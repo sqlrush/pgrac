@@ -112,6 +112,10 @@ MemoryContext CurrentMemoryContext = (MemoryContext)&ut_initial_memory_context_s
 static MemoryContext ut_context_at_flush;
 static int ut_refusal_observe_calls;
 static ClusterCrBuildReason ut_refusal_observed_reason;
+static int ut_log_level;
+static int ut_protocol_logs;
+static int ut_protocol_total_logs;
+static char ut_last_log[1024];
 
 void
 cluster_r4_observe_refusal(ClusterR4RefusalStage stage, ClusterCrBuildReason reason,
@@ -318,7 +322,8 @@ cluster_undo_get_record(UBA uba pg_attribute_unused(), void *out pg_attribute_un
 bool
 errstart(int level, const char *domain pg_attribute_unused())
 {
-	return level >= ERROR;
+	ut_log_level = level;
+	return level == LOG || level >= ERROR;
 }
 
 int
@@ -343,6 +348,11 @@ errmsg(const char *format pg_attribute_unused(), ...)
 int
 errmsg_internal(const char *format pg_attribute_unused(), ...)
 {
+	va_list args;
+
+	va_start(args, format);
+	vsnprintf(ut_last_log, sizeof(ut_last_log), format, args);
+	va_end(args);
 	return 0;
 }
 
@@ -350,6 +360,13 @@ void
 errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
 		  const char *func pg_attribute_unused())
 {
+	if (ut_log_level < ERROR) {
+		if (strstr(ut_last_log, "PGRAC_FAMILY=R4_PROTOCOL") != NULL) {
+			ut_protocol_logs++;
+			ut_protocol_total_logs++;
+		}
+		return;
+	}
 	UT_ASSERT(false); /* A real page operation must not throw in this fixture. */
 	if (PG_exception_stack != NULL)
 		siglongjmp(*PG_exception_stack, 1);
@@ -1022,6 +1039,8 @@ reset_submit_fixture(ClusterLmsSharedState *state)
 	memset(&ut_current_logical, 0, sizeof(ut_current_logical));
 	memset(&ut_current_sample_root, 0, sizeof(ut_current_sample_root));
 	ut_current_sample_generation = UT_FOREIGN_PHYSICAL_GENERATION;
+	ut_protocol_logs = 0;
+	memset(ut_last_log, 0, sizeof(ut_last_log));
 	ut_send_result = CLUSTER_IC_SEND_DONE;
 	ut_send_calls = 0;
 	ut_refusal_observe_calls = 0;
@@ -2109,6 +2128,7 @@ UT_TEST(test_r4_worker0_foreign_undo_samples_generation_before_send)
 	UT_ASSERT_EQ(ut_current_cancel_calls, 0);
 	UT_ASSERT_EQ(ut_forget_calls, 0);
 	UT_ASSERT_EQ(ut_leave_calls, 0);
+	UT_ASSERT_EQ(ut_protocol_logs, 0);
 }
 
 /* Generation zero is a real first physical generation, not the sentinel for
@@ -3129,10 +3149,57 @@ UT_TEST(test_worker0_real_builder_two_foreign_updates_complete_same_owned_contin
 	UT_ASSERT(!continuation_real_pending(0, 1, &ut_pending_locator));
 }
 
+UT_TEST(test_r4_protocol_detail_distinguishes_actual_scur_failures)
+{
+	const char *sites[]
+		= { "PGRAC_SITE=SCUR_ACQUIRE", "PGRAC_SITE=SCUR_SAMPLE", "PGRAC_SITE=SCUR_RELEASE" };
+
+	for (int leg = 0; leg < lengthof(sites); leg++) {
+		ClusterLmsSharedState state;
+		ClusterLmsCrSlot *slot = prepare_worker0_need_undo(&state);
+
+		if (leg == 0)
+			ut_current_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+		else if (leg == 1)
+			ut_current_sample_result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+		else
+			ut_current_release_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+		UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FAIL);
+		UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_PROTOCOL);
+		UT_ASSERT_EQ(ut_send_calls, 0);
+		UT_ASSERT_EQ(ut_current_cancel_calls, 1);
+		UT_ASSERT_EQ(ut_protocol_logs, 1);
+		UT_ASSERT(strstr(ut_last_log, sites[leg]) != NULL);
+		UT_ASSERT(strstr(ut_last_log, "PGRAC_FAMILY=R4_PROTOCOL") != NULL);
+		UT_ASSERT_EQ(ut_current_acquire_calls, 1);
+		UT_ASSERT_EQ(ut_current_sample_calls, leg == 0 ? 0 : 1);
+		UT_ASSERT_EQ(ut_current_release_calls, leg == 2 ? 1 : 0);
+	}
+}
+
+UT_TEST(test_r4_protocol_detail_budget_never_changes_terminal)
+{
+	for (int i = 0; i < 70; i++) {
+		ClusterLmsSharedState state;
+		ClusterLmsCrSlot *slot = prepare_worker0_need_undo(&state);
+
+		ut_current_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
+		UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FAIL);
+		UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_PROTOCOL);
+		UT_ASSERT_EQ(ut_send_calls, 0);
+		UT_ASSERT_EQ(ut_current_cancel_calls, 1);
+	}
+	UT_ASSERT_EQ(ut_protocol_total_logs, 64);
+	UT_ASSERT_EQ(ut_protocol_logs, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(43);
+	UT_PLAN(45);
+	UT_RUN(test_r4_protocol_detail_distinguishes_actual_scur_failures);
 	UT_RUN(test_free_to_pending_canonicalizes_owner_under_lms_lock);
 	UT_RUN(test_free_to_filling_uses_same_proof_window);
 	UT_RUN(test_busy_slot_preserves_winner_owner_stamp);
@@ -3176,6 +3243,7 @@ main(void)
 	UT_RUN(test_data_plane_close_peer_now_is_same_process_and_idempotent);
 	UT_RUN(test_r4_worker0_terminal_hard_error_closes_data_peer_before_cleanup);
 	UT_RUN(test_all_four_legacy_submitters_use_common_reserver);
+	UT_RUN(test_r4_protocol_detail_budget_never_changes_terminal);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

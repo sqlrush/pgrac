@@ -1711,7 +1711,7 @@ UT_TEST(test_real_hint_receiver_wakes_only_after_successful_exact_apply)
  * service substituted. A complete DATA locator must reach that service;
  * a reduced-key miss must not prevent it, for either origin or tuple side. */
 static void
-ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
+ut_full_scratch_case_with_role(bool deleting, bool local_origin, int scenario, int replacement_role)
 {
 	HeapTupleData tuple = { 0 };
 	SnapshotData snapshot = { 0 };
@@ -1820,6 +1820,8 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 			ut_exit_ref.cluster_epoch = ut_current_epoch = 0;
 		if (scenario == 48)
 			ut_current_epoch = UINT64_C(1) << 32;
+		if (replacement_role >= 0)
+			slot->flags = (uint8)replacement_role;
 	}
 	header = (HeapTupleHeader)(ut_visibility_page.data + 1024);
 	header->t_hoff = SizeofHeapTupleHeader;
@@ -1854,8 +1856,12 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 	PG_END_TRY();
 	ut_error_armed = false;
 	if (scenario >= 30) {
-		bool expected_error = scenario >= 34 && scenario != 46;
-		bool expected_call = scenario < 39 || scenario == 40 || scenario == 46 || scenario == 47;
+		bool invalid_role
+			= replacement_role == ITL_FLAG_FREE || replacement_role > ITL_FLAG_LOCK_ONLY_ABORTED;
+		bool expected_error = invalid_role || (scenario >= 34 && scenario != 44 && scenario != 46);
+		bool expected_call = !invalid_role
+							 && (scenario < 39 || scenario == 40 || scenario == 44 || scenario == 46
+								 || scenario == 47);
 
 		UT_ASSERT_EQ(caught, expected_error);
 		if (!caught)
@@ -1886,6 +1892,12 @@ ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
 	UT_ASSERT_EQ(ut_native_calls, 0);
 	UT_ASSERT_EQ(ut_hint_mutations, 0);
 	UT_ASSERT_EQ(memcmp(before.data, ut_visibility_page.data, BLCKSZ), 0);
+}
+
+static void
+ut_full_scratch_exact_case(bool deleting, bool local_origin, int scenario)
+{
+	ut_full_scratch_case_with_role(deleting, local_origin, scenario, -1);
 }
 
 UT_TEST(test_full_scratch_remote_xmax_retains_exact_data_locator)
@@ -1988,7 +2000,7 @@ UT_TEST(test_full_scratch_recycled_deleter_uses_original_origin_terminal_proof)
 
 UT_TEST(test_full_scratch_history_terminal_polarity_and_bound_both_origins)
 {
-	const int scenarios[] = { 31, 32, 33, 46 };
+	const int scenarios[] = { 31, 32, 33, 44, 46 };
 
 	for (int deleting = 0; deleting <= 1; deleting++)
 		for (int origin = 0; origin <= 1; origin++)
@@ -1998,7 +2010,7 @@ UT_TEST(test_full_scratch_history_terminal_polarity_and_bound_both_origins)
 
 UT_TEST(test_full_scratch_history_cannot_rescue_unknown_malformed_or_epoch_drift)
 {
-	const int scenarios[] = { 34, 35, 36, 37, 38, 39, 41, 42, 43, 44, 45, 47, 48 };
+	const int scenarios[] = { 34, 35, 36, 37, 38, 39, 41, 42, 43, 45, 47, 48 };
 
 	for (int deleting = 0; deleting <= 1; deleting++)
 		for (int origin = 0; origin <= 1; origin++)
@@ -2022,10 +2034,34 @@ UT_TEST(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_
 	}
 }
 
+UT_TEST(test_full_scratch_recycled_lock_roles_use_only_original_terminal_proof)
+{
+	const int scenarios[]
+		= { 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 45, 46, 47, 48 };
+
+	for (int role = ITL_FLAG_LOCK_ONLY_ACTIVE; role <= ITL_FLAG_LOCK_ONLY_ABORTED; role++)
+		for (int deleting = 0; deleting <= 1; deleting++)
+			for (int origin = 0; origin <= 1; origin++)
+				for (int i = 0; i < lengthof(scenarios); i++)
+					ut_full_scratch_case_with_role(deleting, origin, scenarios[i], role);
+}
+
+UT_TEST(test_full_scratch_history_never_uses_free_or_multixact_role)
+{
+	const int roles[] = { ITL_FLAG_FREE, ITL_FLAG_LOCK_ONLY_XMAX_IS_MULTI, 255 };
+
+	for (int deleting = 0; deleting <= 1; deleting++)
+		for (int origin = 0; origin <= 1; origin++)
+			for (int i = 0; i < lengthof(roles); i++)
+				ut_full_scratch_case_with_role(deleting, origin, 30, roles[i]);
+}
+
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(38);
+	UT_RUN(test_full_scratch_recycled_lock_roles_use_only_original_terminal_proof);
+	UT_RUN(test_full_scratch_history_never_uses_free_or_multixact_role);
 	UT_RUN(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_commit);
 	UT_RUN(test_full_scratch_history_terminal_polarity_and_bound_both_origins);
 	UT_RUN(test_full_scratch_history_cannot_rescue_unknown_malformed_or_epoch_drift);

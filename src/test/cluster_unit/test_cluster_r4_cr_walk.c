@@ -2706,10 +2706,177 @@ UT_TEST(test_r4_canonical_generation_does_not_change_on_foreign_predecessor)
 	cluster_cr_build_on_holder_forget(0, 193);
 }
 
+/* A row lock followed by UPDATE can leave two heads into one transaction
+ * chain. The earlier lock record must be undone once, not mistaken for a
+ * cycle when the second frozen head is reached. */
+static void
+check_overlapping_lock_head(int variant)
+{
+	PGAlignedBlock page, head_page, tail_page;
+	char expected_old[TEST_TUPLE_LENGTH];
+	ClusterR4CrSlotExtension extension = make_builder_extension(601, 901);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterItlSlotData *slots;
+	UndoRecordHeader *update = (UndoRecordHeader *)ut_undo_record;
+	UndoRecordHeader *lock = (UndoRecordHeader *)ut_second_undo_record;
+	UndoItlPayload *lock_payload
+		= (UndoItlPayload *)(ut_second_undo_record + sizeof(UndoRecordHeader));
+	UndoUpdatePayload *update_payload
+		= (UndoUpdatePayload *)(ut_undo_record + sizeof(UndoRecordHeader));
+	HeapTupleHeader pre_update;
+	ClusterR4CrBuildStepResult result;
+	bool foreign = variant == 4;
+	bool reject = variant == 2 || variant == 3 || variant == 5;
+
+	extension.route_proof.tag.spcOid = 1663;
+	extension.route_proof.tag.dbOid = 5;
+	extension.route_proof.tag.relNumber = 20000;
+	extension.route_proof.tag.forkNum = MAIN_FORKNUM;
+	extension.route_proof.tag.blockNum = 37;
+	make_one_update_candidate_page(page.data, &extension, expected_old);
+	memset(&head_page, 0xa5, sizeof(head_page));
+	memset(&tail_page, 0xa5, sizeof(tail_page));
+	memset(ut_second_undo_record, 0, sizeof(ut_second_undo_record));
+	*lock = *update;
+	lock->record_type = UNDO_RECORD_ITL;
+	lock->flags = UNDO_REC_FLAG_FIRST_IN_TX;
+	lock->payload_length = sizeof(*lock_payload);
+	lock->write_scn = (SCN)150;
+	lock_payload->itl_slot_idx = variant == 1 ? 0 : 1;
+	lock_payload->prev_flags = ITL_FLAG_FREE;
+	lock_payload->new_flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	lock_payload->lock_xid = TEST_XID;
+	lock_payload->prev_xmax = InvalidTransactionId;
+	lock_payload->prev_infomask = HEAP_XMAX_INVALID;
+	ut_expected_second_record_uba = make_record_uba(7, 1);
+	ut_second_undo_record_length = sizeof(*lock) + sizeof(*lock_payload);
+	update->flags = 0;
+	update->prev_uba = ut_expected_second_record_uba;
+	pre_update = (HeapTupleHeader)((char *)update_payload + update_payload->old_tuple_offset);
+	HeapTupleHeaderSetXmax(pre_update, TEST_XID);
+	pre_update->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	slots = ClusterPageGetItlSlots((Page)page.data);
+	slots[1] = slots[0];
+	slots[1].flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slots[1].undo_segment_head = ut_expected_second_record_uba;
+	slots[1].write_scn = (SCN)150;
+	if (variant == 1) {
+		ClusterItlSlotData temporary = slots[0];
+
+		slots[0] = slots[1];
+		slots[1] = temporary;
+	} else if (variant == 2)
+		slots[1].xid++;
+	else if (variant == 3)
+		slots[1].write_scn++;
+	else if (variant == 5)
+		lock_payload->itl_slot_idx = CLUSTER_ITL_INITRANS_DEFAULT;
+	ut_two_record_sequence = true;
+	ut_three_record_sequence = false;
+	ut_cycle_record_sequence = false;
+	ut_undo_get_record_calls = 0;
+	if (foreign) {
+		slots[0].undo_segment_head = make_record_uba_in_segment(257, 9, 0);
+		slots[1].undo_segment_head = make_record_uba_in_segment(257, 8, 0);
+		update->origin_node_id = lock->origin_node_id = 1;
+		update->tt_slot_segment_id = lock->tt_slot_segment_id = 257;
+		update->prev_uba = slots[1].undo_segment_head;
+		make_single_record_undo_block(head_page.data, ut_undo_record, ut_undo_record_length);
+		make_single_record_undo_block(tail_page.data, ut_second_undo_record,
+									  ut_second_undo_record_length);
+	}
+	result = cluster_cr_build_on_holder_step(0, 601, false, &extension, page.data, head_page.data,
+											 &reason);
+	if (foreign) {
+		UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_NEED_UNDO);
+		result = cluster_cr_build_on_holder_step(0, 601, true, &extension, page.data,
+												 head_page.data, &reason);
+		UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_NEED_UNDO);
+		result = cluster_cr_build_on_holder_step(0, 601, true, &extension, page.data,
+												 tail_page.data, &reason);
+	}
+	cluster_cr_build_on_holder_forget(0, 601);
+	UT_ASSERT_EQ(result, reject ? CLUSTER_R4_CR_STEP_FAIL : CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(reason, reject ? CLUSTER_CR_BUILD_BAD_UNDO : CLUSTER_CR_BUILD_NONE);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, foreign ? 0 : 2);
+	if (!reject) {
+		UT_ASSERT_EQ(extension.build_steps, 2);
+		UT_ASSERT_EQ(
+			memcmp(PageGetItem((Page)page.data, PageGetItemId((Page)page.data, FirstOffsetNumber)),
+				   expected_old, TEST_TUPLE_LENGTH),
+			0);
+		UT_ASSERT(!ItemIdIsNormal(PageGetItemId((Page)page.data, 2)));
+	}
+}
+
+UT_TEST(test_r4_overlapping_lock_head_is_consumed_once)
+{
+	check_overlapping_lock_head(0);
+}
+UT_TEST(test_r4_overlap_uses_frozen_order_and_forget_clears_coverage)
+{
+	check_overlapping_lock_head(1);
+	check_overlapping_lock_head(0);
+}
+UT_TEST(test_r4_overlapping_uba_with_different_xid_still_rejects)
+{
+	check_overlapping_lock_head(2);
+}
+UT_TEST(test_r4_overlapping_uba_with_different_stamp_still_rejects)
+{
+	check_overlapping_lock_head(3);
+}
+UT_TEST(test_r4_foreign_overlap_preserves_exact_continuation)
+{
+	check_overlapping_lock_head(4);
+}
+UT_TEST(test_r4_overlap_does_not_cover_malformed_record)
+{
+	check_overlapping_lock_head(5);
+}
+UT_TEST(test_r4_candidate_does_not_hide_recycled_history)
+{
+	PGAlignedBlock page, before, foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(602, 902);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterR4CrBuildStepResult result;
+
+	make_one_insert_candidate_page(page.data, &extension);
+	ClusterPageGetItlHeader((Page)page.data)->itl_recycle_watermark_scn
+		= extension.route_proof.read_scn + 1;
+	memcpy(before.data, page.data, BLCKSZ);
+	memset(foreign.data, 0, BLCKSZ);
+	result = cluster_cr_build_on_holder_step(0, 602, false, &extension, page.data, foreign.data,
+											 &reason);
+	cluster_cr_build_on_holder_forget(0, 602);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FAIL);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 0);
+	UT_ASSERT_EQ(extension.build_steps, 0);
+	UT_ASSERT_EQ(memcmp(before.data, page.data, BLCKSZ), 0);
+}
+UT_TEST(test_r4_candidate_allows_history_at_snapshot_boundary)
+{
+	PGAlignedBlock page, foreign;
+	ClusterR4CrSlotExtension extension = make_builder_extension(603, 903);
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
+	ClusterR4CrBuildStepResult result;
+
+	make_one_insert_candidate_page(page.data, &extension);
+	ClusterPageGetItlHeader((Page)page.data)->itl_recycle_watermark_scn
+		= extension.route_proof.read_scn;
+	memset(foreign.data, 0, BLCKSZ);
+	result = cluster_cr_build_on_holder_step(0, 603, false, &extension, page.data, foreign.data,
+											 &reason);
+	cluster_cr_build_on_holder_forget(0, 603);
+	UT_ASSERT_EQ(result, CLUSTER_R4_CR_STEP_FULL);
+	UT_ASSERT_EQ(ut_undo_get_record_calls, 1);
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(63);
+	UT_PLAN(71);
 
 	UT_RUN(test_head_identity_accepts_exact_uba_xid_wrap_and_tt_slot);
 	UT_RUN(test_head_target_offset_is_not_transaction_identity);
@@ -2774,6 +2941,14 @@ main(int argc, char **argv)
 	UT_RUN(test_r4_builder_known_landed_wrap_must_match_exact_record);
 	UT_RUN(test_r4_dependency_id_is_bounded_and_does_not_alias_next_record);
 	UT_RUN(test_r4_canonical_generation_does_not_change_on_foreign_predecessor);
+	UT_RUN(test_r4_overlapping_lock_head_is_consumed_once);
+	UT_RUN(test_r4_overlap_uses_frozen_order_and_forget_clears_coverage);
+	UT_RUN(test_r4_overlapping_uba_with_different_xid_still_rejects);
+	UT_RUN(test_r4_overlapping_uba_with_different_stamp_still_rejects);
+	UT_RUN(test_r4_foreign_overlap_preserves_exact_continuation);
+	UT_RUN(test_r4_overlap_does_not_cover_malformed_record);
+	UT_RUN(test_r4_candidate_does_not_hide_recycled_history);
+	UT_RUN(test_r4_candidate_allows_history_at_snapshot_boundary);
 
 	UT_DONE();
 	return ut_failed_count != 0 ? 1 : 0;

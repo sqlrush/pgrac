@@ -345,11 +345,15 @@ typedef struct ClusterR4CrBuildContext {
 	UndoRecordHeader immediate_previous_record;
 	uint8 candidate_count;
 	uint8 candidate_cursor;
+	uint8 covered_candidate_mask;
 	bool pending_locator_valid;
 	bool have_previous;
 	uint32 max_steps;
 	uint32 visited_count;
 } ClusterR4CrBuildContext;
+
+StaticAssertDecl(CLUSTER_ITL_INITRANS_DEFAULT <= 8,
+				 "R4 covered-head mask must represent every candidate");
 
 static ClusterR4CrBuildContext CrR4BuildContexts[CLUSTER_LMS_CR_SLOTS];
 
@@ -581,6 +585,16 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 	}
 
 	if (!context->in_use) {
+		SCN recycle_watermark_scn
+			= ClusterPageGetItlHeader((Page)result_page)->itl_recycle_watermark_scn;
+
+		/* A surviving candidate cannot restore history already discarded by
+		 * another slot. FULL must obey the consumer's same snapshot boundary. */
+		if (SCN_VALID(recycle_watermark_scn)
+			&& scn_time_cmp(recycle_watermark_scn, extension->route_proof.read_scn) > 0) {
+			*reason_out = CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD;
+			return CLUSTER_R4_CR_STEP_FAIL;
+		}
 		memset(context, 0, sizeof(*context));
 		context->slot_generation = slot_generation;
 		context->builder_incarnation = extension->owner.builder_incarnation;
@@ -594,16 +608,6 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 		context->in_use = true;
 
 		if (candidate_count == 0) {
-			SCN recycle_watermark_scn
-				= ClusterPageGetItlHeader((Page)result_page)->itl_recycle_watermark_scn;
-
-			if (SCN_VALID(recycle_watermark_scn)
-				&& scn_time_cmp(recycle_watermark_scn,
-								extension->route_proof.read_scn)
-					> 0) {
-				*reason_out = CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD;
-				return CLUSTER_R4_CR_STEP_FAIL;
-			}
 			*reason_out = CLUSTER_CR_BUILD_NONE;
 			return CLUSTER_R4_CR_STEP_FULL;
 		}
@@ -640,6 +644,14 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 		UBA current_uba = supplied_foreign_record ? context->pending_locator.uba
 												: locator->uba;
 		NodeId origin;
+
+		/* Only a frozen head already validated in an earlier chain may be
+		 * skipped. A repeated predecessor within a chain is still a cycle. */
+		if ((context->covered_candidate_mask & (1U << context->candidate_cursor)) != 0) {
+			Assert(!supplied_foreign_record && !context->have_previous);
+			context->candidate_cursor++;
+			continue;
+		}
 
 		for (;;) {
 			UndoRecordHeader *record;
@@ -879,6 +891,22 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 			default:
 				*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
 				return CLUSTER_R4_CR_STEP_FAIL;
+			}
+
+			/* Several page slots can anchor the same transaction chain. Mark
+			 * an older head only after this record and its inverse are proven;
+			 * neither matching xid alone nor an unvalidated UBA is coverage. */
+			for (i = context->candidate_cursor + 1; i < context->candidate_count; i++) {
+				if (!cluster_undo_record_uba_equal(context->candidates[i].undo_segment_head,
+												   current_uba))
+					continue;
+				if (context->candidates[i].write_scn != record->write_scn
+					|| !cr_r4_canonical_record_locator(&context->locators[i], current_uba, record,
+													   &canonical_locator)) {
+					*reason_out = CLUSTER_CR_BUILD_BAD_UNDO;
+					return CLUSTER_R4_CR_STEP_FAIL;
+				}
+				context->covered_candidate_mask |= (uint8)(1U << i);
 			}
 
 			chain_complete = terminal || horizon_reached;

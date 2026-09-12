@@ -3939,7 +3939,15 @@ test_cluster_heap_lock_return_receipt.inc: $(top_srcdir)/src/backend/access/heap
 	     /^}/ { in_lock=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc
+test_cluster_heap_update_successor_header.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && /And also prepare an Xmax value for the new copy/ { planner=1 } \
+	     planner && /^#ifdef USE_PGRAC_CLUSTER/ { emit=1; planner=0; found++ } \
+	     emit { print } emit && /HeapTupleHeaderSetXmax\(newtup->t_data, xmax_new_tuple\)/ { emit=0; done++ } \
+	     /^}/ { in_update=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \

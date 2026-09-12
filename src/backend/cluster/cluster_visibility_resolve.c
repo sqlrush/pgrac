@@ -1034,6 +1034,7 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 	ClusterTxLocator locator;
 	ClusterTxLocator unused_row_wait;
 	const ClusterItlSlotData *slot;
+	ClusterVisXidKind locator_kind;
 
 	if (out == NULL)
 		return;
@@ -1046,11 +1047,19 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 		|| slot_index >= CLUSTER_ITL_INITRANS_DEFAULT)
 		return;
 	slot = &ClusterPageGetItlSlots(page)[slot_index];
-	if (slot->flags < ITL_FLAG_ACTIVE || slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+	if (slot->flags < ITL_FLAG_ACTIVE || slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
+		|| !TransactionIdIsNormal(slot->xid) || UBA_is_invalid(slot->undo_segment_head)
 		|| !cluster_itl_get_tt_ref(page, slot_index, &ref) || ref.local_xid != slot->xid
-		|| ref.tt_slot_id == 0
-		|| !cluster_vis_exact_locators_for_ref(page, slot_index, CLUSTER_VIS_XMIN, ref.local_xid,
-											   &ref, &locator, &unused_row_wait)
+		|| ref.tt_slot_id == 0)
+		return;
+	/* A different occupant can only supply a historical route hint. Its
+	 * ordinary LOCK role is structurally valid, but never DATA authority for
+	 * the same xid; both cases still use the existing exact locator checks. */
+	locator_kind = ref.local_xid != raw_xid && ITL_FLAG_IS_LOCK_ONLY(slot->flags)
+					   ? CLUSTER_VIS_XMAX_LOCK_ONLY
+					   : CLUSTER_VIS_XMIN;
+	if (!cluster_vis_exact_locators_for_ref(page, slot_index, locator_kind, ref.local_xid, &ref,
+											&locator, &unused_row_wait)
 		|| locator.xid != ref.local_xid)
 		return;
 

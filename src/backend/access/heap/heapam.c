@@ -11880,6 +11880,14 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	{
 		if ((oldtup.t_data->t_infomask & HEAP_XMAX_INVALID) ||
 			HEAP_LOCKED_UPGRADED(oldtup.t_data->t_infomask) ||
+#ifdef USE_PGRAC_CLUSTER
+			/* Requalification sees our predecessor TEMP_LOCK. It protects
+			 * the old row only, not a locker to inherit on the new page. */
+			(old_tuple_temp_locked &&
+			 !(oldtup.t_data->t_infomask & HEAP_XMAX_IS_MULTI) &&
+			 HEAP_XMAX_IS_LOCKED_ONLY(oldtup.t_data->t_infomask) &&
+			 HeapTupleHeaderGetRawXmax(oldtup.t_data) == xid) ||
+#endif
 			(checked_lockers && !locker_remains))
 			xmax_new_tuple = InvalidTransactionId;
 		else

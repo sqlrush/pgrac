@@ -328,10 +328,82 @@ UT_TEST(real_row_lock_return_cancels_only_unpublished_receipt)
 	}
 }
 
+static int successor_mx_calls;
+
+/* The real planner's existing multi-locker branch is preserved; membership
+ * lookup is the explicit fixture seam, not a replacement header planner. */
+static void
+GetMultiXactIdHintBits(TransactionId xmax, uint16 *infomask, uint16 *infomask2)
+{
+	successor_mx_calls++;
+	*infomask = HEAP_XMAX_IS_MULTI | HEAP_XMAX_KEYSHR_LOCK | HEAP_XMAX_LOCK_ONLY;
+	*infomask2 = 0;
+}
+
+static void
+check_successor_header(int leg)
+{
+	PGAlignedBlock old_bytes, new_bytes, old_before;
+	HeapTupleData oldtup = { 0 }, new_tuple = { 0 };
+	HeapTuple newtup = &new_tuple;
+	TransactionId xid = 12345, xmax_new_tuple = InvalidTransactionId;
+	CommandId cid = 7;
+	uint16 infomask_new_tuple = 0, infomask2_new_tuple = 0;
+	bool old_tuple_temp_locked = leg != 1;
+	bool cluster_current_mx_recomposed = leg == 4;
+	bool checked_lockers = leg == 6, locker_remains = false;
+	bool expected_invalid = leg == 0 || leg == 4 || leg == 5 || leg == 6;
+
+	memset(&old_bytes, 0, sizeof(old_bytes));
+	memset(&new_bytes, 0, sizeof(new_bytes));
+	oldtup.t_data = (HeapTupleHeader)old_bytes.data;
+	newtup->t_data = (HeapTupleHeader)new_bytes.data;
+	oldtup.t_data->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	HeapTupleHeaderSetXmax(oldtup.t_data, leg == 2 ? xid + 4 : xid);
+	if (leg == 3)
+		oldtup.t_data->t_infomask |= HEAP_XMAX_IS_MULTI;
+	if (leg == 5)
+		oldtup.t_data->t_infomask |= HEAP_XMAX_INVALID;
+	if (leg == 7)
+		oldtup.t_data->t_infomask = 0; /* A real deleting xmax, not legacy EXCL-only. */
+	newtup->t_data->t_infomask = HEAP_XMIN_COMMITTED | HEAP_XMAX_COMMITTED | HEAP_HASNULL;
+	newtup->t_data->t_infomask2 = HEAP_KEYS_UPDATED;
+	memcpy(old_before.data, old_bytes.data, BLCKSZ);
+	successor_mx_calls = 0;
+#include "test_cluster_heap_update_successor_header.inc"
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(newtup->t_data), expected_invalid ? InvalidTransactionId
+															: leg == 2		 ? xid + 4
+																			 : xid);
+	UT_ASSERT_EQ((newtup->t_data->t_infomask & HEAP_XMAX_INVALID) != 0, expected_invalid);
+	UT_ASSERT_EQ((newtup->t_data->t_infomask & HEAP_XMAX_LOCK_ONLY) != 0, !expected_invalid);
+	UT_ASSERT_EQ((newtup->t_data->t_infomask & HEAP_XMAX_IS_MULTI) != 0, leg == 3);
+	UT_ASSERT_EQ(successor_mx_calls, leg == 3 ? 1 : 0);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(newtup->t_data), xid);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawCommandId(newtup->t_data), cid);
+	UT_ASSERT((newtup->t_data->t_infomask & (HEAP_UPDATED | HEAP_HASNULL))
+			  == (HEAP_UPDATED | HEAP_HASNULL));
+	UT_ASSERT_EQ(newtup->t_data->t_infomask2 & HEAP2_XACT_MASK, 0);
+	UT_ASSERT_EQ(memcmp(old_before.data, old_bytes.data, BLCKSZ), 0);
+}
+
+UT_TEST(real_successor_does_not_inherit_own_temporary_lock)
+{
+	check_successor_header(0);
+}
+UT_TEST(real_successor_preserves_all_other_planner_branches)
+{
+	int leg;
+
+	for (leg = 1; leg < 8; leg++)
+		check_successor_header(leg);
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
+	UT_RUN(real_successor_does_not_inherit_own_temporary_lock);
+	UT_RUN(real_successor_preserves_all_other_planner_branches);
 	UT_RUN(real_row_lock_return_cancels_only_unpublished_receipt);
 	UT_RUN(real_update_consumer_requalifies_and_preserves_excluded_routes);
 	UT_RUN(success_preserves_outer_pin_and_original_budget);

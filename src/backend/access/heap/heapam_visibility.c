@@ -2111,7 +2111,8 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin has no DATA ITL slot");
 
 		itl_slot = &ClusterPageGetItlSlots(page)[creator_index];
-		if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+		if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
+			|| (ITL_FLAG_IS_LOCK_ONLY(itl_slot->flags) && itl_slot->xid == raw_xmin)
 			|| !cluster_itl_get_tt_ref(page, creator_index, &ref) || ref.tt_slot_id == 0)
 			cluster_r4_scratch_visibility_unknown(raw_xmin,
 												  "scratch xmin lacks a valid DATA ITL reference");
@@ -2173,7 +2174,8 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 		|| tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT)
 		cluster_r4_scratch_visibility_unknown(raw_xmax, "scratch xmax has no DATA ITL slot");
 	itl_slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
-	if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+	if (itl_slot->flags < ITL_FLAG_ACTIVE || itl_slot->flags > ITL_FLAG_LOCK_ONLY_ABORTED
+		|| (ITL_FLAG_IS_LOCK_ONLY(itl_slot->flags) && itl_slot->xid == raw_xmax)
 		|| !cluster_itl_get_tt_ref(page, tuple->t_itl_slot_idx, &ref) || ref.tt_slot_id == 0)
 		cluster_r4_scratch_visibility_unknown(raw_xmax,
 											  "scratch xmax lacks a valid DATA ITL reference");

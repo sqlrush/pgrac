@@ -139,6 +139,31 @@ typedef struct ClusterR4CrWorkerContext {
 	uint8 reserved[2];
 } ClusterR4CrWorkerContext;
 
+/* Process-local refusal detail only. This never decides a transition and
+ * must be called after releasing any SCUR guard, using sampled scalars. */
+static void
+cr_server_r4_protocol_detail(const ClusterLmsCrSlot *slot, const char *site, int result, int step,
+							 int phase, bool generation_known, uint32 sampled_generation)
+{
+	static uint32 emitted;
+
+	if (slot == NULL || emitted >= 64)
+		return;
+	emitted++;
+	elog(LOG,
+		 "PGRAC_FAMILY=R4_PROTOCOL PGRAC_SITE=%s node=%d request=" UINT64_FORMAT
+		 " dependency=" UINT64_FORMAT " slot_generation=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u read_scn=" UINT64_FORMAT
+		 " build_steps=%u foreign_origin=%d segment=%u block=%u result=%d step=%d"
+		 " scur_phase=%d generation_known=%d sampled_generation=%u detail_limit=%d",
+		 site, cluster_node_id, slot->request_id, slot->r4.foreign_request_id,
+		 slot->r4.slot_generation, slot->tag.spcOid, slot->tag.dbOid, slot->tag.relNumber,
+		 (unsigned)slot->tag.forkNum, slot->tag.blockNum, (uint64)slot->read_scn,
+		 slot->r4.build_steps, slot->r4.foreign_origin_node, slot->r4.foreign_segment_id,
+		 slot->r4.foreign_block_no, result, step, phase, generation_known, sampled_generation,
+		 emitted == 64);
+}
+
 #define CR_SERVER_R4_REQUIRED_HELLO_CAPS                                               \
 	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1       \
 	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                   \
@@ -1234,6 +1259,9 @@ cr_server_r4_build_step(uint32 slot_index)
 			return false;
 	}
 
+	if (reason == CLUSTER_CR_BUILD_PROTOCOL)
+		cr_server_r4_protocol_detail(slot, "BUILD_STEP", (int)step_reason, (int)step_result, -1,
+									 false, 0);
 	slot->r4.terminal_reason = (uint8)reason;
 	pg_write_barrier();
 	expected = CLUSTER_LMS_CR_R4_BUILDING;
@@ -1344,11 +1372,12 @@ cr_server_r4_sample_foreign_generation(
 	ClusterR4CrWorkerContext *context, ClusterTxLocator *locator_out,
 	uint32 *segment_out, uint32 *block_out)
 {
-	ClusterUndoBlock0CurrentStep current_step;
+	ClusterUndoBlock0CurrentStep current_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	ClusterUndoBlock0ResolvedRoot current_root;
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0Result current_result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	uint32 owner_instance;
+	const char *site = "FOREIGN_REQUEST";
 
 	if (slot == NULL || context == NULL || locator_out == NULL
 		|| segment_out == NULL || block_out == NULL
@@ -1357,16 +1386,19 @@ cr_server_r4_sample_foreign_generation(
 			block_out))
 		goto failed;
 	owner_instance = (uint32)slot->r4.foreign_origin_node + 1;
+	site = "SCUR_ROOT";
 	if (owner_instance == 0 || owner_instance > CLUSTER_MAX_NODES
 		|| !cluster_semantic_activation_resolve_shared_undo_root(
 			&context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
 			owner_instance, *segment_out, &current_root))
 		goto failed;
+	site = "SCUR_ROOT_CHANGED";
 	if (context->foreign_scur_phase != CLUSTER_R4_FOREIGN_SCUR_UNUSED
 		&& !cr_server_r4_resolved_root_matches(
 			&context->foreign_resolved_root, &current_root))
 		goto failed;
 
+	site = "SCUR_ACQUIRE";
 	if (context->foreign_scur_phase == CLUSTER_R4_FOREIGN_SCUR_UNUSED) {
 		memset(&logical, 0, sizeof(logical));
 		logical.segment_id = *segment_out;
@@ -1386,6 +1418,7 @@ cr_server_r4_sample_foreign_generation(
 			&context->foreign_scur, &current_result);
 	} else if (context->foreign_scur_phase
 			   == CLUSTER_R4_FOREIGN_SCUR_RELEASE) {
+		site = "SCUR_RELEASE";
 		current_step = cluster_undo_block0_current_release_poll(
 			&context->foreign_scur, &current_result);
 		if (current_step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
@@ -1400,6 +1433,7 @@ cr_server_r4_sample_foreign_generation(
 		return CLUSTER_R4_FOREIGN_SAMPLE_PENDING;
 	if (current_step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
 		goto failed;
+	site = "SCUR_SAMPLE";
 	current_result = cluster_undo_block0_current_sample_generation(
 		&context->foreign_scur, &context->foreign_resolved_root,
 		&context->foreign_sampled_generation);
@@ -1407,6 +1441,7 @@ cr_server_r4_sample_foreign_generation(
 		|| !context->foreign_sampled_generation.known
 		|| context->foreign_sampled_generation.value == UINT32_MAX)
 		goto failed;
+	site = "SCUR_RELEASE";
 	context->foreign_scur_phase = CLUSTER_R4_FOREIGN_SCUR_RELEASE;
 	current_step = cluster_undo_block0_current_release_begin(
 		&context->foreign_scur, &current_result);
@@ -1416,6 +1451,7 @@ cr_server_r4_sample_foreign_generation(
 		goto failed;
 
 released:
+	site = "SCUR_RELEASED_ROOT";
 	if (!cluster_semantic_activation_resolve_shared_undo_root(
 			&context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
 			owner_instance, *segment_out, &current_root)
@@ -1434,8 +1470,15 @@ released:
 	context->foreign_scur_phase = CLUSTER_R4_FOREIGN_SCUR_UNUSED;
 	return CLUSTER_R4_FOREIGN_SAMPLE_READY;
 
-failed:
+failed: {
+	int phase = context != NULL ? context->foreign_scur_phase : -1;
+	bool known = context != NULL && context->foreign_sampled_generation.known;
+	uint32 generation = known ? context->foreign_sampled_generation.value : 0;
+
 	cr_server_r4_foreign_scur_abort(context);
+	cr_server_r4_protocol_detail(slot, site, current_result, current_step, phase, known,
+								 generation);
+}
 	return CLUSTER_R4_FOREIGN_SAMPLE_FAILED;
 }
 
@@ -1470,18 +1513,21 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 			return cr_server_r4_publish_foreign_terminal(
 				slot, CLUSTER_LMS_CR_R4_NEED_UNDO,
 				CLUSTER_LMS_CR_R4_READY_FAIL, CLUSTER_CR_BUILD_PROTOCOL);
-	} else if (!cr_server_r4_foreign_request_valid(
-				   slot_index, slot, context, true, &locator, &segment_id,
-				   &block_no))
+	} else if (!cr_server_r4_foreign_request_valid(slot_index, slot, context, true, &locator,
+												   &segment_id, &block_no)) {
+		cr_server_r4_protocol_detail(slot, "FROZEN_REQUEST", -1, -1, -1, false, 0);
 		return cr_server_r4_publish_foreign_terminal(
 			slot, CLUSTER_LMS_CR_R4_NEED_UNDO, CLUSTER_LMS_CR_R4_READY_FAIL,
 			CLUSTER_CR_BUILD_PROTOCOL);
+	}
 	/* Generation zero is valid.  The separate frozen bit proves that the
 	 * exact PGRD-resolved SCUR sample completed release before publication. */
-	if (context->expected_foreign_physical_generation == UINT32_MAX)
+	if (context->expected_foreign_physical_generation == UINT32_MAX) {
+		cr_server_r4_protocol_detail(slot, "FROZEN_GENERATION", -1, -1, -1, true, UINT32_MAX);
 		return cr_server_r4_publish_foreign_terminal(
 			slot, CLUSTER_LMS_CR_R4_NEED_UNDO, CLUSTER_LMS_CR_R4_READY_FAIL,
 			CLUSTER_CR_BUILD_PROTOCOL);
+	}
 
 	memset(&forward, 0, sizeof(forward));
 	forward.base.request_id = slot->r4.foreign_request_id;
@@ -1496,10 +1542,13 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 	forward.base.reserved_0[6] = CLUSTER_R4_FORWARD_EXTENDED;
 	if (!ClusterR4ForwardExtensionSetLocatorGeneration(
 			&forward.extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator,
-			context->expected_foreign_physical_generation))
+			context->expected_foreign_physical_generation)) {
+		cr_server_r4_protocol_detail(slot, "FORWARD_ENCODE", -1, -1, -1, true,
+									 context->expected_foreign_physical_generation);
 		return cr_server_r4_publish_foreign_terminal(
 			slot, CLUSTER_LMS_CR_R4_NEED_UNDO, CLUSTER_LMS_CR_R4_READY_FAIL,
 			CLUSTER_CR_BUILD_PROTOCOL);
+	}
 
 	expected = CLUSTER_LMS_CR_R4_NEED_UNDO;
 	if (!pg_atomic_compare_exchange_u32(
@@ -1520,6 +1569,7 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 				CLUSTER_LMS_CR_R4_READY_RETRY, CLUSTER_CR_BUILD_CAPACITY);
 		case CLUSTER_IC_SEND_HARD_ERROR:
 			cluster_lms_data_plane_close_peer_now(slot->r4.foreign_origin_node);
+			cr_server_r4_protocol_detail(slot, "FORWARD_SEND", send_result, -1, -1, false, 0);
 			return cr_server_r4_publish_foreign_terminal(
 				slot, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT,
 				CLUSTER_LMS_CR_R4_READY_FAIL, CLUSTER_CR_BUILD_PROTOCOL);
@@ -1635,8 +1685,10 @@ cluster_cr_server_r4_land_foreign_undo(
 		|| header->sender_node != slot->r4.foreign_origin_node
 		|| (!refusal && physical_generation != context->expected_foreign_physical_generation)
 		|| !cr_server_r4_foreign_request_valid(slot_index, slot, context, true, &locator,
-											   &segment_id, &block_no))
+											   &segment_id, &block_no)) {
+		cr_server_r4_protocol_detail(slot, "LANDING_KEY", header->status, -1, -1, false, 0);
 		return false;
+	}
 
 	tt_generation = refusal ? 0 : ClusterGcsUndoAuthTrailerGetTtGeneration(undo_auth);
 	authority_scn = refusal ? InvalidScn : (SCN)ClusterGcsUndoAuthTrailerGetAuthorityScn(undo_auth);
@@ -1651,8 +1703,11 @@ cluster_cr_server_r4_land_foreign_undo(
 			|| canonical_locator.itl_slot_index != locator.itl_slot_index
 			|| canonical_locator.tt_wrap > TT_WRAP_MAX
 			|| (locator.tt_wrap != TT_WRAP_INVALID
-				&& canonical_locator.tt_wrap != locator.tt_wrap)))
+				&& canonical_locator.tt_wrap != locator.tt_wrap))) {
+		cr_server_r4_protocol_detail(slot, "LANDING_RECORD", header->status, -1, -1, true,
+									 physical_generation);
 		return false;
+	}
 
 	memset(&receive_admission, 0, sizeof(receive_admission));
 	admission_result = cluster_semantic_activation_enter(
@@ -1672,6 +1727,8 @@ cluster_cr_server_r4_land_foreign_undo(
 	if (refusal) {
 		bool retry = header->status == GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
 
+		if (!retry)
+			cr_server_r4_protocol_detail(slot, "ORIGIN_REFUSAL", header->status, -1, -1, false, 0);
 		landed = cr_server_r4_publish_foreign_terminal(
 			slot, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT,
 			retry ? CLUSTER_LMS_CR_R4_READY_RETRY : CLUSTER_LMS_CR_R4_READY_FAIL,
