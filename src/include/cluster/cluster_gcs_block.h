@@ -2673,9 +2673,9 @@ ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension,
 	return true;
 }
 
-/* Known generations bind the locator to BLOCK0_CURRENT SCUR. Kind-4 alone
- * permits UINT32_MAX to request origin-side selection under that guard;
- * it is never a positive reply generation. Zero is a known first generation. */
+/* Known generations bind the locator to BLOCK0_CURRENT SCUR. Both TX and
+ * undo-data requests permit UINT32_MAX for origin-side selection under that
+ * guard; it is never a positive DATA generation. Zero is a known first one. */
 static inline bool
 ClusterR4ForwardExtensionSetLocatorGeneration(ClusterR4ForwardExtension *extension,
 										   ClusterR4WireKind kind,
@@ -2685,7 +2685,6 @@ ClusterR4ForwardExtensionSetLocatorGeneration(ClusterR4ForwardExtension *extensi
 	if (extension != NULL)
 		memset(extension, 0, sizeof(*extension));
 	if (extension == NULL || locator == NULL
-		|| (physical_generation == UINT32_MAX && kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH)
 		|| !ClusterR4ForwardExtensionSetLocator(extension, kind, locator))
 		return false;
 	ClusterR4WireWriteU32(extension->subject_id_le, physical_generation);
@@ -2739,8 +2738,6 @@ ClusterR4ForwardExtensionGetLocatorGeneration(const ClusterR4ForwardExtension *e
 	if (extension == NULL || locator_out == NULL || physical_generation_out == NULL)
 		return false;
 	generation = ClusterR4WireReadU32(extension->subject_id_le);
-	if (generation == UINT32_MAX && expected_kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH)
-		return false;
 	copy = *extension;
 	memset(copy.subject_id_le, 0, sizeof(copy.subject_id_le));
 	if (!ClusterR4ForwardExtensionGetLocator(&copy, expected_kind, locator_out))

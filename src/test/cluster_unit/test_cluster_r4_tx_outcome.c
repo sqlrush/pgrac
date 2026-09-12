@@ -151,6 +151,11 @@ static int test_regular_root_resolve_calls;
 static int test_terminal_census_root_resolve_calls;
 static bool test_local_freshref_pair_exact;
 static int test_local_freshref_pair_calls;
+static bool test_remote_origin_enabled;
+static int test_remote_origin_calls;
+static uint32 test_remote_origin_generation;
+static ClusterTxOutcome test_remote_origin_outcome;
+static bool test_remote_origin_revoke_admission;
 static ClusterUndoBlock0CurrentStep test_candidate_acquire_step
 	= CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 static ClusterUndoBlock0CurrentStep test_candidate_poll_step
@@ -822,16 +827,29 @@ cluster_undo_block0_current_cancel(
 }
 
 ClusterTxOutcome
-cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
-	int32 origin_node pg_attribute_unused(),
-	const ClusterTxLocator *locator pg_attribute_unused(),
-	uint32 expected_physical_generation pg_attribute_unused(),
-	uint64 formation_epoch pg_attribute_unused(),
-	ClusterTxResolution *out pg_attribute_unused(),
-	ClusterTxResolveReason *reason_out pg_attribute_unused())
+cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterTxLocator *locator,
+											   uint32 expected_physical_generation,
+											   uint64 formation_epoch, ClusterTxResolution *out,
+											   ClusterTxResolveReason *reason_out)
 {
-	UT_ASSERT(false);
-	return CLUSTER_TX_UNKNOWN;
+	UT_ASSERT(test_remote_origin_enabled);
+	UT_ASSERT_EQ(origin_node, 0);
+	UT_ASSERT_EQ(cluster_node_id, 1);
+	UT_ASSERT_EQ(formation_epoch, test_formation_epoch);
+	UT_ASSERT_EQ(memcmp(locator, &test_origin_locator, sizeof(*locator)), 0);
+	test_remote_origin_calls++;
+	test_remote_origin_generation = expected_physical_generation;
+	/* Transport/proof validation is covered by the real GCS suite. This seam
+	 * records what the real admitted consumer asks the exact origin to do. */
+	memset(out, 0, sizeof(*out));
+	out->locator_echo = *locator;
+	out->outcome = test_remote_origin_outcome;
+	*reason_out = test_remote_origin_outcome == CLUSTER_TX_UNKNOWN
+					  ? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
+					  : CLUSTER_TX_RESOLVE_NONE;
+	if (test_remote_origin_revoke_admission)
+		test_formation_epoch++;
+	return test_remote_origin_outcome;
 }
 
 static void
@@ -949,6 +967,11 @@ reset_exact_origin_fixture(void)
 	test_terminal_census_root_resolve_calls = 0;
 	test_local_freshref_pair_exact = false;
 	test_local_freshref_pair_calls = 0;
+	test_remote_origin_enabled = false;
+	test_remote_origin_calls = 0;
+	test_remote_origin_generation = 0;
+	test_remote_origin_outcome = CLUSTER_TX_IN_PROGRESS;
+	test_remote_origin_revoke_admission = false;
 	test_candidate_acquire_step = CLUSTER_UNDO_BLOCK0_CURRENT_HELD;
 	test_candidate_poll_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
 	test_candidate_after_wait_step = CLUSTER_UNDO_BLOCK0_CURRENT_FAILED;
@@ -1557,6 +1580,100 @@ UT_TEST(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog)
 	UT_ASSERT_EQ(test_tt_slot_seen, TEST_TT_OFFSET);
 	UT_ASSERT_EQ((int)test_tt_xid_seen, (int)TEST_ORIGIN_XID);
 	UT_ASSERT_EQ(test_tt_wrap_seen, TEST_ORIGIN_WRAP);
+}
+
+static void
+test_remote_origin_does_not_depend_on_foreign_residency(ClusterTxResolveMode mode)
+{
+	int variant;
+	int saved_node = cluster_node_id;
+
+	for (variant = 0; variant < 3; variant++) {
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+		ClusterSemanticAdmissionToken admission = { 0 };
+		ClusterTxOutcome outcome;
+
+		reset_exact_origin_fixture();
+		cluster_node_id = 1;
+		test_remote_origin_enabled = true;
+		/* Cold foreign header (the P56 candidate), known local first
+		 * generation, and another locally observed generation all route
+		 * without treating requester cache contents as origin authority. */
+		test_candidate_sample_result
+			= variant == 0 ? CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED : CLUSTER_UNDO_BLOCK0_OK;
+		test_candidate_data_generation = variant == 1 ? 0 : 3;
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		outcome = cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, mode, &admission, &resolution, &reason);
+		cluster_node_id = saved_node;
+		UT_ASSERT_EQ(outcome, CLUSTER_TX_IN_PROGRESS);
+		UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+		UT_ASSERT_EQ(test_remote_origin_calls, 1);
+		UT_ASSERT_EQ(test_remote_origin_generation, UINT32_MAX);
+		UT_ASSERT_EQ(test_regular_root_resolve_calls, 0);
+		UT_ASSERT_EQ(test_terminal_census_root_resolve_calls, 0);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+		UT_ASSERT_EQ(test_candidate_sample_calls, 0);
+		UT_ASSERT_EQ(test_candidate_release_calls, 0);
+		UT_ASSERT_EQ(test_candidate_cancel_calls, 0);
+		UT_ASSERT_EQ(test_candidate_block0_copy_calls, 0);
+		UT_ASSERT_EQ(test_candidate_data_copy_calls, 0);
+		UT_ASSERT_EQ(test_undo_read_calls, 0);
+		UT_ASSERT_EQ(test_tt_exact_calls, 0);
+		UT_ASSERT_EQ(test_native_status_calls, 0);
+	}
+}
+
+UT_TEST(test_visibility_remote_origin_selects_generation_without_foreign_scur)
+{
+	test_remote_origin_does_not_depend_on_foreign_residency(CLUSTER_TX_RESOLVE_VISIBILITY);
+}
+
+UT_TEST(test_terminal_census_remote_origin_selects_generation_without_foreign_scur)
+{
+	test_remote_origin_does_not_depend_on_foreign_residency(CLUSTER_TX_RESOLVE_TERMINAL_CENSUS);
+}
+
+UT_TEST(test_remote_origin_failed_proof_or_revoked_admission_clears_output)
+{
+	int variant;
+	int saved_node = cluster_node_id;
+
+	for (variant = 0; variant < 3; variant++) {
+		ClusterTxResolution resolution;
+		ClusterTxResolution zero = { 0 };
+		ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
+		ClusterSemanticAdmissionToken admission = { 0 };
+		ClusterTxOutcome outcome;
+
+		reset_exact_origin_fixture();
+		cluster_node_id = 1;
+		test_remote_origin_enabled = true;
+		test_remote_origin_revoke_admission = variant == 1;
+		if (variant == 0)
+			test_remote_origin_outcome = CLUSTER_TX_UNKNOWN;
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = variant != 2;
+		memset(&resolution, 0xa5, sizeof(resolution));
+		outcome = cluster_runtime_visibility_resolve_exact_origin_admitted(
+			&test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &resolution, &reason);
+		cluster_node_id = saved_node;
+		UT_ASSERT_EQ(outcome, CLUSTER_TX_UNKNOWN);
+		UT_ASSERT_EQ(reason, variant == 0 ? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
+										  : CLUSTER_TX_RESOLVE_AUTHORITY_STALE);
+		UT_ASSERT_EQ(memcmp(&resolution, &zero, sizeof(zero)), 0);
+		UT_ASSERT_EQ(test_remote_origin_calls, variant == 2 ? 0 : 1);
+		UT_ASSERT_EQ(test_candidate_acquire_calls, 0);
+		UT_ASSERT_EQ(test_native_status_calls, 0);
+	}
 }
 
 UT_TEST(test_terminal_census_local_origin_uses_resident_candidate2_and_canonical_upgrade)
@@ -3486,6 +3603,54 @@ UT_TEST(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge)
 	UT_ASSERT_EQ(test_subtrans_parent_calls, 2 * CLUSTER_R4_SUBTRANS_MAX_DEPTH);
 }
 
+UT_TEST(test_origin_tx_plan_preserves_strict_zero_and_final_generation_recheck)
+{
+	int variant;
+
+	for (variant = 0; variant < 4; variant++) {
+		ClusterRuntimeVisibilityOriginPlan plan;
+		ClusterTxResolution resolution;
+		ClusterTxResolveReason reason;
+		ClusterSemanticAdmissionToken admission = { 0 };
+		ClusterUndoBlock0CurrentGuard data_guard = { 0 }, tt_guard = { 0 };
+		ClusterUndoBlock0ResolvedRoot data_root = { 0 }, tt_root = { 0 };
+		ClusterUndoBlock0Generation expected = { true, variant == 0 ? 0 : 3 };
+
+		reset_exact_origin_fixture();
+		test_candidate_data_generation = 3;
+		test_origin_locator.tt_wrap = TT_WRAP_INVALID;
+		admission.feature_bit = CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1;
+		admission.record_generation = 5;
+		admission.formation_epoch = test_formation_epoch;
+		admission.side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		admission.entered = true;
+		data_root.intent = tt_root.intent = CLUSTER_UNDO_PATH_RUNTIME_SHARED;
+		data_root.root_id = 91;
+		tt_root.root_id = 92;
+		data_root.root_generation = tt_root.root_generation = 7;
+		UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_freeze_data_held(
+						 &test_origin_locator, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &expected,
+						 &data_guard, &data_root, &plan, &resolution, &reason),
+					 variant == 0 ? CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED
+								  : CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL);
+		if (variant == 0) {
+			UT_ASSERT_EQ(test_candidate_data_copy_calls, 0);
+			UT_ASSERT_EQ(test_tt_exact_calls, 0);
+			continue;
+		}
+		UT_ASSERT(cluster_runtime_visibility_origin_plan_sample_canonical_held(
+			&plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &tt_guard, &tt_root, &reason));
+		if (variant == 2)
+			test_candidate_data_generation++;
+		if (variant == 3)
+			test_candidate_mutate_record_on_recheck = true;
+		UT_ASSERT_EQ(cluster_runtime_visibility_origin_plan_recheck_data_held(
+						 &plan, CLUSTER_TX_RESOLVE_VISIBILITY, &admission, &data_guard, &data_root,
+						 &resolution, &reason),
+					 variant == 1 ? CLUSTER_TX_COMMITTED : CLUSTER_TX_UNKNOWN);
+	}
+}
+
 UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
 {
 	int variant;
@@ -3567,7 +3732,7 @@ UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
 int
 main(void)
 {
-	UT_PLAN(108);
+	UT_PLAN(112);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);
@@ -3619,6 +3784,9 @@ main(void)
 	UT_RUN(test_current_member_local_terminal_accepts_clean_formation_epoch_zero);
 	UT_RUN(test_current_member_active_on_current_segment_requires_live_owner_index);
 	UT_RUN(test_exact_origin_committed_uses_canonical_tt_identity_and_direct_clog);
+	UT_RUN(test_visibility_remote_origin_selects_generation_without_foreign_scur);
+	UT_RUN(test_terminal_census_remote_origin_selects_generation_without_foreign_scur);
+	UT_RUN(test_remote_origin_failed_proof_or_revoked_admission_clears_output);
 	UT_RUN(test_terminal_census_local_origin_uses_resident_candidate2_and_canonical_upgrade);
 	UT_RUN(test_terminal_census_nonresident_cleanout_uses_exact_local_c1b_pair);
 	UT_RUN(test_terminal_census_retained_pair_negative_matrix_fails_closed);
@@ -3676,6 +3844,7 @@ main(void)
 	UT_RUN(test_exact_origin_subtrans_depth_fails_closed);
 	UT_RUN(test_exact_origin_subtrans_max_chain_is_rechecked_once_per_edge);
 	UT_RUN(test_origin_export_copies_only_the_final_revalidated_resident_data_page);
+	UT_RUN(test_origin_tx_plan_preserves_strict_zero_and_final_generation_recheck);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

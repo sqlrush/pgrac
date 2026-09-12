@@ -5077,14 +5077,10 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 	if (reason_out != NULL)
 		*reason_out = reason;
 	memset(&decoded, 0, sizeof(decoded));
-	if (out == NULL || locator == NULL || reason_out == NULL
-		|| origin_node < 0 || origin_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| origin_node == cluster_node_id
-		|| expected_physical_generation == UINT32_MAX
-		|| !uba_decode(locator->uba, &segment_id, &block_no,
-					   &tt_slot_offset, &row_offset)
-		|| block_no == 0
-		|| uba_origin_node_id(locator->uba) != (NodeId)origin_node)
+	if (out == NULL || locator == NULL || reason_out == NULL || origin_node < 0
+		|| origin_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || origin_node == cluster_node_id
+		|| !uba_decode(locator->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset)
+		|| block_no == 0 || uba_origin_node_id(locator->uba) != (NodeId)origin_node)
 		return CLUSTER_TX_UNKNOWN;
 	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
 	slot = gcs_block_try_reserve_r4_slot(
@@ -8168,10 +8164,10 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 				}
 				break;
 			}
-			/* A holder need not cache this origin's segment header. Select
+			/* Neither remote consumer must cache this origin's header. Select
 			 * only before freezing DATA, under the existing own-origin guard;
 			 * the unchanged plan then binds and rechecks this exact generation. */
-			if (context->undo_data_fetch && !context->expected_generation.known) {
+			if (!context->expected_generation.known) {
 				ClusterUndoBlock0Generation sampled = { false, 0 };
 
 				if (cluster_undo_block0_current_sample_generation(&context->guard, &context->root,
@@ -8574,7 +8570,8 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 				PGRAC_IC_MSG_GCS_BLOCK_REPLY, requester_node, context->reply_frame, reply_size);
 			cluster_gcs_block_note_send_outcome(
 				GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
-			if (context->undo_data_fetch && send_result == CLUSTER_IC_SEND_NOT_ADMITTED)
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE
+				&& send_result == CLUSTER_IC_SEND_NOT_ADMITTED)
 				break;
 			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
 				cluster_lms_data_plane_close_peer_now(
@@ -8620,7 +8617,7 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 			{
 				MemoryContextSwitchTo(saved_context);
 				FlushErrorState();
-				if (context->undo_data_fetch) {
+				if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE) {
 					if (context->guard_active)
 						cluster_undo_block0_current_cancel(&context->guard);
 					context->guard_active = false;

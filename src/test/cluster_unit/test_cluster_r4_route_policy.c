@@ -1370,7 +1370,8 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id,
 						 sizeof(slot_tag)) == 0
 			  && slot_epoch == requester_send.tx_forward.base.epoch
 			  && slot_master == (int32)dest_node_id;
-		if (!requester_send.tx_kind2 || physical_generation != 9
+		if (!requester_send.tx_kind2
+			|| (physical_generation != 9 && physical_generation != UINT32_MAX)
 			|| !requester_send.slot_armed)
 			return false;
 		if (requester_send.suppress_reply)
@@ -5519,7 +5520,8 @@ UT_TEST(test_forward96_proof_epoch_mismatch_is_consumed_without_holder_submit)
 	cluster_node_id = saved_node_id;
 }
 
-UT_TEST(test_kind2_requester_uses_existing_r4_slot_and_lands_status22)
+static void
+test_kind2_requester_generation_roundtrip(uint32 requested_generation)
 {
 	BufferTag seed_tag = route_test_tag();
 	BufferTag released_tag;
@@ -5554,8 +5556,9 @@ UT_TEST(test_kind2_requester_uses_existing_r4_slot_and_lands_status22)
 	memset(&resolution, 0xa5, sizeof(resolution));
 
 	UT_ASSERT_EQ(cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
-		UT_MASTER_NODE, &locator, 9, UT_FORMATION_EPOCH,
-		&resolution, &reason), CLUSTER_TX_COMMITTED);
+					 UT_MASTER_NODE, &locator, requested_generation, UT_FORMATION_EPOCH,
+					 &resolution, &reason),
+				 CLUSTER_TX_COMMITTED);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
 	UT_ASSERT_EQ(resolution.locator_echo.tt_wrap, 19);
 	UT_ASSERT_EQ(resolution.authority.origin_epoch, UT_FORMATION_EPOCH);
@@ -5577,7 +5580,7 @@ UT_TEST(test_kind2_requester_uses_existing_r4_slot_and_lands_status22)
 	UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
 		&requester_send.tx_forward.extension,
 		CLUSTER_R4_WIRE_TX_RESOLVE, &wire_locator, &wire_generation));
-	UT_ASSERT_EQ(wire_generation, 9);
+	UT_ASSERT_EQ(wire_generation, requested_generation);
 	UT_ASSERT_EQ(memcmp(&wire_locator, &locator, sizeof(locator)), 0);
 	UT_ASSERT(cluster_gcs_block_test_snapshot_r4_requester_slot(
 		&released_in_use, &released_domain, &released_request_id,
@@ -5589,6 +5592,16 @@ UT_TEST(test_kind2_requester_uses_existing_r4_slot_and_lands_status22)
 	UT_ASSERT_EQ(released_epoch, 0);
 	UT_ASSERT_EQ(released_master, -1);
 	cluster_node_id = saved_node_id;
+}
+
+UT_TEST(test_kind2_requester_uses_existing_r4_slot_and_lands_status22)
+{
+	test_kind2_requester_generation_roundtrip(9);
+}
+
+UT_TEST(test_kind2_requester_asks_origin_to_select_and_lands_exact_status22)
+{
+	test_kind2_requester_generation_roundtrip(UINT32_MAX);
 }
 
 UT_TEST(test_kind2_requester_sleep_error_cancels_cv_before_slot_release)
@@ -5866,6 +5879,129 @@ route_test_undo_forward(uint16 wrap)
 	UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
 		&forward.extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator, 9));
 	return forward;
+}
+
+static ClusterR4CrForwardPayload
+route_test_tx_forward(uint32 generation)
+{
+	ClusterR4CrForwardPayload forward = route_test_undo_forward(TT_WRAP_INVALID);
+
+	forward.base.requester_backend_id = UT_REQUESTER_BACKEND;
+	forward.base.master_node = UT_MASTER_NODE;
+	memset(forward.base.reserved_0, 0, sizeof(forward.base.reserved_0));
+	memset(forward.base.expected_pi_watermark_scn_bytes, 0,
+		   sizeof(forward.base.expected_pi_watermark_scn_bytes));
+	forward.extension.r4_kind = CLUSTER_R4_WIRE_TX_RESOLVE;
+	/* Build bytes independently of the codec under test, so old-product RED
+	 * reaches the real origin's admission branch rather than its test helper. */
+	ClusterR4WireWriteU32(forward.extension.subject_id_le, generation);
+	return forward;
+}
+
+UT_TEST(test_kind2_origin_generation_selection_and_strict_known_negatives)
+{
+	int saved_node = cluster_node_id;
+	int variant;
+
+	cluster_node_id = UT_MASTER_NODE;
+	for (variant = 0; variant < 10; variant++) {
+		bool known = variant == 1 || variant == 2;
+		bool positive = variant < 5 && variant != 2;
+		ClusterR4CrForwardPayload forward = route_test_tx_forward(known ? 0 : UINT32_MAX);
+		ClusterICEnvelope env = route_test_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
+		ClusterTxLocator locator;
+		ClusterTxResolution decoded;
+		uint32 generation;
+		int i;
+
+		route_seam_reset();
+		route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
+		route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+		route_seam.candidate_cross_segment = positive;
+		origin_generation_sample_enabled = variant != 5;
+		origin_generation_sample_value
+			= (variant == 1 || variant == 3)
+				  ? 0
+				  : (variant == 4 ? UINT32_MAX - 1 : (variant == 7 ? UINT32_MAX : 3));
+		origin_generation_sample_known = variant != 6;
+		origin_generation_sample_throw = variant == 8;
+		if (variant == 9) {
+			/* The non-census OPEN mode also accepts cold requests. The
+			 * single-segment stub proves selection, not the real TT sample. */
+			route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_OK;
+			positive = true;
+		}
+		UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+		for (i = 0; i < 4; i++)
+			cluster_gcs_block_test_r4_tx_origin_drain();
+		UT_ASSERT_EQ(origin_generation_sample_calls, known ? 0 : 1);
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 1);
+		UT_ASSERT_EQ(route_seam.raw_send_header.status,
+					 positive ? GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT : GCS_BLOCK_REPLY_R4_DENIED);
+		UT_ASSERT_EQ(route_seam.candidate_cancel_calls, variant == 8 ? 1 : 0);
+		UT_ASSERT_EQ(route_seam.candidate_release_begin_calls,
+					 variant == 8 ? 0 : (route_seam.candidate_cross_segment ? 3 : 1));
+		UT_ASSERT_EQ(route_seam.candidate_canonical_sample_calls,
+					 route_seam.candidate_cross_segment ? 1 : 0);
+		UT_ASSERT_EQ(route_seam.candidate_data_recheck_calls,
+					 route_seam.candidate_cross_segment ? 1 : 0);
+		if (positive) {
+			UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
+				&forward.extension, CLUSTER_R4_WIRE_TX_RESOLVE, &locator, &generation));
+			UT_ASSERT(ClusterR4TxVerdictPageDecode((const uint8 *)route_seam.raw_send_page,
+												   &locator, &decoded));
+			UT_ASSERT_EQ(decoded.outcome, CLUSTER_TX_COMMITTED);
+		} else {
+			for (i = 0; i < BLCKSZ; i++)
+				UT_ASSERT_EQ(route_seam.raw_send_page[i], 0);
+			UT_ASSERT_EQ(route_seam.raw_send_header.page_lsn, 0);
+		}
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	}
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_kind2_origin_backpressure_does_not_reselect_or_duplicate)
+{
+	ClusterR4CrForwardPayload forward = route_test_tx_forward(UINT32_MAX);
+	ClusterICEnvelope env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE,
+												UT_MASTER_NODE, sizeof(forward));
+	GcsBlockReplyHeader header;
+	char page[BLCKSZ];
+	int saved_node = cluster_node_id;
+	int i;
+	int acquires;
+
+	cluster_node_id = UT_MASTER_NODE;
+	route_seam_reset();
+	route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED;
+	route_seam.raw_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
+	route_seam.candidate_cross_segment = true;
+	origin_generation_sample_enabled = true;
+	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+	for (i = 0; i < 4; i++)
+		cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+	UT_ASSERT_EQ(route_seam.candidate_release_begin_calls, 3);
+	UT_ASSERT_EQ(origin_generation_sample_calls, 1);
+	header = route_seam.raw_send_header;
+	memcpy(page, route_seam.raw_send_page, BLCKSZ);
+	acquires = route_seam.candidate_acquire_begin_calls;
+	UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+	origin_generation_sample_value++;
+	route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+	cluster_gcs_block_test_r4_tx_origin_drain();
+	UT_ASSERT_EQ(origin_generation_sample_calls, 1);
+	UT_ASSERT_EQ(route_seam.candidate_acquire_begin_calls, acquires);
+	UT_ASSERT_EQ(memcmp(page, route_seam.raw_send_page, BLCKSZ), 0);
+	UT_ASSERT_EQ(memcmp(&header, &route_seam.raw_send_header, sizeof(header)), 0);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	cluster_node_id = saved_node;
 }
 
 UT_TEST(test_kind4_origin_selects_generation_for_cold_holder)
@@ -6182,7 +6318,10 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(113);
+	UT_PLAN(116);
+	UT_RUN(test_kind2_requester_asks_origin_to_select_and_lands_exact_status22);
+	UT_RUN(test_kind2_origin_generation_selection_and_strict_known_negatives);
+	UT_RUN(test_kind2_origin_backpressure_does_not_reselect_or_duplicate);
 	UT_RUN(test_kind4_origin_selects_generation_for_cold_holder);
 	UT_RUN(test_kind4_origin_generation_sample_failure_never_publishes_data);
 	UT_RUN(test_01_null_authority_is_protocol);

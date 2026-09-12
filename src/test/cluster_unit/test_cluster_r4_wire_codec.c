@@ -360,20 +360,20 @@ run_wire_vector(int vector)
 			break;
 		case 46:
 			memset(&forward, 0xa5, sizeof(forward));
-			UT_ASSERT(!ClusterR4ForwardExtensionSetLocatorGeneration(
+			UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(
 				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator, UINT32_MAX));
-			UT_ASSERT(bytes_are_zero((const uint8 *)&forward, sizeof(forward)));
+			UT_ASSERT_EQ(ClusterR4WireReadU32(forward.subject_id_le), UINT32_MAX);
+			UT_ASSERT(bytes_are_zero(forward.flags_le, sizeof(forward.flags_le)));
 			break;
 		case 47:
 			ClusterR4ForwardExtensionSetLocator(&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &locator);
 			ClusterR4WireWriteU32(forward.subject_id_le, UINT32_MAX);
 			memset(&decoded_locator, 0xa5, sizeof(decoded_locator));
 			physical_generation = UINT32_C(0xa5a5a5a5);
-			UT_ASSERT(!ClusterR4ForwardExtensionGetLocatorGeneration(
+			UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
 				&forward, CLUSTER_R4_WIRE_TX_RESOLVE, &decoded_locator, &physical_generation));
-			UT_ASSERT(bytes_are_zero((const uint8 *)&decoded_locator,
-									 sizeof(decoded_locator)));
-			UT_ASSERT_EQ(physical_generation, 0);
+			UT_ASSERT_EQ(memcmp(&decoded_locator, &locator, sizeof(locator)), 0);
+			UT_ASSERT_EQ(physical_generation, UINT32_MAX);
 			break;
 		case 48:
 			UT_ASSERT(ClusterR4ForwardExtensionSetLocatorGeneration(

@@ -2624,7 +2624,6 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 	ClusterRuntimeCandidateCleanup cleanup = { &guard, false };
 	ClusterUndoBlock0LogicalKey logical;
 	ClusterUndoBlock0ResolvedRoot root;
-	ClusterUndoBlock0Generation generation;
 	ClusterUndoBlock0Result current_result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
@@ -2640,7 +2639,6 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 	if (reason_out != NULL)
 		*reason_out = reason;
 	memset(&root, 0, sizeof(root));
-	memset(&generation, 0, sizeof(generation));
 	if (locator == NULL || out == NULL || admission == NULL
 		|| (mode != CLUSTER_TX_RESOLVE_VISIBILITY
 			&& mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)) {
@@ -2662,6 +2660,14 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 		reason = CLUSTER_TX_RESOLVE_BAD_UBA;
 		goto done;
 	}
+	/* A foreign SCUR grant does not publish a local header image. Ask the
+	 * exact origin to select and freeze DATA generation under its own guard;
+	 * never transmit a failed local sample's zero as a known generation. */
+	if (origin != (NodeId)cluster_node_id) {
+		outcome = cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
+			(int32)origin, locator, UINT32_MAX, admission->formation_epoch, out, &reason);
+		goto recheck;
+	}
 	logical.owner_instance = (uint8)((uint32)origin + 1);
 	logical.segment_id = segment_id;
 	if (!cluster_runtime_visibility_resolve_root_admitted(
@@ -2678,13 +2684,8 @@ cluster_runtime_visibility_resolve_exact_origin_admitted(
 			!= CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
 			goto candidate_done;
 		held = true;
-		if (origin == (NodeId)cluster_node_id)
-			outcome = cluster_runtime_visibility_resolve_exact_origin_held(
-				locator, mode, admission, NULL, &guard, &root, out, &reason);
-		else if (cluster_undo_block0_current_sample_generation(
-					 &guard, &root, &generation) != CLUSTER_UNDO_BLOCK0_OK
-				 || !generation.known || generation.value == UINT32_MAX)
-			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+		outcome = cluster_runtime_visibility_resolve_exact_origin_held(
+			locator, mode, admission, NULL, &guard, &root, out, &reason);
 
 candidate_done:
 		if (cleanup.active) {
@@ -2704,13 +2705,13 @@ candidate_done:
 
 	if (!held)
 		goto done;
-	if (origin != (NodeId)cluster_node_id) {
-		outcome = cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
-			(int32)origin, locator, generation.value, admission->formation_epoch,
-			out, &reason);
-	}
-	if (outcome != CLUSTER_TX_UNKNOWN
-		&& cluster_runtime_visibility_admission_current(mode, admission)) {
+
+recheck:
+	if (outcome != CLUSTER_TX_UNKNOWN) {
+		if (!cluster_runtime_visibility_admission_current(mode, admission)) {
+			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+			goto done;
+		}
 		if (reason_out != NULL)
 			*reason_out = CLUSTER_TX_RESOLVE_NONE;
 		return outcome;
