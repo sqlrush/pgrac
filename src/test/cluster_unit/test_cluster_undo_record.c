@@ -1869,7 +1869,7 @@ UT_TEST(test_heap_update_applies_required_receipts_before_undo_and_page_mutation
 	if (source == NULL)
 		return;
 	update = strstr(source, "\nheap_update(");
-	update_end = update == NULL ? NULL : strstr(update, "\nheap_lock_tuple(");
+	update_end = update == NULL ? NULL : strstr(update, "\nheap_lock_tuple_internal(");
 	stage = update == NULL ? NULL : strstr(update, "cluster_undo_record_ctrc_stage_pending(");
 	reuse = update == NULL ? NULL : strstr(update, "cluster_heap_ctrc_stage_reusable_itl_receipt(");
 	prepare = update == NULL ? NULL : strstr(update, "cluster_undo_record_ctrc_prepare_pending(");
@@ -2724,7 +2724,7 @@ UT_TEST(test_heap_retry_preserves_exact_ready_before_considering_cancel)
 	{
 		const char *cancel = strstr(source, "cluster_undo_record_cancel_prepared(&undo_receipt)");
 		const char *update = strstr(source, "\nheap_update(");
-		const char *lock = strstr(source, "\nheap_lock_tuple(");
+		const char *lock = strstr(source, "\nheap_lock_tuple_internal(");
 		const char *next
 			= cancel == NULL
 				  ? NULL
