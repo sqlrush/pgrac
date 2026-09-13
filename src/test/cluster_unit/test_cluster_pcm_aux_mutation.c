@@ -4,6 +4,7 @@
 #include "postgres.h"
 
 #include "access/heapam.h"
+#include "access/hio.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "access/visibilitymap.h"
@@ -968,10 +969,12 @@ UT_TEST(actual_pretoast_vm_retry_refreshes_predecessor_before_l2)
 	run_pretoast_vm_bracket();
 }
 
+#include "test_cluster_heap_hio_vm.h"
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(20);
 	UT_RUN(actual_vm_consumer_requalifies_both_stages_without_replaying_clear);
 	UT_RUN(actual_vm_unchanged_clear_is_completed_not_retry);
 	UT_RUN(actual_consumer_rejects_stale_heap_proof_before_restoring_vm);
@@ -984,6 +987,14 @@ main(void)
 	UT_RUN(actual_update_shared_vm_loss_invalidates_both_aliases);
 	UT_RUN(actual_delete_vm_retry_refreshes_tuple_before_l1);
 	UT_RUN(actual_pretoast_vm_retry_refreshes_predecessor_before_l2);
+	UT_RUN(actual_hio_single_relock_carries_no_vm_pin);
+	UT_RUN(actual_hio_pair_relock_carries_neither_vm_alias);
+	UT_RUN(actual_hio_repin_failure_releases_partial_result);
+	UT_RUN(actual_hio_newly_visible_and_frozen_require_exact_maps);
+	UT_RUN(actual_hio_declared_pin_release_and_alias_counts);
+	UT_RUN(actual_hio_disabled_local_and_cancellation_boundaries);
+	UT_RUN(actual_hio_allocation_reads_and_locks_without_incoming_vm_pins);
+	UT_RUN(actual_hio_rejected_candidate_and_frozen_extension_recheck_maps);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

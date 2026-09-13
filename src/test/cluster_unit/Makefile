@@ -2816,6 +2816,8 @@ test_cluster_heap_vm_pretoast.inc: $(top_srcdir)/src/backend/access/heap/heapam.
 	mv $@.tmp $@
 
 test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c unit_test.h \
+		test_cluster_heap_hio_vm.h test_cluster_heap_hio_vm.inc \
+		test_cluster_heap_hio_allocate.inc \
 		test_cluster_heap_vm_insert.inc test_cluster_heap_vm_tuple_lock.inc \
 		test_cluster_heap_vm_update.inc test_cluster_heap_vm_unwind_helpers.inc \
 		test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc \
@@ -2824,6 +2826,21 @@ test_cluster_pcm_aux_mutation: test_cluster_pcm_aux_mutation.c unit_test.h \
 		test_cluster_pcm_aux_page_space.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+test_cluster_heap_hio_vm.inc: $(top_srcdir)/src/backend/access/heap/hio.c Makefile
+	awk '/^cluster_hio_lock_buffer_pair\(/ { print "static void"; emit=1; pair++ } \
+	     /^cluster_hio_vm_repin_enabled\(/ { print "static bool"; emit=1; mode++ } \
+	     /^cluster_hio_release_vm_pins\(/ { print "static void"; emit=1; release++ } \
+	     /^GetVisibilityMapPins\(/ { print "static bool"; emit=1; pins++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (pair != 1 || pins != 1 || mode != 1 || release != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_hio_allocate.inc: $(top_srcdir)/src/backend/access/heap/hio.c Makefile
+	awk '/^RelationGetBufferForTuple\(/ { print "Buffer"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 
 test_cluster_pcm_aux_page_space.inc: $(top_srcdir)/src/backend/storage/page/bufpage.c Makefile
 	awk '/^PageGet(Heap)?FreeSpace\(/ { print "Size"; emit=1; found++ } \

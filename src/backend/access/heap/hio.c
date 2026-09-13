@@ -28,7 +28,9 @@
 #include "access/visibilitymap.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_hw_lease.h"	/* PGRAC: spec-6.12d lease consume */
+#include "cluster/cluster_mode.h"
 #endif
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
@@ -88,6 +90,33 @@ cluster_hio_lock_buffer_pair(Buffer first, Buffer second)
 		LockBuffer(first, BUFFER_LOCK_UNLOCK);
 		LockBuffer(second, BUFFER_LOCK_EXCLUSIVE);
 		LockBuffer(second, BUFFER_LOCK_UNLOCK);
+	}
+}
+
+static bool
+cluster_hio_vm_repin_enabled(Relation relation)
+{
+#ifdef USE_PGRAC_CLUSTER
+	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation);
+#else
+	return false;
+#endif
+}
+
+/* Each distinct caller variable owns one reference, including equal Buffer
+ * values. A repeated pointer is one variable, not another reference. */
+static void
+cluster_hio_release_vm_pins(Buffer *first, Buffer *second)
+{
+	if (first != NULL && BufferIsValid(*first))
+	{
+		ReleaseBuffer(*first);
+		*first = InvalidBuffer;
+	}
+	if (second != NULL && second != first && BufferIsValid(*second))
+	{
+		ReleaseBuffer(*second);
+		*second = InvalidBuffer;
 	}
 }
 
@@ -206,7 +235,7 @@ ReadBufferBI(Relation relation, BlockNumber targetBlock,
 static bool
 GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 					 BlockNumber block1, BlockNumber block2,
-					 Buffer *vmbuffer1, Buffer *vmbuffer2)
+					 Buffer *vmbuffer1, Buffer *vmbuffer2, Buffer frozen_buffer)
 {
 	bool		need_to_pin_buffer1;
 	bool		need_to_pin_buffer2;
@@ -234,6 +263,60 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
 
 	Assert(BufferIsValid(buffer1));
 	Assert(buffer2 == InvalidBuffer || block1 <= block2);
+
+	if (cluster_hio_vm_repin_enabled(relation))
+	{
+		for (;;)
+		{
+			Buffer recent1 = InvalidBuffer;
+			Buffer recent2 = InvalidBuffer;
+			bool need1 = PageIsAllVisible(BufferGetPage(buffer1))
+				|| buffer1 == frozen_buffer;
+			bool need2 = BufferIsValid(buffer2)
+				&& (PageIsAllVisible(BufferGetPage(buffer2)) || buffer2 == frozen_buffer);
+
+			if ((!need1 || visibilitymap_pin_ok(block1, *vmbuffer1))
+				&& (!need2 || visibilitymap_pin_ok(block2, *vmbuffer2)))
+				return released_locks;
+
+			released_locks = true;
+			LockBuffer(buffer1, BUFFER_LOCK_UNLOCK);
+			if (BufferIsValid(buffer2) && buffer2 != buffer1)
+				LockBuffer(buffer2, BUFFER_LOCK_UNLOCK);
+			cluster_hio_release_vm_pins(vmbuffer1, vmbuffer2);
+			CHECK_FOR_INTERRUPTS();
+
+			/* Prepare each map separately. Even a different map's read may
+			 * need remote work, so carry no passive predecessor pin into it. */
+			if (need1)
+			{
+				visibilitymap_pin(relation, block1, vmbuffer1);
+				recent1 = *vmbuffer1;
+				cluster_hio_release_vm_pins(vmbuffer1, NULL);
+			}
+			if (need2)
+			{
+				visibilitymap_pin(relation, block2, vmbuffer2);
+				recent2 = *vmbuffer2;
+				cluster_hio_release_vm_pins(vmbuffer2, NULL);
+			}
+
+			if (BufferIsValid(buffer2) && buffer2 != buffer1)
+				cluster_hio_lock_buffer_pair(buffer1, buffer2);
+			else
+				LockBuffer(buffer1, BUFFER_LOCK_EXCLUSIVE);
+
+			/* Only exact resident repins are legal below heap content locks.
+			 * A newly visible page or retag race takes the full loop again. */
+			need1 = PageIsAllVisible(BufferGetPage(buffer1)) || buffer1 == frozen_buffer;
+			need2 = BufferIsValid(buffer2)
+				&& (PageIsAllVisible(BufferGetPage(buffer2)) || buffer2 == frozen_buffer);
+			if ((!need1 || visibilitymap_pin_recent(relation, block1, recent1, vmbuffer1))
+				&& (!need2 || visibilitymap_pin_ok(block2, *vmbuffer2)
+					|| visibilitymap_pin_recent(relation, block2, recent2, vmbuffer2)))
+				return true;
+		}
+	}
 
 	while (1)
 	{
@@ -598,6 +681,12 @@ RelationGetBufferForTuple(Relation relation, Size len,
 				otherBlock;
 	bool		unlockedTargetBuffer;
 	bool		recheckVmPins;
+	bool		cluster_vm_repin = cluster_hio_vm_repin_enabled(relation);
+
+	/* An UPDATE may pass the old page's VM pin into allocation. It must not
+	 * survive any target read, FSM search, heap wait or relation extension. */
+	if (cluster_vm_repin)
+		cluster_hio_release_vm_pins(vmbuffer, vmbuffer_other);
 
 	len = MAXALIGN(len);		/* be conservative */
 
@@ -713,7 +802,23 @@ loop:
 		 * Checking without the lock creates a risk of getting the wrong
 		 * answer, so we'll have to recheck after acquiring the lock.
 		 */
-		if (otherBuffer == InvalidBuffer)
+		if (cluster_vm_repin)
+		{
+			if (otherBuffer == InvalidBuffer)
+				buffer = ReadBufferBI(relation, targetBlock, RBM_NORMAL, bistate);
+			else if (otherBlock == targetBlock)
+				buffer = otherBuffer;
+			else
+				buffer = ReadBuffer(relation, targetBlock);
+
+			if (otherBuffer == InvalidBuffer || otherBuffer == buffer)
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			else if (otherBlock < targetBlock)
+				cluster_hio_lock_buffer_pair(otherBuffer, buffer);
+			else
+				cluster_hio_lock_buffer_pair(buffer, otherBuffer);
+		}
+		else if (otherBuffer == InvalidBuffer)
 		{
 			/* easy case */
 			buffer = ReadBufferBI(relation, targetBlock, RBM_NORMAL, bistate);
@@ -777,7 +882,8 @@ loop:
 		 */
 		GetVisibilityMapPins(relation, buffer, otherBuffer,
 							 targetBlock, otherBlock, vmbuffer,
-							 vmbuffer_other);
+							 vmbuffer_other,
+							 (options & HEAP_INSERT_FROZEN) ? buffer : InvalidBuffer);
 
 		/*
 		 * Now we can check to see if there's enough free space here. If so,
@@ -824,6 +930,8 @@ loop:
 			LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK);
 			ReleaseBuffer(buffer);
 		}
+		if (cluster_vm_repin)
+			cluster_hio_release_vm_pins(vmbuffer, vmbuffer_other);
 
 		/* Is there an ongoing bulk extension? */
 		if (bistate && bistate->next_free != InvalidBlockNumber)
@@ -899,7 +1007,7 @@ loop:
 	 * do IO while the buffer is locked, so we unlock the page first if IO is
 	 * needed (necessitating checks below).
 	 */
-	if (options & HEAP_INSERT_FROZEN)
+	if ((options & HEAP_INSERT_FROZEN) && !cluster_vm_repin)
 	{
 		Assert(PageGetMaxOffsetNumber(page) == 0);
 
@@ -920,7 +1028,7 @@ loop:
 	 * that another backend used space on this page. We check for that below,
 	 * and retry if necessary.
 	 */
-	recheckVmPins = false;
+	recheckVmPins = cluster_vm_repin;
 	if (unlockedTargetBuffer)
 	{
 		/* released lock on target buffer above */
@@ -969,7 +1077,8 @@ loop:
 	{
 		if (GetVisibilityMapPins(relation, otherBuffer, buffer,
 								 otherBlock, targetBlock, vmbuffer_other,
-								 vmbuffer))
+								 vmbuffer,
+								 (options & HEAP_INSERT_FROZEN) ? buffer : InvalidBuffer))
 			unlockedTargetBuffer = true;
 	}
 
@@ -988,6 +1097,8 @@ loop:
 			if (otherBuffer != InvalidBuffer)
 				LockBuffer(otherBuffer, BUFFER_LOCK_UNLOCK);
 			UnlockReleaseBuffer(buffer);
+			if (cluster_vm_repin)
+				cluster_hio_release_vm_pins(vmbuffer, vmbuffer_other);
 
 			goto loop;
 		}

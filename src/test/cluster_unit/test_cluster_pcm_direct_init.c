@@ -1373,10 +1373,49 @@ UT_TEST(test_vm_clear_observation_uses_existing_pcm_relation_scope)
 	free(heapam);
 }
 
+/* The real HIO tests exercise allocation; this census binds the other
+ * TEMP_LOCK caller to its existing exact repin helper before same-page use. */
+UT_TEST(test_temp_lock_releases_vm_before_nested_work_and_requalifies)
+{
+	char *heapam = read_source(HEAPAM_SOURCE_PATH);
+	const char *start;
+	const char *end;
+	const char *release;
+	const char *nested;
+	const char *same;
+	const char *tokens[] = { "!RelationUsesLocalBuffers(relation)", "vmbuffer = InvalidBuffer;",
+							 "ReleaseBuffer(vmbuffer_new);", "vmbuffer_new = InvalidBuffer;" };
+	size_t i;
+
+	UT_ASSERT_NOT_NULL(heapam);
+	if (heapam == NULL)
+		return;
+	start = strstr(heapam, "TEMP_LOCK is already published.");
+	UT_ASSERT_NOT_NULL(start);
+	if (start == NULL) {
+		free(heapam);
+		return;
+	}
+	end = strstr(start, "#endif");
+	release = strstr(start, "ReleaseBuffer(vmbuffer);");
+	nested = strstr(start, "heap_toast_insert_or_update(");
+	UT_ASSERT(end != NULL && release != NULL && release < end);
+	UT_ASSERT(nested != NULL && end != NULL && end < nested);
+	for (i = 0; i < lengthof(tokens); i++) {
+		const char *match = strstr(start, tokens[i]);
+
+		UT_ASSERT(match != NULL && end != NULL && match < end);
+	}
+	same = strstr(start, "cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);");
+	UT_ASSERT(same != NULL && nested != NULL && nested < same);
+	UT_ASSERT(same != NULL && strstr(same, "pagefree = PageGetHeapFreeSpace(page);") != NULL);
+	free(heapam);
+}
+
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(33);
 	UT_RUN(test_valid_read_miss_proof);
 	UT_RUN(test_valid_extend_proof);
 	UT_RUN(test_valid_vm_and_fsm_proofs);
@@ -1409,6 +1448,7 @@ main(void)
 	UT_RUN(test_aux_repin_replacement_restarts_from_fresh_relation_ref);
 	UT_RUN(test_ordinary_aux_repin_replacement_reaches_heap_retry);
 	UT_RUN(test_vm_clear_observation_uses_existing_pcm_relation_scope);
+	UT_RUN(test_temp_lock_releases_vm_before_nested_work_and_requalifies);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

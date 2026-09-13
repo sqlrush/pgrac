@@ -12479,6 +12479,20 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* TEMP_LOCK is already published. A passive VM pin cannot cross
+		 * nested TOAST or allocation waits: the remote drop may need it. */
+		if (cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation))
+		{
+			if (BufferIsValid(vmbuffer))
+				ReleaseBuffer(vmbuffer);
+			vmbuffer = InvalidBuffer;
+			if (BufferIsValid(vmbuffer_new))
+				ReleaseBuffer(vmbuffer_new);
+			vmbuffer_new = InvalidBuffer;
+		}
+#endif
+
 		/*
 		 * Let the toaster do its thing, if needed.
 		 *
@@ -12578,11 +12592,18 @@ l_pgrac_reacquire:
 				/* We're all done. */
 				break;
 			}
-			/* Acquire VM page pin if needed and we don't have it. */
-			if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
-				visibilitymap_pin(relation, block, &vmbuffer);
-			/* Re-acquire the lock on the old tuple's page. */
-			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation))
+				cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
+			else
+#endif
+			{
+				/* Acquire VM page pin if needed and we don't have it. */
+				if (vmbuffer == InvalidBuffer && PageIsAllVisible(page))
+					visibilitymap_pin(relation, block, &vmbuffer);
+				/* Re-acquire the lock on the old tuple's page. */
+				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			}
 			/* Re-check using the up-to-date free space */
 			pagefree = PageGetHeapFreeSpace(page);
 			if (newtupsize > pagefree ||
