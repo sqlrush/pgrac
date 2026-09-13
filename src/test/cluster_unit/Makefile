@@ -2780,7 +2780,7 @@ test_cluster_heap_vm_insert.inc: $(top_srcdir)/src/backend/access/heap/heapam.c 
 	mv $@.tmp $@
 
 test_cluster_heap_vm_tuple_lock.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^heap_lock_tuple\(/ { in_lock=1 } \
+	awk '/^heap_lock_tuple_internal\(/ { in_lock=1 } \
 	     in_lock && !found && /^\tvm_locked = false;/ { emit=1; found++ } \
 	     emit { print } emit && /^\t}/ { emit=0; complete++ } \
 	     /^}/ { in_lock=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
