@@ -2086,6 +2086,12 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
 		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
+		test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc \
+		test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc \
+		test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc \
+		test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc \
+		test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc \
+		test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc \
 		test_cluster_heap_lock_dispatch.inc test_cluster_heap_vm_lock_entry.inc \
 		test_cluster_heap_vm_insert.inc test_cluster_heap_vm_tuple_lock.inc \
 		test_cluster_heap_vm_update.inc test_cluster_heap_vm_unwind_helpers.inc \
@@ -3924,19 +3930,107 @@ test_cluster_heap_epq_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam
 
 test_cluster_heap_fetch_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_fetch_internal\(/ { print "static bool"; emit=1; found++ } \
-	     /^(heap_fetch|cluster_heap_fetch_waitable)\(/ { print "bool"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	     /^(heap_fetch|cluster_heap_fetch_waitable|cluster_heap_fetch_owned)\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_lock_dispatch.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^heap_lock_tuple\(/ { in_lock=1 } \
+	awk '/^heap_lock_tuple_internal\(/ { in_lock=1 } \
 	     in_lock && !found && /if \(mode == LockTupleKeyShare/ { emit=1; found++ } \
 	     emit { print } emit && /result = HeapTupleSatisfiesUpdateForWriter/ { emit=0; complete++ } \
 	     /^}/ { in_lock=0 } END { if (found != 1 || complete != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/port/libpgport_srv.a -o $@
+test_cluster_heap_lock_output.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple(_internal)?\(/ { in_lock=1 } \
+	     in_lock && /^out_locked:/ { emit=1; found++ } \
+	     emit && /if \(BufferIsValid\(vmbuffer\)\)/ { emit=0; done++ } \
+	     emit { print } /^}/ { in_lock=0 } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_lock_reacquire.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple_internal\(/ { in_lock=1 } \
+	     in_lock && !found && /follow_result = heap_lock_updated_tuple_authoritative/ { ready=1 } \
+	     ready && /(LockBuffer\(\*buffer, BUFFER_LOCK_EXCLUSIVE\)|heap_lock_tuple_buffer\()/ { emit=1; found++ } \
+	     emit && /if \(xmax_infomask_changed/ { emit=0; ready=0; done++ } \
+	     emit { print } /^}/ { in_lock=0 } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_lock_rebind.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_heap_rebind_locked_tuple\(/ { print "void"; emit=1; found++ } \
+	     /^heap_lock_tuple_buffer\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_lock_self.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple_internal\(/ { in_lock=1 } \
+	     in_lock && /^[[:space:]]*cluster_xwait_remote = cluster_xwait_has_remote_evidence/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; found++ } \
+	     emit && /^[[:space:]]*require_sleep = true;/ { emit=0; done++ } \
+	     emit { print } /^}/ { in_lock=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_lock_strength.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^static const int MultiXactStatusLock/ { emit=1; found++ } \
+	     emit { print } emit && /^};/ { emit=0; done++ } \
+	     /^#define TUPLOCK_from_mxstatus/ { print; getline; print; macro++ } \
+	     END { if (found != 1 || done != 1 || macro != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_scan_lifetime.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^(heapgetpage|heap_rescan)\(/ { print "void"; emit=1; found++ } \
+	     /^(initscan|heapgettup_pagemode|heapgettup)\(/ { print "static void"; emit=1; found++ } \
+	     /^(heapgettup_start_page|heapgettup_continue_page)\(/ { print "static Page"; emit=1; found++ } \
+	     /^(heap_getnextslot|heap_getnextslot_tidrange)\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 9) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_scan_consumers.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^(heapam_scan_bitmap_next_block|heapam_scan_bitmap_next_tuple|heapam_scan_sample_next_tuple|SampleHeapTupleVisible)\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_snapshot_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_tuple_satisfies_snapshot\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_index_recheck.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_index_build_range_scan\(/ { in_scan=1 } \
+	     in_scan && /^[[:space:]]*recheck:/ { ready=1 } \
+	     ready && /LockBuffer\(hscan->rs_cbuf, BUFFER_LOCK_SHARE\)/ { emit=1; found++ } \
+	     emit && /switch \(HeapTupleSatisfiesVacuum/ { emit=0; ready=0; done++ } \
+	     emit { print } /^}/ { in_scan=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_index_recapture.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_index_build_range_scan\(/ { in_scan=1 } \
+	     in_scan && /indexIt = tupleIsAlive = false/ { ready=1; next } \
+	     ready && !emit && /^[[:space:]]*}/ { emit=1; found++; next } \
+	     emit { print } emit && /LockBuffer\(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK\)/ { emit=0; ready=0; done++ } \
+	     /^}/ { in_scan=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_copy_entry.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_relation_copy_for_cluster\(/ { in_copy=1 } \
+	     in_copy && /^[[:space:]]*tuple = ExecFetchSlotHeapTuple/ { emit=1; found++ } \
+	     emit && /switch \(HeapTupleSatisfiesVacuum/ { emit=0; done++ } \
+	     emit { print } /^}/ { in_copy=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_copy_exit.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
+	awk '/^heapam_relation_copy_for_cluster\(/ { in_copy=1 } \
+	     in_copy && /isdead = false; \/\* keep compiler quiet/ { ready=1; next } \
+	     ready && !emit && /^[[:space:]]*}/ { emit=1; found++; next } \
+	     emit && /^[[:space:]]*if \(isdead\)/ { emit=0; ready=0; done++ } \
+	     emit { print } /^}/ { in_copy=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 # Compile the actual backend branch, not the unit-only reachability seam.
 test_cluster_r4_hot_reachability.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -3961,9 +4055,9 @@ test_cluster_heap_update_temp_consumer.inc: $(top_srcdir)/src/backend/access/hea
 	mv $@.tmp $@
 
 test_cluster_heap_lock_return_receipt.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^heap_lock_tuple\(/ { in_lock=1 } \
+	awk '/^heap_lock_tuple_internal\(/ { in_lock=1 } \
 	     in_lock && /^out_unlocked:/ { tail=1 } \
-	     tail && /^#ifdef USE_PGRAC_CLUSTER/ { emit=1; found++ } \
+	     tail && /if \(undo_receipt.magic/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; found++ } \
 	     emit { print } emit && /^#endif/ { emit=0; tail=0 } \
 	     /^}/ { in_lock=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@

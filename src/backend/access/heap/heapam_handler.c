@@ -106,6 +106,7 @@ heapam_store_hot_search_result(HeapHotSearchResult *result,
 			break;
 
 		case HEAP_HOT_SEARCH_OWNED_SCRATCH:
+		case HEAP_HOT_SEARCH_OWNED_CURRENT:
 			ExecForceStoreHeapTuple(&result->tuple, slot, false);
 			slot->tts_tid = result->tuple.t_self;
 			slot->tts_tableOid = result->tuple.t_tableOid;
@@ -308,7 +309,8 @@ heapam_index_fetch_tuple_internal(struct IndexFetchTableData *scan,
 											 hscan->xs_cbuf, call_again, all_dead)
 					 == TABLE_INDEX_FETCH_FOUND;
 	if (got_heap_tuple && !IsMVCCSnapshot(snapshot)
-		&& hot_result.kind == HEAP_HOT_SEARCH_BUFFER_BACKED)
+		&& (hot_result.kind == HEAP_HOT_SEARCH_BUFFER_BACKED
+			|| hot_result.kind == HEAP_HOT_SEARCH_OWNED_CURRENT))
 		*call_again = true;
 
 	return got_heap_tuple ? TABLE_INDEX_FETCH_FOUND : TABLE_INDEX_FETCH_NOT_FOUND;
@@ -356,12 +358,35 @@ heapam_fetch_row_version(Relation relation,
 {
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	Buffer		buffer;
+#ifdef USE_PGRAC_CLUSTER
+	PGAlignedBlock owned_row;
+	bool owned = cluster_heap_read_needs_copy(relation);
+#endif
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
 
 	bslot->base.tupdata.t_self = *tid;
-	if (heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer, false))
+	if (
+#ifdef USE_PGRAC_CLUSTER
+		cluster_heap_fetch_owned(relation, snapshot, &bslot->base.tupdata, &buffer, false,
+								 owned ? owned_row.data : NULL, NULL, NULL)
+#else
+		heap_fetch(relation, snapshot, &bslot->base.tupdata, &buffer, false)
+#endif
+		)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		if (owned)
+		{
+			HeapTupleData tuple = bslot->base.tupdata;
+
+			ExecForceStoreHeapTuple(&tuple, slot, false);
+			slot->tts_tid = tuple.t_self;
+			slot->tts_tableOid = tuple.t_tableOid;
+			ReleaseBuffer(buffer);
+			return true;
+		}
+#endif
 		/* store in slot, transferring existing pin */
 		ExecStorePinnedBufferHeapTuple(&bslot->base.tupdata, slot, buffer);
 		slot->tts_tableOid = RelationGetRelid(relation);
@@ -389,6 +414,52 @@ heapam_tuple_satisfies_snapshot(Relation rel, TupleTableSlot *slot,
 	bool		res;
 
 	Assert(TTS_IS_BUFFERTUPLE(slot));
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_read_needs_copy(rel) && !BufferIsValid(bslot->buffer))
+	{
+		HeapTuple owned = bslot->base.tuple;
+		HeapTupleData current;
+		Buffer buffer;
+		Page page;
+		PageHeader header;
+		OffsetNumber off;
+		ItemId lp;
+
+		/* A materialized CURRENT/FULL row has no residency pin. It cannot
+		 * borrow a live page's ITL metadata unless the complete tuple matches. */
+		if (TupIsNull(slot) || !TTS_SHOULDFREE(slot) || owned == NULL
+			|| owned->t_data == NULL || owned->t_len < SizeofHeapTupleHeader
+			|| owned->t_len > BLCKSZ || !ItemPointerIsValid(&owned->t_self)
+			|| !ItemPointerEquals(&slot->tts_tid, &owned->t_self)
+			|| owned->t_tableOid != RelationGetRelid(rel))
+			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("cluster materialized tuple has no exact snapshot recheck identity")));
+		buffer = ReadBuffer(rel, ItemPointerGetBlockNumber(&owned->t_self));
+		LockBuffer(buffer, BUFFER_LOCK_SHARE);
+		page = BufferGetPage(buffer);
+		header = (PageHeader) page;
+		off = ItemPointerGetOffsetNumber(&owned->t_self);
+		if (header->pd_lower < SizeOfPageHeaderData
+			|| header->pd_lower > header->pd_upper
+			|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
+			|| off > PageGetMaxOffsetNumber(page))
+			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("cluster materialized tuple is not present for snapshot recheck")));
+		lp = PageGetItemId(page, off);
+		if (!ItemIdIsNormal(lp) || ItemIdGetLength(lp) != owned->t_len
+			|| ItemIdGetOffset(lp) < header->pd_upper
+			|| (uint32) ItemIdGetOffset(lp) + ItemIdGetLength(lp) > header->pd_special
+			|| memcmp(PageGetItem(page, lp), owned->t_data, owned->t_len) != 0)
+			ereport(ERROR, (errcode(ERRCODE_T_R_SERIALIZATION_FAILURE),
+				errmsg("cluster materialized tuple changed before snapshot recheck")));
+		current = *owned;
+		current.t_data = (HeapTupleHeader) PageGetItem(page, lp);
+		res = HeapTupleSatisfiesVisibility(&current, snapshot, buffer);
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		ReleaseBuffer(buffer);
+		return res;
+	}
+#endif
 	Assert(BufferIsValid(bslot->buffer));
 
 	/*
@@ -542,6 +613,8 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 	ClusterHeapSuccessorProof expected_successor;
 	ClusterHeapSuccessorProof next_successor;
 	uint64 successor_wait_deadline_us = 0;
+	PGAlignedBlock fetched_row;
+	bool owned = cluster_heap_read_needs_copy(relation);
 #endif
 
 	follow_updates = (flags & TUPLE_LOCK_FLAG_LOCK_UPDATE_IN_PROGRESS) != 0;
@@ -555,11 +628,18 @@ heapam_tuple_lock(Relation relation, ItemPointer tid, Snapshot snapshot,
 
 tuple_lock_retry:
 	tuple->t_self = *tid;
-	result = heap_lock_tuple(relation, tuple, cid, mode, wait_policy,
+	result =
+#ifdef USE_PGRAC_CLUSTER
+		cluster_heap_lock_tuple_owned
+#else
+		heap_lock_tuple
+#endif
+		(relation, tuple, cid, mode, wait_policy,
 							 follow_updates, &buffer, tmfd
 #ifdef USE_PGRAC_CLUSTER
 							 , expected_successor.valid ? &expected_successor : NULL
 							 , &next_successor
+							 , owned ? fetched_row.data : NULL
 #endif
 							 );
 
@@ -621,8 +701,9 @@ tuple_lock_retry:
 				tuple->t_self = *tid;
 				if (
 #ifdef USE_PGRAC_CLUSTER
-					cluster_heap_fetch_waitable(relation, &SnapshotDirty, tuple, &buffer, true,
-												&remote_xmax_wait, &remote_wait_locator)
+					cluster_heap_fetch_owned(relation, &SnapshotDirty, tuple, &buffer, true,
+						cluster_heap_read_needs_copy(relation) ? fetched_row.data : NULL,
+						&remote_xmax_wait, &remote_wait_locator)
 #else
 					heap_fetch(relation, &SnapshotDirty, tuple, &buffer, true)
 #endif
@@ -789,6 +870,17 @@ tuple_lock_retry:
 	tuple->t_tableOid = slot->tts_tableOid;
 
 	/* store in slot, transferring existing pin */
+#ifdef USE_PGRAC_CLUSTER
+	if (owned)
+	{
+		HeapTupleData selected = *tuple;
+		ExecForceStoreHeapTuple(&selected, slot, false);
+		slot->tts_tid = selected.t_self;
+		slot->tts_tableOid = RelationGetRelid(relation);
+		ReleaseBuffer(buffer);
+	}
+	else
+#endif
 	ExecStorePinnedBufferHeapTuple(tuple, slot, buffer);
 
 	return result;
@@ -1015,6 +1107,12 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 		HeapTuple	tuple;
 		Buffer		buf;
 		bool		isdead;
+#ifdef USE_PGRAC_CLUSTER
+		HeapTupleData rewrite_current;
+		PGAlignedBlock rewrite_image;
+		TransactionId creation_xmin = InvalidTransactionId;
+		bool temporary_pin = false;
+#endif
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -1066,8 +1164,26 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 
 		tuple = ExecFetchSlotHeapTuple(slot, false, NULL);
 		buf = hslot->buffer;
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_heap_read_needs_copy(OldHeap) && !BufferIsValid(buf))
+		{
+			/* Materialized scan/index output no longer owns a buffer pin.
+			 * Keep the slot allocation intact while vacuum examines current. */
+			rewrite_current = *tuple;
+			creation_xmin = HeapTupleHeaderGetRawXmin(tuple->t_data);
+			buf = ReadBuffer(OldHeap, ItemPointerGetBlockNumber(&tuple->t_self));
+			temporary_pin = true;
+		}
+#endif
 
 		LockBuffer(buf, BUFFER_LOCK_SHARE);
+#ifdef USE_PGRAC_CLUSTER
+		if (temporary_pin)
+		{
+			cluster_heap_rebind_locked_tuple(OldHeap, buf, &rewrite_current, &creation_xmin);
+			tuple = &rewrite_current;
+		}
+#endif
 
 		switch (HeapTupleSatisfiesVacuum(tuple, OldestXmin, buf))
 		{
@@ -1118,7 +1234,18 @@ heapam_relation_copy_for_cluster(Relation OldHeap, Relation NewHeap,
 				break;
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		if (temporary_pin)
+		{
+			cluster_heap_copy_read_tuple(rewrite_image.data, tuple);
+			tuple->t_data = (HeapTupleHeader) rewrite_image.data;
+		}
+#endif
 		LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+#ifdef USE_PGRAC_CLUSTER
+		if (temporary_pin)
+			ReleaseBuffer(buf);
+#endif
 
 		if (isdead)
 		{
@@ -1616,6 +1743,9 @@ heapam_index_build_range_scan(Relation heapRelation,
 			/* do our own time qual check */
 			bool		indexIt;
 			TransactionId xwait;
+#ifdef USE_PGRAC_CLUSTER
+			TransactionId creation_xmin = HeapTupleHeaderGetRawXmin(heapTuple->t_data);
+#endif
 
 	recheck:
 
@@ -1626,6 +1756,10 @@ heapam_index_build_range_scan(Relation heapRelation,
 			 * with HOT-pruning: our pin on the buffer prevents pruning.)
 			 */
 			LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
+#ifdef USE_PGRAC_CLUSTER
+			cluster_heap_rebind_locked_tuple(heapRelation, hscan->rs_cbuf,
+				heapTuple, &creation_xmin);
+#endif
 
 			/*
 			 * The criteria for counting a tuple as live in this block need to
@@ -1837,6 +1971,9 @@ heapam_index_build_range_scan(Relation heapRelation,
 					break;
 			}
 
+#ifdef USE_PGRAC_CLUSTER
+			cluster_heap_scan_capture_tuple(hscan);
+#endif
 			LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
 
 			if (!indexIt)
@@ -1852,7 +1989,11 @@ heapam_index_build_range_scan(Relation heapRelation,
 		MemoryContextReset(econtext->ecxt_per_tuple_memory);
 
 		/* Set up for predicate or expression evaluation */
+#ifdef USE_PGRAC_CLUSTER
+		cluster_heap_scan_store(hscan, slot);
+#else
 		ExecStoreBufferHeapTuple(heapTuple, slot, hscan->rs_cbuf);
+#endif
 
 		/*
 		 * In a partial index, discard tuples that don't satisfy the
@@ -2358,6 +2499,9 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 
 	hscan->rs_cindex = 0;
 	hscan->rs_ntuples = 0;
+#ifdef USE_PGRAC_CLUSTER
+	hscan->rs_owned_kind = 0;
+#endif
 
 	/*
 	 * Ignore any claimed entries past what we think is the end of the
@@ -2389,8 +2533,8 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 
 	/*
 	 * We must hold share lock on the buffer content while examining tuple
-	 * visibility.  Afterwards, however, the tuples we have found to be
-	 * visible are guaranteed good as long as we hold the buffer pin.
+	 * visibility. Native buffers retain their pinned-tuple contract; shared
+	 * cluster buffers instead retain the selected page image before unlock.
 	 */
 	LockBuffer(buffer, BUFFER_LOCK_SHARE);
 
@@ -2453,6 +2597,9 @@ heapam_scan_bitmap_next_block(TableScanDesc scan,
 		}
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	cluster_heap_scan_capture_page(hscan);
+#endif
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 	Assert(ntup <= MaxHeapTuplesPerPage);
@@ -2478,7 +2625,11 @@ heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 		return false;
 
 	targoffset = hscan->rs_vistuples[hscan->rs_cindex];
+#ifdef USE_PGRAC_CLUSTER
+	page = cluster_heap_scan_page(hscan);
+#else
 	page = BufferGetPage(hscan->rs_cbuf);
+#endif
 	lp = PageGetItemId(page, targoffset);
 	Assert(ItemIdIsNormal(lp));
 
@@ -2490,12 +2641,16 @@ heapam_scan_bitmap_next_tuple(TableScanDesc scan,
 	pgstat_count_heap_fetch(scan->rs_rd);
 
 	/*
-	 * Set up the result slot to point to this tuple.  Note that the slot
-	 * acquires a pin on the buffer.
+	 * A shared cluster slot materializes the selected image; a native slot
+	 * retains its buffer pin.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_heap_scan_store(hscan, slot);
+#else
 	ExecStoreBufferHeapTuple(&hscan->rs_ctup,
 							 slot,
 							 hscan->rs_cbuf);
+#endif
 
 	hscan->rs_cindex++;
 
@@ -2566,6 +2721,9 @@ heapam_scan_sample_next_block(TableScanDesc scan, SampleScanState *scanstate)
 		hscan->rs_cbuf = InvalidBuffer;
 		hscan->rs_cblock = InvalidBlockNumber;
 		hscan->rs_inited = false;
+#ifdef USE_PGRAC_CLUSTER
+		hscan->rs_owned_kind = 0;
+#endif
 
 		return false;
 	}
@@ -2596,7 +2754,11 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 	if (!pagemode)
 		LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_SHARE);
 
+#ifdef USE_PGRAC_CLUSTER
+	page = pagemode ? cluster_heap_scan_page(hscan) : BufferGetPage(hscan->rs_cbuf);
+#else
 	page = (Page) BufferGetPage(hscan->rs_cbuf);
+#endif
 	all_visible = PageIsAllVisible(page) &&
 		!scan->rs_snapshot->takenDuringRecovery;
 	maxoffset = PageGetMaxOffsetNumber(page);
@@ -2645,9 +2807,18 @@ heapam_scan_sample_next_tuple(TableScanDesc scan, SampleScanState *scanstate,
 
 			/* Found visible tuple, return it. */
 			if (!pagemode)
+			{
+#ifdef USE_PGRAC_CLUSTER
+				cluster_heap_scan_capture_tuple(hscan);
+#endif
 				LockBuffer(hscan->rs_cbuf, BUFFER_LOCK_UNLOCK);
+			}
 
+#ifdef USE_PGRAC_CLUSTER
+			cluster_heap_scan_store(hscan, slot);
+#else
 			ExecStoreBufferHeapTuple(tuple, slot, hscan->rs_cbuf);
+#endif
 
 			/* Count successfully-fetched tuples as heap fetches */
 			pgstat_count_heap_getnext(scan->rs_rd);

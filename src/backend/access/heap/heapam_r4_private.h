@@ -19,10 +19,13 @@
 #define HEAPAM_R4_PRIVATE_H
 
 #include "access/htup.h"
+#include "access/htup_details.h"
+#include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/tableam.h"
 #include "cluster/cluster_scn.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_tx_enqueue.h"
@@ -33,21 +36,97 @@
 #include "storage/buf_internals.h"
 #include "storage/bufpage.h"
 #include "utils/snapshot.h"
+#include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
 /* Exact remote Dirty wait channel for the built-in successor consumer only. */
 extern bool cluster_heap_fetch_waitable(Relation relation, Snapshot snapshot, HeapTuple tuple,
 										Buffer *userbuf, bool keep_buf, bool *remote_xmax_wait,
 										ClusterTxLocator *remote_wait_locator);
+extern bool cluster_heap_fetch_owned(Relation relation, Snapshot snapshot, HeapTuple tuple,
+									 Buffer *userbuf, bool keep_buf, char storage[BLCKSZ],
+									 bool *remote_xmax_wait, ClusterTxLocator *remote_wait_locator);
 extern bool cluster_heap_wait_successor(const ClusterTxLocator *locator, LockWaitPolicy wait_policy,
 										uint64 *deadline_us);
+extern TM_Result cluster_heap_lock_tuple_owned(Relation relation, HeapTuple tuple,
+	CommandId cid, LockTupleMode mode, LockWaitPolicy wait_policy, bool follow_updates,
+	Buffer *buffer, TM_FailureData *tmfd, const ClusterHeapSuccessorProof *expected_successor,
+	ClusterHeapSuccessorProof *next_successor, char storage[BLCKSZ]);
+extern void cluster_heap_rebind_locked_tuple(Relation relation, Buffer buffer,
+	HeapTuple tuple, TransactionId *creation_xmin);
+
+/* A pin protects the mapping, not tuple byte offsets across GCS installs. */
+static inline bool
+cluster_heap_read_needs_copy(Relation relation)
+{
+	return cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(relation);
+}
+
+static inline void
+cluster_heap_copy_read_tuple(char storage[BLCKSZ], HeapTuple tuple)
+{
+	/* A copied result must be bounded in release builds too. */
+	if (tuple->t_data == NULL || tuple->t_len < SizeofHeapTupleHeader || tuple->t_len > BLCKSZ)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+			errmsg("cluster heap read result exceeds its owned storage")));
+	memcpy(storage, tuple->t_data, tuple->t_len);
+}
+
+static inline void
+cluster_heap_scan_capture_page(HeapScanDesc scan)
+{
+	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
+	{
+		memcpy(scan->rs_owned_page, BufferGetPage(scan->rs_cbuf), BLCKSZ);
+		scan->rs_owned_kind = 1;
+	}
+}
+
+static inline void
+cluster_heap_scan_capture_tuple(HeapScanDesc scan)
+{
+	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
+	{
+		cluster_heap_copy_read_tuple(scan->rs_owned_page, &scan->rs_ctup);
+		scan->rs_ctup.t_data = (HeapTupleHeader) scan->rs_owned_page;
+		scan->rs_owned_kind = 2;
+	}
+}
+
+static inline Page
+cluster_heap_scan_page(HeapScanDesc scan)
+{
+	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
+	{
+		Assert(scan->rs_owned_kind == 1);
+		return (Page) scan->rs_owned_page;
+	}
+	return BufferGetPage(scan->rs_cbuf);
+}
+
+static inline void
+cluster_heap_scan_store(HeapScanDesc scan, TupleTableSlot *slot)
+{
+	if (cluster_heap_read_needs_copy(scan->rs_base.rs_rd))
+	{
+		HeapTupleData selected = scan->rs_ctup;
+
+		Assert(scan->rs_owned_kind != 0);
+		ExecForceStoreHeapTuple(&selected, slot, false);
+		slot->tts_tid = selected.t_self;
+		slot->tts_tableOid = RelationGetRelid(scan->rs_base.rs_rd);
+	}
+	else
+		ExecStoreBufferHeapTuple(&scan->rs_ctup, slot, scan->rs_cbuf);
+}
 #endif
 
 typedef enum HeapHotSearchResultKind
 {
 	HEAP_HOT_SEARCH_NOT_FOUND = 0,
 	HEAP_HOT_SEARCH_BUFFER_BACKED,
-	HEAP_HOT_SEARCH_OWNED_SCRATCH
+	HEAP_HOT_SEARCH_OWNED_SCRATCH,
+	HEAP_HOT_SEARCH_OWNED_CURRENT
 } HeapHotSearchResultKind;
 
 typedef struct HeapHotSearchResult

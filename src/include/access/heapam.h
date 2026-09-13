@@ -99,6 +99,11 @@ typedef struct HeapScanDescData
 	int			rs_cindex;		/* current tuple's index in vistuples */
 	int			rs_ntuples;		/* number of visible tuples on page */
 	OffsetNumber rs_vistuples[MaxHeapTuplesPerPage];	/* their offsets */
+#ifdef USE_PGRAC_CLUSTER
+	/* Private scan result bytes; no shared-memory or persisted layout. */
+	uint8 rs_owned_kind; /* 0 absent, 1 visibility-matched page, 2 selected row */
+	char rs_owned_page[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+#endif
 }			HeapScanDescData;
 typedef struct HeapScanDescData *HeapScanDesc;
 
