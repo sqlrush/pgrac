@@ -29,6 +29,11 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Record bounded metadata for shared MVCC selection misses.
+ */
 #include "postgres.h"
 
 #include "access/bufmask.h"
@@ -4734,6 +4739,92 @@ heap_hot_r4_buffer_tag(Buffer buffer)
 	return tag;
 }
 
+/* Describe only validated header bytes; diagnostics cannot reject a read. */
+static void
+heap_hot_r4_miss_item(Page page, OffsetNumber offnum, char *out, Size size)
+{
+	ItemId item;
+	HeapTupleHeader tuple;
+	ClusterItlSlotData empty_slot = {0};
+	const ClusterItlSlotData *slot = &empty_slot;
+	PageHeader header;
+	Size offset;
+	Size length;
+
+	strlcpy(out, "unavailable", size);
+	if (!heap_hot_r4_scratch_page_valid(page)
+		|| offnum < FirstOffsetNumber || offnum > PageGetMaxOffsetNumber(page))
+		return;
+	header = (PageHeader) page;
+	item = PageGetItemId(page, offnum);
+	offset = ItemIdGetOffset(item);
+	length = ItemIdGetLength(item);
+	if (!ItemIdIsNormal(item))
+	{
+		snprintf(out, size, "lp=%u,off=%zu,len=%zu", item->lp_flags, offset, length);
+		return;
+	}
+	if (length < SizeofHeapTupleHeader || offset < header->pd_upper
+		|| offset > header->pd_special || length > header->pd_special - offset)
+		return;
+	tuple = (HeapTupleHeader) ((char *) page + offset);
+	if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > length)
+		return;
+	if (tuple->t_itl_slot_idx < CLUSTER_ITL_INITRANS_DEFAULT)
+		slot = &ClusterPageGetItlSlots(page)[tuple->t_itl_slot_idx];
+	snprintf(out, size,
+			 "lp=%u,off=%zu,len=%zu,xmin=%u,xmax=%u,ctid=%u/%u,mask=%u/%u,"
+			 "itl=%u,slot_xid=%u,wrap=%u,flags=%u,write=" UINT64_FORMAT
+			 ",commit=" UINT64_FORMAT,
+			 item->lp_flags, offset, length, HeapTupleHeaderGetRawXmin(tuple),
+			 HeapTupleHeaderGetRawXmax(tuple),
+			 ItemPointerGetBlockNumberNoCheck(&tuple->t_ctid),
+			 ItemPointerGetOffsetNumberNoCheck(&tuple->t_ctid),
+			 tuple->t_infomask, tuple->t_infomask2, tuple->t_itl_slot_idx,
+			 slot->xid, slot->wrap, slot->flags,
+			 (uint64) slot->write_scn, (uint64) slot->commit_scn);
+}
+
+/* Inputs are still SHARE-locked or request-owned. No visibility is resolved. */
+static void
+heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
+					const ItemPointerData *root, OffsetNumber last,
+					Page full, bool all_dead)
+{
+	BufferTag tag;
+	Page current;
+	char current_root[256], current_last[256], full_root[256], full_last[256];
+	OffsetNumber root_off = ItemPointerGetOffsetNumber(root);
+
+	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC
+		|| snapshot->cluster_source != SNAPSHOT_SOURCE_CLUSTER
+		|| !SCN_VALID(snapshot->read_scn) || !cluster_storage_mode_enabled()
+		|| RelationUsesLocalBuffers(relation))
+		return;
+	tag = heap_hot_r4_buffer_tag(buffer);
+	current = BufferGetPage(buffer);
+	heap_hot_r4_miss_item(current, root_off, current_root, sizeof(current_root));
+	heap_hot_r4_miss_item(current, last, current_last, sizeof(current_last));
+	heap_hot_r4_miss_item(full, root_off, full_root, sizeof(full_root));
+	heap_hot_r4_miss_item(full, last, full_last, sizeof(full_last));
+	ereport(LOG,
+			(errmsg("R4 heap selection miss"),
+			 errdetail("PGRAC_FAMILY=R4_SELECTION PGRAC_REASON=%s node=%d "
+					   "tag=%u/%u/%u/%d/%u root=%u/%u last=%u "
+					   "read_scn=" UINT64_FORMAT " epoch=" UINT64_FORMAT " all_dead=%d "
+					   "current_lsn=" UINT64_FORMAT " current_scn=" UINT64_FORMAT " "
+					   "full_lsn=" UINT64_FORMAT " full_scn=" UINT64_FORMAT " "
+					   "current_root={%s} current_last={%s} full_root={%s} full_last={%s}",
+					   full != NULL ? "FULL_NOT_FOUND" : "LIVE_NOT_FOUND", cluster_node_id,
+					   tag.spcOid, tag.dbOid, tag.relNumber, tag.forkNum, tag.blockNum,
+					   ItemPointerGetBlockNumber(root), root_off, last,
+					   (uint64) snapshot->read_scn, (uint64) snapshot->read_epoch, all_dead,
+					   (uint64) PageGetLSN(current), (uint64) ((PageHeader) current)->pd_block_scn,
+					   full != NULL ? (uint64) PageGetLSN(full) : 0,
+					   full != NULL ? (uint64) ((PageHeader) full)->pd_block_scn : 0,
+					   current_root, current_last, full_root, full_last)));
+}
+
 /*
  * Drop SHARE before the TARGET fetch and restore it in PG_FINALLY.  A FULL
  * result is decided solely from result->scratch_page.  TARGET_DISABLED is the
@@ -4964,6 +5055,11 @@ restart_live_search:
 				{
 					if (all_dead)
 						*all_dead = false;
+					heap_hot_r4_log_miss(relation, buffer, snapshot, &logical_root,
+						ItemPointerIsValid(&result->tuple.t_self)
+						? ItemPointerGetOffsetNumber(&result->tuple.t_self)
+						: ItemPointerGetOffsetNumber(&logical_root),
+						(Page) result->scratch_page, false);
 					return HEAP_HOT_SEARCH_NOT_FOUND;
 				}
 
@@ -5066,6 +5162,11 @@ restart_live_search:
 	}
 
 	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
+#ifdef USE_PGRAC_CLUSTER
+	if (first_call)
+		heap_hot_r4_log_miss(relation, buffer, snapshot, &logical_root, offnum,
+							NULL, all_dead != NULL && *all_dead);
+#endif
 	return result->kind;
 }
 

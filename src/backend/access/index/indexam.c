@@ -40,6 +40,11 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Report shared MVCC index exhaustion without changing scan results.
+ */
 
 #include "postgres.h"
 
@@ -54,6 +59,9 @@
 #include "catalog/pg_amproc.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_mode.h"
+#endif
 #include "nodes/makefuncs.h"
 #include "pgstat.h"
 #include "storage/bufmgr.h"
@@ -619,6 +627,10 @@ index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
  * Note: caller must check scan->xs_recheck, and perform rechecking of the
  * scan keys if required.  We do not do that here because we don't have
  * enough information to do it efficiently in the general case.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: Record per-call heap fetches on shared MVCC exhaustion.
+ * Why: Distinguish an empty index result from rejected heap candidates.
  * ----------------
  */
 bool
@@ -665,6 +677,10 @@ index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
 bool
 index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *slot)
 {
+#ifdef USE_PGRAC_CLUSTER
+	uint64 fetches_this_call = 0;
+#endif
+
 	for (;;)
 	{
 		if (!scan->xs_heap_continue)
@@ -687,10 +703,30 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
 		 * the index.
 		 */
 		Assert(ItemPointerIsValid(&scan->xs_heaptid));
+#ifdef USE_PGRAC_CLUSTER
+		fetches_this_call++;
+#endif
 		if (index_fetch_heap(scan, slot))
 			return true;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* This is one call's exhaustion, not a statement-level row count. */
+	if (cluster_storage_mode_enabled() && !RelationUsesLocalBuffers(scan->heapRelation)
+		&& scan->xs_snapshot != NULL
+		&& scan->xs_snapshot->snapshot_type == SNAPSHOT_MVCC
+		&& scan->xs_snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER
+		&& SCN_VALID(scan->xs_snapshot->read_scn))
+		ereport(LOG,
+				(errmsg("R4 index selection exhausted"),
+				 errdetail("PGRAC_FAMILY=R4_SELECTION PGRAC_REASON=INDEX_EXHAUSTED "
+						   "node=%d relation=%u index=%u read_scn=" UINT64_FORMAT
+						   " epoch=" UINT64_FORMAT " fetches_this_call=" UINT64_FORMAT,
+						   cluster_node_id, RelationGetRelid(scan->heapRelation),
+						   RelationGetRelid(scan->indexRelation),
+						   (uint64) scan->xs_snapshot->read_scn,
+						   (uint64) scan->xs_snapshot->read_epoch, fetches_this_call)));
+#endif
 	return false;
 }
 

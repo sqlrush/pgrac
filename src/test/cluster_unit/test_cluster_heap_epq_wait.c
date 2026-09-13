@@ -1,9 +1,12 @@
 /* Real, extracted heapam_tuple_lock consumer; only external boundaries are stubs. */
 #include "postgres.h"
 #include "access/heapam.h"
+#include "access/genam.h"
+#include "access/relscan.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "access/tsmapi.h"
+#include "cluster/cluster_mode.h"
 #include "nodes/execnodes.h"
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
@@ -53,6 +56,9 @@ bool synchronize_seqscans;
 static int scan_additional_page;
 static bool self_xid_case;
 static bool rewrite_recheck_case;
+static bool capture_index_log, finishing_index_log;
+static char index_log[512];
+static int index_log_count, index_tids_left, index_fetch_count, index_found_on;
 static void
 clear_test_slot(TupleTableSlot *slot)
 {
@@ -144,6 +150,10 @@ ExceptionalCondition(const char *c, const char *f, int l)
 bool
 errstart(int level, const char *domain)
 {
+	if (capture_index_log && level == LOG) {
+		finishing_index_log = true;
+		return true;
+	}
 	return level >= ERROR;
 }
 bool
@@ -169,6 +179,10 @@ errmsg_internal(const char *fmt, ...)
 void
 errfinish(const char *file, int line, const char *func)
 {
+	if (finishing_index_log) {
+		finishing_index_log = false;
+		return;
+	}
 	if (PG_exception_stack != NULL)
 		siglongjmp(*PG_exception_stack, 1);
 	abort();
@@ -1334,9 +1348,87 @@ UT_TEST(test_scan_result_survives_current_page_relocation)
 }
 
 int
+errdetail(const char *fmt, ...)
+{
+	if (finishing_index_log && strstr(fmt, "PGRAC_FAMILY=R4_SELECTION") != NULL) {
+		va_list args;
+
+		va_start(args, fmt);
+		vsnprintf(index_log, sizeof(index_log), fmt, args);
+		va_end(args);
+		index_log_count++;
+	}
+	return 0;
+}
+
+ItemPointer
+index_getnext_tid(IndexScanDesc scan, ScanDirection direction)
+{
+	if (index_tids_left-- <= 0)
+		return NULL;
+	ItemPointerSet(&scan->xs_heaptid, 17, index_tids_left + 1);
+	return &scan->xs_heaptid;
+}
+
+bool
+index_fetch_heap(IndexScanDesc scan, TupleTableSlot *slot)
+{
+	index_fetch_count++;
+	return index_fetch_count == index_found_on;
+}
+
+#include "test_cluster_index_exhaustion.inc"
+
+UT_TEST(test_index_exhaustion_evidence_distinguishes_no_tid_from_invisible_heap)
+{
+	int scenario;
+
+	for (scenario = 0; scenario < 5; scenario++) {
+		IndexScanDescData scan = { 0 };
+		RelationData heap = { 0 }, index = { 0 };
+		FormData_pg_class form = { 0 };
+		SnapshotData snapshot = { 0 };
+		TupleTableSlot slot = { 0 };
+		bool found;
+
+		heap.rd_id = 9001;
+		heap.rd_rel = &form;
+		form.relpersistence = RELPERSISTENCE_PERMANENT;
+		index.rd_id = 9002;
+		scan.heapRelation = &heap;
+		scan.indexRelation = &index;
+		scan.xs_snapshot = &snapshot;
+		snapshot.snapshot_type = scenario == 4 ? SNAPSHOT_DIRTY : SNAPSHOT_MVCC;
+		snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+		snapshot.read_scn = 1234;
+		snapshot.read_epoch = 9;
+		cluster_enabled = scenario != 3;
+		index_tids_left = scenario == 0 ? 0 : 2;
+		index_found_on = scenario == 2 ? 2 : -1;
+		index_fetch_count = index_log_count = 0;
+		index_log[0] = '\0';
+		capture_index_log = true;
+		found = index_getnext_slot(&scan, ForwardScanDirection, &slot);
+		capture_index_log = false;
+		UT_ASSERT_EQ(found, scenario == 2);
+		UT_ASSERT_EQ(index_fetch_count, scenario == 0 ? 0 : 2);
+		UT_ASSERT_EQ(index_log_count, scenario < 2 ? 1 : 0);
+		if (scenario < 2) {
+			UT_ASSERT(strstr(index_log, "PGRAC_REASON=INDEX_EXHAUSTED") != NULL);
+			UT_ASSERT(strstr(index_log, "read_scn=1234") != NULL);
+			UT_ASSERT(
+				strstr(index_log, scenario == 0 ? "fetches_this_call=0" : "fetches_this_call=2")
+				!= NULL);
+		}
+	}
+	cluster_enabled = false;
+}
+
+int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(34);
+	UT_RUN(test_index_exhaustion_evidence_distinguishes_no_tid_from_invisible_heap);
 	UT_RUN(test_owned_scan_rejects_oversize_before_copy);
 	UT_RUN(test_rewrite_consumer_owns_temporary_pin_and_recaptured_bytes);
 	UT_RUN(test_compatible_self_lock_keeps_owned_output_after_unlock);

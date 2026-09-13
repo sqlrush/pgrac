@@ -4051,7 +4051,12 @@ test_cluster_heap_copy_exit.inc: $(top_srcdir)/src/backend/access/heap/heapam_ha
 	     emit { print } /^}/ { in_copy=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
+test_cluster_index_exhaustion.inc: $(top_srcdir)/src/backend/access/index/indexam.c Makefile
+	awk '/^index_getnext_slot\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_epq_wait: test_cluster_heap_epq_wait.c unit_test.h test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc test_cluster_heap_lock_dispatch.inc test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc test_cluster_heap_copy_entry.inc test_cluster_heap_copy_exit.inc test_cluster_index_exhaustion.inc $(CLUSTER_HOT_BUFPAGE_TEST_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@

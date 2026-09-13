@@ -83,6 +83,10 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 UT_DEFINE_GLOBALS();
 
 static bool ut_capture_error;
+static bool ut_capture_miss_log;
+static bool ut_finishing_miss_log;
+static int ut_miss_log_count;
+static char ut_miss_log[4096];
 static bool ut_pending_writer_route;
 static bool ut_writer_xid_collision;
 static bool ut_lock_selector_fixture;
@@ -92,6 +96,10 @@ static int ut_successor_proof_fault;
 bool
 errstart(int elevel, const char *domain)
 {
+	if (ut_capture_miss_log && elevel == LOG) {
+		ut_finishing_miss_log = true;
+		return true;
+	}
 	return ut_capture_error ? elevel >= ERROR : ut_activation_errstart(elevel, domain);
 }
 
@@ -104,6 +112,10 @@ errstart_cold(int elevel, const char *domain)
 void
 errfinish(const char *filename, int lineno, const char *funcname)
 {
+	if (ut_finishing_miss_log) {
+		ut_finishing_miss_log = false;
+		return;
+	}
 	if (ut_capture_error)
 		pg_re_throw();
 	ut_activation_errfinish(filename, lineno, funcname);
@@ -1807,8 +1819,16 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 }
 
 int
-errdetail(const char *fmt pg_attribute_unused(), ...)
+errdetail(const char *fmt, ...)
 {
+	if (ut_finishing_miss_log && strstr(fmt, "PGRAC_FAMILY=R4_SELECTION") != NULL) {
+		va_list args;
+
+		va_start(args, fmt);
+		vsnprintf(ut_miss_log, sizeof(ut_miss_log), fmt, args);
+		va_end(args);
+		ut_miss_log_count++;
+	}
 	return 0;
 }
 
@@ -3272,7 +3292,71 @@ ut_full_root_absence_case(int scenario)
 
 UT_TEST(test_full_post_snapshot_root_absence_is_not_found)
 {
+	ut_miss_log_count = 0;
+	ut_miss_log[0] = '\0';
+	ut_capture_miss_log = true;
 	ut_full_root_absence_case(0);
+	ut_capture_miss_log = false;
+	UT_ASSERT_EQ(ut_miss_log_count, 1);
+	UT_ASSERT(strstr(ut_miss_log, "PGRAC_REASON=FULL_NOT_FOUND") != NULL);
+	UT_ASSERT(strstr(ut_miss_log, "root=17/1") != NULL);
+	UT_ASSERT(strstr(ut_miss_log, "read_scn=1193046") != NULL);
+	UT_ASSERT(strstr(ut_miss_log, "current_root={lp=1") != NULL);
+	UT_ASSERT(strstr(ut_miss_log, "full_root={lp=0") != NULL);
+}
+
+UT_TEST(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata)
+{
+	int scenario;
+
+	for (scenario = 0; scenario < 4; scenario++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult result;
+		RelationData relation = { 0 };
+		FormData_pg_class form = { 0 };
+		SnapshotData snapshot = { 0 };
+		ItemPointerData tid;
+		PGAlignedBlock before;
+		bool all_dead = true;
+
+		ut_r4_hot_init_product_fixture(&fixture, &result);
+		ItemIdSetUnused(PageGetItemId((Page)fixture.live_page, UT_HOT_ROOT_OFF));
+		if (scenario == 3)
+			((PageHeader)fixture.live_page)->pd_pagesize_version = 0;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		relation.rd_id = UT_HOT_TABLE_OID;
+		relation.rd_rel = &form;
+		form.relpersistence = scenario == 2 ? RELPERSISTENCE_TEMP : RELPERSISTENCE_PERMANENT;
+		snapshot.snapshot_type = scenario == 1 ? SNAPSHOT_DIRTY : SNAPSHOT_MVCC;
+		snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+		snapshot.read_scn = UT_HOT_READ_SCN;
+		snapshot.read_epoch = 9;
+		ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+		ut_miss_log_count = 0;
+		ut_miss_log[0] = '\0';
+		ut_capture_miss_log = true;
+		UT_ASSERT_EQ(heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot,
+												   &result, &all_dead, true),
+					 HEAP_HOT_SEARCH_NOT_FOUND);
+		ut_capture_miss_log = false;
+		UT_ASSERT_EQ(ut_miss_log_count, scenario == 0 || scenario == 3 ? 1 : 0);
+		if (scenario == 0 || scenario == 3) {
+			UT_ASSERT(strstr(ut_miss_log, "PGRAC_REASON=LIVE_NOT_FOUND") != NULL);
+			UT_ASSERT(strstr(ut_miss_log,
+							 scenario == 0 ? "current_root={lp=0" : "current_root={unavailable}")
+					  != NULL);
+		}
+		UT_ASSERT(all_dead); /* Preserve the pre-existing empty-root result. */
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&tid), UT_HOT_ROOT_OFF);
+		UT_ASSERT_EQ(fixture.fetch_calls, 0);
+		UT_ASSERT(ut_hot_content_lock_held);
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+		ut_hot_production_core_active = false;
+		ut_hot_product_fixture = NULL;
+		ut_hot_live_ref_page = NULL;
+		BufferBlocks = NULL;
+	}
 }
 
 UT_TEST(test_full_unused_root_with_nonzero_storage_is_rejected)
@@ -3421,7 +3505,11 @@ ut_full_three_versions_case(int scenario)
 
 UT_TEST(test_real_hot_full_three_versions_select_creator_and_deleter_separately)
 {
+	ut_miss_log_count = 0;
+	ut_capture_miss_log = true;
 	ut_full_three_versions_case(0);
+	ut_capture_miss_log = false;
+	UT_ASSERT_EQ(ut_miss_log_count, 0);
 }
 
 UT_TEST(test_real_hot_full_three_versions_preserve_statement_scn_polarity)
@@ -6687,7 +6775,8 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(130);
+	UT_PLAN(131);
+	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
 	UT_RUN(test_real_hot_full_redirect_and_slotless_creator_still_select_exact_data);
