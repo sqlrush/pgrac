@@ -3749,6 +3749,16 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 
 	slot = &ClusterPageGetItlSlots(page)[itl_idx];
 
+	/* This shortcut derives creator authority from the selected DATA slot.
+	 * After an update or slot reuse the tuple index can name another writer,
+	 * including a local lock owner for a foreign creator. Its UBA/SCN cannot
+	 * authorize native xmin status or a verdict for this tuple. Decline the
+	 * shortcut; the MVCC caller retains its exact creator/history resolver. */
+	if (!TransactionIdIsNormal(HeapTupleHeaderGetRawXmin(tup)) || slot->flags < ITL_FLAG_ACTIVE
+		|| slot->flags > ITL_FLAG_NEEDS_CLEANOUT
+		|| !TransactionIdEquals(slot->xid, HeapTupleHeaderGetRawXmin(tup)))
+		return CLUSTER_CR_NOT_APPLICABLE;
+
 	/* Tier 2 (ITL gate): this tuple's own change is already in the snapshot. */
 	if (!SCN_VALID(slot->write_scn))
 		return CLUSTER_CR_NOT_APPLICABLE;
