@@ -32,7 +32,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
-        test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock \
+        test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse \
         test_cluster_xnode_profile test_cluster_adg \
@@ -324,7 +324,7 @@ TESTS += test_cluster_pcm_aux_mutation
 # objects reference).
 SIMPLE_TESTS = $(filter-out test_cluster_ic_tier1_partial test_cluster_lms_outbound test_cluster_guc test_cluster_shmem test_cluster_signal test_cluster_views test_cluster_gviews test_cluster_ic test_cluster_conf test_cluster_ic_mock test_cluster_inject test_cluster_pgstat test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_smgr test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision test_cluster_scn test_cluster_scn_frontier test_cluster_adg test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_ges test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory test_cluster_terminal_authority test_cluster_retention test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay test_cluster_thread_driver test_cluster_thread_orchestrator test_cluster_write_fence test_cluster_write_fence_durable test_cluster_write_fence_cache test_cluster_stage4_acceptance test_cluster_stage5_integrated_acceptance test_cluster_stage5_beta_acceptance test_cluster_ges_mode test_cluster_sequence test_cluster_shared_catalog test_cluster_hw test_cluster_dl test_cluster_extend_gate test_cluster_recovery_serial test_cluster_ts test_cluster_ko test_cluster_hw_snapshot test_cluster_cf_authority test_cluster_control_root test_cluster_recovery_duty test_cluster_formation_witness test_cluster_cf_storage test_cluster_cf_enqueue test_cluster_cf_phase2 test_cluster_cf_stats test_cluster_hang test_cluster_hang_resolve test_cluster_cr_server_policy test_cluster_touched_peers test_cluster_clean_leave test_cluster_membership test_cluster_node_remove test_cluster_resolver_cache test_cluster_backup test_cluster_hang_acceptance test_cluster_gcs_reqid test_cluster_runtime_visibility test_cluster_xid_stripe test_cluster_mxid_stripe test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_cr test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_cache test_cluster_cr_coordinator test_cluster_cr_key test_cluster_cr_lifecycle test_cluster_cr_pool test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_gcs_block test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_retransmit test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_gcs_dispatch test_cluster_ges_handoff test_cluster_heap_lock_tuple test_cluster_hw_lease test_cluster_ic_envelope test_cluster_ic_router test_cluster_itl_cleanout test_cluster_itl_cleanout_perf test_cluster_itl_reader_real_triple test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_served test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_perf_gates test_cluster_recovery_merge test_cluster_recovery_plan test_cluster_recovery_worker test_cluster_reverse_key test_cluster_sinval test_cluster_sinval_ack test_cluster_snapshot_source test_cluster_stage2_acceptance test_cluster_stage5_5_cr_acceptance test_cluster_subtrans test_cluster_tt_durable test_cluster_tt_slot_allocator test_cluster_tt_status test_cluster_tt_status_hint test_cluster_uba test_cluster_undo_format test_cluster_undo_lifecycle test_cluster_undo_record test_cluster_undo_block0 test_cluster_undo_smgr_publication test_cluster_visibility_decide_scn test_cluster_visibility_fork test_cluster_visibility_inject test_cluster_wal_state test_cluster_wal_thread test_cluster_xnode_lever test_cluster_xnode_profile test_cluster_pi_shadow test_cluster_oid_lease test_cluster_xid_authority test_cluster_recovery_anchor test_cluster_relmap_authority test_cluster_lms_shard test_cluster_gcs_block_dedup test_cluster_gcs_block_shard test_cluster_undo_resid test_cluster_undo_authority test_cluster_undo_gcs test_cluster_undo_verdict test_cluster_vis_undo_verdict_map test_cluster_undo_horizon test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_cr_walk test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order,$(TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_cr_native_origin test_cluster_tt_abort_owner test_cluster_tt_active_owner test_cluster_pcm_aux_consumer test_cluster_pcm_aux_reobserve test_cluster_multixact_current_stats \
-		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock \
+		test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
 		test_cluster_pcm_aux_mutation test_cluster_heap_inplace \
 		test_cluster_resource_x_identity test_cluster_resource_x_node_wire \
 		test_cluster_resource_x_terminal_ingress \
@@ -2088,6 +2088,9 @@ clean distclean maintainer-clean:
 		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
 		test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc \
 		test_cluster_heap_lock_rebind.inc test_cluster_heap_lock_self.inc \
+		test_cluster_heap_update_reacquire.inc test_cluster_heap_delete_owned.inc \
+		test_cluster_heap_update_owned.inc test_cluster_heap_toast_capture.inc \
+		test_cluster_heap_toast_consume.inc \
 		test_cluster_heap_lock_strength.inc test_cluster_heap_scan_lifetime.inc \
 		test_cluster_heap_scan_consumers.inc test_cluster_heap_snapshot_consumer.inc \
 		test_cluster_heap_index_recheck.inc test_cluster_heap_index_recapture.inc \
@@ -4115,6 +4118,54 @@ test_cluster_heap_update_successor_header.inc: $(top_srcdir)/src/backend/access/
 	     emit { print } emit && /HeapTupleHeaderSetXmax\(newtup->t_data, xmax_new_tuple\)/ { emit=0; done++ } \
 	     /^}/ { in_update=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+test_cluster_heap_update_reacquire.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && /^l_pgrac_reacquire:/ { print "if (true) { /* fixture selects the allocation arm */"; emit=1; found++ } \
+	     emit && /We.re about to do the actual update/ { done++; emit=0; pending="" } \
+	     emit { if ($$0 ~ /^\t\/\*$$/) { pending=$$0; next } \
+	            if (pending != "") { print pending; pending="" } print } \
+	     /^}/ { in_update=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# The real unlocked consumers include capture, unlock, use and matching free.
+test_cluster_heap_delete_owned.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_delete\(/ { in_fn=1 } \
+	     in_fn && /if \(cluster_heap_read_needs_copy\(relation\)\)/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; found++ } \
+	     emit { print } emit && /heap_freetuple\(unlocked_tuple\)/ { emit=0; done++ } \
+	     /^}/ { in_fn=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_owned.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_fn=1 } \
+	     in_fn && /if \(cluster_heap_read_needs_copy\(relation\)\)/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; found++ } \
+	     emit { print } emit && /heap_freetuple\(unlocked_old_tuple\)/ { emit=0; done++ } \
+	     /^}/ { in_fn=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_toast_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_fn=1 } \
+	     in_fn && /if \(need_toast && cluster_heap_read_needs_copy\(relation\)\)/ { print "#ifdef USE_PGRAC_CLUSTER"; emit=1; found++ } \
+	     emit { print } emit && /LockBuffer\(buffer, BUFFER_LOCK_UNLOCK\)/ { emit=0; done++ } \
+	     /^}/ { in_fn=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_toast_consume.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_fn=1 } \
+	     in_fn && /heaptup = heap_toast_insert_or_update\(/ { emit=1; found++ } \
+	     emit { print } emit && /newtupsize = MAXALIGN\(heaptup->t_len\)/ { emit=0; done++ } \
+	     /^}/ { in_fn=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_dml_lifetime: test_cluster_heap_dml_lifetime.c unit_test.h \
+		test_cluster_heap_lock_rebind.inc test_cluster_heap_update_reacquire.inc \
+		test_cluster_heap_delete_owned.inc test_cluster_heap_update_owned.inc \
+		test_cluster_heap_toast_capture.inc test_cluster_heap_toast_consume.inc \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_R4_HEAPTUPLE_TEST_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_R4_HEAPTUPLE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
 
 test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@

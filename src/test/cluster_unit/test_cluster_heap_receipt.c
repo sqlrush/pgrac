@@ -46,6 +46,7 @@ extern int heap_receipt_test_error_detail(const ClusterUndoRecordPrepareReceipt 
 extern void heap_receipt_test_current_handoff(void);
 extern void heap_receipt_test_current_mode(uint8 state);
 extern OffsetNumber heap_receipt_test_insert_offset(Page page, HeapTuple tuple);
+extern bool heap_receipt_test_tuple_address(Page page, int leg);
 
 static char heap_receipt_error_detail[4096];
 
@@ -167,6 +168,19 @@ UT_TEST(cleanout_preserves_exact_unpublished_resource_after_prepare_deadline)
 	UT_ASSERT_EQ(memcmp(&receipt, &saved, sizeof(saved)), 0);
 	UT_ASSERT_EQ(receipt_prepare_calls, 1);
 	UT_ASSERT_EQ(receipt_cancel_calls, 0);
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
+UT_TEST(logical_tid_cannot_authorize_another_tuple_address)
+{
+	PGAlignedBlock image;
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcTargetV1 pending;
+	int leg;
+
+	heap_receipt_fixture(image.data, &receipt, &pending);
+	for (leg = 0; leg < 4; leg++)
+		UT_ASSERT_EQ(heap_receipt_test_tuple_address(image.data, leg), leg == 0);
 	cluster_undo_record_cancel_prepared(&receipt);
 }
 
@@ -390,7 +404,8 @@ UT_TEST(insert_undo_target_matches_real_empty_or_reused_line_pointer)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
+	UT_RUN(logical_tid_cannot_authorize_another_tuple_address);
 	UT_RUN(insert_undo_target_matches_real_empty_or_reused_line_pointer);
 	UT_RUN(cleanout_preserves_exact_unpublished_resource_after_prepare_deadline);
 	UT_RUN(final_itl_predecessor_is_captured_from_current_page);

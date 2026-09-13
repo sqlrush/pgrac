@@ -132,6 +132,30 @@ heap_receipt_test_authority_mismatch(void)
 	return cluster_heap_dml_authority_guard_mismatch(1, &probe_guard);
 }
 
+bool heap_receipt_test_tuple_address(Page page, int leg);
+bool
+heap_receipt_test_tuple_address(Page page, int leg)
+{
+	ClusterHeapDmlAuthorityGuard guard;
+	HeapTupleData tuple = { 0 };
+	PGAlignedBlock private_image;
+	ItemId item = PageGetItemId(page, FirstOffsetNumber);
+
+	BufferBlocks = page;
+	tuple.t_data = (HeapTupleHeader)PageGetItem(page, item);
+	tuple.t_len = ItemIdGetLength(item);
+	ItemPointerSet(&tuple.t_self, 44, FirstOffsetNumber);
+	if (leg == 1)
+		tuple.t_data = (HeapTupleHeader)((char *)tuple.t_data + 1);
+	else if (leg == 2)
+		tuple.t_len--;
+	else if (leg == 3) {
+		memcpy(private_image.data, tuple.t_data, tuple.t_len);
+		tuple.t_data = (HeapTupleHeader)private_image.data;
+	}
+	return cluster_heap_dml_authority_guard_capture(1, &tuple, &guard);
+}
+
 static ClusterHeapPreparedUndoTargetPlan probe_plan;
 
 bool

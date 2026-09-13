@@ -5506,6 +5506,19 @@ UT_TEST(test_lock_only_xid_breach_never_asks_fallback_or_changes_page)
 	ut_itl_census_end();
 }
 
+static bool
+ut_writer_wait_with_relation(Buffer buffer, HeapTuple tuple, TransactionId xid,
+							uint16 infomask, TM_Result *result)
+{
+	RelationData relation = { 0 };
+	FormData_pg_class form = { 0 };
+
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	return cluster_heap_test_writer_wait(&relation, buffer, tuple, xid, infomask, result);
+}
+
 UT_TEST(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck)
 {
 	int leg;
@@ -5542,7 +5555,7 @@ UT_TEST(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck)
 		ut_writer_bridge_mutation = leg >= 2 ? leg - 1 : 0;
 		ut_writer_bridge_tuple_pulls = 0;
 		memcpy(before.data, fixture.live_page, BLCKSZ);
-		UT_ASSERT(cluster_heap_test_writer_wait(NULL, 1, &tuple, 1200, tuple.t_data->t_infomask,
+		UT_ASSERT(ut_writer_wait_with_relation(1, &tuple, 1200, tuple.t_data->t_infomask,
 												&result));
 		UT_ASSERT_EQ(result, leg >= 2 ? TM_BeingModified : leg == 1 ? TM_Ok : TM_Deleted);
 		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
@@ -5596,7 +5609,7 @@ UT_TEST(test_target_writer_uses_bit0_exact_wait_and_requalifies_terminal_proof)
 		ut_writer_target_outcome
 			= leg == 1 || leg == 3 || leg == 7 ? CLUSTER_TX_ABORTED : CLUSTER_TX_COMMITTED;
 		memcpy(before.data, fixture.live_page, BLCKSZ);
-		UT_ASSERT(cluster_heap_test_writer_wait(NULL, 1, &tuple, 1200, tuple.t_data->t_infomask,
+		UT_ASSERT(ut_writer_wait_with_relation(1, &tuple, 1200, tuple.t_data->t_infomask,
 												&result));
 		UT_ASSERT_EQ(result, leg >= 4										  ? TM_BeingModified
 							 : ut_writer_target_outcome == CLUSTER_TX_ABORTED ? TM_Ok
@@ -5715,7 +5728,7 @@ UT_TEST(test_pending_writer_enters_unlocked_bridge_without_a_locked_rpc)
 			ut_writer_target_already_terminal = false;
 			ut_writer_target_outcome = leg == 1 ? CLUSTER_TX_ABORTED : CLUSTER_TX_COMMITTED;
 			ut_writer_bridge_mutation = leg >= 2 && leg < 5 ? leg - 1 : 0;
-			UT_ASSERT(cluster_heap_test_writer_wait(NULL, 1, &tuple, 1200, tuple.t_data->t_infomask,
+			UT_ASSERT(ut_writer_wait_with_relation(1, &tuple, 1200, tuple.t_data->t_infomask,
 													&bridge_result));
 			UT_ASSERT_EQ(bridge_result, leg >= 2 && leg < 5 ? TM_BeingModified
 										: leg == 1			? TM_Ok
@@ -5800,7 +5813,7 @@ ut_lock_only_writer_route_case(int negative)
 		ut_writer_target_already_terminal = false;
 		ut_writer_target_outcome = CLUSTER_TX_COMMITTED;
 		ut_writer_bridge_mutation = negative == 7 ? 2 : negative == 8 ? 3 : 0;
-		UT_ASSERT(cluster_heap_test_writer_wait(NULL, UT_HOT_BUFFER, &tuple, 1200,
+		UT_ASSERT(ut_writer_wait_with_relation(UT_HOT_BUFFER, &tuple, 1200,
 												tuple.t_data->t_infomask, &bridge));
 		UT_ASSERT_EQ(bridge, negative >= 7 ? TM_BeingModified : TM_Ok);
 		UT_ASSERT_EQ(ut_itl_wait_calls, 1);

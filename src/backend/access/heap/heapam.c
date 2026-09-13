@@ -707,6 +707,11 @@ cluster_heap_dml_authority_guard_capture(
 		return false;
 	guard->acquisition_epoch = cluster_epoch_get_current();
 	page = BufferGetPage(buffer);
+	if (((PageHeader)page)->pd_lower < SizeOfPageHeaderData
+		|| ((PageHeader)page)->pd_lower > ((PageHeader)page)->pd_upper
+		|| ((PageHeader)page)->pd_upper > ((PageHeader)page)->pd_special
+		|| ((PageHeader)page)->pd_special > BLCKSZ)
+		return false;
 	guard->page_lower = ((PageHeader) page)->pd_lower;
 	guard->page_upper = ((PageHeader) page)->pd_upper;
 	guard->page_special = ((PageHeader) page)->pd_special;
@@ -721,7 +726,11 @@ cluster_heap_dml_authority_guard_capture(
 			|| guard->offnum > PageGetMaxOffsetNumber(page))
 			return false;
 		lp = PageGetItemId(page, guard->offnum);
-		if (!ItemIdIsNormal(lp) || ItemIdGetLength(lp) < SizeofHeapTupleHeader)
+		if (!ItemIdIsNormal(lp) || ItemIdGetLength(lp) < SizeofHeapTupleHeader
+			|| ItemIdGetOffset(lp) < ((PageHeader)page)->pd_upper
+			|| (uint32)ItemIdGetOffset(lp) + ItemIdGetLength(lp) > ((PageHeader)page)->pd_special
+			|| tuple->t_data != (HeapTupleHeader)PageGetItem(page, lp)
+			|| tuple->t_len != ItemIdGetLength(lp))
 			return false;
 		guard->has_tuple = true;
 		guard->line_pointer = *lp;
@@ -9680,6 +9689,7 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	ClusterItlSlotData recycled_slot;
 	char recycled_tuple_header[SizeofHeapTupleHeader];
 	uint8 recycled_slot_index = CLUSTER_ITL_SLOT_UNALLOCATED;
+	TransactionId creation_xmin = HeapTupleHeaderGetRawXmin(tup->t_data);
 
 	if (!cluster_peer_mode_enabled() || !PageHasItl(page))
 		return false;
@@ -9732,6 +9742,7 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 
 		if (evidence == CLUSTER_VIS_EVIDENCE_LOCAL) {
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+			cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 			return false; /* existing resolver proved a genuinely own xid */
 		}
 		if (evidence == CLUSTER_VIS_EVIDENCE_REMOTE) {
@@ -9862,6 +9873,7 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 			if (wait_policy == LockWaitSkip)
 			{
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+				cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 				*res = TM_WouldBlock;
 				return true;
 			}
@@ -9970,6 +9982,7 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 	 */
 cluster_remote_writer_terminal:
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	cluster_heap_rebind_locked_tuple(relation, buffer, tup, &creation_xmin);
 	if (recycled_terminal || target_terminal || target_would_block) {
 		OffsetNumber offset = ItemPointerGetOffsetNumber(&tup->t_self);
 		ClusterUndoTTSlotRef fresh_ref;
@@ -10245,6 +10258,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		have_tuple_lock = false;
 	bool		iscombo;
 	bool		all_visible_cleared = false;
+	HeapTuple	unlocked_tuple = &tp;
 	HeapTuple	old_key_tuple = NULL;	/* replica identity of the tuple */
 	bool		old_key_copied = false;
 #ifdef USE_PGRAC_CLUSTER
@@ -10268,6 +10282,7 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		cluster_itl_undo_ready = false;
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
+	TransactionId creation_xmin = InvalidTransactionId;
 #endif
 
 	Assert(ItemPointerIsValid(tid));
@@ -10332,6 +10347,7 @@ heap_delete(Relation relation, ItemPointer tid,
 
 l1:
 #ifdef USE_PGRAC_CLUSTER
+	cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
 	cluster_current_mx_handled = false;
 	cluster_current_mx_recomposed = false;
 #endif
@@ -10347,6 +10363,9 @@ l1:
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		visibilitymap_pin(relation, block, &vmbuffer);
 		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+		cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
+#endif
 	}
 
 	if (wait)
@@ -10485,6 +10504,9 @@ l1:
 								relation, &(tp.t_self), XLTW_Delete,
 								NULL);
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+				cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
+#endif
 
 				/*
 				 * If xwait had just locked the tuple then some other xact
@@ -10522,6 +10544,9 @@ l1:
 								 LockWaitBlock, &have_tuple_lock);
 			XactLockTableWait(xwait, relation, &(tp.t_self), XLTW_Delete);
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			cluster_heap_rebind_locked_tuple(relation, buffer, &tp, &creation_xmin);
+#endif
 
 			/*
 			 * xwait is done, but if xwait had just locked the tuple then some
@@ -11228,6 +11253,10 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	}
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_read_needs_copy(relation))
+		unlocked_tuple = heap_copytuple(&tp);
+#endif
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 	if (vmbuffer != InvalidBuffer)
@@ -11243,17 +11272,19 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		relation->rd_rel->relkind != RELKIND_MATVIEW)
 	{
 		/* toast table entries should never be recursively toasted */
-		Assert(!HeapTupleHasExternal(&tp));
+		Assert(!HeapTupleHasExternal(unlocked_tuple));
 	}
-	else if (HeapTupleHasExternal(&tp))
-		heap_toast_delete(relation, &tp, false);
+	else if (HeapTupleHasExternal(unlocked_tuple))
+		heap_toast_delete(relation, unlocked_tuple, false);
 
 	/*
 	 * Mark tuple for invalidation from system caches at next command
 	 * boundary. We have to do this before releasing the buffer because we
 	 * need to look at the contents of the tuple.
 	 */
-	CacheInvalidateHeapTuple(relation, &tp, NULL);
+	CacheInvalidateHeapTuple(relation, unlocked_tuple, NULL);
+	if (unlocked_tuple != &tp)
+		heap_freetuple(unlocked_tuple);
 
 	/* Now we can release the buffer */
 	ReleaseBuffer(buffer);
@@ -11342,6 +11373,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	Bitmapset  *modified_attrs;
 	ItemId		lp;
 	HeapTupleData oldtup;
+	HeapTuple	unlocked_old_tuple = &oldtup;
 	HeapTuple	heaptup;
 	HeapTuple	old_key_tuple = NULL;
 	bool		old_key_copied = false;
@@ -11424,6 +11456,7 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	ClusterCtrcReceiptHandle cluster_itl_ctrc_handles[2] = {{0}};
 	uint64		undo_prepare_deadline_us = 0;
 	TransactionId canonical_xid = InvalidTransactionId;
+	TransactionId creation_xmin = InvalidTransactionId;
 	int			cluster_current_mx_undo_diagnostic_budget = 8;
 #endif
 
@@ -11635,6 +11668,8 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 
 l2:
 #ifdef USE_PGRAC_CLUSTER
+	/* A pin retains the block, not the byte offset across a GCS install. */
+	cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
 	cluster_current_mx_handled = false;
 	cluster_current_mx_recomposed = false;
 #endif
@@ -11840,6 +11875,9 @@ l2:
 				checked_lockers = true;
 				locker_remains = remain != 0;
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+				cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
+#endif
 
 				/*
 				 * If xwait had just locked the tuple then some other xact
@@ -11921,6 +11959,9 @@ l2:
 							  XLTW_Update);
 			checked_lockers = true;
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+			cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
+#endif
 
 			/*
 			 * xwait is done, but if xwait had just locked the tuple then some
@@ -12198,6 +12239,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		uint16		infomask_lock_old_tuple,
 					infomask2_lock_old_tuple;
 		bool		cleared_all_frozen = false;
+		HeapTuple	toast_old_tuple = &oldtup;
 #ifdef USE_PGRAC_CLUSTER
 		ClusterHeapCurrentMxExactPublication temp_lock_publication;
 		ClusterHeapNoRetryBoundaryResult temp_lock_boundary_result;
@@ -12477,6 +12519,12 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		if (vm_locked)
 			LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* TOAST reads after unlock; keep its input separate from the mutable
+		 * current tuple that must be rebound after allocation. */
+		if (need_toast && cluster_heap_read_needs_copy(relation))
+			toast_old_tuple = heap_copytuple(&oldtup);
+#endif
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 
 #ifdef USE_PGRAC_CLUSTER
@@ -12531,7 +12579,9 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			}
 #endif
 			/* Note we always use WAL and FSM during updates */
-			heaptup = heap_toast_insert_or_update(relation, newtup, &oldtup, 0);
+			heaptup = heap_toast_insert_or_update(relation, newtup, toast_old_tuple, 0);
+			if (toast_old_tuple != &oldtup)
+				heap_freetuple(toast_old_tuple);
 			newtupsize = MAXALIGN(heaptup->t_len);
 #ifdef USE_PGRAC_CLUSTER
 			if (resume_update_receipt
@@ -12603,6 +12653,9 @@ l_pgrac_reacquire:
 					visibilitymap_pin(relation, block, &vmbuffer);
 				/* Re-acquire the lock on the old tuple's page. */
 				LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+				cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
+#endif
 			}
 			/* Re-check using the up-to-date free space */
 			pagefree = PageGetHeapFreeSpace(page);
@@ -12630,6 +12683,12 @@ l_pgrac_reacquire:
 		newbuf = buffer;
 		heaptup = newtup;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* TEMP_LOCK protects the logical row, not its physical location in a
+	 * newer image. Both same-page and allocation retries converge here. */
+	cluster_heap_rebind_locked_tuple(relation, buffer, &oldtup, &creation_xmin);
+#endif
 
 	/*
 	 * We're about to do the actual update -- check for conflict first, to
@@ -14094,6 +14153,10 @@ l_pgrac_reacquire:
 	}
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_heap_read_needs_copy(relation))
+		unlocked_old_tuple = heap_copytuple(&oldtup);
+#endif
 	if (newbuf != buffer)
 		LockBuffer(newbuf, BUFFER_LOCK_UNLOCK);
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
@@ -14106,7 +14169,9 @@ l_pgrac_reacquire:
 	 * both tuple versions in one call to inval.c so we can avoid redundant
 	 * sinval messages.)
 	 */
-	CacheInvalidateHeapTuple(relation, &oldtup, heaptup);
+	CacheInvalidateHeapTuple(relation, unlocked_old_tuple, heaptup);
+	if (unlocked_old_tuple != &oldtup)
+		heap_freetuple(unlocked_old_tuple);
 
 	/* Now we can release the buffer(s) */
 	if (newbuf != buffer)
