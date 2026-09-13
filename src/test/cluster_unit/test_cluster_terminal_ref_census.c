@@ -1321,18 +1321,27 @@ test_cleaner_terminal_image(Page image, const ClusterCtrcReceipt *receipt,
 {
 	ClusterCtrcItlCleanoutApplyResult apply_result;
 	XLogRecPtr cleanout_lsn;
+	const char *retain_stage = NULL;
 
 #define GenericXLogAbort(state) ((void)image_aborts++)
 #define UnlockReleaseBuffer(buffer) ((void)image_unlocks++)
 #define cluster_semantic_activation_leave(admission) ((void)image_leaves++)
 #define GenericXLogFinish(state) (image_finishes++, (XLogRecPtr)100)
 #include "test_cluster_ctrc_terminal_image.inc"
+	UT_ASSERT_EQ(cleanout_lsn, 100);
+	return true;
+
+/* The extracted image transition now uses the cleaner's common release
+ * boundary. The complete cleaner fixture separately executes that body. */
+itl_retain_locked:
+	UT_ASSERT_STR_EQ(retain_stage, "SLOT_REVALIDATE");
+	UnlockReleaseBuffer(buffer);
+	cluster_semantic_activation_leave(&admission);
+	return false;
 #undef GenericXLogAbort
 #undef UnlockReleaseBuffer
 #undef cluster_semantic_activation_leave
 #undef GenericXLogFinish
-	UT_ASSERT_EQ(cleanout_lsn, 100);
-	return true;
 }
 
 UT_TEST(test_real_cleaner_terminal_image_closes_plain_lock_reference)
