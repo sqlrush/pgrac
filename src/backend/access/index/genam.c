@@ -766,6 +766,33 @@ systable_endscan_ordered(SysScanDesc sysscan)
 	pfree(sysscan);
 }
 
+/* The selected scan row can be materialized, even in a buffer-heap slot.
+ * Keep its allocation separate from the current row used for mutation. */
+typedef struct SysInplaceUpdateState
+{
+	SysScanDesc scan;
+	HeapTupleData tuple;
+	Buffer		buffer;
+	bool		owns_pin;
+} SysInplaceUpdateState;
+
+/* Called after content unlock, including before a conflicting-xid wait.
+ * Keep the owner allocation for the next scan attempt, but no scan or pin. */
+static void
+systable_inplace_update_release(void *arg)
+{
+	SysInplaceUpdateState *inplace = arg;
+
+	if (inplace->owns_pin)
+	{
+		ReleaseBuffer(inplace->buffer);
+		inplace->owns_pin = false;
+	}
+	inplace->buffer = InvalidBuffer;
+	systable_endscan(inplace->scan);
+	inplace->scan = NULL;
+}
+
 /*
  * systable_inplace_update_begin --- update a row "in place" (overwrite it)
  *
@@ -803,9 +830,12 @@ systable_inplace_update_begin(Relation relation,
 {
 	ScanKey		mutable_key = palloc(sizeof(ScanKeyData) * nkeys);
 	int			retries = 0;
-	SysScanDesc scan;
+	SysInplaceUpdateState *inplace = palloc0(sizeof(*inplace));
 	HeapTuple	oldtup;
 	BufferHeapTupleTableSlot *bslot;
+
+	*state = NULL;
+	inplace->buffer = InvalidBuffer;
 
 	/*
 	 * For now, we don't allow parallel updates.  Unlike a regular update,
@@ -842,25 +872,37 @@ systable_inplace_update_begin(Relation relation,
 			elog(ERROR, "giving up after too many tries to overwrite row");
 
 		memcpy(mutable_key, key, sizeof(ScanKeyData) * nkeys);
-		scan = systable_beginscan(relation, indexId, indexOK, snapshot,
+		inplace->scan = systable_beginscan(relation, indexId, indexOK, snapshot,
 								  nkeys, mutable_key);
-		oldtup = systable_getnext(scan);
+		oldtup = systable_getnext(inplace->scan);
 		if (!HeapTupleIsValid(oldtup))
 		{
-			systable_endscan(scan);
+			systable_inplace_update_release(inplace);
+			pfree(inplace);
+			pfree(mutable_key);
 			*oldtupcopy = NULL;
 			return;
 		}
 
-		slot = scan->slot;
+		slot = inplace->scan->slot;
 		Assert(TTS_IS_BUFFERTUPLE(slot));
 		bslot = (BufferHeapTupleTableSlot *) slot;
-	} while (!heap_inplace_lock(scan->heap_rel,
-								bslot->base.tuple, bslot->buffer,
-								(void (*) (void *)) systable_endscan, scan));
+		inplace->tuple = *oldtup;
+		inplace->buffer = bslot->buffer;
+		if (!BufferIsValid(inplace->buffer))
+		{
+			inplace->buffer = ReadBuffer(relation,
+										 ItemPointerGetBlockNumber(&oldtup->t_self));
+			inplace->owns_pin = true;
+		}
+	} while (!heap_inplace_lock(relation, &inplace->tuple, inplace->buffer,
+								systable_inplace_update_release, inplace));
 
-	*oldtupcopy = heap_copytuple(oldtup);
-	*state = scan;
+	/* The lock routine has rebound this working tuple to the current page.
+	 * An intervening inplace update may have changed the selected statistics. */
+	*oldtupcopy = heap_copytuple(&inplace->tuple);
+	*state = inplace;
+	pfree(mutable_key);
 }
 
 /*
@@ -872,15 +914,12 @@ systable_inplace_update_begin(Relation relation,
 void
 systable_inplace_update_finish(void *state, HeapTuple tuple)
 {
-	SysScanDesc scan = (SysScanDesc) state;
-	Relation	relation = scan->heap_rel;
-	TupleTableSlot *slot = scan->slot;
-	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
-	HeapTuple	oldtup = bslot->base.tuple;
-	Buffer		buffer = bslot->buffer;
+	SysInplaceUpdateState *inplace = state;
 
-	heap_inplace_update_and_unlock(relation, oldtup, tuple, buffer);
-	systable_endscan(scan);
+	heap_inplace_update_and_unlock(inplace->scan->heap_rel, &inplace->tuple,
+								   tuple, inplace->buffer);
+	systable_inplace_update_release(inplace);
+	pfree(inplace);
 }
 
 /*
@@ -891,13 +930,9 @@ systable_inplace_update_finish(void *state, HeapTuple tuple)
 void
 systable_inplace_update_cancel(void *state)
 {
-	SysScanDesc scan = (SysScanDesc) state;
-	Relation	relation = scan->heap_rel;
-	TupleTableSlot *slot = scan->slot;
-	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
-	HeapTuple	oldtup = bslot->base.tuple;
-	Buffer		buffer = bslot->buffer;
+	SysInplaceUpdateState *inplace = state;
 
-	heap_inplace_unlock(relation, oldtup, buffer);
-	systable_endscan(scan);
+	heap_inplace_unlock(inplace->scan->heap_rel, &inplace->tuple, inplace->buffer);
+	systable_inplace_update_release(inplace);
+	pfree(inplace);
 }

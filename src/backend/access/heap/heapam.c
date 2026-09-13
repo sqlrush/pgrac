@@ -17756,6 +17756,50 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 	pgstat_count_heap_delete(relation);
 }
 
+/* Re-resolve a selected catalog row only after taking current buffer X.
+ * A stable scan result need not retain either a pin or a physical address.
+ * Superseded selections use the existing catalog rescan, not a mutation of
+ * a replacement row; malformed current bytes remain an error. */
+static bool
+heap_inplace_rebind(Relation relation, Buffer buffer, HeapTuple tuple,
+					TransactionId creation_xmin)
+{
+	Page		page = BufferGetPage(buffer);
+	PageHeader	header = (PageHeader) page;
+	OffsetNumber off = ItemPointerGetOffsetNumber(&tuple->t_self);
+	ItemId		lp;
+	HeapTupleHeader current;
+
+	if (BufferGetBlockNumber(buffer) != ItemPointerGetBlockNumber(&tuple->t_self)
+		|| header->pd_lower < SizeOfPageHeaderData
+		|| header->pd_lower > header->pd_upper
+		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid current page for inplace update")));
+	if (off > PageGetMaxOffsetNumber(page))
+		return false;
+	lp = PageGetItemId(page, off);
+	if (!ItemIdIsNormal(lp))
+		return false;
+	if (ItemIdGetLength(lp) < SizeofHeapTupleHeader
+		|| ItemIdGetOffset(lp) < header->pd_upper
+		|| (uint32) ItemIdGetOffset(lp) + ItemIdGetLength(lp) > header->pd_special)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid current tuple extent for inplace update")));
+	current = (HeapTupleHeader) PageGetItem(page, lp);
+	if (current->t_hoff < SizeofHeapTupleHeader
+		|| current->t_hoff > ItemIdGetLength(lp)
+		|| !TransactionIdIsValid(HeapTupleHeaderGetRawXmin(current)))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid current tuple header for inplace update")));
+	if (!TransactionIdEquals(creation_xmin, HeapTupleHeaderGetRawXmin(current)))
+		return false;
+	tuple->t_data = current;
+	tuple->t_len = ItemIdGetLength(lp);
+	tuple->t_tableOid = RelationGetRelid(relation);
+	return true;
+}
+
 /*
  * heap_inplace_lock - protect inplace update from concurrent heap_update()
  *
@@ -17766,6 +17810,8 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
  * heap_inplace_update_and_unlock(), calling heap_inplace_unlock(), or raising
  * an error.  Otherwise, call release_callback(arg), wait for blocking
  * transactions to end, and return false.
+ * On true return, oldtup_ptr is rebound to the actual current tuple.  Its
+ * HeapTupleData must be distinct from a materialized scan slot's owned row.
  *
  * Since this is intended for system catalogs and SERIALIZABLE doesn't cover
  * DDL, this doesn't guarantee any particular predicate locking.
@@ -17803,11 +17849,21 @@ heap_inplace_lock(Relation relation,
 				  void (*release_callback) (void *), void *arg)
 {
 	HeapTupleData oldtup = *oldtup_ptr; /* minimize diff vs. heap_update() */
+	TransactionId creation_xmin;
 	TM_Result	result;
 	bool		ret;
 #ifdef USE_PGRAC_CLUSTER
 	ClusterCurrentMxOperationState cluster_current_mx_operation = {0};
 #endif
+
+	if (!BufferIsValid(buffer) || !ItemPointerIsValid(&oldtup.t_self)
+		|| oldtup.t_data == NULL || oldtup.t_len < SizeofHeapTupleHeader)
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid selected tuple or buffer for inplace update")));
+	creation_xmin = HeapTupleHeaderGetRawXmin(oldtup.t_data);
+	if (!TransactionIdIsValid(creation_xmin))
+		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid selected tuple creation for inplace update")));
 
 #ifdef USE_ASSERT_CHECKING
 	if (RelationGetRelid(relation) == RelationRelationId)
@@ -17831,6 +17887,13 @@ heap_inplace_lock(Relation relation,
 
 	LockTuple(relation, &oldtup.t_self, InplaceUpdateTupleLock);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (!heap_inplace_rebind(relation, buffer, &oldtup, creation_xmin))
+	{
+		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+		release_callback(arg);
+		ret = false;
+		goto inplace_decided;
+	}
 
 	/*----------
 	 * Interpret HeapTupleSatisfiesUpdate() like heap_update() does, except:
@@ -17944,6 +18007,7 @@ heap_inplace_lock(Relation relation,
 #ifdef USE_PGRAC_CLUSTER
 cluster_current_mx_inplace_decided:
 #endif
+inplace_decided:
 	/*
 	 * GetCatalogSnapshot() relies on invalidation messages to know when to
 	 * take a new snapshot.  COMMIT of xwait is responsible for sending the
@@ -17958,6 +18022,10 @@ cluster_current_mx_inplace_decided:
 		ForgetInplace_Inval();
 		InvalidateCatalogSnapshot();
 	}
+	else
+		/* Publish only while the caller still owns the current content lock.
+		 * The false branch may already have released its input scan tuple. */
+		*oldtup_ptr = oldtup;
 	return ret;
 }
 
