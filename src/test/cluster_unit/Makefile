@@ -4347,6 +4347,8 @@ test_cluster_ctrc_itl_reuse.inc: $(top_srcdir)/src/backend/cluster/cluster_termi
 
 test_cluster_ctrc_itl_reuse: test_cluster_ctrc_itl_reuse.c test_cluster_ctrc_cleaner.c \
 		test_cluster_ctrc_run_pass.inc test_cluster_ctrc_itl_reuse.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_undo_horizon.c \
+		$(top_srcdir)/src/backend/cluster/cluster_uba.c \
 		$(top_srcdir)/src/backend/cluster/cluster_terminal_ref_census.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(top_builddir)/src/common/libpgcommon_srv.a \

@@ -39,6 +39,7 @@
 #include "miscadmin.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_cr.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
@@ -53,11 +54,15 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/cluster_undo_cleaner.h"
+#include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_undo_retention.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 #include "cluster/cluster_undo_segment.h"
 #include "cluster/cluster_uba.h"
+#include "cluster/cluster_xid_stripe.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/backendid.h"
@@ -6955,13 +6960,14 @@ ctrc_cleaner_dependencies_durable(const ClusterSfDepVec *dependencies,
 	return true;
 }
 
-/* A completed plain-lock slot can be reused before its asynchronous receipt
- * is visited. Do not rewrite the successor. Prove absence on the entire exact
- * current page instead; ambiguous incarnations and MX history stay retained.
- * Caller owns the pin and current/content-X throughout this read-only proof. */
+/* A terminal slot can be reused before its asynchronous receipt is visited.
+ * Never rewrite the successor. Plain locks require complete raw-reference
+ * absence; DATA requires a separate below-floor history proof from the caller.
+ * Ambiguous incarnations and MX history stay retained in either case. Caller
+ * owns the pin and current/content-X throughout this read-only page proof. */
 static bool
-ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
-							 const ClusterCtrcTargetV1 *target)
+ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
+							  const ClusterCtrcTargetV1 *target, bool data_history)
 {
 	PageHeader header = (PageHeader)page;
 	const ClusterItlSlotData *slots;
@@ -6974,8 +6980,8 @@ ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
 	unsigned i;
 
 	if (page == NULL || !ctrc_target_exact_itl_valid(key, target)
-		|| target->fork_number != MAIN_FORKNUM || target->itl_class != 2
-		|| !TransactionIdIsNormal(target->itl_xid) || target->itl_slot_wrap == 0
+		|| target->fork_number != MAIN_FORKNUM || target->itl_class != (data_history ? 1 : 2)
+		|| !TransactionIdIsNormal(target->itl_xid) || (!data_history && target->itl_slot_wrap == 0)
 		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT || !PageHasItl(page)
 		|| PageGetPageSize(page) != BLCKSZ
 		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
@@ -7001,6 +7007,14 @@ ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
 		if (slot->flags == ITL_FLAG_FREE) {
 			if (TransactionIdIsValid(slot->xid) || !UBA_is_invalid(slot->undo_segment_head)
 				|| SCN_VALID(slot->commit_scn) || SCN_VALID(slot->write_scn))
+				return false;
+			continue;
+		}
+		/* DATA history uses the same complete ordinary carrier grammar as
+		 * retained page undo. Initial wrap zero is valid; a successor must
+		 * still have strictly advanced the target's own wrap above. */
+		if (data_history) {
+			if (!cluster_undo_history_prior_valid(slot))
 				return false;
 			continue;
 		}
@@ -7040,8 +7054,31 @@ ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
 			|| item_offset != MAXALIGN(item_offset))
 			return false;
 		tuple = (HeapTupleHeader)((char *)page + item_offset);
-		if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > item_length
-			|| HeapTupleHeaderGetRawXmin(tuple) == target->itl_xid)
+		if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > item_length)
+			return false;
+		if (data_history) {
+			bool old_creator = HeapTupleHeaderGetRawXmin(tuple) == target->itl_xid
+							   && !HeapTupleHeaderXminFrozen(tuple);
+			bool old_deleter = (tuple->t_infomask & HEAP_XMAX_INVALID) == 0
+							   && HeapTupleHeaderGetRawXmax(tuple) == target->itl_xid;
+
+			/* MOVED carries a separate xvac identity outside this ordinary
+			 * creator/deleter history proof. Do not retire it implicitly. */
+			if ((tuple->t_infomask & HEAP_MOVED) != 0)
+				return false;
+			if ((tuple->t_infomask & HEAP_XMAX_INVALID) == 0
+				&& (tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+				return false;
+			/* These raw identities still require the original-origin history
+			 * route. Do not retire an unusable current carrier on their behalf.
+			 * No tuple bit or stored xid is changed by this proof. */
+			if ((old_creator || old_deleter)
+				&& (tuple->t_itl_slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
+					|| slots[tuple->t_itl_slot_idx].flags == ITL_FLAG_FREE))
+				return false;
+			continue;
+		}
+		if (HeapTupleHeaderGetRawXmin(tuple) == target->itl_xid)
 			return false;
 		if ((tuple->t_infomask & HEAP_XMAX_INVALID) == 0
 			&& ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0
@@ -7049,6 +7086,60 @@ ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
 			return false;
 	}
 	return true;
+}
+
+static bool
+ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
+							 const ClusterCtrcTargetV1 *target)
+{
+	return ctrc_cleaner_retired_itl_page(page, key, target, false);
+}
+
+/* Only the current ITL/UBA locator is retired here. Logical old xmin/xmax
+ * may remain, so the caller must also prove exact COMMITTED below the
+ * required-member floor. This is never the plain-lock absence shortcut. */
+static bool
+ctrc_cleaner_data_itl_retired(Page page, const ClusterCtrcTxnKeyV1 *key,
+							  const ClusterCtrcTargetV1 *target)
+{
+	return ctrc_cleaner_retired_itl_page(page, key, target, true);
+}
+
+/* No page/content or receipt lock may be held: the local floor samples
+ * ProcArray and the peer fold consumes existing epoch-qualified reports.
+ * Neither elapsed time nor a terminal stamp alone permits this retirement. */
+static bool
+ctrc_cleaner_data_retirement_ready(const ClusterCtrcTxnKeyV1 *key, ClusterCtrcTerminalStatus status,
+								   SCN commit_scn)
+{
+	ClusterUndoHorizonReportView views[CLUSTER_MAX_NODES];
+	ClusterUndoHorizonFloor floor;
+	ClusterUndoHorizonStallReason reason;
+	uint8 required[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES];
+	uint64 epoch;
+	SCN local_floor;
+	int32 blame;
+	int nviews;
+
+	if (key == NULL || status != CTRC_TERMINAL_COMMITTED || !SCN_VALID(commit_scn)
+		|| !cluster_undo_retention_horizon_enabled || !TransactionIdIsNormal(key->xid)
+		|| cluster_cr_native_prehistory_disabled()
+		|| cluster_xid_origin_slot(key->xid) != key->origin_node_id
+		|| cluster_epoch_get_current() != key->cluster_epoch)
+		return false;
+	local_floor = cluster_undo_retention_horizon();
+	nviews = cluster_undo_horizon_sample_views(views, CLUSTER_MAX_NODES);
+	return nviews == CLUSTER_MAX_NODES && cluster_undo_horizon_required_members(required, &epoch)
+		   && epoch == key->cluster_epoch
+		   && cluster_undo_horizon_cluster_floor(
+				  local_floor, views, nviews, required, cluster_node_id, epoch,
+				  (uint64)GetCurrentTimestamp(), (uint32)cluster_lmon_main_loop_interval, &floor,
+				  &reason, &blame)
+				  == CLUSTER_UNDO_HORIZON_FOLD_OK
+		   && SCN_VALID(floor.scn) && floor.epoch == key->cluster_epoch
+		   && scn_time_cmp(commit_scn, floor.scn) < 0
+		   && !cluster_undo_horizon_epoch_fence_tripped(epoch)
+		   && !cluster_cr_native_prehistory_disabled();
 }
 
 /* Absence creates no local WAL. Its existing page WAL must be covered in the
@@ -7905,6 +7996,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	Page image;
 	bool permanent;
 	bool absent;
+	bool data_retired;
 	const char *retain_stage = "FIRST_PAGE_REVALIDATE";
 	ClusterItlSlotData observed_slot = { 0 };
 	XLogRecPtr observed_lsn = InvalidXLogRecPtr;
@@ -7973,12 +8065,19 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	cluster_sf_dep_vec_reset(&first_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &first_dependencies);
 	absent = ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target);
-	if (absent
+	data_retired = ctrc_cleaner_data_itl_retired(page, &receipt->key, &receipt->target);
+	if ((absent || data_retired)
 		&& !ctrc_cleaner_absence_page_dependency(page, &receipt->target, &first_dependencies)) {
 		retain_stage = "FIRST_ABSENCE_DEPENDENCY";
 		goto itl_retain_locked;
 	}
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+	if (data_retired
+		&& !ctrc_cleaner_data_retirement_ready(&receipt->key, terminal_status, commit_scn)) {
+		ReleaseBuffer(buffer);
+		cluster_semantic_activation_leave(&admission);
+		return false;
+	}
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_WAL_DURABILITY);
 	if (!ctrc_cleaner_dependencies_durable(&first_dependencies, &durability)) {
 		ReleaseBuffer(buffer);
@@ -8015,17 +8114,27 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		retain_stage = "SECOND_ABSENCE_DEPENDENCY";
 		goto itl_retain_locked;
 	}
+	if (data_retired
+		&& (!ctrc_cleaner_data_itl_retired(page, &receipt->key, &receipt->target)
+			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,
+													 &final_dependencies))) {
+		retain_stage = "DATA_RETIREMENT_RECHECK";
+		goto itl_retain_locked;
+	}
 	if (memcmp(&first_dependencies, &final_dependencies, sizeof(first_dependencies)) != 0) {
 		retain_stage = "DEPENDENCY_CHANGED";
 		goto itl_retain_locked;
 	}
-	if (absent) {
+	if (absent || data_retired) {
 		/* Already durable, read-only page proof. Never flush a foreign page
 		 * LSN as a local WAL coordinate and never alter its successor. */
 		cleanout_lsn = durability.local_flush_lsn;
 		projection = CTRC_ITL_TARGET_ABSENT;
 		UnlockReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
+		if (data_retired
+			&& !ctrc_cleaner_data_retirement_ready(&receipt->key, terminal_status, commit_scn))
+			return false;
 		goto itl_discharge;
 	}
 	xlog_state = GenericXLogStartLogged(receipt->target.needs_wal);
