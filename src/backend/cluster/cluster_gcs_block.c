@@ -5603,6 +5603,32 @@ typedef struct GcsFreshrefPairExchangeDiagnostic {
 } GcsFreshrefPairExchangeDiagnostic;
 
 static void
+gcs_ordinary_verdict_refusal(const char *phase, int32 origin, BufferTag tag, TransactionId xid,
+							 uint64 epoch, uint64 request_id,
+							 const volatile GcsFreshrefPairExchangeDiagnostic *d,
+							 const ClusterGcsUndoVerdictPage *page)
+{
+	static uint32 emitted;
+
+	if (emitted >= 64)
+		return;
+	emitted++;
+	elog(LOG,
+		 "PGRAC ordinary TT exchange refused: node=%d origin=%d "
+		 "request=" UINT64_FORMAT " xid=%u epoch=" UINT64_FORMAT
+		 " tag=%u/%u/%u/%u/%u phase=%s received=%d status=%d trailer=%d "
+		 "checksum_ok=%d page_sampled=%d xid_echo=" UINT64_FORMAT
+		 " verdict=%u commit_scn=" UINT64_FORMAT " horizon=" UINT64_FORMAT
+		 " detail_budget_exhausted=%d",
+		 cluster_node_id, origin, request_id, xid, epoch, tag.spcOid, tag.dbOid, tag.relNumber,
+		 tag.forkNum, tag.blockNum, phase, d != NULL && d->received, d == NULL ? -1 : d->status,
+		 d != NULL && d->trailer, d == NULL ? -1 : d->checksum_ok, page != NULL,
+		 page == NULL ? UINT64CONST(0) : page->xid_echo, page == NULL ? 0 : (unsigned)page->verdict,
+		 (uint64)(page == NULL ? 0 : page->commit_scn),
+		 (uint64)(page == NULL ? 0 : page->horizon_scn), emitted == 64);
+}
+
+static void
 gcs_freshref_pair_log_refusal(const char *phase, int32 origin, BufferTag tag, TransactionId xid,
 							  SCN proposed_scn, uint64 epoch, uint64 request_id,
 							  const volatile GcsFreshrefPairExchangeDiagnostic *diagnostic)
@@ -5638,6 +5664,7 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 	bool got_reply = false;
 	bool fetched = false;
 	bool freshref_pair = SCN_VALID(freshref_pair_scn);
+	bool ordinary_diagnostic = !freshref_pair && !authoritative && !authority_kind;
 	volatile GcsFreshrefPairExchangeDiagnostic diagnostic = { false, -1, false, -1 };
 
 	if (freshref_pair && (!authoritative || authority_kind))
@@ -5720,7 +5747,7 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 
 			LWLockAcquire(&blk->lock.lock, LW_SHARED);
 			have_reply = slot->in_use && slot->reply_received;
-			if (freshref_pair && have_reply) {
+			if ((freshref_pair || ordinary_diagnostic) && have_reply) {
 				diagnostic.received = true;
 				diagnostic.status = slot->reply_header.status;
 				diagnostic.trailer = slot->reply_undo_trailer_valid;
@@ -5746,7 +5773,7 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 			uint32 expected = slot->reply_header.checksum;
 			uint32 got = gcs_block_compute_checksum(slot->reply_block_data);
 
-			if (freshref_pair)
+			if (freshref_pair || ordinary_diagnostic)
 				diagnostic.checksum_ok = expected == got;
 			if (expected == got) {
 				if (hdr_out != NULL)
@@ -5773,6 +5800,9 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 			gcs_freshref_pair_log_refusal("EXCHANGE_EXCEPTION", dest_node, tag, xid,
 										  freshref_pair_scn, stamped_epoch, request_id,
 										  &diagnostic);
+		if (ordinary_diagnostic)
+			gcs_ordinary_verdict_refusal("EXCHANGE_EXCEPTION", dest_node, tag, xid, stamped_epoch,
+										 request_id, &diagnostic, NULL);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -5781,6 +5811,9 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 	if (freshref_pair && !fetched)
 		gcs_freshref_pair_log_refusal("WIRE_RESULT", dest_node, tag, xid, freshref_pair_scn,
 									  stamped_epoch, request_id, &diagnostic);
+	if (ordinary_diagnostic && !fetched)
+		gcs_ordinary_verdict_refusal("WIRE_RESULT", dest_node, tag, xid, stamped_epoch, request_id,
+									 &diagnostic, NULL);
 
 	return fetched; /* false -> caller keeps the unchanged 53R97 refusal */
 }
@@ -5835,8 +5868,12 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 											  &page, &tt_generation, &authority_scn))
 		return false;
 
-	if (!cluster_vis_undo_verdict_page_usable(&page, xid))
+	if (!cluster_vis_undo_verdict_page_usable(&page, xid)) {
+		if (!authoritative)
+			gcs_ordinary_verdict_refusal("PAGE_BINDING", origin_node, tag, xid, hdr.epoch,
+										 hdr.request_id, NULL, &page);
 		return false;
+	}
 
 	*verdict_out = page;
 	auth_out->origin_epoch = hdr.epoch;

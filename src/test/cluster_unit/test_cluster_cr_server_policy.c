@@ -84,6 +84,8 @@ extern ClusterUndoVerdictKind cluster_cr_server_c0_zero_match_verdict(
 extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
 	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
 	bool authoritative);
+extern const char *cluster_cr_server_test_ordinary_reason(TransactionId xid, uint32 segment_hint,
+														  ClusterUndoVerdictKind *kind);
 extern ClusterUndoVerdictResult cluster_cr_server_test_own_xid_pair_verdict(
 	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
 	SCN proposed_scn);
@@ -1530,10 +1532,82 @@ UT_TEST(test_lms_exact_status22_preempts_legacy_tt_scan_convoy)
 	free(source);
 }
 
+UT_TEST(test_ordinary_diagnostic_preserves_wrong_carrier_exact_commit)
+{
+	ClusterUndoVerdictKind kind;
+	const char *reason;
+
+	c0_reset();
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_resolved_scn = 14780681;
+	c0_matched_segment = 33;
+	c0_matched_slot = 27;
+	c0_did_commit = true;
+	c0_accept_resolved_scn = true;
+	reason = cluster_cr_server_test_ordinary_reason(4269296, 769, &kind);
+	UT_ASSERT_STR_EQ(reason, "COMMITTED_EXACT");
+	UT_ASSERT_EQ(kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(c0_did_commit_calls, 1);
+	UT_ASSERT_EQ(c0_did_abort_calls, 0);
+	UT_ASSERT_EQ(c0_bound_calls, 0);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 0);
+}
+
+UT_TEST(test_ordinary_diagnostic_keeps_refusals_and_no_extra_reads)
+{
+	const ClusterTTDurableResolve cases[]
+		= { CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE, CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP,
+			CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN, CLUSTER_TT_DURABLE_RESOLVED_SCN };
+	const char *reasons[]
+		= { "TT_SCAN_UNAVAILABLE", "TT_AMBIGUOUS", "TT_UNSTAMPED", "CLOG_NOT_TERMINAL" };
+
+	for (int i = 0; i < lengthof(cases); i++) {
+		ClusterUndoVerdictKind kind;
+
+		c0_reset();
+		c0_resolve = cases[i];
+		UT_ASSERT_STR_EQ(cluster_cr_server_test_ordinary_reason(4269296, 769, &kind), reasons[i]);
+		UT_ASSERT_EQ(kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(c0_raw_clog_calls, 0);
+		UT_ASSERT_EQ(c0_procarray_calls, 0);
+		UT_ASSERT_EQ(c0_bound_calls, 0);
+		UT_ASSERT_EQ(c0_did_commit_calls, i == 3 ? 1 : 0);
+		UT_ASSERT_EQ(c0_did_abort_calls, i == 2 ? 1 : 0);
+	}
+}
+
+UT_TEST(test_ordinary_diagnostic_keeps_recycled_bound_and_refusal)
+{
+	ClusterUndoVerdictKind kind;
+
+	c0_reset();
+	c0_retention_ok = true;
+	c0_did_commit = true;
+	UT_ASSERT_STR_EQ(cluster_cr_server_test_ordinary_reason(4269296, 769, &kind),
+					 "COMMITTED_BOUND");
+	UT_ASSERT_EQ(kind, CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
+	UT_ASSERT_EQ(c0_did_commit_calls, 1);
+	c0_reset();
+	cluster_undo_retention_horizon_enabled = false;
+	UT_ASSERT_STR_EQ(cluster_cr_server_test_ordinary_reason(4269296, 769, &kind),
+					 "RETENTION_UNAVAILABLE");
+	UT_ASSERT_EQ(kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_did_commit_calls, 0);
+	c0_reset();
+	c0_retention_ok = true;
+	UT_ASSERT_STR_EQ(cluster_cr_server_test_ordinary_reason(4269296, 769, &kind),
+					 "ZERO_MATCH_CLOG_UNPROVEN");
+	UT_ASSERT_EQ(kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(c0_bound_calls, 1);
+	UT_ASSERT_EQ(c0_did_commit_calls, 1);
+	UT_ASSERT_EQ(c0_did_abort_calls, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -1564,6 +1638,9 @@ main(void)
 	UT_RUN(test_undo_multi_verdict_inline_entry_is_denied_without_serve);
 	UT_RUN(test_r4_cr_build_inline_entry_is_denied_without_serve);
 	UT_RUN(test_lms_exact_status22_preempts_legacy_tt_scan_convoy);
+	UT_RUN(test_ordinary_diagnostic_preserves_wrong_carrier_exact_commit);
+	UT_RUN(test_ordinary_diagnostic_keeps_refusals_and_no_extra_reads);
+	UT_RUN(test_ordinary_diagnostic_keeps_recycled_bound_and_refusal);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

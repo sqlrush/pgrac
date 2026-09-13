@@ -1111,9 +1111,10 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 				vis_scratch_history_first_unproven_logged = true;
 				elog(LOG,
 					 "PGRAC scratch history first unproven: xid=%u writer_xid=%u "
-					 "derived_origin=%d segment=%u ref_epoch=%u epoch=" UINT64_FORMAT " verdict=%d",
+					 "derived_origin=%d segment=%u ref_epoch=%u epoch=" UINT64_FORMAT
+					 " verdict=%d read_scn=" UINT64_FORMAT,
 					 raw_xid, ref.local_xid, origin, (unsigned)ref.undo_segment_id,
-					 ref.cluster_epoch, epoch, (int)historical.kind);
+					 ref.cluster_epoch, epoch, (int)historical.kind, (uint64)read_scn);
 			}
 		}
 		return;

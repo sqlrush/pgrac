@@ -2409,10 +2409,27 @@ cluster_cr_server_local_freshref_c1b_pair_exact(
 	return true;
 }
 
+/* Request-local copies of observations already made by the ordinary proof.
+ * This record is never an authority input and performs no additional reads. */
+typedef struct LmsOrdinaryVerdictDiagnostic {
+	const char *predicate;
+	ClusterTTDurableResolve resolve;
+	SCN resolved_scn;
+	SCN horizon_scn;
+	uint16 matched_segment;
+	uint16 matched_slot;
+	uint16 matched_wrap;
+	bool commit_sampled;
+	bool did_commit;
+	bool abort_sampled;
+	bool did_abort;
+} LmsOrdinaryVerdictDiagnostic;
+
 static LmsOwnXidReason
-lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
-							uint32 expected_tt_slot_id, bool allow_live, uint8 *out_verdict,
-							SCN *out_commit_scn, SCN *out_horizon_scn, uint16 *out_wrap)
+lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_id,
+									 uint32 expected_tt_slot_id, bool allow_live,
+									 uint8 *out_verdict, SCN *out_commit_scn, SCN *out_horizon_scn,
+									 uint16 *out_wrap, LmsOrdinaryVerdictDiagnostic *diagnostic)
 {
 	SCN scn = InvalidScn;
 	SCN horizon = InvalidScn;
@@ -2420,6 +2437,14 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 	uint16 matched_segment = 0;
 	uint16 matched_slot = 0;
 	ClusterTTDurableResolve resolve;
+	LmsOrdinaryVerdictDiagnostic ignored;
+	bool sampled_commit;
+	bool sampled_abort;
+
+	if (diagnostic == NULL)
+		diagnostic = &ignored;
+	memset(diagnostic, 0, sizeof(*diagnostic));
+	diagnostic->predicate = "SCAN_PENDING";
 
 	*out_verdict = 0;
 	*out_commit_scn = InvalidScn;
@@ -2428,6 +2453,11 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 
 	resolve = cluster_tt_slot_durable_resolve_by_xid(xid, CLUSTER_TT_WRAP_ANY, &scn,
 												 &matched_segment, &matched_slot, &wrap);
+	diagnostic->resolve = resolve;
+	diagnostic->resolved_scn = scn;
+	diagnostic->matched_segment = matched_segment;
+	diagnostic->matched_slot = matched_slot;
+	diagnostic->matched_wrap = wrap;
 	switch (resolve) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN: {
 		bool did_commit = TransactionIdDidCommit(xid);
@@ -2438,6 +2468,10 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		bool exact_binding = false;
 		bool exact_live = false;
 		bool terminal_rechecked = false;
+
+		diagnostic->commit_sampled = true;
+		diagnostic->did_commit = did_commit;
+		diagnostic->predicate = "CLOG_NOT_TERMINAL";
 
 		/*
 		 * RESOLVED_SCN is stamped before the CLOG terminal record.  Only an
@@ -2460,6 +2494,8 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 				  && expected_tt_slot_id == (uint32)matched_slot + 1;
 			if (exact_binding) {
 				did_abort = TransactionIdDidAbort(xid);
+				diagnostic->abort_sampled = true;
+				diagnostic->did_abort = did_abort;
 				if (!did_abort)
 					xid_is_in_progress = TransactionIdIsInProgress(xid);
 
@@ -2517,6 +2553,7 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		}
 	}
 		if (cluster_cr_accept_resolved_scn(scn)) {
+			diagnostic->predicate = "COMMITTED_EXACT";
 			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
 			*out_commit_scn = scn;
 			*out_wrap = wrap;
@@ -2545,10 +2582,13 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		 * the single-xid serve and each multi member-verdict resolve through
 		 * exactly this bound -- no serve forks on the wrap-suspect leg.
 		 */
+		diagnostic->predicate = "RETENTION_UNAVAILABLE";
 		if (!lms_own_xid_recycle_bound(&horizon))
 			return LMS_OWN_XID_REFUSE_OTHER;
 		if (scn_time_cmp(scn, horizon) > 0)
 			horizon = scn;
+		diagnostic->horizon_scn = horizon;
+		diagnostic->predicate = "COMMITTED_BOUND";
 		*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
 		*out_horizon_scn = horizon;
 		return LMS_OWN_XID_PROVEN;
@@ -2654,21 +2694,36 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 			if (c0_hard_refuse)
 				return LMS_OWN_XID_REFUSE_ZERO_MATCH;
 		}
+		diagnostic->predicate = "RETENTION_UNAVAILABLE";
 		if (!lms_own_xid_recycle_bound(&horizon))
 			return LMS_OWN_XID_REFUSE_OTHER;
-		if (TransactionIdDidCommit(xid)) {
+		diagnostic->horizon_scn = horizon;
+		diagnostic->commit_sampled = true;
+		sampled_commit = TransactionIdDidCommit(xid);
+		diagnostic->did_commit = sampled_commit;
+		if (sampled_commit) {
+			diagnostic->predicate = "COMMITTED_BOUND";
 			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
 			*out_horizon_scn = horizon;
 			return LMS_OWN_XID_PROVEN;
 		}
-		if (TransactionIdDidAbort(xid)) {
+		diagnostic->abort_sampled = true;
+		sampled_abort = TransactionIdDidAbort(xid);
+		diagnostic->did_abort = sampled_abort;
+		if (sampled_abort) {
+			diagnostic->predicate = "ABORTED";
 			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
 			return LMS_OWN_XID_PROVEN;
 		}
+		diagnostic->predicate = "ZERO_MATCH_CLOG_UNPROVEN";
 		return LMS_OWN_XID_REFUSE_ZERO_MATCH; /* neither explicit CLOG state -> refuse */
 
 	case CLUSTER_TT_DURABLE_XID_MATCH_INVALID_SCN:
-		if (cluster_cr_server_invalid_scn_verdict(TransactionIdDidAbort(xid))
+		diagnostic->abort_sampled = true;
+		sampled_abort = TransactionIdDidAbort(xid);
+		diagnostic->did_abort = sampled_abort;
+		diagnostic->predicate = "TT_UNSTAMPED";
+		if (cluster_cr_server_invalid_scn_verdict(sampled_abort)
 			== CLUSTER_CR_INVALID_SCN_ABORTED) {
 			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
 			return LMS_OWN_XID_PROVEN_UPGRADE;
@@ -2676,13 +2731,49 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 		return LMS_OWN_XID_REFUSE_INVALID_SCN;
 
 	case CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP:
+		diagnostic->predicate = "TT_AMBIGUOUS";
+		return LMS_OWN_XID_REFUSE_OTHER;
 	case CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE:
+		diagnostic->predicate = "TT_SCAN_UNAVAILABLE";
+		return LMS_OWN_XID_REFUSE_OTHER;
 	default:
+		diagnostic->predicate = "TT_UNKNOWN_RESULT";
 		return LMS_OWN_XID_REFUSE_OTHER;
 	}
 }
 
+static LmsOwnXidReason
+lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
+							uint32 expected_tt_slot_id, bool allow_live, uint8 *out_verdict,
+							SCN *out_commit_scn, SCN *out_horizon_scn, uint16 *out_wrap)
+{
+	return lms_resolve_own_xid_verdict_observed(xid, expected_segment_id, expected_tt_slot_id,
+												allow_live, out_verdict, out_commit_scn,
+												out_horizon_scn, out_wrap, NULL);
+}
+
 #ifdef USE_CLUSTER_UNIT
+const char *
+cluster_cr_server_test_ordinary_reason(TransactionId xid, uint32 segment_hint,
+									   ClusterUndoVerdictKind *kind)
+{
+	uint8 verdict = 0;
+	SCN commit_scn = InvalidScn;
+	SCN horizon_scn = InvalidScn;
+	uint16 wrap = 0;
+	LmsOrdinaryVerdictDiagnostic diagnostic;
+
+	(void)lms_resolve_own_xid_verdict_observed(xid, segment_hint, 0, false, &verdict, &commit_scn,
+											   &horizon_scn, &wrap, &diagnostic);
+	*kind
+		= verdict == CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT ? CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+		  : verdict == CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON
+			  ? CLUSTER_UNDO_VERDICT_COMMITTED_BOUND
+		  : verdict == CLUSTER_GCS_UNDO_VERDICT_ABORTED ? CLUSTER_UNDO_VERDICT_ABORTED
+														: CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+	return diagnostic.predicate;
+}
+
 /* Execute the real static resolver from the focused C0 fixture. */
 ClusterUndoVerdictKind
 cluster_cr_server_test_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
@@ -2848,6 +2939,35 @@ lms_freshref_pair_log_refusal(const ClusterLmsCrSlot *slot, const char *phase,
  *	page truncated under an old xid, an unreadable segment, or any other
  *	throw becomes a refusal, never an LMS exit.
  */
+/* Separate budget: pre-commit authoritative probes cannot hide a refused
+ * ordinary history query.  No additional authority reads in this logger. */
+static void
+lms_ordinary_verdict_refusal(const ClusterLmsCrSlot *slot, const char *predicate,
+							 const LmsOrdinaryVerdictDiagnostic *d, int sqlerrcode)
+{
+	static uint32 emitted;
+
+	if (slot->req_kind != CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT || slot->undo_authoritative
+		|| slot->undo_owner >= 0 || SCN_VALID(slot->read_scn)
+		|| !lms_freshref_pair_detail_admit(&emitted))
+		return;
+	elog(LOG,
+		 "PGRAC ordinary TT refused: node=%d requester=%d backend=%d "
+		 "request=" UINT64_FORMAT " xid=%u segment=%u slot=%u epoch=" UINT64_FORMAT
+		 " predicate=%s sqlerrcode=%d scan_sampled=%d scan=%d matched_segment=%u "
+		 "matched_slot=%u matched_wrap=%u resolved=" UINT64_FORMAT
+		 " commit_sampled=%d did_commit=%d abort_sampled=%d did_abort=%d "
+		 "horizon=" UINT64_FORMAT " authority_scn=" UINT64_FORMAT " detail_budget_exhausted=%d",
+		 cluster_node_id, slot->requester_node, slot->requester_backend, slot->request_id,
+		 slot->undo_xid, slot->undo_segment_id, slot->undo_block_no, slot->epoch, predicate,
+		 sqlerrcode, d != NULL, d == NULL ? -1 : (int)d->resolve,
+		 d == NULL ? 0 : d->matched_segment, d == NULL ? 0 : d->matched_slot,
+		 d == NULL ? 0 : d->matched_wrap, (uint64)(d == NULL ? 0 : d->resolved_scn),
+		 d != NULL && d->commit_sampled, d != NULL && d->did_commit, d != NULL && d->abort_sampled,
+		 d != NULL && d->did_abort, (uint64)(d == NULL ? 0 : d->horizon_scn),
+		 (uint64)slot->undo_auth.authority_scn, emitted == 64);
+}
+
 static bool
 lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 {
@@ -2865,15 +2985,18 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	bool zero_epoch_current = false;
 	ClusterSemanticAdmissionToken zero_epoch_admission;
 	volatile LmsFreshrefPairDiagnostic pair_diagnostic;
+	LmsOrdinaryVerdictDiagnostic ordinary_diagnostic;
 	LmsOwnXidReason reason;
 
 	memset(&zero_epoch_admission, 0, sizeof(zero_epoch_admission));
 	memset((void *)&pair_diagnostic, 0, sizeof(pair_diagnostic));
+	memset(&ordinary_diagnostic, 0, sizeof(ordinary_diagnostic));
 
 	if (!cluster_crossnode_runtime_visibility)
 		return false;
 	if (!TransactionIdIsNormal(xid)) {
 		cluster_vis53r97_note_srv_other();
+		lms_ordinary_verdict_refusal(slot, "BAD_XID", NULL, 0);
 		lms_freshref_pair_log_refusal(slot, "ENTRY", "BAD_XID", NULL);
 		return false;
 	}
@@ -2898,6 +3021,7 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	 */
 	if (!slot->undo_authoritative && !cluster_xid_is_mine(xid)) {
 		cluster_vis53r97_note_srv_other();
+		lms_ordinary_verdict_refusal(slot, "ORIGIN_NOT_OWNED", NULL, 0);
 		return false;
 	}
 
@@ -2953,9 +3077,9 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 				xid, slot->undo_segment_id, slot->undo_block_no, slot->read_scn, &verdict,
 				&commit_scn, &horizon_scn, &wrap, &pair_diagnostic);
 		else
-		reason = lms_resolve_own_xid_verdict(
-			xid, slot->undo_segment_id, slot->undo_block_no,
-			slot->undo_authoritative, &verdict, &commit_scn, &horizon_scn, &wrap);
+			reason = lms_resolve_own_xid_verdict_observed(
+				xid, slot->undo_segment_id, slot->undo_block_no, slot->undo_authoritative, &verdict,
+				&commit_scn, &horizon_scn, &wrap, &ordinary_diagnostic);
 	}
 	if (freshref_pair) {
 		uint64 exit_epoch = cluster_epoch_get_current();
@@ -2973,6 +3097,9 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 			return false;
 		}
 	}
+	if (!freshref_pair && reason != LMS_OWN_XID_PROVEN && reason != LMS_OWN_XID_PROVEN_UPGRADE
+		&& reason != LMS_OWN_XID_PROVEN_IN_PROGRESS)
+		lms_ordinary_verdict_refusal(slot, ordinary_diagnostic.predicate, &ordinary_diagnostic, 0);
 	switch (reason) {
 	case LMS_OWN_XID_PROVEN:
 		break;
@@ -3326,9 +3453,12 @@ cr_serve_slot(ClusterLmsCrSlot *slot)
 			PG_CATCH();
 			{
 				/* Fail-closed serve; keep the worker/LMS alive. */
+				int sqlerrcode = geterrcode();
+
 				served = false;
 				MemoryContextSwitchTo(TopMemoryContext);
 				FlushErrorState();
+				lms_ordinary_verdict_refusal(slot, "CORE_EXCEPTION", NULL, sqlerrcode);
 				if (slot->req_kind == (uint8)CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT)
 					lms_freshref_pair_log_refusal(slot, "EXCEPTION", "CORE_EXCEPTION", NULL);
 			}
