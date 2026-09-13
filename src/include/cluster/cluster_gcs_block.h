@@ -2442,6 +2442,8 @@ extern ClusterTxOutcome cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
 extern void cluster_gcs_block_r4_tx_resolve_drain(void);
 extern bool cluster_gcs_block_r4_tx_resolve_active(void);
+/* Process-local diagnostic snapshot; never supplies authority or advances work. */
+extern int cluster_gcs_block_r4_tx_resolve_pending_detail(char *out, Size capacity);
 #define CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS 1
 static inline long
 cluster_gcs_block_r4_tx_resolve_wait_timeout_for_count(long idle_timeout_ms,

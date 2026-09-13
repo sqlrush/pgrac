@@ -72,6 +72,7 @@ extern bool cluster_gcs_block_test_r4_forward96(const ClusterICEnvelope *env,
 											 const void *payload);
 extern int cluster_gcs_block_test_r4_tx_origin_context_count(void);
 extern void cluster_gcs_block_test_r4_tx_origin_drain(void);
+extern int cluster_gcs_block_r4_tx_resolve_pending_detail(char *out, Size capacity);
 extern bool cluster_gcs_block_test_current_mx_forward128(
 	const ClusterICEnvelope *env, const void *payload);
 extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
@@ -5846,11 +5847,31 @@ UT_TEST(test_kind2_origin_capacity_covers_three_remote_c32_bursts)
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 96);
 	UT_ASSERT_EQ(route_seam.enter_calls, 96);
 	UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+	{
+		char detail[768];
+		char truncated[1] = { 'x' };
+
+		UT_ASSERT_EQ(cluster_gcs_block_r4_tx_resolve_pending_detail(detail, sizeof(detail)), 96);
+		UT_ASSERT(strstr(detail, "active=96") != NULL);
+		UT_ASSERT(strstr(detail, "guards=0") != NULL);
+		UT_ASSERT_EQ(cluster_gcs_block_r4_tx_resolve_pending_detail(truncated, sizeof(truncated)),
+					 96);
+		UT_ASSERT_EQ(truncated[0], '\0');
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 96);
+		UT_ASSERT_EQ(route_seam.enter_calls, 96);
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+	}
 
 	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
 	UT_ASSERT_EQ(route_seam.raw_send_calls, 96);
 	UT_ASSERT_EQ(route_seam.leave_calls, 96);
+	{
+		char detail[768];
+
+		UT_ASSERT_EQ(cluster_gcs_block_r4_tx_resolve_pending_detail(detail, sizeof(detail)), 0);
+		UT_ASSERT(strstr(detail, "active=0") != NULL);
+	}
 	MaxBackends = saved_max_backends;
 	cluster_node_id = saved_node_id;
 }

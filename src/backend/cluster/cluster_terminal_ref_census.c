@@ -7830,6 +7830,57 @@ current_mx_retain_unlocked: {
 	return false;
 }
 
+/* Called only after releasing the page pin/locks. The copied scalars explain
+ * an existing refusal; they cannot discharge a receipt or prove history. */
+static void
+ctrc_cleaner_note_itl_retained(const ClusterCtrcReceipt *receipt, const char *stage,
+							   const ClusterItlSlotData *slot, XLogRecPtr page_lsn, SCN page_scn,
+							   int page_origin, ClusterCtrcTerminalStatus terminal_status,
+							   SCN commit_scn)
+{
+	static uint32 emitted;
+	UBA target_uba;
+	ClusterItlSlotData empty = { 0 };
+	bool sampled = slot != NULL;
+
+	if (emitted >= 128)
+		return;
+	emitted++;
+	memcpy(&target_uba, receipt->target.uba, sizeof(target_uba));
+	if (slot == NULL)
+		slot = &empty;
+	ereport(LOG,
+			(errmsg_internal("CTRC ITL receipt retained"),
+			 errdetail("PGRAC_FAMILY=CTRC_DIAGNOSTIC PGRAC_REASON=%s "
+					   "node=%d journal=" UINT64_FORMAT " operation=" UINT64_FORMAT
+					   " key=%u/%u/%u/%u/%u/%u formation=" UINT64_FORMAT
+					   " tag=%u/%u/%u/%d/%u expected_slot=%u expected_xid=%u expected_wrap=%u "
+					   "expected_class=%u expected_uba=" UINT64_FORMAT "/" UINT64_FORMAT
+					   " terminal=%d commit_scn=" UINT64_FORMAT
+					   " page_sampled=%d page_origin=%d page_lsn=" UINT64_FORMAT
+					   " page_scn=" UINT64_FORMAT " actual_xid=%u actual_wrap=%u actual_flags=%u "
+					   "actual_commit=" UINT64_FORMAT " actual_write=" UINT64_FORMAT
+					   " actual_uba=" UINT64_FORMAT "/" UINT64_FORMAT
+					   " predecessor_origin=%u predecessor_lsn=" UINT64_FORMAT
+					   " predecessor_scn=" UINT64_FORMAT " detail_limit=%d",
+					   stage, cluster_node_id, receipt->publication.journal_sequence,
+					   receipt->publication.operation_id, receipt->key.origin_node_id,
+					   receipt->key.segment_id, receipt->key.segment_generation,
+					   receipt->key.slot_offset, receipt->key.slot_wrap, receipt->key.xid,
+					   receipt->key.formation_epoch, receipt->target.spc_oid,
+					   receipt->target.db_oid, receipt->target.rel_number,
+					   receipt->target.fork_number, receipt->target.block_number,
+					   receipt->target.itl_slot_index, receipt->target.itl_xid,
+					   receipt->target.itl_slot_wrap, receipt->target.itl_class, target_uba.raw[0],
+					   target_uba.raw[1], (int)terminal_status, (uint64)commit_scn, sampled,
+					   page_origin, (uint64)page_lsn, (uint64)page_scn, slot->xid, slot->wrap,
+					   slot->flags, (uint64)slot->commit_scn, (uint64)slot->write_scn,
+					   slot->undo_segment_head.raw[0], slot->undo_segment_head.raw[1],
+					   receipt->target.predecessor_page_lsn_origin_node_id,
+					   receipt->target.predecessor_page_lsn, receipt->target.predecessor_page_scn,
+					   emitted == 128)));
+}
+
 static bool
 ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 							   const ClusterCtrcReceipt *receipt, uint64 participant_index,
@@ -7854,6 +7905,12 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	Page image;
 	bool permanent;
 	bool absent;
+	const char *retain_stage = "FIRST_PAGE_REVALIDATE";
+	ClusterItlSlotData observed_slot = { 0 };
+	XLogRecPtr observed_lsn = InvalidXLogRecPtr;
+	SCN observed_scn = InvalidScn;
+	int observed_origin = -1;
+	bool observed_valid = false;
 
 	if (participant == NULL || receipt == NULL
 		|| participant_index >= CtrcShared->participant_key_entries
@@ -7906,19 +7963,20 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	}
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PAGE_REVALIDATE);
 	if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-		|| !ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page)) {
-		UnlockReleaseBuffer(buffer);
-		cluster_semantic_activation_leave(&admission);
-		return false;
-	}
+		|| !ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page))
+		goto itl_retain_locked;
+	observed_slot = ClusterPageGetItlSlots(page)[receipt->target.itl_slot_index];
+	observed_lsn = PageGetLSN(page);
+	observed_scn = ((PageHeader)page)->pd_block_scn;
+	(void)PageGetLSNOrigin(page, &observed_origin);
+	observed_valid = true;
 	cluster_sf_dep_vec_reset(&first_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &first_dependencies);
 	absent = ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target);
 	if (absent
 		&& !ctrc_cleaner_absence_page_dependency(page, &receipt->target, &first_dependencies)) {
-		UnlockReleaseBuffer(buffer);
-		cluster_semantic_activation_leave(&admission);
-		return false;
+		retain_stage = "FIRST_ABSENCE_DEPENDENCY";
+		goto itl_retain_locked;
 	}
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_WAL_DURABILITY);
@@ -7937,26 +7995,29 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		return false;
 	}
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_PAGE_REVALIDATE);
+	retain_stage = "SECOND_PAGE_REVALIDATE";
+	observed_valid = false;
 	if (!cluster_semantic_activation_recheck_r4_terminal_census(&admission)
-		|| !ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page)) {
-		UnlockReleaseBuffer(buffer);
-		cluster_semantic_activation_leave(&admission);
-		return false;
-	}
+		|| !ctrc_cleaner_itl_page_exact(buffer, &receipt->target, &page))
+		goto itl_retain_locked;
+	observed_slot = ClusterPageGetItlSlots(page)[receipt->target.itl_slot_index];
+	observed_lsn = PageGetLSN(page);
+	observed_scn = ((PageHeader)page)->pd_block_scn;
+	observed_origin = -1;
+	(void)PageGetLSNOrigin(page, &observed_origin);
+	observed_valid = true;
 	cluster_sf_dep_vec_reset(&final_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &final_dependencies);
 	if (absent
 		&& (!ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target)
 			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,
 													 &final_dependencies))) {
-		UnlockReleaseBuffer(buffer);
-		cluster_semantic_activation_leave(&admission);
-		return false;
+		retain_stage = "SECOND_ABSENCE_DEPENDENCY";
+		goto itl_retain_locked;
 	}
 	if (memcmp(&first_dependencies, &final_dependencies, sizeof(first_dependencies)) != 0) {
-		UnlockReleaseBuffer(buffer);
-		cluster_semantic_activation_leave(&admission);
-		return false;
+		retain_stage = "DEPENDENCY_CHANGED";
+		goto itl_retain_locked;
 	}
 	if (absent) {
 		/* Already durable, read-only page proof. Never flush a foreign page
@@ -7974,9 +8035,8 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		&ClusterPageGetItlSlots(image)[receipt->target.itl_slot_index]);
 	if (apply_result == CLUSTER_CTRC_ITL_CLEANOUT_RETAIN) {
 		GenericXLogAbort(xlog_state);
-		UnlockReleaseBuffer(buffer);
-		cluster_semantic_activation_leave(&admission);
-		return false;
+		retain_stage = "SLOT_REVALIDATE";
+		goto itl_retain_locked;
 	}
 	if (receipt->target.itl_class == 2)
 		(void)cluster_itl_clear_terminal_lock_refs(
@@ -8019,6 +8079,16 @@ itl_discharge:
 	return cluster_ctrc_receipt_discharge_itl_shared(&handle, &expected_target, projection,
 													 &durability)
 		   == CLUSTER_CTRC_DISCHARGE_CLEANED;
+
+itl_retain_locked:
+	UnlockReleaseBuffer(buffer);
+	cluster_semantic_activation_leave(&admission);
+	ctrc_cleaner_note_itl_retained(receipt, retain_stage, observed_valid ? &observed_slot : NULL,
+								   observed_valid ? observed_lsn : InvalidXLogRecPtr,
+								   observed_valid ? observed_scn : InvalidScn,
+								   observed_valid ? observed_origin : -1, terminal_status,
+								   commit_scn);
+	return false;
 }
 
 static bool

@@ -37,6 +37,25 @@ static bool reuse_terminal_ok, reuse_tag_ok, reuse_exists;
 static bool reuse_dependency_drift;
 static void (*reuse_between_rounds)(void);
 static XLogRecPtr reuse_peer_flush;
+static unsigned reuse_retained_notes;
+static const char *reuse_retained_stage;
+
+static void
+reuse_note_itl_retained(const ClusterCtrcReceipt *receipt, const char *stage,
+						const ClusterItlSlotData *slot, XLogRecPtr page_lsn, SCN page_scn,
+						int page_origin, ClusterCtrcTerminalStatus terminal_status, SCN commit_scn)
+{
+	Assert(reuse_pins == 0 && reuse_xlocks == 0);
+	Assert(receipt == &reuse_receipt);
+	(void)slot;
+	(void)page_lsn;
+	(void)page_scn;
+	(void)page_origin;
+	(void)terminal_status;
+	(void)commit_scn;
+	reuse_retained_notes++;
+	reuse_retained_stage = stage;
+}
 
 static void
 reuse_assert_unlocked(unsigned call pg_attribute_unused())
@@ -212,7 +231,9 @@ reuse_xlog_abort(GenericXLogState *state)
 #define GenericXLogRegisterBuffer reuse_xlog_register
 #define GenericXLogFinish reuse_xlog_finish
 #define GenericXLogAbort reuse_xlog_abort
+#define ctrc_cleaner_note_itl_retained reuse_note_itl_retained
 #include "test_cluster_ctrc_itl_reuse.inc"
+#undef ctrc_cleaner_note_itl_retained
 #undef ctrc_cleaner_itl_page_exact
 #undef ctrc_cleaner_clean_itl_receipt
 #undef ctrc_cleaner_terminal_sample_exact
@@ -252,6 +273,8 @@ reuse_setup(bool replaced)
 	reuse_terminal_ok = reuse_tag_ok = reuse_exists = true;
 	reuse_dependency_drift = false;
 	reuse_between_rounds = NULL;
+	reuse_retained_notes = 0;
+	reuse_retained_stage = NULL;
 	test_flush_lsn = 4000;
 	reuse_peer_flush = 3500;
 	durability_hook = reuse_assert_unlocked;
@@ -636,10 +659,31 @@ UT_TEST(test_data_and_mx_receipts_do_not_gain_the_absence_path)
 	reuse_expect_retained();
 }
 
+UT_TEST(test_retained_reason_is_reported_after_page_release)
+{
+	reuse_setup(true);
+	reuse_receipt.target.itl_class = 1;
+	reuse_expect_retained();
+	UT_ASSERT_EQ(reuse_retained_notes, 1);
+	UT_ASSERT(reuse_retained_stage != NULL);
+	if (reuse_retained_stage != NULL)
+		UT_ASSERT(strcmp(reuse_retained_stage, "SLOT_REVALIDATE") == 0);
+	reuse_setup(true);
+	reuse_dependency_drift = true;
+	reuse_expect_retained();
+	UT_ASSERT_EQ(reuse_retained_notes, 1);
+	UT_ASSERT(reuse_retained_stage != NULL);
+	if (reuse_retained_stage != NULL)
+		UT_ASSERT(strcmp(reuse_retained_stage, "DEPENDENCY_CHANGED") == 0);
+	reuse_setup(true);
+	UT_ASSERT(reuse_run());
+	UT_ASSERT_EQ(reuse_retained_notes, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_exact_terminal_slot_still_rewrites_and_discharges);
 	UT_RUN(test_reused_lock_slot_absence_discharges_without_page_write);
 	UT_RUN(test_changed_slot_is_never_rewritten_as_the_old_incarnation);
@@ -651,6 +695,7 @@ main(void)
 	UT_RUN(test_page_origin_wal_is_required_even_with_empty_pending_vector);
 	UT_RUN(test_final_shared_identity_and_durability_can_still_refuse);
 	UT_RUN(test_data_and_mx_receipts_do_not_gain_the_absence_path);
+	UT_RUN(test_retained_reason_is_reported_after_page_release);
 	free(CtrcShared);
 	CtrcShared = NULL;
 	UT_DONE();

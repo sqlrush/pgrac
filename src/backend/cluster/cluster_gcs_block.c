@@ -8689,6 +8689,47 @@ cluster_gcs_block_r4_tx_resolve_active(void)
 	return false;
 }
 
+/* Process-local observation only. No guard, phase or deadline is advanced. */
+int
+cluster_gcs_block_r4_tx_resolve_pending_detail(char *out, Size capacity)
+{
+	const GcsBlockR4TxOriginContext *first = NULL;
+	int active = 0;
+	int guards = 0;
+
+	for (int i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
+		const GcsBlockR4TxOriginContext *context = &gcs_block_r4_tx_origin_contexts[i];
+
+		if (!context->in_use)
+			continue;
+		active++;
+		guards += context->guard_active ? 1 : 0;
+		if (first == NULL)
+			first = context;
+	}
+	if (out != NULL && capacity != 0) {
+		if (first == NULL)
+			snprintf(out, capacity, "active=0 guards=0");
+		else
+			snprintf(out, capacity,
+					 "active=%d guards=%d first_domain=%d first_phase=%d first_guard=%d "
+					 "first_request=" UINT64_FORMAT " first_requester=%d first_xid=%u "
+					 "first_data_owner=%u first_data_segment=%u first_tt_owner=%u "
+					 "first_tt_segment=%u first_generation_known=%d first_generation=%u",
+					 active, guards, (int)first->domain, (int)first->phase, first->guard_active,
+					 first->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+						 ? first->current_mx_request.prefix.request_id
+						 : first->forward.base.request_id,
+					 first->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+						 ? first->current_mx_request.prefix.original_requester_node
+						 : first->forward.base.original_requester_node,
+					 first->locator.xid, first->logical.owner_instance, first->logical.segment_id,
+					 first->tt_logical.owner_instance, first->tt_logical.segment_id,
+					 first->expected_generation.known, first->expected_generation.value);
+	}
+	return active;
+}
+
 long
 cluster_gcs_block_r4_tx_resolve_wait_timeout(long idle_timeout_ms)
 {

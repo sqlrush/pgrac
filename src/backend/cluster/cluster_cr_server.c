@@ -3580,6 +3580,49 @@ cr_build_and_send_reply(const ClusterLmsCrSlot *slot)
 	pfree(buf);
 }
 
+/* Sample only the existing deferral, at geometrically spaced observations.
+ * Slot identities are non-atomic diagnostics, not a routing/owner proof. */
+static void
+cr_server_r4_note_origin_deferral(void)
+{
+	static uint64 observations;
+	ClusterLmsCrSlot *first = NULL;
+	uint32 first_state = 0;
+	unsigned pending = 0;
+	char origin[768];
+
+	if (CrServerShared == NULL)
+		return;
+	for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
+		uint32 state = pg_atomic_read_u32(&slot->state);
+
+		if (state < CLUSTER_LMS_CR_R4_QUEUED || state > CLUSTER_LMS_CR_R4_SHIPPING)
+			continue;
+		pending++;
+		if (first == NULL) {
+			first = slot;
+			first_state = state;
+		}
+	}
+	if (first == NULL || observations == UINT64_MAX)
+		return;
+	observations++;
+	if ((observations & (observations - 1)) != 0)
+		return;
+	(void)cluster_gcs_block_r4_tx_resolve_pending_detail(origin, sizeof(origin));
+	ereport(LOG, (errmsg_internal("R4 CR origin-active deferral"),
+				  errdetail("PGRAC_FAMILY=R4_CR_DIAGNOSTIC PGRAC_REASON=ORIGIN_ACTIVE_DEFERRAL "
+							"node=%d observations=" UINT64_FORMAT " pending=%u state=%u "
+							"request=" UINT64_FORMAT " requester=%d tag=%u/%u/%u/%u/%u "
+							"read_scn=" UINT64_FORMAT " slot_generation=" UINT64_FORMAT
+							" non_atomic=1 %s",
+							cluster_node_id, observations, pending, first_state, first->request_id,
+							first->requester_node, first->tag.spcOid, first->tag.dbOid,
+							first->tag.relNumber, (unsigned)first->tag.forkNum, first->tag.blockNum,
+							(uint64)first->read_scn, first->r4.slot_generation, origin)));
+}
+
 /*
  * cluster_lms_cr_drain — CONTROL-plane park drain (LMS worker 0 main loop).
  * Serve every PENDING slot into a READY result (errors become DENIED; LMS
@@ -3595,8 +3638,10 @@ cluster_lms_cr_drain(void)
 	 * process-local, so it must progress even when the legacy CR table is
 	 * absent. */
 	cluster_gcs_block_r4_tx_resolve_drain();
-	if (cluster_gcs_block_r4_tx_resolve_active())
+	if (cluster_gcs_block_r4_tx_resolve_active()) {
+		cr_server_r4_note_origin_deferral();
 		return;
+	}
 	if (CrServerShared == NULL)
 		return;
 
