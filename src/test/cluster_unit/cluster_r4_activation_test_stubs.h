@@ -24,11 +24,13 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_undo_smgr.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "storage/ipc.h"
+#include "access/xlog.h"
 
 int MyProcPid = 101;
 volatile sig_atomic_t InterruptPending = false;
@@ -59,6 +61,13 @@ void ProcessInterrupts(void);
 void
 ProcessInterrupts(void)
 {}
+
+/* Dependency-light tests do not establish a clean startup. */
+bool
+cluster_qvotec_prior_unclean_death(void)
+{
+	return true;
+}
 
 uint64
 cluster_epoch_get_current(void)

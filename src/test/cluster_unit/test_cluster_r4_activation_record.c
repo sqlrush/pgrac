@@ -20,6 +20,12 @@
 
 int cluster_node_id = 0;
 
+bool
+RecoveryInProgress(void)
+{
+	return true;
+}
+
 /* Link-only dependencies of unrelated bootstrap/migration entry points.
  * This record/codec fixture must fail if one is reached, never synthesize
  * a prepared root or a quorum-selected activation record. */
@@ -1495,7 +1501,8 @@ UT_TEST(test_64_shmem_size_includes_exact_ack_table)
 					+ MAXALIGN(sizeof(ClusterR4Bit22CutoverSeamShmem))
 					/* contract: online first-open via the source-close
 					 * BARRIER. */
-					+ MAXALIGN(sizeof(ClusterR4Bit22SourceCloseShmem));
+					+ MAXALIGN(sizeof(ClusterR4Bit22SourceCloseShmem))
+					+ MAXALIGN(sizeof(pg_atomic_uint32)); /* local clean-start observation */
 
 	UT_ASSERT_EQ(cluster_semantic_activation_shmem_size(), expected);
 }

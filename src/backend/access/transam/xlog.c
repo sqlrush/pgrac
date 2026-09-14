@@ -206,6 +206,7 @@
 #include "cluster/cluster_xid_stripe_xlog.h" /* PGRAC: spec-6.15 D5d checkpoint re-emit */
 #include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
 #include "cluster/cluster_xid_wrap_barrier.h" /* PGRAC: GCS-race round-3 P0-1 startup mirror */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
 #include "cluster/cluster_write_fence.h" /* PGRAC: RF-ROOT P6 checkpoint fence deferral */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
@@ -6084,6 +6085,11 @@ StartupXLOG(void)
 	checkPoint = ControlFile->checkPointCopy;
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Own checkpoint/anchor and the actual recovery decision, not a peer's
+	 * shared-control state or an operator assertion. This grants no admission. */
+	cluster_semantic_activation_note_clean_start(
+		boot_state == DB_SHUTDOWNED && wasShutdown && !InRecovery
+		&& !ArchiveRecoveryRequested && !haveBackupLabel);
 
 	/*
 	 * PGRAC (spec-5.6a D3 / L437 sweep): on a clean (no-recovery) restart the
