@@ -6961,13 +6961,13 @@ ctrc_cleaner_dependencies_durable(const ClusterSfDepVec *dependencies,
 }
 
 /* A terminal slot can be reused before its asynchronous receipt is visited.
- * Never rewrite the successor. Plain locks require complete raw-reference
- * absence; DATA requires a separate below-floor history proof from the caller.
+ * Never rewrite the successor. Strict lock absence requires no raw reference;
+ * either ordinary class may instead use a below-floor logical-history proof.
  * Ambiguous incarnations and MX history stay retained in either case. Caller
  * owns the pin and current/content-X throughout this read-only page proof. */
 static bool
 ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
-							  const ClusterCtrcTargetV1 *target, bool data_history)
+							  const ClusterCtrcTargetV1 *target, bool logical_history)
 {
 	PageHeader header = (PageHeader)page;
 	const ClusterItlSlotData *slots;
@@ -6980,8 +6980,11 @@ ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
 	unsigned i;
 
 	if (page == NULL || !ctrc_target_exact_itl_valid(key, target)
-		|| target->fork_number != MAIN_FORKNUM || target->itl_class != (data_history ? 1 : 2)
-		|| !TransactionIdIsNormal(target->itl_xid) || (!data_history && target->itl_slot_wrap == 0)
+		|| target->fork_number != MAIN_FORKNUM
+		|| (logical_history ? (target->itl_class != 1 && target->itl_class != 2)
+							: target->itl_class != 2)
+		|| !TransactionIdIsNormal(target->itl_xid)
+		|| (!logical_history && target->itl_slot_wrap == 0)
 		|| target->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT || !PageHasItl(page)
 		|| PageGetPageSize(page) != BLCKSZ
 		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
@@ -7010,10 +7013,10 @@ ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
 				return false;
 			continue;
 		}
-		/* DATA history uses the same complete ordinary carrier grammar as
+		/* Logical history uses the same complete ordinary carrier grammar as
 		 * retained page undo. Initial wrap zero is valid; a successor must
 		 * still have strictly advanced the target's own wrap above. */
-		if (data_history) {
+		if (logical_history) {
 			if (!cluster_undo_history_prior_valid(slot))
 				return false;
 			continue;
@@ -7056,7 +7059,7 @@ ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
 		tuple = (HeapTupleHeader)((char *)page + item_offset);
 		if (tuple->t_hoff < SizeofHeapTupleHeader || tuple->t_hoff > item_length)
 			return false;
-		if (data_history) {
+		if (logical_history) {
 			bool old_creator = HeapTupleHeaderGetRawXmin(tuple) == target->itl_xid
 							   && !HeapTupleHeaderXminFrozen(tuple);
 			bool old_deleter = (tuple->t_infomask & HEAP_XMAX_INVALID) == 0
@@ -7068,6 +7071,10 @@ ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
 				return false;
 			if ((tuple->t_infomask & HEAP_XMAX_INVALID) == 0
 				&& (tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+				return false;
+			/* The xid can also own a DATA publication, but an effective
+			 * lock is not DATA history. Never retire an unremoved lock. */
+			if (old_deleter && HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
 				return false;
 			/* These raw identities still require the original-origin history
 			 * route. Do not retire an unusable current carrier on their behalf.
@@ -7097,10 +7104,11 @@ ctrc_cleaner_lock_itl_absent(Page page, const ClusterCtrcTxnKeyV1 *key,
 
 /* Only the current ITL/UBA locator is retired here. Logical old xmin/xmax
  * may remain, so the caller must also prove exact COMMITTED below the
- * required-member floor. This is never the plain-lock absence shortcut. */
+ * required-member floor. DATA and LOCK publications share this proof; it
+ * is never the stronger plain-lock raw-absence shortcut. */
 static bool
-ctrc_cleaner_data_itl_retired(Page page, const ClusterCtrcTxnKeyV1 *key,
-							  const ClusterCtrcTargetV1 *target)
+ctrc_cleaner_history_itl_retired(Page page, const ClusterCtrcTxnKeyV1 *key,
+								 const ClusterCtrcTargetV1 *target)
 {
 	return ctrc_cleaner_retired_itl_page(page, key, target, true);
 }
@@ -7109,8 +7117,8 @@ ctrc_cleaner_data_itl_retired(Page page, const ClusterCtrcTxnKeyV1 *key,
  * ProcArray and the peer fold consumes existing epoch-qualified reports.
  * Neither elapsed time nor a terminal stamp alone permits this retirement. */
 static bool
-ctrc_cleaner_data_retirement_ready(const ClusterCtrcTxnKeyV1 *key, ClusterCtrcTerminalStatus status,
-								   SCN commit_scn)
+ctrc_cleaner_history_retirement_ready(const ClusterCtrcTxnKeyV1 *key,
+									  ClusterCtrcTerminalStatus status, SCN commit_scn)
 {
 	ClusterUndoHorizonReportView views[CLUSTER_MAX_NODES];
 	ClusterUndoHorizonFloor floor;
@@ -7996,7 +8004,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	Page image;
 	bool permanent;
 	bool absent;
-	bool data_retired;
+	bool history_retired;
 	const char *retain_stage = "FIRST_PAGE_REVALIDATE";
 	ClusterItlSlotData observed_slot = { 0 };
 	XLogRecPtr observed_lsn = InvalidXLogRecPtr;
@@ -8065,15 +8073,18 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	cluster_sf_dep_vec_reset(&first_dependencies);
 	(void)cluster_sf_dep_vec_for_ship(buffer, &first_dependencies);
 	absent = ctrc_cleaner_lock_itl_absent(page, &receipt->key, &receipt->target);
-	data_retired = ctrc_cleaner_data_itl_retired(page, &receipt->key, &receipt->target);
-	if ((absent || data_retired)
+	/* Keep the original absence contract, including ABORTED and no-floor
+	 * cases. Only the distinct logical-history branch needs the floor. */
+	history_retired
+		= !absent && ctrc_cleaner_history_itl_retired(page, &receipt->key, &receipt->target);
+	if ((absent || history_retired)
 		&& !ctrc_cleaner_absence_page_dependency(page, &receipt->target, &first_dependencies)) {
 		retain_stage = "FIRST_ABSENCE_DEPENDENCY";
 		goto itl_retain_locked;
 	}
 	LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
-	if (data_retired
-		&& !ctrc_cleaner_data_retirement_ready(&receipt->key, terminal_status, commit_scn)) {
+	if (history_retired
+		&& !ctrc_cleaner_history_retirement_ready(&receipt->key, terminal_status, commit_scn)) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
 		return false;
@@ -8114,26 +8125,26 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		retain_stage = "SECOND_ABSENCE_DEPENDENCY";
 		goto itl_retain_locked;
 	}
-	if (data_retired
-		&& (!ctrc_cleaner_data_itl_retired(page, &receipt->key, &receipt->target)
+	if (history_retired
+		&& (!ctrc_cleaner_history_itl_retired(page, &receipt->key, &receipt->target)
 			|| !ctrc_cleaner_absence_page_dependency(page, &receipt->target,
 													 &final_dependencies))) {
-		retain_stage = "DATA_RETIREMENT_RECHECK";
+		retain_stage = "HISTORY_RETIREMENT_RECHECK";
 		goto itl_retain_locked;
 	}
 	if (memcmp(&first_dependencies, &final_dependencies, sizeof(first_dependencies)) != 0) {
 		retain_stage = "DEPENDENCY_CHANGED";
 		goto itl_retain_locked;
 	}
-	if (absent || data_retired) {
+	if (absent || history_retired) {
 		/* Already durable, read-only page proof. Never flush a foreign page
 		 * LSN as a local WAL coordinate and never alter its successor. */
 		cleanout_lsn = durability.local_flush_lsn;
 		projection = CTRC_ITL_TARGET_ABSENT;
 		UnlockReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
-		if (data_retired
-			&& !ctrc_cleaner_data_retirement_ready(&receipt->key, terminal_status, commit_scn))
+		if (history_retired
+			&& !ctrc_cleaner_history_retirement_ready(&receipt->key, terminal_status, commit_scn))
 			return false;
 		goto itl_discharge;
 	}

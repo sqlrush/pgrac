@@ -50,6 +50,8 @@ static int reuse_origin, reuse_view_count;
 static uint64 reuse_members_epoch;
 static unsigned reuse_floor_samples;
 static ClusterCtrcTerminalStatus reuse_terminal_status;
+/* Run the identical history/floor matrix for DATA and LOCK publications. */
+static uint8 reuse_history_class = 1;
 bool cluster_undo_retention_horizon_enabled = true;
 int cluster_lmon_main_loop_interval = 2000;
 
@@ -774,8 +776,8 @@ reuse_data_setup(void)
 {
 	ClusterItlSlotData *slot;
 	reuse_setup(true);
-	reuse_receipt.target.itl_class = 1;
-	reuse_handle.receipt->target.itl_class = 1;
+	reuse_receipt.target.itl_class = reuse_history_class;
+	reuse_handle.receipt->target.itl_class = reuse_history_class;
 	((PageHeader)reuse_page.data)->pd_block_scn = 1000;
 	slot = &ClusterPageGetItlSlots((Page)reuse_page.data)[0];
 	slot->flags = ITL_FLAG_COMMITTED;
@@ -1059,18 +1061,101 @@ UT_TEST(test_data_completed_receipt_is_idempotent_and_exact_slot_is_unchanged)
 	UT_ASSERT_EQ(reuse_handle.receipt->disposition, CTRC_RELEASE_CLEANED_TERMINAL_REWRITE);
 }
 
+UT_TEST(test_lock_publication_with_creator_deleter_history_discharges)
+{
+	for (unsigned side = 0; side < 3; side++) {
+		PGAlignedBlock before;
+		reuse_data_setup();
+		reuse_receipt.target.itl_class = 2;
+		reuse_handle.receipt->target.itl_class = 2;
+		reuse_tuple()->t_infomask = side == 0 ? HEAP_XMAX_INVALID : 0;
+		HeapTupleHeaderSetXmin(reuse_tuple(), side == 1 ? 800 : reuse_receipt.key.xid);
+		HeapTupleHeaderSetXmax(reuse_tuple(), reuse_receipt.key.xid);
+		before = reuse_page;
+		UT_ASSERT(reuse_run());
+		UT_ASSERT_EQ(reuse_handle.receipt->disposition, CTRC_RELEASE_CLEANED_ABSENT);
+		UT_ASSERT_EQ(reuse_handle.participant->applied_count, 0);
+		UT_ASSERT_EQ(reuse_handle.participant->cleaned_count, 1);
+		UT_ASSERT_EQ(reuse_floor_samples, 2);
+		UT_ASSERT_EQ(reuse_wal_starts, 0);
+		UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+	}
+}
+
+UT_TEST(test_effective_old_lock_is_not_logical_data_history)
+{
+	for (unsigned itl_class = 1; itl_class <= 2; itl_class++) {
+		for (unsigned lock_shape = 0; lock_shape < 3; lock_shape++) {
+			reuse_data_setup();
+			reuse_receipt.target.itl_class = itl_class;
+			reuse_handle.receipt->target.itl_class = itl_class;
+			reuse_tuple()->t_infomask = lock_shape == 0 ? HEAP_XMAX_LOCK_ONLY
+										: lock_shape == 1
+											? HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK
+										: HEAP_XMAX_EXCL_LOCK;
+			HeapTupleHeaderSetXmax(reuse_tuple(), reuse_receipt.key.xid);
+			reuse_expect_retained();
+		}
+	}
+}
+
+UT_TEST(test_strict_lock_absence_keeps_its_original_terminal_contract)
+{
+	for (unsigned aborted = 0; aborted < 2; aborted++) {
+		reuse_setup(true);
+		ClusterPageGetItlSlots((Page)reuse_page.data)[0].write_scn = 925;
+		reuse_terminal_status = aborted ? CTRC_TERMINAL_ABORTED : CTRC_TERMINAL_COMMITTED;
+		reuse_local_floor = InvalidScn;
+		reuse_members_valid = false;
+		reuse_raw_disabled = true;
+		UT_ASSERT(reuse_run());
+		UT_ASSERT_EQ(reuse_handle.receipt->disposition, CTRC_RELEASE_CLEANED_ABSENT);
+		UT_ASSERT_EQ(reuse_floor_samples, 0);
+		UT_ASSERT_EQ(reuse_wal_starts, 0);
+	}
+}
+
+static void
+reuse_return_effective_lock(void)
+{
+	reuse_tuple()->t_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
+	HeapTupleHeaderSetXmax(reuse_tuple(), reuse_receipt.key.xid);
+}
+
+UT_TEST(test_history_recheck_rejects_effective_lock_return)
+{
+	for (unsigned itl_class = 1; itl_class <= 2; itl_class++) {
+		reuse_data_setup();
+		reuse_receipt.target.itl_class = itl_class;
+		reuse_handle.receipt->target.itl_class = itl_class;
+		reuse_between_rounds = reuse_return_effective_lock;
+		UT_ASSERT(!reuse_run());
+		UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+		UT_ASSERT_EQ(reuse_handle.participant->cleaned_count, 0);
+		UT_ASSERT_EQ(reuse_wal_starts, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
-	UT_RUN(test_retired_data_below_cluster_floor_discharges_without_tuple_rewrite);
-	UT_RUN(test_data_retirement_keeps_all_retention_and_namespace_failures);
-	UT_RUN(test_data_retirement_cannot_invent_canonical_terminal_status);
-	UT_RUN(test_data_first_wrap_and_ordinary_successors_keep_logical_history);
-	UT_RUN(test_data_surviving_reference_or_malformed_history_retains);
-	UT_RUN(test_data_rechecks_both_page_and_floor_before_shared_discharge);
-	UT_RUN(test_data_final_shared_identity_and_origin_durability_still_guard);
-	UT_RUN(test_data_completed_receipt_is_idempotent_and_exact_slot_is_unchanged);
+	UT_PLAN(32);
+	UT_RUN(test_lock_publication_with_creator_deleter_history_discharges);
+	UT_RUN(test_effective_old_lock_is_not_logical_data_history);
+	UT_RUN(test_strict_lock_absence_keeps_its_original_terminal_contract);
+	UT_RUN(test_history_recheck_rejects_effective_lock_return);
+	for (reuse_history_class = 1; reuse_history_class <= 2; reuse_history_class++) {
+		printf("# ordinary history receipt class=%u\n", (unsigned)reuse_history_class);
+		UT_RUN(test_retired_data_below_cluster_floor_discharges_without_tuple_rewrite);
+		UT_RUN(test_data_retirement_keeps_all_retention_and_namespace_failures);
+		UT_RUN(test_data_retirement_cannot_invent_canonical_terminal_status);
+		UT_RUN(test_data_first_wrap_and_ordinary_successors_keep_logical_history);
+		UT_RUN(test_data_surviving_reference_or_malformed_history_retains);
+		UT_RUN(test_data_rechecks_both_page_and_floor_before_shared_discharge);
+		UT_RUN(test_data_final_shared_identity_and_origin_durability_still_guard);
+		UT_RUN(test_data_completed_receipt_is_idempotent_and_exact_slot_is_unchanged);
+	}
+	reuse_history_class = 1;
 	UT_RUN(test_exact_terminal_slot_still_rewrites_and_discharges);
 	UT_RUN(test_reused_lock_slot_absence_discharges_without_page_write);
 	UT_RUN(test_changed_slot_is_never_rewritten_as_the_old_incarnation);
