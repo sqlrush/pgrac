@@ -59,6 +59,8 @@ int NLocBuffer = 0;
 int cluster_node_id = 0;
 int cluster_smart_fusion_origin_durable_gossip_ms = 50;
 static XLogRecPtr test_sf_flush = 3500;
+static bool test_sf_recovery;
+static unsigned test_sf_flush_reads;
 static unsigned test_sf_sends;
 static bool test_sf_declared = true;
 static bool test_sf_enqueue_ok = true;
@@ -74,9 +76,17 @@ GetCurrentTimestamp(void)
 XLogRecPtr
 GetFlushRecPtr(TimeLineID *timeline)
 {
+	test_sf_flush_reads++;
+	UT_ASSERT(!test_sf_recovery);
 	if (timeline != NULL)
 		*timeline = 1;
 	return test_sf_flush;
+}
+
+bool
+RecoveryInProgress(void)
+{
+	return test_sf_recovery;
 }
 
 const ClusterNodeInfo *
@@ -726,6 +736,8 @@ test_sf_publish_setup(uint32 caps)
 	test_sf_declared = true;
 	test_sf_enqueue_ok = true;
 	test_sf_flush = 3500;
+	test_sf_recovery = false;
+	test_sf_flush_reads = 0;
 	test_sf_sends = 0;
 	test_sf_cap_store_reset();
 	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, caps, 1);
@@ -814,10 +826,52 @@ UT_TEST(test_existing_smart_fusion_peer_still_receives_durability)
 	cluster_smart_fusion = false;
 }
 
+UT_TEST(test_publisher_waits_for_recovery_before_reading_flush)
+{
+	for (unsigned leg = 0; leg < 2; leg++) {
+		test_sf_publish_setup(leg == 0 ? PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+											 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1
+									   : PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2);
+		cluster_smart_fusion = leg != 0;
+		test_sf_recovery = true;
+		cluster_sf_publish_origin_durable_lsn();
+		UT_ASSERT_EQ(test_sf_flush_reads, 0);
+		UT_ASSERT_EQ(test_sf_sends, 0);
+		UT_ASSERT(XLogRecPtrIsInvalid(cluster_sf_observed_origin_durable_lsn(0)));
+		test_sf_recovery = false;
+		cluster_sf_publish_origin_durable_lsn();
+		UT_ASSERT_EQ(test_sf_flush_reads, 1);
+		UT_ASSERT_EQ(test_sf_sends, 1);
+		UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(0), test_sf_flush);
+	}
+	cluster_smart_fusion = false;
+}
+
+UT_TEST(test_lmon_tick_continues_after_recovery_without_commit)
+{
+	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+						  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+	test_sf_now = INT64CONST(300000000);
+	test_sf_recovery = true;
+	cluster_sf_origin_durable_lmon_tick();
+	test_sf_now += 50000;
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_flush_reads, 0);
+	UT_ASSERT_EQ(test_sf_sends, 0);
+	UT_ASSERT(XLogRecPtrIsInvalid(cluster_sf_observed_origin_durable_lsn(0)));
+	test_sf_recovery = false;
+	test_sf_now += 50000;
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_flush_reads, 1);
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(0), test_sf_flush);
+	UT_ASSERT(!cluster_smart_fusion);
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(28);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_vec_set_union_and_clear);
 	UT_RUN(test_vec_rejects_invalid_origin_and_lsn);
@@ -844,5 +898,7 @@ main(void)
 	UT_RUN(test_durable_tick_observes_background_flush_without_commit);
 	UT_RUN(test_durable_zero_flush_does_not_send_positive_proof);
 	UT_RUN(test_existing_smart_fusion_peer_still_receives_durability);
+	UT_RUN(test_publisher_waits_for_recovery_before_reading_flush);
+	UT_RUN(test_lmon_tick_continues_after_recovery_without_commit);
 	UT_DONE();
 }

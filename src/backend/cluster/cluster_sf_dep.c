@@ -925,6 +925,10 @@ cluster_sf_publish_origin_durable_lsn(void)
 	 * store is independent of the optional early-transfer dependency array. */
 	if (!cluster_enabled || ClusterSfDep == NULL || !cluster_sf_dep_origin_valid(cluster_node_id))
 		return;
+	/* LMON starts before local WAL recovery. GetFlushRecPtr is valid only
+	 * after recovery; the next ordinary tick will retry without a caller. */
+	if (RecoveryInProgress())
+		return;
 	durable_lsn = GetFlushRecPtr(NULL);
 	if (XLogRecPtrIsInvalid(durable_lsn))
 		return;
