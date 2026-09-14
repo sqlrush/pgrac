@@ -1436,6 +1436,8 @@ LmonMain(void)
 			 * a missing report as STALLED, never as consent).  Time-based
 			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
 			cluster_undo_horizon_lmon_tick();
+			/* Non-lazy: cleaner WAL may advance after the last user commit. */
+			cluster_sf_origin_durable_lmon_tick();
 
 			/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
 			 * durable stamp -> DISABLE fanout -> ack round -> gate open).
@@ -2119,6 +2121,8 @@ LmonMain(void)
 			 * a missing report as STALLED, never as consent).  Time-based
 			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
 			cluster_undo_horizon_lmon_tick();
+			/* Mutually exclusive with the transport-loop continuation above. */
+			cluster_sf_origin_durable_lmon_tick();
 
 			/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
 			 * durable stamp -> DISABLE fanout -> ack round -> gate open).

@@ -921,9 +921,13 @@ cluster_sf_publish_origin_durable_lsn(void)
 	XLogRecPtr durable_lsn;
 	int peer;
 
-	if (!cluster_smart_fusion || !cluster_sf_dep_origin_valid(cluster_node_id))
+	/* Ordinary CTRC retirement also consumes origin durability. The proof
+	 * store is independent of the optional early-transfer dependency array. */
+	if (!cluster_enabled || ClusterSfDep == NULL || !cluster_sf_dep_origin_valid(cluster_node_id))
 		return;
 	durable_lsn = GetFlushRecPtr(NULL);
+	if (XLogRecPtrIsInvalid(durable_lsn))
+		return;
 	cluster_sf_observe_origin_durable_lsn(cluster_node_id, durable_lsn);
 
 	memset(&msg, 0, sizeof(msg));
@@ -934,11 +938,36 @@ cluster_sf_publish_origin_durable_lsn(void)
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 		if (peer == cluster_node_id || cluster_conf_lookup_node(peer) == NULL)
 			continue;
-		if (!cluster_sf_peer_supports_reply_v2(peer))
+		/* Current CTRC binaries register the unchanged durable message even
+		 * with early transfer off. Do not advertise or enable reply-v2 here. */
+		if (!cluster_sf_peer_supports_reply_v2(peer)
+			&& !cluster_sf_peer_capability_family_sample(peer,
+														 PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+															 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1,
+														 0, NULL, NULL))
 			continue;
 		(void)cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_SMART_FUSION_DURABLE,
 													   (uint32)peer, &msg, sizeof(msg));
 	}
+}
+
+/* LMON owns this periodic continuation, including when no user commits.
+ * Repeat unchanged frontiers: successful enqueue is not acknowledged delivery.
+ * This is only a publish-rate cap, never a deadline or a durability proof. */
+void
+cluster_sf_origin_durable_lmon_tick(void)
+{
+	static TimestampTz last_publish;
+	TimestampTz now;
+
+	if (!cluster_enabled || ClusterSfDep == NULL || !cluster_sf_dep_origin_valid(cluster_node_id))
+		return;
+	now = GetCurrentTimestamp();
+	if (last_publish != 0 && now >= last_publish
+		&& now - last_publish < (int64)cluster_smart_fusion_origin_durable_gossip_ms * 1000)
+		return;
+	last_publish = now;
+	cluster_sf_publish_origin_durable_lsn();
 }
 
 void

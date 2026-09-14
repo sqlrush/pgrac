@@ -593,6 +593,13 @@ void
 cluster_sf_dep_register_ic_msg_types(void)
 {}
 
+/* The standalone LMON fixture does not run its main loop. The production
+ * publisher and rate-limited continuation execute in test_cluster_sf_dep. */
+void cluster_sf_origin_durable_lmon_tick(void);
+void
+cluster_sf_origin_durable_lmon_tick(void)
+{}
+
 /* spec-2.2 additive amendment (spec-5.22e D5 prereq) stub:
  * cluster_lmon_shmem_init registers the PEER_CAPS_REPLY msg type; this
  * standalone unit binary does not link cluster_ic_tier1.o. */

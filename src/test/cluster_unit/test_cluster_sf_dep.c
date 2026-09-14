@@ -11,9 +11,13 @@
 
 #include <stddef.h>
 
+#include "access/xlog.h"
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_sf_dep.h"
 #include "storage/lwlock.h"
+#include "utils/timestamp.h"
 
 #undef printf
 #undef fprintf
@@ -41,6 +45,7 @@ UT_DEFINE_GLOBALS();
 
 typedef union TestSfShmemStorage {
 	LWLock align;
+	uint64 atomic_align;
 	uint8 bytes[TEST_SF_SHMEM_BYTES];
 } TestSfShmemStorage;
 
@@ -51,6 +56,46 @@ bool cluster_enabled = true;
 bool cluster_smart_fusion = false;
 int NBuffers = 0;
 int NLocBuffer = 0;
+int cluster_node_id = 0;
+int cluster_smart_fusion_origin_durable_gossip_ms = 50;
+static XLogRecPtr test_sf_flush = 3500;
+static unsigned test_sf_sends;
+static bool test_sf_declared = true;
+static bool test_sf_enqueue_ok = true;
+static ClusterSfDurableGossipMsg test_sf_message;
+static TimestampTz test_sf_now;
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return test_sf_now;
+}
+
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *timeline)
+{
+	if (timeline != NULL)
+		*timeline = 1;
+	return test_sf_flush;
+}
+
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id)
+{
+	static const ClusterNodeInfo peer = { 0 };
+	return test_sf_declared && node_id == TEST_SF_CAP_PEER ? &peer : NULL;
+}
+
+bool
+cluster_grd_outbound_enqueue_backend_msg(uint8 type, uint32 destination, const void *payload,
+										 uint16 length)
+{
+	Assert(type == PGRAC_IC_MSG_SMART_FUSION_DURABLE);
+	Assert(destination == TEST_SF_CAP_PEER && length == sizeof(test_sf_message));
+	memcpy(&test_sf_message, payload, length);
+	test_sf_sends++;
+	return test_sf_enqueue_ok;
+}
 
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
@@ -79,6 +124,7 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
 					 int lineNumber pg_attribute_unused())
 {
+	fprintf(stderr, "assertion %s at %s:%d\n", conditionName, fileName, lineNumber);
 	abort();
 }
 
@@ -621,10 +667,157 @@ UT_TEST(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift)
 	UT_ASSERT(!cluster_sf_peer_capability_record_snapshot(TEST_SF_CAP_PEER, NULL));
 }
 
+UT_TEST(test_ordinary_ctrc_peer_receives_actual_durability_with_sf_off)
+{
+	ClusterICEnvelope envelope = { 0 };
+	const uint32 caps
+		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+	test_sf_cap_store_reset();
+	cluster_smart_fusion = false;
+	test_sf_sends = 0;
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, caps, 1);
+	UT_ASSERT(!cluster_sf_peer_supports_reply_v2(TEST_SF_CAP_PEER));
+	cluster_sf_publish_origin_durable_lsn();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, test_sf_flush);
+	UT_ASSERT_EQ(test_sf_message.origin_node, cluster_node_id);
+	UT_ASSERT_EQ(test_sf_message.flags, 0);
+	/* Reinitialize the actual store as a receiver, then deliver the captured
+	 * original message. This is a C producer/receiver test, not network I/O. */
+	test_sf_cap_store_reset();
+	UT_ASSERT(XLogRecPtrIsInvalid(cluster_sf_observed_origin_durable_lsn(0)));
+	envelope.source_node_id = 0;
+	envelope.payload_length = sizeof(test_sf_message);
+	cluster_sf_handle_durable_gossip(&envelope, &test_sf_message);
+	UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(0), test_sf_flush);
+	UT_ASSERT(!cluster_smart_fusion);
+}
+
+UT_TEST(test_durable_message_preserves_sender_and_monotonicity)
+{
+	ClusterICEnvelope envelope = { 0 };
+	ClusterSfDurableGossipMsg msg = { CLUSTER_SF_DURABLE_GOSSIP_VERSION, 0, 1, 4000 };
+	test_sf_cap_store_reset();
+	envelope.source_node_id = 2;
+	envelope.payload_length = sizeof(msg);
+	cluster_sf_handle_durable_gossip(&envelope, &msg);
+	UT_ASSERT(XLogRecPtrIsInvalid(cluster_sf_observed_origin_durable_lsn(1)));
+	envelope.source_node_id = 1;
+	envelope.payload_length--;
+	cluster_sf_handle_durable_gossip(&envelope, &msg);
+	UT_ASSERT(XLogRecPtrIsInvalid(cluster_sf_observed_origin_durable_lsn(1)));
+	envelope.payload_length++;
+	msg.msg_version++;
+	cluster_sf_handle_durable_gossip(&envelope, &msg);
+	UT_ASSERT(XLogRecPtrIsInvalid(cluster_sf_observed_origin_durable_lsn(1)));
+	msg.msg_version--;
+	cluster_sf_handle_durable_gossip(&envelope, &msg);
+	msg.durable_lsn = 3999;
+	cluster_sf_handle_durable_gossip(&envelope, &msg);
+	UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(1), 4000);
+}
+
+static void
+test_sf_publish_setup(uint32 caps)
+{
+	cluster_smart_fusion = false;
+	cluster_enabled = true;
+	cluster_node_id = 0;
+	test_sf_declared = true;
+	test_sf_enqueue_ok = true;
+	test_sf_flush = 3500;
+	test_sf_sends = 0;
+	test_sf_cap_store_reset();
+	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, caps, 1);
+}
+
+UT_TEST(test_durable_publisher_requires_declared_current_capability)
+{
+	const uint32 current = PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1;
+	const uint32 ctrc = PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+	for (unsigned leg = 0; leg < 7; leg++) {
+		test_sf_publish_setup(leg == 0 ? 0 : leg == 1 ? current : leg == 2 ? ctrc : current | ctrc);
+		if (leg == 3)
+			cluster_sf_note_peer_disconnected_gen(TEST_SF_CAP_PEER, 1);
+		if (leg == 4)
+			test_sf_declared = false;
+		if (leg == 5)
+			cluster_node_id = -1;
+		if (leg == 6)
+			cluster_enabled = false;
+		cluster_sf_publish_origin_durable_lsn();
+		UT_ASSERT_EQ(test_sf_sends, 0);
+	}
+}
+
+UT_TEST(test_durable_tick_retries_idle_loss_without_changing_deadlines)
+{
+	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+						  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+	test_sf_now = INT64CONST(100000000);
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	test_sf_now += 49999;
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	test_sf_now++;
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 2);
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, 3500);
+	test_sf_enqueue_ok = false;
+	test_sf_now += 50000;
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 3);
+	test_sf_enqueue_ok = true;
+	test_sf_now += 50000;
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 4);
+	test_sf_now--; /* Clock correction affects rate observation, not proof. */
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 5);
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, 3500);
+	UT_ASSERT(!cluster_smart_fusion);
+}
+
+UT_TEST(test_durable_tick_observes_background_flush_without_commit)
+{
+	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+						  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+	test_sf_now = INT64CONST(200000000);
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, 3500);
+	test_sf_flush = 4700;
+	test_sf_now += 50000;
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 2);
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, 4700);
+	UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(0), 4700);
+}
+
+UT_TEST(test_durable_zero_flush_does_not_send_positive_proof)
+{
+	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+						  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+	test_sf_flush = InvalidXLogRecPtr;
+	cluster_sf_publish_origin_durable_lsn();
+	UT_ASSERT_EQ(test_sf_sends, 0);
+	UT_ASSERT(XLogRecPtrIsInvalid(cluster_sf_observed_origin_durable_lsn(0)));
+}
+
+UT_TEST(test_existing_smart_fusion_peer_still_receives_durability)
+{
+	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_SMART_FUSION_REPLY_V2);
+	cluster_smart_fusion = true;
+	cluster_sf_publish_origin_durable_lsn();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, 3500);
+	cluster_smart_fusion = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(26);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_vec_set_union_and_clear);
 	UT_RUN(test_vec_rejects_invalid_origin_and_lsn);
@@ -644,5 +837,12 @@ main(void)
 	UT_RUN(test_r4_exported_family_sample_reconnect_generation_is_exact);
 	UT_RUN(test_stage8_ack_full_word_sample_is_record_coherent);
 	UT_RUN(test_current_mx_capability_generation_sample_is_connection_exact);
+	UT_RUN(test_ordinary_ctrc_peer_receives_actual_durability_with_sf_off);
+	UT_RUN(test_durable_message_preserves_sender_and_monotonicity);
+	UT_RUN(test_durable_publisher_requires_declared_current_capability);
+	UT_RUN(test_durable_tick_retries_idle_loss_without_changing_deadlines);
+	UT_RUN(test_durable_tick_observes_background_flush_without_commit);
+	UT_RUN(test_durable_zero_flush_does_not_send_positive_proof);
+	UT_RUN(test_existing_smart_fusion_peer_still_receives_durability);
 	UT_DONE();
 }

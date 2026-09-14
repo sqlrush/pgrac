@@ -8087,12 +8087,16 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 		&& !ctrc_cleaner_history_retirement_ready(&receipt->key, terminal_status, commit_scn)) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
+		ctrc_cleaner_note_itl_retained(receipt, "HISTORY_FLOOR", &observed_slot, observed_lsn,
+									   observed_scn, observed_origin, terminal_status, commit_scn);
 		return false;
 	}
 	cluster_ctrc_cleaner_reason_set(CTRC_CLEANER_REASON_WAL_DURABILITY);
 	if (!ctrc_cleaner_dependencies_durable(&first_dependencies, &durability)) {
 		ReleaseBuffer(buffer);
 		cluster_semantic_activation_leave(&admission);
+		ctrc_cleaner_note_itl_retained(receipt, "WAL_DURABILITY", &observed_slot, observed_lsn,
+									   observed_scn, observed_origin, terminal_status, commit_scn);
 		return false;
 	}
 

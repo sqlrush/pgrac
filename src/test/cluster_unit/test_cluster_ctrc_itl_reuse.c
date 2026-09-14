@@ -1043,6 +1043,47 @@ UT_TEST(test_data_final_shared_identity_and_origin_durability_still_guard)
 	}
 }
 
+UT_TEST(test_foreign_history_waits_for_real_coverage_then_retires_same_receipt)
+{
+	uint8 saved_class = reuse_history_class;
+	for (reuse_history_class = 1; reuse_history_class <= 2; reuse_history_class++) {
+		PGAlignedBlock before;
+		reuse_data_setup();
+		MemSet(&reuse_dependencies, 0, sizeof(reuse_dependencies));
+		PageSetLSNOrigin((Page)reuse_page.data, 1);
+		PageSetLSNPreserveOrigin((Page)reuse_page.data, 3000);
+		reuse_peer_flush = InvalidXLogRecPtr;
+		before = reuse_page;
+		reuse_expect_retained();
+		UT_ASSERT_EQ(reuse_retained_notes, 1);
+		UT_ASSERT(reuse_retained_stage != NULL
+				  && strcmp(reuse_retained_stage, "WAL_DURABILITY") == 0);
+		reuse_peer_flush = 2999;
+		reuse_expect_retained();
+		UT_ASSERT_EQ(reuse_retained_notes, 2);
+		/* Boundary provider now exposes actual sufficient coverage. The
+		 * unchanged complete cleaner, shared identity/CAS and floor run again. */
+		reuse_peer_flush = 3000;
+		UT_ASSERT(reuse_run());
+		UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_CLEANED);
+		UT_ASSERT_EQ(reuse_handle.receipt->required_lsn[1], 3000);
+		UT_ASSERT_EQ(reuse_handle.participant->applied_count, 0);
+		UT_ASSERT_EQ(reuse_wal_starts, 0);
+		UT_ASSERT_EQ(flush_calls, 0);
+		UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+	}
+	reuse_history_class = saved_class;
+}
+
+UT_TEST(test_history_floor_refusal_is_observed_only_after_release)
+{
+	reuse_data_setup();
+	reuse_local_floor = 899;
+	reuse_expect_retained();
+	UT_ASSERT_EQ(reuse_retained_notes, 1);
+	UT_ASSERT(reuse_retained_stage != NULL && strcmp(reuse_retained_stage, "HISTORY_FLOOR") == 0);
+}
+
 UT_TEST(test_data_completed_receipt_is_idempotent_and_exact_slot_is_unchanged)
 {
 	reuse_data_setup();
@@ -1139,7 +1180,9 @@ UT_TEST(test_history_recheck_rejects_effective_lock_return)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(34);
+	UT_RUN(test_foreign_history_waits_for_real_coverage_then_retires_same_receipt);
+	UT_RUN(test_history_floor_refusal_is_observed_only_after_release);
 	UT_RUN(test_lock_publication_with_creator_deleter_history_discharges);
 	UT_RUN(test_effective_old_lock_is_not_logical_data_history);
 	UT_RUN(test_strict_lock_absence_keeps_its_original_terminal_contract);

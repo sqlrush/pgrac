@@ -241,6 +241,8 @@ extern int cluster_sf_dep_suspect_origin_dead(int32 origin);
 extern void cluster_sf_observe_origin_durable_lsn(int32 origin, XLogRecPtr durable_lsn);
 extern XLogRecPtr cluster_sf_observed_origin_durable_lsn(int32 origin);
 extern void cluster_sf_publish_origin_durable_lsn(void);
+/* Existing-period background proof supply; independent of early block transfer. */
+extern void cluster_sf_origin_durable_lmon_tick(void);
 /* spec-2.2 additive amendment (spec-5.22e D5 prereq): capability learn +
  * clear are generation-bound (see ClusterSfPeerCap above).  Learn sites pass
  * the connection generation that carried the HELLO / PEER_CAPS_REPLY; the
