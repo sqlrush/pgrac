@@ -2023,6 +2023,9 @@ typedef struct UtR4HotProductFixture
 	int lock_calls;
 	int fetch_calls;
 	bool mutate_non_target_itl;
+	OffsetNumber mutate_hint_offset;
+	int hint_changes;
+	bool mutate_hint_payload;
 	bool fail_first_after_mutation;
 	bool live_poisoned;
 	bool full_source_poisoned;
@@ -2407,6 +2410,27 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
 	UT_ASSERT(dst_page != fixture->full_source);
 
 	memcpy(dst_page, fixture->full_source, BLCKSZ);
+	if (OffsetNumberIsValid(fixture->mutate_hint_offset))
+	{
+		/* Repeated refresh of an ordinary hint must not discard FULL forever.
+		 * Bound a broken consumer with a real refusal on its third fetch. */
+		if (fixture->fetch_calls > 2)
+		{
+			*reason_out = CLUSTER_CR_BUILD_IO_ERROR;
+			return CLUSTER_CR_BUILD_FAIL_CLOSED;
+		}
+		if (fixture->fetch_calls <= fixture->hint_changes)
+		{
+			HeapTupleHeader live_tuple = ut_r4_hot_tuple_at(
+				(Page) fixture->live_page, fixture->mutate_hint_offset);
+
+			live_tuple->t_infomask ^= HEAP_XMIN_COMMITTED;
+			if (fixture->mutate_hint_payload)
+				((unsigned char *)live_tuple)[live_tuple->t_hoff] ^= 1;
+		}
+		*reason_out = CLUSTER_CR_BUILD_NONE;
+		return CLUSTER_CR_BUILD_FULL;
+	}
 	if (fixture->fetch_calls == 1)
 	{
 		if (fixture->mutate_non_target_itl)
@@ -3147,6 +3171,107 @@ UT_TEST(test_scratch_frozen_creation_keeps_data_and_context_negatives)
 
 	for (leg = 6; leg <= 13; leg++)
 		ut_scratch_frozen_case(HEAP_XMIN_FROZEN, 1, leg, true, false);
+}
+
+/* Exercise the real FULL consumer, not a model of its page comparator. */
+static void
+ut_hot_full_hint_recheck_case(bool non_target, bool initially_committed,
+							bool invalid_xmin, bool payload_change)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult result;
+	RelationData relation = { 0 };
+	FormData_pg_class form = { 0 };
+	SnapshotData snapshot = { 0 };
+	ItemPointerData tid;
+	PGAlignedBlock expected_live;
+	HeapTupleHeader hint_tuple;
+	HeapHotSearchResultKind kind = HEAP_HOT_SEARCH_NOT_FOUND;
+	volatile bool caught = false;
+	bool semantic_change = invalid_xmin || payload_change;
+
+	ut_r4_hot_init_product_fixture(&fixture, &result);
+	fixture.mutate_hint_offset = non_target ? UT_HOT_SUCCESSOR_OFF : UT_HOT_ROOT_OFF;
+	fixture.hint_changes = semantic_change ? 1 : 2;
+	fixture.mutate_hint_payload = payload_change;
+	if (non_target)
+	{
+		Page page = (Page)fixture.live_page;
+		PageHeader header = (PageHeader)page;
+
+		header->pd_lower = SizeOfPageHeaderData + 2 * sizeof(ItemIdData);
+		header->pd_upper = UT_HOT_SUCCESSOR_DATA_OFF;
+		ItemIdSetNormal(PageGetItemId(page, UT_HOT_SUCCESSOR_OFF),
+						UT_HOT_SUCCESSOR_DATA_OFF, UT_HOT_TUPLE_LEN);
+		ut_r4_hot_set_tuple(ut_r4_hot_tuple_at(page, UT_HOT_SUCCESSOR_OFF),
+							UT_HOT_FULL_XMIN, 1, 0x42);
+	}
+	hint_tuple = ut_r4_hot_tuple_at((Page)fixture.live_page, fixture.mutate_hint_offset);
+	hint_tuple->t_infomask &= ~HEAP_XMIN_COMMITTED;
+	if (initially_committed)
+		hint_tuple->t_infomask |= HEAP_XMIN_COMMITTED;
+	if (invalid_xmin)
+		hint_tuple->t_infomask |= HEAP_XMIN_INVALID;
+	memcpy(expected_live.data, fixture.live_page, BLCKSZ);
+	hint_tuple = ut_r4_hot_tuple_at((Page)expected_live.data, fixture.mutate_hint_offset);
+	hint_tuple->t_infomask ^= HEAP_XMIN_COMMITTED;
+	if (payload_change)
+		((unsigned char *)hint_tuple)[hint_tuple->t_hoff] ^= 1;
+	ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
+									  UT_HOT_READ_SCN, PageGetLSN((Page)fixture.full_source));
+	relation.rd_id = UT_HOT_TABLE_OID;
+	relation.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.read_scn = UT_HOT_READ_SCN;
+	snapshot.read_epoch = 9;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+	ut_capture_error = true;
+	PG_TRY();
+	{
+		kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot,
+												&result, NULL, true);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	ut_capture_error = false;
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(kind, HEAP_HOT_SEARCH_OWNED_SCRATCH);
+	UT_ASSERT_EQ(fixture.fetch_calls, semantic_change ? 2 : 1);
+	UT_ASSERT_EQ(fixture.lock_calls, semantic_change ? 4 : 2);
+	UT_ASSERT_EQ(memcmp(expected_live.data, fixture.live_page, BLCKSZ), 0);
+	UT_ASSERT_EQ(ut_live_visibility_calls, 0);
+	UT_ASSERT(ut_hot_content_lock_held);
+	if (!caught)
+	{
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(result.tuple.t_data), UT_HOT_FULL_XMIN);
+		UT_ASSERT_EQ(((unsigned char *)result.tuple.t_data)[result.tuple.t_data->t_hoff],
+					 UT_HOT_PAYLOAD);
+	}
+	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+	ut_hot_production_core_active = false;
+	ut_hot_product_fixture = NULL;
+	ut_hot_live_ref_page = NULL;
+	BufferBlocks = NULL;
+}
+
+UT_TEST(test_real_hot_full_accepts_only_ordinary_xmin_hint_changes)
+{
+	ut_hot_full_hint_recheck_case(false, false, false, false);
+	ut_hot_full_hint_recheck_case(false, true, false, false);
+	ut_hot_full_hint_recheck_case(true, false, false, false);
+	ut_hot_full_hint_recheck_case(true, true, false, false);
+}
+
+UT_TEST(test_real_hot_full_retries_frozen_and_payload_changes_with_hint)
+{
+	ut_hot_full_hint_recheck_case(true, false, true, false);
+	ut_hot_full_hint_recheck_case(true, true, true, false);
+	ut_hot_full_hint_recheck_case(true, true, false, true);
 }
 
 UT_TEST(test_real_hot_full_consumer_preserves_frozen_creator_without_slot)
@@ -6795,6 +6920,8 @@ main(void)
 	UT_RUN(test_real_hot_full_redirect_and_slotless_creator_still_select_exact_data);
 	UT_RUN(test_real_hot_full_broken_chain_and_ambiguous_creator_are_errors_not_zero_rows);
 	UT_RUN(test_real_hot_full_three_versions_select_creator_and_deleter_separately);
+	UT_RUN(test_real_hot_full_accepts_only_ordinary_xmin_hint_changes);
+	UT_RUN(test_real_hot_full_retries_frozen_and_payload_changes_with_hint);
 	UT_RUN(test_real_hot_full_consumer_preserves_frozen_creator_without_slot);
 	UT_RUN(test_full_post_snapshot_root_absence_is_not_found);
 	UT_RUN(test_full_unused_root_with_nonzero_storage_is_rejected);

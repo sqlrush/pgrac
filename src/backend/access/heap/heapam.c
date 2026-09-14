@@ -4555,6 +4555,73 @@ heap_hot_r4_scratch_page_valid(Page page)
 	return maxoff <= MaxHeapTuplesPerPage;
 }
 
+/*
+ * A completed FULL image is not invalidated by a local xmin commit hint.
+ * Preserve the whole-page guard for everything else, including other tuples'
+ * ITLs.  In particular, COMMITTED together with INVALID denotes frozen xmin,
+ * not an ordinary hint.  Only the private comparison copy is normalized.
+ */
+static bool
+heap_hot_r4_input_matches(Page saved, Page current)
+{
+	PGAlignedBlock normalized;
+	PageHeader header = (PageHeader)saved;
+	OffsetNumber maxoff;
+	OffsetNumber off;
+
+	if (memcmp(saved, current, BLCKSZ) == 0)
+		return true;
+	if (!heap_hot_r4_scratch_page_valid(saved)
+		|| !heap_hot_r4_scratch_page_valid(current)
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
+		|| memcmp(saved, current, header->pd_lower) != 0)
+		return false;
+
+	memcpy(normalized.data, current, BLCKSZ);
+	maxoff = PageGetMaxOffsetNumber(saved);
+	for (off = FirstOffsetNumber; off <= maxoff; off++)
+	{
+		ItemId item = PageGetItemId(saved, off);
+		Size start;
+		Size length;
+		OffsetNumber prior;
+		HeapTupleHeader before;
+		HeapTupleHeader after;
+
+		if (!ItemIdHasStorage(item))
+			continue;
+		start = ItemIdGetOffset(item);
+		length = ItemIdGetLength(item);
+		if (start < header->pd_upper || start > header->pd_special
+			|| length > header->pd_special - start)
+			return false;
+		/* Malformed overlapping storage must not disguise payload as a hint. */
+		for (prior = FirstOffsetNumber; prior < off; prior++)
+		{
+			ItemId other = PageGetItemId(saved, prior);
+			Size other_start = ItemIdGetOffset(other);
+
+			if (ItemIdHasStorage(other) && start < other_start + ItemIdGetLength(other)
+				&& other_start < start + length)
+				return false;
+		}
+		if (!ItemIdIsNormal(item))
+			continue;
+		if (start != MAXALIGN(start) || length < SizeofHeapTupleHeader)
+			return false;
+		before = (HeapTupleHeader)((char *)saved + start);
+		after = (HeapTupleHeader)(normalized.data + start);
+		if (before->t_hoff < SizeofHeapTupleHeader || before->t_hoff > length
+			|| after->t_hoff < SizeofHeapTupleHeader || after->t_hoff > length)
+			return false;
+		if (TransactionIdIsNormal(HeapTupleHeaderGetRawXmin(before))
+			&& ((before->t_infomask ^ after->t_infomask) == HEAP_XMIN_COMMITTED)
+			&& ((before->t_infomask | after->t_infomask) & HEAP_XMIN_INVALID) == 0)
+			after->t_infomask = before->t_infomask;
+	}
+	return memcmp(saved, normalized.data, BLCKSZ) == 0;
+}
+
 static bool
 heap_hot_r4_data_slot(uint8 flags)
 {
@@ -5043,7 +5110,7 @@ restart_live_search:
 				revalidated_tag = heap_hot_r4_buffer_tag(buffer);
 				page = BufferGetPage(buffer);
 				if (!BufferTagsEqual(&tag, &revalidated_tag)
-					|| memcmp(stable_input, page, BLCKSZ) != 0)
+					|| !heap_hot_r4_input_matches((Page)stable_input, page))
 				{
 					memset(result, 0, sizeof(*result));
 					result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
