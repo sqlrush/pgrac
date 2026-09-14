@@ -3649,15 +3649,28 @@ rtvis_local_freshref_c1b_pair_eligible(
 }
 
 static ClusterUndoVerdictResult
-rtvis_resolve_own_xid_freshref_c1b_pair(
-	TransactionId raw_xid, uint32 undo_segment_id,
-	uint32 expected_tt_slot_id, SCN retained_commit_scn)
+rtvis_resolve_own_xid_freshref_c1b_pair(TransactionId raw_xid, uint32 undo_segment_id,
+										uint32 expected_tt_slot_id, SCN retained_commit_scn,
+										SCN read_scn)
 {
 	ClusterUndoVerdictResult result = {
 		.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED,
 		.commit_scn = InvalidScn,
 		.wrap = 0};
 	uint16 wrap = 0;
+
+	/* A local immutable read can consume the same snapshot-relative origin
+	 * bound as a foreign read. The terminal-census caller passes no read SCN
+	 * and must remain exact-only. A bound is never the retained exact stamp. */
+	if (SCN_VALID(read_scn)) {
+		uint64 epoch = cluster_epoch_get_current();
+		ClusterUndoVerdictResult ordinary = rtvis_resolve_own_xid(raw_xid, read_scn);
+
+		if (cluster_epoch_get_current() != epoch)
+			return result;
+		if (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND)
+			return ordinary;
+	}
 
 	if (!cluster_cr_server_local_freshref_c1b_pair_exact(
 			raw_xid, undo_segment_id, expected_tt_slot_id,
@@ -3672,6 +3685,18 @@ rtvis_resolve_own_xid_freshref_c1b_pair(
 	cluster_rtvis_resolve_note_committed();
 	return result;
 }
+
+#ifdef USE_CLUSTER_UNIT
+ClusterUndoVerdictResult
+cluster_runtime_visibility_test_local_retained_read(TransactionId xid, uint32 segment, uint32 slot,
+													SCN retained_scn, SCN read_scn);
+ClusterUndoVerdictResult
+cluster_runtime_visibility_test_local_retained_read(TransactionId xid, uint32 segment, uint32 slot,
+													SCN retained_scn, SCN read_scn)
+{
+	return rtvis_resolve_own_xid_freshref_c1b_pair(xid, segment, slot, retained_scn, read_scn);
+}
+#endif
 
 /* Local-origin retained proof used by terminal census after its DATA record
  * has left the resident undo cache.  This consumes only the already-frozen
@@ -3734,8 +3759,7 @@ cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
 	}
 
 	verdict = rtvis_resolve_own_xid_freshref_c1b_pair(
-		locator->xid, segment_id, (uint32) tt_slot_offset + 1,
-		retained_commit_scn);
+		locator->xid, segment_id, (uint32)tt_slot_offset + 1, retained_commit_scn, InvalidScn);
 	if (verdict.kind != CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
 		|| verdict.commit_scn != retained_commit_scn)
 		goto failed;
@@ -3892,8 +3916,7 @@ cluster_undo_verdict_resolve_internal(
 	if (origin_node == cluster_node_id) {
 		if (freshref_pair)
 			return rtvis_resolve_own_xid_freshref_c1b_pair(
-				raw_xid, undo_segment_id, expected_tt_slot_id,
-				freshref_pair_scn);
+				raw_xid, undo_segment_id, expected_tt_slot_id, freshref_pair_scn, read_scn);
 		return rtvis_resolve_own_xid(raw_xid, read_scn);
 	}
 

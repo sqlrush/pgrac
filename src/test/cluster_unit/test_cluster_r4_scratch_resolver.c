@@ -1870,14 +1870,17 @@ ut_full_scratch_case_with_role(bool deleting, bool local_origin, int scenario, i
 		UT_ASSERT_EQ(ut_calls.exact_resolve, 0);
 		UT_ASSERT_EQ(ut_calls.pair_resolve, 0);
 	} else if (scenario >= 12) {
-		bool expected_error = (scenario >= 13 && scenario <= 20) || scenario == 25;
+		bool expected_error
+			= (scenario >= 13 && scenario <= 20 && scenario != 16) || scenario == 25;
 		bool expected_exact = scenario == 13 || scenario == 17 || scenario == 18 || scenario == 21
 							  || scenario == 24;
 
 		UT_ASSERT_EQ(caught, expected_error);
 		if (!caught)
 			UT_ASSERT_EQ(visible,
-						 scenario == 12 || scenario == 23 || scenario == 26 ? !deleting : deleting);
+						 scenario == 12 || scenario == 16 || scenario == 23 || scenario == 26
+							 ? !deleting
+							 : deleting);
 		UT_ASSERT_EQ(ut_calls.exact_resolve, expected_exact ? 1 : 0);
 		UT_ASSERT_EQ(ut_calls.pair_resolve, scenario == 17 || scenario == 18 ? 0 : 1);
 	} else {
@@ -2031,6 +2034,8 @@ UT_TEST(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_
 	for (int deleting = 0; deleting <= 1; deleting++) {
 		ut_full_scratch_exact_case(deleting, false, 25);
 		ut_full_scratch_exact_case(deleting, false, 26);
+		ut_full_scratch_exact_case(deleting, true, 25);
+		ut_full_scratch_exact_case(deleting, true, 26);
 	}
 }
 

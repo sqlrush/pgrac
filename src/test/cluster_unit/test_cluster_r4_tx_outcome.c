@@ -40,6 +40,7 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/storage/cluster_undo_buf.h"
 #include "cluster/cluster_cr.h"
+#include "cluster/cluster_cr_server.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
@@ -158,6 +159,13 @@ static int test_regular_root_resolve_calls;
 static int test_terminal_census_root_resolve_calls;
 static bool test_local_freshref_pair_exact;
 static int test_local_freshref_pair_calls;
+static SCN test_local_origin_bound;
+static int test_local_origin_calls;
+static bool test_local_origin_epoch_drift;
+
+extern ClusterUndoVerdictResult
+cluster_runtime_visibility_test_local_retained_read(TransactionId xid, uint32 segment, uint32 slot,
+													SCN retained_scn, SCN read_scn);
 static bool test_remote_origin_enabled;
 static int test_remote_origin_calls;
 static uint32 test_remote_origin_generation;
@@ -219,6 +227,40 @@ cluster_rtvis_resolve_note_committed(void)
 void
 cluster_rtvis_resolve_note_failclosed(void)
 {}
+
+void
+cluster_rtvis_resolve_note_aborted(void)
+{}
+
+void
+cluster_scn_observe(SCN remote_scn pg_attribute_unused())
+{}
+
+int
+scn_time_cmp(SCN a, SCN b)
+{
+	return scn_local(a) == scn_local(b) ? 0 : (scn_local(a) > scn_local(b) ? 1 : -1);
+}
+
+bool
+cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
+								   ClusterGcsUndoVerdictPage *page)
+{
+	test_local_origin_calls++;
+	UT_ASSERT_EQ(xid, TEST_ORIGIN_XID);
+	UT_ASSERT(!authoritative);
+	if (test_local_origin_epoch_drift)
+		test_formation_epoch++;
+	if (!SCN_VALID(test_local_origin_bound))
+		return false;
+	memset(page, 0, sizeof(*page));
+	page->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+	page->version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+	page->xid_echo = xid;
+	page->verdict = CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+	page->horizon_scn = test_local_origin_bound;
+	return true;
+}
 
 static bool
 test_uba_equal(UBA left, UBA right)
@@ -1017,6 +1059,9 @@ reset_exact_origin_fixture(void)
 	test_terminal_census_root_resolve_calls = 0;
 	test_local_freshref_pair_exact = false;
 	test_local_freshref_pair_calls = 0;
+	test_local_origin_bound = InvalidScn;
+	test_local_origin_calls = 0;
+	test_local_origin_epoch_drift = false;
 	test_remote_origin_enabled = false;
 	test_remote_origin_calls = 0;
 	test_remote_origin_generation = 0;
@@ -3913,10 +3958,48 @@ UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
 	}
 }
 
+UT_TEST(test_local_retained_read_bound_precedes_exact_pair_without_promoting_it)
+{
+	ClusterUndoVerdictResult result;
+	reset_exact_origin_fixture();
+	test_local_origin_bound = 100;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn, 120);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+	UT_ASSERT_EQ(result.commit_scn, (SCN)100);
+	UT_ASSERT_EQ(test_local_origin_calls, 1);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+
+	reset_exact_origin_fixture();
+	test_local_origin_bound = 100;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn, 99);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 1);
+
+	reset_exact_origin_fixture();
+	test_local_origin_bound = 100;
+	test_local_freshref_pair_exact = true;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(result.commit_scn, test_commit_scn);
+	UT_ASSERT_EQ(test_local_origin_calls, 0); /* terminal census stays exact-only */
+
+	reset_exact_origin_fixture();
+	test_local_origin_bound = 100;
+	test_local_origin_epoch_drift = true;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn, 120);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(120);
+	UT_PLAN(121);
+	UT_RUN(test_local_retained_read_bound_precedes_exact_pair_without_promoting_it);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);

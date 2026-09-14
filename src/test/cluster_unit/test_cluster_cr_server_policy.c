@@ -1687,10 +1687,32 @@ UT_TEST(test_a143_checkpoint_is_not_exact_and_conflicting_stamp_refuses)
 				 CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
 }
 
+UT_TEST(test_retained_data_alias_has_origin_bound_but_never_exact_pair_identity)
+{
+	ClusterGcsUndoVerdictPage page;
+	ClusterUndoVerdictResult pair;
+	c0_reset();
+	c0_startup_bound = 86324311;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_matched_segment = 12;
+	c0_matched_slot = 32;
+	c0_resolved_scn = 14601620;
+	memset(&page, 0, sizeof(page));
+	UT_ASSERT(cluster_lms_undo_verdict_fill_page(4264048, false, &page));
+	UT_ASSERT_EQ(page.verdict, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON);
+	UT_ASSERT_EQ(page.horizon_scn, c0_startup_bound);
+	UT_ASSERT_EQ(page.commit_scn, InvalidScn);
+	pair = cluster_cr_server_test_own_xid_pair_verdict(4264048, 2, 33, 14601620);
+	UT_ASSERT_EQ(pair.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(pair.commit_scn, InvalidScn);
+}
+
 int
 main(void)
 {
-	UT_PLAN(37);
+	UT_PLAN(38);
+	UT_RUN(test_retained_data_alias_has_origin_bound_but_never_exact_pair_identity);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);

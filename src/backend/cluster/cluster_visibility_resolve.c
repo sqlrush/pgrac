@@ -1152,6 +1152,13 @@ cluster_visibility_resolve_scratch_scn(Page page, uint8 slot_index, TransactionI
 					&& retained.commit_scn == ref.cached_commit_scn
 					&& cluster_epoch_get_current() == (uint64)ref.cluster_epoch)
 					completed = cluster_vis_from_undo_verdict(retained, out);
+				else if (retained.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND
+						 && SCN_VALID(retained.commit_scn)
+						 && scn_time_cmp(retained.commit_scn, read_scn) <= 0
+						 && cluster_epoch_get_current() == (uint64)ref.cluster_epoch)
+					/* Read-only proof: preserve the bound marker, never install
+					 * it in an exact memo or stamp the immutable scratch page. */
+					completed = cluster_vis_from_undo_verdict(retained, out);
 				else if (retained.kind != CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED) {
 					out->evidence = CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS;
 					out->status = CLUSTER_TT_STATUS_UNKNOWN;
