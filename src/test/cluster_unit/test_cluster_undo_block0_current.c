@@ -2910,6 +2910,95 @@ UT_TEST(test_live_owner_reuse_flushes_one_exact_successor_to_disk_and_resident)
 	UT_ASSERT_EQ(semantic_leave_calls, 1);
 }
 
+UT_TEST(test_cold_live_owner_reuse_loads_existing_header_under_same_xcur)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0Generation expected = { true, 7 };
+	char successor_page[BLCKSZ];
+
+	reset_fixture();
+	fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	fake_provision_creator = false;
+	fake_provision_generation = expected;
+	init_recyclable_block0(fake_pin_page, key.segment_id, key.owner_instance, expected.value);
+	memcpy(fake_disk_page, fake_pin_page, BLCKSZ);
+	init_fresh_successor_block0(successor_page, key.segment_id, key.owner_instance,
+								expected.value + 1);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_current_live_owner_reuse_exact(&key, &expected, successor_page, 1000),
+		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(provision_calls, 1);
+	UT_ASSERT_EQ(reuse_wal_calls, 1);
+	UT_ASSERT_EQ(flush_sync_calls, 1);
+	UT_ASSERT_EQ(local_release_calls, 1);
+	UT_ASSERT_EQ(semantic_leave_calls, 1);
+}
+
+UT_TEST(test_cold_reuse_retains_absence_generation_io_and_authority_negatives)
+{
+	ClusterUndoBlock0Result failures[]
+		= { CLUSTER_UNDO_BLOCK0_NOT_FOUND, CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH,
+			CLUSTER_UNDO_BLOCK0_IO_ERROR, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED };
+	unsigned i;
+
+	for (i = 0; i < lengthof(failures); i++) {
+		ClusterUndoBlock0LogicalKey key = test_key(1);
+		ClusterUndoBlock0Generation expected = { true, 7 };
+		char successor_page[BLCKSZ];
+
+		reset_fixture();
+		fake_modifier_side = CLUSTER_SEMANTIC_TARGET_SIDE;
+		fake_master = cluster_node_id;
+		fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+		fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		fake_provision_creator = i == 0;
+		fake_provision_generation = (ClusterUndoBlock0Generation){ true, i == 1 ? 8 : 7 };
+		if (i == 2)
+			fake_provision_result = CLUSTER_UNDO_BLOCK0_IO_ERROR;
+		if (i == 3)
+			fake_sample_invalidates_authority = true;
+		init_recyclable_block0(fake_pin_page, key.segment_id, key.owner_instance, 7);
+		memcpy(fake_disk_page, fake_pin_page, BLCKSZ);
+		init_fresh_successor_block0(successor_page, key.segment_id, key.owner_instance, 8);
+		UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_reuse_exact(&key, &expected,
+																		successor_page, 1000),
+					 failures[i]);
+		UT_ASSERT_EQ(reuse_wal_calls, 0);
+		UT_ASSERT_EQ(flush_sync_calls, 0);
+		UT_ASSERT_EQ(local_release_calls, 1);
+		UT_ASSERT_EQ(semantic_leave_calls, 1);
+		if (i == 0)
+			UT_ASSERT_EQ(provision_abort_calls, 1);
+		if (i == 2)
+			UT_ASSERT_EQ(frame_release_calls, 1);
+	}
+}
+
+UT_TEST(test_ordinary_xcur_cold_sample_does_not_gain_live_owner_loading)
+{
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	ClusterUndoBlock0ResolvedRoot root = test_root();
+	ClusterUndoBlock0Generation observed = { false, 0 };
+	ClusterUndoBlock0Result failure;
+
+	reset_fixture();
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	UT_ASSERT_EQ(cluster_undo_block0_current_acquire_begin(&key, CLUSTER_UNDO_BLOCK0_XCUR, 1000,
+														   &guard, &failure),
+				 CLUSTER_UNDO_BLOCK0_CURRENT_HELD);
+	UT_ASSERT_EQ(cluster_undo_block0_current_sample_generation_exclusive(&guard, &root, &observed),
+				 CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
+	UT_ASSERT_EQ(provision_calls, 0);
+	UT_ASSERT_EQ(frame_reserve_calls, 0);
+	cluster_undo_block0_current_cancel(&guard);
+}
+
 UT_TEST(test_live_owner_reuse_rejects_stale_disk_before_any_flush)
 {
 	ClusterUndoBlock0LogicalKey key = test_key(1);
@@ -3505,7 +3594,10 @@ UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
 int
 main(void)
 {
-	UT_PLAN(82);
+	UT_PLAN(85);
+	UT_RUN(test_cold_live_owner_reuse_loads_existing_header_under_same_xcur);
+	UT_RUN(test_cold_reuse_retains_absence_generation_io_and_authority_negatives);
+	UT_RUN(test_ordinary_xcur_cold_sample_does_not_gain_live_owner_loading);
 	UT_RUN(test_record_seal_requires_an_active_predecessor);
 	UT_RUN(test_record_drain_bound_is_owned_by_active_to_committed_only);
 	UT_RUN(test_wait_failures_preserve_exact_reason_and_cleanup);

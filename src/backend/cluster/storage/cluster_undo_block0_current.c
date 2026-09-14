@@ -1445,6 +1445,49 @@ cluster_undo_block0_current_recheck_exclusive(ClusterUndoBlock0CurrentGuard *gua
 	return current_held_xcur_proof(guard, &data, &proof);
 }
 
+/* Cache absence is not loss of the admitted owner's current authority.
+ * Materialize only an existing exact disk header, under the SAME own XCUR;
+ * never create a segment or change the caller's expected generation here. */
+static ClusterUndoBlock0Result
+current_live_owner_sample_generation(ClusterUndoBlock0CurrentGuardData *data,
+									 const ClusterUndoBlock0ResolvedRoot *root,
+									 const ClusterUndoBlock0AuthorityProof *proof,
+									 ClusterUndoBlock0Generation *generation,
+									 volatile ClusterUndoBlock0LiveOwnerCleanup *cleanup)
+{
+	ClusterUndoBlock0Result result;
+	char *page = NULL;
+	bool creator = false;
+
+	result
+		= cluster_undo_block0_sample_resident_generation(&data->logical, root, proof, generation);
+	if (result != CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED)
+		return result;
+	if (cluster_node_id < 0 || data->logical.owner_instance != (uint8)(cluster_node_id + 1)
+		|| (data->reserved[CURRENT_ADMISSION_BORROWED_INDEX] != CURRENT_ADMISSION_LIVE_OWNER_SOURCE
+			&& data->reserved[CURRENT_ADMISSION_BORROWED_INDEX]
+				   != CURRENT_ADMISSION_LIVE_OWNER_TARGET))
+		return result;
+
+	/* The caller retains the pin through its final authority/root check. */
+	result = cluster_undo_block0_frame_reserve_batch(1, cleanup->frame);
+	if (result == CLUSTER_UNDO_BLOCK0_OK)
+		result = cluster_undo_block0_provision_begin(&data->logical, root, proof, cleanup->frame,
+													 cleanup->pin, &page, &creator);
+	if (result == CLUSTER_UNDO_BLOCK0_OK) {
+		if (creator) {
+			cleanup->provision_held = true;
+			result = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
+		} else {
+			cleanup->pin_held = true;
+			*generation = cleanup->pin->observed_generation;
+			if (!generation->known || generation->value == UINT32_MAX)
+				result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
+		}
+	}
+	return result;
+}
+
 ClusterUndoBlock0Result
 cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *guard,
 											  const ClusterUndoBlock0ResolvedRoot *root,
@@ -1485,16 +1528,33 @@ cluster_undo_block0_current_sample_generation_exclusive(ClusterUndoBlock0Current
 	ClusterUndoBlock0AuthorityProof proof;
 	ClusterUndoBlock0Generation sampled;
 	ClusterUndoBlock0Result result;
+	ClusterUndoBlock0FrameToken frame = { UINT32_MAX, false };
+	ClusterUndoBlock0Pin pin;
+	volatile ClusterUndoBlock0LiveOwnerCleanup cleanup;
 
 	if (root == NULL || observed == NULL)
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	result = current_held_xcur_proof(guard, &data, &proof);
 	if (result != CLUSTER_UNDO_BLOCK0_OK)
 		return result;
+	memset(&pin, 0, sizeof(pin));
+	pin.slot = -1;
+	memset((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup, 0, sizeof(cleanup));
+	cleanup.frame = &frame;
+	cleanup.pin = &pin;
 	PG_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
 	{
-		result = cluster_undo_block0_sample_resident_generation(&data->logical, root, &proof,
-																&sampled);
+		PG_ENSURE_ERROR_CLEANUP(current_live_owner_error_cleanup,
+								PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+		{
+			result = current_live_owner_sample_generation(data, root, &proof, &sampled, &cleanup);
+			if (result == CLUSTER_UNDO_BLOCK0_OK && !current_live_recheck(data))
+				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+			current_live_owner_error_cleanup(
+				0, PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
+		}
+		PG_END_ENSURE_ERROR_CLEANUP(current_live_owner_error_cleanup,
+									PointerGetDatum((ClusterUndoBlock0LiveOwnerCleanup *)&cleanup));
 	}
 	PG_END_ENSURE_ERROR_CLEANUP(current_error_cleanup, PointerGetDatum(guard));
 	if (result != CLUSTER_UNDO_BLOCK0_OK)
@@ -1636,8 +1696,6 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 	ClusterUndoBlock0Result current_failure = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	ClusterSemanticAdmissionResult admission_result;
 	uint32 logical_slot;
-	char *page = NULL;
-	bool creator = false;
 
 	if (publication != NULL)
 		memset(publication, 0, sizeof(*publication));
@@ -1711,31 +1769,10 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 		result = current_held_xcur_proof(&guard, &data, &proof);
 		if (result != CLUSTER_UNDO_BLOCK0_OK)
 			goto ensure_done;
-		result = cluster_undo_block0_sample_resident_generation(key, &root, &proof, &generation);
+		result = current_live_owner_sample_generation(data, &root, &proof, &generation, &cleanup);
 		if (result == CLUSTER_UNDO_BLOCK0_OK) {
 			if (!generation.known || generation.value == UINT32_MAX)
 				result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
-		} else if (result == CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED) {
-			result = cluster_undo_block0_frame_reserve_batch(1, &frame);
-			if (result != CLUSTER_UNDO_BLOCK0_OK)
-				goto ensure_done;
-			result = cluster_undo_block0_provision_begin(key, &root, &proof, &frame, &pin, &page,
-														 &creator);
-			if (result != CLUSTER_UNDO_BLOCK0_OK)
-				goto ensure_done;
-			if (creator) {
-				cleanup.provision_held = true;
-				result = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
-				goto ensure_done;
-			}
-			cleanup.pin_held = true;
-			generation = pin.observed_generation;
-			if (!generation.known || generation.value == UINT32_MAX) {
-				result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
-				goto ensure_done;
-			}
-		} else {
-			goto ensure_done;
 		}
 		if (result != CLUSTER_UNDO_BLOCK0_OK)
 			goto ensure_done;
