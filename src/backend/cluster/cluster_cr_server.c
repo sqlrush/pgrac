@@ -2314,6 +2314,18 @@ lms_resolve_own_xid_freshref_c1b_pair(TransactionId xid, uint32 expected_segment
 					&& resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
 					&& raw_clog_status == TRANSACTION_STATUS_COMMITTED) {
 					retention_ok = lms_own_xid_recycle_bound(&horizon_scn);
+					/* This path already holds the no-reuse reader fence and
+					 * literal own COMMITTED proof. A clean startup's durable
+					 * bound may cover the pre-start xid when volatile H cannot. */
+					if (cluster_undo_retention_horizon_enabled
+						&& cluster_tt_slot_retention_off_recycle_count() == 0) {
+						SCN startup = cluster_tt_slot_startup_committed_bound(xid);
+						if (SCN_VALID(startup)
+							&& (!retention_ok || scn_time_cmp(startup, horizon_scn) > 0)) {
+							horizon_scn = startup;
+							retention_ok = true;
+						}
+					}
 					diagnostic->retention_sampled = true;
 					diagnostic->retention_ok = retention_ok;
 					diagnostic->horizon_scn = horizon_scn;
@@ -2425,6 +2437,48 @@ typedef struct LmsOrdinaryVerdictDiagnostic {
 	bool did_abort;
 } LmsOrdinaryVerdictDiagnostic;
 
+/* 0: no added proof; 1: committed bound; -1: own committed stamp contradicts
+ * the validated shutdown checkpoint. Nothing here authorizes reclamation. */
+static int
+lms_own_xid_startup_bound(TransactionId xid, SCN stamped_scn, SCN *out_bound)
+{
+	SCN bound = cluster_tt_slot_startup_committed_bound(xid);
+	volatile int result = 0;
+
+	if (!SCN_VALID(bound) || !cluster_undo_retention_horizon_enabled
+		|| cluster_tt_slot_retention_off_recycle_count() != 0)
+		return 0;
+	PG_TRY(startup_bound);
+	{
+		cluster_cr_native_prehistory_reader_lock();
+		if (!cluster_cr_native_prehistory_disabled() && cluster_xid_is_mine(xid)) {
+			LWLockAcquire(XactTruncationLock, LW_SHARED);
+			if (!TransactionIdPrecedes(xid, ShmemVariableCache->oldestClogXid)) {
+				XLogRecPtr lsn = InvalidXLogRecPtr;
+				if (TransactionIdGetStatus(xid, &lsn) == TRANSACTION_STATUS_COMMITTED) {
+					if (SCN_VALID(stamped_scn) && scn_time_cmp(stamped_scn, bound) > 0)
+						result = -1;
+					else {
+						*out_bound = bound;
+						result = 1;
+					}
+				}
+			}
+			LWLockRelease(XactTruncationLock);
+		}
+		cluster_cr_native_prehistory_reader_unlock();
+	}
+	PG_CATCH(startup_bound);
+	{
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY(startup_bound);
+	return result;
+}
+
 static LmsOwnXidReason
 lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_id,
 									 uint32 expected_tt_slot_id, bool allow_live,
@@ -2458,6 +2512,22 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 	diagnostic->matched_segment = matched_segment;
 	diagnostic->matched_slot = matched_slot;
 	diagnostic->matched_wrap = wrap;
+	if (resolve == CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH
+		|| resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN) {
+		int startup = lms_own_xid_startup_bound(
+			xid, resolve == CLUSTER_TT_DURABLE_RESOLVED_SCN ? scn : InvalidScn, &horizon);
+		if (startup < 0) {
+			diagnostic->predicate = "STARTUP_CHECKPOINT_CONTRADICTION";
+			return LMS_OWN_XID_REFUSE_OTHER;
+		}
+		if (startup > 0) {
+			diagnostic->predicate = "STARTUP_COMMITTED_BOUND";
+			diagnostic->horizon_scn = horizon;
+			*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON;
+			*out_horizon_scn = horizon;
+			return LMS_OWN_XID_PROVEN;
+		}
+	}
 	switch (resolve) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN: {
 		bool did_commit = TransactionIdDidCommit(xid);

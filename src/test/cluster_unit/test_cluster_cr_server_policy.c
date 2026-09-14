@@ -128,6 +128,7 @@ static int c0_event_count;
 static ClusterTTDurableResolve c0_resolve;
 static SCN c0_resolved_scn;
 static SCN c0_horizon_scn;
+static SCN c0_startup_bound;
 static uint16 c0_matched_segment;
 static uint16 c0_matched_slot;
 static bool c0_xid_is_mine;
@@ -196,6 +197,7 @@ c0_reset(void)
 	c0_resolve = CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH;
 	c0_resolved_scn = InvalidScn;
 	c0_horizon_scn = (SCN)100;
+	c0_startup_bound = InvalidScn;
 	c0_matched_segment = 0;
 	c0_matched_slot = 0;
 	c0_xid_is_mine = true;
@@ -377,6 +379,13 @@ cluster_tt_slot_max_recycle_horizon(void)
 	c0_bound_calls++;
 	c0_note(C0_EV_BOUND);
 	return c0_retention_ok ? c0_horizon_scn : InvalidScn;
+}
+
+SCN cluster_tt_slot_startup_committed_bound(TransactionId xid);
+SCN
+cluster_tt_slot_startup_committed_bound(TransactionId xid)
+{
+	return xid < 4275633 ? c0_startup_bound : InvalidScn;
 }
 
 bool
@@ -1604,10 +1613,84 @@ UT_TEST(test_ordinary_diagnostic_keeps_recycled_bound_and_refusal)
 	UT_ASSERT_EQ(c0_did_abort_calls, 1);
 }
 
+UT_TEST(test_a143_clean_restart_pair_keeps_old_terminal_provable)
+{
+	ClusterUndoVerdictResult result;
+	c0_reset();
+	c0_startup_bound = 86324311;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	result = cluster_cr_server_test_own_xid_pair_verdict(4222256, 2, 5, 14395044);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(result.commit_scn, (SCN)14395044);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+}
+
+UT_TEST(test_a143_clean_restart_ordinary_is_bound_not_exact)
+{
+	c0_reset();
+	c0_startup_bound = 86324311;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	c0_did_commit = true;
+	UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4222256, 2, 5, false),
+				 CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+}
+
+UT_TEST(test_a143_startup_bound_retains_all_authority_refusals)
+{
+	int fault;
+	for (fault = 0; fault < 8; fault++) {
+		TransactionId xid = fault == 6 ? 4275633 : 4222256;
+		ClusterUndoVerdictResult pair;
+		c0_reset();
+		c0_startup_bound = 86324311;
+		c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+		if (fault == 0)
+			c0_disabled = true;
+		if (fault == 1)
+			c0_xid_is_mine = false;
+		if (fault == 2)
+			cluster_undo_retention_horizon_enabled = false;
+		if (fault == 3)
+			c0_ungated_recycles = 1;
+		if (fault == 4)
+			c0_raw_status = TRANSACTION_STATUS_SUB_COMMITTED;
+		if (fault == 5)
+			c0_variable_cache.oldestClogXid = xid + 1;
+		if (fault == 7)
+			c0_resolve = CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP;
+		pair = cluster_cr_server_test_own_xid_pair_verdict(xid, 2, 5, 14395044);
+		UT_ASSERT_EQ(pair.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(xid, 2, 5, false),
+					 CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+		UT_ASSERT_EQ(c0_native_lock_depth, 0);
+		UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_a143_checkpoint_is_not_exact_and_conflicting_stamp_refuses)
+{
+	ClusterUndoVerdictResult pair;
+	c0_reset();
+	c0_startup_bound = 100;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	pair = cluster_cr_server_test_own_xid_pair_verdict(4222256, 2, 5, 101);
+	UT_ASSERT_EQ(pair.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	c0_resolve = CLUSTER_TT_DURABLE_RESOLVED_SCN;
+	c0_resolved_scn = 101;
+	c0_did_commit = true;
+	c0_accept_resolved_scn = true;
+	UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4222256, 2, 5, false),
+				 CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	c0_resolved_scn = 99;
+	UT_ASSERT_EQ(cluster_cr_server_test_own_xid_verdict(4222256, 2, 5, false),
+				 CLUSTER_UNDO_VERDICT_COMMITTED_BOUND);
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(37);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);
 	UT_RUN(test_split_self_prefix_foreign_suffix_is_partial);
@@ -1641,6 +1724,10 @@ main(void)
 	UT_RUN(test_ordinary_diagnostic_preserves_wrong_carrier_exact_commit);
 	UT_RUN(test_ordinary_diagnostic_keeps_refusals_and_no_extra_reads);
 	UT_RUN(test_ordinary_diagnostic_keeps_recycled_bound_and_refusal);
+	UT_RUN(test_a143_clean_restart_pair_keeps_old_terminal_provable);
+	UT_RUN(test_a143_clean_restart_ordinary_is_bound_not_exact);
+	UT_RUN(test_a143_startup_bound_retains_all_authority_refusals);
+	UT_RUN(test_a143_checkpoint_is_not_exact_and_conflicting_stamp_refuses);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

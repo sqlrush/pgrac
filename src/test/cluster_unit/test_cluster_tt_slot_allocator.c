@@ -1395,6 +1395,57 @@ UT_TEST(test_t55_unproven_horizon_retains_until_finite_sample)
 	UT_ASSERT_EQ((int)cluster_tt_slot_get_wrap(NODE0_SEG, first), 1);
 }
 
+UT_TEST(test_clean_checkpoint_bound_is_separate_immutable_and_pre_start_only)
+{
+	int fault;
+	reset_allocator();
+	cluster_tt_slot_capture_startup_checkpoint((SCN)100, FullTransactionIdFromU64(1000));
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), InvalidScn);
+	cluster_tt_slot_confirm_clean_start(true, 0);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), (SCN)100);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(1000), InvalidScn);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(1001), InvalidScn);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(FrozenTransactionId), InvalidScn);
+	UT_ASSERT_EQ(cluster_tt_slot_max_recycle_horizon(), InvalidScn);
+	cluster_tt_slot_note_gated_recycle_horizon((SCN)120);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), (SCN)100);
+	cluster_tt_slot_confirm_clean_start(false, 0);
+	cluster_tt_slot_confirm_clean_start(true, 0);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), InvalidScn);
+	for (fault = 0; fault < 5; fault++) {
+		reset_allocator();
+		if (fault == 0)
+			cluster_tt_slot_confirm_clean_start(true, 0); /* missing capture cannot rearm */
+		cluster_tt_slot_capture_startup_checkpoint(
+			fault == 1	 ? scn_encode(1, 100)
+			: fault == 2 ? InvalidScn
+						 : (SCN)100,
+			FullTransactionIdFromU64(fault == 3 ? UINT64_C(0x1000003e8) : 1000));
+		if (fault == 4)
+			cluster_tt_slot_capture_startup_checkpoint((SCN)101, FullTransactionIdFromU64(1000));
+		cluster_tt_slot_confirm_clean_start(true, 0);
+		UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), InvalidScn);
+	}
+	reset_allocator();
+}
+
+UT_TEST(test_startup_prepared_disables_bound_even_after_later_finish)
+{
+	reset_allocator();
+	cluster_tt_slot_capture_startup_checkpoint((SCN)100, FullTransactionIdFromU64(1000));
+	cluster_tt_slot_confirm_clean_start(true, 1);
+	/* The xid may become CLOG COMMITTED only after checkpoint SCN 100. */
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), InvalidScn);
+	/* Finishing it and observing an empty runtime list cannot rearm proof. */
+	cluster_tt_slot_confirm_clean_start(true, 0);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), InvalidScn);
+	reset_allocator();
+	cluster_tt_slot_capture_startup_checkpoint((SCN)100, FullTransactionIdFromU64(1000));
+	cluster_tt_slot_confirm_clean_start(true, -1);
+	UT_ASSERT_EQ(cluster_tt_slot_startup_committed_bound(500), InvalidScn);
+	reset_allocator();
+}
+
 int
 main(void)
 {
@@ -1457,6 +1508,8 @@ main(void)
 	UT_RUN(test_t53_current_exact_alloc_captures_recycle_wrap_atomically);
 	UT_RUN(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample);
 	UT_RUN(test_t55_unproven_horizon_retains_until_finite_sample);
+	UT_RUN(test_clean_checkpoint_bound_is_separate_immutable_and_pre_start_only);
+	UT_RUN(test_startup_prepared_disables_bound_even_after_later_finish);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

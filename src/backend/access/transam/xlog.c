@@ -207,6 +207,7 @@
 #include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
 #include "cluster/cluster_xid_wrap_barrier.h" /* PGRAC: GCS-race round-3 P0-1 startup mirror */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
 #include "cluster/cluster_write_fence.h" /* PGRAC: RF-ROOT P6 checkpoint fence deferral */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
@@ -6506,7 +6507,25 @@ StartupXLOG(void)
 	 * This information is not quite needed yet, but it is positioned here so
 	 * as potential problems are detected before any on-disk change is done.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	{
+		TransactionId *startup_prepared_xids = NULL;
+		int startup_prepared_count = 0;
+
+		oldestActiveXID = PrescanPreparedTransactions(&startup_prepared_xids,
+													&startup_prepared_count);
+		/* Freeze this observation before backend admission: a prepared xid
+		 * may commit after restart, despite preceding the shutdown nextXid. */
+		cluster_tt_slot_confirm_clean_start(
+			boot_state == DB_SHUTDOWNED && wasShutdown && !InRecovery
+			&& !ArchiveRecoveryRequested && !haveBackupLabel,
+			startup_prepared_count);
+		if (startup_prepared_xids != NULL)
+			pfree(startup_prepared_xids);
+	}
+#else
 	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+#endif
 
 	/*
 	 * Allow ordinary WAL segment creation before possibly switching to a new

@@ -157,6 +157,7 @@
 #include "cluster/cluster_tt_status.h" /* PGRAC: spec-4.5a D11 merged counters */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_scn.h" /* PGRAC: spec-4.5a G6 checkpoint SCN seed */
+#include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -1535,6 +1536,10 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		/* PGRAC (spec-4.5a G6): seed the SCN clock from the checkpoint record
 		 * (see the backup_label arm above for why). */
 		cluster_scn_recovery_replay_observe(record->xl_scn);
+		/* Capture the actual own WAL record, not a shared control-file copy.
+		 * StartupXLOG separately confirms the completed clean-start decision. */
+		if (wasShutdown)
+			cluster_tt_slot_capture_startup_checkpoint(record->xl_scn, checkPoint.nextXid);
 #endif
 
 		/* Make sure that REDO location exists. */

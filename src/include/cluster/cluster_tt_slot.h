@@ -453,6 +453,11 @@ extern uint64 cluster_tt_slot_retention_off_recycle_count(void); /* spec-3.22 */
  */
 extern SCN cluster_tt_slot_max_recycle_horizon(void);
 extern void cluster_tt_slot_note_gated_recycle_horizon(SCN horizon);
+/* Startup-only evidence, independent of the live recycle horizon. The
+ * confirmation count comes from the pre-admission prepared-transaction scan. */
+extern void cluster_tt_slot_capture_startup_checkpoint(SCN scn, FullTransactionId next_xid);
+extern void cluster_tt_slot_confirm_clean_start(bool clean, int startup_prepared_count);
+extern SCN cluster_tt_slot_startup_committed_bound(TransactionId xid);
 
 
 /*

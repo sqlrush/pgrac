@@ -143,6 +143,11 @@ typedef struct ClusterTTSlotShmem {
 	 */
 	pg_atomic_uint64 retention_max_recycle_horizon;
 
+	/* A validated own shutdown checkpoint, never a new GC permission. */
+	pg_atomic_uint64 startup_checkpoint_scn;
+	pg_atomic_uint64 startup_checkpoint_next_xid;
+	pg_atomic_uint32 startup_checkpoint_state; /* 0 absent, 1 captured, 2 clean, 3 refused */
+
 	/* spec-3.13 D5: entries refused for recycle because wrap reached
 	 * TT_WRAP_MAX (ABA fail-fast guard; cleared only by whole-segment
 	 * rollover/reuse which resets wraps to 0).  Bumped by BOTH selection
@@ -290,6 +295,57 @@ void
 cluster_tt_slot_note_gated_recycle_horizon(SCN horizon)
 {
 	tt_slot_note_gated_recycle_horizon(horizon);
+}
+
+void
+cluster_tt_slot_capture_startup_checkpoint(SCN scn, FullTransactionId next_xid)
+{
+	if (ClusterTTSlotShm == NULL)
+		return;
+	if (pg_atomic_read_u32(&ClusterTTSlotShm->startup_checkpoint_state) != 0 || !SCN_VALID(scn)
+		|| scn_node_id(scn) != cluster_node_id || EpochFromFullTransactionId(next_xid) != 0
+		|| !TransactionIdIsNormal(XidFromFullTransactionId(next_xid))) {
+		pg_atomic_write_u32(&ClusterTTSlotShm->startup_checkpoint_state, 3);
+		return;
+	}
+	pg_atomic_write_u64(&ClusterTTSlotShm->startup_checkpoint_scn, scn);
+	pg_atomic_write_u64(&ClusterTTSlotShm->startup_checkpoint_next_xid,
+						U64FromFullTransactionId(next_xid));
+	pg_write_barrier();
+	pg_atomic_write_u32(&ClusterTTSlotShm->startup_checkpoint_state, 1);
+}
+
+void
+cluster_tt_slot_confirm_clean_start(bool clean, int startup_prepared_count)
+{
+	uint32 state;
+	if (ClusterTTSlotShm == NULL)
+		return;
+	state = pg_atomic_read_u32(&ClusterTTSlotShm->startup_checkpoint_state);
+	/* Prepared transactions survive clean shutdown and may commit later.
+	 * Refuse the whole startup bound before admission if any were recovered;
+	 * a later empty runtime list must never undo this decision. */
+	pg_atomic_write_u32(&ClusterTTSlotShm->startup_checkpoint_state,
+						clean && startup_prepared_count == 0 && (state == 1 || state == 2) ? 2 : 3);
+}
+
+/* Only the origin resolver may combine this bound with a complete scan,
+ * no-raw-reuse fence and explicit own CLOG terminal proof. */
+SCN
+cluster_tt_slot_startup_committed_bound(TransactionId xid)
+{
+	uint64 cutoff;
+	SCN scn;
+	if (ClusterTTSlotShm == NULL || !TransactionIdIsNormal(xid)
+		|| pg_atomic_read_u32(&ClusterTTSlotShm->startup_checkpoint_state) != 2)
+		return InvalidScn;
+	pg_read_barrier();
+	cutoff = pg_atomic_read_u64(&ClusterTTSlotShm->startup_checkpoint_next_xid);
+	scn = pg_atomic_read_u64(&ClusterTTSlotShm->startup_checkpoint_scn);
+	if (cutoff == 0 || cutoff > UINT32_MAX || xid >= cutoff
+		|| pg_atomic_read_u32(&ClusterTTSlotShm->startup_checkpoint_state) != 2)
+		return InvalidScn;
+	return scn;
 }
 
 
@@ -1091,6 +1147,9 @@ cluster_tt_slot_shmem_init(void)
 		pg_atomic_init_u64(&ClusterTTSlotShm->retention_recycle_count, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->retention_off_recycle_count, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->retention_max_recycle_horizon, 0);
+		pg_atomic_init_u64(&ClusterTTSlotShm->startup_checkpoint_scn, 0);
+		pg_atomic_init_u64(&ClusterTTSlotShm->startup_checkpoint_next_xid, 0);
+		pg_atomic_init_u32(&ClusterTTSlotShm->startup_checkpoint_state, 0);
 		pg_atomic_init_u64(&ClusterTTSlotShm->tt_slot_wrap_retired_count, 0);
 		SpinLockInit(&ClusterTTSlotShm->protected_lock);
 		ClusterTTSlotShm->protected_count = 0;
