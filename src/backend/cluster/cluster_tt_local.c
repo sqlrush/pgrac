@@ -274,9 +274,9 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 
 			/*
 			 * spec-3.12 D2b: allocate on the node's CURRENT TT segment (which may
-			 * have been rolled forward by an earlier retention rollover); only the
-			 * first-ever bind falls back to the fixed spec-3.4b segment id (and
-			 * lazily provisions its file).
+			 * have been rolled forward by an earlier retention rollover). Cold
+			 * memory does not prove the fixed base segment is empty: use the
+			 * same available-segment/current-publication owner for its first bind.
 			 *
 			 * C3b/Q11: rollover releases lifecycle_lock while publishing the live
 			 * owner.  A concurrent winner can therefore advance and fill CURRENT
@@ -284,12 +284,15 @@ cluster_tt_local_reserve_binding(TransactionId top_xid, uint32 *out_segment_id,
 			 * never assume the segment returned by rollover is still fresh.
 			 */
 			seg = cluster_tt_slot_current_segment(cluster_node_id);
-			if (seg == 0)
-				seg = cluster_undo_active_segment_for_node_or_create(cluster_node_id);
-
-			off = cluster_tt_slot_alloc_current_exact(
-				cluster_node_id, seg, top_xid, &retained_pressure,
-				&current_drift, &wrap);
+			if (seg == 0) {
+				/* No local slot reservation exists until a proven fresh segment
+				 * has been published below. Never reset old durable TT history. */
+				off = INVALID_TT_SLOT_OFFSET;
+				retained_pressure = true;
+			} else
+				off = cluster_tt_slot_alloc_current_exact(
+					cluster_node_id, seg, top_xid, &retained_pressure,
+					&current_drift, &wrap);
 			if (current_drift)
 				continue;
 			if (off != INVALID_TT_SLOT_OFFSET)

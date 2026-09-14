@@ -1292,6 +1292,38 @@ UT_TEST(test_full_undo_pool_selects_exact_recyclable_supply_without_rewrite)
 	undo_test_fixture_end();
 }
 
+UT_TEST(test_allocated_nonempty_tt_is_not_fresh_supply)
+{
+	ClusterUndoSegmentExtendPlan plan;
+	TTSlot old_slot = {0};
+	TTSlot observed;
+	char path[MAXPGPATH];
+	int fd;
+
+	if (!undo_test_fixture_begin())
+		return;
+	UT_ASSERT(undo_test_write_header(1, SEGMENT_ALLOCATED));
+	UT_ASSERT(undo_test_write_header(2, SEGMENT_ALLOCATED));
+	old_slot.xid = 4195185;
+	old_slot.status = TT_SLOT_COMMITTED;
+	old_slot.commit_scn = 14274853;
+	undo_test_segment_path(1, path, sizeof(path));
+	fd = open(path, O_RDWR);
+	UT_ASSERT(fd >= 0);
+	if (fd >= 0) {
+		UT_ASSERT_EQ(pwrite(fd, &old_slot, sizeof(old_slot),
+			offsetof(UndoSegmentHeaderData, tt_slots)), sizeof(old_slot));
+		UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+		UT_ASSERT_EQ(plan.segment_id, 2);
+		UT_ASSERT(!plan.needs_reuse);
+		UT_ASSERT_EQ(pread(fd, &observed, sizeof(observed),
+			offsetof(UndoSegmentHeaderData, tt_slots)), sizeof(observed));
+		UT_ASSERT_EQ(memcmp(&observed, &old_slot, sizeof(old_slot)), 0);
+		close(fd);
+	}
+	undo_test_fixture_end();
+}
+
 /* Spec 8.4A I18/I19: one admission debt covers record allocation and every
  * lifecycle/record-seal block0 mutation it can reach. */
 UT_TEST(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks)
@@ -3244,7 +3276,8 @@ UT_TEST(test_history_codec_cross_page_update_requires_exactly_two_targets)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(66);
+	UT_PLAN(67);
+	UT_RUN(test_allocated_nonempty_tt_is_not_fresh_supply);
 	UT_RUN(test_terminal_tt_only_sweep_preserves_actual_recycle_eligibility);
 	UT_RUN(test_record_seal_owner_ignores_every_nonactive_predecessor);
 	UT_RUN(test_history_consume_refuses_missing_metadata_before_install);

@@ -589,12 +589,9 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id,
 
 	seg = &ClusterTTSlotShm->per_node[node_id];
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
-	if (seg->segment_id == 0) {
-		Assert(seg->binding_generation == 0);
-		seg->binding_generation = 1;
-		seg->segment_id = expected_segment_id;
-	}
-	else if (seg->segment_id != expected_segment_id) {
+	/* Only the serialized fresh-segment publisher may initialize CURRENT.
+	 * A zero shared-memory array says nothing about a preexisting disk TT. */
+	if (seg->segment_id != expected_segment_id) {
 		if (out_current_drift)
 			*out_current_drift = true;
 		LWLockRelease(&seg->lock);

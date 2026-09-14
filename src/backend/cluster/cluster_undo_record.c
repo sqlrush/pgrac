@@ -3660,12 +3660,13 @@ rollover_retry_locked:
 		 * A rolled-over TT segment is otherwise TT-exclusive (extend_or_create
 		 * hands disjoint ids to the record vs TT paths), so this is conflict-free.
 		 */
-		if (!old_had_active && old_segment_id != fixed_first
+		if (old_segment_id != 0 && !old_had_active && old_segment_id != fixed_first
 			&& old_segment_id != UndoRecordShared->active_segment_id)
 			mark_old_committed = true;
 	}
 
-	pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retention_rollover_count, 1);
+	if (old_segment_id != 0)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->tt_retention_rollover_count, 1);
 
 	/* Q8: a retention-pressure rollover is exactly when RECYCLABLE supply
 	 * matters -- nudge the cleaner instead of waiting out its interval. */
@@ -3676,7 +3677,8 @@ rollover_retry_locked:
 	 * the rollover fired), so its retention watermark is not older than the
 	 * horizon -> it was skipped for recycle.
 	 */
-	pg_atomic_fetch_add_u64(&UndoRecordShared->segment_retain_skip_count, 1);
+	if (old_segment_id != 0)
+		pg_atomic_fetch_add_u64(&UndoRecordShared->segment_retain_skip_count, 1);
 
 	LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 	if (mark_old_committed) {

@@ -1337,6 +1337,21 @@ UT_TEST(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation)
 	UT_ASSERT_EQ((int)wrap, 0);
 }
 
+UT_TEST(test_unbound_current_exact_cannot_invent_free_slots)
+{
+	bool retained = true;
+	bool drift = false;
+	uint16 wrap = 0;
+
+	reset_allocator();
+	UT_ASSERT_EQ(cluster_tt_slot_alloc_current_exact(0, NODE0_SEG, 100,
+		&retained, &drift, &wrap), INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT(drift);
+	UT_ASSERT(!retained);
+	UT_ASSERT_EQ(wrap, TT_WRAP_INVALID);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 0);
+}
+
 UT_TEST(test_t53_current_exact_alloc_captures_recycle_wrap_atomically)
 {
 	bool retained = false;
@@ -1505,6 +1520,7 @@ main(void)
 	UT_RUN(test_t50_peer_mode_guc_off_cannot_bypass_cluster_floor);
 	UT_RUN(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded);
 	UT_RUN(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation);
+	UT_RUN(test_unbound_current_exact_cannot_invent_free_slots);
 	UT_RUN(test_t53_current_exact_alloc_captures_recycle_wrap_atomically);
 	UT_RUN(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample);
 	UT_RUN(test_t55_unproven_horizon_retains_until_finite_sample);

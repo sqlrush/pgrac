@@ -1104,10 +1104,17 @@ cluster_undo_segment_extend_or_create(
 					return true;
 				}
 				if (header->segment_state == SEGMENT_ALLOCATED) {
-					plan->segment_id = new_segment_id;
-					plan->generation = header->wrap_count;
-					plan->needs_reuse = false;
-					return true;
+					TTSlot empty_slots[TT_SLOTS_PER_SEGMENT] = {{0}};
+
+					/* The state byte alone cannot authorize FREE/wrap0. A
+					 * previous incarnation may have bound a TT before its first
+					 * DATA write. Preserve any occupied slot, including ACTIVE. */
+					if (memcmp(header->tt_slots, empty_slots, sizeof(empty_slots)) == 0) {
+						plan->segment_id = new_segment_id;
+						plan->generation = header->wrap_count;
+						plan->needs_reuse = false;
+						return true;
+					}
 				}
 			}
 			/* File exists — slot is taken. */

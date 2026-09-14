@@ -16,6 +16,11 @@ static int lock_depth;
 static int modifier_enters;
 static int modifier_leaves;
 static int rollovers_on_enter;
+static bool cold_fixture;
+static bool cold_capacity_refused;
+static uint32 cold_successor;
+static int cold_selection_calls;
+static TTSlot cold_old_slot;
 bool cluster_enabled = true;
 bool cluster_undo_retention_horizon_enabled = false;
 int cluster_undo_segments_max_per_instance = 256;
@@ -104,6 +109,8 @@ select_physical_fixture(uint32 segment)
 	disk->owner_instance = 1;
 	disk->tt_slots_count = TT_SLOTS_PER_SEGMENT;
 	disk->wrap_count = 4;
+	if (cold_fixture && segment == 1)
+		disk->tt_slots[0] = cold_old_slot;
 	memcpy(g_current_resident, g_canned_block, BLCKSZ);
 }
 
@@ -147,23 +154,32 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 uint32
 cluster_undo_active_segment_for_node_or_create(int node pg_attribute_unused())
 {
-	UT_ASSERT(false);
-	return 0;
+	UT_ASSERT(cold_fixture);
+	return 1; /* Existing base file is not necessarily an empty TT. */
 }
 
 uint32
-cluster_undo_tt_rollover_locked(int node pg_attribute_unused(), uint32 old pg_attribute_unused(),
-								bool *hard_cap pg_attribute_unused())
+cluster_undo_tt_rollover_locked(int node, uint32 old, bool *hard_cap)
 {
-	UT_ASSERT(false); /* No capacity pressure is injected. */
-	return 0;
+	UT_ASSERT(cold_fixture);
+	UT_ASSERT_EQ(node, 0);
+	UT_ASSERT_EQ(old, 0);
+	UT_ASSERT_EQ(lock_depth, 0);
+	cold_selection_calls++;
+	*hard_cap = cold_capacity_refused;
+	if (cold_capacity_refused)
+		return 0;
+	/* Only physical selection/current publication is doubled. The actual
+	 * allocator, local consumer and durable ACTIVE producer run below. */
+	cluster_tt_slot_rollover(node, cold_successor, NULL);
+	return cold_successor;
 }
 
 bool
 cluster_undo_cleaner_wait_for_capacity(uint32 segment pg_attribute_unused(),
 									   ClusterCtrcTxnKeyV1 *key pg_attribute_unused())
 {
-	UT_ASSERT(false);
+	UT_ASSERT(cold_fixture && cold_capacity_refused);
 	return false;
 }
 
@@ -228,6 +244,10 @@ reset_active_owner(void)
 	memset(&allocator_storage, 0, sizeof(allocator_storage));
 	ClusterTTSlotShm = &allocator_storage;
 	lock_depth = modifier_enters = modifier_leaves = rollovers_on_enter = 0;
+	cold_fixture = cold_capacity_refused = false;
+	cold_selection_calls = 0;
+	cold_successor = 2;
+	memset(&cold_old_slot, 0, sizeof(cold_old_slot));
 	cluster_tt_slot_rollover(0, 1, NULL);
 	reset_current_write_mock();
 	select_physical_fixture(1);
@@ -274,6 +294,54 @@ UT_TEST(test_real_allocator_normal_local_publication)
 {
 	reset_active_owner();
 	require_published_on(1);
+}
+
+UT_TEST(test_cold_allocator_preserves_occupied_durable_base)
+{
+	reset_active_owner();
+	memset(&allocator_storage, 0, sizeof(allocator_storage));
+	cold_fixture = true;
+	cold_old_slot.xid = 4195185;
+	cold_old_slot.status = TT_SLOT_COMMITTED;
+	cold_old_slot.flags = 1;
+	cold_old_slot.commit_scn = ((uint64)1 << 56) | 14274853;
+	require_published_on(2);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 2);
+}
+
+UT_TEST(test_cold_fresh_database_uses_same_publication_path)
+{
+	reset_active_owner();
+	memset(&allocator_storage, 0, sizeof(allocator_storage));
+	cold_fixture = true;
+	cold_successor = 1;
+	require_published_on(1);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+}
+
+UT_TEST(test_cold_full_pool_refuses_before_binding_or_bind_wal)
+{
+	ClusterCanonicalTxnBinding result;
+	volatile bool caught = false;
+
+	reset_active_owner();
+	memset(&allocator_storage, 0, sizeof(allocator_storage));
+	cold_fixture = cold_capacity_refused = true;
+	PG_TRY();
+	{
+		(void)cluster_tt_local_prepare_canonical_active(100, &result);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(cold_selection_calls, 1);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 0);
+	UT_ASSERT_EQ(cluster_tt_local_binding_count, 0);
+	UT_ASSERT_EQ(g_bind_emit_calls, 0);
 }
 
 UT_TEST(test_real_allocator_rolls_after_reserve_before_observation)
@@ -451,7 +519,10 @@ UT_TEST(test_real_local_postbind_error_stays_failed_without_reallocation)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
+	UT_RUN(test_cold_allocator_preserves_occupied_durable_base);
+	UT_RUN(test_cold_fresh_database_uses_same_publication_path);
+	UT_RUN(test_cold_full_pool_refuses_before_binding_or_bind_wal);
 	UT_RUN(test_real_allocator_normal_local_publication);
 	UT_RUN(test_real_allocator_rolls_after_reserve_before_observation);
 	UT_RUN(test_real_allocator_rolls_during_modifier_admission);
