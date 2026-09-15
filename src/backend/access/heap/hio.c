@@ -14,6 +14,8 @@
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  - RelationGetBufferForTuple: consume this node's parked HW space
  *	    lease before the shared FSM (static space affinity).
+ *	  - Shared heap extension completes I/O before ordinary current ownership;
+ *	    preserve a remotely initialized page and requalify space under lock.
  *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave d)
  *
  *-------------------------------------------------------------------------
@@ -398,6 +400,7 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	uint32		not_in_fsm_pages;
 	Buffer		buffer;
 	Page		page;
+	bool		cluster_current = cluster_hio_vm_repin_enabled(relation);
 
 	/*
 	 * Determine by how many pages to try to extend by.
@@ -482,9 +485,10 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	}
 
 	/*
-	 * Extend the relation. We ask for the first returned page to be locked,
-	 * so that we are sure that nobody has inserted into the page
-	 * concurrently.
+	 * Extend the relation. Local/noncluster callers request the first page
+	 * locked. A shared cluster heap must complete input I/O first: another
+	 * node can initialize an allocated page before we obtain its current
+	 * ownership. Ordinary LockBuffer installs that node's current bytes.
 	 *
 	 * With the current MAX_BUFFERS_TO_EXTEND_BY there's no danger of
 	 * [auto]vacuum trying to truncate later pages as REL_TRUNCATE_MINIMUM is
@@ -492,13 +496,15 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	 */
 	first_block = ExtendBufferedRelBy(BMR_REL(relation), MAIN_FORKNUM,
 									  bistate ? bistate->strategy : NULL,
-									  EB_LOCK_FIRST,
+									  cluster_current ? 0 : EB_LOCK_FIRST,
 									  extend_by_pages,
 									  victim_buffers,
 									  &extend_by_pages);
 	buffer = victim_buffers[0]; /* the buffer the function will return */
 	last_block = first_block + (extend_by_pages - 1);
 	Assert(first_block == BufferGetBlockNumber(buffer));
+	if (cluster_current)
+		LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 
 	/*
 	 * Relation is now extended. Initialize the page. We do this here, before
@@ -507,25 +513,47 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	 * happen, but if it does we don't want to risk wiping out valid data).
 	 */
 	page = BufferGetPage(buffer);
-	if (!PageIsNew(page))
+	if (!PageIsNew(page) && !cluster_current)
 		elog(ERROR, "page %u of relation \"%s\" should be empty but is not",
 			 first_block,
 			 RelationGetRelationName(relation));
 
-	/* PGRAC: heap page needs ITL slot array (stage 1.5). */
+	/* PGRAC: existing current bytes are never permission to initialize. */
+	if (PageIsNew(page))
+	{
 #ifdef USE_PGRAC_CLUSTER
-	PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+		PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
 #else
-	PageInit(page, BufferGetPageSize(buffer), 0);
+		PageInit(page, BufferGetPageSize(buffer), 0);
 #endif
-	MarkBufferDirty(buffer);
+		MarkBufferDirty(buffer);
+	}
+#ifdef USE_PGRAC_CLUSTER
+	else
+	{
+		PageHeader header = (PageHeader) page;
+
+		/* Production checks, not assertions: preserve only a real heap page.
+		 * Tuple space and VM state are rechecked by the caller after relock. */
+		if (!PageHasItl(page)
+			|| PageGetPageSize(page) != BufferGetPageSize(buffer)
+			|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
+			|| header->pd_special != BufferGetPageSize(buffer) - MAXALIGN(HeapPageSpecialSize)
+			|| header->pd_lower < SizeOfPageHeaderData
+			|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
+			|| header->pd_lower > header->pd_upper
+			|| header->pd_upper > header->pd_special)
+			elog(ERROR, "invalid current heap page %u of relation \"%s\" after extension",
+				 first_block, RelationGetRelationName(relation));
+	}
+#endif
 
 	/*
 	 * If we decided to put pages into the FSM, release the buffer lock (but
 	 * not pin), we don't want to do IO while holding a buffer lock. This will
 	 * necessitate a bit more extensive checking in our caller.
 	 */
-	if (use_fsm && not_in_fsm_pages < extend_by_pages)
+	if (cluster_current || (use_fsm && not_in_fsm_pages < extend_by_pages))
 	{
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		*did_unlock = true;

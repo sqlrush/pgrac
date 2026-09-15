@@ -975,7 +975,7 @@ UT_TEST(actual_pretoast_vm_retry_refreshes_predecessor_before_l2)
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(21);
 	UT_RUN(actual_vm_consumer_requalifies_both_stages_without_replaying_clear);
 	UT_RUN(actual_vm_unchanged_clear_is_completed_not_retry);
 	UT_RUN(actual_consumer_rejects_stale_heap_proof_before_restoring_vm);
@@ -996,6 +996,7 @@ main(void)
 	UT_RUN(actual_hio_disabled_local_and_cancellation_boundaries);
 	UT_RUN(actual_hio_allocation_reads_and_locks_without_incoming_vm_pins);
 	UT_RUN(actual_hio_rejected_candidate_and_frozen_extension_recheck_maps);
+	UT_RUN(actual_hio_nonempty_extension_retries_with_ordered_requalification);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

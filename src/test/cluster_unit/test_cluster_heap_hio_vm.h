@@ -22,6 +22,7 @@ static int hio_pair_misses;
 static int hio_recent_calls, hio_fail_recent_at;
 static bool hio_make_second_visible, hio_cancel;
 static bool hio_same_vm, hio_enforce_wait_order;
+static bool hio_extension_fill_first;
 static sigjmp_buf hio_jump;
 
 static Buffer
@@ -144,6 +145,7 @@ hio_reset(bool same_vm)
 	hio_recent_calls = hio_fail_recent_at = 0;
 	hio_make_second_visible = hio_cancel = false;
 	hio_same_vm = same_vm;
+	hio_extension_fill_first = false;
 	hio_enforce_wait_order = true;
 	NBuffers = 4;
 	relation_data.rd_rel = &relation_class;
@@ -340,6 +342,8 @@ hio_extend(Relation relation, BulkInsertState state, int num_pages, bool use_fsm
 	hio_extensions++;
 	hio_refs[1]++;
 	page->pd_upper = page->pd_special = BLCKSZ;
+	if (hio_extension_fill_first && hio_extensions == 1)
+		page->pd_upper = page->pd_lower;
 	PageClearAllVisible((Page)page);
 	*unlocked = hio_extension_unlock;
 	hio_locks[1] = !*unlocked;
@@ -447,4 +451,29 @@ UT_TEST(actual_hio_rejected_candidate_and_frozen_extension_recheck_maps)
 		UT_ASSERT(!PageIsAllVisible(hio_pages[1].data));
 		UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
 	}
+}
+
+UT_TEST(actual_hio_nonempty_extension_retries_with_ordered_requalification)
+{
+	Buffer vm = 3, other_vm = 3, result;
+	PageHeader full;
+
+	hio_reset(false);
+	hio_target = 1;
+	hio_data_reads = hio_fsm_calls = hio_extensions = hio_dirties = 0;
+	hio_refs[0] = 1;
+	hio_refs[2] = 2;
+	full = (PageHeader)hio_pages[1].data;
+	full->pd_upper = full->pd_lower;
+	hio_extension_unlock = true;
+	hio_extension_fill_first = true;
+	hio_pair_misses = 1;
+	result = hio_allocate(&relation_data, 80, 1, HEAP_INSERT_FROZEN, NULL, &vm, &other_vm, 1);
+	UT_ASSERT_EQ(result, 2);
+	UT_ASSERT_EQ(hio_extensions, 2);
+	UT_ASSERT_EQ(hio_dirties, 0);
+	UT_ASSERT_EQ(hio_wait_pin_conflicts, 0);
+	UT_ASSERT(hio_locks[0] && hio_locks[1]);
+	UT_ASSERT(hio_refs[0] == 1 && hio_refs[1] == 1);
+	UT_ASSERT(hio_pin_ok(0, other_vm) && hio_pin_ok(1, vm));
 }
