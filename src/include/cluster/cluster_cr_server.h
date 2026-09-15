@@ -511,9 +511,11 @@ extern bool cluster_lms_undo_verdict_submit(const GcsBlockForwardPayload *fwd);
  * (lms_undo_verdict_serve) and the master==self local verdict resolve so the
  * two answers over one xid can never diverge (Rule 8.A).  The caller zeroes
  * the page buffer and owns any authority co-sampling; true = *v holds the
- * verdict, false = refuse (caller keeps 53R97 fail-closed). */
+ * verdict, false = refuse (caller keeps 53R97 fail-closed).
+ * ordinary_single is an explicit consumer permission, not the inverse of
+ * the stripe-check relaxation: local fresh and C1b callers keep both false. */
 extern bool cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
-											   ClusterGcsUndoVerdictPage *v);
+											   bool ordinary_single, ClusterGcsUndoVerdictPage *v);
 /* LMON dispatch side (spec-7.1 D3-b): park a validated undo-MULTI-verdict
  * request (the asked-for MXID rides the widened watermark carrier; a carrier
  * with non-zero upper 32 bits or an invalid mxid is malformed).  false = wave

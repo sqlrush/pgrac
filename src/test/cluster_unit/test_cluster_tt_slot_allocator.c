@@ -63,6 +63,8 @@
 #include <string.h>
 
 #include "access/transam.h"
+#include "miscadmin.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_conf.h" /* ClusterConfShmem (peer-mode test topology) */
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_terminal_ref_census.h"
@@ -310,6 +312,8 @@ s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
  * skips the ~96 KB region); the standalone test runs as an enabled node. */
 bool cluster_enabled = true;
 int cluster_node_id = 0;
+bool IsUnderPostmaster = false;
+BackendType MyBackendType = B_INVALID;
 
 SCN
 cluster_undo_retention_horizon(void)
@@ -1461,6 +1465,127 @@ UT_TEST(test_startup_prepared_disables_bound_even_after_later_finish)
 	reset_allocator();
 }
 
+static uint32 stop_segment;
+static int stop_slot;
+static const char *stop_reason;
+
+static ClusterNormalStopPollResult
+stop_tt_poll(void)
+{
+	int samples = mock_ctrc_sample_calls;
+	int exclusive = mock_lwlock_acquire_excl_count;
+	ClusterNormalStopPollResult result
+		= cluster_tt_slot_normal_stop_poll(&stop_segment, &stop_slot, &stop_reason);
+
+	UT_ASSERT_EQ(mock_lwlock_depth, 0);
+	UT_ASSERT_EQ(mock_lwlock_acquire_excl_count, exclusive);
+	UT_ASSERT_EQ(mock_ctrc_sample_calls, samples);
+	return result;
+}
+
+UT_TEST(test_stop_tt_requires_original_owner_without_initializing_bindings)
+{
+	reset_allocator();
+	IsUnderPostmaster = true;
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_STR_EQ(stop_reason, "NONE");
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(0), 0);
+	UT_ASSERT_EQ(cluster_tt_slot_current_segment(127), 0);
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_tt_slot_alloc(1, 991), 0);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_tt_slot_mark_aborted(1, 0, 991);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	MyBackendType = B_CHECKPOINTER;
+}
+
+UT_TEST(test_stop_tt_all_current_slots_need_original_terminal_owner)
+{
+	int node;
+	int i;
+
+	reset_allocator();
+	IsUnderPostmaster = true;
+	MyBackendType = B_CHECKPOINTER;
+	/* Every node and every offset, not a gauge or the first current segment. */
+	for (node = 0; node < 128; node++) {
+		uint32 segment = (uint32)node * 256 + 1;
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			TransactionId xid = (TransactionId)(1000 + node * 48 + i);
+			uint16 slot = cluster_tt_slot_alloc(segment, xid);
+
+			UT_ASSERT_EQ(slot, i);
+			UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_PENDING);
+			UT_ASSERT_EQ(stop_segment, segment);
+			UT_ASSERT_EQ(stop_slot, i);
+			UT_ASSERT_STR_EQ(stop_reason, "TT_ALLOCATOR_ACTIVE");
+			if ((i & 1) == 0)
+				cluster_tt_slot_mark_committed(segment, slot, xid, scn_encode(node, 20000 + i));
+			else
+				cluster_tt_slot_mark_aborted(segment, slot, xid);
+			UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+			if (ut_current_failed)
+				return;
+		}
+	}
+	/* This is explicitly only the allocator: rollover forgets its old ACTIVE
+	 * entries.  The independent resident TT check must still reject those. */
+	cluster_tt_slot_rollover(0, 2, NULL);
+	UT_ASSERT_EQ(cluster_tt_slot_alloc(2, 90000), 0);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_tt_slot_rollover(0, 3, NULL);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_tt_prepared_map_retains_original_unprotect_semantics)
+{
+	reset_allocator();
+	IsUnderPostmaster = true;
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT(cluster_tt_slot_protect(32768, 47, 0, 9001));
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(stop_segment, 32768);
+	UT_ASSERT_EQ(stop_slot, 47);
+	UT_ASSERT_STR_EQ(stop_reason, "TT_PROTECTED_OWNER_PENDING");
+	UT_ASSERT_EQ(cluster_tt_slot_protected_count(), 1);
+	UT_ASSERT_EQ(cluster_tt_slot_unprotect_xid(9001), 1);
+	/* Unprotect swaps/decrements but need not erase the now-dead tail. */
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(cluster_tt_slot_protect(0, 0, 0, 9002)); /* malformed boundary input */
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(stop_reason, "TT_PROTECTED_IDENTITY_INVALID");
+	UT_ASSERT_EQ(cluster_tt_slot_unprotect_xid(9002), 1);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_tt_last_invalid_is_not_hidden_by_first_active)
+{
+	uint16 slot;
+
+	reset_allocator();
+	IsUnderPostmaster = true;
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_tt_slot_alloc(1, 700), 0);
+	slot = cluster_tt_slot_alloc(32768, 9000);
+	/* Existing test-only injector, not a production terminal owner. */
+	cluster_tt_slot_test_force_status(32768, slot, CTS_COMMITTED);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(stop_segment, 32768);
+	UT_ASSERT_EQ(stop_slot, slot);
+	UT_ASSERT_STR_EQ(stop_reason, "TT_ALLOCATOR_SLOT_INVALID");
+	cluster_tt_slot_test_force_status(32768, slot, CTS_ABORTED);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_tt_slot_mark_aborted(1, 0, 700);
+	UT_ASSERT_EQ(stop_tt_poll(), CLUSTER_NORMAL_STOP_READY);
+}
+
 int
 main(void)
 {
@@ -1526,6 +1651,10 @@ main(void)
 	UT_RUN(test_t55_unproven_horizon_retains_until_finite_sample);
 	UT_RUN(test_clean_checkpoint_bound_is_separate_immutable_and_pre_start_only);
 	UT_RUN(test_startup_prepared_disables_bound_even_after_later_finish);
+	UT_RUN(test_stop_tt_requires_original_owner_without_initializing_bindings);
+	UT_RUN(test_stop_tt_all_current_slots_need_original_terminal_owner);
+	UT_RUN(test_stop_tt_prepared_map_retains_original_unprotect_semantics);
+	UT_RUN(test_stop_tt_last_invalid_is_not_hidden_by_first_active);
 
 	return ut_failed_count == 0 ? 0 : 1;
 }

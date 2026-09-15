@@ -30,6 +30,7 @@
 #include "utils/wait_event.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
@@ -63,6 +64,74 @@ typedef struct ClusterSfDepShared {
 
 static ClusterSfDepShared *ClusterSfDep = NULL;
 static ClusterSfDepVec cluster_sf_xact_vec;
+
+ClusterNormalStopPollResult
+cluster_sf_dep_normal_stop_poll(bool post_checkpoint, int *slot_out, int *origin_out,
+								const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *reason = "NONE";
+	int observed_slot = -1;
+	int observed_origin = -1;
+	int expected_entries = cluster_smart_fusion ? Max(NBuffers, 1) : 0;
+
+	if (!IsUnderPostmaster || !cluster_enabled || ClusterSfDep == NULL) {
+		reason = "SF_UNINITIALIZED";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		goto done;
+	}
+	if (LWLockHeldByMe(&ClusterSfDep->lock)) {
+		reason = "SF_LOCK_HELD";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		goto done;
+	}
+	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
+	/* This is an allocation bound, not a counter: never walk a larger
+	 * configured table or mistake the disabled header for a slot array. */
+	if (ClusterSfDep->max_entries != expected_entries) {
+		reason = "SF_GEOMETRY";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		goto unlock;
+	}
+	for (int i = 0; i < ClusterSfDep->max_entries; i++) {
+		ClusterSfDepSlot *slot = &ClusterSfDep->slots[i];
+
+		for (int origin = 0; origin < CLUSTER_SF_DEP_MAX_ORIGINS; origin++) {
+			XLogRecPtr required = slot->entry.vec.required[origin];
+
+			if (XLogRecPtrIsInvalid(required))
+				continue;
+			if (!slot->in_use) {
+				reason = "SF_FREE_RESIDUAL";
+				observed_slot = i;
+				observed_origin = origin;
+				result = CLUSTER_NORMAL_STOP_INVALID;
+				goto unlock;
+			}
+			/* The pre-checkpoint cut must retain the original WAL/PI
+			 * obligations for checkpoint to discharge. Afterwards every
+			 * required LSN needs original origin-durable evidence. A
+			 * satisfied cached vector need not be erased by this observer. */
+			if (post_checkpoint && required > ClusterSfDep->origin_durable[origin]
+				&& result == CLUSTER_NORMAL_STOP_READY) {
+				reason = "SF_DURABILITY_PENDING";
+				observed_slot = i;
+				observed_origin = origin;
+				result = CLUSTER_NORMAL_STOP_PENDING;
+			}
+		}
+	}
+unlock:
+	LWLockRelease(&ClusterSfDep->lock);
+done:
+	if (slot_out != NULL)
+		*slot_out = observed_slot;
+	if (origin_out != NULL)
+		*origin_out = observed_origin;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
 
 static int cluster_sf_dep_find_locked(const BufferTag *tag);
 static int cluster_sf_dep_find_free_locked(void);
@@ -924,6 +993,12 @@ cluster_sf_publish_origin_durable_lsn(void)
 	/* Ordinary CTRC retirement also consumes origin durability. The proof
 	 * store is independent of the optional early-transfer dependency array. */
 	if (!cluster_enabled || ClusterSfDep == NULL || !cluster_sf_dep_origin_valid(cluster_node_id))
+		return;
+	/* Keep durability supply through seal1 and the actual shutdown checkpoint.
+	 * After the second actor cut, existing dependencies and delivery are
+	 * closed: a periodic new gossip would recreate outbound work behind that
+	 * cut. Do not erase already queued frames or alter observed durability. */
+	if (cluster_normal_stop_service_control_sealed())
 		return;
 	/* LMON starts before local WAL recovery. GetFlushRecPtr is valid only
 	 * after recovery; the next ordinary tick will retry without a caller. */

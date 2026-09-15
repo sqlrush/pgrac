@@ -56,6 +56,7 @@
 #include "access/transam.h"	  /* TransactionIdDidCommit/DidAbort (D-i4 CLOG cross) */
 #include "access/xlog.h"	  /* GetFlushRecPtr (spec-6.12i live_hwm_lsn) */
 #include "cluster/cluster_cr.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_runtime_visibility.h"
@@ -352,6 +353,62 @@ static ClusterCrServerShared *CrServerShared = NULL;
 static ClusterR4CrWorkerContext CrServerR4Contexts[CLUSTER_LMS_CR_SLOTS];
 static uint32 cluster_lms_cr_legacy_drain_cursor;
 
+ClusterNormalStopPollResult
+cluster_cr_server_normal_stop_poll(int *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	ClusterR4CrWorkerContext zero;
+	const char *reason = "NONE";
+	int observed_slot = -1;
+
+	if (slot_out != NULL)
+		*slot_out = -1;
+	if (reason_out != NULL)
+		*reason_out = "NONE";
+	if (!IsUnderPostmaster
+		|| (MyBackendType != B_LMON && MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER)) {
+		reason = "CR_OWNER";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+	} else if (CrServerShared == NULL) {
+		reason = "CR_UNINITIALIZED";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+	} else {
+		memset(&zero, 0, sizeof(zero));
+		for (int i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+			ClusterR4CrWorkerContext *context = &CrServerR4Contexts[i];
+			uint32 state = pg_atomic_read_u32(&CrServerShared->slots[i].state);
+			const char *cause = NULL;
+			bool invalid = false;
+
+			/* Shared payload can be concurrently FILLING or reclaimed. The
+			 * atomic state alone proves outstanding work, never a completion.
+			 * FREE may retain harmless legacy bytes and a reuse generation. */
+			if (state > CLUSTER_LMS_CR_R4_RECLAIMING) {
+				cause = "CR_SLOT_STATE";
+				invalid = true;
+			} else if (memcmp(context, &zero, sizeof(zero)) != 0) {
+				/* Only this process can sign its context. The terminal path
+				 * publishes FREE before forget/admission-leave has returned. */
+				invalid = !context->in_use || MyBackendType != B_LMS;
+				cause = invalid ? "CR_CONTEXT_RESIDUAL" : "CR_CONTEXT_OWNED";
+			} else if (state != CLUSTER_LMS_CR_FREE)
+				cause = "CR_SLOT_OWNED";
+			if (cause != NULL && (invalid || result == CLUSTER_NORMAL_STOP_READY)) {
+				reason = cause;
+				observed_slot = i;
+				result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+			}
+			if (invalid)
+				break;
+		}
+	}
+	if (slot_out != NULL)
+		*slot_out = observed_slot;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
+
 /*
  * This is deliberately only worker 0's process-local half of the close
  * proof.  Stale nonterminal shared slots belong to LMON's later proved
@@ -468,7 +525,8 @@ cr_server_reserve_legacy_slot(ClusterLmsCrSlot *slot, uint32 reserved_state)
 		return false;
 
 	LWLockAcquire(&lms_state->lwlock, LW_EXCLUSIVE);
-	if (pg_atomic_read_u32(&slot->state) == CLUSTER_LMS_CR_FREE) {
+	if (pg_atomic_read_u32(&slot->state) == CLUSTER_LMS_CR_FREE
+		&& cluster_normal_stop_service_new_work(false)) {
 		memset(&slot->r4.owner, 0, sizeof(slot->r4.owner));
 		pg_write_barrier();
 		reserved = pg_atomic_compare_exchange_u32(&slot->state, &expected, reserved_state);
@@ -647,6 +705,10 @@ cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
 	if (CrServerShared == NULL || lms_state == NULL || worker_id < 0
 		|| worker_id >= CLUSTER_LMS_MAX_WORKERS || cluster_node_id < 0
 		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	/* Only a new read context is sealed; original admitted completion and
+	 * exact terminal cleanup never pass through this allocation boundary. */
+	if (!cluster_normal_stop_service_new_work(false))
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 
 	/*
@@ -2437,6 +2499,59 @@ typedef struct LmsOrdinaryVerdictDiagnostic {
 	bool did_abort;
 } LmsOrdinaryVerdictDiagnostic;
 
+typedef enum LmsOwnXidConsumer {
+	LMS_OWN_XID_LEGACY = 0,
+	LMS_OWN_XID_ORDINARY_SINGLE
+} LmsOwnXidConsumer;
+
+typedef enum LmsOrdinaryNativeStatus {
+	LMS_ORDINARY_NATIVE_DENIED = 0,
+	LMS_ORDINARY_NATIVE_COMMITTED,
+	LMS_ORDINARY_NATIVE_ABORTED
+} LmsOrdinaryNativeStatus;
+
+/* Ordinary recycled history must use a literal origin terminal byte, not
+ * recursive DidAbort or the availability of a commit-SCN recycle bound.
+ * The caller completed the durable census before taking this drain. */
+static LmsOrdinaryNativeStatus
+lms_ordinary_native_status(TransactionId xid)
+{
+	volatile LmsOrdinaryNativeStatus result = LMS_ORDINARY_NATIVE_DENIED;
+
+	PG_TRY(ordinary_native);
+	{
+		cluster_cr_native_prehistory_reader_lock();
+		if (cluster_undo_retention_horizon_enabled
+			&& cluster_tt_slot_retention_off_recycle_count() == 0
+			&& !cluster_cr_native_prehistory_disabled()
+			&& cluster_cr_native_origin_epoch0_provable(xid)) {
+			LWLockAcquire(XactTruncationLock, LW_SHARED);
+			if (!TransactionIdPrecedes(xid, ShmemVariableCache->oldestClogXid)) {
+				XLogRecPtr lsn = InvalidXLogRecPtr;
+				XidStatus status = TransactionIdGetStatus(xid, &lsn);
+
+				if (status == TRANSACTION_STATUS_ABORTED)
+					result = LMS_ORDINARY_NATIVE_ABORTED;
+				else if (status == TRANSACTION_STATUS_COMMITTED)
+					result = LMS_ORDINARY_NATIVE_COMMITTED;
+			}
+			LWLockRelease(XactTruncationLock);
+		}
+		cluster_cr_native_prehistory_reader_unlock();
+	}
+	PG_CATCH(ordinary_native);
+	{
+		/* Like the existing C0 reader, all entry points are lock-free.
+		 * CLOG may leave an internal SLRU lock held when it throws. */
+		HOLD_INTERRUPTS();
+		LWLockReleaseAll();
+		RESUME_INTERRUPTS();
+		PG_RE_THROW();
+	}
+	PG_END_TRY(ordinary_native);
+	return result;
+}
+
 /* 0: no added proof; 1: committed bound; -1: own committed stamp contradicts
  * the validated shutdown checkpoint. Nothing here authorizes reclamation. */
 static int
@@ -2483,7 +2598,8 @@ static LmsOwnXidReason
 lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_id,
 									 uint32 expected_tt_slot_id, bool allow_live,
 									 uint8 *out_verdict, SCN *out_commit_scn, SCN *out_horizon_scn,
-									 uint16 *out_wrap, LmsOrdinaryVerdictDiagnostic *diagnostic)
+									 uint16 *out_wrap, LmsOwnXidConsumer consumer,
+									 LmsOrdinaryVerdictDiagnostic *diagnostic)
 {
 	SCN scn = InvalidScn;
 	SCN horizon = InvalidScn;
@@ -2664,6 +2780,21 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 		return LMS_OWN_XID_PROVEN;
 
 	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
+		if (consumer == LMS_OWN_XID_ORDINARY_SINGLE) {
+			LmsOrdinaryNativeStatus status = lms_ordinary_native_status(xid);
+
+			if (status == LMS_ORDINARY_NATIVE_ABORTED) {
+				diagnostic->predicate = "ORDINARY_LITERAL_ABORTED";
+				*out_verdict = (uint8)CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+				return LMS_OWN_XID_PROVEN;
+			}
+			if (status != LMS_ORDINARY_NATIVE_COMMITTED) {
+				diagnostic->predicate = "ORDINARY_NATIVE_UNPROVEN";
+				return LMS_OWN_XID_REFUSE_ZERO_MATCH;
+			}
+			/* Only literal COMMITTED may reach the unchanged H-bound path.
+			 * No fresh/live or multi-member permission is implied by this role. */
+		}
 		/*
 		 * TT-P013-RULE25-C0: the committed-only scan's zero-match also
 		 * contains exact ACTIVE and ABORTED cluster-era xids.  Before the
@@ -2673,10 +2804,11 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 		 * until this SHARED reader has selected its verdict.
 		 *
 		 * The full durable scan intentionally stays outside this drain.  If a
-		 * DISABLE won during/after it, the in-lock covered/disabled recheck
+		 * DISABLE won during/after it, the in-lock disabled recheck
 		 * fails; if this reader wins, raw reuse cannot begin until it releases.
-		 * A nonzero covered_hw is only the current-boot "drain armed" witness,
-		 * NEVER a numeric xid bound (do not use native_prehistory_provable).
+		 * As in the C1b pair, covered_hw may be zero in a formation without
+		 * native-era history. The lock and one-way disable, not that coverage
+		 * watermark, prove this derivable cluster-era xid's no-reuse window.
 		 *
 		 * Read literal raw CLOG under XactTruncationLock.  DidAbort recursively
 		 * follows SUB_COMMITTED, which C0 must keep UNKNOWN.  Only raw COMMITTED
@@ -2685,8 +2817,7 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 		 * before that branch can reinterpret the CLOG byte.
 		 */
 		if (allow_live && expected_segment_id > 0 && expected_segment_id <= UINT16_MAX
-			&& expected_tt_slot_id >= 1 && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT
-			&& cluster_cr_native_prehistory_covered_hw() != 0) {
+			&& expected_tt_slot_id >= 1 && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT) {
 			volatile ClusterUndoVerdictKind c0_verdict
 				= CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
 			volatile bool c0_hard_refuse = false;
@@ -2697,8 +2828,7 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 				bool xid_is_mine;
 
 				cluster_cr_native_prehistory_reader_lock();
-				no_raw_reuse_window = cluster_cr_native_prehistory_covered_hw() != 0
-					  && !cluster_cr_native_prehistory_disabled();
+				no_raw_reuse_window = !cluster_cr_native_prehistory_disabled();
 				xid_is_mine = no_raw_reuse_window && cluster_xid_is_mine(xid);
 
 				if (xid_is_mine) {
@@ -2777,6 +2907,12 @@ lms_resolve_own_xid_verdict_observed(TransactionId xid, uint32 expected_segment_
 			*out_horizon_scn = horizon;
 			return LMS_OWN_XID_PROVEN;
 		}
+		if (consumer == LMS_OWN_XID_ORDINARY_SINGLE) {
+			/* The bracketed ordinary sample was COMMITTED, not ABORTED.
+			 * A later recursive CLOG answer cannot replace that proof. */
+			diagnostic->predicate = "ORDINARY_NATIVE_UNPROVEN";
+			return LMS_OWN_XID_REFUSE_ZERO_MATCH;
+		}
 		diagnostic->abort_sampled = true;
 		sampled_abort = TransactionIdDidAbort(xid);
 		diagnostic->did_abort = sampled_abort;
@@ -2817,9 +2953,9 @@ lms_resolve_own_xid_verdict(TransactionId xid, uint32 expected_segment_id,
 							uint32 expected_tt_slot_id, bool allow_live, uint8 *out_verdict,
 							SCN *out_commit_scn, SCN *out_horizon_scn, uint16 *out_wrap)
 {
-	return lms_resolve_own_xid_verdict_observed(xid, expected_segment_id, expected_tt_slot_id,
-												allow_live, out_verdict, out_commit_scn,
-												out_horizon_scn, out_wrap, NULL);
+	return lms_resolve_own_xid_verdict_observed(
+		xid, expected_segment_id, expected_tt_slot_id, allow_live, out_verdict, out_commit_scn,
+		out_horizon_scn, out_wrap, LMS_OWN_XID_LEGACY, NULL);
 }
 
 #ifdef USE_CLUSTER_UNIT
@@ -2834,7 +2970,8 @@ cluster_cr_server_test_ordinary_reason(TransactionId xid, uint32 segment_hint,
 	LmsOrdinaryVerdictDiagnostic diagnostic;
 
 	(void)lms_resolve_own_xid_verdict_observed(xid, segment_hint, 0, false, &verdict, &commit_scn,
-											   &horizon_scn, &wrap, &diagnostic);
+											   &horizon_scn, &wrap, LMS_OWN_XID_LEGACY,
+											   &diagnostic);
 	*kind
 		= verdict == CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT ? CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
 		  : verdict == CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON
@@ -3149,7 +3286,12 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 		else
 			reason = lms_resolve_own_xid_verdict_observed(
 				xid, slot->undo_segment_id, slot->undo_block_no, slot->undo_authoritative, &verdict,
-				&commit_scn, &horizon_scn, &wrap, &ordinary_diagnostic);
+				&commit_scn, &horizon_scn, &wrap,
+				slot->req_kind == CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT && !slot->undo_authoritative
+						&& slot->undo_owner < 0
+					? LMS_OWN_XID_ORDINARY_SINGLE
+					: LMS_OWN_XID_LEGACY,
+				&ordinary_diagnostic);
 	}
 	if (freshref_pair) {
 		uint64 exit_epoch = cluster_epoch_get_current();
@@ -3210,6 +3352,15 @@ lms_undo_verdict_serve(ClusterLmsCrSlot *slot)
 	v->wrap = wrap;
 	return true;
 }
+
+#ifdef USE_CLUSTER_UNIT
+bool cluster_cr_server_test_undo_verdict_serve(ClusterLmsCrSlot *slot);
+bool
+cluster_cr_server_test_undo_verdict_serve(ClusterLmsCrSlot *slot)
+{
+	return lms_undo_verdict_serve(slot);
+}
+#endif
 
 /*
  * lms_undo_authority_verdict_serve — LMS side of one kind-4 dead-owner
@@ -3302,7 +3453,7 @@ lms_undo_authority_verdict_serve(ClusterLmsCrSlot *slot)
  * the same decision.
  */
 bool
-cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
+cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative, bool ordinary_single,
 								   ClusterGcsUndoVerdictPage *v)
 {
 	uint8 verdict = 0;
@@ -3326,8 +3477,10 @@ cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
 	 * abort upgrade into lms_resolve_own_xid_verdict; this wrapper only
 	 * shapes the page.  Census attribution is the caller's (the self leg
 	 * keeps the rtvis counters; this core bumps none). */
-	switch (
-		lms_resolve_own_xid_verdict(xid, 0, 0, false, &verdict, &commit_scn, &horizon_scn, &wrap)) {
+	switch (lms_resolve_own_xid_verdict_observed(
+		xid, 0, 0, false, &verdict, &commit_scn, &horizon_scn, &wrap,
+		!authoritative && ordinary_single ? LMS_OWN_XID_ORDINARY_SINGLE : LMS_OWN_XID_LEGACY,
+		NULL)) {
 	case LMS_OWN_XID_PROVEN:
 	case LMS_OWN_XID_PROVEN_UPGRADE:
 		break;
@@ -3448,6 +3601,15 @@ lms_undo_multi_verdict_serve(ClusterLmsCrSlot *slot)
 	v->status = (uint8)CLUSTER_GCS_UNDO_MULTI_VERDICT_SERVED;
 	return true;
 }
+
+#ifdef USE_CLUSTER_UNIT
+bool cluster_cr_server_test_multi_verdict_serve(ClusterLmsCrSlot *slot);
+bool
+cluster_cr_server_test_multi_verdict_serve(ClusterLmsCrSlot *slot)
+{
+	return lms_undo_multi_verdict_serve(slot);
+}
+#endif
 
 /*
  * cr_serve_slot — serve one populated request carrier.  Shared by the
@@ -4022,6 +4184,8 @@ cluster_gcs_current_mx_describe_serve_inline(
 	if (expected_worker != recv_worker)
 		return;
 
+	if (!cluster_normal_stop_service_new_work(false))
+		return;
 	old_context = MemoryContextSwitchTo(cr_serve_scratch_context());
 	reply = (char *)palloc0(reply_total);
 	outer = (GcsBlockReplyHeader *)reply;
@@ -4132,6 +4296,8 @@ cluster_gcs_current_mx_member_proof_serve_inline(
 	if (expected_worker != recv_worker)
 		return;
 
+	if (!cluster_normal_stop_service_new_work(false))
+		return;
 	old_context = MemoryContextSwitchTo(cr_serve_scratch_context());
 	reply = (char *)palloc0(reply_total);
 	outer = (GcsBlockReplyHeader *)reply;
@@ -4243,6 +4409,13 @@ cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd, Cluste
 			return;
 		}
 	}
+
+	/* This DATA entry bypasses the parked-slot allocator. Seal 1 still
+	 * permits its read-only completion work; seal 2 admits no new CR/TT
+	 * context, including the defensive DENIED construction below. The
+	 * original outer LMS actor owns an admitted call through send/reset. */
+	if (!cluster_normal_stop_service_new_work(false))
+		return;
 
 	/* Populate the request carrier from the forward payload (was submit). */
 	memset(&slot, 0, sizeof(slot));

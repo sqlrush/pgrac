@@ -21,8 +21,12 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "cluster/cluster_undo_smgr.h"
+#include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/storage/cluster_undo_block0.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "lib/ilist.h"
+#include "cluster/cluster_clean_leave.h"
 #include "port/atomics.h"
 #include "storage/bufpage.h"
 #include "storage/lwlock.h"
@@ -583,6 +587,53 @@ block0_recovery_guard_clear(ClusterUndoBlock0RecoveryGuard *guard)
 }
 
 
+/* The normal loader catches I/O ERROR before Startup's outer ResourceOwner
+ * teardown. Restore only its exact unfinished FILL to the still-owned token,
+ * so that outer closed-pass cleanup can return the frame and loaded prefix.
+ * Other recovery/runtime callers retain their existing ResourceOwner path. */
+static bool
+block0_normal_start_read(ClusterUndoBlock0SlotData *meta,
+						 const ClusterUndoBlock0LogicalKey *logical,
+						 const ClusterUndoBlock0ResolvedRoot *root,
+						 const ClusterUndoBlock0AuthorityProof *proof,
+						 ClusterUndoBlock0FrameToken *token, char *frame)
+{
+	volatile bool read_ok = false;
+	if (!AmStartupProcess() || !cluster_semantic_normal_start_closed()
+		|| !cluster_undo_block0_current_startup_fenced_owned())
+		return cluster_undo_smgr_read_block(root->intent, logical->segment_id,
+											logical->owner_instance, 0, frame);
+	PG_TRY();
+	{
+		read_ok = cluster_undo_smgr_read_block(root->intent, logical->segment_id,
+											   logical->owner_instance, 0, frame);
+	}
+	PG_CATCH();
+	{
+		ClusterUndoBlock0OwnedResource *owned
+			= block0_resource_find(token, CLUSTER_UNDO_BLOCK0_OWNED_FILL);
+		LWLockAcquire(&meta->content_lock, LW_EXCLUSIVE);
+		if (owned != NULL && owned->owner == CurrentResourceOwner && token->owned
+			&& owned->frame_index == token->frame_index && meta->frame_index == token->frame_index
+			&& pg_atomic_read_u32(&meta->state) == CLUSTER_UNDO_BLOCK0_SLOT_FILLING
+			&& pg_atomic_read_u32(&meta->pincount) == 1 && XLogRecPtrIsInvalid(meta->last_wal_lsn)
+			&& meta->logical.segment_id == logical->segment_id
+			&& meta->logical.owner_instance == logical->owner_instance
+			&& cluster_undo_block0_root_matches(&meta->resolved_root, root)
+			&& block0_authority_proof_matches(&meta->proof, proof)) {
+			meta->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
+			pg_atomic_write_u32(&meta->pincount, 0);
+			pg_atomic_write_u32(&meta->state, CLUSTER_UNDO_BLOCK0_SLOT_EMPTY);
+			owned->slot = CLUSTER_UNDO_BLOCK0_SLOT_COUNT;
+			owned->kind = CLUSTER_UNDO_BLOCK0_OWNED_FRAME;
+		}
+		LWLockRelease(&meta->content_lock);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return read_ok;
+}
+
 ClusterUndoBlock0Result
 cluster_undo_block0_admit_runtime(const ClusterUndoBlock0LogicalKey *logical,
 							  const ClusterUndoBlock0ResolvedRoot *root,
@@ -632,8 +683,7 @@ cluster_undo_block0_admit_runtime(const ClusterUndoBlock0LogicalKey *logical,
 	}
 	LWLockRelease(&meta->content_lock);
 
-	if (!cluster_undo_smgr_read_block(root->intent, logical->segment_id, logical->owner_instance, 0,
-									  frame)) {
+	if (!block0_normal_start_read(meta, logical, root, proof, token, frame)) {
 		LWLockAcquire(&meta->content_lock, LW_EXCLUSIVE);
 		meta->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
 		pg_atomic_write_u32(&meta->pincount, 0);
@@ -1446,7 +1496,9 @@ cluster_undo_block0_verify_clean_census(
 
 		if (matched)
 			item_index++;
-		else if (state != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY) {
+		else if (state != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY || pg_atomic_read_u32(&meta->pincount) != 0
+				 || meta->frame_index != CLUSTER_UNDO_BLOCK0_FRAME_INVALID
+				 || !XLogRecPtrIsInvalid(meta->last_wal_lsn)) {
 			LWLockRelease(&meta->content_lock);
 			return false;
 		}
@@ -1454,6 +1506,265 @@ cluster_undo_block0_verify_clean_census(
 	}
 
 	return item_index == count;
+}
+
+bool
+cluster_undo_block0_normal_start_empty(void)
+{
+	bool empty;
+	if (!AmStartupProcess() || Block0Ctl == NULL || !cluster_semantic_normal_start_closed()
+		|| !cluster_undo_block0_current_startup_fenced_owned()
+		|| cluster_undo_block0_backend_has_resources())
+		return false;
+	LWLockAcquire(&Block0Ctl->frame_lock, LW_SHARED);
+	empty = Block0Ctl->free_count == Block0Ctl->frame_count;
+	LWLockRelease(&Block0Ctl->frame_lock);
+	return empty && cluster_undo_block0_verify_clean_census(NULL, 0)
+		   && cluster_semantic_normal_start_closed();
+}
+
+/* The one Startup executor saves this exact item and frame before admission.
+ * A failed pass may return only its own clean, unpinned prefix, while every
+ * serving path remains closed. No live caller can evict a resident binding. */
+bool
+cluster_undo_block0_normal_start_discard(const ClusterUndoBlock0ResidentCensusItem *item,
+										 uint32 frame_index)
+{
+	ClusterUndoBlock0SlotData *meta;
+	uint32 slotno, i;
+	bool exact;
+	if (!AmStartupProcess() || Block0Ctl == NULL || item == NULL
+		|| !cluster_semantic_normal_start_closed()
+		|| !cluster_undo_block0_current_startup_fenced_owned() || cluster_node_id < 0
+		|| cluster_node_id >= UNDO_OWNER_INSTANCE_MAX
+		|| item->logical.owner_instance != cluster_node_id + 1
+		|| item->resolved_root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED || !item->generation.known
+		|| item->generation.value == UINT32_MAX
+		|| item->proof.kind != CLUSTER_UNDO_BLOCK0_LIVE_OWNER
+		|| item->proof.owner_instance != item->logical.owner_instance
+		|| !item->proof.cluster_epoch_present || item->proof.cluster_epoch != 0
+		|| item->proof.recovery_generation != 0 || frame_index >= Block0Ctl->frame_count
+		|| cluster_undo_block0_logical_slot(&item->logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
+		return false;
+	meta = &Block0Slots[slotno].data;
+	/* In particular, never wait on a pin/content lock we do not own. */
+	if (pg_atomic_read_u32(&meta->pincount) != 0
+		|| !LWLockConditionalAcquire(&meta->content_lock, LW_EXCLUSIVE))
+		return false;
+	exact = pg_atomic_read_u32(&meta->state) == CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN
+			&& pg_atomic_read_u32(&meta->pincount) == 0 && meta->frame_index == frame_index
+			&& XLogRecPtrIsInvalid(meta->last_wal_lsn)
+			&& meta->logical.segment_id == item->logical.segment_id
+			&& meta->logical.owner_instance == item->logical.owner_instance
+			&& cluster_undo_block0_root_matches(&meta->resolved_root, &item->resolved_root)
+			&& cluster_undo_block0_generation_matches(&meta->generation, &item->generation)
+			&& block0_authority_proof_matches(&meta->proof, &item->proof);
+	if (!exact) {
+		LWLockRelease(&meta->content_lock);
+		return false;
+	}
+	LWLockAcquire(&Block0Ctl->frame_lock, LW_EXCLUSIVE);
+	exact
+		= Block0Ctl->free_count < Block0Ctl->frame_count && cluster_semantic_normal_start_closed();
+	for (i = 0; exact && i < Block0Ctl->free_count; i++)
+		if (Block0FreeFrames[i] == frame_index)
+			exact = false;
+	if (exact) {
+		memset(&meta->logical, 0, sizeof(meta->logical));
+		memset(&meta->resolved_root, 0, sizeof(meta->resolved_root));
+		memset(&meta->generation, 0, sizeof(meta->generation));
+		memset(&meta->proof, 0, sizeof(meta->proof));
+		meta->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
+		meta->last_wal_lsn = InvalidXLogRecPtr;
+		pg_atomic_write_u32(&meta->state, CLUSTER_UNDO_BLOCK0_SLOT_EMPTY);
+		Block0FreeFrames[Block0Ctl->free_count++] = frame_index;
+	}
+	LWLockRelease(&Block0Ctl->frame_lock);
+	LWLockRelease(&meta->content_lock);
+	return exact;
+}
+
+typedef struct Block0StopObservation {
+	ClusterNormalStopPollResult result;
+	uint32 segment;
+	int tt_slot;
+	const char *reason;
+} Block0StopObservation;
+
+static void
+block0_normal_stop_note(Block0StopObservation *observation, ClusterNormalStopPollResult result,
+						uint32 segment, int tt_slot, const char *reason)
+{
+	if (result == CLUSTER_NORMAL_STOP_READY || observation->result == CLUSTER_NORMAL_STOP_INVALID
+		|| (observation->result == CLUSTER_NORMAL_STOP_PENDING
+			&& result == CLUSTER_NORMAL_STOP_PENDING))
+		return;
+	observation->result = result;
+	observation->segment = segment;
+	observation->tt_slot = tt_slot;
+	observation->reason = reason;
+}
+
+/*
+ * Observe every original resident owner, including TT slots in rolled-away
+ * segments no longer represented by the bounded TT allocator.  A valid
+ * resident binding is not evicted by normal runtime; only unfinished fill /
+ * provision cleanup returns its frame.  Startup's complete namespace census
+ * is nevertheless a SEPARATE prerequisite: an empty resident slot says
+ * nothing about an unopened old file.  This routine grants no read/mutation
+ * authority and performs no I/O, publication, pin release or TT transition.
+ *
+ * Do not queue behind a content-X owner: the coordinator must leave its
+ * original completion path running.  Pool and slot locks are never nested.
+ * Non-atomic pool accounting is only a conservative pending observation;
+ * stability still requires the controller's producer and service seals.
+ */
+ClusterNormalStopPollResult
+cluster_undo_block0_normal_stop_poll(
+	bool post_checkpoint, const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+	uint64 expected_epoch, uint32 *segment_out, int *tt_slot_out, const char **reason_out)
+{
+	Block0StopObservation observation
+		= { CLUSTER_NORMAL_STOP_INVALID, 0, -1, "UNDO_BLOCK0_STOP_STATE_INVALID" };
+	ClusterUndoRootDescriptorV1 descriptor;
+	uint32 frame_count;
+	uint32 free_before;
+	uint32 resident_count = 0;
+	uint32 slotno;
+
+	if (!IsUnderPostmaster
+		|| (MyBackendType != B_CHECKPOINTER && !(post_checkpoint && MyBackendType == B_LMON))
+		|| Block0Ctl == NULL || Block0Slots == NULL || Block0Frames == NULL
+		|| Block0FreeFrames == NULL || root_descriptor == NULL
+		|| cluster_undo_root_descriptor_decode(root_descriptor, GetSystemIdentifier(), &descriptor)
+			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+		|| descriptor.root_kind != CLUSTER_UNDO_ROOT_KIND_SHARED)
+		goto done;
+	/* This process must first return its own original ResourceOwner handles;
+	 * in particular it may itself hold a slot's content-X lock. */
+	if (cluster_undo_block0_backend_has_resources()) {
+		observation.result = CLUSTER_NORMAL_STOP_PENDING;
+		observation.reason = "UNDO_BLOCK0_PRIVATE_OWNER_PENDING";
+		goto done;
+	}
+	LWLockAcquire(&Block0Ctl->frame_lock, LW_SHARED);
+	frame_count = Block0Ctl->frame_count;
+	free_before = Block0Ctl->free_count;
+	LWLockRelease(&Block0Ctl->frame_lock);
+	if (frame_count == 0 || free_before > frame_count)
+		goto done;
+	observation.result = CLUSTER_NORMAL_STOP_READY;
+	observation.reason = "NONE";
+	for (slotno = 0; slotno < CLUSTER_UNDO_BLOCK0_SLOT_COUNT; slotno++) {
+		ClusterUndoBlock0SlotData *meta = &Block0Slots[slotno].data;
+		ClusterUndoBlock0Generation page_generation;
+		ClusterUndoBlock0ResolvedRoot expected_root;
+		const UndoSegmentHeaderData *header;
+		uint32 logical_slot;
+		uint32 state;
+		uint32 pins;
+		int i;
+
+		if (!LWLockConditionalAcquire(&meta->content_lock, LW_SHARED)) {
+			block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, slotno + 1, -1,
+									"UNDO_BLOCK0_CONTENT_BUSY");
+			continue;
+		}
+		state = pg_atomic_read_u32(&meta->state);
+		pins = pg_atomic_read_u32(&meta->pincount);
+		if (state == CLUSTER_UNDO_BLOCK0_SLOT_EMPTY) {
+			/* Failed fill may retain identity fields, but never frame/pin/I/O. */
+			if (pins != 0 || meta->frame_index != CLUSTER_UNDO_BLOCK0_FRAME_INVALID
+				|| !XLogRecPtrIsInvalid(meta->last_wal_lsn))
+				block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_INVALID, slotno + 1, -1,
+										"UNDO_BLOCK0_EMPTY_HAS_OWNER");
+			goto next_slot;
+		}
+		if (state > CLUSTER_UNDO_BLOCK0_SLOT_RETIRING || meta->frame_index >= frame_count
+			|| cluster_undo_block0_logical_slot(&meta->logical, &logical_slot)
+				   != CLUSTER_UNDO_BLOCK0_OK
+			|| logical_slot != slotno
+			|| !cluster_undo_root_descriptor_resolve(&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+													 meta->logical.owner_instance,
+													 meta->logical.segment_id, &expected_root)
+			|| !cluster_undo_block0_root_matches(&meta->resolved_root, &expected_root)
+			|| !block0_authority_proof_valid(&meta->logical, &meta->proof)
+			|| meta->proof.kind != CLUSTER_UNDO_BLOCK0_LIVE_OWNER
+			|| meta->proof.cluster_epoch != expected_epoch
+			|| meta->proof.recovery_generation != 0) {
+			block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_INVALID, slotno + 1, -1,
+									"UNDO_BLOCK0_RESIDENT_IDENTITY_INVALID");
+			goto next_slot;
+		}
+		resident_count++;
+		if (state == CLUSTER_UNDO_BLOCK0_SLOT_FILLING
+			|| state == CLUSTER_UNDO_BLOCK0_SLOT_RETIRING) {
+			block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, slotno + 1, -1,
+									"UNDO_BLOCK0_PUBLICATION_PENDING");
+			goto next_slot;
+		}
+		header = (const UndoSegmentHeaderData *)BLOCK0_FRAME_DATA(meta->frame_index);
+		if (!meta->generation.known || meta->generation.value == UINT32_MAX
+			|| !block0_page_identity((const char *)header, &meta->logical, &page_generation)
+			|| !cluster_undo_block0_generation_matches(&page_generation, &meta->generation)
+			|| (state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN)
+				   != XLogRecPtrIsInvalid(meta->last_wal_lsn)) {
+			block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_INVALID, slotno + 1, -1,
+									"UNDO_BLOCK0_RESIDENT_IMAGE_INVALID");
+			goto next_slot;
+		}
+		if (pins != 0)
+			block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, slotno + 1, -1,
+									"UNDO_BLOCK0_PIN_PENDING");
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+			const TTSlot *tt = &header->tt_slots[i];
+			const TTSlot zero = { 0 };
+			bool valid;
+
+			if (tt->status == TT_SLOT_UNUSED)
+				valid = memcmp(tt, &zero, sizeof(zero)) == 0;
+			else
+				valid = TransactionIdIsNormal(tt->xid) && tt->wrap != TT_WRAP_INVALID
+						&& tt->status <= TT_SLOT_RECYCLABLE
+						&& (tt->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
+						&& ((tt->status == TT_SLOT_COMMITTED && SCN_VALID(tt->commit_scn))
+							|| (tt->status != TT_SLOT_COMMITTED && tt->commit_scn == InvalidScn))
+						&& (tt->status != TT_SLOT_ACTIVE || tt->flags == TT_FLAGS_RESERVED);
+			if (!valid)
+				block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_INVALID, slotno + 1, i,
+										"UNDO_BLOCK0_TT_SHAPE_INVALID");
+			else if (tt->status == TT_SLOT_ACTIVE)
+				block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, slotno + 1, i,
+										"UNDO_BLOCK0_TT_ACTIVE");
+			else if (!UBA_is_invalid(tt->first_undo_block))
+				block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, slotno + 1, i,
+										"UNDO_BLOCK0_TT_UNDO_PENDING");
+		}
+		if (post_checkpoint && state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
+			block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, slotno + 1, -1,
+									"UNDO_BLOCK0_DURABILITY_PENDING");
+	next_slot:
+		LWLockRelease(&meta->content_lock);
+		if (observation.result == CLUSTER_NORMAL_STOP_INVALID)
+			break;
+	}
+	LWLockAcquire(&Block0Ctl->frame_lock, LW_SHARED);
+	if (Block0Ctl->frame_count != frame_count || Block0Ctl->free_count > frame_count)
+		block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_INVALID, 0, -1,
+								"UNDO_BLOCK0_FRAME_POOL_INVALID");
+	else if (Block0Ctl->free_count != free_before
+			 || (uint64)free_before + resident_count != frame_count)
+		block0_normal_stop_note(&observation, CLUSTER_NORMAL_STOP_PENDING, 0, -1,
+								"UNDO_BLOCK0_FRAME_OWNER_PENDING");
+	LWLockRelease(&Block0Ctl->frame_lock);
+done:
+	if (segment_out != NULL)
+		*segment_out = observation.segment;
+	if (tt_slot_out != NULL)
+		*tt_slot_out = observation.tt_slot;
+	if (reason_out != NULL)
+		*reason_out = observation.reason;
+	return observation.result;
 }
 
 

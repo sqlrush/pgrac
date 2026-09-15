@@ -24,6 +24,8 @@
 #include "postgres.h"
 
 #include "access/clog.h"
+#include "access/multixact.h"
+#include "access/xlog.h"
 #include "access/transam.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_cr_server.h"
@@ -31,6 +33,13 @@
 #include "cluster/cluster_undo_retention.h"
 #include "cluster/cluster_xid_authority.h"
 #include "cluster/cluster_xid_stripe.h"
+#include "cluster/cluster_cr.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_mxid_stripe.h"
+#include "cluster/cluster_runtime_visibility.h"
+#include "cluster/cluster_scn.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_undo_record_api.h"
 #include "miscadmin.h"
 #include "storage/lwlock.h"
 #include "storage/procarray.h"
@@ -84,6 +93,8 @@ extern ClusterUndoVerdictKind cluster_cr_server_c0_zero_match_verdict(
 extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
 	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
 	bool authoritative);
+extern bool cluster_cr_server_test_undo_verdict_serve(ClusterLmsCrSlot *slot);
+extern bool cluster_cr_server_test_multi_verdict_serve(ClusterLmsCrSlot *slot);
 extern const char *cluster_cr_server_test_ordinary_reason(TransactionId xid, uint32 segment_hint,
 														  ClusterUndoVerdictKind *kind);
 extern ClusterUndoVerdictResult cluster_cr_server_test_own_xid_pair_verdict(
@@ -139,6 +150,7 @@ static bool c0_reader_pending;
 static uint64 c0_ungated_recycles;
 int cluster_node_id = 0;
 bool cluster_undo_retention_horizon_enabled = true;
+bool cluster_crossnode_runtime_visibility = true;
 static bool c0_did_commit;
 static bool c0_commit_after_procarray;
 static bool c0_durable_drift_after_procarray;
@@ -149,6 +161,7 @@ static bool c0_accept_resolved_scn;
 static XidStatus c0_raw_status;
 static bool c0_throw_on_clog;
 static bool c0_disable_before_native_recheck;
+static bool c0_epoch0_origin_provable;
 static int c0_native_lock_depth;
 static int c0_xact_lock_depth;
 static int c0_slru_lock_depth;
@@ -218,6 +231,7 @@ c0_reset(void)
 	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
 	c0_throw_on_clog = false;
 	c0_disable_before_native_recheck = false;
+	c0_epoch0_origin_provable = true;
 	c0_native_lock_depth = 0;
 	c0_xact_lock_depth = 0;
 	c0_slru_lock_depth = 0;
@@ -325,6 +339,129 @@ cluster_cr_native_prehistory_disabled(void)
 {
 	c0_note(C0_EV_DISABLED);
 	return c0_disabled;
+}
+
+bool
+cluster_cr_native_origin_epoch0_provable(TransactionId xid pg_attribute_unused())
+{
+	/* The origin predicate has its own real tests; this fixture supplies its
+	 * result while checking that the consuming resolver owns the drain. */
+	UT_ASSERT_EQ(c0_native_lock_depth, 1);
+	return c0_epoch0_origin_provable && c0_xid_is_mine;
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return 7;
+}
+
+XLogRecPtr
+GetFlushRecPtr(TimeLineID *insertTLI)
+{
+	if (insertTLI != NULL)
+		*insertTLI = 1;
+	return UINT64CONST(0x1000000);
+}
+
+uint64
+cluster_undo_tt_retention_rollover_count(void)
+{
+	return 9;
+}
+
+SCN
+cluster_scn_current(void)
+{
+	return 1000;
+}
+
+/* These zero-epoch pair hooks must not be reached by ordinary or the
+ * nonzero-epoch role-isolation cases below. */
+bool
+cluster_runtime_visibility_zero_epoch_pair_admission_enter(ClusterSemanticAdmissionToken *token)
+{
+	UT_ASSERT(false);
+	memset(token, 0, sizeof(*token));
+	return false;
+}
+
+bool
+cluster_semantic_activation_recheck(
+	const ClusterSemanticAdmissionToken *token pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+void
+cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token pg_attribute_unused())
+{
+	UT_ASSERT(false);
+}
+
+void
+cluster_vis53r97_note_srv_other(void)
+{}
+void
+cluster_vis53r97_note_srv_zero_match(void)
+{}
+void
+cluster_vis53r97_note_srv_invalid_scn(void)
+{}
+void
+cluster_vis53r97_note_live_upgrade_hit(void)
+{}
+
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	UT_ASSERT(elevel < ERROR);
+	return false;
+}
+
+bool
+errstart_cold(int elevel, const char *domain)
+{
+	return errstart(elevel, domain);
+}
+
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+void
+errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
+		  const char *func pg_attribute_unused())
+{}
+
+bool
+cluster_mxid_is_mine(MultiXactId mxid pg_attribute_unused())
+{
+	return true;
+}
+
+int
+GetMultiXactIdMembers(MultiXactId mxid pg_attribute_unused(), MultiXactMember **members,
+					  bool allow_old pg_attribute_unused(), bool is_lock_only pg_attribute_unused())
+{
+	*members = malloc(2 * sizeof(**members));
+	UT_ASSERT_NOT_NULL(*members);
+	if (*members == NULL)
+		return -1;
+	(*members)[0].xid = 4222256;
+	(*members)[0].status = MultiXactStatusUpdate;
+	(*members)[1].xid = 4222257;
+	(*members)[1].status = MultiXactStatusForShare;
+	return 2;
+}
+
+void
+pfree(void *ptr)
+{
+	free(ptr);
 }
 
 void
@@ -1165,14 +1302,14 @@ UT_TEST(test_c0_real_zero_match_abort_live_and_self_disable)
 	UT_ASSERT_EQ(c0_procarray_calls, 1);
 	UT_ASSERT(c0_event_pos(C0_EV_SCAN) < c0_event_pos(C0_EV_NATIVE_LOCK));
 	UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK)
-			  < c0_event_pos_after(C0_EV_COVERED, c0_event_pos(C0_EV_NATIVE_LOCK)));
+			  < c0_event_pos_after(C0_EV_DISABLED, c0_event_pos(C0_EV_NATIVE_LOCK)));
 	UT_ASSERT(c0_event_pos(C0_EV_DISABLED) < c0_event_pos(C0_EV_CLOG));
 	UT_ASSERT(c0_event_pos(C0_EV_CLOG) < c0_event_pos(C0_EV_XACT_UNLOCK));
 	UT_ASSERT(c0_event_pos(C0_EV_XACT_UNLOCK) < c0_event_pos(C0_EV_PROCARRAY));
 	UT_ASSERT(c0_event_pos(C0_EV_PROCARRAY) < c0_event_pos(C0_EV_NATIVE_UNLOCK));
 	UT_ASSERT_EQ(c0_native_provable_calls, 0);
 
-	/* One-way disable and an unset boot witness both suppress C0. */
+	/* One-way disable suppresses C0; an empty native history does not. */
 	c0_reset();
 	c0_disabled = true;
 	c0_raw_status = TRANSACTION_STATUS_ABORTED;
@@ -1197,8 +1334,21 @@ UT_TEST(test_c0_real_zero_match_abort_live_and_self_disable)
 	c0_covered_hw = 0;
 	c0_raw_status = TRANSACTION_STATUS_ABORTED;
 	kind = cluster_cr_server_test_own_xid_verdict(4195136, 1, 1, true);
-	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ(c0_raw_clog_calls, 0);
+	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_ABORTED);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+
+	c0_reset();
+	c0_covered_hw = 0;
+	c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+	c0_procarray_live = true;
+	kind = cluster_cr_server_test_own_xid_verdict(4195136, 1, 1, true);
+	UT_ASSERT_EQ((int)kind, (int)CLUSTER_UNDO_VERDICT_IN_PROGRESS);
+	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
+	UT_ASSERT_EQ(c0_procarray_calls, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
 
 	/* Terminal-only slot0 callers never enter the live/abort widening. */
 	c0_reset();
@@ -1699,7 +1849,7 @@ UT_TEST(test_retained_data_alias_has_origin_bound_but_never_exact_pair_identity)
 	c0_matched_slot = 32;
 	c0_resolved_scn = 14601620;
 	memset(&page, 0, sizeof(page));
-	UT_ASSERT(cluster_lms_undo_verdict_fill_page(4264048, false, &page));
+	UT_ASSERT(cluster_lms_undo_verdict_fill_page(4264048, false, true, &page));
 	UT_ASSERT_EQ(page.verdict, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON);
 	UT_ASSERT_EQ(page.horizon_scn, c0_startup_bound);
 	UT_ASSERT_EQ(page.commit_scn, InvalidScn);
@@ -1708,10 +1858,221 @@ UT_TEST(test_retained_data_alias_has_origin_bound_but_never_exact_pair_identity)
 	UT_ASSERT_EQ(pair.commit_scn, InvalidScn);
 }
 
+UT_TEST(test_normal_ordinary_abort_needs_no_recycle_or_checkpoint_bound)
+{
+	int sample;
+
+	for (sample = 0; sample < 16; sample++) {
+		ClusterGcsUndoVerdictPage page;
+		TransactionId xid = (sample & 4) ? 4275640 : 4222256;
+
+		c0_reset();
+		c0_covered_hw = (sample & 8) ? 0 : 816;
+		c0_retention_ok = (sample & 1) != 0;
+		c0_startup_bound = (sample & 2) ? 86324311 : InvalidScn;
+		c0_raw_status = TRANSACTION_STATUS_ABORTED;
+		c0_did_abort = true;
+		memset(&page, 0, sizeof(page));
+		UT_ASSERT(cluster_lms_undo_verdict_fill_page(xid, false, true, &page));
+		UT_ASSERT_EQ(page.verdict, CLUSTER_GCS_UNDO_VERDICT_ABORTED);
+		UT_ASSERT_EQ(page.commit_scn, InvalidScn);
+		UT_ASSERT_EQ(page.horizon_scn, InvalidScn);
+		UT_ASSERT_EQ(c0_did_abort_calls, 0);
+		UT_ASSERT_EQ(c0_bound_calls, 0);
+		UT_ASSERT(c0_event_pos(C0_EV_SCAN) < c0_event_pos(C0_EV_NATIVE_LOCK));
+		UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK) < c0_event_pos(C0_EV_CLOG));
+		UT_ASSERT_EQ(c0_native_lock_depth, 0);
+		UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	}
+}
+
+UT_TEST(test_normal_ordinary_abort_doubt_cannot_use_recursive_fallback)
+{
+	int fault;
+
+	for (fault = 1; fault < 13; fault++) {
+		ClusterGcsUndoVerdictPage page;
+
+		c0_reset();
+		c0_covered_hw = 0;
+		c0_retention_ok = true;
+		c0_raw_status = TRANSACTION_STATUS_ABORTED;
+		/* A recursive fallback would incorrectly accept even after the new
+		 * literal/identity proof refused.  Deliberately keep it positive. */
+		c0_did_abort = true;
+		switch (fault) {
+		case 1:
+			c0_disabled = true;
+			break;
+		case 2:
+			c0_disable_before_native_recheck = true;
+			break;
+		case 3:
+			c0_epoch0_origin_provable = false;
+			break;
+		case 4:
+			c0_xid_is_mine = false;
+			break;
+		case 5:
+			cluster_undo_retention_horizon_enabled = false;
+			break;
+		case 6:
+			c0_ungated_recycles = 1;
+			break;
+		case 7:
+			c0_resolve = CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP;
+			break;
+		case 8:
+			c0_resolve = CLUSTER_TT_DURABLE_SCAN_UNAVAILABLE;
+			break;
+		case 9:
+			c0_variable_cache.oldestClogXid = 4222257;
+			break;
+		case 10:
+			c0_raw_status = TRANSACTION_STATUS_SUB_COMMITTED;
+			break;
+		case 11:
+			c0_raw_status = TRANSACTION_STATUS_IN_PROGRESS;
+			break;
+		case 12:
+			/* A later recursive status disagrees with the bracketed literal
+			 * sample. It cannot upgrade this ordinary proof to ABORTED. */
+			c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+			c0_did_commit = false;
+			break;
+		}
+		memset(&page, 0, sizeof(page));
+		UT_ASSERT(!cluster_lms_undo_verdict_fill_page(4222256, false, true, &page));
+		UT_ASSERT_EQ(c0_did_abort_calls, 0);
+		UT_ASSERT_EQ(c0_native_lock_depth, 0);
+		UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+		UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+	}
+}
+
+UT_TEST(test_normal_ordinary_remote_uses_the_same_terminal_proof)
+{
+	ClusterLmsCrSlot slot;
+	ClusterGcsUndoVerdictPage *page = (ClusterGcsUndoVerdictPage *)slot.result_page;
+	int sample;
+
+	for (sample = 0; sample < 8; sample++) {
+		c0_reset();
+		c0_covered_hw = (sample & 4) ? 0 : 816;
+		c0_raw_status = TRANSACTION_STATUS_ABORTED;
+		c0_did_abort = true;
+		c0_retention_ok = (sample & 1) != 0;
+		c0_startup_bound = (sample & 2) ? 86324311 : InvalidScn;
+		memset(&slot, 0, sizeof(slot));
+		slot.req_kind = CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT;
+		slot.undo_owner = -1;
+		slot.undo_xid = 4222256;
+		slot.epoch = 7;
+		UT_ASSERT(cluster_cr_server_test_undo_verdict_serve(&slot));
+		UT_ASSERT_EQ(page->verdict, CLUSTER_GCS_UNDO_VERDICT_ABORTED);
+		UT_ASSERT_EQ(page->xid_echo, UINT64CONST(4222256));
+		UT_ASSERT_EQ(page->commit_scn, InvalidScn);
+		UT_ASSERT_EQ(page->horizon_scn, InvalidScn);
+		UT_ASSERT_EQ(slot.undo_auth.origin_epoch, UINT64CONST(7));
+		UT_ASSERT_EQ(c0_did_abort_calls, 0);
+		UT_ASSERT_EQ(c0_bound_calls, 0);
+		UT_ASSERT_EQ(c0_native_lock_depth, 0);
+		UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_normal_ordinary_permission_does_not_widen_other_roles)
+{
+	ClusterLmsCrSlot slot;
+	ClusterGcsUndoVerdictPage page;
+	int role;
+
+	for (role = 0; role < 5; role++) {
+		c0_reset();
+		c0_raw_status = TRANSACTION_STATUS_ABORTED;
+		c0_did_abort = true;
+		memset(&slot, 0, sizeof(slot));
+		slot.req_kind = CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT;
+		slot.undo_owner = -1;
+		slot.undo_xid = 4222256;
+		slot.epoch = 7;
+		if (role == 0) {
+			memset(&page, 0, sizeof(page));
+			UT_ASSERT(!cluster_lms_undo_verdict_fill_page(4222256, true, true, &page));
+		} else if (role == 1) {
+			slot.undo_authoritative = true;
+			UT_ASSERT(!cluster_cr_server_test_undo_verdict_serve(&slot));
+		} else if (role == 2) {
+			slot.undo_owner = 1;
+			UT_ASSERT(!cluster_cr_server_test_undo_verdict_serve(&slot));
+		} else if (role == 3) {
+			c0_xid_is_mine = false;
+			UT_ASSERT(!cluster_cr_server_test_undo_verdict_serve(&slot));
+		} else {
+			UT_ASSERT(!cluster_cr_server_test_multi_verdict_serve(&slot));
+		}
+		UT_ASSERT_EQ(c0_native_lock_depth, 0);
+		UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	}
+}
+
+UT_TEST(test_zero_native_history_preserves_ordinary_committed_bound)
+{
+	ClusterGcsUndoVerdictPage page;
+
+	c0_reset();
+	c0_covered_hw = 0;
+	c0_retention_ok = true;
+	c0_horizon_scn = 100;
+	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
+	c0_did_commit = true;
+	memset(&page, 0, sizeof(page));
+	UT_ASSERT(cluster_lms_undo_verdict_fill_page(4222256, false, true, &page));
+	UT_ASSERT_EQ(page.verdict, CLUSTER_GCS_UNDO_VERDICT_COMMITTED_BELOW_HORIZON);
+	UT_ASSERT_EQ(page.commit_scn, InvalidScn);
+	UT_ASSERT_EQ(page.horizon_scn, 100);
+	UT_ASSERT(c0_raw_clog_calls > 0);
+	UT_ASSERT(c0_event_pos(C0_EV_NATIVE_LOCK) < c0_event_pos(C0_EV_CLOG));
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+}
+
+UT_TEST(test_normal_ordinary_clog_error_releases_the_complete_lock_stack)
+{
+	volatile bool caught = false;
+
+	c0_reset();
+	c0_throw_on_clog = true;
+	PG_TRY();
+	{
+		ClusterGcsUndoVerdictPage page;
+
+		(void)cluster_lms_undo_verdict_fill_page(4222256, false, true, &page);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(c0_release_all_calls, 1);
+	UT_ASSERT_EQ(c0_native_lock_depth, 0);
+	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
+	UT_ASSERT_EQ(c0_slru_lock_depth, 0);
+	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(44);
+	UT_RUN(test_zero_native_history_preserves_ordinary_committed_bound);
+	UT_RUN(test_normal_ordinary_remote_uses_the_same_terminal_proof);
+	UT_RUN(test_normal_ordinary_permission_does_not_widen_other_roles);
+	UT_RUN(test_normal_ordinary_clog_error_releases_the_complete_lock_stack);
+	UT_RUN(test_normal_ordinary_abort_needs_no_recycle_or_checkpoint_bound);
+	UT_RUN(test_normal_ordinary_abort_doubt_cannot_use_recursive_fallback);
 	UT_RUN(test_retained_data_alias_has_origin_bound_but_never_exact_pair_identity);
 	UT_RUN(test_split_empty_is_full_prefix_zero);
 	UT_RUN(test_split_all_self_is_full);

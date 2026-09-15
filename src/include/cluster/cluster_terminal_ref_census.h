@@ -27,6 +27,7 @@
 
 #include "access/transam.h"
 #include "access/xlogdefs.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_sf_dep.h"
@@ -972,6 +973,39 @@ extern bool cluster_ctrc_origin_begin_seal_shared(
 extern bool cluster_ctrc_origin_next_close_dispatch_shared(
 	ClusterCtrcCloseDispatch *dispatch_out);
 extern bool cluster_ctrc_cleaner_run_pass(void);
+
+typedef enum ClusterCtrcNormalStopDomain {
+	CTRC_STOP_DOMAIN_NONE = 0,
+	CTRC_STOP_DOMAIN_ORIGIN,
+	CTRC_STOP_DOMAIN_ORIGIN_ACK,
+	CTRC_STOP_DOMAIN_PARTICIPANT,
+	CTRC_STOP_DOMAIN_PARTICIPANT_ACK,
+	CTRC_STOP_DOMAIN_RECEIPT
+} ClusterCtrcNormalStopDomain;
+
+typedef enum ClusterCtrcNormalStopReason {
+	CTRC_STOP_REASON_NONE = 0,
+	CTRC_STOP_REASON_UNINITIALIZED,
+	CTRC_STOP_REASON_NOT_RECLAIMED,
+	CTRC_STOP_REASON_RESERVED,
+	CTRC_STOP_REASON_BLOCKED,
+	CTRC_STOP_REASON_MALFORMED
+} ClusterCtrcNormalStopReason;
+
+/* Caller-owned diagnostics; never stored as a release certificate. */
+typedef struct ClusterCtrcNormalStopObservation {
+	ClusterNormalStopPollResult result;
+	ClusterCtrcNormalStopDomain domain;
+	ClusterCtrcNormalStopReason reason;
+	uint32 state;
+	uint64 object_index;
+	ClusterCtrcTxnKeyV1 key;
+} ClusterCtrcNormalStopObservation;
+
+extern ClusterNormalStopPollResult
+cluster_ctrc_normal_stop_poll(ClusterCtrcNormalStopObservation *observation);
+/* The calling cleaner only; the outer undo pass must also have returned. */
+extern bool cluster_ctrc_cleaner_local_idle(void);
 
 typedef enum ClusterCtrcCapacityProbeResult {
 	CLUSTER_CTRC_CAPACITY_REFUSE = 0,

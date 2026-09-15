@@ -18,6 +18,7 @@
 #include "cluster/cluster_sf_dep.h"
 #include "storage/lwlock.h"
 #include "utils/timestamp.h"
+#include "../../backend/cluster/cluster_sf_dep.c"
 
 #undef printf
 #undef fprintf
@@ -52,6 +53,7 @@ typedef union TestSfShmemStorage {
 static TestSfShmemStorage test_sf_shmem;
 
 ProcessingMode Mode = NormalProcessing;
+bool IsUnderPostmaster = true;
 bool cluster_enabled = true;
 bool cluster_smart_fusion = false;
 int NBuffers = 0;
@@ -66,6 +68,14 @@ static bool test_sf_declared = true;
 static bool test_sf_enqueue_ok = true;
 static ClusterSfDurableGossipMsg test_sf_message;
 static TimestampTz test_sf_now;
+static LWLock *test_sf_held_lock;
+static bool test_sf_control_sealed;
+
+bool
+cluster_normal_stop_service_control_sealed(void)
+{
+	return test_sf_control_sealed;
+}
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -120,14 +130,53 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 {}
 
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
+	if (test_sf_held_lock != NULL || lock != &ClusterSfDep->lock)
+		abort();
+	UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	test_sf_held_lock = lock;
 	return true;
 }
 
 void
-LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+LWLockRelease(LWLock *lock)
+{
+	if (test_sf_held_lock != lock)
+		abort();
+	test_sf_held_lock = NULL;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return test_sf_held_lock == lock;
+}
+
+bool
+errstart(int level, const char *domain)
+{
+	return true;
+}
+bool
+errstart_cold(int level, const char *domain)
+{
+	return true;
+}
+int
+errcode(int code)
+{
+	return 0;
+}
+int
+errmsg(const char *format, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file, int line, const char *function)
+{
+	abort();
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -739,6 +788,7 @@ test_sf_publish_setup(uint32 caps)
 	test_sf_recovery = false;
 	test_sf_flush_reads = 0;
 	test_sf_sends = 0;
+	test_sf_control_sealed = false;
 	test_sf_cap_store_reset();
 	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, caps, 1);
 }
@@ -868,11 +918,129 @@ UT_TEST(test_lmon_tick_continues_after_recovery_without_commit)
 	UT_ASSERT(!cluster_smart_fusion);
 }
 
+UT_TEST(test_durable_publisher_stops_new_work_only_after_final_control_seal)
+{
+	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+						  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+	test_sf_now = INT64CONST(400000000);
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	UT_ASSERT_EQ(test_sf_flush_reads, 1);
+	test_sf_control_sealed = true;
+	test_sf_flush = 4800;
+	test_sf_now += 50000;
+	cluster_sf_origin_durable_lmon_tick();
+	cluster_sf_publish_origin_durable_lsn();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	UT_ASSERT_EQ(test_sf_flush_reads, 1);
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, 3500); /* Accepted prior work is retained. */
+	UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(0), 3500);
+	test_sf_control_sealed = false;
+}
+
+UT_TEST(test_sf_stop_requires_initialized_store_even_when_disabled)
+{
+	const char *reason;
+	int slot, origin;
+
+	ClusterSfDep = NULL; /* isolated missing-attachment boundary */
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(false, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SF_UNINITIALIZED");
+	cluster_smart_fusion = false;
+	test_sf_cap_store_reset();
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	ClusterSfDep->max_entries = 1; /* impossible for the disabled header-only allocation */
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(false, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SF_GEOMETRY");
+	test_sf_cap_store_reset();
+}
+
+UT_TEST(test_sf_stop_real_install_and_durable_cut_are_read_only)
+{
+	BufferTag tag = { .spcOid = 1663,
+					  .dbOid = 5,
+					  .relNumber = 16384,
+					  .forkNum = MAIN_FORKNUM,
+					  .blockNum = 7 };
+	ClusterSfDepVec vec = { 0 };
+	TestSfShmemStorage before;
+	const char *reason;
+	int slot, origin;
+
+	cluster_smart_fusion = true;
+	NBuffers = 2;
+	test_sf_cap_store_reset();
+	UT_ASSERT(cluster_sf_dep_vec_set(&vec, 1, 3000));
+	UT_ASSERT(cluster_sf_dep_vec_set(&vec, 2, 4000));
+	cluster_sf_dep_install_vec(tag, &vec);
+	memcpy(&before, &test_sf_shmem, sizeof(before));
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(false, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(origin, 1);
+	UT_ASSERT_EQ(memcmp(&before, &test_sf_shmem, sizeof(before)), 0);
+	cluster_sf_observe_origin_durable_lsn(1, 3000);
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(origin, 2);
+	cluster_sf_observe_origin_durable_lsn(2, 4000);
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(!ClusterSfDep->slots[0].in_use);
+	UT_ASSERT(cluster_sf_dep_vec_set(&vec, 2, 4500));
+	cluster_sf_dep_install_vec(tag, &vec);
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(origin, 2);
+	cluster_smart_fusion = false;
+	NBuffers = 0;
+	test_sf_cap_store_reset();
+}
+
+UT_TEST(test_sf_stop_satisfied_cache_invalid_residue_and_lock_order)
+{
+	BufferTag tag = { .blockNum = 9 };
+	ClusterSfDepVec vec = { 0 };
+	const char *reason;
+	int slot, origin;
+
+	cluster_smart_fusion = true;
+	NBuffers = 2;
+	test_sf_cap_store_reset();
+	cluster_sf_observe_origin_durable_lsn(1, 3000);
+	UT_ASSERT(cluster_sf_dep_vec_set(&vec, 1, 3000));
+	cluster_sf_dep_install_vec(tag, &vec); /* already durable, retained cache is legal */
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(ClusterSfDep->slots[0].in_use);
+	ClusterSfDep->slots[1].entry.vec.required[3] = 5000;
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SF_FREE_RESIDUAL");
+	UT_ASSERT_EQ(slot, 1);
+	UT_ASSERT_EQ(origin, 3);
+	LWLockAcquire(&ClusterSfDep->lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_sf_dep_normal_stop_poll(true, &slot, &origin, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "SF_LOCK_HELD");
+	LWLockRelease(&ClusterSfDep->lock);
+	cluster_smart_fusion = false;
+	NBuffers = 0;
+	test_sf_cap_store_reset();
+}
+
 int
 main(void)
 {
-	UT_PLAN(28);
+	UT_PLAN(32);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
+	UT_RUN(test_sf_stop_requires_initialized_store_even_when_disabled);
+	UT_RUN(test_sf_stop_real_install_and_durable_cut_are_read_only);
+	UT_RUN(test_sf_stop_satisfied_cache_invalid_residue_and_lock_order);
 	UT_RUN(test_vec_set_union_and_clear);
 	UT_RUN(test_vec_rejects_invalid_origin_and_lsn);
 	UT_RUN(test_smart_fusion_lwlock_tranche);
@@ -900,5 +1068,7 @@ main(void)
 	UT_RUN(test_existing_smart_fusion_peer_still_receives_durability);
 	UT_RUN(test_publisher_waits_for_recovery_before_reading_flush);
 	UT_RUN(test_lmon_tick_continues_after_recovery_without_commit);
+	UT_RUN(test_durable_publisher_stops_new_work_only_after_final_control_seal);
 	UT_DONE();
+	return ut_failed_count == 0 ? 0 : 1;
 }

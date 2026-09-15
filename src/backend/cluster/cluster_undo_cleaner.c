@@ -65,6 +65,7 @@
 #include "utils/wait_event.h" /* WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP */
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"			 /* cluster_storage_mode_enabled */
 #include "cluster/cluster_reconfig.h"		 /* ordinary/replacement write gate */
@@ -828,6 +829,41 @@ pass_account:
 }
 
 
+static void
+undo_cleaner_normal_stop_exit(int code, Datum arg pg_attribute_unused())
+{
+	/* An ERROR/FATAL or an early orderly exit is not another worker's ACK.
+	 * Quickdie is separately accounted for by the postmaster's child roster. */
+	if (cluster_normal_stop_requested() && (code != 0 || !cluster_normal_stop_protocol_closed()))
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
+}
+
+static bool
+undo_cleaner_normal_stop_park(void)
+{
+	if (!cluster_normal_stop_cleaner_park_requested())
+		return false;
+	if (!cluster_normal_stop_cleaner_park())
+		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cluster undo cleaner cannot attest normal-stop quiescence")));
+	if (ProcGlobal != NULL && ProcGlobal->checkpointerLatch != NULL)
+		SetLatch(ProcGlobal->checkpointerLatch);
+	for (;;) {
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("cluster undo cleaner normal-stop attempt failed")));
+		if (ShutdownRequestPending || undo_cleaner_shutdown_requested())
+			break;
+		/* A pressure wake only rechecks exit. It never resumes a cleaner
+		 * pass or refreshes the one-way quiescence signature. */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_EXIT_ON_PM_DEATH, -1L,
+						WAIT_EVENT_CLUSTER_BGPROC_UNDO_CLEANER_MAIN_LOOP);
+	}
+	return true;
+}
+
 void
 UndoCleanerMain(void)
 {
@@ -837,6 +873,7 @@ UndoCleanerMain(void)
 	if (undo_cleaner_worker < 0 || !cluster_ctrc_cleaner_bind_worker((unsigned)undo_cleaner_worker))
 		ereport(FATAL,
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("invalid undo cleaner worker identity")));
+	before_shmem_exit(undo_cleaner_normal_stop_exit, (Datum)0);
 
 	MyBackendType = B_UNDO_CLEANER;
 	init_ps_display(NULL);
@@ -896,6 +933,9 @@ UndoCleanerMain(void)
 
 		if (ShutdownRequestPending || undo_cleaner_shutdown_requested())
 			break;
+		/* Request may have arrived while idle after the preceding pass. */
+		if (undo_cleaner_normal_stop_park())
+			break;
 
 		undo_cleaner_advance_liveness_tick();
 
@@ -908,6 +948,10 @@ UndoCleanerMain(void)
 		undo_cleaner_state->workers[undo_cleaner_worker].local_progress_events
 			= cluster_ctrc_cleaner_local_progress();
 		LWLockRelease(&undo_cleaner_state->lwlock);
+		/* The complete outer pass, including worker0 GC/segment work and
+		 * modifier release, has returned. Cover the fast-continue edge too. */
+		if (undo_cleaner_normal_stop_park())
+			break;
 
 		/*
 		 * TT lane H2 (pressure-driven continuous mode): a pass that
@@ -952,6 +996,11 @@ UndoCleanerMain(void)
 	}
 
 	CLUSTER_INJECTION_POINT("undo-cleaner-shutdown-pre");
+	if (cluster_normal_stop_requested() && !cluster_normal_stop_protocol_closed()) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CLEANER);
+		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("cluster undo cleaner exited before normal-stop protocol closed")));
+	}
 
 	/* Graceful shutdown path — HC5 normal exit. */
 	undo_cleaner_publish_status(UNDO_CLEANER_SHUTTING_DOWN);

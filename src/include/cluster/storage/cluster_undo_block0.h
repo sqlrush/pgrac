@@ -256,6 +256,11 @@ extern void cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin,
 extern void cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin);
 extern bool cluster_undo_block0_verify_clean_census(
 	const ClusterUndoBlock0ResidentCensusItem *items, uint32 count);
+/* Normal Startup's closed pass only: never an online eviction interface. */
+extern bool cluster_undo_block0_normal_start_empty(void);
+extern bool
+cluster_undo_block0_normal_start_discard(const ClusterUndoBlock0ResidentCensusItem *item,
+										 uint32 frame_index);
 extern void cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin,
 											  XLogRecPtr wal_lsn);
 extern void cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin,

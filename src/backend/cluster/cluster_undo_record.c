@@ -88,6 +88,7 @@
 #include "cluster/cluster_uba.h"
 #include "cluster/cluster_undo_format.h"
 #include "cluster/cluster_undo_record.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_undo_record_api.h"
 #include "cluster/cluster_undo_retention.h" /* spec-4.12a D1: drain gate + boundary */
 #include "cluster/cluster_undo_segment.h"
@@ -775,13 +776,52 @@ cluster_undo_record_xact_commit_release(void)
 }
 
 /*
- * cluster_undo_active_write_boundary -- the oldest active-write boundary: the
- *	minimum first_undo_scn over all registered in-flight writers, or
- *	{ infinite = true } when none is registered (quiesce).  Scans under
- *	registry_lock SHARED.  Caller holds lifecycle_lock (drain path); the
- *	lifecycle_lock -> registry_lock order is never inverted (registration takes
- *	registry_lock alone).
+ * Observe the original active-write registry in a PGPROC context. Empty is
+ * only this registry's result, not TT terminal, private undo, or disk proof.
+ * Unlike the oldest-boundary helper, missing state is not an infinite bound.
  */
+ClusterNormalStopPollResult
+cluster_undo_active_write_normal_stop_poll(int *backend_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *reason = "UNDO_ACTIVE_WRITE_STATE_INVALID";
+	int backend = 0;
+	int i;
+
+	if (!IsUnderPostmaster || MyProc == NULL || UndoRecordShared == NULL
+		|| cluster_undo_write_registry == NULL || MaxBackends <= 0
+		|| !SCN_NODE_ID_VALID(cluster_node_id))
+		goto done;
+	result = CLUSTER_NORMAL_STOP_READY;
+	reason = "NONE";
+	LWLockAcquire(&UndoRecordShared->registry_lock.lock, LW_SHARED);
+	for (i = 0; i < MaxBackends; i++) {
+		SCN scn = cluster_undo_write_registry[i];
+		if (scn == InvalidScn)
+			continue;
+		if (scn_local(scn) == 0 || scn_node_id(scn) != cluster_node_id) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			backend = i + 1;
+			reason = "UNDO_ACTIVE_WRITE_SCN_INVALID";
+			break;
+		}
+		if (result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			backend = i + 1;
+			reason = "UNDO_ACTIVE_WRITE_PENDING";
+		}
+	}
+	LWLockRelease(&UndoRecordShared->registry_lock.lock);
+done:
+	if (backend_out != NULL)
+		*backend_out = backend;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
+
+/* Oldest first_undo_scn, or infinite when empty. The drain caller holds
+ * lifecycle_lock; the existing order is lifecycle_lock -> registry_lock. */
 static ClusterUndoActiveBoundary
 cluster_undo_active_write_boundary(void)
 {

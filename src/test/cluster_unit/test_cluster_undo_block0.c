@@ -24,6 +24,8 @@
 #include "access/xlog.h"
 #include "miscadmin.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_undo_root_descriptor.h"
 #include "cluster/storage/cluster_undo_block0.h"
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_undo_smgr.h"
@@ -138,6 +140,8 @@ static ClusterR4PrerequisiteSnapshot r4_owner_snapshot = {
 };
 static bool r4_owner_publish_enabled = false;
 static bool r4_startup_fenced_owned = false;
+static bool normal_start_closed = false;
+int cluster_node_id = 0;
 
 ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
 ResourceOwner CurTransactionResourceOwner = NULL;
@@ -145,6 +149,9 @@ ResourceOwner TopTransactionResourceOwner = NULL;
 ResourceOwner AuxProcessResourceOwner = NULL;
 MemoryContext TopMemoryContext = (MemoryContext)(uintptr_t)1;
 volatile uint32 InterruptHoldoffCount = 0;
+bool IsUnderPostmaster = false;
+BackendType MyBackendType = B_INVALID;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 /* Standalone substitute for the reconfiguration owner's lock co-sample. */
 ClusterR4PrerequisiteSnapshot
@@ -164,6 +171,14 @@ bool
 cluster_undo_block0_current_startup_fenced_owned(void)
 {
 	return r4_startup_fenced_owned;
+}
+
+/* The semantic closed-pass co-sample is tested against its real producer
+ * separately. Resident decisions, pins, frames and cleanup below are real. */
+bool
+cluster_semantic_normal_start_closed(void)
+{
+	return normal_start_closed;
 }
 
 void *
@@ -348,6 +363,13 @@ errstart_cold(int elevel, const char *domain)
 
 int
 errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+/* Linux arm64 libpgport's runtime CRC selection uses the internal variant. */
+int
+errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -1888,6 +1910,143 @@ UT_TEST(test_block0_clean_census_requires_exact_complete_unpinned_residency)
 	UT_ASSERT(cluster_undo_block0_verify_clean_census(NULL, 0));
 }
 
+UT_TEST(test_normal_start_empty_requires_exclusive_owner_and_whole_pool)
+{
+	ClusterUndoBlock0FrameToken token;
+	fresh_block0_region(2);
+	MyAuxProcType = StartupProcess;
+	r4_startup_fenced_owned = true;
+	normal_start_closed = true;
+	UT_ASSERT(cluster_undo_block0_normal_start_empty());
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT(!cluster_undo_block0_normal_start_empty());
+	MyAuxProcType = StartupProcess;
+	r4_startup_fenced_owned = false;
+	UT_ASSERT(!cluster_undo_block0_normal_start_empty());
+	r4_startup_fenced_owned = true;
+	normal_start_closed = false;
+	UT_ASSERT(!cluster_undo_block0_normal_start_empty());
+	normal_start_closed = true;
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT(!cluster_undo_block0_normal_start_empty());
+	cluster_undo_block0_frame_release(&token);
+	UT_ASSERT(cluster_undo_block0_normal_start_empty());
+	MyAuxProcType = NotAnAuxProcess;
+	r4_startup_fenced_owned = normal_start_closed = false;
+}
+
+UT_TEST(test_normal_start_discard_is_exact_clean_unpinned_prefix_only)
+{
+	ClusterUndoBlock0ResidentCensusItem items[2];
+	ClusterUndoBlock0FrameToken tokens[2];
+	ClusterUndoBlock0Pin pin;
+	uint32 frames[2];
+	char *page;
+	int i;
+	fresh_block0_region(2);
+	MyAuxProcType = StartupProcess;
+	r4_startup_fenced_owned = normal_start_closed = true;
+	memset(items, 0, sizeof(items));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(2, tokens), CLUSTER_UNDO_BLOCK0_OK);
+	for (i = 0; i < 2; i++) {
+		items[i].logical = make_key(1, i + 1);
+		items[i].resolved_root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 100 + i, 1);
+		items[i].proof = make_live_proof(1, 0);
+		frames[i] = tokens[i].frame_index;
+		make_valid_block0(i + 1, 1, i, 0);
+		UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&items[i].logical, &items[i].resolved_root,
+													   &items[i].proof, &tokens[i], &pin, &page),
+					 CLUSTER_UNDO_BLOCK0_OK);
+		items[i].generation = pin.observed_generation;
+		UT_ASSERT(!cluster_undo_block0_normal_start_discard(&items[i], frames[i]));
+		cluster_undo_block0_unpin(&pin);
+	}
+	UT_ASSERT(!cluster_undo_block0_normal_start_empty());
+	for (i = 0; i < 7; i++) {
+		ClusterUndoBlock0ResidentCensusItem wrong = items[0];
+		switch (i) {
+		case 0:
+			wrong.logical = items[1].logical;
+			break;
+		case 1:
+			wrong.resolved_root.root_id++;
+			break;
+		case 2:
+			wrong.resolved_root.root_generation++;
+			break;
+		case 3:
+			wrong.generation.value++;
+			break;
+		case 4:
+			wrong.generation.known = false;
+			break;
+		case 5:
+			wrong.proof.kind = CLUSTER_UNDO_BLOCK0_STARTUP_REDO;
+			break;
+		case 6:
+			wrong.proof.cluster_epoch++;
+			break;
+		}
+		UT_ASSERT(!cluster_undo_block0_normal_start_discard(&wrong, frames[0]));
+		UT_ASSERT(cluster_undo_block0_verify_clean_census(items, 2));
+	}
+	UT_ASSERT(!cluster_undo_block0_normal_start_discard(&items[0], frames[1]));
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT(!cluster_undo_block0_normal_start_discard(&items[0], frames[0]));
+	MyAuxProcType = StartupProcess;
+	normal_start_closed = false;
+	UT_ASSERT(!cluster_undo_block0_normal_start_discard(&items[0], frames[0]));
+	normal_start_closed = true;
+	r4_startup_fenced_owned = false;
+	UT_ASSERT(!cluster_undo_block0_normal_start_discard(&items[0], frames[0]));
+	r4_startup_fenced_owned = true;
+	UT_ASSERT(cluster_undo_block0_normal_start_discard(&items[0], frames[0]));
+	UT_ASSERT(!cluster_undo_block0_normal_start_discard(&items[0], frames[0]));
+	UT_ASSERT(cluster_undo_block0_verify_clean_census(&items[1], 1));
+	UT_ASSERT(cluster_undo_block0_normal_start_discard(&items[1], frames[1]));
+	UT_ASSERT(cluster_undo_block0_normal_start_empty());
+	UT_ASSERT_EQ(smgr_write_calls, 0);
+	UT_ASSERT_EQ(xlog_flush_calls, 0);
+	UT_ASSERT(!cluster_undo_block0_backend_has_resources());
+	MyAuxProcType = NotAnAuxProcess;
+	r4_startup_fenced_owned = normal_start_closed = false;
+}
+
+UT_TEST(test_normal_start_discard_never_drops_dirty_or_foreign_binding)
+{
+	ClusterUndoBlock0ResidentCensusItem item;
+	ClusterUndoBlock0FrameToken token;
+	ClusterUndoBlock0Pin pin;
+	uint32 frame;
+	char *page;
+	int i;
+	for (i = 0; i < 2; i++) {
+		fresh_block0_region(1);
+		MyAuxProcType = StartupProcess;
+		r4_startup_fenced_owned = normal_start_closed = true;
+		memset(&item, 0, sizeof(item));
+		item.logical = make_key(i + 1, i * 256 + 1);
+		item.resolved_root = make_root(CLUSTER_UNDO_PATH_RUNTIME_SHARED, 100, 1);
+		item.proof = make_live_proof(i + 1, 0);
+		make_valid_block0(item.logical.segment_id, item.logical.owner_instance, 0, 0);
+		UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+		frame = token.frame_index;
+		UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&item.logical, &item.resolved_root,
+													   &item.proof, &token, &pin, &page),
+					 CLUSTER_UNDO_BLOCK0_OK);
+		item.generation = pin.observed_generation;
+		if (i == 0)
+			cluster_undo_block0_mark_wal_dirty(&pin, 0x100);
+		cluster_undo_block0_unpin(&pin);
+		UT_ASSERT(!cluster_undo_block0_normal_start_discard(&item, frame));
+		UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
+					 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
+		UT_ASSERT_EQ(smgr_write_calls, 0);
+	}
+	MyAuxProcType = NotAnAuxProcess;
+	r4_startup_fenced_owned = normal_start_closed = false;
+}
+
 UT_TEST(test_r4_prerequisite_snapshot_is_exact_and_repeatable)
 {
 	int i;
@@ -2033,10 +2192,312 @@ UT_TEST(test_r4_startup_completion_surface_refuses_without_owner_proofs)
 	UT_ASSERT_NULL(context);
 }
 
+/* A148: actual resident admission/reservation/flush/release, with disk bytes
+ * and native lock scheduling as explicit fixture boundaries.  This observer
+ * does not claim the separate Startup namespace census has run. */
+static ClusterUndoBlock0ResolvedRoot stop_root;
+static ClusterUndoRootDescriptorV1 stop_descriptor;
+static uint8 stop_descriptor_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+static uint32 stop_segment;
+static int stop_tt_slot;
+static const char *stop_reason;
+
+uint64
+GetSystemIdentifier(void)
+{
+	return UINT64_C(42);
+}
+
+static void
+stop_block0_encode_root(void)
+{
+	if (!cluster_undo_root_namespace_id(stop_descriptor.descriptor_incarnation,
+										stop_descriptor.root_ordinal, &stop_descriptor.namespace_id)
+		|| !cluster_undo_root_descriptor_encode(&stop_descriptor, stop_descriptor_bytes))
+		abort();
+}
+
+static void
+stop_block0_setup(uint32 frames)
+{
+	fresh_block0_region(frames);
+	IsUnderPostmaster = true;
+	MyBackendType = B_CHECKPOINTER;
+	memset(&stop_descriptor, 0, sizeof(stop_descriptor));
+	stop_descriptor.descriptor_incarnation = 3;
+	stop_descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	stop_descriptor.owner_node = -1;
+	stop_descriptor.system_identifier = 42;
+	stop_descriptor.root_uuid[0] = 1;
+	stop_block0_encode_root();
+}
+
+static ClusterNormalStopPollResult
+stop_block0_poll(bool post_checkpoint)
+{
+	int reads = smgr_read_calls;
+	int writes = smgr_write_calls;
+	int flushes = xlog_flush_calls;
+	uint32 holdoff = InterruptHoldoffCount;
+	ClusterNormalStopPollResult result = cluster_undo_block0_normal_stop_poll(
+		post_checkpoint, stop_descriptor_bytes, 7, &stop_segment, &stop_tt_slot, &stop_reason);
+
+	UT_ASSERT_EQ(smgr_read_calls, reads);
+	UT_ASSERT_EQ(smgr_write_calls, writes);
+	UT_ASSERT_EQ(xlog_flush_calls, flushes);
+	UT_ASSERT_EQ(InterruptHoldoffCount, holdoff);
+	return result;
+}
+
+static void
+stop_block0_load(uint32 segment, uint8 owner, ClusterUndoBlock0Pin *pin, char **page)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(owner, segment);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(owner, 7);
+	ClusterUndoBlock0FrameToken token;
+
+	UT_ASSERT(cluster_undo_root_descriptor_resolve(
+		&stop_descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment, &stop_root));
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &stop_root, &proof, &token, pin, page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+}
+
+UT_TEST(test_stop_block0_requires_owner_root_and_initialized_state)
+{
+	ClusterUndoBlock0FrameToken token;
+	stop_block0_setup(2);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_segment, 0);
+	UT_ASSERT_EQ(stop_tt_slot, -1);
+	UT_ASSERT_STR_EQ(stop_reason, "NONE");
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_undo_block0_frame_release(&token);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_INVALID);
+	MyBackendType = B_CHECKPOINTER;
+	memset(stop_descriptor_bytes, 0, sizeof(stop_descriptor_bytes));
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	stop_block0_encode_root();
+	stop_descriptor.system_identifier++;
+	stop_block0_encode_root();
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	stop_descriptor.system_identifier--;
+	stop_descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_LOCAL;
+	stop_descriptor.owner_node = 0;
+	stop_descriptor.root_ordinal = 1;
+	stop_block0_encode_root();
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	stop_descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	stop_descriptor.owner_node = -1;
+	stop_descriptor.root_ordinal = 0;
+	stop_block0_encode_root();
+	cluster_undo_block0_shmem_detach();
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_STOP_STATE_INVALID");
+}
+
+UT_TEST(test_stop_block0_reserved_frames_need_original_release)
+{
+	ClusterUndoBlock0FrameToken tokens[2];
+
+	stop_block0_setup(3);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(2, tokens), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(tokens[0].owned && tokens[1].owned);
+	cluster_undo_block0_frame_release(&tokens[0]);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_undo_block0_frame_release(&tokens[1]);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_block0_pin_is_debt_but_unpinned_residency_is_not)
+{
+	ClusterUndoBlock0Pin pin;
+	char *page;
+	char original[BLCKSZ];
+
+	stop_block0_setup(2);
+	make_valid_block0(257, 2, 0, 0);
+	stop_block0_load(257, 2, &pin, &page);
+	memcpy(original, page, BLCKSZ);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(pin.slot >= 0);
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(memcmp(original, page, BLCKSZ) == 0);
+}
+
+UT_TEST(test_stop_block0_checks_all_tt_slots_in_last_logical_segment)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(128, 32768);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(128, 7);
+	ClusterUndoBlock0Pin pin;
+	UndoSegmentHeaderData *header;
+	char *page;
+	int i;
+
+	stop_block0_setup(2);
+	make_valid_block0(32768, 128, 0, 0);
+	stop_block0_load(32768, 128, &pin, &page);
+	header = (UndoSegmentHeaderData *)page;
+	cluster_undo_block0_unpin(&pin);
+	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+		UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL,
+											 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page),
+					 CLUSTER_UNDO_BLOCK0_OK);
+		/* Canonical TT publication is the boundary input; resident flush and
+		 * unpin are real.  No allocator mirror substitutes for these bytes. */
+		header->tt_slots[i].xid = (TransactionId)(500 + i);
+		header->tt_slots[i].status = TT_SLOT_ACTIVE;
+		cluster_undo_block0_flush_sync(&pin, page, (XLogRecPtr)(200 + i), false);
+		cluster_undo_block0_unpin(&pin);
+		UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(stop_segment, 32768);
+		UT_ASSERT_EQ(stop_tt_slot, i);
+		UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_TT_ACTIVE");
+		UT_ASSERT_EQ(header->tt_slots[i].status, TT_SLOT_ACTIVE);
+		UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL,
+											 CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page),
+					 CLUSTER_UNDO_BLOCK0_OK);
+		header->tt_slots[i].status = TT_SLOT_COMMITTED;
+		header->tt_slots[i].commit_scn = scn_encode(127, 1000 + i);
+		cluster_undo_block0_flush_sync(&pin, page, (XLogRecPtr)(300 + i), false);
+		cluster_undo_block0_unpin(&pin);
+		UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	}
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_block0_durability_and_undo_anchor_are_not_cleared_by_poll)
+{
+	ClusterUndoBlock0LogicalKey logical = make_key(1, 1);
+	ClusterUndoBlock0AuthorityProof proof = make_live_proof(1, 7);
+	ClusterUndoBlock0Pin pin;
+	char *page;
+	UndoSegmentHeaderData *header;
+
+	stop_block0_setup(2);
+	make_valid_block0(1, 1, 0, 0);
+	stop_block0_load(1, 1, &pin, &page);
+	header = (UndoSegmentHeaderData *)page;
+	cluster_undo_block0_mark_wal_dirty(&pin, 400);
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_DURABILITY_PENDING");
+	UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL, CLUSTER_UNDO_BLOCK0_EXCLUSIVE,
+										 &proof, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	cluster_undo_block0_flush_sync(&pin, page, 400, false);
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+	/* Retained ABORT undo is outstanding work, not an empty terminal slot. */
+	UT_ASSERT_EQ(cluster_undo_block0_pin(&logical, &stop_root, NULL, CLUSTER_UNDO_BLOCK0_EXCLUSIVE,
+										 &proof, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	header->tt_slots[47].xid = 1000;
+	header->tt_slots[47].status = TT_SLOT_ABORTED;
+	header->tt_slots[47].first_undo_block.raw[0] = UINT64CONST(0x100000001);
+	cluster_undo_block0_flush_sync(&pin, page, 500, false);
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(stop_tt_slot, 47);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_TT_UNDO_PENDING");
+	UT_ASSERT(!UBA_is_invalid(header->tt_slots[47].first_undo_block));
+}
+
+UT_TEST(test_stop_block0_invalid_late_slot_overrides_active_and_root_drift)
+{
+	ClusterUndoBlock0Pin pin;
+	char *page;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)smgr_image;
+
+	stop_block0_setup(2);
+	make_valid_block0(1, 1, 0, 0);
+	header->tt_slots[0].xid = 600;
+	header->tt_slots[0].status = TT_SLOT_ACTIVE;
+	header->tt_slots[47].xid = 700;
+	header->tt_slots[47].status = TT_SLOT_COMMITTED; /* invalid: no SCN */
+	stop_block0_load(1, 1, &pin, &page);
+	cluster_undo_block0_unpin(&pin);
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(stop_tt_slot, 47);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_TT_SHAPE_INVALID");
+	stop_descriptor.descriptor_incarnation++;
+	stop_block0_encode_root();
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_RESIDENT_IDENTITY_INVALID");
+	stop_descriptor.descriptor_incarnation--;
+	stop_block0_encode_root();
+	UT_ASSERT_EQ(cluster_undo_block0_normal_stop_poll(false, stop_descriptor_bytes, 8,
+													  &stop_segment, &stop_tt_slot, &stop_reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_RESIDENT_IDENTITY_INVALID");
+}
+
+UT_TEST(test_stop_block0_two_actual_segment_roots_share_one_pgrd_not_one_file_id)
+{
+	ClusterUndoRootDescriptorV1 descriptor = { 0 };
+	ClusterUndoBlock0ResolvedRoot first, second;
+	ClusterUndoBlock0Pin pin;
+	char *page;
+	stop_block0_setup(3);
+	descriptor.descriptor_incarnation = 3;
+	descriptor.root_kind = CLUSTER_UNDO_ROOT_KIND_SHARED;
+	descriptor.owner_node = -1;
+	descriptor.system_identifier = 42;
+	descriptor.root_uuid[0] = 1;
+	UT_ASSERT(cluster_undo_root_namespace_id(3, 0, &descriptor.namespace_id));
+	UT_ASSERT(cluster_undo_root_descriptor_resolve(&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1,
+												   1, &first));
+	UT_ASSERT(cluster_undo_root_descriptor_resolve(&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED, 2,
+												   257, &second));
+	UT_ASSERT(first.root_id != second.root_id);
+	UT_ASSERT_EQ(first.root_generation, second.root_generation);
+	stop_root = first;
+	make_valid_block0(1, 1, 0, 0);
+	stop_block0_load(1, 1, &pin, &page);
+	cluster_undo_block0_unpin(&pin);
+	stop_root = second;
+	make_valid_block0(257, 2, 0, 0);
+	stop_block0_load(257, 2, &pin, &page);
+	cluster_undo_block0_unpin(&pin);
+	stop_root = first;
+	UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_block0_poll(true), CLUSTER_NORMAL_STOP_READY);
+	{
+		ClusterUndoBlock0LogicalKey logical = make_key(2, 258);
+		ClusterUndoBlock0AuthorityProof proof = make_live_proof(2, 7);
+		ClusterUndoBlock0FrameToken token;
+		/* A real local admission with another file's well-formed root is
+		 * not a namespace-wide match. The stop observer must reject it. */
+		make_valid_block0(258, 2, 0, 0);
+		UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+		UT_ASSERT_EQ(
+			cluster_undo_block0_admit_runtime(&logical, &first, &proof, &token, &pin, &page),
+			CLUSTER_UNDO_BLOCK0_OK);
+		cluster_undo_block0_unpin(&pin);
+		UT_ASSERT_EQ(stop_block0_poll(false), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(stop_segment, 258);
+		UT_ASSERT_STR_EQ(stop_reason, "UNDO_BLOCK0_RESIDENT_IDENTITY_INVALID");
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(48);
+	UT_PLAN(58);
 	UT_RUN(test_block0_key_endpoints_map_to_direct_slots);
 	UT_RUN(test_block0_key_rejects_owner_segment_aliases);
 	UT_RUN(test_block0_root_requires_pgrd_identity_and_declared_intent);
@@ -2080,11 +2541,21 @@ main(void)
 	UT_RUN(test_block0_flush_parent_fsync_request_fails_before_wal_or_data_publication);
 	UT_RUN(test_block0_flush_rejects_wrong_logical_successor_before_wal_or_data);
 	UT_RUN(test_block0_clean_census_requires_exact_complete_unpinned_residency);
+	UT_RUN(test_normal_start_empty_requires_exclusive_owner_and_whole_pool);
+	UT_RUN(test_normal_start_discard_is_exact_clean_unpinned_prefix_only);
+	UT_RUN(test_normal_start_discard_never_drops_dirty_or_foreign_binding);
 	UT_RUN(test_r4_prerequisite_snapshot_is_exact_and_repeatable);
 	UT_RUN(test_r4_prerequisite_snapshot_is_fixed_for_concurrent_callers);
 	UT_RUN(test_r4_publish_ready_remains_fail_closed_for_every_unbound_input);
 	UT_RUN(test_r4_publish_ready_accepts_only_owner_cosampled_snapshot);
 	UT_RUN(test_r4_startup_completion_surface_refuses_without_owner_proofs);
+	UT_RUN(test_stop_block0_requires_owner_root_and_initialized_state);
+	UT_RUN(test_stop_block0_reserved_frames_need_original_release);
+	UT_RUN(test_stop_block0_pin_is_debt_but_unpinned_residency_is_not);
+	UT_RUN(test_stop_block0_checks_all_tt_slots_in_last_logical_segment);
+	UT_RUN(test_stop_block0_durability_and_undo_anchor_are_not_cleared_by_poll);
+	UT_RUN(test_stop_block0_invalid_late_slot_overrides_active_and_root_drift);
+	UT_RUN(test_stop_block0_two_actual_segment_roots_share_one_pgrd_not_one_file_id);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

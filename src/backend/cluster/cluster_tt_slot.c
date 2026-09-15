@@ -45,6 +45,7 @@
 #include "postgres.h"
 
 #include "access/transam.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"   /* cluster_undo_retention_horizon_enabled */
 #include "cluster/cluster_mode.h"  /* cluster_peer_mode_enabled */
 #include "cluster/cluster_scn.h"   /* SCN_MAX_VALID_NODE_ID */
@@ -171,7 +172,6 @@ typedef struct ClusterTTSlotShmem {
 
 static ClusterTTSlotShmem *ClusterTTSlotShm = NULL;
 
-
 /*
  * Map segment_id → owning node_id using the per-instance range encoding
  * (CLUSTER_UNDO_SEGS_PER_INSTANCE).  Used to index the shmem array.
@@ -181,6 +181,112 @@ cluster_tt_slot_segment_to_node(uint32 segment_id)
 {
 	Assert(segment_id != 0);
 	return (int)((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE);
+}
+
+/* Only this allocator's live responsibilities, not the canonical TT census.
+ * A rollover can remove an ACTIVE old segment from this array; its original
+ * resident TT and Startup coverage must be checked independently.  Never
+ * initialize an unbound entry, recycle history, or infer abort from PID loss. */
+ClusterNormalStopPollResult
+cluster_tt_slot_normal_stop_poll(uint32 *segment_out, int *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	uint32 segment = 0;
+	int slot = -1;
+	const char *reason = "TT_ALLOCATOR_STOP_STATE_INVALID";
+	uint32 protected_index;
+	int node;
+
+	/* LMON repeats this read-only shared census at the post-STOPPED send
+	 * cut. Neither caller can retire or allocate a slot through this API. */
+	if (!IsUnderPostmaster || (MyBackendType != B_CHECKPOINTER && MyBackendType != B_LMON)
+		|| ClusterTTSlotShm == NULL)
+		goto done;
+	result = CLUSTER_NORMAL_STOP_READY;
+	reason = "NONE";
+	SpinLockAcquire(&ClusterTTSlotShm->protected_lock);
+	if (ClusterTTSlotShm->protected_count > CLUSTER_TT_PROTECTED_MAX) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "TT_PROTECTED_COUNT_INVALID";
+	} else {
+		for (protected_index = 0; protected_index < ClusterTTSlotShm->protected_count;
+			 protected_index++) {
+			uint32 sid = ClusterTTSlotShm->protected_slots[protected_index].segment_id;
+			uint16 off = ClusterTTSlotShm->protected_slots[protected_index].slot_offset;
+			bool valid
+				= sid > 0 && sid <= CLUSTER_TT_SLOT_MAX_NODES * CLUSTER_UNDO_SEGS_PER_INSTANCE
+				  && off < TT_SLOTS_PER_SEGMENT
+				  && ClusterTTSlotShm->protected_slots[protected_index].wrap != TT_WRAP_INVALID
+				  && TransactionIdIsNormal(ClusterTTSlotShm->protected_slots[protected_index].xid);
+
+			if (!valid || result == CLUSTER_NORMAL_STOP_READY) {
+				result = valid ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+				segment = sid;
+				slot = off;
+				reason = valid ? "TT_PROTECTED_OWNER_PENDING" : "TT_PROTECTED_IDENTITY_INVALID";
+			}
+			if (!valid)
+				break;
+		}
+	}
+	SpinLockRelease(&ClusterTTSlotShm->protected_lock);
+	if (result == CLUSTER_NORMAL_STOP_INVALID)
+		goto done;
+	for (node = 0; node < CLUSTER_TT_SLOT_MAX_NODES; node++) {
+		ClusterTTSlotAllocPerSegment *seg = &ClusterTTSlotShm->per_node[node];
+		int i;
+
+		LWLockAcquire(&seg->lock, LW_SHARED);
+		if ((seg->segment_id == 0) != (seg->binding_generation == 0)
+			|| (seg->segment_id != 0 && cluster_tt_slot_segment_to_node(seg->segment_id) != node)) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			segment = seg->segment_id;
+			slot = -1;
+			reason = "TT_ALLOCATOR_BINDING_INVALID";
+		} else {
+			for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
+				const ClusterTTSlotAllocEntry *entry = &seg->slots[i];
+				const ClusterTTSlotAllocEntry zero = { 0 };
+				bool valid;
+
+				if (seg->segment_id == 0)
+					valid = memcmp(entry, &zero, sizeof(zero)) == 0;
+				else if (entry->status == CTS_FREE)
+					valid = entry->xid == InvalidTransactionId && entry->commit_scn == InvalidScn
+							&& entry->wrap != TT_WRAP_INVALID && entry->_pad == 0;
+				else
+					valid = TransactionIdIsNormal(entry->xid) && entry->wrap != TT_WRAP_INVALID
+							&& entry->_pad == 0 && entry->status <= CTS_ABORTED
+							&& ((entry->status == CTS_COMMITTED && SCN_VALID(entry->commit_scn))
+								|| (entry->status != CTS_COMMITTED
+									&& entry->commit_scn == InvalidScn));
+				if (!valid) {
+					result = CLUSTER_NORMAL_STOP_INVALID;
+					segment = seg->segment_id;
+					slot = i;
+					reason = "TT_ALLOCATOR_SLOT_INVALID";
+					break;
+				}
+				if (entry->status == CTS_ACTIVE && result == CLUSTER_NORMAL_STOP_READY) {
+					result = CLUSTER_NORMAL_STOP_PENDING;
+					segment = seg->segment_id;
+					slot = i;
+					reason = "TT_ALLOCATOR_ACTIVE";
+				}
+			}
+		}
+		LWLockRelease(&seg->lock);
+		if (result == CLUSTER_NORMAL_STOP_INVALID)
+			break;
+	}
+done:
+	if (segment_out != NULL)
+		*segment_out = segment;
+	if (slot_out != NULL)
+		*slot_out = slot;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
 }
 
 

@@ -117,6 +117,8 @@ static char undo_test_root[MAXPGPATH];
 static char undo_test_open_fail_path[MAXPGPATH];
 static int undo_test_observer_open_calls;
 static bool undo_test_track_observer_opens;
+static bool undo_test_stop_tracking;
+static int undo_test_stop_lock_depth;
 static uint32 undo_test_wait_event_info;
 static PGAlignedBlock undo_test_lifecycle_disk;
 static bool undo_test_publish_tt_after_block0_read;
@@ -139,6 +141,7 @@ static int receipt_install_calls;
 
 char *DataDir = NULL;
 bool cluster_enabled = false;
+bool IsUnderPostmaster = false;
 bool cluster_undo_gcs_coherence = false;
 int cluster_node_id = 0;
 int cluster_undo_segments_max_per_instance = CLUSTER_UNDO_SEGS_PER_INSTANCE;
@@ -509,6 +512,11 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	if (undo_test_stop_tracking) {
+		UT_ASSERT(lock == &UndoRecordShared->registry_lock.lock);
+		UT_ASSERT_EQ(undo_test_stop_lock_depth, 0);
+		undo_test_stop_lock_depth++;
+	}
 	return true;
 }
 
@@ -520,7 +528,13 @@ LWLockHeldByMeInMode(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attr
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	if (undo_test_stop_tracking) {
+		UT_ASSERT(lock == &UndoRecordShared->registry_lock.lock);
+		UT_ASSERT_EQ(undo_test_stop_lock_depth, 1);
+		undo_test_stop_lock_depth--;
+	}
+}
 
 bool
 cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(), uint32 segment_id,
@@ -3273,10 +3287,121 @@ UT_TEST(test_history_codec_cross_page_update_requires_exactly_two_targets)
 												 &decoded));
 }
 
+static PGPROC undo_stop_proc;
+
+static void
+undo_stop_fixture_ready(void)
+{
+	MaxBackends = 17;
+	undo_test_reset_record_shmem();
+	memset(&cluster_undo_pending, 0, sizeof(cluster_undo_pending));
+	memset(&cluster_undo_record_reservation, 0, sizeof(cluster_undo_record_reservation));
+	cluster_undo_write_registered = false;
+	cluster_node_id = 0;
+	MyBackendId = 17;
+	MyProc = &undo_stop_proc;
+	IsUnderPostmaster = true;
+	undo_test_stop_lock_depth = 0;
+	undo_test_stop_tracking = true;
+}
+
+static void
+undo_stop_fixture_done(void)
+{
+	UT_ASSERT_EQ(undo_test_stop_lock_depth, 0);
+	undo_test_stop_tracking = false;
+	MyProc = NULL;
+	MyBackendId = InvalidBackendId;
+	IsUnderPostmaster = false;
+	MaxBackends = 1;
+}
+
+UT_TEST(test_a148_undo_stop_original_active_writer_requires_original_commit_release)
+{
+	int backend;
+	const char *reason;
+	SCN *saved;
+	undo_stop_fixture_ready();
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	cluster_undo_active_write_register(scn_encode(0, 71));
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(&backend, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(backend, 17);
+	UT_ASSERT_EQ(cluster_undo_write_registry[16], scn_encode(0, 71));
+	UT_ASSERT(cluster_undo_write_registered);
+	cluster_undo_record_xact_commit_release();
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	saved = cluster_undo_write_registry;
+	cluster_undo_write_registry = NULL;
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	cluster_undo_write_registry = saved;
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyProc = NULL;
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	undo_stop_fixture_done();
+}
+
+UT_TEST(test_a148_undo_stop_all_slots_and_late_invalid_do_not_clear_debt)
+{
+	int i, backend;
+	const char *reason;
+	undo_stop_fixture_ready();
+	for (i = 1; i <= MaxBackends; i++) {
+		MyBackendId = i;
+		cluster_undo_active_write_register(scn_encode(0, 72));
+		UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(&backend, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(backend, i);
+		cluster_undo_active_write_unregister();
+		UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL),
+					 CLUSTER_NORMAL_STOP_READY);
+	}
+	MyBackendId = 1;
+	cluster_undo_active_write_register(scn_encode(0, 73));
+	cluster_undo_write_registry[16] = scn_encode(1, 74); /* corrupted own registry fixture */
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(&backend, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(backend, 17);
+	UT_ASSERT(strcmp(reason, "UNDO_ACTIVE_WRITE_SCN_INVALID") == 0);
+	UT_ASSERT_EQ(cluster_undo_write_registry[0], scn_encode(0, 73));
+	UT_ASSERT_EQ(cluster_undo_write_registry[16], scn_encode(1, 74));
+	cluster_undo_write_registry[16] = InvalidScn; /* restore fault input, not product cleanup */
+	cluster_undo_active_write_unregister();
+	undo_stop_fixture_done();
+}
+
+UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer)
+{
+	ClusterUndoExtent saved;
+	undo_stop_fixture_ready();
+	UndoRecordShared->active_segment_id = 33;
+	UndoRecordShared->current_block = 9;
+	UndoRecordShared->next_extent_block = 41;
+	cluster_undo_current_extent.segment_id = 33;
+	cluster_undo_current_extent.first_block = 9;
+	cluster_undo_current_extent.nblocks = 4;
+	saved = cluster_undo_current_extent;
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(memcmp(&saved, &cluster_undo_current_extent, sizeof(saved)), 0);
+	UT_ASSERT_EQ(UndoRecordShared->next_extent_block, 41);
+	MaxBackends = 0;
+	UT_ASSERT_EQ(cluster_undo_active_write_normal_stop_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	undo_stop_fixture_done();
+}
+
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(67);
+	UT_PLAN(70);
+	UT_RUN(test_a148_undo_stop_original_active_writer_requires_original_commit_release);
+	UT_RUN(test_a148_undo_stop_all_slots_and_late_invalid_do_not_clear_debt);
+	UT_RUN(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer);
 	UT_RUN(test_allocated_nonempty_tt_is_not_fresh_supply);
 	UT_RUN(test_terminal_tt_only_sweep_preserves_actual_recycle_eligibility);
 	UT_RUN(test_record_seal_owner_ignores_every_nonactive_predecessor);

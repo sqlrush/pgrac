@@ -1007,6 +1007,18 @@ _classify_owners(
 )
 
 _classify_owners(
+    "ITL_TERMINAL_DISCHARGE",
+    "src/backend/cluster/cluster_terminal_ref_census.c",
+    ("ctrc_cleaner_companions_discharge_locked",),
+    "TERMINAL_PROJECTION_DISCHARGE",
+    "CTRC_REF_HEAP_ITL_UBA",
+    "CTRC_TARGET_EXACT_ITL_SLOT",
+    "EXACT_RETIRED_ITL_PROJECTION",
+    "cluster_ctrc_receipt_discharge_itl",
+    "MXA-T23",
+)
+
+_classify_owners(
     "KO_PHYSICAL_REMOVAL",
     "src/backend/catalog/storage.c",
     ("RelationDropStorage", "RelationTruncate", "smgrDoPendingDeletes"),

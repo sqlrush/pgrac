@@ -80,6 +80,9 @@ UT_DEFINE_GLOBALS();
 int NBuffers = 16;
 int MaxBackends = 8;
 int cluster_node_id = 0;
+BackendType MyBackendType = B_BACKEND;
+static bool allow_new_service_participant = true;
+static unsigned new_service_participant_calls;
 static unsigned wake_count;
 static uint64 test_now_us = UINT64_C(1000000);
 static uint32 test_capability_generation = 19;
@@ -98,6 +101,17 @@ static XLogRecPtr (*origin_durability_hook)(int origin);
 static void (*barrier_hook)(void);
 static void (*pool_upgrade_hook)(void);
 static void (*wakeup_hook)(void);
+/* Optional boundary for a caller's native/truncation guards; shared CTRC
+ * lock ordering is still checked by the original fixture below. */
+static bool (*external_lock_hook)(LWLock *lock, LWLockMode mode, bool acquire);
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	UT_ASSERT(modifies_data);
+	new_service_participant_calls++;
+	return allow_new_service_participant;
+}
 
 void *
 palloc_extended(Size size, int flags)
@@ -245,6 +259,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
 	if (mode != LW_EXCLUSIVE && mode != LW_SHARED)
 		abort();
+	if (external_lock_hook != NULL && external_lock_hook(lock, mode, true))
+		return true;
 	if (lock->tranche == LWTRANCHE_CLUSTER_CTRC_PARTICIPANT)
 		last_participant_lock = lock;
 	if (lock == &CtrcShared->receipt_lock)
@@ -256,6 +272,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 void
 LWLockRelease(LWLock *lock)
 {
+	if (external_lock_hook != NULL && external_lock_hook(lock, LW_SHARED, false))
+		return;
 	test_lock_leave(lock);
 }
 
@@ -342,6 +360,10 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 static void
 reset_fixture(void)
 {
+	MyBackendType = B_BACKEND;
+	allow_new_service_participant = true;
+	new_service_participant_calls = 0;
+	external_lock_hook = NULL;
 	if (held_count != 0 || allocated != 0)
 		abort();
 	free(CtrcShared);
@@ -2151,6 +2173,280 @@ UT_TEST(test_actual_driver_ignores_other_progress_and_clears_error_batch)
 	driver_interrupt = driver_other_progress = false;
 }
 
+UT_TEST(test_normal_stop_uninitialized_and_empty_observation)
+{
+	ClusterCtrcNormalStopObservation observed;
+	ClusterCtrcSharedHeader *saved;
+
+	reset_fixture();
+	saved = CtrcShared;
+	CtrcShared = NULL;
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(observed.reason, CTRC_STOP_REASON_UNINITIALIZED);
+	CtrcShared = saved;
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(NULL), CLUSTER_NORMAL_STOP_INVALID);
+	/* Generations, scheduling hints and allocator tombstones are not debt. */
+	CtrcShared->global_journal_generation = 456;
+	CtrcShared->global_seal_generation = 789;
+	ctrc_receipt_probe_states()[3] = CTRC_RECEIPT_PROBE_TOMBSTONE;
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(observed.result, CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(observed.reason, CTRC_STOP_REASON_NONE);
+	UT_ASSERT_EQ(held_count, 0);
+	UT_ASSERT_EQ(flush_calls + durability_calls + wake_count, 0);
+}
+
+UT_TEST(test_normal_stop_reserved_origin_is_not_empty)
+{
+	ClusterCtrcTxnKeyV1 key;
+	ClusterCtrcOriginReservation reservation;
+	ClusterCtrcNormalStopObservation observed;
+
+	reset_fixture();
+	key = seed_origin(3, 0)->key;
+	reset_fixture();
+	UT_ASSERT_EQ(
+		cluster_ctrc_origin_reserve_entry(&ctrc_origin_entries()[3], &key, 3, 99, &reservation),
+		CLUSTER_CTRC_ORIGIN_RESERVED_PENDING);
+	UT_ASSERT_EQ(ctrc_origin_entries()[3].state, CTRC_ORIGIN_EMPTY);
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(observed.domain, CTRC_STOP_DOMAIN_ORIGIN);
+	UT_ASSERT_EQ(observed.reason, CTRC_STOP_REASON_RESERVED);
+	UT_ASSERT_EQ(observed.object_index, 3);
+	UT_ASSERT_EQ(memcmp(&observed.key, &key, sizeof(key)), 0);
+	UT_ASSERT(
+		cluster_ctrc_origin_cancel_pre_bind_entry(&ctrc_origin_entries()[3], 3, &reservation));
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_normal_stop_origin_phases_and_invalid_override_pending)
+{
+	ClusterCtrcNormalStopObservation observed;
+	ClusterCtrcOriginEntry *origin;
+
+	for (unsigned state = CTRC_ORIGIN_OPEN; state <= CTRC_ORIGIN_RELEASE_PROVEN; state++) {
+		reset_fixture();
+		origin = seed_origin(0, 0);
+		origin->state = state;
+		if (state == CTRC_ORIGIN_OPEN)
+			origin->seal_generation = 0;
+		UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(observed.state, state);
+		/* A later malformed/blocked object cannot hide behind the first debt. */
+		seed_origin(1, 0)->state = CTRC_ORIGIN_BLOCKED;
+		UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(observed.object_index, 1);
+		UT_ASSERT_EQ(observed.reason, CTRC_STOP_REASON_BLOCKED);
+	}
+	reset_fixture();
+	seed_origin(0, 0)->key.segment_id++;
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(observed.reason, CTRC_STOP_REASON_MALFORMED);
+	reset_fixture();
+	ctrc_origin_ack_entries()[4].grant_generation = 1;
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(observed.domain, CTRC_STOP_DOMAIN_ORIGIN_ACK);
+}
+
+UT_TEST(test_normal_stop_live_receipts_and_corrupt_links_are_never_ready)
+{
+	ClusterCtrcNormalStopObservation observed;
+	ClusterCtrcReceiptHandle handle;
+
+	for (unsigned state = CTRC_RECEIPT_PREPARED; state <= CTRC_RECEIPT_RETARGETING; state++) {
+		reset_fixture();
+		UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 123, &handle),
+					 CLUSTER_CTRC_PREPARE_READY);
+		/* Exercise the poll's phase classification, not a release transition. */
+		handle.receipt->state = state;
+		UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), state == CTRC_RECEIPT_BLOCKED
+																   ? CLUSTER_NORMAL_STOP_INVALID
+																   : CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+	for (unsigned fault = 0; fault < 8; fault++) {
+		reset_fixture();
+		UT_ASSERT_EQ(prepare_fixture_receipt(seed_origin(0, 1), 123, &handle),
+					 CLUSTER_CTRC_PREPARE_READY);
+		switch (fault) {
+		case 0:
+			handle.receipt->state = CTRC_RECEIPT_FREE;
+			break;
+		case 1:
+			ctrc_receipt_links()[handle.receipt_index].next_plus_one = handle.receipt_index + 1;
+			break;
+		case 2:
+			ctrc_receipt_links()[handle.receipt_index].journal_generation++;
+			break;
+		case 3:
+			ctrc_participant_receipt_heads()[handle.participant_index] = 0;
+			break;
+		case 4:
+			handle.participant->identity.boot_incarnation = 0;
+			break;
+		case 5:
+			handle.participant->state = CTRC_PARTICIPANT_BLOCKED;
+			break;
+		case 6:
+			ctrc_participant_ack_entries()[handle.participant_index].grant_generation = 7;
+			break;
+		case 7:
+			ctrc_receipt_probe_states()[handle.receipt_index] = CTRC_RECEIPT_PROBE_EMPTY;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(held_count, 0);
+	}
+	reset_fixture();
+	ctrc_receipt_links()[2].journal_generation = 10;
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(observed.domain, CTRC_STOP_DOMAIN_RECEIPT);
+	reset_fixture();
+	ctrc_receipt_entries()[2].publication.journal_sequence = 9;
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_INVALID);
+}
+
+UT_TEST(test_normal_stop_requires_actual_certificate_notification_reclaim)
+{
+	ClusterCtrcNormalStopObservation observed;
+	ClusterCtrcCloseDispatch dispatch;
+	ClusterCtrcSealReplyResult result;
+	ClusterCtrcOriginCertificateSnapshot certificate;
+	ClusterCtrcOriginEntry *origin;
+	uint64 participant_index, receipt_index;
+
+	reset_fixture();
+	UT_ASSERT(seed_frozen_certificate(0, &dispatch, &participant_index, &receipt_index));
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+	origin = &ctrc_origin_entries()[0];
+	UT_ASSERT(cluster_ctrc_origin_arm_close_entry(origin, 0, 501));
+	UT_ASSERT(cluster_ctrc_origin_ack_land_shared(
+		501, &ctrc_participant_ack_entries()[participant_index]));
+	LWLockAcquire(&CtrcShared->origin_lock, LW_EXCLUSIVE);
+	(void)ctrc_origin_dispatchable_locked(origin);
+	LWLockRelease(&CtrcShared->origin_lock);
+	UT_ASSERT(ctrc_origin_certificate_snapshot_index_locked(0, &certificate));
+	/* Exercise the actual in-memory edge AFTER the independently verified
+	 * block-0 durable boundary; this fixture does not prove disk durability. */
+	UT_ASSERT(cluster_ctrc_origin_certificate_commit_entry(origin, &certificate));
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(observed.state, CTRC_ORIGIN_RELEASE_PROVEN);
+	UT_ASSERT(cluster_ctrc_origin_arm_certificate_entry(origin, 0, dispatch.request_id));
+	UT_ASSERT(cluster_ctrc_participant_certificate_batch_shared(&dispatch, 1, &result));
+	UT_ASSERT_EQ(result, CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(cluster_ctrc_origin_note_certificate_reply_shared(dispatch.request_id, 0, result));
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(held_count, 0);
+	/* READY is not cached: a later legal producer revokes the observation. */
+	seed_origin(1, 0);
+	UT_ASSERT_EQ(cluster_ctrc_normal_stop_poll(&observed), CLUSTER_NORMAL_STOP_PENDING);
+}
+
+UT_TEST(test_normal_stop_cleaner_idle_is_local_ownership_not_progress)
+{
+	reset_fixture();
+	UT_ASSERT(!cluster_ctrc_cleaner_local_idle());
+	UT_ASSERT(cluster_ctrc_cleaner_bind_worker(7));
+	UT_ASSERT(cluster_ctrc_cleaner_local_idle());
+	CtrcBatch.active = true;
+	UT_ASSERT(!cluster_ctrc_cleaner_local_idle());
+	CtrcBatch.active = false;
+	CtrcBatch.dispatch_count = 2;
+	CtrcBatch.dispatch_next = 1;
+	UT_ASSERT(!cluster_ctrc_cleaner_local_idle());
+	CtrcBatch.dispatch_next = 2;
+	UT_ASSERT(cluster_ctrc_cleaner_local_idle());
+	CtrcBatch.dispatch_next = 3;
+	UT_ASSERT(!cluster_ctrc_cleaner_local_idle());
+	CtrcBatch.dispatch_next = 2;
+	UT_ASSERT(!ctrc_fixture_run_pass());
+	UT_ASSERT(cluster_ctrc_cleaner_local_idle());
+}
+
+UT_TEST(test_normal_stop_new_close_tombstone_is_not_retained_completion)
+{
+	const BackendType services[] = { B_LMON, B_LMS, B_LMS_WORKER, B_SINVAL_BCAST };
+	for (unsigned i = 0; i < lengthof(services); i++) {
+		ClusterCtrcOriginEntry *origin;
+		ClusterCtrcParticipantEntry *participant;
+		ClusterCtrcLocalReleaseAckV1 *summary, ack, frozen;
+		uint64 index;
+		uint16 reason;
+		reset_fixture();
+		origin = seed_origin(0, 1);
+		UT_ASSERT(ctrc_participant_index(&origin->key, 0, &index));
+		participant = &ctrc_participant_entries()[index];
+		summary = &ctrc_participant_ack_entries()[index];
+		MyBackendType = services[i];
+		allow_new_service_participant = false;
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+						 &origin->key, &origin->touched[0], origin->grant_generation,
+						 origin->seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+					 CTRC_SEAL_REPLY_DENIED);
+		UT_ASSERT(ctrc_bytes_zero(participant, sizeof(*participant)));
+		UT_ASSERT(ctrc_bytes_zero(summary, sizeof(*summary)));
+		UT_ASSERT(ctrc_bytes_zero(&ack, sizeof(ack)));
+		UT_ASSERT_EQ(new_service_participant_calls, 1);
+		UT_ASSERT_EQ(wake_count, 0);
+		UT_ASSERT_EQ(held_count, 0);
+		allow_new_service_participant = true;
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+						 &origin->key, &origin->touched[0], origin->grant_generation,
+						 origin->seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+					 CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK);
+		frozen = ack;
+		allow_new_service_participant = false;
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+						 &origin->key, &origin->touched[0], origin->grant_generation,
+						 origin->seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+					 CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK);
+		UT_ASSERT(memcmp(&ack, &frozen, sizeof(ack)) == 0);
+		UT_ASSERT_EQ(new_service_participant_calls, 2);
+		/* Actual shared certificate census retires the owned zero-range ACK.
+		 * A later CLOSE cannot recreate that responsibility after sealing. */
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+						 &origin->key, &origin->touched[0], origin->grant_generation,
+						 origin->seal_generation, CTRC_SEAL_CERTIFICATE_COMMITTED, &reason, &ack),
+					 CTRC_SEAL_REPLY_CERTIFICATE_RECLAIMED);
+		UT_ASSERT_EQ(new_service_participant_calls, 2);
+		UT_ASSERT(ctrc_bytes_zero(participant, sizeof(*participant)));
+		UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+						 &origin->key, &origin->touched[0], origin->grant_generation,
+						 origin->seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+					 CTRC_SEAL_REPLY_DENIED);
+		UT_ASSERT_EQ(new_service_participant_calls, 3);
+		UT_ASSERT(ctrc_bytes_zero(participant, sizeof(*participant)));
+		UT_ASSERT(ctrc_bytes_zero(summary, sizeof(*summary)));
+		UT_ASSERT_EQ(held_count, 0);
+	}
+}
+
+UT_TEST(test_normal_stop_close_validation_and_local_caller_are_not_service_admission)
+{
+	ClusterCtrcOriginEntry *origin;
+	ClusterCtrcLocalReleaseAckV1 ack;
+	uint16 reason;
+	reset_fixture();
+	origin = seed_origin(0, 1);
+	allow_new_service_participant = false;
+	MyBackendType = B_LMS;
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(&origin->key, &origin->touched[0], 0,
+														 origin->seal_generation,
+														 CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+				 CTRC_SEAL_REPLY_BLOCKED_RETAIN);
+	UT_ASSERT_EQ(new_service_participant_calls, 0);
+	MyBackendType = B_BACKEND;
+	/* Foreground/cleaner local calls belong to the native exit/park barrier.
+	 * Do not forge a service bracket while Smart shutdown waits for them. */
+	UT_ASSERT_EQ(cluster_ctrc_participant_request_shared(
+					 &origin->key, &origin->touched[0], origin->grant_generation,
+					 origin->seal_generation, CTRC_SEAL_CLOSE_AND_CLEAN, &reason, &ack),
+				 CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK);
+	UT_ASSERT_EQ(new_service_participant_calls, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
 int
 main(void)
 {
@@ -2158,7 +2454,7 @@ main(void)
 
 	if (!cluster_ctrc_capacity_compute(NBuffers, MaxBackends, 4, &capacity))
 		abort();
-	UT_PLAN(47);
+	UT_PLAN(55);
 	printf("# CTRC header_bytes=%zu total_bytes=%zu\n", sizeof(ClusterCtrcSharedHeader),
 		   capacity.total_bytes);
 	UT_RUN(test_new_seals_do_not_starve_old_pending);
@@ -2208,6 +2504,14 @@ main(void)
 	UT_RUN(test_receipt_and_ack_select_only_canonical_worker);
 	UT_RUN(test_foreign_progress_and_observations_cannot_drive_local_work);
 	UT_RUN(test_actual_driver_ignores_other_progress_and_clears_error_batch);
+	UT_RUN(test_normal_stop_uninitialized_and_empty_observation);
+	UT_RUN(test_normal_stop_reserved_origin_is_not_empty);
+	UT_RUN(test_normal_stop_origin_phases_and_invalid_override_pending);
+	UT_RUN(test_normal_stop_live_receipts_and_corrupt_links_are_never_ready);
+	UT_RUN(test_normal_stop_requires_actual_certificate_notification_reclaim);
+	UT_RUN(test_normal_stop_cleaner_idle_is_local_ownership_not_progress);
+	UT_RUN(test_normal_stop_new_close_tombstone_is_not_retained_completion);
+	UT_RUN(test_normal_stop_close_validation_and_local_caller_are_not_service_admission);
 	free(CtrcShared);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
