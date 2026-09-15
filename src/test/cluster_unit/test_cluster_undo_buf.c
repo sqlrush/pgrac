@@ -36,6 +36,7 @@
 #define USE_PGRAC_CLUSTER 1
 
 #include "postgres.h"
+#include "miscadmin.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -74,6 +75,9 @@ UT_DEFINE_GLOBALS();
  * node 0 keeps every smgr call on the RUNTIME_SHARED (own) branch.
  */
 int cluster_node_id = 0;
+/* Linked block-zero observer is not called by this DATA-pool fixture. */
+bool IsUnderPostmaster = false;
+BackendType MyBackendType = B_INVALID;
 
 ClusterR4PrerequisiteSnapshot
 cluster_reconfig_r4_prerequisite_snapshot(void)
@@ -192,7 +196,7 @@ int cluster_undo_writeback_boundary_check = CLUSTER_UNDO_WB_CHECK_ON;
  */
 static uint32 ut_wait_event_info_storage = 0;
 uint32 *my_wait_event_info = &ut_wait_event_info_storage;
-int InterruptHoldoffCount = 0;
+volatile uint32 InterruptHoldoffCount = 0;
 
 /* ----- single-node latch: cluster_conf_has_peers() reads ClusterConfShmem;
  * NULL => no peers => latch does not block write-back (U1-U6 are single-node). */

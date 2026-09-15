@@ -419,6 +419,164 @@ static ClusterReplacementClosedStage replacement_closed_stage;
 static ClusterReplacementReadyStage replacement_ready_stage;
 static ClusterJoinMarkerLmonOwner join_marker_lmon_owner;
 
+typedef struct ReconfigStopObservation {
+	ClusterNormalStopPollResult result;
+	const char *domain;
+	uint64 key;
+} ReconfigStopObservation;
+
+static void
+reconfig_stop_note(ReconfigStopObservation *out, bool pending, bool invalid, const char *domain,
+				   uint64 key)
+{
+	if (out->result == CLUSTER_NORMAL_STOP_INVALID || (!pending && !invalid))
+		return;
+	if (invalid || out->result == CLUSTER_NORMAL_STOP_READY) {
+		out->result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+		out->domain = domain;
+		out->key = key;
+	}
+}
+
+static void
+reconfig_stop_mailbox(ReconfigStopObservation *out, const char *domain, pg_atomic_uint64 *requested,
+					  pg_atomic_uint64 *completed)
+{
+	uint64 request = pg_atomic_read_u64(requested);
+	uint64 completion = pg_atomic_read_u64(completed);
+	bool changed;
+
+	pg_read_barrier();
+	changed
+		= request != pg_atomic_read_u64(requested) || completion != pg_atomic_read_u64(completed);
+	reconfig_stop_note(out, changed || request != completion,
+					   !changed && (completion > request || request - completion > 1), domain,
+					   request);
+}
+
+/* Original LMON responsibilities only. Stable OPEN/full formation identity,
+ * other processes' private work and the producer seal are separate cuts.
+ * No marker, exclusion, reservation or cached proof is reset by this poll. */
+ClusterNormalStopPollResult
+cluster_reconfig_normal_stop_poll(const char **domain_out, uint64 *key_out, const char **reason_out)
+{
+	ReconfigStopObservation out = { CLUSTER_NORMAL_STOP_READY, NULL, 0 };
+	const struct {
+		const char *domain;
+		const ClusterMarkerAsync *async;
+		bool submitted;
+	} stages[]
+		= { { "FAILSTOP_FENCE", &failstop_fence_stage.async, failstop_fence_stage.submitted },
+			{ "NODE_REMOVED_FENCE", &node_removed_fence_stage.async,
+			  node_removed_fence_stage.submitted },
+			{ "JOIN_PREPARE", &join_prepare_stage.async, join_prepare_stage.submitted },
+			{ "JOIN_COMMIT", &join_commit_stage.async, join_commit_stage.submitted },
+			{ "JOIN_COMMIT_FENCE", &join_commit_stage.fence_async, join_commit_stage.fence_ready },
+			{ "REPLACEMENT_ADMIT_MARKER", &replacement_admit_stage.marker_async, false },
+			{ "REPLACEMENT_CLOSED_MARKER", &replacement_closed_stage.marker_async, false },
+			{ "REPLACEMENT_READY_MARKER", &replacement_ready_stage.marker_async, false } };
+
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || ReconfigShmem == NULL) {
+		reconfig_stop_note(&out, false, true, "RECONFIG_OWNER_OR_SHMEM", 0);
+		goto done;
+	}
+
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	{
+		uint32 prebump = pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active);
+		const ClusterReplacementEpisode *episode = &ReconfigShmem->replacement_episode;
+		bool empty = cluster_replacement_episode_is_empty(episode);
+
+		reconfig_stop_note(&out, prebump != 0, prebump > 1, "RECONFIG_PREBUMP", 0);
+		reconfig_stop_note(&out, false,
+						   ReconfigShmem->self_join_failed != 0
+							   || ReconfigShmem->self_join_admitted > 1,
+						   "RECONFIG_SELF_JOIN", 0);
+		for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+			uint8 bit = (uint8)(1u << (node % 8));
+			reconfig_stop_note(&out, (ReconfigShmem->pending_join_bitmap[node / 8] & bit) != 0,
+							   false, "PENDING_JOIN", node);
+			reconfig_stop_note(&out, (ReconfigShmem->fast_rejoin_bitmap[node / 8] & bit) != 0,
+							   false, "FAST_REJOIN", node);
+		}
+		reconfig_stop_note(&out, !empty && episode->phase != CLUSTER_REPLACEMENT_EPISODE_ADMITTED,
+						   !empty
+							   && (!cluster_replacement_episode_is_valid(episode)
+								   || episode->phase == CLUSTER_REPLACEMENT_EPISODE_HOLD),
+						   "REPLACEMENT_EPISODE", episode->request_nonce);
+		reconfig_stop_mailbox(&out, "JOIN_MAILBOX", &ReconfigShmem->join_marker_request_seq,
+							  &ReconfigShmem->join_marker_completion_seq);
+		reconfig_stop_mailbox(&out, "FORMATION_MAILBOX",
+							  &ReconfigShmem->formation_marker_request_seq,
+							  &ReconfigShmem->formation_marker_completion_seq);
+	}
+	LWLockRelease(&ReconfigShmem->lock);
+
+	for (int i = 0; i < lengthof(stages); i++) {
+		const ClusterMarkerAsync *a = stages[i].async;
+		reconfig_stop_note(&out,
+						   stages[i].submitted || a->has_staged_event
+							   || a->state == CLUSTER_MARKER_ASYNC_SUBMITTED,
+						   a->state != CLUSTER_MARKER_ASYNC_IDLE
+							   && a->state != CLUSTER_MARKER_ASYNC_SUBMITTED,
+						   stages[i].domain, a->inflight_seq);
+	}
+	/* Admission deliberately retains arbiter_submitted/seq as boot evidence.
+	 * The marker's ACK alone is insufficient, but successful original admission
+	 * ends that private responsibility without erasing the retained evidence. */
+	reconfig_stop_note(
+		&out,
+		!cold_formation_state.admission_done
+			&& (cold_formation_state.arbiter_submitted || cold_formation_state.observe_passed),
+		false, "COLD_FORMATION", cold_formation_state.arbiter_seq);
+	reconfig_stop_note(&out,
+					   offpath_fast_rejoin_active_local || fast_rejoin_control.active
+						   || join_commit_stage.external_rejoin_consumed
+						   || external_rejoin_claim_op != NULL,
+					   false, "EXTERNAL_REJOIN_CLAIM", 0);
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		const ClusterExternalRejoinSlot *slot = &external_rejoin_slots[node];
+		reconfig_stop_note(&out,
+						   slot->phase != CLUSTER_EXTERNAL_REJOIN_EMPTY || slot->op != NULL
+							   || slot->authority_clear != NULL,
+						   slot->phase < CLUSTER_EXTERNAL_REJOIN_EMPTY
+							   || slot->phase > CLUSTER_EXTERNAL_REJOIN_COMMITTING,
+						   "EXTERNAL_REJOIN_SLOT", node);
+	}
+	reconfig_stop_note(&out, replacement_admit_stage.phase != CLUSTER_REPLACEMENT_ADMIT_IDLE,
+					   replacement_admit_stage.phase < CLUSTER_REPLACEMENT_ADMIT_IDLE
+						   || replacement_admit_stage.phase
+								  > CLUSTER_REPLACEMENT_ADMIT_POST_HEAD_WAIT,
+					   "REPLACEMENT_ADMIT", replacement_admit_stage.authority_request_seq);
+	reconfig_stop_note(
+		&out, replacement_closed_stage.phase != CLUSTER_REPLACEMENT_CLOSED_STAGE_IDLE,
+		replacement_closed_stage.phase < CLUSTER_REPLACEMENT_CLOSED_STAGE_IDLE
+			|| replacement_closed_stage.phase > CLUSTER_REPLACEMENT_CLOSED_STAGE_DRAIN_AUTHORITY,
+		"REPLACEMENT_CLOSED", replacement_closed_stage.authority_request_seq);
+	reconfig_stop_note(
+		&out,
+		replacement_ready_stage.phase != CLUSTER_REPLACEMENT_READY_STAGE_IDLE
+			&& replacement_ready_stage.phase != CLUSTER_REPLACEMENT_READY_STAGE_CACHED,
+		replacement_ready_stage.phase < CLUSTER_REPLACEMENT_READY_STAGE_IDLE
+			|| replacement_ready_stage.phase > CLUSTER_REPLACEMENT_READY_STAGE_DRAIN_AUTHORITY,
+		"REPLACEMENT_READY", replacement_ready_stage.authority_request_seq);
+	reconfig_stop_note(&out, join_marker_lmon_owner.reserved,
+					   join_marker_lmon_owner.purpose < CLUSTER_JOIN_MARKER_LMON_NONE
+						   || join_marker_lmon_owner.purpose
+								  > CLUSTER_JOIN_MARKER_LMON_READY_SERIALIZE,
+					   "JOIN_MARKER_OWNER", join_marker_lmon_owner.marker_request_seq);
+done:
+	if (domain_out != NULL)
+		*domain_out = out.domain;
+	if (key_out != NULL)
+		*key_out = out.key;
+	if (reason_out != NULL)
+		*reason_out = out.result == CLUSTER_NORMAL_STOP_READY	  ? "RECONFIG_STOP_READY"
+					  : out.result == CLUSTER_NORMAL_STOP_PENDING ? "RECONFIG_IN_PROGRESS"
+																  : "RECONFIG_STATE_INVALID";
+	return out.result;
+}
+
 static bool cluster_reconfig_join_marker_request_word_decode(
 	uint32 word, ClusterJoinMarkerMailboxOperationV1 *operation_out,
 	int32 *target_node_out);

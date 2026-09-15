@@ -49,6 +49,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_conf.h" /* declared_node_count_early (spec-7.2a D4) */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lms_shard.h" /* CLUSTER_LMS_MAX_WORKERS */
@@ -308,6 +309,107 @@ void
 cluster_gcs_block_dedup_module_init(void)
 {
 	cluster_shmem_register_region(&cluster_gcs_block_dedup_region);
+}
+
+static void
+gcs_dedup_stop_held_lock(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*((bool *)arg) = true;
+}
+
+ClusterNormalStopPollResult
+cluster_gcs_dedup_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *why = "NONE";
+	uint64 request = 0;
+	bool held_lock = false;
+
+	if (domain != NULL)
+		*domain = "GCS_DEDUP";
+	if (key != NULL)
+		*key = 0;
+	if (!IsUnderPostmaster || MyBackendType != B_LMON)
+		why = "GCS_DEDUP_OBSERVER_ROLE";
+	else if (cluster_gcs_block_dedup_ctl == NULL || cluster_gcs_block_dedup_shards == NULL)
+		why = "GCS_DEDUP_UNINITIALIZED";
+	else if (cluster_gcs_block_dedup_n_shards < 1
+			 || cluster_gcs_block_dedup_n_shards > CLUSTER_LMS_MAX_WORKERS
+			 || cluster_gcs_block_dedup_ctl->n_shards != cluster_gcs_block_dedup_n_shards
+			 || cluster_gcs_block_dedup_ctl->max_entries_effective < 1)
+		why = "GCS_DEDUP_GEOMETRY";
+	else {
+		ForEachLWLockHeldByMe(gcs_dedup_stop_held_lock, &held_lock);
+		if (held_lock)
+			why = "GCS_DEDUP_CALLER_LOCK";
+	}
+	if (strcmp(why, "NONE") != 0) {
+		if (reason != NULL)
+			*reason = why;
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+
+	/* A cached reply or completed routing handoff owns no execution work.
+	 * It is not proof of requester INSTALL: that original owner, transport,
+	 * CR context and GRD responsibility must separately pass the global cut.
+	 * Never age, sweep or remove entries to manufacture an empty table. */
+	for (int s = 0; s < cluster_gcs_block_dedup_n_shards; s++) {
+		HASH_SEQ_STATUS scan;
+		GcsBlockDedupEntry *entry;
+		uint64 seen = 0;
+		ClusterGcsBlockDedupShard *shard = &cluster_gcs_block_dedup_shards[s];
+		HTAB *htab = cluster_gcs_block_dedup_htabs[s];
+
+		if (htab == NULL) {
+			if (result != CLUSTER_NORMAL_STOP_INVALID) {
+				result = CLUSTER_NORMAL_STOP_INVALID;
+				why = "GCS_DEDUP_UNINITIALIZED";
+				request = 0;
+			}
+			continue;
+		}
+		LWLockAcquire(&shard->lock.lock, LW_SHARED);
+		hash_seq_init(&scan, htab);
+		while ((entry = hash_seq_search(&scan)) != NULL) {
+			ClusterNormalStopPollResult one = CLUSTER_NORMAL_STOP_READY;
+			const char *cause = "NONE";
+			bool malformed = false;
+			bool pending = false;
+
+			seen++;
+			if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC)
+				pending = entry->completed_at_ts == 0;
+			else if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE) {
+				uint8 state = entry->payload_meta.r4_route.state;
+
+				malformed = state < GCS_BLOCK_R4_ROUTE_ROUTING
+							|| state > GCS_BLOCK_R4_ROUTE_RETRYABLE
+							|| (state != GCS_BLOCK_R4_ROUTE_ROUTING && entry->completed_at_ts == 0);
+				pending = state == GCS_BLOCK_R4_ROUTE_ROUTING;
+			} else
+				malformed = true;
+			if (malformed || seen > (uint64)cluster_gcs_block_dedup_ctl->max_entries_effective) {
+				one = CLUSTER_NORMAL_STOP_INVALID;
+				cause = "GCS_DEDUP_ENTRY_SHAPE";
+			} else if (pending) {
+				one = CLUSTER_NORMAL_STOP_PENDING;
+				cause = "GCS_DEDUP_IN_FLIGHT";
+			}
+			if (one < result) {
+				result = one;
+				why = cause;
+				request = entry->key.request_id;
+			}
+		}
+		LWLockRelease(&shard->lock.lock);
+	}
+	if (key != NULL)
+		*key = request;
+	if (reason != NULL)
+		*reason = why;
+	return result;
 }
 
 
@@ -605,6 +707,10 @@ cluster_gcs_block_dedup_lookup_or_register(int worker_id, const GcsBlockDedupKey
 
 	/* MISS path — insert new in-flight slot.  HASH_ENTER_NULL → may fail
 	 * with cap reached; convert to FULL fail-closed (HC92). */
+	if (!cluster_normal_stop_service_new_work(transition_id != PCM_TRANS_N_TO_S)) {
+		LWLockRelease(&shard->lock.lock);
+		return GCS_BLOCK_DEDUP_FULL;
+	}
 	entry = (GcsBlockDedupEntry *)hash_search(htab, key, HASH_ENTER_NULL, &found);
 	if (entry == NULL) {
 		/* PGRAC: spec-7.2a D1 — before failing closed, try to reclaim one
@@ -720,6 +826,11 @@ cluster_gcs_block_dedup_r4_route_arm_or_match(
 
 	if (transition_id != (uint8)PCM_TRANS_N_TO_S) {
 		result = GCS_BLOCK_R4_ROUTE_ARM_INVALID;
+		goto out;
+	}
+	/* Exact existing routes above retain their original handoff/replay. */
+	if (!cluster_normal_stop_service_new_work(false)) {
+		result = GCS_BLOCK_R4_ROUTE_ARM_FULL;
 		goto out;
 	}
 	entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key, HASH_ENTER_NULL,

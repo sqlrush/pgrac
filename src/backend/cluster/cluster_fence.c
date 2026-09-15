@@ -70,6 +70,7 @@
 #include "funcapi.h"
 
 #include "cluster/cluster_guc.h"	/* cluster_enabled */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (Step 4 D12) */
 #include "cluster/cluster_pgstat.h" /* cluster_pgstat_lookup/_inc (Step 4 D11) */
 #include "cluster/cluster_qvotec.h" /* cluster_qvotec_get_quorum_state (Step 3 D5) */
@@ -155,6 +156,53 @@ typedef struct ClusterFenceShmemStruct {
 } ClusterFenceShmemStruct;
 
 static ClusterFenceShmemStruct *ClusterFenceShmem = NULL;
+
+static void
+fence_stop_held_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)context = true;
+}
+
+/* Observe the original obligation; only its original quorum/postmaster owner
+ * may cancel or execute it. Broadcast history is not outstanding work, and a
+ * READY here grants no quorum, durable-marker or complete-stop authority. */
+ClusterNormalStopPollResult
+cluster_fence_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	bool held = false;
+	TimestampTz requested;
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *why = "FENCE_OWNER_OR_SHMEM";
+
+	if (domain)
+		*domain = "FENCE";
+	if (key)
+		*key = 0;
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || ClusterFenceShmem == NULL)
+		goto done;
+	ForEachLWLockHeldByMe(fence_stop_held_lock, &held);
+	if (held) {
+		why = "FENCE_CALLER_LOCK";
+		goto done;
+	}
+	LWLockAcquire(&ClusterFenceShmem->lock, LW_SHARED);
+	requested = ClusterFenceShmem->self_fence_requested_at_us;
+	LWLockRelease(&ClusterFenceShmem->lock);
+	if (key)
+		*key = (uint64)requested;
+	result = requested < 0	  ? CLUSTER_NORMAL_STOP_INVALID
+			 : requested != 0 ? CLUSTER_NORMAL_STOP_PENDING
+							  : CLUSTER_NORMAL_STOP_READY;
+	why = requested < 0	   ? "FENCE_REQUEST_INVALID"
+		  : requested != 0 ? "FENCE_SELF_REQUEST_PENDING"
+						   : "NONE";
+done:
+	if (reason)
+		*reason = why;
+	return result;
+}
 
 /* The LWLock alone is platform-variable in size (LWLOCK_PADDED_SIZE
  * is 32 or 64 depending on cache line + atomics support).  Don't
@@ -510,9 +558,11 @@ cluster_fence_postmaster_check(void)
 	if (ClusterFenceShmem == NULL)
 		return;
 
-	/* Snapshot under lock — keep critical region small (no kill/ereport
-	 * inside lock per sinvaladt.c:741-755 pattern). */
-	LWLockAcquire(&ClusterFenceShmem->lock, LW_EXCLUSIVE);
+	/* Postmaster has no PGPROC and cannot enqueue on an LWLock. Contention
+	 * keeps the original request and its first timestamp for the next native
+	 * ServerLoop tick; it neither cancels nor restarts the grace period. */
+	if (!LWLockConditionalAcquire(&ClusterFenceShmem->lock, LW_EXCLUSIVE))
+		return;
 	requested_at = ClusterFenceShmem->self_fence_requested_at_us;
 	now_us = GetCurrentTimestamp();
 	grace_us = (int64)cluster_self_fence_grace_ms * INT64CONST(1000);

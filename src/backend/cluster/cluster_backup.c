@@ -48,6 +48,7 @@
 #include "utils/tuplestore.h"
 
 #include "cluster/cluster_backup.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
@@ -205,6 +206,114 @@ void
 cluster_backup_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_backup_region);
+}
+
+static void
+backup_stop_held_lock(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*((bool *)arg) = true;
+}
+
+static void
+backup_stop_note(ClusterNormalStopPollResult result, uint64 object, const char *why,
+				 ClusterNormalStopPollResult *aggregate, uint64 *key, const char **reason)
+{
+	if (result < *aggregate) {
+		*aggregate = result;
+		*key = object;
+		*reason = why;
+	}
+}
+
+/* Only the original LMON owner observes its private holds. Shared counts and
+ * mailboxes are additional duties, not substitutes for native process/actor
+ * completion or durable backup-pin checks at startup. Never release here. */
+ClusterNormalStopPollResult
+cluster_backup_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_INVALID;
+	const char *why = "BACKUP_OWNER_OR_SHMEM";
+	uint64 object = 0;
+	uint32 fence, commits;
+	SessionBackupState native;
+	bool held_lock = false;
+
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || cluster_backup_state == NULL)
+		goto done;
+	ForEachLWLockHeldByMe(backup_stop_held_lock, &held_lock);
+	if (held_lock) {
+		why = "BACKUP_CALLER_HELD_LOCK";
+		goto done;
+	}
+	aggregate = CLUSTER_NORMAL_STOP_READY;
+	why = "NONE";
+	native = get_backup_status();
+	if (native != SESSION_BACKUP_NONE && native != SESSION_BACKUP_RUNNING)
+		backup_stop_note(CLUSTER_NORMAL_STOP_INVALID, 0, "BACKUP_NATIVE_STATE_INVALID", &aggregate,
+						 &object, &why);
+	else if (native == SESSION_BACKUP_RUNNING || cluster_backup_lmon_state != NULL
+			 || cluster_backup_lmon_context != NULL || cluster_backup_lmon_tablespace_map != NULL
+			 || cluster_backup_lmon_restore_point_held
+			 || cluster_backup_lmon_restore_point_prepare_pending)
+		backup_stop_note(CLUSTER_NORMAL_STOP_PENDING,
+						 cluster_backup_lmon_prepare_request.request_id, "BACKUP_LMON_HELD",
+						 &aggregate, &object, &why);
+	commits = pg_atomic_read_u32(&cluster_backup_state->pending_commit_count);
+	fence = pg_atomic_read_u32(&cluster_backup_state->commit_fence_active);
+	if (fence > 1)
+		backup_stop_note(CLUSTER_NORMAL_STOP_INVALID, fence, "BACKUP_FENCE_INVALID", &aggregate,
+						 &object, &why);
+	else if (fence != 0 || commits != 0)
+		backup_stop_note(CLUSTER_NORMAL_STOP_PENDING, commits, "BACKUP_COMMIT_FENCE_PENDING",
+						 &aggregate, &object, &why);
+
+	LWLockAcquire(&cluster_backup_state->lock.lock, LW_SHARED);
+	if (cluster_backup_state->restore_point_count < 0
+		|| cluster_backup_state->restore_point_count > CLUSTER_BACKUP_RESTORE_POINT_MAX
+		|| cluster_backup_state->restore_point_next < 0
+		|| cluster_backup_state->restore_point_next >= CLUSTER_BACKUP_RESTORE_POINT_MAX)
+		backup_stop_note(CLUSTER_NORMAL_STOP_INVALID, 0, "BACKUP_GEOMETRY_INVALID", &aggregate,
+						 &object, &why);
+	if (cluster_backup_state->status.in_progress)
+		backup_stop_note(CLUSTER_NORMAL_STOP_PENDING, 0, "BACKUP_SESSION_PENDING", &aggregate,
+						 &object, &why);
+	if (cluster_backup_state->coordinator_send_pending || cluster_backup_state->peer_command_pending
+		|| cluster_backup_state->peer_restore_point_prepare_pending
+		|| cluster_backup_state->peer_reply_pending)
+		backup_stop_note(CLUSTER_NORMAL_STOP_PENDING, 0, "BACKUP_MAILBOX_PENDING", &aggregate,
+						 &object, &why);
+	if (cluster_backup_state->peer_reply_pending
+		&& (cluster_backup_state->peer_reply_dest < 0
+			|| cluster_backup_state->peer_reply_dest >= CLUSTER_MAX_NODES))
+		backup_stop_note(CLUSTER_NORMAL_STOP_INVALID, 0, "BACKUP_REPLY_DEST_INVALID", &aggregate,
+						 &object, &why);
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		bool expected
+			= cluster_backup_bitmap_test(cluster_backup_state->coordinator_expected, node);
+		bool answered
+			= cluster_backup_bitmap_test(cluster_backup_state->coordinator_acked, node)
+			  || cluster_backup_bitmap_test(cluster_backup_state->coordinator_nacked, node);
+		if ((!expected && answered)
+			|| (expected && cluster_backup_state->coordinator_request.request_id == 0))
+			backup_stop_note(CLUSTER_NORMAL_STOP_INVALID, node, "BACKUP_COORD_IDENTITY_INVALID",
+							 &aggregate, &object, &why);
+		else if (expected && !answered)
+			backup_stop_note(CLUSTER_NORMAL_STOP_PENDING, node, "BACKUP_COORD_PEER_PENDING",
+							 &aggregate, &object, &why);
+	}
+	/* Completed ACK/NAK maps, manifests and last restore points are history.
+	 * A later producer makes the next poll pending; the actor seal is separate. */
+	LWLockRelease(&cluster_backup_state->lock.lock);
+done:
+	if (domain != NULL)
+		*domain = "BACKUP";
+	if (key != NULL)
+		*key = object;
+	if (reason != NULL)
+		*reason = why;
+	return aggregate;
 }
 
 static void cluster_backup_cleanup_session_context(void);
@@ -1711,6 +1820,14 @@ cluster_backup_request_handler(const ClusterICEnvelope *env, const void *payload
 		&& ((ClusterBackupWireOp)request->op == CLUSTER_BACKUP_WIRE_OP_ABORT
 			|| (!cluster_backup_state->peer_reply_pending
 				&& !cluster_backup_state->peer_restore_point_prepare_pending))) {
+		/* This mailbox has no cached command-reply replay.  Even a new STOP
+		 * or ABORT command is new work after the original backup duties have
+		 * drained.  Already admitted commands and their replies keep their
+		 * original consumers; do not gate those completion paths. */
+		if (!cluster_normal_stop_service_new_work(true)) {
+			LWLockRelease(&cluster_backup_state->lock.lock);
+			return;
+		}
 		cluster_backup_state->peer_command = *request;
 		cluster_backup_state->peer_command_pending = true;
 	}

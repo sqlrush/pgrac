@@ -48,6 +48,7 @@
 #include "catalog/pg_class.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_extend_gate.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -112,6 +113,54 @@ typedef struct ClusterKoShared {
 } ClusterKoShared;
 
 static ClusterKoShared *ko_state = NULL;
+
+ClusterNormalStopPollResult
+cluster_ko_normal_stop_poll(uint32 *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *reason = "UNINITIALIZED";
+	uint32 slot = 0, head, tail;
+
+	if (ko_state == NULL)
+		goto done;
+	/* Only the sole consumer can inspect published slots without racing
+	 * another consumer advancing head and allowing producer reuse. The
+	 * checkpointer consumes this actor's sealed idle publication instead. */
+	if (!IsUnderPostmaster || !AmSinvalBcastProcess()) {
+		reason = "NOT_CONSUMER";
+		goto done;
+	}
+	head = pg_atomic_read_u32(&ko_state->inbound_head);
+	tail = pg_atomic_read_u32(&ko_state->inbound_tail);
+	pg_read_barrier();
+	if (head >= CLUSTER_KO_INBOUND_CAPACITY || tail >= CLUSTER_KO_INBOUND_CAPACITY) {
+		reason = "RING_GEOMETRY";
+		goto done;
+	}
+	result = CLUSTER_NORMAL_STOP_READY;
+	reason = "EMPTY";
+	for (uint32 i = head; i != tail; i = (i + 1) % CLUSTER_KO_INBOUND_CAPACITY) {
+		const ClusterKoInboundSlot *item = &ko_state->inbound[i];
+		if (item->batch_id == 0 || item->source_node < 0 || item->source_node >= CLUSTER_MAX_NODES
+			|| item->spc_oid == InvalidOid || item->rel_number == InvalidRelFileNumber) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			reason = "INVALID_REQUEST";
+			slot = i;
+			break;
+		}
+		if (result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			reason = "REQUEST_OWNED";
+			slot = i;
+		}
+	}
+done:
+	if (slot_out != NULL)
+		*slot_out = slot;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
 
 Size
 cluster_ko_shmem_size(void)
@@ -513,6 +562,10 @@ cluster_ko_flush_request_handler(const ClusterICEnvelope *env, const void *paylo
 		|| cluster_conf_lookup_node(hdr->source_node) == NULL)
 		return;
 
+	/* A new object flush/drop cannot cross the normal-stop modifier seal.
+	 * Existing ACK completion still follows its original exact wait entry. */
+	if (!cluster_normal_stop_service_new_work(true))
+		return;
 	/* SPSC enqueue (LMON is the only producer). */
 	tail = pg_atomic_read_u32(&ko_state->inbound_tail);
 	head = pg_atomic_read_u32(&ko_state->inbound_head);

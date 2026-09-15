@@ -59,6 +59,7 @@
 #include <sys/resource.h> /* PGRAC: spec-7.3 D8 setpriority (cluster.lms_nice) */
 
 #include "cluster/cluster_cr_server.h" /* spec-6.12b CR work slots */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"	   /* cluster_epoch_get_current */
@@ -999,6 +1000,107 @@ lms_note_pcm_x_finish_flush_injection_reload(int worker_id)
 }
 
 
+static bool lms_normal_stop_exit_verified;
+
+ClusterNormalStopPollResult
+cluster_lms_normal_stop_idle(void)
+{
+	static TimestampTz last_pending_log;
+	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
+	const char *first_reason = "NONE";
+	const char *first_domain = "NONE";
+	int first_slot = -1;
+
+	if (!cluster_normal_stop_requested())
+		return CLUSTER_NORMAL_STOP_READY;
+	/* Every poll runs in the real owner outside a work bracket/leave lock.
+	 * Do not let an earlier PENDING hide a later malformed responsibility. */
+	for (int module = 0; module < 5; module++) {
+		ClusterNormalStopPollResult result;
+		const char *reason = "NONE";
+		const char *domain = "NONE";
+		int slot = -1;
+		int worker = -1;
+		uint32 position = 0;
+
+		switch (module) {
+		case 0:
+			domain = "CR";
+			result = cluster_cr_server_normal_stop_poll(&slot, &reason);
+			break;
+		case 1:
+			domain = "NATIVE_PROBE";
+			result = cluster_lms_native_probe_normal_stop_poll(&slot, &reason);
+			break;
+		case 2:
+			domain = "GCS_LOCAL";
+			result = cluster_gcs_block_normal_stop_local_poll(&slot, &reason);
+			break;
+		case 3:
+			domain = "OUTBOUND";
+			result = cluster_lms_outbound_normal_stop_poll(&worker, &position, &reason);
+			slot = worker;
+			break;
+		default:
+			result = cluster_ic_normal_stop_poll(&domain, &slot, &position, &reason);
+			break;
+		}
+		if ((result == CLUSTER_NORMAL_STOP_INVALID && aggregate != CLUSTER_NORMAL_STOP_INVALID)
+			|| (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)) {
+			aggregate = result;
+			first_reason = reason;
+			first_domain = domain;
+			first_slot = slot;
+		}
+	}
+	if (aggregate == CLUSTER_NORMAL_STOP_PENDING) {
+		TimestampTz now = GetCurrentTimestamp();
+		if (last_pending_log == 0 || now - last_pending_log >= INT64CONST(1000000)) {
+			last_pending_log = now;
+			ereport(LOG, (errmsg_internal("LMS normal-stop responsibility pending"),
+						  errdetail("aux=%d domain=%s slot=%d reason=%s", (int)MyAuxProcType,
+									first_domain, first_slot, first_reason)));
+		}
+	}
+	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		ereport(LOG,
+				(errmsg_internal("LMS normal-stop responsibility invalid"),
+				 errdetail("domain=%s slot=%d reason=%s", first_domain, first_slot, first_reason)));
+	}
+	return cluster_normal_stop_service_idle(aggregate);
+}
+
+static void
+lms_normal_stop_exit_callback(int code, Datum arg)
+{
+	(void)arg;
+	/* Transport has already closed on the ordinary success path. Never
+	 * inspect its now-empty state to manufacture an idle proof. The local
+	 * latch below is set only at the immediate pre-close cut, with no
+	 * intervening dispatch; shared failure remains independently sticky. */
+	if (cluster_normal_stop_requested()
+		&& (code != 0 || !lms_normal_stop_exit_verified
+			|| !cluster_normal_stop_protocol_closed())) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+		if (code == 0)
+			ereport(FATAL, (errmsg_internal("LMS exited without normal-stop completion")));
+	}
+}
+
+static void
+lms_normal_stop_before_exit(void)
+{
+	if (!cluster_normal_stop_requested())
+		return;
+	if (!cluster_normal_stop_protocol_closed()
+		|| cluster_lms_normal_stop_idle() != CLUSTER_NORMAL_STOP_READY) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+		ereport(FATAL, (errmsg_internal("LMS transport still owns normal-stop work")));
+	}
+	lms_normal_stop_exit_verified = true;
+}
+
 void
 LmsMain(void)
 {
@@ -1008,6 +1110,8 @@ LmsMain(void)
 	Assert(IsUnderPostmaster);
 
 	MyBackendType = B_LMS;
+	lms_normal_stop_exit_verified = false;
+	before_shmem_exit(lms_normal_stop_exit_callback, 0);
 	init_ps_display(NULL);
 
 	/* Standard PG aux-process signal layout (modeled on cluster_lmon.c). */
@@ -1117,6 +1221,7 @@ LmsMain(void)
 
 	for (;;) {
 		long lms_wait_timeout_ms;
+		volatile bool work_completed = false;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -1131,25 +1236,28 @@ LmsMain(void)
 		if (ShutdownRequestPending || lms_shutdown_requested())
 			break;
 
-		pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
-		cluster_lms_native_probe_retry_tick();
-		/* PGRAC: spec-6.12b — construct parked CR-server requests (every
+		if (!cluster_normal_stop_service_enter())
+			ereport(FATAL, (errmsg_internal("LMS cannot enter normal-stop work segment")));
+		PG_TRY();
+		{
+			pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
+			cluster_lms_native_probe_retry_tick();
+			/* PGRAC: spec-6.12b — construct parked CR-server requests (every
 		 * failure becomes a DENIED result; LMS never exits over a serve). */
-		cluster_lms_cr_drain();
-		/* A process-local R4 origin context polls an exact asynchronous SCUR
+			cluster_lms_cr_drain();
+			/* A process-local R4 origin context polls an exact asynchronous SCUR
 		 * acquire/release.  Keep the ordinary 100ms idle sleep when no such
 		 * work exists, but do not multiply that sleep across an eight-slot
 		 * page census while the bounded context is genuinely pending. */
-		lms_wait_timeout_ms
-			= cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
-		(void)lms_r4_drain_ack_tick(cluster_lms_state, r4_worker_incarnation);
+			lms_wait_timeout_ms = cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
+			(void)lms_r4_drain_ack_tick(cluster_lms_state, r4_worker_incarnation);
 
-		/* PGRAC: spec-7.2 D2 — with a live DATA plane the wait moves into
+			/* PGRAC: spec-7.2 D2 — with a live DATA plane the wait moves into
 		 * the data-plane tick (WaitEventSet: DATA sockets + MyLatch, latch
 		 * reset inside);  the historic plain WaitLatch stays the fallback
 		 * when the plane is off. */
-		if (cluster_lms_data_plane_enabled()) {
-			/* PGRAC: spec-7.2 D4 — once the GCS block family flips to
+			if (cluster_lms_data_plane_enabled()) {
+				/* PGRAC: spec-7.2 D4 — once the GCS block family flips to
 			 * the DATA plane, LMS ships its own READY results and
 			 * drives the PI-discard notes (the LMON tick twins go
 			 * quiet via the same registry probe);  the DATA outbound
@@ -1170,22 +1278,37 @@ LmsMain(void)
 			 * Thaw wakes the latch and the held image legs resume
 			 * (pure-read probe, no-throw, per the write_fence_allowed
 			 * contract). */
-			if (cluster_gcs_block_family_on_data_plane()
-				&& !(cluster_write_fence_enforcing() && !cluster_write_fence_allowed())) {
-				cluster_lms_cr_ship_ready();
-				cluster_gcs_block_pi_discard_drain();
-			}
-			/* R10 C-intent: worker 0 performs the sole bounded semantic
+				if (cluster_gcs_block_family_on_data_plane()
+					&& !(cluster_write_fence_enforcing() && !cluster_write_fence_allowed())) {
+					cluster_lms_cr_ship_ready();
+					cluster_gcs_block_pi_discard_drain();
+				}
+				/* R10 C-intent: worker 0 performs the sole bounded semantic
 			 * scan and stages each found owner handle onto its tag shard's
 			 * DATA ring before the normal per-worker drain consumes it. */
-			(void)cluster_lms_outbound_resource_x_intent_pump();
-			(void)cluster_lms_outbound_drain_send(0); /* spec-7.3 D4: worker 0's ring */
-			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
+				(void)cluster_lms_outbound_resource_x_intent_pump();
+				(void)cluster_lms_outbound_drain_send(0); /* spec-7.3 D4: worker 0's ring */
+				/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by the dispatch handler (bounded, one
 			 * attempt each;  never waits on a pin). */
-			cluster_gcs_block_invalidate_park_tick();
+				cluster_gcs_block_invalidate_park_tick();
+			}
+			work_completed = true;
+		}
+		PG_FINALLY();
+		{
+			if (!work_completed)
+				LWLockReleaseAll();
+			(void)cluster_normal_stop_service_leave(work_completed);
+		}
+		PG_END_TRY();
+		if (cluster_lms_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
+			ereport(FATAL, (errmsg_internal("LMS failed normal-stop responsibility check")));
+		/* DATA tick owns separate management/dispatch brackets. Neither
+		 * its WaitEventSetWait nor this fallback may retain our active bit. */
+		if (cluster_lms_data_plane_enabled())
 			cluster_lms_data_plane_tick(lms_wait_timeout_ms);
-		} else {
+		else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 							lms_wait_timeout_ms, WAIT_EVENT_PG_SLEEP);
 			ResetLatch(MyLatch);
@@ -1193,6 +1316,7 @@ LmsMain(void)
 	}
 
 	/* PGRAC: spec-7.2 D2 — close DATA-plane fds before teardown. */
+	lms_normal_stop_before_exit();
 	cluster_lms_data_plane_shutdown();
 
 	/* PGRAC: spec-6.12b — retract the wake latch before teardown. */
@@ -1248,6 +1372,8 @@ LmsWorkerMain(int worker_id)
 	Assert(worker_id >= 1 && worker_id < CLUSTER_LMS_MAX_WORKERS);
 
 	MyBackendType = B_LMS_WORKER;
+	lms_normal_stop_exit_verified = false;
+	before_shmem_exit(lms_normal_stop_exit_callback, 0);
 	init_ps_display(NULL);
 
 	/* Standard PG aux-process signal layout (mirrors LmsMain). */
@@ -1304,7 +1430,8 @@ LmsWorkerMain(int worker_id)
 	 * proc_exit(0) completes cleanly.
 	 */
 	for (;;) {
-		long lms_wait_timeout_ms;
+		long lms_wait_timeout_ms = LMS_IDLE_TIMEOUT_MS;
+		volatile bool work_completed = false;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -1319,25 +1446,42 @@ LmsWorkerMain(int worker_id)
 		if (ShutdownRequestPending)
 			break;
 
-		if (cluster_lms_data_plane_enabled()) {
-			/* Current-MX proof requests are sharded by request identity.  The
+		if (!cluster_normal_stop_service_enter())
+			ereport(FATAL, (errmsg_internal("LMS worker cannot enter normal-stop work segment")));
+		PG_TRY();
+		{
+			if (cluster_lms_data_plane_enabled()) {
+				/* Current-MX proof requests are sharded by request identity.  The
 			 * origin FSM is process-local, so every DATA worker must advance
 			 * the contexts accepted on its own channel without blocking that
 			 * channel on SCUR acquisition or release. */
-			cluster_gcs_block_r4_tx_resolve_drain();
-			lms_wait_timeout_ms
-				= cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
-			/* spec-7.3 D4 — drain this worker's outbound ring (backends
+				cluster_gcs_block_r4_tx_resolve_drain();
+				lms_wait_timeout_ms
+					= cluster_gcs_block_r4_tx_resolve_wait_timeout(LMS_IDLE_TIMEOUT_MS);
+				/* spec-7.3 D4 — drain this worker's outbound ring (backends
 			 * staged REQUEST/FORWARD/INVALIDATE for our shard), then service
 			 * the mesh.  REPLY / INVALIDATE-ACK for blocks we received are
 			 * sent directly from the dispatch handler in THIS process, so
 			 * they already ride this worker's channel. */
-			(void)cluster_lms_outbound_drain_send(worker_id);
-			/* GCS serve-stall round-5 A2 — retry PINNED invalidate
+				(void)cluster_lms_outbound_drain_send(worker_id);
+				/* GCS serve-stall round-5 A2 — retry PINNED invalidate
 			 * directives parked by this worker's dispatch handler. */
-			cluster_gcs_block_invalidate_park_tick();
+				cluster_gcs_block_invalidate_park_tick();
+			}
+			work_completed = true;
+		}
+		PG_FINALLY();
+		{
+			if (!work_completed)
+				LWLockReleaseAll();
+			(void)cluster_normal_stop_service_leave(work_completed);
+		}
+		PG_END_TRY();
+		if (cluster_lms_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
+			ereport(FATAL, (errmsg_internal("LMS worker failed normal-stop responsibility check")));
+		if (cluster_lms_data_plane_enabled())
 			cluster_lms_data_plane_tick(lms_wait_timeout_ms);
-		} else {
+		else {
 			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 							LMS_IDLE_TIMEOUT_MS, WAIT_EVENT_PG_SLEEP);
 			ResetLatch(MyLatch);
@@ -1345,6 +1489,7 @@ LmsWorkerMain(int worker_id)
 	}
 
 	/* Close DATA-plane fds, then clear our pid slot before teardown. */
+	lms_normal_stop_before_exit();
 	cluster_lms_data_plane_shutdown();
 
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);
@@ -1763,6 +1908,88 @@ enum {
 static void native_probe_dispatch(uint32 slot_idx, uint64 probe_id);
 static void native_probe_aggregate(uint32 slot_idx, uint64 probe_id);
 static void native_probe_start_pending(void);
+
+ClusterNormalStopPollResult
+cluster_lms_native_probe_normal_stop_poll(int *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *reason = "NONE";
+	int observed_slot = -1;
+
+	if (slot_out != NULL)
+		*slot_out = -1;
+	if (reason_out != NULL)
+		*reason_out = "NONE";
+	if (!IsUnderPostmaster
+		|| (MyBackendType != B_LMS && MyBackendType != B_LMS_WORKER && MyBackendType != B_LMON)) {
+		reason = "NATIVE_PROBE_OWNER";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		goto done;
+	}
+	if (cluster_lms_state == NULL
+		|| pg_atomic_read_u64(&cluster_lms_state->native_probe_next_id) == 0) {
+		reason = "NATIVE_PROBE_UNINITIALIZED";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		goto done;
+	}
+	if (LWLockHeldByMe(&cluster_lms_state->lwlock)) {
+		reason = "NATIVE_PROBE_LOCK_HELD";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		goto done;
+	}
+	for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
+		if (LWLockHeldByMe(&cluster_lms_state->native_probe_slots[i].lock.lock)) {
+			reason = "NATIVE_PROBE_LOCK_HELD";
+			observed_slot = i;
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			goto done;
+		}
+	}
+	/* Preserve the allocator's pool -> slot order. The active fanout GUC
+	 * does not bound allocated/queued descriptors. No drain or wake here. */
+	LWLockAcquire(&cluster_lms_state->lwlock, LW_SHARED);
+	for (int i = 0; i < CLUSTER_LMS_NATIVE_LOCK_PROBE_MAX_SLOTS; i++) {
+		ClusterLmsNativeLockProbeSlot *slot = &cluster_lms_state->native_probe_slots[i];
+		const char *cause = NULL;
+		bool invalid = false;
+		uint64 phase;
+
+		LWLockAcquire(&slot->lock.lock, LW_SHARED);
+		phase = pg_atomic_read_u64(&slot->in_use);
+		if (phase > PROBE_COMPLETING) {
+			invalid = true;
+			cause = "NATIVE_PROBE_STATE";
+		} else if (phase == PROBE_FREE) {
+			/* Original release retains identity/result bytes, but withdraws
+			 * both ownership flags before publishing FREE. */
+			if (slot->grant_on_clear || slot->final_ready) {
+				invalid = true;
+				cause = "NATIVE_PROBE_FREE_RESIDUAL";
+			}
+		} else if (slot->probe_id == 0 || slot->final_status > CLUSTER_NATIVE_PROBE_FINAL_TIMEOUT
+				   || (slot->expected_replies_bitmap & ~UINT32_C(0xffff)) != 0
+				   || (slot->received_replies_bitmap & ~slot->expected_replies_bitmap) != 0) {
+			invalid = true;
+			cause = "NATIVE_PROBE_IDENTITY";
+		} else
+			cause = "NATIVE_PROBE_OWNED";
+		LWLockRelease(&slot->lock.lock);
+		if (cause != NULL && (invalid || result == CLUSTER_NORMAL_STOP_READY)) {
+			reason = cause;
+			observed_slot = i;
+			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+		}
+		if (invalid)
+			break;
+	}
+	LWLockRelease(&cluster_lms_state->lwlock);
+done:
+	if (slot_out != NULL)
+		*slot_out = observed_slot;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
 
 static void
 native_probe_copy_work(ClusterLmsNativeLockProbeSlot *dest,
@@ -2283,6 +2510,10 @@ cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lock
 
 	if (cluster_lms_state == NULL || resid == NULL || requester == NULL
 		|| !cluster_lms_native_probe_required(resid, lockmode))
+		return false;
+	/* New service-side probe context, not an already admitted retry. The
+	 * frontend wait shares the allocator and must finish before its own cut. */
+	if (!cluster_normal_stop_service_new_work(false))
 		return false;
 	memset(&work, 0, sizeof(work));
 	cluster_grd_resid_decode(resid, &work.locktag);

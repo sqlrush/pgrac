@@ -69,6 +69,10 @@
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
+#include "cluster/cluster_clean_leave.h"
+/* Include the unchanged production translation unit so malformed private
+ * owner shapes can be checked without adding a runtime mutation API. */
+#include "../../backend/cluster/cluster_ic_tier1.c"
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf and we don't rely on pg_printf in this binary. */
@@ -83,6 +87,8 @@ UT_DEFINE_GLOBALS();
  * ============================================================ */
 
 int cluster_node_id = 0;
+bool IsUnderPostmaster = true;
+AuxProcType MyAuxProcType = LmonProcess;
 static uint32 ut_wait_event_info_storage = 0;
 uint32 *my_wait_event_info = &ut_wait_event_info_storage;
 
@@ -507,6 +513,23 @@ static char ut_acc[64 * 1024 * 1024]; /* shared stream accumulator */
 static long ut_junk_a = 0;			  /* junk bytes written ahead of frame A / frame B */
 static long ut_junk_b = 0;
 
+static ClusterNormalStopPollResult
+ut_stop_poll(void)
+{
+	int peer = -1;
+	const char *reason = NULL;
+	return cluster_ic_tier1_normal_stop_poll(&peer, &reason);
+}
+
+UT_TEST(test_stop_poll_requires_initialized_actual_plane_owner)
+{
+	int peer = -1;
+	const char *reason = NULL;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(cluster_ic_tier1_normal_stop_poll(NULL, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(cluster_ic_tier1_normal_stop_poll(&peer, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
 UT_TEST(test_connect_registers_peer_fd)
 {
 	int listener;
@@ -763,6 +786,7 @@ UT_TEST(test_second_frame_survives_backpressure)
 	 * transport owns a copy) — never silently dropped. */
 	rc = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame_e, sizeof(frame_e));
 	UT_ASSERT(rc == CLUSTER_IC_SEND_WOULD_BLOCK);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
 
 	got = ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, (long)sizeof(ut_acc));
 	UT_ASSERT(got >= 12288);
@@ -776,6 +800,7 @@ UT_TEST(test_second_frame_survives_backpressure)
 			e_run++;
 	UT_ASSERT_EQ(d_run, 8192);
 	UT_ASSERT_EQ(e_run, 4096);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
 }
 
 /*
@@ -939,6 +964,7 @@ UT_TEST(test_fifo_full_refuses_honestly)
 	}
 	UT_ASSERT_EQ((long)(cluster_ic_tier1_get_fifo_admitted(CLUSTER_IC_PLANE_CONTROL) - admitted0),
 				 2048L);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
 
 	/* One more must be REFUSED — loudly, with the counter moving. */
 	rc = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame_x, sizeof(frame_x));
@@ -989,11 +1015,131 @@ UT_TEST(test_close_peer_clears_fifo)
 		(long)(cluster_ic_tier1_get_fifo_dropped_close(CLUSTER_IC_PLANE_CONTROL) - dropped0), 2L);
 }
 
+UT_TEST(test_stop_poll_owner_channel_and_idle_capacity)
+{
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	MyAuxProcType = LmsProcess;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	cluster_ic_tier1_set_my_data_channel(0, 8);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = LmsWorker7Process;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	cluster_ic_tier1_set_my_data_channel(7, 8);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyAuxProcType = LmonProcess;
+	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+}
+
+/* Consume only bytes actually sent through the existing nonblocking receive
+ * path; no test mutation establishes the positive half-frame state. */
+static void
+ut_send_receive_slice(const void *bytes, size_t length)
+{
+	fd_set rfds;
+	struct timeval tv = { 5, 0 };
+	UT_ASSERT_EQ(send(ut_rx_fd, bytes, length, 0), (ssize_t)length);
+	FD_ZERO(&rfds);
+	FD_SET(ut_tx_fd, &rfds);
+	UT_ASSERT_EQ(select(ut_tx_fd + 1, &rfds, NULL, NULL, &tv), 1);
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+}
+
+UT_TEST(test_stop_poll_real_partial_envelope_and_payload)
+{
+	ClusterICEnvelope env = { 0 };
+	char payload[9] = "payload";
+	int before = ut_dispatch_count;
+
+	env.source_node_id = UT_PEER_ID;
+	env.dest_node_id = cluster_node_id;
+	env.msg_type = 31;
+	env.payload_length = sizeof(payload);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+	ut_send_receive_slice(&env, 7);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(tier1_recv_buf_len[UT_PEER_ID], 7);
+	ut_send_receive_slice((char *)&env + 7, sizeof(env) - 7);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(tier1_recv_phase[UT_PEER_ID], 1);
+	ut_send_receive_slice(payload, 3);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(tier1_recv_payload_filled[UT_PEER_ID], 3);
+	ut_send_receive_slice(payload + 3, sizeof(payload) - 3);
+	UT_ASSERT_EQ(ut_dispatch_count, before + 1);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+	/* Capacity is reusable memory, not outstanding work. */
+	UT_ASSERT(tier1_recv_payload_buf_dyn_capacity[UT_PEER_ID] >= sizeof(payload));
+
+	env.payload_length = 0;
+	env.msg_type = PGRAC_IC_MSG_HEARTBEAT;
+	ut_send_receive_slice(&env, 1);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	ut_send_receive_slice((char *)&env + 1, sizeof(env) - 1);
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_poll_malformed_state_overrides_earlier_pending)
+{
+	int peer = -1;
+	const char *reason = NULL;
+	int saved;
+	Tier1OutboundFrame *frame = palloc(sizeof(*frame) + 1);
+
+	/* An unclassified incoming HELLO remains work without using its slot
+	 * as an authenticated peer identity. */
+	tier1_anon_hello_len[2] = 1;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	tier1_outbound_remaining[7] = 1;
+	UT_ASSERT_EQ(cluster_ic_tier1_normal_stop_poll(&peer, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(peer, 7);
+	UT_ASSERT_EQ(tier1_outbound_remaining[7], 1);
+	tier1_outbound_remaining[7] = 0;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	tier1_anon_hello_len[2] = 0;
+
+	/* Head/count/tail/bytes must describe the same bounded chain. */
+	frame->len = 1;
+	frame->next = frame;
+	tier1_outbound_fifo_head[UT_PEER_ID] = frame;
+	tier1_outbound_fifo_tail[UT_PEER_ID] = frame;
+	tier1_outbound_fifo_frames[UT_PEER_ID] = 1;
+	tier1_outbound_fifo_bytes[UT_PEER_ID] = 1;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(frame->next == frame);
+	frame->next = NULL;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_PENDING);
+	tier1_outbound_fifo_bytes[UT_PEER_ID] = 2;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	tier1_outbound_fifo_bytes[UT_PEER_ID] = 1;
+	tier1_outbound_fifo_tail[UT_PEER_ID] = NULL;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	tier1_outbound_fifo_head[UT_PEER_ID] = NULL;
+	tier1_outbound_fifo_frames[UT_PEER_ID] = 0;
+	tier1_outbound_fifo_bytes[UT_PEER_ID] = 0;
+	pfree(frame);
+
+	saved = tier1_recv_payload_total[UT_PEER_ID];
+	tier1_recv_payload_total[UT_PEER_ID] = 1; /* phase 0 with payload debt */
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	tier1_recv_payload_total[UT_PEER_ID] = saved;
+	tier1_hello_send_remaining[7] = PGRAC_IC_HELLO_BYTES + 1;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_INVALID);
+	tier1_hello_send_remaining[7] = 0;
+	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(19);
 
+	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
 	UT_RUN(test_initial_eagain_queues_full_frame);
 	UT_RUN(test_drain_delivers_frame_a_intact);
@@ -1004,11 +1150,14 @@ main(void)
 	UT_RUN(test_drain_on_dead_peer_hard_errors);
 	UT_RUN(test_reconnect_after_close);
 	UT_RUN(test_recv_drain_yields_after_bounded_frames);
+	UT_RUN(test_stop_poll_real_partial_envelope_and_payload);
+	UT_RUN(test_stop_poll_malformed_state_overrides_earlier_pending);
 	UT_RUN(test_second_frame_survives_backpressure);
 	UT_RUN(test_fifo_preserves_multi_frame_order);
 	UT_RUN(test_backpressured_peer_does_not_block_other_peer);
 	UT_RUN(test_fifo_full_refuses_honestly);
 	UT_RUN(test_close_peer_clears_fifo);
+	UT_RUN(test_stop_poll_owner_channel_and_idle_capacity);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

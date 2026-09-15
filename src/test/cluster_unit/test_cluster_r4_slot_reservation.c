@@ -11,6 +11,7 @@
 #include "access/htup_details.h"
 
 #include "cluster/cluster_cr.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_r4_observe.h"
@@ -99,6 +100,19 @@ typedef struct UtClusterCrServerShared {
 } UtClusterCrServerShared;
 
 int MyProcPid = 4242;
+bool IsUnderPostmaster = true;
+static bool ut_stop_poll_during_forget;
+static bool ut_stop_new_work_allowed = true;
+static int ut_stop_new_work_calls;
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	UT_ASSERT(!modifies_data);
+	ut_stop_new_work_calls++;
+	return ut_stop_new_work_allowed;
+}
+
 int cluster_node_id = UT_HOLDER_NODE;
 BackendType MyBackendType = B_LMS;
 sigjmp_buf *PG_exception_stack = NULL;
@@ -451,6 +465,15 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 void
 cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation)
 {
+	if (ut_stop_poll_during_forget) {
+		int observed_slot;
+		const char *reason;
+
+		UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&observed_slot, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(observed_slot, slot_index);
+		UT_ASSERT_EQ(strcmp(reason, "CR_CONTEXT_OWNED"), 0);
+	}
 	ut_forget_calls++;
 	ut_forget_slot_index = slot_index;
 	ut_forget_slot_generation = slot_generation;
@@ -846,6 +869,8 @@ LWLockRelease(LWLock *lock)
 static void
 reset_fixture(ClusterLmsSharedState *state, ClusterLmsCrSlot *slot)
 {
+	ut_stop_new_work_allowed = true;
+	ut_stop_new_work_calls = 0;
 	memset(state, 0, sizeof(*state));
 	memset(slot, 0, sizeof(*slot));
 	pg_atomic_init_u32(&slot->state, CLUSTER_LMS_CR_FREE);
@@ -941,6 +966,9 @@ submit_test_admission(void)
 static void
 reset_submit_fixture(ClusterLmsSharedState *state)
 {
+	ut_stop_new_work_allowed = true;
+	ut_stop_new_work_calls = 0;
+	ut_stop_poll_during_forget = false;
 	memset(state, 0, sizeof(*state));
 	memset(&ut_cr_server_shared, 0, sizeof(ut_cr_server_shared));
 	memset(&ut_lms_latch, 0, sizeof(ut_lms_latch));
@@ -3231,10 +3259,144 @@ UT_TEST(test_r4_protocol_detail_budget_never_changes_terminal)
 	UT_ASSERT_EQ(ut_protocol_logs, 0);
 }
 
+UT_TEST(test_normal_stop_cr_requires_initialized_actual_owner)
+{
+	ClusterLmsSharedState state;
+	const char *reason;
+	int slot;
+
+	/* This test runs before any fixture attaches the production pointer. */
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&slot, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(strcmp(reason, "CR_UNINITIALIZED"), 0);
+	reset_submit_fixture(&state);
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&slot, &reason), CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&slot, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&slot, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	MyBackendType = B_LMS;
+}
+
+UT_TEST(test_normal_stop_cr_all_owned_states_not_recovery_drain)
+{
+	ClusterLmsSharedState state;
+	UtClusterCrServerShared before;
+	const char *reason;
+	int slot;
+
+	reset_submit_fixture(&state);
+	for (uint32 phase = CLUSTER_LMS_CR_PENDING; phase <= CLUSTER_LMS_CR_R4_RECLAIMING; phase++) {
+		pg_atomic_write_u32(&ut_cr_server_shared.slots[0].state, phase);
+		memcpy(&before, &ut_cr_server_shared, sizeof(before));
+		UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&slot, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(slot, 0);
+		UT_ASSERT_EQ(strcmp(reason, "CR_SLOT_OWNED"), 0);
+		UT_ASSERT_EQ(memcmp(&before, &ut_cr_server_shared, sizeof(before)), 0);
+	}
+	/* The old recovery predicate explicitly accepts RECLAIMING. */
+	UT_ASSERT(cluster_cr_server_r4_worker0_drained());
+	pg_atomic_write_u32(&ut_cr_server_shared.slots[3].state, UINT32_MAX);
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&slot, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(slot, 3);
+	UT_ASSERT_EQ(strcmp(reason, "CR_SLOT_STATE"), 0);
+}
+
+UT_TEST(test_normal_stop_cr_original_terminal_must_release_local_context)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot *slot = prepare_worker0_claim(&state);
+	const char *reason;
+	int index;
+
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&index, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	/* A final seal forbids a new context, not this admitted completion. */
+	ut_stop_new_work_allowed = false;
+	ut_stop_new_work_calls = 0;
+	UT_ASSERT(cluster_cr_server_test_r4_claim_queued(0));
+	UT_ASSERT(cluster_cr_server_test_r4_build_step(0));
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&index, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	ut_stop_poll_during_forget = true;
+	UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
+	ut_stop_poll_during_forget = false;
+	UT_ASSERT_EQ(ut_forget_calls, 1);
+	UT_ASSERT_EQ(ut_leave_calls, 1);
+	UT_ASSERT(slot_is_canonical_free_with_generation(slot, 1));
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&index, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ut_stop_new_work_calls, 0);
+	/* A lawful new reservation reopens debt; no cached READY. */
+	ut_stop_new_work_allowed = true;
+	ut_watch_submit_lock = false;
+	UT_ASSERT(cluster_cr_server_test_reserve_legacy_slot(slot, CLUSTER_LMS_CR_FILLING));
+	UT_ASSERT_EQ(cluster_cr_server_normal_stop_poll(&index, &reason), CLUSTER_NORMAL_STOP_PENDING);
+}
+
+UT_TEST(test_normal_stop_cr_legacy_seal_precedes_owner_mutation)
+{
+	ClusterLmsSharedState state;
+	ClusterLmsCrSlot slot, before;
+
+	reset_fixture(&state, &slot);
+	dirty_owner_stamp(&slot);
+	slot.r4.slot_generation = 19;
+	memcpy(&before, &slot, sizeof(before));
+	ut_stop_new_work_allowed = false;
+	UT_ASSERT(!cluster_cr_server_test_reserve_legacy_slot(&slot, CLUSTER_LMS_CR_PENDING));
+	UT_ASSERT_EQ(ut_stop_new_work_calls, 1);
+	UT_ASSERT_EQ(memcmp(&slot, &before, sizeof(slot)), 0);
+	UT_ASSERT_EQ(ut_lock_acquire_count, ut_lock_release_count);
+
+	/* A busy slot remains its original owner's responsibility, not a new one. */
+	pg_atomic_write_u32(&slot.state, CLUSTER_LMS_CR_FILLING);
+	memcpy(&before, &slot, sizeof(before));
+	ut_stop_new_work_calls = 0;
+	UT_ASSERT(!cluster_cr_server_test_reserve_legacy_slot(&slot, CLUSTER_LMS_CR_PENDING));
+	UT_ASSERT_EQ(ut_stop_new_work_calls, 0);
+	UT_ASSERT_EQ(memcmp(&slot, &before, sizeof(slot)), 0);
+}
+
+UT_TEST(test_normal_stop_cr_r4_seal_precedes_reservation_and_copy)
+{
+	ClusterLmsSharedState state;
+	ClusterR4CrForwardPayload forward = submit_test_forward96();
+	ClusterSemanticAdmissionToken admission = submit_test_admission();
+	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
+	UtClusterCrServerShared before;
+
+	reset_submit_fixture(&state);
+	memcpy(&before, &ut_cr_server_shared, sizeof(before));
+	ut_stop_new_work_allowed = false;
+	UT_ASSERT_EQ(cluster_lms_cr_submit_r4(&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
+										  UT_MASTER_CAPABILITY_GENERATION, &reason),
+				 CLUSTER_CR_BUILD_FAIL_CLOSED);
+	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
+	UT_ASSERT_EQ(ut_stop_new_work_calls, 1);
+	UT_ASSERT_EQ(ut_copy_calls, 0);
+	UT_ASSERT_EQ(ut_wake_calls, 0);
+	UT_ASSERT_EQ(memcmp(&ut_cr_server_shared, &before, sizeof(before)), 0);
+	UT_ASSERT(admission.entered);
+	UT_ASSERT_EQ(ut_lock_acquire_count, ut_lock_release_count);
+
+	/* Invalid identity still refuses at its original boundary, before the seal. */
+	ut_stop_new_work_calls = 0;
+	forward.base.request_id = 0;
+	UT_ASSERT_EQ(cluster_lms_cr_submit_r4(&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
+										  UT_MASTER_CAPABILITY_GENERATION, &reason),
+				 CLUSTER_CR_BUILD_FAIL_CLOSED);
+	UT_ASSERT_EQ(ut_stop_new_work_calls, 0);
+	UT_ASSERT_EQ(memcmp(&ut_cr_server_shared, &before, sizeof(before)), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(47);
+	UT_PLAN(52);
+	UT_RUN(test_normal_stop_cr_requires_initialized_actual_owner);
+	UT_RUN(test_normal_stop_cr_all_owned_states_not_recovery_drain);
+	UT_RUN(test_normal_stop_cr_original_terminal_must_release_local_context);
+	UT_RUN(test_normal_stop_cr_legacy_seal_precedes_owner_mutation);
+	UT_RUN(test_normal_stop_cr_r4_seal_precedes_reservation_and_copy);
 	UT_RUN(test_foreign_undo_cold_holder_reaches_origin_without_resident_header);
 	UT_RUN(test_cold_foreign_landing_freezes_only_the_validated_dependency);
 	UT_RUN(test_r4_protocol_detail_distinguishes_actual_request_and_send_failures);

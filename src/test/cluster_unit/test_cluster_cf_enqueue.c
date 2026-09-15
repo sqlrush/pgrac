@@ -34,6 +34,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_sequence.h"
@@ -51,6 +52,16 @@
 UT_DEFINE_GLOBALS();
 
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+BackendType MyBackendType = B_INVALID;
+static ClusterNormalStopPollResult g_shared_stop_result = CLUSTER_NORMAL_STOP_READY;
+ClusterNormalStopPollResult
+cluster_cf_normal_stop_shared_poll(bool post_checkpoint, const char **reason)
+{
+	(void)post_checkpoint;
+	if (reason)
+		*reason = "FIXTURE_CF_SHARED";
+	return g_shared_stop_result;
+}
 bool cluster_controlfile_shared_authority = false;
 int cluster_node_id = 0;
 char *cluster_config_file = NULL;
@@ -580,10 +591,67 @@ UT_TEST(test_lock_timeout_and_wait_event)
 	UT_ASSERT_EQ(g_last_wait_event, (uint32)WAIT_EVENT_CLUSTER_CF_ENQUEUE);
 }
 
+UT_TEST(test_stop_cf_original_holds_and_confirmed_retirement)
+{
+	const char *reason;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	cluster_cf_set_bootstrap_authority(false);
+	cluster_cf_set_write_skip(false);
+	cluster_cf_owner_eor_abort();
+	g_shared_stop_result = CLUSTER_NORMAL_STOP_READY;
+	g_seven_result = g_s5_result = g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_READY);
+	for (int i = 0; i < 2; i++) {
+		LOCKMODE mode = i ? ExclusiveLock : ShareLock;
+		int releases;
+		UT_ASSERT(cluster_cf_lock(mode));
+		releases = g_s6_count;
+		UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(g_s6_count, releases);
+		UT_ASSERT(cluster_cf_held(mode));
+		g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+		UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_UNCONFIRMED);
+		UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_PENDING);
+		g_shared_stop_result = CLUSTER_NORMAL_STOP_INVALID;
+		UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_INVALID);
+		g_shared_stop_result = CLUSTER_NORMAL_STOP_READY;
+		g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_READY);
+	}
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyBackendType = B_BACKEND;
+	MyAuxProcType = NotAnAuxProcess;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_INVALID);
+}
+
+UT_TEST(test_stop_cf_separates_old_skip_from_post_checkpoint_permission)
+{
+	const char *reason;
+	IsUnderPostmaster = true;
+	MyAuxProcType = CheckpointerProcess;
+	cluster_cf_set_write_skip(true); /* previous EOR's scoped value */
+	UT_ASSERT_EQ(cluster_cf_normal_stop_poll(false, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "CF_POST_CHECKPOINT_WRITE_SKIP") == 0);
+	UT_ASSERT(cluster_cf_write_skip());
+	/* The original next normal checkpoint, not the observer, clears it. */
+	cluster_cf_set_write_skip(false);
+	UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_READY);
+	cluster_cf_set_bootstrap_authority(true);
+	UT_ASSERT_EQ(cluster_cf_normal_stop_poll(false, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(cluster_cf_in_bootstrap_window());
+	cluster_cf_set_bootstrap_authority(false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -597,6 +665,8 @@ main(void)
 	UT_RUN(test_lock_s5_fail);
 	UT_RUN(test_lock_notavail);
 	UT_RUN(test_lock_timeout_and_wait_event);
+	UT_RUN(test_stop_cf_original_holds_and_confirmed_retirement);
+	UT_RUN(test_stop_cf_separates_old_skip_from_post_checkpoint_permission);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

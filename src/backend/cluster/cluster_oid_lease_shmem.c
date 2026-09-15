@@ -32,6 +32,7 @@
 #include "postgres.h"
 
 #include "miscadmin.h" /* IsUnderPostmaster */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_oid_lease.h"
@@ -70,6 +71,34 @@ typedef struct OidLeaseXHold {
 } OidLeaseXHold;
 
 static OidLeaseXHold oid_x_hold;
+
+ClusterNormalStopPollResult
+cluster_oid_lease_normal_stop_poll(const char **reason_out)
+{
+	bool pending;
+	const char *reason = "OID_STOP_READY";
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+
+	/* The original shared claim spans GES and durable authority advancement.
+	 * Already granted, unused OIDs are not work. This observer neither returns
+	 * them to the authority nor signs another backend's private lock record. */
+	if (!IsUnderPostmaster || (MyBackendType != B_CHECKPOINTER && MyBackendType != B_LMON)
+		|| oid_state == NULL) {
+		reason = "OID_STOP_OWNER_OR_SHMEM";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+	} else {
+		LWLockAcquire(&oid_state->lwlock, LW_SHARED);
+		pending = oid_state->refill_in_progress;
+		LWLockRelease(&oid_state->lwlock);
+		if (pending || oid_x_hold.held) {
+			reason = "OID_REFILL_IN_PROGRESS";
+			result = CLUSTER_NORMAL_STOP_PENDING;
+		}
+	}
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
 
 /* ---- shmem region wiring ---------------------------------------------- */
 

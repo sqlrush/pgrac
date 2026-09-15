@@ -72,6 +72,7 @@
 #include "pgstat.h"			  /* pgstat_report_wait_start/end */
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_epoch.h" /* PGRAC: spec-7.2 D2 HELLO conn_epoch +
 									* caps-reply epoch recheck (spec-2.2
@@ -359,6 +360,127 @@ static uint8 *tier1_recv_payload_buf_dyn[CLUSTER_MAX_NODES];
 static int tier1_recv_payload_buf_dyn_capacity[CLUSTER_MAX_NODES];
 static int tier1_recv_payload_total[CLUSTER_MAX_NODES];
 static int tier1_recv_payload_filled[CLUSTER_MAX_NODES];
+
+ClusterNormalStopPollResult
+cluster_ic_tier1_normal_stop_poll(int *peer_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	int worker = AmLmsProcess()
+					 ? 0
+					 : (AmLmsWorkerProcess() ? ClusterLmsWorkerIdForType(MyAuxProcType) : -1);
+	int peer;
+
+	if (peer_out == NULL || reason_out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*peer_out = -1;
+	*reason_out = "NONE";
+	if (!IsUnderPostmaster
+		|| (AmLmonProcess() ? tier1_my_plane != CLUSTER_IC_PLANE_CONTROL
+							: (worker < 0 || tier1_my_plane != CLUSTER_IC_PLANE_DATA
+							   || tier1_my_data_channel != worker || tier1_my_n_workers <= worker
+							   || tier1_my_n_workers > CLUSTER_IC_TIER1_DATA_CHANNELS))) {
+		*reason_out = "NOT_TRANSPORT_PLANE_OWNER";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	if (!tier1_peer_fds_initialised || Tier1Shmem == NULL
+		|| Tier1Shmem != Tier1ShmemSlots[tier1_slot_of(tier1_my_plane, tier1_my_data_channel)]
+		|| Tier1Shmem->magic != PGRAC_IC_TIER1_SHMEM_MAGIC) {
+		*reason_out = "TRANSPORT_NOT_INITIALIZED";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		int remaining = tier1_outbound_remaining[peer];
+		int total = tier1_outbound_queued_total[peer];
+		int capacity = tier1_outbound_buf_dyn_size[peer];
+		int frames = tier1_outbound_fifo_frames[peer];
+		Size bytes = tier1_outbound_fifo_bytes[peer];
+		const Tier1OutboundFrame *frame = tier1_outbound_fifo_head[peer];
+		const Tier1OutboundFrame *last = NULL;
+		Size counted_bytes = 0;
+		int counted = 0;
+		int recv_len = tier1_recv_buf_len[peer];
+		int payload_total = tier1_recv_payload_total[peer];
+		int payload_filled = tier1_recv_payload_filled[peer];
+		int payload_capacity = tier1_recv_payload_buf_dyn_capacity[peer];
+		const char *invalid = NULL;
+		const char *pending = NULL;
+
+		if (remaining < 0 || total < remaining || total > capacity || capacity < 0
+			|| (remaining == 0 && total != 0)
+			|| (capacity == 0) != (tier1_outbound_buf_dyn[peer] == NULL))
+			invalid = "SEND_TAIL_INVALID";
+		else if (frames < 0 || frames > PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_FRAMES
+				 || bytes > PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_BYTES
+				 || (frames == 0) != (frame == NULL)
+				 || (frames == 0) != (tier1_outbound_fifo_tail[peer] == NULL))
+			invalid = "SEND_FIFO_INVALID";
+		else {
+			/* Bounded traversal also rejects cycles/count drift. Never free or
+			 * promote a frame here, and never substitute diagnostic counters. */
+			while (frame != NULL && counted < frames) {
+				if (frame->len <= 0
+					|| (Size)frame->len > PGRAC_IC_TIER1_OUTBOUND_FIFO_MAX_BYTES - counted_bytes) {
+					invalid = "SEND_FIFO_LENGTH_INVALID";
+					break;
+				}
+				counted_bytes += frame->len;
+				counted++;
+				last = frame;
+				frame = frame->next;
+			}
+			if (invalid == NULL
+				&& (frame != NULL || counted != frames || counted_bytes != bytes
+					|| last != tier1_outbound_fifo_tail[peer]))
+				invalid = "SEND_FIFO_CHAIN_INVALID";
+		}
+		if (invalid == NULL
+			&& (recv_len < 0 || recv_len > PGRAC_IC_ENVELOPE_BYTES || payload_total < 0
+				|| payload_filled < 0 || payload_filled > payload_total || payload_capacity < 0
+				|| payload_capacity > PGRAC_IC_PAYLOAD_MAX || payload_total > payload_capacity
+				|| (payload_capacity == 0) != (tier1_recv_payload_buf_dyn[peer] == NULL)
+				|| (tier1_recv_phase[peer] == 0 ? payload_total != 0
+												: (tier1_recv_phase[peer] != 1 || payload_total == 0
+												   || recv_len != PGRAC_IC_ENVELOPE_BYTES))))
+			invalid = "RECV_STATE_INVALID";
+		if (invalid == NULL && tier1_recv_phase[peer] == 1) {
+			ClusterICEnvelope env;
+			memcpy(&env, tier1_recv_buf[peer], sizeof(env));
+			if (env.payload_length != (uint32)payload_total)
+				invalid = "RECV_PAYLOAD_LENGTH_INVALID";
+		}
+		if (invalid == NULL
+			&& (tier1_hello_send_remaining[peer] < 0
+				|| tier1_hello_send_remaining[peer] > PGRAC_IC_HELLO_BYTES
+				|| tier1_anon_hello_len[peer] < 0
+				|| tier1_anon_hello_len[peer] > PGRAC_IC_HELLO_BYTES))
+			invalid = "HELLO_STATE_INVALID";
+		if (invalid == NULL && tier1_peer_fds[peer] < 0
+			&& (remaining != 0 || frames != 0 || recv_len != 0
+				|| tier1_hello_send_remaining[peer] != 0))
+			invalid = "OWNER_BYTES_WITHOUT_CONNECTION";
+		if (invalid != NULL) {
+			*peer_out = peer;
+			*reason_out = invalid;
+			return CLUSTER_NORMAL_STOP_INVALID;
+		}
+		if (remaining != 0)
+			pending = "SEND_TAIL";
+		else if (frames != 0)
+			pending = "SEND_FIFO";
+		else if (recv_len != 0 || tier1_recv_phase[peer] != 0)
+			pending = "RECV_FRAME";
+		else if (tier1_hello_send_remaining[peer] != 0 || tier1_anon_hello_len[peer] != 0)
+			pending = "HELLO_PARTIAL";
+		if (pending != NULL && result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			*peer_out = peer;
+			*reason_out = pending;
+		}
+	}
+	/* Idle connections and unused buffer capacity remain open. Chunk state,
+	 * RDMA completions and caller-local batches have separate owning polls. */
+	return result;
+}
 
 
 /* ============================================================

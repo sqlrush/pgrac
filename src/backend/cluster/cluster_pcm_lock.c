@@ -38,6 +38,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xlogdefs.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_grd.h" /* PGRAC: spec-2.30 D1 — ClusterGrdHolderId 24B */
 #include "cluster/cluster_guc.h" /* PGRAC: spec-2.30 D3 — cluster_node_id */
 #include "cluster/cluster_gcs.h" /* PGRAC: spec-2.32 D5 — master lookup + send_transition_and_wait */
@@ -9092,6 +9093,313 @@ cluster_pcm_grd_lifecycle_stats_snapshot(PcmGrdLifecycleStats *out)
 }
 
 
+static bool pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out,
+												 bool *retained_out);
+
+static void
+pcm_normal_stop_note_held_lock(LWLock *lock pg_attribute_unused(),
+							   LWLockMode mode pg_attribute_unused(), void *context)
+{
+	*(bool *)context = true;
+}
+
+ClusterNormalStopPollResult
+cluster_pcm_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, uint32 *slot_out,
+							 const char **reason_out)
+{
+	static const ClusterPcmResourceXSlot empty_slot;
+	static const ClusterPcmResourceXMasterState empty_state;
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	BufferTag observed = { 0 };
+	uint32 observed_slot = PG_UINT32_MAX;
+	const char *reason = "NONE";
+	HASH_SEQ_STATUS scan;
+	struct GrdEntry *entry;
+	bool held_lock = false;
+	uint32 gate;
+
+	if (!IsUnderPostmaster || !cluster_enabled || ClusterPcm == NULL || cluster_pcm_htab == NULL
+		|| cluster_pcm_resource_x_slots == NULL || cluster_pcm_resource_x_master_states == NULL
+		|| pcm_grd_effective <= 0) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "PCM_UNINITIALIZED";
+		goto done;
+	}
+	/* Even an already-held entry lock must be refused before taking the
+	 * directory S lock: retirement takes directory X -> entry X. This
+	 * observer belongs at a module-free controller/actor boundary. */
+	ForEachLWLockHeldByMe(pcm_normal_stop_note_held_lock, &held_lock);
+	if (held_lock) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "PCM_CALLER_LOCK_HELD";
+		goto done;
+	}
+	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
+	gate = pg_atomic_read_u32(&ClusterPcm->resource_x_gate_phase);
+	if (gate > RESOURCE_X_GATE_FROZEN
+		|| pg_atomic_read_u32(&ClusterPcm->resource_x_intent_generation_exhausted) != 0) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "PCM_PROTOCOL_BLOCKED";
+	} else if (gate != RESOURCE_X_GATE_OPEN
+			   || pg_atomic_read_u64(&ClusterPcm->resource_x_activation_inflight_count) != 0) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		reason = "PCM_ACTIVATION_OWNED";
+	}
+	hash_seq_init(&scan, cluster_pcm_htab);
+	while ((entry = (struct GrdEntry *)hash_seq_search(&scan)) != NULL) {
+		ClusterNormalStopPollResult current = CLUSTER_NORMAL_STOP_READY;
+		const char *current_reason = "NONE";
+		uint32 pins, waits, transport, mode, s_holders, pi_holders;
+		bool active, retained;
+		bool valid;
+
+		/* Directory S keeps this original entry and its sidecar alive,
+		 * without creating a lookup pin or invoking a retire path. */
+		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained);
+		if (!valid || entry->binding_generation == 0 || entry->binding_generation == UINT64_MAX
+			|| entry->resource_x_bootstrap_round.phase
+				   == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
+			current = CLUSTER_NORMAL_STOP_INVALID;
+			current_reason = "PCM_PROTOCOL_INVALID";
+		} else if (active || retained
+				   || entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+			current = CLUSTER_NORMAL_STOP_PENDING;
+			current_reason = "PCM_PROTOCOL_OWNED";
+		}
+		pins = pg_atomic_read_u32(&entry->pin_count);
+		waits = pg_atomic_read_u32(&entry->wait_refcount);
+		transport = pg_atomic_read_u32(&entry->transport_refcount);
+		mode = pg_atomic_read_u32(&entry->master_state);
+		s_holders = pg_atomic_read_u32(&entry->s_holders_bitmap);
+		pi_holders = pg_atomic_read_u32(&entry->pi_holders_bitmap);
+		if (pins == PG_UINT32_MAX || waits == PG_UINT32_MAX || transport == PG_UINT32_MAX
+			|| mode > PCM_STATE_X || ((uint64)s_holders >> RESOURCE_X_PROTOCOL_NODE_LIMIT) != 0
+			|| ((uint64)pi_holders >> RESOURCE_X_PROTOCOL_NODE_LIMIT) != 0
+			|| entry->x_holder_node < -1 || entry->x_holder_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+			|| (mode == PCM_STATE_X && (entry->x_holder_node == -1 || s_holders != 0))
+			|| (mode != PCM_STATE_X && entry->x_holder_node != -1)
+			|| (mode == PCM_STATE_N && s_holders != 0) || (mode == PCM_STATE_S && s_holders == 0)
+			|| (mode == PCM_STATE_N
+				&& entry->master_holder.node_id != INVALID_PCM_MASTER_HOLDER_NODE)
+			|| (mode == PCM_STATE_S
+				&& (entry->master_holder.node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+					|| (s_holders & (UINT32_C(1) << entry->master_holder.node_id)) == 0))
+			|| (mode == PCM_STATE_X && entry->master_holder.node_id != (uint32)entry->x_holder_node)
+			|| (entry->s_holder_refcount_local != 0
+				&& (mode != PCM_STATE_S || cluster_node_id < 0
+					|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+					|| (s_holders & (UINT32_C(1) << cluster_node_id)) == 0))
+			|| entry->pending_x_requester_node < -1
+			|| entry->pending_x_requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+			|| (entry->pending_x_requester_node == -1 && entry->pending_x_since_lsn != 0)) {
+			current = CLUSTER_NORMAL_STOP_INVALID;
+			current_reason = "PCM_DIRECTORY_SHAPE_INVALID";
+		} else if (current == CLUSTER_NORMAL_STOP_READY
+				   && (pins != 0 || waits != 0 || transport != 0)) {
+			/* S declarations survive content unlock as cache residency, not
+			 * as live entry/buffer pins. Preserve that valid cached cover just
+			 * as for terminal cached-X; the independent bufmgr and service
+			 * cuts still exclude readers, I/O and in-flight work. Never clear
+			 * a declaration here merely to manufacture an empty directory. */
+			current = CLUSTER_NORMAL_STOP_PENDING;
+			current_reason = "PCM_REFERENCE";
+		} else if (current == CLUSTER_NORMAL_STOP_READY
+				   && (entry->pending_x_requester_node != -1 || entry->convert_queue != NULL)) {
+			current = CLUSTER_NORMAL_STOP_PENDING;
+			current_reason = "PCM_PENDING_CONVERT";
+		} else if (current == CLUSTER_NORMAL_STOP_READY && post_checkpoint
+				   && (pi_holders != 0 || entry->pi_watermark_lsn != InvalidXLogRecPtr
+					   || entry->pi_watermark_scn != InvalidScn)) {
+			current = CLUSTER_NORMAL_STOP_PENDING;
+			current_reason = "PCM_PI_DURABILITY";
+		}
+		if ((current == CLUSTER_NORMAL_STOP_INVALID && result != CLUSTER_NORMAL_STOP_INVALID)
+			|| (current == CLUSTER_NORMAL_STOP_PENDING && result == CLUSTER_NORMAL_STOP_READY)) {
+			result = current;
+			reason = current_reason;
+			observed = entry->tag;
+			observed_slot = entry->registry_slot;
+		}
+		LWLockRelease(&entry->entry_lock.lock);
+	}
+	/* Check the other direction too: an empty hash cannot hide a live
+	 * registry or an orphaned sidecar. Retired generations are history;
+	 * original retirement clears the entire master state before tombstone.
+	 * No diagnostic slot count participates in this proof. */
+	for (uint32 slot = 0; slot < (uint32)pcm_grd_effective; slot++) {
+		const ClusterPcmResourceXSlot *registry = &cluster_pcm_resource_x_slots[slot];
+		const ClusterPcmResourceXMasterState *state = &cluster_pcm_resource_x_master_states[slot];
+		bool invalid = false;
+
+		if (registry->state == PCM_REGISTRY_LIVE) {
+			entry
+				= (struct GrdEntry *)hash_search(cluster_pcm_htab, &registry->tag, HASH_FIND, NULL);
+			invalid = entry == NULL || registry->reserved != 0 || registry->binding_generation == 0
+					  || registry->binding_generation == UINT64_MAX
+					  || registry->retired_authority_generation != 0
+					  || state->binding_generation != registry->binding_generation
+					  || (entry != NULL
+						  && (entry->registry_slot != slot
+							  || entry->binding_generation != registry->binding_generation));
+		} else if (registry->state == PCM_REGISTRY_EMPTY) {
+			invalid = memcmp(registry, &empty_slot, sizeof(*registry)) != 0
+					  || memcmp(state, &empty_state, sizeof(*state)) != 0;
+		} else if (registry->state == PCM_REGISTRY_TOMBSTONE) {
+			invalid = registry->reserved != 0 || registry->binding_generation == 0
+					  || registry->binding_generation == UINT64_MAX
+					  || registry->retired_authority_generation == 0
+					  || registry->retired_authority_generation == UINT64_MAX
+					  || memcmp(state, &empty_state, sizeof(*state)) != 0;
+		} else
+			invalid = true;
+		if (invalid && result != CLUSTER_NORMAL_STOP_INVALID) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			reason = "PCM_REGISTRY_BINDING_INVALID";
+			observed = registry->tag;
+			observed_slot = slot;
+		}
+	}
+	LWLockRelease(&ClusterPcm->htab_lock.lock);
+done:
+	if (tag_out != NULL)
+		*tag_out = observed;
+	if (slot_out != NULL)
+		*slot_out = observed_slot;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
+
+/* Original locked state classification, shared by the diagnostic projection
+ * and the stop observer. READY still requires the exact terminal table;
+ * diagnostic counters are never inputs to a stop decision. */
+static bool
+pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, bool *retained_out)
+{
+	ClusterPcmResourceXMasterState *state = NULL;
+	ClusterPcmResourceXBootstrapRound *round;
+	ClusterPcmResourceXLocalOwner *owner;
+	ResourceXDecodedFrame source_settlement;
+	ResourceXDecodedFrame join_grant;
+	ResourceXDecodedFrame join_image;
+	bool active = false;
+	bool drained_pair_history = false;
+	bool retained = false;
+	bool invalid = false;
+	uint32 lifecycle;
+	int node;
+
+	Assert(LWLockHeldByMeInMode(&ClusterPcm->htab_lock.lock, LW_SHARED));
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED));
+
+	lifecycle = pg_atomic_read_u32(&entry->lifecycle);
+	if (lifecycle != PCM_ENTRY_LIVE && lifecycle != PCM_ENTRY_QUIESCING)
+		invalid = true;
+
+	owner = &entry->resource_x_local_owner;
+	if (!pcm_resource_x_local_owner_valid_locked(owner))
+		invalid = true;
+
+	if (!pcm_resource_x_active_empty_locked(entry)) {
+		active = true;
+		if (!pcm_resource_x_active_valid_locked(entry))
+			invalid = true;
+	}
+	round = &entry->resource_x_bootstrap_round;
+	if (round->phase > RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
+		invalid = true;
+	else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+			 && round->phase != RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
+		active = true;
+
+	if (entry->registry_slot >= (uint32)pcm_grd_effective || cluster_pcm_resource_x_slots == NULL
+		|| cluster_pcm_resource_x_master_states == NULL
+		|| cluster_pcm_resource_x_slots[entry->registry_slot].state != PCM_REGISTRY_LIVE
+		|| !BufferTagsEqual(&cluster_pcm_resource_x_slots[entry->registry_slot].tag, &entry->tag)
+		|| cluster_pcm_resource_x_slots[entry->registry_slot].binding_generation
+			   != entry->binding_generation) {
+		invalid = true;
+	} else {
+		state = &cluster_pcm_resource_x_master_states[entry->registry_slot];
+		if (state->binding_generation != entry->binding_generation)
+			invalid = true;
+	}
+
+	if (state != NULL) {
+		drained_pair_history
+			= pcm_resource_x_holder_pair_drained_history_locked(entry, state, NULL, NULL);
+		if ((!drained_pair_history
+			 && (state->holder_status.valid != 0 || state->holder_image.valid != 0
+				 || state->holder_status_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+				 || state->holder_image_intent.state != RESOURCE_X_INTENT_SLOT_EMPTY))
+			|| state->grant_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY
+			|| state->requester_settlement_intent.slot.state != RESOURCE_X_INTENT_SLOT_EMPTY)
+			retained = true;
+		if ((state->holder_status.valid > RESOURCE_X_HOLDER_PAIR_PUBLISHED)
+			|| (state->holder_image.valid > RESOURCE_X_HOLDER_PAIR_PUBLISHED)
+			|| state->holder_status_intent.slot.state > RESOURCE_X_INTENT_SLOT_STAGED
+			|| state->holder_image_intent.state > RESOURCE_X_INTENT_SLOT_STAGED
+			|| state->grant_intent.slot.state > RESOURCE_X_INTENT_SLOT_STAGED
+			|| state->requester_settlement_intent.slot.state > RESOURCE_X_INTENT_SLOT_STAGED)
+			invalid = true;
+
+		if (!pcm_resource_x_requester_join_empty_locked(&state->requester_join)) {
+			retained = true;
+			if (!pcm_resource_x_requester_join_decode_locked(&state->requester_join, &join_grant,
+															 &join_image))
+				invalid = true;
+		}
+		if (!pcm_resource_x_source_settlement_debt_decode_locked(entry, state, &source_settlement))
+			invalid = true;
+		else if (state->source_settlement.state == RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
+			retained = true;
+
+		if (!pcm_resource_x_bootstrap_priority_valid(&state->bootstrap_priority))
+			invalid = true;
+		else if (state->bootstrap_priority.state != RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY)
+			retained = true;
+
+		for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
+			const ClusterPcmResourceXBootstrapReceipt *receipt = &state->bootstrap_receipts[node];
+			const ClusterPcmResourceXMasterRequest *request = &state->requests[node];
+			const ResourceXIntentSlot *block_intent = &state->block_intents[node].slot;
+
+			if (!pcm_resource_x_bootstrap_receipt_valid(receipt))
+				invalid = true;
+			else if (receipt->state != RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
+				retained = true;
+			if (block_intent->state != RESOURCE_X_INTENT_SLOT_EMPTY)
+				retained = true;
+			if (block_intent->state > RESOURCE_X_INTENT_SLOT_STAGED)
+				invalid = true;
+
+			if (request->phase > RESOURCE_X_MASTER_RELEASED)
+				invalid = true;
+			else if (request->phase != RESOURCE_X_MASTER_NONE
+					 && request->phase != RESOURCE_X_MASTER_SETTLED
+					 && request->phase != RESOURCE_X_MASTER_RELEASED)
+				active = true;
+		}
+
+		/* Once all current debt categories are empty, consume the one
+		 * complete terminal validity table.  This is what distinguishes
+		 * exact stable residency from malformed terminal residue. */
+		if (!active && !retained && owner->state == RESOURCE_X_LOCAL_OWNER_EMPTY) {
+			uint64 terminal_count = 0;
+			uint64 digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
+
+			if (!pcm_resource_x_terminal_state_locked(entry, state, true, true, &terminal_count,
+													  &digest))
+				invalid = true;
+		}
+	}
+
+	*active_out = active;
+	*retained_out = retained;
+	return !invalid;
+}
+
 void
 cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 {
@@ -9104,170 +9412,25 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
 		return;
 
-	/* Retirement/removal takes the directory lock EXCLUSIVE, so one SHARED
-	 * scan keeps both the entry pointer and its registry sidecar stable. */
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	hash_seq_init(&status, cluster_pcm_htab);
 	while ((entry = (struct GrdEntry *)hash_seq_search(&status)) != NULL) {
-		ClusterPcmResourceXMasterState *state = NULL;
-		ClusterPcmResourceXBootstrapRound *round;
-		ClusterPcmResourceXLocalOwner *owner;
-		ResourceXDecodedFrame source_settlement;
-		ResourceXDecodedFrame join_grant;
-		ResourceXDecodedFrame join_image;
-		bool active = false;
-		bool drained_pair_history = false;
-		bool retained = false;
-		bool invalid = false;
-		uint32 lifecycle;
-		int node;
+		bool active, retained, valid;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
+		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained);
 		out->wait_refcount += pg_atomic_read_u32(&entry->wait_refcount);
-		out->transport_refcount += pg_atomic_read_u32(
-			&entry->transport_refcount);
-		lifecycle = pg_atomic_read_u32(&entry->lifecycle);
-		if (lifecycle != PCM_ENTRY_LIVE && lifecycle != PCM_ENTRY_QUIESCING)
-			invalid = true;
-
-		owner = &entry->resource_x_local_owner;
-		if (!pcm_resource_x_local_owner_valid_locked(owner))
-			invalid = true;
-		if (owner->state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
+		out->transport_refcount += pg_atomic_read_u32(&entry->transport_refcount);
+		if (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {
 			out->local_owner_entry_count++;
-			if (owner->state == RESOURCE_X_LOCAL_OWNER_EVICTING)
+			if (entry->resource_x_local_owner.state == RESOURCE_X_LOCAL_OWNER_EVICTING)
 				out->evicting_entry_count++;
 		}
-
-		if (!pcm_resource_x_active_empty_locked(entry)) {
-			active = true;
-			if (!pcm_resource_x_active_valid_locked(entry))
-				invalid = true;
-		}
-		round = &entry->resource_x_bootstrap_round;
-		if (round->phase > RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED)
-			invalid = true;
-		else if (round->phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
-				 && round->phase
-					!= RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)
-			active = true;
-
-		if (entry->registry_slot >= (uint32)pcm_grd_effective
-			|| cluster_pcm_resource_x_slots == NULL
-			|| cluster_pcm_resource_x_master_states == NULL
-			|| cluster_pcm_resource_x_slots[entry->registry_slot].state
-				!= PCM_REGISTRY_LIVE
-			|| !BufferTagsEqual(
-				&cluster_pcm_resource_x_slots[entry->registry_slot].tag,
-				&entry->tag)
-			|| cluster_pcm_resource_x_slots[entry->registry_slot]
-				.binding_generation != entry->binding_generation) {
-			invalid = true;
-		}
-		else {
-			state = &cluster_pcm_resource_x_master_states[
-				entry->registry_slot];
-			if (state->binding_generation != entry->binding_generation)
-				invalid = true;
-		}
-
-		if (state != NULL) {
-			drained_pair_history
-				= pcm_resource_x_holder_pair_drained_history_locked(
-					entry, state, NULL, NULL);
-			if ((!drained_pair_history
-					&& (state->holder_status.valid != 0
-						|| state->holder_image.valid != 0
-						|| state->holder_status_intent.slot.state
-							!= RESOURCE_X_INTENT_SLOT_EMPTY
-						|| state->holder_image_intent.state
-							!= RESOURCE_X_INTENT_SLOT_EMPTY))
-				|| state->grant_intent.slot.state
-					!= RESOURCE_X_INTENT_SLOT_EMPTY
-				|| state->requester_settlement_intent.slot.state
-					!= RESOURCE_X_INTENT_SLOT_EMPTY)
-				retained = true;
-			if ((state->holder_status.valid > RESOURCE_X_HOLDER_PAIR_PUBLISHED)
-				|| (state->holder_image.valid
-					> RESOURCE_X_HOLDER_PAIR_PUBLISHED)
-				|| state->holder_status_intent.slot.state
-					> RESOURCE_X_INTENT_SLOT_STAGED
-				|| state->holder_image_intent.state
-					> RESOURCE_X_INTENT_SLOT_STAGED
-				|| state->grant_intent.slot.state
-					> RESOURCE_X_INTENT_SLOT_STAGED
-				|| state->requester_settlement_intent.slot.state
-					> RESOURCE_X_INTENT_SLOT_STAGED)
-				invalid = true;
-
-			if (!pcm_resource_x_requester_join_empty_locked(
-					&state->requester_join)) {
-				retained = true;
-				if (!pcm_resource_x_requester_join_decode_locked(
-						&state->requester_join, &join_grant, &join_image))
-					invalid = true;
-			}
-			if (!pcm_resource_x_source_settlement_debt_decode_locked(
-					entry, state, &source_settlement))
-				invalid = true;
-			else if (state->source_settlement.state
-					== RESOURCE_X_SOURCE_SETTLEMENT_PENDING)
-				retained = true;
-
-			if (!pcm_resource_x_bootstrap_priority_valid(
-					&state->bootstrap_priority))
-				invalid = true;
-			else if (state->bootstrap_priority.state
-					!= RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY)
-				retained = true;
-
-			for (node = 0; node < RESOURCE_X_PROTOCOL_NODE_LIMIT; node++) {
-				const ClusterPcmResourceXBootstrapReceipt *receipt
-					= &state->bootstrap_receipts[node];
-				const ClusterPcmResourceXMasterRequest *request
-					= &state->requests[node];
-				const ResourceXIntentSlot *block_intent
-					= &state->block_intents[node].slot;
-
-				if (!pcm_resource_x_bootstrap_receipt_valid(receipt))
-					invalid = true;
-				else if (receipt->state
-						!= RESOURCE_X_BOOTSTRAP_RECEIPT_EMPTY)
-					retained = true;
-				if (block_intent->state != RESOURCE_X_INTENT_SLOT_EMPTY)
-					retained = true;
-				if (block_intent->state > RESOURCE_X_INTENT_SLOT_STAGED)
-					invalid = true;
-
-				if (request->phase > RESOURCE_X_MASTER_RELEASED)
-					invalid = true;
-				else if (request->phase != RESOURCE_X_MASTER_NONE
-						 && request->phase != RESOURCE_X_MASTER_SETTLED
-						 && request->phase != RESOURCE_X_MASTER_RELEASED)
-					active = true;
-			}
-
-			/* Once all current debt categories are empty, consume the one
-			 * complete terminal validity table.  This is what distinguishes
-			 * exact stable residency from malformed terminal residue. */
-			if (!active && !retained
-				&& owner->state == RESOURCE_X_LOCAL_OWNER_EMPTY) {
-				uint64 terminal_count = 0;
-				uint64 digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
-
-				if (!pcm_resource_x_terminal_state_locked(
-						entry, state, true, true,
-						&terminal_count, &digest))
-					invalid = true;
-			}
-		}
-
-		if (retained) {
+		if (retained)
 			out->retained_entry_count++;
-		}
 		if (active)
 			out->active_resource_x_entry_count++;
-		if (invalid)
+		if (!valid)
 			out->invalid_entry_count++;
 		LWLockRelease(&entry->entry_lock.lock);
 	}
@@ -13032,6 +13195,14 @@ pcm_resource_x_bootstrap_round_step_internal(
 	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_EMPTY) {
 		if (head_no_progress_budget_us == 0 || head_no_progress_budget_us == UINT64_MAX
 			|| now_us >= UINT64_MAX - head_no_progress_budget_us) {
+			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+		} else if ((MyBackendType == B_LMON || MyBackendType == B_LMS
+					|| MyBackendType == B_LMS_WORKER || MyBackendType == B_SINVAL_BCAST)
+				   && !cluster_normal_stop_service_new_work(true)) {
+			/* Only the surviving service actors use this seal. Foreground
+			 * and cleaner callers are drained by their original barriers;
+			 * they must not impersonate a service's active bracket. Existing
+			 * rounds above/below this branch keep their completion owner. */
 			action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 		} else {
 			attempt_floor = round->highest_attempt_floor;
@@ -17770,7 +17941,10 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 			result = RESOURCE_X_APPLY_BAD_STATE;
 		else if (dispatch_state
 				== PCM_RESOURCE_X_BOOTSTRAP_DISPATCH_OCCUPIED) {
-			if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY) {
+			/* Only a new successor is an admission. An already retained
+			 * exact priority remains owned work and keeps its original path. */
+			if (priority->state == RESOURCE_X_BOOTSTRAP_PRIORITY_EMPTY
+				&& cluster_normal_stop_service_new_work(true)) {
 				pcm_resource_x_common_copy(
 					&priority->request, &request->common);
 				priority->r4_record_generation = r4_record_generation;
@@ -17786,6 +17960,8 @@ cluster_pcm_lock_resource_x_bootstrap_request_exact(
 		else if (priority->state
 				== RESOURCE_X_BOOTSTRAP_PRIORITY_NEXT_ADMISSION
 			 && !priority_exact_wire)
+			result = RESOURCE_X_APPLY_BAD_STATE;
+		else if (!priority_exact_wire && !cluster_normal_stop_service_new_work(true))
 			result = RESOURCE_X_APPLY_BAD_STATE;
 		else {
 			pcm_resource_x_bootstrap_receipt_invalidate(receipt);
@@ -18056,6 +18232,13 @@ pcm_resource_x_assert_locked(struct GrdEntry *entry, const ResourceXDecodedFrame
 		result = assertion->common.base_authority_generation
 				 != state->authority_generation
 			? RESOURCE_X_APPLY_STALE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		goto unlock;
+	}
+	/* A validated bootstrap receipt already owns this admission, including
+	 * its canonical assertion and later completion. The unreceipted entry
+	 * must not create a fresh request after the data-modifier seal either. */
+	if (!require_bootstrap && !cluster_normal_stop_service_new_work(true)) {
+		result = RESOURCE_X_APPLY_BAD_STATE;
 		goto unlock;
 	}
 	if (require_bootstrap)

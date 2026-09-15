@@ -29,6 +29,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ko.h" /* cluster_ko_drain_inbound_and_apply (spec-5.7 D6) */
 #include "cluster/cluster_sinval.h"
@@ -57,10 +58,56 @@
 #include "utils/wait_event.h"
 
 
-static void
-SinvalBcastBeforeShmemExit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
+static ClusterNormalStopPollResult
+SinvalBcastNormalStopPoll(void)
 {
+	ClusterNormalStopPollResult sinval, ko;
+	const char *domain, *sinval_reason, *ko_reason;
+	uint64 key;
+	uint32 slot;
+
+	if (!cluster_normal_stop_requested())
+		return CLUSTER_NORMAL_STOP_READY;
+	sinval = cluster_sinval_normal_stop_poll(&domain, &key, &sinval_reason);
+	ko = cluster_ko_normal_stop_poll(&slot, &ko_reason);
+	if (sinval == CLUSTER_NORMAL_STOP_INVALID || ko == CLUSTER_NORMAL_STOP_INVALID) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		ereport(LOG, (errmsg("normal stop SI owner observation is invalid"),
+					  errdetail("sinval=%d domain=%s key=" UINT64_FORMAT
+								" reason=%s; ko=%d slot=%u reason=%s",
+								sinval, domain, key, sinval_reason, ko, slot, ko_reason)));
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	return sinval == CLUSTER_NORMAL_STOP_READY && ko == CLUSTER_NORMAL_STOP_READY
+			   ? CLUSTER_NORMAL_STOP_READY
+			   : CLUSTER_NORMAL_STOP_PENDING;
+}
+
+static bool
+SinvalBcastNormalStopCanExit(void)
+{
+	if (!cluster_normal_stop_requested())
+		return true;
+	return cluster_normal_stop_protocol_closed()
+		   && cluster_normal_stop_service_idle(SinvalBcastNormalStopPoll())
+				  == CLUSTER_NORMAL_STOP_READY;
+}
+
+static void
+SinvalBcastBeforeShmemExit(int code, Datum arg pg_attribute_unused())
+{
+	bool failed = false;
+
+	/* Nonzero/fatal exit must not acquire module locks while unwinding. */
+	if (cluster_normal_stop_requested() && (code != 0 || !SinvalBcastNormalStopCanExit())) {
+		failed = true;
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+	}
 	cluster_sinval_unregister_proc_latch();
+	/* Native shmem_exit removes this callback before invocation. A failed
+	 * final recheck must escalate the pending exit(0), not only set a flag. */
+	if (failed && code == 0)
+		ereport(FATAL, (errmsg("SI broadcaster final normal-stop exit check failed")));
 }
 
 /*
@@ -119,6 +166,8 @@ SinvalBcastMain(void)
 	if (sigsetjmp(local_sigjmp_buf, 1) != 0) {
 		/* Since not using PG_TRY, must reset error stack by hand */
 		error_context_stack = NULL;
+		if (cluster_normal_stop_requested())
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
 
 		/* Prevent interrupts while cleaning up */
 		HOLD_INTERRUPTS();
@@ -143,15 +192,24 @@ SinvalBcastMain(void)
 		MemoryContextResetAndDeleteChildren(sinval_bcast_context);
 
 		RESUME_INTERRUPTS();
+		if (cluster_normal_stop_requested())
+			ereport(FATAL, (errmsg("SI broadcaster failed during normal stop")));
 	}
 	PG_exception_stack = &local_sigjmp_buf;
 	(void)local_sigjmp_buf;
 
 	for (;;) {
 		int rc;
+		volatile bool completed = false;
 
-		if (ShutdownRequestPending)
+		if (ShutdownRequestPending) {
+			if (!SinvalBcastNormalStopCanExit()) {
+				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+				ereport(FATAL,
+						(errmsg("SI broadcaster cannot exit before normal-stop completion")));
+			}
 			proc_exit(0);
+		}
 
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
@@ -169,9 +227,29 @@ SinvalBcastMain(void)
 		 *
 		 * Outbound fanout (sinval + KO ACK) is drained by LMON, not this process.
 		 */
-		cluster_sinval_apply_inbound_overflow_reset_if_pending();
-		cluster_sinval_drain_inbound_and_apply();
-		cluster_ko_drain_inbound_and_apply();
+		if (!cluster_normal_stop_service_enter())
+			ereport(FATAL, (errmsg("SI broadcaster cannot register normal-stop work")));
+		PG_TRY();
+		{
+			cluster_sinval_apply_inbound_overflow_reset_if_pending();
+			cluster_sinval_drain_inbound_and_apply();
+			cluster_ko_drain_inbound_and_apply();
+			completed = true;
+		}
+		PG_FINALLY();
+		{
+			/* An ERROR can leave a module lock held. Release those native
+			 * locks before the leave-lock cleanup, never reverse that order.
+			 * The existing outer handler still releases pins/resources. */
+			if (!completed)
+				LWLockReleaseAll();
+			(void)cluster_normal_stop_service_leave(completed);
+		}
+		PG_END_TRY();
+		if (cluster_normal_stop_requested()
+			&& cluster_normal_stop_service_idle(SinvalBcastNormalStopPoll())
+				   == CLUSTER_NORMAL_STOP_INVALID)
+			ereport(FATAL, (errmsg("SI broadcaster normal-stop observation failed")));
 
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					   cluster_sinval_broadcast_batch_timeout_ms, WAIT_EVENT_SINVAL_BROADCAST_SEND);

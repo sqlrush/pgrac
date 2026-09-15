@@ -24,6 +24,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_tier1.h"
@@ -32,6 +33,70 @@
 
 static ClusterICPeerTransport MuxPeerTransport[CLUSTER_MAX_NODES];
 static uint64 MuxFallbackCount = 0;
+
+ClusterNormalStopPollResult
+cluster_ic_normal_stop_poll(const char **domain_out, int *peer_out, uint32 *sequence_out,
+							const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY, part;
+	const char *domain = "transport", *reason = "EMPTY", *part_reason;
+	int peer = -1, part_peer;
+	uint32 sequence = 0, part_sequence;
+	bool rdma_active = false;
+	bool mux = ClusterICOps_Active == &ClusterICOps_Mux;
+
+#define IC_STOP_NOTE(r, d, p, s, why)                                                              \
+	do {                                                                                           \
+		if ((r) != CLUSTER_NORMAL_STOP_READY                                                       \
+			&& (result == CLUSTER_NORMAL_STOP_READY                                                \
+				|| ((r) == CLUSTER_NORMAL_STOP_INVALID                                             \
+					&& result != CLUSTER_NORMAL_STOP_INVALID))) {                                  \
+			result = (r);                                                                          \
+			domain = (d);                                                                          \
+			peer = (p);                                                                            \
+			sequence = (s);                                                                        \
+			reason = (why);                                                                        \
+		}                                                                                          \
+	} while (0)
+
+	if ((!mux
+		 && (ClusterICOps_Active != &ClusterICOps_Tier1
+			 || cluster_interconnect_tier != CLUSTER_IC_TIER_1))
+		|| (mux && cluster_interconnect_tier != CLUSTER_IC_TIER_2
+			&& cluster_interconnect_tier != CLUSTER_IC_TIER_3)) {
+		IC_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "transport", -1, 0,
+					 "UNINITIALIZED_OR_UNSUPPORTED");
+		goto done;
+	}
+	/* Always check all owners: selecting TCP for every peer does not dispose
+	 * of an earlier RDMA callback, nor does empty TCP receive finish a chunk. */
+	part = cluster_ic_tier1_normal_stop_poll(&part_peer, &part_reason);
+	IC_STOP_NOTE(part, "tier1", part_peer, 0, part_reason);
+	part = cluster_ic_chunk_normal_stop_poll(&part_peer, &part_sequence, &part_reason);
+	IC_STOP_NOTE(part, "chunk", part_peer, part_sequence, part_reason);
+	part = cluster_ic_rdma_normal_stop_poll(&rdma_active, &part_peer, &part_reason);
+	IC_STOP_NOTE(part, "rdma", part_peer, 0, part_reason);
+	if (rdma_active && !mux)
+		IC_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "mux", -1, 0, "UNEXPECTED_RDMA_OWNER");
+	for (int p = 0; p < CLUSTER_MAX_NODES; p++) {
+		if (MuxPeerTransport[p] != CLUSTER_IC_PEER_TRANSPORT_TCP
+			&& MuxPeerTransport[p] != CLUSTER_IC_PEER_TRANSPORT_RDMA)
+			IC_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "mux", p, 0, "INVALID_TRANSPORT");
+		else if (MuxPeerTransport[p] == CLUSTER_IC_PEER_TRANSPORT_RDMA && (!mux || !rdma_active))
+			IC_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "mux", p, 0, "RDMA_WITHOUT_OWNER");
+	}
+done:
+	if (domain_out != NULL)
+		*domain_out = domain;
+	if (peer_out != NULL)
+		*peer_out = peer;
+	if (sequence_out != NULL)
+		*sequence_out = sequence;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+#undef IC_STOP_NOTE
+}
 
 
 const char *

@@ -48,6 +48,7 @@
 #include "cluster/cluster_ic_envelope.h" /* spec-2.9 D4:  ClusterICEnvelope + PGRAC_IC_MSG_BOC_BROADCAST */
 #include "cluster/cluster_ic_router.h" /* spec-2.9 D4: ClusterICFanoutResult */
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2 stub — profiling gate */
 #include "port/atomics.h"
 #include "storage/lwlock.h"
@@ -76,6 +77,7 @@
  */
 
 bool IsUnderPostmaster = false;
+static unsigned test_scn_lock_depth;
 
 /* spec-5.59 D2 stubs: cluster_scn.o now carries GUC-gated profiling probes
  * (cluster_xnode_profile.h); the unit harness links neither cluster_guc.o
@@ -159,6 +161,12 @@ elog_finish(int e pg_attribute_unused(), const char *f pg_attribute_unused(), ..
  *	→ cluster_scn_shmem_init body 执行 atomic init zero loop →
  *	cluster_scn_state 真指向 valid buffer → atomic ops 真生效.
  */
+static union {
+	uint64 force_align;
+	char data[16384];
+} scn_buf;
+static bool scn_initialized = false;
+
 void *
 ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 {
@@ -166,12 +174,6 @@ ShmemInitStruct(const char *name, Size size, bool *foundPtr)
 	 * Use a union instead of plain char[] so pg_atomic_uint64 and LWLock
 	 * inside ClusterScnSharedState are not placed on a 1-byte-aligned
 	 * address in standalone unit tests. */
-	static union {
-		uint64 force_align;
-		char data[16384]; /* generous;  covers spec-7.4 durable_pending growth */
-	} scn_buf;
-	static bool scn_initialized = false;
-
 	if (name != NULL && strcmp(name, "pgrac cluster scn") == 0) {
 		Assert(size <= sizeof(scn_buf.data)); /* catch shmem layout growth */
 		*foundPtr = scn_initialized;
@@ -192,11 +194,16 @@ LWLockInitialize(LWLock *l pg_attribute_unused(), int t pg_attribute_unused())
 bool
 LWLockAcquire(LWLock *l pg_attribute_unused(), LWLockMode m pg_attribute_unused())
 {
+	UT_ASSERT_EQ(test_scn_lock_depth, 0);
+	test_scn_lock_depth++;
 	return true;
 }
 void
 LWLockRelease(LWLock *l pg_attribute_unused())
-{}
+{
+	UT_ASSERT_EQ(test_scn_lock_depth, 1);
+	test_scn_lock_depth--;
+}
 
 /*
  * spec-2.12 D6 / T-scn-16d:  GetCurrentTimestamp stub now backed by
@@ -1134,11 +1141,148 @@ UT_TEST(test_spec74_frontier_overflow_freezes_sticky)
 	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(first_s));
 	UT_ASSERT_EQ(scn_total_cmp(cluster_scn_durable_safe_scn(), last_safe), 0);
 	UT_ASSERT(cluster_scn_durable_frontier_frozen());
+	{
+		const char *reason;
+		IsUnderPostmaster = true;
+		UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, &reason),
+					 CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT(strcmp(reason, "SCN_FRONTIER_UNTRACKED") == 0);
+		IsUnderPostmaster = false;
+	}
+}
+
+UT_TEST(test_a148_scn_stop_missing_and_wrong_owner_not_empty)
+{
+	/* Must run before the first original shared allocation. */
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_scn_lock_depth, 0);
+}
+
+static void
+test_a148_scn_stop_ready_context(void)
+{
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	test_alive_peer_count = 2;
+	test_fanout_peer1_result = test_fanout_peer2_result = CLUSTER_IC_FANOUT_DONE;
+	test_unicast_result[1] = test_unicast_result[2] = CLUSTER_IC_SEND_DONE;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_a148_scn_stop_requires_real_terminal_and_original_broadcast)
+{
+	SCN scn;
+	const char *domain, *reason;
+	test_a148_scn_stop_ready_context();
+	cluster_enable_adg = true;
+	scn = cluster_scn_advance_for_commit();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(&domain, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(domain, "SCN_PENDING") == 0);
+	UT_ASSERT_EQ(cluster_scn_adg_pending_count(), 1);
+	UT_ASSERT_EQ(cluster_scn_durable_pending_count(), 1);
+	UT_ASSERT(cluster_scn_pending_commit_clear_my_pending());
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(cluster_scn_durable_pending_fill_lsn(scn, 21000));
+	UT_ASSERT(!cluster_scn_durable_pending_abort_self());
+	UT_ASSERT_EQ(cluster_scn_durable_pending_discharge_upto(20999), 0);
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_scn_durable_pending_discharge_upto(21000), 1);
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(&domain, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(domain, "SCN_BOC") == 0);
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	/* An unfilled allocation is retired by the original abort path, not the poll. */
+	(void)cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_pending_commit_clear_my_pending());
+	UT_ASSERT(cluster_scn_durable_pending_abort_self());
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	cluster_enable_adg = false;
+	IsUnderPostmaster = false;
+}
+
+UT_TEST(test_a148_scn_stop_retained_retry_is_not_a_drained_counter)
+{
+	SCN scn;
+	const char *domain, *reason;
+	uint64 peer;
+	test_a148_scn_stop_ready_context();
+	scn = cluster_scn_advance_for_commit();
+	UT_ASSERT(
+		cluster_scn_durable_pending_discharge_scn(scn)); /* original durable caller boundary */
+	test_fanout_peer1_result = CLUSTER_IC_FANOUT_NOT_ADMITTED;
+	test_fanout_peer2_result = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+	test_unicast_result[1] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(&domain, &peer, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(domain, "SCN_BOC_RETRY") == 0);
+	UT_ASSERT_EQ(peer, 1);
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	test_unicast_result[1] = CLUSTER_IC_SEND_WOULD_BLOCK;
+	cluster_scn_lmon_drain_boc_broadcast();
+	/* Exact transport handoff empties only this module's responsibility. */
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = false;
+}
+
+UT_TEST(test_a148_scn_stop_no_peer_does_not_consume_pending_event)
+{
+	SCN scn;
+	test_a148_scn_stop_ready_context();
+	scn = cluster_scn_advance_for_commit();
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(scn));
+	test_alive_peer_count = 0;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	test_alive_peer_count = 2;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	MyBackendType = B_LMON;
+	IsUnderPostmaster = false;
+}
+
+UT_TEST(test_a148_scn_stop_original_zero_time_frontier_is_pending)
+{
+	SCN first, second;
+	const char *reason;
+	/* Fresh shared registry for a nonzero owner; previous tests left the
+	 * original local sender without pending responsibility. */
+	scn_initialized = false;
+	cluster_node_id = 1;
+	cluster_scn_shmem_init();
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	test_alive_peer_count = 2;
+	first = cluster_scn_advance_for_commit();
+	second = cluster_scn_advance_for_commit();
+	UT_ASSERT_EQ(scn_local(first), 1);
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(second));
+	UT_ASSERT_EQ(cluster_scn_durable_safe_scn(), scn_encode(1, 0));
+	test_fanout_peer1_result = CLUSTER_IC_FANOUT_DONE;
+	test_fanout_peer2_result = CLUSTER_IC_FANOUT_NOT_ADMITTED;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_boc_payload_decode(test_fanout_last_payload), scn_encode(1, 0));
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "SCN_DURABLE_COMMIT_PENDING") == 0);
+	UT_ASSERT(cluster_scn_durable_pending_discharge_scn(first));
+	test_fanout_peer2_result = CLUSTER_IC_FANOUT_DONE;
+	cluster_scn_lmon_drain_boc_broadcast();
+	UT_ASSERT_EQ(cluster_scn_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = false;
 }
 
 int
 main(void)
 {
+	UT_RUN(test_a148_scn_stop_missing_and_wrong_owner_not_empty);
 	/* Spec-7.4 D1 durable_safe_scn frontier registry (9) --
 	 * T-scn-74-1a..1i.  Cumulative shmem state;  overflow test last. */
 	UT_RUN(test_spec74_frontier_accessors_linkable);
@@ -1169,6 +1313,10 @@ main(void)
 	UT_RUN(test_spec74_drain_zero_len_when_off_even_if_dirty);
 	UT_RUN(test_spec74_drain_does_not_retry_transport_owned_would_block);
 	UT_RUN(test_spec74_drain_retries_only_exact_not_admitted_peer);
+	UT_RUN(test_a148_scn_stop_requires_real_terminal_and_original_broadcast);
+	UT_RUN(test_a148_scn_stop_retained_retry_is_not_a_drained_counter);
+	UT_RUN(test_a148_scn_stop_no_peer_does_not_consume_pending_event);
+	UT_RUN(test_a148_scn_stop_original_zero_time_frontier_is_pending);
 	UT_RUN(test_spec74_frontier_overflow_freezes_sticky);
 
 	UT_DONE();

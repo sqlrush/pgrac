@@ -23,6 +23,7 @@
 #include <time.h>
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_guc.h"
@@ -38,6 +39,17 @@
 
 UT_DEFINE_GLOBALS();
 
+static bool stop_new_work_allowed = true;
+static int stop_gate_calls;
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	(void)modifies_data;
+	stop_gate_calls++;
+	return stop_new_work_allowed;
+}
+
 /* Globals normally supplied by cluster_guc.c / globals.c. */
 bool cluster_enabled = true;
 int cluster_node_id = 0;
@@ -49,6 +61,7 @@ int cluster_gcs_reply_timeout_ms = 5000;
 int MaxConnections = 1;
 bool IsUnderPostmaster = false;
 BackendId MyBackendId = InvalidBackendId;
+BackendType MyBackendType = B_LMON;
 
 /* 26.5 seconds, pinned with the established 2x discipline. */
 #define TEST_LIFETIME_HINT_MS UINT32_C(26500)
@@ -61,6 +74,14 @@ static TimestampTz fake_now = TEST_WALL_BASE_US;
 static struct timespec fake_monotonic_now;
 static int fake_declared_nodes = 1;
 static int fake_lock_depth = 0;
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	static LWLock fixture_lock;
+	if (fake_lock_depth != 0)
+		callback(&fixture_lock, LW_EXCLUSIVE, context);
+}
 
 int cluster_test_clock_gettime(clockid_t clock_id, struct timespec *tp);
 
@@ -1223,10 +1244,78 @@ UT_TEST(test_done_anchor_in_monotonic_future_cannot_reclaim)
 	UT_ASSERT_EQ(1, fake_live_count());
 }
 
+UT_TEST(test_stop_seal_new_route_not_original_handoff_or_replay)
+{
+	GcsBlockR4RouteIdentity identity = make_identity(42, 3, 82, (SCN)142, 35);
+	ClusterR4CrRouteProof proof = make_proof(&identity, 2);
+	GcsBlockR4RouteRecord record;
+
+	fixture_reset(1);
+	stop_new_work_allowed = false;
+	stop_gate_calls = 0;
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_arm_or_match(0, &identity, TEST_ROUTE_TRANSITION,
+															   &proof, TEST_LIFETIME_HINT_MS, true,
+															   &record),
+				 GCS_BLOCK_R4_ROUTE_ARM_FULL);
+	UT_ASSERT_EQ(stop_gate_calls, 1);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 0);
+	stop_new_work_allowed = true;
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_arm_or_match(0, &identity, TEST_ROUTE_TRANSITION,
+															   &proof, TEST_LIFETIME_HINT_MS, true,
+															   &record),
+				 GCS_BLOCK_R4_ROUTE_ARM_NEW);
+	stop_new_work_allowed = false;
+	stop_gate_calls = 0;
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true),
+				 GCS_BLOCK_R4_ROUTE_SEND_FORWARDED);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_arm_or_match(0, &identity, TEST_ROUTE_TRANSITION,
+															   &proof, TEST_LIFETIME_HINT_MS, true,
+															   &record),
+				 GCS_BLOCK_R4_ROUTE_ARM_REPLAY);
+	UT_ASSERT_EQ(record.state, GCS_BLOCK_R4_ROUTE_FORWARDED);
+	UT_ASSERT_EQ(stop_gate_calls, 0);
+	UT_ASSERT_EQ(fake_lock_depth, 0);
+	stop_new_work_allowed = true;
+}
+
+UT_TEST(test_stop_route_handoff_is_not_total_cluster_completion)
+{
+	GcsBlockR4RouteIdentity identity = make_identity(43, 3, 83, (SCN)143, 35);
+	ClusterR4CrRouteProof proof = make_proof(&identity, 2);
+	GcsBlockR4RouteRecord record;
+	const char *domain, *reason;
+	uint64 key;
+
+	fixture_reset(1);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_arm_or_match(0, &identity, TEST_ROUTE_TRANSITION,
+															   &proof, TEST_LIFETIME_HINT_MS, true,
+															   &record),
+				 GCS_BLOCK_R4_ROUTE_ARM_NEW);
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(key, identity.legacy_key.request_id);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true),
+				 GCS_BLOCK_R4_ROUTE_SEND_FORWARDED);
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 1);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_r4_route_arm_or_match(0, &identity, TEST_ROUTE_TRANSITION,
+															   &proof, TEST_LIFETIME_HINT_MS, true,
+															   &record),
+				 GCS_BLOCK_R4_ROUTE_ARM_REPLAY);
+	UT_ASSERT_EQ(record.state, GCS_BLOCK_R4_ROUTE_FORWARDED);
+	IsUnderPostmaster = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(36);
+	UT_RUN(test_stop_route_handoff_is_not_total_cluster_completion);
+	UT_RUN(test_stop_seal_new_route_not_original_handoff_or_replay);
 	UT_RUN(test_route_abi_and_empty_count);
 	UT_RUN(test_new_then_exact_duplicate_replays_stored_record);
 	UT_RUN(test_unarmed_expected_page_scn_new_then_exact_replay);

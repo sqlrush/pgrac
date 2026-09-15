@@ -70,6 +70,7 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_lmd.h"
+#include "cluster/cluster_clean_leave.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
@@ -177,6 +178,7 @@ hash_estimate_size(long num_entries pg_attribute_unused(), Size entrysize pg_att
 }
 
 /* LWLock stubs — lock state is not exercised in the standalone harness. */
+static LWLock *test_held_graph_lock;
 void
 LWLockInitialize(LWLock *l pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
@@ -184,12 +186,28 @@ LWLockInitialize(LWLock *l pg_attribute_unused(), int tranche_id pg_attribute_un
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	if (test_held_graph_lock != NULL)
+		abort();
+	test_held_graph_lock = lock;
 	return true;
 }
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	if (test_held_graph_lock != lock)
+		abort();
+	test_held_graph_lock = NULL;
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return test_held_graph_lock == lock;
+}
+
+/* Original producers, hash walk and retirement; hash storage is a fixture. */
+#include "../../backend/cluster/cluster_lmd_graph.c"
 
 
 /* ============================================================
@@ -1182,10 +1200,66 @@ UT_TEST(test_pcm_convert_wfg_note_counters_are_narrow_and_exact)
 }
 
 
+UT_TEST(test_stop_graph_requires_real_storage_and_original_lock)
+{
+	ClusterNormalStopPollResult result;
+	reset_graph();
+	cluster_lmd_graph_state = NULL;
+	UT_ASSERT_EQ(cluster_lmd_graph_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	reset_graph();
+	cluster_lmd_graph_htab = NULL;
+	UT_ASSERT_EQ(cluster_lmd_graph_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	reset_graph();
+	LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_SHARED);
+	result = cluster_lmd_graph_normal_stop_poll(NULL, NULL);
+	LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	UT_ASSERT_EQ(result, CLUSTER_NORMAL_STOP_INVALID);
+}
+
+UT_TEST(test_stop_graph_walks_live_edges_not_diagnostic_count)
+{
+	ClusterLmdVertex waiter = mkvertex(0, 101, 7, 5001);
+	ClusterLmdVertex blocker = mkvertex(2, 200, 7, 6001);
+	uint64 key = 0;
+	uint64 gen;
+	const char *reason = NULL;
+	reset_graph();
+	UT_ASSERT_EQ(cluster_lmd_graph_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&waiter, &blocker, waiter.request_id));
+	gen = cluster_lmd_graph_generation_get();
+	pg_atomic_write_u64(&cluster_lmd_graph_state->edge_count, 0);
+	UT_ASSERT_EQ(cluster_lmd_graph_normal_stop_poll(&key, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(key, waiter.request_id);
+	UT_ASSERT_EQ(cluster_lmd_graph_generation_get(), gen);
+	UT_ASSERT(cluster_lmd_graph_has_waiter(&waiter));
+	pg_atomic_write_u64(&cluster_lmd_graph_state->edge_count, 1);
+	UT_ASSERT(cluster_lmd_graph_remove_edge_by_waiter(&waiter));
+	UT_ASSERT_EQ(cluster_lmd_graph_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(cluster_lmd_graph_generation_get() > gen);
+}
+
+UT_TEST(test_stop_graph_invalid_overrides_an_earlier_pending_edge)
+{
+	ClusterLmdVertex w1 = mkvertex(0, 101, 7, 5001);
+	ClusterLmdVertex w2 = mkvertex(1, 102, 7, 5002);
+	ClusterLmdVertex b = mkvertex(2, 200, 7, 6001);
+	LmdEdgeKey key;
+	LmdEdgeEntry *entry;
+	reset_graph();
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w1, &b, w1.request_id));
+	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&w2, &b, w2.request_id));
+	make_key(&w2, &b, &key);
+	entry = hash_search(cluster_lmd_graph_htab, &key, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	entry->edge.waiter.request_id++;
+	UT_ASSERT_EQ(cluster_lmd_graph_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(test_held_graph_lock, NULL);
+}
+
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(37);
 	UT_RUN(test_multi_blocker_edges_not_overwritten);
 	UT_RUN(test_remove_by_waiter_removes_all_blocker_edges);
 	UT_RUN(test_exact_remove_requires_wait_seq_and_preserves_new_wait_instance);
@@ -1220,6 +1294,9 @@ main(void)
 	UT_RUN(test_probe_round_incomplete_partial_subset);
 	UT_RUN(test_probe_round_two_identical_partial_subsets_never_complete);
 	UT_RUN(test_pcm_convert_wfg_note_counters_are_narrow_and_exact);
+	UT_RUN(test_stop_graph_requires_real_storage_and_original_lock);
+	UT_RUN(test_stop_graph_walks_live_edges_not_diagnostic_count);
+	UT_RUN(test_stop_graph_invalid_overrides_an_earlier_pending_edge);
 	UT_DONE();
-	return 0;
+	return ut_failed_count != 0;
 }

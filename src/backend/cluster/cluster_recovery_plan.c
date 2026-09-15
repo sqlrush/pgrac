@@ -43,6 +43,8 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_clean_leave.h"
+#include "miscadmin.h"
 #include "cluster/cluster_control_root.h" /* RF-ROOT P7 G1b step 4: canonical verdict source */
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_recovery_worker.h" /* pool lives in this wrapper (spec-4.4 D5) */
@@ -73,6 +75,84 @@ typedef struct ClusterRecoveryPlanShmem {
 } ClusterRecoveryPlanShmem;
 
 static ClusterRecoveryPlanShmem *cluster_recovery_plan_shmem = NULL;
+
+static void
+recovery_stop_note(ClusterNormalStopPollResult result, const char *domain, uint64 key,
+				   const char *reason, ClusterNormalStopPollResult *aggregate,
+				   const char **first_domain, uint64 *first_key, const char **first_reason)
+{
+	if (result < *aggregate) {
+		*aggregate = result;
+		*first_domain = domain;
+		*first_key = key;
+		*first_reason = reason;
+	}
+}
+
+/* Original per-slot ownership, not the observational plan or counters. Native
+ * Startup/worker lifetime and the actor seal are separate enclosing cuts;
+ * only the original worker/LMON retires work. No replay, launch or reset here. */
+ClusterNormalStopPollResult
+cluster_recovery_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_INVALID;
+	const char *first_domain = "RECOVERY", *first_reason = "RECOVERY_OWNER_OR_SHMEM";
+	uint64 first_key = 0;
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || cluster_recovery_plan_shmem == NULL)
+		goto done;
+	aggregate = CLUSTER_NORMAL_STOP_READY;
+	first_reason = "NONE";
+	for (unsigned i = 0; i < CLUSTER_RECOVERY_WORKER_MAX_SLOTS; i++) {
+		uint32 state = pg_atomic_read_u32(&cluster_recovery_plan_shmem->pool.slot_state[i]);
+		ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+		if (state > CLUSTER_RECOVERY_WORKER_SPAWN_FAILED)
+			result = CLUSTER_NORMAL_STOP_INVALID;
+		else if (state == CLUSTER_RECOVERY_WORKER_REQUESTED
+				 || state == CLUSTER_RECOVERY_WORKER_RUNNING)
+			result = CLUSTER_NORMAL_STOP_PENDING;
+		/* Validation workers do not replay; DONE/FAILED/SPAWN_FAILED are
+		 * terminal observations, never a proof that data recovery succeeded. */
+		recovery_stop_note(result, "RECOVERY_WORKER", i,
+						   result == CLUSTER_NORMAL_STOP_INVALID ? "RECOVERY_WORKER_STATE_INVALID"
+																 : "RECOVERY_WORKER_PENDING",
+						   &aggregate, &first_domain, &first_key, &first_reason);
+	}
+	for (uint16 tid = 0; tid <= CLUSTER_RECOVERY_PLAN_THREADS; tid++) {
+		ClusterThreadReplaySlot *slot = &cluster_recovery_plan_shmem->thread_replay[tid];
+		uint32 state = pg_atomic_read_u32(&slot->state), after;
+		uint64 stamp, stamp_after;
+		ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+		const char *why = "THREAD_REPLAY_PENDING";
+		pg_read_barrier();
+		stamp = pg_atomic_read_u64(&slot->episode_epoch);
+		pg_read_barrier();
+		after = pg_atomic_read_u32(&slot->state);
+		stamp_after = pg_atomic_read_u64(&slot->episode_epoch);
+		if (state > CLUSTER_THREADREC_REPLAY_BLOCKED
+			|| (tid == 0 && (state != CLUSTER_THREADREC_REPLAY_IDLE || stamp != 0))
+			|| (state != CLUSTER_THREADREC_REPLAY_IDLE && stamp == 0)) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "THREAD_REPLAY_STATE_INVALID";
+		} else if (state == CLUSTER_THREADREC_REPLAY_BLOCKED) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "THREAD_REPLAY_BLOCKED";
+		} else if (state == CLUSTER_THREADREC_REPLAY_REPLAYING || state != after
+				   || stamp != stamp_after)
+			result = CLUSTER_NORMAL_STOP_PENDING;
+		/* Terminal/retired episode stamps and copied projection tokens are
+		 * retained history, not buffer pins or a new reader authority. */
+		recovery_stop_note(result, "THREAD_REPLAY", tid, why, &aggregate, &first_domain, &first_key,
+						   &first_reason);
+	}
+done:
+	if (domain)
+		*domain = first_domain;
+	if (key)
+		*key = first_key;
+	if (reason)
+		*reason = first_reason;
+	return aggregate;
+}
 
 static Size
 cluster_recovery_plan_shmem_size(void)

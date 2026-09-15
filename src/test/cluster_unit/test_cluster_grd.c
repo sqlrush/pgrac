@@ -49,6 +49,7 @@
 #include <string.h>
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_gcs.h"	   /* spec-4.7 D2 (L238) — cluster_gcs_lookup_master proto */
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 (L238) — block re-declare scan/send protos */
 #include "cluster/cluster_ges.h"
@@ -82,6 +83,7 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_grd_stop_types.inc"
 
 
 /* ============================================================
@@ -89,6 +91,8 @@
  * ============================================================ */
 
 bool IsUnderPostmaster = false;
+static bool stop_lock_tracking;
+static LWLock *stop_held_lock;
 
 /* spec-5.22a D1-5 verifies a fail-closed guard is reached.  Setjmp-based
  * trampoline (mirrors test_cluster_fence.c): when armed, an Assert trip
@@ -780,8 +784,13 @@ GetNamedLWLockTranche(const char *tranche_name pg_attribute_unused())
 }
 
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
+	if (stop_lock_tracking) {
+		if (stop_held_lock != NULL)
+			abort();
+		stop_held_lock = lock;
+	}
 	ut_grd_blocking_lwlock_calls++;
 	if (!ut_in_authority_lmon_tick)
 		ut_grd_postmaster_lwlock_calls++;
@@ -789,8 +798,19 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 }
 
 void
-LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+LWLockRelease(LWLock *lock)
+{
+	if (stop_lock_tracking) {
+		if (stop_held_lock != lock)
+			abort();
+		stop_held_lock = NULL;
+	}
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return stop_lock_tracking && stop_held_lock == lock;
+}
 
 /* spec-2.23 D6 stub: PG exported DoLockModesConflict — cluster_grd.c
  * uses this in enqueue_or_grant / release_and_pop_compatible_waiter.
@@ -5624,6 +5644,151 @@ UT_TEST(test_recovery_authority_composite_change_repost_requires_fresh_done)
 	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
 }
 
+static ClusterGrdShared *
+stop_grd_setup(void)
+{
+	int32 nodes[] = { 0, 1, 2, 3 };
+	bool found;
+	grd_lifecycle_reset(16);
+	set_mock_declared(4, nodes);
+	cluster_grd_master_map_init();
+	cluster_enabled = true;
+	IsUnderPostmaster = true;
+	stop_lock_tracking = true;
+	stop_held_lock = NULL;
+	return ShmemInitStruct("pgrac cluster grd", sizeof(ClusterGrdShared), &found);
+}
+static void
+stop_grd_finish(void)
+{
+	UT_ASSERT(stop_held_lock == NULL);
+	stop_lock_tracking = false;
+	cluster_enabled = false;
+	IsUnderPostmaster = false;
+}
+UT_TEST(test_normal_stop_grd_missing_is_not_empty)
+{
+	const char *reason;
+	cluster_enabled = true;
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GRD_UNINITIALIZED");
+	IsUnderPostmaster = false;
+	cluster_enabled = false;
+}
+UT_TEST(test_normal_stop_grd_keeps_master_and_empty_cached_entries)
+{
+	ClusterGrdShared *shared = stop_grd_setup();
+	ClusterResId resid;
+	ClusterGrdEntry *entry;
+	const char *reason;
+	uint32 mastered = cluster_grd_local_master_count();
+	UT_ASSERT(mastered > 0);
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+	cluster_grd_entry_reclaim = false;
+	grd_lifecycle_resid(6400, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(reason, "GRD_PIN");
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 1);
+	UT_ASSERT_EQ(cluster_grd_local_master_count(), mastered);
+	pg_atomic_write_u32(&shared->master_map_initialized, 0); /* missing authority boundary */
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GRD_MASTER_MAP_UNINITIALIZED");
+	stop_grd_finish();
+}
+UT_TEST(test_normal_stop_grd_all_four_responsibilities_use_original_release)
+{
+	for (int kind = 0; kind < 4; kind++) {
+		ClusterGrdShared *shared = stop_grd_setup();
+		ClusterResId resid, observed;
+		ClusterGrdEntry *entry;
+		ClusterGrdHolderId h1 = grd_lifecycle_holder(1, 13, 100),
+						   h2 = grd_lifecycle_holder(2, 14, 101);
+		ClusterGrdConvert convert
+			= grd_lifecycle_convert_req(1, 13, ShareLock, AccessExclusiveLock, 200);
+		const char *reason;
+		bool drain = false;
+		uint32 shard;
+		uint64 before_count;
+
+		grd_lifecycle_resid(6410 + kind, &resid);
+		UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+					 CLUSTER_GRD_ENTRY_OK);
+		if (kind == 0 || kind == 3)
+			UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &h1, ShareLock),
+						 CLUSTER_GRD_ENTRY_OK);
+		if (kind == 1)
+			UT_ASSERT_EQ(cluster_grd_entry_add_waiter(entry, &h1, ExclusiveLock),
+						 CLUSTER_GRD_ENTRY_OK);
+		if (kind == 2)
+			UT_ASSERT_EQ(cluster_grd_reservation_create(entry, &h1, ShareLock),
+						 CLUSTER_GRD_ENTRY_OK);
+		if (kind == 3) {
+			UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &h2, ShareLock),
+						 CLUSTER_GRD_ENTRY_OK);
+			UT_ASSERT_EQ(cluster_grd_entry_request_convert(entry, &convert, &drain),
+						 CLUSTER_GRD_CONVERT_ENQUEUED);
+		}
+		cluster_grd_entry_release(entry);
+		before_count = pg_atomic_read_u64(&shared->entry_current_count);
+		pg_atomic_write_u64(&shared->entry_current_count,
+							0); /* counter cannot hide list ownership */
+		UT_ASSERT_EQ(cluster_grd_normal_stop_poll(&observed, &shard, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(memcmp(&observed, &resid, sizeof(resid)), 0);
+		UT_ASSERT_EQ(shard, cluster_grd_shard_for_resource(&resid));
+		pg_atomic_write_u64(&shared->entry_current_count, before_count);
+		if (kind == 1)
+			UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&resid, &h1), CLUSTER_GRD_ENTRY_OK);
+		if (kind == 2)
+			UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&resid, &h1), CLUSTER_GRD_ENTRY_OK);
+		if (kind == 3) {
+			h1.request_id = 200;
+			UT_ASSERT_EQ(cluster_grd_cancel_convert_by_id(&resid, &h1, 0), CLUSTER_GRD_ENTRY_OK);
+			h1.request_id = 100;
+			UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &h2), CLUSTER_GRD_ENTRY_OK);
+		}
+		if (kind == 0 || kind == 3)
+			UT_ASSERT_EQ(cluster_grd_release_holder_by_id(&resid, &h1), CLUSTER_GRD_ENTRY_OK);
+		UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+		stop_grd_finish();
+	}
+}
+UT_TEST(test_normal_stop_grd_bounds_late_invalid_and_lock_order)
+{
+	ClusterGrdShared *shared = stop_grd_setup();
+	ClusterResId resid;
+	ClusterGrdEntry *entry;
+	const char *reason;
+	uint32 shard;
+	LWLock *lock = &GetNamedLWLockTranche("ClusterGrdShard")[PGRAC_GRD_SHARD_COUNT - 1].lock;
+	grd_lifecycle_resid(6420, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	entry->ngranted
+		= PGRAC_GRD_MAX_HOLDERS + 1; /* malformed producer boundary, no array read allowed */
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GRD_ENTRY_SHAPE_INVALID");
+	entry->ngranted = 0;
+	pg_atomic_write_u32(&shared->shard_phase[PGRAC_GRD_SHARD_COUNT - 1], 99);
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, &shard, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(shard, PGRAC_GRD_SHARD_COUNT - 1);
+	UT_ASSERT_STR_EQ(reason, "GRD_SHARD_PHASE_INVALID");
+	pg_atomic_write_u32(&shared->shard_phase[PGRAC_GRD_SHARD_COUNT - 1], GRD_SHARD_FROZEN);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	pg_atomic_write_u32(&shared->shard_phase[PGRAC_GRD_SHARD_COUNT - 1], GRD_SHARD_NORMAL);
+	LWLockAcquire(lock, LW_SHARED);
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GRD_SHARD_LOCK_HELD");
+	LWLockRelease(lock);
+	UT_ASSERT_EQ(cluster_grd_normal_stop_poll(NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+	stop_grd_finish();
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -5639,7 +5804,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(110);
+	UT_PLAN(114);
+	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
 	UT_RUN(test_grd_resid_encode_decode_roundtrip);
@@ -5779,6 +5945,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_authority_same_composite_repost_retains_done_slots);
 	UT_RUN(test_recovery_authority_composite_change_repost_requires_fresh_done);
 
+	UT_RUN(test_normal_stop_grd_keeps_master_and_empty_cached_entries);
+	UT_RUN(test_normal_stop_grd_all_four_responsibilities_use_original_release);
+	UT_RUN(test_normal_stop_grd_bounds_late_invalid_and_lock_order);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

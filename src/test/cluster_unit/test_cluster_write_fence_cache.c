@@ -11,6 +11,8 @@
 #include <unistd.h>
 
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_clean_leave.h"
+#include "miscadmin.h"
 #include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_shmem.h"
@@ -36,7 +38,9 @@
 
 UT_DEFINE_GLOBALS();
 
-int CritSectionCount = 0;
+volatile uint32 CritSectionCount = 0;
+bool IsUnderPostmaster = true;
+BackendType MyBackendType = B_LMON;
 int cluster_node_id = 0;
 int cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_ON;
 int cluster_write_fence_lease_ms = 1000;
@@ -531,14 +535,111 @@ UT_TEST(test_critical_zero_lease_remains_panic_with_exact_reason)
 	UT_ASSERT(!cluster_write_fence_allowed());
 }
 
+UT_TEST(test_stop_requires_owning_lmon_and_region)
+{
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	attach_cache();
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_cache_history_is_not_work_but_publisher_is)
+{
+	ClusterFenceMarker marker = cache_marker(0xAA);
+	uint64 seq;
+	uint8 before[sizeof(fence_shmem.bytes)];
+	const char *reason;
+	attach_cache();
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(&marker, 1000000, 0));
+	memcpy(before, fence_shmem.bytes, sizeof(before));
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(memcmp(before, fence_shmem.bytes, sizeof(before)) == 0);
+	seq = cluster_write_fence_authority_cache_mutation_begin();
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "WRITE_FENCE_CACHE_PUBLICATION") == 0);
+	UT_ASSERT_EQ(cluster_write_fence_authority_cache_sequence(), seq);
+	cluster_write_fence_authority_cache_mutation_end(seq);
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_marker_waits_for_original_qvotec_completion)
+{
+	ClusterFenceMarker marker = cache_marker(0xAB), delivered;
+	ClusterMarkerAsync owner;
+	uint32 result;
+	const char *reason;
+	uint64 key;
+	attach_cache();
+	cluster_marker_async_init(&owner);
+	UT_ASSERT(cluster_write_fence_submit_marker_async(&owner, &marker,
+													  CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2, 100));
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(reason, "WRITE_FENCE_MARKER_MAILBOX") == 0);
+	UT_ASSERT_EQ(key, owner.inflight_seq);
+	UT_ASSERT(cluster_write_fence_qvotec_poll_pending(&delivered));
+	UT_ASSERT(memcmp(&delivered, &marker, sizeof(marker)) == 0);
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	/* Disk completion is a fixture boundary. The shared observer does not
+	 * discharge the LMON reconfig owner's private async/staged event. */
+	cluster_write_fence_qvotec_complete(true);
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(cluster_marker_async_is_submitted(&owner));
+	UT_ASSERT_EQ(cluster_write_fence_poll_marker_async(&owner, 101, &result, NULL),
+				 CLUSTER_MARKER_POLL_ACKED);
+	UT_ASSERT_EQ(result, CLUSTER_FENCE_MARKER_SUBMIT_ACK);
+	UT_ASSERT(cluster_write_fence_submit_marker_async(&owner, &marker,
+													  CLUSTER_MARKER_KIND_FENCE_FAILSTOP, 2, 102));
+	UT_ASSERT(cluster_write_fence_qvotec_poll_pending(&delivered));
+	cluster_write_fence_qvotec_complete(false);
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "WRITE_FENCE_MARKER_FAILED") == 0);
+}
+
+UT_TEST(test_stop_rejects_self_fence_and_impossible_mailbox)
+{
+	ClusterWriteFenceShmem *s = (ClusterWriteFenceShmem *)fence_shmem.bytes;
+	ClusterFenceMarker marker = cache_marker(0xAC);
+	uint64 seq;
+	const char *reason;
+	attach_cache();
+	marker.fenced_dead_bitmap[0] = 1; /* actual original token publisher */
+	cluster_write_fence_refresh_from_marker(&marker, 1000);
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "WRITE_FENCE_SELF_FENCED") == 0);
+	/* Explicit corruption fixture: completed unpublished request must not be
+	 * hidden behind an in-progress cache publication. */
+	attach_cache();
+	seq = cluster_write_fence_authority_cache_mutation_begin();
+	pg_atomic_write_u64(&s->marker_completion_seq, 1);
+	UT_ASSERT_EQ(cluster_write_fence_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "WRITE_FENCE_MARKER_SEQUENCE") == 0);
+	UT_ASSERT_EQ(cluster_write_fence_authority_cache_sequence(), seq);
+	cluster_write_fence_authority_cache_mutation_end(seq);
+}
+
 int
 main(void)
 {
 #ifdef USE_ASSERT_CHECKING
-	UT_PLAN(10);
+	UT_PLAN(14);
 #else
-	UT_PLAN(9);
+	UT_PLAN(13);
 #endif
+	UT_RUN(test_stop_requires_owning_lmon_and_region);
 	UT_RUN(test_cache_publish_revalidate_and_invalidate);
 #ifdef USE_ASSERT_CHECKING
 	UT_RUN(test_invalidate_waits_out_preexisting_publisher);
@@ -551,6 +652,9 @@ main(void)
 	UT_RUN(test_passive_fence_snapshot_retains_expiry_without_mutation);
 	UT_RUN(test_denial_detail_keeps_original_expiry_after_renewal);
 	UT_RUN(test_critical_zero_lease_remains_panic_with_exact_reason);
+	UT_RUN(test_stop_cache_history_is_not_work_but_publisher_is);
+	UT_RUN(test_stop_marker_waits_for_original_qvotec_completion);
+	UT_RUN(test_stop_rejects_self_fence_and_impossible_mailbox);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

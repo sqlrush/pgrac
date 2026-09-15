@@ -39,6 +39,7 @@
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_epoch.h" /* PGRAC: spec-7.2 D2 HELLO conn_epoch */
 #include "cluster/cluster_gcs_block.h"
@@ -2127,6 +2128,97 @@ cluster_ic_rdma_borrow_block_scratch(int32 peer_id, size_t len, void **out_addr,
 #else
 	return false;
 #endif
+}
+
+ClusterNormalStopPollResult
+cluster_ic_rdma_normal_stop_poll(bool *active_out, int *peer_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	bool active = false;
+	int peer_id = -1;
+	const char *reason = "INACTIVE_EMPTY";
+
+#define RDMA_STOP_NOTE(r, p, why)                                                                  \
+	do {                                                                                           \
+		if (result == CLUSTER_NORMAL_STOP_READY                                                    \
+			|| ((r) == CLUSTER_NORMAL_STOP_INVALID && result != CLUSTER_NORMAL_STOP_INVALID)) {    \
+			result = (r);                                                                          \
+			peer_id = (p);                                                                         \
+			reason = (why);                                                                        \
+		}                                                                                          \
+	} while (0)
+
+	if (!IsUnderPostmaster || !(AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess())) {
+		RDMA_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, -1, "NOT_OWNER");
+		goto done;
+	}
+#if defined(HAVE_LIBIBVERBS) && defined(HAVE_LIBRDMACM) && defined(HAVE_RDMA_RDMA_CMA_H)
+	/* Never call runtime_available here: that probes devices. A selected
+	 * provider or configured tier alone is not an initialized data path. */
+	active = RdmaCtxOpen && RdmaProvider != NULL;
+	if (RdmaCtxOpen && RdmaProvider == NULL)
+		RDMA_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, -1, "OPEN_WITHOUT_PROVIDER");
+	else if (active)
+		reason = "EMPTY";
+	for (int p = 0; p < CLUSTER_MAX_NODES; p++) {
+		const ClusterICRdmaPeer *peer = &RdmaPeers[p];
+		bool invalid = peer->pending_release_count < 0
+					   || peer->pending_release_count > CLUSTER_IC_RDMA_MAX_SGE
+					   || peer->block_reply_pending_release_count < 0
+					   || peer->block_reply_pending_release_count > CLUSTER_IC_RDMA_MAX_SGE
+					   || peer->queued_len > peer->queued_buf_len
+					   || ((peer->queued_buf == NULL) != (peer->queued_buf_len == 0));
+		/* Count-zero cannot hide an orphan raw-pin callback. NULL callback
+		 * arguments are legal; NULL callbacks within an owned range are not. */
+		if (!invalid) {
+			for (int i = 0; i < CLUSTER_IC_RDMA_MAX_SGE; i++) {
+				if (i < peer->pending_release_count)
+					invalid |= peer->pending_release_cb[i] == NULL;
+				else
+					invalid |= peer->pending_release_cb[i] != NULL
+							   || peer->pending_release_arg[i] != NULL;
+				if (i < peer->block_reply_pending_release_count)
+					invalid |= peer->block_reply_pending_release_cb[i] == NULL;
+				else
+					invalid |= peer->block_reply_pending_release_cb[i] != NULL
+							   || peer->block_reply_pending_release_arg[i] != NULL;
+			}
+		}
+		if (invalid)
+			RDMA_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, p, "INVALID_PRIVATE_STATE");
+		else if (peer->send_busy || peer->queued_len > 0 || peer->block_reply_send_busy
+				 || peer->pending_release_count > 0 || peer->block_reply_pending_release_count > 0
+				 || peer->block_scratch_borrowed)
+			RDMA_STOP_NOTE(active ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID, p,
+						   active ? "TRANSFER_OWNED" : "OWNED_WITHOUT_PROVIDER");
+	}
+#endif
+	/* Empty is an exact pointer-pair predicate. A nonempty list is never
+	 * READY, including a fully read frame not yet returned by its consumer.
+	 * Do not drain CQ, read/free frames or call release callbacks here. */
+	if ((RdmaInboundHead == NULL) != (RdmaInboundTail == NULL))
+		RDMA_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, -1, "INBOUND_HEAD_TAIL");
+	else if (RdmaInboundHead != NULL) {
+		const ClusterICRdmaInboundFrame *ends[2] = { RdmaInboundHead, RdmaInboundTail };
+		bool invalid = RdmaInboundTail->next != NULL;
+		for (int i = 0; i < 2; i++)
+			invalid |= !rdma_valid_peer_id(ends[i]->peer_id) || ends[i]->data == NULL
+					   || ends[i]->len == 0 || ends[i]->consumed > ends[i]->len;
+		if (invalid || !active)
+			RDMA_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, RdmaInboundHead->peer_id,
+						   invalid ? "INVALID_INBOUND" : "INBOUND_WITHOUT_PROVIDER");
+		else
+			RDMA_STOP_NOTE(CLUSTER_NORMAL_STOP_PENDING, RdmaInboundHead->peer_id, "INBOUND_OWNED");
+	}
+done:
+	if (active_out != NULL)
+		*active_out = active;
+	if (peer_out != NULL)
+		*peer_out = peer_id;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+#undef RDMA_STOP_NOTE
 }
 
 bool

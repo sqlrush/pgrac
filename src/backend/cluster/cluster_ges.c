@@ -33,6 +33,8 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_clean_leave.h"
+
 #include "access/xact.h" /* spec-5.8 D1c — GetTopTransactionIdIfAny for waiter_xid */
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_epoch.h"
@@ -56,8 +58,8 @@
 #include "cluster/cluster_wal_retention.h" /* RF-ROOT P6 WALR conditional convert */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h" /* spec-5.8 D8 — cluster_ic_send_envelope (REPORT send-back) */
-#include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
-#include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
+#include "cluster/cluster_qvotec.h"	   /* cluster_qvotec_in_quorum */
+#include "cluster/cluster_conf.h"	   /* cluster_conf_lookup_node */
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_startup_phase.h"
@@ -521,6 +523,10 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 			cluster_grd_inc_ges_inbound_validation_fail();
 			return;
 		}
+		/* A fresh diagnostic REPORT is new service work, not an old round's
+		 * completion. Preserve the validated REPORT-consumer path below. */
+		if (!cluster_normal_stop_service_new_work(false))
+			return;
 		if (cluster_lmd_is_ready()) {
 			/*
 			 * spec-5.8 D8 — build this node's local wait-for REPORT and SEND it

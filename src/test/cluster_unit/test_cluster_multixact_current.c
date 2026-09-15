@@ -26,6 +26,7 @@
 #include <stdio.h>
 
 #include "access/htup_details.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ic_router.h"
@@ -49,6 +50,18 @@
 
 
 UT_DEFINE_GLOBALS();
+
+static bool stop_new_read_allowed = true;
+static int stop_new_read_calls;
+static int stop_allocation_calls;
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	Assert(!modifies_data);
+	stop_new_read_calls++;
+	return stop_new_read_allowed;
+}
 
 static char test_memory_context_storage;
 MemoryContext TopMemoryContext = (MemoryContext)&test_memory_context_storage;
@@ -83,6 +96,7 @@ FlushErrorState(void)
 void *
 palloc0(Size size)
 {
+	stop_allocation_calls++;
 	return calloc(1, size);
 }
 
@@ -3173,7 +3187,19 @@ UT_TEST(test_current_multixact_origin_serves_describe_on_capability_bound_reply)
 	env.payload_length = sizeof(request);
 	cluster_node_id = 2;
 
+	stop_new_read_allowed = false;
+	stop_new_read_calls = stop_allocation_calls = 0;
 	cluster_gcs_current_mx_describe_serve_inline(&env, &request);
+	UT_ASSERT_EQ(stop_new_read_calls, 1);
+	UT_ASSERT_EQ(stop_allocation_calls, 0);
+	UT_ASSERT_EQ(test_runtime_native_describe_calls, 0);
+	UT_ASSERT_EQ(test_runtime_describe_send_calls, 0);
+	stop_new_read_allowed = true;
+	stop_new_read_calls = 0;
+	test_runtime_native_describe_calls = test_runtime_describe_send_calls = 0;
+	test_runtime_describe_capability_calls = test_runtime_describe_generation_match_calls = 0;
+	cluster_gcs_current_mx_describe_serve_inline(&env, &request);
+	UT_ASSERT_EQ(stop_new_read_calls, 1);
 	UT_ASSERT_EQ(test_runtime_native_describe_calls, 1);
 	UT_ASSERT_EQ(test_runtime_describe_capability_calls, 1);
 	UT_ASSERT_EQ(test_runtime_describe_generation_match_calls, 1);
@@ -3360,7 +3386,19 @@ UT_TEST(test_current_multixact_origin_serves_member_proof_on_capability_bound_re
 	env.payload_length = sizeof(request);
 	cluster_node_id = 4;
 
+	stop_new_read_allowed = false;
+	stop_new_read_calls = stop_allocation_calls = 0;
 	cluster_gcs_current_mx_member_proof_serve_inline(&env, &request);
+	UT_ASSERT_EQ(stop_new_read_calls, 1);
+	UT_ASSERT_EQ(stop_allocation_calls, 0);
+	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 0);
+	UT_ASSERT_EQ(test_runtime_describe_send_calls, 0);
+	stop_new_read_allowed = true;
+	stop_new_read_calls = 0;
+	test_runtime_describe_send_calls = test_runtime_describe_capability_calls = 0;
+	test_runtime_describe_generation_match_calls = 0;
+	cluster_gcs_current_mx_member_proof_serve_inline(&env, &request);
+	UT_ASSERT_EQ(stop_new_read_calls, 1);
 	UT_ASSERT_EQ(test_runtime_origin_proof_source_calls, 0);
 	UT_ASSERT_EQ(test_runtime_describe_capability_calls, 1);
 	UT_ASSERT_EQ(test_runtime_describe_generation_match_calls, 1);

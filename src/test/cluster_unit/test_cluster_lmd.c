@@ -64,14 +64,24 @@
 #include "postgres.h"
 
 #include <signal.h>
+#include <setjmp.h>
 #include <string.h>
 
 #include "cluster/cluster_cancel_token.h" /* spec-5.9 D5 — victim-ack tick deps */
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_grd.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
+#include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_cssd.h"
+#include "cluster/cluster_shmem.h"
+#include "utils/guc.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lwlock.h"
+#include "storage/proc.h"
+#include "storage/ipc.h"
+#include "postmaster/auxprocess.h"
 
 /* Drop PG's port.h printf override; unit_test.h uses stdlib printf. */
 #ifdef vprintf
@@ -85,6 +95,27 @@
 #endif
 
 #include "unit_test.h"
+
+static ClusterCleanLeaveSharedState test_stop_region;
+static ClusterLeaveState *cl_state = &test_stop_region.leave;
+static ClusterNormalStopState *cl_normal_stop;
+static uint32 cl_normal_stop_service_depth, cl_normal_stop_service_bit;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+static sigjmp_buf test_main_exit;
+static bool test_main_running;
+static bool test_probe_waiting;
+static int test_main_case, test_main_waits, test_main_polls, test_main_scans;
+static int test_main_coord_scans;
+static int test_main_exit_code, test_error_level;
+static pg_on_exit_callback test_exit_callback;
+static LWLock *test_locks[4];
+static unsigned test_lock_depth;
+static ClusterNormalStopPollResult test_graph_observation;
+static void test_stop_work(void);
+static int test_stop_wait(void);
+static void test_callback_late_work(void);
+#include "test_cluster_lmon_stop_service.inc"
 
 
 /* ============================================================
@@ -101,15 +132,34 @@ elog_finish(int e pg_attribute_unused(), const char *f pg_attribute_unused(), ..
 {}
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return false;
+	test_error_level = elevel;
+	return test_main_running && elevel >= ERROR;
 }
 
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+	if (test_error_level < FATAL && PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	proc_exit(1);
+}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	proc_exit(1);
+}
+
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
 
 int
 errcode(int sqlerrcode pg_attribute_unused())
@@ -179,7 +229,7 @@ RequestAddinShmemSpace(Size size pg_attribute_unused())
 {}
 
 void
-cluster_shmem_register_region(const void *r pg_attribute_unused())
+cluster_shmem_register_region(const ClusterShmemRegion *r pg_attribute_unused())
 {}
 
 /* LWLock / ConditionVariable stubs — state not exercised in unit tests. */
@@ -190,11 +240,25 @@ LWLockInitialize(LWLock *l pg_attribute_unused(), int tranche_id pg_attribute_un
 bool
 LWLockAcquire(LWLock *l pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	if (test_lock_depth >= lengthof(test_locks) || (l == &cl_state->lock && test_lock_depth != 0))
+		abort();
+	test_locks[test_lock_depth++] = l;
 	return true;
 }
 
 void
 LWLockRelease(LWLock *l pg_attribute_unused())
+{
+	if (test_lock_depth == 0 || test_locks[--test_lock_depth] != l)
+		abort();
+}
+void
+LWLockReleaseAll(void)
+{
+	test_lock_depth = 0;
+}
+void
+SetLatch(Latch *l pg_attribute_unused())
 {}
 
 void
@@ -247,6 +311,12 @@ int cluster_victim_repeat_window_ms = 5000;
 /* spec-5.9 D5 — victim-ack tick deps (the tick is never invoked in unit tests;
  * stubbed so cluster_lmd.o links). */
 int cluster_cancel_ack_timeout_ms = 1000;
+int cluster_cancel_max_retransmit = 3;
+AuxProcType MyAuxProcType = LmdProcess;
+static uint64 test_marker_id;
+static ClusterCancelMarker test_marker;
+static int test_ack_sent;
+static int test_ack_mismatch;
 struct PROC_HDR;
 struct PROC_HDR *ProcGlobal = NULL;
 ClusterCancelMarker
@@ -254,14 +324,51 @@ cluster_cancel_token_take_marker(struct PGPROC *p pg_attribute_unused(),
 								 uint64 *out_cancel_id pg_attribute_unused(),
 								 uint64 *out_seq pg_attribute_unused())
 {
-	return CLUSTER_CANCEL_MARKER_NONE;
+	*out_cancel_id = test_marker_id;
+	return test_marker;
 }
 void
 cluster_ges_send_cancel_ack(int32 c pg_attribute_unused(),
 							const struct ClusterGrdHolderId *v pg_attribute_unused(),
 							uint64 w pg_attribute_unused(), uint64 id pg_attribute_unused(),
 							uint8 s pg_attribute_unused())
-{}
+{
+	test_ack_sent++;
+}
+
+void
+cluster_ges_send_cancel_pending(int32 n, const ClusterGrdHolderId *v, uint64 w, uint64 c)
+{
+	(void)n;
+	(void)v;
+	(void)w;
+	(void)c;
+}
+void
+cluster_lmd_cancel_ack_mismatch_count_inc(uint64 n)
+{
+	test_ack_mismatch += n;
+}
+void
+cluster_lmd_cancel_exhausted_timeout_count_inc(uint64 n)
+{
+	(void)n;
+}
+void
+cluster_lmd_cancel_no_safe_victim_count_inc(uint64 n)
+{
+	(void)n;
+}
+void
+cluster_lmd_cancel_retransmit_count_inc(uint64 n)
+{
+	(void)n;
+}
+void
+cluster_lmd_reconfig_cancel_discarded_count_inc(uint64 n)
+{
+	(void)n;
+}
 
 /* spec-2.22 D2/D3/D5 — LMD graph + Tarjan symbols pulled by cluster_lmd.o
  * (LmdMain calls Tarjan scan; shmem region registry references graph
@@ -269,7 +376,10 @@ cluster_ges_send_cancel_ack(int32 c pg_attribute_unused(),
  */
 void
 cluster_lmd_tarjan_run_local_scan(void)
-{}
+{
+	if (test_main_running)
+		test_stop_work();
+}
 
 Size
 cluster_lmd_graph_shmem_size(void)
@@ -306,7 +416,7 @@ SignalHandlerForShutdownRequest(int sig pg_attribute_unused())
 {}
 
 void
-ProcessConfigFile(int context pg_attribute_unused())
+ProcessConfigFile(GucContext context pg_attribute_unused())
 {}
 
 void
@@ -317,6 +427,8 @@ int
 WaitLatch(struct Latch *l pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
+	if (test_main_running)
+		return test_stop_wait();
 	return 0;
 }
 
@@ -331,7 +443,24 @@ init_ps_display(const char *fixed_part pg_attribute_unused())
 void
 proc_exit(int code pg_attribute_unused())
 {
-	/* In test stub, proc_exit must not really exit — return to caller. */
+	pg_on_exit_callback callback = test_exit_callback;
+	if (!test_main_running)
+		abort();
+	test_exit_callback = NULL;
+	test_main_exit_code = code;
+	if (code == 0 && test_main_case == 7)
+		test_callback_late_work();
+	if (callback != NULL)
+		callback(code, 0);
+	siglongjmp(test_main_exit, 1);
+}
+
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	if (test_exit_callback != NULL || arg != 0)
+		abort();
+	test_exit_callback = callback;
 }
 
 extern PGDLLIMPORT sigset_t UnBlockSig;
@@ -362,11 +491,11 @@ procsignal_sigusr1_handler(int sig pg_attribute_unused())
 bool
 errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {
-	return false;
+	return errstart(elevel, domain);
 }
 
 /* spec-2.24 D14/D16 stub audit — new symbols introduced by Steps 1-9. */
-int64
+bool
 TimestampDifferenceExceeds(int64 a pg_attribute_unused(), int64 b pg_attribute_unused(),
 						   int us pg_attribute_unused())
 {
@@ -407,15 +536,6 @@ cluster_lmd_signal_local_victim(uint32 a pg_attribute_unused(), uint64 b pg_attr
 {
 	return false;
 }
-/* spec-5.9 D6 — pending-cancel table lives in cluster_lmd_tarjan.o; stubbed. */
-void
-cluster_lmd_pending_cancel_tick(void)
-{}
-void
-cluster_lmd_pending_cancel_on_ack(uint64 c pg_attribute_unused(), uint8 s pg_attribute_unused(),
-								  const ClusterLmdVertex *v pg_attribute_unused(),
-								  int32 src pg_attribute_unused())
-{}
 void
 cluster_lmd_cross_node_cancel_queue_full_count_inc(uint64 d pg_attribute_unused())
 {}
@@ -445,7 +565,7 @@ cluster_conf_node_count(void)
 	return 1;
 }
 
-int
+ClusterCssdPeerState
 cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
 {
 	return 0; /* CLUSTER_CSSD_PEER_ALIVE */
@@ -453,13 +573,24 @@ cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
 
 void
 cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms pg_attribute_unused())
-{}
+{
+	if (test_main_running) {
+		test_main_coord_scans++;
+		UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&test_stop_region.normal_stop.service_seal), 0);
+	}
+}
 
 /* spec-5.8 D8 — probe collector shmem region register (called from
  * cluster_lmd_shmem_register); standalone harness never attaches it. */
 void
 cluster_lmd_probe_collector_shmem_register(void)
 {}
+
+/* Actual queue, victim and coordinator cancellation producer/consumer bodies.
+ * Native PGPROC markers, transport and scan scheduling are explicit fixtures. */
+#include "../../backend/cluster/cluster_lmd.c"
+#include "test_cluster_lmd_pending.inc"
 
 
 /* ============================================================
@@ -808,11 +939,351 @@ UT_TEST(test_lmd_anti_thrash_recent_victim_ring)
 
 UT_DEFINE_GLOBALS();
 
+static void
+test_stop_lmd_reset(void)
+{
+	static PROC_HDR procs;
+	static PGPROC backend[2];
+	reset_lmd_stub_shmem();
+	memset(lmd_victim_acks, 0, sizeof(lmd_victim_acks));
+	memset(lmd_pending_cancels, 0, sizeof(lmd_pending_cancels));
+	memset(&procs, 0, sizeof(procs));
+	memset(backend, 0, sizeof(backend));
+	procs.allProcs = backend;
+	procs.allProcCount = 2;
+	ProcGlobal = &procs;
+	MyAuxProcType = LmdProcess;
+	IsUnderPostmaster = true;
+	test_marker = CLUSTER_CANCEL_MARKER_NONE;
+	test_marker_id = 0;
+	test_ack_sent = test_ack_mismatch = 0;
+	cl_normal_stop = NULL;
+	cl_normal_stop_service_depth = cl_normal_stop_service_bit = 0;
+	test_lock_depth = 0;
+}
+
+static ClusterLmdVertex
+test_stop_victim(int node)
+{
+	ClusterLmdVertex v = { 0 };
+	v.node_id = node;
+	v.procno = 1;
+	v.cluster_epoch = 17;
+	v.request_id = 33;
+	v.wait_seq = 41;
+	return v;
+}
+
+UT_TEST(test_stop_lmd_observations_belong_to_actual_lmd)
+{
+	test_stop_lmd_reset();
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	MyAuxProcType = LmdProcess;
+	lmd_cancel_queue = NULL;
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
+UT_TEST(test_stop_cancel_queue_only_original_dequeue_retires_wrapped_items)
+{
+	GesCancelAckPayload ack = { 0 };
+	ClusterLmdCancelItem item;
+	test_stop_lmd_reset();
+	ack.opcode = GES_REQ_OPCODE_CANCEL_ACK;
+	lmd_cancel_queue->head = lmd_cancel_queue->tail = CLUSTER_LMD_CANCEL_QUEUE_DEPTH - 1;
+	UT_ASSERT(cluster_lmd_cancel_queue_enqueue(1, &ack, sizeof(ack)));
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(lmd_cancel_queue->head, CLUSTER_LMD_CANCEL_QUEUE_DEPTH - 1);
+	UT_ASSERT(cluster_lmd_cancel_queue_dequeue(&item));
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	/* Consumed ring bytes and monotonic counters are not live ownership. */
+	lmd_cancel_queue->tail = CLUSTER_LMD_CANCEL_QUEUE_DEPTH;
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
+UT_TEST(test_stop_victim_ack_retains_exact_marker_and_original_send)
+{
+	ClusterGrdHolderId victim = { 0, 1, 17, 33 };
+	test_stop_lmd_reset();
+	lmd_victim_ack_add(1, &victim, 41, 99, 1);
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	test_marker = CLUSTER_CANCEL_MARKER_CONSUMED;
+	test_marker_id = 98;
+	cluster_lmd_victim_ack_tick();
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(test_ack_sent, 0);
+	test_marker_id = 99;
+	cluster_lmd_victim_ack_tick();
+	UT_ASSERT_EQ(test_ack_sent, 1);
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_pending_cancel_requires_full_ack_identity_and_terminal_status)
+{
+	ClusterLmdVertex victim = test_stop_victim(1);
+	ClusterLmdVertex stale = victim;
+	test_stop_lmd_reset();
+	UT_ASSERT_NOT_NULL(lmd_pending_cancel_add(&victim, 55, 17, false, 42, &victim, 1));
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_lmd_pending_cancel_on_ack(55, GES_CANCEL_ACK_INSTALLED, &victim, 1);
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	stale.wait_seq++;
+	cluster_lmd_pending_cancel_on_ack(55, GES_CANCEL_ACK_CONSUMED, &stale, 1);
+	UT_ASSERT_EQ(test_ack_mismatch, 1);
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_lmd_pending_cancel_on_ack(55, GES_CANCEL_ACK_CONSUMED, &victim, 1);
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_private_last_slot_invalid_not_hidden_by_pending)
+{
+	ClusterLmdVertex victim = test_stop_victim(1);
+	LmdPendingCancel *first;
+	test_stop_lmd_reset();
+	first = lmd_pending_cancel_add(&victim, 55, 17, false, 42, &victim, 1);
+	UT_ASSERT_NOT_NULL(first);
+	lmd_pending_cancels[63] = *first;
+	lmd_pending_cancels[63].cancel_id = 0;
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	lmd_victim_acks[63].active = true;
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
+static void
+test_stop_work(void)
+{
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	if (cluster_normal_stop_requested())
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 1024);
+	test_main_scans++;
+	if (test_main_case == 6) {
+		LWLockAcquire(&cluster_lmd_state->lwlock, LW_SHARED);
+		ereport(ERROR, (errmsg("fixture original scan error")));
+	}
+	if (test_main_case == 8 && test_main_scans == 1) {
+		pg_atomic_write_u32(&cl_normal_stop->requested, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
+					 CLUSTER_NORMAL_STOP_PENDING);
+	}
+	if (test_main_case == 9 && test_main_scans == 1)
+		pg_atomic_fetch_add_u64(&cluster_lmd_state->lmd_edge_submission_count, 1);
+}
+
+ClusterNormalStopPollResult
+cluster_lmd_graph_normal_stop_poll(uint64 *key, const char **reason)
+{
+	if (key != NULL)
+		*key = 0;
+	if (reason != NULL)
+		*reason = "FIXTURE_GRAPH";
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	test_main_polls++;
+	return test_graph_observation;
+}
+
+ClusterNormalStopPollResult
+cluster_lmd_probe_normal_stop_poll(uint64 *key, const char **reason)
+{
+	if (key != NULL)
+		*key = 0;
+	if (reason != NULL)
+		*reason = "FIXTURE_REPORT_COLLECTOR";
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	return CLUSTER_NORMAL_STOP_READY;
+}
+
+static int
+test_stop_wait(void)
+{
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 0);
+	if (test_probe_waiting) {
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask) & 1024, 0);
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(cluster_normal_stop_service_seal(2047, 1), CLUSTER_NORMAL_STOP_PENDING);
+		MyAuxProcType = LmdProcess;
+		return WL_LATCH_SET;
+	}
+	if (++test_main_waits > 3)
+		abort();
+	if (cluster_normal_stop_requested())
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask),
+					 test_graph_observation == CLUSTER_NORMAL_STOP_READY ? 1024 : 0);
+	if (test_main_waits == 1) {
+		test_graph_observation = CLUSTER_NORMAL_STOP_READY;
+		/* Seal is a controller fixture: no new periodic scans in the next pass. */
+		if (test_main_case == 2)
+			pg_atomic_write_u32(&cl_normal_stop->service_seal, 1);
+	}
+	if (test_main_waits == 2) {
+		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED);
+		pg_atomic_write_u32(&cl_normal_stop->service_seal, 2);
+		ShutdownRequestPending = true;
+	}
+	return WL_LATCH_SET;
+}
+
+static void
+test_callback_late_work(void)
+{
+	lmd_victim_acks[63].active = true;
+}
+
+static void
+run_stop_lmd_main(int scenario)
+{
+	test_stop_lmd_reset();
+	memset(&test_stop_region, 0, sizeof(test_stop_region));
+	cl_normal_stop = &test_stop_region.normal_stop;
+	pg_atomic_write_u32(&cl_normal_stop->requested, scenario != 1 && scenario != 8);
+	pg_atomic_write_u32(&cl_normal_stop->identity_published, 1);
+	pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
+	test_main_case = scenario;
+	test_main_waits = test_main_scans = test_main_coord_scans = test_main_polls = 0;
+	test_main_exit_code = -1;
+	test_exit_callback = NULL;
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
+	test_graph_observation = scenario == 3	 ? CLUSTER_NORMAL_STOP_PENDING
+							 : scenario == 4 ? CLUSTER_NORMAL_STOP_INVALID
+											 : CLUSTER_NORMAL_STOP_READY;
+	ShutdownRequestPending = scenario == 5;
+	lmd_last_coord_scan = lmd_last_cleanup_sweep = 0;
+	test_main_running = true;
+	if (sigsetjmp(test_main_exit, 1) == 0)
+		LmdMain();
+	test_main_running = false;
+	PG_exception_stack = NULL;
+	ShutdownRequestPending = false;
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 0);
+}
+
+UT_TEST(test_lmd_actual_main_work_sleep_pending_and_ordinary)
+{
+	for (int scenario = 1; scenario <= 3; scenario++) {
+		run_stop_lmd_main(scenario);
+		UT_ASSERT_EQ(test_main_exit_code, 0);
+		UT_ASSERT_EQ(test_main_waits, 2);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		UT_ASSERT(scenario == 1 ? test_main_polls == 0 : test_main_polls >= 4);
+		if (scenario == 2)
+			UT_ASSERT_EQ(test_main_scans, 1);
+	}
+}
+
+UT_TEST(test_lmd_actual_main_invalid_early_exit_error_and_callback_refuse_clean)
+{
+	for (int scenario = 4; scenario <= 7; scenario++) {
+		run_stop_lmd_main(scenario);
+		UT_ASSERT_EQ(test_main_exit_code, 1);
+		UT_ASSERT(cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		if (scenario < 7)
+			UT_ASSERT_EQ(test_main_waits, 0);
+	}
+}
+
+UT_TEST(test_lmd_actual_main_midpass_request_and_fast_continue_still_poll)
+{
+	for (int scenario = 8; scenario <= 9; scenario++) {
+		run_stop_lmd_main(scenario);
+		UT_ASSERT_EQ(test_main_exit_code, 0);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		UT_ASSERT_EQ(test_main_waits, 2);
+		UT_ASSERT(test_main_polls >= (scenario == 9 ? 5 : 4));
+	}
+}
+
+UT_TEST(test_lmd_actual_probe_wait_suspends_active_but_never_signs_idle)
+{
+	test_stop_lmd_reset();
+	memset(&test_stop_region, 0, sizeof(test_stop_region));
+	cl_normal_stop = &test_stop_region.normal_stop;
+	pg_atomic_write_u32(&cl_normal_stop->requested, 1);
+	pg_atomic_write_u32(&cl_normal_stop->identity_published, 1);
+	pg_atomic_write_u32(&cl_normal_stop->frontends_gone, 1);
+	pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_QUIESCE);
+	cl_normal_stop->peer_requests_seen = 15;
+	pg_atomic_write_u32(&cl_normal_stop->cleaner_quiesce_requested, 1);
+	pg_atomic_write_u32(&cl_normal_stop->cleaner_quiesced_mask, 255);
+	pg_atomic_write_u32(&cl_normal_stop->service_idle_mask, 2047);
+	UT_ASSERT(cluster_normal_stop_service_enter());
+	test_probe_waiting = test_main_running = true;
+	lmd_probe_wait(50);
+	test_probe_waiting = test_main_running = false;
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 1024);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+	UT_ASSERT(cluster_normal_stop_service_leave(true));
+	UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
+				 CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_service_seal(2047, 1), CLUSTER_NORMAL_STOP_READY);
+	cl_normal_stop = NULL;
+}
+
+UT_TEST(test_lmd_final_seal_rejects_new_queue_item_without_rewriting_existing)
+{
+	GesCancelAckPayload ack = { 0 };
+	LmdCancelQueueShmem before;
+	test_stop_lmd_reset();
+	ack.opcode = GES_REQ_OPCODE_CANCEL_ACK;
+	UT_ASSERT(cluster_lmd_cancel_queue_enqueue(1, &ack, sizeof(ack)));
+	before = *lmd_cancel_queue;
+	memset(&test_stop_region, 0, sizeof(test_stop_region));
+	cl_normal_stop = &test_stop_region.normal_stop;
+	pg_atomic_write_u32(&cl_normal_stop->requested, 1);
+	pg_atomic_write_u32(&cl_normal_stop->service_seal, 2);
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT(cluster_normal_stop_service_enter());
+	UT_ASSERT(!cluster_lmd_cancel_queue_enqueue(1, &ack, sizeof(ack)));
+	UT_ASSERT_EQ(memcmp(&before, lmd_cancel_queue, sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_LATE_UNSEALED_WORK);
+	(void)cluster_normal_stop_service_leave(true);
+	MyAuxProcType = LmdProcess;
+	cl_normal_stop = NULL;
+}
+
+UT_TEST(test_lmd_epoch_zero_is_owned_until_original_ack_not_invalid)
+{
+	ClusterGrdHolderId local = { 0, 1, 0, 0 };
+	ClusterLmdVertex remote = test_stop_victim(1);
+	test_stop_lmd_reset();
+	remote.cluster_epoch = 0; /* CLUSTER_EPOCH_INITIAL is a real epoch. */
+	remote.request_id = 0;	  /* TX waits have no GES request id. */
+	lmd_victim_ack_add(1, &local, 41, 99, 1);
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	test_marker = CLUSTER_CANCEL_MARKER_CONSUMED;
+	test_marker_id = 99;
+	cluster_lmd_victim_ack_tick();
+	UT_ASSERT_EQ(test_ack_sent, 1);
+	UT_ASSERT_EQ(cluster_lmd_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_NOT_NULL(lmd_pending_cancel_add(&remote, 55, 0, false, 42, &remote, 1));
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_lmd_pending_cancel_on_ack(55, GES_CANCEL_ACK_CONSUMED, &remote, 1);
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_lmd_pending_zero_wait_seq_awaits_remote_revalidation_result)
+{
+	ClusterLmdVertex remote = test_stop_victim(1);
+	test_stop_lmd_reset();
+	remote.wait_seq = 0; /* Plain GRD wait metadata, not an installed token. */
+	UT_ASSERT_NOT_NULL(lmd_pending_cancel_add(&remote, 55, 17, false, 42, &remote, 1));
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_lmd_pending_cancel_on_ack(55, GES_CANCEL_ACK_NOT_WAITING, &remote, 1);
+	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
 
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(10);
+	UT_PLAN(22);
 
 	UT_RUN(test_lmd_auxproc_and_backend_type_surface);
 	UT_RUN(test_lmd_shmem_size_init_idempotent);
@@ -824,6 +1295,18 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_lmd_enabled_guc_default_true);
 	UT_RUN(test_lmd_state_to_string_and_alphabetic_position);
 	UT_RUN(test_lmd_anti_thrash_recent_victim_ring);
+	UT_RUN(test_stop_lmd_observations_belong_to_actual_lmd);
+	UT_RUN(test_stop_cancel_queue_only_original_dequeue_retires_wrapped_items);
+	UT_RUN(test_stop_victim_ack_retains_exact_marker_and_original_send);
+	UT_RUN(test_stop_pending_cancel_requires_full_ack_identity_and_terminal_status);
+	UT_RUN(test_stop_private_last_slot_invalid_not_hidden_by_pending);
+	UT_RUN(test_lmd_actual_main_work_sleep_pending_and_ordinary);
+	UT_RUN(test_lmd_actual_main_invalid_early_exit_error_and_callback_refuse_clean);
+	UT_RUN(test_lmd_actual_main_midpass_request_and_fast_continue_still_poll);
+	UT_RUN(test_lmd_actual_probe_wait_suspends_active_but_never_signs_idle);
+	UT_RUN(test_lmd_final_seal_rejects_new_queue_item_without_rewriting_existing);
+	UT_RUN(test_lmd_epoch_zero_is_owned_until_original_ack_not_invalid);
+	UT_RUN(test_lmd_pending_zero_wait_seq_awaits_remote_revalidation_result);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

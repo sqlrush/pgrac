@@ -47,6 +47,8 @@
 #include <stddef.h>
 
 #include "cluster/cluster_fence.h"
+#include "cluster/cluster_clean_leave.h"
+#include "miscadmin.h"
 
 #undef printf
 #undef fprintf
@@ -69,8 +71,14 @@ UT_DEFINE_GLOBALS();
  * ============================================================ */
 
 bool IsUnderPostmaster = false;
+BackendType MyBackendType = B_INVALID;
 int MyProcPid = 0;
 static int ut_kill_call_count = 0;
+static int ut_lw_acquire_calls;
+static int ut_lw_try_calls;
+static int ut_lw_releases;
+static bool ut_lw_try_succeeds = true;
+static bool ut_caller_holds_lock;
 
 int
 kill(pid_t pid pg_attribute_unused(), int sig pg_attribute_unused())
@@ -196,11 +204,26 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	ut_lw_acquire_calls++;
 	return true;
+}
+bool
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+{
+	ut_lw_try_calls++;
+	return ut_lw_try_succeeds;
+}
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	if (ut_caller_holds_lock)
+		callback((LWLock *)shmem_storage, LW_EXCLUSIVE, context);
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	ut_lw_releases++;
+}
 
 #include "cluster/cluster_shmem.h"
 void
@@ -281,7 +304,11 @@ ut_reset_fence_shmem(void)
 	ClusterFenceFreezePending = 0;
 	ut_now_us = 1700000000000000LL;
 	ut_kill_call_count = 0;
+	ut_lw_acquire_calls = ut_lw_try_calls = ut_lw_releases = 0;
+	ut_lw_try_succeeds = true;
+	ut_caller_holds_lock = false;
 	IsUnderPostmaster = false;
+	MyBackendType = B_INVALID;
 	MyProcPid = 12345;
 }
 
@@ -568,14 +595,86 @@ UT_TEST(test_t_fence_7_thaw_clears_self_fence_when_freeze_disabled)
 }
 
 
-/* ============================================================
- * Test driver.
- * ============================================================ */
+/* A148: original production APIs stage/retire the obligation. Locks, clock,
+ * process role and OS kill are fixtures; no real signal is sent by this test. */
+UT_TEST(test_stop_requires_attached_lmon)
+{
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	ut_reset_fence_shmem();
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	MyBackendType = B_LMON;
+	ut_caller_holds_lock = true;
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(ut_lw_acquire_calls, 0);
+	ut_caller_holds_lock = false;
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_keeps_self_request_until_original_owner)
+{
+	const char *domain, *reason;
+	uint64 key;
+	unsigned char before[sizeof(shmem_storage)];
+	ut_reset_fence_shmem();
+	cluster_enabled = cluster_self_fence_enabled = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	cluster_fence_self_request("stop obligation", 0);
+	memcpy(before, shmem_storage, sizeof(before));
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(strcmp(domain, "FENCE") == 0);
+	UT_ASSERT(strcmp(reason, "FENCE_SELF_REQUEST_PENDING") == 0);
+	UT_ASSERT_EQ(key, (uint64)ut_now_us);
+	UT_ASSERT(memcmp(before, shmem_storage, sizeof(before)) == 0);
+	ut_now_us += 31000000;
+	/* Age is not authority to clear the request. */
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(ut_kill_call_count, 0);
+	cluster_fence_broadcast_thaw("original quorum owner", 0);
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_postmaster_contention_preserves_request_and_earliest_grace)
+{
+	ut_reset_fence_shmem();
+	cluster_enabled = cluster_self_fence_enabled = true;
+	cluster_self_fence_grace_ms = 1000;
+	cluster_fence_self_request("first", 0);
+	ut_now_us += 900000;
+	cluster_fence_self_request("repeat", 0);
+	ut_lw_acquire_calls = ut_lw_releases = 0;
+	ut_lw_try_succeeds = false;
+	ut_now_us += 200000;
+	cluster_fence_postmaster_check();
+	UT_ASSERT_EQ(ut_lw_acquire_calls, 0);
+	UT_ASSERT_EQ(ut_lw_releases, 0);
+	UT_ASSERT_EQ(ut_kill_call_count, 0);
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	IsUnderPostmaster = false;
+	ut_lw_try_succeeds = true;
+	cluster_fence_postmaster_check();
+	UT_ASSERT_EQ(ut_kill_call_count, 1);
+	cluster_fence_postmaster_check();
+	UT_ASSERT_EQ(ut_kill_call_count, 1);
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_fence_normal_stop_poll(NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	cluster_self_fence_grace_ms = 30000;
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(13);
 	UT_RUN(test_t_fence_1a_guc_defaults);
+	UT_RUN(test_stop_requires_attached_lmon);
 	UT_RUN(test_t_fence_1b_shmem_init);
 	UT_RUN(test_t_fence_1c_freeze_flag_default);
 	UT_RUN(test_t_fence_1d_api_smoke);
@@ -585,5 +684,8 @@ main(void)
 	UT_RUN(test_t_fence_4_self_request_idempotent_keeps_earliest);
 	UT_RUN(test_t_fence_6_thaw_clears_self_fence_pending);
 	UT_RUN(test_t_fence_7_thaw_clears_self_fence_when_freeze_disabled);
+	UT_RUN(test_stop_keeps_self_request_until_original_owner);
+	UT_RUN(test_postmaster_contention_preserves_request_and_earliest_grace);
 	UT_DONE();
+	return ut_failed_count ? 1 : 0;
 }

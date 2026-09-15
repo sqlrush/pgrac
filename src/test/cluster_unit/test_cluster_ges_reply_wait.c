@@ -16,6 +16,7 @@
 #include <string.h>
 
 #include "cluster/cluster_ges.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_xnode_profile.h"
@@ -44,6 +45,7 @@ UT_DEFINE_GLOBALS();
  * ============================================================ */
 
 bool IsUnderPostmaster = false;
+bool cluster_enabled = true;
 bool cluster_xnode_profile_enabled = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 int cluster_ges_reply_wait_max_entries = 1024;
@@ -122,6 +124,7 @@ static Size fake_entrysize;
 static long fake_init_size;
 static long fake_max_size;
 static int fake_lock_depth;
+static LWLock *fake_held_lock;
 static int fake_lock_acquires;
 static int fake_lock_releases;
 static int fake_cv_prepare_calls;
@@ -238,11 +241,12 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 {}
 
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
 	Assert(fake_lock_depth == 0);
 	Assert(mode == LW_EXCLUSIVE || mode == LW_SHARED);
 	fake_lock_depth = 1;
+	fake_held_lock = lock;
 	fake_lock_acquires++;
 	return true;
 }
@@ -252,7 +256,13 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
 {
 	Assert(fake_lock_depth == 1);
 	fake_lock_depth = 0;
+	fake_held_lock = NULL;
 	fake_lock_releases++;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return fake_lock_depth != 0 && lock == fake_held_lock;
 }
 
 void
@@ -336,6 +346,8 @@ make_key(uint64 request_id, int32 source_node_id, int32 dest_node_id, uint32 req
 static void
 reset_reply_wait_with_cap(int max_entries)
 {
+	bool under_postmaster = IsUnderPostmaster;
+	IsUnderPostmaster = false; /* actual fresh-region initializer */
 	memset(&fake_shared, 0, sizeof(fake_shared));
 	fake_shared_found = false;
 	fake_keysize = 0;
@@ -356,6 +368,7 @@ reset_reply_wait_with_cap(int max_entries)
 	fake_cv_broadcast_calls = 0;
 	cluster_ges_reply_wait_max_entries = max_entries;
 	cluster_ges_reply_wait_shmem_init();
+	IsUnderPostmaster = under_postmaster;
 }
 
 static void
@@ -603,10 +616,90 @@ UT_TEST(test_reply_wait_error_cancels_registration_before_owner_cleanup)
 	UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);
 }
 
+UT_TEST(test_normal_stop_missing_then_actual_empty_table)
+{
+	const char *reason;
+	GesReplyWaitKey key;
+	IsUnderPostmaster = true;
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(&key, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GES_REPLY_UNINITIALIZED");
+	reset_reply_wait();
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(&key, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(key.request_id, 0);
+	IsUnderPostmaster = false;
+}
+UT_TEST(test_normal_stop_delivered_is_pending_until_real_consume)
+{
+	GesReplyWaitKey key = make_key(701, 1, 3, GES_REQ_OPCODE_REQUEST, 21), observed;
+	GesReplyWaitVerdict verdict;
+	const char *reason;
+	FakeReplyWaitHash before;
+	IsUnderPostmaster = true;
+	reset_reply_wait();
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&key, 9000));
+	before = fake_hash;
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(&observed, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(memcmp(&key, &observed, sizeof(key)), 0);
+	UT_ASSERT_EQ(memcmp(&before, &fake_hash, sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_deliver(&key, GES_REPLY_OPCODE_GRANT, 0),
+				 GES_REPLY_DELIVER_WOKE);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict),
+				 GES_REPLY_WAIT_POLL_DELIVERED);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(&observed, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = false;
+}
+UT_TEST(test_normal_stop_abandoned_is_not_owner_cleanup)
+{
+	GesReplyWaitKey key = make_key(702, 1, 3, GES_REQ_OPCODE_REQUEST, 21);
+	const char *reason;
+	IsUnderPostmaster = true;
+	reset_reply_wait();
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&key, 1));
+	UT_ASSERT_EQ(cluster_ges_reply_wait_sweep_timeout(50000), 0); /* live, even past deadline */
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(NULL, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(!cluster_ges_reply_wait_mark_abandoned(&key, 9000));
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(NULL, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_sweep_timeout(8999), 0);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_sweep_timeout(9000), 1);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&key, 10000));
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(NULL, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	cluster_ges_reply_wait_delete(&key);
+	IsUnderPostmaster = false;
+}
+UT_TEST(test_normal_stop_late_bad_key_and_held_original_lock)
+{
+	GesReplyWaitKey valid = make_key(703, 1, 3, GES_REQ_OPCODE_REQUEST, 21);
+	GesReplyWaitKey bad = make_key(0, 1, 3, GES_REQ_OPCODE_REQUEST, 21), observed;
+	const char *reason;
+	IsUnderPostmaster = true;
+	reset_reply_wait();
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&valid, 9000));
+	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&bad, 9000)); /* malformed producer boundary */
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(&observed, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GES_REPLY_KEY_INVALID");
+	UT_ASSERT_EQ(memcmp(&observed, &bad, sizeof(bad)), 0);
+	LWLockAcquire((LWLock *)fake_shared.data, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_normal_stop_poll(NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GES_REPLY_LOCK_HELD");
+	LWLockRelease((LWLock *)fake_shared.data);
+	IsUnderPostmaster = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(15);
+	UT_RUN(test_normal_stop_missing_then_actual_empty_table);
 	UT_RUN(test_poll_pending_keeps_exact_entry);
 	UT_RUN(test_poll_delivered_copies_complete_verdict_then_consumes);
 	UT_RUN(test_poll_abandoned_is_explicit_and_preserves_tombstone);
@@ -618,6 +711,9 @@ main(void)
 	UT_RUN(test_registered_reply_wait_delivers_without_deleting_live_entry);
 	UT_RUN(test_reply_ready_before_enrollment_skips_sleep_but_requires_poll);
 	UT_RUN(test_reply_wait_error_cancels_registration_before_owner_cleanup);
+	UT_RUN(test_normal_stop_delivered_is_pending_until_real_consume);
+	UT_RUN(test_normal_stop_abandoned_is_not_owner_cleanup);
+	UT_RUN(test_normal_stop_late_bad_key_and_held_original_lock);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

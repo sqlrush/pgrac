@@ -39,6 +39,7 @@
 
 #include "cluster/cluster_gcs_block.h" /* GcsBlockRequestPayload (pre-send hook) */
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
@@ -1212,6 +1213,92 @@ cluster_lms_outbound_depth(int worker_id)
 	LWLockRelease(lock);
 	return depth;
 }
+
+ClusterNormalStopPollResult
+cluster_lms_outbound_normal_stop_poll(int *worker_out, uint32 *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	int worker;
+
+	if (worker_out != NULL)
+		*worker_out = -1;
+	if (slot_out != NULL)
+		*slot_out = UINT32_MAX;
+	if (reason_out != NULL)
+		*reason_out = "OUTBOUND_UNINITIALIZED";
+	if (worker_out == NULL || slot_out == NULL || reason_out == NULL
+		|| cluster_lms_outbound_shared == NULL || cluster_lms_outbound_rings == NULL
+		|| cluster_lms_outbound_rings != cluster_lms_outbound_shared->rings
+		|| cluster_lms_workers <= 0 || cluster_lms_workers > CLUSTER_LMS_MAX_WORKERS)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	for (worker = 0; worker < CLUSTER_LMS_MAX_WORKERS; worker++) {
+		if (OB_LOCK(worker) == NULL) {
+			*worker_out = worker;
+			return CLUSTER_NORMAL_STOP_INVALID;
+		}
+	}
+	/* Same all-ring lock order as the existing transport snapshot. This is
+	 * only ring ownership: retained local items and IC-owned copies require
+	 * the actor's outer return and its separate transport-private poll. */
+	for (worker = 0; worker < CLUSTER_LMS_MAX_WORKERS; worker++)
+		LWLockAcquire(OB_LOCK(worker), LW_SHARED);
+	*reason_out = "NONE";
+	for (worker = 0; worker < CLUSTER_LMS_MAX_WORKERS; worker++) {
+		const ClusterLmsOutboundState *ring = OB_RING(worker);
+		const char *invalid_reason = NULL;
+		uint32 bad_slot = UINT32_MAX;
+
+		if (ring->head >= PGRAC_LMS_OUTBOUND_CAPACITY || ring->tail >= PGRAC_LMS_OUTBOUND_CAPACITY
+			|| ring->count > PGRAC_LMS_OUTBOUND_CAPACITY
+			|| (ring->tail + ring->count) % PGRAC_LMS_OUTBOUND_CAPACITY != ring->head)
+			invalid_reason = "OUTBOUND_RING_GEOMETRY";
+		else if (worker >= cluster_lms_workers && ring->count != 0)
+			invalid_reason = "OUTBOUND_INACTIVE_RING";
+		else {
+			for (uint32 offset = 0; offset < ring->count; offset++) {
+				uint32 index = (ring->tail + offset) % PGRAC_LMS_OUTBOUND_CAPACITY;
+				const ClusterLmsOutboundSlot *slot = &ring->ring[index];
+
+				if (slot->dest_node_id >= CLUSTER_MAX_NODES
+					|| slot->kind > CLUSTER_LMS_OUTBOUND_RESOURCE_X_REMOTE_S_STATUS_CANCELLED
+					|| slot->payload_len > PGRAC_LMS_OUTBOUND_PAYLOAD_MAX) {
+					invalid_reason = "OUTBOUND_FRAME_INVALID";
+					bad_slot = index;
+					break;
+				}
+			}
+		}
+		if (invalid_reason != NULL) {
+			*worker_out = worker;
+			*slot_out = bad_slot;
+			*reason_out = invalid_reason;
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			break;
+		}
+		if (ring->count != 0 && result == CLUSTER_NORMAL_STOP_READY) {
+			*worker_out = worker;
+			*slot_out = ring->tail;
+			*reason_out = "OUTBOUND_FRAME_PENDING";
+			result = CLUSTER_NORMAL_STOP_PENDING;
+		}
+		/* Dequeued slot bytes/cookies are historical storage, not live entries. */
+	}
+	for (worker = CLUSTER_LMS_MAX_WORKERS - 1; worker >= 0; worker--)
+		LWLockRelease(OB_LOCK(worker));
+	return result;
+}
+
+#ifdef CLUSTER_LMS_OUTBOUND_UNIT_TEST
+extern void cluster_lms_outbound_test_geometry(int worker, uint32 head, uint32 tail, uint32 count);
+void
+cluster_lms_outbound_test_geometry(int worker, uint32 head, uint32 tail, uint32 count)
+{
+	Assert(worker >= 0 && worker < CLUSTER_LMS_MAX_WORKERS);
+	OB_RING(worker)->head = head;
+	OB_RING(worker)->tail = tail;
+	OB_RING(worker)->count = count;
+}
+#endif
 
 uint64
 cluster_lms_outbound_resource_x_staged_count(void)

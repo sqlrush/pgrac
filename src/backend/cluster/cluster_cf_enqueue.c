@@ -501,6 +501,46 @@ cluster_cf_join_readonly(void)
  */
 static bool cf_write_skip = false;
 
+ClusterNormalStopPollResult
+cluster_cf_normal_stop_poll(bool post_checkpoint, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID, shared;
+	const char *why = "CF_OWNER_INVALID", *shared_reason;
+
+	if (!IsUnderPostmaster || (!AmCheckpointerProcess() && MyBackendType != B_LMON))
+		goto done;
+	/* Observe this process's original holds, not another process's zeroed
+	 * copy. GRD separately verifies the registered holders. An unconfirmed
+	 * S6 remains owned; the observer does not attempt its release. */
+	shared = cluster_cf_normal_stop_shared_poll(post_checkpoint, &shared_reason);
+	if (shared != CLUSTER_NORMAL_STOP_READY && shared != CLUSTER_NORMAL_STOP_PENDING) {
+		why = shared_reason;
+		goto done;
+	}
+	if (cf_bootstrap_authority || cf_owner_eor_authority) {
+		why = "CF_RECOVERY_PERMISSION_ACTIVE";
+		goto done;
+	}
+	/* A prior EOR may leave a process-local skip hint. The original next
+	 * normal checkpoint sets it false before taking CF X; requiring that
+	 * change before the checkpoint itself would deadlock the first stop. */
+	if (cf_write_skip && (post_checkpoint || !AmCheckpointerProcess())) {
+		why = "CF_POST_CHECKPOINT_WRITE_SKIP";
+		goto done;
+	}
+	if (cf_hold_x.held || cf_hold_s.held) {
+		why = cf_hold_x.held ? "CF_LOCAL_X_HELD" : "CF_LOCAL_S_HELD";
+		result = CLUSTER_NORMAL_STOP_PENDING;
+	} else {
+		why = shared_reason;
+		result = shared;
+	}
+done:
+	if (reason)
+		*reason = why;
+	return result;
+}
+
 void
 cluster_cf_set_write_skip(bool on)
 {

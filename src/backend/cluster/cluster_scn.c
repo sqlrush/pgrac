@@ -47,6 +47,7 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_clean_leave.h"
 
 #include "cluster/cluster_conf.h" /* cluster_conf_has_peers */
 #include "cluster/cluster_cssd.h" /* cluster_cssd_get_alive_peer_count (spec-2.9 D2 Q7 zero-peer short-circuit) */
@@ -1742,12 +1743,151 @@ typedef struct ClusterScnBocPeerRetry {
 	SCN frontier;
 } ClusterScnBocPeerRetry;
 
+/* Original LMON-owned fanout state, made file-visible solely for its
+ * normal-stop observation. No shared field, wire or retirement changes. */
+static uint64 last_drained_sweep_count = 0;
+static SCN last_fanout_frontier = InvalidScn;
+static ClusterScnBocPeerRetry peer_retry[CLUSTER_MAX_NODES];
+
+ClusterNormalStopPollResult
+cluster_scn_normal_stop_poll(const char **domain_out, uint64 *key_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *domain = "SCN_PENDING", *reason = "SCN_OWNER_OR_SHARED_STATE_INVALID";
+	uint64 key = 0;
+	bool pending = false, invalid = false;
+	SCN frontier;
+	uint32 dirty;
+	unsigned i;
+
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || cluster_scn_state == NULL
+		|| !SCN_NODE_ID_VALID(cluster_scn_state->node_id)
+		|| cluster_scn_state->node_id != cluster_node_id)
+		goto done;
+	/* Original registries, not the diagnostic counts alone. Never discharge,
+	 * flush, advance a frontier or clear dirty while observing shutdown. */
+	LWLockAcquire(&cluster_scn_state->lwlock, LW_SHARED);
+	if (cluster_scn_state->adg_pending_overflowed || cluster_scn_state->durable_frozen) {
+		reason = "SCN_FRONTIER_UNTRACKED";
+		invalid = true;
+		goto unlocked;
+	}
+	if (cluster_scn_state->adg_pending_count > CLUSTER_SCN_ADG_PENDING_MAX
+		|| cluster_scn_state->durable_pending_count > CLUSTER_SCN_DURABLE_PENDING_MAX) {
+		reason = "SCN_REGISTRY_COUNT_INVALID";
+		invalid = true;
+		goto unlocked;
+	}
+	for (i = 0; i < CLUSTER_SCN_ADG_PENDING_MAX; i++) {
+		SCN scn = cluster_scn_state->adg_pending[i];
+		bool occupied = i < cluster_scn_state->adg_pending_count;
+		if ((occupied
+			 && (!SCN_VALID(scn) || scn_local(scn) == 0
+				 || scn_node_id(scn) != cluster_scn_state->node_id))
+			|| (!occupied && scn != InvalidScn)) {
+			reason = "SCN_ADG_SLOT_INVALID";
+			key = i;
+			invalid = true;
+			goto unlocked;
+		}
+		if (occupied && !pending) {
+			pending = true;
+			key = i;
+			reason = "SCN_ADG_COMMIT_PENDING";
+		}
+	}
+	for (i = 0; i < CLUSTER_SCN_DURABLE_PENDING_MAX; i++) {
+		SCN scn = cluster_scn_state->durable_pending_scn[i];
+		bool occupied = i < cluster_scn_state->durable_pending_count;
+		if ((occupied
+			 && (!SCN_VALID(scn) || scn_local(scn) == 0
+				 || scn_node_id(scn) != cluster_scn_state->node_id))
+			|| (!occupied
+				&& (scn != InvalidScn
+					|| !XLogRecPtrIsInvalid(cluster_scn_state->durable_pending_lsn[i])))) {
+			reason = "SCN_DURABLE_SLOT_INVALID";
+			key = i;
+			invalid = true;
+			goto unlocked;
+		}
+		if (occupied && !pending) {
+			pending = true;
+			key = i;
+			reason = "SCN_DURABLE_COMMIT_PENDING";
+		}
+	}
+unlocked:
+	LWLockRelease(&cluster_scn_state->lwlock);
+	if (invalid)
+		goto done;
+	result = pending ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;
+	if (!pending) {
+		domain = "NONE";
+		reason = "NONE";
+	}
+	if (cluster_scn_backend_pending_commit_scn != InvalidScn
+		|| cluster_scn_backend_durable_pending_scn != InvalidScn) {
+		if (result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			domain = "SCN_PENDING";
+			reason = "SCN_LOCAL_COMMIT_PENDING";
+		}
+	}
+	/* NOT_ADMITTED is still owned here even after the event/sweep was
+	 * consumed. WOULD_BLOCK belongs to the separately observed transport. */
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if (!peer_retry[i].pending)
+			continue;
+		if ((peer_retry[i].payload_len != 0
+			 && peer_retry[i].payload_len != CLUSTER_SCN_BOC_PAYLOAD_V1_LEN)
+			|| (peer_retry[i].payload_len == CLUSTER_SCN_BOC_PAYLOAD_V1_LEN
+				&& (!SCN_VALID(peer_retry[i].frontier)
+					|| scn_node_id(peer_retry[i].frontier) != cluster_scn_state->node_id))) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			domain = "SCN_BOC_RETRY";
+			key = i;
+			reason = "SCN_BOC_RETRY_INVALID";
+			goto done;
+		}
+		if (result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			domain = "SCN_BOC_RETRY";
+			key = i;
+			reason = "SCN_BOC_NOT_ADMITTED";
+		}
+	}
+	dirty = pg_atomic_read_u32(&cluster_scn_state->boc_event_dirty);
+	frontier = pg_atomic_read_u64(&cluster_scn_state->durable_safe_scn);
+	if (dirty > 1) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		domain = "SCN_BOC";
+		key = 0;
+		reason = "SCN_BOC_DIRTY_INVALID";
+	} else if (result == CLUSTER_NORMAL_STOP_READY
+			   && (dirty != 0
+				   || pg_atomic_read_u64(&cluster_scn_state->boc_sweep_count)
+						  != last_drained_sweep_count
+				   || (cluster_boc_event_publish && SCN_VALID(frontier)
+					   && (!SCN_VALID(last_fanout_frontier)
+						   || scn_total_cmp(frontier, last_fanout_frontier) > 0)))) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		domain = "SCN_BOC";
+		key = 0;
+		reason = "SCN_BOC_PUBLICATION_PENDING";
+	}
+done:
+	if (domain_out != NULL)
+		*domain_out = domain;
+	if (key_out != NULL)
+		*key_out = key;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
+
 void
 cluster_scn_lmon_drain_boc_broadcast(void)
 {
-	static uint64 last_drained_sweep_count = 0;
-	static SCN last_fanout_frontier = InvalidScn;
-	static ClusterScnBocPeerRetry peer_retry[CLUSTER_MAX_NODES];
 	ClusterICFanoutResult per_peer[CLUSTER_MAX_NODES];
 	uint64 sweep_count;
 	bool event_pending;

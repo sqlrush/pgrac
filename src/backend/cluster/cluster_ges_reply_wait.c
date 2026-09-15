@@ -43,6 +43,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_ges.h" /* spec-5.16: GES_REPLY_OPCODE_GRANT (orphan tombstone) */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_ges_reply_wait.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_shmem.h"
@@ -74,6 +75,55 @@ typedef struct ClusterGesReplyWaitShared {
 
 static ClusterGesReplyWaitShared *reply_wait_state = NULL;
 static HTAB *reply_wait_htab = NULL;
+
+ClusterNormalStopPollResult
+cluster_ges_reply_wait_normal_stop_poll(GesReplyWaitKey *key_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	GesReplyWaitKey observed = { 0 };
+	const char *reason = "NONE";
+	HASH_SEQ_STATUS scan;
+	GesReplyWaitEntry *entry;
+
+	if (!IsUnderPostmaster || !cluster_enabled || reply_wait_state == NULL
+		|| reply_wait_htab == NULL) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "GES_REPLY_UNINITIALIZED";
+		goto done;
+	}
+	if (LWLockHeldByMe(&reply_wait_state->lwlock)) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "GES_REPLY_LOCK_HELD";
+		goto done;
+	}
+	LWLockAcquire(&reply_wait_state->lwlock, LW_SHARED);
+	hash_seq_init(&scan, reply_wait_htab);
+	while ((entry = (GesReplyWaitEntry *)hash_seq_search(&scan)) != NULL) {
+		bool invalid
+			= entry->key.request_id == 0 || entry->key.source_node_id < 0
+			  || entry->key.source_node_id >= CLUSTER_MAX_NODES || entry->key.dest_node_id < 0
+			  || entry->key.dest_node_id >= CLUSTER_MAX_NODES || entry->key.request_opcode == 0;
+
+		/* Ready is still the caller's entry until its real consume/delete.
+		 * An abandoned entry can still recognize a late orphan GRANT until
+		 * its original completion/sweep removes it. Neither elapsed wall
+		 * clock nor the diagnostic live count discharges that ownership.
+		 * Only immutable keys are sampled; no CV/verdict bytes are read. */
+		if ((invalid && result != CLUSTER_NORMAL_STOP_INVALID)
+			|| result == CLUSTER_NORMAL_STOP_READY) {
+			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+			reason = invalid ? "GES_REPLY_KEY_INVALID" : "GES_REPLY_OWNED";
+			observed = entry->key;
+		}
+	}
+	LWLockRelease(&reply_wait_state->lwlock);
+done:
+	if (key_out != NULL)
+		*key_out = observed;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
 
 
 /* ============================================================

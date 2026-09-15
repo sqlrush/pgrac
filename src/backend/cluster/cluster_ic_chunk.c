@@ -43,6 +43,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"  /* cluster_node_id */
 #include "cluster/cluster_ic.h"	  /* cluster_ic_send_bytes */
 #include "cluster/cluster_ic_chunk.h"
@@ -93,6 +94,65 @@ typedef struct ChunkReassemblyState {
 
 static MemoryContext cluster_chunk_reassembly_ctx[CLUSTER_MAX_NODES];
 static ChunkReassemblyState cluster_chunk_reassembly_state[CLUSTER_MAX_NODES];
+
+ClusterNormalStopPollResult
+cluster_ic_chunk_normal_stop_poll(int *peer_out, uint32 *sequence_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	int peer;
+
+	if (peer_out == NULL || sequence_out == NULL || reason_out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*peer_out = -1;
+	*sequence_out = 0;
+	*reason_out = "NONE";
+	/* These are process-private owners, not a shared diagnostic snapshot.
+	 * The transport poll separately proves its plane is initialized. */
+	if (!IsUnderPostmaster || !(AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess())) {
+		*reason_out = "NOT_TRANSPORT_OWNER";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
+		const ChunkReassemblyState *st = &cluster_chunk_reassembly_state[peer];
+		bool invalid;
+
+		if (cluster_chunk_reassembly_ctx[peer] == NULL) {
+			/* Lazy, never-created contexts are legitimately empty. A lost
+			 * context with residual responsibility is not. */
+			invalid = st->buf != NULL || st->total_payload_len != 0 || st->chunk_total != 0
+					  || st->seq_next != 0 || st->inner_msg_type != 0 || st->source_node_id != 0
+					  || st->started_at != 0;
+			if (!invalid)
+				continue;
+		} else {
+			invalid = st->buf == NULL || st->chunk_total < 2
+					  || st->total_payload_len <= PGRAC_IC_CHUNK_BYTES
+					  || st->total_payload_len > PGRAC_IC_PAYLOAD_MAX_HARD_CAP
+					  || st->total_payload_len > (uint32)cluster_interconnect_payload_max_bytes
+					  || st->chunk_total
+							 != ((uint64)st->total_payload_len + PGRAC_IC_CHUNK_BYTES - 1)
+									/ PGRAC_IC_CHUNK_BYTES
+					  || st->seq_next > st->chunk_total || st->inner_msg_type == 0
+					  || st->inner_msg_type == PGRAC_IC_CHUNK_MSG_TYPE || st->source_node_id != peer
+					  || st->started_at <= 0;
+		}
+		if (invalid) {
+			*peer_out = peer;
+			*sequence_out = st->seq_next;
+			*reason_out = "CHUNK_STATE_INVALID";
+			return CLUSTER_NORMAL_STOP_INVALID;
+		}
+		/* seq_next == chunk_total still owns the buffer while the actual
+		 * inner consumer runs. Only the original reset ends ownership. */
+		if (result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			*peer_out = peer;
+			*sequence_out = st->seq_next;
+			*reason_out = "CHUNK_REASSEMBLY_OR_DISPATCH";
+		}
+	}
+	return result;
+}
 
 
 void

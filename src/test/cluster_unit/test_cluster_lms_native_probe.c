@@ -15,6 +15,8 @@ int cluster_lms_native_lock_probe_retry_budget = 60;
 int cluster_ges_request_timeout_ms = 60000;
 int cluster_ges_dedup_max_entries = 256;
 int MyProcPid = 100;
+bool IsUnderPostmaster = true;
+BackendType MyBackendType = B_LMS;
 Latch *MyLatch;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -47,6 +49,38 @@ static ClusterGesDedupShared dedup_state;
 static ClusterGesDedupEntry dedup_rows[256];
 static bool dedup_used[256];
 static LWLock dedup_lock;
+static LWLock *held_locks[16];
+static unsigned held_count;
+static bool stop_poll_in_completion;
+static bool stop_new_work_allowed = true;
+static unsigned stop_new_work_calls;
+
+void
+hash_seq_init(HASH_SEQ_STATUS *scan, HTAB *table)
+{
+	UT_ASSERT(table == cluster_ges_dedup_htab);
+	scan->hashp = table;
+	scan->curBucket = 0;
+}
+
+void *
+hash_seq_search(HASH_SEQ_STATUS *scan)
+{
+	while (scan->curBucket < lengthof(dedup_rows)) {
+		uint32 row = scan->curBucket++;
+		if (dedup_used[row])
+			return &dedup_rows[row];
+	}
+	return NULL;
+}
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	UT_ASSERT(!modifies_data);
+	stop_new_work_calls++;
+	return stop_new_work_allowed;
+}
 
 /* Only the shmem hash storage is controlled. Registration, exact reply
  * publication and completed-only removal execute the production module. */
@@ -95,14 +129,32 @@ GetCurrentTimestamp(void)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	(void)lock;
-	(void)mode;
+	if (held_count >= lengthof(held_locks) || LWLockHeldByMe(lock))
+		abort();
+	UT_ASSERT(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+	held_locks[held_count++] = lock;
 	return true;
 }
 void
 LWLockRelease(LWLock *lock)
 {
-	(void)lock;
+	if (held_count == 0 || held_locks[held_count - 1] != lock)
+		abort();
+	held_count--;
+}
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	for (unsigned i = 0; i < held_count; i++)
+		if (held_locks[i] == lock)
+			return true;
+	return false;
+}
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	for (unsigned i = 0; i < held_count; i++)
+		callback(held_locks[i], LW_EXCLUSIVE, context);
 }
 void
 ConditionVariableBroadcast(ConditionVariable *cv)
@@ -207,6 +259,14 @@ void
 cluster_grd_outbound_enqueue_lmon_reply(uint32 dest, const void *data, uint16 len)
 {
 	const GesReplyPayload *p = data;
+	if (stop_poll_in_completion) {
+		int slot;
+		const char *reason;
+
+		UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_STR_EQ(reason, "NATIVE_PROBE_OWNED");
+	}
 	(void)dest;
 	UT_ASSERT_EQ(len, sizeof(*p));
 	if (p->opcode == GES_REPLY_OPCODE_GRANT)
@@ -258,6 +318,10 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *id, int32 node, uint32 
 static void
 reset(void)
 {
+	UT_ASSERT_EQ(held_count, 0);
+	stop_new_work_allowed = true;
+	stop_new_work_calls = 0;
+	stop_poll_in_completion = false;
 	memset(&state, 0, sizeof(state));
 	cluster_lms_state = &state;
 	pg_atomic_init_u64(&state.native_probe_next_id, 1);
@@ -663,10 +727,234 @@ UT_TEST(native_grant_release_cycles_do_not_fill_the_receipt_table)
 	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 0);
 	UT_ASSERT_EQ(cluster_ges_dedup_full_reject_count(), 0);
 }
+UT_TEST(normal_stop_probe_owner_and_original_slot_locks)
+{
+	const char *reason;
+	int slot;
+
+	cluster_lms_state = NULL;
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "NATIVE_PROBE_UNINITIALIZED");
+	reset();
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	LWLockAcquire(&state.native_probe_slots[63].lock.lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "NATIVE_PROBE_LOCK_HELD");
+	LWLockRelease(&state.native_probe_slots[63].lock.lock);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(normal_stop_probe_all_descriptors_and_invalid_priority)
+{
+	const char *reason;
+	int slot;
+	ClusterLmsNativeLockProbeSlot *last;
+
+	reset();
+	UT_ASSERT(submit(0));
+	last = &state.native_probe_slots[63];
+	for (uint64 phase = PROBE_ACTIVE; phase <= PROBE_COMPLETING; phase++) {
+		pg_atomic_write_u64(&last->in_use, phase);
+		last->probe_id = 64;
+		UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&last->in_use), phase);
+	}
+	pg_atomic_write_u64(&last->in_use, 99);
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(slot, 63);
+	UT_ASSERT_STR_EQ(reason, "NATIVE_PROBE_STATE");
+	UT_ASSERT_EQ(grants, 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(normal_stop_probe_original_finish_not_final_ready)
+{
+	const char *reason;
+	int slot;
+
+	reset();
+	for (int i = 0; i < 16; i++)
+		UT_ASSERT(submit(i));
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	stop_poll_in_completion = true;
+	stop_new_work_allowed = false;
+	stop_new_work_calls = 0;
+	for (unsigned i = 0; i < sends; i++) {
+		cluster_lms_native_probe_recv_reply(wire_ids[i], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+		cluster_lms_native_probe_retry_tick();
+	}
+	stop_poll_in_completion = false;
+	UT_ASSERT_EQ(grants, 16);
+	UT_ASSERT_EQ(stop_new_work_calls, 0);
+	UT_ASSERT_EQ(occupied(), 0);
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(state.native_probe_slots[0].probe_id != 0); /* retained identity is not debt */
+	stop_new_work_allowed = true;
+	UT_ASSERT(submit(20));
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+}
+
+UT_TEST(normal_stop_probe_free_residual_and_reply_shape)
+{
+	const char *reason;
+	int slot;
+	ClusterLmsNativeLockProbeSlot *s;
+
+	reset();
+	s = &state.native_probe_slots[63];
+	s->final_ready = true;
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "NATIVE_PROBE_FREE_RESIDUAL");
+	UT_ASSERT(s->final_ready);
+	s->final_ready = false;
+	UT_ASSERT(submit(0));
+	s = &state.native_probe_slots[0];
+	s->received_replies_bitmap |= 0x80000000U;
+	UT_ASSERT_EQ(cluster_lms_native_probe_normal_stop_poll(&slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "NATIVE_PROBE_IDENTITY");
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(normal_stop_probe_new_service_context_not_frontend_wait)
+{
+	ClusterLmsSharedState before;
+
+	reset();
+	memcpy(&before, &state, sizeof(before));
+	stop_new_work_allowed = false;
+	UT_ASSERT(!submit(0));
+	UT_ASSERT_EQ(stop_new_work_calls, 1);
+	UT_ASSERT_EQ(occupied(), 0);
+	UT_ASSERT_EQ(sends, 0);
+	UT_ASSERT_EQ(grants, 0);
+	UT_ASSERT_EQ(memcmp(&state, &before, sizeof(state)), 0);
+	UT_ASSERT_EQ(held_count, 0);
+
+	/* Smart-stop may be awaiting an already running frontend. The service
+	 * seal must not be inserted into its common descriptor allocator. */
+	reset();
+	stop_new_work_allowed = false;
+	MyBackendType = B_BACKEND;
+	sleep_mode = 1;
+	UT_ASSERT(local_wait(60000));
+	MyBackendType = B_LMS;
+	UT_ASSERT_EQ(stop_new_work_calls, 0);
+	UT_ASSERT_EQ(occupied(), 0);
+	UT_ASSERT_EQ(held_count, 0);
+}
+
+UT_TEST(normal_stop_ges_new_receipt_not_replay_or_completion)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	GesReplyPayload reply = { 0 };
+
+	reset();
+	stop_new_work_allowed = false;
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_FULL);
+	UT_ASSERT_EQ(stop_new_work_calls, 1);
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 0);
+	stop_new_work_allowed = true;
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	stop_new_work_allowed = false;
+	stop_new_work_calls = 0;
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_IN_FLIGHT_DUPLICATE);
+	cluster_ges_dedup_record_reply(&key, (uint8 *)&reply, sizeof(reply));
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_CACHED_REPLY);
+	UT_ASSERT(cluster_ges_dedup_remove_completed(&key));
+	UT_ASSERT_EQ(stop_new_work_calls, 0);
+}
+
+UT_TEST(normal_stop_ges_original_completion_retains_cache)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	GesReplyPayload reply = { 0 };
+	const char *domain, *reason;
+	uint64 request;
+
+	reset();
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_ges_dedup_normal_stop_poll(&domain, &request, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	UT_ASSERT_EQ(cluster_ges_dedup_normal_stop_poll(&domain, &request, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(request, key.request_id);
+	UT_ASSERT_STR_EQ(reason, "GES_DEDUP_IN_FLIGHT");
+	UT_ASSERT(submit(37));
+	cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+	UT_ASSERT_EQ(cluster_ges_dedup_normal_stop_poll(&domain, &request, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 1);
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(reply.holder_procno, 37);
+	UT_ASSERT_EQ(reply.opcode, GES_REPLY_OPCODE_GRANT);
+	UT_ASSERT_EQ(held_count, 0);
+	MyBackendType = B_LMS;
+}
+
+UT_TEST(normal_stop_ges_invalid_overrides_pending_and_wrong_observer)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	GesReplyPayload reply = { 0 };
+	const char *domain, *reason;
+	uint64 request;
+
+	reset();
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	dedup_used[255] = true;
+	dedup_rows[255].key = receipt_key(99, 1099);
+	dedup_rows[255].status = CLUSTER_GES_DEDUP_CACHED_REPLY;
+	dedup_rows[255].cached_reply_len = 53;
+	UT_ASSERT_EQ(cluster_ges_dedup_normal_stop_poll(&domain, &request, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(request, 1099);
+	UT_ASSERT_STR_EQ(reason, "GES_DEDUP_REPLY_SHAPE");
+	UT_ASSERT_EQ(dedup_rows[255].cached_reply_len, 53);
+	reset();
+	LWLockAcquire(&dedup_lock, LW_EXCLUSIVE);
+	UT_ASSERT_EQ(cluster_ges_dedup_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GES_DEDUP_CALLER_LOCK");
+	LWLockRelease(&dedup_lock);
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(cluster_ges_dedup_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GES_DEDUP_OBSERVER_ROLE");
+	MyBackendType = B_LMON;
+	cluster_ges_dedup_htab = NULL;
+	UT_ASSERT_EQ(cluster_ges_dedup_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GES_DEDUP_UNINITIALIZED");
+	MyBackendType = B_LMS;
+}
+
 int
 main(void)
 {
-	printf("1..22\n");
+	printf("1..30\n");
+	UT_RUN(normal_stop_probe_owner_and_original_slot_locks);
+	UT_RUN(normal_stop_probe_all_descriptors_and_invalid_priority);
+	UT_RUN(normal_stop_probe_original_finish_not_final_ready);
+	UT_RUN(normal_stop_probe_free_residual_and_reply_shape);
+	UT_RUN(normal_stop_probe_new_service_context_not_frontend_wait);
+	UT_RUN(normal_stop_ges_new_receipt_not_replay_or_completion);
+	UT_RUN(normal_stop_ges_original_completion_retains_cache);
+	UT_RUN(normal_stop_ges_invalid_overrides_pending_and_wrong_observer);
 	UT_RUN(eight_active_ninth_must_wait_then_use_real_peer_clear);
 	UT_RUN(sixteen_requests_never_exceed_eight_active_and_all_finish);
 	UT_RUN(oldest_pending_is_promoted_first);

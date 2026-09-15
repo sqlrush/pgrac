@@ -33,6 +33,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_sequence.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "storage/condition_variable.h"
@@ -63,6 +64,51 @@ typedef struct ClusterSeqShared {
 
 static ClusterSeqShared *sq_state = NULL;
 static HTAB *sq_cache_htab = NULL;
+
+ClusterNormalStopPollResult
+cluster_sequence_normal_stop_poll(ClusterResId *resid_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *reason = "SQ_STOP_READY";
+	HASH_SEQ_STATUS scan;
+	const ClusterSeqInstanceCache *entry;
+
+	if (resid_out != NULL)
+		memset(resid_out, 0, sizeof(*resid_out));
+	if (!IsUnderPostmaster || (MyBackendType != B_CHECKPOINTER && MyBackendType != B_LMON)
+		|| sq_state == NULL || sq_cache_htab == NULL) {
+		reason = "SQ_STOP_OWNER_OR_SHMEM";
+		result = CLUSTER_NORMAL_STOP_INVALID;
+	} else {
+		/* Cached unused values may be discarded only after the real producers
+		 * have gone. A full-cache direct refill is covered by that frontend /
+		 * original page-owner cut, not by absence from this cache. */
+		LWLockAcquire(&sq_state->lwlock, LW_SHARED);
+		hash_seq_init(&scan, sq_cache_htab);
+		while ((entry = hash_seq_search(&scan)) != NULL) {
+			bool invalid;
+			if (!entry->refill_in_progress)
+				continue;
+			invalid = entry->resid.type != CLUSTER_SQ_RESID_TYPE
+					  || entry->resid.field3 != entry->generation || entry->increment == 0
+					  || entry->has_segment;
+			if (invalid || result == CLUSTER_NORMAL_STOP_READY) {
+				result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+				reason = invalid ? "SQ_REFILL_IDENTITY" : "SQ_REFILL_IN_PROGRESS";
+				if (resid_out != NULL)
+					*resid_out = entry->resid;
+			}
+			if (invalid) {
+				hash_seq_term(&scan);
+				break;
+			}
+		}
+		LWLockRelease(&sq_state->lwlock);
+	}
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
 
 static const ClusterShmemRegion cluster_sequence_region = {
 	.name = "pgrac cluster sequence",

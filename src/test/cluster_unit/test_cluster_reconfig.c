@@ -45,6 +45,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_thread_recovery.h"
@@ -124,6 +125,7 @@ cluster_undo_horizon_note_self_member(void)
  * test_cluster_marker_async.c. */
 #include "miscadmin.h"
 BackendType MyBackendType = B_INVALID;
+bool IsUnderPostmaster = false;
 
 /* Spec-5.15A phase-3 target-LMON sender controls.  The prerequisite provider
  * stays a production dependency of cluster_reconfig.c; this standalone unit
@@ -7052,10 +7054,118 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
 }
 
+static void
+stop_reconfig_shared_owners_body(void)
+{
+	ClusterReconfigState *s;
+	const char *domain, *reason;
+	uint64 key;
+	ut_join_setup();
+	s = (ClusterReconfigState *)reconfig_shmem_storage;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_READY, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	MyBackendType = B_CHECKPOINTER;
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_INVALID, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	MyBackendType = B_LMON;
+	pg_atomic_write_u32(&s->prebump_sync_active, 1);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_PENDING, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	s->pending_join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES - 1] = 128;
+	pg_atomic_write_u32(&s->prebump_sync_active, 0);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_PENDING,
+				 cluster_reconfig_normal_stop_poll(&domain, &key, &reason));
+	UT_ASSERT_EQ(CLUSTER_MAX_NODES - 1, key);
+	s->pending_join_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES - 1] = 0;
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_READY, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	/* Historical cached counters/marker bytes must not be reset to be idle. */
+	pg_atomic_write_u64(&s->formation_marker_request_seq, 7);
+	pg_atomic_write_u64(&s->formation_marker_completion_seq, 7);
+	pg_atomic_write_u64(&s->join_marker_request_seq, 9);
+	pg_atomic_write_u64(&s->join_marker_completion_seq, 9);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_READY, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	pg_atomic_write_u32(&s->prebump_sync_active, 1);
+	pg_atomic_write_u64(&s->join_marker_completion_seq, 10);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_INVALID,
+				 cluster_reconfig_normal_stop_poll(&domain, &key, &reason));
+	UT_ASSERT_EQ(0, strcmp(domain, "JOIN_MAILBOX"));
+	UT_ASSERT_EQ(10, pg_atomic_read_u64(&s->join_marker_completion_seq));
+	ut_join_setup();
+	MyBackendType = B_INVALID;
+	IsUnderPostmaster = false;
+}
+
+static void
+stop_reconfig_actual_formation_owner_body(void)
+{
+	ClusterReconfigState *s;
+	ClusterFormationMarkerSubmitRequest request;
+	ut_join_setup();
+	cluster_node_id = 0;
+	ut_declared_set[0] = ut_declared_set[1] = true;
+	ut_in_quorum_value = true;
+	UT_ASSERT(cluster_epoch_observe_remote(UINT64_C(5)));
+	cluster_reconfig_record_observed_slot(1, UINT64_C(70), UINT64_C(1), 0);
+	cluster_reconfig_record_observed_fresh_alive(1, true);
+	cluster_reconfig_test_reset_cold_formation();
+	s = (ClusterReconfigState *)reconfig_shmem_storage;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	for (int i = 0; i < 3; i++)
+		cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(1, pg_atomic_read_u64(&s->formation_marker_request_seq));
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_PENDING, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	UT_ASSERT(cluster_reconfig_formation_qvotec_poll_pending(&request));
+	UT_ASSERT(request.active);
+	cluster_reconfig_formation_qvotec_complete(true);
+	/* QVOTEC completion is not the arbiter's admission/retirement. */
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_PENDING, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(CLUSTER_MEMBER_MEMBER, cluster_membership_get_state(0));
+	UT_ASSERT_EQ(1, s->self_join_admitted);
+	UT_ASSERT_EQ(CLUSTER_NORMAL_STOP_READY, cluster_reconfig_normal_stop_poll(NULL, NULL, NULL));
+	UT_ASSERT_EQ(1, pg_atomic_read_u64(&s->formation_marker_request_seq));
+	cluster_reconfig_test_reset_cold_formation();
+	ut_join_setup();
+	MyBackendType = B_INVALID;
+	IsUnderPostmaster = false;
+}
+
+static void
+stop_reconfig_isolated(void (*body)(void))
+{
+	pid_t pid;
+	int status;
+	/* Admission intentionally leaves boot-private evidence. Do not reset
+	 * that evidence merely to run another simulated postmaster in this suite. */
+	fflush(NULL);
+	pid = fork();
+	UT_ASSERT(pid >= 0);
+	if (pid < 0)
+		return;
+	if (pid == 0) {
+		body();
+		fflush(NULL);
+		_exit(ut_current_failed ? 1 : 0);
+	}
+	UT_ASSERT_EQ(pid, waitpid(pid, &status, 0));
+	UT_ASSERT(WIFEXITED(status));
+	UT_ASSERT_EQ(0, WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+}
+UT_TEST(test_stop_reconfig_shared_owners)
+{
+	stop_reconfig_isolated(stop_reconfig_shared_owners_body);
+}
+UT_TEST(test_stop_reconfig_actual_formation_owner)
+{
+	stop_reconfig_isolated(stop_reconfig_actual_formation_owner_body);
+}
+
 int
 main(void)
 {
-	UT_PLAN(117);
+	UT_PLAN(119);
+	UT_RUN(test_stop_reconfig_shared_owners);
+	UT_RUN(test_stop_reconfig_actual_formation_owner);
 
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 

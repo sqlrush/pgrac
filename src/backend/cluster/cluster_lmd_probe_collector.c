@@ -36,13 +36,15 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
-#include "cluster/cluster_ges.h"  /* GesDeadlockReportHeader */
-#include "cluster/cluster_guc.h"  /* cluster_lmd_max_wait_edges */
-#include "cluster/cluster_lmd.h"  /* ClusterLmdWaitEdge + cluster_lmd_probe_member_admit */
+#include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_ges.h" /* GesDeadlockReportHeader */
+#include "cluster/cluster_guc.h" /* cluster_lmd_max_wait_edges */
+#include "cluster/cluster_lmd.h" /* ClusterLmdWaitEdge + cluster_lmd_probe_member_admit */
 #include "cluster/cluster_lmd_probe_collector.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
+#include "port/pg_bitutils.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 
@@ -72,6 +74,52 @@ typedef struct ClusterLmdProbeShmem {
 } ClusterLmdProbeShmem;
 
 static ClusterLmdProbeShmem *cluster_lmd_probe = NULL;
+
+/* A complete REPORT or a drained copy is still owned by the coordinator
+ * until its original reset. Never reset the collector to manufacture idle. */
+ClusterNormalStopPollResult
+cluster_lmd_probe_normal_stop_poll(uint64 *probe_id, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *why = "LMD_PROBE_UNINITIALIZED";
+	uint64 id = 0;
+
+	if (cluster_lmd_probe != NULL) {
+		if (LWLockHeldByMe(&cluster_lmd_probe->lock))
+			why = "LMD_PROBE_LOCK_HELD";
+		else {
+			LWLockAcquire(&cluster_lmd_probe->lock, LW_SHARED);
+			id = cluster_lmd_probe->probe_id;
+			if (cluster_lmd_probe->max_edges < 64 || cluster_lmd_probe->max_edges > 65536
+				|| cluster_lmd_probe->n_edges < 0
+				|| cluster_lmd_probe->n_edges > cluster_lmd_probe->max_edges
+				|| cluster_lmd_probe->n_received < 0
+				|| cluster_lmd_probe->n_received
+					   != pg_popcount64(cluster_lmd_probe->received_lo)
+							  + pg_popcount64(cluster_lmd_probe->received_hi)
+				|| (cluster_lmd_probe->received_lo & ~cluster_lmd_probe->expected_lo) != 0
+				|| (cluster_lmd_probe->received_hi & ~cluster_lmd_probe->expected_hi) != 0)
+				why = "LMD_PROBE_GEOMETRY_INVALID";
+			else if (id != 0) {
+				result = CLUSTER_NORMAL_STOP_PENDING;
+				why = "LMD_PROBE_ROUND_OWNED";
+			} else if (cluster_lmd_probe->expected_lo != 0 || cluster_lmd_probe->expected_hi != 0
+					   || cluster_lmd_probe->received_lo != 0 || cluster_lmd_probe->received_hi != 0
+					   || cluster_lmd_probe->n_edges != 0 || cluster_lmd_probe->overflow)
+				why = "LMD_PROBE_IDLE_RESIDUE";
+			else {
+				result = CLUSTER_NORMAL_STOP_READY;
+				why = "LMD_PROBE_IDLE";
+			}
+			LWLockRelease(&cluster_lmd_probe->lock);
+		}
+	}
+	if (probe_id != NULL)
+		*probe_id = id;
+	if (reason != NULL)
+		*reason = why;
+	return result;
+}
 
 
 /* ============================================================

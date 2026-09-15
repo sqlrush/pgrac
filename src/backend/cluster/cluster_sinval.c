@@ -47,6 +47,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -438,6 +439,8 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 	 * Used by TAP to reproduce HC135 echo-defense violation scenarios. */
 	CLUSTER_INJECTION_POINT("cluster-sinval-receive-skip-validate");
 	if (cluster_injection_should_skip("cluster-sinval-receive-skip-validate")) {
+		if (!cluster_normal_stop_service_new_work(false))
+			return;
 		msgs = (const SharedInvalidationMessage *)((const char *)hdr + sizeof(*hdr));
 		if (cluster_sinval_inbound_try_enqueue(hdr->batch_id, msgs, hdr->nmsgs, hdr->source_node))
 			pg_atomic_fetch_add_u64(&ClusterSinval->broadcast_receive_count, 1);
@@ -475,6 +478,8 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 		/* Fail-safe propagation:  ask SinvalBcast aux to do SIResetAll
 		 * via the existing spec-2.38 inbound_overflow_reset_pending path
 		 * (reuse,  not加 new counter). */
+		if (!cluster_normal_stop_service_new_work(false))
+			return;
 		pg_atomic_write_u32(&ClusterSinval->inbound_overflow_reset_pending, 1);
 		pg_atomic_fetch_add_u64(&ClusterSinval->inbound_overflow_reset_count, 1);
 		cluster_sinval_set_proc_latch();
@@ -514,6 +519,10 @@ cluster_sinval_handle_envelope(const ClusterICEnvelope *env, const void *payload
 		return;
 	}
 
+	/* Existing ACK matching remains allowed; this is admission of a new
+	 * application responsibility after original envelope/identity checks. */
+	if (!cluster_normal_stop_service_new_work(false))
+		return;
 	msgs = (const SharedInvalidationMessage *)((const char *)hdr + sizeof(*hdr));
 
 	/* HC133 nonblocking try-enqueue;  failure → fail-safe SIResetAll
@@ -1004,6 +1013,137 @@ typedef struct ClusterSinvalAckOutboundRing {
 static HTAB *ClusterSinvalAckWaitHTAB = NULL;
 static LWLock *ClusterSinvalAckWaitLock = NULL;
 static ClusterSinvalAckOutboundRing *ClusterSinvalAckOutbound = NULL;
+
+/* Read each original ownership domain, never dequeue or satisfy an ACK here.
+ * A dequeued local item is covered by its actual service work bracket, not by
+ * this shared observation. The stop controller seals producers separately. */
+ClusterNormalStopPollResult
+cluster_sinval_normal_stop_poll(const char **domain_out, uint64 *key_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *domain = "sinval", *reason = "EMPTY";
+	uint64 key = 0;
+	ClusterSinvalQueue *queues[2] = { ClusterSinvalOutbound, ClusterSinvalInbound };
+	uint32 head, tail, reset_in, reset_out;
+	HASH_SEQ_STATUS scan;
+	ClusterSinvalAckWaitEntry *entry;
+	uint32 scanned = 0;
+
+#define SINVAL_STOP_NOTE(r, d, k, why)                                                             \
+	do {                                                                                           \
+		if (result == CLUSTER_NORMAL_STOP_READY                                                    \
+			|| ((r) == CLUSTER_NORMAL_STOP_INVALID && result != CLUSTER_NORMAL_STOP_INVALID)) {    \
+			result = (r);                                                                          \
+			domain = (d);                                                                          \
+			key = (k);                                                                             \
+			reason = (why);                                                                        \
+		}                                                                                          \
+	} while (0)
+
+	if (ClusterSinval == NULL || queues[0] == NULL || queues[1] == NULL
+		|| ClusterSinvalAckWaitHTAB == NULL || ClusterSinvalAckWaitLock == NULL
+		|| ClusterSinvalAckOutbound == NULL || ProcGlobal == NULL) {
+		SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "sinval", 0, "UNINITIALIZED");
+		goto done;
+	}
+	if (LWLockHeldByMe(&queues[0]->lock.lock) || LWLockHeldByMe(&queues[1]->lock.lock)
+		|| LWLockHeldByMe(ClusterSinvalAckWaitLock)
+		|| LWLockHeldByMe(&ClusterSinvalAckOutbound->lock.lock)) {
+		SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "sinval", 0, "OWNER_LOCK_HELD");
+		goto done;
+	}
+	reset_in = pg_atomic_read_u32(&ClusterSinval->inbound_overflow_reset_pending);
+	reset_out = pg_atomic_read_u32(&ClusterSinval->reset_all_broadcast_pending);
+	if (reset_in > 1 || reset_out > 1)
+		SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "reset", 0, "INVALID_FLAG");
+	else if (reset_in || reset_out)
+		SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_PENDING, "reset", 0, "RESET_PENDING");
+
+	for (int q = 0; q < 2; q++) {
+		ClusterSinvalQueue *queue = queues[q];
+		const char *name = q == 0 ? "outbound" : "inbound";
+		LWLockAcquire(&queue->lock.lock, LW_SHARED);
+		head = pg_atomic_read_u32(&queue->head);
+		tail = pg_atomic_read_u32(&queue->tail);
+		if (cluster_sinval_broadcast_max_queue_size < 64
+			|| cluster_sinval_broadcast_max_queue_size > 65536
+			|| queue->capacity != (uint32)cluster_sinval_broadcast_max_queue_size
+			|| head >= queue->capacity || tail >= queue->capacity) {
+			SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, name, head, "RING_GEOMETRY");
+			LWLockRelease(&queue->lock.lock);
+			continue;
+		}
+		for (uint32 i = head; i != tail; i = (i + 1) % queue->capacity) {
+			const ClusterSinvalQueueEntry *item = &queue->slots[i];
+			/* Inbound's producer does not assign flags; its consumer does
+			 * not read them. Only outbound flags carry live responsibility. */
+			if (item->batch_id == 0 || item->nmsgs < 1 || item->nmsgs > CLUSTER_SINVAL_BATCH_MAX
+				|| item->source_node < 0 || item->source_node >= CLUSTER_MAX_NODES
+				|| (q == 0
+					&& (item->source_node != cluster_node_id
+						|| (item->flags & ~SINVAL_REQUIRES_ACK) != 0)))
+				SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, name, i, "INVALID_BATCH");
+			else
+				SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_PENDING, name, i, "BATCH_OWNED");
+		}
+		LWLockRelease(&queue->lock.lock);
+	}
+
+	LWLockAcquire(&ClusterSinvalAckOutbound->lock.lock, LW_SHARED);
+	head = pg_atomic_read_u32(&ClusterSinvalAckOutbound->head);
+	tail = pg_atomic_read_u32(&ClusterSinvalAckOutbound->tail);
+	if (ClusterSinvalAckOutbound->capacity != CLUSTER_SINVAL_ACK_OUTBOUND_CAPACITY
+		|| head >= CLUSTER_SINVAL_ACK_OUTBOUND_CAPACITY
+		|| tail >= CLUSTER_SINVAL_ACK_OUTBOUND_CAPACITY)
+		SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_outbound", head, "RING_GEOMETRY");
+	else {
+		for (uint32 i = head; i != tail; i = (i + 1) % CLUSTER_SINVAL_ACK_OUTBOUND_CAPACITY) {
+			const ClusterSinvalAckOutboundEntry *ack = &ClusterSinvalAckOutbound->slots[i];
+			if (ack->batch_id == 0 || ack->sender_node < 0 || ack->sender_node >= CLUSTER_MAX_NODES
+				|| ack->status > SINVAL_ACK_RESET_PENDING || ack->pad != 0)
+				SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_outbound", i, "INVALID_ACK");
+			else
+				SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_PENDING, "ack_outbound", i, "ACK_OWNED");
+		}
+	}
+	LWLockRelease(&ClusterSinvalAckOutbound->lock.lock);
+
+	if (cluster_sinval_ack_wait_slots < 64 || cluster_sinval_ack_wait_slots > 4096) {
+		SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_wait", 0, "TABLE_GEOMETRY");
+		goto done;
+	}
+	LWLockAcquire(ClusterSinvalAckWaitLock, LW_SHARED);
+	hash_seq_init(&scan, ClusterSinvalAckWaitHTAB);
+	while ((entry = hash_seq_search(&scan)) != NULL) {
+		if (++scanned > (uint32)cluster_sinval_ack_wait_slots) {
+			SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_wait", entry->batch_id,
+							 "TABLE_GEOMETRY");
+			hash_seq_term(&scan);
+			break;
+		}
+		if (entry->batch_id == 0 || entry->enqueuer_pgprocno < 0
+			|| (uint32)entry->enqueuer_pgprocno >= ProcGlobal->allProcCount
+			|| (entry->ack_received_mask & ~entry->alive_peer_mask) != 0
+			|| entry->status > SINVAL_ACK_RESET_PENDING || entry->completion_signaled > 1
+			|| (entry->completion_signaled && entry->ack_received_mask != entry->alive_peer_mask))
+			SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_INVALID, "ack_wait", entry->batch_id,
+							 "INVALID_WAITER");
+		else
+			/* Complete/signaled or deadline expiry is not owner removal. */
+			SINVAL_STOP_NOTE(CLUSTER_NORMAL_STOP_PENDING, "ack_wait", entry->batch_id,
+							 "WAITER_OWNED");
+	}
+	LWLockRelease(ClusterSinvalAckWaitLock);
+done:
+	if (domain_out != NULL)
+		*domain_out = domain;
+	if (key_out != NULL)
+		*key_out = key;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+#undef SINVAL_STOP_NOTE
+}
 
 
 Size

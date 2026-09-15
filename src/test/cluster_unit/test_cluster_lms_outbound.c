@@ -53,6 +53,7 @@
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_router.h" /* cluster_ic_send_envelope prototype */
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sf_dep.h"
@@ -460,6 +461,11 @@ cluster_shmem_register_region(const ClusterShmemRegion *region)
 
 /* Named-tranche plumbing: hand back a static lock array. */
 static LWLockPadded ut_locks[CLUSTER_LMS_MAX_WORKERS];
+static LWLock *ut_held_lock;
+static LWLock *ut_lock_stack[CLUSTER_LMS_MAX_WORKERS];
+static unsigned ut_lock_depth;
+static int ut_lock_reads;
+extern void cluster_lms_outbound_test_geometry(int worker, uint32 head, uint32 tail, uint32 count);
 
 LWLockPadded *
 GetNamedLWLockTranche(const char *tranche_name)
@@ -478,15 +484,23 @@ RequestNamedLWLockTranche(const char *tranche_name, int num_lwlocks)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	(void)lock;
-	(void)mode;
+	if (ut_lock_depth == CLUSTER_LMS_MAX_WORKERS
+		|| (ut_held_lock != NULL && (uintptr_t)lock <= (uintptr_t)ut_held_lock))
+		abort();
+	ut_lock_stack[ut_lock_depth++] = lock;
+	ut_held_lock = lock;
+	if (mode == LW_SHARED)
+		ut_lock_reads++;
 	return true;
 }
 
 void
 LWLockRelease(LWLock *lock)
 {
-	(void)lock;
+	if (ut_held_lock != lock)
+		abort();
+	ut_lock_depth--;
+	ut_held_lock = ut_lock_depth == 0 ? NULL : ut_lock_stack[ut_lock_depth - 1];
 }
 
 /* LMS wakeup + GCS pre-send hook: count-only stubs. */
@@ -1683,11 +1697,111 @@ UT_TEST(test_resource_x_nonrequester_s_status_self_master_loopback_is_retained)
 	UT_ASSERT_EQ(ut_local_dispatch_marker, 0xB3);
 }
 
+UT_TEST(test_normal_stop_missing_outbound_is_not_empty)
+{
+	int worker;
+	uint32 slot;
+	const char *reason;
+
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(strcmp(reason, "OUTBOUND_UNINITIALIZED"), 0);
+	UT_ASSERT_EQ(worker, -1);
+}
+
+UT_TEST(test_normal_stop_queue_observation_follows_real_handoff)
+{
+	int worker;
+	uint32 slot;
+	const char *reason;
+
+	ut_captured_region->init_fn();
+	ut_reset_log();
+	ut_lock_reads = 0;
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(ut_lock_reads, CLUSTER_LMS_MAX_WORKERS);
+	UT_ASSERT(ut_enqueue_marker(1, UT_PEER_X, 0x81));
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(worker, 1);
+	UT_ASSERT_EQ(slot, 0);
+	UT_ASSERT_EQ(strcmp(reason, "OUTBOUND_FRAME_PENDING"), 0);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_WOULD_BLOCK;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(1), 1);
+	/* Ring no longer owns it. This READY does NOT certify the IC FIFO. */
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_NULL(ut_held_lock);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT(ut_enqueue_marker(0, UT_PEER_X, 0x82));
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(0), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_normal_stop_inactive_and_malformed_ring_are_not_hidden)
+{
+	int worker;
+	uint32 slot;
+	const char *reason;
+
+	ut_captured_region->init_fn();
+	UT_ASSERT(ut_enqueue_marker(0, UT_PEER_X, 0x83));
+	UT_ASSERT(ut_enqueue_marker(7, UT_PEER_X, 0x84));
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(worker, 7); /* INVALID overrides the earlier ring's PENDING */
+	UT_ASSERT_EQ(strcmp(reason, "OUTBOUND_INACTIVE_RING"), 0);
+	ut_captured_region->init_fn();
+	cluster_lms_outbound_test_geometry(0, 4, 4, 0); /* retained cursor is not debt */
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	cluster_lms_outbound_test_geometry(0, 5, 4, 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(strcmp(reason, "OUTBOUND_RING_GEOMETRY"), 0);
+	cluster_lms_outbound_test_geometry(0, 256, 0, 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	cluster_lms_outbound_test_geometry(0, 0, 0, 257);
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_NULL(ut_held_lock);
+}
+
+UT_TEST(test_normal_stop_full_and_bad_frames_remain_debt)
+{
+	int worker;
+	uint32 slot;
+	const char *reason;
+
+	ut_captured_region->init_fn();
+	for (int i = 0; i < 256; i++)
+		UT_ASSERT(ut_enqueue_marker(0, UT_PEER_X, (uint8)i));
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 256);
+	ut_captured_region->init_fn();
+	UT_ASSERT(ut_enqueue_marker(0, CLUSTER_MAX_NODES, 0x85));
+	UT_ASSERT_EQ(cluster_lms_outbound_normal_stop_poll(&worker, &slot, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(strcmp(reason, "OUTBOUND_FRAME_INVALID"), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(0), 1); /* poll never discards */
+}
+
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(36);
 
+	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
 	UT_RUN(test_admitted_frame_is_never_resubmitted);
 	UT_RUN(test_blocked_peer_does_not_starve_other_peer);
@@ -1720,6 +1834,9 @@ main(void)
 	UT_RUN(test_resource_x_remote_s_status_is_pending_then_exact_ready);
 	UT_RUN(test_resource_x_remote_s_pending_can_cancel_without_send);
 	UT_RUN(test_resource_x_nonrequester_s_status_self_master_loopback_is_retained);
+	UT_RUN(test_normal_stop_queue_observation_follows_real_handoff);
+	UT_RUN(test_normal_stop_inactive_and_malformed_ring_are_not_hidden);
+	UT_RUN(test_normal_stop_full_and_bad_frames_remain_debt);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

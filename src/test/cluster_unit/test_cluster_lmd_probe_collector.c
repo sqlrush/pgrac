@@ -39,8 +39,9 @@
  *	  src/test/cluster_unit/test_cluster_lmd_probe_collector.c
  *
  * NOTES
- *	  pgrac-original file.  Standalone binary linking
- *	  cluster_lmd_probe_collector.o only.
+ *	  Includes the actual collector so negative tests use its real private
+ *	  layout, never a copied struct definition. PG allocation/locking and
+ *	  the external member-admit helper remain explicit fixture boundaries.
  *	  Spec: spec-5.8-full-cross-node-deadlock-detector.md.
  *
  *-------------------------------------------------------------------------
@@ -50,12 +51,14 @@
 #include <string.h>
 
 #include "cluster/cluster_ges.h" /* GesDeadlockReportHeader */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmd.h" /* ClusterLmdWaitEdge + ClusterLmdProbeAdmit */
 #include "cluster/cluster_lmd_probe_collector.h"
 #include "miscadmin.h" /* ProcessingMode / NormalProcessing (Mode global) */
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
+#include "../../backend/cluster/cluster_lmd_probe_collector.c"
 
 #ifdef vprintf
 #undef vprintf
@@ -79,6 +82,8 @@ UT_DEFINE_GLOBALS();
 bool cluster_enabled = true;
 int cluster_lmd_max_wait_edges = 64; /* small cap so the overflow test is cheap */
 ProcessingMode Mode = NormalProcessing;
+static LWLock *held_probe_lock;
+static unsigned probe_lock_acquisitions;
 
 void
 ExceptionalCondition(const char *c pg_attribute_unused(), const char *f pg_attribute_unused(),
@@ -91,16 +96,30 @@ void
 LWLockInitialize(LWLock *l pg_attribute_unused(), int t pg_attribute_unused())
 {}
 bool
-LWLockAcquire(LWLock *l pg_attribute_unused(), LWLockMode m pg_attribute_unused())
+LWLockAcquire(LWLock *l, LWLockMode m pg_attribute_unused())
 {
+	if (held_probe_lock != NULL)
+		abort();
+	held_probe_lock = l;
+	probe_lock_acquisitions++;
 	return true;
 }
 void
-LWLockRelease(LWLock *l pg_attribute_unused())
-{}
+LWLockRelease(LWLock *l)
+{
+	if (held_probe_lock != l)
+		abort();
+	held_probe_lock = NULL;
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	return held_probe_lock == lock;
+}
 
 void
-cluster_shmem_register_region(const void *r pg_attribute_unused())
+cluster_shmem_register_region(const ClusterShmemRegion *r pg_attribute_unused())
 {}
 
 /* Faithful copy of cluster_lmd_probe_member_admit (logic covered by
@@ -363,10 +382,113 @@ UT_TEST(test_probe_reset_to_idle)
 }
 
 
+UT_TEST(test_stop_probe_uninitialized_is_not_empty)
+{
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
+UT_TEST(test_stop_probe_complete_report_is_still_owned)
+{
+	char report[sizeof(GesDeadlockReportHeader) + MAX_TEST_EDGES * sizeof(ClusterLmdWaitEdge)];
+	char before[sizeof(probe_buf.data)];
+	ClusterLmdWaitEdge edges[2];
+	ClusterLmdProbeDrain drain;
+	const char *reason = NULL;
+	uint64 probe = 0;
+	Size len;
+
+	reset_region();
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(&probe, &reason), CLUSTER_NORMAL_STOP_READY);
+	cluster_lmd_probe_arm(81, exp_bit(1), 0);
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(&probe, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(probe, 81);
+	len = build_report(report, 81, 1, 2);
+	UT_ASSERT(cluster_lmd_probe_collect_receive((GesDeadlockReportHeader *)report, len));
+	memcpy(before, probe_buf.data, sizeof(before));
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(&probe, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(memcmp(before, probe_buf.data, sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_lmd_probe_drain(edges, 2, &drain), 2);
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_lmd_probe_reset();
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(!cluster_lmd_probe_collect_receive((GesDeadlockReportHeader *)report, len));
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	cluster_lmd_probe_arm(82, exp_bit(1), 0);
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+}
+
+UT_TEST(test_stop_overflow_is_owned_until_original_reset)
+{
+	char report[sizeof(GesDeadlockReportHeader) + MAX_TEST_EDGES * sizeof(ClusterLmdWaitEdge)];
+	Size len;
+	reset_region();
+	cluster_lmd_probe_arm(83, exp_bit(1) | exp_bit(2), 0);
+	len = build_report(report, 83, 1, 64);
+	UT_ASSERT(cluster_lmd_probe_collect_receive((GesDeadlockReportHeader *)report, len));
+	len = build_report(report, 83, 2, 1);
+	UT_ASSERT(!cluster_lmd_probe_collect_receive((GesDeadlockReportHeader *)report, len));
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	cluster_lmd_probe_reset();
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_probe_rejects_recursive_module_lock)
+{
+	unsigned acquisitions;
+	reset_region();
+	/* The existing region begins with its original LWLock. This is not a
+	 * fabricated READY/idle input; verify refusal before recursive acquire. */
+	held_probe_lock = (LWLock *)probe_buf.data;
+	acquisitions = probe_lock_acquisitions;
+	UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(probe_lock_acquisitions, acquisitions);
+	held_probe_lock = NULL;
+}
+
+UT_TEST(test_stop_probe_malformed_state_is_not_retired)
+{
+	for (int bad = 0; bad < 8; bad++) {
+		ClusterLmdProbeShmem before;
+		reset_region();
+		switch (bad) {
+		case 0:
+			cluster_lmd_probe->max_edges = 63;
+			break;
+		case 1:
+			cluster_lmd_probe->n_edges = -1;
+			break;
+		case 2:
+			cluster_lmd_probe->n_edges = 65;
+			break;
+		case 3:
+			cluster_lmd_probe->n_received = 1;
+			break;
+		case 4:
+			cluster_lmd_probe->probe_id = 84;
+			cluster_lmd_probe->received_hi = 1;
+			cluster_lmd_probe->n_received = 1;
+			break;
+		case 5:
+			cluster_lmd_probe->expected_lo = exp_bit(1);
+			break;
+		case 6:
+			cluster_lmd_probe->overflow = true;
+			break;
+		default:
+			cluster_lmd_probe->n_edges = 1;
+			break;
+		}
+		memcpy(&before, cluster_lmd_probe, sizeof(before));
+		UT_ASSERT_EQ(cluster_lmd_probe_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(memcmp(&before, cluster_lmd_probe, sizeof(before)), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(12);
+	UT_RUN(test_stop_probe_uninitialized_is_not_empty);
 	UT_RUN(test_probe_complete_report_accepted);
 	UT_RUN(test_probe_duplicate_dropped);
 	UT_RUN(test_probe_stale_probe_id_dropped);
@@ -374,6 +496,10 @@ main(void)
 	UT_RUN(test_probe_overflow_marks_incomplete);
 	UT_RUN(test_probe_multi_node_union);
 	UT_RUN(test_probe_reset_to_idle);
+	UT_RUN(test_stop_probe_complete_report_is_still_owned);
+	UT_RUN(test_stop_overflow_is_owned_until_original_reset);
+	UT_RUN(test_stop_probe_rejects_recursive_module_lock);
+	UT_RUN(test_stop_probe_malformed_state_is_not_retired);
 	UT_DONE();
-	return 0;
+	return ut_failed_count == 0 ? 0 : 1;
 }

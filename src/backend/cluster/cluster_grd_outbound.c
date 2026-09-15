@@ -34,6 +34,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_clean_leave.h"
 
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_gcs_block.h"
@@ -111,6 +112,94 @@ typedef struct ClusterGrdOutboundShared {
 
 static ClusterGrdOutboundShared *cluster_grd_outbound_state = NULL;
 static LWLock *cluster_grd_outbound_lock = NULL;
+
+ClusterNormalStopPollResult
+cluster_grd_outbound_normal_stop_poll(uint32 *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const ClusterGrdOutboundShared *q = cluster_grd_outbound_state;
+	int list;
+
+	if (slot_out == NULL || reason_out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*slot_out = UINT32_MAX;
+	*reason_out = "GRD_OUTBOUND_UNINITIALIZED";
+	if (q == NULL || cluster_grd_outbound_lock == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	if (LWLockHeldByMe(cluster_grd_outbound_lock)) {
+		*reason_out = "GRD_OUTBOUND_LOCK_HELD";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	LWLockAcquire(cluster_grd_outbound_lock, LW_SHARED);
+	*reason_out = "NONE";
+	for (list = 0; list < 3; list++) {
+		const ClusterGrdOutboundSlot *items;
+		uint32 head, tail, count, capacity;
+		const char *pending, *geometry, *invalid;
+
+		if (list == 0) {
+			items = q->ring;
+			head = q->ring_head;
+			tail = q->ring_tail;
+			count = q->ring_count;
+			capacity = PGRAC_GES_OUTBOUND_RING_CAPACITY;
+			pending = "GRD_OUTBOUND_RING";
+			geometry = "GRD_OUTBOUND_RING_GEOMETRY";
+			invalid = "GRD_OUTBOUND_RING_ITEM_INVALID";
+		} else if (list == 1) {
+			items = q->reply_dirty;
+			head = q->reply_dirty_head;
+			tail = q->reply_dirty_tail;
+			count = q->reply_dirty_count;
+			capacity = PGRAC_GES_REPLY_DIRTY_BUDGET;
+			pending = "GRD_REPLY_DIRTY";
+			geometry = "GRD_REPLY_DIRTY_GEOMETRY";
+			invalid = "GRD_REPLY_DIRTY_ITEM_INVALID";
+		} else {
+			items = q->cleanup_dirty;
+			head = q->cleanup_dirty_head;
+			tail = q->cleanup_dirty_tail;
+			count = q->cleanup_dirty_count;
+			capacity = PGRAC_GES_CLEANUP_DIRTY_BUDGET;
+			pending = "GRD_CLEANUP_DIRTY";
+			geometry = "GRD_CLEANUP_DIRTY_GEOMETRY";
+			invalid = "GRD_CLEANUP_DIRTY_ITEM_INVALID";
+		}
+		if (head >= capacity || tail >= capacity || count > capacity
+			|| (tail + count) % capacity != head) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			*slot_out = UINT32_MAX;
+			*reason_out = geometry;
+			break;
+		}
+		for (uint32 offset = 0; offset < count; offset++) {
+			uint32 index = (tail + offset) % capacity;
+			const ClusterGrdOutboundSlot *item = &items[index];
+			if (item->dest_node_id >= CLUSTER_MAX_NODES || item->msg_type == 0
+				|| item->payload_len > sizeof(item->payload)
+				|| item->origin < CLUSTER_GRD_OUTBOUND_BACKEND_REQUEST
+				|| item->origin > CLUSTER_GRD_OUTBOUND_LMS_NATIVE_PROBE
+				|| (list == 1 && item->origin != CLUSTER_GRD_OUTBOUND_LMON_REPLY)
+				|| (list == 2 && item->origin < CLUSTER_GRD_OUTBOUND_CLEANUP_RELEASE)) {
+				result = CLUSTER_NORMAL_STOP_INVALID;
+				*slot_out = index;
+				*reason_out = invalid;
+				break;
+			}
+		}
+		if (result == CLUSTER_NORMAL_STOP_INVALID)
+			break;
+		if (count != 0 && result == CLUSTER_NORMAL_STOP_READY) {
+			result = CLUSTER_NORMAL_STOP_PENDING;
+			*slot_out = tail;
+			*reason_out = pending;
+		}
+	}
+	LWLockRelease(cluster_grd_outbound_lock);
+	/* Ring/dirty-list ownership only. A dequeued stack item and an IC
+	 * accepted frame require the actual actor and transport closure. */
+	return result;
+}
 
 #define CLEANUP_RETRY_WARN50_BIT 0x01
 #define CLEANUP_RETRY_WARN90_BIT 0x02

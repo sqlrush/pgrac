@@ -52,9 +52,11 @@
 #include "cluster/cluster_grd_outbound.h" /* cluster_grd_outbound_enqueue_backend_request */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmd_probe_collector.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "miscadmin.h"
+#include "postmaster/auxprocess.h"
 #include "port/atomics.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -645,6 +647,21 @@ cluster_lmd_run_tarjan_scan_now(void)
 
 static uint64 probe_id_seq;
 
+static void
+lmd_probe_wait(long wait_ms)
+{
+	/* A synchronous coordinator round still owns its local round/snapshot
+	 * across this sleep. Clear active, but never publish idle between rounds.
+	 * The missing LMD idle bit prevents the controller from sealing here. */
+	if (AmLmdProcess() && !cluster_normal_stop_service_leave(true))
+		ereport(FATAL, (errmsg("LMD cannot suspend probe work for normal stop")));
+	(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
+					WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT);
+	ResetLatch(MyLatch);
+	if (AmLmdProcess() && !cluster_normal_stop_service_enter())
+		ereport(FATAL, (errmsg("LMD cannot resume owned probe work for normal stop")));
+}
+
 /*
  * spec-5.8 D3 — one coordinator probe round (NEVER cancels).
  *
@@ -803,9 +820,7 @@ lmd_coordinator_probe_round(int32 self_node, const int32 *peers, int n_peers,
 			break;
 		}
 		CHECK_FOR_INTERRUPTS();
-		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 50,
-						WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT);
-		ResetLatch(MyLatch);
+		lmd_probe_wait(50);
 	}
 	cluster_lmd_probe_broadcast_count_inc(1);
 
@@ -951,6 +966,48 @@ typedef struct LmdPendingCancel {
 } LmdPendingCancel;
 
 static LmdPendingCancel lmd_pending_cancels[CLUSTER_LMD_PENDING_CANCEL_MAX];
+
+/* Only the actual LMD can certify its private table; LMON receives frames
+ * but must hand them to that owner. Inactive retained identity is history. */
+ClusterNormalStopPollResult
+cluster_lmd_pending_normal_stop_poll(uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *why = "LMD_PENDING_CANCEL_IDLE";
+	uint64 first = 0;
+
+	if (!IsUnderPostmaster || !AmLmdProcess()) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		why = "LMD_PENDING_CANCEL_WRONG_OWNER";
+	} else {
+		for (int i = 0; i < CLUSTER_LMD_PENDING_CANCEL_MAX; i++) {
+			const LmdPendingCancel *p = &lmd_pending_cancels[i];
+			if (!p->active)
+				continue;
+			if (p->cancel_id == 0 || p->victim.cluster_epoch != p->cluster_epoch
+				|| p->victim.node_id < 0 || p->victim.node_id >= CLUSTER_MAX_NODES
+				|| p->attempts < 0 || p->next_deadline <= 0
+				|| (p->escalating && p->escal_deadline <= 0) || p->n_cycle_vertices < 0
+				|| p->n_cycle_vertices > CLUSTER_LMD_VICTIM_EXCLUDE_MAX || p->exclude.count < 0
+				|| p->exclude.count > CLUSTER_LMD_VICTIM_EXCLUDE_MAX) {
+				result = CLUSTER_NORMAL_STOP_INVALID;
+				why = "LMD_PENDING_CANCEL_INVALID";
+				first = i;
+				break;
+			}
+			if (result == CLUSTER_NORMAL_STOP_READY) {
+				result = CLUSTER_NORMAL_STOP_PENDING;
+				why = "LMD_PENDING_CANCEL_OWNED";
+				first = p->cancel_id;
+			}
+		}
+	}
+	if (key != NULL)
+		*key = first;
+	if (reason != NULL)
+		*reason = why;
+	return result;
+}
 
 static LmdPendingCancel *
 lmd_pending_cancel_find_by_cancel_id(uint64 cancel_id)
@@ -1323,9 +1380,7 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 				wait_ms = 1;
 			if (wait_ms > 50)
 				wait_ms = 50;
-			(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
-							WAIT_EVENT_CLUSTER_LMD_PROBE_COLLECT);
-			ResetLatch(MyLatch);
+			lmd_probe_wait(wait_ms);
 		}
 	}
 

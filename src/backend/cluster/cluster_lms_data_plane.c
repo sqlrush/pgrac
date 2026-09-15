@@ -51,6 +51,7 @@
 #include <unistd.h>
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_elog.h"
 #include "cluster/cluster_epoch.h" /* PGRAC: spec-7.2 D5 epoch watch */
 #include "cluster/cluster_guc.h"
@@ -298,12 +299,18 @@ cluster_lms_data_plane_tick(long timeout_ms)
 	int n_events;
 	int32 pi;
 	int i;
+	uint32 wait_kind = WAIT_EVENT_CLUSTER_LMS_DATA_RECV;
+	volatile bool work_completed = false;
 
 	Assert(dp_enabled);
 
-	now = GetCurrentTimestamp();
+	if (!cluster_normal_stop_service_enter())
+		ereport(FATAL, (errmsg_internal("LMS DATA cannot enter management segment")));
+	PG_TRY();
+	{
+		now = GetCurrentTimestamp();
 
-	/*
+		/*
 	 * PGRAC: spec-7.2 D5 (INV-7.2-CONN-EPOCH ③) — proactive connection
 	 * reset on an epoch bump:  every DATA connection is bound to the
 	 * epoch it was established under, so a bump force-closes the mesh
@@ -311,15 +318,15 @@ cluster_lms_data_plane_tick(long timeout_ms)
 	 * sender gate in tier1_send_bytes is the structural backstop for
 	 * the window between the bump and this tick.
 	 */
-	CLUSTER_INJECTION_POINT("cluster-lms-conn-reset");
-	{
-		static uint64 dp_last_epoch = 0;
-		static bool dp_epoch_seen = false;
-		static bool dp_inject_reset_done = false;
-		uint64 cur_epoch = cluster_epoch_get_current();
-		bool inject_reset = false;
+		CLUSTER_INJECTION_POINT("cluster-lms-conn-reset");
+		{
+			static uint64 dp_last_epoch = 0;
+			static bool dp_epoch_seen = false;
+			static bool dp_inject_reset_done = false;
+			uint64 cur_epoch = cluster_epoch_get_current();
+			bool inject_reset = false;
 
-		/*
+			/*
 		 * PGRAC: spec-7.2 D7 (F6-1) — the cluster-lms-conn-reset injection
 		 * models a SINGLE epoch-bump reset, but its only arm path is the
 		 * process-local injection GUC, which stays armed and re-sets
@@ -343,33 +350,34 @@ cluster_lms_data_plane_tick(long timeout_ms)
 		 * otherwise lost.  Test-only path: the injection GUC is never armed
 		 * in production, where epoch_bumped alone drives the reset.
 		 */
-		bool epoch_bumped = dp_epoch_seen && cur_epoch != dp_last_epoch;
+			bool epoch_bumped = dp_epoch_seen && cur_epoch != dp_last_epoch;
 
-		if (!epoch_bumped && cluster_injection_should_skip("cluster-lms-conn-reset")
-			&& !dp_inject_reset_done)
-			inject_reset = true;
+			if (!epoch_bumped && cluster_injection_should_skip("cluster-lms-conn-reset")
+				&& !dp_inject_reset_done)
+				inject_reset = true;
 
-		if (!dp_epoch_seen) {
-			dp_last_epoch = cur_epoch;
-			dp_epoch_seen = true;
-		} else if (epoch_bumped || inject_reset) {
-			const char *reason = epoch_bumped ? "data-plane epoch bump reset"
-											  : "data-plane conn-reset injection (F6-1 one-shot)";
-			int n_closed = 0;
+			if (!dp_epoch_seen) {
+				dp_last_epoch = cur_epoch;
+				dp_epoch_seen = true;
+			} else if (epoch_bumped || inject_reset) {
+				const char *reason = epoch_bumped
+										 ? "data-plane epoch bump reset"
+										 : "data-plane conn-reset injection (F6-1 one-shot)";
+				int n_closed = 0;
 
-			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-				if (dp_track[pi].fd >= 0) {
-					cluster_ic_tier1_close_peer(pi, reason);
-					dp_track[pi].fd = -1;
-					dp_track[pi].substate = LMS_DP_DOWN;
-					dp_track[pi].connect_started_at = 0;
-					dp_track[pi].next_attempt_at = 0; /* reconnect immediately */
-					dp_wes_dirty = true;
-					n_closed++;
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+					if (dp_track[pi].fd >= 0) {
+						cluster_ic_tier1_close_peer(pi, reason);
+						dp_track[pi].fd = -1;
+						dp_track[pi].substate = LMS_DP_DOWN;
+						dp_track[pi].connect_started_at = 0;
+						dp_track[pi].next_attempt_at = 0; /* reconnect immediately */
+						dp_wes_dirty = true;
+						n_closed++;
+					}
 				}
-			}
 
-			/*
+				/*
 			 * F6-1 one-shot latch:  only mark the injected reset consumed
 			 * once it has actually torn down a live connection.  This keeps
 			 * the injection from being wasted on a tick where the mesh is
@@ -377,10 +385,10 @@ cluster_lms_data_plane_tick(long timeout_ms)
 			 * a peer is live, then latches so the persistent GUC does not
 			 * storm.  The real epoch-bump reset does not touch the latch.
 			 */
-			if (inject_reset && n_closed > 0)
-				dp_inject_reset_done = true;
+				if (inject_reset && n_closed > 0)
+					dp_inject_reset_done = true;
 
-			/*
+				/*
 			 * PGRAC: spec-7.3 D7 — per-worker reset observability (epoch ×N).
 			 * Each DATA worker (0..N-1) runs this tick in its OWN process and
 			 * observes the shared epoch bump independently, so a reconfig
@@ -391,67 +399,67 @@ cluster_lms_data_plane_tick(long timeout_ms)
 			 * workers reset (only when a live connection was actually torn
 			 * down, to avoid logging on an idle-mesh epoch advance).
 			 */
-			if (n_closed > 0) {
-				cluster_lms_obs_note_conn_reset(); /* spec-7.3 D8 per-worker counter */
-				ereport(LOG,
-						(errmsg("cluster_lms: DATA mesh reset (worker %d) at epoch "
-								"%llu (%d peer%s closed)",
-								cluster_ic_tier1_my_data_channel(), (unsigned long long)cur_epoch,
-								n_closed, n_closed == 1 ? "" : "s")));
+				if (n_closed > 0) {
+					cluster_lms_obs_note_conn_reset(); /* spec-7.3 D8 per-worker counter */
+					ereport(LOG, (errmsg("cluster_lms: DATA mesh reset (worker %d) at epoch "
+										 "%llu (%d peer%s closed)",
+										 cluster_ic_tier1_my_data_channel(),
+										 (unsigned long long)cur_epoch, n_closed,
+										 n_closed == 1 ? "" : "s")));
+				}
+
+				dp_last_epoch = cur_epoch;
 			}
-
-			dp_last_epoch = cur_epoch;
 		}
-	}
 
-	/* Active-role reconnect for DOWN peers whose backoff elapsed. */
-	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-		int new_fd = -1;
+		/* Active-role reconnect for DOWN peers whose backoff elapsed. */
+		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+			int new_fd = -1;
 
-		if (pi == cluster_node_id || !dp_track[pi].is_active)
-			continue;
-		if (dp_track[pi].substate != LMS_DP_DOWN)
-			continue;
-		if (dp_track[pi].next_attempt_at > now)
-			continue;
+			if (pi == cluster_node_id || !dp_track[pi].is_active)
+				continue;
+			if (dp_track[pi].substate != LMS_DP_DOWN)
+				continue;
+			if (dp_track[pi].next_attempt_at > now)
+				continue;
 
-		dp_track[pi].next_attempt_at
-			= now + (int64)cluster_interconnect_heartbeat_interval_ms * INT64CONST(1000);
+			dp_track[pi].next_attempt_at
+				= now + (int64)cluster_interconnect_heartbeat_interval_ms * INT64CONST(1000);
 
-		/* A peer without data_addr is unreachable on this plane —
+			/* A peer without data_addr is unreachable on this plane —
 		 * connect_one fails fast via the NULL peer_addr;  skip quietly
 		 * (the conf may declare it later; SIGHUP reload re-checks). */
-		if (cluster_ic_tier1_connect_one(pi, &new_fd) && new_fd >= 0) {
-			dp_track[pi].fd = new_fd;
-			dp_track[pi].substate = LMS_DP_CONNECT_PEND;
-			dp_track[pi].connect_started_at = now;
-			dp_wes_dirty = true;
-		}
-	}
-
-	/* Connect-establishment timeout scan (no liveness scan on DATA:
-	 * CONTROL is the liveness authority, Q-D2-1). */
-	{
-		int64 connect_to_us = (int64)cluster_interconnect_connect_timeout_ms * INT64CONST(1000);
-
-		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-			if (dp_track[pi].fd < 0)
-				continue;
-			if ((dp_track[pi].substate == LMS_DP_CONNECT_PEND
-				 || dp_track[pi].substate == LMS_DP_HELLO_SENDING
-				 || dp_track[pi].substate == LMS_DP_HELLO_WAIT)
-				&& dp_track[pi].connect_started_at > 0
-				&& now > dp_track[pi].connect_started_at + connect_to_us) {
-				cluster_ic_tier1_close_peer(pi, "data-plane connect timeout");
-				dp_track[pi].fd = -1;
-				dp_track[pi].substate = LMS_DP_DOWN;
-				dp_track[pi].connect_started_at = 0;
+			if (cluster_ic_tier1_connect_one(pi, &new_fd) && new_fd >= 0) {
+				dp_track[pi].fd = new_fd;
+				dp_track[pi].substate = LMS_DP_CONNECT_PEND;
+				dp_track[pi].connect_started_at = now;
 				dp_wes_dirty = true;
 			}
 		}
-	}
 
-	/*
+		/* Connect-establishment timeout scan (no liveness scan on DATA:
+	 * CONTROL is the liveness authority, Q-D2-1). */
+		{
+			int64 connect_to_us = (int64)cluster_interconnect_connect_timeout_ms * INT64CONST(1000);
+
+			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+				if (dp_track[pi].fd < 0)
+					continue;
+				if ((dp_track[pi].substate == LMS_DP_CONNECT_PEND
+					 || dp_track[pi].substate == LMS_DP_HELLO_SENDING
+					 || dp_track[pi].substate == LMS_DP_HELLO_WAIT)
+					&& dp_track[pi].connect_started_at > 0
+					&& now > dp_track[pi].connect_started_at + connect_to_us) {
+					cluster_ic_tier1_close_peer(pi, "data-plane connect timeout");
+					dp_track[pi].fd = -1;
+					dp_track[pi].substate = LMS_DP_DOWN;
+					dp_track[pi].connect_started_at = 0;
+					dp_wes_dirty = true;
+				}
+			}
+		}
+
+		/*
 	 * PGRAC: GCS-race round-4c tier1-partial-IO F3 — re-align WES WRITEABLE
 	 * interest with the actual pending-outbound state.  A dispatch handler's
 	 * reply send during the PREVIOUS event batch may have queued a
@@ -462,114 +470,130 @@ cluster_lms_data_plane_tick(long timeout_ms)
 	 * registered) must equally rebuild, or the level-triggered WRITEABLE on
 	 * a healthy idle socket busy-spins this worker.
 	 */
-	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-		if (dp_track[pi].fd >= 0 && dp_track[pi].substate == LMS_DP_CONNECTED
-			&& cluster_ic_tier1_pending_outbound(pi) != dp_wes_writable[pi]) {
-			dp_wes_dirty = true;
-			break;
-		}
-	}
-
-	if (dp_wes_dirty)
-		dp_rebuild_wes();
-
-	if (timeout_ms < 0)
-		timeout_ms = 0;
-
-	{
-		/* PGRAC: spec-7.2 D6 — wait identity:  SEND while any peer has a
-		 * backpressured partial frame (we are waiting for WRITEABLE
-		 * drainage), RECV otherwise. */
-		uint32 wait_kind = WAIT_EVENT_CLUSTER_LMS_DATA_RECV;
-
 		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 			if (dp_track[pi].fd >= 0 && dp_track[pi].substate == LMS_DP_CONNECTED
-				&& cluster_ic_tier1_pending_outbound(pi)) {
-				wait_kind = WAIT_EVENT_CLUSTER_LMS_DATA_SEND;
+				&& cluster_ic_tier1_pending_outbound(pi) != dp_wes_writable[pi]) {
+				dp_wes_dirty = true;
 				break;
 			}
 		}
-		n_events = WaitEventSetWait(dp_wes, timeout_ms, ev, lengthof(ev), wait_kind);
-	}
 
-	for (i = 0; i < n_events; i++) {
-		intptr_t tag = (intptr_t)ev[i].user_data;
+		if (dp_wes_dirty)
+			dp_rebuild_wes();
 
-		if (ev[i].events & WL_LATCH_SET) {
-			ResetLatch(MyLatch);
-			continue;
-		}
+		if (timeout_ms < 0)
+			timeout_ms = 0;
 
-		if (tag == -1) {
-			/* Listener: drain all pending accepts into anon slots. */
-			for (;;) {
-				int new_fd = -1;
-				int32 dummy_peer_id = -1;
-				int slot;
-
-				if (!cluster_ic_tier1_accept_one(&new_fd, &dummy_peer_id))
+		{
+			/* PGRAC: spec-7.2 D6 — wait identity:  SEND while any peer has a
+		 * backpressured partial frame (we are waiting for WRITEABLE
+		 * drainage), RECV otherwise. */
+			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+				if (dp_track[pi].fd >= 0 && dp_track[pi].substate == LMS_DP_CONNECTED
+					&& cluster_ic_tier1_pending_outbound(pi)) {
+					wait_kind = WAIT_EVENT_CLUSTER_LMS_DATA_SEND;
 					break;
-				if (new_fd < 0)
-					break;
-
-				for (slot = 0; slot < CLUSTER_MAX_NODES; slot++)
-					if (dp_pending_fds[slot] < 0)
-						break;
-				if (slot >= CLUSTER_MAX_NODES) {
-					(void)close(new_fd);
-					continue;
 				}
-				dp_pending_fds[slot] = new_fd;
-				dp_wes_dirty = true;
 			}
-		} else if (tag >= 0 && tag < CLUSTER_MAX_NODES) {
-			int32 peer = (int32)tag;
-			int peer_fd = dp_track[peer].fd;
+		}
+		work_completed = true;
+	}
+	PG_FINALLY();
+	{
+		if (!work_completed)
+			LWLockReleaseAll();
+		(void)cluster_normal_stop_service_leave(work_completed);
+	}
+	PG_END_TRY();
+	if (cluster_lms_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
+		ereport(FATAL, (errmsg_internal("LMS DATA management failed normal-stop check")));
+	n_events = WaitEventSetWait(dp_wes, timeout_ms, ev, lengthof(ev), wait_kind);
+	if (n_events <= 0)
+		return; /* A timeout does not create another work/dispatch segment. */
 
-			if (peer_fd < 0)
+	if (!cluster_normal_stop_service_enter())
+		ereport(FATAL, (errmsg_internal("LMS DATA cannot enter dispatch segment")));
+	work_completed = false;
+	PG_TRY();
+	{
+		for (i = 0; i < n_events; i++) {
+			intptr_t tag = (intptr_t)ev[i].user_data;
+
+			if (ev[i].events & WL_LATCH_SET) {
+				ResetLatch(MyLatch);
 				continue;
+			}
 
-			if (dp_track[peer].substate == LMS_DP_CONNECT_PEND
-				&& (ev[i].events & WL_SOCKET_WRITEABLE)) {
-				if (cluster_ic_tier1_finish_connect(peer, peer_fd)) {
-					if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
-						dp_track[peer].substate = LMS_DP_CONNECTED;
-					else
-						dp_track[peer].substate = LMS_DP_HELLO_SENDING;
-					dp_wes_dirty = true;
-				} else {
-					dp_track[peer].fd = -1;
-					dp_track[peer].substate = LMS_DP_DOWN;
+			if (tag == -1) {
+				/* Listener: drain all pending accepts into anon slots. */
+				for (;;) {
+					int new_fd = -1;
+					int32 dummy_peer_id = -1;
+					int slot;
+
+					if (!cluster_ic_tier1_accept_one(&new_fd, &dummy_peer_id))
+						break;
+					if (new_fd < 0)
+						break;
+
+					for (slot = 0; slot < CLUSTER_MAX_NODES; slot++)
+						if (dp_pending_fds[slot] < 0)
+							break;
+					if (slot >= CLUSTER_MAX_NODES) {
+						(void)close(new_fd);
+						continue;
+					}
+					dp_pending_fds[slot] = new_fd;
 					dp_wes_dirty = true;
 				}
-			} else if (dp_track[peer].substate == LMS_DP_HELLO_SENDING
-					   && (ev[i].events & WL_SOCKET_WRITEABLE)) {
-				if (cluster_ic_tier1_continue_hello_send(peer, peer_fd)) {
-					if (cluster_ic_tier1_hello_send_remaining(peer) == 0) {
-						dp_track[peer].substate = LMS_DP_CONNECTED;
+			} else if (tag >= 0 && tag < CLUSTER_MAX_NODES) {
+				int32 peer = (int32)tag;
+				int peer_fd = dp_track[peer].fd;
+
+				if (peer_fd < 0)
+					continue;
+
+				if (dp_track[peer].substate == LMS_DP_CONNECT_PEND
+					&& (ev[i].events & WL_SOCKET_WRITEABLE)) {
+					if (cluster_ic_tier1_finish_connect(peer, peer_fd)) {
+						if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
+							dp_track[peer].substate = LMS_DP_CONNECTED;
+						else
+							dp_track[peer].substate = LMS_DP_HELLO_SENDING;
+						dp_wes_dirty = true;
+					} else {
+						dp_track[peer].fd = -1;
+						dp_track[peer].substate = LMS_DP_DOWN;
 						dp_wes_dirty = true;
 					}
-				} else {
-					dp_track[peer].fd = -1;
-					dp_track[peer].substate = LMS_DP_DOWN;
-					dp_wes_dirty = true;
-				}
-			} else if (dp_track[peer].substate == LMS_DP_CONNECTED) {
-				bool peer_up = true;
+				} else if (dp_track[peer].substate == LMS_DP_HELLO_SENDING
+						   && (ev[i].events & WL_SOCKET_WRITEABLE)) {
+					if (cluster_ic_tier1_continue_hello_send(peer, peer_fd)) {
+						if (cluster_ic_tier1_hello_send_remaining(peer) == 0) {
+							dp_track[peer].substate = LMS_DP_CONNECTED;
+							dp_wes_dirty = true;
+						}
+					} else {
+						dp_track[peer].fd = -1;
+						dp_track[peer].substate = LMS_DP_DOWN;
+						dp_wes_dirty = true;
+					}
+				} else if (dp_track[peer].substate == LMS_DP_CONNECTED) {
+					bool peer_up = true;
 
-				if (ev[i].events & WL_SOCKET_READABLE) {
-					CLUSTER_INJECTION_POINT("cluster-lms-data-dispatch");
-					/* Generic envelope pump: recv + verify + dispatch.  No
+					if (ev[i].events & WL_SOCKET_READABLE) {
+						CLUSTER_INJECTION_POINT("cluster-lms-data-dispatch");
+						/* Generic envelope pump: recv + verify + dispatch.  No
 					 * DATA msg_type is registered before the D3/D4 flip, so
 					 * pre-flip traffic is limited to HELLO/errors;  post-
 					 * flip this is the block-family dispatch entry. */
-					if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
-						dp_close_peer_now(peer, "data-plane recv failed");
-						peer_up = false;
+						if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
+							dp_close_peer_now(peer, "data-plane recv failed");
+							peer_up = false;
+						}
 					}
-				}
 
-				/*
+					/*
 				 * PGRAC: GCS-race round-4c tier1-partial-IO F2 (56s wall
 				 * root cause #2) — drain the backpressured outbound tail on
 				 * WL_SOCKET_WRITEABLE.  The CONTROL plane (LMON) has done
@@ -583,55 +607,66 @@ cluster_lms_data_plane_tick(long timeout_ms)
 				 * the DATA plane has no idempotent heartbeat to re-enter
 				 * tier1_send_bytes with.
 				 */
-				if (peer_up && (ev[i].events & WL_SOCKET_WRITEABLE)
-					&& cluster_ic_tier1_pending_outbound(peer)) {
-					switch (cluster_ic_tier1_drain_outbound(peer)) {
-					case CLUSTER_IC_SEND_DONE:
-					case CLUSTER_IC_SEND_WOULD_BLOCK:
-						/* Drained or still backpressured: re-align the
+					if (peer_up && (ev[i].events & WL_SOCKET_WRITEABLE)
+						&& cluster_ic_tier1_pending_outbound(peer)) {
+						switch (cluster_ic_tier1_drain_outbound(peer)) {
+						case CLUSTER_IC_SEND_DONE:
+						case CLUSTER_IC_SEND_WOULD_BLOCK:
+							/* Drained or still backpressured: re-align the
 						 * WRITEABLE interest either way. */
-						dp_wes_dirty = true;
-						break;
-					case CLUSTER_IC_SEND_NOT_ADMITTED:
-						/* Unreachable: the drain entry never admits a new
+							dp_wes_dirty = true;
+							break;
+						case CLUSTER_IC_SEND_NOT_ADMITTED:
+							/* Unreachable: the drain entry never admits a new
 						 * frame.  Keep the WES aligned anyway. */
-						dp_wes_dirty = true;
-						break;
-					case CLUSTER_IC_SEND_HARD_ERROR:
-						dp_close_peer_now(peer, "data-plane outbound drain hard error");
-						break;
+							dp_wes_dirty = true;
+							break;
+						case CLUSTER_IC_SEND_HARD_ERROR:
+							dp_close_peer_now(peer, "data-plane outbound drain hard error");
+							break;
+						}
 					}
 				}
-			}
-		} else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES) {
-			/* Anonymous accepted fd: accumulate + verify HELLO. */
-			int slot = (int)(tag - CLUSTER_MAX_NODES);
-			int pend_fd = dp_pending_fds[slot];
-			int32 learned = -1;
+			} else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES) {
+				/* Anonymous accepted fd: accumulate + verify HELLO. */
+				int slot = (int)(tag - CLUSTER_MAX_NODES);
+				int pend_fd = dp_pending_fds[slot];
+				int32 learned = -1;
 
-			if (pend_fd < 0)
-				continue;
+				if (pend_fd < 0)
+					continue;
 
-			if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned)) {
-				if (learned >= 0) {
-					/* HELLO complete: bind to the learned peer. */
-					if (dp_track[learned].fd >= 0 && dp_track[learned].fd != pend_fd)
-						cluster_ic_tier1_close_peer(learned, "data-plane duplicate connection");
-					dp_track[learned].fd = pend_fd;
-					dp_track[learned].substate = LMS_DP_CONNECTED;
+				if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned)) {
+					if (learned >= 0) {
+						/* HELLO complete: bind to the learned peer. */
+						if (dp_track[learned].fd >= 0 && dp_track[learned].fd != pend_fd)
+							cluster_ic_tier1_close_peer(learned, "data-plane duplicate connection");
+						dp_track[learned].fd = pend_fd;
+						dp_track[learned].substate = LMS_DP_CONNECTED;
+						dp_pending_fds[slot] = -1;
+						cluster_ic_tier1_anon_hello_reset(slot);
+						dp_wes_dirty = true;
+					}
+					/* else: still accumulating; stay registered READABLE */
+				} else {
+					(void)close(pend_fd);
 					dp_pending_fds[slot] = -1;
 					cluster_ic_tier1_anon_hello_reset(slot);
 					dp_wes_dirty = true;
 				}
-				/* else: still accumulating; stay registered READABLE */
-			} else {
-				(void)close(pend_fd);
-				dp_pending_fds[slot] = -1;
-				cluster_ic_tier1_anon_hello_reset(slot);
-				dp_wes_dirty = true;
 			}
 		}
+		work_completed = true;
 	}
+	PG_FINALLY();
+	{
+		if (!work_completed)
+			LWLockReleaseAll();
+		(void)cluster_normal_stop_service_leave(work_completed);
+	}
+	PG_END_TRY();
+	if (cluster_lms_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
+		ereport(FATAL, (errmsg_internal("LMS DATA dispatch failed normal-stop check")));
 }
 
 /* Close everything we own (LmsMain teardown path). */

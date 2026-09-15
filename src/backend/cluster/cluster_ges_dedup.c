@@ -28,6 +28,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_clean_leave.h"
 
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_guc.h"
@@ -137,6 +138,79 @@ cluster_ges_dedup_shmem_register(void)
 	cluster_shmem_register_region(&cluster_ges_dedup_region);
 }
 
+static void
+ges_dedup_stop_held_lock(LWLock *lock, LWLockMode mode, void *arg)
+{
+	(void)lock;
+	(void)mode;
+	*((bool *)arg) = true;
+}
+
+ClusterNormalStopPollResult
+cluster_ges_dedup_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	HASH_SEQ_STATUS scan;
+	ClusterGesDedupEntry *entry;
+	const char *why = "NONE";
+	uint64 request = 0;
+	uint64 seen = 0;
+	bool held_lock = false;
+
+	if (domain != NULL)
+		*domain = "GES_DEDUP";
+	if (key != NULL)
+		*key = 0;
+	if (!IsUnderPostmaster || MyBackendType != B_LMON)
+		why = "GES_DEDUP_OBSERVER_ROLE";
+	else if (cluster_ges_dedup_shared == NULL || cluster_ges_dedup_htab == NULL
+			 || cluster_ges_dedup_lock == NULL)
+		why = "GES_DEDUP_UNINITIALIZED";
+	else {
+		ForEachLWLockHeldByMe(ges_dedup_stop_held_lock, &held_lock);
+		if (held_lock)
+			why = "GES_DEDUP_CALLER_LOCK";
+	}
+	if (strcmp(why, "NONE") != 0) {
+		if (reason != NULL)
+			*reason = why;
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+
+	/* The approximate count is not proof. Scan the original table without
+	 * sweeping or releasing anything. Cached reply bytes are history; the
+	 * actual GRD holder, native probe and outbound each have separate owners. */
+	LWLockAcquire(cluster_ges_dedup_lock, LW_SHARED);
+	hash_seq_init(&scan, cluster_ges_dedup_htab);
+	while ((entry = hash_seq_search(&scan)) != NULL) {
+		ClusterNormalStopPollResult one = CLUSTER_NORMAL_STOP_READY;
+		const char *cause = "NONE";
+
+		seen++;
+		if (seen > cluster_ges_dedup_capacity()
+			|| entry->cached_reply_len > CLUSTER_GES_DEDUP_REPLY_BLOB_LEN
+			|| (entry->cached_reply_len == 0 ? entry->status != CLUSTER_GES_DEDUP_MISS_REGISTERED
+											 : entry->status != CLUSTER_GES_DEDUP_CACHED_REPLY)) {
+			one = CLUSTER_NORMAL_STOP_INVALID;
+			cause = "GES_DEDUP_REPLY_SHAPE";
+		} else if (entry->cached_reply_len == 0) {
+			one = CLUSTER_NORMAL_STOP_PENDING;
+			cause = "GES_DEDUP_IN_FLIGHT";
+		}
+		if (one < result) {
+			result = one;
+			why = cause;
+			request = entry->key.request_id;
+		}
+	}
+	LWLockRelease(cluster_ges_dedup_lock);
+	if (key != NULL)
+		*key = request;
+	if (reason != NULL)
+		*reason = why;
+	return result;
+}
+
 /* ============================================================
  * Public API.
  * ============================================================ */
@@ -238,6 +312,10 @@ cluster_ges_dedup_lookup_or_register(const ClusterGesDedupKey *key, uint8 *reply
 	}
 
 	/* MISS path:  register a fresh in-flight entry. */
+	if (!cluster_normal_stop_service_new_work(false)) {
+		LWLockRelease(cluster_ges_dedup_lock);
+		return CLUSTER_GES_DEDUP_FULL;
+	}
 	{
 		uint32 count = pg_atomic_read_u32(&cluster_ges_dedup_shared->entry_count);
 		uint32 cap = cluster_ges_dedup_capacity();

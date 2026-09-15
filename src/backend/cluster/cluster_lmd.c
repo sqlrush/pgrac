@@ -81,6 +81,7 @@
 #include <signal.h>
 
 #include "cluster/cluster_cancel_token.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
@@ -280,6 +281,11 @@ cluster_lmd_cancel_queue_enqueue(uint32 source_node_id, const void *payload, uin
 	if (lmd_cancel_queue == NULL || payload == NULL
 		|| payload_len > sizeof(((ClusterLmdCancelItem *)NULL)->payload))
 		return false;
+	/* The LMON has already validated the original frame. A new queue item
+	 * after the final cut is still work, including an ACK whose private
+	 * consumer is LMD; do not manufacture an empty/clean queue by dropping it. */
+	if (!cluster_normal_stop_service_new_work(false))
+		return false;
 
 	SpinLockAcquire(&lmd_cancel_queue->lock);
 	next_tail = (lmd_cancel_queue->tail + 1) % CLUSTER_LMD_CANCEL_QUEUE_DEPTH;
@@ -321,6 +327,81 @@ typedef struct LmdVictimAck {
 } LmdVictimAck;
 
 static LmdVictimAck lmd_victim_acks[CLUSTER_LMD_VICTIM_ACK_MAX];
+
+/* Queue ownership includes every live ring item. A dequeued stack item is
+ * covered by LmdMain's outer work bracket, not by an empty queue snapshot. */
+ClusterNormalStopPollResult
+cluster_lmd_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *where = "CANCEL_QUEUE";
+	const char *why = "LMD_CANCEL_IDLE";
+	uint64 first = 0;
+
+	if (!IsUnderPostmaster || !AmLmdProcess() || cluster_lmd_state == NULL
+		|| lmd_cancel_queue == NULL || ProcGlobal == NULL) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		why = "LMD_CANCEL_OWNER_UNAVAILABLE";
+	} else {
+		SpinLockAcquire(&lmd_cancel_queue->lock);
+		if (lmd_cancel_queue->head >= CLUSTER_LMD_CANCEL_QUEUE_DEPTH
+			|| lmd_cancel_queue->tail >= CLUSTER_LMD_CANCEL_QUEUE_DEPTH) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "LMD_CANCEL_QUEUE_GEOMETRY_INVALID";
+		} else {
+			for (uint32 i = lmd_cancel_queue->head; i != lmd_cancel_queue->tail;
+				 i = (i + 1) % CLUSTER_LMD_CANCEL_QUEUE_DEPTH) {
+				const ClusterLmdCancelItem *item = &lmd_cancel_queue->items[i];
+				uint32 opcode;
+				memcpy(&opcode, item->payload, sizeof(opcode));
+				if (item->source_node_id >= CLUSTER_MAX_NODES
+					|| (opcode == GES_REQ_OPCODE_CANCEL_ACK
+							? item->payload_len != sizeof(GesCancelAckPayload)
+							: opcode != GES_REQ_OPCODE_CANCEL_PENDING
+								  || item->payload_len != sizeof(GesRequestPayload))) {
+					result = CLUSTER_NORMAL_STOP_INVALID;
+					why = "LMD_CANCEL_QUEUE_ITEM_INVALID";
+					first = i;
+					break;
+				}
+				if (result == CLUSTER_NORMAL_STOP_READY) {
+					result = CLUSTER_NORMAL_STOP_PENDING;
+					why = "LMD_CANCEL_QUEUE_OWNED";
+					first = i;
+				}
+			}
+		}
+		SpinLockRelease(&lmd_cancel_queue->lock);
+		for (int i = 0; i < CLUSTER_LMD_VICTIM_ACK_MAX; i++) {
+			const LmdVictimAck *a = &lmd_victim_acks[i];
+			if (!a->active)
+				continue;
+			if (a->procno >= (uint32)ProcGlobal->allProcCount || a->victim.procno != a->procno
+				|| a->victim.node_id != (uint32)cluster_node_id || a->wait_seq == 0
+				|| a->cancel_id == 0 || a->deadline <= 0 || a->coordinator_node < 0
+				|| a->coordinator_node >= CLUSTER_MAX_NODES) {
+				result = CLUSTER_NORMAL_STOP_INVALID;
+				where = "VICTIM_ACK";
+				why = "LMD_VICTIM_ACK_INVALID";
+				first = i;
+				break;
+			}
+			if (result == CLUSTER_NORMAL_STOP_READY) {
+				result = CLUSTER_NORMAL_STOP_PENDING;
+				where = "VICTIM_ACK";
+				why = "LMD_VICTIM_ACK_OWNED";
+				first = a->cancel_id;
+			}
+		}
+	}
+	if (domain != NULL)
+		*domain = where;
+	if (key != NULL)
+		*key = first;
+	if (reason != NULL)
+		*reason = why;
+	return result;
+}
 
 static void
 lmd_victim_ack_add(uint32 procno, const ClusterGrdHolderId *victim, uint64 wait_seq,
@@ -1032,6 +1113,10 @@ cluster_lmd_run_coordinator_tick(void)
 	 * pending entries go inert -> the finite GES timeout backstops them.
 	 */
 	cluster_lmd_pending_cancel_tick();
+	/* The original controller proved all owners idle before this cut. Do
+	 * not create a fresh periodic probe while finishing the stop suffix. */
+	if (cluster_normal_stop_service_data_sealed())
+		return;
 
 	now = GetCurrentTimestamp();
 	if (lmd_last_coord_scan != 0
@@ -1057,6 +1142,64 @@ cluster_lmd_run_coordinator_tick(void)
  *	work" signal);else increment lmd_idle_count.  Then WaitLatch with the
  *	LMD idle wait event.
  * ============================================================ */
+
+static ClusterNormalStopPollResult
+LmdNormalStopPoll(void)
+{
+	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
+	for (int i = 0; i < 4; i++) {
+		ClusterNormalStopPollResult result;
+		const char *domain = "LMD", *reason = "LMD_OBSERVATION_MISSING";
+		uint64 key = 0;
+		switch (i) {
+		case 0:
+			result = cluster_lmd_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 1:
+			domain = "PENDING_CANCEL";
+			result = cluster_lmd_pending_normal_stop_poll(&key, &reason);
+			break;
+		case 2:
+			domain = "WAIT_GRAPH";
+			result = cluster_lmd_graph_normal_stop_poll(&key, &reason);
+			break;
+		default:
+			domain = "REPORT_COLLECTOR";
+			result = cluster_lmd_probe_normal_stop_poll(&key, &reason);
+			break;
+		}
+		if (result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING) {
+			aggregate = CLUSTER_NORMAL_STOP_INVALID;
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+			ereport(LOG,
+					(errmsg("LMD normal-stop responsibility invalid"),
+					 errdetail("domain=%s key=" UINT64_FORMAT " reason=%s", domain, key, reason)));
+		} else if (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)
+			aggregate = CLUSTER_NORMAL_STOP_PENDING;
+	}
+	return aggregate;
+}
+
+static bool
+LmdNormalStopCanExit(void)
+{
+	return !cluster_normal_stop_requested()
+		   || (cluster_normal_stop_protocol_closed()
+			   && cluster_normal_stop_service_idle(LmdNormalStopPoll())
+					  == CLUSTER_NORMAL_STOP_READY);
+}
+
+static void
+LmdNormalStopBeforeShmemExit(int code, Datum arg pg_attribute_unused())
+{
+	/* A fatal unwind must not try module locks; code0 still needs the final
+	 * owner observation even after its earlier explicit exit check passed. */
+	if (cluster_normal_stop_requested() && (code != 0 || !LmdNormalStopCanExit())) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+		if (code == 0)
+			ereport(FATAL, (errmsg("LMD final normal-stop exit check failed")));
+	}
+}
 
 void
 LmdMain(void)
@@ -1092,6 +1235,7 @@ LmdMain(void)
 				(errcode(ERRCODE_INTERNAL_ERROR), errmsg("cluster_lmd shmem region not attached"),
 				 errhint("cluster_lmd_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
+	before_shmem_exit(LmdNormalStopBeforeShmemExit, (Datum)0);
 
 	/* Publish STARTING + record pid / spawned_at. */
 	LWLockAcquire(&cluster_lmd_state->lwlock, LW_EXCLUSIVE);
@@ -1113,6 +1257,7 @@ LmdMain(void)
 
 	for (;;) {
 		uint64 current_submission_count;
+		volatile bool completed = false;
 
 		CHECK_FOR_INTERRUPTS();
 
@@ -1121,8 +1266,13 @@ LmdMain(void)
 			ProcessConfigFile(PGC_SIGHUP);
 		}
 
-		if (ShutdownRequestPending || lmd_shutdown_requested())
+		if (ShutdownRequestPending || lmd_shutdown_requested()) {
+			if (!LmdNormalStopCanExit()) {
+				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+				ereport(FATAL, (errmsg("LMD cannot exit before normal-stop completion")));
+			}
 			break;
+		}
 
 		/*
 		 * HC6:LMD does not consume / dequeue / maintain graph.  Observe
@@ -1139,19 +1289,36 @@ LmdMain(void)
 		 * is cheap when graph is empty (early return), so no need to
 		 * differentiate paths.
 		 */
-		if (lmd_get_state() == CLUSTER_LMD_READY) {
-			cluster_lmd_tarjan_run_local_scan();
-			/* spec-2.24 D5 — drain cancel queue. */
-			cluster_lmd_drain_cancel_queue();
-			/* spec-5.9 D5 — victim-side: observe consume markers + ACK the
+		if (!cluster_normal_stop_service_enter())
+			ereport(FATAL, (errmsg("LMD cannot register normal-stop work")));
+		PG_TRY();
+		{
+			if (lmd_get_state() == CLUSTER_LMD_READY) {
+				if (!cluster_normal_stop_service_data_sealed())
+					cluster_lmd_tarjan_run_local_scan();
+				/* spec-2.24 D5 — drain cancel queue. */
+				cluster_lmd_drain_cancel_queue();
+				/* spec-5.9 D5 — victim-side: observe consume markers + ACK the
 			 * coordinator (runs on every node — any node can host a victim). */
-			cluster_lmd_victim_ack_tick();
-			/* spec-2.24 D8 — periodic safety net cleanup sweep. */
-			cluster_lmd_run_periodic_cleanup_sweep();
-			/* spec-5.8 D3b — coordinator cross-node deadlock scan (HC16-gated,
+				cluster_lmd_victim_ack_tick();
+				/* spec-2.24 D8 — periodic safety net cleanup sweep. */
+				cluster_lmd_run_periodic_cleanup_sweep();
+				/* spec-5.8 D3b — coordinator cross-node deadlock scan (HC16-gated,
 			 * global_dd_interval cadence, two-round + revalidate). */
-			cluster_lmd_run_coordinator_tick();
+				cluster_lmd_run_coordinator_tick();
+			}
+			completed = true;
 		}
+		PG_FINALLY();
+		{
+			if (!completed)
+				LWLockReleaseAll();
+			(void)cluster_normal_stop_service_leave(completed);
+		}
+		PG_END_TRY();
+		if (cluster_normal_stop_requested()
+			&& cluster_normal_stop_service_idle(LmdNormalStopPoll()) == CLUSTER_NORMAL_STOP_INVALID)
+			ereport(FATAL, (errmsg("LMD normal-stop idle observation failed")));
 
 		if (current_submission_count > seen_submission_count) {
 			pg_atomic_fetch_add_u64(&cluster_lmd_state->lmd_wake_count, 1);

@@ -42,6 +42,8 @@
  */
 #include "postgres.h"
 
+#include "cluster/cluster_clean_leave.h"
+
 #include "access/transam.h"
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES (D4 member admission) */
 #include "cluster/cluster_guc.h"
@@ -848,6 +850,60 @@ cluster_lmd_graph_snapshot_copy(ClusterLmdWaitEdge *out_buf, int max_edges,
 /* ============================================================
  * Accessors + counter helpers.
  * ============================================================ */
+
+/* Read the original table, not the cached diagnostic edge_count. A live
+ * edge remains its original waiter/cancel owner's duty; do not prune here. */
+ClusterNormalStopPollResult
+cluster_lmd_graph_normal_stop_poll(uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *why = "LMD_GRAPH_IDLE";
+	uint64 first = 0;
+	uint64 count = 0;
+	HASH_SEQ_STATUS scan;
+	LmdEdgeEntry *entry;
+
+	if (cluster_lmd_graph_state == NULL || cluster_lmd_graph_htab == NULL) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		why = "LMD_GRAPH_UNINITIALIZED";
+	} else if (LWLockHeldByMe(&cluster_lmd_graph_state->lwlock)) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		why = "LMD_GRAPH_LOCK_HELD";
+	} else {
+		LWLockAcquire(&cluster_lmd_graph_state->lwlock, LW_SHARED);
+		if (cluster_lmd_graph_state->max_edges <= 0) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			why = "LMD_GRAPH_GEOMETRY_INVALID";
+		} else {
+			hash_seq_init(&scan, cluster_lmd_graph_htab);
+			while ((entry = hash_seq_search(&scan)) != NULL) {
+				LmdEdgeKey exact;
+
+				make_key(&entry->edge.waiter, &entry->edge.blocker, &exact);
+				count++;
+				if (count > (uint64)cluster_lmd_graph_state->max_edges
+					|| memcmp(&entry->key, &exact, sizeof(exact)) != 0) {
+					result = CLUSTER_NORMAL_STOP_INVALID;
+					why = "LMD_GRAPH_ENTRY_INVALID";
+					first = entry->key.waiter.request_id;
+					hash_seq_term(&scan);
+					break;
+				}
+				if (result == CLUSTER_NORMAL_STOP_READY) {
+					result = CLUSTER_NORMAL_STOP_PENDING;
+					why = "LMD_GRAPH_WAIT_OWNED";
+					first = entry->key.waiter.request_id;
+				}
+			}
+		}
+		LWLockRelease(&cluster_lmd_graph_state->lwlock);
+	}
+	if (key != NULL)
+		*key = first;
+	if (reason != NULL)
+		*reason = why;
+	return result;
+}
 
 uint64
 cluster_lmd_graph_generation_get(void)

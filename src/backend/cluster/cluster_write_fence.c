@@ -41,6 +41,7 @@
 #include "utils/wait_event.h" /* D4 marker-write + D6 verify wait events */
 
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"			/* cluster_node_id, cluster_voting_disks */
 #include "cluster/cluster_lmon.h"			/* cluster_lmon_marker_complete_wakeup */
 #include "cluster/cluster_qvotec.h"			/* ClusterVotingSlot (marker layout asserts) */
@@ -78,6 +79,65 @@ static ClusterWriteFenceShmem *cluster_write_fence_shmem = NULL;
  */
 static uint64 qvotec_inflight_marker_seq = 0;
 static uint64 qvotec_last_processed_marker_seq = 0;
+
+ClusterNormalStopPollResult
+cluster_write_fence_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	ClusterWriteFenceShmem *s = cluster_write_fence_shmem;
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *why = "WRITE_FENCE_OWNER_OR_SHMEM";
+	uint64 seq, seq_after, request, completion, request_after;
+	uint32 marker_result, self_fenced, cache_valid, engaged;
+	uint64 object = 0;
+
+	if (domain)
+		*domain = "WRITE_FENCE";
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || s == NULL)
+		goto done;
+	/* No cached token or deadline is shutdown authority. We only observe
+	 * original publication ownership and the QVOTEC mailbox. The LMON's
+	 * reconfig observer separately covers its unconsumed private stage;
+	 * reading this process's copy of QVOTEC statics would prove nothing. */
+	seq = pg_atomic_read_u64(&s->authority_cache_seq);
+	request = pg_atomic_read_u64(&s->marker_request_seq);
+	completion = pg_atomic_read_u64(&s->marker_completion_seq);
+	pg_read_barrier();
+	marker_result = pg_atomic_read_u32(&s->marker_result);
+	self_fenced = pg_atomic_read_u32(&s->self_fenced);
+	cache_valid = pg_atomic_read_u32(&s->authority_cache_valid);
+	engaged = pg_atomic_read_u32(&s->fence_engaged);
+	pg_read_barrier();
+	request_after = pg_atomic_read_u64(&s->marker_request_seq);
+	seq_after = pg_atomic_read_u64(&s->authority_cache_seq);
+	object = request;
+	if (request == request_after && completion > request)
+		why = "WRITE_FENCE_MARKER_SEQUENCE";
+	else if (self_fenced != 0)
+		why = "WRITE_FENCE_SELF_FENCED";
+	else if (cache_valid > 1 || engaged > 1)
+		why = "WRITE_FENCE_STATE_INVALID";
+	else if (request == request_after && request != 0 && completion == request
+			 && marker_result != CLUSTER_FENCE_MARKER_SUBMIT_ACK)
+		why = "WRITE_FENCE_MARKER_FAILED";
+	else if (request != request_after || completion != request) {
+		why = "WRITE_FENCE_MARKER_MAILBOX";
+		result = CLUSTER_NORMAL_STOP_PENDING;
+	} else if ((seq & 1) != 0 || seq != seq_after) {
+		why = "WRITE_FENCE_CACHE_PUBLICATION";
+		object = seq;
+		result = CLUSTER_NORMAL_STOP_PENDING;
+	} else {
+		why = "NONE";
+		object = 0;
+		result = CLUSTER_NORMAL_STOP_READY;
+	}
+done:
+	if (key)
+		*key = object;
+	if (reason)
+		*reason = why;
+	return result;
+}
 
 #ifdef USE_ASSERT_CHECKING
 void (*cluster_write_fence_cache_test_after_publish_acquire_hook)(void) = NULL;

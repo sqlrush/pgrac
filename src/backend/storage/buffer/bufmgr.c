@@ -54,6 +54,7 @@
 #include "storage/buf_internals.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_catalog_stats.h"	/* spec-6.14 D10b — catalog buf hit/miss */
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_mode.h"	/* PGRAC (spec-6.14 D8): storage-mode gate */
 #include "cluster/cluster_pcm_direct_init.h"
 #include "cluster/cluster_gcs_block.h"
@@ -333,6 +334,117 @@ cluster_pcm_own_snapshot_locked(BufferDesc *buf, ClusterPcmOwnSnapshot *out)
 {
 	cluster_pcm_own_snapshot_post_state_locked(buf,
 		pg_atomic_read_u32(&buf->state), out);
+}
+
+static void
+cluster_bufmgr_stop_held_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)context = true;
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, int *buffer_id_out,
+								const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	BufferTag observed = { 0 };
+	const char *reason = "BUFMGR_READY";
+	int observed_id = -1;
+	bool held_lock = false;
+	int i;
+
+	if (!IsUnderPostmaster || !cluster_enabled || NBuffers <= 0 || BufferDescriptors == NULL
+		|| ClusterPcmOwnArray == NULL || ClusterPiShadow == NULL) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "BUFMGR_UNINITIALIZED";
+		goto done;
+	}
+	/* No entry/mapping/module lock may be carried into this independent
+	 * observation. The controller seals between observations, never here. */
+	ForEachLWLockHeldByMe(cluster_bufmgr_stop_held_lock, &held_lock);
+	if (held_lock) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "BUFMGR_CALLER_LOCK_HELD";
+		goto done;
+	}
+	for (i = 0; i < NBuffers; i++) {
+		BufferDesc *buf = GetBufferDescriptor(i);
+		uint32 state = LockBufHdr(buf);
+		ClusterNormalStopPollResult current = CLUSTER_NORMAL_STOP_READY;
+		const char *current_reason = "BUFMGR_READY";
+		ClusterPcmOwnSnapshot own;
+		uint64 delivery = 0;
+		bool is_pi = buf->buffer_type == BUF_TYPE_PI;
+
+		/* Check the physical locator before indexing its parallel sidecar. */
+		if (buf->buf_id != i) {
+			current = CLUSTER_NORMAL_STOP_INVALID;
+			current_reason = "BUFMGR_LOCATOR_INVALID";
+		} else {
+			cluster_pcm_own_snapshot_post_state_locked(buf, state, &own);
+			delivery = cluster_pcm_own_delivery_attempt_get(i);
+			if (own.buffer_type > BUF_TYPE_XCUR || own.pcm_state > PCM_STATE_READ_IMAGE
+				|| (state & BM_IO_ERROR) != 0
+				|| ((own.pcm_state == PCM_STATE_S || own.pcm_state == PCM_STATE_X)
+					&& (state & (BM_VALID | BM_IO_IN_PROGRESS)) == 0)
+				|| ((state & BM_TAG_VALID) == 0 && (state & (BM_VALID | BM_DIRTY)) != 0)
+				|| own.generation == UINT64_MAX || own.reservation_token == UINT64_MAX
+				|| delivery == UINT64_MAX
+				|| cluster_pcm_own_classify_live_flags(own.flags, own.reservation_token)
+					   == CLUSTER_PCM_OWN_CORRUPT
+				|| (own.writer_activation_token != 0
+					&& (own.writer_activation_token != own.reservation_token || own.flags != 0))
+				|| (own.resource_x_activation_generation != 0
+					&& (own.writer_activation_token == 0
+						|| own.resource_x_activation_generation == UINT64_MAX))
+				|| (is_pi && (state & BM_VALID) == 0
+					&& ((state & BM_TAG_VALID) == 0 || own.pcm_state != PCM_STATE_N
+						|| (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0))) {
+				current = CLUSTER_NORMAL_STOP_INVALID;
+				current_reason = "BUFMGR_SHAPE_INVALID";
+			} else if (BUF_STATE_GET_REFCOUNT(state) != 0
+					   || (state & (BM_IO_IN_PROGRESS | BM_PIN_COUNT_WAITER)) != 0 || own.flags != 0
+					   || own.writer_activation_token != 0
+					   || own.resource_x_activation_generation != 0 || delivery != 0
+					   || own.pcm_state == PCM_STATE_READ_IMAGE) {
+				current = CLUSTER_NORMAL_STOP_PENDING;
+				current_reason = "BUFMGR_OWNED";
+			} else if (is_pi && (state & BM_VALID) != 0
+					   && (own.pcm_state != PCM_STATE_N
+						   || (state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0)) {
+				/* The same conservative retained-image prefix as the reuse
+				 * gate. Only a clean N remnant with no owner is mere cache. */
+				current = CLUSTER_NORMAL_STOP_PENDING;
+				current_reason = "BUFMGR_RETAINED_IMAGE";
+			} else if (post_checkpoint && is_pi && (state & BM_VALID) == 0) {
+				/* Preserve the original ship shadow until the real DISCARD
+				 * consumer breaks this shape. No timestamp grants durability. */
+				current = CLUSTER_NORMAL_STOP_PENDING;
+				current_reason = "BUFMGR_PI_DURABILITY";
+			} else if (post_checkpoint && (state & (BM_DIRTY | BM_CHECKPOINT_NEEDED)) != 0) {
+				current = CLUSTER_NORMAL_STOP_PENDING;
+				current_reason = "BUFMGR_CHECKPOINT_DIRTY";
+			}
+		}
+		if ((current == CLUSTER_NORMAL_STOP_INVALID && result != CLUSTER_NORMAL_STOP_INVALID)
+			|| (current == CLUSTER_NORMAL_STOP_PENDING && result == CLUSTER_NORMAL_STOP_READY)) {
+			result = current;
+			reason = current_reason;
+			observed = buf->tag;
+			observed_id = i;
+		}
+		UnlockBufHdr(buf, state);
+	}
+done:
+	if (tag_out != NULL)
+		*tag_out = observed;
+	if (buffer_id_out != NULL)
+		*buffer_id_out = observed_id;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
 }
 
 /* A normal D-h1 PI is !BM_VALID.  PCM-X retained-image transfer deliberately

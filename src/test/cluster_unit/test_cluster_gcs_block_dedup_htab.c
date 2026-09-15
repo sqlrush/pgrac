@@ -51,6 +51,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_clean_leave.h"
 
 #include <stddef.h>
 #include <stdlib.h>
@@ -86,9 +87,23 @@ int cluster_gcs_block_retransmit_initial_backoff_ms = 100;
 int MaxConnections = 1;
 bool IsUnderPostmaster = false;
 BackendId MyBackendId = InvalidBackendId;
+BackendType MyBackendType = B_LMON;
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *) pg_attribute_unused(),
+					  void *context pg_attribute_unused())
+{
+	/* No observer called by these online reclaim regressions. */
+}
 
 /* Controlled fake clock (no sleeps: window aging is simulated). */
 static TimestampTz fake_now = 1000000000;
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data pg_attribute_unused())
+{
+	return true; /* Existing online reclaim tests, no normal-stop attempt. */
+}
 
 /* Controlled declared-node-count sniff (spec-7.2a D4 auto-size input). */
 static int fake_declared_nodes = 1;

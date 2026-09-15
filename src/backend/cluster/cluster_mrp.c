@@ -27,6 +27,7 @@
 #include "access/xlogrecovery.h"
 #include "cluster/cluster_adg.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mrp.h"
@@ -1208,6 +1209,64 @@ ClusterMrpSharedState *
 cluster_mrp_shared_state(void)
 {
 	return cluster_mrp_state;
+}
+
+ClusterNormalStopPollResult
+cluster_mrp_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *why = "MRP_OWNER_OR_SHMEM";
+	uint64 request = 0, completion, pending, token_seq, request_after, token_after;
+	uint32 state, valid;
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || cluster_mrp_state == NULL)
+		goto done;
+	/* This contract is stable primary, not an ADG shutdown/recovery path.
+	 * Role is PGC_POSTMASTER and RFS is gated by the same original predicate.
+	 * Never inspect LMON's empty copies of MRP/QVOTEC private fd/lease state. */
+	if (cluster_dg_role != CLUSTER_DG_ROLE_PRIMARY || cluster_mrp_should_start()) {
+		why = "MRP_NOT_PRIMARY_NORMAL_STOP";
+		goto done;
+	}
+	state = pg_atomic_read_u32(&cluster_mrp_state->mrp_state);
+	if (state != CLUSTER_MRP_DISABLED || pg_atomic_read_u32(&cluster_mrp_state->pid) != 0) {
+		why = "MRP_ACTIVE_PROCESS_OUTSIDE_PRIMARY";
+		goto done;
+	}
+	token_seq = pg_atomic_read_u64(&cluster_mrp_state->apply_master_token_seq);
+	request = pg_atomic_read_u64(&cluster_mrp_state->apply_lease_request_seq);
+	pg_read_barrier();
+	valid = pg_atomic_read_u32(&cluster_mrp_state->apply_master_term_valid);
+	pending = pg_atomic_read_u64(&cluster_mrp_state->pending_apply_lease_seq);
+	completion = pg_atomic_read_u64(&cluster_mrp_state->apply_lease_completion_seq);
+	pg_read_barrier();
+	request_after = pg_atomic_read_u64(&cluster_mrp_state->apply_lease_request_seq);
+	token_after = pg_atomic_read_u64(&cluster_mrp_state->apply_master_token_seq);
+	if (completion > request && request == request_after) {
+		why = "MRP_MAILBOX_IDENTITY_INVALID";
+		goto done;
+	}
+	if ((token_seq & 1) != 0 || token_seq != token_after || request != request_after
+		|| request != completion || (pending & 1) != 0 || pending != (request << 1)) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		why = "MRP_PUBLICATION_PENDING";
+		goto done;
+	}
+	if (valid != 0) {
+		why = "MRP_APPLY_AUTHORITY_OUTSIDE_PRIMARY";
+		goto done;
+	}
+	/* Completed mailbox/counters, Startup recovery-thread metadata and the
+	 * live QVOTEC wake latch are not an active apply lease or MRP process. */
+	result = CLUSTER_NORMAL_STOP_READY;
+	why = "NONE";
+done:
+	if (domain)
+		*domain = "MRP";
+	if (key)
+		*key = request;
+	if (reason)
+		*reason = why;
+	return result;
 }
 
 ClusterMrpState

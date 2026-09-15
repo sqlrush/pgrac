@@ -22,6 +22,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_conf.h"
 
 #include "cluster/cluster_ges.h" /* GesRequestPayload (spec-5.8 D8 coupling assert) */
 #include "cluster/cluster_grd_work_queue.h"
@@ -52,6 +54,52 @@ typedef struct ClusterGrdWorkQueueShared {
 
 static ClusterGrdWorkQueueShared *cluster_grd_work_queue_state = NULL;
 static LWLock *cluster_grd_work_queue_lock = NULL;
+
+ClusterNormalStopPollResult
+cluster_grd_work_queue_normal_stop_poll(uint32 *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const ClusterGrdWorkQueueShared *q = cluster_grd_work_queue_state;
+
+	if (slot_out == NULL || reason_out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*slot_out = UINT32_MAX;
+	*reason_out = "GRD_WORK_QUEUE_UNINITIALIZED";
+	if (q == NULL || cluster_grd_work_queue_lock == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	if (LWLockHeldByMe(cluster_grd_work_queue_lock)) {
+		*reason_out = "GRD_WORK_QUEUE_LOCK_HELD";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	LWLockAcquire(cluster_grd_work_queue_lock, LW_SHARED);
+	*reason_out = "NONE";
+	if (q->head >= PGRAC_GES_WORK_QUEUE_CAPACITY || q->tail >= PGRAC_GES_WORK_QUEUE_CAPACITY
+		|| q->count > PGRAC_GES_WORK_QUEUE_CAPACITY
+		|| (q->tail + q->count) % PGRAC_GES_WORK_QUEUE_CAPACITY != q->head) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		*reason_out = "GRD_WORK_QUEUE_GEOMETRY";
+	} else {
+		for (uint32 offset = 0; offset < q->count; offset++) {
+			uint32 index = (q->tail + offset) % PGRAC_GES_WORK_QUEUE_CAPACITY;
+			const ClusterGrdWorkItem *item = &q->items[index];
+			if (item->source_node_id >= CLUSTER_MAX_NODES || item->payload_len == 0
+				|| item->payload_len > sizeof(item->payload)) {
+				result = CLUSTER_NORMAL_STOP_INVALID;
+				*slot_out = index;
+				*reason_out = "GRD_WORK_QUEUE_ITEM_INVALID";
+				break;
+			}
+			if (result == CLUSTER_NORMAL_STOP_READY) {
+				result = CLUSTER_NORMAL_STOP_PENDING;
+				*slot_out = index;
+				*reason_out = "GRD_WORK_QUEUE";
+			}
+		}
+	}
+	LWLockRelease(cluster_grd_work_queue_lock);
+	/* A dequeued item still belongs to the LMON outer work bracket. */
+	return result;
+}
 
 
 Size

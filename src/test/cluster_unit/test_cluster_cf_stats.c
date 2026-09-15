@@ -29,6 +29,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cf_stats.h"
+#include "cluster/cluster_clean_leave.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
 
@@ -46,6 +47,8 @@
 
 
 AuxProcType MyAuxProcType = NotAnAuxProcess;
+BackendType MyBackendType = B_INVALID;
+bool IsUnderPostmaster = false;
 
 /* ============================================================
  * PG runtime stubs.
@@ -97,6 +100,9 @@ UT_TEST(test_cf_counters_null_safe_before_init)
 	 * a no-op and read returns 0 rather than dereferencing NULL. */
 	cluster_cf_counter_inc(CLUSTER_CF_X_ACQUIRE);
 	UT_ASSERT_EQ((int)cluster_cf_counter_read(CLUSTER_CF_X_ACQUIRE), 0);
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(false, NULL), CLUSTER_NORMAL_STOP_INVALID);
 }
 
 
@@ -201,18 +207,65 @@ UT_TEST(test_owner_eor_phase_attach_and_fresh_init)
 }
 
 
+UT_TEST(test_stop_cf_shared_original_eor_owner_must_finish)
+{
+	const char *reason;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(false, NULL), CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_install());
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(false, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_cf_owner_eor_phase_read(), CLUSTER_CF_OWNER_EOR_INSTALLED);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_activate());
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(false, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(cluster_cf_owner_eor_phase_done());
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(false, &reason), CLUSTER_NORMAL_STOP_PENDING);
+	MyAuxProcType = StartupProcess;
+	UT_ASSERT(cluster_cf_owner_eor_phase_clear());
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(true, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_stop_cf_shared_join_hint_does_not_deadlock_first_normal_checkpoint)
+{
+	const char *reason;
+	unsigned char before[sizeof(cf_buf[cf_buf_slot])];
+	MyAuxProcType = CheckpointerProcess;
+	cluster_cf_stats_set_join_readonly(true);
+	memcpy(before, cf_buf[cf_buf_slot], sizeof(before));
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(false, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(true, &reason), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT(strcmp(reason, "CF_POST_CHECKPOINT_JOIN_READONLY") == 0);
+	UT_ASSERT(memcmp(before, cf_buf[cf_buf_slot], sizeof(before)) == 0);
+	cluster_cf_stats_set_join_readonly(false);
+	cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED); /* history not an obligation */
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(true, NULL), CLUSTER_NORMAL_STOP_READY);
+	IsUnderPostmaster = false;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(true, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	IsUnderPostmaster = true;
+	MyBackendType = B_BACKEND;
+	MyAuxProcType = NotAnAuxProcess;
+	UT_ASSERT_EQ(cluster_cf_normal_stop_shared_poll(true, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(4);
+	UT_PLAN(6);
 
 	UT_RUN(test_cf_counters_null_safe_before_init);
 	UT_RUN(test_cf_counters_inc_read_bounds);
 	UT_RUN(test_owner_eor_phase_exact_lifecycle);
 	UT_RUN(test_owner_eor_phase_attach_and_fresh_init);
+	UT_RUN(test_stop_cf_shared_original_eor_owner_must_finish);
+	UT_RUN(test_stop_cf_shared_join_hint_does_not_deadlock_first_normal_checkpoint);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

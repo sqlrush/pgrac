@@ -691,6 +691,96 @@ cluster_grd_entry_is_reclaimable(ClusterGrdEntry *entry)
 		   && (entry->state_flags & CLUSTER_GRD_ENTRY_FLAG_RECLAIMING) == 0;
 }
 
+ClusterNormalStopPollResult
+cluster_grd_normal_stop_poll(ClusterResId *resid_out, uint32 *shard_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	ClusterResId observed = { 0 };
+	uint32 observed_shard = PG_UINT32_MAX;
+	const char *reason = "NONE";
+
+	if (!IsUnderPostmaster || !cluster_enabled || cluster_grd_state == NULL
+		|| cluster_grd_entry_htab == NULL || cluster_grd_shard_locks == NULL) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "GRD_UNINITIALIZED";
+		goto done;
+	}
+	if (pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) != 1) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "GRD_MASTER_MAP_UNINITIALIZED";
+		goto done;
+	}
+	/* Called outside module work/locks. Do not nest a later-shard lock
+	 * underneath an earlier shard acquired by the census. */
+	for (uint32 shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++) {
+		if (LWLockHeldByMe(&cluster_grd_shard_locks[shard].lock)) {
+			result = CLUSTER_NORMAL_STOP_INVALID;
+			reason = "GRD_SHARD_LOCK_HELD";
+			observed_shard = shard;
+			goto done;
+		}
+	}
+	for (uint32 shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++) {
+		dlist_iter iter;
+		uint32 phase;
+
+		LWLockAcquire(&cluster_grd_shard_locks[shard].lock, LW_SHARED);
+		phase = pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard]);
+		if ((phase > GRD_SHARD_REBUILDING && result != CLUSTER_NORMAL_STOP_INVALID)
+			|| (phase != GRD_SHARD_NORMAL && result == CLUSTER_NORMAL_STOP_READY)) {
+			result = phase > GRD_SHARD_REBUILDING ? CLUSTER_NORMAL_STOP_INVALID
+												  : CLUSTER_NORMAL_STOP_PENDING;
+			reason
+				= phase > GRD_SHARD_REBUILDING ? "GRD_SHARD_PHASE_INVALID" : "GRD_SHARD_RECOVERY";
+			observed_shard = shard;
+			memset(&observed, 0, sizeof(observed));
+		}
+		/* Walk original membership, not a diagnostic count or lookup API:
+		 * lookup would add a pin, and its release could reclaim an entry.
+		 * Shard S stabilizes the list; each original spinlock protects its
+		 * counts. Mastership and empty cached entries need not disappear
+		 * when every instance is stopping together. */
+		dlist_foreach(iter, &cluster_grd_state->entry_shard_lists[shard])
+		{
+			ClusterGrdEntry *entry = dlist_container(ClusterGrdEntry, shard_link, iter.cur);
+			uint32 pins;
+			bool invalid;
+			bool pending;
+
+			SpinLockAcquire(&entry->lock);
+			pins = pg_atomic_read_u32(&entry->pin);
+			invalid = entry->ngranted < 0 || entry->ngranted > PGRAC_GRD_MAX_HOLDERS
+					  || entry->nwaiters < 0 || entry->nwaiters > PGRAC_GRD_MAX_WAITERS
+					  || entry->nconverts < 0 || entry->nconverts > PGRAC_GRD_MAX_CONVERTS
+					  || entry->nreservations < 0 || entry->nreservations > PGRAC_GRD_MAX_HOLDERS
+					  || (entry->state_flags & ~CLUSTER_GRD_ENTRY_FLAG_RECLAIMING) != 0
+					  || pins == PG_UINT32_MAX
+					  || cluster_grd_shard_for_resource(&entry->resid) != shard;
+			pending = entry->ngranted != 0 || entry->nwaiters != 0 || entry->nconverts != 0
+					  || entry->nreservations != 0 || pins != 0 || entry->state_flags != 0;
+			if ((invalid && result != CLUSTER_NORMAL_STOP_INVALID)
+				|| (pending && result == CLUSTER_NORMAL_STOP_READY)) {
+				result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+				reason = invalid	 ? "GRD_ENTRY_SHAPE_INVALID"
+						 : pins != 0 ? "GRD_PIN"
+									 : "GRD_ENTRY_OWNED";
+				observed = entry->resid;
+				observed_shard = shard;
+			}
+			SpinLockRelease(&entry->lock);
+		}
+		LWLockRelease(&cluster_grd_shard_locks[shard].lock);
+	}
+done:
+	if (resid_out != NULL)
+		*resid_out = observed;
+	if (shard_out != NULL)
+		*shard_out = observed_shard;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
+
 Size
 cluster_grd_shmem_size(void)
 {

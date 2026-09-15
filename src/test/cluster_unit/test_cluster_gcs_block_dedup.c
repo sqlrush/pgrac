@@ -56,9 +56,11 @@
 #include <stddef.h>
 
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_gcs_block_dedup.h"
 #include "cluster/cluster_lms_shard.h"
 #include "cluster/cluster_shmem.h"
+#include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/buf_internals.h"
 #include "storage/ipc.h"
@@ -81,6 +83,16 @@
 
 
 UT_DEFINE_GLOBALS();
+
+static uint32 stop_seal;
+static int stop_gate_calls;
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	stop_gate_calls++;
+	return stop_seal == 0 || (stop_seal == 1 && !modifies_data);
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -105,6 +117,16 @@ int cluster_gcs_block_retransmit_max_retries = 4;
 int cluster_gcs_reply_timeout_ms = 5000;
 int MyBackendId = 1;
 bool IsUnderPostmaster = true;
+BackendType MyBackendType = B_LMON;
+static int stop_lock_depth;
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	static LWLock fixture_lock;
+	if (stop_lock_depth != 0)
+		callback(&fixture_lock, LW_EXCLUSIVE, context);
+}
 
 
 /* ============================================================
@@ -140,6 +162,8 @@ static int fake_before_shmem_exit_registered;
 static void
 reset_fake_dedup(int n_workers, int max_entries)
 {
+	stop_seal = 0;
+	stop_gate_calls = 0;
 	memset(fake_htab, 0, sizeof(fake_htab));
 	fake_htab_init_seq = 0;
 	fake_keysize = 0;
@@ -272,12 +296,17 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 bool
 LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
+	UT_ASSERT_EQ(stop_lock_depth, 0);
+	stop_lock_depth++;
 	return true;
 }
 
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+{
+	UT_ASSERT_EQ(stop_lock_depth, 1);
+	stop_lock_depth--;
+}
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -1128,10 +1157,150 @@ UT_TEST(u34_pending_x_new_reader_exact_deny_precedes_cached_shortcut)
 /* A contended tag A may remain at the commit-only boundary, but its exact
  * retry must not prevent the same DATA worker from advancing independent tag
  * B.  This exercises the production HTAB scan/cursor, not a scheduler model. */
+UT_TEST(stop_seal_rejects_new_modifier_then_new_read)
+{
+	GcsBlockDedupKey key = make_key(0, 1, 42, 7);
+	BufferTag tag = make_tag(10);
+	GcsBlockDedupEntry cached;
+	FakeDedupShardHtab before;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	memcpy(&before, &fake_htab[0], sizeof(before));
+	stop_seal = 1;
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_X, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_FULL);
+	UT_ASSERT_EQ(stop_gate_calls, 1);
+	UT_ASSERT_EQ(memcmp(&before, &fake_htab[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 0);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_S, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	stop_seal = 2;
+	key.request_id++;
+	memcpy(&before, &fake_htab[0], sizeof(before));
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_S, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_FULL);
+	UT_ASSERT_EQ(stop_gate_calls, 3);
+	UT_ASSERT_EQ(memcmp(&before, &fake_htab[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 1);
+}
+
+UT_TEST(stop_seal_preserves_exact_duplicates_and_original_completion)
+{
+	GcsBlockDedupKey key = make_key(0, 1, 42, 7);
+	BufferTag tag = make_tag(10);
+	GcsBlockDedupEntry cached;
+	FakeDedupShardHtab before;
+
+	reset_fake_dedup(2, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_X, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	stop_seal = 2;
+	stop_gate_calls = 0;
+	memcpy(&before, &fake_htab[0], sizeof(before));
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_X, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE);
+	UT_ASSERT_EQ(memcmp(&before, &fake_htab[0], sizeof(before)), 0);
+	install_granted(0, &key);
+	memcpy(&before, &fake_htab[0], sizeof(before));
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_X, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_CACHED_REPLY);
+	UT_ASSERT_EQ(memcmp(&before, &fake_htab[0], sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_S, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_VALIDATION_FAIL);
+	UT_ASSERT_EQ(stop_gate_calls, 0);
+}
+
+UT_TEST(stop_poll_original_tables_not_cached_counts)
+{
+	const char *domain, *reason;
+	uint64 key;
+	GcsBlockDedupKey keys[8];
+	BufferTag tag = make_tag(10);
+	GcsBlockDedupEntry cached;
+	static FakeDedupShardHtab before[8];
+
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID); /* Runs before original shmem initialization. */
+	reset_fake_dedup(8, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	for (int shard = 0; shard < 8; shard++) {
+		keys[shard] = make_key(0, shard + 1, 100 + shard, 7);
+		UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(
+						 shard, &keys[shard], tag, PCM_TRANS_N_TO_S, 1000, true, &cached),
+					 GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	}
+	memcpy(before, fake_htab, sizeof(before));
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_STR_EQ(reason, "GCS_DEDUP_IN_FLIGHT");
+	UT_ASSERT_EQ(key, 100);
+	UT_ASSERT_EQ(memcmp(before, fake_htab, sizeof(before)), 0);
+	for (int shard = 0; shard < 7; shard++)
+		install_granted(shard, &keys[shard]);
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(key, 107);
+	install_granted(7, &keys[7]);
+	memcpy(before, fake_htab, sizeof(before));
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_get_in_flight_count(), 8); /* includes caches */
+	UT_ASSERT_EQ(memcmp(before, fake_htab, sizeof(before)), 0);
+	UT_ASSERT_EQ(stop_lock_depth, 0);
+	UT_ASSERT_EQ(fake_hash_seq_init_count, fake_hash_seq_term_count);
+}
+
+UT_TEST(stop_poll_invalid_last_shard_and_observer_preconditions)
+{
+	GcsBlockDedupKey key = make_key(0, 1, 42, 7);
+	BufferTag tag = make_tag(10);
+	GcsBlockDedupEntry cached;
+	const char *domain, *reason;
+	uint64 request;
+
+	reset_fake_dedup(8, FAKE_DEDUP_CAP);
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(0, &key, tag, PCM_TRANS_N_TO_S, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	key.request_id++;
+	UT_ASSERT_EQ(cluster_gcs_block_dedup_lookup_or_register(7, &key, tag, PCM_TRANS_N_TO_S, 1000,
+															true, &cached),
+				 GCS_BLOCK_DEDUP_MISS_REGISTERED);
+	((GcsBlockDedupEntry *)fake_htab[7].entries[0])->entry_kind = 99;
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(&domain, &request, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(request, key.request_id);
+	UT_ASSERT_STR_EQ(reason, "GCS_DEDUP_ENTRY_SHAPE");
+	UT_ASSERT_EQ(((GcsBlockDedupEntry *)fake_htab[7].entries[0])->entry_kind, 99);
+	reset_fake_dedup(1, FAKE_DEDUP_CAP);
+	stop_lock_depth = 1;
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GCS_DEDUP_CALLER_LOCK");
+	stop_lock_depth = 0;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT_EQ(cluster_gcs_dedup_normal_stop_poll(NULL, NULL, &reason),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_STR_EQ(reason, "GCS_DEDUP_OBSERVER_ROLE");
+	MyBackendType = B_LMON;
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(22);
+	UT_RUN(stop_poll_original_tables_not_cached_counts);
+	UT_RUN(stop_poll_invalid_last_shard_and_observer_preconditions);
+	UT_RUN(stop_seal_rejects_new_modifier_then_new_read);
+	UT_RUN(stop_seal_preserves_exact_duplicates_and_original_completion);
 	UT_RUN(u1_per_worker_isolation);
 	UT_RUN(u2_dedup_lifecycle_per_shard);
 	UT_RUN(u3_counters_sum_across_shards);

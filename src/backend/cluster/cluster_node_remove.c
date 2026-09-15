@@ -50,6 +50,7 @@
 #include "utils/timestamp.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_grd.h"
@@ -172,6 +173,110 @@ static uint64 nr_marker_epoch = 0;
 static uint64 nr_marker_removed_incarnation = 0;
 static uint64 nr_marker_removal_event_id = 0;
 static bool nr_marker_submitted = false;
+
+typedef struct NodeRemoveStopObservation {
+	ClusterNormalStopPollResult result;
+	const char *reason;
+	uint64 key;
+} NodeRemoveStopObservation;
+
+static void
+nr_stop_note(NodeRemoveStopObservation *out, bool pending, bool invalid, const char *reason,
+			 uint64 key)
+{
+	if ((invalid && out->result != CLUSTER_NORMAL_STOP_INVALID)
+		|| (pending && out->result == CLUSTER_NORMAL_STOP_READY)) {
+		out->result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+		out->reason = reason;
+		out->key = key;
+	}
+}
+
+static void
+nr_stop_held_lock(LWLock *lock, LWLockMode mode, void *context)
+{
+	(void)lock;
+	(void)mode;
+	*(bool *)context = true;
+}
+
+/* Only the original LMON owner can inspect its private marker stage. This
+ * observation never advances removal, consumes its reply or validates a
+ * durable marker for startup. Stable four-member identity is checked by the
+ * enclosing normal-stop controller, not inferred from this module's IDLE. */
+ClusterNormalStopPollResult
+cluster_node_remove_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	NodeRemoveStopObservation out = { CLUSTER_NORMAL_STOP_READY, "NONE", 0 };
+	bool held = false;
+	bool private_owned;
+	ClusterRemovalMarker empty_marker = { 0 };
+
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || nr_state == NULL) {
+		nr_stop_note(&out, false, true, "NODE_REMOVE_OWNER_OR_SHMEM", 0);
+		goto done;
+	}
+	ForEachLWLockHeldByMe(nr_stop_held_lock, &held);
+	if (held) {
+		nr_stop_note(&out, false, true, "NODE_REMOVE_CALLER_LOCK", 0);
+		goto done;
+	}
+	LWLockAcquire(&nr_state->lock, LW_SHARED);
+	{
+		uint32 phase = pg_atomic_read_u32(&nr_state->phase);
+		bool resting = phase == CLUSTER_REMOVE_IDLE || phase == CLUSTER_REMOVE_ABORTED;
+		uint64 request = pg_atomic_read_u64(&nr_state->marker_request_seq);
+		uint64 completion = pg_atomic_read_u64(&nr_state->marker_completion_seq);
+		uint64 request_after = pg_atomic_read_u64(&nr_state->marker_request_seq);
+		uint32 acked = pg_atomic_read_u32(&nr_state->survivor_acked);
+		uint32 announced = pg_atomic_read_u32(&nr_state->announce_sent);
+		uint8 ack_bits = 0;
+
+		for (unsigned i = 0; i < sizeof(nr_state->ack_bitmap); i++)
+			ack_bits |= nr_state->ack_bitmap[i];
+		nr_stop_note(
+			&out, !resting,
+			phase > CLUSTER_REMOVE_ABORTED_ESCALATE || phase == CLUSTER_REMOVE_CLEANUP_BLOCKED
+				|| phase == CLUSTER_REMOVE_COMMITTED || phase == CLUSTER_REMOVE_ABORTED_ESCALATE,
+			"NODE_REMOVE_PHASE", phase);
+		/* A clean pre-fence abort may retain counters and attempt identity,
+		 * never a shrink/fence/cleanup responsibility. Completed shrink or
+		 * fail-stop is outside this stable-four normal-stop positive path. */
+		nr_stop_note(
+			&out, false,
+			acked > 1 || announced > 1
+				|| (resting
+					&& (nr_state->target_node_id != -1 || nr_state->fence_armed
+						|| nr_state->membership_shrunk || nr_state->grd_cleaned
+						|| nr_state->pcm_cleaned || acked != 0 || announced != 0 || ack_bits != 0)),
+			"NODE_REMOVE_TERMINAL_CONTRADICTION", nr_state->removal_event_id);
+		nr_stop_note(&out, request != completion || request != request_after,
+					 request == request_after && completion > request, "NODE_REMOVE_MARKER_MAILBOX",
+					 request);
+	}
+	LWLockRelease(&nr_state->lock);
+
+	private_owned = nr_marker_submitted || nr_marker_async.has_staged_event
+					|| nr_marker_async.state == CLUSTER_MARKER_ASYNC_SUBMITTED;
+	nr_stop_note(&out, private_owned,
+				 nr_marker_async.state != CLUSTER_MARKER_ASYNC_IDLE
+					 && nr_marker_async.state != CLUSTER_MARKER_ASYNC_SUBMITTED,
+				 "NODE_REMOVE_MARKER_OWNER", nr_marker_async.inflight_seq);
+	nr_stop_note(&out, false,
+				 !private_owned
+					 && (nr_marker_phase != 0 || nr_marker_node_id != -1 || nr_marker_epoch != 0
+						 || nr_marker_removed_incarnation != 0 || nr_marker_removal_event_id != 0
+						 || memcmp(&nr_marker_stage, &empty_marker, sizeof(empty_marker)) != 0),
+				 "NODE_REMOVE_ORPHAN_STAGE", nr_marker_removal_event_id);
+done:
+	if (domain != NULL)
+		*domain = "NODE_REMOVE";
+	if (key != NULL)
+		*key = out.key;
+	if (reason != NULL)
+		*reason = out.reason;
+	return out.result;
+}
 
 ClusterRemovalMarkerSubmitResult
 cluster_node_remove_submit_marker(const ClusterRemovalMarker *m)

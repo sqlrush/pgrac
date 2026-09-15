@@ -7032,6 +7032,10 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 	}
 	if (free_context == NULL)
 		return true;
+	/* Exact context replay above is existing work. A fresh read context
+	 * cannot cross the final service seal, including terminal-census mode. */
+	if (!cluster_normal_stop_service_new_work(false))
+		return true;
 	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
 	logical.segment_id = segment_id;
 	admission_result = cluster_semantic_activation_enter(
@@ -7334,6 +7338,10 @@ gcs_block_current_mx_origin_try_accept(
 		}
 		return true;
 	}
+	/* Consume the sealed new request; do not fall through to inline proof
+	 * fallback and allocate another context after the original refusal. */
+	if (!cluster_normal_stop_service_new_work(false))
+		return true;
 	admission_result = cluster_semantic_activation_enter(
 		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
@@ -22339,6 +22347,156 @@ typedef struct GcsBlockParkedInvalidate {
 
 static GcsBlockParkedInvalidate gcs_block_invalidate_park[GCS_BLOCK_INVALIDATE_PARK_MAX];
 
+ClusterNormalStopPollResult
+cluster_gcs_block_normal_stop_poll(bool post_checkpoint, int *backend_out, int *slot_out,
+								   const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	uint64 request_id, append, confirmed, drained;
+	uint32 expected, acked, busy;
+	bool invalid;
+	BufferTag zero_tag = { 0 };
+	int backend;
+
+	if (backend_out == NULL || slot_out == NULL || reason_out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*backend_out = *slot_out = -1;
+	*reason_out = "GCS_UNINITIALIZED";
+	if (ClusterGcsBlock == NULL || gcs_block_backend_blocks == NULL || MaxBackends <= 0)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*reason_out = "GCS_POLL_LOCK_HELD";
+	if (LWLockHeldByMe(&ClusterGcsBlock->invalidate_broadcast_lock.lock))
+		return CLUSTER_NORMAL_STOP_INVALID;
+	for (backend = 0; backend < MaxBackends; backend++)
+		if (LWLockHeldByMe(&gcs_block_backend_blocks[backend].lock.lock))
+			return CLUSTER_NORMAL_STOP_INVALID;
+	*reason_out = "NONE";
+	for (backend = 0; backend < MaxBackends; backend++) {
+		ClusterGcsBlockBackendBlock *blk = &gcs_block_backend_blocks[backend];
+		LWLockAcquire(&blk->lock.lock, LW_SHARED);
+		for (int index = 0; index < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; index++) {
+			const ClusterGcsBlockOutstandingSlot *slot = &blk->slots[index];
+			invalid = slot->reply_domain > CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX
+					  || slot->direct_state < GCS_BLOCK_DIRECT_UNARMED
+					  || slot->direct_state > GCS_BLOCK_DIRECT_ABORTED;
+			if (slot->in_use)
+				invalid |= slot->request_id == 0;
+			else
+				invalid |= slot->request_id != 0 || slot->reply_received
+						   || slot->reply_domain != CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE
+						   || slot->direct_state != GCS_BLOCK_DIRECT_UNARMED
+						   || slot->direct_arm_id != 0 || slot->direct_target_prepared
+						   || slot->direct_target_kind != GCS_BLOCK_DIRECT_TARGET_NONE
+						   || slot->direct_target_buf != NULL || slot->direct_target_addr != NULL
+						   || slot->direct_target_lkey != 0
+						   || slot->direct_abort_reason != GCS_BLOCK_DIRECT_ABORT_NONE
+						   || slot->expected_current_mx_key_valid
+						   || slot->expected_current_mx_proof_valid;
+			if (invalid || (slot->in_use && result == CLUSTER_NORMAL_STOP_READY)) {
+				result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+				*backend_out = backend;
+				*slot_out = index;
+				*reason_out = invalid ? "GCS_REQUESTER_STATE_INVALID" : "GCS_REQUESTER_SLOT";
+			}
+			if (invalid)
+				break;
+		}
+		LWLockRelease(&blk->lock.lock);
+		if (result == CLUSTER_NORMAL_STOP_INVALID)
+			return result;
+	}
+
+	/* One existing broadcast identity, not merely acked == expected. The
+	 * release clears all fields while holding this same original lock. */
+	LWLockAcquire(&ClusterGcsBlock->invalidate_broadcast_lock.lock, LW_SHARED);
+	request_id = pg_atomic_read_u64(&ClusterGcsBlock->invalidate_broadcast_request_id);
+	expected = pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_expected_bm);
+	acked = pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_acked_bm);
+	busy = pg_atomic_read_u32(&ClusterGcsBlock->invalidate_broadcast_busy);
+	invalid = (acked & ~expected) != 0 || busy > 1
+			  || (request_id == 0
+				  && (expected != 0 || acked != 0 || busy != 0
+					  || ClusterGcsBlock->invalidate_broadcast_epoch != 0
+					  || !BufferTagsEqual(&ClusterGcsBlock->invalidate_broadcast_tag, &zero_tag)));
+	LWLockRelease(&ClusterGcsBlock->invalidate_broadcast_lock.lock);
+	if (invalid || (request_id != 0 && result == CLUSTER_NORMAL_STOP_READY)) {
+		result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+		*backend_out = *slot_out = -1;
+		*reason_out = invalid ? "GCS_BROADCAST_STATE_INVALID" : "GCS_BROADCAST_UNRELEASED";
+	}
+	if (invalid)
+		return result;
+
+	/* Pre-checkpoint notes may still need its real sync; post-checkpoint
+	 * requires both durable confirmation and the original owner's drain.
+	 * This does not substitute for bufmgr PI/SF dependency retirement. */
+	SpinLockAcquire(&ClusterGcsBlock->pi_note_lock);
+	append = ClusterGcsBlock->pi_note_append_seq;
+	confirmed = ClusterGcsBlock->pi_note_confirmed_seq;
+	drained = ClusterGcsBlock->pi_note_drain_seq;
+	SpinLockRelease(&ClusterGcsBlock->pi_note_lock);
+	invalid = drained > confirmed || confirmed > append
+			  || append - drained > CLUSTER_GCS_PI_NOTE_RING_SIZE;
+	if (invalid || (post_checkpoint && drained != append && result == CLUSTER_NORMAL_STOP_READY)) {
+		result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+		*backend_out = *slot_out = -1;
+		*reason_out
+			= invalid ? "GCS_PI_NOTE_SEQUENCE_INVALID" : "GCS_PI_NOTE_UNCONFIRMED_OR_UNDRAINED";
+	}
+	return result;
+}
+
+ClusterNormalStopPollResult
+cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	int index;
+
+	if (slot_out == NULL || reason_out == NULL)
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*slot_out = -1;
+	*reason_out = "GCS_LOCAL_OWNER_UNINITIALIZED";
+	if (ClusterGcsBlock == NULL || !IsUnderPostmaster
+		|| !(AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess()))
+		return CLUSTER_NORMAL_STOP_INVALID;
+	*reason_out = "NONE";
+	for (index = 0; index < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; index++) {
+		const GcsBlockR4TxOriginContext *context = &gcs_block_r4_tx_origin_contexts[index];
+		bool invalid = context->in_use
+						   ? (context->domain < GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE
+							  || context->domain > GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+							  || context->phase < GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN
+							  || context->phase > GCS_BLOCK_R4_TX_ORIGIN_SEND)
+						   : (context->guard_active || context->admission.entered
+							  || context->domain != 0 || context->phase != 0);
+		if (invalid || (context->in_use && result == CLUSTER_NORMAL_STOP_READY)) {
+			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+			*slot_out = index;
+			*reason_out = invalid ? "GCS_ORIGIN_CONTEXT_INVALID" : "GCS_ORIGIN_CONTEXT";
+		}
+		if (invalid)
+			return result;
+	}
+	for (index = 0; index < GCS_BLOCK_INVALIDATE_PARK_MAX; index++) {
+		const GcsBlockParkedInvalidate *park = &gcs_block_invalidate_park[index];
+		bool invalid;
+		/* The original tick clears only in_use. Retained bytes are not a
+		 * live request; do not require its reusable slot to be all zero. */
+		if (!park->in_use)
+			continue;
+		invalid = park->deadline <= 0 || park->inv.request_id == 0 || park->inv.master_node < 0
+				  || park->inv.master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT;
+		if (invalid || result == CLUSTER_NORMAL_STOP_READY) {
+			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+			*slot_out = index;
+			*reason_out = invalid ? "GCS_INVALIDATE_PARK_INVALID" : "GCS_INVALIDATE_PARK";
+		}
+		if (invalid)
+			return result;
+	}
+	return result;
+}
+
 static void
 gcs_block_invalidate_park_add(const GcsBlockInvalidatePayload *inv)
 {
@@ -22532,6 +22690,23 @@ cluster_gcs_handle_block_invalidate_envelope(const ClusterICEnvelope *env, const
 		if (inv->epoch == cluster_epoch_get_current())
 			cluster_lever_h_note_discard_result(cluster_bufmgr_discard_pi_block(inv->tag));
 		return;
+	}
+
+	/* Keep the existing revoke/durability suffix at the pre-checkpoint
+	 * cut, but do not start another directive after the final input seal.
+	 * Only the exact retained directive is already owned; sharing its tag
+	 * cannot authorize replacement by a newer request after sealing. */
+	{
+		bool retained = false;
+
+		for (int i = 0; i < GCS_BLOCK_INVALIDATE_PARK_MAX; i++)
+			if (gcs_block_invalidate_park[i].in_use
+				&& memcmp(&gcs_block_invalidate_park[i].inv, inv, sizeof(*inv)) == 0) {
+				retained = true;
+				break;
+			}
+		if (!retained && !cluster_normal_stop_service_new_work(false))
+			return;
 	}
 
 	/* GCS serve-stall round-5 (A2): a PINNED local copy parks the

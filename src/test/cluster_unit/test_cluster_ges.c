@@ -97,6 +97,18 @@
  * ============================================================ */
 
 bool IsUnderPostmaster = false;
+static bool stub_lmd_ready;
+static bool stub_stop_read_allowed = true;
+static int stub_stop_read_calls, stub_report_sends;
+bool cluster_normal_stop_service_new_work(bool modifies_data);
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	if (modifies_data)
+		abort();
+	stub_stop_read_calls++;
+	return stub_stop_read_allowed;
+}
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 /* S3 forensics step 1a stubs — cluster_ges.c now carries the
@@ -546,8 +558,7 @@ bool cluster_lmd_is_ready(void);
 bool
 cluster_lmd_is_ready(void)
 {
-	/* Standalone unit test:LMD shmem not attached, predicate false. */
-	return false;
+	return stub_lmd_ready;
 }
 void cluster_lmd_submit_wait_edge(void);
 void
@@ -658,6 +669,7 @@ ClusterICSendResult
 cluster_ic_send_envelope(uint8 mt pg_attribute_unused(), int32 dest pg_attribute_unused(),
 						 const void *p pg_attribute_unused(), uint32 len pg_attribute_unused())
 {
+	stub_report_sends++;
 	return CLUSTER_IC_SEND_DONE;
 }
 
@@ -1993,10 +2005,41 @@ UT_TEST(test_block0_protected_failure_detail_is_not_elapsed_timeout)
 	UT_ASSERT_EQ(cluster_ges_timeout_detail_get()->source, CLUSTER_GES_TSRC_NONE);
 }
 
+UT_TEST(test_ges_probe_validates_identity_then_obeys_final_stop_seal)
+{
+	ClusterICEnvelope env = { 0 };
+	GesDeadlockProbePayload probe = { 0 };
+	cluster_ges_shmem_init();
+	cluster_node_id = 0;
+	env.source_node_id = 1;
+	env.epoch = stub_current_epoch;
+	env.payload_length = sizeof(probe);
+	probe.opcode = GES_REQ_OPCODE_DEADLOCK_PROBE;
+	probe.coordinator_node_id = 1;
+	probe.probe_id = 17;
+	stub_lmd_ready = true;
+	stub_authority_managed = false;
+	stub_stop_read_allowed = true;
+	stub_stop_read_calls = stub_report_sends = 0;
+	cluster_ges_request_handler(&env, &probe);
+	UT_ASSERT_EQ(stub_report_sends, 1);
+	UT_ASSERT_EQ(stub_stop_read_calls, 1);
+	stub_stop_read_allowed = false;
+	cluster_ges_request_handler(&env, &probe);
+	UT_ASSERT_EQ(stub_report_sends, 1);
+	UT_ASSERT_EQ(stub_stop_read_calls, 2);
+	probe.coordinator_node_id = 2;
+	cluster_ges_request_handler(&env, &probe);
+	UT_ASSERT_EQ(stub_report_sends, 1);
+	UT_ASSERT_EQ(stub_stop_read_calls, 2);
+	stub_lmd_ready = false;
+	stub_stop_read_allowed = true;
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(27);
+	UT_PLAN(28);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -2025,6 +2068,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_request_cv_timeout_retransmits);
 	UT_RUN(test_ges_release_cv_timeout_retransmits);
 	UT_RUN(test_ges_local_release_requires_exact_holder_and_stable_master);
+	UT_RUN(test_ges_probe_validates_identity_then_obeys_final_stop_seal);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -28,6 +28,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_cf_stats.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -50,6 +51,37 @@ typedef struct ClusterCfStatsSharedState {
 } ClusterCfStatsSharedState;
 
 static ClusterCfStatsSharedState *cluster_cf_stats_state = NULL;
+
+ClusterNormalStopPollResult
+cluster_cf_normal_stop_shared_poll(bool post_checkpoint, const char **reason)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *why = "CF_SHARED_OWNER_OR_SHMEM";
+	uint32 phase, join;
+	if (!IsUnderPostmaster || (!AmCheckpointerProcess() && MyBackendType != B_LMON)
+		|| cluster_cf_stats_state == NULL)
+		goto done;
+	phase = pg_atomic_read_u32(&cluster_cf_stats_state->owner_eor_phase);
+	join = pg_atomic_read_u32(&cluster_cf_stats_state->join_readonly);
+	/* Counters are history, not responsibilities. The ordinary non-EOR
+	 * checkpoint clears JOIN_READONLY only after GES is available; do not
+	 * pre-empt that producer or block the very checkpoint that clears it. */
+	if (phase > CLUSTER_CF_OWNER_EOR_DONE || join > 1)
+		why = "CF_SHARED_STATE_INVALID";
+	else if (post_checkpoint && join != 0)
+		why = "CF_POST_CHECKPOINT_JOIN_READONLY";
+	else if (phase != CLUSTER_CF_OWNER_EOR_EMPTY) {
+		why = "CF_OWNER_EOR_PENDING";
+		result = CLUSTER_NORMAL_STOP_PENDING;
+	} else {
+		why = "NONE";
+		result = CLUSTER_NORMAL_STOP_READY;
+	}
+done:
+	if (reason)
+		*reason = why;
+	return result;
+}
 
 
 /* ============================================================
