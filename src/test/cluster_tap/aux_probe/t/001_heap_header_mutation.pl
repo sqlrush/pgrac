@@ -1,3 +1,4 @@
+# Author: SqlRush <sqlrush@gmail.com>
 # Copyright (c) 2026, pgrac contributors
 # Native, single-worker functional proof. Not a cluster throughput test.
 use strict;

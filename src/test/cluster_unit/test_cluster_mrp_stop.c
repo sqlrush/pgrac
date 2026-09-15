@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* A148 stable-primary eligibility, not ADG recovery/lease certification. */
 #include "postgres.h"
 #include "miscadmin.h"

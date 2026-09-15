@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual VM/FSM mutation bodies, heap requalification and SQL consumer glue.
  * Transport, physical lookup and WAL sinks are controlled edges. This does
  * not claim to replay the distributed micro or replace its six live phases. */

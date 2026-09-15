@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PGRAC: cluster-specific implementation and build integration.
 """Verify the exact R11 writer/wire/worker source-removal census."""
 
 from __future__ import annotations

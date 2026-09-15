@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Original node-removal owner; native disk completion is explicitly supplied
  * at the original QVOTEC completion edge. No live cluster or marker I/O. */
 #include "postgres.h"

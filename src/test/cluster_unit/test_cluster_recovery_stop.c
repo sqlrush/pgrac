@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* A148: original recovery region and replay publication/retirement.
  * Native worker scheduling is a fixture; no live recovery or I/O. */
 #include "postgres.h"

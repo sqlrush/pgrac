@@ -1,3 +1,4 @@
+# Author: SqlRush <sqlrush@gmail.com>
 # Qualify the actual background scheduling seam before any charged soak.
 use strict;
 use warnings FATAL => 'all';

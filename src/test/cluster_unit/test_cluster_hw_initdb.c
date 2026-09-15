@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual producer/main sync tail, syscall-only faults and real files.
  * Control bytes model finished bootstrap, not proof of new creation; native
  * initdb TAP separately proves the real bootstrap/control boundary. */

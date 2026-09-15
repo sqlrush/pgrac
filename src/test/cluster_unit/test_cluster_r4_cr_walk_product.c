@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /*-------------------------------------------------------------------------
  * Real CR translation unit plus a test-only entry for the synchronous
  * retained-history adapter. No product branch or predicate is replaced.

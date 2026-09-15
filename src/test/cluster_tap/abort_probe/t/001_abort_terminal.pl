@@ -1,3 +1,4 @@
+# Author: SqlRush <sqlrush@gmail.com>
 # Native ERROR/FATAL/LIFO regression, independent of micro/soak/PRE budgets.
 # Every negative has a fresh disposable instance.  No recovery claim is made.
 use strict;

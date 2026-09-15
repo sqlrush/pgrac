@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual SI producer/consumer and ACK lifecycle. PG shmem, hash storage,
  * locks, wakeups and transport are fixtures, not remote completion proof. */
 #include "postgres.h"

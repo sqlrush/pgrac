@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Standalone PG/I/O boundary for the real activation + resident objects.
  * Directory enumeration and header bytes use private real sparse files. The
  * smgr probe's typed result is a fixture boundary; its own file validation has

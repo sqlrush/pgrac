@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Real, extracted heapam_tuple_lock consumer; only external boundaries are stubs. */
 #include "postgres.h"
 #include "access/heapam.h"

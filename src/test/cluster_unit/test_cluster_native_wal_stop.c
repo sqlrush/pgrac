@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Real xlog observer. Own control memory, process role and native locks are
  * boundary fixtures; this does not claim a disk checkpoint or native restart. */
 #include "postgres.h"

@@ -1,3 +1,4 @@
+# Author: SqlRush <sqlrush@gmail.com>
 # Positive/native mode boundary checks.  No injected authority or return code.
 use strict;
 use warnings FATAL => 'all';

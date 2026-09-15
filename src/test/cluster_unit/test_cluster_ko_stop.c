@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual KO SPSC admission/drain, with explicit storage and ACK-queue boundary
  * fixtures. A queue-empty observation alone does not certify flush completion. */
 #include "postgres.h"

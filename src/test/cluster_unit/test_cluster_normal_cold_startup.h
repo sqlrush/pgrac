@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual Startup call-site slices, linked to the real normal-start producer.
  * WAL decoding/PG lifecycle, prepared scan and unrelated recovery/HW jobs are
  * explicit boundary fixtures. No copied normal-start decision or loader. */

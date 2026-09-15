@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Services outside the real OPEN -> master route boundary.  No semantic
  * admission, token recheck or peer OPEN matcher is replaced in this test. */
 #include "cluster/cluster_cssd.h"

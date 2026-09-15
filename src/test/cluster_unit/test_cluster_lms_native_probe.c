@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Execute the production collector; only process, native-lock and wire edges
  * are controlled. Deferred wire replies keep exactly eight real probes live. */
 #include "postgres.h"

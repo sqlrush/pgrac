@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Real allocator + backend-local ACTIVE consumer + linked durable producer.
  * Only admission, locks, retention and physical IO/WAL dependencies are doubles.
  * Hooks choose exact interleavings; this is not a live scheduling replay.

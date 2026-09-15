@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /*-------------------------------------------------------------------------
  * test_cluster_cr_native_origin.c
  *

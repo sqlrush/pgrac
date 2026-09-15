@@ -1,3 +1,4 @@
+# PGRAC: cluster-specific implementation and build integration.
 #-------------------------------------------------------------------------
 #
 # Makefile

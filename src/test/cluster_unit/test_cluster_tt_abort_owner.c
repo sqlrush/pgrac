@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /*
  * Real local abort consumer plus the existing durable-TT fixture.  Only the
  * external admission, storage and status/hint sinks are doubles.  Including

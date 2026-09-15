@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual genam inplace consumers and heap lock/rebind/unlock bodies.
  * Scan production, visibility/MultiXact decisions and WAL are external seams.
  * This suite proves the selected-row/current-buffer ownership boundary, not

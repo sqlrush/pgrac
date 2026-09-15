@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Verbatim production private types, queue/release bodies and stop observer.
  * No verbs/CM implementation, hardware, CQ completion, or real pin is faked as
  * proven: callback release invocation and device readiness are boundaries. */

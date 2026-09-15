@@ -1,4 +1,5 @@
 #!/usr/bin/env perl
+# Author: SqlRush <sqlrush@gmail.com>
 # Four real requester nodes exercise the existing HW-X S1-S7 path. No relation
 # extension, new wire message, synthetic grant or timeout override is used.
 use strict;

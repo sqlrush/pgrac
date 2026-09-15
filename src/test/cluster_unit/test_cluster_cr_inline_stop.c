@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual inline serve entry; constructor/transport, service-seal state and
  * scratch allocation are boundaries. This proves admission precedes every
  * inline read context, not remote CR correctness or native shutdown. */

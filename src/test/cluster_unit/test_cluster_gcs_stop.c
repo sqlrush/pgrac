@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Normal-stop GCS observations execute the production module, its real slot
  * reserve/release and init. Runtime locks, guard cancellation and admission
  * leave are boundary fixtures; no remote producer or disk sync is claimed. */

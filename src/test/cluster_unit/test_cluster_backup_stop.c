@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* A148: original backup state/producers. No live backup, disk or socket I/O. */
 #include "postgres.h"
 #include "miscadmin.h"

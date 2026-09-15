@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual transport-composition body. The independently tested Tier1/chunk/RDMA
  * owner observations are boundary inputs here, not new transport proof. */
 #include "postgres.h"

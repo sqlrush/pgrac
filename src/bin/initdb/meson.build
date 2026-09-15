@@ -1,3 +1,4 @@
+# PGRAC: cluster-specific implementation and build integration.
 # Copyright (c) 2022-2023, PostgreSQL Global Development Group
 
 initdb_sources = files(
