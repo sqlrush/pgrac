@@ -345,6 +345,7 @@ cluster_hw_try_advance(const ClusterResId *resid, uint32 want, BlockNumber seed_
 	bool created = false;
 	uint32 shard;
 	ClusterHwColdBootMode boot_mode;
+	bool has_root = cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0';
 
 	Assert(resid != NULL && first != NULL && granted != NULL && new_hwm != NULL);
 	Assert(want > 0);
@@ -352,10 +353,15 @@ cluster_hw_try_advance(const ClusterResId *resid, uint32 want, BlockNumber seed_
 	if (hw_htab == NULL)
 		return CLUSTER_HW_FULL; /* shmem absent: caller fails closed */
 	boot_mode = cluster_hw_cold_boot_mode();
-	if (!cluster_hw_authority_active()
-		|| (boot_mode != CLUSTER_HW_BOOT_EXISTING_RECOVERY
-			&& (boot_mode != CLUSTER_HW_BOOT_NORMAL_SELF
-				|| cluster_hw_cold_boot_state() != CLUSTER_HW_READY))) {
+	/* Root-backed cold metadata is not the enable switch for rootless
+	 * block-device allocation. Startup must still classify that mode, and
+	 * the original steady-shard/rebuilt-generation gate below still applies. */
+	if ((has_root
+		 && (!cluster_hw_authority_active()
+			 || (boot_mode != CLUSTER_HW_BOOT_EXISTING_RECOVERY
+				 && (boot_mode != CLUSTER_HW_BOOT_NORMAL_SELF
+					 || cluster_hw_cold_boot_state() != CLUSTER_HW_READY))))
+		|| (!has_root && boot_mode != CLUSTER_HW_BOOT_DISABLED)) {
 		cluster_hw_bump_not_ready();
 		return CLUSTER_HW_NOT_READY;
 	}

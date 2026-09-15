@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual HW shmem/read/apply/allocation/checkpoint with real temporary files.
  * Hash/lock and own-WAL inputs are fixtures, not native Startup qualification. */
 int allocation_stop_fixture_main(void);
@@ -410,12 +411,34 @@ UT_TEST(actual_checkpoint_call_maintains_native_seed_metadata)
 	UT_ASSERT_EQ(cluster_hw_snapshot_normal_read(7, GetSystemIdentifier(), 8192, &hdr, NULL, 0),
 				 CLUSTER_HW_NORMAL_READ_VALID);
 }
+UT_TEST(rootless_storage_keeps_existing_hw_serve_gate)
+{
+	const char *reason = NULL;
+	BlockNumber first = 999;
+	cold_setup();
+	cluster_shared_data_dir = NULL;
+	UT_ASSERT_EQ(cold_advance(22000, 90, &first), CLUSTER_HW_NOT_READY);
+	UT_ASSERT_EQ(first, 999);
+	UT_ASSERT(cluster_hw_startup_prepare(false, true, 4096, &reason));
+	UT_ASSERT(cluster_hw_startup_complete(&reason));
+	UT_ASSERT_EQ(cluster_hw_cold_boot_mode(), CLUSTER_HW_BOOT_DISABLED);
+	UT_ASSERT_EQ(cold_advance(22000, 90, &first), CLUSTER_HW_OK);
+	UT_ASSERT_EQ(first, 90);
+	first = 999;
+	fixture_hw_master_generation = 1;
+	UT_ASSERT_EQ(cold_advance(22000, 90, &first), CLUSTER_HW_NOT_READY);
+	UT_ASSERT_EQ(first, 999);
+	fixture_hw_master_generation = 0;
+	UT_ASSERT_EQ(cold_advance(22000, 90, &first), CLUSTER_HW_OK);
+	UT_ASSERT_EQ(first, 91);
+	UT_ASSERT_EQ(cold_reads + cold_writes, 0);
+}
 int
 main(void)
 {
 	if (mkdtemp(cold_root) == NULL)
 		return 2;
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(unclassified_cannot_allocate_or_publish_empty_checkpoint);
 	UT_RUN(normal_load_precedes_ready_and_first_allocation_uses_durable_hwm);
 	UT_RUN(normal_rebuilt_allows_closing_checkpoint_but_not_service);
@@ -427,6 +450,7 @@ main(void)
 	UT_RUN(actual_wal_tail_uses_own_decoded_checkpoint_and_recovery_decision);
 	UT_RUN(actual_startup_completion_is_after_successful_cf_close);
 	UT_RUN(actual_checkpoint_call_maintains_native_seed_metadata);
+	UT_RUN(rootless_storage_keeps_existing_hw_serve_gate);
 	UT_DONE();
 	/* Leave only our fresh disposable test directory; never clear a user root. */
 	return ut_failed_count != 0;

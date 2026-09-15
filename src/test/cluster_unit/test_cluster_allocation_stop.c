@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual OID/SQ/HW claim, publish and consume bodies. Shmem/hash, locks,
  * scheduler, OID authority I/O and GES are boundary fixtures. READY here is
  * not proof of checkpoint durability, absent frontends or remote completion. */
@@ -59,8 +60,18 @@ cluster_normal_stop_service_new_work(bool modifies_data)
 	return stop_new_modifier_allowed;
 }
 uint32 cluster_grd_shard_for_resource(const ClusterResId *resid) { return 0; }
-uint32 cluster_grd_shard_master_generation(uint32 shard) { return 0; }
-ClusterGrdShardPhase cluster_grd_shard_phase(uint32 shard) { return GRD_SHARD_NORMAL; }
+static uint32 fixture_hw_master_generation;
+static ClusterGrdShardPhase fixture_hw_shard_phase = GRD_SHARD_NORMAL;
+uint32
+cluster_grd_shard_master_generation(uint32 shard)
+{
+	return fixture_hw_master_generation;
+}
+ClusterGrdShardPhase
+cluster_grd_shard_phase(uint32 shard)
+{
+	return fixture_hw_shard_phase;
+}
 XLogRecPtr
 cluster_hw_emit_reserve(RelFileLocator rloc, ForkNumber fork, BlockNumber end, uint32 granted)
 {
