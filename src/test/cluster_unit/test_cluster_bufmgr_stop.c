@@ -24,6 +24,7 @@ UT_DEFINE_GLOBALS();
 int NBuffers = 4;
 bool cluster_enabled = true;
 bool IsUnderPostmaster = true;
+AuxProcType MyAuxProcType = CheckpointerProcess;
 bool cluster_past_image = true;
 static BufferDescPadded descriptors[4];
 BufferDescPadded *BufferDescriptors = descriptors;
@@ -38,6 +39,14 @@ static bool mapping_held;
 static bool caller_lock_held;
 static int header_reads, discarded, io_forgotten, io_wakes;
 static int pi_kept, pi_ineligible;
+static bool all_checkpoints;
+
+bool
+cluster_normal_stop_pi_retirement_allowed(void)
+{
+	UT_ASSERT(!mapping_held && !caller_lock_held);
+	return all_checkpoints;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *filename, int line)
@@ -195,6 +204,8 @@ reset_fixture(void)
 		pg_atomic_init_u32(&buf->state, 0);
 	}
 	mapping_held = caller_lock_held = false;
+	all_checkpoints = false;
+	MyAuxProcType = CheckpointerProcess;
 	header_reads = discarded = io_forgotten = io_wakes = pi_kept = pi_ineligible = 0;
 }
 
@@ -352,6 +363,64 @@ test_io_original_completion_and_failure(void)
 }
 
 static void
+test_global_cut_uses_real_pi_owner_preserves_current_and_owned_negative(void)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		BufferDesc *pi, *current;
+		BufferDescPadded before[4];
+		ClusterNormalStopPollResult result;
+		uint32 state;
+		reset_fixture();
+		current = resident(0);
+		pi = resident(1);
+		state = LockBufHdr(pi);
+		pi->pcm_state = PCM_STATE_N;
+		UT_ASSERT(cluster_bufmgr_convert_to_pi_locked(pi, state));
+		UT_ASSERT(cluster_pi_shadow_read(1) != InvalidScn);
+		all_checkpoints = true;
+		switch (fault) {
+		case 1:
+			all_checkpoints = false;
+			break;
+		case 2:
+			pg_atomic_fetch_add_u32(&pi->state, 1);
+			break;
+		case 3:
+			pg_atomic_fetch_or_u32(&pi->state, BM_IO_IN_PROGRESS);
+			break;
+		case 4:
+			pg_atomic_fetch_or_u32(&current->state, BM_DIRTY);
+			break;
+		case 5:
+			pg_atomic_fetch_or_u32(&pi->state, BM_DIRTY);
+			break;
+		case 6:
+			caller_lock_held = true;
+			break;
+		case 7:
+			MyAuxProcType = LmsProcess;
+			break;
+		}
+		memcpy(before, descriptors, sizeof(before));
+		result = cluster_bufmgr_normal_stop_pi_retire(NULL, NULL, NULL);
+		if (fault == 0) {
+			UT_ASSERT_EQ(result, CLUSTER_NORMAL_STOP_READY);
+			UT_ASSERT_EQ(discarded, 1);
+			UT_ASSERT_EQ(cluster_pi_shadow_read(1), InvalidScn);
+			UT_ASSERT(memcmp(current, &before[0], sizeof(*current)) == 0);
+			UT_ASSERT_EQ(cluster_bufmgr_normal_stop_pi_retire(NULL, NULL, NULL),
+						 CLUSTER_NORMAL_STOP_READY);
+			UT_ASSERT_EQ(discarded, 1);
+		} else {
+			UT_ASSERT(result != CLUSTER_NORMAL_STOP_READY);
+			UT_ASSERT_EQ(discarded, 0);
+			UT_ASSERT(memcmp(before, descriptors, sizeof(before)) == 0);
+			UT_ASSERT(cluster_pi_shadow_read(1) != InvalidScn);
+		}
+	}
+}
+
+static void
 test_retained_cache_is_not_live_pi(void)
 {
 	BufferDesc *buf;
@@ -438,11 +507,12 @@ test_invalid_uninitialized_residency_is_not_cached_authority(void)
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_required_init_and_lock_boundary);
 	UT_RUN(test_original_reservation_activation_delivery_completion);
 	UT_RUN(test_original_pi_convert_preserve_discard);
 	UT_RUN(test_io_original_completion_and_failure);
+	UT_RUN(test_global_cut_uses_real_pi_owner_preserves_current_and_owned_negative);
 	UT_RUN(test_retained_cache_is_not_live_pi);
 	UT_RUN(test_late_invalid_and_read_image_owner);
 	UT_RUN(test_invalid_uninitialized_residency_is_not_cached_authority);

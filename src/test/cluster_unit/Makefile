@@ -2872,12 +2872,13 @@ test_cluster_pcm_checksum_owner.inc: $(top_srcdir)/src/backend/cluster/cluster_g
 # are explicit fixtures; no second implementation of the stop predicate.
 test_cluster_bufmgr_stop_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^cluster_bufmgr_stop_held_lock\(/ { print "static void"; emit=1; held++ } \
-	     /^cluster_bufmgr_normal_stop_poll\(/ { print "ClusterNormalStopPollResult"; emit=1; poll++ } \
+	     /^cluster_bufmgr_stop_poll\(/ { print "static ClusterNormalStopPollResult"; emit=1; scan++ } \
+	     /^cluster_bufmgr_normal_stop_(poll|local_checkpoint_poll|pi_retire)\(/ { print "ClusterNormalStopPollResult"; emit=1; poll++ } \
 	     /^cluster_bufmgr_convert_to_pi_locked\(/ { print "static bool"; emit=1; convert++ } \
 	     /^cluster_bufmgr_discard_pi_block\(/ { print "bool"; emit=1; discard++ } \
 	     /^TerminateBufferIO\(/ { print "static void"; emit=1; io++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (held != 1 || poll != 1 || convert != 1 || discard != 1 || io != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (held != 1 || scan != 1 || poll != 3 || convert != 1 || discard != 1 || io != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_bufmgr_stop: test_cluster_bufmgr_stop.c unit_test.h \
@@ -3468,7 +3469,17 @@ test_cluster_gcs_stop_invalidate.inc: $(top_srcdir)/src/backend/cluster/cluster_
 	     END { if (handlers != 1 || ticks != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_gcs_stop: test_cluster_gcs_stop.c test_cluster_gcs_stop_invalidate.inc unit_test.h \
+# Execute the original unsolicited ACK entry prefix, including checksum,
+# transport identity, shard and epoch checks. Solicited broadcast handling
+# beyond the PI returns is a separate fixture, not reimplemented here.
+test_cluster_gcs_stop_pi_ack.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^cluster_gcs_handle_block_invalidate_ack_envelope\(/ { print "static void"; emit=1; entry++ } \
+	     emit && /if \(ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_RETRYABLE_BUSY\)/ { print "}"; emit=0; end++ } \
+	     emit { print } END { if (entry != 1 || end != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_gcs_stop: test_cluster_gcs_stop.c test_cluster_gcs_stop_invalidate.inc \
+		test_cluster_gcs_stop_pi_ack.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_gcs_block.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \

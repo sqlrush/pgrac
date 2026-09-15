@@ -4066,6 +4066,7 @@ pcm_resource_x_terminal_state_locked(
 	struct GrdEntry *entry,
 	const ClusterPcmResourceXMasterState *state,
 	bool allow_stable_residency, bool allow_drained_pair_history,
+	bool durable_stop_cut,
 	uint64 *terminal_request_count_io, uint64 *digest_io)
 {
 	static const ClusterPcmResourceXMasterRequest empty_request;
@@ -4084,7 +4085,8 @@ pcm_resource_x_terminal_state_locked(
 	Assert(state != NULL);
 	Assert(terminal_request_count_io != NULL);
 	Assert(digest_io != NULL);
-	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED));
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		|| LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 	memset(&empty_round, 0, sizeof(empty_round));
 	empty_round.highest_attempt_floor
 		= entry->resource_x_bootstrap_round.highest_attempt_floor;
@@ -4279,7 +4281,7 @@ pcm_resource_x_terminal_state_locked(
 		else
 			stable_cached = master_state == PCM_STATE_N
 				&& entry->x_holder_node == -1 && s_holders == 0
-				&& (pi_holders & settled_bit) != 0;
+				&& ((pi_holders & settled_bit) != 0 || durable_stop_cut);
 		if (!stable_cached || entry->pending_x_requester_node != -1
 			|| entry->pending_x_since_lsn != 0)
 			return false;
@@ -4304,7 +4306,7 @@ pcm_resource_x_clean_state_locked(
 	uint64 *terminal_request_count_io, uint64 *digest_io)
 {
 	return pcm_resource_x_terminal_state_locked(
-		entry, state, false, false, terminal_request_count_io, digest_io);
+		entry, state, false, false, false, terminal_request_count_io, digest_io);
 }
 
 static bool
@@ -9101,7 +9103,7 @@ cluster_pcm_grd_lifecycle_stats_snapshot(PcmGrdLifecycleStats *out)
 
 
 static bool pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out,
-												 bool *retained_out);
+												 bool *retained_out, bool durable_stop_cut);
 
 static void
 pcm_normal_stop_note_held_lock(LWLock *lock pg_attribute_unused(),
@@ -9110,9 +9112,9 @@ pcm_normal_stop_note_held_lock(LWLock *lock pg_attribute_unused(),
 	*(bool *)context = true;
 }
 
-ClusterNormalStopPollResult
-cluster_pcm_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, uint32 *slot_out,
-							 const char **reason_out)
+static ClusterNormalStopPollResult
+pcm_normal_stop_scan(bool require_pi_retired, bool retire_pi, BufferTag *tag_out, uint32 *slot_out,
+					 const char **reason_out)
 {
 	static const ClusterPcmResourceXSlot empty_slot;
 	static const ClusterPcmResourceXMasterState empty_state;
@@ -9123,6 +9125,7 @@ cluster_pcm_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, uint32 *s
 	HASH_SEQ_STATUS scan;
 	struct GrdEntry *entry;
 	bool held_lock = false;
+	bool durable_stop_cut;
 	uint32 gate;
 
 	if (!IsUnderPostmaster || !cluster_enabled || ClusterPcm == NULL || cluster_pcm_htab == NULL
@@ -9139,6 +9142,14 @@ cluster_pcm_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, uint32 *s
 	if (held_lock) {
 		result = CLUSTER_NORMAL_STOP_INVALID;
 		reason = "PCM_CALLER_LOCK_HELD";
+		goto done;
+	}
+	/* The actual all-member cut only replaces historical PI cover in this
+	 * terminal observer; acquisition and R8/R10 proof never consume it. */
+	durable_stop_cut = cluster_normal_stop_pi_retirement_allowed();
+	if (retire_pi && (!AmCheckpointerProcess() || !durable_stop_cut)) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "PCM_PI_RETIRE_WITHOUT_ALL_CHECKPOINTS";
 		goto done;
 	}
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
@@ -9162,8 +9173,8 @@ cluster_pcm_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, uint32 *s
 
 		/* Directory S keeps this original entry and its sidecar alive,
 		 * without creating a lookup pin or invoking a retire path. */
-		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained);
+		LWLockAcquire(&entry->entry_lock.lock, retire_pi ? LW_EXCLUSIVE : LW_SHARED);
+		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, durable_stop_cut);
 		if (!valid || entry->binding_generation == 0 || entry->binding_generation == UINT64_MAX
 			|| entry->resource_x_bootstrap_round.phase
 				   == RESOURCE_X_BOOTSTRAP_ROUND_FAILED_CLOSED) {
@@ -9215,11 +9226,19 @@ cluster_pcm_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, uint32 *s
 				   && (entry->pending_x_requester_node != -1 || entry->convert_queue != NULL)) {
 			current = CLUSTER_NORMAL_STOP_PENDING;
 			current_reason = "PCM_PENDING_CONVERT";
-		} else if (current == CLUSTER_NORMAL_STOP_READY && post_checkpoint
+		} else if (current == CLUSTER_NORMAL_STOP_READY && require_pi_retired
 				   && (pi_holders != 0 || entry->pi_watermark_lsn != InvalidXLogRecPtr
 					   || entry->pi_watermark_scn != InvalidScn)) {
 			current = CLUSTER_NORMAL_STOP_PENDING;
 			current_reason = "PCM_PI_DURABILITY";
+		}
+		if (retire_pi && current == CLUSTER_NORMAL_STOP_READY) {
+			/* All current holders have really checkpointed this sealed
+			 * formation. Retire only conservative PI metadata, including
+			 * zero-watermark declarations; never erase protocol state. */
+			pg_atomic_write_u32(&entry->pi_holders_bitmap, 0);
+			entry->pi_watermark_lsn = InvalidXLogRecPtr;
+			entry->pi_watermark_scn = InvalidScn;
 		}
 		if ((current == CLUSTER_NORMAL_STOP_INVALID && result != CLUSTER_NORMAL_STOP_INVALID)
 			|| (current == CLUSTER_NORMAL_STOP_PENDING && result == CLUSTER_NORMAL_STOP_READY)) {
@@ -9278,11 +9297,40 @@ done:
 	return result;
 }
 
+ClusterNormalStopPollResult
+cluster_pcm_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, uint32 *slot_out,
+							 const char **reason_out)
+{
+	return pcm_normal_stop_scan(post_checkpoint, false, tag_out, slot_out, reason_out);
+}
+
+ClusterNormalStopPollResult
+cluster_pcm_normal_stop_local_checkpoint_poll(BufferTag *tag_out, uint32 *slot_out,
+											  const char **reason_out)
+{
+	/* The PI predicate is this owner's only pre/post checkpoint difference.
+	 * Every directory, terminal protocol, registry and reference check stays. */
+	return pcm_normal_stop_scan(false, false, tag_out, slot_out, reason_out);
+}
+
+ClusterNormalStopPollResult
+cluster_pcm_normal_stop_pi_retire(BufferTag *tag_out, uint32 *slot_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result;
+	result = pcm_normal_stop_scan(false, false, tag_out, slot_out, reason_out);
+	if (result == CLUSTER_NORMAL_STOP_READY)
+		result = pcm_normal_stop_scan(false, true, tag_out, slot_out, reason_out);
+	if (result == CLUSTER_NORMAL_STOP_READY)
+		result = cluster_pcm_normal_stop_poll(true, tag_out, slot_out, reason_out);
+	return result;
+}
+
 /* Original locked state classification, shared by the diagnostic projection
  * and the stop observer. READY still requires the exact terminal table;
  * diagnostic counters are never inputs to a stop decision. */
 static bool
-pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, bool *retained_out)
+pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, bool *retained_out,
+									bool durable_stop_cut)
 {
 	ClusterPcmResourceXMasterState *state = NULL;
 	ClusterPcmResourceXBootstrapRound *round;
@@ -9298,7 +9346,8 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 	int node;
 
 	Assert(LWLockHeldByMeInMode(&ClusterPcm->htab_lock.lock, LW_SHARED));
-	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED));
+	Assert(LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_SHARED)
+		   || LWLockHeldByMeInMode(&entry->entry_lock.lock, LW_EXCLUSIVE));
 
 	lifecycle = pg_atomic_read_u32(&entry->lifecycle);
 	if (lifecycle != PCM_ENTRY_LIVE && lifecycle != PCM_ENTRY_QUIESCING)
@@ -9396,7 +9445,7 @@ pcm_resource_x_protocol_state_locked(struct GrdEntry *entry, bool *active_out, b
 			uint64 terminal_count = 0;
 			uint64 digest = PGRAC_RESOURCE_X_PROOF_DIGEST_OFFSET;
 
-			if (!pcm_resource_x_terminal_state_locked(entry, state, true, true, &terminal_count,
+			if (!pcm_resource_x_terminal_state_locked(entry, state, true, true, durable_stop_cut, &terminal_count,
 													  &digest))
 				invalid = true;
 		}
@@ -9412,6 +9461,7 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 {
 	HASH_SEQ_STATUS status;
 	struct GrdEntry *entry;
+	bool durable_stop_cut;
 
 	if (out == NULL)
 		return;
@@ -9419,13 +9469,14 @@ cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out)
 	if (ClusterPcm == NULL || cluster_pcm_htab == NULL)
 		return;
 
+	durable_stop_cut = cluster_normal_stop_pi_retirement_allowed();
 	LWLockAcquire(&ClusterPcm->htab_lock.lock, LW_SHARED);
 	hash_seq_init(&status, cluster_pcm_htab);
 	while ((entry = (struct GrdEntry *)hash_seq_search(&status)) != NULL) {
 		bool active, retained, valid;
 
 		LWLockAcquire(&entry->entry_lock.lock, LW_SHARED);
-		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained);
+		valid = pcm_resource_x_protocol_state_locked(entry, &active, &retained, durable_stop_cut);
 		out->wait_refcount += pg_atomic_read_u32(&entry->wait_refcount);
 		out->transport_refcount += pg_atomic_read_u32(&entry->transport_refcount);
 		if (entry->resource_x_local_owner.state != RESOURCE_X_LOCAL_OWNER_EMPTY) {

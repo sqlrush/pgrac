@@ -59,6 +59,10 @@ static TimestampTz fixture_now = 1000000;
 static ClusterNormalStopPollResult module_results[14];
 static unsigned module_calls[14];
 static unsigned module_post_calls;
+static bool module_pi_pending;
+static unsigned module_pi_retire_calls;
+static void (*pi_cut_race_after_shared_unlock)(void);
+static LWLockMode last_leave_lock_mode;
 static bool module_change_root;
 static uint32 module_late_active;
 static bool module_late_completed_debt;
@@ -124,6 +128,8 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 		identity_root[80] ^= 1;
 	lock_holds++;
 	lock_acquisitions++;
+	if (lock == &test_region.leave.lock)
+		last_leave_lock_mode = mode;
 	return true;
 }
 
@@ -135,6 +141,12 @@ LWLockRelease(LWLock *lock)
 		|| lock_holds != 1)
 		abort();
 	lock_holds--;
+	if (lock == &test_region.leave.lock && last_leave_lock_mode == LW_SHARED
+		&& pi_cut_race_after_shared_unlock != NULL) {
+		void (*action)(void) = pi_cut_race_after_shared_unlock;
+		pi_cut_race_after_shared_unlock = NULL;
+		action();
+	}
 }
 
 bool
@@ -229,13 +241,17 @@ cluster_undo_block0_normal_stop_poll(bool post,
 ClusterNormalStopPollResult
 cluster_pcm_normal_stop_poll(bool post, BufferTag *tag, uint32 *slot, const char **reason)
 {
+	ClusterNormalStopPollResult result;
 	if (tag != NULL) {
 		memset(tag, 0, sizeof(*tag));
 		tag->blockNum = 17003;
 	}
 	if (slot != NULL)
 		*slot = 11;
-	return module_fixture(4, post, reason);
+	result = module_fixture(4, post, reason);
+	return result == CLUSTER_NORMAL_STOP_READY && post && module_pi_pending
+			   ? CLUSTER_NORMAL_STOP_PENDING
+			   : result;
 }
 
 ClusterNormalStopPollResult
@@ -281,13 +297,51 @@ cluster_grd_normal_stop_poll(ClusterResId *resid, uint32 *shard, const char **re
 ClusterNormalStopPollResult
 cluster_bufmgr_normal_stop_poll(bool post, BufferTag *tag, int *buffer, const char **reason)
 {
+	ClusterNormalStopPollResult result;
 	if (tag != NULL) {
 		memset(tag, 0, sizeof(*tag));
 		tag->blockNum = 16972;
 	}
 	if (buffer != NULL)
 		*buffer = 31;
-	return module_fixture(9, post, reason);
+	result = module_fixture(9, post, reason);
+	return result == CLUSTER_NORMAL_STOP_READY && post && module_pi_pending
+			   ? CLUSTER_NORMAL_STOP_PENDING
+			   : result;
+}
+
+ClusterNormalStopPollResult
+cluster_pcm_normal_stop_local_checkpoint_poll(BufferTag *tag, uint32 *slot, const char **reason)
+{
+	return cluster_pcm_normal_stop_poll(false, tag, slot, reason);
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_local_checkpoint_poll(BufferTag *tag, int *buffer, const char **reason)
+{
+	return cluster_bufmgr_normal_stop_poll(false, tag, buffer, reason);
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_pi_retire(BufferTag *tag, int *buffer, const char **reason)
+{
+	/* The separate bufmgr test executes the actual owner. Here the real
+	 * coordinator must establish permission before crossing that boundary. */
+	if (!AmCheckpointerProcess() || !cluster_normal_stop_pi_retirement_allowed())
+		abort();
+	module_pi_retire_calls++;
+	return cluster_bufmgr_normal_stop_poll(false, tag, buffer, reason);
+}
+
+ClusterNormalStopPollResult
+cluster_pcm_normal_stop_pi_retire(BufferTag *tag, uint32 *slot, const char **reason)
+{
+	if (!AmCheckpointerProcess() || !cluster_normal_stop_pi_retirement_allowed()
+		|| module_pi_retire_calls == 0)
+		abort();
+	module_pi_retire_calls++;
+	module_pi_pending = false;
+	return cluster_pcm_normal_stop_poll(true, tag, slot, reason);
 }
 
 ClusterNormalStopPollResult
@@ -382,6 +436,9 @@ reset_region(void)
 		module_results[index] = CLUSTER_NORMAL_STOP_READY;
 	memset(module_calls, 0, sizeof(module_calls));
 	module_post_calls = 0;
+	module_pi_pending = false;
+	module_pi_retire_calls = 0;
+	pi_cut_race_after_shared_unlock = NULL;
 	module_change_root = false;
 	module_late_active = 0;
 	lmon_local_observation = CLUSTER_NORMAL_STOP_READY;
@@ -3057,6 +3114,26 @@ UT_TEST(test_post_checkpoint_arm_pending_preserves_predecessor_and_peer_ownershi
 				 CLUSTER_NORMAL_STOP_READY);
 }
 
+UT_TEST(test_pi_waits_for_all_checkpoints_not_before_checkpoint_exchange)
+{
+	ClusterPhase1FullStopPlan plan;
+	seed_at_checkpoint(&plan);
+	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	module_pi_pending = true;
+	/* The real coordinator used to require PI discard before it could
+	 * exchange the very durability proof needed to authorize that discard. */
+	UT_ASSERT_EQ(cluster_normal_stop_modules_poll(true, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_POST_STOPPED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
+	UT_ASSERT(module_pi_pending);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+	UT_ASSERT(!cluster_normal_stop_pi_retirement_allowed());
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(module_pi_retire_calls, 0);
+	UT_ASSERT(module_pi_pending);
+}
+
 UT_TEST(test_post_checkpoint_arm_never_substitutes_active_wal_or_changed_plan)
 {
 	ClusterPhase1FullStopPlan plan;
@@ -3273,6 +3350,141 @@ seed_release_exchange(ClusterPhase1FullStopPlan *plan)
 	release_reply_on_request = release_receipt_on_reply = true;
 	MyAuxProcType = LmonProcess;
 	cl_normal_stop_release_lmon_tick();
+}
+
+UT_TEST(test_pi_retirement_requires_complete_exact_post_checkpoint_cut)
+{
+	ClusterPhase1FullStopPlan plan;
+	for (int fault = 0; fault < 17; fault++) {
+		seed_post_barrier(&plan);
+		UT_ASSERT(cluster_normal_stop_pi_retirement_allowed());
+		module_pi_pending = true;
+		switch (fault) {
+		case 0:
+			cl_state->ack_bitmap[0] &= ~2;
+			break;
+		case 1:
+			cl_state->phase1_post_stopped_reply_sent[0] &= ~2;
+			break;
+		case 2:
+			cl_state->phase1_post_stopped_reply_pending[0] = 2;
+			break;
+		case 3:
+			cl_state->phase1_release_request_nonce[1] = cl_normal_stop->peer_request_nonce[1];
+			break;
+		case 4:
+			cl_state->ack_bitmap[1] = 1;
+			break;
+		case 5:
+			pg_atomic_write_u32(&cl_normal_stop->cleaner_quiesced_mask, 127);
+			break;
+		case 6:
+			pg_atomic_write_u32(&cl_normal_stop->frontends_gone, 0);
+			break;
+		case 7:
+			pg_atomic_write_u32(&cl_normal_stop->service_seal, 0);
+			break;
+		case 8:
+			pg_atomic_write_u32(&cl_normal_stop->identity_published, 0);
+			break;
+		case 9:
+			pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_CHECKPOINT);
+			break;
+		case 10:
+			fixture_now = cl_state->barrier_deadline_us;
+			break;
+		case 11:
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+			break;
+		case 12:
+			cl_normal_stop->member_incarnations[1] = 0;
+			break;
+		case 13:
+			MyAuxProcType = NotAnAuxProcess;
+			break;
+		case 14:
+			cl_normal_stop->peer_reply_sent &= ~2;
+			break;
+		case 15:
+			pg_atomic_write_u64(&cl_state->leave_attempt_nonce,
+								cl_normal_stop->peer_request_nonce[cluster_node_id]);
+			break;
+		case 16:
+			cl_normal_stop->post_checkpoint_deadline_us++;
+			break;
+		}
+		UT_ASSERT(!cluster_normal_stop_pi_retirement_allowed());
+		UT_ASSERT(module_pi_pending);
+		UT_ASSERT_EQ(module_pi_retire_calls, 0);
+	}
+	seed_post_barrier(&plan);
+	module_pi_pending = true;
+	UT_ASSERT_EQ(cluster_normal_stop_modules_poll(true, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(module_pi_retire_calls, 2);
+	UT_ASSERT(!module_pi_pending);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+}
+
+UT_TEST(test_pi_retirement_rejects_changed_identity_or_other_owner)
+{
+	ClusterPhase1FullStopPlan plan;
+	for (int fault = 0; fault < 4; fault++) {
+		seed_post_barrier(&plan);
+		module_pi_pending = true;
+		if (fault == 0)
+			identity_root[80] ^= 1;
+		else if (fault == 1)
+			module_results[9] = CLUSTER_NORMAL_STOP_PENDING; /* real dirty/IO owner */
+		else if (fault == 2)
+			module_results[4] = CLUSTER_NORMAL_STOP_INVALID;
+		else {
+			MyAuxProcType = LmsProcess;
+			UT_ASSERT(cluster_normal_stop_service_enter());
+			MyAuxProcType = CheckpointerProcess;
+		}
+		UT_ASSERT(cluster_normal_stop_close_poll(&plan, NULL) != CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(module_pi_retire_calls, 0);
+		UT_ASSERT(module_pi_pending);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
+	}
+}
+
+static void
+pi_hint_enter_before_last_checkpoint_ack(void)
+{
+	MyAuxProcType = LmsProcess;
+	UT_ASSERT(cluster_normal_stop_service_enter());
+	UT_ASSERT(!cluster_normal_stop_pi_retirement_allowed());
+	/* A real in-flight hint has read the old cut; its PI write has not
+	 * happened. LMON now consumes the final real post-STOPPED ACK. */
+	front_peer_ack(1, pg_atomic_read_u64(&cl_state->leave_attempt_nonce), false);
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 11);
+	MyAuxProcType = CheckpointerProcess;
+}
+
+UT_TEST(test_pi_actor_idle_sample_must_follow_checkpoint_proof)
+{
+	ClusterPhase1FullStopPlan plan;
+	seed_post_barrier(&plan);
+	cl_state->ack_bitmap[0] &= ~2;
+	module_pi_pending = true;
+	pi_cut_race_after_shared_unlock = pi_hint_enter_before_last_checkpoint_ack;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(pi_cut_race_after_shared_unlock == NULL);
+	UT_ASSERT_EQ(module_pi_retire_calls, 0);
+	UT_ASSERT(module_pi_pending);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
+	MyAuxProcType = LmsProcess;
+	UT_ASSERT(cluster_normal_stop_service_leave(true));
+	UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
+				 CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(module_pi_retire_calls, 2);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
 }
 
 UT_TEST(test_current_release_codec_not_pristine_authority)
@@ -4000,7 +4212,7 @@ UT_TEST(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_rec
 int
 main(void)
 {
-	UT_PLAN(96);
+	UT_PLAN(100);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
@@ -4061,6 +4273,10 @@ main(void)
 	UT_RUN(test_checkpoint_seal_must_recheck_debt_created_after_pre_seal_census);
 	UT_RUN(test_post_checkpoint_arm_uses_exact_stop_identity_and_one_fresh_nonce);
 	UT_RUN(test_post_checkpoint_arm_pending_preserves_predecessor_and_peer_ownership);
+	UT_RUN(test_pi_waits_for_all_checkpoints_not_before_checkpoint_exchange);
+	UT_RUN(test_pi_retirement_requires_complete_exact_post_checkpoint_cut);
+	UT_RUN(test_pi_retirement_rejects_changed_identity_or_other_owner);
+	UT_RUN(test_pi_actor_idle_sample_must_follow_checkpoint_proof);
 	UT_RUN(test_post_checkpoint_arm_never_substitutes_active_wal_or_changed_plan);
 	UT_RUN(test_checkpoint_roster_cannot_shrink_or_replace_in_same_attempt);
 	UT_RUN(test_post_control_retains_early_successor_until_own_stopped_and_armed);

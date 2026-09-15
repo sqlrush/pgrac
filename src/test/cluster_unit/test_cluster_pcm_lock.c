@@ -109,6 +109,7 @@ UT_DEFINE_GLOBALS();
 int cluster_node_id = 0;
 bool cluster_enabled = false;
 bool IsUnderPostmaster = false;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 int NBuffers = 0;
 int cluster_injection_armed_count = 0;
 int cluster_gcs_reply_timeout_ms = 1;
@@ -116,6 +117,7 @@ static uint64 ut_lms_master_generation = (UINT64_C(1) << 32) | UINT64_C(1);
 static uint32 ut_wait_event_info_storage = 0;
 static bool stop_new_work_allowed = true;
 static int stop_new_work_calls;
+static bool stop_pi_cut_allowed;
 
 bool
 cluster_normal_stop_service_new_work(bool modifies_data)
@@ -373,6 +375,8 @@ static void
 reset_fake_pcm_runtime(int max_entries)
 {
 	stop_new_work_allowed = true;
+	stop_pi_cut_allowed = false;
+	MyAuxProcType = NotAnAuxProcess;
 	stop_new_work_calls = 0;
 	fake_pcm_clock_us = 0;
 	fake_pcm_clock_hook = NULL;
@@ -696,6 +700,25 @@ stop_pcm_poll(bool post_checkpoint, BufferTag *tag, uint32 *slot, const char **r
 	IsUnderPostmaster = true;
 	cluster_enabled = true;
 	result = cluster_pcm_normal_stop_poll(post_checkpoint, tag, slot, reason);
+	IsUnderPostmaster = was_under;
+	cluster_enabled = was_enabled;
+	return result;
+}
+
+bool
+cluster_normal_stop_pi_retirement_allowed(void)
+{
+	Assert(fake_lwlock_depth == 0);
+	return stop_pi_cut_allowed;
+}
+
+static ClusterNormalStopPollResult
+stop_pcm_retire(void)
+{
+	ClusterNormalStopPollResult result;
+	bool was_under = IsUnderPostmaster, was_enabled = cluster_enabled;
+	IsUnderPostmaster = cluster_enabled = true;
+	result = cluster_pcm_normal_stop_pi_retire(NULL, NULL, NULL);
 	IsUnderPostmaster = was_under;
 	cluster_enabled = was_enabled;
 	return result;
@@ -9945,6 +9968,117 @@ UT_TEST(test_pcm_protocol_debt_projection_rejects_settled_without_cached_or_pi)
 	UT_ASSERT_EQ(debt.invalid_entry_count, UINT64_C(1));
 	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
 }
+
+UT_TEST(test_pcm_stop_durable_cut_replaces_exact_terminal_pi_cover)
+{
+	BufferTag tag = make_tag(242);
+	PcmAuthoritySnapshot authority;
+	PcmGrdProtocolDebtStats debt;
+	ResourceXDecodedFrame assertion;
+	ResourceXDecodedFrame settlement;
+	ResourceXDurableProof durable;
+	ResourceXIntentSlot grant_intent;
+	ResourceXMasterSnapshot snapshot;
+	uint8 grant_bytes[RESOURCE_X_PROOF_V1_BYTES];
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(
+		tag, PCM_TRANS_N_TO_X, 0), PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(
+		tag, PCM_TRANS_X_TO_N_RELEASE, 0), PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &authority));
+
+	assertion = make_resource_x_master_frame(
+		RESOURCE_X_WIRE_ASSERT_X, tag, 3, 3);
+	assertion.common.base_authority_generation = authority.transition_count;
+	assertion.common.authority_generation = authority.transition_count;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_adapter_base_bind_exact(
+		&assertion.common.logical_assertion, 17,
+		authority.transition_count, &authority),
+		RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(
+		&assertion, 3, &snapshot), RESOURCE_X_APPLY_APPLIED);
+
+	memset(&durable, 0, sizeof(durable));
+	durable.assertion = assertion.common.logical_assertion;
+	durable.base_authority_generation = authority.transition_count;
+	durable.resource_formation = 17;
+	durable.master_session_incarnation = 31;
+	durable.assertion_sequence = assertion.common.assertion_sequence;
+	durable.requester_target_generation = 41;
+	durable.page_scn_lsn = 82;
+	durable.page_checksum = UINT32_C(0x12345678);
+	durable.source_proof_crc32c = UINT32_C(0x87654321);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_durable_proof_exact(
+		&durable, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
+		&assertion.common.logical_assertion, &grant_intent, grant_bytes,
+		sizeof(grant_bytes)), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_grant_intent_stage_exact(
+		&grant_intent, 101), RESOURCE_X_INTENT_STAGED);
+	UT_ASSERT(cluster_pcm_lock_resource_x_grant_intent_complete_exact(
+		&grant_intent));
+
+	settlement = make_resource_x_master_frame(
+		RESOURCE_X_WIRE_INSTALL_SETTLEMENT, tag, 3, 3);
+	settlement.common.outcome = RESOURCE_X_OUTCOME_OK;
+	settlement.common.base_authority_generation
+		= durable.base_authority_generation;
+	settlement.common.authority_generation
+		= snapshot.final_authority_generation;
+	settlement.body.install_settlement.conversion_base_generation
+		= durable.base_authority_generation;
+	settlement.body.install_settlement.final_authority_generation
+		= snapshot.final_authority_generation;
+	settlement.body.install_settlement.requester_connection_generation = 91;
+	settlement.body.install_settlement.requester_target_generation = 41;
+	settlement.body.install_settlement.page_scn_lsn = durable.page_scn_lsn;
+	settlement.body.install_settlement.page_checksum = durable.page_checksum;
+	settlement.body.install_settlement.source_proof_crc32c
+		= durable.source_proof_crc32c;
+	settlement.body.install_settlement.installed_mode = PCM_STATE_X;
+	settlement.body.install_settlement.requester_role
+		= RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+	settlement.body.install_settlement.terminal_outcome
+		= RESOURCE_X_OUTCOME_OK;
+	settlement.body.install_settlement.terminal_state
+		= RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_install_settlement_exact(
+		&settlement, 3, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_settled_retire_exact(
+		&assertion.common.logical_assertion,
+		assertion.common.assertion_sequence, &snapshot),
+		RESOURCE_X_APPLY_APPLIED);
+
+	cluster_pcm_grd_protocol_debt_snapshot(&debt);
+	UT_ASSERT_EQ(debt.retained_entry_count, UINT64_C(0));
+	UT_ASSERT_EQ(debt.active_resource_x_entry_count, UINT64_C(0));
+	UT_ASSERT_EQ(debt.local_owner_entry_count, UINT64_C(0));
+	UT_ASSERT_EQ(debt.invalid_entry_count, UINT64_C(0));
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+
+	/* Actual common downgrade leaves a terminal historical PI cover. */
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(
+		tag, PCM_TRANS_X_TO_N_DOWNGRADE, 3), PCM_GCS_TRANSITION_APPLIED);
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_INVALID);
+	stop_pi_cut_allowed = true;
+	UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	/* The exact tombstone is preserved, not changed to RELEASED/success. */
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_master_snapshot_exact(
+		&assertion.common.logical_assertion, &snapshot), RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_SETTLED);
+	/* Without the global durable cut, the old online negative is unchanged. */
+	stop_pi_cut_allowed = false;
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+}
+
 
 /* Exercise the admitted production lane, not a synthesized master request. */
 static ResourceXDecodedFrame
@@ -19550,6 +19684,49 @@ UT_TEST(test_pcm_normal_stop_master_holder_shape_cannot_hide_behind_pending)
 	}
 }
 
+UT_TEST(test_pcm_stop_real_downgrade_pi_requires_global_cut_only_clears_pi)
+{
+	for (int watermarked = 0; watermarked < 2; watermarked++) {
+		BufferTag tag = make_tag(6470 + watermarked);
+		struct StopPcmEntryLayout *entry, expected;
+		uint32 holders;
+		PcmEntryRef ref;
+		PcmEntryAcquireResult acquired;
+		reset_fake_pcm_runtime(4);
+		UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+					 RESOURCE_X_APPLY_APPLIED);
+		cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_X);
+		cluster_pcm_lock_downgrade(tag, PCM_LOCK_MODE_S, true);
+		if (watermarked)
+			cluster_pcm_lock_pi_watermark_scn_advance(tag, (SCN)0x5500,
+													  CLUSTER_PCM_WM_SRC_REDECLARE, 0, 31, 17);
+		entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+		UT_ASSERT_NOT_NULL(entry);
+		UT_ASSERT(pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0);
+		/* A real common downgrade has no SCN proof; online discard remains
+		 * forbidden even with a numerically large written value. */
+		if (!watermarked)
+			UT_ASSERT(!cluster_pcm_lock_pi_discard_collect(tag, (SCN)0xffff, &holders));
+		expected = *entry;
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+		stop_pi_cut_allowed = true;
+		UT_ASSERT(pcm_entry_ref_acquire(&tag, false, &ref, &acquired));
+		UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT(pg_atomic_read_u32(&entry->pi_holders_bitmap) != 0);
+		pcm_entry_ref_release(&ref);
+		expected = *entry;
+		pg_atomic_write_u32(&expected.pi_holders_bitmap, 0);
+		expected.pi_watermark_lsn = InvalidXLogRecPtr;
+		expected.pi_watermark_scn = InvalidScn;
+		UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(memcmp(entry, &expected, sizeof(expected)), 0);
+		UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(stop_pcm_retire(), CLUSTER_NORMAL_STOP_READY);
+	}
+}
+
 UT_TEST(test_stop_seal_rejects_new_bootstrap_not_an_existing_receipt)
 {
 	BufferTag tag = make_tag(291);
@@ -19734,7 +19911,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(279);
+	UT_PLAN(281);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -19872,6 +20049,7 @@ main(void)
 	UT_RUN(test_resource_x_settled_retirement_tombstone_replays_and_frees_live_slot);
 	UT_RUN(test_resource_x_tombstone_lineage_drift_remains_terminal);
 	UT_RUN(test_pcm_protocol_debt_projection_rejects_settled_without_cached_or_pi);
+	UT_RUN(test_pcm_stop_durable_cut_replaces_exact_terminal_pi_cover);
 	UT_RUN(test_resource_x_delegates_final_x_without_standalone_grant);
 	UT_RUN(test_resource_x_delegated_replay_preserves_armed_send);
 	UT_RUN(test_resource_x_delegated_replay_preserves_staged_send);
@@ -20008,6 +20186,7 @@ main(void)
 	UT_RUN(test_pcm_normal_stop_directory_orphan_and_original_tombstone);
 	UT_RUN(test_pcm_normal_stop_is_read_only_and_refuses_preheld_lock);
 	UT_RUN(test_pcm_normal_stop_pi_has_two_cuts);
+	UT_RUN(test_pcm_stop_real_downgrade_pi_requires_global_cut_only_clears_pi);
 	UT_RUN(test_pcm_normal_stop_master_holder_shape_cannot_hide_behind_pending);
 	UT_RUN(test_stop_seal_rejects_new_bootstrap_not_an_existing_receipt);
 	UT_RUN(test_stop_seal_rejects_new_priority_without_overwriting_predecessor);

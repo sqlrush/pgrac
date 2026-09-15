@@ -1448,9 +1448,9 @@ cl_normal_stop_fronts_lmon_tick(void)
 		SetLatch(ProcGlobal->checkpointerLatch);
 }
 
-ClusterNormalStopPollResult
-cluster_normal_stop_modules_poll(bool post_checkpoint,
-								 ClusterNormalStopModuleObservation *observation)
+static ClusterNormalStopPollResult
+cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
+							ClusterNormalStopModuleObservation *observation)
 {
 	static const char *const names[]
 		= { "ACTIVE_WRITE", "TT_SLOT", "UNDO_BLOCK0", "CTRC", "PCM",	  "GCS", "SF",
@@ -1529,7 +1529,11 @@ cluster_normal_stop_modules_poll(bool post_checkpoint,
 					 ctrc.key.slot_wrap, ctrc.key.xid);
 			break;
 		case 4:
-			result = cluster_pcm_normal_stop_poll(post_checkpoint, &tag, &index, &current.reason);
+			result
+				= post_checkpoint && !require_pi_retired
+					  ? cluster_pcm_normal_stop_local_checkpoint_poll(&tag, &index, &current.reason)
+					  : cluster_pcm_normal_stop_poll(post_checkpoint, &tag, &index,
+													 &current.reason);
 			break;
 		case 5:
 			result = cluster_gcs_block_normal_stop_poll(post_checkpoint, &backend, &slot,
@@ -1552,8 +1556,11 @@ cluster_normal_stop_modules_poll(bool post_checkpoint,
 			result = cluster_grd_normal_stop_poll(&resid, &index, &current.reason);
 			break;
 		case 9:
-			result
-				= cluster_bufmgr_normal_stop_poll(post_checkpoint, &tag, &backend, &current.reason);
+			result = post_checkpoint && !require_pi_retired
+						 ? cluster_bufmgr_normal_stop_local_checkpoint_poll(&tag, &backend,
+																			&current.reason)
+						 : cluster_bufmgr_normal_stop_poll(post_checkpoint, &tag, &backend,
+														   &current.reason);
 			break;
 		case 10:
 			result = cluster_oid_lease_normal_stop_poll(&current.reason);
@@ -1608,6 +1615,13 @@ cluster_normal_stop_modules_poll(bool post_checkpoint,
 		observation->reason = "NORMAL_STOP_MODULES_READY_NOT_A_SERVICE_CUT";
 	}
 	return aggregate;
+}
+
+ClusterNormalStopPollResult
+cluster_normal_stop_modules_poll(bool post_checkpoint,
+								 ClusterNormalStopModuleObservation *observation)
+{
+	return cl_normal_stop_modules_poll(post_checkpoint, true, observation);
 }
 
 static bool
@@ -1748,9 +1762,9 @@ cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
 	LWLockRelease(&cl_state->lock);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
-	/* This requires the original durable own STOPPED, not the fact that the
-	 * caller reached phase5. PI/undo/HW post-cut obligations must also finish. */
-	result = cluster_normal_stop_modules_poll(true, observation);
+	/* Actual own STOPPED, dirty/IO and every other post-checkpoint owner
+	 * remain mandatory. PI is retired only AFTER all peers prove this cut. */
+	result = cl_normal_stop_modules_poll(true, false, observation);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	now = (uint64)GetCurrentTimestamp();
@@ -1834,7 +1848,7 @@ cl_normal_stop_post_send(const ClusterPhase1FullStopPlan *plan, uint32 expected,
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 		return false;
 	}
-	result = cluster_normal_stop_modules_poll(true, NULL);
+	result = cl_normal_stop_modules_poll(true, false, NULL);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return false;
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
@@ -2052,6 +2066,105 @@ cl_normal_stop_release_complete_locked(void)
 		   && cl_state->phase1_release_receipt_seen[0] == peers;
 }
 
+/* Read-only permission from the authenticated, already-bound all-member
+ * exchange. No caller-supplied durability bit, elapsed-time inference or
+ * disk repair. Call without module locks; coordinator identity polls still
+ * bracket the actual owner work. LMS may only suppress covered old hints. */
+bool
+cluster_normal_stop_pi_retirement_allowed(void)
+{
+	uint32 phase, peers, seal;
+	uint64 nonce, now;
+	bool valid;
+	if (!IsUnderPostmaster
+		|| (!AmCheckpointerProcess() && !AmLmonProcess() && !AmLmsProcess()
+			&& !AmLmsWorkerProcess())
+		|| !cluster_enabled || cl_state == NULL || cl_normal_stop == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| !cluster_normal_stop_requested())
+		return false;
+	now = (uint64)GetCurrentTimestamp();
+	peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	seal = pg_atomic_read_u32(&cl_normal_stop->service_seal);
+	nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	valid = cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE
+			&& pg_atomic_read_u32(&cl_normal_stop->identity_published) == 1
+			&& ((phase == CLUSTER_NORMAL_STOP_POST_STOPPED && seal == 1)
+				|| (phase == CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED && seal == 2))
+			&& pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
+			&& pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) == 1
+			&& pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask) == 255
+			&& cl_state->leaving_node_id == -1
+			&& pg_atomic_read_u32(&cl_state->phase) == CLUSTER_LEAVE_IDLE
+			&& pg_atomic_read_u32(&cl_state->request_in_progress) == 1
+			&& pg_atomic_read_u32(&cl_state->shutdown_driven) == 1
+			&& pg_atomic_read_u32(&cl_state->nak_received) == 0
+			&& pg_atomic_read_u32(&cl_state->preflight_sent) == 1
+			&& ((pg_atomic_read_u32(&cl_state->preflight_pending) == 1
+				 && pg_atomic_read_u32(&cl_state->phase1_release_pending) == 0)
+				|| (pg_atomic_read_u32(&cl_state->preflight_pending) == 0
+					&& pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1))
+			&& cl_normal_stop->post_checkpoint_deadline_us != 0
+			&& cl_normal_stop->post_checkpoint_deadline_us != UINT64_MAX
+			&& cl_normal_stop->post_checkpoint_deadline_us == cl_state->barrier_deadline_us
+			&& now != 0 && now < cl_state->barrier_deadline_us
+			&& cl_normal_stop->peer_requests_seen == 15
+			&& cl_normal_stop->peer_request_sent == peers
+			&& cl_normal_stop->peer_reply_sent == peers && cl_normal_stop->peer_reply_pending == 0
+			&& cluster_clean_leave_phase1_full_stop_nonce_fresh(
+				cl_normal_stop->peer_request_nonce[cluster_node_id], nonce)
+			&& cl_state->ack_bitmap[0] == peers
+			&& cl_state->phase1_post_stopped_reply_sent[0] == peers
+			&& cl_state->phase1_post_stopped_reply_pending[0] == 0;
+	if (valid) {
+		const uint8 *maps[] = { cl_state->ack_bitmap, cl_state->phase1_post_stopped_reply_sent,
+								cl_state->phase1_post_stopped_reply_pending };
+		for (unsigned i = 0; i < lengthof(maps); i++)
+			if (!cl_phase1_bytes_zero(maps[i] + 1, CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES - 1))
+				valid = false;
+		for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+			if (cl_normal_stop->member_incarnations[peer] == 0
+				|| cl_normal_stop->member_incarnations[peer] == UINT64_MAX)
+				valid = false;
+			if (peer == cluster_node_id) {
+				if (cl_state->phase1_release_request_nonce[peer] != 0)
+					valid = false;
+			} else if (!cluster_clean_leave_phase1_full_stop_nonce_fresh(
+						   cl_normal_stop->peer_request_nonce[peer],
+						   cl_state->phase1_release_request_nonce[peer]))
+				valid = false;
+		}
+	}
+	LWLockRelease(&cl_state->lock);
+	return valid;
+}
+
+static ClusterNormalStopPollResult
+cl_normal_stop_retire_pi(ClusterNormalStopModuleObservation *observation)
+{
+	BufferTag tag = { 0 };
+	int buffer = -1;
+	uint32 slot = PG_UINT32_MAX;
+	ClusterNormalStopPollResult result;
+
+	observation->module = "BUFMGR";
+	result = cluster_bufmgr_normal_stop_pi_retire(&tag, &buffer, &observation->reason);
+	if (result == CLUSTER_NORMAL_STOP_READY) {
+		observation->module = "PCM";
+		result = cluster_pcm_normal_stop_pi_retire(&tag, &slot, &observation->reason);
+	}
+	snprintf(observation->object, sizeof(observation->object),
+			 "tag=%u/%u/%u/%u/%u slot=%u buffer=%d", tag.spcOid, tag.dbOid, tag.relNumber,
+			 (unsigned)tag.forkNum, tag.blockNum, slot, buffer);
+	if (result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	return result;
+}
+
 ClusterNormalStopPollResult
 cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 							   ClusterNormalStopModuleObservation *observation)
@@ -2078,9 +2191,31 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 	LWLockRelease(&cl_state->lock);
 	if (!valid)
 		return CLUSTER_NORMAL_STOP_INVALID;
-	result = cluster_normal_stop_modules_poll(true, observation);
+	result = cl_normal_stop_modules_poll(true, armed, observation);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
+	if (!armed) {
+		bool idle;
+		/* Drain actors that could have accepted a pre-cut PI hint before
+		 * owner retirement. New hints now observe the immutable durable cut. */
+		observation->reason = "NORMAL_STOP_ALL_CHECKPOINTS_OR_ACTOR_CUT_PENDING";
+		if (!cluster_normal_stop_pi_retirement_allowed())
+			return CLUSTER_NORMAL_STOP_PENDING;
+		LWLockAcquire(&cl_state->lock, LW_SHARED);
+		idle = pg_atomic_read_u32(&cl_normal_stop->service_active_mask) == 0
+			   && pg_atomic_read_u32(&cl_normal_stop->service_idle_mask) == expected;
+		LWLockRelease(&cl_state->lock);
+		if (!idle)
+			return CLUSTER_NORMAL_STOP_PENDING;
+		result = cl_normal_stop_retire_pi(observation);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		/* Recheck actual identity and every original strict owner after the
+		 * mutation. A partial discard can never sign a final close. */
+		result = cluster_normal_stop_modules_poll(true, observation);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+	}
 	observation->module = "COORDINATOR";
 	observation->reason = armed ? "NORMAL_STOP_RELEASE_RECEIPT_OR_TRANSPORT_PENDING"
 								: "NORMAL_STOP_POST_BARRIER_PENDING";

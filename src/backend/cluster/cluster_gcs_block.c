@@ -22801,7 +22801,8 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	 * Off-epoch notes are dropped (fail-safe: the PI merely lingers).
 	 */
 	if (ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE) {
-		if (ack->epoch == cluster_epoch_get_current()) {
+		if (ack->epoch == cluster_epoch_get_current()
+			&& !cluster_normal_stop_pi_retirement_allowed()) {
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->pi_durable_note_apply_count, 1);
 			gcs_block_pi_discard_master_apply(ack->tag,
 											  GcsBlockInvalidateAckPayloadGetPageScn(ack));
@@ -22810,7 +22811,7 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	}
 	if (ack->ack_status == GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE) {
 		if (ack->epoch == cluster_epoch_get_current() && ack->sender_node >= 0
-			&& ack->sender_node < 32)
+			&& ack->sender_node < 32 && !cluster_normal_stop_pi_retirement_allowed())
 			cluster_pcm_lock_pi_holder_note(ack->tag, ack->sender_node);
 		return;
 	}

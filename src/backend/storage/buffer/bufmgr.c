@@ -344,9 +344,9 @@ cluster_bufmgr_stop_held_lock(LWLock *lock, LWLockMode mode, void *context)
 	*(bool *)context = true;
 }
 
-ClusterNormalStopPollResult
-cluster_bufmgr_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, int *buffer_id_out,
-								const char **reason_out)
+static ClusterNormalStopPollResult
+cluster_bufmgr_stop_poll(bool post_checkpoint, bool require_pi_retired, BufferTag *tag_out,
+						int *buffer_id_out, const char **reason_out)
 {
 	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
 	BufferTag observed = { 0 };
@@ -418,7 +418,7 @@ cluster_bufmgr_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, int *b
 				 * gate. Only a clean N remnant with no owner is mere cache. */
 				current = CLUSTER_NORMAL_STOP_PENDING;
 				current_reason = "BUFMGR_RETAINED_IMAGE";
-			} else if (post_checkpoint && is_pi && (state & BM_VALID) == 0) {
+			} else if (require_pi_retired && is_pi && (state & BM_VALID) == 0) {
 				/* Preserve the original ship shadow until the real DISCARD
 				 * consumer breaks this shape. No timestamp grants durability. */
 				current = CLUSTER_NORMAL_STOP_PENDING;
@@ -445,6 +445,21 @@ done:
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return result;
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_poll(bool post_checkpoint, BufferTag *tag_out, int *buffer_id_out,
+								const char **reason_out)
+{
+	return cluster_bufmgr_stop_poll(post_checkpoint, post_checkpoint, tag_out, buffer_id_out,
+								   reason_out);
+}
+
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_local_checkpoint_poll(BufferTag *tag_out, int *buffer_id_out,
+												   const char **reason_out)
+{
+	return cluster_bufmgr_stop_poll(true, false, tag_out, buffer_id_out, reason_out);
 }
 
 /* A normal D-h1 PI is !BM_VALID.  PCM-X retained-image transfer deliberately
@@ -17018,6 +17033,55 @@ cluster_bufmgr_discard_pi_block(BufferTag tag)
 	InvalidateBuffer(buf);		/* releases the header spinlock */
 
 	return true;
+}
+
+/* PGRAC: the checkpointer owns this finite all-member shutdown suffix.
+ * Polls themselves remain read-only; no online PI predicate is weakened. */
+ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_pi_retire(BufferTag *tag_out, int *buffer_id_out,
+									const char **reason_out)
+{
+	ClusterNormalStopPollResult result;
+	int i;
+
+	result = cluster_bufmgr_normal_stop_local_checkpoint_poll(tag_out, buffer_id_out, reason_out);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		return result;
+	if (!AmCheckpointerProcess() || !cluster_normal_stop_pi_retirement_allowed()) {
+		if (reason_out != NULL)
+			*reason_out = "BUFMGR_PI_RETIRE_WITHOUT_ALL_CHECKPOINTS";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	for (i = 0; i < NBuffers; i++) {
+		BufferDesc *buf = GetBufferDescriptor(i);
+		uint32 state = LockBufHdr(buf);
+		bool discard = buf->buffer_type == BUF_TYPE_PI && (state & BM_VALID) == 0;
+		BufferTag tag = buf->tag;
+		ClusterPcmOwnSnapshot own;
+
+		cluster_pcm_own_snapshot_post_state_locked(buf, state, &own);
+		if (discard && (BUF_STATE_GET_REFCOUNT(state) != 0
+			|| (state & (BM_IO_IN_PROGRESS | BM_PIN_COUNT_WAITER | BM_DIRTY | BM_IO_ERROR
+						 | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0
+			|| (state & BM_TAG_VALID) == 0 || own.pcm_state != PCM_STATE_N
+			|| own.flags != 0 || own.writer_activation_token != 0
+			|| own.resource_x_activation_generation != 0
+			|| cluster_pcm_own_delivery_attempt_get(i) != 0)) {
+			UnlockBufHdr(buf, state);
+			return cluster_bufmgr_normal_stop_poll(true, tag_out, buffer_id_out, reason_out);
+		}
+		UnlockBufHdr(buf, state);
+		if (discard && !cluster_bufmgr_discard_pi_block(tag)) {
+			if (tag_out != NULL)
+				*tag_out = tag;
+			if (buffer_id_out != NULL)
+				*buffer_id_out = i;
+			if (reason_out != NULL)
+				*reason_out = "BUFMGR_PI_DISCARD_REOBSERVE";
+			return CLUSTER_NORMAL_STOP_PENDING;
+		}
+	}
+	return cluster_bufmgr_normal_stop_poll(true, tag_out, buffer_id_out, reason_out);
 }
 
 /* ========================================================================

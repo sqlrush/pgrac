@@ -25,6 +25,8 @@ int cluster_lms_workers = 1;
 int cluster_injection_armed_count = 0;
 static bool admit_new_invalidate = true, invalidate_finishes = true, rx_frame_consumed;
 static unsigned invalidate_admissions, invalidate_attempts, discard_calls, misroutes;
+static bool pi_global_cut;
+static unsigned pi_hint_kept, pi_hint_durable;
 static void stop_fixture_invalidate_tick(void);
 
 void
@@ -109,6 +111,27 @@ stop_fixture_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 	return invalidate_finishes;
 }
 
+bool
+cluster_normal_stop_pi_retirement_allowed(void)
+{
+	Assert(held_count == 0);
+	return pi_global_cut;
+}
+
+static void
+stop_fixture_pi_kept(BufferTag tag, int32 sender)
+{
+	Assert(tag.relNumber == 99 && sender == 1);
+	pi_hint_kept++;
+}
+
+static void
+stop_fixture_pi_durable(BufferTag tag, SCN written)
+{
+	Assert(tag.relNumber == 99 && written == (SCN)0x5500);
+	pi_hint_durable++;
+}
+
 /* Verbatim actual handler and original park tick; only frame routing,
  * authenticated connection and holder/PI execution are boundary fixtures. */
 #define cluster_gcs_handle_block_invalidate_envelope stop_fixture_invalidate_handler
@@ -122,6 +145,21 @@ stop_fixture_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 #undef gcs_block_try_resource_x_frame
 #undef gcs_block_pcm_x_authenticated_session
 #undef gcs_block_invalidate_execute
+
+/* Original checksum/identity/epoch and both unsolicited PI branches.
+ * PCM application is the boundary (its real owner is tested separately). */
+#define cluster_gcs_handle_block_invalidate_ack_envelope stop_fixture_pi_ack_handler
+#define gcs_block_try_resource_x_frame stop_fixture_resource_x_frame
+#define gcs_block_pi_discard_master_apply stop_fixture_pi_durable
+#define cluster_pcm_lock_pi_holder_note stop_fixture_pi_kept
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-variable"
+#include "test_cluster_gcs_stop_pi_ack.inc"
+#pragma GCC diagnostic pop
+#undef cluster_gcs_handle_block_invalidate_ack_envelope
+#undef gcs_block_try_resource_x_frame
+#undef gcs_block_pi_discard_master_apply
+#undef cluster_pcm_lock_pi_holder_note
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -508,10 +546,48 @@ UT_TEST(test_invalidate_validation_and_pi_suffix_precede_new_work_seal)
 	UT_ASSERT_EQ(invalidate_admissions, 0);
 }
 
+UT_TEST(test_pi_hints_cannot_recreate_debt_after_global_checkpoint_cut)
+{
+	for (int kind = 0; kind < 2; kind++) {
+		GcsBlockInvalidateAckPayload ack = { .epoch = 77, .sender_node = 1 };
+		ClusterICEnvelope env = { .source_node_id = 1, .epoch = 77, .payload_length = sizeof(ack) };
+		reset_test();
+		pi_hint_kept = pi_hint_durable = 0;
+		pi_global_cut = false;
+		ack.tag.relNumber = 99;
+		ack.ack_status = kind ? GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_DURABLE_NOTE
+							  : GCS_BLOCK_INVALIDATE_ACK_STATUS_PI_KEPT_NOTE;
+		GcsBlockInvalidateAckPayloadSetPageScn(&ack, (SCN)0x5500);
+		ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
+		stop_fixture_pi_ack_handler(&env, &ack);
+		UT_ASSERT_EQ(pi_hint_kept + pi_hint_durable, 1);
+		pi_global_cut = true;
+		stop_fixture_pi_ack_handler(&env, &ack);
+		UT_ASSERT_EQ(pi_hint_kept + pi_hint_durable, 1);
+		/* No full proof: retain ordinary behavior, but never accept a bad
+		 * frame merely because the cut is absent. */
+		pi_global_cut = false;
+		ack.checksum++;
+		stop_fixture_pi_ack_handler(&env, &ack);
+		ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
+		env.source_node_id = 2;
+		stop_fixture_pi_ack_handler(&env, &ack);
+		env.source_node_id = 1;
+		ack.epoch = 76;
+		ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
+		stop_fixture_pi_ack_handler(&env, &ack);
+		UT_ASSERT_EQ(pi_hint_kept + pi_hint_durable, 1);
+		ack.epoch = 77;
+		ack.checksum = gcs_block_compute_invalidate_ack_checksum(&ack);
+		stop_fixture_pi_ack_handler(&env, &ack);
+		UT_ASSERT_EQ(pi_hint_kept + pi_hint_durable, 2);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
 	UT_RUN(test_uninitialized_is_not_empty);
 	UT_RUN(test_all_three_real_requester_domains_need_original_release);
 	UT_RUN(test_later_orphan_direct_target_is_invalid_not_empty);
@@ -521,6 +597,7 @@ main(void)
 	UT_RUN(test_parked_invalidate_owned_and_later_invalid_context_wins);
 	UT_RUN(test_sealed_invalidate_new_work_vs_exact_parked_completion);
 	UT_RUN(test_invalidate_validation_and_pi_suffix_precede_new_work_seal);
+	UT_RUN(test_pi_hints_cannot_recreate_debt_after_global_checkpoint_cut);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

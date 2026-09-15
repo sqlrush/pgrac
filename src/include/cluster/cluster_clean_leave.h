@@ -817,6 +817,23 @@ extern ClusterNormalStopPollResult cluster_pcm_normal_stop_poll(bool post_checkp
 																uint32 *slot_out,
 																const char **reason_out);
 
+/* PGRAC: normal all-member durable cut. These local-checkpoint observers
+ * retain PI; only the original owners below may retire it after the actual
+ * post-STOPPED exchange. No online SCN/discard rule is relaxed. */
+extern bool cluster_normal_stop_pi_retirement_allowed(void);
+extern ClusterNormalStopPollResult
+cluster_bufmgr_normal_stop_local_checkpoint_poll(struct buftag *tag_out, int *buffer_id_out,
+												 const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_pcm_normal_stop_local_checkpoint_poll(struct buftag *tag_out, uint32 *slot_out,
+											  const char **reason_out);
+extern ClusterNormalStopPollResult cluster_bufmgr_normal_stop_pi_retire(struct buftag *tag_out,
+																		int *buffer_id_out,
+																		const char **reason_out);
+extern ClusterNormalStopPollResult cluster_pcm_normal_stop_pi_retire(struct buftag *tag_out,
+																	 uint32 *slot_out,
+																	 const char **reason_out);
+
 /* ------------------------------------------------------------------
  * Voting-disk leave-marker two-phase commit (§2.5) — qvotec-mediated.
  *
