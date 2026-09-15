@@ -2044,6 +2044,7 @@ typedef struct UtR4HotProductFixture
 	int fetch_calls;
 	bool mutate_non_target_itl;
 	OffsetNumber mutate_hint_offset;
+	uint16 hint_mask;
 	int hint_changes;
 	bool mutate_hint_payload;
 	bool fail_first_after_mutation;
@@ -2444,7 +2445,8 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
 			HeapTupleHeader live_tuple = ut_r4_hot_tuple_at(
 				(Page) fixture->live_page, fixture->mutate_hint_offset);
 
-			live_tuple->t_infomask ^= HEAP_XMIN_COMMITTED;
+			live_tuple->t_infomask
+				^= fixture->hint_mask != 0 ? fixture->hint_mask : HEAP_XMIN_COMMITTED;
 			if (fixture->mutate_hint_payload)
 				((unsigned char *)live_tuple)[live_tuple->t_hoff] ^= 1;
 		}
@@ -3195,8 +3197,9 @@ UT_TEST(test_scratch_frozen_creation_keeps_data_and_context_negatives)
 
 /* Exercise the real FULL consumer, not a model of its page comparator. */
 static void
-ut_hot_full_hint_recheck_case(bool non_target, bool initially_committed,
-							bool invalid_xmin, bool payload_change)
+ut_hot_full_hint_mask_recheck_case(bool non_target, bool initially_committed, uint16 hint_mask,
+								   uint16 extra_mask, TransactionId hint_xmax, bool payload_change,
+								   bool semantic_change)
 {
 	UtR4HotProductFixture fixture;
 	HeapHotSearchResult result;
@@ -3208,10 +3211,10 @@ ut_hot_full_hint_recheck_case(bool non_target, bool initially_committed,
 	HeapTupleHeader hint_tuple;
 	HeapHotSearchResultKind kind = HEAP_HOT_SEARCH_NOT_FOUND;
 	volatile bool caught = false;
-	bool semantic_change = invalid_xmin || payload_change;
 
 	ut_r4_hot_init_product_fixture(&fixture, &result);
 	fixture.mutate_hint_offset = non_target ? UT_HOT_SUCCESSOR_OFF : UT_HOT_ROOT_OFF;
+	fixture.hint_mask = hint_mask;
 	fixture.hint_changes = semantic_change ? 1 : 2;
 	fixture.mutate_hint_payload = payload_change;
 	if (non_target)
@@ -3227,14 +3230,17 @@ ut_hot_full_hint_recheck_case(bool non_target, bool initially_committed,
 							UT_HOT_FULL_XMIN, 1, 0x42);
 	}
 	hint_tuple = ut_r4_hot_tuple_at((Page)fixture.live_page, fixture.mutate_hint_offset);
-	hint_tuple->t_infomask &= ~HEAP_XMIN_COMMITTED;
+	hint_tuple->t_infomask &= ~hint_mask;
+	if ((hint_mask & HEAP_XMAX_COMMITTED) != 0) {
+		HeapTupleHeaderSetXmax(hint_tuple, hint_xmax);
+		hint_tuple->t_infomask &= ~HEAP_XMAX_INVALID;
+	}
 	if (initially_committed)
-		hint_tuple->t_infomask |= HEAP_XMIN_COMMITTED;
-	if (invalid_xmin)
-		hint_tuple->t_infomask |= HEAP_XMIN_INVALID;
+		hint_tuple->t_infomask |= hint_mask;
+	hint_tuple->t_infomask |= extra_mask;
 	memcpy(expected_live.data, fixture.live_page, BLCKSZ);
 	hint_tuple = ut_r4_hot_tuple_at((Page)expected_live.data, fixture.mutate_hint_offset);
-	hint_tuple->t_infomask ^= HEAP_XMIN_COMMITTED;
+	hint_tuple->t_infomask ^= hint_mask;
 	if (payload_change)
 		((unsigned char *)hint_tuple)[hint_tuple->t_hoff] ^= 1;
 	ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
@@ -3279,6 +3285,15 @@ ut_hot_full_hint_recheck_case(bool non_target, bool initially_committed,
 	BufferBlocks = NULL;
 }
 
+static void
+ut_hot_full_hint_recheck_case(bool non_target, bool initially_committed, bool invalid_xmin,
+							  bool payload_change)
+{
+	ut_hot_full_hint_mask_recheck_case(non_target, initially_committed, HEAP_XMIN_COMMITTED,
+									   invalid_xmin ? HEAP_XMIN_INVALID : 0, InvalidTransactionId,
+									   payload_change, invalid_xmin || payload_change);
+}
+
 UT_TEST(test_real_hot_full_accepts_only_ordinary_xmin_hint_changes)
 {
 	ut_hot_full_hint_recheck_case(false, false, false, false);
@@ -3292,6 +3307,42 @@ UT_TEST(test_real_hot_full_retries_frozen_and_payload_changes_with_hint)
 	ut_hot_full_hint_recheck_case(true, false, true, false);
 	ut_hot_full_hint_recheck_case(true, true, true, false);
 	ut_hot_full_hint_recheck_case(true, true, false, true);
+}
+
+UT_TEST(test_real_hot_full_accepts_xmax_and_combined_commit_hints)
+{
+	int non_target;
+	int initially_committed;
+
+	for (non_target = 0; non_target <= 1; non_target++)
+		for (initially_committed = 0; initially_committed <= 1; initially_committed++) {
+			ut_hot_full_hint_mask_recheck_case(non_target, initially_committed, HEAP_XMAX_COMMITTED,
+											   0, 4380193, false, false);
+			ut_hot_full_hint_mask_recheck_case(non_target, initially_committed,
+											   HEAP_XMIN_COMMITTED | HEAP_XMAX_COMMITTED, 0,
+											   4380193, false, false);
+		}
+}
+
+UT_TEST(test_real_hot_full_retries_nonordinary_xmax_and_payload_changes)
+{
+	const uint16 rejected_masks[]
+		= { HEAP_XMAX_INVALID, HEAP_XMAX_IS_MULTI, HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK,
+			HEAP_XMAX_EXCL_LOCK };
+	Size i;
+
+	for (i = 0; i < lengthof(rejected_masks); i++)
+		ut_hot_full_hint_mask_recheck_case(true, true, HEAP_XMAX_COMMITTED, rejected_masks[i],
+										   4380193, false, true);
+	ut_hot_full_hint_mask_recheck_case(true, true, HEAP_XMAX_COMMITTED, 0, InvalidTransactionId,
+									   false, true);
+	ut_hot_full_hint_mask_recheck_case(true, true, HEAP_XMAX_COMMITTED, 0, FrozenTransactionId,
+									   false, true);
+	ut_hot_full_hint_mask_recheck_case(true, true, HEAP_XMAX_COMMITTED, 0, 4380193, true, true);
+	ut_hot_full_hint_mask_recheck_case(true, true, HEAP_XMIN_COMMITTED | HEAP_XMAX_COMMITTED,
+									   HEAP_XMIN_INVALID, 4380193, false, true);
+	ut_hot_full_hint_mask_recheck_case(true, true, HEAP_XMIN_COMMITTED | HEAP_XMAX_COMMITTED,
+									   HEAP_XMAX_INVALID, 4380193, false, true);
 }
 
 UT_TEST(test_real_hot_full_consumer_preserves_frozen_creator_without_slot)
@@ -6970,6 +7021,8 @@ main(void)
 	UT_RUN(test_real_hot_full_three_versions_select_creator_and_deleter_separately);
 	UT_RUN(test_real_hot_full_accepts_only_ordinary_xmin_hint_changes);
 	UT_RUN(test_real_hot_full_retries_frozen_and_payload_changes_with_hint);
+	UT_RUN(test_real_hot_full_accepts_xmax_and_combined_commit_hints);
+	UT_RUN(test_real_hot_full_retries_nonordinary_xmax_and_payload_changes);
 	UT_RUN(test_real_hot_full_consumer_preserves_frozen_creator_without_slot);
 	UT_RUN(test_full_post_snapshot_root_absence_is_not_found);
 	UT_RUN(test_full_unused_root_with_nonzero_storage_is_rejected);

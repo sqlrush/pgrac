@@ -4597,10 +4597,12 @@ heap_hot_r4_scratch_page_valid(Page page)
 }
 
 /*
- * A completed FULL image is not invalidated by a local xmin commit hint.
+ * A completed FULL image is not invalidated by ordinary commit hints.
  * Preserve the whole-page guard for everything else, including other tuples'
  * ITLs.  In particular, COMMITTED together with INVALID denotes frozen xmin,
- * not an ordinary hint.  Only the private comparison copy is normalized.
+ * not an ordinary hint.  Xmax must be a normal single updater, not a locker
+ * or MultiXact.  Only the private comparison copy is normalized; these bits
+ * never establish transaction status or replace the completed FULL verdict.
  */
 static bool
 heap_hot_r4_input_matches(Page saved, Page current)
@@ -4628,6 +4630,7 @@ heap_hot_r4_input_matches(Page saved, Page current)
 		OffsetNumber prior;
 		HeapTupleHeader before;
 		HeapTupleHeader after;
+		uint16 combined_mask;
 
 		if (!ItemIdHasStorage(item))
 			continue;
@@ -4655,10 +4658,16 @@ heap_hot_r4_input_matches(Page saved, Page current)
 		if (before->t_hoff < SizeofHeapTupleHeader || before->t_hoff > length
 			|| after->t_hoff < SizeofHeapTupleHeader || after->t_hoff > length)
 			return false;
+		combined_mask = before->t_infomask | after->t_infomask;
 		if (TransactionIdIsNormal(HeapTupleHeaderGetRawXmin(before))
-			&& ((before->t_infomask ^ after->t_infomask) == HEAP_XMIN_COMMITTED)
-			&& ((before->t_infomask | after->t_infomask) & HEAP_XMIN_INVALID) == 0)
-			after->t_infomask = before->t_infomask;
+			&& (combined_mask & HEAP_XMIN_INVALID) == 0)
+			after->t_infomask = (after->t_infomask & ~HEAP_XMIN_COMMITTED)
+								| (before->t_infomask & HEAP_XMIN_COMMITTED);
+		if (TransactionIdIsNormal(HeapTupleHeaderGetRawXmax(before))
+			&& (combined_mask & (HEAP_XMAX_INVALID | HEAP_XMAX_IS_MULTI)) == 0
+			&& !HEAP_XMAX_IS_LOCKED_ONLY(combined_mask))
+			after->t_infomask = (after->t_infomask & ~HEAP_XMAX_COMMITTED)
+								| (before->t_infomask & HEAP_XMAX_COMMITTED);
 	}
 	return memcmp(saved, normalized.data, BLCKSZ) == 0;
 }
