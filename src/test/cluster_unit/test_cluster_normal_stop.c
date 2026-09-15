@@ -709,6 +709,13 @@ seed_service_cut(void)
 					 CLUSTER_NORMAL_STOP_READY);
 	}
 	MyAuxProcType = CheckpointerProcess;
+	/* This helper isolates the real actor/leave-lock cut. The global proof
+	 * is an explicit input here; real envelope/coordinator tests below
+	 * independently prove that no missing peer can produce this input. */
+	pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+	cl_state->ack_bitmap[0] = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	cl_normal_stop->peer_reply_sent = cl_state->ack_bitmap[0];
+	cl_normal_stop->peer_reply_pending = 0;
 }
 
 UT_TEST(test_service_dispatch_and_seal_share_one_cut)
@@ -2729,7 +2736,7 @@ UT_TEST(test_front_ack_send_requires_controller_cut_not_just_early_request)
 		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
 		pg_atomic_write_u32(&cl_normal_stop->cleaner_quiesce_requested, fault == 0 ? 0 : 1);
 		pg_atomic_write_u32(&cl_normal_stop->cleaner_quiesced_mask, fault == 1 ? 127 : 255);
-		pg_atomic_write_u32(&cl_normal_stop->service_seal, fault == 2 ? 0 : 1);
+		pg_atomic_write_u32(&cl_normal_stop->service_seal, fault == 2 ? 1 : 0);
 		MyAuxProcType = LmonProcess;
 		cl_normal_stop_fronts_lmon_tick();
 		if (fault < 3) {
@@ -2910,6 +2917,83 @@ deliver_all_drain_acks(void)
 	MyAuxProcType = CheckpointerProcess;
 }
 
+UT_TEST(test_global_producer_cut_keeps_peer_cleaner_service_open_until_last_ack)
+{
+	ClusterNormalStopModuleObservation observation;
+	ClusterPhase1FullStopPlan plan;
+	uint64 nonce;
+	bool admitted;
+
+	seed_module_drain();
+	idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	park_and_idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+	nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	front_peer_ack(0, nonce, false);
+	front_peer_ack(1, nonce, false);
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 3);
+	UT_ASSERT_EQ(cl_normal_stop->peer_reply_sent, 11);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+	/* The remaining peer is still cleaning. This is the actual production
+	 * actor/new-work guard used by a NEW remote current admission, not a
+	 * fabricated duplicate or a replacement table-cleanup verdict. */
+	MyAuxProcType = LmsProcess;
+	UT_ASSERT(cluster_normal_stop_service_enter());
+	admitted = cluster_normal_stop_service_new_work(true);
+	UT_ASSERT(admitted);
+	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 3);
+	if (!admitted)
+		return;
+	UT_ASSERT(cluster_normal_stop_service_leave(true));
+	UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
+				 CLUSTER_NORMAL_STOP_READY);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(!plan.valid);
+	front_peer_ack(3, nonce, false);
+	cl_normal_stop_fronts_lmon_tick();
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(plan.valid);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 1);
+	MyAuxProcType = LmsProcess;
+	UT_ASSERT(cluster_normal_stop_service_enter());
+	UT_ASSERT(!cluster_normal_stop_service_new_work(true));
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_LATE_UNSEALED_WORK);
+}
+
+UT_TEST(test_data_seal_requires_complete_producer_ack_and_send_cut)
+{
+	for (int missing = 0; missing < 3; missing++) {
+		ClusterNormalStopModuleObservation observation;
+		ClusterPhase1FullStopPlan plan;
+		seed_module_drain();
+		idle_original_actors();
+		UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		park_and_idle_original_actors();
+		UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		deliver_all_drain_acks();
+		if (missing == 0)
+			cl_state->ack_bitmap[0] &= ~8;
+		else if (missing == 1)
+			cl_normal_stop->peer_reply_sent &= ~8;
+		else
+			cl_normal_stop->peer_reply_pending |= 8;
+		UT_ASSERT_EQ(cluster_normal_stop_service_seal(2047, 1), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	}
+}
+
 UT_TEST(test_checkpoint_cut_requires_each_owner_park_seal_send_and_ack)
 {
 	ClusterNormalStopModuleObservation observation;
@@ -2930,7 +3014,7 @@ UT_TEST(test_checkpoint_cut_requires_each_owner_park_seal_send_and_ack)
 	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
-	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
 	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(front_ack_sends, 0);
@@ -3024,17 +3108,43 @@ UT_TEST(test_checkpoint_seal_must_recheck_debt_created_after_pre_seal_census)
 	if (pg_atomic_read_u32(&cl_normal_stop->phase) != CLUSTER_NORMAL_STOP_QUIESCE)
 		return;
 	park_and_idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	deliver_all_drain_acks();
 	module_late_completed_debt = true;
 	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+	UT_ASSERT_EQ(front_ack_sends, 3);
+	UT_ASSERT(observation.module != NULL && strcmp(observation.module, "ACTIVE_WRITE") == 0);
+	module_results[0] = CLUSTER_NORMAL_STOP_READY;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_CHECKPOINT);
+}
+
+UT_TEST(test_producer_ack_rechecks_debt_after_last_cleaner_park)
+{
+	ClusterNormalStopModuleObservation observation;
+	ClusterPhase1FullStopPlan plan;
+	seed_module_drain();
+	idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	park_and_idle_original_actors();
+	module_late_completed_debt = true;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_QUIESCE);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
 	UT_ASSERT_EQ(front_ack_sends, 0);
 	UT_ASSERT(observation.module != NULL && strcmp(observation.module, "ACTIVE_WRITE") == 0);
 	module_results[0] = CLUSTER_NORMAL_STOP_READY;
 	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
 				 CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
 }
 
 static void
@@ -4266,11 +4376,14 @@ main(void)
 	UT_RUN(test_module_census_each_pending_retains_exact_cause_without_advancing);
 	UT_RUN(test_module_invalid_and_unknown_override_earlier_pending_and_stick);
 	UT_RUN(test_module_identity_final_recheck_refuses_changed_root_and_wrong_role);
+	UT_RUN(test_global_producer_cut_keeps_peer_cleaner_service_open_until_last_ack);
+	UT_RUN(test_data_seal_requires_complete_producer_ack_and_send_cut);
 	UT_RUN(test_checkpoint_cut_requires_each_owner_park_seal_send_and_ack);
 	UT_RUN(test_checkpoint_last_lock_cut_refuses_actor_started_after_module_poll);
 	UT_RUN(test_checkpoint_repolls_debt_after_ack_and_never_renews_deadline);
 	UT_RUN(test_checkpoint_cannot_park_cleaners_while_private_actor_has_not_signed_idle);
 	UT_RUN(test_checkpoint_seal_must_recheck_debt_created_after_pre_seal_census);
+	UT_RUN(test_producer_ack_rechecks_debt_after_last_cleaner_park);
 	UT_RUN(test_post_checkpoint_arm_uses_exact_stop_identity_and_one_fresh_nonce);
 	UT_RUN(test_post_checkpoint_arm_pending_preserves_predecessor_and_peer_ownership);
 	UT_RUN(test_pi_waits_for_all_checkpoints_not_before_checkpoint_exchange);

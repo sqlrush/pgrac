@@ -1329,7 +1329,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 
 	/* Send one existing ACTIVE request per peer. NOT_ADMITTED keeps its
 	 * original owner; DONE/WOULD_BLOCK transfers it to the existing transport.
-	 * This tick NEVER emits a drain ACK: only the later sealed DRAIN cut may. */
+	 * This initial request is not a producer-cut ACK. */
 	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
 		ClusterLeaveAnnouncePayload request;
 		ClusterICSendResult sent;
@@ -1386,8 +1386,9 @@ cl_normal_stop_fronts_lmon_tick(void)
 		LWLockRelease(&cl_state->lock);
 	}
 
-	/* The checkpointer alone advances to WAIT_DRAIN_ACK, after the full
-	 * module/cleaner/service seal. Earlier peer requests only set pending. */
+	/* The checkpointer alone advances after local owners drained and all
+	 * cleaners permanently parked. Services remain receptive until EVERY
+	 * producer has acknowledged: another peer may still need us to clean. */
 	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
 		ClusterLeaveAckPayload ack;
 		ClusterICSendResult sent;
@@ -1410,7 +1411,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 				|| cl_normal_stop->peer_requests_seen != 15
 				|| pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) != 1
 				|| pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask) != 255
-				|| pg_atomic_read_u32(&cl_normal_stop->service_seal) != 1 || nonce == 0
+				|| pg_atomic_read_u32(&cl_normal_stop->service_seal) != 0 || nonce == 0
 				|| nonce == UINT64_MAX || deadline == 0)
 				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
 		}
@@ -2576,8 +2577,13 @@ cl_normal_stop_checkpoint_state_locked(uint32 expected_services, uint32 phase, u
 		|| !cl_phase1_bytes_zero(cl_state->ack_bitmap + 1, sizeof(cl_state->ack_bitmap) - 1)
 		|| (pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask) & ~UINT32_C(255)) != 0
 		|| (phase == CLUSTER_NORMAL_STOP_DRAIN && seal != 0)
-		|| (phase == CLUSTER_NORMAL_STOP_QUIESCE && seal > 1)
-		|| (phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK && seal != 1)
+		|| (phase == CLUSTER_NORMAL_STOP_QUIESCE && seal != 0)
+		|| (phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK
+			&& (seal > 1
+				|| (seal == 1
+					&& (cl_state->ack_bitmap[0] != peer_bits
+						|| cl_normal_stop->peer_reply_sent != peer_bits
+						|| cl_normal_stop->peer_reply_pending != 0))))
 		|| (phase >= CLUSTER_NORMAL_STOP_QUIESCE
 			&& pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) != 1))
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
@@ -2651,16 +2657,26 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 		observation->reason = "NORMAL_STOP_AWAIT_EACH_OUTER_PASS_PARK";
 		return CLUSTER_NORMAL_STOP_PENDING;
 	}
-	if (phase == CLUSTER_NORMAL_STOP_QUIESCE) {
+	if (phase == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK) {
+		/* Local park is not a global producer cut. Keep the original service
+		 * admissions open while any peer's cleaner still needs remote work.
+		 * The seal owner itself requires the exact complete ACK/send set. */
 		result = cluster_normal_stop_service_seal(expected_services, 1);
 		if (result != CLUSTER_NORMAL_STOP_READY) {
 			observation->module = "SERVICE";
-			observation->reason = "NORMAL_STOP_AWAIT_OWNER_IDLE_CUT";
+			observation->reason = "NORMAL_STOP_AWAIT_ALL_PRODUCERS_OR_OWNER_IDLE_CUT";
 			return result;
 		}
 		/* Work admitted before seal 1 may have finished after the earlier
 		 * census and left shared debt despite a now-idle actor. The sealed
 		 * producer cut must precede the census that authorizes our ACK. */
+		result = cluster_normal_stop_modules_poll(false, observation);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+	} else if (phase == CLUSTER_NORMAL_STOP_QUIESCE) {
+		/* A cleaner's final pass or previously admitted service can complete
+		 * after the first census. Inspect again after observing every park;
+		 * this authorizes our producer ACK, never an early data seal. */
 		result = cluster_normal_stop_modules_poll(false, observation);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
@@ -2680,12 +2696,12 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 	if (!cl_normal_stop_checkpoint_state_locked(expected_services, phase, now))
 		result = CLUSTER_NORMAL_STOP_INVALID;
 	else if (pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask) == 255
-			 && pg_atomic_read_u32(&cl_normal_stop->service_seal) == 1
 			 && pg_atomic_read_u32(&cl_normal_stop->service_active_mask) == 0
 			 && pg_atomic_read_u32(&cl_normal_stop->service_idle_mask) == expected_services) {
 		if (phase == CLUSTER_NORMAL_STOP_QUIESCE)
 			pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
-		else if (cl_state->ack_bitmap[0] == peer_bits
+		else if (pg_atomic_read_u32(&cl_normal_stop->service_seal) == 1
+				 && cl_state->ack_bitmap[0] == peer_bits
 				 && cl_normal_stop->peer_reply_sent == peer_bits
 				 && cl_normal_stop->peer_reply_pending == 0) {
 			observed.valid = true;
@@ -3080,7 +3096,7 @@ cluster_normal_stop_service_seal(uint32 expected_services, uint32 next_seal)
 	seal = pg_atomic_read_u32(&cl_normal_stop->service_seal);
 	active = pg_atomic_read_u32(&cl_normal_stop->service_active_mask);
 	idle = pg_atomic_read_u32(&cl_normal_stop->service_idle_mask);
-	if ((next_seal == 1 && phase != CLUSTER_NORMAL_STOP_QUIESCE)
+	if ((next_seal == 1 && phase != CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK)
 		|| (next_seal == 2 && phase != CLUSTER_NORMAL_STOP_POST_STOPPED)
 		|| (seal != next_seal - 1 && seal != next_seal))
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
@@ -3091,6 +3107,10 @@ cluster_normal_stop_service_seal(uint32 expected_services, uint32 next_seal)
 	else if (pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
 			 && pg_atomic_read_u32(&cl_normal_stop->identity_published) == 1
 			 && cl_normal_stop->peer_requests_seen == 15
+			 && (next_seal != 1
+				 || (cl_state->ack_bitmap[0] == (UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id))
+					 && cl_normal_stop->peer_reply_sent == cl_state->ack_bitmap[0]
+					 && cl_normal_stop->peer_reply_pending == 0))
 			 && pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) == 1
 			 && pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask) == 255 && active == 0
 			 && idle == expected_services) {
