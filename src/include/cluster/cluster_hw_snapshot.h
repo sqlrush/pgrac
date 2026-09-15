@@ -48,72 +48,7 @@
 #include "cluster/cluster_grd.h" /* ClusterResId */
 #include "storage/block.h"		 /* BlockNumber */
 
-/*
- * On-disk envelope identity.  magic doubles as the byte-order / structural
- * gate (a foreign byte order or a torn header fails the magic check before any
- * CRC work), version guards the layout.
- */
-#define CLUSTER_HW_SNAPSHOT_MAGIC 0x48575350 /* 'HWSP' */
-#define CLUSTER_HW_SNAPSHOT_VERSION 1
-
-/*
- * ClusterHwSnapshotKind -- which trigger wrote this snapshot.  R12: kind is
- * the ONLY structural difference between a checkpoint and an adoption
- * snapshot; both use this same envelope and the same read path.
- */
-typedef enum ClusterHwSnapshotKind {
-	CLUSTER_HW_SNAPSHOT_CHECKPOINT = 0, /* CreateCheckPoint hook; snapshot_lsn = redo LSN */
-	CLUSTER_HW_SNAPSHOT_ADOPTION = 1,	/* online remaster; snapshot_lsn = rebuild-complete LSN */
-} ClusterHwSnapshotKind;
-
-/*
- * ClusterHwSnapshotValidity -- outcome of deserialize+validate.  Any non-VALID
- * outcome makes the recovery caller fail closed (53RA6): it must never
- * auto-create the authority at 0 or read FileSize from a snapshot it cannot
- * trust (spec-5.7 §3.1b R6).
- */
-typedef enum ClusterHwSnapshotValidity {
-	CLUSTER_HW_SNAPSHOT_VALID = 0,
-	CLUSTER_HW_SNAPSHOT_INVALID_SHORT,	  /* fewer bytes than the declared structure */
-	CLUSTER_HW_SNAPSHOT_INVALID_MAGIC,	  /* magic / version mismatch (corrupt or foreign) */
-	CLUSTER_HW_SNAPSHOT_INVALID_CRC,	  /* stored CRC != recomputed (torn / corrupt) */
-	CLUSTER_HW_SNAPSHOT_INVALID_IDENTITY, /* CRC ok but system_id/owner/shard mismatch */
-} ClusterHwSnapshotValidity;
-
-/*
- * ClusterHwSnapshotHeader -- the fixed 48-byte envelope header.  Field offsets
- * are chosen so the struct has NO internal padding (the two uint64 fields sit
- * at 8-aligned offsets 8 and 32), so a memcpy of a fully-initialised header is
- * a deterministic byte image -- a torn or padding-dependent CRC is impossible.
- *
- *	magic / version    structural + layout gate (R12 single envelope).
- *	system_id          ControlFileData.system_identifier of the owning cluster.
- *	owner_node_id      the shard master that wrote this snapshot.
- *	shard_partition    the shard / resid-partition identity this snapshot covers.
- *	snapshot_kind      CLUSTER_HW_SNAPSHOT_CHECKPOINT | _ADOPTION.
- *	generation         shard_master_generation: monotone across an owner's
- *	                   snapshots; a reader picks the identity-matching maximum
- *	                   generation as authoritative (R10).
- *	snapshot_lsn       checkpoint redo LSN, or adoption rebuild-complete LSN;
- *	                   the rebuild replays HW_RESERVE with lsn >= snapshot_lsn.
- *	n_entries          number of (resid, next_hwm) pairs that follow.
- *	reserved           must be 0 (CRC-covered; keeps the header 8-aligned).
- */
-typedef struct ClusterHwSnapshotHeader {
-	uint32 magic;			/* offset 0 */
-	uint32 version;			/* offset 4 */
-	uint64 system_id;		/* offset 8 */
-	uint32 owner_node_id;	/* offset 16 */
-	uint32 shard_partition; /* offset 20 */
-	uint32 snapshot_kind;	/* offset 24; ClusterHwSnapshotKind */
-	uint32 generation;		/* offset 28 */
-	uint64 snapshot_lsn;	/* offset 32 */
-	uint32 n_entries;		/* offset 40 */
-	uint32 reserved;		/* offset 44; must be 0 */
-} ClusterHwSnapshotHeader;
-
-StaticAssertDecl(sizeof(ClusterHwSnapshotHeader) == 48,
-				 "HW snapshot header on-disk ABI 48-byte lock (no padding)");
+#include "common/cluster_hw_snapshot_codec.h"
 
 /*
  * ClusterHwSnapshotEntry -- one (rel,fork) authority HWM.  16-byte resid +
@@ -128,9 +63,6 @@ typedef struct ClusterHwSnapshotEntry {
 StaticAssertDecl(sizeof(ClusterHwSnapshotEntry) == 20,
 				 "HW snapshot entry on-disk ABI 20-byte lock");
 
-#define CLUSTER_HW_SNAPSHOT_HEADER_SIZE 48
-#define CLUSTER_HW_SNAPSHOT_ENTRY_SIZE 20
-#define CLUSTER_HW_SNAPSHOT_CRC_SIZE 4
 
 /*
  * cluster_hw_snapshot_serialized_size -- on-disk byte count for n_entries:
@@ -248,19 +180,67 @@ cluster_hw_snapshot_read(uint32 owner_node_id, uint64 expected_sysid, uint32 exp
 						 uint32 expected_shard, ClusterHwSnapshotHeader *out_hdr,
 						 ClusterHwSnapshotEntry *entries_out, uint32 max_entries);
 
+/* Normal zero-redo startup does not use the recovery reader's compatibility
+ * mapping.  Neither a missing/short file nor a different checkpoint is an
+ * empty authority.  Outputs stay untouched unless the whole file is valid. */
+typedef enum ClusterHwSnapshotNormalReadResult {
+	CLUSTER_HW_NORMAL_READ_VALID = 0,
+	CLUSTER_HW_NORMAL_READ_MISSING,
+	CLUSTER_HW_NORMAL_READ_IO_ERROR,
+	CLUSTER_HW_NORMAL_READ_SHORT,
+	CLUSTER_HW_NORMAL_READ_MAGIC,
+	CLUSTER_HW_NORMAL_READ_CRC,
+	CLUSTER_HW_NORMAL_READ_IDENTITY,
+	CLUSTER_HW_NORMAL_READ_KIND,
+	CLUSTER_HW_NORMAL_READ_LSN,
+	CLUSTER_HW_NORMAL_READ_LENGTH,
+	CLUSTER_HW_NORMAL_READ_RESERVED,
+	CLUSTER_HW_NORMAL_READ_ARGUMENT
+} ClusterHwSnapshotNormalReadResult;
+
+extern ClusterHwSnapshotNormalReadResult
+cluster_hw_snapshot_normal_read(uint32 owner_node_id, uint64 expected_sysid,
+								XLogRecPtr expected_redo, ClusterHwSnapshotHeader *out_hdr,
+								ClusterHwSnapshotEntry *entries_out, uint32 max_entries);
+
 /*
- * cluster_hw_authority_active -- gate for the checkpoint write + recovery load:
+ * cluster_hw_authority_active -- gate for multi-node allocation + recovery load:
  * true only in a multi-node cluster with shared storage (where the HW authority
  * is engaged and a survivor must read a dead master's snapshot).  Single-node
- * is a no-op.  Defined in cluster_hw_shmem.c.
+ * allocation is a no-op. Normal seed metadata is maintained independently.
+ * Defined in cluster_hw_shmem.c.
  */
 extern bool cluster_hw_authority_active(void);
+
+/* Per-postmaster startup classification, never inferred from snapshot presence. */
+typedef enum ClusterHwColdBootMode {
+	CLUSTER_HW_BOOT_UNCLASSIFIED = 0,
+	CLUSTER_HW_BOOT_DISABLED,
+	CLUSTER_HW_BOOT_NORMAL_SELF,
+	CLUSTER_HW_BOOT_EXISTING_RECOVERY
+} ClusterHwColdBootMode;
+
+typedef enum ClusterHwColdBootState {
+	CLUSTER_HW_COLD = 0,
+	CLUSTER_HW_LOADING,
+	CLUSTER_HW_REBUILT,
+	CLUSTER_HW_READY,
+	CLUSTER_HW_FAILED
+} ClusterHwColdBootState;
+
+extern bool cluster_hw_metadata_configured(void);
+extern ClusterHwColdBootMode cluster_hw_cold_boot_mode(void);
+extern ClusterHwColdBootState cluster_hw_cold_boot_state(void);
+extern bool cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown,
+									   XLogRecPtr own_redo, const char **failure_out);
+extern bool cluster_hw_startup_complete(const char **failure_out);
 
 /*
  * cluster_hw_snapshot_checkpoint_write -- persist this node's authority HWM
  * table bound to a checkpoint (snapshot_lsn = redo_lsn).  Hooked into
- * CreateCheckPoint before the checkpoint record, gated on
- * cluster_hw_authority_active().  Defined in cluster_hw_shmem.c.
+ * CreateCheckPoint before the checkpoint record. Normal metadata needs
+ * REBUILT/READY; existing recovery retains its original active gate.
+ * Defined in cluster_hw_shmem.c.
  */
 extern void cluster_hw_snapshot_checkpoint_write(XLogRecPtr redo_lsn);
 

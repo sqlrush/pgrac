@@ -34,12 +34,14 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "cluster/cluster_guc.h" /* cluster_shared_data_dir */
 #include "cluster/cluster_hw_snapshot.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+#include "utils/memutils.h"
 
 /*
  * Per-master snapshot lives under the shared data dir, beside the shared
@@ -49,106 +51,25 @@
 #define CLUSTER_HW_SNAPSHOT_REL_DIR "global"
 #define CLUSTER_HW_SNAPSHOT_BASENAME "pg_hw_snapshot"
 
-/*
- * cluster_hw_snapshot_serialized_size -- header (48) + 20*n entries + crc (4).
- */
+/* Typed backend adapters share the frontend-safe v1 codec. */
 size_t
 cluster_hw_snapshot_serialized_size(uint32 n_entries)
 {
-	return (size_t)CLUSTER_HW_SNAPSHOT_HEADER_SIZE
-		   + (size_t)n_entries * CLUSTER_HW_SNAPSHOT_ENTRY_SIZE + CLUSTER_HW_SNAPSHOT_CRC_SIZE;
+	return cluster_hw_snapshot_codec_size(n_entries);
 }
 
-/*
- * cluster_hw_snapshot_serialize -- lay the header, then the n_entries 20-byte
- * (resid, next_hwm) pairs, then a trailing CRC32C over everything before it.
- *
- *	The header struct and the entry struct have no padding (StaticAssert'd
- *	48 / 20), so a fully-initialised input serialises to a deterministic byte
- *	image -- the CRC cannot depend on uninitialised padding.
- */
 size_t
 cluster_hw_snapshot_serialize(const ClusterHwSnapshotHeader *hdr,
 							  const ClusterHwSnapshotEntry *entries, char *buf, size_t buflen)
 {
-	size_t required;
-	size_t crc_offset;
-	pg_crc32c crc;
-
-	Assert(hdr != NULL && buf != NULL);
-	Assert(hdr->n_entries == 0 || entries != NULL);
-
-	required = cluster_hw_snapshot_serialized_size(hdr->n_entries);
-	if (buflen < required)
-		return 0;
-
-	memcpy(buf, hdr, CLUSTER_HW_SNAPSHOT_HEADER_SIZE);
-	if (hdr->n_entries > 0)
-		memcpy(buf + CLUSTER_HW_SNAPSHOT_HEADER_SIZE, entries,
-			   (size_t)hdr->n_entries * CLUSTER_HW_SNAPSHOT_ENTRY_SIZE);
-
-	crc_offset = required - CLUSTER_HW_SNAPSHOT_CRC_SIZE;
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, buf, crc_offset);
-	FIN_CRC32C(crc);
-	memcpy(buf + crc_offset, &crc, CLUSTER_HW_SNAPSHOT_CRC_SIZE);
-
-	return required;
+	return cluster_hw_snapshot_codec_serialize(hdr, entries, buf, buflen);
 }
 
-/*
- * cluster_hw_snapshot_deserialize -- validate then load.
- *
- *	Validation order is structural before cryptographic: a buffer too short to
- *	hold even an empty envelope, or a wrong magic/version, is rejected before
- *	any CRC work (a foreign byte order shows up as a wrong magic).  A declared
- *	entry count larger than the caller's capacity fails closed (R6) rather than
- *	silently truncating the authority.  Only once the structure checks out is
- *	the CRC recomputed and compared.
- */
 ClusterHwSnapshotValidity
 cluster_hw_snapshot_deserialize(const char *buf, size_t len, ClusterHwSnapshotHeader *hdr_out,
 								ClusterHwSnapshotEntry *entries_out, uint32 max_entries)
 {
-	ClusterHwSnapshotHeader hdr;
-	size_t required;
-	size_t crc_offset;
-	pg_crc32c crc;
-	pg_crc32c stored;
-
-	Assert(hdr_out != NULL);
-
-	/* Need at least an empty envelope: header + trailing CRC. */
-	if (buf == NULL || len < (size_t)CLUSTER_HW_SNAPSHOT_HEADER_SIZE + CLUSTER_HW_SNAPSHOT_CRC_SIZE)
-		return CLUSTER_HW_SNAPSHOT_INVALID_SHORT;
-
-	memcpy(&hdr, buf, CLUSTER_HW_SNAPSHOT_HEADER_SIZE);
-
-	if (hdr.magic != CLUSTER_HW_SNAPSHOT_MAGIC || hdr.version != CLUSTER_HW_SNAPSHOT_VERSION)
-		return CLUSTER_HW_SNAPSHOT_INVALID_MAGIC;
-
-	/* Fail closed if the caller cannot hold the declared entries (R6). */
-	if (hdr.n_entries > max_entries)
-		return CLUSTER_HW_SNAPSHOT_INVALID_SHORT;
-
-	required = cluster_hw_snapshot_serialized_size(hdr.n_entries);
-	if (len < required)
-		return CLUSTER_HW_SNAPSHOT_INVALID_SHORT;
-
-	crc_offset = required - CLUSTER_HW_SNAPSHOT_CRC_SIZE;
-	INIT_CRC32C(crc);
-	COMP_CRC32C(crc, buf, crc_offset);
-	FIN_CRC32C(crc);
-	memcpy(&stored, buf + crc_offset, CLUSTER_HW_SNAPSHOT_CRC_SIZE);
-	if (!EQ_CRC32C(crc, stored))
-		return CLUSTER_HW_SNAPSHOT_INVALID_CRC;
-
-	*hdr_out = hdr;
-	if (hdr.n_entries > 0 && entries_out != NULL)
-		memcpy(entries_out, buf + CLUSTER_HW_SNAPSHOT_HEADER_SIZE,
-			   (size_t)hdr.n_entries * CLUSTER_HW_SNAPSHOT_ENTRY_SIZE);
-
-	return CLUSTER_HW_SNAPSHOT_VALID;
+	return cluster_hw_snapshot_codec_deserialize(buf, len, hdr_out, entries_out, max_entries);
 }
 
 /*
@@ -368,4 +289,113 @@ cluster_hw_snapshot_read(uint32 owner_node_id, uint64 expected_sysid, uint32 exp
 		return CLUSTER_HW_SNAPSHOT_INVALID_IDENTITY;
 
 	return CLUSTER_HW_SNAPSHOT_VALID;
+}
+
+ClusterHwSnapshotNormalReadResult
+cluster_hw_snapshot_normal_read(uint32 owner_node_id, uint64 expected_sysid,
+								XLogRecPtr expected_redo, ClusterHwSnapshotHeader *out_hdr,
+								ClusterHwSnapshotEntry *entries_out, uint32 max_entries)
+{
+	ClusterHwSnapshotNormalReadResult result = CLUSTER_HW_NORMAL_READ_VALID;
+	ClusterHwSnapshotValidity validity;
+	ClusterHwSnapshotHeader hdr;
+	struct stat st;
+	char path[MAXPGPATH];
+	char *buf = NULL;
+	char extra;
+	size_t length = 0;
+	size_t consumed = 0;
+	ssize_t nread;
+	int pathlen;
+	int fd;
+
+	if (owner_node_id >= CLUSTER_MAX_NODES || expected_sysid == 0
+		|| XLogRecPtrIsInvalid(expected_redo) || out_hdr == NULL
+		|| (max_entries > 0 && entries_out == NULL)
+		|| max_entries
+			   > (MaxAllocSize - CLUSTER_HW_SNAPSHOT_HEADER_SIZE - CLUSTER_HW_SNAPSHOT_CRC_SIZE)
+					 / CLUSTER_HW_SNAPSHOT_ENTRY_SIZE
+		|| cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		return CLUSTER_HW_NORMAL_READ_ARGUMENT;
+
+	pathlen = snprintf(path, sizeof(path), "%s/%s/%s.%u", cluster_shared_data_dir,
+					   CLUSTER_HW_SNAPSHOT_REL_DIR, CLUSTER_HW_SNAPSHOT_BASENAME, owner_node_id);
+	if (pathlen < 0 || pathlen >= sizeof(path))
+		return CLUSTER_HW_NORMAL_READ_ARGUMENT;
+
+	/* A special file must not turn normal startup into an unbounded open/read. */
+	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY | O_NONBLOCK);
+	if (fd < 0)
+		return errno == ENOENT ? CLUSTER_HW_NORMAL_READ_MISSING : CLUSTER_HW_NORMAL_READ_IO_ERROR;
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode))
+		result = CLUSTER_HW_NORMAL_READ_IO_ERROR;
+	else if (st.st_size < cluster_hw_snapshot_serialized_size(0)
+			 || (uint64)st.st_size > cluster_hw_snapshot_serialized_size(max_entries))
+		result = CLUSTER_HW_NORMAL_READ_SHORT;
+	else {
+		length = (size_t)st.st_size;
+		buf = palloc(length);
+		while (consumed < length) {
+			nread = read(fd, buf + consumed, length - consumed);
+			if (nread < 0 && errno == EINTR)
+				continue;
+			if (nread <= 0) {
+				result = nread < 0 ? CLUSTER_HW_NORMAL_READ_IO_ERROR : CLUSTER_HW_NORMAL_READ_SHORT;
+				break;
+			}
+			consumed += (size_t)nread;
+		}
+		/* Published snapshots are immutable.  Reject growth after fstat too. */
+		if (result == CLUSTER_HW_NORMAL_READ_VALID) {
+			do {
+				nread = read(fd, &extra, 1);
+			} while (nread < 0 && errno == EINTR);
+			if (nread != 0)
+				result
+					= nread < 0 ? CLUSTER_HW_NORMAL_READ_IO_ERROR : CLUSTER_HW_NORMAL_READ_LENGTH;
+		}
+	}
+	if (CloseTransientFile(fd) != 0)
+		result = CLUSTER_HW_NORMAL_READ_IO_ERROR;
+	if (result != CLUSTER_HW_NORMAL_READ_VALID)
+		goto done;
+
+	/* Decode privately: even valid CRC bytes are not authority before all gates. */
+	validity = cluster_hw_snapshot_deserialize(buf, length, &hdr, NULL, max_entries);
+	switch (validity) {
+	case CLUSTER_HW_SNAPSHOT_VALID:
+		break;
+	case CLUSTER_HW_SNAPSHOT_INVALID_MAGIC:
+		result = CLUSTER_HW_NORMAL_READ_MAGIC;
+		break;
+	case CLUSTER_HW_SNAPSHOT_INVALID_CRC:
+		result = CLUSTER_HW_NORMAL_READ_CRC;
+		break;
+	default:
+		result = CLUSTER_HW_NORMAL_READ_SHORT;
+		break;
+	}
+	if (result != CLUSTER_HW_NORMAL_READ_VALID)
+		goto done;
+	if (length != cluster_hw_snapshot_serialized_size(hdr.n_entries))
+		result = CLUSTER_HW_NORMAL_READ_LENGTH;
+	else if (!cluster_hw_snapshot_identity_ok(&hdr, expected_sysid, owner_node_id, owner_node_id))
+		result = CLUSTER_HW_NORMAL_READ_IDENTITY;
+	else if (hdr.snapshot_kind != CLUSTER_HW_SNAPSHOT_CHECKPOINT)
+		result = CLUSTER_HW_NORMAL_READ_KIND;
+	else if (hdr.reserved != 0)
+		result = CLUSTER_HW_NORMAL_READ_RESERVED;
+	else if (hdr.snapshot_lsn != expected_redo)
+		result = CLUSTER_HW_NORMAL_READ_LSN;
+	if (result != CLUSTER_HW_NORMAL_READ_VALID)
+		goto done;
+
+	if (hdr.n_entries > 0)
+		memcpy(entries_out, buf + CLUSTER_HW_SNAPSHOT_HEADER_SIZE,
+			   (size_t)hdr.n_entries * CLUSTER_HW_SNAPSHOT_ENTRY_SIZE);
+	*out_hdr = hdr;
+done:
+	if (buf != NULL)
+		pfree(buf);
+	return result;
 }

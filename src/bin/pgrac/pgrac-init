@@ -142,7 +142,9 @@ locate_pg_tool() {
 # --force.
 set_postgresql_conf_value() {
     local conf="$1" key="$2" value="$3"
-    local key_re="${key//./\\.}"
+    # A literal-dot bracket survives both ERE parsing and awk -v assignment
+    # (gawk consumes an unrecognized backslash escape before regex parsing).
+    local key_re="${key//./[.]}"
     # Only UNcommented lines count as an existing setting.  The shipped
     # postgresql.conf.sample carries commented documentation anchors
     # (e.g. "#cluster.node_id = -1"); treating those as a live value
@@ -208,7 +210,7 @@ EOF
 # Prints nothing when the key is not set.
 get_postgresql_conf_value() {
     local conf="$1" key="$2"
-    local key_re="${key//./\\.}"
+    local key_re="${key//./[.]}"
     local pattern="^[[:space:]]*${key_re}[[:space:]]*="
     # "|| true": an unset key is an empty result, not an errexit death
     # (grep exits 1 on no match and pipefail propagates it).
@@ -613,6 +615,36 @@ if [ "$MODE_SEED" = "yes" ] && [ ! -f "$TARGET_PGDATA/PG_VERSION" ] \
     die "shared tree \"$SHARED_DATA_DIR\" already carries a catalog authority; a fresh initdb can never match it (use --cluster-join to attach an additional node)"
 fi
 
+# The wrapper owns the seed identity and paths.  In particular, an option
+# terminator must not hide the explicit HW producer arguments below.
+if [ "$MODE_SEED" = "yes" ]; then
+    # shellcheck disable=SC2086 # same deliberate splitting as the invocation
+    for INITDB_OPT in $INITDB_OPTS; do
+        case "$INITDB_OPT" in
+            -D*|--pgd*|\
+                --pgrac-hw-snapshot-root|--pgrac-hw-snapshot-root=*|\
+                --pgrac-hw-snapshot-owner|--pgrac-hw-snapshot-owner=*|--)
+                die "--initdb-options cannot override managed seed paths or HW identity"
+                ;;
+        esac
+        # getopt accepts clustered short options. Stop at an option taking
+        # an argument, so e.g. -capplication_name=VALID is not a hidden -D.
+        case "$INITDB_OPT" in
+            --*) ;;
+            -*)
+                INITDB_SHORT_FLAGS=${INITDB_OPT#-}
+                while [ -n "$INITDB_SHORT_FLAGS" ]; do
+                    case "$INITDB_SHORT_FLAGS" in
+                        D*) die "--initdb-options cannot override managed seed PGDATA" ;;
+                        [dgknNsSW]*) INITDB_SHORT_FLAGS=${INITDB_SHORT_FLAGS#?} ;;
+                        *) break ;;
+                    esac
+                done
+                ;;
+        esac
+    done
+fi
+
 # ---- Step 0: per-thread WAL layout (spec-4.1) -------------------------
 #
 # thread_id = node_id + 1 (0 is the permanent legacy sentinel and never
@@ -705,13 +737,25 @@ if [ -d "$TARGET_PGDATA" ] && [ -n "$(ls -A "$TARGET_PGDATA" 2>/dev/null)" ]; th
     fi
 else
     echo "$PROGNAME: running initdb -D \"$TARGET_PGDATA\""
+    HW_INITDB_ARGS=()
+    if [ "$MODE_SEED" = "yes" ]; then
+        # initdb owns the exclusive global/ creation and all snapshot bytes.
+        # Its canonical/empty/nonoverlap checks apply before any PGDATA write.
+        if [ ! -e "$SHARED_DATA_DIR" ] && [ ! -L "$SHARED_DATA_DIR" ]; then
+            mkdir "$SHARED_DATA_DIR" || die "could not create \"$SHARED_DATA_DIR\""
+        fi
+        HW_INITDB_ARGS=("--pgrac-hw-snapshot-root=$SHARED_DATA_DIR"
+                       "--pgrac-hw-snapshot-owner=$NODE_ID")
+    fi
     if [ -n "$WAL_THREADS_DIR" ]; then
         # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
         "$INITDB" $INITDB_OPTS -D "$TARGET_PGDATA" -X "$THREAD_DIR" \
-            "--pgrac-wal-state-root=$WAL_THREADS_DIR"
+            "--pgrac-wal-state-root=$WAL_THREADS_DIR" \
+            ${HW_INITDB_ARGS[@]+"${HW_INITDB_ARGS[@]}"}
     else
         # shellcheck disable=SC2086 # INITDB_OPTS intentionally word-split
-        "$INITDB" -D "$TARGET_PGDATA" $INITDB_OPTS
+        "$INITDB" $INITDB_OPTS -D "$TARGET_PGDATA" \
+            ${HW_INITDB_ARGS[@]+"${HW_INITDB_ARGS[@]}"}
     fi
 fi
 
@@ -735,8 +779,6 @@ fi
 # and publishes the authorities, postmaster-once and idempotent.
 
 if [ "$MODE_SEED" = "yes" ]; then
-    mkdir -p "$SHARED_DATA_DIR/global" \
-        || die "could not create \"$SHARED_DATA_DIR/global\""
     append_shared_catalog_gucs "$PG_CONF" "$SHARED_DATA_DIR"
 fi
 

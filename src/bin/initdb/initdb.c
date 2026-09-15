@@ -70,9 +70,12 @@
 #include "catalog/pg_collation_d.h"
 #include "catalog/pg_database_d.h"	/* pgrminclude ignore */
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/catversion.h"
 #include "cluster/cluster_undo_segment.h"   /* UNDO_SEGMENT_SIZE_BYTES */
 #include "cluster/cluster_undo_segment_init.h"  /* seed segment helper */
 #include "cluster/cluster_wal_state.h"
+#include "common/cluster_hw_snapshot_codec.h"
+#include "common/controldata_utils.h"
 #include "datatype/timestamp.h"
 #endif
 #include "common/file_perm.h"
@@ -171,6 +174,15 @@ static bool data_checksums = false;
 static char *xlog_dir = NULL;
 #ifdef USE_PGRAC_CLUSTER
 static char *pgrac_wal_state_root = NULL;
+static char *pgrac_hw_snapshot_root = NULL;
+static int pgrac_hw_snapshot_owner = -1;
+static int pgrac_hw_root_fd = -1;
+static int pgrac_hw_global_fd = -1;
+static int pgrac_hw_pgdata_fd = -1;
+static char *pgrac_hw_pgdata_path = NULL;
+static int pgrac_hw_wal_fd = -1;
+static char *pgrac_hw_wal_path = NULL;
+static void pgrac_hw_bind_creation(void);
 #endif
 static char *str_wal_segment_size_mb = NULL;
 static int	wal_segment_size_mb;
@@ -781,6 +793,16 @@ cleanup_directories_atexit(void)
 {
 	if (success)
 		return;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* A failed explicit creation is evidence, never a license to erase a root. */
+	if (pgrac_hw_snapshot_root != NULL) {
+		if (made_new_pgdata || found_existing_pgdata || made_new_xlogdir || found_existing_xlogdir)
+			pg_log_info(
+				"incomplete cluster HW creation retained with PGDATA and WAL for inspection");
+		return;
+	}
+#endif
 
 	if (!noclean)
 	{
@@ -2530,6 +2552,10 @@ usage(const char *progname)
 #ifdef USE_PGRAC_CLUSTER
 	printf(_("      --pgrac-wal-state-root=DIR\n"
 			 "                            pgrac-init WAL registry handoff\n"));
+	printf(_("      --pgrac-hw-snapshot-root=DIR\n"
+			 "                            empty canonical shared root for a new seed\n"
+			 "      --pgrac-hw-snapshot-owner=N\n"
+			 "                            seed owner 0..127 (requires root and sync)\n"));
 #endif
 	printf(_("\nLess commonly used options:\n"));
 	printf(_("  -c, --set NAME=VALUE      override default setting for server parameter\n"));
@@ -3046,6 +3072,11 @@ initialize_data_directory(void)
 
 	create_xlog_or_symlink();
 
+#ifdef USE_PGRAC_CLUSTER
+	if (pgrac_hw_snapshot_root != NULL)
+		pgrac_hw_bind_creation();
+#endif
+
 	/* Create required subdirectories (other than pg_wal) */
 	printf(_("creating subdirectories ... "));
 	fflush(stdout);
@@ -3211,6 +3242,355 @@ initialize_data_directory(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+
+/* The frontend options never become bootstrap cluster GUCs. */
+static void
+pgrac_hw_validate_options(void)
+{
+	static const char *const managed[] = { "data_directory",
+										   "config_file",
+										   "hba_file",
+										   "ident_file",
+										   "external_pid_file",
+										   "shared_preload_libraries",
+										   "session_preload_libraries",
+										   "local_preload_libraries",
+										   "dynamic_library_path",
+										   NULL };
+	_stringlist *item;
+
+	if (pgrac_hw_snapshot_root == NULL && pgrac_hw_snapshot_owner < 0)
+		return;
+	if (pgrac_hw_snapshot_root == NULL || pgrac_hw_snapshot_owner < 0)
+		pg_fatal("HW_OPTIONS_PAIRED: snapshot root and owner must be specified together");
+	if (!do_sync || sync_only)
+		pg_fatal("HW_SYNC_REQUIRED: new HW metadata requires full initdb and sync");
+	if (share_path != NULL)
+		pg_fatal("HW_UNSAFE_OVERRIDE: input directory override is not allowed for an HW seed");
+	for (item = extra_guc_names; item != NULL; item = item->next) {
+		const char *name = item->str;
+		/* These names are also consumed by a shell and the config lexer. */
+		if (name[0] == '\0'
+			|| strspn(name, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.")
+				   != strlen(name)
+			|| (name[0] >= '0' && name[0] <= '9') || name[0] == '.')
+			pg_fatal("HW_UNSAFE_OVERRIDE: noncanonical parameter name is not allowed during seed "
+					 "creation");
+		if (pg_strncasecmp(item->str, "cluster.", 8) == 0)
+			pg_fatal(
+				"HW_UNSAFE_OVERRIDE: cluster parameter \"%s\" is not allowed during seed creation",
+				item->str);
+		for (int i = 0; managed[i] != NULL; i++)
+			if (pg_strcasecmp(item->str, managed[i]) == 0)
+				pg_fatal(
+					"HW_UNSAFE_OVERRIDE: managed path or preload parameter \"%s\" is not allowed",
+					item->str);
+	}
+}
+
+/* Resolve a not-yet-created target through its existing parent, including aliases. */
+static char *
+pgrac_hw_resolve_target(const char *path)
+{
+	char *absolute = make_absolute_path(path);
+	char prefix[MAXPGPATH];
+	char *resolved;
+	char *result;
+
+	if (absolute == NULL || strlen(absolute) >= sizeof(prefix))
+		pg_fatal("HW_ROOT_CANONICAL: invalid or overlong target path");
+	strlcpy(prefix, absolute, sizeof(prefix));
+	while ((resolved = realpath(prefix, NULL)) == NULL) {
+		size_t old_len = strlen(prefix);
+		if (errno != ENOENT)
+			pg_fatal("HW_ROOT_CANONICAL: cannot resolve target \"%s\": %m", path);
+		get_parent_directory(prefix);
+		if (prefix[0] == '\0' || strlen(prefix) == old_len)
+			pg_fatal("HW_ROOT_CANONICAL: no existing parent for \"%s\"", path);
+	}
+	result = psprintf("%s%s", resolved, absolute + strlen(prefix));
+	free(resolved);
+	free(absolute);
+	if (strlen(result) >= MAXPGPATH)
+		pg_fatal("HW_ROOT_CANONICAL: resolved target is too long");
+	return result;
+}
+
+static bool
+pgrac_hw_path_contains(const char *parent, const char *child)
+{
+	size_t n = strlen(parent);
+	return strcmp(parent, child) == 0
+		   || (strncmp(parent, child, n) == 0 && (parent[n - 1] == '/' || child[n] == '/'));
+}
+
+/* Every enumeration uses the already opened directory, not a replacement path. */
+static void
+pgrac_hw_check_entries(int fd, const char *allowed)
+{
+	DIR *dir;
+	struct dirent *entry;
+	int copy = dup(fd);
+
+	if (copy < 0 || (dir = fdopendir(copy)) == NULL)
+		pg_fatal("HW_ROOT_IO: cannot enumerate shared directory: %m");
+	rewinddir(dir);
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0
+			&& (allowed == NULL || strcmp(entry->d_name, allowed) != 0))
+			pg_fatal("HW_ROOT_NOT_EMPTY: unexpected shared directory entry \"%s\"", entry->d_name);
+	}
+	if (errno != 0)
+		pg_fatal("HW_ROOT_IO: cannot read shared directory: %m");
+	if (closedir(dir) != 0)
+		pg_fatal("HW_ROOT_IO: cannot close shared directory: %m");
+}
+
+static void
+pgrac_hw_check_path_fd(const char *path, int fd)
+{
+	struct stat held, named;
+	char *resolved = realpath(path, NULL);
+
+	if (resolved == NULL || strcmp(resolved, path) != 0 || fstat(fd, &held) != 0
+		|| lstat(path, &named) != 0 || !S_ISDIR(held.st_mode) || !S_ISDIR(named.st_mode)
+		|| held.st_dev != named.st_dev || held.st_ino != named.st_ino)
+		pg_fatal("HW_ROOT_IDENTITY: directory identity changed for \"%s\"", path);
+	free(resolved);
+}
+
+static void
+pgrac_hw_check_bound_directories(void)
+{
+	struct stat held, named;
+
+	pgrac_hw_check_path_fd(pgrac_hw_snapshot_root, pgrac_hw_root_fd);
+	pgrac_hw_check_path_fd(pgrac_hw_pgdata_path, pgrac_hw_pgdata_fd);
+	if (fstat(pgrac_hw_global_fd, &held) != 0
+		|| fstatat(pgrac_hw_root_fd, "global", &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| !S_ISDIR(held.st_mode) || !S_ISDIR(named.st_mode) || held.st_dev != named.st_dev
+		|| held.st_ino != named.st_ino)
+		pg_fatal("HW_ROOT_IDENTITY: shared global directory was replaced");
+	if (xlog_dir != NULL) {
+		char *link = psprintf("%s/pg_wal", pgrac_hw_pgdata_path);
+		char *resolved = realpath(link, NULL);
+		pgrac_hw_check_path_fd(pgrac_hw_wal_path, pgrac_hw_wal_fd);
+		if (resolved == NULL || strcmp(resolved, pgrac_hw_wal_path) != 0 || lstat(link, &named) != 0
+			|| !S_ISLNK(named.st_mode))
+			pg_fatal("HW_ROOT_IDENTITY: new WAL link no longer names its created directory");
+		free(resolved);
+		free(link);
+	}
+}
+
+static void
+pgrac_hw_prepare_paths(void)
+{
+	char *resolved = realpath(pgrac_hw_snapshot_root, NULL);
+	char *wal;
+
+	if (!is_absolute_path(pgrac_hw_snapshot_root) || resolved == NULL
+		|| strlen(resolved) >= MAXPGPATH || strcmp(resolved, pgrac_hw_snapshot_root) != 0)
+		pg_fatal("HW_ROOT_CANONICAL: shared root must be an existing canonical directory without "
+				 "aliases");
+	free(resolved);
+	pgrac_hw_pgdata_path = pgrac_hw_resolve_target(pg_data);
+	wal = pgrac_hw_resolve_target(xlog_dir != NULL ? xlog_dir : psprintf("%s/pg_wal", pg_data));
+	if (pgrac_hw_path_contains(pgrac_hw_snapshot_root, pgrac_hw_pgdata_path)
+		|| pgrac_hw_path_contains(pgrac_hw_pgdata_path, pgrac_hw_snapshot_root)
+		|| pgrac_hw_path_contains(pgrac_hw_snapshot_root, wal)
+		|| pgrac_hw_path_contains(wal, pgrac_hw_snapshot_root))
+		pg_fatal("HW_ROOT_OVERLAP: shared root must not overlap PGDATA or WAL");
+	/* Use the same canonical paths in child PGDATA, sync, and control reads. */
+	free(pg_data);
+	pg_data = pg_strdup(pgrac_hw_pgdata_path);
+	setup_pgdata();
+	pgrac_hw_wal_path = wal;
+	if (xlog_dir != NULL) {
+		free(xlog_dir);
+		xlog_dir = pg_strdup(wal);
+	}
+	pgrac_hw_root_fd
+		= open(pgrac_hw_snapshot_root, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (pgrac_hw_root_fd < 0)
+		pg_fatal("HW_ROOT_IO: cannot open shared root: %m");
+	pgrac_hw_check_path_fd(pgrac_hw_snapshot_root, pgrac_hw_root_fd);
+	pgrac_hw_check_entries(pgrac_hw_root_fd, NULL);
+}
+
+/* Called only after this invocation really creates the new PGDATA/WAL dirs. */
+static void
+pgrac_hw_bind_creation(void)
+{
+	if (!(made_new_pgdata || found_existing_pgdata) || pgrac_hw_root_fd < 0)
+		pg_fatal("HW_NEW_PGDATA_REQUIRED: no new initdb creation context");
+	pgrac_hw_check_path_fd(pgrac_hw_snapshot_root, pgrac_hw_root_fd);
+	pgrac_hw_check_entries(pgrac_hw_root_fd, NULL);
+	pgrac_hw_pgdata_fd
+		= open(pgrac_hw_pgdata_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (pgrac_hw_pgdata_fd < 0)
+		pg_fatal("HW_ROOT_IO: cannot bind new PGDATA: %m");
+	if (xlog_dir != NULL) {
+		pgrac_hw_wal_fd = open(pgrac_hw_wal_path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+		if (pgrac_hw_wal_fd < 0)
+			pg_fatal("HW_ROOT_IO: cannot bind new WAL directory: %m");
+	}
+	if (mkdirat(pgrac_hw_root_fd, "global", pg_dir_create_mode) != 0)
+		pg_fatal("HW_ROOT_NOT_EMPTY: cannot exclusively create shared global directory: %m");
+	pgrac_hw_global_fd
+		= openat(pgrac_hw_root_fd, "global", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (pgrac_hw_global_fd < 0)
+		pg_fatal("HW_ROOT_IO: cannot bind shared global directory: %m");
+	pgrac_hw_check_bound_directories();
+}
+
+/*
+ * The legacy frontend fsync walker is best-effort on enumeration/open errors.
+ * A new empty authority needs a strict result: sync every created regular file
+ * and directory through bound descriptors, or stop before publishing.  A fresh
+ * initdb has no tablespaces; its only permitted symlink is the explicit WAL dir.
+ */
+static void
+pgrac_hw_sync_directory(int parent_fd, bool pgdata_root, unsigned depth)
+{
+	DIR *dir;
+	struct dirent *entry;
+	int copy = dup(parent_fd);
+
+	if (depth > MAXPGPATH / 2 || copy < 0 || (dir = fdopendir(copy)) == NULL)
+		pg_fatal("HW_DATA_SYNC: cannot enumerate new database directory: %m");
+	rewinddir(dir);
+	while (errno = 0, (entry = readdir(dir)) != NULL) {
+		struct stat before, held, after;
+		int fd;
+		bool isdir;
+
+		if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
+			continue;
+		if (fstatat(parent_fd, entry->d_name, &before, AT_SYMLINK_NOFOLLOW) != 0)
+			pg_fatal("HW_DATA_SYNC: cannot stat new database entry: %m");
+		if (S_ISLNK(before.st_mode) && pgdata_root && xlog_dir != NULL
+			&& strcmp(entry->d_name, "pg_wal") == 0)
+			continue; /* The separately bound WAL fd is synced below. */
+		isdir = S_ISDIR(before.st_mode);
+		if (!isdir && !S_ISREG(before.st_mode))
+			pg_fatal("HW_DATA_SYNC: unexpected nonregular entry in new database");
+		fd = openat(parent_fd, entry->d_name,
+					(isdir ? O_RDONLY | O_DIRECTORY : O_RDWR) | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC
+						| PG_BINARY);
+		if (fd < 0 || fstat(fd, &held) != 0 || held.st_dev != before.st_dev
+			|| held.st_ino != before.st_ino || (held.st_mode & S_IFMT) != (before.st_mode & S_IFMT))
+			pg_fatal("HW_DATA_SYNC: cannot open same new database entry: %m");
+		if (isdir)
+			pgrac_hw_sync_directory(fd, false, depth + 1);
+		else if (fsync(fd) != 0)
+			pg_fatal("HW_DATA_SYNC: cannot sync new database file: %m");
+		if (fstatat(parent_fd, entry->d_name, &after, AT_SYMLINK_NOFOLLOW) != 0
+			|| after.st_dev != held.st_dev || after.st_ino != held.st_ino
+			|| (after.st_mode & S_IFMT) != (held.st_mode & S_IFMT))
+			pg_fatal("HW_DATA_SYNC: new database entry changed during sync");
+		if (close(fd) != 0)
+			pg_fatal("HW_DATA_SYNC: cannot close synced database entry: %m");
+	}
+	if (errno != 0)
+		pg_fatal("HW_DATA_SYNC: cannot finish new database enumeration: %m");
+	if (closedir(dir) != 0 || fsync(parent_fd) != 0)
+		pg_fatal("HW_DATA_SYNC: cannot complete new database directory sync: %m");
+}
+
+static void
+pgrac_hw_sync_new_pgdata(void)
+{
+	pgrac_hw_check_bound_directories();
+	pgrac_hw_sync_directory(pgrac_hw_pgdata_fd, true, 0);
+	if (pgrac_hw_wal_fd >= 0)
+		pgrac_hw_sync_directory(pgrac_hw_wal_fd, false, 0);
+	pgrac_hw_check_bound_directories();
+}
+
+/* Only main's successful post-bootstrap, post-fsync edge calls this producer. */
+static void
+finalize_pgrac_hw_snapshot(void)
+{
+	ControlFileData *control;
+	ClusterHwSnapshotHeader hdr = { 0 };
+	char image[CLUSTER_HW_SNAPSHOT_HEADER_SIZE + CLUSTER_HW_SNAPSHOT_CRC_SIZE];
+	char name[64], temporary[96];
+	struct stat held, named;
+	bool crc_ok;
+	size_t written = 0;
+	int fd;
+
+	pgrac_hw_check_bound_directories();
+	pgrac_hw_check_entries(pgrac_hw_root_fd, "global");
+	pgrac_hw_check_entries(pgrac_hw_global_fd, NULL);
+	control = get_controlfile(pg_data, &crc_ok);
+	if (!crc_ok || control->pg_control_version != PG_CONTROL_VERSION
+		|| control->catalog_version_no != CATALOG_VERSION_NO || control->system_identifier == 0
+		|| control->state != DB_SHUTDOWNED || control->checkPoint == InvalidXLogRecPtr
+		|| control->checkPointCopy.redo == InvalidXLogRecPtr
+		|| control->checkPointCopy.redo > control->checkPoint
+		|| control->checkPointCopy.ThisTimeLineID == 0)
+		pg_fatal("HW_FINAL_CONTROL_INVALID: new seed has no valid final shutdown checkpoint");
+	pgrac_hw_check_bound_directories();
+	hdr.magic = CLUSTER_HW_SNAPSHOT_MAGIC;
+	hdr.version = CLUSTER_HW_SNAPSHOT_VERSION;
+	hdr.system_id = control->system_identifier;
+	hdr.owner_node_id = hdr.shard_partition = (uint32)pgrac_hw_snapshot_owner;
+	hdr.snapshot_kind = CLUSTER_HW_SNAPSHOT_CHECKPOINT;
+	hdr.snapshot_lsn = control->checkPointCopy.redo;
+	free(control);
+	if (cluster_hw_snapshot_codec_serialize(&hdr, NULL, image, sizeof(image)) != sizeof(image))
+		pg_fatal("HW_SNAPSHOT_ENCODE: could not encode new seed metadata");
+	snprintf(name, sizeof(name), "pg_hw_snapshot.%u", hdr.owner_node_id);
+	snprintf(temporary, sizeof(temporary), "%s.initdb.%ld", name, (long)getpid());
+	fd = openat(pgrac_hw_global_fd, temporary,
+				O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | PG_BINARY,
+				pg_file_create_mode);
+	if (fd < 0)
+		pg_fatal("HW_SNAPSHOT_CREATE: cannot exclusively create new seed metadata: %m");
+	while (written < sizeof(image)) {
+		ssize_t n = write(fd, image + written, sizeof(image) - written);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			pg_fatal("HW_SNAPSHOT_WRITE: could not write complete new seed metadata: %m");
+		written += n;
+	}
+	if (fsync(fd) != 0)
+		pg_fatal("HW_SNAPSHOT_SYNC: could not sync new seed metadata: %m");
+	pgrac_hw_check_bound_directories();
+	if (fstat(fd, &held) != 0
+		|| fstatat(pgrac_hw_global_fd, temporary, &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| !S_ISREG(named.st_mode) || named.st_nlink != 1 || named.st_size != sizeof(image)
+		|| held.st_dev != named.st_dev || held.st_ino != named.st_ino)
+		pg_fatal("HW_SNAPSHOT_IDENTITY: temporary metadata was replaced");
+	/* linkat is a no-replace publication, unlike ordinary rename. */
+	if (linkat(pgrac_hw_global_fd, temporary, pgrac_hw_global_fd, name, 0) != 0)
+		pg_fatal("HW_SNAPSHOT_PUBLISH: could not install new seed metadata without overwrite: %m");
+	if (fstatat(pgrac_hw_global_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| held.st_dev != named.st_dev || held.st_ino != named.st_ino)
+		pg_fatal("HW_SNAPSHOT_IDENTITY: installed metadata identity changed");
+	if (fstatat(pgrac_hw_global_fd, temporary, &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| held.st_dev != named.st_dev || held.st_ino != named.st_ino)
+		pg_fatal("HW_SNAPSHOT_IDENTITY: temporary metadata changed after publication");
+	if (unlinkat(pgrac_hw_global_fd, temporary, 0) != 0)
+		pg_fatal("HW_SNAPSHOT_PUBLISH: could not finish new seed publication: %m");
+	if (fsync(pgrac_hw_global_fd) != 0 || fsync(pgrac_hw_root_fd) != 0)
+		pg_fatal("HW_SNAPSHOT_SYNC: could not sync new seed directories: %m");
+	pgrac_hw_check_bound_directories();
+	pgrac_hw_check_entries(pgrac_hw_root_fd, "global");
+	pgrac_hw_check_entries(pgrac_hw_global_fd, name);
+	if (fstatat(pgrac_hw_global_fd, name, &named, AT_SYMLINK_NOFOLLOW) != 0
+		|| !S_ISREG(named.st_mode) || named.st_size != sizeof(image) || held.st_dev != named.st_dev
+		|| held.st_ino != named.st_ino)
+		pg_fatal("HW_SNAPSHOT_IDENTITY: installed metadata changed during directory sync");
+	if (close(fd) != 0 || close(pgrac_hw_global_fd) != 0 || close(pgrac_hw_root_fd) != 0
+		|| close(pgrac_hw_pgdata_fd) != 0 || (pgrac_hw_wal_fd >= 0 && close(pgrac_hw_wal_fd) != 0))
+		pg_fatal("HW_SNAPSHOT_CLOSE: could not close new seed metadata: %m");
+	pgrac_hw_global_fd = pgrac_hw_root_fd = pgrac_hw_pgdata_fd = pgrac_hw_wal_fd = -1;
+}
 
 /*
  * W1's only creator is this frontend finalizer.  PG_TEST_* is a focused
@@ -3543,48 +3923,49 @@ finalize_pgrac_wal_state(void)
 int
 main(int argc, char *argv[])
 {
-	static struct option long_options[] = {
-		{"pgdata", required_argument, NULL, 'D'},
-		{"encoding", required_argument, NULL, 'E'},
-		{"locale", required_argument, NULL, 1},
-		{"lc-collate", required_argument, NULL, 2},
-		{"lc-ctype", required_argument, NULL, 3},
-		{"lc-monetary", required_argument, NULL, 4},
-		{"lc-numeric", required_argument, NULL, 5},
-		{"lc-time", required_argument, NULL, 6},
-		{"lc-messages", required_argument, NULL, 7},
-		{"no-locale", no_argument, NULL, 8},
-		{"text-search-config", required_argument, NULL, 'T'},
-		{"auth", required_argument, NULL, 'A'},
-		{"auth-local", required_argument, NULL, 10},
-		{"auth-host", required_argument, NULL, 11},
-		{"pwprompt", no_argument, NULL, 'W'},
-		{"pwfile", required_argument, NULL, 9},
-		{"username", required_argument, NULL, 'U'},
-		{"help", no_argument, NULL, '?'},
-		{"version", no_argument, NULL, 'V'},
-		{"debug", no_argument, NULL, 'd'},
-		{"show", no_argument, NULL, 's'},
-		{"noclean", no_argument, NULL, 'n'},	/* for backwards compatibility */
-		{"no-clean", no_argument, NULL, 'n'},
-		{"nosync", no_argument, NULL, 'N'}, /* for backwards compatibility */
-		{"no-sync", no_argument, NULL, 'N'},
-		{"no-instructions", no_argument, NULL, 13},
-		{"set", required_argument, NULL, 'c'},
-		{"sync-only", no_argument, NULL, 'S'},
-		{"waldir", required_argument, NULL, 'X'},
-		{"wal-segsize", required_argument, NULL, 12},
-		{"data-checksums", no_argument, NULL, 'k'},
-		{"allow-group-access", no_argument, NULL, 'g'},
-		{"discard-caches", no_argument, NULL, 14},
-		{"locale-provider", required_argument, NULL, 15},
-		{"icu-locale", required_argument, NULL, 16},
-		{"icu-rules", required_argument, NULL, 17},
+	static struct option long_options[]
+		= { { "pgdata", required_argument, NULL, 'D' },
+			{ "encoding", required_argument, NULL, 'E' },
+			{ "locale", required_argument, NULL, 1 },
+			{ "lc-collate", required_argument, NULL, 2 },
+			{ "lc-ctype", required_argument, NULL, 3 },
+			{ "lc-monetary", required_argument, NULL, 4 },
+			{ "lc-numeric", required_argument, NULL, 5 },
+			{ "lc-time", required_argument, NULL, 6 },
+			{ "lc-messages", required_argument, NULL, 7 },
+			{ "no-locale", no_argument, NULL, 8 },
+			{ "text-search-config", required_argument, NULL, 'T' },
+			{ "auth", required_argument, NULL, 'A' },
+			{ "auth-local", required_argument, NULL, 10 },
+			{ "auth-host", required_argument, NULL, 11 },
+			{ "pwprompt", no_argument, NULL, 'W' },
+			{ "pwfile", required_argument, NULL, 9 },
+			{ "username", required_argument, NULL, 'U' },
+			{ "help", no_argument, NULL, '?' },
+			{ "version", no_argument, NULL, 'V' },
+			{ "debug", no_argument, NULL, 'd' },
+			{ "show", no_argument, NULL, 's' },
+			{ "noclean", no_argument, NULL, 'n' }, /* for backwards compatibility */
+			{ "no-clean", no_argument, NULL, 'n' },
+			{ "nosync", no_argument, NULL, 'N' }, /* for backwards compatibility */
+			{ "no-sync", no_argument, NULL, 'N' },
+			{ "no-instructions", no_argument, NULL, 13 },
+			{ "set", required_argument, NULL, 'c' },
+			{ "sync-only", no_argument, NULL, 'S' },
+			{ "waldir", required_argument, NULL, 'X' },
+			{ "wal-segsize", required_argument, NULL, 12 },
+			{ "data-checksums", no_argument, NULL, 'k' },
+			{ "allow-group-access", no_argument, NULL, 'g' },
+			{ "discard-caches", no_argument, NULL, 14 },
+			{ "locale-provider", required_argument, NULL, 15 },
+			{ "icu-locale", required_argument, NULL, 16 },
+			{ "icu-rules", required_argument, NULL, 17 },
 #ifdef USE_PGRAC_CLUSTER
-		{"pgrac-wal-state-root", required_argument, NULL, 18},
+			{ "pgrac-wal-state-root", required_argument, NULL, 18 },
+			{ "pgrac-hw-snapshot-root", required_argument, NULL, 19 },
+			{ "pgrac-hw-snapshot-owner", required_argument, NULL, 20 },
 #endif
-		{NULL, 0, NULL, 0}
-	};
+			{ NULL, 0, NULL, 0 } };
 
 	/*
 	 * options with no short version return a low integer, the rest return
@@ -3766,6 +4147,22 @@ main(int argc, char *argv[])
 			case 18:
 				pgrac_wal_state_root = pg_strdup(optarg);
 				break;
+			case 19:
+				if (pgrac_hw_snapshot_root != NULL)
+					pg_fatal("HW_OPTION_DUPLICATE: snapshot root may be specified only once");
+				pgrac_hw_snapshot_root = pg_strdup(optarg);
+				break;
+			case 20: {
+				char *end;
+				unsigned long owner;
+				if (pgrac_hw_snapshot_owner >= 0)
+					pg_fatal("HW_OPTION_DUPLICATE: snapshot owner may be specified only once");
+				errno = 0;
+				owner = strtoul(optarg, &end, 10);
+				if (optarg[0] < '0' || optarg[0] > '9' || *end != '\0' || errno != 0 || owner > 127)
+					pg_fatal("HW_OWNER_INVALID: snapshot owner must be 0..127");
+				pgrac_hw_snapshot_owner = (int)owner;
+			} break;
 #endif
 			default:
 				/* getopt_long already emitted a complaint */
@@ -3804,6 +4201,7 @@ main(int argc, char *argv[])
 	atexit(cleanup_directories_atexit);
 
 #ifdef USE_PGRAC_CLUSTER
+	pgrac_hw_validate_options();
 	if (pgrac_wal_state_root != NULL)
 	{
 		if (sync_only)
@@ -3897,6 +4295,10 @@ main(int argc, char *argv[])
 
 	printf("\n");
 
+#ifdef USE_PGRAC_CLUSTER
+	if (pgrac_hw_snapshot_root != NULL)
+		pgrac_hw_prepare_paths();
+#endif
 	initialize_data_directory();
 
 #ifdef USE_PGRAC_CLUSTER
@@ -3908,11 +4310,21 @@ main(int argc, char *argv[])
 	{
 		fputs(_("syncing data to disk ... "), stdout);
 		fflush(stdout);
-		fsync_pgdata(pg_data, PG_VERSION_NUM);
+#ifdef USE_PGRAC_CLUSTER
+		if (pgrac_hw_snapshot_root != NULL)
+			pgrac_hw_sync_new_pgdata();
+		else
+#endif
+			fsync_pgdata(pg_data, PG_VERSION_NUM);
 		check_ok();
 	}
 	else
 		printf(_("\nSync to disk skipped.\nThe data directory might become corrupt if the operating system crashes.\n"));
+
+#ifdef USE_PGRAC_CLUSTER
+	if (pgrac_hw_snapshot_root != NULL)
+		finalize_pgrac_hw_snapshot();
+#endif
 
 	if (authwarning)
 	{

@@ -47,6 +47,7 @@
 
 #include "access/xlog.h" /* GetSystemIdentifier */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_grd.h" /* PGRAC_GRD_SHARD_COUNT, shard phase/generation */
 #include "cluster/cluster_guc.h" /* cluster_node_id, cluster_shared_data_dir */
@@ -116,7 +117,13 @@ typedef struct ClusterHwShared {
 	pg_atomic_uint32 remaster_result[CLUSTER_MAX_NODES];
 	pg_atomic_uint32 remaster_attempts[CLUSTER_MAX_NODES];
 	pg_atomic_uint64 remaster_next_attempt_at[CLUSTER_MAX_NODES];
+	pg_atomic_uint32 cold_boot_mode;
+	pg_atomic_uint32 cold_boot_state;
 } ClusterHwShared;
+
+StaticAssertDecl(offsetof(ClusterHwShared, cold_boot_mode) == 19568, "HW cold boot mode offset");
+StaticAssertDecl(offsetof(ClusterHwShared, cold_boot_state) == 19572, "HW cold boot state offset");
+StaticAssertDecl(sizeof(ClusterHwShared) == 19576, "HW shared header size");
 
 /*
  * ClusterHwEntry -- one (rel,fork) authority entry.  An entry is created on
@@ -154,6 +161,93 @@ typedef struct ClusterHwReplyEntry {
 static ClusterHwShared *hw_state = NULL;
 static HTAB *hw_htab = NULL;
 static HTAB *hw_reply_htab = NULL;
+
+ClusterNormalStopPollResult
+cluster_hw_normal_stop_poll(const char **domain_out, uint64 *key_out, int *backend_out,
+							const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_READY;
+	const char *reason = "HW_STOP_READY", *domain = NULL;
+	uint64 key = 0;
+	int backend = -1;
+	HASH_SEQ_STATUS scan;
+	const ClusterHwReplyEntry *entry;
+
+	if (!IsUnderPostmaster || (MyBackendType != B_CHECKPOINTER && MyBackendType != B_LMON)
+		|| hw_state == NULL || hw_htab == NULL || hw_reply_htab == NULL || ProcGlobal == NULL) {
+		result = CLUSTER_NORMAL_STOP_INVALID;
+		reason = "HW_STOP_OWNER_OR_SHMEM";
+		goto done;
+	}
+
+	/* Do not invert snapshot_write_lock -> lwlock or wait for I/O under the
+	 * region lock. An unlocked snapshot writer is not a durability proof;
+	 * the original shutdown checkpoint must still produce that proof. */
+	if (LWLockHeldByMe(&hw_state->snapshot_write_lock)
+		|| !LWLockConditionalAcquire(&hw_state->snapshot_write_lock, LW_SHARED)) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		domain = "HW_SNAPSHOT";
+		reason = "HW_SNAPSHOT_IN_PROGRESS";
+	} else
+		LWLockRelease(&hw_state->snapshot_write_lock);
+
+	LWLockAcquire(&hw_state->lwlock, LW_SHARED);
+	hash_seq_init(&scan, hw_reply_htab);
+	while ((entry = hash_seq_search(&scan)) != NULL) {
+		bool invalid = entry->key.request_id == 0 || entry->key._pad != 0
+					   || entry->key.source_procno >= ProcGlobal->allProcCount
+					   || entry->waiter_procno < 0
+					   || (uint32)entry->waiter_procno != entry->key.source_procno
+					   || entry->ready > 1 || entry->status > HW_ALLOC_REPLY_FAIL_NOT_READY;
+		if (!invalid && entry->ready && entry->status == HW_ALLOC_REPLY_OK)
+			invalid = entry->first_block == InvalidBlockNumber || entry->granted == 0
+					  || (uint64)entry->first_block + entry->granted > InvalidBlockNumber;
+		/* Even a READY reply remains owned until the original waiter consumes
+		 * it. Seeing the reply must not remove it or synthesize consumption. */
+		if (invalid || result == CLUSTER_NORMAL_STOP_READY) {
+			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+			domain = "HW_REPLY";
+			key = entry->key.request_id;
+			backend = entry->waiter_procno;
+			reason = invalid ? "HW_REPLY_IDENTITY" : "HW_REPLY_UNCONSUMED";
+		}
+		if (invalid) {
+			hash_seq_term(&scan);
+			break;
+		}
+	}
+	LWLockRelease(&hw_state->lwlock);
+	if (result == CLUSTER_NORMAL_STOP_INVALID)
+		goto done;
+
+	for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+		uint32 status = pg_atomic_read_u32(&hw_state->remaster_result[node]);
+		bool invalid = status > CLUSTER_HW_REMASTER_NOT_APPLICABLE
+					   || status == CLUSTER_HW_REMASTER_BLOCKED_STRUCTURAL;
+		bool pending = status == CLUSTER_HW_REMASTER_RUNNING
+					   || status == CLUSTER_HW_REMASTER_BLOCKED
+					   || pg_atomic_read_u64(&hw_state->remaster_next_attempt_at[node]) != 0;
+		if (invalid || (pending && result == CLUSTER_NORMAL_STOP_READY)) {
+			result = invalid ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING;
+			domain = "HW_REMASTER";
+			key = (uint64)node;
+			backend = -1;
+			reason = invalid ? "HW_REMASTER_UNPROVEN" : "HW_REMASTER_IN_PROGRESS";
+		}
+		if (invalid)
+			break;
+	}
+done:
+	if (domain_out != NULL)
+		*domain_out = domain;
+	if (key_out != NULL)
+		*key_out = key;
+	if (backend_out != NULL)
+		*backend_out = backend;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
 
 static const ClusterShmemRegion cluster_hw_region = {
 	.name = "pgrac cluster hw",
@@ -203,6 +297,8 @@ cluster_hw_shmem_init(void)
 		pg_atomic_init_u64(&hw_state->remaster_blocked_count, 0);
 		pg_atomic_init_u64(&hw_state->remaster_retry_count, 0);
 		pg_atomic_init_u64(&hw_state->remaster_retry_exhausted_count, 0);
+		pg_atomic_init_u32(&hw_state->cold_boot_mode, CLUSTER_HW_BOOT_UNCLASSIFIED);
+		pg_atomic_init_u32(&hw_state->cold_boot_state, CLUSTER_HW_COLD);
 		/* No shard rebuilt yet; 0 matches a never-remastered shard's GRD
 		 * master_generation (0), so boot / steady state serves. */
 		for (s = 0; s < PGRAC_GRD_SHARD_COUNT; s++)
@@ -248,12 +344,21 @@ cluster_hw_try_advance(const ClusterResId *resid, uint32 want, BlockNumber seed_
 	bool found;
 	bool created = false;
 	uint32 shard;
+	ClusterHwColdBootMode boot_mode;
 
 	Assert(resid != NULL && first != NULL && granted != NULL && new_hwm != NULL);
 	Assert(want > 0);
 
 	if (hw_htab == NULL)
 		return CLUSTER_HW_FULL; /* shmem absent: caller fails closed */
+	boot_mode = cluster_hw_cold_boot_mode();
+	if (!cluster_hw_authority_active()
+		|| (boot_mode != CLUSTER_HW_BOOT_EXISTING_RECOVERY
+			&& (boot_mode != CLUSTER_HW_BOOT_NORMAL_SELF
+				|| cluster_hw_cold_boot_state() != CLUSTER_HW_READY))) {
+		cluster_hw_bump_not_ready();
+		return CLUSTER_HW_NOT_READY;
+	}
 
 	/*
 	 * §3.1b R4/R6 serve gate (8.A).  Before touching the authority table -- and
@@ -500,18 +605,218 @@ cluster_hw_remaster_recoverable(void)
  * ============================================================ */
 
 /*
- * cluster_hw_authority_active -- is the HW authority + its durable snapshot in
- * play?  Only in a multi-node cluster backed by shared storage: that is the
+ * cluster_hw_authority_active -- is multi-node HW allocation in play?
+ * Only in a multi-node cluster backed by shared storage: that is the
  * only configuration where a relation extend is globalized (D2) and where a
- * survivor must read a dead master's snapshot.  Single-node is a complete
- * no-op, so the checkpoint write and the recovery load never perturb a
- * single-node start.
+ * survivor must read a dead master's snapshot.  Normal seed metadata has its
+ * own gate, independent of node count; existing recovery retains this gate.
  */
 bool
 cluster_hw_authority_active(void)
 {
 	return cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0'
 		   && cluster_conf_node_count() > 1;
+}
+
+bool
+cluster_hw_metadata_configured(void)
+{
+	return cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0'
+		   && cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES;
+}
+
+ClusterHwColdBootMode
+cluster_hw_cold_boot_mode(void)
+{
+	ClusterHwColdBootMode mode
+		= hw_state == NULL ? CLUSTER_HW_BOOT_UNCLASSIFIED
+						   : (ClusterHwColdBootMode)pg_atomic_read_u32(&hw_state->cold_boot_mode);
+	pg_read_barrier();
+	return mode;
+}
+
+ClusterHwColdBootState
+cluster_hw_cold_boot_state(void)
+{
+	ClusterHwColdBootState state
+		= hw_state == NULL ? CLUSTER_HW_COLD
+						   : (ClusterHwColdBootState)pg_atomic_read_u32(&hw_state->cold_boot_state);
+	pg_read_barrier();
+	return state;
+}
+
+static const char *
+hw_normal_read_failure(ClusterHwSnapshotNormalReadResult result)
+{
+	switch (result) {
+	case CLUSTER_HW_NORMAL_READ_MISSING:
+		return "SNAPSHOT_MISSING";
+	case CLUSTER_HW_NORMAL_READ_IO_ERROR:
+		return "SNAPSHOT_IO_ERROR";
+	case CLUSTER_HW_NORMAL_READ_SHORT:
+		return "SNAPSHOT_SHORT";
+	case CLUSTER_HW_NORMAL_READ_MAGIC:
+		return "SNAPSHOT_MAGIC";
+	case CLUSTER_HW_NORMAL_READ_CRC:
+		return "SNAPSHOT_CRC";
+	case CLUSTER_HW_NORMAL_READ_IDENTITY:
+		return "SNAPSHOT_IDENTITY";
+	case CLUSTER_HW_NORMAL_READ_KIND:
+		return "SNAPSHOT_KIND";
+	case CLUSTER_HW_NORMAL_READ_LSN:
+		return "SNAPSHOT_LSN";
+	case CLUSTER_HW_NORMAL_READ_LENGTH:
+		return "SNAPSHOT_LENGTH";
+	case CLUSTER_HW_NORMAL_READ_RESERVED:
+		return "SNAPSHOT_RESERVED";
+	case CLUSTER_HW_NORMAL_READ_ARGUMENT:
+		return "SNAPSHOT_ARGUMENT";
+	case CLUSTER_HW_NORMAL_READ_VALID:
+		return NULL;
+	}
+	return "SNAPSHOT_RESULT_INVALID";
+}
+
+/* The only producer is Startup, before any HW service may establish entries.
+ * A partial failed load is never published or retried in this postmaster. */
+static bool
+hw_normal_snapshot_load(XLogRecPtr own_redo, const char **failure_out)
+{
+	ClusterHwSnapshotEntry *volatile entries = NULL;
+	volatile bool locked = false;
+	volatile bool success = false;
+	uint32 expected = CLUSTER_HW_COLD;
+
+	if (!pg_atomic_compare_exchange_u32(&hw_state->cold_boot_state, &expected,
+										CLUSTER_HW_LOADING)) {
+		*failure_out = "NORMAL_LOAD_STATE";
+		return false;
+	}
+	PG_TRY();
+	{
+		ClusterHwSnapshotHeader hdr;
+		ClusterHwSnapshotNormalReadResult result;
+		entries = palloc(sizeof(ClusterHwSnapshotEntry) * CLUSTER_HW_AUTHORITY_MAX);
+		result = cluster_hw_snapshot_normal_read((uint32)cluster_node_id, GetSystemIdentifier(),
+												 own_redo, &hdr, entries, CLUSTER_HW_AUTHORITY_MAX);
+		*failure_out = hw_normal_read_failure(result);
+		if (result == CLUSTER_HW_NORMAL_READ_VALID) {
+			success = true;
+			/* The key is opaque to the shared byte codec, not to HW admission. */
+			for (uint32 i = 0; i < hdr.n_entries; i++) {
+				const ClusterResId *key = &entries[i].resid;
+				if (key->type != CLUSTER_HW_RESID_TYPE || key->lockmethodid != DEFAULT_LOCKMETHOD
+					|| key->field4 > MAX_FORKNUM || key->field2 == 0 || key->field3 == 0) {
+					success = false;
+					*failure_out = "SNAPSHOT_ENTRY_IDENTITY";
+					break;
+				}
+			}
+			if (success) {
+				LWLockAcquire(&hw_state->lwlock, LW_EXCLUSIVE);
+				locked = true;
+				if (hash_get_num_entries(hw_htab) != 0) {
+					success = false;
+					*failure_out = "NORMAL_TABLE_NOT_EMPTY";
+				}
+				for (uint32 i = 0; success && i < hdr.n_entries; i++) {
+					bool found;
+					ClusterHwEntry *entry
+						= hash_search(hw_htab, &entries[i].resid, HASH_ENTER_NULL, &found);
+					if (entry == NULL) {
+						success = false;
+						*failure_out = "NORMAL_TABLE_CAPACITY";
+						break;
+					}
+					entry->next_hwm = found ? cluster_hw_snapshot_rebuild_value(entry->next_hwm,
+																				entries[i].next_hwm)
+											: entries[i].next_hwm;
+					cluster_hw_bump_rebuild();
+				}
+				LWLockRelease(&hw_state->lwlock);
+				locked = false;
+			}
+		}
+		pfree(entries);
+		entries = NULL;
+	}
+	PG_CATCH();
+	{
+		pg_write_barrier();
+		pg_atomic_write_u32(&hw_state->cold_boot_state, CLUSTER_HW_FAILED);
+		if (locked)
+			LWLockRelease(&hw_state->lwlock);
+		if (entries != NULL)
+			pfree(entries);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pg_write_barrier();
+	pg_atomic_write_u32(&hw_state->cold_boot_state,
+						success ? CLUSTER_HW_REBUILT : CLUSTER_HW_FAILED);
+	return success;
+}
+
+bool
+cluster_hw_startup_prepare(bool in_recovery, bool own_clean_shutdown, XLogRecPtr own_redo,
+						   const char **failure_out)
+{
+	bool has_root = cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0';
+	ClusterHwColdBootMode mode;
+	uint32 expected = CLUSTER_HW_BOOT_UNCLASSIFIED;
+
+	if (failure_out == NULL)
+		return false;
+	*failure_out = "STARTUP_ROLE_OR_REGION";
+	if (!has_root && hw_state == NULL)
+		return true; /* Non-cluster startup with no HW region. */
+	if (hw_state == NULL || hw_htab == NULL || (has_root && !AmStartupProcess()))
+		return false;
+	if (has_root && !cluster_hw_metadata_configured()) {
+		*failure_out = "METADATA_IDENTITY";
+		return false;
+	}
+	mode = !has_root	 ? CLUSTER_HW_BOOT_DISABLED
+		   : in_recovery ? CLUSTER_HW_BOOT_EXISTING_RECOVERY
+						 : CLUSTER_HW_BOOT_NORMAL_SELF;
+	if (!pg_atomic_compare_exchange_u32(&hw_state->cold_boot_mode, &expected, mode)) {
+		*failure_out = "BOOT_MODE_ALREADY_SELECTED";
+		return false;
+	}
+	*failure_out = NULL;
+	if (mode != CLUSTER_HW_BOOT_NORMAL_SELF)
+		return true;
+	if (!own_clean_shutdown || XLogRecPtrIsInvalid(own_redo)) {
+		*failure_out = "OWN_CLEAN_CHECKPOINT_REQUIRED";
+		pg_atomic_write_u32(&hw_state->cold_boot_state, CLUSTER_HW_FAILED);
+		return false;
+	}
+	return hw_normal_snapshot_load(own_redo, failure_out);
+}
+
+bool
+cluster_hw_startup_complete(const char **failure_out)
+{
+	ClusterHwColdBootMode mode = cluster_hw_cold_boot_mode();
+	uint32 expected = CLUSTER_HW_REBUILT;
+	if (failure_out == NULL)
+		return false;
+	*failure_out = NULL;
+	if (mode == CLUSTER_HW_BOOT_DISABLED || (hw_state == NULL && !cluster_hw_metadata_configured()))
+		return true;
+	if (!AmStartupProcess() || !cluster_hw_metadata_configured()) {
+		*failure_out = "STARTUP_ROLE_OR_METADATA";
+		return false;
+	}
+	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY)
+		return true; /* Original recovery/EOR contract, no normal READY proof. */
+	if (mode != CLUSTER_HW_BOOT_NORMAL_SELF
+		|| !pg_atomic_compare_exchange_u32(&hw_state->cold_boot_state, &expected,
+										   CLUSTER_HW_READY)) {
+		*failure_out = "NORMAL_REBUILT_REQUIRED";
+		return false;
+	}
+	return true;
 }
 
 /*
@@ -575,6 +880,20 @@ hw_snapshot_capture_and_write(ClusterHwSnapshotKind kind, XLogRecPtr snapshot_ls
 void
 cluster_hw_snapshot_checkpoint_write(XLogRecPtr redo_lsn)
 {
+	ClusterHwColdBootMode mode;
+	ClusterHwColdBootState state;
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
+		return;
+	mode = cluster_hw_cold_boot_mode();
+	state = cluster_hw_cold_boot_state();
+	if (mode == CLUSTER_HW_BOOT_EXISTING_RECOVERY && !cluster_hw_authority_active())
+		return;
+	if (!cluster_hw_metadata_configured() || hw_state == NULL || hw_htab == NULL
+		|| (mode != CLUSTER_HW_BOOT_EXISTING_RECOVERY
+			&& (mode != CLUSTER_HW_BOOT_NORMAL_SELF
+				|| (state != CLUSTER_HW_REBUILT && state != CLUSTER_HW_READY))))
+		ereport(PANIC, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+						errmsg("cluster HW checkpoint requires complete startup authority")));
 	hw_snapshot_capture_and_write(CLUSTER_HW_SNAPSHOT_CHECKPOINT, redo_lsn,
 								  (uint32)cluster_epoch_get_current());
 }

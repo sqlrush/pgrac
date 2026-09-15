@@ -44,6 +44,7 @@
 #include "postgres.h"
 
 #include "access/xlog.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_guc.h"
@@ -220,6 +221,8 @@ cluster_hw_alloc_request_handler(const struct ClusterICEnvelope *env, const void
 
 	/* The envelope (magic/version/crc/payload_len) is validated by the IC
 	 * dispatch layer before the handler runs. */
+	if (!cluster_normal_stop_service_new_work(true))
+		return;
 	cluster_hw_master_process(req, &reply);
 
 	(void)cluster_ic_send_envelope(PGRAC_IC_MSG_HW_ALLOC_REPLY, (int32)env->source_node_id, &reply,

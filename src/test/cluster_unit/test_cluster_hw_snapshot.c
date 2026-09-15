@@ -60,8 +60,56 @@
 
 UT_DEFINE_GLOBALS();
 
+/* The actual common source is separately compiled with FRONTEND and only
+ * its three exported symbols renamed, so neither caller uses a fake codec. */
+extern size_t frontend_hw_snapshot_codec_size(uint32 n_entries);
+extern size_t frontend_hw_snapshot_codec_serialize(const ClusterHwSnapshotHeader *hdr,
+												   const void *entries, char *buf, size_t buflen);
+extern ClusterHwSnapshotValidity
+frontend_hw_snapshot_codec_deserialize(const char *buf, size_t len,
+									   ClusterHwSnapshotHeader *hdr_out, void *entries_out,
+									   uint32 max_entries);
+
 /* Global read by cluster_hw_snapshot.o for the shared-storage path. */
 char *cluster_shared_data_dir = NULL;
+static int open_fault_errno;
+static int read_fail_after = -1, read_eof_after = -1;
+static size_t read_chunk_limit;
+static unsigned read_success_calls;
+static bool read_eintr_once, close_fault;
+
+extern ssize_t hw_snapshot_test_read(int fd, void *buf, size_t count);
+ssize_t
+hw_snapshot_test_read(int fd, void *buf, size_t count)
+{
+	ssize_t result;
+	if (read_eintr_once) {
+		read_eintr_once = false;
+		errno = EINTR;
+		return -1;
+	}
+	if (read_fail_after >= 0 && read_success_calls >= (unsigned)read_fail_after) {
+		errno = EIO;
+		return -1;
+	}
+	if (read_eof_after >= 0 && read_success_calls >= (unsigned)read_eof_after)
+		return 0;
+	if (read_chunk_limit && count > read_chunk_limit)
+		count = read_chunk_limit;
+	result = read(fd, buf, count);
+	if (result >= 0)
+		read_success_calls++;
+	return result;
+}
+
+static void
+reset_read_faults(void)
+{
+	open_fault_errno = 0;
+	read_fail_after = read_eof_after = -1;
+	read_chunk_limit = read_success_calls = 0;
+	read_eintr_once = close_fault = false;
+}
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -125,13 +173,22 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 int
 OpenTransientFile(const char *fileName, int fileFlags)
 {
+	if (open_fault_errno != 0) {
+		errno = open_fault_errno;
+		return -1;
+	}
 	return open(fileName, fileFlags, 0600);
 }
 
 int
 CloseTransientFile(int fd)
 {
-	return close(fd);
+	int result = close(fd);
+	if (result == 0 && close_fault) {
+		errno = EIO;
+		return -1;
+	}
+	return result;
 }
 
 int
@@ -531,10 +588,276 @@ UT_TEST(test_hw_snapshot_read_identity_mismatch)
 	UT_ASSERT_EQ(v, CLUSTER_HW_SNAPSHOT_INVALID_IDENTITY);
 }
 
+UT_TEST(test_frontend_and_backend_use_identical_v1_codec)
+{
+	for (uint32 count = 0; count <= 3; count += 3) {
+		ClusterHwSnapshotHeader hdr, decoded;
+		ClusterHwSnapshotEntry entries[3], decoded_entries[3];
+		char frontend[128], backend[128];
+		size_t len, frontend_len;
+		make_header(&hdr, count);
+		make_entries(entries, count);
+		len = cluster_hw_snapshot_serialize(&hdr, count ? entries : NULL, backend, sizeof(backend));
+		frontend_len = frontend_hw_snapshot_codec_serialize(&hdr, count ? entries : NULL, frontend,
+															sizeof(frontend));
+		UT_ASSERT_EQ(frontend_hw_snapshot_codec_size(count), len);
+		UT_ASSERT_EQ(frontend_len, len);
+		if (frontend_len != len || frontend_len == 0)
+			continue;
+		UT_ASSERT(memcmp(frontend, backend, len) == 0);
+		UT_ASSERT_EQ(cluster_hw_snapshot_deserialize(frontend, len, &decoded, decoded_entries, 3),
+					 CLUSTER_HW_SNAPSHOT_VALID);
+		UT_ASSERT(memcmp(&hdr, &decoded, sizeof(hdr)) == 0);
+		UT_ASSERT(memcmp(entries, decoded_entries, count * sizeof(entries[0])) == 0);
+		UT_ASSERT_EQ(
+			frontend_hw_snapshot_codec_deserialize(backend, len, &decoded, decoded_entries, 3),
+			CLUSTER_HW_SNAPSHOT_VALID);
+		UT_ASSERT(memcmp(&hdr, &decoded, sizeof(hdr)) == 0);
+		UT_ASSERT(memcmp(entries, decoded_entries, count * sizeof(entries[0])) == 0);
+		backend[len - 1] ^= 1;
+		UT_ASSERT_EQ(
+			frontend_hw_snapshot_codec_deserialize(backend, len, &decoded, decoded_entries, 3),
+			CLUSTER_HW_SNAPSHOT_INVALID_CRC);
+		UT_ASSERT_EQ(
+			frontend_hw_snapshot_codec_deserialize(frontend, len - 1, &decoded, decoded_entries, 3),
+			CLUSTER_HW_SNAPSHOT_INVALID_SHORT);
+		if (count != 0)
+			UT_ASSERT_EQ(
+				frontend_hw_snapshot_codec_deserialize(frontend, len, &decoded, decoded_entries, 0),
+				CLUSTER_HW_SNAPSHOT_INVALID_SHORT);
+	}
+}
+
+UT_TEST(test_frontend_empty_file_is_read_by_actual_backend_reader)
+{
+	ClusterHwSnapshotHeader hdr, decoded;
+	char bytes[CLUSTER_HW_SNAPSHOT_HEADER_SIZE + CLUSTER_HW_SNAPSHOT_CRC_SIZE];
+	char path[MAXPGPATH];
+	size_t len;
+	int fd;
+	make_header(&hdr, 0);
+	hdr.owner_node_id = hdr.shard_partition = 6;
+	hdr.snapshot_kind = CLUSTER_HW_SNAPSHOT_CHECKPOINT;
+	hdr.snapshot_lsn = UINT64CONST(0x100020030);
+	len = frontend_hw_snapshot_codec_serialize(&hdr, NULL, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(len, 52);
+	if (len != sizeof(bytes))
+		return;
+	UT_ASSERT(cluster_hw_snapshot_path(6, path, sizeof(path)));
+	fd = open(path, O_CREAT | O_EXCL | O_WRONLY, 0600);
+	UT_ASSERT(fd >= 0);
+	if (fd < 0)
+		return;
+	UT_ASSERT_EQ(write(fd, bytes, len), len);
+	UT_ASSERT_EQ(fsync(fd), 0);
+	UT_ASSERT_EQ(close(fd), 0);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(6, hdr.system_id, 6, 6, &decoded, NULL, 0),
+				 CLUSTER_HW_SNAPSHOT_VALID);
+	UT_ASSERT(memcmp(&hdr, &decoded, sizeof(hdr)) == 0);
+	/* This is codec/file interoperability, not initdb or clean-boot proof. */
+}
+
+static void
+write_normal_test_file(uint32 owner, const char *bytes, size_t size)
+{
+	char path[MAXPGPATH];
+	int fd;
+	UT_ASSERT(cluster_hw_snapshot_path(owner, path, sizeof(path)));
+	fd = open(path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+	UT_ASSERT(fd >= 0);
+	if (fd < 0)
+		abort();
+	UT_ASSERT_EQ(write(fd, bytes, size), size);
+	UT_ASSERT_EQ(fsync(fd), 0);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+static void
+write_normal_header(uint32 owner, const ClusterHwSnapshotHeader *hdr,
+					const ClusterHwSnapshotEntry *entries, bool extra_byte)
+{
+	char bytes[128];
+	size_t len = cluster_hw_snapshot_serialize(hdr, entries, bytes, sizeof(bytes));
+	Assert(len > 0 && len < sizeof(bytes));
+	if (extra_byte)
+		bytes[len++] = 1;
+	write_normal_test_file(owner, bytes, len);
+}
+
+static ClusterHwSnapshotNormalReadResult
+normal_read_untouched(uint32 owner, uint64 sysid, XLogRecPtr redo, uint32 max_entries)
+{
+	ClusterHwSnapshotHeader hdr, before;
+	ClusterHwSnapshotEntry entries[4], entries_before[4];
+	ClusterHwSnapshotNormalReadResult result;
+	Assert(max_entries <= lengthof(entries));
+	memset(&hdr, 0xa5, sizeof(hdr));
+	memset(entries, 0xa5, sizeof(entries));
+	before = hdr;
+	memcpy(entries_before, entries, sizeof(entries));
+	result = cluster_hw_snapshot_normal_read(owner, sysid, redo, &hdr, entries, max_entries);
+	if (result != CLUSTER_HW_NORMAL_READ_VALID) {
+		UT_ASSERT(memcmp(&hdr, &before, sizeof(hdr)) == 0);
+		UT_ASSERT(memcmp(entries, entries_before, sizeof(entries)) == 0);
+	}
+	return result;
+}
+
+UT_TEST(test_normal_reader_exact_own_checkpoint_and_no_partial_publish)
+{
+	ClusterHwSnapshotHeader hdr, out;
+	ClusterHwSnapshotEntry entries[3], loaded[3];
+	reset_read_faults();
+	make_header(&hdr, 3);
+	make_entries(entries, 3);
+	hdr.owner_node_id = hdr.shard_partition = 7;
+	hdr.snapshot_kind = CLUSTER_HW_SNAPSHOT_CHECKPOINT;
+	hdr.snapshot_lsn = UINT64CONST(0x100020030);
+	write_normal_header(7, &hdr, entries, false);
+	UT_ASSERT_EQ(
+		cluster_hw_snapshot_normal_read(7, hdr.system_id, hdr.snapshot_lsn, &out, loaded, 3),
+		CLUSTER_HW_NORMAL_READ_VALID);
+	UT_ASSERT(memcmp(&hdr, &out, sizeof(hdr)) == 0);
+	UT_ASSERT(memcmp(entries, loaded, sizeof(entries)) == 0);
+	UT_ASSERT_EQ(normal_read_untouched(7, hdr.system_id, hdr.snapshot_lsn - 1, 3),
+				 CLUSTER_HW_NORMAL_READ_LSN);
+	UT_ASSERT_EQ(normal_read_untouched(7, hdr.system_id, hdr.snapshot_lsn + 1, 3),
+				 CLUSTER_HW_NORMAL_READ_LSN);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(7, hdr.system_id, 7, 7, &out, loaded, 3),
+				 CLUSTER_HW_SNAPSHOT_VALID);
+}
+
+UT_TEST(test_normal_reader_rejects_adoption_reserved_and_foreign_envelope)
+{
+	ClusterHwSnapshotHeader hdr, out;
+	reset_read_faults();
+	make_header(&hdr, 0);
+	hdr.owner_node_id = hdr.shard_partition = 8;
+	hdr.snapshot_lsn = 4096;
+	hdr.snapshot_kind = CLUSTER_HW_SNAPSHOT_ADOPTION;
+	write_normal_header(8, &hdr, NULL, false);
+	UT_ASSERT_EQ(normal_read_untouched(8, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_KIND);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(8, hdr.system_id, 8, 8, &out, NULL, 0),
+				 CLUSTER_HW_SNAPSHOT_VALID);
+	hdr.snapshot_kind = CLUSTER_HW_SNAPSHOT_CHECKPOINT;
+	hdr.reserved = 1;
+	write_normal_header(8, &hdr, NULL, false);
+	UT_ASSERT_EQ(normal_read_untouched(8, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_RESERVED);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(8, hdr.system_id, 8, 8, &out, NULL, 0),
+				 CLUSTER_HW_SNAPSHOT_VALID);
+	hdr.reserved = 0;
+	write_normal_header(8, &hdr, NULL, false);
+	UT_ASSERT_EQ(normal_read_untouched(8, hdr.system_id + 1, 4096, 4),
+				 CLUSTER_HW_NORMAL_READ_IDENTITY);
+	hdr.owner_node_id = 9;
+	write_normal_header(8, &hdr, NULL, false);
+	UT_ASSERT_EQ(normal_read_untouched(8, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_IDENTITY);
+	hdr.owner_node_id = 8;
+	hdr.shard_partition = 9;
+	write_normal_header(8, &hdr, NULL, false);
+	UT_ASSERT_EQ(normal_read_untouched(8, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_IDENTITY);
+}
+
+UT_TEST(test_normal_reader_missing_io_and_short_are_distinct)
+{
+	ClusterHwSnapshotHeader out;
+	reset_read_faults();
+	UT_ASSERT_EQ(normal_read_untouched(127, 42, 4096, 4), CLUSTER_HW_NORMAL_READ_MISSING);
+	open_fault_errno = EACCES;
+	UT_ASSERT_EQ(normal_read_untouched(127, 42, 4096, 4), CLUSTER_HW_NORMAL_READ_IO_ERROR);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(127, 42, 127, 127, &out, NULL, 0),
+				 CLUSTER_HW_SNAPSHOT_INVALID_SHORT);
+	reset_read_faults();
+	write_normal_test_file(9, "x", 1);
+	UT_ASSERT_EQ(normal_read_untouched(9, 42, 4096, 4), CLUSTER_HW_NORMAL_READ_SHORT);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(9, 42, 9, 9, &out, NULL, 0),
+				 CLUSTER_HW_SNAPSHOT_INVALID_SHORT);
+}
+
+UT_TEST(test_normal_reader_requires_whole_capacity_length_and_crc)
+{
+	ClusterHwSnapshotHeader hdr, out;
+	ClusterHwSnapshotEntry entries[2], out_entries[4];
+	char path[MAXPGPATH];
+	reset_read_faults();
+	make_header(&hdr, 2);
+	make_entries(entries, 2);
+	hdr.owner_node_id = hdr.shard_partition = 10;
+	hdr.snapshot_kind = CLUSTER_HW_SNAPSHOT_CHECKPOINT;
+	hdr.snapshot_lsn = 4096;
+	write_normal_header(10, &hdr, entries, false);
+	UT_ASSERT_EQ(normal_read_untouched(10, hdr.system_id, 4096, 1), CLUSTER_HW_NORMAL_READ_SHORT);
+	write_normal_header(10, &hdr, entries, true);
+	UT_ASSERT_EQ(normal_read_untouched(10, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_LENGTH);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(10, hdr.system_id, 10, 10, &out, out_entries, 4),
+				 CLUSTER_HW_SNAPSHOT_VALID);
+	write_normal_header(10, &hdr, entries, false);
+	UT_ASSERT(cluster_hw_snapshot_path(10, path, sizeof(path)));
+	flip_byte(path, CLUSTER_HW_SNAPSHOT_HEADER_SIZE + 2);
+	UT_ASSERT_EQ(normal_read_untouched(10, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_CRC);
+	hdr.magic ^= 1;
+	write_normal_header(10, &hdr, entries, false);
+	UT_ASSERT_EQ(normal_read_untouched(10, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_MAGIC);
+}
+
+UT_TEST(test_normal_reader_partial_read_eintr_and_io_close_failures)
+{
+	ClusterHwSnapshotHeader hdr, out;
+	ClusterHwSnapshotEntry entries[3], loaded[3];
+	reset_read_faults();
+	make_header(&hdr, 3);
+	make_entries(entries, 3);
+	hdr.owner_node_id = hdr.shard_partition = 11;
+	hdr.snapshot_kind = CLUSTER_HW_SNAPSHOT_CHECKPOINT;
+	hdr.snapshot_lsn = 4096;
+	write_normal_header(11, &hdr, entries, false);
+	read_chunk_limit = 7;
+	read_eintr_once = true;
+	UT_ASSERT_EQ(cluster_hw_snapshot_normal_read(11, hdr.system_id, 4096, &out, loaded, 3),
+				 CLUSTER_HW_NORMAL_READ_VALID);
+	UT_ASSERT(read_success_calls > 1);
+	UT_ASSERT(memcmp(entries, loaded, sizeof(entries)) == 0);
+	reset_read_faults();
+	read_chunk_limit = 7;
+	read_fail_after = 1;
+	UT_ASSERT_EQ(normal_read_untouched(11, hdr.system_id, 4096, 4),
+				 CLUSTER_HW_NORMAL_READ_IO_ERROR);
+	reset_read_faults();
+	read_chunk_limit = 7;
+	read_eof_after = 1;
+	UT_ASSERT_EQ(normal_read_untouched(11, hdr.system_id, 4096, 4), CLUSTER_HW_NORMAL_READ_SHORT);
+	reset_read_faults();
+	close_fault = true;
+	UT_ASSERT_EQ(normal_read_untouched(11, hdr.system_id, 4096, 4),
+				 CLUSTER_HW_NORMAL_READ_IO_ERROR);
+	UT_ASSERT_EQ(cluster_hw_snapshot_read(11, hdr.system_id, 11, 11, &out, loaded, 3),
+				 CLUSTER_HW_SNAPSHOT_VALID);
+	reset_read_faults();
+}
+
+UT_TEST(test_normal_reader_never_uses_unknown_identity_or_unconfigured_root)
+{
+	char *saved_root = cluster_shared_data_dir;
+	ClusterHwSnapshotHeader out;
+	reset_read_faults();
+	UT_ASSERT_EQ(normal_read_untouched(7, 0, 4096, 4), CLUSTER_HW_NORMAL_READ_ARGUMENT);
+	UT_ASSERT_EQ(normal_read_untouched(7, 42, InvalidXLogRecPtr, 4),
+				 CLUSTER_HW_NORMAL_READ_ARGUMENT);
+	UT_ASSERT_EQ(normal_read_untouched(128, 42, 4096, 4), CLUSTER_HW_NORMAL_READ_ARGUMENT);
+	UT_ASSERT_EQ(cluster_hw_snapshot_normal_read(7, 42, 4096, NULL, NULL, 0),
+				 CLUSTER_HW_NORMAL_READ_ARGUMENT);
+	UT_ASSERT_EQ(cluster_hw_snapshot_normal_read(7, 42, 4096, &out, NULL, 1),
+				 CLUSTER_HW_NORMAL_READ_ARGUMENT);
+	cluster_shared_data_dir = NULL;
+	UT_ASSERT_EQ(normal_read_untouched(7, 42, 4096, 4), CLUSTER_HW_NORMAL_READ_ARGUMENT);
+	cluster_shared_data_dir = saved_root;
+	UT_ASSERT_EQ(read_success_calls, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(23);
 	UT_RUN(test_hw_snapshot_serialized_size);
 	UT_RUN(test_hw_snapshot_roundtrip);
 	UT_RUN(test_hw_snapshot_zero_entries);
@@ -545,6 +868,7 @@ main(void)
 	UT_RUN(test_hw_snapshot_identity_ok);
 	UT_RUN(test_hw_snapshot_supersedes);
 	UT_RUN(test_hw_snapshot_rebuild_value);
+	UT_RUN(test_frontend_and_backend_use_identical_v1_codec);
 
 	setup_shared_root();
 	UT_RUN(test_hw_snapshot_path);
@@ -552,6 +876,13 @@ main(void)
 	UT_RUN(test_hw_snapshot_read_missing);
 	UT_RUN(test_hw_snapshot_read_crc_corrupt);
 	UT_RUN(test_hw_snapshot_read_identity_mismatch);
+	UT_RUN(test_frontend_empty_file_is_read_by_actual_backend_reader);
+	UT_RUN(test_normal_reader_exact_own_checkpoint_and_no_partial_publish);
+	UT_RUN(test_normal_reader_rejects_adoption_reserved_and_foreign_envelope);
+	UT_RUN(test_normal_reader_missing_io_and_short_are_distinct);
+	UT_RUN(test_normal_reader_requires_whole_capacity_length_and_crc);
+	UT_RUN(test_normal_reader_partial_read_eintr_and_io_close_failures);
+	UT_RUN(test_normal_reader_never_uses_unknown_identity_or_unconfigured_root);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
