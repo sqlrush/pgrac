@@ -3,6 +3,8 @@
  * test_cluster_r4_activation_fsm.c
  *	  Exact closed-transition, ACK and dormant-admission tests for R4 D13.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -139,6 +141,8 @@ static bool test_terminal_peer_eligible;
 static ClusterSfPeerCap test_terminal_peer_record;
 static ClusterSemanticActivationRecord test_terminal_peer_open;
 static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+static bool test_stop_real_observation;
+static int test_stop_not_fresh_peer = -1;
 static bool test_capability_store_missing;
 static uint32 test_local_capability_word;
 static bool test_ctrc_shmem_is_ready = true;
@@ -734,6 +738,42 @@ cluster_reconfig_get_observed_epoch(int32 node_id)
 			   : 0;
 }
 
+int
+cluster_qvotec_get_status(void)
+{
+	return CLUSTER_QVOTEC_READY;
+}
+
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id)
+{
+	static const ClusterNodeInfo node = { 0 };
+	return node_id >= 0 && node_id < 4 ? &node : NULL;
+}
+
+bool
+cluster_reconfig_get_observed_fresh_alive(int32 node_id)
+{
+	return node_id >= 0 && node_id < 4 && node_id != test_stop_not_fresh_peer;
+}
+
+#include "test_cluster_stop_membership_observation.inc"
+
+static bool
+test_stop_observation_current(const ClusterSemanticActivationRecord *open, const uint8 *root)
+{
+	ClusterR4MembershipSnapshot candidate = { 0 };
+	candidate.formation_epoch = test_membership_snapshot_epoch;
+	candidate.admitted_members_lo = test_membership_snapshot_lo;
+	candidate.admitted_members_hi = test_membership_snapshot_hi;
+	candidate.local_self_boot_incarnation = cluster_qvotec_get_self_incarnation();
+	for (int node = 0; node < 4; node++)
+		candidate.admitted_incarnation[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
+	return cluster_reconfig_r4_membership_observations_current(&candidate, true, open, root)
+		   && cluster_reconfig_r4_membership_observations_current(&candidate, false, open, root);
+}
+
 bool
 cluster_reconfig_lmon_observe_replacement_ready(
 	const ClusterReplacementPhase3HandoffItem *item)
@@ -787,12 +827,32 @@ cluster_reconfig_lmon_snapshot_admitted_membership(
 	}
 	if (!test_membership_snapshot_valid
 		|| test_membership_snapshot_calls == test_membership_snapshot_fail_at_call
+		|| (test_stop_real_observation && !test_stop_observation_current(NULL, NULL))
 		|| out_members_lo == NULL || out_members_hi == NULL || out_formation_epoch == NULL)
 		return false;
 	*out_members_lo = test_membership_snapshot_lo;
 	*out_members_hi = test_membership_snapshot_hi;
 	*out_formation_epoch = test_membership_snapshot_epoch;
 	return true;
+}
+
+bool
+cluster_reconfig_normal_stop_snapshot_admitted_membership(
+	const ClusterSemanticActivationRecord *open, const uint8 *root, uint64 *lo, uint64 *hi,
+	uint64 *epoch)
+{
+	bool use_real = test_stop_real_observation;
+	bool ok;
+	/* Shared snapshot acquisition remains fixture-owned; the precise original
+	 * observation predicate is compiled above and called twice, as in reconfig. */
+	test_stop_real_observation = false;
+	ok = cluster_reconfig_lmon_snapshot_admitted_membership(lo, hi, epoch);
+	test_stop_real_observation = use_real;
+	if (ok && use_real && !test_stop_observation_current(open, root)) {
+		*lo = *hi = *epoch = 0;
+		ok = false;
+	}
+	return ok;
 }
 
 static ClusterR4PrerequisiteSnapshot
@@ -1152,6 +1212,8 @@ test_gate_reset(void)
 	test_strong_random_calls = 0;
 	test_system_identifier = 0;
 	test_qvotec_in_quorum = true;
+	test_stop_real_observation = false;
+	test_stop_not_fresh_peer = -1;
 	test_qvotec_self_incarnation = UINT64_C(0x445566778899aabb);
 	test_last_admitted_incarnation = UINT64_C(0x445566778899aabb);
 	memset(test_remote_admitted_incarnations, 0,
@@ -10575,6 +10637,41 @@ UT_TEST(test_terminal_peer_disconnect_does_not_cover_identity_or_capability_cont
 	test_gate_reset();
 }
 
+UT_TEST(test_stop_real_observation_survives_terminal_peer_alive_clear)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint64 incarnations[4], lo, hi, epoch;
+	ut_a148_stop_identity(&open, root, 0);
+	for (int node = 0; node < 4; node++) {
+		test_observed_slot_valid[node] = true;
+		test_observed_slot_incarnation[node]
+			= cluster_membership_get_last_admitted_incarnation(node);
+		test_observed_slot_generation[node] = 20 + node;
+		test_observed_slot_epoch[node] = 0;
+	}
+	test_stop_real_observation = true;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	test_terminal_peer_open = open;
+	memcpy(test_terminal_peer_root, root, sizeof(root));
+	test_terminal_peer_record_enabled = test_terminal_peer_eligible = true;
+	test_terminal_peer_record
+		= (ClusterSfPeerCap){ .valid = true, .bits = test_peer_capability_word, .generation = 19 };
+	UT_ASSERT(cluster_sf_peer_cap_invalidate_gen(&test_terminal_peer_record, 19));
+	test_stop_not_fresh_peer = 3;
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_admitted_membership(&lo, &hi, &epoch));
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(incarnations[3], UINT64_C(0x103));
+	/* Same actual upper matcher must still reject a genuine identity change. */
+	test_observed_slot_incarnation[3]++;
+	UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	test_terminal_peer_record_enabled = test_terminal_peer_eligible = false;
+	test_gate_reset();
+}
+
 static int a148_stop_mutation;
 
 static void
@@ -11148,7 +11245,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(307);
+	UT_PLAN(308);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
@@ -11442,6 +11539,7 @@ main(void)
 	UT_RUN(test_a148_stop_identity_observation_gaps_do_not_publish_partial_identity);
 	UT_RUN(test_terminal_peer_disconnect_allows_only_normal_stop_receipt_observation);
 	UT_RUN(test_terminal_peer_disconnect_does_not_cover_identity_or_capability_contradiction);
+	UT_RUN(test_stop_real_observation_survives_terminal_peer_alive_clear);
 	UT_RUN(test_a148_stop_identity_rechecks_each_original_publication);
 	UT_RUN(test_a148_stop_read_uses_original_mailbox_before_identity);
 	UT_RUN(test_a148_stop_read_preserves_every_existing_mailbox_owner);

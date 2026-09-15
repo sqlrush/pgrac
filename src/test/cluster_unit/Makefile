@@ -4289,7 +4289,15 @@ test_cluster_normal_cold_postjobs.inc: $(top_srcdir)/src/backend/access/transam/
 	@awk '/^StartupXLOG\(/ { fn=1 } fn && /PGRAC MODIFICATIONS \(spec-4.8 D1\): resolve crash-left/ { print "/*"; emit=1; starts++ } \
 		emit && /^#endif/ { done=1; exit } emit { print } END { if (!done || starts != 1) exit 1 }' $< > $@
 
+# PGRAC: compile the actual observation predicate behind the semantic caller;
+# fixture values are external inputs, never a hand-copied liveness decision.
+test_cluster_stop_membership_observation.inc: $(top_srcdir)/src/backend/cluster/cluster_reconfig.c Makefile
+	@awk '/^cluster_reconfig_r4_membership_observations_current\(/ { emit=1; starts++; print "static bool" } \
+		emit && /^\/\* Formation-LMON-only/ { done=1; exit } emit { print } \
+		END { if (!done || starts != 1) exit 1 }' $< > $@
+
 test_cluster_r4_activation_fsm: test_cluster_r4_activation_fsm.c unit_test.h test_cluster_normal_cold_scn.inc \
+		test_cluster_stop_membership_observation.inc \
 		test_cluster_normal_cold_startup.h test_cluster_normal_cold_capture.inc \
 		test_cluster_normal_cold_prepare.inc test_cluster_normal_cold_postjobs.inc test_cluster_hw_complete_tail.inc \
 		test_cluster_normal_cold_runtime.h $(CLUSTER_UNDO_BLOCK0_RESIDENT_O) \
@@ -5087,7 +5095,13 @@ test_cluster_undo_authority: test_cluster_undo_authority.c unit_test.h \
 # validation and the LMON tick live in the heavy path (D5-2/D5-3) and are
 # covered by the t/370 TAP.
 CLUSTER_UNDO_HORIZON_O = $(top_builddir)/src/backend/cluster/cluster_undo_horizon.o
-test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h \
+# PGRAC: original sender and finite local report sampler, not a model of them.
+test_cluster_undo_horizon_sender.inc: $(top_srcdir)/src/backend/cluster/cluster_undo_horizon_ic.c Makefile
+	@awk '/^static SCN$$/ { emit=1; starts++ } \
+		emit && /^\/\* ---------------- cleaner-side/ { done=1; exit } emit { print } \
+		END { if (!done || starts != 1) exit 1 }' $< > $@
+
+test_cluster_undo_horizon: test_cluster_undo_horizon.c unit_test.h test_cluster_undo_horizon_sender.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_HORIZON_O) \

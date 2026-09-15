@@ -3,6 +3,8 @@
  * test_cluster_sf_dep.c
  *	  spec-6.2 Smart Fusion dependency-vector unit tests.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #define USE_PGRAC_CLUSTER 1
@@ -70,6 +72,13 @@ static ClusterSfDurableGossipMsg test_sf_message;
 static TimestampTz test_sf_now;
 static LWLock *test_sf_held_lock;
 static bool test_sf_control_sealed;
+static bool test_sf_all_checkpoint_proved;
+
+bool
+cluster_normal_stop_pi_retirement_allowed(void)
+{
+	return test_sf_all_checkpoint_proved;
+}
 
 bool
 cluster_normal_stop_service_control_sealed(void)
@@ -789,6 +798,7 @@ test_sf_publish_setup(uint32 caps)
 	test_sf_flush_reads = 0;
 	test_sf_sends = 0;
 	test_sf_control_sealed = false;
+	test_sf_all_checkpoint_proved = false;
 	test_sf_cap_store_reset();
 	cluster_sf_note_peer_hello_capabilities_gen(TEST_SF_CAP_PEER, caps, 1);
 }
@@ -938,6 +948,29 @@ UT_TEST(test_durable_publisher_stops_new_work_only_after_final_control_seal)
 	test_sf_control_sealed = false;
 }
 
+UT_TEST(test_durable_publisher_stops_at_all_member_checkpoint_cut)
+{
+	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
+						  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+	test_sf_now = INT64CONST(500000000);
+	cluster_sf_origin_durable_lmon_tick();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	/* seal1, final release not yet armed: actual full-stop proof is the
+	 * boundary input, not service seal2 or a caller elapsed-time guess. */
+	test_sf_all_checkpoint_proved = true;
+	test_sf_now += 50000;
+	test_sf_flush = 4900;
+	cluster_sf_origin_durable_lmon_tick();
+	cluster_sf_publish_origin_durable_lsn();
+	UT_ASSERT_EQ(test_sf_sends, 1);
+	UT_ASSERT_EQ(test_sf_flush_reads, 1);
+	UT_ASSERT_EQ(test_sf_message.durable_lsn, 3500);
+	UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(0), 3500);
+	test_sf_all_checkpoint_proved = false;
+	cluster_sf_publish_origin_durable_lsn();
+	UT_ASSERT_EQ(test_sf_sends, 2); /* Incomplete proof must keep supply. */
+}
+
 UT_TEST(test_sf_stop_requires_initialized_store_even_when_disabled)
 {
 	const char *reason;
@@ -1036,7 +1069,7 @@ UT_TEST(test_sf_stop_satisfied_cache_invalid_residue_and_lock_order)
 int
 main(void)
 {
-	UT_PLAN(32);
+	UT_PLAN(33);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_sf_stop_requires_initialized_store_even_when_disabled);
 	UT_RUN(test_sf_stop_real_install_and_durable_cut_are_read_only);
@@ -1069,6 +1102,7 @@ main(void)
 	UT_RUN(test_publisher_waits_for_recovery_before_reading_flush);
 	UT_RUN(test_lmon_tick_continues_after_recovery_without_commit);
 	UT_RUN(test_durable_publisher_stops_new_work_only_after_final_control_seal);
+	UT_RUN(test_durable_publisher_stops_at_all_member_checkpoint_cut);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

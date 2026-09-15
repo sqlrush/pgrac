@@ -69,6 +69,7 @@ struct Latch; /* spec-5.15 D4 — join-marker qvotec mailbox latch (pointer only
 
 
 struct ClusterFormationSnapshotV1;
+struct ClusterSemanticActivationRecord;
 
 #define CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK UINT32_C(0x0000007f)
 #define CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED UINT32_C(0x80000000)
@@ -945,6 +946,11 @@ extern bool cluster_reconfig_lmon_snapshot_r4_membership(
 extern bool cluster_reconfig_lmon_snapshot_admitted_membership(
 	uint64 *out_members_lo, uint64 *out_members_hi,
 	uint64 *out_formation_epoch);
+/* Existing exact terminal receipt proof may replace remote online liveness
+ * only for normal-stop observation. No new admission or mutable authority. */
+extern bool cluster_reconfig_normal_stop_snapshot_admitted_membership(
+	const struct ClusterSemanticActivationRecord *open_record, const uint8 *root_descriptor,
+	uint64 *out_members_lo, uint64 *out_members_hi, uint64 *out_formation_epoch);
 /* Target-LMON phase-3 sender.  The positive snapshot remains instantaneous;
  * this tick revalidates its exact episode/JCMK route and retransmits the
  * canonical opcode-18 image until target-side ADMITTED observation. */

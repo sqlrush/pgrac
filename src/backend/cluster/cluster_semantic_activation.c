@@ -1152,9 +1152,10 @@ semantic_activation_ack_self_tuple(
 }
 
 static bool
-semantic_activation_ack_current_authority(
+semantic_activation_ack_current_authority_internal(
 	int32 local_node_id, uint64 *out_members_lo, uint64 *out_members_hi,
-	uint64 *out_formation_epoch, int32 *out_coordinator_node)
+	uint64 *out_formation_epoch, int32 *out_coordinator_node,
+	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root)
 {
 	uint64 members_lo;
 	uint64 members_hi;
@@ -1171,12 +1172,13 @@ semantic_activation_ack_current_authority(
 	*out_members_hi = 0;
 	*out_formation_epoch = 0;
 	*out_coordinator_node = -1;
-	if (local_node_id < 0 || local_node_id >= CLUSTER_MAX_NODES
-		|| !cluster_qvotec_in_quorum()
-		|| !cluster_reconfig_lmon_snapshot_admitted_membership(
-			&members_lo, &members_hi, &formation_epoch)
-		|| members_lo == 0 || members_hi != 0
-		|| (members_lo & ~UINT64_C(0x0000ffff)) != 0)
+	if (local_node_id < 0 || local_node_id >= CLUSTER_MAX_NODES || !cluster_qvotec_in_quorum()
+		|| !(stop_record != NULL
+				 ? cluster_reconfig_normal_stop_snapshot_admitted_membership(
+					   stop_record, stop_root, &members_lo, &members_hi, &formation_epoch)
+				 : cluster_reconfig_lmon_snapshot_admitted_membership(&members_lo, &members_hi,
+																	  &formation_epoch))
+		|| members_lo == 0 || members_hi != 0 || (members_lo & ~UINT64_C(0x0000ffff)) != 0)
 		return false;
 
 	current_epoch = cluster_epoch_get_current();
@@ -1213,6 +1215,16 @@ semantic_activation_ack_current_authority(
 	*out_formation_epoch = formation_epoch;
 	*out_coordinator_node = coordinator_node;
 	return true;
+}
+
+static bool
+semantic_activation_ack_current_authority(int32 local_node_id, uint64 *out_members_lo,
+										  uint64 *out_members_hi, uint64 *out_formation_epoch,
+										  int32 *out_coordinator_node)
+{
+	return semantic_activation_ack_current_authority_internal(local_node_id, out_members_lo,
+															  out_members_hi, out_formation_epoch,
+															  out_coordinator_node, NULL, NULL);
 }
 
 /*
@@ -15103,8 +15115,8 @@ cluster_semantic_normal_stop_match(
 	reason = "SEMANTIC_STOP_OBSERVATION_PENDING";
 	if (!semantic_activation_snapshot(&before) || !semantic_activation_ack_table_snapshot(&table)
 		|| !semantic_activation_pgrd_snapshot_copy(root)
-		|| !semantic_activation_ack_current_authority(cluster_node_id, &lo, &hi, &epoch,
-													  &coordinator))
+		|| !semantic_activation_ack_current_authority_internal(
+			cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor))
 		goto done;
 	result = CLUSTER_NORMAL_STOP_INVALID;
 	reason = "SEMANTIC_STOP_IDENTITY_INVALID";
@@ -15146,8 +15158,8 @@ cluster_semantic_normal_stop_match(
 	if (!semantic_activation_snapshot(&after)
 		|| !semantic_activation_ack_table_snapshot(&table_after)
 		|| !semantic_activation_pgrd_snapshot_copy(root_after)
-		|| !semantic_activation_ack_current_authority(cluster_node_id, &lo, &hi, &epoch,
-													  &coordinator))
+		|| !semantic_activation_ack_current_authority_internal(
+			cluster_node_id, &lo, &hi, &epoch, &coordinator, open_record, root_descriptor))
 		goto done;
 	if (before.seq != after.seq || before.active_bits != after.active_bits
 		|| before.record_generation != after.record_generation

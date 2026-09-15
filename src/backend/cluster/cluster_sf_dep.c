@@ -994,11 +994,11 @@ cluster_sf_publish_origin_durable_lsn(void)
 	 * store is independent of the optional early-transfer dependency array. */
 	if (!cluster_enabled || ClusterSfDep == NULL || !cluster_sf_dep_origin_valid(cluster_node_id))
 		return;
-	/* Keep durability supply through seal1 and the actual shutdown checkpoint.
-	 * After the second actor cut, existing dependencies and delivery are
-	 * closed: a periodic new gossip would recreate outbound work behind that
-	 * cut. Do not erase already queued frames or alter observed durability. */
-	if (cluster_normal_stop_service_control_sealed())
+	/* Keep supply until every real post-checkpoint owner has proved its
+	 * durability. Stop NEW gossip before final release lets peers disconnect;
+	 * waiting for seal2 would recreate outbound work behind that peer cut.
+	 * Existing frames and observed durability remain owned and unchanged. */
+	if (cluster_normal_stop_service_control_sealed() || cluster_normal_stop_pi_retirement_allowed())
 		return;
 	/* LMON starts before local WAL recovery. GetFlushRecPtr is valid only
 	 * after recovery; the next ordinary tick will retry without a caller. */

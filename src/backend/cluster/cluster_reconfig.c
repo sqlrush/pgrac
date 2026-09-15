@@ -8337,7 +8337,8 @@ out:
 
 static bool
 cluster_reconfig_r4_membership_observations_current(
-	ClusterR4MembershipSnapshot *candidate, bool freeze_generations)
+	ClusterR4MembershipSnapshot *candidate, bool freeze_generations,
+	const ClusterSemanticActivationRecord *stop_record, const uint8 *stop_root)
 {
 	int node;
 
@@ -8361,13 +8362,13 @@ cluster_reconfig_r4_membership_observations_current(
 		if (!admitted)
 			continue;
 		if (cluster_conf_lookup_node(node) == NULL
-			|| !cluster_reconfig_get_observed_slot(
-				node, &incarnation, &generation)
-			|| generation == 0
-			|| incarnation != candidate->admitted_incarnation[node]
-			|| !cluster_reconfig_get_observed_fresh_alive(node)
-			|| cluster_reconfig_get_observed_epoch(node)
-				   != candidate->formation_epoch)
+			|| !cluster_reconfig_get_observed_slot(node, &incarnation, &generation)
+			|| generation == 0 || incarnation != candidate->admitted_incarnation[node]
+			|| (!cluster_reconfig_get_observed_fresh_alive(node)
+				&& (stop_record == NULL || stop_root == NULL || node == cluster_node_id
+					|| !cluster_normal_stop_peer_receipt_tail(stop_record, stop_root, node,
+															  incarnation)))
+			|| cluster_reconfig_get_observed_epoch(node) != candidate->formation_epoch)
 			return false;
 		if (freeze_generations)
 			candidate->observed_generation[node] = generation;
@@ -8381,9 +8382,10 @@ cluster_reconfig_r4_membership_observations_current(
  * helper is observation-only: it copies under the reconfiguration lock,
  * validates QVOTEC currentness outside the lock, then byte-revalidates the
  * shared tuple and the same receiver-local observations. */
-bool
-cluster_reconfig_lmon_snapshot_r4_membership(
-	ClusterR4MembershipSnapshot *out)
+static bool
+cluster_reconfig_lmon_snapshot_r4_membership_internal(
+	ClusterR4MembershipSnapshot *out, const ClusterSemanticActivationRecord *stop_record,
+	const uint8 *stop_root)
 {
 	ClusterR4MembershipSnapshot candidate;
 	uint64 self_bit;
@@ -8426,15 +8428,12 @@ cluster_reconfig_lmon_snapshot_r4_membership(
 
 	self_bit = UINT64_C(1) << (cluster_node_id < 64
 								 ? cluster_node_id : cluster_node_id - 64);
-	if (!exact
-		|| (candidate.admitted_members_lo | candidate.admitted_members_hi) == 0
-		|| (cluster_node_id < 64
-				? (candidate.admitted_members_lo & self_bit) == 0
-				: (candidate.admitted_members_hi & self_bit) == 0)
-		|| candidate.admitted_incarnation[cluster_node_id]
-			   != candidate.local_self_boot_incarnation
-		|| !cluster_reconfig_r4_membership_observations_current(
-			&candidate, true))
+	if (!exact || (candidate.admitted_members_lo | candidate.admitted_members_hi) == 0
+		|| (cluster_node_id < 64 ? (candidate.admitted_members_lo & self_bit) == 0
+								 : (candidate.admitted_members_hi & self_bit) == 0)
+		|| candidate.admitted_incarnation[cluster_node_id] != candidate.local_self_boot_incarnation
+		|| !cluster_reconfig_r4_membership_observations_current(&candidate, true, stop_record,
+																stop_root))
 		return false;
 
 	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
@@ -8458,11 +8457,17 @@ cluster_reconfig_lmon_snapshot_r4_membership(
 	}
 	LWLockRelease(&ReconfigShmem->lock);
 	if (!exact
-		|| !cluster_reconfig_r4_membership_observations_current(
-			&candidate, false))
+		|| !cluster_reconfig_r4_membership_observations_current(&candidate, false, stop_record,
+																stop_root))
 		return false;
 	*out = candidate;
 	return true;
+}
+
+bool
+cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnapshot *out)
+{
+	return cluster_reconfig_lmon_snapshot_r4_membership_internal(out, NULL, NULL);
 }
 
 /* Compatibility projection for callers that consume only the global bitmap
@@ -8483,6 +8488,29 @@ cluster_reconfig_lmon_snapshot_admitted_membership(
 	if (out_members_lo == NULL || out_members_hi == NULL
 		|| out_formation_epoch == NULL
 		|| !cluster_reconfig_lmon_snapshot_r4_membership(&snapshot))
+		return false;
+	*out_members_lo = snapshot.admitted_members_lo;
+	*out_members_hi = snapshot.admitted_members_hi;
+	*out_formation_epoch = snapshot.formation_epoch;
+	return true;
+}
+
+bool
+cluster_reconfig_normal_stop_snapshot_admitted_membership(
+	const ClusterSemanticActivationRecord *open_record, const uint8 *root_descriptor,
+	uint64 *out_members_lo, uint64 *out_members_hi, uint64 *out_formation_epoch)
+{
+	ClusterR4MembershipSnapshot snapshot;
+	if (out_members_lo != NULL)
+		*out_members_lo = 0;
+	if (out_members_hi != NULL)
+		*out_members_hi = 0;
+	if (out_formation_epoch != NULL)
+		*out_formation_epoch = 0;
+	if (open_record == NULL || root_descriptor == NULL || out_members_lo == NULL
+		|| out_members_hi == NULL || out_formation_epoch == NULL
+		|| !cluster_reconfig_lmon_snapshot_r4_membership_internal(&snapshot, open_record,
+																  root_descriptor))
 		return false;
 	*out_members_lo = snapshot.admitted_members_lo;
 	*out_members_hi = snapshot.admitted_members_hi;
@@ -10783,6 +10811,16 @@ cluster_reconfig_lmon_snapshot_r4_membership(
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	return false;
+}
+
+bool
+cluster_reconfig_normal_stop_snapshot_admitted_membership(
+	const ClusterSemanticActivationRecord *open_record pg_attribute_unused(),
+	const uint8 *root_descriptor pg_attribute_unused(), uint64 *out_members_lo,
+	uint64 *out_members_hi, uint64 *out_formation_epoch)
+{
+	return cluster_reconfig_lmon_snapshot_admitted_membership(out_members_lo, out_members_hi,
+															  out_formation_epoch);
 }
 
 ClusterR4PrerequisiteSnapshot

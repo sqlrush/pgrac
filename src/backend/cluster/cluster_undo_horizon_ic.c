@@ -43,6 +43,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
@@ -326,6 +327,11 @@ cluster_undo_horizon_lmon_tick(void)
 	int pi;
 
 	if (!cluster_enabled || cluster_node_id < 0 || UndoHorizonShmem == NULL)
+		return;
+	/* All-member post-checkpoint proof also proves every retention consumer
+	 * permanently parked. Do not start new gossip after peers may complete
+	 * final release. Existing transport work and finite reports stay intact. */
+	if (cluster_normal_stop_service_control_sealed() || cluster_normal_stop_pi_retirement_allowed())
 		return;
 
 	/* one report per main-loop interval even when the latch churns */

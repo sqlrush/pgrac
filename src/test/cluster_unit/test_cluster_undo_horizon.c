@@ -28,6 +28,15 @@
 #include "postgres.h"
 
 #include "cluster/cluster_undo_horizon.h"
+#include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic.h"
+#include "cluster/cluster_ic_envelope.h"
+#include "cluster/cluster_mrp.h"
+#include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_undo_retention.h"
+#include "utils/timestamp.h"
 
 #undef printf
 #undef fprintf
@@ -36,6 +45,104 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+/* The generated product functions touch the shared store only for NULL
+ * admission. No report slot, queue or fold result is manufactured here. */
+static int test_horizon_store;
+static void *UndoHorizonShmem = &test_horizon_store;
+bool cluster_enabled = true;
+int cluster_node_id = 0;
+int cluster_lmon_main_loop_interval = 1000;
+static TimestampTz test_horizon_now = INT64CONST(10000000);
+static unsigned test_horizon_sends;
+static bool test_horizon_cut;
+static bool test_horizon_seal;
+static bool test_horizon_capable = true;
+static ClusterUndoHorizonWire test_horizon_last;
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return test_horizon_now;
+}
+uint64
+cluster_epoch_get_current(void)
+{
+	return 7;
+}
+SCN
+cluster_undo_retention_horizon(void)
+{
+	return (SCN)500;
+}
+bool
+cluster_mrp_should_start(void)
+{
+	return false;
+}
+SCN
+cluster_mrp_standby_consistent_scn(void)
+{
+	return InvalidScn;
+}
+bool
+cluster_normal_stop_pi_retirement_allowed(void)
+{
+	return test_horizon_cut;
+}
+bool
+cluster_normal_stop_service_control_sealed(void)
+{
+	return test_horizon_seal;
+}
+bool
+cluster_sf_peer_supports_undo_horizon(int32 peer_id)
+{
+	return test_horizon_capable && peer_id > 0 && peer_id < 4;
+}
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id)
+{
+	static const ClusterNodeInfo node = { 0 };
+	return node_id >= 0 && node_id < 4 ? &node : NULL;
+}
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 type, int32 destination, const void *payload, uint32 length)
+{
+	Assert(type == PGRAC_IC_MSG_UNDO_HORIZON && destination > 0 && destination < 4);
+	Assert(length == sizeof(test_horizon_last));
+	memcpy(&test_horizon_last, payload, length);
+	test_horizon_sends++;
+	return CLUSTER_IC_SEND_DONE;
+}
+
+#include "test_cluster_undo_horizon_sender.inc"
+
+UT_TEST(test_original_horizon_sender_stops_only_after_all_checkpoint_cut)
+{
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, 3);
+	UT_ASSERT_EQ(test_horizon_last.horizon_scn, 500);
+	UT_ASSERT_EQ(test_horizon_last.epoch, 7);
+	test_horizon_cut = true;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, 3);
+	UT_ASSERT_EQ(test_horizon_last.horizon_scn, 500);
+	test_horizon_cut = false;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, 6);
+	test_horizon_seal = true;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, 6);
+	test_horizon_seal = false;
+	test_horizon_capable = false;
+	test_horizon_now += 1000001;
+	cluster_undo_horizon_lmon_tick();
+	UT_ASSERT_EQ(test_horizon_sends, 6);
+}
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -538,7 +645,7 @@ UT_TEST(test_reason_names)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
 
 	UT_RUN(test_u1_no_required_peer);
 	UT_RUN(test_u2_all_fresh_min);
@@ -561,6 +668,8 @@ main(void)
 	UT_RUN(test_u17_idle_sentinel_skipped);
 	UT_RUN(test_u17b_idle_sentinel_still_proven);
 	UT_RUN(test_reason_names);
+	UT_RUN(test_original_horizon_sender_stops_only_after_all_checkpoint_cut);
 
 	UT_DONE();
+	return ut_failed_count == 0 ? 0 : 1;
 }

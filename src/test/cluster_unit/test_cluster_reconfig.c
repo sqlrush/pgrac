@@ -2585,6 +2585,82 @@ ut_prepare_exact_r4_membership(void)
 	}
 }
 
+static bool ut_stop_tail_proved;
+static ClusterSemanticActivationRecord ut_stop_open;
+static uint8 ut_stop_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+
+/* Five-leg owner proof is tested through the actual exchange in the
+ * normal-stop suite. Here only that boundary input is supplied; membership
+ * and QVOTEC observed-slot producers/getters are the real linked product. */
+bool
+cluster_normal_stop_peer_receipt_tail(const ClusterSemanticActivationRecord *open,
+									  const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+									  int peer, uint64 incarnation)
+{
+	return ut_stop_tail_proved && peer == 3 && incarnation == UINT64_C(103) && open != NULL
+		   && root != NULL && memcmp(open, &ut_stop_open, sizeof(*open)) == 0
+		   && memcmp(root, ut_stop_root, sizeof(ut_stop_root)) == 0;
+}
+
+UT_TEST(test_stop_membership_terminal_peer_is_not_online_admission)
+{
+	uint64 lo = 99, hi = 99, epoch = 99;
+	ut_prepare_exact_r4_membership();
+	memset(&ut_stop_open, 0, sizeof(ut_stop_open));
+	memset(ut_stop_root, 0x4a, sizeof(ut_stop_root));
+	ut_stop_tail_proved = true;
+	cluster_reconfig_record_observed_fresh_alive(3, false);
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_admitted_membership(&lo, &hi, &epoch));
+	UT_ASSERT_EQ(lo | hi | epoch, 0);
+	UT_ASSERT(cluster_reconfig_normal_stop_snapshot_admitted_membership(&ut_stop_open, ut_stop_root,
+																		&lo, &hi, &epoch));
+	UT_ASSERT_EQ(lo, 15);
+	UT_ASSERT_EQ(hi | epoch, 0);
+	UT_ASSERT(!cluster_reconfig_get_observed_fresh_alive(3));
+	ut_stop_tail_proved = false;
+}
+
+UT_TEST(test_stop_membership_preserves_all_nonliveness_requirements)
+{
+	for (unsigned fault = 0; fault < 8; fault++) {
+		uint64 lo = 99, hi = 99, epoch = 99;
+		ut_prepare_exact_r4_membership();
+		ut_stop_tail_proved = true;
+		cluster_reconfig_record_observed_fresh_alive(3, false);
+		switch (fault) {
+		case 0:
+			ut_stop_tail_proved = false;
+			break;
+		case 1:
+			cluster_reconfig_record_observed_fresh_alive(0, false);
+			break;
+		case 2:
+			ut_in_quorum_value = false;
+			break;
+		case 3:
+			cluster_reconfig_record_observed_slot(3, 999, 23, 0);
+			break;
+		case 4:
+			cluster_reconfig_record_observed_slot(3, 103, 0, 0);
+			break;
+		case 5:
+			cluster_reconfig_record_observed_slot(3, 103, 23, 1);
+			break;
+		case 6:
+			ut_qvotec_status = CLUSTER_QVOTEC_STARTING;
+			break;
+		case 7:
+			ut_declared_set[3] = false;
+			break;
+		}
+		UT_ASSERT(!cluster_reconfig_normal_stop_snapshot_admitted_membership(
+			&ut_stop_open, ut_stop_root, &lo, &hi, &epoch));
+		UT_ASSERT_EQ(lo | hi | epoch, 0);
+	}
+	ut_stop_tail_proved = false;
+	ut_prepare_exact_r4_membership();
+}
+
 UT_TEST(test_r4_membership_snapshot_captures_exact_current_four_node_view)
 {
 	ClusterR4MembershipSnapshot snapshot;
@@ -7163,7 +7239,9 @@ UT_TEST(test_stop_reconfig_actual_formation_owner)
 int
 main(void)
 {
-	UT_PLAN(119);
+	UT_PLAN(121);
+	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
+	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
 	UT_RUN(test_stop_reconfig_actual_formation_owner);
 
