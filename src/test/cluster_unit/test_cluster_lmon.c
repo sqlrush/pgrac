@@ -41,11 +41,16 @@
 #include <time.h>
 
 #include "cluster/cluster_ic_rdma.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_lmd.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_tt_status_hint.h"
 #include "storage/proc.h"
+#include "storage/ipc.h"
+#include "postmaster/auxprocess.h"
+#include "utils/elog.h"
 
 #undef printf
 #undef fprintf
@@ -69,6 +74,7 @@
  */
 
 bool IsUnderPostmaster = false;
+bool cluster_lmd_enabled = true;
 volatile sig_atomic_t ConfigReloadPending = false;
 volatile sig_atomic_t ShutdownRequestPending = false;
 int MyProcPid = 0;
@@ -85,6 +91,28 @@ static int test_lmon_clock_calls = 0;
 static bool test_lmon_seed_saturation = false;
 static int test_pcm_reclaim_ticks = 0;
 
+/* Actual service primitives; attachment/controller/module payloads are
+ * explicit boundary fixtures, not a full normal-stop identity proof. */
+static ClusterCleanLeaveSharedState test_stop_region;
+static ClusterLeaveState *cl_state = &test_stop_region.leave;
+static ClusterNormalStopState *cl_normal_stop;
+static uint32 cl_normal_stop_service_depth, cl_normal_stop_service_bit;
+AuxProcType MyAuxProcType = LmonProcess;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+static pg_on_exit_callback test_stop_exit_callback;
+static bool test_stop_on, test_stop_transport;
+static int test_stop_case, test_stop_exit_code, test_stop_error_level;
+static unsigned test_stop_duties, test_stop_events, test_stop_polls, test_stop_frees;
+static char test_stop_last_detail[256];
+static TimestampTz test_stop_now;
+static LWLock *test_stop_locks[8];
+static unsigned test_stop_lock_depth;
+static ClusterNormalStopPollResult test_stop_observation[20];
+static void test_stop_work(bool event);
+static int test_stop_wait(WaitEvent *events);
+#include "test_cluster_lmon_stop_service.inc"
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
@@ -94,19 +122,35 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 }
 
 bool
-errstart(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart(int e, const char *d pg_attribute_unused())
 {
-	return false;
+	test_stop_error_level = e;
+	return e >= ERROR || (test_stop_on && e == LOG);
 }
 bool
-errstart_cold(int e pg_attribute_unused(), const char *d pg_attribute_unused())
+errstart_cold(int e, const char *d)
 {
-	return false;
+	return errstart(e, d);
 }
 void
 errfinish(const char *f pg_attribute_unused(), int l pg_attribute_unused(),
 		  const char *fn pg_attribute_unused())
-{}
+{
+	if (test_stop_error_level < ERROR)
+		return;
+	if (test_stop_error_level >= FATAL)
+		proc_exit(1);
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	proc_exit(1);
+}
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	proc_exit(1);
+}
 int
 errcode(int s pg_attribute_unused())
 {
@@ -123,8 +167,13 @@ errmsg_internal(const char *f pg_attribute_unused(), ...)
 	return 0;
 }
 int
-errdetail(const char *f pg_attribute_unused(), ...)
+errdetail(const char *f, ...)
 {
+	va_list args;
+	va_start(args, f);
+	if (test_stop_on && strstr(f, "domain=%s") != NULL)
+		vsnprintf(test_stop_last_detail, sizeof(test_stop_last_detail), f, args);
+	va_end(args);
 	return 0;
 }
 int
@@ -158,21 +207,38 @@ void
 LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute_unused())
 {}
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
+	if (test_stop_on) {
+		if (test_stop_lock_depth >= lengthof(test_stop_locks))
+			abort();
+		if (lock == &cl_state->lock)
+			UT_ASSERT_EQ(test_stop_lock_depth, 0);
+		test_stop_locks[test_stop_lock_depth++] = lock;
+	}
 	test_lwlock_blocking_calls++;
 	return true;
 }
 bool
-LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
-						 LWLockMode mode pg_attribute_unused())
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	test_lwlock_conditional_calls++;
 	return test_lwlock_conditional_result;
 }
 void
-LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+LWLockRelease(LWLock *lock)
+{
+	if (test_stop_on) {
+		if (test_stop_lock_depth == 0 || test_stop_locks[test_stop_lock_depth - 1] != lock)
+			abort();
+		test_stop_lock_depth--;
+	}
+}
+void
+LWLockReleaseAll(void)
+{
+	test_stop_lock_depth = 0;
+}
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr)
@@ -192,7 +258,7 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	return test_stop_on ? test_stop_now : 0;
 }
 
 /*
@@ -268,18 +334,20 @@ cluster_gcs_block_family_on_data_plane(void)
 int
 cluster_ic_tier1_listener_bind(void)
 {
-	return -1;
+	return test_stop_on ? 42 : -1;
 }
 bool
 cluster_ic_tier1_accept_one(int *out_peer_fd pg_attribute_unused(),
 							int32 *out_peer_id pg_attribute_unused())
 {
+	if (test_stop_on)
+		test_stop_work(true);
 	return false;
 }
 int
 cluster_ic_tier1_get_listener_fd(void)
 {
-	return -1;
+	return test_stop_on ? 42 : -1;
 }
 int
 cluster_ic_tier1_get_peer_fd(int32 peer_id pg_attribute_unused())
@@ -473,17 +541,15 @@ static ClusterICMsgTypeInfo test_semantic_ack_registration;
 void
 cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info)
 {
-	if (info != NULL
-		&& info->msg_type == PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1) {
+	if (info != NULL && info->msg_type == PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1) {
 		test_semantic_ack_registration = *info;
 		test_semantic_ack_registered = true;
 	}
 }
 
 void
-cluster_semantic_activation_ack_handler(
-	const ClusterICEnvelope *env pg_attribute_unused(),
-	const void *payload pg_attribute_unused())
+cluster_semantic_activation_ack_handler(const ClusterICEnvelope *env pg_attribute_unused(),
+										const void *payload pg_attribute_unused())
 {}
 
 /* spec-2.32 D4 stub:  cluster_lmon_shmem_init calls cluster_gcs_register_msg_types. */
@@ -518,9 +584,9 @@ cluster_sinval_broadcast_reset_all(void)
 
 /* spec-3.2 D6 + D1 / spec-8.4 D10: gated drain + msg_type register. */
 ClusterSemanticAdmissionResult
-cluster_tt_status_hint_source_dispatch(
-	ClusterTTStatusHintSourceOp op pg_attribute_unused(),
-	const ClusterTTStatusHintSourceRequest *request pg_attribute_unused())
+cluster_tt_status_hint_source_dispatch(ClusterTTStatusHintSourceOp op pg_attribute_unused(),
+									   const ClusterTTStatusHintSourceRequest *request
+										   pg_attribute_unused())
 {
 	return CLUSTER_SEMANTIC_ADMISSION_OK;
 }
@@ -640,7 +706,7 @@ MemoryContext CurrentMemoryContext = NULL;
 WaitEventSet *
 CreateWaitEventSet(MemoryContext cxt pg_attribute_unused(), int nevents pg_attribute_unused())
 {
-	return NULL;
+	return test_stop_on ? (WaitEventSet *)(uintptr_t)1 : NULL;
 }
 int
 AddWaitEventToSet(WaitEventSet *set pg_attribute_unused(), uint32 events pg_attribute_unused(),
@@ -651,14 +717,27 @@ AddWaitEventToSet(WaitEventSet *set pg_attribute_unused(), uint32 events pg_attr
 }
 int
 WaitEventSetWait(WaitEventSet *set pg_attribute_unused(), long timeout pg_attribute_unused(),
-				 WaitEvent *occurred_events pg_attribute_unused(),
-				 int nevents pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
+				 WaitEvent *occurred_events, int nevents pg_attribute_unused(),
+				 uint32 wait_event_info pg_attribute_unused())
 {
+	if (test_stop_on)
+		return test_stop_wait(occurred_events);
 	return 0;
 }
 void
 FreeWaitEventSet(WaitEventSet *set pg_attribute_unused())
-{}
+{
+	if (test_stop_on) {
+		UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+		if (test_stop_case == 10)
+			UT_ASSERT_EQ(test_stop_polls, 0);
+		else
+			UT_ASSERT(test_stop_polls >= 6);
+		test_stop_frees++;
+		if (test_stop_case == 7)
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	}
+}
 void
 cluster_injection_run(const char *name pg_attribute_unused())
 {}
@@ -697,8 +776,13 @@ init_ps_display(const char *fixed_part pg_attribute_unused())
 {}
 
 void
-proc_exit(int code pg_attribute_unused())
+proc_exit(int code)
 {
+	pg_on_exit_callback callback = test_stop_exit_callback;
+	test_stop_exit_callback = NULL; /* native before_shmem_exit pops first */
+	test_stop_exit_code = code;
+	if (callback != NULL)
+		callback(code, 0);
 	if (test_lmon_exit_armed)
 		longjmp(test_lmon_exit_jump, 1);
 	abort();
@@ -726,6 +810,8 @@ int
 WaitLatch(struct Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused(),
 		  long timeout pg_attribute_unused(), uint32 wait_event_info pg_attribute_unused())
 {
+	if (test_stop_on)
+		return test_stop_wait(NULL);
 	test_lmon_wait_calls++;
 	ShutdownRequestPending = true;
 	return 0;
@@ -738,6 +824,13 @@ ResetLatch(struct Latch *latch pg_attribute_unused())
 void
 on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
 {}
+void
+before_shmem_exit(pg_on_exit_callback function, Datum arg)
+{
+	if (test_stop_exit_callback != NULL || arg != 0)
+		abort();
+	test_stop_exit_callback = function;
+}
 
 /* cluster_lmon.c references MyBackendType (set by LmonMain). */
 #include "miscadmin.h"
@@ -751,6 +844,8 @@ void cluster_fence_lmon_tick(void);
 void
 cluster_fence_lmon_tick(void)
 {
+	if (test_stop_on)
+		test_stop_work(false);
 	if (test_lmon_seed_saturation) {
 		test_lmon_state.timed_duty_sample_count = PG_UINT64_MAX;
 		test_lmon_state.total_iter_us = PG_UINT64_MAX - 5;
@@ -1002,22 +1097,16 @@ UT_TEST(test_lmon_iteration_counters_null_safe)
 UT_TEST(test_lmon_registers_semantic_ack_control_handler_without_broadcast)
 {
 	test_semantic_ack_registered = false;
-	memset(&test_semantic_ack_registration, 0,
-		   sizeof(test_semantic_ack_registration));
+	memset(&test_semantic_ack_registration, 0, sizeof(test_semantic_ack_registration));
 	cluster_lmon_shmem_init();
 
 	UT_ASSERT(test_semantic_ack_registered);
-	UT_ASSERT_EQ(test_semantic_ack_registration.msg_type,
-				 PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1);
-	UT_ASSERT_STR_EQ(test_semantic_ack_registration.name,
-				 "semantic_activation_ack_v1");
-	UT_ASSERT_EQ(test_semantic_ack_registration.allowed_producer_mask,
-				 CLUSTER_IC_PRODUCER_LMON);
+	UT_ASSERT_EQ(test_semantic_ack_registration.msg_type, PGRAC_IC_MSG_SEMANTIC_ACTIVATION_ACK_V1);
+	UT_ASSERT_STR_EQ(test_semantic_ack_registration.name, "semantic_activation_ack_v1");
+	UT_ASSERT_EQ(test_semantic_ack_registration.allowed_producer_mask, CLUSTER_IC_PRODUCER_LMON);
 	UT_ASSERT(!test_semantic_ack_registration.broadcast_ok);
-	UT_ASSERT(test_semantic_ack_registration.handler
-			  == cluster_semantic_activation_ack_handler);
-	UT_ASSERT_EQ(test_semantic_ack_registration.plane,
-				 CLUSTER_IC_PLANE_CONTROL);
+	UT_ASSERT(test_semantic_ack_registration.handler == cluster_semantic_activation_ack_handler);
+	UT_ASSERT_EQ(test_semantic_ack_registration.plane, CLUSTER_IC_PLANE_CONTROL);
 }
 
 static void
@@ -1027,6 +1116,7 @@ run_one_real_lmon_duty(uint64 start_us, uint64 finish_us, bool seed_saturation)
 		cluster_lmon_shmem_init();
 
 	IsUnderPostmaster = true;
+	MyAuxProcType = LmonProcess;
 	cluster_enabled = false;
 	ConfigReloadPending = false;
 	ShutdownRequestPending = false;
@@ -1187,14 +1277,664 @@ UT_TEST(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock)
 }
 
 
+/* Full production LmonMain and original service functions, with only the
+ * module observations, controller publication and socket readiness supplied
+ * by this harness. No fabricated transport shutdown is used as an idle poll. */
+static ClusterNormalStopPollResult
+test_stop_poll(unsigned module)
+{
+	UT_ASSERT(test_stop_on);
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(test_stop_lock_depth, 0);
+	UT_ASSERT_EQ(test_stop_frees, 0);
+	test_stop_polls++;
+	return test_stop_observation[module];
+}
+ClusterNormalStopPollResult
+cluster_grd_work_queue_normal_stop_poll(uint32 *slot, const char **reason)
+{
+	*slot = 0;
+	*reason = "FIXTURE_WORK_QUEUE";
+	return test_stop_poll(0);
+}
+ClusterNormalStopPollResult
+cluster_grd_outbound_normal_stop_poll(uint32 *slot, const char **reason)
+{
+	*slot = 0;
+	*reason = "FIXTURE_OUTBOUND";
+	return test_stop_poll(1);
+}
+ClusterNormalStopPollResult
+cluster_cr_server_normal_stop_poll(int *slot, const char **reason)
+{
+	*slot = 0;
+	*reason = "FIXTURE_CR";
+	return test_stop_poll(2);
+}
+ClusterNormalStopPollResult
+cluster_lms_native_probe_normal_stop_poll(int *slot, const char **reason)
+{
+	*slot = 0;
+	*reason = "FIXTURE_NATIVE_PROBE";
+	return test_stop_poll(3);
+}
+ClusterNormalStopPollResult
+cluster_gcs_block_normal_stop_local_poll(int *slot, const char **reason)
+{
+	*slot = 0;
+	*reason = "FIXTURE_GCS_LOCAL";
+	return test_stop_poll(4);
+}
+ClusterNormalStopPollResult
+cluster_ic_normal_stop_poll(const char **domain, int *peer, uint32 *seq, const char **reason)
+{
+	*domain = "FIXTURE_IC";
+	*peer = 1;
+	*seq = 0;
+	*reason = "FIXTURE_RETAINED_TAIL";
+	return test_stop_poll(5);
+}
+
+ClusterNormalStopPollResult
+cluster_semantic_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_R4";
+	*key = 16;
+	*reason = "FIXTURE_UNCONSUMED_R4_OWNER";
+	return test_stop_poll(6);
+}
+
+ClusterNormalStopPollResult
+cluster_scn_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_SCN";
+	*key = 1;
+	*reason = "FIXTURE_SCN_BOC_PENDING";
+	return test_stop_poll(7);
+}
+
+ClusterNormalStopPollResult
+cluster_reconfig_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_RECONFIG";
+	*key = 1;
+	*reason = "FIXTURE_MARKER_OWNER_PENDING";
+	return test_stop_poll(8);
+}
+
+ClusterNormalStopPollResult
+cluster_clean_leave_normal_stop_local_poll(int *peer, const char **reason)
+{
+	*peer = 1;
+	*reason = "FIXTURE_RETAINED_CLOSE_CONTROL";
+	return test_stop_poll(9);
+}
+
+ClusterNormalStopPollResult
+cluster_node_remove_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_NODE_REMOVE";
+	*key = 1;
+	*reason = "FIXTURE_NODE_REMOVE_OWNER_PENDING";
+	return test_stop_poll(10);
+}
+
+ClusterNormalStopPollResult
+cluster_fence_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_FENCE";
+	*key = 1;
+	*reason = "FIXTURE_SELF_REQUEST";
+	return test_stop_poll(11);
+}
+
+ClusterNormalStopPollResult
+cluster_write_fence_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_WRITE_FENCE";
+	*key = 1;
+	*reason = "FIXTURE_MARKER_OWNER";
+	return test_stop_poll(12);
+}
+
+ClusterNormalStopPollResult
+cluster_cf_normal_stop_poll(bool post_checkpoint, const char **reason)
+{
+	UT_ASSERT(!post_checkpoint); /* shared join hint awaits the original checkpoint */
+	*reason = "FIXTURE_CF_OWNER";
+	return test_stop_poll(13);
+}
+
+ClusterNormalStopPollResult
+cluster_recovery_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_RECOVERY";
+	*key = 128;
+	*reason = "FIXTURE_REPLAY_OWNER";
+	return test_stop_poll(14);
+}
+
+ClusterNormalStopPollResult
+cluster_backup_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_BACKUP";
+	*key = 127;
+	*reason = "FIXTURE_BACKUP_OWNER";
+	return test_stop_poll(15);
+}
+
+ClusterNormalStopPollResult
+cluster_mrp_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_MRP";
+	*key = 1;
+	*reason = "FIXTURE_PRIMARY_STATE";
+	return test_stop_poll(16);
+}
+
+ClusterNormalStopPollResult
+cluster_gcs_dedup_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_GCS_DEDUP";
+	*key = 1037;
+	*reason = "FIXTURE_GCS_UNCOMPLETED";
+	return test_stop_poll(17);
+}
+
+ClusterNormalStopPollResult
+cluster_ges_dedup_normal_stop_poll(const char **domain, uint64 *key, const char **reason)
+{
+	*domain = "FIXTURE_GES_DEDUP";
+	*key = 1038;
+	*reason = "FIXTURE_GES_UNCOMPLETED";
+	return test_stop_poll(18);
+}
+
+ClusterNormalStopPollResult
+cluster_lmd_probe_normal_stop_poll(uint64 *key, const char **reason)
+{
+	*key = 81;
+	*reason = "FIXTURE_LMD_PROBE";
+	return test_stop_poll(19);
+}
+
+static void
+test_stop_work(bool event)
+{
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
+	UT_ASSERT_EQ(test_stop_lock_depth, 0);
+	if (event)
+		test_stop_events++;
+	else
+		test_stop_duties++;
+	if (test_stop_case == 2 && !event && test_stop_duties == 1) {
+		UT_ASSERT(!cluster_normal_stop_requested());
+		pg_atomic_write_u32(&cl_normal_stop->requested, 1); /* postmaster boundary */
+		UT_ASSERT_EQ(cluster_normal_stop_service_idle(CLUSTER_NORMAL_STOP_READY),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask), 0);
+	}
+	if ((test_stop_case == 4 && !event) || (test_stop_case == 5 && event)) {
+		LWLockAcquire(&test_lmon_state.lwlock, LW_EXCLUSIVE);
+		ereport(ERROR, (errmsg("fixture failure while native LMON lock is held")));
+	}
+	if (test_stop_case == 9 && event) {
+		UT_ASSERT(!cluster_normal_stop_service_new_work(true));
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_LATE_UNSEALED_WORK);
+	}
+}
+
+static int
+test_stop_wait(WaitEvent *events)
+{
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(test_stop_lock_depth, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_active_mask), 0);
+	test_lmon_wait_calls++;
+	if (test_lmon_wait_calls > 3)
+		abort();
+	if (test_stop_case == 10)
+		UT_ASSERT_EQ(test_stop_polls, 0);
+	else {
+		UT_ASSERT(test_stop_polls >= 10);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask) & 1,
+					 (test_stop_case == 1 || test_stop_case == 11 || test_stop_case == 13
+					  || test_stop_case == 15 || test_stop_case == 17 || test_stop_case == 19
+					  || test_stop_case == 21 || test_stop_case == 23 || test_stop_case == 25
+					  || test_stop_case == 27 || test_stop_case == 29 || test_stop_case == 31
+					  || test_stop_case == 33 || test_stop_case == 35 || test_stop_case == 37)
+							 && test_lmon_wait_calls == 1
+						 ? 0
+						 : 1);
+	}
+	if (test_stop_case == 1 && test_lmon_wait_calls == 1) {
+		test_stop_observation[0] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* real owner becomes idle only in the following pass */
+	}
+	if (test_stop_case == 11 && test_lmon_wait_calls == 1) {
+		test_stop_observation[6] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original R4 consumer completes in the next work segment */
+	}
+	if (test_stop_case == 13 && test_lmon_wait_calls == 1) {
+		test_stop_observation[7] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original SCN/BOC owner completes before the next poll */
+	}
+	if (test_stop_case == 15 && test_lmon_wait_calls == 1) {
+		test_stop_observation[8] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original LMON marker owner completes, not the observer */
+	}
+	if (test_stop_case == 17 && test_lmon_wait_calls == 1) {
+		test_stop_observation[9] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original retained control consumer completes next pass */
+	}
+	if (test_stop_case == 19 && test_lmon_wait_calls == 1) {
+		test_stop_observation[10] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original node-removal owner consumes its completion */
+	}
+	if ((test_stop_case == 21 || test_stop_case == 23) && test_lmon_wait_calls == 1) {
+		test_stop_observation[(test_stop_case - 21) / 2 + 11] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original quorum/marker owner, not the stop observer */
+	}
+	if (test_stop_case == 25 && test_lmon_wait_calls == 1) {
+		test_stop_observation[13] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original CF owner completes outside the poll */
+	}
+	if (test_stop_case == 27 && test_lmon_wait_calls == 1) {
+		test_stop_observation[14] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original replay owner, not the observer */
+	}
+	if (test_stop_case == 29 && test_lmon_wait_calls == 1) {
+		test_stop_observation[15] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original backup owner, not the observer */
+	}
+	if (test_stop_case == 31 && test_lmon_wait_calls == 1) {
+		test_stop_observation[16] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original mailbox publication, not the observer */
+	}
+	if ((test_stop_case == 33 || test_stop_case == 35 || test_stop_case == 37)
+		&& test_lmon_wait_calls == 1) {
+		test_stop_observation[(test_stop_case - 33) / 2 + 17] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* original reply/handoff publication, not the observer */
+	}
+	if (test_stop_case == 9) {
+		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_QUIESCE);
+		/* Other actual actors are an explicit controller boundary here. */
+		pg_atomic_write_u32(&cl_normal_stop->service_idle_mask,
+							pg_atomic_read_u32(&cl_normal_stop->service_idle_mask) | 1538);
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(cluster_normal_stop_service_seal(1539, 1), CLUSTER_NORMAL_STOP_READY);
+		MyAuxProcType = LmonProcess;
+	} else
+		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED);
+	if (test_stop_case == 8) {
+		test_stop_observation[5] = CLUSTER_NORMAL_STOP_PENDING;
+		/* The final observation must remain visible even after another
+		 * pending domain was logged inside this same one-second interval. */
+		test_stop_observation[0] = CLUSTER_NORMAL_STOP_PENDING;
+		(void)cluster_lmon_normal_stop_poll();
+		test_stop_observation[0] = CLUSTER_NORMAL_STOP_READY;
+	}
+	ShutdownRequestPending = true;
+	if (events != NULL && (test_stop_case == 0 || test_stop_case == 5 || test_stop_case == 9)) {
+		events[0].events = WL_SOCKET_READABLE;
+		events[0].fd = 42;
+		events[0].user_data = (void *)(intptr_t)-1;
+		return 1; /* the actual listener/dispatch arm; no real socket IO */
+	}
+	return 0;
+}
+
+static void
+test_run_normal_stop_lmon(bool transport, int scenario)
+{
+	if (!test_lmon_shmem_found)
+		cluster_lmon_shmem_init();
+	memset(&test_stop_region, 0, sizeof(test_stop_region));
+	cl_normal_stop = &test_stop_region.normal_stop;
+	pg_atomic_init_u32(&cl_normal_stop->requested, scenario == 2 || scenario == 10 ? 0 : 1);
+	pg_atomic_init_u32(&cl_normal_stop->frontends_gone, 1);
+	pg_atomic_init_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
+	pg_atomic_init_u32(&cl_normal_stop->failure_reason, 0);
+	pg_atomic_init_u32(&cl_normal_stop->identity_published, 1);
+	pg_atomic_init_u32(&cl_normal_stop->service_active_mask, 0);
+	pg_atomic_init_u32(&cl_normal_stop->service_idle_mask, 0);
+	pg_atomic_init_u32(&cl_normal_stop->service_seal, 0);
+	pg_atomic_init_u32(&cl_normal_stop->cleaner_quiesce_requested, 1);
+	pg_atomic_init_u32(&cl_normal_stop->cleaner_quiesced_mask, 255);
+	cl_normal_stop->peer_requests_seen = 15;
+	cl_normal_stop_service_depth = cl_normal_stop_service_bit = 0;
+	test_stop_case = scenario;
+	test_stop_now += INT64CONST(2000000);
+	test_stop_transport = transport;
+	test_stop_exit_code = -1;
+	test_stop_duties = test_stop_events = test_stop_polls = test_stop_frees = 0;
+	test_stop_last_detail[0] = '\0';
+	test_stop_lock_depth = 0;
+	test_lmon_wait_calls = 0;
+	test_stop_exit_callback = NULL;
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
+	for (unsigned i = 0; i < lengthof(test_stop_observation); i++)
+		test_stop_observation[i] = CLUSTER_NORMAL_STOP_READY;
+	if (scenario == 1 || scenario == 6)
+		test_stop_observation[0] = CLUSTER_NORMAL_STOP_PENDING;
+	if (scenario == 6)
+		test_stop_observation[5] = CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 11 || scenario == 12)
+		test_stop_observation[6]
+			= scenario == 11 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 13 || scenario == 14)
+		test_stop_observation[7]
+			= scenario == 13 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 15 || scenario == 16)
+		test_stop_observation[8]
+			= scenario == 15 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 17 || scenario == 18)
+		test_stop_observation[9]
+			= scenario == 17 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 19 || scenario == 20)
+		test_stop_observation[10]
+			= scenario == 19 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario >= 21 && scenario <= 24)
+		test_stop_observation[(scenario - 21) / 2 + 11]
+			= scenario % 2 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 25 || scenario == 26)
+		test_stop_observation[13]
+			= scenario == 25 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 27 || scenario == 28)
+		test_stop_observation[14]
+			= scenario == 27 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 29 || scenario == 30)
+		test_stop_observation[15]
+			= scenario == 29 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario == 31 || scenario == 32)
+		test_stop_observation[16]
+			= scenario == 31 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	if (scenario >= 33 && scenario <= 38)
+		test_stop_observation[(scenario - 33) / 2 + 17]
+			= scenario % 2 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID;
+	IsUnderPostmaster = true;
+	MyAuxProcType = LmonProcess;
+	cluster_enabled = true;
+	cluster_interconnect_tier = transport ? CLUSTER_IC_TIER_1 : CLUSTER_IC_TIER_STUB;
+	ConfigReloadPending = false;
+	ShutdownRequestPending = scenario == 3;
+	test_lmon_state.shutdown_requested = false;
+	test_stop_on = test_lmon_exit_armed = true;
+	if (setjmp(test_lmon_exit_jump) == 0)
+		LmonMain();
+	test_stop_on = test_lmon_exit_armed = false;
+	PG_exception_stack = NULL;
+	error_context_stack = NULL;
+	UT_ASSERT_EQ(test_stop_lock_depth, 0);
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	IsUnderPostmaster = false;
+}
+
+UT_TEST(test_stop_real_lmon_both_modes_work_wait_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 0);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_stop_duties, 1);
+		UT_ASSERT_EQ(test_stop_events, mode);
+		UT_ASSERT(test_stop_polls >= 12);
+		test_run_normal_stop_lmon(mode, 1);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 10);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_stop_polls, 0);
+	}
+}
+UT_TEST(test_stop_real_lmon_request_during_outer_pass)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 2);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT(test_stop_polls >= 12);
+	}
+}
+UT_TEST(test_stop_real_lmon_early_and_last_cut_refuse_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 3);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+		test_run_normal_stop_lmon(mode, 8);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+UT_TEST(test_stop_real_lmon_both_error_segments_unwind)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 4);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask), 0);
+	}
+	test_run_normal_stop_lmon(true, 5);
+	UT_ASSERT_EQ(test_stop_exit_code, 1);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+}
+UT_TEST(test_stop_real_lmon_late_invalid_overrides_pending)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 6);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(test_stop_polls, lengthof(test_stop_observation));
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	}
+}
+UT_TEST(test_stop_real_lmon_seal_wakeup_and_postclose_failure)
+{
+	test_run_normal_stop_lmon(true, 9);
+	UT_ASSERT_EQ(test_stop_exit_code, 1);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_LATE_UNSEALED_WORK);
+	UT_ASSERT_EQ(test_stop_frees, 0);
+	test_run_normal_stop_lmon(true, 7);
+	UT_ASSERT_EQ(test_stop_exit_code, 1);
+	UT_ASSERT_EQ(test_stop_frees, 1);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+}
+
+UT_TEST(test_stop_real_lmon_r4_owner_blocks_idle_and_failure_blocks_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 11);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 12);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_real_lmon_scn_owner_blocks_idle_and_failure_blocks_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 13);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 14);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_real_lmon_reconfig_owner_blocks_idle_and_failure_blocks_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 15);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 16);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
 /* ============================================================
  * Test runner
  * ============================================================ */
 
+UT_TEST(test_stop_real_lmon_retained_control_blocks_idle_and_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 17);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 18);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_suppression_reads_request_without_pm_lock_or_identity)
+{
+	memset(&test_stop_region, 0, sizeof(test_stop_region));
+	cl_normal_stop = &test_stop_region.normal_stop;
+	pg_atomic_init_u32(&cl_normal_stop->requested, 1);
+	test_lwlock_blocking_calls = test_lwlock_conditional_calls = 0;
+	test_lmon_state.reconfig_suppressed = false;
+	MyProc = NULL;
+	UT_ASSERT(cluster_lmon_reconfig_suppressed());
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 0);
+	UT_ASSERT_EQ(test_lwlock_conditional_calls, 0);
+	UT_ASSERT(!test_lmon_state.reconfig_suppressed);
+	pg_atomic_write_u32(&cl_normal_stop->requested, 0);
+	UT_ASSERT(!cluster_lmon_reconfig_suppressed());
+	UT_ASSERT_EQ(test_lwlock_blocking_calls, 1); /* unchanged legacy getter */
+	cl_normal_stop = NULL;
+}
+
+UT_TEST(test_stop_real_lmon_node_remove_owner_blocks_idle_and_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 19);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 20);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_real_lmon_fence_owners_block_idle_and_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		for (int first = 21; first <= 23; first += 2) {
+			test_run_normal_stop_lmon(mode, first);
+			UT_ASSERT_EQ(test_stop_exit_code, 0);
+			UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+			test_run_normal_stop_lmon(mode, first + 1);
+			UT_ASSERT_EQ(test_stop_exit_code, 1);
+			UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+			UT_ASSERT_EQ(test_stop_frees, 0);
+		}
+	}
+}
+
+UT_TEST(test_stop_real_lmon_cf_owner_blocks_idle_and_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 25);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 26);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_real_lmon_recovery_owner_blocks_idle_and_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 27);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 28);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_real_lmon_backup_owner_blocks_idle_and_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 29);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 30);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_real_lmon_mrp_outside_primary_blocks_exit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 31);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 32);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_real_lmon_dedup_execution_not_cache_count)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		for (int scenario = 33; scenario <= 35; scenario += 2) {
+			test_run_normal_stop_lmon(mode, scenario);
+			UT_ASSERT_EQ(test_stop_exit_code, 0);
+			UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+			test_run_normal_stop_lmon(mode, scenario + 1);
+			UT_ASSERT_EQ(test_stop_exit_code, 1);
+			UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+			UT_ASSERT_EQ(test_stop_frees, 0);
+		}
+	}
+}
+
+UT_TEST(test_stop_real_lmon_report_collector_not_diagnostic_cache)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 37);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		test_run_normal_stop_lmon(mode, 38);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+	}
+}
+
+UT_TEST(test_stop_final_pending_reason_is_not_hidden_by_periodic_log_limit)
+{
+	for (int mode = 0; mode < 2; mode++) {
+		test_run_normal_stop_lmon(mode, 8);
+		UT_ASSERT_EQ(test_stop_exit_code, 1);
+		UT_ASSERT_EQ(test_stop_frees, 0);
+		UT_ASSERT(strstr(test_stop_last_detail, "FIXTURE_RETAINED_TAIL") != NULL);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(33);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -1208,6 +1948,26 @@ main(void)
 	UT_RUN(test_lmon_runs_pcm_reclaim_once_per_duty);
 	UT_RUN(test_lmon_duty_lazy_truth_table);
 	UT_RUN(test_lmon_pid_no_pgproc_never_uses_blocking_lwlock);
+	UT_RUN(test_stop_real_lmon_both_modes_work_wait_exit);
+	UT_RUN(test_stop_real_lmon_request_during_outer_pass);
+	UT_RUN(test_stop_real_lmon_early_and_last_cut_refuse_exit);
+	UT_RUN(test_stop_real_lmon_both_error_segments_unwind);
+	UT_RUN(test_stop_real_lmon_late_invalid_overrides_pending);
+	UT_RUN(test_stop_real_lmon_seal_wakeup_and_postclose_failure);
+	UT_RUN(test_stop_real_lmon_r4_owner_blocks_idle_and_failure_blocks_exit);
+	UT_RUN(test_stop_real_lmon_scn_owner_blocks_idle_and_failure_blocks_exit);
+	UT_RUN(test_stop_real_lmon_reconfig_owner_blocks_idle_and_failure_blocks_exit);
+	UT_RUN(test_stop_real_lmon_retained_control_blocks_idle_and_exit);
+	UT_RUN(test_stop_suppression_reads_request_without_pm_lock_or_identity);
+	UT_RUN(test_stop_real_lmon_node_remove_owner_blocks_idle_and_exit);
+	UT_RUN(test_stop_real_lmon_fence_owners_block_idle_and_exit);
+	UT_RUN(test_stop_real_lmon_cf_owner_blocks_idle_and_exit);
+	UT_RUN(test_stop_real_lmon_recovery_owner_blocks_idle_and_exit);
+	UT_RUN(test_stop_real_lmon_backup_owner_blocks_idle_and_exit);
+	UT_RUN(test_stop_real_lmon_mrp_outside_primary_blocks_exit);
+	UT_RUN(test_stop_real_lmon_dedup_execution_not_cache_count);
+	UT_RUN(test_stop_real_lmon_report_collector_not_diagnostic_cache);
+	UT_RUN(test_stop_final_pending_reason_is_not_hidden_by_periodic_log_limit);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

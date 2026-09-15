@@ -3342,11 +3342,6 @@ sub new_quad
 	if ($opts{shared_data})
 	{
 		$shared_data_root = PostgreSQL::Test::Utils::tempdir();
-		if ($opts{shared_catalog})
-		{
-			mkdir "$shared_data_root/global"
-			  or die "mkdir $shared_data_root/global: $!";
-		}
 	}
 	if ($opts{shared_catalog})
 	{
@@ -3363,7 +3358,17 @@ EOC
 		$nodes[0]->init(allows_streaming => 1,
 			extra => [
 				'-X', "$wal_threads_root/thread_1",
-				"--pgrac-wal-state-root=$wal_threads_root" ]);
+				"--pgrac-wal-state-root=$wal_threads_root",
+				"--pgrac-hw-snapshot-root=$shared_data_root",
+				'--pgrac-hw-snapshot-owner=0' ]);
+		# Maintain seed metadata from the first checkpoint, while catalogs and
+		# user relations remain local until the existing post-backup migration.
+		$nodes[0]->append_conf('postgresql.conf', <<EOC);
+cluster.shared_data_dir = '$shared_data_root'
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.node_id = 0
+EOC
 		$nodes[0]->start;
 		$nodes[0]->backup('clusterquad_scb');
 		$nodes[0]->stop;
@@ -3419,8 +3424,21 @@ EOC
 			'-X', "$wal_threads_root/thread_1",
 			"--pgrac-wal-state-root=$wal_threads_root")
 		  if defined $wal_threads_root;
+		push @init_extra, (
+			"--pgrac-hw-snapshot-root=$shared_data_root",
+			'--pgrac-hw-snapshot-owner=0')
+		  if defined $shared_data_root;
 		$nodes[0]->init(allows_streaming => 1,
 			extra => \@init_extra);
+		if (defined $shared_data_root)
+		{
+			$nodes[0]->append_conf('postgresql.conf', <<EOC);
+cluster.shared_data_dir = '$shared_data_root'
+cluster.enabled = off
+cluster.lms_enabled = off
+cluster.node_id = 0
+EOC
+		}
 		if (defined $seed_sql)
 		{
 			# This is the same native, pre-formation seed boundary used by the
@@ -3429,11 +3447,7 @@ EOC
 			$nodes[0]->append_conf('postgresql.conf', <<EOC);
 shared_buffers = 16MB
 cluster.shared_storage_backend = cluster_fs
-cluster.shared_data_dir = '$shared_data_root'
 cluster.smgr_user_relations = on
-cluster.enabled = off
-cluster.lms_enabled = off
-cluster.node_id = 0
 cluster.relation_extend_lock_enabled = off
 EOC
 		}
@@ -3504,12 +3518,15 @@ EOC
 				$node->append_conf('postgresql.conf',
 					"cluster.xid_striping = on\n");
 			}
-			if (defined $opts{shared_system_identifier_seed_sql})
+			if ($opts{shared_system_identifier})
 			{
-				# Undo the native seed-only values before the four-node start.
+				# Undo the native seed-only LMS value before the four-node start.
 				# extra_conf remains last and may narrow either GUC deliberately.
 				$node->append_conf('postgresql.conf',
 					"cluster.lms_enabled = on\n");
+			}
+			if (defined $opts{shared_system_identifier_seed_sql})
+			{
 				$node->append_conf('postgresql.conf',
 					"cluster.relation_extend_lock_enabled = on\n");
 			}

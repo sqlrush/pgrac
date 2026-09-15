@@ -53,6 +53,8 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_semantic_activation.h" /* R4 writer snapshot stub */
+#include "cluster/cluster_hw_snapshot.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_touched_peers.h"	  /* spec-5.14 D6 self_hex stub */
 #include "cluster/cluster_xnode_profile.h"	  /* spec-5.59 D1 profiling gate stubs */
 #include "cluster/cluster_xnode_lever.h"	  /* spec-6.12 lever counter stub */
@@ -80,7 +82,7 @@ static const char *captured_dump_categories[CAPTURED_DUMP_ROWS_MAX];
 static const char *captured_dump_keys[CAPTURED_DUMP_ROWS_MAX];
 static char captured_dump_key_storage[CAPTURED_DUMP_ROWS_MAX][128];
 static const char *captured_dump_values[CAPTURED_DUMP_ROWS_MAX];
-static char captured_dump_value_storage[CAPTURED_DUMP_ROWS_MAX][512];
+static char captured_dump_value_storage[CAPTURED_DUMP_ROWS_MAX][1025];
 static int captured_dump_row_count;
 static char captured_formatted_values[CAPTURED_FORMATTED_VALUES_MAX][128];
 static int captured_formatted_value_count;
@@ -4805,6 +4807,43 @@ cluster_grd_pending_count(void)
 
 UT_DEFINE_GLOBALS();
 
+static ClusterNormalStartState debug_normal_state;
+static ClusterNormalStartSnapshot debug_normal_snapshot;
+/* Unrelated dump-category fixtures; not proof of HW/CR behavior. */
+ClusterHwColdBootMode
+cluster_hw_cold_boot_mode(void)
+{
+	return 0;
+}
+ClusterHwColdBootState
+cluster_hw_cold_boot_state(void)
+{
+	return 0;
+}
+const char *
+cluster_cr_build_reason_name(ClusterCrBuildReason reason)
+{
+	return "fixture";
+}
+const char *
+cluster_r4_refusal_stage_name(ClusterR4RefusalStage stage)
+{
+	return "fixture";
+}
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return debug_normal_state;
+}
+bool
+cluster_semantic_normal_start_snapshot(ClusterNormalStartSnapshot *out)
+{
+	if (debug_normal_state != CLUSTER_NORMAL_START_TARGET_READY)
+		return false;
+	*out = debug_normal_snapshot;
+	return true;
+}
+
 /* spec-5.14 D6: link-only stubs for the touched_peers counters/hex that
  * dump_reconfig_touched emits.  The real getters live in cluster_reconfig.o
  * (not linked here); their behaviour is covered by cluster_tap t/307. */
@@ -4992,6 +5031,76 @@ UT_TEST(test_debug_dump_exposes_exact_resource_x_owner_state)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_gate_formation"), "17");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_path"), "target");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "resource_x_writer_r4_generation"), "19");
+}
+
+UT_TEST(test_debug_dump_normal_completion_never_fabricates_unready_proof)
+{
+	LOCAL_FCINFO(fcinfo, 0);
+	ReturnSetInfo rsinfo;
+	int state;
+	memset(&debug_normal_snapshot, 0, sizeof(debug_normal_snapshot));
+	debug_normal_snapshot.state = CLUSTER_NORMAL_START_TARGET_READY;
+	debug_normal_snapshot.node_id = 2;
+	debug_normal_snapshot.system_identifier = 17;
+	debug_normal_snapshot.boot_incarnation = 19;
+	debug_normal_snapshot.own_checkpoint_lsn = 0x100;
+	debug_normal_snapshot.own_redo_lsn = 0xf0;
+	debug_normal_snapshot.own_next_full_xid = 2048;
+	debug_normal_snapshot.own_checkpoint_scn = 23;
+	debug_normal_snapshot.tt_commit_scn_max = 29;
+	debug_normal_snapshot.census_count = 256;
+	debug_normal_snapshot.pgsa[0] = 0xab;
+	debug_normal_snapshot.pgsa[511] = 0xcd;
+	debug_normal_snapshot.pgrd[0] = 0x12;
+	debug_normal_snapshot.pgrd[511] = 0x34;
+	for (state = 0; state <= 5; state++) {
+		char wanted_state[8];
+		debug_normal_state = state;
+		memset(fcinfo, 0, SizeForFunctionCallInfo(0));
+		memset(&rsinfo, 0, sizeof(rsinfo));
+		captured_dump_row_count = captured_formatted_value_count = 0;
+		fcinfo->resultinfo = (fmNodePtr)&rsinfo;
+		(void)cluster_dump_state(fcinfo);
+		snprintf(wanted_state, sizeof(wanted_state), "%d", state);
+		UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "state"), wanted_state);
+		UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "completion_bytes"), "1104");
+		UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "ready_snapshot"),
+						 state == 4 ? "true" : "false");
+		if (state == 4) {
+			const char *pgsa = captured_dump_value("normal_start", "pgsa_hex");
+			const char *pgrd = captured_dump_value("normal_start", "pgrd_hex");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "node_id"), "2");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "system_identifier"),
+							 "0x0000000000000011");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "boot_incarnation"),
+							 "0x0000000000000013");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "own_checkpoint_lsn"),
+							 "0x0000000000000100");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "own_redo_lsn"),
+							 "0x00000000000000F0");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "own_next_full_xid"),
+							 "0x0000000000000800");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "own_checkpoint_scn"),
+							 "0x0000000000000017");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "tt_commit_scn_max"),
+							 "0x000000000000001D");
+			UT_ASSERT_STR_EQ(captured_dump_value("normal_start", "census_count"), "256");
+			UT_ASSERT_NOT_NULL(pgsa);
+			UT_ASSERT_NOT_NULL(pgrd);
+			if (pgsa != NULL && pgrd != NULL) {
+				UT_ASSERT_EQ(strlen(pgsa), 1024);
+				UT_ASSERT_EQ(strlen(pgrd), 1024);
+				UT_ASSERT_EQ(strncmp(pgsa, "ab00", 4), 0);
+				UT_ASSERT_STR_EQ(pgsa + 1022, "cd");
+				UT_ASSERT_EQ(strncmp(pgrd, "1200", 4), 0);
+				UT_ASSERT_STR_EQ(pgrd + 1022, "34");
+			}
+		} else {
+			UT_ASSERT_EQ(captured_dump_count("normal_start", "census_count"), 0);
+			UT_ASSERT_EQ(captured_dump_count("normal_start", "pgsa_hex"), 0);
+		}
+	}
+	debug_normal_state = CLUSTER_NORMAL_START_UNCLASSIFIED;
 }
 
 UT_TEST(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats)
@@ -5817,7 +5926,8 @@ UT_TEST(test_debug_phase_symbol_present)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(22);
+	UT_RUN(test_debug_dump_normal_completion_never_fabricates_unready_proof);
 	UT_RUN(test_debug_dump_srf_linkable);
 	UT_RUN(test_debug_dump_omits_retired_legacy_pcm_x_compatibility_keys);
 	UT_RUN(test_debug_dump_exposes_exact_resource_x_owner_state);

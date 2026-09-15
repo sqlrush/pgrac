@@ -650,6 +650,11 @@ cluster_lmon_reconfig_suppressed(void)
 {
 	bool suppressed;
 
+	/* Current normal-stop intent is atomic and does not make postmaster
+	 * take a backend lock. The original LMON owner still validates every
+	 * identity and responsibility before granting a checkpoint cut. */
+	if (cluster_normal_stop_requested())
+		return true;
 	if (cluster_lmon_state == NULL)
 		return false;
 	LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);
@@ -1084,6 +1089,176 @@ lmon_record_iteration(instr_time iter_started_at)
 }
 
 
+static bool lmon_normal_stop_exit_verified;
+
+static ClusterNormalStopPollResult
+lmon_normal_stop_observe(bool final_observation)
+{
+	static TimestampTz last_pending_log;
+	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
+	const char *first_domain = "NONE", *first_reason = "NONE";
+	int first_slot = -1;
+	uint64 first_key = 0;
+
+	if (!cluster_normal_stop_requested())
+		return CLUSTER_NORMAL_STOP_READY;
+	/* Original owners only, never under the leave lock or after transport
+	 * close. The close-control sender may inspect its own private owners
+	 * inside a duty; this does not sign that the outer work segment is idle. */
+	for (int module = 0; module < 20; module++) {
+		ClusterNormalStopPollResult result;
+		const char *domain = "NONE", *reason = "NONE";
+		int slot = -1;
+		uint32 position = 0;
+		uint64 key = 0;
+
+		switch (module) {
+		case 0:
+			domain = "GRD_WORK";
+			result = cluster_grd_work_queue_normal_stop_poll(&position, &reason);
+			slot = (int)position;
+			break;
+		case 1:
+			domain = "GRD_OUTBOUND";
+			result = cluster_grd_outbound_normal_stop_poll(&position, &reason);
+			slot = (int)position;
+			break;
+		case 2:
+			domain = "CR";
+			result = cluster_cr_server_normal_stop_poll(&slot, &reason);
+			break;
+		case 3:
+			domain = "NATIVE_PROBE";
+			result = cluster_lms_native_probe_normal_stop_poll(&slot, &reason);
+			break;
+		case 4:
+			domain = "GCS_LOCAL";
+			result = cluster_gcs_block_normal_stop_local_poll(&slot, &reason);
+			break;
+		case 5:
+			result = cluster_ic_normal_stop_poll(&domain, &slot, &position, &reason);
+			break;
+		case 6:
+			result = cluster_semantic_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 7:
+			result = cluster_scn_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 8:
+			result = cluster_reconfig_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 9:
+			domain = "CLOSE_CONTROL";
+			result = cluster_clean_leave_normal_stop_local_poll(&slot, &reason);
+			break;
+		case 10:
+			result = cluster_node_remove_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 11:
+			result = cluster_fence_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 12:
+			result = cluster_write_fence_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 13:
+			domain = "CF";
+			/* Own holds are strict for LMON. The node-wide join hint is
+			 * consumed by the original checkpoint and checked by its post
+			 * census, not prematurely required before that checkpoint. */
+			result = cluster_cf_normal_stop_poll(false, &reason);
+			break;
+		case 14:
+			result = cluster_recovery_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 15:
+			result = cluster_backup_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 16:
+			result = cluster_mrp_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 17:
+			result = cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 18:
+			result = cluster_ges_dedup_normal_stop_poll(&domain, &key, &reason);
+			break;
+		default:
+			domain = "LMD_PROBE";
+			result = cluster_lmd_probe_normal_stop_poll(&key, &reason);
+			break;
+		}
+		if (result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING)
+			result = CLUSTER_NORMAL_STOP_INVALID;
+		if ((result == CLUSTER_NORMAL_STOP_INVALID && aggregate != CLUSTER_NORMAL_STOP_INVALID)
+			|| (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)) {
+			aggregate = result;
+			first_domain = domain;
+			first_reason = reason;
+			first_slot = slot;
+			first_key = key;
+		}
+	}
+	if (aggregate == CLUSTER_NORMAL_STOP_PENDING) {
+		TimestampTz now = GetCurrentTimestamp();
+		if (final_observation || last_pending_log == 0
+			|| now - last_pending_log >= INT64CONST(1000000)) {
+			last_pending_log = now;
+			ereport(LOG, (errmsg_internal("LMON normal-stop responsibility pending"),
+						  errdetail("domain=%s slot=%d key=%llu reason=%s", first_domain,
+									first_slot, (unsigned long long)first_key, first_reason)));
+		}
+	}
+	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		ereport(LOG, (errmsg_internal("LMON normal-stop responsibility invalid"),
+					  errdetail("domain=%s slot=%d key=%llu reason=%s", first_domain, first_slot,
+								(unsigned long long)first_key, first_reason)));
+	}
+	return aggregate;
+}
+
+ClusterNormalStopPollResult
+cluster_lmon_normal_stop_poll(void)
+{
+	return lmon_normal_stop_observe(false);
+}
+
+static ClusterNormalStopPollResult
+lmon_normal_stop_idle(void)
+{
+	return cluster_normal_stop_service_idle(cluster_lmon_normal_stop_poll());
+}
+
+static void
+lmon_normal_stop_exit_callback(int code, Datum arg)
+{
+	(void)arg;
+	/* The last actual observation precedes close; a post-close empty poll is
+	 * not evidence. Any later failure still invalidates an otherwise code-0
+	 * exit, even if checkpointer has already returned. */
+	if (cluster_normal_stop_requested()
+		&& (code != 0 || !lmon_normal_stop_exit_verified
+			|| !cluster_normal_stop_protocol_closed())) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+		if (code == 0)
+			ereport(FATAL, (errmsg_internal("LMON exited without normal-stop completion")));
+	}
+}
+
+static void
+lmon_normal_stop_before_exit(void)
+{
+	if (!cluster_normal_stop_requested())
+		return;
+	if (!cluster_normal_stop_protocol_closed()
+		|| cluster_normal_stop_service_idle(lmon_normal_stop_observe(true))
+			   != CLUSTER_NORMAL_STOP_READY) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
+		ereport(FATAL, (errmsg_internal("LMON transport still owns normal-stop work")));
+	}
+	lmon_normal_stop_exit_verified = true;
+}
+
 void
 LmonMain(void)
 {
@@ -1100,6 +1275,8 @@ LmonMain(void)
 	Assert(IsUnderPostmaster);
 
 	MyBackendType = B_LMON;
+	lmon_normal_stop_exit_verified = false;
+	before_shmem_exit(lmon_normal_stop_exit_callback, 0);
 	init_ps_display(NULL);
 
 	/*
@@ -1268,6 +1445,7 @@ LmonMain(void)
 			instr_time iter_started_at;
 			int32 i;
 			bool force_all_duties;
+			volatile bool work_completed = false;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -1280,10 +1458,14 @@ LmonMain(void)
 				break;
 			}
 
-			duty_started_at = GetCurrentTimestamp();
-			INSTR_TIME_SET_CURRENT(iter_started_at);
+			if (!cluster_normal_stop_service_enter())
+				ereport(FATAL, (errmsg_internal("LMON normal-stop work entry failed")));
+			PG_TRY();
+			{
+				duty_started_at = GetCurrentTimestamp();
+				INSTR_TIME_SET_CURRENT(iter_started_at);
 
-			/*
+				/*
 			 * PGRAC: spec-7.2 D1 -- >= 1 Hz floor for the lazy duty
 			 * families (§3.5 backstop): every lazy-able drain runs at
 			 * least once per heartbeat interval even if its producer
@@ -1291,14 +1473,14 @@ LmonMain(void)
 			 * run every iteration, order verbatim.  Reuse the iteration
 			 * start timestamp (stage7-p0 profiling) as "now".
 			 */
-			now = duty_started_at;
-			force_all_duties = (now >= next_duty_floor_at);
-			if (force_all_duties)
-				next_duty_floor_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+				now = duty_started_at;
+				force_all_duties = (now >= next_duty_floor_at);
+				if (force_all_duties)
+					next_duty_floor_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
-			lmon_advance_liveness_tick();
+				lmon_advance_liveness_tick();
 
-			/*
+				/*
 			 * spec-2.28 Sprint A Step 3 D5:  consume QVOTEC quorum_state
 			 * and broadcast PROCSIG_CLUSTER_FREEZE_WRITES / _THAW_WRITES
 			 * on OK→{LOST,UNCERTAIN} or {LOST,UNCERTAIN}→OK transitions.
@@ -1307,9 +1489,9 @@ LmonMain(void)
 			 * freeze fires IMMEDIATELY (no grace_ms delay — that gates
 			 * only postmaster self-shutdown).
 			 */
-			cluster_fence_lmon_tick();
+				cluster_fence_lmon_tick();
 
-			/*
+				/*
 			 * spec-2.29 Sprint A Step 2 D3:  reconfig coordinator tick.
 			 * Consumes CSSD peer_state + cluster_qvotec_in_quorum +
 			 * cluster_cssd_get_dead_generation → Q2 A'' deterministic
@@ -1318,18 +1500,18 @@ LmonMain(void)
 			 * (P1.3 a) + I7 coordinator-only epoch++ via D18 (P1.3 b).
 			 * Idempotent within one DEAD episode (same event_id → skip).
 			 */
-			/* spec-2.16 D8 I47:  GRD newly-dead sweep MUST run BEFORE
+				/* spec-2.16 D8 I47:  GRD newly-dead sweep MUST run BEFORE
 			 * reconfig epoch bump (S1 → S2 order writ).  bitmap diff
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
-			cluster_grd_lmon_tick_dead_sweep();
-			(void)cluster_grd_reclaim_sweep();
-			cluster_pcm_lock_lmon_reclaim_tick();
-			/* spec-5.10 fix-forward — runtime-off starvation sweep (no-op
+				cluster_grd_lmon_tick_dead_sweep();
+				(void)cluster_grd_reclaim_sweep();
+				cluster_pcm_lock_lmon_reclaim_tick();
+				/* spec-5.10 fix-forward — runtime-off starvation sweep (no-op
 			 * unless cluster.ges_starvation_protection was just turned off). */
-			(void)cluster_grd_lmon_tick_starvation_sweep();
-			cluster_grd_deadlock_lmon_tick(); /* spec-2.17 Step 5 */
+				(void)cluster_grd_lmon_tick_starvation_sweep();
+				cluster_grd_deadlock_lmon_tick(); /* spec-2.17 Step 5 */
 
-			/*
+				/*
 			 * spec-2.18 Sprint A Step 3 D8 — HC4 single ownership guard.
 			 *
 			 *	When LMS owns grant decisions (state >= READY), LMON
@@ -1345,7 +1527,7 @@ LmonMain(void)
 			 *	wires the raise) and retry; runtime NO ownership
 			 *	transfer path back to LMON.
 			 */
-			/*
+				/*
 			 * spec-2.18 Sprint A Step 1-6 skeleton:  LMS daemon exists for
 			 * catalog visibility but does NOT yet own grant decisions.  LMON
 			 * remains the sole drain consumer + outbound producer until the
@@ -1354,16 +1536,17 @@ LmonMain(void)
 			 * point but the read returns false in the skeleton path because
 			 * LMS never advances past STARTING for the ownership purpose.
 			 */
-			/* PGRAC: spec-7.2 D1 — lazy-gated (producer marks dirty at
+				/* PGRAC: spec-7.2 D1 — lazy-gated (producer marks dirty at
 			 * enqueue; >= 1 Hz floor backstops a missed mark). */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE, force_all_duties))
-				cluster_ges_lmon_drain_work_queue();
-			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
+												 force_all_duties))
+					cluster_ges_lmon_drain_work_queue();
+				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
-			if (!cluster_gcs_block_family_on_data_plane()
-				&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
-				cluster_lms_cr_ship_ready();
-			/*
+				if (!cluster_gcs_block_family_on_data_plane()
+					&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
+					cluster_lms_cr_ship_ready();
+				/*
 			 * spec-5.16 (orphan-grant, Rule 8.A) — reclaim abandoned reply-wait
 			 * tombstones whose bounded TTL has elapsed.  This is the documented
 			 * LMON-tick backstop for the orphan-grant auto-release path: an
@@ -1373,26 +1556,26 @@ LmonMain(void)
 			 * never drain and eventually fail-close live requests with "reply
 			 * wait table full" (cap = cluster.ges_reply_wait_max_entries).
 			 */
-			(void)cluster_ges_reply_wait_sweep_timeout(GetCurrentTimestamp());
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GRD_OUTBOUND, force_all_duties))
-				cluster_grd_outbound_lmon_drain_send();
-			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
-			cluster_lms_native_probe_retry_tick();
+				(void)cluster_ges_reply_wait_sweep_timeout(GetCurrentTimestamp());
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GRD_OUTBOUND, force_all_duties))
+					cluster_grd_outbound_lmon_drain_send();
+				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
+				cluster_lms_native_probe_retry_tick();
 
-			/* spec-5.13 D6: clean-leave orchestration runs BEFORE the reconfig
+				/* spec-5.13 D6: clean-leave orchestration runs BEFORE the reconfig
 			 * tick (same ordering as the dead-sweep) so a cleanly-departed node
 			 * is recorded before reconfig builds its dead set (CL-I13). */
-			cluster_clean_leave_lmon_tick();
+				cluster_clean_leave_lmon_tick();
 
-			/* spec-5.18 D9: drive permanent node removal before reconfig (a removal
+				/* spec-5.18 D9: drive permanent node removal before reconfig (a removal
 			 * masks the node out of effective_dead, INV-LF1). */
-			cluster_node_remove_lmon_tick();
+				cluster_node_remove_lmon_tick();
 
-			cluster_reconfig_lmon_tick();
-			cluster_semantic_activation_lmon_tick();
-			cluster_thread_recovery_lmon_tick();
+				cluster_reconfig_lmon_tick();
+				cluster_semantic_activation_lmon_tick();
+				cluster_thread_recovery_lmon_tick();
 
-			/*
+				/*
 			 * spec-4.6 D1:  GRD recovery sequence (P0-P7) — consumes the
 			 * reconfig event published by the tick above:  freeze affected
 			 * shards → scoped stale sweep → failure-driven remaster →
@@ -1400,34 +1583,35 @@ LmonMain(void)
 			 * sweep → unfreeze.  Must run AFTER cluster_reconfig_lmon_tick
 			 * (event/epoch source) and AFTER dead_sweep (I47, P2).
 			 */
-			cluster_grd_recovery_authority_lmon_tick();
-			cluster_grd_recovery_lmon_tick();
-			if (cluster_gcs_block_resource_x_cutover_tick())
-				SetLatch(MyLatch);
+				cluster_grd_recovery_authority_lmon_tick();
+				cluster_grd_recovery_lmon_tick();
+				if (cluster_gcs_block_resource_x_cutover_tick())
+					SetLatch(MyLatch);
 
-			/*
+				/*
 			 * spec-2.9 D2 review fix: BOC_BROADCAST is triggered by
 			 * walwriter BOC sweeps, but the actual tier1 fanout must run
 			 * in LMON because LMON owns the process-local IC fds.
 			 */
-			cluster_scn_lmon_drain_boc_broadcast();
-			/* PGRAC: spec-7.2 D1 — sinval outbound drains are lazy-gated;
+				cluster_scn_lmon_drain_boc_broadcast();
+				/* PGRAC: spec-7.2 D1 — sinval outbound drains are lazy-gated;
 			 * the RESET-all sentinel below stays never-lazy (order-
 			 * sensitive protocol, §3.6). */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_OUT, force_all_duties))
-				cluster_sinval_drain_outbound_and_broadcast();
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT, force_all_duties))
-				cluster_sinval_drain_ack_outbound_and_send();
-			cluster_sinval_broadcast_reset_all();
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_OUT, force_all_duties))
+					cluster_sinval_drain_outbound_and_broadcast();
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT,
+												 force_all_duties))
+					cluster_sinval_drain_ack_outbound_and_send();
+				cluster_sinval_broadcast_reset_all();
 
-			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
+				/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
-				(void)cluster_tt_status_hint_source_dispatch(
-					CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND, NULL);
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
-				cluster_backup_lmon_tick();
-			/* spec-5.22e D5-2: publish this node's undo retention horizon
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
+					(void)cluster_tt_status_hint_source_dispatch(
+						CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND, NULL);
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
+					cluster_backup_lmon_tick();
+				/* spec-5.22e D5-2: publish this node's undo retention horizon
 			 * report per-peer (capability-gated; internally rate-limited to
 			 * one send per lmon_main_loop_interval).  Deliberately NOT
 			 * producer-gated behind a lazy duty: the report is the
@@ -1435,17 +1619,17 @@ LmonMain(void)
 			 * node's silence stalls every peer's recycling (the fold treats
 			 * a missing report as STALLED, never as consent).  Time-based
 			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
-			cluster_undo_horizon_lmon_tick();
-			/* Non-lazy: cleaner WAL may advance after the last user commit. */
-			cluster_sf_origin_durable_lmon_tick();
+				cluster_undo_horizon_lmon_tick();
+				/* Non-lazy: cleaner WAL may advance after the last user commit. */
+				cluster_sf_origin_durable_lmon_tick();
 
-			/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
+				/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
 			 * durable stamp -> DISABLE fanout -> ack round -> gate open).
 			 * Zero cost before the 2^32 margin and after the gate opens;
 			 * time-based, rides the >= 1 Hz floor like the tick above. */
-			cluster_xid_wrap_barrier_lmon_tick();
+				cluster_xid_wrap_barrier_lmon_tick();
 
-			/*
+				/*
 			 * spec-2.34 D6 (HC93 leg a):  TTL sweep of the GCS block
 			 * dedup HTAB.  Removes completed entries past
 			 * 2 × max_retransmit_window age and in-flight entries
@@ -1454,48 +1638,48 @@ LmonMain(void)
 			 * ResourceOwner).  PGRAC: spec-7.2 D1 — TTL/time-based, so
 			 * floor-driven (>= 1 Hz), no producer mark.
 			 */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_DEDUP_TTL, force_all_duties))
-				cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_DEDUP_TTL, force_all_duties))
+					cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
 
-			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard write
+				/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard write
 			 * notes and route each to the block's master (fire-and-forget;
 			 * only LMON owns the tier1 fds, L172 family). */
-			if (!cluster_gcs_block_family_on_data_plane())
-				cluster_gcs_block_pi_discard_drain();
+				if (!cluster_gcs_block_family_on_data_plane())
+					cluster_gcs_block_pi_discard_drain();
 
-			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
+				CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
-			now = GetCurrentTimestamp();
+				now = GetCurrentTimestamp();
 
-			/*
+				/*
 			 * Active-role reconnect: for each DOWN peer where we are
 			 * the active connector and back-off has elapsed, kick
 			 * off a nonblocking connect.
 			 */
-			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-				int new_fd = -1;
+				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+					int new_fd = -1;
 
-				if (pi == self_id)
-					continue;
-				if (!lmon_peer_track[pi].is_active)
-					continue;
-				if (lmon_peer_track[pi].substate != LMON_SUB_DOWN)
-					continue;
-				if (lmon_peer_track[pi].next_attempt_at > now)
-					continue;
+					if (pi == self_id)
+						continue;
+					if (!lmon_peer_track[pi].is_active)
+						continue;
+					if (lmon_peer_track[pi].substate != LMON_SUB_DOWN)
+						continue;
+					if (lmon_peer_track[pi].next_attempt_at > now)
+						continue;
 
-				lmon_peer_track[pi].next_attempt_at
-					= now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+					lmon_peer_track[pi].next_attempt_at
+						= now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
-				if (cluster_ic_tier1_connect_one(pi, &new_fd) && new_fd >= 0) {
-					lmon_peer_track[pi].fd = new_fd;
-					lmon_peer_track[pi].substate = LMON_SUB_CONNECT_PEND;
-					lmon_peer_track[pi].connect_started_at = now; /* F2 timeout base */
-					wes_dirty = true;
+					if (cluster_ic_tier1_connect_one(pi, &new_fd) && new_fd >= 0) {
+						lmon_peer_track[pi].fd = new_fd;
+						lmon_peer_track[pi].substate = LMON_SUB_CONNECT_PEND;
+						lmon_peer_track[pi].connect_started_at = now; /* F2 timeout base */
+						wes_dirty = true;
+					}
 				}
-			}
 
-			/*
+				/*
 			 * Hardening v1.0.1 F2: timeout / liveness scan.
 			 *
 			 *  - CONNECT_PEND or HELLO_SENDING > connect_timeout_ms since
@@ -1509,54 +1693,54 @@ LmonMain(void)
 			 * heartbeat liveness is transport-only; this drop does NOT
 			 * trigger fence / membership change (that is spec-2.29).
 			 */
-			{
-				int64 connect_to_us
-					= (int64)cluster_interconnect_connect_timeout_ms * INT64CONST(1000);
-				int64 liveness_to_us = 3L * (int64)HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
+				{
+					int64 connect_to_us
+						= (int64)cluster_interconnect_connect_timeout_ms * INT64CONST(1000);
+					int64 liveness_to_us = 3L * (int64)HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-					if (lmon_peer_track[pi].fd < 0)
-						continue;
-
-					if ((lmon_peer_track[pi].substate == LMON_SUB_CONNECT_PEND
-						 || lmon_peer_track[pi].substate == LMON_SUB_HELLO_SENDING
-						 || lmon_peer_track[pi].substate == LMON_SUB_HELLO_WAIT)
-						&& lmon_peer_track[pi].connect_started_at > 0
-						&& now > lmon_peer_track[pi].connect_started_at + connect_to_us) {
-						cluster_ic_tier1_close_peer(pi, "connect timeout");
-						lmon_peer_track[pi].fd = -1;
-						lmon_peer_track[pi].substate = LMON_SUB_DOWN;
-						lmon_peer_track[pi].connect_started_at = 0;
-						wes_dirty = true;
-						continue;
-					}
-
-					if (lmon_peer_track[pi].substate == LMON_SUB_CONNECTED) {
-						const ClusterICPeerStateShmem *p = cluster_ic_tier1_peer_get(pi);
-						TimestampTz last;
-
-						if (cluster_ic_mux_peer_transport(pi) == CLUSTER_IC_PEER_TRANSPORT_RDMA)
+					for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+						if (lmon_peer_track[pi].fd < 0)
 							continue;
-						if (p == NULL)
-							continue;
-						last = p->last_heartbeat_recv_at;
 
-						/* Skip if no heartbeat ever received yet (just CONNECTED;
-						 * give peer 1 full liveness window before judging). */
-						if (last == 0)
-							continue;
-						if (now > last + liveness_to_us) {
-							cluster_ic_tier1_close_peer(pi, "heartbeat liveness timeout");
+						if ((lmon_peer_track[pi].substate == LMON_SUB_CONNECT_PEND
+							 || lmon_peer_track[pi].substate == LMON_SUB_HELLO_SENDING
+							 || lmon_peer_track[pi].substate == LMON_SUB_HELLO_WAIT)
+							&& lmon_peer_track[pi].connect_started_at > 0
+							&& now > lmon_peer_track[pi].connect_started_at + connect_to_us) {
+							cluster_ic_tier1_close_peer(pi, "connect timeout");
 							lmon_peer_track[pi].fd = -1;
 							lmon_peer_track[pi].substate = LMON_SUB_DOWN;
 							lmon_peer_track[pi].connect_started_at = 0;
 							wes_dirty = true;
+							continue;
+						}
+
+						if (lmon_peer_track[pi].substate == LMON_SUB_CONNECTED) {
+							const ClusterICPeerStateShmem *p = cluster_ic_tier1_peer_get(pi);
+							TimestampTz last;
+
+							if (cluster_ic_mux_peer_transport(pi) == CLUSTER_IC_PEER_TRANSPORT_RDMA)
+								continue;
+							if (p == NULL)
+								continue;
+							last = p->last_heartbeat_recv_at;
+
+							/* Skip if no heartbeat ever received yet (just CONNECTED;
+						 * give peer 1 full liveness window before judging). */
+							if (last == 0)
+								continue;
+							if (now > last + liveness_to_us) {
+								cluster_ic_tier1_close_peer(pi, "heartbeat liveness timeout");
+								lmon_peer_track[pi].fd = -1;
+								lmon_peer_track[pi].substate = LMON_SUB_DOWN;
+								lmon_peer_track[pi].connect_started_at = 0;
+								wes_dirty = true;
+							}
 						}
 					}
 				}
-			}
 
-			/*
+				/*
 			 * Heartbeat send tick.
 			 *
 			 * spec-2.3 hardening v1.0.1 F1 (L68):
@@ -1569,47 +1753,47 @@ LmonMain(void)
 				 *   the v1.0.0 bug -- it bypassed the per-peer outbound buffer.
 			 *   HARD_ERROR = real socket death; close peer + state DOWN.
 			 */
-			if (now >= next_heartbeat_at) {
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-					ClusterICSendResult rc;
+				if (now >= next_heartbeat_at) {
+					for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+						ClusterICSendResult rc;
 
-					if (lmon_peer_track[pi].substate != LMON_SUB_CONNECTED)
-						continue;
-					if (cluster_ic_mux_peer_transport(pi) == CLUSTER_IC_PEER_TRANSPORT_RDMA)
-						rc = cluster_ic_send_envelope(PGRAC_IC_MSG_HEARTBEAT, pi, NULL, 0);
-					else
-						rc = cluster_ic_tier1_send_heartbeat(pi);
-					switch (rc) {
-					case CLUSTER_IC_SEND_DONE:
-						break;
-					case CLUSTER_IC_SEND_WOULD_BLOCK:
-						/* Transport-retained frame; arrange the next drain wake. */
-						wes_dirty = true;
-						break;
-					case CLUSTER_IC_SEND_NOT_ADMITTED:
-						/* Refused (queue at capacity / mid-HELLO);  the
+						if (lmon_peer_track[pi].substate != LMON_SUB_CONNECTED)
+							continue;
+						if (cluster_ic_mux_peer_transport(pi) == CLUSTER_IC_PEER_TRANSPORT_RDMA)
+							rc = cluster_ic_send_envelope(PGRAC_IC_MSG_HEARTBEAT, pi, NULL, 0);
+						else
+							rc = cluster_ic_tier1_send_heartbeat(pi);
+						switch (rc) {
+						case CLUSTER_IC_SEND_DONE:
+							break;
+						case CLUSTER_IC_SEND_WOULD_BLOCK:
+							/* Transport-retained frame; arrange the next drain wake. */
+							wes_dirty = true;
+							break;
+						case CLUSTER_IC_SEND_NOT_ADMITTED:
+							/* Refused (queue at capacity / mid-HELLO);  the
 						 * heartbeat is idempotent — next tick re-sends. */
-						wes_dirty = true;
-						break;
-					case CLUSTER_IC_SEND_HARD_ERROR:
-						cluster_ic_tier1_close_peer(pi, "heartbeat send hard error");
-						lmon_peer_track[pi].fd = -1;
-						lmon_peer_track[pi].substate = LMON_SUB_DOWN;
-						wes_dirty = true;
-						break;
+							wes_dirty = true;
+							break;
+						case CLUSTER_IC_SEND_HARD_ERROR:
+							cluster_ic_tier1_close_peer(pi, "heartbeat send hard error");
+							lmon_peer_track[pi].fd = -1;
+							lmon_peer_track[pi].substate = LMON_SUB_DOWN;
+							wes_dirty = true;
+							break;
+						}
 					}
+					next_heartbeat_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
 				}
-				next_heartbeat_at = now + HEARTBEAT_INTERVAL_MS * INT64CONST(1000);
-			}
 
-			/*
+				/*
 			 * spec-2.4 D6 -- chunk reassembly timeout scan.  Cheap per-tick
 			 * walk over CLUSTER_MAX_NODES (16) peers;noop unless any peer
 			 * has an in-flight reassembly state older than the GUC threshold.
 			 */
-			cluster_ic_chunk_scan_reassembly_timeouts();
+				cluster_ic_chunk_scan_reassembly_timeouts();
 
-			/*
+				/*
 			 * spec-2.5 D2.6 -- drain CSSD outbound queue.  CSSD aux process
 			 * cannot hold tier1 TCP fd directly (L61 process-resource-vs-shmem),
 			 * so it writes heartbeat requests into ClusterCssdOutboundSlot[]
@@ -1626,84 +1810,85 @@ LmonMain(void)
 			 * (Step 4 wires postmaster spawn) cluster_cssd_outbound_slots()
 			 * returns NULL → drain noop.
 			 */
-			{
-				ClusterCssdOutboundSlot *slots = cluster_cssd_outbound_slots();
+				{
+					ClusterCssdOutboundSlot *slots = cluster_cssd_outbound_slots();
 
-				if (slots != NULL) {
-					int cs;
+					if (slots != NULL) {
+						int cs;
 
-					for (cs = 0; cs < CLUSTER_MAX_NODES; cs++) {
-						ClusterICEnvelope env;
-						ClusterICSendResult send_rc;
-						ClusterICFanoutResult fanout_rc;
-						uint32 expected = 2;
+						for (cs = 0; cs < CLUSTER_MAX_NODES; cs++) {
+							ClusterICEnvelope env;
+							ClusterICSendResult send_rc;
+							ClusterICFanoutResult fanout_rc;
+							uint32 expected = 2;
 
-						if (!pg_atomic_compare_exchange_u32(&slots[cs].pending, &expected, 3))
-							continue; /* not ready (0/1) or another race */
+							if (!pg_atomic_compare_exchange_u32(&slots[cs].pending, &expected, 3))
+								continue; /* not ready (0/1) or another race */
 
-						/* slot now in pending=3 (LMON-draining);safe to
+							/* slot now in pending=3 (LMON-draining);safe to
 						 * read payload + request_seq + dispatch single-
 						 * peer send.  Result written back atomic before
 						 * publishing pending=0. */
-						if (cs == cluster_node_id || cluster_conf_lookup_node(cs) == NULL
-							|| (cluster_ic_mux_peer_transport(cs) != CLUSTER_IC_PEER_TRANSPORT_RDMA
-								&& cluster_ic_tier1_get_peer_fd(cs) < 0))
-							fanout_rc = CLUSTER_IC_FANOUT_PEER_DOWN;
-						else if (!cluster_ic_envelope_build(
-									 &env, PGRAC_IC_MSG_CSSD_HEARTBEAT, (uint32)cluster_node_id,
-									 (uint32)cs, &slots[cs].payload, sizeof(slots[cs].payload)))
-							fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
-						else {
-							/* spec-2.5 hardening v1.0.1 F2 (L79 envelope-payload-
+							if (cs == cluster_node_id || cluster_conf_lookup_node(cs) == NULL
+								|| (cluster_ic_mux_peer_transport(cs)
+										!= CLUSTER_IC_PEER_TRANSPORT_RDMA
+									&& cluster_ic_tier1_get_peer_fd(cs) < 0))
+								fanout_rc = CLUSTER_IC_FANOUT_PEER_DOWN;
+							else if (!cluster_ic_envelope_build(
+										 &env, PGRAC_IC_MSG_CSSD_HEARTBEAT, (uint32)cluster_node_id,
+										 (uint32)cs, &slots[cs].payload, sizeof(slots[cs].payload)))
+								fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
+							else {
+								/* spec-2.5 hardening v1.0.1 F2 (L79 envelope-payload-
 							 * 单 buffer 拼接发送): envelope + payload MUST be a
 							 * single contiguous send_bytes call so partial-IO
 							 * buffer atomically accumulates the entire frame.
 							 * Splitting was the root-cause of frame stream
 							 * corruption when EAGAIN fell between env (DONE)
 							 * and payload (WOULD_BLOCK). */
-							char combined[sizeof(env) + sizeof(slots[cs].payload)];
+								char combined[sizeof(env) + sizeof(slots[cs].payload)];
 
-							memcpy(combined, &env, sizeof(env));
-							memcpy(combined + sizeof(env), &slots[cs].payload,
-								   sizeof(slots[cs].payload));
-							send_rc = cluster_ic_send_bytes(cs, combined, sizeof(combined));
-							switch (send_rc) {
-							case CLUSTER_IC_SEND_DONE:
-								fanout_rc = CLUSTER_IC_FANOUT_DONE;
-								break;
-							case CLUSTER_IC_SEND_WOULD_BLOCK:
-								fanout_rc = CLUSTER_IC_FANOUT_WOULD_BLOCK;
-								/* RF-ROOT P6 (tier1 audit r5): the heartbeat
+								memcpy(combined, &env, sizeof(env));
+								memcpy(combined + sizeof(env), &slots[cs].payload,
+									   sizeof(slots[cs].payload));
+								send_rc = cluster_ic_send_bytes(cs, combined, sizeof(combined));
+								switch (send_rc) {
+								case CLUSTER_IC_SEND_DONE:
+									fanout_rc = CLUSTER_IC_FANOUT_DONE;
+									break;
+								case CLUSTER_IC_SEND_WOULD_BLOCK:
+									fanout_rc = CLUSTER_IC_FANOUT_WOULD_BLOCK;
+									/* RF-ROOT P6 (tier1 audit r5): the heartbeat
 								 * arm re-registers WRITEABLE on backpressure;
 								 * this arm must too, or a tail/FIFO queued
 								 * cssd frame only drains by hitching the next
 								 * send_bytes call. */
-								if (cluster_ic_tier1_pending_outbound(cs))
-									wes_dirty = true;
-								break;
-							case CLUSTER_IC_SEND_NOT_ADMITTED:
-								fanout_rc = CLUSTER_IC_FANOUT_NOT_ADMITTED;
-								if (cluster_ic_tier1_pending_outbound(cs))
-									wes_dirty = true;
-								break;
-							case CLUSTER_IC_SEND_HARD_ERROR:
-								fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
-								break;
-							default:
-								fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
-								break;
+									if (cluster_ic_tier1_pending_outbound(cs))
+										wes_dirty = true;
+									break;
+								case CLUSTER_IC_SEND_NOT_ADMITTED:
+									fanout_rc = CLUSTER_IC_FANOUT_NOT_ADMITTED;
+									if (cluster_ic_tier1_pending_outbound(cs))
+										wes_dirty = true;
+									break;
+								case CLUSTER_IC_SEND_HARD_ERROR:
+									fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
+									break;
+								default:
+									fanout_rc = CLUSTER_IC_FANOUT_HARD_ERROR;
+									break;
+								}
 							}
-						}
 
-						pg_atomic_write_u32(&slots[cs].result_state, (uint32)fanout_rc);
-						slots[cs].result_seq = slots[cs].request_seq;
-						slots[cs].result_at_us = (uint64)GetCurrentTimestamp();
-						pg_atomic_write_u32(&slots[cs].pending, 0); /* publish + idle */
+							pg_atomic_write_u32(&slots[cs].result_state, (uint32)fanout_rc);
+							slots[cs].result_seq = slots[cs].request_seq;
+							slots[cs].result_at_us = (uint64)GetCurrentTimestamp();
+							pg_atomic_write_u32(&slots[cs].pending, 0); /* publish + idle */
+						}
 					}
 				}
-			}
 
-			/*
+				/*
 			 * spec-2.4 hardening v1.0.1 F3 (L74 cross-aux-process-close-must-
 			 * be-LMON-mediated):drain pending close requests from non-LMON
 			 * contexts (chunk timeout above + future CSSD timeout / GES
@@ -1711,31 +1896,31 @@ LmonMain(void)
 			 * fd was just closed -- detected by tier1_peer_fds[peer] being -1
 			 * while lmon_peer_track[peer].fd was still set.
 			 */
-			if (cluster_ic_tier1_lmon_drain_close_requests()) {
-				int dpi;
+				if (cluster_ic_tier1_lmon_drain_close_requests()) {
+					int dpi;
 
-				for (dpi = 0; dpi < CLUSTER_MAX_NODES; dpi++) {
-					if (lmon_peer_track[dpi].fd >= 0 && cluster_ic_tier1_get_peer_fd(dpi) < 0) {
-						lmon_peer_track[dpi].fd = -1;
-						lmon_peer_track[dpi].substate = LMON_SUB_DOWN;
-						wes_dirty = true;
+					for (dpi = 0; dpi < CLUSTER_MAX_NODES; dpi++) {
+						if (lmon_peer_track[dpi].fd >= 0 && cluster_ic_tier1_get_peer_fd(dpi) < 0) {
+							lmon_peer_track[dpi].fd = -1;
+							lmon_peer_track[dpi].substate = LMON_SUB_DOWN;
+							wes_dirty = true;
+						}
 					}
 				}
-			}
 
-			/* (Re)build WaitEventSet whenever per-peer fd set changes. */
-			if (wes_dirty) {
-				if (wes != NULL) {
-					FreeWaitEventSet(wes);
-					wes = NULL;
-				}
-				rdma_cm_fd = cluster_ic_rdma_lmon_cm_fd();
-				rdma_cq_fd = cluster_ic_rdma_lmon_completion_fd();
+				/* (Re)build WaitEventSet whenever per-peer fd set changes. */
+				if (wes_dirty) {
+					if (wes != NULL) {
+						FreeWaitEventSet(wes);
+						wes = NULL;
+					}
+					rdma_cm_fd = cluster_ic_rdma_lmon_cm_fd();
+					rdma_cq_fd = cluster_ic_rdma_lmon_completion_fd();
 
-				wes = CreateWaitEventSet(CurrentMemoryContext, 5 + 2 * CLUSTER_MAX_NODES);
-				AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
+					wes = CreateWaitEventSet(CurrentMemoryContext, 5 + 2 * CLUSTER_MAX_NODES);
+					AddWaitEventToSet(wes, WL_LATCH_SET, PGINVALID_SOCKET, MyLatch, NULL);
 
-				/*
+					/*
 				 * spec-6.14 D9 (found by the t/339 kill-9 leg): the tier1
 				 * transport loop waits HERE, not in the stub-mode WaitLatch
 				 * (which already has WL_EXIT_ON_PM_DEATH) -- without the
@@ -1744,34 +1929,34 @@ LmonMain(void)
 				 * memory segment and blocking any restart of the node
 				 * ("pre-existing shared memory block is still in use").
 				 */
-				AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
-				if (listener_fd >= 0)
-					AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
-									  (void *)(intptr_t)-1);
-				if (rdma_cm_fd >= 0)
-					AddWaitEventToSet(wes, WL_SOCKET_READABLE, rdma_cm_fd, NULL,
-									  (void *)(intptr_t)-2);
-				if (rdma_cq_fd >= 0)
-					AddWaitEventToSet(wes, WL_SOCKET_READABLE, rdma_cq_fd, NULL,
-									  (void *)(intptr_t)-3);
+					AddWaitEventToSet(wes, WL_EXIT_ON_PM_DEATH, PGINVALID_SOCKET, NULL, NULL);
+					if (listener_fd >= 0)
+						AddWaitEventToSet(wes, WL_SOCKET_READABLE, listener_fd, NULL,
+										  (void *)(intptr_t)-1);
+					if (rdma_cm_fd >= 0)
+						AddWaitEventToSet(wes, WL_SOCKET_READABLE, rdma_cm_fd, NULL,
+										  (void *)(intptr_t)-2);
+					if (rdma_cq_fd >= 0)
+						AddWaitEventToSet(wes, WL_SOCKET_READABLE, rdma_cq_fd, NULL,
+										  (void *)(intptr_t)-3);
 
-				/* Per-peer (post-HELLO-bound) fds. */
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-					int events;
+					/* Per-peer (post-HELLO-bound) fds. */
+					for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+						int events;
 
-					if (lmon_peer_track[pi].fd < 0)
-						continue;
+						if (lmon_peer_track[pi].fd < 0)
+							continue;
 
-					switch (lmon_peer_track[pi].substate) {
-					case LMON_SUB_CONNECT_PEND:
-					case LMON_SUB_HELLO_SENDING: /* F1: WRITEABLE for partial-HELLO drain */
-						events = WL_SOCKET_WRITEABLE;
-						break;
-					case LMON_SUB_HELLO_WAIT:
-						events = WL_SOCKET_READABLE;
-						break;
-					case LMON_SUB_CONNECTED:
-						/*
+						switch (lmon_peer_track[pi].substate) {
+						case LMON_SUB_CONNECT_PEND:
+						case LMON_SUB_HELLO_SENDING: /* F1: WRITEABLE for partial-HELLO drain */
+							events = WL_SOCKET_WRITEABLE;
+							break;
+						case LMON_SUB_HELLO_WAIT:
+							events = WL_SOCKET_READABLE;
+							break;
+						case LMON_SUB_CONNECTED:
+							/*
 						 * spec-2.3 hardening v1.0.1 F1 (L68):
 						 *   Always wake on READABLE for inbound frames.
 						 *   Add WRITEABLE when an outbound frame is
@@ -1781,92 +1966,110 @@ LmonMain(void)
 						 *   the tail via the top-of-function drain path
 						 *   in tier1_send_bytes.
 						 */
-						events = WL_SOCKET_READABLE;
-						if (cluster_ic_tier1_pending_outbound(pi))
-							events |= WL_SOCKET_WRITEABLE;
-						break;
-					default:
-						continue;
+							events = WL_SOCKET_READABLE;
+							if (cluster_ic_tier1_pending_outbound(pi))
+								events |= WL_SOCKET_WRITEABLE;
+							break;
+						default:
+							continue;
+						}
+
+						AddWaitEventToSet(wes, events, lmon_peer_track[pi].fd, NULL,
+										  (void *)(intptr_t)pi);
 					}
 
-					AddWaitEventToSet(wes, events, lmon_peer_track[pi].fd, NULL,
-									  (void *)(intptr_t)pi);
+					/* Anonymous pending accept fds (peer_id learnt via HELLO). */
+					for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+						if (lmon_pending_fds[pi] < 0)
+							continue;
+						AddWaitEventToSet(wes, WL_SOCKET_READABLE, lmon_pending_fds[pi], NULL,
+										  (void *)(intptr_t)(CLUSTER_MAX_NODES + pi));
+					}
+					wes_dirty = false;
 				}
 
-				/* Anonymous pending accept fds (peer_id learnt via HELLO). */
-				for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-					if (lmon_pending_fds[pi] < 0)
-						continue;
-					AddWaitEventToSet(wes, WL_SOCKET_READABLE, lmon_pending_fds[pi], NULL,
-									  (void *)(intptr_t)(CLUSTER_MAX_NODES + pi));
+				now = GetCurrentTimestamp();
+				wait_ms = (next_heartbeat_at > now) ? (long)((next_heartbeat_at - now) / 1000) : 0;
+				if (wait_ms < 0)
+					wait_ms = 0;
+				if (wait_ms > HEARTBEAT_INTERVAL_MS)
+					wait_ms = HEARTBEAT_INTERVAL_MS;
+				if ((ic_tier == CLUSTER_IC_TIER_2 || ic_tier == CLUSTER_IC_TIER_3)
+					&& (ClusterICRdmaCompletionModel)cluster_interconnect_rdma_completion
+						   == CLUSTER_IC_RDMA_COMPLETION_BUSYPOLL) {
+					cluster_ic_rdma_lmon_handle_completion_events();
+					if (wait_ms > 1)
+						wait_ms = 1;
 				}
-				wes_dirty = false;
-			}
 
-			now = GetCurrentTimestamp();
-			wait_ms = (next_heartbeat_at > now) ? (long)((next_heartbeat_at - now) / 1000) : 0;
-			if (wait_ms < 0)
-				wait_ms = 0;
-			if (wait_ms > HEARTBEAT_INTERVAL_MS)
-				wait_ms = HEARTBEAT_INTERVAL_MS;
-			if ((ic_tier == CLUSTER_IC_TIER_2 || ic_tier == CLUSTER_IC_TIER_3)
-				&& (ClusterICRdmaCompletionModel)cluster_interconnect_rdma_completion
-					   == CLUSTER_IC_RDMA_COMPLETION_BUSYPOLL) {
-				cluster_ic_rdma_lmon_handle_completion_events();
-				if (wait_ms > 1)
-					wait_ms = 1;
+				lmon_record_iteration(iter_started_at);
+				work_completed = true;
 			}
-
-			lmon_record_iteration(iter_started_at);
+			PG_FINALLY();
+			{
+				if (!work_completed)
+					LWLockReleaseAll();
+				(void)cluster_normal_stop_service_leave(work_completed);
+			}
+			PG_END_TRY();
+			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
+				ereport(FATAL, (errmsg_internal("LMON normal-stop idle check failed")));
 			n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
 										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
-			for (i = 0; i < n_events; i++) {
-				intptr_t tag = (intptr_t)ev[i].user_data;
+			if (n_events <= 0)
+				continue;
+			if (!cluster_normal_stop_service_enter())
+				ereport(FATAL, (errmsg_internal("LMON normal-stop dispatch entry failed")));
+			work_completed = false;
+			PG_TRY();
+			{
+				for (i = 0; i < n_events; i++) {
+					intptr_t tag = (intptr_t)ev[i].user_data;
 
-				if (ev[i].events & WL_LATCH_SET) {
-					ResetLatch(MyLatch);
-					continue;
-				}
-
-				if (tag == -1) {
-					/* Listener: drain all pending accepts. */
-					for (;;) {
-						int new_fd = -1;
-						int32 dummy_peer_id = -1;
-						int slot;
-
-						if (!cluster_ic_tier1_accept_one(&new_fd, &dummy_peer_id))
-							break;
-						if (new_fd < 0)
-							break;
-
-						for (slot = 0; slot < CLUSTER_MAX_NODES; slot++)
-							if (lmon_pending_fds[slot] < 0)
-								break;
-						if (slot >= CLUSTER_MAX_NODES) {
-							/* No room -- reject by closing. */
-							(void)close(new_fd);
-							continue;
-						}
-						lmon_pending_fds[slot] = new_fd;
-						wes_dirty = true;
+					if (ev[i].events & WL_LATCH_SET) {
+						ResetLatch(MyLatch);
+						continue;
 					}
-				} else if (tag == -2) {
-					cluster_ic_rdma_lmon_handle_cm_events();
-					wes_dirty = true;
-				} else if (tag == -3) {
-					cluster_ic_rdma_lmon_handle_completion_events();
-				} else if (tag >= 0 && tag < CLUSTER_MAX_NODES) {
-					int32 peer = (int32)tag;
-					int peer_fd = lmon_peer_track[peer].fd;
 
-					if (peer_fd < 0)
-						continue; /* lost between events */
+					if (tag == -1) {
+						/* Listener: drain all pending accepts. */
+						for (;;) {
+							int new_fd = -1;
+							int32 dummy_peer_id = -1;
+							int slot;
 
-					if (lmon_peer_track[peer].substate == LMON_SUB_CONNECT_PEND
-						&& (ev[i].events & WL_SOCKET_WRITEABLE)) {
-						/*
+							if (!cluster_ic_tier1_accept_one(&new_fd, &dummy_peer_id))
+								break;
+							if (new_fd < 0)
+								break;
+
+							for (slot = 0; slot < CLUSTER_MAX_NODES; slot++)
+								if (lmon_pending_fds[slot] < 0)
+									break;
+							if (slot >= CLUSTER_MAX_NODES) {
+								/* No room -- reject by closing. */
+								(void)close(new_fd);
+								continue;
+							}
+							lmon_pending_fds[slot] = new_fd;
+							wes_dirty = true;
+						}
+					} else if (tag == -2) {
+						cluster_ic_rdma_lmon_handle_cm_events();
+						wes_dirty = true;
+					} else if (tag == -3) {
+						cluster_ic_rdma_lmon_handle_completion_events();
+					} else if (tag >= 0 && tag < CLUSTER_MAX_NODES) {
+						int32 peer = (int32)tag;
+						int peer_fd = lmon_peer_track[peer].fd;
+
+						if (peer_fd < 0)
+							continue; /* lost between events */
+
+						if (lmon_peer_track[peer].substate == LMON_SUB_CONNECT_PEND
+							&& (ev[i].events & WL_SOCKET_WRITEABLE)) {
+							/*
 						 * spec-2.2 §2.4 + Hardening v1.0.1 F1: active side
 						 * sends HELLO via per-peer buffer.  finish_connect
 						 * does SO_ERROR check + seeds buffer + first send.
@@ -1876,42 +2079,42 @@ LmonMain(void)
 						 * If partial, transition to HELLO_SENDING and re-enter
 						 * on next WRITEABLE.
 						 */
-						if (cluster_ic_tier1_finish_connect(peer, peer_fd)) {
-							if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
-								lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
-							else
-								lmon_peer_track[peer].substate = LMON_SUB_HELLO_SENDING;
-							wes_dirty = true;
-						} else {
-							lmon_peer_track[peer].fd = -1;
-							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
-							wes_dirty = true;
-						}
-					} else if (lmon_peer_track[peer].substate == LMON_SUB_HELLO_SENDING
-							   && (ev[i].events & WL_SOCKET_WRITEABLE)) {
-						/* Hardening v1.0.1 F1: continue partial HELLO send. */
-						if (cluster_ic_tier1_continue_hello_send(peer, peer_fd)) {
-							if (cluster_ic_tier1_hello_send_remaining(peer) == 0) {
-								lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
+							if (cluster_ic_tier1_finish_connect(peer, peer_fd)) {
+								if (cluster_ic_tier1_hello_send_remaining(peer) == 0)
+									lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
+								else
+									lmon_peer_track[peer].substate = LMON_SUB_HELLO_SENDING;
+								wes_dirty = true;
+							} else {
+								lmon_peer_track[peer].fd = -1;
+								lmon_peer_track[peer].substate = LMON_SUB_DOWN;
 								wes_dirty = true;
 							}
-							/* else: still partial, keep WRITEABLE */
-						} else {
-							lmon_peer_track[peer].fd = -1;
-							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
-							wes_dirty = true;
+						} else if (lmon_peer_track[peer].substate == LMON_SUB_HELLO_SENDING
+								   && (ev[i].events & WL_SOCKET_WRITEABLE)) {
+							/* Hardening v1.0.1 F1: continue partial HELLO send. */
+							if (cluster_ic_tier1_continue_hello_send(peer, peer_fd)) {
+								if (cluster_ic_tier1_hello_send_remaining(peer) == 0) {
+									lmon_peer_track[peer].substate = LMON_SUB_CONNECTED;
+									wes_dirty = true;
+								}
+								/* else: still partial, keep WRITEABLE */
+							} else {
+								lmon_peer_track[peer].fd = -1;
+								lmon_peer_track[peer].substate = LMON_SUB_DOWN;
+								wes_dirty = true;
+							}
+						} else if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
+								   && (ev[i].events & WL_SOCKET_READABLE)) {
+							if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
+								cluster_ic_tier1_close_peer(peer, "heartbeat recv failed");
+								lmon_peer_track[peer].fd = -1;
+								lmon_peer_track[peer].substate = LMON_SUB_DOWN;
+								wes_dirty = true;
+							}
 						}
-					} else if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
-							   && (ev[i].events & WL_SOCKET_READABLE)) {
-						if (!cluster_ic_tier1_recv_heartbeat_drain(peer, peer_fd)) {
-							cluster_ic_tier1_close_peer(peer, "heartbeat recv failed");
-							lmon_peer_track[peer].fd = -1;
-							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
-							wes_dirty = true;
-						}
-					}
 
-					/*
+						/*
 					 * spec-2.3 hardening v1.0.1 F1 (L68): drain pending
 					 * outbound buffer on WL_SOCKET_WRITEABLE.
 					 *
@@ -1924,67 +2127,79 @@ LmonMain(void)
 					 * only pushes bytes the transport already owns (tail +
 					 * queued frames, in order).
 					 */
-					if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
-						&& (ev[i].events & WL_SOCKET_WRITEABLE)
-						&& cluster_ic_tier1_pending_outbound(peer)) {
-						switch (cluster_ic_tier1_drain_outbound(peer)) {
-						case CLUSTER_IC_SEND_DONE:
-						case CLUSTER_IC_SEND_WOULD_BLOCK:
-							/* Either drained fully or still buffered;
+						if (lmon_peer_track[peer].substate == LMON_SUB_CONNECTED
+							&& (ev[i].events & WL_SOCKET_WRITEABLE)
+							&& cluster_ic_tier1_pending_outbound(peer)) {
+							switch (cluster_ic_tier1_drain_outbound(peer)) {
+							case CLUSTER_IC_SEND_DONE:
+							case CLUSTER_IC_SEND_WOULD_BLOCK:
+								/* Either drained fully or still buffered;
 							 * wes_dirty rebuild reflects pending state. */
-							wes_dirty = true;
-							break;
-						case CLUSTER_IC_SEND_NOT_ADMITTED:
-							/* Unreachable: the drain entry never admits a
+								wes_dirty = true;
+								break;
+							case CLUSTER_IC_SEND_NOT_ADMITTED:
+								/* Unreachable: the drain entry never admits a
 							 * new frame.  Keep the WES aligned anyway. */
-							wes_dirty = true;
-							break;
-						case CLUSTER_IC_SEND_HARD_ERROR:
-							cluster_ic_tier1_close_peer(peer, "outbound drain hard error");
-							lmon_peer_track[peer].fd = -1;
-							lmon_peer_track[peer].substate = LMON_SUB_DOWN;
-							wes_dirty = true;
-							break;
+								wes_dirty = true;
+								break;
+							case CLUSTER_IC_SEND_HARD_ERROR:
+								cluster_ic_tier1_close_peer(peer, "outbound drain hard error");
+								lmon_peer_track[peer].fd = -1;
+								lmon_peer_track[peer].substate = LMON_SUB_DOWN;
+								wes_dirty = true;
+								break;
+							}
 						}
-					}
-				} else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES) {
-					int slot = (int)(tag - CLUSTER_MAX_NODES);
-					int pend_fd = lmon_pending_fds[slot];
-					int32 learned = -1;
+					} else if (tag >= CLUSTER_MAX_NODES && tag < 2 * CLUSTER_MAX_NODES) {
+						int slot = (int)(tag - CLUSTER_MAX_NODES);
+						int pend_fd = lmon_pending_fds[slot];
+						int32 learned = -1;
 
-					if (pend_fd < 0)
-						continue;
+						if (pend_fd < 0)
+							continue;
 
-					/*
+						/*
 					 * Hardening v1.0.1 F1: continue_hello_recv accumulates
 					 * partial HELLO bytes into per-anon-slot buffer; returns
 					 * true with learned == -1 while still partial, true with
 					 * learned >= 0 when HELLO fully verified.
 					 */
-					if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned)) {
-						if (learned >= 0) {
-							/* HELLO complete + verified.  Migrate fd into
+						if (cluster_ic_tier1_continue_hello_recv(slot, pend_fd, &learned)) {
+							if (learned >= 0) {
+								/* HELLO complete + verified.  Migrate fd into
 							 * peer_track + free anon slot. */
-							lmon_peer_track[learned].fd = pend_fd;
-							lmon_peer_track[learned].substate = LMON_SUB_CONNECTED;
+								lmon_peer_track[learned].fd = pend_fd;
+								lmon_peer_track[learned].substate = LMON_SUB_CONNECTED;
+								lmon_pending_fds[slot] = -1;
+								cluster_ic_tier1_anon_hello_reset(slot);
+								wes_dirty = true;
+							}
+							/* else: still accumulating; keep fd registered as READABLE */
+						} else {
+							/* HELLO failed (parse / verify / EOF / error).
+						 * Drop anonymous fd; reset slot accumulator. */
+							(void)close(pend_fd);
 							lmon_pending_fds[slot] = -1;
 							cluster_ic_tier1_anon_hello_reset(slot);
 							wes_dirty = true;
 						}
-						/* else: still accumulating; keep fd registered as READABLE */
-					} else {
-						/* HELLO failed (parse / verify / EOF / error).
-						 * Drop anonymous fd; reset slot accumulator. */
-						(void)close(pend_fd);
-						lmon_pending_fds[slot] = -1;
-						cluster_ic_tier1_anon_hello_reset(slot);
-						wes_dirty = true;
 					}
 				}
+				work_completed = true;
 			}
+			PG_FINALLY();
+			{
+				if (!work_completed)
+					LWLockReleaseAll();
+				(void)cluster_normal_stop_service_leave(work_completed);
+			}
+			PG_END_TRY();
+			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
+				ereport(FATAL, (errmsg_internal("LMON normal-stop post-dispatch check failed")));
 		}
 
 		/* Shutdown: close every fd we own + free WES. */
+		lmon_normal_stop_before_exit();
 		for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
 			if (lmon_peer_track[pi].fd >= 0)
 				cluster_ic_tier1_close_peer(pi, "lmon shutdown");
@@ -2007,6 +2222,7 @@ LmonMain(void)
 			instr_time iter_started_at;
 			bool force_all_duties;
 			TimestampTz dnow;
+			volatile bool work_completed = false;
 
 			CHECK_FOR_INTERRUPTS();
 
@@ -2019,19 +2235,24 @@ LmonMain(void)
 				break;
 			}
 
-			duty_started_at = GetCurrentTimestamp();
-			INSTR_TIME_SET_CURRENT(iter_started_at);
+			if (!cluster_normal_stop_service_enter())
+				ereport(FATAL, (errmsg_internal("LMON normal-stop stub work entry failed")));
+			PG_TRY();
+			{
+				duty_started_at = GetCurrentTimestamp();
+				INSTR_TIME_SET_CURRENT(iter_started_at);
 
-			/* PGRAC: spec-7.2 D1 — >= 1 Hz floor (see the TIER_1 loop). */
-			dnow = duty_started_at;
-			force_all_duties = (dnow >= next_duty_floor_at);
-			if (force_all_duties)
-				next_duty_floor_at
-					= dnow + (int64)cluster_interconnect_heartbeat_interval_ms * INT64CONST(1000);
+				/* PGRAC: spec-7.2 D1 — >= 1 Hz floor (see the TIER_1 loop). */
+				dnow = duty_started_at;
+				force_all_duties = (dnow >= next_duty_floor_at);
+				if (force_all_duties)
+					next_duty_floor_at
+						= dnow
+						  + (int64)cluster_interconnect_heartbeat_interval_ms * INT64CONST(1000);
 
-			lmon_advance_liveness_tick();
+				lmon_advance_liveness_tick();
 
-			/*
+				/*
 			 * spec-2.28 Sprint A Step 3 D5:  consume QVOTEC quorum_state
 			 * and broadcast PROCSIG_CLUSTER_FREEZE_WRITES / _THAW_WRITES
 			 * on OK→{LOST,UNCERTAIN} or {LOST,UNCERTAIN}→OK transitions.
@@ -2040,9 +2261,9 @@ LmonMain(void)
 			 * freeze fires IMMEDIATELY (no grace_ms delay — that gates
 			 * only postmaster self-shutdown).
 			 */
-			cluster_fence_lmon_tick();
+				cluster_fence_lmon_tick();
 
-			/*
+				/*
 			 * spec-2.29 Sprint A Step 2 D3:  reconfig coordinator tick.
 			 * Consumes CSSD peer_state + cluster_qvotec_in_quorum +
 			 * cluster_cssd_get_dead_generation → Q2 A'' deterministic
@@ -2051,32 +2272,32 @@ LmonMain(void)
 			 * (P1.3 a) + I7 coordinator-only epoch++ via D18 (P1.3 b).
 			 * Idempotent within one DEAD episode (same event_id → skip).
 			 */
-			/* spec-2.16 D8 I47:  GRD newly-dead sweep MUST run BEFORE
+				/* spec-2.16 D8 I47:  GRD newly-dead sweep MUST run BEFORE
 			 * reconfig epoch bump (S1 → S2 order writ).  bitmap diff
 			 * per v0.5 P1.2;  no-op when dead_generation unchanged. */
-			cluster_grd_lmon_tick_dead_sweep();
-			(void)cluster_grd_reclaim_sweep();
-			cluster_pcm_lock_lmon_reclaim_tick();
-			/* spec-5.10 fix-forward — runtime-off starvation sweep. */
-			(void)cluster_grd_lmon_tick_starvation_sweep();
+				cluster_grd_lmon_tick_dead_sweep();
+				(void)cluster_grd_reclaim_sweep();
+				cluster_pcm_lock_lmon_reclaim_tick();
+				/* spec-5.10 fix-forward — runtime-off starvation sweep. */
+				(void)cluster_grd_lmon_tick_starvation_sweep();
 
-			/* spec-5.13 D6: clean-leave orchestration before the reconfig tick. */
-			cluster_clean_leave_lmon_tick();
+				/* spec-5.13 D6: clean-leave orchestration before the reconfig tick. */
+				cluster_clean_leave_lmon_tick();
 
-			/* spec-5.18 D9: drive permanent node removal before reconfig (a removal
+				/* spec-5.18 D9: drive permanent node removal before reconfig (a removal
 			 * masks the node out of effective_dead, INV-LF1). */
-			cluster_node_remove_lmon_tick();
+				cluster_node_remove_lmon_tick();
 
-			cluster_reconfig_lmon_tick();
-			cluster_semantic_activation_lmon_tick();
-			cluster_thread_recovery_lmon_tick();
-			/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
-			cluster_grd_recovery_authority_lmon_tick();
-			cluster_grd_recovery_lmon_tick();
-			if (cluster_gcs_block_resource_x_cutover_tick())
-				SetLatch(MyLatch);
+				cluster_reconfig_lmon_tick();
+				cluster_semantic_activation_lmon_tick();
+				cluster_thread_recovery_lmon_tick();
+				/* spec-4.6 D1:  GRD recovery sequence (see main-loop site). */
+				cluster_grd_recovery_authority_lmon_tick();
+				cluster_grd_recovery_lmon_tick();
+				if (cluster_gcs_block_resource_x_cutover_tick())
+					SetLatch(MyLatch);
 
-			/*
+				/*
 			 * PGRAC: spec-5.3 — drain the GRD work queue in the stub /
 			 * non-TIER_1 path too.  The TIER_1 loop drains it every tick (see
 			 * the TIER_1 branch above), but a single-node / stub-interconnect
@@ -2090,29 +2311,31 @@ LmonMain(void)
 			 * so the outbound drain is intentionally NOT hoisted (a stub
 			 * single node has no peers to send to).
 			 */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE, force_all_duties))
-				cluster_ges_lmon_drain_work_queue();
-			(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
-			/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
+												 force_all_duties))
+					cluster_ges_lmon_drain_work_queue();
+				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
+				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
-			if (!cluster_gcs_block_family_on_data_plane()
-				&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
-				cluster_lms_cr_ship_ready();
+				if (!cluster_gcs_block_family_on_data_plane()
+					&& cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SHIP_READY, force_all_duties))
+					cluster_lms_cr_ship_ready();
 
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_OUT, force_all_duties))
-				cluster_sinval_drain_outbound_and_broadcast();
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT, force_all_duties))
-				cluster_sinval_drain_ack_outbound_and_send();
-			cluster_sinval_broadcast_reset_all();
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_OUT, force_all_duties))
+					cluster_sinval_drain_outbound_and_broadcast();
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_SINVAL_ACK_OUT,
+												 force_all_duties))
+					cluster_sinval_drain_ack_outbound_and_send();
+				cluster_sinval_broadcast_reset_all();
 
-			/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
+				/* spec-3.2 D6:  LMON drain cross-node TT status hint outbound.
 			 * Fire-and-forget;  L172 family — only LMON owns tier1 fds. */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
-				(void)cluster_tt_status_hint_source_dispatch(
-					CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND, NULL);
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
-				cluster_backup_lmon_tick();
-			/* spec-5.22e D5-2: publish this node's undo retention horizon
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_TT_HINT, force_all_duties))
+					(void)cluster_tt_status_hint_source_dispatch(
+						CLUSTER_TT_HINT_SOURCE_DRAIN_OUTBOUND, NULL);
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_BACKUP, force_all_duties))
+					cluster_backup_lmon_tick();
+				/* spec-5.22e D5-2: publish this node's undo retention horizon
 			 * report per-peer (capability-gated; internally rate-limited to
 			 * one send per lmon_main_loop_interval).  Deliberately NOT
 			 * producer-gated behind a lazy duty: the report is the
@@ -2120,34 +2343,46 @@ LmonMain(void)
 			 * node's silence stalls every peer's recycling (the fold treats
 			 * a missing report as STALLED, never as consent).  Time-based
 			 * like the dedup TTL sweep, it rides the >= 1 Hz floor. */
-			cluster_undo_horizon_lmon_tick();
-			/* Mutually exclusive with the transport-loop continuation above. */
-			cluster_sf_origin_durable_lmon_tick();
+				cluster_undo_horizon_lmon_tick();
+				/* Mutually exclusive with the transport-loop continuation above. */
+				cluster_sf_origin_durable_lmon_tick();
 
-			/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
+				/* GCS-race round-3 P0-1: xid wrap barrier (margin check ->
 			 * durable stamp -> DISABLE fanout -> ack round -> gate open).
 			 * Zero cost before the 2^32 margin and after the gate opens;
 			 * time-based, rides the >= 1 Hz floor like the tick above. */
-			cluster_xid_wrap_barrier_lmon_tick();
+				cluster_xid_wrap_barrier_lmon_tick();
 
-			/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB.
+				/* spec-2.34 D6 (HC93 leg a):  TTL sweep GCS block dedup HTAB.
 			 * PGRAC: spec-7.2 D1 — TTL/time-based, floor-driven. */
-			if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_DEDUP_TTL, force_all_duties))
-				cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
+				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_DEDUP_TTL, force_all_duties))
+					cluster_gcs_block_dedup_sweep_expired(GetCurrentTimestamp());
 
-			/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard notes. */
-			if (!cluster_gcs_block_family_on_data_plane())
-				cluster_gcs_block_pi_discard_drain();
+				/* spec-6.12h D-h2:  drain checkpoint-confirmed PI-discard notes. */
+				if (!cluster_gcs_block_family_on_data_plane())
+					cluster_gcs_block_pi_discard_drain();
 
-			CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
+				CLUSTER_INJECTION_POINT("cluster-lmon-main-loop-iter");
 
-			lmon_record_iteration(iter_started_at);
+				lmon_record_iteration(iter_started_at);
+				work_completed = true;
+			}
+			PG_FINALLY();
+			{
+				if (!work_completed)
+					LWLockReleaseAll();
+				(void)cluster_normal_stop_service_leave(work_completed);
+			}
+			PG_END_TRY();
+			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
+				ereport(FATAL, (errmsg_internal("LMON normal-stop stub idle check failed")));
 			rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						   cluster_lmon_main_loop_interval,
 						   WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);
 			if (rc & WL_LATCH_SET)
 				ResetLatch(MyLatch);
 		}
+		lmon_normal_stop_before_exit();
 	}
 
 	/* Sprint B inject: shutdown-pre (test cleanup-time fault). */

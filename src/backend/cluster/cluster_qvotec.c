@@ -1422,35 +1422,20 @@ qvotec_semantic_activation_record_read_fds(
 	return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
 }
 
-/*
- * cluster_qvotec_bootstrap_read_semantic_activation -- RF-ROOT P9 verification
- *	closure (verified implementation): read-only startup interface.  Opens the
- *	configured voting disks itself (the qvotec process owns the long-lived
- *	fds; the startup process / recovery path cannot rely on them), runs the
- *	existing strict-majority selector over the R4 semantic-activation
- *	record tail slots, closes every fd, and writes nothing.  `implicit_open`
- *	reports whether the selected image is the all-zero implicit-OPEN sentinel
- *	(the pre-R4 boot state).
- */
-ClusterSemanticActivationResult
-cluster_qvotec_bootstrap_read_semantic_activation(
-	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
-	bool *implicit_open)
+/* QVOTEC's long-lived descriptors are private to that process. Startup opens
+ * its own read-only set; a failed configured member is not dropped from it. */
+static int
+qvotec_bootstrap_open_readonly(int fds[CLUSTER_MAX_VOTING_DISKS])
 {
 	const char *csv = cluster_voting_disks;
 	const char *p;
-	int fds[CLUSTER_MAX_VOTING_DISKS];
 	int n_disks = 0;
-	ClusterSemanticActivationResult result;
 	int i;
 
-	if (selected == NULL || implicit_open == NULL)
-		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
-	*implicit_open = false;
 	for (i = 0; i < CLUSTER_MAX_VOTING_DISKS; i++)
 		fds[i] = -1;
 	if (csv == NULL || csv[0] == '\0')
-		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+		return -1;
 
 	p = csv;
 	while (*p) {
@@ -1473,10 +1458,8 @@ cluster_qvotec_bootstrap_read_semantic_activation(
 				p++;
 			continue;
 		}
-		if (len >= MAXPGPATH || n_disks >= CLUSTER_MAX_VOTING_DISKS) {
-			result = CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
-			goto cleanup;
-		}
+		if (len >= MAXPGPATH || n_disks >= CLUSTER_MAX_VOTING_DISKS)
+			goto fail;
 		memcpy(path, start, len);
 		path[len] = '\0';
 		/* Read-only open: the startup-process restore must not touch the
@@ -1484,22 +1467,69 @@ cluster_qvotec_bootstrap_read_semantic_activation(
 		 * disks from the StartupProcess recovery path perturb the 2-node
 		 * formation window in t/243). */
 		fd = open(path, O_RDONLY, S_IRUSR | S_IWUSR);
-		if (fd < 0) {
-			result = CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
-			goto cleanup;
-		}
+		if (fd < 0)
+			goto fail;
 		fds[n_disks++] = fd;
 	}
-	if (n_disks <= 0) {
-		result = CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
-		goto cleanup;
-	}
-	result = qvotec_semantic_activation_record_read_fds(
-		fds, n_disks, selected, implicit_open);
-cleanup:
+	return n_disks > 0 ? n_disks : -1;
+
+fail:
 	for (i = 0; i < n_disks; i++)
 		if (fds[i] >= 0)
 			cluster_voting_disk_close(fds[i]);
+	return -1;
+}
+
+/* Same strict selector and canonical encoder as the existing PGRD mailbox.
+ * This read does not publish an authority, repair a minority, or grant access. */
+ClusterUndoRootDescriptorState
+cluster_qvotec_bootstrap_read_undo_root_descriptor(
+	uint64 system_identifier, uint8 selected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+{
+	int fds[CLUSTER_MAX_VOTING_DISKS];
+	int n_disks;
+	int i;
+	uint8 bitmap;
+	uint8 bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = {0};
+	ClusterUndoRootDescriptorV1 descriptor;
+	ClusterUndoRootDescriptorState result;
+
+	if (system_identifier == 0 || selected == NULL)
+		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+	n_disks = qvotec_bootstrap_open_readonly(fds);
+	if (n_disks < 0)
+		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+	result = qvotec_undo_root_descriptor_read_fds(fds, n_disks, system_identifier,
+		CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &descriptor, &bitmap);
+	for (i = 0; i < n_disks; i++)
+		cluster_voting_disk_close(fds[i]);
+	if (result == CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD
+		|| (result == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
+			&& !cluster_undo_root_descriptor_encode(&descriptor, bytes)))
+		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+	memcpy(selected, bytes, sizeof(bytes));
+	return result;
+}
+
+/* RF-ROOT P9 read-only startup interface; original PGSA selector unchanged. */
+ClusterSemanticActivationResult
+cluster_qvotec_bootstrap_read_semantic_activation(
+	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES], bool *implicit_open)
+{
+	int fds[CLUSTER_MAX_VOTING_DISKS];
+	int n_disks;
+	int i;
+	ClusterSemanticActivationResult result;
+
+	if (selected == NULL || implicit_open == NULL)
+		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+	*implicit_open = false;
+	n_disks = qvotec_bootstrap_open_readonly(fds);
+	if (n_disks < 0)
+		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+	result = qvotec_semantic_activation_record_read_fds(fds, n_disks, selected, implicit_open);
+	for (i = 0; i < n_disks; i++)
+		cluster_voting_disk_close(fds[i]);
 	return result;
 }
 
@@ -2450,24 +2480,71 @@ cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us,
 }
 #endif
 
-/*
- * Hardening v0.6 F2 (companion to startup ghost-detect):
- * Clean-shutdown self-slot ALIVE-flag clear.  Writes one final slot to
- * every disk with flags = 0 (no ALIVE) before close.  Best-effort —
- * write failures are swallowed (we are exiting anyway and the startup
- * ghost-detect path will handle next-restart races).  This is NOT
- * called from the on_shmem_exit crash path (proc_exit on FATAL):
- * crash means we cannot trust postmaster_data_dir / fds; the startup
- * ghost-detect path is the fallback for crash-restart races.
- */
+/* PGC_POSTMASTER configuration cannot change after the original open pass. */
+static int
+qvotec_shutdown_configured_disks(void)
+{
+	const char *p = cluster_voting_disks;
+	int count = 0;
+
+	if (p == NULL || *p == '\0')
+		return -1;
+	while (*p != '\0') {
+		const char *start = p;
+		const char *end;
+
+		while (*p != '\0' && *p != ',')
+			p++;
+		end = p;
+		while (start < end && (*start == ' ' || *start == '\t'))
+			start++;
+		while (end > start && (end[-1] == ' ' || end[-1] == '\t'))
+			end--;
+		if (start == end || end - start >= MAXPGPATH || ++count > CLUSTER_MAX_VOTING_DISKS)
+			return -1;
+		if (*p == ',' && *++p == '\0')
+			return -1;
+	}
+	return count;
+}
+
 static void
+qvotec_shutdown_failure(int disk, const char *reason, int io_result)
+{
+	ereport(LOG, (errmsg("qvotec: normal shutdown self-slot clear failed"),
+				  errdetail("family=NORMAL_STOP reason=%s disk=%d io_result=%d", reason, disk,
+							io_result)));
+}
+
+/*
+ * Full normal stop requires every configured disk, not a quorum. Never run
+ * this from the crash exit callback. Existing non-full-stop compatibility
+ * remains best-effort; it cannot publish the full-stop completion result.
+ */
+static bool
 qvotec_clear_self_alive_on_clean_shutdown(void)
 {
 	ClusterVotingSlot blanked;
+	bool normal_stop = cluster_normal_stop_requested();
+	bool all_cleared = true;
 	int i;
 
+	if (normal_stop
+		&& (!cluster_normal_stop_protocol_closed() || QvotecShmem == NULL || qvotec_n_disks <= 0
+			|| qvotec_n_disks > CLUSTER_MAX_VOTING_DISKS
+			|| qvotec_shutdown_configured_disks() != qvotec_n_disks || cluster_node_id < 0
+			|| (uint32)cluster_node_id >= CLUSTER_MAX_NODES || qvotec_self_incarnation == 0)) {
+		qvotec_shutdown_failure(-1, "QVOTEC_CLOSE_PRECONDITION", -1);
+		all_cleared = false;
+		goto complete;
+	}
 	if (qvotec_n_disks == 0 || cluster_node_id < 0 || (uint32)cluster_node_id >= CLUSTER_MAX_NODES)
-		return;
+		return true;
+	if (normal_stop && qvotec_slot_generation > UINT64_MAX - (uint64)qvotec_n_disks) {
+		qvotec_shutdown_failure(-1, "QVOTEC_GENERATION_OVERFLOW", -1);
+		all_cleared = false;
+		goto complete;
+	}
 
 	memset(&blanked, 0, sizeof(blanked));
 	blanked.magic = CLUSTER_VOTING_SLOT_MAGIC;
@@ -2497,20 +2574,65 @@ qvotec_clear_self_alive_on_clean_shutdown(void)
 		memset(blanked._reserved1, 0, sizeof(blanked._reserved1));
 		rrc = cluster_voting_disk_read_slot(
 			qvotec_fds[i], i, (uint32)cluster_node_id, &existing);
-		if (rrc != CLUSTER_VOTING_DISK_IO_OK)
+		if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+			if (normal_stop)
+				qvotec_shutdown_failure(i, "QVOTEC_SELF_SLOT_READ", (int)rrc);
+			all_cleared = false;
 			continue;
+		}
+		/* The I/O layer also validates CRC, magic, version, node and disk. */
+		if (normal_stop
+			&& (existing.incarnation != qvotec_self_incarnation || existing.generation == 0
+				|| existing.generation > qvotec_slot_generation)) {
+			qvotec_shutdown_failure(i, "QVOTEC_SELF_SLOT_IDENTITY", -1);
+			all_cleared = false;
+			continue;
+		}
 		cluster_removal_marker_preserve_per_disk(
 			blanked._reserved1, existing._reserved1);
 		rplm_state = qvotec_replacement_request_preserve(&blanked, &existing);
-		if (rplm_state == CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD)
+		if (rplm_state == CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD) {
+			if (normal_stop)
+				qvotec_shutdown_failure(i, "QVOTEC_REPLACEMENT_HOLD", -1);
+			all_cleared = false;
 			continue;
+		}
 
 		qvotec_slot_generation++;
 		blanked.generation = qvotec_slot_generation;
 		blanked.disk_index = (uint32)i;
-		(void)cluster_voting_disk_write_slot(qvotec_fds[i], &blanked);
+		rrc = cluster_voting_disk_write_slot(qvotec_fds[i], &blanked);
+		if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+			if (normal_stop)
+				qvotec_shutdown_failure(i, "QVOTEC_SELF_SLOT_WRITE_SYNC", (int)rrc);
+			all_cleared = false;
+		}
 	}
+
+complete:
+	if (normal_stop)
+		return cluster_normal_stop_qvotec_complete(all_cleared);
+	return true;
 }
+
+#ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
+extern bool cluster_qvotec_test_clean_shutdown(const int *fds, int n_disks, uint64 incarnation,
+											   uint64 generation);
+bool
+cluster_qvotec_test_clean_shutdown(const int *fds, int n_disks, uint64 incarnation,
+								   uint64 generation)
+{
+	int i;
+
+	Assert(n_disks >= 0 && n_disks <= CLUSTER_MAX_VOTING_DISKS);
+	qvotec_n_disks = n_disks;
+	for (i = 0; i < n_disks; i++)
+		qvotec_fds[i] = fds[i];
+	qvotec_self_incarnation = incarnation;
+	qvotec_slot_generation = generation;
+	return qvotec_clear_self_alive_on_clean_shutdown();
+}
+#endif
 
 
 /* ============================================================
@@ -4189,14 +4311,13 @@ ClusterQvotecMain(void)
 	}
 
 	/*
-	 * Hardening v0.6 F2:  best-effort clear ALIVE flag on self-slot
-	 * BEFORE closing disks, so a fast-restart sees our prior slot as
-	 * "shutdown clean" rather than "ghost peer alive".  Failure here
-	 * is non-fatal — startup ghost-detect path covers the residual
-	 * crash / immediate-shutdown gap.
+	 * Full normal-stop ALIVE clear is a required durable result. Failure
+	 * cannot become a clean exit; the postmaster also checks its sticky
+	 * result. Legacy non-full-stop behaviour stays outside that contract.
 	 */
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_SHUTDOWN);
-	qvotec_clear_self_alive_on_clean_shutdown();
+	if (!qvotec_clear_self_alive_on_clean_shutdown())
+		ereport(FATAL, (errmsg("qvotec could not complete normal shutdown self-slot clear")));
 	qvotec_close_disks();
 	if (!cluster_reconfig_qvotec_lifecycle_transition(
 			&QvotecShmem->mailbox, &QvotecShmem->state,

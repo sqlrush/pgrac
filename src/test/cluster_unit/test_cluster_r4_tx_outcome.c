@@ -160,6 +160,8 @@ static int test_terminal_census_root_resolve_calls;
 static bool test_local_freshref_pair_exact;
 static int test_local_freshref_pair_calls;
 static SCN test_local_origin_bound;
+static bool test_local_ordinary_abort;
+static bool test_local_last_ordinary_single;
 static int test_local_origin_calls;
 static bool test_local_origin_epoch_drift;
 
@@ -243,14 +245,25 @@ scn_time_cmp(SCN a, SCN b)
 }
 
 bool
-cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative,
+cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative, bool ordinary_single,
 								   ClusterGcsUndoVerdictPage *page)
 {
 	test_local_origin_calls++;
+	test_local_last_ordinary_single = ordinary_single;
 	UT_ASSERT_EQ(xid, TEST_ORIGIN_XID);
 	UT_ASSERT(!authoritative);
 	if (test_local_origin_epoch_drift)
 		test_formation_epoch++;
+	if (test_local_ordinary_abort) {
+		if (!ordinary_single)
+			return false;
+		memset(page, 0, sizeof(*page));
+		page->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+		page->version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+		page->xid_echo = xid;
+		page->verdict = CLUSTER_GCS_UNDO_VERDICT_ABORTED;
+		return true;
+	}
 	if (!SCN_VALID(test_local_origin_bound))
 		return false;
 	memset(page, 0, sizeof(*page));
@@ -1060,6 +1073,8 @@ reset_exact_origin_fixture(void)
 	test_local_freshref_pair_exact = false;
 	test_local_freshref_pair_calls = 0;
 	test_local_origin_bound = InvalidScn;
+	test_local_ordinary_abort = false;
+	test_local_last_ordinary_single = false;
 	test_local_origin_calls = 0;
 	test_local_origin_epoch_drift = false;
 	test_remote_origin_enabled = false;
@@ -3995,10 +4010,34 @@ UT_TEST(test_local_retained_read_bound_precedes_exact_pair_without_promoting_it)
 	UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
 }
 
+UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
+{
+	ClusterUndoVerdictResult result;
+	extern ClusterUndoVerdictResult cluster_runtime_visibility_test_self_verdict_role(
+		TransactionId xid, uint32 segment, uint32 slot, SCN read_scn, bool authoritative,
+		SCN retained_scn);
+
+	reset_exact_origin_fixture();
+	test_local_ordinary_abort = true;
+	result = cluster_runtime_visibility_test_self_verdict_role(TEST_ORIGIN_XID, TEST_RECORD_SEGMENT,
+															   0, 120, false, InvalidScn);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_ABORTED);
+	UT_ASSERT(test_local_last_ordinary_single);
+	result = cluster_runtime_visibility_test_self_verdict_role(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, 120, true, InvalidScn);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT(!test_local_last_ordinary_single);
+	result = cluster_runtime_visibility_test_self_verdict_role(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, 120, true, test_commit_scn);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT(!test_local_last_ordinary_single);
+}
+
 int
 main(void)
 {
-	UT_PLAN(121);
+	UT_PLAN(122);
+	UT_RUN(test_self_fresh_role_does_not_inherit_ordinary_abort_permission);
 	UT_RUN(test_local_retained_read_bound_precedes_exact_pair_without_promoting_it);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);

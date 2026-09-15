@@ -24,6 +24,8 @@ ErrorContextCallback *error_context_stack = NULL;
 void
 pg_re_throw(void)
 {
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
 	abort();
 }
 

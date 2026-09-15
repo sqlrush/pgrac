@@ -114,6 +114,11 @@ cluster_replacement_wire_phase3_ingress_local(
 extern bool cluster_replacement_phase3_handoff_poll_local(
 	ClusterReplacementPhase3HandoffItem *out);
 extern uint32 cluster_replacement_phase3_handoff_pending_local(void);
+/* Raw owner observation, not authority: > capacity (including NULL) is
+ * invalid, never empty. The caller must establish the owning LMON context. */
+extern uint64
+cluster_replacement_phase3_handoff_observed_count(const ClusterReplacementPhase3Handoff *handoff);
+extern uint64 cluster_replacement_phase3_handoff_observed_count_local(void);
 
 
 #endif /* CLUSTER_REPLACEMENT_WIRE_H */

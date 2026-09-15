@@ -887,6 +887,16 @@ typedef struct RouteSeamCapture {
 } RouteSeamCapture;
 
 static RouteSeamCapture route_seam;
+static bool stop_new_read_allowed = true;
+static int stop_new_read_calls;
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data)
+{
+	Assert(!modifies_data);
+	stop_new_read_calls++;
+	return stop_new_read_allowed;
+}
 
 bool
 cluster_cr_server_r4_land_foreign_undo(
@@ -1090,6 +1100,8 @@ route_test_capability_generation(int32 peer_id)
 static void
 route_seam_reset(void)
 {
+	stop_new_read_allowed = true;
+	stop_new_read_calls = 0;
 	memset(&route_seam, 0, sizeof(route_seam));
 	origin_generation_sample_enabled = false;
 	origin_generation_sample_value = 9;
@@ -3593,8 +3605,22 @@ UT_TEST(test_current_mx_member_proof_forward128_routes_to_cooperative_origin)
 	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
 	UT_ASSERT_EQ(route_seam.current_mx_proof_serve_calls, 0);
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+	/* An admitted context is not a new read: duplicate and original drain
+	 * remain available after the seal. */
+	stop_new_read_allowed = false;
+	stop_new_read_calls = 0;
+	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+	UT_ASSERT_EQ(stop_new_read_calls, 0);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
 	cluster_gcs_block_test_r4_tx_origin_drain();
 	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	/* Once the original owner retired it, this frame starts a new context. */
+	UT_ASSERT(cluster_gcs_block_test_current_mx_forward128(&env, &request));
+	UT_ASSERT_EQ(stop_new_read_calls, 1);
+	UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+	UT_ASSERT_EQ(route_seam.current_mx_proof_serve_calls, 0);
+	cluster_gcs_block_test_r4_tx_origin_drain(); /* RED-only original cleanup. */
+	stop_new_read_allowed = true;
 
 	cluster_node_id = saved_node_id;
 }
@@ -5919,6 +5945,46 @@ route_test_tx_forward(uint32 generation)
 	return forward;
 }
 
+UT_TEST(test_seal_two_blocks_new_tx_and_undo_contexts_but_not_original_drain)
+{
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_MASTER_NODE;
+	for (int domain = 0; domain < 2; domain++) {
+		ClusterR4CrForwardPayload forward = domain == 0 ? route_test_tx_forward(UINT32_MAX)
+														: route_test_undo_forward(TT_WRAP_INVALID);
+		ClusterICEnvelope env = route_test_envelope(
+			PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_REQUESTER_NODE, UT_MASTER_NODE, sizeof(forward));
+
+		route_seam_reset();
+		route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+		stop_new_read_allowed = false;
+		UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		UT_ASSERT_EQ(stop_new_read_calls, 1);
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+		UT_ASSERT_EQ(route_seam.enter_calls, 0);
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+		for (int i = 0; i < 4; i++)
+			cluster_gcs_block_test_r4_tx_origin_drain(); /* RED-only cleanup. */
+		route_seam_reset();
+		route_seam.raw_send_result = CLUSTER_IC_SEND_DONE;
+		UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+		UT_ASSERT_EQ(stop_new_read_calls, 1);
+		stop_new_read_calls = 0;
+		stop_new_read_allowed = false;
+		UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		UT_ASSERT_EQ(stop_new_read_calls, 0);
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 1);
+		for (int i = 0; i < 4; i++)
+			cluster_gcs_block_test_r4_tx_origin_drain();
+		UT_ASSERT_EQ(cluster_gcs_block_test_r4_tx_origin_context_count(), 0);
+		UT_ASSERT_EQ(route_seam.leave_calls, 1);
+	}
+	stop_new_read_allowed = true;
+	cluster_node_id = saved_node;
+}
+
 UT_TEST(test_kind2_origin_generation_selection_and_strict_known_negatives)
 {
 	int saved_node = cluster_node_id;
@@ -6339,7 +6405,8 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(117);
+	UT_RUN(test_seal_two_blocks_new_tx_and_undo_contexts_but_not_original_drain);
 	UT_RUN(test_kind2_requester_asks_origin_to_select_and_lands_exact_status22);
 	UT_RUN(test_kind2_origin_generation_selection_and_strict_known_negatives);
 	UT_RUN(test_kind2_origin_backpressure_does_not_reselect_or_duplicate);

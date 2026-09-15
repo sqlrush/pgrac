@@ -207,6 +207,7 @@
 #include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
 #include "cluster/cluster_xid_wrap_barrier.h" /* PGRAC: GCS-race round-3 P0-1 startup mirror */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
 #include "cluster/cluster_write_fence.h" /* PGRAC: RF-ROOT P6 checkpoint fence deferral */
@@ -6511,6 +6512,7 @@ StartupXLOG(void)
 	{
 		TransactionId *startup_prepared_xids = NULL;
 		int startup_prepared_count = 0;
+		const char *normal_failure = NULL;
 
 		oldestActiveXID = PrescanPreparedTransactions(&startup_prepared_xids,
 													&startup_prepared_count);
@@ -6522,6 +6524,15 @@ StartupXLOG(void)
 			startup_prepared_count);
 		if (startup_prepared_xids != NULL)
 			pfree(startup_prepared_xids);
+		/* Classify once from the original own-start inputs. A failed normal
+		 * proof is not permission to fall through into crash post-jobs. */
+		if (!cluster_semantic_normal_start_prepare(boot_state == DB_SHUTDOWNED && wasShutdown
+													   && !InRecovery && !ArchiveRecoveryRequested
+													   && !haveBackupLabel,
+												   startup_prepared_count, &normal_failure))
+			ereport(FATAL, (errmsg("could not classify cluster normal startup"),
+							errdetail("reason=%s",
+									  normal_failure != NULL ? normal_failure : "UNCLASSIFIED")));
 	}
 #else
 	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
@@ -6895,7 +6906,10 @@ StartupXLOG(void)
 	 * the startup process, before backends are allowed to connect.  No-op unless
 	 * cluster.enabled + cluster.tt_recovery_resolve_active.
 	 */
-	cluster_tt_recovery_resolve_active_slots();
+	/* A classified normal TARGET validates terminal history without changing
+	 * it. Its strict complete census below replaces these recovery-only jobs. */
+	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+		cluster_tt_recovery_resolve_active_slots();
 
 	/*
 	 * PGRAC MODIFICATIONS (spec-4.8 D5, L222): advance cluster_scn to the
@@ -6904,7 +6918,8 @@ StartupXLOG(void)
 	 * over-fail-closes CR "snapshot too old" until organic SCN advance catches
 	 * up).  Lamport-monotonic, so it can only advance cluster_scn.
 	 */
-	cluster_tt_recovery_observe_scn_highwater();
+	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+		cluster_tt_recovery_observe_scn_highwater();
 	cluster_backup_recovery_observe_highwater();
 
 	/*
@@ -6916,7 +6931,8 @@ StartupXLOG(void)
 	 * fail-closed (MVCC-invisible + vacuum reclaim).  Best-effort cleanout;
 	 * correctness never depends on it.
 	 */
-	cluster_tt_recovery_physical_rollback();
+	if (cluster_semantic_normal_start_state() != CLUSTER_NORMAL_START_TARGET_LOADING)
+		cluster_tt_recovery_physical_rollback();
 #endif
 
 	/*
@@ -6963,6 +6979,32 @@ StartupXLOG(void)
 		ereport(FATAL,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 				 errmsg("could not close the single-node control-file OWNER handoff")));
+	{
+		const char *hw_failure = NULL;
+
+		/* No normal HW READY publication until the real OWNER close succeeds. */
+		if (!cluster_hw_startup_complete(&hw_failure))
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("could not complete cluster HW startup authority"),
+					 errdetail("reason=%s", hw_failure != NULL ? hw_failure : "UNCLASSIFIED")));
+	}
+	if (cluster_enabled && cluster_shared_data_dir != NULL && cluster_shared_data_dir[0] != '\0')
+	{
+		ClusterNormalStartState normal_state = cluster_semantic_normal_start_state();
+		const char *normal_failure = NULL;
+
+		/* Own immutable completion follows both OWNER close and HW rebuild.
+		 * LMON, not Startup, subsequently composes the real four-member ACK. */
+		if (normal_state != CLUSTER_NORMAL_START_EXISTING_OTHER
+			&& normal_state != CLUSTER_NORMAL_START_SOURCE_ZERO
+			&& (normal_state != CLUSTER_NORMAL_START_TARGET_LOADING
+				|| !cluster_semantic_normal_start_finish(&normal_failure)))
+			ereport(FATAL,
+					(errmsg("could not complete cluster normal startup"),
+					 errdetail("reason=%s",
+							   normal_failure != NULL ? normal_failure : "INVALID_STARTUP_STATE")));
+	}
 #endif
 }
 
@@ -7389,6 +7431,38 @@ ShutdownXLOG(int code, Datum arg)
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE);
 	}
 }
+
+#ifdef USE_PGRAC_CLUSTER
+bool
+cluster_native_wal_shutdown_observe(bool stopped, int64 *started_at)
+{
+	ControlFileData observed;
+
+	if (started_at != NULL)
+		*started_at = 0;
+	if (started_at == NULL || !IsUnderPostmaster || MyProc == NULL
+		|| (!AmLmonProcess() && !AmCheckpointerProcess()) || ControlFile == NULL
+		|| PgStartTime <= 0 || !cluster_normal_stop_native_wal_mode()
+		|| RecoveryInProgress() || (stopped && !cluster_normal_stop_requested())
+		|| LWLockHeldByMe(ControlFileLock))
+		return false;
+	/* The original checkpoint publishes and fsyncs under this lock. This
+	 * observer neither writes a clean flag nor supplies recovery authority. */
+	LWLockAcquire(ControlFileLock, LW_SHARED);
+	observed = *ControlFile;
+	LWLockRelease(ControlFileLock);
+	if (observed.state != (stopped ? DB_SHUTDOWNED : DB_IN_PRODUCTION)
+		|| XLogRecPtrIsInvalid(observed.checkPoint)
+		|| XLogRecPtrIsInvalid(observed.checkPointCopy.redo)
+		|| observed.checkPointCopy.redo > observed.checkPoint
+		|| observed.checkPointCopy.ThisTimeLineID == 0
+		|| observed.checkPointCopy.PrevTimeLineID == 0
+		|| observed.checkPointCopy.PrevTimeLineID > observed.checkPointCopy.ThisTimeLineID)
+		return false;
+	*started_at = PgStartTime;
+	return true;
+}
+#endif
 
 /*
  * Log start of a checkpoint.
@@ -8101,11 +8175,13 @@ CreateCheckPoint(int flags)
 	 * (snapshot_lsn = checkPoint.redo).  Written before the checkpoint record so
 	 * a completed checkpoint always has a durable snapshot; recovery loads it
 	 * and replays the HW_RESERVE WAL tail on top (rebuild = max(snapshot, tail)).
-	 * No-op unless the HW authority is active (multi-node + shared storage).
+	 * A native single-node seed also maintains its configured metadata; that
+	 * does not enable multi-node allocation.  The writer checks startup mode
+	 * and completeness, retaining the existing recovery contract separately.
 	 * Must be outside the critical section below -- it does durable file I/O.
 	 */
 #ifdef USE_PGRAC_CLUSTER
-	if (cluster_hw_authority_active())
+	if (cluster_hw_metadata_configured() || cluster_hw_authority_active())
 		cluster_hw_snapshot_checkpoint_write(checkPoint.redo);
 
 	/* PGRAC: spec-6.15 D5d -- re-emit the xid stripe JOIN record so any

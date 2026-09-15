@@ -503,10 +503,28 @@ UT_TEST(test_phase3_handoff_is_bounded_fifo_without_overwrite)
 }
 
 
+UT_TEST(test_stop_observation_cannot_hide_malformed_or_wrapped_queue)
+{
+	ClusterReplacementPhase3Handoff handoff;
+	cluster_replacement_phase3_handoff_init(&handoff);
+	UT_ASSERT_EQ(cluster_replacement_phase3_handoff_observed_count(&handoff), 0);
+	UT_ASSERT(cluster_replacement_phase3_handoff_observed_count(NULL)
+			  > CLUSTER_REPLACEMENT_PHASE3_HANDOFF_CAPACITY);
+	handoff.consumer_seq = UINT64_MAX;
+	handoff.producer_seq = 0;
+	UT_ASSERT_EQ(cluster_replacement_phase3_handoff_observed_count(&handoff), 1);
+	handoff.consumer_seq = 0;
+	handoff.producer_seq = CLUSTER_REPLACEMENT_PHASE3_HANDOFF_CAPACITY + 1;
+	UT_ASSERT_EQ(cluster_replacement_phase3_handoff_pending(&handoff), 0);
+	UT_ASSERT_EQ(cluster_replacement_phase3_handoff_observed_count(&handoff),
+				 CLUSTER_REPLACEMENT_PHASE3_HANDOFF_CAPACITY + 1);
+	UT_ASSERT_EQ(handoff.consumer_seq, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_codec_is_exact_72_byte_little_endian);
 	UT_RUN(test_codec_round_trips_all_four_phase_layouts);
 	UT_RUN(test_phase3_maps_exact_generation_ready_and_zero_reserved);
@@ -519,6 +537,7 @@ main(void)
 	UT_RUN(test_phase3_ingress_enqueues_only_observation_handoff);
 	UT_RUN(test_phase3_ingress_maps_wire_baseline_to_outer_committed_epoch);
 	UT_RUN(test_phase3_handoff_is_bounded_fifo_without_overwrite);
+	UT_RUN(test_stop_observation_cannot_hide_malformed_or_wrapped_queue);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

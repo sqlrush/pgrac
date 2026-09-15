@@ -529,8 +529,13 @@ sub init
 	mkdir $self->backup_dir;
 	mkdir $self->archive_dir;
 
+	# Explicit HW seed publication requires initdb's real final synchronization.
+	# Ordinary test initdb keeps its existing no-sync default.
+	my @init_extra = @{ $params{extra} // [] };
+	my @no_sync = grep(/^--pgrac-hw-snapshot-(?:root|owner)(?:=|$)/, @init_extra)
+	  ? () : ('-N');
 	PostgreSQL::Test::Utils::system_or_bail('initdb', '-D', $pgdata, '-A',
-		'trust', '-N', @{ $params{extra} });
+		'trust', @no_sync, @init_extra);
 	PostgreSQL::Test::Utils::system_or_bail($ENV{PG_REGRESS},
 		'--config-auth', $pgdata, @{ $params{auth_extra} });
 

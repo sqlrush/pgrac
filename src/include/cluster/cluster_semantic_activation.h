@@ -305,13 +305,43 @@ cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSi
 extern ResourceXWriterPath
 cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out);
 extern bool cluster_semantic_activation_phase1_pristine(void);
+/* Postmaster lifecycle hint only: atomics, no locks/I/O/identity copy.
+ * True includes unknown state; it never authorizes a shutdown or OPEN. */
+extern bool cluster_semantic_normal_stop_needs_retention(void);
 extern void cluster_semantic_activation_note_clean_start(bool clean);
-extern bool cluster_semantic_activation_r11_cutover_snapshot(
-	ClusterSemanticR11CutoverSnapshot *out);
+/* A boot-local preparation record, not a replacement for PGSA/ACK authority. */
+typedef enum ClusterNormalStartState {
+	CLUSTER_NORMAL_START_UNCLASSIFIED = 0,
+	CLUSTER_NORMAL_START_EXISTING_OTHER = 1,
+	CLUSTER_NORMAL_START_SOURCE_ZERO = 2,
+	CLUSTER_NORMAL_START_TARGET_LOADING = 3,
+	CLUSTER_NORMAL_START_TARGET_READY = 4,
+	CLUSTER_NORMAL_START_FAILED = 5
+} ClusterNormalStartState;
+typedef struct ClusterNormalStartSnapshot {
+	uint32 state;
+	int32 node_id;
+	uint64 system_identifier, boot_incarnation, epoch;
+	uint64 own_checkpoint_lsn, own_redo_lsn, own_next_full_xid, own_checkpoint_scn;
+	uint64 tt_commit_scn_max;
+	uint32 census_count, reserved;
+	uint8 pgsa[512], pgrd[512];
+} ClusterNormalStartSnapshot;
+StaticAssertDecl(sizeof(ClusterNormalStartSnapshot) == 1104,
+				 "normal-start snapshot must retain the completion layout");
+extern void cluster_semantic_normal_start_capture(uint64 checkpoint_lsn, uint64 redo_lsn,
+												  uint64 next_full_xid, uint64 checkpoint_scn);
+extern ClusterNormalStartState cluster_semantic_normal_start_state(void);
+extern bool cluster_semantic_normal_start_closed(void);
+extern bool cluster_semantic_normal_start_prepare(bool clean, int prepared_count,
+												  const char **failure);
+extern bool cluster_semantic_normal_start_finish(const char **failure);
+extern bool cluster_semantic_normal_start_snapshot(ClusterNormalStartSnapshot *out);
+extern bool
+cluster_semantic_activation_r11_cutover_snapshot(ClusterSemanticR11CutoverSnapshot *out);
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);
 extern ClusterSemanticAdmissionResult
-cluster_semantic_activation_enter_r4_terminal_census(
-	ClusterSemanticAdmissionToken *token);
+cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_recheck_r4_terminal_census(
 	const ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_resolve_shared_undo_root(

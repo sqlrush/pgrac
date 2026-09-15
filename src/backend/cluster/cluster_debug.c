@@ -84,6 +84,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
 #include "cluster/cluster_grd.h"	  /* cluster_grd_* observability accessors (spec-2.14 D6) */
 #include "cluster/cluster_hw.h"		  /* HW relation-extend authority counters (spec-5.7 §3.1c) */
+#include "cluster/cluster_hw_snapshot.h"
 #include "cluster/cluster_dl.h"		  /* DL bulk-load lease counters (spec-5.7 D4) */
 #include "cluster/cluster_ir.h"		  /* IR instance-recovery owner counters (spec-5.7 D8) */
 #include "cluster/cluster_ts.h"		  /* TT tablespace-DDL lock counters (spec-5.7 D5) */
@@ -3802,8 +3803,55 @@ dump_write_fence(ReturnSetInfo *rsinfo)
  * not_ready / failclosed surface the 53RA6 fail-closed serve gate.
  */
 static void
+dump_normal_start(ReturnSetInfo *rsinfo)
+{
+	ClusterNormalStartSnapshot snapshot;
+	bool ready = cluster_semantic_normal_start_snapshot(&snapshot);
+	char pgsa[1025], pgrd[1025];
+	static const char hex[] = "0123456789abcdef";
+	unsigned i;
+
+	/* Incomplete payload is not a zero-valued proof. Only an immutable READY
+	 * snapshot may expose its identities and complete selected disk records. */
+	emit_row(
+		rsinfo, "normal_start", "state",
+		fmt_int32(ready ? (int32)snapshot.state : (int32)cluster_semantic_normal_start_state()));
+	emit_row(rsinfo, "normal_start", "completion_bytes", fmt_int64(sizeof(snapshot)));
+	emit_row(rsinfo, "normal_start", "ready_snapshot", ready ? "true" : "false");
+	if (!ready)
+		return;
+	emit_row(rsinfo, "normal_start", "node_id", fmt_int32(snapshot.node_id));
+	emit_row(rsinfo, "normal_start", "system_identifier",
+			 fmt_uint64_hex(snapshot.system_identifier));
+	emit_row(rsinfo, "normal_start", "boot_incarnation", fmt_uint64_hex(snapshot.boot_incarnation));
+	emit_row(rsinfo, "normal_start", "epoch", fmt_uint64_hex(snapshot.epoch));
+	emit_row(rsinfo, "normal_start", "own_checkpoint_lsn",
+			 fmt_uint64_hex(snapshot.own_checkpoint_lsn));
+	emit_row(rsinfo, "normal_start", "own_redo_lsn", fmt_uint64_hex(snapshot.own_redo_lsn));
+	emit_row(rsinfo, "normal_start", "own_next_full_xid",
+			 fmt_uint64_hex(snapshot.own_next_full_xid));
+	emit_row(rsinfo, "normal_start", "own_checkpoint_scn",
+			 fmt_uint64_hex(snapshot.own_checkpoint_scn));
+	emit_row(rsinfo, "normal_start", "tt_commit_scn_max",
+			 fmt_uint64_hex(snapshot.tt_commit_scn_max));
+	emit_row(rsinfo, "normal_start", "census_count", fmt_int64(snapshot.census_count));
+	emit_row(rsinfo, "normal_start", "reserved", fmt_int64(snapshot.reserved));
+	for (i = 0; i < 512; i++) {
+		pgsa[2 * i] = hex[snapshot.pgsa[i] >> 4];
+		pgsa[2 * i + 1] = hex[snapshot.pgsa[i] & 15];
+		pgrd[2 * i] = hex[snapshot.pgrd[i] >> 4];
+		pgrd[2 * i + 1] = hex[snapshot.pgrd[i] & 15];
+	}
+	pgsa[1024] = pgrd[1024] = '\0';
+	emit_row(rsinfo, "normal_start", "pgsa_hex", pgsa);
+	emit_row(rsinfo, "normal_start", "pgrd_hex", pgrd);
+}
+
+static void
 dump_hw(ReturnSetInfo *rsinfo)
 {
+	emit_row(rsinfo, "hw", "cold_boot_mode", fmt_int64((int64)cluster_hw_cold_boot_mode()));
+	emit_row(rsinfo, "hw", "cold_boot_state", fmt_int64((int64)cluster_hw_cold_boot_state()));
 	emit_row(rsinfo, "hw", "alloc_count", fmt_int64((int64)cluster_hw_alloc_count()));
 	emit_row(rsinfo, "hw", "authority_create_count",
 			 fmt_int64((int64)cluster_hw_authority_create_count()));
@@ -4259,6 +4307,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		 * docs/cluster-debug-design.md §3.
 		 */
 		dump_shmem(rsinfo);
+		dump_normal_start(rsinfo);
 		dump_guc(rsinfo);
 		dump_ic(rsinfo);
 		dump_inject(rsinfo);

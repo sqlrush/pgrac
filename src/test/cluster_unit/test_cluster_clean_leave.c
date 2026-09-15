@@ -1171,9 +1171,13 @@ UT_TEST(test_phase1_full_stop_retains_coordination_without_r4_admission)
 		"retain_shutdown_coordination");
 	stop_coordination = find_in_order(combined, shutdown_end,
 		"if (!retain_shutdown_coordination)");
-	suppress = find_in_order(stop_coordination, shutdown_end,
-		"if (retain_shutdown_coordination && LmonPID != 0)");
+	suppress
+		= find_in_order(stop_coordination, shutdown_end,
+						"if (!retain_normal_stop && retain_shutdown_coordination && LmonPID != 0)");
 	UT_ASSERT_NOT_NULL(suppress);
+	/* The new current branch publishes atomic intent; only this unchanged
+	 * legacy branch uses the old suppression setter. Native behavior is
+	 * exercised in test_cluster_postmaster_stop, not inferred from text. */
 
 	wait_backends = strstr(shutdown_end, "if (pmState == PM_WAIT_BACKENDS)");
 	wait_backends_end = wait_backends == NULL ? NULL

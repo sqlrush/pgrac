@@ -3593,7 +3593,7 @@ cluster_runtime_visibility_try_resolve_remote(int origin_node, uint32 undo_segme
  *	the proven COMMITTED fact and keeps the bound marker.
  */
 static ClusterUndoVerdictResult
-rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
+rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn, bool ordinary_single)
 {
 	ClusterGcsUndoVerdictPage v;
 	ClusterUndoVerdictResult r;
@@ -3602,8 +3602,9 @@ rtvis_resolve_own_xid(TransactionId raw_xid, SCN read_scn)
 
 	memset(&v, 0, sizeof(v));
 	/* master==self keeps the stripe self-check (authoritative=false): D6-7's
-	 * physical-binding relaxation is for the FOREIGN fresh-ref serve only. */
-	if (!cluster_lms_undo_verdict_fill_page(raw_xid, false, &v)) {
+	 * physical-binding relaxation is for the FOREIGN fresh-ref serve only.
+	 * That stripe check is separate from the ordinary/fresh consumer role. */
+	if (!cluster_lms_undo_verdict_fill_page(raw_xid, false, ordinary_single, &v)) {
 		cluster_rtvis_resolve_note_failclosed(); /* D3-6: self-path observability */
 		return unknown;							 /* in-doubt / ambiguous / not-own -> fail-closed */
 	}
@@ -3664,7 +3665,7 @@ rtvis_resolve_own_xid_freshref_c1b_pair(TransactionId raw_xid, uint32 undo_segme
 	 * and must remain exact-only. A bound is never the retained exact stamp. */
 	if (SCN_VALID(read_scn)) {
 		uint64 epoch = cluster_epoch_get_current();
-		ClusterUndoVerdictResult ordinary = rtvis_resolve_own_xid(raw_xid, read_scn);
+		ClusterUndoVerdictResult ordinary = rtvis_resolve_own_xid(raw_xid, read_scn, false);
 
 		if (cluster_epoch_get_current() != epoch)
 			return result;
@@ -3685,6 +3686,17 @@ rtvis_resolve_own_xid_freshref_c1b_pair(TransactionId raw_xid, uint32 undo_segme
 	cluster_rtvis_resolve_note_committed();
 	return result;
 }
+/* The self arm keeps the request role even though it needs no wire exchange. */
+static ClusterUndoVerdictResult
+rtvis_resolve_self_verdict(TransactionId raw_xid, uint32 undo_segment_id,
+						   uint32 expected_tt_slot_id, SCN read_scn, bool authoritative,
+						   SCN freshref_pair_scn)
+{
+	if (SCN_VALID(freshref_pair_scn))
+		return rtvis_resolve_own_xid_freshref_c1b_pair(
+			raw_xid, undo_segment_id, expected_tt_slot_id, freshref_pair_scn, read_scn);
+	return rtvis_resolve_own_xid(raw_xid, read_scn, !authoritative);
+}
 
 #ifdef USE_CLUSTER_UNIT
 ClusterUndoVerdictResult
@@ -3695,6 +3707,17 @@ cluster_runtime_visibility_test_local_retained_read(TransactionId xid, uint32 se
 													SCN retained_scn, SCN read_scn)
 {
 	return rtvis_resolve_own_xid_freshref_c1b_pair(xid, segment, slot, retained_scn, read_scn);
+}
+ClusterUndoVerdictResult
+cluster_runtime_visibility_test_self_verdict_role(TransactionId xid, uint32 segment, uint32 slot,
+												  SCN read_scn, bool authoritative,
+												  SCN retained_scn);
+ClusterUndoVerdictResult
+cluster_runtime_visibility_test_self_verdict_role(TransactionId xid, uint32 segment, uint32 slot,
+												  SCN read_scn, bool authoritative,
+												  SCN retained_scn)
+{
+	return rtvis_resolve_self_verdict(xid, segment, slot, read_scn, authoritative, retained_scn);
 }
 #endif
 
@@ -3914,10 +3937,8 @@ cluster_undo_verdict_resolve_internal(
 
 	/* master==self: own CLOG + own durable TT authority (Q5/D3-4). */
 	if (origin_node == cluster_node_id) {
-		if (freshref_pair)
-			return rtvis_resolve_own_xid_freshref_c1b_pair(
-				raw_xid, undo_segment_id, expected_tt_slot_id, freshref_pair_scn, read_scn);
-		return rtvis_resolve_own_xid(raw_xid, read_scn);
+		return rtvis_resolve_self_verdict(raw_xid, undo_segment_id, expected_tt_slot_id, read_scn,
+										  authoritative, freshref_pair_scn);
 	}
 
 	/*

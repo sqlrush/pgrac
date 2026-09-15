@@ -158,6 +158,7 @@
 #include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_scn.h" /* PGRAC: spec-4.5a G6 checkpoint SCN seed */
 #include "cluster/cluster_tt_slot.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -1538,8 +1539,12 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 		cluster_scn_recovery_replay_observe(record->xl_scn);
 		/* Capture the actual own WAL record, not a shared control-file copy.
 		 * StartupXLOG separately confirms the completed clean-start decision. */
-		if (wasShutdown)
+		if (wasShutdown) {
 			cluster_tt_slot_capture_startup_checkpoint(record->xl_scn, checkPoint.nextXid);
+			cluster_semantic_normal_start_capture(CheckPointLoc, checkPoint.redo,
+												  U64FromFullTransactionId(checkPoint.nextXid),
+												  record->xl_scn);
+		}
 #endif
 
 		/* Make sure that REDO location exists. */
@@ -1750,6 +1755,30 @@ InitWalRecovery(ControlFileData *ControlFile, bool *wasShutdown_ptr,
 	 */
 	abortedRecPtr = InvalidXLogRecPtr;
 	missingContrecPtr = InvalidXLogRecPtr;
+
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * Classify from the actual WAL/recovery decision, never from whether an HW
+	 * file happens to exist.  checkPoint is the record decoded for this boot;
+	 * the shared control-file copy may describe a different owner's checkpoint.
+	 * A normal boot must rebuild before checkpoint or allocation can consume HW.
+	 */
+	{
+		const char *hw_failure = NULL;
+
+		if (!cluster_hw_startup_prepare(
+				InRecovery, wasShutdown && !haveBackupLabel && !ArchiveRecoveryRequested,
+				checkPoint.redo, &hw_failure))
+			ereport(FATAL,
+					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
+					 errmsg("could not prepare cluster HW startup authority"),
+					 errdetail("reason=%s", hw_failure != NULL ? hw_failure : "UNCLASSIFIED")));
+		if (cluster_hw_metadata_configured())
+			ereport(LOG, (errmsg("cluster HW startup mode=%s state=%u",
+								 InRecovery ? "RECOVERY_EXISTING_CONTRACT" : "NORMAL_SELF",
+								 (unsigned)cluster_hw_cold_boot_state())));
+	}
+#endif
 
 	*wasShutdown_ptr = wasShutdown;
 	*haveBackupLabel_ptr = haveBackupLabel;

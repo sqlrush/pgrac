@@ -554,3 +554,8 @@ extern ClusterSemanticActivationResult
 cluster_qvotec_bootstrap_read_semantic_activation(
 	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
 	bool *implicit_open);
+
+/* Startup-only read of the shared PGRD through the existing strict selector.
+ * No provision/CAS and no use of QVOTEC's process-private descriptors. */
+extern ClusterUndoRootDescriptorState cluster_qvotec_bootstrap_read_undo_root_descriptor(
+	uint64 system_identifier, uint8 selected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);

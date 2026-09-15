@@ -66,11 +66,21 @@
 #include "storage/lwlock.h"
 
 #include "cluster/cluster_marker_async.h"
+#include "cluster/cluster_semantic_activation.h"
 
 /* 128 nodes, same width as ReconfigEvent.dead_bitmap. */
 #define CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES 16
 /* Default drain deadline; aligns with the feature-082 30s barrier. */
 #define CLUSTER_CLEAN_LEAVE_DRAIN_TIMEOUT_DEFAULT_MS 30000
+
+/* A local observation, not a reusable authority or a cross-module snapshot.
+ * Only the normal-stop controller's producer cut and final seal make READY
+ * stable. Required modules that are not initialized must return INVALID. */
+typedef enum ClusterNormalStopPollResult {
+	CLUSTER_NORMAL_STOP_INVALID = 0,
+	CLUSTER_NORMAL_STOP_PENDING,
+	CLUSTER_NORMAL_STOP_READY
+} ClusterNormalStopPollResult;
 
 /*
  * ClusterLeavePhase — leaving-node driver state machine (§2.1).  9 states.
@@ -366,12 +376,69 @@ typedef struct ClusterPhase1FullStopPlan {
 	uint64 member_incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
 } ClusterPhase1FullStopPlan;
 
+typedef enum ClusterNormalStopPhase {
+	CLUSTER_NORMAL_STOP_IDLE = 0,
+	CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS,
+	CLUSTER_NORMAL_STOP_DRAIN,
+	CLUSTER_NORMAL_STOP_QUIESCE,
+	CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK,
+	CLUSTER_NORMAL_STOP_CHECKPOINT,
+	CLUSTER_NORMAL_STOP_POST_STOPPED,
+	CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED
+} ClusterNormalStopPhase;
+
+typedef enum ClusterNormalStopFailure {
+	CLUSTER_NORMAL_STOP_FAILURE_NONE = 0,
+	CLUSTER_NORMAL_STOP_FAILURE_STATE,
+	CLUSTER_NORMAL_STOP_FAILURE_IDENTITY,
+	CLUSTER_NORMAL_STOP_FAILURE_DEADLINE,
+	CLUSTER_NORMAL_STOP_FAILURE_MODULE,
+	CLUSTER_NORMAL_STOP_FAILURE_CLEANER,
+	CLUSTER_NORMAL_STOP_FAILURE_SERVICE,
+	CLUSTER_NORMAL_STOP_FAILURE_QVOTEC,
+	CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT,
+	CLUSTER_NORMAL_STOP_FAILURE_LATE_UNSEALED_WORK
+} ClusterNormalStopFailure;
+
+/* Tail of the existing leave region. Never a wire or persistent format.
+ * Identity and service fields use the original leave lock; postmaster only
+ * touches the atomic control fields. A fresh region starts one attempt,
+ * and neither attachment nor ordinary leave cleanup resets this tail. */
+typedef struct ClusterNormalStopState {
+	pg_atomic_uint32 requested;
+	pg_atomic_uint32 frontends_gone;
+	pg_atomic_uint32 phase;
+	pg_atomic_uint32 failure_reason;
+	pg_atomic_uint32 cleaner_quiesce_requested;
+	pg_atomic_uint32 cleaner_quiesced_mask;
+	pg_atomic_uint32 qvotec_clear_result;
+	pg_atomic_uint32 identity_published;
+	uint64 epoch;
+	int64 own_wal_started_at;
+	uint64 member_incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	ClusterSemanticActivationRecord open_record;
+	uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint64 peer_request_nonce[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	uint32 peer_requests_seen;
+	uint32 peer_reply_pending;
+	uint32 peer_reply_sent;
+	uint32 peer_request_sent;
+	pg_atomic_uint32 service_active_mask;
+	pg_atomic_uint32 service_idle_mask;
+	pg_atomic_uint32 service_seal;
+} ClusterNormalStopState;
+
+typedef struct ClusterCleanLeaveSharedState {
+	ClusterLeaveState leave;
+	ClusterNormalStopState normal_stop;
+} ClusterCleanLeaveSharedState;
+
 typedef struct ClusterLeaveAnnouncePayload {
 	uint32 magic;
 	uint16 version;
 	uint16 _pad0;
 	int32 leaving_node_id;
-	uint8 preflight; /* 0=announce, 1=barrier, 2=release, 3=reply receipt */
+	uint8 preflight;	 /* 0=announce, 1=barrier, 2=release, 3=reply receipt */
 	uint8 producer_kind; /* ClusterLeaveProducerKind */
 	uint8 _pad1[2];
 	uint64 leave_epoch;			 /* 0 until bound (preflight / pre-commit) */
@@ -479,8 +546,7 @@ extern bool cluster_clean_leave_should_invalidate(uint64 observed_epoch, uint64 
  * closed (freeze_queue / 53R62) — never read stale storage (Rule 8.A). */
 extern bool cluster_clean_leave_serve_gate_allows(bool block_from_leaving,
 												  bool leave_flushed_invalidated);
-extern bool cluster_clean_leave_startup_serving_allows(bool authority_managed,
-													 bool serving_ready);
+extern bool cluster_clean_leave_startup_serving_allows(bool authority_managed, bool serving_ready);
 
 /* IC payload integrity (D8 / U9 / rule 15) — pure CRC compute + validate.
  * *_valid checks magic + version + CRC; the announce form also rejects an
@@ -495,53 +561,47 @@ extern bool cluster_clean_leave_ack_payload_valid(const ClusterLeaveAckPayload *
  * coordinated-stop probe; it is never a clean-leave announce and grants no
  * authority.  ACK completion is over the captured four members and never
  * shrinks with CSSD liveness. */
-extern bool cluster_clean_leave_phase1_full_stop_plan_valid(
-	const ClusterPhase1FullStopPlan *plan);
+extern bool cluster_clean_leave_phase1_full_stop_plan_valid(const ClusterPhase1FullStopPlan *plan);
 extern bool cluster_clean_leave_phase1_full_stop_probe_accepts(
-	uint8 producer_kind, bool preflight, int32 envelope_source_node,
-	int32 payload_leaving_node, uint64 envelope_epoch, uint64 payload_epoch,
-	uint64 attempt_nonce, bool local_fast_shutdown, bool exact_phase1_eligible);
-extern bool cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-	bool source_active, bool source_stopped,
-	bool local_active, bool local_stopped);
-extern bool cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
-	bool local_stopped, bool request_in_progress, bool shutdown_driven,
-	bool preflight_pending, bool preflight_sent, bool release_pending);
-extern bool cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-	uint8 producer_kind, uint8 wire_round, int32 envelope_source_node,
-	int32 payload_leaving_node, uint64 envelope_epoch, uint64 payload_epoch,
-	uint64 nonce, bool source_stopped, bool local_stopped,
+	uint8 producer_kind, bool preflight, int32 envelope_source_node, int32 payload_leaving_node,
+	uint64 envelope_epoch, uint64 payload_epoch, uint64 attempt_nonce, bool local_fast_shutdown,
 	bool exact_phase1_eligible);
-extern bool cluster_clean_leave_phase1_full_stop_receipt_accepts(
-	uint8 producer_kind, uint8 wire_round, bool release_pending,
-	uint64 stored_nonce, uint64 receipt_nonce, bool request_seen);
+extern bool cluster_clean_leave_phase1_full_stop_probe_phase_accepts(bool source_active,
+																	 bool source_stopped,
+																	 bool local_active,
+																	 bool local_stopped);
+extern bool cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
+	bool local_stopped, bool request_in_progress, bool shutdown_driven, bool preflight_pending,
+	bool preflight_sent, bool release_pending);
+extern bool cluster_clean_leave_phase1_full_stop_release_probe_accepts(
+	uint8 producer_kind, uint8 wire_round, int32 envelope_source_node, int32 payload_leaving_node,
+	uint64 envelope_epoch, uint64 payload_epoch, uint64 nonce, bool source_stopped,
+	bool local_stopped, bool exact_phase1_eligible);
+extern bool
+cluster_clean_leave_phase1_full_stop_receipt_accepts(uint8 producer_kind, uint8 wire_round,
+													 bool release_pending, uint64 stored_nonce,
+													 uint64 receipt_nonce, bool request_seen);
 extern bool cluster_clean_leave_phase1_full_stop_release_complete(
-	const ClusterPhase1FullStopPlan *plan, int32 self_node,
-	const uint8 *request_sent, const uint8 *request_seen,
-	const uint8 *reply_sent, const uint8 *reply_seen,
-	const uint8 *receipt_sent, const uint8 *receipt_seen,
-	int nbytes, bool transport_drained);
+	const ClusterPhase1FullStopPlan *plan, int32 self_node, const uint8 *request_sent,
+	const uint8 *request_seen, const uint8 *reply_sent, const uint8 *reply_seen,
+	const uint8 *receipt_sent, const uint8 *receipt_seen, int nbytes, bool transport_drained);
 extern bool cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-	bool retained, bool retained_before_local_round,
-	uint64 retained_local_nonce, uint64 retained_deadline_us,
-	uint64 current_local_nonce, uint64 current_deadline_us,
-	bool exact_identity, bool request_in_progress,
-	bool shutdown_driven, bool post_requests_sent);
+	bool retained, bool retained_before_local_round, uint64 retained_local_nonce,
+	uint64 retained_deadline_us, uint64 current_local_nonce, uint64 current_deadline_us,
+	bool exact_identity, bool request_in_progress, bool shutdown_driven, bool post_requests_sent);
 extern bool cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
 	bool local_active, bool local_stopped, bool local_post_round_armed);
 extern bool cluster_clean_leave_phase1_full_stop_ack_matches(
-	const ClusterPhase1FullStopPlan *plan, int32 self_node,
-	int32 envelope_source_node, int32 survivor_node, int32 leaving_node,
-	uint64 payload_epoch, uint64 attempt_nonce,
+	const ClusterPhase1FullStopPlan *plan, int32 self_node, int32 envelope_source_node,
+	int32 survivor_node, int32 leaving_node, uint64 payload_epoch, uint64 attempt_nonce,
 	uint64 current_survivor_incarnation);
-extern bool cluster_clean_leave_phase1_full_stop_ack_complete(
-	const ClusterPhase1FullStopPlan *plan, int32 self_node,
-	const uint8 *ack_bitmap, int nbytes);
-extern bool cluster_clean_leave_phase1_full_stop_nonce_fresh(
-	uint64 prior_nonce, uint64 next_nonce);
+extern bool cluster_clean_leave_phase1_full_stop_ack_complete(const ClusterPhase1FullStopPlan *plan,
+															  int32 self_node,
+															  const uint8 *ack_bitmap, int nbytes);
+extern bool cluster_clean_leave_phase1_full_stop_nonce_fresh(uint64 prior_nonce, uint64 next_nonce);
 extern ClusterPhase1FullStopProbeNonceDecision
-cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-	uint64 active_nonce, uint64 stopped_nonce, uint64 incoming_nonce);
+cluster_clean_leave_phase1_full_stop_probe_nonce_decide(uint64 active_nonce, uint64 stopped_nonce,
+														uint64 incoming_nonce);
 
 
 /* ============================================================
@@ -555,6 +615,206 @@ extern PGDLLIMPORT volatile sig_atomic_t cluster_clean_leave_quiesce_pending;
 extern Size cluster_clean_leave_shmem_size(void);
 extern void cluster_clean_leave_shmem_init(void);
 extern void cluster_clean_leave_shmem_register(void);
+
+/* Postmaster owns the two local producer facts, never the leave LWLock. */
+extern bool cluster_normal_stop_postmaster_request(void);
+extern bool cluster_normal_stop_postmaster_frontends_gone(void);
+extern bool cluster_normal_stop_requested(void);
+extern bool cluster_normal_stop_native_wal_mode(void);
+extern void cluster_normal_stop_fail(ClusterNormalStopFailure reason);
+extern ClusterNormalStopFailure cluster_normal_stop_failure(void);
+extern bool cluster_normal_stop_protocol_closed(void);
+/* Checkpointer's first producer cut. READY means all four exact frontend
+ * requests are present, not that cleanup or the shutdown checkpoint is done. */
+extern ClusterNormalStopPollResult
+cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char **reason_out);
+/* Caller-owned diagnostics, never a cached permission or shared certificate. */
+typedef struct ClusterNormalStopModuleObservation {
+	const char *module;
+	const char *reason;
+	char object[192];
+} ClusterNormalStopModuleObservation;
+/* Checkpointer, or LMON for the post-checkpoint send cut only. Original
+ * shared polls execute outside the leave lock; private actor ownership is
+ * separately covered by the immutable service cut and original local poll. */
+extern ClusterNormalStopPollResult
+cluster_normal_stop_modules_poll(bool post_checkpoint,
+								 ClusterNormalStopModuleObservation *observation);
+extern ClusterNormalStopPollResult
+cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullStopPlan *plan_out,
+									ClusterNormalStopModuleObservation *observation);
+/* After the actual ShutdownXLOG and own durable STOPPED publication. READY
+ * arms only the existing post-STOPPED round, never protocol completion. */
+extern ClusterNormalStopPollResult
+cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
+										ClusterNormalStopModuleObservation *observation);
+/* Same fixed plan after arm. READY is protocol closure only; OS exits and
+ * QVOTEC's final durable result remain postmaster obligations. */
+extern ClusterNormalStopPollResult
+cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
+							   ClusterNormalStopModuleObservation *observation);
+/* Actual checkpointer caller: original latch/deadline wait between polls,
+ * with ShutdownXLOG and own STOPPED strictly between these two entries. */
+extern bool cluster_normal_stop_checkpoint_prepare(ClusterPhase1FullStopPlan *plan,
+												   ClusterNormalStopModuleObservation *observation);
+extern bool
+cluster_normal_stop_checkpoint_complete(ClusterPhase1FullStopPlan *plan,
+										ClusterNormalStopModuleObservation *observation);
+/* Checkpointer, after the complete DRAIN observations; original owners still
+ * own all cleanup. Each cleaner signs only itself after its outer pass. */
+extern ClusterNormalStopPollResult cluster_normal_stop_request_cleaner_quiesce(void);
+extern bool cluster_normal_stop_cleaner_park_requested(void);
+extern bool cluster_normal_stop_cleaner_park(void);
+extern bool cluster_normal_stop_cleaners_are_parked(void);
+extern bool cluster_normal_stop_qvotec_complete(bool all_disks_cleared);
+/* Atomic final result only; postmaster still needs every original child exit. */
+extern bool cluster_normal_stop_qvotec_cleared(void);
+extern ClusterNormalStopPollResult
+cluster_node_remove_normal_stop_poll(const char **domain, uint64 *key, const char **reason);
+extern ClusterNormalStopPollResult cluster_fence_normal_stop_poll(const char **domain, uint64 *key,
+																  const char **reason);
+extern ClusterNormalStopPollResult
+cluster_write_fence_normal_stop_poll(const char **domain, uint64 *key, const char **reason);
+extern ClusterNormalStopPollResult cluster_cf_normal_stop_poll(bool post_checkpoint,
+															   const char **reason);
+extern ClusterNormalStopPollResult cluster_cf_normal_stop_shared_poll(bool post_checkpoint,
+																	  const char **reason);
+
+extern ClusterNormalStopPollResult
+cluster_recovery_normal_stop_poll(const char **domain, uint64 *key, const char **reason);
+extern ClusterNormalStopPollResult cluster_mrp_normal_stop_poll(const char **domain, uint64 *key,
+																const char **reason);
+extern ClusterNormalStopPollResult cluster_backup_normal_stop_poll(const char **domain, uint64 *key,
+																   const char **reason);
+
+extern ClusterNormalStopPollResult
+cluster_gcs_dedup_normal_stop_poll(const char **domain, uint64 *key, const char **reason);
+extern ClusterNormalStopPollResult
+cluster_ges_dedup_normal_stop_poll(const char **domain, uint64 *key, const char **reason);
+
+extern ClusterNormalStopPollResult cluster_lmd_graph_normal_stop_poll(uint64 *key,
+																	  const char **reason);
+extern ClusterNormalStopPollResult cluster_lmd_normal_stop_poll(const char **domain, uint64 *key,
+																const char **reason);
+extern ClusterNormalStopPollResult cluster_lmd_pending_normal_stop_poll(uint64 *key,
+																		const char **reason);
+
+/* Non-waiting actor brackets, owned by the actual LMON/LMS/SINVAL/LMD process.
+ * The caller polls its modules only outside this lock and outside a bracket.
+ * expected_services is the checkpointer's immutable actual-start roster, not
+ * a mask recomputed from currently surviving workers. */
+extern bool cluster_normal_stop_service_enter(void);
+extern bool cluster_normal_stop_service_leave(bool completed);
+extern ClusterNormalStopPollResult
+cluster_normal_stop_service_idle(ClusterNormalStopPollResult modules);
+extern ClusterNormalStopPollResult cluster_normal_stop_service_seal(uint32 expected_services,
+																	uint32 next_seal);
+extern bool cluster_normal_stop_service_new_work(bool modifies_data);
+/* Proactive maintenance stops minting new work after the first cut. This is
+ * not admission for a received frame or permission to retire owned work. */
+extern bool cluster_normal_stop_service_data_sealed(void);
+extern bool cluster_normal_stop_service_control_sealed(void);
+
+/* Stack-only exact first cause; does not include transport-private ownership. */
+extern ClusterNormalStopPollResult
+cluster_lms_outbound_normal_stop_poll(int *worker_out, uint32 *slot_out, const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_ic_chunk_normal_stop_poll(int *peer_out, uint32 *sequence_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_ic_normal_stop_poll(const char **domain_out,
+															   int *peer_out, uint32 *sequence_out,
+															   const char **reason_out);
+extern ClusterNormalStopPollResult cluster_ic_rdma_normal_stop_poll(bool *active_out, int *peer_out,
+																	const char **reason_out);
+extern ClusterNormalStopPollResult cluster_ic_tier1_normal_stop_poll(int *peer_out,
+																	 const char **reason_out);
+extern ClusterNormalStopPollResult cluster_grd_work_queue_normal_stop_poll(uint32 *slot_out,
+																		   const char **reason_out);
+extern ClusterNormalStopPollResult cluster_grd_outbound_normal_stop_poll(uint32 *slot_out,
+																		 const char **reason_out);
+extern ClusterNormalStopPollResult cluster_gcs_block_normal_stop_poll(bool post_checkpoint,
+																	  int *backend_out,
+																	  int *slot_out,
+																	  const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_gcs_block_normal_stop_local_poll(int *slot_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_ko_normal_stop_poll(uint32 *slot_out,
+															   const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_sinval_normal_stop_poll(const char **domain_out, uint64 *key_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_cr_server_normal_stop_poll(int *slot_out,
+																	  const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_lms_native_probe_normal_stop_poll(int *slot_out, const char **reason_out);
+/* Actual DATA owner, outside its work segment and before any transport close. */
+extern ClusterNormalStopPollResult cluster_lms_normal_stop_idle(void);
+/* LMON-owned read-only census; does not publish idle or hold the leave lock. */
+extern ClusterNormalStopPollResult cluster_lmon_normal_stop_poll(void);
+extern ClusterNormalStopPollResult cluster_lmd_probe_normal_stop_poll(uint64 *probe_id,
+																	  const char **reason);
+extern ClusterNormalStopPollResult
+cluster_clean_leave_normal_stop_local_poll(int *peer_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_sf_dep_normal_stop_poll(bool post_checkpoint,
+																   int *slot_out, int *origin_out,
+																   const char **reason_out);
+struct GesReplyWaitKey;
+extern ClusterNormalStopPollResult
+cluster_ges_reply_wait_normal_stop_poll(struct GesReplyWaitKey *key_out, const char **reason_out);
+struct ClusterResId;
+extern ClusterNormalStopPollResult cluster_grd_normal_stop_poll(struct ClusterResId *resid_out,
+																uint32 *shard_out,
+																const char **reason_out);
+struct buftag;
+/* Read only the existing five-leg terminal receipt ancestry. Never signs the
+ * missing receipt, restores a capability or grants online authority. */
+extern bool cluster_normal_stop_peer_receipt_tail(
+	const ClusterSemanticActivationRecord *open_record,
+	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], int peer,
+	uint64 admitted_incarnation);
+/* Revalidate an already-read complete OPEN/PGRD identity against the live
+ * original owners. This does not read voting disks, publish a close identity
+ * or prove that any semantic admission/transaction has drained. */
+extern ClusterNormalStopPollResult cluster_semantic_normal_stop_match(
+	const ClusterSemanticActivationRecord *open_record,
+	const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+	uint64 member_incarnations_out[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT], const char **reason_out);
+/* LMON only: nonblocking original QVOTEC read, then full live revalidation.
+ * No identity output escapes before READY; no admission/drain is implied. */
+extern ClusterNormalStopPollResult cluster_semantic_normal_stop_read_identity(
+	ClusterSemanticActivationRecord *open_out, uint8 root_out[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+	uint64 member_incarnations_out[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT], const char **reason_out);
+/* LMON's original shared/private responsibilities, not a replacement for
+ * current identity revalidation or the producer/service seal. */
+extern ClusterNormalStopPollResult cluster_semantic_normal_stop_poll(const char **domain_out,
+																	 uint64 *key_out,
+																	 const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_scn_normal_stop_poll(const char **domain_out, uint64 *key_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_reconfig_normal_stop_poll(const char **domain_out,
+																	 uint64 *key_out,
+																	 const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_undo_active_write_normal_stop_poll(int *backend_out, const char **reason_out);
+extern ClusterNormalStopPollResult
+cluster_tt_slot_normal_stop_poll(uint32 *segment_out, int *slot_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_oid_lease_normal_stop_poll(const char **reason_out);
+extern ClusterNormalStopPollResult cluster_sequence_normal_stop_poll(struct ClusterResId *resid_out,
+																	 const char **reason_out);
+extern ClusterNormalStopPollResult cluster_hw_normal_stop_poll(const char **domain_out,
+															   uint64 *key_out, int *backend_out,
+															   const char **reason_out);
+/* Full already-bound PGRD bytes, not one segment's resolved file root_id.
+ * The owner validates the original codec and resolves each logical segment. */
+extern ClusterNormalStopPollResult cluster_undo_block0_normal_stop_poll(
+	bool post_checkpoint, const uint8 root_descriptor[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+	uint64 expected_epoch, uint32 *segment_out, int *tt_slot_out, const char **reason_out);
+extern ClusterNormalStopPollResult cluster_bufmgr_normal_stop_poll(bool post_checkpoint,
+																   struct buftag *tag_out,
+																   int *buffer_id_out,
+																   const char **reason_out);
+extern ClusterNormalStopPollResult cluster_pcm_normal_stop_poll(bool post_checkpoint,
+																struct buftag *tag_out,
+																uint32 *slot_out,
+																const char **reason_out);
 
 /* ------------------------------------------------------------------
  * Voting-disk leave-marker two-phase commit (§2.5) — qvotec-mediated.
@@ -604,7 +864,7 @@ typedef enum ClusterLeaveRequestResult {
 													 * old fail-open ACCEPTED.  Distinct from
 													 * peers_not_all_enabled (a definite disabled NAK):
 													 * incomplete = handshake unfinished, retry/diagnose */
-	CLUSTER_LEAVE_REQ_REJECTED_NOT_SERVING /* managed startup has not published
+	CLUSTER_LEAVE_REQ_REJECTED_NOT_SERVING			 /* managed startup has not published
 											  * generation-bound SERVING_READY */
 } ClusterLeaveRequestResult;
 
@@ -614,10 +874,8 @@ cluster_clean_leave_request(void);				   /* internal C entry; gated by GUC + in_
 extern void cluster_clean_leave_drive_drain(void); /* phase state-machine step, backend ctx */
 extern bool cluster_clean_leave_phase1_full_stop_candidate(void);
 extern ClusterPhase1FullStopPrepareResult
-cluster_clean_leave_phase1_full_stop_prepare_exact(
-	ClusterPhase1FullStopPlan *plan_out);
-extern bool cluster_clean_leave_phase1_full_stop_close_exact(
-	ClusterPhase1FullStopPlan *plan);
+cluster_clean_leave_phase1_full_stop_prepare_exact(ClusterPhase1FullStopPlan *plan_out);
+extern bool cluster_clean_leave_phase1_full_stop_close_exact(ClusterPhase1FullStopPlan *plan);
 
 /* LMON orchestration (both sides): consume announce + advance barrier + escalate. */
 extern void cluster_clean_leave_lmon_tick(void);

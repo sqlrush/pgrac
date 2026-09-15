@@ -186,6 +186,7 @@
 #include "cluster/cluster_cf_storage.h" /* cluster_cf_startup_prepare (spec-5.6 Da3) */
 #include "cluster/cluster_catalog_bootstrap.h" /* cluster_catalog_startup_prepare (spec-6.14 D2) */
 #include "cluster/cluster_clean_leave.h" /* phase-1 full-stop coordination retention */
+#include "cluster/cluster_conf.h"
 #include "cluster/cluster_fence.h" /* cluster_fence_postmaster_check (spec-2.28 D6) */
 #include "cluster/cluster_guc.h"   /* cluster_enabled (spec-1.11 Sprint B) */
 #include "cluster/cluster_lmon.h"  /* cluster_lmon_suppress_reconfig (RF-ROOT P6) */
@@ -194,6 +195,7 @@
 #include "cluster/cluster_lmd.h"   /* cluster_lmd_mark_child_exit (spec-2.19 D12 hardening) */
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_undo_cleaner.h"
 #endif
@@ -721,6 +723,170 @@ StaticAssertDecl(CLUSTER_LMS_MAX_WORKERS == 8,
 #define EXIT_STATUS_0(st) ((st) == 0)
 #define EXIT_STATUS_1(st) (WIFEXITED(st) && WEXITSTATUS(st) == 1)
 #define EXIT_STATUS_3(st) (WIFEXITED(st) && WEXITSTATUS(st) == 3)
+
+#ifdef USE_PGRAC_CLUSTER
+/* NORMAL_STOP_POSTMASTER_BEGIN
+ * Postmaster-private process ledger. Never shared, durable or a protocol
+ * authority. Slots 0..9 are the immutable service-bit layout; the remaining
+ * original lock/lease/cleaner actors are retained but do not sign idle bits. */
+#define NORMAL_STOP_AUX_COUNT 22
+typedef struct NormalStopPostmaster {
+	bool selected;
+	bool exit_released;
+	bool checkpoint_exited;
+	bool lmd_enabled;
+	int lms_workers;
+	uint32 expected, reaped;
+	pid_t pids[NORMAL_STOP_AUX_COUNT];
+	pid_t checkpointer;
+} NormalStopPostmaster;
+static NormalStopPostmaster normal_stop_pm;
+
+static void
+NormalStopPostmasterPids(pid_t pids[NORMAL_STOP_AUX_COUNT])
+{
+	pids[0] = LmonPID;
+	pids[1] = LmsPID;
+	for (int worker = 1; worker < 8; worker++)
+		pids[1 + worker] = LmsWorkerPIDs[worker];
+	pids[9] = SinvalBcastPID;
+	pids[10] = LckPID;
+	pids[11] = LmdPID;
+	pids[12] = QvotecPID;
+	pids[13] = CssdPID;
+	for (int worker = 0; worker < 8; worker++)
+		pids[14 + worker] = UndoCleanerPIDs[worker];
+}
+
+static bool NormalStopPostmasterRosterMatches(void);
+
+static bool
+NormalStopPostmasterRetaining(void)
+{
+	return normal_stop_pm.selected && !FatalError && Shutdown > NoShutdown
+		   && Shutdown < ImmediateShutdown;
+}
+
+static bool
+NormalStopPostmasterBegin(void)
+{
+	if (IsUnderPostmaster || !IsPostmasterEnvironment || FatalError || Shutdown <= NoShutdown
+		|| Shutdown >= ImmediateShutdown)
+		return false;
+	if (normal_stop_pm.selected) {
+		(void)NormalStopPostmasterRosterMatches();
+		return true; /* failure does not select a different attempt */
+	}
+	if (!cluster_enabled || cluster_conf_node_count() != 4
+		|| !cluster_semantic_normal_stop_needs_retention())
+		return false;
+	normal_stop_pm.selected = true;
+	normal_stop_pm.lms_workers = cluster_lms_workers;
+	normal_stop_pm.lmd_enabled = cluster_lmd_enabled;
+	NormalStopPostmasterPids(normal_stop_pm.pids);
+	normal_stop_pm.checkpointer = CheckpointerPID;
+	/* Requirements come from the boot configuration, NEVER from which
+	 * child happens to remain alive when shutdown was requested. */
+	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++)
+		if (!(i >= 1 && i <= 8 && i > cluster_lms_workers) && !(i == 11 && !cluster_lmd_enabled))
+			normal_stop_pm.expected |= UINT32_C(1) << i;
+	if (!cluster_normal_stop_postmaster_request())
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+	(void)NormalStopPostmasterRosterMatches();
+	return true;
+}
+static bool
+NormalStopPostmasterRosterMatches(void)
+{
+	pid_t current[NORMAL_STOP_AUX_COUNT];
+	if (!normal_stop_pm.selected || IsUnderPostmaster || !IsPostmasterEnvironment)
+		return false;
+	if (normal_stop_pm.lms_workers < 1 || normal_stop_pm.lms_workers > 8 || !cluster_lms_enabled
+		|| cluster_lms_workers != normal_stop_pm.lms_workers
+		|| cluster_lmd_enabled != normal_stop_pm.lmd_enabled || LmsWorkerPIDs[0] != 0)
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+	NormalStopPostmasterPids(current);
+	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++) {
+		bool expected = (normal_stop_pm.expected & (UINT32_C(1) << i)) != 0;
+		bool reaped = (normal_stop_pm.reaped & (UINT32_C(1) << i)) != 0;
+		if ((expected && normal_stop_pm.pids[i] <= 0) || (!expected && normal_stop_pm.pids[i] != 0)
+			|| current[i] != (reaped ? 0 : normal_stop_pm.pids[i]))
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+		if (expected)
+			for (int j = 0; j < i; j++)
+				if (normal_stop_pm.pids[i] == normal_stop_pm.pids[j])
+					cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+	}
+	if (!normal_stop_pm.checkpoint_exited && normal_stop_pm.checkpointer != 0
+		&& CheckpointerPID != normal_stop_pm.checkpointer)
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+	return cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE;
+}
+static void
+NormalStopPostmasterBindCheckpointer(void)
+{
+	if (!normal_stop_pm.selected)
+		return;
+	if (!NormalStopPostmasterRosterMatches() || CheckpointerPID <= 0
+		|| normal_stop_pm.checkpoint_exited
+		|| (normal_stop_pm.checkpointer != 0 && normal_stop_pm.checkpointer != CheckpointerPID)) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+		return;
+	}
+	if (normal_stop_pm.checkpointer == 0)
+		normal_stop_pm.checkpointer = CheckpointerPID;
+}
+static void
+NormalStopPostmasterReap(pid_t pid, int status)
+{
+	if (!normal_stop_pm.selected || pid <= 0)
+		return;
+	/* Called BEFORE the original reaper clears its PID field. Exit status
+	 * is a producer fact, not something the final all-zero scan invents. */
+	if (pid == normal_stop_pm.checkpointer) {
+		if (normal_stop_pm.checkpoint_exited || !EXIT_STATUS_0(status) || pmState != PM_SHUTDOWN
+			|| !cluster_normal_stop_protocol_closed() || !NormalStopPostmasterRosterMatches())
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+		else
+			normal_stop_pm.checkpoint_exited = true;
+		return;
+	}
+	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++)
+		if (pid == normal_stop_pm.pids[i]) {
+			uint32 bit = UINT32_C(1) << i;
+			if (!normal_stop_pm.exit_released || !EXIT_STATUS_0(status)
+				|| (normal_stop_pm.reaped & bit) != 0)
+				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+			normal_stop_pm.reaped |= bit;
+			return;
+		}
+}
+static bool
+NormalStopPostmasterRelease(void)
+{
+	if (!normal_stop_pm.selected || !normal_stop_pm.checkpoint_exited
+		|| !cluster_normal_stop_protocol_closed() || !NormalStopPostmasterRosterMatches())
+		return false;
+	if (!normal_stop_pm.exit_released) {
+		normal_stop_pm.exit_released = true;
+		for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++)
+			if ((normal_stop_pm.expected & (UINT32_C(1) << i)) != 0)
+				signal_child(normal_stop_pm.pids[i], SIGTERM);
+	}
+	return true;
+}
+static bool
+NormalStopPostmasterComplete(void)
+{
+	return normal_stop_pm.selected && normal_stop_pm.exit_released
+		   && normal_stop_pm.checkpoint_exited && CheckpointerPID == 0
+		   && normal_stop_pm.reaped == normal_stop_pm.expected
+		   && NormalStopPostmasterRosterMatches() && cluster_normal_stop_protocol_closed()
+		   && cluster_normal_stop_qvotec_cleared();
+}
+/* NORMAL_STOP_POSTMASTER_END */
+#endif
+
 
 #ifndef WIN32
 /*
@@ -1253,6 +1419,12 @@ PostmasterMain(int argc, char *argv[])
 	InitPostmasterDeathWatchHandle();
 
 #ifdef USE_PGRAC_CLUSTER
+	/* Cluster phase 1 forks LMON before the native auxiliary start point.
+	 * Publish the same postmaster boot time to early and late children; a
+	 * child-local clock cannot identify this postmaster incarnation. */
+	if (cluster_enabled)
+		PgStartTime = GetCurrentTimestamp();
+
 	/*
 	 * PGRAC: spec-1.10 (2026-05-03) — drive postmaster startup phase
 	 * machinery (Phase 0 -> 1 -> 2 -> 3 -> 4).
@@ -1585,6 +1757,10 @@ PostmasterMain(int argc, char *argv[])
 	/*
 	 * Remember postmaster startup time
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* Early cluster children already inherited this immutable value. */
+	if (!cluster_enabled)
+#endif
 	PgStartTime = GetCurrentTimestamp();
 
 	/*
@@ -1933,7 +2109,11 @@ ServerLoop(void)
 		 */
 		if (pmState == PM_RUN || pmState == PM_RECOVERY || pmState == PM_HOT_STANDBY
 			|| pmState == PM_STARTUP) {
-			if (CheckpointerPID == 0)
+			if (CheckpointerPID == 0
+#ifdef USE_PGRAC_CLUSTER
+				&& !normal_stop_pm.selected
+#endif
+			)
 				CheckpointerPID = StartCheckpointer();
 			if (BgWriterPID == 0)
 				BgWriterPID = StartBackgroundWriter();
@@ -1972,7 +2152,7 @@ ServerLoop(void)
 		 *
 		 * Spec: spec-1.11-lmon-skeleton.md Sprint B + codex round 3 P1.
 		 */
-		if (cluster_enabled && LmonPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && !normal_stop_pm.selected && LmonPID == 0 && pmState == PM_RUN)
 			LmonPID = StartLmon();
 
 		/*
@@ -1981,7 +2161,7 @@ ServerLoop(void)
 		 * restart_after_crash recovery + LCK external-SIGTERM paths
 		 * uniformly.
 		 */
-		if (cluster_enabled && LckPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && !normal_stop_pm.selected && LckPID == 0 && pmState == PM_RUN)
 			LckPID = StartLck();
 
 		/*
@@ -2011,7 +2191,7 @@ ServerLoop(void)
 		 * recycling), so it has no startup gate, no wait-for-ready, and
 		 * no spawn-failure SQLSTATE.
 		 */
-		if (cluster_enabled && pmState == PM_RUN)
+		if (cluster_enabled && !normal_stop_pm.selected && pmState == PM_RUN)
 			for (int i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
 				if (UndoCleanerPIDs[i] == 0)
 					UndoCleanerPIDs[i] = StartUndoCleaner(i);
@@ -2022,7 +2202,7 @@ ServerLoop(void)
 		 * driver third upgrade;respawn here closes restart_after_crash
 		 * recovery + external-SIGTERM paths.
 		 */
-		if (cluster_enabled && CssdPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && !normal_stop_pm.selected && CssdPID == 0 && pmState == PM_RUN)
 			CssdPID = StartCssd();
 
 		/*
@@ -2067,7 +2247,7 @@ ServerLoop(void)
 		 * + CR/undo park-serve);  grant ownership stays with LMON (HC4)
 		 * on every node.
 		 */
-		if (cluster_enabled && cluster_lms_enabled && LmsPID == 0
+		if (cluster_enabled && !normal_stop_pm.selected && cluster_lms_enabled && LmsPID == 0
 			&& (!cluster_registry_holds_admission()
 				|| cluster_current_phase() == CLUSTER_PHASE_RUNNING)
 			&& (pmState == PM_RUN || pmState == PM_HOT_STANDBY))
@@ -2080,7 +2260,7 @@ ServerLoop(void)
 		 * respawn above.  cluster.lms_workers = 1 forks no workers (spec-7.2
 		 * topology identity).
 		 */
-		if (cluster_enabled && cluster_lms_enabled
+		if (cluster_enabled && !normal_stop_pm.selected && cluster_lms_enabled
 			&& (!cluster_registry_holds_admission()
 				|| cluster_current_phase() == CLUSTER_PHASE_RUNNING)
 			&& (pmState == PM_RUN || pmState == PM_HOT_STANDBY)) {
@@ -2100,7 +2280,8 @@ ServerLoop(void)
 		 * 4-node deadlock-detection legacy path remains active as the
 		 *唯一 fallback (HC1 / §1.4.6 (a)).
 		 */
-		if (cluster_enabled && cluster_lmd_enabled && LmdPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && !normal_stop_pm.selected && cluster_lmd_enabled && LmdPID == 0
+			&& pmState == PM_RUN)
 			LmdPID = StartLmd();
 
 		/*
@@ -2124,7 +2305,8 @@ ServerLoop(void)
 		 * LMON owns outbound fanout because tier1 TCP fds are LMON
 		 * process-local; SinvalBcast owns inbound apply + reset.
 		 */
-		if (cluster_enabled && cluster_node_id >= 0 && SinvalBcastPID == 0 && pmState == PM_RUN)
+		if (cluster_enabled && !normal_stop_pm.selected && cluster_node_id >= 0
+			&& SinvalBcastPID == 0 && pmState == PM_RUN)
 			SinvalBcastPID = StartSinvalBcast();
 
 		/*
@@ -3136,6 +3318,9 @@ process_pm_shutdown_request(void)
 		if (Shutdown >= SmartShutdown)
 			break;
 		Shutdown = SmartShutdown;
+#ifdef USE_PGRAC_CLUSTER
+		(void)NormalStopPostmasterBegin();
+#endif
 		ereport(LOG, (errmsg("received smart shutdown request")));
 
 		/* Report status */
@@ -3175,6 +3360,9 @@ process_pm_shutdown_request(void)
 		if (Shutdown >= FastShutdown)
 			break;
 		Shutdown = FastShutdown;
+#ifdef USE_PGRAC_CLUSTER
+		(void)NormalStopPostmasterBegin();
+#endif
 		ereport(LOG, (errmsg("received fast shutdown request")));
 
 		/* Report status */
@@ -3262,6 +3450,10 @@ process_pm_child_exit(void)
 	ereport(DEBUG4, (errmsg_internal("reaping dead processes")));
 
 	while ((pid = waitpid(-1, &exitstatus, WNOHANG)) > 0) {
+#ifdef USE_PGRAC_CLUSTER
+		/* Preserve the exact producer exit before its original PID is cleared. */
+		NormalStopPostmasterReap(pid, exitstatus);
+#endif
 		/*
 		 * Check if this child was a startup process.
 		 */
@@ -3421,7 +3613,11 @@ process_pm_child_exit(void)
 		 */
 		if (pid == CheckpointerPID) {
 			CheckpointerPID = 0;
-			if (EXIT_STATUS_0(exitstatus) && pmState == PM_SHUTDOWN) {
+			if (EXIT_STATUS_0(exitstatus) && pmState == PM_SHUTDOWN
+#ifdef USE_PGRAC_CLUSTER
+				&& (!normal_stop_pm.selected || normal_stop_pm.checkpoint_exited)
+#endif
+			) {
 				/*
 				 * OK, we saw normal exit of the checkpointer after it's been
 				 * told to shut down.  We expect that it wrote a shutdown
@@ -3439,26 +3635,33 @@ process_pm_child_exit(void)
 				Assert(Shutdown > NoShutdown);
 
 #ifdef USE_PGRAC_CLUSTER
-				/*
+				if (normal_stop_pm.selected) {
+					if (!NormalStopPostmasterRelease()) {
+						HandleChildCrash(pid, exitstatus, _("checkpointer process"));
+						continue;
+					}
+				} else {
+					/*
 				 * RF A1 W3 completed before this successful checkpointer exit.
 				 * Now retire the retained coordination stack in reverse spawn
 				 * order.  PM_SHUTDOWN_2 waits for every retained PID below.
 				 */
-				{
-					int w;
+					{
+						int w;
 
-					for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
-						if (LmsWorkerPIDs[w] != 0)
-							signal_child(LmsWorkerPIDs[w], SIGTERM);
+						for (w = 1; w < CLUSTER_LMS_MAX_WORKERS; w++)
+							if (LmsWorkerPIDs[w] != 0)
+								signal_child(LmsWorkerPIDs[w], SIGTERM);
+					}
+					if (LmsPID != 0)
+						signal_child(LmsPID, SIGTERM);
+					if (QvotecPID != 0)
+						signal_child(QvotecPID, SIGTERM);
+					if (CssdPID != 0)
+						signal_child(CssdPID, SIGTERM);
+					if (LmonPID != 0)
+						signal_child(LmonPID, SIGTERM);
 				}
-				if (LmsPID != 0)
-					signal_child(LmsPID, SIGTERM);
-				if (QvotecPID != 0)
-					signal_child(QvotecPID, SIGTERM);
-				if (CssdPID != 0)
-					signal_child(CssdPID, SIGTERM);
-				if (LmonPID != 0)
-					signal_child(LmonPID, SIGTERM);
 #endif
 
 				/* Waken archiver for the last time */
@@ -4272,12 +4475,12 @@ PostmasterStateMachine(void)
 			signal_child(WalWriterPID, SIGTERM);
 #ifdef USE_PGRAC_CLUSTER
 		{
+			bool retain_normal_stop = NormalStopPostmasterBegin();
 			bool retain_rf_a1_coordination = cluster_registry_holds_admission();
-			bool retain_phase1_coordination
-				= !retain_rf_a1_coordination
-				  && cluster_clean_leave_phase1_full_stop_candidate();
+			bool retain_phase1_coordination = !retain_normal_stop && !retain_rf_a1_coordination
+											  && cluster_clean_leave_phase1_full_stop_candidate();
 			bool retain_shutdown_coordination
-				= retain_rf_a1_coordination || retain_phase1_coordination;
+				= retain_normal_stop || retain_rf_a1_coordination || retain_phase1_coordination;
 
 			/*
 			 * A formed RF A1 registry stops Stats first so W4 cannot race
@@ -4293,7 +4496,7 @@ PostmasterStateMachine(void)
 				signal_child(ClusterStatsPID, SIGTERM);
 
 			/* spec-2.38 LIFO: SinvalBcast first (last-spawned). */
-			if (SinvalBcastPID != 0)
+			if (!retain_normal_stop && SinvalBcastPID != 0)
 				signal_child(SinvalBcastPID, SIGTERM);
 			/* spec-6.4 LIFO: RFS stops before MRP. */
 			if (RfsPID != 0)
@@ -4302,7 +4505,7 @@ PostmasterStateMachine(void)
 			if (MrpPID != 0)
 				signal_child(MrpPID, SIGTERM);
 			/* spec-2.19 Q10 LIFO: LMD next. */
-			if (LmdPID != 0)
+			if (!retain_normal_stop && LmdPID != 0)
 				signal_child(LmdPID, SIGTERM);
 
 			if (!retain_shutdown_coordination) {
@@ -4323,13 +4526,13 @@ PostmasterStateMachine(void)
 
 			/* PGRAC: spec-3.13 — same shutdown SIGTERM for Undo Cleaner. */
 			for (int i = 0; i < CLUSTER_UNDO_CLEANER_WORKER_TYPES; i++)
-				if (UndoCleanerPIDs[i] != 0)
+				if (!retain_normal_stop && UndoCleanerPIDs[i] != 0)
 					signal_child(UndoCleanerPIDs[i], SIGTERM);
 			/* spec-1.13 Q10 LIFO: DIAG next. */
 			if (DiagPID != 0)
 				signal_child(DiagPID, SIGTERM);
 			/* spec-1.12 Q10 LIFO: LCK next. */
-			if (LckPID != 0)
+			if (!retain_normal_stop && LckPID != 0)
 				signal_child(LckPID, SIGTERM);
 			if (!retain_shutdown_coordination && LmonPID != 0)
 				signal_child(LmonPID, SIGTERM);
@@ -4346,7 +4549,7 @@ PostmasterStateMachine(void)
 			 * the same flag once its own shutdown runs).  No-op when the LMON
 			 * child is absent.
 			 */
-			if (retain_shutdown_coordination && LmonPID != 0)
+			if (!retain_normal_stop && retain_shutdown_coordination && LmonPID != 0)
 				cluster_lmon_suppress_reconfig();
 		}
 #endif
@@ -4366,6 +4569,9 @@ PostmasterStateMachine(void)
 	 * exit, see if they're all gone, and change state if so.
 	 */
 	if (pmState == PM_WAIT_BACKENDS) {
+#ifdef USE_PGRAC_CLUSTER
+		bool retain_normal_stop = NormalStopPostmasterRetaining();
+#endif
 		/*
 		 * PM_WAIT_BACKENDS state ends when we have no regular backends
 		 * (including autovac workers), no bgworkers (including unconnected
@@ -4396,28 +4602,29 @@ PostmasterStateMachine(void)
 			 * stack until the checkpointer exits.  Abnormal/immediate paths
 			 * retain the original all-reaped requirement.
 			 */
-			((cluster_lmon_reconfig_suppressed() && !FatalError && Shutdown > NoShutdown
-			  && Shutdown < ImmediateShutdown)
+			(retain_normal_stop
+			 || (!normal_stop_pm.selected && !FatalError && Shutdown > NoShutdown
+				 && Shutdown < ImmediateShutdown && cluster_lmon_reconfig_suppressed())
 			 || (LmonPID == 0 && CssdPID == 0 && QvotecPID == 0 && LmsPID == 0
 				 && LmsWorkersAllReaped()))
 			&&
 			/* PGRAC: spec-1.12 Sprint A — same wait for LCK (codex
 			 * round 3 P2.3 preempted in 1.12). */
-			LckPID == 0 &&
+			(retain_normal_stop || LckPID == 0) &&
 			/* PGRAC: spec-1.13 Sprint A — same wait for DIAG. */
 			DiagPID == 0 &&
 			/* PGRAC: spec-1.14 Sprint A — same wait for Cluster Stats. */
 			ClusterStatsPID == 0 &&
 			/* PGRAC: spec-3.13 — same wait for Undo Cleaner. */
-			cluster_undo_cleaner_all_reaped(UndoCleanerPIDs) &&
+			(retain_normal_stop || cluster_undo_cleaner_all_reaped(UndoCleanerPIDs)) &&
 			/* PGRAC: spec-2.19 Sprint A — same wait for LMD. */
-			LmdPID == 0 &&
+			(retain_normal_stop || LmdPID == 0) &&
 			/* PGRAC: spec-6.4 D1 — same wait for MRP. */
 			MrpPID == 0 &&
 			/* PGRAC: spec-6.4 D3 — same wait for RFS coordinator. */
 			RfsPID == 0 &&
 			/* PGRAC: spec-2.38 Sprint A — same wait for SI Broadcaster. */
-			SinvalBcastPID == 0 &&
+			(retain_normal_stop || SinvalBcastPID == 0) &&
 #endif
 			AutoVacPID == 0) {
 			if (Shutdown >= ImmediateShutdown || FatalError) {
@@ -4439,11 +4646,32 @@ PostmasterStateMachine(void)
 				 * checkpointer to do a shutdown checkpoint.
 				 */
 				Assert(Shutdown > NoShutdown);
+#ifdef USE_PGRAC_CLUSTER
+				if (retain_normal_stop) {
+					/* A missing/failed publication must not let the child
+					 * choose its unrelated legacy NOT_APPLICABLE branch. */
+					if (!cluster_normal_stop_requested()) {
+						cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+						FatalError = true;
+						SetQuitSignalReason(PMQUIT_FOR_CRASH);
+						TerminateChildren(SIGQUIT);
+						if (AbortStartTime == 0)
+							AbortStartTime = time(NULL);
+						return;
+					}
+					(void)NormalStopPostmasterRosterMatches();
+					if (!cluster_normal_stop_postmaster_frontends_gone())
+						cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+				}
+#endif
 				/* Start the checkpointer if not running */
 				if (CheckpointerPID == 0)
 					CheckpointerPID = StartCheckpointer();
 				/* And tell it to shut down */
 				if (CheckpointerPID != 0) {
+#ifdef USE_PGRAC_CLUSTER
+					NormalStopPostmasterBindCheckpointer();
+#endif
 					signal_child(CheckpointerPID, SIGUSR2);
 					pmState = PM_SHUTDOWN;
 				} else {
@@ -4478,9 +4706,16 @@ PostmasterStateMachine(void)
 		if (PgArchPID == 0 && CountChildren(BACKEND_TYPE_ALL) == 0
 #ifdef USE_PGRAC_CLUSTER
 			&& LmonPID == 0 && CssdPID == 0 && QvotecPID == 0 && LmsPID == 0
-			&& LmsWorkersAllReaped()
+			&& LmsWorkersAllReaped() && LckPID == 0 && LmdPID == 0 && SinvalBcastPID == 0
+			&& cluster_undo_cleaner_all_reaped(UndoCleanerPIDs)
 #endif
 		) {
+#ifdef USE_PGRAC_CLUSTER
+			if (NormalStopPostmasterRetaining() && !NormalStopPostmasterComplete()) {
+				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_CHILD_EXIT);
+				FatalError = true;
+			}
+#endif
 			pmState = PM_WAIT_DEAD_END;
 		}
 	}
@@ -4527,7 +4762,11 @@ PostmasterStateMachine(void)
 	 * processes.
 	 */
 	if (Shutdown > NoShutdown && pmState == PM_NO_CHILDREN) {
-		if (FatalError) {
+		if (FatalError
+#ifdef USE_PGRAC_CLUSTER
+			|| (NormalStopPostmasterRetaining() && !NormalStopPostmasterComplete())
+#endif
+		) {
 			ereport(LOG, (errmsg("abnormal database system shutdown")));
 			ExitPostmaster(1);
 		} else {
@@ -4738,6 +4977,10 @@ SignalSomeChildren(int signal, int target)
 static void
 TerminateChildren(int signal)
 {
+#ifdef USE_PGRAC_CLUSTER
+	if (signal == SIGTERM)
+		(void)NormalStopPostmasterBegin();
+#endif
 	SignalChildren(signal);
 	if (StartupPID != 0) {
 		signal_child(StartupPID, signal);
@@ -4767,8 +5010,7 @@ TerminateChildren(int signal)
 	 * PM_SHUTDOWN_2 path).  Immediate shutdown (SIGQUIT/SIGKILL) still
 	 * kills everything at once, so the crash path is unchanged.
 	 */
-	if (signal != SIGTERM || Shutdown != FastShutdown)
-	{
+	if (signal != SIGTERM || (!NormalStopPostmasterRetaining() && Shutdown != FastShutdown)) {
 		if (LmonPID != 0)
 			signal_child(LmonPID, signal);
 		if (LckPID != 0)

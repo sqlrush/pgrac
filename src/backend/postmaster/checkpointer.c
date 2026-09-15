@@ -600,6 +600,8 @@ HandleCheckpointerInterrupts(void)
 #ifdef USE_PGRAC_CLUSTER
 		bool		clean_handoff_ok;
 		bool		wal_stopped_ok;
+		bool current_normal_stop = cluster_normal_stop_requested();
+		ClusterNormalStopModuleObservation normal_stop_observation;
 		ClusterPhase1FullStopPrepareResult phase1_full_stop_prepare_result;
 		ClusterPhase1FullStopPlan phase1_full_stop_plan;
 #endif
@@ -620,14 +622,32 @@ HandleCheckpointerInterrupts(void)
 		PendingCheckpointerStats.requested_checkpoints++;
 #ifdef USE_PGRAC_CLUSTER
 		memset(&phase1_full_stop_plan, 0, sizeof(phase1_full_stop_plan));
-		phase1_full_stop_prepare_result
-			= cluster_clean_leave_phase1_full_stop_prepare_exact(
-				&phase1_full_stop_plan);
-		if (phase1_full_stop_prepare_result ==
-			CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED)
-			ereport(PANIC,
-					(errmsg("cluster clean-leave: phase-1 full-stop prepare "
-							"failed before the shutdown checkpoint")));
+		memset(&normal_stop_observation, 0, sizeof(normal_stop_observation));
+		phase1_full_stop_prepare_result = CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE;
+		if (current_normal_stop) {
+			/* This attempt was selected by the postmaster, not by a failed
+			 * pristine probe. Keep every original owner alive until its
+			 * responsibility and producer cut permit the real checkpoint. */
+			if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE
+				|| !cluster_normal_stop_checkpoint_prepare(&phase1_full_stop_plan,
+														   &normal_stop_observation)
+				|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
+				ereport(PANIC,
+						(errmsg("cluster normal-stop: pre-checkpoint barrier failed"),
+						 errdetail("failure=%u module=%s reason=%s object=%s",
+								   (unsigned)cluster_normal_stop_failure(),
+								   normal_stop_observation.module ? normal_stop_observation.module
+																  : "COORDINATOR",
+								   normal_stop_observation.reason ? normal_stop_observation.reason
+																  : "STICKY_FAILURE",
+								   normal_stop_observation.object)));
+		} else {
+			phase1_full_stop_prepare_result
+				= cluster_clean_leave_phase1_full_stop_prepare_exact(&phase1_full_stop_plan);
+			if (phase1_full_stop_prepare_result == CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED)
+				ereport(PANIC, (errmsg("cluster clean-leave: phase-1 full-stop prepare "
+									   "failed before the shutdown checkpoint")));
+		}
 #endif
 		ShutdownXLOG(0, 0);
 #ifdef USE_PGRAC_CLUSTER
@@ -649,7 +669,11 @@ HandleCheckpointerInterrupts(void)
 		 * reaches STOPPED.  Checkpoint + STOPPED first keeps every
 		 * fence-gated write inside the still-valid pre-handoff authority.
 		 */
-		wal_stopped_ok = cluster_wal_state_publish_stopped();
+		if (current_normal_stop && cluster_normal_stop_native_wal_mode()) {
+			int64 native_started_at;
+			wal_stopped_ok = cluster_native_wal_shutdown_observe(true, &native_started_at);
+		} else
+			wal_stopped_ok = cluster_wal_state_publish_stopped();
 
 		/*
 		 * RF-ROOT P6 contract 1 (serving rebind / authority transition):
@@ -665,8 +689,26 @@ HandleCheckpointerInterrupts(void)
 		 * is then skipped so the survivors treat this departure as an
 		 * ordinary death (no fake clean-leave).
 		 */
-		if (phase1_full_stop_prepare_result ==
-			CLUSTER_PHASE1_FULL_STOP_READY) {
+		if (current_normal_stop) {
+			if (!wal_stopped_ok)
+				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+			if (!wal_stopped_ok
+				|| !cluster_normal_stop_checkpoint_complete(&phase1_full_stop_plan,
+															&normal_stop_observation)
+				|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
+				ereport(PANIC,
+						(errmsg("cluster normal-stop: post-checkpoint closure failed"),
+						 errdetail("failure=%u module=%s reason=%s object=%s",
+								   (unsigned)cluster_normal_stop_failure(),
+								   normal_stop_observation.module ? normal_stop_observation.module
+																  : "COORDINATOR",
+								   normal_stop_observation.reason ? normal_stop_observation.reason
+																  : "WAL_STOPPED_FAILED",
+								   normal_stop_observation.object)));
+			ereport(LOG,
+					(errmsg("cluster normal-stop: protocol closed after shutdown checkpoint and "
+							"WAL STOPPED; auxiliary exit and voting clear still pending")));
+		} else if (phase1_full_stop_prepare_result == CLUSTER_PHASE1_FULL_STOP_READY) {
 			if (!wal_stopped_ok)
 				ereport(PANIC,
 						(errmsg("cluster clean-leave: phase-1 full-stop exact "

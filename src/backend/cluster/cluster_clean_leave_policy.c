@@ -433,14 +433,12 @@ cluster_clean_leave_announce_payload_valid(const ClusterLeaveAnnouncePayload *p)
 	if (p->preflight > CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT)
 		return false;
 	if (p->preflight >= CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE
-		&& (p->producer_kind != CLUSTER_LEAVE_PRODUCER_SHUTDOWN
-			|| p->_pad0 != 0
-			|| p->_pad1[0] != 0
+		&& (p->producer_kind != CLUSTER_LEAVE_PRODUCER_SHUTDOWN || p->_pad0 != 0 || p->_pad1[0] != 0
 			|| p->_pad1[1] != 0
 			|| p->leaving_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-			|| p->leave_epoch != 0
-			|| p->cssd_dead_generation != 0
-			|| p->leave_nonce == 0
+			/* Existing epoch bytes carry either pristine0 or the bound OPEN
+			 * epoch. Only the corresponding runtime consumer grants meaning. */
+			|| p->leave_epoch == UINT64_MAX || p->cssd_dead_generation != 0 || p->leave_nonce == 0
 			|| p->leave_nonce == UINT64_MAX))
 		return false;
 	return true;
@@ -481,16 +479,12 @@ cluster_clean_leave_ack_payload_valid(const ClusterLeaveAckPayload *p)
 		&& p->phase1_round != CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE)
 		return false;
 	if (p->phase1_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE
-		&& (p->_pad0 != 0
-			|| p->_pad1 != 0
+		&& (p->_pad0 != 0 || p->_pad1 != 0
 			|| p->survivor_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
 			|| p->leaving_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-			|| p->survivor_node_id == p->leaving_node_id
-			|| p->nak != 0
-			|| p->nak_reason != CLUSTER_LEAVE_NAK_NONE
-			|| p->leave_epoch != 0
-			|| p->leave_nonce == 0
-			|| p->leave_nonce == UINT64_MAX))
+			|| p->survivor_node_id == p->leaving_node_id || p->nak != 0
+			|| p->nak_reason != CLUSTER_LEAVE_NAK_NONE || p->leave_epoch == UINT64_MAX
+			|| p->leave_nonce == 0 || p->leave_nonce == UINT64_MAX))
 		return false;
 	return true;
 }

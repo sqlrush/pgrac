@@ -351,3 +351,15 @@ cluster_replacement_phase3_handoff_pending_local(void)
 	return cluster_replacement_phase3_handoff_pending(
 		&replacement_phase3_local_handoff);
 }
+
+uint64
+cluster_replacement_phase3_handoff_observed_count(const ClusterReplacementPhase3Handoff *handoff)
+{
+	return handoff == NULL ? UINT64_MAX : handoff->producer_seq - handoff->consumer_seq;
+}
+
+uint64
+cluster_replacement_phase3_handoff_observed_count_local(void)
+{
+	return cluster_replacement_phase3_handoff_observed_count(&replacement_phase3_local_handoff);
+}

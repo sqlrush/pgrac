@@ -234,6 +234,10 @@ extern void LocalProcessControlFile(bool reset);
 extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
 extern void ShutdownXLOG(int code, Datum arg);
+#ifdef USE_PGRAC_CLUSTER
+/* Read own native control state; never publish a clean state or grant recovery. */
+extern bool cluster_native_wal_shutdown_observe(bool stopped, int64 *started_at);
+#endif
 extern void CreateCheckPoint(int flags);
 extern bool CreateRestartPoint(int flags);
 extern WALAvailability GetWALAvailability(XLogRecPtr targetLSN);
