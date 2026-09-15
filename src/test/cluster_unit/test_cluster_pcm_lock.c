@@ -19314,6 +19314,127 @@ UT_TEST(test_pcm_normal_stop_cached_s_is_not_a_live_reference)
 	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
 }
 
+static void
+normal_stop_after_local_s_transition(PcmLockTransition transition)
+{
+	BufferTag tag = make_tag(6460);
+	struct StopPcmEntryLayout *entry;
+	const char *reason;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	/* Use the real local acquisition producer, not a forged refcount. */
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	UT_ASSERT_EQ(entry->s_holder_refcount_local, 2);
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, transition, 0),
+				 PCM_GCS_TRANSITION_APPLIED);
+	/* Exact conversion/revocation ends all declarations of that S cover;
+	 * it is not a single backend's content unlock or nested release. */
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(entry->s_holder_refcount_local, 0);
+	UT_ASSERT_EQ(stop_pcm_poll(true, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_pcm_normal_stop_local_s_upgrade_ends_declarations)
+{
+	normal_stop_after_local_s_transition(PCM_TRANS_S_TO_X_UPGRADE);
+}
+
+UT_TEST(test_pcm_normal_stop_local_s_invalidate_ends_declarations)
+{
+	normal_stop_after_local_s_transition(PCM_TRANS_S_TO_N_INVALIDATE);
+}
+
+UT_TEST(test_pcm_normal_stop_local_s_terminal_release_ends_declarations)
+{
+	normal_stop_after_local_s_transition(PCM_TRANS_S_TO_N_RELEASE);
+}
+
+UT_TEST(test_pcm_normal_stop_remote_s_release_preserves_local_declarations)
+{
+	BufferTag tag = make_tag(6461);
+	struct StopPcmEntryLayout *entry;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_N_TO_S, 1),
+				 PCM_GCS_TRANSITION_APPLIED);
+	/* A refused conversion is not a lifecycle edge and must not clear
+	 * local declarations while the other S holder still blocks X. */
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_S_TO_X_UPGRADE, 0),
+				 PCM_GCS_TRANSITION_INCOMPATIBLE);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	UT_ASSERT_EQ(entry->s_holder_refcount_local, 2);
+	UT_ASSERT_EQ(cluster_pcm_lock_apply_gcs_transition_result(tag, PCM_TRANS_S_TO_N_INVALIDATE, 1),
+				 PCM_GCS_TRANSITION_APPLIED);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	UT_ASSERT_EQ(entry->s_holder_refcount_local, 2);
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ(entry->s_holder_refcount_local, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_query_s_holders_bitmap(tag), UINT32_C(1));
+	cluster_pcm_lock_release(tag);
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, NULL), CLUSTER_NORMAL_STOP_READY);
+}
+
+UT_TEST(test_pcm_normal_stop_resource_x_local_s_grant_ends_declarations)
+{
+	BufferTag tag = make_tag(6462);
+	PcmAuthoritySnapshot authority;
+	ResourceXDecodedFrame assertion;
+	ResourceXDecodedFrame local_proof;
+	ResourceXMasterSnapshot snapshot;
+	struct StopPcmEntryLayout *entry;
+	const char *reason;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 0;
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	cluster_pcm_lock_acquire(tag, PCM_LOCK_MODE_S);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &authority));
+	UT_ASSERT_EQ(authority.transition_count, UINT64_C(1));
+	assertion = make_resource_x_master_frame(RESOURCE_X_WIRE_ASSERT_X, tag, 0, 0);
+	UT_ASSERT_EQ(
+		cluster_pcm_lock_resource_x_adapter_base_bind_exact(&assertion.common.logical_assertion, 17,
+															authority.transition_count, &authority),
+		RESOURCE_X_APPLY_DUPLICATE);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_assert_exact(&assertion, 0, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_WAIT_PROOF);
+	local_proof = make_resource_x_master_frame(RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION, tag, 0, 0);
+	local_proof.common.observed_mode = PCM_STATE_S;
+	local_proof.common.outcome = RESOURCE_X_OUTCOME_OK;
+	local_proof.body.local_proof.local_holder_authority_generation = 71;
+	local_proof.body.local_proof.requester_target_generation = 41;
+	local_proof.body.local_proof.page_scn_lsn = 82;
+	local_proof.body.local_proof.page_checksum = UINT32_C(0x55667788);
+	local_proof.body.local_proof.local_image_proof_crc32c = UINT32_C(0x99aabbcc);
+	local_proof.body.local_proof.requester_connection_generation = 73;
+	local_proof.body.local_proof.local_proof_generation = 74;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_local_proof_exact(&local_proof, 0, &snapshot),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(snapshot.phase, RESOURCE_X_MASTER_GRANT_COMMITTED);
+	UT_ASSERT(cluster_pcm_lock_authority_snapshot(tag, &authority));
+	UT_ASSERT_EQ(authority.state, PCM_STATE_X);
+	UT_ASSERT_EQ(authority.x_holder_node, 0);
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	UT_ASSERT_EQ(entry->s_holder_refcount_local, 0);
+	/* A live grant remains pending; fixing its S bookkeeping must not
+	 * manufacture a completed shutdown or discard its asynchronous intent. */
+	UT_ASSERT_EQ(stop_pcm_poll(false, NULL, NULL, &reason), CLUSTER_NORMAL_STOP_PENDING);
+}
+
 UT_TEST(test_pcm_normal_stop_directory_orphan_and_original_tombstone)
 {
 	BufferTag tag = make_tag(6441), pending = make_tag(6442), observed;
@@ -19613,7 +19734,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(274);
+	UT_PLAN(279);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -19879,6 +20000,11 @@ main(void)
 	UT_RUN(test_clean_page_xfer_arm_is_one_shot);
 	UT_RUN(test_pcm_normal_stop_original_references_and_pending_barrier);
 	UT_RUN(test_pcm_normal_stop_cached_s_is_not_a_live_reference);
+	UT_RUN(test_pcm_normal_stop_local_s_upgrade_ends_declarations);
+	UT_RUN(test_pcm_normal_stop_local_s_invalidate_ends_declarations);
+	UT_RUN(test_pcm_normal_stop_local_s_terminal_release_ends_declarations);
+	UT_RUN(test_pcm_normal_stop_remote_s_release_preserves_local_declarations);
+	UT_RUN(test_pcm_normal_stop_resource_x_local_s_grant_ends_declarations);
 	UT_RUN(test_pcm_normal_stop_directory_orphan_and_original_tombstone);
 	UT_RUN(test_pcm_normal_stop_is_read_only_and_refuses_preheld_lock);
 	UT_RUN(test_pcm_normal_stop_pi_has_two_cuts);

@@ -7450,16 +7450,23 @@ pcm_transition_apply_internal(struct GrdEntry *entry,
 								"(spec-2.36+);  do not invoke this transition.")));
 		break;
 	}
+	/* A completed node-level S conversion/revocation ends all declarations
+	 * of that local S cover.  Keep this paired with the directory transition,
+	 * including Resource-X consumers that bypass local-acquire wrappers.
+	 * A remote holder's transition must preserve our own cached declarations;
+	 * ordinary nested local release still decrements before its final edge. */
 	if (holder_node_id == cluster_node_id
-		&& (trans == PCM_TRANS_X_TO_S_DOWNGRADE
-			|| trans == PCM_TRANS_X_TO_N_DOWNGRADE
+		&& (trans == PCM_TRANS_S_TO_X_UPGRADE || trans == PCM_TRANS_S_TO_N_INVALIDATE
+			|| trans == PCM_TRANS_S_TO_N_RELEASE))
+		entry->s_holder_refcount_local = 0;
+
+	if (holder_node_id == cluster_node_id
+		&& (trans == PCM_TRANS_X_TO_S_DOWNGRADE || trans == PCM_TRANS_X_TO_N_DOWNGRADE
 			|| trans == PCM_TRANS_X_TO_N_RELEASE)
-		&& entry->resource_x_bootstrap_round.phase
-			!= RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
-		&& !(preserve_resource_x_terminal_cover
-			&& trans == PCM_TRANS_X_TO_N_RELEASE
-			&& entry->resource_x_bootstrap_round.phase
-				== RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)) {
+		&& entry->resource_x_bootstrap_round.phase != RESOURCE_X_BOOTSTRAP_ROUND_EMPTY
+		&& !(preserve_resource_x_terminal_cover && trans == PCM_TRANS_X_TO_N_RELEASE
+			 && entry->resource_x_bootstrap_round.phase
+					== RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED)) {
 		pcm_resource_x_bootstrap_round_clear_binding_locked(
 			&entry->resource_x_bootstrap_round);
 		ConditionVariableBroadcast(&entry->wait_cv);
