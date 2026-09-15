@@ -392,8 +392,8 @@ reset_region(void)
 UT_TEST(test_actual_region_size_matches_frozen_tail)
 {
 	UT_ASSERT_EQ(sizeof(ClusterLeaveState), 472);
-	UT_ASSERT_EQ(sizeof(ClusterNormalStopState), 736);
-	UT_ASSERT_EQ(sizeof(ClusterCleanLeaveSharedState), 1208);
+	UT_ASSERT_EQ(sizeof(ClusterNormalStopState), 744);
+	UT_ASSERT_EQ(sizeof(ClusterCleanLeaveSharedState), 1216);
 	UT_ASSERT_EQ(offsetof(ClusterNormalStopState, open_record), 80);
 	UT_ASSERT_EQ(offsetof(ClusterNormalStopState, root_descriptor), 160);
 	UT_ASSERT_EQ(offsetof(ClusterNormalStopState, service_seal), 728);
@@ -3072,7 +3072,7 @@ UT_TEST(test_post_checkpoint_arm_never_substitutes_active_wal_or_changed_plan)
 		if (fault == 3)
 			plan.attempt_nonce++;
 		if (fault == 4)
-			fixture_now = plan.absolute_deadline_us;
+			plan.absolute_deadline_us++;
 		UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, &observation),
 					 CLUSTER_NORMAL_STOP_INVALID);
 		UT_ASSERT(cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE);
@@ -3569,6 +3569,44 @@ UT_TEST(test_actual_complete_wait_drives_original_post_stop_and_release)
 	UT_ASSERT(cluster_normal_stop_protocol_closed());
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->qvotec_clear_result), 0);
 }
+UT_TEST(test_completed_checkpoint_gets_once_only_post_budget)
+{
+	ClusterPhase1FullStopPlan plan;
+	uint64 post_start;
+	seed_at_checkpoint(&plan);
+	fixture_now = plan.absolute_deadline_us + 1;
+	post_start = fixture_now;
+	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	start_checkpoint_wait(checkpoint_post_wait);
+	UT_ASSERT(cluster_normal_stop_checkpoint_complete(&plan, NULL));
+	checkpoint_wait_action = NULL;
+	UT_ASSERT_EQ(plan.absolute_deadline_us,
+				 post_start + (uint64)cluster_clean_leave_drain_timeout_ms * 1000);
+	UT_ASSERT(cluster_normal_stop_protocol_closed());
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->qvotec_clear_result), 0);
+}
+UT_TEST(test_post_budget_starts_before_pending_owners_and_never_renews)
+{
+	ClusterPhase1FullStopPlan plan;
+	uint64 post_start, deadline;
+	seed_at_checkpoint(&plan);
+	fixture_now = plan.absolute_deadline_us + 1;
+	post_start = fixture_now;
+	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	module_results[9] = CLUSTER_NORMAL_STOP_PENDING;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	deadline = post_start + (uint64)cluster_clean_leave_drain_timeout_ms * 1000;
+	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+	fixture_now += 500;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+	fixture_now = deadline;
+	module_results[9] = CLUSTER_NORMAL_STOP_READY;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
+	UT_ASSERT_EQ(plan.absolute_deadline_us, deadline);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+}
 UT_TEST(test_actual_wait_deadline_is_fixed_not_new_budget)
 {
 	ClusterPhase1FullStopPlan plan;
@@ -3962,7 +4000,7 @@ UT_TEST(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_rec
 int
 main(void)
 {
-	UT_PLAN(94);
+	UT_PLAN(96);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
@@ -4043,6 +4081,8 @@ main(void)
 	UT_RUN(test_release_pending_identity_frame_cannot_be_overwritten);
 	UT_RUN(test_actual_prepare_wait_drives_original_quiesce_and_ack);
 	UT_RUN(test_actual_complete_wait_drives_original_post_stop_and_release);
+	UT_RUN(test_completed_checkpoint_gets_once_only_post_budget);
+	UT_RUN(test_post_budget_starts_before_pending_owners_and_never_renews);
 	UT_RUN(test_actual_wait_deadline_is_fixed_not_new_budget);
 	UT_RUN(test_actual_wait_invalid_owner_does_not_wait_or_requalify);
 	UT_RUN(test_actual_wait_wrong_actor_cannot_touch_close_state);

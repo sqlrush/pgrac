@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual checkpointer shutdown handler; native disk, signals and protocol
  * completion are boundary fixtures, not a full-cluster shutdown witness. */
 #include "postgres.h"

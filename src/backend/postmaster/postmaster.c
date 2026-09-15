@@ -760,6 +760,36 @@ NormalStopPostmasterPids(pid_t pids[NORMAL_STOP_AUX_COUNT])
 
 static bool NormalStopPostmasterRosterMatches(void);
 
+/* Before accepting a normal request, a transiently absent actor is a
+ * rejected attempt, not an immutable (and already poisoned) roster. The
+ * original server loop may finish starting actors before a later request.
+ * This function publishes nothing and never shrinks configuration. */
+static bool
+NormalStopPostmasterPreselectReady(void)
+{
+	pid_t pids[NORMAL_STOP_AUX_COUNT];
+
+	if (normal_stop_pm.selected || IsUnderPostmaster || !IsPostmasterEnvironment || FatalError
+		|| !cluster_enabled || cluster_conf_node_count() != 4
+		|| !cluster_semantic_normal_stop_needs_retention())
+		return true;
+	if (cluster_lms_workers < 1 || cluster_lms_workers > 8 || !cluster_lms_enabled
+		|| LmsWorkerPIDs[0] != 0)
+		return false;
+	NormalStopPostmasterPids(pids);
+	for (int i = 0; i < NORMAL_STOP_AUX_COUNT; i++) {
+		bool expected
+			= !(i >= 1 && i <= 8 && i > cluster_lms_workers) && !(i == 11 && !cluster_lmd_enabled);
+		if (expected ? pids[i] <= 0 : pids[i] != 0)
+			return false;
+		if (expected)
+			for (int j = 0; j < i; j++)
+				if (pids[i] == pids[j])
+					return false;
+	}
+	return true;
+}
+
 static bool
 NormalStopPostmasterRetaining(void)
 {
@@ -3306,6 +3336,17 @@ process_pm_shutdown_request(void)
 		mode = FastShutdown;
 	} else
 		mode = SmartShutdown;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: do not enter half-shutdown, stop actors or close connections
+	 * until the current path can retain its complete original roster. */
+	if (mode < ImmediateShutdown && !NormalStopPostmasterPreselectReady()) {
+		ereport(LOG, (errmsg("cluster normal-stop: shutdown request not accepted; required actor "
+							 "roster is incomplete"),
+					  errhint("Retry normal shutdown after the required actors are ready.")));
+		return;
+	}
+#endif
 
 	switch (mode) {
 	case SmartShutdown:

@@ -426,6 +426,7 @@ typedef struct ClusterNormalStopState {
 	pg_atomic_uint32 service_active_mask;
 	pg_atomic_uint32 service_idle_mask;
 	pg_atomic_uint32 service_seal;
+	uint64 post_checkpoint_deadline_us; /* Once-only tail budget; zero before checkpoint return. */
 } ClusterNormalStopState;
 
 typedef struct ClusterCleanLeaveSharedState {

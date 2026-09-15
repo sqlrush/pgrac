@@ -88,14 +88,14 @@
  * atomics) pushes it past the original 256-byte budget; 512 is the new bound.
  */
 StaticAssertDecl(sizeof(ClusterLeaveState) <= 512, "ClusterLeaveState exceeds 512-byte budget");
-StaticAssertDecl(sizeof(ClusterNormalStopState) == 736, "normal-stop tail layout changed");
+StaticAssertDecl(sizeof(ClusterNormalStopState) == 744, "normal-stop tail layout changed");
 StaticAssertDecl(offsetof(ClusterNormalStopState, open_record) == 80,
 				 "normal-stop OPEN offset changed");
 StaticAssertDecl(offsetof(ClusterNormalStopState, root_descriptor) == 160,
 				 "normal-stop root offset changed");
 StaticAssertDecl(offsetof(ClusterNormalStopState, service_seal) == 728,
 				 "normal-stop seal offset changed");
-StaticAssertDecl(sizeof(ClusterCleanLeaveSharedState) == 1208, "clean-leave region layout changed");
+StaticAssertDecl(sizeof(ClusterCleanLeaveSharedState) == 1216, "clean-leave region layout changed");
 StaticAssertDecl(sizeof(ClusterCleanLeaveSharedState) <= 1280, "clean-leave region exceeds budget");
 
 /*
@@ -1684,7 +1684,15 @@ cl_normal_stop_post_state_locked(const ClusterPhase1FullStopPlan *plan, uint32 p
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
 	if (((active | idle) & ~expected_services) != 0 || (active & idle) != 0)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_SERVICE);
-	if (now >= cl_state->barrier_deadline_us)
+	/* The real checkpoint is between the two bounded protocol phases. Only
+	 * its first post-arm call may cross the old pre-checkpoint deadline.
+	 * Once armed, pending owners and retries must use the exact tail budget. */
+	if (cl_normal_stop->post_checkpoint_deadline_us != 0
+		&& cl_normal_stop->post_checkpoint_deadline_us != cl_state->barrier_deadline_us)
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+	if ((phase != CLUSTER_NORMAL_STOP_CHECKPOINT
+		 || cl_normal_stop->post_checkpoint_deadline_us != 0)
+		&& now >= cl_state->barrier_deadline_us)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_DEADLINE);
 	return cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE;
 }
@@ -1722,6 +1730,21 @@ cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
 		= cl_normal_stop_post_arm_state_locked(plan, phase, now, cl_normal_stop_expected_services)
 			  ? CLUSTER_NORMAL_STOP_READY
 			  : CLUSTER_NORMAL_STOP_INVALID;
+	if (result == CLUSTER_NORMAL_STOP_READY && cl_normal_stop->post_checkpoint_deadline_us == 0) {
+		uint64 budget = cluster_clean_leave_drain_timeout_ms > 0
+							? (uint64)cluster_clean_leave_drain_timeout_ms * UINT64_C(1000)
+							: 0;
+
+		if (phase != CLUSTER_NORMAL_STOP_CHECKPOINT || now == 0 || budget == 0
+			|| now >= UINT64_MAX - budget) {
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+			result = CLUSTER_NORMAL_STOP_INVALID;
+		} else {
+			cl_normal_stop->post_checkpoint_deadline_us = now + budget;
+			cl_state->barrier_deadline_us = now + budget;
+			plan->absolute_deadline_us = now + budget;
+		}
+	}
 	LWLockRelease(&cl_state->lock);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;

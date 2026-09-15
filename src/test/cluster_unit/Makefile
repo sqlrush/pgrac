@@ -601,6 +601,12 @@ test_cluster_postmaster_fsm.inc: $(top_srcdir)/src/backend/postmaster/postmaster
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# PGRAC: exercise the actual shutdown request before any postmaster mutation.
+test_cluster_postmaster_request.inc: $(top_srcdir)/src/backend/postmaster/postmaster.c Makefile
+	awk '/^process_pm_shutdown_request\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_postmaster_respawn.inc: $(top_srcdir)/src/backend/postmaster/postmaster.c Makefile
 	awk '/^[ \t]*if \(cluster_enabled.*LmonPID == 0/ { emit=1; count++ } \
 	     emit { print } /^[ \t]*SinvalBcastPID = StartSinvalBcast\(\);/ { emit=0; ended++ } \
@@ -616,7 +622,7 @@ test_cluster_postmaster_reap.inc: $(top_srcdir)/src/backend/postmaster/postmaste
 	     END { if (count != 1 || hook != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_postmaster_stop: test_cluster_postmaster_stop.c test_cluster_postmaster_stop.inc test_cluster_postmaster_terminate.inc test_cluster_postmaster_fsm.inc test_cluster_postmaster_respawn.inc test_cluster_postmaster_reap.inc unit_test.h \
+test_cluster_postmaster_stop: test_cluster_postmaster_stop.c test_cluster_postmaster_stop.inc test_cluster_postmaster_terminate.inc test_cluster_postmaster_fsm.inc test_cluster_postmaster_request.inc test_cluster_postmaster_respawn.inc test_cluster_postmaster_reap.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 

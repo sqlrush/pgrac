@@ -1,3 +1,4 @@
+/* Author: SqlRush <sqlrush@gmail.com> */
 /* Actual postmaster-private roster code; OS signals and existing atomic
  * product facts are boundary fixtures. No real process is stopped here. */
 #include "postgres.h"
@@ -255,6 +256,21 @@ StartupDataBase(void)
 }
 #include "test_cluster_postmaster_fsm.inc"
 
+static bool pending_pm_shutdown_request, pending_pm_fast_shutdown_request;
+static bool pending_pm_immediate_shutdown_request;
+static unsigned status_writes;
+#define LOCK_FILE_LINE_PM_STATUS 8
+#define PM_STATUS_STOPPING "stopping"
+#define PMQUIT_FOR_STOP 2
+void
+AddToDataDirLockFile(int line, const char *status)
+{
+	(void)line;
+	(void)status;
+	status_writes++;
+}
+#include "test_cluster_postmaster_request.inc"
+
 static int child_crash_calls;
 static void
 HandleChildCrash(int pid, int status, const char *name)
@@ -448,6 +464,39 @@ UT_TEST(missing_extra_and_duplicate_actor_fail_without_shrinking)
 		UT_ASSERT(normal_stop_pm.selected);
 		UT_ASSERT(failure != 0);
 		UT_ASSERT_EQ(signal_count, 0);
+	}
+}
+UT_TEST(actual_normal_request_rejects_missing_roster_before_shutdown_mutation)
+{
+	for (int fast = 0; fast < 2; fast++) {
+		setup();
+		Shutdown = NoShutdown;
+		child_count = 1;
+		connsAllowed = true;
+		status_writes = 0;
+		UndoCleanerPIDs[7] = 0;
+		pending_pm_shutdown_request = true;
+		pending_pm_fast_shutdown_request = fast;
+		pending_pm_immediate_shutdown_request = false;
+		process_pm_shutdown_request();
+		UT_ASSERT_EQ(Shutdown, NoShutdown);
+		UT_ASSERT_EQ(pmState, PM_RUN);
+		UT_ASSERT(connsAllowed);
+		UT_ASSERT(!normal_stop_pm.selected);
+		UT_ASSERT_EQ(request_calls, 0);
+		UT_ASSERT_EQ(signal_count, 0);
+		UT_ASSERT_EQ(status_writes, 0);
+		UT_ASSERT_EQ(failure, CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		/* The original respawn loop, not a shutdown replacement, fills it. */
+		actual_cluster_respawn_edges();
+		UT_ASSERT(UndoCleanerPIDs[7] > 0);
+		pending_pm_shutdown_request = true;
+		pending_pm_fast_shutdown_request = fast;
+		process_pm_shutdown_request();
+		UT_ASSERT_EQ(Shutdown, fast ? FastShutdown : SmartShutdown);
+		UT_ASSERT(normal_stop_pm.selected);
+		UT_ASSERT_EQ(request_calls, 1);
+		UT_ASSERT_EQ(failure, CLUSTER_NORMAL_STOP_FAILURE_NONE);
 	}
 }
 UT_TEST(pristine_noncluster_and_abnormal_do_not_select_current)
@@ -738,10 +787,11 @@ UT_TEST(actual_intent_publication_failure_cannot_dispatch_legacy_checkpoint)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 	UT_RUN(capture_is_once_and_does_not_authorize_checkpoint);
 	UT_RUN(configured_pool_is_frozen_not_surviving_pids);
 	UT_RUN(missing_extra_and_duplicate_actor_fail_without_shrinking);
+	UT_RUN(actual_normal_request_rejects_missing_roster_before_shutdown_mutation);
 	UT_RUN(pristine_noncluster_and_abnormal_do_not_select_current);
 	UT_RUN(early_or_abnormal_exit_never_signs_clean);
 	UT_RUN(replacement_and_config_drift_do_not_requalify);
