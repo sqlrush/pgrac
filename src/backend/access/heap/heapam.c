@@ -171,6 +171,7 @@ typedef struct ClusterHeapItlTerminalCensus
 	ClusterTxLocator locators[CLUSTER_ITL_INITRANS_DEFAULT];
 	ClusterTxResolution resolutions[CLUSTER_ITL_INITRANS_DEFAULT];
 	ClusterTxOutcome outcomes[CLUSTER_ITL_INITRANS_DEFAULT];
+	ClusterTxResolveReason resolution_reasons[CLUSTER_ITL_INITRANS_DEFAULT];
 	uint8 locator_mask;
 	uint8 attempted_mask;
 	uint8 terminal_mask;
@@ -1263,6 +1264,7 @@ cluster_heap_itl_resolve_terminal_census(
 		if ((census->locator_mask & CLUSTER_HEAP_ITL_SLOT_BIT(i)) == 0)
 		{
 			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
+			census->resolution_reasons[i] = CLUSTER_TX_RESOLVE_BAD_LOCATOR;
 			continue;
 		}
 		census->attempted_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
@@ -1275,6 +1277,7 @@ cluster_heap_itl_resolve_terminal_census(
 			census->outcomes[i] = cluster_tx_resolve_exact_admitted(
 				&census->locators[i], CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
 				&census->admission, &census->resolutions[i], &reason);
+		census->resolution_reasons[i] = reason;
 		if (reason != CLUSTER_TX_RESOLVE_NONE)
 			census->outcomes[i] = CLUSTER_TX_UNKNOWN;
 		else if (census->outcomes[i] == CLUSTER_TX_COMMITTED
@@ -1526,6 +1529,42 @@ cluster_heap_itl_now_us(void)
 	return (uint64)INSTR_TIME_GET_MICROSEC(now);
 }
 
+/* Bounded refusal-only evidence from the already copied census. No page/TT
+ * re-read, borrowed pin, authority or policy change is introduced here. */
+static void
+cluster_heap_itl_capacity_diagnostic(const ClusterHeapItlTerminalCensus *census,
+									 ClusterHeapItlCensusCaptureResult capture, const char *stage)
+{
+	ereport(LOG, (errmsg("cluster ITL capacity census refused"),
+				  errdetail("PGRAC_FAMILY=ITL_CAPACITY_DIAGNOSTIC PGRAC_REASON=CENSUS_REFUSED "
+							"stage=%s capture=%d tag=%u/%u/%u/%u/%u pcm=%u flags=%u "
+							"generation=" UINT64_FORMAT " locator_mask=%u attempted=%u terminal=%u",
+							stage, (int)capture, census->pcm.tag.spcOid, census->pcm.tag.dbOid,
+							census->pcm.tag.relNumber, (unsigned)census->pcm.tag.forkNum,
+							census->pcm.tag.blockNum, census->pcm.pcm_state, census->pcm.flags,
+							(uint64)census->pcm.generation, census->locator_mask,
+							census->attempted_mask, census->terminal_mask)));
+	if (capture != CLUSTER_HEAP_ITL_CENSUS_CAPTURED)
+		return;
+	for (uint8 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		const ClusterItlSlotData *slot = &census->slots[i];
+		const ClusterTxResolution *resolved = &census->resolutions[i];
+		ereport(
+			LOG,
+			(errmsg("cluster ITL capacity slot observation"),
+			 errdetail(
+				 "PGRAC_FAMILY=ITL_CAPACITY_DIAGNOSTIC PGRAC_REASON=SLOT_OBSERVATION "
+				 "slot=%u xid=%u wrap=%u flags=%u uba=" UINT64_FORMAT "/" UINT64_FORMAT
+				 " commit=" UINT64_FORMAT " outcome=%d resolve_reason=%d proof=%d "
+				 "echo_xid=%u echo_wrap=%u echo_match=%d",
+				 i, slot->xid, slot->wrap, slot->flags, slot->undo_segment_head.raw[0],
+				 slot->undo_segment_head.raw[1], (uint64)slot->commit_scn, (int)census->outcomes[i],
+				 (int)census->resolution_reasons[i], (int)resolved->proof_kind,
+				 resolved->locator_echo.xid, resolved->locator_echo.tt_wrap,
+				 cluster_tx_locator_reply_matches(&census->locators[i], &resolved->locator_echo))));
+	}
+}
+
 /* Called only after UPDATE's ordinary allocation and terminal census failed.
  * Recapture under the current page bracket: the preceding census may have
  * unlocked/relocked it.  This capture is never stamped or recycled.  All
@@ -1599,6 +1638,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 			return CLUSTER_TXW_RETRY;
 		}
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
+		cluster_heap_itl_capacity_diagnostic(&census, capture_result, "CAPTURE");
 		return CLUSTER_TXW_UNPROVABLE;
 	}
 	if (fresh_capacity) {
@@ -1650,6 +1690,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	PG_END_TRY();
 	if (unprovable) {
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_UNPROVABLE);
+		cluster_heap_itl_capacity_diagnostic(&census, capture_result, "RESOLVE");
 		return CLUSTER_TXW_UNPROVABLE;
 	}
 	if (terminal) {

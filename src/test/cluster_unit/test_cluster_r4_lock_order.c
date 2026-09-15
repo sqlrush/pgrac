@@ -87,6 +87,7 @@ static bool ut_capture_miss_log;
 static bool ut_finishing_miss_log;
 static int ut_miss_log_count;
 static char ut_miss_log[4096];
+static char ut_itl_capacity_log[16384];
 static bool ut_pending_writer_route;
 static bool ut_writer_xid_collision;
 static bool ut_lock_selector_fixture;
@@ -181,6 +182,18 @@ bool
 cluster_wal_state_correctness_census_ok(void)
 {
 	return true;
+}
+
+/* The normal-stop suite owns the real terminal-receipt predicate. Lock-order
+ * tests must never gain admission from a fabricated stopped peer. */
+bool
+cluster_normal_stop_peer_receipt_tail(
+	const ClusterSemanticActivationRecord *open pg_attribute_unused(),
+	const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused(),
+	int peer pg_attribute_unused(), uint64 incarnation pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
 }
 
 /* Unrelated R4 readiness dependencies are closed in this lock-order binary;
@@ -1821,6 +1834,13 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 int
 errdetail(const char *fmt, ...)
 {
+	if (ut_finishing_miss_log && strstr(fmt, "PGRAC_FAMILY=ITL_CAPACITY_DIAGNOSTIC") != NULL) {
+		va_list args;
+		size_t used = strlen(ut_itl_capacity_log);
+		va_start(args, fmt);
+		vsnprintf(ut_itl_capacity_log + used, sizeof(ut_itl_capacity_log) - used, fmt, args);
+		va_end(args);
+	}
 	if (ut_finishing_miss_log && strstr(fmt, "PGRAC_FAMILY=R4_SELECTION") != NULL) {
 		va_list args;
 
@@ -6276,6 +6296,34 @@ UT_TEST(test_itl_wait_negative_boundaries_preserve_page_and_close_owners)
 	}
 }
 
+UT_TEST(test_itl_refusal_reports_capture_or_exact_slot_without_new_reads)
+{
+	for (int leg = 0; leg < 2; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult result;
+		uint64 deadline = 0;
+		const char *reason;
+		ut_itl_census_begin(&fixture, &result, false);
+		ut_itl_census_force_pcm_n = leg == 0;
+		ut_itl_census_outcomes[0] = CLUSTER_TX_UNKNOWN;
+		ut_capture_miss_log = true;
+		ut_itl_capacity_log[0] = '\0';
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+					 CLUSTER_TXW_UNPROVABLE);
+		ut_capture_miss_log = false;
+		UT_ASSERT(strstr(ut_itl_capacity_log, leg == 0 ? "stage=CAPTURE" : "stage=RESOLVE")
+				  != NULL);
+		if (leg != 0)
+			UT_ASSERT(strstr(ut_itl_capacity_log, "slot=0 xid=1200") != NULL);
+		UT_ASSERT_EQ(ut_itl_census_resolve_calls, leg == 0 ? 0 : 8);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+		UT_ASSERT_EQ(deadline, 0);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+	}
+}
+
 UT_TEST(test_itl_fresh_capacity_requalifies_without_wait_or_page_mutation)
 {
 	const uint8 terminal_flags[] = { ITL_FLAG_COMMITTED, ITL_FLAG_ABORTED,
@@ -6913,7 +6961,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(131);
+	UT_PLAN(134);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
@@ -6958,6 +7006,7 @@ main(void)
 	UT_RUN(test_target_writer_uses_bit0_exact_wait_and_requalifies_terminal_proof);
 	UT_RUN(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck);
 	UT_RUN(test_itl_wait_negative_boundaries_preserve_page_and_close_owners);
+	UT_RUN(test_itl_refusal_reports_capture_or_exact_slot_without_new_reads);
 	UT_RUN(test_itl_capacity_deadline_is_once_only_checked_and_ceil_rounded);
 	UT_RUN(test_itl_full_wait_uses_lowest_exact_blocker_after_pair_unwind);
 	UT_RUN(test_recycled_writer_uses_existing_authority_outside_content_lock);
