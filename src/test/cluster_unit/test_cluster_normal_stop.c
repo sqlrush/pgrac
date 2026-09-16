@@ -2812,6 +2812,87 @@ UT_TEST(test_module_census_calls_all_original_owners_with_full_root_and_cut)
 	UT_ASSERT_EQ(module_post_calls, 6);
 }
 
+UT_TEST(test_maintenance_cut_uses_real_front_proof_without_parking_pending_owners)
+{
+	ClusterCleanLeaveSharedState before;
+	ClusterNormalStopModuleObservation observation;
+	ClusterPhase1FullStopPlan plan;
+	seed_module_drain();
+	ctrc_observation = CLUSTER_NORMAL_STOP_PENDING;
+	module_results[7] = CLUSTER_NORMAL_STOP_PENDING;
+	MyAuxProcType = ClusterUndoCleanerTypeForWorker(0);
+	before = test_region;
+	UT_ASSERT(cluster_normal_stop_maintenance_cut());
+	UT_ASSERT_EQ(memcmp(&before, &test_region, sizeof(before)), 0);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, &plan, &observation),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT(!plan.valid);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 0);
+}
+
+UT_TEST(test_maintenance_cut_rejects_each_missing_front_binding_without_mutation)
+{
+	for (int fault = 0; fault < 15; fault++) {
+		ClusterCleanLeaveSharedState before;
+		seed_module_drain();
+		MyAuxProcType = ClusterUndoCleanerTypeForWorker(0);
+		switch (fault) {
+		case 0:
+			MyAuxProcType = ClusterUndoCleanerTypeForWorker(1);
+			break;
+		case 1:
+			MyAuxProcType = CheckpointerProcess;
+			break;
+		case 2:
+			pg_atomic_write_u32(&cl_normal_stop->requested, 0);
+			break;
+		case 3:
+			pg_atomic_write_u32(&cl_normal_stop->frontends_gone, 0);
+			break;
+		case 4:
+			pg_atomic_write_u32(&cl_normal_stop->identity_published, 0);
+			break;
+		case 5:
+			pg_atomic_write_u32(&cl_normal_stop->failure_reason,
+								CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+			break;
+		case 6:
+			pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS);
+			break;
+		case 7:
+			pg_atomic_write_u32(&cl_normal_stop->phase, UINT32_MAX);
+			break;
+		case 8:
+			pg_atomic_write_u32(&cl_state->request_in_progress, 0);
+			break;
+		case 9:
+			pg_atomic_write_u32(&cl_state->shutdown_driven, 0);
+			break;
+		case 10:
+			cl_normal_stop->peer_requests_seen &= ~UINT32_C(2);
+			break;
+		case 11:
+			cl_normal_stop->peer_request_sent &= ~UINT32_C(2);
+			break;
+		case 12:
+			pg_atomic_write_u64(&cl_state->leave_attempt_nonce, 0);
+			break;
+		case 13:
+			cl_normal_stop->peer_request_nonce[1] = UINT64_MAX;
+			break;
+		case 14:
+			cl_normal_stop->peer_request_nonce[cluster_node_id]++;
+			break;
+		}
+		before = test_region;
+		UT_ASSERT(!cluster_normal_stop_maintenance_cut());
+		UT_ASSERT_EQ(memcmp(&before, &test_region, sizeof(before)), 0);
+	}
+}
+
 UT_TEST(test_module_census_each_pending_retains_exact_cause_without_advancing)
 {
 	ClusterNormalStopModuleObservation observation;
@@ -4322,7 +4403,7 @@ UT_TEST(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_rec
 int
 main(void)
 {
-	UT_PLAN(100);
+	UT_PLAN(105);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
@@ -4373,6 +4454,8 @@ main(void)
 	UT_RUN(test_front_ack_send_requires_controller_cut_not_just_early_request);
 	UT_RUN(test_front_stopped_successor_is_retained_not_a_frontend_vote);
 	UT_RUN(test_module_census_calls_all_original_owners_with_full_root_and_cut);
+	UT_RUN(test_maintenance_cut_uses_real_front_proof_without_parking_pending_owners);
+	UT_RUN(test_maintenance_cut_rejects_each_missing_front_binding_without_mutation);
 	UT_RUN(test_module_census_each_pending_retains_exact_cause_without_advancing);
 	UT_RUN(test_module_invalid_and_unknown_override_earlier_pending_and_stick);
 	UT_RUN(test_module_identity_final_recheck_refuses_changed_root_and_wrong_role);

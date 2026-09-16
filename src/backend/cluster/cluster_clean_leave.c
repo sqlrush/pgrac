@@ -2836,6 +2836,40 @@ cluster_normal_stop_checkpoint_complete(ClusterPhase1FullStopPlan *plan,
 	return cl_normal_stop_checkpoint_run(plan, observation, true);
 }
 
+bool
+cluster_normal_stop_maintenance_cut(void)
+{
+	bool cut;
+	uint32 phase, peer_bits;
+	uint64 nonce;
+
+	if (!IsUnderPostmaster || ClusterUndoCleanerWorkerIdForType(MyAuxProcType) != 0
+		|| !cluster_enabled || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || cl_state == NULL
+		|| cl_normal_stop == NULL)
+		return false;
+	peer_bits = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	cut = pg_atomic_read_u32(&cl_normal_stop->requested) == 1
+		  && pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
+		  && pg_atomic_read_u32(&cl_normal_stop->identity_published) == 1
+		  && cluster_normal_stop_failure() == CLUSTER_NORMAL_STOP_FAILURE_NONE
+		  && phase >= CLUSTER_NORMAL_STOP_DRAIN && phase <= CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED
+		  && pg_atomic_read_u32(&cl_state->request_in_progress) == 1
+		  && pg_atomic_read_u32(&cl_state->shutdown_driven) == 1
+		  && cl_normal_stop->peer_requests_seen == 15
+		  && cl_normal_stop->peer_request_sent == peer_bits && nonce != 0 && nonce != UINT64_MAX;
+	for (int peer = 0; cut && peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
+		uint64 peer_nonce = cl_normal_stop->peer_request_nonce[peer];
+		cut = peer_nonce != 0 && peer_nonce != UINT64_MAX
+			  && (peer != cluster_node_id || peer_nonce == nonce);
+	}
+	LWLockRelease(&cl_state->lock);
+	return cut;
+}
+
 ClusterNormalStopPollResult
 cluster_normal_stop_request_cleaner_quiesce(void)
 {

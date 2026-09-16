@@ -663,6 +663,8 @@ cluster_normal_stop_checkpoint_complete(ClusterPhase1FullStopPlan *plan,
 										ClusterNormalStopModuleObservation *observation);
 /* Checkpointer, after the complete DRAIN observations; original owners still
  * own all cleanup. Each cleaner signs only itself after its outer pass. */
+/* Only defers new optional maintenance; never authorizes park or checkpoint. */
+extern bool cluster_normal_stop_maintenance_cut(void);
 extern ClusterNormalStopPollResult cluster_normal_stop_request_cleaner_quiesce(void);
 extern bool cluster_normal_stop_cleaner_park_requested(void);
 extern bool cluster_normal_stop_cleaner_park(void);

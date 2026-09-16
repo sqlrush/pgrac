@@ -56,6 +56,146 @@ static unsigned prepared, cancelled, slept, signalled, broadcasts;
 static bool subscribed, early_signal, test_cancel, test_pin_after_probe;
 static ClusterCtrcCapacityProbeResult test_proof;
 static TransactionId test_xid = 100;
+static bool test_maintenance_cut, test_ctrc_progress;
+static unsigned test_ctrc_passes, test_gc_passes, test_modifier_entries, test_modifier_leaves;
+bool cluster_undo_record_segment_commit_on_rollover;
+int cluster_undo_cleaner_batch_segments = 8;
+
+/* The normal-stop state observer is a boundary input here. Its real shared
+ * state/identity tests live in test_cluster_normal_stop. The complete actual
+ * outer pass above must retain CTRC progress without starting new maintenance. */
+bool
+cluster_normal_stop_maintenance_cut(void)
+{
+	return test_maintenance_cut;
+}
+
+bool
+cluster_ctrc_cleaner_run_pass(void)
+{
+	test_ctrc_passes++;
+	return test_ctrc_progress;
+}
+
+ClusterJoinGateVerdict
+cluster_reconfig_self_join_gate_verdict(void)
+{
+	return CLUSTER_JOIN_GATE_ALLOW;
+}
+
+ClusterSemanticAdmissionResult
+cluster_semantic_activation_modifier_enter(bool writable, ClusterSemanticAdmissionToken *token)
+{
+	if (!writable || test_lock_depth != 0)
+		abort();
+	MemSet(token, 0, sizeof(*token));
+	test_modifier_entries++;
+	return CLUSTER_SEMANTIC_ADMISSION_OK;
+}
+
+bool
+cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken *token,
+											 bool writable)
+{
+	return token != NULL && writable;
+}
+
+void
+cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
+{
+	if (token == NULL || test_lock_depth != 0)
+		abort();
+	test_modifier_leaves++;
+}
+
+bool
+cluster_tt_slot_gc_current_pass(SCN horizon, uint64 epoch, ClusterUndoCleanerPassStats *stats)
+{
+	if (horizon != 1000 || epoch != 13 || stats == NULL || test_lock_depth != 0)
+		abort();
+	test_gc_passes++;
+	/* A finite existing GC refusal exercises the real pass's token release. */
+	return false;
+}
+
+void
+cluster_undo_horizon_note_stall(void)
+{}
+void
+cluster_undo_horizon_note_peer_stale(void)
+{}
+void
+cluster_undo_horizon_note_pass_abort(void)
+{}
+void
+cluster_undo_horizon_note_floor(SCN scn pg_attribute_unused())
+{}
+const char *
+cluster_undo_horizon_stall_reason_name(ClusterUndoHorizonStallReason reason pg_attribute_unused())
+{
+	return "fixture";
+}
+uint32
+cluster_undo_segment_scan_max_existing(uint8 owner pg_attribute_unused())
+{
+	abort();
+}
+uint32
+cluster_undo_record_active_segment_id(void)
+{
+	abort();
+}
+uint32
+cluster_tt_slot_current_segment(int node pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_undo_segment_tt_header_scan_pass(uint32 segment pg_attribute_unused(),
+										 uint8 owner pg_attribute_unused(),
+										 SCN horizon pg_attribute_unused(),
+										 ClusterUndoCleanerPassStats *stats pg_attribute_unused())
+{
+	abort();
+}
+void
+cluster_undo_segment_advance_committed(uint32 segment pg_attribute_unused())
+{
+	abort();
+}
+ClusterUndoSegTryRecycle
+cluster_undo_segment_advance_recyclable(uint32 segment pg_attribute_unused(),
+										SCN horizon pg_attribute_unused(),
+										uint64 epoch pg_attribute_unused())
+{
+	abort();
+}
+bool
+errstart(int level pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+bool
+errstart_cold(int level pg_attribute_unused(), const char *domain pg_attribute_unused())
+{
+	return false;
+}
+int
+errmsg(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
+errhint(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused(),
+		  const char *func pg_attribute_unused())
+{
+	abort();
+}
 
 void
 LWLockInitialize(LWLock *lock, int tranche)
@@ -486,15 +626,38 @@ UT_TEST(test_worker_lifecycle_rows_and_pid_inventory_are_independent)
 	UT_ASSERT(cluster_undo_cleaner_all_reaped(pids));
 }
 
+UT_TEST(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance)
+{
+	for (int cut = 0; cut < 2; cut++) {
+		for (int progress = 0; progress < 2; progress++) {
+			bool remaining = false;
+			reset_wait_fixture();
+			undo_cleaner_worker = 0;
+			test_maintenance_cut = cut != 0;
+			test_ctrc_progress = progress != 0;
+			test_ctrc_passes = test_gc_passes = test_modifier_entries = test_modifier_leaves = 0;
+			(void)undo_cleaner_run_pass(&remaining);
+			UT_ASSERT_EQ(test_ctrc_passes, 1);
+			UT_ASSERT_EQ(remaining, progress != 0);
+			UT_ASSERT_EQ(test_gc_passes, cut ? 0 : 1);
+			UT_ASSERT_EQ(test_modifier_entries, cut ? 0 : 1);
+			UT_ASSERT_EQ(test_modifier_leaves, test_modifier_entries);
+			UT_ASSERT_EQ(undo_cleaner_state->segments_marked_recyclable, 0);
+			UT_ASSERT_EQ(test_lock_depth, 0);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(6);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
 	UT_RUN(test_capacity_cancellation_and_missing_supply_keep_original_outcome);
 	UT_RUN(test_worker_lifecycle_rows_and_pid_inventory_are_independent);
+	UT_RUN(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance);
 	free(undo_cleaner_state);
 	UT_DONE();
 	return ut_failed_count != 0;
