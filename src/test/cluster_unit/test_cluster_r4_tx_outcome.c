@@ -160,6 +160,7 @@ static int test_terminal_census_root_resolve_calls;
 static bool test_local_freshref_pair_exact;
 static int test_local_freshref_pair_calls;
 static SCN test_local_origin_bound;
+static SCN test_local_origin_exact;
 static bool test_local_ordinary_abort;
 static bool test_local_last_ordinary_single;
 static int test_local_origin_calls;
@@ -254,6 +255,16 @@ cluster_lms_undo_verdict_fill_page(TransactionId xid, bool authoritative, bool o
 	UT_ASSERT(!authoritative);
 	if (test_local_origin_epoch_drift)
 		test_formation_epoch++;
+	if (SCN_VALID(test_local_origin_exact)) {
+		memset(page, 0, sizeof(*page));
+		page->magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+		page->version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+		page->xid_echo = xid;
+		page->verdict = CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+		page->commit_scn = test_local_origin_exact;
+		page->wrap = TEST_ORIGIN_WRAP;
+		return true;
+	}
 	if (test_local_ordinary_abort) {
 		if (!ordinary_single)
 			return false;
@@ -1073,6 +1084,7 @@ reset_exact_origin_fixture(void)
 	test_local_freshref_pair_exact = false;
 	test_local_freshref_pair_calls = 0;
 	test_local_origin_bound = InvalidScn;
+	test_local_origin_exact = InvalidScn;
 	test_local_ordinary_abort = false;
 	test_local_last_ordinary_single = false;
 	test_local_origin_calls = 0;
@@ -3973,6 +3985,68 @@ UT_TEST(test_origin_export_copies_only_the_final_revalidated_resident_data_page)
 	}
 }
 
+/* Author: PGRAC. The real local consumer must not discard an already-proven
+ * exact terminal merely because a later physical-alias pair would refuse. */
+UT_TEST(test_local_retained_read_preserves_same_stamp_origin_exact)
+{
+	ClusterUndoVerdictResult result;
+
+	reset_exact_origin_fixture();
+	test_local_origin_exact = test_commit_scn;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+		test_commit_scn + 1);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(result.commit_scn, test_commit_scn);
+	UT_ASSERT_EQ(result.wrap, TEST_ORIGIN_WRAP);
+	UT_ASSERT_EQ(test_local_origin_calls, 1);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+}
+
+UT_TEST(test_local_retained_exact_does_not_replace_the_snapshot_or_census_role)
+{
+	ClusterUndoVerdictResult result;
+
+	reset_exact_origin_fixture();
+	test_local_origin_exact = test_commit_scn;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+		test_commit_scn - 1);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ(result.commit_scn, test_commit_scn);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+
+	reset_exact_origin_fixture();
+	test_local_origin_exact = test_commit_scn;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn, InvalidScn);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(test_local_origin_calls, 0);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 1);
+}
+
+UT_TEST(test_local_retained_exact_mismatch_and_epoch_drift_stay_unproven)
+{
+	ClusterUndoVerdictResult result;
+
+	reset_exact_origin_fixture();
+	test_local_origin_exact = test_commit_scn + 1;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+		test_commit_scn + 2);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 1);
+
+	reset_exact_origin_fixture();
+	test_local_origin_exact = test_commit_scn;
+	test_local_origin_epoch_drift = true;
+	result = cluster_runtime_visibility_test_local_retained_read(
+		TEST_ORIGIN_XID, TEST_RECORD_SEGMENT, TEST_TT_OFFSET + 1, test_commit_scn,
+		test_commit_scn + 1);
+	UT_ASSERT_EQ(result.kind, CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ(test_local_freshref_pair_calls, 0);
+}
+
 UT_TEST(test_local_retained_read_bound_precedes_exact_pair_without_promoting_it)
 {
 	ClusterUndoVerdictResult result;
@@ -4036,9 +4110,12 @@ UT_TEST(test_self_fresh_role_does_not_inherit_ordinary_abort_permission)
 int
 main(void)
 {
-	UT_PLAN(122);
+	UT_PLAN(125);
 	UT_RUN(test_self_fresh_role_does_not_inherit_ordinary_abort_permission);
 	UT_RUN(test_local_retained_read_bound_precedes_exact_pair_without_promoting_it);
+	UT_RUN(test_local_retained_read_preserves_same_stamp_origin_exact);
+	UT_RUN(test_local_retained_exact_does_not_replace_the_snapshot_or_census_role);
+	UT_RUN(test_local_retained_exact_mismatch_and_epoch_drift_stay_unproven);
 	RUN_PAIR_TEST(0);
 	RUN_PAIR_TEST(1);
 	RUN_PAIR_TEST(2);

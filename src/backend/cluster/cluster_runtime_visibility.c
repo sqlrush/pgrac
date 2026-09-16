@@ -3660,23 +3660,24 @@ rtvis_resolve_own_xid_freshref_c1b_pair(TransactionId raw_xid, uint32 undo_segme
 		.wrap = 0};
 	uint16 wrap = 0;
 
-	/* A local immutable read can consume the same snapshot-relative origin
-	 * bound as a foreign read. The terminal-census caller passes no read SCN
-	 * and must remain exact-only. A bound is never the retained exact stamp. */
+	/* A local immutable read can consume an already-proved origin terminal.
+	 * Preserve a same-stamp exact result before a later alias/slot lookup can
+	 * lose it; keep snapshot-relative bounds marked as bounds. The terminal
+	 * census caller passes no read SCN and retains its exact-pair-only path. */
 	if (SCN_VALID(read_scn)) {
 		uint64 epoch = cluster_epoch_get_current();
 		ClusterUndoVerdictResult ordinary = rtvis_resolve_own_xid(raw_xid, read_scn, false);
 
 		if (cluster_epoch_get_current() != epoch)
 			return result;
-		if (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND)
+		if (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND
+			|| (ordinary.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
+				&& SCN_VALID(ordinary.commit_scn) && ordinary.commit_scn == retained_commit_scn))
 			return ordinary;
 	}
 
 	if (!cluster_cr_server_local_freshref_c1b_pair_exact(
-			raw_xid, undo_segment_id, expected_tt_slot_id,
-			retained_commit_scn, &wrap))
-	{
+			raw_xid, undo_segment_id, expected_tt_slot_id, retained_commit_scn, &wrap)) {
 		cluster_rtvis_resolve_note_failclosed();
 		return result;
 	}
