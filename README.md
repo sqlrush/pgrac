@@ -6,28 +6,21 @@ PostgreSQL has never had a shared-disk, multi-active cluster (its HA is
 shared-nothing replication). pgrac brings the Oracle RAC model — many nodes,
 one shared database, Cache Fusion / SCN / GES — to PostgreSQL 16.13.
 
-> ⚠️ **Early stage, built in public.**
+> **MVP 1: [v0.130.0-mvp.1](docs/release-notes/v0.130.0-mvp.1.md).**
 >
-> Per-feature status — working / scaffolded / planned — is tracked honestly at
-> **[pgrac.dev/features](https://pgrac.dev/features/)**. The short version:
+> The first frozen MVP has passed four-node point-update workloads with 8 and
+> 16 clients per node, complete million-row data comparisons, health and
+> outstanding-work checks, coordinated normal shutdown, same-data normal
+> restart, and another workload with all checks repeated after restart.
 >
-> **Running today:** the cluster substrate (TCP interconnect + 1 Hz LMON
-> heartbeat, per-peer state in `pg_cluster_ic_peers`; SCN / ITL / dedicated-undo
-> block format; multi-node `pgrac.conf` bootstrap), plus working code paths for
-> Cache Fusion's 3-way block transfer, cross-node MVCC, the global SCN clock,
-> cluster catalog invalidation, and a cluster-aware storage manager. Honest
-> caveat: these run on real paths, but cross-node *behavioral* test coverage is
-> still being built.
+> **Evaluation only, not production certified.** This acceptance does not
+> certify crash recovery, failover, rolling upgrades, all SQL features or
+> performance targets. See the release notes for the exact scope and limitations.
 >
-> **In progress / planned:** full cross-node GES enqueue locking and crash
-> recovery (active); RDMA transport provider/mux work, Active Data Guard,
-> rolling upgrade, FAN/TAF, and backup/DR.
->
-> **Sanity anchor:** the `--disable-cluster` build is binary-identical to
-> upstream PostgreSQL 16.13 and passes the full 219-test regression suite.
->
-> ⭐ If "Postgres with RAC-style shared storage" is something you've wanted,
-> star the repo to follow the build.
+> Releases use immutable annotated tags. Read the
+> [version policy](docs/release-notes/README.md) to identify a build or select a
+> frozen source baseline. Detailed feature status remains at
+> [pgrac.dev/features](https://pgrac.dev/features/).
 
 ## See it run
 
