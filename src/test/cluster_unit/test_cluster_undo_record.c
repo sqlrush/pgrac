@@ -1338,6 +1338,23 @@ UT_TEST(test_allocated_nonempty_tt_is_not_fresh_supply)
 	undo_test_fixture_end();
 }
 
+UT_TEST(test_absent_segment_selection_does_not_publish_a_file)
+{
+	ClusterUndoSegmentExtendPlan plan;
+
+	if (!undo_test_fixture_begin())
+		return;
+	UT_ASSERT(undo_test_write_header(1, SEGMENT_ACTIVE));
+	UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
+	UT_ASSERT_EQ(plan.segment_id, 2);
+	UT_ASSERT_EQ(plan.generation, 0);
+	UT_ASSERT(plan.needs_provision);
+	UT_ASSERT(!plan.needs_reuse);
+	UT_ASSERT(!plan.at_hard_cap);
+	UT_ASSERT(!cluster_undo_segment_file_exists(1, 2));
+	undo_test_fixture_end();
+}
+
 /* Spec 8.4A I18/I19: one admission debt covers record allocation and every
  * lifecycle/record-seal block0 mutation it can reach. */
 UT_TEST(test_record_allocator_owns_modifier_debt_outside_lifecycle_locks)
@@ -3398,11 +3415,12 @@ UT_TEST(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(70);
+	UT_PLAN(71);
 	UT_RUN(test_a148_undo_stop_original_active_writer_requires_original_commit_release);
 	UT_RUN(test_a148_undo_stop_all_slots_and_late_invalid_do_not_clear_debt);
 	UT_RUN(test_a148_undo_stop_does_not_confuse_extent_and_cursor_cache_with_writer);
 	UT_RUN(test_allocated_nonempty_tt_is_not_fresh_supply);
+	UT_RUN(test_absent_segment_selection_does_not_publish_a_file);
 	UT_RUN(test_terminal_tt_only_sweep_preserves_actual_recycle_eligibility);
 	UT_RUN(test_record_seal_owner_ignores_every_nonactive_predecessor);
 	UT_RUN(test_history_consume_refuses_missing_metadata_before_install);

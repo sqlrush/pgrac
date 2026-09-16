@@ -158,39 +158,6 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner_instance, ui
 
 
 /*
- * Open-or-create the segment file.  Returns the fd (caller closes).
- *
- * Idempotent: if the file already exists, opens it with O_RDWR.  Helps
- * Stage 1.22 callers that ask the allocator twice (e.g., test harness
- * sanity checks) without orphan files.
- */
-static int
-open_or_create_segment(const char *path, bool *out_created)
-{
-	int fd;
-
-	*out_created = false;
-
-	fd = BasicOpenFile(path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
-	if (fd >= 0) {
-		*out_created = true;
-		return fd;
-	}
-
-	if (errno != EEXIST)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not create undo segment file \"%s\": %m", path)));
-
-	/* Already exists -- open for read/write. */
-	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
-	if (fd < 0)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not open existing undo segment file \"%s\": %m", path)));
-	return fd;
-}
-
-
-/*
  * Ensure the parent directory pg_undo/instance_<N>/ exists.
  *
  * Stage 1.22: only instance_0/ is created at initdb time.  Backend
@@ -281,26 +248,16 @@ cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
 /*
  * cluster_undo_segment_allocate
  *
- *   Body:
- *     1. Validate owner_instance (Stage 1.22 single-node restriction).
- *     2. Resolve segment file path.
- *     3. Ensure parent directory exists.
- *     4. Open-or-create the file (idempotent).
- *     5. Generate the 8 KB header bytes via the shared helper.
- *     6. Extend file to UNDO_SEGMENT_SIZE_BYTES if it was just created.
- *     7. pwrite block 0 + fsync.
- *     8. Emit XLOG_UNDO_SEGMENT_INIT WAL record so crash replay can
- *        rebuild the segment header.
+ *   Validate the local owner and enter the current-authorized publisher.
+ *   Existing exact images are load-only. New headers remain private until
+ *   INIT WAL, complete file contents and no-replace publication are durable.
+ *   Invalid existing files are never repaired by a live allocator.
  */
 void
 cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 {
-	char path[MAXPGPATH];
-	PGAlignedBlock page;
-	int fd;
-	bool created;
-	struct stat st;
-	ssize_t written;
+	ClusterUndoBlock0LogicalKey logical = { 0 };
+	ClusterUndoBlock0Result result;
 
 	/*
 	 * spec-3.4b D2 multi-instance unlock.
@@ -353,145 +310,15 @@ cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance)
 							(unsigned)owner_instance, cluster_node_id, cluster_node_id + 1)));
 	}
 
-	if (cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance), owner_instance,
-								  segment_id, path, sizeof(path))
-		!= 0)
-		ereport(ERROR, (errcode(ERRCODE_NAME_TOO_LONG),
-						errmsg("undo segment path too long: instance=%u seg=%u",
-							   (unsigned)owner_instance, (unsigned)segment_id)));
-
 	ensure_instance_subdir(owner_instance);
-
-	fd = open_or_create_segment(path, &created);
-
-	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
-
-	/*
-	 * spec-3.4b hardening:
-	 *
-	 * cluster_undo_active_segment_for_node_or_create() sits on the DML hot
-	 * path.  The allocator is intentionally idempotent, but idempotent must
-	 * not mean "rewrite + fsync + emit XLOG_UNDO_SEGMENT_INIT every xact".
-	 * If the segment file already exists, has the expected size, and block 0
-	 * is a valid header for this segment identity, return immediately.  Do not
-	 * compare the whole block against the fresh zero template: block 0 later
-	 * carries durable TT slots, lifecycle state, and bitmap updates that must
-	 * survive repeated idempotent allocator calls from new backends.
-	 */
-	if (!created) {
-		if (fstat(fd, &st) != 0) {
-			int save_errno = errno;
-
-			close(fd);
-			errno = save_errno;
-			ereport(ERROR, (errcode_for_file_access(),
-							errmsg("could not stat undo segment file \"%s\": %m", path)));
-		}
-
-		if (st.st_size == UNDO_SEGMENT_SIZE_BYTES) {
-			PGAlignedBlock existing;
-			ssize_t readbytes;
-
-			readbytes = pg_pread(fd, existing.data, BLCKSZ, 0);
-			if (readbytes < 0) {
-				int save_errno = errno;
-
-				close(fd);
-				errno = save_errno;
-				ereport(ERROR, (errcode_for_file_access(),
-								errmsg("could not read undo segment header for \"%s\": %m", path)));
-			}
-
-			if (readbytes == BLCKSZ
-				&& cluster_undo_segment_header_identity_ok(existing.data, segment_id,
-														   owner_instance)) {
-				if (close(fd) != 0)
-					ereport(ERROR, (errcode_for_file_access(),
-									errmsg("could not close undo segment file \"%s\": %m", path)));
-				return;
-			}
-		}
-	}
-
-	/*
-	 * Hardening v1.0.4 P1-2: unconditional ftruncate.
-	 *
-	 * v1.0.3 only ftruncate'd when created=true, but a crash between
-	 * O_CREAT and ftruncate leaves a partial / zero-size orphan file.
-	 * The next allocate call sees the existing file, so created=false,
-	 * and the file would never reach UNDO_SEGMENT_SIZE_BYTES -- segment
-	 * tail accesses would EOF.  ftruncate is idempotent (shrink-to-same
-	 * and extend-to-target are both no-ops when size already matches),
-	 * so unconditional is safe and self-healing.  Mirrors the redo
-	 * handler's 6-step idempotent pattern (cluster_undo_xlog.c).
-	 */
-	if (ftruncate(fd, (off_t)UNDO_SEGMENT_SIZE_BYTES) != 0) {
-		int save_errno = errno;
-
-		close(fd);
-		errno = save_errno;
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not extend undo segment file \"%s\" to %d bytes: %m", path,
-							   UNDO_SEGMENT_SIZE_BYTES)));
-	}
-
-	written = pg_pwrite(fd, page.data, BLCKSZ, 0);
-	if (written != BLCKSZ) {
-		int save_errno = errno;
-
-		close(fd);
-		errno = save_errno;
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not write undo segment header for \"%s\": "
-							   "wrote %zd of %d bytes",
-							   path, written, BLCKSZ)));
-	}
-
-	if (pg_fsync(fd) != 0) {
-		int save_errno = errno;
-
-		close(fd);
-		errno = save_errno;
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not fsync undo segment file \"%s\": %m", path)));
-	}
-
-	if (close(fd) != 0)
-		ereport(ERROR, (errcode_for_file_access(),
-						errmsg("could not close undo segment file \"%s\": %m", path)));
-
-	/*
-	 * Hardening v1.0.4 P1-2: fsync parent directory after file creation /
-	 * truncate.  Required for the create case so the dirent is durable;
-	 * harmless for the already-exists case.  Mirrors redo handler.
-	 *
-	 * The directory is derived from the very path the segment was created
-	 * at, never rebuilt from DataDir: under cluster.undo_gcs_coherence the
-	 * resolver lands the segment on the shared cluster_fs root (D2-2), and
-	 * rebuilding from DataDir fsync'd the local instance dir instead -- a
-	 * PANIC when that dir was never created (first coherent write on a
-	 * cloned node), a silently-undurable shared dirent when it was.
-	 */
-	{
-		char dir[MAXPGPATH];
-
-		strlcpy(dir, path, sizeof(dir));
-		get_parent_directory(dir);
-		fsync_fname(dir, true);
-	}
-
-	/*
-	 * Emit WAL record so crash recovery can recreate the header (the
-	 * segment file itself is created earlier in this function; a crash
-	 * between file creation and WAL emit leaves an orphan empty file
-	 * which is harmless -- segment_id allocation is idempotent and the
-	 * file will be reinitialized on next allocate call).
-	 *
-	 * For Stage 1.22 we always emit; Stage 2+ may add a fast-path that
-	 * skips emit when the segment is being created from a known-good
-	 * shared-storage replica (feature-119).
-	 */
-	(void)cluster_undo_emit_segment_init(owner_instance, segment_id, page.data);
+	logical.segment_id = segment_id;
+	logical.owner_instance = owner_instance;
+	result = cluster_undo_block0_current_live_owner_provision(&logical, 10000);
+	if (result != CLUSTER_UNDO_BLOCK0_OK)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("undo segment first publication refused: instance=%u segment=%u result=%d",
+						(unsigned)owner_instance, (unsigned)segment_id, (int)result)));
 }
 
 
@@ -532,8 +359,8 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 	}
 
 	/*
-	 * cluster_undo_segment_allocate is idempotent and cheap when the file
-	 * already exists with the right header.  Calling it here means the first
+	 * cluster_undo_segment_allocate is idempotent under current authority.
+	 * Calling it here means the first
 	 * DML on this node lazily provisions the segment; subsequent calls in
 	 * this backend return from the cache above.
 	 */
@@ -541,9 +368,9 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 
 	cached_node_id = node_id;
 	cached_segment_id = segment_id;
-	cached_block0_resident
-		= cluster_undo_block0_current_live_owner_ensure_resident(
-			&logical, 10000) == CLUSTER_UNDO_BLOCK0_OK;
+	/* Successful first publication already retained and admitted the exact
+	 * image under current X; do not acquire the same authority twice. */
+	cached_block0_resident = true;
 
 	return segment_id;
 }
@@ -1126,19 +953,12 @@ cluster_undo_segment_extend_or_create(
 			return false;
 		}
 
-		/* Found free slot — create the segment file. */
-		cluster_undo_segment_allocate(new_segment_id, owner_instance);
-
-		/* Verify the file was created (cluster_undo_segment_allocate
-		 * is idempotent;  if it ereport'd ERROR we wouldn't reach here). */
-		fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
-		if (fd < 0)
-			return false; /* create silently failed */
-		close(fd);
-
+		/* Freeze the absent candidate only. Its caller must release the
+		 * lifecycle lock before taking current authority and publishing. */
 		plan->segment_id = new_segment_id;
 		plan->generation = 0;
 		plan->needs_reuse = false;
+		plan->needs_provision = true;
 		return true;
 	}
 

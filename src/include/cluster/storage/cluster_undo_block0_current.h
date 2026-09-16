@@ -163,8 +163,11 @@ extern ClusterUndoBlock0Result cluster_undo_block0_current_pin_exclusive(
 extern ClusterUndoBlock0Result cluster_undo_block0_current_recheck_exclusive(
 	ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0Result
-cluster_undo_block0_current_live_owner_ensure_resident(
-	const ClusterUndoBlock0LogicalKey *key, int timeout_ms);
+cluster_undo_block0_current_live_owner_provision(const ClusterUndoBlock0LogicalKey *key,
+												 int timeout_ms);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key,
+													   int timeout_ms);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_ensure_resident_exact(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,

@@ -137,6 +137,7 @@ typedef struct ClusterUndoBlock0LiveOwnerCleanup {
 	ClusterUndoBlock0CurrentGuard *guard;
 	ClusterUndoBlock0FrameToken *frame;
 	ClusterUndoBlock0Pin *pin;
+	char *unpublished_page;
 	bool admission_held;
 	bool current_active;
 	bool pin_held;
@@ -1477,6 +1478,7 @@ current_live_owner_sample_generation(ClusterUndoBlock0CurrentGuardData *data,
 	if (result == CLUSTER_UNDO_BLOCK0_OK) {
 		if (creator) {
 			cleanup->provision_held = true;
+			cleanup->unpublished_page = page;
 			result = CLUSTER_UNDO_BLOCK0_NOT_FOUND;
 		} else {
 			cleanup->pin_held = true;
@@ -1675,10 +1677,10 @@ cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
 	return CLUSTER_UNDO_BLOCK0_OK;
 }
 
-ClusterUndoBlock0Result
-cluster_undo_block0_current_live_owner_ensure_resident_exact(
-	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
-	ClusterUndoBlock0LiveOwnerPublication *publication)
+static ClusterUndoBlock0Result
+current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+								   ClusterUndoBlock0LiveOwnerPublication *publication,
+								   bool allow_creation)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterUndoBlock0CurrentGuard guard = { 0 };
@@ -1770,7 +1772,9 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 		if (result != CLUSTER_UNDO_BLOCK0_OK)
 			goto ensure_done;
 		result = current_live_owner_sample_generation(data, &root, &proof, &generation, &cleanup);
-		if (result == CLUSTER_UNDO_BLOCK0_OK) {
+		if (result == CLUSTER_UNDO_BLOCK0_NOT_FOUND && allow_creation && cleanup.provision_held)
+			result = CLUSTER_UNDO_BLOCK0_OK;
+		else if (result == CLUSTER_UNDO_BLOCK0_OK) {
 			if (!generation.known || generation.value == UINT32_MAX)
 				result = CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH;
 		}
@@ -1790,6 +1794,37 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 			|| !current_live_recheck(data)) {
 			result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 			goto ensure_done;
+		}
+		if (cleanup.provision_held) {
+			XLogRecPtr init_lsn;
+
+			/* Only the explicit creator may initialize the still-private
+			 * frame. The publisher flushes INIT before exposing the final
+			 * pathname and never overwrites an existing winner. */
+			cluster_undo_segment_make_header_bytes(key->segment_id, key->owner_instance,
+												   cleanup.unpublished_page);
+			init_lsn = cluster_undo_emit_segment_init(key->owner_instance, key->segment_id,
+													  cleanup.unpublished_page);
+			if (!current_live_recheck(data)) {
+				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+				goto ensure_done;
+			}
+			cluster_undo_block0_provision_publish(&pin, init_lsn);
+			cleanup.provision_held = false;
+			cleanup.pin_held = true;
+			generation = pin.observed_generation;
+			if (!(admission.side == CLUSTER_SEMANTIC_SOURCE_SIDE
+					  ? cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+							&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance,
+							key->segment_id, &final_root)
+					  : cluster_semantic_activation_resolve_shared_undo_root(
+							&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, key->owner_instance,
+							key->segment_id, &final_root))
+				|| !cluster_undo_block0_root_matches(&root, &final_root)
+				|| !current_live_recheck(data)) {
+				result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
+				goto ensure_done;
+			}
 		}
 		candidate.magic = CLUSTER_UNDO_BLOCK0_LIVE_OWNER_PUBLICATION_MAGIC;
 		candidate.item.logical = *key;
@@ -1831,6 +1866,21 @@ cluster_undo_block0_current_live_owner_ensure_resident_exact(
 	if (result == CLUSTER_UNDO_BLOCK0_OK && publication != NULL)
 		memcpy(publication, &candidate, sizeof(candidate));
 	return result;
+}
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_ensure_resident_exact(
+	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
+	ClusterUndoBlock0LiveOwnerPublication *publication)
+{
+	return current_live_owner_ensure_resident(key, timeout_ms, publication, false);
+}
+
+ClusterUndoBlock0Result
+cluster_undo_block0_current_live_owner_provision(const ClusterUndoBlock0LogicalKey *key,
+												 int timeout_ms)
+{
+	return current_live_owner_ensure_resident(key, timeout_ms, NULL, true);
 }
 
 ClusterUndoBlock0Result

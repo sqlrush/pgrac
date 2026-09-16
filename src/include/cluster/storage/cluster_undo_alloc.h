@@ -177,20 +177,21 @@ extern int cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 instanc
  *	         - segment_id within the node's reserved range, i.e.
  *	           ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1
  *	           must equal owner_instance.
- *	    2. Resolve path, ensure parent dir, open-or-create file.
- *	    3. Generate the 8 KB header bytes via the shared helper.
- *	    4. ftruncate to UNDO_SEGMENT_SIZE_BYTES.
- *	    5. pwrite block 0 + fsync + close + fsync parent dir.
- *	    6. Emit XLOG_UNDO_SEGMENT_INIT (RM_CLUSTER_UNDO) so crash recovery
- *	       reapplies the same byte layout if the page is lost.
+ *	    2. Ensure the parent directory and acquire live-owner current X.
+ *	    3. Load an existing exact header without writing, or reserve an
+ *	       unpublished frame and private temporary file for an absent segment.
+ *	    4. Initialize that frame and emit/flush XLOG_UNDO_SEGMENT_INIT.
+ *	    5. Write/fsync the complete temp, publish without replacement, fsync
+ *	       the parent, then make the resident image visible. Invalid existing
+ *	       files fail closed; no online truncate/repair is performed.
  *
  *	  spec-3.4b D2 unlock: the previous Stage 1.22 single-node restriction
  *	  (owner_instance must equal 1) is removed.  The remaining restriction
  *	  is "owner_instance == cluster_node_id + 1" so a node never writes
  *	  another node's segment directory.
  *
- *	  Caller MUST NOT be inside a critical section: function emits WAL
- *	  via XLogInsert + may ereport(ERROR) on validation / I/O failures.
+ *	  Caller MUST NOT hold lifecycle_lock or be inside a critical section:
+ *	  current acquisition can wait, WAL is emitted, and failures may ERROR.
  */
 extern void cluster_undo_segment_allocate(uint32 segment_id, uint8 owner_instance);
 
@@ -227,7 +228,8 @@ typedef struct ClusterUndoSegmentExtendPlan {
 	uint32 generation;
 	bool needs_reuse;
 	bool at_hard_cap;
-	uint8 reserved[6];
+	bool needs_provision;
+	uint8 reserved[5];
 } ClusterUndoSegmentExtendPlan;
 
 StaticAssertDecl(sizeof(ClusterUndoSegmentExtendPlan) == 16,
@@ -235,9 +237,10 @@ StaticAssertDecl(sizeof(ClusterUndoSegmentExtendPlan) == 16,
 
 /*
  * Choose one fresh/available segment or
- * freeze an exact RECYCLABLE candidate.  The selector never performs the
- * generation-changing reuse transition; callers release lifecycle_lock and
- * run cluster_undo_segment_reuse_in_place() through 0xFB current authority.
+ * freeze an exact RECYCLABLE candidate. The selector never creates a file or
+ * performs the generation-changing reuse transition. Callers retain cursor
+ * ownership but release lifecycle_lock before first provision or reuse
+ * through current authority, then revalidate the selected image.
  */
 extern bool cluster_undo_segment_extend_or_create(
 	uint8 owner_instance, ClusterUndoSegmentExtendPlan *plan);

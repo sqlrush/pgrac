@@ -781,11 +781,17 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id pg_attribute_unused(),
 	return true;
 }
 
+static uint32 g_read_block_absent_once_segment;
+
 bool
 cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(), uint32 segment_id,
 							 uint8 owner_instance pg_attribute_unused(), uint32 block_no, char *buf)
 {
 	g_read_block_calls++;
+	if (segment_id == g_read_block_absent_once_segment) {
+		g_read_block_absent_once_segment = 0;
+		return false;
+	}
 	if (!g_read_block_ok || buf == NULL || block_no != 0
 		|| segment_id != g_canned_block_segment)
 		return false; /* other segments "don't exist" -> by-xid skips them */
@@ -2531,6 +2537,58 @@ UT_TEST(test_locate_any_state_incomplete_scan_fails_closed)
 	g_unreadable_existing_segment = 0;
 }
 
+/* The initial open can precede a complete first publication while the later
+ * existence probe follows it. The scan must read that image, not skip it or
+ * call it unreadable based only on the earlier open. */
+UT_TEST(test_resolve_resamples_a_publication_crossing)
+{
+	SCN got = InvalidScn;
+	uint16 seg = 0;
+	uint16 slot = 0;
+
+	cluster_node_id = 0;
+	g_read_block_ok = true;
+	g_canned_block_segment = 1;
+	g_unreadable_existing_segment = 1;
+	g_read_block_absent_once_segment = 1;
+	memset(g_canned_block, 0, sizeof(g_canned_block));
+	seed_block_slot(3, TT_SLOT_COMMITTED, 12345, scn_encode(1, 77));
+	UT_ASSERT_EQ(cluster_tt_slot_durable_resolve_by_xid_origin(0, 12345, CLUSTER_TT_WRAP_ANY, &got,
+															   &seg, &slot, NULL),
+				 CLUSTER_TT_DURABLE_RESOLVED_SCN);
+	UT_ASSERT_EQ(got, scn_encode(1, 77));
+	UT_ASSERT_EQ(seg, 1);
+	UT_ASSERT_EQ(slot, 3);
+	g_unreadable_existing_segment = 0;
+}
+
+UT_TEST(test_locate_resamples_a_publication_crossing)
+{
+	const uint8 states[] = { TT_SLOT_ACTIVE, TT_SLOT_ABORTED };
+	size_t i;
+
+	for (i = 0; i < lengthof(states); i++) {
+		uint16 seg = 0;
+		uint16 slot = 0;
+		uint8 status = TT_SLOT_INVALID;
+
+		cluster_node_id = 0;
+		g_read_block_ok = true;
+		g_canned_block_segment = 1;
+		g_unreadable_existing_segment = 1;
+		g_read_block_absent_once_segment = 1;
+		memset(g_canned_block, 0, sizeof(g_canned_block));
+		seed_block_slot(6, states[i], 12345, InvalidScn);
+		UT_ASSERT_EQ(
+			cluster_tt_slot_durable_locate_any_by_xid_origin(0, 12345, &seg, &slot, NULL, &status),
+			CLUSTER_TT_DURABLE_LOCATE_FOUND);
+		UT_ASSERT_EQ(seg, 1);
+		UT_ASSERT_EQ(slot, 6);
+		UT_ASSERT_EQ(status, states[i]);
+		g_unreadable_existing_segment = 0;
+	}
+}
+
 
 /* ============================================================
  *	U6: cluster_undo_segment_tt_header_scan_pass (spec-3.13 D2-B,
@@ -2868,7 +2926,7 @@ UT_TEST(test_revert_delete_identity_mismatch_failclosed)
 int
 main(int argc, char **argv)
 {
-	UT_PLAN(95);
+	UT_PLAN(97);
 
 	UT_RUN(test_layout_sizes);
 
@@ -2942,6 +3000,8 @@ main(int argc, char **argv)
 	UT_RUN(test_locate_any_state_reports_active_exact_identity);
 	UT_RUN(test_locate_any_state_distinguishes_missing_and_ambiguous);
 	UT_RUN(test_locate_any_state_incomplete_scan_fails_closed);
+	UT_RUN(test_resolve_resamples_a_publication_crossing);
+	UT_RUN(test_locate_resamples_a_publication_crossing);
 
 	UT_RUN(test_scan_pass_classifies_inventory);
 	UT_RUN(test_scan_pass_writes_nothing);

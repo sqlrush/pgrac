@@ -3,6 +3,8 @@
  * test_cluster_undo_block0_current.c
  *	  Watched tests for the Candidate-2 cooperative block0 current guard.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #define USE_PGRAC_CLUSTER 1
@@ -155,6 +157,12 @@ static ClusterUndoBlock0Result fake_frame_result;
 static ClusterUndoBlock0Result fake_provision_result;
 static ClusterUndoBlock0Generation fake_provision_generation;
 static bool fake_provision_creator;
+static bool fake_init_invalidates_authority;
+static bool fake_publish_throws;
+static int init_wal_calls;
+static int provision_publish_calls;
+static int init_wal_event;
+static int provision_publish_event;
 static pg_on_exit_callback fake_exit_callback;
 static bool fake_exit_lifo_ok;
 static int smgr_exit_hook_ensure_calls;
@@ -1021,6 +1029,37 @@ cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin)
 		pin->slot = -1;
 }
 
+XLogRecPtr
+cluster_undo_emit_segment_init(uint8 owner, uint32 segment_id, const char *page)
+{
+	const UndoSegmentHeaderData *header = (const UndoSegmentHeaderData *)page;
+
+	init_wal_calls++;
+	init_wal_event = ++event_sequence;
+	UT_ASSERT_EQ(owner, 1);
+	UT_ASSERT_EQ(segment_id, 1);
+	UT_ASSERT_EQ(header->segment_id, 1);
+	UT_ASSERT_EQ(header->owner_instance, 1);
+	UT_ASSERT_EQ(header->segment_state, SEGMENT_ALLOCATED);
+	UT_ASSERT_EQ(header->wrap_count, 0);
+	if (fake_init_invalidates_authority)
+		fake_admission_recheck = false;
+	return UINT64_C(0x1000060);
+}
+
+void
+cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr lsn)
+{
+	provision_publish_calls++;
+	provision_publish_event = ++event_sequence;
+	UT_ASSERT_EQ(lsn, UINT64_C(0x1000060));
+	UT_ASSERT_EQ(pin->mode, CLUSTER_UNDO_BLOCK0_EXCLUSIVE);
+	UT_ASSERT_EQ(pin->proof.kind, CLUSTER_UNDO_BLOCK0_LIVE_OWNER);
+	if (fake_publish_throws)
+		siglongjmp(*PG_exception_stack, 1);
+	pin->observed_generation = (ClusterUndoBlock0Generation){ true, 0 };
+}
+
 static ClusterUndoBlock0LogicalKey
 test_key(uint8 owner_instance)
 {
@@ -1096,6 +1135,9 @@ reset_fixture(void)
 	fake_provision_result = CLUSTER_UNDO_BLOCK0_OK;
 	fake_provision_generation = (ClusterUndoBlock0Generation){ true, 4 };
 	fake_provision_creator = false;
+	fake_init_invalidates_authority = fake_publish_throws = false;
+	init_wal_calls = provision_publish_calls = 0;
+	init_wal_event = provision_publish_event = 0;
 	memset(fake_pin_page, 0x6b, sizeof(fake_pin_page));
 	memset(fake_disk_page, 0x6b, sizeof(fake_disk_page));
 	fake_exit_callback = current_exit_hook_registered ? current_backend_exit : NULL;
@@ -1784,6 +1826,105 @@ UT_TEST(test_live_owner_resident_absent_or_invalid_generation_fails_closed)
 	UT_ASSERT_EQ(unpin_calls, 1);
 	UT_ASSERT(unpin_event < local_release_event);
 	UT_ASSERT(local_release_event < semantic_leave_event);
+}
+
+UT_TEST(test_first_provision_owns_current_and_unpublished_frame_before_wal)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	int side;
+
+	for (side = 0; side < 2; side++) {
+		reset_fixture();
+		fake_master = cluster_node_id;
+		fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+		fake_modifier_side
+			= side == 0 ? CLUSTER_SEMANTIC_SOURCE_SIDE : CLUSTER_SEMANTIC_TARGET_SIDE;
+		fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		fake_provision_creator = true;
+		UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_provision(&key, 1000),
+					 CLUSTER_UNDO_BLOCK0_OK);
+		UT_ASSERT_EQ(init_wal_calls, 1);
+		UT_ASSERT_EQ(provision_publish_calls, 1);
+		UT_ASSERT_EQ(provision_abort_calls, 0);
+		UT_ASSERT_EQ(unpin_calls, 1);
+		UT_ASSERT(reserve_event < provision_event);
+		UT_ASSERT(provision_event < init_wal_event);
+		UT_ASSERT(init_wal_event < provision_publish_event);
+		UT_ASSERT(provision_publish_event < unpin_event);
+		UT_ASSERT(unpin_event < local_release_event);
+	}
+}
+
+UT_TEST(test_first_provision_existing_image_is_never_reinitialized)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	char before[BLCKSZ];
+
+	reset_fixture();
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	memcpy(before, fake_pin_page, BLCKSZ);
+	UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_provision(&key, 1000),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(init_wal_calls, 0);
+	UT_ASSERT_EQ(provision_publish_calls, 0);
+	UT_ASSERT_EQ(memcmp(before, fake_pin_page, BLCKSZ), 0);
+	UT_ASSERT_EQ(unpin_calls, 1);
+}
+
+UT_TEST(test_first_provision_refusal_preserves_final_path_and_releases_owner)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	int cause;
+
+	for (cause = 0; cause < 3; cause++) {
+		reset_fixture();
+		fake_master = cluster_node_id;
+		fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+		fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		fake_provision_creator = true;
+		if (cause == 0)
+			fake_root_resolve_success_limit = 1;
+		else if (cause == 1)
+			fake_init_invalidates_authority = true;
+		else
+			fake_provision_result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
+		UT_ASSERT_EQ(cluster_undo_block0_current_live_owner_provision(&key, 1000),
+					 cause == 2 ? CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH
+								: CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+		UT_ASSERT_EQ(provision_publish_calls, 0);
+		UT_ASSERT_EQ(provision_abort_calls, cause == 2 ? 0 : 1);
+		UT_ASSERT_EQ(unpin_calls, 0);
+		UT_ASSERT_EQ(semantic_leave_calls, 1);
+	}
+}
+
+UT_TEST(test_first_provision_error_aborts_private_image_before_current_cleanup)
+{
+	ClusterUndoBlock0LogicalKey key = test_key(1);
+	volatile bool caught = false;
+
+	reset_fixture();
+	fake_master = cluster_node_id;
+	fake_grant_action = CLUSTER_GRD_GRANT_NOW;
+	fake_sample_result = CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+	fake_provision_creator = true;
+	fake_publish_throws = true;
+	PG_TRY();
+	{
+		(void)cluster_undo_block0_current_live_owner_provision(&key, 1000);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(provision_abort_calls, 1);
+	UT_ASSERT_EQ(unpin_calls, 0);
+	UT_ASSERT_EQ(semantic_leave_calls, 1);
+	UT_ASSERT(provision_publish_event < provision_abort_event);
 }
 
 UT_TEST(test_pending_poll_is_pure_nonblocking_and_keeps_correlation)
@@ -3594,7 +3735,11 @@ UT_TEST(test_readiness_denial_names_first_false_gate_without_side_effects)
 int
 main(void)
 {
-	UT_PLAN(85);
+	UT_PLAN(89);
+	UT_RUN(test_first_provision_owns_current_and_unpublished_frame_before_wal);
+	UT_RUN(test_first_provision_existing_image_is_never_reinitialized);
+	UT_RUN(test_first_provision_refusal_preserves_final_path_and_releases_owner);
+	UT_RUN(test_first_provision_error_aborts_private_image_before_current_cleanup);
 	UT_RUN(test_cold_live_owner_reuse_loads_existing_header_under_same_xcur);
 	UT_RUN(test_cold_reuse_retains_absence_generation_io_and_authority_negatives);
 	UT_RUN(test_ordinary_xcur_cold_sample_does_not_gain_live_owner_loading);

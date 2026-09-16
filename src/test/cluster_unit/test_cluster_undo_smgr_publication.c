@@ -3,6 +3,8 @@
  * test_cluster_undo_smgr_publication.c
  *    Unit tests for the Spec 8.4A first-publication storage seam.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -44,6 +46,34 @@ static int product_close_fail_on_call = 0;
 static bool free_dir_forced_error = false;
 static bool basic_open_swap_to_symlink = false;
 static char basic_open_swap_target[MAXPGPATH];
+
+/* Backend path helpers are linked from libpgport_srv. An unexpected ERROR
+ * must fail this standalone fixture, never become an accepted I/O result. */
+bool
+errstart_cold(int level, const char *domain)
+{
+	return true;
+}
+int
+errcode(int code)
+{
+	return 0;
+}
+int
+errmsg(const char *fmt, ...)
+{
+	return 0;
+}
+int
+errmsg_internal(const char *fmt, ...)
+{
+	return 0;
+}
+void
+errfinish(const char *file, int line, const char *function)
+{
+	abort();
+}
 
 void cluster_undo_record_note_smgr_open(void) {}
 void cluster_undo_record_note_smgr_close(void) {}

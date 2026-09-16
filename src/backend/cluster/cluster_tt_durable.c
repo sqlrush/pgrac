@@ -1974,6 +1974,25 @@ cluster_tt_recovery_classify_revert(bool is_delete_record, bool record_xid_abort
 	return CLUSTER_TT_REVERT_APPLY;
 }
 
+/* A failed open and the following existence probe are separate observations.
+ * A complete segment may be published between them. Read that image once
+ * before declaring the scan incomplete; never skip an existing unreadable
+ * segment or treat the earlier absence as a terminal transaction proof. */
+static bool
+durable_scan_read_header(uint8 owner, uint32 segment_id, char block[BLCKSZ], bool *scan_complete)
+{
+	ClusterUndoPathIntent intent = cluster_undo_intent_for_owner(owner);
+
+	if (cluster_undo_smgr_read_block(intent, segment_id, owner, 0, block))
+		return true;
+	if (!cluster_undo_segment_file_exists(owner, segment_id))
+		return false;
+	if (cluster_undo_smgr_read_block(intent, segment_id, owner, 0, block))
+		return true;
+	*scan_complete = false;
+	return false;
+}
+
 /*
  * cluster_tt_slot_durable_resolve_by_xid_origin -- spec-4.5a G6 (P1 #2): the
  * origin-qualified durable by-xid scan.  A materialized foreign read cannot
@@ -2047,13 +2066,8 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 		UndoSegmentHeaderData *hdr;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner), segment_id, owner,
-										  0, blockbuf.data)) {
-			/* absent segment -> sound skip; existing+unreadable -> incomplete. */
-			if (cluster_undo_segment_file_exists(owner, segment_id))
-				scan_complete = false;
+		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete))
 			continue;
-		}
 
 		hdr = (UndoSegmentHeaderData *)blockbuf.data;
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
@@ -2126,13 +2140,8 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
 		const UndoSegmentHeaderData *header;
 		uint16 i;
 
-		if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(owner),
-				segment_id, owner, 0, blockbuf.data))
-		{
-			if (cluster_undo_segment_file_exists(owner, segment_id))
-				scan_complete = false;
+		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete))
 			continue;
-		}
 		header = (const UndoSegmentHeaderData *) blockbuf.data;
 		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
 		{

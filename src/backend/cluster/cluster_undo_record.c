@@ -1379,11 +1379,9 @@ claim_retry_locked:
 		bool selected = false;
 
 		/*
-		 * PGRAC (spec-3.18 D7): attribute the autoextend file-create + fsync I/O
-		 * (the lifecycle_lock-held slow path) to a dedicated wait event so a
-		 * backend blocked extending undo is visible in pg_stat_activity.  Only
-		 * the I/O is wrapped -- the lifecycle_lock acquire is already attributed
-		 * to its LWLock tranche (A1: no double-attribution of the lock wait).
+		 * Attribute the candidate's header probes to the extent claim. First
+		 * publication and reuse run separately after releasing lifecycle_lock;
+		 * that lock's own wait is already attributed to its LWLock tranche.
 		 */
 		pgstat_report_wait_start(WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM);
 		PG_TRY();
@@ -1410,15 +1408,19 @@ claim_retry_locked:
 			return extend_plan.at_hard_cap ? CLAIM_HARD_CAP : CLAIM_FS_FAIL;
 		}
 		new_seg = extend_plan.segment_id;
-		if (extend_plan.needs_reuse) {
+		if (extend_plan.needs_reuse || extend_plan.needs_provision) {
 			/* 0xFB XCUR may wait or perform I/O.  Freeze the exact candidate
 			 * under lifecycle_lock, then release it before the transition. */
 			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 			pgstat_report_wait_start(WAIT_EVENT_CLUSTER_UNDO_EXTENT_CLAIM);
 			PG_TRY();
 			{
-				reused = cluster_undo_segment_reuse_in_place(new_seg, owner_instance,
-															 extend_plan.generation);
+				if (extend_plan.needs_provision) {
+					cluster_undo_segment_allocate(new_seg, owner_instance);
+					reused = new_seg;
+				} else
+					reused = cluster_undo_segment_reuse_in_place(new_seg, owner_instance,
+																 extend_plan.generation);
 			}
 			PG_CATCH();
 			{
@@ -1437,6 +1439,9 @@ claim_retry_locked:
 			if (cluster_undo_segment_read_state(new_seg, owner_instance) == (uint8)SEGMENT_ACTIVE)
 				goto claim_retry_locked;
 			if (reused == 0
+				|| (extend_plan.needs_provision
+					&& cluster_undo_segment_generation(new_seg, owner_instance)
+						   != extend_plan.generation)
 				|| cluster_undo_segment_read_state(new_seg, owner_instance)
 					   != (uint8)SEGMENT_ALLOCATED) {
 				LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
@@ -3569,12 +3574,16 @@ rollover_retry_locked:
 		return 0;
 	}
 	new_segment_id = extend_plan.segment_id;
-	if (extend_plan.needs_reuse) {
+	if (extend_plan.needs_reuse || extend_plan.needs_provision) {
 		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
 		PG_TRY();
 		{
-			reused = cluster_undo_segment_reuse_in_place(new_segment_id, owner_instance,
-														 extend_plan.generation);
+			if (extend_plan.needs_provision) {
+				cluster_undo_segment_allocate(new_segment_id, owner_instance);
+				reused = new_segment_id;
+			} else
+				reused = cluster_undo_segment_reuse_in_place(new_segment_id, owner_instance,
+															 extend_plan.generation);
 		}
 		PG_CATCH();
 		{
@@ -3594,6 +3603,9 @@ rollover_retry_locked:
 			== (uint8)SEGMENT_ACTIVE)
 			goto rollover_retry_locked;
 		if (reused == 0
+			|| (extend_plan.needs_provision
+				&& cluster_undo_segment_generation(new_segment_id, owner_instance)
+					   != extend_plan.generation)
 			|| cluster_undo_segment_read_state(new_segment_id, owner_instance)
 				   != (uint8)SEGMENT_ALLOCATED) {
 			pg_atomic_fetch_add_u64(&UndoRecordShared->tt_rollover_fail_extend_count, 1);
