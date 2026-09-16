@@ -6,6 +6,8 @@ Author: SqlRush <sqlrush@gmail.com>
 
 [v0.130.0-mvp.1 — MVP 1](v0.130.0-mvp.1.md) is the first MVP baseline.
 It is an evaluation prerelease, not a production or general-availability release.
+Its release notes explicitly retain the outstanding CI limitation; that
+snapshot-specific publication does not waive stable-release qualification.
 
 ## Identifying a release
 
