@@ -61,6 +61,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
 		test_cluster_undo_record test_cluster_undo_lifecycle test_cluster_undo_block0 test_cluster_undo_block0_current test_cluster_undo_smgr_publication test_cluster_terminal_ref_census test_cluster_cr test_cluster_cr_cache test_cluster_cr_key test_cluster_cr_pool test_cluster_cr_lifecycle test_cluster_cr_admit test_cluster_cr_admit_stat test_cluster_cr_tuple test_cluster_cr_tuple_stat test_cluster_resolver_cache test_cluster_cr_coordinator test_cluster_r4_static_model test_cluster_r4_tx_locator test_cluster_r4_tx_outcome test_cluster_r4_tx_enqueue test_cluster_r4_wire_codec test_cluster_r4_route_policy test_cluster_r4_slot_machine test_cluster_r4_lms_controls test_cluster_r4_slot_reservation test_cluster_r4_observe test_cluster_r4_cr_walk test_cluster_r4_multi_subx_2pc test_cluster_r4_activation_record test_cluster_r4_activation_fsm test_cluster_r4_lock_order test_cluster_r4_scratch_resolver test_cluster_tt_durable test_cluster_terminal_authority test_cluster_sf_dep \
+        test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
         test_cluster_wal_thread test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
@@ -4599,6 +4600,23 @@ test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 		$(CLUSTER_R4_HEAPTUPLE_TEST_O) $(CLUSTER_WRITER_CHAIN_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(CLUSTER_HOT_PRUNE_TEST_O) $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_HOT_HORIZON_O) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
+		$(top_builddir)/src/common/libpgcommon_srv.a \
+		$(top_builddir)/src/port/libpgport_srv.a -o $@
+
+# PGRAC: keep the real terminal-only resolver in the ITL capacity consumer
+# test. Origin responses and TX wakeups are controlled by the fixture.
+test_cluster_r4_itl_capacity: test_cluster_r4_itl_capacity.c test_cluster_r4_lock_order.c \
+		unit_test.h cluster_r4_activation_test_stubs.h \
+		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
+		$(CLUSTER_R4_MULTI_RESOLVE_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_CR_APPLY_O) \
+		$(CLUSTER_VIS_VERDICT_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(CLUSTER_R4_MULTI_RESOLVE_TEST_O) $(CLUSTER_R4_HOT_HEAPAM_TEST_O) \
+		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_UNDO_BLOCK0_O) $(CLUSTER_CR_APPLY_O) \
+		$(CLUSTER_VIS_VERDICT_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(top_builddir)/src/port/libpgport_srv.a -o $@
 

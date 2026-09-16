@@ -1162,6 +1162,12 @@ cluster_multixact_current_successor_provenance_well_formed(
 		&& locator->tt_wrap == TT_WRAP_INVALID;
 }
 
+static ClusterTxOutcome ut_itl_resolve_fixture(const ClusterTxLocator *locator,
+											   ClusterTxResolveMode mode,
+											   const ClusterSemanticAdmissionToken *admission,
+											   ClusterTxResolution *out,
+											   ClusterTxResolveReason *reason_out);
+
 ClusterTxOutcome
 cluster_tx_resolve_exact(const ClusterTxLocator *locator,
 					 ClusterTxResolveMode mode,
@@ -1170,6 +1176,10 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator,
 {
 	ClusterTxOutcome outcome;
 
+	if (ut_itl_census_active && !ut_writer_target_fixture) {
+		UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
+		return ut_itl_resolve_fixture(locator, mode, NULL, out, reason_out);
+	}
 	UT_ASSERT(ut_writer_target_fixture);
 	UT_ASSERT(!ut_hot_content_lock_held);
 	UT_ASSERT_EQ(semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
@@ -1224,26 +1234,28 @@ cluster_tx_resolve_terminal_census_batch_preflight(void)
 	ut_itl_census_preflight_calls++;
 }
 
-ClusterTxOutcome
-cluster_tx_resolve_exact_admitted(
-	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out)
+static ClusterTxOutcome
+ut_itl_resolve_fixture(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+					   const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
+					   ClusterTxResolveReason *reason_out)
 {
 	ClusterTxOutcome outcome;
 
 	UT_ASSERT(ut_itl_census_active);
-	UT_ASSERT_NOT_NULL(admission);
-	UT_ASSERT(admission->entered);
-	UT_ASSERT_EQ(admission->record_generation, UINT64_C(73));
+	if (mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS) {
+		UT_ASSERT_NOT_NULL(admission);
+		UT_ASSERT(admission->entered);
+		UT_ASSERT_EQ(admission->record_generation, UINT64_C(73));
+		if (ut_itl_census_admission == NULL)
+			ut_itl_census_admission = admission;
+		else
+			UT_ASSERT(admission == ut_itl_census_admission);
+	} else
+		UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_VISIBILITY);
 	UT_ASSERT_EQ(pg_atomic_read_u32(
 		&ut_itl_census_semantic.inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0]), 1);
 	UT_ASSERT_EQ(semantic_activation_local_inflight
 		[CLUSTER_SEMANTIC_TARGET_SIDE][0], 1);
-	if (ut_itl_census_admission == NULL)
-		ut_itl_census_admission = admission;
-	else
-		UT_ASSERT(admission == ut_itl_census_admission);
 	if (ut_itl_pair_active)
 	{
 		UT_ASSERT(!ut_itl_pair_content_lock_held[0]);
@@ -1251,7 +1263,6 @@ cluster_tx_resolve_exact_admitted(
 	}
 	else
 		UT_ASSERT(!ut_hot_content_lock_held);
-	UT_ASSERT_EQ(mode, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS);
 	UT_ASSERT(locator->itl_slot_index < CLUSTER_ITL_INITRANS_DEFAULT);
 	UT_ASSERT_EQ(locator->tt_wrap, TT_WRAP_INVALID);
 	if (ut_itl_census_mutate_wrap && ut_itl_census_resolve_calls == 0)
@@ -1340,6 +1351,14 @@ cluster_tx_resolve_exact_admitted(
 		? CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE
 		: CLUSTER_TX_RESOLVE_NONE;
 	return outcome;
+}
+
+ClusterTxOutcome
+cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+								  const ClusterSemanticAdmissionToken *admission,
+								  ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+{
+	return ut_itl_resolve_fixture(locator, mode, admission, out, reason_out);
 }
 
 ClusterTxOutcome

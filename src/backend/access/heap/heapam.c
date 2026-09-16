@@ -1251,8 +1251,7 @@ cluster_heap_itl_census_validate_terminal(
 }
 
 static void
-cluster_heap_itl_resolve_terminal_census(
-	ClusterHeapItlTerminalCensus *census)
+cluster_heap_itl_resolve_census(ClusterHeapItlTerminalCensus *census, bool capacity_wait)
 {
 	uint8 i;
 
@@ -1268,12 +1267,21 @@ cluster_heap_itl_resolve_terminal_census(
 			continue;
 		}
 		census->attempted_mask |= CLUSTER_HEAP_ITL_SLOT_BIT(i);
-		if (census->slots[i].flags == ITL_FLAG_NEEDS_CLEANOUT)
+		if (capacity_wait)
+			/* Capacity consumes an exact active blocker, never a cleanout
+			 * permission. Enter ordinary TARGET admission through the existing
+			 * visibility resolver; terminal-only census cannot publish ACTIVE.
+			 * This copied observation is never applied to the heap page. */
+			census->outcomes[i]
+				= cluster_tx_resolve_exact(&census->locators[i], CLUSTER_TX_RESOLVE_VISIBILITY,
+										   &census->resolutions[i], &reason);
+		if (census->slots[i].flags == ITL_FLAG_NEEDS_CLEANOUT
+			&& (!capacity_wait || census->outcomes[i] == CLUSTER_TX_UNKNOWN))
 			census->outcomes[i]
 				= cluster_tx_resolve_terminal_census_retained_admitted(
 					&census->locators[i], census->slots[i].commit_scn,
 					&census->admission, &census->resolutions[i], &reason);
-		else
+		else if (!capacity_wait)
 			census->outcomes[i] = cluster_tx_resolve_exact_admitted(
 				&census->locators[i], CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
 				&census->admission, &census->resolutions[i], &reason);
@@ -1293,6 +1301,12 @@ cluster_heap_itl_resolve_terminal_census(
 	cluster_heap_test_itl_last_terminal_mask = census->terminal_mask;
 	cluster_heap_test_itl_last_terminal_count = census->terminal_count;
 #endif
+}
+
+static void
+cluster_heap_itl_resolve_terminal_census(ClusterHeapItlTerminalCensus *census)
+{
+	cluster_heap_itl_resolve_census(census, false);
 }
 
 static ClusterHeapItlTerminalBatchApplyResult
@@ -1648,7 +1662,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	}
 	PG_TRY();
 	{
-		cluster_heap_itl_resolve_terminal_census(&census);
+		cluster_heap_itl_resolve_census(&census, true);
 		for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 			uint8 flags = census.slots[i].flags;
 			const ClusterTxResolution *resolution = &census.resolutions[i];
