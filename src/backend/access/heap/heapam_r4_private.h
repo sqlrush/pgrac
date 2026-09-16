@@ -10,6 +10,8 @@
  * Portions Copyright (c) 1994, Regents of the University of California
  * Portions Copyright (c) 2026, pgrac contributors
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  * IDENTIFICATION
  *	  src/backend/access/heap/heapam_r4_private.h
  *
@@ -129,6 +131,41 @@ typedef enum HeapHotSearchResultKind
 	HEAP_HOT_SEARCH_OWNED_CURRENT
 } HeapHotSearchResultKind;
 
+#ifdef USE_PGRAC_CLUSTER
+/* Backend-private observations only; never inputs to visibility policy. */
+#define CLUSTER_R4_SCRATCH_TRACE_CAPACITY 8
+
+typedef struct ClusterR4ScratchVerdict {
+	bool sampled;
+	ClusterVisEvidence evidence;
+	ClusterTTStatus status;
+	SCN commit_scn;
+	bool is_bound;
+	ClusterUndoTTSlotRef ref;
+} ClusterR4ScratchVerdict;
+
+typedef struct ClusterR4ScratchObservation {
+	OffsetNumber offset;
+	TransactionId xmin;
+	TransactionId xmax;
+	uint16 infomask;
+	uint16 infomask2;
+	uint8 creator_slot;
+	uint8 writer_slot;
+	bool complete;
+	bool visible;
+	ClusterR4ScratchVerdict creator;
+	ClusterR4ScratchVerdict deleter;
+} ClusterR4ScratchObservation;
+
+typedef struct ClusterR4ScratchTrace {
+	uint32 total;
+	ClusterR4ScratchObservation items[CLUSTER_R4_SCRATCH_TRACE_CAPACITY];
+} ClusterR4ScratchTrace;
+
+extern bool cluster_heap_r4_trace_format(const ClusterR4ScratchTrace *trace, char *out, Size size);
+#endif
+
 typedef struct HeapHotSearchResult
 {
 	HeapHotSearchResultKind kind;
@@ -136,6 +173,7 @@ typedef struct HeapHotSearchResult
 #ifdef USE_PGRAC_CLUSTER
 	bool		remote_xmax_wait;
 	ClusterTxLocator remote_wait_locator;
+	ClusterR4ScratchTrace visibility_trace;
 #endif
 	char scratch_page[BLCKSZ] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 } HeapHotSearchResult;
@@ -149,6 +187,9 @@ typedef struct ClusterR4HotScratchTestContext
 	bool already_full;
 	bool allow_hint;
 	bool allow_cleanout;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterR4ScratchTrace *visibility_trace;
+#endif
 } ClusterR4HotScratchTestContext;
 
 typedef void (*ClusterR4HotLockTestHook)(void *arg, bool acquire);

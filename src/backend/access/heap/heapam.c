@@ -4775,6 +4775,7 @@ heap_hot_r4_search_scratch(const BufferTag *tag,
 	context.already_full = true;
 	context.allow_hint = false;
 	context.allow_cleanout = false;
+	context.visibility_trace = &result->visibility_trace;
 
 	for (;;)
 	{
@@ -4914,12 +4915,14 @@ heap_hot_r4_miss_item(Page page, OffsetNumber offnum, char *out, Size size)
 /* Inputs are still SHARE-locked or request-owned. No visibility is resolved. */
 static void
 heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
-					const ItemPointerData *root, OffsetNumber last,
-					Page full, bool all_dead)
+					 const ItemPointerData *root, OffsetNumber last, Page full, bool all_dead,
+					 const ClusterR4ScratchTrace *trace)
 {
 	BufferTag tag;
 	Page current;
 	char current_root[256], current_last[256], full_root[256], full_last[256];
+	char decisions[4096];
+	bool trace_complete;
 	OffsetNumber root_off = ItemPointerGetOffsetNumber(root);
 
 	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC
@@ -4933,6 +4936,7 @@ heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
 	heap_hot_r4_miss_item(current, last, current_last, sizeof(current_last));
 	heap_hot_r4_miss_item(full, root_off, full_root, sizeof(full_root));
 	heap_hot_r4_miss_item(full, last, full_last, sizeof(full_last));
+	trace_complete = cluster_heap_r4_trace_format(trace, decisions, sizeof(decisions));
 	ereport(LOG,
 			(errmsg("R4 heap selection miss"),
 			 errdetail("PGRAC_FAMILY=R4_SELECTION PGRAC_REASON=%s node=%d "
@@ -4940,15 +4944,16 @@ heap_hot_r4_log_miss(Relation relation, Buffer buffer, Snapshot snapshot,
 					   "read_scn=" UINT64_FORMAT " epoch=" UINT64_FORMAT " all_dead=%d "
 					   "current_lsn=" UINT64_FORMAT " current_scn=" UINT64_FORMAT " "
 					   "full_lsn=" UINT64_FORMAT " full_scn=" UINT64_FORMAT " "
-					   "current_root={%s} current_last={%s} full_root={%s} full_last={%s}",
+					   "current_root={%s} current_last={%s} full_root={%s} full_last={%s} "
+					   "trace_complete=%d decisions={%s}",
 					   full != NULL ? "FULL_NOT_FOUND" : "LIVE_NOT_FOUND", cluster_node_id,
 					   tag.spcOid, tag.dbOid, tag.relNumber, tag.forkNum, tag.blockNum,
-					   ItemPointerGetBlockNumber(root), root_off, last,
-					   (uint64) snapshot->read_scn, (uint64) snapshot->read_epoch, all_dead,
-					   (uint64) PageGetLSN(current), (uint64) ((PageHeader) current)->pd_block_scn,
-					   full != NULL ? (uint64) PageGetLSN(full) : 0,
-					   full != NULL ? (uint64) ((PageHeader) full)->pd_block_scn : 0,
-					   current_root, current_last, full_root, full_last)));
+					   ItemPointerGetBlockNumber(root), root_off, last, (uint64)snapshot->read_scn,
+					   (uint64)snapshot->read_epoch, all_dead, (uint64)PageGetLSN(current),
+					   (uint64)((PageHeader)current)->pd_block_scn,
+					   full != NULL ? (uint64)PageGetLSN(full) : 0,
+					   full != NULL ? (uint64)((PageHeader)full)->pd_block_scn : 0, current_root,
+					   current_last, full_root, full_last, trace_complete, decisions)));
 }
 
 /*
@@ -5182,10 +5187,11 @@ restart_live_search:
 					if (all_dead)
 						*all_dead = false;
 					heap_hot_r4_log_miss(relation, buffer, snapshot, &logical_root,
-						ItemPointerIsValid(&result->tuple.t_self)
-						? ItemPointerGetOffsetNumber(&result->tuple.t_self)
-						: ItemPointerGetOffsetNumber(&logical_root),
-						(Page) result->scratch_page, false);
+										 ItemPointerIsValid(&result->tuple.t_self)
+											 ? ItemPointerGetOffsetNumber(&result->tuple.t_self)
+											 : ItemPointerGetOffsetNumber(&logical_root),
+										 (Page)result->scratch_page, false,
+										 &result->visibility_trace);
 					return HEAP_HOT_SEARCH_NOT_FOUND;
 				}
 
@@ -5290,8 +5296,8 @@ restart_live_search:
 	result->kind = HEAP_HOT_SEARCH_NOT_FOUND;
 #ifdef USE_PGRAC_CLUSTER
 	if (first_call)
-		heap_hot_r4_log_miss(relation, buffer, snapshot, &logical_root, offnum,
-							NULL, all_dead != NULL && *all_dead);
+		heap_hot_r4_log_miss(relation, buffer, snapshot, &logical_root, offnum, NULL,
+							 all_dead != NULL && *all_dead, NULL);
 #endif
 	return result->kind;
 }

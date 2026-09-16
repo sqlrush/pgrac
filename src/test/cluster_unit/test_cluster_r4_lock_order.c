@@ -3,6 +3,8 @@
  * test_cluster_r4_lock_order.c
  *	  Control-plane wait-for and held-lock policy tests for R4 D13.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #define USE_CLUSTER_UNIT 1
@@ -191,6 +193,17 @@ cluster_normal_stop_peer_receipt_tail(
 	const ClusterSemanticActivationRecord *open pg_attribute_unused(),
 	const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] pg_attribute_unused(),
 	int peer pg_attribute_unused(), uint64 incarnation pg_attribute_unused())
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+/* Online HOT tests must not obtain membership from a normal-stop receipt. */
+bool
+cluster_reconfig_normal_stop_snapshot_admitted_membership(
+	const ClusterSemanticActivationRecord *open pg_attribute_unused(),
+	const uint8 *root pg_attribute_unused(), uint64 *lo pg_attribute_unused(),
+	uint64 *hi pg_attribute_unused(), uint64 *epoch pg_attribute_unused())
 {
 	UT_ASSERT(false);
 	return false;
@@ -3675,6 +3688,15 @@ ut_full_three_versions_case(int scenario)
 	UT_ASSERT_EQ(caught, expect_error);
 	UT_ASSERT_EQ(kind, expect_error ? HEAP_HOT_SEARCH_NOT_FOUND : HEAP_HOT_SEARCH_OWNED_SCRATCH);
 	if (!caught) {
+		uint32 observations = expected_member - (scenario == 3 ? 1 : 0);
+		const ClusterR4ScratchObservation *last;
+
+		/* Only the requalified FULL attempt survives the fixture's first
+		 * live-page drift. These are actual walker/evaluator observations. */
+		UT_ASSERT_EQ(result.visibility_trace.total, observations);
+		last = &result.visibility_trace.items[observations - 1];
+		UT_ASSERT(last->complete && last->visible);
+		UT_ASSERT_EQ(last->offset, expected_member);
 		UT_ASSERT_EQ(ut_scratch_history_resolves, 2 * proofs_per_full);
 		if (scenario == 0)
 			for (int i = 0; i < 8; i++)
@@ -7012,7 +7034,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(134);
+	UT_PLAN(136);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);

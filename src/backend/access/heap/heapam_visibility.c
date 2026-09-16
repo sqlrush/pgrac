@@ -63,6 +63,7 @@
  *
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
+ *	  Preserve request-owned scratch verdict metadata for selection-miss logs.
  *
  *	  Cluster MVCC visibility fork: tuples carrying cluster ITL evidence are
  *	  resolved through the cluster TT/undo authority instead of native
@@ -2033,6 +2034,92 @@ cluster_r4_scratch_creator_slot(Page page, uint8 writer_index, TransactionId xmi
 	return writer_index;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* Observe already validated private bytes; no authority or page mutation. */
+static ClusterR4ScratchObservation *
+cluster_r4_scratch_observe(const ClusterR4HotScratchTestContext *context, HeapTuple tuple)
+{
+	ClusterR4ScratchTrace *trace = context->visibility_trace;
+	ClusterR4ScratchObservation *entry;
+
+	if (trace == NULL)
+		return NULL;
+	entry = &trace->items[trace->total++ % CLUSTER_R4_SCRATCH_TRACE_CAPACITY];
+	memset(entry, 0, sizeof(*entry));
+	entry->offset = ItemPointerGetOffsetNumber(&tuple->t_self);
+	entry->xmin = HeapTupleHeaderGetRawXmin(tuple->t_data);
+	entry->xmax = HeapTupleHeaderGetRawXmax(tuple->t_data);
+	entry->infomask = tuple->t_data->t_infomask;
+	entry->infomask2 = tuple->t_data->t_infomask2;
+	entry->creator_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
+	entry->writer_slot = tuple->t_data->t_itl_slot_idx;
+	return entry;
+}
+
+static void
+cluster_r4_scratch_observe_verdict(ClusterR4ScratchVerdict *target,
+								   const ClusterVisResolve *resolved)
+{
+	target->sampled = true;
+	target->evidence = resolved->evidence;
+	target->status = resolved->status;
+	target->commit_scn = resolved->commit_scn;
+	target->is_bound = resolved->commit_scn_is_bound;
+	target->ref = resolved->ref;
+}
+
+static bool
+cluster_r4_scratch_return(ClusterR4ScratchObservation *entry, bool visible)
+{
+	if (entry != NULL) {
+		entry->complete = true;
+		entry->visible = visible;
+	}
+	return visible;
+}
+
+/* Format only retained scalars. Truncation is evidence loss, never a verdict. */
+bool
+cluster_heap_r4_trace_format(const ClusterR4ScratchTrace *trace, char *out, Size size)
+{
+	uint32 kept = trace == NULL ? 0 : Min(trace->total, CLUSTER_R4_SCRATCH_TRACE_CAPACITY);
+	uint32 total = trace == NULL ? 0 : trace->total;
+	Size used;
+	int written;
+	uint32 i;
+
+	if (out == NULL || size == 0)
+		return false;
+	written = snprintf(out, size, "total=%u kept=%u", total, kept);
+	if (written < 0 || (Size)written >= size)
+		return false;
+	used = written;
+	for (i = 0; i < kept; i++) {
+		const ClusterR4ScratchObservation *entry
+			= &trace->items[(total - kept + i) % CLUSTER_R4_SCRATCH_TRACE_CAPACITY];
+		const ClusterR4ScratchVerdict *a = &entry->creator;
+		const ClusterR4ScratchVerdict *b = &entry->deleter;
+
+		written = snprintf(
+			out + used, size - used,
+			";off=%u,xid=%u/%u,mask=%u/%u,slot=%u/%u,done=%d,visible=%d"
+			",xmin={sample=%d,ev=%d,status=%d,scn=" UINT64_FORMAT ",bound=%d,ref=%u/%u/%u/%u/%u}"
+			",xmax={sample=%d,ev=%d,status=%d,scn=" UINT64_FORMAT ",bound=%d,ref=%u/%u/%u/%u/%u}",
+			entry->offset, entry->xmin, entry->xmax, entry->infomask, entry->infomask2,
+			entry->creator_slot, entry->writer_slot, entry->complete, entry->visible, a->sampled,
+			a->evidence, a->status, (uint64)a->commit_scn, a->is_bound, a->ref.origin_node_id,
+			a->ref.undo_segment_id, a->ref.tt_slot_id, a->ref.cluster_epoch, a->ref.local_xid,
+			b->sampled, b->evidence, b->status, (uint64)b->commit_scn, b->is_bound,
+			b->ref.origin_node_id, b->ref.undo_segment_id, b->ref.tt_slot_id, b->ref.cluster_epoch,
+			b->ref.local_xid);
+		if (written < 0 || (Size)written >= size - used)
+			return false;
+		used += written;
+	}
+	return true;
+}
+#endif
+
 /*
  * HeapTupleSatisfiesMVCCScratch
  *
@@ -2056,6 +2143,7 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 	const ClusterItlSlotData *itl_slot;
 	ClusterVisResolve resolved;
 	ClusterVisibilityDecision decision;
+	ClusterR4ScratchObservation *observation;
 	TransactionId raw_xmin;
 	TransactionId raw_xmax;
 	char	   *tuple_start;
@@ -2098,6 +2186,7 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 		|| ItemPointerGetBlockNumber(&context->logical_root) != context->tag.blockNum)
 		cluster_r4_scratch_visibility_unknown(InvalidTransactionId,
 										  "malformed or cross-block scratch tuple");
+	observation = cluster_r4_scratch_observe(context, htup);
 
 	/* A frozen creator is already proved by the immutable tuple flags.
 	 * Its raw xmin is historical data; its former DATA slot may be reused.
@@ -2107,6 +2196,8 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 		if (!TransactionIdIsNormal(raw_xmin))
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin is not a normal xid");
 		creator_index = cluster_r4_scratch_creator_slot(page, tuple->t_itl_slot_idx, raw_xmin);
+		if (observation != NULL)
+			observation->creator_slot = creator_index;
 		if (creator_index >= CLUSTER_ITL_INITRANS_DEFAULT)
 			cluster_r4_scratch_visibility_unknown(raw_xmin, "scratch xmin has no DATA ITL slot");
 
@@ -2119,6 +2210,8 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 
 		cluster_visibility_resolve_scratch_scn(page, creator_index, raw_xmin, snapshot->read_scn,
 											   &resolved);
+		if (observation != NULL)
+			cluster_r4_scratch_observe_verdict(&observation->creator, &resolved);
 		if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
 			cluster_r4_scratch_visibility_unknown(
 				raw_xmin, resolved.diagnostic_reason != NULL
@@ -2133,14 +2226,14 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 		case CLUSTER_TT_STATUS_ABORTED:
 		case CLUSTER_TT_STATUS_IN_PROGRESS:
 		case CLUSTER_TT_STATUS_SUBCOMMITTED:
-			return false;
+			return cluster_r4_scratch_return(observation, false);
 
 		case CLUSTER_TT_STATUS_COMMITTED:
 		case CLUSTER_TT_STATUS_CLEANED_OUT:
 			decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
 													 snapshot->read_scn);
 			if (decision == CLUSTER_VISIBILITY_INVISIBLE)
-				return false;
+				return cluster_r4_scratch_return(observation, false);
 			if (decision != CLUSTER_VISIBILITY_VISIBLE)
 				cluster_r4_scratch_visibility_unknown(raw_xmin,
 											  "scratch xmin commit SCN is not comparable to the read SCN");
@@ -2153,11 +2246,11 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 
 	/* A reconstructed pre-update image normally has no deleting xmax. */
 	if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0)
-		return true;
+		return cluster_r4_scratch_return(observation, true);
 
 	/* Row locks do not delete the tuple and need no native MultiXact lookup. */
 	if (HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask))
-		return true;
+		return cluster_r4_scratch_return(observation, true);
 
 	raw_xmax = HeapTupleHeaderGetRawXmax(tuple);
 	if (!TransactionIdIsNormal(raw_xmax)
@@ -2182,6 +2275,8 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 
 	cluster_visibility_resolve_scratch_scn(page, tuple->t_itl_slot_idx, raw_xmax,
 										   snapshot->read_scn, &resolved);
+	if (observation != NULL)
+		cluster_r4_scratch_observe_verdict(&observation->deleter, &resolved);
 	if (resolved.evidence != CLUSTER_VIS_EVIDENCE_REMOTE)
 		cluster_r4_scratch_visibility_unknown(
 			raw_xmax, resolved.diagnostic_reason != NULL
@@ -2197,16 +2292,16 @@ HeapTupleSatisfiesMVCCScratch(HeapTuple htup, Snapshot snapshot,
 		case CLUSTER_TT_STATUS_ABORTED:
 		case CLUSTER_TT_STATUS_IN_PROGRESS:
 		case CLUSTER_TT_STATUS_SUBCOMMITTED:
-			return true;
+			return cluster_r4_scratch_return(observation, true);
 
 		case CLUSTER_TT_STATUS_COMMITTED:
 		case CLUSTER_TT_STATUS_CLEANED_OUT:
 			decision = cluster_visibility_decide_by_scn(resolved.commit_scn,
 													 snapshot->read_scn);
 			if (decision == CLUSTER_VISIBILITY_VISIBLE)
-				return false;
+				return cluster_r4_scratch_return(observation, false);
 			if (decision == CLUSTER_VISIBILITY_INVISIBLE)
-				return true;
+				return cluster_r4_scratch_return(observation, true);
 			break;
 
 		default:

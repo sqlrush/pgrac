@@ -1716,6 +1716,7 @@ ut_full_scratch_case_with_role(bool deleting, bool local_origin, int scenario, i
 	HeapTupleData tuple = { 0 };
 	SnapshotData snapshot = { 0 };
 	ClusterR4HotScratchTestContext context = { 0 };
+	ClusterR4ScratchTrace trace = { 0 };
 	HeapTupleHeader header;
 	ClusterItlSlotData *slot;
 	PageHeader page_header;
@@ -1843,6 +1844,7 @@ ut_full_scratch_case_with_role(bool deleting, bool local_origin, int scenario, i
 	context.read_scn = snapshot.read_scn;
 	context.logical_root = tuple.t_self;
 	context.tag.blockNum = 0;
+	context.visibility_trace = &trace;
 	memcpy(before.data, ut_visibility_page.data, BLCKSZ);
 	ut_error_armed = true;
 	PG_TRY();
@@ -1895,6 +1897,33 @@ ut_full_scratch_case_with_role(bool deleting, bool local_origin, int scenario, i
 	UT_ASSERT_EQ(ut_native_calls, 0);
 	UT_ASSERT_EQ(ut_hint_mutations, 0);
 	UT_ASSERT_EQ(memcmp(before.data, ut_visibility_page.data, BLCKSZ), 0);
+	if (!caught) {
+		const ClusterR4ScratchObservation *entry = &trace.items[0];
+		const ClusterR4ScratchVerdict *verdict = deleting ? &entry->deleter : &entry->creator;
+
+		UT_ASSERT_EQ(trace.total, 1);
+		UT_ASSERT(entry->complete);
+		UT_ASSERT_EQ(entry->visible, visible);
+		UT_ASSERT_EQ(entry->offset, 1);
+		UT_ASSERT_EQ(entry->xmin, UT_RAW_XID);
+		UT_ASSERT_EQ(entry->xmax, deleting ? UT_RAW_XID : InvalidTransactionId);
+		UT_ASSERT(verdict->sampled);
+		UT_ASSERT_EQ(verdict->evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
+		UT_ASSERT_EQ(deleting ? entry->creator.sampled : entry->deleter.sampled, false);
+		if (scenario == 0 || scenario == 12 || scenario == 30) {
+			UT_ASSERT_EQ(verdict->status, CLUSTER_TT_STATUS_COMMITTED);
+			UT_ASSERT_EQ(verdict->commit_scn, UT_COMMIT_SCN);
+			UT_ASSERT(!verdict->is_bound);
+		} else if (scenario == 3 || scenario == 22 || scenario == 31) {
+			UT_ASSERT_EQ(verdict->status, CLUSTER_TT_STATUS_COMMITTED);
+			UT_ASSERT_EQ(verdict->commit_scn, UT_READ_SCN + 1);
+		} else if (scenario == 1 || scenario == 32) {
+			UT_ASSERT_EQ(verdict->status, CLUSTER_TT_STATUS_ABORTED);
+		} else if (scenario == 16 || scenario == 26 || scenario == 33) {
+			UT_ASSERT(verdict->is_bound);
+			UT_ASSERT_EQ(verdict->commit_scn, UT_COMMIT_SCN);
+		}
+	}
 }
 
 static void
@@ -2061,10 +2090,88 @@ UT_TEST(test_full_scratch_history_never_uses_free_or_multixact_role)
 				ut_full_scratch_case_with_role(deleting, origin, 30, roles[i]);
 }
 
+UT_TEST(test_full_scratch_trace_wrap_keeps_last_decisions_without_io)
+{
+	struct {
+		uint64 before;
+		ClusterR4ScratchTrace trace;
+		uint64 after;
+	} guarded = { .before = 1234567, .after = 7654321 };
+	HeapTupleData tuple = { 0 };
+	SnapshotData snapshot = { 0 };
+	ClusterR4HotScratchTestContext context = { 0 };
+	HeapTupleHeader header;
+	int calls;
+	uint32 i;
+	char rendered[4096];
+	char marker[40];
+
+	ut_full_scratch_exact_case(false, true, 0);
+	header = (HeapTupleHeader)(ut_visibility_page.data + 1024);
+	header->t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+	tuple.t_data = header;
+	tuple.t_len = SizeofHeapTupleHeader;
+	ItemPointerSet(&tuple.t_self, 0, 1);
+	snapshot.snapshot_type = SNAPSHOT_MVCC;
+	snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+	snapshot.read_scn = UT_READ_SCN;
+	context.scratch_page = ut_visibility_page.data;
+	context.logical_root = tuple.t_self;
+	context.already_full = true;
+	context.read_scn = UT_READ_SCN;
+	context.visibility_trace = &guarded.trace;
+	calls = ut_calls.exact_resolve + ut_calls.pair_resolve + ut_origin_asks;
+	for (i = 0; i < 11; i++) {
+		HeapTupleHeaderSetXmin(header, UT_RAW_XID + i);
+		UT_ASSERT(HeapTupleSatisfiesMVCCScratch(&tuple, &snapshot, &context));
+	}
+	UT_ASSERT_EQ(guarded.trace.total, 11);
+	UT_ASSERT_EQ(guarded.before, 1234567);
+	UT_ASSERT_EQ(guarded.after, 7654321);
+	for (i = 3; i < 11; i++) {
+		const ClusterR4ScratchObservation *entry = &guarded.trace.items[i % 8];
+
+		UT_ASSERT_EQ(entry->xmin, UT_RAW_XID + i);
+		UT_ASSERT(entry->visible && entry->complete);
+		UT_ASSERT(!entry->creator.sampled && !entry->deleter.sampled);
+	}
+	UT_ASSERT_EQ(ut_calls.exact_resolve + ut_calls.pair_resolve + ut_origin_asks, calls);
+	UT_ASSERT(cluster_heap_r4_trace_format(&guarded.trace, rendered, sizeof(rendered)));
+	UT_ASSERT(strncmp(rendered, "total=11 kept=8;", 16) == 0);
+	snprintf(marker, sizeof(marker), "xid=%u/", UT_RAW_XID + 3);
+	UT_ASSERT(strstr(rendered, marker) != NULL);
+	snprintf(marker, sizeof(marker), "xid=%u/", UT_RAW_XID + 2);
+	UT_ASSERT(strstr(rendered, marker) == NULL);
+	context.visibility_trace = NULL;
+	UT_ASSERT(HeapTupleSatisfiesMVCCScratch(&tuple, &snapshot, &context));
+	UT_ASSERT_EQ(guarded.trace.total, 11);
+}
+
+UT_TEST(test_full_scratch_trace_formatter_reports_truncation_without_overrun)
+{
+	ClusterR4ScratchTrace trace = { 0 };
+	char output[32];
+
+	memset(output, 'X', sizeof(output));
+	UT_ASSERT(!cluster_heap_r4_trace_format(&trace, output, 0));
+	UT_ASSERT_EQ(output[0], 'X');
+	UT_ASSERT(!cluster_heap_r4_trace_format(&trace, output, 5));
+	UT_ASSERT_EQ(output[4], '\0');
+	UT_ASSERT_EQ(output[5], 'X');
+	UT_ASSERT(cluster_heap_r4_trace_format(NULL, output, sizeof(output)));
+	UT_ASSERT(strcmp(output, "total=0 kept=0") == 0);
+	trace.total = 1;
+	UT_ASSERT(!cluster_heap_r4_trace_format(&trace, output, 20));
+	UT_ASSERT_EQ(output[19], '\0');
+	UT_ASSERT(!cluster_heap_r4_trace_format(&trace, NULL, 10));
+}
+
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(40);
+	UT_RUN(test_full_scratch_trace_wrap_keeps_last_decisions_without_io);
+	UT_RUN(test_full_scratch_trace_formatter_reports_truncation_without_overrun);
 	UT_RUN(test_full_scratch_recycled_lock_roles_use_only_original_terminal_proof);
 	UT_RUN(test_full_scratch_history_never_uses_free_or_multixact_role);
 	UT_RUN(test_full_scratch_consumer_does_not_turn_an_upper_bound_into_after_read_commit);
