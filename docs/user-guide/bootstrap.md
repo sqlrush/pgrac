@@ -1,5 +1,8 @@
 # Bootstrap a node
 
+> MVP 1 用户请优先阅读[固定版本部署手册](../mvp/v0.130.0-mvp.1/01-linux-four-node-deployment.md)。下文含历史示例，不能作为当前四节点共享数据库的完整部署步骤；MVP 标签的 OpenSSL 构建与多主机接入边界见新手册。
+
+
 Once the [install](install.md) is complete, the `pgrac-init` and
 `pgrac-start` shell tools provide a one-command path to creating a
 PostgreSQL data directory with cluster-aware configuration and
