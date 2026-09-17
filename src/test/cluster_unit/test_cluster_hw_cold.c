@@ -13,10 +13,16 @@ int allocation_stop_fixture_main(void);
 
 /* This suite qualifies HW in isolation. Its actual Startup tail must leave
  * the separately tested normal-TT producer untouched in EXISTING_OTHER. */
-ClusterNormalStartState cluster_semantic_normal_start_state(void)
-{ return CLUSTER_NORMAL_START_EXISTING_OTHER; }
-bool cluster_semantic_normal_start_finish(const char **failure)
-{ abort(); }
+ClusterNormalStartState
+cluster_semantic_normal_start_state(void)
+{
+	return CLUSTER_NORMAL_START_EXISTING_OTHER;
+}
+bool
+cluster_semantic_normal_start_finish(const char **failure)
+{
+	abort();
+}
 
 AuxProcType MyAuxProcType = StartupProcess;
 static char cold_root[] = "/tmp/pgrac-hw-cold-XXXXXX";

@@ -28,8 +28,7 @@
 #include "cluster/cluster_recovery_duty.h"
 
 bool
-cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty,
-									 ClusterResId *out)
+cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty, ClusterResId *out)
 {
 	ClusterResId encoded;
 

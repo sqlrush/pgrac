@@ -1090,8 +1090,7 @@ UT_TEST(test_spec74_drain_retries_only_exact_not_admitted_peer)
 	UT_ASSERT_EQ(test_unicast_calls[1], 1);
 	UT_ASSERT_EQ(test_unicast_calls[2], 0);
 	UT_ASSERT_EQ(test_unicast_last_len[1], test_fanout_last_len);
-	UT_ASSERT(memcmp(test_unicast_last_payload[1], test_fanout_last_payload,
-					 test_fanout_last_len)
+	UT_ASSERT(memcmp(test_unicast_last_payload[1], test_fanout_last_payload, test_fanout_last_len)
 			  == 0);
 
 	/* Once every live peer accepts the latest frontier, no duplicate

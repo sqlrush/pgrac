@@ -24,8 +24,7 @@ replacement_episode_phase_valid(uint8 phase)
 }
 
 static bool
-replacement_episode_bitmap_empty(
-	const uint8 bitmap[CLUSTER_REPLACEMENT_EPISODE_BITMAP_BYTES])
+replacement_episode_bitmap_empty(const uint8 bitmap[CLUSTER_REPLACEMENT_EPISODE_BITMAP_BYTES])
 {
 	int i;
 
@@ -37,8 +36,8 @@ replacement_episode_bitmap_empty(
 }
 
 static bool
-replacement_episode_bitmap_has(
-	const uint8 bitmap[CLUSTER_REPLACEMENT_EPISODE_BITMAP_BYTES], int32 node_id)
+replacement_episode_bitmap_has(const uint8 bitmap[CLUSTER_REPLACEMENT_EPISODE_BITMAP_BYTES],
+							   int32 node_id)
 {
 	return (bitmap[node_id / 8] & (uint8)(1u << (node_id % 8))) != 0;
 }
@@ -58,7 +57,7 @@ replacement_episode_acks_bounded(const ClusterReplacementEpisode *episode)
 bool
 cluster_replacement_episode_is_empty(const ClusterReplacementEpisode *episode)
 {
-	static const ClusterReplacementEpisode empty_episode = {0};
+	static const ClusterReplacementEpisode empty_episode = { 0 };
 
 	return episode != NULL && memcmp(episode, &empty_episode, sizeof(*episode)) == 0;
 }
@@ -80,17 +79,15 @@ cluster_replacement_episode_is_valid(const ClusterReplacementEpisode *episode)
 		|| episode->fresh_incarnation <= episode->old_admitted_incarnation
 		|| episode->baseline_epoch == UINT64_MAX
 		|| episode->reserved_or_committed_epoch != episode->baseline_epoch + 1
-		|| episode->grammar_fingerprint
-			   != CLUSTER_REPLACEMENT_EPISODE_GRAMMAR_FINGERPRINT)
+		|| episode->grammar_fingerprint != CLUSTER_REPLACEMENT_EPISODE_GRAMMAR_FINGERPRINT)
 		return false;
 
 	if (!replacement_episode_node_valid(episode->target_node_id)
 		|| !replacement_episode_node_valid(episode->coordinator_node_id)
 		|| replacement_episode_bitmap_empty(episode->expected_survivors)
-		|| replacement_episode_bitmap_has(episode->expected_survivors,
-									  episode->target_node_id)
+		|| replacement_episode_bitmap_has(episode->expected_survivors, episode->target_node_id)
 		|| !replacement_episode_bitmap_has(episode->expected_survivors,
-									   episode->coordinator_node_id)
+										   episode->coordinator_node_id)
 		|| !replacement_episode_acks_bounded(episode))
 		return false;
 

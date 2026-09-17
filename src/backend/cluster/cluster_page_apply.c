@@ -35,26 +35,23 @@ cluster_page_mutation_admission(const ClusterPageMutationAdmission *admission)
 	 * never a temporary-failure-to-skip conversion. */
 	if (admission == NULL)
 		return false;
-	return admission->duty_root_ok && admission->recoverer_active_ok
-		&& admission->fence_ok && admission->serialization_ok
-		&& admission->source_proof_fresh && admission->working_version_exact
-		&& admission->retention_covers;
+	return admission->duty_root_ok && admission->recoverer_active_ok && admission->fence_ok
+		   && admission->serialization_ok && admission->source_proof_fresh
+		   && admission->working_version_exact && admission->retention_covers;
 }
 
 static ClusterPageSequenceResult
-cluster_page_sequence_fail(ClusterPageRecoveryState state,
-						   ClusterPageRecoveryOutcome outcome)
+cluster_page_sequence_fail(ClusterPageRecoveryState state, ClusterPageRecoveryOutcome outcome)
 {
 	ClusterPageSequenceResult r;
 
-	r.state = state;			/* unchanged: no advance past a failed gate */
+	r.state = state; /* unchanged: no advance past a failed gate */
 	r.outcome = outcome;
 	return r;
 }
 
 ClusterPageSequenceResult
-cluster_page_apply_step_durability(ClusterPageRecoveryState state,
-								   bool durable_ok)
+cluster_page_apply_step_durability(ClusterPageRecoveryState state, bool durable_ok)
 {
 	ClusterPageSequenceResult r;
 
@@ -73,8 +70,7 @@ cluster_page_apply_step_durability(ClusterPageRecoveryState state,
 }
 
 ClusterPageSequenceResult
-cluster_page_apply_step_post_read(ClusterPageRecoveryState state,
-								  bool post_read_ok)
+cluster_page_apply_step_post_read(ClusterPageRecoveryState state, bool post_read_ok)
 {
 	ClusterPageSequenceResult r;
 
@@ -92,8 +88,7 @@ cluster_page_apply_step_post_read(ClusterPageRecoveryState state,
 }
 
 ClusterPageSequenceResult
-cluster_page_apply_step_authority(ClusterPageRecoveryState state,
-								  bool authority_ok)
+cluster_page_apply_step_authority(ClusterPageRecoveryState state, bool authority_ok)
 {
 	ClusterPageSequenceResult r;
 
@@ -126,43 +121,42 @@ cluster_page_apply_midwrite_cut(void)
 ClusterPageRecoveryOutcome
 cluster_page_crash_matrix_verdict(ClusterPageCrashCut cut)
 {
-	switch (cut)
-	{
-		case CLUSTER_PAGE_CUT_BEFORE_SOURCE_PROOF:
-			/* §7.7: no trusted state -> rebuild the source census;
+	switch (cut) {
+	case CLUSTER_PAGE_CUT_BEFORE_SOURCE_PROOF:
+		/* §7.7: no trusted state -> rebuild the source census;
 			 * mutation=0. */
-			return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
+		return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
 
-		case CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF:
-			/* Ephemeral proof only: the successor re-censuses and never
+	case CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF:
+		/* Ephemeral proof only: the successor re-censuses and never
 			 * adopts the predecessor-local plan (D3′). */
-			return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
+		return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
 
-		case CLUSTER_PAGE_CUT_DURING_TARGET_WRITE:
-			/* Target may be torn: STOP-RF-PAGE-STABLE-BASE. */
-			return CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED;
+	case CLUSTER_PAGE_CUT_DURING_TARGET_WRITE:
+		/* Target may be torn: STOP-RF-PAGE-STABLE-BASE. */
+		return CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED;
 
-		case CLUSTER_PAGE_CUT_AFTER_WRITE_BEFORE_DURABILITY:
-			/* Non-durable/untrusted target: rebuild or BLOCKED. */
-			return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
+	case CLUSTER_PAGE_CUT_AFTER_WRITE_BEFORE_DURABILITY:
+		/* Non-durable/untrusted target: rebuild or BLOCKED. */
+		return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
 
-		case CLUSTER_PAGE_CUT_AFTER_DURABILITY_BEFORE_POST_READ:
-			/* Durable but unverified bytes: fresh post-read; failure =>
+	case CLUSTER_PAGE_CUT_AFTER_DURABILITY_BEFORE_POST_READ:
+		/* Durable but unverified bytes: fresh post-read; failure =>
 			 * rebuild/BLOCKED. */
-			return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
+		return CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE;
 
-		case CLUSTER_PAGE_CUT_AFTER_POST_READ_BEFORE_RELEASE:
-			/* Durable result re-verifiable: authority revalidate then
+	case CLUSTER_PAGE_CUT_AFTER_POST_READ_BEFORE_RELEASE:
+		/* Durable result re-verifiable: authority revalidate then
 			 * exact release (PU-29). */
-			return CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY;
+		return CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY;
 
-		case CLUSTER_PAGE_CUT_AFTER_RELEASE:
-			/* Resource ready only; redo retirement stays RF-ROOT
+	case CLUSTER_PAGE_CUT_AFTER_RELEASE:
+		/* Resource ready only; redo retirement stays RF-ROOT
 			 * FND-10's decision — never implied by the release. */
-			return CLUSTER_PAGE_OUTCOME_APPLY;
+		return CLUSTER_PAGE_OUTCOME_APPLY;
 
-		default:
-			/* Unknown cut: fail closed. */
-			return CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS;
+	default:
+		/* Unknown cut: fail closed. */
+		return CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS;
 	}
 }

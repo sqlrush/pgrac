@@ -30,16 +30,14 @@ epoch_ballot_get_le16(const uint8 *in)
 static uint32
 epoch_ballot_get_le32(const uint8 *in)
 {
-	return (uint32)in[0] | ((uint32)in[1] << 8)
-		   | ((uint32)in[2] << 16) | ((uint32)in[3] << 24);
+	return (uint32)in[0] | ((uint32)in[1] << 8) | ((uint32)in[2] << 16) | ((uint32)in[3] << 24);
 }
 
 
 static uint64
 epoch_ballot_get_le64(const uint8 *in)
 {
-	return (uint64)epoch_ballot_get_le32(in)
-		   | ((uint64)epoch_ballot_get_le32(in + 4) << 32);
+	return (uint64)epoch_ballot_get_le32(in) | ((uint64)epoch_ballot_get_le32(in + 4) << 32);
 }
 
 
@@ -91,16 +89,14 @@ epoch_ballot_bytes_zero(const void *bytes, Size size)
 
 
 static bool
-epoch_ballot_bitmap_empty(
-	const uint8 bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES])
+epoch_ballot_bitmap_empty(const uint8 bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES])
 {
 	return epoch_ballot_bytes_zero(bitmap, CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
 }
 
 
 static int
-epoch_ballot_bitmap_count(
-	const uint8 bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES])
+epoch_ballot_bitmap_count(const uint8 bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES])
 {
 	int count = 0;
 	int i;
@@ -118,8 +114,7 @@ epoch_ballot_bitmap_count(
 
 
 static bool
-epoch_ballot_bitmap_has(
-	const uint8 bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES], int32 node_id)
+epoch_ballot_bitmap_has(const uint8 bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES], int32 node_id)
 {
 	return epoch_ballot_node_valid(node_id)
 		   && (bitmap[node_id / 8] & (uint8)(1u << (node_id % 8))) != 0;
@@ -149,10 +144,8 @@ bool
 cluster_epoch_ballot_id_is_valid(const ClusterEpochBallotId *ballot)
 {
 	return ballot != NULL && ballot->counter != 0
-		   && epoch_ballot_node_valid(ballot->proposer_node_id)
-		   && ballot->reserved == 0
-		   && ballot->proposer_admitted_incarnation != 0
-		   && ballot->nonce != 0;
+		   && epoch_ballot_node_valid(ballot->proposer_node_id) && ballot->reserved == 0
+		   && ballot->proposer_admitted_incarnation != 0 && ballot->nonce != 0;
 }
 
 
@@ -167,8 +160,7 @@ cluster_epoch_ballot_id_encode(const ClusterEpochBallotId *ballot,
 	memset(image, 0, sizeof(image));
 	epoch_ballot_put_le64(image + 0, ballot->counter);
 	epoch_ballot_put_le32(image + 8, (uint32)ballot->proposer_node_id);
-	epoch_ballot_put_le64(image + 16,
-						  ballot->proposer_admitted_incarnation);
+	epoch_ballot_put_le64(image + 16, ballot->proposer_admitted_incarnation);
 	epoch_ballot_put_le64(image + 24, ballot->nonce);
 	memcpy(out, image, sizeof(image));
 	return true;
@@ -176,8 +168,8 @@ cluster_epoch_ballot_id_encode(const ClusterEpochBallotId *ballot,
 
 
 bool
-cluster_epoch_ballot_id_decode(
-	const uint8 bytes[CLUSTER_EPOCH_BALLOT_ID_BYTES], ClusterEpochBallotId *out)
+cluster_epoch_ballot_id_decode(const uint8 bytes[CLUSTER_EPOCH_BALLOT_ID_BYTES],
+							   ClusterEpochBallotId *out)
 {
 	ClusterEpochBallotId decoded;
 
@@ -197,15 +189,14 @@ cluster_epoch_ballot_id_decode(
 
 
 int
-cluster_epoch_ballot_id_compare(const ClusterEpochBallotId *a,
-							const ClusterEpochBallotId *b)
+cluster_epoch_ballot_id_compare(const ClusterEpochBallotId *a, const ClusterEpochBallotId *b)
 {
-#define EPOCH_BALLOT_CMP_FIELD(field) \
-	do { \
-		if (a->field < b->field) \
-			return -1; \
-		if (a->field > b->field) \
-			return 1; \
+#define EPOCH_BALLOT_CMP_FIELD(field)                                                              \
+	do {                                                                                           \
+		if (a->field < b->field)                                                                   \
+			return -1;                                                                             \
+		if (a->field > b->field)                                                                   \
+			return 1;                                                                              \
 	} while (0)
 
 	Assert(a != NULL);
@@ -251,8 +242,7 @@ epoch_authority_target_matches_subject(const ClusterEpochAuthorityValue *value)
 	int subjects = epoch_ballot_bitmap_count(value->event_subject_bitmap);
 
 	if (subjects == 1)
-		return epoch_ballot_bitmap_has(value->event_subject_bitmap,
-									 value->target_node_id);
+		return epoch_ballot_bitmap_has(value->event_subject_bitmap, value->target_node_id);
 	if (subjects > 1)
 		return value->target_node_id == -1;
 	return false;
@@ -272,8 +262,7 @@ epoch_authority_event_identity_valid(const ClusterEpochAuthorityValue *value)
 	case CLUSTER_EPOCH_EVENT_NODE_REMOVE:
 		return value->old_incarnation != 0 && value->fresh_incarnation == 0;
 	case CLUSTER_EPOCH_EVENT_SAME_NODE_REPLACEMENT:
-		return value->old_incarnation != 0
-			   && value->fresh_incarnation > value->old_incarnation;
+		return value->old_incarnation != 0 && value->fresh_incarnation > value->old_incarnation;
 	default:
 		return false;
 	}
@@ -282,19 +271,16 @@ epoch_authority_event_identity_valid(const ClusterEpochAuthorityValue *value)
 
 bool
 cluster_epoch_authority_value_is_valid(const ClusterEpochAuthorityValue *value,
-									  uint64 expected_grammar_fingerprint)
+									   uint64 expected_grammar_fingerprint)
 {
 	bool genesis;
 
-	if (value == NULL
-		|| expected_grammar_fingerprint
-			   != CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT
+	if (value == NULL || expected_grammar_fingerprint != CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT
 		|| value->value_version != CLUSTER_EPOCH_AUTHORITY_VALUE_VERSION
 		|| !epoch_authority_transition_valid(value->transition)
 		|| !epoch_authority_event_kind_valid(value->event_kind)
 		|| !epoch_ballot_node_valid(value->request_origin_node)
-		|| (value->target_node_id != -1
-			&& !epoch_ballot_node_valid(value->target_node_id))
+		|| (value->target_node_id != -1 && !epoch_ballot_node_valid(value->target_node_id))
 		|| value->reserved0 != 0 || value->authority_generation == 0
 		|| epoch_ballot_bitmap_empty(value->authority_member_bitmap)
 		|| value->grammar_fingerprint != expected_grammar_fingerprint
@@ -305,14 +291,12 @@ cluster_epoch_authority_value_is_valid(const ClusterEpochAuthorityValue *value,
 	if (genesis != (value->event_kind == CLUSTER_EPOCH_EVENT_GENESIS))
 		return false;
 	if (genesis) {
-		return value->authority_generation == 1
-			   && value->baseline_epoch == value->reserved_epoch
-			   && value->target_node_id == 0
-			   && value->old_incarnation == 0 && value->fresh_incarnation == 0
-			   && value->request_nonce == 0
+		return value->authority_generation == 1 && value->baseline_epoch == value->reserved_epoch
+			   && value->target_node_id == 0 && value->old_incarnation == 0
+			   && value->fresh_incarnation == 0 && value->request_nonce == 0
 			   && epoch_ballot_bitmap_empty(value->event_subject_bitmap)
 			   && epoch_ballot_bytes_zero(value->predecessor_digest,
-									  sizeof(value->predecessor_digest));
+										  sizeof(value->predecessor_digest));
 	}
 
 	if (value->request_nonce == 0 || value->baseline_epoch == UINT64_MAX
@@ -340,26 +324,21 @@ epoch_authority_value_pack(const ClusterEpochAuthorityValue *value,
 	epoch_ballot_put_le64(image + 40, value->old_incarnation);
 	epoch_ballot_put_le64(image + 48, value->fresh_incarnation);
 	epoch_ballot_put_le64(image + 56, value->request_nonce);
-	memcpy(image + 64, value->authority_member_bitmap,
-		   CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
-	memcpy(image + 80, value->event_subject_bitmap,
-		   CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
+	memcpy(image + 64, value->authority_member_bitmap, CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
+	memcpy(image + 80, value->event_subject_bitmap, CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
 	epoch_ballot_put_le64(image + 96, value->grammar_fingerprint);
-	memcpy(image + 104, value->predecessor_digest,
-		   CLUSTER_EPOCH_BALLOT_DIGEST_BYTES);
+	memcpy(image + 104, value->predecessor_digest, CLUSTER_EPOCH_BALLOT_DIGEST_BYTES);
 }
 
 
 bool
-cluster_epoch_authority_value_encode(
-	const ClusterEpochAuthorityValue *value, uint64 expected_grammar_fingerprint,
-	uint8 out[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES])
+cluster_epoch_authority_value_encode(const ClusterEpochAuthorityValue *value,
+									 uint64 expected_grammar_fingerprint,
+									 uint8 out[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES])
 {
 	uint8 image[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES];
 
-	if (out == NULL
-		|| !cluster_epoch_authority_value_is_valid(
-			value, expected_grammar_fingerprint))
+	if (out == NULL || !cluster_epoch_authority_value_is_valid(value, expected_grammar_fingerprint))
 		return false;
 	epoch_authority_value_pack(value, image);
 	memcpy(out, image, sizeof(image));
@@ -368,9 +347,9 @@ cluster_epoch_authority_value_encode(
 
 
 bool
-cluster_epoch_authority_value_decode(
-	const uint8 bytes[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES],
-	uint64 expected_grammar_fingerprint, ClusterEpochAuthorityValue *out)
+cluster_epoch_authority_value_decode(const uint8 bytes[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES],
+									 uint64 expected_grammar_fingerprint,
+									 ClusterEpochAuthorityValue *out)
 {
 	ClusterEpochAuthorityValue decoded;
 
@@ -389,16 +368,12 @@ cluster_epoch_authority_value_decode(
 	decoded.old_incarnation = epoch_ballot_get_le64(bytes + 40);
 	decoded.fresh_incarnation = epoch_ballot_get_le64(bytes + 48);
 	decoded.request_nonce = epoch_ballot_get_le64(bytes + 56);
-	memcpy(decoded.authority_member_bitmap, bytes + 64,
-		   CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
-	memcpy(decoded.event_subject_bitmap, bytes + 80,
-		   CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
+	memcpy(decoded.authority_member_bitmap, bytes + 64, CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
+	memcpy(decoded.event_subject_bitmap, bytes + 80, CLUSTER_EPOCH_BALLOT_BITMAP_BYTES);
 	decoded.grammar_fingerprint = epoch_ballot_get_le64(bytes + 96);
-	memcpy(decoded.predecessor_digest, bytes + 104,
-		   CLUSTER_EPOCH_BALLOT_DIGEST_BYTES);
+	memcpy(decoded.predecessor_digest, bytes + 104, CLUSTER_EPOCH_BALLOT_DIGEST_BYTES);
 	memcpy(decoded.reserved1, bytes + 120, sizeof(decoded.reserved1));
-	if (!cluster_epoch_authority_value_is_valid(
-			&decoded, expected_grammar_fingerprint))
+	if (!cluster_epoch_authority_value_is_valid(&decoded, expected_grammar_fingerprint))
 		return false;
 	*out = decoded;
 	return true;
@@ -420,8 +395,7 @@ epoch_authority_value_zero(const ClusterEpochAuthorityValue *value)
 
 
 static bool
-epoch_ballot_pair_valid(const ClusterEpochBallotId *ballot,
-						const ClusterEpochAuthorityValue *value,
+epoch_ballot_pair_valid(const ClusterEpochBallotId *ballot, const ClusterEpochAuthorityValue *value,
 						uint64 expected_grammar_fingerprint)
 {
 	bool ballot_zero = epoch_ballot_id_zero(ballot);
@@ -432,22 +406,19 @@ epoch_ballot_pair_valid(const ClusterEpochBallotId *ballot,
 	if (ballot_zero)
 		return true;
 	return cluster_epoch_ballot_id_is_valid(ballot)
-		   && cluster_epoch_authority_value_is_valid(
-			   value, expected_grammar_fingerprint);
+		   && cluster_epoch_authority_value_is_valid(value, expected_grammar_fingerprint);
 }
 
 
 static bool
-epoch_ballot_same_id(const ClusterEpochBallotId *a,
-					 const ClusterEpochBallotId *b)
+epoch_ballot_same_id(const ClusterEpochBallotId *a, const ClusterEpochBallotId *b)
 {
 	return memcmp(a, b, sizeof(*a)) == 0;
 }
 
 
 static bool
-epoch_authority_same_value(const ClusterEpochAuthorityValue *a,
-						   const ClusterEpochAuthorityValue *b)
+epoch_authority_same_value(const ClusterEpochAuthorityValue *a, const ClusterEpochAuthorityValue *b)
 {
 	return memcmp(a, b, sizeof(*a)) == 0;
 }
@@ -464,40 +435,29 @@ epoch_ballot_lane_history_valid(const ClusterEpochBallotLane *lane,
 		|| lane->promised_ballot.proposer_node_id != lane->proposer_node_id
 		|| lane->promised_ballot.proposer_admitted_incarnation
 			   != lane->proposer_admitted_incarnation
-		|| !epoch_ballot_pair_valid(&lane->accepted_ballot,
-								&lane->accepted_value,
-								expected_grammar_fingerprint)
-		|| !epoch_ballot_pair_valid(&lane->settled_ballot,
-								&lane->settled_value,
-								expected_grammar_fingerprint))
+		|| !epoch_ballot_pair_valid(&lane->accepted_ballot, &lane->accepted_value,
+									expected_grammar_fingerprint)
+		|| !epoch_ballot_pair_valid(&lane->settled_ballot, &lane->settled_value,
+									expected_grammar_fingerprint))
+		return false;
+	if (!accepted_zero && lane->accepted_ballot.proposer_node_id != lane->proposer_node_id)
+		return false;
+	if (!settled_zero && lane->settled_ballot.proposer_node_id != lane->proposer_node_id)
 		return false;
 	if (!accepted_zero
-		&& lane->accepted_ballot.proposer_node_id != lane->proposer_node_id)
-		return false;
-	if (!settled_zero
-		&& lane->settled_ballot.proposer_node_id != lane->proposer_node_id)
-		return false;
-	if (!accepted_zero
-		&& cluster_epoch_ballot_id_compare(&lane->promised_ballot,
-										&lane->accepted_ballot) < 0)
+		&& cluster_epoch_ballot_id_compare(&lane->promised_ballot, &lane->accepted_ballot) < 0)
 		return false;
 	if (!accepted_zero && !settled_zero
-		&& cluster_epoch_ballot_id_compare(&lane->accepted_ballot,
-										&lane->settled_ballot) < 0)
+		&& cluster_epoch_ballot_id_compare(&lane->accepted_ballot, &lane->settled_ballot) < 0)
 		return false;
 	if (!accepted_zero && !settled_zero) {
-		if (epoch_ballot_same_id(&lane->accepted_ballot,
-							   &lane->settled_ballot)
-			&& !epoch_authority_same_value(&lane->accepted_value,
-										 &lane->settled_value))
+		if (epoch_ballot_same_id(&lane->accepted_ballot, &lane->settled_ballot)
+			&& !epoch_authority_same_value(&lane->accepted_value, &lane->settled_value))
 			return false;
-		if (lane->accepted_value.authority_generation
-			< lane->settled_value.authority_generation)
+		if (lane->accepted_value.authority_generation < lane->settled_value.authority_generation)
 			return false;
-		if (lane->accepted_value.authority_generation
-				== lane->settled_value.authority_generation
-			&& !epoch_authority_same_value(&lane->accepted_value,
-										 &lane->settled_value))
+		if (lane->accepted_value.authority_generation == lane->settled_value.authority_generation
+			&& !epoch_authority_same_value(&lane->accepted_value, &lane->settled_value))
 			return false;
 	}
 
@@ -506,16 +466,12 @@ epoch_ballot_lane_history_valid(const ClusterEpochBallotLane *lane,
 		return true;
 	case CLUSTER_EPOCH_BALLOT_PHASE_ACCEPTED:
 		return !accepted_zero
-			   && epoch_ballot_same_id(&lane->promised_ballot,
-								   &lane->accepted_ballot);
+			   && epoch_ballot_same_id(&lane->promised_ballot, &lane->accepted_ballot);
 	case CLUSTER_EPOCH_BALLOT_PHASE_SETTLED:
 		return !accepted_zero && !settled_zero
-			   && epoch_ballot_same_id(&lane->promised_ballot,
-								   &lane->accepted_ballot)
-			   && epoch_ballot_same_id(&lane->accepted_ballot,
-								   &lane->settled_ballot)
-			   && epoch_authority_same_value(&lane->accepted_value,
-										&lane->settled_value);
+			   && epoch_ballot_same_id(&lane->promised_ballot, &lane->accepted_ballot)
+			   && epoch_ballot_same_id(&lane->accepted_ballot, &lane->settled_ballot)
+			   && epoch_authority_same_value(&lane->accepted_value, &lane->settled_value);
 	default:
 		return false;
 	}
@@ -523,52 +479,47 @@ epoch_ballot_lane_history_valid(const ClusterEpochBallotLane *lane,
 
 
 bool
-cluster_epoch_ballot_lane_is_valid(
-	const ClusterEpochBallotLane *lane, int32 expected_proposer_node_id,
-	uint32 expected_configured_disk_count,
-	uint64 expected_proposer_admitted_incarnation,
-	uint64 expected_system_identifier, uint64 expected_grammar_fingerprint)
+cluster_epoch_ballot_lane_is_valid(const ClusterEpochBallotLane *lane,
+								   int32 expected_proposer_node_id,
+								   uint32 expected_configured_disk_count,
+								   uint64 expected_proposer_admitted_incarnation,
+								   uint64 expected_system_identifier,
+								   uint64 expected_grammar_fingerprint)
 {
 	if (lane == NULL || !epoch_ballot_node_valid(expected_proposer_node_id)
 		|| !epoch_ballot_disk_count_valid(expected_configured_disk_count)
-		|| expected_proposer_admitted_incarnation == 0
-		|| expected_system_identifier == 0
-		|| expected_grammar_fingerprint
-			   != CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT
+		|| expected_proposer_admitted_incarnation == 0 || expected_system_identifier == 0
+		|| expected_grammar_fingerprint != CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT
 		|| lane->magic != CLUSTER_EPOCH_BALLOT_MAGIC
 		|| lane->version != CLUSTER_EPOCH_BALLOT_VERSION
 		|| lane->last_write_phase < CLUSTER_EPOCH_BALLOT_PHASE_PROMISED
-		|| lane->last_write_phase > CLUSTER_EPOCH_BALLOT_PHASE_SETTLED
-		|| lane->flags != 0
+		|| lane->last_write_phase > CLUSTER_EPOCH_BALLOT_PHASE_SETTLED || lane->flags != 0
 		|| lane->proposer_node_id != expected_proposer_node_id
 		|| lane->configured_disk_count != expected_configured_disk_count
-		|| lane->proposer_admitted_incarnation
-			   != expected_proposer_admitted_incarnation
-		|| lane->lane_generation == 0
-		|| lane->system_identifier != expected_system_identifier
+		|| lane->proposer_admitted_incarnation != expected_proposer_admitted_incarnation
+		|| lane->lane_generation == 0 || lane->system_identifier != expected_system_identifier
 		|| lane->grammar_fingerprint != expected_grammar_fingerprint
 		|| !epoch_ballot_bytes_zero(lane->reserved, sizeof(lane->reserved)))
 		return false;
-	return epoch_ballot_lane_history_valid(lane,
-									   expected_grammar_fingerprint);
+	return epoch_ballot_lane_history_valid(lane, expected_grammar_fingerprint);
 }
 
 
 static bool
-epoch_ballot_id_pack(const ClusterEpochBallotId *ballot,
-					 uint8 image[CLUSTER_EPOCH_BALLOT_ID_BYTES])
+epoch_ballot_id_pack(const ClusterEpochBallotId *ballot, uint8 image[CLUSTER_EPOCH_BALLOT_ID_BYTES])
 {
 	return cluster_epoch_ballot_id_encode(ballot, image);
 }
 
 
 bool
-cluster_epoch_ballot_lane_encode(
-	const ClusterEpochBallotLane *lane, int32 expected_proposer_node_id,
-	uint32 expected_configured_disk_count,
-	uint64 expected_proposer_admitted_incarnation,
-	uint64 expected_system_identifier, uint64 expected_grammar_fingerprint,
-	uint8 out[CLUSTER_EPOCH_BALLOT_LANE_BYTES])
+cluster_epoch_ballot_lane_encode(const ClusterEpochBallotLane *lane,
+								 int32 expected_proposer_node_id,
+								 uint32 expected_configured_disk_count,
+								 uint64 expected_proposer_admitted_incarnation,
+								 uint64 expected_system_identifier,
+								 uint64 expected_grammar_fingerprint,
+								 uint8 out[CLUSTER_EPOCH_BALLOT_LANE_BYTES])
 {
 	uint8 image[CLUSTER_EPOCH_BALLOT_LANE_BYTES];
 
@@ -584,30 +535,23 @@ cluster_epoch_ballot_lane_encode(
 	image[6] = lane->last_write_phase;
 	epoch_ballot_put_le32(image + 8, (uint32)lane->proposer_node_id);
 	epoch_ballot_put_le32(image + 12, lane->configured_disk_count);
-	epoch_ballot_put_le64(image + 16,
-						  lane->proposer_admitted_incarnation);
+	epoch_ballot_put_le64(image + 16, lane->proposer_admitted_incarnation);
 	epoch_ballot_put_le64(image + 24, lane->lane_generation);
 	epoch_ballot_put_le64(image + 32, lane->system_identifier);
 	epoch_ballot_put_le64(image + 40, lane->grammar_fingerprint);
-	if (!epoch_ballot_id_pack(&lane->promised_ballot,
-						   image + EPOCH_BALLOT_OFF_PROMISED))
+	if (!epoch_ballot_id_pack(&lane->promised_ballot, image + EPOCH_BALLOT_OFF_PROMISED))
 		return false;
 	if (!epoch_ballot_id_zero(&lane->accepted_ballot)) {
-		if (!epoch_ballot_id_pack(&lane->accepted_ballot,
-							   image + EPOCH_BALLOT_OFF_ACCEPTED))
+		if (!epoch_ballot_id_pack(&lane->accepted_ballot, image + EPOCH_BALLOT_OFF_ACCEPTED))
 			return false;
-		epoch_authority_value_pack(&lane->accepted_value,
-							 image + EPOCH_BALLOT_OFF_ACCEPTED_VALUE);
+		epoch_authority_value_pack(&lane->accepted_value, image + EPOCH_BALLOT_OFF_ACCEPTED_VALUE);
 	}
 	if (!epoch_ballot_id_zero(&lane->settled_ballot)) {
-		if (!epoch_ballot_id_pack(&lane->settled_ballot,
-							   image + EPOCH_BALLOT_OFF_SETTLED))
+		if (!epoch_ballot_id_pack(&lane->settled_ballot, image + EPOCH_BALLOT_OFF_SETTLED))
 			return false;
-		epoch_authority_value_pack(&lane->settled_value,
-							 image + EPOCH_BALLOT_OFF_SETTLED_VALUE);
+		epoch_authority_value_pack(&lane->settled_value, image + EPOCH_BALLOT_OFF_SETTLED_VALUE);
 	}
-	epoch_ballot_put_le32(image + EPOCH_BALLOT_OFF_CRC,
-						  epoch_ballot_lane_crc(image));
+	epoch_ballot_put_le32(image + EPOCH_BALLOT_OFF_CRC, epoch_ballot_lane_crc(image));
 	memcpy(out, image, sizeof(image));
 	return true;
 }
@@ -626,32 +570,30 @@ epoch_ballot_id_decode_pair(const uint8 bytes[CLUSTER_EPOCH_BALLOT_ID_BYTES],
 
 
 static bool
-epoch_authority_value_decode_pair(
-	const uint8 bytes[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES],
-	uint64 expected_grammar_fingerprint, ClusterEpochAuthorityValue *out)
+epoch_authority_value_decode_pair(const uint8 bytes[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES],
+								  uint64 expected_grammar_fingerprint,
+								  ClusterEpochAuthorityValue *out)
 {
 	if (epoch_ballot_bytes_zero(bytes, CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES)) {
 		memset(out, 0, sizeof(*out));
 		return true;
 	}
-	return cluster_epoch_authority_value_decode(
-		bytes, expected_grammar_fingerprint, out);
+	return cluster_epoch_authority_value_decode(bytes, expected_grammar_fingerprint, out);
 }
 
 
 bool
-cluster_epoch_ballot_lane_decode(
-	const uint8 bytes[CLUSTER_EPOCH_BALLOT_LANE_BYTES],
-	int32 expected_proposer_node_id, uint32 expected_configured_disk_count,
-	uint64 expected_proposer_admitted_incarnation,
-	uint64 expected_system_identifier, uint64 expected_grammar_fingerprint,
-	ClusterEpochBallotLane *out)
+cluster_epoch_ballot_lane_decode(const uint8 bytes[CLUSTER_EPOCH_BALLOT_LANE_BYTES],
+								 int32 expected_proposer_node_id,
+								 uint32 expected_configured_disk_count,
+								 uint64 expected_proposer_admitted_incarnation,
+								 uint64 expected_system_identifier,
+								 uint64 expected_grammar_fingerprint, ClusterEpochBallotLane *out)
 {
 	ClusterEpochBallotLane decoded;
 
 	if (bytes == NULL || out == NULL
-		|| epoch_ballot_lane_crc(bytes)
-			   != epoch_ballot_get_le32(bytes + EPOCH_BALLOT_OFF_CRC))
+		|| epoch_ballot_lane_crc(bytes) != epoch_ballot_get_le32(bytes + EPOCH_BALLOT_OFF_CRC))
 		return false;
 	memset(&decoded, 0, sizeof(decoded));
 	decoded.magic = epoch_ballot_get_le32(bytes + 0);
@@ -664,27 +606,20 @@ cluster_epoch_ballot_lane_decode(
 	decoded.lane_generation = epoch_ballot_get_le64(bytes + 24);
 	decoded.system_identifier = epoch_ballot_get_le64(bytes + 32);
 	decoded.grammar_fingerprint = epoch_ballot_get_le64(bytes + 40);
-	if (!epoch_ballot_id_decode_pair(bytes + EPOCH_BALLOT_OFF_PROMISED,
-									  &decoded.promised_ballot)
-		|| !epoch_ballot_id_decode_pair(bytes + EPOCH_BALLOT_OFF_ACCEPTED,
-									   &decoded.accepted_ballot)
-		|| !epoch_authority_value_decode_pair(
-			bytes + EPOCH_BALLOT_OFF_ACCEPTED_VALUE,
-			expected_grammar_fingerprint, &decoded.accepted_value)
-		|| !epoch_ballot_id_decode_pair(bytes + EPOCH_BALLOT_OFF_SETTLED,
-									   &decoded.settled_ballot)
-		|| !epoch_authority_value_decode_pair(
-			bytes + EPOCH_BALLOT_OFF_SETTLED_VALUE,
-			expected_grammar_fingerprint, &decoded.settled_value))
+	if (!epoch_ballot_id_decode_pair(bytes + EPOCH_BALLOT_OFF_PROMISED, &decoded.promised_ballot)
+		|| !epoch_ballot_id_decode_pair(bytes + EPOCH_BALLOT_OFF_ACCEPTED, &decoded.accepted_ballot)
+		|| !epoch_authority_value_decode_pair(bytes + EPOCH_BALLOT_OFF_ACCEPTED_VALUE,
+											  expected_grammar_fingerprint, &decoded.accepted_value)
+		|| !epoch_ballot_id_decode_pair(bytes + EPOCH_BALLOT_OFF_SETTLED, &decoded.settled_ballot)
+		|| !epoch_authority_value_decode_pair(bytes + EPOCH_BALLOT_OFF_SETTLED_VALUE,
+											  expected_grammar_fingerprint, &decoded.settled_value))
 		return false;
-	memcpy(decoded.reserved, bytes + EPOCH_BALLOT_OFF_RESERVED,
-		   sizeof(decoded.reserved));
+	memcpy(decoded.reserved, bytes + EPOCH_BALLOT_OFF_RESERVED, sizeof(decoded.reserved));
 	decoded.crc32c = epoch_ballot_get_le32(bytes + EPOCH_BALLOT_OFF_CRC);
 	if (!cluster_epoch_ballot_lane_is_valid(
-			&decoded, expected_proposer_node_id,
-			expected_configured_disk_count,
-			expected_proposer_admitted_incarnation,
-			expected_system_identifier, expected_grammar_fingerprint))
+			&decoded, expected_proposer_node_id, expected_configured_disk_count,
+			expected_proposer_admitted_incarnation, expected_system_identifier,
+			expected_grammar_fingerprint))
 		return false;
 	*out = decoded;
 	return true;

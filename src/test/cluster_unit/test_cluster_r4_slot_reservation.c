@@ -39,31 +39,30 @@
 UT_DEFINE_GLOBALS();
 
 extern bool cluster_cr_server_test_reserve_legacy_slot(ClusterLmsCrSlot *slot,
-											uint32 reserved_state);
+													   uint32 reserved_state);
 /* Expected USE_CLUSTER_UNIT claim-only seams.  They expose no builder step. */
 extern bool cluster_cr_server_test_r4_claim_queued(uint32 slot_index);
 extern bool cluster_cr_server_test_r4_build_step(uint32 slot_index);
 extern bool cluster_cr_server_test_r4_send_foreign_undo(uint32 slot_index);
-extern bool cluster_cr_server_r4_land_foreign_undo(
-	const ClusterICEnvelope *env, const GcsBlockReplyHeader *header,
-	const char undo_page[BLCKSZ], const ClusterGcsUndoAuthTrailer *undo_auth);
-extern bool cluster_cr_server_test_r4_freeze_foreign_generation(
-	uint32 slot_index, uint32 physical_generation);
+extern bool cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
+												   const GcsBlockReplyHeader *header,
+												   const char undo_page[BLCKSZ],
+												   const ClusterGcsUndoAuthTrailer *undo_auth);
+extern bool cluster_cr_server_test_r4_freeze_foreign_generation(uint32 slot_index,
+																uint32 physical_generation);
 extern bool cluster_cr_server_test_r4_ship_terminal(uint32 slot_index);
 extern void cluster_cr_server_test_r4_reset_contexts(void);
-extern bool cluster_cr_server_test_r4_context_matches(
-	uint32 slot_index, bool expect_present, uint64 slot_generation,
-	uint64 builder_incarnation, const ClusterSemanticAdmissionToken *admission);
+extern bool
+cluster_cr_server_test_r4_context_matches(uint32 slot_index, bool expect_present,
+										  uint64 slot_generation, uint64 builder_incarnation,
+										  const ClusterSemanticAdmissionToken *admission);
 extern bool cluster_cr_server_r4_worker0_drained(void);
-extern bool cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation,
-														 uint64 generation);
+extern bool cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation, uint64 generation);
 extern void cluster_lms_data_plane_close_peer_now(int32 peer_id);
-extern void cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
-											  bool connected, bool enabled,
-											  bool wes_dirty);
-extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id,
-											  int *fd_out, bool *down_out,
-											  bool *wes_dirty_out);
+extern void cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd, bool connected,
+												  bool enabled, bool wes_dirty);
+extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id, int *fd_out, bool *down_out,
+													  bool *wes_dirty_out);
 
 #define UT_FORMATION_EPOCH UINT64_C(9)
 #define UT_ACTIVATION_GENERATION UINT64_C(12)
@@ -89,10 +88,9 @@ extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id,
 #define UT_FOREIGN_LIVE_HWM ((XLogRecPtr)UINT64_C(0x4000))
 #define UT_FOREIGN_TT_GENERATION UINT64_C(3)
 #define UT_FOREIGN_AUTHORITY_SCN ((SCN)(UT_READ_SCN + 1))
-#define UT_R4_REQUIRED_CAPABILITIES                                                          \
-	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1            \
-	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                        \
-	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
+#define UT_R4_REQUIRED_CAPABILITIES                                                                \
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1                  \
+	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
 
 typedef struct UtClusterCrServerShared {
 	pg_atomic_uint64 lms_latch_ptr;
@@ -388,10 +386,10 @@ errfinish(const char *file pg_attribute_unused(), int line pg_attribute_unused()
 }
 
 bool
-cluster_cr_r4_extract_resident_record(
-	const char resident_undo_page[BLCKSZ],
-	const ClusterTxLocator *request_locator, char record_out[BLCKSZ],
-	size_t *record_length_out, ClusterTxLocator *canonical_locator_out)
+cluster_cr_r4_extract_resident_record(const char resident_undo_page[BLCKSZ],
+									  const ClusterTxLocator *request_locator,
+									  char record_out[BLCKSZ], size_t *record_length_out,
+									  ClusterTxLocator *canonical_locator_out)
 {
 	ut_extract_calls++;
 	if (ut_real_builder)
@@ -402,8 +400,8 @@ cluster_cr_r4_extract_resident_record(
 	if (request_locator != NULL)
 		ut_extract_locator = *request_locator;
 	if (!ut_extract_ok || resident_undo_page == NULL || resident_undo_page[0] != (char)0xa5
-		|| request_locator == NULL || record_out == NULL
-		|| record_length_out == NULL || canonical_locator_out == NULL)
+		|| request_locator == NULL || record_out == NULL || record_length_out == NULL
+		|| canonical_locator_out == NULL)
 		return false;
 	memset(record_out, 0x6b, sizeof(UndoRecordHeader));
 	*record_length_out = sizeof(UndoRecordHeader);
@@ -413,10 +411,8 @@ cluster_cr_r4_extract_resident_record(
 }
 
 ClusterR4CrBuildStepResult
-cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
-								bool foreign_undo_ready,
-								ClusterR4CrSlotExtension *extension,
-								char result_page[BLCKSZ],
+cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool foreign_undo_ready,
+								ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
 								const char foreign_undo_page[BLCKSZ],
 								ClusterCrBuildReason *reason_out)
 {
@@ -429,8 +425,7 @@ cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation,
 	ut_builder_extension = extension;
 	ut_builder_result_page = result_page;
 	ut_builder_foreign_page = foreign_undo_page;
-	ut_state_at_builder_step
-		= pg_atomic_read_u32(&ut_cr_server_shared.slots[slot_index].state);
+	ut_state_at_builder_step = pg_atomic_read_u32(&ut_cr_server_shared.slots[slot_index].state);
 	if (ut_real_builder)
 		return continuation_real_step(slot_index, slot_generation, foreign_undo_ready, extension,
 									  result_page, foreign_undo_page, reason_out);
@@ -482,17 +477,15 @@ cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation)
 }
 
 bool
-cluster_cr_build_on_holder_pending_locator(uint32 slot_index,
-									   uint64 slot_generation,
-									   ClusterTxLocator *locator_out)
+cluster_cr_build_on_holder_pending_locator(uint32 slot_index, uint64 slot_generation,
+										   ClusterTxLocator *locator_out)
 {
 	if (ut_real_builder)
 		return continuation_real_pending(slot_index, slot_generation, locator_out);
 	ut_pending_locator_calls++;
 	ut_pending_locator_slot_index = slot_index;
 	ut_pending_locator_slot_generation = slot_generation;
-	ut_state_at_pending_locator
-		= pg_atomic_read_u32(&ut_cr_server_shared.slots[slot_index].state);
+	ut_state_at_pending_locator = pg_atomic_read_u32(&ut_cr_server_shared.slots[slot_index].state);
 	if (locator_out != NULL)
 		memset(locator_out, 0, sizeof(*locator_out));
 	if (!ut_pending_locator_ok || locator_out == NULL)
@@ -502,14 +495,13 @@ cluster_cr_build_on_holder_pending_locator(uint32 slot_index,
 }
 
 bool
-cluster_semantic_activation_resolve_shared_undo_root(
-	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
-	uint32 owner_instance, uint32 segment_id,
-	ClusterUndoBlock0ResolvedRoot *out)
+cluster_semantic_activation_resolve_shared_undo_root(const ClusterSemanticAdmissionToken *token,
+													 ClusterUndoPathIntent intent,
+													 uint32 owner_instance, uint32 segment_id,
+													 ClusterUndoBlock0ResolvedRoot *out)
 {
 	ut_pgrd_resolve_calls++;
-	memset(&ut_pgrd_resolve_admission, 0,
-		   sizeof(ut_pgrd_resolve_admission));
+	memset(&ut_pgrd_resolve_admission, 0, sizeof(ut_pgrd_resolve_admission));
 	if (token != NULL)
 		ut_pgrd_resolve_admission = *token;
 	ut_pgrd_resolve_intent = intent;
@@ -522,10 +514,10 @@ cluster_semantic_activation_resolve_shared_undo_root(
 }
 
 ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_acquire_begin(
-	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode,
-	int timeout_ms, ClusterUndoBlock0CurrentGuard *guard,
-	ClusterUndoBlock0Result *failure)
+cluster_undo_block0_current_acquire_begin(const ClusterUndoBlock0LogicalKey *key,
+										  ClusterUndoBlock0CurrentMode mode, int timeout_ms,
+										  ClusterUndoBlock0CurrentGuard *guard,
+										  ClusterUndoBlock0Result *failure)
 {
 	ut_current_acquire_calls++;
 	memset(&ut_current_logical, 0, sizeof(ut_current_logical));
@@ -542,8 +534,8 @@ cluster_undo_block0_current_acquire_begin(
 }
 
 ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_acquire_poll(
-	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
+										 ClusterUndoBlock0Result *failure)
 {
 	ut_current_acquire_poll_calls++;
 	UT_ASSERT_NOT_NULL(guard);
@@ -555,18 +547,16 @@ cluster_undo_block0_current_acquire_poll(
 }
 
 ClusterUndoBlock0Result
-cluster_undo_block0_current_sample_generation(
-	ClusterUndoBlock0CurrentGuard *guard,
-	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterUndoBlock0Generation *observed)
+cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *guard,
+											  const ClusterUndoBlock0ResolvedRoot *root,
+											  ClusterUndoBlock0Generation *observed)
 {
 	ut_current_sample_calls++;
 	UT_ASSERT_NOT_NULL(guard);
 	memset(&ut_current_sample_root, 0, sizeof(ut_current_sample_root));
 	if (root != NULL)
 		ut_current_sample_root = *root;
-	if (ut_current_sample_result == CLUSTER_UNDO_BLOCK0_OK
-		&& observed != NULL) {
+	if (ut_current_sample_result == CLUSTER_UNDO_BLOCK0_OK && observed != NULL) {
 		observed->known = true;
 		observed->value = ut_current_sample_generation;
 	}
@@ -574,8 +564,8 @@ cluster_undo_block0_current_sample_generation(
 }
 
 ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_release_begin(
-	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
+										  ClusterUndoBlock0Result *failure)
 {
 	ut_current_release_calls++;
 	UT_ASSERT_NOT_NULL(guard);
@@ -587,8 +577,8 @@ cluster_undo_block0_current_release_begin(
 }
 
 ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_release_poll(
-	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure)
+cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
+										 ClusterUndoBlock0Result *failure)
 {
 	ut_current_release_poll_calls++;
 	UT_ASSERT_NOT_NULL(guard);
@@ -607,8 +597,7 @@ cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard)
 }
 
 void
-cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family,
-									ClusterICSendResult rc)
+cluster_gcs_block_note_send_outcome(GcsBlockSendFamily family, ClusterICSendResult rc)
 {
 	ut_note_send_calls++;
 	ut_note_send_family = family;
@@ -642,8 +631,8 @@ cluster_gcs_block_compute_checksum(const char *block_data)
 }
 
 ClusterICSendResult
-cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id,
-						 const void *payload, uint32 payload_len)
+cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
+						 uint32 payload_len)
 {
 	ut_send_calls++;
 	ut_state_at_send = pg_atomic_read_u32(&ut_cr_server_shared.slots[0].state);
@@ -657,9 +646,8 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id,
 }
 
 bool
-cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type,
-						  uint32 source_node_id, uint32 dest_node_id,
-						  const void *payload, uint32 payload_length)
+cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 source_node_id,
+						  uint32 dest_node_id, const void *payload, uint32 payload_length)
 {
 	ut_envelope_build_calls++;
 	ut_envelope_build_sequence = ++ut_sequence;
@@ -678,26 +666,23 @@ cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type,
 }
 
 bool
-cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload,
-							 int32 peer_id)
+cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
 	ut_local_dispatch_calls++;
 	ut_local_dispatch_sequence = ++ut_sequence;
 	ut_local_dispatch_peer = peer_id;
-	ut_state_at_local_dispatch
-		= pg_atomic_read_u32(&ut_cr_server_shared.slots[0].state);
+	ut_state_at_local_dispatch = pg_atomic_read_u32(&ut_cr_server_shared.slots[0].state);
 	UT_ASSERT_NOT_NULL(env);
 	UT_ASSERT_NOT_NULL(payload);
 	UT_ASSERT(env == NULL || env->payload_length <= sizeof(ut_local_dispatch_payload));
-	if (env != NULL && payload != NULL
-		&& env->payload_length <= sizeof(ut_local_dispatch_payload))
+	if (env != NULL && payload != NULL && env->payload_length <= sizeof(ut_local_dispatch_payload))
 		memcpy(ut_local_dispatch_payload, payload, env->payload_length);
 	return ut_local_dispatch_ok;
 }
 
 void
 cluster_ic_tier1_request_close_peer(int32 peer_id pg_attribute_unused(),
-								const char *reason pg_attribute_unused())
+									const char *reason pg_attribute_unused())
 {
 	ut_close_peer_calls++;
 }
@@ -751,9 +736,9 @@ SetLatch(Latch *latch)
 }
 
 bool
-cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
-									XLogRecPtr *page_lsn_out, SCN *page_scn_out,
-									char *dst, ClusterBufmgrGcsCopyRefusal *refusal_out)
+cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn, XLogRecPtr *page_lsn_out,
+									SCN *page_scn_out, char *dst,
+									ClusterBufmgrGcsCopyRefusal *refusal_out)
 {
 	ut_copy_calls++;
 	ut_copy_sequence = ++ut_sequence;
@@ -807,9 +792,9 @@ cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token)
 
 bool
 cluster_semantic_activation_peer_open_matches(const ClusterSemanticAdmissionToken *token,
-										  int32 authenticated_peer_node_id,
-										  uint32 required_hello_caps,
-										  uint32 sampled_capability_generation)
+											  int32 authenticated_peer_node_id,
+											  uint32 required_hello_caps,
+											  uint32 sampled_capability_generation)
 {
 	int slot = ut_peer_open_calls++;
 
@@ -818,8 +803,7 @@ cluster_semantic_activation_peer_open_matches(const ClusterSemanticAdmissionToke
 		ut_peer_open_required[slot] = required_hello_caps;
 		ut_peer_open_generations[slot] = sampled_capability_generation;
 		ut_peer_open_sequence[slot] = ++ut_sequence;
-		ut_state_at_peer_open[slot]
-			= pg_atomic_read_u32(&ut_cr_server_shared.slots[0].state);
+		ut_state_at_peer_open[slot] = pg_atomic_read_u32(&ut_cr_server_shared.slots[0].state);
 	}
 	return ut_peer_open_ok && token != NULL
 		   && memcmp(token, &ut_expected_admission, sizeof(*token)) == 0
@@ -841,9 +825,8 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 bool
 LWLockAcquire(LWLock *lock, LWLockMode mode)
 {
-	if (ut_reclaim_race_on_proof && !ut_reclaim_race_injected
-		&& ut_lms_state != NULL && lock == &ut_lms_state->lwlock
-		&& mode == LW_EXCLUSIVE) {
+	if (ut_reclaim_race_on_proof && !ut_reclaim_race_injected && ut_lms_state != NULL
+		&& lock == &ut_lms_state->lwlock && mode == LW_EXCLUSIVE) {
 		ut_lms_state->r4_controls.data_worker_incarnation[0]++;
 		ut_reclaim_race_injected = true;
 	}
@@ -916,12 +899,10 @@ submit_test_tag(void)
 static ClusterR4CrForwardPayload
 submit_test_forward96(void)
 {
-	static const uint8 extension_bytes[32] = {
-		0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00,
-		0x09, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x22, 0x22, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
-	};
+	static const uint8 extension_bytes[32]
+		= { 0x01, 0x01, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x09, 0x00, 0x00,
+			0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x22,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	ClusterR4CrForwardPayload forward;
 
 	memset(&forward, 0, sizeof(forward));
@@ -1045,8 +1026,7 @@ reset_submit_fixture(ClusterLmsSharedState *state)
 	ut_pending_locator.itl_slot_index = 0;
 	ut_pgrd_resolve_ok = true;
 	ut_pgrd_resolve_calls = 0;
-	memset(&ut_pgrd_resolve_admission, 0,
-		   sizeof(ut_pgrd_resolve_admission));
+	memset(&ut_pgrd_resolve_admission, 0, sizeof(ut_pgrd_resolve_admission));
 	ut_pgrd_resolve_intent = CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL;
 	ut_pgrd_resolve_owner_instance = 0;
 	ut_pgrd_resolve_segment_id = 0;
@@ -1162,8 +1142,7 @@ peer_recheck_seen(int32 peer, uint32 generation)
 	int i;
 
 	for (i = 0; i < ut_peer_open_calls && i < lengthof(ut_peer_open_peers); i++) {
-		if (ut_peer_open_peers[i] == peer
-			&& ut_peer_open_generations[i] == generation
+		if (ut_peer_open_peers[i] == peer && ut_peer_open_generations[i] == generation
 			&& ut_peer_open_required[i] == UT_R4_REQUIRED_CAPABILITIES)
 			return true;
 	}
@@ -1182,8 +1161,7 @@ slot_is_canonical_free_with_generation(const ClusterLmsCrSlot *slot, uint64 gene
 }
 
 static void
-prepare_reclaimable_r4_slot(ClusterLmsCrSlot *slot, uint32 state,
-							uint64 generation, int worker_id)
+prepare_reclaimable_r4_slot(ClusterLmsCrSlot *slot, uint32 state, uint64 generation, int worker_id)
 {
 	memset(slot, 0, sizeof(*slot));
 	pg_atomic_init_u32(&slot->state, state);
@@ -1191,15 +1169,13 @@ prepare_reclaimable_r4_slot(ClusterLmsCrSlot *slot, uint32 state,
 	slot->r4.owner.edge_owner_incarnation = UINT64_C(41) + (uint64)worker_id;
 	slot->r4.owner.edge_owner_pid = 7000 + worker_id;
 	slot->r4.owner.edge_owner_worker_id = (uint8)worker_id;
-	slot->r4.owner.edge_owner_role
-		= (uint8)(worker_id == 0 ? B_LMS : B_LMS_WORKER);
+	slot->r4.owner.edge_owner_role = (uint8)(worker_id == 0 ? B_LMS : B_LMS_WORKER);
 	if (state != CLUSTER_LMS_CR_FILLING)
 		slot->req_kind = (uint8)CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD;
 }
 
 static void
-prepare_exact_drain_ack(ClusterLmsSharedState *state,
-						uint64 worker_incarnation, uint64 generation)
+prepare_exact_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation, uint64 generation)
 {
 	state->r4_controls.data_worker_incarnation[0] = worker_incarnation;
 	state->r4_controls.drain_request_generation = generation;
@@ -1215,9 +1191,8 @@ prepare_worker0_claim(ClusterLmsSharedState *state)
 	ClusterCrBuildResult result;
 
 	reset_submit_fixture(state);
-	result = cluster_lms_cr_submit_r4(
-		&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
-		UT_MASTER_CAPABILITY_GENERATION, &reason);
+	result = cluster_lms_cr_submit_r4(&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
+									  UT_MASTER_CAPABILITY_GENERATION, &reason);
 	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 
@@ -1263,25 +1238,22 @@ prepare_worker0_need_undo(ClusterLmsSharedState *state)
 }
 
 static ClusterLmsCrSlot *
-prepare_worker0_need_undo_frozen(ClusterLmsSharedState *state,
-								 uint32 physical_generation)
+prepare_worker0_need_undo_frozen(ClusterLmsSharedState *state, uint32 physical_generation)
 {
 	ClusterLmsCrSlot *slot = prepare_worker0_need_undo(state);
 
-	UT_ASSERT(cluster_cr_server_test_r4_freeze_foreign_generation(
-		0, physical_generation));
+	UT_ASSERT(cluster_cr_server_test_r4_freeze_foreign_generation(0, physical_generation));
 	return slot;
 }
 
 static ClusterLmsCrSlot *
 prepare_worker0_undo_inflight(ClusterLmsSharedState *state)
 {
-	ClusterLmsCrSlot *slot = prepare_worker0_need_undo_frozen(
-		state, UT_FOREIGN_PHYSICAL_GENERATION);
+	ClusterLmsCrSlot *slot
+		= prepare_worker0_need_undo_frozen(state, UT_FOREIGN_PHYSICAL_GENERATION);
 
 	UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 
 	/* Measure the receive-side short TARGET episode independently from the
 	 * retained builder episode that prepare_worker0_need_undo() entered. */
@@ -1299,8 +1271,7 @@ prepare_worker0_undo_inflight(ClusterLmsSharedState *state)
 }
 
 static void
-make_foreign_undo_reply(GcsBlockReplyHeader *header,
-						ClusterGcsUndoAuthTrailer *auth,
+make_foreign_undo_reply(GcsBlockReplyHeader *header, ClusterGcsUndoAuthTrailer *auth,
 						ClusterICEnvelope *env, char page[BLCKSZ])
 {
 	memset(header, 0, sizeof(*header));
@@ -1312,10 +1283,8 @@ make_foreign_undo_reply(GcsBlockReplyHeader *header,
 	header->requester_backend_id = CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT;
 	header->transition_id = (uint8)PCM_TRANS_N_TO_S;
 	header->status = (uint8)GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT;
-	GcsBlockReplyHeaderSetForwardingMasterNode(
-		header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
-	UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(
-		header, UT_FOREIGN_PHYSICAL_GENERATION));
+	GcsBlockReplyHeaderSetForwardingMasterNode(header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(header, UT_FOREIGN_PHYSICAL_GENERATION));
 
 	memset(page, 0, BLCKSZ);
 	page[0] = (char)0xa5;
@@ -1334,14 +1303,11 @@ make_foreign_undo_reply(GcsBlockReplyHeader *header,
 static void
 assert_exact_foreign_undo_forward96(void)
 {
-	static const uint8 extension_bytes[32] = {
-		0x01, 0x04, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
-		0x09, 0x00, 0x00, 0x00, 0x03, 0x00, 0x06, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x1d, 0x03, 0x00, 0x00,
-		0x07, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01
-	};
-	const ClusterR4CrForwardPayload *forward
-		= (const ClusterR4CrForwardPayload *)ut_send_payload;
+	static const uint8 extension_bytes[32]
+		= { 0x01, 0x04, 0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x09, 0x00, 0x00,
+			0x00, 0x03, 0x00, 0x06, 0x00, 0x00, 0x00, 0x00, 0x00, 0x1d, 0x03,
+			0x00, 0x00, 0x07, 0x00, 0x01, 0x00, 0x04, 0x03, 0x02, 0x01 };
+	const ClusterR4CrForwardPayload *forward = (const ClusterR4CrForwardPayload *)ut_send_payload;
 
 	UT_ASSERT_EQ(ut_send_msg_type, PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
 	UT_ASSERT_EQ(ut_send_dest, 1);
@@ -1357,12 +1323,10 @@ assert_exact_foreign_undo_forward96(void)
 	UT_ASSERT_EQ(forward->base.requester_backend_id, -2);
 	UT_ASSERT_EQ(forward->base.master_node, UT_HOLDER_NODE);
 	UT_ASSERT_EQ(forward->base.transition_id, PCM_TRANS_N_TO_S);
-	UT_ASSERT_EQ(GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&forward->base),
-				 UT_READ_SCN);
+	UT_ASSERT_EQ(GcsBlockForwardPayloadGetExpectedPiWatermarkScn(&forward->base), UT_READ_SCN);
 	UT_ASSERT(bytes_are(forward->base.reserved_0, 6, 0));
 	UT_ASSERT_EQ(forward->base.reserved_0[6], CLUSTER_R4_FORWARD_EXTENDED);
-	UT_ASSERT_EQ(memcmp(&forward->extension, extension_bytes,
-					 sizeof(extension_bytes)), 0);
+	UT_ASSERT_EQ(memcmp(&forward->extension, extension_bytes, sizeof(extension_bytes)), 0);
 }
 
 UT_TEST(test_free_to_pending_canonicalizes_owner_under_lms_lock)
@@ -1449,9 +1413,8 @@ UT_TEST(test_r4_submit_publishes_complete_stable_copy_once)
 
 	reset_submit_fixture(&state);
 	slot = &ut_cr_server_shared.slots[0];
-	result = cluster_lms_cr_submit_r4(
-		&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
-		UT_MASTER_CAPABILITY_GENERATION, &reason);
+	result = cluster_lms_cr_submit_r4(&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
+									  UT_MASTER_CAPABILITY_GENERATION, &reason);
 
 	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
@@ -1462,16 +1425,15 @@ UT_TEST(test_r4_submit_publishes_complete_stable_copy_once)
 	UT_ASSERT_EQ(ut_lock_mode, LW_EXCLUSIVE);
 	UT_ASSERT_EQ(ut_state_at_lock_release, CLUSTER_LMS_CR_FILLING);
 	UT_ASSERT_EQ(ut_generation_at_lock_release, 1);
-	UT_ASSERT_EQ(ut_owner_at_lock_release.edge_owner_incarnation,
-				 UT_WORKER_INCARNATION);
+	UT_ASSERT_EQ(ut_owner_at_lock_release.edge_owner_incarnation, UT_WORKER_INCARNATION);
 	UT_ASSERT_EQ(ut_owner_at_lock_release.edge_owner_pid, MyProcPid);
 	UT_ASSERT_EQ(ut_owner_at_lock_release.edge_owner_worker_id, UT_WORKER_ID);
 	UT_ASSERT(ut_owner_at_lock_release.edge_owner_role != 0);
 	UT_ASSERT_EQ(ut_owner_at_lock_release.builder_incarnation, 0);
 	UT_ASSERT_EQ(ut_owner_at_lock_release.builder_pid, 0);
 	UT_ASSERT_EQ(ut_owner_at_lock_release.builder_worker_id, 0);
-	UT_ASSERT(bytes_are(ut_owner_at_lock_release.reserved,
-						 sizeof(ut_owner_at_lock_release.reserved), 0));
+	UT_ASSERT(
+		bytes_are(ut_owner_at_lock_release.reserved, sizeof(ut_owner_at_lock_release.reserved), 0));
 
 	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_QUEUED);
 	UT_ASSERT_EQ(slot->r4.slot_generation, 1);
@@ -1484,23 +1446,17 @@ UT_TEST(test_r4_submit_publishes_complete_stable_copy_once)
 	UT_ASSERT_EQ(slot->requester_backend, UT_REQUESTER_BACKEND);
 	UT_ASSERT_EQ(slot->reply_master_node, UT_MASTER_NODE);
 	UT_ASSERT_EQ(slot->transition_id, PCM_TRANS_N_TO_S);
-	UT_ASSERT_EQ(memcmp(&slot->r4.route_proof.tag, &forward.base.tag,
-					 sizeof(BufferTag)), 0);
+	UT_ASSERT_EQ(memcmp(&slot->r4.route_proof.tag, &forward.base.tag, sizeof(BufferTag)), 0);
 	UT_ASSERT_EQ(slot->r4.route_proof.read_scn, UT_READ_SCN);
 	UT_ASSERT_EQ(slot->r4.route_proof.formation_epoch, UT_FORMATION_EPOCH);
-	UT_ASSERT_EQ(slot->r4.route_proof.activation_generation,
-				 UT_ACTIVATION_GENERATION);
-	UT_ASSERT_EQ(slot->r4.route_proof.master_authority_generation,
-				 UT_MASTER_GENERATION);
-	UT_ASSERT_EQ(slot->r4.route_proof.master_resource_transition_count,
-				 UT_MASTER_TRANSITION);
+	UT_ASSERT_EQ(slot->r4.route_proof.activation_generation, UT_ACTIVATION_GENERATION);
+	UT_ASSERT_EQ(slot->r4.route_proof.master_authority_generation, UT_MASTER_GENERATION);
+	UT_ASSERT_EQ(slot->r4.route_proof.master_resource_transition_count, UT_MASTER_TRANSITION);
 	UT_ASSERT_EQ(slot->r4.route_proof.expected_page_scn, UT_EXPECTED_PAGE_SCN);
 	UT_ASSERT_EQ(slot->r4.route_proof.real_master_node, UT_MASTER_NODE);
 	UT_ASSERT_EQ(slot->r4.route_proof.selected_holder_node, UT_HOLDER_NODE);
-	UT_ASSERT_EQ(slot->r4.requester_capability_generation,
-				 UT_REQUESTER_CAPABILITY_GENERATION);
-	UT_ASSERT_EQ(slot->r4.master_capability_generation,
-				 UT_MASTER_CAPABILITY_GENERATION);
+	UT_ASSERT_EQ(slot->r4.requester_capability_generation, UT_REQUESTER_CAPABILITY_GENERATION);
+	UT_ASSERT_EQ(slot->r4.master_capability_generation, UT_MASTER_CAPABILITY_GENERATION);
 	UT_ASSERT_EQ(slot->r4.foreign_request_id, 0);
 	UT_ASSERT_EQ(slot->r4.origin_formation_epoch, 0);
 	UT_ASSERT_EQ(slot->r4.origin_live_hwm_lsn, 0);
@@ -1512,8 +1468,7 @@ UT_TEST(test_r4_submit_publishes_complete_stable_copy_once)
 	UT_ASSERT_EQ(slot->r4.owner.builder_incarnation, 0);
 	UT_ASSERT_EQ(slot->r4.owner.builder_pid, 0);
 	UT_ASSERT_EQ(slot->r4.owner.builder_worker_id, 0);
-	UT_ASSERT(bytes_are(slot->r4.owner.reserved,
-						 sizeof(slot->r4.owner.reserved), 0));
+	UT_ASSERT(bytes_are(slot->r4.owner.reserved, sizeof(slot->r4.owner.reserved), 0));
 
 	UT_ASSERT_EQ(ut_copy_calls, 1);
 	UT_ASSERT_EQ(memcmp(&ut_copy_tag, &forward.base.tag, sizeof(BufferTag)), 0);
@@ -1525,8 +1480,7 @@ UT_TEST(test_r4_submit_publishes_complete_stable_copy_once)
 	UT_ASSERT_EQ(ut_recheck_calls, 1);
 	UT_ASSERT_EQ(ut_peer_open_calls, 2);
 	UT_ASSERT(peer_recheck_seen(UT_MASTER_NODE, UT_MASTER_CAPABILITY_GENERATION));
-	UT_ASSERT(peer_recheck_seen(UT_REQUESTER_NODE,
-						 UT_REQUESTER_CAPABILITY_GENERATION));
+	UT_ASSERT(peer_recheck_seen(UT_REQUESTER_NODE, UT_REQUESTER_CAPABILITY_GENERATION));
 	UT_ASSERT_EQ(ut_wake_calls, 1);
 	UT_ASSERT(ut_lock_release_sequence < ut_copy_sequence);
 	UT_ASSERT(ut_copy_sequence < ut_recheck_sequence);
@@ -1536,8 +1490,7 @@ UT_TEST(test_r4_submit_publishes_complete_stable_copy_once)
 		UT_ASSERT(ut_peer_open_sequence[i] < ut_wake_sequence);
 	}
 	for (i = 1; i < CLUSTER_LMS_CR_SLOTS; i++) {
-		UT_ASSERT_EQ(pg_atomic_read_u32(&ut_cr_server_shared.slots[i].state),
-					 CLUSTER_LMS_CR_FREE);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&ut_cr_server_shared.slots[i].state), CLUSTER_LMS_CR_FREE);
 		UT_ASSERT_EQ(ut_cr_server_shared.slots[i].r4.slot_generation, 0);
 	}
 }
@@ -1562,9 +1515,8 @@ UT_TEST(test_r4_all_local_submit_uses_exact_token_generation_without_peer_matche
 	admission_before = admission;
 	slot = &ut_cr_server_shared.slots[0];
 
-	result = cluster_lms_cr_submit_r4(
-		&forward, &admission, (uint32)admission.record_generation,
-		(uint32)admission.record_generation, &reason);
+	result = cluster_lms_cr_submit_r4(&forward, &admission, (uint32)admission.record_generation,
+									  (uint32)admission.record_generation, &reason);
 
 	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
@@ -1578,12 +1530,9 @@ UT_TEST(test_r4_all_local_submit_uses_exact_token_generation_without_peer_matche
 	UT_ASSERT_EQ(slot->reply_master_node, UT_HOLDER_NODE);
 	UT_ASSERT_EQ(slot->r4.route_proof.real_master_node, UT_HOLDER_NODE);
 	UT_ASSERT_EQ(slot->r4.route_proof.selected_holder_node, UT_HOLDER_NODE);
-	UT_ASSERT_EQ(slot->r4.route_proof.activation_generation,
-				 admission.record_generation);
-	UT_ASSERT_EQ((uint64)slot->r4.requester_capability_generation,
-				 admission.record_generation);
-	UT_ASSERT_EQ((uint64)slot->r4.master_capability_generation,
-				 admission.record_generation);
+	UT_ASSERT_EQ(slot->r4.route_proof.activation_generation, admission.record_generation);
+	UT_ASSERT_EQ((uint64)slot->r4.requester_capability_generation, admission.record_generation);
+	UT_ASSERT_EQ((uint64)slot->r4.master_capability_generation, admission.record_generation);
 	UT_ASSERT_EQ(ut_copy_calls, 1);
 	UT_ASSERT_EQ(ut_recheck_calls, 1);
 	UT_ASSERT_EQ(ut_state_at_recheck, CLUSTER_LMS_CR_FILLING);
@@ -1617,9 +1566,8 @@ UT_TEST(test_r4_all_local_submit_refuses_generation_mismatch_before_slot_mutatio
 	slot = &ut_cr_server_shared.slots[0];
 	before = *slot;
 
-	result = cluster_lms_cr_submit_r4(
-		&forward, &admission, (uint32)admission.record_generation - 1,
-		(uint32)admission.record_generation, &reason);
+	result = cluster_lms_cr_submit_r4(&forward, &admission, (uint32)admission.record_generation - 1,
+									  (uint32)admission.record_generation, &reason);
 
 	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_FAIL_CLOSED);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_PROTOCOL);
@@ -1644,31 +1592,29 @@ UT_TEST(test_r4_submit_copy_refusal_mapping_is_closed)
 		ClusterBufmgrGcsCopyRefusal refusal;
 		ClusterCrBuildResult result;
 		ClusterCrBuildReason reason;
-	} cases[] = {
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT,
-		  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE,
-		  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT,
-		  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED,
-		  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT,
-		  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
-		{ (ClusterBufmgrGcsCopyRefusal)
-			  (CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT + 1),
-		  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT,
-		  CLUSTER_CR_BUILD_RETRYABLE, CLUSTER_CR_BUILD_HOLDER_MOVED },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID,
-		  CLUSTER_CR_BUILD_RETRYABLE, CLUSTER_CR_BUILD_HOLDER_MOVED },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST,
-		  CLUSTER_CR_BUILD_RETRYABLE, CLUSTER_CR_BUILD_HOLDER_MOVED },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND,
-		  CLUSTER_CR_BUILD_RETRYABLE, CLUSTER_CR_BUILD_HOLDER_MOVED },
-		{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY,
-		  CLUSTER_CR_BUILD_RETRYABLE, CLUSTER_CR_BUILD_HOLDER_MOVED }
-	};
+	} cases[]
+		= { { CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INVALID_ARGUMENT, CLUSTER_CR_BUILD_FAIL_CLOSED,
+			  CLUSTER_CR_BUILD_PROTOCOL },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE, CLUSTER_CR_BUILD_FAIL_CLOSED,
+			  CLUSTER_CR_BUILD_PROTOCOL },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_HC89_LSN_DRIFT, CLUSTER_CR_BUILD_FAIL_CLOSED,
+			  CLUSTER_CR_BUILD_PROTOCOL },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_SMART_FUSION_UNCLASSIFIED,
+			  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT, CLUSTER_CR_BUILD_FAIL_CLOSED,
+			  CLUSTER_CR_BUILD_PROTOCOL },
+			{ (ClusterBufmgrGcsCopyRefusal)(CLUSTER_BUFMGR_GCS_COPY_REFUSAL_INJECTED_EVICT + 1),
+			  CLUSTER_CR_BUILD_FAIL_CLOSED, CLUSTER_CR_BUILD_PROTOCOL },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NOT_RESIDENT, CLUSTER_CR_BUILD_RETRYABLE,
+			  CLUSTER_CR_BUILD_HOLDER_MOVED },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CURRENT_INVALID, CLUSTER_CR_BUILD_RETRYABLE,
+			  CLUSTER_CR_BUILD_HOLDER_MOVED },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_FIRST, CLUSTER_CR_BUILD_RETRYABLE,
+			  CLUSTER_CR_BUILD_HOLDER_MOVED },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_CONTENT_LOCK_SECOND, CLUSTER_CR_BUILD_RETRYABLE,
+			  CLUSTER_CR_BUILD_HOLDER_MOVED },
+			{ CLUSTER_BUFMGR_GCS_COPY_REFUSAL_OWNERSHIP_REVOKE_BUSY, CLUSTER_CR_BUILD_RETRYABLE,
+			  CLUSTER_CR_BUILD_HOLDER_MOVED } };
 	ClusterR4CrForwardPayload forward = submit_test_forward96();
 	ClusterSemanticAdmissionToken admission = submit_test_admission();
 	ClusterSemanticAdmissionToken admission_before = admission;
@@ -1685,9 +1631,8 @@ UT_TEST(test_r4_submit_copy_refusal_mapping_is_closed)
 		ut_copy_refusal = cases[i].refusal;
 		slot = &ut_cr_server_shared.slots[0];
 
-		result = cluster_lms_cr_submit_r4(
-			&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
-			UT_MASTER_CAPABILITY_GENERATION, &reason);
+		result = cluster_lms_cr_submit_r4(&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
+										  UT_MASTER_CAPABILITY_GENERATION, &reason);
 
 		UT_ASSERT_EQ(result, cases[i].result);
 		UT_ASSERT_EQ(reason, cases[i].reason);
@@ -1720,9 +1665,8 @@ UT_TEST(test_r4_submit_final_recheck_failure_canonicalizes_before_free)
 	reset_submit_fixture(&state);
 	ut_recheck_ok = false;
 	slot = &ut_cr_server_shared.slots[0];
-	result = cluster_lms_cr_submit_r4(
-		&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
-		UT_MASTER_CAPABILITY_GENERATION, &reason);
+	result = cluster_lms_cr_submit_r4(&forward, &admission, UT_REQUESTER_CAPABILITY_GENERATION,
+									  UT_MASTER_CAPABILITY_GENERATION, &reason);
 
 	UT_ASSERT_EQ(result, CLUSTER_CR_BUILD_RETRYABLE);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_RF_DEFERRED);
@@ -1756,8 +1700,8 @@ UT_TEST(test_r4_worker0_claim_peer_refusal_preserves_queued_slot)
 	UT_ASSERT_EQ(ut_peer_open_calls, 1);
 	UT_ASSERT_EQ(ut_state_at_peer_open[0], CLUSTER_LMS_CR_R4_QUEUED);
 	UT_ASSERT_EQ(ut_leave_calls, 1);
-	UT_ASSERT_EQ(memcmp(&ut_left_admission, &ut_expected_admission,
-					 sizeof(ut_expected_admission)), 0);
+	UT_ASSERT_EQ(memcmp(&ut_left_admission, &ut_expected_admission, sizeof(ut_expected_admission)),
+				 0);
 	UT_ASSERT(ut_enter_sequence < ut_peer_open_sequence[0]);
 	UT_ASSERT(ut_peer_open_sequence[0] < ut_leave_sequence);
 	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, false, 0, 0, NULL));
@@ -1782,8 +1726,7 @@ UT_TEST(test_r4_worker0_claim_rebinds_owner_and_retains_context)
 	UT_ASSERT_EQ(slot->r4.owner.edge_owner_worker_id, 0);
 	UT_ASSERT_EQ(slot->r4.owner.builder_worker_id, 0);
 	UT_ASSERT_EQ(slot->r4.owner.edge_owner_role, B_LMS);
-	UT_ASSERT(bytes_are(slot->r4.owner.reserved,
-					 sizeof(slot->r4.owner.reserved), 0));
+	UT_ASSERT(bytes_are(slot->r4.owner.reserved, sizeof(slot->r4.owner.reserved), 0));
 	UT_ASSERT_EQ(ut_enter_calls, 1);
 	UT_ASSERT_EQ(ut_peer_open_calls, 2);
 	UT_ASSERT_EQ(ut_peer_open_peers[0], UT_MASTER_NODE);
@@ -1795,8 +1738,8 @@ UT_TEST(test_r4_worker0_claim_rebinds_owner_and_retains_context)
 	UT_ASSERT_EQ(ut_state_at_peer_open[0], CLUSTER_LMS_CR_R4_QUEUED);
 	UT_ASSERT_EQ(ut_state_at_peer_open[1], CLUSTER_LMS_CR_R4_QUEUED);
 	UT_ASSERT_EQ(ut_leave_calls, 0);
-	UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-		0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+														&ut_expected_admission));
 	UT_ASSERT(ut_enter_sequence < ut_peer_open_sequence[0]);
 	UT_ASSERT(ut_peer_open_sequence[0] < ut_peer_open_sequence[1]);
 	UT_ASSERT_EQ(ut_wake_calls, 0);
@@ -1820,13 +1763,9 @@ UT_TEST(test_r4_worker0_drain_requires_exact_empty_contexts)
 
 UT_TEST(test_r4_worker0_drain_rejects_every_terminal_and_shipping_state)
 {
-	static const uint32 blocked_states[] = {
-		CLUSTER_LMS_CR_R4_READY_FULL,
-		CLUSTER_LMS_CR_R4_READY_RETRY,
-		CLUSTER_LMS_CR_R4_READY_FAIL,
-		CLUSTER_LMS_CR_R4_CANCELLED,
-		CLUSTER_LMS_CR_R4_SHIPPING
-	};
+	static const uint32 blocked_states[]
+		= { CLUSTER_LMS_CR_R4_READY_FULL, CLUSTER_LMS_CR_R4_READY_RETRY,
+			CLUSTER_LMS_CR_R4_READY_FAIL, CLUSTER_LMS_CR_R4_CANCELLED, CLUSTER_LMS_CR_R4_SHIPPING };
 	ClusterLmsSharedState state;
 	ClusterLmsCrSlot *slot;
 	int i;
@@ -1862,21 +1801,18 @@ UT_TEST(test_r4_lmon_reclaim_requires_exact_ack_then_canonicalizes_all_slots)
 	slot2->r4.slot_generation = 3;
 	prepare_exact_drain_ack(&state, UINT64_C(8), UINT64_C(17));
 
-	UT_ASSERT(cluster_cr_server_r4_lmon_reclaim_closed(
-				  UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(cluster_cr_server_r4_lmon_reclaim_closed(UINT64_C(8), UINT64_C(17)));
 	UT_ASSERT_EQ(ut_lock_acquire_count, 1);
 	UT_ASSERT_EQ(ut_lock_release_count, 1);
 	UT_ASSERT(ut_lock == &state.lwlock);
 	UT_ASSERT_EQ(ut_lock_mode, LW_EXCLUSIVE);
 	UT_ASSERT_EQ(ut_state_at_lock_release, CLUSTER_LMS_CR_R4_RECLAIMING);
 	UT_ASSERT_EQ(ut_generation_at_lock_release, UINT64_C(1));
-	UT_ASSERT_EQ(memcmp(&ut_owner_at_lock_release, &slot0_owner,
-						 sizeof(slot0_owner)), 0);
+	UT_ASSERT_EQ(memcmp(&ut_owner_at_lock_release, &slot0_owner, sizeof(slot0_owner)), 0);
 	UT_ASSERT(slot_is_canonical_free_with_generation(slot0, 1));
 	UT_ASSERT(slot_is_canonical_free_with_generation(slot1, 2));
 	UT_ASSERT(slot_is_canonical_free_with_generation(slot2, 3));
-	UT_ASSERT(slot_is_canonical_free_with_generation(
-				  &ut_cr_server_shared.slots[3], 0));
+	UT_ASSERT(slot_is_canonical_free_with_generation(&ut_cr_server_shared.slots[3], 0));
 }
 
 UT_TEST(test_r4_lmon_reclaim_rechecks_ack_inside_exclusive_claim_window)
@@ -1892,8 +1828,7 @@ UT_TEST(test_r4_lmon_reclaim_rechecks_ack_inside_exclusive_claim_window)
 	prepare_exact_drain_ack(&state, UINT64_C(8), UINT64_C(17));
 	ut_reclaim_race_on_proof = true;
 
-	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(
-				   UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(UINT64_C(8), UINT64_C(17)));
 	UT_ASSERT(ut_reclaim_race_injected);
 	UT_ASSERT_EQ(state.r4_controls.data_worker_incarnation[0], UINT64_C(9));
 	UT_ASSERT_EQ(memcmp(&ut_cr_server_shared, &before, sizeof(before)), 0);
@@ -1913,8 +1848,7 @@ UT_TEST(test_r4_lmon_reclaim_refuses_unproved_or_legacy_slot_without_mutation)
 	slot = &ut_cr_server_shared.slots[0];
 	prepare_reclaimable_r4_slot(slot, CLUSTER_LMS_CR_R4_QUEUED, 1, 2);
 	before = ut_cr_server_shared;
-	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(
-				   UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(UINT64_C(8), UINT64_C(17)));
 	UT_ASSERT(memcmp(&ut_cr_server_shared, &before, sizeof(before)) == 0);
 
 	reset_submit_fixture(&state);
@@ -1922,8 +1856,7 @@ UT_TEST(test_r4_lmon_reclaim_refuses_unproved_or_legacy_slot_without_mutation)
 	pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_FILLING);
 	before = ut_cr_server_shared;
 	prepare_exact_drain_ack(&state, UINT64_C(8), UINT64_C(17));
-	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(
-				   UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(!cluster_cr_server_r4_lmon_reclaim_closed(UINT64_C(8), UINT64_C(17)));
 	UT_ASSERT(memcmp(&ut_cr_server_shared, &before, sizeof(before)) == 0);
 }
 
@@ -1964,8 +1897,8 @@ UT_TEST(test_r4_worker0_claim_all_local_uses_token_without_peer_matcher)
 	UT_ASSERT_EQ(ut_state_at_enter, CLUSTER_LMS_CR_R4_QUEUED);
 	UT_ASSERT_EQ(ut_peer_open_calls, 0);
 	UT_ASSERT_EQ(ut_leave_calls, 0);
-	UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-		0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+														&ut_expected_admission));
 	UT_ASSERT_EQ(ut_wake_calls, 0);
 }
 
@@ -1985,8 +1918,8 @@ UT_TEST(test_r4_worker0_build_step_publishes_ready_full)
 	UT_ASSERT(ut_builder_foreign_page == slot->foreign_undo_page);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_READY_FULL);
 	UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_NONE);
-	UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-		0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+														&ut_expected_admission));
 	UT_ASSERT_EQ(ut_leave_calls, 0);
 }
 
@@ -2031,8 +1964,8 @@ UT_TEST(test_r4_worker0_build_step_publishes_one_need_undo)
 	UT_ASSERT_EQ(ut_forget_calls, 0);
 	UT_ASSERT_EQ(ut_leave_calls, 0);
 	UT_ASSERT_EQ(ut_wake_calls, 0);
-	UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-		0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+														&ut_expected_admission));
 }
 
 /* A query cancel raised by the immutable-page builder belongs to the exact
@@ -2072,10 +2005,8 @@ UT_TEST(test_r4_worker0_query_cancel_terminalizes_exact_building_slot)
 
 	UT_ASSERT(!caught);
 	UT_ASSERT(returned);
-	UT_ASSERT(ut_context_at_flush
-			  == (MemoryContext)&ut_initial_memory_context_storage);
-	UT_ASSERT(CurrentMemoryContext
-			  == (MemoryContext)&ut_initial_memory_context_storage);
+	UT_ASSERT(ut_context_at_flush == (MemoryContext)&ut_initial_memory_context_storage);
+	UT_ASSERT(CurrentMemoryContext == (MemoryContext)&ut_initial_memory_context_storage);
 	UT_ASSERT_EQ(ut_flush_error_calls, 1);
 	UT_ASSERT_EQ(memcmp(slot, &expected, sizeof(expected)), 0);
 	UT_ASSERT_EQ(ut_builder_step_calls, 1);
@@ -2084,8 +2015,8 @@ UT_TEST(test_r4_worker0_query_cancel_terminalizes_exact_building_slot)
 	UT_ASSERT_EQ(ut_forget_slot_generation, 1);
 	UT_ASSERT_EQ(ut_wake_calls, 1);
 	UT_ASSERT_EQ(ut_leave_calls, 0);
-	UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-		0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+														&ut_expected_admission));
 
 	UT_ASSERT(cluster_cr_server_test_r4_ship_terminal(0));
 	UT_ASSERT_EQ(ut_send_calls, 1);
@@ -2147,28 +2078,24 @@ UT_TEST(test_r4_worker0_foreign_undo_sends_frozen_zero_generation)
 
 	UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
 	UT_ASSERT_EQ(ut_send_calls, 1);
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 	forward = (const ClusterR4CrForwardPayload *)ut_send_payload;
 	UT_ASSERT(ClusterR4ForwardExtensionGetLocatorGeneration(
-		&forward->extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator,
-		&physical_generation));
+		&forward->extension, CLUSTER_R4_WIRE_UNDO_DATA_FETCH, &locator, &physical_generation));
 	UT_ASSERT_EQ(physical_generation, 0);
 	UT_ASSERT_EQ(memcmp(&locator, &ut_pending_locator, sizeof(locator)), 0);
 }
 
 UT_TEST(test_r4_worker0_foreign_undo_admitted_send_is_exact_and_one_shot)
 {
-	const ClusterICSendResult admitted_results[] = {
-		CLUSTER_IC_SEND_DONE,
-		CLUSTER_IC_SEND_WOULD_BLOCK
-	};
+	const ClusterICSendResult admitted_results[]
+		= { CLUSTER_IC_SEND_DONE, CLUSTER_IC_SEND_WOULD_BLOCK };
 	int i;
 
 	for (i = 0; i < lengthof(admitted_results); i++) {
 		ClusterLmsSharedState state;
-		ClusterLmsCrSlot *slot = prepare_worker0_need_undo_frozen(
-			&state, UT_FOREIGN_PHYSICAL_GENERATION);
+		ClusterLmsCrSlot *slot
+			= prepare_worker0_need_undo_frozen(&state, UT_FOREIGN_PHYSICAL_GENERATION);
 
 		ut_send_result = admitted_results[i];
 		UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
@@ -2182,14 +2109,13 @@ UT_TEST(test_r4_worker0_foreign_undo_admitted_send_is_exact_and_one_shot)
 		UT_ASSERT_EQ(ut_note_send_calls, 1);
 		UT_ASSERT_EQ(ut_note_send_family, GCS_BLOCK_SEND_FAMILY_FORWARD);
 		UT_ASSERT_EQ(ut_note_send_result, admitted_results[i]);
-		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-					 CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 		UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_NONE);
 		UT_ASSERT_EQ(ut_tier1_close_calls, 0);
 		UT_ASSERT_EQ(ut_forget_calls, 0);
 		UT_ASSERT_EQ(ut_leave_calls, 0);
-		UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-			0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+		UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+															&ut_expected_admission));
 		UT_ASSERT(!cluster_cr_server_test_r4_send_foreign_undo(0));
 		UT_ASSERT_EQ(ut_pending_locator_calls, 1);
 		UT_ASSERT_EQ(ut_send_calls, 1);
@@ -2202,8 +2128,8 @@ UT_TEST(test_r4_worker0_foreign_undo_admitted_send_is_exact_and_one_shot)
 UT_TEST(test_r4_worker0_foreign_undo_accepts_initial_tt_wrap)
 {
 	ClusterLmsSharedState state;
-	ClusterLmsCrSlot *slot = prepare_worker0_need_undo_frozen(
-		&state, UT_FOREIGN_PHYSICAL_GENERATION);
+	ClusterLmsCrSlot *slot
+		= prepare_worker0_need_undo_frozen(&state, UT_FOREIGN_PHYSICAL_GENERATION);
 	const ClusterR4CrForwardPayload *forward;
 
 	slot->r4.foreign_wrap = TT_WRAP_INITIAL;
@@ -2212,8 +2138,7 @@ UT_TEST(test_r4_worker0_foreign_undo_accepts_initial_tt_wrap)
 	UT_ASSERT_EQ(ut_pending_locator_calls, 1);
 	UT_ASSERT_EQ(ut_send_calls, 1);
 	UT_ASSERT_EQ(ut_state_at_send, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 	UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_NONE);
 	forward = (const ClusterR4CrForwardPayload *)ut_send_payload;
 	UT_ASSERT_EQ(forward->extension.kind.locator_bytes[20], 0);
@@ -2226,8 +2151,8 @@ UT_TEST(test_r4_worker0_foreign_undo_accepts_initial_tt_wrap)
 UT_TEST(test_r4_worker0_foreign_undo_sends_unresolved_wrap_for_origin_upgrade)
 {
 	ClusterLmsSharedState state;
-	ClusterLmsCrSlot *slot = prepare_worker0_need_undo_frozen(
-		&state, UT_FOREIGN_PHYSICAL_GENERATION);
+	ClusterLmsCrSlot *slot
+		= prepare_worker0_need_undo_frozen(&state, UT_FOREIGN_PHYSICAL_GENERATION);
 	const ClusterR4CrForwardPayload *forward;
 
 	slot->r4.foreign_wrap = TT_WRAP_INVALID;
@@ -2235,8 +2160,7 @@ UT_TEST(test_r4_worker0_foreign_undo_sends_unresolved_wrap_for_origin_upgrade)
 	UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
 	UT_ASSERT_EQ(ut_send_calls, 1);
 	UT_ASSERT_EQ(ut_note_send_calls, 1);
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 	UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_NONE);
 	forward = (const ClusterR4CrForwardPayload *)ut_send_payload;
 	UT_ASSERT_EQ(forward->extension.kind.locator_bytes[20], 0xff);
@@ -2254,18 +2178,16 @@ UT_TEST(test_r4_worker0_foreign_undo_refusal_mapping_is_close_first)
 		uint32 terminal_state;
 		ClusterCrBuildReason reason;
 		bool closes_peer;
-	} cases[] = {
-		{ CLUSTER_IC_SEND_NOT_ADMITTED, CLUSTER_LMS_CR_R4_READY_RETRY,
-		  CLUSTER_CR_BUILD_CAPACITY, false },
-		{ CLUSTER_IC_SEND_HARD_ERROR, CLUSTER_LMS_CR_R4_READY_FAIL,
-		  CLUSTER_CR_BUILD_PROTOCOL, true }
-	};
+	} cases[] = { { CLUSTER_IC_SEND_NOT_ADMITTED, CLUSTER_LMS_CR_R4_READY_RETRY,
+					CLUSTER_CR_BUILD_CAPACITY, false },
+				  { CLUSTER_IC_SEND_HARD_ERROR, CLUSTER_LMS_CR_R4_READY_FAIL,
+					CLUSTER_CR_BUILD_PROTOCOL, true } };
 	int i;
 
 	for (i = 0; i < lengthof(cases); i++) {
 		ClusterLmsSharedState state;
-		ClusterLmsCrSlot *slot = prepare_worker0_need_undo_frozen(
-			&state, UT_FOREIGN_PHYSICAL_GENERATION);
+		ClusterLmsCrSlot *slot
+			= prepare_worker0_need_undo_frozen(&state, UT_FOREIGN_PHYSICAL_GENERATION);
 		int fd = -1;
 		bool down = false;
 		bool wes_dirty = false;
@@ -2283,12 +2205,10 @@ UT_TEST(test_r4_worker0_foreign_undo_refusal_mapping_is_close_first)
 		UT_ASSERT_EQ(slot->r4.terminal_reason, cases[i].reason);
 		UT_ASSERT_EQ(ut_tier1_close_calls, cases[i].closes_peer ? 1 : 0);
 		UT_ASSERT_EQ(ut_close_peer_calls, 0);
-		UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(
-			1, &fd, &down, &wes_dirty));
+		UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(1, &fd, &down, &wes_dirty));
 		if (cases[i].closes_peer) {
 			UT_ASSERT_EQ(ut_tier1_close_peer, 1);
-			UT_ASSERT_EQ(ut_state_at_tier1_close,
-						 CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+			UT_ASSERT_EQ(ut_state_at_tier1_close, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 			UT_ASSERT_EQ(fd, -1);
 			UT_ASSERT(down);
 			UT_ASSERT(wes_dirty);
@@ -2299,8 +2219,8 @@ UT_TEST(test_r4_worker0_foreign_undo_refusal_mapping_is_close_first)
 		}
 		UT_ASSERT_EQ(ut_forget_calls, 0);
 		UT_ASSERT_EQ(ut_leave_calls, 0);
-		UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-			0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+		UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+															&ut_expected_admission));
 		UT_ASSERT(!cluster_cr_server_test_r4_send_foreign_undo(0));
 		UT_ASSERT_EQ(ut_send_calls, 1);
 	}
@@ -2312,8 +2232,8 @@ UT_TEST(test_r4_worker0_foreign_undo_refusal_mapping_is_close_first)
 UT_TEST(test_r4_worker0_foreign_undo_locator_mismatch_fails_before_send)
 {
 	ClusterLmsSharedState state;
-	ClusterLmsCrSlot *slot = prepare_worker0_need_undo_frozen(
-		&state, UT_FOREIGN_PHYSICAL_GENERATION);
+	ClusterLmsCrSlot *slot
+		= prepare_worker0_need_undo_frozen(&state, UT_FOREIGN_PHYSICAL_GENERATION);
 
 	ut_pending_locator.xid = 798;
 	UT_ASSERT(cluster_cr_server_test_r4_send_foreign_undo(0));
@@ -2326,8 +2246,8 @@ UT_TEST(test_r4_worker0_foreign_undo_locator_mismatch_fails_before_send)
 	UT_ASSERT_EQ(slot->r4.terminal_reason, CLUSTER_CR_BUILD_PROTOCOL);
 	UT_ASSERT_EQ(ut_forget_calls, 0);
 	UT_ASSERT_EQ(ut_leave_calls, 0);
-	UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-		0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+														&ut_expected_admission));
 	UT_ASSERT(!cluster_cr_server_test_r4_send_foreign_undo(0));
 	UT_ASSERT_EQ(ut_pending_locator_calls, 1);
 	UT_ASSERT_EQ(ut_send_calls, 0);
@@ -2347,11 +2267,9 @@ UT_TEST(test_r4_worker0_status24_lands_exact_foreign_undo_and_short_admission)
 	char page[BLCKSZ];
 
 	make_foreign_undo_reply(&header, &auth, &env, page);
-	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(
-		&env, &header, page, &auth));
+	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
 
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_UNDO_READY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_READY);
 	UT_ASSERT_EQ(memcmp(slot->foreign_undo_page, page, BLCKSZ), 0);
 	UT_ASSERT_EQ(slot->r4.origin_formation_epoch, UT_FORMATION_EPOCH);
 	UT_ASSERT_EQ(slot->r4.origin_live_hwm_lsn, UT_FOREIGN_LIVE_HWM);
@@ -2360,8 +2278,7 @@ UT_TEST(test_r4_worker0_status24_lands_exact_foreign_undo_and_short_admission)
 	UT_ASSERT_EQ(slot->r4.foreign_wrap, ut_pending_locator.tt_wrap);
 	UT_ASSERT_EQ(ut_extract_calls, 1);
 	UT_ASSERT_EQ(ut_state_at_extract, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
-	UT_ASSERT_EQ(memcmp(&ut_extract_locator, &ut_pending_locator,
-					   sizeof(ut_pending_locator)), 0);
+	UT_ASSERT_EQ(memcmp(&ut_extract_locator, &ut_pending_locator, sizeof(ut_pending_locator)), 0);
 	UT_ASSERT_EQ(ut_checksum_calls, 1);
 	UT_ASSERT_EQ(ut_enter_calls, 1);
 	UT_ASSERT_EQ(ut_enter_feature_bit, CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
@@ -2373,8 +2290,8 @@ UT_TEST(test_r4_worker0_status24_lands_exact_foreign_undo_and_short_admission)
 	UT_ASSERT(ut_enter_sequence < ut_recheck_sequence);
 	UT_ASSERT(ut_recheck_sequence < ut_leave_sequence);
 	UT_ASSERT_EQ(ut_wake_calls, 1);
-	UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-		0, true, 1, UT_WORKER0_INCARNATION, &ut_expected_admission));
+	UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+														&ut_expected_admission));
 }
 
 /* TT_WRAP_INVALID is the one legal unresolved request generation.  A valid
@@ -2393,8 +2310,8 @@ UT_TEST(test_r4_worker0_status24_canonicalizes_invalid_wrap_before_ready)
 	slot->r4.foreign_wrap = TT_WRAP_INVALID;
 	ut_pending_locator.tt_wrap = TT_WRAP_INVALID;
 	ut_extract_canonical_wrap = 7;
-	UT_ASSERT(cluster_cr_server_test_r4_freeze_foreign_generation(
-		0, UT_FOREIGN_PHYSICAL_GENERATION));
+	UT_ASSERT(
+		cluster_cr_server_test_r4_freeze_foreign_generation(0, UT_FOREIGN_PHYSICAL_GENERATION));
 	pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
 	ut_enter_calls = 0;
 	ut_recheck_calls = 0;
@@ -2403,10 +2320,8 @@ UT_TEST(test_r4_worker0_status24_canonicalizes_invalid_wrap_before_ready)
 	ut_extract_calls = 0;
 
 	make_foreign_undo_reply(&header, &auth, &env, page);
-	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(
-		&env, &header, page, &auth));
-	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state),
-				 CLUSTER_LMS_CR_R4_UNDO_READY);
+	UT_ASSERT(cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&slot->state), CLUSTER_LMS_CR_R4_UNDO_READY);
 	UT_ASSERT_EQ(slot->r4.foreign_wrap, 7);
 	UT_ASSERT_EQ(ut_extract_calls, 1);
 	UT_ASSERT_EQ(ut_extract_locator.tt_wrap, TT_WRAP_INVALID);
@@ -2461,102 +2376,97 @@ UT_TEST(test_r4_worker0_status24_mismatches_leave_shared_slot_unchanged)
 
 		make_foreign_undo_reply(&header, &auth, &env, page);
 		switch ((RejectCase)i) {
-			case REJECT_ENV_SOURCE:
-				env.source_node_id = 2;
-				break;
-			case REJECT_ENV_DEST:
-				env.dest_node_id = 2;
-				break;
-			case REJECT_ENV_LENGTH:
-				env.payload_length--;
-				break;
-			case REJECT_STATUS:
-				header.status = GCS_BLOCK_REPLY_R4_CR_FULL;
-				break;
-			case REJECT_ENDPOINT:
-				header.requester_backend_id = UT_REQUESTER_BACKEND;
-				break;
-			case REJECT_TRANSITION:
-				header.transition_id = PCM_TRANS_N_TO_X;
-				break;
-			case REJECT_FORWARDING:
-				GcsBlockReplyHeaderSetForwardingMasterNode(&header, UT_MASTER_NODE);
-				break;
-			case REJECT_REQUEST_ID:
-				header.request_id = UINT64CONST(8);
-				break;
-			case REJECT_EPOCH:
-				header.epoch++;
-				break;
-			case REJECT_ORIGIN:
-				header.sender_node = 2;
-				env.source_node_id = 2;
-				break;
-			case REJECT_PHYSICAL_GENERATION:
-				UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(
-					&header, UT_FOREIGN_PHYSICAL_GENERATION + 1));
-				break;
-			case REJECT_LIVE_HWM:
-				header.page_lsn = InvalidXLogRecPtr;
-				break;
-			case REJECT_ENV_EPOCH:
-				env.epoch++;
-				break;
-			case REJECT_AUTHORITY_ZERO:
-				ClusterGcsUndoAuthTrailerSetAuthorityScn(&auth, InvalidScn);
-				break;
-			case REJECT_AUTHORITY_BELOW_DEMAND:
-				ClusterGcsUndoAuthTrailerSetAuthorityScn(
-					&auth, (uint64)(UT_READ_SCN - 1));
-				break;
-			case REJECT_CHECKSUM:
-				header.checksum ^= UINT32_C(1);
-				break;
-			case REJECT_RECORD:
-				ut_extract_ok = false;
-				break;
-			case REJECT_CANONICAL_WRAP:
-				ut_extract_canonical_wrap++;
-				break;
-			case REJECT_SLOT_CONTEXT_KEY:
-				slot->requester_backend++;
-				break;
-			case REJECT_DIRTY_FOREIGN_PAGE:
-				slot->foreign_undo_page[BLCKSZ - 1] = 1;
-				break;
-			case REJECT_FINAL_RECHECK:
-				ut_recheck_ok = false;
-				break;
-			case REJECT_WRONG_WORKER:
-				ut_data_worker_id = 1;
-				break;
-			case REJECT_WORKER_INCARCATION:
-				state.r4_controls.data_worker_incarnation[0]++;
-				break;
-			case REJECT_WRONG_STATE:
-				pg_atomic_write_u32(
-					&slot->state, CLUSTER_LMS_CR_R4_UNDO_READY);
-				break;
+		case REJECT_ENV_SOURCE:
+			env.source_node_id = 2;
+			break;
+		case REJECT_ENV_DEST:
+			env.dest_node_id = 2;
+			break;
+		case REJECT_ENV_LENGTH:
+			env.payload_length--;
+			break;
+		case REJECT_STATUS:
+			header.status = GCS_BLOCK_REPLY_R4_CR_FULL;
+			break;
+		case REJECT_ENDPOINT:
+			header.requester_backend_id = UT_REQUESTER_BACKEND;
+			break;
+		case REJECT_TRANSITION:
+			header.transition_id = PCM_TRANS_N_TO_X;
+			break;
+		case REJECT_FORWARDING:
+			GcsBlockReplyHeaderSetForwardingMasterNode(&header, UT_MASTER_NODE);
+			break;
+		case REJECT_REQUEST_ID:
+			header.request_id = UINT64CONST(8);
+			break;
+		case REJECT_EPOCH:
+			header.epoch++;
+			break;
+		case REJECT_ORIGIN:
+			header.sender_node = 2;
+			env.source_node_id = 2;
+			break;
+		case REJECT_PHYSICAL_GENERATION:
+			UT_ASSERT(GcsBlockReplyHeaderSetR4UndoGeneration(&header,
+															 UT_FOREIGN_PHYSICAL_GENERATION + 1));
+			break;
+		case REJECT_LIVE_HWM:
+			header.page_lsn = InvalidXLogRecPtr;
+			break;
+		case REJECT_ENV_EPOCH:
+			env.epoch++;
+			break;
+		case REJECT_AUTHORITY_ZERO:
+			ClusterGcsUndoAuthTrailerSetAuthorityScn(&auth, InvalidScn);
+			break;
+		case REJECT_AUTHORITY_BELOW_DEMAND:
+			ClusterGcsUndoAuthTrailerSetAuthorityScn(&auth, (uint64)(UT_READ_SCN - 1));
+			break;
+		case REJECT_CHECKSUM:
+			header.checksum ^= UINT32_C(1);
+			break;
+		case REJECT_RECORD:
+			ut_extract_ok = false;
+			break;
+		case REJECT_CANONICAL_WRAP:
+			ut_extract_canonical_wrap++;
+			break;
+		case REJECT_SLOT_CONTEXT_KEY:
+			slot->requester_backend++;
+			break;
+		case REJECT_DIRTY_FOREIGN_PAGE:
+			slot->foreign_undo_page[BLCKSZ - 1] = 1;
+			break;
+		case REJECT_FINAL_RECHECK:
+			ut_recheck_ok = false;
+			break;
+		case REJECT_WRONG_WORKER:
+			ut_data_worker_id = 1;
+			break;
+		case REJECT_WORKER_INCARCATION:
+			state.r4_controls.data_worker_incarnation[0]++;
+			break;
+		case REJECT_WRONG_STATE:
+			pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_R4_UNDO_READY);
+			break;
 		}
 		ut_checksum_calls = 0;
 		before = *slot;
-		UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(
-			&env, &header, page, &auth));
+		UT_ASSERT(!cluster_cr_server_r4_land_foreign_undo(&env, &header, page, &auth));
 		UT_ASSERT_EQ(memcmp(slot, &before, sizeof(before)), 0);
 		UT_ASSERT_EQ(ut_wake_calls, 0);
 		UT_ASSERT_EQ(ut_leave_calls, ut_enter_calls);
 		if ((RejectCase)i != REJECT_SLOT_CONTEXT_KEY)
-			UT_ASSERT(cluster_cr_server_test_r4_context_matches(
-				0, true, 1, UT_WORKER0_INCARNATION, &retained));
+			UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, true, 1, UT_WORKER0_INCARNATION,
+																&retained));
 	}
 }
 
 UT_TEST(test_r4_worker0_remote_full_ship_transfers_frame_and_cleans_context)
 {
-	const ClusterICSendResult admitted_results[] = {
-		CLUSTER_IC_SEND_DONE,
-		CLUSTER_IC_SEND_WOULD_BLOCK
-	};
+	const ClusterICSendResult admitted_results[]
+		= { CLUSTER_IC_SEND_DONE, CLUSTER_IC_SEND_WOULD_BLOCK };
 	int i;
 
 	for (i = 0; i < lengthof(admitted_results); i++) {
@@ -2591,8 +2501,8 @@ UT_TEST(test_r4_worker0_remote_full_ship_transfers_frame_and_cleans_context)
 		UT_ASSERT_EQ(ut_forget_slot_index, 0);
 		UT_ASSERT_EQ(ut_forget_slot_generation, 1);
 		UT_ASSERT_EQ(ut_leave_calls, 1);
-		UT_ASSERT_EQ(memcmp(&ut_left_admission, &ut_expected_admission,
-						 sizeof(ut_expected_admission)), 0);
+		UT_ASSERT_EQ(
+			memcmp(&ut_left_admission, &ut_expected_admission, sizeof(ut_expected_admission)), 0);
 		UT_ASSERT(slot_is_canonical_free_with_generation(slot, 1));
 		UT_ASSERT(cluster_cr_server_test_r4_context_matches(0, false, 0, 0, NULL));
 	}
@@ -2664,13 +2574,10 @@ UT_TEST(test_r4_worker0_retry_and_fail_ship_zero_body_without_image_fence)
 		ClusterCrBuildReason reason;
 		uint32 terminal_state;
 		GcsBlockReplyStatus status;
-	} cases[] = {
-		{ CLUSTER_R4_CR_STEP_RETRY, CLUSTER_CR_BUILD_CAPACITY,
-		  CLUSTER_LMS_CR_R4_READY_RETRY,
-		  GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED },
-		{ CLUSTER_R4_CR_STEP_FAIL, CLUSTER_CR_BUILD_PROTOCOL,
-		  CLUSTER_LMS_CR_R4_READY_FAIL, GCS_BLOCK_REPLY_R4_DENIED }
-	};
+	} cases[] = { { CLUSTER_R4_CR_STEP_RETRY, CLUSTER_CR_BUILD_CAPACITY,
+					CLUSTER_LMS_CR_R4_READY_RETRY, GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED },
+				  { CLUSTER_R4_CR_STEP_FAIL, CLUSTER_CR_BUILD_PROTOCOL,
+					CLUSTER_LMS_CR_R4_READY_FAIL, GCS_BLOCK_REPLY_R4_DENIED } };
 	int i;
 
 	for (i = 0; i < lengthof(cases); i++) {
@@ -2703,8 +2610,7 @@ UT_TEST(test_r4_worker0_retry_and_fail_ship_zero_body_without_image_fence)
 		UT_ASSERT_EQ(header->requester_backend_id, UT_REQUESTER_BACKEND);
 		UT_ASSERT_EQ(header->transition_id, PCM_TRANS_N_TO_S);
 		UT_ASSERT_EQ(header->status, cases[i].status);
-		UT_ASSERT_EQ(GcsBlockReplyHeaderGetForwardingMasterNode(header),
-					 UT_MASTER_NODE);
+		UT_ASSERT_EQ(GcsBlockReplyHeaderGetForwardingMasterNode(header), UT_MASTER_NODE);
 		UT_ASSERT(bytes_are(header->reserved_0, sizeof(header->reserved_0), 0));
 		UT_ASSERT(bytes_are(ut_send_payload + sizeof(*header), BLCKSZ, 0));
 		UT_ASSERT_EQ(ut_checksum_calls, 1);
@@ -2731,8 +2637,7 @@ UT_TEST(test_data_plane_close_peer_now_is_same_process_and_idempotent)
 	UT_ASSERT_EQ(ut_tier1_close_calls, 1);
 	UT_ASSERT_EQ(ut_tier1_close_peer, UT_REQUESTER_NODE);
 	UT_ASSERT(strstr(ut_tier1_close_reason, "R4 undo data send hard error") != NULL);
-	UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(
-		UT_REQUESTER_NODE, &fd, &down, &wes_dirty));
+	UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(UT_REQUESTER_NODE, &fd, &down, &wes_dirty));
 	UT_ASSERT_EQ(fd, -1);
 	UT_ASSERT(down);
 	UT_ASSERT(wes_dirty);
@@ -2744,8 +2649,7 @@ UT_TEST(test_data_plane_close_peer_now_is_same_process_and_idempotent)
 	/* The thin API is legal only for a live remote peer on this DATA plane. */
 	cluster_lms_data_plane_test_seed_peer(UT_REQUESTER_NODE, 78, true, false, false);
 	cluster_lms_data_plane_close_peer_now(UT_REQUESTER_NODE);
-	UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(
-		UT_REQUESTER_NODE, &fd, &down, &wes_dirty));
+	UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(UT_REQUESTER_NODE, &fd, &down, &wes_dirty));
 	UT_ASSERT_EQ(fd, 78);
 	UT_ASSERT(!down);
 	UT_ASSERT(!wes_dirty);
@@ -2777,8 +2681,7 @@ UT_TEST(test_r4_worker0_terminal_hard_error_closes_data_peer_before_cleanup)
 	UT_ASSERT_EQ(ut_forget_calls_at_tier1_close, 0);
 	UT_ASSERT_EQ(ut_leave_calls_at_tier1_close, 0);
 	UT_ASSERT_EQ(ut_close_peer_calls, 0);
-	UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(
-		UT_REQUESTER_NODE, &fd, &down, &wes_dirty));
+	UT_ASSERT(cluster_lms_data_plane_test_peer_snapshot(UT_REQUESTER_NODE, &fd, &down, &wes_dirty));
 	UT_ASSERT_EQ(fd, -1);
 	UT_ASSERT(down);
 	UT_ASSERT(wes_dirty);
@@ -2840,13 +2743,13 @@ UT_TEST(test_all_four_legacy_submitters_use_common_reserver)
 	UT_ASSERT_NOT_NULL(source);
 	if (source != NULL) {
 		UT_ASSERT(function_uses_common_reserver(source, "cluster_lms_cr_submit",
-										 "cluster_lms_cr_submit_r4"));
+												"cluster_lms_cr_submit_r4"));
 		UT_ASSERT(function_uses_common_reserver(source, "cluster_lms_undo_fetch_submit",
-										 "cluster_lms_undo_verdict_submit"));
+												"cluster_lms_undo_verdict_submit"));
 		UT_ASSERT(function_uses_common_reserver(source, "cluster_lms_undo_verdict_submit",
-										 "cluster_lms_undo_multi_verdict_submit"));
+												"cluster_lms_undo_multi_verdict_submit"));
 		UT_ASSERT(function_uses_common_reserver(source, "cluster_lms_undo_multi_verdict_submit",
-										 "lms_undo_fetch_serve"));
+												"lms_undo_fetch_serve"));
 	}
 	free(source);
 }

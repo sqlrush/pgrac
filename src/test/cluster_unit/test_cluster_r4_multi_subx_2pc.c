@@ -45,8 +45,7 @@ static int test_native_read_count;
 static int test_native_read_calls;
 static int test_enter_calls;
 static int test_leave_calls;
-static ClusterSemanticAdmissionResult test_admission_result
-	= CLUSTER_SEMANTIC_ADMISSION_OK;
+static ClusterSemanticAdmissionResult test_admission_result = CLUSTER_SEMANTIC_ADMISSION_OK;
 
 sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
@@ -90,9 +89,8 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 }
 
 int
-GetMultiXactIdMembersWithOffset(MultiXactId multi, MultiXactMember **members,
-								bool from_pgupgrade, bool isLockOnly,
-								MultiXactOffset *start_offset_out)
+GetMultiXactIdMembersWithOffset(MultiXactId multi, MultiXactMember **members, bool from_pgupgrade,
+								bool isLockOnly, MultiXactOffset *start_offset_out)
 {
 	TestNativeRead *read;
 	Size size;
@@ -121,7 +119,7 @@ typedef int (*ClusterR4NativeMultiReadFn)(MultiXactId, MultiXactMember **, bool,
 										  MultiXactOffset *);
 
 StaticAssertDecl(__builtin_types_compatible_p(__typeof__(&GetMultiXactIdMembersWithOffset),
-											ClusterR4NativeMultiReadFn),
+											  ClusterR4NativeMultiReadFn),
 				 "R4 native MultiXact reader signature must remain exact");
 
 static void
@@ -477,8 +475,7 @@ UT_TEST(test_null_output_refuses_before_native_read)
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_NONE;
 
 	reset_runtime_fixture();
-	UT_ASSERT_EQ(cluster_tx_resolve_multixact((MultiXactId)73, NULL, &reason),
-				 CLUSTER_TX_UNKNOWN);
+	UT_ASSERT_EQ(cluster_tx_resolve_multixact((MultiXactId)73, NULL, &reason), CLUSTER_TX_UNKNOWN);
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_PROTOCOL);
 	UT_ASSERT_EQ(test_native_read_calls, 0);
 	UT_ASSERT_EQ(test_leave_calls, 1);

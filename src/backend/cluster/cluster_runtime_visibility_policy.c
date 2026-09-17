@@ -91,21 +91,18 @@ cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLiveAuthority au
 }
 
 bool
-cluster_vis_freshref_c1b_pair_request_eligible(
-	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status,
-	SCN cached_commit_scn, uint32 ref_epoch, uint64 current_epoch,
-	int32 origin_node, int32 local_node, uint32 segment_id,
-	uint32 expected_tt_slot_id)
+cluster_vis_freshref_c1b_pair_request_eligible(TransactionId raw_xid, TransactionId ref_xid,
+											   bool has_cached_status, SCN cached_commit_scn,
+											   uint32 ref_epoch, uint64 current_epoch,
+											   int32 origin_node, int32 local_node,
+											   uint32 segment_id, uint32 expected_tt_slot_id)
 {
-	return TransactionIdIsNormal(raw_xid) && ref_xid == raw_xid
-		   && has_cached_status && SCN_VALID(cached_commit_scn)
-		   && current_epoch <= UINT32_MAX
-		   && ref_epoch == (uint32)current_epoch
-		   && origin_node >= 0 && origin_node < CLUSTER_MAX_NODES
-		   && local_node >= 0 && local_node < CLUSTER_MAX_NODES
-		   && origin_node != local_node && segment_id > 0
-		   && segment_id <= UINT16_MAX && expected_tt_slot_id >= 1
-		   && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT;
+	return TransactionIdIsNormal(raw_xid) && ref_xid == raw_xid && has_cached_status
+		   && SCN_VALID(cached_commit_scn) && current_epoch <= UINT32_MAX
+		   && ref_epoch == (uint32)current_epoch && origin_node >= 0
+		   && origin_node < CLUSTER_MAX_NODES && local_node >= 0 && local_node < CLUSTER_MAX_NODES
+		   && origin_node != local_node && segment_id > 0 && segment_id <= UINT16_MAX
+		   && expected_tt_slot_id >= 1 && expected_tt_slot_id <= TT_SLOTS_PER_SEGMENT;
 }
 
 /*

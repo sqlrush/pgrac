@@ -70,16 +70,16 @@ GetCurrentTimestamp(void)
 TimestampTz
 TimestampTzPlusMilliseconds(TimestampTz t, int64 ms)
 {
-	return t + (TimestampTz) ms * 1000;
+	return t + (TimestampTz)ms * 1000;
 }
 
 int
 WaitLatch(Latch *latch, int wakeEvents, long timeout, uint32 wait_event_info)
 {
-	(void) latch;
-	(void) wakeEvents;
-	(void) timeout;
-	(void) wait_event_info;
+	(void)latch;
+	(void)wakeEvents;
+	(void)timeout;
+	(void)wait_event_info;
 	ut_waitlatch_calls++;
 	/* Advance the fake clock 100ms per backoff so the bounded-retry
 	 * deadline tests complete quickly. */
@@ -90,15 +90,14 @@ WaitLatch(Latch *latch, int wakeEvents, long timeout, uint32 wait_event_info)
 void
 ResetLatch(Latch *latch)
 {
-	(void) latch;
+	(void)latch;
 }
 
 volatile sig_atomic_t InterruptPending = 0;
 
 void
 ProcessInterrupts(void)
-{
-}
+{}
 
 bool
 cluster_authority_serving_rebind_leaver(void)
@@ -107,9 +106,10 @@ cluster_authority_serving_rebind_leaver(void)
 }
 
 ClusterControlRootResult
-cluster_control_root_lookup_owner_by_node_runtime(
-	int32 old_node_id, ClusterControlRootIdentity *out_identity,
-	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token)
+cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
+												  ClusterControlRootIdentity *out_identity,
+												  ClusterControlRootSnapshot *out_snapshot,
+												  ClusterControlRootReadToken *out_token)
 {
 	(void)old_node_id;
 	if (ut_root_lookup_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -122,10 +122,9 @@ cluster_control_root_lookup_owner_by_node_runtime(
 }
 
 ClusterRecoveryOwnerImportResult
-cluster_recovery_owner_import_read_v1(
-	int32 node_id, const ClusterWalThreadClaim *immutable_claim,
-	uint64 frozen_admitted_bitmap_low, uint64 frozen_admitted_bitmap_high,
-	uint64 *out_incarnation)
+cluster_recovery_owner_import_read_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
+									  uint64 frozen_admitted_bitmap_low,
+									  uint64 frozen_admitted_bitmap_high, uint64 *out_incarnation)
 {
 	(void)node_id;
 	(void)immutable_claim;
@@ -137,10 +136,11 @@ cluster_recovery_owner_import_read_v1(
 }
 
 ClusterControlRootResult
-cluster_control_root_compare_and_publish(
-	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootPatch *patch, ClusterControlRootPublishReason reason,
-	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token)
+cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
+										 const ClusterControlRootPatch *patch,
+										 ClusterControlRootPublishReason reason,
+										 ClusterControlRootSnapshot *out_snapshot,
+										 ClusterControlRootReadToken *out_token)
 {
 	ClusterControlRootReadToken observed_token = *expected_token;
 
@@ -155,9 +155,8 @@ cluster_control_root_compare_and_publish(
 	ut_root_published_reason = reason;
 	if (ut_root_publish_mutate_token)
 		observed_token.root_publish_seq++;
-	ut_root_publish_context_authorized =
-		cluster_control_root_publish_authority_current_v1(
-			&observed_token, patch, reason);
+	ut_root_publish_context_authorized
+		= cluster_control_root_publish_authority_current_v1(&observed_token, patch, reason);
 	if (!ut_root_publish_context_authorized)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	/* Mirror the real CAS monotonicity (control_root.c compare_and_publish,
@@ -180,40 +179,32 @@ cluster_control_root_compare_and_publish(
 		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE) != 0)
 			out_snapshot->lifecycle = patch->desired.lifecycle;
 		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE) != 0) {
-			out_snapshot->identity.origin_owner_incarnation =
-				patch->desired.identity.origin_owner_incarnation;
-			out_snapshot->identity.root_lineage_seq =
-				patch->desired.identity.root_lineage_seq;
+			out_snapshot->identity.origin_owner_incarnation
+				= patch->desired.identity.origin_owner_incarnation;
+			out_snapshot->identity.root_lineage_seq = patch->desired.identity.root_lineage_seq;
 		}
 		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT) != 0) {
 			out_snapshot->checkpoint_tli = patch->desired.checkpoint_tli;
-			out_snapshot->checkpoint_source_kind =
-				patch->desired.checkpoint_source_kind;
-			out_snapshot->checkpoint_lower_lsn =
-				patch->desired.checkpoint_lower_lsn;
-			out_snapshot->checkpoint_record_crc32c =
-				patch->desired.checkpoint_record_crc32c;
+			out_snapshot->checkpoint_source_kind = patch->desired.checkpoint_source_kind;
+			out_snapshot->checkpoint_lower_lsn = patch->desired.checkpoint_lower_lsn;
+			out_snapshot->checkpoint_record_crc32c = patch->desired.checkpoint_record_crc32c;
 		}
 		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_TAIL) != 0) {
 			out_snapshot->tail_tli = patch->desired.tail_tli;
-			out_snapshot->tail_validation_kind =
-				patch->desired.tail_validation_kind;
-			out_snapshot->validated_tail_lsn_exclusive =
-				patch->desired.validated_tail_lsn_exclusive;
-			out_snapshot->tail_last_record_lsn =
-				patch->desired.tail_last_record_lsn;
-			out_snapshot->tail_last_record_crc32c =
-				patch->desired.tail_last_record_crc32c;
+			out_snapshot->tail_validation_kind = patch->desired.tail_validation_kind;
+			out_snapshot->validated_tail_lsn_exclusive
+				= patch->desired.validated_tail_lsn_exclusive;
+			out_snapshot->tail_last_record_lsn = patch->desired.tail_last_record_lsn;
+			out_snapshot->tail_last_record_crc32c = patch->desired.tail_last_record_crc32c;
 		}
 		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS) != 0) {
 			out_snapshot->root_flags = patch->desired.root_flags;
 			out_snapshot->recovered_tli = patch->desired.recovered_tli;
-			out_snapshot->recovered_through_lsn_exclusive =
-				patch->desired.recovered_through_lsn_exclusive;
-			out_snapshot->recovered_last_record_lsn =
-				patch->desired.recovered_last_record_lsn;
-			out_snapshot->recovered_last_record_crc32c =
-				patch->desired.recovered_last_record_crc32c;
+			out_snapshot->recovered_through_lsn_exclusive
+				= patch->desired.recovered_through_lsn_exclusive;
+			out_snapshot->recovered_last_record_lsn = patch->desired.recovered_last_record_lsn;
+			out_snapshot->recovered_last_record_crc32c
+				= patch->desired.recovered_last_record_crc32c;
 		}
 		if ((patch->mask & CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY) != 0)
 			out_snapshot->root_flags = patch->desired.root_flags;
@@ -243,7 +234,7 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 
 bool
 cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
-											ClusterFormationSnapshotV1 *out)
+											   ClusterFormationSnapshotV1 *out)
 {
 	(void)origin_thread;
 	(void)out;
@@ -265,8 +256,8 @@ cluster_write_fence_authority_cache_sequence(void)
 
 bool
 cluster_write_fence_authority_cache_publish_if_unchanged(const ClusterFenceMarker *marker,
-												 uint64 published_at_us,
-												 uint64 expected_sequence)
+														 uint64 published_at_us,
+														 uint64 expected_sequence)
 {
 	(void)marker;
 	(void)published_at_us;
@@ -378,8 +369,7 @@ sha256_bytes(const uint8 *bytes, size_t len, uint8 out[PG_SHA256_DIGEST_LENGTH])
 {
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
 
-	if (ctx == NULL || pg_cryptohash_init(ctx) < 0
-		|| pg_cryptohash_update(ctx, bytes, len) < 0
+	if (ctx == NULL || pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, bytes, len) < 0
 		|| pg_cryptohash_final(ctx, out, PG_SHA256_DIGEST_LENGTH) < 0)
 		abort();
 	pg_cryptohash_free(ctx);
@@ -403,7 +393,7 @@ build_valid_key(ClusterRecoveryDutyKey *key)
 	key->origin_node_id = 3;
 	key->thread_claim_created_at = INT64_C(1700000000000123);
 	cluster_wal_thread_claim_fill(&claim, key->origin_thread_id, key->origin_node_id,
-								 key->thread_claim_created_at);
+								  key->thread_claim_created_at);
 	key->thread_claim_crc32c = claim.crc;
 	key->origin_owner_incarnation = UINT64_C(0x1122334455667788);
 	key->root_lineage_seq = UINT64_C(9);
@@ -419,17 +409,14 @@ setup_owner_rejoin(uint64 old_incarnation, uint64 new_incarnation)
 	ut_root_snapshot.identity.origin_owner_incarnation = old_incarnation;
 	ut_root_identity = ut_root_snapshot.identity;
 	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
-	ut_root_snapshot.root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
-								 | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
-								 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-								 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	ut_root_snapshot.root_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 	ut_root_snapshot.checkpoint_tli = 1;
 	ut_root_snapshot.tail_tli = 1;
 	ut_root_snapshot.recovered_tli = 1;
-	ut_root_snapshot.checkpoint_source_kind =
-		CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
-	ut_root_snapshot.tail_validation_kind =
-		CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	ut_root_snapshot.checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+	ut_root_snapshot.tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
 	ut_root_snapshot.checkpoint_lower_lsn = UINT64_C(0x1000000);
 	ut_root_snapshot.validated_tail_lsn_exclusive = UINT64_C(0x1100000);
 	ut_root_snapshot.recovered_through_lsn_exclusive = UINT64_C(0x1100000);
@@ -466,21 +453,19 @@ static uint32 ut_ack_min_stage = 0;
 
 bool
 cluster_semantic_activation_ack_complete_matches(
-	uint64 transition_epoch, uint64 record_generation,
-	uint64 expected_members_lo, uint64 expected_members_hi,
-	uint64 source_feature_bitmap, uint64 target_feature_bitmap,
-	uint64 capability_sample_digest,
-	ClusterSemanticActivationAckStage minimum_stage)
+	uint64 transition_epoch, uint64 record_generation, uint64 expected_members_lo,
+	uint64 expected_members_hi, uint64 source_feature_bitmap, uint64 target_feature_bitmap,
+	uint64 capability_sample_digest, ClusterSemanticActivationAckStage minimum_stage)
 {
 	ut_ack_complete_calls++;
-	ut_ack_min_stage = (uint32) minimum_stage;
-	(void) transition_epoch;
-	(void) record_generation;
-	(void) expected_members_lo;
-	(void) expected_members_hi;
-	(void) source_feature_bitmap;
-	(void) target_feature_bitmap;
-	(void) capability_sample_digest;
+	ut_ack_min_stage = (uint32)minimum_stage;
+	(void)transition_epoch;
+	(void)record_generation;
+	(void)expected_members_lo;
+	(void)expected_members_hi;
+	(void)source_feature_bitmap;
+	(void)target_feature_bitmap;
+	(void)capability_sample_digest;
 	return ut_ack_complete_ok;
 }
 
@@ -515,46 +500,35 @@ UT_TEST(test_checkpoint_advance_publishes_canonical_bound)
 	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
 	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	UT_ASSERT(cluster_control_root_checkpoint_advance_publish(
-		UINT64_C(0x2000000), 1, UINT64_C(0x1fffff0), UINT64_C(0x2000020),
-		UINT32_C(0x44556677)));
+		UINT64_C(0x2000000), 1, UINT64_C(0x1fffff0), UINT64_C(0x2000020), UINT32_C(0x44556677)));
 	UT_ASSERT_EQ(ut_root_publish_calls, 1);
 	UT_ASSERT(ut_root_publish_context_authorized);
 	UT_ASSERT_EQ((int)ut_root_published_reason,
 				 (int)CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE);
 	UT_ASSERT_EQ(ut_root_published_patch.mask, UINT64_C(0x38));
-	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
-				 CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
 	/* The 0x38 mask has no LIFECYCLE bit: desired.lifecycle stays 0. */
-	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle,
-				 CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED);
-	UT_ASSERT_EQ(ut_root_published_patch.desired.checkpoint_lower_lsn,
-				 UINT64_C(0x2000000));
-	UT_ASSERT_EQ(ut_root_published_patch.desired.checkpoint_record_crc32c,
-				 UINT32_C(0x44556677));
-	UT_ASSERT_EQ(ut_root_published_patch.desired.validated_tail_lsn_exclusive,
-				 UINT64_C(0x2000020));
-	UT_ASSERT_EQ(ut_root_published_patch.desired.tail_last_record_lsn,
-				 UINT64_C(0x1fffff0));
-	UT_ASSERT_EQ(ut_root_published_patch.desired.tail_last_record_crc32c,
-				 UINT32_C(0x44556677));
-	UT_ASSERT_EQ(
-		ut_root_published_patch.desired.identity.origin_owner_incarnation, 0);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.checkpoint_lower_lsn, UINT64_C(0x2000000));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.checkpoint_record_crc32c, UINT32_C(0x44556677));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.validated_tail_lsn_exclusive, UINT64_C(0x2000020));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.tail_last_record_lsn, UINT64_C(0x1fffff0));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.tail_last_record_crc32c, UINT32_C(0x44556677));
+	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.origin_owner_incarnation, 0);
 	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.root_lineage_seq, 0);
 
 	/* A non-advancing redo (<= current bound) is a no-op: zero publishes. */
 	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
 	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	UT_ASSERT(!cluster_control_root_checkpoint_advance_publish(
-		UINT64_C(0x1000000), 1, UINT64_C(0xfffff0), UINT64_C(0x1000020),
-		UINT32_C(0x44556677)));
+		UINT64_C(0x1000000), 1, UINT64_C(0xfffff0), UINT64_C(0x1000020), UINT32_C(0x44556677)));
 	UT_ASSERT_EQ(ut_root_publish_calls, 0);
 
 	/* Not OPEN (e.g. CLOSED / RECOVERY_COMPLETE) is fail-closed. */
 	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
 	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
 	UT_ASSERT(!cluster_control_root_checkpoint_advance_publish(
-		UINT64_C(0x2000000), 1, UINT64_C(0x1fffff0), UINT64_C(0x2000020),
-		UINT32_C(0x44556677)));
+		UINT64_C(0x2000000), 1, UINT64_C(0x1fffff0), UINT64_C(0x2000020), UINT32_C(0x44556677)));
 	UT_ASSERT_EQ(ut_root_publish_calls, 0);
 }
 
@@ -567,14 +541,11 @@ UT_TEST(test_fpw_sticky_publishes_canonical_flag)
 	UT_ASSERT(cluster_control_root_fpw_sticky_publish());
 	UT_ASSERT_EQ(ut_root_publish_calls, 1);
 	UT_ASSERT(ut_root_publish_context_authorized);
-	UT_ASSERT_EQ((int)ut_root_published_reason,
-				 (int)CLUSTER_CONTROL_ROOT_PUBLISH_FPW_STICKY);
-	UT_ASSERT_EQ(ut_root_published_patch.mask,
-				 CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY);
-	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
-				 CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
-	UT_ASSERT((ut_root_published_patch.desired.root_flags
-			   & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0);
+	UT_ASSERT_EQ((int)ut_root_published_reason, (int)CLUSTER_CONTROL_ROOT_PUBLISH_FPW_STICKY);
+	UT_ASSERT_EQ(ut_root_published_patch.mask, CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY);
+	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT((ut_root_published_patch.desired.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF)
+			  != 0);
 
 	/* Already sticky is a no-op (the apply_patch guard never clears it). */
 	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
@@ -607,8 +578,8 @@ UT_TEST(test_create_authority_requires_complete_ack_round)
 	round.prepare_generation = 7;
 	round.transition_epoch = 3;
 	round.source_feature_bitmap = UINT64_C(1);
-	round.target_feature_bitmap =
-		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.target_feature_bitmap
+		= UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
 	round.admitted_bitmap_low = UINT64_C(0x03);
 	round.admitted_bitmap_high = 0;
 	round.capability_sample_digest = UINT64_C(0xabcd);
@@ -653,18 +624,17 @@ UT_TEST(test_create_authority_requires_complete_ack_round)
 	ut_ack_complete_calls = 0;
 	UT_ASSERT(!cluster_control_root_create_authority_current_v1(&image, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
-	UT_ASSERT_EQ((int)ut_ack_min_stage,
-				 (int)CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
+	UT_ASSERT_EQ((int)ut_ack_min_stage, (int)CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE);
 
 	/* Target with an UNKNOWN feature bit + bit22 -> refused (whitelist
 	 * gate), with no ACK read (exempt round). */
-	round.target_feature_bitmap = (UINT64_C(1) << 20)
-		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.target_feature_bitmap
+		= (UINT64_C(1) << 20) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
 	ut_ack_complete_calls = 0;
 	UT_ASSERT(!cluster_control_root_create_authority_current_v1(&image, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
-	round.target_feature_bitmap =
-		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.target_feature_bitmap
+		= UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
 }
 
 UT_TEST(test_activate_authority_requires_complete_ack_round)
@@ -689,8 +659,8 @@ UT_TEST(test_activate_authority_requires_complete_ack_round)
 	round.prepare_generation = 7;
 	round.transition_epoch = 3;
 	round.source_feature_bitmap = UINT64_C(1);
-	round.target_feature_bitmap =
-		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.target_feature_bitmap
+		= UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
 	round.admitted_bitmap_low = UINT64_C(0x03);
 	round.admitted_bitmap_high = 0;
 	round.capability_sample_digest = UINT64_C(0xabcd);
@@ -704,61 +674,52 @@ UT_TEST(test_activate_authority_requires_complete_ack_round)
 	ut_census_ok = false;
 	ut_ack_complete_ok = true;
 	ut_ack_complete_calls = 0;
-	UT_ASSERT(cluster_control_root_activate_authority_current_v1(
-		&token, sha, &round));
+	UT_ASSERT(cluster_control_root_activate_authority_current_v1(&token, sha, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
 
 	/* ACK COMPLETE + bit22 target -> granted, and the activate proof
 	 * demands the PREPARED stage (W6 clause 3). */
 	ut_census_ok = true;
 	ut_ack_min_stage = 0;
-	UT_ASSERT(cluster_control_root_activate_authority_current_v1(
-		&token, sha, &round));
-	UT_ASSERT_EQ((int)ut_ack_min_stage,
-				 (int)CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
+	UT_ASSERT(cluster_control_root_activate_authority_current_v1(&token, sha, &round));
+	UT_ASSERT_EQ((int)ut_ack_min_stage, (int)CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED);
 
 	/* ACK not COMPLETE -> refused. */
 	ut_ack_complete_ok = false;
 	ut_ack_complete_calls = 0;
-	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
-		&token, sha, &round));
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(&token, sha, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
 	ut_ack_complete_ok = true;
 
 	/* Non-coordinator -> refused BEFORE any ACK read (fail-fast). */
 	cluster_node_id = 1;
 	ut_ack_complete_calls = 0;
-	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
-		&token, sha, &round));
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(&token, sha, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
 	cluster_node_id = 0;
 
 	/* Target WITHOUT bit22 -> refused (the bit22 cutover carrier). */
 	round.target_feature_bitmap = UINT64_C(1);
 	ut_ack_complete_calls = 0;
-	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
-		&token, sha, &round));
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(&token, sha, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
-	round.target_feature_bitmap =
-		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.target_feature_bitmap
+		= UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
 
 	/* Target with an UNKNOWN feature bit -> refused (whitelist gate). */
-	round.target_feature_bitmap = (UINT64_C(1) << 20)
-		| PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.target_feature_bitmap
+		= (UINT64_C(1) << 20) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
 	ut_ack_complete_calls = 0;
-	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
-		&token, sha, &round));
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(&token, sha, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 1);
-	round.target_feature_bitmap =
-		UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	round.target_feature_bitmap
+		= UINT64_C(1) | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
 
 	/* NULL round / NULL sha -> refused before any read. */
 	ut_ack_complete_calls = 0;
-	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
-		&token, sha, NULL));
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(&token, sha, NULL));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
-	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(
-		&token, NULL, &round));
+	UT_ASSERT(!cluster_control_root_activate_authority_current_v1(&token, NULL, &round));
 	UT_ASSERT_EQ(ut_ack_complete_calls, 0);
 }
 
@@ -773,16 +734,13 @@ UT_TEST(test_owner_rejoin_requires_jcmk_and_publishes_exact_root_cas)
 	UT_ASSERT_EQ(ut_root_publish_calls, 1);
 	UT_ASSERT(ut_root_publish_context_authorized);
 	UT_ASSERT(!cluster_control_root_publish_authority_current_v1(
-		&ut_root_token, &ut_root_published_patch,
-		CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
+		&ut_root_token, &ut_root_published_patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
 	UT_ASSERT_EQ(ut_root_published_patch.mask, UINT64_C(0x3b));
 	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
 				 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
-	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle,
-				 CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
-	UT_ASSERT_EQ(
-		ut_root_published_patch.desired.identity.origin_owner_incarnation,
-		new_incarnation);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.origin_owner_incarnation,
+				 new_incarnation);
 	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.root_lineage_seq,
 				 ut_root_identity.root_lineage_seq + 1);
 }
@@ -795,8 +753,7 @@ UT_TEST(test_owner_rejoin_publication_context_rejects_token_drift)
 	UT_ASSERT_EQ(ut_root_publish_calls, 1);
 	UT_ASSERT(!ut_root_publish_context_authorized);
 	UT_ASSERT(!cluster_control_root_publish_authority_current_v1(
-		&ut_root_token, &ut_root_published_patch,
-		CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
+		&ut_root_token, &ut_root_published_patch, CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN));
 }
 
 UT_TEST(test_recovery_complete_uses_exact_private_publish_authority)
@@ -807,30 +764,24 @@ UT_TEST(test_recovery_complete_uses_exact_private_publish_authority)
 	ClusterControlRootResult result;
 
 	setup_owner_rejoin(UINT64_C(70), UINT64_C(77));
-	ut_root_snapshot.lifecycle =
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	ut_root_snapshot.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
 	ut_root_token.lifecycle = ut_root_snapshot.lifecycle;
 	memset(&patch, 0, sizeof(patch));
-	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE |
-		CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
-	patch.expected_lifecycle =
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
-	patch.desired.lifecycle =
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
-	patch.desired.root_flags = ut_root_snapshot.root_flags |
-		CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	patch.mask
+		= CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
+	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	patch.desired.root_flags
+		= ut_root_snapshot.root_flags | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 	patch.desired.recovered_tli = ut_root_snapshot.tail_tli;
-	patch.desired.recovered_through_lsn_exclusive =
-		ut_root_snapshot.validated_tail_lsn_exclusive;
-	result = cluster_control_root_recovery_complete_publish_v1(
-		&ut_root_token, &patch, &published, &published_token);
+	patch.desired.recovered_through_lsn_exclusive = ut_root_snapshot.validated_tail_lsn_exclusive;
+	result = cluster_control_root_recovery_complete_publish_v1(&ut_root_token, &patch, &published,
+															   &published_token);
 	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(ut_root_publish_calls, 1);
 	UT_ASSERT(ut_root_publish_context_authorized);
-	UT_ASSERT_EQ(ut_root_published_reason,
-		CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE);
-	UT_ASSERT_EQ(published.lifecycle,
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+	UT_ASSERT_EQ(ut_root_published_reason, CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE);
+	UT_ASSERT_EQ(published.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
 }
 
 UT_TEST(test_owner_rejoin_rejects_open_stale_owner_frozen)
@@ -885,8 +836,8 @@ UT_TEST(test_clean_close_retry_deadline_gives_up_fail_closed)
 	ut_now_us = 1700000000000000LL;
 	ut_waitlatch_calls = 0;
 	UT_ASSERT(!cluster_control_root_thread_clean_close_publish_retry());
-	UT_ASSERT(ut_root_publish_calls > 1);	/* multiple attempts */
-	UT_ASSERT(ut_waitlatch_calls >= 40);	/* bounded: ~50 backoffs, never unbounded */
+	UT_ASSERT(ut_root_publish_calls > 1); /* multiple attempts */
+	UT_ASSERT(ut_waitlatch_calls >= 40);  /* bounded: ~50 backoffs, never unbounded */
 	ut_root_publish_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -905,15 +856,10 @@ UT_TEST(test_owner_rejoin_closed_lifecycle_routes_to_thread_open)
 	UT_ASSERT_EQ(ut_owner_read_calls, 1);
 	UT_ASSERT_EQ(ut_root_publish_calls, 1);
 	UT_ASSERT(ut_root_publish_context_authorized);
-	UT_ASSERT_EQ((int)ut_root_published_reason,
-				 (int)CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN);
-	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle,
-				 CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
-	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle,
-				 CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
-	UT_ASSERT_EQ(
-		ut_root_published_patch.desired.identity.origin_owner_incarnation,
-		UINT64_C(77));
+	UT_ASSERT_EQ((int)ut_root_published_reason, (int)CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN);
+	UT_ASSERT_EQ(ut_root_published_patch.expected_lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.origin_owner_incarnation, UINT64_C(77));
 	UT_ASSERT_EQ(ut_root_published_patch.desired.identity.root_lineage_seq,
 				 ut_root_identity.root_lineage_seq + 1);
 
@@ -993,8 +939,8 @@ build_expected_encoding(const ClusterRecoveryDutyKey *key,
 }
 
 static void
-build_valid_formation(ClusterFormationSnapshotV1 *snapshot,
-					  ClusterFenceAuthorityProof *proof, uint16 origin_thread)
+build_valid_formation(ClusterFormationSnapshotV1 *snapshot, ClusterFenceAuthorityProof *proof,
+					  uint16 origin_thread)
 {
 	int32 origin_node = (int32)origin_thread - 1;
 
@@ -1028,8 +974,7 @@ build_valid_formation(ClusterFormationSnapshotV1 *snapshot,
 }
 
 static void
-build_owner_samples(ClusterRecoveryOwnerDiskSampleV1 samples[3], int32 node_id,
-					uint64 incarnation)
+build_owner_samples(ClusterRecoveryOwnerDiskSampleV1 samples[3], int32 node_id, uint64 incarnation)
 {
 	int i;
 
@@ -1043,8 +988,8 @@ build_owner_samples(ClusterRecoveryOwnerDiskSampleV1 samples[3], int32 node_id,
 }
 
 static void
-set_committed_join_marker(ClusterJoinCommitMarker *marker, int32 node_id,
-						  uint64 incarnation, uint64 nonce)
+set_committed_join_marker(ClusterJoinCommitMarker *marker, int32 node_id, uint64 incarnation,
+						  uint64 nonce)
 {
 	pg_crc32c crc;
 
@@ -1074,8 +1019,8 @@ UT_TEST(test_owner_import_prefers_exact_jcmk_majority)
 	set_committed_join_marker(&samples[0].join_marker, 3, 77, 11);
 	samples[1].join_marker = samples[0].join_marker;
 	set_committed_join_marker(&samples[2].join_marker, 3, 88, 12);
-	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(
-				 3, &claim, UINT64_C(1) << 3, 0, samples, 3, &incarnation),
+	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(3, &claim, UINT64_C(1) << 3, 0, samples, 3,
+														 &incarnation),
 				 CLUSTER_RECOVERY_OWNER_IMPORT_JCMK);
 	UT_ASSERT_EQ(incarnation, 77);
 }
@@ -1091,8 +1036,8 @@ UT_TEST(test_owner_import_never_falls_back_from_split_jcmk)
 	set_committed_join_marker(&samples[0].join_marker, 3, 77, 11);
 	set_committed_join_marker(&samples[1].join_marker, 3, 88, 12);
 	set_committed_join_marker(&samples[2].join_marker, 3, 99, 13);
-	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(
-				 3, &claim, UINT64_C(1) << 3, 0, samples, 3, &incarnation),
+	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(3, &claim, UINT64_C(1) << 3, 0, samples, 3,
+														 &incarnation),
 				 CLUSTER_RECOVERY_OWNER_IMPORT_JCMK_UNPROVEN);
 	UT_ASSERT_EQ(incarnation, 0);
 }
@@ -1106,19 +1051,18 @@ UT_TEST(test_owner_import_slot_fallback_requires_absent_jcmk_and_claim)
 	build_owner_samples(samples, 3, 70);
 	samples[2].slot.incarnation = 71;
 	cluster_wal_thread_claim_fill(&claim, 4, 3, INT64_C(12345));
-	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(
-				 3, &claim, UINT64_C(1) << 3, 0, samples, 3, &incarnation),
+	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(3, &claim, UINT64_C(1) << 3, 0, samples, 3,
+														 &incarnation),
 				 CLUSTER_RECOVERY_OWNER_IMPORT_VOTING_SLOT);
 	UT_ASSERT_EQ(incarnation, 70);
 	claim.node_id = 4;
 	incarnation = UINT64_C(0xdeadbeef);
-	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(
-				 3, &claim, UINT64_C(1) << 3, 0, samples, 3, &incarnation),
+	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(3, &claim, UINT64_C(1) << 3, 0, samples, 3,
+														 &incarnation),
 				 CLUSTER_RECOVERY_OWNER_IMPORT_CLAIM_MISMATCH);
 	UT_ASSERT_EQ(incarnation, 0);
 	cluster_wal_thread_claim_fill(&claim, 4, 3, INT64_C(12345));
-	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(
-				 3, &claim, 0, 0, samples, 3, &incarnation),
+	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(3, &claim, 0, 0, samples, 3, &incarnation),
 				 CLUSTER_RECOVERY_OWNER_IMPORT_SLOT_UNPROVEN);
 }
 
@@ -1131,8 +1075,8 @@ UT_TEST(test_owner_import_cannot_prove_jcmk_absence_with_unreadable_disk)
 	build_owner_samples(samples, 3, 70);
 	samples[2].join_io_state = CLUSTER_VOTING_DISK_IO_FAILED;
 	cluster_wal_thread_claim_fill(&claim, 4, 3, INT64_C(12345));
-	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(
-				 3, &claim, UINT64_C(1) << 3, 0, samples, 3, &incarnation),
+	UT_ASSERT_EQ(cluster_recovery_owner_import_select_v1(3, &claim, UINT64_C(1) << 3, 0, samples, 3,
+														 &incarnation),
 				 CLUSTER_RECOVERY_OWNER_IMPORT_IO_FAILED);
 	UT_ASSERT_EQ(incarnation, 0);
 }
@@ -1204,11 +1148,12 @@ assert_invalid_key(ClusterRecoveryDutyKey *key)
 	memset(encoded, 0xee, sizeof(encoded));
 	memset(&digest, 0xee, sizeof(digest));
 	UT_ASSERT(!cluster_recovery_duty_key_encode_v1(key, encoded));
-	UT_ASSERT(memcmp(encoded, (uint8[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]){0},
-				 sizeof(encoded)) == 0);
+	UT_ASSERT(memcmp(encoded, (uint8[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]){ 0 }, sizeof(encoded))
+			  == 0);
 	UT_ASSERT(!cluster_recovery_duty_digest_v1(key, &digest));
-	UT_ASSERT(memcmp(digest.bytes, (uint8[CLUSTER_RECOVERY_DUTY_DIGEST_BYTES]){0},
-				 sizeof(digest.bytes)) == 0);
+	UT_ASSERT(
+		memcmp(digest.bytes, (uint8[CLUSTER_RECOVERY_DUTY_DIGEST_BYTES]){ 0 }, sizeof(digest.bytes))
+		== 0);
 	UT_ASSERT_EQ(cluster_recovery_duty_key_compare(key, &valid),
 				 CLUSTER_RECOVERY_DUTY_COMPARE_INVALID);
 }

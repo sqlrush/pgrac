@@ -80,8 +80,8 @@ extern ClusterTxwResult cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder
 /* R4 D9 exact TARGET wait.  The caller owns locator capture and mandatory
  * post-wait page/tuple requalification; this layer never returns visibility. */
 extern ClusterTxwResult cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator,
-											  int effective_timeout_ms,
-											  ClusterTxResolveReason *reason_out);
+													  int effective_timeout_ms,
+													  ClusterTxResolveReason *reason_out);
 
 /* Idempotent R4 D9 SOURCE/TARGET-wait cleanup for proc_exit/FATAL paths. */
 extern void cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code, Datum arg);
@@ -93,9 +93,9 @@ extern void cluster_tx_enqueue_cleanup_on_backend_exit_callback(int code, Datum 
  * the heap caller re-DESCRIBE exact TARGET authority.  The caller retains the
  * in/out monotonic deadline across those retries; zero initializes it once.
  */
-extern ClusterTxwResult cluster_tx_enqueue_wait_current_mx(
-	const ClusterTTStatusKey *holder_key, int effective_timeout_ms,
-	uint64 *absolute_deadline_mono_us);
+extern ClusterTxwResult cluster_tx_enqueue_wait_current_mx(const ClusterTTStatusKey *holder_key,
+														   int effective_timeout_ms,
+														   uint64 *absolute_deadline_mono_us);
 
 /*
  * cluster_txw_wake_waiters — wake every backend waiting on holder_key.

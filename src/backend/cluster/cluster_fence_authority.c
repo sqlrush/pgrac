@@ -166,8 +166,8 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 			}
 		}
 		if (!disk_failed)
-			disk_states[i] = cluster_fence_disk_vote_select_v1(
-				slot_markers, outer_crc_valid, CLUSTER_MAX_NODES, &disk_markers[i]);
+			disk_states[i] = cluster_fence_disk_vote_select_v1(slot_markers, outer_crc_valid,
+															   CLUSTER_MAX_NODES, &disk_markers[i]);
 	}
 	pgstat_report_wait_end();
 	fence_close_targets(targets, n_total);
@@ -177,11 +177,9 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 }
 
 ClusterRecoveryOwnerImportResult
-cluster_recovery_owner_import_read_v1(int32 node_id,
-									 const ClusterWalThreadClaim *immutable_claim,
-									 uint64 frozen_admitted_bitmap_low,
-									 uint64 frozen_admitted_bitmap_high,
-									 uint64 *out_incarnation)
+cluster_recovery_owner_import_read_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
+									  uint64 frozen_admitted_bitmap_low,
+									  uint64 frozen_admitted_bitmap_high, uint64 *out_incarnation)
 {
 	ClusterFenceDiskTarget targets[CLUSTER_MAX_VOTING_DISKS];
 	ClusterRecoveryOwnerDiskSampleV1 samples[CLUSTER_MAX_VOTING_DISKS];
@@ -237,18 +235,18 @@ cluster_recovery_owner_import_read_v1(int32 node_id,
 		if (targets[i].fd < 0 || !targets[i].stat_valid)
 			continue;
 		memset(&join_slot, 0, sizeof(join_slot));
-		samples[i].join_io_state = cluster_voting_disk_read_join_slot(
-			targets[i].fd, (uint32)node_id, join_slot.bytes);
+		samples[i].join_io_state
+			= cluster_voting_disk_read_join_slot(targets[i].fd, (uint32)node_id, join_slot.bytes);
 		if (samples[i].join_io_state == CLUSTER_VOTING_DISK_IO_OK)
 			samples[i].join_marker = join_slot.marker;
-		samples[i].slot_io_state = cluster_voting_disk_read_slot(
-			targets[i].fd, i, (uint32)node_id, &samples[i].slot);
+		samples[i].slot_io_state
+			= cluster_voting_disk_read_slot(targets[i].fd, i, (uint32)node_id, &samples[i].slot);
 	}
 	pgstat_report_wait_end();
 	fence_close_targets(targets, n_total);
 	return cluster_recovery_owner_import_select_v1(
-		node_id, immutable_claim, frozen_admitted_bitmap_low,
-		frozen_admitted_bitmap_high, samples, n_total, out_incarnation);
+		node_id, immutable_claim, frozen_admitted_bitmap_low, frozen_admitted_bitmap_high, samples,
+		n_total, out_incarnation);
 }
 
 #endif /* USE_PGRAC_CLUSTER */

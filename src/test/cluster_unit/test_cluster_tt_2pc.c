@@ -368,17 +368,16 @@ UT_TEST(test_s14_prefinish_is_modifier_gated_and_error_safe)
 		= loop == NULL ? NULL : strstr(loop, "cluster_tt_twophase_modifier_recheck_or_error(");
 	durable_commit = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_commit(");
 	abort_recheck = durable_commit == NULL
-					? NULL
-					: strstr(durable_commit, "cluster_tt_twophase_modifier_recheck_or_error(");
+						? NULL
+						: strstr(durable_commit, "cluster_tt_twophase_modifier_recheck_or_error(");
 	durable_abort = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_abort(");
 	head_recheck = durable_abort == NULL
-				   ? NULL
-				   : strstr(durable_abort, "cluster_tt_twophase_modifier_recheck_or_error(");
+					   ? NULL
+					   : strstr(durable_abort, "cluster_tt_twophase_modifier_recheck_or_error(");
 	durable_set_head = start == NULL ? NULL : strstr(start, "cluster_tt_slot_durable_set_head(");
 	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
-	leave = finally_block == NULL
-				? NULL
-				: strstr(finally_block, "cluster_semantic_activation_leave(");
+	leave = finally_block == NULL ? NULL
+								  : strstr(finally_block, "cluster_semantic_activation_leave(");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -395,9 +394,9 @@ UT_TEST(test_s14_prefinish_is_modifier_gated_and_error_safe)
 	UT_ASSERT_NOT_NULL(finally_block);
 	UT_ASSERT_NOT_NULL(leave);
 	if (start != NULL && end != NULL && enter != NULL && try_block != NULL && parse != NULL
-		&& loop != NULL && commit_recheck != NULL && durable_commit != NULL
-		&& abort_recheck != NULL && durable_abort != NULL && head_recheck != NULL
-		&& durable_set_head != NULL && finally_block != NULL && leave != NULL)
+		&& loop != NULL && commit_recheck != NULL && durable_commit != NULL && abort_recheck != NULL
+		&& durable_abort != NULL && head_recheck != NULL && durable_set_head != NULL
+		&& finally_block != NULL && leave != NULL)
 		UT_ASSERT(start < enter && enter < try_block && try_block < parse && parse < loop
 				  && loop < commit_recheck && commit_recheck < durable_commit
 				  && durable_commit < abort_recheck && abort_recheck < durable_abort
@@ -420,22 +419,19 @@ UT_TEST(test_s15_prefinish_preserves_binding_origin)
 	if (source == NULL)
 		return;
 	start = strstr(source, "\ncluster_tt_twophase_prefinish(");
-	end = start == NULL ? NULL : strstr(start,
-		"\n}\n\n#endif /* USE_PGRAC_CLUSTER */");
-	derive = start == NULL ? NULL : strstr(start,
-		"cluster_tt_2pc_binding_origin_node(b, &origin_node_id)");
-	assign = start == NULL ? NULL : strstr(start,
-		"key.origin_node_id = origin_node_id;");
-	wrong = start == NULL ? NULL : strstr(start,
-		"key.origin_node_id = (uint16)cluster_node_id;");
+	end = start == NULL ? NULL : strstr(start, "\n}\n\n#endif /* USE_PGRAC_CLUSTER */");
+	derive = start == NULL
+				 ? NULL
+				 : strstr(start, "cluster_tt_2pc_binding_origin_node(b, &origin_node_id)");
+	assign = start == NULL ? NULL : strstr(start, "key.origin_node_id = origin_node_id;");
+	wrong = start == NULL ? NULL : strstr(start, "key.origin_node_id = (uint16)cluster_node_id;");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
 	UT_ASSERT_NOT_NULL(derive);
 	UT_ASSERT_NOT_NULL(assign);
 	UT_ASSERT(wrong == NULL || (end != NULL && wrong > end));
-	if (start != NULL && end != NULL && derive != NULL && assign != NULL)
-	{
+	if (start != NULL && end != NULL && derive != NULL && assign != NULL) {
 		UT_ASSERT(derive < assign);
 		UT_ASSERT(assign < end);
 	}
@@ -470,29 +466,33 @@ UT_TEST(test_s16_recovery_pending_activates_native_owner_before_success)
 	if (source == NULL)
 		return;
 	install = strstr(source, "\nTwoPhaseRecoveryPendingInstall(");
-	install_end = install == NULL ? NULL : strstr(install,
-		"\n}\n\n/* Caller holds TwoPhaseStateLock");
+	install_end
+		= install == NULL ? NULL : strstr(install, "\n}\n\n/* Caller holds TwoPhaseStateLock");
 	mark_guts = install == NULL ? NULL : strstr(install, "MarkAsPreparingGuts(");
-	mark_pending = install == NULL ? NULL : strstr(install,
-		"gxact->recovery_activation_pending = true;");
+	mark_pending
+		= install == NULL ? NULL : strstr(install, "gxact->recovery_activation_pending = true;");
 	load_subxids = install == NULL ? NULL : strstr(install, "GXactLoadSubxactData(");
 	mark_prepared = install == NULL ? NULL : strstr(install, "MarkAsPrepared(gxact, true);");
-	recover_records = install == NULL ? NULL : strstr(install,
-		"ProcessRecords(bufptr, xid, twophase_recover_callbacks);");
+	recover_records
+		= install == NULL
+			  ? NULL
+			  : strstr(install, "ProcessRecords(bufptr, xid, twophase_recover_callbacks);");
 	catch_block = recover_records == NULL ? NULL : strstr(recover_records, "PG_CATCH();");
 	panic_transition = catch_block == NULL ? NULL : strstr(catch_block, "ereport(PANIC");
-	clear_pending = install == NULL ? NULL : strstr(install,
-		"gxact->recovery_activation_pending = false;");
+	clear_pending
+		= install == NULL ? NULL : strstr(install, "gxact->recovery_activation_pending = false;");
 	post_prepare = install == NULL ? NULL : strstr(install, "PostPrepare_Twophase();");
-	postread = post_prepare == NULL ? NULL : strstr(post_prepare,
-		"postread = ReadTwoPhaseFile(xid, false);");
+	postread = post_prepare == NULL
+				   ? NULL
+				   : strstr(post_prepare, "postread = ReadTwoPhaseFile(xid, false);");
 	lock_gxact = strstr(source, "\nLockGXact(");
 	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact, "\n}\n\n/*\n * RemoveGXact");
 	view = strstr(source, "\npg_prepared_xact(PG_FUNCTION_ARGS)");
 	view_end = view == NULL ? NULL : strstr(view, "\n}\n\n/*\n * TwoPhaseGetGXact");
 	prepared_predicate = strstr(source, "\nTwoPhaseTransactionIdIsPrepared(");
-	prepared_predicate_end = prepared_predicate == NULL ? NULL :
-		strstr(prepared_predicate, "\n}\n\n\n/* Working status");
+	prepared_predicate_end = prepared_predicate == NULL
+								 ? NULL
+								 : strstr(prepared_predicate, "\n}\n\n\n/* Working status");
 
 	UT_ASSERT_NOT_NULL(install);
 	UT_ASSERT_NOT_NULL(install_end);
@@ -512,24 +512,21 @@ UT_TEST(test_s16_recovery_pending_activates_native_owner_before_success)
 	UT_ASSERT_NOT_NULL(view_end);
 	UT_ASSERT_NOT_NULL(prepared_predicate);
 	UT_ASSERT_NOT_NULL(prepared_predicate_end);
-	if (install != NULL && install_end != NULL && mark_guts != NULL &&
-		mark_pending != NULL && load_subxids != NULL && mark_prepared != NULL &&
-		recover_records != NULL && catch_block != NULL && panic_transition != NULL &&
-		clear_pending != NULL && post_prepare != NULL &&
-		postread != NULL)
-		UT_ASSERT(install < mark_guts && mark_guts < mark_pending &&
-			mark_pending < load_subxids && load_subxids < mark_prepared &&
-			mark_prepared < recover_records && recover_records < catch_block &&
-			catch_block < panic_transition && panic_transition < clear_pending &&
-			clear_pending < post_prepare && post_prepare < postread &&
-			postread < install_end);
+	if (install != NULL && install_end != NULL && mark_guts != NULL && mark_pending != NULL
+		&& load_subxids != NULL && mark_prepared != NULL && recover_records != NULL
+		&& catch_block != NULL && panic_transition != NULL && clear_pending != NULL
+		&& post_prepare != NULL && postread != NULL)
+		UT_ASSERT(install < mark_guts && mark_guts < mark_pending && mark_pending < load_subxids
+				  && load_subxids < mark_prepared && mark_prepared < recover_records
+				  && recover_records < catch_block && catch_block < panic_transition
+				  && panic_transition < clear_pending && clear_pending < post_prepare
+				  && post_prepare < postread && postread < install_end);
 	if (lock_gxact != NULL && lock_end != NULL)
 		UT_ASSERT_NOT_NULL(strstr(lock_gxact, "gxact->recovery_activation_pending"));
 	if (view != NULL && view_end != NULL)
 		UT_ASSERT_NOT_NULL(strstr(view, "gxact->recovery_activation_pending"));
 	if (prepared_predicate != NULL && prepared_predicate_end != NULL)
-		UT_ASSERT_NOT_NULL(strstr(prepared_predicate,
-			"!gxact->recovery_activation_pending"));
+		UT_ASSERT_NOT_NULL(strstr(prepared_predicate, "!gxact->recovery_activation_pending"));
 	free(source);
 }
 
@@ -553,20 +550,18 @@ UT_TEST(test_s17_recovery_pending_remains_reco_owned_after_activation)
 	if (source == NULL)
 		return;
 	definition = strstr(source, "typedef struct GlobalTransactionData {");
-	definition_end = definition == NULL ? NULL : strstr(definition,
-		"} GlobalTransactionData;");
+	definition_end = definition == NULL ? NULL : strstr(definition, "} GlobalTransactionData;");
 	install = strstr(source, "\nTwoPhaseRecoveryPendingInstall(");
-	install_end = install == NULL ? NULL : strstr(install,
-		"\n}\n\n/* Caller holds TwoPhaseStateLock");
-	mark_owned = install == NULL ? NULL : strstr(install,
-		"gxact->recovery_managed = true;");
-	clear_activation = install == NULL ? NULL : strstr(install,
-		"gxact->recovery_activation_pending = false;");
-	remark_owned = clear_activation == NULL ? NULL : strstr(clear_activation,
-		"gxact->recovery_managed = true;");
+	install_end
+		= install == NULL ? NULL : strstr(install, "\n}\n\n/* Caller holds TwoPhaseStateLock");
+	mark_owned = install == NULL ? NULL : strstr(install, "gxact->recovery_managed = true;");
+	clear_activation
+		= install == NULL ? NULL : strstr(install, "gxact->recovery_activation_pending = false;");
+	remark_owned = clear_activation == NULL
+					   ? NULL
+					   : strstr(clear_activation, "gxact->recovery_managed = true;");
 	lock_gxact = strstr(source, "\nLockGXact(");
-	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact,
-		"\n}\n\n/*\n * RemoveGXact");
+	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact, "\n}\n\n/*\n * RemoveGXact");
 
 	UT_ASSERT_NOT_NULL(definition);
 	UT_ASSERT_NOT_NULL(definition_end);
@@ -579,10 +574,10 @@ UT_TEST(test_s17_recovery_pending_remains_reco_owned_after_activation)
 	UT_ASSERT_NOT_NULL(lock_end);
 	if (definition != NULL && definition_end != NULL)
 		UT_ASSERT_NOT_NULL(strstr(definition, "bool recovery_managed;"));
-	if (install != NULL && install_end != NULL && mark_owned != NULL &&
-		clear_activation != NULL && remark_owned != NULL)
-		UT_ASSERT(install < mark_owned && mark_owned < clear_activation &&
-			clear_activation < remark_owned && remark_owned < install_end);
+	if (install != NULL && install_end != NULL && mark_owned != NULL && clear_activation != NULL
+		&& remark_owned != NULL)
+		UT_ASSERT(install < mark_owned && mark_owned < clear_activation
+				  && clear_activation < remark_owned && remark_owned < install_end);
 	if (lock_gxact != NULL && lock_end != NULL)
 		UT_ASSERT_NOT_NULL(strstr(lock_gxact, "gxact->recovery_managed"));
 	free(source);
@@ -600,16 +595,16 @@ UT_TEST(test_s20_prepared_count_excludes_only_terminal_cleanup_receipts)
 	if (source == NULL)
 		return;
 	counter = strstr(source, "\nGetNumberOfPreparedTransactions(void)");
-	counter_end = counter == NULL ? NULL : strstr(counter,
-		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+	counter_end = counter == NULL
+					  ? NULL
+					  : strstr(counter, "\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
 	UT_ASSERT_NOT_NULL(counter);
 	UT_ASSERT_NOT_NULL(counter_end);
-	if (counter != NULL && counter_end != NULL)
-	{
-		UT_ASSERT_NOT_NULL(strstr(counter,
-			"!TwoPhaseState->prepXacts[i]->recovery_terminal_cleanup_pending"));
-		UT_ASSERT(strstr(counter, "prepXacts[i]->valid") == NULL ||
-			strstr(counter, "prepXacts[i]->valid") > counter_end);
+	if (counter != NULL && counter_end != NULL) {
+		UT_ASSERT_NOT_NULL(
+			strstr(counter, "!TwoPhaseState->prepXacts[i]->recovery_terminal_cleanup_pending"));
+		UT_ASSERT(strstr(counter, "prepXacts[i]->valid") == NULL
+				  || strstr(counter, "prepXacts[i]->valid") > counter_end);
 	}
 	free(source);
 }
@@ -636,25 +631,19 @@ UT_TEST(test_s18_restart_finish_fence_reuses_root_and_projection)
 	if (source == NULL)
 		return;
 	helper = strstr(source, "\nTwoPhaseRecoveryFinishIsFenced(");
-	helper_end = helper == NULL ? NULL : strstr(helper,
-		"\n#endif\n\n/*\n * LockGXact");
-	event_read = helper == NULL ? NULL : strstr(helper,
-		"cluster_reconfig_get_last_event(");
-	dead_test = helper == NULL ? NULL : strstr(helper,
-		"RECONFIG_KIND_FAIL_STOP");
-	digest = helper == NULL ? NULL : strstr(helper,
-		"cluster_remote_xact_prepare_digest_v2(");
-	projection = helper == NULL ? NULL : strstr(helper,
-		"cluster_remote_xact_pending_matches_v2(");
+	helper_end = helper == NULL ? NULL : strstr(helper, "\n#endif\n\n/*\n * LockGXact");
+	event_read = helper == NULL ? NULL : strstr(helper, "cluster_reconfig_get_last_event(");
+	dead_test = helper == NULL ? NULL : strstr(helper, "RECONFIG_KIND_FAIL_STOP");
+	digest = helper == NULL ? NULL : strstr(helper, "cluster_remote_xact_prepare_digest_v2(");
+	projection = helper == NULL ? NULL : strstr(helper, "cluster_remote_xact_pending_matches_v2(");
 	lock_gxact = strstr(source, "\nLockGXact(");
-	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact,
-		"\n}\n\n/*\n * RemoveGXact");
-	claim_owner = lock_gxact == NULL ? NULL : strstr(lock_gxact,
-		"gxact->locking_backend = MyBackendId;");
-	release_owner_lock = claim_owner == NULL ? NULL : strstr(claim_owner,
-		"LWLockRelease(TwoPhaseStateLock);");
-	finish_fence = lock_gxact == NULL ? NULL : strstr(lock_gxact,
-		"TwoPhaseRecoveryFinishIsFenced(");
+	lock_end = lock_gxact == NULL ? NULL : strstr(lock_gxact, "\n}\n\n/*\n * RemoveGXact");
+	claim_owner
+		= lock_gxact == NULL ? NULL : strstr(lock_gxact, "gxact->locking_backend = MyBackendId;");
+	release_owner_lock
+		= claim_owner == NULL ? NULL : strstr(claim_owner, "LWLockRelease(TwoPhaseStateLock);");
+	finish_fence
+		= lock_gxact == NULL ? NULL : strstr(lock_gxact, "TwoPhaseRecoveryFinishIsFenced(");
 
 	UT_ASSERT_NOT_NULL(helper);
 	UT_ASSERT_NOT_NULL(helper_end);
@@ -667,14 +656,14 @@ UT_TEST(test_s18_restart_finish_fence_reuses_root_and_projection)
 	UT_ASSERT_NOT_NULL(claim_owner);
 	UT_ASSERT_NOT_NULL(release_owner_lock);
 	UT_ASSERT_NOT_NULL(finish_fence);
-	if (helper != NULL && helper_end != NULL && event_read != NULL &&
-		dead_test != NULL && digest != NULL && projection != NULL)
-		UT_ASSERT(helper < event_read && event_read < dead_test &&
-			dead_test < digest && digest < projection && projection < helper_end);
-	if (lock_gxact != NULL && lock_end != NULL && claim_owner != NULL &&
-		release_owner_lock != NULL && finish_fence != NULL)
-		UT_ASSERT(lock_gxact < claim_owner && claim_owner < release_owner_lock &&
-			release_owner_lock < finish_fence && finish_fence < lock_end);
+	if (helper != NULL && helper_end != NULL && event_read != NULL && dead_test != NULL
+		&& digest != NULL && projection != NULL)
+		UT_ASSERT(helper < event_read && event_read < dead_test && dead_test < digest
+				  && digest < projection && projection < helper_end);
+	if (lock_gxact != NULL && lock_end != NULL && claim_owner != NULL && release_owner_lock != NULL
+		&& finish_fence != NULL)
+		UT_ASSERT(lock_gxact < claim_owner && claim_owner < release_owner_lock
+				  && release_owner_lock < finish_fence && finish_fence < lock_end);
 	UT_ASSERT(strstr(source, ".rfside") == NULL);
 	free(source);
 }
@@ -708,28 +697,33 @@ UT_TEST(test_s19_recovery_terminal_resolves_native_owner_without_new_wal)
 	if (source == NULL)
 		return;
 	read_exact = strstr(source, "\nTwoPhaseRecoveryPendingReadExact(");
-	read_end = read_exact == NULL ? NULL : strstr(read_exact,
-		"\n}\n\nTwoPhaseRecoveryPendingResult\nTwoPhaseRecoveryPendingResolveExact(");
-	managed_read = read_exact == NULL ? NULL : strstr(read_exact,
-		"gxact->recovery_managed");
-	read_file = read_exact == NULL ? NULL : strstr(read_exact,
-		"ReadTwoPhaseFile(");
+	read_end
+		= read_exact == NULL
+			  ? NULL
+			  : strstr(
+					read_exact,
+					"\n}\n\nTwoPhaseRecoveryPendingResult\nTwoPhaseRecoveryPendingResolveExact(");
+	managed_read = read_exact == NULL ? NULL : strstr(read_exact, "gxact->recovery_managed");
+	read_file = read_exact == NULL ? NULL : strstr(read_exact, "ReadTwoPhaseFile(");
 	resolve = strstr(source, "\nTwoPhaseRecoveryPendingResolveExact(");
-	resolve_end = resolve == NULL ? NULL : strstr(resolve,
-		"\n}\n\nTwoPhaseRecoveryPendingResult\nTwoPhaseRecoveryPendingCleanupExact(");
+	resolve_end
+		= resolve == NULL
+			  ? NULL
+			  : strstr(
+					resolve,
+					"\n}\n\nTwoPhaseRecoveryPendingResult\nTwoPhaseRecoveryPendingCleanupExact(");
 	hold = resolve == NULL ? NULL : strstr(resolve, "HOLD_INTERRUPTS();");
 	proc_remove = resolve == NULL ? NULL : strstr(resolve, "ProcArrayRemove(");
 	callbacks = resolve == NULL ? NULL : strstr(resolve, "ProcessRecords(");
 	catch_block = callbacks == NULL ? NULL : strstr(callbacks, "PG_CATCH();");
-	panic_transition = catch_block == NULL ? NULL : strstr(catch_block,
-		"ereport(PANIC");
-	predicate_finish = resolve == NULL ? NULL : strstr(resolve,
-		"PredicateLockTwoPhaseFinish(");
-	cleanup_mark = resolve == NULL ? NULL : strstr(resolve,
-		"recovery_terminal_cleanup_pending = true;");
+	panic_transition = catch_block == NULL ? NULL : strstr(catch_block, "ereport(PANIC");
+	predicate_finish = resolve == NULL ? NULL : strstr(resolve, "PredicateLockTwoPhaseFinish(");
+	cleanup_mark
+		= resolve == NULL ? NULL : strstr(resolve, "recovery_terminal_cleanup_pending = true;");
 	cleanup = strstr(source, "\nTwoPhaseRecoveryPendingCleanupExact(");
-	cleanup_end = cleanup == NULL ? NULL : strstr(cleanup,
-		"\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
+	cleanup_end = cleanup == NULL
+					  ? NULL
+					  : strstr(cleanup, "\n}\n#endif\t\t\t\t\t\t\t/* USE_PGRAC_CLUSTER */");
 	remove_gxact = cleanup == NULL ? NULL : strstr(cleanup, "RemoveGXact(");
 	remove_file = cleanup == NULL ? NULL : strstr(cleanup, "durable_unlink(");
 
@@ -750,28 +744,21 @@ UT_TEST(test_s19_recovery_terminal_resolves_native_owner_without_new_wal)
 	UT_ASSERT_NOT_NULL(cleanup_end);
 	UT_ASSERT_NOT_NULL(remove_gxact);
 	UT_ASSERT_NOT_NULL(remove_file);
-	if (read_exact != NULL && read_end != NULL && managed_read != NULL &&
-		read_file != NULL)
-		UT_ASSERT(read_exact < managed_read && managed_read < read_file &&
-			read_file < read_end);
-	if (resolve != NULL && resolve_end != NULL && hold != NULL &&
-		proc_remove != NULL && callbacks != NULL && catch_block != NULL &&
-		panic_transition != NULL && predicate_finish != NULL &&
-		cleanup_mark != NULL)
-		UT_ASSERT(resolve < hold && hold < proc_remove &&
-			proc_remove < callbacks && callbacks < catch_block &&
-			catch_block < panic_transition && panic_transition < predicate_finish &&
-			predicate_finish < cleanup_mark && cleanup_mark < resolve_end);
-	if (cleanup != NULL && cleanup_end != NULL && remove_gxact != NULL &&
-		remove_file != NULL)
-		UT_ASSERT(cleanup < remove_file && remove_file < remove_gxact &&
-			remove_gxact < cleanup_end);
-	if (resolve != NULL && resolve_end != NULL)
-	{
-		const char *duplicate_commit = strstr(resolve,
-			"RecordTransactionCommitPrepared(");
-		const char *duplicate_abort = strstr(resolve,
-			"RecordTransactionAbortPrepared(");
+	if (read_exact != NULL && read_end != NULL && managed_read != NULL && read_file != NULL)
+		UT_ASSERT(read_exact < managed_read && managed_read < read_file && read_file < read_end);
+	if (resolve != NULL && resolve_end != NULL && hold != NULL && proc_remove != NULL
+		&& callbacks != NULL && catch_block != NULL && panic_transition != NULL
+		&& predicate_finish != NULL && cleanup_mark != NULL)
+		UT_ASSERT(resolve < hold && hold < proc_remove && proc_remove < callbacks
+				  && callbacks < catch_block && catch_block < panic_transition
+				  && panic_transition < predicate_finish && predicate_finish < cleanup_mark
+				  && cleanup_mark < resolve_end);
+	if (cleanup != NULL && cleanup_end != NULL && remove_gxact != NULL && remove_file != NULL)
+		UT_ASSERT(cleanup < remove_file && remove_file < remove_gxact
+				  && remove_gxact < cleanup_end);
+	if (resolve != NULL && resolve_end != NULL) {
+		const char *duplicate_commit = strstr(resolve, "RecordTransactionCommitPrepared(");
+		const char *duplicate_abort = strstr(resolve, "RecordTransactionAbortPrepared(");
 
 		UT_ASSERT(duplicate_commit == NULL || duplicate_commit > resolve_end);
 		UT_ASSERT(duplicate_abort == NULL || duplicate_abort > resolve_end);

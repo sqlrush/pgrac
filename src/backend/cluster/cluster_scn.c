@@ -1932,10 +1932,9 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 			break;
 		}
 	}
-	frontier_advanced
-		= cluster_boc_event_publish && SCN_VALID(frontier)
-		  && (!SCN_VALID(last_fanout_frontier)
-			  || scn_total_cmp(frontier, last_fanout_frontier) > 0);
+	frontier_advanced = cluster_boc_event_publish && SCN_VALID(frontier)
+						&& (!SCN_VALID(last_fanout_frontier)
+							|| scn_total_cmp(frontier, last_fanout_frontier) > 0);
 	new_publication = sweep_count != last_drained_sweep_count || frontier_advanced
 					  || (event_pending && !have_retry);
 	if (!new_publication && !have_retry)
@@ -1971,8 +1970,7 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 		last_fanout_frontier = frontier;
 
 		for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
-			peer_retry[peer].pending
-				= per_peer[peer] == CLUSTER_IC_FANOUT_NOT_ADMITTED;
+			peer_retry[peer].pending = per_peer[peer] == CLUSTER_IC_FANOUT_NOT_ADMITTED;
 			if (peer_retry[peer].pending) {
 				peer_retry[peer].payload_len = send_len;
 				peer_retry[peer].frontier = frontier;
@@ -1993,9 +1991,8 @@ cluster_scn_lmon_drain_boc_broadcast(void)
 				cluster_scn_boc_payload_encode(peer_retry[peer].frontier, retry_payload);
 				retry_send_payload = retry_payload;
 			}
-			send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_BOC_BROADCAST, peer,
-										   retry_send_payload,
-										   peer_retry[peer].payload_len);
+			send_result = cluster_ic_send_envelope(
+				PGRAC_IC_MSG_BOC_BROADCAST, peer, retry_send_payload, peer_retry[peer].payload_len);
 			switch (send_result) {
 			case CLUSTER_IC_SEND_DONE:
 				per_peer[peer] = CLUSTER_IC_FANOUT_DONE;

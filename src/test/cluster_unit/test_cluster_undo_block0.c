@@ -58,25 +58,18 @@ pg_re_throw(void)
 
 /* Spec 8.4A P1 closed diagnostic/private-recovery read seam. */
 extern ClusterUndoBlock0Result cluster_undo_block0_copy_readonly(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *read_root,
-	const ClusterUndoBlock0Generation *expected,
-	const ClusterUndoBlock0AuthorityProof *proof,
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *read_root,
+	const ClusterUndoBlock0Generation *expected, const ClusterUndoBlock0AuthorityProof *proof,
 	char private_page[BLCKSZ]);
 extern ClusterUndoBlock0Result cluster_undo_block0_provision_begin(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *target_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	ClusterUndoBlock0FrameToken *token,
-	ClusterUndoBlock0Pin *pin,
-	char **unpublished_page,
-	bool *creator);
-extern void cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin,
-	XLogRecPtr init_lsn);
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *target_root,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0FrameToken *token,
+	ClusterUndoBlock0Pin *pin, char **unpublished_page, bool *creator);
+extern void cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init_lsn);
 extern void cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin);
-extern ClusterUndoBlock0Result cluster_undo_block0_prove_strict_empty(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0AuthorityProof *proof);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_prove_strict_empty(const ClusterUndoBlock0LogicalKey *logical,
+									   const ClusterUndoBlock0AuthorityProof *proof);
 
 /* storage/shmem.h exports checked arithmetic from the backend executable. */
 Size
@@ -113,8 +106,7 @@ static bool copy_during_fill = false;
 static bool empty_probe_during_fill = false;
 static bool abort_during_fill = false;
 static ClusterUndoBlock0Result copy_during_fill_result = CLUSTER_UNDO_BLOCK0_OK;
-static ClusterUndoBlock0Result empty_probe_during_fill_result
-	= CLUSTER_UNDO_BLOCK0_OK;
+static ClusterUndoBlock0Result empty_probe_during_fill_result = CLUSTER_UNDO_BLOCK0_OK;
 static ClusterUndoBlock0LogicalKey fill_logical;
 static ClusterUndoBlock0ResolvedRoot fill_root;
 static ClusterUndoBlock0AuthorityProof fill_proof;
@@ -124,8 +116,7 @@ static int lwlock_acquire_calls = 0;
 static int lwlock_throw_on_call = 0;
 static int lwlock_release_without_holdoff_count = 0;
 static ClusterUndoSmgrFinalState smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_EXACT;
-static ClusterUndoSmgrPublishResult smgr_publish_result
-	= CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED;
+static ClusterUndoSmgrPublishResult smgr_publish_result = CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED;
 static char smgr_probe_image[BLCKSZ];
 static int smgr_probe_calls = 0;
 static int smgr_temp_create_calls = 0;
@@ -135,7 +126,7 @@ static bool smgr_temp_active = false;
 static ClusterR4PrerequisiteSnapshot r4_owner_snapshot = {
 	.status = CLUSTER_R4_PREREQUISITE_RF_DEFERRED,
 	.ready = false,
-	.reserved0 = {0, 0, 0},
+	.reserved0 = { 0, 0, 0 },
 	.target_node_id = -1,
 };
 static bool r4_owner_publish_enabled = false;
@@ -277,9 +268,9 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent pg_attribute_unused(),
 
 bool
 cluster_undo_smgr_write_block(ClusterUndoPathIntent intent pg_attribute_unused(),
-								  uint32 segment_id pg_attribute_unused(),
-								  uint8 owner_instance pg_attribute_unused(), uint32 block_no,
-								  const char *buf, bool do_fsync)
+							  uint32 segment_id pg_attribute_unused(),
+							  uint8 owner_instance pg_attribute_unused(), uint32 block_no,
+							  const char *buf, bool do_fsync)
 {
 	smgr_write_calls++;
 	smgr_last_write_block = block_no;
@@ -739,8 +730,7 @@ UT_TEST(test_block0_attach_rejects_impossible_free_count)
 	ctl->free_count = ctl->frame_count + 1;
 	token.frame_index = 0;
 	token.owned = true;
-	UT_ASSERT(!cluster_undo_block0_shmem_init_region(
-				 block0_region, block0_region_size, 1, true));
+	UT_ASSERT(!cluster_undo_block0_shmem_init_region(block0_region, block0_region_size, 1, true));
 	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
 				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
 	UT_ASSERT(!token.owned);
@@ -795,11 +785,11 @@ UT_TEST(test_block0_runtime_admission_preserves_generation_zero_and_exact_identi
 	make_valid_block0(1, 1, 0, 0x4d);
 	memset(&token, 0, sizeof(token));
 	memset(&pin, 0, sizeof(pin));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
 	admitted_frame = token.frame_index;
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &read_only_root, &proof, &token, &pin,
-											&page), CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_admit_runtime(&logical, &read_only_root, &proof, &token, &pin, &page),
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	UT_ASSERT(token.owned);
 	UT_ASSERT_EQ(smgr_read_calls, 0);
 	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
@@ -820,7 +810,8 @@ UT_TEST(test_block0_runtime_admission_preserves_generation_zero_and_exact_identi
 	UT_ASSERT_EQ(smgr_read_calls, 0);
 	memset(copied, 0xa5, sizeof(copied));
 	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &root, &expected_zero, &proof, copied,
-											&observed), CLUSTER_UNDO_BLOCK0_OK);
+												   &observed),
+				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(observed.known);
 	UT_ASSERT_EQ(observed.value, 0);
 	UT_ASSERT_EQ((int)(unsigned char)copied[BLCKSZ - 1], 0x4d);
@@ -848,10 +839,8 @@ UT_TEST(test_block0_unpin_after_error_interrupt_reset_is_balanced)
 	memset(&pin, 0, sizeof(pin));
 	lwlock_release_without_holdoff_count = 0;
 	UT_ASSERT_EQ(InterruptHoldoffCount, 0);
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(InterruptHoldoffCount, 1);
 
@@ -876,10 +865,8 @@ UT_TEST(test_block0_runtime_admission_rejects_exhausted_generation)
 	make_valid_block0(1, 1, UINT32_MAX, 0x5e);
 	memset(&token, 0, sizeof(token));
 	memset(&pin, 0, sizeof(pin));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
 	UT_ASSERT(token.owned);
 	UT_ASSERT_NULL(page);
@@ -900,27 +887,23 @@ UT_TEST(test_block0_strict_empty_proof_excludes_filling_and_resident_states)
 	char *page = NULL;
 
 	fresh_block0_region(1);
-	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &proof),
-		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &proof), CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &wrong),
-		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 
 	make_valid_block0(1, 1, 0, 0x5f);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-		CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
 	fill_logical = logical;
 	fill_root = root;
 	fill_proof = proof;
 	empty_probe_during_fill = true;
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-		&logical, &root, &proof, &token, &pin, &page),
-		CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(empty_probe_during_fill_result,
-		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(empty_probe_during_fill_result, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	cluster_undo_block0_unpin(&pin);
 	UT_ASSERT_EQ(cluster_undo_block0_prove_strict_empty(&logical, &proof),
-		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 }
 
 UT_TEST(test_block0_copy_readonly_is_recovery_only_and_generation_exact)
@@ -937,23 +920,20 @@ UT_TEST(test_block0_copy_readonly_is_recovery_only_and_generation_exact)
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 0, 0x60);
 	memset(copied, 0xa5, sizeof(copied));
-	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(
-				 &logical, &root, &zero, &recovery, copied),
+	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(&logical, &root, &zero, &recovery, copied),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(smgr_read_calls, 1);
 	UT_ASSERT_EQ((int)(unsigned char)copied[BLCKSZ - 1], 0x60);
 
 	smgr_read_calls = 0;
 	memset(copied, 0xa5, sizeof(copied));
-	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(
-				 &logical, &root, &zero, &live, copied),
+	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(&logical, &root, &zero, &live, copied),
 				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	UT_ASSERT_EQ(smgr_read_calls, 0);
 	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
 
 	memset(copied, 0xa5, sizeof(copied));
-	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(
-				 &logical, &root, &wrong, &recovery, copied),
+	UT_ASSERT_EQ(cluster_undo_block0_copy_readonly(&logical, &root, &wrong, &recovery, copied),
 				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
 	UT_ASSERT_EQ(smgr_read_calls, 1);
 	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
@@ -987,25 +967,27 @@ UT_TEST(test_block0_resident_copy_rejects_empty_generation_and_root_drift_withou
 	UT_ASSERT_EQ(cluster_undo_block0_reserve(&logical, &root, &proof, &reserved_pin),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(cluster_undo_block0_lock_content(&reserved_pin, &wrong_generation,
-											  CLUSTER_UNDO_BLOCK0_SHARED, &page),
+												  CLUSTER_UNDO_BLOCK0_SHARED, &page),
 				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
 	UT_ASSERT_EQ(reserved_pin.slot, -1);
 	UT_ASSERT_NULL(page);
 
 	memset(copied, 0xa5, sizeof(copied));
-	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &root, &wrong_generation, &proof,
-											copied, NULL),
-				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_copy_resident(&logical, &root, &wrong_generation, &proof, copied, NULL),
+		CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
 	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
 
 	drifted_root.root_generation++;
-	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &drifted_root, NULL, &proof, copied,
-											NULL), CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_copy_resident(&logical, &drifted_root, NULL, &proof, copied, NULL),
+		CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
 	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
 
 	drifted_proof.cluster_epoch++;
-	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&logical, &root, NULL, &drifted_proof, copied,
-											NULL), CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_copy_resident(&logical, &root, NULL, &drifted_proof, copied, NULL),
+		CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	UT_ASSERT_EQ((int)(unsigned char)copied[0], 0xa5);
 
 	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(&absent, &root, NULL, &proof, copied, NULL),
@@ -1030,10 +1012,8 @@ UT_TEST(test_block0_pin_error_drops_reservation_before_rethrow)
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 0, 0x62);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	memset(&item, 0, sizeof(item));
 	item.logical = logical;
@@ -1046,8 +1026,8 @@ UT_TEST(test_block0_pin_error_drops_reservation_before_rethrow)
 	lwlock_throw_on_call = 2; /* reserve succeeds; content-X acquire throws */
 	PG_TRY();
 	{
-		(void)cluster_undo_block0_pin(&logical, &root, &expected,
-			CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &proof, &pin, &page);
+		(void)cluster_undo_block0_pin(&logical, &root, &expected, CLUSTER_UNDO_BLOCK0_EXCLUSIVE,
+									  &proof, &pin, &page);
 	}
 	PG_CATCH();
 	{
@@ -1075,7 +1055,8 @@ UT_TEST(test_block0_filling_is_not_a_positive_resident_copy)
 	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
 	copy_during_fill = true;
 	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&fill_logical, &fill_root, &fill_proof, &token,
-											&pin, &page), CLUSTER_UNDO_BLOCK0_OK);
+												   &pin, &page),
+				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(copy_during_fill_result, CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED);
 	cluster_undo_block0_unpin(&pin);
 }
@@ -1098,17 +1079,14 @@ UT_TEST(test_block0_runtime_fill_abort_releases_slot_and_frame_via_resource_owne
 	memset(&token, 0, sizeof(token));
 	memset(&retry, 0, sizeof(retry));
 	memset(&extra, 0, sizeof(extra));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
 	abort_during_fill = true;
 	if (sigsetjmp(wal_error_jump, 1) == 0)
-		(void)cluster_undo_block0_admit_runtime(
-			&logical, &root, &proof, &token, &pin, &page);
+		(void)cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page);
 	else
 		caught = true;
 	UT_ASSERT(caught);
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry), CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(retry.owned);
 	cluster_undo_block0_frame_release(&token);
 	UT_ASSERT(!token.owned);
@@ -1136,18 +1114,15 @@ UT_TEST(test_block0_resource_owner_cleanup_is_balanced_with_normal_release)
 	memset(&token, 0, sizeof(token));
 	memset(&retry, 0, sizeof(retry));
 	memset(&extra, 0, sizeof(extra));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	memset(&item, 0, sizeof(item));
 	item.logical = logical;
 	item.resolved_root = root;
 	item.generation = pin.observed_generation;
 	item.proof = proof;
-	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
-								  resource_release_arg);
+	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, resource_release_arg);
 	UT_ASSERT(cluster_undo_block0_verify_clean_census(&item, 1));
 
 	/* The admitted frame stays bound.  No stale tracker may return it. */
@@ -1157,13 +1132,10 @@ UT_TEST(test_block0_resource_owner_cleanup_is_balanced_with_normal_release)
 	/* Normal release removes its tracker, so a later owner callback cannot
 	 * duplicate the free-stack entry. */
 	fresh_block0_region(1);
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry), CLUSTER_UNDO_BLOCK0_OK);
 	cluster_undo_block0_frame_release(&retry);
-	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
-								  resource_release_arg);
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, resource_release_arg);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry), CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &extra),
 				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
 	cluster_undo_block0_frame_release(&retry);
@@ -1184,17 +1156,15 @@ UT_TEST(test_block0_provision_existing_exact_loads_without_temp_or_write)
 	make_valid_block0(1, 1, 4, 0x75);
 	memcpy(smgr_probe_image, smgr_image, BLCKSZ);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
-				 &logical, &root, &proof, &token, &pin, &page, &creator),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_provision_begin(&logical, &root, &proof, &token, &pin, &page, &creator),
+		CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(!creator);
 	UT_ASSERT_EQ(smgr_probe_calls, 1);
 	UT_ASSERT_EQ(smgr_temp_create_calls, 0);
 	UT_ASSERT_EQ(smgr_write_calls, 0);
-	UT_ASSERT_EQ((unsigned char)page[BLCKSZ - 1],
-				 (unsigned char)smgr_image[BLCKSZ - 1]);
+	UT_ASSERT_EQ((unsigned char)page[BLCKSZ - 1], (unsigned char)smgr_image[BLCKSZ - 1]);
 	UT_ASSERT(pin.observed_generation.known);
 	UT_ASSERT_EQ(pin.observed_generation.value, 4);
 	cluster_undo_block0_unpin(&pin);
@@ -1216,10 +1186,9 @@ UT_TEST(test_block0_provision_rejects_non_live_authority_before_io)
 	make_valid_block0(1, 1, 4, 0x75);
 	memcpy(smgr_probe_image, smgr_image, BLCKSZ);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	result = cluster_undo_block0_provision_begin(
-		&logical, &root, &proof, &token, &pin, &page, &creator);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	result = cluster_undo_block0_provision_begin(&logical, &root, &proof, &token, &pin, &page,
+												 &creator);
 	UT_ASSERT_EQ(result, CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	UT_ASSERT_EQ(smgr_probe_calls, 0);
 	UT_ASSERT_EQ(smgr_temp_create_calls, 0);
@@ -1245,11 +1214,10 @@ UT_TEST(test_block0_provision_rejects_unknown_probe_state_without_consuming_fram
 	fresh_block0_region(1);
 	smgr_probe_state = (ClusterUndoSmgrFinalState)99;
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
-				 &logical, &root, &proof, &token, &pin, &page, &creator),
-				 CLUSTER_UNDO_BLOCK0_IO_ERROR);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_provision_begin(&logical, &root, &proof, &token, &pin, &page, &creator),
+		CLUSTER_UNDO_BLOCK0_IO_ERROR);
 	UT_ASSERT_EQ(smgr_probe_calls, 1);
 	UT_ASSERT_EQ(smgr_temp_create_calls, 0);
 	UT_ASSERT(token.owned);
@@ -1273,11 +1241,10 @@ UT_TEST(test_block0_provision_absent_creator_publishes_after_wal_flush)
 	make_valid_block0(1, 1, 5, 0x76);
 	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
-				 &logical, &root, &proof, &token, &pin, &page, &creator),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_provision_begin(&logical, &root, &proof, &token, &pin, &page, &creator),
+		CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(creator);
 	UT_ASSERT(smgr_temp_active);
 	UT_ASSERT_EQ(smgr_temp_create_calls, 1);
@@ -1312,11 +1279,10 @@ UT_TEST(test_block0_provision_eexist_loser_installs_exact_winner_image)
 	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
 	smgr_publish_result = CLUSTER_UNDO_SMGR_PUBLISH_EXISTS;
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
-				 &logical, &root, &proof, &token, &pin, &page, &creator),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_provision_begin(&logical, &root, &proof, &token, &pin, &page, &creator),
+		CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(creator);
 	memcpy(page, smgr_image, BLCKSZ);
 	page[BLCKSZ - 1] = (char)0xd7;
@@ -1342,18 +1308,16 @@ UT_TEST(test_block0_provision_abort_cleans_temp_and_returns_frame)
 	smgr_probe_state = CLUSTER_UNDO_SMGR_FINAL_ABSENT;
 	memset(&token, 0, sizeof(token));
 	memset(&retry, 0, sizeof(retry));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
-				 &logical, &root, &proof, &token, &pin, &page, &creator),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_provision_begin(&logical, &root, &proof, &token, &pin, &page, &creator),
+		CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(creator);
 	cluster_undo_block0_provision_abort(&pin);
 	UT_ASSERT_EQ(pin.slot, -1);
 	UT_ASSERT_EQ(smgr_temp_cleanup_calls, 1);
 	UT_ASSERT(!smgr_temp_active);
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry), CLUSTER_UNDO_BLOCK0_OK);
 	cluster_undo_block0_frame_release(&retry);
 }
 
@@ -1376,30 +1340,26 @@ UT_TEST(test_block0_provision_publish_error_resource_owner_cleans_exact_temp)
 	smgr_publish_result = CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 	memset(&token, 0, sizeof(token));
 	memset(&retry, 0, sizeof(retry));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_provision_begin(
-				 &logical, &root, &proof, &token, &pin, &page, &creator),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_provision_begin(&logical, &root, &proof, &token, &pin, &page, &creator),
+		CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(creator);
 	memcpy(page, smgr_image, BLCKSZ);
 
 	wal_error_armed = true;
 	if (sigsetjmp(wal_error_jump, 1) == 0)
-		cluster_undo_block0_provision_publish(&pin,
-			(XLogRecPtr)UINT64CONST(0x140));
+		cluster_undo_block0_provision_publish(&pin, (XLogRecPtr)UINT64CONST(0x140));
 	else
 		caught = true;
 	wal_error_armed = false;
 	UT_ASSERT(caught);
 	UT_ASSERT(smgr_temp_active);
 	UT_ASSERT_NOT_NULL(resource_release_callback);
-	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
-								  resource_release_arg);
+	resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false, resource_release_arg);
 	UT_ASSERT_EQ(smgr_temp_cleanup_calls, 1);
 	UT_ASSERT(!smgr_temp_active);
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &retry), CLUSTER_UNDO_BLOCK0_OK);
 	cluster_undo_block0_frame_release(&retry);
 }
 
@@ -1419,10 +1379,9 @@ UT_TEST(test_block0_recovery_private_begin_reads_without_allocating_a_frame)
 	memset(&only_frame, 0, sizeof(only_frame));
 	memset(&guard, 0xa5, sizeof(guard));
 	memset(private_page, 0, sizeof(private_page));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &only_frame),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, false, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &only_frame), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(exists);
 	UT_ASSERT(guard.content_x_held);
@@ -1452,8 +1411,8 @@ UT_TEST(test_block0_recovery_private_begin_rejects_live_authority_before_io)
 	make_valid_block0(1, 1, 0, 0x45);
 	memset(&guard, 0xa5, sizeof(guard));
 	memset(private_page, 0x5a, sizeof(private_page));
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, false, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	UT_ASSERT(!exists);
 	UT_ASSERT(!guard.content_x_held);
@@ -1476,8 +1435,8 @@ UT_TEST(test_block0_recovery_private_bad_identity_does_not_publish_disk_bytes)
 	make_valid_block0(2, 1, 0, 0x58);
 	memset(&guard, 0xa5, sizeof(guard));
 	memset(private_page, 0x6c, sizeof(private_page));
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, false, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH);
 	UT_ASSERT(!exists);
 	UT_ASSERT(!guard.content_x_held);
@@ -1501,8 +1460,8 @@ UT_TEST(test_block0_recovery_private_absence_stays_fail_closed_without_typed_smg
 	smgr_read_ok = false;
 	memset(&guard, 0xa5, sizeof(guard));
 	memset(private_page, 0x6b, sizeof(private_page));
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, true, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, true, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_IO_ERROR);
 	UT_ASSERT(!exists);
 	UT_ASSERT(!guard.content_x_held);
@@ -1524,12 +1483,12 @@ UT_TEST(test_block0_recovery_private_finish_writes_fsyncs_and_releases_without_r
 
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 6, 0x68);
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, false, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	private_page[BLCKSZ - 1] = (char)0xa8;
-	cluster_undo_block0_recovery_private_finish(
-		&guard, private_page, (XLogRecPtr)UINT64CONST(0xb0), true, false);
+	cluster_undo_block0_recovery_private_finish(&guard, private_page, (XLogRecPtr)UINT64CONST(0xb0),
+												true, false);
 
 	UT_ASSERT_EQ(smgr_write_calls, 1);
 	UT_ASSERT_EQ(smgr_last_write_block, 0);
@@ -1539,8 +1498,7 @@ UT_TEST(test_block0_recovery_private_finish_writes_fsyncs_and_releases_without_r
 	UT_ASSERT(!guard.content_x_held);
 	UT_ASSERT_EQ(guard.slot, -1);
 	memset(&frame, 0, sizeof(frame));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &frame),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &frame), CLUSTER_UNDO_BLOCK0_OK);
 	cluster_undo_block0_frame_release(&frame);
 }
 
@@ -1556,11 +1514,11 @@ UT_TEST(test_block0_recovery_private_finish_validated_noop_has_zero_io)
 
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 7, 0x69);
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, false, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_OK);
-	cluster_undo_block0_recovery_private_finish(
-		&guard, NULL, (XLogRecPtr)UINT64CONST(0xc0), false, true);
+	cluster_undo_block0_recovery_private_finish(&guard, NULL, (XLogRecPtr)UINT64CONST(0xc0), false,
+												true);
 	UT_ASSERT_EQ(smgr_write_calls, 0);
 	UT_ASSERT_EQ(xlog_flush_calls, 0);
 	UT_ASSERT(!guard.content_x_held);
@@ -1580,15 +1538,15 @@ UT_TEST(test_block0_recovery_private_finish_write_failure_panics_with_guard_unpu
 
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 8, 0x6a);
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, false, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	private_page[BLCKSZ - 1] = (char)0xaa;
 	smgr_write_ok = false;
 	wal_error_armed = true;
 	if (sigsetjmp(wal_error_jump, 1) == 0)
-		cluster_undo_block0_recovery_private_finish(
-			&guard, private_page, (XLogRecPtr)UINT64CONST(0xd0), true, false);
+		cluster_undo_block0_recovery_private_finish(&guard, private_page,
+													(XLogRecPtr)UINT64CONST(0xd0), true, false);
 	else
 		caught = true;
 	wal_error_armed = false;
@@ -1613,13 +1571,13 @@ UT_TEST(test_block0_recovery_private_parent_fsync_gap_panics_before_write)
 
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 9, 0x6b);
-	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(
-				 &logical, &root, &proof, false, &guard, private_page, &exists),
+	UT_ASSERT_EQ(cluster_undo_block0_recovery_private_begin(&logical, &root, &proof, false, &guard,
+															private_page, &exists),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	wal_error_armed = true;
 	if (sigsetjmp(wal_error_jump, 1) == 0)
-		cluster_undo_block0_recovery_private_finish(
-			&guard, private_page, (XLogRecPtr)UINT64CONST(0xe0), true, true);
+		cluster_undo_block0_recovery_private_finish(&guard, private_page,
+													(XLogRecPtr)UINT64CONST(0xe0), true, true);
 	else
 		caught = true;
 	wal_error_armed = false;
@@ -1644,18 +1602,15 @@ UT_TEST(test_block0_wal_dirty_uses_monotone_lsn_and_flushes_before_durable_data)
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 2, 0x47);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	memcpy(successor, page, sizeof(successor));
 	successor[BLCKSZ - 1] = (char)0x94;
 
 	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0x80));
 	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0x70));
-	cluster_undo_block0_flush_sync(&pin, successor,
-							   (XLogRecPtr)UINT64CONST(0x75), false);
+	cluster_undo_block0_flush_sync(&pin, successor, (XLogRecPtr)UINT64CONST(0x75), false);
 
 	UT_ASSERT_EQ(xlog_flush_calls, 1);
 	UT_ASSERT_EQ(xlog_last_flush_lsn, (XLogRecPtr)UINT64CONST(0x80));
@@ -1688,29 +1643,26 @@ UT_TEST(test_block0_flush_publishes_successor_generation)
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 2, 0x47);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	memcpy(successor, page, sizeof(successor));
 	((UndoSegmentHeaderData *)successor)->wrap_count = 3;
-	cluster_undo_block0_flush_sync(&pin, successor,
-								   InvalidXLogRecPtr, false);
+	cluster_undo_block0_flush_sync(&pin, successor, InvalidXLogRecPtr, false);
 	UT_ASSERT(pin.observed_generation.known);
 	UT_ASSERT_EQ(pin.observed_generation.value, 3);
 	cluster_undo_block0_unpin(&pin);
 
-	UT_ASSERT_EQ(cluster_undo_block0_sample_resident_generation(
-				 &logical, &root, &proof, &sampled), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_sample_resident_generation(&logical, &root, &proof, &sampled),
+				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(sampled.known);
 	UT_ASSERT_EQ(sampled.value, 3);
-	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(
-				 &logical, &root, &old_generation, &proof, copied, NULL),
-				 CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
-	UT_ASSERT_EQ(cluster_undo_block0_copy_resident(
-				 &logical, &root, &new_generation, &proof, copied, NULL),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_copy_resident(&logical, &root, &old_generation, &proof, copied, NULL),
+		CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_copy_resident(&logical, &root, &new_generation, &proof, copied, NULL),
+		CLUSTER_UNDO_BLOCK0_OK);
 }
 
 UT_TEST(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn)
@@ -1728,10 +1680,8 @@ UT_TEST(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn)
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 4, 0x48);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	memcpy(successor, page, sizeof(successor));
 	successor[BLCKSZ - 1] = (char)0x98;
@@ -1740,8 +1690,7 @@ UT_TEST(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn)
 
 	wal_error_armed = true;
 	if (sigsetjmp(wal_error_jump, 1) == 0)
-		cluster_undo_block0_flush_sync(&pin, successor,
-								   (XLogRecPtr)UINT64CONST(0x85), false);
+		cluster_undo_block0_flush_sync(&pin, successor, (XLogRecPtr)UINT64CONST(0x85), false);
 	else
 		caught = true;
 	wal_error_armed = false;
@@ -1756,8 +1705,7 @@ UT_TEST(test_block0_flush_failure_preserves_resident_predecessor_and_dirty_lsn)
 	xlog_flush_calls = 0;
 	xlog_last_flush_lsn = InvalidXLogRecPtr;
 	smgr_write_calls = 0;
-	cluster_undo_block0_flush_sync(&pin, successor,
-							   (XLogRecPtr)UINT64CONST(0x85), false);
+	cluster_undo_block0_flush_sync(&pin, successor, (XLogRecPtr)UINT64CONST(0x85), false);
 	UT_ASSERT_EQ(xlog_flush_calls, 1);
 	UT_ASSERT_EQ(xlog_last_flush_lsn, (XLogRecPtr)UINT64CONST(0x90));
 	UT_ASSERT_EQ(smgr_write_calls, 1);
@@ -1780,10 +1728,8 @@ UT_TEST(test_block0_flush_parent_fsync_request_fails_before_wal_or_data_publicat
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 5, 0x49);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	memcpy(successor, page, sizeof(successor));
 	successor[BLCKSZ - 1] = (char)0x99;
@@ -1791,8 +1737,7 @@ UT_TEST(test_block0_flush_parent_fsync_request_fails_before_wal_or_data_publicat
 
 	wal_error_armed = true;
 	if (sigsetjmp(wal_error_jump, 1) == 0)
-		cluster_undo_block0_flush_sync(&pin, successor,
-								   (XLogRecPtr)UINT64CONST(0xa0), true);
+		cluster_undo_block0_flush_sync(&pin, successor, (XLogRecPtr)UINT64CONST(0xa0), true);
 	else
 		caught = true;
 	wal_error_armed = false;
@@ -1819,26 +1764,23 @@ UT_TEST(test_block0_flush_rejects_wrong_logical_successor_before_wal_or_data)
 	fresh_block0_region(1);
 	make_valid_block0(1, 1, 6, 0x4a);
 	memset(&token, 0, sizeof(token));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token),
-				 CLUSTER_UNDO_BLOCK0_OK);
-	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-				 &logical, &root, &proof, &token, &pin, &page),
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &token), CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical, &root, &proof, &token, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_OK);
 	memcpy(successor, page, sizeof(successor));
-	((UndoSegmentHeaderData *) successor)->segment_id = 2;
-	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr) UINT64CONST(0xb0));
+	((UndoSegmentHeaderData *)successor)->segment_id = 2;
+	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0xb0));
 
 	wal_error_armed = true;
 	if (sigsetjmp(wal_error_jump, 1) == 0)
-		cluster_undo_block0_flush_sync(&pin, successor,
-								   (XLogRecPtr) UINT64CONST(0xb0), false);
+		cluster_undo_block0_flush_sync(&pin, successor, (XLogRecPtr)UINT64CONST(0xb0), false);
 	else
 		caught = true;
 	wal_error_armed = false;
 	UT_ASSERT(caught);
 	UT_ASSERT_EQ(xlog_flush_calls, 0);
 	UT_ASSERT_EQ(smgr_write_calls, 0);
-	UT_ASSERT_EQ(((UndoSegmentHeaderData *) page)->segment_id, 1);
+	UT_ASSERT_EQ(((UndoSegmentHeaderData *)page)->segment_id, 1);
 	UT_ASSERT_EQ(pin.slot, 0);
 	cluster_undo_block0_unpin(&pin);
 }
@@ -1863,13 +1805,12 @@ UT_TEST(test_block0_clean_census_requires_exact_complete_unpinned_residency)
 
 	fresh_block0_region(2);
 	memset(tokens, 0, sizeof(tokens));
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(2, tokens),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(2, tokens), CLUSTER_UNDO_BLOCK0_OK);
 	for (i = 0; i < 2; i++) {
-		make_valid_block0(logical[i].segment_id, logical[i].owner_instance,
-						 11 + i, (uint8)(0x51 + i));
-		UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(
-					 &logical[i], &root[i], &proof, &tokens[i], &pin, &page),
+		make_valid_block0(logical[i].segment_id, logical[i].owner_instance, 11 + i,
+						  (uint8)(0x51 + i));
+		UT_ASSERT_EQ(cluster_undo_block0_admit_runtime(&logical[i], &root[i], &proof, &tokens[i],
+													   &pin, &page),
 					 CLUSTER_UNDO_BLOCK0_OK);
 		memset(&items[i], 0, sizeof(items[i]));
 		items[i].logical = logical[i];
@@ -1899,9 +1840,9 @@ UT_TEST(test_block0_clean_census_requires_exact_complete_unpinned_residency)
 				 CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 2));
 	expected = items[0].generation;
-	UT_ASSERT_EQ(cluster_undo_block0_lock_content(
-				 &pin, &expected, CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &page),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(
+		cluster_undo_block0_lock_content(&pin, &expected, CLUSTER_UNDO_BLOCK0_EXCLUSIVE, &page),
+		CLUSTER_UNDO_BLOCK0_OK);
 	cluster_undo_block0_mark_wal_dirty(&pin, (XLogRecPtr)UINT64CONST(0xb0));
 	cluster_undo_block0_unpin(&pin);
 	UT_ASSERT(!cluster_undo_block0_verify_clean_census(items, 2));
@@ -2105,8 +2046,7 @@ UT_TEST(test_r4_prerequisite_snapshot_is_fixed_for_concurrent_callers)
 		calls += results[i].calls;
 		mismatches += results[i].mismatches;
 	}
-	UT_ASSERT_EQ(calls,
-				 R4_PREREQUISITE_THREAD_COUNT * R4_PREREQUISITE_CALLS_PER_THREAD);
+	UT_ASSERT_EQ(calls, R4_PREREQUISITE_THREAD_COUNT * R4_PREREQUISITE_CALLS_PER_THREAD);
 	UT_ASSERT_EQ(mismatches, 0);
 }
 

@@ -130,11 +130,9 @@ provision_temp_name_class(const char *name, uint8 owner_instance)
 	if (strncmp(name, "seg_", 4) != 0)
 		return PROVISION_TEMP_NAME_MALFORMED;
 	p = name + 4;
-	if (!provision_decimal_token(&p, &segment_id)
-		|| segment_id == 0 || segment_id > UINT16_MAX
+	if (!provision_decimal_token(&p, &segment_id) || segment_id == 0 || segment_id > UINT16_MAX
 		|| strncmp(p, marker, sizeof(marker) - 1) != 0
-		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1
-			!= (uint64)owner_instance)
+		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != (uint64)owner_instance)
 		return PROVISION_TEMP_NAME_MALFORMED;
 	p += sizeof(marker) - 1;
 	start_begin = p;
@@ -144,15 +142,13 @@ provision_temp_name_class(const char *name, uint8 owner_instance)
 	if (!provision_decimal_token(&p, &ignored))
 		return PROVISION_TEMP_NAME_MALFORMED;
 	pid_end = p;
-	if (*p++ != '.'
-		|| !provision_decimal_token(&p, &ignored) || ignored == 0 || *p != '\0')
+	if (*p++ != '.' || !provision_decimal_token(&p, &ignored) || ignored == 0 || *p != '\0')
 		return PROVISION_TEMP_NAME_MALFORMED;
 
-	start_len = snprintf(current_start, sizeof(current_start), "%lld",
-					 (long long)MyStartTimestamp);
+	start_len = snprintf(current_start, sizeof(current_start), "%lld", (long long)MyStartTimestamp);
 	pid_len = snprintf(current_pid, sizeof(current_pid), "%d", MyProcPid);
-	if (start_len < 0 || start_len >= (int)sizeof(current_start)
-		|| pid_len < 0 || pid_len >= (int)sizeof(current_pid))
+	if (start_len < 0 || start_len >= (int)sizeof(current_start) || pid_len < 0
+		|| pid_len >= (int)sizeof(current_pid))
 		return PROVISION_TEMP_NAME_MALFORMED;
 	if ((size_t)start_len == (size_t)((pid_begin - 1) - start_begin)
 		&& memcmp(start_begin, current_start, (size_t)start_len) == 0
@@ -358,8 +354,7 @@ cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent, uint32 segment_id,
 		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
 	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
 	if (fd < 0)
-		return errno == ENOENT ? CLUSTER_UNDO_SMGR_FINAL_ABSENT
-							   : CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
+		return errno == ENOENT ? CLUSTER_UNDO_SMGR_FINAL_ABSENT : CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
 	if (fstat(fd, &st) != 0) {
 		save_errno = errno;
 		(void)close(fd);
@@ -382,8 +377,7 @@ cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent, uint32 segment_id,
 	if (close(fd) != 0)
 		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
 	if (nread != BLCKSZ
-		|| !cluster_undo_segment_header_identity_ok(private_block.data, segment_id,
-											 owner_instance))
+		|| !cluster_undo_segment_header_identity_ok(private_block.data, segment_id, owner_instance))
 		return CLUSTER_UNDO_SMGR_FINAL_INVALID;
 	if (!provision_fsync_parent(path))
 		return CLUSTER_UNDO_SMGR_FINAL_IO_ERROR;
@@ -431,8 +425,7 @@ provision_temp_owned(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owne
 
 bool
 cluster_undo_smgr_provision_temp_create(ClusterUndoPathIntent intent, uint32 segment_id,
-										uint8 owner_instance,
-										char temp_path[MAXPGPATH])
+										uint8 owner_instance, char temp_path[MAXPGPATH])
 {
 	char final_path[MAXPGPATH];
 	char prefix[MAXPGPATH];
@@ -479,8 +472,7 @@ cluster_undo_smgr_provision_temp_cleanup(ClusterUndoPathIntent intent, uint32 se
 
 
 bool
-cluster_undo_smgr_cleanup_boot_foreign_temps(ClusterUndoPathIntent intent,
-										 uint8 owner_instance)
+cluster_undo_smgr_cleanup_boot_foreign_temps(ClusterUndoPathIntent intent, uint8 owner_instance)
 {
 	char final_path[MAXPGPATH];
 	char directory[MAXPGPATH];
@@ -494,8 +486,9 @@ cluster_undo_smgr_cleanup_boot_foreign_temps(ClusterUndoPathIntent intent,
 	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return false;
 	first_segment = ((uint32)owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
-	if (cluster_undo_path_resolve(intent, owner_instance, first_segment,
-								  final_path, sizeof(final_path)) != 0)
+	if (cluster_undo_path_resolve(intent, owner_instance, first_segment, final_path,
+								  sizeof(final_path))
+		!= 0)
 		return false;
 	strlcpy(directory, final_path, sizeof(directory));
 	get_parent_directory(directory);
@@ -518,9 +511,8 @@ cluster_undo_smgr_cleanup_boot_foreign_temps(ClusterUndoPathIntent intent,
 			break;
 		}
 		ret = snprintf(candidate, sizeof(candidate), "%s/%s", directory, entry->d_name);
-		if (ret < 0 || ret >= (int)sizeof(candidate)
-			|| lstat(candidate, &st) != 0 || !S_ISREG(st.st_mode)
-			|| unlink(candidate) != 0) {
+		if (ret < 0 || ret >= (int)sizeof(candidate) || lstat(candidate, &st) != 0
+			|| !S_ISREG(st.st_mode) || unlink(candidate) != 0) {
 			ok = false;
 			break;
 		}
@@ -544,17 +536,15 @@ root_descriptor_path(const char *root_directory, char final_path[MAXPGPATH])
 
 	if (root_directory == NULL || root_directory[0] == '\0')
 		return false;
-	ret = snprintf(final_path, MAXPGPATH, "%s/%s", root_directory,
-				   PGRD_MIRROR_NAME);
+	ret = snprintf(final_path, MAXPGPATH, "%s/%s", root_directory, PGRD_MIRROR_NAME);
 	return ret >= 0 && ret < MAXPGPATH;
 }
 
 
 static ClusterUndoSmgrRootMirrorState
-root_descriptor_read(
-	const char *root_directory,
-	const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+root_descriptor_read(const char *root_directory,
+					 const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+					 uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
 {
 	char final_path[MAXPGPATH];
 	uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
@@ -565,14 +555,12 @@ root_descriptor_read(
 	int open_flags = O_RDONLY | PG_BINARY;
 	int fd;
 
-	if (observed == NULL
-		|| !root_descriptor_path(root_directory, final_path))
+	if (observed == NULL || !root_descriptor_path(root_directory, final_path))
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 	if (lstat(final_path, &path_st) != 0)
 		return errno == ENOENT ? CLUSTER_UNDO_SMGR_ROOT_MIRROR_ABSENT
 							   : CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
-	if (!S_ISREG(path_st.st_mode)
-		|| path_st.st_size != CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES)
+	if (!S_ISREG(path_st.st_mode) || path_st.st_size != CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES)
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_HOLD;
 
 #ifdef O_NOFOLLOW
@@ -592,10 +580,8 @@ root_descriptor_read(
 		errno = save_errno;
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 	}
-	if (!S_ISREG(fd_st.st_mode)
-		|| fd_st.st_size != CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES
-		|| fd_st.st_dev != path_st.st_dev
-		|| fd_st.st_ino != path_st.st_ino) {
+	if (!S_ISREG(fd_st.st_mode) || fd_st.st_size != CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES
+		|| fd_st.st_dev != path_st.st_dev || fd_st.st_ino != path_st.st_ino) {
 		if (close(fd) != 0)
 			return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_HOLD;
@@ -609,8 +595,7 @@ root_descriptor_read(
 	}
 	if (close(fd) != 0)
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
-	if (nread != sizeof(image)
-		|| (expected != NULL && memcmp(image, expected, sizeof(image)) != 0))
+	if (nread != sizeof(image) || (expected != NULL && memcmp(image, expected, sizeof(image)) != 0))
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_HOLD;
 	if (!provision_fsync_parent(final_path))
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
@@ -620,10 +605,9 @@ root_descriptor_read(
 
 
 ClusterUndoSmgrRootMirrorState
-cluster_undo_smgr_root_descriptor_probe(
-	const char *root_directory,
-	const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+cluster_undo_smgr_root_descriptor_probe(const char *root_directory,
+										const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+										uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
 {
 	if (expected == NULL)
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
@@ -632,18 +616,16 @@ cluster_undo_smgr_root_descriptor_probe(
 
 
 ClusterUndoSmgrRootMirrorState
-cluster_undo_smgr_root_descriptor_read_candidate(
-	const char *root_directory,
-	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+cluster_undo_smgr_root_descriptor_read_candidate(const char *root_directory,
+												 uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
 {
 	return root_descriptor_read(root_directory, NULL, observed);
 }
 
 
 ClusterUndoSmgrRootMirrorState
-cluster_undo_smgr_root_descriptor_publish(
-	const char *root_directory,
-	const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+cluster_undo_smgr_root_descriptor_publish(const char *root_directory,
+										  const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
 {
 	char final_path[MAXPGPATH];
 	char temp_path[MAXPGPATH];
@@ -660,9 +642,8 @@ cluster_undo_smgr_root_descriptor_publish(
 	counter = ++provision_temp_counter;
 	if (counter == 0)
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
-	ret = snprintf(temp_path, sizeof(temp_path), "%s%s%lld.%d." UINT64_FORMAT,
-				   final_path, PGRD_MIRROR_TEMP_MARKER,
-				   (long long)MyStartTimestamp, MyProcPid, counter);
+	ret = snprintf(temp_path, sizeof(temp_path), "%s%s%lld.%d." UINT64_FORMAT, final_path,
+				   PGRD_MIRROR_TEMP_MARKER, (long long)MyStartTimestamp, MyProcPid, counter);
 	if (ret < 0 || ret >= (int)sizeof(temp_path))
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 	fd = BasicOpenFile(temp_path, O_RDWR | O_CREAT | O_EXCL | PG_BINARY);
@@ -684,9 +665,8 @@ cluster_undo_smgr_root_descriptor_publish(
 		bool parent_ok = provision_fsync_parent(final_path);
 		bool cleanup_ok = unlink(temp_path) == 0;
 
-		return parent_ok && cleanup_ok
-				   ? CLUSTER_UNDO_SMGR_ROOT_MIRROR_PUBLISHED
-				   : CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
+		return parent_ok && cleanup_ok ? CLUSTER_UNDO_SMGR_ROOT_MIRROR_PUBLISHED
+									   : CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
 	}
 	if (errno != EEXIST) {
 		(void)unlink(temp_path);
@@ -694,8 +674,7 @@ cluster_undo_smgr_root_descriptor_publish(
 	}
 	if (unlink(temp_path) != 0)
 		return CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR;
-	state = cluster_undo_smgr_root_descriptor_probe(root_directory, image,
-											   observed);
+	state = cluster_undo_smgr_root_descriptor_probe(root_directory, image, observed);
 	if (state == CLUSTER_UNDO_SMGR_ROOT_MIRROR_EXACT)
 		return state;
 	if (state == CLUSTER_UNDO_SMGR_ROOT_MIRROR_HOLD)
@@ -748,7 +727,7 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 		(void)close(fd);
 		errno = save_errno;
 		(void)cluster_undo_smgr_provision_temp_cleanup(intent, segment_id, owner_instance,
-													 temp_path);
+													   temp_path);
 		return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 	}
 	nwritten = pg_pwrite(fd, block0, BLCKSZ, 0);
@@ -761,7 +740,7 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 		temp_ok = false;
 	if (!temp_ok) {
 		(void)cluster_undo_smgr_provision_temp_cleanup(intent, segment_id, owner_instance,
-													 temp_path);
+													   temp_path);
 		return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 	}
 
@@ -772,26 +751,26 @@ cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 se
 			 * private name available for a retry: rewriting it would rewrite
 			 * the already-visible final file and defeat no-replace publication.
 			 */
-			(void)cluster_undo_smgr_provision_temp_cleanup(intent, segment_id,
-												 owner_instance, temp_path);
+			(void)cluster_undo_smgr_provision_temp_cleanup(intent, segment_id, owner_instance,
+														   temp_path);
 			return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 		}
 		if (!cluster_undo_smgr_provision_temp_cleanup(intent, segment_id, owner_instance,
-												temp_path))
+													  temp_path))
 			return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 		return CLUSTER_UNDO_SMGR_PUBLISH_PUBLISHED;
 	}
 	if (errno != EEXIST) {
 		(void)cluster_undo_smgr_provision_temp_cleanup(intent, segment_id, owner_instance,
-													 temp_path);
+													   temp_path);
 		return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 	}
 
-	final_state = cluster_undo_smgr_probe_segment(intent, segment_id, owner_instance,
-											 observed.data);
+	final_state
+		= cluster_undo_smgr_probe_segment(intent, segment_id, owner_instance, observed.data);
 	if (final_state == CLUSTER_UNDO_SMGR_FINAL_EXACT) {
 		if (!cluster_undo_smgr_provision_temp_cleanup(intent, segment_id, owner_instance,
-													temp_path))
+													  temp_path))
 			return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 		return CLUSTER_UNDO_SMGR_PUBLISH_EXISTS;
 	}

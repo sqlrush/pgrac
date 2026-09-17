@@ -243,8 +243,7 @@ stripe_read_activation_one(int fd, ClusterXidStripeActivationRecord *out, uint32
 
 		/* EOF on a file that has not grown past region 4 yet is the
 		 * lazily-materialised empty state, not an I/O failure. */
-		if (fstat(fd, &st) == 0
-			&& (off_t)st.st_size < CLUSTER_VOTING_PGSA_SLOT_OFFSET)
+		if (fstat(fd, &st) == 0 && (off_t)st.st_size < CLUSTER_VOTING_PGSA_SLOT_OFFSET)
 			return STRIPE_READ_ABSENT;
 		return STRIPE_READ_UNREADABLE;
 	}
@@ -988,8 +987,7 @@ cluster_xid_stripe_join_progress(bool self_may_seed)
 			op = StripeBootShmem->op;
 			target = StripeBootShmem->op_target_node;
 			LWLockRelease(&StripeBootShmem->lock);
-			if (req > done && op == STRIPE_OP_CLAIM
-				&& target == cluster_node_id)
+			if (req > done && op == STRIPE_OP_CLAIM && target == cluster_node_id)
 				return STRIPE_JOIN_CLAIM_OWNED;
 			return STRIPE_JOIN_WAIT_EVIDENCE;
 		}

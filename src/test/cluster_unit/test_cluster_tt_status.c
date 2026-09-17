@@ -103,8 +103,8 @@ int cluster_tt_status_overlay_ttl_ms = 30000;
 
 ClusterSemanticAdmissionResult
 cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
-							  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
-							  ClusterTTStatusSourceResult *result pg_attribute_unused())
+								  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+								  ClusterTTStatusSourceResult *result pg_attribute_unused())
 {
 	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }

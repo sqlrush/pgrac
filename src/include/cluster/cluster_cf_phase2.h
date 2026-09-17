@@ -61,9 +61,9 @@ typedef struct ClusterCfPhase2RecordV2 {
 	uint8 kind;
 	uint8 reserved;
 	int32 probe_owner_node;
-	int32 responder_node;	/* CLUSTER_CF_P2_PROBE uses -1 */
+	int32 responder_node; /* CLUSTER_CF_P2_PROBE uses -1 */
 	uint64 probe_nonce;
-	pg_crc32c crc;			/* over [0, offsetof(crc)) */
+	pg_crc32c crc; /* over [0, offsetof(crc)) */
 } ClusterCfPhase2RecordV2;
 
 /*
@@ -76,11 +76,10 @@ extern bool cluster_cf_phase2_write_probe(const char *shared_dir, int probe_owne
 										  uint64 probe_nonce);
 extern bool cluster_cf_phase2_read_probe(const char *shared_dir, int probe_owner,
 										 ClusterCfPhase2RecordV2 *out);
-extern bool cluster_cf_phase2_write_ack(const char *shared_dir, int probe_owner,
-										int responder, uint64 probe_nonce);
+extern bool cluster_cf_phase2_write_ack(const char *shared_dir, int probe_owner, int responder,
+										uint64 probe_nonce);
 extern bool cluster_cf_phase2_read_exact_ack(const char *shared_dir, int probe_owner,
-											 int expected_responder,
-											 uint64 expected_nonce);
+											 int expected_responder, uint64 expected_nonce);
 
 /*
  * Steady-state probe responder (spec-5.6a): acks any configured peer's

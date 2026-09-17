@@ -14,11 +14,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -69,8 +67,7 @@ UT_TEST(test_validation_rejects_invalid_native_tag_fields)
 	BufferTag tag = make_tag();
 	ResourceXAssertion assertion;
 
-	UT_ASSERT(resource_x_assertion_init(&tag, RESOURCE_X_PROTOCOL_NODE_LIMIT - 1,
-		&assertion));
+	UT_ASSERT(resource_x_assertion_init(&tag, RESOURCE_X_PROTOCOL_NODE_LIMIT - 1, &assertion));
 	assertion.resource.relNumber = InvalidRelFileNumber;
 	UT_ASSERT(!resource_x_assertion_valid(&assertion));
 	assertion.resource = tag;
@@ -108,8 +105,7 @@ UT_TEST(test_equality_is_exactly_resource_and_requester_node)
 	UT_ASSERT(resource_x_assertion_init(&tag, 7, &left));
 	UT_ASSERT(resource_x_assertion_init(&tag, 7, &right));
 	UT_ASSERT(resource_x_assertion_equal(&left, &right));
-	UT_ASSERT_EQ(resource_x_assertion_hash(&left),
-		resource_x_assertion_hash(&right));
+	UT_ASSERT_EQ(resource_x_assertion_hash(&left), resource_x_assertion_hash(&right));
 	right.requester_node++;
 	UT_ASSERT(!resource_x_assertion_equal(&left, &right));
 	right = left;
@@ -150,8 +146,7 @@ UT_TEST(test_null_comparisons_fail_closed)
 
 UT_TEST(test_proof_readiness_is_explicitly_available)
 {
-	UT_ASSERT_STR_EQ(resource_x_proof_readiness_status(),
-		"AVAILABLE_PROOF_KIND");
+	UT_ASSERT_STR_EQ(resource_x_proof_readiness_status(), "AVAILABLE_PROOF_KIND");
 }
 
 int

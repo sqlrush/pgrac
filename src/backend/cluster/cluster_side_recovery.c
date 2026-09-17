@@ -44,8 +44,8 @@ cluster_side_page_consumer_ready(const ClusterSidePageConsumeInput *in)
 	if (in->page_class == CLUSTER_PAGE_CLASS_UNKNOWN
 		|| in->page_class == CLUSTER_PAGE_CLASS_UNCLASSIFIED)
 		return false;
-	return in->contributor_coverage && in->durability_barrier_ok
-		&& in->post_read_ok && in->authority_revalidated;
+	return in->contributor_coverage && in->durability_barrier_ok && in->post_read_ok
+		   && in->authority_revalidated;
 }
 
 bool
@@ -71,8 +71,7 @@ cluster_side_retention_proof_ready(const ClusterSideRetentionProof *proof)
 	 * and no exact consumer may remain.  A missing post-read is a
 	 * precise denial — logical DONE never substitutes (spec §4 rows).
 	 */
-	if (proof == NULL || proof->failed_origin_thread == 0
-		|| proof->affected_count == 0)
+	if (proof == NULL || proof->failed_origin_thread == 0 || proof->affected_count == 0)
 		return CLUSTER_SIDE_RETENTION_DENY_INVALID;
 	if (!proof->all_bytes_durable)
 		return CLUSTER_SIDE_RETENTION_DENY_NOT_DURABLE;

@@ -1634,24 +1634,20 @@ cluster_inject_fault(PG_FUNCTION_ARGS)
 		}
 	}
 
-	if (strcmp(name, "cluster-ctrc-stage-barrier") == 0)
-	{
+	if (strcmp(name, "cluster-ctrc-stage-barrier") == 0) {
 		bool armed = new_type != CLUSTER_FAULT_NONE;
 
-		if (armed && (new_type != CLUSTER_FAULT_SKIP
-						|| param <= CTRC_TEST_BARRIER_NONE
-						|| param >= CTRC_TEST_BARRIER_COUNT))
+		if (armed
+			&& (new_type != CLUSTER_FAULT_SKIP || param <= CTRC_TEST_BARRIER_NONE
+				|| param >= CTRC_TEST_BARRIER_COUNT))
 			ereport(ERROR,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("cluster-ctrc-stage-barrier requires fault_type skip and phase 1..%d",
 							CTRC_TEST_BARRIER_COUNT - 1)));
 		if (!cluster_ctrc_test_barrier_control(
-				armed ? (ClusterCtrcTestBarrierPhase)param
-					  : CTRC_TEST_BARRIER_NONE,
-				armed))
-			ereport(ERROR,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("CTRC shared test barrier is unavailable")));
+				armed ? (ClusterCtrcTestBarrierPhase)param : CTRC_TEST_BARRIER_NONE, armed))
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("CTRC shared test barrier is unavailable")));
 	}
 	cluster_injection_arm_internal(p, new_type, param);
 

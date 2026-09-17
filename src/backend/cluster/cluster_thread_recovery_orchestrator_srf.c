@@ -167,7 +167,7 @@ cluster_thread_capability_gate_test(PG_FUNCTION_ARGS)
 	else if (scope_arg > (int32)CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("scope %d out of range [0, %d]", scope_arg,
-						   (int)CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND)));
+							   (int)CLUSTER_THREADREC_SCOPE_NO_SHARED_BACKEND)));
 	else
 		scope = (ClusterThreadRecScope)scope_arg;
 

@@ -112,7 +112,7 @@
 #include "port/atomics.h"
 #include "storage/lwlock.h"
 
-#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_conf.h"				 /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_semantic_activation.h" /* record types */
 
 
@@ -221,12 +221,10 @@ typedef struct ClusterQvotecMailboxCompletion {
 } ClusterQvotecMailboxCompletion;
 
 #ifdef USE_PGRAC_CLUSTER
-StaticAssertDecl(CLUSTER_QVOTEC_MAILBOX_NONE == 0
-					 && CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD == 1
+StaticAssertDecl(CLUSTER_QVOTEC_MAILBOX_NONE == 0 && CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD == 1
 					 && CLUSTER_QVOTEC_MAILBOX_PROPOSE_VALUE == 2,
 				 "ClusterQvotecMailbox request opcode values are frozen");
-StaticAssertDecl(CLUSTER_QVOTEC_MAILBOX_RESULT_NONE == 0
-					 && CLUSTER_QVOTEC_MAILBOX_CHOSEN == 1
+StaticAssertDecl(CLUSTER_QVOTEC_MAILBOX_RESULT_NONE == 0 && CLUSTER_QVOTEC_MAILBOX_CHOSEN == 1
 					 && CLUSTER_QVOTEC_MAILBOX_ADOPTED_OTHER == 2
 					 && CLUSTER_QVOTEC_MAILBOX_HOLD == 3,
 				 "ClusterQvotecMailbox completion result values are frozen");
@@ -430,23 +428,24 @@ extern void cluster_qvotec_observe(ClusterQvotecObservation *out);
  * are volatile and carry no authority across a process restart.
  */
 extern void cluster_qvotec_mailbox_restart_reset(ClusterQvotecMailbox *mailbox);
-extern ClusterQvotecMailboxSubmitStatus cluster_qvotec_mailbox_lmon_submit(
-	ClusterQvotecMailbox *mailbox, ClusterQvotecMailboxOpcode opcode,
-	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES], uint64 *request_seq_out);
+extern ClusterQvotecMailboxSubmitStatus
+cluster_qvotec_mailbox_lmon_submit(ClusterQvotecMailbox *mailbox, ClusterQvotecMailboxOpcode opcode,
+								   const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
+								   uint64 *request_seq_out);
 extern bool cluster_qvotec_mailbox_qvotec_poll(ClusterQvotecMailbox *mailbox,
-											ClusterQvotecMailboxRequest *request_out);
-extern bool cluster_qvotec_mailbox_qvotec_complete(
-	ClusterQvotecMailbox *mailbox, uint8 configured_disk_bitmap,
-	const ClusterQvotecMailboxCompletion *completion);
-extern bool cluster_qvotec_mailbox_lmon_poll_completion(
-	ClusterQvotecMailbox *mailbox, uint64 request_seq,
-	ClusterQvotecMailboxCompletion *completion_out);
+											   ClusterQvotecMailboxRequest *request_out);
+extern bool
+cluster_qvotec_mailbox_qvotec_complete(ClusterQvotecMailbox *mailbox, uint8 configured_disk_bitmap,
+									   const ClusterQvotecMailboxCompletion *completion);
+extern bool
+cluster_qvotec_mailbox_lmon_poll_completion(ClusterQvotecMailbox *mailbox, uint64 request_seq,
+											ClusterQvotecMailboxCompletion *completion_out);
 extern ClusterQvotecMailboxSubmitStatus cluster_qvotec_authority_lmon_submit(
 	ClusterQvotecMailboxOpcode opcode,
-	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
-	uint64 *request_seq_out);
-extern bool cluster_qvotec_authority_lmon_poll_completion(
-	uint64 request_seq, ClusterQvotecMailboxCompletion *completion_out);
+	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES], uint64 *request_seq_out);
+extern bool
+cluster_qvotec_authority_lmon_poll_completion(uint64 request_seq,
+											  ClusterQvotecMailboxCompletion *completion_out);
 
 
 /* ----------
@@ -550,10 +549,8 @@ extern pid_t cluster_postmaster_start_qvotec(void);
 
 /* RF-ROOT P9 verification (implementation): read-only startup read of the R4
  * semantic-activation record tail (strict majority; zero writes). */
-extern ClusterSemanticActivationResult
-cluster_qvotec_bootstrap_read_semantic_activation(
-	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
-	bool *implicit_open);
+extern ClusterSemanticActivationResult cluster_qvotec_bootstrap_read_semantic_activation(
+	uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES], bool *implicit_open);
 
 /* Startup-only read of the shared PGRD through the existing strict selector.
  * No provision/CAS and no use of QVOTEC's process-private descriptors. */

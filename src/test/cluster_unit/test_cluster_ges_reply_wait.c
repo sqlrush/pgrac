@@ -62,7 +62,8 @@ pg_re_throw(void)
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
-					 const char *fileName pg_attribute_unused(), int lineNumber pg_attribute_unused())
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
 {
 	abort();
 }
@@ -197,8 +198,7 @@ hash_search(HTAB *hashp, const void *keyPtr, HASHACTION action, bool *foundPtr)
 		*foundPtr = false;
 	if (action == HASH_FIND || action == HASH_REMOVE)
 		return NULL;
-	if ((action == HASH_ENTER || action == HASH_ENTER_NULL)
-		&& hash->count < FAKE_REPLY_WAIT_CAP) {
+	if ((action == HASH_ENTER || action == HASH_ENTER_NULL) && hash->count < FAKE_REPLY_WAIT_CAP) {
 		char *entry = hash->entries[hash->count++];
 
 		memset(entry, 0, fake_entrysize);
@@ -287,8 +287,7 @@ ConditionVariablePrepareToSleep(ConditionVariable *cv)
 }
 
 bool
-ConditionVariableTimedSleep(ConditionVariable *cv, long timeout_ms,
-							uint32 wait_event)
+ConditionVariableTimedSleep(ConditionVariable *cv, long timeout_ms, uint32 wait_event)
 {
 	Assert(fake_lock_depth == 0);
 	Assert(cv == fake_cv_target);
@@ -444,8 +443,7 @@ UT_TEST(test_poll_missing_is_explicit_without_output_mutation)
 	GesReplyWaitVerdict verdict = { 0xAAAAAAAAU, 0xBBBBBBBBU };
 
 	reset_reply_wait();
-	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict),
-				 GES_REPLY_WAIT_POLL_MISSING);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict), GES_REPLY_WAIT_POLL_MISSING);
 	UT_ASSERT_EQ(verdict.reply_opcode, 0xAAAAAAAAU);
 	UT_ASSERT_EQ(verdict.reject_reason, 0xBBBBBBBBU);
 	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
@@ -468,15 +466,14 @@ UT_TEST(test_poll_matches_all_five_key_fields)
 	UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&base, 9000));
 	for (i = 0; i < 5; i++) {
 		UT_ASSERT_NOT_NULL(cluster_ges_reply_wait_insert(&variants[i], 9000));
-		UT_ASSERT_EQ(cluster_ges_reply_wait_deliver(&variants[i], (uint32)(100 + i),
-												(uint32)(200 + i)),
-					 GES_REPLY_DELIVER_WOKE);
+		UT_ASSERT_EQ(
+			cluster_ges_reply_wait_deliver(&variants[i], (uint32)(100 + i), (uint32)(200 + i)),
+			GES_REPLY_DELIVER_WOKE);
 	}
 
 	verdict.reply_opcode = 0xAAAAAAAAU;
 	verdict.reject_reason = 0xBBBBBBBBU;
-	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&base, &verdict),
-				 GES_REPLY_WAIT_POLL_PENDING);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&base, &verdict), GES_REPLY_WAIT_POLL_PENDING);
 	UT_ASSERT_EQ(verdict.reply_opcode, 0xAAAAAAAAU);
 	UT_ASSERT_EQ(verdict.reject_reason, 0xBBBBBBBBU);
 
@@ -505,8 +502,7 @@ UT_TEST(test_configured_cap_controls_shmem_and_live_admission)
 	size_at_two = cluster_ges_reply_wait_shmem_size();
 	cluster_ges_reply_wait_max_entries = 5;
 	size_at_five = cluster_ges_reply_wait_shmem_size();
-	UT_ASSERT_EQ(size_at_five - size_at_two,
-				 (Size)(3 * sizeof(GesReplyWaitEntry)));
+	UT_ASSERT_EQ(size_at_five - size_at_two, (Size)(3 * sizeof(GesReplyWaitEntry)));
 
 	reset_reply_wait_with_cap(2);
 	UT_ASSERT_EQ(fake_init_size, 2);
@@ -529,8 +525,7 @@ UT_TEST(test_sleep_exact_waits_without_consuming_pending_entry)
 	UT_ASSERT_EQ(fake_cv_cancel_calls, 1);
 	UT_ASSERT_EQ(fake_cv_timeout_ms, 1);
 	UT_ASSERT_EQ(fake_cv_wait_event, 0x1234U);
-	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict),
-				 GES_REPLY_WAIT_POLL_PENDING);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_poll_consume(&key, &verdict), GES_REPLY_WAIT_POLL_PENDING);
 	UT_ASSERT_EQ(verdict.reply_opcode, 0xAAAAAAAAU);
 	UT_ASSERT_EQ(verdict.reject_reason, 0xBBBBBBBBU);
 	UT_ASSERT_EQ(fake_lock_acquires, fake_lock_releases);

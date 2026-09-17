@@ -446,8 +446,7 @@ cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result pg_attr
 }
 
 void
-cluster_vis_memo_install(const ClusterTTStatusKey *key, uint8 status,
-						 SCN commit_scn)
+cluster_vis_memo_install(const ClusterTTStatusKey *key, uint8 status, SCN commit_scn)
 {
 	ut_calls.memo_install++;
 	ut_installed_key = *key;
@@ -545,10 +544,10 @@ cluster_undo_verdict_resolve(int origin_node pg_attribute_unused(),
 }
 
 ClusterUndoVerdictResult
-cluster_undo_verdict_resolve_freshref_c1b_pair(
-	int origin_node, uint32 undo_segment_id, TransactionId raw_xid,
-	TransactionId ref_xid, uint32 expected_tt_slot_id, uint32 ref_epoch,
-	SCN cached_commit_scn, SCN read_scn)
+cluster_undo_verdict_resolve_freshref_c1b_pair(int origin_node, uint32 undo_segment_id,
+											   TransactionId raw_xid, TransactionId ref_xid,
+											   uint32 expected_tt_slot_id, uint32 ref_epoch,
+											   SCN cached_commit_scn, SCN read_scn)
 {
 	ut_calls.wire++;
 	ut_calls.pair_resolve++;
@@ -580,11 +579,11 @@ cluster_undo_verdict_resolve_freshref_c1b_pair(
 }
 
 bool
-cluster_vis_freshref_c1b_pair_request_eligible(
-	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status,
-	SCN cached_commit_scn, uint32 ref_epoch, uint64 current_epoch,
-	int32 origin_node, int32 local_node, uint32 segment_id,
-	uint32 expected_tt_slot_id)
+cluster_vis_freshref_c1b_pair_request_eligible(TransactionId raw_xid, TransactionId ref_xid,
+											   bool has_cached_status, SCN cached_commit_scn,
+											   uint32 ref_epoch, uint64 current_epoch,
+											   int32 origin_node, int32 local_node,
+											   uint32 segment_id, uint32 expected_tt_slot_id)
 {
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12)
 		return raw_xid == UT_RAW_XID && ref_xid == UT_RAW_XID && has_cached_status
@@ -592,12 +591,10 @@ cluster_vis_freshref_c1b_pair_request_eligible(
 			   && current_epoch == ut_current_epoch && origin_node == UT_PEER_NODE
 			   && local_node == UT_SELF_NODE && segment_id == UT_UNDO_SEGMENT
 			   && expected_tt_slot_id == UT_TT_SLOT;
-	return raw_xid == UT_RAW_XID && ref_xid == UT_RAW_XID
-		   && has_cached_status && cached_commit_scn == UT_COMMIT_SCN
-		   && ref_epoch == UT_CLUSTER_EPOCH
-		   && current_epoch == UT_CLUSTER_EPOCH
-		   && origin_node == UT_PEER_NODE && local_node == UT_SELF_NODE
-		   && segment_id == UT_UNDO_SEGMENT
+	return raw_xid == UT_RAW_XID && ref_xid == UT_RAW_XID && has_cached_status
+		   && cached_commit_scn == UT_COMMIT_SCN && ref_epoch == UT_CLUSTER_EPOCH
+		   && current_epoch == UT_CLUSTER_EPOCH && origin_node == UT_PEER_NODE
+		   && local_node == UT_SELF_NODE && segment_id == UT_UNDO_SEGMENT
 		   && expected_tt_slot_id == UT_TT_SLOT;
 }
 
@@ -799,8 +796,8 @@ cluster_tt_recovery_count_remote_active_failclosed(void)
 
 ClusterTxOutcome
 cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
-	ClusterTxResolveMode mode pg_attribute_unused(),
-	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+						 ClusterTxResolveMode mode pg_attribute_unused(), ClusterTxResolution *out,
+						 ClusterTxResolveReason *reason_out)
 {
 	ut_calls.exact_resolve++;
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12) {
@@ -1397,8 +1394,8 @@ UT_TEST(test_peer_fresh_native_ref_uses_covered_prehistory_before_overlay)
 }
 
 static void
-ut_run_freshref_terminal_memo(ClusterUndoVerdictKind kind,
-	ClusterTTStatus expected_status, SCN verdict_scn)
+ut_run_freshref_terminal_memo(ClusterUndoVerdictKind kind, ClusterTTStatus expected_status,
+							  SCN verdict_scn)
 {
 	ClusterUndoTTSlotRef ref = ut_exact_peer_ref();
 	ClusterVisResolve out;
@@ -1413,8 +1410,7 @@ ut_run_freshref_terminal_memo(ClusterUndoVerdictKind kind,
 	cluster_crossnode_runtime_visibility = true;
 
 	memset(&out, 0xA5, sizeof(out));
-	cluster_visibility_resolve_from_ref_scn(
-		UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
+	cluster_visibility_resolve_from_ref_scn(UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
 	UT_ASSERT_EQ(out.evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
 	UT_ASSERT_EQ(out.status, expected_status);
 	UT_ASSERT_EQ(out.commit_scn, verdict_scn);
@@ -1423,14 +1419,12 @@ ut_run_freshref_terminal_memo(ClusterUndoVerdictKind kind,
 	UT_ASSERT_EQ(ut_installed_status, expected_status);
 	UT_ASSERT_EQ(ut_installed_scn, verdict_scn);
 	ut_assert_exact_key();
-	UT_ASSERT_EQ(memcmp(&ut_installed_key, &ut_seen_key,
-						 sizeof(ut_installed_key)), 0);
+	UT_ASSERT_EQ(memcmp(&ut_installed_key, &ut_seen_key, sizeof(ut_installed_key)), 0);
 	first_pair_resolve = ut_calls.pair_resolve;
 	UT_ASSERT_EQ(first_pair_resolve, 1);
 
 	memset(&out, 0xA5, sizeof(out));
-	cluster_visibility_resolve_from_ref_scn(
-		UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
+	cluster_visibility_resolve_from_ref_scn(UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
 	UT_ASSERT_EQ(out.evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
 	UT_ASSERT_EQ(out.status, expected_status);
 	UT_ASSERT_EQ(out.commit_scn, verdict_scn);
@@ -1441,9 +1435,8 @@ ut_run_freshref_terminal_memo(ClusterUndoVerdictKind kind,
 
 UT_TEST(test_freshref_committed_exact_installs_then_hits_terminal_memo)
 {
-	ut_run_freshref_terminal_memo(
-		CLUSTER_UNDO_VERDICT_COMMITTED_EXACT,
-		CLUSTER_TT_STATUS_COMMITTED, UT_COMMIT_SCN);
+	ut_run_freshref_terminal_memo(CLUSTER_UNDO_VERDICT_COMMITTED_EXACT, CLUSTER_TT_STATUS_COMMITTED,
+								  UT_COMMIT_SCN);
 }
 
 /*
@@ -1467,8 +1460,7 @@ UT_TEST(test_pair_eligible_freshref_bypasses_slotless_bound)
 	cluster_crossnode_write_write = true;
 	memset(&out, 0xA5, sizeof(out));
 
-	cluster_visibility_resolve_from_ref_scn(
-		UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
+	cluster_visibility_resolve_from_ref_scn(UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
 	UT_ASSERT_EQ(out.evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
 	UT_ASSERT_EQ(out.status, CLUSTER_TT_STATUS_COMMITTED);
 	UT_ASSERT_EQ(out.commit_scn, UT_COMMIT_SCN);
@@ -1479,9 +1471,8 @@ UT_TEST(test_pair_eligible_freshref_bypasses_slotless_bound)
 
 UT_TEST(test_freshref_aborted_installs_then_hits_terminal_memo)
 {
-	ut_run_freshref_terminal_memo(
-		CLUSTER_UNDO_VERDICT_ABORTED,
-		CLUSTER_TT_STATUS_ABORTED, InvalidScn);
+	ut_run_freshref_terminal_memo(CLUSTER_UNDO_VERDICT_ABORTED, CLUSTER_TT_STATUS_ABORTED,
+								  InvalidScn);
 }
 
 UT_TEST(test_freshref_nonexact_verdicts_never_enter_terminal_memo)
@@ -1492,12 +1483,9 @@ UT_TEST(test_freshref_nonexact_verdicts_never_enter_terminal_memo)
 		ClusterTTStatus status;
 		bool bound;
 	} cases[] = {
-		{ CLUSTER_UNDO_VERDICT_COMMITTED_BOUND, UT_COMMIT_SCN,
-		  CLUSTER_TT_STATUS_COMMITTED, true },
-		{ CLUSTER_UNDO_VERDICT_IN_PROGRESS, InvalidScn,
-		  CLUSTER_TT_STATUS_IN_PROGRESS, false },
-		{ CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, InvalidScn,
-		  CLUSTER_TT_STATUS_UNKNOWN, false }
+		{ CLUSTER_UNDO_VERDICT_COMMITTED_BOUND, UT_COMMIT_SCN, CLUSTER_TT_STATUS_COMMITTED, true },
+		{ CLUSTER_UNDO_VERDICT_IN_PROGRESS, InvalidScn, CLUSTER_TT_STATUS_IN_PROGRESS, false },
+		{ CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED, InvalidScn, CLUSTER_TT_STATUS_UNKNOWN, false }
 	};
 	uint32 i;
 
@@ -1514,8 +1502,7 @@ UT_TEST(test_freshref_nonexact_verdicts_never_enter_terminal_memo)
 		cluster_crossnode_runtime_visibility = true;
 		memset(&out, 0xA5, sizeof(out));
 
-		cluster_visibility_resolve_from_ref_scn(
-			UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
+		cluster_visibility_resolve_from_ref_scn(UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
 		UT_ASSERT_EQ(out.status, cases[i].status);
 		UT_ASSERT_EQ(out.commit_scn_is_bound, cases[i].bound);
 		UT_ASSERT_EQ(ut_calls.memo_install, 0);

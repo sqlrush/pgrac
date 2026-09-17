@@ -48,12 +48,10 @@ static ClusterLockAcquireResult fake_acquire_results[4];
 static int fake_acquire_result_count;
 static int fake_acquire_call_count;
 static ClusterLockAcquireRequest fake_acquire_requests[4];
-static ClusterLockAcquireResult fake_release_result =
-	CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+static ClusterLockAcquireResult fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static int fake_release_call_count;
 static uint16 fake_release_threads[4];
-static ClusterLockAcquireResult fake_s5_result =
-	CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+static ClusterLockAcquireResult fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static int fake_s5_call_count;
 static int fake_s7_call_count;
 static LockAcquireResult fake_native_acquire_result = LOCKACQUIRE_OK;
@@ -72,10 +70,8 @@ static ClusterControlRootSnapshot fake_preflight_root;
 static ClusterControlRootReadToken fake_preflight_token;
 static bool fake_preflight_root_ready;
 static bool fake_extra_configured_thread;
-static PgracExternalFenceNeedSetResult fake_need_build_result =
-	PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
-static ClusterRecoverySerialRevalidateResult fake_serial_result =
-	CLUSTER_RECOVERY_SERIAL_CURRENT;
+static PgracExternalFenceNeedSetResult fake_need_build_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
+static ClusterRecoverySerialRevalidateResult fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
 
 void
 RegisterResourceReleaseCallback(ResourceReleaseCallback callback, void *arg)
@@ -97,8 +93,7 @@ errstart_cold(int elevel, const char *domain)
 }
 
 void
-errfinish(const char *filename pg_attribute_unused(),
-		  int lineno pg_attribute_unused(),
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {}
 
@@ -129,10 +124,8 @@ GetCurrentTimestamp(void)
 ClusterLockAcquireResult
 cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *request)
 {
-	ClusterLockAcquireRequest *mutable_request =
-		(ClusterLockAcquireRequest *)request;
-	ClusterLockAcquireResult result =
-		CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	ClusterLockAcquireRequest *mutable_request = (ClusterLockAcquireRequest *)request;
+	ClusterLockAcquireResult result = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 
 	if (fake_acquire_call_count < lengthof(fake_acquire_requests))
 		fake_acquire_requests[fake_acquire_call_count] = *request;
@@ -153,8 +146,7 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *request)
 ClusterLockAcquireResult
 cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *request)
 {
-	ClusterLockAcquireRequest *mutable_request =
-		(ClusterLockAcquireRequest *)request;
+	ClusterLockAcquireRequest *mutable_request = (ClusterLockAcquireRequest *)request;
 
 	fake_s5_call_count++;
 	if (fake_s5_result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED
@@ -197,8 +189,7 @@ ClusterLockAcquireResult
 cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *request)
 {
 	if (fake_release_call_count < lengthof(fake_release_threads))
-		fake_release_threads[fake_release_call_count] =
-			(uint16)request->resid.field1;
+		fake_release_threads[fake_release_call_count] = (uint16)request->resid.field1;
 	fake_release_call_count++;
 	return fake_release_result;
 }
@@ -218,22 +209,21 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 }
 
 ClusterControlRootResult
-cluster_control_root_read_canonical(
-	uint16 origin_thread_id, const ClusterControlRootIdentity *expected_identity,
-	ClusterControlRootReadMode mode,
-	ClusterControlRootSnapshot *out_snapshot,
-	ClusterControlRootReadToken *out_token)
+cluster_control_root_read_canonical(uint16 origin_thread_id,
+									const ClusterControlRootIdentity *expected_identity,
+									ClusterControlRootReadMode mode,
+									ClusterControlRootSnapshot *out_snapshot,
+									ClusterControlRootReadToken *out_token)
 {
 	if (!fake_preflight_root_ready || origin_thread_id != 1)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
-	if (mode == CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE
-		&& expected_identity == NULL) {
+	if (mode == CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE && expected_identity == NULL) {
 		*out_snapshot = fake_preflight_root;
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
 	if (expected_identity == NULL
-		|| memcmp(expected_identity, &fake_preflight_root.identity,
-				  sizeof(*expected_identity)) != 0)
+		|| memcmp(expected_identity, &fake_preflight_root.identity, sizeof(*expected_identity))
+			   != 0)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
 	*out_snapshot = fake_preflight_root;
 	if (out_token != NULL)
@@ -242,12 +232,11 @@ cluster_control_root_read_canonical(
 }
 
 ClusterFormationWitnessResult
-cluster_formation_witness_build_live_wait(
-	uint16 origin_thread, int timeout_ms,
-	ClusterFormationWitnessV1 **out)
+cluster_formation_witness_build_live_wait(uint16 origin_thread, int timeout_ms,
+										  ClusterFormationWitnessV1 **out)
 {
-	if (!fake_formation_current || origin_thread != 1 || timeout_ms < 1
-		|| out == NULL || *out != NULL)
+	if (!fake_formation_current || origin_thread != 1 || timeout_ms < 1 || out == NULL
+		|| *out != NULL)
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	*out = (ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
 	return CLUSTER_FORMATION_WITNESS_READY;
@@ -269,9 +258,8 @@ cluster_formation_witness_revalidate_nowait(
 
 bool
 cluster_formation_witness_copy_classification_v1(
-	const ClusterFormationWitnessV1 *witness pg_attribute_unused(),
-	uint16 *origin_thread, ClusterFenceAuthorityProof *authority,
-	ClusterFormationSnapshotV1 *snapshot)
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused(), uint16 *origin_thread,
+	ClusterFenceAuthorityProof *authority, ClusterFormationSnapshotV1 *snapshot)
 {
 	memset(authority, 0, sizeof(*authority));
 	memset(snapshot, 0, sizeof(*snapshot));
@@ -289,7 +277,7 @@ cluster_external_fence_need_set_revalidate_nowait(
 	PgracExternalFenceDenyReason *reason)
 {
 	*reason = fake_need_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE
-							  : PGRAC_EXTERNAL_FENCE_DENY_MAPPING_CHANGED;
+								: PGRAC_EXTERNAL_FENCE_DENY_MAPPING_CHANGED;
 	return fake_need_current;
 }
 
@@ -301,15 +289,15 @@ cluster_external_fence_revalidate_set_nowait(
 	PgracExternalFenceDenyReason *reason)
 {
 	*reason = fake_admission_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE
-								   : PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
+									 : PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
 	return fake_admission_current;
 }
 
 PgracExternalFenceNeedSetResult
-cluster_external_fence_need_set_build(
-	const ClusterRecoveryDutyKey *duty pg_attribute_unused(),
-	const ClusterFormationWitnessV1 *formation pg_attribute_unused(),
-	PgracExternalFenceNeedSetV1 **out)
+cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty pg_attribute_unused(),
+									  const ClusterFormationWitnessV1 *formation
+										  pg_attribute_unused(),
+									  PgracExternalFenceNeedSetV1 **out)
 {
 	if (fake_need_build_result == PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
 		*out = (PgracExternalFenceNeedSetV1 *)(uintptr_t)0x4000;
@@ -323,15 +311,13 @@ cluster_external_fence_need_set_release(PgracExternalFenceNeedSetV1 **set)
 }
 
 uint32
-cluster_external_fence_need_set_count(
-	const PgracExternalFenceNeedSetV1 *set pg_attribute_unused())
+cluster_external_fence_need_set_count(const PgracExternalFenceNeedSetV1 *set pg_attribute_unused())
 {
 	return fake_need_count;
 }
 
 const PgracExternalFenceWriterSetDigest *
-cluster_external_fence_need_set_digest(
-	const PgracExternalFenceNeedSetV1 *set pg_attribute_unused())
+cluster_external_fence_need_set_digest(const PgracExternalFenceNeedSetV1 *set pg_attribute_unused())
 {
 	return &fake_need_digest;
 }
@@ -354,16 +340,14 @@ PgracExternalFenceVerdict
 cluster_external_fence_admit_set_wait(
 	const PgracExternalFenceNeedSetV1 *needs pg_attribute_unused(),
 	const ClusterFormationWitnessV1 *formation pg_attribute_unused(),
-	int timeout_ms pg_attribute_unused(),
-	PgracExternalFenceAdmissionSetV1 **out)
+	int timeout_ms pg_attribute_unused(), PgracExternalFenceAdmissionSetV1 **out)
 {
 	*out = (PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x5000;
 	return PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED;
 }
 
 void
-cluster_external_fence_admission_set_release(
-	PgracExternalFenceAdmissionSetV1 **set)
+cluster_external_fence_admission_set_release(PgracExternalFenceAdmissionSetV1 **set)
 {
 	*set = NULL;
 }
@@ -430,7 +414,7 @@ make_duty(uint16 thread_id)
 	duty.origin_node_id = thread_id - 1;
 	duty.thread_claim_created_at = 1000 + thread_id;
 	cluster_wal_thread_claim_fill(&claim, thread_id, duty.origin_node_id,
-								 duty.thread_claim_created_at);
+								  duty.thread_claim_created_at);
 	duty.thread_claim_crc32c = claim.crc;
 	duty.origin_owner_incarnation = 10 + thread_id;
 	duty.root_lineage_seq = 20 + thread_id;
@@ -451,16 +435,14 @@ make_root_token(const ClusterRecoveryDutyKey *duty)
 	token.file_txn_seq = 1;
 	token.root_publish_seq = 1;
 	token.record_crc32c = 1;
-	token.root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	token.root_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 	return token;
 }
 
 static ClusterWalRetentionPinThreadRequest
-make_pin_request(uint16 thread_id, const ClusterWalRetentionInterval *intervals,
-				 uint32 nintervals)
+make_pin_request(uint16 thread_id, const ClusterWalRetentionInterval *intervals, uint32 nintervals)
 {
 	ClusterWalRetentionPinThreadRequest request;
 
@@ -471,8 +453,7 @@ make_pin_request(uint16 thread_id, const ClusterWalRetentionInterval *intervals,
 	request.root_read = make_root_token(&request.duty);
 	request.formation = (const ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
 	request.needs = (const PgracExternalFenceNeedSetV1 *)(uintptr_t)0x2000;
-	request.admissions =
-		(const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x3000;
+	request.admissions = (const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x3000;
 	return request;
 }
 
@@ -493,8 +474,8 @@ make_serial_guard(const ClusterWalRetentionPinThreadRequest *request)
 }
 
 static void
-write_test_wal_segment(const char *directory, TimeLineID tli,
-					   XLogSegNo segno, char *out_path, Size out_path_size)
+write_test_wal_segment(const char *directory, TimeLineID tli, XLogSegNo segno, char *out_path,
+					   Size out_path_size)
 {
 	char wal_name[MAXFNAMELEN];
 	XLogLongPageHeaderData header;
@@ -549,22 +530,15 @@ write_fixture_wal_segment(int argc, char **argv)
 	bool created = false;
 	bool ok = false;
 
-	if (argc != 8
-		|| !parse_fixture_u64(argv[3], &system_identifier)
-		|| !parse_fixture_u64(argv[4], &thread_value)
-		|| !parse_fixture_u64(argv[5], &tli_value)
-		|| !parse_fixture_u64(argv[6], &segno_value)
-		|| !parse_fixture_u64(argv[7], &segsize_value)
-		|| system_identifier == 0
-		|| thread_value == 0
-		|| thread_value > CLUSTER_WAL_RETENTION_MAX_THREADS
-		|| tli_value == 0 || tli_value > UINT32_MAX
-		|| segsize_value > INT_MAX
-		|| !IsValidWalSegSize((int)segsize_value)
-		|| segno_value > UINT64_MAX / segsize_value)
+	if (argc != 8 || !parse_fixture_u64(argv[3], &system_identifier)
+		|| !parse_fixture_u64(argv[4], &thread_value) || !parse_fixture_u64(argv[5], &tli_value)
+		|| !parse_fixture_u64(argv[6], &segno_value) || !parse_fixture_u64(argv[7], &segsize_value)
+		|| system_identifier == 0 || thread_value == 0
+		|| thread_value > CLUSTER_WAL_RETENTION_MAX_THREADS || tli_value == 0
+		|| tli_value > UINT32_MAX || segsize_value > INT_MAX
+		|| !IsValidWalSegSize((int)segsize_value) || segno_value > UINT64_MAX / segsize_value)
 		return 2;
-	XLogFileName(expected_name, (TimeLineID)tli_value,
-				 (XLogSegNo)segno_value, (int)segsize_value);
+	XLogFileName(expected_name, (TimeLineID)tli_value, (XLogSegNo)segno_value, (int)segsize_value);
 	basename = strrchr(argv[2], '/');
 	basename = basename == NULL ? argv[2] : basename + 1;
 	if (strcmp(basename, expected_name) != 0)
@@ -584,8 +558,7 @@ write_fixture_wal_segment(int argc, char **argv)
 	header.xlp_sysid = system_identifier;
 	header.xlp_seg_size = (uint32)segsize_value;
 	header.xlp_xlog_blcksz = XLOG_BLCKSZ;
-	if (pwrite(fd, &header, sizeof(header), 0) != sizeof(header)
-		|| fsync(fd) != 0)
+	if (pwrite(fd, &header, sizeof(header), 0) != sizeof(header) || fsync(fd) != 0)
 		goto done;
 	ok = true;
 
@@ -598,15 +571,13 @@ done:
 }
 
 static void
-prepare_bound_recovery_guard(
-	ClusterWalReuseActionGuard *guard,
-	const ClusterWalRetentionPinThreadRequest *request)
+prepare_bound_recovery_guard(ClusterWalReuseActionGuard *guard,
+							 const ClusterWalRetentionPinThreadRequest *request)
 {
 	ClusterWalReuseDenyReason reason;
 
 	memset(guard, 0, sizeof(*guard));
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(guard, &reason), CLUSTER_WAL_GUARD_OK);
 	guard->state = CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA;
 	guard->entry = CLUSTER_WAL_REUSE_E1_CHECKPOINT_RESTARTPOINT;
 	guard->action = CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE;
@@ -622,8 +593,8 @@ prepare_bound_recovery_guard(
 }
 
 static ClusterControlRootSnapshot
-make_root(uint16 thread_id, ClusterControlRootLifecycle lifecycle,
-		  TimeLineID tli, XLogRecPtr lower, XLogRecPtr tail)
+make_root(uint16 thread_id, ClusterControlRootLifecycle lifecycle, TimeLineID tli, XLogRecPtr lower,
+		  XLogRecPtr tail)
 {
 	ClusterControlRootSnapshot root;
 
@@ -637,8 +608,8 @@ make_root(uint16 thread_id, ClusterControlRootLifecycle lifecycle,
 	root.identity.root_lineage_seq = 1;
 	root.lifecycle = lifecycle;
 	root.root_publish_seq = 1;
-	root.root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
+	root.root_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
 	root.checkpoint_tli = tli;
 	root.checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
 	root.checkpoint_lower_lsn = lower;
@@ -659,7 +630,7 @@ make_root(uint16 thread_id, ClusterControlRootLifecycle lifecycle,
 
 static ClusterWalRootFoldInput
 make_fold_input(bool configured, ClusterControlRootResult read_result,
-				 ClusterControlRootSnapshot root)
+				ClusterControlRootSnapshot root)
 {
 	ClusterWalRootFoldInput input;
 
@@ -707,8 +678,8 @@ UT_TEST(test_wal_basename_exact_parse)
 	ClusterWalFileIdentity file;
 
 	memset(&file, 0x5a, sizeof(file));
-	UT_ASSERT_TRUE(cluster_wal_file_identity_parse(
-		"000000020000000100000003", 7, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_TRUE(
+		cluster_wal_file_identity_parse("000000020000000100000003", 7, TEST_WAL_SEG_SIZE, &file));
 	UT_ASSERT_EQ(file.thread_id, 7);
 	UT_ASSERT_EQ(file.kind, CLUSTER_WAL_FILE_NORMAL);
 	UT_ASSERT_EQ(file.reserved_zero, 0);
@@ -716,8 +687,8 @@ UT_TEST(test_wal_basename_exact_parse)
 	UT_ASSERT_EQ(file.segno, 259);
 	UT_ASSERT_TRUE(cluster_wal_file_identity_valid(&file, TEST_WAL_SEG_SIZE));
 
-	UT_ASSERT_TRUE(cluster_wal_file_identity_parse(
-		"000000020000000100000003.partial", 7, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_TRUE(cluster_wal_file_identity_parse("000000020000000100000003.partial", 7,
+												   TEST_WAL_SEG_SIZE, &file));
 	UT_ASSERT_EQ(file.kind, CLUSTER_WAL_FILE_PARTIAL);
 	UT_ASSERT_EQ(file.segno, 259);
 }
@@ -727,23 +698,23 @@ UT_TEST(test_wal_basename_refuses_aliases)
 	ClusterWalFileIdentity file;
 
 	memset(&file, 0x5a, sizeof(file));
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"000000020000000100000003.done", 7, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_FALSE(cluster_wal_file_identity_parse("000000020000000100000003.done", 7,
+													TEST_WAL_SEG_SIZE, &file));
 	UT_ASSERT_EQ(file.thread_id, 0);
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"000000020000000100000003.partial.extra", 7, TEST_WAL_SEG_SIZE, &file));
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"00000002000000010000000a", 7, TEST_WAL_SEG_SIZE, &file));
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"000000000000000100000003", 7, TEST_WAL_SEG_SIZE, &file));
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"000000020000000100000100", 7, TEST_WAL_SEG_SIZE, &file));
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"000000020000000100000003", 0, TEST_WAL_SEG_SIZE, &file));
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"000000020000000100000003", 129, TEST_WAL_SEG_SIZE, &file));
-	UT_ASSERT_FALSE(cluster_wal_file_identity_parse(
-		"000000020000000100000003", 7, 3 * 1024 * 1024, &file));
+	UT_ASSERT_FALSE(cluster_wal_file_identity_parse("000000020000000100000003.partial.extra", 7,
+													TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_identity_parse("00000002000000010000000a", 7, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_identity_parse("000000000000000100000003", 7, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_identity_parse("000000020000000100000100", 7, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_identity_parse("000000020000000100000003", 0, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_identity_parse("000000020000000100000003", 129, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_identity_parse("000000020000000100000003", 7, 3 * 1024 * 1024, &file));
 }
 
 UT_TEST(test_long_header_exact_identity)
@@ -752,8 +723,8 @@ UT_TEST(test_long_header_exact_identity)
 	XLogLongPageHeaderData header;
 	uint64 system_identifier = UINT64_C(0x1122334455667788);
 
-	UT_ASSERT_TRUE(cluster_wal_file_identity_parse(
-		"000000020000000100000003", 7, TEST_WAL_SEG_SIZE, &file));
+	UT_ASSERT_TRUE(
+		cluster_wal_file_identity_parse("000000020000000100000003", 7, TEST_WAL_SEG_SIZE, &file));
 	memset(&header, 0, sizeof(header));
 	header.std.xlp_magic = XLOG_PAGE_MAGIC;
 	header.std.xlp_info = XLP_LONG_HEADER;
@@ -763,80 +734,72 @@ UT_TEST(test_long_header_exact_identity)
 	header.xlp_sysid = system_identifier;
 	header.xlp_seg_size = TEST_WAL_SEG_SIZE;
 	header.xlp_xlog_blcksz = XLOG_BLCKSZ;
-	UT_ASSERT_TRUE(cluster_wal_file_long_header_matches(
-		&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_TRUE(
+		cluster_wal_file_long_header_matches(&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
 
 	header.std.xlp_thread_id++;
-	UT_ASSERT_FALSE(cluster_wal_file_long_header_matches(
-		&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_long_header_matches(&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
 	header.std.xlp_thread_id--;
 	header.std.xlp_tli++;
-	UT_ASSERT_FALSE(cluster_wal_file_long_header_matches(
-		&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_long_header_matches(&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
 	header.std.xlp_tli--;
 	header.std.xlp_pageaddr += XLOG_BLCKSZ;
-	UT_ASSERT_FALSE(cluster_wal_file_long_header_matches(
-		&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_long_header_matches(&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
 	header.std.xlp_pageaddr -= XLOG_BLCKSZ;
 	header.xlp_sysid++;
-	UT_ASSERT_FALSE(cluster_wal_file_long_header_matches(
-		&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_FALSE(
+		cluster_wal_file_long_header_matches(&file, &header, system_identifier, TEST_WAL_SEG_SIZE));
 }
 
 UT_TEST(test_interval_half_open_segment_bounds)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 7,
-		.tli = 2,
-		.start_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE + 1,
-		.end_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE * 3
-	};
+	ClusterWalRetentionInterval interval = { .thread_id = 7,
+											 .tli = 2,
+											 .start_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE + 1,
+											 .end_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE * 3 };
 	XLogSegNo first = 999;
 	XLogSegNo last = 999;
 
-	UT_ASSERT_TRUE(cluster_wal_retention_interval_segment_bounds(
-		&interval, TEST_WAL_SEG_SIZE, &first, &last));
+	UT_ASSERT_TRUE(
+		cluster_wal_retention_interval_segment_bounds(&interval, TEST_WAL_SEG_SIZE, &first, &last));
 	UT_ASSERT_EQ(first, 1);
 	UT_ASSERT_EQ(last, 2);
 	interval.end_lsn = interval.start_lsn;
-	UT_ASSERT_FALSE(cluster_wal_retention_interval_segment_bounds(
-		&interval, TEST_WAL_SEG_SIZE, &first, &last));
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_interval_segment_bounds(&interval, TEST_WAL_SEG_SIZE, &first, &last));
 	UT_ASSERT_EQ(first, 0);
 	UT_ASSERT_EQ(last, 0);
 	interval.start_lsn = 0;
 	interval.end_lsn = 1;
-	UT_ASSERT_FALSE(cluster_wal_retention_interval_segment_bounds(
-		&interval, TEST_WAL_SEG_SIZE, &first, &last));
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_interval_segment_bounds(&interval, TEST_WAL_SEG_SIZE, &first, &last));
 }
 
 UT_TEST(test_interval_intersection_requires_thread_and_tli)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 7,
-		.tli = 2,
-		.start_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE,
-		.end_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE * 3
-	};
-	ClusterWalFileIdentity file = {
-		.thread_id = 7,
-		.kind = CLUSTER_WAL_FILE_NORMAL,
-		.tli = 2,
-		.segno = 2
-	};
+	ClusterWalRetentionInterval interval = { .thread_id = 7,
+											 .tli = 2,
+											 .start_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE,
+											 .end_lsn = (XLogRecPtr)TEST_WAL_SEG_SIZE * 3 };
+	ClusterWalFileIdentity file
+		= { .thread_id = 7, .kind = CLUSTER_WAL_FILE_NORMAL, .tli = 2, .segno = 2 };
 
-	UT_ASSERT_TRUE(cluster_wal_retention_interval_intersects_file(
-		&interval, &file, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_TRUE(
+		cluster_wal_retention_interval_intersects_file(&interval, &file, TEST_WAL_SEG_SIZE));
 	file.segno = 3;
-	UT_ASSERT_FALSE(cluster_wal_retention_interval_intersects_file(
-		&interval, &file, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_interval_intersects_file(&interval, &file, TEST_WAL_SEG_SIZE));
 	file.segno = 2;
 	file.tli = 3;
-	UT_ASSERT_FALSE(cluster_wal_retention_interval_intersects_file(
-		&interval, &file, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_interval_intersects_file(&interval, &file, TEST_WAL_SEG_SIZE));
 	file.tli = 2;
 	file.thread_id = 8;
-	UT_ASSERT_FALSE(cluster_wal_retention_interval_intersects_file(
-		&interval, &file, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_FALSE(
+		cluster_wal_retention_interval_intersects_file(&interval, &file, TEST_WAL_SEG_SIZE));
 }
 
 UT_TEST(test_walr_resource_encoding_exact)
@@ -872,28 +835,23 @@ UT_TEST(test_walr_resource_encoding_refuses_invalid_thread)
 
 UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalRootPublishGuard *publisher = NULL;
 
 	reset_pin_fakes();
 	fake_native_acquire_result = LOCKACQUIRE_NOT_AVAIL;
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_UNAVAILABLE);
 	UT_ASSERT_NULL(pin);
 	UT_ASSERT_EQ(fake_native_acquire_call_count, 1);
 	UT_ASSERT_EQ(fake_s7_call_count, 1);
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_NOT_NULL(pin);
 	UT_ASSERT_EQ(fake_acquire_call_count, 1);
 	UT_ASSERT_EQ(fake_acquire_requests[0].resid.field1, 1);
@@ -902,11 +860,10 @@ UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 	UT_ASSERT(fake_acquire_requests[0].dontwait);
 	UT_ASSERT_EQ(fake_native_acquire_call_count, 1);
 	UT_ASSERT_EQ(fake_s5_call_count, 1);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1,
-											 &(ClusterWalRetentionPin *){ NULL }),
-				 CLUSTER_WAL_PIN_CAPACITY);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_pin_acquire(&request, 1, &(ClusterWalRetentionPin *){ NULL }),
+		CLUSTER_WAL_PIN_CAPACITY);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_NULL(pin);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
 	UT_ASSERT_EQ(fake_release_threads[0], 1);
@@ -914,16 +871,17 @@ UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 
 	reset_pin_fakes();
 	fake_native_acquire_result = LOCKACQUIRE_NOT_AVAIL;
-	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
-				 &request.root_read, false, &publisher),
-				 CLUSTER_WAL_PIN_UNAVAILABLE);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_UNAVAILABLE);
 	UT_ASSERT_NULL(publisher);
 	UT_ASSERT_EQ(fake_native_acquire_call_count, 1);
 	UT_ASSERT_EQ(fake_s7_call_count, 1);
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
-				 &request.root_read, false, &publisher), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_NOT_NULL(publisher);
 	UT_ASSERT_EQ(fake_native_acquire_call_count, 1);
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
@@ -934,24 +892,23 @@ UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 
 UT_TEST(test_pin_acquire_is_sorted_all_or_none)
 {
-	ClusterWalRetentionInterval intervals[2] = {
-		{ .thread_id = 1, .tli = 1, .start_lsn = TEST_WAL_SEG_SIZE,
-		  .end_lsn = TEST_WAL_SEG_SIZE * 2 },
-		{ .thread_id = 2, .tli = 1, .start_lsn = TEST_WAL_SEG_SIZE * 2,
-		  .end_lsn = TEST_WAL_SEG_SIZE * 3 }
-	};
-	ClusterWalRetentionPinThreadRequest requests[2] = {
-		make_pin_request(1, &intervals[0], 1),
-		make_pin_request(2, &intervals[1], 1)
-	};
+	ClusterWalRetentionInterval intervals[2] = { { .thread_id = 1,
+												   .tli = 1,
+												   .start_lsn = TEST_WAL_SEG_SIZE,
+												   .end_lsn = TEST_WAL_SEG_SIZE * 2 },
+												 { .thread_id = 2,
+												   .tli = 1,
+												   .start_lsn = TEST_WAL_SEG_SIZE * 2,
+												   .end_lsn = TEST_WAL_SEG_SIZE * 3 } };
+	ClusterWalRetentionPinThreadRequest requests[2]
+		= { make_pin_request(1, &intervals[0], 1), make_pin_request(2, &intervals[1], 1) };
 	ClusterWalRetentionPin *pin = NULL;
 
 	reset_pin_fakes();
 	fake_acquire_result_count = 2;
 	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	fake_acquire_results[1] = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &pin),
-				 CLUSTER_WAL_PIN_UNAVAILABLE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &pin), CLUSTER_WAL_PIN_UNAVAILABLE);
 	UT_ASSERT_NULL(pin);
 	UT_ASSERT_EQ(fake_acquire_call_count, 2);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
@@ -960,23 +917,22 @@ UT_TEST(test_pin_acquire_is_sorted_all_or_none)
 	requests[0] = make_pin_request(2, &intervals[1], 1);
 	requests[1] = make_pin_request(1, &intervals[0], 1);
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &pin),
-				 CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &pin), CLUSTER_WAL_PIN_INVALID);
 	UT_ASSERT_EQ(fake_acquire_call_count, 0);
 }
 
 UT_TEST(test_pin_uncertain_rollback_remains_cleanup_only)
 {
-	ClusterWalRetentionInterval intervals[2] = {
-		{ .thread_id = 1, .tli = 1, .start_lsn = TEST_WAL_SEG_SIZE,
-		  .end_lsn = TEST_WAL_SEG_SIZE * 2 },
-		{ .thread_id = 2, .tli = 1, .start_lsn = TEST_WAL_SEG_SIZE * 2,
-		  .end_lsn = TEST_WAL_SEG_SIZE * 3 }
-	};
-	ClusterWalRetentionPinThreadRequest requests[2] = {
-		make_pin_request(1, &intervals[0], 1),
-		make_pin_request(2, &intervals[1], 1)
-	};
+	ClusterWalRetentionInterval intervals[2] = { { .thread_id = 1,
+												   .tli = 1,
+												   .start_lsn = TEST_WAL_SEG_SIZE,
+												   .end_lsn = TEST_WAL_SEG_SIZE * 2 },
+												 { .thread_id = 2,
+												   .tli = 1,
+												   .start_lsn = TEST_WAL_SEG_SIZE * 2,
+												   .end_lsn = TEST_WAL_SEG_SIZE * 3 } };
+	ClusterWalRetentionPinThreadRequest requests[2]
+		= { make_pin_request(1, &intervals[0], 1), make_pin_request(2, &intervals[1], 1) };
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalRetentionPin *other = NULL;
 
@@ -988,152 +944,112 @@ UT_TEST(test_pin_uncertain_rollback_remains_cleanup_only)
 	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &pin),
 				 CLUSTER_WAL_PIN_RELEASE_UNCERTAIN);
 	UT_ASSERT_NOT_NULL(pin);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin,
-											 &(ClusterRecoverySerialGuard){ 0 }),
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &(ClusterRecoverySerialGuard){ 0 }),
 				 CLUSTER_WAL_PIN_RELEASE_UNCERTAIN);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &other),
-				 CLUSTER_WAL_PIN_CAPACITY);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(requests, 2, &other), CLUSTER_WAL_PIN_CAPACITY);
 	UT_ASSERT_NULL(other);
 	fake_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_NULL(pin);
 }
 
 UT_TEST(test_pin_bind_revalidate_and_seal_closed_fsm)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
 	ClusterWalRetentionPin *pin = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_INVALID);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_INVALID);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_INVALID);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
 UT_TEST(test_unbound_pin_has_pre_ir_slow_revalidation_only)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
 	ClusterWalRetentionPin *pin = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_INVALID);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin),
 				 CLUSTER_WAL_PIN_INVALID);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
 	fake_root_current = false;
 	UT_ASSERT_EQ(cluster_wal_retention_pin_preflight_revalidate_wait_v1(pin),
 				 CLUSTER_WAL_PIN_STALE);
-	UT_ASSERT(cluster_wal_retention_pin_bind_one(pin, &serial) !=
-		CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT(cluster_wal_retention_pin_bind_one(pin, &serial) != CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
 UT_TEST(test_pin_revalidation_drift_poisoned_until_release)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
 	ClusterWalRetentionPin *pin = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	fake_serial_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_TRUE(cluster_wal_retention_active_pin_present());
 	fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_STALE);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin),
-				 CLUSTER_WAL_PIN_STALE);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
 }
 
 UT_TEST(test_sealed_pin_root_publish_requires_whole_root_token)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
 	ClusterControlRootReadToken drifted_root = request.root_read;
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalRootPublishGuard *publisher = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
 	drifted_root.root_publish_seq++;
-	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
-				 &drifted_root, true, &publisher), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&drifted_root, true, &publisher),
+				 CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_NULL(publisher);
-	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
-				 &request.root_read, true, &publisher), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_NOT_NULL(publisher);
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
 static ClusterControlRootSnapshot
@@ -1160,29 +1076,22 @@ make_pin_root_snapshot(const ClusterWalRetentionPinThreadRequest *request,
 
 UT_TEST(test_sealed_pin_adopts_same_immutable_root_readback)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
-	ClusterControlRootSnapshot expected =
-		make_pin_root_snapshot(&request, &interval);
+	ClusterControlRootSnapshot expected = make_pin_root_snapshot(&request, &interval);
 	ClusterControlRootSnapshot observed = expected;
 	ClusterControlRootReadToken observed_token = request.root_read;
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalRootPublishGuard *publisher = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
 	serial.held = false;
 	observed.root_publish_seq++;
 	observed.recovered_through_lsn_exclusive = interval.end_lsn;
@@ -1190,122 +1099,101 @@ UT_TEST(test_sealed_pin_adopts_same_immutable_root_readback)
 	observed_token.root_publish_seq++;
 	observed_token.record_crc32c++;
 	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(
-		pin, &expected, &request.root_read, &observed, &observed_token),
-		CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
-		&request.root_read, true, &publisher), CLUSTER_WAL_PIN_STALE);
+					 pin, &expected, &request.root_read, &observed, &observed_token),
+				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_NULL(publisher);
-	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
-		&observed_token, true, &publisher), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&observed_token, true, &publisher),
+				 CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
 UT_TEST(test_sealed_pin_rejects_immutable_root_drift)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
-	ClusterControlRootSnapshot expected =
-		make_pin_root_snapshot(&request, &interval);
+	ClusterControlRootSnapshot expected = make_pin_root_snapshot(&request, &interval);
 	ClusterControlRootSnapshot observed = expected;
 	ClusterControlRootReadToken observed_token = request.root_read;
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalRootPublishGuard *publisher = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
 	serial.held = false;
 	observed.checkpoint_lower_lsn++;
 	observed_token.file_txn_seq++;
 	observed_token.root_publish_seq++;
 	observed_token.record_crc32c++;
 	UT_ASSERT_EQ(cluster_wal_retention_pin_adopt_root_readback_v1(
-		pin, &expected, &request.root_read, &observed, &observed_token),
-		CLUSTER_WAL_PIN_STALE);
-	UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(
-		&request.root_read, true, &publisher), CLUSTER_WAL_PIN_OK);
+					 pin, &expected, &request.root_read, &observed, &observed_token),
+				 CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, true, &publisher),
+		CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
 UT_TEST(test_pin_resource_owner_abort_releases_live_grant)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalRetentionPin *next = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_NOT_NULL(fake_resource_release_callback);
 	if (fake_resource_release_callback != NULL)
-		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false,
-									   false, fake_resource_release_arg);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &next),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&next),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &next), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&next), CLUSTER_WALR_RELEASE_CONFIRMED);
 }
 
 UT_TEST(test_pin_explicit_release_prevents_owner_double_release)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterWalRetentionPin *pin = NULL;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
 	UT_ASSERT_NOT_NULL(fake_resource_release_callback);
 	if (fake_resource_release_callback != NULL)
-		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true,
-									   false, fake_resource_release_arg);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false,
+									   fake_resource_release_arg);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
 }
 
 UT_TEST(test_recovery_guard_converts_same_pin_holder_and_poison_is_cleanup_only)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalReuseActionGuard guard;
@@ -1314,14 +1202,11 @@ UT_TEST(test_recovery_guard_converts_same_pin_holder_and_poison_is_cleanup_only)
 
 	/* Positive: one S holder converts in place to X and back to S. */
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	prepare_bound_recovery_guard(&guard, &request);
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_ARMED);
 	UT_ASSERT(guard.walr.held);
 	UT_ASSERT(guard.walr.coordinated);
@@ -1341,19 +1226,15 @@ UT_TEST(test_recovery_guard_converts_same_pin_holder_and_poison_is_cleanup_only)
 	UT_ASSERT_EQ(fake_acquire_requests[2].current_mode, ExclusiveLock);
 	UT_ASSERT_EQ(fake_acquire_requests[2].lockmode, ShareLock);
 	UT_ASSERT(fake_acquire_requests[2].dontwait);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
 	UT_ASSERT_EQ(fake_native_release_call_count, 3);
 
 	/* A conflicting conversion keeps the original pin S usable. */
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	prepare_bound_recovery_guard(&guard, &request);
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason),
@@ -1361,35 +1242,29 @@ UT_TEST(test_recovery_guard_converts_same_pin_holder_and_poison_is_cleanup_only)
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GES_UNAVAILABLE);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA);
 	UT_ASSERT_FALSE(guard.walr.held);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_NOT_HELD);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 
 	/* An uncertain X->S result poisons the pin; owner cleanup releases X once. */
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	prepare_bound_recovery_guard(&guard, &request);
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason), CLUSTER_WAL_GUARD_OK);
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_UNCONFIRMED);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_RELEASE_UNCERTAIN);
 	UT_ASSERT(guard.walr.release_uncertain);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_NOT_NULL(fake_resource_release_callback);
 	if (fake_resource_release_callback != NULL)
-		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false,
-									   false, fake_resource_release_arg);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
 	UT_ASSERT_EQ(fake_native_release_call_count, 3);
 
@@ -1397,10 +1272,8 @@ UT_TEST(test_recovery_guard_converts_same_pin_holder_and_poison_is_cleanup_only)
 	 * poisons both the guard/pin relationship until ResourceOwner cleanup. */
 	reset_pin_fakes();
 	pin = NULL;
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	prepare_bound_recovery_guard(&guard, &request);
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason),
@@ -1412,54 +1285,45 @@ UT_TEST(test_recovery_guard_converts_same_pin_holder_and_poison_is_cleanup_only)
 	UT_ASSERT(guard.walr.release_uncertain);
 	UT_ASSERT_EQ(guard.serial_or_null, &serial);
 	UT_ASSERT_EQ(guard.pin_or_null, pin);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_NOT_NULL(fake_resource_release_callback);
 	if (fake_resource_release_callback != NULL)
-		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false,
-									   false, fake_resource_release_arg);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
 	UT_ASSERT_EQ(fake_native_release_call_count, 2);
 }
 
 UT_TEST(test_recovery_guard_l3_revalidates_bound_pin_and_serial)
 {
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalReuseActionGuard guard;
 	ClusterWalReuseDenyReason reason;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	prepare_bound_recovery_guard(&guard, &request);
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason), CLUSTER_WAL_GUARD_OK);
 
 	/* ARMED is not durable authority: serial/pin drift must be observed before
 	 * the final object stamp and any destructive syscall. */
 	fake_serial_result = CLUSTER_RECOVERY_SERIAL_FENCE_STALE;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(
-				 &guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
 				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_SERIAL_STALE);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin),
-				 CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
 	UT_ASSERT_NOT_NULL(fake_resource_release_callback);
 	if (fake_resource_release_callback != NULL)
-		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false,
-									   false, fake_resource_release_arg);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
 }
 
 UT_TEST(test_active_recovery_preflight_borrows_exact_pin_and_blocks_retained_file)
@@ -1469,25 +1333,18 @@ UT_TEST(test_active_recovery_preflight_borrows_exact_pin_and_blocks_retained_fil
 	char thread_dir[MAXPGPATH];
 	char retained_path[MAXPGPATH];
 	char disjoint_path[MAXPGPATH];
-	ClusterWalRetentionInterval interval = {
-		.thread_id = 1,
-		.tli = 1,
-		.start_lsn = TEST_WAL_SEG_SIZE,
-		.end_lsn = TEST_WAL_SEG_SIZE * 2
-	};
-	ClusterWalRetentionPinThreadRequest request =
-		make_pin_request(1, &interval, 1);
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
 	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
 	ClusterWalRetentionPin *pin = NULL;
 	ClusterWalRetentionPin *borrowed_pin = NULL;
 	ClusterRecoverySerialGuard *borrowed_serial = NULL;
-	ClusterWalReuseActionGuard guard = {0};
-	ClusterWalFileIdentity file = {
-		.thread_id = 1,
-		.kind = CLUSTER_WAL_FILE_NORMAL,
-		.tli = 1,
-		.segno = 3
-	};
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalFileIdentity file
+		= { .thread_id = 1, .kind = CLUSTER_WAL_FILE_NORMAL, .tli = 1, .segno = 3 };
 	ClusterWalReuseDenyReason reason;
 	ClusterWalTerminalOutcome outcome;
 
@@ -1497,22 +1354,16 @@ UT_TEST(test_active_recovery_preflight_borrows_exact_pin_and_blocks_retained_fil
 	UT_ASSERT_NOT_NULL(root_dir);
 	snprintf(thread_dir, sizeof(thread_dir), "%s/thread_1", root_dir);
 	UT_ASSERT_EQ(mkdir(thread_dir, 0700), 0);
-	write_test_wal_segment(
-		thread_dir, 1, 1, retained_path, sizeof(retained_path));
-	write_test_wal_segment(
-		thread_dir, 1, 3, disjoint_path, sizeof(disjoint_path));
+	write_test_wal_segment(thread_dir, 1, 1, retained_path, sizeof(retained_path));
+	write_test_wal_segment(thread_dir, 1, 3, disjoint_path, sizeof(disjoint_path));
 	cluster_wal_threads_dir = root_dir;
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
 	UT_ASSERT_TRUE(cluster_wal_retention_active_pin_present());
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight_active_recovery(
-				 &guard, &file,
-				 CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH,
-				 &borrowed_serial, &borrowed_pin, &reason),
+					 &guard, &file, CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH, &borrowed_serial,
+					 &borrowed_pin, &reason),
 				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(borrowed_serial, &serial);
 	UT_ASSERT_EQ(borrowed_pin, pin);
@@ -1521,40 +1372,33 @@ UT_TEST(test_active_recovery_preflight_borrows_exact_pin_and_blocks_retained_fil
 	UT_ASSERT_EQ(guard.needs_or_null, request.needs);
 	UT_ASSERT_EQ(guard.admissions_or_null, request.admissions);
 	fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(
-				 &guard, borrowed_serial, borrowed_pin, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, borrowed_serial, borrowed_pin, &reason),
 				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_FALSE(cluster_wal_retention_active_pin_present());
 
 	reset_pin_fakes();
 	request = make_pin_request(1, &interval, 1);
 	serial = make_serial_guard(&request);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin),
-				 CLUSTER_WAL_PIN_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial),
-				 CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
 	memset(&guard, 0, sizeof(guard));
 	file.segno = 1;
 	borrowed_serial = NULL;
 	borrowed_pin = NULL;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight_active_recovery(
-				 &guard, &file,
-				 CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH,
-				 &borrowed_serial, &borrowed_pin, &reason),
+					 &guard, &file, CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH, &borrowed_serial,
+					 &borrowed_pin, &reason),
 				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_REQUIRED);
 	UT_ASSERT_NULL(borrowed_serial);
 	UT_ASSERT_NULL(borrowed_pin);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_NOT_HELD);
-	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin),
-				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
 
 	cluster_wal_threads_dir = NULL;
 	UT_ASSERT_EQ(unlink(retained_path), 0);
@@ -1570,19 +1414,15 @@ UT_TEST(test_correctness_action_context_preflights_e2_without_pin)
 	char thread_dir[MAXPGPATH];
 	char wal_path[MAXPGPATH];
 	char retained_path[MAXPGPATH];
-	ClusterWalRetentionE1Context context = {0};
-	ClusterWalReuseActionGuard guard = {0};
-	ClusterWalFileIdentity file = {
-		.thread_id = 1,
-		.kind = CLUSTER_WAL_FILE_NORMAL,
-		.tli = 1,
-		.segno = 1
-	};
+	ClusterWalRetentionE1Context context = { 0 };
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalFileIdentity file
+		= { .thread_id = 1, .kind = CLUSTER_WAL_FILE_NORMAL, .tli = 1, .segno = 1 };
 	ClusterWalReuseDenyReason reason;
 	ClusterWalTerminalOutcome outcome;
 	PgracExternalFenceNeedSetV1 *needs = NULL;
-	const PgracExternalFenceAdmissionSetV1 *admissions =
-		(const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x3000;
+	const PgracExternalFenceAdmissionSetV1 *admissions
+		= (const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x3000;
 
 	reset_pin_fakes();
 	root_dir = mkdtemp(root_template);
@@ -1591,53 +1431,44 @@ UT_TEST(test_correctness_action_context_preflights_e2_without_pin)
 	UT_ASSERT_EQ(mkdir(thread_dir, 0700), 0);
 	write_test_wal_segment(thread_dir, 1, 1, wal_path, sizeof(wal_path));
 	cluster_wal_threads_dir = root_dir;
-	fake_preflight_root = make_root(
-		1, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED, 1,
-		TEST_WAL_SEG_SIZE * 4, TEST_WAL_SEG_SIZE * 5);
+	fake_preflight_root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED, 1,
+									TEST_WAL_SEG_SIZE * 4, TEST_WAL_SEG_SIZE * 5);
 	fake_preflight_root.identity = make_duty(1);
 	fake_preflight_token = make_root_token(&fake_preflight_root.identity);
 	fake_preflight_root.root_flags = fake_preflight_token.root_flags;
 	fake_preflight_root_ready = true;
 
-	UT_ASSERT_EQ(cluster_wal_retention_action_begin(
-				 &context, 1, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_action_begin(&context, 1, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(fake_acquire_call_count, 0);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_action_preflight(&context, &file,
+														CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH,
+														&guard, &needs, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_action_preflight(
-				 &context, &file,
-				 CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH,
-				 &guard, &needs, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_NOT_NULL(needs);
 	UT_ASSERT_EQ(guard.entry, CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_OK);
 	fake_acquire_result_count = 1;
 	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(
-				 &guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(
-				 &guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_REMOVED);
 	UT_ASSERT_EQ(access(wal_path, F_OK), -1);
 	cluster_external_fence_need_set_release(&needs);
 
-	write_test_wal_segment(
-		thread_dir, 1, 4, retained_path, sizeof(retained_path));
+	write_test_wal_segment(thread_dir, 1, 4, retained_path, sizeof(retained_path));
 	file.segno = 4;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_retention_action_preflight(
-				 &context, &file,
-				 CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH,
-				 &guard, &needs, &reason), CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_action_preflight(&context, &file,
+														CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH,
+														&guard, &needs, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_REQUIRED);
 	UT_ASSERT_NULL(needs);
 	UT_ASSERT_EQ(access(retained_path, F_OK), 0);
@@ -1654,12 +1485,11 @@ UT_TEST(test_correctness_action_context_preflights_e2_without_pin)
 
 UT_TEST(test_reuse_guard_init_and_empty_finish_exact)
 {
-	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalReuseActionGuard guard = { 0 };
 	ClusterWalReuseDenyReason reason = CLUSTER_WAL_DENY_GUARD_STATE;
 	ClusterWalTerminalOutcome outcome = CLUSTER_WAL_TERMINAL_CREATED;
 
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_NONE);
 	UT_ASSERT_EQ(guard.magic, CLUSTER_WAL_REUSE_GUARD_MAGIC);
 	UT_ASSERT_EQ(guard.version, CLUSTER_WAL_REUSE_GUARD_VERSION);
@@ -1680,25 +1510,22 @@ UT_TEST(test_reuse_guard_init_and_empty_finish_exact)
 
 UT_TEST(test_e1_coarse_holds_x_across_strong_floor_then_releases)
 {
-	ClusterWalRetentionE1Context context = {0};
+	ClusterWalRetentionE1Context context = { 0 };
 	ClusterWalRootFoldResult fold_result = CLUSTER_WAL_FOLD_UNKNOWN;
 	XLogSegNo floor = 0;
 	ClusterWalReuseDenyReason reason;
 
 	reset_pin_fakes();
-	fake_preflight_root = make_root(
-		1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
-		TEST_WAL_SEG_SIZE * 4, TEST_WAL_SEG_SIZE * 5);
+	fake_preflight_root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
+									TEST_WAL_SEG_SIZE * 4, TEST_WAL_SEG_SIZE * 5);
 	fake_preflight_root.identity = make_duty(1);
 	fake_preflight_token = make_root_token(&fake_preflight_root.identity);
 	fake_preflight_token.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
-	fake_preflight_token.root_flags &=
-		~CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	fake_preflight_token.root_flags &= ~CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 	fake_preflight_root.root_flags = fake_preflight_token.root_flags;
 	fake_preflight_root_ready = true;
 
-	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(
-				 &context, 1, &fold_result, &floor, &reason),
+	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold_result, &floor, &reason),
 				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(fold_result, CLUSTER_WAL_FOLD_BOUNDED);
 	UT_ASSERT_EQ(floor, 4);
@@ -1716,23 +1543,21 @@ UT_TEST(test_e1_coarse_holds_x_across_strong_floor_then_releases)
 
 UT_TEST(test_e1_coarse_unknown_configured_root_releases_and_retains)
 {
-	ClusterWalRetentionE1Context context = {0};
+	ClusterWalRetentionE1Context context = { 0 };
 	ClusterWalRootFoldResult fold_result = CLUSTER_WAL_FOLD_UNCONSTRAINED;
 	XLogSegNo floor = 99;
 	ClusterWalReuseDenyReason reason;
 
 	reset_pin_fakes();
-	fake_preflight_root = make_root(
-		1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
-		TEST_WAL_SEG_SIZE * 4, TEST_WAL_SEG_SIZE * 5);
+	fake_preflight_root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
+									TEST_WAL_SEG_SIZE * 4, TEST_WAL_SEG_SIZE * 5);
 	fake_preflight_root.identity = make_duty(1);
 	fake_preflight_token = make_root_token(&fake_preflight_root.identity);
 	fake_preflight_root.root_flags = fake_preflight_token.root_flags;
 	fake_preflight_root_ready = true;
 	fake_extra_configured_thread = true;
 
-	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(
-				 &context, 1, &fold_result, &floor, &reason),
+	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold_result, &floor, &reason),
 				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_REQUIRED);
 	UT_ASSERT_EQ(fold_result, CLUSTER_WAL_FOLD_UNKNOWN);
@@ -1743,18 +1568,16 @@ UT_TEST(test_e1_coarse_unknown_configured_root_releases_and_retains)
 
 UT_TEST(test_reuse_guard_rejects_dirty_init_and_stack_copy)
 {
-	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalReuseActionGuard guard = { 0 };
 	ClusterWalReuseActionGuard copy;
 	ClusterWalReuseDenyReason reason = CLUSTER_WAL_DENY_NONE;
 	ClusterWalTerminalOutcome outcome = CLUSTER_WAL_TERMINAL_CREATED;
 
 	guard.flags = 1;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_INVALID);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GUARD_STATE);
 	memset(&guard, 0, sizeof(guard));
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	copy = guard;
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&copy, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_INVALID);
@@ -1766,28 +1589,26 @@ UT_TEST(test_reuse_guard_rejects_dirty_init_and_stack_copy)
 
 UT_TEST(test_reuse_guard_zero_attempts_finish_unchanged)
 {
-	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalReuseActionGuard guard = { 0 };
 	ClusterWalReuseDenyReason reason;
 	ClusterWalTerminalOutcome outcome;
 
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	guard.entry = CLUSTER_WAL_REUSE_E1_CHECKPOINT_RESTARTPOINT;
 	guard.action = CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE;
 	guard.state = CLUSTER_WAL_GUARD_ARMED;
-	guard.flags = CLUSTER_WAL_GUARD_F_PRIMARY_L3
-		| CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_note_zero_mutation(
-				 &guard, CLUSTER_WAL_PHYSICAL_RECYCLE, &reason),
-				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_terminal_durable(
-				 &guard, CLUSTER_WAL_TERMINAL_RECYCLED, &reason),
-				 CLUSTER_WAL_GUARD_INVALID);
+	guard.flags = CLUSTER_WAL_GUARD_F_PRIMARY_L3 | CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE;
+	UT_ASSERT_EQ(
+		cluster_wal_reuse_guard_note_zero_mutation(&guard, CLUSTER_WAL_PHYSICAL_RECYCLE, &reason),
+		CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(
+		cluster_wal_reuse_guard_terminal_durable(&guard, CLUSTER_WAL_TERMINAL_RECYCLED, &reason),
+		CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GUARD_STATE);
 	guard.flags |= CLUSTER_WAL_GUARD_F_FALLBACK_L3;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_note_zero_mutation(
-				 &guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(
+		cluster_wal_reuse_guard_note_zero_mutation(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
+		CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_NOT_HELD);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
@@ -1796,30 +1617,27 @@ UT_TEST(test_reuse_guard_zero_attempts_finish_unchanged)
 
 UT_TEST(test_reuse_guard_terminal_mapping_bookkeep_and_finish)
 {
-	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalReuseActionGuard guard = { 0 };
 	ClusterWalReuseDenyReason reason;
 	ClusterWalTerminalOutcome outcome;
 
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	guard.entry = CLUSTER_WAL_REUSE_E4_PARTIAL_RENAME;
 	guard.action = CLUSTER_WAL_ACTION_RENAME_PARTIAL;
 	guard.state = CLUSTER_WAL_GUARD_ARMED;
 	guard.flags = CLUSTER_WAL_GUARD_F_PRIMARY_L3;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_terminal_durable(
-				 &guard, CLUSTER_WAL_TERMINAL_REMOVED, &reason),
-				 CLUSTER_WAL_GUARD_INVALID);
+	UT_ASSERT_EQ(
+		cluster_wal_reuse_guard_terminal_durable(&guard, CLUSTER_WAL_TERMINAL_REMOVED, &reason),
+		CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GUARD_STATE);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_ARMED);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_terminal_durable(
-				 &guard, CLUSTER_WAL_TERMINAL_RENAMED_PARTIAL, &reason),
+					 &guard, CLUSTER_WAL_TERMINAL_RENAMED_PARTIAL, &reason),
 				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_TERMINAL_DURABLE);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_BOOKKEPT);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason),
-				 CLUSTER_WAL_GUARD_INVALID);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason), CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_NOT_HELD);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_RENAMED_PARTIAL);
@@ -1828,7 +1646,7 @@ UT_TEST(test_reuse_guard_terminal_mapping_bookkeep_and_finish)
 
 UT_TEST(test_reuse_guard_preflight_rejects_closed_matrix_before_authority)
 {
-	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalReuseActionGuard guard = { 0 };
 	ClusterWalReuseGuardRequest request;
 	ClusterWalReuseDenyReason reason;
 	PgracExternalFenceNeedSetV1 *needs = NULL;
@@ -1841,85 +1659,78 @@ UT_TEST(test_reuse_guard_preflight_rejects_closed_matrix_before_authority)
 	request.duty = make_duty(1);
 	request.root_read = make_root_token(&request.duty);
 	request.formation = (const ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 
 	request.entry = CLUSTER_WAL_REUSE_E5_RESTORE_STAGING;
 	request.action = CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_INVALID_IDENTITY);
 	UT_ASSERT_NULL(needs);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_EMPTY);
 
 	request.entry = CLUSTER_WAL_REUSE_E7_EXTERNAL_CLEANUP;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_INVALID_IDENTITY);
 
 	request.entry = CLUSTER_WAL_REUSE_E4_PARTIAL_RENAME;
 	request.action = CLUSTER_WAL_ACTION_RENAME_PARTIAL;
 	request.source_kind = CLUSTER_WAL_INSTALL_SOURCE_ARCHIVE_STAGE;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_INVALID_IDENTITY);
 
 	request.entry = CLUSTER_WAL_REUSE_E3_ARCHIVE_END;
 	request.action = CLUSTER_WAL_ACTION_CREATE_ABSENT;
 	request.source_kind = CLUSTER_WAL_INSTALL_SOURCE_NONE;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_INVALID);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_INVALID_IDENTITY);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard,
-				 &(ClusterWalTerminalOutcome){ CLUSTER_WAL_TERMINAL_CREATED },
-				 &reason), CLUSTER_WALR_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(
+					 &guard, &(ClusterWalTerminalOutcome){ CLUSTER_WAL_TERMINAL_CREATED }, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
 }
 
 UT_TEST(test_reuse_guard_fence_admission_is_na_or_full_set_and)
 {
-	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalReuseActionGuard guard = { 0 };
 	ClusterWalReuseDenyReason reason;
 	ClusterWalTerminalOutcome outcome;
-	const ClusterFormationWitnessV1 *formation =
-		(const ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
-	const PgracExternalFenceNeedSetV1 *needs =
-		(const PgracExternalFenceNeedSetV1 *)(uintptr_t)0x2000;
-	const PgracExternalFenceAdmissionSetV1 *admissions =
-		(const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x3000;
+	const ClusterFormationWitnessV1 *formation
+		= (const ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
+	const PgracExternalFenceNeedSetV1 *needs
+		= (const PgracExternalFenceNeedSetV1 *)(uintptr_t)0x2000;
+	const PgracExternalFenceAdmissionSetV1 *admissions
+		= (const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x3000;
 
 	reset_pin_fakes();
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	guard.state = CLUSTER_WAL_GUARD_PREFLIGHTED;
 	guard.formation = formation;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, NULL, &reason),
+				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_NOT_HELD);
 
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	guard.state = CLUSTER_WAL_GUARD_PREFLIGHTED;
 	guard.formation = formation;
 	guard.needs_or_null = needs;
 	fake_need_count = 2;
 	fake_admission_count = 1;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_FENCE_UNAVAILABLE);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_PREFLIGHTED);
 	fake_admission_count = 2;
 	fake_admission_digest.bytes[0] = 1;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
 	fake_need_digest.bytes[0] = 1;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(guard.admissions_or_null, admissions);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
@@ -1940,14 +1751,14 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	char recycle_path[MAXPGPATH];
 	char held_recycle_path[MAXPGPATH];
 	XLogLongPageHeaderData header;
-	ClusterWalReuseActionGuard guard = {0};
+	ClusterWalReuseActionGuard guard = { 0 };
 	ClusterWalReuseGuardRequest request;
 	ClusterWalFileIdentity destination;
 	ClusterWalReuseDenyReason reason;
 	ClusterWalTerminalOutcome outcome;
 	PgracExternalFenceNeedSetV1 *needs = NULL;
-	const PgracExternalFenceAdmissionSetV1 *admissions =
-		(const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x5000;
+	const PgracExternalFenceAdmissionSetV1 *admissions
+		= (const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)0x5000;
 	int fd;
 
 	reset_pin_fakes();
@@ -1985,8 +1796,7 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	request.root_read = make_root_token(&request.duty);
 	request.formation = (const ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
 	fake_preflight_root.identity = request.duty;
-	fake_preflight_root.lifecycle =
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	fake_preflight_root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
 	fake_preflight_root.root_flags = request.root_read.root_flags;
 	fake_preflight_root.root_publish_seq = 1;
 	fake_preflight_root.checkpoint_tli = 1;
@@ -1996,22 +1806,20 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	fake_preflight_token = request.root_read;
 	fake_preflight_root_ready = true;
 
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_NONE);
 	UT_ASSERT_NOT_NULL(needs);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_PREFLIGHTED);
 	UT_ASSERT_EQ(guard.pre_action_stamp.platform, CLUSTER_WAL_OBJECT_POSIX);
 	UT_ASSERT_EQ(guard.pre_action_stamp.parsed_identity.segno, 1);
 	UT_ASSERT_EQ(guard.needs_or_null, needs);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_OK);
 	fake_acquire_result_count = 1;
 	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(
-				 &guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_ARMED);
 	UT_ASSERT(guard.walr.held);
 	UT_ASSERT(guard.walr.coordinated);
@@ -2027,26 +1835,21 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	 * the terminal identity authority if the configured pathname is swapped. */
 	snprintf(held_thread_dir, sizeof(held_thread_dir), "%s.held", thread_dir);
 	UT_ASSERT_EQ(rename(thread_dir, held_thread_dir), 0);
-	snprintf(held_wal_path, sizeof(held_wal_path), "%s/%s",
-			 held_thread_dir, wal_name);
+	snprintf(held_wal_path, sizeof(held_wal_path), "%s/%s", held_thread_dir, wal_name);
 	UT_ASSERT_EQ(mkdir(thread_dir, 0700), 0);
-	snprintf(replacement_wal_path, sizeof(replacement_wal_path), "%s/%s",
-			 thread_dir, wal_name);
+	snprintf(replacement_wal_path, sizeof(replacement_wal_path), "%s/%s", thread_dir, wal_name);
 	fd = open(replacement_wal_path, O_RDWR | O_CREAT | O_EXCL, 0600);
 	UT_ASSERT(fd >= 0);
 	UT_ASSERT_EQ(ftruncate(fd, TEST_WAL_SEG_SIZE), 0);
 	UT_ASSERT_EQ(pwrite(fd, &header, sizeof(header), 0), sizeof(header));
 	close(fd);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(
-				 &guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(access(held_wal_path, F_OK), -1);
 	UT_ASSERT_EQ(errno, ENOENT);
 	UT_ASSERT_EQ(access(replacement_wal_path, F_OK), 0);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_REMOVED);
@@ -2062,8 +1865,8 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	close(fd);
 	cluster_external_fence_need_set_release(&needs);
 	if (fake_resource_release_callback != NULL)
-		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true,
-									   false, fake_resource_release_arg);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, true, false,
+									   fake_resource_release_arg);
 	UT_ASSERT_EQ(fake_release_call_count, 1);
 
 	/* Recycle must rename within the preflight dirfd and must not follow a
@@ -2071,43 +1874,35 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	memset(&guard, 0, sizeof(guard));
 	fake_acquire_result_count = 2;
 	fake_acquire_results[1] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason), CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(
-				 &guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
 	destination = request.file;
 	destination.tli = 2;
 	destination.segno = 2;
-	XLogFileName(recycle_name, destination.tli, destination.segno,
-				 wal_segment_size);
-	snprintf(recycle_path, sizeof(recycle_path), "%s/%s",
-			 thread_dir, recycle_name);
+	XLogFileName(recycle_name, destination.tli, destination.segno, wal_segment_size);
+	snprintf(recycle_path, sizeof(recycle_path), "%s/%s", thread_dir, recycle_name);
 	UT_ASSERT_EQ(rename(thread_dir, held_thread_dir), 0);
-	snprintf(held_wal_path, sizeof(held_wal_path), "%s/%s",
-			 held_thread_dir, wal_name);
-	snprintf(held_recycle_path, sizeof(held_recycle_path), "%s/%s",
-			 held_thread_dir, recycle_name);
+	snprintf(held_wal_path, sizeof(held_wal_path), "%s/%s", held_thread_dir, wal_name);
+	snprintf(held_recycle_path, sizeof(held_recycle_path), "%s/%s", held_thread_dir, recycle_name);
 	UT_ASSERT_EQ(mkdir(thread_dir, 0700), 0);
 	fd = open(replacement_wal_path, O_RDWR | O_CREAT | O_EXCL, 0600);
 	UT_ASSERT(fd >= 0);
 	UT_ASSERT_EQ(ftruncate(fd, TEST_WAL_SEG_SIZE), 0);
 	UT_ASSERT_EQ(pwrite(fd, &header, sizeof(header), 0), sizeof(header));
 	close(fd);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(
-				 &guard, CLUSTER_WAL_PHYSICAL_RECYCLE, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_RECYCLE, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_recycle(
-				 &guard, &destination, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_recycle(&guard, &destination, &reason),
+				 CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(access(held_wal_path, F_OK), -1);
 	UT_ASSERT_EQ(errno, ENOENT);
 	UT_ASSERT_EQ(access(held_recycle_path, F_OK), 0);
 	UT_ASSERT_EQ(access(replacement_wal_path, F_OK), 0);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_CONFIRMED);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_RECYCLED);
@@ -2128,18 +1923,16 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	memset(&guard, 0, sizeof(guard));
 	fake_acquire_result_count = 3;
 	fake_acquire_results[2] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason), CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(
-				 &guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
 	UT_ASSERT_EQ(fake_native_acquire_call_count, 3);
 	if (fake_resource_release_callback != NULL)
-		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false,
-									   false, fake_resource_release_arg);
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
 	UT_ASSERT_EQ(fake_release_call_count, 3);
 	UT_ASSERT_EQ(fake_native_release_call_count, 3);
 	UT_ASSERT_FALSE(guard.walr.held);
@@ -2150,14 +1943,13 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	fake_acquire_result_count = 4;
 	fake_acquire_results[3] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 	fake_native_acquire_result = LOCKACQUIRE_NOT_AVAIL;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
 				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason), CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(
-				 &guard, admissions, &reason), CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(
-				 &guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, admissions, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GES_UNAVAILABLE);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA);
 	UT_ASSERT_FALSE(guard.walr.held);
@@ -2171,10 +1963,9 @@ UT_TEST(test_reuse_guard_preflight_stamps_folds_and_builds_needset)
 	memset(&guard, 0, sizeof(guard));
 	fake_preflight_root.checkpoint_lower_lsn = TEST_WAL_SEG_SIZE;
 	fake_preflight_root.validated_tail_lsn_exclusive = TEST_WAL_SEG_SIZE * 2;
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason),
-				 CLUSTER_WAL_GUARD_OK);
-	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(
-				 &guard, &request, &needs, &reason), CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_REQUIRED);
 	UT_ASSERT_NULL(needs);
 	UT_ASSERT_EQ(guard.state, CLUSTER_WAL_GUARD_EMPTY);
@@ -2193,8 +1984,8 @@ UT_TEST(test_fold_unconfigured_is_unconstrained)
 	ClusterWalRootFold fold;
 
 	memset(inputs, 0, sizeof(inputs));
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		inputs, lengthof(inputs), TEST_WAL_SEG_SIZE, &fold));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(inputs, lengthof(inputs),
+															  TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_UNCONSTRAINED);
 	UT_ASSERT_EQ(fold.nintervals, 0);
 }
@@ -2205,10 +1996,10 @@ UT_TEST(test_fold_configured_missing_is_unknown)
 	ClusterWalRootFold fold;
 
 	inputs[0] = make_fold_input(true, CLUSTER_CONTROL_ROOT_ABSENT,
-							make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN,
-									 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		inputs, lengthof(inputs), TEST_WAL_SEG_SIZE, &fold));
+								make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
+										  TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(inputs, lengthof(inputs),
+															  TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_UNKNOWN);
 	UT_ASSERT_EQ(fold.nintervals, 0);
 }
@@ -2219,15 +2010,13 @@ UT_TEST(test_fold_open_and_recovery_required_are_bounded)
 	ClusterWalRootFold fold;
 
 	inputs[0] = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY,
-							make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN,
-									 1, TEST_WAL_SEG_SIZE + 7,
-									 TEST_WAL_SEG_SIZE * 3));
+								make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
+										  TEST_WAL_SEG_SIZE + 7, TEST_WAL_SEG_SIZE * 3));
 	inputs[1] = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED,
-							make_root(2, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED,
-									 2, TEST_WAL_SEG_SIZE * 4,
-									 TEST_WAL_SEG_SIZE * 6));
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		inputs, lengthof(inputs), TEST_WAL_SEG_SIZE, &fold));
+								make_root(2, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED, 2,
+										  TEST_WAL_SEG_SIZE * 4, TEST_WAL_SEG_SIZE * 6));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(inputs, lengthof(inputs),
+															  TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_BOUNDED);
 	UT_ASSERT_EQ(fold.nintervals, 2);
 	UT_ASSERT_EQ(fold.intervals[0].thread_id, 1);
@@ -2243,16 +2032,16 @@ UT_TEST(test_fold_terminal_lifecycles_contribute_nothing)
 	ClusterWalRootFold fold;
 
 	inputs[0] = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY,
-							make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE,
-									 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
+								make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE, 1,
+										  TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
 	inputs[1] = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY,
-							make_root(2, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED,
-									 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
+								make_root(2, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED, 1,
+										  TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
 	inputs[2] = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY,
-							make_root(3, CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED,
-									 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		inputs, lengthof(inputs), TEST_WAL_SEG_SIZE, &fold));
+								make_root(3, CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED, 1,
+										  TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(inputs, lengthof(inputs),
+															  TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_UNCONSTRAINED);
 	UT_ASSERT_EQ(fold.nintervals, 0);
 }
@@ -2261,28 +2050,24 @@ UT_TEST(test_fold_refuses_invalid_root_shape)
 {
 	ClusterWalRootFoldInput input;
 	ClusterWalRootFold fold;
-	ClusterControlRootSnapshot root = make_root(
-		1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
-		TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2);
+	ClusterControlRootSnapshot root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
+												TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2);
 
 	root.tail_tli = 2;
 	input = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY, root);
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		&input, 1, TEST_WAL_SEG_SIZE, &fold));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(&input, 1, TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_UNKNOWN);
 
-	root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1,
-		TEST_WAL_SEG_SIZE * 2, TEST_WAL_SEG_SIZE);
+	root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1, TEST_WAL_SEG_SIZE * 2,
+					 TEST_WAL_SEG_SIZE);
 	input = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY, root);
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		&input, 1, TEST_WAL_SEG_SIZE, &fold));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(&input, 1, TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_UNKNOWN);
 
-	root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED, 1,
-		TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE * 2);
+	root = make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED, 1, TEST_WAL_SEG_SIZE,
+					 TEST_WAL_SEG_SIZE * 2);
 	input = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY, root);
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		&input, 1, TEST_WAL_SEG_SIZE, &fold));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(&input, 1, TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_UNKNOWN);
 }
 
@@ -2291,11 +2076,10 @@ UT_TEST(test_fold_empty_open_interval_is_not_bounded)
 	ClusterWalRootFoldInput input;
 	ClusterWalRootFold fold;
 
-	input = make_fold_input(true, CLUSTER_CONTROL_ROOT_OK_PRIMARY,
-							make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN,
-									 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE));
-	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(
-		&input, 1, TEST_WAL_SEG_SIZE, &fold));
+	input = make_fold_input(
+		true, CLUSTER_CONTROL_ROOT_OK_PRIMARY,
+		make_root(1, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN, 1, TEST_WAL_SEG_SIZE, TEST_WAL_SEG_SIZE));
+	UT_ASSERT_TRUE(cluster_wal_retention_fold_validated_roots(&input, 1, TEST_WAL_SEG_SIZE, &fold));
 	UT_ASSERT_EQ(fold.result, CLUSTER_WAL_FOLD_UNCONSTRAINED);
 	UT_ASSERT_EQ(fold.nintervals, 0);
 }

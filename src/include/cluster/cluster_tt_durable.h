@@ -38,7 +38,7 @@
 
 #include "cluster/cluster_itl_slot.h" /* UBA (spec-4.8 D7-A set_head) */
 #include "cluster/cluster_scn.h"	  /* SCN */
-#include "cluster/cluster_tt_slot.h" /* TTSlot */
+#include "cluster/cluster_tt_slot.h"  /* TTSlot */
 
 typedef struct ClusterSemanticAdmissionToken ClusterSemanticAdmissionToken;
 
@@ -63,10 +63,10 @@ typedef enum ClusterTTActiveTransitionDecision {
 	CLUSTER_TT_ACTIVE_CORRUPT
 } ClusterTTActiveTransitionDecision;
 
-extern ClusterTTActiveTransitionDecision cluster_tt_active_transition_decide(
-	const TTSlot *predecessor, uint32 disk_generation,
-	uint32 expected_generation, TransactionId xid, uint16 wrap,
-	bool identity_authorized);
+extern ClusterTTActiveTransitionDecision
+cluster_tt_active_transition_decide(const TTSlot *predecessor, uint32 disk_generation,
+									uint32 expected_generation, TransactionId xid, uint16 wrap,
+									bool identity_authorized);
 
 /* Exact ACTIVE-to-terminal compare-before-transition result. */
 typedef enum ClusterTTTerminalTransitionDecision {
@@ -77,10 +77,10 @@ typedef enum ClusterTTTerminalTransitionDecision {
 	CLUSTER_TT_TERMINAL_CORRUPT
 } ClusterTTTerminalTransitionDecision;
 
-extern ClusterTTTerminalTransitionDecision cluster_tt_terminal_transition_decide(
-	const TTSlot *predecessor, uint32 disk_generation,
-	uint32 expected_generation, TransactionId xid, uint16 wrap,
-	uint8 terminal_status, SCN commit_scn);
+extern ClusterTTTerminalTransitionDecision
+cluster_tt_terminal_transition_decide(const TTSlot *predecessor, uint32 disk_generation,
+									  uint32 expected_generation, TransactionId xid, uint16 wrap,
+									  uint8 terminal_status, SCN commit_scn);
 
 /*
  * Publish the canonical physical ACTIVE predecessor for one exact current
@@ -93,23 +93,23 @@ extern ClusterTTTerminalTransitionDecision cluster_tt_terminal_transition_decide
  * Every other failure raises ERROR.  In particular a BIND emitter failure
  * never returns this retry result, and zero outputs after ERROR prove nothing.
  */
-extern XLogRecPtr cluster_tt_slot_durable_publish_active(
-	const ClusterTTSlotCurrentOwner *expected_owner,
-	const ClusterSemanticAdmissionToken *admission,
-	uint32 *segment_generation_out, TTSlot *successor_out);
+extern XLogRecPtr
+cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected_owner,
+									   const ClusterSemanticAdmissionToken *admission,
+									   uint32 *segment_generation_out, TTSlot *successor_out);
 
 /* Recovery/online-replay exact BIND predecessor classification and apply. */
 extern ClusterTTActiveTransitionDecision
 cluster_tt_durable_bind_preflight_exact(uint8 instance, uint32 segment_id,
-	uint32 segment_generation, uint16 slot_offset, uint16 wrap,
-	TransactionId xid);
+										uint32 segment_generation, uint16 slot_offset, uint16 wrap,
+										TransactionId xid);
 extern ClusterTTTerminalTransitionDecision
 cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
-	uint32 segment_generation, uint16 slot_offset, uint16 wrap,
-	TransactionId xid);
-extern void cluster_tt_durable_redo_bind_slot(uint8 instance,
-	uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
-	uint16 wrap, TransactionId xid);
+										 uint32 segment_generation, uint16 slot_offset, uint16 wrap,
+										 TransactionId xid);
+extern void cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id,
+											  uint32 segment_generation, uint16 slot_offset,
+											  uint16 wrap, TransactionId xid);
 
 /*
  * cluster_tt_durable_redo_decide -- decide what an XLOG_UNDO_TT_SLOT_COMMIT
@@ -206,19 +206,16 @@ extern void cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset
  *	cluster_tt_durable_redo_stamp_slot() (cluster_undo_xlog.c), driven by
  *	xact_redo_commit instead of the 0x30 redo.
  */
-extern uint8 cluster_tt_slot_durable_commit_writeonly(uint32 segment_id,
-												  uint32 segment_generation,
-												  uint16 slot_offset, TransactionId xid, uint16 wrap,
-												  SCN commit_scn,
-												  const ClusterSemanticAdmissionToken *admission,
-												  TTSlot *successor_out);
+extern uint8 cluster_tt_slot_durable_commit_writeonly(
+	uint32 segment_id, uint32 segment_generation, uint16 slot_offset, TransactionId xid,
+	uint16 wrap, SCN commit_scn, const ClusterSemanticAdmissionToken *admission,
+	TTSlot *successor_out);
 
 /* Ordinary abort: verify exact ACTIVE, emit+flush exact 0x60, then
  * apply the identical ABORTED successor before allocator reuse. */
-extern XLogRecPtr cluster_tt_slot_durable_abort_exact(uint32 segment_id,
-	uint32 segment_generation, uint16 slot_offset, TransactionId xid,
-	uint16 wrap, const ClusterSemanticAdmissionToken *admission,
-	TTSlot *successor_out);
+extern XLogRecPtr cluster_tt_slot_durable_abort_exact(
+	uint32 segment_id, uint32 segment_generation, uint16 slot_offset, TransactionId xid,
+	uint16 wrap, const ClusterSemanticAdmissionToken *admission, TTSlot *successor_out);
 
 /*
  * cluster_tt_slot_durable_abort -- spec-3.15 D5 (ROLLBACK PREPARED).
@@ -273,8 +270,8 @@ extern bool cluster_tt_slot_durable_lookup_committed_stable(
  * a non-NULL slot_out remains canonical zero.
  */
 extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
-											   TransactionId xid, uint16 expected_wrap,
-											   TTSlot *slot_out);
+													  TransactionId xid, uint16 expected_wrap,
+													  TTSlot *slot_out);
 
 /*
  * Recovery-only typed TT mutations.  Unlike the normal transaction helpers,
@@ -283,22 +280,21 @@ extern bool cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 
  * exact undo segment before returning; a stale/newer identity is a no-op and
  * must be detected by the caller's exact post-read.
  */
-extern void cluster_tt_durable_redo_abort_slot(uint8 instance,
-	uint32 segment_id, uint16 slot_offset, uint16 wrap, TransactionId xid);
-extern void cluster_tt_durable_redo_abort_slot_exact(uint8 instance,
-	uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
-	uint16 wrap, TransactionId xid);
-extern void cluster_tt_durable_redo_set_head_slot(uint8 instance,
-	uint32 segment_id, uint16 slot_offset, uint16 wrap, TransactionId xid,
-	UBA first_undo_block);
+extern void cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id,
+											   uint16 slot_offset, uint16 wrap, TransactionId xid);
+extern void cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
+													 uint32 segment_generation, uint16 slot_offset,
+													 uint16 wrap, TransactionId xid);
+extern void cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id,
+												  uint16 slot_offset, uint16 wrap,
+												  TransactionId xid, UBA first_undo_block);
 
 extern ClusterTTDurableResolve
 cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid,
 											  uint32 expected_wrap, SCN *commit_scn,
 											  uint16 *out_seg, uint16 *out_slot, uint16 *out_wrap);
 
-typedef enum ClusterTTDurableLocate
-{
+typedef enum ClusterTTDurableLocate {
 	CLUSTER_TT_DURABLE_LOCATE_FOUND = 0,
 	CLUSTER_TT_DURABLE_LOCATE_MISSING,
 	CLUSTER_TT_DURABLE_LOCATE_AMBIGUOUS,
@@ -308,9 +304,9 @@ typedef enum ClusterTTDurableLocate
 /* Recovery projection locator: find exactly one durable ACTIVE/COMMITTED/
  * ABORTED owner without interpreting that state as terminal authority. */
 extern ClusterTTDurableLocate
-cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
-	TransactionId xid, uint16 *out_seg, uint16 *out_slot,
-	uint16 *out_wrap, uint8 *out_status);
+cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId xid,
+												 uint16 *out_seg, uint16 *out_slot,
+												 uint16 *out_wrap, uint8 *out_status);
 
 /*
  * cluster_tt_slot_durable_lookup_by_xid -- scan the local node's undo segment

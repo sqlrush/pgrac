@@ -21,11 +21,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -65,39 +63,31 @@ static bool pin_current;
 static bool stable_proof_current;
 static ClusterRecoverySerialRevalidateResult serial_result;
 
-#define FORMATION ((const ClusterFormationWitnessV1 *) &formation_object)
-#define NEEDS ((const PgracExternalFenceNeedSetV1 *) &needs_object)
-#define ADMISSIONS ((const PgracExternalFenceAdmissionSetV1 *) &admissions_object)
-#define PIN ((ClusterWalRetentionPin *) &pin_object)
+#define FORMATION ((const ClusterFormationWitnessV1 *)&formation_object)
+#define NEEDS ((const PgracExternalFenceNeedSetV1 *)&needs_object)
+#define ADMISSIONS ((const PgracExternalFenceAdmissionSetV1 *)&admissions_object)
+#define PIN ((ClusterWalRetentionPin *)&pin_object)
 #define ROOT_TOKENS (root_tokens)
 #define DUTIES (duty_objects)
 
 bool
 rf_page_stable_base_proof_matches_v1(
-	const RfPageStableBaseProofV1 *proof,
-	const RfPageIdentityV1 *page_identity,
-	const RfPageVersionV1 *expected_result,
-	const ClusterRecoveryDutyKey *duties,
-	const ClusterControlRootReadToken *roots,
-	const ClusterFormationWitnessV1 *formation,
+	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result, const ClusterRecoveryDutyKey *duties,
+	const ClusterControlRootReadToken *roots, const ClusterFormationWitnessV1 *formation,
 	const PgracExternalFenceNeedSetV1 *needs,
-	const PgracExternalFenceAdmissionSetV1 *fence_admissions,
-	ClusterWalRetentionPin *pin,
-	const RfPagePinnedSourceV1 *source,
-	const RfContributorVectorV1 *contributors,
+	const PgracExternalFenceAdmissionSetV1 *fence_admissions, ClusterWalRetentionPin *pin,
+	const RfPagePinnedSourceV1 *source, const RfContributorVectorV1 *contributors,
 	uint32 participant_count)
 {
 	int index = -1;
 	int i;
 
-	if (!stable_proof_current || duties != DUTIES || roots != ROOT_TOKENS ||
-		formation != FORMATION || needs != NEEDS ||
-		fence_admissions != ADMISSIONS || pin != PIN ||
-		participant_count != 1)
+	if (!stable_proof_current || duties != DUTIES || roots != ROOT_TOKENS || formation != FORMATION
+		|| needs != NEEDS || fence_admissions != ADMISSIONS || pin != PIN || participant_count != 1)
 		return false;
 	for (i = 0; i < TEST_AUTHORITY_TARGETS; i++)
-		if (proof == (const RfPageStableBaseProofV1 *) &stable_proof_objects[i])
-		{
+		if (proof == (const RfPageStableBaseProofV1 *)&stable_proof_objects[i]) {
 			index = i;
 			break;
 		}
@@ -105,24 +95,23 @@ rf_page_stable_base_proof_matches_v1(
 		return false;
 	if (contributors != &vector_objects[index])
 		return false;
-	return page_identity != NULL && page_identity->blockno == (uint32) index + 1 &&
-		expected_result != NULL && expected_result->mutation_token ==
-			(uint64) index + 101 &&
-		memcmp(expected_result->segment_incarnation,
-			(const uint8[16]) {7, 7, 7, 7, 7, 7, 7, 7,
-				7, 7, 7, 7, 7, 7, 7, 7}, 16) == 0 &&
-		source == &source_objects[index];
+	return page_identity != NULL && page_identity->blockno == (uint32)index + 1
+		   && expected_result != NULL && expected_result->mutation_token == (uint64)index + 101
+		   && memcmp(expected_result->segment_incarnation,
+					 (const uint8[16]){ 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7 }, 16)
+				  == 0
+		   && source == &source_objects[index];
 }
 
 ClusterRecoveryDutyCompare
 cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
 								  const ClusterRecoveryDutyKey *observed)
 {
-	return expected == &DUTIES[0] && observed != NULL &&
-		observed->origin_thread_id == DUTIES[0].origin_thread_id &&
-		observed->root_lineage_seq == DUTIES[0].root_lineage_seq ?
-		CLUSTER_RECOVERY_DUTY_COMPARE_EXACT :
-		CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
+	return expected == &DUTIES[0] && observed != NULL
+				   && observed->origin_thread_id == DUTIES[0].origin_thread_id
+				   && observed->root_lineage_seq == DUTIES[0].root_lineage_seq
+			   ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
+			   : CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT;
 }
 
 ClusterRecoverySerialRevalidateResult
@@ -132,36 +121,33 @@ cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
 }
 
 bool
-cluster_external_fence_need_set_revalidate_nowait(
-	const PgracExternalFenceNeedSetV1 *needs,
-	const ClusterFormationWitnessV1 *formation,
-	PgracExternalFenceDenyReason *reason)
+cluster_external_fence_need_set_revalidate_nowait(const PgracExternalFenceNeedSetV1 *needs,
+												  const ClusterFormationWitnessV1 *formation,
+												  PgracExternalFenceDenyReason *reason)
 {
 	if (reason != NULL)
-		*reason = fence_need_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE :
-			PGRAC_EXTERNAL_FENCE_DENY_BINDING_MISMATCH;
+		*reason = fence_need_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE
+									 : PGRAC_EXTERNAL_FENCE_DENY_BINDING_MISMATCH;
 	return needs == NEEDS && formation == FORMATION && fence_need_current;
 }
 
 bool
-cluster_external_fence_revalidate_set_nowait(
-	const PgracExternalFenceAdmissionSetV1 *admissions,
-	const PgracExternalFenceNeedSetV1 *needs,
-	const ClusterFormationWitnessV1 *formation,
-	PgracExternalFenceDenyReason *reason)
+cluster_external_fence_revalidate_set_nowait(const PgracExternalFenceAdmissionSetV1 *admissions,
+											 const PgracExternalFenceNeedSetV1 *needs,
+											 const ClusterFormationWitnessV1 *formation,
+											 PgracExternalFenceDenyReason *reason)
 {
 	if (reason != NULL)
-		*reason = fence_admission_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE :
-			PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
-	return admissions == ADMISSIONS && needs == NEEDS &&
-		formation == FORMATION && fence_admission_current;
+		*reason = fence_admission_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE
+										  : PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
+	return admissions == ADMISSIONS && needs == NEEDS && formation == FORMATION
+		   && fence_admission_current;
 }
 
 ClusterWalPinResult
 cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 {
-	return pin == PIN && pin_current ? CLUSTER_WAL_PIN_OK :
-		CLUSTER_WAL_PIN_STALE;
+	return pin == PIN && pin_current ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
 }
 
 static RfPageIdentityV1
@@ -181,8 +167,7 @@ identity(uint32 blockno)
 }
 
 static void
-init_case(RfPageAuthorityBatchRequestV1 *request,
-		  RfPageAuthorityTargetV1 targets[2],
+init_case(RfPageAuthorityBatchRequestV1 *request, RfPageAuthorityTargetV1 targets[2],
 		  ClusterRecoverySerialGuard *serial)
 {
 	memset(request, 0, sizeof(*request));
@@ -194,10 +179,8 @@ init_case(RfPageAuthorityBatchRequestV1 *request,
 	memset(targets[1].expected_result.segment_incarnation, 7, 16);
 	targets[0].expected_result.mutation_token = 101;
 	targets[1].expected_result.mutation_token = 102;
-	targets[0].stable_base =
-		(const RfPageStableBaseProofV1 *) &stable_proof_objects[0];
-	targets[1].stable_base =
-		(const RfPageStableBaseProofV1 *) &stable_proof_objects[1];
+	targets[0].stable_base = (const RfPageStableBaseProofV1 *)&stable_proof_objects[0];
+	targets[1].stable_base = (const RfPageStableBaseProofV1 *)&stable_proof_objects[1];
 	targets[0].source = &source_objects[0];
 	targets[1].source = &source_objects[1];
 	targets[0].contributors = &vector_objects[0];
@@ -219,8 +202,7 @@ init_case(RfPageAuthorityBatchRequestV1 *request,
 	memset(ROOT_TOKENS, 0, sizeof(root_tokens));
 	DUTIES[0].origin_thread_id = 1;
 	DUTIES[0].root_lineage_seq = 91;
-	memset(ROOT_TOKENS[0].authority_uuid, 0x31,
-		   sizeof(ROOT_TOKENS[0].authority_uuid));
+	memset(ROOT_TOKENS[0].authority_uuid, 0x31, sizeof(ROOT_TOKENS[0].authority_uuid));
 	ROOT_TOKENS[0].origin_thread_id = 1;
 	ROOT_TOKENS[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
 	ROOT_TOKENS[0].root_lineage_seq = 91;
@@ -246,12 +228,12 @@ UT_TEST(test_exact_owner_set_promotes_and_revalidates)
 	RfPageAuthorityGuardV1 *guard = NULL;
 
 	init_case(&request, targets, &serial);
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_OK);
-	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(
-		guard, &serial), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(guard, &serial),
+				 RF_PAGE_AUTHORITY_OK);
 	rf_page_authority_guard_release_v1(&guard);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 	UT_ASSERT(guard == NULL && preflight == NULL);
@@ -264,27 +246,25 @@ UT_TEST(test_batch_target_set_is_not_limited_by_record_components)
 	ClusterRecoverySerialGuard serial;
 	RfPageAuthorityPreflightV1 *preflight = NULL;
 	RfPageAuthorityGuardV1 *guard = NULL;
-	uint32		i;
+	uint32 i;
 
 	init_case(&request, targets, &serial);
-	for (i = 2; i < TEST_AUTHORITY_TARGETS; i++)
-	{
+	for (i = 2; i < TEST_AUTHORITY_TARGETS; i++) {
 		targets[i].page_identity = identity(i + 1);
 		memset(targets[i].expected_result.segment_incarnation, 7, 16);
 		targets[i].expected_result.mutation_token = i + 101;
-		targets[i].stable_base =
-			(const RfPageStableBaseProofV1 *) &stable_proof_objects[i];
+		targets[i].stable_base = (const RfPageStableBaseProofV1 *)&stable_proof_objects[i];
 		targets[i].source = &source_objects[i];
 		targets[i].contributors = &vector_objects[i];
 	}
 	request.target_count = TEST_AUTHORITY_TARGETS;
 	rf_page_guard_shmem_init_v1();
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_OK);
-	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(
-		guard, &serial), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(guard, &serial),
+				 RF_PAGE_AUTHORITY_OK);
 	rf_page_authority_guard_release_v1(&guard);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
@@ -298,8 +278,8 @@ UT_TEST(test_missing_live_stop04_object_is_invalid)
 
 	init_case(&request, targets, &serial);
 	request.fence_need_set = NULL;
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_INVALID_ARGUMENT);
 	UT_ASSERT(preflight == NULL);
 }
 
@@ -312,12 +292,11 @@ UT_TEST(test_serial_pointer_identity_mismatch_is_fence_stale)
 	RfPageAuthorityGuardV1 *guard = NULL;
 
 	init_case(&request, targets, &serial);
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
-	serial.fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)
-		&pin_object;
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_FENCE_STALE);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	serial.fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)&pin_object;
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_FENCE_STALE);
 	UT_ASSERT(guard == NULL);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
@@ -331,15 +310,15 @@ UT_TEST(test_fence_stale_blocks_before_page_promote)
 	RfPageAuthorityGuardV1 *guard = NULL;
 
 	init_case(&request, targets, &serial);
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
 	fence_admission_current = false;
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_FENCE_STALE);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_FENCE_STALE);
 	UT_ASSERT(guard == NULL);
 	fence_admission_current = true;
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_OK);
 	rf_page_authority_guard_release_v1(&guard);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
@@ -358,17 +337,15 @@ UT_TEST(test_page_conflict_releases_already_promoted_partition)
 
 	init_case(&request, targets, &serial);
 	rf_page_guard_shmem_init_v1();
-	UT_ASSERT(rf_page_guard_preflight_v1(&targets[1].page_identity,
-		&blocker_preflight));
+	UT_ASSERT(rf_page_guard_preflight_v1(&targets[1].page_identity, &blocker_preflight));
 	memset(&blocker, 0, sizeof(blocker));
 	UT_ASSERT(rf_page_guard_promote_nowait_v1(&blocker_preflight, &blocker));
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_WOULD_BLOCK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_WOULD_BLOCK);
 	UT_ASSERT(guard == NULL);
-	UT_ASSERT(rf_page_guard_preflight_v1(&targets[0].page_identity,
-		&first_preflight));
+	UT_ASSERT(rf_page_guard_preflight_v1(&targets[0].page_identity, &first_preflight));
 	memset(&first_probe, 0, sizeof(first_probe));
 	UT_ASSERT(rf_page_guard_promote_nowait_v1(&first_preflight, &first_probe));
 	rf_page_guard_release_v1(&first_probe);
@@ -386,13 +363,13 @@ UT_TEST(test_stale_pin_after_promote_fails_revalidation)
 
 	init_case(&request, targets, &serial);
 	rf_page_guard_shmem_init_v1();
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_OK);
 	pin_current = false;
-	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(
-		guard, &serial), RF_PAGE_AUTHORITY_RETENTION_STALE);
+	UT_ASSERT_EQ(rf_page_authority_batch_revalidate_nowait_v1(guard, &serial),
+				 RF_PAGE_AUTHORITY_RETENTION_STALE);
 	rf_page_authority_guard_release_v1(&guard);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
@@ -406,8 +383,8 @@ UT_TEST(test_missing_stable_proof_blocks_preflight)
 
 	init_case(&request, targets, &serial);
 	targets[0].stable_base = NULL;
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_NO_STABLE_BASE);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_NO_STABLE_BASE);
 	UT_ASSERT(preflight == NULL);
 }
 
@@ -420,11 +397,11 @@ UT_TEST(test_stable_proof_drift_blocks_page_promotion)
 	RfPageAuthorityGuardV1 *guard = NULL;
 
 	init_case(&request, targets, &serial);
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
 	stable_proof_current = false;
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_NO_STABLE_BASE);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_NO_STABLE_BASE);
 	UT_ASSERT(guard == NULL);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
@@ -438,11 +415,11 @@ UT_TEST(test_serial_duty_mismatch_blocks_page_promotion)
 	RfPageAuthorityGuardV1 *guard = NULL;
 
 	init_case(&request, targets, &serial);
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
 	serial.duty.root_lineage_seq++;
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_GENERATION_STALE);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_GENERATION_STALE);
 	UT_ASSERT(guard == NULL);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
@@ -456,11 +433,11 @@ UT_TEST(test_serial_root_token_mismatch_blocks_page_promotion)
 	RfPageAuthorityGuardV1 *guard = NULL;
 
 	init_case(&request, targets, &serial);
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
 	serial.root_read_token.root_publish_seq++;
-	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(
-		preflight, &serial, &guard), RF_PAGE_AUTHORITY_ROOT_STALE);
+	UT_ASSERT_EQ(rf_page_authority_batch_promote_nowait_v1(preflight, &serial, &guard),
+				 RF_PAGE_AUTHORITY_ROOT_STALE);
 	UT_ASSERT(guard == NULL);
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
@@ -475,18 +452,17 @@ UT_TEST(test_identity_and_incarnation_are_exact)
 	uint8 incarnation[16];
 
 	init_case(&request, targets, &serial);
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
 	memset(incarnation, 7, sizeof(incarnation));
-	UT_ASSERT(rf_page_authority_preflight_matches_target_v1(preflight,
-		&targets[0].page_identity, incarnation));
+	UT_ASSERT(rf_page_authority_preflight_matches_target_v1(preflight, &targets[0].page_identity,
+															incarnation));
 	other = targets[0].page_identity;
 	other.blockno = 3;
-	UT_ASSERT(!rf_page_authority_preflight_matches_target_v1(preflight,
-		&other, incarnation));
+	UT_ASSERT(!rf_page_authority_preflight_matches_target_v1(preflight, &other, incarnation));
 	incarnation[0]++;
-	UT_ASSERT(!rf_page_authority_preflight_matches_target_v1(preflight,
-		&targets[0].page_identity, incarnation));
+	UT_ASSERT(!rf_page_authority_preflight_matches_target_v1(preflight, &targets[0].page_identity,
+															 incarnation));
 	rf_page_authority_preflight_destroy_v1(&preflight);
 }
 
@@ -500,13 +476,11 @@ UT_TEST(test_install_adapter_runs_promote_publish_release)
 
 	init_case(&request, targets, &serial);
 	rf_page_guard_shmem_init_v1();
-	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(
-		&request, 1000, &preflight), RF_PAGE_AUTHORITY_OK);
-	UT_ASSERT(rf_page_install_authority_adapter_init_v1(
-		preflight, &serial, &adapter));
-	UT_ASSERT(adapter.ops.validate_identity(adapter.ops.arg,
-		&targets[0].page_identity,
-		targets[0].expected_result.segment_incarnation));
+	UT_ASSERT_EQ(rf_page_authority_batch_preflight_wait_v1(&request, 1000, &preflight),
+				 RF_PAGE_AUTHORITY_OK);
+	UT_ASSERT(rf_page_install_authority_adapter_init_v1(preflight, &serial, &adapter));
+	UT_ASSERT(adapter.ops.validate_identity(adapter.ops.arg, &targets[0].page_identity,
+											targets[0].expected_result.segment_incarnation));
 	UT_ASSERT(adapter.ops.promote(adapter.ops.arg));
 	UT_ASSERT(adapter.ops.publish(adapter.ops.arg));
 	UT_ASSERT(adapter.ops.release(adapter.ops.arg));

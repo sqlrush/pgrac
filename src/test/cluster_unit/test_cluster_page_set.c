@@ -47,7 +47,7 @@ static ClusterPageRedoChange ut_changes[5];
 static void
 ut_setup_globals(void)
 {
-	int			i;
+	int i;
 
 	memset(&ut_id, 0, sizeof(ut_id));
 	ut_id.rlocator.spcOid = 1;
@@ -60,7 +60,7 @@ ut_setup_globals(void)
 		memset(&ut_v[i], 0, sizeof(ut_v[i]));
 		ut_v[i].identity = ut_id;
 		ut_v[i].incarnation = 7;
-		ut_v[i].token = (uint64) (100 + i);
+		ut_v[i].token = (uint64)(100 + i);
 	}
 
 	for (i = 0; i < 5; i++) {
@@ -68,7 +68,7 @@ ut_setup_globals(void)
 		ut_changes[i].identity = ut_id;
 		ut_changes[i].page_class = CLUSTER_PAGE_CLASS_NORMAL;
 		ut_changes[i].failed_origin_thread = 2;
-		ut_changes[i].change_identity = (uint64) (i + 1);
+		ut_changes[i].change_identity = (uint64)(i + 1);
 	}
 }
 
@@ -96,13 +96,13 @@ ut_set(int n_changes)
 static void
 ut_chain(int n)
 {
-	int			i;
+	int i;
 
 	for (i = 0; i < n; i++) {
 		ut_changes[i].identity = ut_id;
 		ut_changes[i].page_class = CLUSTER_PAGE_CLASS_NORMAL;
 		ut_changes[i].failed_origin_thread = 2;
-		ut_changes[i].change_identity = (uint64) (i + 1);
+		ut_changes[i].change_identity = (uint64)(i + 1);
 		ut_changes[i].expected_before = ut_v[i];
 		ut_changes[i].result_version = ut_v[i + 1];
 	}
@@ -114,11 +114,9 @@ UT_TEST(test_closure_closed_chain_ok)
 
 	ut_chain(3);
 	set = ut_set(3);
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_OK);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set), (int)CLUSTER_PAGE_CLOSURE_OK);
 	/* Rerun determinism (§6.3-9): same inputs, same verdict. */
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_OK);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set), (int)CLUSTER_PAGE_CLOSURE_OK);
 }
 
 UT_TEST(test_closure_gap_and_terminal_mismatch)
@@ -130,24 +128,21 @@ UT_TEST(test_closure_gap_and_terminal_mismatch)
 	ut_changes[1].expected_before = ut_v[0]; /* skips v1 -> wrong join */
 	ut_changes[1].result_version = ut_v[2];
 	set = ut_set(3);
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_GAP);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set), (int)CLUSTER_PAGE_CLOSURE_GAP);
 
 	/* Gap: invalid version in a contributor (PU-05: numeric-higher or
 	 * missing is never coverage). */
 	ut_chain(3);
-	memset(&ut_changes[1].expected_before, 0,
-		   sizeof(ut_changes[1].expected_before));
+	memset(&ut_changes[1].expected_before, 0, sizeof(ut_changes[1].expected_before));
 	set = ut_set(3);
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_GAP);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set), (int)CLUSTER_PAGE_CLOSURE_GAP);
 
 	/* Terminal mismatch: chain ends at v3 but the set requires v4. */
 	ut_chain(3);
 	set = ut_set(3);
 	set.terminal_version = ut_v[4];
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_TERMINAL_MISMATCH);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set),
+				 (int)CLUSTER_PAGE_CLOSURE_TERMINAL_MISMATCH);
 }
 
 UT_TEST(test_closure_unknown_class_and_incarnation_cross)
@@ -158,8 +153,8 @@ UT_TEST(test_closure_unknown_class_and_incarnation_cross)
 	ut_chain(2);
 	ut_changes[1].page_class = CLUSTER_PAGE_CLASS_UNKNOWN;
 	set = ut_set(2);
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_UNKNOWN_CLASS);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set),
+				 (int)CLUSTER_PAGE_CLOSURE_UNKNOWN_CLASS);
 
 	/* Incarnation boundary: equal-SCN-looking versions with a different
 	 * incarnation are NOT adjacency (PU-06/11) — old-incarnation redo
@@ -172,8 +167,8 @@ UT_TEST(test_closure_unknown_class_and_incarnation_cross)
 	set = ut_set(2);
 	set.terminal_version = ut_v[2];
 	set.terminal_version.incarnation = 8;
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_INCARNATION_CROSS);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set),
+				 (int)CLUSTER_PAGE_CLOSURE_INCARNATION_CROSS);
 }
 
 UT_TEST(test_closure_empty_chain)
@@ -184,28 +179,26 @@ UT_TEST(test_closure_empty_chain)
 	 * replay set" conclusion additionally needs the production GCS
 	 * stability witness that the PGDEL-04 CURRENT validator carries. */
 	set = ut_set(0);
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_OK);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set), (int)CLUSTER_PAGE_CLOSURE_OK);
 
 	/* Empty chain, source != terminal: a gap, never a skip. */
 	set = ut_set(0);
 	set.terminal_version = ut_v[1];
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_GAP);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set), (int)CLUSTER_PAGE_CLOSURE_GAP);
 }
 
 UT_TEST(test_closure_invalid_inputs)
 {
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(NULL),
-				 (int) CLUSTER_PAGE_CLOSURE_INVALID_INPUT);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(NULL),
+				 (int)CLUSTER_PAGE_CLOSURE_INVALID_INPUT);
 	{
 		ClusterBlockRecoverySet set = ut_set(1);
 		ClusterPageVersion invalid;
 
 		memset(&invalid, 0, sizeof(invalid));
 		set.source_version = invalid;
-		UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-					 (int) CLUSTER_PAGE_CLOSURE_INVALID_INPUT);
+		UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set),
+					 (int)CLUSTER_PAGE_CLOSURE_INVALID_INPUT);
 	}
 }
 

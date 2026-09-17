@@ -64,8 +64,7 @@ proof_key_is_zero(const ClusterCurrentMemberProofKey *key)
 
 
 static void
-proof_key_set_unbound(ClusterCurrentMemberProofKey *proof_key,
-					  const ClusterTTStatusKey *status_key)
+proof_key_set_unbound(ClusterCurrentMemberProofKey *proof_key, const ClusterTTStatusKey *status_key)
 {
 	memset(proof_key, 0, sizeof(*proof_key));
 	proof_key->origin_node_id = status_key->origin_node_id;
@@ -91,65 +90,58 @@ tt_key_valid(const ClusterTTStatusKey *key, TransactionId xid, uint32 epoch, int
 
 
 static bool
-tt_key_valid_holder(const ClusterTTStatusKey *key, TransactionId member_xid,
-					uint32 epoch, int expected_origin)
+tt_key_valid_holder(const ClusterTTStatusKey *key, TransactionId member_xid, uint32 epoch,
+					int expected_origin)
 {
 	return tt_key_valid(key, InvalidTransactionId, epoch, expected_origin)
-		   && (key->local_xid == member_xid
-			   || TransactionIdPrecedes(key->local_xid, member_xid));
+		   && (key->local_xid == member_xid || TransactionIdPrecedes(key->local_xid, member_xid));
 }
 
 
 static bool
-proof_key_valid_holder(const ClusterCurrentMemberProof *proof,
-					   TransactionId member_xid, uint32 epoch,
-					   int expected_origin)
+proof_key_valid_holder(const ClusterCurrentMemberProof *proof, TransactionId member_xid,
+					   uint32 epoch, int expected_origin)
 {
 	ClusterTTStatusKey status_key;
 	uint32 segment_generation;
 	uint16 slot_wrap;
 
-	return ClusterCurrentMemberProofGetStatusKey(
-			proof, &status_key, &segment_generation, &slot_wrap)
-		&& slot_wrap <= TT_WRAP_MAX
-		&& tt_key_valid_holder(&status_key, member_xid, epoch,
-							   expected_origin);
+	return ClusterCurrentMemberProofGetStatusKey(proof, &status_key, &segment_generation,
+												 &slot_wrap)
+		   && slot_wrap <= TT_WRAP_MAX
+		   && tt_key_valid_holder(&status_key, member_xid, epoch, expected_origin);
 }
 
 
 bool
-cluster_multixact_current_member_proof_bind_ctrc(
-	ClusterCurrentMemberProof *proof, const ClusterCtrcTxnKeyV1 *ctrc_key)
+cluster_multixact_current_member_proof_bind_ctrc(ClusterCurrentMemberProof *proof,
+												 const ClusterCtrcTxnKeyV1 *ctrc_key)
 {
 	if (proof == NULL || ctrc_key == NULL
 		|| (proof->state != CCM_ACTIVE && proof->state != CCM_SELF)
 		|| ClusterCurrentMemberProofGetCtrcGrant(proof) == 0
 		|| ctrc_key->format_version != CLUSTER_CTRC_FORMAT_VERSION
-		|| ctrc_key->owner_instance != ctrc_key->origin_node_id + 1
-		|| ctrc_key->segment_id == 0 || ctrc_key->segment_id > UINT16_MAX
-		|| ctrc_key->segment_generation == UINT32_MAX
-		|| ctrc_key->slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| ctrc_key->slot_wrap > TT_WRAP_MAX
+		|| ctrc_key->owner_instance != ctrc_key->origin_node_id + 1 || ctrc_key->segment_id == 0
+		|| ctrc_key->segment_id > UINT16_MAX || ctrc_key->segment_generation == UINT32_MAX
+		|| ctrc_key->slot_offset >= TT_SLOTS_PER_SEGMENT || ctrc_key->slot_wrap > TT_WRAP_MAX
 		|| proof->key.origin_node_id != ctrc_key->origin_node_id
 		|| proof->key.undo_segment_id != (uint16)ctrc_key->segment_id
-		|| proof->key.tt_slot_id
-		   != cluster_tt_slot_offset_to_id(ctrc_key->slot_offset)
+		|| proof->key.tt_slot_id != cluster_tt_slot_offset_to_id(ctrc_key->slot_offset)
 		|| proof->key.cluster_epoch != ctrc_key->cluster_epoch
 		|| proof->key.local_xid != ctrc_key->xid)
 		return false;
-	ClusterCurrentMemberProofSetCtrcBinding(
-		proof, ctrc_key->segment_generation, ctrc_key->slot_wrap);
+	ClusterCurrentMemberProofSetCtrcBinding(proof, ctrc_key->segment_generation,
+											ctrc_key->slot_wrap);
 	return true;
 }
 
 
 bool
 cluster_multixact_current_resolve_origin_member_proof(
-	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
-	uint16 member_origin_node, uint32 current_epoch, bool requester_self,
-	const ClusterTTStatusKey *initial_key, const ClusterTTStatusResult *initial_result,
-	ClusterCurrentMxExactLookupFn exact_lookup, void *exact_lookup_arg,
-	ClusterCurrentMemberProof *proof)
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal, uint16 member_origin_node,
+	uint32 current_epoch, bool requester_self, const ClusterTTStatusKey *initial_key,
+	const ClusterTTStatusResult *initial_result, ClusterCurrentMxExactLookupFn exact_lookup,
+	void *exact_lookup_arg, ClusterCurrentMemberProof *proof)
 {
 	ClusterTTStatusKey seen_keys[CLUSTER_CURRENT_MX_MAX_PARENT_CHAIN_DEPTH + 1];
 	ClusterTTStatusKey resolved_key;
@@ -161,9 +153,8 @@ cluster_multixact_current_resolve_origin_member_proof(
 		memset(proof, 0, sizeof(*proof));
 		proof->state = CCM_UNKNOWN;
 	}
-	if (proof == NULL || !TransactionIdIsNormal(member_xid)
-		|| member_status > MaxMultiXactStatus || member_origin_node >= CLUSTER_MAX_NODES
-		|| initial_key == NULL || initial_result == NULL
+	if (proof == NULL || !TransactionIdIsNormal(member_xid) || member_status > MaxMultiXactStatus
+		|| member_origin_node >= CLUSTER_MAX_NODES || initial_key == NULL || initial_result == NULL
 		|| !initial_result->authoritative || initial_result->status_epoch != current_epoch
 		|| !tt_key_valid(initial_key, member_xid, current_epoch, member_origin_node))
 		return false;
@@ -184,8 +175,7 @@ cluster_multixact_current_resolve_origin_member_proof(
 			|| seen_count >= lengthof(seen_keys))
 			goto unknown;
 		parent_key = resolved_result.parent_key;
-		if (!tt_key_valid(&parent_key, InvalidTransactionId, current_epoch,
-						  member_origin_node)
+		if (!tt_key_valid(&parent_key, InvalidTransactionId, current_epoch, member_origin_node)
 			|| !TransactionIdPrecedes(parent_key.local_xid, resolved_key.local_xid))
 			goto unknown;
 		for (i = 0; i < seen_count; i++)
@@ -236,10 +226,12 @@ unknown:
 
 
 ClusterUpdaterCandidateVerdict
-cluster_multixact_current_updater_candidate_verdict(
-	const ClusterTTStatusKey *candidate, TransactionId updater_xid,
-	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
-	ClusterTTStatusResult *current_result)
+cluster_multixact_current_updater_candidate_verdict(const ClusterTTStatusKey *candidate,
+													TransactionId updater_xid,
+													uint16 updater_origin_node,
+													uint32 current_epoch,
+													ClusterTTStatusKey *current_binding,
+													ClusterTTStatusResult *current_result)
 {
 	ClusterTTStatusKey sampled_binding;
 	ClusterTTStatusResult sampled_result;
@@ -252,21 +244,19 @@ cluster_multixact_current_updater_candidate_verdict(
 		current_result->commit_scn = InvalidScn;
 	}
 	if (candidate == NULL || current_binding == NULL || current_result == NULL
-		|| updater_origin_node >= CLUSTER_MAX_NODES
-		|| cluster_node_id < 0 || updater_origin_node != (uint16)cluster_node_id
+		|| updater_origin_node >= CLUSTER_MAX_NODES || cluster_node_id < 0
+		|| updater_origin_node != (uint16)cluster_node_id
 		|| !tt_key_valid(candidate, updater_xid, current_epoch, updater_origin_node))
 		return CUCP_UNKNOWN;
 
 	memset(&sampled_binding, 0, sizeof(sampled_binding));
 	memset(&sampled_result, 0, sizeof(sampled_result));
-	if (!(cluster_runtime_visibility_current_owner_lookup_exact(
-			  updater_xid, &sampled_binding, &sampled_result)
-		  || cluster_runtime_visibility_local_terminal_lookup_exact(
-			  updater_xid, &sampled_binding, &sampled_result))
-		|| !sampled_result.authoritative
-		|| sampled_result.status_epoch != current_epoch
-		|| !tt_key_valid(&sampled_binding, updater_xid, current_epoch,
-						  updater_origin_node))
+	if (!(cluster_runtime_visibility_current_owner_lookup_exact(updater_xid, &sampled_binding,
+																&sampled_result)
+		  || cluster_runtime_visibility_local_terminal_lookup_exact(updater_xid, &sampled_binding,
+																	&sampled_result))
+		|| !sampled_result.authoritative || sampled_result.status_epoch != current_epoch
+		|| !tt_key_valid(&sampled_binding, updater_xid, current_epoch, updater_origin_node))
 		return CUCP_UNKNOWN;
 
 	if (memcmp(candidate, &sampled_binding, sizeof(*candidate)) == 0) {
@@ -283,9 +273,8 @@ cluster_multixact_current_updater_candidate_verdict(
 
 bool
 cluster_multixact_current_successor_provenance_well_formed(
-	const ClusterCurrentMxSuccessorAlias *alias,
-	const ClusterTxLocator *locator, TransactionId updater_xid,
-	uint16 updater_origin_node, uint32 current_epoch)
+	const ClusterCurrentMxSuccessorAlias *alias, const ClusterTxLocator *locator,
+	TransactionId updater_xid, uint16 updater_origin_node, uint32 current_epoch)
 {
 	uint32 segment_id;
 	uint32 block_no;
@@ -294,30 +283,22 @@ cluster_multixact_current_successor_provenance_well_formed(
 	uint32 derived_origin;
 	bool data_kind;
 
-	if (alias == NULL || locator == NULL
-		|| updater_origin_node >= CLUSTER_MAX_NODES
+	if (alias == NULL || locator == NULL || updater_origin_node >= CLUSTER_MAX_NODES
 		|| !TransactionIdIsNormal(updater_xid)
-		|| !uba_decode_record(locator->uba, &segment_id, &block_no,
-							  &tt_slot_offset, &row_offset))
+		|| !uba_decode_record(locator->uba, &segment_id, &block_no, &tt_slot_offset, &row_offset))
 		return false;
-	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE
-				|| locator->itl_kind == ITL_FLAG_COMMITTED
+	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE || locator->itl_kind == ITL_FLAG_COMMITTED
 				|| locator->itl_kind == ITL_FLAG_ABORTED
 				|| locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT;
 	derived_origin = (segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE;
-	return data_kind
-		   && segment_id <= UINT16_MAX
-		   && derived_origin == updater_origin_node
-		   && row_offset
-			  < (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
-		   && locator->xid == updater_xid
-		   && locator->tt_wrap == TT_WRAP_INVALID
+	return data_kind && segment_id <= UINT16_MAX && derived_origin == updater_origin_node
+		   && row_offset < (BLCKSZ - sizeof(UndoBlockHeader)) / sizeof(UndoSlotDirEntry)
+		   && locator->xid == updater_xid && locator->tt_wrap == TT_WRAP_INVALID
 		   && locator->itl_slot_index < CLUSTER_ITL_INITRANS_DEFAULT
 		   && alias->origin_node_id == updater_origin_node
 		   && alias->undo_record_segment_id == (uint16)segment_id
 		   && alias->tt_slot_id == (uint32)tt_slot_offset + 1
-		   && alias->cluster_epoch == current_epoch
-		   && alias->local_xid == updater_xid
+		   && alias->cluster_epoch == current_epoch && alias->local_xid == updater_xid
 		   && alias->reserved32 == 0 && alias->reserved32_2 == 0;
 }
 
@@ -327,11 +308,10 @@ cluster_multixact_current_successor_provenance_well_formed(
  * generation; terminal state is sampled from the exact current-or-rolled
  * physical slot and deliberately carries neither grant nor participant. */
 static bool
-current_mx_local_member_sample_exact(
-	TransactionId xid, ClusterTTStatusKey *key,
-	ClusterTTStatusResult *result, uint32 *ctrc_grant,
-	uint32 *participant_capability_generation,
-	ClusterCtrcTxnKeyV1 *ctrc_key_out)
+current_mx_local_member_sample_exact(TransactionId xid, ClusterTTStatusKey *key,
+									 ClusterTTStatusResult *result, uint32 *ctrc_grant,
+									 uint32 *participant_capability_generation,
+									 ClusterCtrcTxnKeyV1 *ctrc_key_out)
 {
 	ClusterCtrcTxnKeyV1 ctrc_key;
 	ClusterCtrcParticipantIdentity participant;
@@ -349,14 +329,11 @@ current_mx_local_member_sample_exact(
 	MemSet(&ctrc_key, 0, sizeof(ctrc_key));
 	MemSet(&participant, 0, sizeof(participant));
 	if (cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
-			xid, key, result, ctrc_grant, &ctrc_key, &participant))
-	{
-		if (result->status != CLUSTER_TT_STATUS_IN_PROGRESS
-			|| *ctrc_grant == 0
+			xid, key, result, ctrc_grant, &ctrc_key, &participant)) {
+		if (result->status != CLUSTER_TT_STATUS_IN_PROGRESS || *ctrc_grant == 0
 			|| participant.capability_record_generation == 0)
 			return false;
-		*participant_capability_generation
-			= participant.capability_record_generation;
+		*participant_capability_generation = participant.capability_record_generation;
 		*ctrc_key_out = ctrc_key;
 		return true;
 	}
@@ -366,10 +343,9 @@ current_mx_local_member_sample_exact(
 	result->status = CLUSTER_TT_STATUS_UNKNOWN;
 	result->commit_scn = InvalidScn;
 	*ctrc_grant = 0;
-	return cluster_runtime_visibility_local_terminal_lookup_exact(
-			xid, key, result)
-		&& (result->status == CLUSTER_TT_STATUS_COMMITTED
-			|| result->status == CLUSTER_TT_STATUS_ABORTED);
+	return cluster_runtime_visibility_local_terminal_lookup_exact(xid, key, result)
+		   && (result->status == CLUSTER_TT_STATUS_COMMITTED
+			   || result->status == CLUSTER_TT_STATUS_ABORTED);
 }
 
 
@@ -419,109 +395,100 @@ descriptor_shape_matches(const ClusterCurrentMxMemberDesc *members, uint16 nmemb
 
 
 bool
-cluster_multixact_current_plan_heap_header(
-	const void *base_header, Size header_size,
-	const ClusterCurrentMxHeapHeaderPlan *plan, void *planned_header)
+cluster_multixact_current_plan_heap_header(const void *base_header, Size header_size,
+										   const ClusterCurrentMxHeapHeaderPlan *plan,
+										   void *planned_header)
 {
 	HeapTupleHeaderData storage;
 	HeapTupleHeader header = &storage;
 
 	if (base_header == NULL || plan == NULL || planned_header == NULL
-		|| header_size != SizeofHeapTupleHeader
-		|| plan->kind < CMX_HEAP_PUBLISH_DELETE
-		|| plan->kind > CMX_HEAP_PUBLISH_TUPLE_LOCK
-		|| !MultiXactIdIsValid(plan->multixact_id)
+		|| header_size != SizeofHeapTupleHeader || plan->kind < CMX_HEAP_PUBLISH_DELETE
+		|| plan->kind > CMX_HEAP_PUBLISH_TUPLE_LOCK || !MultiXactIdIsValid(plan->multixact_id)
 		|| (plan->infomask & HEAP_XMAX_IS_MULTI) == 0
 		|| (plan->itl_slot_index != CLUSTER_ITL_SLOT_UNALLOCATED
 			&& plan->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT))
 		return false;
 	if (!ItemPointerIsValid(&plan->self_tid)
-		|| (plan->kind == CMX_HEAP_PUBLISH_UPDATE_OLD
-			&& !ItemPointerIsValid(&plan->successor_tid)))
+		|| (plan->kind == CMX_HEAP_PUBLISH_UPDATE_OLD && !ItemPointerIsValid(&plan->successor_tid)))
 		return false;
 
 	memcpy(&storage, base_header, header_size);
 
-	switch (plan->kind)
-	{
-		case CMX_HEAP_PUBLISH_DELETE:
-			header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
-			header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
-			header->t_infomask |= plan->infomask;
-			header->t_infomask2 |= plan->infomask2;
+	switch (plan->kind) {
+	case CMX_HEAP_PUBLISH_DELETE:
+		header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+		header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+		header->t_infomask |= plan->infomask;
+		header->t_infomask2 |= plan->infomask2;
+		HeapTupleHeaderClearHotUpdated(header);
+		HeapTupleHeaderSetXmax(header, plan->multixact_id);
+		HeapTupleHeaderSetCmax(header, plan->command_id, plan->command_is_combo);
+		header->t_ctid = plan->self_tid;
+		if (plan->changing_partition)
+			HeapTupleHeaderSetMovedPartitions(header);
+		break;
+
+	case CMX_HEAP_PUBLISH_UPDATE_OLD:
+		if (plan->changing_partition)
+			return false;
+		if (plan->hot_update)
+			HeapTupleHeaderSetHotUpdated(header);
+		else
 			HeapTupleHeaderClearHotUpdated(header);
-			HeapTupleHeaderSetXmax(header, plan->multixact_id);
-			HeapTupleHeaderSetCmax(
-				header, plan->command_id, plan->command_is_combo);
-			header->t_ctid = plan->self_tid;
-			if (plan->changing_partition)
-				HeapTupleHeaderSetMovedPartitions(header);
-			break;
+		header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+		header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+		header->t_infomask |= plan->infomask;
+		header->t_infomask2 |= plan->infomask2;
+		HeapTupleHeaderSetXmax(header, plan->multixact_id);
+		HeapTupleHeaderSetCmax(header, plan->command_id, plan->command_is_combo);
+		header->t_ctid = plan->successor_tid;
+		break;
 
-		case CMX_HEAP_PUBLISH_UPDATE_OLD:
-			if (plan->changing_partition)
-				return false;
-			if (plan->hot_update)
-				HeapTupleHeaderSetHotUpdated(header);
-			else
-				HeapTupleHeaderClearHotUpdated(header);
-			header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
-			header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
-			header->t_infomask |= plan->infomask;
-			header->t_infomask2 |= plan->infomask2;
-			HeapTupleHeaderSetXmax(header, plan->multixact_id);
-			HeapTupleHeaderSetCmax(
-				header, plan->command_id, plan->command_is_combo);
-			header->t_ctid = plan->successor_tid;
-			break;
+	case CMX_HEAP_PUBLISH_UPDATE_NEW:
+		if (plan->changing_partition || plan->command_is_combo
+			|| !TransactionIdIsNormal(plan->xmin))
+			return false;
+		header->t_infomask &= ~HEAP_XACT_MASK;
+		header->t_infomask2 &= ~HEAP2_XACT_MASK;
+		HeapTupleHeaderSetXmin(header, plan->xmin);
+		HeapTupleHeaderSetCmin(header, plan->command_id);
+		header->t_infomask |= HEAP_UPDATED | plan->infomask;
+		header->t_infomask2 |= plan->infomask2;
+		HeapTupleHeaderSetXmax(header, plan->multixact_id);
+		if (plan->hot_update)
+			HeapTupleHeaderSetHeapOnly(header);
+		else
+			HeapTupleHeaderClearHeapOnly(header);
+		header->t_ctid = plan->self_tid;
+		break;
 
-		case CMX_HEAP_PUBLISH_UPDATE_NEW:
-			if (plan->changing_partition || plan->command_is_combo
-				|| !TransactionIdIsNormal(plan->xmin))
-				return false;
-			header->t_infomask &= ~HEAP_XACT_MASK;
-			header->t_infomask2 &= ~HEAP2_XACT_MASK;
-			HeapTupleHeaderSetXmin(header, plan->xmin);
-			HeapTupleHeaderSetCmin(header, plan->command_id);
-			header->t_infomask |= HEAP_UPDATED | plan->infomask;
-			header->t_infomask2 |= plan->infomask2;
-			HeapTupleHeaderSetXmax(header, plan->multixact_id);
-			if (plan->hot_update)
-				HeapTupleHeaderSetHeapOnly(header);
-			else
-				HeapTupleHeaderClearHeapOnly(header);
-			header->t_ctid = plan->self_tid;
-			break;
+	case CMX_HEAP_PUBLISH_TEMP_LOCK:
+		if (plan->changing_partition || plan->hot_update)
+			return false;
+		header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+		header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+		HeapTupleHeaderClearHotUpdated(header);
+		HeapTupleHeaderSetXmax(header, plan->multixact_id);
+		header->t_infomask |= plan->infomask;
+		header->t_infomask2 |= plan->infomask2;
+		HeapTupleHeaderSetCmax(header, plan->command_id, plan->command_is_combo);
+		header->t_ctid = plan->self_tid;
+		break;
 
-		case CMX_HEAP_PUBLISH_TEMP_LOCK:
-			if (plan->changing_partition || plan->hot_update)
-				return false;
-			header->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
-			header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	case CMX_HEAP_PUBLISH_TUPLE_LOCK:
+		if (plan->changing_partition || plan->hot_update || plan->command_is_combo)
+			return false;
+		header->t_infomask &= ~HEAP_XMAX_BITS;
+		header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+		header->t_infomask |= plan->infomask;
+		header->t_infomask2 |= plan->infomask2;
+		if (HEAP_XMAX_IS_LOCKED_ONLY(plan->infomask)) {
 			HeapTupleHeaderClearHotUpdated(header);
-			HeapTupleHeaderSetXmax(header, plan->multixact_id);
-			header->t_infomask |= plan->infomask;
-			header->t_infomask2 |= plan->infomask2;
-			HeapTupleHeaderSetCmax(
-				header, plan->command_id, plan->command_is_combo);
 			header->t_ctid = plan->self_tid;
-			break;
-
-		case CMX_HEAP_PUBLISH_TUPLE_LOCK:
-			if (plan->changing_partition || plan->hot_update
-				|| plan->command_is_combo)
-				return false;
-			header->t_infomask &= ~HEAP_XMAX_BITS;
-			header->t_infomask2 &= ~HEAP_KEYS_UPDATED;
-			header->t_infomask |= plan->infomask;
-			header->t_infomask2 |= plan->infomask2;
-			if (HEAP_XMAX_IS_LOCKED_ONLY(plan->infomask))
-			{
-				HeapTupleHeaderClearHotUpdated(header);
-				header->t_ctid = plan->self_tid;
-			}
-			HeapTupleHeaderSetXmax(header, plan->multixact_id);
-			break;
+		}
+		HeapTupleHeaderSetXmax(header, plan->multixact_id);
+		break;
 	}
 
 	if (plan->itl_slot_index != CLUSTER_ITL_SLOT_UNALLOCATED)
@@ -532,33 +499,27 @@ cluster_multixact_current_plan_heap_header(
 
 
 bool
-cluster_multixact_current_heap_publish_transition(
-	ClusterCurrentMxHeapPublishStage stage,
-	ClusterCurrentMxHeapPublishEvent event,
-	ClusterCurrentMxHeapPublishStage *next_stage)
+cluster_multixact_current_heap_publish_transition(ClusterCurrentMxHeapPublishStage stage,
+												  ClusterCurrentMxHeapPublishEvent event,
+												  ClusterCurrentMxHeapPublishStage *next_stage)
 {
 	if (next_stage == NULL)
 		return false;
 
-	if (stage == CMX_HEAP_STAGE_LOCAL_DESCRIPTOR
-		&& event == CMX_HEAP_EVENT_PREPARE)
+	if (stage == CMX_HEAP_STAGE_LOCAL_DESCRIPTOR && event == CMX_HEAP_EVENT_PREPARE)
 		*next_stage = CMX_HEAP_STAGE_RECEIPT_PREPARED;
-	else if (stage == CMX_HEAP_STAGE_RECEIPT_PREPARED
-			 && event == CMX_HEAP_EVENT_RETRY)
+	else if (stage == CMX_HEAP_STAGE_RECEIPT_PREPARED && event == CMX_HEAP_EVENT_RETRY)
 		*next_stage = CMX_HEAP_STAGE_CANCELLED;
-	else if ((stage == CMX_HEAP_STAGE_LOCAL_DESCRIPTOR
-			  || stage == CMX_HEAP_STAGE_RECEIPT_PREPARED)
+	else if ((stage == CMX_HEAP_STAGE_LOCAL_DESCRIPTOR || stage == CMX_HEAP_STAGE_RECEIPT_PREPARED)
 			 && event == CMX_HEAP_EVENT_ERROR)
 		*next_stage = CMX_HEAP_STAGE_CANCELLED;
 	else if ((stage == CMX_HEAP_STAGE_RECEIPT_APPLIED
 			  || stage == CMX_HEAP_STAGE_REFERENCE_PUBLISHED)
 			 && event == CMX_HEAP_EVENT_ERROR)
 		*next_stage = stage;
-	else if (stage == CMX_HEAP_STAGE_RECEIPT_PREPARED
-			 && event == CMX_HEAP_EVENT_APPLY)
+	else if (stage == CMX_HEAP_STAGE_RECEIPT_PREPARED && event == CMX_HEAP_EVENT_APPLY)
 		*next_stage = CMX_HEAP_STAGE_RECEIPT_APPLIED;
-	else if (stage == CMX_HEAP_STAGE_RECEIPT_APPLIED
-			 && event == CMX_HEAP_EVENT_PUBLISH)
+	else if (stage == CMX_HEAP_STAGE_RECEIPT_APPLIED && event == CMX_HEAP_EVENT_PUBLISH)
 		*next_stage = CMX_HEAP_STAGE_REFERENCE_PUBLISHED;
 	else
 		return false;
@@ -654,19 +615,17 @@ proof_entry_semantic_valid(const ClusterCurrentMemberProof *proof,
 	switch ((ClusterCurrentMemberState)proof->state) {
 	case CCM_SELF:
 	case CCM_ACTIVE:
-		return ClusterCurrentMemberProofGetCtrcGrant(proof) != 0
-			   && proof->commit_scn == InvalidScn
-			   && proof_key_valid_holder(proof, proof->member_xid, epoch,
-								 expected_origin);
+		return ClusterCurrentMemberProofGetCtrcGrant(proof) != 0 && proof->commit_scn == InvalidScn
+			   && proof_key_valid_holder(proof, proof->member_xid, epoch, expected_origin);
 
 	case CCM_COMMITTED:
-		return ClusterCurrentMemberProofGetCtrcGrant(proof) == 0
-			   && proof_key_is_zero(&proof->key) && SCN_VALID(proof->commit_scn);
+		return ClusterCurrentMemberProofGetCtrcGrant(proof) == 0 && proof_key_is_zero(&proof->key)
+			   && SCN_VALID(proof->commit_scn);
 
 	case CCM_ABORTED:
 	case CCM_UNKNOWN:
-		return ClusterCurrentMemberProofGetCtrcGrant(proof) == 0
-			   && proof_key_is_zero(&proof->key) && proof->commit_scn == InvalidScn;
+		return ClusterCurrentMemberProofGetCtrcGrant(proof) == 0 && proof_key_is_zero(&proof->key)
+			   && proof->commit_scn == InvalidScn;
 	}
 
 	return false;
@@ -770,8 +729,7 @@ invalid:
 static bool
 validate_updater_proof_state(const ClusterCurrentMxKey *key,
 							 const ClusterCurrentMxMemberDesc *members,
-							 const ClusterCurrentMemberProof *proofs,
-							 uint16 nmembers,
+							 const ClusterCurrentMemberProof *proofs, uint16 nmembers,
 							 const ClusterCurrentUpdaterChallenge *challenge,
 							 const ClusterCurrentUpdaterProof *updater_proof,
 							 uint16 updater_origin_node_id,
@@ -801,18 +759,14 @@ validate_updater_proof_state(const ClusterCurrentMxKey *key,
 		|| challenge->updater_xid != members[updater_ordinal].xid
 		|| updater_proof->updater_xid != members[updater_ordinal].xid
 		|| !cluster_multixact_current_successor_provenance_well_formed(
-			&challenge->candidate_next_xmin_alias,
-			&challenge->candidate_next_xmin_locator,
-			members[updater_ordinal].xid, updater_origin_node_id,
-			key->cluster_epoch)
-		|| memcmp(&challenge->candidate_next_xmin_alias,
-				  &updater_proof->candidate_next_xmin_alias,
+			&challenge->candidate_next_xmin_alias, &challenge->candidate_next_xmin_locator,
+			members[updater_ordinal].xid, updater_origin_node_id, key->cluster_epoch)
+		|| memcmp(&challenge->candidate_next_xmin_alias, &updater_proof->candidate_next_xmin_alias,
 				  sizeof(ClusterCurrentMxSuccessorAlias))
 			   != 0
 		|| updater_proof->candidate_next_xmin_locator.tt_wrap > TT_WRAP_MAX
-		|| !cluster_tx_locator_reply_matches(
-			&challenge->candidate_next_xmin_locator,
-			&updater_proof->candidate_next_xmin_locator))
+		|| !cluster_tx_locator_reply_matches(&challenge->candidate_next_xmin_locator,
+											 &updater_proof->candidate_next_xmin_locator))
 		return false;
 
 	return true;
@@ -827,9 +781,8 @@ cluster_multixact_current_validate_updater_proof(const ClusterCurrentMxKey *key,
 												 const ClusterCurrentUpdaterProof *updater_proof,
 												 uint16 updater_origin_node_id)
 {
-	return validate_updater_proof_state(
-		key, members, proofs, nmembers, challenge, updater_proof,
-		updater_origin_node_id, CCM_COMMITTED);
+	return validate_updater_proof_state(key, members, proofs, nmembers, challenge, updater_proof,
+										updater_origin_node_id, CCM_COMMITTED);
 }
 
 
@@ -889,7 +842,8 @@ cluster_multixact_current_status_conflicts(uint8 member_status, LockTupleMode wa
 
 	if (valid_out != NULL)
 		*valid_out = true;
-	return DoLockModesConflict(held, wanted);
+	return DoLockModesConflict(held,
+							   wanted); /* GES_MODE_OK: native tuple locks, not GES enqueue. */
 }
 
 
@@ -984,8 +938,8 @@ active_conflict_decision(const ClusterCurrentMxRequestContext *ctx,
 
 
 static ClusterCurrentMxDecision
-current_mx_unknown(ClusterCurrentMxDecisionTrace *trace,
-				   ClusterCurrentMxUnknownReason reason, int32 member_ordinal)
+current_mx_unknown(ClusterCurrentMxDecisionTrace *trace, ClusterCurrentMxUnknownReason reason,
+				   int32 member_ordinal)
 {
 	if (trace != NULL) {
 		trace->unknown_reason = reason;
@@ -996,13 +950,13 @@ current_mx_unknown(ClusterCurrentMxDecisionTrace *trace,
 
 
 ClusterCurrentMxDecision
-cluster_multixact_current_decide_observed(
-	const ClusterCurrentMxMemberDesc *members,
-	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
-	const ClusterCurrentMxRequestContext *ctx,
-	const ClusterCurrentUpdaterChallenge *challenge,
-	const ClusterCurrentUpdaterProof *updater_proof,
-	ClusterTTStatusKey *wait_key, ClusterCurrentMxDecisionTrace *trace)
+cluster_multixact_current_decide_observed(const ClusterCurrentMxMemberDesc *members,
+										  const ClusterCurrentMemberProof *proofs, uint16 nmembers,
+										  const ClusterCurrentMxRequestContext *ctx,
+										  const ClusterCurrentUpdaterChallenge *challenge,
+										  const ClusterCurrentUpdaterProof *updater_proof,
+										  ClusterTTStatusKey *wait_key,
+										  ClusterCurrentMxDecisionTrace *trace)
 {
 	ClusterTTStatusKey selected_wait_key;
 	ClusterCurrentMxDecision self_result = CMDL_CONTINUE;
@@ -1025,8 +979,7 @@ cluster_multixact_current_decide_observed(
 		return current_mx_unknown(trace, CMX_UNKNOWN_REQUEST_CONTEXT, -1);
 	if (!descriptor_entries_valid(members, nmembers))
 		return current_mx_unknown(trace, CMX_UNKNOWN_DESCRIPTOR, -1);
-	if (!descriptor_shape_matches(members, nmembers,
-							  (ClusterCurrentTupleShape)ctx->tuple_shape))
+	if (!descriptor_shape_matches(members, nmembers, (ClusterCurrentTupleShape)ctx->tuple_shape))
 		return current_mx_unknown(trace, CMX_UNKNOWN_TUPLE_SHAPE, -1);
 	if (proofs == NULL)
 		return current_mx_unknown(trace, CMX_UNKNOWN_PROOFS_NULL, -1);
@@ -1053,22 +1006,19 @@ cluster_multixact_current_decide_observed(
 				self_result = ctx->tuple_cmax >= ctx->curcid ? CMDL_SELF_MODIFIED : CMDL_INVISIBLE;
 			break;
 
-		case CCM_ACTIVE:
-		{
+		case CCM_ACTIVE: {
 			ClusterTTStatusKey candidate_wait_key;
 			uint32 segment_generation;
 			uint16 slot_wrap;
 
 			if (ISUPDATE_from_mxstatus(members[i].member_status))
 				active_updater = i;
-			if (!ClusterCurrentMemberProofGetStatusKey(
-					&proofs[i], &candidate_wait_key,
-					&segment_generation, &slot_wrap))
+			if (!ClusterCurrentMemberProofGetStatusKey(&proofs[i], &candidate_wait_key,
+													   &segment_generation, &slot_wrap))
 				return current_mx_unknown(trace, CMX_UNKNOWN_PROOF_ENTRY, i);
 			if (conflicts
 				&& (!have_active_conflict
-					|| wait_key_precedes(&candidate_wait_key,
-									&selected_wait_key))) {
+					|| wait_key_precedes(&candidate_wait_key, &selected_wait_key))) {
 				selected_wait_key = candidate_wait_key;
 				have_active_conflict = true;
 			}
@@ -1102,8 +1052,7 @@ cluster_multixact_current_decide_observed(
 	}
 
 	if (have_unknown)
-		return current_mx_unknown(trace, CMX_UNKNOWN_MEMBER_STATE,
-							  unknown_ordinal);
+		return current_mx_unknown(trace, CMX_UNKNOWN_MEMBER_STATE, unknown_ordinal);
 
 	if (ctx->precheck_result == TM_Invisible)
 		return CMDL_INVISIBLE;
@@ -1117,13 +1066,13 @@ cluster_multixact_current_decide_observed(
 		if (ctx->tuple_shape == CCM_SHAPE_DELETED)
 			return CMDL_DELETED;
 		if (ctx->tuple_shape != CCM_SHAPE_UPDATED)
-			return current_mx_unknown(trace,
-				CMX_UNKNOWN_COMMITTED_UPDATER_SHAPE, committed_updater);
-		if (!cluster_multixact_current_validate_updater_proof(
-				&ctx->mxkey, members, proofs, nmembers, challenge, updater_proof,
-				(uint16)ctx->updater_origin_node_id))
-			return current_mx_unknown(trace,
-				CMX_UNKNOWN_COMMITTED_UPDATER_PROOF, committed_updater);
+			return current_mx_unknown(trace, CMX_UNKNOWN_COMMITTED_UPDATER_SHAPE,
+									  committed_updater);
+		if (!cluster_multixact_current_validate_updater_proof(&ctx->mxkey, members, proofs,
+															  nmembers, challenge, updater_proof,
+															  (uint16)ctx->updater_origin_node_id))
+			return current_mx_unknown(trace, CMX_UNKNOWN_COMMITTED_UPDATER_PROOF,
+									  committed_updater);
 		return CMDL_UPDATED;
 	}
 
@@ -1135,16 +1084,14 @@ cluster_multixact_current_decide_observed(
 	 * usable only after the same full-key proof required for a committed
 	 * updater.
 	 */
-	if (active_updater >= 0 && !have_active_conflict
-		&& ctx->action == CCM_ACTION_LOCK && ctx->follow_updates) {
+	if (active_updater >= 0 && !have_active_conflict && ctx->action == CCM_ACTION_LOCK
+		&& ctx->follow_updates) {
 		if (ctx->tuple_shape != CCM_SHAPE_UPDATED)
-			return current_mx_unknown(trace,
-				CMX_UNKNOWN_ACTIVE_UPDATER_SHAPE, active_updater);
-		if (!validate_updater_proof_state(
-				&ctx->mxkey, members, proofs, nmembers, challenge, updater_proof,
-				(uint16)ctx->updater_origin_node_id, CCM_ACTIVE))
-			return current_mx_unknown(trace,
-				CMX_UNKNOWN_ACTIVE_UPDATER_PROOF, active_updater);
+			return current_mx_unknown(trace, CMX_UNKNOWN_ACTIVE_UPDATER_SHAPE, active_updater);
+		if (!validate_updater_proof_state(&ctx->mxkey, members, proofs, nmembers, challenge,
+										  updater_proof, (uint16)ctx->updater_origin_node_id,
+										  CCM_ACTIVE))
+			return current_mx_unknown(trace, CMX_UNKNOWN_ACTIVE_UPDATER_PROOF, active_updater);
 		return CMDL_FOLLOW_UPDATED;
 	}
 
@@ -1163,8 +1110,8 @@ cluster_multixact_current_decide(const ClusterCurrentMxMemberDesc *members,
 								 const ClusterCurrentUpdaterProof *updater_proof,
 								 ClusterTTStatusKey *wait_key)
 {
-	return cluster_multixact_current_decide_observed(
-		members, proofs, nmembers, ctx, challenge, updater_proof, wait_key, NULL);
+	return cluster_multixact_current_decide_observed(members, proofs, nmembers, ctx, challenge,
+													 updater_proof, wait_key, NULL);
 }
 
 
@@ -1192,8 +1139,7 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 		return CMX_DESC_UNKNOWN;
 
 	current_epoch = cluster_epoch_get_current();
-	if (current_epoch > UINT32_MAX
-		|| key->cluster_epoch != (uint32)current_epoch)
+	if (current_epoch > UINT32_MAX || key->cluster_epoch != (uint32)current_epoch)
 		return CMX_DESC_UNKNOWN;
 
 	origin_slot = cluster_mxid_origin_slot(key->multixact_id);
@@ -1203,14 +1149,13 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 		cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_ASK);
 		PG_TRY();
 		{
-			result = cluster_gcs_current_mx_describe_fetch_and_wait(
-				(int32)key->origin_node_id, key, members, members_cap,
-				nmembers, reported_total_members);
+			result = cluster_gcs_current_mx_describe_fetch_and_wait((int32)key->origin_node_id, key,
+																	members, members_cap, nmembers,
+																	reported_total_members);
 		}
 		PG_CATCH();
 		{
-			cluster_multixact_current_stats_bump(
-				CMX_STAT_DESCRIBE_REMOTE_UNKNOWN);
+			cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_UNKNOWN);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -1222,8 +1167,7 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 			cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_DENIED);
 			break;
 		case CMX_DESC_SUPPORTED_LIMIT:
-			cluster_multixact_current_stats_bump(
-				CMX_STAT_DESCRIBE_REMOTE_SUPPORTED_LIMIT);
+			cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_SUPPORTED_LIMIT);
 			break;
 		case CMX_DESC_TIMEOUT:
 			cluster_multixact_current_stats_bump(CMX_STAT_DESCRIBE_REMOTE_TIMEOUT);
@@ -1250,8 +1194,8 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 			members[i].member_status = (uint8)native_members[i].status;
 		}
 		result = cluster_multixact_current_validate_descriptor(
-			key, (uint16)cluster_node_id, (uint32)current_epoch, members,
-			(uint16)native_count, (uint32)native_count);
+			key, (uint16)cluster_node_id, (uint32)current_epoch, members, (uint16)native_count,
+			(uint32)native_count);
 		if (result == CMX_DESC_OK) {
 			*nmembers = (uint16)native_count;
 			*reported_total_members = (uint32)native_count;
@@ -1271,14 +1215,10 @@ cluster_multixact_current_describe(const ClusterCurrentMxKey *key,
 
 static ClusterMxResolveResult
 cluster_multixact_current_members_resolve_internal(
-	const ClusterCurrentMxKey *key,
-	const ClusterCurrentMxMemberDesc *members,
-	uint16 nmembers, uint64 descriptor_hash,
-	const ClusterCurrentUpdaterChallenge *challenge,
-	ClusterCurrentMemberProof *proofs,
-	ClusterCurrentUpdaterProof *updater_proof,
-	uint32 *proof_capability_generations,
-	TimestampTz *operation_deadline_io)
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	uint64 descriptor_hash, const ClusterCurrentUpdaterChallenge *challenge,
+	ClusterCurrentMemberProof *proofs, ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *proof_capability_generations, TimestampTz *operation_deadline_io)
 {
 	ClusterCurrentMxProofRequestPlan plans[CLUSTER_CURRENT_MX_MAX_CHUNKS];
 	uint16 member_origins[CLUSTER_CURRENT_MX_MAX_MEMBERS];
@@ -1302,30 +1242,24 @@ cluster_multixact_current_members_resolve_internal(
 		return CMX_RESOLVE_SUPPORTED_LIMIT;
 	proof_array_set_unknown(proofs, nmembers);
 	if (proof_capability_generations != NULL)
-		memset(proof_capability_generations, 0,
-			   sizeof(*proof_capability_generations) * nmembers);
+		memset(proof_capability_generations, 0, sizeof(*proof_capability_generations) * nmembers);
 	if (key == NULL || members == NULL || proofs == NULL || updater_proof == NULL
-		|| proof_capability_generations == NULL
-		|| nmembers < 1 || cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		|| proof_capability_generations == NULL || nmembers < 1 || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
 		return CMX_RESOLVE_UNKNOWN;
 
 	current_epoch = cluster_epoch_get_current();
-	operation_deadline = operation_deadline_io != NULL
-		? *operation_deadline_io : 0;
-	if (operation_deadline == 0 && cluster_gcs_reply_timeout_ms > 0)
-	{
-		operation_deadline = TimestampTzPlusMilliseconds(
-			GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms);
+	operation_deadline = operation_deadline_io != NULL ? *operation_deadline_io : 0;
+	if (operation_deadline == 0 && cluster_gcs_reply_timeout_ms > 0) {
+		operation_deadline
+			= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms);
 		if (operation_deadline_io != NULL)
 			*operation_deadline_io = operation_deadline;
 	}
-	if (operation_deadline != 0
-		&& GetCurrentTimestamp() >= operation_deadline)
+	if (operation_deadline != 0 && GetCurrentTimestamp() >= operation_deadline)
 		return CMX_RESOLVE_TIMEOUT;
-	if (current_epoch > UINT32_MAX
-		|| key->cluster_epoch != (uint32)current_epoch
-		|| descriptor_hash
-			   != cluster_multixact_current_descriptor_hash(key, members, nmembers))
+	if (current_epoch > UINT32_MAX || key->cluster_epoch != (uint32)current_epoch
+		|| descriptor_hash != cluster_multixact_current_descriptor_hash(key, members, nmembers))
 		return CMX_RESOLVE_UNKNOWN;
 	for (i = 0; i < nmembers; i++) {
 		int origin = cluster_xid_origin_slot(members[i].xid);
@@ -1342,40 +1276,33 @@ cluster_multixact_current_members_resolve_internal(
 		return result;
 
 	memset(seen, 0, sizeof(seen));
-	memset(source_capability_generations, 0,
-		   sizeof(source_capability_generations));
+	memset(source_capability_generations, 0, sizeof(source_capability_generations));
 	memset(local_ctrc_keys, 0, sizeof(local_ctrc_keys));
 	memset(local_ctrc_grants, 0, sizeof(local_ctrc_grants));
-	memset(local_ctrc_capability_generations, 0,
-		   sizeof(local_ctrc_capability_generations));
+	memset(local_ctrc_capability_generations, 0, sizeof(local_ctrc_capability_generations));
 	for (i = 0; i < plan_count; i++) {
 		ClusterCurrentMemberProof chunk_proofs[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 		ClusterCurrentUpdaterProof chunk_updater;
 		ClusterCurrentMxProofForwardV2 *request = &plans[i].request;
 		uint16 chunk_count = 0;
 		uint32 chunk_capability_generation = 0;
-		uint32 chunk_member_capability_generations[
-			CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+		uint32 chunk_member_capability_generations[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 		uint16 j;
 
-		if (operation_deadline != 0
-			&& GetCurrentTimestamp() >= operation_deadline)
-		{
+		if (operation_deadline != 0 && GetCurrentTimestamp() >= operation_deadline) {
 			result = CMX_RESOLVE_TIMEOUT;
 			goto non_ok;
 		}
 
 		memset(chunk_proofs, 0, sizeof(chunk_proofs));
-		memset(chunk_member_capability_generations, 0,
-			   sizeof(chunk_member_capability_generations));
+		memset(chunk_member_capability_generations, 0, sizeof(chunk_member_capability_generations));
 		memset(&chunk_updater, 0, sizeof(chunk_updater));
 		chunk_updater.verdict = CUCP_UNKNOWN;
 
 		if (plans[i].destination_node_id == (uint16)cluster_node_id) {
 			if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS) {
 				for (j = 0; j < request->prefix.entry_count; j++) {
-					const ClusterCurrentMxProofAskWire *ask
-						= &request->trailer.body.asks[j];
+					const ClusterCurrentMxProofAskWire *ask = &request->trailer.body.asks[j];
 					ClusterTTStatusKey initial_key;
 					ClusterTTStatusResult initial_result;
 					ClusterCtrcTxnKeyV1 ctrc_key;
@@ -1383,42 +1310,33 @@ cluster_multixact_current_members_resolve_internal(
 					uint32 participant_capability_generation = 0;
 
 					if (!current_mx_local_member_sample_exact(
-							ask->xid, &initial_key, &initial_result,
-							&ctrc_grant, &participant_capability_generation,
-							&ctrc_key)
+							ask->xid, &initial_key, &initial_result, &ctrc_grant,
+							&participant_capability_generation, &ctrc_key)
 						|| !cluster_multixact_current_resolve_origin_member_proof(
 							ask->xid, ask->member_status, ask->member_ordinal,
 							(uint16)cluster_node_id, (uint32)current_epoch,
 							TransactionIdIsCurrentTransactionId(ask->xid), &initial_key,
-							&initial_result, NULL, NULL,
-							&chunk_proofs[j]))
+							&initial_result, NULL, NULL, &chunk_proofs[j]))
 						goto unknown;
-					if (chunk_proofs[j].state == CCM_ACTIVE
-						|| chunk_proofs[j].state == CCM_SELF)
-					{
+					if (chunk_proofs[j].state == CCM_ACTIVE || chunk_proofs[j].state == CCM_SELF) {
 						if (ctrc_grant == 0)
 							goto unknown;
-						ClusterCurrentMemberProofSetCtrcGrant(
-							&chunk_proofs[j], ctrc_grant);
-						if (!cluster_multixact_current_member_proof_bind_ctrc(
-								&chunk_proofs[j], &ctrc_key))
+						ClusterCurrentMemberProofSetCtrcGrant(&chunk_proofs[j], ctrc_grant);
+						if (!cluster_multixact_current_member_proof_bind_ctrc(&chunk_proofs[j],
+																			  &ctrc_key))
 							goto unknown;
 						if (participant_capability_generation == 0
 							|| (chunk_capability_generation != 0
 								&& chunk_capability_generation
-								   != participant_capability_generation))
+									   != participant_capability_generation))
 							goto unknown;
-						chunk_capability_generation
-							= participant_capability_generation;
-						chunk_member_capability_generations[j]
-							= participant_capability_generation;
+						chunk_capability_generation = participant_capability_generation;
+						chunk_member_capability_generations[j] = participant_capability_generation;
 						local_ctrc_keys[ask->member_ordinal] = ctrc_key;
 						local_ctrc_grants[ask->member_ordinal] = ctrc_grant;
 						local_ctrc_capability_generations[ask->member_ordinal]
 							= participant_capability_generation;
-					}
-					else if (ctrc_grant != 0
-							 || participant_capability_generation != 0)
+					} else if (ctrc_grant != 0 || participant_capability_generation != 0)
 						goto unknown;
 				}
 				chunk_count = request->prefix.entry_count;
@@ -1434,51 +1352,38 @@ cluster_multixact_current_members_resolve_internal(
 				bool cross_segment = false;
 
 				if (!cluster_runtime_visibility_current_mx_updater_provenance_exact(
-						&wire_challenge->candidate_next_xmin_locator,
-						operation_deadline, &initial_key, &initial_result,
-						&ctrc_grant, &participant_capability_generation,
-						&ctrc_key, &canonical_locator, &cross_segment)
+						&wire_challenge->candidate_next_xmin_locator, operation_deadline,
+						&initial_key, &initial_result, &ctrc_grant,
+						&participant_capability_generation, &ctrc_key, &canonical_locator,
+						&cross_segment)
 					|| !cluster_multixact_current_resolve_origin_member_proof(
 						wire_challenge->updater_xid, wire_challenge->member_status,
 						wire_challenge->member_ordinal, (uint16)cluster_node_id,
 						(uint32)current_epoch,
 						TransactionIdIsCurrentTransactionId(wire_challenge->updater_xid),
-						&initial_key, &initial_result, NULL, NULL,
-						&chunk_proofs[0]))
+						&initial_key, &initial_result, NULL, NULL, &chunk_proofs[0]))
 					goto unknown;
-				if (chunk_proofs[0].state == CCM_ACTIVE
-					|| chunk_proofs[0].state == CCM_SELF)
-				{
+				if (chunk_proofs[0].state == CCM_ACTIVE || chunk_proofs[0].state == CCM_SELF) {
 					if (ctrc_grant == 0)
 						goto unknown;
-					ClusterCurrentMemberProofSetCtrcGrant(
-						&chunk_proofs[0], ctrc_grant);
-					if (!cluster_multixact_current_member_proof_bind_ctrc(
-							&chunk_proofs[0], &ctrc_key))
+					ClusterCurrentMemberProofSetCtrcGrant(&chunk_proofs[0], ctrc_grant);
+					if (!cluster_multixact_current_member_proof_bind_ctrc(&chunk_proofs[0],
+																		  &ctrc_key))
 						goto unknown;
 					if (participant_capability_generation == 0)
 						goto unknown;
-					chunk_capability_generation
+					chunk_capability_generation = participant_capability_generation;
+					chunk_member_capability_generations[0] = participant_capability_generation;
+					local_ctrc_keys[wire_challenge->member_ordinal] = ctrc_key;
+					local_ctrc_grants[wire_challenge->member_ordinal] = ctrc_grant;
+					local_ctrc_capability_generations[wire_challenge->member_ordinal]
 						= participant_capability_generation;
-					chunk_member_capability_generations[0]
-						= participant_capability_generation;
-					local_ctrc_keys[wire_challenge->member_ordinal]
-						= ctrc_key;
-					local_ctrc_grants[wire_challenge->member_ordinal]
-						= ctrc_grant;
-					local_ctrc_capability_generations[
-						wire_challenge->member_ordinal]
-						= participant_capability_generation;
-				}
-				else if (ctrc_grant != 0
-						 || participant_capability_generation != 0)
+				} else if (ctrc_grant != 0 || participant_capability_generation != 0)
 					goto unknown;
 				chunk_count = 1;
 				chunk_updater.mxkey = request->prefix.mxkey;
-				chunk_updater.candidate_next_xmin_alias
-					= wire_challenge->candidate_next_xmin_alias;
-				chunk_updater.candidate_next_xmin_locator
-					= canonical_locator;
+				chunk_updater.candidate_next_xmin_alias = wire_challenge->candidate_next_xmin_alias;
+				chunk_updater.candidate_next_xmin_locator = canonical_locator;
 				chunk_updater.updater_xid = wire_challenge->updater_xid;
 				chunk_updater.member_ordinal = wire_challenge->member_ordinal;
 				chunk_updater.verdict = CUCP_MATCH;
@@ -1491,14 +1396,12 @@ cluster_multixact_current_members_resolve_internal(
 			PG_TRY();
 			{
 				result = cluster_gcs_current_mx_member_proof_fetch_and_wait(
-					plans[i].destination_node_id, request, chunk_proofs,
-					lengthof(chunk_proofs), &chunk_count, &chunk_updater,
-					&chunk_capability_generation, operation_deadline);
+					plans[i].destination_node_id, request, chunk_proofs, lengthof(chunk_proofs),
+					&chunk_count, &chunk_updater, &chunk_capability_generation, operation_deadline);
 			}
 			PG_CATCH();
 			{
-				cluster_multixact_current_stats_bump(
-					CMX_STAT_MEMBER_PROOF_UNKNOWN);
+				cluster_multixact_current_stats_bump(CMX_STAT_MEMBER_PROOF_UNKNOWN);
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
@@ -1510,8 +1413,7 @@ cluster_multixact_current_members_resolve_internal(
 				cluster_multixact_current_stats_bump(CMX_STAT_MEMBER_PROOF_DENIED);
 				break;
 			case CMX_RESOLVE_SUPPORTED_LIMIT:
-				cluster_multixact_current_stats_bump(
-					CMX_STAT_MEMBER_PROOF_SUPPORTED_LIMIT);
+				cluster_multixact_current_stats_bump(CMX_STAT_MEMBER_PROOF_SUPPORTED_LIMIT);
 				break;
 			case CMX_RESOLVE_TIMEOUT:
 				cluster_multixact_current_stats_bump(CMX_STAT_MEMBER_PROOF_TIMEOUT);
@@ -1530,22 +1432,18 @@ cluster_multixact_current_members_resolve_internal(
 
 		if (chunk_count != request->prefix.entry_count)
 			goto unknown;
-		for (j = 0; j < chunk_count; j++)
-		{
-			if (chunk_proofs[j].state != CCM_ACTIVE
-				&& chunk_proofs[j].state != CCM_SELF)
+		for (j = 0; j < chunk_count; j++) {
+			if (chunk_proofs[j].state != CCM_ACTIVE && chunk_proofs[j].state != CCM_SELF)
 				continue;
 			if (chunk_capability_generation == 0)
 				goto unknown;
 			if (plans[i].destination_node_id != (uint16)cluster_node_id)
-				chunk_member_capability_generations[j]
-					= chunk_capability_generation;
+				chunk_member_capability_generations[j] = chunk_capability_generation;
 		}
-		if (chunk_capability_generation != 0)
-		{
+		if (chunk_capability_generation != 0) {
 			if (source_capability_generations[plans[i].destination_node_id] != 0
 				&& source_capability_generations[plans[i].destination_node_id]
-				   != chunk_capability_generation)
+					   != chunk_capability_generation)
 				goto unknown;
 			source_capability_generations[plans[i].destination_node_id]
 				= chunk_capability_generation;
@@ -1555,15 +1453,13 @@ cluster_multixact_current_members_resolve_internal(
 
 			if (ordinal >= nmembers || seen[ordinal]
 				|| member_origins[ordinal] != plans[i].destination_node_id
-				|| !proof_entry_semantic_valid(
-					&chunk_proofs[j], &members[ordinal], ordinal, (uint32)current_epoch,
-					plans[i].destination_node_id)
+				|| !proof_entry_semantic_valid(&chunk_proofs[j], &members[ordinal], ordinal,
+											   (uint32)current_epoch, plans[i].destination_node_id)
 				|| chunk_proofs[j].state == CCM_UNKNOWN)
 				goto unknown;
 			seen[ordinal] = true;
 			proofs[ordinal] = chunk_proofs[j];
-			proof_capability_generations[ordinal]
-				= chunk_member_capability_generations[j];
+			proof_capability_generations[ordinal] = chunk_member_capability_generations[j];
 		}
 
 		if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
@@ -1575,11 +1471,9 @@ cluster_multixact_current_members_resolve_internal(
 						  &wire_challenge->candidate_next_xmin_alias,
 						  sizeof(ClusterCurrentMxSuccessorAlias))
 					   != 0
-				|| chunk_updater.candidate_next_xmin_locator.tt_wrap
-					   > TT_WRAP_MAX
-				|| !cluster_tx_locator_reply_matches(
-					&wire_challenge->candidate_next_xmin_locator,
-					&chunk_updater.candidate_next_xmin_locator)
+				|| chunk_updater.candidate_next_xmin_locator.tt_wrap > TT_WRAP_MAX
+				|| !cluster_tx_locator_reply_matches(&wire_challenge->candidate_next_xmin_locator,
+													 &chunk_updater.candidate_next_xmin_locator)
 				|| chunk_updater.updater_xid != wire_challenge->updater_xid
 				|| chunk_updater.member_ordinal != wire_challenge->member_ordinal
 				|| chunk_updater.verdict > CUCP_UNKNOWN || chunk_updater.reserved8 != 0
@@ -1594,31 +1488,23 @@ cluster_multixact_current_members_resolve_internal(
 	for (i = 0; i < nmembers; i++)
 		if (!seen[i])
 			goto unknown;
-	if (operation_deadline != 0
-		&& GetCurrentTimestamp() >= operation_deadline)
-	{
+	if (operation_deadline != 0 && GetCurrentTimestamp() >= operation_deadline) {
 		result = CMX_RESOLVE_TIMEOUT;
 		goto non_ok;
 	}
-	for (i = 0; i < nmembers; i++)
-	{
+	for (i = 0; i < nmembers; i++) {
 		if (local_ctrc_grants[i] == 0)
 			continue;
 		memset(&local_participant, 0, sizeof(local_participant));
-		local_participant.node_id = (uint16) cluster_node_id;
-		local_participant.capability_record_generation
-			= local_ctrc_capability_generations[i];
-		local_participant.boot_incarnation
-			= local_ctrc_keys[i].origin_boot_incarnation;
-		local_participant.formation_epoch
-			= local_ctrc_keys[i].formation_epoch;
+		local_participant.node_id = (uint16)cluster_node_id;
+		local_participant.capability_record_generation = local_ctrc_capability_generations[i];
+		local_participant.boot_incarnation = local_ctrc_keys[i].origin_boot_incarnation;
+		local_participant.formation_epoch = local_ctrc_keys[i].formation_epoch;
 		local_participant.admission_record_generation
 			= local_ctrc_keys[i].admission_record_generation;
 		if (local_participant.capability_record_generation == 0
-			|| !cluster_ctrc_origin_grant_publishable(
-				&local_ctrc_keys[i], &local_participant,
-				local_ctrc_grants[i]))
-		{
+			|| !cluster_ctrc_origin_grant_publishable(&local_ctrc_keys[i], &local_participant,
+													  local_ctrc_grants[i])) {
 			result = CMX_RESOLVE_RETRY;
 			goto non_ok;
 		}
@@ -1627,16 +1513,14 @@ cluster_multixact_current_members_resolve_internal(
 
 non_ok:
 	proof_array_set_unknown(proofs, nmembers);
-	memset(proof_capability_generations, 0,
-		   sizeof(*proof_capability_generations) * nmembers);
+	memset(proof_capability_generations, 0, sizeof(*proof_capability_generations) * nmembers);
 	memset(updater_proof, 0, sizeof(*updater_proof));
 	updater_proof->verdict = CUCP_UNKNOWN;
 	return result;
 
 unknown:
 	proof_array_set_unknown(proofs, nmembers);
-	memset(proof_capability_generations, 0,
-		   sizeof(*proof_capability_generations) * nmembers);
+	memset(proof_capability_generations, 0, sizeof(*proof_capability_generations) * nmembers);
 	memset(updater_proof, 0, sizeof(*updater_proof));
 	updater_proof->verdict = CUCP_UNKNOWN;
 	return CMX_RESOLVE_UNKNOWN;
@@ -1644,35 +1528,30 @@ unknown:
 
 
 ClusterMxResolveResult
-cluster_multixact_current_members_resolve(
-	const ClusterCurrentMxKey *key,
-	const ClusterCurrentMxMemberDesc *members,
-	uint16 nmembers, uint64 descriptor_hash,
-	const ClusterCurrentUpdaterChallenge *challenge,
-	ClusterCurrentMemberProof *proofs,
-	ClusterCurrentUpdaterProof *updater_proof,
-	uint32 *proof_capability_generations)
+cluster_multixact_current_members_resolve(const ClusterCurrentMxKey *key,
+										  const ClusterCurrentMxMemberDesc *members,
+										  uint16 nmembers, uint64 descriptor_hash,
+										  const ClusterCurrentUpdaterChallenge *challenge,
+										  ClusterCurrentMemberProof *proofs,
+										  ClusterCurrentUpdaterProof *updater_proof,
+										  uint32 *proof_capability_generations)
 {
 	return cluster_multixact_current_members_resolve_internal(
-		key, members, nmembers, descriptor_hash, challenge, proofs,
-		updater_proof, proof_capability_generations, NULL);
+		key, members, nmembers, descriptor_hash, challenge, proofs, updater_proof,
+		proof_capability_generations, NULL);
 }
 
 
 ClusterMxResolveResult
 cluster_multixact_current_members_resolve_until(
-	const ClusterCurrentMxKey *key,
-	const ClusterCurrentMxMemberDesc *members,
-	uint16 nmembers, uint64 descriptor_hash,
-	const ClusterCurrentUpdaterChallenge *challenge,
-	ClusterCurrentMemberProof *proofs,
-	ClusterCurrentUpdaterProof *updater_proof,
-	uint32 *proof_capability_generations,
-	TimestampTz *operation_deadline)
+	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members, uint16 nmembers,
+	uint64 descriptor_hash, const ClusterCurrentUpdaterChallenge *challenge,
+	ClusterCurrentMemberProof *proofs, ClusterCurrentUpdaterProof *updater_proof,
+	uint32 *proof_capability_generations, TimestampTz *operation_deadline)
 {
 	return cluster_multixact_current_members_resolve_internal(
-		key, members, nmembers, descriptor_hash, challenge, proofs,
-		updater_proof, proof_capability_generations, operation_deadline);
+		key, members, nmembers, descriptor_hash, challenge, proofs, updater_proof,
+		proof_capability_generations, operation_deadline);
 }
 
 
@@ -1715,17 +1594,15 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 		switch ((ClusterCurrentMemberState)proof->state) {
 		case CCM_SELF:
 		case CCM_ACTIVE:
-			if (ClusterCurrentMemberProofGetCtrcGrant(proof) == 0
-				|| proof->commit_scn != InvalidScn
-				|| !proof_key_valid_holder(proof, proof->member_xid,
-									 proof->key.cluster_epoch,
-									 proof->key.origin_node_id))
+			if (ClusterCurrentMemberProofGetCtrcGrant(proof) == 0 || proof->commit_scn != InvalidScn
+				|| !proof_key_valid_holder(proof, proof->member_xid, proof->key.cluster_epoch,
+										   proof->key.origin_node_id))
 				return CMX_RECOMPOSE_UNKNOWN;
 			keep = true;
 			break;
 		case CCM_COMMITTED:
-			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0
-				|| !proof_key_is_zero(&proof->key) || !SCN_VALID(proof->commit_scn))
+			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0 || !proof_key_is_zero(&proof->key)
+				|| !SCN_VALID(proof->commit_scn))
 				return CMX_RECOMPOSE_UNKNOWN;
 			/*
 			 * A committed updater changes the tuple version and must have
@@ -1736,8 +1613,8 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 				return CMX_RECOMPOSE_DENIED;
 			break;
 		case CCM_ABORTED:
-			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0
-				|| !proof_key_is_zero(&proof->key) || proof->commit_scn != InvalidScn)
+			if (ClusterCurrentMemberProofGetCtrcGrant(proof) != 0 || !proof_key_is_zero(&proof->key)
+				|| proof->commit_scn != InvalidScn)
 				return CMX_RECOMPOSE_UNKNOWN;
 			break;
 		case CCM_UNKNOWN:
@@ -1805,8 +1682,7 @@ cluster_multixact_current_recompose(const ClusterCurrentMxMemberDesc *members,
 		}
 
 		new_strength = Max(old_strength, new_strength);
-		updater = ISUPDATE_from_mxstatus(old_status)
-			|| ISUPDATE_from_mxstatus(requester_status);
+		updater = ISUPDATE_from_mxstatus(old_status) || ISUPDATE_from_mxstatus(requester_status);
 		if (updater)
 			scratch[requester_index].status
 				= new_strength == 3 ? MultiXactStatusUpdate : MultiXactStatusNoKeyUpdate;

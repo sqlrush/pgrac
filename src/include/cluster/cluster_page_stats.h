@@ -41,11 +41,10 @@
 #include "port/atomics.h"
 #include "cluster/cluster_page_apply.h"
 
-typedef enum ClusterPageStatKind
-{
-	CLUSTER_PAGE_STAT_EVENT = 0,	/* 一次发生（计数） */
-	CLUSTER_PAGE_STAT_GAUGE,		/* 当前值（可设可读） */
-	CLUSTER_PAGE_STAT_TIMESTAMP		/* 最近一次发生时刻（uint64 us） */
+typedef enum ClusterPageStatKind {
+	CLUSTER_PAGE_STAT_EVENT = 0, /* 一次发生（计数） */
+	CLUSTER_PAGE_STAT_GAUGE,	 /* 当前值（可设可读） */
+	CLUSTER_PAGE_STAT_TIMESTAMP	 /* 最近一次发生时刻（uint64 us） */
 } ClusterPageStatKind;
 
 /*
@@ -53,34 +52,33 @@ typedef enum ClusterPageStatKind
  * producer function below (G4′).  Timestamps use GetCurrentTimestamp()
  * microsecond values; latency measurement is the consumer's subtraction.
  */
-typedef struct ClusterPageRecoveryStats
-{
+typedef struct ClusterPageRecoveryStats {
 	/* ---- EVENTS ---- */
-	pg_atomic_uint64 source_selected_current;	/* §9.1-1 CURRENT */
-	pg_atomic_uint64 source_selected_pi;		/* §9.1-1 PI */
-	pg_atomic_uint64 source_selected_storage;	/* §9.1-1 STORAGE */
-	pg_atomic_uint64 source_invalid;			/* §9.1-2 invalid by reason */
-	pg_atomic_uint64 source_missing;			/* §9.1-2 missing */
-	pg_atomic_uint64 source_conflict;			/* §9.1-2 conflict */
-	pg_atomic_uint64 result_skip;				/* §9.1-3 */
-	pg_atomic_uint64 apply_count;				/* §9.1-4 expected-before apply */
-	pg_atomic_uint64 version_mismatch;			/* §9.1-4 mismatch */
-	pg_atomic_uint64 unknown_class_blocked;		/* §9.1-5 */
-	pg_atomic_uint64 authority_stale_rejected;	/* §9.1-8 */
-	pg_atomic_uint64 resource_early_release;	/* §9.1-9 (bug signal) */
-	pg_atomic_uint64 retire_denied;				/* §9.1-10 PL-12 */
-	pg_atomic_uint64 d3_rebuild;				/* §9.1-11 */
-	pg_atomic_uint64 d3_optimization_hit;		/* §9.1-11 */
-	pg_atomic_uint64 stable_base_unresolved;	/* §9.1-12 */
+	pg_atomic_uint64 source_selected_current;  /* §9.1-1 CURRENT */
+	pg_atomic_uint64 source_selected_pi;	   /* §9.1-1 PI */
+	pg_atomic_uint64 source_selected_storage;  /* §9.1-1 STORAGE */
+	pg_atomic_uint64 source_invalid;		   /* §9.1-2 invalid by reason */
+	pg_atomic_uint64 source_missing;		   /* §9.1-2 missing */
+	pg_atomic_uint64 source_conflict;		   /* §9.1-2 conflict */
+	pg_atomic_uint64 result_skip;			   /* §9.1-3 */
+	pg_atomic_uint64 apply_count;			   /* §9.1-4 expected-before apply */
+	pg_atomic_uint64 version_mismatch;		   /* §9.1-4 mismatch */
+	pg_atomic_uint64 unknown_class_blocked;	   /* §9.1-5 */
+	pg_atomic_uint64 authority_stale_rejected; /* §9.1-8 */
+	pg_atomic_uint64 resource_early_release;   /* §9.1-9 (bug signal) */
+	pg_atomic_uint64 retire_denied;			   /* §9.1-10 PL-12 */
+	pg_atomic_uint64 d3_rebuild;			   /* §9.1-11 */
+	pg_atomic_uint64 d3_optimization_hit;	   /* §9.1-11 */
+	pg_atomic_uint64 stable_base_unresolved;   /* §9.1-12 */
 	/* ---- GAUGES ---- */
-	pg_atomic_uint64 contributor_records;		/* §9.1-6 */
-	pg_atomic_uint64 contributor_threads;		/* §9.1-6 */
-	pg_atomic_uint64 contributor_gaps;			/* §9.1-6 */
-	pg_atomic_uint64 retained_pinned_bytes;		/* §9.1-10 */
+	pg_atomic_uint64 contributor_records;	/* §9.1-6 */
+	pg_atomic_uint64 contributor_threads;	/* §9.1-6 */
+	pg_atomic_uint64 contributor_gaps;		/* §9.1-6 */
+	pg_atomic_uint64 retained_pinned_bytes; /* §9.1-10 */
 	/* ---- TIMESTAMPS (last occurrence, us) ---- */
-	pg_atomic_uint64 last_page_write_ts;		/* §9.1-7 */
-	pg_atomic_uint64 last_durability_barrier_ts;	/* §9.1-7 */
-	pg_atomic_uint64 last_post_read_ts;			/* §9.1-7 */
+	pg_atomic_uint64 last_page_write_ts;		 /* §9.1-7 */
+	pg_atomic_uint64 last_durability_barrier_ts; /* §9.1-7 */
+	pg_atomic_uint64 last_post_read_ts;			 /* §9.1-7 */
 } ClusterPageRecoveryStats;
 
 extern void cluster_page_stats_init(ClusterPageRecoveryStats *stats);
@@ -98,16 +96,13 @@ extern void cluster_page_stats_unknown_class_blocked(ClusterPageRecoveryStats *s
 extern void cluster_page_stats_authority_stale(ClusterPageRecoveryStats *stats);
 extern void cluster_page_stats_early_release(ClusterPageRecoveryStats *stats);
 extern void cluster_page_stats_retire_denied(ClusterPageRecoveryStats *stats);
-extern void cluster_page_stats_d3_rebuild(ClusterPageRecoveryStats *stats,
-										  bool optimization_hit);
+extern void cluster_page_stats_d3_rebuild(ClusterPageRecoveryStats *stats, bool optimization_hit);
 extern void cluster_page_stats_stable_base_unresolved(ClusterPageRecoveryStats *stats);
 
 /* GAUGE producers. */
-extern void cluster_page_stats_contributors(ClusterPageRecoveryStats *stats,
-											uint64 records, uint64 threads,
-											uint64 gaps);
-extern void cluster_page_stats_pinned_bytes(ClusterPageRecoveryStats *stats,
-											uint64 bytes);
+extern void cluster_page_stats_contributors(ClusterPageRecoveryStats *stats, uint64 records,
+											uint64 threads, uint64 gaps);
+extern void cluster_page_stats_pinned_bytes(ClusterPageRecoveryStats *stats, uint64 bytes);
 
 /* TIMESTAMP producers. */
 extern void cluster_page_stats_note_page_write(ClusterPageRecoveryStats *stats);
@@ -129,27 +124,25 @@ extern bool cluster_page_stats_describe(const char *name, ClusterPageStatKind *k
  * returns the number of chars that WOULD have been written (snprintf
  * semantics) so the caller can size the buffer.
  */
-typedef struct ClusterPageAttemptDump
-{
-	uint16		failed_origin_thread;
-	uint64		failure_generation;
+typedef struct ClusterPageAttemptDump {
+	uint16 failed_origin_thread;
+	uint64 failure_generation;
 	ClusterPageIdentity identity;
 	ClusterPageClass page_class;
 	ClusterPageSourceKind source_kind;
 	ClusterPageVersion source_version;
 	ClusterPageVersion terminal_version;
-	uint64		contributor_count;
-	uint64		contributor_thread_set;
-	bool		applied;		/* apply 或 skip 结论 */
-	bool		version_mismatch;
-	bool		durability_ok;
-	bool		post_read_ok;
-	bool		authority_revalidated;
-	bool		released;
-	const char *stop_reason;	/* NULL = no STOP */
+	uint64 contributor_count;
+	uint64 contributor_thread_set;
+	bool applied; /* apply 或 skip 结论 */
+	bool version_mismatch;
+	bool durability_ok;
+	bool post_read_ok;
+	bool authority_revalidated;
+	bool released;
+	const char *stop_reason; /* NULL = no STOP */
 } ClusterPageAttemptDump;
 
-extern int cluster_page_attempt_dump(const ClusterPageAttemptDump *dump,
-									 char *buf, Size buflen);
+extern int cluster_page_attempt_dump(const ClusterPageAttemptDump *dump, char *buf, Size buflen);
 
-#endif							/* CLUSTER_PAGE_STATS_H */
+#endif /* CLUSTER_PAGE_STATS_H */

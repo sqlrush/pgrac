@@ -373,15 +373,17 @@ gcs_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node, uint64 *
 	int i;
 	uint32 cur_outstanding;
 
-	if (cluster_node_id < 0 || cluster_node_id > (int)GCS_REQID_NODE_MASK
-		|| backend_ord < 0 || backend_ord > (int)GCS_REQID_BACKEND_MASK)
-		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
-						errmsg("cluster_gcs: requester identity node=%d backend=%d is out of request-id domain",
-							   cluster_node_id, backend_ord)));
+	if (cluster_node_id < 0 || cluster_node_id > (int)GCS_REQID_NODE_MASK || backend_ord < 0
+		|| backend_ord > (int)GCS_REQID_BACKEND_MASK)
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_INTERNAL_ERROR),
+			 errmsg(
+				 "cluster_gcs: requester identity node=%d backend=%d is out of request-id domain",
+				 cluster_node_id, backend_ord)));
 
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
-	if (blk->next_request_id == 0
-		|| blk->next_request_id > GCS_REQID_REQUESTER_SEQ_MASK) {
+	if (blk->next_request_id == 0 || blk->next_request_id > GCS_REQID_REQUESTER_SEQ_MASK) {
 		LWLockRelease(&blk->lock.lock);
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("cluster_gcs: requester sequence exhausted for node=%d backend=%d",
@@ -480,9 +482,9 @@ gcs_mark_slot_reply(const ClusterICEnvelope *env, const GcsReplyPayload *reply)
 			ClusterGcsOutstandingSlot *slot = &blk->slots[i];
 
 			if (slot->in_use && !slot->reply_received
-				&& cluster_gcs_reply_matches_outstanding(
-					reply, slot->request_id, slot->transition_id, slot->master_node,
-					env->source_node_id)) {
+				&& cluster_gcs_reply_matches_outstanding(reply, slot->request_id,
+														 slot->transition_id, slot->master_node,
+														 env->source_node_id)) {
 				slot->reply = *reply;
 				slot->reply_received = true;
 				ConditionVariableSignal(&slot->reply_cv);

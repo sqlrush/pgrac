@@ -17,8 +17,7 @@ resource_x_hash_scalar(uint64 hash, uint64 value)
 {
 	int i;
 
-	for (i = 0; i < 8; i++)
-	{
+	for (i = 0; i < 8; i++) {
 		hash ^= (uint8)(value & UINT64CONST(0xff));
 		hash *= RESOURCE_X_HASH_PRIME;
 		value >>= 8;
@@ -33,16 +32,14 @@ resource_x_assertion_valid(const ResourceXAssertion *assertion)
 		return false;
 	if (!RelFileNumberIsValid(assertion->resource.relNumber)
 		|| assertion->resource.blockNum == InvalidBlockNumber
-		|| assertion->resource.forkNum < MAIN_FORKNUM
-		|| assertion->resource.forkNum > MAX_FORKNUM)
+		|| assertion->resource.forkNum < MAIN_FORKNUM || assertion->resource.forkNum > MAX_FORKNUM)
 		return false;
 	return assertion->requester_node >= 0
-		&& assertion->requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
+		   && assertion->requester_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
 }
 
 bool
-resource_x_assertion_init(const BufferTag *tag, int32 requester_node,
-						  ResourceXAssertion *out)
+resource_x_assertion_init(const BufferTag *tag, int32 requester_node, ResourceXAssertion *out)
 {
 	ResourceXAssertion candidate;
 
@@ -57,13 +54,11 @@ resource_x_assertion_init(const BufferTag *tag, int32 requester_node,
 }
 
 bool
-resource_x_assertion_equal(const ResourceXAssertion *left,
-						   const ResourceXAssertion *right)
+resource_x_assertion_equal(const ResourceXAssertion *left, const ResourceXAssertion *right)
 {
-	return resource_x_assertion_valid(left)
-		&& resource_x_assertion_valid(right)
-		&& BufferTagsEqual(&left->resource, &right->resource)
-		&& left->requester_node == right->requester_node;
+	return resource_x_assertion_valid(left) && resource_x_assertion_valid(right)
+		   && BufferTagsEqual(&left->resource, &right->resource)
+		   && left->requester_node == right->requester_node;
 }
 
 uint32
@@ -83,8 +78,7 @@ resource_x_assertion_hash(const ResourceXAssertion *assertion)
 }
 
 bool
-resource_x_attempt_init(const ResourceXAssertion *assertion,
-						uint64 base_authority_generation,
+resource_x_attempt_init(const ResourceXAssertion *assertion, uint64 base_authority_generation,
 						ResourceXAttemptWitness *out)
 {
 	ResourceXAttemptWitness candidate;
@@ -102,8 +96,8 @@ resource_x_attempt_matches(const ResourceXAttemptWitness *left,
 						   const ResourceXAttemptWitness *right)
 {
 	return left != NULL && right != NULL
-		&& resource_x_assertion_equal(&left->assertion, &right->assertion)
-		&& left->base_authority_generation == right->base_authority_generation;
+		   && resource_x_assertion_equal(&left->assertion, &right->assertion)
+		   && left->base_authority_generation == right->base_authority_generation;
 }
 
 const char *

@@ -93,7 +93,7 @@
 #include "cluster/cluster_ges_dedup.h"		/* cluster_ges_dedup_shmem_register (spec-2.27 D2) */
 #include "cluster/cluster_wal_thread.h"		/* cluster_wal_thread_shmem_register (spec-4.1 D7) */
 #include "cluster/cluster_recovery_plan.h" /* cluster_recovery_plan_shmem_register (spec-4.3 D4) */
-#include "cluster/cluster_page_guard.h" /* STOP-06 no-wait PAGE protection */
+#include "cluster/cluster_page_guard.h"	   /* STOP-06 no-wait PAGE protection */
 #include "cluster/cluster_block_recovery.h" /* cluster_block_recovery_shmem_register (spec-4.10 D6) */
 #include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_shmem_register (spec-2.16 D4) */
 #include "cluster/cluster_grd_work_queue.h" /* cluster_grd_work_queue_shmem_register (spec-2.16 D5) */
@@ -111,8 +111,8 @@
 #include "cluster/cluster_tx_enqueue.h"		/* cluster_tx_enqueue_shmem_register (spec-5.2 D4/D6) */
 #include "cluster/cluster_multixact_current_stats.h"
 #include "cluster/cluster_terminal_ref_census.h"
-#include "cluster/cluster_subtrans.h"		/* cluster_subtrans_shmem_register (spec-3.5 D5) */
-#include "cluster/cluster_multixact.h"		/* cluster_multixact_shmem_register (spec-3.6 D2) */
+#include "cluster/cluster_subtrans.h"		 /* cluster_subtrans_shmem_register (spec-3.5 D5) */
+#include "cluster/cluster_multixact.h"		 /* cluster_multixact_shmem_register (spec-3.6 D2) */
 #include "cluster/cluster_undo_record_api.h" /* cluster_undo_record_shmem_register (spec-3.7 D5) */
 #include "cluster/cluster_cr.h"				 /* cluster_cr_shmem_register (spec-3.9 D2) */
 #include "cluster/cluster_cr_pool.h"		 /* cluster_cr_pool_shmem_register (spec-5.51 D1) */
@@ -514,8 +514,7 @@ cluster_init_shmem_module(void)
 		cluster_multixact_current_stats_shmem_register();
 
 	/* Spec-8.4D: activation-sized CTRC keys, receipts and ACK summaries. */
-	if (cluster_shmem_lookup_region(
-			"pgrac cluster terminal reference census") == NULL)
+	if (cluster_shmem_lookup_region("pgrac cluster terminal reference census") == NULL)
 		cluster_ctrc_shmem_register();
 
 	/*

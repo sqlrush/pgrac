@@ -240,7 +240,7 @@ cluster_epoch_advance_for_reconfig_if_baseline(uint64 baseline, uint64 *new_out)
 	cache_mutation = cluster_write_fence_authority_cache_mutation_begin();
 
 	advanced = pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &expected,
-									  baseline + 1);
+											  baseline + 1);
 	cluster_write_fence_authority_cache_mutation_end(cache_mutation);
 	if (advanced) {
 		*new_out = baseline + 1;
@@ -306,7 +306,7 @@ cluster_epoch_observe_remote(uint64 remote_epoch)
 			mutation_started = true;
 		}
 		if (pg_atomic_compare_exchange_u64(&cluster_epoch_state->current_epoch, &cur_val,
-									   remote_epoch)) {
+										   remote_epoch)) {
 			cluster_write_fence_authority_cache_mutation_end(cache_mutation);
 			return true;
 		}

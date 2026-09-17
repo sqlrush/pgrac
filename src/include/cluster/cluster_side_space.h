@@ -44,8 +44,7 @@
 
 #include "cluster/cluster_page_version.h"
 
-typedef enum ClusterSideSpaceKind
-{
+typedef enum ClusterSideSpaceKind {
 	CLUSTER_SIDE_SPACE_HWM = 0,
 	CLUSTER_SIDE_SPACE_EXTENT,
 	CLUSTER_SIDE_SPACE_BITMAP
@@ -70,8 +69,7 @@ extern bool cluster_side_space_metadata_mutation_allowed(ClusterSideSpaceKind ki
  */
 extern ClusterPageApplyVerdict cluster_side_space_metadata_page_verdict(
 	ClusterSideSpaceKind kind, const ClusterPageVersion *current_working,
-	const ClusterPageVersion *expected_before,
-	const ClusterPageVersion *result_version,
+	const ClusterPageVersion *expected_before, const ClusterPageVersion *result_version,
 	const ClusterPageVersion *trusted_source_version);
 
-#endif							/* CLUSTER_SIDE_SPACE_H */
+#endif /* CLUSTER_SIDE_SPACE_H */

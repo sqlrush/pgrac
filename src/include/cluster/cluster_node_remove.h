@@ -311,8 +311,7 @@ extern const char *cluster_node_remove_phase_str(int phase);
 
 /* canonical text for a request result (operator UDF return). */
 extern const char *cluster_node_remove_request_result_str(ClusterRemoveRequestResult r);
-extern bool cluster_node_remove_startup_serving_allows(bool authority_managed,
-													 bool serving_ready);
+extern bool cluster_node_remove_startup_serving_allows(bool authority_managed, bool serving_ready);
 
 /*
  * Precheck verdict (U10 / §3.2) — pure mapping of the live facts to a request

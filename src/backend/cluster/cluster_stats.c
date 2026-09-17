@@ -423,8 +423,7 @@ stats_advance_liveness_tick(void)
 static bool
 stats_wal_state_configured(void)
 {
-	return cluster_enabled && cluster_wal_threads_dir != NULL
-		&& cluster_wal_threads_dir[0] != '\0';
+	return cluster_enabled && cluster_wal_threads_dir != NULL && cluster_wal_threads_dir[0] != '\0';
 }
 
 
@@ -489,8 +488,7 @@ stats_prepare_incarnation(void)
 		started_at = (int64)cluster_stats_state->spawned_at;
 		LWLockRelease(&cluster_stats_state->lwlock);
 		stats_fill_wal_state_update(CLUSTER_WAL_STATE_UPDATE_ACTIVE, started_at, &update);
-		result = cluster_wal_state_update_own(
-			&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+		result = cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
 		/*
 		 * RF-ROOT A1 retry discipline: the clusterwide CF(X) can be held by
 		 * the coordinator's formation/serving critical sections (or by this
@@ -503,26 +501,22 @@ stats_prepare_incarnation(void)
 
 			for (w2_retry = 0; w2_retry < 3; w2_retry++) {
 				pg_usleep(1000000L); /* 1 s */
-				result = cluster_wal_state_update_own(
-					&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
-				if (result == CLUSTER_WAL_STATE_UPDATE_OK
-					|| result == CLUSTER_WAL_STATE_UPDATE_NOOP
+				result
+					= cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+				if (result == CLUSTER_WAL_STATE_UPDATE_OK || result == CLUSTER_WAL_STATE_UPDATE_NOOP
 					|| result != CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE)
 					break;
 			}
 		}
-		if (result != CLUSTER_WAL_STATE_UPDATE_OK
-			&& result != CLUSTER_WAL_STATE_UPDATE_NOOP)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("could not publish ACTIVE to the WAL state registry"),
-					 errdetail("The verified-CF update returned result %d.", (int)result),
-					 errhint("The node remains outside RUNNING admission; preserve and "
-							 "inspect the registry evidence before retrying.")));
+		if (result != CLUSTER_WAL_STATE_UPDATE_OK && result != CLUSTER_WAL_STATE_UPDATE_NOOP)
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("could not publish ACTIVE to the WAL state registry"),
+							errdetail("The verified-CF update returned result %d.", (int)result),
+							errhint("The node remains outside RUNNING admission; preserve and "
+									"inspect the registry evidence before retrying.")));
 
-		ereport(LOG,
-				(errmsg("pgrac WAL thread %u published ACTIVE in the WAL state registry",
-						(unsigned)cluster_wal_thread_id())));
+		ereport(LOG, (errmsg("pgrac WAL thread %u published ACTIVE in the WAL state registry",
+							 (unsigned)cluster_wal_thread_id())));
 		RequestCheckpoint(CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 		return false;
 	}
@@ -575,12 +569,11 @@ stats_refresh_wal_state(void)
 		return;
 
 	if (cluster_wal_thread_refresh_fail_fetch_add() == 0)
-		ereport(LOG,
-				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-				 errmsg("could not refresh the WAL state registry slot"),
-				 errdetail("The verified-CF update returned result %d.", (int)result),
-				 errhint("Further refresh failures are counted, not logged "
-						 "(cluster.wal_thread.wal_state_refresh_fail_count).")));
+		ereport(LOG, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+					  errmsg("could not refresh the WAL state registry slot"),
+					  errdetail("The verified-CF update returned result %d.", (int)result),
+					  errhint("Further refresh failures are counted, not logged "
+							  "(cluster.wal_thread.wal_state_refresh_fail_count).")));
 }
 
 

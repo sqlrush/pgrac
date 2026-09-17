@@ -49,11 +49,10 @@
 
 #include "cluster/cluster_page_version.h"
 
-typedef enum ClusterPageSourceKind
-{
+typedef enum ClusterPageSourceKind {
 	CLUSTER_PAGE_SOURCE_CURRENT = 0, /* §5.2 survivor GCS holder */
-	CLUSTER_PAGE_SOURCE_PI,		 /* §5.3 past image */
-	CLUSTER_PAGE_SOURCE_STORAGE	 /* §5.4 checkpointed shared storage */
+	CLUSTER_PAGE_SOURCE_PI,			 /* §5.3 past image */
+	CLUSTER_PAGE_SOURCE_STORAGE		 /* §5.4 checkpointed shared storage */
 } ClusterPageSourceKind;
 
 /*
@@ -63,19 +62,18 @@ typedef enum ClusterPageSourceKind
  * resource.  The boolean facts are exactly what the named production
  * owner declares; this layer never infers them.
  */
-typedef struct ClusterPageSourceValidateInput
-{
-	const ClusterPageIdentity *identity;	/* exact expected resource */
+typedef struct ClusterPageSourceValidateInput {
+	const ClusterPageIdentity *identity;	  /* exact expected resource */
 	const ClusterPageVersion *source_version; /* the source's PageVersion */
-	bool		integrity_ok;	/* page-class integrity verifier passed */
-	bool		stability_ok;	/* CURRENT: GCS stability witness; PI: holder stable */
-	bool		lineage_ok;		/* control-root / failure-generation lineage current */
-	bool		owner_ok;		/* source owner present & authoritative */
-	bool		ship_boundary_ok;	/* PI: ship/boundary SCN proof (spec §5.3) */
-	bool		anchored_ok;	/* STORAGE: version anchored to durable checkpoint/root */
-	bool		coverage_ok;	/* STORAGE: FPI/init/FPW + rmgr exceptions handled */
-	bool		fresh_ok;		/* STORAGE: re-verified before mutation (§5.4-7) */
-	bool		contributors_closed; /* STORAGE: §5.4-5, owned by PGDEL-05 */
+	bool integrity_ok;						  /* page-class integrity verifier passed */
+	bool stability_ok;		  /* CURRENT: GCS stability witness; PI: holder stable */
+	bool lineage_ok;		  /* control-root / failure-generation lineage current */
+	bool owner_ok;			  /* source owner present & authoritative */
+	bool ship_boundary_ok;	  /* PI: ship/boundary SCN proof (spec §5.3) */
+	bool anchored_ok;		  /* STORAGE: version anchored to durable checkpoint/root */
+	bool coverage_ok;		  /* STORAGE: FPI/init/FPW + rmgr exceptions handled */
+	bool fresh_ok;			  /* STORAGE: re-verified before mutation (§5.4-7) */
+	bool contributors_closed; /* STORAGE: §5.4-5, owned by PGDEL-05 */
 } ClusterPageSourceValidateInput;
 
 /*
@@ -85,8 +83,7 @@ typedef struct ClusterPageSourceValidateInput
  * "empty replay set" conclusion needs the §5.2-6 per-block chain, which
  * is PGDEL-05's — validation here only admits the source.
  */
-extern bool cluster_page_source_validate_current(
-	const ClusterPageSourceValidateInput *in);
+extern bool cluster_page_source_validate_current(const ClusterPageSourceValidateInput *in);
 
 /*
  * §5.3 PI conjunction: exact identity + valid version + integrity +
@@ -94,8 +91,7 @@ extern bool cluster_page_source_validate_current(
  * failure the PI is discarded: its bytes must never be smuggled into the
  * STORAGE branch, and a PI miss is never written as "page recovered".
  */
-extern bool cluster_page_source_validate_pi(
-	const ClusterPageSourceValidateInput *in);
+extern bool cluster_page_source_validate_pi(const ClusterPageSourceValidateInput *in);
 
 /*
  * §5.4 STORAGE conjunction: exact identity + valid version + integrity +
@@ -105,8 +101,7 @@ extern bool cluster_page_source_validate_pi(
  * honestly closed, and retained failed-origin redo is never a base
  * (spec §5.4 last paragraph).
  */
-extern bool cluster_page_source_validate_storage(
-	const ClusterPageSourceValidateInput *in);
+extern bool cluster_page_source_validate_storage(const ClusterPageSourceValidateInput *in);
 
 /*
  * §5.5/§6.2 selection: returns the chosen input index, or -1 (BLOCKED).
@@ -119,7 +114,6 @@ extern bool cluster_page_source_validate_storage(
  * `kinds` array (inputs do not carry their own kind).
  */
 extern int cluster_page_source_select(const ClusterPageSourceKind *kinds,
-									  const ClusterPageSourceValidateInput *inputs,
-									  int n);
+									  const ClusterPageSourceValidateInput *inputs, int n);
 
-#endif							/* CLUSTER_PAGE_SOURCE_H */
+#endif /* CLUSTER_PAGE_SOURCE_H */

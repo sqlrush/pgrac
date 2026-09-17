@@ -49,8 +49,7 @@ ut_full_verify(void)
 	return in;
 }
 
-typedef struct ProjectionApplyCapture
-{
+typedef struct ProjectionApplyCapture {
 	uint32 reset_count;
 	uint32 postread_count;
 	uint32 truncate_count;
@@ -68,10 +67,9 @@ typedef struct ProjectionApplyCapture
 } ProjectionApplyCapture;
 
 static bool
-capture_reset(void *arg, int origin_slot, TransactionId first_xid,
-	uint32 xid_count)
+capture_reset(void *arg, int origin_slot, TransactionId first_xid, uint32 xid_count)
 {
-	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *)arg;
 
 	capture->reset_count++;
 	capture->origin_slot = origin_slot;
@@ -81,10 +79,9 @@ capture_reset(void *arg, int origin_slot, TransactionId first_xid,
 }
 
 static bool
-capture_postread(void *arg, int origin_slot, TransactionId first_xid,
-	uint32 xid_count)
+capture_postread(void *arg, int origin_slot, TransactionId first_xid, uint32 xid_count)
 {
-	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *)arg;
 
 	capture->postread_count++;
 	UT_ASSERT_EQ(origin_slot, capture->origin_slot);
@@ -96,7 +93,7 @@ capture_postread(void *arg, int origin_slot, TransactionId first_xid,
 static bool
 capture_truncate(void *arg, int origin_slot, TransactionId oldest_xid)
 {
-	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *)arg;
 
 	capture->truncate_count++;
 	capture->origin_slot = origin_slot;
@@ -106,12 +103,11 @@ capture_truncate(void *arg, int origin_slot, TransactionId oldest_xid)
 
 static bool
 capture_multixact(void *arg, int origin_slot, uint32 cluster_epoch,
-	const ClusterSideProjectionOperationV1 *operation,
-	const uint8 *owned_payload, uint32 owned_payload_length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+				  const ClusterSideProjectionOperationV1 *operation, const uint8 *owned_payload,
+				  uint32 owned_payload_length, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
 {
-	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
-	const MultiXactMember *members = (const MultiXactMember *) owned_payload;
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *)arg;
+	const MultiXactMember *members = (const MultiXactMember *)owned_payload;
 
 	UT_ASSERT_EQ(origin_slot, 2);
 	UT_ASSERT_EQ(cluster_epoch, 19);
@@ -128,11 +124,11 @@ capture_multixact(void *arg, int origin_slot, uint32 cluster_epoch,
 
 static bool
 capture_multixact_postread(void *arg, int origin_slot, uint32 cluster_epoch,
-	const ClusterSideProjectionOperationV1 *operation,
-	const uint8 *owned_payload, uint32 owned_payload_length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+						   const ClusterSideProjectionOperationV1 *operation,
+						   const uint8 *owned_payload, uint32 owned_payload_length,
+						   XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
 {
-	ProjectionApplyCapture *capture = (ProjectionApplyCapture *) arg;
+	ProjectionApplyCapture *capture = (ProjectionApplyCapture *)arg;
 
 	UT_ASSERT_EQ(origin_slot, 2);
 	UT_ASSERT_EQ(cluster_epoch, 19);
@@ -148,61 +144,56 @@ capture_multixact_postread(void *arg, int origin_slot, uint32 cluster_epoch,
 static ProjectionApplyCapture owner_capture;
 
 bool
-cluster_remote_xact_reset_range_v2(int origin_slot, TransactionId first_xid,
-	uint32 xid_count)
+cluster_remote_xact_reset_range_v2(int origin_slot, TransactionId first_xid, uint32 xid_count)
 {
 	return capture_reset(&owner_capture, origin_slot, first_xid, xid_count);
 }
 
 bool
-cluster_remote_xact_range_empty_v2(int origin_slot, TransactionId first_xid,
-	uint32 xid_count)
+cluster_remote_xact_range_empty_v2(int origin_slot, TransactionId first_xid, uint32 xid_count)
 {
 	return capture_postread(&owner_capture, origin_slot, first_xid, xid_count);
 }
 
 bool
-cluster_remote_xact_truncate_before_v2(int origin_slot,
-	TransactionId oldest_xid)
+cluster_remote_xact_truncate_before_v2(int origin_slot, TransactionId oldest_xid)
 {
 	return capture_truncate(&owner_capture, origin_slot, oldest_xid);
 }
 
 bool
-cluster_multixact_recovery_projection_apply(void *arg, int origin_slot,
-	uint32 cluster_epoch, const ClusterSideProjectionOperationV1 *operation,
-	const uint8 *owned_payload, uint32 owned_payload_length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+cluster_multixact_recovery_projection_apply(void *arg, int origin_slot, uint32 cluster_epoch,
+											const ClusterSideProjectionOperationV1 *operation,
+											const uint8 *owned_payload, uint32 owned_payload_length,
+											XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
 {
 	UT_ASSERT(arg == NULL);
-	return capture_multixact(&owner_capture, origin_slot, cluster_epoch,
-		operation, owned_payload, owned_payload_length, source_lsn,
-		source_end_lsn);
+	return capture_multixact(&owner_capture, origin_slot, cluster_epoch, operation, owned_payload,
+							 owned_payload_length, source_lsn, source_end_lsn);
 }
 
 bool
-cluster_multixact_recovery_projection_verify(void *arg, int origin_slot,
-	uint32 cluster_epoch, const ClusterSideProjectionOperationV1 *operation,
-	const uint8 *owned_payload, uint32 owned_payload_length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn)
+cluster_multixact_recovery_projection_verify(void *arg, int origin_slot, uint32 cluster_epoch,
+											 const ClusterSideProjectionOperationV1 *operation,
+											 const uint8 *owned_payload,
+											 uint32 owned_payload_length, XLogRecPtr source_lsn,
+											 XLogRecPtr source_end_lsn)
 {
 	UT_ASSERT(arg == NULL);
-	return capture_multixact_postread(&owner_capture, origin_slot,
-		cluster_epoch, operation, owned_payload, owned_payload_length,
-		source_lsn, source_end_lsn);
+	return capture_multixact_postread(&owner_capture, origin_slot, cluster_epoch, operation,
+									  owned_payload, owned_payload_length, source_lsn,
+									  source_end_lsn);
 }
 
 UT_TEST(test_projection_verified_conjunction)
 {
 	ClusterSideProjectionVerifyInput in = ut_full_verify();
-	ClusterSideProjectionKind kinds[] = {
-		CLUSTER_SIDE_PROJECTION_CLOG,
-		CLUSTER_SIDE_PROJECTION_MULTIXACT,
-		CLUSTER_SIDE_PROJECTION_COMMIT_TS
-	};
-	int			i;
+	ClusterSideProjectionKind kinds[]
+		= { CLUSTER_SIDE_PROJECTION_CLOG, CLUSTER_SIDE_PROJECTION_MULTIXACT,
+			CLUSTER_SIDE_PROJECTION_COMMIT_TS };
+	int i;
 
-	for (i = 0; i < (int) lengthof(kinds); i++) {
+	for (i = 0; i < (int)lengthof(kinds); i++) {
 		UT_ASSERT(cluster_side_projection_verified(kinds[i], &in));
 		in.canonical_truth_ok = false;
 		UT_ASSERT(!cluster_side_projection_verified(kinds[i], &in));
@@ -216,50 +207,40 @@ UT_TEST(test_projection_verified_conjunction)
 	}
 	UT_ASSERT(!cluster_side_projection_verified(CLUSTER_SIDE_PROJECTION_CLOG, NULL));
 	/* Out-of-range kind fails closed. */
-	UT_ASSERT(!cluster_side_projection_verified((ClusterSideProjectionKind) 99,
-												&in));
+	UT_ASSERT(!cluster_side_projection_verified((ClusterSideProjectionKind)99, &in));
 }
 
 UT_TEST(test_projection_lookup_fail_closed)
 {
 	/* A miss/UNKNOWN projection NEVER answers from a local guess
 	 * (U-SIDE-08: local bit cannot override TT/redo truth). */
-	UT_ASSERT_EQ((int) cluster_side_projection_lookup(false),
-				 (int) CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED);
-	UT_ASSERT_EQ((int) cluster_side_projection_lookup(true),
-				 (int) CLUSTER_SIDE_PROJECTION_LOOKUP_OK);
+	UT_ASSERT_EQ((int)cluster_side_projection_lookup(false),
+				 (int)CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_side_projection_lookup(true), (int)CLUSTER_SIDE_PROJECTION_LOOKUP_OK);
 }
 
 UT_TEST(test_projection_rebuildable_per_kind)
 {
 	/* CLOG rebuilds from the canonical transaction truth: no redo
 	 * retention required. */
-	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_CLOG,
-												  false, true));
+	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_CLOG, false, true));
 
 	/* MULTIXACT / COMMIT_TS rebuild from the retained redo: the source
 	 * must still be retained (U-SIDE-09/10).  L9: a COMMIT_TS projection
 	 * loss or unknown timestamp never changes the commit truth — the
 	 * rebuild needs the source redo retained and the lookup fails
 	 * closed until it is. */
-	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_MULTIXACT,
-												  true, true));
-	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_MULTIXACT,
-												   false, true));
-	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_COMMIT_TS,
-												  true, true));
-	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_COMMIT_TS,
-												   false, true));
+	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_MULTIXACT, true, true));
+	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_MULTIXACT, false, true));
+	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_COMMIT_TS, true, true));
+	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_COMMIT_TS, false, true));
 
 	/* Every rebuild needs the verified canonical producer — without it,
 	 * the rebuild is a guess and the resource stays BLOCKED. */
-	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_CLOG,
-												   false, false));
-	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_MULTIXACT,
-												   true, false));
+	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_CLOG, false, false));
+	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_MULTIXACT, true, false));
 	/* Out-of-range kind fails closed. */
-	UT_ASSERT(!cluster_side_projection_rebuildable((ClusterSideProjectionKind) 99,
-												   true, true));
+	UT_ASSERT(!cluster_side_projection_rebuildable((ClusterSideProjectionKind)99, true, true));
 }
 
 UT_TEST(test_projection_zero_range_preflight_and_postread)
@@ -277,7 +258,7 @@ UT_TEST(test_projection_zero_range_preflight_and_postread)
 	input.operation = &operation;
 	input.origin_thread = 3;
 	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
-		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+				 CLUSTER_SIDE_PROJECTION_APPLY_OK);
 	memset(&capture, 0, sizeof(capture));
 	capture.reset_ok = true;
 	capture.postread_ok = true;
@@ -287,7 +268,7 @@ UT_TEST(test_projection_zero_range_preflight_and_postread)
 	ops.remote_xact_range_empty = capture_postread;
 	ops.truncate_remote_xact_before = capture_truncate;
 	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
-		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+				 CLUSTER_SIDE_PROJECTION_APPLY_OK);
 	UT_ASSERT_EQ(capture.reset_count, 1);
 	UT_ASSERT_EQ(capture.postread_count, 1);
 	UT_ASSERT_EQ(capture.origin_slot, 2);
@@ -296,7 +277,7 @@ UT_TEST(test_projection_zero_range_preflight_and_postread)
 
 	capture.postread_ok = false;
 	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
-		CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED);
+				 CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED);
 	UT_ASSERT_EQ(capture.reset_count, 2);
 	UT_ASSERT_EQ(capture.postread_count, 2);
 }
@@ -317,10 +298,10 @@ UT_TEST(test_projection_commit_ts_requires_retained_source_and_truncates)
 	input.operation = &operation;
 	input.origin_thread = 3;
 	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
-		CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED);
+				 CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED);
 	input.source_retained = true;
 	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
-		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+				 CLUSTER_SIDE_PROJECTION_APPLY_OK);
 	memset(&capture, 0, sizeof(capture));
 	capture.truncate_ok = true;
 	memset(&ops, 0, sizeof(ops));
@@ -329,7 +310,7 @@ UT_TEST(test_projection_commit_ts_requires_retained_source_and_truncates)
 	ops.remote_xact_range_empty = capture_postread;
 	ops.truncate_remote_xact_before = capture_truncate;
 	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
-		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+				 CLUSTER_SIDE_PROJECTION_APPLY_OK);
 	UT_ASSERT_EQ(capture.truncate_count, 1);
 	UT_ASSERT_EQ(capture.origin_slot, 2);
 	UT_ASSERT_EQ(capture.oldest_xid, 800);
@@ -358,17 +339,17 @@ UT_TEST(test_projection_multixact_requires_retained_exact_source_and_postread)
 	members[1].status = MultiXactStatusUpdate;
 	memset(&input, 0, sizeof(input));
 	input.operation = &operation;
-	input.owned_payload = (const uint8 *) members;
+	input.owned_payload = (const uint8 *)members;
 	input.owned_payload_length = sizeof(members);
 	input.origin_thread = 3;
 	input.cluster_epoch = 19;
 	input.source_lsn = 100;
 	input.source_end_lsn = 200;
 	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
-		CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED);
+				 CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED);
 	input.source_retained = true;
 	UT_ASSERT_EQ(cluster_side_projection_target_preflight_v1(&input),
-		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+				 CLUSTER_SIDE_PROJECTION_APPLY_OK);
 	memset(&capture, 0, sizeof(capture));
 	capture.multixact_mutate_ok = true;
 	capture.multixact_verify_ok = true;
@@ -377,12 +358,12 @@ UT_TEST(test_projection_multixact_requires_retained_exact_source_and_postread)
 	ops.apply_multixact_projection = capture_multixact;
 	ops.verify_multixact_projection = capture_multixact_postread;
 	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
-		CLUSTER_SIDE_PROJECTION_APPLY_OK);
+				 CLUSTER_SIDE_PROJECTION_APPLY_OK);
 	UT_ASSERT_EQ(capture.multixact_mutate_count, 1);
 	UT_ASSERT_EQ(capture.multixact_verify_count, 1);
 	capture.multixact_verify_ok = false;
 	UT_ASSERT_EQ(cluster_side_projection_apply_owned_v1(&input, &ops),
-		CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED);
+				 CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED);
 }
 
 UT_TEST(test_online_owner_wires_retained_source_identity_and_real_callbacks)
@@ -407,22 +388,20 @@ UT_TEST(test_online_owner_wires_retained_source_identity_and_real_callbacks)
 	members[0].status = MultiXactStatusForKeyShare;
 	members[1].xid = 816;
 	members[1].status = MultiXactStatusUpdate;
-	operation.owned_payload = (const uint8 *) members;
+	operation.owned_payload = (const uint8 *)members;
 	operation.owned_payload_length = sizeof(members);
 
 	UT_ASSERT(rf_side_online_projection_owner_init_v1(&owner, 19, true));
 	memset(&owner_capture, 0, sizeof(owner_capture));
 	owner_capture.multixact_mutate_ok = true;
 	owner_capture.multixact_verify_ok = true;
-	UT_ASSERT(rf_side_online_projection_preflight_owned_v1(&owner,
-		&operation));
+	UT_ASSERT(rf_side_online_projection_preflight_owned_v1(&owner, &operation));
 	UT_ASSERT(rf_side_online_projection_apply_owned_v1(&owner, &operation));
 	UT_ASSERT_EQ(owner_capture.multixact_mutate_count, 1);
 	UT_ASSERT_EQ(owner_capture.multixact_verify_count, 1);
 
 	UT_ASSERT(rf_side_online_projection_owner_init_v1(&owner, 19, false));
-	UT_ASSERT(!rf_side_online_projection_preflight_owned_v1(&owner,
-		&operation));
+	UT_ASSERT(!rf_side_online_projection_preflight_owned_v1(&owner, &operation));
 	operation.kind = RF_SIDE_ONLINE_OPERATION_XACT;
 	UT_ASSERT(!rf_side_online_projection_apply_owned_v1(&owner, &operation));
 }

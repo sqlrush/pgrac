@@ -58,12 +58,9 @@ StaticAssertDecl(sizeof(PageHeaderData) == 32,
 				 "PageHeaderData ABI baseline (24-byte PG16 header + 8-byte pd_block_scn)");
 StaticAssertDecl(sizeof(XLogRecord) == 32,
 				 "XLogRecord ABI baseline (24-byte PG16 header + 8-byte xl_scn)");
-StaticAssertDecl(sizeof(BufferTag) == 20,
-				 "BufferTag ABI baseline");
-StaticAssertDecl(sizeof(RelFileLocator) == 12,
-				 "RelFileLocator ABI baseline");
-StaticAssertDecl(offsetof(XLogRecord, xl_scn) == 16,
-				 "spec-4.5 xl_scn at offset 16");
+StaticAssertDecl(sizeof(BufferTag) == 20, "BufferTag ABI baseline");
+StaticAssertDecl(sizeof(RelFileLocator) == 12, "RelFileLocator ABI baseline");
+StaticAssertDecl(offsetof(XLogRecord, xl_scn) == 16, "spec-4.5 xl_scn at offset 16");
 
 UT_TEST(abi_baseline)
 {

@@ -653,14 +653,10 @@ UT_TEST(test_hello_r4_capabilities_preserve_v1_reference)
 
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	capabilities = cluster_ic_hello_capabilities(&parsed);
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1,
-				 (uint32)0x00100000U);
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1,
-				 (uint32)0x00200000U);
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-				 (uint32)0x00020000U);
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1,
-				 UINT32_C(0x00400000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1, (uint32)0x00100000U);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1, (uint32)0x00200000U);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, (uint32)0x00020000U);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1, UINT32_C(0x00400000));
 	UT_ASSERT_EQ(capabilities & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
 				 PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1);
 	UT_ASSERT_EQ(capabilities & UINT32_C(0x007B3000), UINT32_C(0x007B3000));
@@ -684,19 +680,16 @@ UT_TEST(test_local_capability_word_is_hello_authority_with_ack_advertisement)
 	cluster_ic_suppress_caps_reply = false;
 	cluster_ic_suppress_gcs_done_cap = false;
 	cluster_ic_suppress_xid_flock_cap = false;
-	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1,
-		PGRAC_IC_ENVELOPE_VERSION_V1, 0, "four-node-happy-path",
-		CLUSTER_IC_PLANE_CONTROL, 0);
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 0,
+						   "four-node-happy-path", CLUSTER_IC_PLANE_CONTROL, 0);
 
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
-	UT_ASSERT_EQ(cluster_ic_local_capability_word(),
-		cluster_ic_hello_capabilities(&parsed));
+	UT_ASSERT_EQ(cluster_ic_local_capability_word(), cluster_ic_hello_capabilities(&parsed));
 	/* RF-ROOT P9 verification (2026-08-19): the ACK-v1 bit IS advertised —
 	 * tier-1 peers must learn the semantic-activation ACK semantics from
 	 * the HELLO before the first ACK exchange. */
-	UT_ASSERT_EQ(cluster_ic_local_capability_word()
-				 & PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
-		PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1);
+	UT_ASSERT_EQ(cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1,
+				 PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1);
 }
 
 UT_TEST(test_current_mx_capability_is_advertised_without_reserved_bit_alias)
@@ -709,14 +702,12 @@ UT_TEST(test_current_mx_capability_is_advertised_without_reserved_bit_alias)
 	cluster_ic_suppress_caps_reply = false;
 	cluster_ic_suppress_gcs_done_cap = false;
 	cluster_ic_suppress_xid_flock_cap = false;
-	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1,
-		PGRAC_IC_ENVELOPE_VERSION_V1, 0, "current-mx",
-		CLUSTER_IC_PLANE_CONTROL, 0);
+	cluster_ic_build_hello(wire, PGRAC_IC_HELLO_VERSION_V1, PGRAC_IC_ENVELOPE_VERSION_V1, 0,
+						   "current-mx", CLUSTER_IC_PLANE_CONTROL, 0);
 
 	UT_ASSERT(cluster_ic_parse_hello(wire, &parsed));
 	capabilities = cluster_ic_hello_capabilities(&parsed);
-	UT_ASSERT_EQ(capabilities & UINT32_C(0x00010000),
-				 UINT32_C(0x00010000));
+	UT_ASSERT_EQ(capabilities & UINT32_C(0x00010000), UINT32_C(0x00010000));
 	UT_ASSERT_EQ(capabilities & PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1,
 				 PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
 	UT_ASSERT_EQ(capabilities & UINT32_C(0x00004000), 0);
@@ -823,14 +814,10 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1
-			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
-			| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
-			| UINT32_C(0x00010000)
-			| PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1
-			| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
-			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1
-			| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+			| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1 | UINT32_C(0x00010000)
+			| PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
 	/* Keep the aggregate word byte-exact as well as symbolically composed:
 	 * parallel protocol lanes have collided while preserving the same symbolic
 	 * expectation, so the literal catches accidental bit reuse. */
@@ -850,14 +837,10 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_GCS_INVAL_BUSY_V1 | PGRAC_IC_HELLO_CAP_UNDO_HORIZON_IDLE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_CONVERT_V1 | PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1
 			| PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1 | PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1
-			| PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
-			| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
-			| UINT32_C(0x00010000)
-			| PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1
-			| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
-			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1
-			| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+			| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1 | UINT32_C(0x00010000)
+			| PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
 
 	cluster_smart_fusion = true;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_3;
@@ -875,12 +858,9 @@ UT_TEST(test_hello_smart_fusion_capability_gate)
 			| PGRAC_IC_HELLO_CAP_PCM_X_REBASE_V1 | PGRAC_IC_HELLO_CAP_PCM_X_SOURCE_FLOOR_V1
 			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
 			| PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_ACK_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
-			| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1
-			| UINT32_C(0x00010000)
-			| PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1
-			| PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
-			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1
-			| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
+			| PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1 | UINT32_C(0x00010000)
+			| PGRAC_IC_HELLO_CAP_CONTROL_ROOT_V1 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+			| PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
 
 	cluster_smart_fusion = false;
 	cluster_interconnect_tier = CLUSTER_IC_TIER_STUB;

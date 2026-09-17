@@ -537,9 +537,8 @@ UT_TEST(test_ic_payload_removed_incarnation)
 
 UT_TEST(test_startup_serving_gate)
 {
-	UT_ASSERT_STR_EQ(cluster_node_remove_request_result_str(
-						 CLUSTER_REMOVE_REQ_NOT_SERVING),
-				 "rejected:not_serving");
+	UT_ASSERT_STR_EQ(cluster_node_remove_request_result_str(CLUSTER_REMOVE_REQ_NOT_SERVING),
+					 "rejected:not_serving");
 	UT_ASSERT(cluster_node_remove_startup_serving_allows(false, false));
 	UT_ASSERT(cluster_node_remove_startup_serving_allows(false, true));
 	UT_ASSERT(!cluster_node_remove_startup_serving_allows(true, false));

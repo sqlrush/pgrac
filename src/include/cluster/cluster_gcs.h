@@ -148,8 +148,7 @@ cluster_gcs_reply_matches_outstanding(const GcsReplyPayload *reply, uint64 expec
 									  uint8 expected_transition_id, int32 expected_master_node,
 									  uint32 authenticated_source_node)
 {
-	return reply != NULL && expected_request_id != 0
-		   && reply->request_id == expected_request_id
+	return reply != NULL && expected_request_id != 0 && reply->request_id == expected_request_id
 		   && reply->transition_id == expected_transition_id
 		   && reply->status <= GCS_REPLY_DENIED_EPOCH_STALE && reply->reserved_0[0] == 0
 		   && reply->reserved_0[1] == 0 && expected_master_node >= 0

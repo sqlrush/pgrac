@@ -3,6 +3,7 @@
 #include "postgres.h"
 #include "miscadmin.h"
 #include "cluster/cluster_clean_leave.h"
+#include "test_cluster_normal_cold_scn.inc"
 #include "../../backend/cluster/cluster_backup.c"
 #undef printf
 #undef fprintf

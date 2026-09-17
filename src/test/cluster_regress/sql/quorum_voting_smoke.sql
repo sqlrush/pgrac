@@ -27,7 +27,7 @@ SELECT name, vartype, context
                 'cluster.quorum_poll_interval_ms',
                 'cluster.voting_disk_io_timeout_ms',
                 'cluster.voting_disk_size_bytes')
- ORDER BY name;
+ ORDER BY name COLLATE "C";
 
 -- ----------
 -- Block 2: pg_cluster_quorum_state view exists with 7 columns.

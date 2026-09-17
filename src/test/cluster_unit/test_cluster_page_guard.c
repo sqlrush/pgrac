@@ -21,11 +21,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -114,8 +112,7 @@ UT_TEST(test_partition_conflict_fails_without_wait)
 	uint32 blockno;
 
 	UT_ASSERT(rf_page_guard_preflight_v1(&first_page, &first));
-	for (blockno = 21; blockno < 100000; blockno++)
-	{
+	for (blockno = 21; blockno < 100000; blockno++) {
 		second_page.blockno = blockno;
 		UT_ASSERT(rf_page_guard_preflight_v1(&second_page, &second));
 		if (second.partition == first.partition)

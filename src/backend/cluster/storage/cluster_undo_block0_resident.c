@@ -104,23 +104,22 @@ static bool Block0ResourceCallbackRegistered = false;
 #define BLOCK0_FRAME_DATA(i) (Block0Frames + ((Size)(i)) * BLCKSZ)
 
 static bool block0_authority_proof_valid(const ClusterUndoBlock0LogicalKey *logical,
-											 const ClusterUndoBlock0AuthorityProof *proof);
+										 const ClusterUndoBlock0AuthorityProof *proof);
 static bool block0_authority_proof_matches(const ClusterUndoBlock0AuthorityProof *observed,
-											   const ClusterUndoBlock0AuthorityProof *expected);
+										   const ClusterUndoBlock0AuthorityProof *expected);
 static bool block0_page_identity(const char *page, const ClusterUndoBlock0LogicalKey *logical,
 								 ClusterUndoBlock0Generation *generation);
 static void block0_pin_clear(ClusterUndoBlock0Pin *pin);
-static void block0_drop_reservation(ClusterUndoBlock0SlotData *meta,
-										ClusterUndoBlock0Pin *pin);
+static void block0_drop_reservation(ClusterUndoBlock0SlotData *meta, ClusterUndoBlock0Pin *pin);
 static void block0_abort_pin(ClusterUndoBlock0Pin *pin);
 static void block0_recovery_guard_clear(ClusterUndoBlock0RecoveryGuard *guard);
 static void block0_resource_release_callback(ResourceReleasePhase phase, bool isCommit,
-										 bool isTopLevel, void *arg);
+											 bool isTopLevel, void *arg);
 static ClusterUndoBlock0OwnedResource *block0_resource_prepare(const void *handle,
-											ClusterUndoBlock0OwnedKind kind);
+															   ClusterUndoBlock0OwnedKind kind);
 static void block0_resource_link(ClusterUndoBlock0OwnedResource *resource);
-static ClusterUndoBlock0OwnedResource *block0_resource_find(
-	const void *handle, ClusterUndoBlock0OwnedKind kind);
+static ClusterUndoBlock0OwnedResource *block0_resource_find(const void *handle,
+															ClusterUndoBlock0OwnedKind kind);
 static void block0_resource_free(ClusterUndoBlock0OwnedResource *resource);
 static void block0_resource_forget(ClusterUndoBlock0OwnedResource *resource);
 
@@ -213,8 +212,8 @@ block0_resource_return_frame(uint32 frame_index)
 
 
 static void
-block0_resource_release_callback(ResourceReleasePhase phase, bool isCommit,
-									 bool isTopLevel, void *arg)
+block0_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
+								 void *arg)
 {
 	dlist_mutable_iter iter;
 
@@ -273,13 +272,11 @@ block0_resource_release_callback(ResourceReleasePhase phase, bool isCommit,
 					(void)cluster_undo_smgr_provision_temp_cleanup(
 						meta->resolved_root.intent, meta->logical.segment_id,
 						meta->logical.owner_instance, resource->temp_path);
-				if (pg_atomic_read_u32(&meta->state)
-					== CLUSTER_UNDO_BLOCK0_SLOT_FILLING
+				if (pg_atomic_read_u32(&meta->state) == CLUSTER_UNDO_BLOCK0_SLOT_FILLING
 					&& meta->frame_index == resource->frame_index) {
 					meta->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
 					pg_atomic_write_u32(&meta->pincount, 0);
-					pg_atomic_write_u32(&meta->state,
-								CLUSTER_UNDO_BLOCK0_SLOT_EMPTY);
+					pg_atomic_write_u32(&meta->state, CLUSTER_UNDO_BLOCK0_SLOT_EMPTY);
 					return_frame = true;
 				}
 				LWLockRelease(&meta->content_lock);
@@ -304,7 +301,7 @@ cluster_undo_block0_shmem_size(uint32 frame_count)
 
 	sz = MAXALIGN(sizeof(ClusterUndoBlock0Ctl));
 	sz = add_size(sz, MAXALIGN(mul_size((Size)CLUSTER_UNDO_BLOCK0_SLOT_COUNT,
-										 sizeof(ClusterUndoBlock0Slot))));
+										sizeof(ClusterUndoBlock0Slot))));
 	sz = add_size(sz, MAXALIGN(mul_size((Size)frame_count, sizeof(uint32))));
 	sz = add_size(sz, mul_size((Size)frame_count, (Size)BLCKSZ));
 	return sz;
@@ -330,8 +327,8 @@ cluster_undo_block0_shmem_init_region(void *address, Size size, uint32 frame_cou
 	Block0Ctl = (ClusterUndoBlock0Ctl *)cursor;
 	cursor += MAXALIGN(sizeof(ClusterUndoBlock0Ctl));
 	Block0Slots = (ClusterUndoBlock0Slot *)cursor;
-	cursor += MAXALIGN(mul_size((Size)CLUSTER_UNDO_BLOCK0_SLOT_COUNT,
-							 sizeof(ClusterUndoBlock0Slot)));
+	cursor
+		+= MAXALIGN(mul_size((Size)CLUSTER_UNDO_BLOCK0_SLOT_COUNT, sizeof(ClusterUndoBlock0Slot)));
 	Block0FreeFrames = (uint32 *)cursor;
 	cursor += MAXALIGN(mul_size((Size)frame_count, sizeof(uint32)));
 	Block0Frames = cursor;
@@ -438,8 +435,8 @@ cluster_undo_block0_frame_release(ClusterUndoBlock0FrameToken *token)
 	if (token == NULL || !token->owned)
 		return;
 	owned = block0_resource_find(token, CLUSTER_UNDO_BLOCK0_OWNED_FRAME);
-	if (Block0Ctl == NULL || token->frame_index >= Block0Ctl->frame_count
-		|| owned == NULL || owned->frame_index != token->frame_index) {
+	if (Block0Ctl == NULL || token->frame_index >= Block0Ctl->frame_count || owned == NULL
+		|| owned->frame_index != token->frame_index) {
 		token->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
 		token->owned = false;
 		if (Block0Ctl == NULL)
@@ -494,8 +491,7 @@ block0_page_identity(const char *page, const ClusterUndoBlock0LogicalKey *logica
 		return false;
 	ph = (PageHeader)page;
 	hdr = (const UndoSegmentHeaderData *)page;
-	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0
-		|| PageGetPageSize((Page)page) != BLCKSZ
+	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0 || PageGetPageSize((Page)page) != BLCKSZ
 		|| PageGetPageLayoutVersion((Page)page) != PG_PAGE_LAYOUT_VERSION
 		|| hdr->segment_id != logical->segment_id
 		|| hdr->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
@@ -636,10 +632,10 @@ block0_normal_start_read(ClusterUndoBlock0SlotData *meta,
 
 ClusterUndoBlock0Result
 cluster_undo_block0_admit_runtime(const ClusterUndoBlock0LogicalKey *logical,
-							  const ClusterUndoBlock0ResolvedRoot *root,
-							  const ClusterUndoBlock0AuthorityProof *proof,
-							  ClusterUndoBlock0FrameToken *token, ClusterUndoBlock0Pin *pin,
-							  char **page)
+								  const ClusterUndoBlock0ResolvedRoot *root,
+								  const ClusterUndoBlock0AuthorityProof *proof,
+								  ClusterUndoBlock0FrameToken *token, ClusterUndoBlock0Pin *pin,
+								  char **page)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation generation;
@@ -744,8 +740,8 @@ cluster_undo_block0_admit_runtime(const ClusterUndoBlock0LogicalKey *logical,
 
 static void
 block0_provision_restore_token(ClusterUndoBlock0SlotData *meta,
-							 ClusterUndoBlock0OwnedResource *owned,
-							 ClusterUndoBlock0FrameToken *token)
+							   ClusterUndoBlock0OwnedResource *owned,
+							   ClusterUndoBlock0FrameToken *token)
 {
 	meta->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
 	pg_atomic_write_u32(&meta->pincount, 0);
@@ -767,9 +763,8 @@ ClusterUndoBlock0Result
 cluster_undo_block0_provision_begin(const ClusterUndoBlock0LogicalKey *logical,
 									const ClusterUndoBlock0ResolvedRoot *target_root,
 									const ClusterUndoBlock0AuthorityProof *proof,
-									ClusterUndoBlock0FrameToken *token,
-									ClusterUndoBlock0Pin *pin, char **unpublished_page,
-									bool *creator)
+									ClusterUndoBlock0FrameToken *token, ClusterUndoBlock0Pin *pin,
+									char **unpublished_page, bool *creator)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation generation;
@@ -783,8 +778,8 @@ cluster_undo_block0_provision_begin(const ClusterUndoBlock0LogicalKey *logical,
 		*unpublished_page = NULL;
 	if (creator != NULL)
 		*creator = false;
-	if (Block0Ctl == NULL || target_root == NULL || token == NULL || !token->owned
-		|| pin == NULL || unpublished_page == NULL || creator == NULL
+	if (Block0Ctl == NULL || target_root == NULL || token == NULL || !token->owned || pin == NULL
+		|| unpublished_page == NULL || creator == NULL
 		|| token->frame_index >= Block0Ctl->frame_count)
 		return CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE;
 	if (cluster_undo_block0_logical_slot(logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK
@@ -821,7 +816,7 @@ cluster_undo_block0_provision_begin(const ClusterUndoBlock0LogicalKey *logical,
 	Assert(owned->temp_path == NULL);
 
 	final_state = cluster_undo_smgr_probe_segment(target_root->intent, logical->segment_id,
-										 logical->owner_instance, frame);
+												  logical->owner_instance, frame);
 	if (final_state != CLUSTER_UNDO_SMGR_FINAL_ABSENT
 		&& final_state != CLUSTER_UNDO_SMGR_FINAL_EXACT
 		&& final_state != CLUSTER_UNDO_SMGR_FINAL_INVALID
@@ -840,8 +835,8 @@ cluster_undo_block0_provision_begin(const ClusterUndoBlock0LogicalKey *logical,
 	if (final_state == CLUSTER_UNDO_SMGR_FINAL_ABSENT) {
 		owned->temp_path = MemoryContextAlloc(TopMemoryContext, MAXPGPATH);
 		owned->temp_path[0] = '\0';
-		if (!cluster_undo_smgr_provision_temp_create(target_root->intent,
-				logical->segment_id, logical->owner_instance, owned->temp_path)) {
+		if (!cluster_undo_smgr_provision_temp_create(target_root->intent, logical->segment_id,
+													 logical->owner_instance, owned->temp_path)) {
 			block0_provision_restore_token(meta, owned, token);
 			return CLUSTER_UNDO_BLOCK0_IO_ERROR;
 		}
@@ -865,8 +860,8 @@ cluster_undo_block0_provision_begin(const ClusterUndoBlock0LogicalKey *logical,
 	pin->logical = *logical;
 	pin->resolved_root = *target_root;
 	pin->observed_generation = final_state == CLUSTER_UNDO_SMGR_FINAL_EXACT
-									 ? generation
-									 : (ClusterUndoBlock0Generation){ .known = false, .value = 0 };
+								   ? generation
+								   : (ClusterUndoBlock0Generation){ .known = false, .value = 0 };
 	pin->mode = CLUSTER_UNDO_BLOCK0_EXCLUSIVE;
 	pin->proof = *proof;
 	*unpublished_page = frame;
@@ -900,8 +895,7 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 		|| meta->frame_index != owned->frame_index)
 		ereport(ERROR, (errmsg("undo block-zero provision publisher lost filling authority")));
 	frame = BLOCK0_FRAME_DATA(meta->frame_index);
-	if (!block0_page_identity(frame, &meta->logical, &generation)
-		|| generation.value == UINT32_MAX)
+	if (!block0_page_identity(frame, &meta->logical, &generation) || generation.value == UINT32_MAX)
 		ereport(ERROR, (errmsg("invalid undo block-zero provision image")));
 
 	XLogFlush(init_lsn);
@@ -909,9 +903,9 @@ cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init
 		meta->resolved_root.intent, meta->logical.segment_id, meta->logical.owner_instance,
 		owned->temp_path, frame);
 	if (publish_result == CLUSTER_UNDO_SMGR_PUBLISH_EXISTS) {
-		if (cluster_undo_smgr_probe_segment(meta->resolved_root.intent,
-				meta->logical.segment_id, meta->logical.owner_instance, frame)
-			!= CLUSTER_UNDO_SMGR_FINAL_EXACT
+		if (cluster_undo_smgr_probe_segment(meta->resolved_root.intent, meta->logical.segment_id,
+											meta->logical.owner_instance, frame)
+				!= CLUSTER_UNDO_SMGR_FINAL_EXACT
 			|| !block0_page_identity(frame, &meta->logical, &generation)
 			|| generation.value == UINT32_MAX)
 			ereport(ERROR, (errmsg("undo block-zero provision winner is not exact")));
@@ -945,8 +939,9 @@ cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin)
 	meta = &Block0Slots[pin->slot].data;
 	frame_index = owned->frame_index;
 	if (owned->temp_path != NULL && owned->temp_path[0] != '\0')
-		(void)cluster_undo_smgr_provision_temp_cleanup(meta->resolved_root.intent,
-			meta->logical.segment_id, meta->logical.owner_instance, owned->temp_path);
+		(void)cluster_undo_smgr_provision_temp_cleanup(
+			meta->resolved_root.intent, meta->logical.segment_id, meta->logical.owner_instance,
+			owned->temp_path);
 	if (pg_atomic_read_u32(&meta->state) == CLUSTER_UNDO_BLOCK0_SLOT_FILLING
 		&& meta->frame_index == frame_index) {
 		meta->frame_index = CLUSTER_UNDO_BLOCK0_FRAME_INVALID;
@@ -963,8 +958,7 @@ cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin)
 ClusterUndoBlock0Result
 cluster_undo_block0_reserve(const ClusterUndoBlock0LogicalKey *logical,
 							const ClusterUndoBlock0ResolvedRoot *expected_root,
-							const ClusterUndoBlock0AuthorityProof *proof,
-							ClusterUndoBlock0Pin *pin)
+							const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0OwnedResource *owned;
@@ -990,9 +984,8 @@ cluster_undo_block0_reserve(const ClusterUndoBlock0LogicalKey *logical,
 		LWLockRelease(&meta->content_lock);
 		if (owned != NULL)
 			pfree(owned);
-		return state == CLUSTER_UNDO_BLOCK0_SLOT_RETIRING
-				   ? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
-				   : CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		return state == CLUSTER_UNDO_BLOCK0_SLOT_RETIRING ? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
+														  : CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
 	}
 	if (meta->logical.segment_id != logical->segment_id
 		|| meta->logical.owner_instance != logical->owner_instance
@@ -1056,8 +1049,8 @@ cluster_undo_block0_lock_content(ClusterUndoBlock0Pin *pin,
 					 ? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
 					 : CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
 	else if (meta->logical.segment_id != pin->logical.segment_id
-		|| meta->logical.owner_instance != pin->logical.owner_instance
-		|| !cluster_undo_block0_root_matches(&meta->resolved_root, &pin->resolved_root))
+			 || meta->logical.owner_instance != pin->logical.owner_instance
+			 || !cluster_undo_block0_root_matches(&meta->resolved_root, &pin->resolved_root))
 		result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	else if (!block0_authority_proof_matches(&meta->proof, &pin->proof))
 		result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
@@ -1123,7 +1116,7 @@ cluster_undo_block0_copy_resident(const ClusterUndoBlock0LogicalKey *logical,
 	if (private_page == NULL)
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	result = cluster_undo_block0_pin(logical, expected_root, expected, CLUSTER_UNDO_BLOCK0_SHARED,
-								 proof, &pin, &page);
+									 proof, &pin, &page);
 	if (result != CLUSTER_UNDO_BLOCK0_OK)
 		return result;
 	memcpy(private_page, page, BLCKSZ);
@@ -1196,11 +1189,10 @@ cluster_undo_block0_copy_readonly(const ClusterUndoBlock0LogicalKey *logical,
 
 
 ClusterUndoBlock0Result
-cluster_undo_block0_sample_resident_generation(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *expected_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	ClusterUndoBlock0Generation *observed_generation)
+cluster_undo_block0_sample_resident_generation(const ClusterUndoBlock0LogicalKey *logical,
+											   const ClusterUndoBlock0ResolvedRoot *expected_root,
+											   const ClusterUndoBlock0AuthorityProof *proof,
+											   ClusterUndoBlock0Generation *observed_generation)
 {
 	ClusterUndoBlock0Pin pin;
 	ClusterUndoBlock0Result result;
@@ -1209,7 +1201,7 @@ cluster_undo_block0_sample_resident_generation(
 	if (observed_generation == NULL)
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	result = cluster_undo_block0_pin(logical, expected_root, NULL, CLUSTER_UNDO_BLOCK0_SHARED,
-								 proof, &pin, &page);
+									 proof, &pin, &page);
 	if (result != CLUSTER_UNDO_BLOCK0_OK)
 		return result;
 	*observed_generation = pin.observed_generation;
@@ -1220,10 +1212,8 @@ cluster_undo_block0_sample_resident_generation(
 
 ClusterUndoBlock0Result
 cluster_undo_block0_sample_resident_generation_conditional(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *expected_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	ClusterUndoBlock0Generation *observed_generation)
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Generation *observed_generation)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Result result = CLUSTER_UNDO_BLOCK0_OK;
@@ -1234,8 +1224,7 @@ cluster_undo_block0_sample_resident_generation_conditional(
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	memset(observed_generation, 0, sizeof(*observed_generation));
 	if (Block0Ctl == NULL
-		|| cluster_undo_block0_logical_slot(logical, &slotno)
-			!= CLUSTER_UNDO_BLOCK0_OK
+		|| cluster_undo_block0_logical_slot(logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK
 		|| !cluster_undo_block0_root_valid(expected_root)
 		|| !block0_authority_proof_valid(logical, proof))
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
@@ -1247,12 +1236,11 @@ cluster_undo_block0_sample_resident_generation_conditional(
 	if (state != CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN
 		&& state != CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
 		result = state == CLUSTER_UNDO_BLOCK0_SLOT_RETIRING
-			? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
-			: CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+					 ? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
+					 : CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
 	else if (meta->logical.segment_id != logical->segment_id
-		|| meta->logical.owner_instance != logical->owner_instance
-		|| !cluster_undo_block0_root_matches(
-			&meta->resolved_root, expected_root))
+			 || meta->logical.owner_instance != logical->owner_instance
+			 || !cluster_undo_block0_root_matches(&meta->resolved_root, expected_root))
 		result = CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	else if (!block0_authority_proof_matches(&meta->proof, proof))
 		result = CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
@@ -1264,20 +1252,17 @@ cluster_undo_block0_sample_resident_generation_conditional(
 
 
 ClusterUndoBlock0Result
-cluster_undo_block0_prove_strict_empty(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0AuthorityProof *proof)
+cluster_undo_block0_prove_strict_empty(const ClusterUndoBlock0LogicalKey *logical,
+									   const ClusterUndoBlock0AuthorityProof *proof)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Result result;
 	uint32 slotno;
 
-	if (cluster_undo_block0_logical_slot(logical, &slotno)
-		!= CLUSTER_UNDO_BLOCK0_OK)
+	if (cluster_undo_block0_logical_slot(logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK)
 		return CLUSTER_UNDO_BLOCK0_IDENTITY_MISMATCH;
 	if (!block0_authority_proof_valid(logical, proof)
-		|| proof->kind != CLUSTER_UNDO_BLOCK0_LIVE_OWNER
-		|| proof->recovery_generation != 0)
+		|| proof->kind != CLUSTER_UNDO_BLOCK0_LIVE_OWNER || proof->recovery_generation != 0)
 		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
 	if (Block0Ctl == NULL)
 		return CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED;
@@ -1298,14 +1283,11 @@ cluster_undo_block0_prove_strict_empty(
 
 
 ClusterUndoBlock0Result
-cluster_undo_block0_recovery_private_begin(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *redo_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	bool allow_absent,
-	ClusterUndoBlock0RecoveryGuard *guard,
-	char private_page[BLCKSZ],
-	bool *exists)
+cluster_undo_block0_recovery_private_begin(const ClusterUndoBlock0LogicalKey *logical,
+										   const ClusterUndoBlock0ResolvedRoot *redo_root,
+										   const ClusterUndoBlock0AuthorityProof *proof,
+										   bool allow_absent, ClusterUndoBlock0RecoveryGuard *guard,
+										   char private_page[BLCKSZ], bool *exists)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation generation;
@@ -1333,14 +1315,12 @@ cluster_undo_block0_recovery_private_begin(
 	meta = &Block0Slots[slotno].data;
 	LWLockAcquire(&meta->content_lock, LW_EXCLUSIVE);
 	state = pg_atomic_read_u32(&meta->state);
-	if (state != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY
-		|| pg_atomic_read_u32(&meta->pincount) != 0) {
+	if (state != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY || pg_atomic_read_u32(&meta->pincount) != 0) {
 		LWLockRelease(&meta->content_lock);
 		if (owned != NULL)
 			pfree(owned);
-		return state == CLUSTER_UNDO_BLOCK0_SLOT_RETIRING
-				   ? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
-				   : CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
+		return state == CLUSTER_UNDO_BLOCK0_SLOT_RETIRING ? CLUSTER_UNDO_BLOCK0_GENERATION_MISMATCH
+														  : CLUSTER_UNDO_BLOCK0_NOT_PUBLISHED;
 	}
 	if (owned != NULL) {
 		owned->slot = slotno;
@@ -1378,10 +1358,8 @@ cluster_undo_block0_recovery_private_begin(
 
 void
 cluster_undo_block0_recovery_private_finish(ClusterUndoBlock0RecoveryGuard *guard,
-											const char *successor_page,
-											XLogRecPtr replay_lsn,
-											bool write_image,
-											bool fsync_parent)
+											const char *successor_page, XLogRecPtr replay_lsn,
+											bool write_image, bool fsync_parent)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation successor_generation;
@@ -1389,12 +1367,9 @@ cluster_undo_block0_recovery_private_finish(ClusterUndoBlock0RecoveryGuard *guar
 	uint32 slotno;
 
 	if (Block0Ctl == NULL || guard == NULL || !guard->content_x_held || guard->slot < 0
-		|| guard->slot >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT
-		|| XLogRecPtrIsInvalid(replay_lsn)
-		|| cluster_undo_block0_logical_slot(&guard->logical, &slotno)
-			   != CLUSTER_UNDO_BLOCK0_OK
-		|| slotno != (uint32)guard->slot
-		|| !cluster_undo_block0_root_valid(&guard->resolved_root)
+		|| guard->slot >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT || XLogRecPtrIsInvalid(replay_lsn)
+		|| cluster_undo_block0_logical_slot(&guard->logical, &slotno) != CLUSTER_UNDO_BLOCK0_OK
+		|| slotno != (uint32)guard->slot || !cluster_undo_block0_root_valid(&guard->resolved_root)
 		|| !block0_authority_proof_valid(&guard->logical, &guard->proof)
 		|| (guard->proof.kind != CLUSTER_UNDO_BLOCK0_RECOVERY_OWNER
 			&& guard->proof.kind != CLUSTER_UNDO_BLOCK0_STARTUP_REDO)
@@ -1405,22 +1380,17 @@ cluster_undo_block0_recovery_private_finish(ClusterUndoBlock0RecoveryGuard *guar
 	owned = block0_resource_find(guard, CLUSTER_UNDO_BLOCK0_OWNED_RECOVERY);
 	if (pg_atomic_read_u32(&meta->state) != CLUSTER_UNDO_BLOCK0_SLOT_EMPTY
 		|| pg_atomic_read_u32(&meta->pincount) != 0)
-		ereport(PANIC,
-				(errmsg("undo block-zero recovery-private finish found resident state")));
+		ereport(PANIC, (errmsg("undo block-zero recovery-private finish found resident state")));
 
 	if (write_image) {
 		if (successor_page == NULL
-			|| !block0_page_identity(successor_page, &guard->logical,
-									 &successor_generation))
-			ereport(PANIC,
-					(errmsg("invalid undo block-zero recovery-private successor image")));
+			|| !block0_page_identity(successor_page, &guard->logical, &successor_generation))
+			ereport(PANIC, (errmsg("invalid undo block-zero recovery-private successor image")));
 		if (fsync_parent)
 			ereport(PANIC,
 					(errmsg("undo block-zero recovery parent-directory fsync is unavailable")));
-		if (!cluster_undo_smgr_write_block(guard->resolved_root.intent,
-									  guard->logical.segment_id,
-									  guard->logical.owner_instance, 0,
-									  successor_page, true))
+		if (!cluster_undo_smgr_write_block(guard->resolved_root.intent, guard->logical.segment_id,
+										   guard->logical.owner_instance, 0, successor_page, true))
 			ereport(PANIC, (errmsg("could not durably apply recovery-private block zero")));
 	}
 
@@ -1454,14 +1424,13 @@ cluster_undo_block0_recovery_private_abort(ClusterUndoBlock0RecoveryGuard *guard
  * closure remain separate READY prerequisites.
  */
 bool
-cluster_undo_block0_verify_clean_census(
-	const ClusterUndoBlock0ResidentCensusItem *items, uint32 count)
+cluster_undo_block0_verify_clean_census(const ClusterUndoBlock0ResidentCensusItem *items,
+										uint32 count)
 {
 	uint32 item_index = 0;
 	uint32 slotno;
 
-	if (Block0Ctl == NULL || (count > 0 && items == NULL)
-		|| count > CLUSTER_UNDO_BLOCK0_SLOT_COUNT)
+	if (Block0Ctl == NULL || (count > 0 && items == NULL) || count > CLUSTER_UNDO_BLOCK0_SLOT_COUNT)
 		return false;
 
 	for (slotno = 0; slotno < CLUSTER_UNDO_BLOCK0_SLOT_COUNT; slotno++) {
@@ -1472,23 +1441,19 @@ cluster_undo_block0_verify_clean_census(
 		LWLockAcquire(&meta->content_lock, LW_SHARED);
 		state = pg_atomic_read_u32(&meta->state);
 		if (item_index < count) {
-			const ClusterUndoBlock0ResidentCensusItem *item
-				= &items[item_index];
+			const ClusterUndoBlock0ResidentCensusItem *item = &items[item_index];
 			uint32 expected_slot;
 
 			if (cluster_undo_block0_logical_slot(&item->logical, &expected_slot)
 					== CLUSTER_UNDO_BLOCK0_OK
-				&& expected_slot == slotno
-				&& state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN
+				&& expected_slot == slotno && state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN
 				&& pg_atomic_read_u32(&meta->pincount) == 0
 				&& meta->frame_index < Block0Ctl->frame_count
 				&& XLogRecPtrIsInvalid(meta->last_wal_lsn)
 				&& meta->logical.segment_id == item->logical.segment_id
 				&& meta->logical.owner_instance == item->logical.owner_instance
-				&& cluster_undo_block0_root_matches(
-					&meta->resolved_root, &item->resolved_root)
-				&& cluster_undo_block0_generation_matches(
-					&meta->generation, &item->generation)
+				&& cluster_undo_block0_root_matches(&meta->resolved_root, &item->resolved_root)
+				&& cluster_undo_block0_generation_matches(&meta->generation, &item->generation)
 				&& item->generation.known
 				&& block0_authority_proof_matches(&meta->proof, &item->proof))
 				matched = true;
@@ -1775,8 +1740,7 @@ cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin, XLogRecPtr wal_lsn
 	uint32 state;
 
 	Assert(Block0Ctl != NULL);
-	Assert(pin != NULL && pin->slot >= 0
-		   && pin->slot < CLUSTER_UNDO_BLOCK0_SLOT_COUNT);
+	Assert(pin != NULL && pin->slot >= 0 && pin->slot < CLUSTER_UNDO_BLOCK0_SLOT_COUNT);
 	Assert(pin->mode == CLUSTER_UNDO_BLOCK0_EXCLUSIVE);
 	Assert(!XLogRecPtrIsInvalid(wal_lsn));
 	meta = &Block0Slots[pin->slot].data;
@@ -1791,7 +1755,7 @@ cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin, XLogRecPtr wal_lsn
 
 void
 cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_page,
-								   XLogRecPtr required_wal_lsn, bool fsync_parent)
+							   XLogRecPtr required_wal_lsn, bool fsync_parent)
 {
 	ClusterUndoBlock0SlotData *meta;
 	ClusterUndoBlock0Generation successor_generation;
@@ -1799,23 +1763,20 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 	uint32 state;
 
 	if (Block0Ctl == NULL || pin == NULL || pin->slot < 0
-		|| pin->slot >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT
-		|| pin->mode != CLUSTER_UNDO_BLOCK0_EXCLUSIVE || successor_page == NULL)
+		|| pin->slot >= CLUSTER_UNDO_BLOCK0_SLOT_COUNT || pin->mode != CLUSTER_UNDO_BLOCK0_EXCLUSIVE
+		|| successor_page == NULL)
 		ereport(ERROR, (errmsg("invalid undo block-zero synchronous flush owner")));
 	if (fsync_parent)
 		ereport(ERROR, (errmsg("undo block-zero parent-directory fsync is unavailable")));
 
 	meta = &Block0Slots[pin->slot].data;
-	if (!block0_page_identity(successor_page, &meta->logical,
-							  &successor_generation))
-		ereport(ERROR,
-				(errmsg("invalid undo block-zero synchronous flush successor image")));
+	if (!block0_page_identity(successor_page, &meta->logical, &successor_generation))
+		ereport(ERROR, (errmsg("invalid undo block-zero synchronous flush successor image")));
 	state = pg_atomic_read_u32(&meta->state);
 	if (state != CLUSTER_UNDO_BLOCK0_SLOT_VALID_CLEAN
 		&& state != CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
 		ereport(ERROR, (errmsg("undo block-zero synchronous flush found invalid resident state")));
-	if (XLogRecPtrIsInvalid(required_wal_lsn)
-		&& state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
+	if (XLogRecPtrIsInvalid(required_wal_lsn) && state == CLUSTER_UNDO_BLOCK0_SLOT_VALID_DIRTY)
 		ereport(ERROR, (errmsg("undo block-zero dirty flush requires a valid WAL LSN")));
 
 	flush_lsn = required_wal_lsn;
@@ -1825,7 +1786,7 @@ cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_
 	if (!XLogRecPtrIsInvalid(flush_lsn))
 		XLogFlush(flush_lsn);
 	if (!cluster_undo_smgr_write_block(meta->resolved_root.intent, meta->logical.segment_id,
-									  meta->logical.owner_instance, 0, successor_page, true))
+									   meta->logical.owner_instance, 0, successor_page, true))
 		ereport(ERROR, (errmsg("could not flush undo block zero")));
 
 	memcpy(BLOCK0_FRAME_DATA(meta->frame_index), successor_page, BLCKSZ);

@@ -156,8 +156,7 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 	return true;
 }
 bool
-LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
-						 LWLockMode mode pg_attribute_unused())
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	ut_lwlock_conditional_calls++;
 	return ut_lwlock_conditional_result;
@@ -595,8 +594,7 @@ UT_TEST(test_t12_no_pgproc_status_reads_never_block)
 	ut_lwlock_blocking_calls = 0;
 	ut_lwlock_conditional_calls = 0;
 
-	UT_ASSERT_EQ((int)cluster_cssd_get_status(),
-				 (int)CLUSTER_CSSD_STARTING);
+	UT_ASSERT_EQ((int)cluster_cssd_get_status(), (int)CLUSTER_CSSD_STARTING);
 	UT_ASSERT(!cluster_cssd_wait_for_ready(250));
 	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
 	UT_ASSERT(ut_lwlock_conditional_calls >= 2);
@@ -604,8 +602,7 @@ UT_TEST(test_t12_no_pgproc_status_reads_never_block)
 	ut_lwlock_conditional_result = true;
 	ut_lwlock_blocking_calls = 0;
 	ut_lwlock_conditional_calls = 0;
-	UT_ASSERT_EQ((int)cluster_cssd_get_status(),
-				 (int)CLUSTER_CSSD_STARTING);
+	UT_ASSERT_EQ((int)cluster_cssd_get_status(), (int)CLUSTER_CSSD_STARTING);
 	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
 	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 1);
 
@@ -613,8 +610,7 @@ UT_TEST(test_t12_no_pgproc_status_reads_never_block)
 	MyProc = &fake_proc;
 	ut_lwlock_blocking_calls = 0;
 	ut_lwlock_conditional_calls = 0;
-	UT_ASSERT_EQ((int)cluster_cssd_get_status(),
-				 (int)CLUSTER_CSSD_STARTING);
+	UT_ASSERT_EQ((int)cluster_cssd_get_status(), (int)CLUSTER_CSSD_STARTING);
 	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 1);
 	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 0);
 	MyProc = NULL;

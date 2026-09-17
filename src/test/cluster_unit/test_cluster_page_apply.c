@@ -90,45 +90,36 @@ UT_TEST(test_sequence_steps_advance_on_owning_proof)
 	ClusterPageSequenceResult r;
 
 	/* A step outside its owning state is rejected (state unchanged). */
-	r = cluster_page_apply_step_durability(CLUSTER_PAGE_STATE_MUTATED_IN_MEMORY,
-										   true);
-	UT_ASSERT_EQ((int) r.state,
-				 (int) CLUSTER_PAGE_STATE_MUTATED_IN_MEMORY);
-	UT_ASSERT_EQ((int) r.outcome, (int) CLUSTER_PAGE_OUTCOME_BLOCKED_CONTRIBUTOR);
+	r = cluster_page_apply_step_durability(CLUSTER_PAGE_STATE_MUTATED_IN_MEMORY, true);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_MUTATED_IN_MEMORY);
+	UT_ASSERT_EQ((int)r.outcome, (int)CLUSTER_PAGE_OUTCOME_BLOCKED_CONTRIBUTOR);
 
 	/* durability gate: fail -> BLOCKED_SOURCE, state unchanged. */
-	r = cluster_page_apply_step_durability(
-		CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED, false);
-	UT_ASSERT_EQ((int) r.state,
-				 (int) CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED);
-	UT_ASSERT_EQ((int) r.outcome, (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	r = cluster_page_apply_step_durability(CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED, false);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED);
+	UT_ASSERT_EQ((int)r.outcome, (int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
 
 	/* durability ok -> PAGE_WRITE_DURABLE. */
-	r = cluster_page_apply_step_durability(
-		CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED, true);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE);
+	r = cluster_page_apply_step_durability(CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED, true);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE);
 
 	/* PU-30: post-read wrong version/checksum -> CORRUPTION_VERSION, no
 	 * proof/release. */
-	r = cluster_page_apply_step_post_read(CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE,
-										  false);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE);
-	UT_ASSERT_EQ((int) r.outcome, (int) CLUSTER_PAGE_OUTCOME_CORRUPTION_VERSION);
+	r = cluster_page_apply_step_post_read(CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE, false);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE);
+	UT_ASSERT_EQ((int)r.outcome, (int)CLUSTER_PAGE_OUTCOME_CORRUPTION_VERSION);
 
-	r = cluster_page_apply_step_post_read(CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE,
-										  true);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_POST_READ_VERIFIED);
+	r = cluster_page_apply_step_post_read(CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE, true);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_POST_READ_VERIFIED);
 
 	/* PU-29: stale authority before release -> STALE_AUTHORITY, no
 	 * release. */
-	r = cluster_page_apply_step_authority(CLUSTER_PAGE_STATE_POST_READ_VERIFIED,
-										  false);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_POST_READ_VERIFIED);
-	UT_ASSERT_EQ((int) r.outcome, (int) CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY);
+	r = cluster_page_apply_step_authority(CLUSTER_PAGE_STATE_POST_READ_VERIFIED, false);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_POST_READ_VERIFIED);
+	UT_ASSERT_EQ((int)r.outcome, (int)CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY);
 
-	r = cluster_page_apply_step_authority(CLUSTER_PAGE_STATE_POST_READ_VERIFIED,
-										  true);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_RESOURCE_RELEASED);
+	r = cluster_page_apply_step_authority(CLUSTER_PAGE_STATE_POST_READ_VERIFIED, true);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_RESOURCE_RELEASED);
 }
 
 UT_TEST(test_midwrite_cut_is_permanent_stop)
@@ -136,40 +127,35 @@ UT_TEST(test_midwrite_cut_is_permanent_stop)
 	/* PL-03 / §7.6: the repeated-recoverer target-write cut is a
 	 * permanent RED/STOP — never SKIP, never an expected-failure green,
 	 * never a mock carrier. */
-	UT_ASSERT_EQ((int) cluster_page_apply_midwrite_cut(),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
-	UT_ASSERT_EQ((int) cluster_page_apply_midwrite_cut(),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ((int)cluster_page_apply_midwrite_cut(),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ((int)cluster_page_apply_midwrite_cut(),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
 }
 
 UT_TEST(test_crash_matrix_rows)
 {
 	/* §7.7: all seven rows, exactly one outcome each. */
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_BEFORE_SOURCE_PROOF),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_DURING_TARGET_WRITE),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_WRITE_BEFORE_DURABILITY),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_DURABILITY_BEFORE_POST_READ),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_POST_READ_BEFORE_RELEASE),
-				 (int) CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_RELEASE),
-				 (int) CLUSTER_PAGE_OUTCOME_APPLY);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_BEFORE_SOURCE_PROOF),
+				 (int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF),
+				 (int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_DURING_TARGET_WRITE),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ(
+		(int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_WRITE_BEFORE_DURABILITY),
+		(int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ(
+		(int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_DURABILITY_BEFORE_POST_READ),
+		(int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ(
+		(int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_POST_READ_BEFORE_RELEASE),
+		(int)CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_RELEASE),
+				 (int)CLUSTER_PAGE_OUTCOME_APPLY);
 	/* Unknown cut: fail closed. */
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 (ClusterPageCrashCut) 99),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict((ClusterPageCrashCut)99),
+				 (int)CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS);
 }
 
 UT_TEST(test_proof_surface_fields)
@@ -184,13 +170,13 @@ UT_TEST(test_proof_surface_fields)
 	p.durability_barrier_ok = true;
 	p.post_read_ok = true;
 	p.authority_revalidated = true;
-	UT_ASSERT_EQ((int) p.failed_origin_thread, 2);
-	UT_ASSERT_EQ((int) p.page_class, (int) CLUSTER_PAGE_CLASS_NORMAL);
-	UT_ASSERT(p.contributor_coverage && p.durability_barrier_ok
-			  && p.post_read_ok && p.authority_revalidated);
+	UT_ASSERT_EQ((int)p.failed_origin_thread, 2);
+	UT_ASSERT_EQ((int)p.page_class, (int)CLUSTER_PAGE_CLASS_NORMAL);
+	UT_ASSERT(p.contributor_coverage && p.durability_barrier_ok && p.post_read_ok
+			  && p.authority_revalidated);
 	/* A proof without the post-read result is not a proof: the caller
 	 * must fail to produce it (field-level contract, PU-30). */
-	UT_ASSERT_EQ((unsigned long long) p.post_read_version.token, 0ULL);
+	UT_ASSERT_EQ((unsigned long long)p.post_read_version.token, 0ULL);
 }
 
 /* STOP-06 product TDD (implementation): the §7.2 mutation chain
@@ -222,24 +208,23 @@ UT_TEST(test_mutation_chain_full_sequence)
 
 	/* Full §7.2 chain: WAL-before-data -> durability barrier -> canonical
 	 * post-read -> fresh authority -> released. */
-	r = cluster_page_apply_step_durability(
-		CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED, true);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE);
-	UT_ASSERT_EQ((int) r.outcome, (int) CLUSTER_PAGE_OUTCOME_APPLY);
+	r = cluster_page_apply_step_durability(CLUSTER_PAGE_STATE_WAL_BEFORE_DATA_SATISFIED, true);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_PAGE_WRITE_DURABLE);
+	UT_ASSERT_EQ((int)r.outcome, (int)CLUSTER_PAGE_OUTCOME_APPLY);
 	r = cluster_page_apply_step_post_read(r.state, true);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_POST_READ_VERIFIED);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_POST_READ_VERIFIED);
 	r = cluster_page_apply_step_authority(r.state, true);
-	UT_ASSERT_EQ((int) r.state, (int) CLUSTER_PAGE_STATE_RESOURCE_RELEASED);
-	UT_ASSERT_EQ((int) r.outcome, (int) CLUSTER_PAGE_OUTCOME_APPLY);
+	UT_ASSERT_EQ((int)r.state, (int)CLUSTER_PAGE_STATE_RESOURCE_RELEASED);
+	UT_ASSERT_EQ((int)r.outcome, (int)CLUSTER_PAGE_OUTCOME_APPLY);
 
 	/* STOP gate at chain level (PL-03 / §7.6): the mid-write cut is a
 	 * permanent wedge — the chain outcome is STABLE_BASE_UNRESOLVED and
 	 * no step may be attempted past it (mutation = 0 while the STOP
 	 * holds; U-SIDE-18: no config/test override exists). */
-	UT_ASSERT_EQ((int) cluster_page_apply_midwrite_cut(),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
-	UT_ASSERT_EQ((int) cluster_page_apply_midwrite_cut(),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ((int)cluster_page_apply_midwrite_cut(),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ((int)cluster_page_apply_midwrite_cut(),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
 }
 
 int

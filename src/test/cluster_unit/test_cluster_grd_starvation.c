@@ -404,10 +404,9 @@ cluster_thread_recovery_launch_workers(const uint64 *dead pg_attribute_unused(),
 {}
 
 bool
-cluster_reconfig_rejoin_failure_snapshot(
-	int32 old_node_id pg_attribute_unused(),
-	uint64 old_incarnation pg_attribute_unused(),
-	ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
+cluster_reconfig_rejoin_failure_snapshot(int32 old_node_id pg_attribute_unused(),
+										 uint64 old_incarnation pg_attribute_unused(),
+										 ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
 {
 	if (out_failure != NULL)
 		memset(out_failure, 0, sizeof(*out_failure));
@@ -641,15 +640,34 @@ GetNamedLWLockTranche(const char *tranche_name pg_attribute_unused())
 	return dummy_locks;
 }
 
+static LWLock *held_locks[8];
+static int held_lock_count;
+
 bool
-LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
+LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
+	if (held_lock_count >= lengthof(held_locks))
+		abort();
+	held_locks[held_lock_count++] = lock;
 	return true;
 }
 
 void
-LWLockRelease(LWLock *lock pg_attribute_unused())
-{}
+LWLockRelease(LWLock *lock)
+{
+	if (held_lock_count <= 0 || held_locks[held_lock_count - 1] != lock)
+		abort();
+	held_lock_count--;
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	for (int i = 0; i < held_lock_count; i++)
+		if (held_locks[i] == lock)
+			return true;
+	return false;
+}
 
 /* spec-2.23 D6 stub: PG exported DoLockModesConflict — cluster_grd.c
  * uses this in enqueue_or_grant / release_and_pop_compatible_waiter.
@@ -939,8 +957,7 @@ cluster_clean_leave_node_refuses_writes(void)
 
 void
 cluster_lmon_wakeup(void)
-{
-}
+{}
 
 uint64
 cluster_lms_get_lms_restart_generation(void)

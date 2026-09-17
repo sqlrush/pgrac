@@ -85,8 +85,7 @@ read_u16_le(const uint8 *src)
 static uint32
 read_u32_le(const uint8 *src)
 {
-	return (uint32)src[0] | ((uint32)src[1] << 8) | ((uint32)src[2] << 16)
-		   | ((uint32)src[3] << 24);
+	return (uint32)src[0] | ((uint32)src[1] << 8) | ((uint32)src[2] << 16) | ((uint32)src[3] << 24);
 }
 
 static uint64
@@ -100,8 +99,7 @@ read_u64_le(const uint8 *src)
 	return value;
 }
 
-static void make_file_token(const ControlRootImage *image,
-						   ClusterControlRootFileToken *token);
+static void make_file_token(const ControlRootImage *image, ClusterControlRootFileToken *token);
 
 static void
 write_u16_le(uint8 *dst, uint16 value)
@@ -181,16 +179,14 @@ bool
 cluster_control_root_identity_equal(const ClusterControlRootIdentity *left,
 									const ClusterControlRootIdentity *right)
 {
-	return left != NULL && right != NULL
-		   && left->system_identifier == right->system_identifier
+	return left != NULL && right != NULL && left->system_identifier == right->system_identifier
 		   && memcmp(left->storage_uuid, right->storage_uuid, 16) == 0
 		   && memcmp(left->authority_uuid, right->authority_uuid, 16) == 0
-		   && left->origin_thread_id == right->origin_thread_id
-		   && left->reserved42 == 0 && right->reserved42 == 0
-		   && left->origin_node_id == right->origin_node_id
+		   && left->origin_thread_id == right->origin_thread_id && left->reserved42 == 0
+		   && right->reserved42 == 0 && left->origin_node_id == right->origin_node_id
 		   && left->thread_claim_created_at == right->thread_claim_created_at
-		   && left->thread_claim_crc32c == right->thread_claim_crc32c
-		   && left->reserved60 == 0 && right->reserved60 == 0
+		   && left->thread_claim_crc32c == right->thread_claim_crc32c && left->reserved60 == 0
+		   && right->reserved60 == 0
 		   && left->origin_owner_incarnation == right->origin_owner_incarnation
 		   && left->root_lineage_seq == right->root_lineage_seq;
 }
@@ -240,8 +236,7 @@ control_paths_safe(void)
 	if (!build_control_path(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH)
 		|| !build_control_path(bak, sizeof(bak), CLUSTER_CONTROL_ROOT_BAK_REL_PATH))
 		return false;
-	return regular_or_absent_nosymlink(primary, true)
-		   && regular_or_absent_nosymlink(bak, true);
+	return regular_or_absent_nosymlink(primary, true) && regular_or_absent_nosymlink(bak, true);
 }
 
 static int
@@ -302,9 +297,8 @@ static bool
 snapshot_reserved_zero(const ClusterControlRootSnapshot *snapshot)
 {
 	return snapshot->identity.reserved42 == 0 && snapshot->identity.reserved60 == 0
-		   && snapshot->reserved96 == 0 && snapshot->reserved122 == 0
-		   && snapshot->reserved124 == 0 && snapshot->reserved160 == 0
-		   && snapshot->reserved208 == 0;
+		   && snapshot->reserved96 == 0 && snapshot->reserved122 == 0 && snapshot->reserved124 == 0
+		   && snapshot->reserved160 == 0 && snapshot->reserved208 == 0;
 }
 
 static ClusterControlRootResult
@@ -346,12 +340,10 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 	tail_valid = (flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) != 0;
 	recovered_valid = (flags & CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID) != 0;
 	tail_last_valid = (flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID) != 0;
-	recovered_last_valid =
-		(flags & CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID) != 0;
+	recovered_last_valid = (flags & CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID) != 0;
 	bound_valid = (flags & CLUSTER_CONTROL_ROOT_FLAG_CONSERVATIVE_SCN_VALID) != 0;
 
-	if (!checkpoint_valid || snapshot->checkpoint_tli == 0
-		|| snapshot->checkpoint_lower_lsn == 0
+	if (!checkpoint_valid || snapshot->checkpoint_tli == 0 || snapshot->checkpoint_lower_lsn == 0
 		|| snapshot->checkpoint_record_crc32c == 0
 		|| (snapshot->checkpoint_source_kind != CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1
 			&& snapshot->checkpoint_source_kind
@@ -359,8 +351,7 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (tail_valid) {
 		if (snapshot->tail_tli == 0
-			|| snapshot->tail_validation_kind
-				   != CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1
+			|| snapshot->tail_validation_kind != CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1
 			|| snapshot->validated_tail_lsn_exclusive < snapshot->checkpoint_lower_lsn)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		if (snapshot->validated_tail_lsn_exclusive == snapshot->checkpoint_lower_lsn) {
@@ -369,20 +360,17 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		} else if (!tail_last_valid || snapshot->tail_last_record_lsn == 0
 				   || snapshot->tail_last_record_crc32c == 0
-				   || snapshot->tail_last_record_lsn
-					  >= snapshot->validated_tail_lsn_exclusive)
+				   || snapshot->tail_last_record_lsn >= snapshot->validated_tail_lsn_exclusive)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	} else if (snapshot->tail_tli != 0 || snapshot->tail_validation_kind != 0
 			   || snapshot->validated_tail_lsn_exclusive != 0 || tail_last_valid
-			   || snapshot->tail_last_record_lsn != 0
-			   || snapshot->tail_last_record_crc32c != 0)
+			   || snapshot->tail_last_record_lsn != 0 || snapshot->tail_last_record_crc32c != 0)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 
 	if (recovered_valid) {
 		if (!tail_valid || snapshot->recovered_tli == 0
 			|| snapshot->recovered_through_lsn_exclusive < snapshot->checkpoint_lower_lsn
-			|| snapshot->recovered_through_lsn_exclusive
-				   > snapshot->validated_tail_lsn_exclusive)
+			|| snapshot->recovered_through_lsn_exclusive > snapshot->validated_tail_lsn_exclusive)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		if (snapshot->recovered_through_lsn_exclusive == snapshot->checkpoint_lower_lsn) {
 			if (recovered_last_valid || snapshot->recovered_last_record_lsn != 0
@@ -391,19 +379,17 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 		} else if (!recovered_last_valid || snapshot->recovered_last_record_lsn == 0
 				   || snapshot->recovered_last_record_crc32c == 0
 				   || snapshot->recovered_last_record_lsn
-					  >= snapshot->recovered_through_lsn_exclusive)
+						  >= snapshot->recovered_through_lsn_exclusive)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	} else if (snapshot->recovered_tli != 0 || recovered_last_valid
 			   || snapshot->recovered_last_record_lsn != 0
 			   || snapshot->recovered_last_record_crc32c != 0
 			   || (snapshot->recovered_through_lsn_exclusive != 0
-				   && snapshot->recovered_through_lsn_exclusive
-					  != snapshot->checkpoint_lower_lsn))
+				   && snapshot->recovered_through_lsn_exclusive != snapshot->checkpoint_lower_lsn))
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 
 	if (bound_valid) {
-		if (snapshot->conservative_bound_kind
-				!= CLUSTER_CONTROL_ROOT_BOUND_R14_M1_PARTITION_S_V1
+		if (snapshot->conservative_bound_kind != CLUSTER_CONTROL_ROOT_BOUND_R14_M1_PARTITION_S_V1
 			|| snapshot->conservative_commit_scn == 0)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	} else if (snapshot->conservative_bound_kind != CLUSTER_CONTROL_ROOT_BOUND_NONE
@@ -416,9 +402,8 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 }
 
 static void
-encode_record(uint8 *dst, const ClusterControlRootSnapshot *snapshot,
-			  uint64 publisher_incarnation, uint32 publisher_node,
-			  ClusterControlRootPublishReason reason)
+encode_record(uint8 *dst, const ClusterControlRootSnapshot *snapshot, uint64 publisher_incarnation,
+			  uint32 publisher_node, ClusterControlRootPublishReason reason)
 {
 	memset(dst, 0, CLUSTER_CONTROL_ROOT_RECORD_BYTES);
 	memcpy(dst, CONTROL_ROOT_RECORD_MAGIC, 4);
@@ -555,9 +540,9 @@ encode_header(ControlRootImage *image)
 	write_u32_le(dst + 76, image->header.activation_state);
 	write_u64_le(dst + 80, (uint64)image->header.created_at_usec);
 	write_u64_le(dst + 88, (uint64)image->header.published_at_usec);
-	image->header.body_crc32c = control_root_crc(
-		image->bytes + CONTROL_ROOT_BODY_OFFSET,
-		CLUSTER_CONTROL_ROOT_FILE_BYTES - CONTROL_ROOT_BODY_OFFSET);
+	image->header.body_crc32c
+		= control_root_crc(image->bytes + CONTROL_ROOT_BODY_OFFSET,
+						   CLUSTER_CONTROL_ROOT_FILE_BYTES - CONTROL_ROOT_BODY_OFFSET);
 	write_u32_le(dst + 96, image->header.body_crc32c);
 	memcpy(dst + 100, image->header.migration_round_sha256, PG_SHA256_DIGEST_LENGTH);
 	memcpy(dst + 132, image->header.source_wal_state_sha256, PG_SHA256_DIGEST_LENGTH);
@@ -626,19 +611,18 @@ decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 curre
 		|| !cluster_control_root_feature_bitmap_is_known(image->header.source_feature_bitmap)
 		|| !cluster_control_root_feature_bitmap_is_known(image->header.target_feature_bitmap)
 		|| (image->header.target_feature_bitmap
-			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0)
+			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1)
+			   == 0)
 		return CLUSTER_CONTROL_ROOT_MIXED_VERSION;
 	if (image->header.body_crc32c
 		!= control_root_crc(src + CONTROL_ROOT_BODY_OFFSET,
-						CLUSTER_CONTROL_ROOT_FILE_BYTES - CONTROL_ROOT_BODY_OFFSET))
+							CLUSTER_CONTROL_ROOT_FILE_BYTES - CONTROL_ROOT_BODY_OFFSET))
 		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
 
 	for (i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; i++) {
 		ClusterControlRootResult result = decode_record(
-			src + CLUSTER_CONTROL_ROOT_HEADER_BYTES
-				+ (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
-			(uint16)(i + 1), &image->header, &image->records[i],
-			&image->record_crc32c[i]);
+			src + CLUSTER_CONTROL_ROOT_HEADER_BYTES + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
+			(uint16)(i + 1), &image->header, &image->records[i], &image->record_crc32c[i]);
 
 		if (result == CLUSTER_CONTROL_ROOT_ABSENT)
 			continue;
@@ -701,14 +685,15 @@ same_immutable_header(const ControlRootImage *left, const ControlRootImage *righ
 	return left->header.system_identifier == right->header.system_identifier
 		   && memcmp(left->header.storage_uuid, right->header.storage_uuid, 16) == 0
 		   && memcmp(left->header.authority_uuid, right->header.authority_uuid, 16) == 0
-		   && memcmp(left->header.migration_round_sha256,
-					 right->header.migration_round_sha256, PG_SHA256_DIGEST_LENGTH) == 0
-		   && memcmp(left->header.source_wal_state_sha256,
-					 right->header.source_wal_state_sha256, PG_SHA256_DIGEST_LENGTH) == 0
+		   && memcmp(left->header.migration_round_sha256, right->header.migration_round_sha256,
+					 PG_SHA256_DIGEST_LENGTH)
+				  == 0
+		   && memcmp(left->header.source_wal_state_sha256, right->header.source_wal_state_sha256,
+					 PG_SHA256_DIGEST_LENGTH)
+				  == 0
 		   && left->header.migration_prepare_generation
 				  == right->header.migration_prepare_generation
-		   && left->header.migration_transition_epoch
-				  == right->header.migration_transition_epoch
+		   && left->header.migration_transition_epoch == right->header.migration_transition_epoch
 		   && left->header.source_feature_bitmap == right->header.source_feature_bitmap
 		   && left->header.target_feature_bitmap == right->header.target_feature_bitmap;
 }
@@ -738,8 +723,7 @@ read_canonical_pair(ControlRootImage *primary, ControlRootImage *bak)
 			if (!same_immutable_header(primary, bak)
 				|| bak->header.file_txn_seq > primary->header.file_txn_seq
 				|| (bak->header.file_txn_seq == primary->header.file_txn_seq
-					&& memcmp(primary->bytes, bak->bytes,
-							  CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0))
+					&& memcmp(primary->bytes, bak->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0))
 				return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
 			return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 		}
@@ -793,29 +777,25 @@ cluster_control_root_restore_bit22_latch_if_active(void)
 	 * — a REAL durable OPEN(P+2) record reads back nonzero, so the flag
 	 * must NOT gate the restore (a post-bit22 restart would never re-arm
 	 * the latch and the control-plane gates would stay closed). */
-	qv_result = cluster_qvotec_bootstrap_read_semantic_activation(
-		selected, &implicit_open);
-	(void) implicit_open;
+	qv_result = cluster_qvotec_bootstrap_read_semantic_activation(selected, &implicit_open);
+	(void)implicit_open;
 	if (qv_result != CLUSTER_SEMANTIC_ACTIVATION_OK
-		|| !cluster_semantic_activation_record_decode(
-			selected, &open, NULL)
+		|| !cluster_semantic_activation_record_decode(selected, &open, NULL)
 		|| open.phase != CLUSTER_SEMANTIC_PHASE_OPEN)
 		return false;
 	root_result = read_canonical_pair(&primary, &bak);
 	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return false;
-	if (primary.header.activation_state
-			!= CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+	if (primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| (primary.header.target_feature_bitmap
-			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0
+			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1)
+			   == 0
 		|| primary.header.migration_transition_epoch != open.transition_epoch
 		|| primary.header.migration_prepare_generation == UINT64_MAX
-		|| primary.header.migration_prepare_generation + 2
-		   != open.record_generation)
+		|| primary.header.migration_prepare_generation + 2 != open.record_generation)
 		return false;
-	return cluster_r4_bit22_cutover_latch_apply(
-		open.transition_epoch, open.record_generation);
+	return cluster_r4_bit22_cutover_latch_apply(open.transition_epoch, open.record_generation);
 }
 
 /*
@@ -829,25 +809,21 @@ cluster_control_root_restore_bit22_latch_if_active(void)
  */
 ClusterControlRootResult
 cluster_control_root_bootstrap_validate_active_round(
-	const ClusterControlRootMigrationRoundV1 *round,
-	ClusterControlRootFileToken *token)
+	const ClusterControlRootMigrationRoundV1 *round, ClusterControlRootFileToken *token)
 {
 	ControlRootImage primary;
 	ControlRootImage bak;
 	uint8 sha[PG_SHA256_DIGEST_LENGTH];
 	ClusterControlRootResult result;
 
-	if (round == NULL
-		|| !cluster_control_root_round_sha256(round, sha))
+	if (round == NULL || !cluster_control_root_round_sha256(round, sha))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = read_canonical_pair(&primary, &bak);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
-	if (primary.header.activation_state
-			!= CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
-		|| memcmp(primary.header.migration_round_sha256, sha,
-				  PG_SHA256_DIGEST_LENGTH) != 0)
+	if (primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| memcmp(primary.header.migration_round_sha256, sha, PG_SHA256_DIGEST_LENGTH) != 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (token != NULL)
 		make_file_token(&primary, token);
@@ -869,9 +845,10 @@ cluster_control_root_bootstrap_validate_active_round(
  * read_canonical_pair; read-only, grants no token authority.
  */
 ClusterControlRootResult
-cluster_control_root_bootstrap_validate_active_round_fields(
-	uint64 transition_epoch, uint64 prepare_generation,
-	uint64 source_feature_bitmap, uint64 target_feature_bitmap)
+cluster_control_root_bootstrap_validate_active_round_fields(uint64 transition_epoch,
+															uint64 prepare_generation,
+															uint64 source_feature_bitmap,
+															uint64 target_feature_bitmap)
 {
 	ControlRootImage primary;
 	ControlRootImage bak;
@@ -881,8 +858,7 @@ cluster_control_root_bootstrap_validate_active_round_fields(
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
-	if (primary.header.activation_state
-			!= CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+	if (primary.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
 		|| primary.header.migration_transition_epoch != transition_epoch
 		|| primary.header.migration_prepare_generation != prepare_generation
 		|| primary.header.source_feature_bitmap != source_feature_bitmap
@@ -912,8 +888,7 @@ make_read_token(const ControlRootImage *image, uint16 thread_id, uint8 source,
 }
 
 static bool
-read_token_equal(const ClusterControlRootReadToken *left,
-				 const ClusterControlRootReadToken *right)
+read_token_equal(const ClusterControlRootReadToken *left, const ClusterControlRootReadToken *right)
 {
 	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
 }
@@ -940,10 +915,10 @@ release_cf(LOCKMODE mode, ClusterControlRootResult result)
 
 ClusterControlRootResult
 cluster_control_root_read_canonical(uint16 origin_thread_id,
-								const ClusterControlRootIdentity *expected_identity,
-								ClusterControlRootReadMode mode,
-								ClusterControlRootSnapshot *out_snapshot,
-								ClusterControlRootReadToken *out_token)
+									const ClusterControlRootIdentity *expected_identity,
+									ClusterControlRootReadMode mode,
+									ClusterControlRootSnapshot *out_snapshot,
+									ClusterControlRootReadToken *out_token)
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -981,8 +956,8 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	if ((result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		&& expected_identity != NULL
-		&& !cluster_control_root_identity_equal(
-			expected_identity, &primary->records[origin_thread_id - 1].identity))
+		&& !cluster_control_root_identity_equal(expected_identity,
+												&primary->records[origin_thread_id - 1].identity))
 		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
@@ -994,7 +969,7 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 			 * bound phase-4 revalidation — upgrade a bootstrapped bit22
 			 * latch to TARGET_VERIFIED (the serving/admission gate).
 			 * Idempotent; a SOURCE latch is left untouched. */
-			(void) cluster_r4_bit22_cutover_latch_verify();
+			(void)cluster_r4_bit22_cutover_latch_verify();
 		}
 	}
 	pfree(bak);
@@ -1025,9 +1000,9 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
  *	decision directly.
  */
 ClusterControlRootResult
-cluster_control_root_read_canonical_discovered(
-	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot,
-	ClusterControlRootReadToken *out_token)
+cluster_control_root_read_canonical_discovered(uint16 origin_thread_id,
+											   ClusterControlRootSnapshot *out_snapshot,
+											   ClusterControlRootReadToken *out_token)
 {
 	ClusterControlRootSnapshot bootstrap;
 	ClusterControlRootIdentity discovered;
@@ -1041,15 +1016,13 @@ cluster_control_root_read_canonical_discovered(
 		memset(out_token, 0, sizeof(*out_token));
 	memset(&bootstrap, 0, sizeof(bootstrap));
 	result = cluster_control_root_read_canonical(
-		origin_thread_id, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,
-		&bootstrap, NULL);
+		origin_thread_id, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE, &bootstrap, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
 	discovered = bootstrap.identity;
 	return cluster_control_root_read_canonical(
-		origin_thread_id, &discovered, CLUSTER_CONTROL_ROOT_READ_STRONG,
-		out_snapshot, out_token);
+		origin_thread_id, &discovered, CLUSTER_CONTROL_ROOT_READ_STRONG, out_snapshot, out_token);
 }
 
 /*
@@ -1068,8 +1041,8 @@ cluster_control_root_read_canonical_discovered(
  *	remaster -> unfreeze -> CF-shard-NORMAL deadlock.
  */
 ClusterControlRootResult
-cluster_control_root_read_canonical_dead_origin(
-	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot)
+cluster_control_root_read_canonical_dead_origin(uint16 origin_thread_id,
+												ClusterControlRootSnapshot *out_snapshot)
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -1077,8 +1050,7 @@ cluster_control_root_read_canonical_dead_origin(
 
 	if (out_snapshot != NULL)
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
-	if (origin_thread_id == 0
-		|| origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+	if (origin_thread_id == 0 || origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = storage_contract_check(NULL, false);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1103,9 +1075,9 @@ cluster_control_root_read_canonical_dead_origin(
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
-										  ClusterControlRootIdentity *out_identity,
-										  ClusterControlRootSnapshot *out_snapshot,
-										  ClusterControlRootReadToken *out_token)
+												  ClusterControlRootIdentity *out_identity,
+												  ClusterControlRootSnapshot *out_snapshot,
+												  ClusterControlRootReadToken *out_token)
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -1164,16 +1136,14 @@ encode_round(const ClusterControlRootMigrationRoundV1 *round, uint8 bytes[80])
 	if (round == NULL || memcmp(round->magic, "PCRM", 4) != 0 || round->version != 1
 		|| round->bytes != sizeof(*round) || round->prepare_generation == 0
 		|| round->coordinator_incarnation == 0
-		|| round->coordinator_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| round->reserved76 != 0
+		|| round->coordinator_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT || round->reserved76 != 0
 		|| !cluster_control_root_feature_bitmap_is_known(round->source_feature_bitmap)
 		|| !cluster_control_root_feature_bitmap_is_known(round->target_feature_bitmap)
 		/* STOP04 §11.7: this package has no selected/certified production
 		 * provider, so a migration image must not activate bit24. */
-		|| (round->target_feature_bitmap &
-			PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1) != 0
-		|| (round->target_feature_bitmap
-			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0)
+		|| (round->target_feature_bitmap & PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1) != 0
+		|| (round->target_feature_bitmap & PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1)
+			   == 0)
 		return false;
 	memset(bytes, 0, 80);
 	memcpy(bytes, "PCRM", 4);
@@ -1212,7 +1182,7 @@ migration_image_validate(const ClusterControlRootMigrationImage *image,
 			continue;
 		}
 		if (snapshot_validate(snapshot, (uint16)(i + 1), image->system_identifier,
-							 image->storage_uuid, image->authority_uuid)
+							  image->storage_uuid, image->authority_uuid)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return false;
 		if (snapshot->identity.root_lineage_seq != 1)
@@ -1225,8 +1195,7 @@ migration_image_validate(const ClusterControlRootMigrationImage *image,
 }
 
 static bool
-read_thread_claim_exact(uint16 thread_id, int32 node_id,
-						const ClusterControlRootIdentity *expected)
+read_thread_claim_exact(uint16 thread_id, int32 node_id, const ClusterControlRootIdentity *expected)
 {
 	ClusterWalThreadClaim claim;
 	char dirname[MAXPGPATH];
@@ -1242,14 +1211,12 @@ read_thread_claim_exact(uint16 thread_id, int32 node_id,
 	if (dirname[0] == '\0' || written <= 0 || (size_t)written >= sizeof(dirpath)
 		|| lstat(dirpath, &st) != 0 || !S_ISDIR(st.st_mode))
 		return false;
-	written = snprintf(path, sizeof(path), "%s/%s", dirpath,
-					   CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+	written = snprintf(path, sizeof(path), "%s/%s", dirpath, CLUSTER_WAL_THREAD_CLAIM_FILENAME);
 	if (written <= 0 || (size_t)written >= sizeof(path)
 		|| !regular_or_absent_nosymlink(path, false))
 		return false;
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)
-		|| st.st_size != sizeof(claim)) {
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != sizeof(claim)) {
 		if (fd >= 0)
 			CloseTransientFile(fd);
 		return false;
@@ -1294,7 +1261,8 @@ read_source_wal_state(const ClusterControlRootSnapshot *expected_records,
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0'
 		|| lstat(cluster_wal_threads_dir, &st) != 0 || !S_ISDIR(st.st_mode)
 		|| snprintf(path, sizeof(path), "%s/%s", cluster_wal_threads_dir,
-					CLUSTER_WAL_STATE_FILENAME) <= 0
+					CLUSTER_WAL_STATE_FILENAME)
+			   <= 0
 		|| !regular_or_absent_nosymlink(path, false))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	first = palloc(CLUSTER_WAL_STATE_FILE_SIZE);
@@ -1323,8 +1291,8 @@ read_source_wal_state(const ClusterControlRootSnapshot *expected_records,
 			done += (size_t)n;
 		}
 		if (CloseTransientFile(fd) != 0
-			|| !cluster_wal_state_image_validate(dst, CLUSTER_WAL_STATE_FILE_SIZE,
-											 &bad_thread, &reason)) {
+			|| !cluster_wal_state_image_validate(dst, CLUSTER_WAL_STATE_FILE_SIZE, &bad_thread,
+												 &reason)) {
 			pfree(second);
 			pfree(first);
 			return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
@@ -1354,16 +1322,13 @@ read_source_wal_state(const ClusterControlRootSnapshot *expected_records,
 		}
 		if (verdict != CLUSTER_WAL_SLOT_OK
 			|| (slot.state != CLUSTER_WAL_SLOT_STATE_STOPPED
-				&& !(slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE
-					 && round != NULL
-					 && cluster_r4_bit22_source_close_current(
-						 round->transition_epoch,
-						 round->prepare_generation)))
+				&& !(slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE && round != NULL
+					 && cluster_r4_bit22_source_close_current(round->transition_epoch,
+															  round->prepare_generation)))
 			|| slot.checkpoint_redo_lsn == 0 || slot.merge_recovered_lsn != 0
 			|| expected->identity.system_identifier == 0
 			|| expected->identity.origin_node_id != slot.node_id
-			|| !read_thread_claim_exact((uint16)(i + 1), slot.node_id,
-									&expected->identity)) {
+			|| !read_thread_claim_exact((uint16)(i + 1), slot.node_id, &expected->identity)) {
 			pfree(second);
 			pfree(first);
 			return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
@@ -1382,8 +1347,7 @@ read_source_wal_state(const ClusterControlRootSnapshot *expected_records,
 	}
 	pfree(second);
 	pfree(first);
-	if (expected_hash != NULL
-		&& memcmp(expected_hash, hash_out, PG_SHA256_DIGEST_LENGTH) != 0)
+	if (expected_hash != NULL && memcmp(expected_hash, hash_out, PG_SHA256_DIGEST_LENGTH) != 0)
 		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -1428,9 +1392,9 @@ write_durable_image(const char *final_path, const uint8 *bytes)
 	base = strrchr(final_path, '/');
 	if (base == NULL)
 		return false;
-	if (snprintf(temp_path, sizeof(temp_path), "%.*s/%s.tmp.%d.%ld.%s",
-				 (int)(base - final_path), final_path, base + 1, cluster_node_id,
-				 (long)getpid(), suffix) <= 0)
+	if (snprintf(temp_path, sizeof(temp_path), "%.*s/%s.tmp.%d.%ld.%s", (int)(base - final_path),
+				 final_path, base + 1, cluster_node_id, (long)getpid(), suffix)
+		<= 0)
 		return false;
 	fd = BasicOpenFilePerm(temp_path, O_WRONLY | O_CREAT | O_EXCL | PG_BINARY, 0600);
 	if (fd < 0)
@@ -1491,8 +1455,7 @@ publish_initial_image(const ControlRootImage *image)
 		return false;
 	if (lstat(bak, &st) == 0 || errno != ENOENT)
 		return false;
-	return write_durable_image(bak, image->bytes)
-		   && write_durable_image(primary, image->bytes);
+	return write_durable_image(bak, image->bytes) && write_durable_image(primary, image->bytes);
 }
 
 static bool
@@ -1520,14 +1483,12 @@ make_file_token(const ControlRootImage *image, ClusterControlRootFileToken *toke
 	token->format_version = CONTROL_ROOT_FORMAT_VERSION;
 	token->record_count = CLUSTER_CONTROL_ROOT_RECORD_COUNT;
 	token->system_identifier = image->header.system_identifier;
-	if (!control_root_sha256(image->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES,
-						 token->image_sha256))
+	if (!control_root_sha256(image->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, token->image_sha256))
 		memset(token, 0, sizeof(*token));
 }
 
 static bool
-file_token_equal(const ClusterControlRootFileToken *left,
-				 const ClusterControlRootFileToken *right)
+file_token_equal(const ClusterControlRootFileToken *left, const ClusterControlRootFileToken *right)
 {
 	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
 }
@@ -1539,8 +1500,7 @@ file_token_equal(const ClusterControlRootFileToken *left,
  * write-once (spec-4.1), so this is the durable origin evidence.
  */
 static bool
-read_thread_claim_fields(uint16 thread_id, int32 node_id,
-						 ClusterControlRootIdentity *identity)
+read_thread_claim_fields(uint16 thread_id, int32 node_id, ClusterControlRootIdentity *identity)
 {
 	ClusterWalThreadClaim claim;
 	char dirname[MAXPGPATH];
@@ -1554,22 +1514,17 @@ read_thread_claim_fields(uint16 thread_id, int32 node_id,
 		return false;
 	cluster_wal_thread_dir_name(thread_id, dirname, sizeof(dirname));
 	if (dirname[0] == '\0'
-		|| snprintf(dirpath, sizeof(dirpath), "%s/%s",
-					cluster_wal_threads_dir, dirname) <= 0
-		|| (size_t)snprintf(dirpath, sizeof(dirpath), "%s/%s",
-							cluster_wal_threads_dir, dirname)
-		   >= sizeof(dirpath)
+		|| snprintf(dirpath, sizeof(dirpath), "%s/%s", cluster_wal_threads_dir, dirname) <= 0
+		|| (size_t)snprintf(dirpath, sizeof(dirpath), "%s/%s", cluster_wal_threads_dir, dirname)
+			   >= sizeof(dirpath)
 		|| lstat(dirpath, &st) != 0 || !S_ISDIR(st.st_mode))
 		return false;
-	if (snprintf(path, sizeof(path), "%s/%s", dirpath,
-				 CLUSTER_WAL_THREAD_CLAIM_FILENAME) <= 0
-		|| (size_t)snprintf(path, sizeof(path), "%s/%s", dirpath,
-							CLUSTER_WAL_THREAD_CLAIM_FILENAME)
-		   >= sizeof(path))
+	if (snprintf(path, sizeof(path), "%s/%s", dirpath, CLUSTER_WAL_THREAD_CLAIM_FILENAME) <= 0
+		|| (size_t)snprintf(path, sizeof(path), "%s/%s", dirpath, CLUSTER_WAL_THREAD_CLAIM_FILENAME)
+			   >= sizeof(path))
 		return false;
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)
-		|| st.st_size != sizeof(claim)) {
+	if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size != sizeof(claim)) {
 		if (fd >= 0)
 			CloseTransientFile(fd);
 		return false;
@@ -1601,15 +1556,13 @@ read_thread_claim_fields(uint16 thread_id, int32 node_id,
  */
 typedef struct MigrationWalReaderPrivate {
 	char thread_dir[MAXPGPATH];
-	uint32 tli;					/* stream TLI (from the wal-state slot) */
+	uint32 tli; /* stream TLI (from the wal-state slot) */
 } MigrationWalReaderPrivate;
 
 static void
-migration_wal_segment_open(XLogReaderState *state, XLogSegNo nextSegNo,
-						   TimeLineID *tli_p)
+migration_wal_segment_open(XLogReaderState *state, XLogSegNo nextSegNo, TimeLineID *tli_p)
 {
-	MigrationWalReaderPrivate *priv =
-		(MigrationWalReaderPrivate *) state->private_data;
+	MigrationWalReaderPrivate *priv = (MigrationWalReaderPrivate *)state->private_data;
 	char fname[MAXFNAMELEN];
 	char path[MAXPGPATH];
 	int written;
@@ -1620,7 +1573,7 @@ migration_wal_segment_open(XLogReaderState *state, XLogSegNo nextSegNo,
 	}
 	XLogFileName(fname, *tli_p, nextSegNo, state->segcxt.ws_segsize);
 	written = snprintf(path, sizeof(path), "%s/%s", priv->thread_dir, fname);
-	if (written <= 0 || (size_t) written >= sizeof(path)) {
+	if (written <= 0 || (size_t)written >= sizeof(path)) {
 		state->seg.ws_file = -1;
 		return;
 	}
@@ -1642,12 +1595,10 @@ migration_wal_segment_close(XLogReaderState *state)
 }
 
 static int
-migration_wal_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
-						int reqLen, XLogRecPtr targetRecPtr,
-						char *cur_page)
+migration_wal_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr, int reqLen,
+						XLogRecPtr targetRecPtr, char *cur_page)
 {
-	MigrationWalReaderPrivate *priv =
-		(MigrationWalReaderPrivate *) state->private_data;
+	MigrationWalReaderPrivate *priv = (MigrationWalReaderPrivate *)state->private_data;
 	WALReadError errinfo;
 
 	/* WALRead drives segment_open/close and pg_pread; a short read or a
@@ -1655,8 +1606,7 @@ migration_wal_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
 	 * reader treats as EOF. */
 	if (priv == NULL)
 		return XLREAD_FAIL;
-	if (!WALRead(state, cur_page, targetPagePtr, XLOG_BLCKSZ, priv->tli,
-				 &errinfo))
+	if (!WALRead(state, cur_page, targetPagePtr, XLOG_BLCKSZ, priv->tli, &errinfo))
 		return XLREAD_WOULDBLOCK;
 	return XLOG_BLCKSZ;
 }
@@ -1669,9 +1619,8 @@ migration_wal_read_page(XLogReaderState *state, XLogRecPtr targetPagePtr,
  * then cannot pass migration_image_validate — the round stays un-begun).
  */
 static bool
-migration_wal_scan(uint16 thread_id, uint32 tli, XLogRecPtr checkpoint_redo,
-				   XLogRecPtr write_pos, uint32 *out_ckpt_crc,
-				   XLogRecPtr *out_tail_last_lsn, uint32 *out_tail_last_crc)
+migration_wal_scan(uint16 thread_id, uint32 tli, XLogRecPtr checkpoint_redo, XLogRecPtr write_pos,
+				   uint32 *out_ckpt_crc, XLogRecPtr *out_tail_last_lsn, uint32 *out_tail_last_crc)
 {
 	MigrationWalReaderPrivate priv;
 	XLogReaderState *reader;
@@ -1680,10 +1629,8 @@ migration_wal_scan(uint16 thread_id, uint32 tli, XLogRecPtr checkpoint_redo,
 	char *errormsg;
 	bool saw_checkpoint = false;
 
-	if (out_ckpt_crc == NULL || out_tail_last_lsn == NULL
-		|| out_tail_last_crc == NULL || tli == 0
-		|| XLogRecPtrIsInvalid(checkpoint_redo)
-		|| XLogRecPtrIsInvalid(write_pos)
+	if (out_ckpt_crc == NULL || out_tail_last_lsn == NULL || out_tail_last_crc == NULL || tli == 0
+		|| XLogRecPtrIsInvalid(checkpoint_redo) || XLogRecPtrIsInvalid(write_pos)
 		|| write_pos < checkpoint_redo)
 		return false;
 	*out_ckpt_crc = 0;
@@ -1696,11 +1643,12 @@ migration_wal_scan(uint16 thread_id, uint32 tli, XLogRecPtr checkpoint_redo,
 		priv.tli = tli;
 		cluster_wal_thread_dir_name(thread_id, dirname, sizeof(dirname));
 		if (dirname[0] == '\0'
-			|| snprintf(priv.thread_dir, sizeof(priv.thread_dir), "%s/%s",
-						cluster_wal_threads_dir, dirname) <= 0
-			|| (size_t)snprintf(priv.thread_dir, sizeof(priv.thread_dir),
-								"%s/%s", cluster_wal_threads_dir, dirname)
-			   >= sizeof(priv.thread_dir))
+			|| snprintf(priv.thread_dir, sizeof(priv.thread_dir), "%s/%s", cluster_wal_threads_dir,
+						dirname)
+				   <= 0
+			|| (size_t)snprintf(priv.thread_dir, sizeof(priv.thread_dir), "%s/%s",
+								cluster_wal_threads_dir, dirname)
+				   >= sizeof(priv.thread_dir))
 			return false;
 	}
 	reader = XLogReaderAllocate(wal_segment_size, NULL,
@@ -1718,7 +1666,7 @@ migration_wal_scan(uint16 thread_id, uint32 tli, XLogRecPtr checkpoint_redo,
 	for (;;) {
 		record = XLogReadRecord(reader, &errormsg);
 		if (record == NULL)
-			break;		/* clean end of stream */
+			break; /* clean end of stream */
 		if (!saw_checkpoint) {
 			/* The first record at the redo pointer is the checkpoint record. */
 			*out_ckpt_crc = record->xl_crc;
@@ -1750,9 +1698,8 @@ migration_wal_scan(uint16 thread_id, uint32 tli, XLogRecPtr checkpoint_redo,
  * refuses the round before any file is touched.
  */
 ClusterControlRootResult
-cluster_control_root_build_migration_image(
-	const ClusterControlRootMigrationRoundV1 *round,
-	ClusterControlRootMigrationImage *out)
+cluster_control_root_build_migration_image(const ClusterControlRootMigrationRoundV1 *round,
+										   ClusterControlRootMigrationImage *out)
 {
 	ClusterControlRootMigrationImage image;
 	uint8 current_uuid[16];
@@ -1777,7 +1724,8 @@ cluster_control_root_build_migration_image(
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0'
 		|| lstat(cluster_wal_threads_dir, &st) != 0 || !S_ISDIR(st.st_mode)
 		|| snprintf(path, sizeof(path), "%s/%s", cluster_wal_threads_dir,
-					CLUSTER_WAL_STATE_FILENAME) <= 0
+					CLUSTER_WAL_STATE_FILENAME)
+			   <= 0
 		|| !regular_or_absent_nosymlink(path, false))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	first = palloc(CLUSTER_WAL_STATE_FILE_SIZE);
@@ -1786,19 +1734,16 @@ cluster_control_root_build_migration_image(
 	 * rejects a torn read — the same guarantee the double-read in
 	 * read_source_wal_state provides, without re-reading per slot). */
 	fd = OpenTransientFile(path, O_RDONLY | PG_BINARY);
-	if (fd < 0 || fstat(fd, &st) != 0
-		|| st.st_size != CLUSTER_WAL_STATE_FILE_SIZE) {
+	if (fd < 0 || fstat(fd, &st) != 0 || st.st_size != CLUSTER_WAL_STATE_FILE_SIZE) {
 		if (fd >= 0)
 			CloseTransientFile(fd);
 		pfree(second);
 		pfree(first);
 		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
 	}
-	if (pg_pread(fd, first, CLUSTER_WAL_STATE_FILE_SIZE, 0)
-			!= CLUSTER_WAL_STATE_FILE_SIZE
+	if (pg_pread(fd, first, CLUSTER_WAL_STATE_FILE_SIZE, 0) != CLUSTER_WAL_STATE_FILE_SIZE
 		|| CloseTransientFile(fd) != 0
-		|| !cluster_wal_state_image_validate(
-			first, CLUSTER_WAL_STATE_FILE_SIZE, NULL, NULL)) {
+		|| !cluster_wal_state_image_validate(first, CLUSTER_WAL_STATE_FILE_SIZE, NULL, NULL)) {
 		pfree(second);
 		pfree(first);
 		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
@@ -1823,31 +1768,24 @@ cluster_control_root_build_migration_image(
 	 * first-open create_prepared (INVALID_ARGUMENT) at the very first
 	 * bit22 round — the fixture cast path never hit this because it
 	 * carries an externally-minted v4 UUID. */
-	image.authority_uuid[6] = (uint8) ((image.authority_uuid[6] & UINT8_C(0x0f))
-									   | UINT8_C(0x40));
-	image.authority_uuid[8] = (uint8) ((image.authority_uuid[8] & UINT8_C(0x3f))
-									   | UINT8_C(0x80));
+	image.authority_uuid[6] = (uint8)((image.authority_uuid[6] & UINT8_C(0x0f)) | UINT8_C(0x40));
+	image.authority_uuid[8] = (uint8)((image.authority_uuid[8] & UINT8_C(0x3f)) | UINT8_C(0x80));
 	image.created_at_usec = GetCurrentTimestamp();
 	for (i = 0; i < CLUSTER_WAL_STATE_SLOT_COUNT; i++) {
 		ClusterWalStateSlot slot;
 		ClusterWalSlotVerdict verdict;
 		ClusterControlRootSnapshot *record;
 
-		memcpy(&slot, first + CLUSTER_WAL_STATE_SLOT_OFFSET(i + 1),
-			   sizeof(slot));
-		verdict = cluster_wal_state_slot_classify(&slot, (uint16)(i + 1),
-												  -1, NULL);
+		memcpy(&slot, first + CLUSTER_WAL_STATE_SLOT_OFFSET(i + 1), sizeof(slot));
+		verdict = cluster_wal_state_slot_classify(&slot, (uint16)(i + 1), -1, NULL);
 		if (verdict == CLUSTER_WAL_SLOT_EMPTY)
 			continue;
-		if (verdict != CLUSTER_WAL_SLOT_OK
-			|| slot.checkpoint_redo_lsn == 0
+		if (verdict != CLUSTER_WAL_SLOT_OK || slot.checkpoint_redo_lsn == 0
 			|| slot.merge_recovered_lsn != 0
 			|| (slot.state != CLUSTER_WAL_SLOT_STATE_STOPPED
-				&& !(slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE
-					 && round != NULL
-					 && cluster_r4_bit22_source_close_current(
-						 round->transition_epoch,
-						 round->prepare_generation)))) {
+				&& !(slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE && round != NULL
+					 && cluster_r4_bit22_source_close_current(round->transition_epoch,
+															  round->prepare_generation)))) {
 			pfree(second);
 			pfree(first);
 			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -1861,17 +1799,15 @@ cluster_control_root_build_migration_image(
 		record->identity.origin_owner_incarnation
 			= cluster_membership_get_last_admitted_incarnation(slot.node_id);
 		if (record->identity.origin_owner_incarnation == 0
-			|| !read_thread_claim_fields((uint16)(i + 1), slot.node_id,
-										 &record->identity)) {
+			|| !read_thread_claim_fields((uint16)(i + 1), slot.node_id, &record->identity)) {
 			pfree(second);
 			pfree(first);
 			return CLUSTER_CONTROL_ROOT_IO_ERROR;
 		}
 		record->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
-		record->root_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
-							 | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
-							 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-							 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+		record->root_flags
+			= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+			  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 		/* RF-ROOT P9 verification (contract): every snapshot_validate field
 		 * must be backed — lineage/publish/kind/tli/CRC.  The record
 		 * CRCs (checkpoint + tail-last) come from the WAL stream via
@@ -1881,20 +1817,15 @@ cluster_control_root_build_migration_image(
 		record->root_publish_seq = 1;
 		record->checkpoint_lower_lsn = slot.checkpoint_redo_lsn;
 		record->checkpoint_tli = slot.tli;
-		record->checkpoint_source_kind
-			= CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+		record->checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
 		record->validated_tail_lsn_exclusive = slot.highest_lsn;
 		record->tail_tli = slot.tli;
-		record->tail_validation_kind
-			= CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+		record->tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
 		record->recovered_through_lsn_exclusive = slot.checkpoint_redo_lsn;
 		record->recovered_tli = slot.tli;
-		if (!migration_wal_scan(
-				(uint16)(i + 1), slot.tli, slot.checkpoint_redo_lsn,
-				slot.highest_lsn,
-				&record->checkpoint_record_crc32c,
-				&record->tail_last_record_lsn,
-				&record->tail_last_record_crc32c)) {
+		if (!migration_wal_scan((uint16)(i + 1), slot.tli, slot.checkpoint_redo_lsn,
+								slot.highest_lsn, &record->checkpoint_record_crc32c,
+								&record->tail_last_record_lsn, &record->tail_last_record_crc32c)) {
 			pfree(second);
 			pfree(first);
 			return CLUSTER_CONTROL_ROOT_IO_ERROR;
@@ -1907,13 +1838,10 @@ cluster_control_root_build_migration_image(
 		 * both zero).  Without the flag the live first-open image failed
 		 * migration_image_validate (RANGE_INVALID) and create_prepared
 		 * refused the round. */
-		if (record->tail_last_record_lsn != 0
-			&& record->tail_last_record_crc32c != 0)
-			record->root_flags
-				|= CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+		if (record->tail_last_record_lsn != 0 && record->tail_last_record_crc32c != 0)
+			record->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
 		record->published_at_usec = image.created_at_usec;
-		record->lifecycle_reason
-			= CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
+		record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
 		assigned++;
 	}
 	image.assigned_record_count = assigned;
@@ -1949,8 +1877,7 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 	result = storage_contract_check(image->storage_uuid, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!current_storage_uuid(current_uuid)
-		|| memcmp(current_uuid, image->storage_uuid, 16) != 0)
+	if (!current_storage_uuid(current_uuid) || memcmp(current_uuid, image->storage_uuid, 16) != 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -1968,26 +1895,23 @@ cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *ima
 	root->header.migration_transition_epoch = round->transition_epoch;
 	root->header.source_feature_bitmap = round->source_feature_bitmap;
 	root->header.target_feature_bitmap = round->target_feature_bitmap;
-	if (!control_root_sha256(round_bytes, sizeof(round_bytes),
-						 root->header.migration_round_sha256))
+	if (!control_root_sha256(round_bytes, sizeof(round_bytes), root->header.migration_round_sha256))
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	else
-		result = read_source_wal_state(image->records, NULL,
-								 root->header.source_wal_state_sha256,
-								 round);
+		result = read_source_wal_state(image->records, NULL, root->header.source_wal_state_sha256,
+									   round);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		for (i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; i++) {
 			if (image->records[i].identity.system_identifier == 0)
 				continue;
 			root->records[i] = image->records[i];
 			root->records[i].published_at_usec = GetCurrentTimestamp();
-			root->records[i].lifecycle_reason =
-				CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
+			root->records[i].lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
 			encode_record(root->bytes + CLUSTER_CONTROL_ROOT_HEADER_BYTES
-						  + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
-					  &root->records[i], round->coordinator_incarnation,
-					  round->coordinator_node_id,
-					  CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT);
+							  + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
+						  &root->records[i], round->coordinator_incarnation,
+						  round->coordinator_node_id,
+						  CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT);
 			root->present[i] = true;
 		}
 		encode_header(root);
@@ -2043,8 +1967,8 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 	/* The PREPARED token and round hash establish freshness only.  Activation
 	 * also requires the cutover owner's separately bound authority (the round
 	 * carries the coordinator identity + ACK-binding fields for the proof). */
-	if (!cluster_control_root_activate_authority_current_v1(
-			expected_token, expected_round_sha256, round))
+	if (!cluster_control_root_activate_authority_current_v1(expected_token, expected_round_sha256,
+															round))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -2061,12 +1985,12 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 		if (!file_token_equal(expected_token, &actual))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		else if (memcmp(primary->header.migration_round_sha256, expected_round_sha256,
-						PG_SHA256_DIGEST_LENGTH) != 0)
+						PG_SHA256_DIGEST_LENGTH)
+				 != 0)
 			result = CLUSTER_CONTROL_ROOT_MIGRATION_ROUND_MISMATCH;
 		else
-			result = read_source_wal_state(primary->records,
-								   primary->header.source_wal_state_sha256,
-								   source_hash, round);
+			result = read_source_wal_state(
+				primary->records, primary->header.source_wal_state_sha256, source_hash, round);
 	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
@@ -2086,14 +2010,13 @@ cluster_control_root_activate_prepared(const ClusterControlRootFileToken *expect
 				char path[MAXPGPATH];
 
 				if (!current_storage_uuid(current_uuid)
-					|| !build_control_path(path, sizeof(path),
-									   CLUSTER_CONTROL_ROOT_REL_PATH))
+					|| !build_control_path(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH))
 					result = CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 				else
 					result = read_one_image(path, current_uuid, GetSystemIdentifier(), readback);
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-					&& memcmp(readback->bytes, updated->bytes,
-							  CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+					&& memcmp(readback->bytes, updated->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES)
+						   != 0)
 					result = CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 					make_file_token(readback, &token);
@@ -2141,15 +2064,13 @@ reason_mask(ClusterControlRootPublishReason reason)
 }
 
 static bool
-patch_shape_valid(const ClusterControlRootPatch *patch,
-				  ClusterControlRootPublishReason reason)
+patch_shape_valid(const ClusterControlRootPatch *patch, ClusterControlRootPublishReason reason)
 {
 	ClusterControlRootSnapshot allowed;
 	uint64 mask = reason_mask(reason);
 
 	if (patch == NULL || mask == 0 || patch->mask != mask || patch->reserved20 != 0
-		|| patch->reserved24 != 0
-		|| patch->expected_lifecycle < CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| patch->reserved24 != 0 || patch->expected_lifecycle < CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 		|| patch->expected_lifecycle > CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED
 		|| (patch->expected_flags_mask & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) != 0
 		|| (patch->expected_flags_value & ~patch->expected_flags_mask) != 0
@@ -2157,8 +2078,7 @@ patch_shape_valid(const ClusterControlRootPatch *patch,
 		|| (patch->desired.root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) != 0)
 		return false;
 	if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
-		&& (patch->expected_lifecycle
-				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+		&& (patch->expected_lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 			|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 			|| patch->desired.identity.origin_owner_incarnation == 0
 			|| patch->desired.identity.root_lineage_seq == 0))
@@ -2174,13 +2094,11 @@ patch_shape_valid(const ClusterControlRootPatch *patch,
 	 * failure-recovery FSM instead.
 	 */
 	if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE
-		&& (patch->expected_lifecycle
-				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		&& (patch->expected_lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 			|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED))
 		return false;
 	if (reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
-		&& (patch->expected_lifecycle
-				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+		&& (patch->expected_lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 			|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 			|| patch->desired.identity.origin_owner_incarnation == 0
 			|| patch->desired.identity.root_lineage_seq == 0))
@@ -2189,8 +2107,8 @@ patch_shape_valid(const ClusterControlRootPatch *patch,
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE) != 0)
 		allowed.lifecycle = patch->desired.lifecycle;
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE) != 0) {
-		allowed.identity.origin_owner_incarnation =
-			patch->desired.identity.origin_owner_incarnation;
+		allowed.identity.origin_owner_incarnation
+			= patch->desired.identity.origin_owner_incarnation;
 		allowed.identity.root_lineage_seq = patch->desired.identity.root_lineage_seq;
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT) != 0) {
@@ -2208,20 +2126,19 @@ patch_shape_valid(const ClusterControlRootPatch *patch,
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS) != 0) {
 		allowed.recovered_tli = patch->desired.recovered_tli;
-		allowed.recovered_through_lsn_exclusive =
-			patch->desired.recovered_through_lsn_exclusive;
+		allowed.recovered_through_lsn_exclusive = patch->desired.recovered_through_lsn_exclusive;
 		allowed.recovered_last_record_lsn = patch->desired.recovered_last_record_lsn;
-		allowed.recovered_last_record_crc32c =
-			patch->desired.recovered_last_record_crc32c;
+		allowed.recovered_last_record_crc32c = patch->desired.recovered_last_record_crc32c;
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_CONSERVATIVE_BOUND) != 0) {
 		allowed.conservative_bound_kind = patch->desired.conservative_bound_kind;
 		allowed.conservative_commit_scn = patch->desired.conservative_commit_scn;
 	}
-	if ((mask & (CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT | CLUSTER_CONTROL_ROOT_PATCH_TAIL
-				 | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS
-				 | CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY
-				 | CLUSTER_CONTROL_ROOT_PATCH_CONSERVATIVE_BOUND)) != 0)
+	if ((mask
+		 & (CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT | CLUSTER_CONTROL_ROOT_PATCH_TAIL
+			| CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS | CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY
+			| CLUSTER_CONTROL_ROOT_PATCH_CONSERVATIVE_BOUND))
+		!= 0)
 		allowed.root_flags = patch->desired.root_flags;
 	return memcmp(&allowed, &patch->desired, sizeof(allowed)) == 0;
 }
@@ -2241,8 +2158,8 @@ apply_patch(ClusterControlRootSnapshot *snapshot, const ClusterControlRootPatch 
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE) != 0)
 		snapshot->lifecycle = patch->desired.lifecycle;
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE) != 0) {
-		snapshot->identity.origin_owner_incarnation =
-			patch->desired.identity.origin_owner_incarnation;
+		snapshot->identity.origin_owner_incarnation
+			= patch->desired.identity.origin_owner_incarnation;
 		snapshot->identity.root_lineage_seq = patch->desired.identity.root_lineage_seq;
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT) != 0) {
@@ -2251,7 +2168,7 @@ apply_patch(ClusterControlRootSnapshot *snapshot, const ClusterControlRootPatch 
 		snapshot->checkpoint_lower_lsn = patch->desired.checkpoint_lower_lsn;
 		snapshot->checkpoint_record_crc32c = patch->desired.checkpoint_record_crc32c;
 		merge_flag_group(&snapshot->root_flags, patch->desired.root_flags,
-					 CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID);
+						 CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID);
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_TAIL) != 0) {
 		snapshot->tail_tli = patch->desired.tail_tli;
@@ -2260,63 +2177,60 @@ apply_patch(ClusterControlRootSnapshot *snapshot, const ClusterControlRootPatch 
 		snapshot->tail_last_record_lsn = patch->desired.tail_last_record_lsn;
 		snapshot->tail_last_record_crc32c = patch->desired.tail_last_record_crc32c;
 		merge_flag_group(&snapshot->root_flags, patch->desired.root_flags,
-					 CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-						 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID);
+						 CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+							 | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID);
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS) != 0) {
 		snapshot->recovered_tli = patch->desired.recovered_tli;
-		snapshot->recovered_through_lsn_exclusive =
-			patch->desired.recovered_through_lsn_exclusive;
+		snapshot->recovered_through_lsn_exclusive = patch->desired.recovered_through_lsn_exclusive;
 		snapshot->recovered_last_record_lsn = patch->desired.recovered_last_record_lsn;
-		snapshot->recovered_last_record_crc32c =
-			patch->desired.recovered_last_record_crc32c;
+		snapshot->recovered_last_record_crc32c = patch->desired.recovered_last_record_crc32c;
 		merge_flag_group(&snapshot->root_flags, patch->desired.root_flags,
-					 CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
-						 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID);
+						 CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+							 | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID);
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_FPW_STICKY) != 0) {
 		if ((old_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0
 			&& (patch->desired.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) == 0)
 			return false;
 		merge_flag_group(&snapshot->root_flags, patch->desired.root_flags,
-					 CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF);
+						 CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF);
 	}
 	if ((mask & CLUSTER_CONTROL_ROOT_PATCH_CONSERVATIVE_BOUND) != 0) {
 		snapshot->conservative_bound_kind = patch->desired.conservative_bound_kind;
 		snapshot->conservative_commit_scn = patch->desired.conservative_commit_scn;
 		merge_flag_group(&snapshot->root_flags, patch->desired.root_flags,
-					 CLUSTER_CONTROL_ROOT_FLAG_CONSERVATIVE_SCN_VALID);
+						 CLUSTER_CONTROL_ROOT_FLAG_CONSERVATIVE_SCN_VALID);
 	}
 	return true;
 }
 
 static bool
-root_publish_requires_walr(ClusterControlRootPublishReason reason,
-						   bool *require_sealed_pin)
+root_publish_requires_walr(ClusterControlRootPublishReason reason, bool *require_sealed_pin)
 {
 	*require_sealed_pin = false;
 	switch (reason) {
-		case CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN:
-		case CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE:
-		case CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_DUTY_OPEN:
-		case CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_TAIL_VALIDATED:
-		case CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN:
-		case CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE:
-			return true;
-		case CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE:
-			*require_sealed_pin = true;
-			return true;
-		default:
-			return false;
+	case CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN:
+	case CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE:
+	case CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_DUTY_OPEN:
+	case CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_TAIL_VALIDATED:
+	case CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN:
+	case CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE:
+		return true;
+	case CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE:
+		*require_sealed_pin = true;
+		return true;
+	default:
+		return false;
 	}
 }
 
 ClusterControlRootResult
 cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
-									 const ClusterControlRootPatch *patch,
-									 ClusterControlRootPublishReason reason,
-									 ClusterControlRootSnapshot *out_snapshot,
-									 ClusterControlRootReadToken *out_token)
+										 const ClusterControlRootPatch *patch,
+										 ClusterControlRootPublishReason reason,
+										 ClusterControlRootSnapshot *out_snapshot,
+										 ClusterControlRootReadToken *out_token)
 {
 	ControlRootImage *primary;
 	ControlRootImage *bak;
@@ -2344,8 +2258,7 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 	/* RF-ROOT P5: the byte-exact CAS token proves root freshness, not caller
 	 * authority.  Consume the backend-private authority bound by the owning
 	 * publisher before CF acquisition or any file I/O. */
-	if (!cluster_control_root_publish_authority_current_v1(
-			expected_token, patch, reason))
+	if (!cluster_control_root_publish_authority_current_v1(expected_token, patch, reason))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	thread_id = expected_token->origin_thread_id;
 	if (root_publish_requires_walr(reason, &require_sealed_pin)) {
@@ -2361,8 +2274,7 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto release_walr;
-	if (!acquire_clusterwide_cf(ExclusiveLock))
-	{
+	if (!acquire_clusterwide_cf(ExclusiveLock)) {
 		result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		goto release_walr;
 	}
@@ -2380,26 +2292,23 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 		if (!read_token_equal(expected_token, &actual))
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		else if (primary->records[thread_id - 1].lifecycle != patch->expected_lifecycle
-				 || (primary->records[thread_id - 1].root_flags
-					 & patch->expected_flags_mask) != patch->expected_flags_value)
+				 || (primary->records[thread_id - 1].root_flags & patch->expected_flags_mask)
+						!= patch->expected_flags_value)
 			result = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 		else if ((reason == CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
 				  || reason == CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN)
-				 && (primary->records[thread_id - 1].identity.root_lineage_seq
-						 == UINT64_MAX
+				 && (primary->records[thread_id - 1].identity.root_lineage_seq == UINT64_MAX
 					 || patch->desired.identity.root_lineage_seq
 							!= primary->records[thread_id - 1].identity.root_lineage_seq + 1
 					 || patch->desired.identity.origin_owner_incarnation
-							<= primary->records[thread_id - 1]
-								   .identity.origin_owner_incarnation))
+							<= primary->records[thread_id - 1].identity.origin_owner_incarnation))
 			result = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 		memcpy(updated, primary, sizeof(*updated));
 		snapshot = updated->records[thread_id - 1];
-		if (updated->header.file_txn_seq == UINT64_MAX
-			|| snapshot.root_publish_seq == UINT64_MAX)
+		if (updated->header.file_txn_seq == UINT64_MAX || snapshot.root_publish_seq == UINT64_MAX)
 			result = CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
 		else if (!apply_patch(&snapshot, patch))
 			result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
@@ -2407,17 +2316,16 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 			snapshot.root_publish_seq++;
 			snapshot.published_at_usec = GetCurrentTimestamp();
 			snapshot.lifecycle_reason = reason;
-			result = snapshot_validate(&snapshot, thread_id,
-								   updated->header.system_identifier,
-								   updated->header.storage_uuid,
-								   updated->header.authority_uuid);
+			result
+				= snapshot_validate(&snapshot, thread_id, updated->header.system_identifier,
+									updated->header.storage_uuid, updated->header.authority_uuid);
 		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			updated->records[thread_id - 1] = snapshot;
 			encode_record(updated->bytes + CLUSTER_CONTROL_ROOT_HEADER_BYTES
-						  + (size_t)(thread_id - 1) * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
-					  &snapshot, snapshot.identity.origin_owner_incarnation,
-					  (uint32)cluster_node_id, reason);
+							  + (size_t)(thread_id - 1) * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
+						  &snapshot, snapshot.identity.origin_owner_incarnation,
+						  (uint32)cluster_node_id, reason);
 			updated->header.file_txn_seq++;
 			updated->header.published_at_usec = snapshot.published_at_usec;
 			encode_header(updated);
@@ -2429,19 +2337,17 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 				char path[MAXPGPATH];
 
 				if (!current_storage_uuid(current_uuid)
-					|| !build_control_path(path, sizeof(path),
-									   CLUSTER_CONTROL_ROOT_REL_PATH))
+					|| !build_control_path(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH))
 					result = CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 				else
 					result = read_one_image(path, current_uuid, GetSystemIdentifier(), readback);
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-					&& memcmp(readback->bytes, updated->bytes,
-							  CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+					&& memcmp(readback->bytes, updated->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES)
+						   != 0)
 					result = CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 					snapshot = readback->records[thread_id - 1];
-					make_read_token(readback, thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
-								&token);
+					make_read_token(readback, thread_id, CONTROL_ROOT_SOURCE_PRIMARY, &token);
 				}
 				pfree(readback);
 			}
@@ -2454,8 +2360,7 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 
 release_walr:
 	if (walr_guard != NULL) {
-		walr_release_result =
-			cluster_wal_retention_root_publish_end(&walr_guard);
+		walr_release_result = cluster_wal_retention_root_publish_end(&walr_guard);
 		if (walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
 			result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
 	}
@@ -2481,9 +2386,9 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
 	if (token == NULL || expected_identity == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	result = cluster_control_root_read_canonical(token->origin_thread_id, expected_identity,
-										 CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot,
-										 &fresh);
+	result
+		= cluster_control_root_read_canonical(token->origin_thread_id, expected_identity,
+											  CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &fresh);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -2500,14 +2405,12 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
  * migration_round_sha256).  The cutover driver needs it to stage the seam.
  */
 bool
-cluster_control_root_round_sha256(
-	const ClusterControlRootMigrationRoundV1 *round,
-	uint8 out_sha[PG_SHA256_DIGEST_LENGTH])
+cluster_control_root_round_sha256(const ClusterControlRootMigrationRoundV1 *round,
+								  uint8 out_sha[PG_SHA256_DIGEST_LENGTH])
 {
 	uint8 round_bytes[80];
 
-	if (round == NULL || out_sha == NULL
-		|| !encode_round(round, round_bytes))
+	if (round == NULL || out_sha == NULL || !encode_round(round, round_bytes))
 		return false;
 	return control_root_sha256(round_bytes, sizeof(round_bytes), out_sha);
 }

@@ -376,9 +376,7 @@ cluster_shared_fs_sharedfs_nblocks(ClusterSharedFsHandle *handle)
 	 * cluster-wide corruption verdict.  Re-sample for one short fixed budget;
 	 * aligned observations remain the only values ever returned.
 	 */
-	for (recheck = 0; recheck < CLUSTER_SHAREDFS_EOF_RECHECK_ATTEMPTS;
-		 recheck++)
-	{
+	for (recheck = 0; recheck < CLUSTER_SHAREDFS_EOF_RECHECK_ATTEMPTS; recheck++) {
 		size = FileSize(handle->vfd);
 		if (size < 0)
 			ereport(ERROR, (errcode_for_file_access(),

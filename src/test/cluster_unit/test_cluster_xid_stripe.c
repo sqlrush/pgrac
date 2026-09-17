@@ -106,8 +106,7 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 }
 
 void
-errfinish(const char *filename pg_attribute_unused(),
-		  int lineno pg_attribute_unused(),
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {}
 

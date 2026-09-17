@@ -75,19 +75,16 @@
 
 UT_DEFINE_GLOBALS();
 
-static ClusterReplacementEpisode ut_admitted_replacement_episode(
-	int32 target_node_id);
+static ClusterReplacementEpisode ut_admitted_replacement_episode(int32 target_node_id);
 static bool jb_test(const uint8 *bmp, int i);
 static void ut_join_setup(void);
-static void ut_set_self_incarnation_sequence(uint64 first, uint64 second,
-											 uint64 later);
-static bool ut_join_qvotec_poll_write_pending(int32 *target_node_out,
-											  void *write_slot512_out);
+static void ut_set_self_incarnation_sequence(uint64 first, uint64 second, uint64 later);
+static bool ut_join_qvotec_poll_write_pending(int32 *target_node_out, void *write_slot512_out);
 static void ut_join_qvotec_complete_write(bool acked);
 
-extern bool cluster_reconfig_qvotec_lifecycle_transition(
-	ClusterQvotecMailbox *authority_mailbox,
-	pg_atomic_uint32 *qvotec_status, ClusterQvotecStatus next_status);
+extern bool cluster_reconfig_qvotec_lifecycle_transition(ClusterQvotecMailbox *authority_mailbox,
+														 pg_atomic_uint32 *qvotec_status,
+														 ClusterQvotecStatus next_status);
 
 void
 cluster_qvotec_mailbox_restart_reset(ClusterQvotecMailbox *mailbox)
@@ -97,10 +94,8 @@ cluster_qvotec_mailbox_restart_reset(ClusterQvotecMailbox *mailbox)
 	memset(mailbox, 0, sizeof(*mailbox));
 	pg_atomic_init_u64(&mailbox->request_seq, 0);
 	pg_atomic_init_u64(&mailbox->completion_seq, 0);
-	pg_atomic_init_u32(&mailbox->request_opcode,
-					   CLUSTER_QVOTEC_MAILBOX_NONE);
-	pg_atomic_init_u32(&mailbox->completion_result,
-					   CLUSTER_QVOTEC_MAILBOX_RESULT_NONE);
+	pg_atomic_init_u32(&mailbox->request_opcode, CLUSTER_QVOTEC_MAILBOX_NONE);
+	pg_atomic_init_u32(&mailbox->completion_result, CLUSTER_QVOTEC_MAILBOX_RESULT_NONE);
 }
 
 /* spec-5.22e D5-8 stub: cluster_membership_set_state notes self-admission
@@ -151,8 +146,7 @@ static ClusterControlRootIdentity ut_recovery_root_identity;
 static bool ut_rejoin_root_complete;
 static bool ut_external_fence_active;
 static bool ut_authority_managed;
-static ClusterAuthorityReadiness ut_authority_readiness
-	= CLUSTER_AUTHORITY_OFF;
+static ClusterAuthorityReadiness ut_authority_readiness = CLUSTER_AUTHORITY_OFF;
 static uint64 ut_handoff_identity_incarnation;
 static uint64 ut_handoff_identity_predecessor_floor;
 static bool ut_serving_ready;
@@ -176,21 +170,19 @@ static char ut_rejoin_op_storage;
 static char ut_rejoin_clear_storage;
 
 ClusterControlRootResult
-cluster_control_root_lookup_owner_by_node_runtime(
-	int32 old_node_id pg_attribute_unused(),
-	ClusterControlRootIdentity *out_identity,
-	ClusterControlRootSnapshot *out_snapshot,
-	ClusterControlRootReadToken *out_token)
+cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id pg_attribute_unused(),
+												  ClusterControlRootIdentity *out_identity,
+												  ClusterControlRootSnapshot *out_snapshot,
+												  ClusterControlRootReadToken *out_token)
 {
 	if (out_identity != NULL)
 		*out_identity = ut_recovery_root_identity;
-	if (out_snapshot != NULL)
-	{
+	if (out_snapshot != NULL) {
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
 		out_snapshot->identity = ut_recovery_root_identity;
 		out_snapshot->lifecycle = ut_rejoin_root_complete
-			? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
-			: CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+									  ? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+									  : CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
 	}
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
@@ -216,14 +208,12 @@ cluster_authority_readiness_get(void)
 }
 
 bool
-cluster_authority_handoff_identity_current(
-	uint64 expected_self_incarnation, uint64 expected_predecessor_floor)
+cluster_authority_handoff_identity_current(uint64 expected_self_incarnation,
+										   uint64 expected_predecessor_floor)
 {
-	return ut_authority_managed
-		&& ut_authority_readiness == CLUSTER_AUTHORITY_OFF
-		&& expected_self_incarnation == ut_handoff_identity_incarnation
-		&& expected_predecessor_floor
-			   == ut_handoff_identity_predecessor_floor;
+	return ut_authority_managed && ut_authority_readiness == CLUSTER_AUTHORITY_OFF
+		   && expected_self_incarnation == ut_handoff_identity_incarnation
+		   && expected_predecessor_floor == ut_handoff_identity_predecessor_floor;
 }
 
 bool
@@ -263,43 +253,39 @@ cluster_external_fence_rejoin_protected_set_digest(uint8 out[32])
 }
 
 PgracExternalFenceRejoinStatus
-cluster_external_fence_rejoin_start_async(
-	int timeout_ms, PgracExternalFenceRejoinOpV1 **out_op)
+cluster_external_fence_rejoin_start_async(int timeout_ms, PgracExternalFenceRejoinOpV1 **out_op)
 {
 	ut_rejoin_start_calls++;
-	if (ut_rejoin_start_calls > 1 ||
-		timeout_ms != PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS ||
-		out_op == NULL || *out_op != NULL)
+	if (ut_rejoin_start_calls > 1 || timeout_ms != PGRAC_EXTERNAL_FENCE_ACQUIRE_TIMEOUT_DEFAULT_MS
+		|| out_op == NULL || *out_op != NULL)
 		return PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE;
-	*out_op = (PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage;
+	*out_op = (PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage;
 	ut_rejoin_poll_status = PGRAC_EXTERNAL_FENCE_REJOIN_OFFERED;
 	return PGRAC_EXTERNAL_FENCE_REJOIN_PENDING;
 }
 
 PgracExternalFenceRejoinStatus
-cluster_external_fence_rejoin_poll_nowait(
-	PgracExternalFenceRejoinOpV1 *op, PgracExternalFenceDenyReason *reason)
+cluster_external_fence_rejoin_poll_nowait(PgracExternalFenceRejoinOpV1 *op,
+										  PgracExternalFenceDenyReason *reason)
 {
 	ut_rejoin_poll_calls++;
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
-	if (op != (PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage)
+	if (op != (PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage)
 		return PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE;
 	return ut_rejoin_poll_status;
 }
 
 const PgracExternalFenceRejoinOfferV1 *
-cluster_external_fence_rejoin_offer(
-	const PgracExternalFenceRejoinOpV1 *op)
+cluster_external_fence_rejoin_offer(const PgracExternalFenceRejoinOpV1 *op)
 {
-	return op == (const PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage
-		? &ut_rejoin_offer : NULL;
+	return op == (const PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage ? &ut_rejoin_offer
+																			 : NULL;
 }
 
 bool
-cluster_grd_rejoin_clear_snapshot(
-	const ClusterReconfigRejoinFailureSnapshotV1 *failure,
-	ClusterGrdRejoinClearSnapshotV1 *out_clear)
+cluster_grd_rejoin_clear_snapshot(const ClusterReconfigRejoinFailureSnapshotV1 *failure,
+								  ClusterGrdRejoinClearSnapshotV1 *out_clear)
 {
 	if (!ut_rejoin_grd_clear_ready || failure == NULL || out_clear == NULL)
 		return false;
@@ -313,43 +299,36 @@ cluster_grd_rejoin_clear_snapshot(
 
 PgracExternalFenceRejoinStatus
 cluster_external_fence_rejoin_authority_clear_build(
-	const PgracExternalFenceRejoinOpV1 *op,
-	const ClusterReconfigRejoinFailureSnapshotV1 *failure,
+	const PgracExternalFenceRejoinOpV1 *op, const ClusterReconfigRejoinFailureSnapshotV1 *failure,
 	const ClusterGrdRejoinClearSnapshotV1 *grd_clear,
-	PgracExternalFenceRejoinAuthorityClearV1 **out_clear,
-	PgracExternalFenceDenyReason *reason)
+	PgracExternalFenceRejoinAuthorityClearV1 **out_clear, PgracExternalFenceDenyReason *reason)
 {
 	ut_rejoin_clear_build_calls++;
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
-	if (op != (const PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage ||
-		failure == NULL || grd_clear == NULL || out_clear == NULL ||
-		*out_clear != NULL)
+	if (op != (const PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage || failure == NULL
+		|| grd_clear == NULL || out_clear == NULL || *out_clear != NULL)
 		return PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE;
 	ut_rejoin_failure_seen = *failure;
-	*out_clear = (PgracExternalFenceRejoinAuthorityClearV1 *)
-		&ut_rejoin_clear_storage;
+	*out_clear = (PgracExternalFenceRejoinAuthorityClearV1 *)&ut_rejoin_clear_storage;
 	return PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT;
 }
 
 PgracExternalFenceRejoinStatus
-cluster_external_fence_rejoin_authorize_on_async(
-	PgracExternalFenceRejoinOpV1 *op,
-	PgracExternalFenceRejoinAuthorityClearV1 **clear,
-	const ClusterControlRootIdentity *identity,
-	const ClusterControlRootSnapshot *snapshot,
-	const ClusterControlRootReadToken *token,
-	const uint8 protected_set_digest[32],
-	PgracExternalFenceDenyReason *reason)
+cluster_external_fence_rejoin_authorize_on_async(PgracExternalFenceRejoinOpV1 *op,
+												 PgracExternalFenceRejoinAuthorityClearV1 **clear,
+												 const ClusterControlRootIdentity *identity,
+												 const ClusterControlRootSnapshot *snapshot,
+												 const ClusterControlRootReadToken *token,
+												 const uint8 protected_set_digest[32],
+												 PgracExternalFenceDenyReason *reason)
 {
 	ut_rejoin_authorize_calls++;
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
-	if (op != (PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage ||
-		clear == NULL ||
-		*clear != (PgracExternalFenceRejoinAuthorityClearV1 *)
-			&ut_rejoin_clear_storage || identity == NULL || snapshot == NULL ||
-		token == NULL || protected_set_digest == NULL)
+	if (op != (PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage || clear == NULL
+		|| *clear != (PgracExternalFenceRejoinAuthorityClearV1 *)&ut_rejoin_clear_storage
+		|| identity == NULL || snapshot == NULL || token == NULL || protected_set_digest == NULL)
 		return PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE;
 	*clear = NULL;
 	ut_rejoin_poll_status = PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_JOINER;
@@ -358,15 +337,13 @@ cluster_external_fence_rejoin_authorize_on_async(
 
 PgracExternalFenceRejoinStatus
 cluster_external_fence_rejoin_refresh_on_async(
-	PgracExternalFenceRejoinOpV1 *op,
-	const ClusterReconfigRejoinPendingSnapshotV1 *pending,
+	PgracExternalFenceRejoinOpV1 *op, const ClusterReconfigRejoinPendingSnapshotV1 *pending,
 	PgracExternalFenceDenyReason *reason)
 {
 	ut_rejoin_refresh_calls++;
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
-	if (op != (PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage ||
-		pending == NULL)
+	if (op != (PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage || pending == NULL)
 		return PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE;
 	ut_rejoin_pending_seen = *pending;
 	ut_rejoin_poll_status = PGRAC_EXTERNAL_FENCE_REJOIN_READY;
@@ -374,16 +351,14 @@ cluster_external_fence_rejoin_refresh_on_async(
 }
 
 bool
-cluster_external_fence_rejoin_revalidate_root(
-	PgracExternalFenceRejoinOpV1 *op,
-	ClusterControlRootSnapshot *out_snapshot,
-	PgracExternalFenceDenyReason *reason)
+cluster_external_fence_rejoin_revalidate_root(PgracExternalFenceRejoinOpV1 *op,
+											  ClusterControlRootSnapshot *out_snapshot,
+											  PgracExternalFenceDenyReason *reason)
 {
 	ut_rejoin_root_revalidate_calls++;
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
-	if (op != (PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage ||
-		out_snapshot == NULL)
+	if (op != (PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage || out_snapshot == NULL)
 		return false;
 	memset(out_snapshot, 0, sizeof(*out_snapshot));
 	out_snapshot->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
@@ -391,11 +366,10 @@ cluster_external_fence_rejoin_revalidate_root(
 }
 
 bool
-cluster_external_fence_rejoin_consume_nowait(
-	PgracExternalFenceRejoinOpV1 *op,
-	const ClusterReconfigRejoinPendingSnapshotV1 *pending,
-	const ClusterJoinCommitMarker *marker,
-	PgracExternalFenceDenyReason *reason)
+cluster_external_fence_rejoin_consume_nowait(PgracExternalFenceRejoinOpV1 *op,
+											 const ClusterReconfigRejoinPendingSnapshotV1 *pending,
+											 const ClusterJoinCommitMarker *marker,
+											 PgracExternalFenceDenyReason *reason)
 {
 	ClusterJoinMarkerMailboxOperationV1 operation;
 	int32 target = -1;
@@ -404,10 +378,10 @@ cluster_external_fence_rejoin_consume_nowait(
 	ut_rejoin_consume_calls++;
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
-	ut_rejoin_consume_saw_prior_marker_submit =
-		cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot);
-	if (op != (PgracExternalFenceRejoinOpV1 *) &ut_rejoin_op_storage ||
-		pending == NULL || marker == NULL)
+	ut_rejoin_consume_saw_prior_marker_submit
+		= cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot);
+	if (op != (PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage || pending == NULL
+		|| marker == NULL)
 		return false;
 	ut_rejoin_pending_seen = *pending;
 	ut_rejoin_committed_seen = *marker;
@@ -417,8 +391,7 @@ cluster_external_fence_rejoin_consume_nowait(
 void
 cluster_external_fence_rejoin_release(PgracExternalFenceRejoinOpV1 **op)
 {
-	if (op != NULL && *op != NULL)
-	{
+	if (op != NULL && *op != NULL) {
 		ut_rejoin_release_calls++;
 		*op = NULL;
 	}
@@ -470,18 +443,16 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason pg_attribute_unuse
 }
 
 bool
-cluster_sf_peer_capability_family_sample(
-	int32 peer_id, uint32 required_capabilities,
-	uint32 optional_capabilities, bool *optional_supported_out,
-	uint32 *generation_out)
+cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabilities,
+										 uint32 optional_capabilities, bool *optional_supported_out,
+										 uint32 *generation_out)
 {
 	if (optional_supported_out != NULL)
 		*optional_supported_out = false;
 	if (generation_out != NULL)
 		*generation_out = 0;
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
-		|| required_capabilities
-			   != PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+		|| required_capabilities != PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
 		|| optional_capabilities != 0 || !ut_candidate2_capable[peer_id])
 		return false;
 	if (generation_out != NULL)
@@ -561,14 +532,12 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
 	return true;
 }
 bool
-LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
-						 LWLockMode mode pg_attribute_unused())
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	ut_lwlock_conditional_calls++;
 	return ut_lwlock_conditional_result
-		&& (ut_lwlock_conditional_fail_call == 0
-			|| ut_lwlock_conditional_calls
-				   != ut_lwlock_conditional_fail_call);
+		   && (ut_lwlock_conditional_fail_call == 0
+			   || ut_lwlock_conditional_calls != ut_lwlock_conditional_fail_call);
 }
 void
 LWLockRelease(LWLock *lock pg_attribute_unused())
@@ -677,14 +646,12 @@ static ClusterQvotecMailboxCompletion ut_authority_completion;
 ClusterQvotecMailboxSubmitStatus
 cluster_qvotec_authority_lmon_submit(
 	ClusterQvotecMailboxOpcode opcode,
-	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
-	uint64 *request_seq_out)
+	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES], uint64 *request_seq_out)
 {
 	static const uint8 zero_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES] = { 0 };
 
-	if (opcode != CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD
-		|| request_value == NULL || request_seq_out == NULL
-		|| memcmp(request_value, zero_value, sizeof(zero_value)) != 0)
+	if (opcode != CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD || request_value == NULL
+		|| request_seq_out == NULL || memcmp(request_value, zero_value, sizeof(zero_value)) != 0)
 		return CLUSTER_QVOTEC_MAILBOX_SUBMIT_INVALID;
 	ut_authority_submit_calls++;
 	if (ut_authority_submit_status != CLUSTER_QVOTEC_MAILBOX_SUBMIT_ACCEPTED)
@@ -695,8 +662,8 @@ cluster_qvotec_authority_lmon_submit(
 }
 
 bool
-cluster_qvotec_authority_lmon_poll_completion(
-	uint64 request_seq, ClusterQvotecMailboxCompletion *completion_out)
+cluster_qvotec_authority_lmon_poll_completion(uint64 request_seq,
+											  ClusterQvotecMailboxCompletion *completion_out)
 {
 	if (!ut_authority_completion_ready || completion_out == NULL
 		|| ut_authority_completion.request_seq != request_seq)
@@ -868,8 +835,8 @@ cluster_gcs_block_on_epoch_advance(uint64 new_epoch pg_attribute_unused())
 {}
 
 void
-cluster_gcs_block_on_epoch_advance_exact(
-	uint64 new_epoch pg_attribute_unused(), const uint8 *dead_bitmap pg_attribute_unused())
+cluster_gcs_block_on_epoch_advance_exact(uint64 new_epoch pg_attribute_unused(),
+										 const uint8 *dead_bitmap pg_attribute_unused())
 {}
 
 /* spec-2.39 D14 stub: cluster_reconfig_apply_epoch_bump_as_coordinator
@@ -924,8 +891,7 @@ static bool ut_fence_async_marker_captured = false;
 static ClusterFenceMarker ut_fence_async_marker;
 
 bool
-cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a,
-										const ClusterFenceMarker *m,
+cluster_write_fence_submit_marker_async(ClusterMarkerAsync *a, const ClusterFenceMarker *m,
 										ClusterMarkerAsyncKind kind, int32 target_node,
 										TimestampTz now pg_attribute_unused())
 {
@@ -1028,16 +994,13 @@ cluster_grd_inc_offpath_crash_rejoin_fenced(void)
 /* spec-6.15 D5b: stripe joiner gate.  Most tests keep the legacy PROCEED
  * fixture; the AD-023 cold-boot ordering test drives the HOLD edge. */
 #include "cluster/cluster_xid_stripe_boot.h"
-static ClusterXidStripeJoinVerdict ut_xid_stripe_verdict
-	= CLUSTER_XID_STRIPE_JOIN_PROCEED;
+static ClusterXidStripeJoinVerdict ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 static int ut_xid_stripe_join_gate_calls;
 static bool ut_xid_stripe_last_may_seed;
-static ClusterXidStripeJoinProgress ut_xid_stripe_progress
-	= STRIPE_JOIN_PROCEED;
+static ClusterXidStripeJoinProgress ut_xid_stripe_progress = STRIPE_JOIN_PROCEED;
 static int ut_xid_stripe_join_progress_calls;
 static bool ut_xid_stripe_progress_last_may_seed;
-static ClusterXidStripeDiskState ut_xid_stripe_disk_state
-	= CLUSTER_XID_STRIPE_DISK_UNKNOWN;
+static ClusterXidStripeDiskState ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_UNKNOWN;
 static ClusterWalSlotVerdict ut_wal_slot_verdict[CLUSTER_MAX_NODES];
 static ClusterWalStateSlot ut_wal_slot[CLUSTER_MAX_NODES];
 static bool ut_recovery_in_progress = false;
@@ -1089,18 +1052,17 @@ void
 on_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
 {}
 void
-before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(), Datum arg pg_attribute_unused())
+before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
+				  Datum arg pg_attribute_unused())
 {}
 #include "cluster/cluster_voting_disk_io.h"
 static bool ut_join_disk_readable[CLUSTER_MAX_VOTING_DISKS];
 static uint8 ut_join_disk_images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_VOTING_SLOT_BYTES];
 ClusterVotingDiskIoState
-cluster_voting_disk_read_join_slot(int fd,
-								   uint32 node_id pg_attribute_unused(),
-								   void *out_slot512)
+cluster_voting_disk_read_join_slot(int fd, uint32 node_id pg_attribute_unused(), void *out_slot512)
 {
-	if (fd >= 0 && fd < CLUSTER_MAX_VOTING_DISKS
-		&& ut_join_disk_readable[fd] && out_slot512 != NULL) {
+	if (fd >= 0 && fd < CLUSTER_MAX_VOTING_DISKS && ut_join_disk_readable[fd]
+		&& out_slot512 != NULL) {
 		memcpy(out_slot512, ut_join_disk_images[fd], CLUSTER_VOTING_SLOT_BYTES);
 		return CLUSTER_VOTING_DISK_IO_OK;
 	}
@@ -1155,8 +1117,7 @@ ut_reset_mocks(void)
 	memset(&ut_authority_completion, 0, sizeof(ut_authority_completion));
 	memset(ut_join_disk_readable, 0, sizeof(ut_join_disk_readable));
 	memset(ut_join_disk_images, 0, sizeof(ut_join_disk_images));
-	memset(&ut_r4_prerequisite_snapshot, 0,
-		   sizeof(ut_r4_prerequisite_snapshot));
+	memset(&ut_r4_prerequisite_snapshot, 0, sizeof(ut_r4_prerequisite_snapshot));
 	ut_r4_prerequisite_snapshot.target_node_id = -1;
 	ut_r4_snapshot_use_reconfig = false;
 	ut_phase3_send_result = CLUSTER_IC_SEND_DONE;
@@ -1370,9 +1331,7 @@ UT_TEST(test_reconfig_replacement_episode_is_embedded_and_zero_initialized)
 	memset(&empty_episode, 0, sizeof(empty_episode));
 
 	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 12640);
-	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &empty_episode,
-						sizeof(empty_episode)),
-				 0);
+	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &empty_episode, sizeof(empty_episode)), 0);
 }
 
 
@@ -1620,11 +1579,9 @@ UT_TEST(test_reconfig_builds_exact_replacement_committed_event)
 	episode.readiness_flags = 0;
 	memset(&event, 0, sizeof(event));
 	UT_ASSERT(cluster_reconfig_build_replacement_committed_event(
-		&episode, CLUSTER_RECONFIG_OBSERVER_SURVIVOR,
-		(TimestampTz)UINT64_C(1234), &event));
+		&episode, CLUSTER_RECONFIG_OBSERVER_SURVIVOR, (TimestampTz)UINT64_C(1234), &event));
 	UT_ASSERT_EQ((int)RECONFIG_KIND_REPLACEMENT_COMMITTED, 6);
-	UT_ASSERT_EQ((int)event.reconfig_kind,
-		(int)RECONFIG_KIND_REPLACEMENT_COMMITTED);
+	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_REPLACEMENT_COMMITTED);
 	UT_ASSERT(event.event_id != 0);
 	UT_ASSERT_EQ(event.coordinator_node_id, episode.coordinator_node_id);
 	UT_ASSERT_EQ(event.old_epoch, episode.baseline_epoch);
@@ -1643,15 +1600,13 @@ UT_TEST(test_reconfig_builds_exact_replacement_committed_event)
 	changed = episode;
 	changed.request_nonce++;
 	UT_ASSERT(cluster_reconfig_build_replacement_committed_event(
-		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR,
-		(TimestampTz)UINT64_C(1234), &changed_event));
+		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR, (TimestampTz)UINT64_C(1234), &changed_event));
 	UT_ASSERT(changed_event.event_id != event.event_id);
 	changed = episode;
 	changed.expected_survivors[0] ^= UINT8_C(0x10);
 	changed.acknowledgements[0] = changed.expected_survivors[0];
 	UT_ASSERT(cluster_reconfig_build_replacement_committed_event(
-		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR,
-		(TimestampTz)UINT64_C(1234), &changed_event));
+		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR, (TimestampTz)UINT64_C(1234), &changed_event));
 	UT_ASSERT(changed_event.event_id != event.event_id);
 
 	memset(&sentinel, 0xa5, sizeof(sentinel));
@@ -1659,19 +1614,16 @@ UT_TEST(test_reconfig_builds_exact_replacement_committed_event)
 	changed = episode;
 	changed.acknowledgements[0] &= (uint8)~UINT8_C(0x04);
 	UT_ASSERT(!cluster_reconfig_build_replacement_committed_event(
-		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR,
-		(TimestampTz)UINT64_C(1234), &changed_event));
+		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR, (TimestampTz)UINT64_C(1234), &changed_event));
 	UT_ASSERT_EQ(memcmp(&changed_event, &sentinel, sizeof(sentinel)), 0);
 
 	changed = episode;
 	changed.phase = CLUSTER_REPLACEMENT_EPISODE_PURGING;
 	UT_ASSERT(!cluster_reconfig_build_replacement_committed_event(
-		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR,
-		(TimestampTz)UINT64_C(1234), &changed_event));
+		&changed, CLUSTER_RECONFIG_OBSERVER_SURVIVOR, (TimestampTz)UINT64_C(1234), &changed_event));
 	UT_ASSERT_EQ(memcmp(&changed_event, &sentinel, sizeof(sentinel)), 0);
 	UT_ASSERT(!cluster_reconfig_build_replacement_committed_event(
-		&episode, CLUSTER_RECONFIG_OBSERVER_NONE,
-		(TimestampTz)UINT64_C(1234), &changed_event));
+		&episode, CLUSTER_RECONFIG_OBSERVER_NONE, (TimestampTz)UINT64_C(1234), &changed_event));
 	UT_ASSERT_EQ(memcmp(&changed_event, &sentinel, sizeof(sentinel)), 0);
 }
 
@@ -1702,44 +1654,40 @@ UT_TEST(test_reconfig_replacement_grd_basis_uses_immutable_survivors)
 	committed.old_admitted_incarnation = episode.old_admitted_incarnation;
 	committed.fresh_incarnation = episode.fresh_incarnation;
 	committed.baseline_epoch = episode.baseline_epoch;
-	committed.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	committed.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	committed.request_nonce = episode.request_nonce;
 	memcpy(committed.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(committed.expected_purge_survivors));
 	committed.grammar_fingerprint = episode.grammar_fingerprint;
 	UT_ASSERT(cluster_reconfig_build_replacement_committed_event(
-		&episode, CLUSTER_RECONFIG_OBSERVER_SURVIVOR,
-		(TimestampTz)UINT64_C(1234), &event));
+		&episode, CLUSTER_RECONFIG_OBSERVER_SURVIVOR, (TimestampTz)UINT64_C(1234), &event));
 	event.event_seq = UINT64_C(7); /* proves local publication, not a builder */
 	memset(survivors, 0xa5, sizeof(survivors));
 	memcpy(sentinel, survivors, sizeof(sentinel));
 
-	UT_ASSERT(cluster_reconfig_replacement_grd_basis_authorized(
-		&event, &episode, &committed, 2, survivors, &epoch));
-	UT_ASSERT_EQ(memcmp(survivors, episode.expected_survivors,
-					 sizeof(survivors)), 0);
+	UT_ASSERT(cluster_reconfig_replacement_grd_basis_authorized(&event, &episode, &committed, 2,
+																survivors, &epoch));
+	UT_ASSERT_EQ(memcmp(survivors, episode.expected_survivors, sizeof(survivors)), 0);
 	UT_ASSERT_EQ(epoch, episode.reserved_or_committed_epoch);
 
 	memcpy(survivors, sentinel, sizeof(survivors));
 	epoch = epoch_sentinel;
 	event.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
-	UT_ASSERT(!cluster_reconfig_replacement_grd_basis_authorized(
-		&event, &episode, &committed, 2, survivors, &epoch));
+	UT_ASSERT(!cluster_reconfig_replacement_grd_basis_authorized(&event, &episode, &committed, 2,
+																 survivors, &epoch));
 	UT_ASSERT_EQ(memcmp(survivors, sentinel, sizeof(survivors)), 0);
 	UT_ASSERT_EQ(epoch, epoch_sentinel);
 	event.reconfig_kind = RECONFIG_KIND_REPLACEMENT_COMMITTED;
 
 	committed.expected_purge_survivors[0] ^= UINT8_C(0x02);
-	UT_ASSERT(!cluster_reconfig_replacement_grd_basis_authorized(
-		&event, &episode, &committed, 2, survivors, &epoch));
+	UT_ASSERT(!cluster_reconfig_replacement_grd_basis_authorized(&event, &episode, &committed, 2,
+																 survivors, &epoch));
 	UT_ASSERT_EQ(memcmp(survivors, sentinel, sizeof(survivors)), 0);
 	UT_ASSERT_EQ(epoch, epoch_sentinel);
 	committed.expected_purge_survivors[0] ^= UINT8_C(0x02);
 
 	UT_ASSERT(!cluster_reconfig_replacement_grd_basis_authorized(
-		&event, &episode, &committed, episode.target_node_id,
-		survivors, &epoch));
+		&event, &episode, &committed, episode.target_node_id, survivors, &epoch));
 	UT_ASSERT_EQ(memcmp(survivors, sentinel, sizeof(survivors)), 0);
 	UT_ASSERT_EQ(epoch, epoch_sentinel);
 
@@ -1751,33 +1699,25 @@ UT_TEST(test_reconfig_replacement_grd_basis_uses_immutable_survivors)
 	state->replacement_episode = episode;
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&committed, committed_image));
-	memcpy(state->join_pending_marker, committed_image,
-		   sizeof(committed_image));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&committed, committed_image));
+	memcpy(state->join_pending_marker, committed_image, sizeof(committed_image));
 	pg_atomic_write_u64(&state->join_marker_request_seq, UINT64_C(11));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(11));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 	UT_ASSERT(cluster_reconfig_build_replacement_committed_event(
-		&episode, CLUSTER_RECONFIG_OBSERVER_SURVIVOR,
-		(TimestampTz)UINT64_C(4321), &event));
+		&episode, CLUSTER_RECONFIG_OBSERVER_SURVIVOR, (TimestampTz)UINT64_C(4321), &event));
 	cluster_reconfig_publish_event(&event);
 	memset(survivors, 0xa5, sizeof(survivors));
 	epoch = epoch_sentinel;
-	UT_ASSERT(cluster_reconfig_lmon_snapshot_replacement_grd_basis(
-		survivors, &epoch));
-	UT_ASSERT_EQ(memcmp(survivors, episode.expected_survivors,
-					 sizeof(survivors)), 0);
+	UT_ASSERT(cluster_reconfig_lmon_snapshot_replacement_grd_basis(survivors, &epoch));
+	UT_ASSERT_EQ(memcmp(survivors, episode.expected_survivors, sizeof(survivors)), 0);
 	UT_ASSERT_EQ(epoch, episode.reserved_or_committed_epoch);
 
 	memcpy(survivors, sentinel, sizeof(survivors));
 	epoch = epoch_sentinel;
 	state->join_pending_marker[24] ^= UINT8_C(0x01);
-	UT_ASSERT(!cluster_reconfig_lmon_snapshot_replacement_grd_basis(
-		survivors, &epoch));
+	UT_ASSERT(!cluster_reconfig_lmon_snapshot_replacement_grd_basis(survivors, &epoch));
 	UT_ASSERT_EQ(memcmp(survivors, sentinel, sizeof(survivors)), 0);
 	UT_ASSERT_EQ(epoch, epoch_sentinel);
 }
@@ -2273,8 +2213,7 @@ UT_TEST(test_reconfig_node_remove_marker_carries_full_excluded_set)
 	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
 	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
 	contest = true;
-	ret = cluster_reconfig_apply_node_removed_as_coordinator(1, baseline, 42, 7,
-												 &contest);
+	ret = cluster_reconfig_apply_node_removed_as_coordinator(1, baseline, 42, 7, &contest);
 	UT_ASSERT(ret > baseline);
 	UT_ASSERT(!contest);
 	cluster_reconfig_get_last_event(&applied);
@@ -2533,12 +2472,12 @@ ut_join_setup(void)
 	cluster_epoch_shmem_init();
 	cluster_qvotec_mailbox_restart_reset(&authority_mailbox);
 	pg_atomic_init_u32(&qvotec_status, CLUSTER_QVOTEC_READY);
-	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
-		&authority_mailbox, &qvotec_status, CLUSTER_QVOTEC_STARTING));
-	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
-		&authority_mailbox, &qvotec_status, CLUSTER_QVOTEC_READY));
-	cluster_node_id = 0;		   /* self */
-	ut_declared_set[0] = true;	   /* self declared */
+	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(&authority_mailbox, &qvotec_status,
+														   CLUSTER_QVOTEC_STARTING));
+	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(&authority_mailbox, &qvotec_status,
+														   CLUSTER_QVOTEC_READY));
+	cluster_node_id = 0;	   /* self */
+	ut_declared_set[0] = true; /* self declared */
 }
 
 static ClusterReplacementEpisode
@@ -2570,17 +2509,15 @@ ut_prepare_exact_r4_membership(void)
 
 	ut_join_setup();
 	ut_in_quorum_value = true;
-	ut_set_self_incarnation_sequence(UINT64_C(100), UINT64_C(100),
-								 UINT64_C(100));
+	ut_set_self_incarnation_sequence(UINT64_C(100), UINT64_C(100), UINT64_C(100));
 	for (node = 0; node < 4; node++) {
 		uint64 incarnation = UINT64_C(100) + (uint64)node;
 
 		ut_declared_set[node] = true;
 		cluster_membership_record_admitted(node, incarnation);
 		cluster_membership_set_state(node, CLUSTER_MEMBER_MEMBER);
-		cluster_reconfig_record_observed_slot(
-			node, incarnation, UINT64_C(20) + (uint64)node,
-			CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_slot(node, incarnation, UINT64_C(20) + (uint64)node,
+											  CLUSTER_EPOCH_INITIAL);
 		cluster_reconfig_record_observed_fresh_alive(node, true);
 	}
 }
@@ -2674,10 +2611,8 @@ UT_TEST(test_r4_membership_snapshot_captures_exact_current_four_node_view)
 	UT_ASSERT_EQ(snapshot.admitted_members_hi, 0);
 	UT_ASSERT_EQ(snapshot.local_self_boot_incarnation, UINT64_C(100));
 	for (node = 0; node < 4; node++) {
-		UT_ASSERT_EQ(snapshot.admitted_incarnation[node],
-					 UINT64_C(100) + (uint64)node);
-		UT_ASSERT_EQ(snapshot.observed_generation[node],
-					 UINT64_C(20) + (uint64)node);
+		UT_ASSERT_EQ(snapshot.admitted_incarnation[node], UINT64_C(100) + (uint64)node);
+		UT_ASSERT_EQ(snapshot.observed_generation[node], UINT64_C(20) + (uint64)node);
 	}
 	for (; node < CLUSTER_MAX_NODES; node++) {
 		UT_ASSERT_EQ(snapshot.admitted_incarnation[node], 0);
@@ -2696,8 +2631,7 @@ UT_TEST(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence)
 	UT_ASSERT_EQ(snapshot.admitted_incarnation[3], 0);
 
 	ut_prepare_exact_r4_membership();
-	cluster_reconfig_record_observed_slot(
-		3, UINT64_C(999), UINT64_C(23), CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_record_observed_slot(3, UINT64_C(999), UINT64_C(23), CLUSTER_EPOCH_INITIAL);
 	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
 	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
 
@@ -2707,8 +2641,7 @@ UT_TEST(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence)
 	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
 
 	ut_prepare_exact_r4_membership();
-	ut_set_self_incarnation_sequence(UINT64_C(101), UINT64_C(101),
-								 UINT64_C(101));
+	ut_set_self_incarnation_sequence(UINT64_C(101), UINT64_C(101), UINT64_C(101));
 	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
 	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
 }
@@ -2736,14 +2669,12 @@ UT_TEST(test_replacement_purge_request_requires_exact_reserve_prepare_authority)
 	episode = ut_admitted_replacement_episode(3);
 	episode.phase = CLUSTER_REPLACEMENT_EPISODE_PREPARE_DURABLE;
 	episode.readiness_flags = 0;
-	memset(episode.acknowledgements, 0,
-		   sizeof(episode.acknowledgements));
+	memset(episode.acknowledgements, 0, sizeof(episode.acknowledgements));
 	state->replacement_episode = episode;
 	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_record_admitted(1, UINT64_C(111));
-	cluster_membership_record_admitted(
-		episode.target_node_id, episode.old_admitted_incarnation);
+	cluster_membership_record_admitted(episode.target_node_id, episode.old_admitted_incarnation);
 	cluster_membership_record_admitted(2, UINT64_C(222));
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
@@ -2758,8 +2689,7 @@ UT_TEST(test_replacement_purge_request_requires_exact_reserve_prepare_authority)
 	prepare.old_admitted_incarnation = episode.old_admitted_incarnation;
 	prepare.fresh_incarnation = episode.fresh_incarnation;
 	prepare.baseline_epoch = episode.baseline_epoch;
-	prepare.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	prepare.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	prepare.request_nonce = episode.request_nonce;
 	memcpy(prepare.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(prepare.expected_purge_survivors));
@@ -2782,8 +2712,7 @@ UT_TEST(test_replacement_purge_request_requires_exact_reserve_prepare_authority)
 	reserve.event_subject_bitmap[episode.target_node_id / 8]
 		= (uint8)(1u << (episode.target_node_id % 8));
 	reserve.grammar_fingerprint = episode.grammar_fingerprint;
-	memset(reserve.predecessor_digest, 0x5a,
-		   sizeof(reserve.predecessor_digest));
+	memset(reserve.predecessor_digest, 0x5a, sizeof(reserve.predecessor_digest));
 
 	memset(&ballot, 0, sizeof(ballot));
 	ballot.counter = UINT64_C(7);
@@ -2798,16 +2727,13 @@ UT_TEST(test_replacement_purge_request_requires_exact_reserve_prepare_authority)
 	request.request_nonce = episode.request_nonce;
 	request.identity0 = episode.old_admitted_incarnation;
 	request.identity1 = episode.fresh_incarnation;
-	memcpy(request.body.bitmap, episode.expected_survivors,
-		   sizeof(request.body.bitmap));
+	memcpy(request.body.bitmap, episode.expected_survivors, sizeof(request.body.bitmap));
 	request.grammar_fingerprint = episode.grammar_fingerprint;
 	before = state->replacement_episode;
 
 	UT_ASSERT(cluster_reconfig_replacement_purge_request_authorized(
-		&request, episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare));
-	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before,
-					  sizeof(before)), 0);
+		&request, episode.coordinator_node_id, cluster_node_id, &reserve, &ballot, &prepare));
+	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before, sizeof(before)), 0);
 
 	UT_ASSERT(cluster_replacement_wire_encode(&request, request_bytes));
 	memset(&envelope, 0, sizeof(envelope));
@@ -2818,54 +2744,45 @@ UT_TEST(test_replacement_purge_request_requires_exact_reserve_prepare_authority)
 	envelope.payload_length = CLUSTER_REPLACEMENT_WIRE_BYTES;
 	memset(&observed, 0, sizeof(observed));
 	UT_ASSERT(cluster_reconfig_replacement_purge_request_ingress_authorized(
-		&envelope, request_bytes, sizeof(request_bytes),
-		episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare, &observed));
+		&envelope, request_bytes, sizeof(request_bytes), episode.coordinator_node_id,
+		cluster_node_id, &reserve, &ballot, &prepare, &observed));
 	UT_ASSERT_EQ(memcmp(&observed, &request, sizeof(request)), 0);
 
 	memset(&sentinel, 0xa5, sizeof(sentinel));
 	observed = sentinel;
 	envelope.source_node_id = (uint32)cluster_node_id;
 	UT_ASSERT(!cluster_reconfig_replacement_purge_request_ingress_authorized(
-		&envelope, request_bytes, sizeof(request_bytes),
-		episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare, &observed));
+		&envelope, request_bytes, sizeof(request_bytes), episode.coordinator_node_id,
+		cluster_node_id, &reserve, &ballot, &prepare, &observed));
 	UT_ASSERT_EQ(memcmp(&observed, &sentinel, sizeof(sentinel)), 0);
 	envelope.source_node_id = (uint32)episode.coordinator_node_id;
 	envelope.epoch++;
 	UT_ASSERT(!cluster_reconfig_replacement_purge_request_ingress_authorized(
-		&envelope, request_bytes, sizeof(request_bytes),
-		episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare, &observed));
+		&envelope, request_bytes, sizeof(request_bytes), episode.coordinator_node_id,
+		cluster_node_id, &reserve, &ballot, &prepare, &observed));
 	UT_ASSERT_EQ(memcmp(&observed, &sentinel, sizeof(sentinel)), 0);
 	envelope.epoch--;
 	UT_ASSERT(!cluster_reconfig_replacement_purge_request_ingress_authorized(
-		&envelope, request_bytes, sizeof(request_bytes) - 1,
-		episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare, &observed));
+		&envelope, request_bytes, sizeof(request_bytes) - 1, episode.coordinator_node_id,
+		cluster_node_id, &reserve, &ballot, &prepare, &observed));
 	UT_ASSERT_EQ(memcmp(&observed, &sentinel, sizeof(sentinel)), 0);
 
 	ballot.proposer_node_id = cluster_node_id;
 	UT_ASSERT(!cluster_reconfig_replacement_purge_request_authorized(
-		&request, episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare));
+		&request, episode.coordinator_node_id, cluster_node_id, &reserve, &ballot, &prepare));
 	ballot.proposer_node_id = episode.coordinator_node_id;
 	prepare.phase = CLUSTER_JCMK_REPLACEMENT_PHASE_COMMITTED_CLOSED;
 	UT_ASSERT(!cluster_reconfig_replacement_purge_request_authorized(
-		&request, episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare));
+		&request, episode.coordinator_node_id, cluster_node_id, &reserve, &ballot, &prepare));
 	prepare.phase = CLUSTER_JCMK_REPLACEMENT_PHASE_PREPARE;
 	request.body.bitmap[0] ^= UINT8_C(0x02);
 	UT_ASSERT(!cluster_reconfig_replacement_purge_request_authorized(
-		&request, episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare));
+		&request, episode.coordinator_node_id, cluster_node_id, &reserve, &ballot, &prepare));
 	request.body.bitmap[0] ^= UINT8_C(0x02);
 	ut_candidate2_capable[episode.target_node_id] = false;
 	UT_ASSERT(!cluster_reconfig_replacement_purge_request_authorized(
-		&request, episode.coordinator_node_id, cluster_node_id,
-		&reserve, &ballot, &prepare));
-	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before,
-					  sizeof(before)), 0);
+		&request, episode.coordinator_node_id, cluster_node_id, &reserve, &ballot, &prepare));
+	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before, sizeof(before)), 0);
 
 	/* Phase 2 derives the ACK node only from the authenticated endpoint. The
 	 * wire bitmap is identity, never a self-asserted ACK selector. A duplicate
@@ -2879,11 +2796,9 @@ UT_TEST(test_replacement_purge_request_requires_exact_reserve_prepare_authority)
 		int32 ack_node = -1;
 
 		UT_ASSERT(cluster_reconfig_replacement_purge_ack_authorized(
-			&request, 2, cluster_node_id, &reserve, &ballot, &prepare,
-			&ack_node));
+			&request, 2, cluster_node_id, &reserve, &ballot, &prepare, &ack_node));
 		UT_ASSERT_EQ(ack_node, 2);
-		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before,
-						  sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before, sizeof(before)), 0);
 
 		UT_ASSERT(cluster_replacement_wire_encode(&request, request_bytes));
 		memset(&envelope, 0, sizeof(envelope));
@@ -2893,50 +2808,42 @@ UT_TEST(test_replacement_purge_request_requires_exact_reserve_prepare_authority)
 		envelope.epoch = episode.baseline_epoch;
 		envelope.payload_length = CLUSTER_REPLACEMENT_WIRE_BYTES;
 		ack_node = -1;
-		UT_ASSERT(
-			cluster_reconfig_replacement_purge_ack_ingress_authorized(
-				&envelope, request_bytes, sizeof(request_bytes), 2,
-				cluster_node_id, &reserve, &ballot, &prepare, &ack_node));
+		UT_ASSERT(cluster_reconfig_replacement_purge_ack_ingress_authorized(
+			&envelope, request_bytes, sizeof(request_bytes), 2, cluster_node_id, &reserve, &ballot,
+			&prepare, &ack_node));
 		UT_ASSERT_EQ(ack_node, 2);
-		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before,
-						  sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before, sizeof(before)), 0);
 		ack_node = -1;
 		envelope.dest_node_id = UINT32_C(2);
-		UT_ASSERT(
-			!cluster_reconfig_replacement_purge_ack_ingress_authorized(
-				&envelope, request_bytes, sizeof(request_bytes), 2,
-				cluster_node_id, &reserve, &ballot, &prepare, &ack_node));
+		UT_ASSERT(!cluster_reconfig_replacement_purge_ack_ingress_authorized(
+			&envelope, request_bytes, sizeof(request_bytes), 2, cluster_node_id, &reserve, &ballot,
+			&prepare, &ack_node));
 		UT_ASSERT_EQ(ack_node, -1);
 		envelope.dest_node_id = (uint32)cluster_node_id;
-		UT_ASSERT(
-			!cluster_reconfig_replacement_purge_ack_ingress_authorized(
-				&envelope, request_bytes, sizeof(request_bytes) - 1, 2,
-				cluster_node_id, &reserve, &ballot, &prepare, &ack_node));
+		UT_ASSERT(!cluster_reconfig_replacement_purge_ack_ingress_authorized(
+			&envelope, request_bytes, sizeof(request_bytes) - 1, 2, cluster_node_id, &reserve,
+			&ballot, &prepare, &ack_node));
 		UT_ASSERT_EQ(ack_node, -1);
 
 		state->replacement_episode.acknowledgements[0] |= UINT8_C(0x04);
 		before = state->replacement_episode;
 		ack_node = -1;
 		UT_ASSERT(cluster_reconfig_replacement_purge_ack_authorized(
-			&request, 2, cluster_node_id, &reserve, &ballot, &prepare,
-			&ack_node));
+			&request, 2, cluster_node_id, &reserve, &ballot, &prepare, &ack_node));
 		UT_ASSERT_EQ(ack_node, 2);
-		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before,
-						  sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before, sizeof(before)), 0);
 
 		ack_node = -1;
 		ballot.proposer_node_id = 2;
 		UT_ASSERT(!cluster_reconfig_replacement_purge_ack_authorized(
-			&request, 2, cluster_node_id, &reserve, &ballot, &prepare,
-			&ack_node));
+			&request, 2, cluster_node_id, &reserve, &ballot, &prepare, &ack_node));
 		UT_ASSERT_EQ(ack_node, -1);
 		ballot.proposer_node_id = episode.coordinator_node_id;
 		UT_ASSERT(!cluster_reconfig_replacement_purge_ack_authorized(
-			&request, episode.target_node_id, cluster_node_id,
-			&reserve, &ballot, &prepare, &ack_node));
+			&request, episode.target_node_id, cluster_node_id, &reserve, &ballot, &prepare,
+			&ack_node));
 		UT_ASSERT_EQ(ack_node, -1);
-		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before,
-						  sizeof(before)), 0);
+		UT_ASSERT_EQ(memcmp(&state->replacement_episode, &before, sizeof(before)), 0);
 	}
 }
 
@@ -2999,8 +2906,7 @@ UT_TEST(test_initial_absent_peer_is_not_a_runtime_join_edge)
 	UT_ASSERT_EQ(inc, UINT64_C(103));
 	UT_ASSERT_EQ(cluster_reconfig_compute_join_bitmap(jb), 0);
 	UT_ASSERT(!jb_test(jb, 3));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(3),
-				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(3), (int)CLUSTER_MEMBER_ABSENT);
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(3), 0);
 
 	/* A real past-INITIAL cluster still owns ordinary never-seen admission. */
@@ -3122,10 +3028,8 @@ UT_TEST(test_shared_cf_fast_rejoin_evicts_prior_live_incarnation)
 	cluster_reconfig_bootstrap_publish_in_quorum(true);
 
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_ABSENT);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(0));
 	UT_ASSERT_EQ(state->fast_rejoin_incarnation[1], UINT64_C(0));
 	UT_ASSERT_EQ(cluster_reconfig_get_apply_counter(), UINT64_C(0));
 
@@ -3135,10 +3039,8 @@ UT_TEST(test_shared_cf_fast_rejoin_evicts_prior_live_incarnation)
 	cluster_reconfig_record_observed_slot(1, UINT64_C(70), UINT64_C(2), 0);
 	cluster_reconfig_record_observed_fresh_alive(1, true);
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(70));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(70));
 	UT_ASSERT_EQ(state->fast_rejoin_incarnation[1], UINT64_C(0));
 	UT_ASSERT_EQ(cluster_reconfig_get_apply_counter(), UINT64_C(0));
 
@@ -3146,10 +3048,8 @@ UT_TEST(test_shared_cf_fast_rejoin_evicts_prior_live_incarnation)
 	 * already-formed peer's fresh slot establishes fast_rejoin_incarnation
 	 * (a zero floor is bootstrap, never rollover evidence). */
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ(state->fast_rejoin_incarnation[1],
-				 UINT64_C(70));
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(70));
+	UT_ASSERT_EQ(state->fast_rejoin_incarnation[1], UINT64_C(70));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(70));
 	UT_ASSERT_EQ(cluster_reconfig_get_apply_counter(), UINT64_C(0));
 
 	/* A later fresh slot for the same live node is an incarnation rollover,
@@ -3158,8 +3058,7 @@ UT_TEST(test_shared_cf_fast_rejoin_evicts_prior_live_incarnation)
 	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(3), 0);
 	cluster_reconfig_lmon_tick();
 	cluster_reconfig_get_last_event(&event);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_DEAD);
 	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_FAIL_STOP);
 	UT_ASSERT((event.dead_bitmap[0] & UINT8_C(0x02)) != 0);
 	UT_ASSERT_EQ(event.new_epoch, UINT64_C(1));
@@ -3246,16 +3145,14 @@ UT_TEST(test_fast_rejoin_control_episode_carries_only_bound_join_to_terminal)
 	UT_ASSERT_EQ(target, 1);
 	memcpy(&marker, slot, sizeof(marker));
 	UT_ASSERT_EQ((int)marker.phase, (int)CLUSTER_JCMK_PHASE_COMMITTED);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
-				 (int)CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2), (int)CLUSTER_MEMBER_DEAD);
 
 	/* Complete the bound terminal so no process-local stage leaks to later tests. */
 	ut_join_qvotec_complete_write(true);
 	cluster_reconfig_lmon_tick();
 	cluster_reconfig_get_last_event(&event);
 	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_MEMBER);
 	UT_ASSERT(!jb_test(state->fast_rejoin_bitmap, 1));
 
 	ut_authority_managed = false;
@@ -3293,8 +3190,7 @@ UT_TEST(test_fast_rejoin_control_episode_lms_generation_loss_fails_closed)
 	memcpy(&marker, slot, sizeof(marker));
 	UT_ASSERT_EQ((int)marker.phase, (int)CLUSTER_JCMK_PHASE_COMMITTED);
 	UT_ASSERT_EQ(marker.admitted_incarnation, UINT64_C(77));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_JOINING);
 
 	/* Complete the already-authorized terminal so no stage leaks to later
 	 * tests: the drain publishes JOIN_COMMITTED after the majority ACK. */
@@ -3302,8 +3198,7 @@ UT_TEST(test_fast_rejoin_control_episode_lms_generation_loss_fails_closed)
 	cluster_reconfig_lmon_tick();
 	cluster_reconfig_get_last_event(&event);
 	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_MEMBER);
 
 	/* Fail-closed half: restoring the old generation must NOT resurrect the
 	 * capability — an unrelated newly eligible peer stays out of the episode
@@ -3318,8 +3213,7 @@ UT_TEST(test_fast_rejoin_control_episode_lms_generation_loss_fails_closed)
 	cluster_reconfig_get_last_event(&event);
 	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
 	UT_ASSERT(!jb_test(event.join_bitmap, 2));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
-				 (int)CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2), (int)CLUSTER_MEMBER_DEAD);
 
 	ut_authority_managed = false;
 	ut_serving_ready = false;
@@ -3346,8 +3240,7 @@ UT_TEST(test_legacy_online_join_off_does_not_evict_live_member)
 	apply_before = cluster_reconfig_get_apply_counter();
 
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_MEMBER);
 	UT_ASSERT_EQ(cluster_reconfig_get_apply_counter(), apply_before);
 }
 
@@ -3467,27 +3360,22 @@ UT_TEST(test_cold_bootstrap_records_exact_floor_before_opening_gate)
 		UT_ASSERT_EQ(state->self_join_admitted, 0);
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 					 (int)CLUSTER_MEMBER_JOINING);
-		UT_ASSERT_EQ(
-			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-			UINT64_C(0));
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+					 UINT64_C(0));
 
-		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61),
-									 UINT64_C(61));
+		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61), UINT64_C(61));
 		cluster_reconfig_lmon_tick();
-		UT_ASSERT_EQ(
-			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-			UINT64_C(61));
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+					 UINT64_C(61));
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 					 (int)CLUSTER_MEMBER_MEMBER);
 		UT_ASSERT_EQ(state->self_join_admitted, 1);
 		UT_ASSERT(ut_self_member_callback_seen);
-		UT_ASSERT_EQ((int)ut_self_member_callback_gate,
-					 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
+		UT_ASSERT_EQ((int)ut_self_member_callback_gate, (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 
 		cluster_reconfig_lmon_tick();
-		UT_ASSERT_EQ(
-			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-			UINT64_C(61));
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+					 UINT64_C(61));
 		UT_ASSERT_EQ(state->self_join_admitted, 1);
 		fflush(stdout);
 		_exit(ut_current_failed == 0 ? 0 : 1);
@@ -3519,17 +3407,15 @@ UT_TEST(test_initial_bootstrap_stripe_gate_publishes_control_member_only)
 		cluster_online_join = true;
 		ut_join_setup();
 		ut_in_quorum_value = true;
-		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61),
-									 UINT64_C(61));
+		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61), UINT64_C(61));
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
 
 		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
 		cluster_reconfig_lmon_tick();
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 					 (int)CLUSTER_MEMBER_MEMBER);
-		UT_ASSERT_EQ(
-			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-			UINT64_C(61));
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+					 UINT64_C(61));
 		UT_ASSERT_EQ(state->self_join_admitted, 0);
 
 		/* HOLD remains idempotent and cannot latch the one-shot decision. */
@@ -3542,9 +3428,8 @@ UT_TEST(test_initial_bootstrap_stripe_gate_publishes_control_member_only)
 		cluster_reconfig_lmon_tick();
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
 					 (int)CLUSTER_MEMBER_MEMBER);
-		UT_ASSERT_EQ(
-			cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-			UINT64_C(61));
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+					 UINT64_C(61));
 		UT_ASSERT_EQ(state->self_join_admitted, 1);
 		fflush(stdout);
 		_exit(ut_current_failed == 0 ? 0 : 1);
@@ -3578,16 +3463,14 @@ UT_TEST(test_late_initial_node_becomes_online_joiner)
 		ut_join_setup();
 		cluster_node_id = 1;
 		ut_in_quorum_value = true;
-		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61),
-									 UINT64_C(61));
+		ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61), UINT64_C(61));
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
 		for (i = 0; i < 4; i++) {
 			ut_declared_set[i] = true;
 			if (i == cluster_node_id)
 				continue;
-			cluster_reconfig_record_observed_slot(
-				i, UINT64_C(100) + (uint64)i, UINT64_C(1),
-				CLUSTER_EPOCH_INITIAL);
+			cluster_reconfig_record_observed_slot(i, UINT64_C(100) + (uint64)i, UINT64_C(1),
+												  CLUSTER_EPOCH_INITIAL);
 			cluster_reconfig_record_observed_fresh_alive(i, true);
 		}
 
@@ -3602,8 +3485,7 @@ UT_TEST(test_late_initial_node_becomes_online_joiner)
 		 * advanced their formation.  Their fresh QVOTEC-authenticated slot is
 		 * still sufficient to close this node's gate and classify it as an
 		 * ordinary JCMK joiner; it is never authority to admit the node. */
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_slot(0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
 		cluster_reconfig_record_observed_fresh_alive(0, true);
 		ut_in_quorum_value = false;
 		cluster_reconfig_lmon_tick();
@@ -3648,8 +3530,7 @@ UT_TEST(test_late_joiner_does_not_adopt_stale_peer_epoch)
 		ut_declared_set[1] = true;
 		ut_in_quorum_value = false;
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_slot(0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
 		cluster_reconfig_record_observed_fresh_alive(0, false);
 
 		cluster_reconfig_lmon_tick();
@@ -3694,8 +3575,7 @@ UT_TEST(test_late_joiner_epoch_adoption_waits_for_exact_publish_window)
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
 
 		cluster_reconfig_bootstrap_publish_begin();
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(101), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_slot(0, UINT64_C(101), UINT64_C(2), UINT64_C(7));
 		cluster_reconfig_record_observed_fresh_alive(0, true);
 		cluster_reconfig_lmon_tick();
 		UT_ASSERT_EQ(cluster_epoch_get_current(), CLUSTER_EPOCH_INITIAL);
@@ -3740,11 +3620,9 @@ UT_TEST(test_late_joiner_deadline_starts_only_after_stripe_claim_owned)
 		cluster_node_id = 1;
 		ut_declared_set[0] = true;
 		ut_declared_set[1] = true;
-		ut_set_self_incarnation_sequence(UINT64_C(71), UINT64_C(71),
-									 UINT64_C(71));
+		ut_set_self_incarnation_sequence(UINT64_C(71), UINT64_C(71), UINT64_C(71));
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_slot(0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
 		cluster_reconfig_record_observed_fresh_alive(0, true);
 
 		/* Classification is allowed without local quorum, but ownership and
@@ -3806,11 +3684,9 @@ UT_TEST(test_clean_leave_suppresses_late_joiner_classification_and_progress)
 		ut_declared_set[0] = true;
 		ut_declared_set[1] = true;
 		ut_in_quorum_value = true;
-		ut_set_self_incarnation_sequence(UINT64_C(73), UINT64_C(73),
-									 UINT64_C(73));
+		ut_set_self_incarnation_sequence(UINT64_C(73), UINT64_C(73), UINT64_C(73));
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_slot(0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
 		cluster_reconfig_record_observed_fresh_alive(0, true);
 		ut_xid_stripe_progress = STRIPE_JOIN_CLAIM_OWNED;
 
@@ -3864,15 +3740,13 @@ UT_TEST(test_epoch0_late_founder_classifies_only_after_recovery)
 		ut_declared_set[0] = true;
 		ut_declared_set[3] = true;
 		ut_in_quorum_value = true;
-		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
-									 UINT64_C(83));
+		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83), UINT64_C(83));
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_slot(0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
 		cluster_reconfig_record_observed_fresh_alive(0, true);
 		cluster_membership_record_admitted(0, UINT64_C(80));
 		cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
-	ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
+		ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_DISK_PUBLISHED;
 		ut_wal_slot_verdict[0] = CLUSTER_WAL_SLOT_OK;
 		ut_wal_slot[0].thread_id = 1;
 		ut_wal_slot[0].node_id = 0;
@@ -3935,11 +3809,9 @@ UT_TEST(test_epoch0_current_authority_is_not_reclassified_as_late_founder)
 		ut_declared_set[0] = true;
 		ut_declared_set[3] = true;
 		ut_in_quorum_value = true;
-		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
-								 UINT64_C(83));
+		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83), UINT64_C(83));
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_slot(0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
 		cluster_reconfig_record_observed_fresh_alive(0, true);
 		cluster_membership_record_admitted(0, UINT64_C(80));
 		cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
@@ -3976,11 +3848,9 @@ ut_prepare_epoch0_managed_handoff(void)
 	ut_declared_set[0] = true;
 	ut_declared_set[3] = true;
 	ut_in_quorum_value = true;
-	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
-								 UINT64_C(83));
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83), UINT64_C(83));
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
-	cluster_reconfig_record_observed_slot(
-		0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_record_observed_slot(0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
 	cluster_reconfig_record_observed_fresh_alive(0, true);
 	cluster_membership_record_admitted(0, UINT64_C(80));
 	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
@@ -4022,37 +3892,29 @@ UT_TEST(test_pre_publish_join_handoff_is_exact_idempotent_and_nonblocking)
 	ut_lwlock_blocking_calls = 0;
 	/* Two exact peer captures precede the handoff's EXCLUSIVE claim. */
 	ut_lwlock_conditional_fail_call = 3;
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 3);
 	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 
-	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
-								 UINT64_C(83));
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83), UINT64_C(83));
 	ut_lwlock_conditional_fail_call = 0;
 	ut_lwlock_conditional_calls = 0;
 	ut_lwlock_blocking_calls = 0;
-	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 	UT_ASSERT(cluster_reconfig_pre_publish_join_handoff_current());
 
 	admitted_before = state->self_join_admitted;
 	failed_before = state->self_join_failed;
 	deadline_before = state->self_join_deadline_us;
-	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
-								 UINT64_C(83));
-	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83), UINT64_C(83));
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
 	UT_ASSERT_EQ(state->self_join_admitted, admitted_before);
 	UT_ASSERT_EQ(state->self_join_failed, failed_before);
 	UT_ASSERT_EQ(state->self_join_deadline_us, deadline_before);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-		cluster_node_id), UINT64_C(82));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(82));
 }
 
 /* Every conjunct is fail-closed: no generic managed+OFF+JOINING state may be
@@ -4064,46 +3926,35 @@ UT_TEST(test_pre_publish_join_handoff_rejects_nonexact_state)
 
 	state = ut_prepare_epoch0_managed_handoff();
 	ut_authority_readiness = CLUSTER_AUTHORITY_RECOVERY_READY;
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 
 	state = ut_prepare_epoch0_managed_handoff();
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(84), UINT64_C(82)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(84), UINT64_C(82)));
 
 	state = ut_prepare_epoch0_managed_handoff();
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(81)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(81)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	cluster_membership_record_admitted(cluster_node_id, UINT64_C(83));
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(83)));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(83)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 
 	state = ut_prepare_epoch0_managed_handoff();
 	cluster_membership_record_admitted(cluster_node_id, UINT64_C(84));
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(84)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(84)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	state->replacement_episode = ut_admitted_replacement_episode(cluster_node_id);
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	ut_clean_leave_in_progress = true;
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
 
 	state = ut_prepare_epoch0_managed_handoff();
-	state->removed_bitmap[cluster_node_id / 8]
-		|= (uint8)(1u << (cluster_node_id % 8));
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
+	state->removed_bitmap[cluster_node_id / 8] |= (uint8)(1u << (cluster_node_id % 8));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
 
 	state = ut_prepare_epoch0_managed_handoff();
 	state->self_join_failed = 1;
@@ -4116,12 +3967,9 @@ UT_TEST(test_pre_publish_join_handoff_rejects_nonexact_state)
 	UT_ASSERT(!cluster_reconfig_pre_publish_join_handoff_current());
 
 	state = ut_prepare_epoch0_managed_handoff();
-	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(84),
-								 UINT64_C(84));
-	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
+	ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(84), UINT64_C(84));
+	UT_ASSERT(!cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
 	UT_ASSERT_EQ(state->self_join_failed, 0);
 	UT_ASSERT_EQ(state->self_join_deadline_us, 0);
@@ -4130,8 +3978,7 @@ UT_TEST(test_pre_publish_join_handoff_rejects_nonexact_state)
 	 * handoff does not retain a second cross-boot identity authority. */
 
 	state = ut_prepare_epoch0_managed_handoff();
-	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
 	cluster_membership_record_admitted(cluster_node_id, UINT64_C(83));
 	UT_ASSERT(!cluster_reconfig_pre_publish_join_handoff_current());
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
@@ -4148,10 +3995,8 @@ UT_TEST(test_epoch0_managed_pivot_drives_ordinary_join_owner)
 	int status = 0;
 	ClusterReconfigState *state = ut_prepare_epoch0_managed_handoff();
 
-	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(
-		UINT64_C(83), UINT64_C(82)));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT(cluster_reconfig_stage_pre_publish_join_handoff(UINT64_C(83), UINT64_C(82)));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 
 	fflush(NULL);
 	pid = fork();
@@ -4160,8 +4005,7 @@ UT_TEST(test_epoch0_managed_pivot_drives_ordinary_join_owner)
 		return;
 	if (pid == 0) {
 		ut_current_failed = 0;
-		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83),
-									 UINT64_C(83));
+		ut_set_self_incarnation_sequence(UINT64_C(83), UINT64_C(83), UINT64_C(83));
 		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
 		ut_xid_stripe_progress = STRIPE_JOIN_CLAIM_OWNED;
 		ut_recovery_in_progress = false;
@@ -4183,14 +4027,14 @@ UT_TEST(test_epoch0_managed_pivot_drives_ordinary_join_owner)
 		cluster_reconfig_note_self_admitted(UINT64_C(7));
 		UT_ASSERT_EQ(state->self_join_admitted, 0);
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-						 (int)CLUSTER_MEMBER_JOINING);
+					 (int)CLUSTER_MEMBER_JOINING);
 		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 		cluster_reconfig_note_self_admitted(UINT64_C(7));
 		UT_ASSERT_EQ(state->self_join_admitted, 1);
 		UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-						 (int)CLUSTER_MEMBER_MEMBER);
-		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-			cluster_node_id), UINT64_C(83));
+					 (int)CLUSTER_MEMBER_MEMBER);
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
+					 UINT64_C(83));
 		fflush(stdout);
 		_exit(ut_current_failed == 0 ? 0 : 1);
 	}
@@ -4208,8 +4052,7 @@ UT_TEST(test_epoch0_late_founder_evidence_requires_exact_peer_and_pgxa)
 	ut_declared_set[0] = true;
 	ut_declared_set[3] = true;
 	ut_in_quorum_value = true;
-	cluster_reconfig_record_observed_slot(
-		0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_record_observed_slot(0, UINT64_C(80), UINT64_C(7), CLUSTER_EPOCH_INITIAL);
 	cluster_reconfig_record_observed_fresh_alive(0, true);
 	cluster_membership_record_admitted(0, UINT64_C(80));
 	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
@@ -4239,8 +4082,7 @@ UT_TEST(test_epoch0_late_founder_evidence_requires_exact_peer_and_pgxa)
 	cluster_reconfig_record_observed_fresh_alive(0, false);
 	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
 	cluster_reconfig_record_observed_fresh_alive(0, true);
-	cluster_reconfig_record_observed_slot(
-		0, UINT64_C(81), UINT64_C(8), CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_record_observed_slot(0, UINT64_C(81), UINT64_C(8), CLUSTER_EPOCH_INITIAL);
 	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
 	cluster_membership_record_admitted(0, UINT64_C(81));
 	UT_ASSERT(cluster_reconfig_epoch0_late_founder_evidence_current());
@@ -4250,8 +4092,7 @@ UT_TEST(test_epoch0_late_founder_evidence_requires_exact_peer_and_pgxa)
 	cluster_reconfig_bootstrap_publish_begin();
 	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
 	cluster_reconfig_bootstrap_publish_end();
-	cluster_reconfig_record_observed_slot(
-		0, UINT64_C(81), UINT64_C(9), UINT64_C(1));
+	cluster_reconfig_record_observed_slot(0, UINT64_C(81), UINT64_C(9), UINT64_C(1));
 	UT_ASSERT(!cluster_reconfig_epoch0_late_founder_evidence_current());
 }
 
@@ -4275,11 +4116,9 @@ UT_TEST(test_late_joiner_stripe_refuse_is_terminal_fail_closed)
 		ut_declared_set[0] = true;
 		ut_declared_set[1] = true;
 		ut_in_quorum_value = true;
-		ut_set_self_incarnation_sequence(UINT64_C(72), UINT64_C(72),
-									 UINT64_C(72));
+		ut_set_self_incarnation_sequence(UINT64_C(72), UINT64_C(72), UINT64_C(72));
 		state = (ClusterReconfigState *)reconfig_shmem_storage;
-		cluster_reconfig_record_observed_slot(
-			0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
+		cluster_reconfig_record_observed_slot(0, UINT64_C(100), UINT64_C(2), UINT64_C(7));
 		cluster_reconfig_record_observed_fresh_alive(0, true);
 		ut_xid_stripe_progress = STRIPE_JOIN_REFUSE;
 
@@ -4312,8 +4151,7 @@ UT_TEST(test_online_join_waits_for_own_stripe_claim)
 	ut_join_setup();
 	cluster_node_id = 1;
 	ut_declared_set[1] = true;
-	ut_set_self_incarnation_sequence(UINT64_C(81), UINT64_C(81),
-								 UINT64_C(81));
+	ut_set_self_incarnation_sequence(UINT64_C(81), UINT64_C(81), UINT64_C(81));
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
@@ -4322,20 +4160,16 @@ UT_TEST(test_online_join_waits_for_own_stripe_claim)
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-		cluster_node_id), UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(0));
 
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 	cluster_reconfig_note_self_admitted(UINT64_C(7));
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-		cluster_node_id), UINT64_C(81));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(81));
 	cluster_online_join = false;
 }
 
@@ -4350,8 +4184,7 @@ UT_TEST(test_online_join_waits_for_join_wal)
 	ut_join_setup();
 	cluster_node_id = 2;
 	ut_declared_set[2] = true;
-	ut_set_self_incarnation_sequence(UINT64_C(82), UINT64_C(82),
-								 UINT64_C(82));
+	ut_set_self_incarnation_sequence(UINT64_C(82), UINT64_C(82), UINT64_C(82));
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
@@ -4360,18 +4193,15 @@ UT_TEST(test_online_join_waits_for_join_wal)
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 	cluster_reconfig_note_self_admitted(UINT64_C(9));
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-		cluster_node_id), UINT64_C(82));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(82));
 	cluster_online_join = false;
 }
 
@@ -4433,18 +4263,14 @@ UT_TEST(test_offpath_member_requires_decided_boot_and_exact_current_floor)
 	ut_in_quorum_value = true;
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	ut_offpath_boot_decided = true;
-	ut_set_self_incarnation_sequence(UINT64_C(101), UINT64_C(101),
-								 UINT64_C(101));
+	ut_set_self_incarnation_sequence(UINT64_C(101), UINT64_C(101), UINT64_C(101));
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(101));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(101));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 	invalidations_after_publish = ut_authority_cache_invalidate_count;
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ(ut_authority_cache_invalidate_count,
-				 invalidations_after_publish);
+	UT_ASSERT_EQ(ut_authority_cache_invalidate_count, invalidations_after_publish);
 
 	/* With multiple declared nodes and no fresh bootstrap quorum, Shape A is
 	 * UNDECIDED.  The ordinary maintenance choke must withhold both floor and
@@ -4455,14 +4281,11 @@ UT_TEST(test_offpath_member_requires_decided_boot_and_exact_current_floor)
 	ut_declared_set[1] = true;
 	ut_declared_set[2] = true;
 	ut_offpath_boot_decided = false;
-	ut_set_self_incarnation_sequence(UINT64_C(102), UINT64_C(102),
-								 UINT64_C(102));
+	ut_set_self_incarnation_sequence(UINT64_C(102), UINT64_C(102), UINT64_C(102));
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(0));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 }
 
 UT_TEST(test_ordinary_self_floor_drift_and_high_water_fail_closed_then_retry)
@@ -4474,16 +4297,12 @@ UT_TEST(test_ordinary_self_floor_drift_and_high_water_fail_closed_then_retry)
 	ut_offpath_boot_decided = true;
 	ut_set_self_incarnation_sequence(0, 0, 0);
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(0));
 	ut_set_self_incarnation_sequence(UINT64_C(31), UINT64_C(31), UINT64_C(31));
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(31));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(31));
 
 	/* A change between the pre-lock and lock-held samples records nothing. */
 	ut_join_setup();
@@ -4491,16 +4310,12 @@ UT_TEST(test_ordinary_self_floor_drift_and_high_water_fail_closed_then_retry)
 	ut_offpath_boot_decided = true;
 	ut_set_self_incarnation_sequence(UINT64_C(40), UINT64_C(41), UINT64_C(41));
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(0));
 	ut_set_self_incarnation_sequence(UINT64_C(41), UINT64_C(41), UINT64_C(41));
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(41));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(41));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 
 	/* A post-record incarnation change leaves the raised floor but withholds
 	 * MEMBER until a later stable incarnation raises it again. */
@@ -4509,16 +4324,12 @@ UT_TEST(test_ordinary_self_floor_drift_and_high_water_fail_closed_then_retry)
 	ut_offpath_boot_decided = true;
 	ut_set_self_incarnation_sequence(UINT64_C(60), UINT64_C(60), UINT64_C(61));
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(60));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(60));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 	ut_set_self_incarnation_sequence(UINT64_C(61), UINT64_C(61), UINT64_C(61));
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(61));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(61));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 
 	/* Monotonic record_admitted cannot lower a prior floor.  Exact equality is
 	 * still required before MEMBER, then the matching formation retries. */
@@ -4528,16 +4339,12 @@ UT_TEST(test_ordinary_self_floor_drift_and_high_water_fail_closed_then_retry)
 	cluster_membership_record_admitted(cluster_node_id, UINT64_C(70));
 	ut_set_self_incarnation_sequence(UINT64_C(69), UINT64_C(69), UINT64_C(69));
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(70));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(70));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_JOINING);
 	ut_set_self_incarnation_sequence(UINT64_C(70), UINT64_C(70), UINT64_C(70));
 	cluster_reconfig_lmon_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(70));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(70));
 }
 
 UT_TEST(test_self_join_gate_lifecycle)
@@ -4585,18 +4392,15 @@ UT_TEST(test_replacement_member_publish_is_exact_and_write_closed)
 	wrong = episode;
 	wrong.phase = CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED;
 	UT_ASSERT(!cluster_reconfig_publish_replacement_member_closed(&wrong));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_ABSENT);
-	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
-				 (int)CLUSTER_JOIN_GATE_ALLOW);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
 
 	wrong = episode;
 	wrong.target_node_id = 3;
 	UT_ASSERT(!cluster_reconfig_publish_replacement_member_closed(&wrong));
 
 	UT_ASSERT(cluster_reconfig_publish_replacement_member_closed(&episode));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &episode, sizeof(episode)), 0);
@@ -4612,8 +4416,7 @@ UT_TEST(test_replacement_member_publish_is_exact_and_write_closed)
 	cluster_reconfig_note_self_admitted(episode.reserved_or_committed_epoch);
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 }
 
 /* The ordinary LMON self-state maintenance must not infer JOINING solely from
@@ -4632,12 +4435,10 @@ UT_TEST(test_lmon_preserves_replacement_admitted_member_while_write_closed)
 	UT_ASSERT(cluster_reconfig_publish_replacement_member_closed(&episode));
 	cluster_reconfig_lmon_tick();
 
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id),
-				 UINT64_C(0));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(cluster_node_id), UINT64_C(0));
 }
 
 /* With online join enabled, the ordinary cold-bootstrap classifier also runs
@@ -4658,8 +4459,7 @@ UT_TEST(test_ordinary_bootstrap_cannot_open_replacement_admitted_member)
 
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 	cluster_online_join = false;
 }
 
@@ -4701,35 +4501,27 @@ UT_TEST(test_uniform_open_requires_exact_replacement_episode_and_generation)
 	ut_join_setup();
 	episode = ut_admitted_replacement_episode(cluster_node_id);
 
-	UT_ASSERT(!cluster_reconfig_open_replacement_admission(
-		&episode, episode.state_generation));
+	UT_ASSERT(!cluster_reconfig_open_replacement_admission(&episode, episode.state_generation));
 	UT_ASSERT(cluster_reconfig_publish_replacement_member_closed(&episode));
 
-	UT_ASSERT(!cluster_reconfig_open_replacement_admission(
-		&episode, episode.state_generation + 1));
+	UT_ASSERT(!cluster_reconfig_open_replacement_admission(&episode, episode.state_generation + 1));
 	wrong = episode;
 	wrong.request_nonce++;
-	UT_ASSERT(!cluster_reconfig_open_replacement_admission(
-		&wrong, wrong.state_generation));
+	UT_ASSERT(!cluster_reconfig_open_replacement_admission(&wrong, wrong.state_generation));
 
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_JOINING);
-	UT_ASSERT(!cluster_reconfig_open_replacement_admission(
-		&episode, episode.state_generation));
+	UT_ASSERT(!cluster_reconfig_open_replacement_admission(&episode, episode.state_generation));
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 	cluster_membership_set_state(cluster_node_id, CLUSTER_MEMBER_MEMBER);
 
-	UT_ASSERT(cluster_reconfig_open_replacement_admission(
-		&episode, episode.state_generation));
-	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
-				 (int)CLUSTER_JOIN_GATE_ALLOW);
-	UT_ASSERT(cluster_reconfig_open_replacement_admission(
-		&episode, episode.state_generation));
+	UT_ASSERT(cluster_reconfig_open_replacement_admission(&episode, episode.state_generation));
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
+	UT_ASSERT(cluster_reconfig_open_replacement_admission(&episode, episode.state_generation));
 
 	/* A delayed closed-MEMBER duplicate cannot re-close a completed OPEN. */
 	UT_ASSERT(!cluster_reconfig_publish_replacement_member_closed(&episode));
-	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
-				 (int)CLUSTER_JOIN_GATE_ALLOW);
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
 }
 
 /* ======================================================================
@@ -4829,12 +4621,12 @@ UT_TEST(test_reconfig_bootstrap_quorum_epoch_proof)
 UT_TEST(test_reconfig_bootstrap_proof_seqlock)
 {
 	ClusterReconfigState *state;
-	uint64		inc = 0;
+	uint64 inc = 0;
 
-	ut_join_setup();			/* self = node 0, fresh shmem, seq 0 even */
+	ut_join_setup(); /* self = node 0, fresh shmem, seq 0 even */
 	ut_declared_set[1] = true;
 	ut_declared_set[2] = true;
-	state = (ClusterReconfigState *) reconfig_shmem_storage;
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
 
 	/* --- A. ODD seq (writer in progress) is never accepted. --- */
 	cluster_reconfig_record_observed_slot(1, 7, 1, 0);
@@ -4861,10 +4653,10 @@ UT_TEST(test_reconfig_bootstrap_proof_seqlock)
 	 *        publishes fresh for the same round inside the same window,
 	 *        so the mixed state cannot survive end(). --- */
 	pg_atomic_write_u64(&state->observed_bootstrap_seq, 5); /* begin: odd */
-	cluster_reconfig_record_observed_slot(1, 9, 2, 0);	   /* NEW incarnation */
+	cluster_reconfig_record_observed_slot(1, 9, 2, 0);		/* NEW incarnation */
 	/* fresh_alive(1) is still true from the OLD round — the mixed view */
 	UT_ASSERT(!cluster_reconfig_bootstrap_proof_node(1, &inc)); /* odd: reject */
-	pg_atomic_write_u64(&state->observed_bootstrap_seq, 6); /* end: even */
+	pg_atomic_write_u64(&state->observed_bootstrap_seq, 6);		/* end: even */
 	UT_ASSERT(cluster_reconfig_bootstrap_proof_node(1, &inc));
 	UT_ASSERT(inc == UINT64_C(9));
 
@@ -4998,22 +4790,20 @@ UT_TEST(test_reconfig_bootstrap_proof_stale_slot_failclosed)
 }
 
 static bool
-ut_join_qvotec_poll_write_pending(int32 *target_node_out,
-								  void *write_slot512_out)
+ut_join_qvotec_poll_write_pending(int32 *target_node_out, void *write_slot512_out)
 {
 	ClusterJoinMarkerMailboxOperationV1 operation;
 	bool pending;
 
-	pending = cluster_reconfig_join_qvotec_poll_pending(
-		&operation, target_node_out, write_slot512_out);
+	pending
+		= cluster_reconfig_join_qvotec_poll_pending(&operation, target_node_out, write_slot512_out);
 	return pending && operation == CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT;
 }
 
 static void
 ut_join_qvotec_complete_write(bool acked)
 {
-	cluster_reconfig_join_qvotec_complete(
-		CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT, acked, NULL);
+	cluster_reconfig_join_qvotec_complete(CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT, acked, NULL);
 }
 
 static void
@@ -5074,13 +4864,11 @@ UT_TEST(test_join_commit_clears_only_owner_after_root_rejoin_gate)
 	UT_ASSERT_EQ(ut_owner_rejoin_incarnation, UINT64_C(77));
 	UT_ASSERT(ut_fence_async_marker_captured);
 	UT_ASSERT(cluster_fence_marker_valid_v1(&ut_fence_async_marker));
-	UT_ASSERT_EQ((int)ut_fence_async_marker.marker_kind,
-				 (int)CLUSTER_FENCE_MARKER_KIND_BASELINE);
+	UT_ASSERT_EQ((int)ut_fence_async_marker.marker_kind, (int)CLUSTER_FENCE_MARKER_KIND_BASELINE);
 	UT_ASSERT_EQ(ut_fence_async_marker.fenced_dead_bitmap[0], UINT8_C(0x04));
 	cluster_reconfig_get_last_event(&applied);
 	UT_ASSERT_EQ(applied.event_id, UINT64_C(501));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_JOINING);
 
 	ut_fence_async_poll_pr = CLUSTER_MARKER_POLL_ACKED;
 	ut_fence_async_poll_result = CLUSTER_FENCE_MARKER_SUBMIT_ACK;
@@ -5089,10 +4877,8 @@ UT_TEST(test_join_commit_clears_only_owner_after_root_rejoin_gate)
 	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
 	UT_ASSERT_EQ(ut_fence_async_marker.fence_epoch, applied.new_epoch);
 	UT_ASSERT_EQ(ut_fence_async_marker.fence_event_id, applied.event_id);
-	UT_ASSERT_EQ(ut_fence_async_marker.fence_generation,
-				 applied.cssd_dead_generation);
-	UT_ASSERT_EQ(ut_fence_async_marker.issuer_node_id,
-				 applied.coordinator_node_id);
+	UT_ASSERT_EQ(ut_fence_async_marker.fence_generation, applied.cssd_dead_generation);
+	UT_ASSERT_EQ(ut_fence_async_marker.issuer_node_id, applied.coordinator_node_id);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x02)) == 0);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x04)) != 0);
 	MyBackendType = B_INVALID;
@@ -5110,8 +4896,7 @@ UT_TEST(test_join_commit_root_gate_failure_keeps_owner_excluded)
 	cluster_reconfig_get_last_event(&applied);
 	UT_ASSERT_EQ(applied.event_id, UINT64_C(501));
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x02)) != 0);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_JOINING);
 	MyBackendType = B_INVALID;
 	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
 	cluster_online_join = false;
@@ -5130,8 +4915,7 @@ UT_TEST(test_join_commit_fence_ack_failure_keeps_owner_excluded)
 	cluster_reconfig_get_last_event(&applied);
 	UT_ASSERT_EQ(applied.event_id, UINT64_C(501));
 	UT_ASSERT_EQ(applied.dead_bitmap[0], UINT8_C(0x06));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_JOINING);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_JOINING);
 	MyBackendType = B_INVALID;
 	cluster_write_fence_enforcement = CLUSTER_WRITE_FENCE_ENFORCE_OFF;
 	cluster_online_join = false;
@@ -5229,8 +5013,7 @@ UT_TEST(test_survivor_join_observation_requires_root_rejoin_gate)
 	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
 	UT_ASSERT_EQ(ut_owner_rejoin_node, 2);
 	UT_ASSERT_EQ(ut_owner_rejoin_incarnation, UINT64_C(77));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
-				 (int)CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2), (int)CLUSTER_MEMBER_DEAD);
 	cluster_reconfig_get_last_event(&applied);
 	UT_ASSERT_EQ(applied.event_id, UINT64_C(601));
 	UT_ASSERT_EQ(applied.dead_bitmap[0], UINT8_C(0x0c));
@@ -5244,11 +5027,9 @@ UT_TEST(test_survivor_join_observation_clears_only_gated_origin)
 	ut_stage_survivor_join_observation(true);
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2), (int)CLUSTER_MEMBER_MEMBER);
 	cluster_reconfig_get_last_event(&applied);
-	UT_ASSERT_EQ((int)applied.reconfig_kind,
-				 (int)RECONFIG_KIND_JOIN_COMMITTED);
+	UT_ASSERT_EQ((int)applied.reconfig_kind, (int)RECONFIG_KIND_JOIN_COMMITTED);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x04)) == 0);
 	UT_ASSERT((applied.dead_bitmap[0] & UINT8_C(0x08)) != 0);
 	cluster_online_join = false;
@@ -5263,16 +5044,14 @@ UT_TEST(test_survivor_join_observation_waits_for_serving_ready)
 	ut_serving_ready = false;
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(ut_owner_rejoin_calls, 0);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
-				 (int)CLUSTER_MEMBER_DEAD);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2), (int)CLUSTER_MEMBER_DEAD);
 	cluster_reconfig_get_last_event(&applied);
 	UT_ASSERT_EQ(applied.event_id, UINT64_C(601));
 
 	ut_serving_ready = true;
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(ut_owner_rejoin_calls, 1);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(2),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(2), (int)CLUSTER_MEMBER_MEMBER);
 	cluster_online_join = false;
 }
 
@@ -5307,8 +5086,7 @@ UT_TEST(test_reconfig_region3_mailbox_preserves_v2_and_canonical_v3)
 	cluster_join_marker_compute_crc(&v2);
 	cluster_marker_async_init(&async);
 	UT_ASSERT(cluster_reconfig_submit_join_marker_async(
-		&async, 2, &v2, CLUSTER_MARKER_KIND_JOIN_PREPARE,
-		(TimestampTz)UINT64_C(1000)));
+		&async, 2, &v2, CLUSTER_MARKER_KIND_JOIN_PREPARE, (TimestampTz)UINT64_C(1000)));
 	memset(slot, 0xa5, sizeof(slot));
 	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
 	UT_ASSERT_EQ(target, 2);
@@ -5336,15 +5114,13 @@ UT_TEST(test_reconfig_region3_mailbox_preserves_v2_and_canonical_v3)
 
 	cluster_marker_async_init(&async);
 	UT_ASSERT(cluster_reconfig_submit_replacement_marker_v3_async(
-		&async, 3, &v3, CLUSTER_MARKER_KIND_JOIN_COMMITTED,
-		(TimestampTz)UINT64_C(2000)));
+		&async, 3, &v3, CLUSTER_MARKER_KIND_JOIN_COMMITTED, (TimestampTz)UINT64_C(2000)));
 	memset(slot, 0xa5, sizeof(slot));
 	target = -1;
 	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
 	UT_ASSERT_EQ(target, 3);
 	UT_ASSERT_EQ(memcmp(slot, expected_v3, sizeof(expected_v3)), 0);
-	for (i = CLUSTER_JCMK_REPLACEMENT_BYTES;
-		 i < CLUSTER_VOTING_SLOT_BYTES; i++)
+	for (i = CLUSTER_JCMK_REPLACEMENT_BYTES; i < CLUSTER_VOTING_SLOT_BYTES; i++)
 		UT_ASSERT_EQ(slot[i], 0);
 	ut_join_qvotec_complete_write(true);
 
@@ -5353,15 +5129,13 @@ UT_TEST(test_reconfig_region3_mailbox_preserves_v2_and_canonical_v3)
 	v3.reserved0[0] = 1;
 	cluster_marker_async_init(&async);
 	UT_ASSERT(!cluster_reconfig_submit_replacement_marker_v3_async(
-		&async, 3, &v3, CLUSTER_MARKER_KIND_JOIN_COMMITTED,
-		(TimestampTz)UINT64_C(3000)));
+		&async, 3, &v3, CLUSTER_MARKER_KIND_JOIN_COMMITTED, (TimestampTz)UINT64_C(3000)));
 	UT_ASSERT(!cluster_marker_async_is_submitted(&async));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_request_seq), seq_before);
 	UT_ASSERT(!ut_join_qvotec_poll_write_pending(&target, slot));
 	v3.reserved0[0] = 0;
 	UT_ASSERT(!cluster_reconfig_submit_replacement_marker_v3_async(
-		&async, 4, &v3, CLUSTER_MARKER_KIND_JOIN_COMMITTED,
-		(TimestampTz)UINT64_C(3001)));
+		&async, 4, &v3, CLUSTER_MARKER_KIND_JOIN_COMMITTED, (TimestampTz)UINT64_C(3001)));
 	UT_ASSERT(!cluster_marker_async_is_submitted(&async));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_request_seq), seq_before);
 	UT_ASSERT(!ut_join_qvotec_poll_write_pending(&target, slot));
@@ -5386,12 +5160,9 @@ UT_TEST(test_reconfig_region3_mailbox_request_word_is_exact_duplex)
 	ut_join_setup();
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 12640);
-	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK,
-				 UINT32_C(0x0000007f));
-	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK,
-				 UINT32_C(0x7fffff80));
-	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED,
-				 UINT32_C(0x80000000));
+	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK, UINT32_C(0x0000007f));
+	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK, UINT32_C(0x7fffff80));
+	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED, UINT32_C(0x80000000));
 
 	memset(&marker, 0, sizeof(marker));
 	marker.magic = CLUSTER_JCMK_MAGIC;
@@ -5413,25 +5184,21 @@ UT_TEST(test_reconfig_region3_mailbox_request_word_is_exact_duplex)
 		&async, marker.target_node_id, (TimestampTz)UINT64_C(4000)));
 	UT_ASSERT_EQ(state->join_marker_request_word,
 				 CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED
-				 | (uint32)marker.target_node_id);
+					 | (uint32)marker.target_node_id);
 	for (i = 0; i < CLUSTER_JCMK_REPLACEMENT_BYTES; i++)
 		UT_ASSERT_EQ(state->join_pending_marker[i], 0);
 
 	memset(slot, 0xa5, sizeof(slot));
 	operation = CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT;
 	target = -1;
-	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(
-		&operation, &target, slot));
-	UT_ASSERT_EQ((int)operation,
-				 (int)CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED);
+	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot));
+	UT_ASSERT_EQ((int)operation, (int)CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED);
 	UT_ASSERT_EQ(target, marker.target_node_id);
 	for (i = 0; i < CLUSTER_VOTING_SLOT_BYTES; i++)
 		UT_ASSERT_EQ(slot[i], 0);
 	cluster_reconfig_join_qvotec_complete(operation, true, image);
-	UT_ASSERT_EQ(pg_atomic_read_u32(&state->join_marker_result),
-				 CLUSTER_JOIN_MARKER_SUBMIT_ACK);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_completion_seq),
-				 async.inflight_seq);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&state->join_marker_result), CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_completion_seq), async.inflight_seq);
 	UT_ASSERT_EQ(memcmp(state->join_pending_marker, image, sizeof(image)), 0);
 
 	/* The next VERIFY deliberately completes through the WRITE branch. */
@@ -5439,12 +5206,9 @@ UT_TEST(test_reconfig_region3_mailbox_request_word_is_exact_duplex)
 	UT_ASSERT(cluster_reconfig_verify_replacement_committed_closed_async(
 		&async, marker.target_node_id, (TimestampTz)UINT64_C(5000)));
 	memset(slot, 0xa5, sizeof(slot));
-	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(
-		&operation, &target, slot));
-	cluster_reconfig_join_qvotec_complete(
-		CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT, true, NULL);
-	UT_ASSERT_EQ(pg_atomic_read_u32(&state->join_marker_result),
-				 CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
+	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot));
+	cluster_reconfig_join_qvotec_complete(CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT, true, NULL);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&state->join_marker_result), CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
 	for (i = 0; i < CLUSTER_JCMK_REPLACEMENT_BYTES; i++)
 		UT_ASSERT_EQ(state->join_pending_marker[i], 0);
 }
@@ -5466,58 +5230,41 @@ UT_TEST(test_reconfig_qvotec_lifecycle_double_invalidates_mailboxes)
 	memset(authority_zero, 0, sizeof(authority_zero));
 	pg_atomic_init_u32(&qvotec_status, CLUSTER_QVOTEC_READY);
 	state->join_marker_request_word = UINT32_C(5);
-	memset(state->join_pending_marker, 0x5a,
-		   sizeof(state->join_pending_marker));
-	memcpy(payload_before, state->join_pending_marker,
-		   sizeof(payload_before));
+	memset(state->join_pending_marker, 0x5a, sizeof(state->join_pending_marker));
+	memcpy(payload_before, state->join_pending_marker, sizeof(payload_before));
 	pg_atomic_write_u64(&state->join_marker_request_seq, UINT64_C(701));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(701));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 
 	/* Poll transfers the persistent request to the old QVOTEC process. */
-	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(
-		&operation, &target, slot));
-	UT_ASSERT_EQ((int)operation,
-				 (int)CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT);
+	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot));
+	UT_ASSERT_EQ((int)operation, (int)CLUSTER_JOIN_MARKER_MAILBOX_WRITE_EXACT);
 	UT_ASSERT_EQ(target, 5);
 
-	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
-		&authority_mailbox, &qvotec_status,
-		CLUSTER_QVOTEC_SHUTTING_DOWN));
-	UT_ASSERT_EQ(pg_atomic_read_u32(&qvotec_status),
-				 CLUSTER_QVOTEC_SHUTTING_DOWN);
-	UT_ASSERT_EQ(memcmp(&authority_mailbox, authority_zero,
-					 sizeof(authority_mailbox)), 0);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_request_seq),
-				 UINT64_C(701));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_completion_seq),
-				 UINT64_C(0));
-	UT_ASSERT_EQ(pg_atomic_read_u32(&state->join_marker_result),
-				 CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
+	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(&authority_mailbox, &qvotec_status,
+														   CLUSTER_QVOTEC_SHUTTING_DOWN));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&qvotec_status), CLUSTER_QVOTEC_SHUTTING_DOWN);
+	UT_ASSERT_EQ(memcmp(&authority_mailbox, authority_zero, sizeof(authority_mailbox)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_request_seq), UINT64_C(701));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_completion_seq), UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&state->join_marker_result), CLUSTER_JOIN_MARKER_SUBMIT_FAILED);
 	UT_ASSERT_EQ(state->join_marker_request_word, UINT32_C(5));
-	UT_ASSERT_EQ(memcmp(state->join_pending_marker, payload_before,
-					 sizeof(payload_before)), 0);
+	UT_ASSERT_EQ(memcmp(state->join_pending_marker, payload_before, sizeof(payload_before)), 0);
 
 	/* The successor repeats the invalidation before publishing a latch. */
 	memset(&authority_mailbox, 0xa5, sizeof(authority_mailbox));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(701));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
-	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
-		&authority_mailbox, &qvotec_status, CLUSTER_QVOTEC_STARTING));
-	UT_ASSERT_EQ(pg_atomic_read_u32(&qvotec_status),
-				 CLUSTER_QVOTEC_STARTING);
-	UT_ASSERT_EQ(memcmp(&authority_mailbox, authority_zero,
-					 sizeof(authority_mailbox)), 0);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_completion_seq),
-				 UINT64_C(0));
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(&authority_mailbox, &qvotec_status,
+														   CLUSTER_QVOTEC_STARTING));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&qvotec_status), CLUSTER_QVOTEC_STARTING);
+	UT_ASSERT_EQ(memcmp(&authority_mailbox, authority_zero, sizeof(authority_mailbox)), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->join_marker_completion_seq), UINT64_C(0));
 
-	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
-		&authority_mailbox, &qvotec_status, CLUSTER_QVOTEC_READY));
+	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(&authority_mailbox, &qvotec_status,
+														   CLUSTER_QVOTEC_READY));
 	UT_ASSERT_EQ(pg_atomic_read_u32(&qvotec_status), CLUSTER_QVOTEC_READY);
-	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(
-		&operation, &target, slot));
+	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot));
 	UT_ASSERT_EQ(target, 5);
 	UT_ASSERT_EQ(memcmp(slot, payload_before, sizeof(payload_before)), 0);
 	cluster_reconfig_join_qvotec_complete(operation, false, NULL);
@@ -5538,17 +5285,15 @@ UT_TEST(test_reconfig_target_refuses_ready_without_startup_closure_proof)
 	episode = ut_admitted_replacement_episode(cluster_node_id);
 	episode.phase = CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED;
 	episode.state_generation = UINT32_C(17);
-	episode.readiness_flags
-		= CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY
-		  | CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED;
+	episode.readiness_flags = CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY
+							  | CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED;
 	state->replacement_episode = episode;
 	state->self_join_admitted = 0;
 	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
 
 	memset(&marker, 0, sizeof(marker));
 	marker.magic = CLUSTER_JCMK_MAGIC;
@@ -5559,8 +5304,7 @@ UT_TEST(test_reconfig_target_refuses_ready_without_startup_closure_proof)
 	marker.old_admitted_incarnation = episode.old_admitted_incarnation;
 	marker.fresh_incarnation = episode.fresh_incarnation;
 	marker.baseline_epoch = episode.baseline_epoch;
-	marker.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	marker.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	marker.request_nonce = episode.request_nonce;
 	memcpy(marker.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(marker.expected_purge_survivors));
@@ -5569,8 +5313,7 @@ UT_TEST(test_reconfig_target_refuses_ready_without_startup_closure_proof)
 	memcpy(state->join_pending_marker, marker_image, sizeof(marker_image));
 	pg_atomic_write_u64(&state->join_marker_request_seq, UINT64_C(900));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(900));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 
 	memset(&expected, 0, sizeof(expected));
 	expected.status = CLUSTER_R4_PREREQUISITE_R4A_READY;
@@ -5585,10 +5328,8 @@ UT_TEST(test_reconfig_target_refuses_ready_without_startup_closure_proof)
 	expected.grammar_fingerprint = episode.grammar_fingerprint;
 
 	UT_ASSERT(!cluster_reconfig_r4_publish_ready(&expected));
-	UT_ASSERT_EQ(state->replacement_episode.state_generation,
-				 episode.state_generation);
-	UT_ASSERT_EQ(state->replacement_episode.readiness_flags,
-				 episode.readiness_flags);
+	UT_ASSERT_EQ(state->replacement_episode.state_generation, episode.state_generation);
+	UT_ASSERT_EQ(state->replacement_episode.readiness_flags, episode.readiness_flags);
 	observed = cluster_reconfig_r4_prerequisite_snapshot();
 	UT_ASSERT_EQ(observed.status, CLUSTER_R4_PREREQUISITE_RF_DEFERRED);
 	UT_ASSERT(!observed.ready);
@@ -5618,14 +5359,12 @@ UT_TEST(test_reconfig_phase3_observation_sets_only_existing_ready_bit)
 	episode = ut_admitted_replacement_episode(3);
 	episode.phase = CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED;
 	episode.state_generation = UINT32_C(17);
-	episode.readiness_flags
-		= CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY
-		  | CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED;
+	episode.readiness_flags = CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY
+							  | CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED;
 	state->replacement_episode = episode;
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
 
 	memset(&marker, 0, sizeof(marker));
 	marker.magic = CLUSTER_JCMK_MAGIC;
@@ -5643,37 +5382,32 @@ UT_TEST(test_reconfig_phase3_observation_sets_only_existing_ready_bit)
 	marker.grammar_fingerprint = episode.grammar_fingerprint;
 	cluster_marker_async_init(&async);
 	UT_ASSERT(cluster_reconfig_submit_replacement_marker_v3_async(
-		&async, marker.target_node_id, &marker,
-		CLUSTER_MARKER_KIND_JOIN_COMMITTED, (TimestampTz)UINT64_C(2000)));
+		&async, marker.target_node_id, &marker, CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+		(TimestampTz)UINT64_C(2000)));
 	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
 	UT_ASSERT_EQ(target, marker.target_node_id);
 	ut_join_qvotec_complete_write(true);
 
 	memset(&item, 0, sizeof(item));
-	item.message.phase
-		= CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY;
+	item.message.phase = CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY;
 	item.message.target_node_id = episode.target_node_id;
 	item.message.epoch = episode.baseline_epoch;
 	item.message.request_nonce = episode.request_nonce;
 	item.message.identity0 = episode.old_admitted_incarnation;
 	item.message.identity1 = episode.fresh_incarnation;
 	item.message.body.phase3.jcmk_generation = marker.generation;
-	item.message.body.phase3.episode_state_generation
-		= episode.state_generation;
+	item.message.body.phase3.episode_state_generation = episode.state_generation;
 	item.message.grammar_fingerprint = episode.grammar_fingerprint;
 	item.authenticated_source_node_id = episode.target_node_id;
 	item.local_receiver_node_id = episode.coordinator_node_id;
 	item.control_connection_generation = UINT32_C(9);
 
 	UT_ASSERT(cluster_reconfig_lmon_observe_replacement_ready(&item));
-	UT_ASSERT_EQ(state->replacement_episode.phase,
-				 CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
-	UT_ASSERT_EQ(state->replacement_episode.state_generation,
-				 episode.state_generation);
+	UT_ASSERT_EQ(state->replacement_episode.phase, CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
+	UT_ASSERT_EQ(state->replacement_episode.state_generation, episode.state_generation);
 	UT_ASSERT_EQ(state->replacement_episode.readiness_flags,
 				 CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK);
-	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
-				 (int)gate_before);
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)gate_before);
 }
 
 /* Building ADMITTED is a zero-mutation derivation from three exact durable
@@ -5701,8 +5435,7 @@ UT_TEST(test_reconfig_builds_admitted_only_from_terminal_same_episode)
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
 
 	memset(&committed, 0, sizeof(committed));
 	committed.magic = CLUSTER_JCMK_MAGIC;
@@ -5713,20 +5446,16 @@ UT_TEST(test_reconfig_builds_admitted_only_from_terminal_same_episode)
 	committed.old_admitted_incarnation = episode.old_admitted_incarnation;
 	committed.fresh_incarnation = episode.fresh_incarnation;
 	committed.baseline_epoch = episode.baseline_epoch;
-	committed.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	committed.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	committed.request_nonce = episode.request_nonce;
 	memcpy(committed.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(committed.expected_purge_survivors));
 	committed.grammar_fingerprint = episode.grammar_fingerprint;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&committed, committed_image));
-	memcpy(state->join_pending_marker, committed_image,
-		   sizeof(committed_image));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&committed, committed_image));
+	memcpy(state->join_pending_marker, committed_image, sizeof(committed_image));
 	pg_atomic_write_u64(&state->join_marker_request_seq, UINT64_C(9));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(9));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 
 	memset(&head, 0, sizeof(head));
 	head.value_version = CLUSTER_EPOCH_AUTHORITY_VALUE_VERSION;
@@ -5745,96 +5474,71 @@ UT_TEST(test_reconfig_builds_admitted_only_from_terminal_same_episode)
 	head.event_subject_bitmap[episode.target_node_id / 8]
 		= (uint8)(1u << (episode.target_node_id % 8));
 	head.grammar_fingerprint = episode.grammar_fingerprint;
-	memset(head.predecessor_digest, 0x5a,
-		   sizeof(head.predecessor_digest));
+	memset(head.predecessor_digest, 0x5a, sizeof(head.predecessor_digest));
 
 	cluster_membership_set_state(2, CLUSTER_MEMBER_ABSENT);
 	memset(&admitted, 0, sizeof(admitted));
-	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(
-		&head, &admitted));
+	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(&head, &admitted));
 	UT_ASSERT_EQ((int)admitted.phase, 0);
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
-	cluster_membership_set_state(episode.target_node_id,
-							 CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(
-		&head, &admitted));
+	cluster_membership_set_state(episode.target_node_id, CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(&head, &admitted));
 	UT_ASSERT_EQ((int)admitted.phase, 0);
-	cluster_membership_set_state(episode.target_node_id,
-							 CLUSTER_MEMBER_ABSENT);
+	cluster_membership_set_state(episode.target_node_id, CLUSTER_MEMBER_ABSENT);
 	cluster_membership_set_state(4, CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(
-		&head, &admitted));
+	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(&head, &admitted));
 	UT_ASSERT_EQ((int)admitted.phase, 0);
 	cluster_membership_set_state(4, CLUSTER_MEMBER_ABSENT);
 
 	ut_candidate2_capable[episode.target_node_id] = false;
 	memset(&admitted, 0, sizeof(admitted));
-	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(
-		&head, &admitted));
+	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(&head, &admitted));
 	UT_ASSERT_EQ((int)admitted.phase, 0);
 	ut_candidate2_capable[episode.target_node_id] = true;
 	ut_candidate2_capable[2] = false;
-	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(
-		&head, &admitted));
+	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(&head, &admitted));
 	UT_ASSERT_EQ((int)admitted.phase, 0);
 	ut_candidate2_capable[2] = true;
 
 	memset(&admitted, 0, sizeof(admitted));
-	UT_ASSERT(cluster_reconfig_lmon_build_replacement_admitted(
-		&head, &admitted));
-	UT_ASSERT_EQ((int)admitted.phase,
-				 CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
+	UT_ASSERT(cluster_reconfig_lmon_build_replacement_admitted(&head, &admitted));
+	UT_ASSERT_EQ((int)admitted.phase, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
 	UT_ASSERT_EQ(admitted.generation, committed.generation + 1);
-	UT_ASSERT_EQ(admitted.ready_state_generation,
-				 episode.state_generation);
+	UT_ASSERT_EQ(admitted.ready_state_generation, episode.state_generation);
 	built = admitted;
-	UT_ASSERT_EQ(state->replacement_episode.phase,
-				 CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
-	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
-				 (int)CLUSTER_JOIN_GATE_ALLOW);
+	UT_ASSERT_EQ(state->replacement_episode.phase, CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
 
 	head.request_nonce++;
 	memset(&admitted, 0, sizeof(admitted));
-	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(
-		&head, &admitted));
+	UT_ASSERT(!cluster_reconfig_lmon_build_replacement_admitted(&head, &admitted));
 	UT_ASSERT_EQ((int)admitted.phase, 0);
 
 	head.request_nonce--;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&built, committed_image));
-	memcpy(state->join_pending_marker, committed_image,
-		   sizeof(committed_image));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&built, committed_image));
+	memcpy(state->join_pending_marker, committed_image, sizeof(committed_image));
 	pg_atomic_write_u64(&state->join_marker_request_seq, UINT64_C(10));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(10));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 	ut_candidate2_capable[episode.target_node_id] = false;
-	UT_ASSERT(!cluster_reconfig_lmon_finalize_replacement_admitted(
-		&head, &built));
-	UT_ASSERT_EQ(state->replacement_episode.phase,
-				 CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
+	UT_ASSERT(!cluster_reconfig_lmon_finalize_replacement_admitted(&head, &built));
+	UT_ASSERT_EQ(state->replacement_episode.phase, CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(episode.target_node_id),
 				 (int)CLUSTER_MEMBER_ABSENT);
 	ut_candidate2_capable[episode.target_node_id] = true;
 	ut_candidate2_capable[2] = false;
-	UT_ASSERT(!cluster_reconfig_lmon_finalize_replacement_admitted(
-		&head, &built));
-	UT_ASSERT_EQ(state->replacement_episode.phase,
-				 CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
+	UT_ASSERT(!cluster_reconfig_lmon_finalize_replacement_admitted(&head, &built));
+	UT_ASSERT_EQ(state->replacement_episode.phase, CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(episode.target_node_id),
 				 (int)CLUSTER_MEMBER_ABSENT);
 	ut_candidate2_capable[2] = true;
-	UT_ASSERT(cluster_reconfig_lmon_finalize_replacement_admitted(
-		&head, &built));
-	UT_ASSERT_EQ(state->replacement_episode.phase,
-				 CLUSTER_REPLACEMENT_EPISODE_ADMITTED);
+	UT_ASSERT(cluster_reconfig_lmon_finalize_replacement_admitted(&head, &built));
+	UT_ASSERT_EQ(state->replacement_episode.phase, CLUSTER_REPLACEMENT_EPISODE_ADMITTED);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(episode.target_node_id),
 				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-					 episode.target_node_id),
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(episode.target_node_id),
 				 episode.fresh_incarnation);
-	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
-				 (int)CLUSTER_JOIN_GATE_ALLOW);
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
 }
 
 /* The formation LMON actor may publish ADMITTED/MEMBER only between two exact
@@ -5868,8 +5572,7 @@ UT_TEST(test_reconfig_lmon_admits_between_identical_terminal_head_reads)
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
 
 	memset(&committed, 0, sizeof(committed));
 	committed.magic = CLUSTER_JCMK_MAGIC;
@@ -5880,20 +5583,16 @@ UT_TEST(test_reconfig_lmon_admits_between_identical_terminal_head_reads)
 	committed.old_admitted_incarnation = episode.old_admitted_incarnation;
 	committed.fresh_incarnation = episode.fresh_incarnation;
 	committed.baseline_epoch = episode.baseline_epoch;
-	committed.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	committed.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	committed.request_nonce = episode.request_nonce;
 	memcpy(committed.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(committed.expected_purge_survivors));
 	committed.grammar_fingerprint = episode.grammar_fingerprint;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&committed, committed_image));
-	memcpy(state->join_pending_marker, committed_image,
-		   sizeof(committed_image));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&committed, committed_image));
+	memcpy(state->join_pending_marker, committed_image, sizeof(committed_image));
 	pg_atomic_write_u64(&state->join_marker_request_seq, UINT64_C(9));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(9));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 
 	memset(&head, 0, sizeof(head));
 	head.value_version = CLUSTER_EPOCH_AUTHORITY_VALUE_VERSION;
@@ -5912,10 +5611,9 @@ UT_TEST(test_reconfig_lmon_admits_between_identical_terminal_head_reads)
 	head.event_subject_bitmap[episode.target_node_id / 8]
 		= (uint8)(1u << (episode.target_node_id % 8));
 	head.grammar_fingerprint = episode.grammar_fingerprint;
-	memset(head.predecessor_digest, 0x5a,
-		   sizeof(head.predecessor_digest));
-	UT_ASSERT(cluster_epoch_authority_value_encode(
-		&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, head_image));
+	memset(head.predecessor_digest, 0x5a, sizeof(head.predecessor_digest));
+	UT_ASSERT(cluster_epoch_authority_value_encode(&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+												   head_image));
 
 	memset(&ballot, 0, sizeof(ballot));
 	ballot.counter = UINT64_C(7);
@@ -5927,12 +5625,9 @@ UT_TEST(test_reconfig_lmon_admits_between_identical_terminal_head_reads)
 	memset(&ut_authority_completion, 0, sizeof(ut_authority_completion));
 	ut_authority_completion.request_seq = UINT64_C(2);
 	ut_authority_completion.result = CLUSTER_QVOTEC_MAILBOX_CHOSEN;
-	memcpy(ut_authority_completion.completion_value, head_image,
-		   sizeof(head_image));
-	memcpy(ut_authority_completion.completion_ballot, ballot_image,
-		   sizeof(ballot_image));
-	ut_authority_completion.actor_phase
-		= CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
+	memcpy(ut_authority_completion.completion_value, head_image, sizeof(head_image));
+	memcpy(ut_authority_completion.completion_ballot, ballot_image, sizeof(ballot_image));
+	ut_authority_completion.actor_phase = CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
 
 	cluster_reconfig_lmon_replacement_admit_tick(); /* submit pre-read */
 	UT_ASSERT_EQ(ut_authority_submit_calls, 1);
@@ -5944,10 +5639,8 @@ UT_TEST(test_reconfig_lmon_admits_between_identical_terminal_head_reads)
 	if (ut_join_qvotec_poll_write_pending(&target, slot)) {
 		ClusterReplacementCommitMarkerV3 observed;
 
-		UT_ASSERT(cluster_replacement_marker_v3_decode(
-			slot, episode.target_node_id, &observed));
-		UT_ASSERT(observed.phase
-				  != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
+		UT_ASSERT(cluster_replacement_marker_v3_decode(slot, episode.target_node_id, &observed));
+		UT_ASSERT(observed.phase != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
 		ut_join_qvotec_complete_write(true);
 	}
 	UT_ASSERT_EQ((int)state->replacement_episode.phase,
@@ -5963,13 +5656,11 @@ UT_TEST(test_reconfig_lmon_admits_between_identical_terminal_head_reads)
 	memset(slot, 0, sizeof(slot));
 	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
 	UT_ASSERT_EQ(target, episode.target_node_id);
-	UT_ASSERT(cluster_replacement_marker_v3_decode(
-		slot, episode.target_node_id, &durable_admitted));
-	UT_ASSERT_EQ((int)durable_admitted.phase,
-				 (int)CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
+	UT_ASSERT(
+		cluster_replacement_marker_v3_decode(slot, episode.target_node_id, &durable_admitted));
+	UT_ASSERT_EQ((int)durable_admitted.phase, (int)CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
 	UT_ASSERT_EQ(durable_admitted.generation, committed.generation + 1);
-	UT_ASSERT_EQ(durable_admitted.ready_state_generation,
-				 episode.state_generation);
+	UT_ASSERT_EQ(durable_admitted.ready_state_generation, episode.state_generation);
 	ut_join_qvotec_complete_write(true);
 
 	cluster_reconfig_lmon_replacement_admit_tick(); /* observe ADMITTED ACK */
@@ -5979,15 +5670,12 @@ UT_TEST(test_reconfig_lmon_admits_between_identical_terminal_head_reads)
 	ut_authority_completion_ready = true;
 	cluster_reconfig_lmon_replacement_admit_tick(); /* consume + publish */
 
-	UT_ASSERT_EQ((int)state->replacement_episode.phase,
-				 (int)CLUSTER_REPLACEMENT_EPISODE_ADMITTED);
+	UT_ASSERT_EQ((int)state->replacement_episode.phase, (int)CLUSTER_REPLACEMENT_EPISODE_ADMITTED);
 	UT_ASSERT_EQ((int)cluster_membership_get_state(episode.target_node_id),
 				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(
-					 episode.target_node_id),
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(episode.target_node_id),
 				 episode.fresh_incarnation);
-	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
-				 (int)CLUSTER_JOIN_GATE_ALLOW);
+	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(), (int)CLUSTER_JOIN_GATE_ALLOW);
 }
 
 UT_TEST(test_reconfig_lmon_closed_apply_consumes_recovered_verify_pair)
@@ -6019,8 +5707,7 @@ UT_TEST(test_reconfig_lmon_closed_apply_consumes_recovered_verify_pair)
 	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_record_admitted(1, UINT64_C(111));
-	cluster_membership_record_admitted(
-		episode.target_node_id, episode.old_admitted_incarnation);
+	cluster_membership_record_admitted(episode.target_node_id, episode.old_admitted_incarnation);
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
 	UT_ASSERT(cluster_epoch_observe_remote(episode.baseline_epoch));
@@ -6034,14 +5721,12 @@ UT_TEST(test_reconfig_lmon_closed_apply_consumes_recovered_verify_pair)
 	committed.old_admitted_incarnation = episode.old_admitted_incarnation;
 	committed.fresh_incarnation = episode.fresh_incarnation;
 	committed.baseline_epoch = episode.baseline_epoch;
-	committed.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	committed.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	committed.request_nonce = episode.request_nonce;
 	memcpy(committed.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(committed.expected_purge_survivors));
 	committed.grammar_fingerprint = episode.grammar_fingerprint;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&committed, committed_image));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&committed, committed_image));
 
 	memset(&head, 0, sizeof(head));
 	head.value_version = CLUSTER_EPOCH_AUTHORITY_VALUE_VERSION;
@@ -6060,10 +5745,9 @@ UT_TEST(test_reconfig_lmon_closed_apply_consumes_recovered_verify_pair)
 	head.event_subject_bitmap[episode.target_node_id / 8]
 		= (uint8)(1u << (episode.target_node_id % 8));
 	head.grammar_fingerprint = episode.grammar_fingerprint;
-	memset(head.predecessor_digest, 0x5a,
-		   sizeof(head.predecessor_digest));
-	UT_ASSERT(cluster_epoch_authority_value_encode(
-		&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, head_image));
+	memset(head.predecessor_digest, 0x5a, sizeof(head.predecessor_digest));
+	UT_ASSERT(cluster_epoch_authority_value_encode(&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+												   head_image));
 
 	memset(&ballot, 0, sizeof(ballot));
 	ballot.counter = UINT64_C(7);
@@ -6074,47 +5758,36 @@ UT_TEST(test_reconfig_lmon_closed_apply_consumes_recovered_verify_pair)
 
 	cluster_reconfig_lmon_replacement_closed_tick();
 	UT_ASSERT_EQ(ut_authority_submit_calls, 1);
-	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(
-		&operation, &target, slot));
-	UT_ASSERT_EQ((int)operation,
-				 (int)CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED);
+	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot));
+	UT_ASSERT_EQ((int)operation, (int)CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED);
 	UT_ASSERT_EQ(target, episode.target_node_id);
 	cluster_reconfig_join_qvotec_complete(operation, true, committed_image);
 	cluster_marker_async_init(&conflicting_marker);
 	UT_ASSERT(!cluster_reconfig_submit_replacement_marker_v3_async(
-		&conflicting_marker, episode.target_node_id, &committed,
-		CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+		&conflicting_marker, episode.target_node_id, &committed, CLUSTER_MARKER_KIND_JOIN_COMMITTED,
 		(TimestampTz)UINT64_C(8000)));
 
-	memset(&ut_authority_completion, 0,
-		   sizeof(ut_authority_completion));
+	memset(&ut_authority_completion, 0, sizeof(ut_authority_completion));
 	ut_authority_completion.request_seq = UINT64_C(2);
 	ut_authority_completion.result = CLUSTER_QVOTEC_MAILBOX_CHOSEN;
-	memcpy(ut_authority_completion.completion_value, head_image,
-		   sizeof(head_image));
-	memcpy(ut_authority_completion.completion_ballot, ballot_image,
-		   sizeof(ballot_image));
-	ut_authority_completion.actor_phase
-		= CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
+	memcpy(ut_authority_completion.completion_value, head_image, sizeof(head_image));
+	memcpy(ut_authority_completion.completion_ballot, ballot_image, sizeof(ballot_image));
+	ut_authority_completion.actor_phase = CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
 	ut_authority_completion_ready = true;
 
 	cluster_reconfig_lmon_replacement_closed_tick();
 	UT_ASSERT_EQ((int)state->replacement_episode.phase,
 				 (int)CLUSTER_REPLACEMENT_EPISODE_COMMITTED_CLOSED);
-	UT_ASSERT_EQ(state->replacement_episode.state_generation,
-				 UINT32_C(18));
-	UT_ASSERT_EQ(cluster_epoch_get_current(),
-				 episode.reserved_or_committed_epoch);
+	UT_ASSERT_EQ(state->replacement_episode.state_generation, UINT32_C(18));
+	UT_ASSERT_EQ(cluster_epoch_get_current(), episode.reserved_or_committed_epoch);
 	cluster_reconfig_get_last_event(&event);
-	UT_ASSERT_EQ((int)event.reconfig_kind,
-				 (int)RECONFIG_KIND_REPLACEMENT_COMMITTED);
+	UT_ASSERT_EQ((int)event.reconfig_kind, (int)RECONFIG_KIND_REPLACEMENT_COMMITTED);
 	UT_ASSERT_EQ(event.old_epoch, episode.baseline_epoch);
 	UT_ASSERT_EQ(event.new_epoch, episode.reserved_or_committed_epoch);
-	UT_ASSERT_EQ((int)event.observer_role,
-				 (int)CLUSTER_RECONFIG_OBSERVER_SURVIVOR);
+	UT_ASSERT_EQ((int)event.observer_role, (int)CLUSTER_RECONFIG_OBSERVER_SURVIVOR);
 	UT_ASSERT_EQ((int)cluster_reconfig_lmon_publish_replacement_committed_closed(
-		UINT64_C(2), pg_atomic_read_u64(&state->join_marker_request_seq)),
-		(int)CLUSTER_REPLACEMENT_CLOSED_RETRY);
+					 UINT64_C(2), pg_atomic_read_u64(&state->join_marker_request_seq)),
+				 (int)CLUSTER_REPLACEMENT_CLOSED_RETRY);
 }
 
 /* Target QVOTEC must not infer replacement membership from one disk, a v2
@@ -6136,18 +5809,17 @@ UT_TEST(test_reconfig_qvotec_majority_admitted_publishes_member_closed)
 	state->replacement_episode = episode;
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
 
 	/* The immutable expected survivor set {1,2} has published E+1. */
 	ut_declared_set[1] = true;
 	ut_declared_set[2] = true;
 	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
-	cluster_reconfig_record_observed_slot(
-		1, UINT64_C(101), UINT64_C(1), episode.reserved_or_committed_epoch);
-	cluster_reconfig_record_observed_slot(
-		2, UINT64_C(102), UINT64_C(1), episode.reserved_or_committed_epoch);
+	cluster_reconfig_record_observed_slot(1, UINT64_C(101), UINT64_C(1),
+										  episode.reserved_or_committed_epoch);
+	cluster_reconfig_record_observed_slot(2, UINT64_C(102), UINT64_C(1),
+										  episode.reserved_or_committed_epoch);
 
 	memset(&admitted, 0, sizeof(admitted));
 	admitted.magic = CLUSTER_JCMK_MAGIC;
@@ -6158,43 +5830,37 @@ UT_TEST(test_reconfig_qvotec_majority_admitted_publishes_member_closed)
 	admitted.old_admitted_incarnation = episode.old_admitted_incarnation;
 	admitted.fresh_incarnation = episode.fresh_incarnation;
 	admitted.baseline_epoch = episode.baseline_epoch;
-	admitted.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	admitted.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	admitted.request_nonce = episode.request_nonce;
 	memcpy(admitted.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(admitted.expected_purge_survivors));
 	admitted.grammar_fingerprint = episode.grammar_fingerprint;
 	admitted.ready_state_generation = episode.state_generation;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&admitted, admitted_image));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&admitted, admitted_image));
 	memcpy(ut_join_disk_images[0], admitted_image, sizeof(admitted_image));
 	memcpy(ut_join_disk_images[1], admitted_image, sizeof(admitted_image));
 	ut_join_disk_readable[0] = true;
 
-	UT_ASSERT(!cluster_reconfig_qvotec_observe_replacement_admitted(
-		fds, 3, episode.fresh_incarnation));
+	UT_ASSERT(
+		!cluster_reconfig_qvotec_observe_replacement_admitted(fds, 3, episode.fresh_incarnation));
 	UT_ASSERT_EQ((int)state->replacement_episode.phase,
 				 (int)CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_ABSENT);
 
 	ut_join_disk_readable[1] = true;
-	UT_ASSERT(!cluster_reconfig_qvotec_observe_replacement_admitted(
-		fds, 3, episode.fresh_incarnation + 1));
+	UT_ASSERT(!cluster_reconfig_qvotec_observe_replacement_admitted(fds, 3,
+																	episode.fresh_incarnation + 1));
 	ut_candidate2_capable[2] = false;
-	UT_ASSERT(!cluster_reconfig_qvotec_observe_replacement_admitted(
-		fds, 3, episode.fresh_incarnation));
+	UT_ASSERT(
+		!cluster_reconfig_qvotec_observe_replacement_admitted(fds, 3, episode.fresh_incarnation));
 	UT_ASSERT_EQ((int)state->replacement_episode.phase,
 				 (int)CLUSTER_REPLACEMENT_EPISODE_POST_EPOCH);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_ABSENT);
 	ut_candidate2_capable[2] = true;
-	UT_ASSERT(cluster_reconfig_qvotec_observe_replacement_admitted(
-		fds, 3, episode.fresh_incarnation));
-	UT_ASSERT_EQ((int)state->replacement_episode.phase,
-				 (int)CLUSTER_REPLACEMENT_EPISODE_ADMITTED);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT(
+		cluster_reconfig_qvotec_observe_replacement_admitted(fds, 3, episode.fresh_incarnation));
+	UT_ASSERT_EQ((int)state->replacement_episode.phase, (int)CLUSTER_REPLACEMENT_EPISODE_ADMITTED);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(cluster_node_id), (int)CLUSTER_MEMBER_MEMBER);
 	UT_ASSERT_EQ((int)cluster_reconfig_self_join_gate_verdict(),
 				 (int)CLUSTER_JOIN_GATE_BLOCK_53R60);
 }
@@ -6220,13 +5886,11 @@ UT_TEST(test_reconfig_lmon_snapshots_only_exact_admitted_certificate)
 	state->replacement_episode = episode;
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
 	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(episode.target_node_id, CLUSTER_MEMBER_MEMBER);
-	cluster_membership_record_admitted(episode.target_node_id,
-								 episode.fresh_incarnation);
+	cluster_membership_record_admitted(episode.target_node_id, episode.fresh_incarnation);
 
 	memset(&admitted, 0, sizeof(admitted));
 	admitted.magic = CLUSTER_JCMK_MAGIC;
@@ -6237,50 +5901,41 @@ UT_TEST(test_reconfig_lmon_snapshots_only_exact_admitted_certificate)
 	admitted.old_admitted_incarnation = episode.old_admitted_incarnation;
 	admitted.fresh_incarnation = episode.fresh_incarnation;
 	admitted.baseline_epoch = episode.baseline_epoch;
-	admitted.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	admitted.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	admitted.request_nonce = episode.request_nonce;
 	memcpy(admitted.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(admitted.expected_purge_survivors));
 	admitted.grammar_fingerprint = episode.grammar_fingerprint;
 	admitted.ready_state_generation = episode.state_generation;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&admitted, admitted_image));
-	memcpy(state->join_pending_marker, admitted_image,
-		   sizeof(admitted_image));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&admitted, admitted_image));
+	memcpy(state->join_pending_marker, admitted_image, sizeof(admitted_image));
 	pg_atomic_write_u64(&state->join_marker_request_seq, UINT64_C(10));
 	pg_atomic_write_u64(&state->join_marker_completion_seq, UINT64_C(10));
-	pg_atomic_write_u32(&state->join_marker_result,
-						CLUSTER_JOIN_MARKER_SUBMIT_ACK);
+	pg_atomic_write_u32(&state->join_marker_result, CLUSTER_JOIN_MARKER_SUBMIT_ACK);
 
 	memset(&observed_episode, 0xa5, sizeof(observed_episode));
 	memset(&observed_marker, 0x5a, sizeof(observed_marker));
-	UT_ASSERT(cluster_reconfig_lmon_snapshot_replacement_admitted(
-		&observed_episode, &observed_marker));
+	UT_ASSERT(
+		cluster_reconfig_lmon_snapshot_replacement_admitted(&observed_episode, &observed_marker));
 	UT_ASSERT_EQ(memcmp(&observed_episode, &episode, sizeof(episode)), 0);
-	UT_ASSERT(cluster_replacement_marker_v3_same_image(
-		&observed_marker, &admitted));
+	UT_ASSERT(cluster_replacement_marker_v3_same_image(&observed_marker, &admitted));
 
 	memset(&observed_episode, 0xa5, sizeof(observed_episode));
 	memset(&observed_marker, 0x5a, sizeof(observed_marker));
 	before_episode = observed_episode;
 	before_marker = observed_marker;
 	cluster_membership_set_state(4, CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT(!cluster_reconfig_lmon_snapshot_replacement_admitted(
-		&observed_episode, &observed_marker));
-	UT_ASSERT_EQ(memcmp(&observed_episode, &before_episode,
-					 sizeof(observed_episode)), 0);
-	UT_ASSERT_EQ(memcmp(&observed_marker, &before_marker,
-					 sizeof(observed_marker)), 0);
+	UT_ASSERT(
+		!cluster_reconfig_lmon_snapshot_replacement_admitted(&observed_episode, &observed_marker));
+	UT_ASSERT_EQ(memcmp(&observed_episode, &before_episode, sizeof(observed_episode)), 0);
+	UT_ASSERT_EQ(memcmp(&observed_marker, &before_marker, sizeof(observed_marker)), 0);
 	cluster_membership_set_state(4, CLUSTER_MEMBER_ABSENT);
 
 	admitted.ready_state_generation++;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&admitted, admitted_image));
-	memcpy(state->join_pending_marker, admitted_image,
-		   sizeof(admitted_image));
-	UT_ASSERT(!cluster_reconfig_lmon_snapshot_replacement_admitted(
-		&observed_episode, &observed_marker));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&admitted, admitted_image));
+	memcpy(state->join_pending_marker, admitted_image, sizeof(admitted_image));
+	UT_ASSERT(
+		!cluster_reconfig_lmon_snapshot_replacement_admitted(&observed_episode, &observed_marker));
 }
 
 /* The target LMON is the CONTROL-plane sender for Startup's instantaneous
@@ -6310,11 +5965,9 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
 	cluster_qvotec_mailbox_restart_reset(&lifecycle_authority_mailbox);
 	pg_atomic_init_u32(&lifecycle_status, CLUSTER_QVOTEC_DOWN);
 	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
-		&lifecycle_authority_mailbox, &lifecycle_status,
-		CLUSTER_QVOTEC_STARTING));
+		&lifecycle_authority_mailbox, &lifecycle_status, CLUSTER_QVOTEC_STARTING));
 	UT_ASSERT(cluster_reconfig_qvotec_lifecycle_transition(
-		&lifecycle_authority_mailbox, &lifecycle_status,
-		CLUSTER_QVOTEC_READY));
+		&lifecycle_authority_mailbox, &lifecycle_status, CLUSTER_QVOTEC_READY));
 	cluster_node_id = 3;
 	MyBackendType = B_LMON;
 	ut_in_quorum_value = true;
@@ -6329,12 +5982,10 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
 	cluster_membership_set_state(1, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(2, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_record_admitted(1, UINT64_C(111));
-	cluster_membership_record_admitted(
-		episode.target_node_id, episode.old_admitted_incarnation);
+	cluster_membership_record_admitted(episode.target_node_id, episode.old_admitted_incarnation);
 	epoch_init_done = false;
 	cluster_epoch_shmem_init();
-	UT_ASSERT(cluster_epoch_observe_remote(
-		episode.reserved_or_committed_epoch));
+	UT_ASSERT(cluster_epoch_observe_remote(episode.reserved_or_committed_epoch));
 
 	memset(&committed, 0, sizeof(committed));
 	committed.magic = CLUSTER_JCMK_MAGIC;
@@ -6345,14 +5996,12 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
 	committed.old_admitted_incarnation = episode.old_admitted_incarnation;
 	committed.fresh_incarnation = episode.fresh_incarnation;
 	committed.baseline_epoch = episode.baseline_epoch;
-	committed.reserved_or_committed_epoch
-		= episode.reserved_or_committed_epoch;
+	committed.reserved_or_committed_epoch = episode.reserved_or_committed_epoch;
 	committed.request_nonce = episode.request_nonce;
 	memcpy(committed.expected_purge_survivors, episode.expected_survivors,
 		   sizeof(committed.expected_purge_survivors));
 	committed.grammar_fingerprint = episode.grammar_fingerprint;
-	UT_ASSERT(cluster_replacement_marker_v3_encode(
-		&committed, committed_image));
+	UT_ASSERT(cluster_replacement_marker_v3_encode(&committed, committed_image));
 
 	memset(&head, 0, sizeof(head));
 	head.value_version = CLUSTER_EPOCH_AUTHORITY_VALUE_VERSION;
@@ -6371,10 +6020,9 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
 	head.event_subject_bitmap[episode.target_node_id / 8]
 		= (uint8)(1u << (episode.target_node_id % 8));
 	head.grammar_fingerprint = episode.grammar_fingerprint;
-	memset(head.predecessor_digest, 0x5a,
-		   sizeof(head.predecessor_digest));
-	UT_ASSERT(cluster_epoch_authority_value_encode(
-		&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, head_image));
+	memset(head.predecessor_digest, 0x5a, sizeof(head.predecessor_digest));
+	UT_ASSERT(cluster_epoch_authority_value_encode(&head, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+												   head_image));
 
 	memset(&ballot, 0, sizeof(ballot));
 	ballot.counter = UINT64_C(7);
@@ -6387,51 +6035,39 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
 	cluster_reconfig_lmon_replacement_ready_tick();
 	UT_ASSERT_EQ(ut_phase3_send_calls, 0);
 	UT_ASSERT_EQ(ut_authority_submit_calls, 1);
-	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(
-		&operation, &target, slot));
-	UT_ASSERT_EQ((int)operation,
-				 (int)CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED);
+	UT_ASSERT(cluster_reconfig_join_qvotec_poll_pending(&operation, &target, slot));
+	UT_ASSERT_EQ((int)operation, (int)CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED);
 	UT_ASSERT_EQ(target, episode.target_node_id);
 	cluster_reconfig_join_qvotec_complete(operation, true, committed_image);
 	cluster_marker_async_init(&conflicting_marker);
 	UT_ASSERT(!cluster_reconfig_submit_replacement_marker_v3_async(
-		&conflicting_marker, episode.target_node_id, &committed,
-		CLUSTER_MARKER_KIND_JOIN_COMMITTED,
+		&conflicting_marker, episode.target_node_id, &committed, CLUSTER_MARKER_KIND_JOIN_COMMITTED,
 		(TimestampTz)UINT64_C(9000)));
 
-	memset(&ut_authority_completion, 0,
-		   sizeof(ut_authority_completion));
+	memset(&ut_authority_completion, 0, sizeof(ut_authority_completion));
 	ut_authority_completion.request_seq = UINT64_C(2);
 	ut_authority_completion.result = CLUSTER_QVOTEC_MAILBOX_CHOSEN;
-	memcpy(ut_authority_completion.completion_value, head_image,
-		   sizeof(head_image));
-	memcpy(ut_authority_completion.completion_ballot, ballot_image,
-		   sizeof(ballot_image));
-	ut_authority_completion.actor_phase
-		= CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
+	memcpy(ut_authority_completion.completion_value, head_image, sizeof(head_image));
+	memcpy(ut_authority_completion.completion_ballot, ballot_image, sizeof(ballot_image));
+	ut_authority_completion.actor_phase = CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
 	ut_authority_completion_ready = true;
 
 	cluster_reconfig_lmon_replacement_ready_tick();
 	UT_ASSERT_EQ(ut_phase3_send_calls, 1);
-	UT_ASSERT_EQ((int)ut_phase3_send_msg_type,
-				 (int)PGRAC_IC_MSG_GES_REQUEST);
+	UT_ASSERT_EQ((int)ut_phase3_send_msg_type, (int)PGRAC_IC_MSG_GES_REQUEST);
 	UT_ASSERT_EQ(ut_phase3_send_dest, episode.coordinator_node_id);
-	UT_ASSERT_EQ((int)ut_phase3_send_length,
-				 CLUSTER_REPLACEMENT_WIRE_BYTES);
+	UT_ASSERT_EQ((int)ut_phase3_send_length, CLUSTER_REPLACEMENT_WIRE_BYTES);
 	memcpy(first_image, ut_phase3_send_bytes, sizeof(first_image));
 	UT_ASSERT(cluster_replacement_wire_decode(first_image, &decoded));
-	UT_ASSERT_EQ((int)decoded.phase,
-				 CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	UT_ASSERT_EQ((int)decoded.phase, CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	UT_ASSERT_EQ(decoded.target_node_id, episode.target_node_id);
 	UT_ASSERT(decoded.body.phase3.jcmk_generation == committed.generation);
-	UT_ASSERT_EQ((int)decoded.body.phase3.episode_state_generation,
-				 (int)episode.state_generation);
+	UT_ASSERT_EQ((int)decoded.body.phase3.episode_state_generation, (int)episode.state_generation);
 
 	ut_phase3_send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
 	cluster_reconfig_lmon_replacement_ready_tick();
 	UT_ASSERT_EQ(ut_phase3_send_calls, 2);
-	UT_ASSERT_EQ(memcmp(first_image, ut_phase3_send_bytes,
-					 sizeof(first_image)), 0);
+	UT_ASSERT_EQ(memcmp(first_image, ut_phase3_send_bytes, sizeof(first_image)), 0);
 
 	ut_phase3_send_result = CLUSTER_IC_SEND_HARD_ERROR;
 	cluster_reconfig_lmon_replacement_ready_tick();
@@ -6456,8 +6092,7 @@ UT_TEST(test_thread_recovery_eligibility_uses_current_failstop_and_root_duty)
 	ReconfigEvent event;
 
 	cluster_reconfig_shmem_init();
-	memset(&ut_recovery_root_identity, 0,
-		   sizeof(ut_recovery_root_identity));
+	memset(&ut_recovery_root_identity, 0, sizeof(ut_recovery_root_identity));
 	ut_recovery_root_identity.system_identifier = UINT64_C(0x1234);
 	memset(ut_recovery_root_identity.storage_uuid, 0x11, 16);
 	memset(ut_recovery_root_identity.authority_uuid, 0x22, 16);
@@ -6480,21 +6115,17 @@ UT_TEST(test_thread_recovery_eligibility_uses_current_failstop_and_root_duty)
 	cluster_reconfig_publish_event(&event);
 
 	memset(&eligibility, 0xA5, sizeof(eligibility));
-	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(
-		1, &eligibility));
+	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
 	UT_ASSERT_EQ(eligibility.origin_thread, 1);
 	UT_ASSERT_EQ(eligibility.attempt_stamp, 7);
-	UT_ASSERT(memcmp(&eligibility.duty, &ut_recovery_root_identity,
-				 sizeof(eligibility.duty)) == 0);
+	UT_ASSERT(memcmp(&eligibility.duty, &ut_recovery_root_identity, sizeof(eligibility.duty)) == 0);
 
 	event.dead_bitmap[0] = 0;
 	cluster_reconfig_publish_event(&event);
 	memset(&eligibility, 0xA5, sizeof(eligibility));
-	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(
-		1, &eligibility));
-	UT_ASSERT(memcmp(&eligibility,
-				 &(ClusterThreadRecLaunchEligibility){ 0 },
-				 sizeof(eligibility)) == 0);
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT(memcmp(&eligibility, &(ClusterThreadRecLaunchEligibility){ 0 }, sizeof(eligibility))
+			  == 0);
 	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, NULL));
 }
 
@@ -6504,14 +6135,11 @@ UT_TEST(test_rejoin_observed_slot_getter_is_coherent)
 	uint64 generation = UINT64_MAX;
 
 	ut_join_setup();
-	UT_ASSERT(!cluster_reconfig_get_observed_slot_coherent(
-		1, &incarnation, &generation));
+	UT_ASSERT(!cluster_reconfig_get_observed_slot_coherent(1, &incarnation, &generation));
 	UT_ASSERT_EQ(incarnation, 0);
 	UT_ASSERT_EQ(generation, 0);
-	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(9),
-										  UINT64_C(12));
-	UT_ASSERT(cluster_reconfig_get_observed_slot_coherent(
-		1, &incarnation, &generation));
+	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(9), UINT64_C(12));
+	UT_ASSERT(cluster_reconfig_get_observed_slot_coherent(1, &incarnation, &generation));
 	UT_ASSERT_EQ(incarnation, UINT64_C(77));
 	UT_ASSERT_EQ(generation, UINT64_C(9));
 }
@@ -6537,8 +6165,7 @@ UT_TEST(test_rejoin_failure_snapshot_requires_exact_nonempty_survivors_and_floor
 	event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 	cluster_reconfig_publish_event(&event);
 
-	UT_ASSERT(cluster_reconfig_rejoin_failure_snapshot(
-		1, UINT64_C(70), &failure));
+	UT_ASSERT(cluster_reconfig_rejoin_failure_snapshot(1, UINT64_C(70), &failure));
 	UT_ASSERT_EQ(failure.reconfig_kind, RECONFIG_KIND_FAIL_STOP);
 	UT_ASSERT_EQ(failure.event_id, UINT64_C(501));
 	UT_ASSERT_EQ(failure.new_epoch, UINT64_C(9));
@@ -6550,8 +6177,7 @@ UT_TEST(test_rejoin_failure_snapshot_requires_exact_nonempty_survivors_and_floor
 
 	memset(&failure, 0xa5, sizeof(failure));
 	memset(&zero, 0, sizeof(zero));
-	UT_ASSERT(!cluster_reconfig_rejoin_failure_snapshot(
-		1, UINT64_C(69), &failure));
+	UT_ASSERT(!cluster_reconfig_rejoin_failure_snapshot(1, UINT64_C(69), &failure));
 	UT_ASSERT(memcmp(&failure, &zero, sizeof(failure)) == 0);
 }
 
@@ -6577,13 +6203,11 @@ UT_TEST(test_rejoin_pending_snapshot_requires_exact_singleton_lineage)
 	event.dead_bitmap[0] = UINT8_C(0x02);
 	event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 	cluster_reconfig_publish_event(&event);
-	UT_ASSERT(cluster_reconfig_rejoin_failure_snapshot(
-		1, UINT64_C(70), &failure));
+	UT_ASSERT(cluster_reconfig_rejoin_failure_snapshot(1, UINT64_C(70), &failure));
 
 	cluster_membership_set_state(1, CLUSTER_MEMBER_JOINING);
 	state->pending_join_bitmap[0] = UINT8_C(0x02);
-	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(11),
-										  UINT64_C(10));
+	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(11), UINT64_C(10));
 	memset(incarnations, 0, sizeof(incarnations));
 	incarnations[1] = UINT64_C(77);
 	memset(&event, 0, sizeof(event));
@@ -6592,13 +6216,12 @@ UT_TEST(test_rejoin_pending_snapshot_requires_exact_singleton_lineage)
 	event.cssd_dead_generation = UINT64_C(5);
 	event.join_bitmap[0] = UINT8_C(0x02);
 	event.reconfig_kind = RECONFIG_KIND_JOIN_PENDING;
-	event.event_id = cluster_reconfig_compute_event_id_v2(
-		RECONFIG_KIND_JOIN_PENDING, event.dead_bitmap, event.join_bitmap,
-		incarnations, event.cssd_dead_generation);
+	event.event_id = cluster_reconfig_compute_event_id_v2(RECONFIG_KIND_JOIN_PENDING,
+														  event.dead_bitmap, event.join_bitmap,
+														  incarnations, event.cssd_dead_generation);
 	cluster_reconfig_publish_event(&event);
 
-	UT_ASSERT(cluster_reconfig_rejoin_pending_snapshot(
-		&failure, UINT64_C(77), &pending));
+	UT_ASSERT(cluster_reconfig_rejoin_pending_snapshot(&failure, UINT64_C(77), &pending));
 	UT_ASSERT_EQ(pending.reconfig_kind, RECONFIG_KIND_JOIN_PENDING);
 	UT_ASSERT_EQ(pending.old_epoch, UINT64_C(9));
 	UT_ASSERT_EQ(pending.new_epoch, UINT64_C(10));
@@ -6611,8 +6234,7 @@ UT_TEST(test_rejoin_pending_snapshot_requires_exact_singleton_lineage)
 	cluster_reconfig_publish_event(&event);
 	memset(&pending, 0xa5, sizeof(pending));
 	memset(&zero, 0, sizeof(zero));
-	UT_ASSERT(!cluster_reconfig_rejoin_pending_snapshot(
-		&failure, UINT64_C(77), &pending));
+	UT_ASSERT(!cluster_reconfig_rejoin_pending_snapshot(&failure, UINT64_C(77), &pending));
 	UT_ASSERT(memcmp(&pending, &zero, sizeof(pending)) == 0);
 }
 
@@ -6633,7 +6255,7 @@ UT_TEST(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit)
 	ut_dead_generation = UINT64_C(9);
 	ut_declared_set[1] = true;
 	ut_peer_state[1] = CLUSTER_CSSD_PEER_DEAD;
-	state = (ClusterReconfigState *) reconfig_shmem_storage;
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	state->self_join_admitted = 1;
 	cluster_membership_set_state(0, CLUSTER_MEMBER_MEMBER);
 	cluster_membership_set_state(1, CLUSTER_MEMBER_DEAD);
@@ -6653,18 +6275,16 @@ UT_TEST(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit)
 	event.cssd_dead_generation = UINT64_C(9);
 	event.dead_bitmap[0] = UINT8_C(0x02);
 	event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
-	event.event_id = cluster_reconfig_compute_event_id(
-		event.dead_bitmap, event.cssd_dead_generation);
+	event.event_id
+		= cluster_reconfig_compute_event_id(event.dead_bitmap, event.cssd_dead_generation);
 	cluster_reconfig_publish_event(&event);
 
 	memset(&ut_rejoin_offer, 0, sizeof(ut_rejoin_offer));
-	memset(ut_rejoin_offer.operation_id, 0x33,
-		   sizeof(ut_rejoin_offer.operation_id));
+	memset(ut_rejoin_offer.operation_id, 0x33, sizeof(ut_rejoin_offer.operation_id));
 	ut_rejoin_offer.old_node_id = 1;
 	ut_rejoin_offer.old_incarnation = UINT64_C(70);
 	ut_rejoin_offer.candidate_incarnation = UINT64_C(77);
-	memset(&ut_recovery_root_identity, 0,
-		   sizeof(ut_recovery_root_identity));
+	memset(&ut_recovery_root_identity, 0, sizeof(ut_recovery_root_identity));
 	ut_recovery_root_identity.system_identifier = UINT64_C(0x1234);
 	ut_recovery_root_identity.origin_thread_id = 2;
 	ut_recovery_root_identity.origin_node_id = 1;
@@ -6708,8 +6328,7 @@ UT_TEST(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit)
 	 * may now publish exact singleton P, whose dead bitmap excludes B-old while
 	 * membership remains JOINING and the durable fence marker still retains it. */
 	ut_peer_state[1] = CLUSTER_CSSD_PEER_ALIVE;
-	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(11),
-										  UINT64_C(9));
+	cluster_reconfig_record_observed_slot(1, UINT64_C(77), UINT64_C(11), UINT64_C(9));
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(cluster_epoch_get_current(), UINT64_C(10));
 	memset(slot, 0, sizeof(slot));
@@ -6719,15 +6338,13 @@ UT_TEST(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit)
 	cluster_reconfig_lmon_tick();
 	UT_ASSERT_EQ(cluster_epoch_get_current(), UINT64_C(10));
 	cluster_reconfig_get_last_event(&pending_event);
-	UT_ASSERT_EQ((int) pending_event.reconfig_kind,
-				 (int) RECONFIG_KIND_JOIN_PENDING);
-	UT_ASSERT_EQ(pending_event.old_epoch,
-				 ut_rejoin_failure_seen.new_epoch);
+	UT_ASSERT_EQ((int)pending_event.reconfig_kind, (int)RECONFIG_KIND_JOIN_PENDING);
+	UT_ASSERT_EQ(pending_event.old_epoch, ut_rejoin_failure_seen.new_epoch);
 	UT_ASSERT_EQ(pending_event.dead_bitmap[0], 0);
 	UT_ASSERT_EQ(pending_event.join_bitmap[0], UINT8_C(0x02));
 	memset(&exact_pending, 0, sizeof(exact_pending));
-	UT_ASSERT(cluster_reconfig_rejoin_pending_snapshot(
-		&ut_rejoin_failure_seen, UINT64_C(77), &exact_pending));
+	UT_ASSERT(cluster_reconfig_rejoin_pending_snapshot(&ut_rejoin_failure_seen, UINT64_C(77),
+													   &exact_pending));
 	UT_ASSERT(cluster_reconfig_rejoin_pending_ready(&exact_pending));
 
 	/* Refresh reaches READY on a later poll.  The final root revalidate and
@@ -6740,22 +6357,17 @@ UT_TEST(test_external_rejoin_consumes_exact_candidate_before_jcmk_submit)
 	UT_ASSERT_EQ(ut_rejoin_consume_calls, 1);
 	UT_ASSERT(!ut_rejoin_consume_saw_prior_marker_submit);
 	UT_ASSERT_EQ(ut_rejoin_pending_seen.node_id, 1);
-	UT_ASSERT_EQ(ut_rejoin_pending_seen.candidate_incarnation,
-				 UINT64_C(77));
+	UT_ASSERT_EQ(ut_rejoin_pending_seen.candidate_incarnation, UINT64_C(77));
 	UT_ASSERT_EQ(ut_rejoin_committed_seen.node_id, 1);
-	UT_ASSERT_EQ(ut_rejoin_committed_seen.phase,
-				 CLUSTER_JCMK_PHASE_COMMITTED);
-	UT_ASSERT_EQ(ut_rejoin_committed_seen.admitted_incarnation,
-				 UINT64_C(77));
+	UT_ASSERT_EQ(ut_rejoin_committed_seen.phase, CLUSTER_JCMK_PHASE_COMMITTED);
+	UT_ASSERT_EQ(ut_rejoin_committed_seen.admitted_incarnation, UINT64_C(77));
 	UT_ASSERT_EQ(ut_rejoin_committed_seen.generation, UINT64_C(77));
-	UT_ASSERT_EQ(ut_rejoin_committed_seen.admitted_epoch,
-				 pending_event.new_epoch + 1);
+	UT_ASSERT_EQ(ut_rejoin_committed_seen.admitted_epoch, pending_event.new_epoch + 1);
 	UT_ASSERT(ut_rejoin_committed_seen.commit_nonce != 0);
 	memset(slot, 0, sizeof(slot));
 	UT_ASSERT(ut_join_qvotec_poll_write_pending(&target, slot));
 	memcpy(&submitted, slot, sizeof(submitted));
-	UT_ASSERT(memcmp(&submitted, &ut_rejoin_committed_seen,
-				 sizeof(submitted)) == 0);
+	UT_ASSERT(memcmp(&submitted, &ut_rejoin_committed_seen, sizeof(submitted)) == 0);
 }
 
 /* ======================================================================
@@ -6804,7 +6416,7 @@ UT_TEST(test_formation_marker_admission_waits_for_stripe)
 {
 	ClusterReconfigState *state;
 	ClusterFormationCommitMarker marker;
-	uint64 incs[CLUSTER_MAX_NODES] = {0};
+	uint64 incs[CLUSTER_MAX_NODES] = { 0 };
 	int t;
 
 	cluster_online_join = false;
@@ -6831,20 +6443,16 @@ UT_TEST(test_formation_marker_admission_waits_for_stripe)
 		cluster_reconfig_cold_formation_tick();
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_ABSENT);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(0));
 	UT_ASSERT_EQ(state->self_join_admitted, 0);
 
 	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
 	cluster_reconfig_cold_formation_tick();
 	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
 	UT_ASSERT(!ut_xid_stripe_last_may_seed);
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(77));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(77));
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
 }
 
@@ -6852,11 +6460,11 @@ UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
 {
 	ClusterReconfigState *state;
 	ClusterFormationCommitMarker marker;
-	uint64		incs[CLUSTER_MAX_NODES] = {0};
-	int			t;
+	uint64 incs[CLUSTER_MAX_NODES] = { 0 };
+	int t;
 
 	ut_cold_formation_setup_coboot();
-	state = (ClusterReconfigState *) reconfig_shmem_storage;
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
 
 	/*
 	 * The arbiter (node 0, lowest co-boot node) submitted the COMMITTED
@@ -6887,8 +6495,7 @@ UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
 	for (t = 0; t < 3; t++)
 		cluster_reconfig_cold_formation_tick();
 
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_MEMBER);
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
 				 UINT64_C(77)); /* D13 exact floor, from the marker */
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
@@ -6896,8 +6503,7 @@ UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
 	/* The survivor never submitted anything (no takeover write): the
 	 * durable marker alone carried the admission. */
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq),
-				 UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq), UINT64_C(0));
 
 	/* The dead writer's slot ages out: the window goes PENDING, but the
 	 * admission is already durable — self stays MEMBER with the exact
@@ -6905,10 +6511,8 @@ UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
 	cluster_reconfig_record_observed_fresh_alive(0, false);
 	for (t = 0; t < 5; t++)
 		cluster_reconfig_cold_formation_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(77));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(77));
 }
 
 UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_replacement)
@@ -6917,7 +6521,7 @@ UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_re
 	ClusterFormationCommitMarker marker;
 	ClusterInitialCleanFormationSnapshot snapshot;
 	ClusterReplacementEpisode replacement;
-	uint64 incarnations[CLUSTER_MAX_NODES] = {0};
+	uint64 incarnations[CLUSTER_MAX_NODES] = { 0 };
 	int node;
 
 	ut_join_setup();
@@ -6940,8 +6544,7 @@ UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_re
 		cluster_membership_record_admitted(node, incarnations[node]);
 		cluster_membership_set_state(node, CLUSTER_MEMBER_MEMBER);
 	}
-	cluster_reconfig_formation_qvotec_publish_observed(
-		&marker, incarnations);
+	cluster_reconfig_formation_qvotec_publish_observed(&marker, incarnations);
 
 	memset(&snapshot, 0xa5, sizeof(snapshot));
 	UT_ASSERT(cluster_reconfig_snapshot_initial_clean_formation(&snapshot));
@@ -6952,8 +6555,7 @@ UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_re
 	UT_ASSERT_EQ(snapshot.arbiter_node, UINT64_C(0));
 	UT_ASSERT_EQ(snapshot.arbiter_incarnation, UINT64_C(60));
 	for (node = 0; node < 4; node++)
-		UT_ASSERT_EQ(snapshot.admitted_incarnation[node],
-					 incarnations[node]);
+		UT_ASSERT_EQ(snapshot.admitted_incarnation[node], incarnations[node]);
 
 	replacement = ut_admitted_replacement_episode(3);
 	state->replacement_episode = replacement;
@@ -6974,14 +6576,12 @@ UT_TEST(test_initial_clean_snapshot_accepts_exact_initial_quorum_without_marker)
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	state->self_join_admitted = 1;
 	ut_in_quorum_value = true;
-	ut_set_self_incarnation_sequence(
-		UINT64_C(80), UINT64_C(80), UINT64_C(80));
+	ut_set_self_incarnation_sequence(UINT64_C(80), UINT64_C(80), UINT64_C(80));
 	for (node = 0; node < 4; node++) {
 		incarnations[node] = UINT64_C(80) + (uint64)node;
 		ut_declared_set[node] = true;
-		cluster_reconfig_record_observed_slot(
-			node, incarnations[node], UINT64_C(1),
-			CLUSTER_EPOCH_INITIAL);
+		cluster_reconfig_record_observed_slot(node, incarnations[node], UINT64_C(1),
+											  CLUSTER_EPOCH_INITIAL);
 		cluster_reconfig_record_observed_fresh_alive(node, true);
 		cluster_membership_record_admitted(node, incarnations[node]);
 		cluster_membership_set_state(node, CLUSTER_MEMBER_MEMBER);
@@ -6996,13 +6596,11 @@ UT_TEST(test_initial_clean_snapshot_accepts_exact_initial_quorum_without_marker)
 	UT_ASSERT_EQ(snapshot.formation_epoch, CLUSTER_EPOCH_INITIAL);
 	UT_ASSERT_EQ(snapshot.members_lo, UINT64_C(0x0f));
 	for (node = 0; node < 4; node++)
-		UT_ASSERT_EQ(snapshot.admitted_incarnation[node],
-					 incarnations[node]);
+		UT_ASSERT_EQ(snapshot.admitted_incarnation[node], incarnations[node]);
 
 	cluster_reconfig_bootstrap_publish_begin();
-	cluster_reconfig_record_observed_slot(
-		2, incarnations[2] + 1, UINT64_C(2),
-		CLUSTER_EPOCH_INITIAL);
+	cluster_reconfig_record_observed_slot(2, incarnations[2] + 1, UINT64_C(2),
+										  CLUSTER_EPOCH_INITIAL);
 	cluster_reconfig_bootstrap_publish_in_quorum(true);
 	cluster_reconfig_bootstrap_publish_end();
 	memset(&snapshot, 0xa5, sizeof(snapshot));
@@ -7014,7 +6612,7 @@ UT_TEST(test_initial_clean_snapshot_accepts_exact_initial_quorum_without_marker)
 UT_TEST(test_cold_formation_leg2_live_survivor_refuses)
 {
 	ClusterReconfigState *state;
-	int			t;
+	int t;
 
 	ut_join_setup();
 	cluster_node_id = 1;
@@ -7024,11 +6622,10 @@ UT_TEST(test_cold_formation_leg2_live_survivor_refuses)
 	UT_ASSERT(cluster_epoch_observe_remote(UINT64_C(5)));
 	/* node 0 is a LIVE survivor: fresh slot publishing the LIVE epoch
 	 * (A-semantics: a formed node publishes the real epoch). */
-	cluster_reconfig_record_observed_slot(0, UINT64_C(66), UINT64_C(1),
-										  UINT64_C(7));
+	cluster_reconfig_record_observed_slot(0, UINT64_C(66), UINT64_C(1), UINT64_C(7));
 	cluster_reconfig_record_observed_fresh_alive(0, true);
 	cluster_reconfig_test_reset_cold_formation();
-	state = (ClusterReconfigState *) reconfig_shmem_storage;
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
 
 	for (t = 0; t < 12; t++)
 		cluster_reconfig_cold_formation_tick();
@@ -7037,26 +6634,23 @@ UT_TEST(test_cold_formation_leg2_live_survivor_refuses)
 	 * ever staged, and this node never admitted through the cold-formation
 	 * path (a live cluster has no cold formation — the ordinary join/JCMK
 	 * chain owns this node). */
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq),
-				 UINT64_C(0));
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_ABSENT);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq), UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(0));
 }
 
 UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 {
 	ClusterReconfigState *state;
 	ClusterFormationCommitMarker marker;
-	uint64		incs[CLUSTER_MAX_NODES] = {0};
-	int			t;
+	uint64 incs[CLUSTER_MAX_NODES] = { 0 };
+	int t;
 
 	/* ---- A. non-arbiter: a DIVERGENT marker (names an OLD incarnation
 	 * for self — a stale/divergent generation's image) is rejected; the
 	 * node keeps waiting and never admits. ---- */
 	ut_cold_formation_setup_coboot();
-	state = (ClusterReconfigState *) reconfig_shmem_storage;
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
 	marker.version = CLUSTER_FORMATION_MARKER_VERSION;
 	marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
@@ -7072,18 +6666,15 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 	cluster_reconfig_formation_qvotec_publish_observed(&marker, incs);
 	for (t = 0; t < 6; t++)
 		cluster_reconfig_cold_formation_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(1),
-				 (int)CLUSTER_MEMBER_ABSENT);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(0));
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
-				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(1), (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(0));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0), UINT64_C(0));
 
 	/* ---- B. arbiter: the marker write did NOT reach quorum-majority
 	 * readback (qvotec completes FAILED) — no admission happens; the
 	 * arbiter resets and re-submits with a fresh nonce, and only a
 	 * later PROVEN write admits. ---- */
-	ut_join_setup();		   /* self = 0 = the LOWEST co-boot node */
+	ut_join_setup(); /* self = 0 = the LOWEST co-boot node */
 	cluster_node_id = 0;
 	ut_declared_set[0] = true;
 	ut_declared_set[1] = true;
@@ -7092,7 +6683,7 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 	cluster_reconfig_record_observed_slot(1, UINT64_C(70), UINT64_C(1), 0);
 	cluster_reconfig_record_observed_fresh_alive(1, true);
 	cluster_reconfig_test_reset_cold_formation();
-	state = (ClusterReconfigState *) reconfig_shmem_storage;
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
 
 	for (t = 0; t < 3; t++)
 		cluster_reconfig_cold_formation_tick();
@@ -7102,31 +6693,24 @@ UT_TEST(test_cold_formation_leg3_divergent_marker_rejected_no_majority)
 	/* qvotec read back fewer than a strict majority of exact images. */
 	cluster_reconfig_formation_qvotec_complete(false);
 	cluster_reconfig_cold_formation_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(0),
-				 (int)CLUSTER_MEMBER_ABSENT);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
-				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(0), (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0), UINT64_C(0));
 
 	/* The failed submission is retried (fresh nonce, same generation
 	 * lineage: max observed generation + 1 stays 1). */
 	cluster_reconfig_cold_formation_tick();
 	UT_ASSERT_EQ(pg_atomic_read_u64(&state->formation_marker_request_seq),
 				 UINT64_C(2)); /* re-submitted */
-	UT_ASSERT_EQ((int)cluster_membership_get_state(0),
-				 (int)CLUSTER_MEMBER_ABSENT);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
-				 UINT64_C(0));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(0), (int)CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0), UINT64_C(0));
 
 	/* The retried write proves on a majority: admission lands with the
 	 * exact per-member floors. */
 	cluster_reconfig_formation_qvotec_complete(true);
 	cluster_reconfig_cold_formation_tick();
-	UT_ASSERT_EQ((int)cluster_membership_get_state(0),
-				 (int)CLUSTER_MEMBER_MEMBER);
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0),
-				 UINT64_C(77));
-	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1),
-				 UINT64_C(70));
+	UT_ASSERT_EQ((int)cluster_membership_get_state(0), (int)CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(0), UINT64_C(77));
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(70));
 	UT_ASSERT_EQ(state->self_join_admitted, 1);
 }
 

@@ -50,20 +50,18 @@
  * any false the caller performs NO page mutation and never converts a
  * temporary failure into a skip (spec §7.1).
  */
-typedef struct ClusterPageMutationAdmission
-{
-	bool		duty_root_ok;		/* exact duty/control root current */
-	bool		recoverer_active_ok;	/* active recoverer + failure generation */
-	bool		fence_ok;			/* four-layer fence armed */
-	bool		serialization_ok;	/* exact resource serialization held */
-	bool		source_proof_fresh; /* selected §5 proof re-validated */
-	bool		working_version_exact; /* current == expected-before (exact) */
-	bool		retention_covers;	/* retention pin covers ALL contributors */
+typedef struct ClusterPageMutationAdmission {
+	bool duty_root_ok;			/* exact duty/control root current */
+	bool recoverer_active_ok;	/* active recoverer + failure generation */
+	bool fence_ok;				/* four-layer fence armed */
+	bool serialization_ok;		/* exact resource serialization held */
+	bool source_proof_fresh;	/* selected §5 proof re-validated */
+	bool working_version_exact; /* current == expected-before (exact) */
+	bool retention_covers;		/* retention pin covers ALL contributors */
 } ClusterPageMutationAdmission;
 
 /* true iff every §7.1 fact holds. */
-extern bool cluster_page_mutation_admission(
-	const ClusterPageMutationAdmission *admission);
+extern bool cluster_page_mutation_admission(const ClusterPageMutationAdmission *admission);
 
 /*
  * §7.2 sequence step judgement.  The caller executes each native step
@@ -83,18 +81,17 @@ extern bool cluster_page_mutation_admission(
  *  relation-fsync-counter/logical-DONE/pre-write-checksum are never
  *  substitutes (spec §7.2 last paragraph).
  */
-typedef struct ClusterPageSequenceResult
-{
+typedef struct ClusterPageSequenceResult {
 	ClusterPageRecoveryState state; /* advanced state (unchanged on failure) */
 	ClusterPageRecoveryOutcome outcome;
 } ClusterPageSequenceResult;
 
-extern ClusterPageSequenceResult cluster_page_apply_step_durability(
-	ClusterPageRecoveryState state, bool durable_ok);
-extern ClusterPageSequenceResult cluster_page_apply_step_post_read(
-	ClusterPageRecoveryState state, bool post_read_ok);
-extern ClusterPageSequenceResult cluster_page_apply_step_authority(
-	ClusterPageRecoveryState state, bool authority_ok);
+extern ClusterPageSequenceResult cluster_page_apply_step_durability(ClusterPageRecoveryState state,
+																	bool durable_ok);
+extern ClusterPageSequenceResult cluster_page_apply_step_post_read(ClusterPageRecoveryState state,
+																   bool post_read_ok);
+extern ClusterPageSequenceResult cluster_page_apply_step_authority(ClusterPageRecoveryState state,
+																   bool authority_ok);
 
 /*
  * §7.3 typed page proof exported to RF-ROOT/SIDE (logical export only —
@@ -102,16 +99,15 @@ extern ClusterPageSequenceResult cluster_page_apply_step_authority(
  * FND-10 conjunction; RF-SIDE consumes only page dependencies; it is
  * never an all-domain barrier (spec §7.3).
  */
-typedef struct ClusterPageProof
-{
-	uint16		failed_origin_thread;
+typedef struct ClusterPageProof {
+	uint16 failed_origin_thread;
 	ClusterPageIdentity identity;
 	ClusterPageClass page_class;
 	ClusterPageVersion post_read_version; /* canonical post-read result */
-	bool		contributor_coverage;	/* source-to-terminal chain closed */
-	bool		durability_barrier_ok;	/* durable ordering completed */
-	bool		post_read_ok;			/* canonical bytes verified */
-	bool		authority_revalidated;	/* RF-ROOT revalidation passed */
+	bool contributor_coverage;			  /* source-to-terminal chain closed */
+	bool durability_barrier_ok;			  /* durable ordering completed */
+	bool post_read_ok;					  /* canonical bytes verified */
+	bool authority_revalidated;			  /* RF-ROOT revalidation passed */
 } ClusterPageProof;
 
 /*
@@ -130,8 +126,7 @@ extern ClusterPageRecoveryOutcome cluster_page_apply_midwrite_cut(void);
  * rebuild, a fresh post-read or the stable-base STOP).  Every row maps
  * to exactly one outcome; unknown cuts fail closed.
  */
-typedef enum ClusterPageCrashCut
-{
+typedef enum ClusterPageCrashCut {
 	CLUSTER_PAGE_CUT_BEFORE_SOURCE_PROOF = 0,
 	CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF,
 	CLUSTER_PAGE_CUT_DURING_TARGET_WRITE,
@@ -141,7 +136,6 @@ typedef enum ClusterPageCrashCut
 	CLUSTER_PAGE_CUT_AFTER_RELEASE
 } ClusterPageCrashCut;
 
-extern ClusterPageRecoveryOutcome cluster_page_crash_matrix_verdict(
-	ClusterPageCrashCut cut);
+extern ClusterPageRecoveryOutcome cluster_page_crash_matrix_verdict(ClusterPageCrashCut cut);
 
-#endif							/* CLUSTER_PAGE_APPLY_H */
+#endif /* CLUSTER_PAGE_APPLY_H */

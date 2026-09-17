@@ -39,8 +39,7 @@ cluster_page_identity_valid(const ClusterPageIdentity *identity)
 	/* A zeroed RelFileLocator is the PG "never-set" identity; a fork/block
 	 * must be a real address.  RelFileNumber is an Oid; InvalidOid is its
 	 * never-set value. */
-	if (identity->rlocator.spcOid == InvalidOid
-		|| identity->rlocator.dbOid == InvalidOid
+	if (identity->rlocator.spcOid == InvalidOid || identity->rlocator.dbOid == InvalidOid
 		|| identity->rlocator.relNumber == InvalidOid)
 		return false;
 	if (identity->forknum < 0 || identity->forknum > MAX_FORKNUM)
@@ -51,14 +50,12 @@ cluster_page_identity_valid(const ClusterPageIdentity *identity)
 }
 
 bool
-cluster_page_identity_equal(const ClusterPageIdentity *a,
-							const ClusterPageIdentity *b)
+cluster_page_identity_equal(const ClusterPageIdentity *a, const ClusterPageIdentity *b)
 {
 	if (a == NULL || b == NULL)
 		return false;
-	return RelFileLocatorEquals(a->rlocator, b->rlocator)
-		&& a->forknum == b->forknum
-		&& a->blocknum == b->blocknum;
+	return RelFileLocatorEquals(a->rlocator, b->rlocator) && a->forknum == b->forknum
+		   && a->blocknum == b->blocknum;
 }
 
 bool
@@ -82,8 +79,7 @@ cluster_page_version_valid(const ClusterPageVersion *version)
 }
 
 bool
-cluster_page_version_equal(const ClusterPageVersion *a,
-						   const ClusterPageVersion *b)
+cluster_page_version_equal(const ClusterPageVersion *a, const ClusterPageVersion *b)
 {
 	/*
 	 * Exact equality only, and only between VALID versions.  An invalid
@@ -93,8 +89,7 @@ cluster_page_version_equal(const ClusterPageVersion *a,
 	if (!cluster_page_version_valid(a) || !cluster_page_version_valid(b))
 		return false;
 	return cluster_page_identity_equal(&a->identity, &b->identity)
-		&& a->incarnation == b->incarnation
-		&& a->token == b->token;
+		   && a->incarnation == b->incarnation && a->token == b->token;
 }
 
 bool
@@ -110,14 +105,13 @@ cluster_page_before_state_valid(const ClusterPageBeforeState *state)
 }
 
 bool
-cluster_page_before_state_equal(const ClusterPageBeforeState *a,
-								const ClusterPageBeforeState *b)
+cluster_page_before_state_equal(const ClusterPageBeforeState *a, const ClusterPageBeforeState *b)
 {
 	/* Same strict rule as versions: valid-only exact equality. */
 	if (!cluster_page_before_state_valid(a) || !cluster_page_before_state_valid(b))
 		return false;
 	return cluster_page_identity_equal(&a->identity, &b->identity)
-		&& a->new_incarnation == b->new_incarnation;
+		   && a->new_incarnation == b->new_incarnation;
 }
 
 /* ---------------------------------------------------------------------
@@ -154,14 +148,12 @@ cluster_page_version_decide(const ClusterPageVersion *current_working,
 	 * newer and recoverer-local bitmaps are all deliberately absent
 	 * (spec §3.2 last paragraph).
 	 */
-	if (result_version != NULL
-		&& cluster_page_version_valid(result_version)
+	if (result_version != NULL && cluster_page_version_valid(result_version)
 		&& trusted_source_version != NULL
 		&& cluster_page_version_equal(trusted_source_version, result_version))
 		return CLUSTER_PAGE_APPLY_SKIP;
 
-	if (current_working == NULL || expected_before == NULL
-		|| result_version == NULL
+	if (current_working == NULL || expected_before == NULL || result_version == NULL
 		|| !cluster_page_version_valid(result_version)
 		|| !cluster_page_version_valid(expected_before))
 		return CLUSTER_PAGE_APPLY_BLOCKED;
@@ -184,22 +176,21 @@ cluster_page_version_decide(const ClusterPageVersion *current_working,
  */
 #define CLUSTER_PAGE_KNOWN_OPCODE_MAX 64
 
-typedef struct ClusterPageKnownOpcode
-{
-	uint8		rmid;
-	uint16		opcode;
+typedef struct ClusterPageKnownOpcode {
+	uint8 rmid;
+	uint16 opcode;
 } ClusterPageKnownOpcode;
 
 static ClusterPageKnownOpcode cluster_page_known_opcodes[CLUSTER_PAGE_KNOWN_OPCODE_MAX];
-static int	cluster_page_known_opcode_count = 0;
+static int cluster_page_known_opcode_count = 0;
 
 bool
 cluster_page_class_register_known_opcode(uint8 rmid, uint16 opcode)
 {
 	if (cluster_page_class_is_known_opcode(rmid, opcode))
-		return true;			/* idempotent */
+		return true; /* idempotent */
 	if (cluster_page_known_opcode_count >= CLUSTER_PAGE_KNOWN_OPCODE_MAX)
-		return false;			/* fail-closed: registry full */
+		return false; /* fail-closed: registry full */
 	cluster_page_known_opcodes[cluster_page_known_opcode_count].rmid = rmid;
 	cluster_page_known_opcodes[cluster_page_known_opcode_count].opcode = opcode;
 	cluster_page_known_opcode_count++;
@@ -209,7 +200,7 @@ cluster_page_class_register_known_opcode(uint8 rmid, uint16 opcode)
 bool
 cluster_page_class_is_known_opcode(uint8 rmid, uint16 opcode)
 {
-	int			i;
+	int i;
 
 	for (i = 0; i < cluster_page_known_opcode_count; i++)
 		if (cluster_page_known_opcodes[i].rmid == rmid
@@ -229,9 +220,9 @@ cluster_page_class_is_known_opcode(uint8 rmid, uint16 opcode)
 ClusterPageClass
 cluster_page_classify(const ClusterPageClassifyInput *input)
 {
-	bool		new_page;
-	bool		full_image;
-	bool		will_init;
+	bool new_page;
+	bool full_image;
+	bool will_init;
 
 	if (input == NULL)
 		return CLUSTER_PAGE_CLASS_UNKNOWN;
@@ -248,17 +239,15 @@ cluster_page_classify(const ClusterPageClassifyInput *input)
 
 	if (input->header_owner != CLUSTER_PAGE_HEADER_OWNER_NONE
 		&& (input->forknum == INIT_FORKNUM || input->forknum == FSM_FORKNUM
-			|| input->relation_is_temp || full_image || will_init || new_page
-			|| input->is_cleanout || input->relation_is_unlogged))
+			|| input->relation_is_temp || full_image || will_init || new_page || input->is_cleanout
+			|| input->relation_is_unlogged))
 		return CLUSTER_PAGE_CLASS_UNKNOWN;
 	if (input->forknum == FSM_FORKNUM
-		&& (full_image || will_init || input->is_cleanout
-			|| input->relation_is_unlogged))
+		&& (full_image || will_init || input->is_cleanout || input->relation_is_unlogged))
 		return CLUSTER_PAGE_CLASS_UNKNOWN;
 	if (full_image && will_init)
 		return CLUSTER_PAGE_CLASS_UNKNOWN;
-	if ((input->is_cleanout || input->relation_is_unlogged)
-		&& (full_image || will_init))
+	if ((input->is_cleanout || input->relation_is_unlogged) && (full_image || will_init))
 		return CLUSTER_PAGE_CLASS_UNKNOWN;
 
 	/*

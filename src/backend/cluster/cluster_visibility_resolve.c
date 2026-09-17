@@ -53,7 +53,7 @@
 #include "cluster/cluster_tt_durable.h"			/* spec-4.8 D2 remote_active_failclosed counter */
 #include "cluster/cluster_tt_status.h"			/* lookup_exact / Key / Result */
 #include "cluster/cluster_touched_peers.h"		/* spec-5.14 D2 class 4 */
-#include "cluster/cluster_tx_resolve.h"		/* exact DATA->canonical TT fallback */
+#include "cluster/cluster_tx_resolve.h"			/* exact DATA->canonical TT fallback */
 #include "cluster/cluster_visibility_resolve.h"
 #include "cluster/cluster_wal_state.h"	   /* CLUSTER_WAL_STATE_SLOT_COUNT */
 #include "cluster/cluster_xid_authority.h" /* GCS-race round-2 RC-E: native-prehistory gate */
@@ -120,9 +120,8 @@ vis_origin_materialized(int origin)
 static int cluster_vis_resolve_depth = 0;
 
 static bool
-cluster_vis_from_exact_tx_resolution(
-	ClusterTxOutcome outcome, const ClusterTxResolution *resolution,
-	ClusterVisResolve *out)
+cluster_vis_from_exact_tx_resolution(ClusterTxOutcome outcome,
+									 const ClusterTxResolution *resolution, ClusterVisResolve *out)
 {
 	if (resolution == NULL || out == NULL || outcome != resolution->outcome)
 		return false;
@@ -306,11 +305,9 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 	 * route; eligibility is rechecked immediately before the exact request.
 	 */
 	defer_slotless_origin_pull = cluster_vis_freshref_c1b_pair_request_eligible(
-		raw_xid, ref->local_xid, ref->has_cached_status,
-		ref->cached_commit_scn, ref->cluster_epoch,
-		cluster_epoch_get_current(), (int32)ref->origin_node_id,
-		cluster_node_id, (uint32)ref->undo_segment_id,
-		(uint32)ref->tt_slot_id);
+		raw_xid, ref->local_xid, ref->has_cached_status, ref->cached_commit_scn, ref->cluster_epoch,
+		cluster_epoch_get_current(), (int32)ref->origin_node_id, cluster_node_id,
+		(uint32)ref->undo_segment_id, (uint32)ref->tt_slot_id);
 
 	memset(&source_request, 0, sizeof(source_request));
 	source_request.key = &key;
@@ -383,11 +380,11 @@ resolve_from_remote_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, 
 }
 
 static void
-cluster_vis_log_freshref_unproven(
-	TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
-	bool freshref_pair, ClusterUndoVerdictResult v,
-	const ClusterTxLocator *exact_locator, ClusterTxOutcome exact_outcome,
-	ClusterTxResolveReason exact_reason)
+cluster_vis_log_freshref_unproven(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref,
+								  bool freshref_pair, ClusterUndoVerdictResult v,
+								  const ClusterTxLocator *exact_locator,
+								  ClusterTxOutcome exact_outcome,
+								  ClusterTxResolveReason exact_reason)
 {
 	if (vis_freshref_first_unproven_logged || ref == NULL)
 		return;
@@ -397,12 +394,10 @@ cluster_vis_log_freshref_unproven(
 		 "ref_epoch=%u cached=%d cached_scn=" UINT64_FORMAT
 		 " freshref_pair=%d undo_verdict=%d exact_locator=%d "
 		 "exact_outcome=%d exact_reason=%s",
-		 raw_xid, (unsigned)ref->origin_node_id,
-		 (unsigned)ref->undo_segment_id, (unsigned)ref->tt_slot_id,
-		 ref->cluster_epoch, ref->has_cached_status,
-		 (uint64)ref->cached_commit_scn, freshref_pair, (int)v.kind,
-		 exact_locator != NULL, (int)exact_outcome,
-		 cluster_tx_resolve_reason_name(exact_reason));
+		 raw_xid, (unsigned)ref->origin_node_id, (unsigned)ref->undo_segment_id,
+		 (unsigned)ref->tt_slot_id, ref->cluster_epoch, ref->has_cached_status,
+		 (uint64)ref->cached_commit_scn, freshref_pair, (int)v.kind, exact_locator != NULL,
+		 (int)exact_outcome, cluster_tx_resolve_reason_name(exact_reason));
 }
 
 
@@ -421,8 +416,7 @@ cluster_vis_log_freshref_unproven(
  */
 static void
 classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
-				  SCN read_scn, const ClusterTxLocator *exact_locator,
-				  ClusterVisResolve *out)
+				  SCN read_scn, const ClusterTxLocator *exact_locator, ClusterVisResolve *out)
 {
 	if (out == NULL || ref == NULL)
 		return;
@@ -805,11 +799,9 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			 * the dedicated fresh-ref counter is the ONLY extra bump here -- an
 			 * explicit rtvis_resolve_note here would double-count. */
 			bool freshref_pair = cluster_vis_freshref_c1b_pair_request_eligible(
-				raw_xid, ref->local_xid, ref->has_cached_status,
-				ref->cached_commit_scn, ref->cluster_epoch,
-				cluster_epoch_get_current(), (int32)ref->origin_node_id,
-				cluster_node_id, (uint32)ref->undo_segment_id,
-				(uint32)ref->tt_slot_id);
+				raw_xid, ref->local_xid, ref->has_cached_status, ref->cached_commit_scn,
+				ref->cluster_epoch, cluster_epoch_get_current(), (int32)ref->origin_node_id,
+				cluster_node_id, (uint32)ref->undo_segment_id, (uint32)ref->tt_slot_id);
 			ClusterUndoVerdictResult v;
 
 			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
@@ -829,8 +821,7 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				/* O2: an origin-proven exact terminal is immutable and may use
 				 * the existing backend-local, lxid-bound memo.  A bound or live
 				 * result remains request/snapshot relative and is never installed. */
-				if ((v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
-					 && SCN_VALID(v.commit_scn))
+				if ((v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT && SCN_VALID(v.commit_scn))
 					|| v.kind == CLUSTER_UNDO_VERDICT_ABORTED) {
 					ClusterTTStatusKey memo_key;
 
@@ -845,9 +836,7 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 						v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
 							? (uint8)CLUSTER_TT_STATUS_COMMITTED
 							: (uint8)CLUSTER_TT_STATUS_ABORTED,
-						v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT
-							? v.commit_scn
-							: InvalidScn);
+						v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT ? v.commit_scn : InvalidScn);
 				}
 				cluster_vis_freshref_verdict_note_resolved();
 				return;
@@ -862,13 +851,12 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			exact_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 			if (exact_locator != NULL)
 				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
-			exact_outcome = exact_locator == NULL
-				? CLUSTER_TX_UNKNOWN
-				: cluster_tx_resolve_exact(
-					exact_locator, CLUSTER_TX_RESOLVE_VISIBILITY,
-					&exact_resolution, &exact_reason);
-			if (cluster_vis_from_exact_tx_resolution(
-					exact_outcome, &exact_resolution, out)) {
+			exact_outcome
+				= exact_locator == NULL
+					  ? CLUSTER_TX_UNKNOWN
+					  : cluster_tx_resolve_exact(exact_locator, CLUSTER_TX_RESOLVE_VISIBILITY,
+												 &exact_resolution, &exact_reason);
+			if (cluster_vis_from_exact_tx_resolution(exact_outcome, &exact_resolution, out)) {
 				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ROUTE_BYPASS);
 				cluster_vis_evidence_note(CLUSTER_VIS_METRIC_DURABLE_ROUTE_GAP);
 				cluster_vis_evidence_note(exact_outcome == CLUSTER_TX_IN_PROGRESS
@@ -879,9 +867,8 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 			}
 			/* Both reduced-key verdicts and the exact DATA->TT resolver are
 			 * unproven.  The latter never returns BOUND or installs a memo. */
-			cluster_vis_log_freshref_unproven(
-				raw_xid, ref, freshref_pair, v, exact_locator,
-				exact_outcome, exact_reason);
+			cluster_vis_log_freshref_unproven(raw_xid, ref, freshref_pair, v, exact_locator,
+											  exact_outcome, exact_reason);
 			if (exact_locator != NULL) {
 				if (exact_reason == CLUSTER_TX_RESOLVE_TIMEOUT) {
 					out->diagnostic_reason = "AUTHORITY_DEADLINE_EXPIRED";
@@ -956,8 +943,7 @@ cluster_vis_exact_locators_for_ref(Page page, uint8 slot_index, ClusterVisXidKin
  */
 static void
 classify_ref(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRecPtr anchor_lsn,
-			 SCN read_scn, const ClusterTxLocator *exact_locator,
-			 ClusterVisResolve *out)
+			 SCN read_scn, const ClusterTxLocator *exact_locator, ClusterVisResolve *out)
 {
 	cluster_vis_resolve_depth++;
 	classify_ref_guts(raw_xid, ref, anchor_lsn, read_scn, exact_locator, out);

@@ -30,7 +30,11 @@ int cluster_oid_lease_size = 8;
 int cluster_node_id = 0;
 char *cluster_shared_data_dir;
 static int fixture_node_count = 4;
-int cluster_conf_node_count(void) { return fixture_node_count; }
+int
+cluster_conf_node_count(void)
+{
+	return fixture_node_count;
+}
 PGPROC *MyProc;
 PROC_HDR *ProcGlobal;
 Latch *MyLatch;
@@ -59,7 +63,11 @@ cluster_normal_stop_service_new_work(bool modifies_data)
 	stop_new_modifier_calls++;
 	return stop_new_modifier_allowed;
 }
-uint32 cluster_grd_shard_for_resource(const ClusterResId *resid) { return 0; }
+uint32
+cluster_grd_shard_for_resource(const ClusterResId *resid)
+{
+	return 0;
+}
 static uint32 fixture_hw_master_generation;
 static ClusterGrdShardPhase fixture_hw_shard_phase = GRD_SHARD_NORMAL;
 uint32
@@ -609,8 +617,8 @@ UT_TEST(lmon_post_send_observes_original_shared_owners)
 
 UT_TEST(hw_remote_seal_precedes_original_advance_wal_and_reply)
 {
-	HwAllocRequest req = {0};
-	ClusterICEnvelope env = {0};
+	HwAllocRequest req = { 0 };
+	ClusterICEnvelope env = { 0 };
 	HwAllocReply accepted;
 	ClusterResId resid;
 	bool found;
@@ -633,7 +641,7 @@ UT_TEST(hw_remote_seal_precedes_original_advance_wal_and_reply)
 	env.source_node_id = 1;
 	env.dest_node_id = 0;
 	env.payload_length = sizeof(req);
-	cluster_hw_resid_encode((RelFileLocator){1663, 5, 16384}, MAIN_FORKNUM, &resid);
+	cluster_hw_resid_encode((RelFileLocator){ 1663, 5, 16384 }, MAIN_FORKNUM, &resid);
 	stop_new_modifier_allowed = false;
 	cluster_hw_alloc_request_handler(&env, &req);
 	UT_ASSERT_EQ(stop_new_modifier_calls, 1);
@@ -662,9 +670,9 @@ UT_TEST(hw_remote_seal_precedes_original_advance_wal_and_reply)
 
 UT_TEST(hw_local_backend_and_existing_reply_keep_original_paths)
 {
-	HwAllocRequest req = {0};
+	HwAllocRequest req = { 0 };
 	HwAllocReply reply, received;
-	ClusterICEnvelope env = {0};
+	ClusterICEnvelope env = { 0 };
 
 	reset_fixture();
 	cluster_shared_data_dir = "allocation-fixture";

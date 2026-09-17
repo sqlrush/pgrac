@@ -59,8 +59,7 @@ errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unuse
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{
-}
+{}
 
 int
 errmsg_internal(const char *fmt pg_attribute_unused(), ...)
@@ -92,8 +91,7 @@ ShmemInitStruct(const char *name, Size size, bool *found)
 
 void
 cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
-{
-}
+{}
 
 UT_TEST(test_current_mx_stats_null_safe)
 {
@@ -106,20 +104,13 @@ UT_TEST(test_current_mx_stats_null_safe)
 
 UT_TEST(test_current_mx_restart_bucket_boundaries)
 {
-	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(0),
-				 CMX_STAT_RESTART_BUCKET_0);
-	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(1),
-				 CMX_STAT_RESTART_BUCKET_1);
-	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(2),
-				 CMX_STAT_RESTART_BUCKET_2_3);
-	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(3),
-				 CMX_STAT_RESTART_BUCKET_2_3);
-	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(4),
-				 CMX_STAT_RESTART_BUCKET_4_7);
-	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(7),
-				 CMX_STAT_RESTART_BUCKET_4_7);
-	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(8),
-				 CMX_STAT_RESTART_BUCKET_8_PLUS);
+	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(0), CMX_STAT_RESTART_BUCKET_0);
+	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(1), CMX_STAT_RESTART_BUCKET_1);
+	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(2), CMX_STAT_RESTART_BUCKET_2_3);
+	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(3), CMX_STAT_RESTART_BUCKET_2_3);
+	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(4), CMX_STAT_RESTART_BUCKET_4_7);
+	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(7), CMX_STAT_RESTART_BUCKET_4_7);
+	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(8), CMX_STAT_RESTART_BUCKET_8_PLUS);
 	UT_ASSERT_EQ(cluster_multixact_current_restart_bucket(UINT32_MAX),
 				 CMX_STAT_RESTART_BUCKET_8_PLUS);
 }

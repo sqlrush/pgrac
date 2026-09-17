@@ -40,13 +40,13 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h" /* D4 marker-write + D6 verify wait events */
 
-#include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current */
+#include "cluster/cluster_epoch.h" /* cluster_epoch_get_current */
 #include "cluster/cluster_clean_leave.h"
-#include "cluster/cluster_guc.h"			/* cluster_node_id, cluster_voting_disks */
-#include "cluster/cluster_lmon.h"			/* cluster_lmon_marker_complete_wakeup */
-#include "cluster/cluster_qvotec.h"			/* ClusterVotingSlot (marker layout asserts) */
-#include "cluster/cluster_shmem.h"			/* cluster_shmem_register_region */
-#include "cluster/cluster_write_fence.h"	/* region + judge + wrapper + marker */
+#include "cluster/cluster_guc.h"		 /* cluster_node_id, cluster_voting_disks */
+#include "cluster/cluster_lmon.h"		 /* cluster_lmon_marker_complete_wakeup */
+#include "cluster/cluster_qvotec.h"		 /* ClusterVotingSlot (marker layout asserts) */
+#include "cluster/cluster_shmem.h"		 /* cluster_shmem_register_region */
+#include "cluster/cluster_write_fence.h" /* region + judge + wrapper + marker */
 
 /*
  * spec-4.12 D1: pin the fence-marker on-disk layout against the voting slot, so a
@@ -230,19 +230,17 @@ cluster_write_fence_shmem_register(void)
  * This generation check prevents a pre-change proof from being published
  * after the state-changing invalidation that made it stale. */
 static bool
-cluster_write_fence_cache_write_begin_if_unchanged(uint64 expected_sequence,
-											   uint64 *odd_seq)
+cluster_write_fence_cache_write_begin_if_unchanged(uint64 expected_sequence, uint64 *odd_seq)
 {
 	uint64 expected;
 
 	if (cluster_write_fence_shmem == NULL || odd_seq == NULL)
 		return false;
-	if ((expected_sequence & UINT64_C(1)) != 0
-		|| expected_sequence >= UINT64_MAX - 1)
+	if ((expected_sequence & UINT64_C(1)) != 0 || expected_sequence >= UINT64_MAX - 1)
 		return false;
 	expected = expected_sequence;
-	if (!pg_atomic_compare_exchange_u64(&cluster_write_fence_shmem->authority_cache_seq,
-										&expected, expected_sequence + 1))
+	if (!pg_atomic_compare_exchange_u64(&cluster_write_fence_shmem->authority_cache_seq, &expected,
+										expected_sequence + 1))
 		return false;
 	*odd_seq = expected_sequence + 1;
 	return true;
@@ -296,8 +294,8 @@ cluster_write_fence_authority_cache_sequence(void)
 
 bool
 cluster_write_fence_authority_cache_publish_if_unchanged(const ClusterFenceMarker *marker,
-												 uint64 published_at_us,
-												 uint64 expected_sequence)
+														 uint64 published_at_us,
+														 uint64 expected_sequence)
 {
 	uint64 odd_seq;
 
@@ -393,9 +391,9 @@ cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected,
 		pg_read_barrier();
 		seq_after = pg_atomic_read_u64(&cluster_write_fence_shmem->authority_cache_seq);
 		if (seq_before == seq_after && (seq_after & UINT64_C(1)) == 0)
-			return cluster_fence_authority_cache_decide_v1(
-				expected, seq_before, seq_after, valid, &observed, published_at_us, expiry_us,
-				now_us);
+			return cluster_fence_authority_cache_decide_v1(expected, seq_before, seq_after, valid,
+														   &observed, published_at_us, expiry_us,
+														   now_us);
 	}
 	return CLUSTER_FENCE_CACHE_UNAVAILABLE;
 }
@@ -957,8 +955,7 @@ cluster_write_fence_atomic_max(pg_atomic_uint64 *value, uint64 candidate)
 {
 	uint64 old = pg_atomic_read_u64(value);
 
-	while (candidate > old &&
-		   !pg_atomic_compare_exchange_u64(value, &old, candidate))
+	while (candidate > old && !pg_atomic_compare_exchange_u64(value, &old, candidate))
 		;
 }
 
@@ -970,25 +967,22 @@ cluster_write_fence_note_external_admit_requested(void)
 }
 
 void
-cluster_write_fence_note_external_write_excluded(uint64 journal_seq,
-											 uint64 verified_mono_ns)
+cluster_write_fence_note_external_write_excluded(uint64 journal_seq, uint64 verified_mono_ns)
 {
 	if (cluster_write_fence_shmem == NULL)
 		return;
 	pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->external_write_excluded, 1);
 	cluster_write_fence_atomic_max(&cluster_write_fence_shmem->external_last_journal_seq,
-									journal_seq);
-	cluster_write_fence_atomic_max(
-		&cluster_write_fence_shmem->external_last_verified_mono_ns,
-		verified_mono_ns);
+								   journal_seq);
+	cluster_write_fence_atomic_max(&cluster_write_fence_shmem->external_last_verified_mono_ns,
+								   verified_mono_ns);
 }
 
-#define DEFINE_EXTERNAL_COUNTER_NOTE(name) \
-	void cluster_write_fence_note_external_##name(void) \
-	{ \
-		if (cluster_write_fence_shmem != NULL) \
-			pg_atomic_fetch_add_u64( \
-				&cluster_write_fence_shmem->external_##name, 1); \
+#define DEFINE_EXTERNAL_COUNTER_NOTE(name)                                                         \
+	void cluster_write_fence_note_external_##name(void)                                            \
+	{                                                                                              \
+		if (cluster_write_fence_shmem != NULL)                                                     \
+			pg_atomic_fetch_add_u64(&cluster_write_fence_shmem->external_##name, 1);               \
 	}
 
 DEFINE_EXTERNAL_COUNTER_NOTE(rejected)
@@ -1002,11 +996,12 @@ DEFINE_EXTERNAL_COUNTER_NOTE(publish_gate_blocked)
 
 #undef DEFINE_EXTERNAL_COUNTER_NOTE
 
-#define DEFINE_EXTERNAL_COUNTER_GETTER(name) \
-	uint64 cluster_write_fence_get_external_##name(void) \
-	{ \
-		return cluster_write_fence_shmem == NULL ? 0 : \
-			pg_atomic_read_u64(&cluster_write_fence_shmem->external_##name); \
+#define DEFINE_EXTERNAL_COUNTER_GETTER(name)                                                       \
+	uint64 cluster_write_fence_get_external_##name(void)                                           \
+	{                                                                                              \
+		return cluster_write_fence_shmem == NULL                                                   \
+				   ? 0                                                                             \
+				   : pg_atomic_read_u64(&cluster_write_fence_shmem->external_##name);              \
 	}
 
 DEFINE_EXTERNAL_COUNTER_GETTER(admit_requested)
@@ -1035,12 +1030,10 @@ cluster_write_fence_get_external_last_proof_age_ms(uint64 *age_ms)
 	*age_ms = 0;
 	if (cluster_write_fence_shmem == NULL)
 		return false;
-	sample = pg_atomic_read_u64(
-		&cluster_write_fence_shmem->external_last_verified_mono_ns);
+	sample = pg_atomic_read_u64(&cluster_write_fence_shmem->external_last_verified_mono_ns);
 	if (sample == 0 || clock_gettime(CLOCK_MONOTONIC, &now) != 0)
 		return false;
-	now_ns = (uint64) now.tv_sec * UINT64_C(1000000000) +
-		(uint64) now.tv_nsec;
+	now_ns = (uint64)now.tv_sec * UINT64_C(1000000000) + (uint64)now.tv_nsec;
 	if (now_ns < sample)
 		return false;
 	*age_ms = (now_ns - sample) / UINT64_C(1000000);

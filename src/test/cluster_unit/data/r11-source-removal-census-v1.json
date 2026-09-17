@@ -15,8 +15,8 @@
   },
   "current_product_snapshot": {
     "algorithm": "sha256-canonical-path-blob-v1",
-    "path_count": 2224,
-    "sha256": "b257e233d68a37edfbd238891077e28248d64fa8f1743cba1cdaf18a3c2680c2"
+    "path_count": 2225,
+    "sha256": "4788ca2a041bb8a02a38f4815170d76b6200fc6ef37580fab3b9e50aaa9e0f61"
   },
   "gates": {
     "L1": {
@@ -131,7 +131,7 @@
         },
         {
           "path": "src/backend/cluster/cluster_lms_outbound.c",
-          "symbol": "cluster_pcm_lock_resource_x_outbound_intent_probe_exact"
+          "symbol": "cluster_pcm_lock_resource_x_outbound_work_probe_exact"
         }
       ]
     },

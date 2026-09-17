@@ -107,8 +107,7 @@ cluster_cr_server_live_binding_exact(bool xid_is_mine, uint32 expected_segment_i
 
 ClusterUndoVerdictKind
 cluster_cr_server_c0_zero_match_verdict(bool authoritative, bool xid_is_mine,
-										uint32 expected_segment_id,
-										uint32 expected_tt_slot_id,
+										uint32 expected_segment_id, uint32 expected_tt_slot_id,
 										bool no_raw_reuse_window, bool clog_is_committed,
 										bool clog_is_aborted, bool clog_is_in_progress,
 										bool xid_is_in_progress)
@@ -121,8 +120,7 @@ cluster_cr_server_c0_zero_match_verdict(bool authoritative, bool xid_is_mine,
 		return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
 
 	raw_status_count
-		= (clog_is_committed ? 1 : 0) + (clog_is_aborted ? 1 : 0)
-		  + (clog_is_in_progress ? 1 : 0);
+		= (clog_is_committed ? 1 : 0) + (clog_is_aborted ? 1 : 0) + (clog_is_in_progress ? 1 : 0);
 	if (raw_status_count != 1 || clog_is_committed)
 		return CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
 	if (clog_is_aborted)
@@ -134,11 +132,12 @@ cluster_cr_server_c0_zero_match_verdict(bool authoritative, bool xid_is_mine,
 }
 
 ClusterUndoVerdictKind
-cluster_cr_server_freshref_c1b_pair_verdict(
-	bool pair_request, bool xid_is_mine, uint32 expected_segment_id,
-	uint32 expected_tt_slot_id, bool no_raw_reuse_window, int raw_clog_status,
-	ClusterTTDurableResolve resolve, uint16 matched_segment, uint16 matched_slot,
-	SCN resolved_scn, SCN proposed_scn, bool retention_ok, SCN horizon_scn)
+cluster_cr_server_freshref_c1b_pair_verdict(bool pair_request, bool xid_is_mine,
+											uint32 expected_segment_id, uint32 expected_tt_slot_id,
+											bool no_raw_reuse_window, int raw_clog_status,
+											ClusterTTDurableResolve resolve, uint16 matched_segment,
+											uint16 matched_slot, SCN resolved_scn, SCN proposed_scn,
+											bool retention_ok, SCN horizon_scn)
 {
 	if (!pair_request || !xid_is_mine || expected_segment_id == 0
 		|| expected_segment_id > UINT16_MAX || expected_tt_slot_id < 1
@@ -149,8 +148,8 @@ cluster_cr_server_freshref_c1b_pair_verdict(
 	switch (resolve) {
 	case CLUSTER_TT_DURABLE_RESOLVED_SCN:
 		if ((uint32)matched_segment == expected_segment_id
-			&& (uint32)matched_slot + 1 == expected_tt_slot_id
-			&& SCN_VALID(resolved_scn) && resolved_scn == proposed_scn)
+			&& (uint32)matched_slot + 1 == expected_tt_slot_id && SCN_VALID(resolved_scn)
+			&& resolved_scn == proposed_scn)
 			return CLUSTER_UNDO_VERDICT_COMMITTED_EXACT;
 		break;
 	case CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH:
@@ -170,11 +169,12 @@ cluster_cr_server_freshref_c1b_pair_verdict(
 }
 
 bool
-cluster_cr_server_freshref_c1b_pair_request_decode(
-	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node,
-	int32 local_node, uint64 current_epoch, int max_backends,
-	uint32 *segment_id, TransactionId *xid, uint32 *expected_tt_slot_id,
-	SCN *proposed_scn)
+cluster_cr_server_freshref_c1b_pair_request_decode(const GcsBlockForwardPayload *fwd,
+												   int32 authenticated_source_node,
+												   int32 local_node, uint64 current_epoch,
+												   int max_backends, uint32 *segment_id,
+												   TransactionId *xid, uint32 *expected_tt_slot_id,
+												   SCN *proposed_scn)
 {
 	uint32 decoded_segment = 0;
 	uint32 decoded_slot = 0;
@@ -183,22 +183,18 @@ cluster_cr_server_freshref_c1b_pair_request_decode(
 	int i;
 
 	if (fwd == NULL || !GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(fwd)
-		|| fwd->request_id == 0 || fwd->epoch != current_epoch
-		|| authenticated_source_node < 0
-		|| authenticated_source_node >= CLUSTER_MAX_NODES
-		|| local_node < 0 || local_node >= CLUSTER_MAX_NODES
-		|| authenticated_source_node == local_node
+		|| fwd->request_id == 0 || fwd->epoch != current_epoch || authenticated_source_node < 0
+		|| authenticated_source_node >= CLUSTER_MAX_NODES || local_node < 0
+		|| local_node >= CLUSTER_MAX_NODES || authenticated_source_node == local_node
 		|| fwd->original_requester_node != authenticated_source_node
-		|| fwd->master_node != authenticated_source_node
-		|| max_backends <= 0 || fwd->requester_backend_id <= 0
-		|| fwd->requester_backend_id > max_backends
+		|| fwd->master_node != authenticated_source_node || max_backends <= 0
+		|| fwd->requester_backend_id <= 0 || fwd->requester_backend_id > max_backends
 		|| fwd->transition_id != (uint8)PCM_TRANS_N_TO_S)
 		return false;
 	for (i = 0; i < 6; i++)
 		if (fwd->reserved_0[i] != 0)
 			return false;
-	if (!GcsBlockUndoFreshRefC1bTagDecode(
-			fwd->tag, &decoded_segment, &decoded_xid, &decoded_slot))
+	if (!GcsBlockUndoFreshRefC1bTagDecode(fwd->tag, &decoded_segment, &decoded_xid, &decoded_slot))
 		return false;
 	decoded_scn = GcsBlockForwardPayloadGetExpectedPiWatermarkScn(fwd);
 	if (!SCN_VALID(decoded_scn))

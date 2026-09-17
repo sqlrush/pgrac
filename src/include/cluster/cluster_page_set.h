@@ -51,29 +51,27 @@
  * exact-equality record identity; `failed_origin_thread` names the
  * failed-origin duty this change belongs to.
  */
-typedef struct ClusterPageRedoChange
-{
+typedef struct ClusterPageRedoChange {
 	ClusterPageIdentity identity;
 	ClusterPageClass page_class;
 	ClusterPageVersion expected_before;
 	ClusterPageVersion result_version;
-	uint64		change_identity;	/* opaque exact-equality */
-	uint16		failed_origin_thread;
+	uint64 change_identity; /* opaque exact-equality */
+	uint16 failed_origin_thread;
 } ClusterPageRedoChange;
 
 /*
  * §6.1 BlockRecoverySet — the in-memory rebuildable plan for ONE block.
  */
-typedef struct ClusterBlockRecoverySet
-{
-	uint16		failed_origin_thread;
+typedef struct ClusterBlockRecoverySet {
+	uint16 failed_origin_thread;
 	ClusterPageIdentity identity;
 	ClusterPageClass page_class;
-	ClusterPageSourceKind source_kind;	/* selected source (PGDEL-04) */
-	ClusterPageVersion source_version;	/* selected source's version */
-	ClusterPageVersion terminal_version;	/* required terminal version */
+	ClusterPageSourceKind source_kind;		   /* selected source (PGDEL-04) */
+	ClusterPageVersion source_version;		   /* selected source's version */
+	ClusterPageVersion terminal_version;	   /* required terminal version */
 	const ClusterPageRedoChange *contributors; /* ordered same-block chain */
-	int			n_contributors;
+	int n_contributors;
 } ClusterBlockRecoverySet;
 
 /*
@@ -89,13 +87,12 @@ typedef struct ClusterBlockRecoverySet
  *     construction — the closure FAILS on any mismatch instead of
  *     guessing which terminal is right).
  */
-typedef enum ClusterPageClosureResult
-{
+typedef enum ClusterPageClosureResult {
 	CLUSTER_PAGE_CLOSURE_OK = 0,
-	CLUSTER_PAGE_CLOSURE_GAP,	/* missing/unknown/invalid version join */
-	CLUSTER_PAGE_CLOSURE_UNKNOWN_CLASS, /* a contributor class is UNKNOWN */
+	CLUSTER_PAGE_CLOSURE_GAP,				/* missing/unknown/invalid version join */
+	CLUSTER_PAGE_CLOSURE_UNKNOWN_CLASS,		/* a contributor class is UNKNOWN */
 	CLUSTER_PAGE_CLOSURE_INCARNATION_CROSS, /* incarnation boundary crossed */
-	CLUSTER_PAGE_CLOSURE_THREAD_MISMATCH, /* contributor of another origin */
+	CLUSTER_PAGE_CLOSURE_THREAD_MISMATCH,	/* contributor of another origin */
 	CLUSTER_PAGE_CLOSURE_TERMINAL_MISMATCH, /* chain end != terminal */
 	CLUSTER_PAGE_CLOSURE_INVALID_INPUT
 } ClusterPageClosureResult;
@@ -105,8 +102,8 @@ typedef enum ClusterPageClosureResult
  * deterministic: the same canonical inputs always produce the same
  * result (rerun determinism).  No mutation, no I/O.
  */
-extern ClusterPageClosureResult cluster_page_contributor_closure(
-	const ClusterBlockRecoverySet *set);
+extern ClusterPageClosureResult
+cluster_page_contributor_closure(const ClusterBlockRecoverySet *set);
 
 /*
  * §3.3 shape-2 trusted skip: true when a contributor chain is closed
@@ -115,7 +112,7 @@ extern ClusterPageClosureResult cluster_page_contributor_closure(
  * an empty chain) is already covered by the closed chain.  Only a
  * closed chain proves coverage: a numeric high-water never does (§3.3).
  */
-extern bool cluster_page_contributor_chain_covers(
-	const ClusterBlockRecoverySet *set, const ClusterPageVersion *from_version);
+extern bool cluster_page_contributor_chain_covers(const ClusterBlockRecoverySet *set,
+												  const ClusterPageVersion *from_version);
 
-#endif							/* CLUSTER_PAGE_SET_H */
+#endif /* CLUSTER_PAGE_SET_H */

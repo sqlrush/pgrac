@@ -28,14 +28,13 @@ static void test_wait_state_write_barrier(void);
 extern void test_real_wait_state_init(ClusterLmdProcWaitState *ws);
 extern void test_real_wait_state_reset(ClusterLmdProcWaitState *ws);
 extern uint64 test_real_wait_state_publish(ClusterLmdProcWaitState *ws, uint8 kind,
-											uint64 request_id, uint64 cluster_epoch,
-											TransactionId xid);
+										   uint64 request_id, uint64 cluster_epoch,
+										   TransactionId xid);
 extern void test_real_wait_state_clear(ClusterLmdProcWaitState *ws);
 extern ClusterLmdWaitStateReadResult
-test_real_wait_state_read_exact(ClusterLmdProcWaitState *ws,
-								  ClusterLmdWaitStateSnapshot *out);
+test_real_wait_state_read_exact(ClusterLmdProcWaitState *ws, ClusterLmdWaitStateSnapshot *out);
 extern bool test_real_wait_state_read(ClusterLmdProcWaitState *ws,
-								  ClusterLmdWaitStateSnapshot *out);
+									  ClusterLmdWaitStateSnapshot *out);
 
 #define cluster_lmd_wait_state_init test_real_wait_state_init
 #define cluster_lmd_wait_state_reset test_real_wait_state_reset
@@ -67,9 +66,9 @@ UT_DEFINE_GLOBALS();
 #define TEST_XID ((TransactionId)900)
 #define TEST_EPOCH UINT64CONST(77)
 
-static char test_txw_storage[MAXALIGN(offsetof(ClusterTxwShmem, slots)
-											 + TEST_NSLOTS * sizeof(ClusterTxwWaitSlot))]
-	pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static char test_txw_storage[MAXALIGN(
+	offsetof(ClusterTxwShmem, slots)
+	+ TEST_NSLOTS * sizeof(ClusterTxwWaitSlot))] pg_attribute_aligned(MAXIMUM_ALIGNOF);
 static PGPROC test_procs[TEST_NSLOTS];
 static PROC_HDR test_proc_hdr;
 
@@ -157,7 +156,8 @@ cluster_cancel_token_consume(void)
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
-					 const char *fileName pg_attribute_unused(), int lineNumber pg_attribute_unused())
+					 const char *fileName pg_attribute_unused(),
+					 int lineNumber pg_attribute_unused())
 {
 	test_exceptional_condition_hit = true;
 	if (test_fail_stop_armed) {
@@ -212,7 +212,8 @@ LWLockInitialize(LWLock *lock pg_attribute_unused(), int tranche_id pg_attribute
 {}
 
 void *
-ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(), bool *found)
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
+				bool *found)
 {
 	*found = true;
 	return test_txw_storage;
@@ -263,8 +264,8 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator pg_attribute_unused(),
 
 ClusterSemanticAdmissionResult
 cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
-							  const ClusterTTStatusSourceRequest *request,
-							  ClusterTTStatusSourceResult *result)
+								  const ClusterTTStatusSourceRequest *request,
+								  ClusterTTStatusSourceResult *result)
 {
 	test_legacy_tt_dispatch_calls++;
 	UT_ASSERT_EQ((int)op, (int)CLUSTER_TT_SOURCE_LOOKUP);
@@ -280,8 +281,8 @@ cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 }
 
 uint64
-cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws, uint8 kind,
-								   uint64 request_id, uint64 epoch, TransactionId xid)
+cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws, uint8 kind, uint64 request_id,
+							   uint64 epoch, TransactionId xid)
 {
 	uint64 wait_seq;
 
@@ -312,8 +313,7 @@ cluster_lmd_wait_state_clear(ClusterLmdProcWaitState *ws)
 }
 
 ClusterLmdWaitStateReadResult
-cluster_lmd_wait_state_read_exact(ClusterLmdProcWaitState *ws,
-								  ClusterLmdWaitStateSnapshot *out)
+cluster_lmd_wait_state_read_exact(ClusterLmdProcWaitState *ws, ClusterLmdWaitStateSnapshot *out)
 {
 	ClusterLmdWaitStateReadResult result;
 
@@ -321,8 +321,7 @@ cluster_lmd_wait_state_read_exact(ClusterLmdProcWaitState *ws,
 	if (test_wait_read_override) {
 		*out = test_wait_snapshot;
 		result = test_wait_read_result;
-	}
-	else
+	} else
 		result = test_real_wait_state_read_exact(ws, out);
 	if (test_mutate_slot_during_wait_read) {
 		ClusterTxw->slots[MyProc->pgprocno].waiting = test_mutated_slot_kind;
@@ -332,8 +331,8 @@ cluster_lmd_wait_state_read_exact(ClusterLmdProcWaitState *ws,
 }
 
 bool
-cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter,
-								  const ClusterLmdVertex *blocker, uint64 request_id)
+cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter, const ClusterLmdVertex *blocker,
+								  uint64 request_id)
 {
 	test_wfg_submit_calls++;
 	test_wfg_waiter = *waiter;
@@ -362,15 +361,13 @@ cluster_lmd_graph_remove_edge_by_waiter_exact_result(const ClusterLmdVertex *wai
 	test_cleanup_events[test_cleanup_event_count++] = 'G';
 	if (!test_wfg_live)
 		test_wfg_last_remove_result = CLUSTER_LMD_GRAPH_REMOVE_ABSENT;
-	else if (waiter->node_id == test_wfg_waiter.node_id
-			 && waiter->procno == test_wfg_waiter.procno
+	else if (waiter->node_id == test_wfg_waiter.node_id && waiter->procno == test_wfg_waiter.procno
 			 && waiter->cluster_epoch == test_wfg_waiter.cluster_epoch
 			 && waiter->request_id == test_wfg_waiter.request_id
 			 && waiter->wait_seq == test_wfg_waiter.wait_seq) {
 		test_wfg_live = false;
 		test_wfg_last_remove_result = CLUSTER_LMD_GRAPH_REMOVE_REMOVED;
-	}
-	else
+	} else
 		test_wfg_last_remove_result = CLUSTER_LMD_GRAPH_REMOVE_STALE;
 	return test_wfg_last_remove_result;
 }
@@ -439,8 +436,7 @@ test_wait_state_write_barrier(void)
 		return;
 
 	UT_ASSERT_NOT_NULL(test_wait_write_ws);
-	test_pending_fatal_saw_odd
-		= (pg_atomic_read_u32(&test_wait_write_ws->change_seq) & 1U) != 0;
+	test_pending_fatal_saw_odd = (pg_atomic_read_u32(&test_wait_write_ws->change_seq) & 1U) != 0;
 	test_pending_fatal_saw_holdoff = InterruptHoldoffCount > 0;
 	InterruptPending = true;
 	test_pending_fatal_delivery = true;
@@ -494,15 +490,13 @@ prepare_owned_active_wait(uint32 slot_kind, bool insert_edge)
 		ClusterTTStatusKey source = test_source_key();
 
 		txw_slot_set(0, &source, false);
-	}
-	else {
+	} else {
 		ClusterTxLocator locator = test_locator();
 
 		UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
 	}
-	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
-										  CLUSTER_LMD_WAIT_TX, 0, TEST_EPOCH,
-										  test_local_xid);
+	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait, CLUSTER_LMD_WAIT_TX, 0,
+											  TEST_EPOCH, test_local_xid);
 	txw_exact_waiter_vertex(&test_wfg_waiter, 0, TEST_EPOCH, test_local_xid, wait_seq);
 	memset(&blocker, 0, sizeof(blocker));
 	test_wfg_blocker = blocker;
@@ -666,13 +660,12 @@ assert_d9_authorities_equal(const TestD9AuthoritySnapshot *expected)
 {
 	UT_ASSERT_EQ(memcmp(&ClusterTxw->slots[0], &expected->slot, sizeof(expected->slot)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&ClusterTxw->active_waiters), expected->active_waiters);
-	UT_ASSERT_EQ(memcmp(&MyProc->cluster_lmd_wait, &expected->wait_state,
-						 sizeof(expected->wait_state)), 0);
+	UT_ASSERT_EQ(
+		memcmp(&MyProc->cluster_lmd_wait, &expected->wait_state, sizeof(expected->wait_state)), 0);
 	UT_ASSERT_EQ(test_wfg_live, expected->wfg_live);
-	UT_ASSERT_EQ(memcmp(&test_wfg_waiter, &expected->wfg_waiter,
-						 sizeof(expected->wfg_waiter)), 0);
-	UT_ASSERT_EQ(memcmp(&test_wfg_blocker, &expected->wfg_blocker,
-						 sizeof(expected->wfg_blocker)), 0);
+	UT_ASSERT_EQ(memcmp(&test_wfg_waiter, &expected->wfg_waiter, sizeof(expected->wfg_waiter)), 0);
+	UT_ASSERT_EQ(memcmp(&test_wfg_blocker, &expected->wfg_blocker, sizeof(expected->wfg_blocker)),
+				 0);
 }
 
 static void
@@ -994,8 +987,7 @@ UT_TEST(test_current_mx_source_wait_consumes_deadlock_token_after_cleanup)
 
 	reset_fixture();
 	test_cancel_token_pending = true;
-	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
-				 &deadline_mono_us),
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000, &deadline_mono_us),
 				 CLUSTER_TXW_DEADLOCK);
 	UT_ASSERT(deadline_mono_us != 0);
 	UT_ASSERT(!test_cancel_token_pending);
@@ -1014,8 +1006,7 @@ UT_TEST(test_current_mx_active_poll_retries_without_dormant_source)
 	/* A terminal legacy SOURCE row must not decide an active R4 wait. */
 	test_legacy_tt_found = true;
 	test_legacy_tt_status = CLUSTER_TT_STATUS_COMMITTED;
-	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
-				 &deadline_mono_us),
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000, &deadline_mono_us),
 				 CLUSTER_TXW_RETRY);
 	UT_ASSERT(deadline_mono_us != 0);
 	frozen_deadline_mono_us = deadline_mono_us;
@@ -1026,8 +1017,7 @@ UT_TEST(test_current_mx_active_poll_retries_without_dormant_source)
 	assert_slot_clean();
 
 	/* A full tuple/DESCRIBE retry keeps the original operation deadline. */
-	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
-				 &deadline_mono_us),
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000, &deadline_mono_us),
 				 CLUSTER_TXW_RETRY);
 	UT_ASSERT_EQ(deadline_mono_us, frozen_deadline_mono_us);
 	UT_ASSERT_EQ(test_legacy_tt_dispatch_calls, 0);
@@ -1036,8 +1026,7 @@ UT_TEST(test_current_mx_active_poll_retries_without_dormant_source)
 
 	/* An exhausted retained budget times out after exact registration cleanup. */
 	deadline_mono_us = 1;
-	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000,
-				 &deadline_mono_us),
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_current_mx(&source, 1000, &deadline_mono_us),
 				 CLUSTER_TXW_TIMEOUT);
 	UT_ASSERT_EQ(deadline_mono_us, 1);
 	UT_ASSERT_EQ(test_legacy_tt_dispatch_calls, 0);
@@ -1063,9 +1052,8 @@ UT_TEST(test_backend_exit_cleans_exact_target_and_allows_procno_reuse)
 
 	reset_fixture();
 	UT_ASSERT(txw_target_slot_set_if_free(0, &locator));
-	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
-										  CLUSTER_LMD_WAIT_TX, 0, TEST_EPOCH,
-										  test_local_xid);
+	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait, CLUSTER_LMD_WAIT_TX, 0,
+											  TEST_EPOCH, test_local_xid);
 	txw_exact_waiter_vertex(&waiter, 0, TEST_EPOCH, test_local_xid, wait_seq);
 	memset(&blocker, 0, sizeof(blocker));
 	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&waiter, &blocker, 0));
@@ -1099,9 +1087,8 @@ UT_TEST(test_backend_exit_cleans_exact_source_and_allows_procno_reuse)
 
 	reset_fixture();
 	txw_slot_set(0, &source, false);
-	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
-										  CLUSTER_LMD_WAIT_TX, 0, TEST_EPOCH,
-										  test_local_xid);
+	wait_seq = cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait, CLUSTER_LMD_WAIT_TX, 0,
+											  TEST_EPOCH, test_local_xid);
 	txw_exact_waiter_vertex(&waiter, 0, TEST_EPOCH, test_local_xid, wait_seq);
 	memset(&blocker, 0, sizeof(blocker));
 	UT_ASSERT(cluster_lmd_submit_wait_edge_real(&waiter, &blocker, 0));
@@ -1299,12 +1286,10 @@ UT_TEST(test_pending_fatal_during_wait_state_publish_finishes_even_before_exit)
 	test_inject_pending_fatal = true;
 	if (sigsetjmp(test_fail_stop_stack, 1) == 0) {
 		test_fail_stop_armed = true;
-		(void)cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait,
-										 CLUSTER_LMD_WAIT_TX, 0, TEST_EPOCH,
-										 test_local_xid);
+		(void)cluster_lmd_wait_state_publish(&MyProc->cluster_lmd_wait, CLUSTER_LMD_WAIT_TX, 0,
+											 TEST_EPOCH, test_local_xid);
 		test_fail_stop_armed = false;
-	}
-	else {
+	} else {
 		test_fail_stop_armed = false;
 		caught = true;
 	}
@@ -1342,8 +1327,7 @@ UT_TEST(test_pending_fatal_during_wait_state_clear_finishes_even_before_exit)
 		test_fail_stop_armed = true;
 		cluster_lmd_wait_state_clear(&MyProc->cluster_lmd_wait);
 		test_fail_stop_armed = false;
-	}
-	else {
+	} else {
 		test_fail_stop_armed = false;
 		caught = true;
 	}

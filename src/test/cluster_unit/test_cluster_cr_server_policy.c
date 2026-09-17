@@ -68,15 +68,12 @@ VariableCache ShmemVariableCache = &c0_variable_cache;
  * origin CLOG abort is positive ABORTED authority, while "not committed" by
  * itself remains UNKNOWN_FAIL_CLOSED.
  */
-extern ClusterUndoVerdictKind
-cluster_cr_server_resolved_scn_verdict(bool clog_did_commit, bool clog_did_abort,
-									   bool xid_is_in_progress);
-extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine,
-												 uint32 expected_segment_id,
-												 uint32 expected_tt_slot_id,
-												 uint16 matched_segment,
-												 uint16 matched_slot,
-												 bool xid_is_in_progress,
+extern ClusterUndoVerdictKind cluster_cr_server_resolved_scn_verdict(bool clog_did_commit,
+																	 bool clog_did_abort,
+																	 bool xid_is_in_progress);
+extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine, uint32 expected_segment_id,
+												 uint32 expected_tt_slot_id, uint16 matched_segment,
+												 uint16 matched_slot, bool xid_is_in_progress,
 												 bool durable_binding_stable);
 
 /*
@@ -87,19 +84,20 @@ extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine,
  * product header before the RED receipt is captured.
  */
 extern ClusterUndoVerdictKind cluster_cr_server_c0_zero_match_verdict(
-	bool authoritative, bool xid_is_mine, uint32 expected_segment_id,
-	uint32 expected_tt_slot_id, bool no_raw_reuse_window, bool clog_is_committed,
-	bool clog_is_aborted, bool clog_is_in_progress, bool xid_is_in_progress);
-extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
-	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
-	bool authoritative);
+	bool authoritative, bool xid_is_mine, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	bool no_raw_reuse_window, bool clog_is_committed, bool clog_is_aborted,
+	bool clog_is_in_progress, bool xid_is_in_progress);
+extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(TransactionId xid,
+																	 uint32 expected_segment_id,
+																	 uint32 expected_tt_slot_id,
+																	 bool authoritative);
 extern bool cluster_cr_server_test_undo_verdict_serve(ClusterLmsCrSlot *slot);
 extern bool cluster_cr_server_test_multi_verdict_serve(ClusterLmsCrSlot *slot);
 extern const char *cluster_cr_server_test_ordinary_reason(TransactionId xid, uint32 segment_hint,
 														  ClusterUndoVerdictKind *kind);
-extern ClusterUndoVerdictResult cluster_cr_server_test_own_xid_pair_verdict(
-	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
-	SCN proposed_scn);
+extern ClusterUndoVerdictResult
+cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid, uint32 expected_segment_id,
+											uint32 expected_tt_slot_id, SCN proposed_scn);
 extern const char *cluster_cr_server_test_own_xid_pair_reason(TransactionId xid,
 															  uint32 expected_segment_id,
 															  uint32 expected_tt_slot_id,
@@ -107,15 +105,14 @@ extern const char *cluster_cr_server_test_own_xid_pair_reason(TransactionId xid,
 															  ClusterUndoVerdictResult *out);
 extern bool cluster_cr_server_test_pair_detail_admit(uint32 *emitted);
 extern bool cluster_cr_server_freshref_c1b_pair_request_decode(
-	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node,
-	int32 local_node, uint64 current_epoch, int max_backends,
-	uint32 *segment_id, TransactionId *xid, uint32 *expected_tt_slot_id,
-	SCN *proposed_scn);
+	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node, int32 local_node,
+	uint64 current_epoch, int max_backends, uint32 *segment_id, TransactionId *xid,
+	uint32 *expected_tt_slot_id, SCN *proposed_scn);
 extern ClusterUndoVerdictKind cluster_cr_server_freshref_c1b_pair_verdict(
-	bool pair_request, bool xid_is_mine, uint32 expected_segment_id,
-	uint32 expected_tt_slot_id, bool no_raw_reuse_window, XidStatus raw_status,
-	ClusterTTDurableResolve resolve, uint16 matched_segment, uint16 matched_slot,
-	SCN resolved_scn, SCN proposed_scn, bool retention_ok, SCN horizon_scn);
+	bool pair_request, bool xid_is_mine, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	bool no_raw_reuse_window, XidStatus raw_status, ClusterTTDurableResolve resolve,
+	uint16 matched_segment, uint16 matched_slot, SCN resolved_scn, SCN proposed_scn,
+	bool retention_ok, SCN horizon_scn);
 
 typedef enum C0TestEvent {
 	C0_EV_SCAN = 1,
@@ -283,8 +280,7 @@ TransactionIdDidAbort(TransactionId xid pg_attribute_unused())
 bool
 TransactionIdIsInProgress(TransactionId xid pg_attribute_unused())
 {
-	UT_ASSERT_EQ(c0_native_lock_depth,
-				 c0_expect_procarray_under_native_lock ? 1 : 0);
+	UT_ASSERT_EQ(c0_native_lock_depth, c0_expect_procarray_under_native_lock ? 1 : 0);
 	UT_ASSERT_EQ(c0_xact_lock_depth, 0);
 	c0_procarray_calls++;
 	c0_note(C0_EV_PROCARRAY);
@@ -539,8 +535,8 @@ scn_time_cmp(SCN a, SCN b)
 
 bool
 cluster_xid_native_prehistory_provable_full(uint64 next_full_xid pg_attribute_unused(),
-										uint64 covered_hw_full pg_attribute_unused(),
-										TransactionId xid pg_attribute_unused())
+											uint64 covered_hw_full pg_attribute_unused(),
+											TransactionId xid pg_attribute_unused())
 {
 	c0_native_provable_calls++;
 	return false;
@@ -779,16 +775,14 @@ UT_TEST(test_resolved_scn_explicit_abort_after_stamp_is_positive)
 		= source != NULL ? strstr(source, "case CLUSTER_TT_DURABLE_RESOLVED_SCN:") : NULL;
 	const char *resolved_end
 		= resolved != NULL ? strstr(resolved, "if (cluster_cr_accept_resolved_scn(scn))") : NULL;
-	const char *exact_gate
-		= resolved != NULL ? strstr(resolved, "if (exact_binding)") : NULL;
+	const char *exact_gate = resolved != NULL ? strstr(resolved, "if (exact_binding)") : NULL;
 	const char *did_abort
 		= exact_gate != NULL ? strstr(exact_gate, "TransactionIdDidAbort(xid)") : NULL;
 	const char *abort_verdict
 		= did_abort != NULL ? strstr(did_abort, "CLUSTER_UNDO_VERDICT_ABORTED") : NULL;
-	const char *unknown
-		= abort_verdict != NULL
-			  ? strstr(abort_verdict, "CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED")
-			  : NULL;
+	const char *unknown = abort_verdict != NULL
+							  ? strstr(abort_verdict, "CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED")
+							  : NULL;
 
 	UT_ASSERT_EQ((int)cluster_cr_server_resolved_scn_verdict(false, true, false),
 				 (int)CLUSTER_UNDO_VERDICT_ABORTED);
@@ -865,45 +859,45 @@ UT_TEST(test_resolved_scn_commit_between_clog_and_procarray_rechecks_exact_bindi
  */
 UT_TEST(test_c0_zero_match_positive_proof_table)
 {
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 1, true, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 1, true, false, true,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_ABORTED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 1, true, false, false, true, true),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 1, true, false, false,
+															  true, true),
 				 (int)CLUSTER_UNDO_VERDICT_IN_PROGRESS);
 
 	/* Commit-without-SCN, SUB_COMMITTED/unknown and contradictory samples. */
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 1, true, true, false, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 1, true, true, false,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 1, true, false, false, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 1, true, false, false,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 1, true, false, true, false, true),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 1, true, false, true,
+															  false, true),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 
 	/* Every carrier/no-reuse gate is fail-closed. */
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  false, true, 1, 1, true, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(false, true, 1, 1, true, false, true,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, false, 1, 1, true, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, false, 1, 1, true, false, true,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 0, 1, true, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 0, 1, true, false, true,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, UINT32_C(65536), 1, true, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, UINT32_C(65536), 1, true,
+															  false, true, false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 0, true, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 0, true, false, true,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 49, true, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 49, true, false, true,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(
-					  true, true, 1, 1, false, false, true, false, false),
+	UT_ASSERT_EQ((int)cluster_cr_server_c0_zero_match_verdict(true, true, 1, 1, false, false, true,
+															  false, false),
 				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 }
 
@@ -913,69 +907,65 @@ UT_TEST(test_c0_zero_match_positive_proof_table)
  * COMMITTED_BOUND. */
 UT_TEST(test_freshref_c1b_pair_exact_truth_table)
 {
-	const SCN proposed = (SCN) 10498;
+	const SCN proposed = (SCN)10498;
 
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 0, proposed, proposed,
-					  false, InvalidScn),
-				 (int) CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
-					  proposed, true, proposed),
-				 (int) CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 0, proposed, proposed, false, InvalidScn),
+				 (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn, proposed, true,
+					 proposed),
+				 (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
 
 	/* Pair identity, no-reuse and literal origin CLOG are all mandatory. */
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  false, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
-					  proposed, true, proposed),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, false, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
-					  proposed, true, proposed),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_ABORTED,
-					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
-					  proposed, true, proposed),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 false, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn, proposed, true,
+					 proposed),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, false, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn, proposed, true,
+					 proposed),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_ABORTED,
+					 CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn, proposed, true,
+					 proposed),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 
 	/* Live match requires exact segment, 1-based slot and SCN. */
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 8, 0, proposed, proposed,
-					  false, InvalidScn),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 1, proposed, proposed,
-					  false, InvalidScn),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 0, proposed + 1, proposed,
-					  false, InvalidScn),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RESOLVED_SCN, 8, 0, proposed, proposed, false, InvalidScn),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 1, proposed, proposed, false, InvalidScn),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RESOLVED_SCN, 7, 0, proposed + 1, proposed, false,
+					 InvalidScn),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 
 	/* Recycled zero-match requires retention and proposed <= frozen horizon. */
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
-					  proposed, false, proposed),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn,
-					  proposed, true, proposed - 1),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
-	UT_ASSERT_EQ((int) cluster_cr_server_freshref_c1b_pair_verdict(
-					  true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
-					  CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP, 0, 0, InvalidScn,
-					  proposed, true, proposed),
-				 (int) CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn, proposed, false,
+					 proposed),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_RECYCLED_ZERO_MATCH, 0, 0, InvalidScn, proposed, true,
+					 proposed - 1),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)cluster_cr_server_freshref_c1b_pair_verdict(
+					 true, true, 7, 1, true, TRANSACTION_STATUS_COMMITTED,
+					 CLUSTER_TT_DURABLE_AMBIGUOUS_WRAP, 0, 0, InvalidScn, proposed, true, proposed),
+				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 }
 
 UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
@@ -1022,10 +1012,8 @@ UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
 	c0_retention_ok = true;
 	c0_horizon_scn = proposed + 2;
 	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
-	result = cluster_cr_server_test_own_xid_pair_verdict(
-		4195136, 7, 1, proposed);
-	UT_ASSERT_EQ((int)result.kind,
-				 (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
+	result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, proposed);
+	UT_ASSERT_EQ((int)result.kind, (int)CLUSTER_UNDO_VERDICT_COMMITTED_EXACT);
 	UT_ASSERT_EQ((uint64)result.commit_scn, (uint64)proposed);
 	UT_ASSERT_EQ(c0_raw_clog_calls, 1);
 	UT_ASSERT_EQ(c0_retention_calls, 0);
@@ -1041,8 +1029,7 @@ UT_TEST(test_freshref_c1b_pair_real_resolver_holds_no_reuse_through_c1b)
 	c0_raw_status = TRANSACTION_STATUS_COMMITTED;
 	c0_disable_before_native_recheck = true;
 	result = cluster_cr_server_test_own_xid_pair_verdict(4195136, 7, 1, proposed);
-	UT_ASSERT_EQ((int)result.kind,
-				 (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
+	UT_ASSERT_EQ((int)result.kind, (int)CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED);
 	UT_ASSERT_EQ(c0_raw_clog_calls, 0);
 	UT_ASSERT_EQ(c0_retention_calls, 0);
 	UT_ASSERT_EQ(c0_native_lock_depth, 0);
@@ -1067,8 +1054,8 @@ UT_TEST(test_freshref_c1b_pair_request_canonical_decode)
 	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)10498);
 	GcsBlockForwardPayloadSetUndoFreshRefC1bPairRequest(&fwd);
 
-	UT_ASSERT(cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 11, 8, &segment, &xid, &slot, &proposed));
+	UT_ASSERT(cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 11, 8, &segment, &xid,
+																 &slot, &proposed));
 	UT_ASSERT_EQ(segment, 7);
 	UT_ASSERT_EQ(xid, (TransactionId)4195136);
 	UT_ASSERT_EQ(slot, 1);
@@ -1078,36 +1065,36 @@ UT_TEST(test_freshref_c1b_pair_request_canonical_decode)
 	 * the runtime requester/origin pair gate must additionally hold a current
 	 * homogeneous R4 TARGET admission before it can send or consume it. */
 	fwd.epoch = 0;
-	UT_ASSERT(cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 0, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 0, 8, NULL, NULL, NULL,
+																 NULL));
 	fwd.epoch = 11;
 
 	/* Every transport/canonical identity axis independently fails closed. */
 	fwd.epoch = 12;
-	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 11, 8, NULL, NULL,
+																  NULL, NULL));
 	fwd.epoch = 11;
-	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 2, 0, 11, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 2, 0, 11, 8, NULL, NULL,
+																  NULL, NULL));
 	fwd.master_node = 2;
-	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 11, 8, NULL, NULL,
+																  NULL, NULL));
 	fwd.master_node = 1;
 	fwd.requester_backend_id = 9;
-	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 11, 8, NULL, NULL,
+																  NULL, NULL));
 	fwd.requester_backend_id = 4;
 	fwd.reserved_0[0] = 1;
-	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 11, 8, NULL, NULL,
+																  NULL, NULL));
 	fwd.reserved_0[0] = 0;
 	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, InvalidScn);
-	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 11, 8, NULL, NULL,
+																  NULL, NULL));
 	GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, (SCN)10498);
 	GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, true);
-	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(
-		&fwd, 1, 0, 11, 8, NULL, NULL, NULL, NULL));
+	UT_ASSERT(!cluster_cr_server_freshref_c1b_pair_request_decode(&fwd, 1, 0, 11, 8, NULL, NULL,
+																  NULL, NULL));
 }
 
 /* Observe the actual resolver, without promoting an old refusal to success. */
@@ -1604,15 +1591,12 @@ UT_TEST(test_r4_cr_build_inline_entry_is_denied_without_serve)
 		= source != NULL ? strstr(source, "\ncluster_gcs_block_forward_serve_inline(") : NULL;
 	const char *function_end = function != NULL ? strstr(function, "\n}\n\n#endif") : NULL;
 	const char *kind_switch = function != NULL ? strstr(function, "\tswitch (kind) {") : NULL;
-	const char *r4_case
-		= kind_switch != NULL
-			  ? strstr(kind_switch, "case CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD:")
-			  : NULL;
-	const char *deny_jump
-		= r4_case != NULL ? strstr(r4_case, "goto inline_deny_no_serve;") : NULL;
+	const char *r4_case = kind_switch != NULL
+							  ? strstr(kind_switch, "case CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD:")
+							  : NULL;
+	const char *deny_jump = r4_case != NULL ? strstr(r4_case, "goto inline_deny_no_serve;") : NULL;
 	const char *serve = kind_switch != NULL ? strstr(kind_switch, "cr_serve_slot(&slot);") : NULL;
-	const char *deny_label
-		= serve != NULL ? strstr(serve, "\ninline_deny_no_serve:") : NULL;
+	const char *deny_label = serve != NULL ? strstr(serve, "\ninline_deny_no_serve:") : NULL;
 	const char *reply
 		= deny_label != NULL ? strstr(deny_label, "cr_build_and_send_reply(&slot);") : NULL;
 
@@ -1624,12 +1608,10 @@ UT_TEST(test_r4_cr_build_inline_entry_is_denied_without_serve)
 	UT_ASSERT_NOT_NULL(serve);
 	UT_ASSERT_NOT_NULL(deny_label);
 	UT_ASSERT_NOT_NULL(reply);
-	if (function != NULL && function_end != NULL && kind_switch != NULL
-		&& r4_case != NULL && deny_jump != NULL && serve != NULL
-		&& deny_label != NULL && reply != NULL)
-		UT_ASSERT(function < kind_switch && kind_switch < r4_case
-				  && r4_case < deny_jump && deny_jump < serve
-				  && serve < deny_label && deny_label < reply
+	if (function != NULL && function_end != NULL && kind_switch != NULL && r4_case != NULL
+		&& deny_jump != NULL && serve != NULL && deny_label != NULL && reply != NULL)
+		UT_ASSERT(function < kind_switch && kind_switch < r4_case && r4_case < deny_jump
+				  && deny_jump < serve && serve < deny_label && deny_label < reply
 				  && reply < function_end);
 	free(source);
 }
@@ -1646,32 +1628,21 @@ UT_TEST(test_r4_cr_build_inline_entry_is_denied_without_serve)
 UT_TEST(test_lms_exact_status22_preempts_legacy_tt_scan_convoy)
 {
 	char *source = read_cr_server_source();
-	const char *function
-		= source != NULL ? strstr(source, "\ncluster_lms_cr_drain(") : NULL;
+	const char *function = source != NULL ? strstr(source, "\ncluster_lms_cr_drain(") : NULL;
 	const char *function_end
-		= function != NULL
-			  ? strstr(function, "\n}\n\n/*\n * cluster_lms_cr_ship_ready")
-			  : NULL;
+		= function != NULL ? strstr(function, "\n}\n\n/*\n * cluster_lms_cr_ship_ready") : NULL;
 	const char *exact_drain
-		= function != NULL
-			  ? strstr(function, "cluster_gcs_block_r4_tx_resolve_drain();")
-			  : NULL;
-	const char *exact_active
-		= exact_drain != NULL
-			  ? strstr(exact_drain, "cluster_gcs_block_r4_tx_resolve_active()")
-			  : NULL;
+		= function != NULL ? strstr(function, "cluster_gcs_block_r4_tx_resolve_drain();") : NULL;
+	const char *exact_active = exact_drain != NULL
+								   ? strstr(exact_drain, "cluster_gcs_block_r4_tx_resolve_active()")
+								   : NULL;
 	const char *cursor
-		= exact_active != NULL
-			  ? strstr(exact_active, "cluster_lms_cr_legacy_drain_cursor")
-			  : NULL;
-	const char *single_serve
-		= cursor != NULL ? strstr(cursor, "cr_serve_slot(slot);") : NULL;
-	const char *advance
-		= single_serve != NULL
-			  ? strstr(single_serve, "cluster_lms_cr_legacy_drain_cursor =")
-			  : NULL;
-	const char *bounded_break
-		= advance != NULL ? strstr(advance, "break;") : NULL;
+		= exact_active != NULL ? strstr(exact_active, "cluster_lms_cr_legacy_drain_cursor") : NULL;
+	const char *single_serve = cursor != NULL ? strstr(cursor, "cr_serve_slot(slot);") : NULL;
+	const char *advance = single_serve != NULL
+							  ? strstr(single_serve, "cluster_lms_cr_legacy_drain_cursor =")
+							  : NULL;
+	const char *bounded_break = advance != NULL ? strstr(advance, "break;") : NULL;
 
 	UT_ASSERT_NOT_NULL(function);
 	UT_ASSERT_NOT_NULL(function_end);
@@ -1681,12 +1652,10 @@ UT_TEST(test_lms_exact_status22_preempts_legacy_tt_scan_convoy)
 	UT_ASSERT_NOT_NULL(single_serve);
 	UT_ASSERT_NOT_NULL(advance);
 	UT_ASSERT_NOT_NULL(bounded_break);
-	if (function != NULL && function_end != NULL && exact_drain != NULL
-		&& exact_active != NULL && cursor != NULL && single_serve != NULL
-		&& advance != NULL && bounded_break != NULL)
-		UT_ASSERT(function < exact_drain && exact_drain < exact_active
-				  && exact_active < cursor && cursor < single_serve
-				  && single_serve < advance && advance < bounded_break
+	if (function != NULL && function_end != NULL && exact_drain != NULL && exact_active != NULL
+		&& cursor != NULL && single_serve != NULL && advance != NULL && bounded_break != NULL)
+		UT_ASSERT(function < exact_drain && exact_drain < exact_active && exact_active < cursor
+				  && cursor < single_serve && single_serve < advance && advance < bounded_break
 				  && bounded_break < function_end);
 	free(source);
 }

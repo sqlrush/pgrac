@@ -61,8 +61,8 @@
 #include "storage/itemptr.h" /* OffsetNumber */
 #include "storage/relfilelocator.h"
 #include "cluster/cluster_buffer_desc.h" /* PCM_STATE_N / PCM_STATE_X */
-#include "cluster/cluster_itl_slot.h" /* CLUSTER_ITL_INITRANS_DEFAULT (spec-3.4c D14) */
-#include "cluster/cluster_scn.h"	  /* SCN */
+#include "cluster/cluster_itl_slot.h"	 /* CLUSTER_ITL_INITRANS_DEFAULT (spec-3.4c D14) */
+#include "cluster/cluster_scn.h"		 /* SCN */
 #include "cluster/cluster_terminal_ref_census.h"
 
 /*
@@ -140,13 +140,12 @@ typedef struct ClusterItlTerminalProof {
  */
 static inline bool
 cluster_itl_terminal_stamp_authority_admissible(bool storage_mode, int local_node_id,
-											 int node_count, bool recovery_merge_active,
-											 uint8 pcm_state, uint32 own_flags,
-											 uint64 writer_activation_token)
+												int node_count, bool recovery_merge_active,
+												uint8 pcm_state, uint32 own_flags,
+												uint64 writer_activation_token)
 {
-	if (!storage_mode || node_count <= 0 || local_node_id < 0
-		|| local_node_id >= node_count || recovery_merge_active || own_flags != 0
-		|| writer_activation_token != 0)
+	if (!storage_mode || node_count <= 0 || local_node_id < 0 || local_node_id >= node_count
+		|| recovery_merge_active || own_flags != 0 || writer_activation_token != 0)
 		return false;
 
 	if (node_count == 1)
@@ -156,29 +155,26 @@ cluster_itl_terminal_stamp_authority_admissible(bool storage_mode, int local_nod
 
 /* Exact local-owner and slot checks used by terminal hinting. */
 static inline bool
-cluster_itl_terminal_proof_owner_exact(const ClusterItlTerminalProof *proof,
-									   uint64 own_generation, uint64 acquisition_epoch,
-									   uint8 pcm_state, bool authority_admissible,
-									   uint32 own_flags,
+cluster_itl_terminal_proof_owner_exact(const ClusterItlTerminalProof *proof, uint64 own_generation,
+									   uint64 acquisition_epoch, uint8 pcm_state,
+									   bool authority_admissible, uint32 own_flags,
 									   uint64 writer_activation_token)
 {
-	return proof != NULL && proof->valid && authority_admissible
-		&& pcm_state == proof->pcm_state && own_flags == 0
-		&& writer_activation_token == 0 && own_generation == proof->own_generation
-		&& acquisition_epoch == proof->acquisition_epoch;
+	return proof != NULL && proof->valid && authority_admissible && pcm_state == proof->pcm_state
+		   && own_flags == 0 && writer_activation_token == 0
+		   && own_generation == proof->own_generation
+		   && acquisition_epoch == proof->acquisition_epoch;
 }
 
 static inline bool
-cluster_itl_terminal_proof_slot_exact(const ClusterItlTerminalProof *proof,
-									  TransactionId xid, uint16 slot_wrap,
-									  uint8 slot_class,
+cluster_itl_terminal_proof_slot_exact(const ClusterItlTerminalProof *proof, TransactionId xid,
+									  uint16 slot_wrap, uint8 slot_class,
 									  const UBA *undo_segment_head)
 {
-	return proof != NULL && proof->valid && xid == proof->xid
-		&& slot_wrap == proof->slot_wrap && slot_class == proof->slot_class
-		&& undo_segment_head != NULL
-		&& undo_segment_head->raw[0] == proof->undo_segment_head.raw[0]
-		&& undo_segment_head->raw[1] == proof->undo_segment_head.raw[1];
+	return proof != NULL && proof->valid && xid == proof->xid && slot_wrap == proof->slot_wrap
+		   && slot_class == proof->slot_class && undo_segment_head != NULL
+		   && undo_segment_head->raw[0] == proof->undo_segment_head.raw[0]
+		   && undo_segment_head->raw[1] == proof->undo_segment_head.raw[1];
 }
 
 /*
@@ -240,17 +236,17 @@ extern void cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle
 /* Receipt-bearing twin for an ordinary heap path that already crossed exact
  * APPLY.  The receipt handle is copied only into the private touch record;
  * ClusterItlTouchHandle remains the frozen 24-byte public ABI. */
-extern void cluster_itl_touch_register_exact_ctrc(
-	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
-	const ClusterCtrcReceiptHandle *ctrc_handle);
+extern void cluster_itl_touch_register_exact_ctrc(const ClusterItlTouchHandle *handle,
+												  Buffer buffer, TransactionId xid,
+												  const ClusterCtrcReceiptHandle *ctrc_handle);
 
 /* Lookup-only accelerator for same-transaction, same-ITL receipt reuse.
  * The caller holds the page content lock EXCLUSIVE.  A hit requires the
  * current slot bytes and local X-owner proof to match the newest capture in
  * the current subtransaction range; a miss changes no shared state. */
-extern bool cluster_itl_touch_lookup_reusable_ctrc(
-	const ClusterItlTouchHandle *handle, Buffer buffer, TransactionId xid,
-	ClusterCtrcReceiptHandle *ctrc_handle_out);
+extern bool cluster_itl_touch_lookup_reusable_ctrc(const ClusterItlTouchHandle *handle,
+												   Buffer buffer, TransactionId xid,
+												   ClusterCtrcReceiptHandle *ctrc_handle_out);
 
 /*
  * spec-3.5 hardening: subxact range ownership for touched ITL slots.

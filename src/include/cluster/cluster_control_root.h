@@ -52,14 +52,14 @@
 /* Bit 0 is the already-frozen R4 synchronous-CR semantic feature.  Keep the
  * complete root-v1 known set public so every reader rejects the same unknown
  * bits; inclusion here is understanding, not activation. */
-#define PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1 \
-	((UINT64_C(1) << 0) | PGRAC_CONTROL_ROOT_FEATURE_WAL_REUSE_V1 | \
-	 PGRAC_CONTROL_ROOT_FEATURE_PAGE_STABLE_BASE_V1 | \
-	 PGRAC_CONTROL_ROOT_FEATURE_SPACE_METADATA_V1 | \
-	 PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1 | \
-	 PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1 | \
-	 PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1 | \
-	 PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1)
+#define PGRAC_CONTROL_ROOT_FEATURE_KNOWN_MASK_V1                                                   \
+	((UINT64_C(1) << 0) | PGRAC_CONTROL_ROOT_FEATURE_WAL_REUSE_V1                                  \
+	 | PGRAC_CONTROL_ROOT_FEATURE_PAGE_STABLE_BASE_V1                                              \
+	 | PGRAC_CONTROL_ROOT_FEATURE_SPACE_METADATA_V1                                                \
+	 | PGRAC_CONTROL_ROOT_FEATURE_CONSERVATIVE_COMMIT_SCN_V1                                       \
+	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1                                        \
+	 | PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_SERIAL_V1                                               \
+	 | PGRAC_CONTROL_ROOT_FEATURE_EXTERNAL_FENCE_V1)
 
 typedef enum ClusterControlRootLifecycle {
 	CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED = 0,
@@ -248,8 +248,7 @@ typedef struct ClusterControlRootFileToken {
 	uint8 image_sha256[32];
 } ClusterControlRootFileToken;
 
-StaticAssertDecl(sizeof(ClusterControlRootIdentity) == 80,
-				 "ClusterControlRootIdentity ABI");
+StaticAssertDecl(sizeof(ClusterControlRootIdentity) == 80, "ClusterControlRootIdentity ABI");
 StaticAssertDecl(offsetof(ClusterControlRootIdentity, system_identifier) == 0,
 				 "control-root system identifier offset");
 StaticAssertDecl(offsetof(ClusterControlRootIdentity, storage_uuid) == 8,
@@ -272,8 +271,7 @@ StaticAssertDecl(offsetof(ClusterControlRootIdentity, origin_owner_incarnation) 
 				 "control-root owner offset");
 StaticAssertDecl(offsetof(ClusterControlRootIdentity, root_lineage_seq) == 72,
 				 "control-root lineage offset");
-StaticAssertDecl(sizeof(ClusterControlRootSnapshot) == 216,
-				 "ClusterControlRootSnapshot ABI");
+StaticAssertDecl(sizeof(ClusterControlRootSnapshot) == 216, "ClusterControlRootSnapshot ABI");
 StaticAssertDecl(offsetof(ClusterControlRootSnapshot, lifecycle) == 80,
 				 "control-root lifecycle offset");
 StaticAssertDecl(offsetof(ClusterControlRootSnapshot, root_flags) == 84,
@@ -324,8 +322,7 @@ StaticAssertDecl(offsetof(ClusterControlRootSnapshot, lifecycle_reason) == 204,
 				 "control-root lifecycle reason offset");
 StaticAssertDecl(offsetof(ClusterControlRootSnapshot, reserved208) == 208,
 				 "control-root reserved208 offset");
-StaticAssertDecl(sizeof(ClusterControlRootReadToken) == 64,
-				 "ClusterControlRootReadToken ABI");
+StaticAssertDecl(sizeof(ClusterControlRootReadToken) == 64, "ClusterControlRootReadToken ABI");
 StaticAssertDecl(offsetof(ClusterControlRootReadToken, authority_uuid) == 0,
 				 "control-root token authority offset");
 StaticAssertDecl(offsetof(ClusterControlRootReadToken, origin_thread_id) == 16,
@@ -348,10 +345,8 @@ StaticAssertDecl(offsetof(ClusterControlRootReadToken, record_crc32c) == 56,
 				 "control-root token CRC offset");
 StaticAssertDecl(offsetof(ClusterControlRootReadToken, root_flags) == 60,
 				 "control-root token flags offset");
-StaticAssertDecl(sizeof(ClusterControlRootPatch) == 248,
-				 "ClusterControlRootPatch ABI");
-StaticAssertDecl(offsetof(ClusterControlRootPatch, mask) == 0,
-				 "control-root patch mask offset");
+StaticAssertDecl(sizeof(ClusterControlRootPatch) == 248, "ClusterControlRootPatch ABI");
+StaticAssertDecl(offsetof(ClusterControlRootPatch, mask) == 0, "control-root patch mask offset");
 StaticAssertDecl(offsetof(ClusterControlRootPatch, expected_lifecycle) == 8,
 				 "control-root patch lifecycle offset");
 StaticAssertDecl(offsetof(ClusterControlRootPatch, expected_flags_mask) == 12,
@@ -402,8 +397,7 @@ StaticAssertDecl(offsetof(ClusterControlRootMigrationRoundV1, coordinator_node_i
 				 "control-root round coordinator node offset");
 StaticAssertDecl(offsetof(ClusterControlRootMigrationRoundV1, reserved76) == 76,
 				 "control-root round reserved offset");
-StaticAssertDecl(sizeof(ClusterControlRootFileToken) == 80,
-				 "ClusterControlRootFileToken ABI");
+StaticAssertDecl(sizeof(ClusterControlRootFileToken) == 80, "ClusterControlRootFileToken ABI");
 StaticAssertDecl(offsetof(ClusterControlRootFileToken, authority_uuid) == 0,
 				 "control-root file token authority offset");
 StaticAssertDecl(offsetof(ClusterControlRootFileToken, file_txn_seq) == 16,
@@ -432,10 +426,8 @@ extern ClusterControlRootResult cluster_control_root_read_canonical(
 /* RF-ROOT P9 verification (implementation): verify the canonical root is ACTIVE and
  * bound to exactly this cutover round (full canonical validation, read-only
  * proof; returns a file token for the caller's freshness binding). */
-extern ClusterControlRootResult
-cluster_control_root_bootstrap_validate_active_round(
-	const ClusterControlRootMigrationRoundV1 *round,
-	ClusterControlRootFileToken *token);
+extern ClusterControlRootResult cluster_control_root_bootstrap_validate_active_round(
+	const ClusterControlRootMigrationRoundV1 *round, ClusterControlRootFileToken *token);
 
 /* RF-ROOT P9 verification (cold-formation): member-side field binding —
  * ACTIVE root bound to the round identity a member holds (epoch /
@@ -443,19 +435,19 @@ cluster_control_root_bootstrap_validate_active_round(
  * full round + its sha are coordinator-local (seam shmem), so members
  * cannot recompute round_sha256; the identity fields + the root's own
  * CRC/dual-copy validation bind the round. */
-extern ClusterControlRootResult
-cluster_control_root_bootstrap_validate_active_round_fields(
-	uint64 transition_epoch, uint64 prepare_generation,
-	uint64 source_feature_bitmap, uint64 target_feature_bitmap);
+extern ClusterControlRootResult cluster_control_root_bootstrap_validate_active_round_fields(
+	uint64 transition_epoch, uint64 prepare_generation, uint64 source_feature_bitmap,
+	uint64 target_feature_bitmap);
 
 /* RF-ROOT P9 verification (contract): re-arm the bit22 cutover latch from a
  * durable ACTIVE root across a postmaster restart.  Returns whether the
  * dual-path gate reads as post-bit22 afterwards. */
 extern bool cluster_control_root_restore_bit22_latch_if_active(void);
 
-extern ClusterControlRootResult cluster_control_root_read_canonical_discovered(
-	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot,
-	ClusterControlRootReadToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_read_canonical_discovered(uint16 origin_thread_id,
+											   ClusterControlRootSnapshot *out_snapshot,
+											   ClusterControlRootReadToken *out_token);
 /* Stage 8 contract (verified implementation): lock-free canonical read for a DEAD
  * origin's thread — no live writer exists (the only publisher was the dead
  * postmaster) and the GRD recovery adopts each shard to exactly one
@@ -463,41 +455,39 @@ extern ClusterControlRootResult cluster_control_root_read_canonical_discovered(
  * Used by the post-bit22 hw-remaster path while the GRD recovery holds the
  * CF shard FROZEN (CF(S) itself unavailable), breaking the remaster ->
  * unfreeze -> CF-shard-NORMAL deadlock. */
-extern ClusterControlRootResult cluster_control_root_read_canonical_dead_origin(
-	uint16 origin_thread_id, ClusterControlRootSnapshot *out_snapshot);
+extern ClusterControlRootResult
+cluster_control_root_read_canonical_dead_origin(uint16 origin_thread_id,
+												ClusterControlRootSnapshot *out_snapshot);
 extern ClusterControlRootResult cluster_control_root_lookup_owner_by_node_runtime(
 	int32 old_node_id, ClusterControlRootIdentity *out_identity,
 	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token);
 extern ClusterControlRootResult cluster_control_root_compare_and_publish(
-	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootPatch *patch, ClusterControlRootPublishReason reason,
-	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token);
-extern ClusterControlRootResult cluster_control_root_revalidate(
-	const ClusterControlRootReadToken *token,
-	const ClusterControlRootIdentity *expected_identity,
-	ClusterControlRootSnapshot *out_snapshot);
+	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
+	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,
+	ClusterControlRootReadToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
+								const ClusterControlRootIdentity *expected_identity,
+								ClusterControlRootSnapshot *out_snapshot);
 extern bool cluster_control_root_identity_equal(const ClusterControlRootIdentity *left,
-											 const ClusterControlRootIdentity *right);
+												const ClusterControlRootIdentity *right);
 extern bool cluster_control_root_feature_bitmap_is_known(uint64 active_feature_bitmap);
-extern ClusterControlRootResult cluster_control_root_create_prepared(
-	const ClusterControlRootMigrationImage *image,
-	const ClusterControlRootMigrationRoundV1 *round,
-	ClusterControlRootFileToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_create_prepared(const ClusterControlRootMigrationImage *image,
+									 const ClusterControlRootMigrationRoundV1 *round,
+									 ClusterControlRootFileToken *out_token);
 extern ClusterControlRootResult cluster_control_root_activate_prepared(
-	const ClusterControlRootFileToken *expected_token,
-	const uint8 expected_round_sha256[32],
-	const ClusterControlRootMigrationRoundV1 *round,
-	ClusterControlRootFileToken *out_token);
-extern bool cluster_control_root_round_sha256(
-	const ClusterControlRootMigrationRoundV1 *round,
-	uint8 out_sha[PG_SHA256_DIGEST_LENGTH]);
+	const ClusterControlRootFileToken *expected_token, const uint8 expected_round_sha256[32],
+	const ClusterControlRootMigrationRoundV1 *round, ClusterControlRootFileToken *out_token);
+extern bool cluster_control_root_round_sha256(const ClusterControlRootMigrationRoundV1 *round,
+											  uint8 out_sha[PG_SHA256_DIGEST_LENGTH]);
 /* contract step ④d: construct the create_prepared migration image from the
  * live registry + claims + membership (coordinator side). */
-extern ClusterControlRootResult cluster_control_root_build_migration_image(
-	const ClusterControlRootMigrationRoundV1 *round,
-	ClusterControlRootMigrationImage *out);
-extern ClusterControlRootResult cluster_control_root_discard_inactive(
-	const ClusterControlRootFileToken *expected_token,
-	const uint8 expected_round_sha256[32]);
+extern ClusterControlRootResult
+cluster_control_root_build_migration_image(const ClusterControlRootMigrationRoundV1 *round,
+										   ClusterControlRootMigrationImage *out);
+extern ClusterControlRootResult
+cluster_control_root_discard_inactive(const ClusterControlRootFileToken *expected_token,
+									  const uint8 expected_round_sha256[32]);
 
 #endif /* CLUSTER_CONTROL_ROOT_H */

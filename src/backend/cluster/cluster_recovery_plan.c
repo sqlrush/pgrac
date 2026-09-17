@@ -314,11 +314,10 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 			 * §A two-step discovered-identity pattern (the startup process
 			 * is the frozen CF(S)-capable recovery admission, AD-023 §4).
 			 */
-			root_result = cluster_control_root_read_canonical_discovered(
-				tid, &snapshot, &token);
+			root_result = cluster_control_root_read_canonical_discovered(tid, &snapshot, &token);
 			read_verdict = (int)root_result;
-			verdict = cluster_recovery_classify_root_slot(
-				root_result, &snapshot, own_thread, tid, now_us, CheckPointTimeout);
+			verdict = cluster_recovery_classify_root_slot(root_result, &snapshot, own_thread, tid,
+														  now_us, CheckPointTimeout);
 
 			if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				|| root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
@@ -347,8 +346,7 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 			 */
 			v = cluster_wal_state_read_slot(tid, &slot);
 			read_verdict = (int)v;
-			verdict = cluster_recovery_classify_slot(v, &slot, own_thread, tid,
-													 now_us,
+			verdict = cluster_recovery_classify_slot(v, &slot, own_thread, tid, now_us,
 													 cluster_recovery_stale_active_ms);
 			if (v == CLUSTER_WAL_SLOT_OK) {
 				if (slot.highest_lsn > plan.max_highest_lsn)
@@ -382,9 +380,9 @@ cluster_recovery_plan_generate(uint32 dbstate_at_startup, bool local_recovery_ne
 		}
 
 		if (verdict != CLUSTER_RECOVERY_THREAD_EMPTY)
-			ereport(DEBUG1, (errmsg("recovery plan: thread %u verdict %d (read verdict %d, bit22=%d)",
-									(unsigned)tid, (int)verdict, read_verdict,
-									bit22_active ? 1 : 0)));
+			ereport(DEBUG1,
+					(errmsg("recovery plan: thread %u verdict %d (read verdict %d, bit22=%d)",
+							(unsigned)tid, (int)verdict, read_verdict, bit22_active ? 1 : 0)));
 	}
 	plan.generated = true;
 
@@ -459,8 +457,7 @@ cluster_thread_recovery_pin_projection(uint16 dead_tid, uint64 episode_epoch)
 	slot = cluster_thread_recovery_replay_slot(dead_tid);
 	if (slot == NULL)
 		return false;
-	root_result = cluster_control_root_read_canonical_discovered(
-		dead_tid, &snapshot, &token);
+	root_result = cluster_control_root_read_canonical_discovered(dead_tid, &snapshot, &token);
 	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return false;
@@ -487,18 +484,16 @@ cluster_thread_recovery_pin_projection(uint16 dead_tid, uint64 episode_epoch)
 bool
 cluster_thread_recovery_projection_current(uint16 dead_tid, uint64 episode_epoch,
 										   ClusterControlRootReadToken *token_out,
-										   uint64 *validated_tail_out,
-										   uint64 *checkpoint_lower_out,
-										   uint64 *lifecycle_out,
-										   uint32 *tail_tli_out,
+										   uint64 *validated_tail_out, uint64 *checkpoint_lower_out,
+										   uint64 *lifecycle_out, uint32 *tail_tli_out,
 										   uint32 *checkpoint_tli_out)
 {
 	ClusterThreadReplaySlot *slot;
 
 	slot = cluster_thread_recovery_replay_slot(dead_tid);
-	return cluster_thread_recovery_projection_read(
-		slot, episode_epoch, token_out, validated_tail_out, checkpoint_lower_out,
-		lifecycle_out, tail_tli_out, checkpoint_tli_out);
+	return cluster_thread_recovery_projection_read(slot, episode_epoch, token_out,
+												   validated_tail_out, checkpoint_lower_out,
+												   lifecycle_out, tail_tli_out, checkpoint_tli_out);
 }
 
 /*

@@ -40,7 +40,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "miscadmin.h"
 
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_buffer_desc.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D1 — ClusterGcsBlockPhase + phase_for_tag proto */
 #include "cluster/cluster_inject.h"
@@ -75,6 +77,31 @@ int NBuffers = 0;
 int cluster_injection_armed_count = 0;
 int cluster_gcs_reply_timeout_ms = 1;
 bool cluster_enabled = true; /* PGRAC: spec-2.31 D2 helper depends on this */
+bool IsUnderPostmaster = false;
+BackendType MyBackendType = B_BACKEND;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+
+bool
+cluster_normal_stop_service_new_work(bool modifies_data pg_attribute_unused())
+{
+	/* The fixture models an open service, never a normal-stop episode. */
+	return true;
+}
+
+bool
+cluster_normal_stop_pi_retirement_allowed(void)
+{
+	return false;
+}
+
+int
+s_lock(volatile slock_t *lock, const char *file pg_attribute_unused(),
+	   int line pg_attribute_unused(), const char *func pg_attribute_unused())
+{
+	while (TAS_SPIN(lock))
+		;
+	return 0;
+}
 
 uint64
 cluster_lms_get_shard_master_generation(void)
@@ -87,8 +114,7 @@ cluster_lms_wakeup(int worker_id pg_attribute_unused())
 {}
 
 bool
-cluster_lms_outbound_resource_x_transport_snapshot(
-	ClusterLmsResourceXTransportSnapshot *out)
+cluster_lms_outbound_resource_x_transport_snapshot(ClusterLmsResourceXTransportSnapshot *out)
 {
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -96,10 +122,9 @@ cluster_lms_outbound_resource_x_transport_snapshot(
 }
 
 ResourceXSidecarNeutralizeResult
-cluster_bufmgr_resource_x_neutralize_exact(
-	const BufferTag *tag pg_attribute_unused(),
-	uint64 old_formation pg_attribute_unused(),
-	uint64 acquisition_generation pg_attribute_unused())
+cluster_bufmgr_resource_x_neutralize_exact(const BufferTag *tag pg_attribute_unused(),
+										   uint64 old_formation pg_attribute_unused(),
+										   uint64 acquisition_generation pg_attribute_unused())
 {
 	return RESOURCE_X_SIDECAR_NEUTRALIZED;
 }
@@ -170,7 +195,6 @@ static uint32 ut_wait_event_info_storage = 0;
 uint32 *my_wait_event_info = &ut_wait_event_info_storage;
 
 #define FAKE_PCM_MAX_ENTRIES 8
-#define FAKE_PCM_ENTRY_BYTES 1032
 
 static union {
 	uint64 force_align;
@@ -180,10 +204,8 @@ static union {
 	char data[1048576];
 } fake_pcm_header;
 
-static union {
-	uint64 force_align;
-	char data[FAKE_PCM_MAX_ENTRIES][FAKE_PCM_ENTRY_BYTES];
-} fake_pcm_entries;
+/* malloc alignment and the production HASHCTL size, without a stale ABI copy. */
+static void *fake_pcm_entries[FAKE_PCM_MAX_ENTRIES];
 
 static char fake_pcm_htab_token;
 static bool fake_pcm_header_found = false;
@@ -255,13 +277,18 @@ ShmemInitHash(const char *name pg_attribute_unused(), long init_size pg_attribut
 			  long max_size, HASHCTL *infoP, int hash_flags pg_attribute_unused())
 {
 	Assert((hash_flags & HASH_ELEM) != 0);
-	Assert(infoP->entrysize <= FAKE_PCM_ENTRY_BYTES);
+	Assert(infoP->entrysize >= infoP->keysize);
 	Assert(max_size <= FAKE_PCM_MAX_ENTRIES);
 	fake_pcm_keysize = infoP->keysize;
 	fake_pcm_entrysize = infoP->entrysize;
 	fake_pcm_entry_max = max_size;
 	fake_pcm_entry_count = 0;
-	memset(&fake_pcm_entries, 0, sizeof(fake_pcm_entries));
+	for (long i = 0; i < FAKE_PCM_MAX_ENTRIES; i++) {
+		free(fake_pcm_entries[i]);
+		fake_pcm_entries[i] = i < max_size ? calloc(1, infoP->entrysize) : NULL;
+		if (i < max_size && fake_pcm_entries[i] == NULL)
+			abort();
+	}
 	return (HTAB *)&fake_pcm_htab_token;
 }
 
@@ -274,7 +301,7 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *keyPtr, HASHACTION ac
 	Assert(fake_pcm_keysize > 0);
 
 	for (i = 0; i < fake_pcm_entry_count; i++) {
-		char *entry = fake_pcm_entries.data[i];
+		char *entry = fake_pcm_entries[i];
 
 		if (memcmp(entry, keyPtr, fake_pcm_keysize) == 0) {
 			if (foundPtr != NULL)
@@ -298,10 +325,10 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *keyPtr, HASHACTION ac
 		Assert(false);
 	}
 
-	memcpy(fake_pcm_entries.data[fake_pcm_entry_count], keyPtr, fake_pcm_keysize);
+	memcpy(fake_pcm_entries[fake_pcm_entry_count], keyPtr, fake_pcm_keysize);
 	if (foundPtr != NULL)
 		*foundPtr = false;
-	return fake_pcm_entries.data[fake_pcm_entry_count++];
+	return fake_pcm_entries[fake_pcm_entry_count++];
 }
 
 long
@@ -322,7 +349,7 @@ hash_seq_search(HASH_SEQ_STATUS *status)
 {
 	if (status->curBucket >= (uint32)fake_pcm_entry_count)
 		return NULL;
-	return fake_pcm_entries.data[status->curBucket++];
+	return fake_pcm_entries[status->curBucket++];
 }
 
 void
@@ -358,6 +385,13 @@ bool
 LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
 {
 	return fake_lwlock_held == lock && fake_lwlock_mode == mode;
+}
+
+void
+ForEachLWLockHeldByMe(void (*callback)(LWLock *, LWLockMode, void *), void *context)
+{
+	if (fake_lwlock_held != NULL)
+		callback(fake_lwlock_held, fake_lwlock_mode, context);
 }
 
 TimestampTz
@@ -404,8 +438,8 @@ cluster_gcs_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 
 bool
 cluster_gcs_try_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
-									 PcmLockTransition trans pg_attribute_unused(),
-									 int master_node pg_attribute_unused())
+										 PcmLockTransition trans pg_attribute_unused(),
+										 int master_node pg_attribute_unused())
 {
 	abort();
 }
@@ -429,11 +463,10 @@ cluster_gcs_send_block_request_and_wait(struct BufferDesc *buf pg_attribute_unus
 
 /* spec-5.2 D2 sub-case B stub: local-master read-image forward unreachable. */
 bool
-cluster_gcs_local_master_read_image_and_wait(struct BufferDesc *buf pg_attribute_unused(),
-											 const PcmAuthoritySnapshot *expected
-												 pg_attribute_unused(),
-											 bool force_one_shot pg_attribute_unused(),
-											 bool *out_retry_denied pg_attribute_unused())
+cluster_gcs_local_master_read_image_and_wait(
+	struct BufferDesc *buf pg_attribute_unused(),
+	const PcmAuthoritySnapshot *expected pg_attribute_unused(),
+	bool force_one_shot pg_attribute_unused(), bool *out_retry_denied pg_attribute_unused())
 {
 	abort();
 }
@@ -658,7 +691,6 @@ static void
 reset_fixture(void)
 {
 	memset(&fake_pcm_header, 0, sizeof(fake_pcm_header));
-	memset(&fake_pcm_entries, 0, sizeof(fake_pcm_entries));
 	fake_pcm_header_found = false;
 	fake_pcm_entry_count = 0;
 	fake_pcm_entry_max = 0;
@@ -875,37 +907,35 @@ UT_TEST(test_L10_read_image_is_neither_cached_cover_nor_write_authority)
 	before = live;
 
 	UT_ASSERT_EQ(CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET, 2);
-	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
-		&live, BM_VALID, (uint8)BUF_TYPE_CURRENT, &reason),
-		CLUSTER_PCM_OWN_BUSY);
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(&live, BM_VALID,
+															(uint8)BUF_TYPE_CURRENT, &reason),
+				 CLUSTER_PCM_OWN_BUSY);
 	UT_ASSERT_EQ(reason, CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET);
 	UT_ASSERT_EQ(memcmp(&live, &before, sizeof(live)), 0);
 	UT_ASSERT(!cluster_pcm_x_cached_cover_reverify_accepts(
-		(uint8)PCM_LOCK_MODE_S, live.generation, live.generation,
-		live.pcm_state, live.flags, live.writer_activation_token,
-		live.resource_x_activation_generation));
-	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(
-		true, true, false, live.pcm_state, live.flags,
-		live.writer_activation_token,
-		live.resource_x_activation_generation));
+		(uint8)PCM_LOCK_MODE_S, live.generation, live.generation, live.pcm_state, live.flags,
+		live.writer_activation_token, live.resource_x_activation_generation));
+	UT_ASSERT(!cluster_pcm_x_ordinary_mutation_allowed(true, true, false, live.pcm_state,
+													   live.flags, live.writer_activation_token,
+													   live.resource_x_activation_generation));
 
 	live.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	reason = CLUSTER_PCM_GRANT_WAIT_READ_IMAGE_BRACKET;
-	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
-		&live, BM_VALID, (uint8)BUF_TYPE_CURRENT, &reason),
-		CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(&live, BM_VALID,
+															(uint8)BUF_TYPE_CURRENT, &reason),
+				 CLUSTER_PCM_OWN_CORRUPT);
 	UT_ASSERT_EQ(reason, CLUSTER_PCM_GRANT_WAIT_NONE);
 	live = before;
 	live.generation = UINT64_MAX;
-	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
-		&live, BM_VALID, (uint8)BUF_TYPE_CURRENT, &reason),
-		CLUSTER_PCM_OWN_EXHAUSTED);
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(&live, BM_VALID,
+															(uint8)BUF_TYPE_CURRENT, &reason),
+				 CLUSTER_PCM_OWN_EXHAUSTED);
 	live = before;
-	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
-		&live, BM_VALID | BM_IO_IN_PROGRESS,
-		(uint8)BUF_TYPE_CURRENT, &reason), CLUSTER_PCM_OWN_CORRUPT);
-	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(
-		&live, BM_VALID, (uint8)BUF_TYPE_PI, &reason),
+	UT_ASSERT_EQ(cluster_pcm_x_read_image_begin_disposition(&live, BM_VALID | BM_IO_IN_PROGRESS,
+															(uint8)BUF_TYPE_CURRENT, &reason),
+				 CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(
+		cluster_pcm_x_read_image_begin_disposition(&live, BM_VALID, (uint8)BUF_TYPE_PI, &reason),
 		CLUSTER_PCM_OWN_CORRUPT);
 }
 

@@ -162,8 +162,7 @@ assert_data_active_publish(const char *source, const char *start_marker, const c
 	const char *crit_end = start != NULL ? strstr(start, "END_CRIT_SECTION();") : NULL;
 
 	snprintf(publish_call, sizeof(publish_call),
-			 "cluster_tt_local_record_data_active(canonical_xid, %s);",
-			 uba_name);
+			 "cluster_tt_local_record_data_active(canonical_xid, %s);", uba_name);
 	publish = start != NULL ? strstr(start, publish_call) : NULL;
 
 	if (publish != NULL && end != NULL && publish >= end)
@@ -192,28 +191,22 @@ static void
 assert_multi_insert_uses_receipt_safe_per_tuple_route(const char *source)
 {
 	const char *start = strstr(source, "\nheap_multi_insert(Relation");
-	const char *end = start == NULL
-		? NULL
-		: strstr(start, "\n/*\n *\tsimple_heap_insert - insert a tuple");
-	const char *route = start == NULL
-		? NULL
-		: strstr(start, "cluster_heap_multi_insert_route(");
-	const char *per_tuple = route == NULL
-		? NULL
-		: strstr(route, "heap_insert(relation, tuple, cid, options, bistate);");
-	const char *route_return = per_tuple == NULL
-		? NULL
-		: strstr(per_tuple, "\n\t\treturn;");
+	const char *end
+		= start == NULL ? NULL : strstr(start, "\n/*\n *\tsimple_heap_insert - insert a tuple");
+	const char *route = start == NULL ? NULL : strstr(start, "cluster_heap_multi_insert_route(");
+	const char *per_tuple
+		= route == NULL ? NULL
+						: strstr(route, "heap_insert(relation, tuple, cid, options, bistate);");
+	const char *route_return = per_tuple == NULL ? NULL : strstr(per_tuple, "\n\t\treturn;");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
 	UT_ASSERT_NOT_NULL(route);
 	UT_ASSERT_NOT_NULL(per_tuple);
 	UT_ASSERT_NOT_NULL(route_return);
-	if (start != NULL && end != NULL && route != NULL && per_tuple != NULL
-		&& route_return != NULL)
-		UT_ASSERT(start < route && route < per_tuple
-				  && per_tuple < route_return && route_return < end);
+	if (start != NULL && end != NULL && route != NULL && per_tuple != NULL && route_return != NULL)
+		UT_ASSERT(start < route && route < per_tuple && per_tuple < route_return
+				  && route_return < end);
 }
 
 
@@ -430,9 +423,7 @@ UT_TEST(test_update_fork_preserves_native_self_three_state)
 		return;
 	start = strstr(source, "\ncluster_satisfies_update_fork(HeapTuple htup, CommandId curcid,");
 	end = start == NULL ? NULL : strstr(start, "\n}\n#endif /* USE_PGRAC_CLUSTER */");
-	helper = start == NULL
-		? NULL
-		: strstr(start, "cluster_vis_update_native_self_verdict(");
+	helper = start == NULL ? NULL : strstr(start, "cluster_vis_update_native_self_verdict(");
 	entry = strstr(
 		source, "cluster_satisfies_update_fork(htup, curcid, buffer, &cluster_res, writer_bridge)");
 
@@ -462,23 +453,21 @@ UT_TEST(test_update_fork_preserves_terminal_local_lock_only)
 	if (source == NULL)
 		return;
 	start = strstr(source,
-		"if (xmin_remote_visible) {\n\t\tif (TransactionIdIsInProgress(raw_xmax))");
+				   "if (xmin_remote_visible) {\n\t\tif (TransactionIdIsInProgress(raw_xmax))");
 	end = start == NULL ? NULL : strstr(start, "\n\t}\n\n\treturn false;");
 	lock_only = start == NULL ? NULL : strstr(start, "else if (lock_only)");
 	lock_released = lock_only == NULL ? NULL : strstr(lock_only, "*res = TM_Ok;");
-	committed_writer = start == NULL
-		? NULL
-		: strstr(start, "else if (TransactionIdDidCommit(raw_xmax))");
+	committed_writer
+		= start == NULL ? NULL : strstr(start, "else if (TransactionIdDidCommit(raw_xmax))");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
 	UT_ASSERT_NOT_NULL(lock_only);
 	UT_ASSERT_NOT_NULL(lock_released);
 	UT_ASSERT_NOT_NULL(committed_writer);
-	if (start != NULL && end != NULL && lock_only != NULL
-		&& lock_released != NULL && committed_writer != NULL)
-		UT_ASSERT(start < lock_only && lock_only < lock_released
-				  && lock_released < committed_writer
+	if (start != NULL && end != NULL && lock_only != NULL && lock_released != NULL
+		&& committed_writer != NULL)
+		UT_ASSERT(start < lock_only && lock_only < lock_released && lock_released < committed_writer
 				  && committed_writer < end);
 	free(source);
 }
@@ -500,20 +489,16 @@ UT_TEST(test_dirty_remote_xmax_wait_uses_exact_unlocked_route)
 	const char *exact_wait;
 	const char *research;
 
-	if (visibility_source == NULL || heap_source == NULL
-		|| handler_source == NULL || nbtree_source == NULL)
+	if (visibility_source == NULL || heap_source == NULL || handler_source == NULL
+		|| nbtree_source == NULL)
 		goto done;
 
-	capture = strstr(visibility_source,
-		"cluster_vis_dirty_remote_xmax_waitable(");
+	capture = strstr(visibility_source, "cluster_vis_dirty_remote_xmax_waitable(");
 	propagate = strstr(handler_source, "remote_xmax_wait");
 	wait_branch = strstr(nbtree_source, "if (remote_xmax_wait)");
-	release_leaf = wait_branch == NULL
-		? NULL
-		: strstr(wait_branch, "_bt_relbuf(rel, insertstate.buf);");
-	exact_wait = wait_branch == NULL
-		? NULL
-		: strstr(wait_branch, "cluster_tx_enqueue_wait_exact(");
+	release_leaf
+		= wait_branch == NULL ? NULL : strstr(wait_branch, "_bt_relbuf(rel, insertstate.buf);");
+	exact_wait = wait_branch == NULL ? NULL : strstr(wait_branch, "cluster_tx_enqueue_wait_exact(");
 	research = exact_wait == NULL ? NULL : strstr(exact_wait, "goto search;");
 
 	UT_ASSERT_NOT_NULL(capture);
@@ -523,12 +508,9 @@ UT_TEST(test_dirty_remote_xmax_wait_uses_exact_unlocked_route)
 	UT_ASSERT_NOT_NULL(release_leaf);
 	UT_ASSERT_NOT_NULL(exact_wait);
 	UT_ASSERT_NOT_NULL(research);
-	if (wait_branch != NULL && release_leaf != NULL && exact_wait != NULL
-		&& research != NULL)
-		UT_ASSERT(wait_branch < release_leaf && release_leaf < exact_wait
-				  && exact_wait < research);
-	UT_ASSERT(strstr(nbtree_source,
-		"XactLockTableWait(remote_wait_locator.xid") == NULL);
+	if (wait_branch != NULL && release_leaf != NULL && exact_wait != NULL && research != NULL)
+		UT_ASSERT(wait_branch < release_leaf && release_leaf < exact_wait && exact_wait < research);
+	UT_ASSERT(strstr(nbtree_source, "XactLockTableWait(remote_wait_locator.xid") == NULL);
 
 done:
 	free(visibility_source);
@@ -551,23 +533,23 @@ UT_TEST(test_mvcc_frozen_xmin_bypasses_remote_resolve_but_keeps_xmax_gate)
 
 	if (source == NULL)
 		return;
-	mvcc = strstr(source,
-		"if (cluster_enabled && BufferIsValid(buffer)");
-	frozen = mvcc == NULL ? NULL : strstr(mvcc,
-		"if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask))");
-	xmax_gate = frozen == NULL ? NULL : strstr(frozen,
-		"cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)");
-	xmin_resolve = mvcc == NULL ? NULL : strstr(mvcc,
-		"cluster_visibility_resolve_from_ref_scn(raw_xmin");
+	mvcc = strstr(source, "if (cluster_enabled && BufferIsValid(buffer)");
+	frozen = mvcc == NULL
+				 ? NULL
+				 : strstr(mvcc, "if (!cluster_vis_xmin_needs_resolution(tuple->t_infomask))");
+	xmax_gate
+		= frozen == NULL
+			  ? NULL
+			  : strstr(frozen, "cluster_remote_live_xmax_keeps_visible(buffer, tuple, snapshot)");
+	xmin_resolve
+		= mvcc == NULL ? NULL : strstr(mvcc, "cluster_visibility_resolve_from_ref_scn(raw_xmin");
 
 	UT_ASSERT_NOT_NULL(mvcc);
 	UT_ASSERT_NOT_NULL(frozen);
 	UT_ASSERT_NOT_NULL(xmax_gate);
 	UT_ASSERT_NOT_NULL(xmin_resolve);
-	if (mvcc != NULL && frozen != NULL && xmax_gate != NULL
-		&& xmin_resolve != NULL)
-		UT_ASSERT(mvcc < frozen && frozen < xmax_gate
-				  && xmax_gate < xmin_resolve);
+	if (mvcc != NULL && frozen != NULL && xmax_gate != NULL && xmin_resolve != NULL)
+		UT_ASSERT(mvcc < frozen && frozen < xmax_gate && xmax_gate < xmin_resolve);
 	free(source);
 }
 
@@ -589,20 +571,16 @@ UT_TEST(test_normal_commit_stamp_is_modifier_gated_and_error_safe)
 		return;
 	start = strstr(source, "\ncluster_tt_local_precommit_durable_finish(");
 	end = start == NULL ? NULL : strstr(start, "\n}\n\nvoid\ncluster_tt_local_record_commit(");
-	published = start == NULL ? NULL
-		: strstr(start, "cluster_tt_local_get_published_binding(xid, &binding)");
+	published = start == NULL
+					? NULL
+					: strstr(start, "cluster_tt_local_get_published_binding(xid, &binding)");
 	enter = start == NULL ? NULL : strstr(start, "cluster_semantic_activation_modifier_enter(");
 	try_block = start == NULL ? NULL : strstr(start, "PG_TRY();");
-	recheck = start == NULL
-				  ? NULL
-				  : strstr(start, "cluster_tt_local_modifier_recheck_or_error(");
-	durable = recheck == NULL
-				? NULL
-				: strstr(recheck, "cluster_tt_slot_durable_commit_writeonly(");
+	recheck = start == NULL ? NULL : strstr(start, "cluster_tt_local_modifier_recheck_or_error(");
+	durable = recheck == NULL ? NULL : strstr(recheck, "cluster_tt_slot_durable_commit_writeonly(");
 	finally_block = start == NULL ? NULL : strstr(start, "PG_FINALLY();");
-	leave = finally_block == NULL
-				? NULL
-				: strstr(finally_block, "cluster_semantic_activation_leave(");
+	leave = finally_block == NULL ? NULL
+								  : strstr(finally_block, "cluster_semantic_activation_leave(");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -641,24 +619,23 @@ UT_TEST(test_ordinary_abort_durable_receipt_precedes_allocator_reuse)
 		free(tt_source);
 		return;
 	}
-	abort_start = strstr(xact_source,
-		"\nRecordTransactionAbort(bool isSubXact)\n{");
-	preabort = abort_start == NULL ? NULL : strstr(abort_start,
-		"cluster_tt_local_preabort_durable_finish(xid)");
+	abort_start = strstr(xact_source, "\nRecordTransactionAbort(bool isSubXact)\n{");
+	preabort = abort_start == NULL
+				   ? NULL
+				   : strstr(abort_start, "cluster_tt_local_preabort_durable_finish(xid)");
 	crit = abort_start == NULL ? NULL : strstr(abort_start, "START_CRIT_SECTION();");
-	record_abort = crit == NULL ? NULL : strstr(crit,
-		"cluster_tt_local_record_abort(xid)");
-	local_preabort = strstr(tt_source,
-		"cluster_tt_local_preabort_durable_finish(TransactionId xid)");
-	exact_abort = local_preabort == NULL ? NULL : strstr(local_preabort,
-		"cluster_tt_slot_durable_abort_exact(");
-	receipt = exact_abort == NULL ? NULL : strstr(exact_abort,
-		"CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE");
+	record_abort = crit == NULL ? NULL : strstr(crit, "cluster_tt_local_record_abort(xid)");
+	local_preabort
+		= strstr(tt_source, "cluster_tt_local_preabort_durable_finish(TransactionId xid)");
+	exact_abort = local_preabort == NULL
+					  ? NULL
+					  : strstr(local_preabort, "cluster_tt_slot_durable_abort_exact(");
+	receipt = exact_abort == NULL ? NULL
+								  : strstr(exact_abort, "CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE");
 	finish = strstr(tt_source, "cluster_tt_local_finish_bindings(bool committed");
-	terminal_gate = finish == NULL ? NULL : strstr(finish,
-		"CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE");
-	mark_aborted = finish == NULL ? NULL : strstr(finish,
-		"cluster_tt_slot_mark_aborted(");
+	terminal_gate
+		= finish == NULL ? NULL : strstr(finish, "CLUSTER_TT_LOCAL_TERMINAL_ABORT_DURABLE");
+	mark_aborted = finish == NULL ? NULL : strstr(finish, "cluster_tt_slot_mark_aborted(");
 
 	UT_ASSERT_NOT_NULL(abort_start);
 	UT_ASSERT_NOT_NULL(preabort);
@@ -670,10 +647,8 @@ UT_TEST(test_ordinary_abort_durable_receipt_precedes_allocator_reuse)
 	UT_ASSERT_NOT_NULL(finish);
 	UT_ASSERT_NOT_NULL(terminal_gate);
 	UT_ASSERT_NOT_NULL(mark_aborted);
-	if (abort_start != NULL && preabort != NULL && crit != NULL
-		&& record_abort != NULL)
-		UT_ASSERT(abort_start < preabort && preabort < crit
-			&& crit < record_abort);
+	if (abort_start != NULL && preabort != NULL && crit != NULL && record_abort != NULL)
+		UT_ASSERT(abort_start < preabort && preabort < crit && crit < record_abort);
 	if (local_preabort != NULL && exact_abort != NULL && receipt != NULL)
 		UT_ASSERT(local_preabort < exact_abort && exact_abort < receipt);
 	if (finish != NULL && terminal_gate != NULL && mark_aborted != NULL)
@@ -697,14 +672,12 @@ UT_TEST(test_deleting_xmax_error_names_actual_xmax)
 
 	if (source == NULL)
 		return;
-	message = strstr(source,
-		"errmsg(\"cluster TT status unknown for deleting xmax of xid %u\"");
+	message = strstr(source, "errmsg(\"cluster TT status unknown for deleting xmax of xid %u\"");
 	hint = message != NULL ? strstr(message, "errhint(") : NULL;
-	actual_xmax = message != NULL
-		? strstr(message, "HeapTupleHeaderGetRawXmax(tuple)") : NULL;
+	actual_xmax = message != NULL ? strstr(message, "HeapTupleHeaderGetRawXmax(tuple)") : NULL;
 	wrong_xmin = message != NULL ? strstr(message, "raw_xmin),") : NULL;
-	wrong_hint = message != NULL
-		? strstr(message, "Remote deleter commit state not yet propagated") : NULL;
+	wrong_hint = message != NULL ? strstr(message, "Remote deleter commit state not yet propagated")
+								 : NULL;
 
 	UT_ASSERT_NOT_NULL(message);
 	UT_ASSERT_NOT_NULL(hint);
@@ -737,29 +710,16 @@ UT_TEST(test_tt_retention_rollover_follower_reclassifies_current_segment)
 	if (source == NULL)
 		return;
 	start = strstr(source, "\ncluster_tt_local_reserve_binding(");
-	end = start == NULL
-		? NULL
-		: strstr(start, "\n}\n\n/*\n * cluster_tt_local_peek_binding");
+	end = start == NULL ? NULL : strstr(start, "\n}\n\n/*\n * cluster_tt_local_peek_binding");
 	retry_loop = start == NULL ? NULL : strstr(start, "for (;;)");
-	classify = retry_loop == NULL
-		? NULL
-		: strstr(retry_loop,
-				 "cluster_tt_slot_alloc_current_exact(");
-	drift_retry = classify == NULL
-		? NULL
-		: strstr(classify, "if (current_drift)");
-	rollover = classify == NULL
-		? NULL
-		: strstr(classify, "cluster_undo_tt_rollover_locked(");
-	one_shot = rollover == NULL
-		? NULL
-		: strstr(rollover, "cluster_tt_slot_alloc(seg, top_xid)");
-	fresh_error = rollover == NULL
-		? NULL
-		: strstr(rollover, "fresh rollover segment");
-	late_wrap_read = classify == NULL
-		? NULL
-		: strstr(classify, "cluster_tt_slot_get_wrap(seg, off)");
+	classify
+		= retry_loop == NULL ? NULL : strstr(retry_loop, "cluster_tt_slot_alloc_current_exact(");
+	drift_retry = classify == NULL ? NULL : strstr(classify, "if (current_drift)");
+	rollover = classify == NULL ? NULL : strstr(classify, "cluster_undo_tt_rollover_locked(");
+	one_shot = rollover == NULL ? NULL : strstr(rollover, "cluster_tt_slot_alloc(seg, top_xid)");
+	fresh_error = rollover == NULL ? NULL : strstr(rollover, "fresh rollover segment");
+	late_wrap_read
+		= classify == NULL ? NULL : strstr(classify, "cluster_tt_slot_get_wrap(seg, off)");
 
 	UT_ASSERT_NOT_NULL(start);
 	UT_ASSERT_NOT_NULL(end);
@@ -793,24 +753,29 @@ UT_TEST(test_canonical_active_is_prepared_before_heap_content_lock)
 		free(tt_source);
 		return;
 	}
-	prepare = strstr(tt_source,
-		"cluster_tt_local_prepare_canonical_active(TransactionId top_xid");
-	publish = prepare == NULL ? NULL : strstr(prepare,
-		"cluster_tt_slot_durable_publish_active(");
-	published_accessor = strstr(tt_source,
-		"cluster_tt_local_get_published_binding(TransactionId top_xid");
+	prepare = strstr(tt_source, "cluster_tt_local_prepare_canonical_active(TransactionId top_xid");
+	publish = prepare == NULL ? NULL : strstr(prepare, "cluster_tt_slot_durable_publish_active(");
+	published_accessor
+		= strstr(tt_source, "cluster_tt_local_get_published_binding(TransactionId top_xid");
 
 	UT_ASSERT_NOT_NULL(prepare);
 	UT_ASSERT_NOT_NULL(publish);
 	UT_ASSERT_NOT_NULL(published_accessor);
 	UT_ASSERT(strstr(heap_source, "cluster_tt_local_get_or_create_binding(") == NULL);
 	UT_ASSERT(strstr(heap_source, "canonical_xid = GetTopTransactionId();") != NULL);
-	UT_ASSERT(strstr(heap_source,
-		"cluster_tt_local_prepare_canonical_active(\n\t\t\tcanonical_xid, &canonical_binding)") != NULL);
-	UT_ASSERT(strstr(heap_source,
-		"cluster_tt_local_get_published_binding(\n\t\t\t\tcanonical_xid, &canonical_binding)") != NULL);
-	UT_ASSERT(strstr(heap_source,
-		"cluster_tt_local_prepare_canonical_active(xid, &canonical_binding)") == NULL);
+	UT_ASSERT(
+		strstr(
+			heap_source,
+			"cluster_tt_local_prepare_canonical_active(\n\t\t\tcanonical_xid, &canonical_binding)")
+		!= NULL);
+	UT_ASSERT(
+		strstr(
+			heap_source,
+			"cluster_tt_local_get_published_binding(\n\t\t\t\tcanonical_xid, &canonical_binding)")
+		!= NULL);
+	UT_ASSERT(
+		strstr(heap_source, "cluster_tt_local_prepare_canonical_active(xid, &canonical_binding)")
+		== NULL);
 	UT_ASSERT(strstr(tt_source, "CLUSTER_CANONICAL_TXN_PUBLISHED") != NULL);
 
 	free(heap_source);
@@ -832,10 +797,10 @@ UT_TEST(test_writer_proof_entry_excludes_native_inplace_and_keyshare_shortcuts)
 		cursor++;
 	}
 	UT_ASSERT_EQ(count, 3);
-	UT_ASSERT(
-		strstr(source, "if (wait)\n\t\tresult = HeapTupleSatisfiesUpdateForWriter(&tp, cid, "
-					   "buffer);\n\telse\n\t\tresult = HeapTupleSatisfiesUpdate(&tp, cid, buffer);")
-		!= NULL);
+	UT_ASSERT(strstr(source,
+					 "if (wait)\n\t\tresult = HeapTupleSatisfiesUpdateForWriter(&tp, cid, "
+					 "buffer);\n\telse\n\t\tresult = HeapTupleSatisfiesUpdate(&tp, cid, buffer);")
+			  != NULL);
 	UT_ASSERT(
 		strstr(source,
 			   "if (wait)\n\t\tresult = HeapTupleSatisfiesUpdateForWriter(&oldtup, cid, "

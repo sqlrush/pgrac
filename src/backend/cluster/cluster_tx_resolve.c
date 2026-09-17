@@ -26,8 +26,7 @@
 #include "cluster/cluster_tx_resolve.h"
 
 static bool
-cluster_tx_locator_is_well_formed(const ClusterTxLocator *locator,
-								  bool allow_partial_wrap,
+cluster_tx_locator_is_well_formed(const ClusterTxLocator *locator, bool allow_partial_wrap,
 								  ClusterTxResolveReason *reason_out)
 {
 	uint32 segment_id;
@@ -41,8 +40,7 @@ cluster_tx_locator_is_well_formed(const ClusterTxLocator *locator,
 	if (locator == NULL)
 		return false;
 
-	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE
-				|| locator->itl_kind == ITL_FLAG_COMMITTED
+	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE || locator->itl_kind == ITL_FLAG_COMMITTED
 				|| locator->itl_kind == ITL_FLAG_ABORTED
 				|| locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT;
 	if (locator->itl_slot_index >= CLUSTER_ITL_INITRANS_DEFAULT
@@ -77,31 +75,25 @@ cluster_tx_resolve_reason_is_known(ClusterTxResolveReason reason)
 }
 
 static bool
-cluster_tx_zero_epoch_terminal_census_is_admissible(
-	const ClusterTxLocator *locator,
-	const ClusterSemanticAdmissionToken *admission,
-	bool caller_owned_terminal_census)
+cluster_tx_zero_epoch_terminal_census_is_admissible(const ClusterTxLocator *locator,
+													const ClusterSemanticAdmissionToken *admission,
+													bool caller_owned_terminal_census)
 {
 	NodeId origin = uba_origin_node_id(locator->uba);
 	int node_count = cluster_conf_node_count();
 	bool generation_admissible;
 	bool topology_admissible;
 
-	topology_admissible
-		= (node_count == 1 && origin == (NodeId)cluster_node_id)
-		  || (node_count == 4 && origin != InvalidNodeId);
+	topology_admissible = (node_count == 1 && origin == (NodeId)cluster_node_id)
+						  || (node_count == 4 && origin != InvalidNodeId);
 	/* The single-node sentinel exists only before the first PGSA record.
 	 * The approved homogeneous four-node clean-formation path instead binds
 	 * whatever record generation the caller-owned admission currently holds;
 	 * its exact-current check below is the freshness proof. */
 	generation_admissible
-		= (node_count == 1 && admission->record_generation == 0)
-		  || node_count == 4;
-	return caller_owned_terminal_census
-		   && generation_admissible
-		   && cluster_storage_mode_enabled()
-		   && topology_admissible
-		   && !cluster_recmerge_window_active
+		= (node_count == 1 && admission->record_generation == 0) || node_count == 4;
+	return caller_owned_terminal_census && generation_admissible && cluster_storage_mode_enabled()
+		   && topology_admissible && !cluster_recmerge_window_active
 		   && cluster_epoch_get_current() == 0
 		   && cluster_semantic_activation_recheck_r4_terminal_census(admission);
 }
@@ -112,17 +104,13 @@ cluster_tx_zero_epoch_terminal_census_is_admissible(
  * and is admitted only for the homogeneous four-node clean formation. */
 static bool
 cluster_tx_zero_epoch_partial_visibility_is_admissible(
-	const ClusterTxLocator *locator,
-	const ClusterSemanticAdmissionToken *admission)
+	const ClusterTxLocator *locator, const ClusterSemanticAdmissionToken *admission)
 {
 	NodeId origin = uba_origin_node_id(locator->uba);
 
-	return cluster_conf_node_count() == 4
-		   && origin != InvalidNodeId
-		   && admission->record_generation != 0
-		   && cluster_storage_mode_enabled()
-		   && !cluster_recmerge_window_active
-		   && cluster_epoch_get_current() == 0
+	return cluster_conf_node_count() == 4 && origin != InvalidNodeId
+		   && admission->record_generation != 0 && cluster_storage_mode_enabled()
+		   && !cluster_recmerge_window_active && cluster_epoch_get_current() == 0
 		   && cluster_semantic_activation_recheck(admission);
 }
 
@@ -149,10 +137,8 @@ cluster_tx_resolution_is_publishable(const ClusterTxLocator *locator, ClusterTxR
 
 	/* Hint cleanout and bounded terminal census may publish only an
 	 * irreversible terminal result. */
-	if ((mode == CLUSTER_TX_RESOLVE_CLEANOUT_HINT
-		 || mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
-		&& resolution->outcome != CLUSTER_TX_COMMITTED
-		&& resolution->outcome != CLUSTER_TX_ABORTED)
+	if ((mode == CLUSTER_TX_RESOLVE_CLEANOUT_HINT || mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
+		&& resolution->outcome != CLUSTER_TX_COMMITTED && resolution->outcome != CLUSTER_TX_ABORTED)
 		return false;
 
 	return true;
@@ -216,9 +202,8 @@ cluster_tx_locator_from_itl(Page page, uint8 slot_index, ClusterTxLocator *out,
 }
 
 bool
-cluster_tx_locator_from_itl_terminal_census(
-	Page page, uint8 slot_index, ClusterTxLocator *out,
-	ClusterTxResolveReason *reason_out)
+cluster_tx_locator_from_itl_terminal_census(Page page, uint8 slot_index, ClusterTxLocator *out,
+											ClusterTxResolveReason *reason_out)
 {
 	if (!cluster_tx_locator_from_itl(page, slot_index, out, reason_out))
 		return false;
@@ -230,11 +215,11 @@ cluster_tx_locator_from_itl_terminal_census(
 }
 
 static ClusterTxOutcome
-cluster_tx_resolve_exact_with_admission(
-	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out, bool caller_owned_terminal_census,
-	SCN retained_commit_scn)
+cluster_tx_resolve_exact_with_admission(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+										const ClusterSemanticAdmissionToken *admission,
+										ClusterTxResolution *out,
+										ClusterTxResolveReason *reason_out,
+										bool caller_owned_terminal_census, SCN retained_commit_scn)
 {
 	ClusterTxResolution candidate;
 	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
@@ -242,9 +227,8 @@ cluster_tx_resolve_exact_with_admission(
 	ClusterTxOutcome outcome = CLUSTER_TX_UNKNOWN;
 	uint64 formation_epoch;
 	bool terminal_census = mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS;
-	bool partial_visibility
-		= mode == CLUSTER_TX_RESOLVE_VISIBILITY
-		  && locator != NULL && locator->tt_wrap == TT_WRAP_INVALID;
+	bool partial_visibility = mode == CLUSTER_TX_RESOLVE_VISIBILITY && locator != NULL
+							  && locator->tt_wrap == TT_WRAP_INVALID;
 	bool clean_formation_row_wait = false;
 
 	if (out != NULL)
@@ -256,11 +240,9 @@ cluster_tx_resolve_exact_with_admission(
 	if (admission == NULL || !admission->entered
 		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
 		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE || out == NULL
-		|| (unsigned int)mode
-			   > (unsigned int)CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
+		|| (unsigned int)mode > (unsigned int)CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
 		goto done;
-	if (!cluster_tx_locator_is_well_formed(
-			locator, terminal_census || partial_visibility, &reason))
+	if (!cluster_tx_locator_is_well_formed(locator, terminal_census || partial_visibility, &reason))
 		goto done;
 
 	formation_epoch = admission->formation_epoch;
@@ -295,36 +277,31 @@ cluster_tx_resolve_exact_with_admission(
 		outcome = cluster_runtime_visibility_resolve_exact_origin_admitted(
 			locator, mode, admission, &candidate, &provider_reason);
 	else
-		outcome = cluster_runtime_visibility_resolve_exact_origin(
-			locator, mode, formation_epoch, &candidate, &provider_reason);
+		outcome = cluster_runtime_visibility_resolve_exact_origin(locator, mode, formation_epoch,
+																  &candidate, &provider_reason);
 	if (outcome == CLUSTER_TX_UNKNOWN && terminal_census
-		&& locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT
-		&& SCN_VALID(retained_commit_scn))
-	{
+		&& locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT && SCN_VALID(retained_commit_scn)) {
 		memset(&candidate, 0, sizeof(candidate));
 		provider_reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-		outcome
-			= cluster_runtime_visibility_resolve_terminal_census_retained_exact(
-				locator, retained_commit_scn, admission, &candidate,
-				&provider_reason);
+		outcome = cluster_runtime_visibility_resolve_terminal_census_retained_exact(
+			locator, retained_commit_scn, admission, &candidate, &provider_reason);
 	}
 	if (outcome == CLUSTER_TX_UNKNOWN) {
 		reason = provider_reason == CLUSTER_TX_RESOLVE_NONE
-					 || !cluster_tx_resolve_reason_is_known(provider_reason)
-			 ? CLUSTER_TX_RESOLVE_PROTOCOL
-			 : provider_reason;
+						 || !cluster_tx_resolve_reason_is_known(provider_reason)
+					 ? CLUSTER_TX_RESOLVE_PROTOCOL
+					 : provider_reason;
 		goto done;
 	}
-	if (!cluster_tx_resolution_is_publishable(locator, mode, formation_epoch,
-										  outcome, &candidate, provider_reason)) {
+	if (!cluster_tx_resolution_is_publishable(locator, mode, formation_epoch, outcome, &candidate,
+											  provider_reason)) {
 		outcome = CLUSTER_TX_UNKNOWN;
 		reason = CLUSTER_TX_RESOLVE_PROTOCOL;
 		goto done;
 	}
 	if (cluster_epoch_get_current() != formation_epoch
-		|| (terminal_census
-				? !cluster_semantic_activation_recheck_r4_terminal_census(admission)
-				: !cluster_semantic_activation_recheck(admission))) {
+		|| (terminal_census ? !cluster_semantic_activation_recheck_r4_terminal_census(admission)
+							: !cluster_semantic_activation_recheck(admission))) {
 		outcome = CLUSTER_TX_UNKNOWN;
 		reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
 		goto done;
@@ -335,26 +312,21 @@ cluster_tx_resolve_exact_with_admission(
 
 done:
 	switch (outcome) {
-		case CLUSTER_TX_UNKNOWN:
-			cluster_r4_observe(CLUSTER_R4_EVENT_TX_UNKNOWN, reason,
-						   CLUSTER_CR_BUILD_NONE);
-			break;
-		case CLUSTER_TX_IN_PROGRESS:
-			cluster_r4_observe(CLUSTER_R4_EVENT_TX_IN_PROGRESS, reason,
-						   CLUSTER_CR_BUILD_NONE);
-			break;
-		case CLUSTER_TX_PREPARED:
-			cluster_r4_observe(CLUSTER_R4_EVENT_TX_PREPARED, reason,
-						   CLUSTER_CR_BUILD_NONE);
-			break;
-		case CLUSTER_TX_COMMITTED:
-			cluster_r4_observe(CLUSTER_R4_EVENT_TX_COMMITTED, reason,
-						   CLUSTER_CR_BUILD_NONE);
-			break;
-		case CLUSTER_TX_ABORTED:
-			cluster_r4_observe(CLUSTER_R4_EVENT_TX_ABORTED, reason,
-						   CLUSTER_CR_BUILD_NONE);
-			break;
+	case CLUSTER_TX_UNKNOWN:
+		cluster_r4_observe(CLUSTER_R4_EVENT_TX_UNKNOWN, reason, CLUSTER_CR_BUILD_NONE);
+		break;
+	case CLUSTER_TX_IN_PROGRESS:
+		cluster_r4_observe(CLUSTER_R4_EVENT_TX_IN_PROGRESS, reason, CLUSTER_CR_BUILD_NONE);
+		break;
+	case CLUSTER_TX_PREPARED:
+		cluster_r4_observe(CLUSTER_R4_EVENT_TX_PREPARED, reason, CLUSTER_CR_BUILD_NONE);
+		break;
+	case CLUSTER_TX_COMMITTED:
+		cluster_r4_observe(CLUSTER_R4_EVENT_TX_COMMITTED, reason, CLUSTER_CR_BUILD_NONE);
+		break;
+	case CLUSTER_TX_ABORTED:
+		cluster_r4_observe(CLUSTER_R4_EVENT_TX_ABORTED, reason, CLUSTER_CR_BUILD_NONE);
+		break;
 	}
 	if (reason_out != NULL)
 		*reason_out = reason;
@@ -362,10 +334,9 @@ done:
 }
 
 ClusterTxOutcome
-cluster_tx_resolve_exact_admitted(
-	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out)
+cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+								  const ClusterSemanticAdmissionToken *admission,
+								  ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	if (mode != CLUSTER_TX_RESOLVE_TERMINAL_CENSUS) {
 		if (out != NULL)
@@ -374,27 +345,27 @@ cluster_tx_resolve_exact_admitted(
 			*reason_out = CLUSTER_TX_RESOLVE_PROTOCOL;
 		return CLUSTER_TX_UNKNOWN;
 	}
-	return cluster_tx_resolve_exact_with_admission(
-		locator, mode, admission, out, reason_out, true, InvalidScn);
+	return cluster_tx_resolve_exact_with_admission(locator, mode, admission, out, reason_out, true,
+												   InvalidScn);
 }
 
 ClusterTxOutcome
-cluster_tx_resolve_terminal_census_retained_admitted(
-	const ClusterTxLocator *locator, SCN retained_commit_scn,
-	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out)
+cluster_tx_resolve_terminal_census_retained_admitted(const ClusterTxLocator *locator,
+													 SCN retained_commit_scn,
+													 const ClusterSemanticAdmissionToken *admission,
+													 ClusterTxResolution *out,
+													 ClusterTxResolveReason *reason_out)
 {
-	if (!SCN_VALID(retained_commit_scn))
-	{
+	if (!SCN_VALID(retained_commit_scn)) {
 		if (out != NULL)
 			memset(out, 0, sizeof(*out));
 		if (reason_out != NULL)
 			*reason_out = CLUSTER_TX_RESOLVE_PROTOCOL;
 		return CLUSTER_TX_UNKNOWN;
 	}
-	return cluster_tx_resolve_exact_with_admission(
-		locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS, admission, out,
-		reason_out, true, retained_commit_scn);
+	return cluster_tx_resolve_exact_with_admission(locator, CLUSTER_TX_RESOLVE_TERMINAL_CENSUS,
+												   admission, out, reason_out, true,
+												   retained_commit_scn);
 }
 
 void
@@ -405,8 +376,7 @@ cluster_tx_resolve_terminal_census_batch_preflight(void)
 
 ClusterTxOutcome
 cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
-						 ClusterTxResolution *out,
-						 ClusterTxResolveReason *reason_out)
+						 ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -420,23 +390,21 @@ cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode m
 		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
 	memset(&admission, 0, sizeof(admission));
 	if (terminal_census)
-		admission_result
-			= cluster_semantic_activation_enter_r4_terminal_census(&admission);
+		admission_result = cluster_semantic_activation_enter_r4_terminal_census(&admission);
 	else
 		admission_result = cluster_semantic_activation_enter(
-			CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-			CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+			CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		reason = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
-				 ? CLUSTER_TX_RESOLVE_TARGET_DISABLED
-				 : CLUSTER_TX_RESOLVE_RF_DEFERRED;
+					 ? CLUSTER_TX_RESOLVE_TARGET_DISABLED
+					 : CLUSTER_TX_RESOLVE_RF_DEFERRED;
 		goto done;
 	}
 
 	PG_TRY();
 	{
-		outcome = cluster_tx_resolve_exact_with_admission(
-			locator, mode, &admission, out, &reason, false, InvalidScn);
+		outcome = cluster_tx_resolve_exact_with_admission(locator, mode, &admission, out, &reason,
+														  false, InvalidScn);
 	}
 	PG_FINALLY();
 	{
@@ -465,12 +433,12 @@ cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 		*reason_out = CLUSTER_TX_RESOLVE_TARGET_DISABLED;
 	memset(&admission, 0, sizeof(admission));
 
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		reason = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
-				 ? CLUSTER_TX_RESOLVE_TARGET_DISABLED
-				 : CLUSTER_TX_RESOLVE_RF_DEFERRED;
+					 ? CLUSTER_TX_RESOLVE_TARGET_DISABLED
+					 : CLUSTER_TX_RESOLVE_RF_DEFERRED;
 		goto done;
 	}
 
@@ -497,10 +465,9 @@ cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 			bool stable;
 			int i;
 
-			first_count = GetMultiXactIdMembersWithOffset(mxid, &first, false, false,
-												 &first_start);
-			second_count = GetMultiXactIdMembersWithOffset(mxid, &second, false, false,
-												  &second_start);
+			first_count = GetMultiXactIdMembersWithOffset(mxid, &first, false, false, &first_start);
+			second_count
+				= GetMultiXactIdMembersWithOffset(mxid, &second, false, false, &second_start);
 
 			first_valid = first_start != 0 && first_count >= 2
 						  && first_count <= CLUSTER_R4_MAX_MULTI_MEMBERS && first != NULL;
@@ -528,8 +495,8 @@ cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 			}
 
 			stable = first_valid && second_valid
-					 && cluster_multixact_native_snapshot_equal(
-							first_start, first_count, first, second_start, second_count, second);
+					 && cluster_multixact_native_snapshot_equal(first_start, first_count, first,
+																second_start, second_count, second);
 			if (first != NULL)
 				pfree(first);
 			if (second != NULL)
@@ -546,8 +513,7 @@ cluster_tx_resolve_multixact(MultiXactId mxid, ClusterMultiResolution *out,
 			reason = CLUSTER_TX_RESOLVE_COMPOSITION_CHANGED;
 		}
 
-admitted_done:
-		;
+	admitted_done:;
 	}
 	PG_FINALLY();
 	{

@@ -96,7 +96,7 @@ extern char *cluster_undo_buf_pin(uint32 segment_id, uint8 owner, uint32 block_n
  * disabled pool returns false without disk I/O and leaves dst unchanged.
  */
 extern bool cluster_undo_buf_copy_resident(uint32 segment_id, uint8 owner, uint32 block_no,
-									   char dst[BLCKSZ]);
+										   char dst[BLCKSZ]);
 
 /*
  * cluster_undo_buf_mark_dirty -- the EXCLUSIVE-pinned block was modified,
@@ -119,11 +119,10 @@ extern void cluster_undo_buf_unref_slot(int slot);
  * retry edge.  Once locked, the exact referenced slot cannot be evicted or
  * rebound; install is therefore infallible and is followed by explicit
  * unlock after the prepared image is copied. */
-extern bool cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id,
-									  uint8 owner, uint32 block_no);
-extern void cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id,
-									uint8 owner, uint32 block_no,
-									const char image[BLCKSZ]);
+extern bool cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id, uint8 owner,
+												  uint32 block_no);
+extern void cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner,
+												uint32 block_no, const char image[BLCKSZ]);
 extern void cluster_undo_buf_unlock_ref(int slot);
 
 /* checkpoint / shutdown flush hook.  is_checkpoint=true on checkpoint. */

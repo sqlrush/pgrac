@@ -79,9 +79,9 @@ int cluster_tt_status_hint_outbound_capacity = 256;
 int cluster_tt_status_hint_emit_mode = CLUSTER_TT_STATUS_HINT_EMIT_ALL_STATUS;
 
 ClusterSemanticAdmissionResult
-cluster_tt_status_hint_source_dispatch(
-	ClusterTTStatusHintSourceOp op pg_attribute_unused(),
-	const ClusterTTStatusHintSourceRequest *request pg_attribute_unused())
+cluster_tt_status_hint_source_dispatch(ClusterTTStatusHintSourceOp op pg_attribute_unused(),
+									   const ClusterTTStatusHintSourceRequest *request
+										   pg_attribute_unused())
 {
 	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }

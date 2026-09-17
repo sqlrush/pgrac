@@ -262,7 +262,7 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	source_request.status = install_status;
 	source_request.commit_scn = commit_scn;
 	install_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
-											  &source_request, &source_result);
+														  &source_request, &source_result);
 	install_value = source_result.bool_value;
 	installed = install_admission == CLUSTER_SEMANTIC_ADMISSION_OK && install_value;
 
@@ -277,25 +277,24 @@ cluster_test_inject_visibility_tt_ref(PG_FUNCTION_ARGS)
 	memset(&source_request, 0, sizeof(source_request));
 	source_request.key = &key;
 	lookup_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request,
-											 &source_result);
+														 &source_result);
 	lookup_value = source_result.bool_value;
 	looked_up = lookup_admission == CLUSTER_SEMANTIC_ADMISSION_OK && lookup_value;
 	res = source_result.lookup;
-	if (!installed || !looked_up || res.status != install_status
-		|| res.commit_scn != commit_scn)
-		ereport(ERROR, (errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-						errmsg("cluster TT status overlay install verification failed"),
-						errdetail("install admission=%d result=%s; lookup admission=%d result=%s; "
-								  "key epoch=%u current epoch=" UINT64_FORMAT "; "
-								  "requested status=%d observed status=%d; "
-								  "requested commit SCN=" UINT64_FORMAT
-								  " observed commit SCN=" UINT64_FORMAT ".",
-								  (int)install_admission, install_value ? "true" : "false",
-								  (int)lookup_admission, lookup_value ? "true" : "false",
-								  key.cluster_epoch, cluster_epoch_get_current(),
-								  (int)install_status, (int)res.status,
-								  (uint64)commit_scn, (uint64)res.commit_scn),
-						errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
+	if (!installed || !looked_up || res.status != install_status || res.commit_scn != commit_scn)
+		ereport(ERROR,
+				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+				 errmsg("cluster TT status overlay install verification failed"),
+				 errdetail("install admission=%d result=%s; lookup admission=%d result=%s; "
+						   "key epoch=%u current epoch=" UINT64_FORMAT "; "
+						   "requested status=%d observed status=%d; "
+						   "requested commit SCN=" UINT64_FORMAT
+						   " observed commit SCN=" UINT64_FORMAT ".",
+						   (int)install_admission, install_value ? "true" : "false",
+						   (int)lookup_admission, lookup_value ? "true" : "false",
+						   key.cluster_epoch, cluster_epoch_get_current(), (int)install_status,
+						   (int)res.status, (uint64)commit_scn, (uint64)res.commit_scn),
+				 errhint("Raise cluster.tt_status_overlay_max_entries or lower TTL.")));
 
 	PG_RETURN_BOOL(true);
 }
@@ -339,7 +338,7 @@ cluster_test_clear_visibility_injects(PG_FUNCTION_ARGS)
 		memset(&source_request, 0, sizeof(source_request));
 		source_request.key = &key;
 		(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_DELETE_EXACT, &source_request,
-											&source_result);
+												&source_result);
 
 		hash_search(ClusterVisibilityInjectHTAB, &e->xid, HASH_REMOVE, NULL);
 		removed++;

@@ -385,15 +385,14 @@ UT_TEST(test_io_9_marker_regions_are_disjoint)
 	UT_ASSERT(CLUSTER_VOTING_STRIPE_SLOT_OFFSET(0)
 			  == (off_t)4 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES);
 	UT_ASSERT(CLUSTER_VOTING_STRIPE_ACTIVATION_OFFSET
-				  == (off_t)5 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES);
+			  == (off_t)5 * CLUSTER_MAX_NODES * CLUSTER_VOTING_SLOT_BYTES);
 	UT_ASSERT_EQ(CLUSTER_VOTING_PGSA_SLOT_OFFSET, (off_t)328192);
 	UT_ASSERT_EQ(CLUSTER_EPOCH_BALLOT_SLOT(0), 642);
 	UT_ASSERT_EQ(CLUSTER_EPOCH_BALLOT_SLOT(CLUSTER_MAX_NODES - 1), 769);
 	UT_ASSERT_EQ(CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(0), (off_t)328704);
-	UT_ASSERT_EQ(CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(CLUSTER_MAX_NODES - 1),
-				 (off_t)393728);
+	UT_ASSERT_EQ(CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(CLUSTER_MAX_NODES - 1), (off_t)393728);
 	UT_ASSERT(CLUSTER_VOTING_FILE_BYTES_MIN
-				  == (off_t)(6 * CLUSTER_MAX_NODES + 2) * CLUSTER_VOTING_SLOT_BYTES);
+			  == (off_t)(6 * CLUSTER_MAX_NODES + 2) * CLUSTER_VOTING_SLOT_BYTES);
 	UT_ASSERT_EQ(CLUSTER_VOTING_FILE_BYTES_MIN, (off_t)394240);
 	UT_ASSERT_EQ(CLUSTER_VOTING_PGSA_SLOT_OFFSET + CLUSTER_VOTING_SLOT_BYTES,
 				 CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(0));
@@ -488,8 +487,7 @@ UT_TEST(test_io_12_raw_tail_write_lazily_extends_old_file)
 
 	UT_ASSERT_EQ(cluster_voting_disk_write_raw_tail_slot(fd, in), CLUSTER_VOTING_DISK_IO_OK);
 	UT_ASSERT_EQ(fstat(fd, &st), 0);
-	UT_ASSERT_EQ(st.st_size,
-				 CLUSTER_VOTING_PGSA_SLOT_OFFSET + (off_t)CLUSTER_VOTING_SLOT_BYTES);
+	UT_ASSERT_EQ(st.st_size, CLUSTER_VOTING_PGSA_SLOT_OFFSET + (off_t)CLUSTER_VOTING_SLOT_BYTES);
 
 	memset(out, 0, sizeof(out));
 	UT_ASSERT_EQ(cluster_voting_disk_read_raw_tail_slot(fd, out),
@@ -584,12 +582,10 @@ UT_TEST(test_io_15_epoch_ballot_slots_round_trip_without_aliasing)
 				 CLUSTER_VOTING_DISK_IO_OK);
 
 	memset(out, 0, sizeof(out));
-	UT_ASSERT_EQ(cluster_voting_disk_read_epoch_ballot_slot(fd, 0, out),
-				 CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(cluster_voting_disk_read_epoch_ballot_slot(fd, 0, out), CLUSTER_VOTING_DISK_IO_OK);
 	UT_ASSERT_EQ(memcmp(out, lane0, sizeof(out)), 0);
 	memset(out, 0, sizeof(out));
-	UT_ASSERT_EQ(cluster_voting_disk_read_epoch_ballot_slot(fd, 1, out),
-				 CLUSTER_VOTING_DISK_IO_OK);
+	UT_ASSERT_EQ(cluster_voting_disk_read_epoch_ballot_slot(fd, 1, out), CLUSTER_VOTING_DISK_IO_OK);
 	UT_ASSERT_EQ(memcmp(out, lane1, sizeof(out)), 0);
 	memset(out, 0, sizeof(out));
 	UT_ASSERT_EQ(cluster_voting_disk_read_epoch_ballot_slot(fd, CLUSTER_MAX_NODES - 1, out),

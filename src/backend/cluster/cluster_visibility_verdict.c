@@ -164,8 +164,7 @@ cluster_vis_update_lock_only_xmax_verdict(ClusterTTStatus status)
  * through local CLOG.  lock_only dominates the command-id comparison.
  */
 ClusterVisNativeSelfUpdateVerdict
-cluster_vis_update_native_self_verdict(bool lock_only,
-									   bool cmax_at_or_after_curcid)
+cluster_vis_update_native_self_verdict(bool lock_only, bool cmax_at_or_after_curcid)
 {
 	if (lock_only)
 		return CLUSTER_VIS_NATIVE_SELF_BEING_MODIFIED;
@@ -253,8 +252,7 @@ bool
 cluster_vis_dirty_remote_xmax_waitable(ClusterTTStatus status, bool is_xmax,
 									   bool exact_locator_valid)
 {
-	return status == CLUSTER_TT_STATUS_IN_PROGRESS
-		&& is_xmax && exact_locator_valid;
+	return status == CLUSTER_TT_STATUS_IN_PROGRESS && is_xmax && exact_locator_valid;
 }
 
 /* ============================================================

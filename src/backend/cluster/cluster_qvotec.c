@@ -98,7 +98,7 @@
 #include "cluster/cluster_elog.h"		 /* CLUSTER_LOG (best-effort logging) */
 #include "cluster/cluster_epoch.h"		 /* spec-4.12b D2/D5: current-epoch upper-bound Assert */
 #include "cluster/cluster_epoch_ballot.h"
-#include "cluster/cluster_guc.h"		 /* cluster_enabled */
+#include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_replacement_request.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -177,13 +177,13 @@ typedef struct ClusterQvotecShmem {
 } ClusterQvotecShmem;
 
 StaticAssertDecl(sizeof(ClusterQvotecShmem) == CLUSTER_QVOTEC_SHMEM_BYTES,
-					 "ClusterQvotecShmem must be exactly 448 bytes");
+				 "ClusterQvotecShmem must be exactly 448 bytes");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, self_incarnation) == 64,
-					 "ClusterQvotecShmem self incarnation offset");
+				 "ClusterQvotecShmem self incarnation offset");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, prior_unclean_death) == 72,
-					 "prior_unclean_death must sit at offset 72 (queue lane owns 64..71)");
+				 "prior_unclean_death must sit at offset 72 (queue lane owns 64..71)");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, mailbox) == CLUSTER_QVOTEC_SHMEM_PREFIX_BYTES,
-					 "ClusterQvotecShmem mailbox must start at absolute offset 128");
+				 "ClusterQvotecShmem mailbox must start at absolute offset 128");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, diagnostic_cycle_started_us) == 80,
 				 "diagnostic timestamps must occupy only the former reserved prefix");
 
@@ -542,9 +542,9 @@ cluster_qvotec_mailbox_restart_reset(ClusterQvotecMailbox *mailbox)
 }
 
 ClusterQvotecMailboxSubmitStatus
-cluster_qvotec_mailbox_lmon_submit(
-	ClusterQvotecMailbox *mailbox, ClusterQvotecMailboxOpcode opcode,
-	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES], uint64 *request_seq_out)
+cluster_qvotec_mailbox_lmon_submit(ClusterQvotecMailbox *mailbox, ClusterQvotecMailboxOpcode opcode,
+								   const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
+								   uint64 *request_seq_out)
 {
 	uint64 request_seq;
 	uint64 completion_seq;
@@ -584,7 +584,7 @@ cluster_qvotec_mailbox_lmon_submit(
 
 bool
 cluster_qvotec_mailbox_qvotec_poll(ClusterQvotecMailbox *mailbox,
-									ClusterQvotecMailboxRequest *request_out)
+								   ClusterQvotecMailboxRequest *request_out)
 {
 	ClusterQvotecMailboxRequest snapshot;
 	uint64 request_seq_before;
@@ -615,7 +615,7 @@ cluster_qvotec_mailbox_qvotec_poll(ClusterQvotecMailbox *mailbox,
 		|| !qvotec_mailbox_opcode_valid(opcode)
 		|| (opcode == CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD
 			&& !qvotec_mailbox_bytes_are_zero(snapshot.request_value,
-											CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES)))
+											  CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES)))
 		return false;
 
 	*request_out = snapshot;
@@ -623,9 +623,8 @@ cluster_qvotec_mailbox_qvotec_poll(ClusterQvotecMailbox *mailbox,
 }
 
 bool
-cluster_qvotec_mailbox_qvotec_complete(
-	ClusterQvotecMailbox *mailbox, uint8 configured_disk_bitmap,
-	const ClusterQvotecMailboxCompletion *completion)
+cluster_qvotec_mailbox_qvotec_complete(ClusterQvotecMailbox *mailbox, uint8 configured_disk_bitmap,
+									   const ClusterQvotecMailboxCompletion *completion)
 {
 	uint64 request_seq;
 	uint64 completion_seq;
@@ -665,9 +664,8 @@ cluster_qvotec_mailbox_qvotec_complete(
 }
 
 bool
-cluster_qvotec_mailbox_lmon_poll_completion(
-	ClusterQvotecMailbox *mailbox, uint64 request_seq,
-	ClusterQvotecMailboxCompletion *completion_out)
+cluster_qvotec_mailbox_lmon_poll_completion(ClusterQvotecMailbox *mailbox, uint64 request_seq,
+											ClusterQvotecMailboxCompletion *completion_out)
 {
 	ClusterQvotecMailboxCompletion snapshot;
 	uint64 completion_seq_before;
@@ -690,8 +688,7 @@ cluster_qvotec_mailbox_lmon_poll_completion(
 	snapshot.request_seq = request_seq;
 	result = pg_atomic_read_u32(&mailbox->completion_result);
 	snapshot.result = (ClusterQvotecMailboxResult)result;
-	memcpy(snapshot.completion_value, mailbox->completion_value,
-		   sizeof(snapshot.completion_value));
+	memcpy(snapshot.completion_value, mailbox->completion_value, sizeof(snapshot.completion_value));
 	memcpy(snapshot.completion_ballot, mailbox->completion_ballot,
 		   sizeof(snapshot.completion_ballot));
 	snapshot.observed_disk_bitmap = mailbox->observed_disk_bitmap;
@@ -713,23 +710,22 @@ cluster_qvotec_mailbox_lmon_poll_completion(
 ClusterQvotecMailboxSubmitStatus
 cluster_qvotec_authority_lmon_submit(
 	ClusterQvotecMailboxOpcode opcode,
-	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
-	uint64 *request_seq_out)
+	const uint8 request_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES], uint64 *request_seq_out)
 {
 	if (QvotecShmem == NULL)
 		return CLUSTER_QVOTEC_MAILBOX_SUBMIT_HOLD;
-	return cluster_qvotec_mailbox_lmon_submit(
-		&QvotecShmem->mailbox, opcode, request_value, request_seq_out);
+	return cluster_qvotec_mailbox_lmon_submit(&QvotecShmem->mailbox, opcode, request_value,
+											  request_seq_out);
 }
 
 bool
-cluster_qvotec_authority_lmon_poll_completion(
-	uint64 request_seq, ClusterQvotecMailboxCompletion *completion_out)
+cluster_qvotec_authority_lmon_poll_completion(uint64 request_seq,
+											  ClusterQvotecMailboxCompletion *completion_out)
 {
 	if (QvotecShmem == NULL)
 		return false;
-	return cluster_qvotec_mailbox_lmon_poll_completion(
-		&QvotecShmem->mailbox, request_seq, completion_out);
+	return cluster_qvotec_mailbox_lmon_poll_completion(&QvotecShmem->mailbox, request_seq,
+													   completion_out);
 }
 
 Size
@@ -1097,8 +1093,7 @@ cluster_writes_currently_frozen(void)
  * ============================================================ */
 #include "cluster/cluster_voting_disk_io.h" /* fd open/close + format */
 
-StaticAssertDecl(CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN
-					 == CLUSTER_VOTING_PGRD_FILE_BYTES_MIN,
+StaticAssertDecl(CLUSTER_UNDO_ROOT_DESCRIPTOR_FILE_BYTES_MIN == CLUSTER_VOTING_PGRD_FILE_BYTES_MIN,
 				 "PGRD voting capacity bounds must match");
 
 static bool
@@ -1114,15 +1109,13 @@ qvotec_pgsa_bytes_are_zero(const uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_
 }
 
 static ClusterUndoRootDescriptorState qvotec_undo_root_descriptor_read_fds(
-	const int *fds, int n_disks, uint64 system_identifier,
-	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
-	uint8 *out_observed_disk_bitmap);
+	const int *fds, int n_disks, uint64 system_identifier, uint8 root_kind, int32 owner_node,
+	ClusterUndoRootDescriptorV1 *out, uint8 *out_observed_disk_bitmap);
 
 static bool
-qvotec_undo_root_descriptor_provision_fds(
-	const int *fds, int n_disks, uint64 system_identifier,
-	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint8 *out_completed_disk_bitmap)
+qvotec_undo_root_descriptor_provision_fds(const int *fds, int n_disks, uint64 system_identifier,
+										  const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+										  uint8 *out_completed_disk_bitmap)
 {
 	bool eligible[CLUSTER_MAX_VOTING_DISKS] = { false };
 	bool wrote[CLUSTER_MAX_VOTING_DISKS] = { false };
@@ -1136,18 +1129,16 @@ qvotec_undo_root_descriptor_provision_fds(
 	int majority;
 	int i;
 
-	if (fds == NULL || desired == NULL || out_completed_disk_bitmap == NULL
-		|| n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS
-		|| cluster_undo_root_descriptor_decode(
-			   desired, system_identifier, &descriptor)
+	if (fds == NULL || desired == NULL || out_completed_disk_bitmap == NULL || n_disks <= 0
+		|| n_disks > CLUSTER_MAX_VOTING_DISKS
+		|| cluster_undo_root_descriptor_decode(desired, system_identifier, &descriptor)
 			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
 		|| descriptor.descriptor_incarnation != 1)
 		return false;
 	if (descriptor.root_kind == CLUSTER_UNDO_ROOT_KIND_SHARED)
 		offset = CLUSTER_UNDO_ROOT_DESCRIPTOR_SHARED_OFFSET;
 	else if (descriptor.root_kind == CLUSTER_UNDO_ROOT_KIND_LOCAL)
-		offset = CLUSTER_UNDO_ROOT_DESCRIPTOR_LOCAL_OFFSET(
-			descriptor.owner_node);
+		offset = CLUSTER_UNDO_ROOT_DESCRIPTOR_LOCAL_OFFSET(descriptor.owner_node);
 	else
 		return false;
 
@@ -1158,8 +1149,7 @@ qvotec_undo_root_descriptor_provision_fds(
 		ClusterUndoRootDescriptorState descriptor_state;
 
 		memset(image, 0, sizeof(image));
-		read_state = cluster_voting_disk_read_raw_slot_at(
-			fds[i], offset, image);
+		read_state = cluster_voting_disk_read_raw_slot_at(fds[i], offset, image);
 		if (read_state == CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF) {
 			eligible[i] = true;
 			eligible_count++;
@@ -1169,8 +1159,7 @@ qvotec_undo_root_descriptor_provision_fds(
 			return false;
 		if (read_state != CLUSTER_VOTING_DISK_RAW_READ_FULL)
 			continue;
-		descriptor_state = cluster_undo_root_descriptor_decode(
-			image, system_identifier, &observed);
+		descriptor_state = cluster_undo_root_descriptor_decode(image, system_identifier, &observed);
 		if (descriptor_state == CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED
 			|| (descriptor_state == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
 				&& memcmp(image, desired, sizeof(image)) == 0)) {
@@ -1201,9 +1190,8 @@ qvotec_undo_root_descriptor_provision_fds(
 	}
 	if (completed_count < majority)
 		return false;
-	if (qvotec_undo_root_descriptor_read_fds(
-			fds, n_disks, system_identifier, descriptor.root_kind,
-			descriptor.owner_node, &committed, &observed_bitmap)
+	if (qvotec_undo_root_descriptor_read_fds(fds, n_disks, system_identifier, descriptor.root_kind,
+											 descriptor.owner_node, &committed, &observed_bitmap)
 			!= CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
 		|| !cluster_undo_root_descriptor_encode(&committed, image)
 		|| memcmp(image, desired, sizeof(image)) != 0)
@@ -1213,13 +1201,12 @@ qvotec_undo_root_descriptor_provision_fds(
 }
 
 static ClusterUndoRootDescriptorState
-qvotec_undo_root_descriptor_read_fds(
-	const int *fds, int n_disks, uint64 system_identifier,
-	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
-	uint8 *out_observed_disk_bitmap)
+qvotec_undo_root_descriptor_read_fds(const int *fds, int n_disks, uint64 system_identifier,
+									 uint8 root_kind, int32 owner_node,
+									 ClusterUndoRootDescriptorV1 *out,
+									 uint8 *out_observed_disk_bitmap)
 {
-	uint8 images[CLUSTER_MAX_VOTING_DISKS]
-		[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	uint8 images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 	ClusterUndoRootDescriptorV1 descriptors[CLUSTER_MAX_VOTING_DISKS];
 	ClusterUndoRootDescriptorState states[CLUSTER_MAX_VOTING_DISKS];
 	bool valid[CLUSTER_MAX_VOTING_DISKS] = { false };
@@ -1232,8 +1219,7 @@ qvotec_undo_root_descriptor_read_fds(
 		memset(out, 0, sizeof(*out));
 	if (out_observed_disk_bitmap != NULL)
 		*out_observed_disk_bitmap = 0;
-	if (fds == NULL || n_disks <= 0
-		|| n_disks > CLUSTER_MAX_VOTING_DISKS || system_identifier == 0
+	if (fds == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS || system_identifier == 0
 		|| out == NULL || out_observed_disk_bitmap == NULL)
 		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 	if (root_kind == CLUSTER_UNDO_ROOT_KIND_SHARED && owner_node == -1)
@@ -1251,8 +1237,7 @@ qvotec_undo_root_descriptor_read_fds(
 	for (i = 0; i < n_disks; i++) {
 		ClusterVotingDiskRawReadState read_state;
 
-		read_state = cluster_voting_disk_read_raw_slot_at(
-			fds[i], offset, images[i]);
+		read_state = cluster_voting_disk_read_raw_slot_at(fds[i], offset, images[i]);
 		if (read_state == CLUSTER_VOTING_DISK_RAW_READ_CLEAN_EOF) {
 			states[i] = CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED;
 			valid[i] = true;
@@ -1260,8 +1245,8 @@ qvotec_undo_root_descriptor_read_fds(
 		}
 		if (read_state != CLUSTER_VOTING_DISK_RAW_READ_FULL)
 			return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
-		states[i] = cluster_undo_root_descriptor_decode(
-			images[i], system_identifier, &descriptors[i]);
+		states[i]
+			= cluster_undo_root_descriptor_decode(images[i], system_identifier, &descriptors[i]);
 		if (states[i] == CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED)
 			valid[i] = true;
 		else if (states[i] == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
@@ -1279,8 +1264,7 @@ qvotec_undo_root_descriptor_read_fds(
 			continue;
 		for (j = i + 1; j < n_disks; j++) {
 			if (states[j] == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
-				&& descriptors[i].descriptor_incarnation
-					   == descriptors[j].descriptor_incarnation
+				&& descriptors[i].descriptor_incarnation == descriptors[j].descriptor_incarnation
 				&& memcmp(images[i], images[j], sizeof(images[i])) != 0)
 				return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 		}
@@ -1293,8 +1277,7 @@ qvotec_undo_root_descriptor_read_fds(
 		if (!valid[i])
 			continue;
 		for (j = 0; j < n_disks; j++) {
-			if (valid[j]
-				&& memcmp(images[i], images[j], sizeof(images[i])) == 0)
+			if (valid[j] && memcmp(images[i], images[j], sizeof(images[i])) == 0)
 				identical++;
 		}
 		if (identical >= majority) {
@@ -1306,8 +1289,7 @@ qvotec_undo_root_descriptor_read_fds(
 		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 
 	for (i = 0; i < n_disks; i++) {
-		if (valid[i]
-			&& memcmp(images[selected], images[i], sizeof(images[i])) == 0)
+		if (valid[i] && memcmp(images[selected], images[i], sizeof(images[i])) == 0)
 			*out_observed_disk_bitmap |= (uint8)(UINT8_C(1) << i);
 	}
 	if (states[selected] == CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED)
@@ -1317,13 +1299,11 @@ qvotec_undo_root_descriptor_read_fds(
 }
 
 static bool
-qvotec_undo_root_descriptor_formation_attested_fds(
-	const int *fds, int n_disks)
+qvotec_undo_root_descriptor_formation_attested_fds(const int *fds, int n_disks)
 {
 	int i;
 
-	if (fds == NULL
-		|| (n_disks != 1 && n_disks != 3 && n_disks != 5 && n_disks != 7))
+	if (fds == NULL || (n_disks != 1 && n_disks != 3 && n_disks != 5 && n_disks != 7))
 		return false;
 	for (i = 0; i < n_disks; i++) {
 		if (!cluster_voting_disk_pgrd_authority_attest(fds[i]))
@@ -1334,12 +1314,10 @@ qvotec_undo_root_descriptor_formation_attested_fds(
 
 static ClusterSemanticActivationResult
 qvotec_semantic_activation_record_read_fds(
-	const int *fds, int n_disks,
-	uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
+	const int *fds, int n_disks, uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
 	bool *implicit_open)
 {
-	uint8 images[CLUSTER_MAX_VOTING_DISKS]
-		[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
+	uint8 images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 	ClusterSemanticActivationRecord records[CLUSTER_MAX_VOTING_DISKS];
 	bool valid[CLUSTER_MAX_VOTING_DISKS];
 	bool nonzero[CLUSTER_MAX_VOTING_DISKS];
@@ -1348,13 +1326,11 @@ qvotec_semantic_activation_record_read_fds(
 	int i;
 
 	if (selected_bytes != NULL)
-		memset(selected_bytes, 0,
-			   CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES);
+		memset(selected_bytes, 0, CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES);
 	if (implicit_open != NULL)
 		*implicit_open = false;
-	if (fds == NULL || n_disks <= 0
-		|| n_disks > CLUSTER_MAX_VOTING_DISKS
-		|| selected_bytes == NULL || implicit_open == NULL)
+	if (fds == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS || selected_bytes == NULL
+		|| implicit_open == NULL)
 		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
 
 	memset(images, 0, sizeof(images));
@@ -1376,8 +1352,7 @@ qvotec_semantic_activation_record_read_fds(
 			valid[i] = true;
 			continue;
 		}
-		if (cluster_semantic_activation_record_decode(
-				images[i], &records[i], NULL)) {
+		if (cluster_semantic_activation_record_decode(images[i], &records[i], NULL)) {
 			valid[i] = true;
 			nonzero[i] = true;
 		}
@@ -1390,8 +1365,7 @@ qvotec_semantic_activation_record_read_fds(
 		if (!valid[i])
 			continue;
 		for (j = 0; j < n_disks; j++) {
-			if (valid[j]
-				&& memcmp(images[i], images[j], sizeof(images[i])) == 0)
+			if (valid[j] && memcmp(images[i], images[j], sizeof(images[i])) == 0)
 				identical++;
 		}
 		if (identical >= majority) {
@@ -1400,8 +1374,7 @@ qvotec_semantic_activation_record_read_fds(
 		}
 	}
 	if (selected >= 0) {
-		memcpy(selected_bytes, images[selected],
-			   CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES);
+		memcpy(selected_bytes, images[selected], CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES);
 		*implicit_open = !nonzero[selected];
 		return CLUSTER_SEMANTIC_ACTIVATION_OK;
 	}
@@ -1413,8 +1386,7 @@ qvotec_semantic_activation_record_read_fds(
 			continue;
 		for (j = i + 1; j < n_disks; j++) {
 			if (valid[j] && nonzero[j]
-				&& records[i].record_generation
-					   == records[j].record_generation
+				&& records[i].record_generation == records[j].record_generation
 				&& memcmp(images[i], images[j], sizeof(images[i])) != 0)
 				return CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT;
 		}
@@ -1490,7 +1462,7 @@ cluster_qvotec_bootstrap_read_undo_root_descriptor(
 	int n_disks;
 	int i;
 	uint8 bitmap;
-	uint8 bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = {0};
+	uint8 bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = { 0 };
 	ClusterUndoRootDescriptorV1 descriptor;
 	ClusterUndoRootDescriptorState result;
 
@@ -1499,8 +1471,8 @@ cluster_qvotec_bootstrap_read_undo_root_descriptor(
 	n_disks = qvotec_bootstrap_open_readonly(fds);
 	if (n_disks < 0)
 		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
-	result = qvotec_undo_root_descriptor_read_fds(fds, n_disks, system_identifier,
-		CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &descriptor, &bitmap);
+	result = qvotec_undo_root_descriptor_read_fds(
+		fds, n_disks, system_identifier, CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &descriptor, &bitmap);
 	for (i = 0; i < n_disks; i++)
 		cluster_voting_disk_close(fds[i]);
 	if (result == CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD
@@ -1535,8 +1507,7 @@ cluster_qvotec_bootstrap_read_semantic_activation(
 
 static ClusterSemanticActivationResult
 qvotec_semantic_activation_record_cas_write_fds(
-	const int *fds, int n_disks, uint64 expected_generation,
-	uint64 expected_source_feature_bitmap,
+	const int *fds, int n_disks, uint64 expected_generation, uint64 expected_source_feature_bitmap,
 	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
 {
 	uint8 current_images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
@@ -1570,7 +1541,7 @@ qvotec_semantic_activation_record_cas_write_fds(
 		} else if (read_state == CLUSTER_VOTING_DISK_RAW_READ_FULL
 				   && (qvotec_pgsa_bytes_are_zero(current_images[i])
 					   || cluster_semantic_activation_record_decode(current_images[i],
-															   &current_record, NULL)))
+																	&current_record, NULL)))
 			current_valid[i] = true;
 	}
 
@@ -1595,30 +1566,29 @@ qvotec_semantic_activation_record_cas_write_fds(
 	if (selected < 0)
 		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
 
-	if (memcmp(current_images[selected], desired_bytes,
-			   CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES)
+	if (memcmp(current_images[selected], desired_bytes, CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES)
 		== 0)
 		return CLUSTER_SEMANTIC_ACTIVATION_OK;
 
 	memset(&current_record, 0, sizeof(current_record));
 	if (!qvotec_pgsa_bytes_are_zero(current_images[selected])
 		&& !cluster_semantic_activation_record_decode(current_images[selected], &current_record,
-														  NULL))
+													  NULL))
 		return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
 	if (qvotec_pgsa_bytes_are_zero(current_images[selected]))
 		current_source_feature_bitmap = 0;
 	else {
 		switch (current_record.phase) {
-			case CLUSTER_SEMANTIC_PHASE_PREPARE:
-			case CLUSTER_SEMANTIC_PHASE_COMMIT:
-				current_source_feature_bitmap = current_record.source_feature_bitmap;
-				break;
-			case CLUSTER_SEMANTIC_PHASE_OPEN:
-			case CLUSTER_SEMANTIC_PHASE_ROLLBACK_COMPLETE:
-				current_source_feature_bitmap = current_record.target_feature_bitmap;
-				break;
-			default:
-				return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+		case CLUSTER_SEMANTIC_PHASE_PREPARE:
+		case CLUSTER_SEMANTIC_PHASE_COMMIT:
+			current_source_feature_bitmap = current_record.source_feature_bitmap;
+			break;
+		case CLUSTER_SEMANTIC_PHASE_OPEN:
+		case CLUSTER_SEMANTIC_PHASE_ROLLBACK_COMPLETE:
+			current_source_feature_bitmap = current_record.target_feature_bitmap;
+			break;
+		default:
+			return CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
 		}
 	}
 	if (current_record.record_generation != expected_generation
@@ -1626,7 +1596,7 @@ qvotec_semantic_activation_record_cas_write_fds(
 		return CLUSTER_SEMANTIC_ACTIVATION_RECORD_CONFLICT;
 
 	for (i = 0; i < n_disks; i++)
-		(void) cluster_voting_disk_write_raw_tail_slot(fds[i], desired_bytes);
+		(void)cluster_voting_disk_write_raw_tail_slot(fds[i], desired_bytes);
 
 	{
 		int desired_count = 0;
@@ -1635,14 +1605,13 @@ qvotec_semantic_activation_record_cas_write_fds(
 			uint8 reread[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 			ClusterVotingDiskRawReadState read_state;
 
-			read_state
-				= cluster_voting_disk_read_raw_tail_slot(fds[i], reread);
+			read_state = cluster_voting_disk_read_raw_tail_slot(fds[i], reread);
 			if (read_state == CLUSTER_VOTING_DISK_RAW_READ_FULL
 				&& memcmp(reread, desired_bytes, sizeof(reread)) == 0)
 				desired_count++;
 		}
 		return desired_count >= majority ? CLUSTER_SEMANTIC_ACTIVATION_OK
-										   : CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
+										 : CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
 	}
 }
 
@@ -1661,18 +1630,17 @@ cluster_semantic_activation_record_cas_write(
  * Keeping the per-disk intersection here prevents two different majorities
  * (write success on A/B, stale exact bytes on B/C) from forming a false ACK. */
 static bool
-qvotec_join_marker_ack_proven_fds(
-	const int *fds, int n_disks, int32 target_node,
-	const uint8 staged_slot[CLUSTER_VOTING_SLOT_BYTES],
-	const bool write_succeeded[CLUSTER_MAX_VOTING_DISKS])
+qvotec_join_marker_ack_proven_fds(const int *fds, int n_disks, int32 target_node,
+								  const uint8 staged_slot[CLUSTER_VOTING_SLOT_BYTES],
+								  const bool write_succeeded[CLUSTER_MAX_VOTING_DISKS])
 {
 	uint32 exact = 0;
 	uint32 majority;
 	int i;
 
-	if (fds == NULL || staged_slot == NULL || write_succeeded == NULL
-		|| n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS
-		|| target_node < 0 || target_node >= CLUSTER_MAX_NODES)
+	if (fds == NULL || staged_slot == NULL || write_succeeded == NULL || n_disks <= 0
+		|| n_disks > CLUSTER_MAX_VOTING_DISKS || target_node < 0
+		|| target_node >= CLUSTER_MAX_NODES)
 		return false;
 
 	majority = ((uint32)n_disks / 2u) + 1u;
@@ -1682,8 +1650,7 @@ qvotec_join_marker_ack_proven_fds(
 		if (!write_succeeded[i])
 			continue;
 		memset(reread, 0, sizeof(reread));
-		if (cluster_voting_disk_read_join_slot(
-				fds[i], (uint32)target_node, reread)
+		if (cluster_voting_disk_read_join_slot(fds[i], (uint32)target_node, reread)
 				== CLUSTER_VOTING_DISK_IO_OK
 			&& memcmp(reread, staged_slot, sizeof(reread)) == 0)
 			exact++;
@@ -1709,9 +1676,8 @@ qvotec_join_marker_verify_committed_closed_fds(
 	if (verified_image96 == NULL)
 		return false;
 	memset(verified_image96, 0, CLUSTER_JCMK_REPLACEMENT_BYTES);
-	if (fds == NULL || n_disks <= 0
-		|| n_disks > CLUSTER_MAX_VOTING_DISKS
-		|| target_node < 0 || target_node >= CLUSTER_MAX_NODES)
+	if (fds == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS || target_node < 0
+		|| target_node >= CLUSTER_MAX_NODES)
 		return false;
 
 	memset(images, 0, sizeof(images));
@@ -1720,42 +1686,39 @@ qvotec_join_marker_verify_committed_closed_fds(
 		uint64 incarnation_floor;
 
 		memset(slot, 0, sizeof(slot));
-		if (cluster_voting_disk_read_join_slot(
-				fds[i], (uint32)target_node, slot)
+		if (cluster_voting_disk_read_join_slot(fds[i], (uint32)target_node, slot)
 				== CLUSTER_VOTING_DISK_IO_OK
-			&& cluster_replacement_marker_v3_is_committed_closed_basis(
-				slot, target_node, &incarnation_floor))
+			&& cluster_replacement_marker_v3_is_committed_closed_basis(slot, target_node,
+																	   &incarnation_floor))
 			memcpy(images[i], slot, CLUSTER_JCMK_REPLACEMENT_BYTES);
 	}
 
 	majority = ((uint32)n_disks / 2u) + 1u;
-	selected = cluster_replacement_marker_v3_select_majority(
-		images, n_disks, majority, target_node, &winner, NULL);
-	if (selected < 0
-		|| !cluster_replacement_marker_v3_encode(&winner, canonical)
+	selected = cluster_replacement_marker_v3_select_majority(images, n_disks, majority, target_node,
+															 &winner, NULL);
+	if (selected < 0 || !cluster_replacement_marker_v3_encode(&winner, canonical)
 		|| memcmp(canonical, images[selected], sizeof(canonical)) != 0)
 		return false;
 	memcpy(verified_image96, canonical, sizeof(canonical));
 	return true;
 }
 
-static bool qvotec_epoch_ballot_phase1_promise_fds(
-	const int *fds, int n_disks, uint64 system_identifier,
-	const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
-	int32 proposer_node_id, const ClusterEpochBallotId *ballot,
-	uint8 *out_completed_disk_bitmap) pg_attribute_unused();
+static bool
+qvotec_epoch_ballot_phase1_promise_fds(const int *fds, int n_disks, uint64 system_identifier,
+									   const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
+									   int32 proposer_node_id, const ClusterEpochBallotId *ballot,
+									   uint8 *out_completed_disk_bitmap) pg_attribute_unused();
 
 static bool
-qvotec_epoch_ballot_component_monotone(
-	const ClusterEpochBallotId *older_ballot,
-	const ClusterEpochAuthorityValue *older_value,
-	const ClusterEpochBallotId *newer_ballot,
-	const ClusterEpochAuthorityValue *newer_value)
+qvotec_epoch_ballot_component_monotone(const ClusterEpochBallotId *older_ballot,
+									   const ClusterEpochAuthorityValue *older_value,
+									   const ClusterEpochBallotId *newer_ballot,
+									   const ClusterEpochAuthorityValue *newer_value)
 {
-	bool older_zero = qvotec_mailbox_bytes_are_zero(
-		(const uint8 *)older_ballot, sizeof(*older_ballot));
-	bool newer_zero = qvotec_mailbox_bytes_are_zero(
-		(const uint8 *)newer_ballot, sizeof(*newer_ballot));
+	bool older_zero
+		= qvotec_mailbox_bytes_are_zero((const uint8 *)older_ballot, sizeof(*older_ballot));
+	bool newer_zero
+		= qvotec_mailbox_bytes_are_zero((const uint8 *)newer_ballot, sizeof(*newer_ballot));
 	int cmp;
 
 	if (older_zero)
@@ -1763,25 +1726,20 @@ qvotec_epoch_ballot_component_monotone(
 	if (newer_zero)
 		return false;
 	cmp = cluster_epoch_ballot_id_compare(older_ballot, newer_ballot);
-	return cmp < 0
-		   || (cmp == 0
-			   && memcmp(older_value, newer_value, sizeof(*older_value)) == 0);
+	return cmp < 0 || (cmp == 0 && memcmp(older_value, newer_value, sizeof(*older_value)) == 0);
 }
 
 static bool
-qvotec_epoch_ballot_lane_monotone(
-	const ClusterEpochBallotLane *older,
-	const ClusterEpochBallotLane *newer)
+qvotec_epoch_ballot_lane_monotone(const ClusterEpochBallotLane *older,
+								  const ClusterEpochBallotLane *newer)
 {
 	return older->lane_generation < newer->lane_generation
-		   && cluster_epoch_ballot_id_compare(
-				  &older->promised_ballot, &newer->promised_ballot) <= 0
+		   && cluster_epoch_ballot_id_compare(&older->promised_ballot, &newer->promised_ballot) <= 0
 		   && qvotec_epoch_ballot_component_monotone(
-				  &older->accepted_ballot, &older->accepted_value,
-				  &newer->accepted_ballot, &newer->accepted_value)
-		   && qvotec_epoch_ballot_component_monotone(
-				  &older->settled_ballot, &older->settled_value,
-				  &newer->settled_ballot, &newer->settled_value);
+			   &older->accepted_ballot, &older->accepted_value, &newer->accepted_ballot,
+			   &newer->accepted_value)
+		   && qvotec_epoch_ballot_component_monotone(&older->settled_ballot, &older->settled_value,
+													 &newer->settled_ballot, &newer->settled_value);
 }
 
 /* Execute only the durable PHASE-1 primitive from spec-5.15A §2.1A.2.
@@ -1789,11 +1747,10 @@ qvotec_epoch_ballot_lane_monotone(
  * ballot reached durable disks before a later all-lane scan observed a higher
  * promise, so the owning actor must RECOVER before minting its retry. */
 static bool
-qvotec_epoch_ballot_phase1_promise_fds(
-	const int *fds, int n_disks, uint64 system_identifier,
-	const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
-	int32 proposer_node_id, const ClusterEpochBallotId *ballot,
-	uint8 *out_completed_disk_bitmap)
+qvotec_epoch_ballot_phase1_promise_fds(const int *fds, int n_disks, uint64 system_identifier,
+									   const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
+									   int32 proposer_node_id, const ClusterEpochBallotId *ballot,
+									   uint8 *out_completed_disk_bitmap)
 {
 	ClusterEpochBallotLane base;
 	ClusterEpochBallotLane promised;
@@ -1809,17 +1766,13 @@ qvotec_epoch_ballot_phase1_promise_fds(
 
 	if (out_completed_disk_bitmap != NULL)
 		*out_completed_disk_bitmap = 0;
-	if (fds == NULL || admitted_incarnations == NULL
-		|| out_completed_disk_bitmap == NULL || ballot == NULL
-		|| n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS
-		|| (n_disks != 1 && n_disks != 3 && n_disks != 5 && n_disks != 7)
-		|| system_identifier == 0 || proposer_node_id < 0
-		|| proposer_node_id >= CLUSTER_MAX_NODES
-		|| admitted_incarnations[proposer_node_id] == 0
-		|| !cluster_epoch_ballot_id_is_valid(ballot)
+	if (fds == NULL || admitted_incarnations == NULL || out_completed_disk_bitmap == NULL
+		|| ballot == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS
+		|| (n_disks != 1 && n_disks != 3 && n_disks != 5 && n_disks != 7) || system_identifier == 0
+		|| proposer_node_id < 0 || proposer_node_id >= CLUSTER_MAX_NODES
+		|| admitted_incarnations[proposer_node_id] == 0 || !cluster_epoch_ballot_id_is_valid(ballot)
 		|| ballot->proposer_node_id != proposer_node_id
-		|| ballot->proposer_admitted_incarnation
-			   != admitted_incarnations[proposer_node_id])
+		|| ballot->proposer_admitted_incarnation != admitted_incarnations[proposer_node_id])
 		return false;
 
 	memset(&base, 0, sizeof(base));
@@ -1837,18 +1790,15 @@ qvotec_epoch_ballot_phase1_promise_fds(
 		for (d = 0; d < n_disks; d++) {
 			uint8 image[CLUSTER_EPOCH_BALLOT_LANE_BYTES];
 
-			if (cluster_voting_disk_read_epoch_ballot_slot(
-					fds[d], (uint32)proposer, image)
-					!= CLUSTER_VOTING_DISK_IO_OK)
+			if (cluster_voting_disk_read_epoch_ballot_slot(fds[d], (uint32)proposer, image)
+				!= CLUSTER_VOTING_DISK_IO_OK)
 				return false;
 			if (qvotec_mailbox_bytes_are_zero(image, sizeof(image)))
 				continue;
 			if (admitted_incarnations[proposer] == 0
 				|| !cluster_epoch_ballot_lane_decode(
-					image, proposer, (uint32)n_disks,
-					admitted_incarnations[proposer], system_identifier,
-					CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
-					&lanes[d]))
+					image, proposer, (uint32)n_disks, admitted_incarnations[proposer],
+					system_identifier, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &lanes[d]))
 				return false;
 			valid[d] = true;
 		}
@@ -1862,30 +1812,25 @@ qvotec_epoch_ballot_phase1_promise_fds(
 
 				if (!valid[other])
 					continue;
-				if (lanes[d].lane_generation
-						== lanes[other].lane_generation) {
-					if (memcmp(&lanes[d], &lanes[other],
-							   sizeof(lanes[d])) != 0)
+				if (lanes[d].lane_generation == lanes[other].lane_generation) {
+					if (memcmp(&lanes[d], &lanes[other], sizeof(lanes[d])) != 0)
 						return false;
 					continue;
 				}
-				older = lanes[d].lane_generation
-							 < lanes[other].lane_generation
-						 ? &lanes[d] : &lanes[other];
+				older = lanes[d].lane_generation < lanes[other].lane_generation ? &lanes[d]
+																				: &lanes[other];
 				newer = older == &lanes[d] ? &lanes[other] : &lanes[d];
 				if (!qvotec_epoch_ballot_lane_monotone(older, newer))
 					return false;
 			}
 			if (!have_max_observed_promise
-				|| cluster_epoch_ballot_id_compare(
-					   &lanes[d].promised_ballot,
-					   &max_observed_promise) > 0) {
+				|| cluster_epoch_ballot_id_compare(&lanes[d].promised_ballot, &max_observed_promise)
+					   > 0) {
 				max_observed_promise = lanes[d].promised_ballot;
 				have_max_observed_promise = true;
 			}
 			if (proposer == proposer_node_id
-				&& (!have_base
-					|| lanes[d].lane_generation > base.lane_generation)) {
+				&& (!have_base || lanes[d].lane_generation > base.lane_generation)) {
 				base = lanes[d];
 				have_base = true;
 			}
@@ -1893,8 +1838,7 @@ qvotec_epoch_ballot_phase1_promise_fds(
 	}
 
 	if (have_max_observed_promise
-		&& cluster_epoch_ballot_id_compare(
-			   ballot, &max_observed_promise) <= 0)
+		&& cluster_epoch_ballot_id_compare(ballot, &max_observed_promise) <= 0)
 		return false;
 
 	if (have_base) {
@@ -1908,31 +1852,27 @@ qvotec_epoch_ballot_phase1_promise_fds(
 		promised.version = CLUSTER_EPOCH_BALLOT_VERSION;
 		promised.proposer_node_id = proposer_node_id;
 		promised.configured_disk_count = (uint32)n_disks;
-		promised.proposer_admitted_incarnation
-			= admitted_incarnations[proposer_node_id];
+		promised.proposer_admitted_incarnation = admitted_incarnations[proposer_node_id];
 		promised.lane_generation = 1;
 		promised.system_identifier = system_identifier;
-		promised.grammar_fingerprint
-			= CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT;
+		promised.grammar_fingerprint = CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT;
 	}
 	promised.last_write_phase = CLUSTER_EPOCH_BALLOT_PHASE_PROMISED;
 	promised.promised_ballot = *ballot;
 	promised.crc32c = 0;
 	if (!cluster_epoch_ballot_lane_encode(
-			&promised, proposer_node_id, (uint32)n_disks,
-			admitted_incarnations[proposer_node_id], system_identifier,
-			CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, promised_image))
+			&promised, proposer_node_id, (uint32)n_disks, admitted_incarnations[proposer_node_id],
+			system_identifier, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, promised_image))
 		return false;
 
 	for (d = 0; d < n_disks; d++) {
 		uint8 reread[CLUSTER_EPOCH_BALLOT_LANE_BYTES];
 
-		if (cluster_voting_disk_write_epoch_ballot_slot(
-				fds[d], (uint32)proposer_node_id, promised_image)
+		if (cluster_voting_disk_write_epoch_ballot_slot(fds[d], (uint32)proposer_node_id,
+														promised_image)
 				== CLUSTER_VOTING_DISK_IO_OK
-			&& cluster_voting_disk_read_epoch_ballot_slot(
-				fds[d], (uint32)proposer_node_id, reread)
-				== CLUSTER_VOTING_DISK_IO_OK
+			&& cluster_voting_disk_read_epoch_ballot_slot(fds[d], (uint32)proposer_node_id, reread)
+				   == CLUSTER_VOTING_DISK_IO_OK
 			&& memcmp(reread, promised_image, sizeof(reread)) == 0) {
 			completed_disk_bitmap |= (uint8)(1u << d);
 			completed_disks++;
@@ -1950,19 +1890,16 @@ qvotec_epoch_ballot_phase1_promise_fds(
 			ClusterEpochBallotLane lane;
 			uint8 image[CLUSTER_EPOCH_BALLOT_LANE_BYTES];
 
-			if (cluster_voting_disk_read_epoch_ballot_slot(
-					fds[d], (uint32)proposer, image)
-					!= CLUSTER_VOTING_DISK_IO_OK)
+			if (cluster_voting_disk_read_epoch_ballot_slot(fds[d], (uint32)proposer, image)
+				!= CLUSTER_VOTING_DISK_IO_OK)
 				return false;
 			if (qvotec_mailbox_bytes_are_zero(image, sizeof(image)))
 				continue;
 			if (admitted_incarnations[proposer] == 0
 				|| !cluster_epoch_ballot_lane_decode(
-					image, proposer, (uint32)n_disks,
-					admitted_incarnations[proposer], system_identifier,
-					CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &lane)
-				|| cluster_epoch_ballot_id_compare(
-					   &lane.promised_ballot, ballot) > 0)
+					image, proposer, (uint32)n_disks, admitted_incarnations[proposer],
+					system_identifier, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &lane)
+				|| cluster_epoch_ballot_id_compare(&lane.promised_ballot, ballot) > 0)
 				return false;
 		}
 	}
@@ -1976,12 +1913,11 @@ qvotec_epoch_ballot_phase1_promise_fds(
  * is deliberate: the settled head must be known before accepted generations
  * can be classified as historical, next, or corruptly skipped. */
 static ClusterQvotecMailboxResult
-qvotec_epoch_ballot_recover_head_fds(
-	const int *fds, int n_disks, uint64 system_identifier,
-	const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
-	uint8 out_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
-	uint8 out_ballot[CLUSTER_QVOTEC_BALLOT_BYTES],
-	uint8 *out_observed_disk_bitmap)
+qvotec_epoch_ballot_recover_head_fds(const int *fds, int n_disks, uint64 system_identifier,
+									 const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
+									 uint8 out_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
+									 uint8 out_ballot[CLUSTER_QVOTEC_BALLOT_BYTES],
+									 uint8 *out_observed_disk_bitmap)
 {
 	ClusterEpochAuthorityValue settled_value;
 	ClusterEpochBallotId settled_ballot;
@@ -2000,9 +1936,8 @@ qvotec_epoch_ballot_recover_head_fds(
 		memset(out_ballot, 0, CLUSTER_QVOTEC_BALLOT_BYTES);
 	if (out_observed_disk_bitmap != NULL)
 		*out_observed_disk_bitmap = 0;
-	if (fds == NULL || admitted_incarnations == NULL || out_value == NULL
-		|| out_ballot == NULL || out_observed_disk_bitmap == NULL
-		|| n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS
+	if (fds == NULL || admitted_incarnations == NULL || out_value == NULL || out_ballot == NULL
+		|| out_observed_disk_bitmap == NULL || n_disks <= 0 || n_disks > CLUSTER_MAX_VOTING_DISKS
 		|| system_identifier == 0)
 		return CLUSTER_QVOTEC_MAILBOX_HOLD;
 
@@ -2023,14 +1958,11 @@ qvotec_epoch_ballot_recover_head_fds(
 		for (d = 0; d < n_disks; d++) {
 			uint8 image[CLUSTER_EPOCH_BALLOT_LANE_BYTES];
 
-			if (cluster_voting_disk_read_epoch_ballot_slot(
-					fds[d], (uint32)proposer, image)
+			if (cluster_voting_disk_read_epoch_ballot_slot(fds[d], (uint32)proposer, image)
 					== CLUSTER_VOTING_DISK_IO_OK
 				&& cluster_epoch_ballot_lane_decode(
-					image, proposer, (uint32)n_disks,
-					admitted_incarnations[proposer], system_identifier,
-					CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
-					&lanes[d]))
+					image, proposer, (uint32)n_disks, admitted_incarnations[proposer],
+					system_identifier, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &lanes[d]))
 				valid[d] = true;
 		}
 
@@ -2043,12 +1975,10 @@ qvotec_epoch_ballot_recover_head_fds(
 				continue;
 			for (other = 0; other < n_disks; other++) {
 				if (valid[other]
-					&& memcmp(&lanes[d].settled_ballot,
-							  &lanes[other].settled_ballot,
+					&& memcmp(&lanes[d].settled_ballot, &lanes[other].settled_ballot,
 							  sizeof(lanes[d].settled_ballot))
 						   == 0
-					&& memcmp(&lanes[d].settled_value,
-							  &lanes[other].settled_value,
+					&& memcmp(&lanes[d].settled_value, &lanes[other].settled_value,
 							  sizeof(lanes[d].settled_value))
 						   == 0) {
 					count++;
@@ -2066,11 +1996,10 @@ qvotec_epoch_ballot_recover_head_fds(
 				have_settled = true;
 			} else if (lanes[d].settled_value.authority_generation
 					   == settled_value.authority_generation) {
-				if (memcmp(&lanes[d].settled_value, &settled_value,
-						   sizeof(settled_value)) != 0)
+				if (memcmp(&lanes[d].settled_value, &settled_value, sizeof(settled_value)) != 0)
 					return CLUSTER_QVOTEC_MAILBOX_HOLD;
-				if (cluster_epoch_ballot_id_compare(
-						&lanes[d].settled_ballot, &settled_ballot) > 0) {
+				if (cluster_epoch_ballot_id_compare(&lanes[d].settled_ballot, &settled_ballot)
+					> 0) {
 					settled_ballot = lanes[d].settled_ballot;
 					settled_disk_bitmap = agreeing;
 				}
@@ -2092,14 +2021,11 @@ qvotec_epoch_ballot_recover_head_fds(
 		for (d = 0; d < n_disks; d++) {
 			uint8 image[CLUSTER_EPOCH_BALLOT_LANE_BYTES];
 
-			if (cluster_voting_disk_read_epoch_ballot_slot(
-					fds[d], (uint32)proposer, image)
+			if (cluster_voting_disk_read_epoch_ballot_slot(fds[d], (uint32)proposer, image)
 					== CLUSTER_VOTING_DISK_IO_OK
 				&& cluster_epoch_ballot_lane_decode(
-					image, proposer, (uint32)n_disks,
-					admitted_incarnations[proposer], system_identifier,
-					CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
-					&lanes[d]))
+					image, proposer, (uint32)n_disks, admitted_incarnations[proposer],
+					system_identifier, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, &lanes[d]))
 				valid[d] = true;
 		}
 		for (d = 0; d < n_disks; d++) {
@@ -2111,12 +2037,10 @@ qvotec_epoch_ballot_recover_head_fds(
 				continue;
 			for (other = 0; other < n_disks; other++) {
 				if (valid[other]
-					&& memcmp(&lanes[d].accepted_ballot,
-							  &lanes[other].accepted_ballot,
+					&& memcmp(&lanes[d].accepted_ballot, &lanes[other].accepted_ballot,
 							  sizeof(lanes[d].accepted_ballot))
 						   == 0
-					&& memcmp(&lanes[d].accepted_value,
-							  &lanes[other].accepted_value,
+					&& memcmp(&lanes[d].accepted_value, &lanes[other].accepted_value,
 							  sizeof(lanes[d].accepted_value))
 						   == 0) {
 					count++;
@@ -2126,44 +2050,40 @@ qvotec_epoch_ballot_recover_head_fds(
 			if (count < majority)
 				continue;
 			if (lanes[d].accepted_value.authority_generation
-					> settled_value.authority_generation + 1)
+				> settled_value.authority_generation + 1)
+				return CLUSTER_QVOTEC_MAILBOX_HOLD;
+			if (lanes[d].accepted_value.authority_generation == settled_value.authority_generation
+				&& memcmp(&lanes[d].accepted_value, &settled_value, sizeof(settled_value)) != 0)
 				return CLUSTER_QVOTEC_MAILBOX_HOLD;
 			if (lanes[d].accepted_value.authority_generation
-					== settled_value.authority_generation
-				&& memcmp(&lanes[d].accepted_value, &settled_value,
-						  sizeof(settled_value)) != 0)
-				return CLUSTER_QVOTEC_MAILBOX_HOLD;
-			if (lanes[d].accepted_value.authority_generation
-					!= settled_value.authority_generation + 1)
+				!= settled_value.authority_generation + 1)
 				continue;
 			if (!have_accepted
-				|| cluster_epoch_ballot_id_compare(
-					   &lanes[d].accepted_ballot, &accepted_ballot) > 0) {
+				|| cluster_epoch_ballot_id_compare(&lanes[d].accepted_ballot, &accepted_ballot)
+					   > 0) {
 				accepted_value = lanes[d].accepted_value;
 				accepted_ballot = lanes[d].accepted_ballot;
 				accepted_disk_bitmap = agreeing;
 				have_accepted = true;
-			} else if (cluster_epoch_ballot_id_compare(
-						   &lanes[d].accepted_ballot, &accepted_ballot) == 0
-					   && memcmp(&lanes[d].accepted_value, &accepted_value,
-							 sizeof(accepted_value)) != 0)
+			} else if (cluster_epoch_ballot_id_compare(&lanes[d].accepted_ballot, &accepted_ballot)
+						   == 0
+					   && memcmp(&lanes[d].accepted_value, &accepted_value, sizeof(accepted_value))
+							  != 0)
 				return CLUSTER_QVOTEC_MAILBOX_HOLD;
 		}
 	}
 
 	if (have_accepted) {
 		if (!cluster_epoch_authority_value_encode(
-				&accepted_value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
-				out_value)
+				&accepted_value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, out_value)
 			|| !cluster_epoch_ballot_id_encode(&accepted_ballot, out_ballot))
 			return CLUSTER_QVOTEC_MAILBOX_HOLD;
 		*out_observed_disk_bitmap = accepted_disk_bitmap;
 		return CLUSTER_QVOTEC_MAILBOX_ADOPTED_OTHER;
 	}
 
-	if (!cluster_epoch_authority_value_encode(
-			&settled_value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
-			out_value)
+	if (!cluster_epoch_authority_value_encode(&settled_value,
+											  CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, out_value)
 		|| !cluster_epoch_ballot_id_encode(&settled_ballot, out_ballot))
 		return CLUSTER_QVOTEC_MAILBOX_HOLD;
 	*out_observed_disk_bitmap = settled_disk_bitmap;
@@ -2182,8 +2102,7 @@ qvotec_epoch_ballot_formation_attested_fds(const int *fds, int n_disks)
 {
 	int i;
 
-	if (fds == NULL
-		|| (n_disks != 1 && n_disks != 3 && n_disks != 5 && n_disks != 7))
+	if (fds == NULL || (n_disks != 1 && n_disks != 3 && n_disks != 5 && n_disks != 7))
 		return false;
 	for (i = 0; i < n_disks; i++) {
 		if (!cluster_voting_disk_epoch_ballot_authority_attest(fds[i]))
@@ -2201,87 +2120,71 @@ qvotec_epoch_ballot_mailbox_tick(void)
 	uint8 configured_disk_bitmap;
 	int i;
 
-	if (QvotecShmem == NULL
-		|| !cluster_qvotec_mailbox_qvotec_poll(
-			&QvotecShmem->mailbox, &request))
+	if (QvotecShmem == NULL || !cluster_qvotec_mailbox_qvotec_poll(&QvotecShmem->mailbox, &request))
 		return;
 	memset(&completion, 0, sizeof(completion));
 	completion.request_seq = request.request_seq;
 	completion.actor_phase = CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_A;
-	if (!qvotec_epoch_ballot_formation_attested_fds(
-			qvotec_fds, qvotec_n_disks)
+	if (!qvotec_epoch_ballot_formation_attested_fds(qvotec_fds, qvotec_n_disks)
 		|| request.opcode != CLUSTER_QVOTEC_MAILBOX_RECOVER_HEAD) {
 		completion.result = CLUSTER_QVOTEC_MAILBOX_HOLD;
 		completion.actor_phase = CLUSTER_QVOTEC_ACTOR_HOLD;
 	} else {
 		for (i = 0; i < CLUSTER_MAX_NODES; i++)
-			admitted_incarnations[i]
-				= cluster_membership_get_last_admitted_incarnation(i);
+			admitted_incarnations[i] = cluster_membership_get_last_admitted_incarnation(i);
 		completion.result = qvotec_epoch_ballot_recover_head_fds(
-			qvotec_fds, qvotec_n_disks, GetSystemIdentifier(),
-			admitted_incarnations, completion.completion_value,
-			completion.completion_ballot,
+			qvotec_fds, qvotec_n_disks, GetSystemIdentifier(), admitted_incarnations,
+			completion.completion_value, completion.completion_ballot,
 			&completion.observed_disk_bitmap);
-		completion.actor_phase
-			= completion.result == CLUSTER_QVOTEC_MAILBOX_HOLD
-				  ? CLUSTER_QVOTEC_ACTOR_HOLD
-				  : CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
+		completion.actor_phase = completion.result == CLUSTER_QVOTEC_MAILBOX_HOLD
+									 ? CLUSTER_QVOTEC_ACTOR_HOLD
+									 : CLUSTER_QVOTEC_ACTOR_RECOVER_SCAN_B;
 	}
-	configured_disk_bitmap
-		= (uint8)((UINT32_C(1) << qvotec_n_disks) - UINT32_C(1));
-	(void)cluster_qvotec_mailbox_qvotec_complete(
-		&QvotecShmem->mailbox, configured_disk_bitmap, &completion);
+	configured_disk_bitmap = (uint8)((UINT32_C(1) << qvotec_n_disks) - UINT32_C(1));
+	(void)cluster_qvotec_mailbox_qvotec_complete(&QvotecShmem->mailbox, configured_disk_bitmap,
+												 &completion);
 }
 
 #ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
 extern ClusterSemanticActivationResult cluster_qvotec_test_semantic_activation_record_cas_write(
-	const int *fds, int n_disks, uint64 expected_generation,
-	uint64 expected_source_feature_bitmap,
+	const int *fds, int n_disks, uint64 expected_generation, uint64 expected_source_feature_bitmap,
 	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES]);
 extern ClusterSemanticActivationResult cluster_qvotec_test_semantic_activation_record_read(
-	const int *fds, int n_disks,
-	uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
+	const int *fds, int n_disks, uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
 	bool *implicit_open);
-extern bool cluster_qvotec_test_join_marker_ack_proven(
-	const int *fds, int n_disks, int32 target_node,
-	const uint8 *staged_slot, uint32 writes_ok);
+extern bool cluster_qvotec_test_join_marker_ack_proven(const int *fds, int n_disks,
+													   int32 target_node, const uint8 *staged_slot,
+													   uint32 writes_ok);
 extern bool cluster_qvotec_test_join_marker_verify_committed_closed(
 	const int *fds, int n_disks, int32 target_node,
 	uint8 verified_image96[CLUSTER_JCMK_REPLACEMENT_BYTES]);
-extern ClusterQvotecMailboxResult cluster_qvotec_test_epoch_ballot_recover_head(
-	const int *fds, int n_disks, uint64 system_identifier,
-	const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
-	uint8 out_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
-	uint8 out_ballot[CLUSTER_QVOTEC_BALLOT_BYTES],
-	uint8 *out_observed_disk_bitmap);
+extern ClusterQvotecMailboxResult
+cluster_qvotec_test_epoch_ballot_recover_head(const int *fds, int n_disks, uint64 system_identifier,
+											  const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
+											  uint8 out_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
+											  uint8 out_ballot[CLUSTER_QVOTEC_BALLOT_BYTES],
+											  uint8 *out_observed_disk_bitmap);
 extern bool cluster_qvotec_test_epoch_ballot_phase1_promise(
 	const int *fds, int n_disks, uint64 system_identifier,
-	const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
-	int32 proposer_node_id, const ClusterEpochBallotId *ballot,
-	uint8 *out_completed_disk_bitmap);
-extern bool cluster_qvotec_test_epoch_ballot_formation_attested(
-	const int *fds, int n_disks);
-extern bool cluster_qvotec_test_undo_root_descriptor_formation_attested(
-	const int *fds, int n_disks);
+	const uint64 admitted_incarnations[CLUSTER_MAX_NODES], int32 proposer_node_id,
+	const ClusterEpochBallotId *ballot, uint8 *out_completed_disk_bitmap);
+extern bool cluster_qvotec_test_epoch_ballot_formation_attested(const int *fds, int n_disks);
+extern bool cluster_qvotec_test_undo_root_descriptor_formation_attested(const int *fds,
+																		int n_disks);
 extern bool cluster_qvotec_test_undo_root_descriptor_provision(
 	const int *fds, int n_disks, uint64 system_identifier,
-	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint8 *out_completed_disk_bitmap);
-extern ClusterUndoRootDescriptorState
-cluster_qvotec_test_undo_root_descriptor_read(
-	const int *fds, int n_disks, uint64 system_identifier,
-	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
-	uint8 *out_observed_disk_bitmap);
+	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint8 *out_completed_disk_bitmap);
+extern ClusterUndoRootDescriptorState cluster_qvotec_test_undo_root_descriptor_read(
+	const int *fds, int n_disks, uint64 system_identifier, uint8 root_kind, int32 owner_node,
+	ClusterUndoRootDescriptorV1 *out, uint8 *out_observed_disk_bitmap);
 extern ClusterReplacementRequestSlotState
-cluster_qvotec_test_replacement_request_preserve(
-	ClusterVotingSlot *next, const ClusterVotingSlot *prior);
-extern long cluster_qvotec_test_poll_wait_timeout_ms(
-	uint64 elapsed_us, int poll_interval_ms);
+cluster_qvotec_test_replacement_request_preserve(ClusterVotingSlot *next,
+												 const ClusterVotingSlot *prior);
+extern long cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us, int poll_interval_ms);
 
 ClusterSemanticActivationResult
 cluster_qvotec_test_semantic_activation_record_cas_write(
-	const int *fds, int n_disks, uint64 expected_generation,
-	uint64 expected_source_feature_bitmap,
+	const int *fds, int n_disks, uint64 expected_generation, uint64 expected_source_feature_bitmap,
 	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES])
 {
 	return qvotec_semantic_activation_record_cas_write_fds(
@@ -2290,18 +2193,15 @@ cluster_qvotec_test_semantic_activation_record_cas_write(
 
 ClusterSemanticActivationResult
 cluster_qvotec_test_semantic_activation_record_read(
-	const int *fds, int n_disks,
-	uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
+	const int *fds, int n_disks, uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
 	bool *implicit_open)
 {
-	return qvotec_semantic_activation_record_read_fds(
-		fds, n_disks, selected_bytes, implicit_open);
+	return qvotec_semantic_activation_record_read_fds(fds, n_disks, selected_bytes, implicit_open);
 }
 
 bool
-cluster_qvotec_test_join_marker_ack_proven(
-	const int *fds, int n_disks, int32 target_node,
-	const uint8 *staged_slot, uint32 writes_ok)
+cluster_qvotec_test_join_marker_ack_proven(const int *fds, int n_disks, int32 target_node,
+										   const uint8 *staged_slot, uint32 writes_ok)
 {
 	bool write_succeeded[CLUSTER_MAX_VOTING_DISKS] = { false };
 	uint32 bounded_writes;
@@ -2312,8 +2212,8 @@ cluster_qvotec_test_join_marker_ack_proven(
 	bounded_writes = Min(writes_ok, (uint32)n_disks);
 	for (i = 0; i < bounded_writes; i++)
 		write_succeeded[i] = true;
-	return qvotec_join_marker_ack_proven_fds(
-		fds, n_disks, target_node, staged_slot, write_succeeded);
+	return qvotec_join_marker_ack_proven_fds(fds, n_disks, target_node, staged_slot,
+											 write_succeeded);
 }
 
 bool
@@ -2321,70 +2221,62 @@ cluster_qvotec_test_join_marker_verify_committed_closed(
 	const int *fds, int n_disks, int32 target_node,
 	uint8 verified_image96[CLUSTER_JCMK_REPLACEMENT_BYTES])
 {
-	return qvotec_join_marker_verify_committed_closed_fds(
-		fds, n_disks, target_node, verified_image96);
+	return qvotec_join_marker_verify_committed_closed_fds(fds, n_disks, target_node,
+														  verified_image96);
 }
 
 ClusterQvotecMailboxResult
-cluster_qvotec_test_epoch_ballot_recover_head(
-	const int *fds, int n_disks, uint64 system_identifier,
-	const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
-	uint8 out_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
-	uint8 out_ballot[CLUSTER_QVOTEC_BALLOT_BYTES],
-	uint8 *out_observed_disk_bitmap)
+cluster_qvotec_test_epoch_ballot_recover_head(const int *fds, int n_disks, uint64 system_identifier,
+											  const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
+											  uint8 out_value[CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES],
+											  uint8 out_ballot[CLUSTER_QVOTEC_BALLOT_BYTES],
+											  uint8 *out_observed_disk_bitmap)
 {
-	return qvotec_epoch_ballot_recover_head_fds(
-		fds, n_disks, system_identifier, admitted_incarnations,
-		out_value, out_ballot, out_observed_disk_bitmap);
+	return qvotec_epoch_ballot_recover_head_fds(fds, n_disks, system_identifier,
+												admitted_incarnations, out_value, out_ballot,
+												out_observed_disk_bitmap);
 }
 
 bool
 cluster_qvotec_test_epoch_ballot_phase1_promise(
 	const int *fds, int n_disks, uint64 system_identifier,
-	const uint64 admitted_incarnations[CLUSTER_MAX_NODES],
-	int32 proposer_node_id, const ClusterEpochBallotId *ballot,
-	uint8 *out_completed_disk_bitmap)
+	const uint64 admitted_incarnations[CLUSTER_MAX_NODES], int32 proposer_node_id,
+	const ClusterEpochBallotId *ballot, uint8 *out_completed_disk_bitmap)
 {
-	return qvotec_epoch_ballot_phase1_promise_fds(
-		fds, n_disks, system_identifier, admitted_incarnations,
-		proposer_node_id, ballot, out_completed_disk_bitmap);
+	return qvotec_epoch_ballot_phase1_promise_fds(fds, n_disks, system_identifier,
+												  admitted_incarnations, proposer_node_id, ballot,
+												  out_completed_disk_bitmap);
 }
 
 bool
-cluster_qvotec_test_epoch_ballot_formation_attested(
-	const int *fds, int n_disks)
+cluster_qvotec_test_epoch_ballot_formation_attested(const int *fds, int n_disks)
 {
 	return qvotec_epoch_ballot_formation_attested_fds(fds, n_disks);
 }
 
 bool
-cluster_qvotec_test_undo_root_descriptor_formation_attested(
-	const int *fds, int n_disks)
+cluster_qvotec_test_undo_root_descriptor_formation_attested(const int *fds, int n_disks)
 {
-	return qvotec_undo_root_descriptor_formation_attested_fds(
-		fds, n_disks);
+	return qvotec_undo_root_descriptor_formation_attested_fds(fds, n_disks);
 }
 
 bool
 cluster_qvotec_test_undo_root_descriptor_provision(
 	const int *fds, int n_disks, uint64 system_identifier,
-	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint8 *out_completed_disk_bitmap)
+	const uint8 desired[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES], uint8 *out_completed_disk_bitmap)
 {
-	return qvotec_undo_root_descriptor_provision_fds(
-		fds, n_disks, system_identifier, desired,
-		out_completed_disk_bitmap);
+	return qvotec_undo_root_descriptor_provision_fds(fds, n_disks, system_identifier, desired,
+													 out_completed_disk_bitmap);
 }
 
 ClusterUndoRootDescriptorState
-cluster_qvotec_test_undo_root_descriptor_read(
-	const int *fds, int n_disks, uint64 system_identifier,
-	uint8 root_kind, int32 owner_node, ClusterUndoRootDescriptorV1 *out,
-	uint8 *out_observed_disk_bitmap)
+cluster_qvotec_test_undo_root_descriptor_read(const int *fds, int n_disks, uint64 system_identifier,
+											  uint8 root_kind, int32 owner_node,
+											  ClusterUndoRootDescriptorV1 *out,
+											  uint8 *out_observed_disk_bitmap)
 {
-	return qvotec_undo_root_descriptor_read_fds(
-		fds, n_disks, system_identifier, root_kind, owner_node, out,
-		out_observed_disk_bitmap);
+	return qvotec_undo_root_descriptor_read_fds(fds, n_disks, system_identifier, root_kind,
+												owner_node, out, out_observed_disk_bitmap);
 }
 #endif
 
@@ -2414,25 +2306,22 @@ qvotec_close_disks_atexit(int code pg_attribute_unused(), Datum arg pg_attribute
  * over that disk.
  */
 static ClusterReplacementRequestSlotState
-qvotec_replacement_request_preserve(ClusterVotingSlot *next,
-									const ClusterVotingSlot *prior)
+qvotec_replacement_request_preserve(ClusterVotingSlot *next, const ClusterVotingSlot *prior)
 {
 	ClusterReplacementRequestSlotState state;
 
 	if (next == NULL || prior == NULL)
 		return CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD;
-	state = cluster_replacement_request_slot_state(
-		prior->flags, prior->_reserved1, (int32)next->node_id,
-		next->incarnation, NULL);
+	state = cluster_replacement_request_slot_state(prior->flags, prior->_reserved1,
+												   (int32)next->node_id, next->incarnation, NULL);
 	if (state == CLUSTER_REPLACEMENT_REQUEST_SLOT_VALID
-		&& (prior->node_id != next->node_id
-			|| prior->incarnation != next->incarnation))
+		&& (prior->node_id != next->node_id || prior->incarnation != next->incarnation))
 		return CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD;
 	if (state != CLUSTER_REPLACEMENT_REQUEST_SLOT_VALID)
 		return state;
-	return cluster_replacement_request_preserve_per_disk(
-		prior->flags, prior->_reserved1, (int32)next->node_id,
-		next->incarnation, &next->flags, next->_reserved1);
+	return cluster_replacement_request_preserve_per_disk(prior->flags, prior->_reserved1,
+														 (int32)next->node_id, next->incarnation,
+														 &next->flags, next->_reserved1);
 }
 
 #ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
@@ -2466,15 +2355,14 @@ cluster_qvotec_test_poll_pre_injection(void)
 }
 
 ClusterReplacementRequestSlotState
-cluster_qvotec_test_replacement_request_preserve(
-	ClusterVotingSlot *next, const ClusterVotingSlot *prior)
+cluster_qvotec_test_replacement_request_preserve(ClusterVotingSlot *next,
+												 const ClusterVotingSlot *prior)
 {
 	return qvotec_replacement_request_preserve(next, prior);
 }
 
 long
-cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us,
-									 int poll_interval_ms)
+cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us, int poll_interval_ms)
 {
 	return qvotec_poll_wait_timeout_ms(elapsed_us, poll_interval_ms);
 }
@@ -2572,8 +2460,7 @@ qvotec_clear_self_alive_on_clean_shutdown(void)
 		 */
 		blanked.flags = 0;
 		memset(blanked._reserved1, 0, sizeof(blanked._reserved1));
-		rrc = cluster_voting_disk_read_slot(
-			qvotec_fds[i], i, (uint32)cluster_node_id, &existing);
+		rrc = cluster_voting_disk_read_slot(qvotec_fds[i], i, (uint32)cluster_node_id, &existing);
 		if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
 			if (normal_stop)
 				qvotec_shutdown_failure(i, "QVOTEC_SELF_SLOT_READ", (int)rrc);
@@ -2588,8 +2475,7 @@ qvotec_clear_self_alive_on_clean_shutdown(void)
 			all_cleared = false;
 			continue;
 		}
-		cluster_removal_marker_preserve_per_disk(
-			blanked._reserved1, existing._reserved1);
+		cluster_removal_marker_preserve_per_disk(blanked._reserved1, existing._reserved1);
 		rplm_state = qvotec_replacement_request_preserve(&blanked, &existing);
 		if (rplm_state == CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD) {
 			if (normal_stop)
@@ -2781,8 +2667,7 @@ qvotec_build_baseline_marker(ClusterFenceMarker *out)
 		int f;
 
 		for (f = 0; f < CLUSTER_MAX_NODES; f++) {
-			uint64 departed_epoch
-				= cluster_reconfig_get_clean_departed_epoch(f);
+			uint64 departed_epoch = cluster_reconfig_get_clean_departed_epoch(f);
 
 			if (departed_epoch > floor_epoch)
 				floor_epoch = departed_epoch;
@@ -2944,55 +2829,45 @@ qvotec_poll_once(void)
 	ClusterAdgApplyMasterLease apply_lease_request;
 	ClusterAdgApplyMasterLeaseQuorum apply_lease_winner;
 	bool have_apply_lease_request;
-	ClusterFenceMarker baseline_marker; /* spec-4.12b D2 */
-	bool author_baseline = false;		/* spec-4.12b D2: wrote a baseline this cycle */
-	bool is_leader = false;				/* spec-4.12b D6: lowest-live baseline leader */
-	bool durable_has_authority = false; /* exact authority observed on disk THIS poll */
+	ClusterFenceMarker baseline_marker;			 /* spec-4.12b D2 */
+	bool author_baseline = false;				 /* spec-4.12b D2: wrote a baseline this cycle */
+	bool is_leader = false;						 /* spec-4.12b D6: lowest-live baseline leader */
+	bool durable_has_authority = false;			 /* exact authority observed on disk THIS poll */
 	ClusterFenceMarker durable_authority_marker; /* exact tuple observed this poll */
-	bool fence_majority_written = false; /* RF-ROOT P6: this poll's marker tuple
+	bool fence_majority_written = false;		 /* RF-ROOT P6: this poll's marker tuple
 										 * reached quorum-majority durability */
 
 	qvotec_diagnostic_phase_enter(QVOTEC_DIAG_SEMANTIC_MAILBOX);
-	if (cluster_semantic_activation_qvotec_poll_record_read(
-			&semantic_record_read_request)) {
+	if (cluster_semantic_activation_qvotec_poll_record_read(&semantic_record_read_request)) {
 		uint8 selected[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES];
 		bool implicit_open = false;
-		ClusterSemanticActivationResult result
-			= qvotec_semantic_activation_record_read_fds(
-				qvotec_fds, qvotec_n_disks, selected, &implicit_open);
+		ClusterSemanticActivationResult result = qvotec_semantic_activation_record_read_fds(
+			qvotec_fds, qvotec_n_disks, selected, &implicit_open);
 
 		(void)cluster_semantic_activation_qvotec_complete_record_read(
-			semantic_record_read_request.request_seq, result,
-			implicit_open, selected);
-	} else if (cluster_semantic_activation_qvotec_poll_record_cas(
-				   &semantic_record_cas_request)) {
+			semantic_record_read_request.request_seq, result, implicit_open, selected);
+	} else if (cluster_semantic_activation_qvotec_poll_record_cas(&semantic_record_cas_request)) {
 		ClusterSemanticActivationResult semantic_record_cas_result
 			= cluster_semantic_activation_record_cas_write(
 				semantic_record_cas_request.expected_generation,
 				semantic_record_cas_request.expected_source_feature_bitmap,
 				semantic_record_cas_request.desired_bytes);
 
-		(void) cluster_semantic_activation_qvotec_complete_record_cas(
-				semantic_record_cas_request.request_seq,
-				semantic_record_cas_result);
+		(void)cluster_semantic_activation_qvotec_complete_record_cas(
+			semantic_record_cas_request.request_seq, semantic_record_cas_result);
 	} else if (cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
 				   &undo_root_descriptor_read_request)) {
 		ClusterUndoRootDescriptorV1 descriptor;
 		uint8 selected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES] = { 0 };
 		uint8 observed_disk_bitmap = 0;
-		ClusterUndoRootDescriptorState state
-			= CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
+		ClusterUndoRootDescriptorState state = CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 
-		if (qvotec_undo_root_descriptor_formation_attested_fds(
-				qvotec_fds, qvotec_n_disks)) {
+		if (qvotec_undo_root_descriptor_formation_attested_fds(qvotec_fds, qvotec_n_disks)) {
 			state = qvotec_undo_root_descriptor_read_fds(
-				qvotec_fds, qvotec_n_disks,
-				undo_root_descriptor_read_request.system_identifier,
-				CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &descriptor,
-				&observed_disk_bitmap);
+				qvotec_fds, qvotec_n_disks, undo_root_descriptor_read_request.system_identifier,
+				CLUSTER_UNDO_ROOT_KIND_SHARED, -1, &descriptor, &observed_disk_bitmap);
 			if (state == CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
-				&& !cluster_undo_root_descriptor_encode(
-					&descriptor, selected))
+				&& !cluster_undo_root_descriptor_encode(&descriptor, selected))
 				state = CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 		}
 		(void)observed_disk_bitmap;
@@ -3002,13 +2877,11 @@ qvotec_poll_once(void)
 				   &undo_root_descriptor_request)) {
 		uint8 completed_disk_bitmap;
 		ClusterSemanticActivationResult result
-			= qvotec_undo_root_descriptor_formation_attested_fds(
-				  qvotec_fds, qvotec_n_disks)
-				  && qvotec_undo_root_descriptor_provision_fds(
-				  qvotec_fds, qvotec_n_disks,
-				  undo_root_descriptor_request.system_identifier,
-				  undo_root_descriptor_request.desired_bytes,
-				  &completed_disk_bitmap)
+			= qvotec_undo_root_descriptor_formation_attested_fds(qvotec_fds, qvotec_n_disks)
+					  && qvotec_undo_root_descriptor_provision_fds(
+						  qvotec_fds, qvotec_n_disks,
+						  undo_root_descriptor_request.system_identifier,
+						  undo_root_descriptor_request.desired_bytes, &completed_disk_bitmap)
 				  ? CLUSTER_SEMANTIC_ACTIVATION_OK
 				  : CLUSTER_SEMANTIC_ACTIVATION_QUORUM_HOLD;
 
@@ -3042,9 +2915,8 @@ qvotec_poll_once(void)
 	 * leave marker (this node's own slot) it is written to the JOINER's region-3
 	 * slot (join_target_node) on every disk in the same write loop below and acked
 	 * majority-durable. */
-	have_join_submit
-		= cluster_reconfig_join_qvotec_poll_pending(
-			&join_marker_operation, &join_target_node, join_marker_slot);
+	have_join_submit = cluster_reconfig_join_qvotec_poll_pending(
+		&join_marker_operation, &join_target_node, join_marker_slot);
 
 	/* RF-ROOT P9 verification (cold-formation cold-formation ruling): pick
 	 * up a pending cold-formation marker submit.  The arbiter LMON staged a
@@ -3052,8 +2924,7 @@ qvotec_poll_once(void)
 	 * every target member's region-7 slot on every disk and ACKs only on a
 	 * majority write + majority exact readback. */
 	have_formation_marker_submit
-		= cluster_reconfig_formation_qvotec_poll_pending(
-			&formation_marker_request);
+		= cluster_reconfig_formation_qvotec_poll_pending(&formation_marker_request);
 
 	/* spec-5.18 §2.5: pick up a pending removal-marker submit too.  It rides THIS
 	 * node's own self-slot _reserved1[64..] (right after the 4.12 fence marker),
@@ -3078,8 +2949,8 @@ qvotec_poll_once(void)
 		if (have_leave_submit)
 			cluster_clean_leave_qvotec_complete(false); /* no disk -> no majority */
 		if (have_join_submit)
-			cluster_reconfig_join_qvotec_complete(
-				join_marker_operation, false, NULL); /* no disk -> no majority */
+			cluster_reconfig_join_qvotec_complete(join_marker_operation, false,
+												  NULL); /* no disk -> no majority */
 		if (have_formation_marker_submit)
 			cluster_reconfig_formation_qvotec_complete(false); /* no disk */
 		if (have_removal_submit)
@@ -3091,16 +2962,14 @@ qvotec_poll_once(void)
 	}
 
 	if (have_join_submit
-		&& join_marker_operation
-			   == CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED) {
+		&& join_marker_operation == CLUSTER_JOIN_MARKER_MAILBOX_VERIFY_COMMITTED_CLOSED) {
 		uint8 verified_image[CLUSTER_JCMK_REPLACEMENT_BYTES];
 		bool verified;
 
-		verified = qvotec_join_marker_verify_committed_closed_fds(
-			qvotec_fds, qvotec_n_disks, join_target_node, verified_image);
-		cluster_reconfig_join_qvotec_complete(
-			join_marker_operation, verified,
-			verified ? verified_image : NULL);
+		verified = qvotec_join_marker_verify_committed_closed_fds(qvotec_fds, qvotec_n_disks,
+																  join_target_node, verified_image);
+		cluster_reconfig_join_qvotec_complete(join_marker_operation, verified,
+											  verified ? verified_image : NULL);
 		have_join_submit = false;
 	}
 
@@ -3114,8 +2983,8 @@ qvotec_poll_once(void)
 		if (have_leave_submit)
 			cluster_clean_leave_qvotec_complete(false); /* cannot author self slot */
 		if (have_join_submit)
-			cluster_reconfig_join_qvotec_complete(
-				join_marker_operation, false, NULL); /* cannot author self slot */
+			cluster_reconfig_join_qvotec_complete(join_marker_operation, false,
+												  NULL); /* cannot author self slot */
 		if (have_removal_submit)
 			cluster_node_remove_qvotec_complete(false); /* cannot author self slot */
 		if (have_apply_lease_request)
@@ -3166,8 +3035,7 @@ qvotec_poll_once(void)
 			ClusterVotingDiskIoState rrc;
 
 			rrc = cluster_voting_disk_read_slot(qvotec_fds[i], i, node, cell);
-			if (node == (uint32)cluster_node_id
-				&& rrc == CLUSTER_VOTING_DISK_IO_OK)
+			if (node == (uint32)cluster_node_id && rrc == CLUSTER_VOTING_DISK_IO_OK)
 				own_prior_read_ok[i] = true;
 			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
 				/* Per-slot miss is no-data;whole-disk failure only
@@ -3271,8 +3139,8 @@ qvotec_poll_once(void)
 		int d;
 		int win;
 
-		(void)cluster_reconfig_qvotec_observe_replacement_admitted(
-			qvotec_fds, qvotec_n_disks, qvotec_self_incarnation);
+		(void)cluster_reconfig_qvotec_observe_replacement_admitted(qvotec_fds, qvotec_n_disks,
+																   qvotec_self_incarnation);
 
 		for (d = 0; d < qvotec_n_disks; d++) {
 			union {
@@ -3528,8 +3396,7 @@ qvotec_poll_once(void)
 		 * withheld and counted failed below.
 		 */
 		if (own_prior_read_ok[i])
-			rplm_state
-				= qvotec_replacement_request_preserve(&self_slot, own_prior);
+			rplm_state = qvotec_replacement_request_preserve(&self_slot, own_prior);
 		else
 			rplm_state = CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD;
 
@@ -3584,7 +3451,7 @@ qvotec_poll_once(void)
 		 */
 		if (have_join_submit && join_target_node >= 0
 			&& cluster_voting_disk_write_join_slot(qvotec_fds[i], (uint32)join_target_node,
-											   join_marker_slot)
+												   join_marker_slot)
 				   == CLUSTER_VOTING_DISK_IO_OK)
 			join_disk_write_succeeded[i] = true;
 
@@ -3593,18 +3460,15 @@ qvotec_poll_once(void)
 		 * write the staged cold-formation marker into EVERY target member's
 		 * region-7 slot on this disk (the JCMK coordinator-write pattern).
 		 */
-		if (have_formation_marker_submit)
-		{
-			int			tm;
+		if (have_formation_marker_submit) {
+			int tm;
 
-			for (tm = 0; tm < CLUSTER_MAX_NODES; tm++)
-			{
-				if ((formation_marker_request.target_members[tm / 8]
-					 & (uint8) (1u << (tm % 8))) == 0)
+			for (tm = 0; tm < CLUSTER_MAX_NODES; tm++) {
+				if ((formation_marker_request.target_members[tm / 8] & (uint8)(1u << (tm % 8)))
+					== 0)
 					continue;
-				(void) cluster_voting_disk_write_formation_slot(
-					qvotec_fds[i], (uint32) tm,
-					formation_marker_request.marker_bytes);
+				(void)cluster_voting_disk_write_formation_slot(
+					qvotec_fds[i], (uint32)tm, formation_marker_request.marker_bytes);
 			}
 		}
 	}
@@ -3673,47 +3537,40 @@ qvotec_poll_once(void)
 
 		/* spec-5.15 §2.6: ACK only after a strict majority of the same
 		 * disks complete write + durability + exact region-3 readback. */
-	if (have_join_submit)
-	{
-		bool proven;
+		if (have_join_submit) {
+			bool proven;
 
-		proven = qvotec_join_marker_ack_proven_fds(
-			qvotec_fds, qvotec_n_disks, join_target_node,
-			join_marker_slot, join_disk_write_succeeded);
-		cluster_reconfig_join_qvotec_complete(
-			join_marker_operation, proven, NULL);
-	}
+			proven = qvotec_join_marker_ack_proven_fds(qvotec_fds, qvotec_n_disks, join_target_node,
+													   join_marker_slot, join_disk_write_succeeded);
+			cluster_reconfig_join_qvotec_complete(join_marker_operation, proven, NULL);
+		}
 
 		/* RF-ROOT P9 verification (cold-formation cold-formation ruling):
 		 * ACK the cold-formation marker submit only when EVERY target
 		 * member's region-7 slot carries the EXACT image on a strict
 		 * majority of disks (write + readback). */
-		if (have_formation_marker_submit)
-		{
-			bool		proven = true;
-			int			tm;
+		if (have_formation_marker_submit) {
+			bool proven = true;
+			int tm;
 
-			for (tm = 0; tm < CLUSTER_MAX_NODES && proven; tm++)
-			{
-				uint32		exact = 0;
-				int			d;
+			for (tm = 0; tm < CLUSTER_MAX_NODES && proven; tm++) {
+				uint32 exact = 0;
+				int d;
 
-				if ((formation_marker_request.target_members[tm / 8]
-					 & (uint8) (1u << (tm % 8))) == 0)
+				if ((formation_marker_request.target_members[tm / 8] & (uint8)(1u << (tm % 8)))
+					== 0)
 					continue;
-				for (d = 0; d < qvotec_n_disks; d++)
-				{
-					uint8		reread[CLUSTER_VOTING_SLOT_BYTES];
+				for (d = 0; d < qvotec_n_disks; d++) {
+					uint8 reread[CLUSTER_VOTING_SLOT_BYTES];
 
-					if (cluster_voting_disk_read_formation_slot(
-							qvotec_fds[d], (uint32) tm, reread)
+					if (cluster_voting_disk_read_formation_slot(qvotec_fds[d], (uint32)tm, reread)
 							== CLUSTER_VOTING_DISK_IO_OK
-						&& memcmp(reread,
-								  formation_marker_request.marker_bytes,
-								  CLUSTER_VOTING_SLOT_BYTES) == 0)
+						&& memcmp(reread, formation_marker_request.marker_bytes,
+								  CLUSTER_VOTING_SLOT_BYTES)
+							   == 0)
 						exact++;
 				}
-				if (exact < (uint32) qvotec_n_disks / 2u + 1u)
+				if (exact < (uint32)qvotec_n_disks / 2u + 1u)
 					proven = false;
 			}
 			cluster_reconfig_formation_qvotec_complete(proven);
@@ -3803,51 +3660,43 @@ qvotec_poll_once(void)
 	 * published for the cold-formation admission; otherwise the observation
 	 * is cleared (fail-closed: no marker, no admission). */
 	{
-		uint8		images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_VOTING_SLOT_BYTES];
-		bool		valid[CLUSTER_MAX_VOTING_DISKS];
-		int			selected = -1;
-		uint32		majority = (uint32) qvotec_n_disks / 2u + 1u;
-		int			d;
+		uint8 images[CLUSTER_MAX_VOTING_DISKS][CLUSTER_VOTING_SLOT_BYTES];
+		bool valid[CLUSTER_MAX_VOTING_DISKS];
+		int selected = -1;
+		uint32 majority = (uint32)qvotec_n_disks / 2u + 1u;
+		int d;
 
 		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_FORMATION);
 		memset(valid, 0, sizeof(valid));
-		for (d = 0; d < qvotec_n_disks; d++)
-		{
-			if (cluster_voting_disk_read_formation_slot(
-					qvotec_fds[d], (uint32) cluster_node_id, images[d])
-					== CLUSTER_VOTING_DISK_IO_OK)
-			{
+		for (d = 0; d < qvotec_n_disks; d++) {
+			if (cluster_voting_disk_read_formation_slot(qvotec_fds[d], (uint32)cluster_node_id,
+														images[d])
+				== CLUSTER_VOTING_DISK_IO_OK) {
 				ClusterFormationCommitMarker dec;
 
 				if (cluster_formation_marker_validate(images[d], &dec, NULL))
 					valid[d] = true;
 			}
 		}
-		for (d = 0; d < qvotec_n_disks && selected < 0; d++)
-		{
-			uint32		same = 0;
-			int			e;
+		for (d = 0; d < qvotec_n_disks && selected < 0; d++) {
+			uint32 same = 0;
+			int e;
 
 			if (!valid[d])
 				continue;
 			for (e = 0; e < qvotec_n_disks; e++)
-				if (valid[e]
-					&& memcmp(images[d], images[e], CLUSTER_VOTING_SLOT_BYTES) == 0)
+				if (valid[e] && memcmp(images[d], images[e], CLUSTER_VOTING_SLOT_BYTES) == 0)
 					same++;
 			if (same >= majority)
 				selected = d;
 		}
-		if (selected >= 0)
-		{
+		if (selected >= 0) {
 			ClusterFormationCommitMarker dec;
-			uint64		incarnation_by_node[CLUSTER_MAX_NODES];
+			uint64 incarnation_by_node[CLUSTER_MAX_NODES];
 
-			if (cluster_formation_marker_decode(
-					images[selected], &dec, incarnation_by_node))
-				cluster_reconfig_formation_qvotec_publish_observed(
-					&dec, incarnation_by_node);
-		}
-		else
+			if (cluster_formation_marker_decode(images[selected], &dec, incarnation_by_node))
+				cluster_reconfig_formation_qvotec_publish_observed(&dec, incarnation_by_node);
+		} else
 			cluster_reconfig_formation_qvotec_clear_observed();
 	}
 
@@ -3875,7 +3724,7 @@ qvotec_poll_once(void)
 			uint64 best_gen = 0;
 			uint64 best_incarnation = 0;
 			uint64 best_epoch = 0;
-			bool	fresh;
+			bool fresh;
 
 			for (i = 0; i < qvotec_n_disks; i++) {
 				ClusterVotingSlot *cell = &qvotec_slot_matrix[i * CLUSTER_MAX_NODES + node];
@@ -3886,14 +3735,13 @@ qvotec_poll_once(void)
 					best_epoch = cell->current_epoch;
 				}
 			}
-			cluster_reconfig_record_observed_slot((int32)node, best_incarnation,
-												  best_gen, best_epoch);
-			fresh = (decision.alive_bitmap[node / 8]
-					 & (uint8) (1u << (node % 8))) != 0;
+			cluster_reconfig_record_observed_slot((int32)node, best_incarnation, best_gen,
+												  best_epoch);
+			fresh = (decision.alive_bitmap[node / 8] & (uint8)(1u << (node % 8))) != 0;
 			cluster_reconfig_record_observed_fresh_alive((int32)node, fresh);
 		}
-		cluster_reconfig_bootstrap_publish_in_quorum(
-			decision.quorum_state == CLUSTER_QVOTEC_QUORUM_OK);
+		cluster_reconfig_bootstrap_publish_in_quorum(decision.quorum_state
+													 == CLUSTER_QVOTEC_QUORUM_OK);
 		cluster_reconfig_bootstrap_publish_end();
 	}
 }
@@ -4032,9 +3880,8 @@ ClusterQvotecMain(void)
 
 	/* spec-5.15A §2.4.1: start-current invalidates both volatile
 	 * completions under the reconfig lock before any latch is published. */
-	if (!cluster_reconfig_qvotec_lifecycle_transition(
-			&QvotecShmem->mailbox, &QvotecShmem->state,
-			CLUSTER_QVOTEC_STARTING))
+	if (!cluster_reconfig_qvotec_lifecycle_transition(&QvotecShmem->mailbox, &QvotecShmem->state,
+													  CLUSTER_QVOTEC_STARTING))
 		ereport(FATAL, (errmsg("qvotec could not establish STARTING lifecycle cut")));
 
 	/*
@@ -4111,23 +3958,19 @@ ClusterQvotecMain(void)
 	 * formation commits its CURRENT boot incarnations (a new postmaster
 	 * never resumes a previous marker's incarnation). */
 	{
-		uint64		max_generation = 0;
-		int			n;
+		uint64 max_generation = 0;
+		int n;
 
-		for (n = 0; n < CLUSTER_MAX_NODES; n++)
-		{
-			int			d;
+		for (n = 0; n < CLUSTER_MAX_NODES; n++) {
+			int d;
 
-			for (d = 0; d < qvotec_n_disks; d++)
-			{
-				uint8		slot_bytes[CLUSTER_VOTING_SLOT_BYTES];
+			for (d = 0; d < qvotec_n_disks; d++) {
+				uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES];
 				ClusterFormationCommitMarker dec;
 
-				if (cluster_voting_disk_read_formation_slot(
-						qvotec_fds[d], (uint32) n, slot_bytes)
+				if (cluster_voting_disk_read_formation_slot(qvotec_fds[d], (uint32)n, slot_bytes)
 						== CLUSTER_VOTING_DISK_IO_OK
-					&& cluster_formation_marker_validate(
-						slot_bytes, &dec, NULL)
+					&& cluster_formation_marker_validate(slot_bytes, &dec, NULL)
 					&& dec.formation_generation > max_generation)
 					max_generation = dec.formation_generation;
 			}
@@ -4242,9 +4085,8 @@ ClusterQvotecMain(void)
 		}
 	}
 
-	if (!cluster_reconfig_qvotec_lifecycle_transition(
-			&QvotecShmem->mailbox, &QvotecShmem->state,
-			CLUSTER_QVOTEC_READY))
+	if (!cluster_reconfig_qvotec_lifecycle_transition(&QvotecShmem->mailbox, &QvotecShmem->state,
+													  CLUSTER_QVOTEC_READY))
 		ereport(FATAL, (errmsg("qvotec could not publish READY lifecycle cut")));
 
 	for (;;) {
@@ -4273,10 +4115,8 @@ ClusterQvotecMain(void)
 		if (ShutdownRequestPending
 			|| pg_atomic_read_u32(&QvotecShmem->state) == CLUSTER_QVOTEC_SHUTTING_DOWN) {
 			if (!cluster_reconfig_qvotec_lifecycle_transition(
-					&QvotecShmem->mailbox, &QvotecShmem->state,
-					CLUSTER_QVOTEC_SHUTTING_DOWN))
-				ereport(FATAL,
-						(errmsg("qvotec could not publish SHUTTING_DOWN lifecycle cut")));
+					&QvotecShmem->mailbox, &QvotecShmem->state, CLUSTER_QVOTEC_SHUTTING_DOWN))
+				ereport(FATAL, (errmsg("qvotec could not publish SHUTTING_DOWN lifecycle cut")));
 			break;
 		}
 
@@ -4298,9 +4138,8 @@ ClusterQvotecMain(void)
 		pg_atomic_fetch_add_u32(&QvotecShmem->poll_cycle_count, 1);
 		cluster_pgstat_inc(qvotec_counter_poll_cycle);
 
-		timeout_ms = qvotec_poll_wait_timeout_ms(
-			INSTR_TIME_GET_MICROSEC(cycle_finished),
-			cluster_quorum_poll_interval_ms);
+		timeout_ms = qvotec_poll_wait_timeout_ms(INSTR_TIME_GET_MICROSEC(cycle_finished),
+												 cluster_quorum_poll_interval_ms);
 
 		qvotec_diagnostic_phase_enter(QVOTEC_DIAG_IDLE);
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
@@ -4319,9 +4158,8 @@ ClusterQvotecMain(void)
 	if (!qvotec_clear_self_alive_on_clean_shutdown())
 		ereport(FATAL, (errmsg("qvotec could not complete normal shutdown self-slot clear")));
 	qvotec_close_disks();
-	if (!cluster_reconfig_qvotec_lifecycle_transition(
-			&QvotecShmem->mailbox, &QvotecShmem->state,
-			CLUSTER_QVOTEC_DOWN))
+	if (!cluster_reconfig_qvotec_lifecycle_transition(&QvotecShmem->mailbox, &QvotecShmem->state,
+													  CLUSTER_QVOTEC_DOWN))
 		ereport(FATAL, (errmsg("qvotec could not publish DOWN lifecycle cut")));
 
 	proc_exit(0);
@@ -4365,9 +4203,8 @@ cluster_qvotec_request_shutdown(void)
 	if (QvotecShmem == NULL)
 		return;
 
-	(void)cluster_reconfig_qvotec_lifecycle_transition(
-		&QvotecShmem->mailbox, &QvotecShmem->state,
-		CLUSTER_QVOTEC_SHUTTING_DOWN);
+	(void)cluster_reconfig_qvotec_lifecycle_transition(&QvotecShmem->mailbox, &QvotecShmem->state,
+													   CLUSTER_QVOTEC_SHUTTING_DOWN);
 }
 
 

@@ -428,8 +428,7 @@ cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key, uint32 reply_opcode,
 }
 
 GesReplyWaitPollResult
-cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key,
-									GesReplyWaitVerdict *verdict_out)
+cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key, GesReplyWaitVerdict *verdict_out)
 {
 	GesReplyWaitEntry *entry;
 	GesReplyWaitVerdict verdict;
@@ -470,14 +469,12 @@ cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key,
 }
 
 bool
-cluster_ges_reply_wait_sleep_exact(const GesReplyWaitKey *key, long timeout_ms,
-								   uint32 wait_event)
+cluster_ges_reply_wait_sleep_exact(const GesReplyWaitKey *key, long timeout_ms, uint32 wait_event)
 {
 	GesReplyWaitEntry *entry;
 	bool ready;
 
-	if (key == NULL || timeout_ms <= 0 || reply_wait_state == NULL
-		|| reply_wait_htab == NULL)
+	if (key == NULL || timeout_ms <= 0 || reply_wait_state == NULL || reply_wait_htab == NULL)
 		return false;
 
 	/*

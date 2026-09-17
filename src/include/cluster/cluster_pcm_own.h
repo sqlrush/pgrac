@@ -65,9 +65,9 @@ typedef struct ClusterPcmOwnEntry {
 	pg_atomic_uint64 reservation_token;		  /* monotone; active iff a transient flag is set */
 	pg_atomic_uint64 writer_activation_token; /* committed X not yet activated under content X */
 	pg_atomic_uint64 resource_x_activation_generation; /* target T2 bound, T3 not yet open */
-	pg_atomic_uint32 flags;					  /* PCM_OWN_FLAG_* */
-	uint32 _pad;							  /* keep naturally aligned */
-	pg_atomic_uint64 delivery_attempt;		  /* non-authoritative target residency hold */
+	pg_atomic_uint32 flags;							   /* PCM_OWN_FLAG_* */
+	uint32 _pad;									   /* keep naturally aligned */
+	pg_atomic_uint64 delivery_attempt;				   /* non-authoritative target residency hold */
 } ClusterPcmOwnEntry;
 
 StaticAssertDecl(sizeof(ClusterPcmOwnEntry) == 48, "ClusterPcmOwnEntry must remain 48 bytes");
@@ -147,24 +147,27 @@ cluster_pcm_own_writer_grant_commit_exact(int buf_id, uint64 expected_generation
 /* Clear only the exact committed generation/token after content-EXCLUSIVE
  * activation proof or after exact queue-claim cleanup. */
 extern ClusterPcmOwnResult cluster_pcm_own_writer_activation_clear_exact(int buf_id,
-														 uint64 expected_generation,
-														 uint64 reservation_token);
+																		 uint64 expected_generation,
+																		 uint64 reservation_token);
 /* Resource-X T2 binds its acquisition generation only while the exact writer
  * fence is closed.  Normal T3 clears the generation first and the writer
  * token second.  Generic legacy clear is forbidden while this binding lives. */
-extern ClusterPcmOwnResult cluster_pcm_own_resource_x_activation_bind_exact(
-	int buf_id, uint64 expected_generation, uint64 reservation_token,
-	uint64 acquisition_generation);
-extern ClusterPcmOwnResult cluster_pcm_own_resource_x_activation_clear_exact(
-	int buf_id, uint64 expected_generation, uint64 reservation_token,
-	uint64 acquisition_generation);
+extern ClusterPcmOwnResult
+cluster_pcm_own_resource_x_activation_bind_exact(int buf_id, uint64 expected_generation,
+												 uint64 reservation_token,
+												 uint64 acquisition_generation);
+extern ClusterPcmOwnResult
+cluster_pcm_own_resource_x_activation_clear_exact(int buf_id, uint64 expected_generation,
+												  uint64 reservation_token,
+												  uint64 acquisition_generation);
 /* R8 recovery-owner clear: unlike normal T3, this advances the descriptor
  * ownership generation while clearing both activation fields.  The bufmgr
  * caller changes the descriptor to a non-writable N+PI shape under the same
  * header-lock hold. */
-extern ClusterPcmOwnResult cluster_pcm_own_resource_x_neutralize_exact(
-	int buf_id, uint64 expected_generation, uint64 reservation_token,
-	uint64 acquisition_generation, uint64 *out_neutral_generation);
+extern ClusterPcmOwnResult
+cluster_pcm_own_resource_x_neutralize_exact(int buf_id, uint64 expected_generation,
+											uint64 reservation_token, uint64 acquisition_generation,
+											uint64 *out_neutral_generation);
 /* PCM-X retained-image revoke: commit advances the ownership generation but
  * deliberately leaves the exact REVOKING token live until DRAIN proves the
  * immutable image record is no longer needed.  Release clears only that

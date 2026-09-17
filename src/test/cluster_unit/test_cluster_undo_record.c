@@ -1309,7 +1309,7 @@ UT_TEST(test_full_undo_pool_selects_exact_recyclable_supply_without_rewrite)
 UT_TEST(test_allocated_nonempty_tt_is_not_fresh_supply)
 {
 	ClusterUndoSegmentExtendPlan plan;
-	TTSlot old_slot = {0};
+	TTSlot old_slot = { 0 };
 	TTSlot observed;
 	char path[MAXPGPATH];
 	int fd;
@@ -1325,13 +1325,15 @@ UT_TEST(test_allocated_nonempty_tt_is_not_fresh_supply)
 	fd = open(path, O_RDWR);
 	UT_ASSERT(fd >= 0);
 	if (fd >= 0) {
-		UT_ASSERT_EQ(pwrite(fd, &old_slot, sizeof(old_slot),
-			offsetof(UndoSegmentHeaderData, tt_slots)), sizeof(old_slot));
+		UT_ASSERT_EQ(
+			pwrite(fd, &old_slot, sizeof(old_slot), offsetof(UndoSegmentHeaderData, tt_slots)),
+			sizeof(old_slot));
 		UT_ASSERT(cluster_undo_segment_extend_or_create(1, &plan));
 		UT_ASSERT_EQ(plan.segment_id, 2);
 		UT_ASSERT(!plan.needs_reuse);
-		UT_ASSERT_EQ(pread(fd, &observed, sizeof(observed),
-			offsetof(UndoSegmentHeaderData, tt_slots)), sizeof(observed));
+		UT_ASSERT_EQ(
+			pread(fd, &observed, sizeof(observed), offsetof(UndoSegmentHeaderData, tt_slots)),
+			sizeof(observed));
 		UT_ASSERT_EQ(memcmp(&observed, &old_slot, sizeof(old_slot)), 0);
 		close(fd);
 	}
@@ -2950,10 +2952,11 @@ UT_TEST(test_update_toast_releases_outer_receipt_before_nested_producers)
 UT_TEST(test_update_itl_wait_returns_through_receipt_and_page_requalification)
 {
 	char *source = read_heapam_source();
-	char *compact = malloc(strlen(source) + 1);
+	char *compact = source != NULL ? malloc(strlen(source) + 1) : NULL;
 	char *write = compact;
 	const char *read;
-	char *update = strstr(source, "\nheap_update(Relation ");
+	char *update = source != NULL ? strstr(source, "\nheap_update(Relation ") : NULL;
+	char *update_end = update != NULL ? strstr(update, "\n}\n") : NULL;
 	char *deadline = update ? strstr(update, "itl_capacity_absolute_deadline_us = 0;") : NULL;
 	char *wait = update ? strstr(update, "\nl_pgrac_itl_capacity_wait:") : NULL;
 	char *old_full = update ? strstr(update, "itl_capacity_wait_buffer = buffer;") : NULL;
@@ -2964,7 +2967,14 @@ UT_TEST(test_update_itl_wait_returns_through_receipt_and_page_requalification)
 	char *same_page = receipt ? strstr(receipt, "goto l2;") : NULL;
 
 	/* This is an adjacency contract, not a clang-format indentation contract. */
+	UT_ASSERT_NOT_NULL(source);
 	UT_ASSERT_NOT_NULL(compact);
+	UT_ASSERT_NOT_NULL(update_end);
+	if (compact == NULL || update_end == NULL) {
+		free(compact);
+		free(source);
+		return;
+	}
 	for (read = source; *read; read++)
 		if (!isspace((unsigned char)*read))
 			*write++ = *read;
@@ -2980,8 +2990,11 @@ UT_TEST(test_update_itl_wait_returns_through_receipt_and_page_requalification)
 	UT_ASSERT_NOT_NULL(receipt);
 	UT_ASSERT_NOT_NULL(reacquire);
 	UT_ASSERT_NOT_NULL(same_page);
-	if (deadline && wait)
-		UT_ASSERT(strstr(deadline + 1, "itl_capacity_absolute_deadline_us = 0;") == NULL);
+	if (deadline && wait) {
+		const char *next_deadline = strstr(deadline + 1, "itl_capacity_absolute_deadline_us = 0;");
+		UT_ASSERT(deadline < update_end && wait < update_end);
+		UT_ASSERT(next_deadline == NULL || next_deadline > update_end);
+	}
 	free(compact);
 	free(source);
 }

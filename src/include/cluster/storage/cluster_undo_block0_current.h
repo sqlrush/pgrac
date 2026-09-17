@@ -112,93 +112,79 @@ extern void cluster_undo_block0_current_ensure_exit_hooks(void);
 extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin(
 	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode, int timeout_ms,
 	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
-extern ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_acquire_begin_admitted(
-	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode,
-	int timeout_ms, const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
-extern ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_acquire_begin_ctrc_release(
+extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin_admitted(
+	const ClusterUndoBlock0LogicalKey *key, ClusterUndoBlock0CurrentMode mode, int timeout_ms,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	ClusterUndoBlock0Result *failure);
+extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin_ctrc_release(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
-extern ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_acquire_begin_live_owner_source(
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	ClusterUndoBlock0Result *failure);
+extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin_live_owner_source(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
-extern ClusterUndoBlock0CurrentStep
-cluster_undo_block0_current_acquire_begin_live_owner_target(
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	ClusterUndoBlock0Result *failure);
+extern ClusterUndoBlock0CurrentStep cluster_undo_block0_current_acquire_begin_live_owner_target(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard, ClusterUndoBlock0Result *failure);
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	ClusterUndoBlock0Result *failure);
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_acquire_poll(ClusterUndoBlock0CurrentGuard *guard,
-										ClusterUndoBlock0Result *failure);
+										 ClusterUndoBlock0Result *failure);
 extern bool cluster_undo_block0_current_wait_reply(ClusterUndoBlock0CurrentGuard *guard,
 												   ClusterUndoBlock0ReplyWaitSite site);
 extern void cluster_undo_block0_current_cancel(ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_release_begin(ClusterUndoBlock0CurrentGuard *guard,
-										ClusterUndoBlock0Result *failure);
+										  ClusterUndoBlock0Result *failure);
 extern ClusterUndoBlock0CurrentStep
 cluster_undo_block0_current_release_poll(ClusterUndoBlock0CurrentGuard *guard,
-									   ClusterUndoBlock0Result *failure);
+										 ClusterUndoBlock0Result *failure);
 
-extern ClusterUndoBlock0Result cluster_undo_block0_current_sample_generation(
-	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterUndoBlock0Generation *observed);
-extern ClusterUndoBlock0Result cluster_undo_block0_current_sample_generation_exclusive(
-	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterUndoBlock0Generation *observed);
 extern ClusterUndoBlock0Result
-cluster_undo_block0_current_prove_strict_empty_exclusive(
-	ClusterUndoBlock0CurrentGuard *guard);
+cluster_undo_block0_current_sample_generation(ClusterUndoBlock0CurrentGuard *guard,
+											  const ClusterUndoBlock0ResolvedRoot *root,
+											  ClusterUndoBlock0Generation *observed);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_sample_generation_exclusive(ClusterUndoBlock0CurrentGuard *guard,
+														const ClusterUndoBlock0ResolvedRoot *root,
+														ClusterUndoBlock0Generation *observed);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_prove_strict_empty_exclusive(ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0Result cluster_undo_block0_current_copy_resident(
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
 	const ClusterUndoBlock0Generation *expected, char private_page[BLCKSZ]);
 extern ClusterUndoBlock0Result cluster_undo_block0_current_pin_exclusive(
 	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
 	const ClusterUndoBlock0Generation *expected, ClusterUndoBlock0Pin *pin, char **page);
-extern ClusterUndoBlock0Result cluster_undo_block0_current_recheck_exclusive(
-	ClusterUndoBlock0CurrentGuard *guard);
+extern ClusterUndoBlock0Result
+cluster_undo_block0_current_recheck_exclusive(ClusterUndoBlock0CurrentGuard *guard);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_provision(const ClusterUndoBlock0LogicalKey *key,
 												 int timeout_ms);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_current_live_owner_ensure_resident(const ClusterUndoBlock0LogicalKey *key,
 													   int timeout_ms);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_current_live_owner_ensure_resident_exact(
+extern ClusterUndoBlock0Result cluster_undo_block0_current_live_owner_ensure_resident_exact(
 	const ClusterUndoBlock0LogicalKey *key, int timeout_ms,
 	ClusterUndoBlock0LiveOwnerPublication *publication);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_current_live_owner_reuse_exact(
-	const ClusterUndoBlock0LogicalKey *key,
-	const ClusterUndoBlock0Generation *expected,
+extern ClusterUndoBlock0Result cluster_undo_block0_current_live_owner_reuse_exact(
+	const ClusterUndoBlock0LogicalKey *key, const ClusterUndoBlock0Generation *expected,
 	const char successor_page[BLCKSZ], int timeout_ms);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_current_live_owner_mutate_exact(
-	const ClusterUndoBlock0LogicalKey *key,
-	const ClusterUndoBlock0Generation *expected,
-	const char predecessor_page[BLCKSZ],
-	const char successor_page[BLCKSZ], int timeout_ms);
-extern ClusterUndoBlock0RecycleResult
-cluster_undo_block0_current_live_owner_recycle_exact(
-	const ClusterUndoBlock0LogicalKey *key, SCN horizon,
-	uint64 expected_epoch, int timeout_ms);
+extern ClusterUndoBlock0Result cluster_undo_block0_current_live_owner_mutate_exact(
+	const ClusterUndoBlock0LogicalKey *key, const ClusterUndoBlock0Generation *expected,
+	const char predecessor_page[BLCKSZ], const char successor_page[BLCKSZ], int timeout_ms);
+extern ClusterUndoBlock0RecycleResult cluster_undo_block0_current_live_owner_recycle_exact(
+	const ClusterUndoBlock0LogicalKey *key, SCN horizon, uint64 expected_epoch, int timeout_ms);
 extern bool cluster_undo_block0_current_live_owner_publication_recheck(
 	const ClusterUndoBlock0LiveOwnerPublication *publication);
-extern bool
-cluster_undo_block0_current_live_owner_publication_recheck_conditional(
+extern bool cluster_undo_block0_current_live_owner_publication_recheck_conditional(
 	const ClusterUndoBlock0LiveOwnerPublication *publication);
 
 /* Target Startup's sole no-live-GES lane.  READY publication additionally
  * revalidates this process-local ownership through the query below. */
-extern bool cluster_undo_block0_current_startup_fenced_begin(
-	ClusterUndoBlock0CurrentGuard *guard);
-extern bool cluster_undo_block0_current_startup_fenced_end(
-	ClusterUndoBlock0CurrentGuard *guard);
+extern bool cluster_undo_block0_current_startup_fenced_begin(ClusterUndoBlock0CurrentGuard *guard);
+extern bool cluster_undo_block0_current_startup_fenced_end(ClusterUndoBlock0CurrentGuard *guard);
 extern bool cluster_undo_block0_current_startup_fenced_owned(void);
 
 #endif /* CLUSTER_UNDO_BLOCK0_CURRENT_H */

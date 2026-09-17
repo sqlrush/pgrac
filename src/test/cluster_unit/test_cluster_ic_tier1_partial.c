@@ -729,15 +729,14 @@ UT_TEST(test_recv_drain_yields_after_bounded_frames)
 	int i;
 
 	memset(frames, 0, sizeof(frames));
-	for (i = 0; i < lengthof(frames); i++)
-	{
+	for (i = 0; i < lengthof(frames); i++) {
 		frames[i].msg_type = PGRAC_IC_MSG_HEARTBEAT;
 		frames[i].source_node_id = UT_PEER_ID;
 		frames[i].dest_node_id = cluster_node_id;
 	}
 
 	sent = send(ut_rx_fd, frames, sizeof(frames), 0);
-	UT_ASSERT_EQ(sent, (ssize_t) sizeof(frames));
+	UT_ASSERT_EQ(sent, (ssize_t)sizeof(frames));
 	{
 		fd_set rfds;
 		struct timeval tv;

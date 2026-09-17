@@ -53,6 +53,19 @@
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (stage 0.30 sweep) */
 #include "cluster/cluster_views.h"
 
+#ifndef USE_PGRAC_CLUSTER
+/* pg_proc keeps this entry in both builds; no cutover exists without cluster. */
+PG_FUNCTION_INFO_V1(pgrac_r4_bit22_cutover_begin);
+
+Datum
+pgrac_r4_bit22_cutover_begin(PG_FUNCTION_ARGS)
+{
+	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("cluster support is not enabled in this build")));
+	PG_RETURN_NULL();
+}
+#endif
+
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_apply_master_election.h"
 #include "cluster/cluster_conf.h"			/* cluster_conf_lookup_node, role helpers */

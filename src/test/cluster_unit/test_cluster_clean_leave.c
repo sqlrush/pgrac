@@ -451,30 +451,22 @@ UT_TEST(test_phase1_full_stop_probe_policy)
 	plan.member_incarnations[3] = 104;
 
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_plan_valid(&plan));
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 0, 51,
-		true, true));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_accepts(CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
+																 true, 2, 2, 0, 0, 51, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_OPERATOR, true, 2, 2, 0, 0, 51,
-		true, true));
+		CLUSTER_LEAVE_PRODUCER_OPERATOR, true, 2, 2, 0, 0, 51, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, false, 2, 2, 0, 0, 51,
-		true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, false, 2, 2, 0, 0, 51, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 1, 2, 0, 0, 51,
-		true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 1, 2, 0, 0, 51, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 1, 51,
-		true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 1, 51, true, true));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
+																  true, 2, 2, 0, 0, 0, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 0, 0,
-		true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 0, 51, false, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 0, 51,
-		false, true));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 0, 51,
-		true, false));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, true, 2, 2, 0, 0, 51, true, false));
 }
 
 UT_TEST(test_phase1_full_stop_probe_phase_policy)
@@ -482,24 +474,16 @@ UT_TEST(test_phase1_full_stop_probe_phase_policy)
 	/* The authenticated sender's existing WAL evidence distinguishes the two
 	 * same-wire rounds.  A peer already in the post-STOPPED round must never
 	 * receive an ACK from a receiver which is still ACTIVE. */
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		true, false, true, false));
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		true, false, false, true));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		false, true, true, false));
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		false, true, false, true));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_phase_accepts(true, false, true, false));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_phase_accepts(true, false, false, true));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(false, true, true, false));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_probe_phase_accepts(false, true, false, true));
 
 	/* Missing or contradictory source/local evidence is fail-closed. */
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		false, false, true, false));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		true, true, true, false));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		true, false, false, false));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-		true, false, true, true));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(false, false, true, false));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(true, true, true, false));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(true, false, false, false));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_probe_phase_accepts(true, false, true, true));
 }
 
 UT_TEST(test_phase1_full_stop_post_stopped_request_ahead_consumption_policy)
@@ -508,54 +492,44 @@ UT_TEST(test_phase1_full_stop_post_stopped_request_ahead_consumption_policy)
 	 * lifecycle edges.  A peer request arriving in that narrow interval must
 	 * stay bound to the predecessor local nonce and become consumable after the
 	 * one legal nonce transition. */
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
-		true, false, false));
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
-		false, true, false));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(true, false,
+																						false));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(false, true,
+																						false));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
 		false, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
 		false, false, false));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
-		true, true, false));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(true, true,
+																						 false));
 
 	/* A transport-consumed request which arrived while this receiver was still
 	 * ACTIVE remains owned by the receiver.  It becomes consumable exactly once
 	 * after the same local attempt advances to STOPPED, dispatches its own peer
 	 * requests, and retains the original absolute deadline. */
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, true, 101, 9000, 102, 9000,
-		true, true, true, true));
+		true, true, 101, 9000, 102, 9000, true, true, true, true));
 	/* A request retained after local STOPPED but before dispatch keeps the same
 	 * local round nonce rather than accepting another transition. */
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, false, 102, 9000, 102, 9000,
-		true, true, true, true));
+		true, false, 102, 9000, 102, 9000, true, true, true, true));
 
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		false, true, 101, 9000, 102, 9000,
-		true, true, true, true));
+		false, true, 101, 9000, 102, 9000, true, true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, true, 101, 9000, 101, 9000,
-		true, true, true, true));
+		true, true, 101, 9000, 101, 9000, true, true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, false, 102, 9000, 103, 9000,
-		true, true, true, true));
+		true, false, 102, 9000, 103, 9000, true, true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, true, 101, 9000, 102, 9001,
-		true, true, true, true));
+		true, true, 101, 9000, 102, 9001, true, true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, true, 101, 9000, 102, 9000,
-		false, true, true, true));
+		true, true, 101, 9000, 102, 9000, false, true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, true, 101, 9000, 102, 9000,
-		true, false, true, true));
+		true, true, 101, 9000, 102, 9000, true, false, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, true, 101, 9000, 102, 9000,
-		true, true, false, true));
+		true, true, 101, 9000, 102, 9000, true, true, false, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-		true, true, 101, 9000, 102, 9000,
-		true, true, true, false));
+		true, true, 101, 9000, 102, 9000, true, true, true, false));
 }
 
 UT_TEST(test_phase1_full_stop_post_stopped_request_retains_per_peer_transport_ownership)
@@ -572,31 +546,26 @@ UT_TEST(test_phase1_full_stop_post_stopped_request_retains_per_peer_transport_ow
 	 * exact local ownership bit until the current transport consumes the frame;
 	 * NOT_ADMITTED therefore leaves only that peer pending for an event-loop
 	 * retry under the original absolute deadline. */
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"phase1_post_stopped_request_sent"));
-	tick = strstr(clean_leave,
-		"\ncl_phase1_full_stop_post_stopped_request_lmon_tick(");
+	UT_ASSERT_NOT_NULL(strstr(clean_leave, "phase1_post_stopped_request_sent"));
+	tick = strstr(clean_leave, "\ncl_phase1_full_stop_post_stopped_request_lmon_tick(");
 	UT_ASSERT_NOT_NULL(tick);
 	if (tick == NULL)
 		goto out;
-	tick_end = strstr(tick,
-		"\n}\n\nstatic void\ncl_phase1_full_stop_post_stopped_reply_lmon_tick(");
+	tick_end
+		= strstr(tick, "\n}\n\nstatic void\ncl_phase1_full_stop_post_stopped_reply_lmon_tick(");
 	UT_ASSERT_NOT_NULL(tick_end);
 	if (tick_end == NULL)
 		goto out;
-	UT_ASSERT_NOT_NULL(find_in_order(tick, tick_end,
-		"phase1_post_stopped_request_sent"));
-	UT_ASSERT_NOT_NULL(find_in_order(tick, tick_end,
-		"cl_phase1_full_stop_capture_barrier_identity("));
-	UT_ASSERT_NOT_NULL(find_in_order(tick, tick_end,
-		"local_wal_state != CLUSTER_WAL_SLOT_STATE_STOPPED"));
-	UT_ASSERT_NOT_NULL(find_in_order(tick, tick_end,
-		"cl_phase1_full_stop_send_post_stopped_request("));
-	UT_ASSERT_NOT_NULL(find_in_order(tick, tick_end,
-		"CLUSTER_IC_SEND_NOT_ADMITTED"));
+	UT_ASSERT_NOT_NULL(find_in_order(tick, tick_end, "phase1_post_stopped_request_sent"));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(tick, tick_end, "cl_phase1_full_stop_capture_barrier_identity("));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(tick, tick_end, "local_wal_state != CLUSTER_WAL_SLOT_STATE_STOPPED"));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(tick, tick_end, "cl_phase1_full_stop_send_post_stopped_request("));
+	UT_ASSERT_NOT_NULL(find_in_order(tick, tick_end, "CLUSTER_IC_SEND_NOT_ADMITTED"));
 	UT_ASSERT(strstr(tick, "cluster_clean_leave_ic_broadcast_announce(") == NULL
-			  || strstr(tick, "cluster_clean_leave_ic_broadcast_announce(")
-				 >= tick_end);
+			  || strstr(tick, "cluster_clean_leave_ic_broadcast_announce(") >= tick_end);
 out:
 	free(clean_leave);
 }
@@ -626,43 +595,44 @@ UT_TEST(test_phase1_full_stop_early_receiver_retains_semantic_ownership)
 	/* DONE/WOULD_BLOCK has transferred the frame to this LMON.  A valid peer
 	 * STOPPED request which is one stage ahead must enter the bounded exact
 	 * receiver slot; the handler may not silently return and discard it. */
-	UT_ASSERT_NOT_NULL(find_in_order(handler, handler_end,
-		"cl_phase1_full_stop_retain_request_ahead_locked("));
-	UT_ASSERT(strstr(handler,
-		"cl_phase1_member_bit_clear(\n\t\t\t\t\t\tcl_phase1_post_stopped_request_sent") == NULL
-			  || strstr(handler,
-				 "cl_phase1_member_bit_clear(\n\t\t\t\t\t\tcl_phase1_post_stopped_request_sent")
-				 >= handler_end);
+	UT_ASSERT_NOT_NULL(
+		find_in_order(handler, handler_end, "cl_phase1_full_stop_retain_request_ahead_locked("));
+	UT_ASSERT(
+		strstr(handler,
+			   "cl_phase1_member_bit_clear(\n\t\t\t\t\t\tcl_phase1_post_stopped_request_sent")
+			== NULL
+		|| strstr(handler,
+				  "cl_phase1_member_bit_clear(\n\t\t\t\t\t\tcl_phase1_post_stopped_request_sent")
+			   >= handler_end);
 
-	consume = strstr(clean_leave,
-		"\ncl_phase1_full_stop_consume_request_ahead_lmon_tick(");
+	consume = strstr(clean_leave, "\ncl_phase1_full_stop_consume_request_ahead_lmon_tick(");
 	UT_ASSERT_NOT_NULL(consume);
 	if (consume == NULL)
 		goto out;
-	consume_end = strstr(consume,
-		"\n}\n\nstatic void\ncl_phase1_full_stop_post_stopped_reply_lmon_tick(");
+	consume_end
+		= strstr(consume, "\n}\n\nstatic void\ncl_phase1_full_stop_post_stopped_reply_lmon_tick(");
 	UT_ASSERT_NOT_NULL(consume_end);
 	if (consume_end == NULL)
 		goto out;
-	UT_ASSERT_NOT_NULL(find_in_order(consume, consume_end,
-		"cl_phase1_full_stop_consume_request_ahead_locked("));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(consume, consume_end, "cl_phase1_full_stop_consume_request_ahead_locked("));
 
-	consume_locked = strstr(clean_leave,
-		"\ncl_phase1_full_stop_consume_request_ahead_locked(");
+	consume_locked = strstr(clean_leave, "\ncl_phase1_full_stop_consume_request_ahead_locked(");
 	UT_ASSERT_NOT_NULL(consume_locked);
 	if (consume_locked == NULL)
 		goto out;
-	consume_locked_end = strstr(consume_locked,
-		"\n}\n\n\nstatic void\ncl_phase1_full_stop_release(");
+	consume_locked_end
+		= strstr(consume_locked, "\n}\n\n\nstatic void\ncl_phase1_full_stop_release(");
 	UT_ASSERT_NOT_NULL(consume_locked_end);
 	if (consume_locked_end == NULL)
 		goto out;
-	UT_ASSERT_NOT_NULL(find_in_order(consume_locked, consume_locked_end,
-		"cluster_clean_leave_phase1_full_stop_request_ahead_can_consume("));
-	UT_ASSERT_NOT_NULL(find_in_order(consume_locked, consume_locked_end,
-		"phase1_post_stopped_reply_pending"));
-	UT_ASSERT_NOT_NULL(find_in_order(consume_locked, consume_locked_end,
-		"memset(ahead, 0, sizeof(*ahead))"));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(consume_locked, consume_locked_end,
+					  "cluster_clean_leave_phase1_full_stop_request_ahead_can_consume("));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(consume_locked, consume_locked_end, "phase1_post_stopped_reply_pending"));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(consume_locked, consume_locked_end, "memset(ahead, 0, sizeof(*ahead))"));
 out:
 	free(clean_leave);
 }
@@ -675,52 +645,45 @@ UT_TEST(test_phase1_full_stop_post_stopped_receiver_requires_confirmed_local_rou
 	 * the existing post-STOPPED round.  Once that round completes locally, the
 	 * exact receive window remains open through the bounded release phase so a
 	 * slower peer's same-round replay cannot be discarded. */
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
-		true, true, true, true, true, false));
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
-		true, true, true, false, true, true));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(true, true, true,
+																			   true, true, false));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(true, true, true,
+																			   false, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
 		true, true, true, false, true, false));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
 		true, true, true, true, false, false));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
-		false, true, true, true, true, false));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
-		true, false, true, true, true, false));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
-		true, true, false, true, true, false));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(false, true, true,
+																				true, true, false));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(true, false, true,
+																				true, true, false));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(true, true, false,
+																				true, true, false));
 }
 
 UT_TEST(test_phase1_full_stop_release_probe_is_exact_and_phase1_only)
 {
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE,
-		2, 2, 0, 0, 91, true, true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 2, 2, 0, 0, 91,
+		true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_OPERATOR,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE,
-		2, 2, 0, 0, 91, true, true, true));
+		CLUSTER_LEAVE_PRODUCER_OPERATOR, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 2, 2, 0, 0, 91,
+		true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_BARRIER,
-		2, 2, 0, 0, 91, true, true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_BARRIER, 2, 2, 0, 0, 91,
+		true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE,
-		1, 2, 0, 0, 91, true, true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 1, 2, 0, 0, 91,
+		true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE,
-		2, 2, 1, 0, 91, true, true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 2, 2, 1, 0, 91,
+		true, true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE,
-		2, 2, 0, 0, 0, true, true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 2, 2, 0, 0, 0, true,
+		true, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE,
-		2, 2, 0, 0, 91, false, true, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 2, 2, 0, 0, 91,
+		false, true, true));
 }
 
 UT_TEST(test_phase1_full_stop_exact_receipt_may_precede_local_reply_publication)
@@ -729,33 +692,25 @@ UT_TEST(test_phase1_full_stop_exact_receipt_may_precede_local_reply_publication)
 	 * sender's local reply_sent publication may lag that cross-process fact;
 	 * final completion still checks reply_sent independently. */
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_receipt_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT,
-		true, 91, 91, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, true, 91, 91,
+		true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_receipt_accepts(
-		CLUSTER_LEAVE_PRODUCER_OPERATOR,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT,
-		true, 91, 91, true));
+		CLUSTER_LEAVE_PRODUCER_OPERATOR, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, true, 91, 91,
+		true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_receipt_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE,
-		true, 91, 91, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, true, 91, 91,
+		true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_receipt_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT,
-		false, 91, 91, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, false, 91, 91,
+		true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_receipt_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT,
-		true, 0, 91, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, true, 0, 91, true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_receipt_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT,
-		true, 90, 91, true));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, true, 90, 91,
+		true));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_receipt_accepts(
-		CLUSTER_LEAVE_PRODUCER_SHUTDOWN,
-		CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT,
-		true, 91, 91, false));
+		CLUSTER_LEAVE_PRODUCER_SHUTDOWN, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, true, 91, 91,
+		false));
 }
 
 UT_TEST(test_phase1_full_stop_release_completion_requires_four_way_delivery)
@@ -778,32 +733,32 @@ UT_TEST(test_phase1_full_stop_release_completion_requires_four_way_delivery)
 	plan.member_incarnations[1] = 102;
 	plan.member_incarnations[2] = 103;
 	plan.member_incarnations[3] = 104;
-	request_sent[0] = request_seen[0] = reply_sent[0] = reply_seen[0]
-		= receipt_sent[0] = receipt_seen[0] = 0x0e;
+	request_sent[0] = request_seen[0] = reply_sent[0] = reply_seen[0] = receipt_sent[0]
+		= receipt_seen[0] = 0x0e;
 
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_release_complete(
-		&plan, 0, request_sent, request_seen, reply_sent, reply_seen,
-		receipt_sent, receipt_seen, sizeof(request_sent), true));
+		&plan, 0, request_sent, request_seen, reply_sent, reply_seen, receipt_sent, receipt_seen,
+		sizeof(request_sent), true));
 	request_seen[0] = 0x06;
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_complete(
-		&plan, 0, request_sent, request_seen, reply_sent, reply_seen,
-		receipt_sent, receipt_seen, sizeof(request_sent), true));
+		&plan, 0, request_sent, request_seen, reply_sent, reply_seen, receipt_sent, receipt_seen,
+		sizeof(request_sent), true));
 	request_seen[0] = 0x0e;
 	reply_sent[0] = 0x06;
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_complete(
-		&plan, 0, request_sent, request_seen, reply_sent, reply_seen,
-		receipt_sent, receipt_seen, sizeof(request_sent), true));
+		&plan, 0, request_sent, request_seen, reply_sent, reply_seen, receipt_sent, receipt_seen,
+		sizeof(request_sent), true));
 	reply_sent[0] = 0x0e;
 	receipt_seen[0] = 0x06;
 	/* Local egress drain is not evidence that every peer consumed our final
 	 * release reply.  Exact per-peer receipts are mandatory. */
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_complete(
-		&plan, 0, request_sent, request_seen, reply_sent, reply_seen,
-		receipt_sent, receipt_seen, sizeof(request_sent), true));
+		&plan, 0, request_sent, request_seen, reply_sent, reply_seen, receipt_sent, receipt_seen,
+		sizeof(request_sent), true));
 	receipt_seen[0] = 0x0e;
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_release_complete(
-		&plan, 0, request_sent, request_seen, reply_sent, reply_seen,
-		receipt_sent, receipt_seen, sizeof(request_sent), false));
+		&plan, 0, request_sent, request_seen, reply_sent, reply_seen, receipt_sent, receipt_seen,
+		sizeof(request_sent), false));
 }
 
 UT_TEST(test_phase1_full_stop_exact_ack_barrier)
@@ -822,24 +777,20 @@ UT_TEST(test_phase1_full_stop_exact_ack_barrier)
 	plan.member_incarnations[2] = 103;
 	plan.member_incarnations[3] = 104;
 
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_ack_matches(
-		&plan, 0, 2, 2, 0, 0, 61, 103));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_matches(
-		&plan, 0, 1, 2, 0, 0, 61, 103));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_matches(
-		&plan, 0, 2, 2, 0, 0, 60, 103));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_matches(
-		&plan, 0, 2, 2, 0, 0, 61, 999));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_ack_matches(&plan, 0, 2, 2, 0, 0, 61, 103));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_matches(&plan, 0, 1, 2, 0, 0, 61, 103));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_matches(&plan, 0, 2, 2, 0, 0, 60, 103));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_matches(&plan, 0, 2, 2, 0, 0, 61, 999));
 
 	ack_bitmap[0] = 0x0e; /* exact peers 1,2,3 for self node 0 */
-	UT_ASSERT(cluster_clean_leave_phase1_full_stop_ack_complete(
-		&plan, 0, ack_bitmap, sizeof(ack_bitmap)));
+	UT_ASSERT(cluster_clean_leave_phase1_full_stop_ack_complete(&plan, 0, ack_bitmap,
+																sizeof(ack_bitmap)));
 	ack_bitmap[0] = 0x06;
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_complete(
-		&plan, 0, ack_bitmap, sizeof(ack_bitmap)));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_complete(&plan, 0, ack_bitmap,
+																 sizeof(ack_bitmap)));
 	ack_bitmap[0] = 0x1e; /* an out-of-contract fifth member/ACK is a drift */
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_complete(
-		&plan, 0, ack_bitmap, sizeof(ack_bitmap)));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_ack_complete(&plan, 0, ack_bitmap,
+																 sizeof(ack_bitmap)));
 }
 
 UT_TEST(test_phase1_full_stop_barrier_waits_for_local_positive_ack_fanout)
@@ -851,15 +802,15 @@ UT_TEST(test_phase1_full_stop_barrier_waits_for_local_positive_ack_fanout)
 	UT_ASSERT_NOT_NULL(clean_leave);
 	if (clean_leave == NULL)
 		return;
-	barrier = strstr(clean_leave,
-		"\ncl_phase1_full_stop_post_stopped_barrier(");
+	barrier = strstr(clean_leave, "\ncl_phase1_full_stop_post_stopped_barrier(");
 	UT_ASSERT_NOT_NULL(barrier);
-	barrier_end = barrier == NULL ? NULL : strstr(barrier,
-		"\n}\n\nstatic bool\ncl_phase1_full_stop_release_completion(");
+	barrier_end
+		= barrier == NULL
+			  ? NULL
+			  : strstr(barrier, "\n}\n\nstatic bool\ncl_phase1_full_stop_release_completion(");
 	UT_ASSERT_NOT_NULL(barrier_end);
 	if (barrier != NULL && barrier_end != NULL)
-		UT_ASSERT_NOT_NULL(find_in_order(barrier, barrier_end,
-			"phase1_post_stopped_reply_sent"));
+		UT_ASSERT_NOT_NULL(find_in_order(barrier, barrier_end, "phase1_post_stopped_reply_sent"));
 	free(clean_leave);
 }
 
@@ -868,29 +819,27 @@ UT_TEST(test_phase1_full_stop_post_stopped_nonce_is_fresh)
 	UT_ASSERT(cluster_clean_leave_phase1_full_stop_nonce_fresh(61, 62));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_nonce_fresh(61, 61));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_nonce_fresh(61, 0));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_nonce_fresh(
-		61, UINT64_MAX));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_nonce_fresh(61, UINT64_MAX));
 	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_nonce_fresh(0, 62));
-	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_nonce_fresh(
-		UINT64_MAX, 62));
+	UT_ASSERT(!cluster_clean_leave_phase1_full_stop_nonce_fresh(UINT64_MAX, 62));
 }
 
 UT_TEST(test_phase1_full_stop_two_round_nonce_lineage_is_closed)
 {
-	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-		11, 0, 11), CLUSTER_PHASE1_PROBE_NONCE_STALE_ACTIVE);
-	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-		11, 0, 12), CLUSTER_PHASE1_PROBE_NONCE_ACCEPT_STOPPED);
-	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-		11, 12, 12), CLUSTER_PHASE1_PROBE_NONCE_DUPLICATE_STOPPED);
-	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-		11, 12, 11), CLUSTER_PHASE1_PROBE_NONCE_STALE_ACTIVE);
-	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-		11, 12, 13), CLUSTER_PHASE1_PROBE_NONCE_CONFLICT);
-	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-		0, 0, 12), CLUSTER_PHASE1_PROBE_NONCE_CONFLICT);
-	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-		11, 0, UINT64_MAX), CLUSTER_PHASE1_PROBE_NONCE_CONFLICT);
+	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(11, 0, 11),
+				 CLUSTER_PHASE1_PROBE_NONCE_STALE_ACTIVE);
+	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(11, 0, 12),
+				 CLUSTER_PHASE1_PROBE_NONCE_ACCEPT_STOPPED);
+	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(11, 12, 12),
+				 CLUSTER_PHASE1_PROBE_NONCE_DUPLICATE_STOPPED);
+	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(11, 12, 11),
+				 CLUSTER_PHASE1_PROBE_NONCE_STALE_ACTIVE);
+	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(11, 12, 13),
+				 CLUSTER_PHASE1_PROBE_NONCE_CONFLICT);
+	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(0, 0, 12),
+				 CLUSTER_PHASE1_PROBE_NONCE_CONFLICT);
+	UT_ASSERT_EQ(cluster_clean_leave_phase1_full_stop_probe_nonce_decide(11, 0, UINT64_MAX),
+				 CLUSTER_PHASE1_PROBE_NONCE_CONFLICT);
 }
 
 UT_TEST(test_phase1_full_stop_prepare_disposition_is_closed)
@@ -922,8 +871,8 @@ UT_TEST(test_phase1_full_stop_pgstat_follower_uses_existing_aux_hook)
 	UT_ASSERT_NOT_NULL(aux_hook_end);
 	if (aux_hook == NULL || aux_hook_end == NULL)
 		goto out;
-	UT_ASSERT(find_in_order(aux_hook, aux_hook_end,
-		"pgstat_prepare_for_server_shutdown_follower()") != NULL);
+	UT_ASSERT(find_in_order(aux_hook, aux_hook_end, "pgstat_prepare_for_server_shutdown_follower()")
+			  != NULL);
 
 	pgstat_hook = strstr(pgstat, "\npgstat_shutdown_hook(");
 	pgstat_hook_end = pgstat_hook == NULL ? NULL : strstr(pgstat_hook, "\n}");
@@ -931,15 +880,12 @@ UT_TEST(test_phase1_full_stop_pgstat_follower_uses_existing_aux_hook)
 	UT_ASSERT_NOT_NULL(pgstat_hook_end);
 	if (pgstat_hook == NULL || pgstat_hook_end == NULL)
 		goto out;
-	follower = find_in_order(pgstat_hook, pgstat_hook_end,
-		"pgstat_server_shutdown_follower");
-	report = find_in_order(pgstat_hook, pgstat_hook_end,
-		"pgstat_report_stat(true)");
+	follower = find_in_order(pgstat_hook, pgstat_hook_end, "pgstat_server_shutdown_follower");
+	report = find_in_order(pgstat_hook, pgstat_hook_end, "pgstat_report_stat(true)");
 	UT_ASSERT_NOT_NULL(follower);
 	UT_ASSERT_NOT_NULL(report);
 	UT_ASSERT(follower != NULL && report != NULL && follower < report);
-	UT_ASSERT_NOT_NULL(strstr(pgstat,
-		"pgstat_prepare_for_server_shutdown_follower(void)"));
+	UT_ASSERT_NOT_NULL(strstr(pgstat, "pgstat_prepare_for_server_shutdown_follower(void)"));
 out:
 	free(auxprocess);
 	free(pgstat);
@@ -983,14 +929,14 @@ UT_TEST(test_phase1_full_stop_runtime_order_and_no_polling)
 	if (shutdown == NULL || shutdown_end == NULL)
 		goto out;
 	prepare = find_in_order(shutdown, shutdown_end,
-		"cluster_clean_leave_phase1_full_stop_prepare_exact(");
+							"cluster_clean_leave_phase1_full_stop_prepare_exact(");
 	if (prepare == NULL)
 		goto out;
 	prepare = find_in_order(prepare, shutdown_end, "&phase1_full_stop_plan");
 	if (prepare == NULL)
 		goto out;
-	prepare_failed = find_in_order(prepare, shutdown_end,
-		"CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED");
+	prepare_failed
+		= find_in_order(prepare, shutdown_end, "CLUSTER_PHASE1_FULL_STOP_ATTEMPT_FAILED");
 	if (prepare_failed == NULL)
 		goto out;
 	fail_closed = find_in_order(prepare_failed, shutdown_end, "ereport(PANIC");
@@ -1000,129 +946,110 @@ UT_TEST(test_phase1_full_stop_runtime_order_and_no_polling)
 	if (prepare == NULL)
 		goto out;
 	stopped = find_in_order(prepare, shutdown_end,
-		"wal_stopped_ok = cluster_wal_state_publish_stopped()");
+							"wal_stopped_ok = cluster_wal_state_publish_stopped()");
 	if (stopped == NULL)
 		goto out;
-	stopped_failure = find_in_order(stopped, shutdown_end,
-		"if (!wal_stopped_ok");
+	stopped_failure = find_in_order(stopped, shutdown_end, "if (!wal_stopped_ok");
 	if (stopped_failure == NULL)
 		goto out;
-	stopped_failure = find_in_order(stopped_failure, shutdown_end,
-		"ereport(PANIC");
+	stopped_failure = find_in_order(stopped_failure, shutdown_end, "ereport(PANIC");
 	if (stopped_failure == NULL)
 		goto out;
-	stopped_failure = find_in_order(stopped_failure, shutdown_end,
-		"WAL STOPPED publication failed");
+	stopped_failure
+		= find_in_order(stopped_failure, shutdown_end, "WAL STOPPED publication failed");
 	if (stopped_failure == NULL)
 		goto out;
-	stopped_success = find_in_order(stopped, shutdown_end,
-		"WAL STOPPED published");
+	stopped_success = find_in_order(stopped, shutdown_end, "WAL STOPPED published");
 	if (stopped_success == NULL)
 		goto out;
 	close = find_in_order(stopped_success, shutdown_end,
-		"cluster_clean_leave_phase1_full_stop_close_exact(");
+						  "cluster_clean_leave_phase1_full_stop_close_exact(");
 	if (close == NULL)
 		goto out;
 	close = find_in_order(close, shutdown_end, "&phase1_full_stop_plan");
 	if (close == NULL)
 		goto out;
-	close_failure = find_in_order(close, shutdown_end,
-		"if (!clean_handoff_ok");
+	close_failure = find_in_order(close, shutdown_end, "if (!clean_handoff_ok");
 	if (close_failure == NULL)
 		goto out;
-	close_failure = find_in_order(close_failure, shutdown_end,
-		"ereport(PANIC");
+	close_failure = find_in_order(close_failure, shutdown_end, "ereport(PANIC");
 	if (close_failure == NULL)
 		goto out;
-	close_failure = find_in_order(close_failure, shutdown_end,
-		"post-STOPPED ACK barrier failed");
+	close_failure = find_in_order(close_failure, shutdown_end, "post-STOPPED ACK barrier failed");
 	if (close_failure == NULL)
 		goto out;
-	close_success = find_in_order(close, shutdown_end,
-		"exact four-member ACK barrier complete");
+	close_success = find_in_order(close, shutdown_end, "exact four-member ACK barrier complete");
 	if (close_success == NULL)
 		goto out;
-	release_success = find_in_order(close_success, shutdown_end,
-		"release/completion complete");
+	release_success = find_in_order(close_success, shutdown_end, "release/completion complete");
 	UT_ASSERT_NOT_NULL(release_success);
-	post_stopped = strstr(clean_leave,
-		"\ncl_phase1_full_stop_post_stopped_barrier(");
+	post_stopped = strstr(clean_leave, "\ncl_phase1_full_stop_post_stopped_barrier(");
 	UT_ASSERT_NOT_NULL(post_stopped);
 	if (post_stopped == NULL)
 		goto out;
-	post_stopped_end = strstr(post_stopped,
-		"\n}\n\nbool\ncluster_clean_leave_phase1_full_stop_close_exact(");
+	post_stopped_end
+		= strstr(post_stopped, "\n}\n\nbool\ncluster_clean_leave_phase1_full_stop_close_exact(");
 	UT_ASSERT_NOT_NULL(post_stopped_end);
 	if (post_stopped_end == NULL)
 		goto out;
 	UT_ASSERT_NOT_NULL(strstr(post_stopped, "CLUSTER_WAL_SLOT_STATE_STOPPED"));
-	UT_ASSERT_NOT_NULL(strstr(post_stopped,
-		"cl_phase1_full_stop_identity_matches("));
+	UT_ASSERT_NOT_NULL(strstr(post_stopped, "cl_phase1_full_stop_identity_matches("));
 	UT_ASSERT_NOT_NULL(strstr(post_stopped, "plan->absolute_deadline_us"));
 	UT_ASSERT_NOT_NULL(strstr(post_stopped, "WaitLatch("));
-	UT_ASSERT_NOT_NULL(strstr(post_stopped,
-		"failure-domain stage=post-STOPPED"));
+	UT_ASSERT_NOT_NULL(strstr(post_stopped, "failure-domain stage=post-STOPPED"));
 	UT_ASSERT(strstr(post_stopped, "pg_usleep(") == NULL
 			  || strstr(post_stopped, "pg_usleep(") >= post_stopped_end);
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"cl_phase1_full_stop_retain_request_ahead_locked("));
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"cl_phase1_full_stop_consume_request_ahead_lmon_tick("));
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready("));
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"phase1_post_stopped_reply_pending"));
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"cl_phase1_full_stop_send_post_stopped_reply("));
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"CLUSTER_IC_SEND_NOT_ADMITTED"));
-	release_completion = strstr(clean_leave,
-		"\ncl_phase1_full_stop_release_completion(");
-	release_completion_end = release_completion == NULL ? NULL
-		: strstr(release_completion,
-			"\n}\n\nbool\ncluster_clean_leave_phase1_full_stop_close_exact(");
+	UT_ASSERT_NOT_NULL(strstr(clean_leave, "cl_phase1_full_stop_retain_request_ahead_locked("));
+	UT_ASSERT_NOT_NULL(strstr(clean_leave, "cl_phase1_full_stop_consume_request_ahead_lmon_tick("));
+	UT_ASSERT_NOT_NULL(
+		strstr(clean_leave, "cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready("));
+	UT_ASSERT_NOT_NULL(strstr(clean_leave, "phase1_post_stopped_reply_pending"));
+	UT_ASSERT_NOT_NULL(strstr(clean_leave, "cl_phase1_full_stop_send_post_stopped_reply("));
+	UT_ASSERT_NOT_NULL(strstr(clean_leave, "CLUSTER_IC_SEND_NOT_ADMITTED"));
+	release_completion = strstr(clean_leave, "\ncl_phase1_full_stop_release_completion(");
+	release_completion_end
+		= release_completion == NULL
+			  ? NULL
+			  : strstr(release_completion,
+					   "\n}\n\nbool\ncluster_clean_leave_phase1_full_stop_close_exact(");
 	UT_ASSERT_NOT_NULL(release_completion);
 	UT_ASSERT_NOT_NULL(release_completion_end);
 	if (release_completion != NULL && release_completion_end != NULL) {
-		UT_ASSERT_NOT_NULL(strstr(release_completion,
-			"plan->absolute_deadline_us"));
-		UT_ASSERT_NOT_NULL(strstr(release_completion,
-			"phase1_release_receipt_seen"));
-		UT_ASSERT_NOT_NULL(strstr(release_completion,
-			"failure-domain stage=release-completion"));
+		UT_ASSERT_NOT_NULL(strstr(release_completion, "plan->absolute_deadline_us"));
+		UT_ASSERT_NOT_NULL(strstr(release_completion, "phase1_release_receipt_seen"));
+		UT_ASSERT_NOT_NULL(strstr(release_completion, "failure-domain stage=release-completion"));
 		UT_ASSERT_NOT_NULL(strstr(release_completion, "WaitLatch("));
 		UT_ASSERT(strstr(release_completion, "pg_usleep(") == NULL
-				  || strstr(release_completion, "pg_usleep(")
-					 >= release_completion_end);
+				  || strstr(release_completion, "pg_usleep(") >= release_completion_end);
 	}
-	close_body = strstr(clean_leave,
-		"\ncluster_clean_leave_phase1_full_stop_close_exact(");
-	close_end = close_body == NULL ? NULL : strstr(close_body,
-		"\n}\n\n/*\n * cluster_clean_leave_drive_drain");
+	close_body = strstr(clean_leave, "\ncluster_clean_leave_phase1_full_stop_close_exact(");
+	close_end = close_body == NULL
+					? NULL
+					: strstr(close_body, "\n}\n\n/*\n * cluster_clean_leave_drive_drain");
 	UT_ASSERT_NOT_NULL(close_body);
 	UT_ASSERT_NOT_NULL(close_end);
 	if (close_body == NULL || close_end == NULL)
 		goto out;
-	UT_ASSERT(strstr(close_body,
-		"cluster_control_root_thread_clean_close_publish(") == NULL
-			  || strstr(close_body,
-				 "cluster_control_root_thread_clean_close_publish(") >= close_end);
-	post_stopped = find_in_order(close_body, close_end,
-		"cl_phase1_full_stop_post_stopped_barrier(plan)");
+	UT_ASSERT(strstr(close_body, "cluster_control_root_thread_clean_close_publish(") == NULL
+			  || strstr(close_body, "cluster_control_root_thread_clean_close_publish(")
+					 >= close_end);
+	post_stopped
+		= find_in_order(close_body, close_end, "cl_phase1_full_stop_post_stopped_barrier(plan)");
 	UT_ASSERT_NOT_NULL(post_stopped);
-	release_completion = post_stopped == NULL ? NULL
-		: find_in_order(post_stopped, close_end,
-			"cl_phase1_full_stop_release_completion(plan)");
+	release_completion = post_stopped == NULL
+							 ? NULL
+							 : find_in_order(post_stopped, close_end,
+											 "cl_phase1_full_stop_release_completion(plan)");
 	UT_ASSERT_NOT_NULL(release_completion);
-	UT_ASSERT_NOT_NULL(strstr(clean_leave,
-		"CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT"));
+	UT_ASSERT_NOT_NULL(strstr(clean_leave, "CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT"));
 	legacy = find_in_order(close, shutdown_end, "cluster_clean_leave_shutdown_drain()");
 	UT_ASSERT_NOT_NULL(legacy);
 
-	prepare_body = strstr(clean_leave,
-		"\ncluster_clean_leave_phase1_full_stop_prepare_exact(");
-	prepare_end = prepare_body == NULL ? NULL : strstr(prepare_body,
-		"\n}\n\nbool\ncluster_clean_leave_phase1_full_stop_close_exact(");
+	prepare_body = strstr(clean_leave, "\ncluster_clean_leave_phase1_full_stop_prepare_exact(");
+	prepare_end = prepare_body == NULL
+					  ? NULL
+					  : strstr(prepare_body,
+							   "\n}\n\nbool\ncluster_clean_leave_phase1_full_stop_close_exact(");
 	UT_ASSERT_NOT_NULL(prepare_body);
 	UT_ASSERT_NOT_NULL(prepare_end);
 	if (prepare_body == NULL || prepare_end == NULL)
@@ -1157,20 +1084,16 @@ UT_TEST(test_phase1_full_stop_retains_coordination_without_r4_admission)
 		return;
 
 	shutdown = strstr(postmaster, "if (pmState == PM_STOP_BACKENDS)");
-	shutdown_end = shutdown == NULL ? NULL
-		: strstr(shutdown, "pmState = PM_WAIT_BACKENDS;");
+	shutdown_end = shutdown == NULL ? NULL : strstr(shutdown, "pmState = PM_WAIT_BACKENDS;");
 	UT_ASSERT_NOT_NULL(shutdown);
 	UT_ASSERT_NOT_NULL(shutdown_end);
 	if (shutdown == NULL || shutdown_end == NULL)
 		goto out;
-	rf_admission = find_in_order(shutdown, shutdown_end,
-		"cluster_registry_holds_admission()");
+	rf_admission = find_in_order(shutdown, shutdown_end, "cluster_registry_holds_admission()");
 	phase1_candidate = find_in_order(rf_admission, shutdown_end,
-		"cluster_clean_leave_phase1_full_stop_candidate()");
-	combined = find_in_order(phase1_candidate, shutdown_end,
-		"retain_shutdown_coordination");
-	stop_coordination = find_in_order(combined, shutdown_end,
-		"if (!retain_shutdown_coordination)");
+									 "cluster_clean_leave_phase1_full_stop_candidate()");
+	combined = find_in_order(phase1_candidate, shutdown_end, "retain_shutdown_coordination");
+	stop_coordination = find_in_order(combined, shutdown_end, "if (!retain_shutdown_coordination)");
 	suppress
 		= find_in_order(stop_coordination, shutdown_end,
 						"if (!retain_normal_stop && retain_shutdown_coordination && LmonPID != 0)");
@@ -1180,14 +1103,14 @@ UT_TEST(test_phase1_full_stop_retains_coordination_without_r4_admission)
 	 * exercised in test_cluster_postmaster_stop, not inferred from text. */
 
 	wait_backends = strstr(shutdown_end, "if (pmState == PM_WAIT_BACKENDS)");
-	wait_backends_end = wait_backends == NULL ? NULL
-		: strstr(wait_backends, "if (pmState == PM_SHUTDOWN_2)");
+	wait_backends_end
+		= wait_backends == NULL ? NULL : strstr(wait_backends, "if (pmState == PM_SHUTDOWN_2)");
 	UT_ASSERT_NOT_NULL(wait_backends);
 	UT_ASSERT_NOT_NULL(wait_backends_end);
 	if (wait_backends == NULL || wait_backends_end == NULL)
 		goto out;
-	UT_ASSERT_NOT_NULL(find_in_order(wait_backends, wait_backends_end,
-		"cluster_lmon_reconfig_suppressed()"));
+	UT_ASSERT_NOT_NULL(
+		find_in_order(wait_backends, wait_backends_end, "cluster_lmon_reconfig_suppressed()"));
 out:
 	free(postmaster);
 }

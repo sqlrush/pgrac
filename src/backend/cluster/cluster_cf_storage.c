@@ -511,9 +511,10 @@ cluster_cf_enter_bootstrap_window_or_fail(void)
 	multi_node = cluster_enabled && cluster_conf_node_count() > 1;
 	if (!multi_node) {
 		if (!cluster_cf_exactly_one_declared_node())
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-					 errmsg("single-node control-file authority requires exactly one declared node")));
+			ereport(
+				FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("single-node control-file authority requires exactly one declared node")));
 
 		/* Install the boot-local transport before retaining Startup permission. */
 		if (!cluster_cf_owner_eor_install())

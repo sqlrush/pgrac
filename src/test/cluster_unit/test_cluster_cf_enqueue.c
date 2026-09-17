@@ -234,8 +234,7 @@ cluster_cf_owner_eor_phase_install(void)
 bool
 cluster_cf_owner_eor_phase_activate(void)
 {
-	if (!AmCheckpointerProcess()
-		|| g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_INSTALLED)
+	if (!AmCheckpointerProcess() || g_owner_eor_phase != CLUSTER_CF_OWNER_EOR_INSTALLED)
 		return false;
 	g_owner_eor_phase = CLUSTER_CF_OWNER_EOR_ACTIVE;
 	return true;
@@ -435,9 +434,9 @@ UT_TEST(test_owner_eor_disabled_seed_uses_exact_declared_node)
 	UT_ASSERT(fd >= 0);
 	f = fdopen(fd, "w");
 	UT_ASSERT(f != NULL);
-	UT_ASSERT(fprintf(f,
-				  "[cluster]\nname = pgrac\n\n[node.0]\n"
-				  "interconnect_addr = 127.0.0.1:6433\n") > 0);
+	UT_ASSERT(fprintf(f, "[cluster]\nname = pgrac\n\n[node.0]\n"
+						 "interconnect_addr = 127.0.0.1:6433\n")
+			  > 0);
 	UT_ASSERT_EQ(fclose(f), 0);
 
 	g_node_count = 0;
@@ -500,21 +499,18 @@ UT_TEST(test_confirmed_release_requires_clusterwide_s6_success)
 
 	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
 	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
-	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
-				 CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_CONFIRMED);
 	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
 	UT_ASSERT_EQ(g_s6_count, 1);
 
 	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
 	g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
-	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
-				 CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
 	UT_ASSERT(cluster_cf_held(ExclusiveLock));
 	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
 
 	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
-	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock),
-				 CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_CONFIRMED);
 	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
 }
 
@@ -526,8 +522,7 @@ UT_TEST(test_native_hold_never_becomes_clusterwide_authority)
 	UT_ASSERT(cluster_cf_lock(ShareLock));
 	UT_ASSERT(cluster_cf_held(ShareLock));
 	UT_ASSERT(!cluster_cf_held_is_clusterwide(ShareLock));
-	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock),
-				 CLUSTER_CF_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_NOT_HELD);
 	UT_ASSERT(!cluster_cf_held(ShareLock));
 	UT_ASSERT_EQ(g_s6_count, 0);
 }

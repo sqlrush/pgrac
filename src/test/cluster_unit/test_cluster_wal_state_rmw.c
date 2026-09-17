@@ -417,8 +417,7 @@ fixture_reset(void)
 
 	memset(virtual_file, 0, sizeof(virtual_file));
 	cluster_wal_state_header_fill(header, 123);
-	cluster_wal_state_slot_fill(slot, 4, 3, CLUSTER_WAL_SLOT_STATE_ACTIVE, 7, 100, 200, 300,
-								400);
+	cluster_wal_state_slot_fill(slot, 4, 3, CLUSTER_WAL_SLOT_STATE_ACTIVE, 7, 100, 200, 300, 400);
 	slot->checkpoint_redo_lsn = 500;
 	slot->refresh_interval_ms = 600;
 	slot->fpw_was_off = 1;
@@ -483,8 +482,7 @@ UT_TEST(test_a1_verified_cf_gate_rejects_before_io)
 
 	fixture_reset();
 	cluster_controlfile_shared_authority = false;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
 	assert_no_registry_io();
 	UT_ASSERT_EQ(stub_cf_lock_count, 0);
@@ -492,32 +490,28 @@ UT_TEST(test_a1_verified_cf_gate_rejects_before_io)
 	fixture_reset();
 	cluster_lms_enabled = false;
 	stub_lms_ready = true;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
 	assert_no_registry_io();
 	UT_ASSERT_EQ(stub_cf_lock_count, 0);
 
 	fixture_reset();
 	stub_lms_ready = false;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
 	assert_no_registry_io();
 	UT_ASSERT_EQ(stub_cf_lock_count, 0);
 
 	fixture_reset();
 	stub_cf_master = -1;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
 	assert_no_registry_io();
 	UT_ASSERT_EQ(stub_cf_lock_count, 0);
 
 	fixture_reset();
 	stub_cf_lock_ok = false;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
 	assert_no_registry_io();
 	UT_ASSERT_EQ(stub_cf_lock_count, 1);
@@ -530,16 +524,17 @@ UT_TEST(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread)
 	ClusterWalStateSlot before;
 	ClusterWalStateSlot published;
 	ClusterWalStateSlot *ondisk;
-	RmwEvent expected_events[] = {RMW_EVENT_CF_LOCK, RMW_EVENT_OPEN, RMW_EVENT_FSTAT,
-		RMW_EVENT_PREAD_HEADER, RMW_EVENT_PREAD_SLOT, RMW_EVENT_PWRITE_SLOT, RMW_EVENT_FSYNC,
-		RMW_EVENT_PREAD_SLOT, RMW_EVENT_CLOSE, RMW_EVENT_CF_UNLOCK};
+	RmwEvent expected_events[]
+		= { RMW_EVENT_CF_LOCK,	  RMW_EVENT_OPEN,		 RMW_EVENT_FSTAT, RMW_EVENT_PREAD_HEADER,
+			RMW_EVENT_PREAD_SLOT, RMW_EVENT_PWRITE_SLOT, RMW_EVENT_FSYNC, RMW_EVENT_PREAD_SLOT,
+			RMW_EVENT_CLOSE,	  RMW_EVENT_CF_UNLOCK };
 	size_t i;
 
 	fixture_reset();
 	memcpy(&before, virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4), sizeof(before));
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, &published),
-				 (int)CLUSTER_WAL_STATE_UPDATE_OK);
+	UT_ASSERT_EQ(
+		(int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, &published),
+		(int)CLUSTER_WAL_STATE_UPDATE_OK);
 	UT_ASSERT_EQ(event_count, (int)lengthof(expected_events));
 	for (i = 0; i < lengthof(expected_events); i++)
 		UT_ASSERT_EQ((int)event_log[i], (int)expected_events[i]);
@@ -579,8 +574,7 @@ UT_TEST(test_a1_release_uncertain_fails_closed)
 	 * succeeded and was post-read-verified. */
 	fixture_reset();
 	stub_cf_release_confirmed = false;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_RELEASE_UNCERTAIN);
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
 	/* The slot deliberately stays held (never a double grant). */
@@ -588,8 +582,7 @@ UT_TEST(test_a1_release_uncertain_fails_closed)
 	fixture_reset();
 
 	/* Confirmed release keeps the exact existing success semantics. */
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_OK);
 	UT_ASSERT(!stub_cf_held);
 }
@@ -600,8 +593,7 @@ UT_TEST(test_a1_short_write_and_fsync_fail_without_compensation)
 
 	fixture_reset();
 	forced_pwrite_result = 511;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_IO_ERROR);
 	UT_ASSERT_EQ(pwrite_count, 1);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -610,8 +602,7 @@ UT_TEST(test_a1_short_write_and_fsync_fail_without_compensation)
 
 	fixture_reset();
 	forced_fsync_result = -1;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_IO_ERROR);
 	UT_ASSERT_EQ(pwrite_count, 1);
 	UT_ASSERT_EQ(fsync_count, 1);
@@ -629,9 +620,9 @@ UT_TEST(test_a1_postread_mismatch_fails_without_compensation)
 	memset(&sentinel, 0xa5, sizeof(sentinel));
 	memcpy(&published, &sentinel, sizeof(published));
 	force_postread_mismatch = true;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, &published),
-				 (int)CLUSTER_WAL_STATE_UPDATE_POSTREAD_MISMATCH);
+	UT_ASSERT_EQ(
+		(int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, &published),
+		(int)CLUSTER_WAL_STATE_UPDATE_POSTREAD_MISMATCH);
 	UT_ASSERT_EQ(pwrite_count, 1);
 	UT_ASSERT_EQ(fsync_count, 1);
 	UT_ASSERT_EQ(slot_pread_count, 2);
@@ -645,8 +636,7 @@ UT_TEST(test_a1_borrow_verified_cf_does_not_reenter_or_unlock)
 
 	fixture_reset();
 	stub_cf_held = true;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_BORROW_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_BORROW_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_OK);
 	UT_ASSERT_EQ(stub_cf_lock_count, 0);
 	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
@@ -655,8 +645,7 @@ UT_TEST(test_a1_borrow_verified_cf_does_not_reenter_or_unlock)
 
 	fixture_reset();
 	stub_cf_held = false;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_BORROW_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_BORROW_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
 	assert_no_registry_io();
 	UT_ASSERT_EQ(stub_cf_lock_count, 0);
@@ -671,8 +660,7 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 
 	fixture_reset();
 	virtual_file_size--;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CORRUPT);
 	UT_ASSERT_EQ(pwrite_count, 0);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -681,8 +669,7 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	fixture_reset();
 	header = (ClusterWalStateHeader *)virtual_file;
 	header->crc ^= 1;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CORRUPT);
 	UT_ASSERT_EQ(pwrite_count, 0);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -691,8 +678,7 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	fixture_reset();
 	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
 	memset(slot, 0, sizeof(*slot));
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_EMPTY);
 	UT_ASSERT_EQ(pwrite_count, 0);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -701,8 +687,7 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	fixture_reset();
 	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
 	slot->crc ^= 1;
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_CORRUPT);
 	UT_ASSERT_EQ(pwrite_count, 0);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -712,8 +697,7 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
 	slot->node_id = 9;
 	slot->crc = cluster_wal_state_block_crc(slot);
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_FOREIGN);
 	UT_ASSERT_EQ(pwrite_count, 0);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -723,8 +707,7 @@ UT_TEST(test_a1_fresh_header_slot_typed_rejections)
 	slot = (ClusterWalStateSlot *)(virtual_file + CLUSTER_WAL_STATE_SLOT_OFFSET(4));
 	slot->state = CLUSTER_WAL_SLOT_STATE_STOPPED;
 	slot->crc = cluster_wal_state_block_crc(slot);
-	UT_ASSERT_EQ((int)cluster_wal_state_update_own(
-					 &update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+	UT_ASSERT_EQ((int)cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
 				 (int)CLUSTER_WAL_STATE_UPDATE_WRONG_STATE);
 	UT_ASSERT_EQ(pwrite_count, 0);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -795,9 +778,10 @@ UT_TEST(test_a1_w3_publish_stopped_uses_verified_cf_rmw)
 {
 	ClusterWalStateSlot before;
 	ClusterWalStateSlot *ondisk;
-	RmwEvent expected_events[] = {RMW_EVENT_CF_LOCK, RMW_EVENT_OPEN, RMW_EVENT_FSTAT,
-		RMW_EVENT_PREAD_HEADER, RMW_EVENT_PREAD_SLOT, RMW_EVENT_PWRITE_SLOT, RMW_EVENT_FSYNC,
-		RMW_EVENT_PREAD_SLOT, RMW_EVENT_CLOSE, RMW_EVENT_CF_UNLOCK};
+	RmwEvent expected_events[]
+		= { RMW_EVENT_CF_LOCK,	  RMW_EVENT_OPEN,		 RMW_EVENT_FSTAT, RMW_EVENT_PREAD_HEADER,
+			RMW_EVENT_PREAD_SLOT, RMW_EVENT_PWRITE_SLOT, RMW_EVENT_FSYNC, RMW_EVENT_PREAD_SLOT,
+			RMW_EVENT_CLOSE,	  RMW_EVENT_CF_UNLOCK };
 	size_t i;
 
 	fixture_reset();
@@ -879,8 +863,7 @@ cluster_r4_bit22_source_writer_enter(void)
 
 void
 cluster_r4_bit22_source_writer_leave(void)
-{
-}
+{}
 
 bool
 cluster_r4_bit22_source_close_begin(uint64 transition_epoch pg_attribute_unused(),
@@ -902,9 +885,7 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_PLAN(13);
 
 
-
-
-UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
+	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
 	UT_RUN(test_a1_acquire_fresh_rmw_exact_order_and_distinct_postread);
 	UT_RUN(test_a1_release_uncertain_fails_closed);
 	UT_RUN(test_a1_short_write_and_fsync_fail_without_compensation);

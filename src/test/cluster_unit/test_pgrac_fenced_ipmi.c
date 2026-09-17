@@ -33,27 +33,24 @@ make_adapter(uint8 *bytes, uint16 address_family, const char *path)
 	memset(bytes, 0, PGRAC_FENCED_IPMI_ADAPTER_MAX_BYTES);
 	memcpy(bytes, PGRAC_FENCED_IPMI_ADAPTER_MAGIC, 4);
 	bytes[4] = PGRAC_FENCED_IPMI_ADAPTER_VERSION;
-	bytes[6] = (uint8) total_len;
-	bytes[7] = (uint8) (total_len >> 8);
-	bytes[8] = (uint8) address_family;
+	bytes[6] = (uint8)total_len;
+	bytes[7] = (uint8)(total_len >> 8);
+	bytes[8] = (uint8)address_family;
 	bytes[10] = UINT8_C(0x6f);
 	bytes[11] = UINT8_C(0x02);
-	if (address_family == 4)
-	{
+	if (address_family == 4) {
 		bytes[12] = 192;
 		bytes[13] = 0;
 		bytes[14] = 2;
 		bytes[15] = 10;
-	}
-	else
-	{
+	} else {
 		bytes[12] = 0x20;
 		bytes[13] = 0x01;
 		bytes[27] = 0x01;
 	}
 	bytes[28] = 17;
-	bytes[30] = (uint8) path_len;
-	bytes[31] = (uint8) (path_len >> 8);
+	bytes[30] = (uint8)path_len;
+	bytes[31] = (uint8)(path_len >> 8);
 	memset(bytes + 32, 0x5a, 32);
 	memcpy(bytes + PGRAC_FENCED_IPMI_ADAPTER_FIXED_BYTES, path, path_len);
 	return total_len;
@@ -102,8 +99,8 @@ UT_TEST(test_adapter_rejects_header_and_length_errors)
 	bytes[30]--;
 	UT_ASSERT(!pgrac_fenced_ipmi_adapter_parse(bytes, len, &adapter));
 	UT_ASSERT(!pgrac_fenced_ipmi_adapter_parse(bytes, 63, &adapter));
-	UT_ASSERT(!pgrac_fenced_ipmi_adapter_parse(bytes,
-		PGRAC_FENCED_IPMI_ADAPTER_MAX_BYTES + 1, &adapter));
+	UT_ASSERT(
+		!pgrac_fenced_ipmi_adapter_parse(bytes, PGRAC_FENCED_IPMI_ADAPTER_MAX_BYTES + 1, &adapter));
 	UT_ASSERT(!pgrac_fenced_ipmi_adapter_parse(NULL, len, &adapter));
 	UT_ASSERT(!pgrac_fenced_ipmi_adapter_parse(bytes, len, NULL));
 }
@@ -173,8 +170,7 @@ UT_TEST(test_adapter_accepts_maximum_canonical_path)
 	path[PGRAC_FENCED_IPMI_ADAPTER_PATH_MAX] = '\0';
 	len = make_adapter(bytes, 6, path);
 	UT_ASSERT(pgrac_fenced_ipmi_adapter_parse(bytes, len, &adapter));
-	UT_ASSERT_EQ(adapter.executable_path_len,
-		PGRAC_FENCED_IPMI_ADAPTER_PATH_MAX);
+	UT_ASSERT_EQ(adapter.executable_path_len, PGRAC_FENCED_IPMI_ADAPTER_PATH_MAX);
 	UT_ASSERT_STR_EQ(adapter.executable_path, path);
 }
 
@@ -213,26 +209,17 @@ UT_TEST(test_credential_grammars_are_exact)
 	static const uint8 user_ok[] = "admin-1\n";
 	static const uint8 password_ok[] = "s ecret!\n";
 
-	UT_ASSERT(pgrac_fenced_ipmi_username_parse(user_ok,
-		sizeof(user_ok) - 1, username));
+	UT_ASSERT(pgrac_fenced_ipmi_username_parse(user_ok, sizeof(user_ok) - 1, username));
 	UT_ASSERT_STR_EQ(username, "admin-1");
-	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *) " admin\n",
-		7, username));
-	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *) "admin \n",
-		7, username));
-	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *) "admin\r\n",
-		7, username));
-	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *) "admin\nroot\n",
-		11, username));
-	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *) "admin", 5,
-		username));
-	UT_ASSERT(pgrac_fenced_ipmi_password_validate(password_ok,
-		sizeof(password_ok) - 1));
-	UT_ASSERT(!pgrac_fenced_ipmi_password_validate((const uint8 *) "secret", 6));
-	UT_ASSERT(!pgrac_fenced_ipmi_password_validate(
-		(const uint8 *) "secret\r\n", 8));
-	UT_ASSERT(!pgrac_fenced_ipmi_password_validate(
-		(const uint8 *) "secret\nmore\n", 12));
+	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *)" admin\n", 7, username));
+	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *)"admin \n", 7, username));
+	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *)"admin\r\n", 7, username));
+	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *)"admin\nroot\n", 11, username));
+	UT_ASSERT(!pgrac_fenced_ipmi_username_parse((const uint8 *)"admin", 5, username));
+	UT_ASSERT(pgrac_fenced_ipmi_password_validate(password_ok, sizeof(password_ok) - 1));
+	UT_ASSERT(!pgrac_fenced_ipmi_password_validate((const uint8 *)"secret", 6));
+	UT_ASSERT(!pgrac_fenced_ipmi_password_validate((const uint8 *)"secret\r\n", 8));
+	UT_ASSERT(!pgrac_fenced_ipmi_password_validate((const uint8 *)"secret\nmore\n", 12));
 }
 
 UT_TEST(test_credential_paths_use_raw_uuid_lowercase_hex)
@@ -243,16 +230,16 @@ UT_TEST(test_credential_paths_use_raw_uuid_lowercase_hex)
 	size_t i;
 
 	for (i = 0; i < sizeof(uuid); i++)
-		uuid[i] = (uint8) i;
-	UT_ASSERT(pgrac_fenced_ipmi_credential_paths(uuid, user_path,
-		sizeof(user_path), password_path, sizeof(password_path)));
+		uuid[i] = (uint8)i;
+	UT_ASSERT(pgrac_fenced_ipmi_credential_paths(uuid, user_path, sizeof(user_path), password_path,
+												 sizeof(password_path)));
 	UT_ASSERT_STR_EQ(user_path,
-		"/etc/pgrac/credentials/ipmi-000102030405060708090a0b0c0d0e0f.user");
+					 "/etc/pgrac/credentials/ipmi-000102030405060708090a0b0c0d0e0f.user");
 	UT_ASSERT_STR_EQ(password_path,
-		"/etc/pgrac/credentials/ipmi-000102030405060708090a0b0c0d0e0f.password");
+					 "/etc/pgrac/credentials/ipmi-000102030405060708090a0b0c0d0e0f.password");
 	memset(uuid, 0, sizeof(uuid));
-	UT_ASSERT(!pgrac_fenced_ipmi_credential_paths(uuid, user_path,
-		sizeof(user_path), password_path, sizeof(password_path)));
+	UT_ASSERT(!pgrac_fenced_ipmi_credential_paths(uuid, user_path, sizeof(user_path), password_path,
+												  sizeof(password_path)));
 }
 
 UT_TEST(test_executable_open_requires_fresh_matching_hash)
@@ -268,13 +255,12 @@ UT_TEST(test_executable_open_requires_fresh_matching_hash)
 	UT_ASSERT(source_fd >= 0);
 	if (source_fd < 0)
 		return;
-	UT_ASSERT(pgrac_fenced_ipmi_sha256_fd(source_fd,
-		adapter.executable_sha256));
-	(void) close(source_fd);
+	UT_ASSERT(pgrac_fenced_ipmi_sha256_fd(source_fd, adapter.executable_sha256));
+	(void)close(source_fd);
 	validated_fd = pgrac_fenced_ipmi_executable_open(&adapter);
 	UT_ASSERT(validated_fd >= 0);
 	if (validated_fd >= 0)
-		(void) close(validated_fd);
+		(void)close(validated_fd);
 	adapter.executable_sha256[0] ^= 1;
 	UT_ASSERT_EQ(pgrac_fenced_ipmi_executable_open(&adapter), -1);
 }
@@ -294,11 +280,9 @@ UT_TEST(test_executable_open_rejects_final_symlink)
 	adapter.executable_path_len = strlen(path);
 	source_fd = open("/usr/bin/true", O_RDONLY);
 	UT_ASSERT(source_fd >= 0);
-	if (source_fd >= 0)
-	{
-		UT_ASSERT(pgrac_fenced_ipmi_sha256_fd(source_fd,
-			adapter.executable_sha256));
-		(void) close(source_fd);
+	if (source_fd >= 0) {
+		UT_ASSERT(pgrac_fenced_ipmi_sha256_fd(source_fd, adapter.executable_sha256));
+		(void)close(source_fd);
 	}
 	UT_ASSERT_EQ(pgrac_fenced_ipmi_executable_open(&adapter), -1);
 	UT_ASSERT_EQ(unlink(path), 0);
@@ -327,8 +311,8 @@ UT_TEST(test_invocation_uses_only_fixed_numeric_argv)
 
 	len = make_adapter(bytes, 4, VALID_PATH);
 	UT_ASSERT(pgrac_fenced_ipmi_adapter_parse(bytes, len, &adapter));
-	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(&adapter, "admin",
-		"/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
+	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(
+		&adapter, "admin", "/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
 		PGRAC_FENCED_IPMI_COMMAND_GUID, &invocation));
 	UT_ASSERT_EQ(invocation.argc, 16);
 	UT_ASSERT_STR_EQ(invocation.argv[0], "ipmitool");
@@ -344,58 +328,53 @@ UT_TEST(test_invocation_uses_only_fixed_numeric_argv)
 	UT_ASSERT_STR_EQ(invocation.argv[10], "admin");
 	UT_ASSERT_STR_EQ(invocation.argv[11], "-f");
 	UT_ASSERT_STR_EQ(invocation.argv[12],
-		"/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password");
+					 "/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password");
 	UT_ASSERT_STR_EQ(invocation.argv[13], "raw");
 	UT_ASSERT_STR_EQ(invocation.argv[14], "0x06");
 	UT_ASSERT_STR_EQ(invocation.argv[15], "0x37");
 	UT_ASSERT_NULL(invocation.argv[16]);
 
-	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(&adapter, "admin",
-		"/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
+	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(
+		&adapter, "admin", "/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
 		PGRAC_FENCED_IPMI_COMMAND_OFF, &invocation));
 	UT_ASSERT_STR_EQ(invocation.argv[13], "chassis");
 	UT_ASSERT_STR_EQ(invocation.argv[14], "power");
 	UT_ASSERT_STR_EQ(invocation.argv[15], "off");
-	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(&adapter, "admin",
-		"/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
+	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(
+		&adapter, "admin", "/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
 		PGRAC_FENCED_IPMI_COMMAND_STATUS, &invocation));
 	UT_ASSERT_STR_EQ(invocation.argv[15], "status");
-	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(&adapter, "admin",
-		"/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
+	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(
+		&adapter, "admin", "/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
 		PGRAC_FENCED_IPMI_COMMAND_ON, &invocation));
 	UT_ASSERT_STR_EQ(invocation.argv[15], "on");
 
 	len = make_adapter(bytes, 6, VALID_PATH);
 	UT_ASSERT(pgrac_fenced_ipmi_adapter_parse(bytes, len, &adapter));
-	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(&adapter, "admin",
-		"/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
+	UT_ASSERT(pgrac_fenced_ipmi_invocation_build(
+		&adapter, "admin", "/etc/pgrac/credentials/ipmi-00112233445566778899aabbccddeeff.password",
 		PGRAC_FENCED_IPMI_COMMAND_STATUS, &invocation));
 	UT_ASSERT_STR_EQ(invocation.argv[4], "2001::1");
 }
 
 UT_TEST(test_guid_result_parser_is_byte_exact)
 {
-	static const uint8 valid[] =
-		" 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n";
+	static const uint8 valid[] = " 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n";
 	uint8 output[sizeof(valid)];
 	uint8 uuid[16];
 	size_t i;
 
 	UT_ASSERT_EQ(sizeof(valid) - 1, 49);
-	UT_ASSERT(pgrac_fenced_ipmi_guid_result_parse(0, valid,
-		sizeof(valid) - 1, NULL, 0, uuid));
+	UT_ASSERT(pgrac_fenced_ipmi_guid_result_parse(0, valid, sizeof(valid) - 1, NULL, 0, uuid));
 	for (i = 0; i < sizeof(uuid); i++)
 		UT_ASSERT_EQ(uuid[i], i);
 	memcpy(output, valid, sizeof(valid));
 	output[31] = 'A';
-	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(0, output,
-		sizeof(valid) - 1, NULL, 0, uuid));
-	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(1, valid,
-		sizeof(valid) - 1, NULL, 0, uuid));
-	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(0, valid,
-		sizeof(valid) - 2, NULL, 0, uuid));
-	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(0, valid,
-		sizeof(valid) - 1, (const uint8 *) "x", 1, uuid));
+	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(0, output, sizeof(valid) - 1, NULL, 0, uuid));
+	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(1, valid, sizeof(valid) - 1, NULL, 0, uuid));
+	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(0, valid, sizeof(valid) - 2, NULL, 0, uuid));
+	UT_ASSERT(!pgrac_fenced_ipmi_guid_result_parse(0, valid, sizeof(valid) - 1, (const uint8 *)"x",
+												   1, uuid));
 }
 
 UT_TEST(test_power_and_action_results_are_byte_exact)
@@ -406,25 +385,21 @@ UT_TEST(test_power_and_action_results_are_byte_exact)
 	PgracFencedTargetState state = PGRAC_FENCED_TARGET_UNKNOWN;
 
 	memset(action_output, 'x', sizeof(action_output));
-	UT_ASSERT(pgrac_fenced_ipmi_power_result_parse(0, on, sizeof(on) - 1,
-		NULL, 0, &state));
+	UT_ASSERT(pgrac_fenced_ipmi_power_result_parse(0, on, sizeof(on) - 1, NULL, 0, &state));
 	UT_ASSERT_EQ(state, PGRAC_FENCED_TARGET_ON);
-	UT_ASSERT(pgrac_fenced_ipmi_power_result_parse(0, off, sizeof(off) - 1,
-		NULL, 0, &state));
+	UT_ASSERT(pgrac_fenced_ipmi_power_result_parse(0, off, sizeof(off) - 1, NULL, 0, &state));
 	UT_ASSERT_EQ(state, PGRAC_FENCED_TARGET_OFF);
-	UT_ASSERT(!pgrac_fenced_ipmi_power_result_parse(0, on, sizeof(on),
-		NULL, 0, &state));
-	UT_ASSERT(!pgrac_fenced_ipmi_power_result_parse(0,
-		(const uint8 *) "Chassis Power is unknown\n", 25, NULL, 0, &state));
+	UT_ASSERT(!pgrac_fenced_ipmi_power_result_parse(0, on, sizeof(on), NULL, 0, &state));
+	UT_ASSERT(!pgrac_fenced_ipmi_power_result_parse(0, (const uint8 *)"Chassis Power is unknown\n",
+													25, NULL, 0, &state));
 	UT_ASSERT(!pgrac_fenced_ipmi_power_result_parse(0, off, sizeof(off) - 1,
-		(const uint8 *) "warning\n", 8, &state));
-	UT_ASSERT(pgrac_fenced_ipmi_action_result_validate(0, action_output,
-		PGRAC_FENCED_IPMI_ACTION_OUTPUT_MAX, NULL, 0));
-	UT_ASSERT(!pgrac_fenced_ipmi_action_result_validate(0, action_output,
-		PGRAC_FENCED_IPMI_ACTION_OUTPUT_MAX + 1, NULL, 0));
+													(const uint8 *)"warning\n", 8, &state));
+	UT_ASSERT(pgrac_fenced_ipmi_action_result_validate(
+		0, action_output, PGRAC_FENCED_IPMI_ACTION_OUTPUT_MAX, NULL, 0));
+	UT_ASSERT(!pgrac_fenced_ipmi_action_result_validate(
+		0, action_output, PGRAC_FENCED_IPMI_ACTION_OUTPUT_MAX + 1, NULL, 0));
 	UT_ASSERT(!pgrac_fenced_ipmi_action_result_validate(1, NULL, 0, NULL, 0));
-	UT_ASSERT(!pgrac_fenced_ipmi_action_result_validate(0, NULL, 0,
-		(const uint8 *) "warning\n", 8));
+	UT_ASSERT(!pgrac_fenced_ipmi_action_result_validate(0, NULL, 0, (const uint8 *)"warning\n", 8));
 }
 
 UT_TEST(test_uncertified_readback_never_claims_io_drained)
@@ -433,17 +408,15 @@ UT_TEST(test_uncertified_readback_never_claims_io_drained)
 	uint8 uuid[16];
 
 	memset(uuid, 0x42, sizeof(uuid));
-	UT_ASSERT(pgrac_fenced_ipmi_uncertified_readback(uuid,
-		PGRAC_FENCED_TARGET_OFF, &readback));
+	UT_ASSERT(pgrac_fenced_ipmi_uncertified_readback(uuid, PGRAC_FENCED_TARGET_OFF, &readback));
 	UT_ASSERT_EQ(readback.state, PGRAC_FENCED_TARGET_OFF);
 	UT_ASSERT_EQ(readback.io_drain_state, PGRAC_FENCED_IO_DRAIN_UNKNOWN);
 	UT_ASSERT(memcmp(readback.observed_target_uuid, uuid, sizeof(uuid)) == 0);
-	UT_ASSERT(pgrac_fenced_ipmi_uncertified_readback(uuid,
-		PGRAC_FENCED_TARGET_ON, &readback));
+	UT_ASSERT(pgrac_fenced_ipmi_uncertified_readback(uuid, PGRAC_FENCED_TARGET_ON, &readback));
 	UT_ASSERT_EQ(readback.state, PGRAC_FENCED_TARGET_ON);
 	UT_ASSERT_EQ(readback.io_drain_state, PGRAC_FENCED_IO_DRAIN_UNKNOWN);
-	UT_ASSERT(!pgrac_fenced_ipmi_uncertified_readback(uuid,
-		PGRAC_FENCED_TARGET_UNKNOWN, &readback));
+	UT_ASSERT(
+		!pgrac_fenced_ipmi_uncertified_readback(uuid, PGRAC_FENCED_TARGET_UNKNOWN, &readback));
 }
 
 int

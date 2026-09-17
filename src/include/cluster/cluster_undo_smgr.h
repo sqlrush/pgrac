@@ -132,20 +132,22 @@ typedef enum ClusterUndoSmgrPublishResult {
 	CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR
 } ClusterUndoSmgrPublishResult;
 
-extern ClusterUndoSmgrFinalState cluster_undo_smgr_probe_segment(
-	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
-	char block0[BLCKSZ]);
-extern bool cluster_undo_smgr_provision_temp_create(
-	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
-	char temp_path[MAXPGPATH]);
-extern ClusterUndoSmgrPublishResult cluster_undo_smgr_provision_temp_publish(
-	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
-	const char *temp_path, const char block0[BLCKSZ]);
-extern bool cluster_undo_smgr_provision_temp_cleanup(
-	ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_instance,
-	const char *temp_path);
-extern bool cluster_undo_smgr_cleanup_boot_foreign_temps(
-	ClusterUndoPathIntent intent, uint8 owner_instance);
+extern ClusterUndoSmgrFinalState cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent,
+																 uint32 segment_id,
+																 uint8 owner_instance,
+																 char block0[BLCKSZ]);
+extern bool cluster_undo_smgr_provision_temp_create(ClusterUndoPathIntent intent, uint32 segment_id,
+													uint8 owner_instance,
+													char temp_path[MAXPGPATH]);
+extern ClusterUndoSmgrPublishResult
+cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent, uint32 segment_id,
+										 uint8 owner_instance, const char *temp_path,
+										 const char block0[BLCKSZ]);
+extern bool cluster_undo_smgr_provision_temp_cleanup(ClusterUndoPathIntent intent,
+													 uint32 segment_id, uint8 owner_instance,
+													 const char *temp_path);
+extern bool cluster_undo_smgr_cleanup_boot_foreign_temps(ClusterUndoPathIntent intent,
+														 uint8 owner_instance);
 
 /*
  * A-prime immutable root-descriptor applicability mirror.  root_directory is
@@ -160,16 +162,15 @@ typedef enum ClusterUndoSmgrRootMirrorState {
 	CLUSTER_UNDO_SMGR_ROOT_MIRROR_IO_ERROR
 } ClusterUndoSmgrRootMirrorState;
 
-extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_probe(
-	const char *root_directory,
-	const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
+extern ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_probe(const char *root_directory,
+										const uint8 expected[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+										uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
 extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_read_candidate(
-	const char *root_directory,
-	uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
-extern ClusterUndoSmgrRootMirrorState cluster_undo_smgr_root_descriptor_publish(
-	const char *root_directory,
-	const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
+	const char *root_directory, uint8 observed[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
+extern ClusterUndoSmgrRootMirrorState
+cluster_undo_smgr_root_descriptor_publish(const char *root_directory,
+										  const uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
 
 
 /*

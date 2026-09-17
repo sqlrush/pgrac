@@ -13,7 +13,7 @@
 #define CLUSTER_SEMANTIC_ACTIVATION_H
 
 #include "c.h"
-#include "common/sha2.h" /* PG_SHA256_DIGEST_LENGTH (contract seam) */
+#include "common/sha2.h"				  /* PG_SHA256_DIGEST_LENGTH (contract seam) */
 #include "cluster/cluster_control_root.h" /* file token + round (contract seam) */
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_undo_root_descriptor.h"
@@ -302,8 +302,7 @@ typedef struct ClusterSemanticActivationDescriptor {
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter(uint64 feature_bit, ClusterSemanticAdmissionSide side,
 								  ClusterSemanticAdmissionToken *token);
-extern ResourceXWriterPath
-cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out);
+extern ResourceXWriterPath cluster_resource_x_writer_path_snapshot(uint64 *r4_generation_out);
 extern bool cluster_semantic_activation_phase1_pristine(void);
 /* Postmaster lifecycle hint only: atomics, no locks/I/O/identity copy.
  * True includes unknown state; it never authorizes a shutdown or OPEN. */
@@ -342,41 +341,36 @@ cluster_semantic_activation_r11_cutover_snapshot(ClusterSemanticR11CutoverSnapsh
 extern bool cluster_semantic_activation_recheck(const ClusterSemanticAdmissionToken *token);
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_enter_r4_terminal_census(ClusterSemanticAdmissionToken *token);
-extern bool cluster_semantic_activation_recheck_r4_terminal_census(
-	const ClusterSemanticAdmissionToken *token);
+extern bool
+cluster_semantic_activation_recheck_r4_terminal_census(const ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_resolve_shared_undo_root(
-	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
-	uint32 owner_instance, uint32 segment_id,
-	ClusterUndoBlock0ResolvedRoot *out);
-extern bool
-cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
-	uint32 owner_instance, uint32 segment_id,
-	ClusterUndoBlock0ResolvedRoot *out);
-extern bool
-cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent,
-	uint32 owner_instance, uint32 segment_id,
-	ClusterUndoBlock0ResolvedRoot *out);
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent, uint32 owner_instance,
+	uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out);
+extern bool cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent, uint32 owner_instance,
+	uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out);
+extern bool cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+	const ClusterSemanticAdmissionToken *token, ClusterUndoPathIntent intent, uint32 owner_instance,
+	uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out);
 extern bool cluster_semantic_activation_peer_open_matches(
 	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
 	uint32 required_hello_caps, uint32 sampled_capability_generation);
-extern bool cluster_semantic_activation_resource_x_peer_open_matches(
-	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
-	uint32 sampled_capability_generation);
+extern bool
+cluster_semantic_activation_resource_x_peer_open_matches(const ClusterSemanticAdmissionToken *token,
+														 int32 authenticated_peer_node_id,
+														 uint32 sampled_capability_generation);
 extern ClusterSemanticResourceXPeerOpenResult
-cluster_semantic_activation_resource_x_peer_open_check(
-	const ClusterSemanticAdmissionToken *token, int32 authenticated_peer_node_id,
-	uint32 sampled_capability_generation);
+cluster_semantic_activation_resource_x_peer_open_check(const ClusterSemanticAdmissionToken *token,
+													   int32 authenticated_peer_node_id,
+													   uint32 sampled_capability_generation);
 extern bool cluster_semantic_activation_restore_open_proof_if_active(void);
 extern void cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token);
 extern bool cluster_semantic_activation_backend_has_admission(void);
 extern ClusterSemanticAdmissionResult
 cluster_semantic_activation_modifier_enter(bool writable_admission,
-									   ClusterSemanticAdmissionToken *token);
-extern bool
-cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken *token,
-									 bool writable_admission);
+										   ClusterSemanticAdmissionToken *token);
+extern bool cluster_semantic_activation_modifier_recheck(const ClusterSemanticAdmissionToken *token,
+														 bool writable_admission);
 extern Size cluster_semantic_activation_shmem_size(void);
 extern void cluster_semantic_activation_shmem_init(void);
 /* RF-ROOT P7 (contract §B): the bit22 cutover reader latch — the dual-path
@@ -391,35 +385,31 @@ extern bool cluster_r4_bit22_cutover_verified(void);
  * first-open round (wal-state registry writer gate). */
 extern bool cluster_r4_bit22_source_writer_enter(void);
 extern void cluster_r4_bit22_source_writer_leave(void);
-extern bool cluster_r4_bit22_source_close_begin(uint64 transition_epoch,
-												uint64 prepare_generation);
+extern bool cluster_r4_bit22_source_close_begin(uint64 transition_epoch, uint64 prepare_generation);
 extern bool cluster_r4_bit22_source_close_current(uint64 transition_epoch,
 												  uint64 prepare_generation);
 extern bool cluster_r4_bit22_cutover_latch_verify(void);
-extern bool cluster_r4_bit22_cutover_latch_apply(uint64 transition_epoch,
-												 uint64 round_generation);
+extern bool cluster_r4_bit22_cutover_latch_apply(uint64 transition_epoch, uint64 round_generation);
 /* contract: the round driver stages the PREPARED token/sha/round here after
  * create_prepared; the coordinator LMON consumes it at the OPEN_APPLIED
  * advance (step ②). */
-extern bool cluster_r4_bit22_cutover_seam_store(
-	const ClusterControlRootFileToken *file_token,
-	const uint8 round_sha[PG_SHA256_DIGEST_LENGTH],
-	const ClusterControlRootMigrationRoundV1 *round);
+extern bool cluster_r4_bit22_cutover_seam_store(const ClusterControlRootFileToken *file_token,
+												const uint8 round_sha[PG_SHA256_DIGEST_LENGTH],
+												const ClusterControlRootMigrationRoundV1 *round);
 /* contract step ④c: the round driver entry — coordinator backend, with the
  * constructed migration image + round. */
-extern bool cluster_r4_bit22_cutover_begin(
-	const ClusterControlRootMigrationImage *image,
-	const ClusterControlRootMigrationRoundV1 *round);
+extern bool cluster_r4_bit22_cutover_begin(const ClusterControlRootMigrationImage *image,
+										   const ClusterControlRootMigrationRoundV1 *round);
 extern void
 cluster_semantic_activation_register(const ClusterSemanticActivationDescriptor *descriptor);
 extern const ClusterSemanticActivationDescriptor *
 cluster_semantic_activation_descriptor(uint64 feature_bit);
 extern uint64 cluster_semantic_activation_compiled_feature_bitmap(void);
 extern bool cluster_semantic_activation_record_encode(const ClusterSemanticActivationRecord *record,
-												  uint8 bytes[512]);
+													  uint8 bytes[512]);
 extern bool cluster_semantic_activation_record_decode(const uint8 bytes[512],
-												  ClusterSemanticActivationRecord *record,
-												  ClusterSemanticActivationRefusal *refusal);
+													  ClusterSemanticActivationRecord *record,
+													  ClusterSemanticActivationRefusal *refusal);
 extern bool cluster_semantic_activation_ack_wire_encode(
 	const ClusterSemanticActivationAckWireV1 *message,
 	uint8 bytes[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES]);
@@ -432,34 +422,30 @@ extern bool
 cluster_semantic_activation_qvotec_poll_record_cas(ClusterSemanticActivationCasRequest *out);
 extern bool
 cluster_semantic_activation_qvotec_complete_record_cas(uint64 request_seq,
-												   ClusterSemanticActivationResult result);
-extern bool cluster_semantic_activation_qvotec_poll_record_read(
-	ClusterSemanticActivationReadRequest *out);
+													   ClusterSemanticActivationResult result);
+extern bool
+cluster_semantic_activation_qvotec_poll_record_read(ClusterSemanticActivationReadRequest *out);
 extern bool cluster_semantic_activation_qvotec_complete_record_read(
-	uint64 request_seq, ClusterSemanticActivationResult result,
-	bool implicit_open,
+	uint64 request_seq, ClusterSemanticActivationResult result, bool implicit_open,
 	const uint8 selected_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES]);
 extern bool cluster_semantic_activation_undo_root_descriptor_mailbox_submit(
-	const ClusterSemanticFormationBinding *formation,
-	uint64 system_identifier,
-	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES],
-	uint64 *out_request_seq);
+	const ClusterSemanticFormationBinding *formation, uint64 system_identifier,
+	const uint8 desired_bytes[CLUSTER_SEMANTIC_ACTIVATION_RECORD_BYTES], uint64 *out_request_seq);
 extern bool cluster_semantic_activation_qvotec_pgrd_formation_matches(
 	const ClusterSemanticFormationBinding *formation);
-extern bool cluster_semantic_activation_qvotec_poll_undo_root_descriptor(
-	ClusterUndoRootDescriptorRequest *out);
+extern bool
+cluster_semantic_activation_qvotec_poll_undo_root_descriptor(ClusterUndoRootDescriptorRequest *out);
 extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor(
 	uint64 request_seq, ClusterSemanticActivationResult result);
-extern bool
-cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
+extern bool cluster_semantic_activation_undo_root_descriptor_mailbox_poll_completion(
 	uint64 request_seq, ClusterSemanticActivationResult *out_result);
 extern bool cluster_semantic_activation_qvotec_poll_undo_root_descriptor_read(
 	ClusterUndoRootDescriptorReadRequest *out);
 extern bool cluster_semantic_activation_qvotec_complete_undo_root_descriptor_read(
 	uint64 request_seq, ClusterUndoRootDescriptorState state,
 	const uint8 selected_bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES]);
-extern void cluster_semantic_activation_ack_handler(
-	const ClusterICEnvelope *env, const void *payload);
+extern void cluster_semantic_activation_ack_handler(const ClusterICEnvelope *env,
+													const void *payload);
 extern void cluster_semantic_activation_lmon_tick(void);
 /* RF-ROOT P7 G3: the R4 cutover coordinator proof reads the ACK table's
  * COMPLETE state bound to the exact round identity (transition epoch,
@@ -469,11 +455,9 @@ extern void cluster_semantic_activation_lmon_tick(void);
  * table stands at (or beyond) minimum_stage — SAMPLE for the create proof,
  * PREPARED for the activate proof (the W6 clause 3 CLOSED binding). */
 extern bool cluster_semantic_activation_ack_complete_matches(
-	uint64 transition_epoch, uint64 record_generation,
-	uint64 expected_members_lo, uint64 expected_members_hi,
-	uint64 source_feature_bitmap, uint64 target_feature_bitmap,
-	uint64 capability_sample_digest,
-	ClusterSemanticActivationAckStage minimum_stage);
+	uint64 transition_epoch, uint64 record_generation, uint64 expected_members_lo,
+	uint64 expected_members_hi, uint64 source_feature_bitmap, uint64 target_feature_bitmap,
+	uint64 capability_sample_digest, ClusterSemanticActivationAckStage minimum_stage);
 extern ClusterSemanticActivationResult
 cluster_semantic_activation_submit(ClusterSemanticActivationAction action,
 								   ClusterSemanticActivationRefusal *refusal);

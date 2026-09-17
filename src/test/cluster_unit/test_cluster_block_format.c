@@ -170,7 +170,7 @@ UT_TEST(test_page_lsn_origin_roundtrip_preserves_other_flags)
 	UT_ASSERT(PageGetLSNOrigin((Page)&ph, &origin));
 	UT_ASSERT_EQ(origin, 0);
 	UT_ASSERT_EQ(ph.pd_flags & (PD_HAS_ITL | PD_CLUSTER_FORCE_FPI),
-		PD_HAS_ITL | PD_CLUSTER_FORCE_FPI);
+				 PD_HAS_ITL | PD_CLUSTER_FORCE_FPI);
 	PageSetLSNOrigin((Page)&ph, PGRAC_PAGE_LSN_ORIGIN_MAX);
 	UT_ASSERT(PageGetLSNOrigin((Page)&ph, &origin));
 	UT_ASSERT_EQ(origin, PGRAC_PAGE_LSN_ORIGIN_MAX);

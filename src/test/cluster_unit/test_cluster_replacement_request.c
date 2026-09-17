@@ -57,15 +57,11 @@ UT_TEST(test_replacement_request_exact_layout_and_roundtrip)
 	ClusterReplacementRequestMarker marker = valid_marker();
 	ClusterReplacementRequestMarker decoded;
 	uint8 image[CLUSTER_REPLACEMENT_MARKER_BYTES];
-	static const uint8 expected_prefix[56] = {
-		0x4d, 0x4c, 0x50, 0x52, 0x01, 0x00, 0x01, 0x00,
-		0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-		0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
-		0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
-		0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
-		0xe4, 0x05, 0x89, 0x42, 0x5b, 0xae, 0x0d, 0x8e
-	};
+	static const uint8 expected_prefix[56]
+		= { 0x4d, 0x4c, 0x50, 0x52, 0x01, 0x00, 0x01, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x18, 0x17, 0x16, 0x15,
+			0x14, 0x13, 0x12, 0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21, 0x38, 0x37,
+			0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0xe4, 0x05, 0x89, 0x42, 0x5b, 0xae, 0x0d, 0x8e };
 
 	memset(image, 0xa5, sizeof(image));
 	UT_ASSERT(cluster_replacement_request_encode(&marker, image));
@@ -78,8 +74,7 @@ UT_TEST(test_replacement_request_exact_layout_and_roundtrip)
 	UT_ASSERT(cluster_replacement_request_decode(image, 3, &decoded));
 	UT_ASSERT_EQ(decoded.target_node_id, 3);
 	UT_ASSERT_EQ(decoded.baseline_epoch, marker.baseline_epoch);
-	UT_ASSERT_EQ(decoded.old_admitted_incarnation,
-				 marker.old_admitted_incarnation);
+	UT_ASSERT_EQ(decoded.old_admitted_incarnation, marker.old_admitted_incarnation);
 	UT_ASSERT_EQ(decoded.fresh_incarnation, marker.fresh_incarnation);
 	UT_ASSERT_EQ(decoded.request_nonce, marker.request_nonce);
 	UT_ASSERT_EQ(decoded.grammar_fingerprint, marker.grammar_fingerprint);
@@ -139,28 +134,26 @@ UT_TEST(test_replacement_request_reserved1_pack_clear_is_exact)
 	memset(reserved1, 0x7c, sizeof(reserved1));
 	memcpy(before, reserved1, sizeof(before));
 	UT_ASSERT(cluster_replacement_request_pack(reserved1, &marker));
-	UT_ASSERT_EQ(memcmp(reserved1, before,
-				 CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET), 0);
-	UT_ASSERT_EQ(memcmp(
-		reserved1 + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			+ CLUSTER_REPLACEMENT_MARKER_BYTES,
-		before + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			+ CLUSTER_REPLACEMENT_MARKER_BYTES,
-		sizeof(reserved1) - CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			- CLUSTER_REPLACEMENT_MARKER_BYTES), 0);
+	UT_ASSERT_EQ(memcmp(reserved1, before, CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET), 0);
+	UT_ASSERT_EQ(memcmp(reserved1 + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
+							+ CLUSTER_REPLACEMENT_MARKER_BYTES,
+						before + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
+							+ CLUSTER_REPLACEMENT_MARKER_BYTES,
+						sizeof(reserved1) - CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
+							- CLUSTER_REPLACEMENT_MARKER_BYTES),
+				 0);
 	UT_ASSERT(cluster_replacement_request_unpack(reserved1, 3, &decoded));
 	UT_ASSERT_EQ(decoded.request_nonce, marker.request_nonce);
 	cluster_replacement_request_clear(reserved1);
 	UT_ASSERT(cluster_replacement_request_is_clear(reserved1));
-	UT_ASSERT_EQ(memcmp(reserved1, before,
-				 CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET), 0);
-	UT_ASSERT_EQ(memcmp(
-		reserved1 + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			+ CLUSTER_REPLACEMENT_MARKER_BYTES,
-		before + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			+ CLUSTER_REPLACEMENT_MARKER_BYTES,
-		sizeof(reserved1) - CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			- CLUSTER_REPLACEMENT_MARKER_BYTES), 0);
+	UT_ASSERT_EQ(memcmp(reserved1, before, CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET), 0);
+	UT_ASSERT_EQ(memcmp(reserved1 + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
+							+ CLUSTER_REPLACEMENT_MARKER_BYTES,
+						before + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
+							+ CLUSTER_REPLACEMENT_MARKER_BYTES,
+						sizeof(reserved1) - CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
+							- CLUSTER_REPLACEMENT_MARKER_BYTES),
+				 0);
 }
 
 UT_TEST(test_replacement_request_slot_state_requires_exact_pair)
@@ -173,37 +166,37 @@ UT_TEST(test_replacement_request_slot_state_requires_exact_pair)
 	memset(reserved1, 0, sizeof(reserved1));
 	memset(&sentinel, 0x5a, sizeof(sentinel));
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_replacement_request_slot_state(
-		0, reserved1, 3, marker.fresh_incarnation, &decoded),
+	UT_ASSERT_EQ(
+		cluster_replacement_request_slot_state(0, reserved1, 3, marker.fresh_incarnation, &decoded),
 		CLUSTER_REPLACEMENT_REQUEST_SLOT_CLEAR);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	UT_ASSERT(cluster_replacement_request_pack(reserved1, &marker));
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_replacement_request_slot_state(
-		CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED, reserved1, 3,
-		marker.fresh_incarnation, &decoded),
+	UT_ASSERT_EQ(
+		cluster_replacement_request_slot_state(CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED,
+											   reserved1, 3, marker.fresh_incarnation, &decoded),
 		CLUSTER_REPLACEMENT_REQUEST_SLOT_VALID);
 	UT_ASSERT_EQ(decoded.request_nonce, marker.request_nonce);
 
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_replacement_request_slot_state(
-		0, reserved1, 3, marker.fresh_incarnation, &decoded),
+	UT_ASSERT_EQ(
+		cluster_replacement_request_slot_state(0, reserved1, 3, marker.fresh_incarnation, &decoded),
 		CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	decoded = sentinel;
 	UT_ASSERT_EQ(cluster_replacement_request_slot_state(
-		CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED, reserved1, 3,
-		marker.fresh_incarnation + 1, &decoded),
-		CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD);
+					 CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED, reserved1, 3,
+					 marker.fresh_incarnation + 1, &decoded),
+				 CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	cluster_replacement_request_clear(reserved1);
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_replacement_request_slot_state(
-		CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED, reserved1, 3,
-		marker.fresh_incarnation, &decoded),
+	UT_ASSERT_EQ(
+		cluster_replacement_request_slot_state(CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED,
+											   reserved1, 3, marker.fresh_incarnation, &decoded),
 		CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 }
@@ -220,9 +213,9 @@ UT_TEST(test_replacement_request_slot_state_rejects_corrupt_pair)
 	reserved1[CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET + 24] ^= UINT8_C(1);
 	memset(&sentinel, 0xa5, sizeof(sentinel));
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_replacement_request_slot_state(
-		CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED, reserved1, 3,
-		marker.fresh_incarnation, &decoded),
+	UT_ASSERT_EQ(
+		cluster_replacement_request_slot_state(CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED,
+											   reserved1, 3, marker.fresh_incarnation, &decoded),
 		CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 }
@@ -241,39 +234,37 @@ UT_TEST(test_replacement_request_preserve_is_per_disk_and_exact)
 	memcpy(before, next, sizeof(before));
 	flags = UINT64_C(0x1);
 	UT_ASSERT_EQ(cluster_replacement_request_preserve_per_disk(
-		CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED, prior, 3,
-		marker.fresh_incarnation, &flags, next),
-		CLUSTER_REPLACEMENT_REQUEST_SLOT_VALID);
-	UT_ASSERT_EQ(flags, UINT64_C(0x1)
-		| CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED);
-	UT_ASSERT_EQ(memcmp(next, before,
-		CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET), 0);
-	UT_ASSERT_EQ(memcmp(
-		next + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET,
-		prior + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET,
-		CLUSTER_REPLACEMENT_MARKER_BYTES), 0);
-	UT_ASSERT_EQ(memcmp(
-		next + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			+ CLUSTER_REPLACEMENT_MARKER_BYTES,
-		before + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			+ CLUSTER_REPLACEMENT_MARKER_BYTES,
-		sizeof(next) - CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-			- CLUSTER_REPLACEMENT_MARKER_BYTES), 0);
+					 CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED, prior, 3,
+					 marker.fresh_incarnation, &flags, next),
+				 CLUSTER_REPLACEMENT_REQUEST_SLOT_VALID);
+	UT_ASSERT_EQ(flags, UINT64_C(0x1) | CLUSTER_VOTING_SLOT_FLAG_REPLACEMENT_REQUESTED);
+	UT_ASSERT_EQ(memcmp(next, before, CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET), 0);
+	UT_ASSERT_EQ(memcmp(next + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET,
+						prior + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET,
+						CLUSTER_REPLACEMENT_MARKER_BYTES),
+				 0);
+	UT_ASSERT_EQ(
+		memcmp(
+			next + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET + CLUSTER_REPLACEMENT_MARKER_BYTES,
+			before + CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET + CLUSTER_REPLACEMENT_MARKER_BYTES,
+			sizeof(next) - CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
+				- CLUSTER_REPLACEMENT_MARKER_BYTES),
+		0);
 
 	memset(prior, 0, sizeof(prior));
 	memset(next, 0x3d, sizeof(next));
 	memcpy(before, next, sizeof(before));
 	flags = UINT64_C(0x1);
 	UT_ASSERT_EQ(cluster_replacement_request_preserve_per_disk(
-		0, prior, 3, marker.fresh_incarnation, &flags, next),
-		CLUSTER_REPLACEMENT_REQUEST_SLOT_CLEAR);
+					 0, prior, 3, marker.fresh_incarnation, &flags, next),
+				 CLUSTER_REPLACEMENT_REQUEST_SLOT_CLEAR);
 	UT_ASSERT_EQ(flags, UINT64_C(0x1));
 	UT_ASSERT_EQ(memcmp(next, before, sizeof(next)), 0);
 
 	UT_ASSERT(cluster_replacement_request_pack(prior, &marker));
 	UT_ASSERT_EQ(cluster_replacement_request_preserve_per_disk(
-		0, prior, 3, marker.fresh_incarnation, &flags, next),
-		CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD);
+					 0, prior, 3, marker.fresh_incarnation, &flags, next),
+				 CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD);
 	UT_ASSERT_EQ(flags, UINT64_C(0x1));
 	UT_ASSERT_EQ(memcmp(next, before, sizeof(next)), 0);
 }

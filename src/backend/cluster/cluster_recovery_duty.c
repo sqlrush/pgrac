@@ -15,7 +15,7 @@
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_semantic_activation.h" /* R4 cutover ACK proof (G3) */
-#include "cluster/cluster_wal_state.h" /* G4 runtime census gate (bit22) */
+#include "cluster/cluster_wal_state.h"			 /* G4 runtime census gate (bit22) */
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster_control_root_private.h"
 #include "cluster/cluster_startup_phase.h" /* serving rebind (recovery path retry) */
@@ -45,9 +45,8 @@ static ClusterControlRootPublishAuthorityV1 root_publish_authority;
 static void cluster_control_root_publish_authority_clear_v1(void);
 
 bool
-cluster_control_root_create_authority_current_v1(
-	const ClusterControlRootMigrationImage *image,
-	const ClusterControlRootMigrationRoundV1 *round)
+cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
+												 const ClusterControlRootMigrationRoundV1 *round)
 {
 	/* RF-ROOT P7 G3 (R4 cutover batch, Stage 8 contract): the
 	 * coordinator's exact one-shot proof, replacing the P5 refusal.  This
@@ -61,7 +60,7 @@ cluster_control_root_create_authority_current_v1(
 	if (image == NULL || round == NULL || cluster_node_id < 0
 		|| cluster_node_id >= CLUSTER_MAX_NODES)
 		return false;
-	if ((int32) round->coordinator_node_id != cluster_node_id)
+	if ((int32)round->coordinator_node_id != cluster_node_id)
 		return false;
 	/* RF-ROOT P9 verification (contract, follow-up option b): the bit22 cutover
 	 * round's create is EXEMPT from the SAMPLE-stage ACK precondition —
@@ -72,29 +71,23 @@ cluster_control_root_create_authority_current_v1(
 	 * capability sampling, which the cutover round bypasses (member set +
 	 * capabilities come from current_authority + IC sampling in begin).
 	 * R4 rounds (no bit22) keep the frozen precondition. */
-	if ((round->target_feature_bitmap
-		 & PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0
+	if ((round->target_feature_bitmap & PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0
 		&& !cluster_semantic_activation_ack_complete_matches(
-			round->transition_epoch, round->prepare_generation,
-			round->admitted_bitmap_low, round->admitted_bitmap_high,
-			round->source_feature_bitmap, round->target_feature_bitmap,
-			round->capability_sample_digest,
-			CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE))
+			round->transition_epoch, round->prepare_generation, round->admitted_bitmap_low,
+			round->admitted_bitmap_high, round->source_feature_bitmap, round->target_feature_bitmap,
+			round->capability_sample_digest, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_SAMPLE))
 		return false;
-	if (!cluster_control_root_feature_bitmap_is_known(
-			round->source_feature_bitmap)
-		|| !cluster_control_root_feature_bitmap_is_known(
-			round->target_feature_bitmap)
-		|| (round->target_feature_bitmap
-			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0)
+	if (!cluster_control_root_feature_bitmap_is_known(round->source_feature_bitmap)
+		|| !cluster_control_root_feature_bitmap_is_known(round->target_feature_bitmap)
+		|| (round->target_feature_bitmap & PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1)
+			   == 0)
 		return false;
 	return true;
 }
 
 bool
 cluster_control_root_activate_authority_current_v1(
-	const ClusterControlRootFileToken *expected_token,
-	const uint8 expected_round_sha256[32],
+	const ClusterControlRootFileToken *expected_token, const uint8 expected_round_sha256[32],
 	const ClusterControlRootMigrationRoundV1 *round)
 {
 	/* RF-ROOT P7 G3 (R4 cutover batch, Stage 8 contract + implementation /
@@ -113,30 +106,25 @@ cluster_control_root_activate_authority_current_v1(
 	if (expected_token == NULL || expected_round_sha256 == NULL || round == NULL
 		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
 		return false;
-	if ((int32) round->coordinator_node_id != cluster_node_id)
+	if ((int32)round->coordinator_node_id != cluster_node_id)
 		return false;
 	if (!cluster_semantic_activation_ack_complete_matches(
-			round->transition_epoch, round->prepare_generation,
-			round->admitted_bitmap_low, round->admitted_bitmap_high,
-			round->source_feature_bitmap, round->target_feature_bitmap,
-			round->capability_sample_digest,
-			CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED))
+			round->transition_epoch, round->prepare_generation, round->admitted_bitmap_low,
+			round->admitted_bitmap_high, round->source_feature_bitmap, round->target_feature_bitmap,
+			round->capability_sample_digest, CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_PREPARED))
 		return false;
-	if (!cluster_control_root_feature_bitmap_is_known(
-			round->source_feature_bitmap)
-		|| !cluster_control_root_feature_bitmap_is_known(
-			round->target_feature_bitmap)
-		|| (round->target_feature_bitmap
-			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1) == 0)
+	if (!cluster_control_root_feature_bitmap_is_known(round->source_feature_bitmap)
+		|| !cluster_control_root_feature_bitmap_is_known(round->target_feature_bitmap)
+		|| (round->target_feature_bitmap & PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1)
+			   == 0)
 		return false;
 	return true;
 }
 
 static bool
-cluster_control_root_publish_authority_bind_v1(
-	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootPatch *patch,
-	ClusterControlRootPublishReason reason)
+cluster_control_root_publish_authority_bind_v1(const ClusterControlRootReadToken *expected_token,
+											   const ClusterControlRootPatch *patch,
+											   ClusterControlRootPublishReason reason)
 {
 	if (root_publish_authority.active || expected_token == NULL || patch == NULL
 		|| (reason != CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN
@@ -163,11 +151,10 @@ cluster_control_root_publish_authority_bind_v1(
 }
 
 ClusterControlRootResult
-cluster_control_root_recovery_complete_publish_v1(
-	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootPatch *patch,
-	ClusterControlRootSnapshot *out_snapshot,
-	ClusterControlRootReadToken *out_token)
+cluster_control_root_recovery_complete_publish_v1(const ClusterControlRootReadToken *expected_token,
+												  const ClusterControlRootPatch *patch,
+												  ClusterControlRootSnapshot *out_snapshot,
+												  ClusterControlRootReadToken *out_token)
 {
 	ClusterControlRootResult result;
 
@@ -175,21 +162,18 @@ cluster_control_root_recovery_complete_publish_v1(
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
-	if (expected_token == NULL || patch == NULL ||
-		patch->mask != (CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE |
-			CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS) ||
-		patch->expected_lifecycle !=
-			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
-		patch->desired.lifecycle !=
-			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE ||
-		!cluster_control_root_publish_authority_bind_v1(
-			expected_token, patch,
-			CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE))
+	if (expected_token == NULL || patch == NULL
+		|| patch->mask
+			   != (CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE
+				   | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS)
+		|| patch->expected_lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| patch->desired.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+		|| !cluster_control_root_publish_authority_bind_v1(
+			expected_token, patch, CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = cluster_control_root_compare_and_publish(
-		expected_token, patch,
-		CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE,
-		out_snapshot, out_token);
+		expected_token, patch, CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE, out_snapshot,
+		out_token);
 	cluster_control_root_publish_authority_clear_v1();
 	return result;
 }
@@ -201,16 +185,15 @@ cluster_control_root_publish_authority_clear_v1(void)
 }
 
 bool
-cluster_control_root_publish_authority_current_v1(
-	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootPatch *patch,
-	ClusterControlRootPublishReason reason)
+cluster_control_root_publish_authority_current_v1(const ClusterControlRootReadToken *expected_token,
+												  const ClusterControlRootPatch *patch,
+												  ClusterControlRootPublishReason reason)
 {
-	bool exact = root_publish_authority.active && expected_token != NULL
-		&& patch != NULL && reason == root_publish_authority.reason
-		&& memcmp(expected_token, &root_publish_authority.token,
-				  sizeof(*expected_token)) == 0
-		&& memcmp(patch, &root_publish_authority.patch, sizeof(*patch)) == 0;
+	bool exact
+		= root_publish_authority.active && expected_token != NULL && patch != NULL
+		  && reason == root_publish_authority.reason
+		  && memcmp(expected_token, &root_publish_authority.token, sizeof(*expected_token)) == 0
+		  && memcmp(patch, &root_publish_authority.patch, sizeof(*patch)) == 0;
 
 	/* One exact compare-and-publish attempt consumes the authority before the
 	 * control-root layer can acquire CF or touch storage.  A failed or nested
@@ -248,9 +231,8 @@ write_u64_le(uint8 *dst, uint64 value)
 }
 
 bool
-cluster_recovery_duty_key_encode_v1(
-	const ClusterRecoveryDutyKey *key,
-	uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES])
+cluster_recovery_duty_key_encode_v1(const ClusterRecoveryDutyKey *key,
+									uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES])
 {
 	if (out == NULL)
 		return false;
@@ -285,8 +267,7 @@ cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
 }
 
 bool
-cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key,
-								ClusterRecoveryDutyDigest *out)
+cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key, ClusterRecoveryDutyDigest *out)
 {
 	static const uint8 domain[19] = "PGRAC-ROOT-DUTY-V1";
 	uint8 preimage[19 + 4 + CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
@@ -298,14 +279,12 @@ cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key,
 	memset(out, 0, sizeof(*out));
 	memcpy(preimage, domain, sizeof(domain));
 	write_u32_le(preimage + sizeof(domain), CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES);
-	if (!cluster_recovery_duty_key_encode_v1(
-			key, preimage + sizeof(domain) + sizeof(uint32)))
+	if (!cluster_recovery_duty_key_encode_v1(key, preimage + sizeof(domain) + sizeof(uint32)))
 		return false;
 	ctx = pg_cryptohash_create(PG_SHA256);
 	if (ctx == NULL)
 		return false;
-	if (pg_cryptohash_init(ctx) >= 0
-		&& pg_cryptohash_update(ctx, preimage, sizeof(preimage)) >= 0
+	if (pg_cryptohash_init(ctx) >= 0 && pg_cryptohash_update(ctx, preimage, sizeof(preimage)) >= 0
 		&& pg_cryptohash_final(ctx, out->bytes, sizeof(out->bytes)) >= 0)
 		success = true;
 	pg_cryptohash_free(ctx);
@@ -331,10 +310,8 @@ owner_marker_committed_valid(const ClusterJoinCommitMarker *marker, int32 node_i
 {
 	pg_crc32c crc;
 
-	if (marker->magic != CLUSTER_JCMK_MAGIC
-		|| marker->version != CLUSTER_JCMK_VERSION
-		|| marker->node_id != node_id
-		|| marker->phase != CLUSTER_JCMK_PHASE_COMMITTED
+	if (marker->magic != CLUSTER_JCMK_MAGIC || marker->version != CLUSTER_JCMK_VERSION
+		|| marker->node_id != node_id || marker->phase != CLUSTER_JCMK_PHASE_COMMITTED
 		|| marker->admitted_incarnation == 0)
 		return false;
 	INIT_CRC32C(crc);
@@ -344,11 +321,11 @@ owner_marker_committed_valid(const ClusterJoinCommitMarker *marker, int32 node_i
 }
 
 ClusterRecoveryOwnerImportResult
-cluster_recovery_owner_import_select_v1(
-	int32 node_id, const ClusterWalThreadClaim *immutable_claim,
-	uint64 frozen_admitted_bitmap_low, uint64 frozen_admitted_bitmap_high,
-	const ClusterRecoveryOwnerDiskSampleV1 *samples, int total_disk_count,
-	uint64 *out_incarnation)
+cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
+										uint64 frozen_admitted_bitmap_low,
+										uint64 frozen_admitted_bitmap_high,
+										const ClusterRecoveryOwnerDiskSampleV1 *samples,
+										int total_disk_count, uint64 *out_incarnation)
 {
 	ClusterJoinCommitMarker committed[CLUSTER_MAX_VOTING_DISKS];
 	uint32 majority;
@@ -360,17 +337,15 @@ cluster_recovery_owner_import_select_v1(
 
 	if (out_incarnation != NULL)
 		*out_incarnation = 0;
-	if (out_incarnation == NULL || immutable_claim == NULL || samples == NULL
-		|| node_id < 0 || node_id >= CLUSTER_MAX_NODES
-		|| total_disk_count <= 0 || total_disk_count > CLUSTER_MAX_VOTING_DISKS)
+	if (out_incarnation == NULL || immutable_claim == NULL || samples == NULL || node_id < 0
+		|| node_id >= CLUSTER_MAX_NODES || total_disk_count <= 0
+		|| total_disk_count > CLUSTER_MAX_VOTING_DISKS)
 		return CLUSTER_RECOVERY_OWNER_IMPORT_BAD_ARGUMENT;
-	if (!cluster_wal_thread_claim_validate(
-			immutable_claim, (uint16)(node_id + 1), node_id, NULL))
+	if (!cluster_wal_thread_claim_validate(immutable_claim, (uint16)(node_id + 1), node_id, NULL))
 		return CLUSTER_RECOVERY_OWNER_IMPORT_CLAIM_MISMATCH;
 	initial_member = node_id < 64
-					 ? (frozen_admitted_bitmap_low & (UINT64_C(1) << node_id)) != 0
-					 : (frozen_admitted_bitmap_high
-						& (UINT64_C(1) << (node_id - 64))) != 0;
+						 ? (frozen_admitted_bitmap_low & (UINT64_C(1) << node_id)) != 0
+						 : (frozen_admitted_bitmap_high & (UINT64_C(1) << (node_id - 64))) != 0;
 	majority = (uint32)(total_disk_count / 2) + 1;
 	for (i = 0; i < total_disk_count; i++) {
 		const ClusterJoinCommitMarker *marker = &samples[i].join_marker;
@@ -412,8 +387,7 @@ cluster_recovery_owner_import_select_v1(
 		int j;
 
 		if (samples[i].slot_io_state != CLUSTER_VOTING_DISK_IO_OK
-			|| samples[i].slot.node_id != (uint32)node_id
-			|| samples[i].slot.incarnation == 0)
+			|| samples[i].slot.node_id != (uint32)node_id || samples[i].slot.incarnation == 0)
 			continue;
 		candidate = samples[i].slot.incarnation;
 		for (j = 0; j < total_disk_count; j++)
@@ -443,18 +417,16 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 	ClusterWalThreadClaim immutable_claim;
 	uint64 proven_incarnation = 0;
 
-	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES
-		|| admitted_incarnation == 0)
+	if (node_id < 0 || node_id >= CLUSTER_MAX_NODES || admitted_incarnation == 0)
 		return false;
-	root_result = cluster_control_root_lookup_owner_by_node_runtime(
-		node_id, &identity, &snapshot, &token);
+	root_result
+		= cluster_control_root_lookup_owner_by_node_runtime(node_id, &identity, &snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| !cluster_recovery_duty_key_valid_v1(&identity)
 		|| cluster_recovery_duty_key_compare(&identity, &snapshot.identity)
 			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
-		|| (snapshot.lifecycle
-				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+		|| (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 			&& snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 			/* RF-ROOT P6 (STOP-01 contract, corrected
 			 * design):  a CLOSED root is the same-owner clean release
@@ -486,20 +458,18 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 		 * incarnation (admitted == root owner) fails closed AT THE CAS and
 		 * converges once the qvotec prior-incarnation slot ages out — the
 		 * head gate only needs the exhausted-lineage reject. */
-		|| (snapshot.lifecycle
-				== CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
+		|| (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE
 			&& (identity.root_lineage_seq == UINT64_MAX
 				|| identity.origin_owner_incarnation >= admitted_incarnation))
 		|| (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 			&& identity.root_lineage_seq == UINT64_MAX))
 		return false;
-	cluster_wal_thread_claim_fill(
-		&immutable_claim, identity.origin_thread_id, identity.origin_node_id,
-		identity.thread_claim_created_at);
+	cluster_wal_thread_claim_fill(&immutable_claim, identity.origin_thread_id,
+								  identity.origin_node_id, identity.thread_claim_created_at);
 	if (immutable_claim.crc != identity.thread_claim_crc32c)
 		return false;
-	owner_result = cluster_recovery_owner_import_read_v1(
-		node_id, &immutable_claim, 0, 0, &proven_incarnation);
+	owner_result = cluster_recovery_owner_import_read_v1(node_id, &immutable_claim, 0, 0,
+														 &proven_incarnation);
 	if (owner_result != CLUSTER_RECOVERY_OWNER_IMPORT_JCMK
 		|| proven_incarnation != admitted_incarnation)
 		return false;
@@ -511,19 +481,16 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 		return true;
 
 	memset(&patch, 0, sizeof(patch));
-	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE
-				 | CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE
-				 | CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT
-				 | CLUSTER_CONTROL_ROOT_PATCH_TAIL
+	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE | CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE
+				 | CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT | CLUSTER_CONTROL_ROOT_PATCH_TAIL
 				 | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
 	/* Frozen shapes (STOP-01 §17.4 + STOP-02): OWNER_REJOIN admits only the
 	 * RECOVERY_COMPLETE pre-lifecycle (crash-rejoin mainline); a CLOSED root
 	 * (clean release) reopens under the THREAD_OPEN reason with its frozen
 	 * CLOSED -> OPEN shape.  Same owner-lineage monotonicity + proof set. */
-	patch.expected_lifecycle =
-		(snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
-		? CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
-		: CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	patch.expected_lifecycle = (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+								   ? CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+								   : CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
 	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	patch.desired.identity.origin_owner_incarnation = admitted_incarnation;
 	patch.desired.identity.root_lineage_seq = identity.root_lineage_seq + 1;
@@ -534,28 +501,25 @@ cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation)
 	patch.desired.checkpoint_record_crc32c = snapshot.checkpoint_record_crc32c;
 	patch.desired.tail_tli = snapshot.tail_tli;
 	patch.desired.tail_validation_kind = snapshot.tail_validation_kind;
-	patch.desired.validated_tail_lsn_exclusive =
-		snapshot.validated_tail_lsn_exclusive;
+	patch.desired.validated_tail_lsn_exclusive = snapshot.validated_tail_lsn_exclusive;
 	patch.desired.tail_last_record_lsn = snapshot.tail_last_record_lsn;
 	patch.desired.tail_last_record_crc32c = snapshot.tail_last_record_crc32c;
 	patch.desired.recovered_tli = snapshot.recovered_tli;
-	patch.desired.recovered_through_lsn_exclusive =
-		snapshot.recovered_through_lsn_exclusive;
+	patch.desired.recovered_through_lsn_exclusive = snapshot.recovered_through_lsn_exclusive;
 	patch.desired.recovered_last_record_lsn = snapshot.recovered_last_record_lsn;
-	patch.desired.recovered_last_record_crc32c =
-		snapshot.recovered_last_record_crc32c;
+	patch.desired.recovered_last_record_crc32c = snapshot.recovered_last_record_crc32c;
 
 	if (!cluster_control_root_publish_authority_bind_v1(
 			&token, &patch,
 			(snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
-			? CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
-			: CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN))
+				? CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
+				: CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN))
 		return false;
 	root_result = cluster_control_root_compare_and_publish(
 		&token, &patch,
 		(snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
-		? CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
-		: CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
+			? CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN
+			: CLUSTER_CONTROL_ROOT_PUBLISH_OWNER_REJOIN,
 		&published, &published_token);
 	cluster_control_root_publish_authority_clear_v1();
 	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -598,8 +562,8 @@ cluster_control_root_thread_clean_close_publish(void)
 
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
 		return false;
-	root_result = cluster_control_root_lookup_owner_by_node_runtime(
-		cluster_node_id, &identity, &snapshot, &token);
+	root_result = cluster_control_root_lookup_owner_by_node_runtime(cluster_node_id, &identity,
+																	&snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| !cluster_recovery_duty_key_valid_v1(&identity)
@@ -609,10 +573,8 @@ cluster_control_root_thread_clean_close_publish(void)
 		return false; /* not an open owner of this thread: nothing to close */
 
 	memset(&patch, 0, sizeof(patch));
-	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE
-				 | CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT
-				 | CLUSTER_CONTROL_ROOT_PATCH_TAIL
-				 | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
+	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE | CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT
+				 | CLUSTER_CONTROL_ROOT_PATCH_TAIL | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
 	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
 	patch.desired.root_flags = snapshot.root_flags;
@@ -622,31 +584,27 @@ cluster_control_root_thread_clean_close_publish(void)
 	patch.desired.checkpoint_record_crc32c = snapshot.checkpoint_record_crc32c;
 	patch.desired.tail_tli = snapshot.tail_tli;
 	patch.desired.tail_validation_kind = snapshot.tail_validation_kind;
-	patch.desired.validated_tail_lsn_exclusive =
-		snapshot.validated_tail_lsn_exclusive;
+	patch.desired.validated_tail_lsn_exclusive = snapshot.validated_tail_lsn_exclusive;
 	patch.desired.tail_last_record_lsn = snapshot.tail_last_record_lsn;
 	patch.desired.tail_last_record_crc32c = snapshot.tail_last_record_crc32c;
 	patch.desired.recovered_tli = snapshot.recovered_tli;
-	patch.desired.recovered_through_lsn_exclusive =
-		snapshot.recovered_through_lsn_exclusive;
+	patch.desired.recovered_through_lsn_exclusive = snapshot.recovered_through_lsn_exclusive;
 	patch.desired.recovered_last_record_lsn = snapshot.recovered_last_record_lsn;
-	patch.desired.recovered_last_record_crc32c =
-		snapshot.recovered_last_record_crc32c;
+	patch.desired.recovered_last_record_crc32c = snapshot.recovered_last_record_crc32c;
 
 	if (!cluster_control_root_publish_authority_bind_v1(
 			&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE))
 		return false;
 	root_result = cluster_control_root_compare_and_publish(
-		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE,
-		&published, &published_token);
+		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE, &published,
+		&published_token);
 	cluster_control_root_publish_authority_clear_v1();
 	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& published.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED) {
-		ereport(LOG,
-				(errmsg("cluster control root: thread %u clean-closed by owner node %d "
-						"(owner incarnation " UINT64_FORMAT ")",
-						identity.origin_thread_id, cluster_node_id,
-						identity.origin_owner_incarnation)));
+		ereport(LOG, (errmsg("cluster control root: thread %u clean-closed by owner node %d "
+							 "(owner incarnation " UINT64_FORMAT ")",
+							 identity.origin_thread_id, cluster_node_id,
+							 identity.origin_owner_incarnation)));
 		return true;
 	}
 	return false;
@@ -676,11 +634,10 @@ cluster_control_root_thread_open_publish(uint64 boot_incarnation)
 	ClusterControlRootPatch patch;
 	ClusterControlRootResult root_result;
 
-	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
-		|| boot_incarnation == 0)
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES || boot_incarnation == 0)
 		return false;
-	root_result = cluster_control_root_lookup_owner_by_node_runtime(
-		cluster_node_id, &identity, &snapshot, &token);
+	root_result = cluster_control_root_lookup_owner_by_node_runtime(cluster_node_id, &identity,
+																	&snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| !cluster_recovery_duty_key_valid_v1(&identity)
@@ -692,10 +649,8 @@ cluster_control_root_thread_open_publish(uint64 boot_incarnation)
 		return false; /* not a clean-closed thread of this owner, or stale */
 
 	memset(&patch, 0, sizeof(patch));
-	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE
-				 | CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE
-				 | CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT
-				 | CLUSTER_CONTROL_ROOT_PATCH_TAIL
+	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE | CLUSTER_CONTROL_ROOT_PATCH_OWNER_LINEAGE
+				 | CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT | CLUSTER_CONTROL_ROOT_PATCH_TAIL
 				 | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
 	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
 	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
@@ -708,23 +663,19 @@ cluster_control_root_thread_open_publish(uint64 boot_incarnation)
 	patch.desired.checkpoint_record_crc32c = snapshot.checkpoint_record_crc32c;
 	patch.desired.tail_tli = snapshot.tail_tli;
 	patch.desired.tail_validation_kind = snapshot.tail_validation_kind;
-	patch.desired.validated_tail_lsn_exclusive =
-		snapshot.validated_tail_lsn_exclusive;
+	patch.desired.validated_tail_lsn_exclusive = snapshot.validated_tail_lsn_exclusive;
 	patch.desired.tail_last_record_lsn = snapshot.tail_last_record_lsn;
 	patch.desired.tail_last_record_crc32c = snapshot.tail_last_record_crc32c;
 	patch.desired.recovered_tli = snapshot.recovered_tli;
-	patch.desired.recovered_through_lsn_exclusive =
-		snapshot.recovered_through_lsn_exclusive;
+	patch.desired.recovered_through_lsn_exclusive = snapshot.recovered_through_lsn_exclusive;
 	patch.desired.recovered_last_record_lsn = snapshot.recovered_last_record_lsn;
-	patch.desired.recovered_last_record_crc32c =
-		snapshot.recovered_last_record_crc32c;
+	patch.desired.recovered_last_record_crc32c = snapshot.recovered_last_record_crc32c;
 
-	if (!cluster_control_root_publish_authority_bind_v1(
-			&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN))
+	if (!cluster_control_root_publish_authority_bind_v1(&token, &patch,
+														CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN))
 		return false;
 	root_result = cluster_control_root_compare_and_publish(
-		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN,
-		&published, &published_token);
+		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_OPEN, &published, &published_token);
 	cluster_control_root_publish_authority_clear_v1();
 	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& published.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
@@ -732,11 +683,9 @@ cluster_control_root_thread_open_publish(uint64 boot_incarnation)
 		&& published.identity.root_lineage_seq == identity.root_lineage_seq + 1) {
 		ereport(LOG,
 				(errmsg("cluster control root: thread %u reopened by owner node %d "
-						"(owner incarnation %llu -> " UINT64_FORMAT ", lineage "
-						UINT64_FORMAT ")",
+						"(owner incarnation %llu -> " UINT64_FORMAT ", lineage " UINT64_FORMAT ")",
 						identity.origin_thread_id, cluster_node_id,
-						(unsigned long long)identity.origin_owner_incarnation,
-						boot_incarnation,
+						(unsigned long long)identity.origin_owner_incarnation, boot_incarnation,
 						identity.root_lineage_seq + 1)));
 		return true;
 	}
@@ -763,11 +712,9 @@ cluster_control_root_thread_open_publish(uint64 boot_incarnation)
  *	record (read back by the caller after XLogFlush).
  */
 bool
-cluster_control_root_checkpoint_advance_publish(XLogRecPtr redo,
-												TimeLineID tli,
+cluster_control_root_checkpoint_advance_publish(XLogRecPtr redo, TimeLineID tli,
 												XLogRecPtr ckpt_record_start,
-												XLogRecPtr ckpt_record_end,
-												uint32 record_crc32c)
+												XLogRecPtr ckpt_record_end, uint32 record_crc32c)
 {
 	ClusterControlRootIdentity identity;
 	ClusterControlRootSnapshot snapshot;
@@ -777,14 +724,12 @@ cluster_control_root_checkpoint_advance_publish(XLogRecPtr redo,
 	ClusterControlRootPatch patch;
 	ClusterControlRootResult root_result;
 
-	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
-		|| XLogRecPtrIsInvalid(redo) || tli == 0 || record_crc32c == 0
-		|| XLogRecPtrIsInvalid(ckpt_record_start)
-		|| XLogRecPtrIsInvalid(ckpt_record_end)
-		|| ckpt_record_start >= ckpt_record_end)
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES || XLogRecPtrIsInvalid(redo)
+		|| tli == 0 || record_crc32c == 0 || XLogRecPtrIsInvalid(ckpt_record_start)
+		|| XLogRecPtrIsInvalid(ckpt_record_end) || ckpt_record_start >= ckpt_record_end)
 		return false;
-	root_result = cluster_control_root_lookup_owner_by_node_runtime(
-		cluster_node_id, &identity, &snapshot, &token);
+	root_result = cluster_control_root_lookup_owner_by_node_runtime(cluster_node_id, &identity,
+																	&snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| !cluster_recovery_duty_key_valid_v1(&identity)
@@ -800,23 +745,21 @@ cluster_control_root_checkpoint_advance_publish(XLogRecPtr redo,
 	 * (e.g. an end-of-recovery re-checkpoint) is a no-op — never move the
 	 * advertised bound backwards.
 	 */
-	if ((uint64) redo <= snapshot.checkpoint_lower_lsn)
+	if ((uint64)redo <= snapshot.checkpoint_lower_lsn)
 		return false;
 
 	memset(&patch, 0, sizeof(patch));
-	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT
-				 | CLUSTER_CONTROL_ROOT_PATCH_TAIL
+	patch.mask = CLUSTER_CONTROL_ROOT_PATCH_CHECKPOINT | CLUSTER_CONTROL_ROOT_PATCH_TAIL
 				 | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
 	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	/* No LIFECYCLE bit in the 0x38 mask: the shape rule requires the
 	 * unmasked desired.lifecycle to stay at the zero value (UNUSED). */
 	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED;
-	patch.desired.root_flags = snapshot.root_flags
-							   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+	patch.desired.root_flags = snapshot.root_flags | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
 							   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
 	patch.desired.checkpoint_tli = tli;
 	patch.desired.checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
-	patch.desired.checkpoint_lower_lsn = (uint64) redo;
+	patch.desired.checkpoint_lower_lsn = (uint64)redo;
 	patch.desired.checkpoint_record_crc32c = record_crc32c;
 	/*
 	 * The just-written checkpoint record is the WAL-extent validation point:
@@ -827,42 +770,38 @@ cluster_control_root_checkpoint_advance_publish(XLogRecPtr redo,
 	 */
 	patch.desired.tail_tli = tli;
 	patch.desired.tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
-	patch.desired.validated_tail_lsn_exclusive = (uint64) ckpt_record_end;
-	patch.desired.tail_last_record_lsn = (uint64) ckpt_record_start;
+	patch.desired.validated_tail_lsn_exclusive = (uint64)ckpt_record_end;
+	patch.desired.tail_last_record_lsn = (uint64)ckpt_record_start;
 	patch.desired.tail_last_record_crc32c = record_crc32c;
 	/* recovery progress preserved from the durable snapshot. */
 	patch.desired.recovered_tli = snapshot.recovered_tli;
-	patch.desired.recovered_through_lsn_exclusive =
-		snapshot.recovered_through_lsn_exclusive;
+	patch.desired.recovered_through_lsn_exclusive = snapshot.recovered_through_lsn_exclusive;
 	patch.desired.recovered_last_record_lsn = snapshot.recovered_last_record_lsn;
-	patch.desired.recovered_last_record_crc32c =
-		snapshot.recovered_last_record_crc32c;
+	patch.desired.recovered_last_record_crc32c = snapshot.recovered_last_record_crc32c;
 
 	if (!cluster_control_root_publish_authority_bind_v1(
 			&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE))
 		return false;
 	root_result = cluster_control_root_compare_and_publish(
-		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE,
-		&published, &published_token);
+		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE, &published,
+		&published_token);
 	cluster_control_root_publish_authority_clear_v1();
 	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& published.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
-		&& published.checkpoint_lower_lsn == (uint64) redo
+		&& published.checkpoint_lower_lsn == (uint64)redo
 		&& published.checkpoint_record_crc32c == record_crc32c
-		&& published.validated_tail_lsn_exclusive == (uint64) ckpt_record_end) {
-		ereport(LOG,
-				(errmsg("cluster control root: thread %u checkpoint advanced by node %d "
-						"(redo %X/%X, tli %u, tail %X/%X, root publish seq " UINT64_FORMAT ")",
-						identity.origin_thread_id, cluster_node_id,
-						LSN_FORMAT_ARGS(redo), (unsigned) tli,
-						LSN_FORMAT_ARGS(ckpt_record_end),
-						published.root_publish_seq)));
+		&& published.validated_tail_lsn_exclusive == (uint64)ckpt_record_end) {
+		ereport(LOG, (errmsg("cluster control root: thread %u checkpoint advanced by node %d "
+							 "(redo %X/%X, tli %u, tail %X/%X, root publish seq " UINT64_FORMAT ")",
+							 identity.origin_thread_id, cluster_node_id, LSN_FORMAT_ARGS(redo),
+							 (unsigned)tli, LSN_FORMAT_ARGS(ckpt_record_end),
+							 published.root_publish_seq)));
 		return true;
 	}
 	ereport(WARNING,
 			(errmsg("cluster control root: checkpoint advance publish failed for thread %u "
 					"(result %d); the next checkpoint will retry",
-					identity.origin_thread_id, (int) root_result)));
+					identity.origin_thread_id, (int)root_result)));
 	return false;
 }
 
@@ -884,9 +823,9 @@ cluster_control_root_checkpoint_advance_publish(XLogRecPtr redo,
 bool
 cluster_control_root_thread_clean_close_publish_retry(void)
 {
-	TimestampTz deadline = TimestampTzPlusMilliseconds(
-		GetCurrentTimestamp(), CLUSTER_CLEAN_CLOSE_RETRY_MS);
-	bool		closed_ok = false;
+	TimestampTz deadline
+		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), CLUSTER_CLEAN_CLOSE_RETRY_MS);
+	bool closed_ok = false;
 
 	for (;;) {
 		closed_ok = cluster_control_root_thread_clean_close_publish();
@@ -895,20 +834,18 @@ cluster_control_root_thread_clean_close_publish_retry(void)
 		/* Re-validate / re-bind the leaver serving authority (the LMON-tick
 		 * rebind may not have landed inside this shutdown window) before
 		 * the next attempt. */
-		(void) cluster_authority_serving_rebind_leaver();
+		(void)cluster_authority_serving_rebind_leaver();
 		if (GetCurrentTimestamp() >= deadline)
 			break;
-		(void) WaitLatch(MyLatch,
-						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-						 50, WAIT_EVENT_CHECKPOINTER_MAIN);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 50,
+						WAIT_EVENT_CHECKPOINTER_MAIN);
 		ResetLatch(MyLatch);
 		CHECK_FOR_INTERRUPTS();
 	}
 	if (!closed_ok)
-		ereport(LOG,
-				(errmsg("cluster control root: THREAD_CLEAN_CLOSE could not be published "
-						"within the bounded shutdown window; the root stays OPEN and the "
-						"restart takes the ordinary crash-rejoin chain (fail-closed)")));
+		ereport(LOG, (errmsg("cluster control root: THREAD_CLEAN_CLOSE could not be published "
+							 "within the bounded shutdown window; the root stays OPEN and the "
+							 "restart takes the ordinary crash-rejoin chain (fail-closed)")));
 	return closed_ok;
 }
 
@@ -936,8 +873,8 @@ cluster_control_root_fpw_sticky_publish(void)
 
 	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
 		return false;
-	root_result = cluster_control_root_lookup_owner_by_node_runtime(
-		cluster_node_id, &identity, &snapshot, &token);
+	root_result = cluster_control_root_lookup_owner_by_node_runtime(cluster_node_id, &identity,
+																	&snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| !cluster_recovery_duty_key_valid_v1(&identity)
@@ -953,29 +890,25 @@ cluster_control_root_fpw_sticky_publish(void)
 	patch.expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
 	/* No LIFECYCLE bit in the 0x40 mask: desired.lifecycle stays 0. */
 	patch.desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED;
-	patch.desired.root_flags = snapshot.root_flags
-							   | CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF;
+	patch.desired.root_flags = snapshot.root_flags | CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF;
 
-	if (!cluster_control_root_publish_authority_bind_v1(
-			&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_FPW_STICKY))
+	if (!cluster_control_root_publish_authority_bind_v1(&token, &patch,
+														CLUSTER_CONTROL_ROOT_PUBLISH_FPW_STICKY))
 		return false;
 	root_result = cluster_control_root_compare_and_publish(
-		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_FPW_STICKY,
-		&published, &published_token);
+		&token, &patch, CLUSTER_CONTROL_ROOT_PUBLISH_FPW_STICKY, &published, &published_token);
 	cluster_control_root_publish_authority_clear_v1();
 	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& (published.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0) {
 		ereport(LOG,
 				(errmsg("cluster control root: thread %u FPW-off sticky published by node %d "
 						"(root publish seq " UINT64_FORMAT ")",
-						identity.origin_thread_id, cluster_node_id,
-						published.root_publish_seq)));
+						identity.origin_thread_id, cluster_node_id, published.root_publish_seq)));
 		return true;
 	}
-	ereport(WARNING,
-			(errmsg("cluster control root: FPW sticky publish failed for thread %u "
-					"(result %d); the next checkpoint will retry",
-					identity.origin_thread_id, (int) root_result)));
+	ereport(WARNING, (errmsg("cluster control root: FPW sticky publish failed for thread %u "
+							 "(result %d); the next checkpoint will retry",
+							 identity.origin_thread_id, (int)root_result)));
 	return false;
 }
 
@@ -998,8 +931,7 @@ formation_bitmap_nonempty(const uint8 bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES]
 }
 
 static void
-formation_expected_marker(const ClusterFormationSnapshotV1 *snapshot,
-						  ClusterFenceMarker *expected)
+formation_expected_marker(const ClusterFormationSnapshotV1 *snapshot, ClusterFenceMarker *expected)
 {
 	memset(expected, 0, sizeof(*expected));
 	expected->magic = CLUSTER_FENCE_MARKER_MAGIC;
@@ -1012,16 +944,15 @@ formation_expected_marker(const ClusterFormationSnapshotV1 *snapshot,
 								   : snapshot->applied.coordinator_node_id;
 	memcpy(expected->fenced_dead_bitmap, snapshot->excluded_bitmap,
 		   sizeof(expected->fenced_dead_bitmap));
-	expected->marker_kind = snapshot->applied.event_id == 0
-							? CLUSTER_FENCE_MARKER_KIND_BASELINE
-							: CLUSTER_FENCE_MARKER_KIND_FENCE;
+	expected->marker_kind = snapshot->applied.event_id == 0 ? CLUSTER_FENCE_MARKER_KIND_BASELINE
+															: CLUSTER_FENCE_MARKER_KIND_FENCE;
 }
 
 ClusterFormationWitnessResult
 cluster_formation_witness_decide_v1(const ClusterFormationSnapshotV1 *f1,
 									const ClusterFenceAuthorityProof *authority,
-									const ClusterFormationSnapshotV1 *f2,
-									uint16 origin_thread, bool opening_new_duty)
+									const ClusterFormationSnapshotV1 *f2, uint16 origin_thread,
+									bool opening_new_duty)
 {
 	ClusterFenceMarker expected;
 	int32 origin_node;
@@ -1050,12 +981,10 @@ cluster_formation_witness_decide_v1(const ClusterFormationSnapshotV1 *f1,
 
 	origin_node = (int32)origin_thread - 1;
 	if (!formation_bitmap_has_node(f2->excluded_bitmap, origin_node)
-		|| (opening_new_duty
-			&& !formation_bitmap_has_node(f2->applied.dead_bitmap, origin_node)))
+		|| (opening_new_duty && !formation_bitmap_has_node(f2->applied.dead_bitmap, origin_node)))
 		return CLUSTER_FORMATION_WITNESS_ORIGIN_NOT_EXCLUDED;
 	if (f2->victim_incarnation == 0
-		|| f2->victim_incarnation
-			   != f2->membership.last_admitted_incarnation[origin_node]
+		|| f2->victim_incarnation != f2->membership.last_admitted_incarnation[origin_node]
 		|| (f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_DEAD
 			&& f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_REMOVED))
 		return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
@@ -1076,23 +1005,20 @@ cluster_formation_witness_decide_v1(const ClusterFormationSnapshotV1 *f1,
 static ClusterFormationWitnessResult
 formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
 								 const ClusterFenceAuthorityProof *authority,
-								 const ClusterFormationSnapshotV1 *f2,
-								 uint16 origin_thread)
+								 const ClusterFormationSnapshotV1 *f2, uint16 origin_thread)
 {
 	ClusterFenceMarker expected;
 	int32 origin_node;
-	int		i;
+	int i;
 
 	if (f1 == NULL || authority == NULL || f2 == NULL || origin_thread == 0
 		|| origin_thread > CLUSTER_MAX_NODES)
 		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
 	if (memcmp(f1, f2, sizeof(*f1)) != 0)
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
-	if (f2->prebump_sync_active != 0 || !f2->self_join_admitted
-		|| f2->self_join_failed
+	if (f2->prebump_sync_active != 0 || !f2->self_join_admitted || f2->self_join_failed
 		|| formation_bitmap_nonempty(f2->pending_join_bitmap)
-		|| f2->applied.reconfig_kind == RECONFIG_KIND_JOIN_PENDING)
-	{
+		|| f2->applied.reconfig_kind == RECONFIG_KIND_JOIN_PENDING) {
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	}
 	/*
@@ -1109,8 +1035,7 @@ formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
 	 * whole phase3_timeout on every crash-rejoin.
 	 */
 	if (f2->local_epoch != f2->applied.new_epoch
-		&& !(f2->self_join_admitted
-			 && f2->local_epoch > f2->applied.new_epoch))
+		&& !(f2->self_join_admitted && f2->local_epoch > f2->applied.new_epoch))
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	if (authority->total_disk_count == 0
 		|| authority->agree_disk_count <= authority->total_disk_count / 2
@@ -1137,19 +1062,16 @@ formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
 	 * admission proof, and only while the adopted epoch is strictly newer
 	 * than the stale applied epoch.
 	 */
-	if ((!f2->self_join_admitted
-		 || f2->local_epoch <= f2->applied.new_epoch)
+	if ((!f2->self_join_admitted || f2->local_epoch <= f2->applied.new_epoch)
 		&& (!cluster_fence_marker_valid_v1(&expected)
-			|| !cluster_fence_marker_tuple_equal(&authority->marker, &expected)))
-	{
+			|| !cluster_fence_marker_tuple_equal(&authority->marker, &expected))) {
 		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
 	}
 
 	origin_node = (int32)origin_thread - 1;
 	if (f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_MEMBER
 		|| f2->membership.last_admitted_incarnation[origin_node] == 0
-		|| formation_bitmap_has_node(f2->excluded_bitmap, origin_node))
-	{
+		|| formation_bitmap_has_node(f2->excluded_bitmap, origin_node)) {
 		return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
 	}
 	/*
@@ -1162,8 +1084,7 @@ formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
 	 * publishing floors the witness stays OWNER_MISMATCH, the same transient
 	 * the phase-3 deadline loop already retries.
 	 */
-	for (i = 0; i < CLUSTER_MAX_NODES; i++)
-	{
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (f2->membership.membership_state[i] != CLUSTER_MEMBER_MEMBER
 			|| formation_bitmap_has_node(f2->excluded_bitmap, i))
 			continue;
@@ -1179,10 +1100,10 @@ formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
  * live witness: only the exact epoch-0 baseline with no reconfiguration debt
  * may omit self_join_admitted. */
 static ClusterFormationWitnessResult
-formation_witness_decide_recovery_control_v1(
-	const ClusterFormationSnapshotV1 *f1,
-	const ClusterFenceAuthorityProof *authority,
-	const ClusterFormationSnapshotV1 *f2, uint16 origin_thread)
+formation_witness_decide_recovery_control_v1(const ClusterFormationSnapshotV1 *f1,
+											 const ClusterFenceAuthorityProof *authority,
+											 const ClusterFormationSnapshotV1 *f2,
+											 uint16 origin_thread)
 {
 	ClusterFenceMarker expected;
 	int32 origin_node;
@@ -1192,8 +1113,7 @@ formation_witness_decide_recovery_control_v1(
 		|| origin_thread > CLUSTER_MAX_NODES)
 		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
 	if (f2->self_join_admitted)
-		return formation_witness_decide_live_v1(
-			f1, authority, f2, origin_thread);
+		return formation_witness_decide_live_v1(f1, authority, f2, origin_thread);
 	if (memcmp(f1, f2, sizeof(*f1)) != 0)
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
 	if (f2->prebump_sync_active != 0 || f2->self_join_failed
@@ -1201,13 +1121,10 @@ formation_witness_decide_recovery_control_v1(
 		|| formation_bitmap_nonempty(f2->clean_departed_bitmap)
 		|| formation_bitmap_nonempty(f2->removed_bitmap)
 		|| formation_bitmap_nonempty(f2->excluded_bitmap)
-		|| f2->local_epoch != CLUSTER_EPOCH_INITIAL
-		|| f2->applied.event_id != 0
+		|| f2->local_epoch != CLUSTER_EPOCH_INITIAL || f2->applied.event_id != 0
 		|| f2->applied.old_epoch != CLUSTER_EPOCH_INITIAL
-		|| f2->applied.new_epoch != CLUSTER_EPOCH_INITIAL
-		|| f2->applied.event_seq != 0
-		|| f2->applied.cssd_dead_generation != 0
-		|| f2->applied.reconfig_kind != RECONFIG_KIND_NONE
+		|| f2->applied.new_epoch != CLUSTER_EPOCH_INITIAL || f2->applied.event_seq != 0
+		|| f2->applied.cssd_dead_generation != 0 || f2->applied.reconfig_kind != RECONFIG_KIND_NONE
 		|| formation_bitmap_nonempty(f2->applied.dead_bitmap)
 		|| formation_bitmap_nonempty(f2->applied.join_bitmap))
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
@@ -1265,29 +1182,27 @@ static ClusterFormationWitnessResult
 formation_authority_result(ClusterFenceAuthorityReadResult result)
 {
 	switch (result) {
-		case CLUSTER_FENCE_AUTHORITY_OK:
-			return CLUSTER_FORMATION_WITNESS_READY;
-		case CLUSTER_FENCE_AUTHORITY_NO_MAJORITY:
-			return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
-		case CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE:
-			return CLUSTER_FORMATION_WITNESS_IO_FAILED;
-		case CLUSTER_FENCE_AUTHORITY_ENFORCEMENT_OFF:
-		case CLUSTER_FENCE_AUTHORITY_NO_CONFIG:
-			return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
-		case CLUSTER_FENCE_AUTHORITY_BAD_ARGUMENT:
-		case CLUSTER_FENCE_AUTHORITY_BAD_CONFIG:
-		case CLUSTER_FENCE_AUTHORITY_MIXED_VERSION:
-		case CLUSTER_FENCE_AUTHORITY_CORRUPT:
-		default:
-			return CLUSTER_FORMATION_WITNESS_CORRUPT;
+	case CLUSTER_FENCE_AUTHORITY_OK:
+		return CLUSTER_FORMATION_WITNESS_READY;
+	case CLUSTER_FENCE_AUTHORITY_NO_MAJORITY:
+		return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+	case CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE:
+		return CLUSTER_FORMATION_WITNESS_IO_FAILED;
+	case CLUSTER_FENCE_AUTHORITY_ENFORCEMENT_OFF:
+	case CLUSTER_FENCE_AUTHORITY_NO_CONFIG:
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	case CLUSTER_FENCE_AUTHORITY_BAD_ARGUMENT:
+	case CLUSTER_FENCE_AUTHORITY_BAD_CONFIG:
+	case CLUSTER_FENCE_AUTHORITY_MIXED_VERSION:
+	case CLUSTER_FENCE_AUTHORITY_CORRUPT:
+	default:
+		return CLUSTER_FORMATION_WITNESS_CORRUPT;
 	}
 }
 
 static ClusterFormationWitnessResult
-formation_witness_build_wait_internal(uint16 origin_thread,
-									  bool opening_new_duty,
-									  ClusterFormationWitnessMode mode,
-									  int timeout_ms,
+formation_witness_build_wait_internal(uint16 origin_thread, bool opening_new_duty,
+									  ClusterFormationWitnessMode mode, int timeout_ms,
 									  ClusterFormationWitnessV1 **out)
 {
 	ClusterFormationWitnessResult last = CLUSTER_FORMATION_WITNESS_UNSTABLE;
@@ -1310,8 +1225,7 @@ formation_witness_build_wait_internal(uint16 origin_thread,
 		uint64 now_us;
 
 		proof_sequence = cluster_write_fence_authority_cache_sequence();
-		if ((proof_sequence & UINT64_C(1)) != 0
-			|| proof_sequence >= UINT64_MAX - 1) {
+		if ((proof_sequence & UINT64_C(1)) != 0 || proof_sequence >= UINT64_MAX - 1) {
 			last = CLUSTER_FORMATION_WITNESS_UNSTABLE;
 			goto retry;
 		}
@@ -1323,15 +1237,13 @@ formation_witness_build_wait_internal(uint16 origin_thread,
 			if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &f2))
 				return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 			if (mode == CLUSTER_FORMATION_WITNESS_MODE_LIVE)
-				last = formation_witness_decide_live_v1(
-					&f1, &authority, &f2, origin_thread);
+				last = formation_witness_decide_live_v1(&f1, &authority, &f2, origin_thread);
 			else if (mode == CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL)
-				last = formation_witness_decide_recovery_control_v1(
-					&f1, &authority, &f2, origin_thread);
+				last = formation_witness_decide_recovery_control_v1(&f1, &authority, &f2,
+																	origin_thread);
 			else
-				last = cluster_formation_witness_decide_v1(
-					&f1, &authority, &f2, origin_thread,
-					opening_new_duty);
+				last = cluster_formation_witness_decide_v1(&f1, &authority, &f2, origin_thread,
+														   opening_new_duty);
 			if (last == CLUSTER_FORMATION_WITNESS_READY) {
 				ClusterFormationWitnessV1 *witness;
 
@@ -1353,10 +1265,8 @@ formation_witness_build_wait_internal(uint16 origin_thread,
 				witness->f1 = f1;
 				witness->f2 = f2;
 				if (mode == CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL) {
-					witness->f1.reserved[0]
-						= CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
-					witness->f2.reserved[0]
-						= CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
+					witness->f1.reserved[0] = CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
+					witness->f2.reserved[0] = CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
 				}
 				*out = witness;
 				return CLUSTER_FORMATION_WITNESS_READY;
@@ -1375,32 +1285,27 @@ formation_witness_build_wait_internal(uint16 origin_thread,
 }
 
 ClusterFormationWitnessResult
-cluster_formation_witness_build_wait(uint16 origin_thread,
-									 bool opening_new_duty, int timeout_ms,
+cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty, int timeout_ms,
 									 ClusterFormationWitnessV1 **out)
 {
 	return formation_witness_build_wait_internal(
-		origin_thread, opening_new_duty,
-		CLUSTER_FORMATION_WITNESS_MODE_DUTY, timeout_ms, out);
+		origin_thread, opening_new_duty, CLUSTER_FORMATION_WITNESS_MODE_DUTY, timeout_ms, out);
 }
 
 ClusterFormationWitnessResult
-cluster_formation_witness_build_live_wait(uint16 origin_thread,
-									  int timeout_ms,
-									  ClusterFormationWitnessV1 **out)
+cluster_formation_witness_build_live_wait(uint16 origin_thread, int timeout_ms,
+										  ClusterFormationWitnessV1 **out)
 {
 	return formation_witness_build_wait_internal(
-		origin_thread, false, CLUSTER_FORMATION_WITNESS_MODE_LIVE,
-		timeout_ms, out);
+		origin_thread, false, CLUSTER_FORMATION_WITNESS_MODE_LIVE, timeout_ms, out);
 }
 
 ClusterFormationWitnessResult
-cluster_formation_witness_build_recovery_control_wait(
-	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out)
+cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread, int timeout_ms,
+													  ClusterFormationWitnessV1 **out)
 {
 	return formation_witness_build_wait_internal(
-		origin_thread, false,
-		CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL, timeout_ms, out);
+		origin_thread, false, CLUSTER_FORMATION_WITNESS_MODE_RECOVERY_CONTROL, timeout_ms, out);
 }
 
 ClusterFormationWitnessResult
@@ -1416,15 +1321,15 @@ cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *wit
 		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 	result = cluster_write_fence_revalidate_cached_nowait(&witness->authority.marker, now_us);
 	switch (result) {
-		case CLUSTER_FENCE_CACHE_MATCH:
-			return CLUSTER_FORMATION_WITNESS_READY;
-		case CLUSTER_FENCE_CACHE_STALE:
-		case CLUSTER_FENCE_CACHE_EXPIRED:
-			return CLUSTER_FORMATION_WITNESS_UNSTABLE;
-		case CLUSTER_FENCE_CACHE_INVALID:
-		case CLUSTER_FENCE_CACHE_UNAVAILABLE:
-		default:
-			return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	case CLUSTER_FENCE_CACHE_MATCH:
+		return CLUSTER_FORMATION_WITNESS_READY;
+	case CLUSTER_FENCE_CACHE_STALE:
+	case CLUSTER_FENCE_CACHE_EXPIRED:
+		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	case CLUSTER_FENCE_CACHE_INVALID:
+	case CLUSTER_FENCE_CACHE_UNAVAILABLE:
+	default:
+		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 	}
 }
 
@@ -1433,9 +1338,8 @@ cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *wit
  * classification additionally tolerates only its one monotone local edge:
  * self_join_admitted 0 -> 1 after StartupXLOG completes the stripe gate. */
 bool
-cluster_formation_snapshot_matches_v1(
-	const ClusterFormationSnapshotV1 *expected,
-	const ClusterFormationSnapshotV1 *observed)
+cluster_formation_snapshot_matches_v1(const ClusterFormationSnapshotV1 *expected,
+									  const ClusterFormationSnapshotV1 *observed)
 {
 	ClusterFormationSnapshotV1 normalized;
 
@@ -1443,16 +1347,13 @@ cluster_formation_snapshot_matches_v1(
 		return false;
 	if (expected->reserved[0] == 0 && expected->reserved[1] == 0)
 		return memcmp(expected, observed, sizeof(*expected)) == 0;
-	if (expected->reserved[0]
-			!= CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL
-		|| expected->reserved[1] != 0
-		|| observed->reserved[0] != 0 || observed->reserved[1] != 0)
+	if (expected->reserved[0] != CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL
+		|| expected->reserved[1] != 0 || observed->reserved[0] != 0 || observed->reserved[1] != 0)
 		return false;
 
 	normalized = *observed;
 	normalized.reserved[0] = CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL;
-	if (expected->self_join_admitted == 0
-		&& normalized.self_join_admitted == 1)
+	if (expected->self_join_admitted == 0 && normalized.self_join_admitted == 1)
 		normalized.self_join_admitted = 0;
 	return memcmp(expected, &normalized, sizeof(*expected)) == 0;
 }
@@ -1462,16 +1363,16 @@ cluster_formation_snapshot_matches_v1(
  * generation-bound counterpart of copy_classification_v1(): a copied proof
  * never becomes a timeless authority token. */
 ClusterFormationWitnessResult
-cluster_formation_classification_revalidate_nowait(
-	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
-	const ClusterFormationSnapshotV1 *snapshot)
+cluster_formation_classification_revalidate_nowait(uint16 origin_thread,
+												   const ClusterFenceAuthorityProof *authority,
+												   const ClusterFormationSnapshotV1 *snapshot)
 {
 	ClusterFormationSnapshotV1 current;
 	ClusterFenceAuthorityCacheResult cache_result;
 	uint64 now_us;
 
-	if (origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
-		|| authority == NULL || snapshot == NULL)
+	if (origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES || authority == NULL
+		|| snapshot == NULL)
 		return CLUSTER_FORMATION_WITNESS_BAD_ARGUMENT;
 	if (!cluster_reconfig_capture_formation_snapshot_v1(origin_thread, &current))
 		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
@@ -1481,23 +1382,22 @@ cluster_formation_classification_revalidate_nowait(
 	now_us = formation_monotonic_us();
 	if (now_us == 0)
 		return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
-	cache_result = cluster_write_fence_revalidate_cached_nowait(
-		&authority->marker, now_us);
-	return cache_result == CLUSTER_FENCE_CACHE_MATCH
-		? CLUSTER_FORMATION_WITNESS_READY
-		: (cache_result == CLUSTER_FENCE_CACHE_STALE
-				   || cache_result == CLUSTER_FENCE_CACHE_EXPIRED)
-			? CLUSTER_FORMATION_WITNESS_UNSTABLE
-			: CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
+	cache_result = cluster_write_fence_revalidate_cached_nowait(&authority->marker, now_us);
+	return cache_result == CLUSTER_FENCE_CACHE_MATCH ? CLUSTER_FORMATION_WITNESS_READY
+		   : (cache_result == CLUSTER_FENCE_CACHE_STALE
+			  || cache_result == CLUSTER_FENCE_CACHE_EXPIRED)
+			   ? CLUSTER_FORMATION_WITNESS_UNSTABLE
+			   : CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 }
 
 bool
-cluster_formation_witness_copy_classification_v1(
-	const ClusterFormationWitnessV1 *witness, uint16 *origin_thread,
-	ClusterFenceAuthorityProof *authority, ClusterFormationSnapshotV1 *snapshot)
+cluster_formation_witness_copy_classification_v1(const ClusterFormationWitnessV1 *witness,
+												 uint16 *origin_thread,
+												 ClusterFenceAuthorityProof *authority,
+												 ClusterFormationSnapshotV1 *snapshot)
 {
-	if (witness == NULL || witness->magic != CLUSTER_FORMATION_WITNESS_MAGIC ||
-		origin_thread == NULL || authority == NULL || snapshot == NULL)
+	if (witness == NULL || witness->magic != CLUSTER_FORMATION_WITNESS_MAGIC
+		|| origin_thread == NULL || authority == NULL || snapshot == NULL)
 		return false;
 	*origin_thread = witness->origin_thread;
 	*authority = witness->authority;

@@ -170,13 +170,15 @@ cluster_ic_tier1_bump_epoch_observe_advance(int32 peer_id pg_attribute_unused())
 /*
  * ereport family stubs.  envelope_verify step-7 epoch enforce uses
  * ereport(LOG, ...) on reject -- we want it to NOT abort but also
- * not require a real backend.  Minimal stub:errstart returns true
- * (so errmsg etc. run);errfinish is a no-op.
+ * not require a real backend. Suppress DEBUG output, including the platform
+ * CRC dispatch diagnostic. Unexpected ERRORs still abort the fixture.
  */
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
-	return true;
+	if (elevel >= ERROR)
+		abort();
+	return elevel >= LOG;
 }
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),

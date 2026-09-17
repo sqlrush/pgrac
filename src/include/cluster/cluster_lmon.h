@@ -142,7 +142,7 @@ typedef struct ClusterLmonSharedState {
 	uint64 last_iter_us;			   /* most recent main-loop iteration wall time */
 	uint64 max_iter_us;				   /* high-water iteration wall time */
 	uint64 slow_iter_count;			   /* iterations over cluster.lmon_slow_iteration_warn_ms */
-	uint64 timed_duty_sample_count;	/* completed samples paired with total_iter_us */
+	uint64 timed_duty_sample_count;	   /* completed samples paired with total_iter_us */
 	uint64 total_iter_us;			   /* same-incarnation cumulative duty time */
 	struct Latch *lmon_latch;		   /* qvotec completion wake target; LMON owns lifecycle */
 	bool shutdown_requested;		   /* postmaster sets; LMON main loop polls + exits */

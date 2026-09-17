@@ -987,7 +987,6 @@ CssdMain(void)
 						   WAIT_EVENT_CLUSTER_BGPROC_CSSD_MAIN_LOOP);
 			if (rc & WL_LATCH_SET)
 				ResetLatch(MyLatch);
-
 		}
 	}
 

@@ -138,8 +138,8 @@ typedef struct ClusterCurrentMxDescribeReplyHeader {
 	uint32 reserved32;
 } ClusterCurrentMxDescribeReplyHeader;
 
-#define CLUSTER_CURRENT_MX_DESCRIBE_REPLY_RESERVED_SIZE                                      \
-	(BLCKSZ - sizeof(ClusterCurrentMxDescribeReplyHeader)                                    \
+#define CLUSTER_CURRENT_MX_DESCRIBE_REPLY_RESERVED_SIZE                                            \
+	(BLCKSZ - sizeof(ClusterCurrentMxDescribeReplyHeader)                                          \
 	 - CLUSTER_CURRENT_MX_MAX_MEMBERS * sizeof(ClusterCurrentMxMemberDesc))
 
 typedef struct ClusterCurrentMxDescribeReplyPage {
@@ -170,22 +170,18 @@ typedef struct ClusterCurrentMxProofReplyHeader {
 typedef struct ClusterCurrentMxUpdaterProofReplyBodyWire {
 	ClusterCurrentMemberProof member_proof;
 	ClusterCurrentUpdaterProof updater_proof;
-	uint8 reserved[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
-					   * sizeof(ClusterCurrentMemberProof)
-				   - sizeof(ClusterCurrentMemberProof)
-				   - sizeof(ClusterCurrentUpdaterProof)];
+	uint8 reserved[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME * sizeof(ClusterCurrentMemberProof)
+				   - sizeof(ClusterCurrentMemberProof) - sizeof(ClusterCurrentUpdaterProof)];
 } ClusterCurrentMxUpdaterProofReplyBodyWire;
 
 typedef union ClusterCurrentMxProofReplyBodyWire {
 	ClusterCurrentMemberProof proofs[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 	ClusterCurrentMxUpdaterProofReplyBodyWire updater;
-	uint8 raw[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
-			  * sizeof(ClusterCurrentMemberProof)];
+	uint8 raw[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME * sizeof(ClusterCurrentMemberProof)];
 } ClusterCurrentMxProofReplyBodyWire;
 
-#define CLUSTER_CURRENT_MX_PROOF_REPLY_RESERVED_SIZE                                           \
-	(BLCKSZ - sizeof(ClusterCurrentMxProofReplyHeader)                                          \
-	 - sizeof(ClusterCurrentMxProofReplyBodyWire))
+#define CLUSTER_CURRENT_MX_PROOF_REPLY_RESERVED_SIZE                                               \
+	(BLCKSZ - sizeof(ClusterCurrentMxProofReplyHeader) - sizeof(ClusterCurrentMxProofReplyBodyWire))
 
 typedef struct ClusterCurrentMxProofReplyPage {
 	ClusterCurrentMxProofReplyHeader header;
@@ -196,7 +192,7 @@ typedef struct ClusterCurrentMxProofReplyPage {
 StaticAssertDecl(sizeof(ClusterCurrentMxDescribePrefixWire) == sizeof(GcsBlockForwardPayload),
 				 "current MX describe prefix must preserve the shipped 64-byte frame");
 StaticAssertDecl(offsetof(ClusterCurrentMxDescribePrefixWire, request_id)
-					 == offsetof(GcsBlockForwardPayload, request_id)
+						 == offsetof(GcsBlockForwardPayload, request_id)
 					 && offsetof(ClusterCurrentMxDescribePrefixWire, epoch)
 							== offsetof(GcsBlockForwardPayload, epoch)
 					 && offsetof(ClusterCurrentMxDescribePrefixWire, original_requester_node)
@@ -253,8 +249,7 @@ StaticAssertDecl(sizeof(ClusterCurrentMxDescribeReplyPage) == BLCKSZ,
 				 "current MX describe reply must fill one GCS page");
 StaticAssertDecl(sizeof(ClusterCurrentMxProofReplyHeader) == 64,
 				 "current MX proof reply header must remain 64 bytes");
-StaticAssertDecl(offsetof(ClusterCurrentMxProofReplyHeader,
-					  requester_capability_generation) == 60,
+StaticAssertDecl(offsetof(ClusterCurrentMxProofReplyHeader, requester_capability_generation) == 60,
 				 "current MX requester capability carrier offset must remain 60");
 StaticAssertDecl(sizeof(ClusterCurrentMxUpdaterProofReplyBodyWire)
 					 == CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME
@@ -317,15 +312,13 @@ extern ClusterMxResolveResult cluster_multixact_current_wire_build_proof_request
 	uint16 plans_cap, uint16 *plan_count);
 extern ClusterMxResolveResult cluster_multixact_current_wire_validate_proof_reply(
 	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
-	const ClusterCurrentMxProofForwardV2 *expected_request,
-	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof,
+	const ClusterCurrentMxProofForwardV2 *expected_request, ClusterCurrentMemberProof *proofs,
+	uint16 proofs_cap, uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof,
 	uint32 *requester_capability_generation_out);
 extern bool cluster_multixact_current_wire_validate_proof_reply_frame(
 	const void *payload, uint32 payload_length, int32 expected_source, uint64 current_epoch,
 	const ClusterCurrentMxProofForwardV2 *expected_request, ClusterMxResolveResult *result,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof,
-	uint32 *requester_capability_generation_out);
+	ClusterCurrentUpdaterProof *updater_proof, uint32 *requester_capability_generation_out);
 
 #endif /* CLUSTER_MULTIXACT_CURRENT_WIRE_H */

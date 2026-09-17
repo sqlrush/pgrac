@@ -225,8 +225,7 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *key_ptr pg_attribute_
 	switch (action) {
 	case HASH_FIND:
 		for (i = 0; i < fake_hash_count; i++)
-			if (memcmp(fake_hash_storage[i], key_ptr,
-					   sizeof(ClusterTTStatusKey)) == 0) {
+			if (memcmp(fake_hash_storage[i], key_ptr, sizeof(ClusterTTStatusKey)) == 0) {
 				if (found_ptr != NULL)
 					*found_ptr = true;
 				return fake_hash_storage[i];
@@ -237,8 +236,7 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *key_ptr pg_attribute_
 	case HASH_ENTER:
 	case HASH_ENTER_NULL:
 		for (i = 0; i < fake_hash_count; i++)
-			if (memcmp(fake_hash_storage[i], key_ptr,
-					   sizeof(ClusterTTStatusKey)) == 0) {
+			if (memcmp(fake_hash_storage[i], key_ptr, sizeof(ClusterTTStatusKey)) == 0) {
 				if (found_ptr != NULL)
 					*found_ptr = true;
 				return fake_hash_storage[i];
@@ -247,21 +245,17 @@ hash_search(HTAB *hashp pg_attribute_unused(), const void *key_ptr pg_attribute_
 			*found_ptr = false;
 		if (fake_hash_count >= lengthof(fake_hash_storage))
 			return NULL;
-		memset(fake_hash_storage[fake_hash_count], 0,
-			   sizeof(fake_hash_storage[fake_hash_count]));
-		memcpy(fake_hash_storage[fake_hash_count], key_ptr,
-			   sizeof(ClusterTTStatusKey));
+		memset(fake_hash_storage[fake_hash_count], 0, sizeof(fake_hash_storage[fake_hash_count]));
+		memcpy(fake_hash_storage[fake_hash_count], key_ptr, sizeof(ClusterTTStatusKey));
 		return fake_hash_storage[fake_hash_count++];
 	case HASH_REMOVE:
 		for (i = 0; i < fake_hash_count; i++)
-			if (memcmp(fake_hash_storage[i], key_ptr,
-					   sizeof(ClusterTTStatusKey)) == 0) {
+			if (memcmp(fake_hash_storage[i], key_ptr, sizeof(ClusterTTStatusKey)) == 0) {
 				if (found_ptr != NULL)
 					*found_ptr = true;
 				if (i + 1 < fake_hash_count)
 					memmove(fake_hash_storage[i], fake_hash_storage[i + 1],
-							(sizeof(fake_hash_storage[0])
-							 * (fake_hash_count - i - 1)));
+							(sizeof(fake_hash_storage[0]) * (fake_hash_count - i - 1)));
 				fake_hash_count--;
 				return fake_hash_storage[fake_hash_count];
 			}
@@ -396,9 +390,9 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node pg_attribute_unuse
 }
 
 ClusterTTDurableLocate
-cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
-	TransactionId xid, uint16 *out_seg, uint16 *out_slot,
-	uint16 *out_wrap, uint8 *out_status)
+cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId xid,
+												 uint16 *out_seg, uint16 *out_slot,
+												 uint16 *out_wrap, uint8 *out_status)
 {
 	UT_ASSERT_EQ(origin_node, cluster_node_id);
 	UT_ASSERT(TransactionIdIsNormal(xid));
@@ -416,8 +410,7 @@ cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
 }
 
 bool
-cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
-	ClusterTTSlotCurrentOwner *out)
+cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid, ClusterTTSlotCurrentOwner *out)
 {
 	UT_ASSERT_EQ(node_id, cluster_node_id);
 	UT_ASSERT(TransactionIdIsNormal(xid));
@@ -640,8 +633,8 @@ UT_TEST(test_current_own_candidate_is_exact_and_admission_bound)
 
 	request.xid = key.local_xid;
 	memset(&result, 0xA5, sizeof(result));
-	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
-					 CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID, &request, &result),
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID,
+												   &request, &result),
 				 CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(result.bool_value);
 	UT_ASSERT_EQ(memcmp(&result.current_key, &key, sizeof(key)), 0);
@@ -694,13 +687,13 @@ UT_TEST(test_current_own_uses_exact_allocator_canonical_among_matching_data_alia
 	request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
 	request.commit_scn = InvalidScn;
 	request.key = &canonical;
-	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
-		CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
 		CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(result.bool_value);
 	request.key = &data_alias;
-	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
-		CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
 		CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(result.bool_value);
 
@@ -711,16 +704,15 @@ UT_TEST(test_current_own_uses_exact_allocator_canonical_among_matching_data_alia
 	fake_current_owner.segment_id = canonical.undo_segment_id;
 	fake_current_owner.xid = canonical.local_xid;
 	fake_current_owner.commit_scn = InvalidScn;
-	fake_current_owner.slot_offset =
-		cluster_tt_slot_id_to_offset(canonical.tt_slot_id);
+	fake_current_owner.slot_offset = cluster_tt_slot_id_to_offset(canonical.tt_slot_id);
 	fake_current_owner.wrap = 4;
 	fake_current_owner.status = CTS_ACTIVE;
 	memset(&request, 0, sizeof(request));
 	request.xid = canonical.local_xid;
 	memset(&result, 0xA5, sizeof(result));
-	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
-		CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID, &request, &result),
-		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID,
+												   &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(result.bool_value);
 	UT_ASSERT_EQ(memcmp(&result.current_key, &canonical, sizeof(canonical)), 0);
 	UT_ASSERT_EQ(result.lookup.status, CLUSTER_TT_STATUS_IN_PROGRESS);
@@ -730,9 +722,9 @@ UT_TEST(test_current_own_uses_exact_allocator_canonical_among_matching_data_alia
 	 * ambiguous; semantic agreement alone never grants authority. */
 	fake_current_owner_found = false;
 	memset(&result, 0xA5, sizeof(result));
-	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
-		CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID, &request, &result),
-		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID,
+												   &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(!result.bool_value);
 
 	/* A status-divergent alias is rejected even when the allocator owner still
@@ -740,16 +732,16 @@ UT_TEST(test_current_own_uses_exact_allocator_canonical_among_matching_data_alia
 	fake_current_owner_found = true;
 	request.key = &data_alias;
 	request.status = CLUSTER_TT_STATUS_ABORTED;
-	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
-		CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
+	UT_ASSERT_EQ(
+		cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &request, &result),
 		CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(result.bool_value);
 	memset(&request, 0, sizeof(request));
 	request.xid = canonical.local_xid;
 	memset(&result, 0xA5, sizeof(result));
-	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(
-		CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID, &request, &result),
-		CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT_EQ(cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID,
+												   &request, &result),
+				 CLUSTER_SEMANTIC_ADMISSION_OK);
 	UT_ASSERT(!result.bool_value);
 }
 

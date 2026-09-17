@@ -213,8 +213,7 @@ validate_stream_from_root(uint16 tid, const ClusterControlRootSnapshot *snapshot
 		return CLUSTER_RECOVERY_STREAM_SUSPECT;
 
 	if (!cluster_recovery_worker_target_page(snapshot->validated_tail_lsn_exclusive,
-											 wal_segment_size, &segno,
-											 &page_offset, &pageaddr))
+											 wal_segment_size, &segno, &page_offset, &pageaddr))
 		return CLUSTER_RECOVERY_STREAM_UNREADABLE; /* no written bytes */
 
 	/* Segment file name is CONSTRUCTED (never a directory scan; the
@@ -257,8 +256,7 @@ cluster_recovery_worker_revalidate(uint16 thread_id)
 		ClusterControlRootReadToken token;
 		ClusterControlRootResult root_result;
 
-		root_result = cluster_control_root_read_canonical_discovered(
-			thread_id, &snapshot, &token);
+		root_result = cluster_control_root_read_canonical_discovered(thread_id, &snapshot, &token);
 		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 			return CLUSTER_RECOVERY_STREAM_UNREADABLE;
@@ -342,32 +340,30 @@ cluster_recovery_worker_main(Datum main_arg)
 			 * or stale projection fails closed.
 			 */
 			if (!cluster_thread_recovery_projection_current(
-					tid, (uint64) pool->generation, &pin_token,
-					&pin_validated_tail, &pin_checkpoint_lower,
-					&pin_lifecycle, &pin_tail_tli,
-					&pin_checkpoint_tli)) {
+					tid, (uint64)pool->generation, &pin_token, &pin_validated_tail,
+					&pin_checkpoint_lower, &pin_lifecycle, &pin_tail_tli, &pin_checkpoint_tli)) {
 				sv = CLUSTER_RECOVERY_STREAM_UNREADABLE;
 			} else {
 				memset(&pin_snapshot, 0, sizeof(pin_snapshot));
 				pin_snapshot.identity.origin_thread_id = tid;
-				pin_snapshot.identity.origin_node_id = (int32) tid - 1;
-				pin_snapshot.lifecycle = (uint32) pin_lifecycle;
+				pin_snapshot.identity.origin_node_id = (int32)tid - 1;
+				pin_snapshot.lifecycle = (uint32)pin_lifecycle;
 				pin_snapshot.validated_tail_lsn_exclusive = pin_validated_tail;
 				pin_snapshot.checkpoint_lower_lsn = pin_checkpoint_lower;
 				pin_snapshot.tail_tli = pin_tail_tli;
 				pin_snapshot.checkpoint_tli = pin_checkpoint_tli;
-				(void) pin_token;
-				(void) pin_checkpoint_lower;
-				(void) pin_checkpoint_tli;
+				(void)pin_token;
+				(void)pin_checkpoint_lower;
+				(void)pin_checkpoint_tli;
 
 				/*
 				 * Re-classify from the pinned lifecycle (ALIVE-biased,
 				 * contract): a peer with a recent publication is
 				 * SKIPPED.  Only CRASHED_CANDIDATE gets validated.
 				 */
-				if (cluster_recovery_classify_root_slot(
-						CLUSTER_CONTROL_ROOT_OK_PRIMARY, &pin_snapshot,
-						own_thread, tid, now_us, CheckPointTimeout)
+				if (cluster_recovery_classify_root_slot(CLUSTER_CONTROL_ROOT_OK_PRIMARY,
+														&pin_snapshot, own_thread, tid, now_us,
+														CheckPointTimeout)
 					!= CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE) {
 					sv = CLUSTER_RECOVERY_STREAM_SKIPPED;
 				} else {
@@ -389,11 +385,9 @@ cluster_recovery_worker_main(Datum main_arg)
 			} else {
 				ClusterRecoveryThreadVerdict verdict;
 
-				verdict = cluster_recovery_classify_slot(
-					v, &reg_slot, own_thread, tid, now_us,
-					cluster_recovery_stale_active_ms);
-				if (verdict
-					!= CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE) {
+				verdict = cluster_recovery_classify_slot(v, &reg_slot, own_thread, tid, now_us,
+														 cluster_recovery_stale_active_ms);
+				if (verdict != CLUSTER_RECOVERY_THREAD_CRASHED_CANDIDATE) {
 					sv = CLUSTER_RECOVERY_STREAM_SKIPPED;
 				} else {
 					sv = validate_stream(tid, &reg_slot);
@@ -480,12 +474,10 @@ cluster_recovery_workers_launch(void)
 	 * will refuse it (UNREADABLE verdict).
 	 */
 	for (tid = XLP_THREAD_ID_FIRST_REAL; tid <= CLUSTER_WAL_THREAD_MAX; tid++) {
-		if ((plan.candidate_bitmap[(tid - 1) / 64]
-			 & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
+		if ((plan.candidate_bitmap[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
 			continue;
 		if (cluster_r4_bit22_cutover_active()) {
-			(void) cluster_thread_recovery_pin_projection(
-				tid, (uint64) pool->generation);
+			(void)cluster_thread_recovery_pin_projection(tid, (uint64)pool->generation);
 		}
 	}
 

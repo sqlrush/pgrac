@@ -18,31 +18,27 @@
 #define RESOURCE_X_PROOF_READINESS_UNAVAILABLE "UNAVAILABLE_PROOF_KIND"
 #define RESOURCE_X_PROOF_READINESS_AVAILABLE "AVAILABLE_PROOF_KIND"
 
-typedef struct ResourceXAssertion
-{
-	BufferTag	resource;
-	int32		requester_node;
+typedef struct ResourceXAssertion {
+	BufferTag resource;
+	int32 requester_node;
 } ResourceXAssertion;
 
-typedef struct ResourceXAttemptWitness
-{
+typedef struct ResourceXAttemptWitness {
 	ResourceXAssertion assertion;
-	uint64		base_authority_generation;
+	uint64 base_authority_generation;
 } ResourceXAttemptWitness;
 
-typedef struct ResourceXTransportWitness
-{
-	uint64		cluster_epoch;
-	uint64		peer_session_incarnation;
-	uint32		connection_generation;
-	uint16		lane_id;
-	uint16		flags;
+typedef struct ResourceXTransportWitness {
+	uint64 cluster_epoch;
+	uint64 peer_session_incarnation;
+	uint32 connection_generation;
+	uint16 lane_id;
+	uint16 flags;
 } ResourceXTransportWitness;
 
 /* Process-local D6-03 outcome.  These values are never persisted or sent on
  * the legacy 41--64 wire family. */
-typedef enum ResourceXLocalJoinResult
-{
+typedef enum ResourceXLocalJoinResult {
 	RESOURCE_X_LOCAL_JOIN_NONE = 0,
 	RESOURCE_X_LOCAL_LEADER_MUST_SUBMIT,
 	RESOURCE_X_LOCAL_JOINED_LOCAL_ASSERTION,
@@ -70,16 +66,14 @@ StaticAssertDecl(offsetof(ResourceXTransportWitness, cluster_epoch) == 0
 					 && offsetof(ResourceXTransportWitness, flags) == 22,
 				 "Resource-X transport witness offsets changed");
 
-extern bool resource_x_assertion_init(const BufferTag *tag,
-									  int32 requester_node,
+extern bool resource_x_assertion_init(const BufferTag *tag, int32 requester_node,
 									  ResourceXAssertion *out);
 extern bool resource_x_assertion_valid(const ResourceXAssertion *assertion);
 extern bool resource_x_assertion_equal(const ResourceXAssertion *left,
 									   const ResourceXAssertion *right);
 extern uint32 resource_x_assertion_hash(const ResourceXAssertion *assertion);
 extern bool resource_x_attempt_init(const ResourceXAssertion *assertion,
-									uint64 base_authority_generation,
-									ResourceXAttemptWitness *out);
+									uint64 base_authority_generation, ResourceXAttemptWitness *out);
 extern bool resource_x_attempt_matches(const ResourceXAttemptWitness *left,
 									   const ResourceXAttemptWitness *right);
 /* R6 readiness only: no proof enum, proof value, producer, or proof-bearing key. */

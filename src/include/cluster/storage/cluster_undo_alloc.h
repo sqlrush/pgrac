@@ -242,8 +242,8 @@ StaticAssertDecl(sizeof(ClusterUndoSegmentExtendPlan) == 16,
  * ownership but release lifecycle_lock before first provision or reuse
  * through current authority, then revalidate the selected image.
  */
-extern bool cluster_undo_segment_extend_or_create(
-	uint8 owner_instance, ClusterUndoSegmentExtendPlan *plan);
+extern bool cluster_undo_segment_extend_or_create(uint8 owner_instance,
+												  ClusterUndoSegmentExtendPlan *plan);
 
 
 /*
@@ -295,20 +295,21 @@ typedef enum ClusterUndoSegTryRecycle {
 } ClusterUndoSegTryRecycle;
 
 /* Caller holds no lifecycle/content lock; expected_epoch binds the folded floor. */
-extern ClusterUndoSegTryRecycle
-cluster_undo_segment_try_mark_recyclable(uint32 segment_id,
-	uint8 owner_instance, SCN horizon, uint64 expected_epoch);
+extern ClusterUndoSegTryRecycle cluster_undo_segment_try_mark_recyclable(uint32 segment_id,
+																		 uint8 owner_instance,
+																		 SCN horizon,
+																		 uint64 expected_epoch);
 
 /* spec-3.13 D4: exact in-place rebirth; caller holds no lifecycle/content lock. */
 extern uint32 cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance,
-											  uint32 old_generation);
+												  uint32 old_generation);
 
 /* spec-3.13 D4: durable segment generation (== header wrap_count; 0 = unknown). */
 extern uint32 cluster_undo_segment_generation(uint32 segment_id, uint8 owner_instance);
 
 /* spec-3.13: identity check exported for redo + reuse peek (L212 surface). */
 extern bool cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
-											uint8 owner_instance);
+													uint8 owner_instance);
 
 typedef enum ClusterUndoPoolObservationResult {
 	CLUSTER_UNDO_POOL_OBS_OK = 0,

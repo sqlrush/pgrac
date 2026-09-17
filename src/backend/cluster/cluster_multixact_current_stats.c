@@ -55,7 +55,7 @@ cluster_multixact_current_stats_shmem_init(void)
 	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
 		return;
 	ClusterCurrentMxStats = ShmemInitStruct("pgrac current multixact stats",
-										   sizeof(ClusterCurrentMxStatsShmem), &found);
+											sizeof(ClusterCurrentMxStatsShmem), &found);
 	if (!found) {
 		ClusterCurrentMxStats->stats_since = GetCurrentTimestamp();
 		for (i = 0; i < CMX_STAT_COUNT; i++)
@@ -102,9 +102,8 @@ cluster_multixact_current_stats_since(void)
 }
 
 bool
-cluster_multixact_current_stats_snapshot(
-	uint32 node_id, uint64 cluster_epoch,
-	ClusterCurrentMxStatsSnapshot *snapshot)
+cluster_multixact_current_stats_snapshot(uint32 node_id, uint64 cluster_epoch,
+										 ClusterCurrentMxStatsSnapshot *snapshot)
 {
 	int i;
 
@@ -115,8 +114,7 @@ cluster_multixact_current_stats_snapshot(
 	snapshot->cluster_epoch = cluster_epoch;
 	snapshot->stats_since = ClusterCurrentMxStats->stats_since;
 	for (i = 0; i < CMX_STAT_COUNT; i++)
-		snapshot->counters[i]
-			= pg_atomic_read_u64(&ClusterCurrentMxStats->counters[i]);
+		snapshot->counters[i] = pg_atomic_read_u64(&ClusterCurrentMxStats->counters[i]);
 	return snapshot->stats_since != 0;
 }
 
@@ -142,30 +140,23 @@ cluster_multixact_current_stats_record_restarts(uint32 restarts)
 	if (ClusterCurrentMxStats == NULL)
 		return;
 
-	cluster_multixact_current_stats_bump(
-		cluster_multixact_current_restart_bucket(restarts));
+	cluster_multixact_current_stats_bump(cluster_multixact_current_restart_bucket(restarts));
 
-	expected = pg_atomic_read_u64(
-		&ClusterCurrentMxStats->counters[CMX_STAT_RESTART_MAX]);
-	while (expected < restarts &&
-		   !pg_atomic_compare_exchange_u64(
-			   &ClusterCurrentMxStats->counters[CMX_STAT_RESTART_MAX],
-			   &expected, restarts))
+	expected = pg_atomic_read_u64(&ClusterCurrentMxStats->counters[CMX_STAT_RESTART_MAX]);
+	while (expected < restarts
+		   && !pg_atomic_compare_exchange_u64(
+			   &ClusterCurrentMxStats->counters[CMX_STAT_RESTART_MAX], &expected, restarts))
 		;
 }
 
 void
 cluster_multixact_current_stats_alert_sample(void)
 {
-	static const ClusterCurrentMxStatId alert_stats[] = {
-		CMX_STAT_DESCRIBE_REMOTE_TIMEOUT,
-		CMX_STAT_DESCRIBE_REMOTE_UNKNOWN,
-		CMX_STAT_MEMBER_PROOF_UNKNOWN,
-		CMX_STAT_DESCRIBE_INVALID_REPLY,
-		CMX_STAT_MEMBER_PROOF_INVALID_REPLY,
-		CMX_STAT_RESTART_BUCKET_8_PLUS,
-		CMX_STAT_FOREIGN_SLRU_GUARD
-	};
+	static const ClusterCurrentMxStatId alert_stats[]
+		= { CMX_STAT_DESCRIBE_REMOTE_TIMEOUT,	 CMX_STAT_DESCRIBE_REMOTE_UNKNOWN,
+			CMX_STAT_MEMBER_PROOF_UNKNOWN,		 CMX_STAT_DESCRIBE_INVALID_REPLY,
+			CMX_STAT_MEMBER_PROOF_INVALID_REPLY, CMX_STAT_RESTART_BUCKET_8_PLUS,
+			CMX_STAT_FOREIGN_SLRU_GUARD };
 	static uint64 previous[lengthof(alert_stats)];
 	static TimestampTz last_sample;
 	TimestampTz now;
@@ -177,17 +168,13 @@ cluster_multixact_current_stats_alert_sample(void)
 		return;
 
 	now = GetCurrentTimestamp();
-	if (last_sample != 0
-		&& now >= last_sample
-		&& now - last_sample < INT64CONST(60000000))
+	if (last_sample != 0 && now >= last_sample && now - last_sample < INT64CONST(60000000))
 		return;
 
 	for (i = 0; i < lengthof(alert_stats); i++) {
 		uint64 current = cluster_multixact_current_stats_get(alert_stats[i]);
 
-		deltas[i] = current >= previous[i]
-						? current - previous[i]
-						: current;
+		deltas[i] = current >= previous[i] ? current - previous[i] : current;
 		previous[i] = current;
 		changed |= deltas[i] != 0;
 	}

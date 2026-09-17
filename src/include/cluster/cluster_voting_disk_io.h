@@ -147,7 +147,8 @@
  * (JCMK coordinator-write pattern).  Payload = ClusterFormationCommitMarker
  * (magic "PGFM"); this layer is payload-agnostic aligned raw slot I/O.
  */
-#define CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id) 	((off_t) (7 * CLUSTER_MAX_NODES + 3 + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
+#define CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id)                                              \
+	((off_t)(7 * CLUSTER_MAX_NODES + 3 + (node_id)) * CLUSTER_VOTING_SLOT_BYTES)
 
 /*
  * spec-8.4 / spec-5.15A — PGSA occupies fixed slot 5N+1.  One 512-byte
@@ -319,12 +320,10 @@ extern ClusterVotingDiskIoState cluster_voting_disk_write_join_slot(int fd, uint
  * magic/version/CRC.  Same per-I/O timeout discipline and fail-closed
  * empty semantics as the join-slot path.
  */
-extern ClusterVotingDiskIoState cluster_voting_disk_read_formation_slot(int fd,
-																	   uint32 node_id,
-																	   void *out_slot512);
-extern ClusterVotingDiskIoState cluster_voting_disk_write_formation_slot(int fd,
-																		uint32 node_id,
-																		const void *in_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_read_formation_slot(int fd, uint32 node_id,
+																		void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_formation_slot(int fd, uint32 node_id,
+																		 const void *in_slot512);
 
 /*
  * spec-6.4 D7 — raw 512-byte ADG apply-master lease slot R/W in region 4.
@@ -365,20 +364,19 @@ extern ClusterVotingDiskIoState cluster_voting_disk_write_stripe_activation(int 
  * Fixed PGSA slot.  The offset is deliberately not a caller parameter.  A
  * full all-zero page remains FULL; payload policy belongs to the caller.
  */
-extern ClusterVotingDiskRawReadState
-cluster_voting_disk_read_raw_tail_slot(int fd, void *out_slot512);
-extern ClusterVotingDiskIoState
-cluster_voting_disk_write_raw_tail_slot(int fd, const void *in_slot512);
+extern ClusterVotingDiskRawReadState cluster_voting_disk_read_raw_tail_slot(int fd,
+																			void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_raw_tail_slot(int fd,
+																		const void *in_slot512);
 
 /* Payload-neutral aligned raw-sector I/O at a caller-selected frozen offset.
  * The offset must be nonnegative and exactly 512-byte aligned.  Payload
  * validation, fixed-slot ownership, readback comparison and quorum counting
  * remain with the authority layer. */
-extern ClusterVotingDiskRawReadState
-cluster_voting_disk_read_raw_slot_at(int fd, off_t offset, void *out_slot512);
-extern ClusterVotingDiskIoState
-cluster_voting_disk_write_raw_slot_at(int fd, off_t offset,
-									  const void *in_slot512);
+extern ClusterVotingDiskRawReadState cluster_voting_disk_read_raw_slot_at(int fd, off_t offset,
+																		  void *out_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_raw_slot_at(int fd, off_t offset,
+																	  const void *in_slot512);
 
 /*
  * Raw node-indexed epoch-ballot lane I/O.  This is a dedicated synchronous
@@ -388,9 +386,9 @@ cluster_voting_disk_write_raw_slot_at(int fd, off_t offset,
  */
 extern ClusterVotingDiskIoState
 cluster_voting_disk_read_epoch_ballot_slot(int fd, uint32 proposer_node_id, void *out_slot512);
-extern ClusterVotingDiskIoState
-cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id,
-											 const void *in_slot512);
+extern ClusterVotingDiskIoState cluster_voting_disk_write_epoch_ballot_slot(int fd,
+																			uint32 proposer_node_id,
+																			const void *in_slot512);
 
 /* Positive common-epoch ballot authority is Linux raw-block only.  Regular
  * files remain valid codec/I/O fixtures but can never pass this attestation. */

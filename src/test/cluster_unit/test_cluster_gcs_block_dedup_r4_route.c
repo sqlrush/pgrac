@@ -403,8 +403,7 @@ make_tag(uint32 blockno)
 }
 
 static GcsBlockR4RouteIdentity
-make_identity(uint64 seq, uint64 epoch, uint32 blockno, SCN read_scn,
-			  uint64 activation_generation)
+make_identity(uint64 seq, uint64 epoch, uint32 blockno, SCN read_scn, uint64 activation_generation)
 {
 	GcsBlockR4RouteIdentity identity;
 
@@ -456,8 +455,8 @@ static GcsBlockR4RouteArmResult
 arm_route(const GcsBlockR4RouteIdentity *identity, const ClusterR4CrRouteProof *proof,
 		  GcsBlockR4RouteRecord *record_out)
 {
-	return cluster_gcs_block_dedup_r4_route_arm_or_match(
-		0, identity, TEST_ROUTE_TRANSITION, proof, TEST_LIFETIME_HINT_MS, true, record_out);
+	return cluster_gcs_block_dedup_r4_route_arm_or_match(0, identity, TEST_ROUTE_TRANSITION, proof,
+														 TEST_LIFETIME_HINT_MS, true, record_out);
 }
 
 /* -------------------------------------------------------------------------
@@ -612,14 +611,13 @@ UT_TEST(test_proof_drift_marks_retryable_without_overwriting_winner)
 	drifted.selected_holder_node = 3;
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_HOLDER_MOVED, arm_route(&identity, &drifted, &record));
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_count());
-	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_RETRYABLE,
-				 arm_route(&identity, &first_proof, &record));
+	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_RETRYABLE, arm_route(&identity, &first_proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_COLLISION,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &drifted, true));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &drifted, true));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_FORWARDED,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &first_proof, true));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &first_proof, true));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&identity, &first_proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_FORWARDED, record.state);
 	assert_proof_exact(&record.proof, &first_proof);
@@ -634,13 +632,13 @@ UT_TEST(test_send_failure_then_late_admission_becomes_forwarded)
 	fixture_reset(8);
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_RETRYABLE,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &proof, false));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, false));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_RETRYABLE, arm_route(&identity, &proof, &record));
 
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_FORWARDED,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &proof, true));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&identity, &proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_FORWARDED, record.state);
 }
@@ -654,11 +652,11 @@ UT_TEST(test_send_failure_cannot_downgrade_forwarded)
 	fixture_reset(8);
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_FORWARDED,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &proof, true));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_RETRYABLE,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &proof, false));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, false));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&identity, &proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_FORWARDED, record.state);
 }
@@ -676,8 +674,8 @@ UT_TEST(test_duplicate_send_admission_does_not_extend_forwarded_ttl)
 	first_completion_monotonic = fixture_monotonic_us();
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_FORWARDED,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &proof, true));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true));
 
 	/* A duplicate accepted publication one microsecond later must not refresh
 	 * completed_at_ts.  At the original strict TTL + 1 boundary the route
@@ -685,8 +683,8 @@ UT_TEST(test_duplicate_send_admission_does_not_extend_forwarded_ttl)
 	fake_now = first_completion_wall + 1;
 	fixture_set_monotonic_us(first_completion_monotonic + 1);
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_FORWARDED,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &proof, true));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true));
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_count());
 
 	fake_now = first_completion_wall + TEST_PINNED_LIFETIME_US + 1;
@@ -706,8 +704,8 @@ UT_TEST(test_finish_send_after_epoch_cleanup_is_stale)
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_sweep_epoch(4));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_SEND_STALE,
-				 cluster_gcs_block_dedup_r4_route_finish_send(
-					 0, &identity, TEST_ROUTE_TRANSITION, &proof, true));
+				 cluster_gcs_block_dedup_r4_route_finish_send(0, &identity, TEST_ROUTE_TRANSITION,
+															  &proof, true));
 	UT_ASSERT_EQ(0, cluster_gcs_block_dedup_r4_route_count());
 }
 
@@ -763,9 +761,9 @@ UT_TEST(test_wall_forward_monotonic_in_window_expires_generic_but_keeps_route)
 	fixture_reset(8);
 	generic_key.request_id = gcs_reqid_requester(1, 7, 23);
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_MISS_REGISTERED,
-				 cluster_gcs_block_dedup_lookup_or_register(
-					 0, &generic_key, generic_tag, TEST_ROUTE_TRANSITION,
-					 TEST_LIFETIME_HINT_MS, true, NULL));
+				 cluster_gcs_block_dedup_lookup_or_register(0, &generic_key, generic_tag,
+															TEST_ROUTE_TRANSITION,
+															TEST_LIFETIME_HINT_MS, true, NULL));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&route, &proof, &record));
 
 	/* Generic remains wall-clock based, while the route is still only one
@@ -831,8 +829,7 @@ UT_TEST(test_cap_one_wall_backward_monotonic_expired_reclaims_route)
 	if (result != GCS_BLOCK_R4_ROUTE_ARM_NEW)
 		return;
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_count());
-	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY,
-				 arm_route(&second, &second_proof, &record));
+	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&second, &second_proof, &record));
 }
 
 UT_TEST(test_epoch_zero_is_valid_and_only_stale_formation_is_swept)
@@ -865,8 +862,7 @@ UT_TEST(test_backend_exit_removes_exact_requester_route)
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&survivor, &survivor_proof, &record));
 	cluster_gcs_block_dedup_cleanup_on_backend_exit(1, 7);
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_count());
-	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY,
-				 arm_route(&survivor, &survivor_proof, &record));
+	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&survivor, &survivor_proof, &record));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&matching, &matching_proof, &record));
 }
 
@@ -895,18 +891,18 @@ UT_TEST(test_closed_purge_removes_routes_but_preserves_generic_entry)
 	generic_key = route.legacy_key;
 	generic_key.request_id = gcs_reqid_requester(1, 7, 15);
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_MISS_REGISTERED,
-				 cluster_gcs_block_dedup_lookup_or_register(
-					 0, &generic_key, generic_tag, TEST_ROUTE_TRANSITION,
-					 TEST_LIFETIME_HINT_MS, true, NULL));
+				 cluster_gcs_block_dedup_lookup_or_register(0, &generic_key, generic_tag,
+															TEST_ROUTE_TRANSITION,
+															TEST_LIFETIME_HINT_MS, true, NULL));
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&route, &proof, &record));
 
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_purge_closed());
 	UT_ASSERT_EQ(0, cluster_gcs_block_dedup_r4_route_count());
 	UT_ASSERT_EQ(1, fake_live_count());
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_IN_FLIGHT_DUPLICATE,
-				 cluster_gcs_block_dedup_lookup_or_register(
-					 0, &generic_key, generic_tag, TEST_ROUTE_TRANSITION,
-					 TEST_LIFETIME_HINT_MS, true, NULL));
+				 cluster_gcs_block_dedup_lookup_or_register(0, &generic_key, generic_tag,
+															TEST_ROUTE_TRANSITION,
+															TEST_LIFETIME_HINT_MS, true, NULL));
 }
 
 UT_TEST(test_generic_done_and_remove_ignore_route)
@@ -919,15 +915,14 @@ UT_TEST(test_generic_done_and_remove_ignore_route)
 	fixture_reset(8);
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_NEW, arm_route(&identity, &proof, &record));
 	done_mismatch_before = cluster_gcs_block_dedup_get_done_mismatch_count();
-	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(
-		0, &identity.legacy_key, &identity.tag, TEST_ROUTE_TRANSITION));
+	UT_ASSERT(!cluster_gcs_block_dedup_mark_done(0, &identity.legacy_key, &identity.tag,
+												 TEST_ROUTE_TRANSITION));
 	cluster_gcs_block_dedup_remove(0, &identity.legacy_key);
 	UT_ASSERT_EQ(GCS_BLOCK_DEDUP_VALIDATION_FAIL,
-				 cluster_gcs_block_dedup_lookup_or_register(
-					 0, &identity.legacy_key, identity.tag, TEST_ROUTE_TRANSITION,
-					 TEST_LIFETIME_HINT_MS, true, NULL));
-	UT_ASSERT_EQ(done_mismatch_before,
-				 cluster_gcs_block_dedup_get_done_mismatch_count());
+				 cluster_gcs_block_dedup_lookup_or_register(0, &identity.legacy_key, identity.tag,
+															TEST_ROUTE_TRANSITION,
+															TEST_LIFETIME_HINT_MS, true, NULL));
+	UT_ASSERT_EQ(done_mismatch_before, cluster_gcs_block_dedup_get_done_mismatch_count());
 	UT_ASSERT_EQ(1, cluster_gcs_block_dedup_r4_route_count());
 	UT_ASSERT_EQ(GCS_BLOCK_R4_ROUTE_ARM_REPLAY, arm_route(&identity, &proof, &record));
 }

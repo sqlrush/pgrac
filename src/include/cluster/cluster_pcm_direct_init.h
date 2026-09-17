@@ -57,18 +57,15 @@ cluster_pcm_direct_init_proof_consume(ClusterPcmDirectInitKind kind,
 									  const ClusterPcmDirectInitSnapshot *snapshot,
 									  ClusterPcmDirectInitProof *proof);
 extern ClusterPcmOwnResult
-cluster_pcm_direct_init_aux_pending_observer_validate(
-	ClusterPcmDirectInitKind kind,
-	const ClusterPcmDirectInitSnapshot *snapshot);
+cluster_pcm_direct_init_aux_pending_observer_validate(ClusterPcmDirectInitKind kind,
+													  const ClusterPcmDirectInitSnapshot *snapshot);
 extern ClusterPcmOwnResult
-cluster_pcm_direct_init_target_pending_validate(
-	ClusterPcmDirectInitKind kind,
-	const ClusterPcmDirectInitSnapshot *pending,
-	const ClusterPcmDirectInitProof *consumed_proof);
+cluster_pcm_direct_init_target_pending_validate(ClusterPcmDirectInitKind kind,
+												const ClusterPcmDirectInitSnapshot *pending,
+												const ClusterPcmDirectInitProof *consumed_proof);
 extern ClusterPcmOwnResult
-cluster_pcm_direct_init_target_commit_validate(
-	ClusterPcmDirectInitKind kind,
-	const ClusterPcmDirectInitSnapshot *committed,
-	const ClusterPcmDirectInitProof *consumed_proof);
+cluster_pcm_direct_init_target_commit_validate(ClusterPcmDirectInitKind kind,
+											   const ClusterPcmDirectInitSnapshot *committed,
+											   const ClusterPcmDirectInitProof *consumed_proof);
 
 #endif /* CLUSTER_PCM_DIRECT_INIT_H */

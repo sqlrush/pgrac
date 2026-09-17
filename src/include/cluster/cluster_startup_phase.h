@@ -269,7 +269,7 @@ typedef enum ClusterAuthorityReadiness {
 } ClusterAuthorityReadiness;
 
 typedef struct ClusterPhaseSharedState {
-	LWLock lwlock; /* LWTRANCHE_CLUSTER_STARTUP_PHASE */
+	LWLock lwlock;					/* LWTRANCHE_CLUSTER_STARTUP_PHASE */
 	pg_atomic_uint32 current_phase; /* AD-023 A1: lock-free reads */
 	TimestampTz phase_start_times[CLUSTER_PHASE_LAST + 1];
 	PhaseHistoryEntry phase_history[CLUSTER_PHASE_HISTORY_RING_SIZE];
@@ -309,13 +309,12 @@ extern void cluster_phase_shmem_register(void);
  * transitions; every consumer gets a generation-revalidated predicate. */
 extern ClusterAuthorityReadiness cluster_authority_readiness_get(void);
 extern bool cluster_authority_readiness_managed(void);
-extern bool cluster_authority_handoff_identity_current(
-	uint64 expected_self_incarnation, uint64 expected_predecessor_floor);
-extern bool cluster_authority_readiness_begin(
-	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
-	const ClusterFormationSnapshotV1 *formation);
-extern bool cluster_authority_readiness_bind_recovery_generation(
-	uint64 lms_generation);
+extern bool cluster_authority_handoff_identity_current(uint64 expected_self_incarnation,
+													   uint64 expected_predecessor_floor);
+extern bool cluster_authority_readiness_begin(uint16 origin_thread,
+											  const ClusterFenceAuthorityProof *authority,
+											  const ClusterFormationSnapshotV1 *formation);
+extern bool cluster_authority_readiness_bind_recovery_generation(uint64 lms_generation);
 extern bool cluster_authority_readiness_publish_recovery(uint64 lms_generation);
 extern bool cluster_authority_readiness_publish_serving(void);
 extern void cluster_authority_readiness_clear(void);
@@ -328,10 +327,9 @@ extern bool cluster_authority_serving_rebind_lmon(void);
  * (no local episode closes for its own departure; re-stamps from its own
  * applied CLEAN_LEAVE evidence). */
 extern bool cluster_authority_serving_rebind_leaver(void);
-extern bool cluster_recovery_authority_resid_mode_allowed(
-	const ClusterResId *resid, LOCKMODE mode);
-extern bool cluster_recovery_authority_request_allowed(
-	const ClusterResId *resid, LOCKMODE mode, bool startup_process);
+extern bool cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid, LOCKMODE mode);
+extern bool cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE mode,
+													   bool startup_process);
 
 
 /* ----------

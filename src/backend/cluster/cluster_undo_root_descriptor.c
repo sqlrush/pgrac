@@ -37,16 +37,14 @@ pgrd_get_le16(const uint8 *in)
 static uint32
 pgrd_get_le32(const uint8 *in)
 {
-	return (uint32)in[0] | ((uint32)in[1] << 8)
-		   | ((uint32)in[2] << 16) | ((uint32)in[3] << 24);
+	return (uint32)in[0] | ((uint32)in[1] << 8) | ((uint32)in[2] << 16) | ((uint32)in[3] << 24);
 }
 
 
 static uint64
 pgrd_get_le64(const uint8 *in)
 {
-	return (uint64)pgrd_get_le32(in)
-		   | ((uint64)pgrd_get_le32(in + 4) << 32);
+	return (uint64)pgrd_get_le32(in) | ((uint64)pgrd_get_le32(in + 4) << 32);
 }
 
 
@@ -102,8 +100,8 @@ pgrd_crc32c(const uint8 bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
 
 
 bool
-cluster_undo_root_namespace_id(uint64 descriptor_incarnation,
-							   uint32 root_ordinal, uint64 *namespace_id)
+cluster_undo_root_namespace_id(uint64 descriptor_incarnation, uint32 root_ordinal,
+							   uint64 *namespace_id)
 {
 	uint64 ordinal = (uint64)root_ordinal + 1;
 	uint64 incarnation_index;
@@ -113,9 +111,7 @@ cluster_undo_root_namespace_id(uint64 descriptor_incarnation,
 		|| root_ordinal >= CLUSTER_UNDO_ROOT_COUNT)
 		return false;
 	incarnation_index = descriptor_incarnation - 1;
-	if (incarnation_index
-		> (CLUSTER_UNDO_ROOT_MAX_NAMESPACE - ordinal)
-		  / CLUSTER_UNDO_ROOT_COUNT)
+	if (incarnation_index > (CLUSTER_UNDO_ROOT_MAX_NAMESPACE - ordinal) / CLUSTER_UNDO_ROOT_COUNT)
 		return false;
 	value = incarnation_index * CLUSTER_UNDO_ROOT_COUNT + ordinal;
 	if (value == 0 || value > CLUSTER_UNDO_ROOT_MAX_NAMESPACE)
@@ -126,11 +122,10 @@ cluster_undo_root_namespace_id(uint64 descriptor_incarnation,
 
 
 bool
-cluster_undo_root_file_slot(uint32 owner_instance, uint32 segment_slot,
-							uint32 *file_slot)
+cluster_undo_root_file_slot(uint32 owner_instance, uint32 segment_slot, uint32 *file_slot)
 {
-	if (file_slot == NULL || owner_instance == 0
-		|| owner_instance > CLUSTER_MAX_NODES || segment_slot >= 256)
+	if (file_slot == NULL || owner_instance == 0 || owner_instance > CLUSTER_MAX_NODES
+		|| segment_slot >= 256)
 		return false;
 	*file_slot = (owner_instance - 1) * 256 + segment_slot;
 	return true;
@@ -140,8 +135,7 @@ cluster_undo_root_file_slot(uint32 owner_instance, uint32 segment_slot,
 bool
 cluster_undo_root_id(uint64 namespace_id, uint32 file_slot, uint64 *root_id)
 {
-	if (root_id == NULL || namespace_id == 0
-		|| namespace_id > CLUSTER_UNDO_ROOT_MAX_NAMESPACE
+	if (root_id == NULL || namespace_id == 0 || namespace_id > CLUSTER_UNDO_ROOT_MAX_NAMESPACE
 		|| file_slot >= CLUSTER_UNDO_ROOT_FILE_SLOTS)
 		return false;
 	*root_id = (namespace_id << 15) | file_slot;
@@ -156,66 +150,52 @@ pgrd_descriptor_valid(const ClusterUndoRootDescriptorV1 *descriptor)
 
 	if (descriptor == NULL || descriptor->descriptor_incarnation == 0
 		|| descriptor->system_identifier == 0
-		|| pgrd_bytes_zero(descriptor->root_uuid,
-							 CLUSTER_UNDO_ROOT_UUID_BYTES))
+		|| pgrd_bytes_zero(descriptor->root_uuid, CLUSTER_UNDO_ROOT_UUID_BYTES))
 		return false;
 	if (descriptor->root_kind == CLUSTER_UNDO_ROOT_KIND_SHARED) {
 		if (descriptor->owner_node != -1 || descriptor->root_ordinal != 0)
 			return false;
 	} else if (descriptor->root_kind == CLUSTER_UNDO_ROOT_KIND_LOCAL) {
-		if (descriptor->owner_node < 0
-			|| descriptor->owner_node >= CLUSTER_MAX_NODES
-			|| descriptor->root_ordinal
-				   != (uint32)descriptor->owner_node + 1)
+		if (descriptor->owner_node < 0 || descriptor->owner_node >= CLUSTER_MAX_NODES
+			|| descriptor->root_ordinal != (uint32)descriptor->owner_node + 1)
 			return false;
 	} else
 		return false;
-	return cluster_undo_root_namespace_id(
-			   descriptor->descriptor_incarnation, descriptor->root_ordinal,
-			   &expected_namespace)
+	return cluster_undo_root_namespace_id(descriptor->descriptor_incarnation,
+										  descriptor->root_ordinal, &expected_namespace)
 		   && descriptor->namespace_id == expected_namespace;
 }
 
 
 bool
-cluster_undo_root_descriptor_encode(
-	const ClusterUndoRootDescriptorV1 *descriptor,
-	uint8 out[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
+cluster_undo_root_descriptor_encode(const ClusterUndoRootDescriptorV1 *descriptor,
+									uint8 out[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES])
 {
 	uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 
 	if (out == NULL || !pgrd_descriptor_valid(descriptor))
 		return false;
 	memset(image, 0, sizeof(image));
-	pgrd_put_le32(image + PGRD_OFF_MAGIC,
-				   CLUSTER_UNDO_ROOT_DESCRIPTOR_MAGIC);
-	pgrd_put_le16(image + PGRD_OFF_VERSION,
-				   CLUSTER_UNDO_ROOT_DESCRIPTOR_VERSION);
-	pgrd_put_le16(image + PGRD_OFF_HEADER_LEN,
-				   CLUSTER_UNDO_ROOT_DESCRIPTOR_HEADER_LEN);
-	pgrd_put_le64(image + PGRD_OFF_INCARNATION,
-				   descriptor->descriptor_incarnation);
+	pgrd_put_le32(image + PGRD_OFF_MAGIC, CLUSTER_UNDO_ROOT_DESCRIPTOR_MAGIC);
+	pgrd_put_le16(image + PGRD_OFF_VERSION, CLUSTER_UNDO_ROOT_DESCRIPTOR_VERSION);
+	pgrd_put_le16(image + PGRD_OFF_HEADER_LEN, CLUSTER_UNDO_ROOT_DESCRIPTOR_HEADER_LEN);
+	pgrd_put_le64(image + PGRD_OFF_INCARNATION, descriptor->descriptor_incarnation);
 	image[PGRD_OFF_ROOT_KIND] = descriptor->root_kind;
-	pgrd_put_le32(image + PGRD_OFF_OWNER_NODE,
-				   (uint32)descriptor->owner_node);
-	pgrd_put_le32(image + PGRD_OFF_ROOT_ORDINAL,
-				   descriptor->root_ordinal);
-	memcpy(image + PGRD_OFF_ROOT_UUID, descriptor->root_uuid,
-		   CLUSTER_UNDO_ROOT_UUID_BYTES);
+	pgrd_put_le32(image + PGRD_OFF_OWNER_NODE, (uint32)descriptor->owner_node);
+	pgrd_put_le32(image + PGRD_OFF_ROOT_ORDINAL, descriptor->root_ordinal);
+	memcpy(image + PGRD_OFF_ROOT_UUID, descriptor->root_uuid, CLUSTER_UNDO_ROOT_UUID_BYTES);
 	pgrd_put_le64(image + PGRD_OFF_NAMESPACE_ID, descriptor->namespace_id);
-	pgrd_put_le64(image + PGRD_OFF_SYSTEM_IDENTIFIER,
-				   descriptor->system_identifier);
-	pgrd_put_le32(image + CLUSTER_UNDO_ROOT_DESCRIPTOR_CRC_OFFSET,
-				   pgrd_crc32c(image));
+	pgrd_put_le64(image + PGRD_OFF_SYSTEM_IDENTIFIER, descriptor->system_identifier);
+	pgrd_put_le32(image + CLUSTER_UNDO_ROOT_DESCRIPTOR_CRC_OFFSET, pgrd_crc32c(image));
 	memcpy(out, image, sizeof(image));
 	return true;
 }
 
 
 ClusterUndoRootDescriptorState
-cluster_undo_root_descriptor_decode(
-	const uint8 bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
-	uint64 expected_system_identifier, ClusterUndoRootDescriptorV1 *out)
+cluster_undo_root_descriptor_decode(const uint8 bytes[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+									uint64 expected_system_identifier,
+									ClusterUndoRootDescriptorV1 *out)
 {
 	ClusterUndoRootDescriptorV1 decoded;
 
@@ -223,34 +203,25 @@ cluster_undo_root_descriptor_decode(
 		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 	if (pgrd_bytes_zero(bytes, CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES))
 		return CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED;
-	if (pgrd_get_le32(bytes + PGRD_OFF_MAGIC)
-			!= CLUSTER_UNDO_ROOT_DESCRIPTOR_MAGIC
-		|| pgrd_get_le16(bytes + PGRD_OFF_VERSION)
-			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VERSION
-		|| pgrd_get_le16(bytes + PGRD_OFF_HEADER_LEN)
-			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_HEADER_LEN
+	if (pgrd_get_le32(bytes + PGRD_OFF_MAGIC) != CLUSTER_UNDO_ROOT_DESCRIPTOR_MAGIC
+		|| pgrd_get_le16(bytes + PGRD_OFF_VERSION) != CLUSTER_UNDO_ROOT_DESCRIPTOR_VERSION
+		|| pgrd_get_le16(bytes + PGRD_OFF_HEADER_LEN) != CLUSTER_UNDO_ROOT_DESCRIPTOR_HEADER_LEN
 		|| !pgrd_bytes_zero(bytes + PGRD_OFF_RESERVED0, 3)
 		|| pgrd_get_le32(bytes + PGRD_OFF_RESERVED1) != 0
 		|| !pgrd_bytes_zero(bytes + PGRD_OFF_RESERVED2,
-							 CLUSTER_UNDO_ROOT_DESCRIPTOR_CRC_OFFSET
-							 - PGRD_OFF_RESERVED2)
-		|| pgrd_get_le32(bytes + CLUSTER_UNDO_ROOT_DESCRIPTOR_CRC_OFFSET)
-			   != pgrd_crc32c(bytes))
+							CLUSTER_UNDO_ROOT_DESCRIPTOR_CRC_OFFSET - PGRD_OFF_RESERVED2)
+		|| pgrd_get_le32(bytes + CLUSTER_UNDO_ROOT_DESCRIPTOR_CRC_OFFSET) != pgrd_crc32c(bytes))
 		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 
 	memset(&decoded, 0, sizeof(decoded));
-	decoded.descriptor_incarnation
-		= pgrd_get_le64(bytes + PGRD_OFF_INCARNATION);
+	decoded.descriptor_incarnation = pgrd_get_le64(bytes + PGRD_OFF_INCARNATION);
 	decoded.root_kind = bytes[PGRD_OFF_ROOT_KIND];
 	decoded.owner_node = (int32)pgrd_get_le32(bytes + PGRD_OFF_OWNER_NODE);
 	decoded.root_ordinal = pgrd_get_le32(bytes + PGRD_OFF_ROOT_ORDINAL);
-	memcpy(decoded.root_uuid, bytes + PGRD_OFF_ROOT_UUID,
-		   CLUSTER_UNDO_ROOT_UUID_BYTES);
+	memcpy(decoded.root_uuid, bytes + PGRD_OFF_ROOT_UUID, CLUSTER_UNDO_ROOT_UUID_BYTES);
 	decoded.namespace_id = pgrd_get_le64(bytes + PGRD_OFF_NAMESPACE_ID);
-	decoded.system_identifier
-		= pgrd_get_le64(bytes + PGRD_OFF_SYSTEM_IDENTIFIER);
-	if (!pgrd_descriptor_valid(&decoded)
-		|| decoded.system_identifier != expected_system_identifier)
+	decoded.system_identifier = pgrd_get_le64(bytes + PGRD_OFF_SYSTEM_IDENTIFIER);
+	if (!pgrd_descriptor_valid(&decoded) || decoded.system_identifier != expected_system_identifier)
 		return CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD;
 	*out = decoded;
 	return CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID;
@@ -258,18 +229,17 @@ cluster_undo_root_descriptor_decode(
 
 
 bool
-cluster_undo_root_descriptor_resolve(
-	const ClusterUndoRootDescriptorV1 *descriptor,
-	ClusterUndoPathIntent intent, uint32 owner_instance, uint32 segment_id,
-	ClusterUndoBlock0ResolvedRoot *out)
+cluster_undo_root_descriptor_resolve(const ClusterUndoRootDescriptorV1 *descriptor,
+									 ClusterUndoPathIntent intent, uint32 owner_instance,
+									 uint32 segment_id, ClusterUndoBlock0ResolvedRoot *out)
 {
 	ClusterUndoBlock0ResolvedRoot resolved;
 	uint32 file_slot;
 	uint32 first_segment;
 	uint32 segment_slot;
 
-	if (out == NULL || !pgrd_descriptor_valid(descriptor)
-		|| owner_instance == 0 || owner_instance > CLUSTER_MAX_NODES)
+	if (out == NULL || !pgrd_descriptor_valid(descriptor) || owner_instance == 0
+		|| owner_instance > CLUSTER_MAX_NODES)
 		return false;
 	if (descriptor->root_kind == CLUSTER_UNDO_ROOT_KIND_SHARED) {
 		if (intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
@@ -286,8 +256,7 @@ cluster_undo_root_descriptor_resolve(
 		return false;
 	segment_slot = segment_id - first_segment;
 	if (!cluster_undo_root_file_slot(owner_instance, segment_slot, &file_slot)
-		|| !cluster_undo_root_id(descriptor->namespace_id, file_slot,
-							  &resolved.root_id))
+		|| !cluster_undo_root_id(descriptor->namespace_id, file_slot, &resolved.root_id))
 		return false;
 
 	resolved.intent = intent;

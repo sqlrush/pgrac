@@ -26,23 +26,21 @@
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_projection.h"
 
-#define RF_SIDE_CLOG_XACTS_PER_PAGE ((uint32) BLCKSZ * 4)
+#define RF_SIDE_CLOG_XACTS_PER_PAGE ((uint32)BLCKSZ * 4)
 #define RF_SIDE_COMMIT_TS_ENTRY_BYTES UINT32_C(10)
-#define RF_SIDE_COMMIT_TS_XACTS_PER_PAGE \
-	((uint32) BLCKSZ / RF_SIDE_COMMIT_TS_ENTRY_BYTES)
+#define RF_SIDE_COMMIT_TS_XACTS_PER_PAGE ((uint32)BLCKSZ / RF_SIDE_COMMIT_TS_ENTRY_BYTES)
 
 static bool
-cluster_side_projection_zero_range(
-	const ClusterSideProjectionApplyInputV1 *input,
-	TransactionId *first_xid, uint32 *xid_count)
+cluster_side_projection_zero_range(const ClusterSideProjectionApplyInputV1 *input,
+								   TransactionId *first_xid, uint32 *xid_count)
 {
 	const ClusterSideProjectionOperationV1 *operation = input->operation;
 	uint32 per_page;
 	uint64 first;
 	uint64 remaining;
 
-	if (operation->action != CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE ||
-		operation->page_number < 0 || first_xid == NULL || xid_count == NULL)
+	if (operation->action != CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE || operation->page_number < 0
+		|| first_xid == NULL || xid_count == NULL)
 		return false;
 	if (operation->kind == CLUSTER_SIDE_PROJECTION_CLOG)
 		per_page = RF_SIDE_CLOG_XACTS_PER_PAGE;
@@ -50,200 +48,166 @@ cluster_side_projection_zero_range(
 		per_page = RF_SIDE_COMMIT_TS_XACTS_PER_PAGE;
 	else
 		return false;
-	first = (uint64) (uint32) operation->page_number * per_page;
+	first = (uint64)(uint32)operation->page_number * per_page;
 	if (first > UINT32_MAX)
 		return false;
-	remaining = (uint64) UINT32_MAX - first + 1;
-	*first_xid = (TransactionId) first;
-	*xid_count = (uint32) Min((uint64) per_page, remaining);
-	return cluster_remote_xact_reset_range_valid_v2(
-		input->origin_thread - 1, *first_xid, *xid_count);
+	remaining = (uint64)UINT32_MAX - first + 1;
+	*first_xid = (TransactionId)first;
+	*xid_count = (uint32)Min((uint64)per_page, remaining);
+	return cluster_remote_xact_reset_range_valid_v2(input->origin_thread - 1, *first_xid,
+													*xid_count);
 }
 
 ClusterSideProjectionApplyResultV1
-cluster_side_projection_target_preflight_v1(
-	const ClusterSideProjectionApplyInputV1 *input)
+cluster_side_projection_target_preflight_v1(const ClusterSideProjectionApplyInputV1 *input)
 {
 	const ClusterSideProjectionOperationV1 *operation;
 	TransactionId first_xid;
 	uint32 xid_count;
 
-	if (input == NULL || input->operation == NULL || input->origin_thread == 0 ||
-		input->origin_thread > (1 << 7))
+	if (input == NULL || input->operation == NULL || input->origin_thread == 0
+		|| input->origin_thread > (1 << 7))
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	operation = input->operation;
-	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT)
-	{
+	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT) {
 		uint32 i;
 
-		if (!input->source_retained || input->cluster_epoch == 0 ||
-			input->source_lsn == InvalidXLogRecPtr ||
-			input->source_end_lsn <= input->source_lsn)
+		if (!input->source_retained || input->cluster_epoch == 0
+			|| input->source_lsn == InvalidXLogRecPtr || input->source_end_lsn <= input->source_lsn)
 			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-		if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE)
-		{
-			const MultiXactMember *members =
-				(const MultiXactMember *) input->owned_payload;
+		if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_CREATE) {
+			const MultiXactMember *members = (const MultiXactMember *)input->owned_payload;
 
-			if (operation->normalized_info != XLOG_MULTIXACT_CREATE_ID ||
-				!MultiXactIdIsValid(operation->multixact_id) ||
-				operation->member_offset == 0 ||
-				operation->member_count == 0 ||
-				operation->member_count > 256 || members == NULL ||
-				input->owned_payload_length != operation->member_count *
-					sizeof(MultiXactMember))
+			if (operation->normalized_info != XLOG_MULTIXACT_CREATE_ID
+				|| !MultiXactIdIsValid(operation->multixact_id) || operation->member_offset == 0
+				|| operation->member_count == 0 || operation->member_count > 256 || members == NULL
+				|| input->owned_payload_length != operation->member_count * sizeof(MultiXactMember))
 				return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 			for (i = 0; i < operation->member_count; i++)
-				if (!TransactionIdIsNormal(members[i].xid) ||
-					members[i].status < MultiXactStatusForKeyShare ||
-					members[i].status > MaxMultiXactStatus)
+				if (!TransactionIdIsNormal(members[i].xid)
+					|| members[i].status < MultiXactStatusForKeyShare
+					|| members[i].status > MaxMultiXactStatus)
 					return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-		}
-		else if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
-		{
-			if ((operation->normalized_info != XLOG_MULTIXACT_ZERO_OFF_PAGE &&
-				 operation->normalized_info != XLOG_MULTIXACT_ZERO_MEM_PAGE) ||
-				operation->page_number < 0 || input->owned_payload_length != 0)
+		} else if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
+			if ((operation->normalized_info != XLOG_MULTIXACT_ZERO_OFF_PAGE
+				 && operation->normalized_info != XLOG_MULTIXACT_ZERO_MEM_PAGE)
+				|| operation->page_number < 0 || input->owned_payload_length != 0)
 				return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-		}
-		else if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE)
-		{
-			if (operation->normalized_info != XLOG_MULTIXACT_TRUNCATE_ID ||
-				!OidIsValid(operation->oldest_database) ||
-				!MultiXactIdIsValid(operation->truncate_start_multixact) ||
-				!MultiXactIdIsValid(operation->truncate_end_multixact) ||
-				input->owned_payload_length != 0)
+		} else if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE) {
+			if (operation->normalized_info != XLOG_MULTIXACT_TRUNCATE_ID
+				|| !OidIsValid(operation->oldest_database)
+				|| !MultiXactIdIsValid(operation->truncate_start_multixact)
+				|| !MultiXactIdIsValid(operation->truncate_end_multixact)
+				|| input->owned_payload_length != 0)
 				return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-		}
-		else
+		} else
 			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 		return CLUSTER_SIDE_PROJECTION_APPLY_OK;
 	}
-	if (operation->kind != CLUSTER_SIDE_PROJECTION_CLOG &&
-		operation->kind != CLUSTER_SIDE_PROJECTION_COMMIT_TS)
+	if (operation->kind != CLUSTER_SIDE_PROJECTION_CLOG
+		&& operation->kind != CLUSTER_SIDE_PROJECTION_COMMIT_TS)
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-	if (operation->kind == CLUSTER_SIDE_PROJECTION_COMMIT_TS &&
-		!input->source_retained)
+	if (operation->kind == CLUSTER_SIDE_PROJECTION_COMMIT_TS && !input->source_retained)
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
 		return cluster_side_projection_zero_range(input, &first_xid, &xid_count)
-			? CLUSTER_SIDE_PROJECTION_APPLY_OK
-			: CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE &&
-		operation->page_number >= 0 &&
-		TransactionIdIsNormal(operation->oldest_xid))
+				   ? CLUSTER_SIDE_PROJECTION_APPLY_OK
+				   : CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
+	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_TRUNCATE && operation->page_number >= 0
+		&& TransactionIdIsNormal(operation->oldest_xid))
 		return CLUSTER_SIDE_PROJECTION_APPLY_OK;
 	return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 }
 
 ClusterSideProjectionApplyResultV1
-cluster_side_projection_apply_owned_v1(
-	const ClusterSideProjectionApplyInputV1 *input,
-	const ClusterSideProjectionApplyOpsV1 *ops)
+cluster_side_projection_apply_owned_v1(const ClusterSideProjectionApplyInputV1 *input,
+									   const ClusterSideProjectionApplyOpsV1 *ops)
 {
 	const ClusterSideProjectionOperationV1 *operation;
 	TransactionId first_xid;
 	uint32 xid_count;
 	int origin_slot;
 
-	if (cluster_side_projection_target_preflight_v1(input) !=
-		CLUSTER_SIDE_PROJECTION_APPLY_OK || ops == NULL)
+	if (cluster_side_projection_target_preflight_v1(input) != CLUSTER_SIDE_PROJECTION_APPLY_OK
+		|| ops == NULL)
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	operation = input->operation;
 	origin_slot = input->origin_thread - 1;
-	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT)
-	{
-		if (ops->apply_multixact_projection == NULL ||
-			ops->verify_multixact_projection == NULL ||
-			!ops->apply_multixact_projection(ops->arg, origin_slot,
-				input->cluster_epoch, operation, input->owned_payload,
-				input->owned_payload_length, input->source_lsn,
-				input->source_end_lsn))
+	if (operation->kind == CLUSTER_SIDE_PROJECTION_MULTIXACT) {
+		if (ops->apply_multixact_projection == NULL || ops->verify_multixact_projection == NULL
+			|| !ops->apply_multixact_projection(
+				ops->arg, origin_slot, input->cluster_epoch, operation, input->owned_payload,
+				input->owned_payload_length, input->source_lsn, input->source_end_lsn))
 			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-		if (!ops->verify_multixact_projection(ops->arg, origin_slot,
-				input->cluster_epoch, operation, input->owned_payload,
-				input->owned_payload_length, input->source_lsn,
-				input->source_end_lsn))
+		if (!ops->verify_multixact_projection(
+				ops->arg, origin_slot, input->cluster_epoch, operation, input->owned_payload,
+				input->owned_payload_length, input->source_lsn, input->source_end_lsn))
 			return CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED;
 		return CLUSTER_SIDE_PROJECTION_APPLY_OK;
 	}
-	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE)
-	{
-		if (ops->reset_remote_xact_range == NULL ||
-			ops->remote_xact_range_empty == NULL ||
-			!cluster_side_projection_zero_range(input, &first_xid, &xid_count) ||
-			!ops->reset_remote_xact_range(ops->arg, origin_slot,
-				first_xid, xid_count))
+	if (operation->action == CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE) {
+		if (ops->reset_remote_xact_range == NULL || ops->remote_xact_range_empty == NULL
+			|| !cluster_side_projection_zero_range(input, &first_xid, &xid_count)
+			|| !ops->reset_remote_xact_range(ops->arg, origin_slot, first_xid, xid_count))
 			return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
-		if (!ops->remote_xact_range_empty(ops->arg, origin_slot,
-				first_xid, xid_count))
+		if (!ops->remote_xact_range_empty(ops->arg, origin_slot, first_xid, xid_count))
 			return CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED;
 		return CLUSTER_SIDE_PROJECTION_APPLY_OK;
 	}
-	if (ops->truncate_remote_xact_before == NULL ||
-		!ops->truncate_remote_xact_before(ops->arg, origin_slot,
-			operation->oldest_xid))
+	if (ops->truncate_remote_xact_before == NULL
+		|| !ops->truncate_remote_xact_before(ops->arg, origin_slot, operation->oldest_xid))
 		return CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED;
 	return CLUSTER_SIDE_PROJECTION_APPLY_OK;
 }
 
 static bool
-side_projection_reset_remote_xact_range(void *arg, int origin_slot,
-	TransactionId first_xid, uint32 xid_count)
+side_projection_reset_remote_xact_range(void *arg, int origin_slot, TransactionId first_xid,
+										uint32 xid_count)
 {
-	(void) arg;
-	return cluster_remote_xact_reset_range_v2(origin_slot, first_xid,
-		xid_count);
+	(void)arg;
+	return cluster_remote_xact_reset_range_v2(origin_slot, first_xid, xid_count);
 }
 
 static bool
-side_projection_remote_xact_range_empty(void *arg, int origin_slot,
-	TransactionId first_xid, uint32 xid_count)
+side_projection_remote_xact_range_empty(void *arg, int origin_slot, TransactionId first_xid,
+										uint32 xid_count)
 {
-	(void) arg;
-	return cluster_remote_xact_range_empty_v2(origin_slot, first_xid,
-		xid_count);
+	(void)arg;
+	return cluster_remote_xact_range_empty_v2(origin_slot, first_xid, xid_count);
 }
 
 static bool
-side_projection_truncate_remote_xact_before(void *arg, int origin_slot,
-	TransactionId oldest_xid)
+side_projection_truncate_remote_xact_before(void *arg, int origin_slot, TransactionId oldest_xid)
 {
-	(void) arg;
+	(void)arg;
 	return cluster_remote_xact_truncate_before_v2(origin_slot, oldest_xid);
 }
 
 bool
-rf_side_online_projection_owner_init_v1(
-	RfSideOnlineProjectionOwnerV1 *owner, uint32 cluster_epoch,
-	bool failed_origin_redo_retained)
+rf_side_online_projection_owner_init_v1(RfSideOnlineProjectionOwnerV1 *owner, uint32 cluster_epoch,
+										bool failed_origin_redo_retained)
 {
 	if (owner == NULL || cluster_epoch == 0)
 		return false;
 	memset(owner, 0, sizeof(*owner));
 	owner->cluster_epoch = cluster_epoch;
 	owner->failed_origin_redo_retained = failed_origin_redo_retained;
-	owner->projection_ops.reset_remote_xact_range =
-		side_projection_reset_remote_xact_range;
-	owner->projection_ops.remote_xact_range_empty =
-		side_projection_remote_xact_range_empty;
-	owner->projection_ops.truncate_remote_xact_before =
-		side_projection_truncate_remote_xact_before;
-	owner->projection_ops.apply_multixact_projection =
-		cluster_multixact_recovery_projection_apply;
-	owner->projection_ops.verify_multixact_projection =
-		cluster_multixact_recovery_projection_verify;
+	owner->projection_ops.reset_remote_xact_range = side_projection_reset_remote_xact_range;
+	owner->projection_ops.remote_xact_range_empty = side_projection_remote_xact_range_empty;
+	owner->projection_ops.truncate_remote_xact_before = side_projection_truncate_remote_xact_before;
+	owner->projection_ops.apply_multixact_projection = cluster_multixact_recovery_projection_apply;
+	owner->projection_ops.verify_multixact_projection
+		= cluster_multixact_recovery_projection_verify;
 	return true;
 }
 
 static bool
 side_projection_owned_input(RfSideOnlineProjectionOwnerV1 *owner,
-	const RfSideOnlineOperationV1 *operation,
-	ClusterSideProjectionApplyInputV1 *input)
+							const RfSideOnlineOperationV1 *operation,
+							ClusterSideProjectionApplyInputV1 *input)
 {
-	if (owner == NULL || operation == NULL || input == NULL ||
-		owner->cluster_epoch == 0 ||
-		operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
+	if (owner == NULL || operation == NULL || input == NULL || owner->cluster_epoch == 0
+		|| operation->kind != RF_SIDE_ONLINE_OPERATION_PROJECTION)
 		return false;
 	memset(input, 0, sizeof(*input));
 	input->operation = &operation->projection;
@@ -258,29 +222,25 @@ side_projection_owned_input(RfSideOnlineProjectionOwnerV1 *owner,
 }
 
 bool
-rf_side_online_projection_preflight_owned_v1(void *arg,
-	const RfSideOnlineOperationV1 *operation)
+rf_side_online_projection_preflight_owned_v1(void *arg, const RfSideOnlineOperationV1 *operation)
 {
-	RfSideOnlineProjectionOwnerV1 *owner =
-		(RfSideOnlineProjectionOwnerV1 *) arg;
+	RfSideOnlineProjectionOwnerV1 *owner = (RfSideOnlineProjectionOwnerV1 *)arg;
 	ClusterSideProjectionApplyInputV1 input;
 
-	return side_projection_owned_input(owner, operation, &input) &&
-		cluster_side_projection_target_preflight_v1(&input) ==
-			CLUSTER_SIDE_PROJECTION_APPLY_OK;
+	return side_projection_owned_input(owner, operation, &input)
+		   && cluster_side_projection_target_preflight_v1(&input)
+				  == CLUSTER_SIDE_PROJECTION_APPLY_OK;
 }
 
 bool
-rf_side_online_projection_apply_owned_v1(void *arg,
-	const RfSideOnlineOperationV1 *operation)
+rf_side_online_projection_apply_owned_v1(void *arg, const RfSideOnlineOperationV1 *operation)
 {
-	RfSideOnlineProjectionOwnerV1 *owner =
-		(RfSideOnlineProjectionOwnerV1 *) arg;
+	RfSideOnlineProjectionOwnerV1 *owner = (RfSideOnlineProjectionOwnerV1 *)arg;
 	ClusterSideProjectionApplyInputV1 input;
 
-	return side_projection_owned_input(owner, operation, &input) &&
-		cluster_side_projection_apply_owned_v1(&input,
-			&owner->projection_ops) == CLUSTER_SIDE_PROJECTION_APPLY_OK;
+	return side_projection_owned_input(owner, operation, &input)
+		   && cluster_side_projection_apply_owned_v1(&input, &owner->projection_ops)
+				  == CLUSTER_SIDE_PROJECTION_APPLY_OK;
 }
 
 bool
@@ -302,16 +262,14 @@ cluster_side_projection_verified(ClusterSideProjectionKind kind,
 		return false;
 	/* The kind itself only selects the contract; the facts are the same
 	 * three.  A kind value out of range fails closed. */
-	if (kind != CLUSTER_SIDE_PROJECTION_CLOG
-		&& kind != CLUSTER_SIDE_PROJECTION_MULTIXACT
+	if (kind != CLUSTER_SIDE_PROJECTION_CLOG && kind != CLUSTER_SIDE_PROJECTION_MULTIXACT
 		&& kind != CLUSTER_SIDE_PROJECTION_COMMIT_TS)
 		return false;
 	return true;
 }
 
 bool
-cluster_side_projection_rebuildable(ClusterSideProjectionKind kind,
-									bool source_retained,
+cluster_side_projection_rebuildable(ClusterSideProjectionKind kind, bool source_retained,
 									bool canonical_producer_ok)
 {
 	/*
@@ -327,13 +285,12 @@ cluster_side_projection_rebuildable(ClusterSideProjectionKind kind,
 	 */
 	if (!canonical_producer_ok)
 		return false;
-	switch (kind)
-	{
-		case CLUSTER_SIDE_PROJECTION_CLOG:
-			return true;		/* canonical truth rebuild */
-		case CLUSTER_SIDE_PROJECTION_MULTIXACT:
-		case CLUSTER_SIDE_PROJECTION_COMMIT_TS:
-			return source_retained;
+	switch (kind) {
+	case CLUSTER_SIDE_PROJECTION_CLOG:
+		return true; /* canonical truth rebuild */
+	case CLUSTER_SIDE_PROJECTION_MULTIXACT:
+	case CLUSTER_SIDE_PROJECTION_COMMIT_TS:
+		return source_retained;
 	}
 	return false;
 }
@@ -345,5 +302,5 @@ cluster_side_projection_lookup(bool verified)
 	 * completes — the judgement adds no synchronous network or durable
 	 * I/O (pure function). */
 	return verified ? CLUSTER_SIDE_PROJECTION_LOOKUP_OK
-		: CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED;
+					: CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED;
 }

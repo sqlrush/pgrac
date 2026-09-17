@@ -69,8 +69,7 @@ node_id_in_range(int32 node_id)
 static inline uint32
 jcmk_get_le32(const uint8 *p)
 {
-	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16)
-		   | ((uint32)p[3] << 24);
+	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
 }
 
 static inline uint64
@@ -130,8 +129,8 @@ cluster_replacement_marker_v3_encode(const ClusterReplacementCommitMarkerV3 *m,
 	if (m == NULL || out == NULL)
 		return false;
 	if (m->magic != CLUSTER_JCMK_MAGIC || m->version != CLUSTER_JCMK_REPLACEMENT_VERSION
-		|| !node_id_in_range(m->target_node_id) || m->generation == 0
-		|| m->reserved0[0] != 0 || m->reserved0[1] != 0 || m->reserved0[2] != 0
+		|| !node_id_in_range(m->target_node_id) || m->generation == 0 || m->reserved0[0] != 0
+		|| m->reserved0[1] != 0 || m->reserved0[2] != 0
 		|| !replacement_marker_v3_phase_valid(m->phase, m->ready_state_generation))
 		return false;
 
@@ -166,8 +165,7 @@ cluster_replacement_marker_v3_decode(const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_
 	if (jcmk_get_le32(bytes + 0) != CLUSTER_JCMK_MAGIC
 		|| jcmk_get_le32(bytes + 4) != CLUSTER_JCMK_REPLACEMENT_VERSION
 		|| (int32)jcmk_get_le32(bytes + 8) != expected_target_node || bytes[13] != 0
-		|| bytes[14] != 0 || bytes[15] != 0
-		|| jcmk_get_le64(bytes + 16) == 0
+		|| bytes[14] != 0 || bytes[15] != 0 || jcmk_get_le64(bytes + 16) == 0
 		|| !replacement_marker_v3_phase_valid(bytes[12], jcmk_get_le32(bytes + 88))
 		|| replacement_marker_v3_crc(bytes) != jcmk_get_le32(bytes + 92))
 		return false;
@@ -215,9 +213,10 @@ cluster_replacement_marker_v3_same_image(const ClusterReplacementCommitMarkerV3 
  * winning group is found.
  */
 int
-cluster_replacement_marker_v3_select_majority(
-	const uint8 images[][CLUSTER_JCMK_REPLACEMENT_BYTES], int n, uint32 majority,
-	int32 expected_target_node, ClusterReplacementCommitMarkerV3 *out_marker, uint32 *out_agree)
+cluster_replacement_marker_v3_select_majority(const uint8 images[][CLUSTER_JCMK_REPLACEMENT_BYTES],
+											  int n, uint32 majority, int32 expected_target_node,
+											  ClusterReplacementCommitMarkerV3 *out_marker,
+											  uint32 *out_agree)
 {
 	int a;
 	int b;
@@ -253,9 +252,8 @@ cluster_replacement_marker_v3_select_majority(
  * the old admitted floor; post-COMMIT phases pin the fresh incarnation.
  */
 bool
-cluster_replacement_marker_v3_floor_basis(
-	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
-	uint64 *out_incarnation_floor)
+cluster_replacement_marker_v3_floor_basis(const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES],
+										  int32 expected_target_node, uint64 *out_incarnation_floor)
 {
 	ClusterReplacementCommitMarkerV3 marker;
 	uint64 floor;
@@ -299,16 +297,16 @@ cluster_replacement_marker_v3_is_committed_closed_basis(
 }
 
 bool
-cluster_replacement_marker_v3_is_admitted_basis(
-	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
-	uint64 *out_incarnation_floor, uint32 *out_ready_state_generation)
+cluster_replacement_marker_v3_is_admitted_basis(const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES],
+												int32 expected_target_node,
+												uint64 *out_incarnation_floor,
+												uint32 *out_ready_state_generation)
 {
 	ClusterReplacementCommitMarkerV3 marker;
 
 	if (out_incarnation_floor == NULL || out_ready_state_generation == NULL
 		|| !cluster_replacement_marker_v3_decode(bytes, expected_target_node, &marker)
-		|| marker.phase != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED
-		|| marker.fresh_incarnation == 0)
+		|| marker.phase != CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED || marker.fresh_incarnation == 0)
 		return false;
 	*out_incarnation_floor = marker.fresh_incarnation;
 	*out_ready_state_generation = marker.ready_state_generation;

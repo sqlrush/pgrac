@@ -498,8 +498,8 @@ cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
 /* Generic, record-coherent required/optional capability sample. */
 bool
 cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabilities,
-										 uint32 optional_capabilities,
-										 bool *optional_supported_out, uint32 *generation_out)
+										 uint32 optional_capabilities, bool *optional_supported_out,
+										 uint32 *generation_out)
 {
 	bool supported;
 
@@ -511,9 +511,9 @@ cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabili
 		return false;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
-	supported = cluster_sf_peer_cap_family_sample(
-		&ClusterSfDep->peer_capabilities[peer_id], required_capabilities, optional_capabilities,
-		optional_supported_out, generation_out);
+	supported = cluster_sf_peer_cap_family_sample(&ClusterSfDep->peer_capabilities[peer_id],
+												  required_capabilities, optional_capabilities,
+												  optional_supported_out, generation_out);
 	LWLockRelease(&ClusterSfDep->lock);
 	return supported;
 }
@@ -552,8 +552,7 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabiliti
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
 	cap = &ClusterSfDep->peer_capabilities[peer_id];
-	if (cap->valid
-		&& (cap->bits & required_capabilities) == required_capabilities) {
+	if (cap->valid && (cap->bits & required_capabilities) == required_capabilities) {
 		capability_word = cap->bits;
 		generation = cap->generation;
 		supported = true;
@@ -572,8 +571,7 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabiliti
 /* Spec-3.6b: sample Current-MX authority and its connection generation from
  * the same CONTROL-owned HELLO record. */
 bool
-cluster_sf_peer_multixact_current_capability_generation(
-	int32 peer_id, uint32 *generation_out)
+cluster_sf_peer_multixact_current_capability_generation(int32 peer_id, uint32 *generation_out)
 {
 	bool supported;
 
@@ -583,9 +581,9 @@ cluster_sf_peer_multixact_current_capability_generation(
 		return false;
 
 	LWLockAcquire(&ClusterSfDep->lock, LW_SHARED);
-	supported = cluster_sf_peer_cap_generation_for_bits(
-		&ClusterSfDep->peer_capabilities[peer_id],
-		PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1, generation_out);
+	supported = cluster_sf_peer_cap_generation_for_bits(&ClusterSfDep->peer_capabilities[peer_id],
+														PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+														generation_out);
 	LWLockRelease(&ClusterSfDep->lock);
 	return supported;
 }

@@ -35,11 +35,11 @@
 #define CLUSTER_IR_H
 
 #include "cluster/cluster_control_root.h" /* ClusterRecoveryDutyKey */
-#include "cluster/cluster_grd.h" /* ClusterResId */
-#include "cluster/cluster_hw.h"	 /* CLUSTER_HW_RESID_TYPE (collision check) */
-#include "cluster/cluster_dl.h"	 /* CLUSTER_DL_RESID_TYPE (collision check) */
-#include "cluster/cluster_xlog.h" /* CLUSTER_WAL_THREAD_MAX */
-#include "storage/lock.h"		 /* LOCKTAG_LAST_TYPE */
+#include "cluster/cluster_grd.h"		  /* ClusterResId */
+#include "cluster/cluster_hw.h"			  /* CLUSTER_HW_RESID_TYPE (collision check) */
+#include "cluster/cluster_dl.h"			  /* CLUSTER_DL_RESID_TYPE (collision check) */
+#include "cluster/cluster_xlog.h"		  /* CLUSTER_WAL_THREAD_MAX */
+#include "storage/lock.h"				  /* LOCKTAG_LAST_TYPE */
 
 /*
  * CLUSTER_IR_RESID_TYPE -- IR resource-id namespace marker.  Above every PG
@@ -60,8 +60,8 @@ StaticAssertDecl(CLUSTER_IR_RESID_TYPE != CLUSTER_DL_RESID_TYPE,
 
 /* RF-ROOT P3 / STOP03 §17.2: compact IR(X) key derived only from a valid
  * full recovery-duty identity.  Invalid input preserves *out. */
-extern bool cluster_recovery_serial_resid_encode(
-	const ClusterRecoveryDutyKey *duty, ClusterResId *out);
+extern bool cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty,
+												 ClusterResId *out);
 
 #ifndef FRONTEND
 
@@ -69,8 +69,7 @@ extern bool cluster_recovery_serial_resid_encode(
 
 typedef struct ClusterFormationWitnessV1 ClusterFormationWitnessV1;
 typedef struct PgracExternalFenceNeedSetV1 PgracExternalFenceNeedSetV1;
-typedef struct PgracExternalFenceAdmissionSetV1
-	PgracExternalFenceAdmissionSetV1;
+typedef struct PgracExternalFenceAdmissionSetV1 PgracExternalFenceAdmissionSetV1;
 
 typedef enum ClusterRecoverySerialMode {
 	CLUSTER_RECOVERY_SERIAL_ONLINE = 1,
@@ -138,19 +137,19 @@ typedef struct ClusterRecoverySerialGuardSet {
 	ClusterRecoverySerialGuard guards[CLUSTER_RECOVERY_SERIAL_SET_MAX];
 } ClusterRecoverySerialGuardSet;
 
-extern ClusterRecoverySerialAcquireResult cluster_recovery_serial_acquire(
-	const ClusterRecoverySerialRequest *request,
-	ClusterRecoverySerialGuard *guard);
-extern ClusterRecoverySerialRevalidateResult cluster_recovery_serial_revalidate(
-	ClusterRecoverySerialGuard *guard);
-extern ClusterRecoverySerialReleaseResult cluster_recovery_serial_release(
-	ClusterRecoverySerialGuard *guard);
-extern ClusterRecoverySerialAcquireResult cluster_recovery_serial_acquire_set(
-	const ClusterRecoverySerialRequest *requests, uint16 count,
-	int overall_acquire_timeout_ms, ClusterRecoverySerialGuardSet *set,
-	uint16 *failed_index);
-extern ClusterRecoverySerialReleaseResult cluster_recovery_serial_release_set(
-	ClusterRecoverySerialGuardSet *set);
+extern ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
+								ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialReleaseResult
+cluster_recovery_serial_release(ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialAcquireResult
+cluster_recovery_serial_acquire_set(const ClusterRecoverySerialRequest *requests, uint16 count,
+									int overall_acquire_timeout_ms,
+									ClusterRecoverySerialGuardSet *set, uint16 *failed_index);
+extern ClusterRecoverySerialReleaseResult
+cluster_recovery_serial_release_set(ClusterRecoverySerialGuardSet *set);
 
 /* Minimal shmem region for the ten STOP03 §10.3 volatile counters. */
 extern Size cluster_ir_shmem_size(void);

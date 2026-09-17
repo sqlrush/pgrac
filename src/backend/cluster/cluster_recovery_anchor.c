@@ -359,21 +359,19 @@ checkpoint_phase4_publisher_is_current(uint64 self_incarnation)
 	own_thread = cluster_wal_thread_id();
 	if (own_thread < XLP_THREAD_ID_FIRST_REAL || own_thread > CLUSTER_WAL_THREAD_MAX
 		|| !cluster_wal_thread_dir_configured() || !cluster_wal_thread_dir_validated()
-		|| cluster_wal_thread_dump_thread_id() != own_thread
-		|| !cluster_wal_state_registry_ready())
+		|| cluster_wal_thread_dump_thread_id() != own_thread || !cluster_wal_state_registry_ready())
 		return false;
 
 	phase4_started_at = cluster_phase_started_at(CLUSTER_PHASE_4_NORMAL);
 	stats_spawned_at = cluster_stats_spawned_at();
-	if (phase4_started_at == 0 || stats_spawned_at == 0
-		|| stats_spawned_at < phase4_started_at)
+	if (phase4_started_at == 0 || stats_spawned_at == 0 || stats_spawned_at < phase4_started_at)
 		return false;
 
 	memset(&slot, 0, sizeof(slot));
 	verdict = cluster_wal_state_read_slot(own_thread, &slot);
 	return verdict == CLUSTER_WAL_SLOT_OK && slot.thread_id == own_thread
-		&& slot.node_id == cluster_node_id && slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE
-		&& slot.started_at == stats_spawned_at && slot.started_at >= phase4_started_at;
+		   && slot.node_id == cluster_node_id && slot.state == CLUSTER_WAL_SLOT_STATE_ACTIVE
+		   && slot.started_at == stats_spawned_at && slot.started_at >= phase4_started_at;
 }
 
 static bool
@@ -381,8 +379,7 @@ checkpoint_publisher_is_current(uint64 expected_sysid)
 {
 	uint64 self_incarnation;
 
-	if (expected_sysid == 0 || cluster_node_id < 0
-		|| cluster_node_id >= CLUSTER_MAX_NODES)
+	if (expected_sysid == 0 || cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
 		return false;
 	/* The delegated EOR checkpointer runs before steady membership admission;
 	 * its existing boot-local OWNER handoff is the sole recovery-actor arm. */
@@ -398,17 +395,14 @@ checkpoint_publisher_is_current(uint64 expected_sysid)
 	 * CF(X).  This restores the frozen clean-seed path without allowing a
 	 * formed or stale member to use native bootstrap as a publication bypass.
 	 */
-	if (!cluster_enabled && cluster_controlfile_shared_authority
-		&& self_incarnation == 0
+	if (!cluster_enabled && cluster_controlfile_shared_authority && self_incarnation == 0
 		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_ABSENT
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == 0
-		&& cluster_cf_exactly_one_declared_node()
-		&& cluster_cf_held(ExclusiveLock))
+		&& cluster_cf_exactly_one_declared_node() && cluster_cf_held(ExclusiveLock))
 		return true;
 	if (self_incarnation != 0
 		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER
-		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			== self_incarnation)
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == self_incarnation)
 		return true;
 	return checkpoint_phase4_publisher_is_current(self_incarnation);
 }
@@ -468,8 +462,7 @@ cluster_recovery_anchor_publish_checkpoint(XLogRecPtr checkpoint_lsn,
 	 * this checkpoint before its caller can recycle WAL. */
 	cluster_write_fence_reject_if_fenced("recovery anchor checkpoint post-publication");
 	if (!checkpoint_publisher_is_current(sysid))
-		ereport(PANIC,
-				(errmsg("cluster recovery checkpoint publisher changed before WAL reuse")));
+		ereport(PANIC, (errmsg("cluster recovery checkpoint publisher changed before WAL reuse")));
 }
 
 /*

@@ -66,13 +66,12 @@ typedef enum ClusterCurrentMxStatId {
 	CMX_STAT_COUNT
 } ClusterCurrentMxStatId;
 
-typedef struct ClusterCurrentMxStatsSnapshot
-{
-	uint32		node_id;
-	uint32		reserved32;
-	uint64		cluster_epoch;
+typedef struct ClusterCurrentMxStatsSnapshot {
+	uint32 node_id;
+	uint32 reserved32;
+	uint64 cluster_epoch;
 	TimestampTz stats_since;
-	uint64		counters[CMX_STAT_COUNT];
+	uint64 counters[CMX_STAT_COUNT];
 } ClusterCurrentMxStatsSnapshot;
 
 extern Size cluster_multixact_current_stats_shmem_size(void);
@@ -84,9 +83,8 @@ extern TimestampTz cluster_multixact_current_stats_since(void);
 extern ClusterCurrentMxStatId cluster_multixact_current_restart_bucket(uint32 restarts);
 extern void cluster_multixact_current_stats_record_restarts(uint32 restarts);
 extern void cluster_multixact_current_stats_alert_sample(void);
-extern bool cluster_multixact_current_stats_snapshot(
-	uint32 node_id, uint64 cluster_epoch,
-	ClusterCurrentMxStatsSnapshot *snapshot);
+extern bool cluster_multixact_current_stats_snapshot(uint32 node_id, uint64 cluster_epoch,
+													 ClusterCurrentMxStatsSnapshot *snapshot);
 
 #endif /* USE_PGRAC_CLUSTER */
 

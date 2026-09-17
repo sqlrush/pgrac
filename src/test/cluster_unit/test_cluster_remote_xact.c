@@ -117,9 +117,8 @@ UT_TEST(test_remote_xact_terminal_codec_carries_commit_ts_and_wrap)
 	ClusterRemoteXactEntryV2 entry;
 	ClusterRemoteXactEntryDecodedV2 decoded;
 
-	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&entry,
-		CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(9123), INT64_C(77112233),
-		true, 17));
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(
+		&entry, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(9123), INT64_C(77112233), true, 17));
 	UT_ASSERT(cluster_remote_xact_entry_decode_terminal_v2(&entry, &decoded));
 	UT_ASSERT_EQ(decoded.outcome, CLUSTER_REMOTE_XACT_COMMITTED);
 	UT_ASSERT_EQ(decoded.commit_scn, UINT64_C(9123));
@@ -129,8 +128,8 @@ UT_TEST(test_remote_xact_terminal_codec_carries_commit_ts_and_wrap)
 
 	entry.payload[18] = 1;
 	UT_ASSERT(!cluster_remote_xact_entry_decode_terminal_v2(&entry, &decoded));
-	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&entry,
-		CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0));
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&entry, CLUSTER_REMOTE_XACT_ABORTED,
+														   InvalidScn, 0, false, 0));
 	UT_ASSERT(cluster_remote_xact_entry_decode_terminal_v2(&entry, &decoded));
 	UT_ASSERT_EQ(decoded.outcome, CLUSTER_REMOTE_XACT_ABORTED);
 	UT_ASSERT_EQ(decoded.commit_timestamp, 0);
@@ -146,17 +145,17 @@ UT_TEST(test_remote_xact_prepare_transition_is_idempotent_and_conflict_closed)
 	memset(&current, 0, sizeof(current));
 	memset(first, 0x31, sizeof(first));
 	memset(second, 0x32, sizeof(second));
-	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
-		&current, first, &next), CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(&current, first, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_WRITE);
 	current = next;
-	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
-		&current, first, &next), CLUSTER_REMOTE_XACT_ENTRY_NOOP);
-	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
-		&current, second, &next), CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
-	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&current,
-		CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0, false, 0));
-	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(
-		&current, first, &next), CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(&current, first, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_NOOP);
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(&current, second, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&current, CLUSTER_REMOTE_XACT_ABORTED,
+														   InvalidScn, 0, false, 0));
+	UT_ASSERT_EQ(cluster_remote_xact_entry_prepare_transition_v2(&current, first, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
 }
 
 UT_TEST(test_remote_xact_prepared_terminal_requires_pending_or_exact_result)
@@ -170,24 +169,27 @@ UT_TEST(test_remote_xact_prepared_terminal_requires_pending_or_exact_result)
 	memset(digest, 0x77, sizeof(digest));
 	memset(wrong_digest, 0x78, sizeof(wrong_digest));
 	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
-		&current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
-		INT64_C(1234), true, 7, &next),
-		CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+					 &current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
+					 INT64_C(1234), true, 7, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
 	UT_ASSERT(cluster_remote_xact_entry_encode_pending_v2(&current, digest));
 	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
-		&current, true, wrong_digest, CLUSTER_REMOTE_XACT_COMMITTED,
-		UINT64_C(91), INT64_C(1234), true, 7, &next),
-		CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+					 &current, true, wrong_digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
+					 INT64_C(1234), true, 7, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
 	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
-		&current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
-		INT64_C(1234), true, 7, &next), CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+					 &current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
+					 INT64_C(1234), true, 7, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_WRITE);
 	current = next;
 	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
-		&current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
-		INT64_C(1234), true, 7, &next), CLUSTER_REMOTE_XACT_ENTRY_NOOP);
-	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(
-		&current, true, digest, CLUSTER_REMOTE_XACT_ABORTED, InvalidScn, 0,
-		false, 0, &next), CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
+					 &current, true, digest, CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(91),
+					 INT64_C(1234), true, 7, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_NOOP);
+	UT_ASSERT_EQ(cluster_remote_xact_entry_terminal_transition_v2(&current, true, digest,
+																  CLUSTER_REMOTE_XACT_ABORTED,
+																  InvalidScn, 0, false, 0, &next),
+				 CLUSTER_REMOTE_XACT_ENTRY_CONFLICT);
 }
 
 UT_TEST(test_remote_xact_projection_reset_is_idempotent_invalidation)
@@ -197,31 +199,29 @@ UT_TEST(test_remote_xact_projection_reset_is_idempotent_invalidation)
 
 	memset(&current, 0, sizeof(current));
 	UT_ASSERT_EQ(cluster_remote_xact_entry_reset_transition_v2(&current, &next),
-		CLUSTER_REMOTE_XACT_ENTRY_NOOP);
+				 CLUSTER_REMOTE_XACT_ENTRY_NOOP);
 	UT_ASSERT(cluster_remote_xact_entry_is_empty_v2(&next));
-	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&current,
-		CLUSTER_REMOTE_XACT_COMMITTED, UINT64_C(991), INT64_C(881), true, 7));
+	UT_ASSERT(cluster_remote_xact_entry_encode_terminal_v2(&current, CLUSTER_REMOTE_XACT_COMMITTED,
+														   UINT64_C(991), INT64_C(881), true, 7));
 	UT_ASSERT_EQ(cluster_remote_xact_entry_reset_transition_v2(&current, &next),
-		CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+				 CLUSTER_REMOTE_XACT_ENTRY_WRITE);
 	UT_ASSERT(cluster_remote_xact_entry_is_empty_v2(&next));
 	/* Projection corruption is invalidated, never promoted to authority. */
 	memset(&current, 0xee, sizeof(current));
 	UT_ASSERT_EQ(cluster_remote_xact_entry_reset_transition_v2(&current, &next),
-		CLUSTER_REMOTE_XACT_ENTRY_WRITE);
+				 CLUSTER_REMOTE_XACT_ENTRY_WRITE);
 	UT_ASSERT(cluster_remote_xact_entry_is_empty_v2(&next));
 }
 
 UT_TEST(test_remote_xact_projection_reset_range_is_bounded)
 {
 	UT_ASSERT(cluster_remote_xact_reset_range_valid_v2(0, 0, 1));
-	UT_ASSERT(cluster_remote_xact_reset_range_valid_v2(127,
-		UINT32_MAX - 32767, 32768));
+	UT_ASSERT(cluster_remote_xact_reset_range_valid_v2(127, UINT32_MAX - 32767, 32768));
 	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(-1, 0, 1));
 	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(128, 0, 1));
 	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(0, 0, 0));
 	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(0, 0, 32769));
-	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(0,
-		UINT32_MAX - 2, 4));
+	UT_ASSERT(!cluster_remote_xact_reset_range_valid_v2(0, UINT32_MAX - 2, 4));
 }
 
 UT_TEST(test_remote_xact_origin_no_cross_partition_overlap)

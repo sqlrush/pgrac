@@ -39,22 +39,22 @@
 #include "utils/elog.h"
 #include "utils/timestamp.h"
 
-#include "cluster/cluster_guc.h"		  /* cluster_node_id */
+#include "cluster/cluster_guc.h" /* cluster_node_id */
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_qvotec.h"
-#include "cluster/cluster_scn.h"		  /* SCN, SCN_VALID, InvalidScn */
+#include "cluster/cluster_scn.h" /* SCN, SCN_VALID, InvalidScn */
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_undo_cleaner.h" /* spec-3.13 D2-B scan-only pass */
 #include "cluster/cluster_tt_durable.h"
-#include "cluster/cluster_tt_slot.h"	  /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
+#include "cluster/cluster_tt_slot.h" /* TTSlot, TT_SLOT_COMMITTED, TT_SLOTS_PER_SEGMENT */
 #include "cluster/cluster_tt_status.h"
-#include "cluster/cluster_undo_segment.h" /* UndoSegmentHeaderData */
-#include "cluster/cluster_undo_smgr.h"	  /* header-bytes + block I/O */
+#include "cluster/cluster_undo_segment.h"		/* UndoSegmentHeaderData */
+#include "cluster/cluster_undo_smgr.h"			/* header-bytes + block I/O */
 #include "cluster/storage/cluster_undo_alloc.h" /* CLUSTER_UNDO_SEGS_PER_INSTANCE */
 #include "cluster/storage/cluster_undo_block0_current.h"
-#include "cluster/storage/cluster_undo_xlog.h"	/* cluster_undo_emit_tt_slot_commit */
+#include "cluster/storage/cluster_undo_xlog.h" /* cluster_undo_emit_tt_slot_commit */
 
 
 /* Absolute byte offset of TTSlot[slot_offset] within segment header block 0. */
@@ -110,17 +110,14 @@ cluster_tt_durable_redo_decide(uint8 slot_status, TransactionId slot_xid, uint16
 }
 
 ClusterTTActiveTransitionDecision
-cluster_tt_active_transition_decide(const TTSlot *predecessor,
-									uint32 disk_generation,
-									uint32 expected_generation,
-									TransactionId xid, uint16 wrap,
+cluster_tt_active_transition_decide(const TTSlot *predecessor, uint32 disk_generation,
+									uint32 expected_generation, TransactionId xid, uint16 wrap,
 									bool identity_authorized)
 {
 	TTSlot zero_slot;
 	bool terminal_shape;
 
-	if (predecessor == NULL || !TransactionIdIsNormal(xid)
-		|| wrap == TT_WRAP_INVALID)
+	if (predecessor == NULL || !TransactionIdIsNormal(xid) || wrap == TT_WRAP_INVALID)
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 	if (disk_generation > expected_generation)
 		return CLUSTER_TT_ACTIVE_STALE;
@@ -131,12 +128,11 @@ cluster_tt_active_transition_decide(const TTSlot *predecessor,
 
 	memset(&zero_slot, 0, sizeof(zero_slot));
 	if (predecessor->status == TT_SLOT_UNUSED)
-		return memcmp(predecessor, &zero_slot, sizeof(zero_slot)) == 0
-			? CLUSTER_TT_ACTIVE_APPLY : CLUSTER_TT_ACTIVE_CORRUPT;
+		return memcmp(predecessor, &zero_slot, sizeof(zero_slot)) == 0 ? CLUSTER_TT_ACTIVE_APPLY
+																	   : CLUSTER_TT_ACTIVE_CORRUPT;
 
 	if (predecessor->status == TT_SLOT_ACTIVE) {
-		if (predecessor->flags != TT_FLAGS_RESERVED
-			|| SCN_VALID(predecessor->commit_scn)
+		if (predecessor->flags != TT_FLAGS_RESERVED || SCN_VALID(predecessor->commit_scn)
 			|| !UBA_is_invalid(predecessor->first_undo_block))
 			return CLUSTER_TT_ACTIVE_CORRUPT;
 		if (predecessor->wrap > wrap)
@@ -148,36 +144,31 @@ cluster_tt_active_transition_decide(const TTSlot *predecessor,
 
 	terminal_shape
 		= (predecessor->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
-		&& UBA_is_invalid(predecessor->first_undo_block)
-		&& ((predecessor->status == TT_SLOT_COMMITTED
-				 && SCN_VALID(predecessor->commit_scn))
-			|| ((predecessor->status == TT_SLOT_ABORTED
-				  || predecessor->status == TT_SLOT_RECYCLABLE)
-				 && !SCN_VALID(predecessor->commit_scn)));
+		  && UBA_is_invalid(predecessor->first_undo_block)
+		  && ((predecessor->status == TT_SLOT_COMMITTED && SCN_VALID(predecessor->commit_scn))
+			  || ((predecessor->status == TT_SLOT_ABORTED
+				   || predecessor->status == TT_SLOT_RECYCLABLE)
+				  && !SCN_VALID(predecessor->commit_scn)));
 	if (!terminal_shape)
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 	if (predecessor->wrap > wrap)
 		return CLUSTER_TT_ACTIVE_STALE;
-	if (predecessor->wrap >= TT_WRAP_MAX
-		|| wrap != (uint16)(predecessor->wrap + 1))
+	if (predecessor->wrap >= TT_WRAP_MAX || wrap != (uint16)(predecessor->wrap + 1))
 		return CLUSTER_TT_ACTIVE_CONFLICT;
 	return CLUSTER_TT_ACTIVE_APPLY;
 }
 
 ClusterTTTerminalTransitionDecision
-cluster_tt_terminal_transition_decide(const TTSlot *predecessor,
-								 uint32 disk_generation,
-								 uint32 expected_generation,
-								 TransactionId xid, uint16 wrap,
-								 uint8 terminal_status, SCN commit_scn)
+cluster_tt_terminal_transition_decide(const TTSlot *predecessor, uint32 disk_generation,
+									  uint32 expected_generation, TransactionId xid, uint16 wrap,
+									  uint8 terminal_status, SCN commit_scn)
 {
 	bool terminal_shape;
 
 	if (predecessor == NULL || expected_generation == UINT32_MAX
-		|| disk_generation < expected_generation
-		|| !TransactionIdIsNormal(xid) || wrap == TT_WRAP_INVALID
-		|| (terminal_status != TT_SLOT_COMMITTED
-			&& terminal_status != TT_SLOT_ABORTED)
+		|| disk_generation < expected_generation || !TransactionIdIsNormal(xid)
+		|| wrap == TT_WRAP_INVALID
+		|| (terminal_status != TT_SLOT_COMMITTED && terminal_status != TT_SLOT_ABORTED)
 		|| (terminal_status == TT_SLOT_COMMITTED) != SCN_VALID(commit_scn))
 		return CLUSTER_TT_TERMINAL_CORRUPT;
 	if (disk_generation > expected_generation)
@@ -189,46 +180,38 @@ cluster_tt_terminal_transition_decide(const TTSlot *predecessor,
 		return CLUSTER_TT_TERMINAL_CONFLICT;
 
 	if (predecessor->status == TT_SLOT_ACTIVE) {
-		if (predecessor->flags != TT_FLAGS_RESERVED
-			|| SCN_VALID(predecessor->commit_scn)
+		if (predecessor->flags != TT_FLAGS_RESERVED || SCN_VALID(predecessor->commit_scn)
 			|| !UBA_is_invalid(predecessor->first_undo_block))
 			return CLUSTER_TT_TERMINAL_CORRUPT;
 		return CLUSTER_TT_TERMINAL_APPLY;
 	}
 
-	terminal_shape = (predecessor->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
-		&& UBA_is_invalid(predecessor->first_undo_block)
-		&& ((predecessor->status == TT_SLOT_COMMITTED
-				 && SCN_VALID(predecessor->commit_scn))
-			|| (predecessor->status == TT_SLOT_ABORTED
-				&& !SCN_VALID(predecessor->commit_scn)));
+	terminal_shape
+		= (predecessor->flags & ~TT_SLOT_FLAGS_KNOWN) == 0
+		  && UBA_is_invalid(predecessor->first_undo_block)
+		  && ((predecessor->status == TT_SLOT_COMMITTED && SCN_VALID(predecessor->commit_scn))
+			  || (predecessor->status == TT_SLOT_ABORTED && !SCN_VALID(predecessor->commit_scn)));
 	if (!terminal_shape)
-		return predecessor->status == TT_SLOT_UNUSED
-			? CLUSTER_TT_TERMINAL_CONFLICT
-			: CLUSTER_TT_TERMINAL_CORRUPT;
+		return predecessor->status == TT_SLOT_UNUSED ? CLUSTER_TT_TERMINAL_CONFLICT
+													 : CLUSTER_TT_TERMINAL_CORRUPT;
 	if (predecessor->status != terminal_status)
 		return CLUSTER_TT_TERMINAL_CONFLICT;
-	if (terminal_status == TT_SLOT_COMMITTED
-		&& predecessor->commit_scn != commit_scn)
+	if (terminal_status == TT_SLOT_COMMITTED && predecessor->commit_scn != commit_scn)
 		return CLUSTER_TT_TERMINAL_CONFLICT;
 	return (predecessor->flags & TT_SLOT_FLAG_CTRC_RELEASE_PROVEN) != 0
-		? CLUSTER_TT_TERMINAL_APPLY
-		: CLUSTER_TT_TERMINAL_IDEMPOTENT;
+			   ? CLUSTER_TT_TERMINAL_APPLY
+			   : CLUSTER_TT_TERMINAL_IDEMPOTENT;
 }
 
 static bool
 tt_active_owner_matches(const ClusterTTSlotCurrentOwner *expected,
 						const ClusterTTSlotCurrentOwner *observed)
 {
-	return expected != NULL && observed != NULL
-		&& expected->segment_id == observed->segment_id
-		&& expected->xid == observed->xid
-		&& expected->commit_scn == observed->commit_scn
-		&& expected->slot_offset == observed->slot_offset
-		&& expected->wrap == observed->wrap
-		&& expected->status == observed->status
-		&& memcmp(expected->reserved8, observed->reserved8,
-				  sizeof(expected->reserved8)) == 0;
+	return expected != NULL && observed != NULL && expected->segment_id == observed->segment_id
+		   && expected->xid == observed->xid && expected->commit_scn == observed->commit_scn
+		   && expected->slot_offset == observed->slot_offset && expected->wrap == observed->wrap
+		   && expected->status == observed->status
+		   && memcmp(expected->reserved8, observed->reserved8, sizeof(expected->reserved8)) == 0;
 }
 
 /*
@@ -265,8 +248,7 @@ tt_allocator_classify_owner(const ClusterTTSlotCurrentOwner *expected)
 		return TT_ALLOCATOR_OWNER_ROLLED_AWAY;
 
 	memset(&observed, 0, sizeof(observed));
-	if (cluster_tt_slot_current_owner_by_xid(
-			cluster_node_id, expected->xid, &observed)
+	if (cluster_tt_slot_current_owner_by_xid(cluster_node_id, expected->xid, &observed)
 		&& tt_active_owner_matches(expected, &observed))
 		return TT_ALLOCATOR_OWNER_MATCH;
 
@@ -283,17 +265,16 @@ tt_allocator_corroborates_or_rolled_away(const ClusterTTSlotCurrentOwner *expect
 }
 
 XLogRecPtr
-cluster_tt_slot_durable_publish_active(
-	const ClusterTTSlotCurrentOwner *expected_owner,
-	const ClusterSemanticAdmissionToken *admission,
-	uint32 *segment_generation_out, TTSlot *successor_out)
+cluster_tt_slot_durable_publish_active(const ClusterTTSlotCurrentOwner *expected_owner,
+									   const ClusterSemanticAdmissionToken *admission,
+									   uint32 *segment_generation_out, TTSlot *successor_out)
 {
 	TTAllocatorOwnerObservation allocator_observation;
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0ResolvedRoot root;
 	ClusterUndoBlock0ResolvedRoot final_root;
-	ClusterUndoBlock0Generation generation = {false, 0};
-	ClusterUndoBlock0CurrentGuard guard = {0};
+	ClusterUndoBlock0Generation generation = { false, 0 };
+	ClusterUndoBlock0CurrentGuard guard = { 0 };
 	ClusterUndoBlock0Pin pin;
 	ClusterCtrcTxnKeyV1 ctrc_key;
 	ClusterCtrcOriginReservation ctrc_reservation;
@@ -339,9 +320,8 @@ cluster_tt_slot_durable_publish_active(
 		|| expected_owner->status != CTS_ACTIVE || expected_owner->commit_scn != InvalidScn
 		|| expected_owner->reserved8[0] != 0 || expected_owner->reserved8[1] != 0
 		|| expected_owner->reserved8[2] != 0)
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("cannot publish canonical ACTIVE without an exact local TT owner")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						errmsg("cannot publish canonical ACTIVE without an exact local TT owner")));
 
 	*segment_generation_out = UINT32_MAX;
 	memset(successor_out, 0, sizeof(*successor_out));
@@ -370,31 +350,28 @@ cluster_tt_slot_durable_publish_active(
 	target_side = admission->side == CLUSTER_SEMANTIC_TARGET_SIDE;
 	ctrc_reserve_perpetual = cluster_ges_request_timeout_ms == -1;
 	if (!ctrc_reserve_perpetual)
-		ctrc_reserve_deadline = TimestampTzPlusMilliseconds(
-			GetCurrentTimestamp(), cluster_ges_request_timeout_ms);
+		ctrc_reserve_deadline
+			= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_ges_request_timeout_ms);
 
 	PG_TRY();
 	{
 	retry_active_snapshot:
 		MemSet(&root, 0, sizeof(root));
 		MemSet(&generation, 0, sizeof(generation));
-		root_available = target_side
-			? cluster_semantic_activation_resolve_shared_undo_root(
-				  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-				  expected_owner->segment_id, &root)
-			: cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-				  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-				  expected_owner->segment_id, &root);
+		root_available
+			= target_side ? cluster_semantic_activation_resolve_shared_undo_root(
+								admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+								expected_owner->segment_id, &root)
+						  : cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+								admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+								expected_owner->segment_id, &root);
 
 		step = target_side
-			? cluster_undo_block0_current_acquire_begin_live_owner_target(
-				  &key, cluster_ges_request_timeout_ms, admission, &guard,
-				  &current_failure)
-			: cluster_undo_block0_current_acquire_begin_live_owner_source(
-				  &key, cluster_ges_request_timeout_ms, admission, &guard,
-				  &current_failure);
-		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED)
-		{
+				   ? cluster_undo_block0_current_acquire_begin_live_owner_target(
+						 &key, cluster_ges_request_timeout_ms, admission, &guard, &current_failure)
+				   : cluster_undo_block0_current_acquire_begin_live_owner_source(
+						 &key, cluster_ges_request_timeout_ms, admission, &guard, &current_failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
 			/* A failed begin retains no guard under the current API.  A known
 			 * obsolete local candidate need not restore its old readiness before
 			 * returning the still-unpublished reservation to its caller. */
@@ -415,8 +392,7 @@ cluster_tt_slot_durable_publish_active(
 
 		while (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
 			CHECK_FOR_INTERRUPTS();
-			step = cluster_undo_block0_current_acquire_poll(&guard,
-				&current_failure);
+			step = cluster_undo_block0_current_acquire_poll(&guard, &current_failure);
 			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING
 				&& !cluster_undo_block0_current_wait_reply(
 					&guard, CLUSTER_UNDO_BLOCK0_WAIT_TT_ACTIVE_ACQUIRE))
@@ -427,8 +403,7 @@ cluster_tt_slot_durable_publish_active(
 		allocator_observation = tt_allocator_classify_owner(expected_owner);
 		if (allocator_observation == TT_ALLOCATOR_OWNER_ROLLED_AWAY)
 			goto active_publication_done;
-		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD || !root_available)
-		{
+		if (step != CLUSTER_UNDO_BLOCK0_CURRENT_HELD || !root_available) {
 			ges_failure = cluster_ges_timeout_detail_get();
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
@@ -458,10 +433,9 @@ cluster_tt_slot_durable_publish_active(
 					 expected_owner->slot_offset, expected_owner->wrap,
 					 cluster_tt_slot_current_segment(cluster_node_id))));
 
-		result = cluster_undo_block0_current_sample_generation_exclusive(
-			&guard, &root, &generation);
-		if (result != CLUSTER_UNDO_BLOCK0_OK || !generation.known
-			|| generation.value == UINT32_MAX)
+		result
+			= cluster_undo_block0_current_sample_generation_exclusive(&guard, &root, &generation);
+		if (result != CLUSTER_UNDO_BLOCK0_OK || !generation.known || generation.value == UINT32_MAX)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
 					 errmsg("canonical ACTIVE block-zero generation is unavailable"),
@@ -469,8 +443,8 @@ cluster_tt_slot_durable_publish_active(
 							   "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 							   cluster_node_id)));
 
-		result = cluster_undo_block0_current_pin_exclusive(
-			&guard, &root, &generation, &pin, (char **)&resident_header);
+		result = cluster_undo_block0_current_pin_exclusive(&guard, &root, &generation, &pin,
+														   (char **)&resident_header);
 		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_header == NULL)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
@@ -481,12 +455,11 @@ cluster_tt_slot_durable_publish_active(
 		pin_held = true;
 
 		cluster_tt_durable_io_wait_start();
-		if (!cluster_undo_smgr_read_block(root.intent,
-				expected_owner->segment_id, owner, 0, disk_block.data)) {
+		if (!cluster_undo_smgr_read_block(root.intent, expected_owner->segment_id, owner, 0,
+										  disk_block.data)) {
 			cluster_tt_durable_io_wait_end();
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("cannot read canonical TT block zero for ACTIVE publication")));
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cannot read canonical TT block zero for ACTIVE publication")));
 		}
 		cluster_tt_durable_io_wait_end();
 
@@ -499,8 +472,8 @@ cluster_tt_slot_durable_publish_active(
 			|| resident_header->tt_slots_count != disk_header->tt_slots_count
 			|| resident_header->wrap_count != disk_header->wrap_count
 			|| memcmp(&resident_header->tt_slots[expected_owner->slot_offset],
-					  &disk_header->tt_slots[expected_owner->slot_offset],
-					  sizeof(TTSlot)) != 0)
+					  &disk_header->tt_slots[expected_owner->slot_offset], sizeof(TTSlot))
+				   != 0)
 			ereport(
 				ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -525,27 +498,23 @@ cluster_tt_slot_durable_publish_active(
 						   resident_header->tt_slots[expected_owner->slot_offset].status)));
 
 		publication_epoch = cluster_epoch_get_current();
-		publication_boot_incarnation
-			= cluster_qvotec_get_self_incarnation();
-		if (publication_epoch > UINT32_MAX
-			|| publication_boot_incarnation == 0
-			|| admission->record_generation == 0
-			|| root.root_id == 0 || root.root_generation == 0
+		publication_boot_incarnation = cluster_qvotec_get_self_incarnation();
+		if (publication_epoch > UINT32_MAX || publication_boot_incarnation == 0
+			|| admission->record_generation == 0 || root.root_id == 0 || root.root_generation == 0
 			|| GetSystemIdentifier() == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE CTRC identity is unavailable"),
-					 errdetail("epoch=%llu boot_incarnation=%llu "
-							   "record_generation=%llu formation_epoch=%llu "
-							   "root_id=%llu root_generation=%llu "
-							   "system_identifier=%llu",
-							   (unsigned long long)publication_epoch,
-							   (unsigned long long)publication_boot_incarnation,
-							   (unsigned long long)admission->record_generation,
-							   (unsigned long long)admission->formation_epoch,
-							   (unsigned long long)root.root_id,
-							   (unsigned long long)root.root_generation,
-							   (unsigned long long)GetSystemIdentifier())));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("canonical ACTIVE CTRC identity is unavailable"),
+							errdetail("epoch=%llu boot_incarnation=%llu "
+									  "record_generation=%llu formation_epoch=%llu "
+									  "root_id=%llu root_generation=%llu "
+									  "system_identifier=%llu",
+									  (unsigned long long)publication_epoch,
+									  (unsigned long long)publication_boot_incarnation,
+									  (unsigned long long)admission->record_generation,
+									  (unsigned long long)admission->formation_epoch,
+									  (unsigned long long)root.root_id,
+									  (unsigned long long)root.root_generation,
+									  (unsigned long long)GetSystemIdentifier())));
 		MemSet(&ctrc_key, 0, sizeof(ctrc_key));
 		ctrc_key.format_version = CLUSTER_CTRC_FORMAT_VERSION;
 		ctrc_key.owner_instance = owner;
@@ -563,84 +532,62 @@ cluster_tt_slot_durable_publish_active(
 		ctrc_key.root_descriptor_incarnation = root.root_generation;
 		ctrc_key.root_id = root.root_id;
 		ctrc_key.root_generation = root.root_generation;
-		ctrc_reserve_result = cluster_ctrc_origin_reserve_active(
-			&ctrc_key, &ctrc_reservation);
-		if (ctrc_reserve_result
-			== CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED)
-		{
+		ctrc_reserve_result = cluster_ctrc_origin_reserve_active(&ctrc_key, &ctrc_reservation);
+		if (ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED) {
 			/* The old row needs cleaner progress before it can be reclaimed.
 			 * Never retain block-0 current or its content pin across that
 			 * asynchronous wait: the cleaner can require the same authority
 			 * before it reaches certificate notification.  The next attempt
 			 * reacquires and rebuilds the complete canonical snapshot. */
-			if (pin_held)
-			{
+			if (pin_held) {
 				cluster_undo_block0_unpin(&pin);
 				pin_held = false;
 			}
-			if (current_active)
-			{
+			if (current_active) {
 				cluster_undo_block0_current_cancel(&guard);
-					current_active = false;
-					MemSet(&guard, 0, sizeof(guard));
-				}
+				current_active = false;
+				MemSet(&guard, 0, sizeof(guard));
+			}
 			/* Terminal publication already woke the first cleaner pass.  Re-arm
 			 * explicitly for an overlap observed between passes, then poll only
 			 * the CTRC row.  Reacquiring block-0 XCUR while the released row is
 			 * unchanged creates no new evidence and can starve the cleaner/GES
 			 * path that must deliver the notification. */
 			cluster_undo_cleaner_wakeup();
-			while (cluster_ctrc_origin_release_overlap_pending(&ctrc_key))
-			{
-				if (!ctrc_reserve_perpetual
-					&& GetCurrentTimestamp() >= ctrc_reserve_deadline)
+			while (cluster_ctrc_origin_release_overlap_pending(&ctrc_key)) {
+				if (!ctrc_reserve_perpetual && GetCurrentTimestamp() >= ctrc_reserve_deadline)
 					break;
 				CHECK_FOR_INTERRUPTS();
 				pg_usleep(1000L);
 			}
-			if (ctrc_reserve_perpetual
-				|| GetCurrentTimestamp() < ctrc_reserve_deadline)
-			{
+			if (ctrc_reserve_perpetual || GetCurrentTimestamp() < ctrc_reserve_deadline) {
 				CHECK_FOR_INTERRUPTS();
 				goto retry_active_snapshot;
 			}
 		}
 		if (ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVE_REFUSED)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE CTRC origin reservation is unavailable"),
-					 errdetail("ready=%s owner=%u origin=%u segment=%u "
-							   "generation=%u slot=%u wrap=%u xid=%u",
-							   cluster_ctrc_shmem_ready() ? "true" : "false",
-							   ctrc_key.owner_instance,
-							   ctrc_key.origin_node_id,
-							   ctrc_key.segment_id,
-							   ctrc_key.segment_generation,
-							   ctrc_key.slot_offset,
-							   ctrc_key.slot_wrap,
-							   ctrc_key.xid)));
-		if (ctrc_reserve_result
-			== CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE CTRC origin release notification timed out"),
-					 errdetail("owner=%u origin=%u segment=%u generation=%u "
-							   "slot=%u wrap=%u xid=%u timeout_ms=%d",
-							   ctrc_key.owner_instance,
-							   ctrc_key.origin_node_id,
-							   ctrc_key.segment_id,
-							   ctrc_key.segment_generation,
-							   ctrc_key.slot_offset,
-							   ctrc_key.slot_wrap,
-							   ctrc_key.xid,
-							   cluster_ges_request_timeout_ms)));
-		ctrc_pre_bind_cancel_armed
-			= ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("canonical ACTIVE CTRC origin reservation is unavailable"),
+							errdetail("ready=%s owner=%u origin=%u segment=%u "
+									  "generation=%u slot=%u wrap=%u xid=%u",
+									  cluster_ctrc_shmem_ready() ? "true" : "false",
+									  ctrc_key.owner_instance, ctrc_key.origin_node_id,
+									  ctrc_key.segment_id, ctrc_key.segment_generation,
+									  ctrc_key.slot_offset, ctrc_key.slot_wrap, ctrc_key.xid)));
+		if (ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVE_RETRY_RELEASED)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("canonical ACTIVE CTRC origin release notification timed out"),
+							errdetail("owner=%u origin=%u segment=%u generation=%u "
+									  "slot=%u wrap=%u xid=%u timeout_ms=%d",
+									  ctrc_key.owner_instance, ctrc_key.origin_node_id,
+									  ctrc_key.segment_id, ctrc_key.segment_generation,
+									  ctrc_key.slot_offset, ctrc_key.slot_wrap, ctrc_key.xid,
+									  cluster_ges_request_timeout_ms)));
+		ctrc_pre_bind_cancel_armed = ctrc_reserve_result == CLUSTER_CTRC_ORIGIN_RESERVED_PENDING;
 
 		switch (cluster_tt_active_transition_decide(
-			&disk_header->tt_slots[expected_owner->slot_offset],
-			disk_header->wrap_count, generation.value,
-			expected_owner->xid, expected_owner->wrap, true)) {
+			&disk_header->tt_slots[expected_owner->slot_offset], disk_header->wrap_count,
+			generation.value, expected_owner->xid, expected_owner->wrap, true)) {
 		case CLUSTER_TT_ACTIVE_APPLY:
 			memset(&successor, 0, sizeof(successor));
 			successor.xid = expected_owner->xid;
@@ -657,68 +604,60 @@ cluster_tt_slot_durable_publish_active(
 		case CLUSTER_TT_ACTIVE_CORRUPT:
 		default:
 			ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("canonical ACTIVE predecessor is not an exact legal transition")));
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("canonical ACTIVE predecessor is not an exact legal transition")));
 		}
 
-		bind_lsn = cluster_undo_emit_tt_slot_bind(
-			owner, expected_owner->segment_id, generation.value,
-			expected_owner->slot_offset, expected_owner->wrap,
-			expected_owner->xid);
+		bind_lsn = cluster_undo_emit_tt_slot_bind(owner, expected_owner->segment_id,
+												  generation.value, expected_owner->slot_offset,
+												  expected_owner->wrap, expected_owner->xid);
 		if (XLogRecPtrIsInvalid(bind_lsn))
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical ACTIVE BIND WAL was not inserted")));
-		if (ctrc_pre_bind_cancel_armed)
-		{
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("canonical ACTIVE BIND WAL was not inserted")));
+		if (ctrc_pre_bind_cancel_armed) {
 			ctrc_pre_bind_cancel_armed = false;
 			ctrc_post_bind_block_armed = true;
 		}
 
-		if (memcmp(&disk_header->tt_slots[expected_owner->slot_offset],
-				   &successor, sizeof(successor)) != 0) {
+		if (memcmp(&disk_header->tt_slots[expected_owner->slot_offset], &successor,
+				   sizeof(successor))
+			!= 0) {
 			cluster_tt_durable_io_wait_start();
 			if (!cluster_undo_smgr_write_header_bytes(
 					root.intent, expected_owner->segment_id, owner,
-					tt_slot_file_offset(expected_owner->slot_offset),
-					(const char *)&successor, sizeof(successor))) {
+					tt_slot_file_offset(expected_owner->slot_offset), (const char *)&successor,
+					sizeof(successor))) {
 				cluster_tt_durable_io_wait_end();
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("cannot write canonical ACTIVE TT slot")));
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cannot write canonical ACTIVE TT slot")));
 			}
 			cluster_tt_durable_io_wait_end();
-			memcpy(&resident_header->tt_slots[expected_owner->slot_offset],
-				   &successor, sizeof(successor));
+			memcpy(&resident_header->tt_slots[expected_owner->slot_offset], &successor,
+				   sizeof(successor));
 		}
 
-		if (!(target_side
-				  ? cluster_semantic_activation_resolve_shared_undo_root(
-						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-						expected_owner->segment_id, &final_root)
-				  : cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-						expected_owner->segment_id, &final_root))
+		if (!(target_side ? cluster_semantic_activation_resolve_shared_undo_root(
+								admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+								expected_owner->segment_id, &final_root)
+						  : cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+								admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
+								expected_owner->segment_id, &final_root))
 			|| !cluster_undo_block0_root_matches(&root, &final_root)
 			|| !cluster_semantic_activation_modifier_recheck(admission, true)
 			|| cluster_epoch_get_current() != publication_epoch
-			|| cluster_qvotec_get_self_incarnation()
-			   != publication_boot_incarnation
-			|| cluster_undo_block0_current_recheck_exclusive(&guard)
-			   != CLUSTER_UNDO_BLOCK0_OK
+			|| cluster_qvotec_get_self_incarnation() != publication_boot_incarnation
+			|| cluster_undo_block0_current_recheck_exclusive(&guard) != CLUSTER_UNDO_BLOCK0_OK
 			|| resident_header->wrap_count != generation.value
-			|| memcmp(&resident_header->tt_slots[expected_owner->slot_offset],
-					  &successor, sizeof(successor)) != 0
+			|| memcmp(&resident_header->tt_slots[expected_owner->slot_offset], &successor,
+					  sizeof(successor))
+				   != 0
 			|| !tt_allocator_corroborates_or_rolled_away(expected_owner))
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE authority drifted during publication")));
-		if (!cluster_ctrc_origin_open_reserved(
-				&ctrc_reservation, &ctrc_grant_generation)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("canonical ACTIVE authority drifted during publication")));
+		if (!cluster_ctrc_origin_open_reserved(&ctrc_reservation, &ctrc_grant_generation)
 			|| ctrc_grant_generation == 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical ACTIVE CTRC origin grant is unavailable")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("canonical ACTIVE CTRC origin grant is unavailable")));
 		ctrc_post_bind_block_armed = false;
 
 		*segment_generation_out = generation.value;
@@ -727,13 +666,10 @@ cluster_tt_slot_durable_publish_active(
 	}
 	PG_FINALLY();
 	{
-		if (ctrc_pre_bind_cancel_armed)
-		{
+		if (ctrc_pre_bind_cancel_armed) {
 			(void)cluster_ctrc_origin_cancel_pre_bind(&ctrc_reservation);
 			ctrc_pre_bind_cancel_armed = false;
-		}
-		else if (ctrc_post_bind_block_armed)
-		{
+		} else if (ctrc_post_bind_block_armed) {
 			(void)cluster_ctrc_origin_block_post_bind(&ctrc_reservation);
 			ctrc_post_bind_block_armed = false;
 		}
@@ -753,20 +689,16 @@ cluster_tt_slot_durable_publish_active(
 
 ClusterTTActiveTransitionDecision
 cluster_tt_durable_bind_preflight_exact(uint8 instance, uint32 segment_id,
-										uint32 segment_generation,
-										uint16 slot_offset, uint16 wrap,
+										uint32 segment_generation, uint16 slot_offset, uint16 wrap,
 										TransactionId xid)
 {
 	PGAlignedBlock first;
 	PGAlignedBlock second;
-	const UndoSegmentHeaderData *first_header
-		= (const UndoSegmentHeaderData *)first.data;
-	const UndoSegmentHeaderData *second_header
-		= (const UndoSegmentHeaderData *)second.data;
+	const UndoSegmentHeaderData *first_header = (const UndoSegmentHeaderData *)first.data;
+	const UndoSegmentHeaderData *second_header = (const UndoSegmentHeaderData *)second.data;
 	uint8 expected_instance;
 
-	if (instance == 0 || segment_id == 0
-		|| slot_offset >= TT_SLOTS_PER_SEGMENT
+	if (instance == 0 || segment_id == 0 || slot_offset >= TT_SLOTS_PER_SEGMENT
 		|| !TransactionIdIsNormal(xid) || wrap == TT_WRAP_INVALID)
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 	expected_instance = tt_owner_instance_for_segment(segment_id);
@@ -774,99 +706,89 @@ cluster_tt_durable_bind_preflight_exact(uint8 instance, uint32 segment_id,
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance),
-			segment_id, instance, 0, first.data)
-		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance),
-			segment_id, instance, 0, second.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id, instance,
+									  0, first.data)
+		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id,
+										 instance, 0, second.data)) {
 		cluster_tt_durable_io_wait_end();
 		return CLUSTER_TT_ACTIVE_CONFLICT;
 	}
 	cluster_tt_durable_io_wait_end();
 
-	if (first_header->segment_id != segment_id
-		|| first_header->owner_instance != instance
+	if (first_header->segment_id != segment_id || first_header->owner_instance != instance
 		|| first_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 		|| second_header->segment_id != first_header->segment_id
 		|| second_header->owner_instance != first_header->owner_instance
 		|| second_header->tt_slots_count != first_header->tt_slots_count)
 		return CLUSTER_TT_ACTIVE_CORRUPT;
 	if (second_header->wrap_count != first_header->wrap_count
-		|| memcmp(&second_header->tt_slots[slot_offset],
-				  &first_header->tt_slots[slot_offset], sizeof(TTSlot)) != 0)
+		|| memcmp(&second_header->tt_slots[slot_offset], &first_header->tt_slots[slot_offset],
+				  sizeof(TTSlot))
+			   != 0)
 		return CLUSTER_TT_ACTIVE_CONFLICT;
 
-	return cluster_tt_active_transition_decide(
-		&first_header->tt_slots[slot_offset], first_header->wrap_count,
-		segment_generation, xid, wrap, true);
+	return cluster_tt_active_transition_decide(&first_header->tt_slots[slot_offset],
+											   first_header->wrap_count, segment_generation, xid,
+											   wrap, true);
 }
 
 ClusterTTTerminalTransitionDecision
 cluster_tt_durable_abort_preflight_exact(uint8 instance, uint32 segment_id,
-										 uint32 segment_generation,
-										 uint16 slot_offset, uint16 wrap,
+										 uint32 segment_generation, uint16 slot_offset, uint16 wrap,
 										 TransactionId xid)
 {
 	PGAlignedBlock first;
 	PGAlignedBlock second;
-	const UndoSegmentHeaderData *first_header
-		= (const UndoSegmentHeaderData *)first.data;
-	const UndoSegmentHeaderData *second_header
-		= (const UndoSegmentHeaderData *)second.data;
+	const UndoSegmentHeaderData *first_header = (const UndoSegmentHeaderData *)first.data;
+	const UndoSegmentHeaderData *second_header = (const UndoSegmentHeaderData *)second.data;
 
-	if (instance == 0 || segment_id == 0
-		|| segment_generation == UINT32_MAX
-		|| slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| !TransactionIdIsNormal(xid) || wrap == TT_WRAP_INVALID
-		|| instance != tt_owner_instance_for_segment(segment_id))
+	if (instance == 0 || segment_id == 0 || segment_generation == UINT32_MAX
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| wrap == TT_WRAP_INVALID || instance != tt_owner_instance_for_segment(segment_id))
 		return CLUSTER_TT_TERMINAL_CORRUPT;
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance),
-			segment_id, instance, 0, first.data)
-		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance),
-			segment_id, instance, 0, second.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id, instance,
+									  0, first.data)
+		|| !cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id,
+										 instance, 0, second.data)) {
 		cluster_tt_durable_io_wait_end();
 		return CLUSTER_TT_TERMINAL_CONFLICT;
 	}
 	cluster_tt_durable_io_wait_end();
-	if (first_header->segment_id != segment_id
-		|| first_header->owner_instance != instance
+	if (first_header->segment_id != segment_id || first_header->owner_instance != instance
 		|| first_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 		|| second_header->segment_id != first_header->segment_id
 		|| second_header->owner_instance != first_header->owner_instance
 		|| second_header->tt_slots_count != first_header->tt_slots_count)
 		return CLUSTER_TT_TERMINAL_CORRUPT;
 	if (second_header->wrap_count != first_header->wrap_count
-		|| memcmp(&second_header->tt_slots[slot_offset],
-				  &first_header->tt_slots[slot_offset], sizeof(TTSlot)) != 0)
+		|| memcmp(&second_header->tt_slots[slot_offset], &first_header->tt_slots[slot_offset],
+				  sizeof(TTSlot))
+			   != 0)
 		return CLUSTER_TT_TERMINAL_CONFLICT;
-	return cluster_tt_terminal_transition_decide(
-		&first_header->tt_slots[slot_offset], first_header->wrap_count,
-		segment_generation, xid, wrap, TT_SLOT_ABORTED, InvalidScn);
+	return cluster_tt_terminal_transition_decide(&first_header->tt_slots[slot_offset],
+												 first_header->wrap_count, segment_generation, xid,
+												 wrap, TT_SLOT_ABORTED, InvalidScn);
 }
 
 ClusterUndoTtCtrcReleaseRedoDecision
-cluster_tt_durable_ctrc_release_preflight_exact(
-	const xl_undo_tt_slot_ctrc_release_v1 *record)
+cluster_tt_durable_ctrc_release_preflight_exact(const xl_undo_tt_slot_ctrc_release_v1 *record)
 {
 	PGAlignedBlock first;
 	PGAlignedBlock second;
-	const UndoSegmentHeaderData *first_header
-		= (const UndoSegmentHeaderData *)first.data;
-	const UndoSegmentHeaderData *second_header
-		= (const UndoSegmentHeaderData *)second.data;
+	const UndoSegmentHeaderData *first_header = (const UndoSegmentHeaderData *)first.data;
+	const UndoSegmentHeaderData *second_header = (const UndoSegmentHeaderData *)second.data;
 	ClusterUndoPathIntent intent;
 
 	if (!cluster_undo_tt_ctrc_release_valid(record)
-		|| record->owner_instance
-		   != tt_owner_instance_for_segment(record->segment_id))
+		|| record->owner_instance != tt_owner_instance_for_segment(record->segment_id))
 		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
 	intent = cluster_undo_intent_for_owner(record->owner_instance);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(intent, record->segment_id,
-			record->owner_instance, 0, first.data)
-		|| !cluster_undo_smgr_read_block(intent, record->segment_id,
-			record->owner_instance, 0, second.data))
-	{
+	if (!cluster_undo_smgr_read_block(intent, record->segment_id, record->owner_instance, 0,
+									  first.data)
+		|| !cluster_undo_smgr_read_block(intent, record->segment_id, record->owner_instance, 0,
+										 second.data)) {
 		cluster_tt_durable_io_wait_end();
 		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
 	}
@@ -879,16 +801,15 @@ cluster_tt_durable_ctrc_release_preflight_exact(
 		|| second_header->tt_slots_count != first_header->tt_slots_count
 		|| second_header->wrap_count != first_header->wrap_count
 		|| memcmp(&second_header->tt_slots[record->slot_offset],
-			&first_header->tt_slots[record->slot_offset], sizeof(TTSlot)) != 0)
+				  &first_header->tt_slots[record->slot_offset], sizeof(TTSlot))
+			   != 0)
 		return CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_CONFLICT;
 	return cluster_undo_tt_ctrc_release_redo_decide(
-		first_header->wrap_count,
-		&first_header->tt_slots[record->slot_offset], record);
+		first_header->wrap_count, &first_header->tt_slots[record->slot_offset], record);
 }
 
 void
-cluster_tt_durable_redo_ctrc_release_slot_exact(
-	const xl_undo_tt_slot_ctrc_release_v1 *record)
+cluster_tt_durable_redo_ctrc_release_slot_exact(const xl_undo_tt_slot_ctrc_release_v1 *record)
 {
 	ClusterUndoPathIntent intent;
 	PGAlignedBlock block;
@@ -897,69 +818,54 @@ cluster_tt_durable_redo_ctrc_release_slot_exact(
 	TTSlot *slot;
 
 	if (!cluster_undo_tt_ctrc_release_valid(record)
-		|| record->owner_instance
-		   != tt_owner_instance_for_segment(record->segment_id))
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid exact TT CTRC release identity")));
+		|| record->owner_instance != tt_owner_instance_for_segment(record->segment_id))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid exact TT CTRC release identity")));
 	intent = cluster_undo_intent_for_owner(record->owner_instance);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(intent, record->segment_id,
-			record->owner_instance, 0, block.data))
-	{
+	if (!cluster_undo_smgr_read_block(intent, record->segment_id, record->owner_instance, 0,
+									  block.data)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot read undo segment %u for CTRC release redo",
-					record->segment_id)));
+				 errmsg("cannot read undo segment %u for CTRC release redo", record->segment_id)));
 	}
-	if (header->segment_id != record->segment_id
-		|| header->owner_instance != record->owner_instance
-		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT)
-	{
+	if (header->segment_id != record->segment_id || header->owner_instance != record->owner_instance
+		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("conflicting undo segment header for CTRC release redo")));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("conflicting undo segment header for CTRC release redo")));
 	}
 	slot = &header->tt_slots[record->slot_offset];
-	decision = cluster_undo_tt_ctrc_release_redo_decide(
-		header->wrap_count, slot, record);
-	if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE)
-	{
+	decision = cluster_undo_tt_ctrc_release_redo_decide(header->wrap_count, slot, record);
+	if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_SKIP_STALE) {
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
 	}
-	if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT)
-	{
+	if (decision == CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_IDEMPOTENT) {
 		cluster_tt_durable_io_wait_end();
 		return;
 	}
-	if (decision != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY)
-	{
+	if (decision != CLUSTER_UNDO_TT_CTRC_RELEASE_REDO_APPLY) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("conflicting terminal predecessor for CTRC release redo"),
-				 errdetail("segment_generation=%u disk_generation=%u slot=%u wrap=%u xid=%u",
-					record->segment_generation, header->wrap_count,
-					record->slot_offset, record->slot_wrap, record->xid)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("conflicting terminal predecessor for CTRC release redo"),
+						errdetail("segment_generation=%u disk_generation=%u slot=%u wrap=%u xid=%u",
+								  record->segment_generation, header->wrap_count,
+								  record->slot_offset, record->slot_wrap, record->xid)));
 	}
 	slot->flags = TT_SLOT_FLAG_CTRC_RELEASE_PROVEN;
-	if (!cluster_undo_smgr_write_header_bytes(intent, record->segment_id,
-			record->owner_instance,
-			(uint32)offsetof(UndoSegmentHeaderData, tt_slots)
-				+ (uint32)record->slot_offset * (uint32)sizeof(TTSlot),
-			(const char *)slot, sizeof(*slot))
-		|| !cluster_undo_smgr_fsync_segment_file(record->segment_id,
-			record->owner_instance))
-	{
+	if (!cluster_undo_smgr_write_header_bytes(intent, record->segment_id, record->owner_instance,
+											  (uint32)offsetof(UndoSegmentHeaderData, tt_slots)
+												  + (uint32)record->slot_offset
+														* (uint32)sizeof(TTSlot),
+											  (const char *)slot, sizeof(*slot))
+		|| !cluster_undo_smgr_fsync_segment_file(record->segment_id, record->owner_instance)) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot durably write CTRC release bit for undo segment %u slot %u",
-					record->segment_id, record->slot_offset)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot durably write CTRC release bit for undo segment %u slot %u",
+							   record->segment_id, record->slot_offset)));
 	}
 	cluster_tt_durable_io_wait_end();
 	cluster_vis_bump_recovery_undo_redo_applies();
@@ -1106,9 +1012,8 @@ cluster_tt_slot_durable_commit(uint32 segment_id, uint16 slot_offset, Transactio
 }
 
 static uint8
-tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
-							   uint16 slot_offset, TransactionId xid,
-							   uint16 wrap, uint8 terminal_status,
+tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation, uint16 slot_offset,
+							   TransactionId xid, uint16 wrap, uint8 terminal_status,
 							   SCN terminal_scn, bool apply_transition,
 							   const ClusterSemanticAdmissionToken *admission,
 							   TTSlot *successor_out)
@@ -1141,8 +1046,7 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 	Assert((terminal_status == TT_SLOT_COMMITTED) == SCN_VALID(terminal_scn));
 	if (admission == NULL || successor_out == NULL || !admission->entered
 		|| segment_generation == UINT32_MAX
-		|| (terminal_status != TT_SLOT_COMMITTED
-			&& terminal_status != TT_SLOT_ABORTED)
+		|| (terminal_status != TT_SLOT_COMMITTED && terminal_status != TT_SLOT_ABORTED)
 		|| (admission->side != CLUSTER_SEMANTIC_SOURCE_SIDE
 			&& admission->side != CLUSTER_SEMANTIC_TARGET_SIDE)
 		|| cluster_node_id < 0 || owner != (uint8)(cluster_node_id + 1))
@@ -1164,23 +1068,20 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 	memset(&pin, 0, sizeof(pin));
 	pin.slot = -1;
 	target_side = admission->side == CLUSTER_SEMANTIC_TARGET_SIDE;
-	root_available = target_side
-		? cluster_semantic_activation_resolve_shared_undo_root(
-			  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root)
-		: cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-			  admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root);
+	root_available
+		= target_side ? cluster_semantic_activation_resolve_shared_undo_root(
+							admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root)
+					  : cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
+							admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &root);
 	if (!tt_allocator_corroborates_or_rolled_away(&expected_owner))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("cannot commit a transaction: allocator identity is not exact")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+						errmsg("cannot commit a transaction: allocator identity is not exact")));
 
 	step = target_side
-		? cluster_undo_block0_current_acquire_begin_live_owner_target(
-			  &key, cluster_ges_request_timeout_ms, admission, &guard,
-			  &current_failure)
-		: cluster_undo_block0_current_acquire_begin_live_owner_source(
-			  &key, cluster_ges_request_timeout_ms, admission, &guard,
-			  &current_failure);
+			   ? cluster_undo_block0_current_acquire_begin_live_owner_target(
+					 &key, cluster_ges_request_timeout_ms, admission, &guard, &current_failure)
+			   : cluster_undo_block0_current_acquire_begin_live_owner_source(
+					 &key, cluster_ges_request_timeout_ms, admission, &guard, &current_failure);
 	if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
 		ges_failure = cluster_ges_timeout_detail_get();
 		ereport(
@@ -1227,75 +1128,67 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 						   "segment=%u result=%d",
 						   cluster_node_id, segment_id, (int)current_failure)));
 
-		result = cluster_undo_block0_current_sample_generation_exclusive(
-			&guard, &root, &generation);
+		result
+			= cluster_undo_block0_current_sample_generation_exclusive(&guard, &root, &generation);
 		if (result != CLUSTER_UNDO_BLOCK0_OK || !generation.known
 			|| generation.value != segment_generation)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("cannot commit a transaction: canonical generation changed")));
-		result = cluster_undo_block0_current_pin_exclusive(
-			&guard, &root, &generation, &pin, (char **)&resident_header);
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("cannot commit a transaction: canonical generation changed")));
+		result = cluster_undo_block0_current_pin_exclusive(&guard, &root, &generation, &pin,
+														   (char **)&resident_header);
 		if (result != CLUSTER_UNDO_BLOCK0_OK || resident_header == NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("cannot commit a transaction: canonical block-zero content is unavailable")));
+			ereport(
+				ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg(
+					 "cannot commit a transaction: canonical block-zero content is unavailable")));
 		pin_held = true;
 
 		cluster_tt_durable_io_wait_start();
-		if (!cluster_undo_smgr_read_block(root.intent, segment_id, owner, 0,
-				disk_block.data)) {
+		if (!cluster_undo_smgr_read_block(root.intent, segment_id, owner, 0, disk_block.data)) {
 			cluster_tt_durable_io_wait_end();
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("cannot read canonical TT block zero for commit")));
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("cannot read canonical TT block zero for commit")));
 		}
 		cluster_tt_durable_io_wait_end();
-		if (disk_header->segment_id != segment_id
-			|| disk_header->owner_instance != owner
+		if (disk_header->segment_id != segment_id || disk_header->owner_instance != owner
 			|| disk_header->tt_slots_count != TT_SLOTS_PER_SEGMENT
 			|| disk_header->wrap_count != segment_generation
 			|| resident_header->segment_id != disk_header->segment_id
 			|| resident_header->owner_instance != disk_header->owner_instance
 			|| resident_header->tt_slots_count != disk_header->tt_slots_count
 			|| resident_header->wrap_count != disk_header->wrap_count
-			|| memcmp(&resident_header->tt_slots[slot_offset],
-					  &disk_header->tt_slots[slot_offset], sizeof(TTSlot)) != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical TT commit identity or generation mismatch")));
+			|| memcmp(&resident_header->tt_slots[slot_offset], &disk_header->tt_slots[slot_offset],
+					  sizeof(TTSlot))
+				   != 0)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("canonical TT commit identity or generation mismatch")));
 
 		decision = cluster_tt_terminal_transition_decide(
-			&disk_header->tt_slots[slot_offset], disk_header->wrap_count,
-			segment_generation, xid, wrap, terminal_status, terminal_scn);
-		if (decision != CLUSTER_TT_TERMINAL_APPLY
-			&& decision != CLUSTER_TT_TERMINAL_IDEMPOTENT)
-			ereport(ERROR,
-					(errcode(ERRCODE_DATA_CORRUPTED),
-					 errmsg("canonical TT commit predecessor is not exact")));
+			&disk_header->tt_slots[slot_offset], disk_header->wrap_count, segment_generation, xid,
+			wrap, terminal_status, terminal_scn);
+		if (decision != CLUSTER_TT_TERMINAL_APPLY && decision != CLUSTER_TT_TERMINAL_IDEMPOTENT)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("canonical TT commit predecessor is not exact")));
 		successor = disk_header->tt_slots[slot_offset];
 		successor.status = terminal_status;
 		successor.flags = TT_FLAGS_RESERVED;
 		successor.commit_scn = terminal_scn;
 		successor.first_undo_block = InvalidUbaVal;
-		final_expected = apply_transition ? successor
-			: disk_header->tt_slots[slot_offset];
+		final_expected = apply_transition ? successor : disk_header->tt_slots[slot_offset];
 
 		memset(&final_root, 0, sizeof(final_root));
 		if (!(target_side
 				  ? cluster_semantic_activation_resolve_shared_undo_root(
-						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-						segment_id, &final_root)
+						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &final_root)
 				  : cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-						segment_id, &final_root))
+						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id,
+						&final_root))
 			|| !cluster_undo_block0_root_matches(&root, &final_root)
 			|| !cluster_semantic_activation_modifier_recheck(admission, true)
-			|| cluster_undo_block0_current_recheck_exclusive(&guard)
-			   != CLUSTER_UNDO_BLOCK0_OK)
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical TT commit authority drifted before transition")));
+			|| cluster_undo_block0_current_recheck_exclusive(&guard) != CLUSTER_UNDO_BLOCK0_OK)
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("canonical TT commit authority drifted before transition")));
 
 		if (apply_transition && decision == CLUSTER_TT_TERMINAL_APPLY) {
 			cluster_tt_durable_io_wait_start();
@@ -1303,34 +1196,29 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 					root.intent, segment_id, owner, tt_slot_file_offset(slot_offset),
 					(const char *)&successor, sizeof(successor))) {
 				cluster_tt_durable_io_wait_end();
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("cannot write canonical terminal TT slot")));
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("cannot write canonical terminal TT slot")));
 			}
 			cluster_tt_durable_io_wait_end();
-			memcpy(&resident_header->tt_slots[slot_offset], &successor,
-				   sizeof(successor));
+			memcpy(&resident_header->tt_slots[slot_offset], &successor, sizeof(successor));
 		}
 
 		memset(&final_root, 0, sizeof(final_root));
 		if (!(target_side
 				  ? cluster_semantic_activation_resolve_shared_undo_root(
-						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-						segment_id, &final_root)
+						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id, &final_root)
 				  : cluster_semantic_activation_resolve_shared_undo_root_live_owner_source(
-						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner,
-						segment_id, &final_root))
+						admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, owner, segment_id,
+						&final_root))
 			|| !cluster_undo_block0_root_matches(&root, &final_root)
 			|| !cluster_semantic_activation_modifier_recheck(admission, true)
-			|| cluster_undo_block0_current_recheck_exclusive(&guard)
-			   != CLUSTER_UNDO_BLOCK0_OK
+			|| cluster_undo_block0_current_recheck_exclusive(&guard) != CLUSTER_UNDO_BLOCK0_OK
 			|| resident_header->wrap_count != segment_generation
-			|| memcmp(&resident_header->tt_slots[slot_offset], &final_expected,
-					  sizeof(successor)) != 0
+			|| memcmp(&resident_header->tt_slots[slot_offset], &final_expected, sizeof(successor))
+				   != 0
 			|| !tt_allocator_corroborates_or_rolled_away(&expected_owner))
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-					 errmsg("canonical TT commit authority drifted after transition")));
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+							errmsg("canonical TT commit authority drifted after transition")));
 
 		*successor_out = successor;
 	}
@@ -1354,43 +1242,40 @@ tt_slot_durable_terminal_exact(uint32 segment_id, uint32 segment_generation,
 }
 
 uint8
-cluster_tt_slot_durable_commit_writeonly(uint32 segment_id,
-										 uint32 segment_generation,
-										 uint16 slot_offset, TransactionId xid,
-										 uint16 wrap, SCN commit_scn,
+cluster_tt_slot_durable_commit_writeonly(uint32 segment_id, uint32 segment_generation,
+										 uint16 slot_offset, TransactionId xid, uint16 wrap,
+										 SCN commit_scn,
 										 const ClusterSemanticAdmissionToken *admission,
 										 TTSlot *successor_out)
 {
 	uint8 owner;
 
-	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation,
-		slot_offset, xid, wrap, TT_SLOT_COMMITTED, commit_scn, true,
-		admission, successor_out);
+	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
+										   TT_SLOT_COMMITTED, commit_scn, true, admission,
+										   successor_out);
 	cluster_tt_durable_count_commit();
 	return owner;
 }
 
 XLogRecPtr
-cluster_tt_slot_durable_abort_exact(uint32 segment_id,
-								   uint32 segment_generation,
-								   uint16 slot_offset, TransactionId xid,
-								   uint16 wrap,
-								   const ClusterSemanticAdmissionToken *admission,
-								   TTSlot *successor_out)
+cluster_tt_slot_durable_abort_exact(uint32 segment_id, uint32 segment_generation,
+									uint16 slot_offset, TransactionId xid, uint16 wrap,
+									const ClusterSemanticAdmissionToken *admission,
+									TTSlot *successor_out)
 {
 	TTSlot prepared_successor;
 	XLogRecPtr abort_lsn;
 	uint8 owner;
 
-	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation,
-		slot_offset, xid, wrap, TT_SLOT_ABORTED, InvalidScn, false,
-		admission, &prepared_successor);
-	abort_lsn = cluster_undo_emit_tt_slot_abort_exact(owner, segment_id,
-		segment_generation, slot_offset, wrap, xid);
+	owner = tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
+										   TT_SLOT_ABORTED, InvalidScn, false, admission,
+										   &prepared_successor);
+	abort_lsn = cluster_undo_emit_tt_slot_abort_exact(owner, segment_id, segment_generation,
+													  slot_offset, wrap, xid);
 	XLogFlush(abort_lsn);
-	(void)tt_slot_durable_terminal_exact(segment_id, segment_generation,
-		slot_offset, xid, wrap, TT_SLOT_ABORTED, InvalidScn, true,
-		admission, successor_out);
+	(void)tt_slot_durable_terminal_exact(segment_id, segment_generation, slot_offset, xid, wrap,
+										 TT_SLOT_ABORTED, InvalidScn, true, admission,
+										 successor_out);
 	return abort_lsn;
 }
 
@@ -1595,9 +1480,8 @@ cluster_tt_slot_durable_lookup_committed_stable(uint32 segment_id, uint16 slot_o
 }
 
 bool
-cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
-										  TransactionId xid, uint16 expected_wrap,
-										  TTSlot *slot_out)
+cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										  uint16 expected_wrap, TTSlot *slot_out)
 {
 	uint8 owner;
 	uint32 off;
@@ -1609,8 +1493,7 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 	memset(slot_out, 0, sizeof(*slot_out));
 
 	if (segment_id == 0
-		|| segment_id
-			   > ((uint32)SCN_MAX_VALID_NODE_ID + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE
+		|| segment_id > ((uint32)SCN_MAX_VALID_NODE_ID + 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE
 		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
 		|| expected_wrap == TT_WRAP_INVALID)
 		return false;
@@ -1627,8 +1510,7 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 	}
 	cluster_tt_durable_io_wait_end();
 
-	if (first.status > (uint8)TT_SLOT_RECYCLABLE || first.xid != xid
-		|| first.wrap != expected_wrap)
+	if (first.status > (uint8)TT_SLOT_RECYCLABLE || first.xid != xid || first.wrap != expected_wrap)
 		return false;
 
 	cluster_tt_durable_io_wait_start();
@@ -1639,9 +1521,8 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 	}
 	cluster_tt_durable_io_wait_end();
 
-	if (memcmp(&first, &second, sizeof(first)) != 0
-		|| second.status > (uint8)TT_SLOT_RECYCLABLE || second.xid != xid
-		|| second.wrap != expected_wrap)
+	if (memcmp(&first, &second, sizeof(first)) != 0 || second.status > (uint8)TT_SLOT_RECYCLABLE
+		|| second.xid != xid || second.wrap != expected_wrap)
 		return false;
 
 	*slot_out = second;
@@ -1650,44 +1531,34 @@ cluster_tt_slot_durable_read_exact_stable(uint32 segment_id, uint16 slot_offset,
 
 
 void
-cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id,
-								   uint16 slot_offset, uint16 wrap,
-								   TransactionId xid)
+cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id, uint16 slot_offset,
+								   uint16 wrap, TransactionId xid)
 {
-	uint32		off;
-	TTSlot		slot;
+	uint32 off;
+	TTSlot slot;
 	ClusterTTRedoDecision decision;
 
-	if (instance == 0 || segment_id == 0 ||
-		instance != tt_owner_instance_for_segment(segment_id) ||
-		slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid) ||
-		wrap == TT_WRAP_INVALID)
+	if (instance == 0 || segment_id == 0 || instance != tt_owner_instance_for_segment(segment_id)
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| wrap == TT_WRAP_INVALID)
 		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid typed TT abort redo identity")));
+				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid typed TT abort redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(
-			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
-			(char *) &slot, sizeof(slot)))
-	{
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
+											 instance, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot read TT slot %u of undo segment %u for abort redo",
-					 slot_offset, segment_id)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot read TT slot %u of undo segment %u for abort redo",
+							   slot_offset, segment_id)));
 	}
-	decision = cluster_tt_durable_redo_decide(slot.status, slot.xid,
-		slot.wrap, xid, wrap);
-	if (decision == CLUSTER_TT_REDO_BADSTATUS)
-	{
+	decision = cluster_tt_durable_redo_decide(slot.status, slot.xid, slot.wrap, xid, wrap);
+	if (decision == CLUSTER_TT_REDO_BADSTATUS) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid TT status %u in typed abort redo", slot.status)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid TT status %u in typed abort redo", slot.status)));
 	}
-	if (decision == CLUSTER_TT_REDO_SKIP)
-	{
+	if (decision == CLUSTER_TT_REDO_SKIP) {
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
@@ -1698,16 +1569,13 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id,
 	slot.flags = TT_FLAGS_RESERVED;
 	slot.commit_scn = InvalidScn;
 	slot.first_undo_block = InvalidUbaVal;
-	if (!cluster_undo_smgr_write_header_bytes(
-			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
-			(const char *) &slot, sizeof(slot)) ||
-		!cluster_undo_smgr_fsync_segment_file(segment_id, instance))
-	{
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
+											  instance, off, (const char *)&slot, sizeof(slot))
+		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot durably write TT slot %u of undo segment %u for abort redo",
-					 slot_offset, segment_id)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot durably write TT slot %u of undo segment %u for abort redo",
+							   slot_offset, segment_id)));
 	}
 	cluster_tt_durable_io_wait_end();
 	cluster_vis_bump_recovery_undo_redo_applies();
@@ -1715,8 +1583,7 @@ cluster_tt_durable_redo_abort_slot(uint8 instance, uint32 segment_id,
 
 void
 cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
-										 uint32 segment_generation,
-										 uint16 slot_offset, uint16 wrap,
+										 uint32 segment_generation, uint16 slot_offset, uint16 wrap,
 										 TransactionId xid)
 {
 	PGAlignedBlock block;
@@ -1724,34 +1591,28 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 	TTSlot successor;
 	ClusterTTTerminalTransitionDecision decision;
 
-	if (instance == 0 || segment_id == 0
-		|| segment_generation == UINT32_MAX
+	if (instance == 0 || segment_id == 0 || segment_generation == UINT32_MAX
 		|| instance != tt_owner_instance_for_segment(segment_id)
-		|| slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| !TransactionIdIsNormal(xid) || wrap == TT_WRAP_INVALID)
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| wrap == TT_WRAP_INVALID)
 		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid exact TT abort redo identity")));
+				(errcode(ERRCODE_DATA_CORRUPTED), errmsg("invalid exact TT abort redo identity")));
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance),
-			segment_id, instance, 0, block.data)) {
+	if (!cluster_undo_smgr_read_block(cluster_undo_intent_for_owner(instance), segment_id, instance,
+									  0, block.data)) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot read undo segment %u for exact abort redo",
-						segment_id)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot read undo segment %u for exact abort redo", segment_id)));
 	}
-	if (header->segment_id != segment_id
-		|| header->owner_instance != instance
+	if (header->segment_id != segment_id || header->owner_instance != instance
 		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("conflicting undo segment header for exact abort redo")));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("conflicting undo segment header for exact abort redo")));
 	}
-	decision = cluster_tt_terminal_transition_decide(
-		&header->tt_slots[slot_offset], header->wrap_count,
-		segment_generation, xid, wrap, TT_SLOT_ABORTED, InvalidScn);
+	decision = cluster_tt_terminal_transition_decide(&header->tt_slots[slot_offset],
+													 header->wrap_count, segment_generation, xid,
+													 wrap, TT_SLOT_ABORTED, InvalidScn);
 	if (decision == CLUSTER_TT_TERMINAL_STALE) {
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
@@ -1763,24 +1624,21 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 	}
 	if (decision != CLUSTER_TT_TERMINAL_APPLY) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("conflicting canonical ACTIVE predecessor for exact abort redo")));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("conflicting canonical ACTIVE predecessor for exact abort redo")));
 	}
 	successor = header->tt_slots[slot_offset];
 	successor.status = TT_SLOT_ABORTED;
 	successor.flags = TT_FLAGS_RESERVED;
 	successor.commit_scn = InvalidScn;
 	successor.first_undo_block = InvalidUbaVal;
-	if (!cluster_undo_smgr_write_header_bytes(
-			cluster_undo_intent_for_owner(instance), segment_id, instance,
-			tt_slot_file_offset(slot_offset), (const char *)&successor,
-			sizeof(successor))
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
+											  instance, tt_slot_file_offset(slot_offset),
+											  (const char *)&successor, sizeof(successor))
 		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot durably write exact ABORTED TT slot")));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot durably write exact ABORTED TT slot")));
 	}
 	cluster_tt_durable_io_wait_end();
 	cluster_vis_bump_recovery_undo_redo_applies();
@@ -1788,51 +1646,40 @@ cluster_tt_durable_redo_abort_slot_exact(uint8 instance, uint32 segment_id,
 
 
 void
-cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id,
-									 uint16 slot_offset, uint16 wrap,
-									 TransactionId xid,
-									 UBA first_undo_block)
+cluster_tt_durable_redo_set_head_slot(uint8 instance, uint32 segment_id, uint16 slot_offset,
+									  uint16 wrap, TransactionId xid, UBA first_undo_block)
 {
-	uint32		off;
-	TTSlot		slot;
+	uint32 off;
+	TTSlot slot;
 
-	if (instance == 0 || segment_id == 0 ||
-		instance != tt_owner_instance_for_segment(segment_id) ||
-		slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid) ||
-		wrap == TT_WRAP_INVALID || UBA_is_invalid(first_undo_block))
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid typed TT set-head redo identity")));
+	if (instance == 0 || segment_id == 0 || instance != tt_owner_instance_for_segment(segment_id)
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| wrap == TT_WRAP_INVALID || UBA_is_invalid(first_undo_block))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid typed TT set-head redo identity")));
 	off = tt_slot_file_offset(slot_offset);
 	cluster_tt_durable_io_wait_start();
-	if (!cluster_undo_smgr_read_header_bytes(
-			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
-			(char *) &slot, sizeof(slot)))
-	{
+	if (!cluster_undo_smgr_read_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
+											 instance, off, (char *)&slot, sizeof(slot))) {
 		cluster_tt_durable_io_wait_end();
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("cannot read TT slot %u of undo segment %u for set-head redo",
-					 slot_offset, segment_id)));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("cannot read TT slot %u of undo segment %u for set-head redo",
+							   slot_offset, segment_id)));
 	}
-	if (slot.status != TT_SLOT_ABORTED || slot.xid != xid ||
-		slot.wrap != wrap)
-	{
+	if (slot.status != TT_SLOT_ABORTED || slot.xid != xid || slot.wrap != wrap) {
 		cluster_tt_durable_io_wait_end();
 		cluster_vis_bump_recovery_undo_redo_skips();
 		return;
 	}
 	slot.first_undo_block = first_undo_block;
-	if (!cluster_undo_smgr_write_header_bytes(
-			cluster_undo_intent_for_owner(instance), segment_id, instance, off,
-			(const char *) &slot, sizeof(slot)) ||
-		!cluster_undo_smgr_fsync_segment_file(segment_id, instance))
-	{
+	if (!cluster_undo_smgr_write_header_bytes(cluster_undo_intent_for_owner(instance), segment_id,
+											  instance, off, (const char *)&slot, sizeof(slot))
+		|| !cluster_undo_smgr_fsync_segment_file(segment_id, instance)) {
 		cluster_tt_durable_io_wait_end();
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("cannot durably write TT slot %u of undo segment %u for set-head redo",
-					 slot_offset, segment_id)));
+						slot_offset, segment_id)));
 	}
 	cluster_tt_durable_io_wait_end();
 	cluster_vis_bump_recovery_undo_redo_applies();
@@ -2112,48 +1959,45 @@ cluster_tt_slot_durable_resolve_by_xid_origin(int origin_node, TransactionId xid
 }
 
 ClusterTTDurableLocate
-cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node,
-	TransactionId xid, uint16 *out_seg, uint16 *out_slot,
-	uint16 *out_wrap, uint8 *out_status)
+cluster_tt_slot_durable_locate_any_by_xid_origin(int origin_node, TransactionId xid,
+												 uint16 *out_seg, uint16 *out_slot,
+												 uint16 *out_wrap, uint8 *out_status)
 {
-	uint8		owner;
-	uint32		seg_lo;
-	uint32		seg_hi;
-	uint32		segment_id;
+	uint8 owner;
+	uint32 seg_lo;
+	uint32 seg_hi;
+	uint32 segment_id;
 	PGAlignedBlock blockbuf;
-	uint32		matches = 0;
-	bool		scan_complete = true;
-	uint16		matched_seg = 0;
-	uint16		matched_slot = 0;
-	uint16		matched_wrap = 0;
-	uint8		matched_status = TT_SLOT_INVALID;
+	uint32 matches = 0;
+	bool scan_complete = true;
+	uint16 matched_seg = 0;
+	uint16 matched_slot = 0;
+	uint16 matched_wrap = 0;
+	uint8 matched_status = TT_SLOT_INVALID;
 
 	if (origin_node < 0 || !TransactionIdIsNormal(xid))
 		return CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
-	owner = (uint8) (origin_node + 1);
-	seg_lo = (uint32) origin_node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+	owner = (uint8)(origin_node + 1);
+	seg_lo = (uint32)origin_node * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
 	seg_hi = seg_lo + CLUSTER_UNDO_SEGS_PER_INSTANCE - 1;
 	cluster_tt_durable_count_by_xid_scan();
 	cluster_tt_durable_io_wait_start();
-	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++)
-	{
+	for (segment_id = seg_lo; segment_id <= seg_hi; segment_id++) {
 		const UndoSegmentHeaderData *header;
 		uint16 i;
 
 		if (!durable_scan_read_header(owner, segment_id, blockbuf.data, &scan_complete))
 			continue;
-		header = (const UndoSegmentHeaderData *) blockbuf.data;
-		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++)
-		{
+		header = (const UndoSegmentHeaderData *)blockbuf.data;
+		for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 			const TTSlot *slot = &header->tt_slots[i];
 
-			if (slot->xid != xid ||
-				(slot->status != TT_SLOT_ACTIVE &&
-				 slot->status != TT_SLOT_COMMITTED &&
-				 slot->status != TT_SLOT_ABORTED))
+			if (slot->xid != xid
+				|| (slot->status != TT_SLOT_ACTIVE && slot->status != TT_SLOT_COMMITTED
+					&& slot->status != TT_SLOT_ABORTED))
 				continue;
 			matches++;
-			matched_seg = (uint16) segment_id;
+			matched_seg = (uint16)segment_id;
 			matched_slot = i;
 			matched_wrap = slot->wrap;
 			matched_status = slot->status;

@@ -627,9 +627,8 @@ cluster_node_remove_request(int32 node_id)
 	int32 cur_target;
 
 	CLUSTER_INJECTION_POINT("cluster-node-remove-request");
-	if (!cluster_node_remove_startup_serving_allows(
-			cluster_authority_readiness_managed(),
-			cluster_serving_ready_is_current()))
+	if (!cluster_node_remove_startup_serving_allows(cluster_authority_readiness_managed(),
+													cluster_serving_ready_is_current()))
 		return CLUSTER_REMOVE_REQ_NOT_SERVING;
 
 	feature = cluster_online_node_removal;
@@ -1017,9 +1016,8 @@ cluster_node_remove_lmon_tick(void)
 
 	if (nr_state == NULL || !cluster_enabled || !cluster_online_node_removal)
 		return;
-	if (!cluster_node_remove_startup_serving_allows(
-			cluster_authority_readiness_managed(),
-			cluster_serving_ready_is_current()))
+	if (!cluster_node_remove_startup_serving_allows(cluster_authority_readiness_managed(),
+													cluster_serving_ready_is_current()))
 		return;
 	if (!cluster_qvotec_in_quorum())
 		return; /* only an in-quorum survivor participates */

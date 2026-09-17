@@ -50,8 +50,7 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 }
 
 void
-errfinish(const char *filename pg_attribute_unused(),
-		  int lineno pg_attribute_unused(),
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
 {}
 
@@ -59,14 +58,14 @@ errfinish(const char *filename pg_attribute_unused(),
 
 static int failures = 0;
 
-#define EXPECT_TRUE(cond, msg) \
-	do { \
-		if (!(cond)) { \
-			fprintf(stderr, "FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__); \
-			failures++; \
-		} else { \
-			printf("ok: %s\n", msg); \
-		} \
+#define EXPECT_TRUE(cond, msg)                                                                     \
+	do {                                                                                           \
+		if (!(cond)) {                                                                             \
+			fprintf(stderr, "FAIL: %s (%s:%d)\n", msg, __FILE__, __LINE__);                        \
+			failures++;                                                                            \
+		} else {                                                                                   \
+			printf("ok: %s\n", msg);                                                               \
+		}                                                                                          \
 	} while (0)
 
 static void
@@ -74,9 +73,9 @@ test_roundtrip(void)
 {
 	ClusterFormationCommitMarker m;
 	ClusterFormationCommitMarker out;
-	uint64		inc_by_node[CLUSTER_MAX_NODES];
-	uint64		out_inc[CLUSTER_MAX_NODES];
-	uint8		slot[CLUSTER_VOTING_SLOT_BYTES];
+	uint64 inc_by_node[CLUSTER_MAX_NODES];
+	uint64 out_inc[CLUSTER_MAX_NODES];
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
 
 	memset(&m, 0, sizeof(m));
 	m.magic = CLUSTER_FORMATION_MARKER_MAGIC;
@@ -87,7 +86,7 @@ test_roundtrip(void)
 	m.arbiter_node = 0;
 	m.arbiter_incarnation = 1001;
 	m.commit_nonce = 0xdeadbeef;
-	m.admitted_nodes[0] = 0x03;	/* members 0 and 1 */
+	m.admitted_nodes[0] = 0x03; /* members 0 and 1 */
 	m.n_admitted = 2;
 	cluster_formation_marker_compute_crc(&m);
 
@@ -95,29 +94,23 @@ test_roundtrip(void)
 	inc_by_node[0] = 1001;
 	inc_by_node[1] = 2002;
 
-	EXPECT_TRUE(cluster_formation_marker_encode(&m, inc_by_node, slot),
-				"encode two-member marker");
+	EXPECT_TRUE(cluster_formation_marker_encode(&m, inc_by_node, slot), "encode two-member marker");
 	memset(&out, 0, sizeof(out));
 	memset(out_inc, 0, sizeof(out_inc));
-	EXPECT_TRUE(cluster_formation_marker_decode(slot, &out, out_inc),
-				"decode round-trip");
-	EXPECT_TRUE(out.formation_generation == 1
-				&& out.formation_epoch == 7
-				&& out.arbiter_node == 0
-				&& out.arbiter_incarnation == 1001
-				&& out.commit_nonce == 0xdeadbeef
-				&& out.n_admitted == 2,
+	EXPECT_TRUE(cluster_formation_marker_decode(slot, &out, out_inc), "decode round-trip");
+	EXPECT_TRUE(out.formation_generation == 1 && out.formation_epoch == 7 && out.arbiter_node == 0
+					&& out.arbiter_incarnation == 1001 && out.commit_nonce == 0xdeadbeef
+					&& out.n_admitted == 2,
 				"decoded header fields match");
-	EXPECT_TRUE(out_inc[0] == 1001 && out_inc[1] == 2002,
-				"decoded incarnation table matches");
+	EXPECT_TRUE(out_inc[0] == 1001 && out_inc[1] == 2002, "decoded incarnation table matches");
 }
 
 static void
 test_wire_crc_covers_table(void)
 {
 	ClusterFormationCommitMarker m;
-	uint64		inc_by_node[CLUSTER_MAX_NODES];
-	uint8		slot[CLUSTER_VOTING_SLOT_BYTES];
+	uint64 inc_by_node[CLUSTER_MAX_NODES];
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
 
 	memset(&m, 0, sizeof(m));
 	m.magic = CLUSTER_FORMATION_MARKER_MAGIC;
@@ -133,15 +126,14 @@ test_wire_crc_covers_table(void)
 	memset(inc_by_node, 0, sizeof(inc_by_node));
 	inc_by_node[0] = 55;
 	inc_by_node[1] = 66;
-	EXPECT_TRUE(cluster_formation_marker_encode(&m, inc_by_node, slot),
-				"encode for tamper test");
+	EXPECT_TRUE(cluster_formation_marker_encode(&m, inc_by_node, slot), "encode for tamper test");
 
 	/* Flip one byte INSIDE the compact table (entry 1's incarnation at
 	 * 72 + 9 = 81).  A CRC that covers the table must reject it. */
 	slot[81] ^= 0xFF;
 	{
 		ClusterFormationCommitMarker out;
-		uint64		out_inc[CLUSTER_MAX_NODES];
+		uint64 out_inc[CLUSTER_MAX_NODES];
 
 		EXPECT_TRUE(!cluster_formation_marker_decode(slot, &out, out_inc),
 					"table tamper rejected by wire CRC");
@@ -152,8 +144,8 @@ static void
 test_capacity_clamp(void)
 {
 	ClusterFormationCommitMarker m;
-	uint64		inc_by_node[CLUSTER_MAX_NODES];
-	uint8		slot[CLUSTER_VOTING_SLOT_BYTES];
+	uint64 inc_by_node[CLUSTER_MAX_NODES];
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
 
 	memset(&m, 0, sizeof(m));
 	m.magic = CLUSTER_FORMATION_MARKER_MAGIC;
@@ -167,7 +159,7 @@ test_capacity_clamp(void)
 	/* member index beyond MAX_MEMBERS (48) — the 128-bit bitmap allows it
 	 * but the compact table cannot hold it: must be rejected. */
 	m.admitted_nodes[CLUSTER_FORMATION_MARKER_MAX_MEMBERS / 8]
-		= (uint8) (1u << (CLUSTER_FORMATION_MARKER_MAX_MEMBERS % 8));
+		= (uint8)(1u << (CLUSTER_FORMATION_MARKER_MAX_MEMBERS % 8));
 	m.n_admitted = 1;
 	memset(inc_by_node, 0, sizeof(inc_by_node));
 	inc_by_node[CLUSTER_FORMATION_MARKER_MAX_MEMBERS] = 9;
@@ -179,8 +171,8 @@ static void
 test_corrupt_n_admitted_oob(void)
 {
 	ClusterFormationCommitMarker m;
-	uint64		inc_by_node[CLUSTER_MAX_NODES];
-	uint8		slot[CLUSTER_VOTING_SLOT_BYTES];
+	uint64 inc_by_node[CLUSTER_MAX_NODES];
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
 
 	memset(&m, 0, sizeof(m));
 	m.magic = CLUSTER_FORMATION_MARKER_MAGIC;
@@ -204,7 +196,7 @@ test_corrupt_n_admitted_oob(void)
 	slot[65] = 0xFF;
 	{
 		ClusterFormationCommitMarker out;
-		uint64		out_inc[CLUSTER_MAX_NODES];
+		uint64 out_inc[CLUSTER_MAX_NODES];
 
 		EXPECT_TRUE(!cluster_formation_marker_decode(slot, &out, out_inc),
 					"corrupt n_admitted rejected");
@@ -215,8 +207,8 @@ static void
 test_zero_members_rejected(void)
 {
 	ClusterFormationCommitMarker m;
-	uint64		inc_by_node[CLUSTER_MAX_NODES];
-	uint8		slot[CLUSTER_VOTING_SLOT_BYTES];
+	uint64 inc_by_node[CLUSTER_MAX_NODES];
+	uint8 slot[CLUSTER_VOTING_SLOT_BYTES];
 
 	memset(&m, 0, sizeof(m));
 	m.magic = CLUSTER_FORMATION_MARKER_MAGIC;
@@ -227,7 +219,7 @@ test_zero_members_rejected(void)
 	m.arbiter_node = 0;
 	m.arbiter_incarnation = 1;
 	m.commit_nonce = 3;
-	m.n_admitted = 0;			/* no members — structural violation */
+	m.n_admitted = 0; /* no members — structural violation */
 	memset(inc_by_node, 0, sizeof(inc_by_node));
 	EXPECT_TRUE(!cluster_formation_marker_encode(&m, inc_by_node, slot),
 				"zero-member marker rejected");

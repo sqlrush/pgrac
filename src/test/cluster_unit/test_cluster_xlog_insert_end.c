@@ -52,16 +52,14 @@ extern void cluster_xlog_unit_set_insert_bytepos(uint64 bytepos);
 static uint64
 usable_bytes_in_segment(void)
 {
-	return ((uint64)wal_segment_size / XLOG_BLCKSZ) *
-			   (XLOG_BLCKSZ - SizeOfXLogShortPHD) -
-		   (SizeOfXLogLongPHD - SizeOfXLogShortPHD);
+	return ((uint64)wal_segment_size / XLOG_BLCKSZ) * (XLOG_BLCKSZ - SizeOfXLogShortPHD)
+		   - (SizeOfXLogLongPHD - SizeOfXLogShortPHD);
 }
 
 static uint64
 second_internal_page_end_bytepos(void)
 {
-	return (XLOG_BLCKSZ - SizeOfXLogLongPHD) +
-		   (XLOG_BLCKSZ - SizeOfXLogShortPHD);
+	return (XLOG_BLCKSZ - SizeOfXLogLongPHD) + (XLOG_BLCKSZ - SizeOfXLogShortPHD);
 }
 
 UT_TEST(test_internal_page_boundary_returns_record_end_not_next_start)
@@ -83,8 +81,7 @@ UT_TEST(test_segment_boundary_returns_boundary_not_long_header_start)
 	UT_ASSERT_NE(GetXLogInsertEndRecPtr(), boundary + SizeOfXLogLongPHD);
 }
 
-typedef struct InsertEndRace
-{
+typedef struct InsertEndRace {
 	uint64 bytepos_a;
 	uint64 bytepos_b;
 	XLogRecPtr expected_a;
@@ -139,8 +136,7 @@ UT_TEST(test_concurrent_reservation_sample_is_one_record_end)
 	pg_atomic_write_u32(&race.start, 1);
 	while (pg_atomic_read_u32(&race.published) == 0)
 		;
-	while (pg_atomic_read_u32(&race.stop) == 0)
-	{
+	while (pg_atomic_read_u32(&race.stop) == 0) {
 		XLogRecPtr sample = GetXLogInsertEndRecPtr();
 
 		samples++;
@@ -171,8 +167,7 @@ read_bufmgr_source(void)
 	UT_ASSERT_EQ(fseek(file, 0, SEEK_SET), 0);
 	source = malloc((size_t)length + 1);
 	UT_ASSERT_NOT_NULL(source);
-	if (source == NULL)
-	{
+	if (source == NULL) {
 		fclose(file);
 		return NULL;
 	}
@@ -194,8 +189,7 @@ UT_TEST(test_ship_flush_ceiling_uses_record_end_accessor)
 	UT_ASSERT_NOT_NULL(begin);
 	end = begin != NULL ? strstr(begin, "\n}\n") : NULL;
 	UT_ASSERT_NOT_NULL(end);
-	if (begin != NULL && end != NULL)
-	{
+	if (begin != NULL && end != NULL) {
 		const char *record_end = strstr(begin, "GetXLogInsertEndRecPtr()");
 		const char *next_start = strstr(begin, "GetXLogInsertRecPtr()");
 

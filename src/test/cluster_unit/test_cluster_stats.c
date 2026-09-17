@@ -393,8 +393,7 @@ cluster_wal_state_read_slot(uint16 thread_id, ClusterWalStateSlot *slot_out)
 }
 
 ClusterWalStateUpdateResult
-cluster_wal_state_update_own(const ClusterWalStateUpdate *update,
-							 ClusterWalStateCfMode cf_mode,
+cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStateCfMode cf_mode,
 							 ClusterWalStateSlot *published_slot pg_attribute_unused())
 {
 	UT_ASSERT_EQ((int)cf_mode, (int)CLUSTER_WAL_STATE_CF_ACQUIRE_X);
@@ -523,8 +522,7 @@ UT_TEST(test_rf_a1_initial_stats_owns_active_checkpoint_then_telemetry)
 	UT_ASSERT_EQ(stats_test_self_check_calls, 1);
 	UT_ASSERT_EQ(stats_test_active_calls, 1);
 	UT_ASSERT_EQ((int)stats_test_active_status, (int)CLUSTER_STATS_SPAWNING);
-	UT_ASSERT_EQ((int)stats_test_active_update.kind,
-				 (int)CLUSTER_WAL_STATE_UPDATE_ACTIVE);
+	UT_ASSERT_EQ((int)stats_test_active_update.kind, (int)CLUSTER_WAL_STATE_UPDATE_ACTIVE);
 	UT_ASSERT_EQ((int)stats_test_active_update.tli, 7);
 	UT_ASSERT_EQ((uint64)stats_test_active_update.highest_lsn, (uint64)300);
 	UT_ASSERT_EQ((uint64)stats_test_active_update.highest_scn, (uint64)400);
@@ -534,8 +532,7 @@ UT_TEST(test_rf_a1_initial_stats_owns_active_checkpoint_then_telemetry)
 				 CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE | CHECKPOINT_WAIT);
 	UT_ASSERT_EQ(stats_test_telemetry_calls, 1);
 	UT_ASSERT_EQ((int)stats_test_telemetry_status, (int)CLUSTER_STATS_READY);
-	UT_ASSERT_EQ((int)stats_test_telemetry_update.kind,
-				 (int)CLUSTER_WAL_STATE_UPDATE_TELEMETRY);
+	UT_ASSERT_EQ((int)stats_test_telemetry_update.kind, (int)CLUSTER_WAL_STATE_UPDATE_TELEMETRY);
 	UT_ASSERT_EQ((int)stats_test_telemetry_update.tli, 7);
 	UT_ASSERT_EQ((int64)stats_test_telemetry_update.started_at, (int64)0);
 	UT_ASSERT_EQ((uint64)stats_test_telemetry_update.highest_lsn, (uint64)300);

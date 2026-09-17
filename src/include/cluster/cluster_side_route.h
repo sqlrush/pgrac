@@ -50,30 +50,27 @@
  * everything without an exact route is BLOCKED (the matrix's
  * "unknown/failure direction" is always BLOCKED).
  */
-typedef enum ClusterSideRouteKind
-{
+typedef enum ClusterSideRouteKind {
 	CLUSTER_SIDE_ROUTE_PAGE = 0,	/* RF-PAGE owns the mutation */
-	CLUSTER_SIDE_ROUTE_TT_UNDO,	 /* transaction/undo truth primitive */
-	CLUSTER_SIDE_ROUTE_PROJECTION, /* CLOG/MULTIXACT/COMMIT_TS projection */
-	CLUSTER_SIDE_ROUTE_STORAGE,	 /* canonical storage lifecycle */
+	CLUSTER_SIDE_ROUTE_TT_UNDO,		/* transaction/undo truth primitive */
+	CLUSTER_SIDE_ROUTE_PROJECTION,	/* CLOG/MULTIXACT/COMMIT_TS projection */
+	CLUSTER_SIDE_ROUTE_STORAGE,		/* canonical storage lifecycle */
 	CLUSTER_SIDE_ROUTE_PROVED_NOOP, /* positive no-mutation proof */
-	CLUSTER_SIDE_ROUTE_BLOCKED	 /* mutation=0, resource never released */
+	CLUSTER_SIDE_ROUTE_BLOCKED		/* mutation=0, resource never released */
 } ClusterSideRouteKind;
 
-typedef struct ClusterSideRouteRow
-{
-	uint8		rmid;
-	uint16		opcode;			/* 0 with opcode_mask==0 = whole rmgr */
-	uint16		opcode_mask;	/* 0 = exact opcode match */
+typedef struct ClusterSideRouteRow {
+	uint8 rmid;
+	uint16 opcode;		/* 0 with opcode_mask==0 = whole rmgr */
+	uint16 opcode_mask; /* 0 = exact opcode match */
 	ClusterSideRouteKind kind;
-	const char *noop_reason;	/* PROVED_NOOP proof kind (else NULL) */
+	const char *noop_reason; /* PROVED_NOOP proof kind (else NULL) */
 } ClusterSideRouteRow;
 
 /*
  * §2.1 verdicts.
  */
-typedef enum ClusterSideRouteVerdict
-{
+typedef enum ClusterSideRouteVerdict {
 	CLUSTER_SIDE_ROUTE_VERDICT_APPLY = 0,
 	CLUSTER_SIDE_ROUTE_VERDICT_PROVED_NOOP,
 	CLUSTER_SIDE_ROUTE_VERDICT_BLOCKED
@@ -83,15 +80,13 @@ typedef enum ClusterSideRouteVerdict
  * Total-registry lookup: exactly one row per (rmid, opcode), or false
  * for an unknown rmgr/opcode (the caller must treat it as BLOCKED).
  */
-extern bool cluster_side_route_lookup(uint8 rmid, uint16 opcode,
-									  ClusterSideRouteRow *out);
+extern bool cluster_side_route_lookup(uint8 rmid, uint16 opcode, ClusterSideRouteRow *out);
 
 /*
  * §2.1 verdict — pure function of the row (cold/online identical,
  * U-SIDE-02).  A PROVED_NOOP row carries its proof kind; anything
  * without a positive no-mutation proof is BLOCKED.
  */
-extern ClusterSideRouteVerdict cluster_side_route_verdict(
-	const ClusterSideRouteRow *row);
+extern ClusterSideRouteVerdict cluster_side_route_verdict(const ClusterSideRouteRow *row);
 
-#endif							/* CLUSTER_SIDE_ROUTE_H */
+#endif /* CLUSTER_SIDE_ROUTE_H */

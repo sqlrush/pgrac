@@ -288,16 +288,13 @@ typedef struct ClusterWalReuseGuardRequest {
 	const ClusterFormationWitnessV1 *formation;
 } ClusterWalReuseGuardRequest;
 
-StaticAssertDecl(sizeof(ClusterWalFileIdentity) == 16,
-				 "ClusterWalFileIdentity must be 16 bytes");
+StaticAssertDecl(sizeof(ClusterWalFileIdentity) == 16, "ClusterWalFileIdentity must be 16 bytes");
 StaticAssertDecl(offsetof(ClusterWalFileIdentity, thread_id) == 0,
 				 "ClusterWalFileIdentity thread offset");
-StaticAssertDecl(offsetof(ClusterWalFileIdentity, kind) == 2,
-				 "ClusterWalFileIdentity kind offset");
+StaticAssertDecl(offsetof(ClusterWalFileIdentity, kind) == 2, "ClusterWalFileIdentity kind offset");
 StaticAssertDecl(offsetof(ClusterWalFileIdentity, reserved_zero) == 3,
 				 "ClusterWalFileIdentity reserved offset");
-StaticAssertDecl(offsetof(ClusterWalFileIdentity, tli) == 4,
-				 "ClusterWalFileIdentity TLI offset");
+StaticAssertDecl(offsetof(ClusterWalFileIdentity, tli) == 4, "ClusterWalFileIdentity TLI offset");
 StaticAssertDecl(offsetof(ClusterWalFileIdentity, segno) == 8,
 				 "ClusterWalFileIdentity segment offset");
 StaticAssertDecl(sizeof(ClusterWalRetentionInterval) == 24,
@@ -311,131 +308,124 @@ StaticAssertDecl(offsetof(ClusterWalRetentionInterval, start_lsn) == 8,
 StaticAssertDecl(offsetof(ClusterWalRetentionInterval, end_lsn) == 16,
 				 "ClusterWalRetentionInterval end offset");
 
-extern bool cluster_wal_thread_directory_parse(const char *basename,
-											 uint16 *out_thread_id);
-extern bool cluster_wal_file_identity_parse(const char *basename,
-										 uint16 thread_id, int wal_segsz_bytes,
-										 ClusterWalFileIdentity *out_identity);
+extern bool cluster_wal_thread_directory_parse(const char *basename, uint16 *out_thread_id);
+extern bool cluster_wal_file_identity_parse(const char *basename, uint16 thread_id,
+											int wal_segsz_bytes,
+											ClusterWalFileIdentity *out_identity);
 extern bool cluster_wal_file_identity_valid(const ClusterWalFileIdentity *identity,
-										 int wal_segsz_bytes);
-extern bool cluster_wal_file_long_header_matches(
-	const ClusterWalFileIdentity *identity, const XLogLongPageHeaderData *header,
-	uint64 system_identifier, int wal_segsz_bytes);
-extern bool cluster_wal_retention_interval_segment_bounds(
-	const ClusterWalRetentionInterval *interval, int wal_segsz_bytes,
-	XLogSegNo *out_first, XLogSegNo *out_last);
-extern bool cluster_wal_retention_interval_intersects_file(
-	const ClusterWalRetentionInterval *interval,
-	const ClusterWalFileIdentity *identity, int wal_segsz_bytes);
-extern bool cluster_wal_retention_resid_encode(uint16 thread_id,
-										ClusterResId *out_resid);
-extern ClusterWalPinResult cluster_wal_retention_pin_acquire(
-	const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
-	ClusterWalRetentionPin **out_pin);
-extern ClusterWalPinResult cluster_wal_retention_pin_bind_one(
-	ClusterWalRetentionPin *pin, ClusterRecoverySerialGuard *held_serial);
-extern ClusterWalPinResult cluster_wal_retention_pin_bind_set(
-	ClusterWalRetentionPin *pin, ClusterRecoverySerialGuardSet *held_set);
+											int wal_segsz_bytes);
+extern bool cluster_wal_file_long_header_matches(const ClusterWalFileIdentity *identity,
+												 const XLogLongPageHeaderData *header,
+												 uint64 system_identifier, int wal_segsz_bytes);
+extern bool
+cluster_wal_retention_interval_segment_bounds(const ClusterWalRetentionInterval *interval,
+											  int wal_segsz_bytes, XLogSegNo *out_first,
+											  XLogSegNo *out_last);
+extern bool
+cluster_wal_retention_interval_intersects_file(const ClusterWalRetentionInterval *interval,
+											   const ClusterWalFileIdentity *identity,
+											   int wal_segsz_bytes);
+extern bool cluster_wal_retention_resid_encode(uint16 thread_id, ClusterResId *out_resid);
 extern ClusterWalPinResult
-cluster_wal_retention_pin_preflight_revalidate_wait_v1(
-	ClusterWalRetentionPin *pin);
-extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(
-	ClusterWalRetentionPin *pin);
-extern ClusterWalPinResult cluster_wal_retention_pin_seal_for_root_publish(
-	ClusterWalRetentionPin *pin);
+cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
+								  uint16 nthreads, ClusterWalRetentionPin **out_pin);
+extern ClusterWalPinResult
+cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
+								   ClusterRecoverySerialGuard *held_serial);
+extern ClusterWalPinResult
+cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
+								   ClusterRecoverySerialGuardSet *held_set);
+extern ClusterWalPinResult
+cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *pin);
+extern ClusterWalPinResult cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin);
+extern ClusterWalPinResult
+cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin);
 extern ClusterWalPinResult cluster_wal_retention_pin_adopt_root_readback_v1(
-	ClusterWalRetentionPin *pin,
-	const ClusterControlRootSnapshot *expected_snapshot,
+	ClusterWalRetentionPin *pin, const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,
 	const ClusterControlRootSnapshot *observed_snapshot,
 	const ClusterControlRootReadToken *observed_token);
-extern ClusterWalrReleaseResult cluster_wal_retention_pin_release(
-	ClusterWalRetentionPin **pin);
-extern ClusterWalPinResult cluster_wal_retention_root_publish_begin_exact(
-	const ClusterControlRootReadToken *expected_root, bool require_sealed_pin,
-	ClusterWalRootPublishGuard **out_guard);
-extern ClusterWalrReleaseResult cluster_wal_retention_root_publish_end(
-	ClusterWalRootPublishGuard **guard);
-extern ClusterWalReuseGuardResult cluster_wal_retention_e1_coarse_begin(
-	ClusterWalRetentionE1Context *context, uint16 thread_id,
-	ClusterWalRootFoldResult *out_fold_result, XLogSegNo *out_floor_segno,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalrReleaseResult cluster_wal_retention_e1_coarse_release(
-	ClusterWalRetentionE1Context *context,
-	ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalrReleaseResult cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin);
+extern ClusterWalPinResult
+cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
+											   bool require_sealed_pin,
+											   ClusterWalRootPublishGuard **out_guard);
+extern ClusterWalrReleaseResult
+cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard);
+extern ClusterWalReuseGuardResult
+cluster_wal_retention_e1_coarse_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
+									  ClusterWalRootFoldResult *out_fold_result,
+									  XLogSegNo *out_floor_segno,
+									  ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalrReleaseResult
+cluster_wal_retention_e1_coarse_release(ClusterWalRetentionE1Context *context,
+										ClusterWalReuseDenyReason *out_reason);
 extern ClusterWalReuseGuardResult cluster_wal_retention_e1_preflight(
-	ClusterWalRetentionE1Context *context,
-	const ClusterWalFileIdentity *file, ClusterWalReuseActionGuard *guard,
-	PgracExternalFenceNeedSetV1 **out_needs,
+	ClusterWalRetentionE1Context *context, const ClusterWalFileIdentity *file,
+	ClusterWalReuseActionGuard *guard, PgracExternalFenceNeedSetV1 **out_needs,
 	ClusterWalReuseDenyReason *out_reason);
 extern bool cluster_wal_retention_active_pin_present(void);
-extern ClusterWalReuseGuardResult cluster_wal_retention_action_begin(
-	ClusterWalRetentionE1Context *context, uint16 thread_id,
-	ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_retention_action_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
+								   ClusterWalReuseDenyReason *out_reason);
 extern ClusterWalReuseGuardResult cluster_wal_retention_action_preflight(
-	ClusterWalRetentionE1Context *context,
-	const ClusterWalFileIdentity *file, ClusterWalReuseEntry entry,
-	ClusterWalReuseActionGuard *guard,
-	PgracExternalFenceNeedSetV1 **out_needs,
-	ClusterWalReuseDenyReason *out_reason);
-extern void cluster_wal_retention_action_finish(
-	ClusterWalRetentionE1Context *context);
+	ClusterWalRetentionE1Context *context, const ClusterWalFileIdentity *file,
+	ClusterWalReuseEntry entry, ClusterWalReuseActionGuard *guard,
+	PgracExternalFenceNeedSetV1 **out_needs, ClusterWalReuseDenyReason *out_reason);
+extern void cluster_wal_retention_action_finish(ClusterWalRetentionE1Context *context);
 extern ClusterWalReuseGuardResult cluster_wal_retention_e1_fence_wait(
 	ClusterWalRetentionE1Context *context, ClusterWalReuseActionGuard *guard,
-	PgracExternalFenceNeedSetV1 *needs,
-	PgracExternalFenceAdmissionSetV1 **out_admissions,
+	PgracExternalFenceNeedSetV1 *needs, PgracExternalFenceAdmissionSetV1 **out_admissions,
 	ClusterWalReuseDenyReason *out_reason);
-extern void cluster_wal_retention_e1_finish(
-	ClusterWalRetentionE1Context *context);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_init(
-	ClusterWalReuseActionGuard *guard, ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_preflight(
-	ClusterWalReuseActionGuard *guard,
-	const ClusterWalReuseGuardRequest *request,
-	PgracExternalFenceNeedSetV1 **out_needs,
-	ClusterWalReuseDenyReason *out_reason);
+extern void cluster_wal_retention_e1_finish(ClusterWalRetentionE1Context *context);
 extern ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_preflight_active_recovery(
-	ClusterWalReuseActionGuard *guard,
-	const ClusterWalFileIdentity *file, ClusterWalReuseEntry entry,
-	ClusterRecoverySerialGuard **out_serial,
-	ClusterWalRetentionPin **out_pin,
-	ClusterWalReuseDenyReason *out_reason);
+cluster_wal_reuse_guard_init(ClusterWalReuseActionGuard *guard,
+							 ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_preflight(
+	ClusterWalReuseActionGuard *guard, const ClusterWalReuseGuardRequest *request,
+	PgracExternalFenceNeedSetV1 **out_needs, ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_preflight_active_recovery(
+	ClusterWalReuseActionGuard *guard, const ClusterWalFileIdentity *file,
+	ClusterWalReuseEntry entry, ClusterRecoverySerialGuard **out_serial,
+	ClusterWalRetentionPin **out_pin, ClusterWalReuseDenyReason *out_reason);
 extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_fence_admitted_nowait(
-	ClusterWalReuseActionGuard *guard,
-	const PgracExternalFenceAdmissionSetV1 *admissions_or_null,
+	ClusterWalReuseActionGuard *guard, const PgracExternalFenceAdmissionSetV1 *admissions_or_null,
 	ClusterWalReuseDenyReason *out_reason);
 extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_arm(
-	ClusterWalReuseActionGuard *guard,
-	ClusterRecoverySerialGuard *held_serial_or_null,
-	ClusterWalRetentionPin *held_pin_or_null,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_l3_begin(
-	ClusterWalReuseActionGuard *guard, ClusterWalReusePhysicalAction physical,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_note_zero_mutation(
-	ClusterWalReuseActionGuard *guard, ClusterWalReusePhysicalAction physical,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_confirm_zero_mutation(
-	ClusterWalReuseActionGuard *guard, ClusterWalReusePhysicalAction physical,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_terminal_durable(
-	ClusterWalReuseActionGuard *guard, ClusterWalTerminalOutcome outcome,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_remove(
-	ClusterWalReuseActionGuard *guard,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_recycle(
-	ClusterWalReuseActionGuard *guard,
-	const ClusterWalFileIdentity *destination,
-	ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalReuseGuardResult cluster_wal_reuse_guard_bookkeep(
-	ClusterWalReuseActionGuard *guard, ClusterWalReuseDenyReason *out_reason);
-extern ClusterWalrReleaseResult cluster_wal_reuse_guard_finish(
-	ClusterWalReuseActionGuard *guard, ClusterWalTerminalOutcome *out_outcome,
-	ClusterWalReuseDenyReason *out_reason);
-extern bool cluster_wal_retention_fold_validated_roots(
-	const ClusterWalRootFoldInput *inputs, uint16 nslots, int wal_segsz_bytes,
-	ClusterWalRootFold *out_fold);
+	ClusterWalReuseActionGuard *guard, ClusterRecoverySerialGuard *held_serial_or_null,
+	ClusterWalRetentionPin *held_pin_or_null, ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_reuse_guard_l3_begin(ClusterWalReuseActionGuard *guard,
+								 ClusterWalReusePhysicalAction physical,
+								 ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_reuse_guard_note_zero_mutation(ClusterWalReuseActionGuard *guard,
+										   ClusterWalReusePhysicalAction physical,
+										   ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_reuse_guard_confirm_zero_mutation(ClusterWalReuseActionGuard *guard,
+											  ClusterWalReusePhysicalAction physical,
+											  ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_reuse_guard_terminal_durable(ClusterWalReuseActionGuard *guard,
+										 ClusterWalTerminalOutcome outcome,
+										 ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_reuse_guard_remove(ClusterWalReuseActionGuard *guard,
+							   ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_reuse_guard_recycle(ClusterWalReuseActionGuard *guard,
+								const ClusterWalFileIdentity *destination,
+								ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalReuseGuardResult
+cluster_wal_reuse_guard_bookkeep(ClusterWalReuseActionGuard *guard,
+								 ClusterWalReuseDenyReason *out_reason);
+extern ClusterWalrReleaseResult
+cluster_wal_reuse_guard_finish(ClusterWalReuseActionGuard *guard,
+							   ClusterWalTerminalOutcome *out_outcome,
+							   ClusterWalReuseDenyReason *out_reason);
+extern bool cluster_wal_retention_fold_validated_roots(const ClusterWalRootFoldInput *inputs,
+													   uint16 nslots, int wal_segsz_bytes,
+													   ClusterWalRootFold *out_fold);
 
 #endif /* CLUSTER_WAL_RETENTION_H */

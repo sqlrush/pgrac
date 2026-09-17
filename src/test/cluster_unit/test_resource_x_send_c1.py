@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import importlib.util
 import pathlib
+import os
+import shlex
+import subprocess
 import tempfile
 import unittest
 
@@ -226,6 +229,62 @@ class SendC1GateTests(unittest.TestCase):
                 )
             },
         )
+
+    def test_mutation_compiles_with_separate_source_and_build_roots(self) -> None:
+        compiler = os.environ.get("CC", "cc")
+        recipes = {
+            "pcm_lock": ("version", "resource_x_identity", "resource_x_node_wire"),
+            "lms_outbound": ("version",),
+            "gcs_block": ("version", "pcm_x_convert", "resource_x_identity",
+                          "resource_x_retry"),
+        }
+        for separate in (True, False):
+            with self.subTest(separate_build=separate):
+                build_root = self.root / "build" if separate else self.root
+                unit_build = build_root / "src/test/cluster_unit"
+                backend_build = build_root / "src/backend/cluster"
+                unit_build.mkdir(parents=True, exist_ok=True)
+                backend_build.mkdir(parents=True, exist_ok=True)
+                empty_source = self.root / "empty.c"
+                empty_source.write_text("/* link-only dependency fixture */\n")
+                empty_object = unit_build / "cluster_unit_port_stubs.o"
+                subprocess.run(shlex.split(compiler) + ["-c", str(empty_source),
+                               "-o", str(empty_object)], check=True, capture_output=True)
+                for library in ("common/libpgcommon_srv.a", "port/libpgport_srv.a"):
+                    archive = build_root / "src" / library
+                    archive.parent.mkdir(parents=True, exist_ok=True)
+                    subprocess.run(["ar", "rcs", str(archive), str(empty_object)],
+                                   check=True, capture_output=True)
+                (self.tests / "unit_test.h").write_text("int producer(void);\n")
+                (unit_build / "generated_fixture.h").write_text("#define EXPECTED 0\n")
+                for module, dependencies in recipes.items():
+                    with self.subTest(module=module):
+                        source_relative = f"src/backend/cluster/cluster_{module}.c"
+                        (self.root / source_relative).write_text(
+                            "static int consumer(void) { return 1; }\n"
+                            "int producer(void) { return consumer(); }\n")
+                        binary_name = f"test_cluster_{module}"
+                        unit_text = '#include "unit_test.h"\n#include "generated_fixture.h"\n'
+                        if module == "gcs_block":
+                            unit_text += '#include GCS_BLOCK_SOURCE_PATH\n'
+                        unit_text += "int main(void) { return producer() != EXPECTED; }\n"
+                        (self.tests / f"{binary_name}.c").write_text(unit_text)
+                        for dependency in dependencies:
+                            (backend_build / f"cluster_{dependency}.o").write_bytes(
+                                empty_object.read_bytes())
+                        row = {
+                            "id": "C1-1", "mutation_edge": ["producer", "consumer"],
+                            "production_sources": {"producer": source_relative},
+                            "mutation_witness": "positive", "mutation_result": "0",
+                            "positive_binary": binary_name,
+                        }
+                        with tempfile.TemporaryDirectory() as temporary:
+                            executable, actual_name, _ = CHECKER._compile_mutation_binary(
+                                row, self.root, unit_build, pathlib.Path(temporary),
+                                compiler, "", "", "", "")
+                            self.assertEqual(actual_name, binary_name)
+                            self.assertEqual(subprocess.run([str(executable)],
+                                             capture_output=True).returncode, 0)
 
 
 if __name__ == "__main__":

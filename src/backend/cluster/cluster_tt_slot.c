@@ -46,10 +46,10 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_clean_leave.h"
-#include "cluster/cluster_guc.h"   /* cluster_undo_retention_horizon_enabled */
-#include "cluster/cluster_mode.h"  /* cluster_peer_mode_enabled */
-#include "cluster/cluster_scn.h"   /* SCN_MAX_VALID_NODE_ID */
-#include "cluster/cluster_shmem.h" /* ClusterShmemRegion */
+#include "cluster/cluster_guc.h"				 /* cluster_undo_retention_horizon_enabled */
+#include "cluster/cluster_mode.h"				 /* cluster_peer_mode_enabled */
+#include "cluster/cluster_scn.h"				 /* SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_shmem.h"				 /* ClusterShmemRegion */
 #include "cluster/cluster_terminal_ref_census.h" /* L11/L12 release sample */
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_undo_retention.h"		/* horizon + recyclable predicate */
@@ -490,8 +490,8 @@ tt_slot_entry_recycle_locked(ClusterTTSlotAllocEntry *e, TransactionId new_owner
  */
 static uint16
 cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_id,
-							 TransactionId top_xid, bool gate_enabled, bool peer_mode,
-							 SCN horizon, bool *out_retained_pressure, uint16 *out_wrap)
+							 TransactionId top_xid, bool gate_enabled, bool peer_mode, SCN horizon,
+							 bool *out_retained_pressure, uint16 *out_wrap)
 {
 	int reusable_idx = -1;
 	int free_idx = -1;
@@ -516,8 +516,7 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
 			/* A local ProcArray horizon cannot authorize destruction of evidence
 			 * still needed by a peer snapshot or current-MX canonical proof. */
 			bool recyclable
-				= (peer_mode
-				   && (e->status == CTS_COMMITTED || e->status == CTS_ABORTED))
+				= (peer_mode && (e->status == CTS_COMMITTED || e->status == CTS_ABORTED))
 					  ? false
 					  : (gate_enabled
 							 ? cluster_tt_slot_recyclable(e->status, e->commit_scn, horizon)
@@ -530,8 +529,7 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
 			}
 
 			if (recyclable) {
-				if (reusable_idx < 0
-					&& !cluster_tt_slot_is_protected(segment_id, (uint16)i))
+				if (reusable_idx < 0 && !cluster_tt_slot_is_protected(segment_id, (uint16)i))
 					reusable_idx = i;
 			} else {
 				retained_pressure = true;
@@ -541,8 +539,7 @@ cluster_tt_slot_alloc_locked(ClusterTTSlotAllocPerSegment *seg, uint32 segment_i
 	}
 
 	if (retain_skip_seen > 0 && ClusterTTSlotShm != NULL)
-		pg_atomic_fetch_add_u64(&ClusterTTSlotShm->tt_slot_retain_skip_count,
-								retain_skip_seen);
+		pg_atomic_fetch_add_u64(&ClusterTTSlotShm->tt_slot_retain_skip_count, retain_skip_seen);
 
 	/* Pass 2: prefer FREE over a retention-eligible recyclable slot. */
 	if (free_idx >= 0) {
@@ -641,8 +638,8 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
 	seg = cluster_tt_slot_get_or_init(segment_id);
 
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
-	result = cluster_tt_slot_alloc_locked(seg, segment_id, top_xid, gate_enabled,
-								 peer_mode, horizon, out_retained_pressure, NULL);
+	result = cluster_tt_slot_alloc_locked(seg, segment_id, top_xid, gate_enabled, peer_mode,
+										  horizon, out_retained_pressure, NULL);
 	LWLockRelease(&seg->lock);
 	return result;
 }
@@ -657,9 +654,9 @@ cluster_tt_slot_alloc_ext(uint32 segment_id, TransactionId top_xid, bool *out_re
  * segment unexpectedly.
  */
 uint16
-cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id,
-								TransactionId top_xid, bool *out_retained_pressure,
-								bool *out_current_drift, uint16 *out_wrap)
+cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id, TransactionId top_xid,
+									bool *out_retained_pressure, bool *out_current_drift,
+									uint16 *out_wrap)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	bool gate_enabled;
@@ -677,11 +674,12 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id,
 	if (ClusterTTSlotShm == NULL)
 		ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
 						errmsg("cluster TT slot allocator shmem not initialised")));
-	if (node_id < 0 || node_id >= CLUSTER_TT_SLOT_MAX_NODES
-		|| expected_segment_id == 0 || expected_segment_id > UINT16_MAX
+	if (node_id < 0 || node_id >= CLUSTER_TT_SLOT_MAX_NODES || expected_segment_id == 0
+		|| expected_segment_id > UINT16_MAX
 		|| cluster_tt_slot_segment_to_node(expected_segment_id) != node_id)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("cluster_tt_slot_alloc_current_exact: invalid node/segment identity")));
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("cluster_tt_slot_alloc_current_exact: invalid node/segment identity")));
 	if (!TransactionIdIsValid(top_xid))
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 						errmsg("cluster_tt_slot_alloc_current_exact: top_xid must be valid")));
@@ -704,9 +702,8 @@ cluster_tt_slot_alloc_current_exact(int node_id, uint32 expected_segment_id,
 		return INVALID_TT_SLOT_OFFSET;
 	}
 
-	result = cluster_tt_slot_alloc_locked(seg, expected_segment_id, top_xid,
-								 gate_enabled, peer_mode, horizon,
-								 out_retained_pressure, out_wrap);
+	result = cluster_tt_slot_alloc_locked(seg, expected_segment_id, top_xid, gate_enabled,
+										  peer_mode, horizon, out_retained_pressure, out_wrap);
 	LWLockRelease(&seg->lock);
 	return result;
 }
@@ -772,8 +769,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 		binding_generation = seg->binding_generation;
 		LWLockRelease(&seg->lock);
 
-		if (candidate.status != CTS_COMMITTED
-			&& candidate.status != CTS_ABORTED)
+		if (candidate.status != CTS_COMMITTED && candidate.status != CTS_ABORTED)
 			continue;
 		if (tt_slot_entry_wrap_retired(&candidate)) {
 			tt_slot_count_wrap_retired();
@@ -786,20 +782,18 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 		 * 8.4D floor is inclusive; ABORTED has no invented SCN horizon. */
 		if (peer_mode) {
 			recyclable = candidate.status == CTS_ABORTED
-				? candidate.commit_scn == InvalidScn
-				: SCN_VALID(candidate.commit_scn)
-				  && SCN_VALID(horizon)
-				  && scn_time_cmp(candidate.commit_scn, horizon) <= 0;
-			terminal_status = candidate.status == CTS_COMMITTED
-				? (uint8)TT_SLOT_COMMITTED : (uint8)TT_SLOT_ABORTED;
+							 ? candidate.commit_scn == InvalidScn
+							 : SCN_VALID(candidate.commit_scn) && SCN_VALID(horizon)
+								   && scn_time_cmp(candidate.commit_scn, horizon) <= 0;
+			terminal_status = candidate.status == CTS_COMMITTED ? (uint8)TT_SLOT_COMMITTED
+																: (uint8)TT_SLOT_ABORTED;
 			if (recyclable)
 				recyclable = cluster_ctrc_terminal_release_sample_exact(
-					segment_id, (uint16)i, candidate.xid,
-					candidate.wrap, terminal_status, candidate.commit_scn,
-					expected_epoch);
+					segment_id, (uint16)i, candidate.xid, candidate.wrap, terminal_status,
+					candidate.commit_scn, expected_epoch);
 		} else
-			recyclable = cluster_tt_slot_recyclable(candidate.status,
-				candidate.commit_scn, horizon);
+			recyclable
+				= cluster_tt_slot_recyclable(candidate.status, candidate.commit_scn, horizon);
 		if (!recyclable)
 			continue;
 
@@ -817,8 +811,7 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 expected_epoch,
 		 * binding generation.  This is the mutation point and therefore the
 		 * final folded-epoch fence is repeated while the candidate is owned. */
 		LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
-		if (seg->segment_id != segment_id
-			|| seg->binding_generation != binding_generation
+		if (seg->segment_id != segment_id || seg->binding_generation != binding_generation
 			|| memcmp(&seg->slots[i], &candidate, sizeof(candidate)) != 0) {
 			LWLockRelease(&seg->lock);
 			continue;
@@ -947,7 +940,7 @@ cluster_tt_slot_mark_committed(uint32 segment_id, uint16 slot_offset, Transactio
 							   SCN commit_scn)
 {
 	ClusterTTSlotAllocPerSegment *seg;
-	bool		transitioned = false;
+	bool transitioned = false;
 
 	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
 		ereport(ERROR,
@@ -993,7 +986,7 @@ void
 cluster_tt_slot_mark_aborted(uint32 segment_id, uint16 slot_offset, TransactionId xid)
 {
 	ClusterTTSlotAllocPerSegment *seg;
-	bool		transitioned = false;
+	bool transitioned = false;
 
 	if (slot_offset >= TT_SLOTS_PER_SEGMENT)
 		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
@@ -1054,8 +1047,7 @@ cluster_tt_slot_current_segment(int node_id)
  *	canonical owner and therefore fails closed with a zeroed result.
  */
 bool
-cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
-									 ClusterTTSlotCurrentOwner *out)
+cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid, ClusterTTSlotCurrentOwner *out)
 {
 	ClusterTTSlotAllocPerSegment *seg;
 	ClusterTTSlotCurrentOwner found;
@@ -1066,8 +1058,7 @@ cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
 	if (out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
-	if (ClusterTTSlotShm == NULL || node_id < 0
-		|| node_id >= CLUSTER_TT_SLOT_MAX_NODES
+	if (ClusterTTSlotShm == NULL || node_id < 0 || node_id >= CLUSTER_TT_SLOT_MAX_NODES
 		|| !TransactionIdIsNormal(xid))
 		return false;
 
@@ -1088,12 +1079,10 @@ cluster_tt_slot_current_owner_by_xid(int node_id, TransactionId xid,
 			valid = false;
 			break;
 		}
-		if ((entry->status == CTS_COMMITTED
-			 && !SCN_VALID(entry->commit_scn))
+		if ((entry->status == CTS_COMMITTED && !SCN_VALID(entry->commit_scn))
 			|| ((entry->status == CTS_ACTIVE || entry->status == CTS_ABORTED)
 				&& entry->commit_scn != InvalidScn)
-			|| (entry->status != CTS_ACTIVE
-				&& entry->status != CTS_COMMITTED
+			|| (entry->status != CTS_ACTIVE && entry->status != CTS_COMMITTED
 				&& entry->status != CTS_ABORTED)) {
 			valid = false;
 			break;
@@ -1163,10 +1152,9 @@ cluster_tt_slot_rollover(int node_id, uint32 new_segment_id, bool *out_old_had_a
 	LWLockAcquire(&seg->lock, LW_EXCLUSIVE);
 	if (seg->binding_generation == UINT64_MAX) {
 		LWLockRelease(&seg->lock);
-		ereport(ERROR,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cluster_tt_slot_rollover: binding generation exhausted for node %d",
-						node_id)));
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cluster_tt_slot_rollover: binding generation exhausted for node %d",
+							   node_id)));
 	}
 	for (i = 0; i < TT_SLOTS_PER_SEGMENT; i++) {
 		if (seg->slots[i].status == CTS_ACTIVE) {

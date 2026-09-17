@@ -43,8 +43,7 @@
 
 struct XLogReaderState;
 typedef struct ClusterRecoverySerialGuard ClusterRecoverySerialGuard;
-typedef struct ClusterThreadRecoveryAuthorityV1
-	ClusterThreadRecoveryAuthorityV1;
+typedef struct ClusterThreadRecoveryAuthorityV1 ClusterThreadRecoveryAuthorityV1;
 
 /*
  * Result of attempting to online-recover one dead thread (spec-4.11 §2.2).
@@ -53,10 +52,10 @@ typedef struct ClusterThreadRecoveryAuthorityV1
  * (result-returning, not FATAL -- R13).
  */
 typedef enum ClusterThreadRecResult {
-	CLUSTER_THREADREC_DONE = 0,			/* recovered_through_local published */
-	CLUSTER_THREADREC_BLOCKED = 1,		/* verified semantic failure (53RA4) */
+	CLUSTER_THREADREC_DONE = 0,			  /* recovered_through_local published */
+	CLUSTER_THREADREC_BLOCKED = 1,		  /* verified semantic failure (53RA4) */
 	CLUSTER_THREADREC_NOT_APPLICABLE = 2, /* no online recovery attempt */
-	CLUSTER_THREADREC_DEFERRED = 3,		/* transient; keep REPLAYING for reap */
+	CLUSTER_THREADREC_DEFERRED = 3,		  /* transient; keep REPLAYING for reap */
 } ClusterThreadRecResult;
 
 /*
@@ -90,14 +89,12 @@ typedef enum ClusterThreadReplayMatchResult {
 } ClusterThreadReplayMatchResult;
 
 static inline bool
-cluster_thread_recovery_replay_transition_shape_valid(
-	ClusterThreadRecReplayState expected,
-	ClusterThreadRecReplayState target)
+cluster_thread_recovery_replay_transition_shape_valid(ClusterThreadRecReplayState expected,
+													  ClusterThreadRecReplayState target)
 {
 	return expected == CLUSTER_THREADREC_REPLAY_REPLAYING
-		&& (target == CLUSTER_THREADREC_REPLAY_IDLE
-			|| target == CLUSTER_THREADREC_REPLAY_DONE
-			|| target == CLUSTER_THREADREC_REPLAY_BLOCKED);
+		   && (target == CLUSTER_THREADREC_REPLAY_IDLE || target == CLUSTER_THREADREC_REPLAY_DONE
+			   || target == CLUSTER_THREADREC_REPLAY_BLOCKED);
 }
 
 /*
@@ -259,12 +256,11 @@ typedef enum ClusterThreadRecReapDecision {
 } ClusterThreadRecReapDecision;
 
 static inline ClusterThreadRecReapDecision
-cluster_thread_recovery_reap_decide(
-	BgwHandleStatus handle_status, bool slot_read, uint64 owned_stamp,
-	ClusterThreadRecReplayState slot_state, uint64 slot_stamp)
+cluster_thread_recovery_reap_decide(BgwHandleStatus handle_status, bool slot_read,
+									uint64 owned_stamp, ClusterThreadRecReplayState slot_state,
+									uint64 slot_stamp)
 {
-	if (handle_status == BGWH_STARTED
-		|| handle_status == BGWH_NOT_YET_STARTED
+	if (handle_status == BGWH_STARTED || handle_status == BGWH_NOT_YET_STARTED
 		|| handle_status == BGWH_POSTMASTER_DIED)
 		return CLUSTER_THREADREC_REAP_RETAIN;
 	if (handle_status != BGWH_STOPPED || !slot_read || owned_stamp == 0
@@ -288,24 +284,23 @@ typedef struct ClusterThreadRecLaunchEligibility {
  * acquire any authority it must match the exact main argument and the live
  * REPLAYING slot/stamp, and it must still carry a valid full duty identity. */
 static inline bool
-cluster_thread_recovery_worker_start_valid(
-	const ClusterThreadRecLaunchEligibility *eligibility, uint16 main_thread,
-	bool slot_read, ClusterThreadRecReplayState slot_state,
-	uint64 slot_stamp)
+cluster_thread_recovery_worker_start_valid(const ClusterThreadRecLaunchEligibility *eligibility,
+										   uint16 main_thread, bool slot_read,
+										   ClusterThreadRecReplayState slot_state,
+										   uint64 slot_stamp)
 {
-	return eligibility != NULL
-		&& main_thread >= XLP_THREAD_ID_FIRST_REAL
-		&& main_thread <= CLUSTER_WAL_THREAD_MAX
-		&& eligibility->origin_thread == main_thread
-		&& eligibility->attempt_stamp != 0 && slot_read
-		&& slot_state == CLUSTER_THREADREC_REPLAY_REPLAYING
-		&& slot_stamp == eligibility->attempt_stamp
-		&& cluster_recovery_duty_key_valid_v1(&eligibility->duty)
-		&& eligibility->duty.origin_thread_id == main_thread;
+	return eligibility != NULL && main_thread >= XLP_THREAD_ID_FIRST_REAL
+		   && main_thread <= CLUSTER_WAL_THREAD_MAX && eligibility->origin_thread == main_thread
+		   && eligibility->attempt_stamp != 0 && slot_read
+		   && slot_state == CLUSTER_THREADREC_REPLAY_REPLAYING
+		   && slot_stamp == eligibility->attempt_stamp
+		   && cluster_recovery_duty_key_valid_v1(&eligibility->duty)
+		   && eligibility->duty.origin_thread_id == main_thread;
 }
 
-extern bool cluster_reconfig_thread_recovery_eligibility_consume(
-	uint16 origin_thread, ClusterThreadRecLaunchEligibility *out);
+extern bool
+cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
+													 ClusterThreadRecLaunchEligibility *out);
 extern void cluster_thread_recovery_lmon_tick(void);
 extern void cluster_thread_recovery_lmon_shutdown(void);
 
@@ -390,7 +385,7 @@ typedef struct ClusterThreadTouchedRels {
 	 * touched set was recovered for.  Set by the orchestrator from the
 	 * real dead_tid so the retention proof's failed_origin_thread is a
 	 * true identity, not a placeholder.  0 = unset (fail-closed). */
-	uint16		origin_thread_id;
+	uint16 origin_thread_id;
 } ClusterThreadTouchedRels;
 
 /*
@@ -486,7 +481,7 @@ cluster_thread_recovery_replay_epoch_aborts(uint64 slot_epoch, uint64 current_ep
  */
 static inline bool
 cluster_thread_recovery_worker_terminal_state(ClusterThreadRecResult res,
-										   ClusterThreadRecReplayState *state)
+											  ClusterThreadRecReplayState *state)
 {
 	if (state == NULL)
 		return false;
@@ -507,9 +502,9 @@ cluster_thread_recovery_worker_terminal_state(ClusterThreadRecResult res,
  * later increment (the Q10-B apply matrix); declared here for the
  * reconfig FSM driver call site.
  */
-extern ClusterThreadRecResult cluster_thread_recovery_replay_one(uint16 dead_tid,
-																 uint64 episode_epoch,
-																 const ClusterThreadRecoveryAuthorityV1 *authority);
+extern ClusterThreadRecResult
+cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
+								   const ClusterThreadRecoveryAuthorityV1 *authority);
 
 /*
  * Unfreeze precondition (spec-4.11 D3, 3b-3): has dead_tid been fully
@@ -553,10 +548,9 @@ extern bool cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap, int
  */
 extern bool cluster_thread_recovery_replay_mark_replaying(uint16 dead_tid, uint64 episode_epoch);
 extern ClusterThreadReplayMatchResult
-cluster_thread_recovery_replay_transition_if_match(
-	uint16 dead_tid, uint64 attempt_stamp,
-	ClusterThreadRecReplayState expected,
-	ClusterThreadRecReplayState target);
+cluster_thread_recovery_replay_transition_if_match(uint16 dead_tid, uint64 attempt_stamp,
+												   ClusterThreadRecReplayState expected,
+												   ClusterThreadRecReplayState target);
 extern bool cluster_thread_recovery_replay_read(uint16 dead_tid,
 												ClusterThreadRecReplayState *state_out,
 												uint64 *epoch_out);
@@ -699,11 +693,9 @@ extern ClusterThreadRecResult cluster_thread_recovery_validated_end(uint16 dead_
  * Real validated-boundary derivation for replay_one(dead_tid, epoch) is D4
  * (3b-4); 3b-2 derives only a basic window.
  */
-extern ClusterThreadRecResult
-cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower,
-										  XLogRecPtr scan_upper, uint64 episode_epoch,
-										  const ClusterThreadRecoveryAuthorityV1 *authority,
-										  ClusterThreadReplayStats *stats);
+extern ClusterThreadRecResult cluster_thread_recovery_replay_one_window(
+	uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper, uint64 episode_epoch,
+	const ClusterThreadRecoveryAuthorityV1 *authority, ClusterThreadReplayStats *stats);
 
 /*
  * PGRAC: spec-6.12h D-h3b -- per-thread WAL reader factory, exported for the

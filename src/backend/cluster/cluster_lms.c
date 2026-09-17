@@ -290,7 +290,7 @@ lms_r4_publish_worker_incarnation(ClusterLmsSharedState *state, int worker_id)
  */
 bool
 cluster_lms_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
-								 uint64 *worker_incarnation)
+							 uint64 *worker_incarnation)
 {
 	uint64 current;
 	bool requested = false;
@@ -318,8 +318,7 @@ cluster_lms_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
 
 /* Publish only the ACK belonging to the exact live request identity. */
 static bool
-lms_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation,
-				 uint64 generation)
+lms_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation, uint64 generation)
 {
 	bool published = false;
 
@@ -327,8 +326,8 @@ lms_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation,
 		return false;
 
 	LWLockAcquire(&state->lwlock, LW_EXCLUSIVE);
-	if (state->r4_controls.data_worker_incarnation[0] == worker_incarnation &&
-		state->r4_controls.drain_request_generation == generation) {
+	if (state->r4_controls.data_worker_incarnation[0] == worker_incarnation
+		&& state->r4_controls.drain_request_generation == generation) {
 		state->r4_controls.drain_ack_generation = generation;
 		published = true;
 	}
@@ -341,8 +340,8 @@ lms_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation,
 /* Focused test-only observer; product reclaim co-samples this identity inside
  * its single EXCLUSIVE claim window and exposes no separate acceptance API. */
 static bool
-cluster_lms_r4_drain_ack_matches(ClusterLmsSharedState *state,
-								 uint64 worker_incarnation, uint64 generation)
+cluster_lms_r4_drain_ack_matches(ClusterLmsSharedState *state, uint64 worker_incarnation,
+								 uint64 generation)
 {
 	bool matches;
 
@@ -350,9 +349,9 @@ cluster_lms_r4_drain_ack_matches(ClusterLmsSharedState *state,
 		return false;
 
 	LWLockAcquire(&state->lwlock, LW_SHARED);
-	matches = state->r4_controls.data_worker_incarnation[0] == worker_incarnation &&
-		state->r4_controls.drain_request_generation == generation &&
-		state->r4_controls.drain_ack_generation == generation;
+	matches = state->r4_controls.data_worker_incarnation[0] == worker_incarnation
+			  && state->r4_controls.drain_request_generation == generation
+			  && state->r4_controls.drain_ack_generation == generation;
 	LWLockRelease(&state->lwlock);
 
 	return matches;
@@ -384,8 +383,7 @@ lms_r4_drain_ack_tick(ClusterLmsSharedState *state, uint64 worker_incarnation)
 	for (peer = 0; peer < CLUSTER_MAX_NODES; peer++) {
 		if (peer == cluster_node_id)
 			continue;
-		if (cluster_ic_tier1_pending_outbound(peer)
-			|| cluster_ic_rdma_pending_outbound(peer))
+		if (cluster_ic_tier1_pending_outbound(peer) || cluster_ic_rdma_pending_outbound(peer))
 			return false;
 	}
 
@@ -407,23 +405,21 @@ cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state, uint64 generatio
 }
 
 bool
-cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state,
-						  uint64 worker_incarnation, uint64 generation)
+cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation,
+							  uint64 generation)
 {
 	return lms_r4_drain_ack(state, worker_incarnation, generation);
 }
 
 bool
-cluster_lms_test_r4_drain_ack_matches(ClusterLmsSharedState *state,
-								  uint64 worker_incarnation,
-								  uint64 generation)
+cluster_lms_test_r4_drain_ack_matches(ClusterLmsSharedState *state, uint64 worker_incarnation,
+									  uint64 generation)
 {
 	return cluster_lms_r4_drain_ack_matches(state, worker_incarnation, generation);
 }
 
 bool
-cluster_lms_test_r4_drain_ack_tick(ClusterLmsSharedState *state,
-								   uint64 worker_incarnation)
+cluster_lms_test_r4_drain_ack_tick(ClusterLmsSharedState *state, uint64 worker_incarnation)
 {
 	return lms_r4_drain_ack_tick(state, worker_incarnation);
 }
@@ -563,9 +559,8 @@ cluster_lms_is_recovery_ready(void)
 	generation = pg_atomic_read_u64(&cluster_lms_state->lms_restart_generation);
 	state = lms_get_state();
 	return generation != 0
-		&& pg_atomic_read_u64(&cluster_lms_state->recovery_ready_generation)
-			   == generation
-		&& (state == CLUSTER_LMS_STARTING || state == CLUSTER_LMS_READY);
+		   && pg_atomic_read_u64(&cluster_lms_state->recovery_ready_generation) == generation
+		   && (state == CLUSTER_LMS_STARTING || state == CLUSTER_LMS_READY);
 }
 
 bool
@@ -601,8 +596,7 @@ cluster_lms_request_serving(void)
 	if (!cluster_lms_is_recovery_ready())
 		return false;
 	generation = pg_atomic_read_u64(&cluster_lms_state->lms_restart_generation);
-	pg_atomic_write_u64(&cluster_lms_state->serving_requested_generation,
-					generation);
+	pg_atomic_write_u64(&cluster_lms_state->serving_requested_generation, generation);
 	cluster_lms_wakeup(0);
 	return true;
 }
@@ -972,17 +966,16 @@ lms_note_pcm_x_finish_flush_injection_reload(int worker_id)
 	armed = cluster_injection_is_armed("cluster-pcm-x-retain-flush-error");
 	value = cluster_injection_points != NULL ? cluster_injection_points : "";
 	target = cluster_pcm_x_retain_flush_error_target != NULL
-		? cluster_pcm_x_retain_flush_error_target
-		: "";
-	if (initialized && armed == was_armed && strcmp(value, was_value) == 0 &&
-		strcmp(target, was_target) == 0)
+				 ? cluster_pcm_x_retain_flush_error_target
+				 : "";
+	if (initialized && armed == was_armed && strcmp(value, was_value) == 0
+		&& strcmp(target, was_target) == 0)
 		return;
 	ereport(LOG,
 			(errmsg_internal("cluster_lms: DATA worker=%d applied PCM-X finish Flush "
 							 "injection config: pid=%d armed=%s value=\"%s\" "
 							 "target=\"%s\"",
-							 worker_id, (int)MyProcPid, armed ? "true" : "false",
-							 value, target)));
+							 worker_id, (int)MyProcPid, armed ? "true" : "false", value, target)));
 
 	next_value = MemoryContextStrdup(TopMemoryContext, value);
 	next_target = MemoryContextStrdup(TopMemoryContext, target);
@@ -995,7 +988,7 @@ lms_note_pcm_x_finish_flush_injection_reload(int worker_id)
 	was_armed = armed;
 	initialized = true;
 #else
-	(void) worker_id;
+	(void)worker_id;
 #endif
 }
 
@@ -1137,9 +1130,8 @@ LmsMain(void)
 						 "CreateSharedMemoryAndSemaphores().")));
 	r4_worker_incarnation = lms_r4_publish_worker_incarnation(cluster_lms_state, 0);
 	if (r4_worker_incarnation == 0)
-		ereport(FATAL,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cluster_lms DATA worker 0 incarnation exhausted")));
+		ereport(FATAL, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cluster_lms DATA worker 0 incarnation exhausted")));
 
 	/* Publish STARTING + record pid / spawned_at.  spec-7.3 D4: worker 0's
 	 * pid also goes to worker_pids[0] so cluster_lms_wakeup(0) is uniform with
@@ -1166,19 +1158,16 @@ LmsMain(void)
 	/* The phase-3 child first exposes only the exact recovery allowlist.  A
 	 * legacy/unmanaged boot proceeds immediately, while a formed boot waits
 	 * for the post-recovery phase-4 request on the same child generation. */
-	pg_atomic_write_u64(&cluster_lms_state->recovery_ready_generation,
-				recovery_generation);
+	pg_atomic_write_u64(&cluster_lms_state->recovery_ready_generation, recovery_generation);
 	while (cluster_authority_readiness_managed()
-		   && pg_atomic_read_u64(
-				  &cluster_lms_state->serving_requested_generation)
+		   && pg_atomic_read_u64(&cluster_lms_state->serving_requested_generation)
 				  != recovery_generation) {
 		int rc;
 
 		if (ShutdownRequestPending || lms_shutdown_requested())
 			break;
-		rc = WaitLatch(MyLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					   100L, WAIT_EVENT_PG_SLEEP);
+		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 100L,
+					   WAIT_EVENT_PG_SLEEP);
 		ResetLatch(MyLatch);
 		if (rc & WL_EXIT_ON_PM_DEATH)
 			proc_exit(1);
@@ -1397,9 +1386,8 @@ LmsWorkerMain(int worker_id)
 				 errhint("cluster_lms_shmem_init() must run during "
 						 "CreateSharedMemoryAndSemaphores().")));
 	if (lms_r4_publish_worker_incarnation(cluster_lms_state, worker_id) == 0)
-		ereport(FATAL,
-				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("cluster_lms DATA worker %d incarnation exhausted", worker_id)));
+		ereport(FATAL, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("cluster_lms DATA worker %d incarnation exhausted", worker_id)));
 
 	/* Publish this worker's pid so the D4 wakeup path can find it. */
 	LWLockAcquire(&cluster_lms_state->lwlock, LW_EXCLUSIVE);

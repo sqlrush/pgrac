@@ -387,14 +387,12 @@ extern const ClusterSharedFsOps cluster_shared_fs_sharedfs_ops;
 extern void cluster_shared_fs_sentinel_attach(void);
 extern bool cluster_shared_fs_sentinel_has_participant(int node_id);
 extern void cluster_shared_fs_get_storage_uuid(char *out, size_t outlen);
-extern bool cluster_shared_fs_get_protected_set_identity(
-	ClusterProtectedSetIdentityV1 *out);
+extern bool cluster_shared_fs_get_protected_set_identity(ClusterProtectedSetIdentityV1 *out);
 
 /* Backend-private identity source used by the provider-neutral dispatcher.
  * It returns only a strict configured UUID already matched to the CRC-valid
  * raw superblock; the legacy "raw-block-device" fallback returns false. */
-extern bool cluster_shared_fs_block_device_get_storage_uuid(
-	char *out, size_t outlen);
+extern bool cluster_shared_fs_block_device_get_storage_uuid(char *out, size_t outlen);
 
 
 #endif /* CLUSTER_SHARED_FS_H */

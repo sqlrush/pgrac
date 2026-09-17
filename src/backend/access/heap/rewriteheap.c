@@ -100,6 +100,12 @@
  *
  *-------------------------------------------------------------------------
  */
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Require terminal-reference closure for cluster rewrites, not native
+ *   backends with no assigned cluster identity.
+ */
 #include "postgres.h"
 
 #include <unistd.h>
@@ -249,7 +255,7 @@ begin_heap_rewrite(Relation old_heap, Relation new_heap, TransactionId oldest_xm
 	/* A rewrite changes every physical TID.  Under the caller's
 	 * AccessExclusiveLock, require the bounded CTRC journal for the old
 	 * relfilenode to be fully terminal before copying any tuple bytes. */
-	if (cluster_enabled
+	if (cluster_enabled && cluster_node_id >= 0
 		&& old_heap->rd_rel->relpersistence != RELPERSISTENCE_TEMP
 		&& !cluster_ctrc_relation_removal_ready_shared(
 			(uint32)old_heap->rd_locator.spcOid,

@@ -88,7 +88,7 @@
 #include "cluster/cluster_page_version.h"
 #include "cluster/cluster_side_recovery.h"
 #include "cluster/cluster_side_route.h"
-#include "cluster/cluster_side_prepared.h" /* D-SIDE-03 production judge (队列 ④) */
+#include "cluster/cluster_side_prepared.h"	 /* D-SIDE-03 production judge (队列 ④) */
 #include "cluster/cluster_side_projection.h" /* D-SIDE-04 production judge (队列 ④) */
 #include "cluster/cluster_side_stats.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -147,8 +147,7 @@ touched_add(ClusterThreadTouchedRels *touched, const RelFileLocator *rl, ForkNum
  * (the production post-read/authority wiring is RED), so the outcome is
  * the honest deny — the failed-origin interval stays retained.
  */
-static void
-cluster_thread_recovery_retention_judge(const ClusterThreadTouchedRels *touched);
+static void cluster_thread_recovery_retention_judge(const ClusterThreadTouchedRels *touched);
 
 void
 cluster_thread_recovery_touched_sync_all(const ClusterThreadTouchedRels *touched)
@@ -204,13 +203,13 @@ cluster_thread_recovery_retention_judge(const ClusterThreadTouchedRels *touched)
 
 	memset(&proof, 0, sizeof(proof));
 	memset(&handoff, 0, sizeof(handoff));
-	handoff.proof = &proof;		/* incomplete proof: FND-10 denies */
-	(void) cluster_page_handoff_ready(&handoff);
+	handoff.proof = &proof; /* incomplete proof: FND-10 denies */
+	(void)cluster_page_handoff_ready(&handoff);
 
 	memset(&retention, 0, sizeof(retention));
-	retention.failed_origin_thread =
-		(touched != NULL ? touched->origin_thread_id : 0); /* real dead_tid */
-	retention.affected_count = (uint32) (touched != NULL ? touched->n : 0);
+	retention.failed_origin_thread
+		= (touched != NULL ? touched->origin_thread_id : 0); /* real dead_tid */
+	retention.affected_count = (uint32)(touched != NULL ? touched->n : 0);
 	retention.all_bytes_durable = true; /* smgrimmedsync just ran */
 	retention.all_post_read_ok = false; /* post-read wiring RED */
 	retention.consumers_zero = false;	/* consumers wiring RED */
@@ -375,9 +374,9 @@ cluster_thread_recovery_page_judge(XLogReaderState *reader, uint8 block_id,
 	ClusterSideReadinessInput ready;
 	ClusterPageClass cls;
 	ClusterPageApplyVerdict verdict;
-	uint8		rmid;
-	uint16		opcode;
-	bool		decoded_ok;
+	uint8 rmid;
+	uint16 opcode;
+	bool decoded_ok;
 
 	if (!stats_inited) {
 		cluster_page_stats_init(&page_stats);
@@ -394,11 +393,10 @@ cluster_thread_recovery_page_judge(XLogReaderState *reader, uint8 block_id,
 	cin.opcode = opcode;
 	cin.forknum = forknum;
 	cin.has_full_page_image = XLogRecHasBlockRef(reader, block_id)
-		&& XLogRecHasBlockImage(reader, block_id)
-		&& XLogRecBlockImageApply(reader, block_id);
+							  && XLogRecHasBlockImage(reader, block_id)
+							  && XLogRecBlockImageApply(reader, block_id);
 	cls = cluster_page_classify(&cin);
-	if (cls == CLUSTER_PAGE_CLASS_UNKNOWN
-		|| cls == CLUSTER_PAGE_CLASS_UNCLASSIFIED)
+	if (cls == CLUSTER_PAGE_CLASS_UNKNOWN || cls == CLUSTER_PAGE_CLASS_UNCLASSIFIED)
 		cluster_page_stats_unknown_class_blocked(&page_stats);
 
 	/* 2. §3.1 decode (census-gated identity + hints). */
@@ -407,7 +405,7 @@ cluster_thread_recovery_page_judge(XLogReaderState *reader, uint8 block_id,
 	if (!decoded_ok) {
 		cluster_page_stats_source_missing(&page_stats);
 		cluster_side_stats_blocked(&side_stats, true);
-		return;					/* no identity: the chain fails closed */
+		return; /* no identity: the chain fails closed */
 	}
 
 	/* 3. §3.2 admission — the VersionToken producer contract is RED, so
@@ -422,13 +420,13 @@ cluster_thread_recovery_page_judge(XLogReaderState *reader, uint8 block_id,
 	consume.identity = &decoded.identity;
 	consume.page_class = decoded.page_class;
 	consume.expected_before = NULL; /* no producer yet: fails closed */
-	(void) cluster_side_page_consumer_ready(&consume);
+	(void)cluster_side_page_consumer_ready(&consume);
 	memset(&ready, 0, sizeof(ready));
-	ready.resource_id = (uint16) blocknum;
-	(void) cluster_side_resource_readiness(&ready);
+	ready.resource_id = (uint16)blocknum;
+	(void)cluster_side_resource_readiness(&ready);
 	cluster_side_stats_domain(&side_stats, CLUSTER_SIDE_ROUTE_TT_UNDO);
 	cluster_side_stats_durability(&side_stats);
-	(void) rl;
+	(void)rl;
 }
 
 /*
@@ -457,8 +455,7 @@ cluster_thread_recovery_prepared_judge(XLogReaderState *reader, uint8 info)
 	uint8 opmask = info & XLOG_XACT_OPMASK;
 	uint32 data_len;
 
-	if (opmask != XLOG_XACT_PREPARE
-		&& opmask != XLOG_XACT_COMMIT_PREPARED
+	if (opmask != XLOG_XACT_PREPARE && opmask != XLOG_XACT_COMMIT_PREPARED
 		&& opmask != XLOG_XACT_ABORT_PREPARED)
 		return;
 	if (reader == NULL)
@@ -470,7 +467,7 @@ cluster_thread_recovery_prepared_judge(XLogReaderState *reader, uint8 info)
 
 	if (opmask == XLOG_XACT_PREPARE) {
 		ClusterSidePreparedInput in;
-		xl_xact_prepare *xlrec = (xl_xact_prepare *) XLogRecGetData(reader);
+		xl_xact_prepare *xlrec = (xl_xact_prepare *)XLogRecGetData(reader);
 
 		data_len = XLogRecGetDataLen(reader);
 		memset(&in, 0, sizeof(in));
@@ -478,11 +475,10 @@ cluster_thread_recovery_prepared_judge(XLogReaderState *reader, uint8 info)
 		 * it); the GID leg requires a well-formed non-empty GID that fits
 		 * inside the record payload. */
 		in.prepare_redo_ok = true;
-		in.gid_identity_match = xlrec != NULL
-			&& data_len >= sizeof(xl_xact_prepare)
-			&& cluster_side_prepared_gid_identity_ok(
-				(const char *) xlrec + sizeof(xl_xact_prepare),
-				xlrec->gidlen, data_len - (uint32) sizeof(xl_xact_prepare));
+		in.gid_identity_match = xlrec != NULL && data_len >= sizeof(xl_xact_prepare)
+								&& cluster_side_prepared_gid_identity_ok(
+									(const char *)xlrec + sizeof(xl_xact_prepare), xlrec->gidlen,
+									data_len - (uint32)sizeof(xl_xact_prepare));
 		/* G3 gap: no durable database-scoped pending store, no TT/undo
 		 * match producer — the honest fail-closed legs. */
 		in.pending_durable_ok = false;
@@ -492,17 +488,17 @@ cluster_thread_recovery_prepared_judge(XLogReaderState *reader, uint8 info)
 		ClusterSidePreparedResolveInput r;
 
 		memset(&r, 0, sizeof(r));
-		r.terminal_redo_ok = true;	/* we are replaying the terminal */
-		r.pending_match = false;	/* G3 gap: no pending store */
+		r.terminal_redo_ok = true; /* we are replaying the terminal */
+		r.pending_match = false;   /* G3 gap: no pending store */
 		r.tt_undo_complete = false;
-		(void) cluster_side_prepared_resolve_ready(&r);
+		(void)cluster_side_prepared_resolve_ready(&r);
 		verdict = CLUSTER_SIDE_PREPARED_BLOCKED;
 	}
 	if (verdict == CLUSTER_SIDE_PREPARED_IN_DOUBT)
 		cluster_side_stats_domain(&side_stats, CLUSTER_SIDE_ROUTE_TT_UNDO);
 	else
 		cluster_side_stats_blocked(&side_stats, false);
-	(void) verdict;
+	(void)verdict;
 }
 
 /*
@@ -543,8 +539,8 @@ cluster_thread_recovery_projection_judge(XLogReaderState *reader)
 	/* canonical_truth_ok / coverage / integrity / producer / retention:
 	 * all RED in production — verification and rebuildability both fail
 	 * closed and the lookup refuses (no projection is ever served). */
-	(void) cluster_side_projection_lookup(false);
-	(void) cluster_side_projection_rebuildable(kind, false, false);
+	(void)cluster_side_projection_lookup(false);
+	(void)cluster_side_projection_rebuildable(kind, false, false);
 	/* D-SIDE-04 real exporter: this IS the projection route (CLOG /
 	 * MULTIXACT / COMMIT_TS redo in the replay stream), so the domain
 	 * counter must land in the projection bucket — never the TT/undo

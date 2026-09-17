@@ -84,8 +84,7 @@ bool cluster_recmerge_apply_foreign = false;
 
 #define CLUSTER_RECOVERY_FENCE_PLAN_MAGIC UINT32_C(0x52465034) /* "RFP4" */
 
-typedef struct ClusterRecoveryFenceOrigin
-{
+typedef struct ClusterRecoveryFenceOrigin {
 	uint16 origin_thread;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken root_token;
@@ -94,8 +93,7 @@ typedef struct ClusterRecoveryFenceOrigin
 	PgracExternalFenceAdmissionSetV1 *admissions;
 } ClusterRecoveryFenceOrigin;
 
-struct ClusterRecoveryFencePlan
-{
+struct ClusterRecoveryFencePlan {
 	uint32 magic;
 	int32 owner_pid;
 	uint16 own_thread;
@@ -1000,26 +998,22 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 			ClusterControlRootResult root_result;
 
 			root_result = cluster_control_root_lookup_owner_by_node_runtime(
-				(int) tid - 1, &root_identity, &root_snapshot, &root_token);
+				(int)tid - 1, &root_identity, &root_snapshot, &root_token);
 			if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 				 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 				|| !cluster_recovery_duty_key_valid_v1(&root_identity)
-				|| cluster_recovery_duty_key_compare(&root_identity,
-												   &root_snapshot.identity)
+				|| cluster_recovery_duty_key_compare(&root_identity, &root_snapshot.identity)
 					   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
-				appendStringInfo(&blockers,
-								 "%sthread %u canonical root unreadable (result %d)",
-								 blockers.len ? "; " : "", (unsigned) tid,
-								 (int) root_result);
+				appendStringInfo(&blockers, "%sthread %u canonical root unreadable (result %d)",
+								 blockers.len ? "; " : "", (unsigned)tid, (int)root_result);
 			} else {
 				if (root_snapshot.checkpoint_lower_lsn == 0)
 					appendStringInfo(&blockers, "%sthread %u has no checkpoint redo start",
-									 blockers.len ? "; " : "", (unsigned) tid);
-				if ((root_snapshot.root_flags
-					 & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0)
+									 blockers.len ? "; " : "", (unsigned)tid);
+				if ((root_snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0)
 					appendStringInfo(&blockers, "%sthread %u ran with full_page_writes=off",
-									 blockers.len ? "; " : "", (unsigned) tid);
-				out_start[tid] = (XLogRecPtr) root_snapshot.checkpoint_lower_lsn;
+									 blockers.len ? "; " : "", (unsigned)tid);
+				out_start[tid] = (XLogRecPtr)root_snapshot.checkpoint_lower_lsn;
 			}
 		}
 	}
@@ -1038,10 +1032,10 @@ cluster_recovery_merge_project_readonly(uint16 own_thread, XLogRecPtr own_redo,
 static bool
 recovery_fence_plan_valid(const ClusterRecoveryFencePlan *plan)
 {
-	return plan != NULL && plan->magic == CLUSTER_RECOVERY_FENCE_PLAN_MAGIC &&
-		plan->owner_pid == MyProcPid && plan->own_thread >= 1 &&
-		plan->own_thread <= CLUSTER_WAL_STATE_SLOT_COUNT &&
-		plan->origin_count <= CLUSTER_WAL_STATE_SLOT_COUNT;
+	return plan != NULL && plan->magic == CLUSTER_RECOVERY_FENCE_PLAN_MAGIC
+		   && plan->owner_pid == MyProcPid && plan->own_thread >= 1
+		   && plan->own_thread <= CLUSTER_WAL_STATE_SLOT_COUNT
+		   && plan->origin_count <= CLUSTER_WAL_STATE_SLOT_COUNT;
 }
 
 static void
@@ -1051,8 +1045,7 @@ recovery_fence_plan_release_members(ClusterRecoveryFencePlan *plan)
 
 	if (plan == NULL)
 		return;
-	for (i = plan->origin_count; i > 0; i--)
-	{
+	for (i = plan->origin_count; i > 0; i--) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[i - 1];
 
 		cluster_external_fence_admission_set_release(&origin->admissions);
@@ -1061,14 +1054,14 @@ recovery_fence_plan_release_members(ClusterRecoveryFencePlan *plan)
 	}
 }
 
-static void pg_attribute_noreturn()
-recovery_fence_unavailable(int32 node_id, uint64 incarnation,
-						   int verdict, int reason, const char *stage)
+static void
+pg_attribute_noreturn() recovery_fence_unavailable(int32 node_id, uint64 incarnation, int verdict,
+												   int reason, const char *stage)
 {
 	ereport(FATAL,
 			(errcode(ERRCODE_CLUSTER_EXTERNAL_FENCE_UNAVAILABLE),
-			 errmsg("external write exclusion is not proven for node %d incarnation "
-					UINT64_FORMAT, node_id, incarnation),
+			 errmsg("external write exclusion is not proven for node %d incarnation " UINT64_FORMAT,
+					node_id, incarnation),
 			 errdetail("Cold recovery external-fence stage %s returned verdict %d, reason %d.",
 					   stage, verdict, reason),
 			 errhint("Restore the configured root fencing provider and retry; do not disable "
@@ -1077,13 +1070,11 @@ recovery_fence_unavailable(int32 node_id, uint64 incarnation,
 }
 
 static int
-recovery_fence_plan_find_origin(const ClusterRecoveryFencePlan *plan,
-								uint16 origin_thread)
+recovery_fence_plan_find_origin(const ClusterRecoveryFencePlan *plan, uint16 origin_thread)
 {
 	uint16 i;
 
-	for (i = 0; i < plan->origin_count; i++)
-	{
+	for (i = 0; i < plan->origin_count; i++) {
 		if (plan->origins[i].origin_thread == origin_thread)
 			return (int)i;
 	}
@@ -1096,8 +1087,7 @@ recovery_fence_plan_find_origin(const ClusterRecoveryFencePlan *plan,
  * failure destroys the complete plan; no subset can reach the merge claim.
  */
 ClusterMergeEngage
-cluster_recovery_merge_preflight_readonly(uint16 own_thread,
-										  XLogRecPtr own_redo,
+cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo,
 										  ClusterRecoveryFencePlan **out_plan)
 {
 	ClusterRecoveryFencePlan *plan;
@@ -1105,10 +1095,9 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 	instr_time admission_started;
 	uint16 origin_threads[CLUSTER_WAL_STATE_SLOT_COUNT];
 	uint16 tid;
-	uint32 required_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID |
-		CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID |
-		CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID |
-		CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	uint32 required_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 
 	if (out_plan == NULL || *out_plan != NULL)
 		return CLUSTER_MERGE_NO_NO_PLAN;
@@ -1116,12 +1105,10 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 	plan->magic = CLUSTER_RECOVERY_FENCE_PLAN_MAGIC;
 	plan->owner_pid = MyProcPid;
 	plan->own_thread = own_thread;
-	plan->acquire_timeout_ms_snapshot =
-		cluster_external_fence_acquire_timeout_ms;
-	engage = cluster_recovery_merge_project_readonly(
-		own_thread, own_redo, plan->replay_thread_bitmap, plan->start_lsn);
-	if (engage != CLUSTER_MERGE_ENGAGE)
-	{
+	plan->acquire_timeout_ms_snapshot = cluster_external_fence_acquire_timeout_ms;
+	engage = cluster_recovery_merge_project_readonly(own_thread, own_redo,
+													 plan->replay_thread_bitmap, plan->start_lsn);
+	if (engage != CLUSTER_MERGE_ENGAGE) {
 		MemSet(plan, 0, sizeof(*plan));
 		pfree(plan);
 		return engage;
@@ -1129,13 +1116,11 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 
 	plan->foreign_origin_bitmap[0] = plan->replay_thread_bitmap[0];
 	plan->foreign_origin_bitmap[1] = plan->replay_thread_bitmap[1];
-	plan->foreign_origin_bitmap[(own_thread - 1) / 64] &=
-		~(UINT64_C(1) << ((own_thread - 1) % 64));
+	plan->foreign_origin_bitmap[(own_thread - 1) / 64] &= ~(UINT64_C(1) << ((own_thread - 1) % 64));
 
 	/* First close every classification.  No provider call is reachable from
 	 * this loop, so a late non-current origin still yields zero sockets. */
-	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++)
-	{
+	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
 		ClusterControlRootIdentity identity;
 		ClusterControlRootSnapshot snapshot;
 		ClusterControlRootReadToken token;
@@ -1143,53 +1128,41 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 		ClusterRecoveryFenceOrigin *origin;
 		int32 node_id;
 
-		if ((plan->foreign_origin_bitmap[(tid - 1) / 64] &
-			 (UINT64_C(1) << ((tid - 1) % 64))) == 0)
+		if ((plan->foreign_origin_bitmap[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
 			continue;
 		node_id = (int32)tid - 1;
 		MemSet(&identity, 0, sizeof(identity));
 		MemSet(&snapshot, 0, sizeof(snapshot));
 		MemSet(&token, 0, sizeof(token));
-		root_result = cluster_control_root_lookup_owner_by_node_runtime(
-			node_id, &identity, &snapshot, &token);
-		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
-			 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
-			!cluster_recovery_duty_key_valid_v1(&identity) ||
-			identity.origin_thread_id != tid ||
-			identity.origin_node_id != node_id ||
-			cluster_recovery_duty_key_compare(&snapshot.identity, &identity) !=
-				CLUSTER_RECOVERY_DUTY_COMPARE_EXACT)
-		{
+		root_result = cluster_control_root_lookup_owner_by_node_runtime(node_id, &identity,
+																		&snapshot, &token);
+		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			|| !cluster_recovery_duty_key_valid_v1(&identity) || identity.origin_thread_id != tid
+			|| identity.origin_node_id != node_id
+			|| cluster_recovery_duty_key_compare(&snapshot.identity, &identity)
+				   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT) {
 			recovery_fence_plan_release_members(plan);
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
-			recovery_fence_unavailable(node_id,
-				identity.origin_owner_incarnation,
-				PGRAC_EXTERNAL_FENCE_UNAVAILABLE, (int)root_result,
-				"root-classification");
+			recovery_fence_unavailable(node_id, identity.origin_owner_incarnation,
+									   PGRAC_EXTERNAL_FENCE_UNAVAILABLE, (int)root_result,
+									   "root-classification");
 		}
-		if (snapshot.lifecycle ==
-			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
-		{
-			plan->replay_thread_bitmap[(tid - 1) / 64] &=
-				~(UINT64_C(1) << ((tid - 1) % 64));
-			plan->foreign_origin_bitmap[(tid - 1) / 64] &=
-				~(UINT64_C(1) << ((tid - 1) % 64));
+		if (snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE) {
+			plan->replay_thread_bitmap[(tid - 1) / 64] &= ~(UINT64_C(1) << ((tid - 1) % 64));
+			plan->foreign_origin_bitmap[(tid - 1) / 64] &= ~(UINT64_C(1) << ((tid - 1) % 64));
 			plan->start_lsn[tid] = InvalidXLogRecPtr;
 			continue;
 		}
-		if (snapshot.lifecycle !=
-				CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
-			(snapshot.root_flags & required_flags) != required_flags)
-		{
+		if (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| (snapshot.root_flags & required_flags) != required_flags) {
 			recovery_fence_plan_release_members(plan);
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
-			recovery_fence_unavailable(node_id,
-				identity.origin_owner_incarnation,
-				PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
-				PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE,
-				"root-lifecycle");
+			recovery_fence_unavailable(
+				node_id, identity.origin_owner_incarnation, PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+				PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE, "root-lifecycle");
 		}
 		origin = &plan->origins[plan->origin_count];
 		origin->origin_thread = tid;
@@ -1199,17 +1172,14 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 		plan->origin_count++;
 	}
 
-	if (plan->origin_count == 0)
-	{
+	if (plan->origin_count == 0) {
 		MemSet(plan, 0, sizeof(*plan));
 		pfree(plan);
 		return CLUSTER_MERGE_NO_NO_CANDIDATES;
 	}
-	if (!cluster_recovery_fence_plan_shape_valid(
-			own_thread, plan->replay_thread_bitmap,
-			plan->foreign_origin_bitmap, origin_threads,
-			plan->origin_count))
-	{
+	if (!cluster_recovery_fence_plan_shape_valid(own_thread, plan->replay_thread_bitmap,
+												 plan->foreign_origin_bitmap, origin_threads,
+												 plan->origin_count)) {
 		MemSet(plan, 0, sizeof(*plan));
 		pfree(plan);
 		return CLUSTER_MERGE_NO_NO_PLAN;
@@ -1217,51 +1187,42 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 
 	/* Then build every formation/NeedSet.  Only after all nonwaitable
 	 * classification gates are closed may the aggregate admission loop run. */
-	for (tid = 0; tid < plan->origin_count; tid++)
-	{
+	for (tid = 0; tid < plan->origin_count; tid++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[tid];
 		ClusterFormationWitnessResult formation_result;
 
 		formation_result = cluster_formation_witness_build_wait(
-			origin->origin_thread, false,
-			plan->acquire_timeout_ms_snapshot,
-			&origin->formation);
-		if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
-		{
+			origin->origin_thread, false, plan->acquire_timeout_ms_snapshot, &origin->formation);
+		if (formation_result != CLUSTER_FORMATION_WITNESS_READY) {
 			int32 node_id = origin->duty.origin_node_id;
 			uint64 incarnation = origin->duty.origin_owner_incarnation;
 
 			recovery_fence_plan_release_members(plan);
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
-			recovery_fence_unavailable(node_id, incarnation,
-				PGRAC_EXTERNAL_FENCE_UNAVAILABLE, (int)formation_result,
-				"formation");
+			recovery_fence_unavailable(node_id, incarnation, PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+									   (int)formation_result, "formation");
 		}
 	}
-	for (tid = 0; tid < plan->origin_count; tid++)
-	{
+	for (tid = 0; tid < plan->origin_count; tid++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[tid];
 		PgracExternalFenceNeedSetResult need_result;
 
-		need_result = cluster_external_fence_need_set_build(
-			&origin->duty, origin->formation, &origin->needs);
-		if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
-		{
+		need_result = cluster_external_fence_need_set_build(&origin->duty, origin->formation,
+															&origin->needs);
+		if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK) {
 			int32 node_id = origin->duty.origin_node_id;
 			uint64 incarnation = origin->duty.origin_owner_incarnation;
 
 			recovery_fence_plan_release_members(plan);
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
-			recovery_fence_unavailable(node_id, incarnation,
-				PGRAC_EXTERNAL_FENCE_UNAVAILABLE, (int)need_result,
-				"need-set");
+			recovery_fence_unavailable(node_id, incarnation, PGRAC_EXTERNAL_FENCE_UNAVAILABLE,
+									   (int)need_result, "need-set");
 		}
 	}
 	INSTR_TIME_SET_CURRENT(admission_started);
-	for (tid = 0; tid < plan->origin_count; tid++)
-	{
+	for (tid = 0; tid < plan->origin_count; tid++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[tid];
 		PgracExternalFenceVerdict verdict;
 		PgracExternalFenceDenyReason reason;
@@ -1276,30 +1237,24 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 		elapsed_ms_ceil = (int)elapsed_ms;
 		if ((double)elapsed_ms_ceil < elapsed_ms)
 			elapsed_ms_ceil++;
-		remaining_ms = plan->acquire_timeout_ms_snapshot -
-			elapsed_ms_ceil;
-		if (remaining_ms <= 0)
-		{
+		remaining_ms = plan->acquire_timeout_ms_snapshot - elapsed_ms_ceil;
+		if (remaining_ms <= 0) {
 			verdict = PGRAC_EXTERNAL_FENCE_UNAVAILABLE;
 			reason = PGRAC_EXTERNAL_FENCE_DENY_TIMEOUT;
-		}
-		else
-		{
-			verdict = cluster_external_fence_admit_set_wait(
-				origin->needs, origin->formation, remaining_ms,
-				&origin->admissions);
+		} else {
+			verdict = cluster_external_fence_admit_set_wait(origin->needs, origin->formation,
+															remaining_ms, &origin->admissions);
 			reason = cluster_external_fence_last_deny_reason();
 		}
-		if (verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED)
-		{
+		if (verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED) {
 			int32 node_id = origin->duty.origin_node_id;
 			uint64 incarnation = origin->duty.origin_owner_incarnation;
 
 			recovery_fence_plan_release_members(plan);
 			MemSet(plan, 0, sizeof(*plan));
 			pfree(plan);
-			recovery_fence_unavailable(node_id, incarnation,
-				(int)verdict, (int)reason, "admission-set");
+			recovery_fence_unavailable(node_id, incarnation, (int)verdict, (int)reason,
+									   "admission-set");
 		}
 	}
 
@@ -1309,20 +1264,18 @@ cluster_recovery_merge_preflight_readonly(uint16 own_thread,
 }
 
 bool
-cluster_recovery_merge_fence_plan_acquire_serial(
-	ClusterRecoveryFencePlan *plan)
+cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 {
 	ClusterRecoverySerialRequest *requests;
 	ClusterRecoverySerialAcquireResult result;
 	uint16 failed_index;
 	uint16 i;
 
-	if (!recovery_fence_plan_valid(plan) || !plan->sealed ||
-		plan->serial_held || plan->committed || plan->origin_count == 0)
+	if (!recovery_fence_plan_valid(plan) || !plan->sealed || plan->serial_held || plan->committed
+		|| plan->origin_count == 0)
 		return false;
 	requests = palloc0(sizeof(*requests) * plan->origin_count);
-	for (i = 0; i < plan->origin_count; i++)
-	{
+	for (i = 0; i < plan->origin_count; i++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
 
 		requests[i].mode = CLUSTER_RECOVERY_SERIAL_COLD_FORMED;
@@ -1331,15 +1284,12 @@ cluster_recovery_merge_fence_plan_acquire_serial(
 		requests[i].formation = origin->formation;
 		requests[i].fence_need_set = origin->needs;
 		requests[i].fence_admission_set = origin->admissions;
-		requests[i].acquire_timeout_ms =
-			plan->acquire_timeout_ms_snapshot;
-		requests[i].release_timeout_ms =
-			plan->acquire_timeout_ms_snapshot;
+		requests[i].acquire_timeout_ms = plan->acquire_timeout_ms_snapshot;
+		requests[i].release_timeout_ms = plan->acquire_timeout_ms_snapshot;
 	}
-	result = cluster_recovery_serial_acquire_set(
-		requests, plan->origin_count,
-		plan->acquire_timeout_ms_snapshot,
-		&plan->serial_guards, &failed_index);
+	result = cluster_recovery_serial_acquire_set(requests, plan->origin_count,
+												 plan->acquire_timeout_ms_snapshot,
+												 &plan->serial_guards, &failed_index);
 	pfree(requests);
 	if (result != CLUSTER_RECOVERY_SERIAL_GRANTED)
 		return false;
@@ -1350,7 +1300,7 @@ cluster_recovery_merge_fence_plan_acquire_serial(
 bool
 cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 {
-	uint64 current_replay[2] = {0, 0};
+	uint64 current_replay[2] = { 0, 0 };
 	uint64 current_foreign[2];
 	XLogRecPtr current_start[CLUSTER_WAL_STATE_SLOT_COUNT + 1];
 	uint16 current_origins[CLUSTER_WAL_STATE_SLOT_COUNT];
@@ -1358,62 +1308,50 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 	ClusterMergeEngage engage;
 	uint16 tid;
 
-	if (!recovery_fence_plan_valid(plan) || !plan->sealed ||
-		!plan->serial_held || plan->committed)
+	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->serial_held || plan->committed)
 		return false;
 	MemSet(current_start, 0, sizeof(current_start));
 	engage = cluster_recovery_merge_project_readonly(
-		plan->own_thread, plan->start_lsn[plan->own_thread],
-		current_replay, current_start);
+		plan->own_thread, plan->start_lsn[plan->own_thread], current_replay, current_start);
 	if (engage != CLUSTER_MERGE_ENGAGE)
 		return false;
 	current_foreign[0] = current_replay[0];
 	current_foreign[1] = current_replay[1];
-	current_foreign[(plan->own_thread - 1) / 64] &=
-		~(UINT64_C(1) << ((plan->own_thread - 1) % 64));
+	current_foreign[(plan->own_thread - 1) / 64] &= ~(UINT64_C(1) << ((plan->own_thread - 1) % 64));
 
-	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++)
-	{
+	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
 		ClusterControlRootSnapshot snapshot;
 		ClusterControlRootReadToken token;
 		ClusterControlRootResult root_result;
 		int origin_index;
 
-		if ((current_foreign[(tid - 1) / 64] &
-			 (UINT64_C(1) << ((tid - 1) % 64))) == 0)
+		if ((current_foreign[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
 			continue;
 		origin_index = recovery_fence_plan_find_origin(plan, tid);
 		if (origin_index < 0)
 			return false;
-		root_result = cluster_control_root_read_canonical(
-			tid, &plan->origins[origin_index].duty,
-			CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
-		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
-			 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
-			snapshot.lifecycle !=
-				CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
-			cluster_recovery_duty_key_compare(
-				&snapshot.identity, &plan->origins[origin_index].duty) !=
-				CLUSTER_RECOVERY_DUTY_COMPARE_EXACT ||
-			memcmp(&token, &plan->origins[origin_index].root_token,
-				   sizeof(token)) != 0)
+		root_result = cluster_control_root_read_canonical(tid, &plan->origins[origin_index].duty,
+														  CLUSTER_CONTROL_ROOT_READ_STRONG,
+														  &snapshot, &token);
+		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| cluster_recovery_duty_key_compare(&snapshot.identity,
+												 &plan->origins[origin_index].duty)
+				   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
+			|| memcmp(&token, &plan->origins[origin_index].root_token, sizeof(token)) != 0)
 			return false;
 		current_origins[current_count++] = tid;
 	}
-	if (!cluster_recovery_fence_plan_shape_valid(
-			plan->own_thread, current_replay, current_foreign,
-			current_origins, current_count) ||
-		memcmp(current_replay, plan->replay_thread_bitmap,
-			   sizeof(current_replay)) != 0 ||
-		memcmp(current_foreign, plan->foreign_origin_bitmap,
-			   sizeof(current_foreign)) != 0 ||
-		current_count != plan->origin_count)
+	if (!cluster_recovery_fence_plan_shape_valid(plan->own_thread, current_replay, current_foreign,
+												 current_origins, current_count)
+		|| memcmp(current_replay, plan->replay_thread_bitmap, sizeof(current_replay)) != 0
+		|| memcmp(current_foreign, plan->foreign_origin_bitmap, sizeof(current_foreign)) != 0
+		|| current_count != plan->origin_count)
 		return false;
-	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++)
-	{
-		if ((current_replay[(tid - 1) / 64] &
-			 (UINT64_C(1) << ((tid - 1) % 64))) != 0 &&
-			current_start[tid] != plan->start_lsn[tid])
+	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
+		if ((current_replay[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) != 0
+			&& current_start[tid] != plan->start_lsn[tid])
 			return false;
 	}
 	if (!cluster_recovery_merge_fence_plan_revalidate_nowait(plan))
@@ -1423,55 +1361,47 @@ cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan)
 }
 
 bool
-cluster_recovery_merge_fence_plan_copy_replay(
-	const ClusterRecoveryFencePlan *plan, uint64 out_bitmap[2],
-	XLogRecPtr *out_start)
+cluster_recovery_merge_fence_plan_copy_replay(const ClusterRecoveryFencePlan *plan,
+											  uint64 out_bitmap[2], XLogRecPtr *out_start)
 {
 	uint16 tid;
 
-	if (!recovery_fence_plan_valid(plan) || !plan->committed ||
-		out_bitmap == NULL || out_start == NULL)
+	if (!recovery_fence_plan_valid(plan) || !plan->committed || out_bitmap == NULL
+		|| out_start == NULL)
 		return false;
-	memcpy(out_bitmap, plan->replay_thread_bitmap,
-		   sizeof(plan->replay_thread_bitmap));
+	memcpy(out_bitmap, plan->replay_thread_bitmap, sizeof(plan->replay_thread_bitmap));
 	for (tid = 0; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++)
 		out_start[tid] = plan->start_lsn[tid];
 	return true;
 }
 
 bool
-cluster_recovery_merge_fence_plan_revalidate_nowait(
-	ClusterRecoveryFencePlan *plan)
+cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan)
 {
 	PgracExternalFenceDenyReason reason;
 	uint16 i;
 
-	if (!recovery_fence_plan_valid(plan) || !plan->sealed ||
-		!plan->serial_held || plan->origin_count == 0 ||
-		plan->serial_guards.count != plan->origin_count)
+	if (!recovery_fence_plan_valid(plan) || !plan->sealed || !plan->serial_held
+		|| plan->origin_count == 0 || plan->serial_guards.count != plan->origin_count)
 		return false;
-	for (i = 0; i < plan->origin_count; i++)
-	{
+	for (i = 0; i < plan->origin_count; i++) {
 		ClusterRecoveryFenceOrigin *origin = &plan->origins[i];
 
-		if (cluster_recovery_serial_revalidate(
-				&plan->serial_guards.guards[i]) !=
-				CLUSTER_RECOVERY_SERIAL_CURRENT ||
-			cluster_formation_witness_revalidate_nowait(
-				origin->formation) != CLUSTER_FORMATION_WITNESS_READY ||
-			!cluster_external_fence_need_set_revalidate_nowait(
-				origin->needs, origin->formation, &reason) ||
-			!cluster_external_fence_revalidate_set_nowait(
-				origin->admissions, origin->needs, origin->formation,
-				&reason))
+		if (cluster_recovery_serial_revalidate(&plan->serial_guards.guards[i])
+				!= CLUSTER_RECOVERY_SERIAL_CURRENT
+			|| cluster_formation_witness_revalidate_nowait(origin->formation)
+				   != CLUSTER_FORMATION_WITNESS_READY
+			|| !cluster_external_fence_need_set_revalidate_nowait(origin->needs, origin->formation,
+																  &reason)
+			|| !cluster_external_fence_revalidate_set_nowait(origin->admissions, origin->needs,
+															 origin->formation, &reason))
 			return false;
 	}
 	return true;
 }
 
 bool
-cluster_recovery_merge_fence_plan_release_serial(
-	ClusterRecoveryFencePlan *plan)
+cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 {
 	ClusterRecoverySerialReleaseResult result;
 
@@ -1654,16 +1584,13 @@ cluster_recovery_merge_begin_internal(const uint64 merge_bitmap[2], const XLogRe
 
 			if (!restore_mode) {
 				root_result = cluster_control_root_lookup_owner_by_node_runtime(
-					(int) tid - 1, &root_identity, &root_snapshot, &root_token);
+					(int)tid - 1, &root_identity, &root_snapshot, &root_token);
 				if ((root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 					 || root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-					&& cluster_recovery_duty_key_compare(
-						&root_identity, &root_snapshot.identity)
+					&& cluster_recovery_duty_key_compare(&root_identity, &root_snapshot.identity)
 						   == CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
-					&& root_snapshot.validated_tail_lsn_exclusive
-						   > (uint64) start_lsn[tid])
-					validated_min =
-						(XLogRecPtr) root_snapshot.validated_tail_lsn_exclusive;
+					&& root_snapshot.validated_tail_lsn_exclusive > (uint64)start_lsn[tid])
+					validated_min = (XLogRecPtr)root_snapshot.validated_tail_lsn_exclusive;
 			}
 			ms->valid_end = merge_compute_valid_end(ms->dir, start_lsn[tid], validated_min,
 													!restore_mode && tid != own_thread, tid, tli,

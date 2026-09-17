@@ -45,15 +45,13 @@
 #include "access/transam.h"
 #include "access/xlogdefs.h"
 
-typedef enum ClusterSideProjectionKind
-{
+typedef enum ClusterSideProjectionKind {
 	CLUSTER_SIDE_PROJECTION_CLOG = 0,
 	CLUSTER_SIDE_PROJECTION_MULTIXACT,
 	CLUSTER_SIDE_PROJECTION_COMMIT_TS
 } ClusterSideProjectionKind;
 
-typedef enum ClusterSideProjectionActionV1
-{
+typedef enum ClusterSideProjectionActionV1 {
 	CLUSTER_SIDE_PROJECTION_ACTION_INVALID = 0,
 	CLUSTER_SIDE_PROJECTION_ACTION_ZERO_PAGE,
 	CLUSTER_SIDE_PROJECTION_ACTION_CREATE,
@@ -65,58 +63,53 @@ typedef enum ClusterSideProjectionActionV1
  * MULTIXACT CREATE members remain caller-owned bytes in the enclosing SIDE
  * plan; member_count/member_offset describe their exact native identity.
  */
-typedef struct ClusterSideProjectionOperationV1
-{
+typedef struct ClusterSideProjectionOperationV1 {
 	ClusterSideProjectionKind kind;
 	ClusterSideProjectionActionV1 action;
-	uint8		normalized_info;
-	uint8		reserved9[3];
-	int32		page_number;
-	Oid			oldest_database;
+	uint8 normalized_info;
+	uint8 reserved9[3];
+	int32 page_number;
+	Oid oldest_database;
 	TransactionId oldest_xid;
 	MultiXactId multixact_id;
 	MultiXactOffset member_offset;
-	uint32		member_count;
+	uint32 member_count;
 	MultiXactId truncate_start_multixact;
 	MultiXactId truncate_end_multixact;
 	MultiXactOffset truncate_start_member;
 	MultiXactOffset truncate_end_member;
 } ClusterSideProjectionOperationV1;
 
-typedef enum ClusterSideProjectionApplyResultV1
-{
+typedef enum ClusterSideProjectionApplyResultV1 {
 	CLUSTER_SIDE_PROJECTION_APPLY_OK = 0,
 	CLUSTER_SIDE_PROJECTION_APPLY_BLOCKED,
 	CLUSTER_SIDE_PROJECTION_APPLY_POST_READ_FAILED
 } ClusterSideProjectionApplyResultV1;
 
-typedef struct ClusterSideProjectionApplyInputV1
-{
+typedef struct ClusterSideProjectionApplyInputV1 {
 	const ClusterSideProjectionOperationV1 *operation;
 	const uint8 *owned_payload;
-	uint32		owned_payload_length;
-	uint16		origin_thread;
-	bool		source_retained;
-	uint8		reserved19;
-	uint32		cluster_epoch;
+	uint32 owned_payload_length;
+	uint16 origin_thread;
+	bool source_retained;
+	uint8 reserved19;
+	uint32 cluster_epoch;
 	XLogRecPtr source_lsn;
 	XLogRecPtr source_end_lsn;
 } ClusterSideProjectionApplyInputV1;
 
-typedef bool (*ClusterSideProjectionResetRangeV1)(void *arg,
-	int origin_slot, TransactionId first_xid, uint32 xid_count);
-typedef bool (*ClusterSideProjectionRangeEmptyV1)(void *arg,
-	int origin_slot, TransactionId first_xid, uint32 xid_count);
-typedef bool (*ClusterSideProjectionTruncateBeforeV1)(void *arg,
-	int origin_slot, TransactionId oldest_xid);
-typedef bool (*ClusterSideProjectionMultiOperationV1)(void *arg,
-	int origin_slot, uint32 cluster_epoch,
-	const ClusterSideProjectionOperationV1 *operation,
-	const uint8 *owned_payload, uint32 owned_payload_length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+typedef bool (*ClusterSideProjectionResetRangeV1)(void *arg, int origin_slot,
+												  TransactionId first_xid, uint32 xid_count);
+typedef bool (*ClusterSideProjectionRangeEmptyV1)(void *arg, int origin_slot,
+												  TransactionId first_xid, uint32 xid_count);
+typedef bool (*ClusterSideProjectionTruncateBeforeV1)(void *arg, int origin_slot,
+													  TransactionId oldest_xid);
+typedef bool (*ClusterSideProjectionMultiOperationV1)(
+	void *arg, int origin_slot, uint32 cluster_epoch,
+	const ClusterSideProjectionOperationV1 *operation, const uint8 *owned_payload,
+	uint32 owned_payload_length, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
 
-typedef struct ClusterSideProjectionApplyOpsV1
-{
+typedef struct ClusterSideProjectionApplyOpsV1 {
 	void *arg;
 	ClusterSideProjectionResetRangeV1 reset_remote_xact_range;
 	ClusterSideProjectionRangeEmptyV1 remote_xact_range_empty;
@@ -126,22 +119,19 @@ typedef struct ClusterSideProjectionApplyOpsV1
 } ClusterSideProjectionApplyOpsV1;
 
 extern ClusterSideProjectionApplyResultV1
-cluster_side_projection_target_preflight_v1(
-	const ClusterSideProjectionApplyInputV1 *input);
+cluster_side_projection_target_preflight_v1(const ClusterSideProjectionApplyInputV1 *input);
 extern ClusterSideProjectionApplyResultV1
-cluster_side_projection_apply_owned_v1(
-	const ClusterSideProjectionApplyInputV1 *input,
-	const ClusterSideProjectionApplyOpsV1 *ops);
+cluster_side_projection_apply_owned_v1(const ClusterSideProjectionApplyInputV1 *input,
+									   const ClusterSideProjectionApplyOpsV1 *ops);
 
 /*
  * §2.4 verifier facts for one projection scope.
  */
-typedef struct ClusterSideProjectionVerifyInput
-{
-	bool		canonical_truth_ok; /* canonical producer (TT/undo + matching
+typedef struct ClusterSideProjectionVerifyInput {
+	bool canonical_truth_ok; /* canonical producer (TT/undo + matching
 									 * terminal redo) bidirectional match */
-	bool		coverage_ok;	/* xid/origin/wrap/terminal coverage exact */
-	bool		integrity_ok;	/* checksum/coverage mismatch detector passed */
+	bool coverage_ok;		 /* xid/origin/wrap/terminal coverage exact */
+	bool integrity_ok;		 /* checksum/coverage mismatch detector passed */
 } ClusterSideProjectionVerifyInput;
 
 /*
@@ -165,20 +155,18 @@ extern bool cluster_side_projection_verified(ClusterSideProjectionKind kind,
  * check for the rebuild source.
  */
 extern bool cluster_side_projection_rebuildable(ClusterSideProjectionKind kind,
-												bool source_retained,
-												bool canonical_producer_ok);
+												bool source_retained, bool canonical_producer_ok);
 
 /*
  * §2.4 lookup verdict: a VERIFIED projection answers; anything else is
  * FAIL_CLOSED (scope closed until rebuild; no synchronous network or
  * durable I/O is added by this judgement — it is a pure function).
  */
-typedef enum ClusterSideProjectionLookup
-{
+typedef enum ClusterSideProjectionLookup {
 	CLUSTER_SIDE_PROJECTION_LOOKUP_OK = 0,
 	CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED
 } ClusterSideProjectionLookup;
 
 extern ClusterSideProjectionLookup cluster_side_projection_lookup(bool verified);
 
-#endif							/* CLUSTER_SIDE_PROJECTION_H */
+#endif /* CLUSTER_SIDE_PROJECTION_H */

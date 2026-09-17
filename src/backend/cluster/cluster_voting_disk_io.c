@@ -595,9 +595,8 @@ cluster_voting_disk_write_formation_slot(int fd, uint32 node_id, const void *in_
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 
 	voting_disk_io_arm_timeout();
-	nwritten
-		= pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
-				 CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id));
+	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
+					  CLUSTER_VOTING_FORMATION_SLOT_OFFSET(node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES) {
 		voting_disk_io_disarm_timeout();
 		return CLUSTER_VOTING_DISK_IO_FAILED;
@@ -873,8 +872,7 @@ cluster_voting_disk_read_raw_slot_at(int fd, off_t offset, void *out_slot512)
 
 	if (fd < 0)
 		return CLUSTER_VOTING_DISK_RAW_READ_NOT_TRIED;
-	if (out_slot512 == NULL || offset < 0
-		|| offset % CLUSTER_VOTING_SLOT_BYTES != 0)
+	if (out_slot512 == NULL || offset < 0 || offset % CLUSTER_VOTING_SLOT_BYTES != 0)
 		return CLUSTER_VOTING_DISK_RAW_READ_IO_FAILED;
 
 	memset(aligned, 0, sizeof(aligned));
@@ -894,16 +892,14 @@ cluster_voting_disk_read_raw_slot_at(int fd, off_t offset, void *out_slot512)
 
 
 ClusterVotingDiskIoState
-cluster_voting_disk_write_raw_slot_at(int fd, off_t offset,
-								  const void *in_slot512)
+cluster_voting_disk_write_raw_slot_at(int fd, off_t offset, const void *in_slot512)
 {
 	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
 	ssize_t nwritten;
 
 	if (fd < 0)
 		return CLUSTER_VOTING_DISK_IO_NOT_TRIED;
-	if (in_slot512 == NULL || offset < 0
-		|| offset % CLUSTER_VOTING_SLOT_BYTES != 0)
+	if (in_slot512 == NULL || offset < 0 || offset % CLUSTER_VOTING_SLOT_BYTES != 0)
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
@@ -948,8 +944,7 @@ cluster_voting_disk_read_epoch_ballot_slot(int fd, uint32 proposer_node_id, void
 }
 
 ClusterVotingDiskIoState
-cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id,
-											const void *in_slot512)
+cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id, const void *in_slot512)
 {
 	char aligned[CLUSTER_VOTING_SLOT_BYTES] __attribute__((aligned(512)));
 	ssize_t nwritten;
@@ -961,7 +956,7 @@ cluster_voting_disk_write_epoch_ballot_slot(int fd, uint32 proposer_node_id,
 
 	memcpy(aligned, in_slot512, CLUSTER_VOTING_SLOT_BYTES);
 	nwritten = pwrite(fd, aligned, CLUSTER_VOTING_SLOT_BYTES,
-					CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(proposer_node_id));
+					  CLUSTER_VOTING_EPOCH_BALLOT_SLOT_OFFSET(proposer_node_id));
 	if (nwritten != CLUSTER_VOTING_SLOT_BYTES)
 		return CLUSTER_VOTING_DISK_IO_FAILED;
 	if (fdatasync(fd) != 0)
@@ -989,8 +984,7 @@ voting_disk_raw_authority_attest(int fd, uint64 required_capacity)
 		return false;
 	if (ioctl(fd, BLKGETSIZE64, &capacity) != 0)
 		return false;
-	return capacity >= required_capacity
-		   && (capacity % CLUSTER_VOTING_SLOT_BYTES) == 0;
+	return capacity >= required_capacity && (capacity % CLUSTER_VOTING_SLOT_BYTES) == 0;
 #else
 	(void)fd;
 	(void)required_capacity;
@@ -1001,15 +995,13 @@ voting_disk_raw_authority_attest(int fd, uint64 required_capacity)
 bool
 cluster_voting_disk_epoch_ballot_authority_attest(int fd)
 {
-	return voting_disk_raw_authority_attest(
-		fd, (uint64)CLUSTER_VOTING_FILE_BYTES_MIN);
+	return voting_disk_raw_authority_attest(fd, (uint64)CLUSTER_VOTING_FILE_BYTES_MIN);
 }
 
 bool
 cluster_voting_disk_pgrd_authority_attest(int fd)
 {
-	if (voting_disk_raw_authority_attest(
-			fd, (uint64)CLUSTER_VOTING_PGRD_FILE_BYTES_MIN))
+	if (voting_disk_raw_authority_attest(fd, (uint64)CLUSTER_VOTING_PGRD_FILE_BYTES_MIN))
 		return true;
 #ifndef __linux__
 	{

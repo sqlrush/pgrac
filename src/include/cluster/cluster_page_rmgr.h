@@ -73,16 +73,15 @@
  *                  mutation declaration + VersionToken producer contract
  *                  land with the apply chain (PGDEL-03/06).
  */
-typedef struct ClusterPageRmgrCensusEntry
-{
-	uint8		rmid;
-	uint16		opcode;
-	uint16		opcode_mask;
+typedef struct ClusterPageRmgrCensusEntry {
+	uint8 rmid;
+	uint16 opcode;
+	uint16 opcode_mask;
 	ClusterPageClass page_class;
-	bool		affects_page;
-	bool		known_delta;
-	bool		will_init;
-	bool		decoder_registered;
+	bool affects_page;
+	bool known_delta;
+	bool will_init;
+	bool decoder_registered;
 } ClusterPageRmgrCensusEntry;
 
 /*
@@ -111,21 +110,19 @@ extern void cluster_page_rmgr_populate_known_set(void);
  * expected-before -> result-version edge topology is the apply chain's
  * contract (PGDEL-03/06).
  */
-typedef struct ClusterPageRedoHints
-{
-	SCN			record_scn;		/* xl_scn from the record header */
-	XLogRecPtr	record_lsn;		/* record EndRecPtr */
-	SCN			page_scn;		/* pd_block_scn of the working page (caller) */
-	XLogRecPtr	page_lsn;		/* pd_lsn of the working page (caller) */
+typedef struct ClusterPageRedoHints {
+	SCN record_scn;		   /* xl_scn from the record header */
+	XLogRecPtr record_lsn; /* record EndRecPtr */
+	SCN page_scn;		   /* pd_block_scn of the working page (caller) */
+	XLogRecPtr page_lsn;   /* pd_lsn of the working page (caller) */
 } ClusterPageRedoHints;
 
-typedef struct ClusterPageRedoDecoded
-{
-	ClusterPageClass page_class; /* census row assignment */
+typedef struct ClusterPageRedoDecoded {
+	ClusterPageClass page_class;  /* census row assignment */
 	ClusterPageIdentity identity; /* from the record block reference */
 	ClusterPageRedoHints hints;
-	bool		full_image;		/* XLR block image present AND applies */
-	bool		will_init;		/* BKPBLOCK_WILL_INIT attribute */
+	bool full_image; /* XLR block image present AND applies */
+	bool will_init;	 /* BKPBLOCK_WILL_INIT attribute */
 } ClusterPageRedoDecoded;
 
 /*
@@ -138,4 +135,4 @@ typedef struct ClusterPageRedoDecoded
 extern bool cluster_page_redo_decode(XLogReaderState *record, uint8 block_id,
 									 ClusterPageRedoDecoded *out);
 
-#endif							/* CLUSTER_PAGE_RMGR_H */
+#endif /* CLUSTER_PAGE_RMGR_H */

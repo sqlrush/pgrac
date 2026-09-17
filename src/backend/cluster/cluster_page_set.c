@@ -29,8 +29,7 @@
  * (equal SCN with different incarnation/identity is NOT adjacency,
  * spec §3.4/PU-06/PU-27). */
 static bool
-cluster_page_chain_adjacent(const ClusterPageRedoChange *a,
-							const ClusterPageRedoChange *b)
+cluster_page_chain_adjacent(const ClusterPageRedoChange *a, const ClusterPageRedoChange *b)
 {
 	if (!cluster_page_version_valid(&a->result_version)
 		|| !cluster_page_version_valid(&b->expected_before))
@@ -41,7 +40,7 @@ cluster_page_chain_adjacent(const ClusterPageRedoChange *a,
 ClusterPageClosureResult
 cluster_page_contributor_closure(const ClusterBlockRecoverySet *set)
 {
-	int			i;
+	int i;
 
 	if (set == NULL || set->n_contributors < 0)
 		return CLUSTER_PAGE_CLOSURE_INVALID_INPUT;
@@ -62,8 +61,7 @@ cluster_page_contributor_closure(const ClusterBlockRecoverySet *set)
 	 * the production stability witness the PGDEL-04 CURRENT validator
 	 * carries — the version equality here is the chain half of that). */
 	if (set->n_contributors == 0) {
-		if (cluster_page_version_equal(&set->source_version,
-									   &set->terminal_version))
+		if (cluster_page_version_equal(&set->source_version, &set->terminal_version))
 			return CLUSTER_PAGE_CLOSURE_OK;
 		return CLUSTER_PAGE_CLOSURE_GAP;
 	}
@@ -90,16 +88,14 @@ cluster_page_contributor_closure(const ClusterBlockRecoverySet *set)
 
 		/* First contributor must join from the selected source version. */
 		if (i == 0) {
-			if (!cluster_page_version_equal(&set->source_version,
-											&c->expected_before))
+			if (!cluster_page_version_equal(&set->source_version, &c->expected_before))
 				return CLUSTER_PAGE_CLOSURE_GAP;
 		} else if (!cluster_page_chain_adjacent(&set->contributors[i - 1], c)) {
 			/* Incarnation boundary: the versions are unequal (equal SCN
 			 * with different incarnation is a mismatch, PU-06).  Report
 			 * the incarnation cross distinctly so the caller can route
 			 * to the PC-INCARNATION lifecycle instead of a silent gap. */
-			if (cluster_page_identity_equal(&set->contributors[i - 1].identity,
-											&c->identity)
+			if (cluster_page_identity_equal(&set->contributors[i - 1].identity, &c->identity)
 				&& set->contributors[i - 1].result_version.incarnation
 					   != c->expected_before.incarnation)
 				return CLUSTER_PAGE_CLOSURE_INCARNATION_CROSS;
@@ -110,9 +106,8 @@ cluster_page_contributor_closure(const ClusterBlockRecoverySet *set)
 	/* Terminal: the last result must equal the required terminal EXACTLY
 	 * (terminal uniqueness by construction — a mismatch fails instead of
 	 * guessing). */
-	if (!cluster_page_version_equal(
-			&set->contributors[set->n_contributors - 1].result_version,
-			&set->terminal_version))
+	if (!cluster_page_version_equal(&set->contributors[set->n_contributors - 1].result_version,
+									&set->terminal_version))
 		return CLUSTER_PAGE_CLOSURE_TERMINAL_MISMATCH;
 	return CLUSTER_PAGE_CLOSURE_OK;
 }
@@ -121,11 +116,10 @@ bool
 cluster_page_contributor_chain_covers(const ClusterBlockRecoverySet *set,
 									  const ClusterPageVersion *from_version)
 {
-	int			start;
-	int			i;
+	int start;
+	int i;
 
-	if (set == NULL || from_version == NULL
-		|| !cluster_page_version_valid(from_version))
+	if (set == NULL || from_version == NULL || !cluster_page_version_valid(from_version))
 		return false;
 	if (!cluster_page_version_valid(&set->source_version)
 		|| !cluster_page_version_valid(&set->terminal_version))
@@ -138,14 +132,13 @@ cluster_page_contributor_chain_covers(const ClusterBlockRecoverySet *set,
 	 * adjacent and lands on the terminal. */
 	start = -1;
 	for (i = 0; i < set->n_contributors; i++) {
-		if (cluster_page_version_equal(&set->contributors[i].result_version,
-									   from_version)) {
+		if (cluster_page_version_equal(&set->contributors[i].result_version, from_version)) {
 			start = i;
 			break;
 		}
 	}
 	if (start < 0)
-		return false;			/* from_version not produced by any change */
+		return false; /* from_version not produced by any change */
 
 	for (i = start; i < set->n_contributors; i++) {
 		const ClusterPageRedoChange *c = &set->contributors[i];
@@ -156,11 +149,9 @@ cluster_page_contributor_chain_covers(const ClusterBlockRecoverySet *set,
 		if (!cluster_page_version_valid(&c->expected_before)
 			|| !cluster_page_version_valid(&c->result_version))
 			return false;
-		if (i > start && !cluster_page_chain_adjacent(&set->contributors[i - 1],
-													  c))
+		if (i > start && !cluster_page_chain_adjacent(&set->contributors[i - 1], c))
 			return false;
 	}
-	return cluster_page_version_equal(
-		&set->contributors[set->n_contributors - 1].result_version,
-		&set->terminal_version);
+	return cluster_page_version_equal(&set->contributors[set->n_contributors - 1].result_version,
+									  &set->terminal_version);
 }

@@ -399,24 +399,20 @@ extern void LmsMain(void) pg_attribute_noreturn();
 extern void LmsWorkerMain(int worker_id) pg_attribute_noreturn();
 
 /* D4-B LMON/worker0 close handshake over the existing 80-byte control tail. */
-extern bool cluster_lms_r4_drain_request(ClusterLmsSharedState *state,
-									 uint64 generation,
-									 uint64 *worker_incarnation);
+extern bool cluster_lms_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
+										 uint64 *worker_incarnation);
 
 #ifdef USE_CLUSTER_UNIT
 extern uint64 cluster_lms_test_publish_r4_worker_incarnation(ClusterLmsSharedState *state,
-												 int worker_id);
-extern bool cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state,
-											 uint64 generation,
-											 uint64 *worker_incarnation);
-extern bool cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state,
-										 uint64 worker_incarnation,
-										 uint64 generation);
+															 int worker_id);
+extern bool cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
+											  uint64 *worker_incarnation);
+extern bool cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation,
+										  uint64 generation);
 extern bool cluster_lms_test_r4_drain_ack_matches(ClusterLmsSharedState *state,
-												 uint64 worker_incarnation,
-												 uint64 generation);
+												  uint64 worker_incarnation, uint64 generation);
 extern bool cluster_lms_test_r4_drain_ack_tick(ClusterLmsSharedState *state,
-											 uint64 worker_incarnation);
+											   uint64 worker_incarnation);
 #endif
 
 /*
@@ -440,12 +436,10 @@ extern void cluster_lms_data_plane_tick(long timeout_ms);
 extern void cluster_lms_data_plane_shutdown(void);
 
 #ifdef USE_CLUSTER_UNIT
-extern void cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
-											  bool connected, bool enabled,
-											  bool wes_dirty);
-extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id,
-											  int *fd_out, bool *down_out,
-											  bool *wes_dirty_out);
+extern void cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd, bool connected,
+												  bool enabled, bool wes_dirty);
+extern bool cluster_lms_data_plane_test_peer_snapshot(int32 peer_id, int *fd_out, bool *down_out,
+													  bool *wes_dirty_out);
 #endif
 
 /*
@@ -462,14 +456,15 @@ extern void cluster_lms_outbound_request_lwlocks(void);
 extern bool cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 										 const void *payload, uint16 payload_len);
 extern bool cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type,
-											   uint32 dest_node_id, const void *payload,
-											   uint16 payload_len, uint32 required_capability,
-											   uint32 connection_generation);
+												   uint32 dest_node_id, const void *payload,
+												   uint16 payload_len, uint32 required_capability,
+												   uint32 connection_generation);
 struct ResourceXIntentSlot;
 struct ClusterPcmOwnSnapshot;
-extern bool cluster_lms_outbound_enqueue_resource_x_intent(
-	int worker_id, const struct ResourceXIntentSlot *intent,
-	uint32 connection_generation, uint64 deadline_us);
+extern bool cluster_lms_outbound_enqueue_resource_x_intent(int worker_id,
+														   const struct ResourceXIntentSlot *intent,
+														   uint32 connection_generation,
+														   uint64 deadline_us);
 
 /* Process-local handle for the current-slice remote-S holder adaptation.
  * It names one exact PENDING slot in the existing LMS DATA ring; none of
@@ -483,23 +478,19 @@ typedef struct ClusterLmsRemoteSStatusHandle {
 	uint64 reservation_token;
 } ClusterLmsRemoteSStatusHandle;
 
-extern ClusterPcmOwnResult
-cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
-	int worker_id, uint32 dest_node_id, const void *payload,
-	uint16 payload_len, const struct ClusterPcmOwnSnapshot *expected_revoking,
+extern ClusterPcmOwnResult cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
+	int worker_id, uint32 dest_node_id, const void *payload, uint16 payload_len,
+	const struct ClusterPcmOwnSnapshot *expected_revoking,
 	ClusterLmsRemoteSStatusHandle *handle_out);
-extern ClusterPcmOwnResult
-cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
-	const ClusterLmsRemoteSStatusHandle *handle,
-	const struct ClusterPcmOwnSnapshot *released_n);
-extern ClusterPcmOwnResult
-cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
+extern ClusterPcmOwnResult cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
+	const ClusterLmsRemoteSStatusHandle *handle, const struct ClusterPcmOwnSnapshot *released_n);
+extern ClusterPcmOwnResult cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
 	const ClusterLmsRemoteSStatusHandle *handle);
 extern int cluster_lms_outbound_resource_x_intent_pump(void);
 struct GcsBlockReplyHeader;
 extern bool cluster_lms_outbound_enqueue_zero_block_reply(int worker_id, uint32 dest_node_id,
-												  const struct GcsBlockReplyHeader *header,
-												  bool direct_land);
+														  const struct GcsBlockReplyHeader *header,
+														  bool direct_land);
 extern bool cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 	int worker_id, uint32 dest_node_id, const struct GcsBlockReplyHeader *header,
 	uint32 required_capability, uint32 connection_generation);
@@ -516,8 +507,8 @@ typedef struct ClusterLmsResourceXTransportSnapshot {
 StaticAssertDecl(sizeof(ClusterLmsResourceXTransportSnapshot) == 16,
 				 "Resource-X transport snapshot layout must remain 16 bytes");
 
-extern bool cluster_lms_outbound_resource_x_transport_snapshot(
-	ClusterLmsResourceXTransportSnapshot *out);
+extern bool
+cluster_lms_outbound_resource_x_transport_snapshot(ClusterLmsResourceXTransportSnapshot *out);
 extern uint64 cluster_lms_outbound_resource_x_staged_count(void);
 
 /*

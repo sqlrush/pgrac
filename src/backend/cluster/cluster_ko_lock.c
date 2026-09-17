@@ -439,16 +439,14 @@ cluster_ko_flush_and_wait_ack(RelFileLocator rloc, char relpersistence)
 	 * runs.  Refuse before KO, buffer invalidation or physical removal unless
 	 * every local receipt for the relfilenode is already terminal.
 	 */
-	if (!cluster_ctrc_relation_removal_ready_shared(
-			(uint32)rloc.spcOid, (uint32)rloc.dbOid,
-			(uint32)rloc.relNumber))
-	{
+	if (!cluster_ctrc_relation_removal_ready_shared((uint32)rloc.spcOid, (uint32)rloc.dbOid,
+													(uint32)rloc.relNumber)) {
 		KO_BUMP(failclosed_count);
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_OBJECT_FLUSH_UNAVAILABLE),
-				 errmsg("could not drain terminal-reference receipts for relfilenode %u/%u/%u before reuse",
-						(unsigned)rloc.spcOid, (unsigned)rloc.dbOid,
-						(unsigned)rloc.relNumber),
+				 errmsg("could not drain terminal-reference receipts for relfilenode %u/%u/%u "
+						"before reuse",
+						(unsigned)rloc.spcOid, (unsigned)rloc.dbOid, (unsigned)rloc.relNumber),
 				 errhint("Wait for canonical terminal-reference cleanout and retry.")));
 	}
 	if (!cluster_object_reuse_flush_enabled)
@@ -655,10 +653,8 @@ cluster_ko_drain_inbound_and_apply(void)
 		/* A peer may publish DONE only after its own bounded CTRC journal is
 		 * drained.  No ACK makes the enqueuer fail closed without extending
 		 * the existing KO wire. */
-		if (!cluster_ctrc_relation_removal_ready_shared(
-				(uint32)rloc.spcOid, (uint32)rloc.dbOid,
-				(uint32)rloc.relNumber))
-		{
+		if (!cluster_ctrc_relation_removal_ready_shared((uint32)rloc.spcOid, (uint32)rloc.dbOid,
+														(uint32)rloc.relNumber)) {
 			head = pg_atomic_read_u32(&ko_state->inbound_head);
 			tail = pg_atomic_read_u32(&ko_state->inbound_tail);
 			continue;

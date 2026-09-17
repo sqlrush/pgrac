@@ -56,8 +56,8 @@
 #include "cluster/cluster_grd.h"		 /* ClusterGrdHolderId */
 #include "cluster/cluster_resource_x_identity.h"
 #include "cluster/cluster_resource_x_node_wire.h"
-#include "cluster/cluster_scn.h"		 /* spec-2.41 D2 — SCN dual watermark */
-#include "storage/buf_internals.h"		 /* BufferTag */
+#include "cluster/cluster_scn.h"   /* spec-2.41 D2 — SCN dual watermark */
+#include "storage/buf_internals.h" /* BufferTag */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -192,8 +192,7 @@ typedef struct PcmReclaimBatch {
 	uint8 reserved[7];
 } PcmReclaimBatch;
 
-StaticAssertDecl(sizeof(PcmReclaimBatch) == 24,
-				 "PcmReclaimBatch layout must remain 24 bytes");
+StaticAssertDecl(sizeof(PcmReclaimBatch) == 24, "PcmReclaimBatch layout must remain 24 bytes");
 
 /* Read-only D5 lifecycle observability.  Every value is sourced from the
  * native PCM directory/reclaim owner; none aliases the removed PCM-X ticket
@@ -412,8 +411,7 @@ extern void cluster_pcm_vm_clear_note(const BufferTag *tag, BlockNumber heap_blo
 extern void cluster_pcm_vm_latency_note(const BufferTag *tag, bool remote, uint64 elapsed_us);
 extern bool cluster_pcm_vm_stats_snapshot(PcmVmStats *out);
 
-StaticAssertDecl(sizeof(PcmGrdLifecycleStats)
-				 == (9 + PCM_RETIRE_REFUSAL_N) * sizeof(uint64),
+StaticAssertDecl(sizeof(PcmGrdLifecycleStats) == (9 + PCM_RETIRE_REFUSAL_N) * sizeof(uint64),
 				 "PcmGrdLifecycleStats must remain a fixed native counter cohort");
 
 /* Read-only current gauges for protocol debt which must drain before a
@@ -442,8 +440,7 @@ typedef struct PcmEntryRef {
 	uint8 reserved[3];
 } PcmEntryRef;
 
-StaticAssertDecl(sizeof(PcmEntryRef) == 48,
-				 "PcmEntryRef layout must remain 48 bytes");
+StaticAssertDecl(sizeof(PcmEntryRef) == 48, "PcmEntryRef layout must remain 48 bytes");
 
 /* A staged transport may outlive the lookup pin that created it.  This
  * exact identity keeps the binding non-retirable without granting PCM or
@@ -460,23 +457,20 @@ typedef struct PcmEntryTransportRef {
 StaticAssertDecl(sizeof(PcmEntryTransportRef) == 48,
 				 "PcmEntryTransportRef layout must remain 48 bytes");
 
-extern bool pcm_entry_ref_acquire(const BufferTag *tag, bool create,
-	PcmEntryRef *out, PcmEntryAcquireResult *result);
+extern bool pcm_entry_ref_acquire(const BufferTag *tag, bool create, PcmEntryRef *out,
+								  PcmEntryAcquireResult *result);
 extern void pcm_entry_ref_release(PcmEntryRef *ref);
 extern bool pcm_entry_transport_ref_begin(const PcmEntryRef *entry_ref,
-	PcmEntryTransportRef *transport_ref);
+										  PcmEntryTransportRef *transport_ref);
 extern void pcm_entry_transport_ref_end(PcmEntryTransportRef *transport_ref);
-extern bool pcm_entry_retire_classify_exact(const BufferTag *tag,
-	uint64 expected_generation, PcmRetireRefusal *why);
-extern bool pcm_entry_try_retire_exact(const BufferTag *tag,
-	uint64 binding_generation, PcmRetireReason reason);
-extern bool cluster_pcm_lock_reclaim_bounded(uint32 probe_budget,
-	PcmReclaimBatch *out);
+extern bool pcm_entry_retire_classify_exact(const BufferTag *tag, uint64 expected_generation,
+											PcmRetireRefusal *why);
+extern bool pcm_entry_try_retire_exact(const BufferTag *tag, uint64 binding_generation,
+									   PcmRetireReason reason);
+extern bool cluster_pcm_lock_reclaim_bounded(uint32 probe_budget, PcmReclaimBatch *out);
 extern void cluster_pcm_lock_lmon_reclaim_tick(void);
-extern void cluster_pcm_grd_lifecycle_stats_snapshot(
-	PcmGrdLifecycleStats *out);
-extern void cluster_pcm_grd_protocol_debt_snapshot(
-	PcmGrdProtocolDebtStats *out);
+extern void cluster_pcm_grd_lifecycle_stats_snapshot(PcmGrdLifecycleStats *out);
+extern void cluster_pcm_grd_protocol_debt_snapshot(PcmGrdProtocolDebtStats *out);
 
 /* Stage 8 R9: one logical Resource-X acquisition is the already-frozen D6
  * assertion plus exact formation and acquisition generation.  Transport
@@ -976,15 +970,15 @@ extern bool cluster_pcm_lock_resource_x_trace_begin(const BufferTag *tag, uint64
 extern bool cluster_pcm_lock_resource_x_trace_seal(uint64 epoch);
 extern bool cluster_pcm_lock_resource_x_trace_snapshot(ResourceXTraceStats *out);
 extern uint32 cluster_pcm_lock_resource_x_trace_read(uint64 epoch, uint64 first,
-													  ResourceXTraceEvent *out, uint32 limit);
+													 ResourceXTraceEvent *out, uint32 limit);
 extern bool cluster_pcm_lock_resource_x_trace_release(uint64 epoch);
 extern void cluster_pcm_lock_resource_x_trace_note(const ResourceXTraceEvent *event);
-extern void cluster_pcm_lock_resource_x_trace_ref(uint16 kind,
-	const ResourceXAcquisitionRef *ref, uint64 value);
-extern void cluster_pcm_lock_resource_x_trace_frame(uint16 kind,
-	const ResourceXDecodedFrame *frame, int32 peer, int32 result);
-extern void cluster_pcm_lock_resource_x_trace_wire(uint8 msg_type, int32 peer,
-	const void *payload, uint32 length, int32 result);
+extern void cluster_pcm_lock_resource_x_trace_ref(uint16 kind, const ResourceXAcquisitionRef *ref,
+												  uint64 value);
+extern void cluster_pcm_lock_resource_x_trace_frame(uint16 kind, const ResourceXDecodedFrame *frame,
+													int32 peer, int32 result);
+extern void cluster_pcm_lock_resource_x_trace_wire(uint8 msg_type, int32 peer, const void *payload,
+												   uint32 length, int32 result);
 
 /* Exact, process-local D2 result retained for the R8 sweep owner.  This is
  * deliberately not a wire structure and carries both the removed queue
@@ -1036,8 +1030,7 @@ typedef struct ResourceXReconfigToken {
 	uint32 reserved;
 } ResourceXReconfigToken;
 
-#define RESOURCE_X_RECONFIG_RECLAIM_WITNESS_MAX \
-	(4 * RESOURCE_X_PROTOCOL_NODE_LIMIT)
+#define RESOURCE_X_RECONFIG_RECLAIM_WITNESS_MAX (4 * RESOURCE_X_PROTOCOL_NODE_LIMIT)
 
 typedef struct ResourceXReconfigBatch {
 	uint32 examined_count;
@@ -1054,8 +1047,7 @@ typedef struct ResourceXReconfigBatch {
 	uint32 reclaim_orphan_count;
 	uint64 next_state_index;
 	uint64 residual_count;
-	ResourceXReclaimWitness
-		reclaim_witnesses[RESOURCE_X_RECONFIG_RECLAIM_WITNESS_MAX];
+	ResourceXReclaimWitness reclaim_witnesses[RESOURCE_X_RECONFIG_RECLAIM_WITNESS_MAX];
 } ResourceXReconfigBatch;
 
 typedef struct ResourceXReconfigStats {
@@ -1422,52 +1414,42 @@ extern PcmLockMode cluster_pcm_lock_query(BufferTag tag);
 extern int cluster_pcm_grd_capacity(void);
 extern bool cluster_pcm_lock_authority_snapshot(BufferTag tag, PcmAuthoritySnapshot *out);
 extern bool cluster_pcm_lock_r4_route_snapshot(BufferTag tag, PcmAuthoritySnapshot *authority_out,
-										uint64 *master_authority_generation_out,
-										SCN *expected_page_scn_out);
+											   uint64 *master_authority_generation_out,
+											   SCN *expected_page_scn_out);
 extern bool cluster_pcm_lock_authority_matches(BufferTag tag, const PcmAuthoritySnapshot *expected);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_t1_grant_exact(const ResourceXAcquisitionRef *ref);
 /* Temporary R10 production adapter handoff.  The caller must already have
  * selected the exact PCM-X master ticket, then pass a complete legacy
  * authority snapshot taken without either domain lock. */
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_adapter_base_bind_exact(
-	const ResourceXAssertion *assertion, uint64 formation,
-	uint64 base_authority_generation,
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_adapter_base_bind_exact(
+	const ResourceXAssertion *assertion, uint64 formation, uint64 base_authority_generation,
 	const PcmAuthoritySnapshot *legacy_authority);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_adapter_head_rebind_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	uint64 ticket_id, uint64 formation,
-	uint64 base_authority_generation,
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_adapter_head_rebind_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence, uint64 ticket_id,
+	uint64 formation, uint64 base_authority_generation,
 	const PcmAuthoritySnapshot *legacy_authority);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_adapter_successor_base_exact(
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_adapter_successor_base_exact(
 	const ResourceXAssertion *assertion, uint64 formation,
-	const PcmAuthoritySnapshot *legacy_authority,
-	uint64 *base_authority_generation_out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_exact(
-	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
-	ResourceXMasterSnapshot *out);
+	const PcmAuthoritySnapshot *legacy_authority, uint64 *base_authority_generation_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_assert_exact(const ResourceXDecodedFrame *assertion,
+										 int32 authenticated_source_node,
+										 ResourceXMasterSnapshot *out);
 /* PGRAC adaptation: kind-9 is a non-authority pre-ASSERT receipt.  The
  * caller passes independently authenticated/current connection, R4, and
  * master-session values; the exact ASSERT consumes the receipt under the
  * same resource entry lock that creates the canonical master request. */
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_request_exact(
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_request_exact(
 	const ResourceXDecodedFrame *request, int32 authenticated_source_node,
-	uint32 authenticated_ingress_connection_generation,
-	uint64 r4_record_generation, uint64 current_master_session_incarnation,
-	uint32 master_sender_connection_generation,
+	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation,
+	uint64 current_master_session_incarnation, uint32 master_sender_connection_generation,
 	ResourceXDecodedFrame *ack_out);
-extern bool cluster_pcm_lock_resource_x_s_barrier_active(
-	const BufferTag *tag);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
+extern bool cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
 	const ResourceXDecodedFrame *assertion, int32 authenticated_source_node,
-	uint32 authenticated_ingress_connection_generation,
-	uint64 r4_record_generation, uint64 current_master_session_incarnation,
-	uint32 current_master_sender_connection_generation,
+	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation,
+	uint64 current_master_session_incarnation, uint32 current_master_sender_connection_generation,
 	ResourceXMasterSnapshot *out);
 /* Process-local membership in one node head.  This is not authority and is
  * never copied to another caller.  A failed witness cannot be reset by a
@@ -1619,11 +1601,8 @@ cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_exact(
 	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
-	const ResourceXAssertion *assertion,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	uint64 now_us,
-	uint64 *r4_record_generation_out,
+	const ResourceXAssertion *assertion, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, uint64 now_us, uint64 *r4_record_generation_out,
 	uint64 *absolute_deadline_us_out);
 extern ResourceXBootstrapRoundAction
 cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
@@ -1634,17 +1613,14 @@ cluster_pcm_lock_resource_x_bootstrap_round_step_direct_init_join_exact(
 	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
 	uint64 direct_init_reservation_token, bool cached_local_x, uint64 cached_ownership_generation,
 	ResourceXDecodedFrame *dispatch_out, ResourceXAcquisitionRef *terminal_ref_out);
-extern ResourceXBootstrapRoundAction
-cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+extern ResourceXBootstrapRoundAction cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
 	const ResourceXDecodedFrame *ack, int32 authenticated_master_node,
-	uint32 authenticated_ingress_connection_generation,
-	uint64 r4_record_generation, uint64 now_us,
+	uint32 authenticated_ingress_connection_generation, uint64 r4_record_generation, uint64 now_us,
 	ResourceXDecodedFrame *assertion_out);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
 	const ResourceXDecodedFrame *request, int32 expected_master_node,
-	uint64 expected_r4_record_generation,
-	uint32 expected_master_ingress_connection_generation,
+	uint64 expected_r4_record_generation, uint32 expected_master_ingress_connection_generation,
 	uint64 expected_retry_slice_us, uint64 expected_absolute_deadline_us,
 	uint64 expected_direct_init_ownership_generation,
 	uint64 expected_direct_init_reservation_token);
@@ -1673,54 +1649,39 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_predecessor_wait_exact(
 	uint64 current_formation, uint64 expected_carrier_generation,
 	uint64 caller_absolute_deadline_us, uint64 requested_sleep_slice_us);
 struct ClusterPcmOwnSnapshot;
-extern bool
-cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	const struct ClusterPcmOwnSnapshot *observed);
+extern bool cluster_pcm_lock_resource_x_bootstrap_round_direct_init_inflight_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, const struct ClusterPcmOwnSnapshot *observed);
 /* An ordinary TARGET follower may observe the exact R9 executor's closed
  * N-reservation through T2-before-T3 interval.  This predicate grants no
  * authority: it only joins that BufferDesc observation to the same
  * ASSERT-dispatched requester round and active T1/T2 acquisition so the
  * caller may wait and re-probe instead of treating the closed fence as
  * corruption. */
-extern bool
-cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
-	uint64 retry_slice_us,
-	const struct ClusterPcmOwnSnapshot *observed);
+extern bool cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, const struct ClusterPcmOwnSnapshot *observed);
 extern ResourceXTargetInstallFollowState
 cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation,
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
 	uint64 retry_slice_us, uint64 caller_absolute_deadline_us,
 	const struct ClusterPcmOwnSnapshot *observed,
 	ResourceXTargetInstallContinuation *continuation_out);
 extern ResourceXTargetInstallFollowState
 cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
 	const ResourceXTargetInstallContinuation *continuation,
-	const struct ClusterPcmOwnSnapshot *observed,
-	ResourceXAcquisitionRef *terminal_ref_out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+	const struct ClusterPcmOwnSnapshot *observed, ResourceXAcquisitionRef *terminal_ref_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
 	const ResourceXTargetInstallContinuation *continuation,
-	ResourceXTargetInstallFollowState expected_follow_state,
-	long timeout_ms);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
+	ResourceXTargetInstallFollowState expected_follow_state, long timeout_ms);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation,
 	uint64 terminal_authority_generation, uint64 now_us);
@@ -1728,78 +1689,54 @@ cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
  * EVICTING owner and freezes kind-4 while the BufferDesc is still exact
  * X+REVOKING.  ABORT is pre-mutation only; COMMIT is called only after local
  * apply or reliable transport admission and clears cover+owner together. */
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_target_evict_prepare_exact(
-	const BufferTag *tag, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation, uint64 cached_ownership_generation,
-	uint64 reservation_token, uint32 sender_connection_generation,
-	int32 owner_procno, ResourceXDecodedFrame *release_out,
-	ResourceXLocalOwnerHandle *handle_out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_target_evict_abort_exact(
-	const ResourceXLocalOwnerHandle *handle);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_target_evict_commit_exact(
-	const ResourceXDecodedFrame *release, int32 current_master_node,
-	uint64 r4_record_generation, uint64 cached_ownership_generation,
-	const ResourceXLocalOwnerHandle *handle);
-extern bool
-cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
-	const ResourceXAcquisitionRef *ref,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token);
-extern bool
-cluster_pcm_lock_resource_x_bootstrap_round_direct_init_terminal_holder_exact(
-	const ResourceXDecodedFrame *successor_block,
-	int32 authenticated_master_node, uint64 r4_record_generation,
-	uint64 cached_ownership_generation,
-	ResourceXTerminalXLineage *lineage_out);
-extern bool
-cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(
-	const ResourceXDecodedFrame *successor_block,
-	int32 authenticated_master_node, uint64 r4_record_generation,
-	uint64 cached_ownership_generation,
-	ResourceXTerminalXLineage *lineage_out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_itl_recycle_begin_exact(
-	const ResourceXAcquisitionRef *ref,
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, int32 current_master_node, uint64 resource_formation,
 	uint64 master_session_incarnation, uint64 r4_record_generation,
 	uint64 cached_ownership_generation, uint64 reservation_token,
-	int32 owner_procno, uint64 now_us,
+	uint32 sender_connection_generation, int32 owner_procno, ResourceXDecodedFrame *release_out,
 	ResourceXLocalOwnerHandle *handle_out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_itl_recycle_finish_exact(
-	const ResourceXLocalOwnerHandle *handle, uint64 now_us);
+cluster_pcm_lock_resource_x_target_evict_abort_exact(const ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_target_evict_commit_exact(
+	const ResourceXDecodedFrame *release, int32 current_master_node, uint64 r4_record_generation,
+	uint64 cached_ownership_generation, const ResourceXLocalOwnerHandle *handle);
+extern bool cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
+	const ResourceXAcquisitionRef *ref, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token);
+extern bool cluster_pcm_lock_resource_x_bootstrap_round_direct_init_terminal_holder_exact(
+	const ResourceXDecodedFrame *successor_block, int32 authenticated_master_node,
+	uint64 r4_record_generation, uint64 cached_ownership_generation,
+	ResourceXTerminalXLineage *lineage_out);
+extern bool cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(
+	const ResourceXDecodedFrame *successor_block, int32 authenticated_master_node,
+	uint64 r4_record_generation, uint64 cached_ownership_generation,
+	ResourceXTerminalXLineage *lineage_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_itl_recycle_begin_exact(
+	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
+	uint64 r4_record_generation, uint64 cached_ownership_generation, uint64 reservation_token,
+	int32 owner_procno, uint64 now_us, ResourceXLocalOwnerHandle *handle_out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_itl_recycle_cancel_exact(
-	const ResourceXLocalOwnerHandle *handle);
+cluster_pcm_lock_resource_x_itl_recycle_finish_exact(const ResourceXLocalOwnerHandle *handle,
+													 uint64 now_us);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
-	const ResourceXDecodedFrame *successor_block,
-	int32 authenticated_master_node, uint64 r4_record_generation,
-	uint64 cached_ownership_generation, uint64 reservation_token,
-	int32 owner_procno, uint64 now_us,
-	ResourceXTerminalXLineage *lineage_out,
+cluster_pcm_lock_resource_x_itl_recycle_cancel_exact(const ResourceXLocalOwnerHandle *handle);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+	const ResourceXDecodedFrame *successor_block, int32 authenticated_master_node,
+	uint64 r4_record_generation, uint64 cached_ownership_generation, uint64 reservation_token,
+	int32 owner_procno, uint64 now_us, ResourceXTerminalXLineage *lineage_out,
 	ResourceXLocalOwnerHandle *handle_out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
-	const ResourceXDecodedFrame *successor_block,
-	int32 authenticated_master_node, uint64 r4_record_generation,
-	uint64 cached_ownership_generation, uint64 now_us,
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
+	const ResourceXDecodedFrame *successor_block, int32 authenticated_master_node,
+	uint64 r4_record_generation, uint64 cached_ownership_generation, uint64 now_us,
 	ResourceXTerminalXLineage *lineage_out);
-extern bool
-cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(
-	const ResourceXDecodedFrame *successor_block,
-	int32 authenticated_master_node, uint64 r4_record_generation,
-	uint64 cached_ownership_generation,
-	const ResourceXLocalOwnerHandle *handle,
-	ResourceXTerminalXLineage *lineage_out);
+extern bool cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(
+	const ResourceXDecodedFrame *successor_block, int32 authenticated_master_node,
+	uint64 r4_record_generation, uint64 cached_ownership_generation,
+	const ResourceXLocalOwnerHandle *handle, ResourceXTerminalXLineage *lineage_out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
-	const ResourceXLocalOwnerHandle *handle, uint64 now_us);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(
+cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(const ResourceXLocalOwnerHandle *handle,
+														  uint64 now_us);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(
 	const ResourceXLocalOwnerHandle *handle);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_finish_defer_exact(
 	const ResourceXDecodedFrame *block, int32 master_node,
@@ -1811,79 +1748,56 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_terminal_x_revoke_finish
 	const ResourceXDecodedFrame *successor_block, int32 authenticated_master_node,
 	uint64 r4_record_generation, const struct ClusterPcmOwnSnapshot *revoking,
 	const struct ClusterPcmOwnSnapshot *dropped, const ResourceXLocalOwnerHandle *handle);
-extern bool
-cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
-	const ResourceXAcquisitionRef *ref,
-	uint64 *direct_init_ownership_generation_out,
+extern bool cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
+	const ResourceXAcquisitionRef *ref, uint64 *direct_init_ownership_generation_out,
 	uint64 *direct_init_reservation_token_out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation, uint64 retry_slice_us,
-	ResourceXBootstrapRoundFailureSnapshot *out);
-extern bool
-cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, ResourceXBootstrapRoundFailureSnapshot *out);
+extern bool cluster_pcm_lock_resource_x_bootstrap_round_cover_matches_exact(
 	const ResourceXAcquisitionRef *ref, uint64 master_session_incarnation,
 	uint64 r4_record_generation, uint64 cached_ownership_generation);
 extern ResourceXApplyResult
 cluster_pcm_lock_resource_x_bootstrap_round_invalidate_ownership_loss_exact(
-	const ResourceXAssertion *assertion, int32 current_master_node,
-	uint64 resource_formation, uint64 master_session_incarnation,
-	uint64 r4_record_generation,
-	uint32 requester_sender_connection_generation,
-	uint32 master_ingress_connection_generation, uint64 retry_slice_us,
-	const struct ClusterPcmOwnSnapshot *observed);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_x_to_s_preflight_exact(
+	const ResourceXAssertion *assertion, int32 current_master_node, uint64 resource_formation,
+	uint64 master_session_incarnation, uint64 r4_record_generation,
+	uint32 requester_sender_connection_generation, uint32 master_ingress_connection_generation,
+	uint64 retry_slice_us, const struct ClusterPcmOwnSnapshot *observed);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_x_to_s_preflight_exact(
 	const struct ClusterPcmOwnSnapshot *current);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_bootstrap_round_note_x_to_s_exact(
+	const struct ClusterPcmOwnSnapshot *revoking, const struct ClusterPcmOwnSnapshot *shared);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_bootstrap_round_note_x_to_s_exact(
-	const struct ClusterPcmOwnSnapshot *revoking,
-	const struct ClusterPcmOwnSnapshot *shared);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_exact(
-	const ResourceXDecodedFrame *block, int32 authenticated_master_node);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_block_to_n_source_exact(
+cluster_pcm_lock_resource_x_block_to_n_exact(const ResourceXDecodedFrame *block,
+											 int32 authenticated_master_node);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	const ResourceXDecodedFrame *blocked_status,
-	const ResourceXDecodedFrame *image_envelope);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	const ResourceXDecodedFrame *blocked_status,
-	const ResourceXDecodedFrame *image_envelope,
-	const struct ClusterPcmOwnSnapshot *revoking,
-	const ResourceXLocalOwnerHandle *owner);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
+	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
+	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	const ResourceXDecodedFrame *blocked_status,
-	const ResourceXDecodedFrame *image_envelope,
-	const struct ClusterPcmOwnSnapshot *revoking,
-	const ResourceXLocalOwnerHandle *owner);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
+	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
+	const struct ClusterPcmOwnSnapshot *revoking, const ResourceXLocalOwnerHandle *owner);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
 	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	const ResourceXDecodedFrame *blocked_status,
-	const ResourceXDecodedFrame *image_envelope,
-	const struct ClusterPcmOwnSnapshot *prepared_source,
-	XLogRecPtr prepared_page_lsn, uint64 prepared_page_scn,
-	uint32 prepared_page_checksum);
+	const ResourceXDecodedFrame *blocked_status, const ResourceXDecodedFrame *image_envelope,
+	const struct ClusterPcmOwnSnapshot *prepared_source, XLogRecPtr prepared_page_lsn,
+	uint64 prepared_page_scn, uint32 prepared_page_checksum);
 /* Retention is PENDING and transport-invisible.  Publish the indivisible pair
  * only after the caller completed the exact physical source revoke.  The
  * query returns NOT_FOUND when only an exact older same-domain attempt is
  * retained; replacement remains gated by its separate DRAIN contract. */
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	int32 authenticated_master_node, uint64 authenticated_master_session);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_pair_publish_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	int32 authenticated_master_node, uint64 authenticated_master_session);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_publish_needed_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
+	uint64 authenticated_master_session);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
+	uint64 authenticated_master_session);
 /* Replay only a published, undrained immutable pair. Occupied physical slots
  * are validated and left untouched; an empty pair is rearmed atomically. */
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_replay_exact(
@@ -1893,76 +1807,73 @@ extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_replay_exact
  * physical generation to the exact still-undrained PENDING/PUBLISHED pair
  * under the resource entry lock; callers must separately revalidate
  * BufferDesc. */
-extern bool
-cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
-	const BufferTag *tag, int32 current_master_node,
-	uint64 current_master_session, uint64 current_formation,
-	uint64 retained_generation);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_status_exact(
-	const ResourceXAssertion *assertion, ResourceXDecodedFrame *out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_image_exact(
-	const ResourceXAssertion *assertion, ResourceXDecodedFrame *out);
+extern bool cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
+	const BufferTag *tag, int32 current_master_node, uint64 current_master_session,
+	uint64 current_formation, uint64 retained_generation);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_holder_status_exact(const ResourceXAssertion *assertion,
+												ResourceXDecodedFrame *out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_holder_image_exact(const ResourceXAssertion *assertion,
+											   ResourceXDecodedFrame *out);
 /* Classify one old type-17 as superseded only when the current retained
  * status+image pair is atomically exact and has a strictly newer sequence. */
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	int32 authenticated_master_node, uint64 authenticated_master_session);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
+	uint64 authenticated_master_session);
 /* Validate and retire only the exact type-18/type-15 retained carrier pair
  * selected by one authenticated post-settlement DRAIN.  The prepare/commit
  * split keeps the GRD entry lock out of the BufferContent critical section. */
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_drain_prepare_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
+	uint64 authenticated_master_session, uint64 *source_generation_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_pair_drain_commit_exact(
+	const ResourceXAssertion *assertion, uint64 assertion_sequence, int32 authenticated_master_node,
+	uint64 authenticated_master_session, uint64 source_generation);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_pair_drain_prepare_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	int32 authenticated_master_node, uint64 authenticated_master_session,
-	uint64 *source_generation_out);
+cluster_pcm_lock_resource_x_blocked_to_n_exact(const ResourceXDecodedFrame *blocked,
+											   int32 authenticated_source_node,
+											   ResourceXMasterSnapshot *out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_pair_drain_commit_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	int32 authenticated_master_node, uint64 authenticated_master_session,
-	uint64 source_generation);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_blocked_to_n_exact(
-	const ResourceXDecodedFrame *blocked, int32 authenticated_source_node,
-	ResourceXMasterSnapshot *out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_local_proof_exact(
-	const ResourceXDecodedFrame *local_proof, int32 authenticated_source_node,
-	ResourceXMasterSnapshot *out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_durable_proof_exact(
-	const ResourceXDurableProof *durable_proof, ResourceXMasterSnapshot *out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_master_snapshot_exact(
-	const ResourceXAssertion *assertion, ResourceXMasterSnapshot *out);
-extern bool cluster_pcm_lock_resource_x_s_barrier_active_exact(
-	const BufferTag *tag);
+cluster_pcm_lock_resource_x_local_proof_exact(const ResourceXDecodedFrame *local_proof,
+											  int32 authenticated_source_node,
+											  ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_durable_proof_exact(const ResourceXDurableProof *durable_proof,
+												ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_master_snapshot_exact(const ResourceXAssertion *assertion,
+												  ResourceXMasterSnapshot *out);
+extern bool cluster_pcm_lock_resource_x_s_barrier_active_exact(const BufferTag *tag);
 /* Requester-node projection of an in-flight bootstrap round.  This is a
  * retry-only local S-admission barrier; terminal cached X remains eligible
  * for the normal BufferDesc covering-grant path. */
-extern bool
-cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
-	const BufferTag *tag);
+extern bool cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(const BufferTag *tag);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_current_x_successor_exact(
-	const BufferTag *tag, int32 holder_node, bool *preserve_current_x_out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_authority_grant_exact(
-	const ResourceXAssertion *assertion, ResourceXDecodedFrame *out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_exact(
-	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
-	ResourceXRequesterJoinSnapshot *out);
+cluster_pcm_lock_resource_x_current_x_successor_exact(const BufferTag *tag, int32 holder_node,
+													  bool *preserve_current_x_out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_authority_grant_exact(const ResourceXAssertion *assertion,
+												  ResourceXDecodedFrame *out);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_join_exact(const ResourceXDecodedFrame *frame,
+												 int32 authenticated_source_node,
+												 ResourceXRequesterJoinSnapshot *out);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_current_exact(
 	const ResourceXDecodedFrame *frame, int32 authenticated_source_node,
 	uint32 authenticated_source_ingress_generation, int32 current_master_node,
 	uint32 current_master_ingress_generation, uint64 r4_record_generation,
 	ResourceXRequesterJoinSnapshot *out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_requester_join_frames_exact(
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_join_frames_exact(
 	const ResourceXAssertion *assertion, ResourceXDecodedFrame *grant_out,
 	ResourceXDecodedFrame *image_out, ResourceXRequesterJoinSnapshot *out);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_install_settlement_exact(
-	const ResourceXDecodedFrame *settlement, int32 authenticated_source_node,
-	ResourceXMasterSnapshot *out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_source_settlement_intent_snapshot_exact(
-	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
-	void *payload_out, uint16 payload_capacity);
+cluster_pcm_lock_resource_x_install_settlement_exact(const ResourceXDecodedFrame *settlement,
+													 int32 authenticated_source_node,
+													 ResourceXMasterSnapshot *out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity);
 
 /* Process-local freshness evidence for one SourceSettlement ingress.  The
  * plan is never serialized or retained and grants no Resource-X authority. */
@@ -1995,8 +1906,7 @@ typedef struct ResourceXSourceSettlementPlan {
 	bool valid;
 } ResourceXSourceSettlementPlan;
 
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_prepare_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
 	ResourceXSourceSettlementPlan *plan_out);
 
@@ -2055,92 +1965,84 @@ typedef struct ResourceXSourceSettlementCommitObservation {
 } ResourceXSourceSettlementCommitObservation;
 
 StaticAssertDecl(sizeof(ResourceXSourceSettlementCommitObservation) == 96,
-	"ResourceXSourceSettlementCommitObservation layout must remain 96 bytes");
+				 "ResourceXSourceSettlementCommitObservation layout must remain 96 bytes");
 
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
 	ResourceXSourceSettlementPlan *plan_out,
 	ResourceXSourceSettlementCommitObservation *observation_out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_source_settlement_commit_exact(
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_commit_exact(
 	const ResourceXDecodedFrame *settlement, int32 authenticated_master_node,
 	const ResourceXSourceSettlementPlan *plan,
 	ResourceXSourceSettlementCommitObservation *observation_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_source_settlement_ack_build_exact(
+	const ResourceXDecodedFrame *settlement, uint32 sender_connection_generation,
+	ResourceXDecodedFrame *ack_out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_source_settlement_ack_build_exact(
-	const ResourceXDecodedFrame *settlement,
-	uint32 sender_connection_generation, ResourceXDecodedFrame *ack_out);
+cluster_pcm_lock_resource_x_source_settlement_ack_exact(const ResourceXDecodedFrame *ack,
+														int32 authenticated_source_node,
+														ResourceXMasterSnapshot *out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_source_settlement_ack_exact(
-	const ResourceXDecodedFrame *ack, int32 authenticated_source_node,
-	ResourceXMasterSnapshot *out);
+cluster_pcm_lock_resource_x_settled_retire_exact(const ResourceXAssertion *assertion,
+												 uint64 assertion_sequence,
+												 const ResourceXMasterSnapshot *settled);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_settled_retire_exact(
-	const ResourceXAssertion *assertion, uint64 assertion_sequence,
-	const ResourceXMasterSnapshot *settled);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_release_x_exact(
-	const ResourceXDecodedFrame *release, int32 authenticated_source_node,
-	ResourceXMasterSnapshot *out);
+cluster_pcm_lock_resource_x_release_x_exact(const ResourceXDecodedFrame *release,
+											int32 authenticated_source_node,
+											ResourceXMasterSnapshot *out);
 extern ResourceXReclaimResult cluster_pcm_lock_resource_x_reclaim_requester_exact(
-	const BufferTag *tag, int32 dead_node, uint64 dead_formation,
-	ResourceXReclaimWitness *out);
+	const BufferTag *tag, int32 dead_node, uint64 dead_formation, ResourceXReclaimWitness *out);
 extern bool cluster_pcm_lock_resource_x_intent_arm_exact(
-	ResourceXIntentSlot *slot, const ResourceXIntentBodyHandle *body,
-	uint64 logical_generation, uint64 authority_generation,
-	uint64 now_us, uint32 destination_node, uint16 payload_bytes,
+	ResourceXIntentSlot *slot, const ResourceXIntentBodyHandle *body, uint64 logical_generation,
+	uint64 authority_generation, uint64 now_us, uint32 destination_node, uint16 payload_bytes,
 	ResourceXWireKind kind);
 extern ResourceXIntentResult cluster_pcm_lock_resource_x_intent_not_admitted_exact(
-	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
-	uint64 now_us);
-extern ResourceXIntentResult cluster_pcm_lock_resource_x_intent_stage_exact(
-	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
-	uint64 now_us);
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected, uint64 now_us);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_intent_stage_exact(ResourceXIntentSlot *slot,
+											   const ResourceXIntentSlot *expected, uint64 now_us);
 extern ResourceXIntentResult cluster_pcm_lock_resource_x_intent_hard_rearm_exact(
-	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected,
-	uint64 now_us);
-extern bool cluster_pcm_lock_resource_x_intent_complete_exact(
-	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected);
+	ResourceXIntentSlot *slot, const ResourceXIntentSlot *expected, uint64 now_us);
+extern bool cluster_pcm_lock_resource_x_intent_complete_exact(ResourceXIntentSlot *slot,
+															  const ResourceXIntentSlot *expected);
 extern ResourceXApplyResult cluster_pcm_lock_resource_x_block_intent_snapshot_exact(
-	const ResourceXAssertion *assertion, int32 holder_node,
-	ResourceXIntentSlot *slot_out, void *payload_out,
+	const ResourceXAssertion *assertion, int32 holder_node, ResourceXIntentSlot *slot_out,
+	void *payload_out, uint16 payload_capacity);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
+	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out, void *payload_out,
 	uint16 payload_capacity);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_status_intent_snapshot_exact(
-	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
-	void *payload_out, uint16 payload_capacity);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_holder_image_intent_snapshot_exact(
-	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
-	void *payload_out, uint16 payload_capacity);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(
-	const ResourceXAssertion *assertion, ResourceXIntentSlot *slot_out,
-	void *payload_out, uint16 payload_capacity);
+cluster_pcm_lock_resource_x_grant_intent_snapshot_exact(const ResourceXAssertion *assertion,
+														ResourceXIntentSlot *slot_out,
+														void *payload_out, uint16 payload_capacity);
 extern ResourceXIntentResult
-cluster_pcm_lock_resource_x_grant_intent_not_admitted_exact(
-	const ResourceXIntentSlot *expected, uint64 now_us);
-extern ResourceXIntentResult cluster_pcm_lock_resource_x_grant_intent_stage_exact(
-	const ResourceXIntentSlot *expected, uint64 now_us);
+cluster_pcm_lock_resource_x_grant_intent_not_admitted_exact(const ResourceXIntentSlot *expected,
+															uint64 now_us);
 extern ResourceXIntentResult
-cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(
-	const ResourceXIntentSlot *expected, uint64 now_us);
-extern bool cluster_pcm_lock_resource_x_grant_intent_complete_exact(
-	const ResourceXIntentSlot *expected);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
-	const ResourceXIntentSlot *expected, ResourceXIntentSlot *slot_out,
-	void *payload_out, uint16 payload_capacity);
+cluster_pcm_lock_resource_x_grant_intent_stage_exact(const ResourceXIntentSlot *expected,
+													 uint64 now_us);
 extern ResourceXIntentResult
-cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(
-	const ResourceXIntentSlot *expected, uint64 now_us);
+cluster_pcm_lock_resource_x_grant_intent_hard_rearm_exact(const ResourceXIntentSlot *expected,
+														  uint64 now_us);
+extern bool
+cluster_pcm_lock_resource_x_grant_intent_complete_exact(const ResourceXIntentSlot *expected);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_outbound_intent_snapshot_exact(
+	const ResourceXIntentSlot *expected, ResourceXIntentSlot *slot_out, void *payload_out,
+	uint16 payload_capacity);
 extern ResourceXIntentResult
-cluster_pcm_lock_resource_x_outbound_intent_stage_exact(
-	const ResourceXIntentSlot *expected, uint64 now_us);
+cluster_pcm_lock_resource_x_outbound_intent_not_admitted_exact(const ResourceXIntentSlot *expected,
+															   uint64 now_us);
 extern ResourceXIntentResult
-cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(
-	const ResourceXIntentSlot *expected, uint64 now_us);
-extern bool cluster_pcm_lock_resource_x_outbound_intent_complete_exact(
-	const ResourceXIntentSlot *expected);
+cluster_pcm_lock_resource_x_outbound_intent_stage_exact(const ResourceXIntentSlot *expected,
+														uint64 now_us);
+extern ResourceXIntentResult
+cluster_pcm_lock_resource_x_outbound_intent_hard_rearm_exact(const ResourceXIntentSlot *expected,
+															 uint64 now_us);
+extern bool
+cluster_pcm_lock_resource_x_outbound_intent_complete_exact(const ResourceXIntentSlot *expected);
 extern ResourceXIntentProbeResult
 cluster_pcm_lock_resource_x_ready_intent_probe_exact(const BufferTag *tag, uint32 *owner_cursor,
 													 ResourceXIntentSlot *slot_out);
@@ -2150,64 +2052,57 @@ extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_intent_pr
 extern ResourceXIntentProbeResult cluster_pcm_lock_resource_x_outbound_work_probe_exact(
 	uint32 probe_budget, ResourceXIntentSlot *slot_out, void *payload_out, uint16 payload_capacity,
 	uint32 *examined_out, ResourceXAcquisitionRef *delivery_out);
+extern ResourceXApplyResult cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
+extern bool
+cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(ResourceXGateSnapshot *snapshot_out);
+extern bool cluster_pcm_lock_resource_x_gate_snapshot(ResourceXGateSnapshot *snapshot_out);
 extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_gate_bind_formation_exact(uint64 formation);
-extern bool cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
-	ResourceXGateSnapshot *snapshot_out);
-extern bool cluster_pcm_lock_resource_x_gate_snapshot(
-	ResourceXGateSnapshot *snapshot_out);
-extern ResourceXApplyResult
-cluster_pcm_lock_resource_x_gate_fail_closed_exact(
-	const ResourceXGateSnapshot *expected);
+cluster_pcm_lock_resource_x_gate_fail_closed_exact(const ResourceXGateSnapshot *expected);
 extern bool cluster_pcm_lock_resource_x_gate_open_exact(uint64 formation);
-extern bool cluster_pcm_lock_resource_x_executor_enter(
-	const ResourceXAcquisitionRef *ref, ResourceXActivationGateToken *out_gate);
-extern void
-cluster_pcm_lock_resource_x_executor_leave(ResourceXActivationGateToken *gate);
+extern bool cluster_pcm_lock_resource_x_executor_enter(const ResourceXAcquisitionRef *ref,
+													   ResourceXActivationGateToken *out_gate);
+extern void cluster_pcm_lock_resource_x_executor_leave(ResourceXActivationGateToken *gate);
 extern uint64 cluster_pcm_lock_resource_x_activation_inflight_count(void);
 extern bool cluster_resource_x_reconfig_freeze_pending(uint64 old_formation,
-											ResourceXReconfigToken *out);
-extern bool cluster_resource_x_reconfig_freeze_pending_exact(
-	uint64 old_formation, uint32 dead_requester_bitmap,
-	ResourceXReconfigToken *out);
-extern bool cluster_resource_x_reconfig_bind_new_formation_exact(
-	ResourceXReconfigToken *token, uint64 new_formation);
+													   ResourceXReconfigToken *out);
+extern bool cluster_resource_x_reconfig_freeze_pending_exact(uint64 old_formation,
+															 uint32 dead_requester_bitmap,
+															 ResourceXReconfigToken *out);
+extern bool cluster_resource_x_reconfig_bind_new_formation_exact(ResourceXReconfigToken *token,
+																 uint64 new_formation);
 extern bool cluster_resource_x_reconfig_freeze(uint64 old_formation, uint64 new_formation,
 											   ResourceXReconfigToken *out);
-extern bool cluster_resource_x_reconfig_freeze_exact(
-	uint64 old_formation, uint64 new_formation, uint32 dead_requester_bitmap,
-	ResourceXReconfigToken *out);
+extern bool cluster_resource_x_reconfig_freeze_exact(uint64 old_formation, uint64 new_formation,
+													 uint32 dead_requester_bitmap,
+													 ResourceXReconfigToken *out);
 /* Source-removal cutover enters the R8 owner without supplying a formation
  * value.  The Resource-X gate retains the exact current value and allocates
  * its own checked successor after the pending full sweep. */
-extern bool cluster_resource_x_reconfig_cutover_begin_native_exact(
-	ResourceXReconfigToken *out);
-extern bool cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
-	ResourceXReconfigToken *token);
-extern ResourceXReconfigResult cluster_resource_x_reconfig_sweep(
-	const ResourceXReconfigToken *token, uint32 probe_budget, ResourceXReconfigBatch *out);
-extern bool cluster_resource_x_reconfig_zero_proof_exact(
-	const ResourceXReconfigToken *token, ResourceXZeroResidualProof *out);
+extern bool cluster_resource_x_reconfig_cutover_begin_native_exact(ResourceXReconfigToken *out);
+extern bool
+cluster_resource_x_reconfig_cutover_bind_native_successor_exact(ResourceXReconfigToken *token);
+extern ResourceXReconfigResult
+cluster_resource_x_reconfig_sweep(const ResourceXReconfigToken *token, uint32 probe_budget,
+								  ResourceXReconfigBatch *out);
+extern bool cluster_resource_x_reconfig_zero_proof_exact(const ResourceXReconfigToken *token,
+														 ResourceXZeroResidualProof *out);
 extern bool cluster_pcm_lock_resource_x_clean_completion_prove_exact(
-	const ResourceXReconfigToken *token,
-	const ResourceXZeroResidualProof *zero_proof,
+	const ResourceXReconfigToken *token, const ResourceXZeroResidualProof *zero_proof,
 	ResourceXCleanCompletionProof *out);
 extern bool cluster_pcm_lock_resource_x_clean_completion_proof_exact(
-	const ResourceXReconfigToken *token,
-	const ResourceXZeroResidualProof *zero_proof,
+	const ResourceXReconfigToken *token, const ResourceXZeroResidualProof *zero_proof,
 	ResourceXCleanCompletionProof *out);
 /* Read-only R11 prerequisite view of the current frozen R8/R10 pair.  The
  * owning proof validators remain authoritative; this accessor only returns
  * exact copies after both live checks succeed for one token. */
-extern bool cluster_pcm_lock_resource_x_cutover_proofs_exact(
-	ResourceXReconfigToken *token_out,
-	ResourceXZeroResidualProof *zero_proof_out,
-	ResourceXCleanCompletionProof *clean_proof_out);
+extern bool
+cluster_pcm_lock_resource_x_cutover_proofs_exact(ResourceXReconfigToken *token_out,
+												 ResourceXZeroResidualProof *zero_proof_out,
+												 ResourceXCleanCompletionProof *clean_proof_out);
 /* Read-only post-thaw view of the same retained pair.  The frozen accessor
  * above deliberately remains false after thaw. */
 extern bool cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
-	ResourceXReconfigToken *token_out,
-	ResourceXZeroResidualProof *zero_proof_out,
+	ResourceXReconfigToken *token_out, ResourceXZeroResidualProof *zero_proof_out,
 	ResourceXCleanCompletionProof *clean_proof_out);
 /* Read the exact current R8/R10 pair and a local digest without accepting an
  * external formation coordinate.  The returned token remains the only
@@ -2216,19 +2111,24 @@ extern bool cluster_pcm_lock_resource_x_cutover_current_proof_digest_exact(
 	bool thawed, ResourceXReconfigToken *token_out, uint64 *digest_out);
 extern bool cluster_resource_x_reconfig_thaw_exact(const ResourceXReconfigToken *token);
 extern void cluster_resource_x_reconfig_stats_snapshot(ResourceXReconfigStats *out);
-extern ResourceXExecutorProbeResult cluster_pcm_lock_resource_x_executor_probe_exact(
-	const ResourceXAcquisitionRef *ref, ResourceXExecutorSnapshot *out_snapshot);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_executor_wait_exact(
-	const ResourceXAcquisitionRef *ref, long timeout_ms);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_executor_rearm_exact(
-	const ResourceXAcquisitionRef *ref);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_apply_exact(
-	const ResourceXAcquisitionRef *ref, const ResourceXBufferInstallProof *proof);
-extern ResourceXApplyResult cluster_pcm_lock_resource_x_requester_activate_exact(
-	const ResourceXAcquisitionRef *ref, const ResourceXBufferActivationProof *proof);
+extern ResourceXExecutorProbeResult
+cluster_pcm_lock_resource_x_executor_probe_exact(const ResourceXAcquisitionRef *ref,
+												 ResourceXExecutorSnapshot *out_snapshot);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_executor_wait_exact(const ResourceXAcquisitionRef *ref,
+												long timeout_ms);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_executor_rearm_exact(const ResourceXAcquisitionRef *ref);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_apply_exact(const ResourceXAcquisitionRef *ref,
+												  const ResourceXBufferInstallProof *proof);
+extern ResourceXApplyResult
+cluster_pcm_lock_resource_x_requester_activate_exact(const ResourceXAcquisitionRef *ref,
+													 const ResourceXBufferActivationProof *proof);
 extern void cluster_pcm_lock_resource_x_o1_stats_snapshot(ResourceXO1Stats *out);
-extern void cluster_pcm_lock_resource_x_publish_no_progress_exact(
-	const ResourceXAcquisitionRef *ref, ResourceXNoProgressReason reason);
+extern void
+cluster_pcm_lock_resource_x_publish_no_progress_exact(const ResourceXAcquisitionRef *ref,
+													  ResourceXNoProgressReason reason);
 extern int cluster_pcm_grd_count(void);
 extern void cluster_pcm_grd_get_summary(int *n_count, int *s_count, int *x_count,
 										int *pi_holders_total, int *convert_queue_active);

@@ -23,6 +23,8 @@
  */
 #include "postgres.h"
 
+#include <ctype.h>
+
 #include "access/multixact.h"		   /* MultiXactStatus* member kinds (D3-b) */
 #include "cluster/cluster_gcs_block.h" /* undo-fetch tag + auth trailer (CP2) */
 #include "cluster/cluster_runtime_visibility.h"
@@ -32,9 +34,8 @@
 #include "unit_test.h"
 
 extern bool cluster_vis_freshref_c1b_pair_request_eligible(
-	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status,
-	SCN cached_commit_scn, uint32 ref_epoch, uint64 current_epoch,
-	int32 origin_node, int32 local_node, uint32 segment_id,
+	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status, SCN cached_commit_scn,
+	uint32 ref_epoch, uint64 current_epoch, int32 origin_node, int32 local_node, uint32 segment_id,
 	uint32 expected_tt_slot_id);
 
 UT_DEFINE_GLOBALS();
@@ -51,12 +52,10 @@ read_runtime_visibility_source(void)
 	char *source;
 
 	if (suffix_at != NULL)
-		snprintf(path, sizeof(path),
-				 "%.*s/src/backend/cluster/cluster_runtime_visibility.c",
+		snprintf(path, sizeof(path), "%.*s/src/backend/cluster/cluster_runtime_visibility.c",
 				 (int)(suffix_at - source_file), source_file);
 	else
-		snprintf(path, sizeof(path),
-				 "../../../src/backend/cluster/cluster_runtime_visibility.c");
+		snprintf(path, sizeof(path), "../../../src/backend/cluster/cluster_runtime_visibility.c");
 
 	file = fopen(path, "rb");
 	UT_ASSERT_NOT_NULL(file);
@@ -82,8 +81,7 @@ static char *
 read_visibility_resolve_source(void)
 {
 	const char *source_file = __FILE__;
-	const char *source_suffix
-		= "/src/test/cluster_unit/test_cluster_runtime_visibility.c";
+	const char *source_suffix = "/src/test/cluster_unit/test_cluster_runtime_visibility.c";
 	const char *suffix_at = strstr(source_file, source_suffix);
 	char path[MAXPGPATH];
 	FILE *file;
@@ -91,12 +89,10 @@ read_visibility_resolve_source(void)
 	char *source;
 
 	if (suffix_at != NULL)
-		snprintf(path, sizeof(path),
-				 "%.*s/src/backend/cluster/cluster_visibility_resolve.c",
+		snprintf(path, sizeof(path), "%.*s/src/backend/cluster/cluster_visibility_resolve.c",
 				 (int)(suffix_at - source_file), source_file);
 	else
-		snprintf(path, sizeof(path),
-				 "../../../src/backend/cluster/cluster_visibility_resolve.c");
+		snprintf(path, sizeof(path), "../../../src/backend/cluster/cluster_visibility_resolve.c");
 	file = fopen(path, "rb");
 	UT_ASSERT_NOT_NULL(file);
 	if (file == NULL)
@@ -270,34 +266,32 @@ UT_TEST(test_committed_bound_admission_terminal_vs_snapshot)
 
 UT_TEST(test_freshref_c1b_pair_request_eligibility)
 {
-	UT_ASSERT(cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 7, 1));
+	UT_ASSERT(cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, true, (SCN)10498, 11,
+															 11, 1, 0, 7, 1));
 	/* The homogeneous Stage-8 clean formation legitimately carries exact
 	 * epoch zero.  This pure classifier may select that exact pair; the
 	 * requester and origin still require a current R4 TARGET admission before
 	 * any zero-epoch frame can be sent or consumed. */
-	UT_ASSERT(cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 0, 0, 1, 0, 7, 1));
+	UT_ASSERT(cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, true, (SCN)10498, 0,
+															 0, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, true, (SCN)10498, 1,
+															  0, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195137, true, (SCN)10498,
+															  11, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, false, (SCN)10498,
+															  11, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, true, InvalidScn,
+															  11, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, true, (SCN)10498,
+															  10, 11, 1, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, true, (SCN)10498,
+															  11, 11, 0, 0, 7, 1));
+	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(4195136, 4195136, true, (SCN)10498,
+															  11, 11, 1, 0, 0, 1));
 	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 1, 0, 1, 0, 7, 1));
+		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 7, TT_SLOTS_PER_SEGMENT + 1));
 	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195137, true, (SCN)10498, 11, 11, 1, 0, 7, 1));
-	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, false, (SCN)10498, 11, 11, 1, 0, 7, 1));
-	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, InvalidScn, 11, 11, 1, 0, 7, 1));
-	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 10, 11, 1, 0, 7, 1));
-	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 11, 11, 0, 0, 7, 1));
-	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 0, 1));
-	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 11, 11, 1, 0, 7,
-		TT_SLOTS_PER_SEGMENT + 1));
-	UT_ASSERT(!cluster_vis_freshref_c1b_pair_request_eligible(
-		4195136, 4195136, true, (SCN)10498, 11,
-		UINT64_C(0x100000000), 1, 0, 7, 1));
+		4195136, 4195136, true, (SCN)10498, 11, UINT64_C(0x100000000), 1, 0, 7, 1));
 }
 
 /* CP2: authority trailer little-endian carrier roundtrip (wire ABI). */
@@ -1006,23 +1000,19 @@ UT_TEST(test_terminal_remote_wrapper_rejects_in_progress_verdict)
 	const char *origin = source != NULL ? strstr(source, "\nrtvis_try_origin_verdict(") : NULL;
 	const char *origin_end
 		= origin != NULL ? strstr(origin, "\nrtvis_try_resolve_remote_internal(") : NULL;
-	const char *kind4
-		= origin != NULL
-			  ? strstr(origin, "case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:")
-			  : NULL;
+	const char *kind4 = origin != NULL
+							? strstr(origin, "case (uint8)CLUSTER_GCS_UNDO_VERDICT_IN_PROGRESS:")
+							: NULL;
 	const char *authoritative_gate
 		= kind4 != NULL ? strstr(kind4, "if (!authoritative || expected_tt_slot_id < 1") : NULL;
 	const char *slot_ceiling
 		= authoritative_gate != NULL
-			  ? strstr(authoritative_gate,
-					   "expected_tt_slot_id > TT_SLOTS_PER_SEGMENT")
+			  ? strstr(authoritative_gate, "expected_tt_slot_id > TT_SLOTS_PER_SEGMENT")
 			  : NULL;
-	const char *publish_live
-		= kind4 != NULL ? strstr(kind4, "*out_in_progress = true;") : NULL;
-	const char *wrapper
-		= source != NULL
-			  ? strstr(source, "\ncluster_runtime_visibility_try_resolve_remote(")
-			  : NULL;
+	const char *publish_live = kind4 != NULL ? strstr(kind4, "*out_in_progress = true;") : NULL;
+	const char *wrapper = source != NULL
+							  ? strstr(source, "\ncluster_runtime_visibility_try_resolve_remote(")
+							  : NULL;
 	const char *wrapper_end
 		= wrapper != NULL ? strstr(wrapper, "\n}\n\n/*\n * rtvis_resolve_own_xid") : NULL;
 	const char *guarded_call
@@ -1040,8 +1030,8 @@ UT_TEST(test_terminal_remote_wrapper_rejects_in_progress_verdict)
 	UT_ASSERT_NOT_NULL(wrapper_end);
 	UT_ASSERT_NOT_NULL(guarded_call);
 	UT_ASSERT_NOT_NULL(terminal_reject);
-	if (origin_end != NULL && kind4 != NULL && authoritative_gate != NULL
-		&& slot_ceiling != NULL && publish_live != NULL)
+	if (origin_end != NULL && kind4 != NULL && authoritative_gate != NULL && slot_ceiling != NULL
+		&& publish_live != NULL)
 		UT_ASSERT(kind4 < authoritative_gate && authoritative_gate < slot_ceiling
 				  && slot_ceiling < publish_live && publish_live < origin_end);
 	if (wrapper_end != NULL && guarded_call != NULL && terminal_reject != NULL)
@@ -1061,9 +1051,7 @@ UT_TEST(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair)
 {
 	char *source = read_runtime_visibility_source();
 	const char *resolver
-		= source != NULL
-			  ? strstr(source, "\ncluster_undo_verdict_resolve_internal(")
-			  : NULL;
+		= source != NULL ? strstr(source, "\ncluster_undo_verdict_resolve_internal(") : NULL;
 	const char *resolver_end
 		= resolver != NULL
 			  ? strstr(resolver, "\n}\n\nClusterUndoVerdictResult\ncluster_undo_verdict_resolve(")
@@ -1073,17 +1061,20 @@ UT_TEST(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair)
 			  ? strstr(resolver, "freshref exact-live verdict precedes terminal C1b pair")
 			  : NULL;
 	const char *generic_call
-		= live_first != NULL
-			  ? strstr(live_first, "rtvis_try_resolve_remote_internal(")
-			  : NULL;
+		= live_first != NULL ? strstr(live_first, "rtvis_try_resolve_remote_internal(") : NULL;
 	const char *generic_shape
-		= generic_call != NULL
-			  ? strstr(generic_call, "0, InvalidScn, read_scn, true")
-			  : NULL;
-	const char *pair_call
-		= generic_shape != NULL
-			  ? strstr(generic_shape, "ref_epoch, freshref_pair_scn, read_scn, authoritative")
-			  : NULL;
+		= generic_call != NULL ? strstr(generic_call, "0, InvalidScn, read_scn, true") : NULL;
+	const char *pair_call = generic_shape != NULL
+								? strstr(generic_shape, "ref_epoch, freshref_pair_scn, read_scn,")
+								: NULL;
+	const char *pair_authority
+		= pair_call != NULL ? pair_call + strlen("ref_epoch, freshref_pair_scn, read_scn,") : NULL;
+
+	if (pair_authority != NULL) {
+		while (isspace((unsigned char)*pair_authority))
+			pair_authority++;
+		UT_ASSERT(strncmp(pair_authority, "authoritative,", strlen("authoritative,")) == 0);
+	}
 
 	UT_ASSERT_NOT_NULL(resolver);
 	UT_ASSERT_NOT_NULL(resolver_end);
@@ -1091,8 +1082,8 @@ UT_TEST(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair)
 	UT_ASSERT_NOT_NULL(generic_call);
 	UT_ASSERT_NOT_NULL(generic_shape);
 	UT_ASSERT_NOT_NULL(pair_call);
-	if (resolver_end != NULL && live_first != NULL && generic_call != NULL
-		&& generic_shape != NULL && pair_call != NULL)
+	if (resolver_end != NULL && live_first != NULL && generic_call != NULL && generic_shape != NULL
+		&& pair_call != NULL)
 		UT_ASSERT(live_first < generic_call && generic_call < generic_shape
 				  && generic_shape < pair_call && pair_call < resolver_end);
 	free(source);
@@ -1101,27 +1092,16 @@ UT_TEST(test_pair_eligible_freshref_tries_exact_live_before_terminal_pair)
 UT_TEST(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo)
 {
 	char *source = read_visibility_resolve_source();
-	const char *classifier
-		= source != NULL ? strstr(source, "\nclassify_ref_guts(") : NULL;
+	const char *classifier = source != NULL ? strstr(source, "\nclassify_ref_guts(") : NULL;
 	const char *classifier_end
 		= classifier != NULL ? strstr(classifier, "\n}\n\n/*\n * classify_ref") : NULL;
-	const char *pair
-		= classifier != NULL
-			  ? strstr(classifier,
-					   "cluster_undo_verdict_resolve_freshref_c1b_pair(")
-			  : NULL;
-	const char *exact
-		= pair != NULL
-			  ? strstr(pair, "cluster_tx_resolve_exact(")
-			  : NULL;
-	const char *visibility
-		= exact != NULL
-			  ? strstr(exact, "CLUSTER_TX_RESOLVE_VISIBILITY")
-			  : NULL;
+	const char *pair = classifier != NULL
+						   ? strstr(classifier, "cluster_undo_verdict_resolve_freshref_c1b_pair(")
+						   : NULL;
+	const char *exact = pair != NULL ? strstr(pair, "cluster_tx_resolve_exact(") : NULL;
+	const char *visibility = exact != NULL ? strstr(exact, "CLUSTER_TX_RESOLVE_VISIBILITY") : NULL;
 	const char *exact_map
-		= visibility != NULL
-			  ? strstr(visibility, "cluster_vis_from_exact_tx_resolution(")
-			  : NULL;
+		= visibility != NULL ? strstr(visibility, "cluster_vis_from_exact_tx_resolution(") : NULL;
 
 	UT_ASSERT_NOT_NULL(classifier);
 	UT_ASSERT_NOT_NULL(classifier_end);
@@ -1133,10 +1113,10 @@ UT_TEST(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo)
 	UT_ASSERT_NOT_NULL(strstr(source, "*row_wait_locator_out = candidate;"));
 	UT_ASSERT_NOT_NULL(strstr(source, "candidate.tt_wrap = TT_WRAP_INVALID;"));
 	UT_ASSERT_NOT_NULL(strstr(source, "*visibility_locator_out = candidate;"));
-	if (classifier_end != NULL && pair != NULL && exact != NULL
-		&& visibility != NULL && exact_map != NULL)
-		UT_ASSERT(pair < exact && exact < visibility
-				  && visibility < exact_map && exact_map < classifier_end);
+	if (classifier_end != NULL && pair != NULL && exact != NULL && visibility != NULL
+		&& exact_map != NULL)
+		UT_ASSERT(pair < exact && exact < visibility && visibility < exact_map
+				  && exact_map < classifier_end);
 	/* The exact fallback is operation-local evidence only. */
 	UT_ASSERT_NULL(strstr(exact != NULL ? exact : "", "cluster_vis_memo_install("));
 	free(source);
@@ -1144,31 +1124,25 @@ UT_TEST(test_freshref_unknown_uses_page_exact_locator_without_bound_or_memo)
 
 UT_TEST(test_freshref_failclosed_records_exact_first_local_predicate)
 {
-	static const char *const diagnostic_fields[] = {
-		"raw_xid",
-		"ref->origin_node_id",
-		"ref->undo_segment_id",
-		"ref->tt_slot_id",
-		"freshref_pair",
-		"(int)v.kind",
-		"exact_locator != NULL",
-		"(int)exact_outcome",
-		"cluster_tx_resolve_reason_name(exact_reason)"
-	};
+	static const char *const diagnostic_fields[]
+		= { "raw_xid",
+			"ref->origin_node_id",
+			"ref->undo_segment_id",
+			"ref->tt_slot_id",
+			"freshref_pair",
+			"(int)v.kind",
+			"exact_locator != NULL",
+			"(int)exact_outcome",
+			"cluster_tx_resolve_reason_name(exact_reason)" };
 	char *source = read_visibility_resolve_source();
-	const char *classifier
-		= source != NULL ? strstr(source, "\nclassify_ref_guts(") : NULL;
+	const char *classifier = source != NULL ? strstr(source, "\nclassify_ref_guts(") : NULL;
 	const char *classifier_end
 		= classifier != NULL ? strstr(classifier, "\n}\n\n/*\n * classify_ref") : NULL;
 	const char *diagnostic
-		= classifier != NULL
-			  ? strstr(classifier, "cluster_vis_log_freshref_unproven(")
-			  : NULL;
+		= classifier != NULL ? strstr(classifier, "cluster_vis_log_freshref_unproven(") : NULL;
 	const char *failclosed
-		= diagnostic != NULL
-			  ? strstr(diagnostic,
-					   "cluster_vis_freshref_verdict_note_failclosed()")
-			  : NULL;
+		= diagnostic != NULL ? strstr(diagnostic, "cluster_vis_freshref_verdict_note_failclosed()")
+							 : NULL;
 	size_t i;
 
 	/* This is observability only: the first local fail-closed predicate is

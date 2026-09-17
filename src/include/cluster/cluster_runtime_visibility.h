@@ -148,8 +148,8 @@ typedef struct ClusterRuntimeVisibilityCanonicalDiagnostic {
 } ClusterRuntimeVisibilityCanonicalDiagnostic;
 
 extern void cluster_runtime_visibility_ensure_exit_hooks(void);
-extern bool cluster_runtime_visibility_zero_epoch_pair_admission_enter(
-	ClusterSemanticAdmissionToken *token);
+extern bool
+cluster_runtime_visibility_zero_epoch_pair_admission_enter(ClusterSemanticAdmissionToken *token);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode, uint64 formation_epoch,
 	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
@@ -157,44 +157,35 @@ extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_admitted
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
-extern ClusterTxOutcome
-cluster_runtime_visibility_resolve_terminal_census_retained_exact(
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_terminal_census_retained_exact(
 	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
-extern ClusterTxOutcome
-cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
+extern ClusterTxOutcome cluster_runtime_visibility_resolve_terminal_census_retained_local_exact(
 	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_runtime_visibility_resolve_exact_origin_held(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission,
-	const ClusterUndoBlock0Generation *expected_generation,
-	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
-extern ClusterRuntimeVisibilityOriginStep
-cluster_runtime_visibility_origin_plan_freeze_data_held(
+extern ClusterRuntimeVisibilityOriginStep cluster_runtime_visibility_origin_plan_freeze_data_held(
 	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 	const ClusterSemanticAdmissionToken *admission,
-	const ClusterUndoBlock0Generation *expected_generation,
-	ClusterUndoBlock0CurrentGuard *guard,
-	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out);
+	const ClusterUndoBlock0Generation *expected_generation, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterRuntimeVisibilityOriginPlan *plan,
+	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_logical(
-	const ClusterRuntimeVisibilityOriginPlan *plan,
-	ClusterUndoBlock0LogicalKey *logical_out);
+	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterUndoBlock0LogicalKey *logical_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_physical(
-	const ClusterRuntimeVisibilityOriginPlan *plan,
-	ClusterTTSlotPhysicalLocator *locator_out, bool *same_segment_out);
+	const ClusterRuntimeVisibilityOriginPlan *plan, ClusterTTSlotPhysicalLocator *locator_out,
+	bool *same_segment_out);
 extern bool cluster_runtime_visibility_origin_plan_sample_canonical_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard,
-	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTxResolveReason *reason_out);
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolveReason *reason_out);
 extern bool cluster_runtime_visibility_origin_plan_canonical_diagnostic(
 	const ClusterRuntimeVisibilityOriginPlan *plan,
 	ClusterRuntimeVisibilityCanonicalDiagnostic *out);
@@ -204,55 +195,41 @@ extern bool cluster_runtime_visibility_origin_plan_canonical_diagnostic(
  * Neither can create an ACTIVE or terminal result from nonmatching bytes. */
 extern bool cluster_runtime_visibility_current_owner_sample_held(
 	TransactionId xid, const ClusterTTSlotCurrentOwner *expected_owner,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard,
-	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
-	bool *ctrc_physical_active_out);
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterUndoBlock0ResolvedRoot *root, ClusterTTStatusKey *key_out,
+	ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out);
 extern bool cluster_runtime_visibility_physical_locator_sample_held(
-	const ClusterTTSlotPhysicalLocator *locator,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard,
-	const ClusterUndoBlock0ResolvedRoot *root,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
-	bool *ctrc_physical_active_out);
+	const ClusterTTSlotPhysicalLocator *locator, const ClusterSemanticAdmissionToken *admission,
+	ClusterUndoBlock0CurrentGuard *guard, const ClusterUndoBlock0ResolvedRoot *root,
+	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out, bool *ctrc_physical_active_out);
 extern bool cluster_runtime_visibility_current_owner_lookup_exact(
-	TransactionId xid, ClusterTTStatusKey *key_out,
-	ClusterTTStatusResult *result_out);
+	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
 extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc(
-	TransactionId xid, ClusterTTStatusKey *key_out,
-	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out);
+	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
+	uint32 *ctrc_grant_out);
 extern bool cluster_runtime_visibility_current_owner_lookup_exact_ctrc_full(
-	TransactionId xid, ClusterTTStatusKey *key_out,
-	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
-	ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
+	uint32 *ctrc_grant_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
 	ClusterCtrcParticipantIdentity *participant_out);
 /* Local current-MX terminal proof path.  It samples the exact current or
  * rolled physical slot and never creates a CTRC touch/grant/participant. */
 extern bool cluster_runtime_visibility_local_terminal_lookup_exact(
-	TransactionId xid, ClusterTTStatusKey *key_out,
-	ClusterTTStatusResult *result_out);
+	TransactionId xid, ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out);
 /* Resolve an updater from its exact page-derived DATA locator.  The function
  * executes the same DATA -> canonical TT -> DATA proof used by the remote
  * origin adapter and never substitutes a by-xid locator. */
 extern bool cluster_runtime_visibility_current_mx_updater_provenance_exact(
-	const ClusterTxLocator *locator, TimestampTz deadline,
-	ClusterTTStatusKey *key_out, ClusterTTStatusResult *result_out,
-	uint32 *ctrc_grant_out,
-	uint32 *participant_capability_generation_out,
-	ClusterCtrcTxnKeyV1 *ctrc_key_out,
-	ClusterTxLocator *canonical_locator_out,
-	bool *cross_segment_out);
+	const ClusterTxLocator *locator, TimestampTz deadline, ClusterTTStatusKey *key_out,
+	ClusterTTStatusResult *result_out, uint32 *ctrc_grant_out,
+	uint32 *participant_capability_generation_out, ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	ClusterTxLocator *canonical_locator_out, bool *cross_segment_out);
 extern bool cluster_runtime_visibility_active_proof_ctrc_identity_exact(
 	const ClusterCurrentMemberProofKey *proof_key, uint32 ctrc_grant,
-	uint32 requester_capability_generation,
-	ClusterCtrcTxnKeyV1 *ctrc_key_out,
+	uint32 requester_capability_generation, ClusterCtrcTxnKeyV1 *ctrc_key_out,
 	ClusterCtrcParticipantIdentity *participant_out);
-extern ClusterTxOutcome
-cluster_runtime_visibility_origin_plan_recheck_data_held(
+extern ClusterTxOutcome cluster_runtime_visibility_origin_plan_recheck_data_held(
 	ClusterRuntimeVisibilityOriginPlan *plan, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterUndoBlock0CurrentGuard *guard,
+	const ClusterSemanticAdmissionToken *admission, ClusterUndoBlock0CurrentGuard *guard,
 	const ClusterUndoBlock0ResolvedRoot *root, ClusterTxResolution *out,
 	ClusterTxResolveReason *reason_out);
 /* Export the exact revalidated resident DATA image under the final guard.
@@ -315,7 +292,8 @@ extern bool cluster_vis_live_authority_covers_policy(SCN demand_scn, ClusterLive
 
 /*
  * S3-P0-03: pure admission for a COMMITTED_BELOW_HORIZON proof.  A valid
- * snapshot may consume the bound only when horizon_scn <= read_scn.  The
+ * snapshot may consume the bound only when scn_time_cmp(horizon_scn, read_scn)
+ * is nonpositive.  The
  * plain visibility resolver passes InvalidScn for terminal-state-only
  * consumers (Update/Self/Dirty/Toast/writer-chain); those consumers may use
  * the origin+CLOG-proven COMMITTED fact, but must preserve the bound marker
@@ -328,9 +306,8 @@ extern bool cluster_vis_committed_bound_admissible(SCN horizon_scn, SCN read_scn
  * exact retained-page pairing.  Pure and fail-closed; no authority/state is
  * created by a true result. */
 extern bool cluster_vis_freshref_c1b_pair_request_eligible(
-	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status,
-	SCN cached_commit_scn, uint32 ref_epoch, uint64 current_epoch,
-	int32 origin_node, int32 local_node, uint32 segment_id,
+	TransactionId raw_xid, TransactionId ref_xid, bool has_cached_status, SCN cached_commit_scn,
+	uint32 ref_epoch, uint64 current_epoch, int32 origin_node, int32 local_node, uint32 segment_id,
 	uint32 expected_tt_slot_id);
 
 /*

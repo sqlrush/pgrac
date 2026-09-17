@@ -191,8 +191,7 @@ typedef enum GcsBlockR4RouteSendResult {
 
 StaticAssertDecl(sizeof(GcsBlockR4RouteIdentity) == 64,
 				 "R4 CR route identity must remain 64 bytes");
-StaticAssertDecl(sizeof(GcsBlockR4RouteRecord) == 128,
-				 "R4 CR route record must remain 128 bytes");
+StaticAssertDecl(sizeof(GcsBlockR4RouteRecord) == 128, "R4 CR route record must remain 128 bytes");
 
 typedef union GcsBlockDedupPayloadMeta {
 	ClusterSfDepVec sf_dep_vec;

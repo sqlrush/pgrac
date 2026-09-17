@@ -147,9 +147,8 @@ cluster_recovery_classify_slot(ClusterWalSlotVerdict v, const ClusterWalStateSlo
  */
 static inline ClusterRecoveryThreadVerdict
 cluster_recovery_classify_root_slot(ClusterControlRootResult root_result,
-									const ClusterControlRootSnapshot *snapshot,
-									uint16 own_thread, uint16 tid, int64 now_us,
-									int checkpoint_timeout_sec)
+									const ClusterControlRootSnapshot *snapshot, uint16 own_thread,
+									uint16 tid, int64 now_us, int checkpoint_timeout_sec)
 {
 	int64 threshold_us;
 	int64 age_us;
@@ -160,13 +159,13 @@ cluster_recovery_classify_root_slot(ClusterControlRootResult root_result,
 		return CLUSTER_RECOVERY_THREAD_EMPTY;
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		|| snapshot->identity.origin_node_id != (int32) tid - 1)
+		|| snapshot->identity.origin_node_id != (int32)tid - 1)
 		return CLUSTER_RECOVERY_THREAD_UNKNOWN;
 	if (snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
 		return CLUSTER_RECOVERY_THREAD_CLEAN;
 	if (snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
 		return CLUSTER_RECOVERY_THREAD_UNKNOWN;
-	threshold_us = (int64) Max(checkpoint_timeout_sec * 2, 60) * INT64CONST(1000000);
+	threshold_us = (int64)Max(checkpoint_timeout_sec * 2, 60) * INT64CONST(1000000);
 	age_us = now_us - snapshot->published_at_usec;
 	/* Boundary included in the alive side (mirrors the registry
 	 * classifier's <= stale window; ALIVE-biased per follow-up). */
@@ -308,14 +307,11 @@ cluster_thread_recovery_pin_fill(ClusterThreadReplaySlot *slot,
 static inline bool
 cluster_thread_recovery_projection_read(ClusterThreadReplaySlot *slot, uint64 episode_epoch,
 										ClusterControlRootReadToken *token_out,
-										uint64 *validated_tail_out,
-										uint64 *checkpoint_lower_out,
-										uint64 *lifecycle_out,
-										uint32 *tail_tli_out,
+										uint64 *validated_tail_out, uint64 *checkpoint_lower_out,
+										uint64 *lifecycle_out, uint32 *tail_tli_out,
 										uint32 *checkpoint_tli_out)
 {
-	if (slot == NULL
-		|| pg_atomic_read_u64(&slot->episode_epoch) != episode_epoch)
+	if (slot == NULL || pg_atomic_read_u64(&slot->episode_epoch) != episode_epoch)
 		return false;
 	pg_read_barrier();
 	if (token_out != NULL)
@@ -344,8 +340,7 @@ extern bool cluster_thread_recovery_projection_current(uint16 dead_tid, uint64 e
 													   ClusterControlRootReadToken *token_out,
 													   uint64 *validated_tail_out,
 													   uint64 *checkpoint_lower_out,
-													   uint64 *lifecycle_out,
-													   uint32 *tail_tli_out,
+													   uint64 *lifecycle_out, uint32 *tail_tli_out,
 													   uint32 *checkpoint_tli_out);
 
 #endif /* !FRONTEND */

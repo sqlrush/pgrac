@@ -205,17 +205,16 @@ extern GesReplyDeliverResult cluster_ges_reply_wait_deliver(const GesReplyWaitKe
  *
  * No HTAB entry pointer escapes this API and it never waits on a CV.
  */
-extern GesReplyWaitPollResult
-cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key,
-									GesReplyWaitVerdict *verdict_out);
+extern GesReplyWaitPollResult cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key,
+																  GesReplyWaitVerdict *verdict_out);
 
 /*
  * Arm and perform one bounded sleep on the exact live reply entry without
  * consuming or changing its verdict.  Returns false when the key has no live
  * waitable entry, so cooperative callers can retain their polling fallback.
  */
-extern bool cluster_ges_reply_wait_sleep_exact(const GesReplyWaitKey *key,
-										long timeout_ms, uint32 wait_event);
+extern bool cluster_ges_reply_wait_sleep_exact(const GesReplyWaitKey *key, long timeout_ms,
+											   uint32 wait_event);
 
 /*
  * spec-5.16 — abandon a wait entry at the bounded GES timeout instead of deleting

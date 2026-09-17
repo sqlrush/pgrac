@@ -72,10 +72,10 @@ typedef struct ClusterCanonicalTxnBinding {
 StaticAssertDecl(sizeof(ClusterCanonicalTxnBinding) == 32,
 				 "canonical transaction binding must remain stack-only 32 bytes");
 
-extern bool cluster_tt_local_prepare_canonical_active(
-	TransactionId top_xid, ClusterCanonicalTxnBinding *binding_out);
-extern bool cluster_tt_local_get_published_binding(
-	TransactionId top_xid, ClusterCanonicalTxnBinding *binding_out);
+extern bool cluster_tt_local_prepare_canonical_active(TransactionId top_xid,
+													  ClusterCanonicalTxnBinding *binding_out);
+extern bool cluster_tt_local_get_published_binding(TransactionId top_xid,
+												   ClusterCanonicalTxnBinding *binding_out);
 
 /*
  * cluster_tt_local_record_commit -- install COMMITTED status for a
@@ -106,7 +106,7 @@ extern void cluster_tt_local_record_commit(TransactionId xid, SCN commit_scn);
  * must NOT do durable I/O).
  */
 extern bool cluster_tt_local_precommit_durable_finish(TransactionId xid, SCN commit_scn,
-												  struct xl_xact_tt_commit *out_fold);
+													  struct xl_xact_tt_commit *out_fold);
 extern bool cluster_tt_local_preabort_durable_finish(TransactionId xid);
 
 /*

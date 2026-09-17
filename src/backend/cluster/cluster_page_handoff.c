@@ -48,9 +48,9 @@ cluster_page_handoff_ready(const ClusterPageHandoffInput *in)
 	 * provides the torn target's stable base (§7.4 last sentence), so
 	 * retention_pinned alone cannot make this true.
 	 */
-	return p->contributor_coverage && p->durability_barrier_ok
-		&& p->post_read_ok && p->authority_revalidated
-		&& in->side_proof_ok && in->retention_pinned && in->consumers_zero;
+	return p->contributor_coverage && p->durability_barrier_ok && p->post_read_ok
+		   && p->authority_revalidated && in->side_proof_ok && in->retention_pinned
+		   && in->consumers_zero;
 }
 
 bool

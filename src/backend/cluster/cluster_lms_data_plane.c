@@ -174,11 +174,9 @@ cluster_lms_data_plane_enabled(void)
 static void
 dp_close_peer_now(int32 peer_id, const char *reason)
 {
-	if (!dp_enabled || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
-		|| peer_id == cluster_node_id)
+	if (!dp_enabled || peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || peer_id == cluster_node_id)
 		return;
-	if (dp_track[peer_id].fd < 0
-		&& dp_track[peer_id].substate == LMS_DP_DOWN)
+	if (dp_track[peer_id].fd < 0 && dp_track[peer_id].substate == LMS_DP_DOWN)
 		return;
 
 	cluster_ic_tier1_close_peer(peer_id, reason);
@@ -195,9 +193,8 @@ cluster_lms_data_plane_close_peer_now(int32 peer_id)
 
 #ifdef USE_CLUSTER_UNIT
 void
-cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
-									 bool connected, bool enabled,
-									 bool wes_dirty)
+cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd, bool connected, bool enabled,
+									  bool wes_dirty)
 {
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
@@ -208,12 +205,11 @@ cluster_lms_data_plane_test_seed_peer(int32 peer_id, int fd,
 }
 
 bool
-cluster_lms_data_plane_test_peer_snapshot(int32 peer_id, int *fd_out,
-										 bool *down_out,
-										 bool *wes_dirty_out)
+cluster_lms_data_plane_test_peer_snapshot(int32 peer_id, int *fd_out, bool *down_out,
+										  bool *wes_dirty_out)
 {
-	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
-		|| fd_out == NULL || down_out == NULL || wes_dirty_out == NULL)
+	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES || fd_out == NULL || down_out == NULL
+		|| wes_dirty_out == NULL)
 		return false;
 	*fd_out = dp_track[peer_id].fd;
 	*down_out = dp_track[peer_id].substate == LMS_DP_DOWN;

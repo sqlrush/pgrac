@@ -18,67 +18,58 @@
 #define RF_PAGE_STABLE_MAX_EDGES 65536
 #define RF_PAGE_STABLE_MAX_COMPONENTS 33
 
-typedef struct RfPageIdentityV1
-{
-	uint64		system_identifier;
-	uint8		storage_uuid[16];
+typedef struct RfPageIdentityV1 {
+	uint64 system_identifier;
+	uint8 storage_uuid[16];
 	RelFileLocator locator;
-	uint32		forknum;
+	uint32 forknum;
 	BlockNumber blockno;
-	uint32		reserved_zero;
+	uint32 reserved_zero;
 } RfPageIdentityV1;
 
-StaticAssertDecl(sizeof(RfPageIdentityV1) == 48,
-				 "RfPageIdentityV1 ABI drift");
+StaticAssertDecl(sizeof(RfPageIdentityV1) == 48, "RfPageIdentityV1 ABI drift");
 StaticAssertDecl(offsetof(RfPageIdentityV1, storage_uuid) == 8,
 				 "RfPageIdentityV1 storage UUID offset drift");
 StaticAssertDecl(offsetof(RfPageIdentityV1, locator) == 24,
 				 "RfPageIdentityV1 locator offset drift");
-StaticAssertDecl(offsetof(RfPageIdentityV1, forknum) == 36,
-				 "RfPageIdentityV1 fork offset drift");
-StaticAssertDecl(offsetof(RfPageIdentityV1, blockno) == 40,
-				 "RfPageIdentityV1 block offset drift");
+StaticAssertDecl(offsetof(RfPageIdentityV1, forknum) == 36, "RfPageIdentityV1 fork offset drift");
+StaticAssertDecl(offsetof(RfPageIdentityV1, blockno) == 40, "RfPageIdentityV1 block offset drift");
 
 #define RF_CONTRIBUTOR_CUT_COMPLETE UINT16_C(0x0001)
 #define RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY UINT16_C(0x0002)
 #define RF_CONTRIBUTOR_CUT_KNOWN_MASK UINT16_C(0x0003)
 
-typedef struct RfContributorStreamCutV1
-{
-	uint16		failed_thread;
-	uint16		flags;
+typedef struct RfContributorStreamCutV1 {
+	uint16 failed_thread;
+	uint16 flags;
 	TimeLineID timeline_id;
 	XLogRecPtr scan_begin_inclusive;
 	XLogRecPtr scan_end_exclusive;
-	uint32		contributor_count;
-	uint32		component_count;
+	uint32 contributor_count;
+	uint32 component_count;
 } RfContributorStreamCutV1;
 
-StaticAssertDecl(sizeof(RfContributorStreamCutV1) == 32,
-				 "RfContributorStreamCutV1 ABI drift");
+StaticAssertDecl(sizeof(RfContributorStreamCutV1) == 32, "RfContributorStreamCutV1 ABI drift");
 StaticAssertDecl(offsetof(RfContributorStreamCutV1, timeline_id) == 4,
 				 "RfContributorStreamCutV1 timeline offset drift");
-StaticAssertDecl(offsetof(RfContributorStreamCutV1,
-						  scan_begin_inclusive) == 8,
+StaticAssertDecl(offsetof(RfContributorStreamCutV1, scan_begin_inclusive) == 8,
 				 "RfContributorStreamCutV1 begin offset drift");
-StaticAssertDecl(offsetof(RfContributorStreamCutV1,
-						  contributor_count) == 24,
+StaticAssertDecl(offsetof(RfContributorStreamCutV1, contributor_count) == 24,
 				 "RfContributorStreamCutV1 count offset drift");
 
 /* Exact immutable identity of one decoded foreign WAL record. */
-typedef struct RfPageReplayRecordIdentityV1
-{
-	uint64		system_identifier;
-	uint8		storage_uuid[16];
-	uint16		origin_thread;
-	uint16		reserved_zero;
+typedef struct RfPageReplayRecordIdentityV1 {
+	uint64 system_identifier;
+	uint8 storage_uuid[16];
+	uint16 origin_thread;
+	uint16 reserved_zero;
 	TimeLineID timeline_id;
 	XLogRecPtr read_rec_ptr;
 	XLogRecPtr end_rec_ptr;
-	uint32		record_crc;
-	uint8		rmid;
-	uint8		info;
-	uint16		reserved_zero2;
+	uint32 record_crc;
+	uint8 rmid;
+	uint8 info;
+	uint16 reserved_zero2;
 } RfPageReplayRecordIdentityV1;
 
 StaticAssertDecl(sizeof(RfPageReplayRecordIdentityV1) == 56,
@@ -90,8 +81,7 @@ StaticAssertDecl(offsetof(RfPageReplayRecordIdentityV1, read_rec_ptr) == 32,
 StaticAssertDecl(offsetof(RfPageReplayRecordIdentityV1, record_crc) == 48,
 				 "RfPageReplayRecordIdentityV1 CRC offset drift");
 
-typedef enum RfPageProofDetailV1
-{
+typedef enum RfPageProofDetailV1 {
 	RF_PAGE_PROOF_DETAIL_OK = 0,
 	RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT = 1,
 	RF_PAGE_PROOF_DETAIL_ROOT_STALE = 2,
@@ -125,75 +115,68 @@ typedef enum RfPageProofDetailV1
 } RfPageProofDetailV1;
 
 /* Immutable decoder output projected onto one ordinary target page. */
-typedef struct RfPageStableEdgeInputV1
-{
+typedef struct RfPageStableEdgeInputV1 {
 	RfPageIdentityV1 page_identity;
 	RfPageVersionEdgeEntryV1 edge;
-	uint64		result_token;
+	uint64 result_token;
 	RfPageReplayRecordIdentityV1 record_identity;
-	uint16		participant_index;
-	uint16		component_count;
-	uint8		anchor_digest[32];
-	bool		record_complete;
-	bool		opcode_supported;
-	bool		side_complete;
-	bool		image_integrity_ok;
+	uint16 participant_index;
+	uint16 component_count;
+	uint8 anchor_digest[32];
+	bool record_complete;
+	bool opcode_supported;
+	bool side_complete;
+	bool image_integrity_ok;
 } RfPageStableEdgeInputV1;
 
 /* Caller-owned RF-SIDE view.  It owns neither WAL nor authority. */
-typedef struct RfContributorVectorV1
-{
-	uint64		system_identifier;
-	uint8		storage_uuid[16];
-	uint32		participant_count;
-	uint32		edge_count;
+typedef struct RfContributorVectorV1 {
+	uint64 system_identifier;
+	uint8 storage_uuid[16];
+	uint32 participant_count;
+	uint32 edge_count;
 	const RfContributorStreamCutV1 *cuts;
 	const RfPageStableEdgeInputV1 *edges;
 } RfContributorVectorV1;
 
-typedef struct RfPagePinnedSourceV1
-{
+typedef struct RfPagePinnedSourceV1 {
 	RfPageIdentityV1 page_identity;
 	RfPageVersionV1 source_version;
-	uint64		binding_cookie;
-	uint64		current_binding_cookie;
-	bool		identity_verified;
-	bool		integrity_verified;
+	uint64 binding_cookie;
+	uint64 current_binding_cookie;
+	bool identity_verified;
+	bool integrity_verified;
 } RfPagePinnedSourceV1;
 
-typedef struct RfPageStableGraphRequestV1
-{
+typedef struct RfPageStableGraphRequestV1 {
 	RfPageIdentityV1 page_identity;
 	RfPageVersionV1 expected_result;
 	const RfContributorVectorV1 *contributors;
 	const RfPagePinnedSourceV1 *source;
-	uint32		participant_count;
-	uint32		flags;
-	uint64		retention_binding_cookie;
-	uint64		current_retention_binding_cookie;
-	bool		root_current;
-	bool		duty_current;
-	bool		fence_current;
-	bool		retention_current;
+	uint32 participant_count;
+	uint32 flags;
+	uint64 retention_binding_cookie;
+	uint64 current_retention_binding_cookie;
+	bool root_current;
+	bool duty_current;
+	bool fence_current;
+	bool retention_current;
 } RfPageStableGraphRequestV1;
 
-typedef struct RfPageStableSelectionV1
-{
+typedef struct RfPageStableSelectionV1 {
 	RfPageVersionV1 terminal_version;
-	uint32		anchor_edge_index;
-	uint32		chain_length;
-	bool		result_already_present;
+	uint32 anchor_edge_index;
+	uint32 chain_length;
+	bool result_already_present;
 } RfPageStableSelectionV1;
 
-typedef struct PgracExternalFenceAdmissionSetV1
-	PgracExternalFenceAdmissionSetV1;
+typedef struct PgracExternalFenceAdmissionSetV1 PgracExternalFenceAdmissionSetV1;
 typedef struct PgracExternalFenceNeedSetV1 PgracExternalFenceNeedSetV1;
 typedef struct ClusterFormationWitnessV1 ClusterFormationWitnessV1;
 typedef struct ClusterWalRetentionPin ClusterWalRetentionPin;
 typedef struct RfPageStableBaseProofV1 RfPageStableBaseProofV1;
 
-typedef struct RfPageStableBaseProofRequestV1
-{
+typedef struct RfPageStableBaseProofRequestV1 {
 	const RfPageStableGraphRequestV1 *graph;
 	const ClusterRecoveryDutyKey *duties;
 	const ClusterControlRootReadToken *root_tokens;
@@ -201,12 +184,11 @@ typedef struct RfPageStableBaseProofRequestV1
 	const PgracExternalFenceNeedSetV1 *fence_need_set;
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
 	ClusterWalRetentionPin *retention_pin;
-	uint32		flags;
+	uint32 flags;
 } RfPageStableBaseProofRequestV1;
 
 extern bool rf_page_identity_valid_v1(const RfPageIdentityV1 *identity);
-extern bool rf_page_identity_equal_v1(const RfPageIdentityV1 *left,
-									  const RfPageIdentityV1 *right);
+extern bool rf_page_identity_equal_v1(const RfPageIdentityV1 *left, const RfPageIdentityV1 *right);
 extern bool rf_page_version_present_v1(const RfPageVersionV1 *version);
 
 /*
@@ -214,94 +196,82 @@ extern bool rf_page_version_present_v1(const RfPageVersionV1 *version);
  * caller-owned workspace and receives anchor-to-terminal edge indices only on
  * success.  Every failure leaves both output objects untouched.
  */
-extern RfPageProofDetailV1 rf_page_stable_base_select_v1(
-	const RfPageStableGraphRequestV1 *request,
-	uint32 *chain_indices, uint32 chain_capacity,
-	RfPageStableSelectionV1 *selection);
-extern RfPageProofDetailV1 rf_page_stable_base_proof_build_wait_v1(
-	const RfPageStableBaseProofRequestV1 *request,
-	uint32 *chain_indices, uint32 chain_capacity, int timeout_ms,
-	RfPageStableBaseProofV1 **out_proof);
-extern RfPageProofDetailV1 rf_page_stable_base_proof_build_bound_v1(
-	const RfPageStableBaseProofRequestV1 *request,
-	uint32 *chain_indices, uint32 chain_capacity,
-	RfPageStableBaseProofV1 **out_proof);
+extern RfPageProofDetailV1 rf_page_stable_base_select_v1(const RfPageStableGraphRequestV1 *request,
+														 uint32 *chain_indices,
+														 uint32 chain_capacity,
+														 RfPageStableSelectionV1 *selection);
+extern RfPageProofDetailV1
+rf_page_stable_base_proof_build_wait_v1(const RfPageStableBaseProofRequestV1 *request,
+										uint32 *chain_indices, uint32 chain_capacity,
+										int timeout_ms, RfPageStableBaseProofV1 **out_proof);
+extern RfPageProofDetailV1
+rf_page_stable_base_proof_build_bound_v1(const RfPageStableBaseProofRequestV1 *request,
+										 uint32 *chain_indices, uint32 chain_capacity,
+										 RfPageStableBaseProofV1 **out_proof);
 extern bool rf_page_stable_base_proof_matches_v1(
-	const RfPageStableBaseProofV1 *proof,
-	const RfPageIdentityV1 *page_identity,
-	const RfPageVersionV1 *expected_result,
-	const ClusterRecoveryDutyKey *duties,
-	const ClusterControlRootReadToken *root_tokens,
-	const ClusterFormationWitnessV1 *formation,
+	const RfPageStableBaseProofV1 *proof, const RfPageIdentityV1 *page_identity,
+	const RfPageVersionV1 *expected_result, const ClusterRecoveryDutyKey *duties,
+	const ClusterControlRootReadToken *root_tokens, const ClusterFormationWitnessV1 *formation,
 	const PgracExternalFenceNeedSetV1 *fence_need_set,
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set,
-	ClusterWalRetentionPin *retention_pin,
-	const RfPagePinnedSourceV1 *source,
-	const RfContributorVectorV1 *contributors,
-	uint32 participant_count);
-extern void rf_page_stable_base_proof_destroy_v1(
-	RfPageStableBaseProofV1 **proof);
+	ClusterWalRetentionPin *retention_pin, const RfPagePinnedSourceV1 *source,
+	const RfContributorVectorV1 *contributors, uint32 participant_count);
+extern void rf_page_stable_base_proof_destroy_v1(RfPageStableBaseProofV1 **proof);
 
 #ifdef USE_CLUSTER_UNIT
 
-typedef enum RfPageInstallTargetStateV1
-{
+typedef enum RfPageInstallTargetStateV1 {
 	RF_PAGE_INSTALL_TARGET_EXPECTED = 1,
 	RF_PAGE_INSTALL_TARGET_RESULT = 2,
 	RF_PAGE_INSTALL_TARGET_TORN = 3,
 	RF_PAGE_INSTALL_TARGET_UNRELATED = 4
 } RfPageInstallTargetStateV1;
 
-typedef struct RfPageInstallComponentV1
-{
+typedef struct RfPageInstallComponentV1 {
 	RfPageIdentityV1 page_identity;
 	RfPageVersionV1 expected_before;
 	RfPageVersionV1 expected_result;
 	const char *canonical_page;
-	uint8		target_state;
-	bool		route_preflight_ok;
-	bool		side_preflight_ok;
-	bool		scratch_ready;
-	bool		identity_authority_ok;
-	bool		canonical_layout_ok;
-	bool		checksums_enabled;
+	uint8 target_state;
+	bool route_preflight_ok;
+	bool side_preflight_ok;
+	bool scratch_ready;
+	bool identity_authority_ok;
+	bool canonical_layout_ok;
+	bool checksums_enabled;
 } RfPageInstallComponentV1;
 
-typedef struct RfPageInstallOpsV1
-{
-	void	   *arg;
-	bool		(*canonicalize) (void *arg, uint32 index,
-								  bool checksums_enabled, char page[BLCKSZ]);
-	bool		(*promote) (void *arg);
-	bool		(*write) (void *arg, uint32 index, const char page[BLCKSZ]);
-	bool		(*sync) (void *arg, uint32 index);
-	bool		(*postread) (void *arg, uint32 index, char page[BLCKSZ]);
-	bool		(*publish) (void *arg);
-	bool		(*release) (void *arg);
+typedef struct RfPageInstallOpsV1 {
+	void *arg;
+	bool (*canonicalize)(void *arg, uint32 index, bool checksums_enabled, char page[BLCKSZ]);
+	bool (*promote)(void *arg);
+	bool (*write)(void *arg, uint32 index, const char page[BLCKSZ]);
+	bool (*sync)(void *arg, uint32 index);
+	bool (*postread)(void *arg, uint32 index, char page[BLCKSZ]);
+	bool (*publish)(void *arg);
+	bool (*release)(void *arg);
 } RfPageInstallOpsV1;
 
-typedef struct RfPageInstallRequestV1
-{
+typedef struct RfPageInstallRequestV1 {
 	const RfPageInstallComponentV1 *components;
-	uint32		component_count;
-	char	   *prepared_pages;
-	Size		prepared_capacity;
+	uint32 component_count;
+	char *prepared_pages;
+	Size prepared_capacity;
 	const RfPageInstallOpsV1 *ops;
-	bool		global_preflight_ok;
+	bool global_preflight_ok;
 } RfPageInstallRequestV1;
 
-typedef struct RfPageInstallProofV1
-{
-	uint32		component_count;
-	bool		durability_complete;
-	bool		postread_complete;
-	bool		proof_published;
-	bool		authority_released;
+typedef struct RfPageInstallProofV1 {
+	uint32 component_count;
+	bool durability_complete;
+	bool postread_complete;
+	bool proof_published;
+	bool authority_released;
 } RfPageInstallProofV1;
 
-extern RfPageProofDetailV1 rf_page_stable_install_test_v1(
-	const RfPageInstallRequestV1 *request, RfPageInstallProofV1 *proof);
+extern RfPageProofDetailV1 rf_page_stable_install_test_v1(const RfPageInstallRequestV1 *request,
+														  RfPageInstallProofV1 *proof);
 
-#endif							/* USE_CLUSTER_UNIT */
+#endif /* USE_CLUSTER_UNIT */
 
-#endif							/* CLUSTER_PAGE_STABLE_BASE_H */
+#endif /* CLUSTER_PAGE_STABLE_BASE_H */

@@ -671,21 +671,18 @@ static bool
 cluster_tt_status_current_entries_agree(const ClusterTTOverlayEntry *a,
 										const ClusterTTOverlayEntry *b)
 {
-	return a->status == b->status
-		   && a->commit_scn == b->commit_scn && a->status_epoch == b->status_epoch
-		   && a->has_parent_key == b->has_parent_key
+	return a->status == b->status && a->commit_scn == b->commit_scn
+		   && a->status_epoch == b->status_epoch && a->has_parent_key == b->has_parent_key
 		   && memcmp(&a->parent_key, &b->parent_key, sizeof(a->parent_key)) == 0;
 }
 
 static bool
-cluster_tt_status_current_entry_matches(const ClusterTTOverlayEntry *entry,
-										TransactionId xid, uint32 epoch,
-										TimestampTz now)
+cluster_tt_status_current_entry_matches(const ClusterTTOverlayEntry *entry, TransactionId xid,
+										uint32 epoch, TimestampTz now)
 {
-	return entry->key.origin_node_id == (uint16)cluster_node_id
-		   && entry->key.local_xid == xid && entry->key.cluster_epoch == epoch
-		   && entry->key.undo_segment_id != 0 && entry->key.tt_slot_id != 0
-		   && entry->key._reserved == 0 && entry->key._reserved2 == 0
+	return entry->key.origin_node_id == (uint16)cluster_node_id && entry->key.local_xid == xid
+		   && entry->key.cluster_epoch == epoch && entry->key.undo_segment_id != 0
+		   && entry->key.tt_slot_id != 0 && entry->key._reserved == 0 && entry->key._reserved2 == 0
 		   && entry->status_epoch == epoch && is_entry_fresh(entry, now);
 }
 
@@ -695,10 +692,10 @@ cluster_tt_status_current_entry_matches(const ClusterTTOverlayEntry *entry,
  * cluster_tt_local.  This helper classifies their status agreement; it never
  * chooses which physical key is canonical. */
 static bool
-cluster_tt_status_current_group_locked(
-	TransactionId xid, uint32 epoch, TimestampTz now,
-	const ClusterTTStatusKey *candidate, ClusterTTOverlayEntry *sample,
-	uint32 *match_count, bool *candidate_found)
+cluster_tt_status_current_group_locked(TransactionId xid, uint32 epoch, TimestampTz now,
+									   const ClusterTTStatusKey *candidate,
+									   ClusterTTOverlayEntry *sample, uint32 *match_count,
+									   bool *candidate_found)
 {
 	HASH_SEQ_STATUS seq;
 	ClusterTTOverlayEntry *entry;
@@ -710,8 +707,7 @@ cluster_tt_status_current_group_locked(
 	while ((entry = (ClusterTTOverlayEntry *)hash_seq_search(&seq)) != NULL) {
 		if (!cluster_tt_status_current_entry_matches(entry, xid, epoch, now))
 			continue;
-		if (candidate != NULL
-			&& memcmp(&entry->key, candidate, sizeof(*candidate)) == 0)
+		if (candidate != NULL && memcmp(&entry->key, candidate, sizeof(*candidate)) == 0)
 			*candidate_found = true;
 		if (*match_count == 0)
 			*sample = *entry;
@@ -725,24 +721,20 @@ cluster_tt_status_current_group_locked(
 }
 
 static bool
-cluster_tt_status_overlay_matches_current_owner(
-	const ClusterTTOverlayEntry *entry,
-	const ClusterTTSlotCurrentOwner *owner)
+cluster_tt_status_overlay_matches_current_owner(const ClusterTTOverlayEntry *entry,
+												const ClusterTTSlotCurrentOwner *owner)
 {
 	switch (owner->status) {
 	case CTS_ACTIVE:
 		return (entry->status == CLUSTER_TT_STATUS_IN_PROGRESS
 				|| entry->status == CLUSTER_TT_STATUS_SUBCOMMITTED)
-			   && entry->commit_scn == InvalidScn
-			   && owner->commit_scn == InvalidScn;
+			   && entry->commit_scn == InvalidScn && owner->commit_scn == InvalidScn;
 	case CTS_COMMITTED:
 		return (entry->status == CLUSTER_TT_STATUS_COMMITTED
 				|| entry->status == CLUSTER_TT_STATUS_CLEANED_OUT)
-			   && SCN_VALID(entry->commit_scn)
-			   && entry->commit_scn == owner->commit_scn;
+			   && SCN_VALID(entry->commit_scn) && entry->commit_scn == owner->commit_scn;
 	case CTS_ABORTED:
-		return entry->status == CLUSTER_TT_STATUS_ABORTED
-			   && entry->commit_scn == InvalidScn
+		return entry->status == CLUSTER_TT_STATUS_ABORTED && entry->commit_scn == InvalidScn
 			   && owner->commit_scn == InvalidScn;
 	default:
 		return false;
@@ -750,9 +742,11 @@ cluster_tt_status_overlay_matches_current_owner(
 }
 
 static bool
-cluster_tt_status_lookup_current_own_xid_internal(
-	TransactionId xid, const ClusterTTStatusKey *candidate, ClusterTTStatusKey *key,
-	ClusterTTStatusResult *result, ClusterTTCurrentKeyVerdict *candidate_verdict)
+cluster_tt_status_lookup_current_own_xid_internal(TransactionId xid,
+												  const ClusterTTStatusKey *candidate,
+												  ClusterTTStatusKey *key,
+												  ClusterTTStatusResult *result,
+												  ClusterTTCurrentKeyVerdict *candidate_verdict)
 {
 	ClusterTTOverlayEntry *entry;
 	ClusterTTOverlayEntry selected;
@@ -781,22 +775,20 @@ cluster_tt_status_lookup_current_own_xid_internal(
 	if (epoch > UINT32_MAX)
 		return false;
 	if (candidate != NULL
-		&& (candidate->origin_node_id != (uint16)cluster_node_id
-			|| candidate->local_xid != xid || candidate->cluster_epoch != (uint32)epoch
-			|| candidate->undo_segment_id == 0 || candidate->tt_slot_id == 0
-			|| candidate->_reserved != 0 || candidate->_reserved2 != 0))
+		&& (candidate->origin_node_id != (uint16)cluster_node_id || candidate->local_xid != xid
+			|| candidate->cluster_epoch != (uint32)epoch || candidate->undo_segment_id == 0
+			|| candidate->tt_slot_id == 0 || candidate->_reserved != 0
+			|| candidate->_reserved2 != 0))
 		return false;
 	now = GetCurrentTimestamp();
 	LWLockAcquire(ClusterTTStatusLock, LW_SHARED);
 	group_agrees = cluster_tt_status_current_group_locked(
-		xid, (uint32)epoch, now, candidate, &selected, &match_count,
-		&candidate_found);
+		xid, (uint32)epoch, now, candidate, &selected, &match_count, &candidate_found);
 	LWLockRelease(ClusterTTStatusLock);
 
 	if (!group_agrees) {
 		if (match_count != 0)
-			pg_atomic_fetch_add_u64(
-				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
 		return false;
 	}
 
@@ -813,56 +805,45 @@ cluster_tt_status_lookup_current_own_xid_internal(
 		 * canonical binding for the active happy path.  Snapshot it outside the
 		 * overlay lock, recheck the complete overlay group, then snapshot it
 		 * again after releasing that lock to close the rollover/reuse window. */
-		if (!cluster_tt_slot_current_owner_by_xid(
-				cluster_node_id, xid, &owner)
+		if (!cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner)
 			|| owner.segment_id == 0 || owner.xid != xid
-			|| owner.slot_offset >= TT_SLOTS_PER_SEGMENT
-			|| owner.reserved8[0] != 0 || owner.reserved8[1] != 0
-			|| owner.reserved8[2] != 0) {
+			|| owner.slot_offset >= TT_SLOTS_PER_SEGMENT || owner.reserved8[0] != 0
+			|| owner.reserved8[1] != 0 || owner.reserved8[2] != 0) {
 			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
 			return false;
 		}
 		memset(&canonical_key, 0, sizeof(canonical_key));
 		canonical_key.origin_node_id = (uint16)cluster_node_id;
 		canonical_key.undo_segment_id = owner.segment_id;
-		canonical_key.tt_slot_id =
-			cluster_tt_slot_offset_to_id(owner.slot_offset);
+		canonical_key.tt_slot_id = cluster_tt_slot_offset_to_id(owner.slot_offset);
 		canonical_key.cluster_epoch = (uint32)epoch;
 		canonical_key.local_xid = xid;
 
 		now = GetCurrentTimestamp();
 		LWLockAcquire(ClusterTTStatusLock, LW_SHARED);
-		entry = (ClusterTTOverlayEntry *)hash_search(
-			ClusterTTStatusHTAB, &canonical_key, HASH_FIND, NULL);
+		entry = (ClusterTTOverlayEntry *)hash_search(ClusterTTStatusHTAB, &canonical_key, HASH_FIND,
+													 NULL);
 		if (entry == NULL
-			|| !cluster_tt_status_current_entry_matches(
-				entry, xid, (uint32)epoch, now)) {
+			|| !cluster_tt_status_current_entry_matches(entry, xid, (uint32)epoch, now)) {
 			LWLockRelease(ClusterTTStatusLock);
-			pg_atomic_fetch_add_u64(
-				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
 			return false;
 		}
 		canonical_entry = *entry;
-		if (!cluster_tt_status_current_group_locked(
-				xid, (uint32)epoch, now, candidate, &selected, &check_count,
-				&check_candidate_found)
+		if (!cluster_tt_status_current_group_locked(xid, (uint32)epoch, now, candidate, &selected,
+													&check_count, &check_candidate_found)
 			|| check_count < 2
-			|| !cluster_tt_status_current_entries_agree(
-				&canonical_entry, &selected)
-			|| !cluster_tt_status_overlay_matches_current_owner(
-				&canonical_entry, &owner)) {
+			|| !cluster_tt_status_current_entries_agree(&canonical_entry, &selected)
+			|| !cluster_tt_status_overlay_matches_current_owner(&canonical_entry, &owner)) {
 			LWLockRelease(ClusterTTStatusLock);
-			pg_atomic_fetch_add_u64(
-				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
 			return false;
 		}
 		LWLockRelease(ClusterTTStatusLock);
 
-		if (!cluster_tt_slot_current_owner_by_xid(
-				cluster_node_id, xid, &owner_check)
+		if (!cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &owner_check)
 			|| memcmp(&owner, &owner_check, sizeof(owner)) != 0) {
-			pg_atomic_fetch_add_u64(
-				&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterTTStatusState->ambiguous_raw_xid_reject_count, 1);
 			return false;
 		}
 		selected = canonical_entry;
@@ -1309,9 +1290,11 @@ cluster_tt_status_lookup_exact(const ClusterTTStatusKey *key, ClusterTTStatusRes
 }
 
 static bool
-cluster_tt_status_lookup_current_own_xid_internal(
-	TransactionId xid, const ClusterTTStatusKey *candidate, ClusterTTStatusKey *key,
-	ClusterTTStatusResult *result, ClusterTTCurrentKeyVerdict *candidate_verdict)
+cluster_tt_status_lookup_current_own_xid_internal(TransactionId xid,
+												  const ClusterTTStatusKey *candidate,
+												  ClusterTTStatusKey *key,
+												  ClusterTTStatusResult *result,
+												  ClusterTTCurrentKeyVerdict *candidate_verdict)
 {
 	(void)xid;
 	(void)candidate;
@@ -1508,20 +1491,17 @@ cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op,
 				if (request == NULL)
 					admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 				else
-					local_result.bool_value
-						= cluster_tt_status_lookup_current_own_xid_internal(
-							request->xid, NULL, &local_result.current_key,
-							&local_result.lookup, NULL);
+					local_result.bool_value = cluster_tt_status_lookup_current_own_xid_internal(
+						request->xid, NULL, &local_result.current_key, &local_result.lookup, NULL);
 				break;
 			case CLUSTER_TT_SOURCE_LOOKUP_CURRENT_OWN_XID_CANDIDATE:
 				local_result.current_key_verdict = CLUSTER_TT_CURRENT_KEY_UNKNOWN;
 				if (request == NULL || request->key == NULL)
 					admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 				else
-					local_result.bool_value
-						= cluster_tt_status_lookup_current_own_xid_internal(
-							request->xid, request->key, &local_result.current_key,
-							&local_result.lookup, &local_result.current_key_verdict);
+					local_result.bool_value = cluster_tt_status_lookup_current_own_xid_internal(
+						request->xid, request->key, &local_result.current_key, &local_result.lookup,
+						&local_result.current_key_verdict);
 				break;
 			default:
 				admission = CLUSTER_SEMANTIC_ADMISSION_CLOSED;

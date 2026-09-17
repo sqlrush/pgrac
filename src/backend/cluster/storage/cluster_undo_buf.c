@@ -328,7 +328,7 @@ cluster_undo_buf_shmem_init(void)
 	data_region_sz = add_size(data_region_sz, mul_size((Size)BLCKSZ, n));
 	block0_sz = cluster_undo_block0_shmem_size((uint32)n);
 	if (!cluster_undo_block0_shmem_init_region(((char *)UndoBufPool) + data_region_sz, block0_sz,
-										  (uint32)n, found))
+											   (uint32)n, found))
 		ereport(PANIC, (errmsg("could not initialize cluster undo block-zero resident region")));
 
 	if (found)
@@ -869,27 +869,21 @@ cluster_undo_buf_unref_slot(int slot)
 
 
 bool
-cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id,
-								 uint8 owner, uint32 block_no)
+cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id, uint8 owner, uint32 block_no)
 {
 	UndoBufSlot *s;
 	bool exact;
 
-	if (UndoBufPool == NULL || UndoBufSlots == NULL
-		|| slot < 0 || slot >= UndoBufPool->nslots)
+	if (UndoBufPool == NULL || UndoBufSlots == NULL || slot < 0 || slot >= UndoBufPool->nslots)
 		return false;
 	s = &UndoBufSlots[slot];
-	if (!s->valid || s->io_in_progress
-		|| s->segment_id != segment_id || s->owner != owner
-		|| s->block_no != block_no
-		|| pg_atomic_read_u32(&s->pincount) == 0)
+	if (!s->valid || s->io_in_progress || s->segment_id != segment_id || s->owner != owner
+		|| s->block_no != block_no || pg_atomic_read_u32(&s->pincount) == 0)
 		return false;
 	if (!LWLockConditionalAcquire(&s->content_lock, LW_EXCLUSIVE))
 		return false;
-	exact = s->valid && !s->io_in_progress
-		&& s->segment_id == segment_id && s->owner == owner
-		&& s->block_no == block_no
-		&& pg_atomic_read_u32(&s->pincount) > 0;
+	exact = s->valid && !s->io_in_progress && s->segment_id == segment_id && s->owner == owner
+			&& s->block_no == block_no && pg_atomic_read_u32(&s->pincount) > 0;
 	if (!exact)
 		LWLockRelease(&s->content_lock);
 	return exact;
@@ -897,26 +891,21 @@ cluster_undo_buf_lock_ref_conditional(int slot, uint32 segment_id,
 
 
 void
-cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id,
-								uint8 owner, uint32 block_no,
-								const char image[BLCKSZ])
+cluster_undo_buf_install_ref_locked(int slot, uint32 segment_id, uint8 owner, uint32 block_no,
+									const char image[BLCKSZ])
 {
 	UndoBufSlot *s;
 
-	if (UndoBufPool == NULL || UndoBufSlots == NULL || image == NULL
-		|| slot < 0 || slot >= UndoBufPool->nslots)
-		ereport(PANIC,
-				(errmsg("cluster undo prepared consume lost its buffer slot")));
+	if (UndoBufPool == NULL || UndoBufSlots == NULL || image == NULL || slot < 0
+		|| slot >= UndoBufPool->nslots)
+		ereport(PANIC, (errmsg("cluster undo prepared consume lost its buffer slot")));
 	s = &UndoBufSlots[slot];
-	if (!LWLockHeldByMe(&s->content_lock)
-		|| !s->valid || s->io_in_progress
-		|| s->segment_id != segment_id || s->owner != owner
-		|| s->block_no != block_no
+	if (!LWLockHeldByMe(&s->content_lock) || !s->valid || s->io_in_progress
+		|| s->segment_id != segment_id || s->owner != owner || s->block_no != block_no
 		|| pg_atomic_read_u32(&s->pincount) == 0)
-		ereport(PANIC,
-				(errmsg("cluster undo prepared consume lost exact resident authority "
-						"seg=%u owner=%u block=%u slot=%d",
-						segment_id, (unsigned int) owner, block_no, slot)));
+		ereport(PANIC, (errmsg("cluster undo prepared consume lost exact resident authority "
+							   "seg=%u owner=%u block=%u slot=%d",
+							   segment_id, (unsigned int)owner, block_no, slot)));
 	memcpy(SLOT_DATA(slot), image, BLCKSZ);
 }
 
@@ -926,15 +915,12 @@ cluster_undo_buf_unlock_ref(int slot)
 {
 	UndoBufSlot *s;
 
-	if (UndoBufPool == NULL || UndoBufSlots == NULL
-		|| slot < 0 || slot >= UndoBufPool->nslots)
-		ereport(PANIC,
-				(errmsg("cluster undo prepared consume cannot unlock its buffer slot")));
+	if (UndoBufPool == NULL || UndoBufSlots == NULL || slot < 0 || slot >= UndoBufPool->nslots)
+		ereport(PANIC, (errmsg("cluster undo prepared consume cannot unlock its buffer slot")));
 	s = &UndoBufSlots[slot];
 	if (!LWLockHeldByMe(&s->content_lock))
 		ereport(PANIC,
-				(errmsg("cluster undo prepared consume does not hold buffer slot %d",
-						slot)));
+				(errmsg("cluster undo prepared consume does not hold buffer slot %d", slot)));
 	LWLockRelease(&s->content_lock);
 }
 

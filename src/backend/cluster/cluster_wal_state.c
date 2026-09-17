@@ -169,8 +169,8 @@ wal_state_cf_prerequisites_ready(void)
 {
 	ClusterResId cf_resid;
 
-	if (!cluster_controlfile_shared_authority || !cluster_lms_enabled
-		|| !cluster_lms_is_ready() || MyProc == NULL)
+	if (!cluster_controlfile_shared_authority || !cluster_lms_enabled || !cluster_lms_is_ready()
+		|| MyProc == NULL)
 		return false;
 	cluster_cf_resid_encode(&cf_resid);
 	return cluster_grd_lookup_master(&cf_resid) >= 0;
@@ -202,8 +202,7 @@ cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStat
 	ssize_t nbytes;
 
 	if (update == NULL
-		|| (cf_mode != CLUSTER_WAL_STATE_CF_ACQUIRE_X
-			&& cf_mode != CLUSTER_WAL_STATE_CF_BORROW_X))
+		|| (cf_mode != CLUSTER_WAL_STATE_CF_ACQUIRE_X && cf_mode != CLUSTER_WAL_STATE_CF_BORROW_X))
 		return CLUSTER_WAL_STATE_UPDATE_INVALID;
 	if (!cluster_enabled || !registry_configured())
 		return CLUSTER_WAL_STATE_UPDATE_DISABLED;
@@ -275,8 +274,8 @@ cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStat
 		goto out;
 	}
 
-	result = cluster_wal_state_slot_prepare_update(
-		&fresh_before, thread_id, cluster_node_id, update, &expected_after);
+	result = cluster_wal_state_slot_prepare_update(&fresh_before, thread_id, cluster_node_id,
+												   update, &expected_after);
 	if (result == CLUSTER_WAL_STATE_UPDATE_NOOP) {
 		if (published_slot != NULL)
 			memcpy(published_slot, &fresh_before, sizeof(*published_slot));
@@ -318,8 +317,8 @@ cluster_wal_state_update_own(const ClusterWalStateUpdate *update, ClusterWalStat
 		result = CLUSTER_WAL_STATE_UPDATE_IO_ERROR;
 		goto out;
 	}
-	result = cluster_wal_state_slot_verify_postread(
-		&expected_after, &fresh_observed, thread_id, cluster_node_id);
+	result = cluster_wal_state_slot_verify_postread(&expected_after, &fresh_observed, thread_id,
+													cluster_node_id);
 	if (result == CLUSTER_WAL_STATE_UPDATE_OK && published_slot != NULL)
 		memcpy(published_slot, &fresh_observed, sizeof(*published_slot));
 
@@ -337,8 +336,7 @@ out:
 		 * RELEASE_UNCERTAIN — fail-closed (the caller must not re-acquire
 		 * or re-publish on the same token; the slot deliberately stays
 		 * held and the next acquire drains it — never a double grant). */
-		if (cluster_cf_unlock_confirmed(ExclusiveLock)
-			== CLUSTER_CF_RELEASE_UNCONFIRMED)
+		if (cluster_cf_unlock_confirmed(ExclusiveLock) == CLUSTER_CF_RELEASE_UNCONFIRMED)
 			return CLUSTER_WAL_STATE_UPDATE_RELEASE_UNCERTAIN;
 	}
 	return result;
@@ -389,20 +387,20 @@ cluster_wal_state_ensure(void)
 		long long actual_size = (long long)st.st_size;
 
 		(void)close(fd);
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-						errmsg("WAL state registry \"%s\" is not a regular exact-size file "
-							   "(size %lld, expected %d)",
-							   path, actual_size, CLUSTER_WAL_STATE_FILE_SIZE),
-						errhint("Restore a known-valid registry while the cluster is fully offline; "
-								"runtime startup preserves the invalid evidence.")));
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+				 errmsg("WAL state registry \"%s\" is not a regular exact-size file "
+						"(size %lld, expected %d)",
+						path, actual_size, CLUSTER_WAL_STATE_FILE_SIZE),
+				 errhint("Restore a known-valid registry while the cluster is fully offline; "
+						 "runtime startup preserves the invalid evidence.")));
 	}
 
 	image = palloc0(CLUSTER_WAL_STATE_FILE_SIZE);
 	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_WAL_STATE_READ);
 	for (block = 0; block <= CLUSTER_WAL_STATE_SLOT_COUNT; block++) {
 		off_t offset = (off_t)block * CLUSTER_WAL_STATE_SLOT_SIZE;
-		ssize_t nread
-			= pg_pread(fd, image + offset, CLUSTER_WAL_STATE_SLOT_SIZE, offset);
+		ssize_t nread = pg_pread(fd, image + offset, CLUSTER_WAL_STATE_SLOT_SIZE, offset);
 
 		if (nread != CLUSTER_WAL_STATE_SLOT_SIZE) {
 			int save_errno = nread < 0 ? errno : EIO;
@@ -436,41 +434,39 @@ cluster_wal_state_ensure(void)
 							errdetail("Header validation failed: %s.",
 									  reason != NULL ? reason : "unknown"),
 							errhint("Restore a known-valid registry while the cluster is fully "
-										"offline; runtime startup never deletes, truncates or "
-										"rebuilds it.")));
+									"offline; runtime startup never deletes, truncates or "
+									"rebuilds it.")));
 		else
 			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
 							errmsg("WAL state registry \"%s\" failed validation", path),
 							errdetail("Slot %u validation failed: %s.", (unsigned)bad_thread,
 									  reason != NULL ? reason : "unknown"),
 							errhint("Restore a known-valid registry while the cluster is fully "
-										"offline; runtime startup never deletes, truncates or "
-										"rebuilds it.")));
+									"offline; runtime startup never deletes, truncates or "
+									"rebuilds it.")));
 	}
 
 	own_thread = cluster_wal_thread_id();
 	memcpy(&own_slot, image + CLUSTER_WAL_STATE_SLOT_OFFSET(own_thread), sizeof(own_slot));
-	own_verdict
-		= cluster_wal_state_slot_classify(&own_slot, own_thread, cluster_node_id, &reason);
+	own_verdict = cluster_wal_state_slot_classify(&own_slot, own_thread, cluster_node_id, &reason);
 	if (own_verdict != CLUSTER_WAL_SLOT_EMPTY && own_verdict != CLUSTER_WAL_SLOT_OK) {
 		pfree(image);
 		if (own_verdict == CLUSTER_WAL_SLOT_FOREIGN)
-			ereport(FATAL,
-					(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					 errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
-							(unsigned)own_thread),
-					 errdetail("Own-slot validation failed: node_id mismatch "
-							   "(expected %d, found %d).",
-							   cluster_node_id, (int)own_slot.node_id),
-					 errhint("Restore the correct known-valid registry while the cluster is "
-							 "fully offline; foreign ownership evidence is preserved.")));
-		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
-					errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
-							   (unsigned)own_thread),
-						errdetail("Own-slot validation failed: %s.",
-								  reason != NULL ? reason : "unknown"),
-						errhint("Restore the correct known-valid registry while the cluster is "
-								"fully offline; foreign ownership evidence is preserved.")));
+			ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+							errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
+								   (unsigned)own_thread),
+							errdetail("Own-slot validation failed: node_id mismatch "
+									  "(expected %d, found %d).",
+									  cluster_node_id, (int)own_slot.node_id),
+							errhint("Restore the correct known-valid registry while the cluster is "
+									"fully offline; foreign ownership evidence is preserved.")));
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
+				 errmsg("WAL state registry \"%s\" own slot %u failed validation", path,
+						(unsigned)own_thread),
+				 errdetail("Own-slot validation failed: %s.", reason != NULL ? reason : "unknown"),
+				 errhint("Restore the correct known-valid registry while the cluster is "
+						 "fully offline; foreign ownership evidence is preserved.")));
 	}
 	pfree(image);
 	return true;
@@ -640,10 +636,8 @@ cluster_wal_state_publish_stopped(void)
 	update.last_updated = (int64)GetCurrentTimestamp();
 	update.highest_lsn = (uint64)write_ptr;
 	update.highest_scn = (uint64)cluster_scn_current();
-	result = cluster_wal_state_update_own(
-		&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
-	if (result != CLUSTER_WAL_STATE_UPDATE_OK
-		&& result != CLUSTER_WAL_STATE_UPDATE_NOOP
+	result = cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL);
+	if (result != CLUSTER_WAL_STATE_UPDATE_OK && result != CLUSTER_WAL_STATE_UPDATE_NOOP
 		&& result != CLUSTER_WAL_STATE_UPDATE_DISABLED)
 		ereport(WARNING, (errcode(ERRCODE_CLUSTER_WAL_STATE_IO_FAILURE),
 						  errmsg("could not publish STOPPED to the WAL state registry "
@@ -651,8 +645,7 @@ cluster_wal_state_publish_stopped(void)
 								 (int)result),
 						  errhint("The slot stays ACTIVE; recovery readers treat it "
 								  "conservatively.")));
-	return result == CLUSTER_WAL_STATE_UPDATE_OK
-		|| result == CLUSTER_WAL_STATE_UPDATE_NOOP;
+	return result == CLUSTER_WAL_STATE_UPDATE_OK || result == CLUSTER_WAL_STATE_UPDATE_NOOP;
 }
 
 /*
@@ -853,9 +846,7 @@ cluster_wal_state_refresh_fail_count(void)
  * lockstep anchor for any future ungated site (a regression re-lists it
  * here + in the script and turns the latch apply self-check RED).
  */
-static const char *const cluster_wal_state_census_deferred_sites[] = {
-	NULL
-};
+static const char *const cluster_wal_state_census_deferred_sites[] = { NULL };
 
 bool
 cluster_wal_state_correctness_census_ok(void)

@@ -62,15 +62,13 @@ typedef uint64 ClusterPageIncarnation;
 typedef uint64 ClusterVersionToken;
 
 /* exact shared-storage database identity + physical relation/fork/block. */
-typedef struct ClusterPageIdentity
-{
+typedef struct ClusterPageIdentity {
 	RelFileLocator rlocator;
-	ForkNumber	forknum;
+	ForkNumber forknum;
 	BlockNumber blocknum;
 } ClusterPageIdentity;
 
-typedef struct ClusterPageVersion
-{
+typedef struct ClusterPageVersion {
 	ClusterPageIdentity identity;
 	ClusterPageIncarnation incarnation; /* 0 = invalid */
 	ClusterVersionToken token;			/* 0 = invalid */
@@ -79,8 +77,7 @@ typedef struct ClusterPageVersion
 /* §3.4: expected_before is "PageVersion-or-explicit-class-state".  The one
  * explicit class state defined here is UNFORMATTED (PC-NEW before-state):
  * typed, never a numeric sentinel (spec §3.1, §4.3). */
-typedef struct ClusterPageBeforeState
-{
+typedef struct ClusterPageBeforeState {
 	ClusterPageIdentity identity;
 	ClusterPageIncarnation new_incarnation; /* 0 = invalid */
 } ClusterPageBeforeState;
@@ -92,11 +89,10 @@ typedef struct ClusterPageBeforeState
  * Any invalid input fails closed to BLOCKED — InvalidScn containment is
  * BLOCKED, never a version success (spec §10.1 PU-01).
  */
-typedef enum ClusterPageApplyVerdict
-{
-	CLUSTER_PAGE_APPLY_APPLY = 0,	/* current == expected_before, result valid */
-	CLUSTER_PAGE_APPLY_SKIP,		/* trusted source == result (shape 1) */
-	CLUSTER_PAGE_APPLY_BLOCKED		/* anything else: fail closed */
+typedef enum ClusterPageApplyVerdict {
+	CLUSTER_PAGE_APPLY_APPLY = 0, /* current == expected_before, result valid */
+	CLUSTER_PAGE_APPLY_SKIP,	  /* trusted source == result (shape 1) */
+	CLUSTER_PAGE_APPLY_BLOCKED	  /* anything else: fail closed */
 } ClusterPageApplyVerdict;
 
 /*
@@ -105,8 +101,7 @@ typedef enum ClusterPageApplyVerdict
  * unknown fork-header / ambiguous lifecycle classify UNKNOWN (BLOCKED).
  * Class names track the spec table rows (PC-NORMAL .. PC-UNKNOWN).
  */
-typedef enum ClusterPageClass
-{
+typedef enum ClusterPageClass {
 	CLUSTER_PAGE_CLASS_UNCLASSIFIED = 0, /* state-machine start (spec §3.5) */
 	CLUSTER_PAGE_CLASS_NORMAL,			 /* PC-NORMAL */
 	CLUSTER_PAGE_CLASS_NEW,				 /* PC-NEW */
@@ -124,11 +119,10 @@ typedef enum ClusterPageClass
 /* §4.5: header pages route to an exact typed owner.  NONE means the caller
  * declares no typed owner — a header-class page without an owner is never
  * auto-inferred (that would be a guess, and guesses are UNKNOWN). */
-typedef enum ClusterPageHeaderOwner
-{
+typedef enum ClusterPageHeaderOwner {
 	CLUSTER_PAGE_HEADER_OWNER_NONE = 0,
-	CLUSTER_PAGE_HEADER_OWNER_ROOT,	 /* RF-ROOT typed owner */
-	CLUSTER_PAGE_HEADER_OWNER_SIDE,	 /* RF-SIDE typed owner */
+	CLUSTER_PAGE_HEADER_OWNER_ROOT,	  /* RF-ROOT typed owner */
+	CLUSTER_PAGE_HEADER_OWNER_SIDE,	  /* RF-SIDE typed owner */
 	CLUSTER_PAGE_HEADER_OWNER_PG_CORE /* PG core typed owner */
 } ClusterPageHeaderOwner;
 
@@ -139,18 +133,17 @@ typedef enum ClusterPageHeaderOwner
  * exact caller-declared facts — the classifier never infers them from
  * names, paths, counters or digests (spec §5.1).
  */
-typedef struct ClusterPageClassifyInput
-{
-	uint8		rmid;
-	uint16		opcode;
-	bool		has_full_page_image; /* XLR_FULL_PAGE_WRITE / FPI payload */
-	bool		has_will_init;		 /* WILL_INIT record attribute */
-	ForkNumber	forknum;
-	bool		relation_is_temp;	 /* temp/session-local relation scope */
-	bool		relation_is_unlogged; /* nonlogged relation (no WAL coverage) */
-	bool		page_absent;		 /* relation/file absent or block beyond EOF */
-	bool		page_is_new;		 /* PageIsNew: all-zero/uninitialized page */
-	bool		is_cleanout;		 /* delayed cleanout metadata normalization */
+typedef struct ClusterPageClassifyInput {
+	uint8 rmid;
+	uint16 opcode;
+	bool has_full_page_image; /* XLR_FULL_PAGE_WRITE / FPI payload */
+	bool has_will_init;		  /* WILL_INIT record attribute */
+	ForkNumber forknum;
+	bool relation_is_temp;				 /* temp/session-local relation scope */
+	bool relation_is_unlogged;			 /* nonlogged relation (no WAL coverage) */
+	bool page_absent;					 /* relation/file absent or block beyond EOF */
+	bool page_is_new;					 /* PageIsNew: all-zero/uninitialized page */
+	bool is_cleanout;					 /* delayed cleanout metadata normalization */
 	ClusterPageHeaderOwner header_owner; /* typed owner declaration */
 } ClusterPageClassifyInput;
 
@@ -158,11 +151,9 @@ typedef struct ClusterPageClassifyInput
  * Identity / version helpers.
  */
 extern bool cluster_page_identity_valid(const ClusterPageIdentity *identity);
-extern bool cluster_page_identity_equal(const ClusterPageIdentity *a,
-										const ClusterPageIdentity *b);
+extern bool cluster_page_identity_equal(const ClusterPageIdentity *a, const ClusterPageIdentity *b);
 extern bool cluster_page_version_valid(const ClusterPageVersion *version);
-extern bool cluster_page_version_equal(const ClusterPageVersion *a,
-									   const ClusterPageVersion *b);
+extern bool cluster_page_version_equal(const ClusterPageVersion *a, const ClusterPageVersion *b);
 extern bool cluster_page_before_state_valid(const ClusterPageBeforeState *state);
 extern bool cluster_page_before_state_equal(const ClusterPageBeforeState *a,
 											const ClusterPageBeforeState *b);
@@ -176,10 +167,8 @@ extern bool cluster_page_before_state_equal(const ClusterPageBeforeState *a,
  * §3.3 shape-2 contributor-chain skip belongs to PGDEL-05).
  */
 extern ClusterPageApplyVerdict cluster_page_version_decide(
-	const ClusterPageVersion *current_working,
-	const ClusterPageVersion *expected_before,
-	const ClusterPageVersion *result_version,
-	const ClusterPageVersion *trusted_source_version);
+	const ClusterPageVersion *current_working, const ClusterPageVersion *expected_before,
+	const ClusterPageVersion *result_version, const ClusterPageVersion *trusted_source_version);
 
 /*
  * §4.1 closed classifier.  Returns exactly one class; UNKNOWN means the
@@ -200,4 +189,4 @@ extern ClusterPageClass cluster_page_classify(const ClusterPageClassifyInput *in
 extern bool cluster_page_class_register_known_opcode(uint8 rmid, uint16 opcode);
 extern bool cluster_page_class_is_known_opcode(uint8 rmid, uint16 opcode);
 
-#endif							/* CLUSTER_PAGE_VERSION_H */
+#endif /* CLUSTER_PAGE_VERSION_H */

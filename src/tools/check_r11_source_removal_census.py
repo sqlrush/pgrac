@@ -23,8 +23,8 @@ L3_COMMIT = "cc1c5a554276542a05c15f5f1e0e0c7317fba66e"
 L3_TREE = "be71cb8fa6bba4164f8f9b57e54adcc6ef2a34b5"
 CURRENT_PRODUCT_SNAPSHOT = {
     "algorithm": "sha256-canonical-path-blob-v1",
-    "path_count": 2224,
-    "sha256": "b257e233d68a37edfbd238891077e28248d64fa8f1743cba1cdaf18a3c2680c2",
+    "path_count": 2225,
+    "sha256": "4788ca2a041bb8a02a38f4815170d76b6200fc6ef37580fab3b9e50aaa9e0f61",
 }
 
 LAYERS = {
@@ -64,7 +64,7 @@ LAYERS = {
             },
             {
                 "path": "src/backend/cluster/cluster_lms_outbound.c",
-                "symbol": "cluster_pcm_lock_resource_x_outbound_intent_probe_exact",
+                "symbol": "cluster_pcm_lock_resource_x_outbound_work_probe_exact",
             },
         ],
     },
@@ -361,7 +361,7 @@ def validate(source_root: pathlib.Path, manifest_path: pathlib.Path) -> str:
     stale_body = (source_root / "src/backend/cluster/cluster_gcs_block.c").read_text(
         encoding="utf-8"
     )
-    if len(re.findall(r"(?m)^gcs_block_legacy_pcm_x_stale_ingress\($", stale_body)) != 1:
+    if len(re.findall(r"(?m)^gcs_block_legacy_pcm_x_stale_ingress\s*\(", stale_body)) != 1:
         raise CensusError("bounded stale-family ingress cardinality is not one")
     build_body = (source_root / BUILD_LINK["manifest_path"]).read_text(encoding="utf-8")
     for name in BUILD_LINK["forbidden_objects"]:

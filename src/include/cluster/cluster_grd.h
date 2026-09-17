@@ -182,7 +182,7 @@ typedef struct ClusterGrdShared {
 	/* spec-4.6 D1/D4 — per-shard recovery phase (ClusterGrdShardPhase). */
 	pg_atomic_uint32 shard_phase[PGRAC_GRD_SHARD_COUNT];
 
-	pg_atomic_uint32 master_map_initialized;	 /* 0 until LMON init */
+	pg_atomic_uint32 master_map_initialized; /* 0 until LMON init */
 	/* Scheme A recovery-authority barrier.  The existing REDECLARE_DONE
 	 * epoch/hash wire converges holder truth across the exact formation.
 	 * A1 keeps every blocking step in LMON: Postmaster publishes the request
@@ -559,22 +559,22 @@ extern uint32 cluster_grd_shard_lookup(const ClusterResId *resid);
  */
 extern int32 cluster_grd_shard_master(uint32 shard_id);
 extern bool cluster_grd_is_local_master(uint32 shard_id);
-extern bool cluster_grd_recovery_authority_barrier_wait(
-	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
-	uint64 lms_generation, int timeout_ms);
+extern bool cluster_grd_recovery_authority_barrier_wait(const ClusterFormationSnapshotV1 *formation,
+														uint64 boot_incarnation,
+														uint64 lms_generation, int timeout_ms);
 extern void cluster_grd_recovery_authority_lmon_tick(void);
-extern bool cluster_grd_recovery_authority_is_current(
-	uint64 boot_incarnation, uint64 lms_generation);
-extern bool cluster_grd_serving_authority_rebind_lmon(
-	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
-	uint64 lms_generation);
+extern bool cluster_grd_recovery_authority_is_current(uint64 boot_incarnation,
+													  uint64 lms_generation);
+extern bool cluster_grd_serving_authority_rebind_lmon(const ClusterFormationSnapshotV1 *formation,
+													  uint64 boot_incarnation,
+													  uint64 lms_generation);
 /* RF-ROOT P6 (L5 shutdown handoff): the committed LEAVER's serving rebind —
  * no episode gates (the departed node never arms one for its own departure;
  * its drain was cooperative and complete), re-stamped from its own applied
  * CLEAN_LEAVE evidence. */
-extern bool cluster_grd_serving_authority_rebind_leaver(
-	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
-	uint64 lms_generation);
+extern bool cluster_grd_serving_authority_rebind_leaver(const ClusterFormationSnapshotV1 *formation,
+														uint64 boot_incarnation,
+														uint64 lms_generation);
 
 /*
  * spec-4.6 D2 — failure-driven remaster (NOT affinity/DRM, NOT
@@ -1126,8 +1126,7 @@ extern ClusterGrdEntryResult cluster_grd_revalidate_and_promote(const ClusterRes
  * mirror.  Only the exact reservation identity is consumed; sibling
  * reservations are neither authority nor a reason to reject the grant. */
 extern ClusterGrdEntryResult
-cluster_grd_promote_remote_grant_exact(const ClusterResId *resid,
-									   const ClusterGrdHolderId *holder);
+cluster_grd_promote_remote_grant_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder);
 extern ClusterGrdEntryResult
 cluster_grd_promote_remote_grant_mode_exact(const ClusterResId *resid,
 											const ClusterGrdHolderId *holder, LOCKMODE mode);
@@ -1136,12 +1135,11 @@ extern ClusterGrdEntryResult cluster_grd_confirm_local_grant_exact(const Cluster
 																   LOCKMODE mode);
 
 extern ClusterGrdEntryResult cluster_grd_release_holder_by_id(const ClusterResId *resid,
-														 const ClusterGrdHolderId *holder);
+															  const ClusterGrdHolderId *holder);
 /* Lookup an exact full-identity holder without creating an entry.  Used by
  * recovery-mode release gates to prove the allowlisted mode before mutation. */
 extern bool cluster_grd_holder_mode_by_id(const ClusterResId *resid,
-										 const ClusterGrdHolderId *holder,
-										 LOCKMODE *out_mode);
+										  const ClusterGrdHolderId *holder, LOCKMODE *out_mode);
 
 extern ClusterGrdEntryResult cluster_grd_cancel_reservation_by_id(const ClusterResId *resid,
 																  const ClusterGrdHolderId *holder);
@@ -1455,8 +1453,9 @@ extern ClusterGrdConvertResult cluster_grd_entry_request_convert(ClusterGrdEntry
 
 /* RF-ROOT P6 S05-3H -- return a conflicting UPGRADE immediately without
  * inserting it into converts[]. */
-extern ClusterGrdConvertResult cluster_grd_entry_request_convert_nowait(
-	ClusterGrdEntry *entry, const ClusterGrdConvert *req, bool *out_drain_hint);
+extern ClusterGrdConvertResult
+cluster_grd_entry_request_convert_nowait(ClusterGrdEntry *entry, const ClusterGrdConvert *req,
+										 bool *out_drain_hint);
 
 /*
  * D5 — convert-priority drain (caller holds entry->lock).  Grants every
@@ -1532,10 +1531,11 @@ extern ClusterGrdConvertResult cluster_grd_convert_or_enqueue_meta(
 	ClusterGrdConflictHolder *conflict_holders_out, int *n_conflict_out);
 
 /* RF-ROOT P6 S05-3H -- master-side non-enqueuing same-holder conversion. */
-extern ClusterGrdConvertResult cluster_grd_convert_nowait(
-	const ClusterResId *resid, int32 node_id, uint32 procno, uint64 cluster_epoch,
-	LOCKMODE current_mode, LOCKMODE requested_mode, uint64 convert_request_id,
-	uint64 old_request_id, int32 source_node_id, uint64 shard_master_generation);
+extern ClusterGrdConvertResult
+cluster_grd_convert_nowait(const ClusterResId *resid, int32 node_id, uint32 procno,
+						   uint64 cluster_epoch, LOCKMODE current_mode, LOCKMODE requested_mode,
+						   uint64 convert_request_id, uint64 old_request_id, int32 source_node_id,
+						   uint64 shard_master_generation);
 
 /*
  * spec-5.3 §3.5 native-probe clear path: commit a convert located by the

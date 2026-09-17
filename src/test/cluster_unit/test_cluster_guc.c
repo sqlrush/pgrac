@@ -117,31 +117,26 @@ static GucStringAssignHook pcm_x_retain_flush_error_target_assign_hook = NULL;
  * for the missing injection-only symbols instead of failing at link time.
  * The real cluster_guc object replaces both definitions once D3 lands. */
 char *cluster_pcm_x_retain_flush_error_target __attribute__((weak)) = NULL;
-extern bool cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid,
-														 uint32 db_oid,
-														 uint32 rel_number,
-														 int fork_number,
-														 uint32 block_number)
+extern bool cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid, uint32 db_oid,
+															uint32 rel_number, int fork_number,
+															uint32 block_number)
 	__attribute__((weak));
 
 bool
 cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid pg_attribute_unused(),
-														 uint32 db_oid pg_attribute_unused(),
-														 uint32 rel_number pg_attribute_unused(),
-														 int fork_number pg_attribute_unused(),
-														 uint32 block_number pg_attribute_unused())
+												uint32 db_oid pg_attribute_unused(),
+												uint32 rel_number pg_attribute_unused(),
+												int fork_number pg_attribute_unused(),
+												uint32 block_number pg_attribute_unused())
 {
 	return false;
 }
 #endif
 
 void
-DefineCustomIntVariable(const char *name,
-						const char *short_desc pg_attribute_unused(),
-						const char *long_desc,
-						int *valueAddr, int bootValue,
-						int minValue, int maxValue,
-						GucContext context, int flags pg_attribute_unused(),
+DefineCustomIntVariable(const char *name, const char *short_desc pg_attribute_unused(),
+						const char *long_desc, int *valueAddr, int bootValue, int minValue,
+						int maxValue, GucContext context, int flags pg_attribute_unused(),
 						GucIntCheckHook check_hook pg_attribute_unused(),
 						GucIntAssignHook assign_hook pg_attribute_unused(),
 						GucShowHook show_hook pg_attribute_unused())
@@ -154,8 +149,7 @@ DefineCustomIntVariable(const char *name,
 		undo_buffers_max_value = maxValue;
 		undo_buffers_context = context;
 		undo_buffers_long_desc = long_desc;
-	}
-	else if (strcmp(name, "cluster.external_fence_acquire_timeout_ms") == 0) {
+	} else if (strcmp(name, "cluster.external_fence_acquire_timeout_ms") == 0) {
 		external_fence_timeout_value_addr = valueAddr;
 		external_fence_timeout_boot_value = bootValue;
 		external_fence_timeout_min_value = minValue;
@@ -195,13 +189,12 @@ DefineCustomRealVariable(
 }
 
 void
-DefineCustomStringVariable(
-	const char *name, const char *short_desc pg_attribute_unused(),
-	const char *long_desc pg_attribute_unused(), char **valueAddr pg_attribute_unused(),
-	const char *bootValue, GucContext context,
-	int flags, GucStringCheckHook check_hook,
-	GucStringAssignHook assign_hook pg_attribute_unused(),
-	GucShowHook show_hook pg_attribute_unused())
+DefineCustomStringVariable(const char *name, const char *short_desc pg_attribute_unused(),
+						   const char *long_desc pg_attribute_unused(),
+						   char **valueAddr pg_attribute_unused(), const char *bootValue,
+						   GucContext context, int flags, GucStringCheckHook check_hook,
+						   GucStringAssignHook assign_hook pg_attribute_unused(),
+						   GucShowHook show_hook pg_attribute_unused())
 {
 	if (strcmp(name, "cluster.external_fence_socket_path") == 0) {
 		external_fence_socket_value_addr = valueAddr;
@@ -547,8 +540,8 @@ UT_TEST(test_external_fence_guc_contract)
 	external_fence_socket_check_hook = NULL;
 	cluster_init_guc();
 
-	UT_ASSERT_EQ(external_fence_timeout_value_addr ==
-				 &cluster_external_fence_acquire_timeout_ms, true);
+	UT_ASSERT_EQ(external_fence_timeout_value_addr == &cluster_external_fence_acquire_timeout_ms,
+				 true);
 	UT_ASSERT_EQ(cluster_external_fence_acquire_timeout_ms, 120000);
 	UT_ASSERT_EQ(external_fence_timeout_boot_value, 120000);
 	UT_ASSERT_EQ(external_fence_timeout_min_value, 1);
@@ -556,26 +549,21 @@ UT_TEST(test_external_fence_guc_contract)
 	UT_ASSERT_EQ(external_fence_timeout_context, PGC_SIGHUP);
 	UT_ASSERT_EQ(external_fence_timeout_flags, GUC_UNIT_MS);
 
-	UT_ASSERT_EQ(external_fence_socket_value_addr ==
-				 &cluster_external_fence_socket_path, true);
-	UT_ASSERT_STR_EQ(external_fence_socket_boot_value,
-				 "/var/run/pgrac/pgrac-fenced.sock");
+	UT_ASSERT_EQ(external_fence_socket_value_addr == &cluster_external_fence_socket_path, true);
+	UT_ASSERT_STR_EQ(external_fence_socket_boot_value, "/var/run/pgrac/pgrac-fenced.sock");
 	UT_ASSERT_EQ(external_fence_socket_context, PGC_POSTMASTER);
 	UT_ASSERT_EQ(external_fence_socket_flags, 0);
 	UT_ASSERT_NOT_NULL(external_fence_socket_check_hook);
 	if (external_fence_socket_check_hook != NULL) {
 		UT_ASSERT(external_fence_socket_check_hook(&valid, &extra, PGC_S_TEST));
 		UT_ASSERT(!external_fence_socket_check_hook(&relative, &extra, PGC_S_TEST));
-		UT_ASSERT(!external_fence_socket_check_hook(&parent_component, &extra,
-											 PGC_S_TEST));
-		UT_ASSERT(external_fence_socket_check_hook(&dotdot_name, &extra,
-										 PGC_S_TEST));
+		UT_ASSERT(!external_fence_socket_check_hook(&parent_component, &extra, PGC_S_TEST));
+		UT_ASSERT(external_fence_socket_check_hook(&dotdot_name, &extra, PGC_S_TEST));
 
 		memset(too_long, 'a', sizeof(too_long));
 		too_long[0] = '/';
 		too_long[sizeof(too_long) - 1] = '\0';
-		UT_ASSERT(!external_fence_socket_check_hook(&too_long_ptr, &extra,
-											 PGC_S_TEST));
+		UT_ASSERT(!external_fence_socket_check_hook(&too_long_ptr, &extra, PGC_S_TEST));
 	}
 }
 
@@ -584,29 +572,14 @@ UT_TEST(test_external_fence_guc_contract)
 UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
 {
 	static const char *const invalid_targets[]
-		= { "0/5/12345/0/0",
-			"1663/0/12345/0/0",
-			"1663/5/0/0/0",
-			"1663/5/12345/0",
-			"1663//12345/0/0",
-			"1663/5//0/0",
-			"1663/5/12345//0",
-			"1663/5/12345/0/",
-			"1663/5/12345/0/0/1",
-			" 1663/5/12345/0/0",
-			"1663/5/12345/0/0 ",
-			"1663/ 5/12345/0/0",
-			"+1663/5/12345/0/0",
-			"-1663/5/12345/0/0",
-			"0x67f/5/12345/0/0",
-			"1663/5/12x45/0/0",
-			"1663/5/12345/0/0suffix",
-			"1663/5/12345/0/0\n",
-			"4294967296/5/12345/0/0",
-			"1663/4294967296/12345/0/0",
-			"1663/5/4294967296/0/0",
-			"1663/5/12345/4/0",
-			"1663/5/12345/0/4294967295" };
+		= { "0/5/12345/0/0",		  "1663/0/12345/0/0",		   "1663/5/0/0/0",
+			"1663/5/12345/0",		  "1663//12345/0/0",		   "1663/5//0/0",
+			"1663/5/12345//0",		  "1663/5/12345/0/",		   "1663/5/12345/0/0/1",
+			" 1663/5/12345/0/0",	  "1663/5/12345/0/0 ",		   "1663/ 5/12345/0/0",
+			"+1663/5/12345/0/0",	  "-1663/5/12345/0/0",		   "0x67f/5/12345/0/0",
+			"1663/5/12x45/0/0",		  "1663/5/12345/0/0suffix",	   "1663/5/12345/0/0\n",
+			"4294967296/5/12345/0/0", "1663/4294967296/12345/0/0", "1663/5/4294967296/0/0",
+			"1663/5/12345/4/0",		  "1663/5/12345/0/4294967295" };
 	char *value;
 	void *extra;
 	int i;
@@ -620,19 +593,20 @@ UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
 	cluster_init_guc();
 
 	UT_ASSERT_NOT_NULL(pcm_x_retain_flush_error_target_value_addr);
-	UT_ASSERT_NOT_NULL((void *) &cluster_pcm_x_retain_flush_error_target);
+	UT_ASSERT_NOT_NULL((void *)&cluster_pcm_x_retain_flush_error_target);
 	if (&cluster_pcm_x_retain_flush_error_target != NULL)
-		UT_ASSERT_EQ(pcm_x_retain_flush_error_target_value_addr ==
-						 &cluster_pcm_x_retain_flush_error_target, true);
+		UT_ASSERT_EQ(pcm_x_retain_flush_error_target_value_addr
+						 == &cluster_pcm_x_retain_flush_error_target,
+					 true);
 	UT_ASSERT_STR_EQ(pcm_x_retain_flush_error_target_boot_value, "");
 	UT_ASSERT_EQ(pcm_x_retain_flush_error_target_context, PGC_SUSET);
 	UT_ASSERT_EQ(pcm_x_retain_flush_error_target_flags, GUC_NOT_IN_SAMPLE);
 	UT_ASSERT_NOT_NULL(pcm_x_retain_flush_error_target_check_hook);
 	UT_ASSERT_NOT_NULL(pcm_x_retain_flush_error_target_assign_hook);
-	UT_ASSERT_NOT_NULL((void *) cluster_pcm_x_retain_flush_error_target_matches);
-	if (pcm_x_retain_flush_error_target_check_hook == NULL ||
-		pcm_x_retain_flush_error_target_assign_hook == NULL ||
-		cluster_pcm_x_retain_flush_error_target_matches == NULL)
+	UT_ASSERT_NOT_NULL((void *)cluster_pcm_x_retain_flush_error_target_matches);
+	if (pcm_x_retain_flush_error_target_check_hook == NULL
+		|| pcm_x_retain_flush_error_target_assign_hook == NULL
+		|| cluster_pcm_x_retain_flush_error_target_matches == NULL)
 		return;
 
 	/* Empty is a valid assignment with a distinct match-none parse result. */
@@ -672,8 +646,8 @@ UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
 		pcm_x_retain_flush_error_target_assign_hook(value, extra);
 		free(extra);
 	}
-	UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(
-		UINT32_MAX, UINT32_MAX, UINT32_MAX, MAX_FORKNUM, InvalidBlockNumber - 1));
+	UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(UINT32_MAX, UINT32_MAX, UINT32_MAX,
+															  MAX_FORKNUM, InvalidBlockNumber - 1));
 
 	/* Restore the canonical value.  Every rejected check leaves this assigned
 	 * parse untouched because the assign hook is never called. */
@@ -685,15 +659,14 @@ UT_TEST(test_pcm_x_retain_flush_error_target_guc_contract)
 		free(extra);
 	}
 	for (i = 0; i < lengthof(invalid_targets); i++) {
-		value = (char *) invalid_targets[i];
+		value = (char *)invalid_targets[i];
 		extra = NULL;
 		last_guc_check_errcode = 0;
 		UT_ASSERT(!pcm_x_retain_flush_error_target_check_hook(&value, &extra, PGC_S_TEST));
 		UT_ASSERT_EQ(last_guc_check_errcode, ERRCODE_INVALID_PARAMETER_VALUE);
 		if (extra != NULL)
 			free(extra);
-		UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(
-			1663, 5, 12345, 0, 0));
+		UT_ASSERT(cluster_pcm_x_retain_flush_error_target_matches(1663, 5, 12345, 0, 0));
 	}
 }
 #endif

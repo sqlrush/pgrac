@@ -64,7 +64,7 @@
 #include "storage/ipc.h"
 #include "utils/wait_event.h"
 
-#include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_conf.h"		  /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_control_root.h" /* implementation: two-step root read (contract §A) */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_guc.h" /* cluster_node_id, cluster_wal_threads_dir */
@@ -72,10 +72,10 @@
 #include "cluster/cluster_hw_remaster.h"
 #include "cluster/cluster_hw_snapshot.h"
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
-#include "cluster/cluster_thread_recovery.h"   /* validated_end (torn-tail boundary) */
-#include "cluster/cluster_wal_state.h"		   /* read_slot (durable watermark) */
-#include "cluster/cluster_wal_thread.h"		   /* node id -> thread id */
-#include "cluster/storage/cluster_undo_xlog.h" /* xl_hw_reserve, XLOG_HW_RESERVE */
+#include "cluster/cluster_thread_recovery.h"	 /* validated_end (torn-tail boundary) */
+#include "cluster/cluster_wal_state.h"			 /* read_slot (durable watermark) */
+#include "cluster/cluster_wal_thread.h"			 /* node id -> thread id */
+#include "cluster/storage/cluster_undo_xlog.h"	 /* xl_hw_reserve, XLOG_HW_RESERVE */
 
 /* One worker process owns exactly one dead origin / episode. */
 static int hw_worker_dead_node = -1;
@@ -511,8 +511,7 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 		 * by exactly one survivor, so the lock-free read is the final
 		 * value (the minted-lost discriminator below stays intact: ABSENT
 		 * against a registry publication is still the danger state). */
-		root_result = cluster_control_root_read_canonical_dead_origin(
-			dead_tid, &root_snap);
+		root_result = cluster_control_root_read_canonical_dead_origin(dead_tid, &root_snap);
 		if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 			/* contract discriminator: the registry publication record.  A
@@ -532,7 +531,7 @@ cluster_hw_remaster_rebuild_origin(int dead_node_id, uint64 episode_epoch)
 			 * complete path below (the registry slot read either succeeds
 			 * or fails closed exactly as pre-bit22). */
 		} else {
-			validated_min = (XLogRecPtr) root_snap.validated_tail_lsn_exclusive;
+			validated_min = (XLogRecPtr)root_snap.validated_tail_lsn_exclusive;
 			if (validated_min == 0) {
 				cluster_hw_bump_failclosed();
 				ereport(LOG, (errmsg("cluster HW remaster: dead node %d canonical root has no "

@@ -35,19 +35,18 @@
 UT_DEFINE_GLOBALS();
 
 
-typedef struct FetchFixture
-{
+typedef struct FetchFixture {
 	TableIndexFetchTupleResult typed_result;
-	bool		legacy_found;
-	bool		mutate_tid;
-	bool		set_all_dead;
-	bool		slot_empty;
-	bool		call_again_seen;
-	int			tid;
-	int			typed_calls;
-	int			legacy_calls;
-	int			cleanup_calls;
-	bool		throw_error;
+	bool legacy_found;
+	bool mutate_tid;
+	bool set_all_dead;
+	bool slot_empty;
+	bool call_again_seen;
+	int tid;
+	int typed_calls;
+	int legacy_calls;
+	int cleanup_calls;
+	bool throw_error;
 } FetchFixture;
 
 static sigjmp_buf error_jump;
@@ -100,11 +99,9 @@ fixture_cleanup(void *context)
 	fixture->cleanup_calls++;
 }
 
-static const TableIndexFetchBarrierOps fixture_ops = {
-	.typed_fetch = fixture_typed_fetch,
-	.legacy_fetch = fixture_legacy_fetch,
-	.cleanup = fixture_cleanup
-};
+static const TableIndexFetchBarrierOps fixture_ops = { .typed_fetch = fixture_typed_fetch,
+													   .legacy_fetch = fixture_legacy_fetch,
+													   .cleanup = fixture_cleanup };
 
 static FetchFixture
 fetch_fixture(void)
@@ -120,10 +117,9 @@ fetch_fixture(void)
 UT_TEST(test_t1_legacy_false_maps_to_not_found)
 {
 	FetchFixture fixture = fetch_fixture();
-	bool		all_dead = true;
+	bool all_dead = true;
 
-	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture,
-											 false, &all_dead),
+	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture, false, &all_dead),
 				 TABLE_INDEX_FETCH_NOT_FOUND);
 	UT_ASSERT_EQ(fixture.legacy_calls, 1);
 	UT_ASSERT_EQ(fixture.typed_calls, 0);
@@ -135,8 +131,7 @@ UT_TEST(test_t2_legacy_true_maps_to_found)
 	FetchFixture fixture = fetch_fixture();
 
 	fixture.legacy_found = true;
-	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture,
-											 false, NULL),
+	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture, false, NULL),
 				 TABLE_INDEX_FETCH_FOUND);
 	UT_ASSERT(!fixture.slot_empty);
 	UT_ASSERT_EQ(fixture.cleanup_calls, 1);
@@ -145,11 +140,10 @@ UT_TEST(test_t2_legacy_true_maps_to_found)
 UT_TEST(test_t3_barrier_is_disjoint_and_mutates_no_visibility_state)
 {
 	FetchFixture fixture = fetch_fixture();
-	bool		all_dead = true;
+	bool all_dead = true;
 
 	fixture.typed_result = TABLE_INDEX_FETCH_BARRIER_CLOSED;
-	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture,
-											 true, &all_dead),
+	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture, true, &all_dead),
 				 TABLE_INDEX_FETCH_BARRIER_CLOSED);
 	UT_ASSERT_EQ(fixture.tid, 42);
 	UT_ASSERT(!all_dead);
@@ -162,8 +156,7 @@ UT_TEST(test_t4_typed_not_found_preserves_completed_scan_result)
 	FetchFixture fixture = fetch_fixture();
 
 	fixture.typed_result = TABLE_INDEX_FETCH_NOT_FOUND;
-	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture,
-											 true, NULL),
+	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture, true, NULL),
 				 TABLE_INDEX_FETCH_NOT_FOUND);
 	UT_ASSERT_EQ(fixture.typed_calls, 1);
 	UT_ASSERT(fixture.slot_empty);
@@ -172,13 +165,12 @@ UT_TEST(test_t4_typed_not_found_preserves_completed_scan_result)
 UT_TEST(test_t5_typed_found_preserves_callback_outputs)
 {
 	FetchFixture fixture = fetch_fixture();
-	bool		all_dead = false;
+	bool all_dead = false;
 
 	fixture.typed_result = TABLE_INDEX_FETCH_FOUND;
 	fixture.mutate_tid = true;
 	fixture.set_all_dead = true;
-	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture,
-											 true, &all_dead),
+	UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture, true, &all_dead),
 				 TABLE_INDEX_FETCH_FOUND);
 	UT_ASSERT_EQ(fixture.tid, 43);
 	UT_ASSERT(all_dead);
@@ -191,10 +183,8 @@ UT_TEST(test_t6_callback_error_propagates_without_false_result)
 	FetchFixture fixture = fetch_fixture();
 
 	fixture.throw_error = true;
-	if (sigsetjmp(error_jump, 1) == 0)
-	{
-		(void) table_index_fetch_barrier_execute(&fixture_ops, &fixture,
-												 true, NULL);
+	if (sigsetjmp(error_jump, 1) == 0) {
+		(void)table_index_fetch_barrier_execute(&fixture_ops, &fixture, true, NULL);
 		UT_ASSERT(false);
 	}
 	UT_ASSERT_EQ(fixture.cleanup_calls, 0);
@@ -205,12 +195,10 @@ UT_TEST(test_t7_cleanup_runs_once_for_each_normal_result)
 	FetchFixture fixture = fetch_fixture();
 	TableIndexFetchTupleResult result;
 
-	for (result = TABLE_INDEX_FETCH_NOT_FOUND;
-		 result <= TABLE_INDEX_FETCH_BARRIER_CLOSED; result++)
-	{
+	for (result = TABLE_INDEX_FETCH_NOT_FOUND; result <= TABLE_INDEX_FETCH_BARRIER_CLOSED;
+		 result++) {
 		fixture.typed_result = result;
-		UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture,
-												 true, NULL), result);
+		UT_ASSERT_EQ(table_index_fetch_barrier_execute(&fixture_ops, &fixture, true, NULL), result);
 	}
 	UT_ASSERT_EQ(fixture.cleanup_calls, 3);
 }

@@ -133,15 +133,15 @@ UT_TEST(test_validate_pi_conjunction)
 	 * reused; the caller discards the PI). */
 	in = ut_full_current_input();
 	in.ship_boundary_ok = true;
-	in.stability_ok = false;	/* holder changed */
+	in.stability_ok = false; /* holder changed */
 	UT_ASSERT(!cluster_page_source_validate_pi(&in));
 	in = ut_full_current_input();
 	in.ship_boundary_ok = true;
-	in.lineage_ok = false;		/* wrong failure-generation lineage */
+	in.lineage_ok = false; /* wrong failure-generation lineage */
 	UT_ASSERT(!cluster_page_source_validate_pi(&in));
 	in = ut_full_current_input();
 	in.ship_boundary_ok = true;
-	in.integrity_ok = false;	/* corrupt past image */
+	in.integrity_ok = false; /* corrupt past image */
 	UT_ASSERT(!cluster_page_source_validate_pi(&in));
 	in = ut_full_current_input();
 	in.ship_boundary_ok = true;

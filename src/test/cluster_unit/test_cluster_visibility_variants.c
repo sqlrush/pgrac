@@ -196,18 +196,12 @@ UT_TEST(test_obs3_dirty_full_table)
  * terminal outcome or unexpected SUBCOMMITTED value never opens the route. */
 UT_TEST(test_obs3_dirty_exact_remote_xmax_wait_gate)
 {
-	UT_ASSERT(cluster_vis_dirty_remote_xmax_waitable(
-		CLUSTER_TT_STATUS_IN_PROGRESS, true, true));
-	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
-		CLUSTER_TT_STATUS_IN_PROGRESS, true, false));
-	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
-		CLUSTER_TT_STATUS_IN_PROGRESS, false, true));
-	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
-		CLUSTER_TT_STATUS_SUBCOMMITTED, true, true));
-	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
-		CLUSTER_TT_STATUS_COMMITTED, true, true));
-	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(
-		CLUSTER_TT_STATUS_ABORTED, true, true));
+	UT_ASSERT(cluster_vis_dirty_remote_xmax_waitable(CLUSTER_TT_STATUS_IN_PROGRESS, true, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(CLUSTER_TT_STATUS_IN_PROGRESS, true, false));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(CLUSTER_TT_STATUS_IN_PROGRESS, false, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(CLUSTER_TT_STATUS_SUBCOMMITTED, true, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(CLUSTER_TT_STATUS_COMMITTED, true, true));
+	UT_ASSERT(!cluster_vis_dirty_remote_xmax_waitable(CLUSTER_TT_STATUS_ABORTED, true, true));
 }
 
 /* ---- meta: no status maps to an out-of-range verdict (exhaustive sweep) ---- */

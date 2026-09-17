@@ -58,10 +58,10 @@
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_external_fence.h"
-#include "cluster/cluster_hw.h"				 /* spec-4.6a HW remaster watchdog stubs */
-#include "cluster/cluster_lmd.h"			 /* spec-5.8 D1b — WFG vertex + submit/cancel edge */
-#include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
-#include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — ReconfigEvent stub type */
+#include "cluster/cluster_hw.h"			/* spec-4.6a HW remaster watchdog stubs */
+#include "cluster/cluster_lmd.h"		/* spec-5.8 D1b — WFG vertex + submit/cancel edge */
+#include "cluster/cluster_undo_resid.h" /* spec-5.22a D1-5 — undo-class hash-route guard */
+#include "cluster/cluster_reconfig.h"	/* spec-4.6 D1 — ReconfigEvent stub type */
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
@@ -483,16 +483,14 @@ cluster_reconfig_get_last_event(ReconfigEvent *out)
 }
 
 bool
-cluster_reconfig_rejoin_failure_snapshot(
-	int32 old_node_id, uint64 old_incarnation,
-	ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
+cluster_reconfig_rejoin_failure_snapshot(int32 old_node_id, uint64 old_incarnation,
+										 ClusterReconfigRejoinFailureSnapshotV1 *out_failure)
 {
 	if (out_failure != NULL)
 		memset(out_failure, 0, sizeof(*out_failure));
-	if (out_failure == NULL ||
-		old_node_id != ut_mock_rejoin_failure.old_node_id ||
-		old_incarnation != ut_mock_rejoin_failure.old_incarnation ||
-		ut_mock_rejoin_failure.event_id == 0)
+	if (out_failure == NULL || old_node_id != ut_mock_rejoin_failure.old_node_id
+		|| old_incarnation != ut_mock_rejoin_failure.old_incarnation
+		|| ut_mock_rejoin_failure.event_id == 0)
 		return false;
 	*out_failure = ut_mock_rejoin_failure;
 	return true;
@@ -921,9 +919,8 @@ cluster_lmd_submit_wait_edge_real(const ClusterLmdVertex *waiter, const ClusterL
 		ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
 
 		ut_wfg_release_holder_on_submit_once = false;
-		ut_wfg_release_granted
-			= cluster_grd_release_and_drain(&ut_wfg_release_resid, &ut_wfg_release_holder,
-										granted, lengthof(granted));
+		ut_wfg_release_granted = cluster_grd_release_and_drain(
+			&ut_wfg_release_resid, &ut_wfg_release_holder, granted, lengthof(granted));
 	}
 
 	if (ut_wfg_throw_on_submit_once) {
@@ -1786,8 +1783,7 @@ UT_TEST(test_grd_remote_grant_promotes_exact_reservation_amid_siblings)
 	UT_ASSERT_EQ((int)mode, (int)ExclusiveLock);
 	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &sibling, &mode));
 
-	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &first),
-				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_release_holder_by_id(&resid, &first), (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ((int)cluster_grd_promote_remote_grant_exact(&resid, &sibling),
 				 (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &sibling, &mode));
@@ -2087,8 +2083,7 @@ UT_TEST(test_grd_release_and_drain_reclaims_empty_entry)
 	cluster_grd_entry_release(entry);
 	missing = h1;
 	missing.request_id++;
-	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &missing, granted,
-									 lengthof(granted)), -1);
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &missing, granted, lengthof(granted)), -1);
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 1); /* exact holder retained */
 	(void)cluster_grd_release_and_drain(&resid, &h1, granted, lengthof(granted));
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0); /* empty -> reclaimed */
@@ -2698,8 +2693,7 @@ UT_TEST(test_walr_convert_nowait_conflict_never_enqueues)
 	other.node_id = 2;
 	other.procno = 200;
 	other.request_id = 22;
-	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &other),
-				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &other), (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert_nowait(e, &req, &drain),
 				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
 	UT_ASSERT_EQ(cluster_grd_entry_nconverts(e), 0);
@@ -2782,7 +2776,7 @@ UT_TEST(test_convert_u6_multiple_self_holders_excluded)
 
 	convert_reset();
 	e = convert_make_entry(2016);
-	convert_grant(e, 1, 100, 11, ShareLock);       /* precise convert source */
+	convert_grant(e, 1, 100, 11, ShareLock);	   /* precise convert source */
 	convert_grant(e, 1, 100, 12, AccessShareLock); /* additive self holder */
 
 	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 77);
@@ -2796,8 +2790,7 @@ UT_TEST(test_convert_u6_multiple_self_holders_excluded)
 	converted.node_id = 1;
 	converted.procno = 100;
 	converted.request_id = 77;
-	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &converted),
-				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &converted), (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1);
 	convert_teardown();
 }
@@ -2880,9 +2873,9 @@ UT_TEST(test_convert_u8_drain_converts_before_waiters)
 	 * slot.  This specifically exercises the queued drain predicate. */
 	convert_reset();
 	e = convert_make_entry(2017);
-	convert_grant(e, 1, 100, 11, ShareLock);       /* precise convert source */
+	convert_grant(e, 1, 100, 11, ShareLock);	   /* precise convert source */
 	convert_grant(e, 1, 100, 12, AccessShareLock); /* additive self holder */
-	convert_grant(e, 2, 200, 22, ShareLock);       /* real remote blocker */
+	convert_grant(e, 2, 200, 22, ShareLock);	   /* real remote blocker */
 
 	req = convert_req(1, 100, ShareLock, AccessExclusiveLock, 79);
 	UT_ASSERT_EQ((int)cluster_grd_entry_request_convert(e, &req, &drain),
@@ -2909,8 +2902,7 @@ UT_TEST(test_convert_u8_drain_converts_before_waiters)
 	converted.node_id = 1;
 	converted.procno = 100;
 	converted.request_id = 79;
-	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &converted),
-				 (int)CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ((int)cluster_grd_entry_release_holder(e, &converted), (int)CLUSTER_GRD_ENTRY_OK);
 	UT_ASSERT_EQ(cluster_grd_entry_ngranted(e), 1);
 	UT_ASSERT(cluster_grd_entry_holder_mode(e, 1, 100, &m));
 	UT_ASSERT_EQ((int)m, (int)AccessShareLock);
@@ -3466,19 +3458,16 @@ UT_TEST(test_walr_convert_nowait_requires_exact_old_holder_id)
 	bast_resid(5184, &resid);
 	holder = bast_holder(1, 100, 41);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
-					 &resid, &holder, 1, 41,
-					 (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
+					 &resid, &holder, 1, 41, (ClusterGrdWaiterMeta){ (TransactionId)0, 0 }, 0,
 					 UT_GES_OPCODE_REQUEST, ShareLock, conflicts, &nconflict),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
-	UT_ASSERT_EQ((int)cluster_grd_convert_nowait(
-					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 42,
-					 999, 1, 0),
-				 (int)CLUSTER_GRD_CONVERT_ILLEGAL);
-	UT_ASSERT_EQ((int)cluster_grd_convert_nowait(
-					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 42,
-					 41, 1, 0),
-				 (int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	UT_ASSERT_EQ(
+		(int)cluster_grd_convert_nowait(&resid, 1, 100, 0, ShareLock, ExclusiveLock, 42, 999, 1, 0),
+		(int)CLUSTER_GRD_CONVERT_ILLEGAL);
+	UT_ASSERT_EQ(
+		(int)cluster_grd_convert_nowait(&resid, 1, 100, 0, ShareLock, ExclusiveLock, 42, 41, 1, 0),
+		(int)CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
 	convert_teardown();
 }
 
@@ -4015,16 +4004,16 @@ UT_TEST(test_5_8_wfg_projection_retries_after_release_wins_snapshot_publish_race
 	bast_resid(5805, &resid);
 
 	h = bast_holder(3, 482, 305);
-	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 305, 0,
-											 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(
+					 &resid, &h, 3, 305, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
 				 (int)CLUSTER_GRD_GRANT_NOW);
 
 	ut_wfg_release_resid = resid;
 	ut_wfg_release_holder = h;
 	ut_wfg_release_holder_on_submit_once = true;
 	h = bast_holder(3, 543, 306);
-	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(&resid, &h, 3, 306, 0,
-											 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
+	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant(
+					 &resid, &h, 3, 306, 0, UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	UT_ASSERT(!ut_wfg_release_holder_on_submit_once);
@@ -4575,8 +4564,7 @@ UT_TEST(test_recovery_idle_ignores_join_pending)
 	cluster_grd_recovery_lmon_tick();
 	cluster_grd_recovery_lmon_tick(); /* persistent staging remains inert */
 
-	UT_ASSERT_EQ(cluster_grd_recovery_state_value(),
-				 (uint32)GRD_RECOVERY_IDLE);
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), (uint32)GRD_RECOVERY_IDLE);
 	UT_ASSERT_EQ(cluster_grd_recovery_last_event_id(), 0);
 	cluster_grd_recovery_counters_snapshot(&counters);
 	UT_ASSERT_EQ(counters.remaster_started, 0);
@@ -5282,16 +5270,14 @@ UT_TEST(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut)
 	ut_mock_last_event.event_id = failure.event_id;
 	ut_mock_last_event.old_epoch = UINT64_C(8);
 	ut_mock_last_event.new_epoch = failure.new_epoch;
-	ut_mock_last_event.cssd_dead_generation =
-		failure.cssd_dead_generation;
+	ut_mock_last_event.cssd_dead_generation = failure.cssd_dead_generation;
 	ut_mock_last_event.coordinator_node_id = 0;
 	ut_mock_last_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 	memcpy(ut_mock_last_event.dead_bitmap, failure.dead_bitmap,
 		   sizeof(ut_mock_last_event.dead_bitmap));
 	ut_mock_epoch = failure.new_epoch;
 	cluster_grd_recovery_lmon_tick();
-	UT_ASSERT_EQ(cluster_grd_recovery_episode_epoch_value(),
-				 failure.new_epoch);
+	UT_ASSERT_EQ(cluster_grd_recovery_episode_epoch_value(), failure.new_epoch);
 	dead_hash = cluster_grd_dead_bitmap_hash(failure.dead_bitmap);
 	UT_ASSERT_EQ(cluster_grd_recovery_event_bitmap_hash_value(), dead_hash);
 
@@ -5305,8 +5291,8 @@ UT_TEST(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut)
 	UT_ASSERT(cluster_grd_rejoin_clear_snapshot(&failure, &clear));
 	UT_ASSERT_EQ(clear.episode_epoch, failure.new_epoch);
 	UT_ASSERT_EQ(clear.dead_bitmap_hash, dead_hash);
-	UT_ASSERT(memcmp(clear.survivor_bitmap, failure.survivor_bitmap,
-				 sizeof(clear.survivor_bitmap)) == 0);
+	UT_ASSERT(memcmp(clear.survivor_bitmap, failure.survivor_bitmap, sizeof(clear.survivor_bitmap))
+			  == 0);
 
 	failure.survivor_bitmap[0] = 0;
 	memset(&clear, 0xa5, sizeof(clear));
@@ -5347,8 +5333,7 @@ setup_recovery_authority_fixture(ClusterFormationSnapshotV1 *formation)
 }
 
 static void
-setup_recovery_authority_singleton_fixture(
-	ClusterFormationSnapshotV1 *formation)
+setup_recovery_authority_singleton_fixture(ClusterFormationSnapshotV1 *formation)
 {
 	const int32 nodes[] = { 0 };
 
@@ -5374,8 +5359,7 @@ setup_recovery_authority_singleton_fixture(
 }
 
 static void
-setup_recovery_authority_four_node_fixture(
-	ClusterFormationSnapshotV1 *formation)
+setup_recovery_authority_four_node_fixture(ClusterFormationSnapshotV1 *formation)
 {
 	const int32 nodes[] = { 0, 1, 2, 3 };
 	int i;
@@ -5416,36 +5400,30 @@ UT_TEST(test_recovery_authority_done_echo_is_bounded_per_requester)
 	int dest;
 
 	setup_recovery_authority_four_node_fixture(&formation);
-	bitmap_hash = cluster_grd_dead_bitmap_hash(
-		formation.applied.dead_bitmap);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(formation.applied.dead_bitmap);
 	UT_ASSERT(bitmap_hash != 0);
 
 	/* Drive far enough to stamp our exact self-DONE, but withhold all three
 	 * peer DONEs so the authority request terminates fail-closed. */
 	ut_drive_authority_lmon_tick = true;
 	cluster_enabled = true;
-	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 20));
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 20));
 	ut_drive_authority_lmon_tick = false;
 	cluster_grd_recovery_authority_lmon_tick();
 	memset(ut_done_enqueue_count, 0, sizeof(ut_done_enqueue_count));
 
-	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
-										bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch, bitmap_hash);
 	for (dest = 1; dest < 4; dest++)
 		UT_ASSERT_EQ(ut_done_enqueue_count[dest], 1);
 
 	/* Exact duplicate from requester 1 is idempotent. */
-	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
-										bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch, bitmap_hash);
 	for (dest = 1; dest < 4; dest++)
 		UT_ASSERT_EQ(ut_done_enqueue_count[dest], 1);
 
 	/* Distinct late requesters at the same composite each re-arm one echo. */
-	cluster_grd_recovery_mark_peer_done(2, formation.local_epoch,
-										bitmap_hash);
-	cluster_grd_recovery_mark_peer_done(3, formation.local_epoch,
-										bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(2, formation.local_epoch, bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(3, formation.local_epoch, bitmap_hash);
 	for (dest = 1; dest < 4; dest++)
 		UT_ASSERT_EQ(ut_done_enqueue_count[dest], 3);
 
@@ -5463,8 +5441,7 @@ UT_TEST(test_recovery_authority_postmaster_cannot_execute_blocking_barrier)
 
 	/* With no LMON tick, the coordinator may only publish and poll.  It
 	 * must time out fail-closed without running shard cleanup itself. */
-	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 2));
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 2));
 	UT_ASSERT_EQ(ut_grd_blocking_lwlock_calls, 0);
 	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
 
@@ -5487,8 +5464,7 @@ UT_TEST(test_recovery_authority_lmon_tick_is_sole_blocking_executor)
 	ut_drive_authority_lmon_tick = true;
 	cluster_enabled = true;
 
-	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 10));
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
 
 	ut_drive_authority_lmon_tick = false;
 	cluster_enabled = false;
@@ -5510,8 +5486,7 @@ UT_TEST(test_recovery_authority_initial_epoch_zero_is_valid)
 	ut_drive_authority_lmon_tick = true;
 	cluster_enabled = true;
 
-	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 10));
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
 
 	ut_drive_authority_lmon_tick = false;
 	cluster_enabled = false;
@@ -5525,8 +5500,7 @@ UT_TEST(test_recovery_authority_rejects_missing_peer_or_unremastered_map)
 	ClusterFormationSnapshotV1 formation;
 
 	setup_recovery_authority_fixture(&formation);
-	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 2));
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 2));
 	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
 
 	/* A declared shard master outside the exact MEMBER formation is not
@@ -5534,8 +5508,7 @@ UT_TEST(test_recovery_authority_rejects_missing_peer_or_unremastered_map)
 	setup_recovery_authority_fixture(&formation);
 	formation.membership.membership_state[1] = CLUSTER_MEMBER_ABSENT;
 	ut_member_mask = 0x1;
-	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 10));
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
 	UT_ASSERT(!cluster_grd_recovery_authority_is_current(11, 7));
 }
 
@@ -5559,14 +5532,12 @@ UT_TEST(test_recovery_authority_same_composite_repost_retains_done_slots)
 	ut_drive_authority_lmon_tick = false;
 	cluster_enabled = true;
 
-	bitmap_hash = cluster_grd_dead_bitmap_hash(
-		formation.applied.dead_bitmap);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(formation.applied.dead_bitmap);
 	UT_ASSERT(bitmap_hash != 0);
 
 	/* gen=1: no LMON tick and no peer DONE -> timeout fail-closed (the
 	 * request is cancelled, the composite fields stay published). */
-	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 2));
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 2));
 
 	/* Terminalize the cancelled request so a fresh generation may post
 	 * (request-pending gate). */
@@ -5575,14 +5546,12 @@ UT_TEST(test_recovery_authority_same_composite_repost_retains_done_slots)
 	/* The peer completed its re-declare at the request composite while the
 	 * request fields were still published; its DONE stamps the authority
 	 * slot (the exact evidence a same-composite re-post needs). */
-	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
-										bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch, bitmap_hash);
 
 	/* gen=2 re-post of the IDENTICAL composite: with the peer slot retained,
 	 * the driven LMON tick converges without any fresh peer frame. */
 	ut_drive_authority_lmon_tick = true;
-	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 20));
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 20));
 	ut_drive_authority_lmon_tick = false;
 	cluster_enabled = false;
 	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
@@ -5605,17 +5574,14 @@ UT_TEST(test_recovery_authority_composite_change_repost_requires_fresh_done)
 	ut_drive_authority_lmon_tick = false;
 	cluster_enabled = true;
 
-	bitmap_hash = cluster_grd_dead_bitmap_hash(
-		formation.applied.dead_bitmap);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(formation.applied.dead_bitmap);
 	UT_ASSERT(bitmap_hash != 0);
 
 	/* Same prologue as the retention test: gen=1 cancelled, peer slot
 	 * stamped at (5, hash). */
-	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 2));
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 2));
 	cluster_grd_recovery_authority_lmon_tick();
-	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
-										bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch, bitmap_hash);
 
 	/* The epoch advances (a new reconfig event): the re-post composite
 	 * CHANGES, so the old (5, hash) slots must not carry over. */
@@ -5626,19 +5592,16 @@ UT_TEST(test_recovery_authority_composite_change_repost_requires_fresh_done)
 	/* gen=2 at (6, hash): the peer slot was zeroed by the composite change;
 	 * with no fresh (6, hash) DONE the barrier must fail closed. */
 	ut_drive_authority_lmon_tick = true;
-	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 20));
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 20));
 
 	/* Terminalize the cancelled gen=2 so a fresh generation may post, then
 	 * a fresh peer DONE at the new composite lets the next same-composite
 	 * retry converge. */
 	ut_drive_authority_lmon_tick = false;
 	cluster_grd_recovery_authority_lmon_tick();
-	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch,
-										bitmap_hash);
+	cluster_grd_recovery_mark_peer_done(1, formation.local_epoch, bitmap_hash);
 	ut_drive_authority_lmon_tick = true;
-	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(
-		&formation, 11, 7, 20));
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 20));
 	ut_drive_authority_lmon_tick = false;
 	cluster_enabled = false;
 	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));

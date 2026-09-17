@@ -197,9 +197,8 @@ cluster_recovery_worker_target_page(uint64 highest_lsn, int wal_segsz_bytes, uin
 static inline bool
 cluster_recovery_worker_root_anchor_valid(const ClusterControlRootSnapshot *snapshot)
 {
-	return snapshot != NULL
-		&& snapshot->validated_tail_lsn_exclusive != 0
-		&& snapshot->tail_tli != 0;
+	return snapshot != NULL && snapshot->validated_tail_lsn_exclusive != 0
+		   && snapshot->tail_tli != 0;
 }
 
 #ifndef FRONTEND
