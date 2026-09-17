@@ -393,10 +393,20 @@ ok($node->safe_psql('postgres',
 		'SELECT count(*) >= 30 FROM pg_cluster_state')
 	eq 't', 'O1 pg_cluster_state returns >= 30 rows (20 inject + others)');
 
+my @state_categories = (qw(
+	advisory block_format buffer_format catalog cf cluster_cssd cluster_stats
+	conf cr cr_coord cr_pool ctrc diag dl gcs gcs_recovery ges grd grd_recovery
+	guc hang hw ic inject ir ko lck lmd lmon lms multixact_current normal_start
+	pcm pgstat phase r4 reconfig reconfig_join reconfig_touched recovery
+	resolver_cache scn sequence shared_fs shmem sinval smart_fusion ts tt_2pc
+	tt_recovery tt_status tt_status_hint undo undo_cleaner visibility wal_thread
+	write_fence xid_stripe xnode_lever xnode_profile
+), map { "undo.cleaner.worker.$_" } 0 .. 7);
 is($node->safe_psql('postgres',
-		q{SELECT string_agg(DISTINCT category, ',' ORDER BY category) FROM pg_cluster_state}),
-	'advisory,block_format,buffer_format,catalog,cf,cluster_cssd,cluster_stats,conf,cr,cr_coord,cr_pool,diag,dl,gcs,gcs_recovery,ges,grd,grd_recovery,guc,hang,hw,ic,inject,ir,ko,lck,lmd,lmon,lms,multixact_current,pcm,pgstat,phase,r4,reconfig,reconfig_join,reconfig_touched,recovery,resolver_cache,scn,sequence,shared_fs,shmem,sinval,smart_fusion,ts,tt_2pc,tt_recovery,tt_status,tt_status_hint,undo,undo_cleaner,visibility,wal_thread,write_fence,xid_stripe,xnode_lever,xnode_profile',
-	'O2 pg_cluster_state has all 58 categories (Stage 8 R4 adds observation events)');
+		q{SELECT string_agg(DISTINCT category COLLATE "C", ','
+		                   ORDER BY category COLLATE "C") FROM pg_cluster_state}),
+	join(',', sort @state_categories),
+	'O2 pg_cluster_state has all 68 categories, including normal start and cleaner workers');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

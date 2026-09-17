@@ -59,8 +59,8 @@
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_ic_router.h"
-#include "cluster/cluster_ic_tier1.h"	   /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
-#include "cluster/cluster_lms.h"		   /* PGRAC: spec-7.3 D8 per-worker dispatch counter */
+#include "cluster/cluster_ic_tier1.h" /* cluster_ic_tier1_get_peer_fd (spec-2.5 D2.5 fanout) */
+#include "cluster/cluster_lms.h"	  /* PGRAC: spec-7.3 D8 per-worker dispatch counter */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D6 profiling */
 
@@ -202,8 +202,7 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	/* Scheme A service split: DATA is an ordinary serving capability, not
 	 * implied by CSSD ALIVE, quorum, MEMBER, or recovery LMS transport. */
 	if (!is_chunk_wrap && (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed()
-		&& !cluster_serving_ready_is_current())
+		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
 		return CLUSTER_IC_SEND_HARD_ERROR;
 
 	/* (3) dest = self -- short-circuit no-op success.  spec-2.2 stub
@@ -374,8 +373,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	 * because the authenticated peer connection is healthy; only the frame's
 	 * serving capability is absent. */
 	if ((ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed()
-		&& !cluster_serving_ready_is_current())
+		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
 		return true;
 
 	/*

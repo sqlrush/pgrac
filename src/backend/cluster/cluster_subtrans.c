@@ -240,7 +240,7 @@ cluster_subtrans_emit_subcommit(TransactionId child_xid, TransactionId parent_xi
 	tt_request.key = &child_key;
 	tt_request.parent_key = &parent_key;
 	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED, &tt_request,
-										 &tt_result)
+										  &tt_result)
 			!= CLUSTER_SEMANTIC_ADMISSION_OK
 		|| !tt_result.bool_value)
 		return false;
@@ -249,7 +249,7 @@ cluster_subtrans_emit_subcommit(TransactionId child_xid, TransactionId parent_xi
 	hint_request.key = &child_key;
 	hint_request.parent_key = &parent_key;
 	(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT_SUBCOMMITTED,
-										   &hint_request);
+												 &hint_request);
 
 	/* spec-3.15 D7: track the link for a potential PREPARE. */
 	{
@@ -342,7 +342,7 @@ cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result, int de
 		memset(&source_request, 0, sizeof(source_request));
 		source_request.key = &next_key;
 		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP, &source_request,
-										  &source_result)
+											  &source_result)
 				!= CLUSTER_SEMANTIC_ADMISSION_OK
 			|| !source_result.bool_value) {
 			/*
@@ -358,7 +358,7 @@ cluster_subtrans_lookup_parent(const ClusterTTStatusResult *child_result, int de
 
 		memset(&bump_request, 0, sizeof(bump_request));
 		(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_BUMP_PARENT_CHAIN_FOLLOW,
-											&bump_request, &bump_result);
+												&bump_request, &bump_result);
 
 		if (parent_res.status != CLUSTER_TT_STATUS_SUBCOMMITTED)
 			return parent_res;

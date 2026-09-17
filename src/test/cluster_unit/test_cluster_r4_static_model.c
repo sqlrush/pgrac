@@ -350,7 +350,7 @@ function_region_has_ordered(const char *source, const char *symbol, const char *
 
 static bool
 function_region_has_single_finally_leave(const char *source, const char *symbol,
-									 const char *next_symbol)
+										 const char *next_symbol)
 {
 	const char *const ordered[] = { "PG_FINALLY();", "cluster_semantic_activation_leave" };
 	char start_marker[128];
@@ -375,8 +375,8 @@ function_region_has_single_finally_leave(const char *source, const char *symbol,
 	for (cursor = start; (cursor = strstr(cursor, "PG_FINALLY();")) != NULL && cursor < end;
 		 cursor += strlen("PG_FINALLY();"))
 		finally_count++;
-	for (cursor = start; (cursor = strstr(cursor, "cluster_semantic_activation_leave")) != NULL
-						 && cursor < end;
+	for (cursor = start;
+		 (cursor = strstr(cursor, "cluster_semantic_activation_leave")) != NULL && cursor < end;
 		 cursor += strlen("cluster_semantic_activation_leave"))
 		leave_count++;
 	return finally_count == 1 && leave_count == 1;
@@ -421,7 +421,7 @@ d10_tt_source_edge_present(void)
 	return source_has_definition(sources.tt_status_source, "cluster_tt_status_lookup_exact")
 		   && source_has_definition(sources.tt_status_source, "cluster_tt_status_source_dispatch")
 		   && source_has(sources.vis_resolve_source,
-					 "cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP");
+						 "cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_LOOKUP");
 }
 
 static bool
@@ -441,10 +441,8 @@ d10_multi_source_edge_present(void)
 								 "cluster_multixact_member_overlay_install_raw")
 		   && source_has_definition(sources.multixact_source,
 									"cluster_multixact_member_overlay_lookup_raw")
-		   && source_has(sources.multixact_source,
-						 "cluster_multixact_source_dispatch_body(")
-		   && source_has_definition(sources.multixact_source,
-									"cluster_multixact_source_dispatch");
+		   && source_has(sources.multixact_source, "cluster_multixact_source_dispatch_body(")
+		   && source_has_definition(sources.multixact_source, "cluster_multixact_source_dispatch");
 }
 
 static bool
@@ -473,16 +471,16 @@ static bool
 all_four_d10_dispatches_gate_before_body(void)
 {
 	return dispatch_orders_gate_before_body(sources.gcs_source, "cluster_r4_source_cr_dispatch",
-										"cluster_gcs_block_cr_fetch_and_wait_raw")
+											"cluster_gcs_block_cr_fetch_and_wait_raw")
 		   && dispatch_orders_gate_before_body(sources.tt_status_source,
-										  "cluster_tt_status_source_dispatch",
-										  "cluster_tt_status_lookup_exact")
+											   "cluster_tt_status_source_dispatch",
+											   "cluster_tt_status_lookup_exact")
 		   && dispatch_orders_gate_before_body(sources.tt_hint_source,
-										  "cluster_tt_status_hint_source_dispatch",
-										  "cluster_tt_status_hint_emit_raw")
+											   "cluster_tt_status_hint_source_dispatch",
+											   "cluster_tt_status_hint_emit_raw")
 		   && dispatch_orders_gate_before_body(sources.multixact_source,
-										  "cluster_multixact_source_dispatch",
-										  "cluster_multixact_source_dispatch_body");
+											   "cluster_multixact_source_dispatch",
+											   "cluster_multixact_source_dispatch_body");
 }
 
 static bool
@@ -495,18 +493,17 @@ d10_admitted_wrappers_have_single_finally_leave(void)
 	 * cluster_gcs_block_redo_lsn_covered, and each of them legitimately
 	 * owns its own PG_FINALLY/leave pair.
 	 */
-	return function_region_has_single_finally_leave(
-			   sources.gcs_source, "cluster_r4_source_cr_dispatch",
-			   "cluster_gcs_block_undo_tt_fetch_and_wait")
+	return function_region_has_single_finally_leave(sources.gcs_source,
+													"cluster_r4_source_cr_dispatch",
+													"cluster_gcs_block_undo_tt_fetch_and_wait")
 		   && function_region_has_single_finally_leave(
-			   sources.gcs_source, "cluster_gcs_block_r4_route_cr",
-			   "gcs_block_try_r4_request80")
-		   && function_region_has_single_finally_leave(
-			   sources.cr_server_source, "cluster_cr_build_on_holder",
-			   "cluster_cr_server_shmem_size")
-		   && function_region_has_single_finally_leave(
-			   sources.tx_resolve_source, "cluster_tx_resolve_exact",
-			   "cluster_tx_resolve_multixact");
+			   sources.gcs_source, "cluster_gcs_block_r4_route_cr", "gcs_block_try_r4_request80")
+		   && function_region_has_single_finally_leave(sources.cr_server_source,
+													   "cluster_cr_build_on_holder",
+													   "cluster_cr_server_shmem_size")
+		   && function_region_has_single_finally_leave(sources.tx_resolve_source,
+													   "cluster_tx_resolve_exact",
+													   "cluster_tx_resolve_multixact");
 }
 
 static bool
@@ -522,9 +519,8 @@ d10_epoch_sampling_order_is_exact(void)
 	const char *const enter_order[]
 		= { "pg_write_barrier();", "semantic_activation_snapshot(&after)",
 			"epoch_after = cluster_epoch_get_current()" };
-	const char *const recheck_order[]
-		= { "semantic_activation_snapshot(&snapshot)",
-			"current_epoch = cluster_epoch_get_current()" };
+	const char *const recheck_order[] = { "semantic_activation_snapshot(&snapshot)",
+										  "current_epoch = cluster_epoch_get_current()" };
 
 	return function_region_has_ordered(
 			   sources.semantic_source, "semantic_activation_enter_internal",
@@ -552,7 +548,8 @@ legacy_d6_live_page_semantics_present(void)
 	const char *const ordered[]
 		= { "cluster_visibility_resolve_tuple_scn(", "page = BufferGetPage(buffer);",
 			"cluster_itl_get_tt_ref(page, htup->t_itl_slot_idx, &ref)",
-			"classify_page_ref(page, raw_xid, &ref, anchor_lsn, read_scn, out);" };
+			"classify_page_ref(page, htup->t_itl_slot_idx, which, raw_xid, &ref, anchor_lsn,",
+			"read_scn, out);" };
 
 	return source_has_ordered(sources.vis_resolve_source, ordered, lengthof(ordered));
 }
@@ -654,7 +651,7 @@ contract_actual(int contract_number)
 			&& source_has(sources.tt_hint_source, "CLUSTER_TT_STATUS_HINT_V4"))
 			return contract_required[5];
 		return all_four_d10_source_edges_present() ? "FOUR_SOURCE_EDGES_WITHOUT_ACTIVE_ZERO_PROOF"
-											 : "ABSENT";
+												   : "ABSENT";
 	case 7:
 		return semantic_gate && holder_route && sources.tx_resolve_source != NULL
 				   ? contract_required[6]
@@ -692,8 +689,7 @@ contract_actual(int contract_number)
 		if (source_has(sources.semantic_source, "cluster_semantic_activation_lmon_tick")
 			&& source_has(sources.semantic_source,
 						  "cluster_semantic_activation_qvotec_poll_record_cas")
-			&& source_has(sources.qvotec_source,
-						  "cluster_semantic_activation_record_cas_write")
+			&& source_has(sources.qvotec_source, "cluster_semantic_activation_record_cas_write")
 			&& source_has(sources.semantic_source, "QVOTEC"))
 			return contract_required[10];
 		return "ABSENT";
@@ -706,7 +702,7 @@ contract_actual(int contract_number)
 		if (semantic_gate && all_four_d10_source_edges_present())
 			return contract_required[12];
 		return all_four_d10_source_edges_present() ? "FOUR_SOURCE_EDGES_WITHOUT_COMMON_GATE"
-											 : "ABSENT";
+												   : "ABSENT";
 	case 14:
 		if (source_has(sources.semantic_source, "DefineCustomBoolVariable")
 			|| source_has(sources.semantic_source, "StartChildProcess")
@@ -725,9 +721,8 @@ contract_actual(int contract_number)
 			return contract_required[14];
 		return "RAW_OLD_SOURCE_LINK_VISIBLE";
 	case 16:
-		return semantic_gate && all_four_d10_dispatches_gate_before_body()
-				   ? contract_required[15]
-				   : "ABSENT";
+		return semantic_gate && all_four_d10_dispatches_gate_before_body() ? contract_required[15]
+																		   : "ABSENT";
 	case 17:
 		/* XMIN_MISMATCH_FULL_CR_ONLY (spec-8.4 §2.6g / D6 row): an
 		 * updated-row XMIN/current-last-writer mismatch enters the FULL-CR
@@ -750,7 +745,7 @@ contract_actual(int contract_number)
 			&& source_has(sources.heapam_source, "scratch") && full_builder)
 			return contract_required[17];
 		return legacy_d6_live_page_semantics_present() ? "LIVE_PAGE_FIELDS_NO_SCRATCH_REEVALUATION"
-												   : "ABSENT";
+													   : "ABSENT";
 	case 19:
 		if (source_has(sources.gcs_header, "master_resource_transition_count")
 			&& source_has(sources.gcs_source, "master_resource_transition_count")
@@ -765,11 +760,9 @@ contract_actual(int contract_number)
 		return "ABSENT";
 	case 21:
 		if (source_has(sources.gcs_header, "cluster_bufmgr_copy_block_for_r4_cr")
-			&& source_has_definition(sources.bufmgr_source,
-									 "cluster_bufmgr_copy_block_for_r4_cr")
+			&& source_has_definition(sources.bufmgr_source, "cluster_bufmgr_copy_block_for_r4_cr")
 			&& (source_has(sources.gcs_source, "cluster_bufmgr_copy_block_for_r4_cr(")
-				|| source_has(sources.cr_server_source,
-							  "cluster_bufmgr_copy_block_for_r4_cr(")))
+				|| source_has(sources.cr_server_source, "cluster_bufmgr_copy_block_for_r4_cr(")))
 			return contract_required[20];
 		return "ABSENT";
 	default:

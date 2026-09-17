@@ -1,0 +1,30 @@
+{
+  "schema_version": 1,
+  "required_workflows": {
+    "fast.yml": [
+      "Validate (comment headers + format + tidy + commit msg)",
+      "Security (cppcheck + scan-build)",
+      "Linux --disable-cluster regression",
+      "macOS build-only (compile guard)",
+      "Linux enable-cluster (unit + regress + smoke TAP)"
+    ],
+    "nightly.yml": [
+      "Linux PG 219 regression",
+      "macOS Build+Test (smoke)"
+    ]
+  },
+  "smoke_tests": [
+    "t/010_views.pl",
+    "t/030_acceptance.pl",
+    "t/031_undo_publication_refusal.pl",
+    "t/050_shared_storage_initdb.pl",
+    "t/200_stage2_acceptance_capability.pl",
+    "t/332_block_device_backend.pl"
+  ],
+  "historical_workflow": "legacy-extended.yml",
+  "historical_fast_tests": {
+    "t/226_stage3_mvcc_acceptance_capability.pl": "Mixed legacy capability fixture including positive prepared transactions and immediate-stop recovery.",
+    "t/273_stage4_recovery_acceptance_capability.pl": "Legacy positive recovery qualification, outside the current MVP release scope.",
+    "t/333_block_device_multinode.pl": "Legacy raw-device multi-node deployment fixture, not the qualified MVP single-host shared-filesystem topology."
+  }
+}

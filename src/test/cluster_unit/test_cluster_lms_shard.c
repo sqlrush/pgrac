@@ -361,14 +361,11 @@ UT_TEST(test_lms_child_exit_invalidates_shared_readiness)
 
 	cluster_lms_shared_mark_child_exit(&state);
 
-	UT_ASSERT_EQ((int)pg_atomic_read_u32(&state.lms_state),
-				 (int)CLUSTER_LMS_STOPPED);
+	UT_ASSERT_EQ((int)pg_atomic_read_u32(&state.lms_state), (int)CLUSTER_LMS_STOPPED);
 	UT_ASSERT_EQ(state.pid, 0);
 	UT_ASSERT_EQ(state.worker_pids[0], 0);
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state.recovery_ready_generation),
-				 UINT64_C(0));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&state.serving_requested_generation),
-				 UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.recovery_ready_generation), UINT64_C(0));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&state.serving_requested_generation), UINT64_C(0));
 }
 
 int

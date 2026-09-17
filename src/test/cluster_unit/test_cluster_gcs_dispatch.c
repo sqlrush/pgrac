@@ -703,34 +703,34 @@ UT_TEST(test_gcs_reply_identity_is_exact_across_backends)
 	reply.epoch = 7;
 
 	UT_ASSERT(cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
-											PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+													PCM_TRANS_S_TO_N_RELEASE, 3, 3));
 
 	/* Same raw sequence in another backend domain is not this request. */
 	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend0_request,
-											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+													 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
 
 	/* A predecessor reply cannot complete the successor transition. */
 	reply.transition_id = PCM_TRANS_X_TO_S_DOWNGRADE;
 	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
-											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+													 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
 	reply.transition_id = PCM_TRANS_S_TO_N_RELEASE;
 
 	/* Body sender and authenticated envelope source are both exact. */
 	reply.sender_node = 2;
 	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
-											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+													 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
 	reply.sender_node = 3;
 	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
-											 PCM_TRANS_S_TO_N_RELEASE, 3, 2));
+													 PCM_TRANS_S_TO_N_RELEASE, 3, 2));
 
 	/* Reserved bytes and status domain remain fail closed. */
 	reply.reserved_0[0] = 1;
 	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
-											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+													 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
 	reply.reserved_0[0] = 0;
 	reply.status = (uint8)(GCS_REPLY_DENIED_EPOCH_STALE + 1);
 	UT_ASSERT(!cluster_gcs_reply_matches_outstanding(&reply, backend1_request,
-											 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
+													 PCM_TRANS_S_TO_N_RELEASE, 3, 3));
 }
 
 

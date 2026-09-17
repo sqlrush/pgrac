@@ -44,57 +44,50 @@ GetCurrentTimestamp(void)
 	static int64 ticks = 1000000;
 
 	ticks += 1000000;
-	return (TimestampTz) ticks;
+	return (TimestampTz)ticks;
 }
 
 static ClusterPageRecoveryStats ut_stats;
 
 UT_TEST(test_counters_have_one_kind_each)
 {
-	static const char *event_names[] = {
-		"cluster.page.source_selected_current",
-		"cluster.page.source_selected_pi",
-		"cluster.page.source_selected_storage",
-		"cluster.page.source_invalid",
-		"cluster.page.source_missing",
-		"cluster.page.source_conflict",
-		"cluster.page.result_skip",
-		"cluster.page.apply_count",
-		"cluster.page.version_mismatch",
-		"cluster.page.unknown_class_blocked",
-		"cluster.page.authority_stale_rejected",
-		"cluster.page.resource_early_release",
-		"cluster.page.retire_denied",
-		"cluster.page.d3_rebuild",
-		"cluster.page.d3_optimization_hit",
-		"cluster.page.stable_base_unresolved"
-	};
-	static const char *gauge_names[] = {
-		"cluster.page.contributor_records",
-		"cluster.page.contributor_threads",
-		"cluster.page.contributor_gaps",
-		"cluster.page.retained_pinned_bytes"
-	};
-	static const char *ts_names[] = {
-		"cluster.page.last_page_write_ts",
-		"cluster.page.last_durability_barrier_ts",
-		"cluster.page.last_post_read_ts"
-	};
-	int			i;
+	static const char *event_names[] = { "cluster.page.source_selected_current",
+										 "cluster.page.source_selected_pi",
+										 "cluster.page.source_selected_storage",
+										 "cluster.page.source_invalid",
+										 "cluster.page.source_missing",
+										 "cluster.page.source_conflict",
+										 "cluster.page.result_skip",
+										 "cluster.page.apply_count",
+										 "cluster.page.version_mismatch",
+										 "cluster.page.unknown_class_blocked",
+										 "cluster.page.authority_stale_rejected",
+										 "cluster.page.resource_early_release",
+										 "cluster.page.retire_denied",
+										 "cluster.page.d3_rebuild",
+										 "cluster.page.d3_optimization_hit",
+										 "cluster.page.stable_base_unresolved" };
+	static const char *gauge_names[]
+		= { "cluster.page.contributor_records", "cluster.page.contributor_threads",
+			"cluster.page.contributor_gaps", "cluster.page.retained_pinned_bytes" };
+	static const char *ts_names[]
+		= { "cluster.page.last_page_write_ts", "cluster.page.last_durability_barrier_ts",
+			"cluster.page.last_post_read_ts" };
+	int i;
 	ClusterPageStatKind kind;
 
 	/* G2: every §9.1 metric is exactly one of EVENT/GAUGE/TIMESTAMP. */
-	for (i = 0; i < (int) lengthof(event_names); i++) {
+	for (i = 0; i < (int)lengthof(event_names); i++) {
 		UT_ASSERT(cluster_page_stats_describe(event_names[i], &kind));
-		UT_ASSERT_EQ((int) kind, (int) CLUSTER_PAGE_STAT_EVENT);
+		UT_ASSERT_EQ((int)kind, (int)CLUSTER_PAGE_STAT_EVENT);
 	}
-	for (i = 0; i < (int) lengthof(gauge_names); i++) {
+	for (i = 0; i < (int)lengthof(gauge_names); i++) {
 		UT_ASSERT(cluster_page_stats_describe(gauge_names[i], &kind));
-		UT_ASSERT_EQ((int) kind, (int) CLUSTER_PAGE_STAT_GAUGE);
+		UT_ASSERT_EQ((int)kind, (int)CLUSTER_PAGE_STAT_GAUGE);
 	}
-	for (i = 0; i < (int) lengthof(ts_names); i++) {
+	for (i = 0; i < (int)lengthof(ts_names); i++) {
 		UT_ASSERT(cluster_page_stats_describe(ts_names[i], &kind));
-		UT_ASSERT_EQ((int) kind, (int) CLUSTER_PAGE_STAT_TIMESTAMP);
+		UT_ASSERT_EQ((int)kind, (int)CLUSTER_PAGE_STAT_TIMESTAMP);
 	}
 	/* Unknown names fail closed. */
 	UT_ASSERT(!cluster_page_stats_describe("cluster.page.no_such", &kind));
@@ -122,11 +115,9 @@ UT_TEST(test_event_producers)
 	cluster_page_stats_d3_rebuild(&ut_stats, false);
 	cluster_page_stats_d3_rebuild(&ut_stats, true);
 
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_selected_current),
-				 UINT64_C(1));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_selected_current), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_selected_pi), UINT64_C(1));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_selected_storage),
-				 UINT64_C(1));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_selected_storage), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_invalid), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_missing), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.source_conflict), UINT64_C(1));
@@ -134,13 +125,10 @@ UT_TEST(test_event_producers)
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.apply_count), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.version_mismatch), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.unknown_class_blocked), UINT64_C(1));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.authority_stale_rejected),
-				 UINT64_C(1));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.resource_early_release),
-				 UINT64_C(1));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.authority_stale_rejected), UINT64_C(1));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.resource_early_release), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.retire_denied), UINT64_C(1));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.stable_base_unresolved),
-				 UINT64_C(1));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.stable_base_unresolved), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.d3_rebuild), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.d3_optimization_hit), UINT64_C(1));
 
@@ -158,8 +146,7 @@ UT_TEST(test_gauge_and_timestamp_producers)
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.contributor_records), UINT64_C(12));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.contributor_threads), UINT64_C(2));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.contributor_gaps), UINT64_C(0));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.retained_pinned_bytes),
-				 UINT64_C(4096));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.retained_pinned_bytes), UINT64_C(4096));
 
 	/* Timestamps are written (non-zero after note). */
 	cluster_page_stats_note_page_write(&ut_stats);
@@ -173,10 +160,10 @@ UT_TEST(test_gauge_and_timestamp_producers)
 UT_TEST(test_attempt_dump_full_field_set)
 {
 	ClusterPageAttemptDump d;
-	char		buf[512];
-	char		small[32];
-	int			written;
-	int			full;
+	char buf[512];
+	char small[32];
+	int written;
+	int full;
 
 	memset(&d, 0, sizeof(d));
 	d.failed_origin_thread = 2;
@@ -229,7 +216,7 @@ UT_TEST(test_attempt_dump_full_field_set)
 
 	/* Small buffers truncate safely; the return is the would-be length. */
 	written = cluster_page_attempt_dump(&d, small, sizeof(small));
-	UT_ASSERT(written >= full); /* snprintf semantics */
+	UT_ASSERT(written >= full);		 /* snprintf semantics */
 	small[sizeof(small) - 1] = '\0'; /* NUL-terminated by snprintf */
 
 	/* NULL dump is a no-op. */

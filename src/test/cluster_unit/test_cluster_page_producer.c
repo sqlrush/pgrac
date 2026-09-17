@@ -20,11 +20,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -71,9 +69,8 @@ cluster_scn_observe(SCN token)
 }
 
 void
-XLogRegisterPageVersionEdge(uint64 result_token,
-						const RfPageVersionEdgeEntryV1 *entries,
-						uint8 entry_count)
+XLogRegisterPageVersionEdge(uint64 result_token, const RfPageVersionEdgeEntryV1 *entries,
+							uint8 entry_count)
 {
 	register_calls++;
 	registered_token = result_token;
@@ -97,24 +94,23 @@ reset_allocator(SCN token)
 static void
 make_page(PGAlignedBlock *block, uint64 token)
 {
-	PageHeader	header;
+	PageHeader header;
 
 	memset(block, 0, sizeof(*block));
-	header = (PageHeader) block->data;
-	if (token != 0)
-	{
+	header = (PageHeader)block->data;
+	if (token != 0) {
 		header->pd_lower = SizeOfPageHeaderData;
 		header->pd_upper = BLCKSZ;
 		header->pd_special = BLCKSZ;
 		header->pd_pagesize_version = BLCKSZ | PG_PAGE_LAYOUT_VERSION;
 	}
-	header->pd_block_scn = (SCN) token;
+	header->pd_block_scn = (SCN)token;
 }
 
 static void
 set_incarnation(uint8 incarnation[16], uint8 seed)
 {
-	int			i;
+	int i;
 
 	for (i = 0; i < 16; i++)
 		incarnation[i] = seed + i;
@@ -137,17 +133,17 @@ ordinary_component(uint8 block_id, uint8 before_kind, Page page, uint8 seed)
 
 UT_TEST(test_token_next_delegates_once)
 {
-	reset_allocator((SCN) 901);
+	reset_allocator((SCN)901);
 	UT_ASSERT_EQ(rf_page_mutation_token_next(), UINT64_C(901));
 	UT_ASSERT_EQ(advance_calls, 1);
 }
 
 UT_TEST(test_token_observe_delegates_exact_value)
 {
-	reset_allocator((SCN) 1);
+	reset_allocator((SCN)1);
 	rf_page_mutation_token_observe(UINT64_C(777));
 	UT_ASSERT_EQ(observe_calls, 1);
-	UT_ASSERT_EQ(observed_token, (SCN) 777);
+	UT_ASSERT_EQ(observed_token, (SCN)777);
 }
 
 UT_TEST(test_prepare_captures_before_without_mutation)
@@ -158,9 +154,9 @@ UT_TEST(test_prepare_captures_before_without_mutation)
 
 	make_page(&page, 40);
 	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 3);
-	reset_allocator((SCN) 41);
+	reset_allocator((SCN)41);
 	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
-	UT_ASSERT_EQ(((PageHeader) page.data)->pd_block_scn, (SCN) 40);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, (SCN)40);
 	UT_ASSERT_EQ(batch.entries[0].before.mutation_token, UINT64_C(40));
 	UT_ASSERT_EQ(batch.result_token, UINT64_C(41));
 	UT_ASSERT(!batch.stamped);
@@ -174,10 +170,10 @@ UT_TEST(test_stamp_installs_result_token)
 
 	make_page(&page, 40);
 	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 3);
-	reset_allocator((SCN) 41);
+	reset_allocator((SCN)41);
 	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
 	UT_ASSERT(rf_page_producer_stamp_v1(&batch));
-	UT_ASSERT_EQ(((PageHeader) page.data)->pd_block_scn, (SCN) 41);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, (SCN)41);
 	UT_ASSERT(batch.stamped);
 }
 
@@ -186,20 +182,18 @@ UT_TEST(test_multiblock_batch_uses_one_token)
 	PGAlignedBlock pages[3];
 	RfPageProducerComponentV1 components[3];
 	RfPageProducerBatchV1 batch;
-	int			i;
+	int i;
 
-	for (i = 0; i < 3; i++)
-	{
+	for (i = 0; i < 3; i++) {
 		make_page(&pages[i], 10 + i);
-		components[i] = ordinary_component(i, RF_PAGE_STATE_PRESENT,
-			pages[i].data, 8);
+		components[i] = ordinary_component(i, RF_PAGE_STATE_PRESENT, pages[i].data, 8);
 	}
-	reset_allocator((SCN) 88);
+	reset_allocator((SCN)88);
 	UT_ASSERT(rf_page_producer_prepare_v1(components, 3, &batch));
 	UT_ASSERT_EQ(advance_calls, 1);
 	UT_ASSERT(rf_page_producer_stamp_v1(&batch));
 	for (i = 0; i < 3; i++)
-		UT_ASSERT_EQ(((PageHeader) pages[i].data)->pd_block_scn, (SCN) 88);
+		UT_ASSERT_EQ(((PageHeader)pages[i].data)->pd_block_scn, (SCN)88);
 }
 
 UT_TEST(test_routed_component_has_zero_version_and_no_page)
@@ -210,7 +204,7 @@ UT_TEST(test_routed_component_has_zero_version_and_no_page)
 	memset(&component, 0, sizeof(component));
 	component.page_class = RF_PAGE_CLASS_ROUTED_SIDE;
 	component.before_kind = RF_PAGE_STATE_ROUTED;
-	reset_allocator((SCN) 55);
+	reset_allocator((SCN)55);
 	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
 	UT_ASSERT_EQ(batch.entries[0].result_kind, RF_PAGE_STATE_ROUTED);
 	UT_ASSERT_EQ(batch.entries[0].before.mutation_token, 0);
@@ -222,10 +216,10 @@ UT_TEST(test_invalid_count_never_allocates_token)
 	RfPageProducerBatchV1 batch;
 
 	memset(&batch, 0x5a, sizeof(batch));
-	reset_allocator((SCN) 60);
+	reset_allocator((SCN)60);
 	UT_ASSERT(!rf_page_producer_prepare_v1(NULL, 0, &batch));
 	UT_ASSERT_EQ(advance_calls, 0);
-	UT_ASSERT_EQ(((unsigned char *) &batch)[0], 0x5a);
+	UT_ASSERT_EQ(((unsigned char *)&batch)[0], 0x5a);
 }
 
 UT_TEST(test_unsorted_block_ids_fail_before_token)
@@ -236,13 +230,11 @@ UT_TEST(test_unsorted_block_ids_fail_before_token)
 
 	make_page(&pages[0], 1);
 	make_page(&pages[1], 2);
-	components[0] = ordinary_component(1, RF_PAGE_STATE_PRESENT,
-		pages[0].data, 2);
+	components[0] = ordinary_component(1, RF_PAGE_STATE_PRESENT, pages[0].data, 2);
 	components[0].component_ordinal = 0;
-	components[1] = ordinary_component(0, RF_PAGE_STATE_PRESENT,
-		pages[1].data, 2);
+	components[1] = ordinary_component(0, RF_PAGE_STATE_PRESENT, pages[1].data, 2);
 	components[1].component_ordinal = 1;
-	reset_allocator((SCN) 3);
+	reset_allocator((SCN)3);
 	UT_ASSERT(!rf_page_producer_prepare_v1(components, 2, &batch));
 	UT_ASSERT_EQ(advance_calls, 0);
 }
@@ -256,7 +248,7 @@ UT_TEST(test_duplicate_page_fails_before_token)
 	make_page(&page, 1);
 	components[0] = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 2);
 	components[1] = ordinary_component(1, RF_PAGE_STATE_PRESENT, page.data, 2);
-	reset_allocator((SCN) 3);
+	reset_allocator((SCN)3);
 	UT_ASSERT(!rf_page_producer_prepare_v1(components, 2, &batch));
 	UT_ASSERT_EQ(advance_calls, 0);
 }
@@ -270,7 +262,7 @@ UT_TEST(test_zero_incarnation_fails_before_token)
 	make_page(&page, 1);
 	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 2);
 	memset(component.segment_incarnation, 0, 16);
-	reset_allocator((SCN) 3);
+	reset_allocator((SCN)3);
 	UT_ASSERT(!rf_page_producer_prepare_v1(&component, 1, &batch));
 	UT_ASSERT_EQ(advance_calls, 0);
 }
@@ -286,8 +278,8 @@ UT_TEST(test_zero_allocator_result_leaves_page_and_output_untouched)
 	memset(&batch, 0x6b, sizeof(batch));
 	reset_allocator(InvalidScn);
 	UT_ASSERT(!rf_page_producer_prepare_v1(&component, 1, &batch));
-	UT_ASSERT_EQ(((PageHeader) page.data)->pd_block_scn, (SCN) 9);
-	UT_ASSERT_EQ(((unsigned char *) &batch)[0], 0x6b);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, (SCN)9);
+	UT_ASSERT_EQ(((unsigned char *)&batch)[0], 0x6b);
 }
 
 UT_TEST(test_stamp_drift_is_zero_mutation_for_whole_batch)
@@ -298,16 +290,14 @@ UT_TEST(test_stamp_drift_is_zero_mutation_for_whole_batch)
 
 	make_page(&pages[0], 10);
 	make_page(&pages[1], 20);
-	components[0] = ordinary_component(0, RF_PAGE_STATE_PRESENT,
-		pages[0].data, 2);
-	components[1] = ordinary_component(1, RF_PAGE_STATE_PRESENT,
-		pages[1].data, 2);
-	reset_allocator((SCN) 30);
+	components[0] = ordinary_component(0, RF_PAGE_STATE_PRESENT, pages[0].data, 2);
+	components[1] = ordinary_component(1, RF_PAGE_STATE_PRESENT, pages[1].data, 2);
+	reset_allocator((SCN)30);
 	UT_ASSERT(rf_page_producer_prepare_v1(components, 2, &batch));
-	((PageHeader) pages[1].data)->pd_block_scn = (SCN) 21;
+	((PageHeader)pages[1].data)->pd_block_scn = (SCN)21;
 	UT_ASSERT(!rf_page_producer_stamp_v1(&batch));
-	UT_ASSERT_EQ(((PageHeader) pages[0].data)->pd_block_scn, (SCN) 10);
-	UT_ASSERT_EQ(((PageHeader) pages[1].data)->pd_block_scn, (SCN) 21);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, (SCN)10);
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, (SCN)21);
 }
 
 UT_TEST(test_absent_and_unformatted_before_shapes)
@@ -315,23 +305,22 @@ UT_TEST(test_absent_and_unformatted_before_shapes)
 	PGAlignedBlock pages[2];
 	RfPageProducerComponentV1 components[2];
 	RfPageProducerBatchV1 batch;
-	int			i;
+	int i;
 
 	make_page(&pages[0], 0);
 	make_page(&pages[1], 0);
-	components[0] = ordinary_component(0, RF_PAGE_STATE_ABSENT,
-		pages[0].data, 4);
-	components[1] = ordinary_component(1, RF_PAGE_STATE_UNFORMATTED,
-		pages[1].data, 4);
-	reset_allocator((SCN) 44);
+	components[0] = ordinary_component(0, RF_PAGE_STATE_ABSENT, pages[0].data, 4);
+	components[1] = ordinary_component(1, RF_PAGE_STATE_UNFORMATTED, pages[1].data, 4);
+	reset_allocator((SCN)44);
 	UT_ASSERT(rf_page_producer_prepare_v1(components, 2, &batch));
 	for (i = 0; i < 16; i++)
 		UT_ASSERT_EQ(batch.entries[0].before.segment_incarnation[i], 0);
-	UT_ASSERT(memcmp(batch.entries[1].before.segment_incarnation,
-		components[1].segment_incarnation, 16) == 0);
+	UT_ASSERT(
+		memcmp(batch.entries[1].before.segment_incarnation, components[1].segment_incarnation, 16)
+		== 0);
 	UT_ASSERT(rf_page_producer_stamp_v1(&batch));
-	UT_ASSERT_EQ(((PageHeader) pages[0].data)->pd_block_scn, (SCN) 44);
-	UT_ASSERT_EQ(((PageHeader) pages[1].data)->pd_block_scn, (SCN) 44);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, (SCN)44);
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, (SCN)44);
 }
 
 UT_TEST(test_stamp_retry_is_idempotent)
@@ -342,11 +331,11 @@ UT_TEST(test_stamp_retry_is_idempotent)
 
 	make_page(&page, 7);
 	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 5);
-	reset_allocator((SCN) 8);
+	reset_allocator((SCN)8);
 	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
 	UT_ASSERT(rf_page_producer_stamp_v1(&batch));
 	UT_ASSERT(rf_page_producer_stamp_v1(&batch));
-	UT_ASSERT_EQ(((PageHeader) page.data)->pd_block_scn, (SCN) 8);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, (SCN)8);
 }
 
 UT_TEST(test_wal_registration_requires_stamped_batch)
@@ -357,7 +346,7 @@ UT_TEST(test_wal_registration_requires_stamped_batch)
 
 	make_page(&page, 7);
 	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 5);
-	reset_allocator((SCN) 8);
+	reset_allocator((SCN)8);
 	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
 	UT_ASSERT(!rf_page_producer_register_wal_v1(&batch));
 	UT_ASSERT_EQ(register_calls, 0);
@@ -371,15 +360,14 @@ UT_TEST(test_wal_registration_forwards_exact_batch)
 
 	make_page(&page, 7);
 	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 5);
-	reset_allocator((SCN) 8);
+	reset_allocator((SCN)8);
 	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
 	UT_ASSERT(rf_page_producer_stamp_v1(&batch));
 	UT_ASSERT(rf_page_producer_register_wal_v1(&batch));
 	UT_ASSERT_EQ(register_calls, 1);
 	UT_ASSERT_EQ(registered_token, UINT64_C(8));
 	UT_ASSERT_EQ(registered_count, 1);
-	UT_ASSERT(memcmp(&registered_entries[0], &batch.entries[0],
-		sizeof(batch.entries[0])) == 0);
+	UT_ASSERT(memcmp(&registered_entries[0], &batch.entries[0], sizeof(batch.entries[0])) == 0);
 }
 
 UT_TEST(test_wal_registration_revalidates_stamped_pages)
@@ -390,10 +378,10 @@ UT_TEST(test_wal_registration_revalidates_stamped_pages)
 
 	make_page(&page, 7);
 	component = ordinary_component(0, RF_PAGE_STATE_PRESENT, page.data, 5);
-	reset_allocator((SCN) 8);
+	reset_allocator((SCN)8);
 	UT_ASSERT(rf_page_producer_prepare_v1(&component, 1, &batch));
 	UT_ASSERT(rf_page_producer_stamp_v1(&batch));
-	((PageHeader) page.data)->pd_block_scn = (SCN) 9;
+	((PageHeader)page.data)->pd_block_scn = (SCN)9;
 	UT_ASSERT(!rf_page_producer_register_wal_v1(&batch));
 	UT_ASSERT_EQ(register_calls, 0);
 }

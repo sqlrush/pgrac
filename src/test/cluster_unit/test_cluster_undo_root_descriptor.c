@@ -75,16 +75,12 @@ UT_TEST(test_pgrd_v1_exact_layout_and_roundtrip)
 	ClusterUndoRootDescriptorV1 descriptor = valid_shared_descriptor();
 	ClusterUndoRootDescriptorV1 decoded;
 	uint8 image[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
-	static const uint8 expected_prefix[64] = {
-		0x44, 0x52, 0x47, 0x50, 0x01, 0x00, 0x40, 0x00,
-		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-		0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
-		0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11
-	};
+	static const uint8 expected_prefix[64]
+		= { 0x44, 0x52, 0x47, 0x50, 0x01, 0x00, 0x40, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16,
+			0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x01, 0x00, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11 };
 	int i;
 
 	memset(image, 0xa5, sizeof(image));
@@ -98,16 +94,13 @@ UT_TEST(test_pgrd_v1_exact_layout_and_roundtrip)
 	UT_ASSERT_EQ(image[511], 0x88);
 
 	memset(&decoded, 0, sizeof(decoded));
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		image, descriptor.system_identifier, &decoded),
-		CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID);
-	UT_ASSERT_EQ(decoded.descriptor_incarnation,
-				 descriptor.descriptor_incarnation);
+	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(image, descriptor.system_identifier, &decoded),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID);
+	UT_ASSERT_EQ(decoded.descriptor_incarnation, descriptor.descriptor_incarnation);
 	UT_ASSERT_EQ(decoded.root_kind, descriptor.root_kind);
 	UT_ASSERT_EQ(decoded.owner_node, descriptor.owner_node);
 	UT_ASSERT_EQ(decoded.root_ordinal, descriptor.root_ordinal);
-	UT_ASSERT_EQ(memcmp(decoded.root_uuid, descriptor.root_uuid,
-					 CLUSTER_UNDO_ROOT_UUID_BYTES), 0);
+	UT_ASSERT_EQ(memcmp(decoded.root_uuid, descriptor.root_uuid, CLUSTER_UNDO_ROOT_UUID_BYTES), 0);
 	UT_ASSERT_EQ(decoded.namespace_id, descriptor.namespace_id);
 	UT_ASSERT_EQ(decoded.system_identifier, descriptor.system_identifier);
 }
@@ -124,26 +117,23 @@ UT_TEST(test_pgrd_v1_zero_and_corruption_fail_closed_without_output)
 	memset(&sentinel, 0x5a, sizeof(sentinel));
 	memset(zero, 0, sizeof(zero));
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		zero, descriptor.system_identifier, &decoded),
-		CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED);
+	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(zero, descriptor.system_identifier, &decoded),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_UNPROVISIONED);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	UT_ASSERT(cluster_undo_root_descriptor_encode(&descriptor, image));
 	image[32] ^= UINT8_C(1);
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		image, descriptor.system_identifier, &decoded),
-		CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(image, descriptor.system_identifier, &decoded),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	UT_ASSERT(cluster_undo_root_descriptor_encode(&descriptor, image));
 	image[64] = UINT8_C(1);
 	set_image_crc(image);
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		image, descriptor.system_identifier, &decoded),
-		CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(image, descriptor.system_identifier, &decoded),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 }
 
@@ -160,33 +150,30 @@ UT_TEST(test_pgrd_v1_identity_relations_fail_closed)
 	memset(image + 32, 0, CLUSTER_UNDO_ROOT_UUID_BYTES);
 	set_image_crc(image);
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		image, descriptor.system_identifier, &decoded),
-		CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(image, descriptor.system_identifier, &decoded),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	UT_ASSERT(cluster_undo_root_descriptor_encode(&descriptor, image));
 	image[16] = CLUSTER_UNDO_ROOT_KIND_LOCAL;
 	set_image_crc(image);
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		image, descriptor.system_identifier, &decoded),
-		CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(image, descriptor.system_identifier, &decoded),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	UT_ASSERT(cluster_undo_root_descriptor_encode(&descriptor, image));
 	image[48] = UINT8_C(2);
 	set_image_crc(image);
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		image, descriptor.system_identifier, &decoded),
-		CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
+	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(image, descriptor.system_identifier, &decoded),
+				 CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 
 	UT_ASSERT(cluster_undo_root_descriptor_encode(&descriptor, image));
 	decoded = sentinel;
-	UT_ASSERT_EQ(cluster_undo_root_descriptor_decode(
-		image, descriptor.system_identifier + 1, &decoded),
+	UT_ASSERT_EQ(
+		cluster_undo_root_descriptor_decode(image, descriptor.system_identifier + 1, &decoded),
 		CLUSTER_UNDO_ROOT_DESCRIPTOR_HOLD);
 	UT_ASSERT_EQ(memcmp(&decoded, &sentinel, sizeof(decoded)), 0);
 }
@@ -233,12 +220,10 @@ UT_TEST(test_pgrd_formula_rejects_invalid_and_exhausted_inputs)
 	UT_ASSERT_EQ(namespace_id, UINT64_C(0x5a5a5a5a5a5a5a5a));
 	UT_ASSERT(!cluster_undo_root_namespace_id(1, 129, &namespace_id));
 	UT_ASSERT_EQ(namespace_id, UINT64_C(0x5a5a5a5a5a5a5a5a));
-	UT_ASSERT(cluster_undo_root_namespace_id(
-		UINT64_C(4363953127297), 0, &namespace_id));
+	UT_ASSERT(cluster_undo_root_namespace_id(UINT64_C(4363953127297), 0, &namespace_id));
 	UT_ASSERT_EQ(namespace_id, UINT64_C(562949953421185));
 	namespace_id = UINT64_C(0x5a5a5a5a5a5a5a5a);
-	UT_ASSERT(!cluster_undo_root_namespace_id(
-		UINT64_C(4363953127298), 0, &namespace_id));
+	UT_ASSERT(!cluster_undo_root_namespace_id(UINT64_C(4363953127298), 0, &namespace_id));
 	UT_ASSERT_EQ(namespace_id, UINT64_C(0x5a5a5a5a5a5a5a5a));
 
 	UT_ASSERT(!cluster_undo_root_file_slot(0, 0, &file_slot));
@@ -250,8 +235,7 @@ UT_TEST(test_pgrd_formula_rejects_invalid_and_exhausted_inputs)
 
 	UT_ASSERT(!cluster_undo_root_id(0, 0, &root_id));
 	UT_ASSERT_EQ(root_id, UINT64_C(0x6b6b6b6b6b6b6b6b));
-	UT_ASSERT(!cluster_undo_root_id(
-		UINT64_C(562949953421312), 0, &root_id));
+	UT_ASSERT(!cluster_undo_root_id(UINT64_C(562949953421312), 0, &root_id));
 	UT_ASSERT_EQ(root_id, UINT64_C(0x6b6b6b6b6b6b6b6b));
 	UT_ASSERT(!cluster_undo_root_id(1, UINT32_C(32768), &root_id));
 	UT_ASSERT_EQ(root_id, UINT64_C(0x6b6b6b6b6b6b6b6b));
@@ -266,17 +250,15 @@ UT_TEST(test_pgrd_descriptor_resolves_exact_block0_root)
 	ClusterUndoBlock0ResolvedRoot local;
 	ClusterUndoBlock0ResolvedRoot sentinel;
 
-	UT_ASSERT(cluster_undo_root_descriptor_resolve(
-		&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1, 1, &shared));
+	UT_ASSERT(cluster_undo_root_descriptor_resolve(&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED, 1,
+												   1, &shared));
 	UT_ASSERT_EQ(shared.intent, CLUSTER_UNDO_PATH_RUNTIME_SHARED);
 	UT_ASSERT_EQ(shared.root_id, UINT64_C(32768));
 	UT_ASSERT_EQ(shared.root_generation, UINT64_C(1));
 
 	UT_ASSERT(cluster_undo_root_descriptor_resolve(
-		&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0,
-		1, 1, &authority));
-	UT_ASSERT_EQ(authority.intent,
-				 CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0);
+		&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0, 1, 1, &authority));
+	UT_ASSERT_EQ(authority.intent, CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0);
 	UT_ASSERT_EQ(authority.root_id, shared.root_id);
 	UT_ASSERT_EQ(authority.root_generation, shared.root_generation);
 
@@ -292,8 +274,8 @@ UT_TEST(test_pgrd_descriptor_resolves_exact_block0_root)
 
 	memset(&sentinel, 0x5a, sizeof(sentinel));
 	local = sentinel;
-	UT_ASSERT(!cluster_undo_root_descriptor_resolve(
-		&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED, 2, 264, &local));
+	UT_ASSERT(!cluster_undo_root_descriptor_resolve(&descriptor, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
+													2, 264, &local));
 	UT_ASSERT_EQ(memcmp(&local, &sentinel, sizeof(local)), 0);
 }
 

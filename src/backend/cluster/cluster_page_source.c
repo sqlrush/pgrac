@@ -58,8 +58,7 @@ cluster_page_source_validate_current(const ClusterPageSourceValidateInput *in)
 	 */
 	if (!cluster_page_source_base_ok(in))
 		return false;
-	return in->integrity_ok && in->stability_ok && in->lineage_ok
-		&& in->owner_ok;
+	return in->integrity_ok && in->stability_ok && in->lineage_ok && in->owner_ok;
 }
 
 bool
@@ -76,8 +75,8 @@ cluster_page_source_validate_pi(const ClusterPageSourceValidateInput *in)
 	 */
 	if (!cluster_page_source_base_ok(in))
 		return false;
-	return in->integrity_ok && in->ship_boundary_ok && in->stability_ok
-		&& in->lineage_ok && in->owner_ok;
+	return in->integrity_ok && in->ship_boundary_ok && in->stability_ok && in->lineage_ok
+		   && in->owner_ok;
 }
 
 bool
@@ -101,55 +100,52 @@ cluster_page_source_validate_storage(const ClusterPageSourceValidateInput *in)
 	 */
 	if (!cluster_page_source_base_ok(in))
 		return false;
-	return in->integrity_ok && in->lineage_ok && in->anchored_ok
-		&& in->coverage_ok && in->fresh_ok && in->contributors_closed;
+	return in->integrity_ok && in->lineage_ok && in->anchored_ok && in->coverage_ok && in->fresh_ok
+		   && in->contributors_closed;
 }
 
 static int
 cluster_page_source_kind_rank(ClusterPageSourceKind kind)
 {
-	switch (kind)
-	{
-		case CLUSTER_PAGE_SOURCE_CURRENT:
-			return 0;			/* §6.2: prefer CURRENT */
-		case CLUSTER_PAGE_SOURCE_PI:
-			return 1;
-		case CLUSTER_PAGE_SOURCE_STORAGE:
-			return 2;			/* last resort: checkpointed storage */
+	switch (kind) {
+	case CLUSTER_PAGE_SOURCE_CURRENT:
+		return 0; /* §6.2: prefer CURRENT */
+	case CLUSTER_PAGE_SOURCE_PI:
+		return 1;
+	case CLUSTER_PAGE_SOURCE_STORAGE:
+		return 2; /* last resort: checkpointed storage */
 	}
 	return 3;
 }
 
 int
 cluster_page_source_select(const ClusterPageSourceKind *kinds,
-						   const ClusterPageSourceValidateInput *inputs,
-						   int n)
+						   const ClusterPageSourceValidateInput *inputs, int n)
 {
-	bool		valid[8];
-	int			nvalid = 0;
-	int			first = -1;
-	int			i;
+	bool valid[8];
+	int nvalid = 0;
+	int first = -1;
+	int i;
 
 	if (kinds == NULL || inputs == NULL || n < 0)
 		return -1;
-	if (n > (int) lengthof(valid))
-		return -1;				/* bounded: fail closed beyond the table */
+	if (n > (int)lengthof(valid))
+		return -1; /* bounded: fail closed beyond the table */
 
 	for (i = 0; i < n; i++) {
-		switch (kinds[i])
-		{
-			case CLUSTER_PAGE_SOURCE_CURRENT:
-				valid[i] = cluster_page_source_validate_current(&inputs[i]);
-				break;
-			case CLUSTER_PAGE_SOURCE_PI:
-				valid[i] = cluster_page_source_validate_pi(&inputs[i]);
-				break;
-			case CLUSTER_PAGE_SOURCE_STORAGE:
-				valid[i] = cluster_page_source_validate_storage(&inputs[i]);
-				break;
-			default:
-				valid[i] = false;
-				break;
+		switch (kinds[i]) {
+		case CLUSTER_PAGE_SOURCE_CURRENT:
+			valid[i] = cluster_page_source_validate_current(&inputs[i]);
+			break;
+		case CLUSTER_PAGE_SOURCE_PI:
+			valid[i] = cluster_page_source_validate_pi(&inputs[i]);
+			break;
+		case CLUSTER_PAGE_SOURCE_STORAGE:
+			valid[i] = cluster_page_source_validate_storage(&inputs[i]);
+			break;
+		default:
+			valid[i] = false;
+			break;
 		}
 		if (valid[i]) {
 			nvalid++;
@@ -166,16 +162,15 @@ cluster_page_source_select(const ClusterPageSourceKind *kinds,
 	 * corruption/BLOCKED — never max-SCN, max-LSN or majority. */
 	if (nvalid > 1) {
 		for (i = 0; i < n; i++) {
-			int			j;
+			int j;
 
 			if (!valid[i])
 				continue;
 			for (j = i + 1; j < n; j++) {
 				if (!valid[j])
 					continue;
-				if (!cluster_page_version_equal(inputs[i].source_version,
-												inputs[j].source_version))
-					return -1;	/* conflicting versions: BLOCKED */
+				if (!cluster_page_version_equal(inputs[i].source_version, inputs[j].source_version))
+					return -1; /* conflicting versions: BLOCKED */
 			}
 		}
 		/* Equal versions: §6.2 preference CURRENT > PI > STORAGE. */

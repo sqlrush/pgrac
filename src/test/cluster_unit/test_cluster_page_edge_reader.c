@@ -18,11 +18,9 @@ UT_DEFINE_GLOBALS();
 #define TEST_ERROR_BUFFER_SIZE 1001
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -45,18 +43,15 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 }
 
 bool
-errstart_cold(int elevel pg_attribute_unused(),
-			  const char *domain pg_attribute_unused())
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {
 	return false;
 }
 
 void
-errfinish(const char *filename pg_attribute_unused(),
-		  int lineno pg_attribute_unused(),
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{
-}
+{}
 
 static void
 set_incarnation(uint8 incarnation[16], uint8 seed)
@@ -87,7 +82,7 @@ static size_t
 append_block_ref(uint8 *target, uint8 block_id)
 {
 	XLogRecordBlockHeader header;
-	RelFileLocator locator = {1663, 5, 17};
+	RelFileLocator locator = { 1663, 5, 17 };
 	BlockNumber block = 23;
 	uint8 *start = target;
 
@@ -116,28 +111,26 @@ build_record(bool edge_first, bool edge_block_mismatch, size_t *record_size)
 	make_edge(&edge);
 	if (edge_block_mismatch)
 		edge.entries[0].block_id = 1;
-	UT_ASSERT(XLogEncodePageVersionEdgeV1(edge_wire, sizeof(edge_wire),
-		edge.result_token, edge.entries, edge.entry_count, &edge_len));
-	block_len = SizeOfXLogRecordBlockHeader + sizeof(RelFileLocator) +
-		sizeof(BlockNumber);
+	UT_ASSERT(XLogEncodePageVersionEdgeV1(edge_wire, sizeof(edge_wire), edge.result_token,
+										  edge.entries, edge.entry_count, &edge_len));
+	block_len = SizeOfXLogRecordBlockHeader + sizeof(RelFileLocator) + sizeof(BlockNumber);
 	*record_size = SizeOfXLogRecord + edge_len + block_len;
 	record = calloc(1, *record_size);
 	UT_ASSERT(record != NULL);
+	if (record == NULL)
+		abort();
 	record->xl_tot_len = *record_size;
-	target = (uint8 *) record + SizeOfXLogRecord;
-	if (edge_first)
-	{
+	target = (uint8 *)record + SizeOfXLogRecord;
+	if (edge_first) {
 		memcpy(target, edge_wire, edge_len);
 		target += edge_len;
 		target += append_block_ref(target, 0);
-	}
-	else
-	{
+	} else {
 		target += append_block_ref(target, 0);
 		memcpy(target, edge_wire, edge_len);
 		target += edge_len;
 	}
-	UT_ASSERT_EQ((size_t) (target - (uint8 *) record), *record_size);
+	UT_ASSERT_EQ((size_t)(target - (uint8 *)record), *record_size);
 	return record;
 }
 
@@ -147,14 +140,16 @@ build_block_only_record(size_t *record_size)
 	XLogRecord *record;
 	uint8 *target;
 
-	*record_size = SizeOfXLogRecord + SizeOfXLogRecordBlockHeader +
-		sizeof(RelFileLocator) + sizeof(BlockNumber);
+	*record_size = SizeOfXLogRecord + SizeOfXLogRecordBlockHeader + sizeof(RelFileLocator)
+				   + sizeof(BlockNumber);
 	record = calloc(1, *record_size);
 	UT_ASSERT(record != NULL);
+	if (record == NULL)
+		abort();
 	record->xl_tot_len = *record_size;
-	target = (uint8 *) record + SizeOfXLogRecord;
+	target = (uint8 *)record + SizeOfXLogRecord;
 	target += append_block_ref(target, 0);
-	UT_ASSERT_EQ((size_t) (target - (uint8 *) record), *record_size);
+	UT_ASSERT_EQ((size_t)(target - (uint8 *)record), *record_size);
 	return record;
 }
 
@@ -172,9 +167,7 @@ decode_record(XLogRecord *record, DecodedXLogRecord **decoded_out)
 	state.ReadRecPtr = UINT64_C(0x1000000);
 	decoded = calloc(1, DecodeXLogRecordRequiredSpace(record->xl_tot_len));
 	UT_ASSERT(decoded != NULL);
-	if (!DecodeXLogRecord(&state, decoded, record, state.ReadRecPtr,
-		&errormsg))
-	{
+	if (!DecodeXLogRecord(&state, decoded, record, state.ReadRecPtr, &errormsg)) {
 		free(decoded);
 		*decoded_out = NULL;
 		return false;
@@ -247,21 +240,20 @@ UT_TEST(test_reader_rejects_stale_and_malformed_edge_headers)
 	uint16 one = 1;
 
 	record = build_record(true, false, &record_size);
-	edge_wire = (uint8 *) record + SizeOfXLogRecord;
+	edge_wire = (uint8 *)record + SizeOfXLogRecord;
 	edge_wire[3] = 32;
 	UT_ASSERT(!decode_record(record, &decoded));
 	free(record);
 
 	record = build_record(true, false, &record_size);
-	edge_wire = (uint8 *) record + SizeOfXLogRecord;
+	edge_wire = (uint8 *)record + SizeOfXLogRecord;
 	memcpy(edge_wire + 4, &one, sizeof(one));
 	UT_ASSERT(!decode_record(record, &decoded));
 	free(record);
 
 	record = build_record(true, false, &record_size);
-	edge_wire = (uint8 *) record + SizeOfXLogRecord;
-	memcpy(edge_wire + XLR_PAGE_VERSION_EDGE_HEADER_SIZE + 4,
-		&one, sizeof(one));
+	edge_wire = (uint8 *)record + SizeOfXLogRecord;
+	memcpy(edge_wire + XLR_PAGE_VERSION_EDGE_HEADER_SIZE + 4, &one, sizeof(one));
 	UT_ASSERT(!decode_record(record, &decoded));
 	free(record);
 }
@@ -276,8 +268,7 @@ UT_TEST(test_reader_rejects_init_flag_without_block_declaration)
 	uint64 zero = 0;
 
 	record = build_record(true, false, &record_size);
-	entry_wire = (uint8 *) record + SizeOfXLogRecord +
-		XLR_PAGE_VERSION_EDGE_HEADER_SIZE;
+	entry_wire = (uint8 *)record + SizeOfXLogRecord + XLR_PAGE_VERSION_EDGE_HEADER_SIZE;
 	entry_wire[2] = RF_PAGE_STATE_UNFORMATTED;
 	memcpy(entry_wire + 4, &init_flags, sizeof(init_flags));
 	memcpy(entry_wire + 24, &zero, sizeof(zero));

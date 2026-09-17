@@ -193,7 +193,12 @@ errcode(int sqlerrcode)
 	captured_code = sqlerrcode;
 	return 0;
 }
-int errmsg(const char *fmt, ...) { (void)fmt; return 0; }
+int
+errmsg(const char *fmt, ...)
+{
+	(void)fmt;
+	return 0;
+}
 int
 errmsg_internal(const char *fmt, ...)
 {
@@ -209,7 +214,12 @@ errdetail(const char *fmt, ...)
 	va_end(args);
 	return 0;
 }
-int errhint(const char *fmt, ...) { (void)fmt; return 0; }
+int
+errhint(const char *fmt, ...)
+{
+	(void)fmt;
+	return 0;
+}
 
 static ClusterFenceMarker
 cache_marker(uint64 event_id)
@@ -278,8 +288,8 @@ publisher_main(void *arg)
 	ClusterFenceMarker *marker = (ClusterFenceMarker *)arg;
 	uint64 expected_sequence = cluster_write_fence_authority_cache_sequence();
 
-	(void)cluster_write_fence_authority_cache_publish_if_unchanged(
-		marker, UINT64_C(1000000), expected_sequence);
+	(void)cluster_write_fence_authority_cache_publish_if_unchanged(marker, UINT64_C(1000000),
+																   expected_sequence);
 	return NULL;
 }
 
@@ -304,8 +314,8 @@ UT_TEST(test_cache_publish_revalidate_and_invalidate)
 
 	attach_cache();
 	expected_sequence = cluster_write_fence_authority_cache_sequence();
-	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
-		&marker, UINT64_C(1000000), expected_sequence));
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(&marker, UINT64_C(1000000),
+																	   expected_sequence));
 	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
 				 CLUSTER_FENCE_CACHE_MATCH);
 	cluster_write_fence_authority_cache_invalidate();
@@ -321,8 +331,8 @@ UT_TEST(test_invalidation_rejects_late_prechange_proof)
 	attach_cache();
 	prechange_sequence = cluster_write_fence_authority_cache_sequence();
 	cluster_write_fence_authority_cache_invalidate();
-	UT_ASSERT(!cluster_write_fence_authority_cache_publish_if_unchanged(
-		&marker, UINT64_C(1000000), prechange_sequence));
+	UT_ASSERT(!cluster_write_fence_authority_cache_publish_if_unchanged(&marker, UINT64_C(1000000),
+																		prechange_sequence));
 	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
 				 CLUSTER_FENCE_CACHE_INVALID);
 }
@@ -335,8 +345,8 @@ UT_TEST(test_mutation_guard_keeps_cache_unavailable_until_change_finishes)
 
 	attach_cache();
 	expected_sequence = cluster_write_fence_authority_cache_sequence();
-	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
-		&marker, UINT64_C(1000000), expected_sequence));
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(&marker, UINT64_C(1000000),
+																	   expected_sequence));
 	odd_sequence = cluster_write_fence_authority_cache_mutation_begin();
 	UT_ASSERT(odd_sequence != 0);
 	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
@@ -392,8 +402,8 @@ UT_TEST(test_membership_mutation_invalidates_cache_before_change)
 	attach_cache();
 	cluster_membership_attach(NULL);
 	expected_sequence = cluster_write_fence_authority_cache_sequence();
-	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
-		&marker, UINT64_C(1000000), expected_sequence));
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(&marker, UINT64_C(1000000),
+																	   expected_sequence));
 	UT_ASSERT_EQ(cluster_write_fence_revalidate_cached_nowait(&marker, UINT64_C(1000000)),
 				 CLUSTER_FENCE_CACHE_MATCH);
 	cluster_membership_set_state(3, CLUSTER_MEMBER_DEAD);
@@ -411,8 +421,8 @@ UT_TEST(test_epoch_mutation_invalidates_cache_before_change)
 	attach_cache();
 	attach_epoch();
 	expected_sequence = cluster_write_fence_authority_cache_sequence();
-	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(
-		&marker, UINT64_C(1000000), expected_sequence));
+	UT_ASSERT(cluster_write_fence_authority_cache_publish_if_unchanged(&marker, UINT64_C(1000000),
+																	   expected_sequence));
 	cluster_epoch_advance_for_reconfig(&old_epoch, &new_epoch);
 	UT_ASSERT_EQ(old_epoch, CLUSTER_EPOCH_INITIAL);
 	UT_ASSERT_EQ(new_epoch, CLUSTER_EPOCH_INITIAL + 1);
@@ -443,8 +453,7 @@ UT_TEST(test_external_fence_counters_are_exact_and_restart_empty)
 	cluster_write_fence_note_external_mutation_gate_blocked();
 	cluster_write_fence_note_external_publish_gate_blocked();
 	UT_ASSERT_EQ(clock_gettime(CLOCK_MONOTONIC, &now), 0);
-	sample = (uint64) now.tv_sec * UINT64_C(1000000000) +
-		(uint64) now.tv_nsec;
+	sample = (uint64)now.tv_sec * UINT64_C(1000000000) + (uint64)now.tv_nsec;
 	cluster_write_fence_note_external_write_excluded(41, sample);
 	cluster_write_fence_note_external_write_excluded(40, sample - 1);
 

@@ -76,8 +76,8 @@
 #include "cluster/cluster_sf_dep.h" /* ClusterSfDepVec / max origins */
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tx_resolve.h"
-#include "storage/block.h"			/* BLCKSZ */
-#include "storage/buf_internals.h"	/* BufferTag, BufferDesc */
+#include "storage/block.h"		   /* BLCKSZ */
+#include "storage/buf_internals.h" /* BufferTag, BufferDesc */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -127,56 +127,37 @@ typedef struct ResourceXRemoteSFailureDecision {
  * lock domains before returning the terminal reference. */
 static inline bool
 cluster_gcs_resource_x_target_terminal_resample_exact(
-	ClusterPcmOwnResult candidate_result,
-	const ClusterPcmOwnSnapshot *before_n,
-	const ClusterPcmOwnSnapshot *live_x,
-	ResourceXApplyResult round_snapshot_result,
+	ClusterPcmOwnResult candidate_result, const ClusterPcmOwnSnapshot *before_n,
+	const ClusterPcmOwnSnapshot *live_x, ResourceXApplyResult round_snapshot_result,
 	const ResourceXBootstrapRoundFailureSnapshot *round)
 {
-	if (candidate_result != CLUSTER_PCM_OWN_STALE
-		|| before_n == NULL || live_x == NULL || round == NULL
-		|| round_snapshot_result != RESOURCE_X_APPLY_APPLIED
+	if (candidate_result != CLUSTER_PCM_OWN_STALE || before_n == NULL || live_x == NULL
+		|| round == NULL || round_snapshot_result != RESOURCE_X_APPLY_APPLIED
 		|| round->terminal != 1)
 		return false;
 	if (!BufferTagsEqual(&before_n->tag, &live_x->tag)
-		|| !BufferTagsEqual(&live_x->tag,
-			&round->ref.assertion.resource)
-		|| before_n->pcm_state != (uint8) PCM_STATE_N
-		|| before_n->flags != 0
-		|| before_n->generation == UINT64_MAX
-		|| before_n->reservation_token == UINT64_MAX
-		|| before_n->writer_activation_token != 0
-		|| before_n->resource_x_activation_generation != 0
-		|| live_x->pcm_state != (uint8) PCM_STATE_X
-		|| live_x->flags != 0
-		|| live_x->generation == 0
-		|| live_x->generation == UINT64_MAX
-		|| live_x->generation == before_n->generation
-		|| live_x->reservation_token == 0
-		|| live_x->reservation_token == UINT64_MAX
-		|| live_x->writer_activation_token != 0
-		|| live_x->resource_x_activation_generation != 0)
+		|| !BufferTagsEqual(&live_x->tag, &round->ref.assertion.resource)
+		|| before_n->pcm_state != (uint8)PCM_STATE_N || before_n->flags != 0
+		|| before_n->generation == UINT64_MAX || before_n->reservation_token == UINT64_MAX
+		|| before_n->writer_activation_token != 0 || before_n->resource_x_activation_generation != 0
+		|| live_x->pcm_state != (uint8)PCM_STATE_X || live_x->flags != 0 || live_x->generation == 0
+		|| live_x->generation == UINT64_MAX || live_x->generation == before_n->generation
+		|| live_x->reservation_token == 0 || live_x->reservation_token == UINT64_MAX
+		|| live_x->writer_activation_token != 0 || live_x->resource_x_activation_generation != 0)
 		return false;
 	return round->buffer_ownership_generation == live_x->generation
-		&& round->ref.assertion.requester_node >= 0
-		&& round->ref.formation != 0
-		&& round->ref.formation != UINT64_MAX
-		&& round->ref.acquisition_generation != 0
-		&& round->ref.acquisition_generation != UINT64_MAX
-		&& round->base_authority_generation != 0
-		&& round->base_authority_generation != UINT64_MAX
-		&& round->authority_generation
-			> round->base_authority_generation
-		&& round->authority_generation != UINT64_MAX
-		&& round->r4_record_generation != 0
-		&& round->r4_record_generation != UINT64_MAX
-		&& round->master_session_incarnation != 0
-		&& round->master_session_incarnation != UINT64_MAX
-		&& round->absolute_deadline_us != 0
-		&& round->absolute_deadline_us != UINT64_MAX
-		&& round->retired_acquisition_generation
-			== round->ref.acquisition_generation
-		&& round->progress_flags == 0;
+		   && round->ref.assertion.requester_node >= 0 && round->ref.formation != 0
+		   && round->ref.formation != UINT64_MAX && round->ref.acquisition_generation != 0
+		   && round->ref.acquisition_generation != UINT64_MAX
+		   && round->base_authority_generation != 0
+		   && round->base_authority_generation != UINT64_MAX
+		   && round->authority_generation > round->base_authority_generation
+		   && round->authority_generation != UINT64_MAX && round->r4_record_generation != 0
+		   && round->r4_record_generation != UINT64_MAX && round->master_session_incarnation != 0
+		   && round->master_session_incarnation != UINT64_MAX && round->absolute_deadline_us != 0
+		   && round->absolute_deadline_us != UINT64_MAX
+		   && round->retired_acquisition_generation == round->ref.acquisition_generation
+		   && round->progress_flags == 0;
 }
 
 /* The same-node T1 executor can finish its exact N+GRANT_PENDING install and
@@ -217,10 +198,8 @@ cluster_gcs_resource_x_target_terminal_resample_exact(
  * mask is the exact stable cover that permits a fresh driver iteration. */
 static inline uint64
 cluster_gcs_resource_x_pending_terminal_resample_mismatch(
-	const ClusterPcmOwnSnapshot *before_pending,
-	const ClusterPcmOwnSnapshot *live_x,
-	ResourceXApplyResult round_snapshot_result,
-	const ResourceXBootstrapRoundFailureSnapshot *round)
+	const ClusterPcmOwnSnapshot *before_pending, const ClusterPcmOwnSnapshot *live_x,
+	ResourceXApplyResult round_snapshot_result, const ResourceXBootstrapRoundFailureSnapshot *round)
 {
 	uint64 mismatch = RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE;
 
@@ -233,19 +212,18 @@ cluster_gcs_resource_x_pending_terminal_resample_mismatch(
 	if (!BufferTagsEqual(&before_pending->tag, &live_x->tag)
 		|| !BufferTagsEqual(&live_x->tag, &round->ref.assertion.resource))
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_TAG;
-	if (before_pending->pcm_state != (uint8) PCM_STATE_N)
+	if (before_pending->pcm_state != (uint8)PCM_STATE_N)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_STATE;
 	if (before_pending->flags != PCM_OWN_FLAG_GRANT_PENDING)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_FLAGS;
 	if (before_pending->generation >= UINT64_MAX - 1)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_GENERATION;
-	if (before_pending->reservation_token == 0
-		|| before_pending->reservation_token == UINT64_MAX)
+	if (before_pending->reservation_token == 0 || before_pending->reservation_token == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_TOKEN;
 	if (before_pending->writer_activation_token != 0
 		|| before_pending->resource_x_activation_generation != 0)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_BEFORE_ACTIVATION;
-	if (live_x->pcm_state != (uint8) PCM_STATE_X)
+	if (live_x->pcm_state != (uint8)PCM_STATE_X)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_STATE;
 	if (live_x->flags != 0)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_FLAGS;
@@ -254,8 +232,7 @@ cluster_gcs_resource_x_pending_terminal_resample_mismatch(
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_GENERATION;
 	if (live_x->reservation_token != before_pending->reservation_token)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_TOKEN;
-	if (live_x->writer_activation_token != 0
-		|| live_x->resource_x_activation_generation != 0)
+	if (live_x->writer_activation_token != 0 || live_x->resource_x_activation_generation != 0)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_LIVE_ACTIVATION;
 	if (round->buffer_ownership_generation != live_x->generation)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_BUFFER_GENERATION;
@@ -263,26 +240,20 @@ cluster_gcs_resource_x_pending_terminal_resample_mismatch(
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_REQUESTER;
 	if (round->ref.formation == 0 || round->ref.formation == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_FORMATION;
-	if (round->ref.acquisition_generation == 0
-		|| round->ref.acquisition_generation == UINT64_MAX)
+	if (round->ref.acquisition_generation == 0 || round->ref.acquisition_generation == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_ACQUISITION;
-	if (round->base_authority_generation == 0
-		|| round->base_authority_generation == UINT64_MAX)
+	if (round->base_authority_generation == 0 || round->base_authority_generation == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_BASE_AUTHORITY;
 	if (round->authority_generation <= round->base_authority_generation
 		|| round->authority_generation == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_AUTHORITY;
-	if (round->r4_record_generation == 0
-		|| round->r4_record_generation == UINT64_MAX)
+	if (round->r4_record_generation == 0 || round->r4_record_generation == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_R4;
-	if (round->master_session_incarnation == 0
-		|| round->master_session_incarnation == UINT64_MAX)
+	if (round->master_session_incarnation == 0 || round->master_session_incarnation == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_SESSION;
-	if (round->absolute_deadline_us == 0
-		|| round->absolute_deadline_us == UINT64_MAX)
+	if (round->absolute_deadline_us == 0 || round->absolute_deadline_us == UINT64_MAX)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_DEADLINE;
-	if (round->retired_acquisition_generation
-		!= round->ref.acquisition_generation)
+	if (round->retired_acquisition_generation != round->ref.acquisition_generation)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_RETIRED;
 	if (round->progress_flags != 0)
 		mismatch |= RESOURCE_X_PENDING_TERMINAL_MISMATCH_ROUND_PROGRESS;
@@ -291,14 +262,12 @@ cluster_gcs_resource_x_pending_terminal_resample_mismatch(
 
 static inline bool
 cluster_gcs_resource_x_target_pending_terminal_resample_exact(
-	const ClusterPcmOwnSnapshot *before_pending,
-	const ClusterPcmOwnSnapshot *live_x,
-	ResourceXApplyResult round_snapshot_result,
-	const ResourceXBootstrapRoundFailureSnapshot *round)
+	const ClusterPcmOwnSnapshot *before_pending, const ClusterPcmOwnSnapshot *live_x,
+	ResourceXApplyResult round_snapshot_result, const ResourceXBootstrapRoundFailureSnapshot *round)
 {
-	return cluster_gcs_resource_x_pending_terminal_resample_mismatch(
-		before_pending, live_x, round_snapshot_result, round)
-		== RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE;
+	return cluster_gcs_resource_x_pending_terminal_resample_mismatch(before_pending, live_x,
+																	 round_snapshot_result, round)
+		   == RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE;
 }
 
 /* A legacy local acquire and the target-only Resource-X driver serialize
@@ -310,11 +279,11 @@ cluster_gcs_resource_x_target_pending_terminal_resample_exact(
  * bounded sleep/reprobe with the original diagnostic timestamp. The next
  * iteration validates the successor through its canonical predicate. */
 static inline bool
-cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
-	const ClusterPcmOwnSnapshot *before,
-	ClusterPcmOwnResult live_result,
-	const ClusterPcmOwnSnapshot *live,
-	uint64 now_us, uint64 absolute_deadline_us)
+cluster_gcs_resource_x_target_local_n_reservation_retry_exact(const ClusterPcmOwnSnapshot *before,
+															  ClusterPcmOwnResult live_result,
+															  const ClusterPcmOwnSnapshot *live,
+															  uint64 now_us,
+															  uint64 absolute_deadline_us)
 {
 	bool before_pending;
 
@@ -323,28 +292,22 @@ cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
 		return false;
 	before_pending = before->flags == PCM_OWN_FLAG_GRANT_PENDING;
 	if ((!before_pending && before->flags != 0)
-		|| live_result != (before_pending
-			? CLUSTER_PCM_OWN_OK : CLUSTER_PCM_OWN_STALE)
-		|| !BufferTagsEqual(&before->tag, &live->tag)
-		|| before->pcm_state != (uint8) PCM_STATE_N
-		|| live->pcm_state != (uint8) PCM_STATE_N
-		|| (live->flags != 0
-			&& live->flags != PCM_OWN_FLAG_GRANT_PENDING)
-		|| before->generation == UINT64_MAX
-		|| live->generation != before->generation
-		|| before->reservation_token == UINT64_MAX
-		|| live->reservation_token == UINT64_MAX
-		|| before->writer_activation_token != 0
-		|| live->writer_activation_token != 0
+		|| live_result != (before_pending ? CLUSTER_PCM_OWN_OK : CLUSTER_PCM_OWN_STALE)
+		|| !BufferTagsEqual(&before->tag, &live->tag) || before->pcm_state != (uint8)PCM_STATE_N
+		|| live->pcm_state != (uint8)PCM_STATE_N
+		|| (live->flags != 0 && live->flags != PCM_OWN_FLAG_GRANT_PENDING)
+		|| before->generation == UINT64_MAX || live->generation != before->generation
+		|| before->reservation_token == UINT64_MAX || live->reservation_token == UINT64_MAX
+		|| before->writer_activation_token != 0 || live->writer_activation_token != 0
 		|| before->resource_x_activation_generation != 0
 		|| live->resource_x_activation_generation != 0)
 		return false;
 	if (before_pending)
 		return before->reservation_token != 0
-			&& live->reservation_token >= before->reservation_token
-			&& (live->flags == 0 || live->reservation_token != 0);
+			   && live->reservation_token >= before->reservation_token
+			   && (live->flags == 0 || live->reservation_token != 0);
 	return live->reservation_token > before->reservation_token
-		&& (live->flags == 0 || live->reservation_token != 0);
+		   && (live->flags == 0 || live->reservation_token != 0);
 }
 
 /* An ordinary pre-assert observation is not a reservation or authority.
@@ -378,16 +341,14 @@ cluster_gcs_resource_x_target_preassert_resample_exact(
  * already-joined remote carrier only for VM/FSM, whose exact retained image
  * is installed by the existing Resource-X target path before X commit. */
 static inline bool
-GcsBlockResourceXDirectInitProofAllowedExact(
-	const BufferTag *tag, bool durable_proof, bool remote_proof)
+GcsBlockResourceXDirectInitProofAllowedExact(const BufferTag *tag, bool durable_proof,
+											 bool remote_proof)
 {
 	if (tag == NULL || durable_proof == remote_proof)
 		return false;
 	if (durable_proof)
 		return true;
-	return remote_proof
-		&& (tag->forkNum == VISIBILITYMAP_FORKNUM
-			|| tag->forkNum == FSM_FORKNUM);
+	return remote_proof && (tag->forkNum == VISIBILITYMAP_FORKNUM || tag->forkNum == FSM_FORKNUM);
 }
 
 /* A clean cached X observation can race one complete type-17 X-to-N
@@ -411,22 +372,15 @@ cluster_gcs_resource_x_target_empty_round_drift_retry_exact(
 		|| now_us == 0 || now_us == UINT64_MAX || absolute_deadline_us == 0
 		|| absolute_deadline_us == UINT64_MAX)
 		return false;
-	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
-		|| before_x->pcm_state != (uint8) PCM_STATE_X
-		|| before_x->flags != 0
-		|| before_x->generation == 0
-		|| before_x->generation >= UINT64_MAX - 1
-		|| before_x->reservation_token == 0
-		|| before_x->reservation_token >= UINT64_MAX - 1
-		|| before_x->writer_activation_token != 0
+	if (!BufferTagsEqual(&before_x->tag, &live_n->tag) || before_x->pcm_state != (uint8)PCM_STATE_X
+		|| before_x->flags != 0 || before_x->generation == 0
+		|| before_x->generation >= UINT64_MAX - 1 || before_x->reservation_token == 0
+		|| before_x->reservation_token >= UINT64_MAX - 1 || before_x->writer_activation_token != 0
 		|| before_x->resource_x_activation_generation != 0
-		|| live_n->pcm_state != (uint8) PCM_STATE_N
-		|| live_n->flags != 0
+		|| live_n->pcm_state != (uint8)PCM_STATE_N || live_n->flags != 0
 		|| live_n->generation != before_x->generation + 1
-		|| live_n->reservation_token
-			!= before_x->reservation_token + 1
-		|| live_n->writer_activation_token != 0
-		|| live_n->resource_x_activation_generation != 0)
+		|| live_n->reservation_token != before_x->reservation_token + 1
+		|| live_n->writer_activation_token != 0 || live_n->resource_x_activation_generation != 0)
 		return false;
 	return true;
 }
@@ -448,24 +402,17 @@ cluster_gcs_resource_x_target_retained_predecessor_retry_exact(
 		|| now_us == 0 || now_us == UINT64_MAX || absolute_deadline_us == 0
 		|| absolute_deadline_us == UINT64_MAX)
 		return false;
-	if (!BufferTagsEqual(&before_x->tag, &live_n->tag)
-		|| before_x->pcm_state != (uint8) PCM_STATE_X
-		|| before_x->flags != 0
-		|| before_x->generation == 0
-		|| before_x->generation >= UINT64_MAX - 1
-		|| before_x->reservation_token == 0
-		|| before_x->reservation_token == UINT64_MAX
-		|| before_x->writer_activation_token != 0
+	if (!BufferTagsEqual(&before_x->tag, &live_n->tag) || before_x->pcm_state != (uint8)PCM_STATE_X
+		|| before_x->flags != 0 || before_x->generation == 0
+		|| before_x->generation >= UINT64_MAX - 1 || before_x->reservation_token == 0
+		|| before_x->reservation_token == UINT64_MAX || before_x->writer_activation_token != 0
 		|| before_x->resource_x_activation_generation != 0
-		|| live_n->pcm_state != (uint8) PCM_STATE_N
-		|| (live_n->flags != PCM_OWN_FLAG_REVOKING
-			&& live_n->flags != 0)
-		|| live_n->generation != before_x->generation + 1
-		|| live_n->reservation_token == 0
+		|| live_n->pcm_state != (uint8)PCM_STATE_N
+		|| (live_n->flags != PCM_OWN_FLAG_REVOKING && live_n->flags != 0)
+		|| live_n->generation != before_x->generation + 1 || live_n->reservation_token == 0
 		|| live_n->reservation_token == UINT64_MAX
 		|| live_n->reservation_token <= before_x->reservation_token
-		|| live_n->writer_activation_token != 0
-		|| live_n->resource_x_activation_generation != 0)
+		|| live_n->writer_activation_token != 0 || live_n->resource_x_activation_generation != 0)
 		return false;
 	return true;
 }
@@ -479,18 +426,13 @@ cluster_gcs_resource_x_target_retained_predecessor_retry_exact(
 static inline bool
 cluster_gcs_resource_x_target_undrained_current_predecessor_exact(
 	bool retained_pair_exact, bool retained_buffer_exact,
-	ClusterPcmOwnResult current_candidate_result,
-	const ClusterPcmOwnSnapshot *current_n)
+	ClusterPcmOwnResult current_candidate_result, const ClusterPcmOwnSnapshot *current_n)
 {
 	if (!retained_pair_exact || retained_buffer_exact
-		|| current_candidate_result != CLUSTER_PCM_OWN_OK
-		|| current_n == NULL
-		|| current_n->pcm_state != (uint8) PCM_STATE_N
-		|| current_n->flags != 0
-		|| current_n->generation == 0
-		|| current_n->generation == UINT64_MAX
-		|| current_n->reservation_token == 0
-		|| current_n->reservation_token == UINT64_MAX
+		|| current_candidate_result != CLUSTER_PCM_OWN_OK || current_n == NULL
+		|| current_n->pcm_state != (uint8)PCM_STATE_N || current_n->flags != 0
+		|| current_n->generation == 0 || current_n->generation == UINT64_MAX
+		|| current_n->reservation_token == 0 || current_n->reservation_token == UINT64_MAX
 		|| current_n->writer_activation_token != 0
 		|| current_n->resource_x_activation_generation != 0)
 		return false;
@@ -522,12 +464,9 @@ cluster_gcs_resource_x_event_owner_identity(int32 procno, int32 process_pid)
 
 static inline uint32
 cluster_gcs_resource_x_dispatch_recheck_failure_mask(
-	bool admission_current, bool gate_session_current,
-	bool requester_sampled, bool master_sampled,
-	uint32 expected_requester_generation,
-	uint32 expected_master_generation,
-	uint32 observed_requester_generation,
-	uint32 observed_master_generation)
+	bool admission_current, bool gate_session_current, bool requester_sampled, bool master_sampled,
+	uint32 expected_requester_generation, uint32 expected_master_generation,
+	uint32 observed_requester_generation, uint32 observed_master_generation)
 {
 	uint32 mask = RESOURCE_X_DISPATCH_RECHECK_OK;
 
@@ -553,10 +492,10 @@ cluster_gcs_resource_x_dispatch_recheck_failure_mask(
  * publication failure is ambiguous.  This helper owns no state and grants no
  * authority. */
 static inline ResourceXRemoteSFailureDecision
-cluster_gcs_resource_x_remote_s_failure_decide(
-	ResourceXRemoteSStage stage, ResourceXFailureDomain cause_domain,
-	bool cancel_attempted, bool cancel_ok,
-	bool abort_attempted, bool abort_ok)
+cluster_gcs_resource_x_remote_s_failure_decide(ResourceXRemoteSStage stage,
+											   ResourceXFailureDomain cause_domain,
+											   bool cancel_attempted, bool cancel_ok,
+											   bool abort_attempted, bool abort_ok)
 {
 	ResourceXRemoteSFailureDecision decision;
 
@@ -564,8 +503,7 @@ cluster_gcs_resource_x_remote_s_failure_decide(
 	decision.global_fail_closed = true;
 	decision.discard_old_round = false;
 	decision.rollback_complete = false;
-	if (cause_domain <= RESOURCE_X_FAIL_NONE
-		|| cause_domain > RESOURCE_X_FAIL_INTERNAL_CORRUPTION)
+	if (cause_domain <= RESOURCE_X_FAIL_NONE || cause_domain > RESOURCE_X_FAIL_INTERNAL_CORRUPTION)
 		return decision;
 
 	switch (stage) {
@@ -579,8 +517,7 @@ cluster_gcs_resource_x_remote_s_failure_decide(
 		if (cancel_attempted || !abort_attempted)
 			return decision;
 		if (!abort_ok) {
-			decision.domain
-				= RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+			decision.domain = RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
 			return decision;
 		}
 		decision.rollback_complete = true;
@@ -589,8 +526,7 @@ cluster_gcs_resource_x_remote_s_failure_decide(
 		if (!cancel_attempted || !abort_attempted)
 			return decision;
 		if (!cancel_ok || !abort_ok) {
-			decision.domain
-				= RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
+			decision.domain = RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
 			return decision;
 		}
 		decision.rollback_complete = true;
@@ -607,11 +543,9 @@ cluster_gcs_resource_x_remote_s_failure_decide(
 	}
 
 	decision.domain = cause_domain;
-	decision.global_fail_closed
-		= cause_domain == RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY
-		  || cause_domain == RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
-	decision.discard_old_round
-		= cause_domain == RESOURCE_X_FAIL_AUTHORITY_DRIFT;
+	decision.global_fail_closed = cause_domain == RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY
+								  || cause_domain == RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
+	decision.discard_old_round = cause_domain == RESOURCE_X_FAIL_AUTHORITY_DRIFT;
 	return decision;
 }
 
@@ -688,7 +622,7 @@ static inline bool
 cluster_gcs_pcm_x_auth_result_retryable(PcmXSessionAuthResult result)
 {
 	return result >= PCM_X_SESSION_AUTH_CONNECTION_NOT_READY
-		&& result <= PCM_X_SESSION_AUTH_CONNECTION_TORN;
+		   && result <= PCM_X_SESSION_AUTH_CONNECTION_TORN;
 }
 
 /* ============================================================
@@ -1027,12 +961,9 @@ StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT == GCS_BLOCK_REPLY_UNDO_TT_
 StaticAssertDecl(GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT
 					 == GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT + 1,
 				 "spec-7.1 D3-b undo-multi-verdict status must follow undo-verdict");
-StaticAssertDecl(GCS_BLOCK_REPLY_R4_CR_FULL == 21,
-				 "R4 reply status ABI must begin at 21");
-StaticAssertDecl(GCS_BLOCK_REPLY_R4_DENIED == 26,
-				 "R4 reply status ABI must end at 26");
-StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
-					 == GCS_BLOCK_REPLY_R4_DENIED + 1,
+StaticAssertDecl(GCS_BLOCK_REPLY_R4_CR_FULL == 21, "R4 reply status ABI must begin at 21");
+StaticAssertDecl(GCS_BLOCK_REPLY_R4_DENIED == 26, "R4 reply status ABI must end at 26");
+StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT == GCS_BLOCK_REPLY_R4_DENIED + 1,
 				 "current MX describe result must follow the closed R4 domain");
 StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
 					 == GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT + 1,
@@ -1050,8 +981,7 @@ StaticAssertDecl(GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT
 static inline bool
 GcsBlockReplyStatusIsLegacy(GcsBlockReplyStatus status)
 {
-	return status >= GCS_BLOCK_REPLY_GRANTED
-		   && status <= GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
+	return status >= GCS_BLOCK_REPLY_GRANTED && status <= GCS_BLOCK_REPLY_UNDO_MULTI_VERDICT_RESULT;
 }
 
 static inline bool
@@ -1577,14 +1507,13 @@ StaticAssertDecl(sizeof(GcsBlockReplyHeader) == 48,
 				 "spec-2.33 D1 + spec-2.35 HC109 GcsBlockReplyHeader wire ABI 48B "
 				 "(request_id 8 + page_lsn 8 + epoch 8 + checksum 4 + "
 				 "sender_node 4 + requester_backend_id 4 + transition_id 1 + "
-					 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
+				 "status 1 + forwarding_master_node_bytes 4 + reserved 6)");
 
 /* Status 24 alone reuses the six-byte reply tail as
  * {physical_generation:u32_le, reserved:u16=0}.  Generation zero is valid;
  * UINT32_MAX is exhausted and cannot be published. */
 static inline bool
-GcsBlockReplyHeaderSetR4UndoGeneration(GcsBlockReplyHeader *header,
-									   uint32 physical_generation)
+GcsBlockReplyHeaderSetR4UndoGeneration(GcsBlockReplyHeader *header, uint32 physical_generation)
 {
 	if (header != NULL)
 		memset(header->reserved_0, 0, sizeof(header->reserved_0));
@@ -1605,13 +1534,11 @@ GcsBlockReplyHeaderGetR4UndoGeneration(const GcsBlockReplyHeader *header,
 
 	if (physical_generation_out != NULL)
 		*physical_generation_out = 0;
-	if (header == NULL || physical_generation_out == NULL
-		|| header->reserved_0[4] != 0 || header->reserved_0[5] != 0)
+	if (header == NULL || physical_generation_out == NULL || header->reserved_0[4] != 0
+		|| header->reserved_0[5] != 0)
 		return false;
-	generation = (uint32)header->reserved_0[0]
-				 | ((uint32)header->reserved_0[1] << 8)
-				 | ((uint32)header->reserved_0[2] << 16)
-				 | ((uint32)header->reserved_0[3] << 24);
+	generation = (uint32)header->reserved_0[0] | ((uint32)header->reserved_0[1] << 8)
+				 | ((uint32)header->reserved_0[2] << 16) | ((uint32)header->reserved_0[3] << 24);
 	if (generation == UINT32_MAX)
 		return false;
 	*physical_generation_out = generation;
@@ -1837,13 +1764,12 @@ GcsBlockForwardPayloadGetExpectedPiWatermarkScn(const GcsBlockForwardPayload *p)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF ((uint8)7)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS ((uint8)8)
 #define GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE ((uint8)9)
-#define CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT ((int32)-2)
+#define CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT ((int32) - 2)
 
-StaticAssertDecl(CLUSTER_R4_FORWARD_EXTENDED
-					 < GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF,
+StaticAssertDecl(CLUSTER_R4_FORWARD_EXTENDED < GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF,
 				 "current MX request domain must follow the closed R4 kind");
 StaticAssertDecl(GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS
-					 == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF + 1
+						 == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF + 1
 					 && GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE
 							== GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS + 1,
 				 "current MX request kind allocation changed");
@@ -1858,8 +1784,7 @@ GcsBlockForwardPayloadIsCurrentMxMemberProof(const GcsBlockForwardPayload *paylo
 static inline bool
 GcsBlockForwardPayloadIsCurrentMxDescribe(const GcsBlockForwardPayload *payload)
 {
-	return payload != NULL
-		   && payload->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
+	return payload != NULL && payload->reserved_0[6] == GCS_BLOCK_FORWARD_KIND_CURRENT_MX_DESCRIBE;
 }
 
 static inline bool
@@ -1872,8 +1797,7 @@ GcsBlockForwardPayloadIsCurrentMxRuntime(const GcsBlockForwardPayload *payload)
 /* Current-MX overlays the old BufferTag.  DATA sharding therefore uses only
  * the preserved request identity; this synthetic tag is never authority. */
 static inline BufferTag
-GcsBlockCurrentMxRouteTagMake(uint64 request_id, uint64 epoch,
-							  int32 requester_node,
+GcsBlockCurrentMxRouteTagMake(uint64 request_id, uint64 epoch, int32 requester_node,
 							  int32 requester_backend_id)
 {
 	BufferTag tag;
@@ -1923,27 +1847,27 @@ static inline ClusterCrBuildResult
 cluster_cr_build_result_for_reason(ClusterCrBuildReason reason)
 {
 	switch (reason) {
-		case CLUSTER_CR_BUILD_NONE:
-			return CLUSTER_CR_BUILD_FULL;
-		case CLUSTER_CR_BUILD_TARGET_DISABLED:
-		case CLUSTER_CR_BUILD_RF_DEFERRED:
-		case CLUSTER_CR_BUILD_WRONG_MASTER:
-		case CLUSTER_CR_BUILD_NO_HOLDER:
-		case CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS:
-		case CLUSTER_CR_BUILD_HOLDER_MOVED:
-		case CLUSTER_CR_BUILD_RECOVERING:
-		case CLUSTER_CR_BUILD_GENERATION_MISMATCH:
-		case CLUSTER_CR_BUILD_CAPACITY:
-		case CLUSTER_CR_BUILD_EPOCH_MISMATCH:
-			return CLUSTER_CR_BUILD_RETRYABLE;
-		case CLUSTER_CR_BUILD_BAD_LOCATOR:
-		case CLUSTER_CR_BUILD_BAD_UNDO:
-		case CLUSTER_CR_BUILD_CHAIN_LIMIT:
-		case CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD:
-		case CLUSTER_CR_BUILD_CANCELLED:
-		case CLUSTER_CR_BUILD_IO_ERROR:
-		case CLUSTER_CR_BUILD_PROTOCOL:
-			return CLUSTER_CR_BUILD_FAIL_CLOSED;
+	case CLUSTER_CR_BUILD_NONE:
+		return CLUSTER_CR_BUILD_FULL;
+	case CLUSTER_CR_BUILD_TARGET_DISABLED:
+	case CLUSTER_CR_BUILD_RF_DEFERRED:
+	case CLUSTER_CR_BUILD_WRONG_MASTER:
+	case CLUSTER_CR_BUILD_NO_HOLDER:
+	case CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS:
+	case CLUSTER_CR_BUILD_HOLDER_MOVED:
+	case CLUSTER_CR_BUILD_RECOVERING:
+	case CLUSTER_CR_BUILD_GENERATION_MISMATCH:
+	case CLUSTER_CR_BUILD_CAPACITY:
+	case CLUSTER_CR_BUILD_EPOCH_MISMATCH:
+		return CLUSTER_CR_BUILD_RETRYABLE;
+	case CLUSTER_CR_BUILD_BAD_LOCATOR:
+	case CLUSTER_CR_BUILD_BAD_UNDO:
+	case CLUSTER_CR_BUILD_CHAIN_LIMIT:
+	case CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD:
+	case CLUSTER_CR_BUILD_CANCELLED:
+	case CLUSTER_CR_BUILD_IO_ERROR:
+	case CLUSTER_CR_BUILD_PROTOCOL:
+		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 	}
 	return CLUSTER_CR_BUILD_FAIL_CLOSED;
 }
@@ -1960,8 +1884,7 @@ typedef struct ClusterR4CrRouteProof {
 	int32 selected_holder_node;
 } ClusterR4CrRouteProof;
 
-StaticAssertDecl(sizeof(ClusterR4CrRouteProof) == 80,
-				 "R4 CR route proof must remain 80 bytes");
+StaticAssertDecl(sizeof(ClusterR4CrRouteProof) == 80, "R4 CR route proof must remain 80 bytes");
 
 /*
  * R4 D3 master-side policy over one coherent PCM snapshot.  NONE means one
@@ -1971,8 +1894,7 @@ StaticAssertDecl(sizeof(ClusterR4CrRouteProof) == 80,
  */
 static inline ClusterCrBuildReason
 cluster_r4_route_policy_classify(const PcmAuthoritySnapshot *authority, uint64 current_epoch,
-								 uint64 master_authority_generation,
-								 int32 *selected_holder_out)
+								 uint64 master_authority_generation, int32 *selected_holder_out)
 {
 	uint32 master_node;
 
@@ -1997,8 +1919,7 @@ cluster_r4_route_policy_classify(const PcmAuthoritySnapshot *authority, uint64 c
 	if (authority->state == PCM_STATE_X) {
 		if (authority->x_holder_node < 0
 			|| authority->x_holder_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-			|| authority->s_holders_bitmap != 0
-			|| master_node != (uint32)authority->x_holder_node)
+			|| authority->s_holders_bitmap != 0 || master_node != (uint32)authority->x_holder_node)
 			return CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS;
 		*selected_holder_out = authority->x_holder_node;
 	} else if (authority->state == PCM_STATE_S) {
@@ -2023,10 +1944,8 @@ cluster_r4_route_policy_classify(const PcmAuthoritySnapshot *authority, uint64 c
  * the selected canonical holder remain exact. */
 static inline bool
 cluster_r4_route_proof_matches(const ClusterR4CrRouteProof *armed, uint64 formation_epoch,
-							   uint64 master_authority_generation,
-							   int32 selected_holder_node,
-							   uint64 master_resource_transition_count,
-							   SCN expected_page_scn)
+							   uint64 master_authority_generation, int32 selected_holder_node,
+							   uint64 master_resource_transition_count, SCN expected_page_scn)
 {
 	return armed != NULL && selected_holder_node >= 0
 		   && selected_holder_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
@@ -2112,252 +2031,258 @@ typedef struct ClusterR4TransitionCell {
 	const char *spec_action;
 } ClusterR4TransitionCell;
 
-#define CLUSTER_R4_ROUTE_OWNERS                                                                 \
-	(CLUSTER_R4_OWNER_REQUESTER | CLUSTER_R4_OWNER_REAL_MASTER)
-#define CLUSTER_R4_FORWARD_OWNERS                                                               \
-	(CLUSTER_R4_OWNER_REAL_MASTER | CLUSTER_R4_OWNER_HOLDER_LMON)
-#define CLUSTER_R4_UNDO_OWNERS                                                                  \
+#define CLUSTER_R4_ROUTE_OWNERS (CLUSTER_R4_OWNER_REQUESTER | CLUSTER_R4_OWNER_REAL_MASTER)
+#define CLUSTER_R4_FORWARD_OWNERS (CLUSTER_R4_OWNER_REAL_MASTER | CLUSTER_R4_OWNER_HOLDER_LMON)
+#define CLUSTER_R4_UNDO_OWNERS                                                                     \
 	(CLUSTER_R4_OWNER_HOLDER_LMON | CLUSTER_R4_OWNER_HOLDER_LMS | CLUSTER_R4_OWNER_ORIGIN)
-#define CLUSTER_R4_CELL(next, alternate, owner, action, text)                                    \
-	{ (next), (alternate), (owner), (action), (text) }
+#define CLUSTER_R4_CELL(next, alternate, owner, action, text)                                      \
+	{                                                                                              \
+		(next), (alternate), (owner), (action), (text)                                             \
+	}
 
 static inline const ClusterR4TransitionCell *
 cluster_r4_transition_lookup(ClusterR4OperationState state, ClusterR4OperationEvent event)
 {
-	static const ClusterR4TransitionCell
-		cluster_r4_transition_manifest[CLUSTER_R4_STATE_COUNT][CLUSTER_R4_EVENT_COUNT] = {
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_ARM_BEFORE_SEND,
-					"R/arm-before-send"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_NO_SEND, "K/no-send"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
-					"X/FC(protocol)"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FORWARDED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_MASTER_FORWARD,
-					"F/master selects+forwards"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_REPLAY_ROUTE,
-					"R/replay same route"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_CLOSE_ATTEMPT,
-					"T/close attempt"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_CANCEL_ROUTE,
-					"K/cancel route"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_STALE_ROUTE,
-					"T/stale route"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
-					"X/FC(protocol)"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_HOLDER_STABLE_COPY,
-					"B/holder stable copy"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FORWARDED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_DROP_OR_REPLAY,
-					"F/drop or replay"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_CLOSE_ATTEMPT,
-					"T/close attempt"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_CANCEL_SLOT,
-					"K/cancel slot"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_STALE_SLOT,
-					"T/stale slot"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
-					"X/FC(protocol)"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_WAIT_UNDO, CLUSTER_R4_STATE_REPLIED,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_REQUEST_UNDO_OR_PUBLISH,
-					"U/request foreign undo or P/publish result"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_DROP, "B/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
-					"T/abort scratch"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
-					"K/abort scratch"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
-					"T/abort scratch"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_FAIL_DATA_PROTOCOL,
-					"X/FC(data/protocol)"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_EXACT_UNDO_REPLY,
-					"B/exact undo reply"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_WAIT_UNDO, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_DROP, "U/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
-					"T/abort scratch"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
-					"K/abort scratch"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
-					"T/abort scratch"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_FAIL_DATA_PROTOCOL,
-					"X/FC(data/protocol)"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CONSUMER_CAS,
-					"C/exact consumer CAS"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP_RESULT,
-					"K/drop result"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_NEW_REQUEST,
-					"R/new request id after typed close"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "T/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "T/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_OVERALL_DEADLINE,
-					"X/overall deadline"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CLEANUP, "K/cleanup"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_WAIT_TOPOLOGY,
-					"T/wait topology"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_WAIT_ADMISSION,
-					"T/wait admission"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_BACKOFF, "T/backoff"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
-					"X/FC(protocol)"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CLEANUP, "X/cleanup"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
-			},
-			{
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-				CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
-					CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
-			},
-		};
+	static const ClusterR4TransitionCell cluster_r4_transition_manifest[CLUSTER_R4_STATE_COUNT]
+																	   [CLUSTER_R4_EVENT_COUNT]
+		= {
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_ARM_BEFORE_SEND,
+								  "R/arm-before-send"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_NO_SEND,
+								  "K/no-send"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_EMPTY, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "E/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+								  "X/FC(protocol)"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FORWARDED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_MASTER_FORWARD,
+								  "F/master selects+forwards"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_REPLAY_ROUTE,
+								  "R/replay same route"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_CLOSE_ATTEMPT,
+								  "T/close attempt"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_CANCEL_ROUTE,
+								  "K/cancel route"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_STALE_ROUTE,
+								  "T/stale route"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_ROUTE_OWNERS, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+								  "X/FC(protocol)"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_HOLDER_STABLE_COPY,
+								  "B/holder stable copy"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FORWARDED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_DROP_OR_REPLAY,
+								  "F/drop or replay"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_CLOSE_ATTEMPT,
+								  "T/close attempt"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_CANCEL_SLOT,
+								  "K/cancel slot"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_STALE_SLOT,
+								  "T/stale slot"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_FORWARD_OWNERS, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+								  "X/FC(protocol)"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_WAIT_UNDO, CLUSTER_R4_STATE_REPLIED,
+								  CLUSTER_R4_OWNER_HOLDER_LMS,
+								  CLUSTER_R4_ACTION_REQUEST_UNDO_OR_PUBLISH,
+								  "U/request foreign undo or P/publish result"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_DROP, "B/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+								  "T/abort scratch"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+								  "K/abort scratch"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+								  "T/abort scratch"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_HOLDER_LMS, CLUSTER_R4_ACTION_FAIL_DATA_PROTOCOL,
+								  "X/FC(data/protocol)"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_BUILDING, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_EXACT_UNDO_REPLY,
+								  "B/exact undo reply"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_WAIT_UNDO, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_DROP, "U/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+								  "T/abort scratch"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+								  "K/abort scratch"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_ABORT_SCRATCH,
+								  "T/abort scratch"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_RETRY, "T/retry"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_UNDO_OWNERS, CLUSTER_R4_ACTION_FAIL_DATA_PROTOCOL,
+								  "X/FC(data/protocol)"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CONSUMER_CAS,
+								  "C/exact consumer CAS"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP_RESULT,
+								  "K/drop result"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_REPLIED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "P/drop"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CONSUMED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "C/drop"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_ROUTING, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_NEW_REQUEST,
+								  "R/new request id after typed close"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "T/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "T/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_OVERALL_DEADLINE,
+								  "X/overall deadline"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CLEANUP,
+								  "K/cleanup"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_WAIT_TOPOLOGY,
+								  "T/wait topology"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_WAIT_ADMISSION,
+								  "T/wait admission"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_RETRYABLE, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_BACKOFF,
+								  "T/backoff"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_FAIL_PROTOCOL,
+								  "X/FC(protocol)"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_CLEANUP,
+								  "X/cleanup"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_FAIL_CLOSED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "X/drop"),
+			  },
+			  {
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+				  CLUSTER_R4_CELL(CLUSTER_R4_STATE_CANCELLED, CLUSTER_R4_STATE_INVALID,
+								  CLUSTER_R4_OWNER_REQUESTER, CLUSTER_R4_ACTION_DROP, "K/drop"),
+			  },
+		  };
 
 	if (state < CLUSTER_R4_STATE_EMPTY || state >= CLUSTER_R4_STATE_COUNT
 		|| event < CLUSTER_R4_EVENT_VALID || event >= CLUSTER_R4_EVENT_COUNT)
@@ -2410,8 +2335,7 @@ StaticAssertDecl(sizeof(ClusterR4ForwardKindUnion) == 24,
 				 "R4 forward kind union must remain 24 bytes");
 StaticAssertDecl(sizeof(ClusterR4ForwardExtension) == 32,
 				 "R4 forward extension must remain 32 bytes");
-StaticAssertDecl(offsetof(ClusterR4ForwardExtension,
-						 kind.cr.master_resource_transition_count_le)
+StaticAssertDecl(offsetof(ClusterR4ForwardExtension, kind.cr.master_resource_transition_count_le)
 					 == 12,
 				 "R4 FORWARD96 transition count must occupy absolute bytes 76..83");
 
@@ -2431,74 +2355,69 @@ StaticAssertDecl(sizeof(ClusterR4CrForwardPayload) == 96,
 				 "R4 CR forward payload must remain 96 bytes");
 
 struct ClusterICEnvelope;
-extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(
-	const struct ClusterICEnvelope *env, const ClusterR4CrRequestPayload *request,
-	ClusterCrBuildReason *reason_out);
+extern ClusterCrBuildResult cluster_gcs_block_r4_route_cr(const struct ClusterICEnvelope *env,
+														  const ClusterR4CrRequestPayload *request,
+														  ClusterCrBuildReason *reason_out);
 /* LMON close census: live requester slots in the exact R4_CR domain. */
 extern uint64 cluster_gcs_block_r4_requester_count(void);
 extern ClusterTxOutcome cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
-	int32 origin_node, const ClusterTxLocator *locator,
-	uint32 expected_physical_generation, uint64 formation_epoch,
-	ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
+	int32 origin_node, const ClusterTxLocator *locator, uint32 expected_physical_generation,
+	uint64 formation_epoch, ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
 extern void cluster_gcs_block_r4_tx_resolve_drain(void);
 extern bool cluster_gcs_block_r4_tx_resolve_active(void);
 /* Process-local diagnostic snapshot; never supplies authority or advances work. */
 extern int cluster_gcs_block_r4_tx_resolve_pending_detail(char *out, Size capacity);
 #define CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS 1
 static inline long
-cluster_gcs_block_r4_tx_resolve_wait_timeout_for_count(long idle_timeout_ms,
-													int active_contexts)
+cluster_gcs_block_r4_tx_resolve_wait_timeout_for_count(long idle_timeout_ms, int active_contexts)
 {
 	if (idle_timeout_ms <= 0 || active_contexts <= 0)
 		return idle_timeout_ms;
 	return idle_timeout_ms < CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS
-		? idle_timeout_ms
-		: CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS;
+			   ? idle_timeout_ms
+			   : CLUSTER_GCS_BLOCK_R4_TX_ORIGIN_PENDING_WAIT_MS;
 }
 extern long cluster_gcs_block_r4_tx_resolve_wait_timeout(long idle_timeout_ms);
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_gcs_block_test_r4_request80(const struct ClusterICEnvelope *env,
-											 const void *payload);
+												const void *payload);
 extern bool cluster_gcs_block_test_r4_forward96(const struct ClusterICEnvelope *env,
-												 const void *payload);
+												const void *payload);
 extern int cluster_gcs_block_test_r4_tx_origin_context_count(void);
 extern void cluster_gcs_block_test_r4_tx_origin_drain(void);
-extern bool cluster_gcs_block_test_current_mx_forward128(
-	const struct ClusterICEnvelope *env, const void *payload);
+extern bool cluster_gcs_block_test_current_mx_forward128(const struct ClusterICEnvelope *env,
+														 const void *payload);
 extern bool cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
-											  ClusterCrBuildReason reason,
-											  bool admitted_forward,
-											  GcsBlockReplyStatus *status_out);
+													 ClusterCrBuildReason reason,
+													 bool admitted_forward,
+													 GcsBlockReplyStatus *status_out);
 extern bool cluster_gcs_block_test_decode_r4_reply(
 	const struct ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
 	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
-	int32 expected_sender_node, int32 expected_forwarding_master_node,
-	uint8 expected_reply_domain);
-extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id,
-												 uint64 request_epoch,
-												 int32 requester_backend_id,
-												 uint8 transition_id,
-												 int32 expected_master_node);
-extern bool cluster_gcs_block_test_arm_legacy_reply_slot(uint64 request_id,
-													 uint64 request_epoch,
+	int32 expected_sender_node, int32 expected_forwarding_master_node, uint8 expected_reply_domain);
+extern bool cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id, uint64 request_epoch,
 													 int32 requester_backend_id,
 													 uint8 transition_id,
 													 int32 expected_master_node);
-extern bool cluster_gcs_block_test_snapshot_r4_reply_slot(
-	GcsBlockReplyHeader *header_out, char block_out[GCS_BLOCK_DATA_SIZE],
-	bool *reply_received_out, uint64 *stale_drop_count_out);
-extern bool cluster_gcs_block_test_r4_requester_arm(
-	BufferTag tag, uint64 request_epoch, int32 expected_master_node,
-	uint64 next_sequence, uint64 *request_id_out);
+extern bool cluster_gcs_block_test_arm_legacy_reply_slot(uint64 request_id, uint64 request_epoch,
+														 int32 requester_backend_id,
+														 uint8 transition_id,
+														 int32 expected_master_node);
+extern bool cluster_gcs_block_test_snapshot_r4_reply_slot(GcsBlockReplyHeader *header_out,
+														  char block_out[GCS_BLOCK_DATA_SIZE],
+														  bool *reply_received_out,
+														  uint64 *stale_drop_count_out);
+extern bool cluster_gcs_block_test_r4_requester_arm(BufferTag tag, uint64 request_epoch,
+													int32 expected_master_node,
+													uint64 next_sequence, uint64 *request_id_out);
 extern bool cluster_gcs_block_test_snapshot_r4_requester_slot(
-	bool *in_use_out, uint8 *reply_domain_out, uint64 *request_id_out,
-	uint8 *transition_id_out, BufferTag *tag_out, uint64 *request_epoch_out,
-	int32 *expected_master_node_out, ClusterGcsBlockDirectState *direct_state_out,
-	bool *direct_target_prepared_out);
+	bool *in_use_out, uint8 *reply_domain_out, uint64 *request_id_out, uint8 *transition_id_out,
+	BufferTag *tag_out, uint64 *request_epoch_out, int32 *expected_master_node_out,
+	ClusterGcsBlockDirectState *direct_state_out, bool *direct_target_prepared_out);
 extern bool cluster_gcs_block_test_release_r4_requester_slot(void);
-extern bool cluster_gcs_block_test_r4_fetch_and_wait(
-	BufferTag tag, SCN read_scn, int32 real_master_node,
-	char dst_page[GCS_BLOCK_DATA_SIZE]);
+extern bool cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
+													 int32 real_master_node,
+													 char dst_page[GCS_BLOCK_DATA_SIZE]);
 #endif
 
 static inline void
@@ -2594,8 +2513,7 @@ ClusterR4RequestExtensionGetCr(const ClusterR4RequestExtension *extension, SCN *
 static inline void
 ClusterR4ForwardExtensionSetCrProof(ClusterR4ForwardExtension *extension,
 									uint64 master_authority_generation,
-									uint64 master_resource_transition_count,
-									SCN expected_page_scn)
+									uint64 master_resource_transition_count, SCN expected_page_scn)
 {
 	if (extension == NULL)
 		return;
@@ -2606,14 +2524,12 @@ ClusterR4ForwardExtensionSetCrProof(ClusterR4ForwardExtension *extension,
 						  master_authority_generation);
 	ClusterR4WireWriteU64(extension->kind.cr.master_resource_transition_count_le,
 						  master_resource_transition_count);
-	ClusterR4WireWriteU64(extension->kind.cr.expected_page_scn_le,
-						  (uint64)expected_page_scn);
+	ClusterR4WireWriteU64(extension->kind.cr.expected_page_scn_le, (uint64)expected_page_scn);
 }
 
 static inline bool
 ClusterR4ForwardExtensionGetCrProof(const ClusterR4ForwardExtension *extension,
-									uint64 formation_epoch,
-									uint64 *master_authority_generation_out,
+									uint64 formation_epoch, uint64 *master_authority_generation_out,
 									uint64 *master_resource_transition_count_out,
 									SCN *expected_page_scn_out)
 {
@@ -2636,32 +2552,27 @@ ClusterR4ForwardExtensionGetCrProof(const ClusterR4ForwardExtension *extension,
 		|| memcmp(extension->subject_id_le, zero_subject, sizeof(zero_subject)) != 0)
 		return false;
 
-	master_generation
-		= ClusterR4WireReadU64(extension->kind.cr.master_authority_generation_le);
-	transition_count
-		= ClusterR4WireReadU64(extension->kind.cr.master_resource_transition_count_le);
+	master_generation = ClusterR4WireReadU64(extension->kind.cr.master_authority_generation_le);
+	transition_count = ClusterR4WireReadU64(extension->kind.cr.master_resource_transition_count_le);
 	if ((uint32)master_generation == 0
-		|| (uint32)(master_generation >> 32) != (uint32)formation_epoch
-		|| transition_count == 0 || transition_count == UINT64_MAX)
+		|| (uint32)(master_generation >> 32) != (uint32)formation_epoch || transition_count == 0
+		|| transition_count == UINT64_MAX)
 		return false;
 
 	*master_authority_generation_out = master_generation;
 	*master_resource_transition_count_out = transition_count;
-	*expected_page_scn_out
-		= (SCN)ClusterR4WireReadU64(extension->kind.cr.expected_page_scn_le);
+	*expected_page_scn_out = (SCN)ClusterR4WireReadU64(extension->kind.cr.expected_page_scn_le);
 	return true;
 }
 
 static inline bool
-ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension,
-									ClusterR4WireKind kind,
+ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension, ClusterR4WireKind kind,
 									const ClusterTxLocator *locator)
 {
 	if (extension != NULL)
 		memset(extension, 0, sizeof(*extension));
 	if (extension == NULL || locator == NULL
-		|| (kind != CLUSTER_R4_WIRE_TX_RESOLVE
-			&& kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
+		|| (kind != CLUSTER_R4_WIRE_TX_RESOLVE && kind != CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
 		return false;
 
 	extension->r4_version = CLUSTER_R4_WIRE_VERSION;
@@ -2680,9 +2591,9 @@ ClusterR4ForwardExtensionSetLocator(ClusterR4ForwardExtension *extension,
  * guard; it is never a positive DATA generation. Zero is a known first one. */
 static inline bool
 ClusterR4ForwardExtensionSetLocatorGeneration(ClusterR4ForwardExtension *extension,
-										   ClusterR4WireKind kind,
-										   const ClusterTxLocator *locator,
-										   uint32 physical_generation)
+											  ClusterR4WireKind kind,
+											  const ClusterTxLocator *locator,
+											  uint32 physical_generation)
 {
 	if (extension != NULL)
 		memset(extension, 0, sizeof(*extension));
@@ -2695,8 +2606,7 @@ ClusterR4ForwardExtensionSetLocatorGeneration(ClusterR4ForwardExtension *extensi
 
 static inline bool
 ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
-									ClusterR4WireKind expected_kind,
-									ClusterTxLocator *locator_out)
+									ClusterR4WireKind expected_kind, ClusterTxLocator *locator_out)
 {
 	static const uint8 zero_flags[2] = { 0, 0 };
 	static const uint8 zero_subject[4] = { 0, 0, 0, 0 };
@@ -2726,9 +2636,9 @@ ClusterR4ForwardExtensionGetLocator(const ClusterR4ForwardExtension *extension,
 
 static inline bool
 ClusterR4ForwardExtensionGetLocatorGeneration(const ClusterR4ForwardExtension *extension,
-										   ClusterR4WireKind expected_kind,
-										   ClusterTxLocator *locator_out,
-										   uint32 *physical_generation_out)
+											  ClusterR4WireKind expected_kind,
+											  ClusterTxLocator *locator_out,
+											  uint32 *physical_generation_out)
 {
 	uint32 generation;
 	ClusterR4ForwardExtension copy;
@@ -2799,8 +2709,8 @@ ClusterR4TxVerdictPageDecode(const uint8 page[BLCKSZ], const ClusterTxLocator *e
 	if (page == NULL || expected_locator == NULL || resolution_out == NULL
 		|| ClusterR4WireReadU32(&page[0]) != CLUSTER_R4_TX_VERDICT_MAGIC
 		|| ClusterR4WireReadU16(&page[4]) != CLUSTER_R4_TX_VERDICT_VERSION
-		|| ClusterR4WireReadU16(&page[6]) != CLUSTER_R4_TX_VERDICT_HEADER_LEN
-		|| page[10] != 0 || page[11] != 0
+		|| ClusterR4WireReadU16(&page[6]) != CLUSTER_R4_TX_VERDICT_HEADER_LEN || page[10] != 0
+		|| page[11] != 0
 		|| memcmp(&page[CLUSTER_R4_TX_VERDICT_HEADER_LEN], zero_tail, sizeof(zero_tail)) != 0)
 		return false;
 
@@ -2816,8 +2726,7 @@ ClusterR4TxVerdictPageDecode(const uint8 page[BLCKSZ], const ClusterTxLocator *e
 	decoded.locator_echo.tt_wrap = ClusterR4WireReadU16(&page[32]);
 	decoded.locator_echo.itl_kind = page[34];
 	decoded.locator_echo.itl_slot_index = page[35];
-	if (!cluster_tx_locator_reply_matches(expected_locator,
-									   &decoded.locator_echo))
+	if (!cluster_tx_locator_reply_matches(expected_locator, &decoded.locator_echo))
 		return false;
 
 	decoded.top_xid = (TransactionId)ClusterR4WireReadU32(&page[36]);
@@ -3221,8 +3130,7 @@ GcsBlockForwardPayloadIsUndoVerdictRequest(const GcsBlockForwardPayload *p)
 static inline bool
 GcsBlockForwardPayloadIsUndoVerdictAuthoritative(const GcsBlockForwardPayload *p)
 {
-	return p->reserved_0[6] == (uint8)5
-		   || GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(p);
+	return p->reserved_0[6] == (uint8)5 || GcsBlockForwardPayloadIsUndoFreshRefC1bPairRequest(p);
 }
 
 /* PGRAC: spec-5.22d D4-6 — reserved_0[6] VALUE 4 = dead-owner AUTHORITY
@@ -3364,8 +3272,7 @@ GcsBlockUndoAuthorityFetchTagDecodeOwner(BufferTag tag, int32 *owner_node)
  * there while dbOid and blockNum retain the exact segment and 1-based TT slot.
  * The discriminator is validated separately before this decoder is called. */
 static inline BufferTag
-GcsBlockUndoFreshRefC1bTagMake(uint32 segment_id, TransactionId xid,
-									 uint32 expected_tt_slot_id)
+GcsBlockUndoFreshRefC1bTagMake(uint32 segment_id, TransactionId xid, uint32 expected_tt_slot_id)
 {
 	BufferTag tag = GcsBlockUndoFetchTagMake(segment_id, expected_tt_slot_id);
 
@@ -3374,8 +3281,8 @@ GcsBlockUndoFreshRefC1bTagMake(uint32 segment_id, TransactionId xid,
 }
 
 static inline bool
-GcsBlockUndoFreshRefC1bTagDecode(BufferTag tag, uint32 *segment_id,
-									TransactionId *xid, uint32 *expected_tt_slot_id)
+GcsBlockUndoFreshRefC1bTagDecode(BufferTag tag, uint32 *segment_id, TransactionId *xid,
+								 uint32 *expected_tt_slot_id)
 {
 	TransactionId decoded_xid = (TransactionId)tag.relNumber;
 
@@ -3612,7 +3519,7 @@ typedef enum GcsXheldReadShipDecision {
 
 static inline GcsXheldReadShipDecision
 gcs_block_xheld_read_ship_decision(uint8 transition_id, int pre_state, int32 holder_node,
-									   int32 requester_node, int32 master_node, bool master_resident)
+								   int32 requester_node, int32 master_node, bool master_resident)
 {
 	/* Only plain cross-node reads (N→S) on an X-held block are in scope. */
 	if (transition_id != (uint8)PCM_TRANS_N_TO_S || pre_state != (int)PCM_LOCK_MODE_X)
@@ -3644,22 +3551,19 @@ gcs_block_xheld_read_ship_decision(uint8 transition_id, int pre_state, int32 hol
  * widened into an X->S downgrade or S registration. */
 static inline bool
 gcs_block_xheld_read_barrier_bypass_exact(const PcmAuthoritySnapshot *before,
-										  const PcmAuthoritySnapshot *after,
-										  int32 requester_node)
+										  const PcmAuthoritySnapshot *after, int32 requester_node)
 {
 	int32 holder_node;
 
 	if (before == NULL || after == NULL || requester_node < 0
 		|| requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| memcmp(before, after, sizeof(*before)) != 0
-		|| before->reserved[0] != 0 || before->reserved[1] != 0
-		|| before->state != PCM_STATE_X || before->transition_count == 0
+		|| memcmp(before, after, sizeof(*before)) != 0 || before->reserved[0] != 0
+		|| before->reserved[1] != 0 || before->state != PCM_STATE_X || before->transition_count == 0
 		|| before->transition_count == UINT64_MAX || before->s_holders_bitmap != 0)
 		return false;
 	holder_node = before->x_holder_node;
 	return holder_node >= 0 && holder_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		   && holder_node != requester_node
-		   && before->master_holder.node_id == (uint32)holder_node;
+		   && holder_node != requester_node && before->master_holder.node_id == (uint32)holder_node;
 }
 
 typedef enum GcsBlockSBarrierReadAction {
@@ -3669,8 +3573,8 @@ typedef enum GcsBlockSBarrierReadAction {
 } GcsBlockSBarrierReadAction;
 
 static inline GcsBlockSBarrierReadAction
-gcs_block_s_barrier_read_action_exact(bool queue_before, bool queue_after,
-									  bool resource_x_before, bool resource_x_after,
+gcs_block_s_barrier_read_action_exact(bool queue_before, bool queue_after, bool resource_x_before,
+									  bool resource_x_after,
 									  const PcmAuthoritySnapshot *authority_before,
 									  bool authority_before_valid,
 									  const PcmAuthoritySnapshot *authority_after,
@@ -3681,10 +3585,10 @@ gcs_block_s_barrier_read_action_exact(bool queue_before, bool queue_after,
 	if (queue_before || queue_after || (!resource_x_before && !resource_x_after)
 		|| !authority_before_valid || !authority_after_valid)
 		return GCS_BLOCK_S_BARRIER_DENY;
-	return gcs_block_xheld_read_barrier_bypass_exact(
-		authority_before, authority_after, requester_node)
-		? GCS_BLOCK_S_BARRIER_IMAGE_ONLY
-		: GCS_BLOCK_S_BARRIER_DENY;
+	return gcs_block_xheld_read_barrier_bypass_exact(authority_before, authority_after,
+													 requester_node)
+			   ? GCS_BLOCK_S_BARRIER_IMAGE_ONLY
+			   : GCS_BLOCK_S_BARRIER_DENY;
 }
 
 /* A FORWARDED_IN_FLIGHT dedup record caches routing, never authority.  Reuse
@@ -3694,9 +3598,8 @@ gcs_block_s_barrier_read_action_exact(bool queue_before, bool queue_after,
  * a committed Resource-X handoff invalidates it through the holder fields.
  * No PI bitmap participates in this decision. */
 static inline bool
-gcs_block_forward_replay_authority_exact(GcsBlockReplyStatus cached_status,
-										 uint8 transition_id, int32 cached_holder_node,
-										 int32 requester_node,
+gcs_block_forward_replay_authority_exact(GcsBlockReplyStatus cached_status, uint8 transition_id,
+										 int32 cached_holder_node, int32 requester_node,
 										 const PcmAuthoritySnapshot *authority)
 {
 	uint32 holder_bit;
@@ -3710,25 +3613,19 @@ gcs_block_forward_replay_authority_exact(GcsBlockReplyStatus cached_status,
 
 	switch (cached_status) {
 	case GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER:
-		return transition_id == (uint8)PCM_TRANS_N_TO_S
-			   && authority->state == PCM_STATE_X
-			   && authority->x_holder_node == cached_holder_node
-			   && authority->s_holders_bitmap == 0
+		return transition_id == (uint8)PCM_TRANS_N_TO_S && authority->state == PCM_STATE_X
+			   && authority->x_holder_node == cached_holder_node && authority->s_holders_bitmap == 0
 			   && authority->master_holder.node_id == (uint32)cached_holder_node
-			   && authority->pending_x_requester_node == -1
-			   && authority->pending_x_since_lsn == 0;
+			   && authority->pending_x_requester_node == -1 && authority->pending_x_since_lsn == 0;
 	case GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER:
-		return transition_id == (uint8)PCM_TRANS_N_TO_S
-			   && authority->state == PCM_STATE_S && authority->x_holder_node == -1
-			   && (authority->s_holders_bitmap & holder_bit) != 0
+		return transition_id == (uint8)PCM_TRANS_N_TO_S && authority->state == PCM_STATE_S
+			   && authority->x_holder_node == -1 && (authority->s_holders_bitmap & holder_bit) != 0
 			   && authority->master_holder.node_id == (uint32)cached_holder_node
-			   && authority->pending_x_requester_node == -1
-			   && authority->pending_x_since_lsn == 0;
+			   && authority->pending_x_requester_node == -1 && authority->pending_x_since_lsn == 0;
 	case GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER:
 		return (transition_id == (uint8)PCM_TRANS_N_TO_X
 				|| transition_id == (uint8)PCM_TRANS_S_TO_X_UPGRADE)
-			   && authority->state == PCM_STATE_X
-			   && authority->x_holder_node == cached_holder_node
+			   && authority->state == PCM_STATE_X && authority->x_holder_node == cached_holder_node
 			   && authority->s_holders_bitmap == 0
 			   && authority->master_holder.node_id == (uint32)cached_holder_node
 			   && authority->pending_x_requester_node == requester_node
@@ -3744,8 +3641,7 @@ gcs_block_forward_replay_authority_exact(GcsBlockReplyStatus cached_status,
  * immediately following cleanup response is retryable.  No direct refusal
  * can start a retry round by itself. */
 static inline bool
-gcs_block_holder_refusal_retry_exact(int32 forwarding_master,
-									 bool *awaiting_master_cleanup,
+gcs_block_holder_refusal_retry_exact(int32 forwarding_master, bool *awaiting_master_cleanup,
 									 int retry_attempt, int max_retries)
 {
 	if (awaiting_master_cleanup == NULL || retry_attempt >= max_retries) {
@@ -3770,13 +3666,12 @@ gcs_block_holder_refusal_retry_exact(int32 forwarding_master,
  * a fresh request identity.  Direct master denials and writer transitions do
  * not qualify. */
 static inline bool
-gcs_block_forwarded_s_refusal_requires_fresh_retry(
-	GcsBlockReplyStatus status, uint8 transition_id,
-	int32 forwarding_master)
+gcs_block_forwarded_s_refusal_requires_fresh_retry(GcsBlockReplyStatus status, uint8 transition_id,
+												   int32 forwarding_master)
 {
 	return status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
-		&& transition_id == (uint8)PCM_TRANS_N_TO_S
-		&& forwarding_master >= 0 && forwarding_master < 32;
+		   && transition_id == (uint8)PCM_TRANS_N_TO_S && forwarding_master >= 0
+		   && forwarding_master < 32;
 }
 
 /* PGRAC: spec-5.2a D3 — pure master-side decision for an eligible clean-page
@@ -3877,11 +3772,11 @@ GcsBlockMasterDirectCopyRefusalStatus(ClusterBufmgrGcsCopyRefusal refusal)
 
 extern const char *cluster_bufmgr_gcs_copy_refusal_name(ClusterBufmgrGcsCopyRefusal refusal);
 extern bool cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char *dst,
-										  ClusterBufmgrGcsCopyRefusal *out_refusal);
+											  ClusterBufmgrGcsCopyRefusal *out_refusal);
 extern bool cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag, SCN expected_page_scn,
-										XLogRecPtr *page_lsn_out, SCN *page_scn_out,
-										char *dst,
-										ClusterBufmgrGcsCopyRefusal *refusal_out);
+												XLogRecPtr *page_lsn_out, SCN *page_scn_out,
+												char *dst,
+												ClusterBufmgrGcsCopyRefusal *refusal_out);
 extern bool cluster_bufmgr_borrow_block_for_gcs_live_sge(BufferTag tag, XLogRecPtr *out_page_lsn,
 														 void **out_page_addr,
 														 BufferDesc **out_buf);
@@ -3948,11 +3843,9 @@ typedef enum ClusterItlStampSkipReason {
  * for the exact expected tag while recovery merge is inactive.  Returns the
  * captured generation, acquisition epoch and PCM state; creates no authority
  * or lifecycle state. */
-extern bool cluster_bufmgr_terminal_stamp_authority(Buffer buffer,
-												const BufferTag *expected_tag,
-												uint64 *own_generation,
-												uint64 *acquisition_epoch,
-												uint8 *pcm_state);
+extern bool cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *expected_tag,
+													uint64 *own_generation,
+													uint64 *acquisition_epoch, uint8 *pcm_state);
 
 /* PGRAC: spec-8.3 — no-fetch exact-proof acquire for the commit-time ITL
  * stamp.  Replaces the residency-only semantic: under mapping authority,
@@ -4189,9 +4082,9 @@ extern bool cluster_gcs_send_block_request_and_wait(BufferDesc *buf,
  * bufmgr aborts/rearms GRANT_PENDING and selects a fresh holder identity.
  */
 extern bool cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf,
-												 const PcmAuthoritySnapshot *expected,
-												 bool force_one_shot,
-												 bool *out_retry_denied);
+														 const PcmAuthoritySnapshot *expected,
+														 bool force_one_shot,
+														 bool *out_retry_denied);
 /*
  * R10/A' PGRAC adaptation: a master-local legacy N->S acquisition bypasses
  * the data-plane dedup table, so consult the existing exact PCM-X active-head
@@ -4437,9 +4330,9 @@ extern uint64 cluster_gcs_get_block_dedup_done_marked_count(void);	  /* RC-F DON
 extern uint64 cluster_gcs_get_block_dedup_done_mismatch_count(void);  /* RC-F DONE */
 extern uint64 cluster_gcs_get_block_dedup_hint_violation_count(void); /* review F5 */
 extern uint64 cluster_gcs_get_block_dedup_legacy_pin_count(void);	  /* review F5 */
-extern uint64 cluster_gcs_get_fallback_scn_verify_pass_count(void); /* round-4c FUNC-1 */
-extern uint64 cluster_gcs_get_fallback_scn_refresh_count(void);		/* round-4c FUNC-1 */
-extern uint64 cluster_gcs_get_fallback_scn_failclosed_count(void);	/* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_fallback_scn_verify_pass_count(void);	  /* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_fallback_scn_refresh_count(void);		  /* round-4c FUNC-1 */
+extern uint64 cluster_gcs_get_fallback_scn_failclosed_count(void);	  /* round-4c FUNC-1 */
 
 /*
  * PGRAC: spec-2.35 D12 — 7 NEW reliability/lifecycle counter accessors
@@ -4587,7 +4480,7 @@ typedef struct ResourceXWriterUseContext {
 } ResourceXWriterUseContext;
 
 StaticAssertDecl(sizeof(ResourceXWriterUseContext) == 72,
-	"ResourceXWriterUseContext layout must remain 72 bytes");
+				 "ResourceXWriterUseContext layout must remain 72 bytes");
 
 /* Process-local TARGET cached-X eviction plan.  It is never serialized or
  * stored in shared memory: PREPARE freezes the exact existing kind-4 bytes
@@ -4632,16 +4525,14 @@ extern const char *cluster_gcs_resource_x_take_acquire_failure_reason(int buffer
 																	  ResourceXApplyResult result,
 																	  uint64 *attempt_out);
 
-extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_exact(
-	BufferDesc *buf, uint64 r4_record_generation,
-	ResourceXAcquisitionRef *ref_out);
+extern ResourceXApplyResult
+cluster_gcs_resource_x_target_acquire_exact(BufferDesc *buf, uint64 r4_record_generation,
+											ResourceXAcquisitionRef *ref_out);
 /* Stack-only retry variant for the bufmgr pre-use handoff.  A zero input
  * freezes the ordinary R7 absolute deadline; subsequent calls must present
  * the same nonzero value and can never refresh it. */
-extern ResourceXApplyResult
-cluster_gcs_resource_x_target_acquire_until_exact(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	uint64 r4_record_generation,
+extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_until_exact(
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
 	uint64 *absolute_deadline_us_io, ResourceXAcquisitionRef *ref_out);
 
 /* Only a deliberate, unpinned VM/FSM handoff owner may opt into this entry.
@@ -4650,17 +4541,14 @@ cluster_gcs_resource_x_target_acquire_until_exact(
 extern ResourceXApplyResult cluster_gcs_resource_x_target_acquire_reobserve_exact(
 	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
 	ResourceXAuxiliaryAcquireContext *context, ResourceXAcquisitionRef *ref_out);
-extern ResourceXApplyResult
-cluster_gcs_resource_x_target_evict_prepare_exact(
-	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x,
-	uint64 r4_record_generation, uint64 reservation_token,
-	ResourceXTargetEvictionPlan *plan_out);
+extern ResourceXApplyResult cluster_gcs_resource_x_target_evict_prepare_exact(
+	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x, uint64 r4_record_generation,
+	uint64 reservation_token, ResourceXTargetEvictionPlan *plan_out);
 extern ResourceXApplyResult
 cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *plan,
 												  bool *retry_pending_out);
 extern ResourceXApplyResult
-cluster_gcs_resource_x_target_evict_abort_exact(
-	ResourceXTargetEvictionPlan *plan);
+cluster_gcs_resource_x_target_evict_abort_exact(ResourceXTargetEvictionPlan *plan);
 /* Optional process-local disposition, not authority: only NOT_FOUND plus
  * creation_reobserve_out=true proves a consumed auxiliary creation may be
  * relooked up by its original unpinned caller. Bare NOT_FOUND is an error. */
@@ -4668,31 +4556,25 @@ extern ResourceXApplyResult cluster_gcs_resource_x_target_direct_init_acquire_ex
 	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
 	uint64 direct_init_ownership_generation, uint64 direct_init_reservation_token,
 	bool *creation_reobserve_out, ResourceXAcquisitionRef *ref_out);
-extern ResourceXApplyResult
-cluster_gcs_resource_x_target_direct_init_join_exact(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	ResourceXAcquisitionRef *ref_out);
-extern bool cluster_gcs_resource_x_target_context_recheck_exact(
-	const ResourceXWriterUseContext *context);
+extern ResourceXApplyResult cluster_gcs_resource_x_target_direct_init_join_exact(
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 direct_init_ownership_generation,
+	uint64 direct_init_reservation_token, ResourceXAcquisitionRef *ref_out);
+extern bool
+cluster_gcs_resource_x_target_context_recheck_exact(const ResourceXWriterUseContext *context);
 /* Local proof check only: BAD_STATE means recognized unavailable observation,
  * never permission. Callers must revalidate their physical proof after wait. */
 extern ResourceXApplyResult cluster_gcs_resource_x_target_context_recheck_result_exact(
 	const ResourceXWriterUseContext *context);
 extern ResourceXApplyResult
-cluster_gcs_resource_x_target_itl_recycle_begin_exact(
-	const ResourceXWriterUseContext *context,
-	const ClusterPcmOwnSnapshot *observed,
-	ResourceXLocalOwnerHandle *handle_out);
+cluster_gcs_resource_x_target_itl_recycle_begin_exact(const ResourceXWriterUseContext *context,
+													  const ClusterPcmOwnSnapshot *observed,
+													  ResourceXLocalOwnerHandle *handle_out);
 extern ResourceXApplyResult
-cluster_gcs_resource_x_target_itl_recycle_finish_exact(
-	const ResourceXWriterUseContext *context,
-	const ClusterPcmOwnSnapshot *observed,
-	const ResourceXLocalOwnerHandle *handle);
+cluster_gcs_resource_x_target_itl_recycle_finish_exact(const ResourceXWriterUseContext *context,
+													   const ClusterPcmOwnSnapshot *observed,
+													   const ResourceXLocalOwnerHandle *handle);
 extern ResourceXApplyResult
-cluster_gcs_resource_x_target_itl_recycle_cancel_exact(
-	const ResourceXLocalOwnerHandle *handle);
+cluster_gcs_resource_x_target_itl_recycle_cancel_exact(const ResourceXLocalOwnerHandle *handle);
 /* ============================================================
  * spec-2.34 D4 — eager wake on epoch advance.
  *
@@ -4707,11 +4589,9 @@ cluster_gcs_resource_x_target_itl_recycle_cancel_exact(
  *	reply timeout safety net.
  * ============================================================ */
 extern void cluster_gcs_block_on_epoch_advance(uint64 new_epoch);
-extern void cluster_gcs_block_on_epoch_advance_exact(
-	uint64 new_epoch, const uint8 *dead_bitmap);
+extern void cluster_gcs_block_on_epoch_advance_exact(uint64 new_epoch, const uint8 *dead_bitmap);
 extern bool cluster_gcs_block_resource_x_cutover_tick(void);
-extern bool cluster_gcs_ctrc_dispatch_close(
-	const ClusterCtrcCloseDispatch *dispatch);
+extern bool cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch);
 extern void cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size count);
 
 

@@ -1207,8 +1207,10 @@ UT_TEST(test_lmd_actual_probe_wait_suspends_active_but_never_signs_idle)
 	pg_atomic_write_u32(&cl_normal_stop->requested, 1);
 	pg_atomic_write_u32(&cl_normal_stop->identity_published, 1);
 	pg_atomic_write_u32(&cl_normal_stop->frontends_gone, 1);
-	pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_QUIESCE);
+	pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
 	cl_normal_stop->peer_requests_seen = 15;
+	cl_state->ack_bitmap[0] = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	cl_normal_stop->peer_reply_sent = cl_state->ack_bitmap[0];
 	pg_atomic_write_u32(&cl_normal_stop->cleaner_quiesce_requested, 1);
 	pg_atomic_write_u32(&cl_normal_stop->cleaner_quiesced_mask, 255);
 	pg_atomic_write_u32(&cl_normal_stop->service_idle_mask, 2047);

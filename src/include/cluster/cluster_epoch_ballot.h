@@ -24,8 +24,7 @@
 #define CLUSTER_EPOCH_BALLOT_LANE_BYTES 512
 #define CLUSTER_EPOCH_BALLOT_BITMAP_BYTES 16
 #define CLUSTER_EPOCH_BALLOT_DIGEST_BYTES 16
-#define CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT \
-	UINT64_C(0x8e0dae5b428905e4)
+#define CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT UINT64_C(0x8e0dae5b428905e4)
 
 typedef enum ClusterEpochBallotPhase {
 	CLUSTER_EPOCH_BALLOT_PHASE_EMPTY = 0,
@@ -55,51 +54,51 @@ typedef enum ClusterEpochEventKind {
 #define CLUSTER_EPOCH_AUTHORITY_VALUE_VERSION UINT16_C(1)
 
 typedef struct ClusterEpochBallotId {
-	uint64 counter;						/* 0 */
-	int32 proposer_node_id;				/* 8 */
-	uint32 reserved;						/* 12: zero */
-	uint64 proposer_admitted_incarnation;	/* 16 */
-	uint64 nonce;							/* 24 */
+	uint64 counter;						  /* 0 */
+	int32 proposer_node_id;				  /* 8 */
+	uint32 reserved;					  /* 12: zero */
+	uint64 proposer_admitted_incarnation; /* 16 */
+	uint64 nonce;						  /* 24 */
 } ClusterEpochBallotId;
 
 typedef struct ClusterEpochAuthorityValue {
-	uint16 value_version;					/* 0 */
-	uint8 transition;						/* 2 */
-	uint8 event_kind;						/* 3 */
-	int32 request_origin_node;				/* 4 */
-	int32 target_node_id;					/* 8 */
-	uint32 reserved0;						/* 12: zero */
-	uint64 authority_generation;			/* 16 */
-	uint64 baseline_epoch;					/* 24 */
-	uint64 reserved_epoch;					/* 32 */
-	uint64 old_incarnation;					/* 40 */
-	uint64 fresh_incarnation;				/* 48 */
-	uint64 request_nonce;					/* 56 */
+	uint16 value_version;											  /* 0 */
+	uint8 transition;												  /* 2 */
+	uint8 event_kind;												  /* 3 */
+	int32 request_origin_node;										  /* 4 */
+	int32 target_node_id;											  /* 8 */
+	uint32 reserved0;												  /* 12: zero */
+	uint64 authority_generation;									  /* 16 */
+	uint64 baseline_epoch;											  /* 24 */
+	uint64 reserved_epoch;											  /* 32 */
+	uint64 old_incarnation;											  /* 40 */
+	uint64 fresh_incarnation;										  /* 48 */
+	uint64 request_nonce;											  /* 56 */
 	uint8 authority_member_bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES]; /* 64 */
-	uint8 event_subject_bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES]; /* 80 */
-	uint64 grammar_fingerprint;			/* 96 */
-	uint8 predecessor_digest[CLUSTER_EPOCH_BALLOT_DIGEST_BYTES]; /* 104 */
-	uint8 reserved1[8];						/* 120: zero */
+	uint8 event_subject_bitmap[CLUSTER_EPOCH_BALLOT_BITMAP_BYTES];	  /* 80 */
+	uint64 grammar_fingerprint;										  /* 96 */
+	uint8 predecessor_digest[CLUSTER_EPOCH_BALLOT_DIGEST_BYTES];	  /* 104 */
+	uint8 reserved1[8];												  /* 120: zero */
 } ClusterEpochAuthorityValue;
 
 typedef struct ClusterEpochBallotLane {
-	uint32 magic;							/* 0 */
-	uint16 version;						/* 4 */
-	uint8 last_write_phase;				/* 6 */
-	uint8 flags;							/* 7: zero */
-	int32 proposer_node_id;				/* 8 */
-	uint32 configured_disk_count;		/* 12 */
-	uint64 proposer_admitted_incarnation;	/* 16 */
-	uint64 lane_generation;				/* 24 */
-	uint64 system_identifier;				/* 32 */
-	uint64 grammar_fingerprint;			/* 40 */
-	ClusterEpochBallotId promised_ballot;	/* 48 */
-	ClusterEpochBallotId accepted_ballot;	/* 80 */
+	uint32 magic;							   /* 0 */
+	uint16 version;							   /* 4 */
+	uint8 last_write_phase;					   /* 6 */
+	uint8 flags;							   /* 7: zero */
+	int32 proposer_node_id;					   /* 8 */
+	uint32 configured_disk_count;			   /* 12 */
+	uint64 proposer_admitted_incarnation;	   /* 16 */
+	uint64 lane_generation;					   /* 24 */
+	uint64 system_identifier;				   /* 32 */
+	uint64 grammar_fingerprint;				   /* 40 */
+	ClusterEpochBallotId promised_ballot;	   /* 48 */
+	ClusterEpochBallotId accepted_ballot;	   /* 80 */
 	ClusterEpochAuthorityValue accepted_value; /* 112 */
-	ClusterEpochBallotId settled_ballot;	/* 240 */
-	ClusterEpochAuthorityValue settled_value; /* 272 */
-	uint8 reserved[108];					/* 400: zero */
-	uint32 crc32c;							/* 508 */
+	ClusterEpochBallotId settled_ballot;	   /* 240 */
+	ClusterEpochAuthorityValue settled_value;  /* 272 */
+	uint8 reserved[108];					   /* 400: zero */
+	uint32 crc32c;							   /* 508 */
 } ClusterEpochBallotLane;
 
 StaticAssertDecl(sizeof(ClusterEpochBallotId) == CLUSTER_EPOCH_BALLOT_ID_BYTES,
@@ -115,8 +114,7 @@ StaticAssertDecl(offsetof(ClusterEpochBallotId, proposer_admitted_incarnation) =
 StaticAssertDecl(offsetof(ClusterEpochBallotId, nonce) == 24,
 				 "epoch ballot nonce offset must remain 24");
 
-StaticAssertDecl(sizeof(ClusterEpochAuthorityValue)
-				 == CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES,
+StaticAssertDecl(sizeof(ClusterEpochAuthorityValue) == CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES,
 				 "epoch authority value must remain 128 bytes");
 StaticAssertDecl(offsetof(ClusterEpochAuthorityValue, value_version) == 0,
 				 "authority value version offset must remain 0");
@@ -191,41 +189,43 @@ StaticAssertDecl(offsetof(ClusterEpochBallotLane, crc32c) == 508,
 				 "epoch ballot lane crc offset must remain 508");
 
 extern bool cluster_epoch_ballot_id_is_valid(const ClusterEpochBallotId *ballot);
-extern bool cluster_epoch_ballot_id_encode(
-	const ClusterEpochBallotId *ballot,
-	uint8 out[CLUSTER_EPOCH_BALLOT_ID_BYTES]);
-extern bool cluster_epoch_ballot_id_decode(
-	const uint8 bytes[CLUSTER_EPOCH_BALLOT_ID_BYTES],
-	ClusterEpochBallotId *out);
+extern bool cluster_epoch_ballot_id_encode(const ClusterEpochBallotId *ballot,
+										   uint8 out[CLUSTER_EPOCH_BALLOT_ID_BYTES]);
+extern bool cluster_epoch_ballot_id_decode(const uint8 bytes[CLUSTER_EPOCH_BALLOT_ID_BYTES],
+										   ClusterEpochBallotId *out);
 extern int cluster_epoch_ballot_id_compare(const ClusterEpochBallotId *a,
-										 const ClusterEpochBallotId *b);
+										   const ClusterEpochBallotId *b);
 extern bool cluster_epoch_ballot_next_counter(uint64 current, uint64 *next);
 
-extern bool cluster_epoch_authority_value_is_valid(
-	const ClusterEpochAuthorityValue *value, uint64 expected_grammar_fingerprint);
-extern bool cluster_epoch_authority_value_encode(
-	const ClusterEpochAuthorityValue *value, uint64 expected_grammar_fingerprint,
-	uint8 out[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES]);
-extern bool cluster_epoch_authority_value_decode(
-	const uint8 bytes[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES],
-	uint64 expected_grammar_fingerprint, ClusterEpochAuthorityValue *out);
+extern bool cluster_epoch_authority_value_is_valid(const ClusterEpochAuthorityValue *value,
+												   uint64 expected_grammar_fingerprint);
+extern bool cluster_epoch_authority_value_encode(const ClusterEpochAuthorityValue *value,
+												 uint64 expected_grammar_fingerprint,
+												 uint8 out[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES]);
+extern bool
+cluster_epoch_authority_value_decode(const uint8 bytes[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES],
+									 uint64 expected_grammar_fingerprint,
+									 ClusterEpochAuthorityValue *out);
 
-extern bool cluster_epoch_ballot_lane_is_valid(
-	const ClusterEpochBallotLane *lane, int32 expected_proposer_node_id,
-	uint32 expected_configured_disk_count,
-	uint64 expected_proposer_admitted_incarnation,
-	uint64 expected_system_identifier, uint64 expected_grammar_fingerprint);
-extern bool cluster_epoch_ballot_lane_encode(
-	const ClusterEpochBallotLane *lane, int32 expected_proposer_node_id,
-	uint32 expected_configured_disk_count,
-	uint64 expected_proposer_admitted_incarnation,
-	uint64 expected_system_identifier, uint64 expected_grammar_fingerprint,
-	uint8 out[CLUSTER_EPOCH_BALLOT_LANE_BYTES]);
-extern bool cluster_epoch_ballot_lane_decode(
-	const uint8 bytes[CLUSTER_EPOCH_BALLOT_LANE_BYTES],
-	int32 expected_proposer_node_id, uint32 expected_configured_disk_count,
-	uint64 expected_proposer_admitted_incarnation,
-	uint64 expected_system_identifier, uint64 expected_grammar_fingerprint,
-	ClusterEpochBallotLane *out);
+extern bool cluster_epoch_ballot_lane_is_valid(const ClusterEpochBallotLane *lane,
+											   int32 expected_proposer_node_id,
+											   uint32 expected_configured_disk_count,
+											   uint64 expected_proposer_admitted_incarnation,
+											   uint64 expected_system_identifier,
+											   uint64 expected_grammar_fingerprint);
+extern bool cluster_epoch_ballot_lane_encode(const ClusterEpochBallotLane *lane,
+											 int32 expected_proposer_node_id,
+											 uint32 expected_configured_disk_count,
+											 uint64 expected_proposer_admitted_incarnation,
+											 uint64 expected_system_identifier,
+											 uint64 expected_grammar_fingerprint,
+											 uint8 out[CLUSTER_EPOCH_BALLOT_LANE_BYTES]);
+extern bool cluster_epoch_ballot_lane_decode(const uint8 bytes[CLUSTER_EPOCH_BALLOT_LANE_BYTES],
+											 int32 expected_proposer_node_id,
+											 uint32 expected_configured_disk_count,
+											 uint64 expected_proposer_admitted_incarnation,
+											 uint64 expected_system_identifier,
+											 uint64 expected_grammar_fingerprint,
+											 ClusterEpochBallotLane *out);
 
 #endif /* CLUSTER_EPOCH_BALLOT_H */

@@ -41,12 +41,10 @@ char *cluster_shared_data_dir;
 static bool cluster_r4_activation_test_formation_valid;
 static int32 cluster_r4_activation_test_membership_node = -1;
 static uint64 cluster_r4_activation_test_membership_floor;
-static ClusterMembershipState cluster_r4_activation_test_membership_state
-	= CLUSTER_MEMBER_MEMBER;
+static ClusterMembershipState cluster_r4_activation_test_membership_state = CLUSTER_MEMBER_MEMBER;
 static int32 cluster_r4_activation_test_membership_node2 = -1;
 static uint64 cluster_r4_activation_test_membership_floor2;
-static ClusterMembershipState cluster_r4_activation_test_membership_state2
-	= CLUSTER_MEMBER_MEMBER;
+static ClusterMembershipState cluster_r4_activation_test_membership_state2 = CLUSTER_MEMBER_MEMBER;
 static uint64 cluster_r4_activation_test_self_incarnation = 1;
 static uint64 cluster_r4_activation_test_current_epoch;
 static bool cluster_r4_activation_test_in_quorum = true;
@@ -76,19 +74,16 @@ cluster_epoch_get_current(void)
 }
 
 bool
-cluster_replacement_episode_is_valid(
-	const ClusterReplacementEpisode *episode)
+cluster_replacement_episode_is_valid(const ClusterReplacementEpisode *episode)
 {
 	return cluster_r4_activation_test_formation_valid && episode != NULL;
 }
 
 bool
-cluster_reconfig_lmon_snapshot_replacement_admitted(
-	ClusterReplacementEpisode *out_episode,
-	ClusterReplacementCommitMarkerV3 *out_marker)
+cluster_reconfig_lmon_snapshot_replacement_admitted(ClusterReplacementEpisode *out_episode,
+													ClusterReplacementCommitMarkerV3 *out_marker)
 {
-	if (!cluster_r4_activation_test_formation_valid || out_episode == NULL
-		|| out_marker == NULL)
+	if (!cluster_r4_activation_test_formation_valid || out_episode == NULL || out_marker == NULL)
 		return false;
 
 	memset(out_episode, 0, sizeof(*out_episode));
@@ -182,10 +177,8 @@ cluster_undo_smgr_root_descriptor_publish(
 }
 
 bool
-cluster_reconfig_lmon_snapshot_admitted_membership(
-	uint64 *out_members_lo,
-	uint64 *out_members_hi,
-	uint64 *out_formation_epoch)
+cluster_reconfig_lmon_snapshot_admitted_membership(uint64 *out_members_lo, uint64 *out_members_hi,
+												   uint64 *out_formation_epoch)
 {
 	cluster_r4_activation_test_admitted_snapshot_calls++;
 	if (out_members_lo != NULL)
@@ -194,9 +187,8 @@ cluster_reconfig_lmon_snapshot_admitted_membership(
 		*out_members_hi = 0;
 	if (out_formation_epoch != NULL)
 		*out_formation_epoch = 0;
-	if (!cluster_r4_activation_test_admitted_snapshot_valid
-		|| out_members_lo == NULL || out_members_hi == NULL
-		|| out_formation_epoch == NULL)
+	if (!cluster_r4_activation_test_admitted_snapshot_valid || out_members_lo == NULL
+		|| out_members_hi == NULL || out_formation_epoch == NULL)
 		return false;
 	*out_members_lo = cluster_r4_activation_test_admitted_members_lo;
 	*out_members_hi = cluster_r4_activation_test_admitted_members_hi;
@@ -233,10 +225,9 @@ cluster_lms_shared_state(void)
 }
 
 bool
-cluster_lms_r4_drain_request(
-	ClusterLmsSharedState *state pg_attribute_unused(),
-	uint64 generation pg_attribute_unused(),
-	uint64 *worker_incarnation pg_attribute_unused())
+cluster_lms_r4_drain_request(ClusterLmsSharedState *state pg_attribute_unused(),
+							 uint64 generation pg_attribute_unused(),
+							 uint64 *worker_incarnation pg_attribute_unused())
 {
 	return false;
 }
@@ -246,9 +237,8 @@ cluster_lms_wakeup(int worker_id pg_attribute_unused())
 {}
 
 bool
-cluster_cr_server_r4_lmon_reclaim_closed(
-	uint64 worker_incarnation pg_attribute_unused(),
-	uint64 generation pg_attribute_unused())
+cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation pg_attribute_unused(),
+										 uint64 generation pg_attribute_unused())
 {
 	return false;
 }
@@ -272,26 +262,23 @@ cluster_gcs_block_r4_requester_count(void)
 }
 
 bool cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
-											uint32 expected_generation);
+												   uint32 expected_generation);
 static bool cluster_r4_activation_test_capability_generation_matches;
 static int32 cluster_r4_activation_test_capability_peer = -1;
 static uint64 cluster_r4_activation_test_capability_peer_mask;
 static uint32 cluster_r4_activation_test_capability_required;
 static uint32 cluster_r4_activation_test_capability_expected_generation;
 bool
-cluster_sf_peer_capability_generation_matches(int32 peer_id,
-											uint32 required_capabilities,
-											uint32 expected_generation)
+cluster_sf_peer_capability_generation_matches(int32 peer_id, uint32 required_capabilities,
+											  uint32 expected_generation)
 {
 	return cluster_r4_activation_test_capability_generation_matches
 		   && (peer_id == cluster_r4_activation_test_capability_peer
 			   || (peer_id >= 0 && peer_id < 64
-				   && (cluster_r4_activation_test_capability_peer_mask
-					   & (UINT64_C(1) << peer_id)) != 0))
-		   && required_capabilities
-			  == cluster_r4_activation_test_capability_required
-		   && expected_generation
-			  == cluster_r4_activation_test_capability_expected_generation;
+				   && (cluster_r4_activation_test_capability_peer_mask & (UINT64_C(1) << peer_id))
+						  != 0))
+		   && required_capabilities == cluster_r4_activation_test_capability_required
+		   && expected_generation == cluster_r4_activation_test_capability_expected_generation;
 }
 
 static bool cluster_r4_activation_test_capability_word_sample_ok;
@@ -299,11 +286,10 @@ static uint32 cluster_r4_activation_test_capability_word;
 static uint32 cluster_r4_activation_test_capability_generation;
 static uint32 cluster_r4_activation_test_capability_sample_calls[CLUSTER_MAX_NODES];
 static uint32 cluster_r4_activation_test_local_capability_word;
-static ClusterICSendResult
-	cluster_r4_activation_test_send_results[CLUSTER_MAX_NODES];
+static ClusterICSendResult cluster_r4_activation_test_send_results[CLUSTER_MAX_NODES];
 static uint32 cluster_r4_activation_test_send_calls[CLUSTER_MAX_NODES];
 static uint8 cluster_r4_activation_test_send_payloads[CLUSTER_MAX_NODES]
-	[CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
+													 [CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES];
 static uint32 cluster_r4_activation_test_send_payload_lengths[CLUSTER_MAX_NODES];
 static uint8 cluster_r4_activation_test_send_msg_types[CLUSTER_MAX_NODES];
 static uint32 cluster_r4_activation_test_close_calls[CLUSTER_MAX_NODES];
@@ -326,8 +312,7 @@ cluster_sf_peer_capability_record_snapshot(int32 peer_id, ClusterSfPeerCap *out)
 
 bool
 cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
-									  uint32 *capability_word_out,
-									  uint32 *generation_out)
+									   uint32 *capability_word_out, uint32 *generation_out)
 {
 	if (capability_word_out != NULL)
 		*capability_word_out = 0;
@@ -335,9 +320,8 @@ cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabiliti
 		*generation_out = 0;
 	if (peer_id >= 0 && peer_id < CLUSTER_MAX_NODES)
 		cluster_r4_activation_test_capability_sample_calls[peer_id]++;
-	if (!cluster_r4_activation_test_capability_word_sample_ok
-		|| peer_id < 0 || peer_id >= CLUSTER_MAX_NODES
-		|| required_capabilities == 0
+	if (!cluster_r4_activation_test_capability_word_sample_ok || peer_id < 0
+		|| peer_id >= CLUSTER_MAX_NODES || required_capabilities == 0
 		|| (cluster_r4_activation_test_capability_word & required_capabilities)
 			   != required_capabilities)
 		return false;
@@ -355,18 +339,16 @@ cluster_ic_local_capability_word(void)
 }
 
 ClusterICSendResult
-cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id,
-						 const void *payload, uint32 payload_len)
+cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
+						 uint32 payload_len)
 {
-	if (dest_node_id < 0 || dest_node_id >= CLUSTER_MAX_NODES
-		|| payload == NULL
+	if (dest_node_id < 0 || dest_node_id >= CLUSTER_MAX_NODES || payload == NULL
 		|| payload_len != CLUSTER_SEMANTIC_ACTIVATION_ACK_WIRE_BYTES)
 		return CLUSTER_IC_SEND_HARD_ERROR;
 	cluster_r4_activation_test_send_calls[dest_node_id]++;
 	cluster_r4_activation_test_send_msg_types[dest_node_id] = msg_type;
 	cluster_r4_activation_test_send_payload_lengths[dest_node_id] = payload_len;
-	memcpy(cluster_r4_activation_test_send_payloads[dest_node_id], payload,
-		payload_len);
+	memcpy(cluster_r4_activation_test_send_payloads[dest_node_id], payload, payload_len);
 	return cluster_r4_activation_test_send_results[dest_node_id];
 }
 

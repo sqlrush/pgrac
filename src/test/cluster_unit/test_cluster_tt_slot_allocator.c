@@ -87,9 +87,10 @@ UT_DEFINE_GLOBALS();
 /* spec-5.22e D5-3 stub: the gc pass consults the F-D2 epoch fence
  * (cluster_undo_horizon_ic.c not linked here); never tripped in unit. */
 bool cluster_undo_horizon_epoch_fence_tripped(uint64 expected_epoch);
-bool cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
-	uint16 slot_offset, TransactionId xid, uint16 slot_wrap,
-	uint8 terminal_status, SCN terminal_scn, uint64 expected_epoch);
+bool cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset,
+												TransactionId xid, uint16 slot_wrap,
+												uint8 terminal_status, SCN terminal_scn,
+												uint64 expected_epoch);
 void cluster_undo_cleaner_wakeup(void);
 
 bool
@@ -167,13 +168,9 @@ LWLockRelease(LWLock *lock pg_attribute_unused())
  * away-and-back rebind while the sample is in flight, exercising the final
  * allocator-candidate ABA recheck. */
 bool
-cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
-										   uint16 slot_offset,
-										   TransactionId xid,
-										   uint16 slot_wrap,
-										   uint8 terminal_status,
-										   SCN terminal_scn,
-										   uint64 expected_epoch)
+cluster_ctrc_terminal_release_sample_exact(uint32 segment_id, uint16 slot_offset, TransactionId xid,
+										   uint16 slot_wrap, uint8 terminal_status,
+										   SCN terminal_scn, uint64 expected_epoch)
 {
 	mock_ctrc_sample_calls++;
 	mock_ctrc_sample_lock_depth = mock_lwlock_depth;
@@ -181,16 +178,14 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
 	UT_ASSERT_EQ(slot_offset, 0);
 	UT_ASSERT_EQ(xid, (TransactionId)100);
 	UT_ASSERT_EQ(slot_wrap, 0);
-	UT_ASSERT(terminal_status == TT_SLOT_COMMITTED
-			  || terminal_status == TT_SLOT_ABORTED);
+	UT_ASSERT(terminal_status == TT_SLOT_COMMITTED || terminal_status == TT_SLOT_ABORTED);
 	UT_ASSERT_EQ(expected_epoch, UINT64_C(7));
 	if (terminal_status == TT_SLOT_COMMITTED)
 		UT_ASSERT(SCN_VALID(terminal_scn));
 	else
 		UT_ASSERT_EQ(terminal_scn, InvalidScn);
 
-	if (mock_ctrc_rebind_during_sample)
-	{
+	if (mock_ctrc_rebind_during_sample) {
 		uint16 rebound;
 
 		mock_ctrc_rebind_during_sample = false;
@@ -199,11 +194,9 @@ cluster_ctrc_terminal_release_sample_exact(uint32 segment_id,
 		rebound = cluster_tt_slot_alloc(UINT32_C(1), (TransactionId)100);
 		UT_ASSERT_EQ(rebound, 0);
 		if (terminal_status == TT_SLOT_COMMITTED)
-			cluster_tt_slot_mark_committed(UINT32_C(1), rebound,
-				(TransactionId)100, terminal_scn);
+			cluster_tt_slot_mark_committed(UINT32_C(1), rebound, (TransactionId)100, terminal_scn);
 		else
-			cluster_tt_slot_mark_aborted(UINT32_C(1), rebound,
-				(TransactionId)100);
+			cluster_tt_slot_mark_aborted(UINT32_C(1), rebound, (TransactionId)100);
 	}
 	return mock_ctrc_release_proven;
 }
@@ -1196,7 +1189,7 @@ UT_TEST(test_t49_peer_mode_aborted_retains_canonical_slot)
 	uint16 off;
 	uint16 result;
 	bool retained = false;
-	ClusterUndoCleanerPassStats stats = {0};
+	ClusterUndoCleanerPassStats stats = { 0 };
 	int i;
 
 	reset_allocator();
@@ -1232,7 +1225,7 @@ UT_TEST(test_t49_peer_mode_aborted_retains_canonical_slot)
 
 UT_TEST(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample)
 {
-	ClusterUndoCleanerPassStats stats = {0};
+	ClusterUndoCleanerPassStats stats = { 0 };
 	ClusterTTSlotCurrentOwner owner;
 	uint16 off;
 
@@ -1240,8 +1233,7 @@ UT_TEST(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample)
 	mock_cluster_conf.node_count = 2;
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	UT_ASSERT_EQ(off, 0);
-	cluster_tt_slot_mark_committed(NODE0_SEG, off,
-		(TransactionId)100, (SCN)10);
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)10);
 	mock_ctrc_release_proven = true;
 	mock_ctrc_rebind_during_sample = true;
 
@@ -1249,8 +1241,7 @@ UT_TEST(test_t54_peer_gc_rejects_exact_candidate_aba_after_release_sample)
 	UT_ASSERT_EQ(mock_ctrc_sample_calls, 1);
 	UT_ASSERT_EQ(mock_ctrc_sample_lock_depth, 0);
 	UT_ASSERT_EQ((int)stats.shmem_tt_slots_gcd, 0);
-	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(
-		0, (TransactionId)100, &owner));
+	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(0, (TransactionId)100, &owner));
 	UT_ASSERT_EQ(owner.status, CTS_COMMITTED);
 	UT_ASSERT_EQ(owner.commit_scn, (SCN)10);
 }
@@ -1288,8 +1279,7 @@ UT_TEST(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded)
 	cluster_tt_slot_rollover(0, NODE0_SEG, NULL);
 	off = cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)100);
 	memset(&owner, 0xA5, sizeof(owner));
-	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(
-		0, (TransactionId)100, &owner));
+	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(0, (TransactionId)100, &owner));
 	UT_ASSERT_EQ((int)owner.segment_id, (int)NODE0_SEG);
 	UT_ASSERT_EQ((int)owner.xid, 100);
 	UT_ASSERT_EQ((int)owner.slot_offset, (int)off);
@@ -1300,18 +1290,15 @@ UT_TEST(test_t51_current_owner_snapshot_is_exact_and_rollover_bounded)
 	UT_ASSERT_EQ((int)owner.reserved8[1], 0);
 	UT_ASSERT_EQ((int)owner.reserved8[2], 0);
 
-	cluster_tt_slot_mark_committed(
-		NODE0_SEG, off, (TransactionId)100, (SCN)77);
-	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(
-		0, (TransactionId)100, &owner));
+	cluster_tt_slot_mark_committed(NODE0_SEG, off, (TransactionId)100, (SCN)77);
+	UT_ASSERT(cluster_tt_slot_current_owner_by_xid(0, (TransactionId)100, &owner));
 	UT_ASSERT_EQ((int)owner.status, (int)CTS_COMMITTED);
 	UT_ASSERT_EQ((int)owner.commit_scn, 77);
 
 	cluster_tt_slot_rollover(0, 2, NULL);
 	memset(&owner, 0xA5, sizeof(owner));
-	UT_ASSERT(!cluster_tt_slot_current_owner_by_xid(
-		0, (TransactionId)100, &owner));
-	UT_ASSERT_EQ(memcmp(&owner, &(ClusterTTSlotCurrentOwner){0}, sizeof(owner)), 0);
+	UT_ASSERT(!cluster_tt_slot_current_owner_by_xid(0, (TransactionId)100, &owner));
+	UT_ASSERT_EQ(memcmp(&owner, &(ClusterTTSlotCurrentOwner){ 0 }, sizeof(owner)), 0);
 }
 
 UT_TEST(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation)
@@ -1325,16 +1312,16 @@ UT_TEST(test_t52_current_exact_alloc_reports_rollover_drift_without_mutation)
 	cluster_tt_slot_rollover(0, NODE0_SEG, NULL);
 	cluster_tt_slot_rollover(0, 2, NULL);
 
-	result = cluster_tt_slot_alloc_current_exact(
-		0, NODE0_SEG, (TransactionId)100, &retained, &current_drift, &wrap);
+	result = cluster_tt_slot_alloc_current_exact(0, NODE0_SEG, (TransactionId)100, &retained,
+												 &current_drift, &wrap);
 	UT_ASSERT_EQ((int)result, (int)INVALID_TT_SLOT_OFFSET);
 	UT_ASSERT_EQ((int)retained, 0);
 	UT_ASSERT_EQ((int)current_drift, 1);
 	UT_ASSERT_EQ((int)wrap, (int)TT_WRAP_INVALID);
 	UT_ASSERT_EQ((int)cluster_tt_slot_current_segment(0), 2);
 
-	result = cluster_tt_slot_alloc_current_exact(
-		0, 2, (TransactionId)100, &retained, &current_drift, &wrap);
+	result = cluster_tt_slot_alloc_current_exact(0, 2, (TransactionId)100, &retained,
+												 &current_drift, &wrap);
 	UT_ASSERT_EQ((int)result, 0);
 	UT_ASSERT_EQ((int)retained, 0);
 	UT_ASSERT_EQ((int)current_drift, 0);
@@ -1348,8 +1335,8 @@ UT_TEST(test_unbound_current_exact_cannot_invent_free_slots)
 	uint16 wrap = 0;
 
 	reset_allocator();
-	UT_ASSERT_EQ(cluster_tt_slot_alloc_current_exact(0, NODE0_SEG, 100,
-		&retained, &drift, &wrap), INVALID_TT_SLOT_OFFSET);
+	UT_ASSERT_EQ(cluster_tt_slot_alloc_current_exact(0, NODE0_SEG, 100, &retained, &drift, &wrap),
+				 INVALID_TT_SLOT_OFFSET);
 	UT_ASSERT(drift);
 	UT_ASSERT(!retained);
 	UT_ASSERT_EQ(wrap, TT_WRAP_INVALID);
@@ -1371,9 +1358,8 @@ UT_TEST(test_t53_current_exact_alloc_captures_recycle_wrap_atomically)
 	for (i = 1; i < TT_SLOTS_PER_SEGMENT; i++)
 		(void)cluster_tt_slot_alloc(NODE0_SEG, (TransactionId)(1000 + i));
 
-	recycled = cluster_tt_slot_alloc_current_exact(
-		0, NODE0_SEG, (TransactionId)99999,
-		&retained, &current_drift, &wrap);
+	recycled = cluster_tt_slot_alloc_current_exact(0, NODE0_SEG, (TransactionId)99999, &retained,
+												   &current_drift, &wrap);
 	UT_ASSERT_EQ((int)recycled, (int)first);
 	UT_ASSERT_EQ((int)retained, 0);
 	UT_ASSERT_EQ((int)current_drift, 0);

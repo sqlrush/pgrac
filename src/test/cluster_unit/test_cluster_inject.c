@@ -79,9 +79,8 @@
 char *cluster_injection_points = NULL; /* extern from cluster_guc.h */
 
 bool
-cluster_ctrc_test_barrier_control(
-	ClusterCtrcTestBarrierPhase phase pg_attribute_unused(),
-	bool armed pg_attribute_unused())
+cluster_ctrc_test_barrier_control(ClusterCtrcTestBarrierPhase phase pg_attribute_unused(),
+								  bool armed pg_attribute_unused())
 {
 	return true;
 }

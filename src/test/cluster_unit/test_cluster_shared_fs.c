@@ -769,18 +769,15 @@ UT_TEST(test_undo_shared_path_resolve)
 
 UT_TEST(test_external_fence_protected_set_identity_is_exact_and_closed)
 {
-	static const uint8 expected_uuid[16] = {
-		0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
-		0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff
-	};
+	static const uint8 expected_uuid[16] = { 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77,
+											 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff };
 	ClusterProtectedSetIdentityV1 identity;
 
 	cluster_shared_storage_backend = CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE;
 	stub_block_device_storage_uuid = "00112233445566778899aabbccddeeff";
 	UT_ASSERT(cluster_shared_fs_get_protected_set_identity(&identity));
 	UT_ASSERT_EQ(identity.backend_id, CLUSTER_SHARED_FS_BACKEND_BLOCK_DEVICE);
-	UT_ASSERT(memcmp(identity.storage_uuid, expected_uuid,
-				 sizeof(expected_uuid)) == 0);
+	UT_ASSERT(memcmp(identity.storage_uuid, expected_uuid, sizeof(expected_uuid)) == 0);
 
 	stub_block_device_storage_uuid = "raw-block-device";
 	UT_ASSERT(!cluster_shared_fs_get_protected_set_identity(&identity));

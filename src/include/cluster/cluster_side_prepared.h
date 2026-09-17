@@ -41,10 +41,9 @@
 #ifndef CLUSTER_SIDE_PREPARED_H
 #define CLUSTER_SIDE_PREPARED_H
 
-typedef enum ClusterSidePreparedVerdict
-{
+typedef enum ClusterSidePreparedVerdict {
 	CLUSTER_SIDE_PREPARED_IN_DOUBT = 0, /* prepare + pending + TT/undo all match */
-	CLUSTER_SIDE_PREPARED_BLOCKED	/* any fact missing/conflicting */
+	CLUSTER_SIDE_PREPARED_BLOCKED		/* any fact missing/conflicting */
 } ClusterSidePreparedVerdict;
 
 /*
@@ -52,12 +51,11 @@ typedef enum ClusterSidePreparedVerdict
  * (the production 2PC/TT wiring supplies them); this layer judges the
  * conjunction only.
  */
-typedef struct ClusterSidePreparedInput
-{
-	bool		prepare_redo_ok;	/* exact prepare terminal redo seen */
-	bool		pending_durable_ok; /* database-scoped durable pending entry */
-	bool		tt_undo_match;		/* matching shared TT/undo identity */
-	bool		gid_identity_match; /* same transaction, exact GID/identity */
+typedef struct ClusterSidePreparedInput {
+	bool prepare_redo_ok;	 /* exact prepare terminal redo seen */
+	bool pending_durable_ok; /* database-scoped durable pending entry */
+	bool tt_undo_match;		 /* matching shared TT/undo identity */
+	bool gid_identity_match; /* same transaction, exact GID/identity */
 } ClusterSidePreparedInput;
 
 /*
@@ -66,8 +64,7 @@ typedef struct ClusterSidePreparedInput
  * origin-local file or recoverer-local cache standing in for the
  * database-scoped pending entry.
  */
-extern ClusterSidePreparedVerdict cluster_side_prepared_verdict(
-	const ClusterSidePreparedInput *in);
+extern ClusterSidePreparedVerdict cluster_side_prepared_verdict(const ClusterSidePreparedInput *in);
 
 /*
  * RECO-style resolution (COMMIT_PREPARED / ABORT_PREPARED terminal):
@@ -79,15 +76,13 @@ extern ClusterSidePreparedVerdict cluster_side_prepared_verdict(
  * released only after the matching resolution is durable verified
  * (§2.3 last bullet; §4 PREPARED rows).
  */
-typedef struct ClusterSidePreparedResolveInput
-{
-	bool		terminal_redo_ok;	/* commit-prepared / rollback-prepared redo */
-	bool		pending_match;		/* exact pending/prepare identity match */
-	bool		tt_undo_complete;	/* COMMIT: TT match; ROLLBACK: undo done */
+typedef struct ClusterSidePreparedResolveInput {
+	bool terminal_redo_ok; /* commit-prepared / rollback-prepared redo */
+	bool pending_match;	   /* exact pending/prepare identity match */
+	bool tt_undo_complete; /* COMMIT: TT match; ROLLBACK: undo done */
 } ClusterSidePreparedResolveInput;
 
-extern bool cluster_side_prepared_resolve_ready(
-	const ClusterSidePreparedResolveInput *in);
+extern bool cluster_side_prepared_resolve_ready(const ClusterSidePreparedResolveInput *in);
 
 /*
  * cluster_side_prepared_gid_identity_ok -- the GID identity leg of the
@@ -96,8 +91,7 @@ extern bool cluster_side_prepared_resolve_ready(
  * wire/2PC path uses, and fully inside the available payload bytes.
  * Pure predicate; no state, no locks.
  */
-extern bool cluster_side_prepared_gid_identity_ok(const char *gid,
-												  uint16 gidlen,
+extern bool cluster_side_prepared_gid_identity_ok(const char *gid, uint16 gidlen,
 												  uint32 available_bytes);
 
-#endif							/* CLUSTER_SIDE_PREPARED_H */
+#endif /* CLUSTER_SIDE_PREPARED_H */

@@ -856,8 +856,7 @@ raw_ensure_layout(void)
 					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 					 errmsg("raw block device capacity exceeds the supported offset range"),
 					 errdetail("BLKGETSIZE64 reported " UINT64_FORMAT
-							   " bytes; the maximum supported capacity is " INT64_FORMAT
-							   " bytes.",
+							   " bytes; the maximum supported capacity is " INT64_FORMAT " bytes.",
 							   reported_capacity, (int64)PG_INT64_MAX),
 					 errhint("Use a block device no larger than the reported maximum.")));
 		if (size_failure == RAW_DEVICE_SIZE_FAILURE_SECTOR_ALIGNMENT)
@@ -870,11 +869,10 @@ raw_ensure_layout(void)
 					 errhint("Verify that the block-device mapping exposes a whole number of "
 							 "512-byte sectors.")));
 		if (size_failure == RAW_DEVICE_SIZE_FAILURE_UNSUPPORTED)
-			ereport(FATAL,
-					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("could not query raw block device capacity on this platform"),
-					 errhint("Use a Linux block device that supports BLKGETSIZE64, or a "
-							 "regular-file image for development tests.")));
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("could not query raw block device capacity on this platform"),
+							errhint("Use a Linux block device that supports BLKGETSIZE64, or a "
+									"regular-file image for development tests.")));
 		errno = saved_errno;
 		if (size_failure == RAW_DEVICE_SIZE_FAILURE_BLOCK_QUERY)
 			ereport(FATAL,
@@ -1488,19 +1486,16 @@ cluster_shared_fs_block_device_init(void)
 		bool exact = true;
 		int i;
 
-		memset(cluster_raw_protected_storage_uuid, 0,
-			   sizeof(cluster_raw_protected_storage_uuid));
+		memset(cluster_raw_protected_storage_uuid, 0, sizeof(cluster_raw_protected_storage_uuid));
 		raw_load_super(&super, &valid, &all_zero);
-		if (!valid || all_zero || super.storage_uuid[32] != '\0' ||
-			cluster_shared_storage_uuid == NULL ||
-			strlen(cluster_shared_storage_uuid) != 32)
+		if (!valid || all_zero || super.storage_uuid[32] != '\0'
+			|| cluster_shared_storage_uuid == NULL || strlen(cluster_shared_storage_uuid) != 32)
 			exact = false;
-		for (i = 0; exact && i < 32; i++)
-		{
-			unsigned char ch = (unsigned char) super.storage_uuid[i];
+		for (i = 0; exact && i < 32; i++) {
+			unsigned char ch = (unsigned char)super.storage_uuid[i];
 
-			if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f')) ||
-				ch != (unsigned char) cluster_shared_storage_uuid[i])
+			if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))
+				|| ch != (unsigned char)cluster_shared_storage_uuid[i])
 				exact = false;
 		}
 		if (exact)
@@ -1520,8 +1515,7 @@ cluster_shared_fs_block_device_shutdown(void)
 	}
 	cluster_raw_fence_capability = CLUSTER_FENCE_CAP_NONE;
 	cluster_shared_fs_block_device_caps.supports_scsi3_pr = false;
-	memset(cluster_raw_protected_storage_uuid, 0,
-		   sizeof(cluster_raw_protected_storage_uuid));
+	memset(cluster_raw_protected_storage_uuid, 0, sizeof(cluster_raw_protected_storage_uuid));
 }
 
 bool
@@ -1532,8 +1526,7 @@ cluster_shared_fs_block_device_get_storage_uuid(char *out, size_t outlen)
 	out[0] = '\0';
 	if (cluster_raw_protected_storage_uuid[0] == '\0')
 		return false;
-	memcpy(out, cluster_raw_protected_storage_uuid,
-		   sizeof(cluster_raw_protected_storage_uuid));
+	memcpy(out, cluster_raw_protected_storage_uuid, sizeof(cluster_raw_protected_storage_uuid));
 	return true;
 }
 

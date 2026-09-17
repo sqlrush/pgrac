@@ -223,9 +223,8 @@ cluster_undo_emit_segment_init(uint8 instance, uint32 segment_id, const char *pa
  * flush is required: the first dependent undo/heap WAL record follows it.
  */
 XLogRecPtr
-cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id,
-								uint32 segment_generation, uint16 slot_offset,
-								uint16 wrap, TransactionId xid)
+cluster_undo_emit_tt_slot_bind(uint8 instance, uint32 segment_id, uint32 segment_generation,
+							   uint16 slot_offset, uint16 wrap, TransactionId xid)
 {
 	xl_undo_tt_slot_bind rec;
 
@@ -376,10 +375,8 @@ cluster_undo_emit_tt_slot_abort(uint8 instance, uint32 segment_id, uint16 slot_o
 }
 
 XLogRecPtr
-cluster_undo_emit_tt_slot_abort_exact(uint8 instance, uint32 segment_id,
-									 uint32 segment_generation,
-									 uint16 slot_offset, uint16 wrap,
-									 TransactionId xid)
+cluster_undo_emit_tt_slot_abort_exact(uint8 instance, uint32 segment_id, uint32 segment_generation,
+									  uint16 slot_offset, uint16 wrap, TransactionId xid)
 {
 	xl_undo_tt_slot_abort_exact rec;
 	XLogRecPtr lsn;
@@ -440,38 +437,39 @@ cluster_undo_emit_tt_slot_set_head(uint8 instance, uint32 segment_id, uint16 slo
  * caller owns block-0 X-current and flushes this LSN before publishing the
  * exact TT release bit. */
 XLogRecPtr
-cluster_undo_xlog_insert_tt_ctrc_release(
-	const xl_undo_tt_slot_ctrc_release_v1 *record)
+cluster_undo_xlog_insert_tt_ctrc_release(const xl_undo_tt_slot_ctrc_release_v1 *record)
 {
 	uint8 bytes[CLUSTER_UNDO_TT_CTRC_RELEASE_BYTES];
 
 	if (!cluster_undo_tt_ctrc_release_encode(record, bytes))
-		ereport(ERROR,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid canonical TT CTRC release certificate"),
-				 errdetail("segment_id=%u segment_generation=%u xid=%u cluster_epoch=%u root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT " formation_epoch=" UINT64_FORMAT " admission_generation=" UINT64_FORMAT " seal_generation=" UINT64_FORMAT " touched_low=" UINT64_FORMAT " touched_high=" UINT64_FORMAT " slot_offset=%u slot_wrap=%u owner_instance=%u terminal_status=%u format_version=%u flags=%u",
-					 record != NULL ? record->segment_id : 0,
-					 record != NULL ? record->segment_generation : 0,
-					 record != NULL ? record->xid : 0,
-					 record != NULL ? record->cluster_epoch : 0,
-					 (uint64)(record != NULL ? record->root_id : 0),
-					 (uint64)(record != NULL ? record->root_generation : 0),
-					 (uint64)(record != NULL ? record->formation_epoch : 0),
-					 (uint64)(record != NULL
-						 ? record->admission_record_generation : 0),
-					 (uint64)(record != NULL ? record->seal_generation : 0),
-					 (uint64)(record != NULL ? record->touched_nodes_low : 0),
-					 (uint64)(record != NULL ? record->touched_nodes_high : 0),
-					 record != NULL ? record->slot_offset : 0,
-					 record != NULL ? record->slot_wrap : 0,
-					 record != NULL ? record->owner_instance : 0,
-					 record != NULL ? record->terminal_status : 0,
-					 record != NULL ? record->format_version : 0,
-					 record != NULL ? record->flags : 0)));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("invalid canonical TT CTRC release certificate"),
+			 errdetail(
+				 "segment_id=%u segment_generation=%u xid=%u cluster_epoch=%u "
+				 "root_id=" UINT64_FORMAT " root_generation=" UINT64_FORMAT
+				 " formation_epoch=" UINT64_FORMAT " admission_generation=" UINT64_FORMAT
+				 " seal_generation=" UINT64_FORMAT " touched_low=" UINT64_FORMAT
+				 " touched_high=" UINT64_FORMAT " slot_offset=%u slot_wrap=%u owner_instance=%u "
+				 "terminal_status=%u format_version=%u flags=%u",
+				 record != NULL ? record->segment_id : 0,
+				 record != NULL ? record->segment_generation : 0, record != NULL ? record->xid : 0,
+				 record != NULL ? record->cluster_epoch : 0,
+				 (uint64)(record != NULL ? record->root_id : 0),
+				 (uint64)(record != NULL ? record->root_generation : 0),
+				 (uint64)(record != NULL ? record->formation_epoch : 0),
+				 (uint64)(record != NULL ? record->admission_record_generation : 0),
+				 (uint64)(record != NULL ? record->seal_generation : 0),
+				 (uint64)(record != NULL ? record->touched_nodes_low : 0),
+				 (uint64)(record != NULL ? record->touched_nodes_high : 0),
+				 record != NULL ? record->slot_offset : 0, record != NULL ? record->slot_wrap : 0,
+				 record != NULL ? record->owner_instance : 0,
+				 record != NULL ? record->terminal_status : 0,
+				 record != NULL ? record->format_version : 0, record != NULL ? record->flags : 0)));
 	XLogBeginInsert();
 	XLogRegisterData((char *)bytes, sizeof(bytes));
-	return XLogInsert(RM_CLUSTER_UNDO_ID,
-		XLOG_UNDO_TT_SLOT_CTRC_RELEASE);
+	return XLogInsert(RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_CTRC_RELEASE);
 }
 
 
@@ -843,10 +841,8 @@ static const UBA InvalidUbaVal = InvalidUba_init;
  * is either an exact idempotent ACTIVE or recovery corruption.
  */
 void
-cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id,
-									uint32 segment_generation,
-									uint16 slot_offset, uint16 wrap,
-									TransactionId xid)
+cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segment_generation,
+								  uint16 slot_offset, uint16 wrap, TransactionId xid)
 {
 	char path[MAXPGPATH];
 	int fd;
@@ -858,27 +854,24 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id,
 	uint32 offset;
 	ssize_t nread;
 
-	if (instance == 0 || instance > UNDO_OWNER_INSTANCE_MAX
-		|| segment_id == 0 || slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| !TransactionIdIsNormal(xid) || wrap == TT_WRAP_INVALID
-		|| (uint8)(((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1)
-			!= instance)
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid canonical TT ACTIVE identity during redo")));
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance),
-			instance, segment_id, path, sizeof(path)) != 0)
-		ereport(PANIC,
-				(errmsg("undo segment path too long for TT ACTIVE redo: instance=%u seg=%u",
-						instance, segment_id)));
+	if (instance == 0 || instance > UNDO_OWNER_INSTANCE_MAX || segment_id == 0
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| wrap == TT_WRAP_INVALID
+		|| (uint8)(((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1) != instance)
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid canonical TT ACTIVE identity during redo")));
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance), instance, segment_id, path,
+								sizeof(path))
+		!= 0)
+		ereport(PANIC, (errmsg("undo segment path too long for TT ACTIVE redo: instance=%u seg=%u",
+							   instance, segment_id)));
 
 	/* A BIND delta cannot reconstruct a missing segment header/generation. */
 	fd = cluster_undo_redo_open_segment(instance, segment_id, path, false);
 	if (fd < 0)
 		ereport(PANIC,
 				(errcode_for_file_access(),
-				 errmsg("could not open undo segment file \"%s\" for TT ACTIVE redo: %m",
-						path)));
+				 errmsg("could not open undo segment file \"%s\" for TT ACTIVE redo: %m", path)));
 	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
 	if (nread != BLCKSZ) {
 		int save_errno = errno;
@@ -886,22 +879,21 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id,
 		close(fd);
 		errno = save_errno;
 		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not read undo segment header \"%s\" for TT ACTIVE redo: read %zd of %d bytes",
-						path, nread, BLCKSZ)));
+				(errcode_for_file_access(), errmsg("could not read undo segment header \"%s\" for "
+												   "TT ACTIVE redo: read %zd of %d bytes",
+												   path, nread, BLCKSZ)));
 	}
 	if (header->segment_id != segment_id || header->owner_instance != instance
 		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT) {
 		close(fd);
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("undo segment \"%s\" identity mismatch during TT ACTIVE redo",
-						path)));
+				 errmsg("undo segment \"%s\" identity mismatch during TT ACTIVE redo", path)));
 	}
 
 	predecessor = &header->tt_slots[slot_offset];
-	decision = cluster_tt_active_transition_decide(
-		predecessor, header->wrap_count, segment_generation, xid, wrap, true);
+	decision = cluster_tt_active_transition_decide(predecessor, header->wrap_count,
+												   segment_generation, xid, wrap, true);
 	switch (decision) {
 	case CLUSTER_TT_ACTIVE_STALE:
 		cluster_vis_bump_recovery_undo_redo_skips();
@@ -916,17 +908,15 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id,
 		successor.commit_scn = InvalidScn;
 		successor.first_undo_block = InvalidUbaVal;
 		offset = (uint32)offsetof(UndoSegmentHeaderData, tt_slots)
-			+ (uint32)slot_offset * (uint32)sizeof(TTSlot);
-		if (pg_pwrite(fd, &successor, sizeof(successor), (off_t)offset)
-			!= sizeof(successor)) {
+				 + (uint32)slot_offset * (uint32)sizeof(TTSlot);
+		if (pg_pwrite(fd, &successor, sizeof(successor), (off_t)offset) != sizeof(successor)) {
 			int save_errno = errno;
 
 			close(fd);
 			errno = save_errno;
 			ereport(PANIC,
 					(errcode_for_file_access(),
-					 errmsg("could not write undo segment \"%s\" TT ACTIVE slot: %m",
-							path)));
+					 errmsg("could not write undo segment \"%s\" TT ACTIVE slot: %m", path)));
 		}
 		if (pg_fsync(fd) != 0) {
 			int save_errno = errno;
@@ -935,8 +925,7 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id,
 			errno = save_errno;
 			ereport(PANIC,
 					(errcode_for_file_access(),
-					 errmsg("could not fsync undo segment \"%s\" after TT ACTIVE redo: %m",
-							path)));
+					 errmsg("could not fsync undo segment \"%s\" after TT ACTIVE redo: %m", path)));
 		}
 		cluster_vis_bump_recovery_undo_redo_applies();
 		break;
@@ -944,19 +933,18 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id,
 	case CLUSTER_TT_ACTIVE_CORRUPT:
 	default:
 		close(fd);
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("undo segment \"%s\" has conflicting TT ACTIVE predecessor",
-						path),
-				 errdetail("segment_generation=%u disk_generation=%u slot=%u wrap=%u xid=%u decision=%d",
-						   segment_generation, header->wrap_count, slot_offset,
-						   wrap, xid, (int)decision)));
+		ereport(
+			PANIC,
+			(errcode(ERRCODE_DATA_CORRUPTED),
+			 errmsg("undo segment \"%s\" has conflicting TT ACTIVE predecessor", path),
+			 errdetail(
+				 "segment_generation=%u disk_generation=%u slot=%u wrap=%u xid=%u decision=%d",
+				 segment_generation, header->wrap_count, slot_offset, wrap, xid, (int)decision)));
 	}
 
 	if (close(fd) != 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not close undo segment file \"%s\": %m", path)));
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not close undo segment file \"%s\": %m", path)));
 }
 
 /*
@@ -1092,8 +1080,7 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 
 void
 cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
-										 uint32 segment_generation,
-										 uint16 slot_offset, uint16 wrap,
+										 uint32 segment_generation, uint16 slot_offset, uint16 wrap,
 										 TransactionId xid, SCN commit_scn)
 {
 	char path[MAXPGPATH];
@@ -1104,51 +1091,44 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 	ClusterTTTerminalTransitionDecision decision;
 	ssize_t nread;
 
-	if (instance == 0 || segment_id == 0
-		|| segment_generation == UINT32_MAX
-		|| slot_offset >= TT_SLOTS_PER_SEGMENT
-		|| wrap == TT_WRAP_INVALID || !TransactionIdIsNormal(xid)
-		|| !SCN_VALID(commit_scn))
+	if (instance == 0 || segment_id == 0 || segment_generation == UINT32_MAX
+		|| slot_offset >= TT_SLOTS_PER_SEGMENT || wrap == TT_WRAP_INVALID
+		|| !TransactionIdIsNormal(xid) || !SCN_VALID(commit_scn))
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid exact canonical TT commit redo identity")));
+	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance), instance, segment_id, path,
+								sizeof(path))
+		!= 0)
 		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid exact canonical TT commit redo identity")));
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance),
-			instance, segment_id, path, sizeof(path)) != 0)
-		ereport(PANIC,
-				(errmsg("undo segment path too long: instance=%u seg=%u",
-						instance, segment_id)));
+				(errmsg("undo segment path too long: instance=%u seg=%u", instance, segment_id)));
 
 	fd = cluster_undo_redo_open_segment(instance, segment_id, path, false);
 	if (fd < 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not open undo segment file \"%s\" for exact TT commit redo: %m",
-						path)));
+		ereport(
+			PANIC,
+			(errcode_for_file_access(),
+			 errmsg("could not open undo segment file \"%s\" for exact TT commit redo: %m", path)));
 	nread = pg_pread(fd, blockbuf.data, BLCKSZ, 0);
 	if (nread != BLCKSZ) {
 		int save_errno = errno;
 
 		close(fd);
 		errno = save_errno;
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
-						path, nread, BLCKSZ)));
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not read undo segment header \"%s\": read %zd of %d bytes",
+							   path, nread, BLCKSZ)));
 	}
 	header = (UndoSegmentHeaderData *)blockbuf.data;
-	if (header->segment_id != segment_id
-		|| header->owner_instance != instance
+	if (header->segment_id != segment_id || header->owner_instance != instance
 		|| header->tt_slots_count != TT_SLOTS_PER_SEGMENT) {
 		close(fd);
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("undo segment \"%s\" has conflicting exact TT commit header",
-						path)));
+				 errmsg("undo segment \"%s\" has conflicting exact TT commit header", path)));
 	}
 	slot = &header->tt_slots[slot_offset];
-	decision = cluster_tt_terminal_transition_decide(
-		slot, header->wrap_count, segment_generation, xid, wrap,
-		TT_SLOT_COMMITTED, commit_scn);
+	decision = cluster_tt_terminal_transition_decide(slot, header->wrap_count, segment_generation,
+													 xid, wrap, TT_SLOT_COMMITTED, commit_scn);
 	if (decision == CLUSTER_TT_TERMINAL_STALE) {
 		cluster_vis_bump_recovery_undo_redo_skips();
 	} else if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT) {
@@ -1166,10 +1146,12 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 
 			close(fd);
 			errno = save_errno;
-			ereport(PANIC,
-					(errcode_for_file_access(),
-					 errmsg("could not write undo segment \"%s\" exact TT commit: wrote %zd of %d bytes",
-							path, written, BLCKSZ)));
+			ereport(
+				PANIC,
+				(errcode_for_file_access(),
+				 errmsg(
+					 "could not write undo segment \"%s\" exact TT commit: wrote %zd of %d bytes",
+					 path, written, BLCKSZ)));
 		}
 		if (pg_fsync(fd) != 0) {
 			int save_errno = errno;
@@ -1187,16 +1169,14 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 		close(fd);
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("undo segment \"%s\" has conflicting exact TT commit predecessor",
-						path),
+				 errmsg("undo segment \"%s\" has conflicting exact TT commit predecessor", path),
 				 errdetail("generation=%u disk_generation=%u slot=%u wrap=%u xid=%u decision=%d",
-						   segment_generation, header->wrap_count, slot_offset,
-						   wrap, xid, (int)decision)));
+						   segment_generation, header->wrap_count, slot_offset, wrap, xid,
+						   (int)decision)));
 	}
 	if (close(fd) != 0)
-		ereport(PANIC,
-				(errcode_for_file_access(),
-				 errmsg("could not close undo segment file \"%s\": %m", path)));
+		ereport(PANIC, (errcode_for_file_access(),
+						errmsg("could not close undo segment file \"%s\": %m", path)));
 }
 
 /*
@@ -1207,9 +1187,8 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 static void
 cluster_undo_redo_tt_slot_commit(const ClusterUndoDecoded *decoded)
 {
-	cluster_tt_durable_redo_stamp_slot(decoded->instance, decoded->segment_id,
-		decoded->slot_offset, decoded->wrap, decoded->xid,
-		decoded->commit_scn);
+	cluster_tt_durable_redo_stamp_slot(decoded->instance, decoded->segment_id, decoded->slot_offset,
+									   decoded->wrap, decoded->xid, decoded->commit_scn);
 }
 
 
@@ -1223,15 +1202,14 @@ cluster_undo_redo_tt_slot_commit(const ClusterUndoDecoded *decoded)
 static void
 cluster_undo_redo_tt_slot_abort(const ClusterUndoDecoded *decoded)
 {
-	if (decoded->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION)
-	{
-		cluster_tt_durable_redo_abort_slot_exact(decoded->instance,
-			decoded->segment_id, decoded->expected_generation,
-			decoded->slot_offset, decoded->wrap, decoded->xid);
+	if (decoded->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
+		cluster_tt_durable_redo_abort_slot_exact(decoded->instance, decoded->segment_id,
+												 decoded->expected_generation, decoded->slot_offset,
+												 decoded->wrap, decoded->xid);
 		return;
 	}
-	cluster_tt_durable_redo_abort_slot(decoded->instance, decoded->segment_id,
-		decoded->slot_offset, decoded->wrap, decoded->xid);
+	cluster_tt_durable_redo_abort_slot(decoded->instance, decoded->segment_id, decoded->slot_offset,
+									   decoded->wrap, decoded->xid);
 }
 
 
@@ -1249,9 +1227,9 @@ cluster_undo_redo_tt_slot_abort(const ClusterUndoDecoded *decoded)
 static void
 cluster_undo_redo_tt_slot_set_head(const ClusterUndoDecoded *decoded)
 {
-	cluster_tt_durable_redo_set_head_slot(decoded->instance,
-		decoded->segment_id, decoded->slot_offset, decoded->wrap,
-		decoded->xid, decoded->first_undo_block);
+	cluster_tt_durable_redo_set_head_slot(decoded->instance, decoded->segment_id,
+										  decoded->slot_offset, decoded->wrap, decoded->xid,
+										  decoded->first_undo_block);
 }
 
 /* Replay the exact CTRC release certificate without consulting live
@@ -1271,13 +1249,11 @@ cluster_undo_redo_tt_ctrc_release(const ClusterUndoDecoded *decoded)
 	record.root_id = decoded->root_id;
 	record.root_generation = decoded->root_generation;
 	record.formation_epoch = decoded->formation_epoch;
-	record.admission_record_generation
-		= decoded->admission_record_generation;
+	record.admission_record_generation = decoded->admission_record_generation;
 	record.seal_generation = decoded->seal_generation;
 	record.touched_nodes_low = decoded->touched_nodes_low;
 	record.touched_nodes_high = decoded->touched_nodes_high;
-	memcpy(record.ack_set_digest, decoded->ack_set_digest,
-		sizeof(record.ack_set_digest));
+	memcpy(record.ack_set_digest, decoded->ack_set_digest, sizeof(record.ack_set_digest));
 	record.slot_offset = decoded->slot_offset;
 	record.slot_wrap = decoded->wrap;
 	record.owner_instance = decoded->instance;
@@ -1285,9 +1261,8 @@ cluster_undo_redo_tt_ctrc_release(const ClusterUndoDecoded *decoded)
 	record.format_version = decoded->format_version;
 	record.flags = decoded->flags;
 	if (!cluster_undo_tt_ctrc_release_valid(&record))
-		ereport(PANIC,
-				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid decoded TT CTRC release certificate")));
+		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
+						errmsg("invalid decoded TT CTRC release certificate")));
 	cluster_tt_durable_redo_ctrc_release_slot_exact(&record);
 }
 
@@ -1826,21 +1801,20 @@ cluster_undo_redo(XLogReaderState *record)
 	 * the separate canonical shared SPACE ABI is approved.
 	 */
 	memset(&decoded, 0, sizeof(decoded));
-	if (!cluster_undo_decode(record, &decoded) ||
-		 decoded.opcode != info || !cluster_undo_preflight(&decoded))
+	if (!cluster_undo_decode(record, &decoded) || decoded.opcode != info
+		|| !cluster_undo_preflight(&decoded))
 		ereport(PANIC,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("invalid cluster undo record %u during shared decode preflight",
-					 info)));
+				 errmsg("invalid cluster undo record %u during shared decode preflight", info)));
 
 	switch (info) {
 	case XLOG_UNDO_SEGMENT_INIT:
 		cluster_undo_redo_segment_init(record);
 		break;
 	case XLOG_UNDO_TT_SLOT_BIND:
-		cluster_tt_durable_redo_bind_slot(decoded.instance,
-			decoded.segment_id, decoded.expected_generation,
-			decoded.slot_offset, decoded.wrap, decoded.xid);
+		cluster_tt_durable_redo_bind_slot(decoded.instance, decoded.segment_id,
+										  decoded.expected_generation, decoded.slot_offset,
+										  decoded.wrap, decoded.xid);
 		break;
 	case XLOG_UNDO_TT_SLOT_COMMIT:
 		cluster_undo_redo_tt_slot_commit(&decoded);

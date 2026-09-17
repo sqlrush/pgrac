@@ -62,7 +62,7 @@
 #include "cluster/cluster_multixact_current.h"
 #include "cluster/cluster_runtime_visibility.h" /* ClusterLiveAuthority (spec-6.12i) */
 #include "cluster/cluster_semantic_activation.h"
-#include "cluster/cluster_tt_durable.h" /* ClusterTTDurableResolve */
+#include "cluster/cluster_tt_durable.h"	  /* ClusterTTDurableResolve */
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22d D4-6) */
 
 /* Split verdict for the server-side construction (see banner). */
@@ -126,34 +126,35 @@ extern bool cluster_cr_server_live_binding_exact(bool xid_is_mine, uint32 expect
  * carrier/window doubt remain UNKNOWN_FAIL_CLOSED.
  */
 extern ClusterUndoVerdictKind cluster_cr_server_c0_zero_match_verdict(
-	bool authoritative, bool xid_is_mine, uint32 expected_segment_id,
-	uint32 expected_tt_slot_id, bool no_raw_reuse_window, bool clog_is_committed,
-	bool clog_is_aborted, bool clog_is_in_progress, bool xid_is_in_progress);
+	bool authoritative, bool xid_is_mine, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	bool no_raw_reuse_window, bool clog_is_committed, bool clog_is_aborted,
+	bool clog_is_in_progress, bool xid_is_in_progress);
 
 /* S8-815PRE-FRESHREF-C1B-01: pure exact-pair conjunction.  This classifier
  * can return only COMMITTED_EXACT or UNKNOWN_FAIL_CLOSED; the existing
  * COMMITTED_BOUND contract is intentionally unreachable here. */
 extern ClusterUndoVerdictKind cluster_cr_server_freshref_c1b_pair_verdict(
-	bool pair_request, bool xid_is_mine, uint32 expected_segment_id,
-	uint32 expected_tt_slot_id, bool no_raw_reuse_window, int raw_clog_status,
-	ClusterTTDurableResolve resolve, uint16 matched_segment, uint16 matched_slot,
-	SCN resolved_scn, SCN proposed_scn, bool retention_ok, SCN horizon_scn);
+	bool pair_request, bool xid_is_mine, uint32 expected_segment_id, uint32 expected_tt_slot_id,
+	bool no_raw_reuse_window, int raw_clog_status, ClusterTTDurableResolve resolve,
+	uint16 matched_segment, uint16 matched_slot, SCN resolved_scn, SCN proposed_scn,
+	bool retention_ok, SCN horizon_scn);
 extern bool cluster_cr_server_freshref_c1b_pair_request_decode(
-	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node,
-	int32 local_node, uint64 current_epoch, int max_backends,
-	uint32 *segment_id, TransactionId *xid, uint32 *expected_tt_slot_id,
-	SCN *proposed_scn);
-extern bool cluster_cr_server_local_freshref_c1b_pair_exact(
-	TransactionId xid, uint32 expected_segment_id,
-	uint32 expected_tt_slot_id, SCN proposed_scn, uint16 *out_wrap);
+	const GcsBlockForwardPayload *fwd, int32 authenticated_source_node, int32 local_node,
+	uint64 current_epoch, int max_backends, uint32 *segment_id, TransactionId *xid,
+	uint32 *expected_tt_slot_id, SCN *proposed_scn);
+extern bool cluster_cr_server_local_freshref_c1b_pair_exact(TransactionId xid,
+															uint32 expected_segment_id,
+															uint32 expected_tt_slot_id,
+															SCN proposed_scn, uint16 *out_wrap);
 
 #ifdef USE_CLUSTER_UNIT
-extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(
-	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
-	bool authoritative);
-extern ClusterUndoVerdictResult cluster_cr_server_test_own_xid_pair_verdict(
-	TransactionId xid, uint32 expected_segment_id, uint32 expected_tt_slot_id,
-	SCN proposed_scn);
+extern ClusterUndoVerdictKind cluster_cr_server_test_own_xid_verdict(TransactionId xid,
+																	 uint32 expected_segment_id,
+																	 uint32 expected_tt_slot_id,
+																	 bool authoritative);
+extern ClusterUndoVerdictResult
+cluster_cr_server_test_own_xid_pair_verdict(TransactionId xid, uint32 expected_segment_id,
+											uint32 expected_tt_slot_id, SCN proposed_scn);
 #endif
 
 /*
@@ -197,9 +198,9 @@ typedef enum ClusterLmsCrSlotState {
 
 /* Work-slot request kind (spec-6.12i extends the wave-b CR-only table). */
 typedef enum ClusterLmsCrSlotKind {
-	CLUSTER_LMS_SLOT_KIND_CR = 0,				 /* spec-6.12b CR construction */
-	CLUSTER_LMS_SLOT_KIND_UNDO_FETCH = 1,		 /* spec-6.12i undo-TT block fetch */
-	CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT = 2,		 /* spec-6.12i D-i4 complete-scan verdict */
+	CLUSTER_LMS_SLOT_KIND_CR = 0,				  /* spec-6.12b CR construction */
+	CLUSTER_LMS_SLOT_KIND_UNDO_FETCH = 1,		  /* spec-6.12i undo-TT block fetch */
+	CLUSTER_LMS_SLOT_KIND_UNDO_VERDICT = 2,		  /* spec-6.12i D-i4 complete-scan verdict */
 	CLUSTER_LMS_SLOT_KIND_UNDO_MULTI_VERDICT = 3, /* spec-7.1 D3-b multi member verdict */
 	CLUSTER_LMS_SLOT_KIND_R4_CR_BUILD = 4
 } ClusterLmsCrSlotKind;
@@ -243,18 +244,15 @@ StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, edge_owner_incarnation) == 0,
 				 "R4 owner edge-incarnation offset");
 StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, builder_incarnation) == 8,
 				 "R4 owner builder-incarnation offset");
-StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, edge_owner_pid) == 16,
-				 "R4 owner edge-pid offset");
-StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, builder_pid) == 20,
-				 "R4 owner builder-pid offset");
+StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, edge_owner_pid) == 16, "R4 owner edge-pid offset");
+StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, builder_pid) == 20, "R4 owner builder-pid offset");
 StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, edge_owner_worker_id) == 24,
 				 "R4 owner edge-worker offset");
 StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, builder_worker_id) == 25,
 				 "R4 owner builder-worker offset");
 StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, edge_owner_role) == 26,
 				 "R4 owner edge-role offset");
-StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, reserved) == 27,
-				 "R4 owner reserved offset");
+StaticAssertDecl(offsetof(ClusterR4CrOwnerStamp, reserved) == 27, "R4 owner reserved offset");
 StaticAssertDecl(sizeof(ClusterR4CrOwnerStamp) == 32,
 				 "R4 owner stamp must remain exactly 32 bytes");
 
@@ -287,8 +285,7 @@ typedef struct ClusterR4CrSlotExtension {
 
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, route_proof) == 0,
 				 "R4 slot route-proof offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, owner) == 80,
-				 "R4 slot owner-stamp offset");
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, owner) == 80, "R4 slot owner-stamp offset");
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, slot_generation) == 112,
 				 "R4 slot generation offset");
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_request_id) == 120,
@@ -329,16 +326,13 @@ StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, foreign_row_offset) == 226,
 				 "R4 slot foreign-row offset");
 StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, terminal_reason) == 228,
 				 "R4 slot terminal-reason offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, flags) == 229,
-				 "R4 slot flags offset");
-StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, reserved) == 230,
-				 "R4 slot reserved offset");
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, flags) == 229, "R4 slot flags offset");
+StaticAssertDecl(offsetof(ClusterR4CrSlotExtension, reserved) == 230, "R4 slot reserved offset");
 StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) == 256,
 				 "R4 slot extension must remain exactly 256 bytes");
 StaticAssertDecl(MAXALIGN(sizeof(ClusterR4CrSlotExtension)) == 256,
 				 "R4 slot extension must add no alignment padding");
-StaticAssertDecl(MAXALIGN(BLCKSZ) == BLCKSZ,
-				 "R4 foreign page must add no alignment padding");
+StaticAssertDecl(MAXALIGN(BLCKSZ) == BLCKSZ, "R4 foreign page must add no alignment padding");
 
 typedef struct ClusterLmsCrSlot {
 	pg_atomic_uint32 state;	 /* ClusterLmsCrSlotState */
@@ -389,14 +383,12 @@ typedef struct ClusterLmsCrSlot {
 
 StaticAssertDecl(sizeof(((ClusterLmsCrSlot *)0)->result_page) == BLCKSZ,
 				 "legacy result_page must remain one block");
-StaticAssertDecl(offsetof(ClusterLmsCrSlot, r4)
-					 == offsetof(ClusterLmsCrSlot, result_page) + BLCKSZ,
+StaticAssertDecl(offsetof(ClusterLmsCrSlot, r4) == offsetof(ClusterLmsCrSlot, result_page) + BLCKSZ,
 				 "R4 metadata must immediately follow legacy result_page");
 StaticAssertDecl(offsetof(ClusterLmsCrSlot, foreign_undo_page)
 					 == offsetof(ClusterLmsCrSlot, r4) + 256,
 				 "R4 foreign scratch must immediately follow metadata");
-StaticAssertDecl(sizeof(ClusterLmsCrSlot)
-					 == offsetof(ClusterLmsCrSlot, r4) + 256 + BLCKSZ,
+StaticAssertDecl(sizeof(ClusterLmsCrSlot) == offsetof(ClusterLmsCrSlot, r4) + 256 + BLCKSZ,
 				 "R4 slot increment must remain exactly 8448 bytes");
 StaticAssertDecl(sizeof(ClusterR4CrSlotExtension) + BLCKSZ == 8448,
 				 "R4 per-slot increment must remain exactly 8448 bytes");
@@ -426,15 +418,15 @@ extern void cluster_cr_server_stat_bump(ClusterCrServerStat which);
 extern void cluster_cr_construct_page_for_server(const char *cur_page, SCN read_scn, BufferTag tag,
 												 char *dst_page, bool *out_partial);
 extern ClusterCrBuildResult cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn,
-										char dst[BLCKSZ],
-										ClusterCrBuildReason *reason_out);
+													   char dst[BLCKSZ],
+													   ClusterCrBuildReason *reason_out);
 
 /* TARGET-only requester CR entry.  SOURCE retains its private historical
  * bool/PARTIAL path; this ABI exposes the closed R4 result/reason domains and
  * copies a page to dst only after a positive final TARGET recheck. */
-extern ClusterCrBuildResult cluster_gcs_block_cr_fetch_and_wait(
-	BufferTag tag, SCN read_scn, char dst[BLCKSZ],
-	ClusterCrBuildReason *reason_out);
+extern ClusterCrBuildResult cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
+																char dst[BLCKSZ],
+																ClusterCrBuildReason *reason_out);
 
 /* Shmem region registration (cluster_shmem.c registry). */
 extern void cluster_cr_server_shmem_register(void);
@@ -454,19 +446,19 @@ extern bool cluster_lms_cr_submit(const GcsBlockForwardPayload *fwd);
  * copy, clear, transfer or leave it.  FULL/NONE means the immutable holder
  * work was published, not that a finished CR page already exists.
  */
-extern ClusterCrBuildResult cluster_lms_cr_submit_r4(
-	const ClusterR4CrForwardPayload *forward,
-	const ClusterSemanticAdmissionToken *receive_admission,
-	uint32 requester_capability_generation,
-	uint32 master_capability_generation,
-	ClusterCrBuildReason *reason_out);
+extern ClusterCrBuildResult
+cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
+						 const ClusterSemanticAdmissionToken *receive_admission,
+						 uint32 requester_capability_generation,
+						 uint32 master_capability_generation, ClusterCrBuildReason *reason_out);
 
 /* Worker-0 endpoint for one already authenticated status-24 foreign undo
  * response.  The caller retains every input; true means the exact correlated
  * R4 slot release-published UNDO_READY. */
-extern bool cluster_cr_server_r4_land_foreign_undo(
-	const ClusterICEnvelope *env, const GcsBlockReplyHeader *header,
-	const char undo_page[BLCKSZ], const ClusterGcsUndoAuthTrailer *undo_auth);
+extern bool cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
+												   const GcsBlockReplyHeader *header,
+												   const char undo_page[BLCKSZ],
+												   const ClusterGcsUndoAuthTrailer *undo_auth);
 
 /* Worker-0 process-local half of the D4 close proof: every retained build
  * context is canonical empty and no terminal/SHIPPING positive edge remains.
@@ -474,22 +466,22 @@ extern bool cluster_cr_server_r4_land_foreign_undo(
 extern bool cluster_cr_server_r4_worker0_drained(void);
 
 /* LMON-only recovery after the exact current worker0 drain ACK. */
-extern bool cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation,
-												 uint64 generation);
+extern bool cluster_cr_server_r4_lmon_reclaim_closed(uint64 worker_incarnation, uint64 generation);
 
 #ifdef USE_CLUSTER_UNIT
 extern bool cluster_cr_server_test_reserve_legacy_slot(ClusterLmsCrSlot *slot,
-											uint32 reserved_state);
+													   uint32 reserved_state);
 extern bool cluster_cr_server_test_r4_claim_queued(uint32 slot_index);
 extern bool cluster_cr_server_test_r4_build_step(uint32 slot_index);
 extern bool cluster_cr_server_test_r4_send_foreign_undo(uint32 slot_index);
-extern bool cluster_cr_server_test_r4_freeze_foreign_generation(
-	uint32 slot_index, uint32 physical_generation);
+extern bool cluster_cr_server_test_r4_freeze_foreign_generation(uint32 slot_index,
+																uint32 physical_generation);
 extern bool cluster_cr_server_test_r4_ship_terminal(uint32 slot_index);
 extern void cluster_cr_server_test_r4_reset_contexts(void);
-extern bool cluster_cr_server_test_r4_context_matches(
-	uint32 slot_index, bool expect_present, uint64 slot_generation,
-	uint64 builder_incarnation, const ClusterSemanticAdmissionToken *admission);
+extern bool
+cluster_cr_server_test_r4_context_matches(uint32 slot_index, bool expect_present,
+										  uint64 slot_generation, uint64 builder_incarnation,
+										  const ClusterSemanticAdmissionToken *admission);
 #endif
 
 /* LMON dispatch side (spec-6.12i D-i1): park a validated undo-TT fetch
@@ -544,27 +536,24 @@ extern void cluster_lms_cr_ship_ready(void);
  * ships exactly one reply, so the caller does not itself reply on refusal.
  */
 extern void cluster_gcs_block_forward_serve_inline(const GcsBlockForwardPayload *fwd,
-											   ClusterLmsCrSlotKind kind);
+												   ClusterLmsCrSlotKind kind);
 extern ClusterMxDescribeResult cluster_gcs_current_mx_describe_fetch_and_wait(
 	int32 origin_node, const ClusterCurrentMxKey *key, ClusterCurrentMxMemberDesc *members,
 	uint16 members_cap, uint16 *members_count, uint32 *reported_total_members);
-extern void cluster_gcs_current_mx_describe_serve_inline(
-	const struct ClusterICEnvelope *env, const void *payload);
+extern void cluster_gcs_current_mx_describe_serve_inline(const struct ClusterICEnvelope *env,
+														 const void *payload);
 struct ClusterCurrentMxProofForwardV2;
-extern void cluster_gcs_current_mx_member_proof_serve_inline(
-	const struct ClusterICEnvelope *env, const void *payload);
+extern void cluster_gcs_current_mx_member_proof_serve_inline(const struct ClusterICEnvelope *env,
+															 const void *payload);
 struct ClusterCurrentMxProofReplyPage;
 extern ClusterMxResolveResult cluster_cr_server_current_mx_build_proof_page(
-	uint16 source_node_id,
-	const struct ClusterCurrentMxProofForwardV2 *request,
+	uint16 source_node_id, const struct ClusterCurrentMxProofForwardV2 *request,
 	ClusterMxResolveResult result, uint32 requester_capability_generation,
-	const ClusterCurrentMemberProof *proofs,
-	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
-	struct ClusterCurrentMxProofReplyPage *page);
+	const ClusterCurrentMemberProof *proofs, uint16 proof_count,
+	const ClusterCurrentUpdaterProof *updater_proof, struct ClusterCurrentMxProofReplyPage *page);
 #ifdef USE_CLUSTER_UNIT
 struct ClusterCurrentMxDescribeReplyPage;
-extern ClusterMxDescribeResult
-cluster_cr_server_test_current_mx_build_describe_page(
+extern ClusterMxDescribeResult cluster_cr_server_test_current_mx_build_describe_page(
 	uint16 source_node_id, uint64 request_id, const ClusterCurrentMxKey *key,
 	const MultiXactMember *native_members, int native_count,
 	struct ClusterCurrentMxDescribeReplyPage *page);
@@ -572,17 +561,14 @@ cluster_cr_server_test_current_mx_build_describe_page(
 extern ClusterMxResolveResult cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	int32 origin_node, struct ClusterCurrentMxProofForwardV2 *request,
 	ClusterCurrentMemberProof *proofs, uint16 proofs_cap, uint16 *proof_count,
-	ClusterCurrentUpdaterProof *updater_proof,
-	uint32 *requester_capability_generation_out, TimestampTz deadline);
+	ClusterCurrentUpdaterProof *updater_proof, uint32 *requester_capability_generation_out,
+	TimestampTz deadline);
 #ifdef USE_CLUSTER_UNIT
-extern ClusterMxResolveResult
-cluster_cr_server_test_current_mx_build_proof_page(
-	uint16 source_node_id,
-	const struct ClusterCurrentMxProofForwardV2 *request,
+extern ClusterMxResolveResult cluster_cr_server_test_current_mx_build_proof_page(
+	uint16 source_node_id, const struct ClusterCurrentMxProofForwardV2 *request,
 	ClusterMxResolveResult result, uint32 requester_capability_generation,
-	const ClusterCurrentMemberProof *proofs,
-	uint16 proof_count, const ClusterCurrentUpdaterProof *updater_proof,
-	struct ClusterCurrentMxProofReplyPage *page);
+	const ClusterCurrentMemberProof *proofs, uint16 proof_count,
+	const ClusterCurrentUpdaterProof *updater_proof, struct ClusterCurrentMxProofReplyPage *page);
 #endif
 
 typedef enum ClusterR4SourceCrOp { CLUSTER_R4_SOURCE_CR_FETCH = 0 } ClusterR4SourceCrOp;
@@ -632,9 +618,9 @@ extern bool cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uin
 														  ClusterGcsUndoVerdictPage *verdict_out,
 														  ClusterLiveAuthority *auth_out);
 extern bool cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
-	int32 origin_node, uint32 segment_id, uint32 expected_tt_slot_id,
-	TransactionId xid, uint32 ref_epoch, SCN proposed_scn,
-	ClusterGcsUndoVerdictPage *verdict_out, ClusterLiveAuthority *auth_out);
+	int32 origin_node, uint32 segment_id, uint32 expected_tt_slot_id, TransactionId xid,
+	uint32 ref_epoch, SCN proposed_scn, ClusterGcsUndoVerdictPage *verdict_out,
+	ClusterLiveAuthority *auth_out);
 
 /* Requester side (backend, spec-5.22d D4-6): ask the elected serve AUTHORITY
  * (a live survivor — NOT the dead owner) for a block0-proven verdict on the

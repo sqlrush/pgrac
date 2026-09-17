@@ -15,11 +15,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-	int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name,
-		line_number);
+	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -49,17 +47,16 @@ cluster_thread_recovery_authority_revalidate_nowait_v1(
 	const ClusterThreadRecoveryAuthorityV1 *authority)
 {
 	authority_revalidations++;
-	return authority != NULL && authority_current ?
-		CLUSTER_THREAD_AUTHORITY_OK : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
+	return authority != NULL && authority_current ? CLUSTER_THREAD_AUTHORITY_OK
+												  : CLUSTER_THREAD_AUTHORITY_ROOT_STALE;
 }
 
 bool
 cluster_thread_recovery_authority_covers_window_v1(
-	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 dead_thread,
-	XLogRecPtr scan_begin, XLogRecPtr scan_end)
+	const ClusterThreadRecoveryAuthorityV1 *authority, uint16 dead_thread, XLogRecPtr scan_begin,
+	XLogRecPtr scan_end)
 {
-	return authority != NULL && dead_thread == 2 && scan_begin == 0x100 &&
-		scan_end == 0x200;
+	return authority != NULL && dead_thread == 2 && scan_begin == 0x100 && scan_end == 0x200;
 }
 
 XLogReaderState *
@@ -114,45 +111,40 @@ cluster_thread_recovery_fabric_plan_create_v1(
 
 	UT_ASSERT(request != NULL && out_plan != NULL);
 	UT_ASSERT_EQ(request->system_identifier, 99);
-	UT_ASSERT(request->storage_uuid[0] == 3 && request->participant_count == 1 &&
-		request->retention_binding_cookie != 0 && !request->space_active);
+	UT_ASSERT(request->storage_uuid[0] == 3 && request->participant_count == 1
+			  && request->retention_binding_cookie != 0 && !request->space_active);
 	cut = request->physical_cuts;
-	UT_ASSERT(cut != NULL && cut->failed_thread == 2 &&
-		cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE && cut->timeline_id == 7 &&
-		cut->scan_begin_inclusive == 0x100 &&
-		cut->scan_end_exclusive == 0x200);
+	UT_ASSERT(cut != NULL && cut->failed_thread == 2 && cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE
+			  && cut->timeline_id == 7 && cut->scan_begin_inclusive == 0x100
+			  && cut->scan_end_exclusive == 0x200);
 	plan_create_count++;
-	*out_plan = (ClusterThreadRecoveryFabricPlanV1 *) &fabric_object;
+	*out_plan = (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1
-cluster_thread_recovery_fabric_plan_feed_record_v1(
-	ClusterThreadRecoveryFabricPlanV1 *plan, XLogReaderState *state,
-	uint16 participant_index)
+cluster_thread_recovery_fabric_plan_feed_record_v1(ClusterThreadRecoveryFabricPlanV1 *plan,
+												   XLogReaderState *state, uint16 participant_index)
 {
-	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *) &fabric_object &&
-		state == &reader && state->seg.ws_tli == 7 && participant_index == 0);
+	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object && state == &reader
+			  && state->seg.ws_tli == 7 && participant_index == 0);
 	plan_feed_count++;
-	return plan_feed_count == feed_fail_at ?
-		RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED : RF_PAGE_PROOF_DETAIL_OK;
+	return plan_feed_count == feed_fail_at ? RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED
+										   : RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1
-cluster_thread_recovery_fabric_plan_seal_v1(
-	ClusterThreadRecoveryFabricPlanV1 *plan)
+cluster_thread_recovery_fabric_plan_seal_v1(ClusterThreadRecoveryFabricPlanV1 *plan)
 {
-	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *) &fabric_object);
+	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object);
 	plan_seal_count++;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 void
-cluster_thread_recovery_fabric_plan_destroy_v1(
-	ClusterThreadRecoveryFabricPlanV1 **plan)
+cluster_thread_recovery_fabric_plan_destroy_v1(ClusterThreadRecoveryFabricPlanV1 **plan)
 {
-	UT_ASSERT(plan != NULL &&
-		*plan == (ClusterThreadRecoveryFabricPlanV1 *) &fabric_object);
+	UT_ASSERT(plan != NULL && *plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object);
 	plan_destroy_count++;
 	*plan = NULL;
 }
@@ -176,8 +168,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	root.validated_tail_lsn_exclusive = 0x200;
 	authority->duty = &duty;
 	authority->root_snapshot = &root;
-	authority->retention_pin =
-		(ClusterWalRetentionPin *) &retention_pin_object;
+	authority->retention_pin = (ClusterWalRetentionPin *)&retention_pin_object;
 	record_begin[0] = 0x100;
 	record_end[0] = 0x140;
 	record_begin[1] = 0x140;
@@ -199,10 +190,10 @@ UT_TEST(test_scans_exact_root_cut_and_seals_only_at_upper_boundary)
 	uint64 records = 0;
 
 	init_case(&authority);
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x100,
-		0x200, &authority, false, &plan, &records),
-		RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *) &fabric_object);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x100, 0x200, &authority, false,
+															 &plan, &records),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object);
 	UT_ASSERT_EQ(records, 2);
 	UT_ASSERT_EQ(begin_read_lsn, 0x100);
 	UT_ASSERT(authority_revalidations >= 2);
@@ -222,9 +213,9 @@ UT_TEST(test_early_end_destroys_unsealed_plan)
 
 	init_case(&authority);
 	record_count = 1;
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x100,
-		0x200, &authority, false, &plan, &records),
-		RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x100, 0x200, &authority, false,
+															 &plan, &records),
+				 RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 	UT_ASSERT(plan == NULL && records == 0);
 	UT_ASSERT_EQ(plan_seal_count, 0);
 	UT_ASSERT_EQ(plan_destroy_count, 1);
@@ -239,9 +230,9 @@ UT_TEST(test_feed_failure_poisons_and_destroys_whole_plan)
 
 	init_case(&authority);
 	feed_fail_at = 2;
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x100,
-		0x200, &authority, false, &plan, &records),
-		RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x100, 0x200, &authority, false,
+															 &plan, &records),
+				 RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
 	UT_ASSERT(plan == NULL && records == 0);
 	UT_ASSERT_EQ(plan_feed_count, 2);
 	UT_ASSERT_EQ(plan_seal_count, 0);
@@ -255,9 +246,9 @@ UT_TEST(test_non_root_window_is_rejected_before_reader_or_plan)
 	uint64 records = 9;
 
 	init_case(&authority);
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x120,
-		0x200, &authority, false, &plan, &records),
-		RF_PAGE_PROOF_DETAIL_ROOT_STALE);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x120, 0x200, &authority, false,
+															 &plan, &records),
+				 RF_PAGE_PROOF_DETAIL_ROOT_STALE);
 	UT_ASSERT(plan == NULL && records == 0);
 	UT_ASSERT_EQ(reader_make_count, 0);
 	UT_ASSERT_EQ(plan_create_count, 0);

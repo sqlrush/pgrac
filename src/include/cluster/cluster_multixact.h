@@ -135,15 +135,14 @@ cluster_multixact_native_snapshot_equal(MultiXactOffset first_generation, int fi
 {
 	int i;
 
-	if (first_generation == 0 || second_generation == 0
-		|| first_generation != second_generation || first_count != second_count
-		|| first_count < 2 || first_count > 256 || first == NULL || second == NULL)
+	if (first_generation == 0 || second_generation == 0 || first_generation != second_generation
+		|| first_count != second_count || first_count < 2 || first_count > 256 || first == NULL
+		|| second == NULL)
 		return false;
 
 	for (i = 0; i < first_count; i++) {
 		if (!TransactionIdIsNormal(first[i].xid) || !TransactionIdIsNormal(second[i].xid)
-			|| first[i].status < MultiXactStatusForKeyShare
-			|| first[i].status > MaxMultiXactStatus
+			|| first[i].status < MultiXactStatusForKeyShare || first[i].status > MaxMultiXactStatus
 			|| second[i].status < MultiXactStatusForKeyShare
 			|| second[i].status > MaxMultiXactStatus || first[i].xid != second[i].xid
 			|| first[i].status != second[i].status)
@@ -214,9 +213,10 @@ typedef struct ClusterMultiXactSourceResult {
  *	Callers may consume overlay_out only when the return value is OK and
  *	the operation's fixed success field is positive.
  */
-extern ClusterSemanticAdmissionResult cluster_multixact_source_dispatch(
-	ClusterMultiXactSourceOp op, const ClusterMultiXactSourceRequest *request,
-	ClusterMultiXactSourceResult *result);
+extern ClusterSemanticAdmissionResult
+cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op,
+								  const ClusterMultiXactSourceRequest *request,
+								  ClusterMultiXactSourceResult *result);
 
 /*
  * Resolve the frozen D3-b snapshot-visibility contract under the semantic
@@ -227,25 +227,22 @@ extern ClusterSemanticAdmissionResult cluster_multixact_source_dispatch(
  * unchanged.
  */
 extern ClusterSemanticAdmissionResult
-cluster_multixact_remote_xmax_visibility_dispatch(
-	const ClusterMultiXactSourceRequest *request,
-	ClusterMultiXactSourceResult *result);
+cluster_multixact_remote_xmax_visibility_dispatch(const ClusterMultiXactSourceRequest *request,
+												  ClusterMultiXactSourceResult *result);
 
 struct ClusterSideProjectionOperationV1;
 
 /* RF-SIDE retained-redo rebuild path.  These callback-shaped APIs bypass the
  * R4 semantic-serving gate only to mutate/verify non-authoritative projection
  * metadata; they never grant terminal state, readiness or OPEN. */
-extern bool cluster_multixact_recovery_projection_apply(void *arg,
-	int origin_slot, uint32 cluster_epoch,
-	const struct ClusterSideProjectionOperationV1 *operation,
-	const uint8 *owned_payload, uint32 owned_payload_length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
-extern bool cluster_multixact_recovery_projection_verify(void *arg,
-	int origin_slot, uint32 cluster_epoch,
-	const struct ClusterSideProjectionOperationV1 *operation,
-	const uint8 *owned_payload, uint32 owned_payload_length,
-	XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+extern bool cluster_multixact_recovery_projection_apply(
+	void *arg, int origin_slot, uint32 cluster_epoch,
+	const struct ClusterSideProjectionOperationV1 *operation, const uint8 *owned_payload,
+	uint32 owned_payload_length, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
+extern bool cluster_multixact_recovery_projection_verify(
+	void *arg, int origin_slot, uint32 cluster_epoch,
+	const struct ClusterSideProjectionOperationV1 *operation, const uint8 *owned_payload,
+	uint32 owned_payload_length, XLogRecPtr source_lsn, XLogRecPtr source_end_lsn);
 
 /*
  * spec-7.1 D3-b: one multixact member's origin-SERVED terminal verdict.

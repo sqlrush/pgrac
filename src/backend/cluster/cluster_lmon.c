@@ -694,8 +694,7 @@ cluster_lmon_pid(void)
 	if (cluster_lmon_state == NULL)
 		return 0;
 	if (MyProc == NULL) {
-		if (!LWLockConditionalAcquire(&cluster_lmon_state->lwlock,
-								  LW_SHARED))
+		if (!LWLockConditionalAcquire(&cluster_lmon_state->lwlock, LW_SHARED))
 			return 0;
 	} else
 		LWLockAcquire(&cluster_lmon_state->lwlock, LW_SHARED);

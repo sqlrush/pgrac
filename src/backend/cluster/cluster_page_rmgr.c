@@ -53,40 +53,20 @@
  * is forbidden, 8.A/R11).
  */
 static const ClusterPageRmgrCensusEntry cluster_page_census_opcode[] = {
-	{
-		RM_HEAP_ID, XLOG_HEAP_INSERT, 0,
-		CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false
-	},
-	{
-		RM_HEAP_ID, XLOG_HEAP_DELETE, 0,
-		CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false
-	},
-	{
-		RM_HEAP_ID, XLOG_HEAP_UPDATE, 0,
-		CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false
-	},
-	{
-		RM_HEAP_ID, XLOG_HEAP_HOT_UPDATE, 0,
-		CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false
-	},
-	{
-		/* LOCK/CONFIRM/INPLACE: page-affecting NORMAL row, but no
+	{ RM_HEAP_ID, XLOG_HEAP_INSERT, 0, CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false },
+	{ RM_HEAP_ID, XLOG_HEAP_DELETE, 0, CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false },
+	{ RM_HEAP_ID, XLOG_HEAP_UPDATE, 0, CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false },
+	{ RM_HEAP_ID, XLOG_HEAP_HOT_UPDATE, 0, CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false },
+	{ /* LOCK/CONFIRM/INPLACE: page-affecting NORMAL row, but no
 		 * differential evidence -> never registers -> UNKNOWN at runtime. */
-		RM_HEAP_ID, XLOG_HEAP_LOCK, XLOG_HEAP_OPMASK,
-		CLUSTER_PAGE_CLASS_NORMAL, true, false, false, false
-	},
-	{
-		/* XLOG_HEAP_INIT_PAGE: full page re-initialization ATTRIBUTE.
+	  RM_HEAP_ID, XLOG_HEAP_LOCK, XLOG_HEAP_OPMASK, CLUSTER_PAGE_CLASS_NORMAL, true, false, false,
+	  false },
+	{ /* XLOG_HEAP_INIT_PAGE: full page re-initialization ATTRIBUTE.
 		 * This row fact is not a §4.6 full-init RULE (expected class state
 		 * + result-version proof are RED), so the classifier still
 		 * returns UNKNOWN for WILL_INIT records (PU-17). */
-		RM_HEAP_ID, XLOG_HEAP_INIT_PAGE, 0,
-		CLUSTER_PAGE_CLASS_NEW, true, false, true, false
-	},
-	{
-		RM_GENERIC_ID, 0, 0,
-		CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false
-	},
+	  RM_HEAP_ID, XLOG_HEAP_INIT_PAGE, 0, CLUSTER_PAGE_CLASS_NEW, true, false, true, false },
+	{ RM_GENERIC_ID, 0, 0, CLUSTER_PAGE_CLASS_NORMAL, true, true, false, false },
 };
 
 /*
@@ -128,17 +108,16 @@ static const ClusterPageRmgrCensusEntry cluster_page_census_rmgr[] = {
 };
 
 bool
-cluster_page_rmgr_census_lookup(uint8 rmid, uint16 opcode,
-								ClusterPageRmgrCensusEntry *out)
+cluster_page_rmgr_census_lookup(uint8 rmid, uint16 opcode, ClusterPageRmgrCensusEntry *out)
 {
-	int			i;
+	int i;
 
 	if (out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
 
 	/* Opcode-granular rows first (exact or masked match). */
-	for (i = 0; i < (int) lengthof(cluster_page_census_opcode); i++) {
+	for (i = 0; i < (int)lengthof(cluster_page_census_opcode); i++) {
 		const ClusterPageRmgrCensusEntry *row = &cluster_page_census_opcode[i];
 
 		if (row->rmid != rmid)
@@ -153,7 +132,7 @@ cluster_page_rmgr_census_lookup(uint8 rmid, uint16 opcode,
 	}
 
 	/* Rmgr-granular rows (any opcode of that rmgr). */
-	for (i = 0; i < (int) lengthof(cluster_page_census_rmgr); i++) {
+	for (i = 0; i < (int)lengthof(cluster_page_census_rmgr); i++) {
 		const ClusterPageRmgrCensusEntry *row = &cluster_page_census_rmgr[i];
 
 		if (row->rmid == rmid) {
@@ -161,7 +140,7 @@ cluster_page_rmgr_census_lookup(uint8 rmid, uint16 opcode,
 			return true;
 		}
 	}
-	return false;				/* unknown rmgr: fail closed */
+	return false; /* unknown rmgr: fail closed */
 }
 
 /* ---------------------------------------------------------------------
@@ -171,17 +150,16 @@ cluster_page_rmgr_census_lookup(uint8 rmid, uint16 opcode,
 void
 cluster_page_rmgr_populate_known_set(void)
 {
-	int			i;
+	int i;
 
 	/* Only rows with byte-for-byte differential evidence register: an
 	 * unproven opcode must keep classifying UNKNOWN (spec §4.2: a NORMAL
 	 * row without every producer/decoder/verifier is BLOCKED). */
-	for (i = 0; i < (int) lengthof(cluster_page_census_opcode); i++) {
+	for (i = 0; i < (int)lengthof(cluster_page_census_opcode); i++) {
 		const ClusterPageRmgrCensusEntry *row = &cluster_page_census_opcode[i];
 
 		if (row->known_delta && row->affects_page)
-			(void) cluster_page_class_register_known_opcode(row->rmid,
-															row->opcode);
+			(void)cluster_page_class_register_known_opcode(row->rmid, row->opcode);
 	}
 }
 
@@ -190,25 +168,23 @@ cluster_page_rmgr_populate_known_set(void)
  * --------------------------------------------------------------------- */
 
 bool
-cluster_page_redo_decode(XLogReaderState *record, uint8 block_id,
-						 ClusterPageRedoDecoded *out)
+cluster_page_redo_decode(XLogReaderState *record, uint8 block_id, ClusterPageRedoDecoded *out)
 {
 	ClusterPageRmgrCensusEntry row;
-	DecodedBkpBlock *blk;
-	uint8		rmid;
+	const DecodedBkpBlock *blk;
+	uint8 rmid;
 
 	if (record == NULL || out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
 
 	if (!XLogRecHasBlockRef(record, block_id))
-		return false;			/* no block reference: nothing to decode */
+		return false; /* no block reference: nothing to decode */
 	rmid = XLogRecGetRmid(record);
-	if (!cluster_page_rmgr_census_lookup(rmid, XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK,
-										 &row))
-		return false;			/* unknown rmgr/opcode: fail closed */
+	if (!cluster_page_rmgr_census_lookup(rmid, XLogRecGetInfo(record) & XLR_RMGR_INFO_MASK, &row))
+		return false; /* unknown rmgr/opcode: fail closed */
 	if (!row.affects_page)
-		return false;			/* not a page-affecting record */
+		return false; /* not a page-affecting record */
 
 	/* Identity comes straight from the decoded block reference (the
 	 * XLogRecGetBlockTag backend helper is not linked into the standalone
@@ -218,8 +194,8 @@ cluster_page_redo_decode(XLogReaderState *record, uint8 block_id,
 	out->identity.rlocator = blk->rlocator;
 	out->identity.forknum = blk->forknum;
 	out->identity.blocknum = blk->blkno;
-	out->full_image = XLogRecHasBlockImage(record, block_id)
-		&& XLogRecBlockImageApply(record, block_id);
+	out->full_image
+		= XLogRecHasBlockImage(record, block_id) && XLogRecBlockImageApply(record, block_id);
 	/* BKPBLOCK_WILL_INIT rides the block's fork_flags (xlogrecord.h). */
 	out->will_init = (blk->flags & BKPBLOCK_WILL_INIT) != 0;
 	/* §3.1 hints: locator/hint only, never VersionToken. */
@@ -229,8 +205,8 @@ cluster_page_redo_decode(XLogReaderState *record, uint8 block_id,
 	return true;
 }
 
-#else							/* !USE_PGRAC_CLUSTER */
+#else /* !USE_PGRAC_CLUSTER */
 
 /* Disable-cluster build: this file compiles to nothing. */
 
-#endif							/* USE_PGRAC_CLUSTER */
+#endif /* USE_PGRAC_CLUSTER */

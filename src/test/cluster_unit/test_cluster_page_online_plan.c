@@ -18,11 +18,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -31,29 +29,26 @@ static int fail_component = -1;
 bool
 rf_page_identity_valid_v1(const RfPageIdentityV1 *identity)
 {
-	return identity != NULL && identity->system_identifier != 0 &&
-		identity->locator.spcOid != InvalidOid &&
-		identity->locator.dbOid != InvalidOid &&
-		identity->locator.relNumber != InvalidRelFileNumber &&
-		identity->blockno != InvalidBlockNumber && identity->reserved_zero == 0;
+	return identity != NULL && identity->system_identifier != 0
+		   && identity->locator.spcOid != InvalidOid && identity->locator.dbOid != InvalidOid
+		   && identity->locator.relNumber != InvalidRelFileNumber
+		   && identity->blockno != InvalidBlockNumber && identity->reserved_zero == 0;
 }
 
 bool
-rf_page_identity_equal_v1(const RfPageIdentityV1 *left,
-					  const RfPageIdentityV1 *right)
+rf_page_identity_equal_v1(const RfPageIdentityV1 *left, const RfPageIdentityV1 *right)
 {
-	return left != NULL && right != NULL &&
-		left->system_identifier == right->system_identifier &&
-		memcmp(left->storage_uuid, right->storage_uuid, 16) == 0 &&
-		RelFileLocatorEquals(left->locator, right->locator) &&
-		left->forknum == right->forknum && left->blockno == right->blockno;
+	return left != NULL && right != NULL && left->system_identifier == right->system_identifier
+		   && memcmp(left->storage_uuid, right->storage_uuid, 16) == 0
+		   && RelFileLocatorEquals(left->locator, right->locator) && left->forknum == right->forknum
+		   && left->blockno == right->blockno;
 }
 
 bool
 rf_page_version_present_v1(const RfPageVersionV1 *version)
 {
-	uint8		value = 0;
-	int			i;
+	uint8 value = 0;
+	int i;
 
 	if (version == NULL || version->mutation_token == 0)
 		return false;
@@ -63,48 +58,42 @@ rf_page_version_present_v1(const RfPageVersionV1 *version)
 }
 
 bool
-rf_page_version_equal_v1(const RfPageVersionV1 *left,
-					 const RfPageVersionV1 *right)
+rf_page_version_equal_v1(const RfPageVersionV1 *left, const RfPageVersionV1 *right)
 {
-	return left != NULL && right != NULL &&
-		left->mutation_token == right->mutation_token &&
-		memcmp(left->segment_incarnation,
-			   right->segment_incarnation, 16) == 0;
+	return left != NULL && right != NULL && left->mutation_token == right->mutation_token
+		   && memcmp(left->segment_incarnation, right->segment_incarnation, 16) == 0;
 }
 
 RfPageProofDetailV1
-rf_page_detached_apply_v1(const RfDetachedRecordPlanV1 *plan,
-						  uint32 component_index,
-						  const char old_page[BLCKSZ],
-						  char new_page[BLCKSZ])
+rf_page_detached_apply_v1(const RfDetachedRecordPlanV1 *plan, uint32 component_index,
+						  const char old_page[BLCKSZ], char new_page[BLCKSZ])
 {
 	const RfDetachedComponentPlanV1 *component;
-	PageHeader	header;
+	PageHeader header;
 
-	if ((int) component_index == fail_component)
+	if ((int)component_index == fail_component)
 		return RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED;
 	component = &plan->components[component_index];
-	memset(new_page, (int) component->result.mutation_token, BLCKSZ);
-	header = (PageHeader) new_page;
+	memset(new_page, (int)component->result.mutation_token, BLCKSZ);
+	header = (PageHeader)new_page;
 	memset(header, 0, SizeOfPageHeaderData);
 	header->pd_lower = SizeOfPageHeaderData;
 	header->pd_upper = BLCKSZ;
 	header->pd_special = BLCKSZ;
-	header->pd_pagesize_version =
-		(BLCKSZ & 0xFF00) | PG_PAGE_LAYOUT_VERSION;
+	header->pd_pagesize_version = (BLCKSZ & 0xFF00) | PG_PAGE_LAYOUT_VERSION;
 	header->pd_block_scn = component->result.mutation_token;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
-typedef struct FakeRecord
-{
+typedef struct FakeRecord {
 	XLogReaderState reader;
 	RfDetachedRecordPlanV1 plan;
-	union
-	{
+	union {
 		DecodedXLogRecord decoded;
-		char padding[sizeof(DecodedXLogRecord) +
-			RF_PAGE_STABLE_MAX_COMPONENTS * sizeof(DecodedBkpBlock)];
+		/* Reserves the trailing block array addressed through decoded. */
+		/* cppcheck-suppress unusedStructMember */
+		char padding[sizeof(DecodedXLogRecord)
+					 + RF_PAGE_STABLE_MAX_COMPONENTS * sizeof(DecodedBkpBlock)];
 	} storage;
 } FakeRecord;
 
@@ -116,8 +105,7 @@ set_version(RfPageVersionV1 *version, uint64 token)
 }
 
 static void
-init_record(FakeRecord *record, XLogRecPtr begin, XLogRecPtr end,
-			uint32 count)
+init_record(FakeRecord *record, XLogRecPtr begin, XLogRecPtr end, uint32 count)
 {
 	memset(record, 0, sizeof(*record));
 	record->reader.ReadRecPtr = begin;
@@ -126,18 +114,18 @@ init_record(FakeRecord *record, XLogRecPtr begin, XLogRecPtr end,
 	record->reader.record = &record->storage.decoded;
 	record->storage.decoded.lsn = begin;
 	record->storage.decoded.next_lsn = end;
-	record->storage.decoded.header.xl_crc = (pg_crc32c) (begin ^ end);
+	record->storage.decoded.header.xl_crc = (pg_crc32c)(begin ^ end);
 	record->storage.decoded.header.xl_rmid = RM_XLOG_ID;
-	record->storage.decoded.header.xl_info = (uint8) (begin & 0xf0);
-	record->storage.decoded.max_block_id = (int) count - 1;
+	record->storage.decoded.header.xl_info = (uint8)(begin & 0xf0);
+	record->storage.decoded.max_block_id = (int)count - 1;
 	record->plan.source_record = &record->reader;
 	record->plan.component_count = count;
 	record->plan.preflight_complete = true;
 }
 
 static void
-set_component(FakeRecord *record, uint32 index, Oid rel, BlockNumber block,
-			  uint64 before, uint64 result, bool anchor)
+set_component(FakeRecord *record, uint32 index, Oid rel, BlockNumber block, uint64 before,
+			  uint64 result, bool anchor)
 {
 	DecodedBkpBlock *decoded = &record->storage.decoded.blocks[index];
 	RfDetachedComponentPlanV1 *component = &record->plan.components[index];
@@ -148,17 +136,16 @@ set_component(FakeRecord *record, uint32 index, Oid rel, BlockNumber block,
 	decoded->rlocator.relNumber = rel;
 	decoded->forknum = MAIN_FORKNUM;
 	decoded->blkno = block;
-	component->block_id = (uint8) index;
+	component->block_id = (uint8)index;
 	component->page_class = RF_PAGE_CLASS_ORDINARY;
 	component->owner = RF_DETACHED_COMPONENT_PAGE_CODEC;
-	component->component_ordinal = (uint16) index;
+	component->component_ordinal = (uint16)index;
 	component->before_kind = RF_PAGE_STATE_PRESENT;
 	component->result_kind = RF_PAGE_STATE_PRESENT;
 	set_version(&component->before, before);
 	set_version(&component->result, result);
 	if (anchor)
-		component->edge_flags = RF_PAGE_EDGE_FULL_IMAGE_APPLY |
-			RF_PAGE_EDGE_FULL_COVERAGE;
+		component->edge_flags = RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE;
 }
 
 static RfPageOnlinePlanV1 *
@@ -180,8 +167,7 @@ create_plan(XLogRecPtr begin, XLogRecPtr end)
 	request.physical_cuts = &cut;
 	request.participant_count = 1;
 	request.retention_binding_cookie = 41;
-	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan),
-		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
 }
 
@@ -192,14 +178,12 @@ record_identity(const FakeRecord *record)
 
 	memset(&identity, 0, sizeof(identity));
 	identity.record.system_identifier = 99;
-	memset(identity.record.storage_uuid, 3,
-		   sizeof(identity.record.storage_uuid));
+	memset(identity.record.storage_uuid, 3, sizeof(identity.record.storage_uuid));
 	identity.record.origin_thread = 1;
 	identity.record.timeline_id = 1;
 	identity.record.read_rec_ptr = record->reader.ReadRecPtr;
 	identity.record.end_rec_ptr = record->reader.EndRecPtr;
-	identity.record.record_crc =
-		(uint32) record->storage.decoded.header.xl_crc;
+	identity.record.record_crc = (uint32)record->storage.decoded.header.xl_crc;
 	identity.record.rmid = record->storage.decoded.header.xl_rmid;
 	identity.record.info = record->storage.decoded.header.xl_info;
 	return identity;
@@ -217,19 +201,18 @@ UT_TEST(test_two_record_chain_builds_canonical_target)
 	set_component(&first, 0, 10, 4, 10, 11, true);
 	id = record_identity(&first);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &first.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OK);
+				 RF_PAGE_PROOF_DETAIL_OK);
 	init_record(&second, 0x200, 0x300, 1);
 	set_component(&second, 0, 10, 4, 11, 12, false);
 	id = record_identity(&second);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &second.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_OK);
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), 1);
 	UT_ASSERT(rf_page_online_plan_target_v1(plan, 0, &target));
 	UT_ASSERT_EQ(target.expected_before.mutation_token, 10);
 	UT_ASSERT_EQ(target.expected_result.mutation_token, 12);
-	UT_ASSERT_EQ(((PageHeader) target.canonical_page)->pd_block_scn, 12);
+	UT_ASSERT_EQ(((PageHeader)target.canonical_page)->pd_block_scn, 12);
 	UT_ASSERT_EQ(target.source->source_version.mutation_token, 11);
 	UT_ASSERT_EQ(target.contributors->edge_count, 2);
 	UT_ASSERT_EQ(target.contributors->cuts[0].contributor_count, 2);
@@ -251,12 +234,11 @@ UT_TEST(test_record_failure_is_atomic_and_retryable)
 	id = record_identity(&record);
 	fail_component = 1;
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
+				 RF_PAGE_PROOF_DETAIL_OPCODE_UNSUPPORTED);
 	fail_component = -1;
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_OK);
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(rf_page_online_plan_target_count_v1(plan), 2);
 	UT_ASSERT(rf_page_online_plan_target_v1(plan, 0, &first));
 	UT_ASSERT(rf_page_online_plan_target_v1(plan, 1, &second));
@@ -275,12 +257,11 @@ UT_TEST(test_first_delta_requires_full_anchor)
 	set_component(&record, 0, 10, 1, 10, 11, false);
 	id = record_identity(&record);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
-		RF_PAGE_PROOF_DETAIL_ANCHOR_MISSING);
+				 RF_PAGE_PROOF_DETAIL_ANCHOR_MISSING);
 	set_component(&record, 0, 10, 1, 10, 11, true);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_OK);
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
@@ -295,17 +276,16 @@ UT_TEST(test_edge_gap_does_not_advance_stream)
 	set_component(&first, 0, 10, 1, 10, 11, true);
 	id = record_identity(&first);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &first.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OK);
+				 RF_PAGE_PROOF_DETAIL_OK);
 	init_record(&second, 0x200, 0x300, 1);
 	set_component(&second, 0, 10, 1, 99, 12, false);
 	id = record_identity(&second);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &second.plan, &id),
-		RF_PAGE_PROOF_DETAIL_EDGE_GAP);
+				 RF_PAGE_PROOF_DETAIL_EDGE_GAP);
 	set_component(&second, 0, 10, 1, 11, 12, false);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &second.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_OK);
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
@@ -319,9 +299,8 @@ UT_TEST(test_seal_requires_complete_physical_cut)
 	set_component(&record, 0, 10, 1, 10, 11, true);
 	id = record_identity(&record);
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &id),
-		RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
 	rf_page_online_plan_destroy_v1(&plan);
 }
 
@@ -337,10 +316,12 @@ UT_TEST(test_record_identity_binds_full_decoded_tuple)
 	set_component(&record, 0, 10, 1, 10, 11, true);
 	valid = record_identity(&record);
 
-#define ASSERT_IDENTITY_REJECTED(statement_) \
-	do { changed = valid; statement_; \
-		 UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, \
-			 &record.plan, &changed), RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH); \
+#define ASSERT_IDENTITY_REJECTED(statement_)                                                       \
+	do {                                                                                           \
+		changed = valid;                                                                           \
+		statement_;                                                                                \
+		UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &changed),             \
+					 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);                                      \
 	} while (0)
 	ASSERT_IDENTITY_REJECTED(changed.record.system_identifier++);
 	ASSERT_IDENTITY_REJECTED(changed.record.storage_uuid[0]++);
@@ -354,15 +335,15 @@ UT_TEST(test_record_identity_binds_full_decoded_tuple)
 	saved_crc = record.storage.decoded.header.xl_crc;
 	record.storage.decoded.header.xl_crc++;
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &valid),
-		RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+				 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
 	record.storage.decoded.header.xl_crc = saved_crc;
 	record.storage.decoded.next_lsn++;
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &valid),
-		RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+				 RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
 	record.storage.decoded.next_lsn--;
 
 	UT_ASSERT_EQ(rf_page_online_plan_feed_record_v1(plan, &record.plan, &valid),
-		RF_PAGE_PROOF_DETAIL_OK);
+				 RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT_EQ(rf_page_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	rf_page_online_plan_destroy_v1(&plan);
 }

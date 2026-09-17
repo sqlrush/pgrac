@@ -80,6 +80,21 @@ sigjmp_buf *PG_exception_stack = NULL;
 ErrorContextCallback *error_context_stack = NULL;
 
 void
+cluster_vis_evidence_note(ClusterVisEvidenceMetric metric pg_attribute_unused())
+{
+	/* Diagnostics are not the source-admission policy under test. */
+}
+
+const ClusterNodeInfo *
+cluster_conf_lookup_node(int32 node_id)
+{
+	for (int i = 0; i < test_cluster_conf.node_count; i++)
+		if (test_cluster_conf.nodes[i].node_id == node_id)
+			return &test_cluster_conf.nodes[i];
+	return NULL;
+}
+
+void
 ExceptionalCondition(const char *condition_name pg_attribute_unused(),
 					 const char *file_name pg_attribute_unused(),
 					 int line_number pg_attribute_unused())
@@ -154,7 +169,8 @@ cluster_epoch_get_current(void)
 
 ClusterSemanticAdmissionResult
 cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op pg_attribute_unused(),
-								  const ClusterMultiXactSourceRequest *request pg_attribute_unused(),
+								  const ClusterMultiXactSourceRequest *request
+									  pg_attribute_unused(),
 								  ClusterMultiXactSourceResult *result)
 {
 	memset(result, 0, sizeof(*result));
@@ -164,8 +180,8 @@ cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op pg_attribute_unuse
 
 ClusterSemanticAdmissionResult
 cluster_tt_status_source_dispatch(ClusterTTStatusSourceOp op pg_attribute_unused(),
-							  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
-							  ClusterTTStatusSourceResult *result)
+								  const ClusterTTStatusSourceRequest *request pg_attribute_unused(),
+								  ClusterTTStatusSourceResult *result)
 {
 	memset(result, 0, sizeof(*result));
 	result->bool_value = true;
@@ -276,6 +292,8 @@ test_prepare_hint_state(void)
 {
 	memset(&test_cluster_conf, 0, sizeof(test_cluster_conf));
 	test_cluster_conf.node_count = 2;
+	test_cluster_conf.nodes[0].node_id = 0;
+	test_cluster_conf.nodes[1].node_id = 1;
 	cluster_tt_status_hint_shmem_init();
 }
 

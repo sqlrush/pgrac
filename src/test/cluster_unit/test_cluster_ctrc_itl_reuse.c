@@ -1240,7 +1240,7 @@ UT_TEST(test_effective_old_lock_is_not_logical_data_history)
 			reuse_tuple()->t_infomask = lock_shape == 0 ? HEAP_XMAX_LOCK_ONLY
 										: lock_shape == 1
 											? HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK
-										: HEAP_XMAX_EXCL_LOCK;
+											: HEAP_XMAX_EXCL_LOCK;
 			HeapTupleHeaderSetXmax(reuse_tuple(), reuse_receipt.key.xid);
 			reuse_expect_retained();
 		}

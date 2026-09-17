@@ -46,8 +46,7 @@ static int mock_open_fd_count;
 static int cache_invalidation_count;
 static int owner_selector_total;
 
-static void three_disk_config(char config[MAXPGPATH * 3 + 3],
-							  char paths[3][MAXPGPATH]);
+static void three_disk_config(char config[MAXPGPATH * 3 + 3], char paths[3][MAXPGPATH]);
 static void remove_three_disks(char paths[3][MAXPGPATH]);
 
 void
@@ -94,8 +93,7 @@ cluster_voting_disk_read_slot(int fd, int expected_disk_index, uint32 node_id,
 	out->node_id = node_id;
 	out->incarnation = mock_owner_incarnations[expected_disk_index];
 	if (mock_slot_present[expected_disk_index][node_id])
-		cluster_fence_marker_pack(out->_reserved1,
-								 &mock_slots[expected_disk_index][node_id]);
+		cluster_fence_marker_pack(out->_reserved1, &mock_slots[expected_disk_index][node_id]);
 	return CLUSTER_VOTING_DISK_IO_OK;
 }
 
@@ -120,11 +118,11 @@ cluster_voting_disk_read_join_slot(int fd, uint32 node_id, void *out_slot512)
 }
 
 ClusterRecoveryOwnerImportResult
-cluster_recovery_owner_import_select_v1(
-	int32 node_id, const ClusterWalThreadClaim *immutable_claim,
-	uint64 frozen_admitted_bitmap_low, uint64 frozen_admitted_bitmap_high,
-	const ClusterRecoveryOwnerDiskSampleV1 *samples, int total_disk_count,
-	uint64 *out_incarnation)
+cluster_recovery_owner_import_select_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
+										uint64 frozen_admitted_bitmap_low,
+										uint64 frozen_admitted_bitmap_high,
+										const ClusterRecoveryOwnerDiskSampleV1 *samples,
+										int total_disk_count, uint64 *out_incarnation)
 {
 	UT_ASSERT_EQ(node_id, 0);
 	UT_ASSERT(immutable_claim != NULL);
@@ -181,8 +179,8 @@ UT_TEST(test_owner_import_runtime_reads_every_distinct_disk)
 	cluster_wal_thread_claim_fill(&claim, 1, 0, INT64_C(12345));
 	mock_join_slots[0].admitted_incarnation = 77;
 	mock_owner_incarnations[1] = 70;
-	UT_ASSERT_EQ(cluster_recovery_owner_import_read_v1(
-				 0, &claim, 1, 0, &incarnation), CLUSTER_RECOVERY_OWNER_IMPORT_JCMK);
+	UT_ASSERT_EQ(cluster_recovery_owner_import_read_v1(0, &claim, 1, 0, &incarnation),
+				 CLUSTER_RECOVERY_OWNER_IMPORT_JCMK);
 	UT_ASSERT_EQ(owner_selector_total, 3);
 	UT_ASSERT_EQ(incarnation, 77);
 	remove_three_disks(paths);
@@ -282,8 +280,7 @@ UT_TEST(test_durable_majority_and_total_counts)
 	mock_slot_present[0][0] = true;
 	mock_slot_present[1][0] = true;
 	mock_slot_present[2][0] = true;
-	UT_ASSERT_EQ(cluster_write_fence_read_durable_authority(&proof),
-				 CLUSTER_FENCE_AUTHORITY_OK);
+	UT_ASSERT_EQ(cluster_write_fence_read_durable_authority(&proof), CLUSTER_FENCE_AUTHORITY_OK);
 	UT_ASSERT_EQ(proof.marker.fence_epoch, 8);
 	UT_ASSERT_EQ(proof.agree_disk_count, 2);
 	UT_ASSERT_EQ(proof.total_disk_count, 3);
@@ -317,14 +314,12 @@ UT_TEST(test_join_baseline_majority_replaces_prior_failstop_tuple)
 	mock_slot_present[0][0] = true;
 	mock_slot_present[1][0] = true;
 	mock_slot_present[2][0] = true;
-	UT_ASSERT_EQ(cluster_write_fence_read_durable_authority(&proof),
-				 CLUSTER_FENCE_AUTHORITY_OK);
+	UT_ASSERT_EQ(cluster_write_fence_read_durable_authority(&proof), CLUSTER_FENCE_AUTHORITY_OK);
 	UT_ASSERT_EQ(proof.marker.fence_epoch, UINT64_C(9));
 	UT_ASSERT_EQ(proof.marker.fence_generation, UINT64_C(9));
 	UT_ASSERT_EQ(proof.marker.fence_event_id, UINT64_C(0xBB));
 	UT_ASSERT_EQ(proof.marker.fenced_dead_bitmap[0], UINT8_C(0x04));
-	UT_ASSERT_EQ((int)proof.marker.marker_kind,
-				 (int)CLUSTER_FENCE_MARKER_KIND_BASELINE);
+	UT_ASSERT_EQ((int)proof.marker.marker_kind, (int)CLUSTER_FENCE_MARKER_KIND_BASELINE);
 	UT_ASSERT_EQ(proof.agree_disk_count, 2);
 	UT_ASSERT_EQ(proof.total_disk_count, 3);
 	remove_three_disks(paths);
@@ -343,8 +338,7 @@ UT_TEST(test_unreadable_disk_stays_in_denominator)
 	mock_slot_present[0][0] = true;
 	mock_slot_present[1][0] = true;
 	(void)unlink(paths[2]);
-	UT_ASSERT_EQ(cluster_write_fence_read_durable_authority(&proof),
-				 CLUSTER_FENCE_AUTHORITY_OK);
+	UT_ASSERT_EQ(cluster_write_fence_read_durable_authority(&proof), CLUSTER_FENCE_AUTHORITY_OK);
 	UT_ASSERT_EQ(proof.total_disk_count, 3);
 
 	mock_disk_read_failed[1] = true;

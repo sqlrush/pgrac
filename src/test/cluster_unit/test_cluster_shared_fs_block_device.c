@@ -398,10 +398,9 @@ UT_TEST(test_block_device_roundtrip_layout_and_eof)
 	{
 		char protected_uuid[CLUSTER_SHARED_UUID_LEN];
 
-		UT_ASSERT(cluster_shared_fs_block_device_get_storage_uuid(
-			protected_uuid, sizeof(protected_uuid)));
-		UT_ASSERT_STR_EQ(protected_uuid,
-						 "00112233445566778899aabbccddeeff");
+		UT_ASSERT(cluster_shared_fs_block_device_get_storage_uuid(protected_uuid,
+																  sizeof(protected_uuid)));
+		UT_ASSERT_STR_EQ(protected_uuid, "00112233445566778899aabbccddeeff");
 	}
 
 	raw_wal_emit_count = 0;

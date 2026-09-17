@@ -30,6 +30,9 @@ UT_DEFINE_GLOBALS();
 #ifndef HIO_SOURCE_PATH
 #error "HIO_SOURCE_PATH must identify production hio.c"
 #endif
+#ifndef PROBES_SOURCE_PATH
+#error "PROBES_SOURCE_PATH must identify production probes.d"
+#endif
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -125,11 +128,10 @@ assert_ordered(const char *source, const char *const *needles, int count)
 static int
 count_occurrences(const char *source, const char *needle)
 {
-	int			count = 0;
+	int count = 0;
 	const char *cursor = source;
 
-	while ((cursor = strstr(cursor, needle)) != NULL)
-	{
+	while ((cursor = strstr(cursor, needle)) != NULL) {
 		count++;
 		cursor += strlen(needle);
 	}
@@ -265,45 +267,50 @@ UT_TEST(test_state_s_and_live_reservations_are_rejected_by_class)
 
 UT_TEST(test_aux_pending_observer_accepts_only_exact_existing_reservation)
 {
-	ClusterPcmDirectInitSnapshot snapshot
-		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_VM);
+	ClusterPcmDirectInitSnapshot snapshot = make_snapshot(CLUSTER_PCM_DIRECT_INIT_VM);
 
 	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	snapshot.reservation_token = 9;
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(CLUSTER_PCM_DIRECT_INIT_VM,
+																	   &snapshot),
+				 CLUSTER_PCM_OWN_OK);
 	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_VM, &snapshot), CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &snapshot),
-		CLUSTER_PCM_OWN_INVALID);
+					 CLUSTER_PCM_DIRECT_INIT_READ_MISS, &snapshot),
+				 CLUSTER_PCM_OWN_INVALID);
 
 	snapshot.reservation_token = 0;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_VM, &snapshot), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(CLUSTER_PCM_DIRECT_INIT_VM,
+																	   &snapshot),
+				 CLUSTER_PCM_OWN_STALE);
 	snapshot.reservation_token = UINT64_MAX;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_VM, &snapshot), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(CLUSTER_PCM_DIRECT_INIT_VM,
+																	   &snapshot),
+				 CLUSTER_PCM_OWN_STALE);
 
 	snapshot = make_snapshot(CLUSTER_PCM_DIRECT_INIT_FSM);
 	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING | PCM_OWN_FLAG_REVOKING;
 	snapshot.reservation_token = 9;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot), CLUSTER_PCM_OWN_CORRUPT);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(CLUSTER_PCM_DIRECT_INIT_FSM,
+																	   &snapshot),
+				 CLUSTER_PCM_OWN_CORRUPT);
 
 	snapshot = make_snapshot(CLUSTER_PCM_DIRECT_INIT_FSM);
 	snapshot.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	snapshot.reservation_token = 9;
 	snapshot.page_is_new = false;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(CLUSTER_PCM_DIRECT_INIT_FSM,
+																	   &snapshot),
+				 CLUSTER_PCM_OWN_STALE);
 	snapshot.page_is_new = true;
 	snapshot.pcm_state = (uint8)PCM_STATE_X;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(CLUSTER_PCM_DIRECT_INIT_FSM,
+																	   &snapshot),
+				 CLUSTER_PCM_OWN_STALE);
 	snapshot.pcm_state = (uint8)PCM_STATE_N;
 	snapshot.generation = UINT64_MAX;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(
-		CLUSTER_PCM_DIRECT_INIT_FSM, &snapshot),
-		CLUSTER_PCM_OWN_EXHAUSTED);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_aux_pending_observer_validate(CLUSTER_PCM_DIRECT_INIT_FSM,
+																	   &snapshot),
+				 CLUSTER_PCM_OWN_EXHAUSTED);
 }
 
 UT_TEST(test_revalidate_rejects_state_pin_and_reservation_changes)
@@ -366,83 +373,92 @@ UT_TEST(test_vm_fsm_fork_and_valid_shape_are_exact)
 UT_TEST(test_target_pending_reservation_remains_bound_to_consumed_known_new_proof)
 {
 	ClusterPcmDirectInitProof proof;
-	ClusterPcmDirectInitSnapshot base
-		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_EXTEND);
+	ClusterPcmDirectInitSnapshot base = make_snapshot(CLUSTER_PCM_DIRECT_INIT_EXTEND);
 	ClusterPcmDirectInitSnapshot pending;
 
-	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_consume(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_direct_init_proof_consume(CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof),
+		CLUSTER_PCM_OWN_OK);
 	pending = base;
 	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	pending.reservation_token++;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(CLUSTER_PCM_DIRECT_INIT_EXTEND,
+																 &pending, &proof),
+				 CLUSTER_PCM_OWN_OK);
 
 	pending.buf_state &= ~BM_IO_IN_PROGRESS;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(CLUSTER_PCM_DIRECT_INIT_EXTEND,
+																 &pending, &proof),
+				 CLUSTER_PCM_OWN_STALE);
 	pending = base;
 	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	pending.reservation_token += 2;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(CLUSTER_PCM_DIRECT_INIT_EXTEND,
+																 &pending, &proof),
+				 CLUSTER_PCM_OWN_STALE);
 }
 
 UT_TEST(test_target_post_t3_commit_revalidates_exact_known_new_identity)
 {
 	ClusterPcmDirectInitProof proof;
-	ClusterPcmDirectInitSnapshot base
-		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_READ_MISS);
+	ClusterPcmDirectInitSnapshot base = make_snapshot(CLUSTER_PCM_DIRECT_INIT_READ_MISS);
 	ClusterPcmDirectInitSnapshot committed;
 
-	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(
-		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &base, &proof), CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_consume(
-		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &base, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_direct_init_proof_arm(CLUSTER_PCM_DIRECT_INIT_READ_MISS, &base, &proof),
+		CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_direct_init_proof_consume(CLUSTER_PCM_DIRECT_INIT_READ_MISS, &base, &proof),
+		CLUSTER_PCM_OWN_OK);
 	committed = base;
 	committed.generation++;
 	committed.reservation_token++;
 	committed.buffer_type = (uint8)BUF_TYPE_XCUR;
 	committed.pcm_state = (uint8)PCM_STATE_X;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
-		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &committed, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(CLUSTER_PCM_DIRECT_INIT_READ_MISS,
+																&committed, &proof),
+				 CLUSTER_PCM_OWN_OK);
 
 	committed.page_is_new = false;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
-		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &committed, &proof), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(CLUSTER_PCM_DIRECT_INIT_READ_MISS,
+																&committed, &proof),
+				 CLUSTER_PCM_OWN_STALE);
 	committed.page_is_new = true;
 	committed.generation++;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
-		CLUSTER_PCM_DIRECT_INIT_READ_MISS, &committed, &proof), CLUSTER_PCM_OWN_STALE);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(CLUSTER_PCM_DIRECT_INIT_READ_MISS,
+																&committed, &proof),
+				 CLUSTER_PCM_OWN_STALE);
 }
 
 UT_TEST(test_target_fresh_generation_zero_is_exact_known_new_identity)
 {
 	ClusterPcmDirectInitProof proof;
-	ClusterPcmDirectInitSnapshot base
-		= make_snapshot(CLUSTER_PCM_DIRECT_INIT_EXTEND);
+	ClusterPcmDirectInitSnapshot base = make_snapshot(CLUSTER_PCM_DIRECT_INIT_EXTEND);
 	ClusterPcmDirectInitSnapshot pending;
 	ClusterPcmDirectInitSnapshot committed;
 
 	base.generation = 0;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
-	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_consume(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_proof_arm(CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof),
+				 CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(
+		cluster_pcm_direct_init_proof_consume(CLUSTER_PCM_DIRECT_INIT_EXTEND, &base, &proof),
+		CLUSTER_PCM_OWN_OK);
 	pending = base;
 	pending.flags = PCM_OWN_FLAG_GRANT_PENDING;
 	pending.reservation_token++;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &pending, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_pending_validate(CLUSTER_PCM_DIRECT_INIT_EXTEND,
+																 &pending, &proof),
+				 CLUSTER_PCM_OWN_OK);
 	committed = pending;
 	committed.generation = 1;
 	committed.flags = 0;
 	committed.buffer_type = (uint8)BUF_TYPE_XCUR;
 	committed.pcm_state = (uint8)PCM_STATE_X;
-	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(
-		CLUSTER_PCM_DIRECT_INIT_EXTEND, &committed, &proof), CLUSTER_PCM_OWN_OK);
+	UT_ASSERT_EQ(cluster_pcm_direct_init_target_commit_validate(CLUSTER_PCM_DIRECT_INIT_EXTEND,
+																&committed, &proof),
+				 CLUSTER_PCM_OWN_OK);
 }
 
 UT_TEST(test_bufmgr_consumes_proof_before_reservation_and_wire)
@@ -462,27 +478,25 @@ UT_TEST(test_bufmgr_consumes_proof_before_reservation_and_wire)
 UT_TEST(test_target_direct_init_uses_exact_resource_x_round_without_legacy_fallback)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
-	static const char *const target_order[] = {
-		"cluster_bufmgr_pcm_gate_direct_init(",
-		"cluster_pcm_direct_init_proof_consume",
-		"cluster_pcm_own_reservation_begin_exact",
-		"cluster_pcm_direct_init_target_pending_validate(",
-		"cluster_resource_x_writer_path_snapshot(",
-		"writer_path != RESOURCE_X_WRITER_TARGET",
-		"cluster_pcm_own_abort_grant_after_error(",
-		"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
-		"pending_base.generation",
-		"pending_token",
-		"cluster_pcm_direct_init_target_commit_validate(",
-		"cluster_bufmgr_pcm_x_writer_track_target_direct_init("
-	};
+	static const char *const target_order[]
+		= { "cluster_bufmgr_pcm_gate_direct_init(",
+			"cluster_pcm_direct_init_proof_consume",
+			"cluster_pcm_own_reservation_begin_exact",
+			"cluster_pcm_direct_init_target_pending_validate(",
+			"cluster_resource_x_writer_path_snapshot(",
+			"writer_path != RESOURCE_X_WRITER_TARGET",
+			"cluster_pcm_own_abort_grant_after_error(",
+			"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+			"pending_base.generation",
+			"pending_token",
+			"cluster_pcm_direct_init_target_commit_validate(",
+			"cluster_bufmgr_pcm_x_writer_track_target_direct_init(" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
 		assert_ordered(source, target_order, lengthof(target_order));
 		UT_ASSERT(strstr(source, "case RESOURCE_X_WRITER_SOURCE:") == NULL);
-		UT_ASSERT(strstr(source,
-			"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X") == NULL);
+		UT_ASSERT(strstr(source, "cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_X") == NULL);
 		free(source);
 	}
 }
@@ -550,52 +564,41 @@ UT_TEST(test_aux_pending_direct_init_joins_exact_round_without_second_proof)
 	const char *gate_end;
 	const char *aux;
 	const char *aux_end;
-	static const char *const aux_order[] = {
-		"LockBufferForAuxiliaryPageInit(",
-		"cluster_bufmgr_pcm_arm_direct_init(",
-		"CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X",
-		"cluster_bufmgr_pcm_join_aux_direct_init_exact(",
-		"continue;",
-		"cluster_bufmgr_pcm_gate_direct_init("
-	};
+	static const char *const aux_order[] = { "LockBufferForAuxiliaryPageInit(",
+											 "cluster_bufmgr_pcm_arm_direct_init(",
+											 "CLUSTER_BUFMGR_PCM_DIRECT_INIT_CACHED_X",
+											 "cluster_bufmgr_pcm_join_aux_direct_init_exact(",
+											 "continue;",
+											 "cluster_bufmgr_pcm_gate_direct_init(" };
 
 	UT_ASSERT(source != NULL);
 	if (source == NULL)
 		return;
 	assert_ordered(source, aux_order, lengthof(aux_order));
 	arm_helper = strstr(source, "cluster_bufmgr_pcm_arm_direct_init(");
-	arm_helper_end = arm_helper != NULL
-		? strstr(arm_helper, "\n}\n") : NULL;
+	arm_helper_end = arm_helper != NULL ? strstr(arm_helper, "\n}\n") : NULL;
 	UT_ASSERT(arm_helper != NULL && arm_helper_end != NULL);
 	if (arm_helper != NULL && arm_helper_end != NULL) {
-		UT_ASSERT(strstr(arm_helper,
-			"cluster_pcm_direct_init_proof_arm(") < arm_helper_end);
-		UT_ASSERT(strstr(arm_helper,
-			"cluster_pcm_direct_init_aux_pending_observer_validate(")
-			< arm_helper_end);
+		UT_ASSERT(strstr(arm_helper, "cluster_pcm_direct_init_proof_arm(") < arm_helper_end);
+		UT_ASSERT(strstr(arm_helper, "cluster_pcm_direct_init_aux_pending_observer_validate(")
+				  < arm_helper_end);
 	}
-	join_helper = strstr(source,
-		"cluster_bufmgr_pcm_join_aux_direct_init_exact(");
-	join_helper_end = join_helper != NULL
-		? strstr(join_helper, "\n}\n") : NULL;
+	join_helper = strstr(source, "cluster_bufmgr_pcm_join_aux_direct_init_exact(");
+	join_helper_end = join_helper != NULL ? strstr(join_helper, "\n}\n") : NULL;
 	UT_ASSERT(join_helper != NULL && join_helper_end != NULL);
 	if (join_helper != NULL && join_helper_end != NULL) {
-		UT_ASSERT(strstr(join_helper,
-			"cluster_gcs_resource_x_target_direct_init_join_exact(")
-			< join_helper_end);
-		UT_ASSERT(strstr(join_helper,
-			"cluster_gcs_resource_x_target_direct_init_acquire_exact(") == NULL
-			|| strstr(join_helper,
-				"cluster_gcs_resource_x_target_direct_init_acquire_exact(")
-				> join_helper_end);
-		UT_ASSERT(strstr(join_helper,
-			"cluster_pcm_own_reservation_begin_exact(") == NULL
-			|| strstr(join_helper,
-				"cluster_pcm_own_reservation_begin_exact(") > join_helper_end);
-		UT_ASSERT(strstr(join_helper,
-			"cluster_resource_x_writer_path_snapshot(") == NULL
-			|| strstr(join_helper,
-				"cluster_resource_x_writer_path_snapshot(") > join_helper_end);
+		UT_ASSERT(strstr(join_helper, "cluster_gcs_resource_x_target_direct_init_join_exact(")
+				  < join_helper_end);
+		UT_ASSERT(strstr(join_helper, "cluster_gcs_resource_x_target_direct_init_acquire_exact(")
+					  == NULL
+				  || strstr(join_helper, "cluster_gcs_resource_x_target_direct_init_acquire_exact(")
+						 > join_helper_end);
+		UT_ASSERT(strstr(join_helper, "cluster_pcm_own_reservation_begin_exact(") == NULL
+				  || strstr(join_helper, "cluster_pcm_own_reservation_begin_exact(")
+						 > join_helper_end);
+		UT_ASSERT(strstr(join_helper, "cluster_resource_x_writer_path_snapshot(") == NULL
+				  || strstr(join_helper, "cluster_resource_x_writer_path_snapshot(")
+						 > join_helper_end);
 	}
 	aux = strstr(source, "LockBufferForAuxiliaryPageInit(");
 	aux_end = aux != NULL ? strstr(aux, "\n}\n") : NULL;
@@ -604,22 +607,19 @@ UT_TEST(test_aux_pending_direct_init_joins_exact_round_without_second_proof)
 	gate_end = gate != NULL ? strstr(gate, "\n}\n") : NULL;
 	UT_ASSERT(gate != NULL && gate_end != NULL);
 	if (gate != NULL && gate_end != NULL)
-		UT_ASSERT(strstr(gate,
-			"cluster_pcm_direct_init_target_pending_validate(")
-			< gate_end);
+		UT_ASSERT(strstr(gate, "cluster_pcm_direct_init_target_pending_validate(") < gate_end);
 	free(source);
 }
 
 UT_TEST(test_valid_n_s_x_without_proof_uses_target_or_s_reservation)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
-	static const char *const order[]
-		= { "if (pcm_mode == PCM_LOCK_MODE_X)",
-			"cluster_bufmgr_pcm_x_writer_prepare_target(",
-			"else",
-			"cluster_bufmgr_pcm_begin_grant_reservation_wait(",
-			"cluster_pcm_lock_acquire_buffer(",
-			"buf, PCM_LOCK_MODE_S, &retry_denied" };
+	static const char *const order[] = { "if (pcm_mode == PCM_LOCK_MODE_X)",
+										 "cluster_bufmgr_pcm_x_writer_prepare_target(",
+										 "else",
+										 "cluster_bufmgr_pcm_begin_grant_reservation_wait(",
+										 "cluster_pcm_lock_acquire_buffer(",
+										 "buf, PCM_LOCK_MODE_S, &retry_denied" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
@@ -652,10 +652,9 @@ UT_TEST(test_direct_init_one_shot_image_cannot_return_without_x)
 UT_TEST(test_wire_throw_exact_aborts_reservation_before_rethrow)
 {
 	char *source = read_source(BUFMGR_SOURCE_PATH);
-	static const char *const order[]
-		= { "cluster_gcs_resource_x_target_direct_init_acquire_exact(", "PG_CATCH();",
-			"cluster_pcm_own_abort_grant_after_error(",
-			"\"direct-init Resource-X acquire\"", "PG_RE_THROW();" };
+	static const char *const order[] = { "cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+										 "PG_CATCH();", "cluster_pcm_own_abort_grant_after_error(",
+										 "\"direct-init Resource-X acquire\"", "PG_RE_THROW();" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
@@ -690,8 +689,7 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 
 		static const char *const wrapper_signature[]
 			= { "ClusterLockBufferExclusiveBarrierAware(Buffer buffer,",
-				"ClusterBufferBarrierSiteId site_id,",
-				"bool *pin_replaced)" };
+				"ClusterBufferBarrierSiteId site_id,", "bool *pin_replaced)" };
 
 		assert_ordered(bufmgr, wrapper_signature, lengthof(wrapper_signature));
 		assert_ordered(bufmgr, refusal_order, lengthof(refusal_order));
@@ -705,15 +703,14 @@ UT_TEST(test_precrit_vm_barrier_refusal_unwinds_to_caller)
 													  "vmbuffer = InvalidBuffer",
 													  "cluster_heap_lock_with_vm_repin",
 													  "goto l2;" };
-		static const char *const requalify_order[]
-			= { "PGRAC: BARRIER_CLOSED caller-owned unwind",
-				"if (!old_tuple_temp_locked)",
-				"LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
-				"cluster_heap_vm_barrier_warm",
-				"ReleaseBuffer(vmbuffer)",
-				"vmbuffer = InvalidBuffer",
-				"cluster_heap_lock_with_vm_repin",
-				"goto l2;" };
+		static const char *const requalify_order[] = { "PGRAC: BARRIER_CLOSED caller-owned unwind",
+													   "if (!old_tuple_temp_locked)",
+													   "LockBuffer(buffer, BUFFER_LOCK_UNLOCK)",
+													   "cluster_heap_vm_barrier_warm",
+													   "ReleaseBuffer(vmbuffer)",
+													   "vmbuffer = InvalidBuffer",
+													   "cluster_heap_lock_with_vm_repin",
+													   "goto l2;" };
 		static const char *const reacquire_order[]
 			= { "PGRAC: vm barrier unwind (update reacquire)",
 				"LockBuffer(newbuf, BUFFER_LOCK_UNLOCK)",
@@ -839,55 +836,47 @@ UT_TEST(test_vm_fsm_resource_x_wait_releases_and_exactly_repins)
 	const char *direct_end;
 	const char *follower;
 	const char *follower_end;
-	static const char *const handoff_order[] = {
-		"cluster_pcm_x_revoke_finish_mode(expected_resource, 0)",
-		"GetPrivateRefCount(buffer)",
-		"BufferTagsEqual(expected_resource, &buf->tag)",
-		"handoff->tag = buf->tag",
-		"ReleaseBuffer(buffer)",
-		"ReadRecentBuffer(",
-		"BufferTagsEqual(&handoff->tag, &buf->tag)"
-	};
-	static const char *const ordinary_order[] = {
-		"cluster_bufmgr_pcm_aux_pin_handoff_begin(",
-		"cluster_bufmgr_pcm_x_writer_prepare_target(",
-		"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(",
-		"LWLockAcquire("
-	};
-	static const char *const direct_order[] = {
-		"aux_pin_required = kind == CLUSTER_PCM_DIRECT_INIT_VM",
-		"cluster_pcm_own_reservation_begin_exact(",
-		"if (aux_pin_required\n\t\t&& !cluster_bufmgr_pcm_aux_pin_handoff_begin(",
-		"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
-		"if (aux_pin_required\n\t\t\t\t&& !cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(",
-		"cluster_pcm_direct_init_target_commit_validate("
-	};
-	static const char *const follower_order[] = {
-		"cluster_bufmgr_pcm_aux_pin_handoff_begin(",
-		"cluster_gcs_resource_x_target_direct_init_join_exact(",
-		"cluster_bufmgr_resource_x_wait_retry(",
-		"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact("
-	};
+	static const char *const handoff_order[]
+		= { "cluster_pcm_x_revoke_finish_mode(expected_resource, 0)",
+			"GetPrivateRefCount(buffer)",
+			"BufferTagsEqual(expected_resource, &buf->tag)",
+			"handoff->tag = buf->tag",
+			"ReleaseBuffer(buffer)",
+			"ReadRecentBuffer(",
+			"BufferTagsEqual(&handoff->tag, &buf->tag)" };
+	static const char *const ordinary_order[]
+		= { "cluster_bufmgr_pcm_aux_pin_handoff_begin(",
+			"cluster_bufmgr_pcm_x_writer_prepare_target(",
+			"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(", "LWLockAcquire(" };
+	static const char *const direct_order[]
+		= { "aux_pin_required = kind == CLUSTER_PCM_DIRECT_INIT_VM",
+			"cluster_pcm_own_reservation_begin_exact(",
+			"if (aux_pin_required\n\t\t&& !cluster_bufmgr_pcm_aux_pin_handoff_begin(",
+			"cluster_gcs_resource_x_target_direct_init_acquire_exact(",
+			"if (aux_pin_required\n\t\t\t\t&& !cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(",
+			"cluster_pcm_direct_init_target_commit_validate(" };
+	static const char *const follower_order[]
+		= { "cluster_bufmgr_pcm_aux_pin_handoff_begin(",
+			"cluster_gcs_resource_x_target_direct_init_join_exact(",
+			"cluster_bufmgr_resource_x_wait_retry(",
+			"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(" };
 
 	UT_ASSERT(bufmgr != NULL);
 	if (bufmgr == NULL)
 		return;
 	handoff = strstr(bufmgr, "\ncluster_bufmgr_pcm_aux_pin_handoff_begin(");
-	handoff_end = handoff != NULL
-		? strstr(handoff,
-			"\nstatic bool\ncluster_bufmgr_pcm_aux_pin_handoff_finish_exact(")
-		: NULL;
+	handoff_end
+		= handoff != NULL
+			  ? strstr(handoff, "\nstatic bool\ncluster_bufmgr_pcm_aux_pin_handoff_finish_exact(")
+			  : NULL;
 	ordinary = strstr(bufmgr, "\nLockBufferInternal(");
-	ordinary_end = ordinary != NULL
-		? strstr(ordinary, "\nvoid\nLockBuffer(") : NULL;
+	ordinary_end = ordinary != NULL ? strstr(ordinary, "\nvoid\nLockBuffer(") : NULL;
 	direct = strstr(bufmgr, "\ncluster_bufmgr_pcm_gate_direct_init(");
-	direct_end = direct != NULL
-		? strstr(direct, "\n}\n\n#endif") : NULL;
-	follower = strstr(bufmgr,
-		"\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
+	direct_end = direct != NULL ? strstr(direct, "\n}\n\n#endif") : NULL;
+	follower = strstr(bufmgr, "\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
 	follower_end = follower != NULL
-		? strstr(follower, "\ntypedef enum ClusterBufmgrPcmDirectInitArmResult")
-		: NULL;
+					   ? strstr(follower, "\ntypedef enum ClusterBufmgrPcmDirectInitArmResult")
+					   : NULL;
 
 	UT_ASSERT(handoff != NULL);
 	UT_ASSERT(handoff_end != NULL);
@@ -897,15 +886,12 @@ UT_TEST(test_vm_fsm_resource_x_wait_releases_and_exactly_repins)
 	UT_ASSERT(direct_end != NULL);
 	UT_ASSERT(follower != NULL);
 	UT_ASSERT(follower_end != NULL);
-	if (handoff != NULL && handoff_end != NULL)
-	{
-		const char *pregrant_current_image = strstr(
-			handoff,
-			"cluster_bufmgr_pcm_current_image_locked(buf, buf_state)");
+	if (handoff != NULL && handoff_end != NULL) {
+		const char *pregrant_current_image
+			= strstr(handoff, "cluster_bufmgr_pcm_current_image_locked(buf, buf_state)");
 
 		assert_ordered(handoff, handoff_order, lengthof(handoff_order));
-		UT_ASSERT(pregrant_current_image == NULL
-			|| pregrant_current_image >= handoff_end);
+		UT_ASSERT(pregrant_current_image == NULL || pregrant_current_image >= handoff_end);
 	}
 	if (ordinary != NULL && ordinary_end != NULL)
 		assert_ordered(ordinary, ordinary_order, lengthof(ordinary_order));
@@ -932,32 +918,30 @@ UT_TEST(test_aux_direct_init_pending_lifecycle_survives_pin_handoff_only)
 	UT_ASSERT(bufmgr != NULL);
 	if (bufmgr == NULL)
 		return;
-	known_new = strstr(bufmgr,
-		"\ncluster_bufmgr_pcm_direct_init_known_new_locked(");
-	known_new_end = known_new != NULL
-		? strstr(known_new,
-			"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_n_direct_init_candidate_exact(")
-		: NULL;
+	known_new = strstr(bufmgr, "\ncluster_bufmgr_pcm_direct_init_known_new_locked(");
+	known_new_end
+		= known_new != NULL
+			  ? strstr(
+					known_new,
+					"\nClusterPcmOwnResult\ncluster_bufmgr_pcm_own_n_direct_init_candidate_exact(")
+			  : NULL;
 	candidate = known_new_end;
-	candidate_end = candidate != NULL
-		? strstr(candidate,
-			"\n/* PGRAC adaptation for the Stage-8 remote non-requester S-holder path.")
-		: NULL;
+	candidate_end
+		= candidate != NULL
+			  ? strstr(candidate,
+					   "\n/* PGRAC adaptation for the Stage-8 remote non-requester S-holder path.")
+			  : NULL;
 
 	UT_ASSERT(known_new != NULL);
 	UT_ASSERT(known_new_end != NULL);
 	UT_ASSERT(candidate != NULL);
 	UT_ASSERT(candidate_end != NULL);
-	if (known_new != NULL && known_new_end != NULL)
-	{
-		const char *aux_guard = strstr(known_new,
-			"aux_pin_handoff_protected");
-		const char *pending = strstr(known_new,
-			"PCM_OWN_FLAG_GRANT_PENDING");
-		const char *writer = strstr(known_new,
-			"cluster_pcm_own_writer_activation_token_get");
-		const char *resource_x = strstr(known_new,
-			"cluster_pcm_own_resource_x_activation_generation_get");
+	if (known_new != NULL && known_new_end != NULL) {
+		const char *aux_guard = strstr(known_new, "aux_pin_handoff_protected");
+		const char *pending = strstr(known_new, "PCM_OWN_FLAG_GRANT_PENDING");
+		const char *writer = strstr(known_new, "cluster_pcm_own_writer_activation_token_get");
+		const char *resource_x
+			= strstr(known_new, "cluster_pcm_own_resource_x_activation_generation_get");
 		const char *fork_vm = strstr(known_new, "VISIBILITYMAP_FORKNUM");
 		const char *fork_fsm = strstr(known_new, "FSM_FORKNUM");
 
@@ -968,12 +952,12 @@ UT_TEST(test_aux_direct_init_pending_lifecycle_survives_pin_handoff_only)
 		UT_ASSERT(fork_vm != NULL && fork_vm < known_new_end);
 		UT_ASSERT(fork_fsm != NULL && fork_fsm < known_new_end);
 		UT_ASSERT(strstr(known_new,
-			"BUF_STATE_GET_REFCOUNT(buf_state) != 0\n\t\t|| aux_pin_handoff_protected")
-			< known_new_end);
+						 "BUF_STATE_GET_REFCOUNT(buf_state) != 0\n\t\t|| aux_pin_handoff_protected")
+				  < known_new_end);
 	}
 	if (candidate != NULL && candidate_end != NULL)
-		UT_ASSERT(strstr(candidate,
-			"cluster_bufmgr_pcm_direct_init_known_new_locked(buf, buf_state)")
+		UT_ASSERT(
+			strstr(candidate, "cluster_bufmgr_pcm_direct_init_known_new_locked(buf, buf_state)")
 			< candidate_end);
 	free(bufmgr);
 }
@@ -1033,11 +1017,9 @@ UT_TEST(test_cross_page_heap_pair_second_acquire_never_waits_under_first)
 	UT_ASSERT(pins_end != NULL);
 	UT_ASSERT(relation != NULL);
 	UT_ASSERT(relation_end != NULL);
-	if (helper != NULL && helper_end != NULL)
-	{
+	if (helper != NULL && helper_end != NULL) {
 		assert_ordered(helper, helper_order, lengthof(helper_order));
-		UT_ASSERT(strstr(helper,
-			"ClusterLockBufferExclusiveBarrierAware(second,") == NULL);
+		UT_ASSERT(strstr(helper, "ClusterLockBufferExclusiveBarrierAware(second,") == NULL);
 	}
 	UT_ASSERT(pins != NULL && pins_end != NULL && pins_call != NULL && pins_call < pins_end);
 	UT_ASSERT(lower_branch != NULL && lower_call != NULL && upper_branch != NULL
@@ -1058,21 +1040,26 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 	char *bufmgr = read_source(BUFMGR_SOURCE_PATH);
 	char *heapam = read_source(HEAPAM_SOURCE_PATH);
 	char *hio = read_source(HIO_SOURCE_PATH);
-	char *probes = read_source("../../backend/utils/probes.d");
+	char *probes = read_source(PROBES_SOURCE_PATH);
 	const char *common;
 	const char *update;
-	static const char *const probe_payload[]
-		= { "probe r2__passive__identity__receipt(", "R2SiteId", "R2Phase",
-			"R2SpcOid", "R2DbOid", "R2RelNumber", "R2ForkNumber",
-			"R2BlockNumber", "R2Outcome", "R2ProofMask" };
-	static const char *const common_chain[]
-		= { "CLUSTER_BUFFER_BARRIER_PHASE_LOWER_REFUSED",
-			"CLUSTER_BUFFER_BARRIER_OUTCOME_BARRIER_CLOSED",
-			"CLUSTER_BUFFER_BARRIER_PROOF_LOWER_REFUSED",
-			"cluster_bufmgr_pcm_unwind_barrier_refusal(",
-			"CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY",
-			"CLUSTER_BUFFER_BARRIER_OUTCOME_EMPTY",
-			"CLUSTER_BUFFER_BARRIER_PROOF_COMMON_EMPTY" };
+	static const char *const probe_payload[] = { "probe r2__passive__identity__receipt(",
+												 "R2SiteId",
+												 "R2Phase",
+												 "R2SpcOid",
+												 "R2DbOid",
+												 "R2RelNumber",
+												 "R2ForkNumber",
+												 "R2BlockNumber",
+												 "R2Outcome",
+												 "R2ProofMask" };
+	static const char *const common_chain[] = { "CLUSTER_BUFFER_BARRIER_PHASE_LOWER_REFUSED",
+												"CLUSTER_BUFFER_BARRIER_OUTCOME_BARRIER_CLOSED",
+												"CLUSTER_BUFFER_BARRIER_PROOF_LOWER_REFUSED",
+												"cluster_bufmgr_pcm_unwind_barrier_refusal(",
+												"CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY",
+												"CLUSTER_BUFFER_BARRIER_OUTCOME_EMPTY",
+												"CLUSTER_BUFFER_BARRIER_PROOF_COMMON_EMPTY" };
 	static const char *const heap_sites[]
 		= { "CLUSTER_BUFFER_BARRIER_SITE_HEAP_DELETE_VM",
 			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PRETOAST_VM",
@@ -1080,40 +1067,33 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_PAIR_OLD_SECOND",
 			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_OLD",
 			"CLUSTER_BUFFER_BARRIER_SITE_HEAP_UPDATE_NEW" };
-	static const char *const caller_reentry[]
-		= { "CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST",
-			"CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK",
-			"CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST",
-			"cluster_heap_vm_barrier_warm(",
-			"CLUSTER_BUFFER_BARRIER_PHASE_REENTRY",
-			"CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED",
-			"CLUSTER_BUFFER_BARRIER_PROOF_REENTRY" };
+	static const char *const caller_reentry[] = { "CLUSTER_BUFFER_BARRIER_PHASE_CALLER_POST",
+												  "CLUSTER_BUFFER_BARRIER_OUTCOME_POSTCONDITION_OK",
+												  "CLUSTER_BUFFER_BARRIER_PROOF_CALLER_POST",
+												  "cluster_heap_vm_barrier_warm(",
+												  "CLUSTER_BUFFER_BARRIER_PHASE_REENTRY",
+												  "CLUSTER_BUFFER_BARRIER_OUTCOME_REQUALIFIED",
+												  "CLUSTER_BUFFER_BARRIER_PROOF_REENTRY" };
 
 	UT_ASSERT(bufmgr != NULL);
 	UT_ASSERT(heapam != NULL);
 	UT_ASSERT(hio != NULL);
 	UT_ASSERT(probes != NULL);
-	if (probes != NULL)
-	{
-		UT_ASSERT_EQ(count_occurrences(probes,
-									   "probe r2__passive__identity__receipt("), 1);
+	if (probes != NULL) {
+		UT_ASSERT_EQ(count_occurrences(probes, "probe r2__passive__identity__receipt("), 1);
 		assert_ordered(probes, probe_payload, lengthof(probe_payload));
 		free(probes);
 	}
-	if (bufmgr != NULL)
-	{
+	if (bufmgr != NULL) {
 		common = strstr(bufmgr, "cluster_lockbuffer_barrier_refusal:");
 		UT_ASSERT(common != NULL);
 		if (common != NULL)
 			assert_ordered(common, common_chain, lengthof(common_chain));
-		UT_ASSERT_EQ(count_occurrences(bufmgr,
-									   "TRACE_POSTGRESQL_R2_PASSIVE_IDENTITY_RECEIPT("), 1);
+		UT_ASSERT_EQ(count_occurrences(bufmgr, "TRACE_POSTGRESQL_R2_PASSIVE_IDENTITY_RECEIPT("), 1);
 		free(bufmgr);
 	}
-	if (heapam != NULL)
-	{
-		const char *stamp_helper = strstr(heapam,
-			"cluster_current_mx_stamp_lock_buffer(");
+	if (heapam != NULL) {
+		const char *stamp_helper = strstr(heapam, "cluster_current_mx_stamp_lock_buffer(");
 		static const char *const stamp_helper_chain[]
 			= { "cluster_current_mx_stamp_lock_buffer(",
 				"if (context != NULL)",
@@ -1128,8 +1108,7 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 			UT_ASSERT(strstr(heapam, heap_sites[i]) != NULL);
 		UT_ASSERT(stamp_helper != NULL);
 		if (stamp_helper != NULL)
-			assert_ordered(stamp_helper, stamp_helper_chain,
-						   lengthof(stamp_helper_chain));
+			assert_ordered(stamp_helper, stamp_helper_chain, lengthof(stamp_helper_chain));
 		/* Legacy compatibility stays centralized in the MX helper. Primary
 		 * VM consumers use the explicit-context branch, including DELETE. */
 		UT_ASSERT_EQ(count_occurrences(heapam, "ClusterLockBufferExclusiveBarrierAware("), 1);
@@ -1140,10 +1119,8 @@ UT_TEST(test_d11_passive_identity_probe_has_exact_sites_and_phase_chain)
 			assert_ordered(update, caller_reentry, lengthof(caller_reentry));
 		free(heapam);
 	}
-	if (hio != NULL)
-	{
-		UT_ASSERT_EQ(count_occurrences(hio,
-									   "ClusterLockBufferExclusiveBarrierAware("), 0);
+	if (hio != NULL) {
+		UT_ASSERT_EQ(count_occurrences(hio, "ClusterLockBufferExclusiveBarrierAware("), 0);
 		UT_ASSERT(strstr(hio, "ConditionalLockBuffer(second)") != NULL);
 		free(hio);
 	}
@@ -1173,21 +1150,18 @@ UT_TEST(test_aux_repin_replacement_restarts_from_fresh_relation_ref)
 	UT_ASSERT(bufmgr != NULL);
 	UT_ASSERT(vm != NULL);
 	UT_ASSERT(fsm != NULL);
-	if (bufmgr != NULL)
-	{
-		join_decl = strstr(bufmgr,
-			"static bool\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
-		join = join_decl == NULL ? NULL : strstr(join_decl,
-			"\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
-		join_end = join == NULL ? NULL
-			: strstr(join,
-				"\ntypedef enum ClusterBufmgrPcmDirectInitArmResult");
+	if (bufmgr != NULL) {
+		join_decl = strstr(bufmgr, "static bool\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
+		join = join_decl == NULL
+				   ? NULL
+				   : strstr(join_decl, "\ncluster_bufmgr_pcm_join_aux_direct_init_exact(");
+		join_end = join == NULL
+					   ? NULL
+					   : strstr(join, "\ntypedef enum ClusterBufmgrPcmDirectInitArmResult");
 		gate = strstr(bufmgr, "\ncluster_bufmgr_pcm_gate_direct_init(");
 		gate_end = gate == NULL ? NULL : strstr(gate, "\n}\n\n#endif");
 		aux = strstr(bufmgr, "\nLockBufferForAuxiliaryPageInit(");
-		aux_end = aux == NULL ? NULL
-			: strstr(aux,
-				"\nBuffer\nLockBufferForVisibilityMapPageInit(");
+		aux_end = aux == NULL ? NULL : strstr(aux, "\nBuffer\nLockBufferForVisibilityMapPageInit(");
 
 		UT_ASSERT(join != NULL);
 		UT_ASSERT(join_end != NULL);
@@ -1195,49 +1169,38 @@ UT_TEST(test_aux_repin_replacement_restarts_from_fresh_relation_ref)
 		UT_ASSERT(gate_end != NULL);
 		UT_ASSERT(aux != NULL);
 		UT_ASSERT(aux_end != NULL);
-		if (join != NULL && join_end != NULL)
-		{
+		if (join != NULL && join_end != NULL) {
 			UT_ASSERT(strstr(join, "pin_handoff.active = false;") < join_end);
-			UT_ASSERT(strstr(join,
-				"cluster_bufmgr_resource_x_fail_closed_current()") == NULL
-				|| strstr(join,
-					"cluster_bufmgr_resource_x_fail_closed_current()") >= join_end);
+			UT_ASSERT(strstr(join, "cluster_bufmgr_resource_x_fail_closed_current()") == NULL
+					  || strstr(join, "cluster_bufmgr_resource_x_fail_closed_current()")
+							 >= join_end);
 		}
-		if (gate != NULL && gate_end != NULL)
-		{
+		if (gate != NULL && gate_end != NULL) {
 			UT_ASSERT(strstr(gate, "bool *pin_replaced") < gate_end);
-			repin = strstr(gate,
-				"cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(");
-			post_t3 = strstr(gate,
-				"The terminal round has already completed T2/T3");
+			repin = strstr(gate, "cluster_bufmgr_pcm_aux_pin_handoff_finish_exact(");
+			post_t3 = strstr(gate, "The terminal round has already completed T2/T3");
 			UT_ASSERT(repin != NULL);
 			UT_ASSERT(post_t3 != NULL);
-			if (repin != NULL && post_t3 != NULL)
-			{
+			if (repin != NULL && post_t3 != NULL) {
 				UT_ASSERT(repin < post_t3);
 				UT_ASSERT(strstr(repin, "*pin_replaced = true;") < post_t3);
 				UT_ASSERT(strstr(repin, "return false;") < post_t3);
 				UT_ASSERT(strstr(repin, "if (pin_replaced == NULL)") < post_t3);
-				UT_ASSERT(strstr(repin,
-					"cluster_bufmgr_resource_x_fail_closed_current()") < post_t3);
+				UT_ASSERT(strstr(repin, "cluster_bufmgr_resource_x_fail_closed_current()")
+						  < post_t3);
 			}
 		}
-		if (aux != NULL && aux_end != NULL)
-		{
+		if (aux != NULL && aux_end != NULL) {
 			UT_ASSERT(strstr(aux, "static Buffer") < aux);
 			UT_ASSERT(strstr(aux, "bool pin_replaced = false;") < aux_end);
 			UT_ASSERT(strstr(aux, "return InvalidBuffer;") < aux_end);
 		}
 		free(bufmgr);
 	}
-	if (vm != NULL)
-	{
-		const char *lock = strstr(vm,
-			"buf = LockBufferForVisibilityMapPageInit(buf);");
-		const char *invalid = lock == NULL ? NULL
-			: strstr(lock, "if (!BufferIsValid(buf))");
-		const char *retry = invalid == NULL ? NULL
-			: strstr(invalid, "continue;");
+	if (vm != NULL) {
+		const char *lock = strstr(vm, "buf = LockBufferForVisibilityMapPageInit(buf);");
+		const char *invalid = lock == NULL ? NULL : strstr(lock, "if (!BufferIsValid(buf))");
+		const char *retry = invalid == NULL ? NULL : strstr(invalid, "continue;");
 
 		UT_ASSERT(lock != NULL);
 		UT_ASSERT(invalid != NULL);
@@ -1246,14 +1209,10 @@ UT_TEST(test_aux_repin_replacement_restarts_from_fresh_relation_ref)
 			UT_ASSERT(lock < invalid && invalid < retry);
 		free(vm);
 	}
-	if (fsm != NULL)
-	{
-		const char *lock = strstr(fsm,
-			"buf = LockBufferForFreeSpaceMapPageInit(buf);");
-		const char *invalid = lock == NULL ? NULL
-			: strstr(lock, "if (!BufferIsValid(buf))");
-		const char *retry = invalid == NULL ? NULL
-			: strstr(invalid, "continue;");
+	if (fsm != NULL) {
+		const char *lock = strstr(fsm, "buf = LockBufferForFreeSpaceMapPageInit(buf);");
+		const char *invalid = lock == NULL ? NULL : strstr(lock, "if (!BufferIsValid(buf))");
+		const char *retry = invalid == NULL ? NULL : strstr(invalid, "continue;");
 
 		UT_ASSERT(lock != NULL);
 		UT_ASSERT(invalid != NULL);
@@ -1282,52 +1241,42 @@ UT_TEST(test_ordinary_aux_repin_replacement_reaches_heap_retry)
 
 	UT_ASSERT(bufmgr != NULL);
 	UT_ASSERT(heapam != NULL);
-	if (bufmgr != NULL)
-	{
-		wrapper = strstr(bufmgr,
-			"ClusterLockBufferExclusiveBarrierAware(Buffer buffer,");
-		wrapper_end = wrapper == NULL ? NULL
-			: strstr(wrapper, "\n}\n\n/*\n * Resource-X aware EXCLUSIVE lock");
+	if (bufmgr != NULL) {
+		wrapper = strstr(bufmgr, "ClusterLockBufferExclusiveBarrierAware(Buffer buffer,");
+		wrapper_end = wrapper == NULL
+						  ? NULL
+						  : strstr(wrapper, "\n}\n\n/*\n * Resource-X aware EXCLUSIVE lock");
 		refusal = strstr(bufmgr, "cluster_lockbuffer_barrier_refusal:");
 
 		UT_ASSERT(wrapper != NULL);
 		UT_ASSERT(wrapper_end != NULL);
 		UT_ASSERT(refusal != NULL);
-		if (wrapper != NULL && wrapper_end != NULL)
-		{
+		if (wrapper != NULL && wrapper_end != NULL) {
 			UT_ASSERT(strstr(wrapper, "bool *pin_replaced") < wrapper_end);
 			UT_ASSERT(strstr(wrapper, "&transient_refused") < wrapper_end);
 			UT_ASSERT(strstr(wrapper, "*pin_replaced = replaced") < wrapper_end);
 			UT_ASSERT(strstr(wrapper, "&& !replaced") < wrapper_end);
 		}
-		if (refusal != NULL)
-		{
-			const char *common_empty = strstr(refusal,
-				"CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY");
+		if (refusal != NULL) {
+			const char *common_empty = strstr(refusal, "CLUSTER_BUFFER_BARRIER_PHASE_COMMON_EMPTY");
 
 			UT_ASSERT(common_empty != NULL);
-			if (common_empty != NULL)
-			{
-				UT_ASSERT(strstr(refusal, "if (pcm_pin_replaced != NULL)")
-					< common_empty);
-				UT_ASSERT(strstr(refusal, "*pcm_pin_replaced = true;")
-					< common_empty);
+			if (common_empty != NULL) {
+				UT_ASSERT(strstr(refusal, "if (pcm_pin_replaced != NULL)") < common_empty);
+				UT_ASSERT(strstr(refusal, "*pcm_pin_replaced = true;") < common_empty);
 			}
 		}
 		free(bufmgr);
 	}
-	if (heapam != NULL)
-	{
+	if (heapam != NULL) {
 		helper = strstr(heapam, "cluster_current_mx_stamp_lock_buffer(");
 		helper_end = helper == NULL ? NULL : strstr(helper, "\n}\n");
 		UT_ASSERT(helper != NULL);
 		UT_ASSERT(helper_end != NULL);
-		if (helper != NULL && helper_end != NULL)
-		{
+		if (helper != NULL && helper_end != NULL) {
 			UT_ASSERT(strstr(helper, "bool *pin_replaced") < helper_end);
-			UT_ASSERT(strstr(helper,
-				"ClusterLockBufferExclusiveBarrierAware(buffer, site,")
-				< helper_end);
+			UT_ASSERT(strstr(helper, "ClusterLockBufferExclusiveBarrierAware(buffer, site,")
+					  < helper_end);
 		}
 		UT_ASSERT(strstr(heapam, "refused_pin_replaced = false;") != NULL);
 		UT_ASSERT(strstr(heapam, "if (refused_pin_replaced)") != NULL);

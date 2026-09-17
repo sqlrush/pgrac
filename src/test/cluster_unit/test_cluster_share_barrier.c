@@ -32,8 +32,7 @@
 UT_DEFINE_GLOBALS();
 
 
-typedef enum FixtureAction
-{
+typedef enum FixtureAction {
 	ACTION_ABORT_HOLDER = 1,
 	ACTION_ABORT_WRITER,
 	ACTION_RELEASE_MASTER,
@@ -42,24 +41,23 @@ typedef enum FixtureAction
 	ACTION_PROVE_EMPTY
 } FixtureAction;
 
-typedef struct BarrierFixture
-{
-	bool		content_lock;
-	bool		holder;
-	bool		writer;
-	bool		pending;
-	bool		master_grant;
-	bool		cached_share_cover;
-	bool		outer_lock;
-	bool		first_buffer_lock;
-	int			pins;
+typedef struct BarrierFixture {
+	bool content_lock;
+	bool holder;
+	bool writer;
+	bool pending;
+	bool master_grant;
+	bool cached_share_cover;
+	bool outer_lock;
+	bool first_buffer_lock;
+	int pins;
 	ClusterBufferBarrierCleanupResult holder_result;
 	ClusterBufferBarrierCleanupResult writer_result;
 	ClusterBufferBarrierCleanupResult master_result;
 	ClusterBufferBarrierCleanupResult converge_result;
 	ClusterBufferBarrierCleanupResult pending_result;
 	FixtureAction actions[8];
-	int			action_count;
+	int action_count;
 } BarrierFixture;
 
 void
@@ -137,25 +135,23 @@ fixture_prove_empty(void *context)
 	BarrierFixture *fixture = context;
 
 	record_action(fixture, ACTION_PROVE_EMPTY);
-	return !fixture->content_lock && !fixture->holder && !fixture->writer
-		&& !fixture->pending && !fixture->master_grant;
+	return !fixture->content_lock && !fixture->holder && !fixture->writer && !fixture->pending
+		   && !fixture->master_grant;
 }
 
-static const ClusterBufferBarrierUnwindOps fixture_ops = {
-	.abort_holder = fixture_abort_holder,
-	.abort_writer = fixture_abort_writer,
-	.release_master = fixture_release_master,
-	.converge_local = fixture_converge_local,
-	.abort_pending = fixture_abort_pending,
-	.prove_empty = fixture_prove_empty
-};
+static const ClusterBufferBarrierUnwindOps fixture_ops = { .abort_holder = fixture_abort_holder,
+														   .abort_writer = fixture_abort_writer,
+														   .release_master = fixture_release_master,
+														   .converge_local = fixture_converge_local,
+														   .abort_pending = fixture_abort_pending,
+														   .prove_empty = fixture_prove_empty };
 
 static BarrierFixture
 clean_fixture(void)
 {
 	BarrierFixture fixture;
 
-	MemSet(&fixture, 0, sizeof(fixture));
+	memset(&fixture, 0, sizeof(fixture));
 	fixture.outer_lock = true;
 	fixture.first_buffer_lock = true;
 	fixture.cached_share_cover = true;
@@ -167,8 +163,7 @@ UT_TEST(test_u1_early_barrier_proves_empty)
 {
 	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT_EQ(fixture.action_count, 3);
 	UT_ASSERT_EQ(fixture.actions[2], ACTION_PROVE_EMPTY);
@@ -178,8 +173,7 @@ UT_TEST(test_u2_cached_cover_is_not_released)
 {
 	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT(!fixture.master_grant);
 	UT_ASSERT(fixture.cached_share_cover);
@@ -191,8 +185,7 @@ UT_TEST(test_u3_read_image_clears_exact_pending)
 	BarrierFixture fixture = clean_fixture();
 
 	fixture.pending = true;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, true),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, true),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT(!fixture.pending);
 	UT_ASSERT_EQ(fixture.actions[2], ACTION_ABORT_PENDING);
@@ -204,8 +197,7 @@ UT_TEST(test_u4_durable_grant_releases_master_before_local)
 
 	fixture.pending = true;
 	fixture.master_grant = true;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  true, true),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, true, true),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT_EQ(fixture.actions[2], ACTION_RELEASE_MASTER);
 	UT_ASSERT_EQ(fixture.actions[3], ACTION_CONVERGE_LOCAL);
@@ -216,8 +208,7 @@ UT_TEST(test_u5_rearm_barrier_does_not_abort_twice)
 {
 	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT_EQ(fixture.action_count, 3);
 }
@@ -228,16 +219,14 @@ UT_TEST(test_u6_holder_is_removed_before_clean_return)
 	BarrierFixture deferred = clean_fixture();
 
 	fixture.holder = true;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT(!fixture.holder);
 	UT_ASSERT_EQ(fixture.actions[2], ACTION_PROVE_EMPTY);
 
 	deferred.holder = true;
 	deferred.holder_result = CLUSTER_BUFFER_BARRIER_DEFERRED;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &deferred,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &deferred, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_HOLDER_NOT_EMPTY);
 	UT_ASSERT(deferred.holder);
 }
@@ -249,8 +238,7 @@ UT_TEST(test_u7_master_release_failure_preserves_pending)
 	fixture.pending = true;
 	fixture.master_grant = true;
 	fixture.master_result = CLUSTER_BUFFER_BARRIER_FAILED;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  true, true),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, true, true),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_MASTER_RELEASE_FAILED);
 	UT_ASSERT(fixture.pending);
 	UT_ASSERT(fixture.master_grant);
@@ -263,8 +251,7 @@ UT_TEST(test_u8_local_convergence_failure_is_not_clean)
 	fixture.pending = true;
 	fixture.master_grant = true;
 	fixture.converge_result = CLUSTER_BUFFER_BARRIER_FAILED;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  true, true),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, true, true),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_LOCAL_CONVERGENCE_FAILED);
 	UT_ASSERT(fixture.pending);
 	UT_ASSERT(!fixture.master_grant);
@@ -274,8 +261,7 @@ UT_TEST(test_u9_clean_success_is_the_only_false_postcondition)
 {
 	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT(!fixture.content_lock);
 }
@@ -286,16 +272,14 @@ UT_TEST(test_u10_exclusive_writer_cleanup_is_exact)
 	BarrierFixture deferred = clean_fixture();
 
 	fixture.writer = true;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT(!fixture.writer);
 	UT_ASSERT(fixture.outer_lock);
 
 	deferred.writer = true;
 	deferred.writer_result = CLUSTER_BUFFER_BARRIER_DEFERRED;
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &deferred,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &deferred, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_WRITER_NOT_EMPTY);
 	UT_ASSERT(deferred.writer);
 }
@@ -304,8 +288,7 @@ UT_TEST(test_u11_two_buffer_outer_lock_stays_owned)
 {
 	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT(fixture.first_buffer_lock);
 }
@@ -314,8 +297,7 @@ UT_TEST(test_u12_pins_and_outer_ownership_are_unchanged)
 {
 	BarrierFixture fixture = clean_fixture();
 
-	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture,
-												  false, false),
+	UT_ASSERT_EQ(cluster_buffer_barrier_unwind_execute(&fixture_ops, &fixture, false, false),
 				 CLUSTER_BUFFER_BARRIER_UNWIND_OK);
 	UT_ASSERT_EQ(fixture.pins, 2);
 	UT_ASSERT(fixture.outer_lock);

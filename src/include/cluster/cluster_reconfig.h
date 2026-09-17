@@ -541,8 +541,8 @@ extern void cluster_reconfig_get_last_event(ReconfigEvent *out);
  * reconfig event -- the GRD recovery IDLE tick must hold its baseline instead
  * of re-capturing the post-bump epoch (else WAIT_EPOCH wedges). */
 extern bool cluster_reconfig_has_pending_prebump_stage(void);
-extern bool cluster_reconfig_capture_formation_snapshot_v1(
-	uint16 origin_thread, struct ClusterFormationSnapshotV1 *out);
+extern bool cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
+														   struct ClusterFormationSnapshotV1 *out);
 
 
 /* ============================================================
@@ -636,53 +636,45 @@ extern uint64 cluster_reconfig_compute_event_id_v2(
 
 /* Build, but do not publish or apply, the exact node-local kind-6 observer
  * assertion. Durable JCMK/ballot recovery remains the caller's prerequisite. */
-extern bool cluster_reconfig_build_replacement_committed_event(
-	const ClusterReplacementEpisode *episode, int32 observer_role,
-	TimestampTz applied_at, ReconfigEvent *out_event);
+extern bool
+cluster_reconfig_build_replacement_committed_event(const ClusterReplacementEpisode *episode,
+												   int32 observer_role, TimestampTz applied_at,
+												   ReconfigEvent *out_event);
 
 /* Pure replacement-GRD basis gate.  The caller supplies a locally published
  * kind-6 assertion and a majority-recovered COMMITTED_CLOSED marker; success
  * exposes only the immutable durable survivor set and committed epoch. */
 extern bool cluster_reconfig_replacement_grd_basis_authorized(
 	const ReconfigEvent *event, const ClusterReplacementEpisode *episode,
-	const ClusterReplacementCommitMarkerV3 *committed_marker,
-	int32 local_node_id,
-	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
-	uint64 *out_epoch);
+	const ClusterReplacementCommitMarkerV3 *committed_marker, int32 local_node_id,
+	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], uint64 *out_epoch);
 extern bool cluster_reconfig_lmon_snapshot_replacement_grd_basis(
-	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES],
-	uint64 *out_epoch);
+	uint8 out_survivors[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES], uint64 *out_epoch);
 
 /* Phase-1 opcode-18 pre-mutation gate.  This only validates the already-
  * recovered RESERVE/ballot, durable PREPARE and node-local episode; it neither
  * publishes the target fence nor performs purge/ACK work. */
 extern bool cluster_reconfig_replacement_purge_request_authorized(
-	const ClusterReplacementWireMessage *request,
-	int32 authenticated_source_node_id, int32 local_receiver_node_id,
-	const ClusterEpochAuthorityValue *settled_reserve,
+	const ClusterReplacementWireMessage *request, int32 authenticated_source_node_id,
+	int32 local_receiver_node_id, const ClusterEpochAuthorityValue *settled_reserve,
 	const ClusterEpochBallotId *settled_ballot,
 	const ClusterReplacementCommitMarkerV3 *durable_prepare);
 extern bool cluster_reconfig_replacement_purge_request_ingress_authorized(
 	const ClusterICEnvelope *env, const void *payload, uint32 payload_length,
 	int32 authenticated_source_node_id, int32 local_receiver_node_id,
-	const ClusterEpochAuthorityValue *settled_reserve,
-	const ClusterEpochBallotId *settled_ballot,
+	const ClusterEpochAuthorityValue *settled_reserve, const ClusterEpochBallotId *settled_ballot,
 	const ClusterReplacementCommitMarkerV3 *durable_prepare,
 	ClusterReplacementWireMessage *out_request);
 extern bool cluster_reconfig_replacement_purge_ack_authorized(
-	const ClusterReplacementWireMessage *ack,
-	int32 authenticated_source_node_id, int32 local_receiver_node_id,
-	const ClusterEpochAuthorityValue *settled_reserve,
+	const ClusterReplacementWireMessage *ack, int32 authenticated_source_node_id,
+	int32 local_receiver_node_id, const ClusterEpochAuthorityValue *settled_reserve,
 	const ClusterEpochBallotId *settled_ballot,
-	const ClusterReplacementCommitMarkerV3 *durable_prepare,
-	int32 *out_ack_node_id);
+	const ClusterReplacementCommitMarkerV3 *durable_prepare, int32 *out_ack_node_id);
 extern bool cluster_reconfig_replacement_purge_ack_ingress_authorized(
 	const ClusterICEnvelope *env, const void *payload, uint32 payload_length,
 	int32 authenticated_source_node_id, int32 local_receiver_node_id,
-	const ClusterEpochAuthorityValue *settled_reserve,
-	const ClusterEpochBallotId *settled_ballot,
-	const ClusterReplacementCommitMarkerV3 *durable_prepare,
-	int32 *out_ack_node_id);
+	const ClusterEpochAuthorityValue *settled_reserve, const ClusterEpochBallotId *settled_ballot,
+	const ClusterReplacementCommitMarkerV3 *durable_prepare, int32 *out_ack_node_id);
 
 /*
  * spec-5.15 D1/D4 — qvotec publishes the freshest observed voting-slot
@@ -726,8 +718,7 @@ extern bool cluster_reconfig_get_observed_fresh_alive(int32 node_id);
 extern void cluster_reconfig_bootstrap_publish_begin(void);
 extern void cluster_reconfig_bootstrap_publish_in_quorum(bool in_quorum);
 extern void cluster_reconfig_bootstrap_publish_end(void);
-extern bool cluster_reconfig_bootstrap_proof_node(int32 node_id,
-												  uint64 *out_incarnation);
+extern bool cluster_reconfig_bootstrap_proof_node(int32 node_id, uint64 *out_incarnation);
 
 /*
  * spec-5.15 Hardening v1.1 (HF-1 / INV-J9): true iff a majority of the current
@@ -787,25 +778,25 @@ cluster_reconfig_submit_join_marker(int32 target_node, const ClusterJoinCommitMa
 extern bool cluster_reconfig_submit_join_marker_async(ClusterMarkerAsync *a, int32 target_node,
 													  const ClusterJoinCommitMarker *m,
 													  ClusterMarkerAsyncKind kind, TimestampTz now);
-extern bool cluster_reconfig_submit_replacement_marker_v3_async(
-	ClusterMarkerAsync *a, int32 target_node,
-	const ClusterReplacementCommitMarkerV3 *marker,
-	ClusterMarkerAsyncKind kind, TimestampTz now);
-extern bool cluster_reconfig_verify_replacement_committed_closed_async(
-	ClusterMarkerAsync *a, int32 target_node, TimestampTz now);
+extern bool
+cluster_reconfig_submit_replacement_marker_v3_async(ClusterMarkerAsync *a, int32 target_node,
+													const ClusterReplacementCommitMarkerV3 *marker,
+													ClusterMarkerAsyncKind kind, TimestampTz now);
+extern bool cluster_reconfig_verify_replacement_committed_closed_async(ClusterMarkerAsync *a,
+																	   int32 target_node,
+																	   TimestampTz now);
 extern ClusterMarkerPollResult cluster_reconfig_poll_join_marker_async(ClusterMarkerAsync *a,
-															   TimestampTz now,
-															   uint32 *out_result,
-															   uint64 *out_elapsed_us);
-extern bool cluster_reconfig_join_qvotec_poll_pending(
-	ClusterJoinMarkerMailboxOperationV1 *operation_out,
-	int32 *target_node_out, void *write_slot512_out);
-extern void cluster_reconfig_join_qvotec_complete(
-	ClusterJoinMarkerMailboxOperationV1 operation, bool acked,
-	const uint8 *verified_image96);
-extern bool cluster_reconfig_qvotec_lifecycle_transition(
-	ClusterQvotecMailbox *authority_mailbox,
-	pg_atomic_uint32 *qvotec_status, ClusterQvotecStatus next_status);
+																	   TimestampTz now,
+																	   uint32 *out_result,
+																	   uint64 *out_elapsed_us);
+extern bool
+cluster_reconfig_join_qvotec_poll_pending(ClusterJoinMarkerMailboxOperationV1 *operation_out,
+										  int32 *target_node_out, void *write_slot512_out);
+extern void cluster_reconfig_join_qvotec_complete(ClusterJoinMarkerMailboxOperationV1 operation,
+												  bool acked, const uint8 *verified_image96);
+extern bool cluster_reconfig_qvotec_lifecycle_transition(ClusterQvotecMailbox *authority_mailbox,
+														 pg_atomic_uint32 *qvotec_status,
+														 ClusterQvotecStatus next_status);
 extern void cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch);
 
 /* RF-ROOT P9 verification / cold-formation cold-formation ruling —
@@ -813,14 +804,13 @@ extern void cluster_reconfig_publish_join_qvotec_latch(struct Latch *latch);
  * LMON submits a COMMITTED marker + target co-boot member set; qvotec
  * writes it to every target member's slot on every disk and completes only
  * on a majority write + majority exact readback. */
-extern bool cluster_reconfig_formation_qvotec_poll_pending(
-	ClusterFormationMarkerSubmitRequest *out);
+extern bool
+cluster_reconfig_formation_qvotec_poll_pending(ClusterFormationMarkerSubmitRequest *out);
 extern void cluster_reconfig_formation_qvotec_complete(bool success);
-extern void cluster_reconfig_formation_qvotec_note_max_generation(
-	uint64 generation);
-extern void cluster_reconfig_formation_qvotec_publish_observed(
-	const ClusterFormationCommitMarker *marker,
-	const uint64 *incarnation_by_node);
+extern void cluster_reconfig_formation_qvotec_note_max_generation(uint64 generation);
+extern void
+cluster_reconfig_formation_qvotec_publish_observed(const ClusterFormationCommitMarker *marker,
+												   const uint64 *incarnation_by_node);
 extern void cluster_reconfig_formation_qvotec_clear_observed(void);
 extern void cluster_reconfig_publish_formation_qvotec_latch(struct Latch *latch);
 extern void cluster_reconfig_cold_formation_tick(void);
@@ -878,8 +868,8 @@ extern bool cluster_reconfig_self_join_admitted(void); /* RF-ROOT P6 */
  * current QVOTEC peer identity, exact admitted membership, and the already-
  * published stripe face.  It grants neither membership nor xid authority. */
 extern bool cluster_reconfig_epoch0_late_founder_evidence_current(void);
-extern bool cluster_reconfig_stage_pre_publish_join_handoff(
-	uint64 expected_self_incarnation, uint64 expected_predecessor_floor);
+extern bool cluster_reconfig_stage_pre_publish_join_handoff(uint64 expected_self_incarnation,
+															uint64 expected_predecessor_floor);
 extern bool cluster_reconfig_pre_publish_join_handoff_current(void);
 
 /* spec-5.15A closed replacement admission.  A canonical local ADMITTED
@@ -887,29 +877,29 @@ extern bool cluster_reconfig_pre_publish_join_handoff_current(void);
  * closed.  The later uniform-OPEN seam is declared separately below. */
 extern bool cluster_reconfig_publish_replacement_member_closed(
 	const ClusterReplacementEpisode *admitted_episode);
-extern bool cluster_reconfig_qvotec_observe_replacement_admitted(
-	const int *fds, int n_disks, uint64 live_incarnation);
+extern bool cluster_reconfig_qvotec_observe_replacement_admitted(const int *fds, int n_disks,
+																 uint64 live_incarnation);
 
 /* Called only by the uniform-OPEN owner after the cluster-wide OPEN/ACK gate.
  * The local gate opens only when the caller's full episode and explicit
  * generation are byte-identical to the stored ADMITTED MEMBER episode. */
-extern bool cluster_reconfig_open_replacement_admission(
-	const ClusterReplacementEpisode *expected_episode,
-	uint32 expected_state_generation);
+extern bool
+cluster_reconfig_open_replacement_admission(const ClusterReplacementEpisode *expected_episode,
+											uint32 expected_state_generation);
 
 /* Formation-LMON-only phase-3 observer.  The authenticated handoff alone can
  * never write JCMK, publish MEMBER, or open admission. */
-extern bool cluster_reconfig_lmon_observe_replacement_ready(
-	const ClusterReplacementPhase3HandoffItem *item);
-extern bool cluster_reconfig_lmon_build_replacement_admitted(
-	const ClusterEpochAuthorityValue *terminal_head,
-	ClusterReplacementCommitMarkerV3 *out_marker);
+extern bool
+cluster_reconfig_lmon_observe_replacement_ready(const ClusterReplacementPhase3HandoffItem *item);
+extern bool
+cluster_reconfig_lmon_build_replacement_admitted(const ClusterEpochAuthorityValue *terminal_head,
+												 ClusterReplacementCommitMarkerV3 *out_marker);
 extern bool cluster_reconfig_lmon_finalize_replacement_admitted(
 	const ClusterEpochAuthorityValue *terminal_head,
 	const ClusterReplacementCommitMarkerV3 *admitted_marker);
-extern bool cluster_reconfig_lmon_snapshot_replacement_admitted(
-	ClusterReplacementEpisode *out_episode,
-	ClusterReplacementCommitMarkerV3 *out_marker);
+extern bool
+cluster_reconfig_lmon_snapshot_replacement_admitted(ClusterReplacementEpisode *out_episode,
+													ClusterReplacementCommitMarkerV3 *out_marker);
 
 /* D13 initial-clean formation basis.  This stack-only image is not a new
  * authority: it exposes the exact current four-node identity only while every
@@ -938,14 +928,13 @@ typedef struct ClusterR4MembershipSnapshot {
 	uint64 local_self_boot_incarnation;
 } ClusterR4MembershipSnapshot;
 
-extern bool cluster_reconfig_snapshot_initial_clean_formation(
-	ClusterInitialCleanFormationSnapshot *out);
-extern bool cluster_reconfig_lmon_snapshot_r4_membership(
-	ClusterR4MembershipSnapshot *out);
+extern bool
+cluster_reconfig_snapshot_initial_clean_formation(ClusterInitialCleanFormationSnapshot *out);
+extern bool cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnapshot *out);
 /* Formation-LMON-only coherent MEMBER/epoch sample for PGSA reconstruction. */
-extern bool cluster_reconfig_lmon_snapshot_admitted_membership(
-	uint64 *out_members_lo, uint64 *out_members_hi,
-	uint64 *out_formation_epoch);
+extern bool cluster_reconfig_lmon_snapshot_admitted_membership(uint64 *out_members_lo,
+															   uint64 *out_members_hi,
+															   uint64 *out_formation_epoch);
 /* Existing exact terminal receipt proof may replace remote online liveness
  * only for normal-stop observation. No new admission or mutable authority. */
 extern bool cluster_reconfig_normal_stop_snapshot_admitted_membership(
@@ -958,15 +947,13 @@ extern void cluster_reconfig_lmon_replacement_ready_tick(void);
 extern void cluster_reconfig_lmon_replacement_admit_tick(void);
 extern void cluster_reconfig_lmon_replacement_closed_tick(void);
 extern ClusterReplacementCommittedClosedPublishResultV1
-cluster_reconfig_lmon_publish_replacement_committed_closed(
-	uint64 authority_request_seq, uint64 marker_request_seq);
+cluster_reconfig_lmon_publish_replacement_committed_closed(uint64 authority_request_seq,
+														   uint64 marker_request_seq);
 
 /* Reconfiguration is the sole owner of the replacement episode/JCMK
  * co-sample behind the public R4A prerequisite facade. */
-extern ClusterR4PrerequisiteSnapshot
-cluster_reconfig_r4_prerequisite_snapshot(void);
-extern bool cluster_reconfig_r4_publish_ready(
-	const ClusterR4PrerequisiteSnapshot *expected);
+extern ClusterR4PrerequisiteSnapshot cluster_reconfig_r4_prerequisite_snapshot(void);
+extern bool cluster_reconfig_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected);
 
 
 /* ============================================================

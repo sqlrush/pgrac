@@ -80,7 +80,7 @@ static ClusterPageVersion ut_v[3];
 static void
 ut_setup_globals(void)
 {
-	int			i;
+	int i;
 
 	memset(&ut_id, 0, sizeof(ut_id));
 	ut_id.rlocator.spcOid = 1;
@@ -93,7 +93,7 @@ ut_setup_globals(void)
 		memset(&ut_v[i], 0, sizeof(ut_v[i]));
 		ut_v[i].identity = ut_id;
 		ut_v[i].incarnation = 7;
-		ut_v[i].token = (uint64) (100 + i);
+		ut_v[i].token = (uint64)(100 + i);
 	}
 }
 
@@ -108,22 +108,20 @@ UT_TEST(test_u17_l1_production_reachable_and_consistent)
 	ClusterPageApplyVerdict verdict;
 
 	memset(&cin, 0, sizeof(cin));
-	cin.rmid = 10;			   /* RM_HEAP_ID (census-registered shape) */
-	cin.opcode = 0x10;		   /* XLOG_HEAP_INSERT-shaped */
+	cin.rmid = 10;	   /* RM_HEAP_ID (census-registered shape) */
+	cin.opcode = 0x10; /* XLOG_HEAP_INSERT-shaped */
 	cin.forknum = MAIN_FORKNUM;
 	cin.header_owner = CLUSTER_PAGE_HEADER_OWNER_NONE;
 	/* The probe's classify shape: a registered main-fork delta is NORMAL
 	 * only after the census wiring; without it the honest UNKNOWN. */
 	cls = cluster_page_classify(&cin);
-	UT_ASSERT(cls == CLUSTER_PAGE_CLASS_UNKNOWN
-			  || cls == CLUSTER_PAGE_CLASS_NORMAL);
+	UT_ASSERT(cls == CLUSTER_PAGE_CLASS_UNKNOWN || cls == CLUSTER_PAGE_CLASS_NORMAL);
 	/* The probe's admission shape: no VersionToken producer yet -> the
 	 * decision fails closed. */
 	verdict = cluster_page_version_decide(NULL, NULL, NULL, NULL);
-	UT_ASSERT_EQ((int) verdict, (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)verdict, (int)CLUSTER_PAGE_APPLY_BLOCKED);
 	/* Deterministic: same inputs, same outputs (L1 cold/online). */
-	UT_ASSERT_EQ((int) cluster_page_version_decide(NULL, NULL, NULL, NULL),
-				 (int) verdict);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(NULL, NULL, NULL, NULL), (int)verdict);
 }
 
 /* L3: commit cuts — TT write/fsync/terminal missing one-at-a-time keep
@@ -138,8 +136,7 @@ UT_TEST(test_l3_commit_cuts_blocked_until_truth_complete)
 	prepare.pending_durable_ok = true;
 	prepare.tt_undo_match = true;
 	prepare.gid_identity_match = true;
-	UT_ASSERT_EQ((int) cluster_side_prepared_verdict(&prepare),
-				 (int) CLUSTER_SIDE_PREPARED_IN_DOUBT);
+	UT_ASSERT_EQ((int)cluster_side_prepared_verdict(&prepare), (int)CLUSTER_SIDE_PREPARED_IN_DOUBT);
 
 	memset(&resolve, 0, sizeof(resolve));
 	resolve.terminal_redo_ok = true;
@@ -164,11 +161,9 @@ UT_TEST(test_l5_prepare_restart_in_doubt)
 	prepare.gid_identity_match = true;
 	/* A restart with the same durable evidence keeps IN_DOUBT (never a
 	 * guessed abort). */
-	UT_ASSERT_EQ((int) cluster_side_prepared_verdict(&prepare),
-				 (int) CLUSTER_SIDE_PREPARED_IN_DOUBT);
+	UT_ASSERT_EQ((int)cluster_side_prepared_verdict(&prepare), (int)CLUSTER_SIDE_PREPARED_IN_DOUBT);
 	prepare.pending_durable_ok = false; /* pending write cut */
-	UT_ASSERT_EQ((int) cluster_side_prepared_verdict(&prepare),
-				 (int) CLUSTER_SIDE_PREPARED_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_side_prepared_verdict(&prepare), (int)CLUSTER_SIDE_PREPARED_BLOCKED);
 }
 
 /* L7: CLOG miss fails closed until the truth rebuild completes. */
@@ -178,13 +173,11 @@ UT_TEST(test_l7_clog_miss_fail_closed)
 
 	memset(&verify, 0, sizeof(verify));
 	verify.canonical_truth_ok = false;
-	UT_ASSERT(!cluster_side_projection_verified(CLUSTER_SIDE_PROJECTION_CLOG,
-												&verify));
-	UT_ASSERT_EQ((int) cluster_side_projection_lookup(false),
-				 (int) CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED);
+	UT_ASSERT(!cluster_side_projection_verified(CLUSTER_SIDE_PROJECTION_CLOG, &verify));
+	UT_ASSERT_EQ((int)cluster_side_projection_lookup(false),
+				 (int)CLUSTER_SIDE_PROJECTION_LOOKUP_FAIL_CLOSED);
 	/* Rebuild from canonical truth (CLOG needs no redo retention). */
-	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_CLOG,
-												  false, true));
+	UT_ASSERT(cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_CLOG, false, true));
 }
 
 /* L8: MULTIXACT retire denied while the consumer still needs the redo. */
@@ -192,8 +185,7 @@ UT_TEST(test_l8_multixact_retire_denied)
 {
 	/* Source not retained -> not rebuildable -> the projection cannot
 	 * survive retirement -> deny. */
-	UT_ASSERT(!cluster_side_projection_rebuildable(
-				  CLUSTER_SIDE_PROJECTION_MULTIXACT, false, true));
+	UT_ASSERT(!cluster_side_projection_rebuildable(CLUSTER_SIDE_PROJECTION_MULTIXACT, false, true));
 	/* And the retention exporter denies on any missing post-read. */
 	{
 		ClusterSideRetentionProof retention;
@@ -204,16 +196,15 @@ UT_TEST(test_l8_multixact_retire_denied)
 		retention.all_bytes_durable = true;
 		retention.all_post_read_ok = false;
 		retention.consumers_zero = true;
-		UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&retention),
-					 (int) CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ);
+		UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&retention),
+					 (int)CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ);
 	}
 }
 
 /* L10: canonical HWM update under the ABI STOP -> mutation=0. */
 UT_TEST(test_l10_hwm_stop_mutation_zero)
 {
-	UT_ASSERT(!cluster_side_space_metadata_mutation_allowed(
-				  CLUSTER_SIDE_SPACE_HWM));
+	UT_ASSERT(!cluster_side_space_metadata_mutation_allowed(CLUSTER_SIDE_SPACE_HWM));
 }
 
 /* L12: recoverer death -> successor never adopts private progress. */
@@ -221,12 +212,11 @@ UT_TEST(test_l12_no_private_progress_adoption)
 {
 	/* Death after the source proof: the successor re-censuses and never
 	 * adopts the predecessor-local plan (crash matrix row 2). */
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF),
+				 (int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
 	/* Death during the target write: STOP (no stable base). */
-	UT_ASSERT_EQ((int) cluster_page_apply_midwrite_cut(),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ((int)cluster_page_apply_midwrite_cut(),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
 }
 
 /* L14 + L20: resource A recovered opens while B stays BLOCKED, and the
@@ -263,20 +253,20 @@ UT_TEST(test_l17_retire_denied_missing_post_read)
 	retention.all_bytes_durable = true;
 	retention.all_post_read_ok = false;
 	retention.consumers_zero = true;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&retention),
-				 (int) CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&retention),
+				 (int)CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ);
 	/* Complete proof -> ready (the ROOT caller still owns the removal). */
 	retention.all_post_read_ok = true;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&retention),
-				 (int) CLUSTER_SIDE_RETENTION_READY);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&retention),
+				 (int)CLUSTER_SIDE_RETENTION_READY);
 }
 
 /* L18: the stable-base unresolved fixture must report STOP — never a
  * skip, never a forced green. */
 UT_TEST(test_l18_stable_base_never_green)
 {
-	UT_ASSERT_EQ((int) cluster_page_apply_midwrite_cut(),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ((int)cluster_page_apply_midwrite_cut(),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
 }
 
 /* L19: same identity/version, different bytes / opposite terminal

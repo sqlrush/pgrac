@@ -68,14 +68,13 @@ StaticAssertDecl(offsetof(GcsBlockInvalidateAckPayload, tag) == 16,
 StaticAssertDecl(offsetof(GcsBlockDonePayload, tag) == 16,
 				 "GCS-race round-2 review F4: GcsBlockDonePayload.tag offset moved");
 static bool
-cluster_resource_x_payload_route_tag(uint8 msg_type, const void *payload,
-									 uint16 payload_len, BufferTag *tag)
+cluster_resource_x_payload_route_tag(uint8 msg_type, const void *payload, uint16 payload_len,
+									 BufferTag *tag)
 {
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject;
 
-	if (!cluster_resource_x_wire_decode(msg_type, payload, payload_len,
-										&decoded, &reject))
+	if (!cluster_resource_x_wire_decode(msg_type, payload, payload_len, &decoded, &reject))
 		return false;
 	*tag = decoded.common.logical_assertion.resource;
 	return true;
@@ -90,15 +89,15 @@ cluster_ctrc_route_get_u16_le(const uint8 *bytes)
 static uint32
 cluster_ctrc_route_get_u32_le(const uint8 *bytes)
 {
-	return (uint32)bytes[0] | ((uint32)bytes[1] << 8)
-		| ((uint32)bytes[2] << 16) | ((uint32)bytes[3] << 24);
+	return (uint32)bytes[0] | ((uint32)bytes[1] << 8) | ((uint32)bytes[2] << 16)
+		   | ((uint32)bytes[3] << 24);
 }
 
 static uint64
 cluster_ctrc_route_get_u64_le(const uint8 *bytes)
 {
 	return (uint64)cluster_ctrc_route_get_u32_le(bytes)
-		| ((uint64)cluster_ctrc_route_get_u32_le(bytes + 4) << 32);
+		   | ((uint64)cluster_ctrc_route_get_u32_le(bytes + 4) << 32);
 }
 
 /* The full authenticated selector is checked by the receiving handler.  The
@@ -106,8 +105,7 @@ cluster_ctrc_route_get_u64_le(const uint8 *bytes)
  * to derive affinity, so a 136-byte collision cannot fall through to a
  * BufferTag route or split one request between workers. */
 static bool
-cluster_ctrc_payload_route_tag(const void *payload, uint16 payload_len,
-							   BufferTag *tag)
+cluster_ctrc_payload_route_tag(const void *payload, uint16 payload_len, BufferTag *tag)
 {
 	const uint8 *bytes = (const uint8 *)payload;
 	uint64 request_id;
@@ -115,18 +113,13 @@ cluster_ctrc_payload_route_tag(const void *payload, uint16 payload_len,
 	uint32 requester_node;
 	uint32 requester_backend;
 
-	if (payload == NULL || tag == NULL
-		|| payload_len != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+	if (payload == NULL || tag == NULL || payload_len != CLUSTER_CTRC_SEAL_REQUEST_BYTES
 		|| cluster_ctrc_route_get_u16_le(bytes + 60) != 0
-		|| bytes[62] != CLUSTER_CTRC_SELECTOR_VERSION
-		|| bytes[63] != CLUSTER_CTRC_FORWARD_KIND
+		|| bytes[62] != CLUSTER_CTRC_SELECTOR_VERSION || bytes[63] != CLUSTER_CTRC_FORWARD_KIND
 		|| cluster_ctrc_route_get_u32_le(bytes + 64) != CLUSTER_CTRC_WIRE_MAGIC
-		|| cluster_ctrc_route_get_u16_le(bytes + 68)
-		   != CLUSTER_CTRC_WIRE_VERSION
-		|| cluster_ctrc_route_get_u16_le(bytes + 70)
-		   != CLUSTER_CTRC_SEAL_REQUEST_BYTES
-		|| (bytes[55] != CTRC_SEAL_CLOSE_AND_CLEAN
-			&& bytes[55] != CTRC_SEAL_CERTIFICATE_COMMITTED)
+		|| cluster_ctrc_route_get_u16_le(bytes + 68) != CLUSTER_CTRC_WIRE_VERSION
+		|| cluster_ctrc_route_get_u16_le(bytes + 70) != CLUSTER_CTRC_SEAL_REQUEST_BYTES
+		|| (bytes[55] != CTRC_SEAL_CLOSE_AND_CLEAN && bytes[55] != CTRC_SEAL_CERTIFICATE_COMMITTED)
 		|| cluster_ctrc_route_get_u32_le(bytes + 128) == 0
 		|| cluster_ctrc_route_get_u32_le(bytes + 132) != 0)
 		return false;
@@ -135,13 +128,12 @@ cluster_ctrc_payload_route_tag(const void *payload, uint16 payload_len,
 	epoch = cluster_ctrc_route_get_u64_le(bytes + 8);
 	requester_node = cluster_ctrc_route_get_u32_le(bytes + 36);
 	requester_backend = cluster_ctrc_route_get_u32_le(bytes + 40);
-	if (request_id == 0 || epoch == 0
-		|| requester_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
+	if (request_id == 0 || epoch == 0 || requester_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| requester_backend != (uint32)CLUSTER_CTRC_INTERNAL_ENDPOINT)
 		return false;
 
-	*tag = GcsBlockCurrentMxRouteTagMake(request_id, epoch,
-		(int32)requester_node, (int32)requester_backend);
+	*tag = GcsBlockCurrentMxRouteTagMake(request_id, epoch, (int32)requester_node,
+										 (int32)requester_backend);
 	return true;
 }
 
@@ -160,8 +152,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 	case PGRAC_IC_MSG_GCS_BLOCK_REQUEST:
 		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES
 			|| payload_len == RESOURCE_X_SHORT_V1_BYTES) {
-			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
-												  payload_len, &resource_x_tag))
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len,
+													  &resource_x_tag))
 				return -1;
 			tag = &resource_x_tag;
 			break;
@@ -172,26 +164,22 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		tag = &((const GcsBlockRequestPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_REPLY:
-		if (payload_len != RESOURCE_X_CONTROL_V1_BYTES
-			&& payload_len != RESOURCE_X_PROOF_V1_BYTES
+		if (payload_len != RESOURCE_X_CONTROL_V1_BYTES && payload_len != RESOURCE_X_PROOF_V1_BYTES
 			&& payload_len != RESOURCE_X_IMAGE_V1_BYTES)
 			return -1;
-		if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len,
-												  &resource_x_tag))
+		if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len, &resource_x_tag))
 			return -1;
 		tag = &resource_x_tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_FORWARD:
 		if (payload_len == CLUSTER_CTRC_SEAL_REQUEST_BYTES) {
-			if (!cluster_ctrc_payload_route_tag(payload, payload_len,
-											&route_tag))
+			if (!cluster_ctrc_payload_route_tag(payload, payload_len, &route_tag))
 				return -1;
 			tag = &route_tag;
 			break;
 		}
 		if (payload_len == CLUSTER_CURRENT_MX_DESCRIBE_FORWARD_SIZE) {
-			const GcsBlockForwardPayload *current_mx
-				= (const GcsBlockForwardPayload *)payload;
+			const GcsBlockForwardPayload *current_mx = (const GcsBlockForwardPayload *)payload;
 			const ClusterCurrentMxDescribeForwardV2 *frame
 				= (const ClusterCurrentMxDescribeForwardV2 *)payload;
 
@@ -200,10 +188,9 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 				|| frame->trailer.version != CLUSTER_CURRENT_MX_WIRE_VERSION
 				|| frame->trailer.flags != CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE)
 				return -1;
-			route_tag = GcsBlockCurrentMxRouteTagMake(
-				current_mx->request_id, current_mx->epoch,
-				current_mx->original_requester_node,
-				current_mx->requester_backend_id);
+			route_tag = GcsBlockCurrentMxRouteTagMake(current_mx->request_id, current_mx->epoch,
+													  current_mx->original_requester_node,
+													  current_mx->requester_backend_id);
 			tag = &route_tag;
 			break;
 		}
@@ -216,23 +203,20 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		 * the positive backend id of the physical R4_CR reply slot.  Every
 		 * other exact FORWARD96 retains the legacy tag shard. */
 		if (payload_len == sizeof(ClusterR4CrForwardPayload)) {
-			const ClusterR4CrForwardPayload *r4
-				= (const ClusterR4CrForwardPayload *)payload;
+			const ClusterR4CrForwardPayload *r4 = (const ClusterR4CrForwardPayload *)payload;
 
 			if (r4->extension.r4_version == CLUSTER_R4_WIRE_VERSION
 				&& (r4->extension.r4_kind == CLUSTER_R4_WIRE_TX_RESOLVE
-					|| (r4->base.requester_backend_id
-							== CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
-						&& r4->extension.r4_kind
-							   == CLUSTER_R4_WIRE_UNDO_DATA_FETCH)))
+					|| (r4->base.requester_backend_id == CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
+						&& r4->extension.r4_kind == CLUSTER_R4_WIRE_UNDO_DATA_FETCH)))
 				return n_workers > 0 ? 0 : -1;
 		}
 		tag = &((const GcsBlockForwardPayload *)payload)->tag;
 		break;
 	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE:
 		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES) {
-			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
-												  payload_len, &resource_x_tag))
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len,
+													  &resource_x_tag))
 				return -1;
 			tag = &resource_x_tag;
 			break;
@@ -244,8 +228,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 	case PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK:
 		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES
 			|| payload_len == RESOURCE_X_PROOF_V1_BYTES) {
-			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
-												  payload_len, &resource_x_tag))
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len,
+													  &resource_x_tag))
 				return -1;
 			tag = &resource_x_tag;
 			break;
@@ -262,8 +246,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 		 * on the worker that owns the dedup entry. */
 		if (payload_len == RESOURCE_X_CONTROL_V1_BYTES
 			|| payload_len == RESOURCE_X_SHORT_V1_BYTES) {
-			if (!cluster_resource_x_payload_route_tag(msg_type, payload,
-												  payload_len, &resource_x_tag))
+			if (!cluster_resource_x_payload_route_tag(msg_type, payload, payload_len,
+													  &resource_x_tag))
 				return -1;
 			tag = &resource_x_tag;
 			break;

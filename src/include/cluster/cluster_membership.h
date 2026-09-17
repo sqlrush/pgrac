@@ -213,22 +213,22 @@ typedef struct ClusterReplacementCommitMarkerV3 {
 	uint32 crc32c;
 } ClusterReplacementCommitMarkerV3;
 
-extern bool cluster_replacement_marker_v3_encode(
-	const ClusterReplacementCommitMarkerV3 *marker,
-	uint8 out[CLUSTER_JCMK_REPLACEMENT_BYTES]);
-extern bool cluster_replacement_marker_v3_decode(
-	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
-	ClusterReplacementCommitMarkerV3 *out);
+extern bool cluster_replacement_marker_v3_encode(const ClusterReplacementCommitMarkerV3 *marker,
+												 uint8 out[CLUSTER_JCMK_REPLACEMENT_BYTES]);
+extern bool cluster_replacement_marker_v3_decode(const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES],
+												 int32 expected_target_node,
+												 ClusterReplacementCommitMarkerV3 *out);
 
 /* Pure v3 identity, strict-majority and phase-basis decisions. */
-extern bool cluster_replacement_marker_v3_same_image(
-	const ClusterReplacementCommitMarkerV3 *a, const ClusterReplacementCommitMarkerV3 *b);
+extern bool cluster_replacement_marker_v3_same_image(const ClusterReplacementCommitMarkerV3 *a,
+													 const ClusterReplacementCommitMarkerV3 *b);
 extern int cluster_replacement_marker_v3_select_majority(
 	const uint8 images[][CLUSTER_JCMK_REPLACEMENT_BYTES], int n, uint32 majority,
 	int32 expected_target_node, ClusterReplacementCommitMarkerV3 *out_marker, uint32 *out_agree);
-extern bool cluster_replacement_marker_v3_floor_basis(
-	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
-	uint64 *out_incarnation_floor);
+extern bool
+cluster_replacement_marker_v3_floor_basis(const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES],
+										  int32 expected_target_node,
+										  uint64 *out_incarnation_floor);
 extern bool cluster_replacement_marker_v3_is_committed_closed_basis(
 	const uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES], int32 expected_target_node,
 	uint64 *out_incarnation_floor);

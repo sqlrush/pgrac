@@ -26,13 +26,13 @@
 void
 cluster_side_stats_init(ClusterSideStats *stats)
 {
-	int			i;
+	int i;
 	pg_atomic_uint64 *fields;
-	int			nfields;
+	int nfields;
 
 	if (stats == NULL)
 		return;
-	fields = (pg_atomic_uint64 *) stats;
+	fields = (pg_atomic_uint64 *)stats;
 	nfields = sizeof(ClusterSideStats) / sizeof(pg_atomic_uint64);
 	for (i = 0; i < nfields; i++)
 		pg_atomic_init_u64(&fields[i], 0);
@@ -43,18 +43,17 @@ cluster_side_stats_route(ClusterSideStats *stats, int verdict)
 {
 	if (stats == NULL)
 		return;
-	switch ((ClusterSideRouteVerdict) verdict)
-	{
-		case CLUSTER_SIDE_ROUTE_VERDICT_APPLY:
-			pg_atomic_fetch_add_u64(&stats->route_applies, 1);
-			break;
-		case CLUSTER_SIDE_ROUTE_VERDICT_PROVED_NOOP:
-			pg_atomic_fetch_add_u64(&stats->route_noops, 1);
-			break;
-		case CLUSTER_SIDE_ROUTE_VERDICT_BLOCKED:
-		default:
-			pg_atomic_fetch_add_u64(&stats->route_blocked, 1);
-			break;
+	switch ((ClusterSideRouteVerdict)verdict) {
+	case CLUSTER_SIDE_ROUTE_VERDICT_APPLY:
+		pg_atomic_fetch_add_u64(&stats->route_applies, 1);
+		break;
+	case CLUSTER_SIDE_ROUTE_VERDICT_PROVED_NOOP:
+		pg_atomic_fetch_add_u64(&stats->route_noops, 1);
+		break;
+	case CLUSTER_SIDE_ROUTE_VERDICT_BLOCKED:
+	default:
+		pg_atomic_fetch_add_u64(&stats->route_blocked, 1);
+		break;
 	}
 }
 
@@ -63,19 +62,18 @@ cluster_side_stats_domain(ClusterSideStats *stats, int route_kind)
 {
 	if (stats == NULL)
 		return;
-	switch ((ClusterSideRouteKind) route_kind)
-	{
-		case CLUSTER_SIDE_ROUTE_TT_UNDO:
-			pg_atomic_fetch_add_u64(&stats->domain_tt_undo, 1);
-			break;
-		case CLUSTER_SIDE_ROUTE_PROJECTION:
-			pg_atomic_fetch_add_u64(&stats->domain_projection, 1);
-			break;
-		case CLUSTER_SIDE_ROUTE_STORAGE:
-			pg_atomic_fetch_add_u64(&stats->domain_storage, 1);
-			break;
-		default:
-			break;				/* PAGE/NOOP/BLOCKED are not domain events */
+	switch ((ClusterSideRouteKind)route_kind) {
+	case CLUSTER_SIDE_ROUTE_TT_UNDO:
+		pg_atomic_fetch_add_u64(&stats->domain_tt_undo, 1);
+		break;
+	case CLUSTER_SIDE_ROUTE_PROJECTION:
+		pg_atomic_fetch_add_u64(&stats->domain_projection, 1);
+		break;
+	case CLUSTER_SIDE_ROUTE_STORAGE:
+		pg_atomic_fetch_add_u64(&stats->domain_storage, 1);
+		break;
+	default:
+		break; /* PAGE/NOOP/BLOCKED are not domain events */
 	}
 }
 
@@ -105,33 +103,27 @@ cluster_side_stats_durability(ClusterSideStats *stats)
 }
 
 /* G2 vocabulary: all EVENT; unknown names fail closed. */
-typedef struct ClusterSideStatName
-{
+typedef struct ClusterSideStatName {
 	const char *name;
-	int			kind;			/* 0 = EVENT (the only kind here) */
+	int kind; /* 0 = EVENT (the only kind here) */
 } ClusterSideStatName;
 
 static const ClusterSideStatName cluster_side_stat_names[] = {
-	{ "cluster.side.route_applies", 0 },
-	{ "cluster.side.route_noops", 0 },
-	{ "cluster.side.route_blocked", 0 },
-	{ "cluster.side.domain_tt_undo", 0 },
-	{ "cluster.side.domain_projection", 0 },
-	{ "cluster.side.domain_storage", 0 },
-	{ "cluster.side.blocked_unknown_class", 0 },
-	{ "cluster.side.blocked_authority", 0 },
-	{ "cluster.side.rebuild_events", 0 },
-	{ "cluster.side.durability_events", 0 },
+	{ "cluster.side.route_applies", 0 },		 { "cluster.side.route_noops", 0 },
+	{ "cluster.side.route_blocked", 0 },		 { "cluster.side.domain_tt_undo", 0 },
+	{ "cluster.side.domain_projection", 0 },	 { "cluster.side.domain_storage", 0 },
+	{ "cluster.side.blocked_unknown_class", 0 }, { "cluster.side.blocked_authority", 0 },
+	{ "cluster.side.rebuild_events", 0 },		 { "cluster.side.durability_events", 0 },
 };
 
 bool
 cluster_side_stats_describe(const char *name, int *kind)
 {
-	int			i;
+	int i;
 
 	if (name == NULL)
 		return false;
-	for (i = 0; i < (int) lengthof(cluster_side_stat_names); i++) {
+	for (i = 0; i < (int)lengthof(cluster_side_stat_names); i++) {
 		if (strcmp(cluster_side_stat_names[i].name, name) == 0) {
 			if (kind != NULL)
 				*kind = cluster_side_stat_names[i].kind;

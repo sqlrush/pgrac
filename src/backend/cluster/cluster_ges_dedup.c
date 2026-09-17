@@ -385,8 +385,7 @@ cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key)
 		return false;
 
 	LWLockAcquire(cluster_ges_dedup_lock, LW_EXCLUSIVE);
-	entry = (ClusterGesDedupEntry *)hash_search(cluster_ges_dedup_htab, key,
-											HASH_FIND, &found);
+	entry = (ClusterGesDedupEntry *)hash_search(cluster_ges_dedup_htab, key, HASH_FIND, &found);
 	if (found && entry != NULL && entry->cached_reply_len > 0) {
 		(void)hash_search(cluster_ges_dedup_htab, key, HASH_REMOVE, &found);
 		Assert(found);

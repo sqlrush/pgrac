@@ -38,48 +38,36 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 UT_TEST(test_action_table_closed_rows)
 {
 	/* §4.1 recovery-action column, one row per class. */
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_NORMAL),
-				 (int) CLUSTER_PAGE_ACTION_APPLY);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_CLEANOUT),
-				 (int) CLUSTER_PAGE_ACTION_APPLY);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_NEW),
-				 (int) CLUSTER_PAGE_ACTION_INIT);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_INCARNATION),
-				 (int) CLUSTER_PAGE_ACTION_INCARNATE);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_TEMP),
-				 (int) CLUSTER_PAGE_ACTION_DISCARD);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_REBUILDABLE),
-				 (int) CLUSTER_PAGE_ACTION_REBUILD);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_HEADER),
-				 (int) CLUSTER_PAGE_ACTION_ROUTE);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_FULLIMAGE),
-				 (int) CLUSTER_PAGE_ACTION_IMAGE);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_NONLOGGED),
-				 (int) CLUSTER_PAGE_ACTION_REBUILD);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_NORMAL),
+				 (int)CLUSTER_PAGE_ACTION_APPLY);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_CLEANOUT),
+				 (int)CLUSTER_PAGE_ACTION_APPLY);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_NEW),
+				 (int)CLUSTER_PAGE_ACTION_INIT);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_INCARNATION),
+				 (int)CLUSTER_PAGE_ACTION_INCARNATE);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_TEMP),
+				 (int)CLUSTER_PAGE_ACTION_DISCARD);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_REBUILDABLE),
+				 (int)CLUSTER_PAGE_ACTION_REBUILD);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_HEADER),
+				 (int)CLUSTER_PAGE_ACTION_ROUTE);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_FULLIMAGE),
+				 (int)CLUSTER_PAGE_ACTION_IMAGE);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_NONLOGGED),
+				 (int)CLUSTER_PAGE_ACTION_REBUILD);
 }
 
 UT_TEST(test_action_unknown_default_blocked)
 {
 	/* "unknown default 必须 BLOCKED" (PGDEL-03) — UNKNOWN, UNCLASSIFIED
 	 * and the WILLINIT-without-rule row are all mutation=0. */
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_UNKNOWN),
-				 (int) CLUSTER_PAGE_ACTION_BLOCKED);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_UNCLASSIFIED),
-				 (int) CLUSTER_PAGE_ACTION_BLOCKED);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_WILLINIT),
-				 (int) CLUSTER_PAGE_ACTION_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_UNKNOWN),
+				 (int)CLUSTER_PAGE_ACTION_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_UNCLASSIFIED),
+				 (int)CLUSTER_PAGE_ACTION_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_WILLINIT),
+				 (int)CLUSTER_PAGE_ACTION_BLOCKED);
 }
 
 UT_TEST(test_state_machine_adjacent_advance)
@@ -88,7 +76,7 @@ UT_TEST(test_state_machine_adjacent_advance)
 
 	/* The full §3.5 chain, one adjacent step at a time. */
 	UT_ASSERT(cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_CLASSIFIED));
-	UT_ASSERT_EQ((int) st, (int) CLUSTER_PAGE_STATE_CLASSIFIED);
+	UT_ASSERT_EQ((int)st, (int)CLUSTER_PAGE_STATE_CLASSIFIED);
 	UT_ASSERT(cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_SOURCE_PROVEN));
 	UT_ASSERT(cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_CONTRIBUTORS_CLOSED));
 	UT_ASSERT(cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_VERSION_CHAIN_VERIFIED));
@@ -100,7 +88,7 @@ UT_TEST(test_state_machine_adjacent_advance)
 	UT_ASSERT(cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_RESOURCE_RELEASED));
 	/* Terminal: no further advance. */
 	UT_ASSERT(!cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_RESOURCE_RELEASED + 1));
-	UT_ASSERT_EQ((int) st, (int) CLUSTER_PAGE_STATE_RESOURCE_RELEASED);
+	UT_ASSERT_EQ((int)st, (int)CLUSTER_PAGE_STATE_RESOURCE_RELEASED);
 }
 
 UT_TEST(test_state_machine_rejects_jumps_and_repeats)
@@ -109,7 +97,7 @@ UT_TEST(test_state_machine_rejects_jumps_and_repeats)
 
 	/* A jump skips a proof step: rejected, state unchanged. */
 	UT_ASSERT(!cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_SOURCE_PROVEN));
-	UT_ASSERT_EQ((int) st, (int) CLUSTER_PAGE_STATE_UNCLASSIFIED);
+	UT_ASSERT_EQ((int)st, (int)CLUSTER_PAGE_STATE_UNCLASSIFIED);
 	/* A repeat of the same step is not an advance. */
 	UT_ASSERT(!cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_UNCLASSIFIED));
 	/* NULL state. */
@@ -117,26 +105,26 @@ UT_TEST(test_state_machine_rejects_jumps_and_repeats)
 	/* Advancing from a valid state to itself is rejected too. */
 	UT_ASSERT(cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_CLASSIFIED));
 	UT_ASSERT(!cluster_page_state_advance(&st, CLUSTER_PAGE_STATE_CLASSIFIED));
-	UT_ASSERT_EQ((int) st, (int) CLUSTER_PAGE_STATE_CLASSIFIED);
+	UT_ASSERT_EQ((int)st, (int)CLUSTER_PAGE_STATE_CLASSIFIED);
 }
 
 UT_TEST(test_dispatcher_verdict_combination)
 {
 	/* APPLY / SKIP come straight from the §3.2 gate. */
-	UT_ASSERT_EQ((int) cluster_page_dispatcher_verdict(
-					 CLUSTER_PAGE_CLASS_NORMAL, CLUSTER_PAGE_APPLY_APPLY),
-				 (int) CLUSTER_PAGE_OUTCOME_APPLY);
-	UT_ASSERT_EQ((int) cluster_page_dispatcher_verdict(
-					 CLUSTER_PAGE_CLASS_NORMAL, CLUSTER_PAGE_APPLY_SKIP),
-				 (int) CLUSTER_PAGE_OUTCOME_SKIP);
+	UT_ASSERT_EQ(
+		(int)cluster_page_dispatcher_verdict(CLUSTER_PAGE_CLASS_NORMAL, CLUSTER_PAGE_APPLY_APPLY),
+		(int)CLUSTER_PAGE_OUTCOME_APPLY);
+	UT_ASSERT_EQ(
+		(int)cluster_page_dispatcher_verdict(CLUSTER_PAGE_CLASS_NORMAL, CLUSTER_PAGE_APPLY_SKIP),
+		(int)CLUSTER_PAGE_OUTCOME_SKIP);
 	/* Any blocked verdict from the class layer is BLOCKED_CLASS (the
 	 * finer subdivisions belong to the PGDEL-04..06 proof owners). */
-	UT_ASSERT_EQ((int) cluster_page_dispatcher_verdict(
-					 CLUSTER_PAGE_CLASS_NORMAL, CLUSTER_PAGE_APPLY_BLOCKED),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS);
-	UT_ASSERT_EQ((int) cluster_page_dispatcher_verdict(
-					 CLUSTER_PAGE_CLASS_UNKNOWN, CLUSTER_PAGE_APPLY_BLOCKED),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS);
+	UT_ASSERT_EQ(
+		(int)cluster_page_dispatcher_verdict(CLUSTER_PAGE_CLASS_NORMAL, CLUSTER_PAGE_APPLY_BLOCKED),
+		(int)CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS);
+	UT_ASSERT_EQ((int)cluster_page_dispatcher_verdict(CLUSTER_PAGE_CLASS_UNKNOWN,
+													  CLUSTER_PAGE_APPLY_BLOCKED),
+				 (int)CLUSTER_PAGE_OUTCOME_BLOCKED_CLASS);
 }
 
 int

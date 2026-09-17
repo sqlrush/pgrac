@@ -345,8 +345,8 @@ cluster_pcm_own_writer_activation_clear_exact(int buf_id, uint64 expected_genera
 
 ClusterPcmOwnResult
 cluster_pcm_own_resource_x_activation_bind_exact(int buf_id, uint64 expected_generation,
-											 uint64 reservation_token,
-											 uint64 acquisition_generation)
+												 uint64 reservation_token,
+												 uint64 acquisition_generation)
 {
 	ClusterPcmOwnEntry *entry;
 	uint64 live_activation;
@@ -365,7 +365,7 @@ cluster_pcm_own_resource_x_activation_bind_exact(int buf_id, uint64 expected_gen
 	live_resource_x = pg_atomic_read_u64(&entry->resource_x_activation_generation);
 	if (live_activation != reservation_token)
 		return live_activation == 0 && live_resource_x != 0 ? CLUSTER_PCM_OWN_CORRUPT
-													 : CLUSTER_PCM_OWN_STALE;
+															: CLUSTER_PCM_OWN_STALE;
 	if (live_resource_x == acquisition_generation)
 		return CLUSTER_PCM_OWN_OK;
 	if (live_resource_x != 0)
@@ -377,8 +377,8 @@ cluster_pcm_own_resource_x_activation_bind_exact(int buf_id, uint64 expected_gen
 
 ClusterPcmOwnResult
 cluster_pcm_own_resource_x_activation_clear_exact(int buf_id, uint64 expected_generation,
-											  uint64 reservation_token,
-											  uint64 acquisition_generation)
+												  uint64 reservation_token,
+												  uint64 acquisition_generation)
 {
 	ClusterPcmOwnEntry *entry;
 
@@ -390,8 +390,7 @@ cluster_pcm_own_resource_x_activation_clear_exact(int buf_id, uint64 expected_ge
 		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
 		|| pg_atomic_read_u32(&entry->flags) != 0
 		|| pg_atomic_read_u64(&entry->writer_activation_token) != reservation_token
-		|| pg_atomic_read_u64(&entry->resource_x_activation_generation)
-			   != acquisition_generation)
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != acquisition_generation)
 		return CLUSTER_PCM_OWN_STALE;
 
 	/* T3 ordering is part of the local write fence: remove the target
@@ -403,9 +402,8 @@ cluster_pcm_own_resource_x_activation_clear_exact(int buf_id, uint64 expected_ge
 
 ClusterPcmOwnResult
 cluster_pcm_own_resource_x_neutralize_exact(int buf_id, uint64 expected_generation,
-										uint64 reservation_token,
-										uint64 acquisition_generation,
-										uint64 *out_neutral_generation)
+											uint64 reservation_token, uint64 acquisition_generation,
+											uint64 *out_neutral_generation)
 {
 	ClusterPcmOwnEntry *entry;
 	uint64 next_generation;
@@ -421,8 +419,7 @@ cluster_pcm_own_resource_x_neutralize_exact(int buf_id, uint64 expected_generati
 		|| pg_atomic_read_u64(&entry->reservation_token) != reservation_token
 		|| pg_atomic_read_u32(&entry->flags) != 0
 		|| pg_atomic_read_u64(&entry->writer_activation_token) != reservation_token
-		|| pg_atomic_read_u64(&entry->resource_x_activation_generation)
-			   != acquisition_generation)
+		|| pg_atomic_read_u64(&entry->resource_x_activation_generation) != acquisition_generation)
 		return CLUSTER_PCM_OWN_STALE;
 	if (expected_generation == UINT64_MAX)
 		return CLUSTER_PCM_OWN_EXHAUSTED;

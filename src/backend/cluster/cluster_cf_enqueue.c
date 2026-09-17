@@ -36,7 +36,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
-#include "miscadmin.h"					  /* AmStartupProcess / AmCheckpointerProcess */
+#include "miscadmin.h" /* AmStartupProcess / AmCheckpointerProcess */
 #include "storage/fd.h"
 #include "storage/lock.h"
 #include "utils/timestamp.h"
@@ -133,10 +133,9 @@ cluster_cf_lock(LOCKMODE mode)
 	 * a backend that slips past it.
 	 */
 	if (cluster_clean_leave_node_refuses_writes() && !AmCheckpointerProcess()) {
-		ereport(LOG,
-				(errmsg("cluster CF acquire refused: clean-leave drain in "
-						"progress on this node (mode %d)",
-						(int) mode)));
+		ereport(LOG, (errmsg("cluster CF acquire refused: clean-leave drain in "
+							 "progress on this node (mode %d)",
+							 (int)mode)));
 		return false;
 	}
 
@@ -160,10 +159,9 @@ cluster_cf_lock(LOCKMODE mode)
 		ClusterCfReleaseResult drain = cluster_cf_unlock_confirmed(mode);
 
 		if (drain == CLUSTER_CF_RELEASE_UNCONFIRMED) {
-			ereport(LOG,
-					(errmsg("cluster CF acquire refused: stale held slot could "
-							"not be drained (mode %d)",
-							(int) mode)));
+			ereport(LOG, (errmsg("cluster CF acquire refused: stale held slot could "
+								 "not be drained (mode %d)",
+								 (int)mode)));
 			return false;
 		}
 	}
@@ -229,9 +227,7 @@ cluster_cf_lock(LOCKMODE mode)
 			 * appropriate FATAL/ERROR (CF correctness).
 			 */
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
-		ereport(LOG,
-				(errmsg("cluster CF acquire failed (mode %d, result %d)",
-						(int) mode, (int) r)));
+		ereport(LOG, (errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r)));
 		return false;
 	}
 }
@@ -316,8 +312,7 @@ cluster_cf_set_bootstrap_authority(bool on)
 bool
 cluster_cf_write_permitted(void)
 {
-	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority
-		|| cf_owner_eor_authority;
+	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority || cf_owner_eor_authority;
 }
 
 /*
@@ -353,8 +348,8 @@ cluster_cf_exactly_one_declared_node(void)
 	if (loaded_count != 0)
 		return loaded_count == 1;
 
-	path = (cluster_config_file != NULL && cluster_config_file[0] != '\0')
-		? cluster_config_file : "pgrac.conf";
+	path = (cluster_config_file != NULL && cluster_config_file[0] != '\0') ? cluster_config_file
+																		   : "pgrac.conf";
 	f = AllocateFile(path, "r");
 	if (f == NULL)
 		return false;
@@ -371,9 +366,8 @@ cluster_cf_exactly_one_declared_node(void)
 
 		errno = 0;
 		node_id = strtol(p + 6, &endptr, 10);
-		if (errno != 0 || endptr == p + 6 || *endptr != ']'
-			|| node_id < 0 || node_id >= CLUSTER_MAX_NODES
-			|| node_id != cluster_node_id) {
+		if (errno != 0 || endptr == p + 6 || *endptr != ']' || node_id < 0
+			|| node_id >= CLUSTER_MAX_NODES || node_id != cluster_node_id) {
 			valid = false;
 			break;
 		}
@@ -405,10 +399,8 @@ cluster_cf_exactly_one_declared_node(void)
 bool
 cluster_cf_owner_eor_install(void)
 {
-	if (!cluster_controlfile_shared_authority
-		|| !cluster_cf_exactly_one_declared_node()
-		|| cluster_cf_join_readonly()
-		|| cf_bootstrap_authority)
+	if (!cluster_controlfile_shared_authority || !cluster_cf_exactly_one_declared_node()
+		|| cluster_cf_join_readonly() || cf_bootstrap_authority)
 		return false;
 	if (!cluster_cf_owner_eor_phase_install())
 		return false;
@@ -424,10 +416,8 @@ cluster_cf_owner_eor_install(void)
 bool
 cluster_cf_owner_eor_consume(bool end_of_recovery, bool identity_ok)
 {
-	if (!end_of_recovery || !identity_ok
-		|| !cluster_controlfile_shared_authority
-		|| !cluster_cf_exactly_one_declared_node()
-		|| cluster_cf_join_readonly()
+	if (!end_of_recovery || !identity_ok || !cluster_controlfile_shared_authority
+		|| !cluster_cf_exactly_one_declared_node() || cluster_cf_join_readonly()
 		|| cf_owner_eor_authority)
 		return false;
 	if (!cluster_cf_owner_eor_phase_activate())

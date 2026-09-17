@@ -20,11 +20,9 @@ UT_DEFINE_GLOBALS();
 
 
 void
-ExceptionalCondition(const char *conditionName, const char *fileName,
-					 int lineNumber)
+ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
-	printf("# Assert failed: %s at %s:%d\n", conditionName, fileName,
-		   lineNumber);
+	printf("# Assert failed: %s at %s:%d\n", conditionName, fileName, lineNumber);
 	abort();
 }
 
@@ -98,10 +96,9 @@ static void
 expected_ballot_bytes(uint8 out[CLUSTER_EPOCH_BALLOT_ID_BYTES])
 {
 	static const uint8 bytes[CLUSTER_EPOCH_BALLOT_ID_BYTES] = {
-		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
-		0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
-		0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
+		0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x07, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13,
+		0x12, 0x11, 0x28, 0x27, 0x26, 0x25, 0x24, 0x23, 0x22, 0x21,
 	};
 
 	memcpy(out, bytes, sizeof(bytes));
@@ -112,21 +109,14 @@ static void
 expected_value_bytes(uint8 out[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES])
 {
 	static const uint8 bytes[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES] = {
-		0x01, 0x00, 0x02, 0x05, 0x02, 0x00, 0x00, 0x00,
-		0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
-		0x48, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41,
-		0x49, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41,
-		0x58, 0x57, 0x56, 0x55, 0x54, 0x53, 0x52, 0x51,
-		0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61,
-		0x78, 0x77, 0x76, 0x75, 0x74, 0x73, 0x72, 0x71,
-		0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-		0xe4, 0x05, 0x89, 0x42, 0x5b, 0xae, 0x0d, 0x8e,
-		0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87,
-		0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
+		0x01, 0x00, 0x02, 0x05, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31, 0x48, 0x47, 0x46, 0x45, 0x44, 0x43,
+		0x42, 0x41, 0x49, 0x47, 0x46, 0x45, 0x44, 0x43, 0x42, 0x41, 0x58, 0x57, 0x56, 0x55, 0x54,
+		0x53, 0x52, 0x51, 0x68, 0x67, 0x66, 0x65, 0x64, 0x63, 0x62, 0x61, 0x78, 0x77, 0x76, 0x75,
+		0x74, 0x73, 0x72, 0x71, 0x0f, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe4, 0x05, 0x89, 0x42, 0x5b, 0xae, 0x0d, 0x8e, 0x80,
+		0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89, 0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f,
 		0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	};
 
@@ -138,12 +128,10 @@ static void
 expected_lane_bytes(uint8 out[CLUSTER_EPOCH_BALLOT_LANE_BYTES])
 {
 	static const uint8 header[48] = {
-		0x45, 0x50, 0x42, 0x4c, 0x01, 0x00, 0x03, 0x00,
-		0x07, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
-		0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
-		0x11, 0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a,
-		0x38, 0x37, 0x36, 0x35, 0x34, 0x33, 0x32, 0x31,
-		0xe4, 0x05, 0x89, 0x42, 0x5b, 0xae, 0x0d, 0x8e,
+		0x45, 0x50, 0x42, 0x4c, 0x01, 0x00, 0x03, 0x00, 0x07, 0x00, 0x00, 0x00,
+		0x03, 0x00, 0x00, 0x00, 0x18, 0x17, 0x16, 0x15, 0x14, 0x13, 0x12, 0x11,
+		0x11, 0x10, 0x0f, 0x0e, 0x0d, 0x0c, 0x0b, 0x0a, 0x38, 0x37, 0x36, 0x35,
+		0x34, 0x33, 0x32, 0x31, 0xe4, 0x05, 0x89, 0x42, 0x5b, 0xae, 0x0d, 0x8e,
 	};
 	uint8 ballot[CLUSTER_EPOCH_BALLOT_ID_BYTES];
 	uint8 value[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES];
@@ -182,20 +170,18 @@ test_lane_recrc(uint8 bytes[CLUSTER_EPOCH_BALLOT_LANE_BYTES])
 static bool
 encode_lane(const ClusterEpochBallotLane *lane, uint8 out[CLUSTER_EPOCH_BALLOT_LANE_BYTES])
 {
-	return cluster_epoch_ballot_lane_encode(
-		lane, 7, 3, UINT64_C(0x1112131415161718),
-		UINT64_C(0x3132333435363738),
-		CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, out);
+	return cluster_epoch_ballot_lane_encode(lane, 7, 3, UINT64_C(0x1112131415161718),
+											UINT64_C(0x3132333435363738),
+											CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, out);
 }
 
 
 static bool
 decode_lane(const uint8 bytes[CLUSTER_EPOCH_BALLOT_LANE_BYTES], ClusterEpochBallotLane *out)
 {
-	return cluster_epoch_ballot_lane_decode(
-		bytes, 7, 3, UINT64_C(0x1112131415161718),
-		UINT64_C(0x3132333435363738),
-		CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, out);
+	return cluster_epoch_ballot_lane_decode(bytes, 7, 3, UINT64_C(0x1112131415161718),
+											UINT64_C(0x3132333435363738),
+											CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, out);
 }
 
 
@@ -295,8 +281,8 @@ UT_TEST(test_authority_value_exact_little_endian_golden_and_roundtrip)
 	uint8 actual[CLUSTER_EPOCH_AUTHORITY_VALUE_BYTES];
 
 	expected_value_bytes(expected);
-	UT_ASSERT(cluster_epoch_authority_value_encode(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT, actual));
+	UT_ASSERT(cluster_epoch_authority_value_encode(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT,
+												   actual));
 	UT_ASSERT_EQ(memcmp(actual, expected, sizeof(actual)), 0);
 	memset(&decoded, 0, sizeof(decoded));
 	UT_ASSERT(cluster_epoch_authority_value_decode(
@@ -309,68 +295,67 @@ UT_TEST(test_authority_value_rejects_identity_phase_and_reserved_drift)
 {
 	ClusterEpochAuthorityValue value = make_value();
 
-	UT_ASSERT(cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value.value_version++;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.transition = 0;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.event_kind = 6;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.request_origin_node = -1;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.target_node_id = -1;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.event_subject_bitmap[0] = UINT8_C(0x0c);
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value.target_node_id = -1;
-	UT_ASSERT(cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.reserved0 = 1;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.authority_generation = 0;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.reserved_epoch++;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.baseline_epoch = UINT64_MAX;
 	value.reserved_epoch = 0;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.request_nonce = 0;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
-	memset(value.authority_member_bitmap, 0,
-		   sizeof(value.authority_member_bitmap));
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	memset(value.authority_member_bitmap, 0, sizeof(value.authority_member_bitmap));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.grammar_fingerprint ^= UINT64_C(1);
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.reserved1[3] = 1;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 }
 
 
@@ -388,20 +373,20 @@ UT_TEST(test_authority_genesis_has_the_exact_zero_polarity)
 	value.request_nonce = 0;
 	memset(value.event_subject_bitmap, 0, sizeof(value.event_subject_bitmap));
 	memset(value.predecessor_digest, 0, sizeof(value.predecessor_digest));
-	UT_ASSERT(cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 
 	value.authority_generation = 2;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value.authority_generation = 1;
 	value.request_nonce = 1;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 	value = make_value();
 	value.event_kind = CLUSTER_EPOCH_EVENT_GENESIS;
-	UT_ASSERT(!cluster_epoch_authority_value_is_valid(
-		&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
+	UT_ASSERT(
+		!cluster_epoch_authority_value_is_valid(&value, CLUSTER_EPOCH_BALLOT_GRAMMAR_FINGERPRINT));
 }
 
 

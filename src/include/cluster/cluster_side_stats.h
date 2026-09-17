@@ -40,8 +40,7 @@
 
 #include "port/atomics.h"
 
-typedef struct ClusterSideStats
-{
+typedef struct ClusterSideStats {
 	/* route events (D-SIDE-01 verdicts observed) */
 	pg_atomic_uint64 route_applies;
 	pg_atomic_uint64 route_noops;
@@ -74,4 +73,4 @@ extern void cluster_side_stats_durability(ClusterSideStats *stats);
  */
 extern bool cluster_side_stats_describe(const char *name, int *kind);
 
-#endif							/* CLUSTER_SIDE_STATS_H */
+#endif /* CLUSTER_SIDE_STATS_H */

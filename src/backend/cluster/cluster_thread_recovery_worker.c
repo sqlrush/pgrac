@@ -56,15 +56,15 @@
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
-#include "cluster/cluster_conf.h"			   /* node_count / has_peers / CLUSTER_MAX_NODES */
-#include "cluster/cluster_external_fence.h"   /* STOP04 NeedSet/AdmissionSet */
-#include "cluster/cluster_grd.h"			   /* live recovery episode epoch (L235)        */
-#include "cluster/cluster_guc.h"			   /* cluster_online_thread_recovery (scope)    */
-#include "cluster/cluster_ir.h"				   /* spec-5.7 D8 — IR(X) recovery-owner gate    */
+#include "cluster/cluster_conf.h"			/* node_count / has_peers / CLUSTER_MAX_NODES */
+#include "cluster/cluster_external_fence.h" /* STOP04 NeedSet/AdmissionSet */
+#include "cluster/cluster_grd.h"			/* live recovery episode epoch (L235)        */
+#include "cluster/cluster_guc.h"			/* cluster_online_thread_recovery (scope)    */
+#include "cluster/cluster_ir.h"				/* spec-5.7 D8 — IR(X) recovery-owner gate    */
 #include "cluster/cluster_recovery_duty.h"
-#include "cluster/cluster_recovery_plan.h"	   /* RF-ROOT P7 G1b: pinned projection API      */
+#include "cluster/cluster_recovery_plan.h"		 /* RF-ROOT P7 G1b: pinned projection API      */
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
-#include "cluster/cluster_thread_recovery.h"   /* slot helpers + replay_one + gates          */
+#include "cluster/cluster_thread_recovery.h"	 /* slot helpers + replay_one + gates          */
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/storage/cluster_shared_fs.h" /* shared backend (scope)                    */
 
@@ -75,8 +75,7 @@
  *	publishes nothing, and leaves the slot for the live episode (keep frozen).
  */
 static ClusterThreadRecResult
-thread_recovery_worker_run(
-	const ClusterThreadRecLaunchEligibility *eligibility)
+thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 {
 	ClusterFormationWitnessV1 *formation = NULL;
 	PgracExternalFenceNeedSetV1 *needs = NULL;
@@ -112,10 +111,9 @@ thread_recovery_worker_run(
 
 	/* The launch must have marked the slot REPLAYING; anything else means this
 	 * spawn raced a reset or a newer launch -> moot (do not touch the slot). */
-	slot_read = cluster_thread_recovery_replay_read(dead_tid, &state,
-												&launch_epoch);
-	if (!cluster_thread_recovery_worker_start_valid(
-			eligibility, dead_tid, slot_read, state, launch_epoch))
+	slot_read = cluster_thread_recovery_replay_read(dead_tid, &state, &launch_epoch);
+	if (!cluster_thread_recovery_worker_start_valid(eligibility, dead_tid, slot_read, state,
+													launch_epoch))
 		return CLUSTER_THREADREC_DEFERRED;
 
 	/* L235 BEFORE: a stale launch epoch means the reconfig episode advanced past
@@ -128,39 +126,34 @@ thread_recovery_worker_run(
 	/* All waitable evidence is obtained before IR.  The current provider-0
 	 * package deterministically stops at NeedSet/admit with BLOCKED and performs
 	 * zero GES/replay/publish; a future certified provider uses this same order. */
-	formation_result = cluster_formation_witness_build_wait(
-		dead_tid, false, fence_timeout_ms,
-		&formation);
+	formation_result
+		= cluster_formation_witness_build_wait(dead_tid, false, fence_timeout_ms, &formation);
 	if (formation_result != CLUSTER_FORMATION_WITNESS_READY)
-		return formation_result == CLUSTER_FORMATION_WITNESS_UNSTABLE ||
-			formation_result == CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN ||
-			formation_result == CLUSTER_FORMATION_WITNESS_IO_FAILED
-				? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
+		return formation_result == CLUSTER_FORMATION_WITNESS_UNSTABLE
+					   || formation_result == CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN
+					   || formation_result == CLUSTER_FORMATION_WITNESS_IO_FAILED
+				   ? CLUSTER_THREADREC_DEFERRED
+				   : CLUSTER_THREADREC_BLOCKED;
 
-	need_result = cluster_external_fence_need_set_build(
-		&eligibility->duty, formation, &needs);
-	if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK)
-	{
+	need_result = cluster_external_fence_need_set_build(&eligibility->duty, formation, &needs);
+	if (need_result != PGRAC_EXTERNAL_FENCE_NEED_SET_OK) {
 		cluster_formation_witness_destroy(&formation);
-		return need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE ||
-			need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE
-				? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
+		return need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_MEMBERSHIP_UNSTABLE
+					   || need_result == PGRAC_EXTERNAL_FENCE_NEED_SET_FENCE_AUTHORITY_UNAVAILABLE
+				   ? CLUSTER_THREADREC_DEFERRED
+				   : CLUSTER_THREADREC_BLOCKED;
 	}
-	fence_verdict = cluster_external_fence_admit_set_wait(
-		needs, formation, fence_timeout_ms,
-		&admissions);
-	if (fence_verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED)
-	{
+	fence_verdict
+		= cluster_external_fence_admit_set_wait(needs, formation, fence_timeout_ms, &admissions);
+	if (fence_verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED) {
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
 		return CLUSTER_THREADREC_BLOCKED;
 	}
-	if (!cluster_external_fence_need_set_revalidate_nowait(
-			needs, formation, &deny_reason) ||
-		!cluster_external_fence_revalidate_set_nowait(
-			admissions, needs, formation, &deny_reason))
-	{
+	if (!cluster_external_fence_need_set_revalidate_nowait(needs, formation, &deny_reason)
+		|| !cluster_external_fence_revalidate_set_nowait(admissions, needs, formation,
+														 &deny_reason)) {
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
@@ -168,33 +161,27 @@ thread_recovery_worker_run(
 	}
 
 	root_result = cluster_control_root_read_canonical(
-		eligibility->duty.origin_thread_id, &eligibility->duty,
-		CLUSTER_CONTROL_ROOT_READ_STRONG, &root_snapshot, &root_token);
-	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY &&
-		 root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) ||
-		root_snapshot.lifecycle !=
-			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
-		memcmp(&root_snapshot.identity, &eligibility->duty,
-			   sizeof(eligibility->duty)) != 0)
-	{
+		eligibility->duty.origin_thread_id, &eligibility->duty, CLUSTER_CONTROL_ROOT_READ_STRONG,
+		&root_snapshot, &root_token);
+	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		|| root_snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| memcmp(&root_snapshot.identity, &eligibility->duty, sizeof(eligibility->duty)) != 0) {
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
 		return CLUSTER_THREADREC_DEFERRED;
 	}
-	if (!cluster_thread_recovery_pin_request_build_v1(
-			dead_tid, &eligibility->duty, &root_snapshot, &root_token,
-			formation, needs, admissions, &pin_interval, &pin_request))
-	{
+	if (!cluster_thread_recovery_pin_request_build_v1(dead_tid, &eligibility->duty, &root_snapshot,
+													  &root_token, formation, needs, admissions,
+													  &pin_interval, &pin_request)) {
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
 		return CLUSTER_THREADREC_DEFERRED;
 	}
-	pin_result = cluster_wal_retention_pin_acquire(
-		&pin_request, 1, &retention_pin);
-	if (pin_result != CLUSTER_WAL_PIN_OK)
-	{
+	pin_result = cluster_wal_retention_pin_acquire(&pin_request, 1, &retention_pin);
+	if (pin_result != CLUSTER_WAL_PIN_OK) {
 		/* A non-NULL failed acquisition is release-uncertain.  Its ResourceOwner
 		 * callback must retain the borrowed fence owners until process exit. */
 		if (retention_pin != NULL)
@@ -202,9 +189,9 @@ thread_recovery_worker_run(
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
-		return pin_result == CLUSTER_WAL_PIN_UNAVAILABLE ||
-			pin_result == CLUSTER_WAL_PIN_STALE
-				? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
+		return pin_result == CLUSTER_WAL_PIN_UNAVAILABLE || pin_result == CLUSTER_WAL_PIN_STALE
+				   ? CLUSTER_THREADREC_DEFERRED
+				   : CLUSTER_THREADREC_BLOCKED;
 	}
 	memset(&serial_request, 0, sizeof(serial_request));
 	serial_request.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
@@ -215,10 +202,8 @@ thread_recovery_worker_run(
 	serial_request.fence_admission_set = admissions;
 	serial_request.acquire_timeout_ms = fence_timeout_ms;
 	serial_request.release_timeout_ms = fence_timeout_ms;
-	serial_result = cluster_recovery_serial_acquire(
-		&serial_request, &serial_guard);
-	if (serial_result != CLUSTER_RECOVERY_SERIAL_GRANTED)
-	{
+	serial_result = cluster_recovery_serial_acquire(&serial_request, &serial_guard);
+	if (serial_result != CLUSTER_RECOVERY_SERIAL_GRANTED) {
 		walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
 		if (walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
 			return CLUSTER_THREADREC_BLOCKED;
@@ -226,22 +211,21 @@ thread_recovery_worker_run(
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
 		return serial_result == CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE
-			? CLUSTER_THREADREC_BLOCKED : CLUSTER_THREADREC_DEFERRED;
+				   ? CLUSTER_THREADREC_BLOCKED
+				   : CLUSTER_THREADREC_DEFERRED;
 	}
-	pin_result = cluster_wal_retention_pin_bind_one(
-		retention_pin, &serial_guard);
-	if (pin_result != CLUSTER_WAL_PIN_OK)
-	{
+	pin_result = cluster_wal_retention_pin_bind_one(retention_pin, &serial_guard);
+	if (pin_result != CLUSTER_WAL_PIN_OK) {
 		release_result = cluster_recovery_serial_release(&serial_guard);
 		walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
-		if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED ||
-			walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
+		if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
+			|| walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
 			return CLUSTER_THREADREC_BLOCKED;
 		cluster_external_fence_admission_set_release(&admissions);
 		cluster_external_fence_need_set_release(&needs);
 		cluster_formation_witness_destroy(&formation);
-		return pin_result == CLUSTER_WAL_PIN_STALE
-			? CLUSTER_THREADREC_DEFERRED : CLUSTER_THREADREC_BLOCKED;
+		return pin_result == CLUSTER_WAL_PIN_STALE ? CLUSTER_THREADREC_DEFERRED
+												   : CLUSTER_THREADREC_BLOCKED;
 	}
 	memset(&authority, 0, sizeof(authority));
 	authority.duty = &eligibility->duty;
@@ -252,27 +236,21 @@ thread_recovery_worker_run(
 	authority.fence_admission_set = admissions;
 	authority.retention_pin = retention_pin;
 	authority.serial_guard = &serial_guard;
-	if (cluster_thread_recovery_authority_revalidate_nowait_v1(&authority) !=
-			CLUSTER_THREAD_AUTHORITY_OK)
-	{
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
+		!= CLUSTER_THREAD_AUTHORITY_OK) {
 		cluster_write_fence_note_external_mutation_gate_blocked();
 		result = CLUSTER_THREADREC_DEFERRED;
-	}
-	else
-	{
+	} else {
 		PG_TRY();
 		{
-			result = cluster_thread_recovery_replay_one(
-				dead_tid, launch_epoch, &authority);
+			result = cluster_thread_recovery_replay_one(dead_tid, launch_epoch, &authority);
 		}
 		PG_CATCH();
 		{
 			release_result = cluster_recovery_serial_release(&serial_guard);
-			walr_release_result =
-				cluster_wal_retention_pin_release(&retention_pin);
-			if (release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED &&
-				walr_release_result == CLUSTER_WALR_RELEASE_CONFIRMED)
-			{
+			walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
+			if (release_result == CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
+				&& walr_release_result == CLUSTER_WALR_RELEASE_CONFIRMED) {
 				cluster_external_fence_admission_set_release(&admissions);
 				cluster_external_fence_need_set_release(&needs);
 				cluster_formation_witness_destroy(&formation);
@@ -284,13 +262,13 @@ thread_recovery_worker_run(
 
 	/* IR and WAL retention stay held through replay_one's publish.  A stale
 	 * final bundle forbids DONE even if replay completed. */
-	if (cluster_thread_recovery_authority_revalidate_nowait_v1(&authority) !=
-			CLUSTER_THREAD_AUTHORITY_OK)
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(&authority)
+		!= CLUSTER_THREAD_AUTHORITY_OK)
 		result = CLUSTER_THREADREC_BLOCKED;
 	release_result = cluster_recovery_serial_release(&serial_guard);
 	walr_release_result = cluster_wal_retention_pin_release(&retention_pin);
-	if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED ||
-		walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
+	if (release_result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED
+		|| walr_release_result != CLUSTER_WALR_RELEASE_CONFIRMED)
 		return CLUSTER_THREADREC_BLOCKED;
 	cluster_external_fence_admission_set_release(&admissions);
 	cluster_external_fence_need_set_release(&needs);
@@ -325,10 +303,9 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 	if (MyBgworkerEntry == NULL)
 		return;
 	memcpy(&eligibility, MyBgworkerEntry->bgw_extra, sizeof(eligibility));
-	slot_read = cluster_thread_recovery_replay_read(
-		(uint16)dead_tid, &state, &launch_epoch);
-	if (!cluster_thread_recovery_worker_start_valid(
-			&eligibility, (uint16)dead_tid, slot_read, state, launch_epoch))
+	slot_read = cluster_thread_recovery_replay_read((uint16)dead_tid, &state, &launch_epoch);
+	if (!cluster_thread_recovery_worker_start_valid(&eligibility, (uint16)dead_tid, slot_read,
+													state, launch_epoch))
 		return;
 
 	/* Cleanup authority on every controlled exit; scheduler state is reaped only
@@ -344,27 +321,27 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 	res = thread_recovery_worker_run(&eligibility);
 	if (cluster_thread_recovery_worker_terminal_state(res, &terminal_state)) {
 		match_result = cluster_thread_recovery_replay_transition_if_match(
-			(uint16)dead_tid, eligibility.attempt_stamp,
-			CLUSTER_THREADREC_REPLAY_REPLAYING, terminal_state);
+			(uint16)dead_tid, eligibility.attempt_stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
+			terminal_state);
 		if (match_result != CLUSTER_THREADREC_MATCH_CHANGED)
-			ereport(PANIC,
-					(errmsg("online thread-recovery terminal slot transition failed"),
-					 errdetail("thread=%u stamp=" UINT64_FORMAT
-							   " result=%d match=%d",
-							   (unsigned)dead_tid, eligibility.attempt_stamp,
-							   (int)res, (int)match_result)));
+			ereport(PANIC, (errmsg("online thread-recovery terminal slot transition failed"),
+							errdetail("thread=%u stamp=" UINT64_FORMAT " result=%d match=%d",
+									  (unsigned)dead_tid, eligibility.attempt_stamp, (int)res,
+									  (int)match_result)));
 	}
 
-	ereport(LOG, (errmsg("online thread recovery: dead thread %d -> %s", dead_tid,
-						 res == CLUSTER_THREADREC_DONE
-							 ? "done"
-							 : (res == CLUSTER_THREADREC_BLOCKED ? "blocked (kept frozen)"
-								: (res == CLUSTER_THREADREC_DEFERRED ? "deferred"
-															  : "not applicable"))),
-				  res == CLUSTER_THREADREC_BLOCKED
-					  ? errhint("The dead thread's resources stay frozen; check the shared WAL "
-								"storage and cluster.thread_recovery_on_unrecoverable.")
-					  : 0));
+	ereport(
+		LOG,
+		(errmsg("online thread recovery: dead thread %d -> %s", dead_tid,
+				res == CLUSTER_THREADREC_DONE
+					? "done"
+					: (res == CLUSTER_THREADREC_BLOCKED
+						   ? "blocked (kept frozen)"
+						   : (res == CLUSTER_THREADREC_DEFERRED ? "deferred" : "not applicable"))),
+		 res == CLUSTER_THREADREC_BLOCKED
+			 ? errhint("The dead thread's resources stay frozen; check the shared WAL "
+					   "storage and cluster.thread_recovery_on_unrecoverable.")
+			 : 0));
 }
 
 typedef struct ClusterThreadRecOwnedWorker {
@@ -373,21 +350,18 @@ typedef struct ClusterThreadRecOwnedWorker {
 	bool terminate_sent;
 } ClusterThreadRecOwnedWorker;
 
-static ClusterThreadRecOwnedWorker
-	thread_recovery_owned[CLUSTER_WAL_THREAD_MAX + 1];
+static ClusterThreadRecOwnedWorker thread_recovery_owned[CLUSTER_WAL_THREAD_MAX + 1];
 
 StaticAssertDecl(sizeof(ClusterThreadRecLaunchEligibility) <= BGW_EXTRALEN,
 				 "thread recovery eligibility must fit bgw_extra");
 
 static bool
-thread_recovery_eligibility_valid(
-	const ClusterThreadRecLaunchEligibility *eligibility)
+thread_recovery_eligibility_valid(const ClusterThreadRecLaunchEligibility *eligibility)
 {
 	return eligibility != NULL
-		&& cluster_thread_recovery_worker_start_valid(
-			eligibility, eligibility->origin_thread, true,
-			CLUSTER_THREADREC_REPLAY_REPLAYING,
-			eligibility->attempt_stamp);
+		   && cluster_thread_recovery_worker_start_valid(eligibility, eligibility->origin_thread,
+														 true, CLUSTER_THREADREC_REPLAY_REPLAYING,
+														 eligibility->attempt_stamp);
 }
 
 static bool
@@ -440,44 +414,38 @@ thread_recovery_reap_one(uint16 dead_tid, bool *retained_out)
 		return;
 	status = GetBackgroundWorkerPid(owned->handle, &pid);
 	if (status == BGWH_STOPPED)
-		slot_read = cluster_thread_recovery_replay_read(dead_tid, &state,
-															 &slot_stamp);
-	decision = cluster_thread_recovery_reap_decide(
-		status, slot_read, owned->attempt_stamp, state, slot_stamp);
+		slot_read = cluster_thread_recovery_replay_read(dead_tid, &state, &slot_stamp);
+	decision = cluster_thread_recovery_reap_decide(status, slot_read, owned->attempt_stamp, state,
+												   slot_stamp);
 	if (decision == CLUSTER_THREADREC_REAP_RETAIN) {
 		if (retained_out != NULL)
 			*retained_out = true;
 		return;
 	}
 	if (decision == CLUSTER_THREADREC_REAP_INVALID)
-		ereport(FATAL,
-				(errmsg("invalid online thread-recovery worker/slot relation"),
-				 errdetail("thread=%u owned_stamp=" UINT64_FORMAT
-						   " status=%d slot_read=%s slot_state=%d slot_stamp=" UINT64_FORMAT,
-						   (unsigned)dead_tid, owned->attempt_stamp, (int)status,
-						   slot_read ? "true" : "false", (int)state,
-						   slot_stamp)));
+		ereport(FATAL, (errmsg("invalid online thread-recovery worker/slot relation"),
+						errdetail("thread=%u owned_stamp=" UINT64_FORMAT
+								  " status=%d slot_read=%s slot_state=%d slot_stamp=" UINT64_FORMAT,
+								  (unsigned)dead_tid, owned->attempt_stamp, (int)status,
+								  slot_read ? "true" : "false", (int)state, slot_stamp)));
 	if (decision == CLUSTER_THREADREC_REAP_RESET_IDLE) {
 		ClusterThreadReplayMatchResult match_result
-			= cluster_thread_recovery_replay_transition_if_match(
-				dead_tid, owned->attempt_stamp,
-				CLUSTER_THREADREC_REPLAY_REPLAYING,
-				CLUSTER_THREADREC_REPLAY_IDLE);
+			= cluster_thread_recovery_replay_transition_if_match(dead_tid, owned->attempt_stamp,
+																 CLUSTER_THREADREC_REPLAY_REPLAYING,
+																 CLUSTER_THREADREC_REPLAY_IDLE);
 
 		if (match_result != CLUSTER_THREADREC_MATCH_CHANGED)
 			ereport(FATAL,
 					(errmsg("online thread-recovery STOPPED reap could not reset slot"),
-					 errdetail("thread=%u stamp=" UINT64_FORMAT " match=%d",
-							   (unsigned)dead_tid, owned->attempt_stamp,
-							   (int)match_result)));
+					 errdetail("thread=%u stamp=" UINT64_FORMAT " match=%d", (unsigned)dead_tid,
+							   owned->attempt_stamp, (int)match_result)));
 	}
 	pfree(owned->handle);
 	memset(owned, 0, sizeof(*owned));
 }
 
 static void
-thread_recovery_launch_one(
-	const ClusterThreadRecLaunchEligibility *eligibility)
+thread_recovery_launch_one(const ClusterThreadRecLaunchEligibility *eligibility)
 {
 	ClusterThreadRecOwnedWorker *owned;
 	ClusterThreadRecReplayState state;
@@ -490,15 +458,12 @@ thread_recovery_launch_one(
 		return;
 	if (!cluster_thread_recovery_replay_read(dead_tid, &state, &slot_stamp)
 		|| state != CLUSTER_THREADREC_REPLAY_IDLE)
-		ereport(FATAL,
-				(errmsg("invalid online thread-recovery launch slot"),
-				 errdetail("thread=%u state=%d stamp=" UINT64_FORMAT,
-						   (unsigned)dead_tid, (int)state, slot_stamp)));
-	if (!cluster_thread_recovery_replay_mark_replaying(
-			dead_tid, eligibility->attempt_stamp))
-		ereport(FATAL,
-				(errmsg("could not stamp online thread-recovery slot for dead thread %u",
-						(unsigned)dead_tid)));
+		ereport(FATAL, (errmsg("invalid online thread-recovery launch slot"),
+						errdetail("thread=%u state=%d stamp=" UINT64_FORMAT, (unsigned)dead_tid,
+								  (int)state, slot_stamp)));
+	if (!cluster_thread_recovery_replay_mark_replaying(dead_tid, eligibility->attempt_stamp))
+		ereport(FATAL, (errmsg("could not stamp online thread-recovery slot for dead thread %u",
+							   (unsigned)dead_tid)));
 	/*
 	 * RF-ROOT P7 (contract §B): pin the canonical-root projection BEFORE
 	 * the worker spawns — post-bit22 only (pre-bit22 replay_one derives
@@ -512,8 +477,7 @@ thread_recovery_launch_one(
 	 * the worker fails closed (window derivation BLOCKED).
 	 */
 	if (cluster_r4_bit22_cutover_active()) {
-		(void) cluster_thread_recovery_pin_projection(
-			dead_tid, eligibility->attempt_stamp);
+		(void)cluster_thread_recovery_pin_projection(dead_tid, eligibility->attempt_stamp);
 	}
 	if (register_one_worker(eligibility, &owned->handle)) {
 		owned->attempt_stamp = eligibility->attempt_stamp;
@@ -522,20 +486,16 @@ thread_recovery_launch_one(
 	}
 
 	match_result = cluster_thread_recovery_replay_transition_if_match(
-		dead_tid, eligibility->attempt_stamp,
-		CLUSTER_THREADREC_REPLAY_REPLAYING,
+		dead_tid, eligibility->attempt_stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
 		CLUSTER_THREADREC_REPLAY_IDLE);
 	if (match_result != CLUSTER_THREADREC_MATCH_CHANGED)
-		ereport(FATAL,
-				(errmsg("could not reset failed online thread-recovery launch"),
-				 errdetail("thread=%u stamp=" UINT64_FORMAT " match=%d",
-						   (unsigned)dead_tid, eligibility->attempt_stamp,
-						   (int)match_result)));
-	ereport(WARNING,
-			(errmsg("could not register online thread-recovery worker for dead thread %u",
-					(unsigned)dead_tid),
-			 errhint("Background worker slots are exhausted (max_worker_processes); the "
-					 "dead thread stays frozen until recovery can run.")));
+		ereport(FATAL, (errmsg("could not reset failed online thread-recovery launch"),
+						errdetail("thread=%u stamp=" UINT64_FORMAT " match=%d", (unsigned)dead_tid,
+								  eligibility->attempt_stamp, (int)match_result)));
+	ereport(WARNING, (errmsg("could not register online thread-recovery worker for dead thread %u",
+							 (unsigned)dead_tid),
+					  errhint("Background worker slots are exhausted (max_worker_processes); the "
+							  "dead thread stays frozen until recovery can run.")));
 }
 
 void
@@ -546,40 +506,31 @@ cluster_thread_recovery_lmon_tick(void)
 	int survivors;
 	uint16 dead_tid;
 
-	for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
-		 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++)
+	for (dead_tid = XLP_THREAD_ID_FIRST_REAL; dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++)
 		thread_recovery_reap_one(dead_tid, NULL);
 
-	shared_fs = (cluster_shared_storage_backend
-				 == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
+	shared_fs = (cluster_shared_storage_backend == CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS);
 	survivors = cluster_conf_node_count() - 1;
-	scope = cluster_thread_recovery_decide_scope(
-		cluster_online_thread_recovery, cluster_conf_has_peers(), shared_fs,
-		survivors);
+	scope = cluster_thread_recovery_decide_scope(cluster_online_thread_recovery,
+												 cluster_conf_has_peers(), shared_fs, survivors);
 	if (scope != CLUSTER_THREADREC_SCOPE_APPLICABLE)
 		return;
 
-	for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
-		 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++) {
+	for (dead_tid = XLP_THREAD_ID_FIRST_REAL; dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++) {
 		ClusterThreadRecLaunchEligibility eligibility;
-		ClusterThreadRecOwnedWorker *owned
-			= &thread_recovery_owned[dead_tid];
+		ClusterThreadRecOwnedWorker *owned = &thread_recovery_owned[dead_tid];
 
 		memset(&eligibility, 0, sizeof(eligibility));
-		if (!cluster_reconfig_thread_recovery_eligibility_consume(
-				dead_tid, &eligibility))
+		if (!cluster_reconfig_thread_recovery_eligibility_consume(dead_tid, &eligibility))
 			continue;
 		if (!thread_recovery_eligibility_valid(&eligibility)
 			|| eligibility.origin_thread != dead_tid)
-			ereport(FATAL,
-					(errmsg("invalid online thread-recovery launch eligibility"),
-					 errdetail("requested_thread=%u carrier_thread=%u stamp=" UINT64_FORMAT,
-							   (unsigned)dead_tid,
-							   (unsigned)eligibility.origin_thread,
-							   eligibility.attempt_stamp)));
+			ereport(FATAL, (errmsg("invalid online thread-recovery launch eligibility"),
+							errdetail("requested_thread=%u carrier_thread=%u stamp=" UINT64_FORMAT,
+									  (unsigned)dead_tid, (unsigned)eligibility.origin_thread,
+									  eligibility.attempt_stamp)));
 		if (owned->handle != NULL) {
-			if (owned->attempt_stamp != eligibility.attempt_stamp
-				&& !owned->terminate_sent) {
+			if (owned->attempt_stamp != eligibility.attempt_stamp && !owned->terminate_sent) {
 				TerminateBackgroundWorker(owned->handle);
 				owned->terminate_sent = true;
 			}
@@ -592,14 +543,11 @@ cluster_thread_recovery_lmon_tick(void)
 void
 cluster_thread_recovery_lmon_shutdown(void)
 {
-	TimestampTz deadline
-		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
+	TimestampTz deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), 5000);
 	uint16 dead_tid;
 
-	for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
-		 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++) {
-		ClusterThreadRecOwnedWorker *owned
-			= &thread_recovery_owned[dead_tid];
+	for (dead_tid = XLP_THREAD_ID_FIRST_REAL; dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++) {
+		ClusterThreadRecOwnedWorker *owned = &thread_recovery_owned[dead_tid];
 
 		if (owned->handle != NULL && !owned->terminate_sent) {
 			TerminateBackgroundWorker(owned->handle);
@@ -612,23 +560,22 @@ cluster_thread_recovery_lmon_shutdown(void)
 		long wait_ms;
 		int rc;
 
-		for (dead_tid = XLP_THREAD_ID_FIRST_REAL;
-			 dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++)
+		for (dead_tid = XLP_THREAD_ID_FIRST_REAL; dead_tid <= CLUSTER_WAL_THREAD_MAX; dead_tid++)
 			thread_recovery_reap_one(dead_tid, &retained);
 		if (!retained)
 			return;
 		now = GetCurrentTimestamp();
 		if (now >= deadline)
-			ereport(FATAL,
-					(errmsg("timed out reaping online thread-recovery workers during LMON shutdown")));
+			ereport(
+				FATAL,
+				(errmsg("timed out reaping online thread-recovery workers during LMON shutdown")));
 		wait_ms = (long)((deadline - now + INT64CONST(999)) / INT64CONST(1000));
 		if (wait_ms > 50)
 			wait_ms = 50;
 		if (wait_ms < 1)
 			wait_ms = 1;
-		rc = WaitLatch(MyLatch,
-					   WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-					   wait_ms, WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);
+		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, wait_ms,
+					   WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);
 		if (rc & WL_LATCH_SET)
 			ResetLatch(MyLatch);
 	}

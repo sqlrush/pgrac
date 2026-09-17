@@ -91,8 +91,8 @@ static ClusterWalRetentionE1Context *active_e1_context;
 static ClusterWalRetentionE1Context *active_action_context;
 static bool walr_resource_callback_registered;
 
-static void walr_resource_release_callback(ResourceReleasePhase phase,
-									bool isCommit, bool isTopLevel, void *arg);
+static void walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit,
+										   bool isTopLevel, void *arg);
 
 static void
 wal_reuse_guard_close_handles(ClusterWalReuseActionGuard *guard)
@@ -130,7 +130,7 @@ static bool
 control_root_read_ready(ClusterControlRootResult result)
 {
 	return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED;
+		   || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED;
 }
 
 bool
@@ -161,16 +161,13 @@ cluster_wal_thread_directory_parse(const char *basename, uint16 *out_thread_id)
 }
 
 bool
-cluster_wal_file_identity_valid(const ClusterWalFileIdentity *identity,
-								 int wal_segsz_bytes)
+cluster_wal_file_identity_valid(const ClusterWalFileIdentity *identity, int wal_segsz_bytes)
 {
 	uint64 segments_per_id;
 
-	if (identity == NULL || !IsValidWalSegSize(wal_segsz_bytes)
-		|| identity->thread_id == 0
+	if (identity == NULL || !IsValidWalSegSize(wal_segsz_bytes) || identity->thread_id == 0
 		|| identity->thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS
-		|| (identity->kind != CLUSTER_WAL_FILE_NORMAL
-			&& identity->kind != CLUSTER_WAL_FILE_PARTIAL)
+		|| (identity->kind != CLUSTER_WAL_FILE_NORMAL && identity->kind != CLUSTER_WAL_FILE_PARTIAL)
 		|| identity->reserved_zero != 0 || identity->tli == 0)
 		return false;
 	segments_per_id = XLogSegmentsPerXLogId(wal_segsz_bytes);
@@ -178,8 +175,7 @@ cluster_wal_file_identity_valid(const ClusterWalFileIdentity *identity,
 }
 
 bool
-cluster_wal_file_identity_parse(const char *basename, uint16 thread_id,
-								int wal_segsz_bytes,
+cluster_wal_file_identity_parse(const char *basename, uint16 thread_id, int wal_segsz_bytes,
 								ClusterWalFileIdentity *out_identity)
 {
 	ClusterWalFileIdentity identity;
@@ -194,8 +190,8 @@ cluster_wal_file_identity_parse(const char *basename, uint16 thread_id,
 	if (out_identity == NULL)
 		return false;
 	memset(out_identity, 0, sizeof(*out_identity));
-	if (basename == NULL || !IsValidWalSegSize(wal_segsz_bytes)
-		|| thread_id == 0 || thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS)
+	if (basename == NULL || !IsValidWalSegSize(wal_segsz_bytes) || thread_id == 0
+		|| thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS)
 		return false;
 	partial = IsPartialXLogFileName(basename);
 	if (!partial && !IsXLogFileName(basename))
@@ -223,42 +219,37 @@ cluster_wal_file_identity_parse(const char *basename, uint16 thread_id,
 
 bool
 cluster_wal_file_long_header_matches(const ClusterWalFileIdentity *identity,
-									 const XLogLongPageHeaderData *header,
-									 uint64 system_identifier,
+									 const XLogLongPageHeaderData *header, uint64 system_identifier,
 									 int wal_segsz_bytes)
 {
 	XLogRecPtr expected_pageaddr;
 
-	if (!cluster_wal_file_identity_valid(identity, wal_segsz_bytes)
-		|| header == NULL || system_identifier == 0)
+	if (!cluster_wal_file_identity_valid(identity, wal_segsz_bytes) || header == NULL
+		|| system_identifier == 0)
 		return false;
 	expected_pageaddr = (XLogRecPtr)(identity->segno * (uint64)wal_segsz_bytes);
-	return header->std.xlp_magic == XLOG_PAGE_MAGIC
-		&& (header->std.xlp_info & ~XLP_ALL_FLAGS) == 0
-		&& (header->std.xlp_info & XLP_LONG_HEADER) != 0
-		&& header->std.xlp_tli == identity->tli
-		&& header->std.xlp_pageaddr == expected_pageaddr
-		&& header->std.xlp_thread_id == identity->thread_id
-		&& header->std.xlp_cluster_flags == XLP_CLUSTER_FLAGS_RESERVED
-		&& header->xlp_sysid == system_identifier
-		&& header->xlp_seg_size == (uint32)wal_segsz_bytes
-		&& header->xlp_xlog_blcksz == XLOG_BLCKSZ;
+	return header->std.xlp_magic == XLOG_PAGE_MAGIC && (header->std.xlp_info & ~XLP_ALL_FLAGS) == 0
+		   && (header->std.xlp_info & XLP_LONG_HEADER) != 0 && header->std.xlp_tli == identity->tli
+		   && header->std.xlp_pageaddr == expected_pageaddr
+		   && header->std.xlp_thread_id == identity->thread_id
+		   && header->std.xlp_cluster_flags == XLP_CLUSTER_FLAGS_RESERVED
+		   && header->xlp_sysid == system_identifier
+		   && header->xlp_seg_size == (uint32)wal_segsz_bytes
+		   && header->xlp_xlog_blcksz == XLOG_BLCKSZ;
 }
 
 bool
-cluster_wal_retention_interval_segment_bounds(
-	const ClusterWalRetentionInterval *interval, int wal_segsz_bytes,
-	XLogSegNo *out_first, XLogSegNo *out_last)
+cluster_wal_retention_interval_segment_bounds(const ClusterWalRetentionInterval *interval,
+											  int wal_segsz_bytes, XLogSegNo *out_first,
+											  XLogSegNo *out_last)
 {
 	if (out_first == NULL || out_last == NULL)
 		return false;
 	*out_first = 0;
 	*out_last = 0;
-	if (interval == NULL || !IsValidWalSegSize(wal_segsz_bytes)
-		|| interval->thread_id == 0
-		|| interval->thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS
-		|| interval->reserved_zero != 0 || interval->tli == 0
-		|| interval->start_lsn == InvalidXLogRecPtr
+	if (interval == NULL || !IsValidWalSegSize(wal_segsz_bytes) || interval->thread_id == 0
+		|| interval->thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS || interval->reserved_zero != 0
+		|| interval->tli == 0 || interval->start_lsn == InvalidXLogRecPtr
 		|| interval->end_lsn <= interval->start_lsn)
 		return false;
 	*out_first = interval->start_lsn / (uint64)wal_segsz_bytes;
@@ -267,20 +258,18 @@ cluster_wal_retention_interval_segment_bounds(
 }
 
 bool
-cluster_wal_retention_interval_intersects_file(
-	const ClusterWalRetentionInterval *interval,
-	const ClusterWalFileIdentity *identity, int wal_segsz_bytes)
+cluster_wal_retention_interval_intersects_file(const ClusterWalRetentionInterval *interval,
+											   const ClusterWalFileIdentity *identity,
+											   int wal_segsz_bytes)
 {
 	XLogSegNo first;
 	XLogSegNo last;
 
 	if (!cluster_wal_file_identity_valid(identity, wal_segsz_bytes)
-		|| !cluster_wal_retention_interval_segment_bounds(
-			interval, wal_segsz_bytes, &first, &last))
+		|| !cluster_wal_retention_interval_segment_bounds(interval, wal_segsz_bytes, &first, &last))
 		return false;
-	return interval->thread_id == identity->thread_id
-		&& interval->tli == identity->tli && identity->segno >= first
-		&& identity->segno <= last;
+	return interval->thread_id == identity->thread_id && interval->tli == identity->tli
+		   && identity->segno >= first && identity->segno <= last;
 }
 
 bool
@@ -319,20 +308,18 @@ static bool
 walr_request_has_native_lock(const ClusterLockAcquireRequest *request)
 {
 	return request->locktag.locktag_field1 == CLUSTER_WALR_NATIVE_TAG_MAGIC
-		&& request->locktag.locktag_field2 == request->resid.field1
-		&& request->locktag.locktag_field3
-			== CLUSTER_WAL_RETENTION_RESID_TYPE
-		&& request->locktag.locktag_field4 == 0
-		&& request->locktag.locktag_type == LOCKTAG_USERLOCK
-		&& request->locktag.locktag_lockmethodid == DEFAULT_LOCKMETHOD;
+		   && request->locktag.locktag_field2 == request->resid.field1
+		   && request->locktag.locktag_field3 == CLUSTER_WAL_RETENTION_RESID_TYPE
+		   && request->locktag.locktag_field4 == 0
+		   && request->locktag.locktag_type == LOCKTAG_USERLOCK
+		   && request->locktag.locktag_lockmethodid == DEFAULT_LOCKMETHOD;
 }
 
 static void
 walr_native_lock_release_or_fatal(const ClusterLockAcquireRequest *request)
 {
 	if (walr_request_has_native_lock(request)
-		&& !LockRelease(&request->locktag, request->lockmode,
-						 request->sessionLock))
+		&& !LockRelease(&request->locktag, request->lockmode, request->sessionLock))
 		elog(FATAL, "could not release WALR PG-native lock");
 }
 
@@ -348,10 +335,9 @@ walr_request_acquire_actual(ClusterLockAcquireRequest *request)
 	if (result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK) {
 		LockAcquireResult native_result;
 
-		walr_native_locktag_init((uint16)request->resid.field1,
-						 &request->locktag);
-		native_result = LockAcquire(&request->locktag, request->lockmode,
-									request->sessionLock, request->dontwait);
+		walr_native_locktag_init((uint16)request->resid.field1, &request->locktag);
+		native_result = LockAcquire(&request->locktag, request->lockmode, request->sessionLock,
+									request->dontwait);
 		if (native_result != LOCKACQUIRE_OK) {
 			if (native_result == LOCKACQUIRE_ALREADY_CLEAR
 				|| native_result == LOCKACQUIRE_ALREADY_HELD)
@@ -371,8 +357,7 @@ walr_request_acquire_actual(ClusterLockAcquireRequest *request)
  * preserve_request_id is used by X->S: keeping the confirmed X holder key
  * makes cleanup exact whether the downgrade reply is received or lost. */
 static ClusterLockAcquireResult
-walr_request_convert_actual(ClusterLockAcquireRequest *request,
-							uint64 preserve_request_id,
+walr_request_convert_actual(ClusterLockAcquireRequest *request, uint64 preserve_request_id,
 							bool *out_cleanup_required)
 {
 	ClusterLockAcquireResult result;
@@ -388,18 +373,16 @@ walr_request_convert_actual(ClusterLockAcquireRequest *request,
 		request->holder.request_id = preserve_request_id;
 	}
 	walr_native_locktag_init((uint16)request->resid.field1, &request->locktag);
-	native_result = LockAcquire(&request->locktag, request->lockmode,
-								request->sessionLock, request->dontwait);
-	if (native_result != LOCKACQUIRE_OK
-		&& native_result != LOCKACQUIRE_ALREADY_HELD) {
+	native_result = LockAcquire(&request->locktag, request->lockmode, request->sessionLock,
+								request->dontwait);
+	if (native_result != LOCKACQUIRE_OK && native_result != LOCKACQUIRE_ALREADY_HELD) {
 		if (native_result == LOCKACQUIRE_ALREADY_CLEAR)
 			walr_native_lock_release_or_fatal(request);
 		return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
 	}
 	result = cluster_lock_acquire_s5_promote(request);
 	if (result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
-		if (request->lockmode == ExclusiveLock
-			&& result != CLUSTER_LOCK_ACQUIRE_NOT_AVAIL) {
+		if (request->lockmode == ExclusiveLock && result != CLUSTER_LOCK_ACQUIRE_NOT_AVAIL) {
 			if (out_cleanup_required != NULL)
 				*out_cleanup_required = true;
 		} else
@@ -425,51 +408,43 @@ static bool
 root_token_matches_identity(const ClusterControlRootReadToken *token,
 							const ClusterRecoveryDutyKey *duty)
 {
-	uint32 required_flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
+	uint32 required_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
 
-	return token != NULL && duty != NULL
-		&& token->origin_thread_id == duty->origin_thread_id
-		&& token->root_lineage_seq == duty->root_lineage_seq
-		&& memcmp(token->authority_uuid, duty->authority_uuid,
-				  sizeof(token->authority_uuid)) == 0
-		&& token->source != 0
-		&& token->lifecycle >= CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
-		&& token->lifecycle <= CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED
-		&& token->reserved20 == 0 && token->reserved32 == 0
-		&& token->file_txn_seq != 0 && token->root_publish_seq != 0
-		&& token->record_crc32c != 0
-		&& (token->root_flags & required_flags) == required_flags
-		&& (token->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) == 0;
+	return token != NULL && duty != NULL && token->origin_thread_id == duty->origin_thread_id
+		   && token->root_lineage_seq == duty->root_lineage_seq
+		   && memcmp(token->authority_uuid, duty->authority_uuid, sizeof(token->authority_uuid))
+				  == 0
+		   && token->source != 0 && token->lifecycle >= CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		   && token->lifecycle <= CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED && token->reserved20 == 0
+		   && token->reserved32 == 0 && token->file_txn_seq != 0 && token->root_publish_seq != 0
+		   && token->record_crc32c != 0 && (token->root_flags & required_flags) == required_flags
+		   && (token->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) == 0;
 }
 
 static bool
 root_token_matches_recovery_duty(const ClusterControlRootReadToken *token,
 								 const ClusterRecoveryDutyKey *duty)
 {
-	uint32 required_flags = CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-		| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	uint32 required_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
 
 	return root_token_matches_identity(token, duty)
-		&& token->lifecycle
-			== CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-		&& (token->root_flags & required_flags) == required_flags;
+		   && token->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		   && (token->root_flags & required_flags) == required_flags;
 }
 
 static bool
-pin_request_valid(const ClusterWalRetentionPinThreadRequest *request,
-			  int wal_segsz_bytes, Size *total_bytes)
+pin_request_valid(const ClusterWalRetentionPinThreadRequest *request, int wal_segsz_bytes,
+				  Size *total_bytes)
 {
 	uint32 i;
 	Size interval_bytes;
 
-	if (request == NULL || request->intervals == NULL
-		|| request->nintervals == 0
+	if (request == NULL || request->intervals == NULL || request->nintervals == 0
 		|| !cluster_recovery_duty_key_valid_v1(&request->duty)
-		|| !root_token_matches_recovery_duty(
-			&request->root_read, &request->duty)
-		|| request->formation == NULL || request->needs == NULL
-		|| request->admissions == NULL
+		|| !root_token_matches_recovery_duty(&request->root_read, &request->duty)
+		|| request->formation == NULL || request->needs == NULL || request->admissions == NULL
 		|| request->nintervals > MaxAllocSize / sizeof(*request->intervals))
 		return false;
 	interval_bytes = (Size)request->nintervals * sizeof(*request->intervals);
@@ -483,16 +458,14 @@ pin_request_valid(const ClusterWalRetentionPinThreadRequest *request,
 		XLogSegNo last;
 
 		if (interval->thread_id != request->duty.origin_thread_id
-			|| !cluster_wal_retention_interval_segment_bounds(
-				interval, wal_segsz_bytes, &first, &last))
+			|| !cluster_wal_retention_interval_segment_bounds(interval, wal_segsz_bytes, &first,
+															  &last))
 			return false;
 		if (i > 0) {
-			const ClusterWalRetentionInterval *previous =
-				&request->intervals[i - 1];
+			const ClusterWalRetentionInterval *previous = &request->intervals[i - 1];
 
 			if (previous->tli > interval->tli
-				|| (previous->tli == interval->tli
-					&& previous->end_lsn >= interval->start_lsn))
+				|| (previous->tli == interval->tli && previous->end_lsn >= interval->start_lsn))
 				return false;
 		}
 	}
@@ -503,12 +476,10 @@ static bool
 pin_valid(const ClusterWalRetentionPin *pin)
 {
 	return pin != NULL && pin == active_pin && pin->magic == CLUSTER_WAL_PIN_MAGIC
-		&& pin->owner_pid == MyProcPid && pin->owner == CurrentResourceOwner
-		&& pin->nthreads > 0
-		&& pin->nthreads <= CLUSTER_WAL_RETENTION_MAX_THREADS
-		&& pin->threads != NULL
-		&& pin->state >= CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND
-		&& pin->state <= CLUSTER_WAL_PIN_STATE_SEALED;
+		   && pin->owner_pid == MyProcPid && pin->owner == CurrentResourceOwner && pin->nthreads > 0
+		   && pin->nthreads <= CLUSTER_WAL_RETENTION_MAX_THREADS && pin->threads != NULL
+		   && pin->state >= CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND
+		   && pin->state <= CLUSTER_WAL_PIN_STATE_SEALED;
 }
 
 static void
@@ -550,8 +521,7 @@ pin_release_locks(ClusterWalRetentionPin *pin)
 			unconfirmed = true;
 		}
 	}
-	return unconfirmed ? CLUSTER_WALR_RELEASE_UNCONFIRMED
-						 : CLUSTER_WALR_RELEASE_CONFIRMED;
+	return unconfirmed ? CLUSTER_WALR_RELEASE_UNCONFIRMED : CLUSTER_WALR_RELEASE_CONFIRMED;
 }
 
 static ClusterWalPinResult
@@ -577,40 +547,34 @@ pin_current_after_grants(ClusterWalRetentionPin *pin)
 		ClusterWalPinThread *thread = &pin->threads[i];
 		ClusterControlRootSnapshot snapshot;
 		ClusterControlRootResult result;
-		PgracExternalFenceDenyReason reason =
-			PGRAC_EXTERNAL_FENCE_DENY_NONE;
+		PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 
-		result = cluster_control_root_revalidate(
-			&thread->root_read, &thread->duty, &snapshot);
+		result = cluster_control_root_revalidate(&thread->root_read, &thread->duty, &snapshot);
 		if (!control_root_read_ready(result)
-			|| memcmp(&snapshot.identity, &thread->duty,
-					  sizeof(thread->duty)) != 0
-			|| snapshot.lifecycle
-				!= CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| memcmp(&snapshot.identity, &thread->duty, sizeof(thread->duty)) != 0
+			|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 			|| snapshot.root_flags != thread->root_read.root_flags
 			|| cluster_formation_witness_revalidate_nowait(thread->formation)
-				!= CLUSTER_FORMATION_WITNESS_READY
-			|| !cluster_external_fence_need_set_revalidate_nowait(
-				thread->needs, thread->formation, &reason)
-			|| !cluster_external_fence_revalidate_set_nowait(
-				thread->admissions, thread->needs, thread->formation, &reason))
+				   != CLUSTER_FORMATION_WITNESS_READY
+			|| !cluster_external_fence_need_set_revalidate_nowait(thread->needs, thread->formation,
+																  &reason)
+			|| !cluster_external_fence_revalidate_set_nowait(thread->admissions, thread->needs,
+															 thread->formation, &reason))
 			return CLUSTER_WAL_PIN_STALE;
 	}
 	return CLUSTER_WAL_PIN_OK;
 }
 
 ClusterWalPinResult
-cluster_wal_retention_pin_acquire(
-	const ClusterWalRetentionPinThreadRequest *requests, uint16 nthreads,
-	ClusterWalRetentionPin **out_pin)
+cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *requests,
+								  uint16 nthreads, ClusterWalRetentionPin **out_pin)
 {
 	ClusterWalRetentionPin *pin;
 	Size total_bytes;
 	uint16 i;
 
-	if (out_pin == NULL || *out_pin != NULL || requests == NULL
-		|| CurrentResourceOwner == NULL || nthreads == 0
-		|| nthreads > CLUSTER_WAL_RETENTION_MAX_THREADS)
+	if (out_pin == NULL || *out_pin != NULL || requests == NULL || CurrentResourceOwner == NULL
+		|| nthreads == 0 || nthreads > CLUSTER_WAL_RETENTION_MAX_THREADS)
 		return CLUSTER_WAL_PIN_INVALID;
 	if (active_pin != NULL)
 		return CLUSTER_WAL_PIN_CAPACITY;
@@ -621,8 +585,7 @@ cluster_wal_retention_pin_acquire(
 	for (i = 0; i < nthreads; i++) {
 		if (!pin_request_valid(&requests[i], wal_segment_size, &total_bytes)
 			|| (i > 0
-				&& requests[i - 1].duty.origin_thread_id
-					>= requests[i].duty.origin_thread_id))
+				&& requests[i - 1].duty.origin_thread_id >= requests[i].duty.origin_thread_id))
 			return CLUSTER_WAL_PIN_INVALID;
 	}
 	walr_resource_ensure_callback();
@@ -636,8 +599,7 @@ cluster_wal_retention_pin_acquire(
 	pin->state = CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND;
 	for (i = 0; i < nthreads; i++) {
 		ClusterWalPinThread *thread = &pin->threads[i];
-		Size bytes = (Size)requests[i].nintervals
-			* sizeof(*thread->intervals);
+		Size bytes = (Size)requests[i].nintervals * sizeof(*thread->intervals);
 
 		thread->intervals = palloc0(bytes);
 		memcpy(thread->intervals, requests[i].intervals, bytes);
@@ -655,9 +617,8 @@ cluster_wal_retention_pin_acquire(
 		ClusterLockAcquireResult result;
 
 		memset(&walr->request, 0, sizeof(walr->request));
-		if (!cluster_wal_retention_resid_encode(
-				pin->threads[i].duty.origin_thread_id,
-				&walr->request.resid))
+		if (!cluster_wal_retention_resid_encode(pin->threads[i].duty.origin_thread_id,
+												&walr->request.resid))
 			return pin_fail_after_locks(pin, CLUSTER_WAL_PIN_INVALID, out_pin);
 		walr->request.lockmode = ShareLock;
 		walr->request.op = CLUSTER_LOCK_OP_REQUEST;
@@ -665,14 +626,12 @@ cluster_wal_retention_pin_acquire(
 		walr->request.lockmethod_id = DEFAULT_LOCKMETHOD;
 		walr->request.dontwait = true;
 		walr->request.sessionLock = false;
-		walr->request.caller_local_start_ts_ms =
-			(uint64)(GetCurrentTimestamp() / 1000);
+		walr->request.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 		walr->request.timeout_ms = 1;
 		walr->request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 		result = walr_request_acquire_actual(&walr->request);
 		if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
-			return pin_fail_after_locks(pin, CLUSTER_WAL_PIN_UNAVAILABLE,
-									out_pin);
+			return pin_fail_after_locks(pin, CLUSTER_WAL_PIN_UNAVAILABLE, out_pin);
 		walr->held = true;
 	}
 	if (pin_current_after_grants(pin) != CLUSTER_WAL_PIN_OK)
@@ -682,18 +641,14 @@ cluster_wal_retention_pin_acquire(
 }
 
 static bool
-serial_matches_thread(ClusterRecoverySerialGuard *serial,
-					  const ClusterWalPinThread *thread)
+serial_matches_thread(ClusterRecoverySerialGuard *serial, const ClusterWalPinThread *thread)
 {
 	return serial != NULL && serial->held && !serial->release_uncertain
-		&& memcmp(&serial->duty, &thread->duty, sizeof(thread->duty)) == 0
-		&& memcmp(&serial->root_read_token, &thread->root_read,
-				  sizeof(thread->root_read)) == 0
-		&& serial->formation == thread->formation
-		&& serial->fence_need_set == thread->needs
-		&& serial->fence_admission_set == thread->admissions
-		&& cluster_recovery_serial_revalidate(serial)
-			== CLUSTER_RECOVERY_SERIAL_CURRENT;
+		   && memcmp(&serial->duty, &thread->duty, sizeof(thread->duty)) == 0
+		   && memcmp(&serial->root_read_token, &thread->root_read, sizeof(thread->root_read)) == 0
+		   && serial->formation == thread->formation && serial->fence_need_set == thread->needs
+		   && serial->fence_admission_set == thread->admissions
+		   && cluster_recovery_serial_revalidate(serial) == CLUSTER_RECOVERY_SERIAL_CURRENT;
 }
 
 static ClusterWalPinThread *
@@ -717,8 +672,7 @@ cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 		return CLUSTER_WAL_PIN_INVALID;
 	if (pin->poisoned)
 		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
-	if (pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND
-		|| pin->nthreads != 1)
+	if (pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND || pin->nthreads != 1)
 		return CLUSTER_WAL_PIN_INVALID;
 	if (!serial_matches_thread(held_serial, &pin->threads[0]))
 		return CLUSTER_WAL_PIN_STALE;
@@ -737,9 +691,8 @@ cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
 		return CLUSTER_WAL_PIN_INVALID;
 	if (pin->poisoned)
 		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
-	if (pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND
-		|| pin->nthreads <= 1 || held_set == NULL
-		|| held_set->count != pin->nthreads)
+	if (pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND || pin->nthreads <= 1
+		|| held_set == NULL || held_set->count != pin->nthreads)
 		return CLUSTER_WAL_PIN_INVALID;
 	for (i = 0; i < pin->nthreads; i++)
 		if (!serial_matches_thread(&held_set->guards[i], &pin->threads[i]))
@@ -768,13 +721,11 @@ pin_revalidate_bound(ClusterWalRetentionPin *pin)
 }
 
 ClusterWalPinResult
-cluster_wal_retention_pin_preflight_revalidate_wait_v1(
-	ClusterWalRetentionPin *pin)
+cluster_wal_retention_pin_preflight_revalidate_wait_v1(ClusterWalRetentionPin *pin)
 {
 	ClusterWalPinResult result;
 
-	if (!pin_valid(pin) || pin->state !=
-			CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND)
+	if (!pin_valid(pin) || pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND)
 		return CLUSTER_WAL_PIN_INVALID;
 	if (pin->poisoned)
 		return CLUSTER_WAL_PIN_STALE;
@@ -815,40 +766,36 @@ pin_root_token_matches_snapshot(const ClusterControlRootReadToken *token,
 								const ClusterControlRootSnapshot *snapshot,
 								const ClusterRecoveryDutyKey *duty)
 {
-	return token != NULL && snapshot != NULL && duty != NULL &&
-		memcmp(&snapshot->identity, duty, sizeof(*duty)) == 0 &&
-		memcmp(token->authority_uuid, duty->authority_uuid, 16) == 0 &&
-		token->origin_thread_id == duty->origin_thread_id &&
-		token->source != 0 && token->lifecycle == snapshot->lifecycle &&
-		token->root_lineage_seq == duty->root_lineage_seq &&
-		token->reserved20 == 0 && token->reserved32 == 0 &&
-		token->file_txn_seq != 0 && token->root_publish_seq != 0 &&
-		token->record_crc32c != 0 && token->root_flags == snapshot->root_flags &&
-		(token->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) == 0;
+	return token != NULL && snapshot != NULL && duty != NULL
+		   && memcmp(&snapshot->identity, duty, sizeof(*duty)) == 0
+		   && memcmp(token->authority_uuid, duty->authority_uuid, 16) == 0
+		   && token->origin_thread_id == duty->origin_thread_id && token->source != 0
+		   && token->lifecycle == snapshot->lifecycle
+		   && token->root_lineage_seq == duty->root_lineage_seq && token->reserved20 == 0
+		   && token->reserved32 == 0 && token->file_txn_seq != 0 && token->root_publish_seq != 0
+		   && token->record_crc32c != 0 && token->root_flags == snapshot->root_flags
+		   && (token->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) == 0;
 }
 
 static bool
 pin_root_immutable_tuple_equal(const ClusterControlRootSnapshot *left,
 							   const ClusterControlRootSnapshot *right)
 {
-	return memcmp(&left->identity, &right->identity,
-				sizeof(left->identity)) == 0 &&
-		left->checkpoint_tli == right->checkpoint_tli &&
-		left->checkpoint_source_kind == right->checkpoint_source_kind &&
-		left->checkpoint_lower_lsn == right->checkpoint_lower_lsn &&
-		left->checkpoint_record_crc32c == right->checkpoint_record_crc32c &&
-		left->tail_tli == right->tail_tli &&
-		left->tail_validation_kind == right->tail_validation_kind &&
-		left->validated_tail_lsn_exclusive ==
-			right->validated_tail_lsn_exclusive &&
-		left->tail_last_record_lsn == right->tail_last_record_lsn &&
-		left->tail_last_record_crc32c == right->tail_last_record_crc32c;
+	return memcmp(&left->identity, &right->identity, sizeof(left->identity)) == 0
+		   && left->checkpoint_tli == right->checkpoint_tli
+		   && left->checkpoint_source_kind == right->checkpoint_source_kind
+		   && left->checkpoint_lower_lsn == right->checkpoint_lower_lsn
+		   && left->checkpoint_record_crc32c == right->checkpoint_record_crc32c
+		   && left->tail_tli == right->tail_tli
+		   && left->tail_validation_kind == right->tail_validation_kind
+		   && left->validated_tail_lsn_exclusive == right->validated_tail_lsn_exclusive
+		   && left->tail_last_record_lsn == right->tail_last_record_lsn
+		   && left->tail_last_record_crc32c == right->tail_last_record_crc32c;
 }
 
 ClusterWalPinResult
 cluster_wal_retention_pin_adopt_root_readback_v1(
-	ClusterWalRetentionPin *pin,
-	const ClusterControlRootSnapshot *expected_snapshot,
+	ClusterWalRetentionPin *pin, const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,
 	const ClusterControlRootSnapshot *observed_snapshot,
 	const ClusterControlRootReadToken *observed_token)
@@ -856,37 +803,30 @@ cluster_wal_retention_pin_adopt_root_readback_v1(
 	ClusterWalPinThread *thread;
 	const ClusterWalRetentionInterval *interval;
 
-	if (!pin_valid(pin) || expected_snapshot == NULL || expected_token == NULL ||
-		observed_snapshot == NULL || observed_token == NULL)
+	if (!pin_valid(pin) || expected_snapshot == NULL || expected_token == NULL
+		|| observed_snapshot == NULL || observed_token == NULL)
 		return CLUSTER_WAL_PIN_INVALID;
 	if (pin->poisoned || pin->state != CLUSTER_WAL_PIN_STATE_SEALED)
 		return CLUSTER_WAL_PIN_STALE;
 	thread = pin_find_thread(pin, expected_token->origin_thread_id);
-	if (thread == NULL || thread->serial == NULL || thread->serial->held ||
-		thread->serial->release_uncertain || thread->nintervals != 1 ||
-		memcmp(&thread->root_read, expected_token,
-			sizeof(*expected_token)) != 0 ||
-		!pin_root_token_matches_snapshot(expected_token, expected_snapshot,
-			&thread->duty) ||
-		!pin_root_token_matches_snapshot(observed_token, observed_snapshot,
-			&thread->duty))
+	if (thread == NULL || thread->serial == NULL || thread->serial->held
+		|| thread->serial->release_uncertain || thread->nintervals != 1
+		|| memcmp(&thread->root_read, expected_token, sizeof(*expected_token)) != 0
+		|| !pin_root_token_matches_snapshot(expected_token, expected_snapshot, &thread->duty)
+		|| !pin_root_token_matches_snapshot(observed_token, observed_snapshot, &thread->duty))
 		return CLUSTER_WAL_PIN_STALE;
 	interval = &thread->intervals[0];
-	if (expected_snapshot->lifecycle !=
-			CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED ||
-		(observed_snapshot->lifecycle !=
-			 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED &&
-		 observed_snapshot->lifecycle !=
-			 CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE) ||
-		interval->thread_id != thread->duty.origin_thread_id ||
-		interval->tli != expected_snapshot->checkpoint_tli ||
-		interval->tli != expected_snapshot->tail_tli ||
-		interval->start_lsn != expected_snapshot->checkpoint_lower_lsn ||
-		interval->end_lsn !=
-			expected_snapshot->validated_tail_lsn_exclusive ||
-		!pin_root_immutable_tuple_equal(expected_snapshot, observed_snapshot) ||
-		observed_token->file_txn_seq < expected_token->file_txn_seq ||
-		observed_token->root_publish_seq < expected_token->root_publish_seq)
+	if (expected_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (observed_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			&& observed_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
+		|| interval->thread_id != thread->duty.origin_thread_id
+		|| interval->tli != expected_snapshot->checkpoint_tli
+		|| interval->tli != expected_snapshot->tail_tli
+		|| interval->start_lsn != expected_snapshot->checkpoint_lower_lsn
+		|| interval->end_lsn != expected_snapshot->validated_tail_lsn_exclusive
+		|| !pin_root_immutable_tuple_equal(expected_snapshot, observed_snapshot)
+		|| observed_token->file_txn_seq < expected_token->file_txn_seq
+		|| observed_token->root_publish_seq < expected_token->root_publish_seq)
 		return CLUSTER_WAL_PIN_STALE;
 	thread->root_read = *observed_token;
 	return CLUSTER_WAL_PIN_OK;
@@ -929,34 +869,30 @@ walr_share_request_init(uint16 thread_id, ClusterLockAcquireRequest *request)
 	request->lockmethod_id = DEFAULT_LOCKMETHOD;
 	request->dontwait = true;
 	request->sessionLock = false;
-	request->caller_local_start_ts_ms =
-		(uint64)(GetCurrentTimestamp() / 1000);
+	request->caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	request->timeout_ms = 1;
 	request->wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 	return true;
 }
 
 ClusterWalPinResult
-cluster_wal_retention_root_publish_begin_exact(
-	const ClusterControlRootReadToken *expected_root, bool require_sealed_pin,
-	ClusterWalRootPublishGuard **out_guard)
+cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
+											   bool require_sealed_pin,
+											   ClusterWalRootPublishGuard **out_guard)
 {
 	ClusterWalRootPublishGuard *guard;
 	uint16 thread_id;
 	uint16 i;
 
 	if (out_guard == NULL || *out_guard != NULL || expected_root == NULL
-		|| CurrentResourceOwner == NULL
-		|| expected_root->origin_thread_id == 0
+		|| CurrentResourceOwner == NULL || expected_root->origin_thread_id == 0
 		|| expected_root->origin_thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS
 		|| expected_root->source == 0
 		|| expected_root->lifecycle < CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 		|| expected_root->lifecycle > CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED
 		|| expected_root->reserved20 != 0 || expected_root->reserved32 != 0
-		|| expected_root->root_lineage_seq == 0
-		|| expected_root->file_txn_seq == 0
-		|| expected_root->root_publish_seq == 0
-		|| expected_root->record_crc32c == 0
+		|| expected_root->root_lineage_seq == 0 || expected_root->file_txn_seq == 0
+		|| expected_root->root_publish_seq == 0 || expected_root->record_crc32c == 0
 		|| (expected_root->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) != 0)
 		return CLUSTER_WAL_PIN_INVALID;
 	thread_id = expected_root->origin_thread_id;
@@ -979,10 +915,8 @@ cluster_wal_retention_root_publish_begin_exact(
 			if (active_pin->threads[i].duty.origin_thread_id == thread_id)
 				break;
 		if (i == active_pin->nthreads
-			|| memcmp(&active_pin->threads[i].root_read, expected_root,
-					  sizeof(*expected_root)) != 0
-			|| !active_pin->threads[i].walr.held
-			|| active_pin->threads[i].walr.release_uncertain) {
+			|| memcmp(&active_pin->threads[i].root_read, expected_root, sizeof(*expected_root)) != 0
+			|| !active_pin->threads[i].walr.held || active_pin->threads[i].walr.release_uncertain) {
 			pfree(guard);
 			return CLUSTER_WAL_PIN_STALE;
 		}
@@ -1019,10 +953,8 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 		return CLUSTER_WALR_RELEASE_INVALID;
 	if (*guard == NULL)
 		return CLUSTER_WALR_RELEASE_NOT_HELD;
-	if (*guard != active_root_publish_guard
-		|| (*guard)->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC
-		|| (*guard)->owner_pid != MyProcPid
-		|| (*guard)->owner != CurrentResourceOwner)
+	if (*guard != active_root_publish_guard || (*guard)->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC
+		|| (*guard)->owner_pid != MyProcPid || (*guard)->owner != CurrentResourceOwner)
 		return CLUSTER_WALR_RELEASE_INVALID;
 	if (!(*guard)->borrowed_from_pin) {
 		ClusterLockAcquireResult lock_result;
@@ -1044,8 +976,8 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 }
 
 static void
-walr_resource_release_callback(ResourceReleasePhase phase,
-								bool isCommit, bool isTopLevel, void *arg)
+walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
+							   void *arg)
 {
 	(void)isCommit;
 	(void)isTopLevel;
@@ -1053,22 +985,19 @@ walr_resource_release_callback(ResourceReleasePhase phase,
 	if (phase != RESOURCE_RELEASE_BEFORE_LOCKS)
 		return;
 
-	if (active_reuse_guard != NULL
-		&& active_reuse_guard->owner == CurrentResourceOwner) {
+	if (active_reuse_guard != NULL && active_reuse_guard->owner == CurrentResourceOwner) {
 		ClusterLockAcquireResult lock_result;
 		ClusterWalPinThread *pin_thread = NULL;
 
 		if (active_reuse_guard->walr.converted_from_pin) {
-			pin_thread = pin_find_thread(
-				active_reuse_guard->pin_or_null,
-				active_reuse_guard->duty.origin_thread_id);
+			pin_thread = pin_find_thread(active_reuse_guard->pin_or_null,
+										 active_reuse_guard->duty.origin_thread_id);
 			if (pin_thread == NULL || !pin_thread->walr.held
 				|| pin_thread->serial != active_reuse_guard->serial_or_null)
 				elog(FATAL, "lost WALR retained-source holder during action cleanup");
 		}
 
-		lock_result = walr_request_release_actual(
-			&active_reuse_guard->walr.acquire_request);
+		lock_result = walr_request_release_actual(&active_reuse_guard->walr.acquire_request);
 		if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 			elog(FATAL, "could not confirm WALR action-guard cleanup");
 		active_reuse_guard->walr.held = false;
@@ -1084,12 +1013,10 @@ walr_resource_release_callback(ResourceReleasePhase phase,
 		wal_reuse_guard_close_handles(active_reuse_guard);
 		active_reuse_guard = NULL;
 	}
-	if (active_e1_context != NULL
-		&& active_e1_context->owner == CurrentResourceOwner) {
+	if (active_e1_context != NULL && active_e1_context->owner == CurrentResourceOwner) {
 		ClusterLockAcquireResult lock_result;
 
-		lock_result = walr_request_release_actual(
-			&active_e1_context->coarse_walr.acquire_request);
+		lock_result = walr_request_release_actual(&active_e1_context->coarse_walr.acquire_request);
 		if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 			elog(FATAL, "could not confirm coarse WAL-retention cleanup");
 		active_e1_context->coarse_walr.held = false;
@@ -1097,8 +1024,7 @@ walr_resource_release_callback(ResourceReleasePhase phase,
 		explicit_bzero(active_e1_context, sizeof(*active_e1_context));
 		active_e1_context = NULL;
 	}
-	if (active_action_context != NULL
-		&& active_action_context->owner == CurrentResourceOwner) {
+	if (active_action_context != NULL && active_action_context->owner == CurrentResourceOwner) {
 		cluster_formation_witness_destroy(&active_action_context->formation);
 		explicit_bzero(active_action_context, sizeof(*active_action_context));
 		active_action_context = NULL;
@@ -1107,8 +1033,7 @@ walr_resource_release_callback(ResourceReleasePhase phase,
 		&& active_root_publish_guard->owner == CurrentResourceOwner) {
 		ClusterWalRootPublishGuard *guard = active_root_publish_guard;
 
-		if (cluster_wal_retention_root_publish_end(&guard)
-			!= CLUSTER_WALR_RELEASE_CONFIRMED)
+		if (cluster_wal_retention_root_publish_end(&guard) != CLUSTER_WALR_RELEASE_CONFIRMED)
 			elog(FATAL, "could not confirm WALR root-publisher cleanup");
 	}
 	if (active_pin != NULL && active_pin->owner == CurrentResourceOwner) {
@@ -1125,18 +1050,15 @@ static bool
 wal_reuse_guard_valid(const ClusterWalReuseActionGuard *guard)
 {
 	return guard != NULL && guard->magic == CLUSTER_WAL_REUSE_GUARD_MAGIC
-		&& guard->version == CLUSTER_WAL_REUSE_GUARD_VERSION
-		&& guard->owner_pid == MyProcPid
-		&& guard->self_address == (uintptr_t)guard
-		&& guard->owner == CurrentResourceOwner
-		&& CurrentResourceOwner != NULL
-		&& guard->state <= CLUSTER_WAL_GUARD_BOOKKEPT
-		&& (guard->flags & ~CLUSTER_WAL_GUARD_F_KNOWN_MASK) == 0;
+		   && guard->version == CLUSTER_WAL_REUSE_GUARD_VERSION && guard->owner_pid == MyProcPid
+		   && guard->self_address == (uintptr_t)guard && guard->owner == CurrentResourceOwner
+		   && CurrentResourceOwner != NULL && guard->state <= CLUSTER_WAL_GUARD_BOOKKEPT
+		   && (guard->flags & ~CLUSTER_WAL_GUARD_F_KNOWN_MASK) == 0;
 }
 
 ClusterWalReuseGuardResult
 cluster_wal_reuse_guard_init(ClusterWalReuseActionGuard *guard,
-							ClusterWalReuseDenyReason *out_reason)
+							 ClusterWalReuseDenyReason *out_reason)
 {
 	static const ClusterWalReuseActionGuard zero_guard;
 
@@ -1166,10 +1088,10 @@ wal_reuse_request_has_no_source(const ClusterWalReuseGuardRequest *request)
 	static const ClusterWalFileIdentity zero_file;
 
 	return request->source_kind == CLUSTER_WAL_INSTALL_SOURCE_NONE
-		&& memcmp(&request->source_carrier, &zero_file, sizeof(zero_file)) == 0
-		&& request->fork_lsn == InvalidXLogRecPtr
-		&& request->source_coverage_start == InvalidXLogRecPtr
-		&& request->source_coverage_end == InvalidXLogRecPtr;
+		   && memcmp(&request->source_carrier, &zero_file, sizeof(zero_file)) == 0
+		   && request->fork_lsn == InvalidXLogRecPtr
+		   && request->source_coverage_start == InvalidXLogRecPtr
+		   && request->source_coverage_end == InvalidXLogRecPtr;
 }
 
 static bool
@@ -1185,25 +1107,21 @@ wal_reuse_request_source_valid(const ClusterWalReuseGuardRequest *request)
 		return false;
 	segment_end = segment_start + (uint64)wal_segment_size;
 	if (request->entry == CLUSTER_WAL_REUSE_E3_ARCHIVE_END)
-		return request->source_kind
-				== CLUSTER_WAL_INSTALL_SOURCE_FORK_COPY_TEMP
-			&& cluster_wal_file_identity_valid(&request->source_carrier,
-										   wal_segment_size)
-			&& request->source_carrier.kind == CLUSTER_WAL_FILE_NORMAL
-			&& request->source_carrier.segno == request->file.segno
-			&& request->source_carrier.tli != request->file.tli
-			&& request->fork_lsn > segment_start
-			&& request->fork_lsn < segment_end
-			&& request->source_coverage_start == segment_start
-			&& request->source_coverage_end == request->fork_lsn;
+		return request->source_kind == CLUSTER_WAL_INSTALL_SOURCE_FORK_COPY_TEMP
+			   && cluster_wal_file_identity_valid(&request->source_carrier, wal_segment_size)
+			   && request->source_carrier.kind == CLUSTER_WAL_FILE_NORMAL
+			   && request->source_carrier.segno == request->file.segno
+			   && request->source_carrier.tli != request->file.tli
+			   && request->fork_lsn > segment_start && request->fork_lsn < segment_end
+			   && request->source_coverage_start == segment_start
+			   && request->source_coverage_end == request->fork_lsn;
 	if (request->entry == CLUSTER_WAL_REUSE_E6_ARCHIVE_KEEP)
 		return request->source_kind == CLUSTER_WAL_INSTALL_SOURCE_ARCHIVE_STAGE
-			&& memcmp(&request->source_carrier, &request->file,
-					  sizeof(request->file)) == 0
-			&& request->fork_lsn == InvalidXLogRecPtr
-			&& request->source_coverage_start >= segment_start
-			&& request->source_coverage_start < request->source_coverage_end
-			&& request->source_coverage_end <= segment_end;
+			   && memcmp(&request->source_carrier, &request->file, sizeof(request->file)) == 0
+			   && request->fork_lsn == InvalidXLogRecPtr
+			   && request->source_coverage_start >= segment_start
+			   && request->source_coverage_start < request->source_coverage_end
+			   && request->source_coverage_end <= segment_end;
 	return false;
 }
 
@@ -1212,38 +1130,32 @@ wal_reuse_request_shape_valid(const ClusterWalReuseGuardRequest *request)
 {
 	bool no_source;
 
-	if (request == NULL
-		|| !cluster_wal_file_identity_valid(&request->file, wal_segment_size)
+	if (request == NULL || !cluster_wal_file_identity_valid(&request->file, wal_segment_size)
 		|| !cluster_recovery_duty_key_valid_v1(&request->duty)
 		|| !root_token_matches_identity(&request->root_read, &request->duty)
-		|| request->file.thread_id != request->duty.origin_thread_id
-		|| request->formation == NULL)
+		|| request->file.thread_id != request->duty.origin_thread_id || request->formation == NULL)
 		return false;
 	no_source = wal_reuse_request_has_no_source(request);
 	switch (request->entry) {
-		case CLUSTER_WAL_REUSE_E1_CHECKPOINT_RESTARTPOINT:
-		case CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH:
-			return request->action
-					== CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE
-				&& no_source;
-		case CLUSTER_WAL_REUSE_E3_ARCHIVE_END:
-			if (request->action
-				== CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE)
-				return no_source;
-			return (request->action == CLUSTER_WAL_ACTION_FORCE_REPLACE
-					|| request->action == CLUSTER_WAL_ACTION_CREATE_ABSENT)
-				&& wal_reuse_request_source_valid(request);
-		case CLUSTER_WAL_REUSE_E4_PARTIAL_RENAME:
-			return request->action == CLUSTER_WAL_ACTION_RENAME_PARTIAL
-				&& no_source;
-		case CLUSTER_WAL_REUSE_E6_ARCHIVE_KEEP:
-			return (request->action == CLUSTER_WAL_ACTION_ARCHIVE_REPLACE
-					|| request->action == CLUSTER_WAL_ACTION_CREATE_ABSENT)
-				&& wal_reuse_request_source_valid(request);
-		case CLUSTER_WAL_REUSE_E5_RESTORE_STAGING:
-		case CLUSTER_WAL_REUSE_E7_EXTERNAL_CLEANUP:
-		default:
-			return false;
+	case CLUSTER_WAL_REUSE_E1_CHECKPOINT_RESTARTPOINT:
+	case CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH:
+		return request->action == CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE && no_source;
+	case CLUSTER_WAL_REUSE_E3_ARCHIVE_END:
+		if (request->action == CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE)
+			return no_source;
+		return (request->action == CLUSTER_WAL_ACTION_FORCE_REPLACE
+				|| request->action == CLUSTER_WAL_ACTION_CREATE_ABSENT)
+			   && wal_reuse_request_source_valid(request);
+	case CLUSTER_WAL_REUSE_E4_PARTIAL_RENAME:
+		return request->action == CLUSTER_WAL_ACTION_RENAME_PARTIAL && no_source;
+	case CLUSTER_WAL_REUSE_E6_ARCHIVE_KEEP:
+		return (request->action == CLUSTER_WAL_ACTION_ARCHIVE_REPLACE
+				|| request->action == CLUSTER_WAL_ACTION_CREATE_ABSENT)
+			   && wal_reuse_request_source_valid(request);
+	case CLUSTER_WAL_REUSE_E5_RESTORE_STAGING:
+	case CLUSTER_WAL_REUSE_E7_EXTERNAL_CLEANUP:
+	default:
+		return false;
 	}
 }
 
@@ -1252,11 +1164,9 @@ static int64
 wal_reuse_stat_mtime_ns(const struct stat *st)
 {
 #ifdef __APPLE__
-	return (int64)st->st_mtimespec.tv_sec * INT64_C(1000000000)
-		+ st->st_mtimespec.tv_nsec;
+	return (int64)st->st_mtimespec.tv_sec * INT64_C(1000000000) + st->st_mtimespec.tv_nsec;
 #else
-	return (int64)st->st_mtim.tv_sec * INT64_C(1000000000)
-		+ st->st_mtim.tv_nsec;
+	return (int64)st->st_mtim.tv_sec * INT64_C(1000000000) + st->st_mtim.tv_nsec;
 #endif
 }
 
@@ -1264,11 +1174,9 @@ static int64
 wal_reuse_stat_ctime_ns(const struct stat *st)
 {
 #ifdef __APPLE__
-	return (int64)st->st_ctimespec.tv_sec * INT64_C(1000000000)
-		+ st->st_ctimespec.tv_nsec;
+	return (int64)st->st_ctimespec.tv_sec * INT64_C(1000000000) + st->st_ctimespec.tv_nsec;
 #else
-	return (int64)st->st_ctim.tv_sec * INT64_C(1000000000)
-		+ st->st_ctim.tv_nsec;
+	return (int64)st->st_ctim.tv_sec * INT64_C(1000000000) + st->st_ctim.tv_nsec;
 #endif
 }
 
@@ -1276,15 +1184,14 @@ static bool
 wal_reuse_same_leaf_stat(const struct stat *left, const struct stat *right)
 {
 	return left->st_dev == right->st_dev && left->st_ino == right->st_ino
-		&& left->st_mode == right->st_mode && left->st_size == right->st_size
-		&& wal_reuse_stat_mtime_ns(left) == wal_reuse_stat_mtime_ns(right)
-		&& wal_reuse_stat_ctime_ns(left) == wal_reuse_stat_ctime_ns(right);
+		   && left->st_mode == right->st_mode && left->st_size == right->st_size
+		   && wal_reuse_stat_mtime_ns(left) == wal_reuse_stat_mtime_ns(right)
+		   && wal_reuse_stat_ctime_ns(left) == wal_reuse_stat_ctime_ns(right);
 }
 #endif
 
 static bool
-wal_reuse_target_basename(const ClusterWalFileIdentity *file,
-						  char *basename, Size basename_size)
+wal_reuse_target_basename(const ClusterWalFileIdentity *file, char *basename, Size basename_size)
 {
 	char normal[XLOG_FNAME_LEN + 1];
 	int written;
@@ -1298,9 +1205,8 @@ wal_reuse_target_basename(const ClusterWalFileIdentity *file,
 }
 
 static bool
-wal_reuse_stamp_held_target(const ClusterWalFileIdentity *file,
-							 uint64 system_identifier, int dirfd, int fd,
-							 ClusterWalFileObjectStamp *out_stamp)
+wal_reuse_stamp_held_target(const ClusterWalFileIdentity *file, uint64 system_identifier, int dirfd,
+							int fd, ClusterWalFileObjectStamp *out_stamp)
 {
 #ifndef WIN32
 	char basename[MAXFNAMELEN];
@@ -1320,27 +1226,22 @@ wal_reuse_stamp_held_target(const ClusterWalFileIdentity *file,
 #else
 	return false;
 #endif
-	if (dirfd < 0 || fd < 0
-		|| !wal_reuse_target_basename(file, basename, sizeof(basename))
-		|| fstat(dirfd, &dir_stat) != 0 || !S_ISDIR(dir_stat.st_mode)
-		|| fstat(fd, &before) != 0 || !S_ISREG(before.st_mode)
-		|| before.st_size < (off_t)SizeOfXLogLongPHD
+	if (dirfd < 0 || fd < 0 || !wal_reuse_target_basename(file, basename, sizeof(basename))
+		|| fstat(dirfd, &dir_stat) != 0 || !S_ISDIR(dir_stat.st_mode) || fstat(fd, &before) != 0
+		|| !S_ISREG(before.st_mode) || before.st_size < (off_t)SizeOfXLogLongPHD
 		|| fstatat(dirfd, basename, &named_before, at_flags) != 0
 		|| !wal_reuse_same_leaf_stat(&before, &named_before)
-		|| pread(fd, header_bytes, sizeof(header_bytes), 0)
-			!= (ssize_t)sizeof(header_bytes)
-		|| fstat(fd, &after) != 0
-		|| fstatat(dirfd, basename, &named_after, at_flags) != 0
+		|| pread(fd, header_bytes, sizeof(header_bytes), 0) != (ssize_t)sizeof(header_bytes)
+		|| fstat(fd, &after) != 0 || fstatat(dirfd, basename, &named_after, at_flags) != 0
 		|| !wal_reuse_same_leaf_stat(&before, &after)
 		|| !wal_reuse_same_leaf_stat(&after, &named_after)
-		|| !cluster_wal_file_identity_parse(basename, file->thread_id,
-										wal_segment_size, &parsed)
+		|| !cluster_wal_file_identity_parse(basename, file->thread_id, wal_segment_size, &parsed)
 		|| memcmp(&parsed, file, sizeof(parsed)) != 0)
 		return false;
 	memset(&header, 0, sizeof(header));
 	memcpy(&header, header_bytes, Min(sizeof(header), sizeof(header_bytes)));
-	if (!cluster_wal_file_long_header_matches(
-			&parsed, &header, system_identifier, wal_segment_size))
+	if (!cluster_wal_file_long_header_matches(&parsed, &header, system_identifier,
+											  wal_segment_size))
 		return false;
 	out_stamp->platform = CLUSTER_WAL_OBJECT_POSIX;
 	out_stamp->directory_device = (uint64)dir_stat.st_dev;
@@ -1365,10 +1266,9 @@ wal_reuse_stamp_held_target(const ClusterWalFileIdentity *file,
 }
 
 static bool
-wal_reuse_open_target(const ClusterWalFileIdentity *file,
-					  uint64 system_identifier,
-					  ClusterWalFileObjectStamp *out_stamp,
-					  intptr_t *out_dir_handle, intptr_t *out_handle)
+wal_reuse_open_target(const ClusterWalFileIdentity *file, uint64 system_identifier,
+					  ClusterWalFileObjectStamp *out_stamp, intptr_t *out_dir_handle,
+					  intptr_t *out_handle)
 {
 #ifndef WIN32
 	char dirname[32];
@@ -1385,8 +1285,8 @@ wal_reuse_open_target(const ClusterWalFileIdentity *file,
 		return false;
 	cluster_wal_thread_dir_name(file->thread_id, dirname, sizeof(dirname));
 	if (dirname[0] == '\0'
-		|| snprintf(dirpath, sizeof(dirpath), "%s/%s", cluster_wal_threads_dir,
-					dirname) >= (int)sizeof(dirpath)
+		|| snprintf(dirpath, sizeof(dirpath), "%s/%s", cluster_wal_threads_dir, dirname)
+			   >= (int)sizeof(dirpath)
 		|| !wal_reuse_target_basename(file, basename, sizeof(basename)))
 		return false;
 #ifdef O_DIRECTORY
@@ -1403,8 +1303,7 @@ wal_reuse_open_target(const ClusterWalFileIdentity *file,
 	if (dirfd < 0)
 		return false;
 	fd = openat(dirfd, basename, open_flags);
-	if (fd < 0 || !wal_reuse_stamp_held_target(
-			file, system_identifier, dirfd, fd, out_stamp)) {
+	if (fd < 0 || !wal_reuse_stamp_held_target(file, system_identifier, dirfd, fd, out_stamp)) {
 		if (fd >= 0)
 			close(fd);
 		close(dirfd);
@@ -1424,8 +1323,7 @@ wal_reuse_open_target(const ClusterWalFileIdentity *file,
 }
 
 static ClusterWalReuseGuardResult
-wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request,
-						  ClusterWalRootFold *fold,
+wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request, ClusterWalRootFold *fold,
 						  ClusterControlRootSnapshot *target_root,
 						  ClusterWalReuseDenyReason *out_reason)
 {
@@ -1438,17 +1336,17 @@ wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request,
 	memset(&formation_snapshot, 0, sizeof(formation_snapshot));
 	memset(&authority, 0, sizeof(authority));
 	memset(inputs, 0, sizeof(inputs));
-	if (!cluster_formation_witness_copy_classification_v1(
-			request->formation, &witness_thread, &authority, &formation_snapshot)
+	if (!cluster_formation_witness_copy_classification_v1(request->formation, &witness_thread,
+														  &authority, &formation_snapshot)
 		|| witness_thread != request->duty.origin_thread_id
 		|| cluster_formation_witness_revalidate_nowait(request->formation)
-			!= CLUSTER_FORMATION_WITNESS_READY) {
+			   != CLUSTER_FORMATION_WITNESS_READY) {
 		*out_reason = CLUSTER_WAL_DENY_FORMATION_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	for (i = 0; i < CLUSTER_WAL_RETENTION_MAX_THREADS; i++) {
-		ClusterMembershipState state =
-			(ClusterMembershipState)formation_snapshot.membership.membership_state[i];
+		ClusterMembershipState state
+			= (ClusterMembershipState)formation_snapshot.membership.membership_state[i];
 		ClusterControlRootIdentity discovered_identity;
 		ClusterControlRootReadToken token;
 		ClusterControlRootResult result;
@@ -1462,23 +1360,22 @@ wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request,
 		inputs[i].configured = true;
 		memset(&token, 0, sizeof(token));
 		if (i + 1 == request->duty.origin_thread_id) {
-			result = cluster_control_root_read_canonical(
-				i + 1, &request->duty, CLUSTER_CONTROL_ROOT_READ_STRONG,
-				&inputs[i].snapshot, &token);
+			result = cluster_control_root_read_canonical(i + 1, &request->duty,
+														 CLUSTER_CONTROL_ROOT_READ_STRONG,
+														 &inputs[i].snapshot, &token);
 		} else {
 			ClusterControlRootSnapshot bootstrap;
 
 			result = cluster_control_root_read_canonical(
-				i + 1, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,
-				&bootstrap, NULL);
+				i + 1, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE, &bootstrap, NULL);
 			if (!control_root_read_ready(result)) {
 				inputs[i].read_result = result;
 				continue;
 			}
 			discovered_identity = bootstrap.identity;
-			result = cluster_control_root_read_canonical(
-				i + 1, &discovered_identity, CLUSTER_CONTROL_ROOT_READ_STRONG,
-				&inputs[i].snapshot, &token);
+			result = cluster_control_root_read_canonical(i + 1, &discovered_identity,
+														 CLUSTER_CONTROL_ROOT_READ_STRONG,
+														 &inputs[i].snapshot, &token);
 		}
 		inputs[i].read_result = result;
 		if (i + 1 == request->duty.origin_thread_id) {
@@ -1498,8 +1395,8 @@ wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request,
 		*out_reason = CLUSTER_WAL_DENY_FORMATION_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	if (!cluster_wal_retention_fold_validated_roots(
-			inputs, CLUSTER_WAL_RETENTION_MAX_THREADS, wal_segment_size, fold)
+	if (!cluster_wal_retention_fold_validated_roots(inputs, CLUSTER_WAL_RETENTION_MAX_THREADS,
+													wal_segment_size, fold)
 		|| fold->result == CLUSTER_WAL_FOLD_UNKNOWN) {
 		*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
 		return CLUSTER_WAL_GUARD_BLOCKED;
@@ -1508,26 +1405,23 @@ wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request,
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_preflight(
-	ClusterWalReuseActionGuard *guard,
-	const ClusterWalReuseGuardRequest *request,
-	PgracExternalFenceNeedSetV1 **out_needs,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_preflight(ClusterWalReuseActionGuard *guard,
+								  const ClusterWalReuseGuardRequest *request,
+								  PgracExternalFenceNeedSetV1 **out_needs,
+								  ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterWalFileObjectStamp target_stamp;
 	ClusterWalRootFold fold;
 	ClusterControlRootSnapshot target_root;
 	PgracExternalFenceNeedSetV1 *needs = NULL;
 	ClusterWalReuseGuardResult result;
-	PgracExternalFenceDenyReason fence_reason =
-		PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	PgracExternalFenceDenyReason fence_reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 	uint32 i;
 
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_EMPTY
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_EMPTY
 		|| out_needs == NULL || *out_needs != NULL) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
@@ -1540,9 +1434,8 @@ cluster_wal_reuse_guard_preflight(
 		*out_reason = CLUSTER_WAL_DENY_INSTALL_SOURCE_UNPROVEN;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	if (!wal_reuse_open_target(
-			&request->file, request->duty.system_identifier, &target_stamp,
-			&guard->source_dir_handle, &guard->source_handle)) {
+	if (!wal_reuse_open_target(&request->file, request->duty.system_identifier, &target_stamp,
+							   &guard->source_dir_handle, &guard->source_handle)) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
@@ -1552,22 +1445,19 @@ cluster_wal_reuse_guard_preflight(
 	if (result != CLUSTER_WAL_GUARD_OK)
 		return result;
 	for (i = 0; i < fold.nintervals; i++)
-		if (cluster_wal_retention_interval_intersects_file(
-				&fold.intervals[i], &request->file, wal_segment_size)) {
+		if (cluster_wal_retention_interval_intersects_file(&fold.intervals[i], &request->file,
+														   wal_segment_size)) {
 			*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
 			return CLUSTER_WAL_GUARD_BLOCKED;
 		}
-	if (target_root.lifecycle
-		== CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED) {
-		if (cluster_external_fence_need_set_build(
-				&request->duty, request->formation, &needs)
-			!= PGRAC_EXTERNAL_FENCE_NEED_SET_OK
-			|| needs == NULL
-			|| cluster_external_fence_need_set_count(needs) == 0
+	if (target_root.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED) {
+		if (cluster_external_fence_need_set_build(&request->duty, request->formation, &needs)
+				!= PGRAC_EXTERNAL_FENCE_NEED_SET_OK
+			|| needs == NULL || cluster_external_fence_need_set_count(needs) == 0
 			|| cluster_external_fence_need_set_count(needs) > CLUSTER_MAX_NODES
 			|| cluster_external_fence_need_set_digest(needs) == NULL
-			|| !cluster_external_fence_need_set_revalidate_nowait(
-				needs, request->formation, &fence_reason)) {
+			|| !cluster_external_fence_need_set_revalidate_nowait(needs, request->formation,
+																  &fence_reason)) {
 			if (needs != NULL)
 				cluster_external_fence_need_set_release(&needs);
 			*out_reason = CLUSTER_WAL_DENY_FENCE_UNAVAILABLE;
@@ -1593,12 +1483,12 @@ cluster_wal_reuse_guard_preflight(
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_preflight_active_recovery(
-	ClusterWalReuseActionGuard *guard,
-	const ClusterWalFileIdentity *file, ClusterWalReuseEntry entry,
-	ClusterRecoverySerialGuard **out_serial,
-	ClusterWalRetentionPin **out_pin,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_preflight_active_recovery(ClusterWalReuseActionGuard *guard,
+												  const ClusterWalFileIdentity *file,
+												  ClusterWalReuseEntry entry,
+												  ClusterRecoverySerialGuard **out_serial,
+												  ClusterWalRetentionPin **out_pin,
+												  ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterWalPinThread *thread;
 	ClusterWalFileObjectStamp target_stamp;
@@ -1607,40 +1497,33 @@ cluster_wal_reuse_guard_preflight_active_recovery(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (out_serial == NULL || out_pin == NULL
-		|| *out_serial != NULL || *out_pin != NULL
-		|| !wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_EMPTY
-		|| file == NULL
+	if (out_serial == NULL || out_pin == NULL || *out_serial != NULL || *out_pin != NULL
+		|| !wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_EMPTY || file == NULL
 		|| !cluster_wal_file_identity_valid(file, wal_segment_size)
-		|| entry != CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH
-		|| !pin_valid(active_pin) || active_pin->poisoned
+		|| entry != CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH || !pin_valid(active_pin)
+		|| active_pin->poisoned
 		|| (active_pin->state != CLUSTER_WAL_PIN_STATE_BOUND_ONE
 			&& active_pin->state != CLUSTER_WAL_PIN_STATE_BOUND_SET)) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	thread = pin_find_thread(active_pin, file->thread_id);
-	if (thread == NULL || thread->serial == NULL
-		|| thread->formation == NULL || thread->needs == NULL
-		|| thread->admissions == NULL || !thread->walr.held
+	if (thread == NULL || thread->serial == NULL || thread->formation == NULL
+		|| thread->needs == NULL || thread->admissions == NULL || !thread->walr.held
 		|| thread->walr.release_uncertain
-		|| !root_token_matches_recovery_duty(
-			&thread->root_read, &thread->duty)
-		|| cluster_wal_retention_pin_revalidate(active_pin)
-			!= CLUSTER_WAL_PIN_OK) {
+		|| !root_token_matches_recovery_duty(&thread->root_read, &thread->duty)
+		|| cluster_wal_retention_pin_revalidate(active_pin) != CLUSTER_WAL_PIN_OK) {
 		*out_reason = CLUSTER_WAL_DENY_SERIAL_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	for (i = 0; i < thread->nintervals; i++)
-		if (cluster_wal_retention_interval_intersects_file(
-				&thread->intervals[i], file, wal_segment_size)) {
+		if (cluster_wal_retention_interval_intersects_file(&thread->intervals[i], file,
+														   wal_segment_size)) {
 			*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
 			return CLUSTER_WAL_GUARD_BLOCKED;
 		}
-	if (!wal_reuse_open_target(
-			file, thread->duty.system_identifier, &target_stamp,
-			&guard->source_dir_handle, &guard->source_handle)) {
+	if (!wal_reuse_open_target(file, thread->duty.system_identifier, &target_stamp,
+							   &guard->source_dir_handle, &guard->source_handle)) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
@@ -1662,22 +1545,19 @@ cluster_wal_reuse_guard_preflight_active_recovery(
 
 ClusterWalReuseGuardResult
 cluster_wal_reuse_guard_fence_admitted_nowait(
-	ClusterWalReuseActionGuard *guard,
-	const PgracExternalFenceAdmissionSetV1 *admissions_or_null,
+	ClusterWalReuseActionGuard *guard, const PgracExternalFenceAdmissionSetV1 *admissions_or_null,
 	ClusterWalReuseDenyReason *out_reason)
 {
 	const PgracExternalFenceWriterSetDigest *need_digest;
 	const PgracExternalFenceWriterSetDigest *admission_digest;
-	PgracExternalFenceDenyReason fence_reason =
-		PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	PgracExternalFenceDenyReason fence_reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 	uint32 need_count;
 	uint32 admission_count;
 
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_PREFLIGHTED
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_PREFLIGHTED
 		|| guard->formation == NULL) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
@@ -1700,24 +1580,19 @@ cluster_wal_reuse_guard_fence_admitted_nowait(
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	need_count = cluster_external_fence_need_set_count(guard->needs_or_null);
-	admission_count =
-		cluster_external_fence_admission_set_count(admissions_or_null);
-	need_digest =
-		cluster_external_fence_need_set_digest(guard->needs_or_null);
-	admission_digest =
-		cluster_external_fence_admission_set_digest(admissions_or_null);
-	if (need_count == 0 || need_count > CLUSTER_MAX_NODES
-		|| admission_count != need_count || need_digest == NULL
-		|| admission_digest == NULL
+	admission_count = cluster_external_fence_admission_set_count(admissions_or_null);
+	need_digest = cluster_external_fence_need_set_digest(guard->needs_or_null);
+	admission_digest = cluster_external_fence_admission_set_digest(admissions_or_null);
+	if (need_count == 0 || need_count > CLUSTER_MAX_NODES || admission_count != need_count
+		|| need_digest == NULL || admission_digest == NULL
 		|| memcmp(need_digest, admission_digest, sizeof(*need_digest)) != 0) {
 		*out_reason = CLUSTER_WAL_DENY_FENCE_UNAVAILABLE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	if (!cluster_external_fence_need_set_revalidate_nowait(
-			guard->needs_or_null, guard->formation, &fence_reason)
-		|| !cluster_external_fence_revalidate_set_nowait(
-			admissions_or_null, guard->needs_or_null, guard->formation,
-			&fence_reason)) {
+	if (!cluster_external_fence_need_set_revalidate_nowait(guard->needs_or_null, guard->formation,
+														   &fence_reason)
+		|| !cluster_external_fence_revalidate_set_nowait(admissions_or_null, guard->needs_or_null,
+														 guard->formation, &fence_reason)) {
 		*out_reason = CLUSTER_WAL_DENY_FENCE_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
@@ -1741,36 +1616,31 @@ static bool
 wal_retention_e1_context_valid(const ClusterWalRetentionE1Context *context)
 {
 	return context != NULL && context->magic == CLUSTER_WAL_E1_CONTEXT_MAGIC
-		&& context->thread_id > 0
-		&& context->thread_id <= CLUSTER_WAL_RETENTION_MAX_THREADS
-		&& context->reserved == 0 && context->owner_pid == MyProcPid
-		&& context->owner == CurrentResourceOwner
-		&& context->formation != NULL;
+		   && context->thread_id > 0 && context->thread_id <= CLUSTER_WAL_RETENTION_MAX_THREADS
+		   && context->reserved == 0 && context->owner_pid == MyProcPid
+		   && context->owner == CurrentResourceOwner && context->formation != NULL;
 }
 
 static bool
-wal_retention_e1_read_root(ClusterWalRetentionE1Context *context,
-						  bool discover_identity,
-						  ClusterControlRootSnapshot *out_snapshot,
-						  ClusterControlRootReadToken *out_token)
+wal_retention_e1_read_root(ClusterWalRetentionE1Context *context, bool discover_identity,
+						   ClusterControlRootSnapshot *out_snapshot,
+						   ClusterControlRootReadToken *out_token)
 {
 	ClusterControlRootIdentity identity;
 	ClusterControlRootSnapshot bootstrap;
 	ClusterControlRootResult result;
 
 	if (discover_identity) {
-		result = cluster_control_root_read_canonical(
-			context->thread_id, NULL,
-			CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,
-			&bootstrap, NULL);
+		result = cluster_control_root_read_canonical(context->thread_id, NULL,
+													 CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,
+													 &bootstrap, NULL);
 		if (!control_root_read_ready(result))
 			return false;
 		identity = bootstrap.identity;
 	} else
 		identity = context->duty;
 	result = cluster_control_root_read_canonical(
-		context->thread_id, &identity, CLUSTER_CONTROL_ROOT_READ_STRONG,
-		out_snapshot, out_token);
+		context->thread_id, &identity, CLUSTER_CONTROL_ROOT_READ_STRONG, out_snapshot, out_token);
 	if (!control_root_read_ready(result)
 		|| memcmp(&out_snapshot->identity, &identity, sizeof(identity)) != 0
 		|| !root_token_matches_identity(out_token, &identity))
@@ -1781,10 +1651,10 @@ wal_retention_e1_read_root(ClusterWalRetentionE1Context *context,
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_retention_e1_coarse_begin(
-	ClusterWalRetentionE1Context *context, uint16 thread_id,
-	ClusterWalRootFoldResult *out_fold_result, XLogSegNo *out_floor_segno,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_retention_e1_coarse_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
+									  ClusterWalRootFoldResult *out_fold_result,
+									  XLogSegNo *out_floor_segno,
+									  ClusterWalReuseDenyReason *out_reason)
 {
 	static const ClusterWalRetentionE1Context zero_context;
 	ClusterWalReuseGuardRequest request;
@@ -1808,10 +1678,9 @@ cluster_wal_retention_e1_coarse_begin(
 	if (context == NULL || out_fold_result == NULL || out_floor_segno == NULL
 		|| CurrentResourceOwner == NULL || thread_id == 0
 		|| thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS
-		|| memcmp(context, &zero_context, sizeof(*context)) != 0
-		|| active_e1_context != NULL || active_action_context != NULL
-		|| active_reuse_guard != NULL
-		|| active_pin != NULL || active_root_publish_guard != NULL) {
+		|| memcmp(context, &zero_context, sizeof(*context)) != 0 || active_e1_context != NULL
+		|| active_action_context != NULL || active_reuse_guard != NULL || active_pin != NULL
+		|| active_root_publish_guard != NULL) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
@@ -1828,8 +1697,7 @@ cluster_wal_retention_e1_coarse_begin(
 	}
 	memset(&own_root, 0, sizeof(own_root));
 	memset(&own_token, 0, sizeof(own_token));
-	if (!wal_retention_e1_read_root(
-			context, true, &own_root, &own_token)) {
+	if (!wal_retention_e1_read_root(context, true, &own_root, &own_token)) {
 		cluster_formation_witness_destroy(&context->formation);
 		explicit_bzero(context, sizeof(*context));
 		*out_reason = CLUSTER_WAL_DENY_ROOT_UNAVAILABLE;
@@ -1849,8 +1717,7 @@ cluster_wal_retention_e1_coarse_begin(
 	lock_request.lockmethod_id = DEFAULT_LOCKMETHOD;
 	lock_request.dontwait = true;
 	lock_request.sessionLock = false;
-	lock_request.caller_local_start_ts_ms =
-		(uint64)(GetCurrentTimestamp() / 1000);
+	lock_request.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	lock_request.timeout_ms = 1;
 	lock_request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 	walr_resource_ensure_callback();
@@ -1876,10 +1743,8 @@ cluster_wal_retention_e1_coarse_begin(
 	request.formation = context->formation;
 	memset(&fold, 0, sizeof(fold));
 	memset(&target_root, 0, sizeof(target_root));
-	result = wal_reuse_preflight_roots(
-		&request, &fold, &target_root, out_reason);
-	if (result == CLUSTER_WAL_GUARD_OK
-		&& fold.result == CLUSTER_WAL_FOLD_BOUNDED
+	result = wal_reuse_preflight_roots(&request, &fold, &target_root, out_reason);
+	if (result == CLUSTER_WAL_GUARD_OK && fold.result == CLUSTER_WAL_FOLD_BOUNDED
 		&& fold.floor_by_thread[thread_id - 1] == 0) {
 		*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
 		result = CLUSTER_WAL_GUARD_BLOCKED;
@@ -1902,9 +1767,8 @@ cluster_wal_retention_e1_coarse_begin(
 }
 
 ClusterWalrReleaseResult
-cluster_wal_retention_e1_coarse_release(
-	ClusterWalRetentionE1Context *context,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_retention_e1_coarse_release(ClusterWalRetentionE1Context *context,
+										ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterLockAcquireResult lock_result;
 	uint64 now_us;
@@ -1913,13 +1777,12 @@ cluster_wal_retention_e1_coarse_release(
 		return CLUSTER_WALR_RELEASE_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
 	if (!wal_retention_e1_context_valid(context)
-		|| context->state != CLUSTER_WAL_E1_STATE_COARSE_HELD
-		|| active_e1_context != context || !context->coarse_walr.held) {
+		|| context->state != CLUSTER_WAL_E1_STATE_COARSE_HELD || active_e1_context != context
+		|| !context->coarse_walr.held) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WALR_RELEASE_INVALID;
 	}
-	lock_result = walr_request_release_actual(
-		&context->coarse_walr.acquire_request);
+	lock_result = walr_request_release_actual(&context->coarse_walr.acquire_request);
 	if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
 		context->coarse_walr.release_uncertain = true;
 		*out_reason = CLUSTER_WAL_DENY_RELEASE_UNCERTAIN;
@@ -1928,19 +1791,17 @@ cluster_wal_retention_e1_coarse_release(
 	context->coarse_walr.held = false;
 	context->coarse_walr.coordinated = false;
 	context->coarse_walr.mode = NoLock;
-	memset(&context->coarse_walr.acquire_request, 0,
-		   sizeof(context->coarse_walr.acquire_request));
+	memset(&context->coarse_walr.acquire_request, 0, sizeof(context->coarse_walr.acquire_request));
 	active_e1_context = NULL;
 	context->state = CLUSTER_WAL_E1_STATE_FILES;
 	now_us = wal_retention_monotonic_us();
 	if (now_us == 0
-		|| now_us > UINT64_MAX
-			- (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000)) {
+		|| now_us > UINT64_MAX - (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000)) {
 		*out_reason = CLUSTER_WAL_DENY_FENCE_UNAVAILABLE;
 		return CLUSTER_WALR_RELEASE_INVALID;
 	}
-	context->provider_deadline_us = now_us
-		+ (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000);
+	context->provider_deadline_us
+		= now_us + (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000);
 	return CLUSTER_WALR_RELEASE_CONFIRMED;
 }
 
@@ -1951,9 +1812,8 @@ cluster_wal_retention_active_pin_present(void)
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_retention_action_begin(
-	ClusterWalRetentionE1Context *context, uint16 thread_id,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_retention_action_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
+								   ClusterWalReuseDenyReason *out_reason)
 {
 	static const ClusterWalRetentionE1Context zero_context;
 	ClusterControlRootSnapshot own_root;
@@ -1966,9 +1826,8 @@ cluster_wal_retention_action_begin(
 	*out_reason = CLUSTER_WAL_DENY_NONE;
 	if (context == NULL || CurrentResourceOwner == NULL || thread_id == 0
 		|| thread_id > CLUSTER_WAL_RETENTION_MAX_THREADS
-		|| memcmp(context, &zero_context, sizeof(*context)) != 0
-		|| active_action_context != NULL || active_e1_context != NULL
-		|| active_reuse_guard != NULL || active_pin != NULL
+		|| memcmp(context, &zero_context, sizeof(*context)) != 0 || active_action_context != NULL
+		|| active_e1_context != NULL || active_reuse_guard != NULL || active_pin != NULL
 		|| active_root_publish_guard != NULL) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
@@ -1995,27 +1854,26 @@ cluster_wal_retention_action_begin(
 	}
 	now_us = wal_retention_monotonic_us();
 	if (now_us == 0
-		|| now_us > UINT64_MAX
-			- (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000)) {
+		|| now_us > UINT64_MAX - (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000)) {
 		cluster_formation_witness_destroy(&context->formation);
 		explicit_bzero(context, sizeof(*context));
 		*out_reason = CLUSTER_WAL_DENY_FENCE_UNAVAILABLE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	context->provider_deadline_us = now_us
-		+ (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000);
+	context->provider_deadline_us
+		= now_us + (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS * UINT64_C(1000);
 	walr_resource_ensure_callback();
 	active_action_context = context;
 	return CLUSTER_WAL_GUARD_OK;
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_retention_action_preflight(
-	ClusterWalRetentionE1Context *context,
-	const ClusterWalFileIdentity *file, ClusterWalReuseEntry entry,
-	ClusterWalReuseActionGuard *guard,
-	PgracExternalFenceNeedSetV1 **out_needs,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_retention_action_preflight(ClusterWalRetentionE1Context *context,
+									   const ClusterWalFileIdentity *file,
+									   ClusterWalReuseEntry entry,
+									   ClusterWalReuseActionGuard *guard,
+									   PgracExternalFenceNeedSetV1 **out_needs,
+									   ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterControlRootSnapshot own_root;
 	ClusterControlRootReadToken own_token;
@@ -2024,19 +1882,16 @@ cluster_wal_retention_action_preflight(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_retention_e1_context_valid(context)
-		|| active_action_context != context
-		|| context->state != CLUSTER_WAL_E1_STATE_FILES
-		|| context->coarse_walr.held || file == NULL || guard == NULL
-		|| entry != CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH
-		|| out_needs == NULL || *out_needs != NULL) {
+	if (!wal_retention_e1_context_valid(context) || active_action_context != context
+		|| context->state != CLUSTER_WAL_E1_STATE_FILES || context->coarse_walr.held || file == NULL
+		|| guard == NULL || entry != CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH || out_needs == NULL
+		|| *out_needs != NULL) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	memset(&own_root, 0, sizeof(own_root));
 	memset(&own_token, 0, sizeof(own_token));
-	if (!wal_retention_e1_read_root(
-			context, false, &own_root, &own_token)) {
+	if (!wal_retention_e1_read_root(context, false, &own_root, &own_token)) {
 		*out_reason = CLUSTER_WAL_DENY_ROOT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
@@ -2048,8 +1903,7 @@ cluster_wal_retention_action_preflight(
 	request.duty = context->duty;
 	request.root_read = context->root_read;
 	request.formation = context->formation;
-	return cluster_wal_reuse_guard_preflight(
-		guard, &request, out_needs, out_reason);
+	return cluster_wal_reuse_guard_preflight(guard, &request, out_needs, out_reason);
 }
 
 void
@@ -2057,8 +1911,8 @@ cluster_wal_retention_action_finish(ClusterWalRetentionE1Context *context)
 {
 	if (context == NULL || context->magic == 0)
 		return;
-	if (!wal_retention_e1_context_valid(context)
-		|| active_action_context != context || context->coarse_walr.held)
+	if (!wal_retention_e1_context_valid(context) || active_action_context != context
+		|| context->coarse_walr.held)
 		return;
 	cluster_formation_witness_destroy(&context->formation);
 	explicit_bzero(context, sizeof(*context));
@@ -2066,11 +1920,11 @@ cluster_wal_retention_action_finish(ClusterWalRetentionE1Context *context)
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_retention_e1_preflight(
-	ClusterWalRetentionE1Context *context,
-	const ClusterWalFileIdentity *file, ClusterWalReuseActionGuard *guard,
-	PgracExternalFenceNeedSetV1 **out_needs,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_retention_e1_preflight(ClusterWalRetentionE1Context *context,
+								   const ClusterWalFileIdentity *file,
+								   ClusterWalReuseActionGuard *guard,
+								   PgracExternalFenceNeedSetV1 **out_needs,
+								   ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterControlRootSnapshot own_root;
 	ClusterControlRootReadToken own_token;
@@ -2079,17 +1933,15 @@ cluster_wal_retention_e1_preflight(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_retention_e1_context_valid(context)
-		|| context->state != CLUSTER_WAL_E1_STATE_FILES
-		|| context->coarse_walr.held || file == NULL || guard == NULL
-		|| out_needs == NULL || *out_needs != NULL) {
+	if (!wal_retention_e1_context_valid(context) || context->state != CLUSTER_WAL_E1_STATE_FILES
+		|| context->coarse_walr.held || file == NULL || guard == NULL || out_needs == NULL
+		|| *out_needs != NULL) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	memset(&own_root, 0, sizeof(own_root));
 	memset(&own_token, 0, sizeof(own_token));
-	if (!wal_retention_e1_read_root(
-			context, false, &own_root, &own_token)) {
+	if (!wal_retention_e1_read_root(context, false, &own_root, &own_token)) {
 		*out_reason = CLUSTER_WAL_DENY_ROOT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
@@ -2101,16 +1953,15 @@ cluster_wal_retention_e1_preflight(
 	request.duty = context->duty;
 	request.root_read = context->root_read;
 	request.formation = context->formation;
-	return cluster_wal_reuse_guard_preflight(
-		guard, &request, out_needs, out_reason);
+	return cluster_wal_reuse_guard_preflight(guard, &request, out_needs, out_reason);
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_retention_e1_fence_wait(
-	ClusterWalRetentionE1Context *context, ClusterWalReuseActionGuard *guard,
-	PgracExternalFenceNeedSetV1 *needs,
-	PgracExternalFenceAdmissionSetV1 **out_admissions,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_retention_e1_fence_wait(ClusterWalRetentionE1Context *context,
+									ClusterWalReuseActionGuard *guard,
+									PgracExternalFenceNeedSetV1 *needs,
+									PgracExternalFenceAdmissionSetV1 **out_admissions,
+									ClusterWalReuseDenyReason *out_reason)
 {
 	PgracExternalFenceVerdict verdict;
 	uint64 now_us;
@@ -2120,16 +1971,14 @@ cluster_wal_retention_e1_fence_wait(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_retention_e1_context_valid(context)
-		|| context->state != CLUSTER_WAL_E1_STATE_FILES
-		|| guard == NULL || out_admissions == NULL
-		|| *out_admissions != NULL || guard->needs_or_null != needs) {
+	if (!wal_retention_e1_context_valid(context) || context->state != CLUSTER_WAL_E1_STATE_FILES
+		|| guard == NULL || out_admissions == NULL || *out_admissions != NULL
+		|| guard->needs_or_null != needs) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	if (needs == NULL)
-		return cluster_wal_reuse_guard_fence_admitted_nowait(
-			guard, NULL, out_reason);
+		return cluster_wal_reuse_guard_fence_admitted_nowait(guard, NULL, out_reason);
 	now_us = wal_retention_monotonic_us();
 	if (now_us == 0 || now_us >= context->provider_deadline_us) {
 		*out_reason = CLUSTER_WAL_DENY_FENCE_UNAVAILABLE;
@@ -2137,18 +1986,16 @@ cluster_wal_retention_e1_fence_wait(
 	}
 	remaining_us = context->provider_deadline_us - now_us;
 	timeout_ms = (int)Min((remaining_us + UINT64_C(999)) / UINT64_C(1000),
-						(uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS);
+						  (uint64)CLUSTER_WAL_REUSE_FENCE_TIMEOUT_MS);
 	if (timeout_ms < 1)
 		timeout_ms = 1;
-	verdict = cluster_external_fence_admit_set_wait(
-		needs, context->formation, timeout_ms, out_admissions);
-	if (verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED
-		|| *out_admissions == NULL) {
+	verdict = cluster_external_fence_admit_set_wait(needs, context->formation, timeout_ms,
+													out_admissions);
+	if (verdict != PGRAC_EXTERNAL_FENCE_WRITE_EXCLUDED || *out_admissions == NULL) {
 		*out_reason = CLUSTER_WAL_DENY_FENCE_UNAVAILABLE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	return cluster_wal_reuse_guard_fence_admitted_nowait(
-		guard, *out_admissions, out_reason);
+	return cluster_wal_reuse_guard_fence_admitted_nowait(guard, *out_admissions, out_reason);
 }
 
 void
@@ -2162,7 +2009,7 @@ cluster_wal_retention_e1_finish(ClusterWalRetentionE1Context *context)
 		return;
 	if (context->coarse_walr.held
 		&& cluster_wal_retention_e1_coarse_release(context, &reason)
-			!= CLUSTER_WALR_RELEASE_CONFIRMED)
+			   != CLUSTER_WALR_RELEASE_CONFIRMED)
 		elog(FATAL, "could not confirm coarse WAL-retention release");
 	cluster_formation_witness_destroy(&context->formation);
 	explicit_bzero(context, sizeof(*context));
@@ -2174,8 +2021,7 @@ wal_reuse_guard_fence_current(const ClusterWalReuseActionGuard *guard,
 {
 	const PgracExternalFenceWriterSetDigest *need_digest;
 	const PgracExternalFenceWriterSetDigest *admission_digest;
-	PgracExternalFenceDenyReason fence_reason =
-		PGRAC_EXTERNAL_FENCE_DENY_NONE;
+	PgracExternalFenceDenyReason fence_reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 	uint32 need_count;
 	uint32 admission_count;
 
@@ -2196,23 +2042,19 @@ wal_reuse_guard_fence_current(const ClusterWalReuseActionGuard *guard,
 		return false;
 	}
 	need_count = cluster_external_fence_need_set_count(guard->needs_or_null);
-	admission_count = cluster_external_fence_admission_set_count(
-		guard->admissions_or_null);
+	admission_count = cluster_external_fence_admission_set_count(guard->admissions_or_null);
 	need_digest = cluster_external_fence_need_set_digest(guard->needs_or_null);
-	admission_digest = cluster_external_fence_admission_set_digest(
-		guard->admissions_or_null);
-	if (need_count == 0 || need_count > CLUSTER_MAX_NODES
-		|| admission_count != need_count || need_digest == NULL
-		|| admission_digest == NULL
+	admission_digest = cluster_external_fence_admission_set_digest(guard->admissions_or_null);
+	if (need_count == 0 || need_count > CLUSTER_MAX_NODES || admission_count != need_count
+		|| need_digest == NULL || admission_digest == NULL
 		|| memcmp(need_digest, admission_digest, sizeof(*need_digest)) != 0) {
 		*out_reason = CLUSTER_WAL_DENY_FENCE_UNAVAILABLE;
 		return false;
 	}
-	if (!cluster_external_fence_need_set_revalidate_nowait(
-			guard->needs_or_null, guard->formation, &fence_reason)
+	if (!cluster_external_fence_need_set_revalidate_nowait(guard->needs_or_null, guard->formation,
+														   &fence_reason)
 		|| !cluster_external_fence_revalidate_set_nowait(
-			guard->admissions_or_null, guard->needs_or_null, guard->formation,
-			&fence_reason)) {
+			guard->admissions_or_null, guard->needs_or_null, guard->formation, &fence_reason)) {
 		*out_reason = CLUSTER_WAL_DENY_FENCE_STALE;
 		return false;
 	}
@@ -2220,10 +2062,8 @@ wal_reuse_guard_fence_current(const ClusterWalReuseActionGuard *guard,
 }
 
 static ClusterWalReuseGuardResult
-wal_reuse_guard_rollback_x(ClusterWalReuseActionGuard *guard,
-						  ClusterWalReuseGuardResult result,
-						  ClusterWalReuseDenyReason reason,
-						  ClusterWalReuseDenyReason *out_reason)
+wal_reuse_guard_rollback_x(ClusterWalReuseActionGuard *guard, ClusterWalReuseGuardResult result,
+						   ClusterWalReuseDenyReason reason, ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterLockAcquireResult lock_result;
 
@@ -2235,8 +2075,7 @@ wal_reuse_guard_rollback_x(ClusterWalReuseActionGuard *guard,
 	}
 	guard->walr.held = false;
 	guard->walr.coordinated = false;
-	memset(&guard->walr.acquire_request, 0,
-		   sizeof(guard->walr.acquire_request));
+	memset(&guard->walr.acquire_request, 0, sizeof(guard->walr.acquire_request));
 	memset(&guard->walr.resid, 0, sizeof(guard->walr.resid));
 	guard->walr.mode = NoLock;
 	guard->state = CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA;
@@ -2246,11 +2085,10 @@ wal_reuse_guard_rollback_x(ClusterWalReuseActionGuard *guard,
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_arm(
-	ClusterWalReuseActionGuard *guard,
-	ClusterRecoverySerialGuard *held_serial_or_null,
-	ClusterWalRetentionPin *held_pin_or_null,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_arm(ClusterWalReuseActionGuard *guard,
+							ClusterRecoverySerialGuard *held_serial_or_null,
+							ClusterWalRetentionPin *held_pin_or_null,
+							ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterWalReuseGuardRequest request;
 	ClusterWalFileObjectStamp current_stamp;
@@ -2264,8 +2102,7 @@ cluster_wal_reuse_guard_arm(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_FENCE_ADMITTED_OR_NA
 		|| active_reuse_guard != NULL) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
@@ -2279,31 +2116,23 @@ cluster_wal_reuse_guard_arm(
 		ClusterResId expected_resid;
 		bool cleanup_required = false;
 
-		thread = pin_find_thread(held_pin_or_null,
-							 guard->duty.origin_thread_id);
+		thread = pin_find_thread(held_pin_or_null, guard->duty.origin_thread_id);
 		if (thread == NULL || held_pin_or_null->poisoned
 			|| (held_pin_or_null->state != CLUSTER_WAL_PIN_STATE_BOUND_ONE
 				&& held_pin_or_null->state != CLUSTER_WAL_PIN_STATE_BOUND_SET)
-			|| active_root_publish_guard != NULL
-			|| thread->serial != held_serial_or_null
+			|| active_root_publish_guard != NULL || thread->serial != held_serial_or_null
 			|| memcmp(&thread->duty, &guard->duty, sizeof(guard->duty)) != 0
-			|| memcmp(&thread->root_read, &guard->root_read,
-					  sizeof(guard->root_read)) != 0
-			|| thread->formation != guard->formation
-			|| thread->needs != guard->needs_or_null
+			|| memcmp(&thread->root_read, &guard->root_read, sizeof(guard->root_read)) != 0
+			|| thread->formation != guard->formation || thread->needs != guard->needs_or_null
 			|| thread->admissions != guard->admissions_or_null
 			|| !serial_matches_thread(held_serial_or_null, thread)
-			|| cluster_wal_retention_pin_revalidate(held_pin_or_null)
-				!= CLUSTER_WAL_PIN_OK
+			|| cluster_wal_retention_pin_revalidate(held_pin_or_null) != CLUSTER_WAL_PIN_OK
 			|| !thread->walr.held || thread->walr.release_uncertain
 			|| thread->walr.request.lockmode != ShareLock
-			|| thread->walr.request.holder.request_id
-				!= thread->walr.request.request_id
+			|| thread->walr.request.holder.request_id != thread->walr.request.request_id
 			|| !walr_request_has_native_lock(&thread->walr.request)
-			|| !cluster_wal_retention_resid_encode(
-				guard->duty.origin_thread_id, &expected_resid)
-			|| memcmp(&thread->walr.request.resid, &expected_resid,
-					  sizeof(expected_resid)) != 0) {
+			|| !cluster_wal_retention_resid_encode(guard->duty.origin_thread_id, &expected_resid)
+			|| memcmp(&thread->walr.request.resid, &expected_resid, sizeof(expected_resid)) != 0) {
 			*out_reason = CLUSTER_WAL_DENY_INVALID_IDENTITY;
 			return CLUSTER_WAL_GUARD_BLOCKED;
 		}
@@ -2317,8 +2146,7 @@ cluster_wal_reuse_guard_arm(
 		lock_request.timeout_ms = 1;
 		lock_request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 		walr_resource_ensure_callback();
-		lock_result = walr_request_convert_actual(
-			&lock_request, 0, &cleanup_required);
+		lock_result = walr_request_convert_actual(&lock_request, 0, &cleanup_required);
 		if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
 			if (cleanup_required) {
 				guard->serial_or_null = held_serial_or_null;
@@ -2361,8 +2189,7 @@ cluster_wal_reuse_guard_arm(
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	memset(&lock_request, 0, sizeof(lock_request));
-	if (!cluster_wal_retention_resid_encode(
-			guard->file.thread_id, &lock_request.resid)) {
+	if (!cluster_wal_retention_resid_encode(guard->file.thread_id, &lock_request.resid)) {
 		*out_reason = CLUSTER_WAL_DENY_INVALID_IDENTITY;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
@@ -2372,8 +2199,7 @@ cluster_wal_reuse_guard_arm(
 	lock_request.lockmethod_id = DEFAULT_LOCKMETHOD;
 	lock_request.dontwait = true;
 	lock_request.sessionLock = false;
-	lock_request.caller_local_start_ts_ms =
-		(uint64)(GetCurrentTimestamp() / 1000);
+	lock_request.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	lock_request.timeout_ms = 1;
 	lock_request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 	walr_resource_ensure_callback();
@@ -2391,15 +2217,12 @@ cluster_wal_reuse_guard_arm(
 	guard->state = CLUSTER_WAL_GUARD_WALR_X_HELD;
 	active_reuse_guard = guard;
 
-	if (!wal_reuse_stamp_held_target(
-			&guard->file, guard->duty.system_identifier,
-			(int)guard->source_dir_handle, (int)guard->source_handle,
-			&current_stamp)
-		|| memcmp(&current_stamp, &guard->pre_action_stamp,
-				  sizeof(current_stamp)) != 0)
-		return wal_reuse_guard_rollback_x(
-			guard, CLUSTER_WAL_GUARD_BLOCKED, CLUSTER_WAL_DENY_OBJECT_STALE,
-			out_reason);
+	if (!wal_reuse_stamp_held_target(&guard->file, guard->duty.system_identifier,
+									 (int)guard->source_dir_handle, (int)guard->source_handle,
+									 &current_stamp)
+		|| memcmp(&current_stamp, &guard->pre_action_stamp, sizeof(current_stamp)) != 0)
+		return wal_reuse_guard_rollback_x(guard, CLUSTER_WAL_GUARD_BLOCKED,
+										  CLUSTER_WAL_DENY_OBJECT_STALE, out_reason);
 	memset(&request, 0, sizeof(request));
 	request.file = guard->file;
 	request.entry = guard->entry;
@@ -2416,45 +2239,42 @@ cluster_wal_reuse_guard_arm(
 	memset(&target_root, 0, sizeof(target_root));
 	result = wal_reuse_preflight_roots(&request, &fold, &target_root, out_reason);
 	if (result != CLUSTER_WAL_GUARD_OK)
-		return wal_reuse_guard_rollback_x(
-			guard, result, *out_reason, out_reason);
+		return wal_reuse_guard_rollback_x(guard, result, *out_reason, out_reason);
 	for (i = 0; i < fold.nintervals; i++)
-		if (cluster_wal_retention_interval_intersects_file(
-				&fold.intervals[i], &guard->file, wal_segment_size))
-			return wal_reuse_guard_rollback_x(
-				guard, CLUSTER_WAL_GUARD_BLOCKED,
-				CLUSTER_WAL_DENY_ROOT_REQUIRED, out_reason);
+		if (cluster_wal_retention_interval_intersects_file(&fold.intervals[i], &guard->file,
+														   wal_segment_size))
+			return wal_reuse_guard_rollback_x(guard, CLUSTER_WAL_GUARD_BLOCKED,
+											  CLUSTER_WAL_DENY_ROOT_REQUIRED, out_reason);
 	if (!wal_reuse_guard_fence_current(guard, out_reason))
-		return wal_reuse_guard_rollback_x(
-			guard, CLUSTER_WAL_GUARD_BLOCKED, *out_reason, out_reason);
+		return wal_reuse_guard_rollback_x(guard, CLUSTER_WAL_GUARD_BLOCKED, *out_reason,
+										  out_reason);
 	guard->state = CLUSTER_WAL_GUARD_ARMED;
 	return CLUSTER_WAL_GUARD_OK;
 }
 
 static bool
 wal_reuse_primary_physical_legal(const ClusterWalReuseActionGuard *guard,
-							ClusterWalReusePhysicalAction physical)
+								 ClusterWalReusePhysicalAction physical)
 {
 	switch (guard->action) {
-		case CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE:
-			return physical == CLUSTER_WAL_PHYSICAL_RECYCLE
-				|| physical == CLUSTER_WAL_PHYSICAL_REMOVE;
-		case CLUSTER_WAL_ACTION_FORCE_REPLACE:
-		case CLUSTER_WAL_ACTION_ARCHIVE_REPLACE:
-			return physical == CLUSTER_WAL_PHYSICAL_REPLACE;
-		case CLUSTER_WAL_ACTION_RENAME_PARTIAL:
-			return physical == CLUSTER_WAL_PHYSICAL_RENAME_PARTIAL;
-		case CLUSTER_WAL_ACTION_CREATE_ABSENT:
-			return physical == CLUSTER_WAL_PHYSICAL_CREATE_ABSENT;
-		default:
-			return false;
+	case CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE:
+		return physical == CLUSTER_WAL_PHYSICAL_RECYCLE || physical == CLUSTER_WAL_PHYSICAL_REMOVE;
+	case CLUSTER_WAL_ACTION_FORCE_REPLACE:
+	case CLUSTER_WAL_ACTION_ARCHIVE_REPLACE:
+		return physical == CLUSTER_WAL_PHYSICAL_REPLACE;
+	case CLUSTER_WAL_ACTION_RENAME_PARTIAL:
+		return physical == CLUSTER_WAL_PHYSICAL_RENAME_PARTIAL;
+	case CLUSTER_WAL_ACTION_CREATE_ABSENT:
+		return physical == CLUSTER_WAL_PHYSICAL_CREATE_ABSENT;
+	default:
+		return false;
 	}
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_l3_begin(
-	ClusterWalReuseActionGuard *guard, ClusterWalReusePhysicalAction physical,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_l3_begin(ClusterWalReuseActionGuard *guard,
+								 ClusterWalReusePhysicalAction physical,
+								 ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterWalFileObjectStamp current_stamp;
 	ClusterWalPinThread *pin_thread;
@@ -2463,35 +2283,26 @@ cluster_wal_reuse_guard_l3_begin(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_ARMED
-		|| active_reuse_guard != guard || !guard->walr.held
-		|| !guard->walr.coordinated || guard->walr.mode != ExclusiveLock
-		|| guard->walr.release_uncertain
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_ARMED
+		|| active_reuse_guard != guard || !guard->walr.held || !guard->walr.coordinated
+		|| guard->walr.mode != ExclusiveLock || guard->walr.release_uncertain
 		|| !root_token_matches_identity(&guard->root_read, &guard->duty)) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	if (guard->walr.converted_from_pin) {
-		pin_thread = pin_find_thread(guard->pin_or_null,
-							 guard->duty.origin_thread_id);
+		pin_thread = pin_find_thread(guard->pin_or_null, guard->duty.origin_thread_id);
 		if (pin_thread == NULL
-			|| (guard->pin_or_null->state
-					!= CLUSTER_WAL_PIN_STATE_BOUND_ONE
-				&& guard->pin_or_null->state
-					!= CLUSTER_WAL_PIN_STATE_BOUND_SET)
+			|| (guard->pin_or_null->state != CLUSTER_WAL_PIN_STATE_BOUND_ONE
+				&& guard->pin_or_null->state != CLUSTER_WAL_PIN_STATE_BOUND_SET)
 			|| pin_thread->serial != guard->serial_or_null
-			|| memcmp(&pin_thread->duty, &guard->duty,
-					  sizeof(guard->duty)) != 0
-			|| memcmp(&pin_thread->root_read, &guard->root_read,
-					  sizeof(guard->root_read)) != 0
+			|| memcmp(&pin_thread->duty, &guard->duty, sizeof(guard->duty)) != 0
+			|| memcmp(&pin_thread->root_read, &guard->root_read, sizeof(guard->root_read)) != 0
 			|| pin_thread->formation != guard->formation
 			|| pin_thread->needs != guard->needs_or_null
-			|| pin_thread->admissions != guard->admissions_or_null
-			|| !pin_thread->walr.held
+			|| pin_thread->admissions != guard->admissions_or_null || !pin_thread->walr.held
 			|| pin_thread->walr.release_uncertain
-			|| cluster_wal_retention_pin_revalidate(guard->pin_or_null)
-				!= CLUSTER_WAL_PIN_OK
+			|| cluster_wal_retention_pin_revalidate(guard->pin_or_null) != CLUSTER_WAL_PIN_OK
 			|| !serial_matches_thread(guard->serial_or_null, pin_thread)) {
 			*out_reason = CLUSTER_WAL_DENY_SERIAL_STALE;
 			return CLUSTER_WAL_GUARD_BLOCKED;
@@ -2503,25 +2314,21 @@ cluster_wal_reuse_guard_l3_begin(
 			*out_reason = CLUSTER_WAL_DENY_INVALID_IDENTITY;
 			return CLUSTER_WAL_GUARD_INVALID;
 		}
-	} else if (guard->action
-			   != CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE
-		|| physical != CLUSTER_WAL_PHYSICAL_REMOVE
-		|| (guard->flags & (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE
-						 | CLUSTER_WAL_GUARD_F_PRIMARY_ZERO))
-			!= (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE
-				| CLUSTER_WAL_GUARD_F_PRIMARY_ZERO)
-		|| (guard->flags & CLUSTER_WAL_GUARD_F_FALLBACK_L3) != 0) {
+	} else if (guard->action != CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE
+			   || physical != CLUSTER_WAL_PHYSICAL_REMOVE
+			   || (guard->flags
+				   & (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE | CLUSTER_WAL_GUARD_F_PRIMARY_ZERO))
+					  != (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE | CLUSTER_WAL_GUARD_F_PRIMARY_ZERO)
+			   || (guard->flags & CLUSTER_WAL_GUARD_F_FALLBACK_L3) != 0) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	if (!wal_reuse_guard_fence_current(guard, out_reason))
 		return CLUSTER_WAL_GUARD_BLOCKED;
-	if (!wal_reuse_stamp_held_target(
-			&guard->file, guard->duty.system_identifier,
-			(int)guard->source_dir_handle, (int)guard->source_handle,
-			&current_stamp)
-		|| memcmp(&current_stamp, &guard->pre_action_stamp,
-				  sizeof(current_stamp)) != 0) {
+	if (!wal_reuse_stamp_held_target(&guard->file, guard->duty.system_identifier,
+									 (int)guard->source_dir_handle, (int)guard->source_handle,
+									 &current_stamp)
+		|| memcmp(&current_stamp, &guard->pre_action_stamp, sizeof(current_stamp)) != 0) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
@@ -2537,25 +2344,26 @@ cluster_wal_reuse_guard_l3_begin(
 
 static bool
 wal_reuse_guard_primary_physical(const ClusterWalReuseActionGuard *guard,
-							 ClusterWalReusePhysicalAction *physical)
+								 ClusterWalReusePhysicalAction *physical)
 {
 	switch (guard->action) {
-		case CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE:
-			*physical = (guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE) != 0
-				? CLUSTER_WAL_PHYSICAL_RECYCLE : CLUSTER_WAL_PHYSICAL_REMOVE;
-			return true;
-		case CLUSTER_WAL_ACTION_FORCE_REPLACE:
-		case CLUSTER_WAL_ACTION_ARCHIVE_REPLACE:
-			*physical = CLUSTER_WAL_PHYSICAL_REPLACE;
-			return true;
-		case CLUSTER_WAL_ACTION_RENAME_PARTIAL:
-			*physical = CLUSTER_WAL_PHYSICAL_RENAME_PARTIAL;
-			return true;
-		case CLUSTER_WAL_ACTION_CREATE_ABSENT:
-			*physical = CLUSTER_WAL_PHYSICAL_CREATE_ABSENT;
-			return true;
-		default:
-			return false;
+	case CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE:
+		*physical = (guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE) != 0
+						? CLUSTER_WAL_PHYSICAL_RECYCLE
+						: CLUSTER_WAL_PHYSICAL_REMOVE;
+		return true;
+	case CLUSTER_WAL_ACTION_FORCE_REPLACE:
+	case CLUSTER_WAL_ACTION_ARCHIVE_REPLACE:
+		*physical = CLUSTER_WAL_PHYSICAL_REPLACE;
+		return true;
+	case CLUSTER_WAL_ACTION_RENAME_PARTIAL:
+		*physical = CLUSTER_WAL_PHYSICAL_RENAME_PARTIAL;
+		return true;
+	case CLUSTER_WAL_ACTION_CREATE_ABSENT:
+		*physical = CLUSTER_WAL_PHYSICAL_CREATE_ABSENT;
+		return true;
+	default:
+		return false;
 	}
 }
 
@@ -2563,25 +2371,25 @@ static ClusterWalTerminalOutcome
 wal_reuse_terminal_for_physical(ClusterWalReusePhysicalAction physical)
 {
 	switch (physical) {
-		case CLUSTER_WAL_PHYSICAL_REMOVE:
-			return CLUSTER_WAL_TERMINAL_REMOVED;
-		case CLUSTER_WAL_PHYSICAL_RECYCLE:
-			return CLUSTER_WAL_TERMINAL_RECYCLED;
-		case CLUSTER_WAL_PHYSICAL_REPLACE:
-			return CLUSTER_WAL_TERMINAL_REPLACED;
-		case CLUSTER_WAL_PHYSICAL_RENAME_PARTIAL:
-			return CLUSTER_WAL_TERMINAL_RENAMED_PARTIAL;
-		case CLUSTER_WAL_PHYSICAL_CREATE_ABSENT:
-			return CLUSTER_WAL_TERMINAL_CREATED;
-		default:
-			return CLUSTER_WAL_TERMINAL_UNCHANGED;
+	case CLUSTER_WAL_PHYSICAL_REMOVE:
+		return CLUSTER_WAL_TERMINAL_REMOVED;
+	case CLUSTER_WAL_PHYSICAL_RECYCLE:
+		return CLUSTER_WAL_TERMINAL_RECYCLED;
+	case CLUSTER_WAL_PHYSICAL_REPLACE:
+		return CLUSTER_WAL_TERMINAL_REPLACED;
+	case CLUSTER_WAL_PHYSICAL_RENAME_PARTIAL:
+		return CLUSTER_WAL_TERMINAL_RENAMED_PARTIAL;
+	case CLUSTER_WAL_PHYSICAL_CREATE_ABSENT:
+		return CLUSTER_WAL_TERMINAL_CREATED;
+	default:
+		return CLUSTER_WAL_TERMINAL_UNCHANGED;
 	}
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_confirm_zero_mutation(
-	ClusterWalReuseActionGuard *guard, ClusterWalReusePhysicalAction physical,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_confirm_zero_mutation(ClusterWalReuseActionGuard *guard,
+											  ClusterWalReusePhysicalAction physical,
+											  ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterWalFileObjectStamp current_stamp;
 	ClusterWalPinThread *pin_thread;
@@ -2589,34 +2397,26 @@ cluster_wal_reuse_guard_confirm_zero_mutation(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_ARMED
-		|| active_reuse_guard != guard || !guard->walr.held
-		|| !guard->walr.coordinated || guard->walr.mode != ExclusiveLock
-		|| guard->walr.release_uncertain
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_ARMED
+		|| active_reuse_guard != guard || !guard->walr.held || !guard->walr.coordinated
+		|| guard->walr.mode != ExclusiveLock || guard->walr.release_uncertain
 		|| !root_token_matches_identity(&guard->root_read, &guard->duty)) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	if (guard->walr.converted_from_pin) {
-		pin_thread = pin_find_thread(guard->pin_or_null,
-							 guard->duty.origin_thread_id);
+		pin_thread = pin_find_thread(guard->pin_or_null, guard->duty.origin_thread_id);
 		if (pin_thread == NULL
-			|| (guard->pin_or_null->state
-					!= CLUSTER_WAL_PIN_STATE_BOUND_ONE
-				&& guard->pin_or_null->state
-					!= CLUSTER_WAL_PIN_STATE_BOUND_SET)
+			|| (guard->pin_or_null->state != CLUSTER_WAL_PIN_STATE_BOUND_ONE
+				&& guard->pin_or_null->state != CLUSTER_WAL_PIN_STATE_BOUND_SET)
 			|| pin_thread->serial != guard->serial_or_null
-			|| memcmp(&pin_thread->duty, &guard->duty,
-					  sizeof(guard->duty)) != 0
-			|| memcmp(&pin_thread->root_read, &guard->root_read,
-					  sizeof(guard->root_read)) != 0
+			|| memcmp(&pin_thread->duty, &guard->duty, sizeof(guard->duty)) != 0
+			|| memcmp(&pin_thread->root_read, &guard->root_read, sizeof(guard->root_read)) != 0
 			|| pin_thread->formation != guard->formation
 			|| pin_thread->needs != guard->needs_or_null
-			|| pin_thread->admissions != guard->admissions_or_null
-			|| !pin_thread->walr.held || pin_thread->walr.release_uncertain
-			|| cluster_wal_retention_pin_revalidate(guard->pin_or_null)
-				!= CLUSTER_WAL_PIN_OK
+			|| pin_thread->admissions != guard->admissions_or_null || !pin_thread->walr.held
+			|| pin_thread->walr.release_uncertain
+			|| cluster_wal_retention_pin_revalidate(guard->pin_or_null) != CLUSTER_WAL_PIN_OK
 			|| !serial_matches_thread(guard->serial_or_null, pin_thread)) {
 			*out_reason = CLUSTER_WAL_DENY_SERIAL_STALE;
 			return CLUSTER_WAL_GUARD_BLOCKED;
@@ -2624,41 +2424,36 @@ cluster_wal_reuse_guard_confirm_zero_mutation(
 	}
 	if (!wal_reuse_guard_fence_current(guard, out_reason))
 		return CLUSTER_WAL_GUARD_BLOCKED;
-	if (!wal_reuse_stamp_held_target(
-			&guard->file, guard->duty.system_identifier,
-			(int)guard->source_dir_handle, (int)guard->source_handle,
-			&current_stamp)
-		|| memcmp(&current_stamp, &guard->pre_action_stamp,
-				  sizeof(current_stamp)) != 0) {
+	if (!wal_reuse_stamp_held_target(&guard->file, guard->duty.system_identifier,
+									 (int)guard->source_dir_handle, (int)guard->source_handle,
+									 &current_stamp)
+		|| memcmp(&current_stamp, &guard->pre_action_stamp, sizeof(current_stamp)) != 0) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	return cluster_wal_reuse_guard_note_zero_mutation(
-		guard, physical, out_reason);
+	return cluster_wal_reuse_guard_note_zero_mutation(guard, physical, out_reason);
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_note_zero_mutation(
-	ClusterWalReuseActionGuard *guard, ClusterWalReusePhysicalAction physical,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_note_zero_mutation(ClusterWalReuseActionGuard *guard,
+										   ClusterWalReusePhysicalAction physical,
+										   ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterWalReusePhysicalAction expected;
 
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_ARMED
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_ARMED
 		|| (guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_L3) == 0) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	if ((guard->flags & CLUSTER_WAL_GUARD_F_FALLBACK_L3) != 0) {
 		if (physical != CLUSTER_WAL_PHYSICAL_REMOVE
-			|| (guard->flags & (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE
-							 | CLUSTER_WAL_GUARD_F_PRIMARY_ZERO))
-				!= (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE
-					| CLUSTER_WAL_GUARD_F_PRIMARY_ZERO)
+			|| (guard->flags
+				& (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE | CLUSTER_WAL_GUARD_F_PRIMARY_ZERO))
+				   != (CLUSTER_WAL_GUARD_F_PRIMARY_RECYCLE | CLUSTER_WAL_GUARD_F_PRIMARY_ZERO)
 			|| (guard->flags & CLUSTER_WAL_GUARD_F_FALLBACK_ZERO) != 0) {
 			*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 			return CLUSTER_WAL_GUARD_INVALID;
@@ -2667,8 +2462,7 @@ cluster_wal_reuse_guard_note_zero_mutation(
 		return CLUSTER_WAL_GUARD_OK;
 	}
 	if ((guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_ZERO) != 0
-		|| !wal_reuse_guard_primary_physical(guard, &expected)
-		|| physical != expected) {
+		|| !wal_reuse_guard_primary_physical(guard, &expected) || physical != expected) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
@@ -2677,9 +2471,9 @@ cluster_wal_reuse_guard_note_zero_mutation(
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_terminal_durable(
-	ClusterWalReuseActionGuard *guard, ClusterWalTerminalOutcome outcome,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_terminal_durable(ClusterWalReuseActionGuard *guard,
+										 ClusterWalTerminalOutcome outcome,
+										 ClusterWalReuseDenyReason *out_reason)
 {
 	ClusterWalReusePhysicalAction physical;
 	ClusterWalTerminalOutcome expected;
@@ -2687,8 +2481,7 @@ cluster_wal_reuse_guard_terminal_durable(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_ARMED
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_ARMED
 		|| (guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_L3) == 0) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
@@ -2732,10 +2525,8 @@ cluster_wal_reuse_guard_remove(ClusterWalReuseActionGuard *guard,
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_ARMED
-		|| active_reuse_guard != guard || !guard->walr.held
-		|| guard->walr.release_uncertain
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_ARMED
+		|| active_reuse_guard != guard || !guard->walr.held || guard->walr.release_uncertain
 		|| (guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_L3) == 0
 		/* STOP-05 §15.5: the single recycle-to-remove fallback is the one
 		 * legal shape where PRIMARY_ZERO may be set -- the recycle attempt
@@ -2756,8 +2547,7 @@ cluster_wal_reuse_guard_remove(ClusterWalReuseActionGuard *guard,
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
 	if (physical != CLUSTER_WAL_PHYSICAL_REMOVE
-		|| !wal_reuse_target_basename(
-			&guard->file, basename, sizeof(basename))) {
+		|| !wal_reuse_target_basename(&guard->file, basename, sizeof(basename))) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
@@ -2770,43 +2560,38 @@ cluster_wal_reuse_guard_remove(ClusterWalReuseActionGuard *guard,
 #endif
 	/* This is the mutation-adjacent identity check.  It deliberately uses
 	 * the exact preflight handles and performs no pathname reconstruction. */
-	if (!wal_reuse_stamp_held_target(
-			&guard->file, guard->duty.system_identifier, dirfd,
-			(int)guard->source_handle, &current_stamp)
-		|| memcmp(&current_stamp, &guard->pre_action_stamp,
-				  sizeof(current_stamp)) != 0) {
+	if (!wal_reuse_stamp_held_target(&guard->file, guard->duty.system_identifier, dirfd,
+									 (int)guard->source_handle, &current_stamp)
+		|| memcmp(&current_stamp, &guard->pre_action_stamp, sizeof(current_stamp)) != 0) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	if (unlinkat(dirfd, basename, 0) != 0) {
-		result = cluster_wal_reuse_guard_confirm_zero_mutation(
-			guard, CLUSTER_WAL_PHYSICAL_REMOVE, out_reason);
+		result = cluster_wal_reuse_guard_confirm_zero_mutation(guard, CLUSTER_WAL_PHYSICAL_REMOVE,
+															   out_reason);
 		if (result != CLUSTER_WAL_GUARD_OK)
 			return result;
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	if (fsync(dirfd) != 0
-		|| fstatat(dirfd, basename, &post_action, at_flags) == 0
+	if (fsync(dirfd) != 0 || fstatat(dirfd, basename, &post_action, at_flags) == 0
 		|| errno != ENOENT) {
 		*out_reason = CLUSTER_WAL_DENY_RELEASE_UNCERTAIN;
 		return CLUSTER_WAL_GUARD_RELEASE_UNCERTAIN;
 	}
-	return cluster_wal_reuse_guard_terminal_durable(
-		guard, CLUSTER_WAL_TERMINAL_REMOVED, out_reason);
+	return cluster_wal_reuse_guard_terminal_durable(guard, CLUSTER_WAL_TERMINAL_REMOVED,
+													out_reason);
 #else
 	if (out_reason != NULL)
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
-	return out_reason == NULL ? CLUSTER_WAL_GUARD_INVALID
-		: CLUSTER_WAL_GUARD_BLOCKED;
+	return out_reason == NULL ? CLUSTER_WAL_GUARD_INVALID : CLUSTER_WAL_GUARD_BLOCKED;
 #endif
 }
 
 ClusterWalReuseGuardResult
-cluster_wal_reuse_guard_recycle(
-	ClusterWalReuseActionGuard *guard,
-	const ClusterWalFileIdentity *destination,
-	ClusterWalReuseDenyReason *out_reason)
+cluster_wal_reuse_guard_recycle(ClusterWalReuseActionGuard *guard,
+								const ClusterWalFileIdentity *destination,
+								ClusterWalReuseDenyReason *out_reason)
 {
 #ifndef WIN32
 	ClusterWalFileObjectStamp current_stamp;
@@ -2823,26 +2608,22 @@ cluster_wal_reuse_guard_recycle(
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_ARMED
-		|| active_reuse_guard != guard || !guard->walr.held
-		|| guard->walr.release_uncertain
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_ARMED
+		|| active_reuse_guard != guard || !guard->walr.held || guard->walr.release_uncertain
 		|| (guard->flags & CLUSTER_WAL_GUARD_F_PRIMARY_L3) == 0
-		|| (guard->flags & (CLUSTER_WAL_GUARD_F_PRIMARY_ZERO
-							 | CLUSTER_WAL_GUARD_F_FALLBACK_L3
-							 | CLUSTER_WAL_GUARD_F_FALLBACK_ZERO)) != 0
+		|| (guard->flags
+			& (CLUSTER_WAL_GUARD_F_PRIMARY_ZERO | CLUSTER_WAL_GUARD_F_FALLBACK_L3
+			   | CLUSTER_WAL_GUARD_F_FALLBACK_ZERO))
+			   != 0
 		|| !wal_reuse_guard_primary_physical(guard, &physical)
-		|| physical != CLUSTER_WAL_PHYSICAL_RECYCLE
-		|| destination == NULL
+		|| physical != CLUSTER_WAL_PHYSICAL_RECYCLE || destination == NULL
 		|| !cluster_wal_file_identity_valid(destination, wal_segment_size)
 		|| destination->kind != CLUSTER_WAL_FILE_NORMAL
 		|| destination->thread_id != guard->file.thread_id
 		|| memcmp(destination, &guard->file, sizeof(*destination)) == 0
-		|| !wal_reuse_target_basename(
-			&guard->file, source_basename, sizeof(source_basename))
-		|| !wal_reuse_target_basename(
-			destination, destination_basename,
-			sizeof(destination_basename))) {
+		|| !wal_reuse_target_basename(&guard->file, source_basename, sizeof(source_basename))
+		|| !wal_reuse_target_basename(destination, destination_basename,
+									  sizeof(destination_basename))) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
@@ -2853,62 +2634,54 @@ cluster_wal_reuse_guard_recycle(
 	*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 	return CLUSTER_WAL_GUARD_BLOCKED;
 #endif
-	if (!wal_reuse_stamp_held_target(
-			&guard->file, guard->duty.system_identifier, dirfd,
-			(int)guard->source_handle, &current_stamp)
-		|| memcmp(&current_stamp, &guard->pre_action_stamp,
-				  sizeof(current_stamp)) != 0) {
+	if (!wal_reuse_stamp_held_target(&guard->file, guard->duty.system_identifier, dirfd,
+									 (int)guard->source_handle, &current_stamp)
+		|| memcmp(&current_stamp, &guard->pre_action_stamp, sizeof(current_stamp)) != 0) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	stat_result = fstatat(
-		dirfd, destination_basename, &destination_after, at_flags);
+	stat_result = fstatat(dirfd, destination_basename, &destination_after, at_flags);
 	if (stat_result == 0 || errno != ENOENT) {
-		result = cluster_wal_reuse_guard_note_zero_mutation(
-			guard, CLUSTER_WAL_PHYSICAL_RECYCLE, out_reason);
+		result = cluster_wal_reuse_guard_note_zero_mutation(guard, CLUSTER_WAL_PHYSICAL_RECYCLE,
+															out_reason);
 		if (result != CLUSTER_WAL_GUARD_OK)
 			return result;
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	if (renameat(dirfd, source_basename, dirfd, destination_basename) != 0) {
-		result = cluster_wal_reuse_guard_confirm_zero_mutation(
-			guard, CLUSTER_WAL_PHYSICAL_RECYCLE, out_reason);
+		result = cluster_wal_reuse_guard_confirm_zero_mutation(guard, CLUSTER_WAL_PHYSICAL_RECYCLE,
+															   out_reason);
 		if (result != CLUSTER_WAL_GUARD_OK)
 			return result;
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	if (fsync(dirfd) != 0
-		|| fstatat(dirfd, source_basename, &source_after, at_flags) == 0
-		|| errno != ENOENT
-		|| fstat((int)guard->source_handle, &source_after) != 0
-		|| fstatat(dirfd, destination_basename,
-				   &destination_after, at_flags) != 0
+	if (fsync(dirfd) != 0 || fstatat(dirfd, source_basename, &source_after, at_flags) == 0
+		|| errno != ENOENT || fstat((int)guard->source_handle, &source_after) != 0
+		|| fstatat(dirfd, destination_basename, &destination_after, at_flags) != 0
 		|| !wal_reuse_same_leaf_stat(&source_after, &destination_after)) {
 		*out_reason = CLUSTER_WAL_DENY_RELEASE_UNCERTAIN;
 		return CLUSTER_WAL_GUARD_RELEASE_UNCERTAIN;
 	}
-	return cluster_wal_reuse_guard_terminal_durable(
-		guard, CLUSTER_WAL_TERMINAL_RECYCLED, out_reason);
+	return cluster_wal_reuse_guard_terminal_durable(guard, CLUSTER_WAL_TERMINAL_RECYCLED,
+													out_reason);
 #else
 	(void)destination;
 	if (out_reason != NULL)
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
-	return out_reason == NULL ? CLUSTER_WAL_GUARD_INVALID
-		: CLUSTER_WAL_GUARD_BLOCKED;
+	return out_reason == NULL ? CLUSTER_WAL_GUARD_INVALID : CLUSTER_WAL_GUARD_BLOCKED;
 #endif
 }
 
 ClusterWalReuseGuardResult
 cluster_wal_reuse_guard_bookkeep(ClusterWalReuseActionGuard *guard,
-							 ClusterWalReuseDenyReason *out_reason)
+								 ClusterWalReuseDenyReason *out_reason)
 {
 	if (out_reason == NULL)
 		return CLUSTER_WAL_GUARD_INVALID;
 	*out_reason = CLUSTER_WAL_DENY_NONE;
-	if (!wal_reuse_guard_valid(guard)
-		|| guard->state != CLUSTER_WAL_GUARD_TERMINAL_DURABLE
+	if (!wal_reuse_guard_valid(guard) || guard->state != CLUSTER_WAL_GUARD_TERMINAL_DURABLE
 		|| guard->outcome == CLUSTER_WAL_TERMINAL_UNCHANGED) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
@@ -2919,8 +2692,8 @@ cluster_wal_reuse_guard_bookkeep(ClusterWalReuseActionGuard *guard,
 
 ClusterWalrReleaseResult
 cluster_wal_reuse_guard_finish(ClusterWalReuseActionGuard *guard,
-						  ClusterWalTerminalOutcome *out_outcome,
-						  ClusterWalReuseDenyReason *out_reason)
+							   ClusterWalTerminalOutcome *out_outcome,
+							   ClusterWalReuseDenyReason *out_reason)
 {
 	if (out_outcome != NULL)
 		*out_outcome = CLUSTER_WAL_TERMINAL_UNCHANGED;
@@ -2968,10 +2741,8 @@ cluster_wal_reuse_guard_finish(ClusterWalReuseActionGuard *guard,
 			ClusterLockAcquireRequest downgrade;
 			bool cleanup_required = false;
 
-			thread = pin_find_thread(guard->pin_or_null,
-								 guard->duty.origin_thread_id);
-			if (thread == NULL || !thread->walr.held
-				|| thread->serial != guard->serial_or_null
+			thread = pin_find_thread(guard->pin_or_null, guard->duty.origin_thread_id);
+			if (thread == NULL || !thread->walr.held || thread->serial != guard->serial_or_null
 				|| guard->walr.acquire_request.lockmode != ExclusiveLock
 				|| guard->walr.mode != ExclusiveLock) {
 				*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
@@ -2984,8 +2755,7 @@ cluster_wal_reuse_guard_finish(ClusterWalReuseActionGuard *guard,
 			downgrade.convert_old_request_id = 0;
 			downgrade.dontwait = true;
 			lock_result = walr_request_convert_actual(
-				&downgrade, guard->walr.acquire_request.request_id,
-				&cleanup_required);
+				&downgrade, guard->walr.acquire_request.request_id, &cleanup_required);
 			if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
 				guard->walr.release_uncertain = true;
 				guard->pin_or_null->poisoned = true;
@@ -2996,8 +2766,7 @@ cluster_wal_reuse_guard_finish(ClusterWalReuseActionGuard *guard,
 			/* Drop only the temporary native X and extra S conversion refs;
 			 * the pin's original native S remains.  The master holder keeps
 			 * the confirmed converted request id, now in ShareLock mode. */
-			walr_native_lock_release_or_fatal(
-				&guard->walr.acquire_request);
+			walr_native_lock_release_or_fatal(&guard->walr.acquire_request);
 			walr_native_lock_release_or_fatal(&downgrade);
 			thread->walr.request = downgrade;
 			thread->walr.held = true;
@@ -3008,8 +2777,7 @@ cluster_wal_reuse_guard_finish(ClusterWalReuseActionGuard *guard,
 			explicit_bzero(guard, sizeof(*guard));
 			return CLUSTER_WALR_RELEASE_CONFIRMED;
 		}
-		lock_result = walr_request_release_actual(
-			&guard->walr.acquire_request);
+		lock_result = walr_request_release_actual(&guard->walr.acquire_request);
 		if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
 			guard->walr.release_uncertain = true;
 			*out_reason = CLUSTER_WAL_DENY_RELEASE_UNCERTAIN;
@@ -3027,17 +2795,15 @@ cluster_wal_reuse_guard_finish(ClusterWalReuseActionGuard *guard,
 }
 
 bool
-cluster_wal_retention_fold_validated_roots(const ClusterWalRootFoldInput *inputs,
-										uint16 nslots, int wal_segsz_bytes,
-										ClusterWalRootFold *out_fold)
+cluster_wal_retention_fold_validated_roots(const ClusterWalRootFoldInput *inputs, uint16 nslots,
+										   int wal_segsz_bytes, ClusterWalRootFold *out_fold)
 {
 	uint16 i;
 
 	if (out_fold == NULL)
 		return false;
 	fold_unknown(out_fold);
-	if (inputs == NULL || nslots == 0
-		|| nslots > CLUSTER_WAL_RETENTION_MAX_THREADS
+	if (inputs == NULL || nslots == 0 || nslots > CLUSTER_WAL_RETENTION_MAX_THREADS
 		|| !IsValidWalSegSize(wal_segsz_bytes))
 		return false;
 
@@ -3050,10 +2816,8 @@ cluster_wal_retention_fold_validated_roots(const ClusterWalRootFoldInput *inputs
 
 		if (!input->configured)
 			continue;
-		if (!control_root_read_ready(input->read_result)
-			|| root->identity.origin_thread_id != i + 1
-			|| root->identity.system_identifier == 0
-			|| root->identity.root_lineage_seq == 0
+		if (!control_root_read_ready(input->read_result) || root->identity.origin_thread_id != i + 1
+			|| root->identity.system_identifier == 0 || root->identity.root_lineage_seq == 0
 			|| (root->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) != 0
 			|| (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID) == 0) {
 			fold_unknown(out_fold);
@@ -3061,47 +2825,43 @@ cluster_wal_retention_fold_validated_roots(const ClusterWalRootFoldInput *inputs
 		}
 
 		switch (root->lifecycle) {
-			case CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN:
-			case CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED:
-				if ((root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID) == 0
-					|| (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0
-					|| root->checkpoint_tli == 0
-					|| root->checkpoint_tli != root->tail_tli
-					|| root->checkpoint_lower_lsn == InvalidXLogRecPtr
-					|| root->validated_tail_lsn_exclusive
-						< root->checkpoint_lower_lsn) {
-					fold_unknown(out_fold);
-					return true;
-				}
-				if (root->validated_tail_lsn_exclusive
-					== root->checkpoint_lower_lsn)
-					continue;
-				memset(&interval, 0, sizeof(interval));
-				interval.thread_id = i + 1;
-				interval.tli = root->checkpoint_tli;
-				interval.start_lsn = root->checkpoint_lower_lsn;
-				interval.end_lsn = root->validated_tail_lsn_exclusive;
-				if (!cluster_wal_retention_interval_segment_bounds(
-						&interval, wal_segsz_bytes, &first, &last)
-					|| out_fold->nintervals
-						>= CLUSTER_WAL_RETENTION_MAX_THREADS) {
-					fold_unknown(out_fold);
-					return true;
-				}
-				out_fold->intervals[out_fold->nintervals++] = interval;
-				out_fold->floor_by_thread[i] = first;
-				break;
-			case CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE:
-			case CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED:
-			case CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED:
-				break;
-			case CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED:
-			default:
+		case CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN:
+		case CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED:
+			if ((root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID) == 0
+				|| (root->root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0
+				|| root->checkpoint_tli == 0 || root->checkpoint_tli != root->tail_tli
+				|| root->checkpoint_lower_lsn == InvalidXLogRecPtr
+				|| root->validated_tail_lsn_exclusive < root->checkpoint_lower_lsn) {
 				fold_unknown(out_fold);
 				return true;
+			}
+			if (root->validated_tail_lsn_exclusive == root->checkpoint_lower_lsn)
+				continue;
+			memset(&interval, 0, sizeof(interval));
+			interval.thread_id = i + 1;
+			interval.tli = root->checkpoint_tli;
+			interval.start_lsn = root->checkpoint_lower_lsn;
+			interval.end_lsn = root->validated_tail_lsn_exclusive;
+			if (!cluster_wal_retention_interval_segment_bounds(&interval, wal_segsz_bytes, &first,
+															   &last)
+				|| out_fold->nintervals >= CLUSTER_WAL_RETENTION_MAX_THREADS) {
+				fold_unknown(out_fold);
+				return true;
+			}
+			out_fold->intervals[out_fold->nintervals++] = interval;
+			out_fold->floor_by_thread[i] = first;
+			break;
+		case CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE:
+		case CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED:
+		case CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED:
+			break;
+		case CLUSTER_CONTROL_ROOT_LIFECYCLE_UNUSED:
+		default:
+			fold_unknown(out_fold);
+			return true;
 		}
 	}
-	out_fold->result = out_fold->nintervals > 0 ? CLUSTER_WAL_FOLD_BOUNDED
-											 : CLUSTER_WAL_FOLD_UNCONSTRAINED;
+	out_fold->result
+		= out_fold->nintervals > 0 ? CLUSTER_WAL_FOLD_BOUNDED : CLUSTER_WAL_FOLD_UNCONSTRAINED;
 	return true;
 }

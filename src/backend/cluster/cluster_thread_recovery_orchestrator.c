@@ -62,14 +62,14 @@
 #include "port/atomics.h"			/* replay-slot atomics + barriers (3b-4b)      */
 #include "portability/instr_time.h" /* PGRAC: spec-4.13 D5 LOG-only latency        */
 
-#include "cluster/cluster_conf.h"			   /* node_count / has_peers (scope gate)        */
-#include "cluster/cluster_elog.h"			   /* ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED     */
-#include "cluster/cluster_guc.h"			   /* GUCs: online flag + shared backend + policy */
-#include "cluster/cluster_ir.h"                /* STOP03 held serial guard */
-#include "cluster/cluster_recovery_merge.h"	   /* node-local authority publish (online)       */
-#include "cluster/cluster_recovery_plan.h"	   /* ClusterThreadReplaySlot + slot accessor     */
+#include "cluster/cluster_conf.h"				 /* node_count / has_peers (scope gate)        */
+#include "cluster/cluster_elog.h"				 /* ERRCODE_CLUSTER_THREAD_RECOVERY_BLOCKED     */
+#include "cluster/cluster_guc.h"				 /* GUCs: online flag + shared backend + policy */
+#include "cluster/cluster_ir.h"					 /* STOP03 held serial guard */
+#include "cluster/cluster_recovery_merge.h"		 /* node-local authority publish (online)       */
+#include "cluster/cluster_recovery_plan.h"		 /* ClusterThreadReplaySlot + slot accessor     */
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
-#include "cluster/cluster_thread_recovery.h"   /* engine / driver / pure gates                */
+#include "cluster/cluster_thread_recovery.h"	 /* engine / driver / pure gates                */
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
 #include "cluster/cluster_wal_state.h"		   /* replay-window slot read                     */
@@ -98,23 +98,20 @@ cluster_thread_recovery_replay_mark_replaying(uint16 dead_tid, uint64 episode_ep
 }
 
 ClusterThreadReplayMatchResult
-cluster_thread_recovery_replay_transition_if_match(
-	uint16 dead_tid, uint64 attempt_stamp,
-	ClusterThreadRecReplayState expected,
-	ClusterThreadRecReplayState target)
+cluster_thread_recovery_replay_transition_if_match(uint16 dead_tid, uint64 attempt_stamp,
+												   ClusterThreadRecReplayState expected,
+												   ClusterThreadRecReplayState target)
 {
 	ClusterThreadReplaySlot *slot = cluster_thread_recovery_replay_slot(dead_tid);
 	uint32 expected_state;
 
 	if (slot == NULL || attempt_stamp == 0
-		|| !cluster_thread_recovery_replay_transition_shape_valid(expected,
-																 target))
+		|| !cluster_thread_recovery_replay_transition_shape_valid(expected, target))
 		return CLUSTER_THREADREC_MATCH_INVALID;
 	if (pg_atomic_read_u64(&slot->episode_epoch) != attempt_stamp)
 		return CLUSTER_THREADREC_MATCH_STAMP_MISMATCH;
 	expected_state = (uint32)expected;
-	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected_state,
-										 (uint32)target))
+	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected_state, (uint32)target))
 		return CLUSTER_THREADREC_MATCH_STATE_MISMATCH;
 	return CLUSTER_THREADREC_MATCH_CHANGED;
 }
@@ -276,58 +273,48 @@ cluster_thread_recovery_capability_gate(ClusterThreadRecScope scope)
 }
 
 static ClusterThreadRecResult
-cluster_thread_recovery_drive_fabric(uint16 dead_tid,
-	XLogRecPtr scan_lower, XLogRecPtr scan_upper,
-	const ClusterThreadRecoveryAuthorityV1 *authority,
-	ClusterThreadReplayStats *stats)
+cluster_thread_recovery_drive_fabric(uint16 dead_tid, XLogRecPtr scan_lower, XLogRecPtr scan_upper,
+									 const ClusterThreadRecoveryAuthorityV1 *authority,
+									 ClusterThreadReplayStats *stats)
 {
 	volatile RfPageProofDetailV1 detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
 	ClusterThreadRecoveryFabricApplyResultV1 apply_result;
-	uint64		record_count = 0;
+	uint64 record_count = 0;
 	MemoryContext caller_ctx = CurrentMemoryContext;
 
 	memset(&apply_result, 0, sizeof(apply_result));
 	PG_TRY();
 	{
-		detail = cluster_thread_recovery_fabric_execute_root_v1(dead_tid,
-			scan_lower, scan_upper, authority, false, &apply_result,
-			&record_count);
+		detail = cluster_thread_recovery_fabric_execute_root_v1(
+			dead_tid, scan_lower, scan_upper, authority, false, &apply_result, &record_count);
 	}
 	PG_CATCH();
 	{
-		ErrorData  *edata;
+		ErrorData *edata;
 
 		MemoryContextSwitchTo(caller_ctx);
 		edata = CopyErrorData();
-		if (cluster_thread_recovery_should_rethrow(edata->elevel))
-		{
+		if (cluster_thread_recovery_should_rethrow(edata->elevel)) {
 			FreeErrorData(edata);
 			PG_RE_THROW();
 		}
-		ereport(LOG,
-			(errmsg("cluster thread recovery: immutable fabric execution "
-					"blocked for dead thread %u: %s",
-					dead_tid, edata->message != NULL ? edata->message :
-					"unknown")));
+		ereport(LOG, (errmsg("cluster thread recovery: immutable fabric execution "
+							 "blocked for dead thread %u: %s",
+							 dead_tid, edata->message != NULL ? edata->message : "unknown")));
 		FlushErrorState();
 		FreeErrorData(edata);
 		detail = RF_PAGE_PROOF_DETAIL_INTERNAL;
 	}
 	PG_END_TRY();
 
-	if (detail != RF_PAGE_PROOF_DETAIL_OK || record_count == 0 ||
-		!apply_result.side_apply_complete ||
-		apply_result.page_write_count +
-			apply_result.page_result_skip_count !=
-			apply_result.page_target_count ||
-		(apply_result.page_target_count > 0 &&
-		 (!apply_result.page_durability_complete ||
-		  !apply_result.page_postread_complete)))
-	{
-		ereport(LOG,
-			(errmsg("cluster thread recovery: immutable fabric did not close "
-					"for dead thread %u (detail %d)", dead_tid,
-					(int) detail)));
+	if (detail != RF_PAGE_PROOF_DETAIL_OK || record_count == 0 || !apply_result.side_apply_complete
+		|| apply_result.page_write_count + apply_result.page_result_skip_count
+			   != apply_result.page_target_count
+		|| (apply_result.page_target_count > 0
+			&& (!apply_result.page_durability_complete || !apply_result.page_postread_complete))) {
+		ereport(LOG, (errmsg("cluster thread recovery: immutable fabric did not close "
+							 "for dead thread %u (detail %d)",
+							 dead_tid, (int)detail)));
 		memset(stats, 0, sizeof(*stats));
 		return CLUSTER_THREADREC_BLOCKED;
 	}
@@ -375,8 +362,8 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	/* dead_tid must name a real thread slot (origin in range). */
 	if (dead_tid < 1 || dead_tid > CLUSTER_WAL_STATE_SLOT_COUNT)
 		return CLUSTER_THREADREC_BLOCKED;
-	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
-			CLUSTER_THREAD_AUTHORITY_OK) {
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority)
+		!= CLUSTER_THREAD_AUTHORITY_OK) {
 		cluster_write_fence_note_external_mutation_gate_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
@@ -393,8 +380,8 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 	 */
 	INSTR_TIME_SET_CURRENT(tr_start); /* PGRAC: spec-4.13 D5 replay-phase start */
 	pgstat_report_wait_start(WAIT_EVENT_CLUSTER_THREAD_RECOVERY);
-	drive_res = cluster_thread_recovery_drive_fabric(dead_tid, scan_lower,
-		scan_upper, authority, stats);
+	drive_res
+		= cluster_thread_recovery_drive_fabric(dead_tid, scan_lower, scan_upper, authority, stats);
 	pgstat_report_wait_end();
 	INSTR_TIME_SET_CURRENT(tr_replay_end); /* PGRAC: spec-4.13 D5 replay/visibility done */
 
@@ -444,11 +431,13 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
 			/* STOP04 publish gate: the same held IR/formation/NeedSet/
 			 * AdmissionSet must still be current after fabric durability and
 			 * immediately before reader authority becomes visible. */
-			if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
-					CLUSTER_THREAD_AUTHORITY_OK) {
+			if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority)
+				!= CLUSTER_THREAD_AUTHORITY_OK) {
 				cluster_write_fence_note_external_publish_gate_blocked();
-				ereport(ERROR,
-						(errmsg("thread recovery root/fence/pin authority became stale before publish")));
+				ereport(
+					ERROR,
+					(errmsg(
+						"thread recovery root/fence/pin authority became stale before publish")));
 			}
 
 			/*
@@ -565,9 +554,8 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 	bool shared_fs;
 	int survivors;
 
-	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
-			CLUSTER_THREAD_AUTHORITY_OK)
-	{
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority)
+		!= CLUSTER_THREAD_AUTHORITY_OK) {
 		cluster_write_fence_note_external_mutation_gate_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
@@ -612,28 +600,23 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 		uint32 pin_checkpoint_tli;
 
 		if (!cluster_thread_recovery_projection_current(
-				dead_tid, episode_epoch, &pin_token, &pin_validated_tail,
-				&pin_checkpoint_lower, &pin_lifecycle, &pin_tail_tli,
-				&pin_checkpoint_tli)) {
+				dead_tid, episode_epoch, &pin_token, &pin_validated_tail, &pin_checkpoint_lower,
+				&pin_lifecycle, &pin_tail_tli, &pin_checkpoint_tli)) {
 			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u canonical projection "
 								 "unavailable -> BLOCKED (kept frozen)",
 								 dead_tid)));
 			cluster_thread_recovery_count_blocked();
 			return CLUSTER_THREADREC_BLOCKED;
 		}
-		if (memcmp(&pin_token, authority->root_token, sizeof(pin_token)) != 0 ||
-			pin_lifecycle != authority->root_snapshot->lifecycle ||
-			pin_tail_tli != authority->root_snapshot->tail_tli ||
-			pin_checkpoint_tli != authority->root_snapshot->checkpoint_tli ||
-			pin_checkpoint_lower !=
-				authority->root_snapshot->checkpoint_lower_lsn ||
-			pin_validated_tail !=
-				authority->root_snapshot->validated_tail_lsn_exclusive)
-		{
-			ereport(LOG,
-					(errmsg("cluster thread recovery: dead thread %u canonical projection "
-							"does not match the held root owner -> BLOCKED (kept frozen)",
-							dead_tid)));
+		if (memcmp(&pin_token, authority->root_token, sizeof(pin_token)) != 0
+			|| pin_lifecycle != authority->root_snapshot->lifecycle
+			|| pin_tail_tli != authority->root_snapshot->tail_tli
+			|| pin_checkpoint_tli != authority->root_snapshot->checkpoint_tli
+			|| pin_checkpoint_lower != authority->root_snapshot->checkpoint_lower_lsn
+			|| pin_validated_tail != authority->root_snapshot->validated_tail_lsn_exclusive) {
+			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u canonical projection "
+								 "does not match the held root owner -> BLOCKED (kept frozen)",
+								 dead_tid)));
 			cluster_thread_recovery_count_blocked();
 			return CLUSTER_THREADREC_BLOCKED;
 		}
@@ -642,23 +625,23 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u canonical projection "
 								 "unusable (checkpoint_lower %X/%X, validated_tail %X/%X) "
 								 "-> BLOCKED (kept frozen)",
-								 dead_tid,
-								 LSN_FORMAT_ARGS((XLogRecPtr) pin_checkpoint_lower),
-								 LSN_FORMAT_ARGS((XLogRecPtr) pin_validated_tail))));
+								 dead_tid, LSN_FORMAT_ARGS((XLogRecPtr)pin_checkpoint_lower),
+								 LSN_FORMAT_ARGS((XLogRecPtr)pin_validated_tail))));
 			cluster_thread_recovery_count_blocked();
 			return CLUSTER_THREADREC_BLOCKED;
 		}
-		lower = (XLogRecPtr) pin_checkpoint_lower;
-		validated_min = (XLogRecPtr) pin_validated_tail;
+		lower = (XLogRecPtr)pin_checkpoint_lower;
+		validated_min = (XLogRecPtr)pin_validated_tail;
 	} else {
 		ClusterWalStateSlot slot;
 
 		/* Pre-bit22 (frozen §17.8): the wal-state registry is the selected
 		 * authority — the restored pre-migration shape (bb7fda782e^). */
 		if (cluster_wal_state_read_slot(dead_tid, &slot) != CLUSTER_WAL_SLOT_OK) {
-			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u wal-state slot unreadable "
-								 "-> BLOCKED (kept frozen)",
-								 dead_tid)));
+			ereport(LOG,
+					(errmsg("cluster thread recovery: dead thread %u wal-state slot unreadable "
+							"-> BLOCKED (kept frozen)",
+							dead_tid)));
 			cluster_thread_recovery_count_blocked();
 			return CLUSTER_THREADREC_BLOCKED;
 		}
@@ -667,14 +650,13 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u wal-state slot unusable "
 								 "(checkpoint_redo %X/%X, highest %X/%X) "
 								 "-> BLOCKED (kept frozen)",
-								 dead_tid,
-								 LSN_FORMAT_ARGS((XLogRecPtr) slot.checkpoint_redo_lsn),
-								 LSN_FORMAT_ARGS((XLogRecPtr) slot.highest_lsn))));
+								 dead_tid, LSN_FORMAT_ARGS((XLogRecPtr)slot.checkpoint_redo_lsn),
+								 LSN_FORMAT_ARGS((XLogRecPtr)slot.highest_lsn))));
 			cluster_thread_recovery_count_blocked();
 			return CLUSTER_THREADREC_BLOCKED;
 		}
-		lower = (XLogRecPtr) slot.checkpoint_redo_lsn;
-		validated_min = (XLogRecPtr) slot.highest_lsn;
+		lower = (XLogRecPtr)slot.checkpoint_redo_lsn;
+		validated_min = (XLogRecPtr)slot.highest_lsn;
 	}
 
 	/*
@@ -693,22 +675,20 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
-	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority) !=
-			CLUSTER_THREAD_AUTHORITY_OK ||
-		!cluster_thread_recovery_authority_covers_window_v1(
-			authority, dead_tid, lower, scan_upper))
-	{
-		ereport(LOG,
-				(errmsg("cluster thread recovery: dead thread %u validated window "
-						"is outside the held WAL retention authority -> BLOCKED (kept frozen)",
-						dead_tid)));
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority)
+			!= CLUSTER_THREAD_AUTHORITY_OK
+		|| !cluster_thread_recovery_authority_covers_window_v1(authority, dead_tid, lower,
+															   scan_upper)) {
+		ereport(LOG, (errmsg("cluster thread recovery: dead thread %u validated window "
+							 "is outside the held WAL retention authority -> BLOCKED (kept frozen)",
+							 dead_tid)));
 		cluster_write_fence_note_external_mutation_gate_blocked();
 		cluster_thread_recovery_count_blocked();
 		return CLUSTER_THREADREC_BLOCKED;
 	}
 
-	return cluster_thread_recovery_replay_one_window(
-		dead_tid, lower, scan_upper, episode_epoch, authority, NULL);
+	return cluster_thread_recovery_replay_one_window(dead_tid, lower, scan_upper, episode_epoch,
+													 authority, NULL);
 }
 
 /*

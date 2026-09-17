@@ -253,11 +253,9 @@ extern char *cluster_injection_points;
 
 #ifdef ENABLE_INJECTION
 extern char *cluster_pcm_x_retain_flush_error_target;
-extern bool cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid,
-														 uint32 db_oid,
-														 uint32 rel_number,
-														 int fork_number,
-														 uint32 block_number);
+extern bool cluster_pcm_x_retain_flush_error_target_matches(uint32 spc_oid, uint32 db_oid,
+															uint32 rel_number, int fork_number,
+															uint32 block_number);
 #endif
 
 

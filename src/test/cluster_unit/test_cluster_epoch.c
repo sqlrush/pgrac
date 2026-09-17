@@ -92,8 +92,7 @@ cluster_write_fence_authority_cache_mutation_begin(void)
 }
 
 void
-cluster_write_fence_authority_cache_mutation_end(
-	uint64 odd_sequence pg_attribute_unused())
+cluster_write_fence_authority_cache_mutation_end(uint64 odd_sequence pg_attribute_unused())
 {}
 
 /*

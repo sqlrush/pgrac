@@ -49,7 +49,7 @@ typedef enum ClusterR4RefusalStage {
 	 + CLUSTER_R4_REFUSAL_STAGE_COUNT * CLUSTER_R4_REFUSAL_REASON_COUNT)
 
 extern void cluster_r4_observe(ClusterR4Event event, ClusterTxResolveReason tx_reason,
-							  ClusterCrBuildReason cr_reason);
+							   ClusterCrBuildReason cr_reason);
 extern const char *cluster_r4_refusal_stage_name(ClusterR4RefusalStage stage);
 extern void cluster_r4_observe_refusal(ClusterR4RefusalStage stage, ClusterCrBuildReason reason,
 									   const BufferTag *tag, uint64 request_id, uint64 epoch,

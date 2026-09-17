@@ -7,6 +7,9 @@
  *
  *	  Links cluster_ic_tier1.o standalone and drives the PRODUCTION
  *	  send/drain paths over a real localhost TCP pair:
+ *	  After real socket saturation, a test-only send boundary holds
+ *	  EAGAIN for that fd until explicit drain/close.  Kernel ACK progress
+ *	  cannot silently remove the precondition.  Resumed bytes use real TCP.
  *
  *	    T-1  connect_one registers the peer fd (production registration
  *	         path — no test seam into tier1_peer_fds).
@@ -71,8 +74,12 @@
 #include "utils/wait_event.h"
 #include "cluster/cluster_clean_leave.h"
 /* Include the unchanged production translation unit so malformed private
- * owner shapes can be checked without adding a runtime mutation API. */
+ * owner shapes can be checked without adding a runtime mutation API.
+ * Interpose only the syscall after libc declarations, not product logic. */
+static ssize_t ut_backpressured_send(int fd, const void *buf, size_t len, int flags);
+#define send ut_backpressured_send
 #include "../../backend/cluster/cluster_ic_tier1.c"
+#undef send
 
 /* Drop PG's port.h printf -> pg_printf override; unit_test.h uses
  * stdlib printf and we don't rely on pg_printf in this binary. */
@@ -81,6 +88,29 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+static int ut_backpressure_fd = -1;
+static unsigned int ut_backpressure_calls = 0;
+
+static ssize_t
+ut_backpressured_send(int fd, const void *buf, size_t len, int flags)
+{
+	if (fd == ut_backpressure_fd) {
+		ut_backpressure_calls++;
+		errno = EAGAIN;
+		return -1;
+	}
+	return send(fd, buf, len, flags);
+}
+
+static void
+ut_release_backpressure(int fd)
+{
+	if (fd == ut_backpressure_fd) {
+		UT_ASSERT(ut_backpressure_calls > 0);
+		ut_backpressure_fd = -1;
+	}
+}
 
 /* ============================================================
  * PG-runtime stubs.
@@ -409,26 +439,46 @@ ut_open_listener(int *out_port)
 	return fd;
 }
 
-/* Fill the peer's send path with junk until EAGAIN (both socket buffers
- * full).  Returns the number of junk bytes written. */
+/* Observe real EAGAIN, then hold that syscall result for the exact fd until
+ * the test starts draining or finishes closing it.  EAGAIN by itself is not
+ * a promise about later writes or smaller frames.  Returns real junk bytes. */
 static long
 ut_fill_until_eagain(int fd)
 {
 	char junk[4096];
 	long total = 0;
 
+	UT_ASSERT_EQ(ut_backpressure_fd, -1);
 	memset(junk, 'J', sizeof(junk));
 	for (;;) {
 		ssize_t n = send(fd, junk, sizeof(junk), 0);
 
 		if (n < 0) {
 			UT_ASSERT(errno == EAGAIN || errno == EWOULDBLOCK);
+			ut_backpressure_fd = fd;
+			ut_backpressure_calls = 0;
 			break;
 		}
 		total += (long)n;
 		UT_ASSERT(total < 64L * 1024 * 1024); /* runaway guard */
 	}
 	return total;
+}
+
+/* Real ACK/window progress without running the product's queued-tail drain.
+ * The test's held EAGAIN must survive even when the kernel becomes writable. */
+static void
+ut_allow_socket_progress(int tx_fd, int rx_fd)
+{
+	char junk[65536];
+	fd_set wfds;
+	struct timeval tv = { 5, 0 };
+
+	while (recv(rx_fd, junk, sizeof(junk), MSG_DONTWAIT) > 0)
+		;
+	FD_ZERO(&wfds);
+	FD_SET(tx_fd, &wfds);
+	UT_ASSERT_EQ(select(tx_fd + 1, NULL, &wfds, NULL, &tv), 1);
 }
 
 /* Pump the production drain entry until DONE, receiving concurrently so
@@ -442,6 +492,7 @@ ut_drain_and_collect(int rx_fd, char *acc, long acc_cap, long expected)
 	long collected = 0;
 	int idle_spins = 0;
 
+	ut_release_backpressure(cluster_ic_tier1_get_peer_fd(UT_PEER_ID));
 	UT_ASSERT(expected <= acc_cap);
 	for (;;) {
 		ssize_t n = recv(rx_fd, acc + collected, (size_t)(acc_cap - collected), MSG_DONTWAIT);
@@ -480,6 +531,7 @@ ut_drain_all_and_sweep(int32 peer_id, int rx_fd, char *acc, long acc_cap)
 	long collected = 0;
 	int idle_spins = 0;
 
+	ut_release_backpressure(cluster_ic_tier1_get_peer_fd(peer_id));
 	for (;;) {
 		ssize_t n = recv(rx_fd, acc + collected, (size_t)(acc_cap - collected), MSG_DONTWAIT);
 
@@ -650,6 +702,9 @@ UT_TEST(test_close_peer_resets_queued_tail)
 
 	memset(frame_c, 'C', sizeof(frame_c));
 	(void)ut_fill_until_eagain(ut_tx_fd);
+	/* Model socket room reopening between the fill probe and the smaller
+	 * frame.  A previous EAGAIN does not reserve backpressure for this send. */
+	ut_allow_socket_progress(ut_tx_fd, ut_rx_fd);
 	rc = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame_c, sizeof(frame_c));
 	UT_ASSERT(rc == CLUSTER_IC_SEND_WOULD_BLOCK);
 	UT_ASSERT(cluster_ic_tier1_pending_outbound(UT_PEER_ID));
@@ -658,6 +713,7 @@ UT_TEST(test_close_peer_resets_queued_tail)
 	 * so a reconnect can never start its stream with mid-frame bytes. */
 	cluster_ic_tier1_close_peer(UT_PEER_ID, "test close");
 	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+	ut_release_backpressure(ut_tx_fd);
 }
 
 UT_TEST(test_drain_on_dead_peer_hard_errors)
@@ -729,15 +785,14 @@ UT_TEST(test_recv_drain_yields_after_bounded_frames)
 	int i;
 
 	memset(frames, 0, sizeof(frames));
-	for (i = 0; i < lengthof(frames); i++)
-	{
+	for (i = 0; i < lengthof(frames); i++) {
 		frames[i].msg_type = PGRAC_IC_MSG_HEARTBEAT;
 		frames[i].source_node_id = UT_PEER_ID;
 		frames[i].dest_node_id = cluster_node_id;
 	}
 
 	sent = send(ut_rx_fd, frames, sizeof(frames), 0);
-	UT_ASSERT_EQ(sent, (ssize_t) sizeof(frames));
+	UT_ASSERT_EQ(sent, (ssize_t)sizeof(frames));
 	{
 		fd_set rfds;
 		struct timeval tv;
@@ -781,6 +836,10 @@ UT_TEST(test_second_frame_survives_backpressure)
 	rc = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame_d, sizeof(frame_d));
 	UT_ASSERT(rc == CLUSTER_IC_SEND_WOULD_BLOCK);
 	UT_ASSERT(cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+
+	/* Let the kernel make room without calling the product drain.  This
+	 * reproduces the ACK/window progress that can happen before frame E. */
+	ut_allow_socket_progress(ut_tx_fd, ut_rx_fd);
 
 	/* Frame E while D is pending: must be admitted (WOULD_BLOCK = the
 	 * transport owns a copy) — never silently dropped. */
@@ -1011,6 +1070,7 @@ UT_TEST(test_close_peer_clears_fifo)
 
 	cluster_ic_tier1_close_peer(UT_PEER_ID, "test close (fifo)");
 	UT_ASSERT(!cluster_ic_tier1_pending_outbound(UT_PEER_ID));
+	ut_release_backpressure(ut_tx_fd);
 	UT_ASSERT_EQ(
 		(long)(cluster_ic_tier1_get_fifo_dropped_close(CLUSTER_IC_PLANE_CONTROL) - dropped0), 2L);
 }

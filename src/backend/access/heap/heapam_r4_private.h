@@ -234,6 +234,7 @@ typedef struct ClusterHeapNoRetryTestReport
 	bool retry_edge;
 } ClusterHeapNoRetryTestReport;
 
+#ifdef USE_PGRAC_CLUSTER
 typedef struct ClusterHeapPrepareRetryTestReport
 {
 	uint8 prepare_calls;
@@ -241,6 +242,7 @@ typedef struct ClusterHeapPrepareRetryTestReport
 	uint64 observed_deadline_us;
 	ClusterUndoRecordPrepareResult terminal_result;
 } ClusterHeapPrepareRetryTestReport;
+#endif
 
 typedef enum ClusterHeapMultiInsertRoute
 {
@@ -305,6 +307,8 @@ extern ClusterTxwResult cluster_heap_test_itl_wait_capacity(Buffer old_buffer, B
 															Buffer full_buffer, TransactionId xid,
 															uint64 *deadline_us,
 															const char **diagnostic_reason);
+extern ClusterTxwResult cluster_heap_test_itl_wait_lock_capacity(Buffer buffer, TransactionId xid,
+	uint64 *deadline_us, const char **diagnostic_reason);
 extern bool cluster_heap_test_itl_resolve_pair_terminal_census(
 	Buffer old_buffer, Buffer new_buffer, Buffer full_buffer);
 extern bool cluster_heap_test_itl_update_same_page_failure_cleanup(void);

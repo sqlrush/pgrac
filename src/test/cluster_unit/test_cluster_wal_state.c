@@ -297,8 +297,7 @@ UT_TEST(test_crc_covers_watermark_fields)
 static void
 fill_a1_active_slot(ClusterWalStateSlot *slot)
 {
-	cluster_wal_state_slot_fill(slot, 4, 3, CLUSTER_WAL_SLOT_STATE_ACTIVE, 7, 100, 200, 300,
-								400);
+	cluster_wal_state_slot_fill(slot, 4, 3, CLUSTER_WAL_SLOT_STATE_ACTIVE, 7, 100, 200, 300, 400);
 	slot->checkpoint_redo_lsn = 500;
 	slot->refresh_interval_ms = 600;
 	slot->fpw_was_off = 1;
@@ -510,8 +509,7 @@ cluster_r4_bit22_source_writer_enter(void)
 
 void
 cluster_r4_bit22_source_writer_leave(void)
-{
-}
+{}
 
 bool
 cluster_r4_bit22_source_close_begin(uint64 transition_epoch pg_attribute_unused(),
@@ -534,9 +532,7 @@ main(int argc, char **argv)
 	UT_PLAN(21);
 
 
-
-
-UT_RUN(test_header_layout_locks);
+	UT_RUN(test_header_layout_locks);
 	UT_RUN(test_slot_layout_locks);
 	UT_RUN(test_slot_offset_macro_locks);
 	UT_RUN(test_header_roundtrip);

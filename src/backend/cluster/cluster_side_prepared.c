@@ -37,8 +37,8 @@ cluster_side_prepared_verdict(const ClusterSidePreparedInput *in)
 	 */
 	if (in == NULL)
 		return CLUSTER_SIDE_PREPARED_BLOCKED;
-	if (!in->prepare_redo_ok || !in->pending_durable_ok
-		|| !in->tt_undo_match || !in->gid_identity_match)
+	if (!in->prepare_redo_ok || !in->pending_durable_ok || !in->tt_undo_match
+		|| !in->gid_identity_match)
 		return CLUSTER_SIDE_PREPARED_BLOCKED;
 	return CLUSTER_SIDE_PREPARED_IN_DOUBT;
 }
@@ -64,8 +64,7 @@ cluster_side_prepared_resolve_ready(const ClusterSidePreparedResolveInput *in)
 }
 
 bool
-cluster_side_prepared_gid_identity_ok(const char *gid, uint16 gidlen,
-									  uint32 available_bytes)
+cluster_side_prepared_gid_identity_ok(const char *gid, uint16 gidlen, uint32 available_bytes)
 {
 	/*
 	 * GID identity leg (implementation): a well-formed GID is
@@ -75,8 +74,7 @@ cluster_side_prepared_gid_identity_ok(const char *gid, uint16 gidlen,
 	 * oversized or truncated GID can never name a matching pending
 	 * entry — identity is BLOCKED, never guessed.
 	 */
-	if (gid == NULL || gidlen == 0 || gidlen > MAXPGPATH
-		|| available_bytes < (uint32) gidlen)
+	if (gid == NULL || gidlen == 0 || gidlen > MAXPGPATH || available_bytes < (uint32)gidlen)
 		return false;
 	return gid[0] != '\0';
 }

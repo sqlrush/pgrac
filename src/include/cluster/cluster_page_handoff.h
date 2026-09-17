@@ -49,12 +49,11 @@
  * contributors is still retained; `consumers_zero` says no consumer
  * remains for this resource.
  */
-typedef struct ClusterPageHandoffInput
-{
+typedef struct ClusterPageHandoffInput {
 	const ClusterPageProof *proof;
-	bool		side_proof_ok;
-	bool		retention_pinned;
-	bool		consumers_zero;
+	bool side_proof_ok;
+	bool retention_pinned;
+	bool consumers_zero;
 } ClusterPageHandoffInput;
 
 /*
@@ -74,4 +73,4 @@ extern bool cluster_page_handoff_ready(const ClusterPageHandoffInput *in);
  */
 extern bool cluster_page_handoff_retention_denied(const ClusterPageHandoffInput *in);
 
-#endif							/* CLUSTER_PAGE_HANDOFF_H */
+#endif /* CLUSTER_PAGE_HANDOFF_H */

@@ -95,28 +95,23 @@ cluster_tx_outcome_proof_is_valid(ClusterTxOutcome outcome, ClusterTxProofKind p
 {
 	static const uint8 valid_proofs[5] = {
 		[CLUSTER_TX_UNKNOWN]
-		= (uint8)((1U << CLUSTER_TX_PROOF_NONE)
-				  | (1U << CLUSTER_TX_PROOF_RECYCLED_BELOW_HORIZON)),
-		[CLUSTER_TX_IN_PROGRESS]
-		= (uint8)((1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)),
-		[CLUSTER_TX_PREPARED]
-		= (uint8)((1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_TWOPHASE)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)),
-		[CLUSTER_TX_COMMITTED]
-		= (uint8)((1U << CLUSTER_TX_PROOF_ITL_CLEANOUT)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)
-				  | (1U << CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED)),
-		[CLUSTER_TX_ABORTED]
-		= (uint8)((1U << CLUSTER_TX_PROOF_ITL_CLEANOUT)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
-				  | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)
-				  | (1U << CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED)),
+		= (uint8)((1U << CLUSTER_TX_PROOF_NONE) | (1U << CLUSTER_TX_PROOF_RECYCLED_BELOW_HORIZON)),
+		[CLUSTER_TX_IN_PROGRESS] = (uint8)((1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
+										   | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+										   | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)),
+		[CLUSTER_TX_PREPARED] = (uint8)((1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+										| (1U << CLUSTER_TX_PROOF_ORIGIN_TWOPHASE)
+										| (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)),
+		[CLUSTER_TX_COMMITTED] = (uint8)((1U << CLUSTER_TX_PROOF_ITL_CLEANOUT)
+										 | (1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
+										 | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+										 | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)
+										 | (1U << CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED)),
+		[CLUSTER_TX_ABORTED] = (uint8)((1U << CLUSTER_TX_PROOF_ITL_CLEANOUT)
+									   | (1U << CLUSTER_TX_PROOF_ORIGIN_DURABLE_TT_CLOG)
+									   | (1U << CLUSTER_TX_PROOF_ORIGIN_SUBTRANS_TOP)
+									   | (1U << CLUSTER_TX_PROOF_ORIGIN_MULTIXACT)
+									   | (1U << CLUSTER_TX_PROOF_RECOVERY_MATERIALIZED)),
 	};
 
 	if ((unsigned int)outcome >= lengthof(valid_proofs)
@@ -150,15 +145,11 @@ typedef struct ClusterTxResolution {
  * exact undo record under Candidate-2 SCUR.  Every other identity byte is
  * immutable; a canonical request never permits a wrap substitution. */
 static inline bool
-cluster_tx_locator_reply_matches(const ClusterTxLocator *request,
-							 const ClusterTxLocator *reply)
+cluster_tx_locator_reply_matches(const ClusterTxLocator *request, const ClusterTxLocator *reply)
 {
-	if (request == NULL || reply == NULL
-		|| request->uba.raw[0] != reply->uba.raw[0]
-		|| request->uba.raw[1] != reply->uba.raw[1]
-		|| request->xid != reply->xid
-		|| request->itl_kind != reply->itl_kind
-		|| request->itl_slot_index != reply->itl_slot_index)
+	if (request == NULL || reply == NULL || request->uba.raw[0] != reply->uba.raw[0]
+		|| request->uba.raw[1] != reply->uba.raw[1] || request->xid != reply->xid
+		|| request->itl_kind != reply->itl_kind || request->itl_slot_index != reply->itl_slot_index)
 		return false;
 	if (request->tt_wrap == TT_WRAP_INVALID)
 		return reply->tt_wrap <= TT_WRAP_MAX;
@@ -192,17 +183,17 @@ typedef struct ClusterMultiResolution {
 
 extern bool cluster_tx_locator_from_itl(Page page, uint8 slot_index, ClusterTxLocator *out,
 										ClusterTxResolveReason *reason_out);
-extern bool cluster_tx_locator_from_itl_terminal_census(
-	Page page, uint8 slot_index, ClusterTxLocator *out,
-	ClusterTxResolveReason *reason_out);
+extern bool cluster_tx_locator_from_itl_terminal_census(Page page, uint8 slot_index,
+														ClusterTxLocator *out,
+														ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_tx_resolve_exact(const ClusterTxLocator *locator,
 												 ClusterTxResolveMode mode,
 												 ClusterTxResolution *out,
 												 ClusterTxResolveReason *reason_out);
-extern ClusterTxOutcome cluster_tx_resolve_exact_admitted(
-	const ClusterTxLocator *locator, ClusterTxResolveMode mode,
-	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,
-	ClusterTxResolveReason *reason_out);
+extern ClusterTxOutcome
+cluster_tx_resolve_exact_admitted(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+								  const ClusterSemanticAdmissionToken *admission,
+								  ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
 extern ClusterTxOutcome cluster_tx_resolve_terminal_census_retained_admitted(
 	const ClusterTxLocator *locator, SCN retained_commit_scn,
 	const ClusterSemanticAdmissionToken *admission, ClusterTxResolution *out,

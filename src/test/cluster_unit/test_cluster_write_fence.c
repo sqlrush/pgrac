@@ -489,35 +489,29 @@ UT_TEST(test_baseline_author_rejects_same_order_durable_conflict)
 	memset(dead, 0, sizeof(dead));
 	durable = mk_marker(4, 0, 0x44, 1, 0x01);
 	cluster_fence_marker_build_baseline(&baseline, 4, dead, 0, 0,
-									 CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+										CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
 
 	/* A restarting lowest-live node has not applied the survivor's current
 	 * membership yet.  It must not overwrite its self slot with a same-order,
 	 * different tuple: the direct durable reader correctly treats those two
 	 * identities as corruption. */
-	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(
-		&baseline, true, &durable));
+	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(&baseline, true, &durable));
 
 	baseline = durable;
 	baseline.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
-	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(
-		&baseline, true, &durable));
+	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(&baseline, true, &durable));
 
 	baseline.fence_epoch = 3;
-	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(
-		&baseline, true, &durable));
+	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(&baseline, true, &durable));
 
 	baseline = durable;
 	baseline.fence_epoch = 5;
-	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(
-		&baseline, true, &durable));
+	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(&baseline, true, &durable));
 
 	cluster_fence_marker_build_baseline(&baseline, 5, dead, 0, 0,
-									 CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
-	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(
-		&baseline, true, &durable));
-	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(
-		&baseline, false, NULL));
+										CLUSTER_FENCE_BASELINE_INITIAL_ISSUER);
+	UT_ASSERT(!cluster_fence_baseline_author_permitted_v1(&baseline, true, &durable));
+	UT_ASSERT(cluster_fence_baseline_author_permitted_v1(&baseline, false, NULL));
 }
 
 UT_TEST(test_baseline_pristine_issuer_is_sentinel_and_uniform)
@@ -719,18 +713,18 @@ UT_TEST(test_stop02_cache_exact_match_stale_and_expired)
 	uint64 published = UINT64_C(10000000);
 	uint64 expiry = published + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US;
 
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 2, 2, true, &observed, published, expiry, published),
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 2, 2, true, &observed,
+														 published, expiry, published),
 				 CLUSTER_FENCE_CACHE_MATCH);
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 2, 2, true, &observed, published, expiry, published - 1),
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 2, 2, true, &observed,
+														 published, expiry, published - 1),
 				 CLUSTER_FENCE_CACHE_STALE);
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 2, 2, true, &observed, published, expiry, expiry),
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 2, 2, true, &observed,
+														 published, expiry, expiry),
 				 CLUSTER_FENCE_CACHE_EXPIRED);
 	observed.fence_event_id++;
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 2, 2, true, &observed, published, expiry, published),
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 2, 2, true, &observed,
+														 published, expiry, published),
 				 CLUSTER_FENCE_CACHE_STALE);
 }
 
@@ -740,17 +734,17 @@ UT_TEST(test_stop02_cache_invalid_and_torn_are_distinct)
 	uint64 published = UINT64_C(10000000);
 	uint64 expiry = published + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US;
 
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 0, 0, false, &expected, 0, 0, published),
-				 CLUSTER_FENCE_CACHE_INVALID);
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 3, 4, true, &expected, published, expiry, published),
+	UT_ASSERT_EQ(
+		cluster_fence_authority_cache_decide_v1(&expected, 0, 0, false, &expected, 0, 0, published),
+		CLUSTER_FENCE_CACHE_INVALID);
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 3, 4, true, &expected,
+														 published, expiry, published),
 				 CLUSTER_FENCE_CACHE_UNAVAILABLE);
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 4, 6, true, &expected, published, expiry, published),
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 4, 6, true, &expected,
+														 published, expiry, published),
 				 CLUSTER_FENCE_CACHE_UNAVAILABLE);
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 4, 4, false, &expected, published, expiry, published),
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 4, 4, false, &expected,
+														 published, expiry, published),
 				 CLUSTER_FENCE_CACHE_INVALID);
 }
 
@@ -760,14 +754,14 @@ UT_TEST(test_stop02_cache_rejects_bad_expiry_and_semantic_kind_mismatch)
 	ClusterFenceMarker observed = expected;
 	uint64 published = UINT64_MAX - 10;
 
-	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 2, 2, true, &observed, published, UINT64_MAX, published),
+	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(&expected, 2, 2, true, &observed,
+														 published, UINT64_MAX, published),
 				 CLUSTER_FENCE_CACHE_INVALID);
 	published = UINT64_C(10000000);
 	observed.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
 	UT_ASSERT_EQ(cluster_fence_authority_cache_decide_v1(
-				 &expected, 2, 2, true, &observed, published,
-				 published + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US, published),
+					 &expected, 2, 2, true, &observed, published,
+					 published + CLUSTER_FENCE_AUTHORITY_CACHE_MAX_AGE_US, published),
 				 CLUSTER_FENCE_CACHE_STALE);
 }
 

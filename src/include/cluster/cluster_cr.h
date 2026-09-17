@@ -86,10 +86,11 @@ cluster_cr_r4_dependency_request_id(uint32 slot_index, uint64 slot_generation, u
 	return (slot_generation << 18) | ((uint64)(build_steps - 1) << 2) | slot_index;
 }
 
-extern ClusterR4CrBuildStepResult cluster_cr_build_on_holder_step(
-	uint32 slot_index, uint64 slot_generation, bool foreign_undo_ready,
-	ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
-	const char foreign_undo_page[BLCKSZ], ClusterCrBuildReason *reason_out);
+extern ClusterR4CrBuildStepResult
+cluster_cr_build_on_holder_step(uint32 slot_index, uint64 slot_generation, bool foreign_undo_ready,
+								ClusterR4CrSlotExtension *extension, char result_page[BLCKSZ],
+								const char foreign_undo_page[BLCKSZ],
+								ClusterCrBuildReason *reason_out);
 /*
  * Extract one exact transaction member from an already-resident private DATA
  * block.  This helper performs no I/O and touches no shared state.  On success
@@ -97,12 +98,13 @@ extern ClusterR4CrBuildStepResult cluster_cr_build_on_holder_step(
  * TT_WRAP_INVALID may be upgraded once from record.tt_wrap_plus1.  On failure
  * every output is left byte-for-byte unchanged.
  */
-extern bool cluster_cr_r4_extract_resident_record(
-	const char resident_undo_page[BLCKSZ],
-	const ClusterTxLocator *request_locator, char record_out[BLCKSZ],
-	size_t *record_length_out, ClusterTxLocator *canonical_locator_out);
-extern bool cluster_cr_build_on_holder_pending_locator(
-	uint32 slot_index, uint64 slot_generation, ClusterTxLocator *locator_out);
+extern bool cluster_cr_r4_extract_resident_record(const char resident_undo_page[BLCKSZ],
+												  const ClusterTxLocator *request_locator,
+												  char record_out[BLCKSZ],
+												  size_t *record_length_out,
+												  ClusterTxLocator *canonical_locator_out);
+extern bool cluster_cr_build_on_holder_pending_locator(uint32 slot_index, uint64 slot_generation,
+													   ClusterTxLocator *locator_out);
 extern void cluster_cr_build_on_holder_forget(uint32 slot_index, uint64 slot_generation);
 #endif
 

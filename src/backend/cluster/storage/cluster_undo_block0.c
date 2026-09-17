@@ -189,8 +189,7 @@ cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expect
  * current lane.  Callers cannot manufacture an empty affected-set proof.
  */
 ClusterR4StartupCompletionResultV1
-cluster_undo_block0_r4_startup_begin(
-	int timeout_ms, ClusterR4StartupCompletionContextV1 **out)
+cluster_undo_block0_r4_startup_begin(int timeout_ms, ClusterR4StartupCompletionContextV1 **out)
 {
 	if (out == NULL)
 		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
@@ -201,12 +200,11 @@ cluster_undo_block0_r4_startup_begin(
 }
 
 ClusterR4StartupCompletionResultV1
-cluster_undo_block0_r4_startup_close_next(
-	ClusterR4StartupCompletionContextV1 *context,
-	const RfRootResourceAdmissionV1 *root,
-	const RfRecordClosureProofV1 *record,
-	const RfPageResourceProofV1 *page,
-	const RfSideResourceProofSetV1 *side)
+cluster_undo_block0_r4_startup_close_next(ClusterR4StartupCompletionContextV1 *context,
+										  const RfRootResourceAdmissionV1 *root,
+										  const RfRecordClosureProofV1 *record,
+										  const RfPageResourceProofV1 *page,
+										  const RfSideResourceProofSetV1 *side)
 {
 	(void)root;
 	(void)record;
@@ -217,8 +215,7 @@ cluster_undo_block0_r4_startup_close_next(
 }
 
 ClusterR4StartupCompletionResultV1
-cluster_undo_block0_r4_startup_finalize(
-	ClusterR4StartupCompletionContextV1 **context)
+cluster_undo_block0_r4_startup_finalize(ClusterR4StartupCompletionContextV1 **context)
 {
 	if (context == NULL || *context == NULL)
 		return CLUSTER_R4_STARTUP_COMPLETION_INVALID;
@@ -226,8 +223,7 @@ cluster_undo_block0_r4_startup_finalize(
 }
 
 void
-cluster_undo_block0_r4_startup_abort(
-	ClusterR4StartupCompletionContextV1 **context)
+cluster_undo_block0_r4_startup_abort(ClusterR4StartupCompletionContextV1 **context)
 {
 	if (context != NULL)
 		*context = NULL;

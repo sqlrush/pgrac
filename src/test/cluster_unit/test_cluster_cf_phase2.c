@@ -201,8 +201,7 @@ cluster_conf_lookup_node(int32 id)
 {
 	static const ClusterNodeInfo marker;
 
-	return (id >= 0 && id < CLUSTER_MAX_NODES && stub_configured_nodes[id])
-		? &marker : NULL;
+	return (id >= 0 && id < CLUSTER_MAX_NODES && stub_configured_nodes[id]) ? &marker : NULL;
 }
 int
 cluster_conf_node_count(void)
@@ -236,8 +235,8 @@ configure_nodes(int count)
 static void
 ack_path(char path[MAXPGPATH], int probe_owner, int responder, uint64 nonce)
 {
-	snprintf(path, MAXPGPATH, "%s/%s/ack.%d.%d.%016" INT64_MODIFIER "x",
-		shared_root, CLUSTER_CF_PHASE2_DIR, probe_owner, responder, nonce);
+	snprintf(path, MAXPGPATH, "%s/%s/ack.%d.%d.%016" INT64_MODIFIER "x", shared_root,
+			 CLUSTER_CF_PHASE2_DIR, probe_owner, responder, nonce);
 }
 
 static void
@@ -255,8 +254,7 @@ static void
 restamp_v2(ClusterCfPhase2RecordV2 *record)
 {
 	INIT_CRC32C(record->crc);
-	COMP_CRC32C(record->crc, record,
-		offsetof(ClusterCfPhase2RecordV2, crc));
+	COMP_CRC32C(record->crc, record, offsetof(ClusterCfPhase2RecordV2, crc));
 	FIN_CRC32C(record->crc);
 }
 
@@ -340,11 +338,9 @@ UT_TEST(test_four_responders_publish_distinct_exact_acks)
 	configure_nodes(4);
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, nonce));
 	for (responder = 1; responder <= 3; responder++)
-		UT_ASSERT(cluster_cf_phase2_write_ack(
-			shared_root, 0, responder, nonce));
+		UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, responder, nonce));
 	for (responder = 1; responder <= 3; responder++)
-		UT_ASSERT(cluster_cf_phase2_read_exact_ack(
-			shared_root, 0, responder, nonce));
+		UT_ASSERT(cluster_cf_phase2_read_exact_ack(shared_root, 0, responder, nonce));
 }
 
 UT_TEST(test_nonselected_responder_cannot_complete_rendezvous)
@@ -355,8 +351,7 @@ UT_TEST(test_nonselected_responder_cannot_complete_rendezvous)
 	configure_nodes(4);
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, nonce));
 	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 2, nonce));
-	UT_ASSERT(!cluster_cf_phase2_rendezvous(
-		shared_root, 0, 1, nonce, 0));
+	UT_ASSERT(!cluster_cf_phase2_rendezvous(shared_root, 0, 1, nonce, 0));
 }
 
 UT_TEST(test_delayed_old_nonce_writer_cannot_replace_current_ack)
@@ -371,8 +366,7 @@ UT_TEST(test_delayed_old_nonce_writer_cannot_replace_current_ack)
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, new_nonce));
 	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 1, new_nonce));
 	UT_ASSERT(!cluster_cf_phase2_write_ack(shared_root, 0, 1, old_nonce));
-	UT_ASSERT(cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 1, new_nonce));
+	UT_ASSERT(cluster_cf_phase2_read_exact_ack(shared_root, 0, 1, new_nonce));
 }
 
 UT_TEST(test_duplicate_exact_ack_is_idempotent)
@@ -384,8 +378,7 @@ UT_TEST(test_duplicate_exact_ack_is_idempotent)
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, nonce));
 	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 1, nonce));
 	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 1, nonce));
-	UT_ASSERT(cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 1, nonce));
+	UT_ASSERT(cluster_cf_phase2_read_exact_ack(shared_root, 0, 1, nonce));
 }
 
 UT_TEST(test_v2_crc_and_path_tuple_validation)
@@ -394,6 +387,8 @@ UT_TEST(test_v2_crc_and_path_tuple_validation)
 		uint32 magic;
 		uint32 version;
 		uint64 nonce;
+		/* The fixture writes the complete old wire record, including CRC. */
+		/* cppcheck-suppress unusedStructMember */
 		pg_crc32c crc;
 	} ClusterCfPhase2RecordV1;
 	ClusterCfPhase2RecordV1 v1;
@@ -407,10 +402,8 @@ UT_TEST(test_v2_crc_and_path_tuple_validation)
 	configure_nodes(4);
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, nonce));
 	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 1, nonce));
-	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 2, nonce));
-	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 1, nonce + 1));
+	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(shared_root, 0, 2, nonce));
+	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(shared_root, 0, 1, nonce + 1));
 
 	ack_path(path, 0, 1, nonce);
 	fd = open(path, O_RDONLY);
@@ -419,8 +412,7 @@ UT_TEST(test_v2_crc_and_path_tuple_validation)
 	close(fd);
 	record.crc ^= 1;
 	write_test_bytes(path, &record, sizeof(record));
-	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 1, nonce));
+	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(shared_root, 0, 1, nonce));
 
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, nonce + 1));
 	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 1, nonce + 1));
@@ -432,15 +424,12 @@ UT_TEST(test_v2_crc_and_path_tuple_validation)
 	record.responder_node = 2;
 	restamp_v2(&record);
 	write_test_bytes(path, &record, sizeof(record));
-	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 1, nonce + 1));
+	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(shared_root, 0, 1, nonce + 1));
 
 	/* A valid V2 body moved under another probe-owner path is foreign. */
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, nonce + 2));
-	snprintf(from, sizeof(from), "%s/%s/probe.0",
-		shared_root, CLUSTER_CF_PHASE2_DIR);
-	snprintf(path, sizeof(path), "%s/%s/probe.1",
-		shared_root, CLUSTER_CF_PHASE2_DIR);
+	snprintf(from, sizeof(from), "%s/%s/probe.0", shared_root, CLUSTER_CF_PHASE2_DIR);
+	snprintf(path, sizeof(path), "%s/%s/probe.1", shared_root, CLUSTER_CF_PHASE2_DIR);
 	UT_ASSERT_EQ(rename(from, path), 0);
 	UT_ASSERT(!cluster_cf_phase2_read_probe(shared_root, 1, &record));
 
@@ -451,8 +440,7 @@ UT_TEST(test_v2_crc_and_path_tuple_validation)
 	v1.nonce = nonce + 3;
 	ack_path(path, 0, 1, nonce + 3);
 	write_test_bytes(path, &v1, sizeof(v1));
-	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 1, nonce + 3));
+	UT_ASSERT(!cluster_cf_phase2_read_exact_ack(shared_root, 0, 1, nonce + 3));
 }
 
 UT_TEST(test_ack_cleanup_is_scoped_to_exact_responder_pair)
@@ -477,13 +465,12 @@ UT_TEST(test_ack_cleanup_is_scoped_to_exact_responder_pair)
 	ack_path(old_same_pair, 0, 1, old_nonce);
 	ack_path(old_other_responder, 0, 2, old_nonce);
 	ack_path(old_other_owner, 1, 2, foreign_nonce);
-	snprintf(malformed, sizeof(malformed), "%s/%s/ack.0.1.foreign",
-		shared_root, CLUSTER_CF_PHASE2_DIR);
+	snprintf(malformed, sizeof(malformed), "%s/%s/ack.0.1.foreign", shared_root,
+			 CLUSTER_CF_PHASE2_DIR);
 	write_test_bytes(malformed, &marker, sizeof(marker));
 
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, current_nonce));
-	UT_ASSERT(cluster_cf_phase2_write_ack(
-		shared_root, 0, 1, current_nonce));
+	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 1, current_nonce));
 	ack_path(current, 0, 1, current_nonce);
 	UT_ASSERT(access(old_same_pair, F_OK) != 0);
 	UT_ASSERT(access(current, F_OK) == 0);
@@ -520,8 +507,7 @@ UT_TEST(test_delayed_old_cleanup_cannot_delete_later_current_ack)
 	UT_ASSERT_EQ(kill(child, SIGCONT), 0);
 	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
 	UT_ASSERT(WIFEXITED(status));
-	UT_ASSERT(cluster_cf_phase2_read_exact_ack(
-		shared_root, 0, 1, new_nonce));
+	UT_ASSERT(cluster_cf_phase2_read_exact_ack(shared_root, 0, 1, new_nonce));
 }
 
 /* ======================================================================
@@ -540,8 +526,7 @@ UT_TEST(test_rendezvous_success)
 	 */
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 1, UINT64CONST(0xAAAA0001BBBB0002)));
 	UT_ASSERT(cluster_cf_phase2_write_probe(shared_root, 0, UINT64CONST(0xCCCC0003DDDD0004)));
-	UT_ASSERT(cluster_cf_phase2_write_ack(
-		shared_root, 0, 1, UINT64CONST(0xCCCC0003DDDD0004)));
+	UT_ASSERT(cluster_cf_phase2_write_ack(shared_root, 0, 1, UINT64CONST(0xCCCC0003DDDD0004)));
 
 	UT_ASSERT(
 		cluster_cf_phase2_rendezvous(shared_root, 0, 1, UINT64CONST(0xCCCC0003DDDD0004), 60000));
@@ -552,8 +537,8 @@ UT_TEST(test_rendezvous_success)
 
 		UT_ASSERT(cluster_cf_phase2_read_probe(shared_root, 0, &probe));
 		UT_ASSERT_EQ(probe.probe_nonce, UINT64CONST(0xCCCC0003DDDD0004));
-		UT_ASSERT(cluster_cf_phase2_read_exact_ack(
-			shared_root, 1, 0, UINT64CONST(0xAAAA0001BBBB0002)));
+		UT_ASSERT(
+			cluster_cf_phase2_read_exact_ack(shared_root, 1, 0, UINT64CONST(0xAAAA0001BBBB0002)));
 	}
 }
 

@@ -51,7 +51,7 @@
 #include "cluster/cluster_hang.h"		  /* spec-5.11: ClusterHangDumpData for dump_hang stubs */
 #include "cluster/cluster_hang_resolve.h" /* spec-5.12: ClusterHangResolveCounters for dump stubs */
 #include "cluster/cluster_lmd.h"
-#include "cluster/cluster_reconfig.h"		  /* spec-5.14 D6 touched getter stubs */
+#include "cluster/cluster_reconfig.h"			 /* spec-5.14 D6 touched getter stubs */
 #include "cluster/cluster_semantic_activation.h" /* R4 writer snapshot stub */
 #include "cluster/cluster_hw_snapshot.h"
 #include "cluster/cluster_r4_observe.h"
@@ -849,30 +849,23 @@ cluster_dl_release_count(void)
 }
 
 /* STOP03 §10.3 dump_ir stubs (cluster_ir_lock.c is not linked here). */
-#define DEFINE_RECOVERY_SERIAL_COUNTER_STUB(name) \
-	uint64 name(void);                             \
-	uint64 name(void)                              \
-	{                                              \
-		return 0;                                    \
+#define DEFINE_RECOVERY_SERIAL_COUNTER_STUB(name)                                                  \
+	uint64 name(void);                                                                             \
+	uint64 name(void)                                                                              \
+	{                                                                                              \
+		return 0;                                                                                  \
 	}
 
 DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_grant_count)
 DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_busy_count)
 DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_retry_count)
-DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
-	cluster_recovery_serial_revalidate_reject_count)
-DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
-	cluster_recovery_serial_node_cleanup_wait_count)
-DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
-	cluster_recovery_serial_release_confirmed_count)
-DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
-	cluster_recovery_serial_release_unconfirmed_count)
-DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
-	cluster_recovery_serial_cold_set_grant_count)
-DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
-	cluster_recovery_serial_capability_denied_count)
-DEFINE_RECOVERY_SERIAL_COUNTER_STUB(
-	cluster_recovery_serial_native_result_rejected_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_revalidate_reject_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_node_cleanup_wait_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_release_confirmed_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_release_unconfirmed_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_cold_set_grant_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_capability_denied_count)
+DEFINE_RECOVERY_SERIAL_COUNTER_STUB(cluster_recovery_serial_native_result_rejected_count)
 
 #undef DEFINE_RECOVERY_SERIAL_COUNTER_STUB
 
@@ -986,10 +979,10 @@ cluster_write_fence_get_baseline_authority_age_us(void)
 {
 	return 0;
 }
-#define DEFINE_EXTERNAL_FENCE_COUNTER_STUB(name) \
-	uint64 cluster_write_fence_get_external_##name(void) \
-	{ \
-		return 0; \
+#define DEFINE_EXTERNAL_FENCE_COUNTER_STUB(name)                                                   \
+	uint64 cluster_write_fence_get_external_##name(void)                                           \
+	{                                                                                              \
+		return 0;                                                                                  \
 	}
 DEFINE_EXTERNAL_FENCE_COUNTER_STUB(admit_requested)
 DEFINE_EXTERNAL_FENCE_COUNTER_STUB(write_excluded)
@@ -3578,8 +3571,7 @@ LWLockAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_u
  * LWLock reads; the debug unit never runs those paths, so the stub simply
  * reports acquire success and never blocks. */
 bool
-LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(),
-						 LWLockMode mode pg_attribute_unused())
+LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	return true;
 }
@@ -3633,17 +3625,17 @@ cluster_wal_thread_id(void)
 
 ClusterFormationWitnessResult
 cluster_formation_witness_build_live_wait(uint16 origin_thread pg_attribute_unused(),
-									  int timeout_ms pg_attribute_unused(),
-									  ClusterFormationWitnessV1 **out)
+										  int timeout_ms pg_attribute_unused(),
+										  ClusterFormationWitnessV1 **out)
 {
 	*out = NULL;
 	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
 }
 
 ClusterFormationWitnessResult
-cluster_formation_witness_build_recovery_control_wait(
-	uint16 origin_thread pg_attribute_unused(),
-	int timeout_ms pg_attribute_unused(), ClusterFormationWitnessV1 **out)
+cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread pg_attribute_unused(),
+													  int timeout_ms pg_attribute_unused(),
+													  ClusterFormationWitnessV1 **out)
 {
 	*out = NULL;
 	return CLUSTER_FORMATION_WITNESS_CAPABILITY_UNAVAILABLE;
@@ -3657,9 +3649,8 @@ cluster_formation_witness_destroy(ClusterFormationWitnessV1 **witness)
 
 bool
 cluster_formation_witness_copy_classification_v1(
-	const ClusterFormationWitnessV1 *witness pg_attribute_unused(),
-	uint16 *origin_thread, ClusterFenceAuthorityProof *authority,
-	ClusterFormationSnapshotV1 *snapshot)
+	const ClusterFormationWitnessV1 *witness pg_attribute_unused(), uint16 *origin_thread,
+	ClusterFenceAuthorityProof *authority, ClusterFormationSnapshotV1 *snapshot)
 {
 	memset(authority, 0, sizeof(*authority));
 	memset(snapshot, 0, sizeof(*snapshot));
@@ -3692,9 +3683,8 @@ cluster_formation_snapshot_matches_v1(
 }
 
 bool
-cluster_reconfig_capture_formation_snapshot_v1(
-	uint16 origin_thread pg_attribute_unused(),
-	ClusterFormationSnapshotV1 *snapshot)
+cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread pg_attribute_unused(),
+											   ClusterFormationSnapshotV1 *snapshot)
 {
 	memset(snapshot, 0, sizeof(*snapshot));
 	return false;
@@ -3721,17 +3711,15 @@ cluster_membership_get_last_admitted_incarnation(int32 node_id pg_attribute_unus
 bool
 cluster_grd_recovery_authority_barrier_wait(
 	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
-	uint64 boot_incarnation pg_attribute_unused(),
-	uint64 lms_generation pg_attribute_unused(),
+	uint64 boot_incarnation pg_attribute_unused(), uint64 lms_generation pg_attribute_unused(),
 	int timeout_ms pg_attribute_unused())
 {
 	return false;
 }
 
 bool
-cluster_grd_recovery_authority_is_current(
-	uint64 boot_incarnation pg_attribute_unused(),
-	uint64 lms_generation pg_attribute_unused())
+cluster_grd_recovery_authority_is_current(uint64 boot_incarnation pg_attribute_unused(),
+										  uint64 lms_generation pg_attribute_unused())
 {
 	return false;
 }
@@ -3739,8 +3727,7 @@ cluster_grd_recovery_authority_is_current(
 bool
 cluster_grd_serving_authority_rebind_lmon(
 	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
-	uint64 boot_incarnation pg_attribute_unused(),
-	uint64 lms_generation pg_attribute_unused())
+	uint64 boot_incarnation pg_attribute_unused(), uint64 lms_generation pg_attribute_unused())
 {
 	return false;
 }
@@ -3751,8 +3738,7 @@ cluster_grd_serving_authority_rebind_lmon(
 bool
 cluster_grd_serving_authority_rebind_leaver(
 	const ClusterFormationSnapshotV1 *formation pg_attribute_unused(),
-	uint64 boot_incarnation pg_attribute_unused(),
-	uint64 lms_generation pg_attribute_unused())
+	uint64 boot_incarnation pg_attribute_unused(), uint64 lms_generation pg_attribute_unused())
 {
 	return false;
 }
@@ -3806,8 +3792,7 @@ cluster_reconfig_stage_pre_publish_join_handoff(
 
 void
 cluster_cf_phase2_verify_or_fail(const char *pgdata pg_attribute_unused())
-{
-}
+{}
 
 bool
 cluster_cf_phase2_peer_verified(void)
@@ -5127,8 +5112,8 @@ UT_TEST(test_debug_dump_exposes_native_pcm_grd_lifecycle_stats)
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_capacity_retry_count"), "6");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_capacity_fail_count"), "7");
 	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_peak_live_entries"), "12");
-	UT_ASSERT_STR_EQ(captured_dump_value("pcm",
-		"pcm_grd_reclaim_refused_pcm_mode_not_n_count"), "9");
+	UT_ASSERT_STR_EQ(captured_dump_value("pcm", "pcm_grd_reclaim_refused_pcm_mode_not_n_count"),
+					 "9");
 	UT_ASSERT_EQ(captured_dump_count("pcm", "pcm_x_runtime_state"), 0);
 }
 
@@ -5339,8 +5324,7 @@ UT_TEST(test_debug_dump_exposes_closed_ctrc_observability)
 	(void)cluster_dump_state(fcinfo);
 
 	for (i = 0; i < CTRC_STAT_COUNT; i++)
-		UT_ASSERT_EQ(captured_dump_count("ctrc",
-			cluster_ctrc_stat_name((ClusterCtrcStatId)i)), 1);
+		UT_ASSERT_EQ(captured_dump_count("ctrc", cluster_ctrc_stat_name((ClusterCtrcStatId)i)), 1);
 	UT_ASSERT_STR_EQ(captured_dump_value("ctrc", "cleaner_reason"), "NONE");
 	UT_ASSERT_EQ(captured_dump_count("ctrc", "test_barrier_phase"), 1);
 	UT_ASSERT_EQ(captured_dump_count("ctrc", "test_barrier_hit_count"), 1);

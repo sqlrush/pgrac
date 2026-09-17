@@ -100,16 +100,13 @@ UT_TEST(test_pu01_invalid_scn_normal_page_blocked)
 
 	/* InvalidScn containment: BLOCKED, never a version success. */
 	UT_ASSERT(!cluster_page_version_valid(&result_invalid));
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result_invalid, &trusted),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result_invalid, &trusted),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 	/* An invalid expected-before or current is equally BLOCKED. */
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 NULL, &expected, &current, NULL),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, NULL, &current, NULL),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(NULL, &expected, &current, NULL),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, NULL, &current, NULL),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 }
 
 UT_TEST(test_pu02_expected_before_exact_match_applies)
@@ -124,14 +121,12 @@ UT_TEST(test_pu02_expected_before_exact_match_applies)
 	result = ut_version(7, 101);
 	trusted = ut_version(7, 50);
 
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, &trusted),
-				 (int) CLUSTER_PAGE_APPLY_APPLY);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, &trusted),
+				 (int)CLUSTER_PAGE_APPLY_APPLY);
 	/* The trusted source is irrelevant when it does not equal the result:
 	 * exact expected-before match still admits the apply. */
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, NULL),
-				 (int) CLUSTER_PAGE_APPLY_APPLY);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, NULL),
+				 (int)CLUSTER_PAGE_APPLY_APPLY);
 }
 
 UT_TEST(test_pu03_expected_before_mismatch_blocked)
@@ -144,16 +139,14 @@ UT_TEST(test_pu03_expected_before_mismatch_blocked)
 	expected = ut_version(7, 99); /* mismatch on the token */
 	result = ut_version(7, 101);
 
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, NULL),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, NULL),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 	/* Different incarnation with the "same" SCN-shaped token is a mismatch
 	 * too (PU-06): incarnation participates in exact equality. */
 	current = ut_version(8, 100);
 	expected = ut_version(7, 100);
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, NULL),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, NULL),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 }
 
 UT_TEST(test_pu04_trusted_exact_result_skips)
@@ -170,9 +163,8 @@ UT_TEST(test_pu04_trusted_exact_result_skips)
 
 	/* Trusted result-version skip (shape 1): zero apply, even though the
 	 * working version does not match expected_before. */
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, &trusted),
-				 (int) CLUSTER_PAGE_APPLY_SKIP);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, &trusted),
+				 (int)CLUSTER_PAGE_APPLY_SKIP);
 }
 
 UT_TEST(test_pu05_numeric_higher_with_gap_no_skip)
@@ -191,17 +183,15 @@ UT_TEST(test_pu05_numeric_higher_with_gap_no_skip)
 	result = ut_version(7, 101);
 	trusted = ut_version(7, 99);
 
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, &trusted),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, &trusted),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 
 	/* A numerically-higher CURRENT also proves nothing: exact equality is
 	 * the only predicate. */
 	current = ut_version(7, 200);
 	expected = ut_version(7, 5);
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, NULL),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, NULL),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 }
 
 UT_TEST(test_pu06_same_scn_different_incarnation_mismatch)
@@ -218,9 +208,8 @@ UT_TEST(test_pu06_same_scn_different_incarnation_mismatch)
 	result = ut_version(11, 556);
 
 	UT_ASSERT(!cluster_page_version_equal(&current, &expected));
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, NULL),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, NULL),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 
 	/* A different physical identity is likewise never equal. */
 	{
@@ -252,7 +241,7 @@ UT_TEST(test_version_identity_helpers)
 	v = ut_version(7, 100);
 	UT_ASSERT(cluster_page_version_valid(&v));
 	UT_ASSERT(cluster_page_version_equal(&v, &v));
-	UT_ASSERT(!cluster_page_version_valid(&(ClusterPageVersion){0}));
+	UT_ASSERT(!cluster_page_version_valid(&(ClusterPageVersion){ 0 }));
 	{
 		ClusterPageVersion inv = v;
 
@@ -280,7 +269,7 @@ ut_classify_input(void)
 	ClusterPageClassifyInput in;
 
 	memset(&in, 0, sizeof(in));
-	in.rmid = 250;			   /* deliberately unregistered by default */
+	in.rmid = 250; /* deliberately unregistered by default */
 	in.opcode = 0x10;
 	in.forknum = MAIN_FORKNUM;
 	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_NONE;
@@ -293,11 +282,9 @@ UT_TEST(test_pu07_unknown_rmid_opcode_default_blocked)
 
 	/* Unknown rmid/opcode on a main-fork persistent page: UNKNOWN -> the
 	 * caller must fail closed (mutation=0). */
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 	/* NULL input is UNKNOWN too. */
-	UT_ASSERT_EQ((int) cluster_page_classify(NULL),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(NULL), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
 UT_TEST(test_pu08_normal_persistent_page_chain_required)
@@ -315,8 +302,7 @@ UT_TEST(test_pu08_normal_persistent_page_chain_required)
 	UT_ASSERT(cluster_page_class_is_known_opcode(9, 0x20));
 	in.rmid = 9;
 	in.opcode = 0x20;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_NORMAL);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_NORMAL);
 
 	/* NORMAL requires the full PageVersion before/result chain: with any
 	 * invalid member the admission decision is BLOCKED (no chain -> no
@@ -324,13 +310,11 @@ UT_TEST(test_pu08_normal_persistent_page_chain_required)
 	current = ut_version(7, 100);
 	expected = ut_version(7, 100);
 	result = ut_version(7, 101);
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, &result, NULL),
-				 (int) CLUSTER_PAGE_APPLY_APPLY);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, &result, NULL),
+				 (int)CLUSTER_PAGE_APPLY_APPLY);
 	/* Missing result (chain not produced) -> BLOCKED. */
-	UT_ASSERT_EQ((int) cluster_page_version_decide(
-					 &current, &expected, NULL, NULL),
-				 (int) CLUSTER_PAGE_APPLY_BLOCKED);
+	UT_ASSERT_EQ((int)cluster_page_version_decide(&current, &expected, NULL, NULL),
+				 (int)CLUSTER_PAGE_APPLY_BLOCKED);
 }
 
 UT_TEST(test_pu13_fsm_rebuildable_class)
@@ -340,16 +324,13 @@ UT_TEST(test_pu13_fsm_rebuildable_class)
 	in.forknum = FSM_FORKNUM;
 	/* FSM is the approved deviation: rebuildable hint cache, never generic
 	 * redo apply — classified without any rmgr registration. */
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_REBUILDABLE);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_REBUILDABLE);
 	/* FSM + image/init/cleanout attributes are ambiguous -> UNKNOWN. */
 	in.has_full_page_image = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 	in.has_full_page_image = false;
 	in.has_will_init = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
 UT_TEST(test_pu14_header_routes_to_typed_owner)
@@ -357,17 +338,14 @@ UT_TEST(test_pu14_header_routes_to_typed_owner)
 	ClusterPageClassifyInput in = ut_classify_input();
 
 	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_ROOT;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_HEADER);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_HEADER);
 	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_SIDE;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_HEADER);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_HEADER);
 	/* A header declaration combined with temp/FSM/new/image is ambiguous
 	 * -> UNKNOWN (multi-match). */
 	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_PG_CORE;
 	in.forknum = INIT_FORKNUM;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
 UT_TEST(test_pu17_will_init_without_rule_blocked)
@@ -377,12 +355,10 @@ UT_TEST(test_pu17_will_init_without_rule_blocked)
 	/* WILL_INIT alone never authorizes initialization; no exact rmgr
 	 * full-init rule is registered, so the class is UNKNOWN (BLOCKED). */
 	in.has_will_init = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 	/* FPI + WILL_INIT is a multi-match -> UNKNOWN as well. */
 	in.has_full_page_image = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
 UT_TEST(test_classifier_remaining_rows_closed)
@@ -391,61 +367,52 @@ UT_TEST(test_classifier_remaining_rows_closed)
 
 	/* PC-TEMP: temp fork or temp-scoped relation. */
 	in.forknum = INIT_FORKNUM;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_TEMP);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_TEMP);
 	in.forknum = MAIN_FORKNUM;
 	in.relation_is_temp = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_TEMP);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_TEMP);
 	in.relation_is_temp = false;
 
 	/* PC-FULLIMAGE: FPI is an image payload row (lineage admission is the
 	 * apply layer's). */
 	in.has_full_page_image = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_FULLIMAGE);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_FULLIMAGE);
 	in.has_full_page_image = false;
 
 	/* PC-NEW: absent or uninitialized page. */
 	in.page_absent = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_NEW);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_NEW);
 	in.page_absent = false;
 	in.page_is_new = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_NEW);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_NEW);
 	in.page_is_new = false;
 
 	/* PC-CLEANOUT / PC-NONLOGGED: declared classes (recovery action stays
 	 * BLOCKED until producer + exact codec census land, PGDEL-02/06). */
 	in.is_cleanout = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_CLEANOUT);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_CLEANOUT);
 	in.is_cleanout = false;
 	in.relation_is_unlogged = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_NONLOGGED);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_NONLOGGED);
 	in.relation_is_unlogged = false;
 
 	/* Cleanout/nonlogged combined with image/init is ambiguous. */
 	in.is_cleanout = true;
 	in.has_will_init = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
 UT_TEST(test_known_opcode_registry_fail_closed)
 {
-	uint8		rmid = 200;
-	int			i;
+	uint8 rmid = 200;
+	int i;
 
 	/* Fixed capacity: registration is refused once the table is full
 	 * (fail-closed) — an overflow must never silently admit.  Run LAST:
 	 * it fills the registry.  (One earlier test registered (9, 0x20), so
 	 * 63 more entries fill the 64-slot table.) */
 	for (i = 0; i < 63; i++)
-		UT_ASSERT(cluster_page_class_register_known_opcode(rmid,
-														   (uint16) (0x100 + i)));
+		UT_ASSERT(cluster_page_class_register_known_opcode(rmid, (uint16)(0x100 + i)));
 	UT_ASSERT(!cluster_page_class_register_known_opcode(rmid, 0x7fff));
 	/* Idempotent re-registration still succeeds. */
 	UT_ASSERT(cluster_page_class_register_known_opcode(rmid, 0x100));

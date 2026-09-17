@@ -34,8 +34,7 @@ cluster_side_space_metadata_mutation_allowed(ClusterSideSpaceKind kind)
 	 * API (U-SIDE-18: the STOP cannot be turned off by config or test).
 	 * "never raise shmem and call complete" (spec §3.2 HW row).
 	 */
-	if (kind != CLUSTER_SIDE_SPACE_HWM
-		&& kind != CLUSTER_SIDE_SPACE_EXTENT
+	if (kind != CLUSTER_SIDE_SPACE_HWM && kind != CLUSTER_SIDE_SPACE_EXTENT
 		&& kind != CLUSTER_SIDE_SPACE_BITMAP)
 		return false;
 	return false;
@@ -57,10 +56,9 @@ cluster_side_space_metadata_page_verdict(ClusterSideSpaceKind kind,
 	 * result; expected-before apply only on an exact match).  The kind
 	 * is validated for the contract but does not change the maths.
 	 */
-	if (kind != CLUSTER_SIDE_SPACE_HWM
-		&& kind != CLUSTER_SIDE_SPACE_EXTENT
+	if (kind != CLUSTER_SIDE_SPACE_HWM && kind != CLUSTER_SIDE_SPACE_EXTENT
 		&& kind != CLUSTER_SIDE_SPACE_BITMAP)
 		return CLUSTER_PAGE_APPLY_BLOCKED;
-	return cluster_page_version_decide(current_working, expected_before,
-									   result_version, trusted_source_version);
+	return cluster_page_version_decide(current_working, expected_before, result_version,
+									   trusted_source_version);
 }

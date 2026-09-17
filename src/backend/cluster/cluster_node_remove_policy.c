@@ -161,8 +161,7 @@ cluster_node_remove_request_result_str(ClusterRemoveRequestResult r)
 }
 
 bool
-cluster_node_remove_startup_serving_allows(bool authority_managed,
-										 bool serving_ready)
+cluster_node_remove_startup_serving_allows(bool authority_managed, bool serving_ready)
 {
 	return !authority_managed || serving_ready;
 }

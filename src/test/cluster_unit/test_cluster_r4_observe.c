@@ -107,8 +107,8 @@ cluster_semantic_activation_leave(ClusterSemanticAdmissionToken *token)
 bool
 cluster_bufmgr_copy_block_for_r4_cr(BufferTag tag pg_attribute_unused(),
 									SCN expected_page_scn pg_attribute_unused(),
-									XLogRecPtr *page_lsn_out, SCN *page_scn_out,
-									char *dst, ClusterBufmgrGcsCopyRefusal *refusal_out)
+									XLogRecPtr *page_lsn_out, SCN *page_scn_out, char *dst,
+									ClusterBufmgrGcsCopyRefusal *refusal_out)
 {
 	if (page_lsn_out != NULL)
 		*page_lsn_out = (XLogRecPtr)1;
@@ -133,8 +133,7 @@ cluster_cr_construct_page_for_server(const char *cur_page pg_attribute_unused(),
 
 void
 FlushErrorState(void)
-{
-}
+{}
 
 void
 pg_re_throw(void)
@@ -188,12 +187,10 @@ UT_TEST(test_event_domain_is_exact_and_adapter_is_one_to_one)
 	UT_ASSERT_EQ(CLUSTER_R4_EVENT_COUNT, 9);
 	UT_ASSERT_EQ(CLUSTER_R4_OBSERVATION_EVENT_COUNT, 71);
 	for (i = 0; i < CLUSTER_R4_OBSERVATION_EVENT_COUNT; i++)
-		cluster_r4_observe((ClusterR4Event)i, CLUSTER_TX_RESOLVE_NONE,
-						   CLUSTER_CR_BUILD_NONE);
+		cluster_r4_observe((ClusterR4Event)i, CLUSTER_TX_RESOLVE_NONE, CLUSTER_CR_BUILD_NONE);
 	for (i = 0; i < CLUSTER_R4_OBSERVATION_EVENT_COUNT; i++)
 		UT_ASSERT_EQ(observed[i], 1);
-	cluster_r4_observe((ClusterR4Event)-1, CLUSTER_TX_RESOLVE_PROTOCOL,
-					   CLUSTER_CR_BUILD_PROTOCOL);
+	cluster_r4_observe((ClusterR4Event)-1, CLUSTER_TX_RESOLVE_PROTOCOL, CLUSTER_CR_BUILD_PROTOCOL);
 	cluster_r4_observe((ClusterR4Event)CLUSTER_R4_OBSERVATION_EVENT_COUNT,
 					   CLUSTER_TX_RESOLVE_PROTOCOL, CLUSTER_CR_BUILD_PROTOCOL);
 	UT_ASSERT_EQ(observation_total(), CLUSTER_R4_OBSERVATION_EVENT_COUNT);
@@ -201,13 +198,12 @@ UT_TEST(test_event_domain_is_exact_and_adapter_is_one_to_one)
 
 UT_TEST(test_holder_full_is_observed_after_accepted_build)
 {
-	BufferTag tag = {0};
+	BufferTag tag = { 0 };
 	char page[BLCKSZ];
 	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_PROTOCOL;
 
 	reset_fixture();
-	UT_ASSERT_EQ(cluster_cr_build_on_holder(&tag, (SCN)1, page, &reason),
-				 CLUSTER_CR_BUILD_FULL);
+	UT_ASSERT_EQ(cluster_cr_build_on_holder(&tag, (SCN)1, page, &reason), CLUSTER_CR_BUILD_FULL);
 	UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
 	UT_ASSERT_EQ(observed[CLUSTER_R4_EVENT_CR_HOLDER_FULL], 1);
 	UT_ASSERT_EQ(observation_total(), 1);
@@ -218,7 +214,7 @@ UT_TEST(test_holder_full_is_observed_after_accepted_build)
 
 UT_TEST(test_holder_retry_is_observed_with_typed_reason)
 {
-	BufferTag tag = {0};
+	BufferTag tag = { 0 };
 	char page[BLCKSZ];
 	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
 
@@ -247,7 +243,7 @@ UT_TEST(test_holder_nonretryable_failure_is_observed)
 
 UT_TEST(test_holder_admission_refusal_is_not_an_event)
 {
-	BufferTag tag = {0};
+	BufferTag tag = { 0 };
 	char page[BLCKSZ];
 	ClusterCrBuildReason reason = CLUSTER_CR_BUILD_NONE;
 

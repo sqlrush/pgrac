@@ -174,8 +174,8 @@ cluster_undo_record_slot_index_valid(uint16 slot_count, uint16 row_offset)
 
 
 static inline bool
-cluster_undo_record_slot_range_valid(uint16 slot_count, uint16 row_offset,
-									 uint32 record_offset, uint16 record_length)
+cluster_undo_record_slot_range_valid(uint16 slot_count, uint16 row_offset, uint32 record_offset,
+									 uint16 record_length)
 {
 	uint64 directory_bytes = (uint64)slot_count * sizeof(UndoSlotDirEntry);
 	uint64 record_end = (uint64)record_offset + (uint64)record_length;

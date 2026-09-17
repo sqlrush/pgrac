@@ -1391,8 +1391,9 @@ claim_retry_locked:
 		PG_CATCH();
 		{
 			pgstat_report_wait_end();
-			LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
+			/* ERROR resets InterruptHoldoffCount. The outer transaction
+			 * handler releases LWLocks with LWLockReleaseAll, not retail
+			 * LWLockRelease calls from this rethrow-only handler. */
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -1425,7 +1426,6 @@ claim_retry_locked:
 			PG_CATCH();
 			{
 				pgstat_report_wait_end();
-				LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
@@ -1474,7 +1474,6 @@ claim_retry_locked:
 			}
 			PG_CATCH();
 			{
-				LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 				PG_RE_THROW();
 			}
 			PG_END_TRY();
@@ -1524,7 +1523,6 @@ claim_retry_locked:
 		}
 		PG_CATCH();
 		{
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -3512,6 +3510,11 @@ cluster_undo_autoextend_count(void)
  *	cluster_tt_slot_current_segment / cluster_tt_slot_rollover) -- never the
  *	reverse.  The retention horizon (ProcArrayLock) is computed by the caller
  *	BEFORE this call and is not held across it.
+ *
+ *	On ERROR, the transaction error handler owns LWLockReleaseAll. ERROR has
+ *	already reset InterruptHoldoffCount, so rethrow handlers must not call
+ *	LWLockRelease on the allocator locks. Normal return paths still release
+ *	their exact locks below.
  */
 uint32
 cluster_undo_tt_rollover_locked(int node_id, uint32 old_segment_id, bool *out_at_hard_cap)
@@ -3551,8 +3554,6 @@ rollover_retry_locked:
 	}
 	PG_CATCH();
 	{
-		LWLockRelease(&UndoRecordShared->lifecycle_lock.lock);
-		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -3587,7 +3588,6 @@ rollover_retry_locked:
 		}
 		PG_CATCH();
 		{
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();
@@ -3630,7 +3630,6 @@ rollover_retry_locked:
 	}
 	PG_CATCH();
 	{
-		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -3669,7 +3668,6 @@ rollover_retry_locked:
 	}
 	PG_CATCH();
 	{
-		LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -3740,7 +3738,6 @@ rollover_retry_locked:
 		}
 		PG_CATCH();
 		{
-			LWLockRelease(&UndoRecordShared->cursor_lock.lock);
 			PG_RE_THROW();
 		}
 		PG_END_TRY();

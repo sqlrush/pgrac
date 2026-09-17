@@ -24,21 +24,19 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
 /* This binary links stable-base only for shared key helpers.  Keep every
  * external authority seam fail closed if its owner branch becomes reachable. */
 ClusterControlRootResult
-cluster_control_root_revalidate(
-	const ClusterControlRootReadToken *token pg_attribute_unused(),
-	const ClusterControlRootIdentity *expected_identity pg_attribute_unused(),
-	ClusterControlRootSnapshot *out_snapshot pg_attribute_unused())
+cluster_control_root_revalidate(const ClusterControlRootReadToken *token pg_attribute_unused(),
+								const ClusterControlRootIdentity *expected_identity
+									pg_attribute_unused(),
+								ClusterControlRootSnapshot *out_snapshot pg_attribute_unused())
 {
 	return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
@@ -77,8 +75,7 @@ cluster_wal_retention_pin_preflight_revalidate_wait_v1(
 }
 
 ClusterWalPinResult
-cluster_wal_retention_pin_revalidate(
-	ClusterWalRetentionPin *pin pg_attribute_unused())
+cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin pg_attribute_unused())
 {
 	return CLUSTER_WAL_PIN_STALE;
 }
@@ -121,23 +118,20 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 }
 
 bool
-errstart_cold(int elevel pg_attribute_unused(),
-			  const char *domain pg_attribute_unused())
+errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
 {
 	return false;
 }
 
 void
-errfinish(const char *filename pg_attribute_unused(),
-		  int lineno pg_attribute_unused(),
+errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{
-}
+{}
 
 static void
 fill_bytes(uint8 bytes[16], uint8 seed)
 {
-	int			i;
+	int i;
 
 	for (i = 0; i < 16; i++)
 		bytes[i] = seed + i;
@@ -266,12 +260,11 @@ UT_TEST(test_explicit_cache_loss_is_safe_miss)
 UT_TEST(test_capacity_exhaustion_is_safe_miss)
 {
 	RfPageAnchorCacheKeyV1 key;
-	int			i;
+	int i;
 
 	rf_page_anchor_cache_forget_all_v1();
-	for (i = 0; i < RF_PAGE_ANCHOR_CACHE_CAPACITY; i++)
-	{
-		key = make_key((BlockNumber) i + 1);
+	for (i = 0; i < RF_PAGE_ANCHOR_CACHE_CAPACITY; i++) {
+		key = make_key((BlockNumber)i + 1);
 		UT_ASSERT(rf_page_anchor_cache_record_v1(&key, true, true));
 	}
 	key = make_key(999);
@@ -295,11 +288,10 @@ UT_TEST(test_invalid_key_never_earns_credit)
 UT_TEST(test_cache_miss_adds_explicit_force_flag)
 {
 	RfPageAnchorCacheKeyV1 key = make_key(1);
-	uint8		flags;
+	uint8 flags;
 
 	rf_page_anchor_cache_forget_all_v1();
-	flags = rf_page_anchor_cache_registration_flags_v1(&key,
-		REGBUF_WILL_INIT | REGBUF_STANDARD);
+	flags = rf_page_anchor_cache_registration_flags_v1(&key, REGBUF_WILL_INIT | REGBUF_STANDARD);
 	UT_ASSERT((flags & REGBUF_FORCE_IMAGE) != 0);
 	UT_ASSERT((flags & REGBUF_WILL_INIT) == REGBUF_WILL_INIT);
 }
@@ -307,12 +299,11 @@ UT_TEST(test_cache_miss_adds_explicit_force_flag)
 UT_TEST(test_cache_hit_preserves_caller_flags)
 {
 	RfPageAnchorCacheKeyV1 key = make_key(1);
-	uint8		flags = REGBUF_STANDARD;
+	uint8 flags = REGBUF_STANDARD;
 
 	rf_page_anchor_cache_forget_all_v1();
 	UT_ASSERT(rf_page_anchor_cache_record_v1(&key, true, true));
-	UT_ASSERT_EQ(rf_page_anchor_cache_registration_flags_v1(&key, flags),
-		flags);
+	UT_ASSERT_EQ(rf_page_anchor_cache_registration_flags_v1(&key, flags), flags);
 }
 
 UT_TEST(test_anchor_key_binds_exact_registered_block)
@@ -320,29 +311,23 @@ UT_TEST(test_anchor_key_binds_exact_registered_block)
 	RfPageAnchorCacheKeyV1 key = make_key(11);
 	RelFileLocator locator = key.page_identity.locator;
 
-	UT_ASSERT(rf_page_anchor_cache_block_matches_v1(&key, &locator,
-		MAIN_FORKNUM, 11));
+	UT_ASSERT(rf_page_anchor_cache_block_matches_v1(&key, &locator, MAIN_FORKNUM, 11));
 	locator.relNumber++;
-	UT_ASSERT(!rf_page_anchor_cache_block_matches_v1(&key, &locator,
-		MAIN_FORKNUM, 11));
+	UT_ASSERT(!rf_page_anchor_cache_block_matches_v1(&key, &locator, MAIN_FORKNUM, 11));
 	locator = key.page_identity.locator;
-	UT_ASSERT(!rf_page_anchor_cache_block_matches_v1(&key, &locator,
-		FSM_FORKNUM, 11));
-	UT_ASSERT(!rf_page_anchor_cache_block_matches_v1(&key, &locator,
-		MAIN_FORKNUM, 12));
+	UT_ASSERT(!rf_page_anchor_cache_block_matches_v1(&key, &locator, FSM_FORKNUM, 11));
+	UT_ASSERT(!rf_page_anchor_cache_block_matches_v1(&key, &locator, MAIN_FORKNUM, 12));
 }
 
 UT_TEST(test_anchor_key_binds_exact_result_incarnation)
 {
 	RfPageAnchorCacheKeyV1 key = make_key(11);
-	uint8		incarnation[16];
+	uint8 incarnation[16];
 
 	memcpy(incarnation, key.segment_incarnation, 16);
-	UT_ASSERT(rf_page_anchor_cache_incarnation_matches_v1(&key,
-		incarnation));
+	UT_ASSERT(rf_page_anchor_cache_incarnation_matches_v1(&key, incarnation));
 	incarnation[15] ^= 0x80;
-	UT_ASSERT(!rf_page_anchor_cache_incarnation_matches_v1(&key,
-		incarnation));
+	UT_ASSERT(!rf_page_anchor_cache_incarnation_matches_v1(&key, incarnation));
 	UT_ASSERT(!rf_page_anchor_cache_incarnation_matches_v1(&key, NULL));
 }
 

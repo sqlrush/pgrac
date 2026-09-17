@@ -14,11 +14,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -46,14 +44,13 @@ make_ordinary(RfPageVersionEdgeEntryV1 *entry, uint8 block_id)
 }
 
 static bool
-encode_entries(uint64 result_token, RfPageVersionEdgeEntryV1 *entries,
-			   uint8 entry_count, uint8 *wire, Size capacity,
-			   Size *wire_size)
+encode_entries(uint64 result_token, RfPageVersionEdgeEntryV1 *entries, uint8 entry_count,
+			   uint8 *wire, Size capacity, Size *wire_size)
 {
 	memset(wire, 0xa5, capacity);
 	*wire_size = SIZE_MAX;
-	return XLogEncodePageVersionEdgeV1(wire, capacity, result_token,
-		entries, entry_count, wire_size);
+	return XLogEncodePageVersionEdgeV1(wire, capacity, result_token, entries, entry_count,
+									   wire_size);
 }
 
 UT_TEST(test_successor_literals_and_layout)
@@ -80,8 +77,8 @@ UT_TEST(test_encoder_writes_exact_native_endian_offsets)
 	Size wire_size;
 
 	make_ordinary(&entry, 0);
-	UT_ASSERT(encode_entries(UINT64_C(0x1122334455667788), &entry, 1,
-		wire, sizeof(wire), &wire_size));
+	UT_ASSERT(
+		encode_entries(UINT64_C(0x1122334455667788), &entry, 1, wire, sizeof(wire), &wire_size));
 	UT_ASSERT_EQ(wire_size, 64);
 	UT_ASSERT_EQ(wire[0], 251);
 	UT_ASSERT_EQ(wire[1], 1);
@@ -91,10 +88,8 @@ UT_TEST(test_encoder_writes_exact_native_endian_offsets)
 	memcpy(&before_token, wire + 16 + 24, sizeof(before_token));
 	UT_ASSERT_EQ(token, UINT64_C(0x1122334455667788));
 	UT_ASSERT_EQ(before_token, 10);
-	UT_ASSERT(memcmp(wire + 16 + 8,
-		entry.before.segment_incarnation, 16) == 0);
-	UT_ASSERT(memcmp(wire + 16 + 32,
-		entry.result_incarnation, 16) == 0);
+	UT_ASSERT(memcmp(wire + 16 + 8, entry.before.segment_incarnation, 16) == 0);
+	UT_ASSERT(memcmp(wire + 16 + 32, entry.result_incarnation, 16) == 0);
 }
 
 UT_TEST(test_encoder_failure_leaves_outputs_untouched)
@@ -121,11 +116,9 @@ UT_TEST(test_encoder_accepts_exact_33_entry_maximum)
 
 	for (i = 0; i < 33; i++)
 		make_ordinary(&entries[i], i);
-	UT_ASSERT(encode_entries(17, entries, 33, wire, sizeof(wire),
-		&wire_size));
+	UT_ASSERT(encode_entries(17, entries, 33, wire, sizeof(wire), &wire_size));
 	UT_ASSERT_EQ(wire_size, XLR_PAGE_VERSION_EDGE_MAX_SIZE);
-	UT_ASSERT(!encode_entries(17, entries, 34, wire, sizeof(wire),
-		&wire_size));
+	UT_ASSERT(!encode_entries(17, entries, 34, wire, sizeof(wire), &wire_size));
 }
 
 UT_TEST(test_encoder_requires_sorted_unique_blocks_and_ordinals)
@@ -169,24 +162,19 @@ UT_TEST(test_encoder_accepts_only_exact_anchor_masks)
 	RfPageVersionEdgeEntryV1 entry;
 	uint8 wire[XLR_PAGE_VERSION_EDGE_MAX_SIZE];
 	Size wire_size;
-	uint16 valid[] = {UINT16_C(0x0005), UINT16_C(0x0006), UINT16_C(0x0007)};
-	uint16 invalid[] = {UINT16_C(0x0001), UINT16_C(0x0002),
-		UINT16_C(0x0004), UINT16_C(0x8000)};
+	uint16 valid[] = { UINT16_C(0x0005), UINT16_C(0x0006), UINT16_C(0x0007) };
+	uint16 invalid[] = { UINT16_C(0x0001), UINT16_C(0x0002), UINT16_C(0x0004), UINT16_C(0x8000) };
 	int i;
 
-	for (i = 0; i < lengthof(valid); i++)
-	{
+	for (i = 0; i < lengthof(valid); i++) {
 		make_ordinary(&entry, 0);
 		entry.edge_flags = valid[i];
-		UT_ASSERT(encode_entries(17, &entry, 1, wire, sizeof(wire),
-			&wire_size));
+		UT_ASSERT(encode_entries(17, &entry, 1, wire, sizeof(wire), &wire_size));
 	}
-	for (i = 0; i < lengthof(invalid); i++)
-	{
+	for (i = 0; i < lengthof(invalid); i++) {
 		make_ordinary(&entry, 0);
 		entry.edge_flags = invalid[i];
-		UT_ASSERT(!encode_entries(17, &entry, 1, wire, sizeof(wire),
-			&wire_size));
+		UT_ASSERT(!encode_entries(17, &entry, 1, wire, sizeof(wire), &wire_size));
 	}
 }
 
@@ -211,19 +199,15 @@ UT_TEST(test_encoder_validates_rebuildable_and_routed_entries)
 
 UT_TEST(test_explicit_anchor_force_has_total_precedence)
 {
-	uint8		force_will_init = REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT;
+	uint8 force_will_init = REGBUF_FORCE_IMAGE | REGBUF_WILL_INIT;
 
-	UT_ASSERT(XLogPageVersionImageRequiredV1(force_will_init, false,
-		InvalidXLogRecPtr, InvalidXLogRecPtr));
-	UT_ASSERT(XLogPageVersionImageRequiredV1(
-		REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE, false,
-		UINT64_C(900), UINT64_C(1)));
-	UT_ASSERT(!XLogPageVersionImageRequiredV1(REGBUF_NO_IMAGE, true,
-		UINT64_C(1), UINT64_C(900)));
-	UT_ASSERT(!XLogPageVersionImageRequiredV1(0, false,
-		UINT64_C(1), UINT64_C(900)));
-	UT_ASSERT(XLogPageVersionImageRequiredV1(0, true,
-		UINT64_C(1), UINT64_C(900)));
+	UT_ASSERT(XLogPageVersionImageRequiredV1(force_will_init, false, InvalidXLogRecPtr,
+											 InvalidXLogRecPtr));
+	UT_ASSERT(XLogPageVersionImageRequiredV1(REGBUF_FORCE_IMAGE | REGBUF_NO_IMAGE, false,
+											 UINT64_C(900), UINT64_C(1)));
+	UT_ASSERT(!XLogPageVersionImageRequiredV1(REGBUF_NO_IMAGE, true, UINT64_C(1), UINT64_C(900)));
+	UT_ASSERT(!XLogPageVersionImageRequiredV1(0, false, UINT64_C(1), UINT64_C(900)));
+	UT_ASSERT(XLogPageVersionImageRequiredV1(0, true, UINT64_C(1), UINT64_C(900)));
 }
 
 int

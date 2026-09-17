@@ -64,6 +64,7 @@
  * PGRAC MODIFICATIONS
  *	  Modified by: SqlRush <sqlrush@gmail.com>
  *	  Preserve request-owned scratch verdict metadata for selection-miss logs.
+ *	  Compile cluster-only scratch proof helpers only in cluster builds.
  *
  *	  Cluster MVCC visibility fork: tuples carrying cluster ITL evidence are
  *	  resolved through the cluster TT/undo authority instead of native
@@ -1993,6 +1994,7 @@ cluster_remote_live_xmax_keeps_visible(Buffer buffer, HeapTupleHeader tuple, Sna
 }
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
 /*
  * Fail closed when a FULL R4 page does not carry a complete, authoritative
  * visibility proof.  This evaluator deliberately has no Buffer argument:
@@ -2034,7 +2036,6 @@ cluster_r4_scratch_creator_slot(Page page, uint8 writer_index, TransactionId xmi
 	return writer_index;
 }
 
-#ifdef USE_PGRAC_CLUSTER
 /* Observe already validated private bytes; no authority or page mutation. */
 static ClusterR4ScratchObservation *
 cluster_r4_scratch_observe(const ClusterR4HotScratchTestContext *context, HeapTuple tuple)

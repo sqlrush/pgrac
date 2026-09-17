@@ -69,7 +69,8 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 
 ClusterSemanticAdmissionResult
 cluster_multixact_source_dispatch(ClusterMultiXactSourceOp op pg_attribute_unused(),
-								  const ClusterMultiXactSourceRequest *request pg_attribute_unused(),
+								  const ClusterMultiXactSourceRequest *request
+									  pg_attribute_unused(),
 								  ClusterMultiXactSourceResult *result pg_attribute_unused())
 {
 	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
@@ -106,9 +107,9 @@ cluster_multixact_get_resolve_visibility_count(void)
 }
 
 ClusterSemanticAdmissionResult
-cluster_tt_status_hint_source_dispatch(
-	ClusterTTStatusHintSourceOp op pg_attribute_unused(),
-	const ClusterTTStatusHintSourceRequest *request pg_attribute_unused())
+cluster_tt_status_hint_source_dispatch(ClusterTTStatusHintSourceOp op pg_attribute_unused(),
+									   const ClusterTTStatusHintSourceRequest *request
+										   pg_attribute_unused())
 {
 	return CLUSTER_SEMANTIC_ADMISSION_CLOSED;
 }

@@ -87,9 +87,9 @@ typedef struct ClusterGcsBlockDedupShard {
 	pg_atomic_uint64 done_marked_count;	  /* identity-verified DONE stamped */
 	pg_atomic_uint64 done_mismatch_count; /* DONE dropped: miss / identity / in-flight */
 	/* GCS-race round-2 review F5 (calibration 2): registration routing. */
-	pg_atomic_uint64 hint_violation_count;	 /* capable peer, hint 0 / over-max: denied */
-	pg_atomic_uint64 legacy_pin_count;		 /* no-capability peer: protocol-max pin */
-	pg_atomic_uint32 entry_count;			 /* live in-flight + completed entries */
+	pg_atomic_uint64 hint_violation_count; /* capable peer, hint 0 / over-max: denied */
+	pg_atomic_uint64 legacy_pin_count;	   /* no-capability peer: protocol-max pin */
+	pg_atomic_uint32 entry_count;		   /* live in-flight + completed entries */
 } ClusterGcsBlockDedupShard;
 
 typedef struct ClusterGcsBlockDedupCtl {
@@ -474,17 +474,13 @@ dedup_note_validation_failure(ClusterGcsBlockDedupShard *shard)
 }
 
 static bool
-dedup_r4_route_proof_equal(const ClusterR4CrRouteProof *left,
-						   const ClusterR4CrRouteProof *right)
+dedup_r4_route_proof_equal(const ClusterR4CrRouteProof *left, const ClusterR4CrRouteProof *right)
 {
-	return left != NULL && right != NULL
-		   && memcmp(&left->tag, &right->tag, sizeof(BufferTag)) == 0
-		   && left->read_scn == right->read_scn
-		   && left->formation_epoch == right->formation_epoch
+	return left != NULL && right != NULL && memcmp(&left->tag, &right->tag, sizeof(BufferTag)) == 0
+		   && left->read_scn == right->read_scn && left->formation_epoch == right->formation_epoch
 		   && left->activation_generation == right->activation_generation
 		   && left->master_authority_generation == right->master_authority_generation
-		   && left->master_resource_transition_count
-			  == right->master_resource_transition_count
+		   && left->master_resource_transition_count == right->master_resource_transition_count
 		   && left->expected_page_scn == right->expected_page_scn
 		   && left->real_master_node == right->real_master_node
 		   && left->selected_holder_node == right->selected_holder_node;
@@ -492,8 +488,7 @@ dedup_r4_route_proof_equal(const ClusterR4CrRouteProof *left,
 
 static bool
 dedup_r4_route_identity_equal(const GcsBlockDedupEntry *entry,
-							  const GcsBlockR4RouteIdentity *identity,
-							  uint8 transition_id)
+							  const GcsBlockR4RouteIdentity *identity, uint8 transition_id)
 {
 	const ClusterR4CrRouteProof *stored = &entry->payload_meta.r4_route.proof;
 
@@ -508,22 +503,18 @@ static bool
 dedup_r4_route_input_valid(const GcsBlockR4RouteIdentity *identity, uint8 transition_id,
 						   const ClusterR4CrRouteProof *proof)
 {
-	return identity != NULL && proof != NULL
-		   && identity->legacy_key.request_id != 0
+	return identity != NULL && proof != NULL && identity->legacy_key.request_id != 0
 		   && identity->legacy_key.requester_backend_id > 0
 		   && identity->legacy_key.origin_node_id < RESOURCE_X_PROTOCOL_NODE_LIMIT
-		   && identity->activation_generation != 0
-		   && SCN_VALID(identity->read_scn)
+		   && identity->activation_generation != 0 && SCN_VALID(identity->read_scn)
 		   && memcmp(&identity->tag, &proof->tag, sizeof(BufferTag)) == 0
 		   && proof->read_scn == identity->read_scn
 		   && proof->formation_epoch == identity->legacy_key.cluster_epoch
 		   && proof->activation_generation == identity->activation_generation
 		   && (uint32)proof->master_authority_generation != 0
-		   && (uint32)(proof->master_authority_generation >> 32)
-			  == (uint32)proof->formation_epoch
+		   && (uint32)(proof->master_authority_generation >> 32) == (uint32)proof->formation_epoch
 		   && proof->master_resource_transition_count != 0
-		   && proof->master_resource_transition_count != UINT64_MAX
-		   && proof->real_master_node >= 0
+		   && proof->master_resource_transition_count != UINT64_MAX && proof->real_master_node >= 0
 		   && proof->real_master_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
 		   && proof->selected_holder_node >= 0
 		   && proof->selected_holder_node < RESOURCE_X_PROTOCOL_NODE_LIMIT;
@@ -570,8 +561,8 @@ dedup_r4_route_reclaim_safe(const GcsBlockDedupEntry *entry, const instr_time *n
 	if (now == NULL || !dedup_r4_route_anchor_load(anchor_slot, &anchor))
 		return false;
 
-	deadline_us = entry->pinned_lifetime_us > 0 ? entry->pinned_lifetime_us
-											 : fallback_out_of_window_us;
+	deadline_us
+		= entry->pinned_lifetime_us > 0 ? entry->pinned_lifetime_us : fallback_out_of_window_us;
 	/* R4 timestamps are monotonic anchors, including terminal DONE.  A
 	 * completed requester no longer retransmits this physical request, but
 	 * retain its route through the same pinned quarantine as ordinary DONE. */
@@ -584,21 +575,17 @@ dedup_r4_route_reclaim_safe(const GcsBlockDedupEntry *entry, const instr_time *n
 	INSTR_TIME_SUBTRACT(elapsed, anchor);
 	if (INSTR_TIME_GET_NANOSEC(elapsed) < 0)
 		return false;
-	return deadline_us > 0
-		   && INSTR_TIME_GET_MICROSEC(elapsed) > (uint64)deadline_us;
+	return deadline_us > 0 && INSTR_TIME_GET_MICROSEC(elapsed) > (uint64)deadline_us;
 }
 
 static bool
 dedup_entry_reclaim_safe(const GcsBlockDedupEntry *entry, TimestampTz wall_now,
-						 const instr_time *route_now,
-						 int64 fallback_out_of_window_us)
+						 const instr_time *route_now, int64 fallback_out_of_window_us)
 {
 	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_GENERIC)
-		return GcsBlockDedupEntryIsReclaimSafe(entry, wall_now,
-											 fallback_out_of_window_us);
+		return GcsBlockDedupEntryIsReclaimSafe(entry, wall_now, fallback_out_of_window_us);
 	if (entry->entry_kind == GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE)
-		return dedup_r4_route_reclaim_safe(entry, route_now,
-											 fallback_out_of_window_us);
+		return dedup_r4_route_reclaim_safe(entry, route_now, fallback_out_of_window_us);
 	return false;
 }
 
@@ -784,8 +771,7 @@ cluster_gcs_block_dedup_r4_route_arm_or_match(
 
 	if (record_out != NULL)
 		memset(record_out, 0, sizeof(*record_out));
-	if (record_out == NULL
-		|| !dedup_r4_route_input_valid(identity, transition_id, fresh_proof))
+	if (record_out == NULL || !dedup_r4_route_input_valid(identity, transition_id, fresh_proof))
 		return GCS_BLOCK_R4_ROUTE_ARM_INVALID;
 	if (lifetime_hint_trusted
 		&& (requester_lifetime_hint_ms == 0
@@ -833,12 +819,11 @@ cluster_gcs_block_dedup_r4_route_arm_or_match(
 		result = GCS_BLOCK_R4_ROUTE_ARM_FULL;
 		goto out;
 	}
-	entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key, HASH_ENTER_NULL,
-										&found);
+	entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key, HASH_ENTER_NULL, &found);
 	if (entry == NULL
 		&& dedup_reclaim_reclaimable_locked(shard, htab, GetCurrentTimestamp(), 1) > 0)
-		entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key,
-											 HASH_ENTER_NULL, &found);
+		entry = (GcsBlockDedupEntry *)hash_search(htab, &identity->legacy_key, HASH_ENTER_NULL,
+												  &found);
 	if (entry == NULL) {
 		result = GCS_BLOCK_R4_ROUTE_ARM_FULL;
 		goto out;
@@ -852,7 +837,7 @@ cluster_gcs_block_dedup_r4_route_arm_or_match(
 	entry->payload_meta.r4_route.state = GCS_BLOCK_R4_ROUTE_ROUTING;
 	dedup_r4_route_anchor_now(&entry->registered_at_ts);
 	pinned_lifetime_ms = lifetime_hint_trusted ? (int64)requester_lifetime_hint_ms
-										 : GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS;
+											   : GCS_BLOCK_DEDUP_MAX_PROTOCOL_LIFETIME_MS;
 	entry->pinned_lifetime_us = pinned_lifetime_ms * 1000 * 2;
 	entry->pinned_done_linger_us
 		= (int64)(cluster_gcs_reply_timeout_ms > 0 ? cluster_gcs_reply_timeout_ms : 5000) * 1000
@@ -867,9 +852,10 @@ out:
 }
 
 GcsBlockR4RouteSendResult
-cluster_gcs_block_dedup_r4_route_finish_send(
-	int worker_id, const GcsBlockR4RouteIdentity *identity, uint8 transition_id,
-	const ClusterR4CrRouteProof *armed_proof, bool outbound_admitted)
+cluster_gcs_block_dedup_r4_route_finish_send(int worker_id, const GcsBlockR4RouteIdentity *identity,
+											 uint8 transition_id,
+											 const ClusterR4CrRouteProof *armed_proof,
+											 bool outbound_admitted)
 {
 	ClusterGcsBlockDedupShard *shard;
 	HTAB *htab = NULL;
@@ -934,8 +920,7 @@ dedup_r4_route_remove_if(bool (*predicate)(const GcsBlockDedupEntry *, uint64), 
 		LWLockAcquire(&shard->lock.lock, LW_EXCLUSIVE);
 		hash_seq_init(&scan, htab);
 		while ((entry = (GcsBlockDedupEntry *)hash_seq_search(&scan)) != NULL) {
-			if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE
-				|| !predicate(entry, arg))
+			if (entry->entry_kind != GCS_BLOCK_DEDUP_ENTRY_R4_CR_ROUTE || !predicate(entry, arg))
 				continue;
 			(void)hash_search(htab, &entry->key, HASH_REMOVE, NULL);
 			removed++;

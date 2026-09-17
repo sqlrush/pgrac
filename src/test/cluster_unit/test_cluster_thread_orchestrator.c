@@ -210,8 +210,7 @@ UT_TEST(test_worker_terminal_state_done_only_for_done)
 {
 	ClusterThreadRecReplayState state = CLUSTER_THREADREC_REPLAY_IDLE;
 
-	UT_ASSERT(cluster_thread_recovery_worker_terminal_state(
-		CLUSTER_THREADREC_DONE, &state));
+	UT_ASSERT(cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_DONE, &state));
 	UT_ASSERT_EQ((int)state, (int)CLUSTER_THREADREC_REPLAY_DONE);
 }
 
@@ -219,8 +218,7 @@ UT_TEST(test_worker_terminal_state_blocked_is_blocked)
 {
 	ClusterThreadRecReplayState state = CLUSTER_THREADREC_REPLAY_IDLE;
 
-	UT_ASSERT(cluster_thread_recovery_worker_terminal_state(
-		CLUSTER_THREADREC_BLOCKED, &state));
+	UT_ASSERT(cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_BLOCKED, &state));
 	UT_ASSERT_EQ((int)state, (int)CLUSTER_THREADREC_REPLAY_BLOCKED);
 }
 
@@ -231,29 +229,23 @@ UT_TEST(test_worker_deferred_is_numeric_three_and_nonterminal)
 	/* STOP03 U12: DEFERRED is result value 3, but must never be cast/stored as
 	 * replay-slot BLOCKED (also numeric 3).  Only DONE/BLOCKED are terminal. */
 	UT_ASSERT_EQ((int)CLUSTER_THREADREC_DEFERRED, 3);
-	UT_ASSERT(!cluster_thread_recovery_worker_terminal_state(
-		CLUSTER_THREADREC_DEFERRED, &state));
+	UT_ASSERT(!cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_DEFERRED, &state));
 	UT_ASSERT_EQ((int)state, (int)CLUSTER_THREADREC_REPLAY_BLOCKED);
-	UT_ASSERT(!cluster_thread_recovery_worker_terminal_state(
-		CLUSTER_THREADREC_NOT_APPLICABLE, &state));
+	UT_ASSERT(
+		!cluster_thread_recovery_worker_terminal_state(CLUSTER_THREADREC_NOT_APPLICABLE, &state));
 
 	UT_ASSERT_EQ((int)CLUSTER_THREADREC_MATCH_CHANGED, 0);
 	UT_ASSERT_EQ((int)CLUSTER_THREADREC_MATCH_INVALID, 3);
 	UT_ASSERT(cluster_thread_recovery_replay_transition_shape_valid(
-		CLUSTER_THREADREC_REPLAY_REPLAYING,
-		CLUSTER_THREADREC_REPLAY_IDLE));
+		CLUSTER_THREADREC_REPLAY_REPLAYING, CLUSTER_THREADREC_REPLAY_IDLE));
 	UT_ASSERT(cluster_thread_recovery_replay_transition_shape_valid(
-		CLUSTER_THREADREC_REPLAY_REPLAYING,
-		CLUSTER_THREADREC_REPLAY_DONE));
+		CLUSTER_THREADREC_REPLAY_REPLAYING, CLUSTER_THREADREC_REPLAY_DONE));
 	UT_ASSERT(cluster_thread_recovery_replay_transition_shape_valid(
-		CLUSTER_THREADREC_REPLAY_REPLAYING,
-		CLUSTER_THREADREC_REPLAY_BLOCKED));
+		CLUSTER_THREADREC_REPLAY_REPLAYING, CLUSTER_THREADREC_REPLAY_BLOCKED));
 	UT_ASSERT(!cluster_thread_recovery_replay_transition_shape_valid(
-		CLUSTER_THREADREC_REPLAY_IDLE,
-		CLUSTER_THREADREC_REPLAY_REPLAYING));
+		CLUSTER_THREADREC_REPLAY_IDLE, CLUSTER_THREADREC_REPLAY_REPLAYING));
 	UT_ASSERT(!cluster_thread_recovery_replay_transition_shape_valid(
-		CLUSTER_THREADREC_REPLAY_REPLAYING,
-		CLUSTER_THREADREC_REPLAY_REPLAYING));
+		CLUSTER_THREADREC_REPLAY_REPLAYING, CLUSTER_THREADREC_REPLAY_REPLAYING));
 }
 
 UT_TEST(test_a2_reap_decision_matrix)
@@ -261,37 +253,35 @@ UT_TEST(test_a2_reap_decision_matrix)
 	uint64 stamp = UINT64_C(77);
 
 	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STARTED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		stamp), (int)CLUSTER_THREADREC_REAP_RETAIN);
+					 BGWH_STARTED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
+				 (int)CLUSTER_THREADREC_REAP_RETAIN);
 	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_NOT_YET_STARTED, true, stamp,
-		CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
-		(int)CLUSTER_THREADREC_REAP_RETAIN);
+					 BGWH_NOT_YET_STARTED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
+				 (int)CLUSTER_THREADREC_REAP_RETAIN);
 	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_POSTMASTER_DIED, true, stamp,
-		CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
-		(int)CLUSTER_THREADREC_REAP_RETAIN);
+					 BGWH_POSTMASTER_DIED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
+				 (int)CLUSTER_THREADREC_REAP_RETAIN);
 	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		stamp), (int)CLUSTER_THREADREC_REAP_RESET_IDLE);
+					 BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
+				 (int)CLUSTER_THREADREC_REAP_RESET_IDLE);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(BGWH_STOPPED, true, stamp,
+														  CLUSTER_THREADREC_REPLAY_DONE, stamp),
+				 (int)CLUSTER_THREADREC_REAP_KEEP_TERMINAL);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(BGWH_STOPPED, true, stamp,
+														  CLUSTER_THREADREC_REPLAY_BLOCKED, stamp),
+				 (int)CLUSTER_THREADREC_REAP_KEEP_TERMINAL);
 	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_DONE,
-		stamp), (int)CLUSTER_THREADREC_REAP_KEEP_TERMINAL);
+					 BGWH_STOPPED, false, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING, stamp),
+				 (int)CLUSTER_THREADREC_REAP_INVALID);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(BGWH_STOPPED, true, stamp,
+														  CLUSTER_THREADREC_REPLAY_IDLE, stamp),
+				 (int)CLUSTER_THREADREC_REAP_INVALID);
 	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_BLOCKED,
-		stamp), (int)CLUSTER_THREADREC_REAP_KEEP_TERMINAL);
-	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STOPPED, false, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		stamp), (int)CLUSTER_THREADREC_REAP_INVALID);
-	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_IDLE,
-		stamp), (int)CLUSTER_THREADREC_REAP_INVALID);
-	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		stamp + 1), (int)CLUSTER_THREADREC_REAP_INVALID);
-	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(
-		BGWH_STOPPED, true, 0, CLUSTER_THREADREC_REPLAY_REPLAYING, 0),
-		(int)CLUSTER_THREADREC_REAP_INVALID);
+					 BGWH_STOPPED, true, stamp, CLUSTER_THREADREC_REPLAY_REPLAYING, stamp + 1),
+				 (int)CLUSTER_THREADREC_REAP_INVALID);
+	UT_ASSERT_EQ((int)cluster_thread_recovery_reap_decide(BGWH_STOPPED, true, 0,
+														  CLUSTER_THREADREC_REPLAY_REPLAYING, 0),
+				 (int)CLUSTER_THREADREC_REAP_INVALID);
 }
 
 static ClusterRecoveryDutyKey
@@ -309,9 +299,8 @@ valid_a2_duty(uint16 origin_thread)
 	duty.origin_thread_id = origin_thread;
 	duty.origin_node_id = (int32)origin_thread - 1;
 	duty.thread_claim_created_at = INT64_C(77);
-	cluster_wal_thread_claim_fill(&claim, origin_thread,
-								 duty.origin_node_id,
-								 duty.thread_claim_created_at);
+	cluster_wal_thread_claim_fill(&claim, origin_thread, duty.origin_node_id,
+								  duty.thread_claim_created_at);
 	duty.thread_claim_crc32c = claim.crc;
 	duty.origin_owner_incarnation = UINT64_C(9);
 	duty.root_lineage_seq = UINT64_C(10);
@@ -329,27 +318,20 @@ UT_TEST(test_a2_worker_payload_fresh_validation)
 	eligibility.duty = valid_a2_duty(thread);
 
 	UT_ASSERT(cluster_thread_recovery_worker_start_valid(
-		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		UINT64_C(77)));
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
-		NULL, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		UINT64_C(77)));
+		NULL, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
-		&eligibility, thread + 1, true,
-		CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
+		&eligibility, thread + 1, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
-		&eligibility, thread, false, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		UINT64_C(77)));
+		&eligibility, thread, false, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
-		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_IDLE,
-		UINT64_C(77)));
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_IDLE, UINT64_C(77)));
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
-		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		UINT64_C(78)));
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(78)));
 	eligibility.duty.root_lineage_seq = 0;
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
-		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
-		UINT64_C(77)));
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
 }
 
 /* ----------

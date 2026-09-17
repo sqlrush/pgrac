@@ -553,26 +553,24 @@ cluster_undo_horizon_read_admission_enforce(SCN read_scn)
 		refuse_reason = "no active snapshot";
 	else if (snap->read_epoch < admitted - 1)
 		refuse_reason = "snapshot epoch predates self admission epoch";
-	else if (SCN_VALID(read_scn) && SCN_VALID(snap->read_scn)
-			 && snap->read_scn != read_scn)
+	else if (SCN_VALID(read_scn) && SCN_VALID(snap->read_scn) && snap->read_scn != read_scn)
 		refuse_reason = "resolver read SCN does not match the active snapshot";
 
 	if (refuse_reason != NULL) {
 		if (UndoHorizonShmem != NULL)
 			pg_atomic_fetch_add_u64(&UndoHorizonShmem->admission_refuse_count, 1);
-		ereport(ERROR, (errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-						errmsg("cross-node undo access refused: snapshot predates this node's "
-							   "cluster admission"),
-						errdetail("reason=%s admitted_epoch=" UINT64_FORMAT
-							  " snapshot_epoch=" UINT64_FORMAT " current_epoch=" UINT64_FORMAT
-							  " resolver_read_scn=" UINT64_FORMAT
-							  " snapshot_read_scn=" UINT64_FORMAT,
-							  refuse_reason, admitted == 0 ? 0 : admitted - 1,
-							  snap == NULL ? 0 : snap->read_epoch,
-							  cluster_epoch_get_current(), (uint64)read_scn,
-							  snap == NULL ? 0 : (uint64)snap->read_scn),
-						errhint("Take a new snapshot (new statement or transaction) after the "
-								"join completed and retry.")));
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+				 errmsg("cross-node undo access refused: snapshot predates this node's "
+						"cluster admission"),
+				 errdetail("reason=%s admitted_epoch=" UINT64_FORMAT
+						   " snapshot_epoch=" UINT64_FORMAT " current_epoch=" UINT64_FORMAT
+						   " resolver_read_scn=" UINT64_FORMAT " snapshot_read_scn=" UINT64_FORMAT,
+						   refuse_reason, admitted == 0 ? 0 : admitted - 1,
+						   snap == NULL ? 0 : snap->read_epoch, cluster_epoch_get_current(),
+						   (uint64)read_scn, snap == NULL ? 0 : (uint64)snap->read_scn),
+				 errhint("Take a new snapshot (new statement or transaction) after the "
+						 "join completed and retry.")));
 	}
 
 	/*

@@ -161,7 +161,7 @@ extern bool cluster_undo_block0_generation_matches(const ClusterUndoBlock0Genera
 extern bool cluster_undo_block0_generation_advance(const ClusterUndoBlock0Generation *current,
 												   ClusterUndoBlock0Generation *next);
 extern bool cluster_undo_block0_state_transition_allowed(ClusterUndoBlock0SlotState from,
-												 ClusterUndoBlock0SlotState to);
+														 ClusterUndoBlock0SlotState to);
 
 /* Separate block0 subregion embedded after the ordinary undo DATA bank. */
 extern Size cluster_undo_block0_shmem_size(uint32 frame_count);
@@ -173,114 +173,78 @@ extern ClusterUndoBlock0Result
 cluster_undo_block0_frame_reserve_batch(uint32 count, ClusterUndoBlock0FrameToken *tokens);
 extern void cluster_undo_block0_frame_release(ClusterUndoBlock0FrameToken *token);
 
-extern ClusterUndoBlock0Result
-cluster_undo_block0_admit_runtime(const ClusterUndoBlock0LogicalKey *logical,
-								  const ClusterUndoBlock0ResolvedRoot *root,
-								  const ClusterUndoBlock0AuthorityProof *proof,
-								  ClusterUndoBlock0FrameToken *token, ClusterUndoBlock0Pin *pin,
-								  char **page);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_reserve(const ClusterUndoBlock0LogicalKey *logical,
-							const ClusterUndoBlock0ResolvedRoot *expected_root,
-							const ClusterUndoBlock0AuthorityProof *proof,
-							ClusterUndoBlock0Pin *pin);
+extern ClusterUndoBlock0Result cluster_undo_block0_admit_runtime(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *root,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0FrameToken *token,
+	ClusterUndoBlock0Pin *pin, char **page);
+extern ClusterUndoBlock0Result cluster_undo_block0_reserve(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin);
 extern ClusterUndoBlock0Result
 cluster_undo_block0_lock_content(ClusterUndoBlock0Pin *pin,
 								 const ClusterUndoBlock0Generation *expected,
 								 ClusterUndoBlock0Mode mode, char **page);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_pin(const ClusterUndoBlock0LogicalKey *logical,
-						const ClusterUndoBlock0ResolvedRoot *expected_root,
-						const ClusterUndoBlock0Generation *expected, ClusterUndoBlock0Mode mode,
-						const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin,
-						char **page);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_copy_resident(const ClusterUndoBlock0LogicalKey *logical,
-								  const ClusterUndoBlock0ResolvedRoot *expected_root,
-								  const ClusterUndoBlock0Generation *expected,
-								  const ClusterUndoBlock0AuthorityProof *proof,
-								  char private_page[BLCKSZ],
-								  ClusterUndoBlock0Generation *observed_generation);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_copy_readonly(const ClusterUndoBlock0LogicalKey *logical,
-								  const ClusterUndoBlock0ResolvedRoot *read_root,
-								  const ClusterUndoBlock0Generation *expected,
-								  const ClusterUndoBlock0AuthorityProof *proof,
-								  char private_page[BLCKSZ]);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_sample_resident_generation(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *expected_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	ClusterUndoBlock0Generation *observed_generation);
+extern ClusterUndoBlock0Result cluster_undo_block0_pin(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0Generation *expected, ClusterUndoBlock0Mode mode,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Pin *pin, char **page);
+extern ClusterUndoBlock0Result cluster_undo_block0_copy_resident(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0Generation *expected, const ClusterUndoBlock0AuthorityProof *proof,
+	char private_page[BLCKSZ], ClusterUndoBlock0Generation *observed_generation);
+extern ClusterUndoBlock0Result cluster_undo_block0_copy_readonly(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *read_root,
+	const ClusterUndoBlock0Generation *expected, const ClusterUndoBlock0AuthorityProof *proof,
+	char private_page[BLCKSZ]);
+extern ClusterUndoBlock0Result cluster_undo_block0_sample_resident_generation(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Generation *observed_generation);
 /* Same exact sample, but never queues behind the resident content lock and
  * never fills a missing slot.  CAPACITY_UNAVAILABLE means the caller must
  * drop its later-ranked lock and retry from its original deadline. */
+extern ClusterUndoBlock0Result cluster_undo_block0_sample_resident_generation_conditional(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *expected_root,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0Generation *observed_generation);
 extern ClusterUndoBlock0Result
-cluster_undo_block0_sample_resident_generation_conditional(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *expected_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	ClusterUndoBlock0Generation *observed_generation);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_prove_strict_empty(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0AuthorityProof *proof);
-extern ClusterUndoBlock0Result
-cluster_undo_block0_recovery_private_begin(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *redo_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	bool allow_absent,
-	ClusterUndoBlock0RecoveryGuard *guard,
-	char private_page[BLCKSZ],
-	bool *exists);
-extern void
-cluster_undo_block0_recovery_private_finish(ClusterUndoBlock0RecoveryGuard *guard,
-											const char *successor_page,
-											XLogRecPtr replay_lsn,
-											bool write_image,
-											bool fsync_parent);
-extern void
-cluster_undo_block0_recovery_private_abort(ClusterUndoBlock0RecoveryGuard *guard);
+cluster_undo_block0_prove_strict_empty(const ClusterUndoBlock0LogicalKey *logical,
+									   const ClusterUndoBlock0AuthorityProof *proof);
+extern ClusterUndoBlock0Result cluster_undo_block0_recovery_private_begin(
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *redo_root,
+	const ClusterUndoBlock0AuthorityProof *proof, bool allow_absent,
+	ClusterUndoBlock0RecoveryGuard *guard, char private_page[BLCKSZ], bool *exists);
+extern void cluster_undo_block0_recovery_private_finish(ClusterUndoBlock0RecoveryGuard *guard,
+														const char *successor_page,
+														XLogRecPtr replay_lsn, bool write_image,
+														bool fsync_parent);
+extern void cluster_undo_block0_recovery_private_abort(ClusterUndoBlock0RecoveryGuard *guard);
 extern ClusterUndoBlock0Result cluster_undo_block0_provision_begin(
-	const ClusterUndoBlock0LogicalKey *logical,
-	const ClusterUndoBlock0ResolvedRoot *target_root,
-	const ClusterUndoBlock0AuthorityProof *proof,
-	ClusterUndoBlock0FrameToken *token,
-	ClusterUndoBlock0Pin *pin,
-	char **unpublished_page,
-	bool *creator);
-extern void cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin,
-	XLogRecPtr init_lsn);
+	const ClusterUndoBlock0LogicalKey *logical, const ClusterUndoBlock0ResolvedRoot *target_root,
+	const ClusterUndoBlock0AuthorityProof *proof, ClusterUndoBlock0FrameToken *token,
+	ClusterUndoBlock0Pin *pin, char **unpublished_page, bool *creator);
+extern void cluster_undo_block0_provision_publish(ClusterUndoBlock0Pin *pin, XLogRecPtr init_lsn);
 extern void cluster_undo_block0_provision_abort(ClusterUndoBlock0Pin *pin);
-extern bool cluster_undo_block0_verify_clean_census(
-	const ClusterUndoBlock0ResidentCensusItem *items, uint32 count);
+extern bool
+cluster_undo_block0_verify_clean_census(const ClusterUndoBlock0ResidentCensusItem *items,
+										uint32 count);
 /* Normal Startup's closed pass only: never an online eviction interface. */
 extern bool cluster_undo_block0_normal_start_empty(void);
 extern bool
 cluster_undo_block0_normal_start_discard(const ClusterUndoBlock0ResidentCensusItem *item,
 										 uint32 frame_index);
-extern void cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin,
-											  XLogRecPtr wal_lsn);
-extern void cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin,
-									 const char *successor_page,
-									 XLogRecPtr required_wal_lsn,
-									 bool fsync_parent);
+extern void cluster_undo_block0_mark_wal_dirty(ClusterUndoBlock0Pin *pin, XLogRecPtr wal_lsn);
+extern void cluster_undo_block0_flush_sync(ClusterUndoBlock0Pin *pin, const char *successor_page,
+										   XLogRecPtr required_wal_lsn, bool fsync_parent);
 extern void cluster_undo_block0_unpin(ClusterUndoBlock0Pin *pin);
 extern ClusterR4PrerequisiteSnapshot cluster_undo_block0_r4_prerequisite_snapshot(void);
-extern bool
-cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected);
+extern bool cluster_undo_block0_r4_publish_ready(const ClusterR4PrerequisiteSnapshot *expected);
 
-typedef struct ClusterR4StartupCompletionContextV1
-	ClusterR4StartupCompletionContextV1;
+typedef struct ClusterR4StartupCompletionContextV1 ClusterR4StartupCompletionContextV1;
 typedef struct RfRootResourceAdmissionV1 RfRootResourceAdmissionV1;
 typedef struct RfRecordClosureProofV1 RfRecordClosureProofV1;
 typedef struct RfPageResourceProofV1 RfPageResourceProofV1;
 typedef struct RfSideResourceProofSetV1 RfSideResourceProofSetV1;
 
-typedef enum ClusterR4StartupCompletionResultV1
-{
+typedef enum ClusterR4StartupCompletionResultV1 {
 	CLUSTER_R4_STARTUP_COMPLETION_OK = 0,
 	CLUSTER_R4_STARTUP_COMPLETION_RETRY = 1,
 	CLUSTER_R4_STARTUP_COMPLETION_BLOCKED_LINEAGE = 2,
@@ -296,19 +260,13 @@ typedef enum ClusterR4StartupCompletionResultV1
 } ClusterR4StartupCompletionResultV1;
 
 extern ClusterR4StartupCompletionResultV1
-cluster_undo_block0_r4_startup_begin(
-	int timeout_ms, ClusterR4StartupCompletionContextV1 **out);
-extern ClusterR4StartupCompletionResultV1
-cluster_undo_block0_r4_startup_close_next(
-	ClusterR4StartupCompletionContextV1 *context,
-	const RfRootResourceAdmissionV1 *root,
-	const RfRecordClosureProofV1 *record,
-	const RfPageResourceProofV1 *page,
+cluster_undo_block0_r4_startup_begin(int timeout_ms, ClusterR4StartupCompletionContextV1 **out);
+extern ClusterR4StartupCompletionResultV1 cluster_undo_block0_r4_startup_close_next(
+	ClusterR4StartupCompletionContextV1 *context, const RfRootResourceAdmissionV1 *root,
+	const RfRecordClosureProofV1 *record, const RfPageResourceProofV1 *page,
 	const RfSideResourceProofSetV1 *side);
 extern ClusterR4StartupCompletionResultV1
-cluster_undo_block0_r4_startup_finalize(
-	ClusterR4StartupCompletionContextV1 **context);
-extern void cluster_undo_block0_r4_startup_abort(
-	ClusterR4StartupCompletionContextV1 **context);
+cluster_undo_block0_r4_startup_finalize(ClusterR4StartupCompletionContextV1 **context);
+extern void cluster_undo_block0_r4_startup_abort(ClusterR4StartupCompletionContextV1 **context);
 
 #endif /* CLUSTER_UNDO_BLOCK0_H */

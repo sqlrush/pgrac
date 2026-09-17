@@ -191,8 +191,7 @@ typedef struct ClusterFenceAuthorityProof {
 	uint32 total_disk_count;
 } ClusterFenceAuthorityProof;
 
-StaticAssertDecl(sizeof(ClusterFenceAuthorityProof) == 72,
-				 "ClusterFenceAuthorityProof ABI");
+StaticAssertDecl(sizeof(ClusterFenceAuthorityProof) == 72, "ClusterFenceAuthorityProof ABI");
 
 /* Internal one-vote-per-physical-disk input to the pure total selector. */
 typedef enum ClusterFenceDiskVoteState {
@@ -282,14 +281,12 @@ cluster_fence_marker_valid_v1(const ClusterFenceMarker *m)
 			return m->fence_event_id == 0 && m->fence_generation == 0;
 		return m->issuer_node_id >= 0
 			   && m->issuer_node_id < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES * 8
-			   && !cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap,
-													m->issuer_node_id);
+			   && !cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap, m->issuer_node_id);
 	}
 
 	return bitmap_nonempty && m->issuer_node_id >= 0
 		   && m->issuer_node_id < CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES * 8
-		   && !cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap,
-											m->issuer_node_id);
+		   && !cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap, m->issuer_node_id);
 }
 
 /*
@@ -326,8 +323,7 @@ cluster_fence_marker_order_compare(const ClusterFenceMarker *a, const ClusterFen
  */
 static inline ClusterFenceDiskVoteState
 cluster_fence_disk_vote_select_v1(const ClusterFenceMarker *slot_markers,
-								  const bool *outer_crc_valid, int n_slots,
-								  ClusterFenceMarker *out)
+								  const bool *outer_crc_valid, int n_slots, ClusterFenceMarker *out)
 {
 	ClusterFenceMarker best;
 	bool found = false;
@@ -373,8 +369,8 @@ cluster_fence_disk_vote_select_v1(const ClusterFenceMarker *slot_markers,
  */
 static inline ClusterFenceAuthorityReadResult
 cluster_fence_authority_prove_v1(const ClusterFenceMarker *disk_markers,
-								 const ClusterFenceDiskVoteState *disk_states,
-								 int n_disks, ClusterFenceAuthorityProof *out)
+								 const ClusterFenceDiskVoteState *disk_states, int n_disks,
+								 ClusterFenceAuthorityProof *out)
 {
 	ClusterFenceAuthorityProof proof;
 	bool unreadable = false;
@@ -391,22 +387,22 @@ cluster_fence_authority_prove_v1(const ClusterFenceMarker *disk_markers,
 	majority = n_disks / 2 + 1;
 	for (i = 0; i < n_disks; i++) {
 		switch (disk_states[i]) {
-			case CLUSTER_FENCE_DISK_VOTE_EMPTY:
-				break;
-			case CLUSTER_FENCE_DISK_VOTE_VALID:
-				if (!cluster_fence_marker_valid_v1(&disk_markers[i]))
-					corrupt = true;
-				break;
-			case CLUSTER_FENCE_DISK_VOTE_UNREADABLE:
-				unreadable = true;
-				break;
-			case CLUSTER_FENCE_DISK_VOTE_MIXED_VERSION:
-				mixed_version = true;
-				break;
-			case CLUSTER_FENCE_DISK_VOTE_CORRUPT:
-			default:
+		case CLUSTER_FENCE_DISK_VOTE_EMPTY:
+			break;
+		case CLUSTER_FENCE_DISK_VOTE_VALID:
+			if (!cluster_fence_marker_valid_v1(&disk_markers[i]))
 				corrupt = true;
-				break;
+			break;
+		case CLUSTER_FENCE_DISK_VOTE_UNREADABLE:
+			unreadable = true;
+			break;
+		case CLUSTER_FENCE_DISK_VOTE_MIXED_VERSION:
+			mixed_version = true;
+			break;
+		case CLUSTER_FENCE_DISK_VOTE_CORRUPT:
+		default:
+			corrupt = true;
+			break;
 		}
 	}
 	if (corrupt)
@@ -468,9 +464,8 @@ cluster_fence_marker_semantic_equal(const ClusterFenceMarker *a, const ClusterFe
 static inline ClusterFenceAuthorityCacheResult
 cluster_fence_authority_cache_decide_v1(const ClusterFenceMarker *expected, uint64 seq_before,
 										uint64 seq_after, bool valid,
-										const ClusterFenceMarker *observed,
-										uint64 published_at_us, uint64 expiry_us,
-										uint64 now_us)
+										const ClusterFenceMarker *observed, uint64 published_at_us,
+										uint64 expiry_us, uint64 now_us)
 {
 	if (!valid)
 		return CLUSTER_FENCE_CACHE_INVALID;
@@ -624,9 +619,8 @@ cluster_write_fence_authority_advances(uint64 new_epoch, const uint8 *new_dead,
  * can only reject locally.  This is the author-side half of 4.12b D5.
  */
 static inline bool
-cluster_fence_baseline_author_permitted_v1(
-	const ClusterFenceMarker *baseline, bool have_durable,
-	const ClusterFenceMarker *durable)
+cluster_fence_baseline_author_permitted_v1(const ClusterFenceMarker *baseline, bool have_durable,
+										   const ClusterFenceMarker *durable)
 {
 	int order;
 
@@ -636,12 +630,11 @@ cluster_fence_baseline_author_permitted_v1(
 		return true;
 	if (!cluster_fence_marker_valid_v1(durable)
 		|| !cluster_write_fence_authority_advances(
-			baseline->fence_epoch, baseline->fenced_dead_bitmap,
-			durable->fence_epoch, durable->fenced_dead_bitmap))
+			baseline->fence_epoch, baseline->fenced_dead_bitmap, durable->fence_epoch,
+			durable->fenced_dead_bitmap))
 		return false;
 	order = cluster_fence_marker_order_compare(baseline, durable);
-	return order > 0
-		|| (order == 0 && cluster_fence_marker_tuple_equal(baseline, durable));
+	return order > 0 || (order == 0 && cluster_fence_marker_tuple_equal(baseline, durable));
 }
 
 /*
@@ -865,8 +858,8 @@ extern bool cluster_write_fence_enforcing(void);
 /* STOP-02 \u00a717.5 direct, total, distinct-disk durable authority proof. */
 extern ClusterFenceAuthorityReadResult
 cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out);
-extern ClusterFenceAuthorityCacheResult cluster_write_fence_revalidate_cached_nowait(
-	const ClusterFenceMarker *expected, uint64 now_us);
+extern ClusterFenceAuthorityCacheResult
+cluster_write_fence_revalidate_cached_nowait(const ClusterFenceMarker *expected, uint64 now_us);
 extern void cluster_write_fence_authority_cache_invalidate(void);
 extern uint64 cluster_write_fence_authority_cache_mutation_begin(void);
 extern void cluster_write_fence_authority_cache_mutation_end(uint64 odd_sequence);
@@ -958,7 +951,7 @@ extern void cluster_write_fence_note_baseline_published(bool is_leader, bool pub
 /* STOP-04 \u00a73.13 external-fence producers and L110-safe readers. */
 extern void cluster_write_fence_note_external_admit_requested(void);
 extern void cluster_write_fence_note_external_write_excluded(uint64 journal_seq,
-														 uint64 verified_mono_ns);
+															 uint64 verified_mono_ns);
 extern void cluster_write_fence_note_external_rejected(void);
 extern void cluster_write_fence_note_external_unknown(void);
 extern void cluster_write_fence_note_external_unavailable(void);

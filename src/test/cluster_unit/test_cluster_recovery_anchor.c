@@ -404,9 +404,8 @@ wipe_anchor_files(void)
 	test_wal_registry_ready = true;
 	test_wal_slot_verdict = CLUSTER_WAL_SLOT_OK;
 	cluster_wal_state_slot_fill(&test_wal_slot, test_wal_thread_id, cluster_node_id,
-								CLUSTER_WAL_SLOT_STATE_ACTIVE, 1,
-								test_stats_spawned_at, test_stats_spawned_at + 1,
-								0x1000, 0x2000);
+								CLUSTER_WAL_SLOT_STATE_ACTIVE, 1, test_stats_spawned_at,
+								test_stats_spawned_at + 1, 0x1000, 0x2000);
 	test_wal_slot_read_calls = 0;
 	test_wal_slot_last_read_thread = 0;
 	test_cf_x_held = true;
@@ -728,9 +727,8 @@ publish_checkpoint_panics(const CheckPoint *cp)
 {
 	test_expect_panic = true;
 	if (setjmp(test_panic_jump) == 0) {
-		cluster_recovery_anchor_publish_checkpoint(
-			0x0000000398770000ULL, cp, TEST_SYSID,
-			(uint32)DB_IN_PRODUCTION, InvalidXLogRecPtr);
+		cluster_recovery_anchor_publish_checkpoint(0x0000000398770000ULL, cp, TEST_SYSID,
+												   (uint32)DB_IN_PRODUCTION, InvalidXLogRecPtr);
 		test_expect_panic = false;
 		return false;
 	}
@@ -807,9 +805,8 @@ UT_TEST(test_checkpoint_publish_requires_current_owner_before_io)
 	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);
 
 	wipe_anchor_files();
-	cluster_recovery_anchor_publish_checkpoint(
-		0x0000000398770000ULL, &cp, TEST_SYSID,
-		(uint32)DB_IN_PRODUCTION, InvalidXLogRecPtr);
+	cluster_recovery_anchor_publish_checkpoint(0x0000000398770000ULL, &cp, TEST_SYSID,
+											   (uint32)DB_IN_PRODUCTION, InvalidXLogRecPtr);
 	UT_ASSERT_EQ(test_write_fence_calls, 1);
 	UT_ASSERT(cluster_recovery_anchor_read(TEST_SYSID, &out, &used_bak));
 	UT_ASSERT_EQ(out.checkPoint, 0x0000000398770000ULL);

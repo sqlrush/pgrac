@@ -746,7 +746,7 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 		multi_request.member_count = v4_member_count;
 		multi_request.members = v4_members;
 		if (cluster_multixact_source_dispatch(CLUSTER_MULTI_SOURCE_OVERLAY_INSTALL, &multi_request,
-										 &multi_result)
+											  &multi_result)
 			!= CLUSTER_SEMANTIC_ADMISSION_OK)
 			return;
 
@@ -878,18 +878,17 @@ cluster_tt_status_hint_handle_envelope_raw(const ClusterICEnvelope *env, const v
 	if (is_v3_subcommitted) {
 		tt_request.parent_key = &parent_key_local;
 		tt_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED,
-													&tt_request, &tt_result);
+														 &tt_request, &tt_result);
 	} else {
 		tt_request.status = (ClusterTTStatus)status_raw;
 		tt_request.commit_scn = commit_scn;
-		tt_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &tt_request,
-													&tt_result);
+		tt_admission = cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
+														 &tt_request, &tt_result);
 	}
 	if (tt_admission != CLUSTER_SEMANTIC_ADMISSION_OK || !tt_result.bool_value)
 		return;
 
 	if (!is_v3_subcommitted) {
-
 		/*
 		 * spec-5.2 D6:  a remote holder just became terminal on this node's
 		 * TT cache — wake any backend blocked in cluster_tx_enqueue_wait on

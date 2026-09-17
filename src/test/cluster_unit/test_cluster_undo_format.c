@@ -180,18 +180,13 @@ UT_TEST(test_block_has_space)
 
 UT_TEST(test_record_slot_range_stays_inside_data_region)
 {
-	UT_ASSERT(cluster_undo_record_slot_range_valid(1, 0,
-										 sizeof(UndoBlockHeader), 64));
-	UT_ASSERT(!cluster_undo_record_slot_range_valid(0, 0,
-										  sizeof(UndoBlockHeader), 64));
-	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 1,
-										  sizeof(UndoBlockHeader), 64));
-	UT_ASSERT(!cluster_undo_record_slot_range_valid(UINT16_MAX, 0,
-										  sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(cluster_undo_record_slot_range_valid(1, 0, sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(0, 0, sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 1, sizeof(UndoBlockHeader), 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(UINT16_MAX, 0, sizeof(UndoBlockHeader), 64));
 	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 0, BLCKSZ - 32, 64));
 	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 0, BLCKSZ - 8, 8));
-	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 0,
-										  sizeof(UndoBlockHeader) - 1, 64));
+	UT_ASSERT(!cluster_undo_record_slot_range_valid(1, 0, sizeof(UndoBlockHeader) - 1, 64));
 }
 
 

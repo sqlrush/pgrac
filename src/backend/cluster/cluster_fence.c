@@ -69,7 +69,7 @@
 #include "utils/timestamp.h"
 #include "funcapi.h"
 
-#include "cluster/cluster_guc.h"	/* cluster_enabled */
+#include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_inject.h" /* CLUSTER_INJECTION_POINT (Step 4 D12) */
 #include "cluster/cluster_pgstat.h" /* cluster_pgstat_lookup/_inc (Step 4 D11) */

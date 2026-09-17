@@ -51,15 +51,15 @@
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 — block re-declare scan + send */
 #include "cluster/cluster_signal.h"
 #include "cluster/cluster_shmem.h"
-#include "cluster/cluster_cssd.h"			 /* spec-2.16 D8 newly-dead bitmap diff */
-#include "cluster/cluster_ic_tier1.h"		 /* cluster_ic_tier1_get_peer_fd (RF-ROOT P6 diag) */
-#include "cluster/cluster_epoch.h"			 /* spec-4.6 D1 — accepted epoch reads */
+#include "cluster/cluster_cssd.h"			/* spec-2.16 D8 newly-dead bitmap diff */
+#include "cluster/cluster_ic_tier1.h"		/* cluster_ic_tier1_get_peer_fd (RF-ROOT P6 diag) */
+#include "cluster/cluster_epoch.h"			/* spec-4.6 D1 — accepted epoch reads */
 #include "cluster/cluster_external_fence.h" /* STOP04 rejoin cleanup cut */
-#include "cluster/cluster_clean_leave.h"	 /* RF-ROOT P6: leaver write-refusal gate */
-#include "cluster/cluster_reconfig.h"		 /* spec-4.6 D1 — reconfig event consume */
+#include "cluster/cluster_clean_leave.h"	/* RF-ROOT P6: leaver write-refusal gate */
+#include "cluster/cluster_reconfig.h"		/* spec-4.6 D1 — reconfig event consume */
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_duty.h"
-#include "cluster/cluster_startup_phase.h" /* RF-ROOT P6 diag — cluster_current_phase */
+#include "cluster/cluster_startup_phase.h"	 /* RF-ROOT P6 diag — cluster_current_phase */
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 — unfreeze gate */
 #include "cluster/cluster_undo_resid.h"		 /* spec-5.22a D1-5 — undo-class hash-route guard */
 #include "storage/procsignal.h"				 /* spec-4.6 D3 — redeclare broadcast */
@@ -394,8 +394,8 @@ grd_wfg_cancel_snapshot_waiters(const GrdWfgSnapshot *snap)
 		const GrdWfgWaiterSnap *w = &snap->waiters[i];
 		ClusterLmdVertex waiter_v;
 
-		grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id,
-							w->waiter_xid, w->wait_seq, &waiter_v);
+		grd_wfg_make_vertex(w->node_id, w->procno, w->cluster_epoch, w->request_id, w->waiter_xid,
+							w->wait_seq, &waiter_v);
 		cluster_lmd_cancel_wait_edge_real(&waiter_v);
 	}
 }
@@ -809,40 +809,24 @@ cluster_grd_shmem_init(void)
 			dlist_init(&cluster_grd_state->entry_shard_lists[i]);
 		}
 		pg_atomic_init_u32(&cluster_grd_state->master_map_initialized, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_request_sequence, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_request_generation, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_cancel_generation, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_terminal_generation, 0);
-		pg_atomic_init_u32(
-			&cluster_grd_state->recovery_authority_terminal_result, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_request_boot_incarnation, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_request_lms_generation, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_request_master_refresh, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_boot_incarnation, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_lms_generation, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_master_refresh, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_formation_epoch, 0);
-		pg_atomic_init_u64(
-			&cluster_grd_state->recovery_authority_bitmap_hash, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_request_sequence, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_request_generation, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_cancel_generation, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_terminal_generation, 0);
+		pg_atomic_init_u32(&cluster_grd_state->recovery_authority_terminal_result, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_request_boot_incarnation, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_request_lms_generation, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_request_master_refresh, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_boot_incarnation, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_lms_generation, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_master_refresh, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_formation_epoch, 0);
+		pg_atomic_init_u64(&cluster_grd_state->recovery_authority_bitmap_hash, 0);
 		for (i = 0; i < 2; i++)
-			pg_atomic_init_u64(
-				&cluster_grd_state->recovery_authority_members[i], 0);
+			pg_atomic_init_u64(&cluster_grd_state->recovery_authority_members[i], 0);
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-			pg_atomic_init_u64(
-				&cluster_grd_state->recovery_authority_done_epoch[i], 0);
-			pg_atomic_init_u64(
-				&cluster_grd_state->recovery_authority_done_hash[i], 0);
+			pg_atomic_init_u64(&cluster_grd_state->recovery_authority_done_epoch[i], 0);
+			pg_atomic_init_u64(&cluster_grd_state->recovery_authority_done_hash[i], 0);
 		}
 		pg_atomic_init_u64(&cluster_grd_state->resid_encode_count, 0);
 		pg_atomic_init_u64(&cluster_grd_state->shard_lookup_count, 0);
@@ -1271,8 +1255,7 @@ cluster_grd_is_local_master(uint32 shard_id)
 }
 
 static bool
-cluster_grd_authority_member(uint64 members_lo, uint64 members_hi,
-							 int32 node)
+cluster_grd_authority_member(uint64 members_lo, uint64 members_hi, int32 node)
 {
 	if (node < 0 || node >= CLUSTER_MAX_NODES)
 		return false;
@@ -1281,32 +1264,27 @@ cluster_grd_authority_member(uint64 members_lo, uint64 members_hi,
 }
 
 static bool
-cluster_grd_authority_map_is_current(uint64 refresh, uint64 members_lo,
-									 uint64 members_hi)
+cluster_grd_authority_map_is_current(uint64 refresh, uint64 members_lo, uint64 members_hi)
 {
 	uint32 shard;
 
 	if (cluster_grd_state == NULL || cluster_grd_entry_htab == NULL
 		|| pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0
-		|| pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count)
-			   != refresh)
+		|| pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count) != refresh)
 		return false;
 	for (shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++) {
-		int32 master
-			= (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]);
+		int32 master = (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]);
 
 		if (!cluster_grd_authority_member(members_lo, members_hi, master)
 			|| pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard])
 				   != (uint32)GRD_SHARD_NORMAL)
 			return false;
 	}
-	return pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count)
-		== refresh;
+	return pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count) == refresh;
 }
 
 bool
-cluster_grd_recovery_authority_is_current(uint64 boot_incarnation,
-										 uint64 lms_generation)
+cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_generation)
 {
 	uint64 refresh;
 	uint64 epoch;
@@ -1315,44 +1293,29 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation,
 	uint64 members_hi;
 	int i;
 
-	if (cluster_grd_state == NULL || boot_incarnation == 0
-		|| lms_generation == 0
-		|| pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_authority_boot_incarnation)
+	if (cluster_grd_state == NULL || boot_incarnation == 0 || lms_generation == 0
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_boot_incarnation)
 			   != boot_incarnation
-		|| pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_authority_lms_generation)
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_lms_generation)
 			   != lms_generation
-		|| !cluster_qvotec_in_quorum()
-		|| cluster_qvotec_get_self_incarnation() != boot_incarnation
+		|| !cluster_qvotec_in_quorum() || cluster_qvotec_get_self_incarnation() != boot_incarnation
 		|| !cluster_membership_is_member(cluster_node_id)
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != boot_incarnation)
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != boot_incarnation)
 		return false;
-	refresh = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_master_refresh);
-	epoch = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_formation_epoch);
-	bitmap_hash = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_bitmap_hash);
-	members_lo = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[0]);
-	members_hi = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[1]);
-	if (refresh == 0 || bitmap_hash == 0
-		|| cluster_epoch_get_current() != epoch
-		|| !cluster_grd_authority_map_is_current(
-			refresh, members_lo, members_hi))
+	refresh = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_master_refresh);
+	epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_formation_epoch);
+	bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_bitmap_hash);
+	members_lo = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[0]);
+	members_hi = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[1]);
+	if (refresh == 0 || bitmap_hash == 0 || cluster_epoch_get_current() != epoch
+		|| !cluster_grd_authority_map_is_current(refresh, members_lo, members_hi))
 		return false;
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (!cluster_grd_authority_member(members_lo, members_hi, i))
 			continue;
 		if (!cluster_membership_is_member(i)
-			|| pg_atomic_read_u64(
-				   &cluster_grd_state->recovery_authority_done_epoch[i])
-				   != epoch
-			|| pg_atomic_read_u64(
-				   &cluster_grd_state->recovery_authority_done_hash[i])
+			|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_done_epoch[i]) != epoch
+			|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_done_hash[i])
 				   != bitmap_hash)
 			return false;
 	}
@@ -1364,9 +1327,8 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation,
  * to reseal the same boot/LMS serving generation.  This never starts a second
  * redeclare episode and never changes GRD/GES ownership. */
 bool
-cluster_grd_serving_authority_rebind_lmon(
-	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
-	uint64 lms_generation)
+cluster_grd_serving_authority_rebind_lmon(const ClusterFormationSnapshotV1 *formation,
+										  uint64 boot_incarnation, uint64 lms_generation)
 {
 	uint64 bitmap_hash;
 	uint64 epoch;
@@ -1380,33 +1342,26 @@ cluster_grd_serving_authority_rebind_lmon(
 		|| cluster_grd_recovery_in_progress()
 		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction)
 			   != (uint32)GRD_REMASTER_DIR_NONE
-		|| !cluster_qvotec_in_quorum()
-		|| cluster_qvotec_get_self_incarnation() != boot_incarnation
+		|| !cluster_qvotec_in_quorum() || cluster_qvotec_get_self_incarnation() != boot_incarnation
 		|| cluster_lms_get_lms_restart_generation() != lms_generation
 		|| !cluster_membership_is_member(cluster_node_id)
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != boot_incarnation)
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != boot_incarnation)
 		return false;
 
 	epoch = formation->local_epoch;
-	if (formation->applied.event_id == 0
-		|| epoch != formation->applied.new_epoch
+	if (formation->applied.event_id == 0 || epoch != formation->applied.new_epoch
 		|| epoch != cluster_epoch_get_current()
 		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id)
 			   != formation->applied.event_id
-		|| pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch)
-			   != epoch) {
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch) != epoch) {
 		return false;
 	}
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		bool formation_member
-			= formation->membership.membership_state[i]
-			  == CLUSTER_MEMBER_MEMBER;
+		bool formation_member = formation->membership.membership_state[i] == CLUSTER_MEMBER_MEMBER;
 
 		if (formation_member
-			&& (cluster_conf_lookup_node(i) == NULL
-				|| !cluster_membership_is_member(i)))
+			&& (cluster_conf_lookup_node(i) == NULL || !cluster_membership_is_member(i)))
 			return false;
 		if (!formation_member && cluster_conf_lookup_node(i) != NULL
 			&& cluster_membership_is_member(i))
@@ -1418,19 +1373,14 @@ cluster_grd_serving_authority_rebind_lmon(
 		else
 			members_hi |= UINT64_C(1) << (i - 64);
 	}
-	if (!cluster_grd_authority_member(
-			members_lo, members_hi, cluster_node_id))
+	if (!cluster_grd_authority_member(members_lo, members_hi, cluster_node_id))
 		return false;
 
-	refresh = pg_atomic_read_u64(
-		&cluster_grd_state->master_map_refresh_count);
-	bitmap_hash = cluster_grd_dead_bitmap_hash(
-		formation->applied.dead_bitmap);
+	refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(formation->applied.dead_bitmap);
 	if (refresh == 0 || bitmap_hash == 0
-		|| pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_event_bitmap_hash) != bitmap_hash
-		|| !cluster_grd_authority_map_is_current(
-			refresh, members_lo, members_hi)) {
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash) != bitmap_hash
+		|| !cluster_grd_authority_map_is_current(refresh, members_lo, members_hi)) {
 		return false;
 	}
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
@@ -1454,11 +1404,8 @@ cluster_grd_serving_authority_rebind_lmon(
 		/* A JOIN recipient held no pre-episode grants to re-declare; the
 		 * ordinary P6 gate deliberately excludes it.  Every survivor still
 		 * needs the exact composite DONE key. */
-		if ((pg_atomic_read_u64(
-				 &cluster_grd_state->recovery_done_epoch[i]) != epoch
-			 || pg_atomic_read_u64(
-					&cluster_grd_state->recovery_done_bitmap_hash[i])
-					!= bitmap_hash)
+		if ((pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i]) != epoch
+			 || pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[i]) != bitmap_hash)
 			&& !join_fence_is_recipient_for(i, epoch)) {
 			return false;
 		}
@@ -1469,36 +1416,24 @@ cluster_grd_serving_authority_rebind_lmon(
 	 * field and synthetic authority-DONE slot is complete. */
 	grd_recovery_authority_clear_seal();
 	pg_write_barrier();
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_formation_epoch, epoch);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_bitmap_hash, bitmap_hash);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_members[0], members_lo);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_members[1], members_hi);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_formation_epoch, epoch);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_bitmap_hash, bitmap_hash);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_members[0], members_lo);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_members[1], members_hi);
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		bool member = cluster_grd_authority_member(members_lo, members_hi, i);
 
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_epoch[i],
-			member ? epoch : 0);
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_hash[i],
-			member ? bitmap_hash : 0);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_epoch[i],
+							member ? epoch : 0);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_hash[i],
+							member ? bitmap_hash : 0);
 	}
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_master_refresh, refresh);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_master_refresh, refresh);
 	pg_write_barrier();
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_boot_incarnation,
-		boot_incarnation);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_lms_generation,
-		lms_generation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_boot_incarnation, boot_incarnation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_lms_generation, lms_generation);
 
-	if (!cluster_grd_recovery_authority_is_current(
-			boot_incarnation, lms_generation)) {
+	if (!cluster_grd_recovery_authority_is_current(boot_incarnation, lms_generation)) {
 		grd_recovery_authority_clear_seal();
 		return false;
 	}
@@ -1524,9 +1459,8 @@ cluster_grd_serving_authority_rebind_lmon(
  *	and a current, NORMAL-shard master map.
  */
 bool
-cluster_grd_serving_authority_rebind_leaver(
-	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
-	uint64 lms_generation)
+cluster_grd_serving_authority_rebind_leaver(const ClusterFormationSnapshotV1 *formation,
+											uint64 boot_incarnation, uint64 lms_generation)
 {
 	uint64 bitmap_hash;
 	uint64 epoch;
@@ -1537,12 +1471,10 @@ cluster_grd_serving_authority_rebind_leaver(
 
 	if (formation == NULL || boot_incarnation == 0 || lms_generation == 0
 		|| cluster_grd_state == NULL || cluster_grd_entry_htab == NULL
-		|| !cluster_qvotec_in_quorum()
-		|| cluster_qvotec_get_self_incarnation() != boot_incarnation
+		|| !cluster_qvotec_in_quorum() || cluster_qvotec_get_self_incarnation() != boot_incarnation
 		|| cluster_lms_get_lms_restart_generation() != lms_generation
 		|| !cluster_membership_is_member(cluster_node_id)
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != boot_incarnation) {
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != boot_incarnation) {
 		return false;
 	}
 
@@ -1556,21 +1488,17 @@ cluster_grd_serving_authority_rebind_leaver(
 	 * from REQUESTED through COMMITTED, exactly the committed shutdown
 	 * window this rebind serves.
 	 */
-	if (!cluster_clean_leave_node_refuses_writes()
-		|| formation->local_epoch == 0
+	if (!cluster_clean_leave_node_refuses_writes() || formation->local_epoch == 0
 		|| formation->local_epoch != cluster_epoch_get_current()) {
 		return false;
 	}
 	epoch = formation->local_epoch;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		bool formation_member
-			= formation->membership.membership_state[i]
-			  == CLUSTER_MEMBER_MEMBER;
+		bool formation_member = formation->membership.membership_state[i] == CLUSTER_MEMBER_MEMBER;
 
 		if (formation_member
-			&& (cluster_conf_lookup_node(i) == NULL
-				|| !cluster_membership_is_member(i)))
+			&& (cluster_conf_lookup_node(i) == NULL || !cluster_membership_is_member(i)))
 			return false;
 		if (!formation_member && cluster_conf_lookup_node(i) != NULL
 			&& cluster_membership_is_member(i))
@@ -1582,17 +1510,13 @@ cluster_grd_serving_authority_rebind_leaver(
 		else
 			members_hi |= UINT64_C(1) << (i - 64);
 	}
-	if (!cluster_grd_authority_member(
-			members_lo, members_hi, cluster_node_id))
+	if (!cluster_grd_authority_member(members_lo, members_hi, cluster_node_id))
 		return false;
 
-	refresh = pg_atomic_read_u64(
-		&cluster_grd_state->master_map_refresh_count);
-	bitmap_hash = cluster_grd_dead_bitmap_hash(
-		formation->applied.dead_bitmap);
+	refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(formation->applied.dead_bitmap);
 	if (refresh == 0 || bitmap_hash == 0
-		|| !cluster_grd_authority_map_is_current(
-			refresh, members_lo, members_hi)) {
+		|| !cluster_grd_authority_map_is_current(refresh, members_lo, members_hi)) {
 		return false;
 	}
 
@@ -1600,36 +1524,24 @@ cluster_grd_serving_authority_rebind_leaver(
 	 * survivor rebind above). */
 	grd_recovery_authority_clear_seal();
 	pg_write_barrier();
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_formation_epoch, epoch);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_bitmap_hash, bitmap_hash);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_members[0], members_lo);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_members[1], members_hi);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_formation_epoch, epoch);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_bitmap_hash, bitmap_hash);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_members[0], members_lo);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_members[1], members_hi);
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		bool member = cluster_grd_authority_member(members_lo, members_hi, i);
 
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_epoch[i],
-			member ? epoch : 0);
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_hash[i],
-			member ? bitmap_hash : 0);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_epoch[i],
+							member ? epoch : 0);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_hash[i],
+							member ? bitmap_hash : 0);
 	}
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_master_refresh, refresh);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_master_refresh, refresh);
 	pg_write_barrier();
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_boot_incarnation,
-		boot_incarnation);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_lms_generation,
-		lms_generation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_boot_incarnation, boot_incarnation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_lms_generation, lms_generation);
 
-	if (!cluster_grd_recovery_authority_is_current(
-			boot_incarnation, lms_generation)) {
+	if (!cluster_grd_recovery_authority_is_current(boot_incarnation, lms_generation)) {
 		grd_recovery_authority_clear_seal();
 		return false;
 	}
@@ -2345,16 +2257,16 @@ static bool
 grd_recovery_event_is_terminal(uint8 reconfig_kind)
 {
 	switch ((ClusterReconfigKind)reconfig_kind) {
-		case RECONFIG_KIND_FAIL_STOP:
-		case RECONFIG_KIND_CLEAN_LEAVE:
-		case RECONFIG_KIND_JOIN_COMMITTED:
-		case RECONFIG_KIND_NODE_REMOVED:
-		case RECONFIG_KIND_REPLACEMENT_COMMITTED:
-			return true;
-		case RECONFIG_KIND_NONE:
-		case RECONFIG_KIND_JOIN_PENDING:
-		default:
-			return false;
+	case RECONFIG_KIND_FAIL_STOP:
+	case RECONFIG_KIND_CLEAN_LEAVE:
+	case RECONFIG_KIND_JOIN_COMMITTED:
+	case RECONFIG_KIND_NODE_REMOVED:
+	case RECONFIG_KIND_REPLACEMENT_COMMITTED:
+		return true;
+	case RECONFIG_KIND_NONE:
+	case RECONFIG_KIND_JOIN_PENDING:
+	default:
+		return false;
 	}
 }
 
@@ -2772,8 +2684,7 @@ grd_recovery_broadcast_done(uint64 epoch)
 	 * dead-bitmap hash (cross-node convergence key), riding the request-id
 	 * field pair — NOT the sender-local event_id. */
 	grd_recovery_broadcast_done_key(
-		epoch,
-		pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash));
+		epoch, pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash));
 }
 
 /* REDECLARE_DONE receiver (cluster_ges.c inbound handler). */
@@ -2852,15 +2763,12 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 	 * startup authority convergence in separate accounting slots, so it
 	 * cannot forge or regress the ordinary remaster FSM's done arrays. */
 	if (dead_bitmap_hash != 0
-		&& epoch == pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_authority_formation_epoch)
-		&& dead_bitmap_hash == pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_authority_bitmap_hash)) {
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_epoch[node], epoch);
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_hash[node],
-			dead_bitmap_hash);
+		&& epoch == pg_atomic_read_u64(&cluster_grd_state->recovery_authority_formation_epoch)
+		&& dead_bitmap_hash
+			   == pg_atomic_read_u64(&cluster_grd_state->recovery_authority_bitmap_hash)) {
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_epoch[node], epoch);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_hash[node],
+							dead_bitmap_hash);
 	}
 
 	episode_bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash);
@@ -2905,21 +2813,19 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 dead_bitmap
 	 * existing broadcasts use.
 	 */
 	{
-		uint64 fsm_epoch = pg_atomic_read_u64(
-			&cluster_grd_state->recovery_done_epoch[cluster_node_id]);
-		uint64 fsm_hash = pg_atomic_read_u64(
-			&cluster_grd_state->recovery_done_bitmap_hash[cluster_node_id]);
+		uint64 fsm_epoch
+			= pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[cluster_node_id]);
+		uint64 fsm_hash
+			= pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[cluster_node_id]);
 		uint64 auth_epoch = pg_atomic_read_u64(
 			&cluster_grd_state->recovery_authority_done_epoch[cluster_node_id]);
-		uint64 auth_hash = pg_atomic_read_u64(
-			&cluster_grd_state->recovery_authority_done_hash[cluster_node_id]);
+		uint64 auth_hash
+			= pg_atomic_read_u64(&cluster_grd_state->recovery_authority_done_hash[cluster_node_id]);
 
 		if ((epoch == fsm_epoch && dead_bitmap_hash == fsm_hash)
-			|| (epoch == auth_epoch && dead_bitmap_hash == auth_hash))
-		{
+			|| (epoch == auth_epoch && dead_bitmap_hash == auth_hash)) {
 			if (epoch != grd_recovery_done_echo_epoch[node]
-				|| dead_bitmap_hash != grd_recovery_done_echo_hash[node])
-			{
+				|| dead_bitmap_hash != grd_recovery_done_echo_hash[node]) {
 				grd_recovery_done_echo_epoch[node] = epoch;
 				grd_recovery_done_echo_hash[node] = dead_bitmap_hash;
 				grd_recovery_broadcast_done_key(epoch, dead_bitmap_hash);
@@ -2949,12 +2855,9 @@ static uint64 grd_recovery_authority_lmon_redeclare_generation = 0;
 static void
 grd_recovery_authority_clear_seal(void)
 {
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_boot_incarnation, 0);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_lms_generation, 0);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_master_refresh, 0);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_boot_incarnation, 0);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_lms_generation, 0);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_master_refresh, 0);
 }
 
 static bool
@@ -2969,26 +2872,20 @@ grd_recovery_authority_request_current(uint64 request_generation)
 	int i;
 
 	if (request_generation == 0 || cluster_grd_state == NULL
-		|| pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_authority_request_generation)
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation)
 			   != request_generation
-		|| pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_authority_cancel_generation)
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_cancel_generation)
 			   >= request_generation)
 		return false;
 	pg_read_barrier();
-	boot_incarnation = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_request_boot_incarnation);
-	lms_generation = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_request_lms_generation);
-	refresh = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_request_master_refresh);
-	epoch = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_formation_epoch);
-	members_lo = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[0]);
-	members_hi = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[1]);
+	boot_incarnation
+		= pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_boot_incarnation);
+	lms_generation
+		= pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_lms_generation);
+	refresh = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_master_refresh);
+	epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_formation_epoch);
+	members_lo = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[0]);
+	members_hi = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[1]);
 	{
 		bool boot_ok = boot_incarnation != 0;
 		bool lmsgen_ok = lms_generation != 0;
@@ -2997,27 +2894,19 @@ grd_recovery_authority_request_current(uint64 request_generation)
 		bool progress_ok = !cluster_grd_recovery_in_progress();
 		bool cssd_ok = cluster_cssd_get_status() == CLUSTER_CSSD_READY;
 		bool quorum_ok = cluster_qvotec_in_quorum();
-		bool inc_ok = cluster_qvotec_get_self_incarnation()
-			== boot_incarnation;
-		bool lms_match_ok = cluster_lms_get_lms_restart_generation()
-			== lms_generation;
+		bool inc_ok = cluster_qvotec_get_self_incarnation() == boot_incarnation;
+		bool lms_match_ok = cluster_lms_get_lms_restart_generation() == lms_generation;
 		bool admitted_ok
-			= cluster_membership_get_last_admitted_incarnation(
-				  cluster_node_id)
-			  == boot_incarnation;
-		bool selfmember_ok = cluster_grd_authority_member(
-			members_lo, members_hi, cluster_node_id);
-		bool map_ok = cluster_grd_authority_map_is_current(
-			refresh, members_lo, members_hi);
+			= cluster_membership_get_last_admitted_incarnation(cluster_node_id) == boot_incarnation;
+		bool selfmember_ok = cluster_grd_authority_member(members_lo, members_hi, cluster_node_id);
+		bool map_ok = cluster_grd_authority_map_is_current(refresh, members_lo, members_hi);
 
-		if (!(boot_ok && lmsgen_ok && refresh_ok && epoch_ok && progress_ok
-			  && cssd_ok && quorum_ok && inc_ok && lms_match_ok
-			  && admitted_ok && selfmember_ok && map_ok))
+		if (!(boot_ok && lmsgen_ok && refresh_ok && epoch_ok && progress_ok && cssd_ok && quorum_ok
+			  && inc_ok && lms_match_ok && admitted_ok && selfmember_ok && map_ok))
 			return false;
 	}
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		bool request_member
-			= cluster_grd_authority_member(members_lo, members_hi, i);
+		bool request_member = cluster_grd_authority_member(members_lo, members_hi, i);
 		/*
 		 * RF-ROOT P6 (crash-rejoin): the durable admission is the
 		 * membership proof for SELF.  The LMON self-state byte can
@@ -3031,38 +2920,30 @@ grd_recovery_authority_request_current(uint64 request_generation)
 		 * latch.  The quorum-majority COMMITTED join marker +
 		 * publish-proof (self_join_admitted) closes that cycle.
 		 */
-		bool current_member
-			= cluster_membership_is_member(i)
-			  || (i == cluster_node_id
-				  && cluster_reconfig_self_join_admitted());
+		bool current_member = cluster_membership_is_member(i)
+							  || (i == cluster_node_id && cluster_reconfig_self_join_admitted());
 
-		if (request_member
-			&& (cluster_conf_lookup_node(i) == NULL || !current_member))
+		if (request_member && (cluster_conf_lookup_node(i) == NULL || !current_member))
 			return false;
-		if (!request_member && cluster_conf_lookup_node(i) != NULL
-			&& current_member)
+		if (!request_member && cluster_conf_lookup_node(i) != NULL && current_member)
 			return false;
 	}
 	return true;
 }
 
 static void
-grd_recovery_authority_publish_terminal(
-	uint64 request_generation, ClusterGrdRecoveryAuthorityTerminal result)
+grd_recovery_authority_publish_terminal(uint64 request_generation,
+										ClusterGrdRecoveryAuthorityTerminal result)
 {
-	if (pg_atomic_read_u64(
-			&cluster_grd_state->recovery_authority_request_generation)
+	if (pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation)
 		!= request_generation)
 		return;
 	if (result != GRD_RECOVERY_AUTHORITY_TERMINAL_SUCCESS)
 		grd_recovery_authority_clear_seal();
-	pg_atomic_write_u32(
-		&cluster_grd_state->recovery_authority_terminal_result,
-		(uint32)result);
+	pg_atomic_write_u32(&cluster_grd_state->recovery_authority_terminal_result, (uint32)result);
 	pg_write_barrier();
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_terminal_generation,
-		request_generation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_terminal_generation,
+						request_generation);
 }
 
 /* A1 R1: sole blocking executor.  This runs once per LMON duty; it never
@@ -3084,53 +2965,41 @@ cluster_grd_recovery_authority_lmon_tick(void)
 
 	if (!cluster_enabled || cluster_grd_state == NULL)
 		return;
-	request_generation = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_request_generation);
+	request_generation
+		= pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation);
 	if (request_generation == 0
-		|| pg_atomic_read_u64(
-			   &cluster_grd_state->recovery_authority_terminal_generation)
-			   >= request_generation)
-	{
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_terminal_generation)
+			   >= request_generation) {
 		return;
 	}
 	if (!grd_recovery_authority_request_current(request_generation)) {
-		grd_recovery_authority_publish_terminal(
-			request_generation, GRD_RECOVERY_AUTHORITY_TERMINAL_FAILED);
+		grd_recovery_authority_publish_terminal(request_generation,
+												GRD_RECOVERY_AUTHORITY_TERMINAL_FAILED);
 		return;
 	}
 
-	epoch = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_formation_epoch);
-	bitmap_hash = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_bitmap_hash);
-	members_lo = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[0]);
-	members_hi = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[1]);
-	refresh = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_request_master_refresh);
-	boot_incarnation = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_request_boot_incarnation);
-	lms_generation = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_request_lms_generation);
+	epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_formation_epoch);
+	bitmap_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_bitmap_hash);
+	members_lo = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[0]);
+	members_hi = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[1]);
+	refresh = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_master_refresh);
+	boot_incarnation
+		= pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_boot_incarnation);
+	lms_generation
+		= pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_lms_generation);
 
-	if (grd_recovery_authority_lmon_request_generation
-		!= request_generation) {
+	if (grd_recovery_authority_lmon_request_generation != request_generation) {
 		grd_recovery_authority_lmon_request_generation = request_generation;
 		grd_recovery_authority_lmon_redeclare_generation
-			= pg_atomic_add_fetch_u64(
-				&cluster_grd_state->recovery_redeclare_generation, 1);
+			= pg_atomic_add_fetch_u64(&cluster_grd_state->recovery_redeclare_generation, 1);
 		(void)grd_recovery_broadcast_redeclare();
 	}
 
-	if (grd_recovery_barrier_complete(
-			grd_recovery_authority_lmon_redeclare_generation, epoch)) {
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_epoch[cluster_node_id],
-			epoch);
-		pg_atomic_write_u64(
-			&cluster_grd_state->recovery_authority_done_hash[cluster_node_id],
-			bitmap_hash);
+	if (grd_recovery_barrier_complete(grd_recovery_authority_lmon_redeclare_generation, epoch)) {
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_epoch[cluster_node_id],
+							epoch);
+		pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_hash[cluster_node_id],
+							bitmap_hash);
 		/*
 		 * RF-ROOT P6 (STOP-01 contract): 1 Hz floor on the
 		 * done-key re-announce.  The LMON main loop iterates at inbound-frame
@@ -3148,10 +3017,8 @@ cluster_grd_recovery_authority_lmon_tick(void)
 			static TimestampTz last_done_broadcast_at = 0;
 			TimestampTz now_ts = GetCurrentTimestamp();
 
-			if (now_ts == 0
-				|| last_done_broadcast_at == 0
-				|| now_ts - last_done_broadcast_at
-					   >= INT64CONST(1000000)) {
+			if (now_ts == 0 || last_done_broadcast_at == 0
+				|| now_ts - last_done_broadcast_at >= INT64CONST(1000000)) {
 				grd_recovery_broadcast_done_key(epoch, bitmap_hash);
 				last_done_broadcast_at = now_ts;
 			}
@@ -3160,11 +3027,8 @@ cluster_grd_recovery_authority_lmon_tick(void)
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (!cluster_grd_authority_member(members_lo, members_hi, i))
 			continue;
-		if (pg_atomic_read_u64(
-				&cluster_grd_state->recovery_authority_done_epoch[i])
-				!= epoch
-			|| pg_atomic_read_u64(
-					   &cluster_grd_state->recovery_authority_done_hash[i])
+		if (pg_atomic_read_u64(&cluster_grd_state->recovery_authority_done_epoch[i]) != epoch
+			|| pg_atomic_read_u64(&cluster_grd_state->recovery_authority_done_hash[i])
 				   != bitmap_hash) {
 			all_done = false;
 			break;
@@ -3175,23 +3039,17 @@ cluster_grd_recovery_authority_lmon_tick(void)
 
 	(void)cluster_grd_cleanup_stale_epoch_postbarrier(epoch);
 	if (!grd_recovery_authority_request_current(request_generation)) {
-		grd_recovery_authority_publish_terminal(
-			request_generation, GRD_RECOVERY_AUTHORITY_TERMINAL_FAILED);
+		grd_recovery_authority_publish_terminal(request_generation,
+												GRD_RECOVERY_AUTHORITY_TERMINAL_FAILED);
 		return;
 	}
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_master_refresh, refresh);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_boot_incarnation,
-		boot_incarnation);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_lms_generation,
-		lms_generation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_master_refresh, refresh);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_boot_incarnation, boot_incarnation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_lms_generation, lms_generation);
 	pg_write_barrier();
 	grd_recovery_authority_publish_terminal(
 		request_generation,
-		cluster_grd_recovery_authority_is_current(
-			boot_incarnation, lms_generation)
+		cluster_grd_recovery_authority_is_current(boot_incarnation, lms_generation)
 			? GRD_RECOVERY_AUTHORITY_TERMINAL_SUCCESS
 			: GRD_RECOVERY_AUTHORITY_TERMINAL_FAILED);
 }
@@ -3199,9 +3057,9 @@ cluster_grd_recovery_authority_lmon_tick(void)
 /* Postmaster coordinator: validate and publish one immutable request, then
  * poll only atomic terminal state under the caller's existing deadline. */
 bool
-cluster_grd_recovery_authority_barrier_wait(
-	const ClusterFormationSnapshotV1 *formation, uint64 boot_incarnation,
-	uint64 lms_generation, int timeout_ms)
+cluster_grd_recovery_authority_barrier_wait(const ClusterFormationSnapshotV1 *formation,
+											uint64 boot_incarnation, uint64 lms_generation,
+											int timeout_ms)
 {
 	TimestampTz deadline;
 	uint64 bitmap_hash;
@@ -3216,15 +3074,13 @@ cluster_grd_recovery_authority_barrier_wait(
 	uint64 prev_members_hi;
 	int i;
 
-	if (formation == NULL || boot_incarnation == 0 || lms_generation == 0
-		|| timeout_ms <= 0 || cluster_grd_state == NULL
-		|| cluster_grd_entry_htab == NULL || cluster_grd_recovery_in_progress()
-		|| !cluster_qvotec_in_quorum()
+	if (formation == NULL || boot_incarnation == 0 || lms_generation == 0 || timeout_ms <= 0
+		|| cluster_grd_state == NULL || cluster_grd_entry_htab == NULL
+		|| cluster_grd_recovery_in_progress() || !cluster_qvotec_in_quorum()
 		|| cluster_qvotec_get_self_incarnation() != boot_incarnation
 		|| cluster_lms_get_lms_restart_generation() != lms_generation
 		|| !cluster_membership_is_member(cluster_node_id)
-		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-			   != boot_incarnation) {
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id) != boot_incarnation) {
 		return false;
 	}
 
@@ -3242,19 +3098,15 @@ cluster_grd_recovery_authority_barrier_wait(
 	 * until some UNRELATED reconfig lands.
 	 */
 	if ((epoch != formation->applied.new_epoch
-		 && !(formation->self_join_admitted
-			  && epoch > formation->applied.new_epoch))
+		 && !(formation->self_join_admitted && epoch > formation->applied.new_epoch))
 		|| epoch != cluster_epoch_get_current())
 		return false;
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-		bool formation_member
-			= formation->membership.membership_state[i]
-			  == CLUSTER_MEMBER_MEMBER;
+		bool formation_member = formation->membership.membership_state[i] == CLUSTER_MEMBER_MEMBER;
 
 		if (formation_member
-			&& (cluster_conf_lookup_node(i) == NULL
-				|| !cluster_membership_is_member(i)))
+			&& (cluster_conf_lookup_node(i) == NULL || !cluster_membership_is_member(i)))
 			return false;
 		if (!formation_member && cluster_conf_lookup_node(i) != NULL
 			&& cluster_membership_is_member(i))
@@ -3266,26 +3118,20 @@ cluster_grd_recovery_authority_barrier_wait(
 		else
 			members_hi |= UINT64_C(1) << (i - 64);
 	}
-	if (!cluster_grd_authority_member(
-			members_lo, members_hi, cluster_node_id))
+	if (!cluster_grd_authority_member(members_lo, members_hi, cluster_node_id))
 		return false;
 	refresh = pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
-	if (refresh == 0
-		|| !cluster_grd_authority_map_is_current(
-			refresh, members_lo, members_hi))
+	if (refresh == 0 || !cluster_grd_authority_map_is_current(refresh, members_lo, members_hi))
 		return false;
-	bitmap_hash = cluster_grd_dead_bitmap_hash(
-		formation->applied.dead_bitmap);
+	bitmap_hash = cluster_grd_dead_bitmap_hash(formation->applied.dead_bitmap);
 	if (bitmap_hash == 0)
 		return false;
-	if (pg_atomic_read_u64(
-			&cluster_grd_state->recovery_authority_request_generation)
-		> pg_atomic_read_u64(
-			&cluster_grd_state->recovery_authority_terminal_generation))
+	if (pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation)
+		> pg_atomic_read_u64(&cluster_grd_state->recovery_authority_terminal_generation))
 		return false;
 
-	request_generation = pg_atomic_add_fetch_u64(
-		&cluster_grd_state->recovery_authority_request_sequence, 1);
+	request_generation
+		= pg_atomic_add_fetch_u64(&cluster_grd_state->recovery_authority_request_sequence, 1);
 	if (request_generation == 0)
 		return false;
 	/*
@@ -3305,48 +3151,32 @@ cluster_grd_recovery_authority_barrier_wait(
 	 * retained; on a changed composite they cannot match the new request's
 	 * all_done comparison anyway, so zeroing there is pure hygiene.
 	 */
-	prev_epoch = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_formation_epoch);
-	prev_hash = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_bitmap_hash);
-	prev_members_lo = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[0]);
-	prev_members_hi = pg_atomic_read_u64(
-		&cluster_grd_state->recovery_authority_members[1]);
+	prev_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_formation_epoch);
+	prev_hash = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_bitmap_hash);
+	prev_members_lo = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[0]);
+	prev_members_hi = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_members[1]);
 	grd_recovery_authority_clear_seal();
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_request_boot_incarnation,
-		boot_incarnation);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_request_lms_generation,
-		lms_generation);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_request_master_refresh,
-		refresh);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_formation_epoch, epoch);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_bitmap_hash, bitmap_hash);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_members[0], members_lo);
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_members[1], members_hi);
-	if (epoch != prev_epoch || bitmap_hash != prev_hash
-		|| members_lo != prev_members_lo || members_hi != prev_members_hi) {
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_request_boot_incarnation,
+						boot_incarnation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_request_lms_generation,
+						lms_generation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_request_master_refresh, refresh);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_formation_epoch, epoch);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_bitmap_hash, bitmap_hash);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_members[0], members_lo);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_members[1], members_hi);
+	if (epoch != prev_epoch || bitmap_hash != prev_hash || members_lo != prev_members_lo
+		|| members_hi != prev_members_hi) {
 		for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-			pg_atomic_write_u64(
-				&cluster_grd_state->recovery_authority_done_epoch[i], 0);
-			pg_atomic_write_u64(
-				&cluster_grd_state->recovery_authority_done_hash[i], 0);
+			pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_epoch[i], 0);
+			pg_atomic_write_u64(&cluster_grd_state->recovery_authority_done_hash[i], 0);
 		}
 	}
-	pg_atomic_write_u32(
-		&cluster_grd_state->recovery_authority_terminal_result,
-		GRD_RECOVERY_AUTHORITY_TERMINAL_NONE);
+	pg_atomic_write_u32(&cluster_grd_state->recovery_authority_terminal_result,
+						GRD_RECOVERY_AUTHORITY_TERMINAL_NONE);
 	pg_write_barrier();
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_request_generation,
-		request_generation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_request_generation,
+						request_generation);
 	cluster_lmon_wakeup();
 
 	deadline = TimestampTzPlusMilliseconds(GetCurrentTimestamp(), timeout_ms);
@@ -3355,33 +3185,27 @@ cluster_grd_recovery_authority_barrier_wait(
 
 		if (GetCurrentTimestamp() >= deadline)
 			break;
-		terminal_generation = pg_atomic_read_u64(
-			&cluster_grd_state->recovery_authority_terminal_generation);
+		terminal_generation
+			= pg_atomic_read_u64(&cluster_grd_state->recovery_authority_terminal_generation);
 		if (terminal_generation == request_generation) {
 			uint32 tresult;
 
 			pg_read_barrier();
-			tresult = pg_atomic_read_u32(
-				&cluster_grd_state->recovery_authority_terminal_result);
+			tresult = pg_atomic_read_u32(&cluster_grd_state->recovery_authority_terminal_result);
 			return tresult == GRD_RECOVERY_AUTHORITY_TERMINAL_SUCCESS
-				&& cluster_grd_recovery_authority_is_current(
-					boot_incarnation, lms_generation);
+				   && cluster_grd_recovery_authority_is_current(boot_incarnation, lms_generation);
 		}
-		if (pg_atomic_read_u64(
-				&cluster_grd_state->recovery_authority_request_generation)
+		if (pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation)
 				!= request_generation
-			|| cluster_epoch_get_current() != epoch
-			|| !cluster_qvotec_in_quorum()
+			|| cluster_epoch_get_current() != epoch || !cluster_qvotec_in_quorum()
 			|| cluster_qvotec_get_self_incarnation() != boot_incarnation
-			|| cluster_lms_get_lms_restart_generation() != lms_generation)
-		{
+			|| cluster_lms_get_lms_restart_generation() != lms_generation) {
 			break;
 		}
 		pg_usleep(1000L);
 	}
-	pg_atomic_write_u64(
-		&cluster_grd_state->recovery_authority_cancel_generation,
-		request_generation);
+	pg_atomic_write_u64(&cluster_grd_state->recovery_authority_cancel_generation,
+						request_generation);
 	pg_write_barrier();
 	cluster_lmon_wakeup();
 	return false;
@@ -6136,9 +5960,8 @@ grd_find_holder_slot(ClusterGrdEntry *entry, int32 node_id, uint32 procno, LOCKM
 }
 
 static ClusterGrdConvertResult
-cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry,
-									   const ClusterGrdConvert *req,
-									   bool *out_drain_hint, bool dontwait)
+cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry, const ClusterGrdConvert *req,
+										   bool *out_drain_hint, bool dontwait)
 {
 	int hslot;
 	ClusterGesConvertClass klass;
@@ -6234,21 +6057,17 @@ cluster_grd_entry_request_convert_internal(ClusterGrdEntry *entry,
 }
 
 ClusterGrdConvertResult
-cluster_grd_entry_request_convert(ClusterGrdEntry *entry,
-								  const ClusterGrdConvert *req,
+cluster_grd_entry_request_convert(ClusterGrdEntry *entry, const ClusterGrdConvert *req,
 								  bool *out_drain_hint)
 {
-	return cluster_grd_entry_request_convert_internal(entry, req,
-													out_drain_hint, false);
+	return cluster_grd_entry_request_convert_internal(entry, req, out_drain_hint, false);
 }
 
 ClusterGrdConvertResult
-cluster_grd_entry_request_convert_nowait(ClusterGrdEntry *entry,
-										  const ClusterGrdConvert *req,
-										  bool *out_drain_hint)
+cluster_grd_entry_request_convert_nowait(ClusterGrdEntry *entry, const ClusterGrdConvert *req,
+										 bool *out_drain_hint)
 {
-	return cluster_grd_entry_request_convert_internal(entry, req,
-													out_drain_hint, true);
+	return cluster_grd_entry_request_convert_internal(entry, req, out_drain_hint, true);
 }
 
 /* Remove convert slot c (swap-with-last compaction). */
@@ -6698,10 +6517,9 @@ cluster_grd_convert_or_enqueue_meta(const ClusterResId *resid, int32 node_id, ui
  * target is created. */
 ClusterGrdConvertResult
 cluster_grd_convert_nowait(const ClusterResId *resid, int32 node_id, uint32 procno,
-							uint64 cluster_epoch, LOCKMODE current_mode,
-							LOCKMODE requested_mode, uint64 convert_request_id,
-							uint64 old_request_id, int32 source_node_id,
-							uint64 shard_master_generation)
+						   uint64 cluster_epoch, LOCKMODE current_mode, LOCKMODE requested_mode,
+						   uint64 convert_request_id, uint64 old_request_id, int32 source_node_id,
+						   uint64 shard_master_generation)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult lookup_result;
@@ -6728,13 +6546,11 @@ cluster_grd_convert_nowait(const ClusterResId *resid, int32 node_id, uint32 proc
 
 	SpinLockAcquire(&entry->lock);
 	hslot = grd_find_holder_slot(entry, node_id, procno, current_mode);
-	if (old_request_id == 0 || hslot < 0
-		|| entry->holders[hslot].request_id != old_request_id) {
+	if (old_request_id == 0 || hslot < 0 || entry->holders[hslot].request_id != old_request_id) {
 		pg_atomic_fetch_add_u64(&cluster_grd_state->convert_illegal_count, 1);
 		result = CLUSTER_GRD_CONVERT_ILLEGAL;
 	} else
-		result = cluster_grd_entry_request_convert_nowait(entry, &creq,
-														 &drain_hint);
+		result = cluster_grd_entry_request_convert_nowait(entry, &creq, &drain_hint);
 	SpinLockRelease(&entry->lock);
 	cluster_grd_entry_release(entry);
 	if (result == CLUSTER_GRD_CONVERT_GRANTED_INPLACE)
@@ -6847,9 +6663,8 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 
 	lookup_result = cluster_grd_entry_lookup_or_create(resid, false, &entry);
 	if (lookup_result != CLUSTER_GRD_ENTRY_OK || entry == NULL)
-		return lookup_result == CLUSTER_GRD_ENTRY_NOT_FOUND
-			? CLUSTER_GRD_RELEASE_NOT_FOUND
-			: CLUSTER_GRD_RELEASE_NOT_READY;
+		return lookup_result == CLUSTER_GRD_ENTRY_NOT_FOUND ? CLUSTER_GRD_RELEASE_NOT_FOUND
+															: CLUSTER_GRD_RELEASE_NOT_READY;
 
 	SpinLockAcquire(&entry->lock);
 
@@ -7411,9 +7226,8 @@ cluster_grd_clean_leave_verify_no_leftover(int32 leaving_node)
  * current FAIL_STOP lineage.  This is a read-only process-local snapshot;
  * later GRD gates/unfreeze and daemon state are deliberately not authority. */
 bool
-cluster_grd_rejoin_clear_snapshot(
-	const ClusterReconfigRejoinFailureSnapshotV1 *failure,
-	ClusterGrdRejoinClearSnapshotV1 *out_clear)
+cluster_grd_rejoin_clear_snapshot(const ClusterReconfigRejoinFailureSnapshotV1 *failure,
+								  ClusterGrdRejoinClearSnapshotV1 *out_clear)
 {
 	ClusterReconfigRejoinFailureSnapshotV1 current;
 	ClusterGrdRejoinClearSnapshotV1 clear;
@@ -7423,50 +7237,44 @@ cluster_grd_rejoin_clear_snapshot(
 
 	if (out_clear != NULL)
 		memset(out_clear, 0, sizeof(*out_clear));
-	if (out_clear == NULL || failure == NULL || cluster_grd_state == NULL ||
-		failure->reconfig_kind != RECONFIG_KIND_FAIL_STOP ||
-		failure->reserved0 != 0 || failure->reserved68 != 0 ||
-		failure->event_id == 0 || failure->new_epoch == 0 ||
-		failure->cssd_dead_generation == 0 ||
-		failure->old_node_id < 0 ||
-		failure->old_node_id >= CLUSTER_MAX_NODES ||
-		failure->old_incarnation == 0)
+	if (out_clear == NULL || failure == NULL || cluster_grd_state == NULL
+		|| failure->reconfig_kind != RECONFIG_KIND_FAIL_STOP || failure->reserved0 != 0
+		|| failure->reserved68 != 0 || failure->event_id == 0 || failure->new_epoch == 0
+		|| failure->cssd_dead_generation == 0 || failure->old_node_id < 0
+		|| failure->old_node_id >= CLUSTER_MAX_NODES || failure->old_incarnation == 0)
 		return false;
-	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++)
-	{
+	for (i = 0; i < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; i++) {
 		uint8 survivors = failure->survivor_bitmap[i];
 
 		if ((failure->dead_bitmap[i] & survivors) != 0)
 			return false;
-		while (survivors != 0)
-		{
+		while (survivors != 0) {
 			survivor_count += survivors & 1;
 			survivors >>= 1;
 		}
 	}
-	if (survivor_count < 1 || survivor_count >= CLUSTER_MAX_NODES ||
-		(failure->dead_bitmap[failure->old_node_id / 8] &
-		 (uint8)(UINT8_C(1) << (failure->old_node_id % 8))) == 0 ||
-		(failure->survivor_bitmap[failure->old_node_id / 8] &
-		 (uint8)(UINT8_C(1) << (failure->old_node_id % 8))) != 0)
+	if (survivor_count < 1 || survivor_count >= CLUSTER_MAX_NODES
+		|| (failure->dead_bitmap[failure->old_node_id / 8]
+			& (uint8)(UINT8_C(1) << (failure->old_node_id % 8)))
+			   == 0
+		|| (failure->survivor_bitmap[failure->old_node_id / 8]
+			& (uint8)(UINT8_C(1) << (failure->old_node_id % 8)))
+			   != 0)
 		return false;
 
-	if (!cluster_reconfig_rejoin_failure_snapshot(failure->old_node_id,
-			failure->old_incarnation, &current) ||
-		memcmp(&current, failure, sizeof(current)) != 0)
+	if (!cluster_reconfig_rejoin_failure_snapshot(failure->old_node_id, failure->old_incarnation,
+												  &current)
+		|| memcmp(&current, failure, sizeof(current)) != 0)
 		return false;
 	dead_hash = cluster_grd_dead_bitmap_hash(failure->dead_bitmap);
-	if (dead_hash == 0 ||
-		cluster_grd_recovery_episode_epoch_value() != failure->new_epoch ||
-		cluster_grd_recovery_event_bitmap_hash_value() != dead_hash)
+	if (dead_hash == 0 || cluster_grd_recovery_episode_epoch_value() != failure->new_epoch
+		|| cluster_grd_recovery_event_bitmap_hash_value() != dead_hash)
 		return false;
-	for (i = 0; i < CLUSTER_MAX_NODES; i++)
-	{
-		if ((failure->survivor_bitmap[i / 8] &
-			 (uint8)(UINT8_C(1) << (i % 8))) == 0)
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		if ((failure->survivor_bitmap[i / 8] & (uint8)(UINT8_C(1) << (i % 8))) == 0)
 			continue;
-		if (cluster_grd_recovery_done_epoch_for(i) != failure->new_epoch ||
-			cluster_grd_recovery_done_bitmap_hash_for(i) != dead_hash)
+		if (cluster_grd_recovery_done_epoch_for(i) != failure->new_epoch
+			|| cluster_grd_recovery_done_bitmap_hash_for(i) != dead_hash)
 			return false;
 	}
 	if (!cluster_grd_clean_leave_verify_no_leftover(failure->old_node_id))
@@ -7475,8 +7283,7 @@ cluster_grd_rejoin_clear_snapshot(
 	memset(&clear, 0, sizeof(clear));
 	clear.episode_epoch = failure->new_epoch;
 	clear.dead_bitmap_hash = dead_hash;
-	memcpy(clear.survivor_bitmap, failure->survivor_bitmap,
-		   sizeof(clear.survivor_bitmap));
+	memcpy(clear.survivor_bitmap, failure->survivor_bitmap, sizeof(clear.survivor_bitmap));
 	*out_clear = clear;
 	return true;
 }
@@ -8349,8 +8156,7 @@ grd_promote_remote_grant_exact(const ClusterResId *resid, const ClusterGrdHolder
 
 	Assert(resid != NULL && holder != NULL);
 
-	if (cluster_grd_entry_lookup_or_create(resid, false, &entry)
-			!= CLUSTER_GRD_ENTRY_OK
+	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
 		|| entry == NULL)
 		return CLUSTER_GRD_ENTRY_NOT_FOUND;
 
@@ -8364,8 +8170,7 @@ grd_promote_remote_grant_exact(const ClusterResId *resid, const ClusterGrdHolder
 			LOCKMODE mode = entry->reservations[i].mode;
 
 			if (i < entry->nreservations - 1)
-				entry->reservations[i]
-					= entry->reservations[entry->nreservations - 1];
+				entry->reservations[i] = entry->reservations[entry->nreservations - 1];
 			memset(&entry->reservations[entry->nreservations - 1], 0,
 				   sizeof(entry->reservations[0]));
 			entry->nreservations--;
@@ -8460,9 +8265,8 @@ cluster_grd_release_holder_by_id(const ClusterResId *resid, const ClusterGrdHold
 }
 
 bool
-cluster_grd_holder_mode_by_id(const ClusterResId *resid,
-								 const ClusterGrdHolderId *holder,
-								 LOCKMODE *out_mode)
+cluster_grd_holder_mode_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+							  LOCKMODE *out_mode)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er;

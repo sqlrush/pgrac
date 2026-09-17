@@ -108,17 +108,15 @@ repalloc(void *pointer, Size size)
 
 bool
 cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *expected_tag,
-										uint64 *own_generation,
-										uint64 *acquisition_epoch,
+										uint64 *own_generation, uint64 *acquisition_epoch,
 										uint8 *pcm_state)
 {
 	UT_ASSERT_EQ(buffer, 1);
 	if (!test_capture_authority || expected_tag == NULL
 		|| !BufferTagsEqual(expected_tag, &test_live_tag)
 		|| !cluster_itl_terminal_stamp_authority_admissible(
-			cluster_enabled, cluster_node_id, test_node_count,
-			test_recovery_merge_active, test_pcm_state, test_own_flags,
-			test_writer_activation_token))
+			cluster_enabled, cluster_node_id, test_node_count, test_recovery_merge_active,
+			test_pcm_state, test_own_flags, test_writer_activation_token))
 		return false;
 	*own_generation = test_own_generation;
 	*acquisition_epoch = test_acquisition_epoch;
@@ -128,24 +126,22 @@ cluster_bufmgr_terminal_stamp_authority(Buffer buffer, const BufferTag *expected
 
 Buffer
 cluster_bufmgr_lock_resident_for_exact_itl_stamp(const ClusterItlTouchRecord *record,
-											 ClusterItlStampSkipReason *out_reason)
+												 ClusterItlStampSkipReason *out_reason)
 {
 	test_stamp_lock_calls++;
 	test_stamp_lock_saw_valid_proof = record->proof.valid;
 	if (!record->proof.valid
-		|| !BufferTagsEqual(&test_live_tag,
-							 &(BufferTag){ .spcOid = record->key.rloc.spcOid,
-										  .dbOid = record->key.rloc.dbOid,
-										  .relNumber = record->key.rloc.relNumber,
-										  .forkNum = record->key.forknum,
-										  .blockNum = record->key.block })
+		|| !BufferTagsEqual(&test_live_tag, &(BufferTag){ .spcOid = record->key.rloc.spcOid,
+														  .dbOid = record->key.rloc.dbOid,
+														  .relNumber = record->key.rloc.relNumber,
+														  .forkNum = record->key.forknum,
+														  .blockNum = record->key.block })
 		|| !cluster_itl_terminal_stamp_authority_admissible(
-			cluster_enabled, cluster_node_id, test_node_count,
-			test_recovery_merge_active, test_pcm_state, test_own_flags,
-			test_writer_activation_token)
-		|| !cluster_itl_terminal_proof_owner_exact(
-			&record->proof, test_own_generation, test_acquisition_epoch,
-			test_pcm_state, true, test_own_flags, test_writer_activation_token)) {
+			cluster_enabled, cluster_node_id, test_node_count, test_recovery_merge_active,
+			test_pcm_state, test_own_flags, test_writer_activation_token)
+		|| !cluster_itl_terminal_proof_owner_exact(&record->proof, test_own_generation,
+												   test_acquisition_epoch, test_pcm_state, true,
+												   test_own_flags, test_writer_activation_token)) {
 		*out_reason = CLUSTER_ITL_STAMP_SKIP_INVALID_PROOF;
 		return InvalidBuffer;
 	}
@@ -229,11 +225,10 @@ cluster_sf_observed_origin_durable_lsn(int32 origin)
 }
 
 ClusterCtrcDischargeResult
-cluster_ctrc_receipt_discharge_itl_shared(
-	const ClusterCtrcReceiptHandle *handle,
-	const ClusterCtrcItlTargetIdentity *expected_target,
-	ClusterCtrcItlProjection projection,
-	const ClusterCtrcDurability *durability)
+cluster_ctrc_receipt_discharge_itl_shared(const ClusterCtrcReceiptHandle *handle,
+										  const ClusterCtrcItlTargetIdentity *expected_target,
+										  ClusterCtrcItlProjection projection,
+										  const ClusterCtrcDurability *durability)
 {
 	UT_ASSERT(handle != NULL && handle->valid);
 	UT_ASSERT(expected_target != NULL);
@@ -248,9 +243,9 @@ cluster_ctrc_receipt_discharge_itl_shared(
 }
 
 void
-cluster_ctrc_note_publication_after_apply(
-	const ClusterCtrcReceiptHandle *handle pg_attribute_unused(),
-	bool current_mx pg_attribute_unused())
+cluster_ctrc_note_publication_after_apply(const ClusterCtrcReceiptHandle *handle
+											  pg_attribute_unused(),
+										  bool current_mx pg_attribute_unused())
 {}
 
 static ClusterItlSlotData *
@@ -356,10 +351,8 @@ registration_ctrc_handle(int receipt_index, const ClusterItlTouchHandle *touch,
 	receipt->target.itl_slot_wrap = slot->wrap;
 	receipt->target.itl_xid = slot->xid;
 	receipt->target.itl_class = slot->flags == ITL_FLAG_LOCK_ONLY_ACTIVE ? 2 : 1;
-	receipt->target.needs_wal
-		= (touch->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
-	memcpy(receipt->target.uba, &slot->undo_segment_head,
-		   sizeof(slot->undo_segment_head));
+	receipt->target.needs_wal = (touch->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL) != 0;
+	memcpy(receipt->target.uba, &slot->undo_segment_head, sizeof(slot->undo_segment_head));
 	return handle;
 }
 
@@ -386,8 +379,7 @@ UT_TEST(u13_exact_owner_proof_matches)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(cluster_itl_terminal_proof_owner_exact(
-		&proof, 41, 17, PCM_STATE_X, true, 0, 0));
+	UT_ASSERT(cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u14_missing_owner_proof_is_rejected)
@@ -395,42 +387,36 @@ UT_TEST(u14_missing_owner_proof_is_rejected)
 	ClusterItlTerminalProof proof = valid_proof();
 
 	proof.valid = false;
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
-		&proof, 41, 17, PCM_STATE_X, true, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u15_later_x_generation_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
-		&proof, 42, 17, PCM_STATE_X, true, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 42, 17, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u16_scope_change_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
-		&proof, 41, 18, PCM_STATE_X, true, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 18, PCM_STATE_X, true, 0, 0));
 }
 
 UT_TEST(u17_non_x_owner_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
-		&proof, 41, 17, PCM_STATE_N, true, 0, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, PCM_STATE_N, true, 0, 0));
 }
 
 UT_TEST(u18_busy_owner_is_rejected)
 {
 	ClusterItlTerminalProof proof = valid_proof();
 
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
-		&proof, 41, 17, PCM_STATE_X, true, 1, 0));
-	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(
-		&proof, 41, 17, PCM_STATE_X, true, 0, 99));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, PCM_STATE_X, true, 1, 0));
+	UT_ASSERT(!cluster_itl_terminal_proof_owner_exact(&proof, 41, 17, PCM_STATE_X, true, 0, 99));
 }
 
 UT_TEST(u19_exact_slot_proof_matches)
@@ -438,8 +424,7 @@ UT_TEST(u19_exact_slot_proof_matches)
 	ClusterItlTerminalProof proof = valid_proof();
 	UBA uba = proof.undo_segment_head;
 
-	UT_ASSERT(cluster_itl_terminal_proof_slot_exact(&proof, 700, 3,
-		ITL_FLAG_ACTIVE, &uba));
+	UT_ASSERT(cluster_itl_terminal_proof_slot_exact(&proof, 700, 3, ITL_FLAG_ACTIVE, &uba));
 }
 
 UT_TEST(u20_slot_aba_or_class_change_is_rejected)
@@ -447,15 +432,12 @@ UT_TEST(u20_slot_aba_or_class_change_is_rejected)
 	ClusterItlTerminalProof proof = valid_proof();
 	UBA uba = proof.undo_segment_head;
 
-	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 701, 3,
-		ITL_FLAG_ACTIVE, &uba));
-	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 4,
-		ITL_FLAG_ACTIVE, &uba));
-	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 3,
-		ITL_FLAG_LOCK_ONLY_ACTIVE, &uba));
+	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 701, 3, ITL_FLAG_ACTIVE, &uba));
+	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 4, ITL_FLAG_ACTIVE, &uba));
+	UT_ASSERT(
+		!cluster_itl_terminal_proof_slot_exact(&proof, 700, 3, ITL_FLAG_LOCK_ONLY_ACTIVE, &uba));
 	uba.raw[1]++;
-	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 3,
-		ITL_FLAG_ACTIVE, &uba));
+	UT_ASSERT(!cluster_itl_terminal_proof_slot_exact(&proof, 700, 3, ITL_FLAG_ACTIVE, &uba));
 }
 
 UT_TEST(u35_uba_drift_preserves_active_slot)
@@ -504,8 +486,7 @@ UT_TEST(u36_abort_discharge_waits_for_terminal_wal_and_dependency_frontier)
 	UT_ASSERT_EQ(test_discharge_target.itl_xid, xid);
 	UT_ASSERT_EQ(test_discharge_target.itl_slot_wrap, slot->wrap);
 	UT_ASSERT_EQ(test_discharge_target.itl_class, 1);
-	UT_ASSERT_EQ(test_discharge_target.uba[15],
-		((const uint8 *)&slot->undo_segment_head)[15]);
+	UT_ASSERT_EQ(test_discharge_target.uba[15], ((const uint8 *)&slot->undo_segment_head)[15]);
 	UT_ASSERT_EQ(test_discharge_durability.highest_local_lsn, 300);
 	UT_ASSERT_EQ(test_discharge_durability.local_flush_lsn, 300);
 	UT_ASSERT_EQ(test_discharge_durability.required_lsn[4], 400);
@@ -625,8 +606,7 @@ UT_TEST(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle)
 
 	UT_ASSERT_EQ(test_discharge_calls, 1);
 	UT_ASSERT(test_discharged_receipt == &test_ctrc_receipts[1]);
-	UT_ASSERT_EQ(test_discharge_target.uba[0],
-		((const uint8 *)&slot->undo_segment_head)[0]);
+	UT_ASSERT_EQ(test_discharge_target.uba[0], ((const uint8 *)&slot->undo_segment_head)[0]);
 }
 
 UT_TEST(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt)
@@ -644,21 +624,17 @@ UT_TEST(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt)
 	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &registered);
 
 	MemSet(&found, 0, sizeof(found));
-	UT_ASSERT(cluster_itl_touch_lookup_reusable_ctrc(
-		&touch, 1, xid, &found));
+	UT_ASSERT(cluster_itl_touch_lookup_reusable_ctrc(&touch, 1, xid, &found));
 	UT_ASSERT(found.valid);
 	UT_ASSERT(found.receipt == registered.receipt);
-	UT_ASSERT_EQ(found.journal_slot_generation,
-		registered.journal_slot_generation);
+	UT_ASSERT_EQ(found.journal_slot_generation, registered.journal_slot_generation);
 
 	slot->undo_segment_head.raw[1]++;
-	UT_ASSERT(!cluster_itl_touch_lookup_reusable_ctrc(
-		&touch, 1, xid, &found));
+	UT_ASSERT(!cluster_itl_touch_lookup_reusable_ctrc(&touch, 1, xid, &found));
 	UT_ASSERT(!found.valid);
 	slot->undo_segment_head.raw[1]--;
 	test_own_generation++;
-	UT_ASSERT(!cluster_itl_touch_lookup_reusable_ctrc(
-		&touch, 1, xid, &found));
+	UT_ASSERT(!cluster_itl_touch_lookup_reusable_ctrc(&touch, 1, xid, &found));
 	UT_ASSERT(!found.valid);
 }
 

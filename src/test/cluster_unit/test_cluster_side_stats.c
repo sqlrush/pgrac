@@ -37,20 +37,14 @@ static ClusterSideStats ut_stats;
 
 UT_TEST(test_counters_and_vocabulary)
 {
-	static const char *names[] = {
-		"cluster.side.route_applies",
-		"cluster.side.route_noops",
-		"cluster.side.route_blocked",
-		"cluster.side.domain_tt_undo",
-		"cluster.side.domain_projection",
-		"cluster.side.domain_storage",
-		"cluster.side.blocked_unknown_class",
-		"cluster.side.blocked_authority",
-		"cluster.side.rebuild_events",
-		"cluster.side.durability_events"
-	};
-	int			i;
-	int			kind;
+	static const char *names[]
+		= { "cluster.side.route_applies",		  "cluster.side.route_noops",
+			"cluster.side.route_blocked",		  "cluster.side.domain_tt_undo",
+			"cluster.side.domain_projection",	  "cluster.side.domain_storage",
+			"cluster.side.blocked_unknown_class", "cluster.side.blocked_authority",
+			"cluster.side.rebuild_events",		  "cluster.side.durability_events" };
+	int i;
+	int kind;
 
 	cluster_side_stats_init(&ut_stats);
 
@@ -71,15 +65,14 @@ UT_TEST(test_counters_and_vocabulary)
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.domain_tt_undo), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.domain_projection), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.domain_storage), UINT64_C(1));
-	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.blocked_unknown_class),
-				 UINT64_C(1));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.blocked_unknown_class), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.blocked_authority), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.rebuild_events), UINT64_C(1));
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ut_stats.durability_events), UINT64_C(1));
 
 	/* G2 vocabulary: every name maps to exactly one kind; unknown names
 	 * fail closed. */
-	for (i = 0; i < (int) lengthof(names); i++)
+	for (i = 0; i < (int)lengthof(names); i++)
 		UT_ASSERT(cluster_side_stats_describe(names[i], &kind));
 	UT_ASSERT(!cluster_side_stats_describe("cluster.side.no_such", &kind));
 	UT_ASSERT(!cluster_side_stats_describe(NULL, &kind));
@@ -97,18 +90,16 @@ UT_TEST(test_counter_never_changes_verdict)
 	 * judgements are pure over their typed facts and never read a
 	 * counter, so every verdict must be identical. */
 	{
-		int			i;
-		pg_atomic_uint64 *fields =
-			(pg_atomic_uint64 *) &ut_stats;
-		int			nfields = sizeof(ClusterSideStats) / sizeof(pg_atomic_uint64);
+		int i;
+		pg_atomic_uint64 *fields = (pg_atomic_uint64 *)&ut_stats;
+		int nfields = sizeof(ClusterSideStats) / sizeof(pg_atomic_uint64);
 
 		for (i = 0; i < nfields; i++)
 			pg_atomic_write_u64(&fields[i], UINT64_MAX / 2);
 	}
 
 	UT_ASSERT(cluster_side_route_lookup(10 /* RM_HEAP_ID */, 0x10, &row));
-	UT_ASSERT_EQ((int) cluster_side_route_verdict(&row),
-				 (int) CLUSTER_SIDE_ROUTE_VERDICT_APPLY);
+	UT_ASSERT_EQ((int)cluster_side_route_verdict(&row), (int)CLUSTER_SIDE_ROUTE_VERDICT_APPLY);
 
 	memset(&ready, 0, sizeof(ready));
 	ready.resource_id = 1;

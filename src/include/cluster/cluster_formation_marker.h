@@ -41,7 +41,7 @@
 #define CLUSTER_FORMATION_MARKER_H
 
 #include "c.h"
-#include "cluster/cluster_voting_disk_io.h"	/* CLUSTER_VOTING_SLOT_BYTES */
+#include "cluster/cluster_voting_disk_io.h" /* CLUSTER_VOTING_SLOT_BYTES */
 
 /* 16 bytes — mirrors CLUSTER_RECONFIG_DEAD_BITMAP_BYTES (cluster_reconfig.h
  * cannot be included here: it includes this header for the mailbox type). */
@@ -65,15 +65,14 @@
 /* Header bytes up to (and including) crc32c); entries follow at 72. */
 #define CLUSTER_FORMATION_MARKER_HEADER_BYTES 72
 /* Max co-boot members that fit the 512-byte slot. */
-#define CLUSTER_FORMATION_MARKER_MAX_MEMBERS \
-	((CLUSTER_VOTING_SLOT_BYTES - CLUSTER_FORMATION_MARKER_HEADER_BYTES) \
+#define CLUSTER_FORMATION_MARKER_MAX_MEMBERS                                                       \
+	((CLUSTER_VOTING_SLOT_BYTES - CLUSTER_FORMATION_MARKER_HEADER_BYTES)                           \
 	 / CLUSTER_FORMATION_MARKER_ENTRY_BYTES)
 
-typedef struct ClusterFormationCommitMarker
-{
-	uint32 magic;				/* CLUSTER_FORMATION_MARKER_MAGIC */
-	uint16 version;				/* CLUSTER_FORMATION_MARKER_VERSION */
-	uint8 phase;				/* CLUSTER_FORMATION_MARKER_PHASE_COMMITTED */
+typedef struct ClusterFormationCommitMarker {
+	uint32 magic;	/* CLUSTER_FORMATION_MARKER_MAGIC */
+	uint16 version; /* CLUSTER_FORMATION_MARKER_VERSION */
+	uint8 phase;	/* CLUSTER_FORMATION_MARKER_PHASE_COMMITTED */
 	uint8 _pad1;
 	uint64 formation_generation; /* monotonic; takeover raises it */
 	uint64 formation_epoch;		 /* the (possibly recovered) cluster epoch */
@@ -81,28 +80,26 @@ typedef struct ClusterFormationCommitMarker
 	uint64 arbiter_incarnation;	 /* arbiter's CURRENT boot incarnation */
 	uint64 commit_nonce;		 /* per-formation-attempt identity */
 	uint8 admitted_nodes[CLUSTER_FORMATION_MARKER_BITMAP_BYTES]; /* co-boot bitmap */
-	uint16 n_admitted;			 /* = popcount(admitted_nodes) */
+	uint16 n_admitted;											 /* = popcount(admitted_nodes) */
 	uint16 _pad2;
-	uint32 crc32c;				 /* CRC32C over [magic .. _pad2] */
-	/* followed by n_admitted compact entries: uint8 node_id + uint64 incarnation */
+	uint32 crc32c; /* CRC32C over [magic .. _pad2] */
+				   /* followed by n_admitted compact entries: uint8 node_id + uint64 incarnation */
 } ClusterFormationCommitMarker;
 
-extern void cluster_formation_marker_compute_crc(
-	ClusterFormationCommitMarker *marker);
-extern bool cluster_formation_marker_encode(
-	const ClusterFormationCommitMarker *marker,
-	const uint64 *incarnation_by_node /* CLUSTER_MAX_NODES */,
-	uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES]);
-extern bool cluster_formation_marker_decode(
-	const uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES],
-	ClusterFormationCommitMarker *marker,
-	uint64 *incarnation_by_node /* CLUSTER_MAX_NODES, optional */);
-extern bool cluster_formation_marker_validate(
-	const uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES],
-	ClusterFormationCommitMarker *out_decoded,
-	uint64 *out_incarnations);
-extern uint64 cluster_formation_marker_incarnation_for(
-	const uint64 *incarnation_by_node, int32 node_id);
+extern void cluster_formation_marker_compute_crc(ClusterFormationCommitMarker *marker);
+extern bool
+cluster_formation_marker_encode(const ClusterFormationCommitMarker *marker,
+								const uint64 *incarnation_by_node /* CLUSTER_MAX_NODES */,
+								uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES]);
+extern bool
+cluster_formation_marker_decode(const uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES],
+								ClusterFormationCommitMarker *marker,
+								uint64 *incarnation_by_node /* CLUSTER_MAX_NODES, optional */);
+extern bool cluster_formation_marker_validate(const uint8 slot_bytes[CLUSTER_VOTING_SLOT_BYTES],
+											  ClusterFormationCommitMarker *out_decoded,
+											  uint64 *out_incarnations);
+extern uint64 cluster_formation_marker_incarnation_for(const uint64 *incarnation_by_node,
+													   int32 node_id);
 
 /*
  * qvotec formation-marker mailbox (mirrors the join-marker submit pattern):
@@ -113,14 +110,13 @@ extern uint64 cluster_formation_marker_incarnation_for(
  * majority of disks carries the EXACT image (majority readback).  A marker
  * that cannot reach majority on every target member fails closed.
  */
-typedef struct ClusterFormationMarkerSubmitRequest
-{
+typedef struct ClusterFormationMarkerSubmitRequest {
 	bool active;
 	uint64 request_seq;
 	uint64 completion_seq;
-	uint32 result;				/* bool success */
+	uint32 result; /* bool success */
 	uint8 marker_bytes[CLUSTER_VOTING_SLOT_BYTES];
 	uint8 target_members[CLUSTER_FORMATION_MARKER_BITMAP_BYTES];
 } ClusterFormationMarkerSubmitRequest;
 
-#endif							/* CLUSTER_FORMATION_MARKER_H */
+#endif /* CLUSTER_FORMATION_MARKER_H */

@@ -78,6 +78,21 @@ int cluster_node_id = 0;
 /* Linked block-zero observer is not called by this DATA-pool fixture. */
 bool IsUnderPostmaster = false;
 BackendType MyBackendType = B_INVALID;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
+
+bool
+cluster_semantic_normal_start_closed(void)
+{
+	/* This DATA-pool fixture cannot assert a normal-start barrier. */
+	return false;
+}
+
+uint64
+GetSystemIdentifier(void)
+{
+	/* Resolving a startup root is outside this DATA-pool test. */
+	abort();
+}
 
 ClusterR4PrerequisiteSnapshot
 cluster_reconfig_r4_prerequisite_snapshot(void)
@@ -104,42 +119,38 @@ cluster_undo_block0_current_startup_fenced_owned(void)
 }
 
 ClusterUndoSmgrFinalState
-cluster_undo_smgr_probe_segment(
-	ClusterUndoPathIntent intent pg_attribute_unused(),
-	uint32 segment_id pg_attribute_unused(),
-	uint8 owner_instance pg_attribute_unused(),
-	char block0[BLCKSZ] pg_attribute_unused())
+cluster_undo_smgr_probe_segment(ClusterUndoPathIntent intent pg_attribute_unused(),
+								uint32 segment_id pg_attribute_unused(),
+								uint8 owner_instance pg_attribute_unused(),
+								char block0[BLCKSZ] pg_attribute_unused())
 {
 	return CLUSTER_UNDO_SMGR_FINAL_ABSENT;
 }
 
 bool
-cluster_undo_smgr_provision_temp_create(
-	ClusterUndoPathIntent intent pg_attribute_unused(),
-	uint32 segment_id pg_attribute_unused(),
-	uint8 owner_instance pg_attribute_unused(),
-	char temp_path[MAXPGPATH] pg_attribute_unused())
+cluster_undo_smgr_provision_temp_create(ClusterUndoPathIntent intent pg_attribute_unused(),
+										uint32 segment_id pg_attribute_unused(),
+										uint8 owner_instance pg_attribute_unused(),
+										char temp_path[MAXPGPATH] pg_attribute_unused())
 {
 	return false;
 }
 
 ClusterUndoSmgrPublishResult
-cluster_undo_smgr_provision_temp_publish(
-	ClusterUndoPathIntent intent pg_attribute_unused(),
-	uint32 segment_id pg_attribute_unused(),
-	uint8 owner_instance pg_attribute_unused(),
-	const char *temp_path pg_attribute_unused(),
-	const char block0[BLCKSZ] pg_attribute_unused())
+cluster_undo_smgr_provision_temp_publish(ClusterUndoPathIntent intent pg_attribute_unused(),
+										 uint32 segment_id pg_attribute_unused(),
+										 uint8 owner_instance pg_attribute_unused(),
+										 const char *temp_path pg_attribute_unused(),
+										 const char block0[BLCKSZ] pg_attribute_unused())
 {
 	return CLUSTER_UNDO_SMGR_PUBLISH_IO_ERROR;
 }
 
 bool
-cluster_undo_smgr_provision_temp_cleanup(
-	ClusterUndoPathIntent intent pg_attribute_unused(),
-	uint32 segment_id pg_attribute_unused(),
-	uint8 owner_instance pg_attribute_unused(),
-	const char *temp_path pg_attribute_unused())
+cluster_undo_smgr_provision_temp_cleanup(ClusterUndoPathIntent intent pg_attribute_unused(),
+										 uint32 segment_id pg_attribute_unused(),
+										 uint8 owner_instance pg_attribute_unused(),
+										 const char *temp_path pg_attribute_unused())
 {
 	return false;
 }
@@ -240,8 +251,7 @@ LWLockRelease(LWLock *lock)
 bool
 LWLockConditionalAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
 {
-	if (!undo_test_conditional_acquire_allowed
-		|| undo_test_conditionally_held_lock != NULL)
+	if (!undo_test_conditional_acquire_allowed || undo_test_conditionally_held_lock != NULL)
 		return false;
 	undo_test_conditionally_held_lock = lock;
 	return true;
@@ -584,14 +594,12 @@ UT_TEST(test_undo_buf_region_keeps_data_and_block0_frame_capacity_separate)
 
 	/* Fill and retain every ordinary DATA slot. */
 	for (uint32 block = 1; block <= 4; block++) {
-		img = cluster_undo_buf_pin(1, 0, block, CLUSTER_UNDO_BUF_SHARED,
-								&data_pins[block - 1]);
+		img = cluster_undo_buf_pin(1, 0, block, CLUSTER_UNDO_BUF_SHARED, &data_pins[block - 1]);
 		UT_ASSERT_NOT_NULL(img);
 	}
 
 	/* The separate block0 bank still owns all B=D frames. */
-	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(4, block0_tokens),
-				 CLUSTER_UNDO_BLOCK0_OK);
+	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(4, block0_tokens), CLUSTER_UNDO_BLOCK0_OK);
 	UT_ASSERT_EQ(cluster_undo_block0_frame_reserve_batch(1, &extra),
 				 CLUSTER_UNDO_BLOCK0_CAPACITY_UNAVAILABLE);
 	for (int i = 0; i < 4; i++) {

@@ -41,12 +41,11 @@
 #define CLUSTER_SIDE_UNDO_H
 
 #include "access/xlogreader.h"
-#include "cluster/cluster_scn.h" /* SCN */
+#include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_itl_slot.h" /* UBA */
-#include "storage/itemptr.h" /* TransactionId */
+#include "storage/itemptr.h"		  /* TransactionId */
 
-typedef enum ClusterUndoDecodedKind
-{
+typedef enum ClusterUndoDecodedKind {
 	CLUSTER_UNDO_KIND_SEGMENT_INIT = 0,
 	CLUSTER_UNDO_KIND_TT_BIND,
 	CLUSTER_UNDO_KIND_TT_COMMIT,
@@ -57,7 +56,7 @@ typedef enum ClusterUndoDecodedKind
 	CLUSTER_UNDO_KIND_SEGMENT_REUSE,
 	CLUSTER_UNDO_KIND_BLOCK_WRITE,
 	CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI,
-	CLUSTER_UNDO_KIND_HW_RESERVE,	/* BLOCKED: STOP-RF-SIDE-SPACE-ABI */
+	CLUSTER_UNDO_KIND_HW_RESERVE, /* BLOCKED: STOP-RF-SIDE-SPACE-ABI */
 	CLUSTER_UNDO_KIND_UNKNOWN
 } ClusterUndoDecodedKind;
 
@@ -67,43 +66,42 @@ typedef enum ClusterUndoDecodedKind
  * re-derived; the per-kind fields are filled only for the kinds that
  * carry them (0 otherwise).
  */
-typedef struct ClusterUndoDecoded
-{
+typedef struct ClusterUndoDecoded {
 	ClusterUndoDecodedKind kind;
-	uint16		opcode;			/* rmgr info after XLR_INFO_MASK */
-	uint8		instance;		/* owner instance (1..128) */
-	uint32		segment_id;
-	uint16		slot_offset;	/* TT slot offset */
-	uint16		wrap;			/* TT reuse generation */
-	TransactionId xid;			/* TT slot owner */
-	SCN			commit_scn;		/* TT commit SCN */
-	uint32		block_no;		/* BLOCK_WRITE target block */
-	bool		has_payload;	/* BLOCK_WRITE carries a payload image */
-	bool		has_fpi;		/* BLOCK_WRITE payload is a full page */
-	uint16		rec_off;
-	uint16		rec_len;
-	uint16		slot_off;
-	uint16		slot_len;
-	uint32		payload_offset;	/* immutable-copy range in record main data */
-	uint32		payload_length;
-	uint32		expected_generation;
-	uint32		new_generation;
-	uint32		cluster_epoch;
-	uint64		root_id;
-	uint64		root_generation;
-	uint64		formation_epoch;
-	uint64		admission_record_generation;
-	uint64		seal_generation;
-	uint64		touched_nodes_low;
-	uint64		touched_nodes_high;
-	uint8		ack_set_digest[16];
-	uint8		format_version;
-	uint8		flags;
-	uint8		terminal_status;
-	uint8		old_state;
-	uint8		new_state;
-	uint8		reserved_zero[1];
-	UBA			first_undo_block;
+	uint16 opcode;	/* rmgr info after XLR_INFO_MASK */
+	uint8 instance; /* owner instance (1..128) */
+	uint32 segment_id;
+	uint16 slot_offset; /* TT slot offset */
+	uint16 wrap;		/* TT reuse generation */
+	TransactionId xid;	/* TT slot owner */
+	SCN commit_scn;		/* TT commit SCN */
+	uint32 block_no;	/* BLOCK_WRITE target block */
+	bool has_payload;	/* BLOCK_WRITE carries a payload image */
+	bool has_fpi;		/* BLOCK_WRITE payload is a full page */
+	uint16 rec_off;
+	uint16 rec_len;
+	uint16 slot_off;
+	uint16 slot_len;
+	uint32 payload_offset; /* immutable-copy range in record main data */
+	uint32 payload_length;
+	uint32 expected_generation;
+	uint32 new_generation;
+	uint32 cluster_epoch;
+	uint64 root_id;
+	uint64 root_generation;
+	uint64 formation_epoch;
+	uint64 admission_record_generation;
+	uint64 seal_generation;
+	uint64 touched_nodes_low;
+	uint64 touched_nodes_high;
+	uint8 ack_set_digest[16];
+	uint8 format_version;
+	uint8 flags;
+	uint8 terminal_status;
+	uint8 old_state;
+	uint8 new_state;
+	uint8 reserved_zero[1];
+	UBA first_undo_block;
 } ClusterUndoDecoded;
 
 /*
@@ -121,26 +119,23 @@ extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out
  */
 extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
 
-typedef enum ClusterUndoApplyResultV1
-{
+typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,
 	CLUSTER_UNDO_APPLY_BLOCKED = 1,
 	CLUSTER_UNDO_APPLY_POST_READ_FAILED = 2
 } ClusterUndoApplyResultV1;
 
-typedef enum ClusterUndoTargetPreflightV1
-{
+typedef enum ClusterUndoTargetPreflightV1 {
 	CLUSTER_UNDO_TARGET_APPLY = 0,
 	CLUSTER_UNDO_TARGET_PROVED_NOOP = 1,
 	CLUSTER_UNDO_TARGET_BLOCKED = 2
 } ClusterUndoTargetPreflightV1;
 
 /* Classify the exact durable TT target without mutating it. */
-extern ClusterUndoTargetPreflightV1 cluster_undo_preflight_tt_target_v1(
-	const ClusterUndoDecoded *decoded);
+extern ClusterUndoTargetPreflightV1
+cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded);
 
 /* Apply one already-decoded TT operation and verify the exact durable slot. */
-extern ClusterUndoApplyResultV1 cluster_undo_apply_tt_v1(
-	const ClusterUndoDecoded *decoded);
+extern ClusterUndoApplyResultV1 cluster_undo_apply_tt_v1(const ClusterUndoDecoded *decoded);
 
-#endif							/* CLUSTER_SIDE_UNDO_H */
+#endif /* CLUSTER_SIDE_UNDO_H */

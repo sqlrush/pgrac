@@ -19,18 +19,15 @@
 UT_DEFINE_GLOBALS();
 
 extern uint64 cluster_lms_test_publish_r4_worker_incarnation(ClusterLmsSharedState *state,
-												 int worker_id);
-extern bool cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state,
-											 uint64 generation,
-											 uint64 *worker_incarnation);
-extern bool cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state,
-										 uint64 worker_incarnation,
-										 uint64 generation);
+															 int worker_id);
+extern bool cluster_lms_test_r4_drain_request(ClusterLmsSharedState *state, uint64 generation,
+											  uint64 *worker_incarnation);
+extern bool cluster_lms_test_r4_drain_ack(ClusterLmsSharedState *state, uint64 worker_incarnation,
+										  uint64 generation);
 extern bool cluster_lms_test_r4_drain_ack_matches(ClusterLmsSharedState *state,
-												 uint64 worker_incarnation,
-												 uint64 generation);
+												  uint64 worker_incarnation, uint64 generation);
 extern bool cluster_lms_test_r4_drain_ack_tick(ClusterLmsSharedState *state,
-											 uint64 worker_incarnation);
+											   uint64 worker_incarnation);
 
 int cluster_node_id = 1;
 
@@ -173,8 +170,7 @@ UT_TEST(test_invalid_worker_refuses_without_lock_or_mutation)
 	before = state;
 
 	UT_ASSERT_EQ(cluster_lms_test_publish_r4_worker_incarnation(&state, -1), UINT64_C(0));
-	UT_ASSERT_EQ(cluster_lms_test_publish_r4_worker_incarnation(
-					 &state, CLUSTER_LMS_MAX_WORKERS),
+	UT_ASSERT_EQ(cluster_lms_test_publish_r4_worker_incarnation(&state, CLUSTER_LMS_MAX_WORKERS),
 				 UINT64_C(0));
 	UT_ASSERT(memcmp(&state, &before, sizeof(state)) == 0);
 	UT_ASSERT_EQ(ut_lock_acquire_count, 0);
@@ -190,8 +186,7 @@ UT_TEST(test_drain_request_and_ack_are_current_incarnation_bound)
 	state.r4_controls.data_worker_incarnation[0] = UINT64_C(8);
 	state.r4_controls.drain_ack_generation = UINT64_C(99);
 
-	UT_ASSERT(cluster_lms_test_r4_drain_request(&state, UINT64_C(17),
-											 &worker_incarnation));
+	UT_ASSERT(cluster_lms_test_r4_drain_request(&state, UINT64_C(17), &worker_incarnation));
 	UT_ASSERT_EQ(worker_incarnation, UINT64_C(8));
 	UT_ASSERT_EQ(state.r4_controls.drain_request_generation, UINT64_C(17));
 	UT_ASSERT_EQ(state.r4_controls.drain_ack_generation, UINT64_C(0));
@@ -202,12 +197,10 @@ UT_TEST(test_drain_request_and_ack_are_current_incarnation_bound)
 	UT_ASSERT_EQ(state.r4_controls.drain_ack_generation, UINT64_C(0));
 	UT_ASSERT(cluster_lms_test_r4_drain_ack(&state, UINT64_C(8), UINT64_C(17)));
 	UT_ASSERT_EQ(state.r4_controls.drain_ack_generation, UINT64_C(17));
-	UT_ASSERT(cluster_lms_test_r4_drain_ack_matches(
-					 &state, UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(cluster_lms_test_r4_drain_ack_matches(&state, UINT64_C(8), UINT64_C(17)));
 
 	state.r4_controls.data_worker_incarnation[0] = UINT64_C(9);
-	UT_ASSERT(!cluster_lms_test_r4_drain_ack_matches(
-					  &state, UINT64_C(8), UINT64_C(17)));
+	UT_ASSERT(!cluster_lms_test_r4_drain_ack_matches(&state, UINT64_C(8), UINT64_C(17)));
 	UT_ASSERT_EQ(ut_lock_acquire_count, 6);
 	UT_ASSERT_EQ(ut_lock_release_count, 6);
 	UT_ASSERT_EQ(ut_lock_mode, LW_SHARED);
@@ -223,14 +216,12 @@ UT_TEST(test_same_generation_drain_request_preserves_matching_ack)
 	state.r4_controls.drain_request_generation = UINT64_C(17);
 	state.r4_controls.drain_ack_generation = UINT64_C(17);
 
-	UT_ASSERT(cluster_lms_test_r4_drain_request(
-		&state, UINT64_C(17), &worker_incarnation));
+	UT_ASSERT(cluster_lms_test_r4_drain_request(&state, UINT64_C(17), &worker_incarnation));
 	UT_ASSERT_EQ(worker_incarnation, UINT64_C(8));
 	UT_ASSERT_EQ(state.r4_controls.drain_request_generation, UINT64_C(17));
 	UT_ASSERT_EQ(state.r4_controls.drain_ack_generation, UINT64_C(17));
 
-	UT_ASSERT(cluster_lms_test_r4_drain_request(
-		&state, UINT64_C(18), &worker_incarnation));
+	UT_ASSERT(cluster_lms_test_r4_drain_request(&state, UINT64_C(18), &worker_incarnation));
 	UT_ASSERT_EQ(state.r4_controls.drain_request_generation, UINT64_C(18));
 	UT_ASSERT_EQ(state.r4_controls.drain_ack_generation, UINT64_C(0));
 }
@@ -246,19 +237,15 @@ UT_TEST(test_drain_request_rejects_zero_and_missing_worker_without_mutation)
 	state.r4_controls.drain_ack_generation = UINT64_C(12);
 	before = state;
 
-	UT_ASSERT(!cluster_lms_test_r4_drain_request(
-					  &state, UINT64_C(0), &worker_incarnation));
-	UT_ASSERT(!cluster_lms_test_r4_drain_request(
-					  &state, UINT64_C(13), NULL));
-	UT_ASSERT(!cluster_lms_test_r4_drain_request(
-					  NULL, UINT64_C(13), &worker_incarnation));
+	UT_ASSERT(!cluster_lms_test_r4_drain_request(&state, UINT64_C(0), &worker_incarnation));
+	UT_ASSERT(!cluster_lms_test_r4_drain_request(&state, UINT64_C(13), NULL));
+	UT_ASSERT(!cluster_lms_test_r4_drain_request(NULL, UINT64_C(13), &worker_incarnation));
 	UT_ASSERT_EQ(worker_incarnation, UINT64_C(55));
 	UT_ASSERT(memcmp(&state, &before, sizeof(state)) == 0);
 	UT_ASSERT_EQ(ut_lock_acquire_count, 0);
 	UT_ASSERT_EQ(ut_lock_release_count, 0);
 
-	UT_ASSERT(!cluster_lms_test_r4_drain_request(
-					  &state, UINT64_C(13), &worker_incarnation));
+	UT_ASSERT(!cluster_lms_test_r4_drain_request(&state, UINT64_C(13), &worker_incarnation));
 	UT_ASSERT_EQ(worker_incarnation, UINT64_C(55));
 	UT_ASSERT(memcmp(&state, &before, sizeof(state)) == 0);
 	UT_ASSERT_EQ(ut_lock_acquire_count, 1);

@@ -2385,12 +2385,10 @@ cluster_ic_rdma_send_envelope_sge(uint8 msg_type, int32 dest_node_id,
 							   msg_type, info->name, (int)MyBackendType)));
 
 	if ((ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed()
-		&& !cluster_serving_ready_is_current()) {
+		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
 		rdma_release_sge_callbacks(payload_sge, n_sge);
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-				 errmsg("cluster IC RDMA data plane is not serving-ready")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+						errmsg("cluster IC RDMA data plane is not serving-ready")));
 		return CLUSTER_IC_SEND_HARD_ERROR;
 	}
 

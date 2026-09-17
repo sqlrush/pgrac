@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# PGRAC: validate real cluster send-edge evidence in source and build trees.
 """Validate and freshness-check the Resource-X SEND-C1 9+2 gate."""
 
 from __future__ import annotations
@@ -519,15 +520,26 @@ def _compile_mutation_binary(
     output_binary = temporary / f"{row['id'].lower()}-{binary_name}"
     compiler = shlex.split(cc)
     common_flags = shlex.split(cflags) + shlex.split(cppflags)
-    include_flags = ["-I", str(unit_directory), "-I", str(source_root / "src" / "include")]
+    build_root = unit_directory.parents[2]
+    unit_source = source_root / "src" / "test" / "cluster_unit"
+    include_flags = ["-I", str(unit_directory), "-I", str(unit_source),
+                     "-I", str(build_root / "src" / "include"),
+                     "-I", str(source_root / "src" / "include")]
     backend = source_root / "src" / "backend" / "cluster"
-    common = source_root / "src" / "common" / "libpgcommon_srv.a"
-    port = source_root / "src" / "port" / "libpgport_srv.a"
+    backend_build = build_root / "src" / "backend" / "cluster"
+    common = build_root / "src" / "common" / "libpgcommon_srv.a"
+    port = build_root / "src" / "port" / "libpgport_srv.a"
+    port_boundary = unit_directory / "cluster_unit_port_stubs.o"
 
     if binary_name in {"test_cluster_pcm_lock", "test_cluster_lms_outbound"}:
         mutated_object = temporary / f"{row['id'].lower()}-{pathlib.Path(source_relative).stem}.o"
+        fixture_flags = (
+            ["-Dclock_gettime=cluster_test_pcm_clock_gettime"]
+            if binary_name == "test_cluster_pcm_lock"
+            else ["-DCLUSTER_LMS_OUTBOUND_UNIT_TEST"]
+        )
         _run_compile(
-            compiler + common_flags + include_flags
+            compiler + common_flags + include_flags + fixture_flags
             + ["-c", str(mutated_path), "-o", str(mutated_object)],
             unit_directory,
             f"{row['id']} mutation object compile",
@@ -537,19 +549,19 @@ def _compile_mutation_binary(
             link += [
                 f'-DGCS_BLOCK_SOURCE_PATH="{backend / "cluster_gcs_block.c"}"',
                 f'-DPCM_LOCK_SOURCE_PATH="{mutated_path}"',
-                str(unit_directory / "test_cluster_pcm_lock.c"),
-                str(backend / "cluster_version.o"),
+                str(unit_source / "test_cluster_pcm_lock.c"),
+                str(backend_build / "cluster_version.o"),
                 str(mutated_object),
-                str(backend / "cluster_resource_x_identity.o"),
-                str(backend / "cluster_resource_x_node_wire.o"),
+                str(backend_build / "cluster_resource_x_identity.o"),
+                str(backend_build / "cluster_resource_x_node_wire.o"),
             ]
         else:
             link += [
-                str(unit_directory / "test_cluster_lms_outbound.c"),
-                str(backend / "cluster_version.o"),
+                str(unit_source / "test_cluster_lms_outbound.c"),
+                str(backend_build / "cluster_version.o"),
                 str(mutated_object),
             ]
-        link += [str(common), str(port), "-o", str(output_binary)]
+        link += [str(common), str(port), str(port_boundary), "-o", str(output_binary)]
     else:
         link = compiler + common_flags + shlex.split(pthread_cflags) + include_flags + [
             f'-DGCS_BLOCK_SOURCE_PATH="{mutated_path}"',
@@ -557,12 +569,15 @@ def _compile_mutation_binary(
             f'-DLMS_SOURCE_PATH="{backend / "cluster_lms.c"}"',
             f'-DLMS_OUTBOUND_SOURCE_PATH="{backend / "cluster_lms_outbound.c"}"',
             f'-DT400_SOURCE_PATH="{source_root / "src/test/cluster_tap/t/400_pcm_x_queue_4node_liveness.pl"}"',
-            str(unit_directory / "test_cluster_gcs_block.c"),
-            str(backend / "cluster_version.o"),
-            str(backend / "cluster_pcm_x_convert.o"),
-            str(backend / "cluster_resource_x_identity.o"),
-            str(backend / "cluster_resource_x_retry.o"),
-            str(common), str(port),
+            f'-DPCM_LOCK_SOURCE_PATH="{backend / "cluster_pcm_lock.c"}"',
+            f'-DRUNTIME_VISIBILITY_SOURCE_PATH="{backend / "cluster_runtime_visibility.c"}"',
+            f'-DLMON_SOURCE_PATH="{backend / "cluster_lmon.c"}"',
+            f'-DT406_SOURCE_PATH="{source_root / "src/test/cluster_tap/t/406_resource_x_finish_flush_failclosed_4node.pl"}"',
+            str(unit_source / "test_cluster_gcs_block.c"),
+            str(backend_build / "cluster_version.o"),
+            str(backend_build / "cluster_resource_x_identity.o"),
+            str(backend_build / "cluster_resource_x_retry.o"),
+            str(common), str(port), str(port_boundary),
         ] + shlex.split(pthread_libs) + ["-o", str(output_binary)]
     _run_compile(link, unit_directory, f"{row['id']} mutation witness link")
     return output_binary, binary_name, mutation_sha256

@@ -48,8 +48,10 @@
 #include "miscadmin.h"		/* superuser() */
 #include "utils/builtins.h" /* cstring_to_text */
 
+#ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* cluster_enabled */
 #include "cluster/cluster_node_remove.h"
+#endif
 
 PG_FUNCTION_INFO_V1(cluster_get_node_removal_state);
 PG_FUNCTION_INFO_V1(pg_cluster_remove_node);

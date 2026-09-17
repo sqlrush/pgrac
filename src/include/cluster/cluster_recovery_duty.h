@@ -81,8 +81,7 @@ typedef struct ClusterFormationSnapshotV1 {
  * this local tag.  It authorizes no serving or write operation. */
 #define CLUSTER_FORMATION_SNAPSHOT_RECOVERY_CONTROL UINT8_C(1)
 
-StaticAssertDecl(sizeof(ClusterRecoveryDutyDigest) == 32,
-				 "ClusterRecoveryDutyDigest ABI");
+StaticAssertDecl(sizeof(ClusterRecoveryDutyDigest) == 32, "ClusterRecoveryDutyDigest ABI");
 
 /* Shared pure validity predicate for every consumer of the exact duty key.
  * Keeping this beside the canonical encoder prevents compact resource ids
@@ -103,75 +102,70 @@ cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
 	}
 	if (!storage_nonzero || !authority_nonzero
 		|| (key->authority_uuid[6] & UINT8_C(0xf0)) != UINT8_C(0x40)
-		|| (key->authority_uuid[8] & UINT8_C(0xc0)) != UINT8_C(0x80)
-		|| key->origin_thread_id == 0
-		|| key->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| key->origin_node_id < 0
+		|| (key->authority_uuid[8] & UINT8_C(0xc0)) != UINT8_C(0x80) || key->origin_thread_id == 0
+		|| key->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT || key->origin_node_id < 0
 		|| key->origin_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| key->origin_thread_id != (uint16)(key->origin_node_id + 1)
-		|| key->reserved42 != 0 || key->thread_claim_created_at == 0
-		|| key->thread_claim_crc32c == 0 || key->reserved60 != 0
-		|| key->origin_owner_incarnation == 0 || key->root_lineage_seq == 0)
+		|| key->origin_thread_id != (uint16)(key->origin_node_id + 1) || key->reserved42 != 0
+		|| key->thread_claim_created_at == 0 || key->thread_claim_crc32c == 0
+		|| key->reserved60 != 0 || key->origin_owner_incarnation == 0 || key->root_lineage_seq == 0)
 		return false;
-	cluster_wal_thread_claim_fill(&claim, key->origin_thread_id,
-								 key->origin_node_id,
-								 key->thread_claim_created_at);
+	cluster_wal_thread_claim_fill(&claim, key->origin_thread_id, key->origin_node_id,
+								  key->thread_claim_created_at);
 	return key->thread_claim_crc32c == claim.crc;
 }
 
-extern bool cluster_recovery_duty_key_encode_v1(
-	const ClusterRecoveryDutyKey *key,
-	uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]);
-extern ClusterRecoveryDutyCompare cluster_recovery_duty_key_compare(
-	const ClusterRecoveryDutyKey *expected, const ClusterRecoveryDutyKey *observed);
+extern bool cluster_recovery_duty_key_encode_v1(const ClusterRecoveryDutyKey *key,
+												uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]);
+extern ClusterRecoveryDutyCompare
+cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
+								  const ClusterRecoveryDutyKey *observed);
 extern bool cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key,
-									ClusterRecoveryDutyDigest *out);
+											ClusterRecoveryDutyDigest *out);
 extern ClusterRecoveryOwnerImportResult cluster_recovery_owner_import_select_v1(
-	int32 node_id, const ClusterWalThreadClaim *immutable_claim,
-	uint64 frozen_admitted_bitmap_low, uint64 frozen_admitted_bitmap_high,
-	const ClusterRecoveryOwnerDiskSampleV1 *samples, int total_disk_count,
-	uint64 *out_incarnation);
-extern ClusterRecoveryOwnerImportResult cluster_recovery_owner_import_read_v1(
-	int32 node_id, const ClusterWalThreadClaim *immutable_claim,
-	uint64 frozen_admitted_bitmap_low, uint64 frozen_admitted_bitmap_high,
-	uint64 *out_incarnation);
-extern bool cluster_recovery_owner_rejoin_v1(int32 node_id,
-									 uint64 admitted_incarnation);
+	int32 node_id, const ClusterWalThreadClaim *immutable_claim, uint64 frozen_admitted_bitmap_low,
+	uint64 frozen_admitted_bitmap_high, const ClusterRecoveryOwnerDiskSampleV1 *samples,
+	int total_disk_count, uint64 *out_incarnation);
+extern ClusterRecoveryOwnerImportResult
+cluster_recovery_owner_import_read_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
+									  uint64 frozen_admitted_bitmap_low,
+									  uint64 frozen_admitted_bitmap_high, uint64 *out_incarnation);
+extern bool cluster_recovery_owner_rejoin_v1(int32 node_id, uint64 admitted_incarnation);
 extern bool cluster_control_root_thread_clean_close_publish(void); /* RF-ROOT P6 */
-extern bool cluster_control_root_thread_clean_close_publish_retry(void); /* RF-ROOT P7 recovery path */
-extern bool cluster_control_root_thread_open_publish(
-	uint64 boot_incarnation); /* RF-ROOT P6 */
+extern bool
+cluster_control_root_thread_clean_close_publish_retry(void); /* RF-ROOT P7 recovery path */
+extern bool cluster_control_root_thread_open_publish(uint64 boot_incarnation); /* RF-ROOT P6 */
 extern bool cluster_control_root_checkpoint_advance_publish(
-	XLogRecPtr redo, TimeLineID tli, XLogRecPtr ckpt_record_start,
-	XLogRecPtr ckpt_record_end, uint32 record_crc32c); /* RF-ROOT P7 G1a */
+	XLogRecPtr redo, TimeLineID tli, XLogRecPtr ckpt_record_start, XLogRecPtr ckpt_record_end,
+	uint32 record_crc32c);								   /* RF-ROOT P7 G1a */
 extern bool cluster_control_root_fpw_sticky_publish(void); /* RF-ROOT P7 G1a-2 */
 extern ClusterFormationWitnessResult cluster_formation_witness_decide_v1(
 	const ClusterFormationSnapshotV1 *f1, const ClusterFenceAuthorityProof *authority,
 	const ClusterFormationSnapshotV1 *f2, uint16 origin_thread, bool opening_new_duty);
-extern ClusterFormationWitnessResult cluster_formation_witness_build_wait(
-	uint16 origin_thread, bool opening_new_duty, int timeout_ms,
-	ClusterFormationWitnessV1 **out);
-extern ClusterFormationWitnessResult cluster_formation_witness_build_live_wait(
-	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out);
 extern ClusterFormationWitnessResult
-cluster_formation_witness_build_recovery_control_wait(
-	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out);
-extern ClusterFormationWitnessResult cluster_formation_witness_revalidate_nowait(
-	const ClusterFormationWitnessV1 *witness);
-extern ClusterFormationWitnessResult cluster_formation_classification_revalidate_nowait(
-	uint16 origin_thread, const ClusterFenceAuthorityProof *authority,
-	const ClusterFormationSnapshotV1 *snapshot);
-extern bool cluster_formation_snapshot_matches_v1(
-	const ClusterFormationSnapshotV1 *expected,
-	const ClusterFormationSnapshotV1 *observed);
+cluster_formation_witness_build_wait(uint16 origin_thread, bool opening_new_duty, int timeout_ms,
+									 ClusterFormationWitnessV1 **out);
+extern ClusterFormationWitnessResult
+cluster_formation_witness_build_live_wait(uint16 origin_thread, int timeout_ms,
+										  ClusterFormationWitnessV1 **out);
+extern ClusterFormationWitnessResult
+cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread, int timeout_ms,
+													  ClusterFormationWitnessV1 **out);
+extern ClusterFormationWitnessResult
+cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *witness);
+extern ClusterFormationWitnessResult
+cluster_formation_classification_revalidate_nowait(uint16 origin_thread,
+												   const ClusterFenceAuthorityProof *authority,
+												   const ClusterFormationSnapshotV1 *snapshot);
+extern bool cluster_formation_snapshot_matches_v1(const ClusterFormationSnapshotV1 *expected,
+												  const ClusterFormationSnapshotV1 *observed);
 /* Copy the immutable classification already owned by an admitted witness.
  * This performs no current-state read; callers must separately revalidate the
  * same opaque witness before consuming the copy. */
 extern bool cluster_formation_witness_copy_classification_v1(
 	const ClusterFormationWitnessV1 *witness, uint16 *origin_thread,
 	ClusterFenceAuthorityProof *authority, ClusterFormationSnapshotV1 *snapshot);
-extern const ClusterFenceAuthorityProof *cluster_formation_witness_authority(
-	const ClusterFormationWitnessV1 *witness);
+extern const ClusterFenceAuthorityProof *
+cluster_formation_witness_authority(const ClusterFormationWitnessV1 *witness);
 extern void cluster_formation_witness_destroy(ClusterFormationWitnessV1 **witness);
 
 #endif /* CLUSTER_RECOVERY_DUTY_H */

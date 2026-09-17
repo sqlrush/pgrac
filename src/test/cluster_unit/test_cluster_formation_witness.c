@@ -8,7 +8,7 @@
 
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_semantic_activation.h" /* ACK stage enum (G3 stub) */
-#include "storage/latch.h" /* recovery path retry stubs (MyLatch/WaitLatch) */
+#include "storage/latch.h"						 /* recovery path retry stubs (MyLatch/WaitLatch) */
 
 #undef printf
 #undef fprintf
@@ -35,11 +35,19 @@ static uint64 cache_sequence;
 /* Added to the product header by the GREEN; keep the RED link-exact rather
  * than relying on an implicit declaration. */
 extern ClusterFormationWitnessResult
-cluster_formation_witness_build_recovery_control_wait(
-	uint16 origin_thread, int timeout_ms, ClusterFormationWitnessV1 **out);
+cluster_formation_witness_build_recovery_control_wait(uint16 origin_thread, int timeout_ms,
+													  ClusterFormationWitnessV1 **out);
 
-void *palloc(Size size) { return malloc(size); }
-void pfree(void *pointer) { free(pointer); }
+void *
+palloc(Size size)
+{
+	return malloc(size);
+}
+void
+pfree(void *pointer)
+{
+	free(pointer);
+}
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -55,7 +63,7 @@ pg_usleep(long microsec)
 
 bool
 cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
-											ClusterFormationSnapshotV1 *out)
+											   ClusterFormationSnapshotV1 *out)
 {
 	(void)origin_thread;
 	if (!snapshot_available)
@@ -75,8 +83,8 @@ cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 
 bool
 cluster_write_fence_authority_cache_publish_if_unchanged(const ClusterFenceMarker *marker,
-												 uint64 published_at_us,
-												 uint64 expected_sequence)
+														 uint64 published_at_us,
+														 uint64 expected_sequence)
 {
 	(void)marker;
 	(void)published_at_us;
@@ -94,9 +102,10 @@ cluster_write_fence_authority_cache_sequence(void)
  * product object also owns the runtime owner-rejoin path; keep those unused
  * dependencies fail-closed without widening this unit's link boundary. */
 ClusterControlRootResult
-cluster_control_root_lookup_owner_by_node_runtime(
-	int32 old_node_id, ClusterControlRootIdentity *out_identity,
-	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token)
+cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
+												  ClusterControlRootIdentity *out_identity,
+												  ClusterControlRootSnapshot *out_snapshot,
+												  ClusterControlRootReadToken *out_token)
 {
 	(void)old_node_id;
 	(void)out_identity;
@@ -110,8 +119,7 @@ cluster_control_root_lookup_owner_by_node_runtime(
  * formation-witness entry points, so keep the proofs fail-closed. */
 bool
 cluster_semantic_activation_ack_complete_matches(
-	uint64 transition_epoch pg_attribute_unused(),
-	uint64 record_generation pg_attribute_unused(),
+	uint64 transition_epoch pg_attribute_unused(), uint64 record_generation pg_attribute_unused(),
 	uint64 expected_members_lo pg_attribute_unused(),
 	uint64 expected_members_hi pg_attribute_unused(),
 	uint64 source_feature_bitmap pg_attribute_unused(),
@@ -135,10 +143,9 @@ cluster_wal_state_correctness_census_ok(void)
 }
 
 ClusterRecoveryOwnerImportResult
-cluster_recovery_owner_import_read_v1(
-	int32 node_id, const ClusterWalThreadClaim *immutable_claim,
-	uint64 frozen_admitted_bitmap_low, uint64 frozen_admitted_bitmap_high,
-	uint64 *out_incarnation)
+cluster_recovery_owner_import_read_v1(int32 node_id, const ClusterWalThreadClaim *immutable_claim,
+									  uint64 frozen_admitted_bitmap_low,
+									  uint64 frozen_admitted_bitmap_high, uint64 *out_incarnation)
 {
 	(void)node_id;
 	(void)immutable_claim;
@@ -149,10 +156,11 @@ cluster_recovery_owner_import_read_v1(
 }
 
 ClusterControlRootResult
-cluster_control_root_compare_and_publish(
-	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootPatch *patch, ClusterControlRootPublishReason reason,
-	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token)
+cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expected_token,
+										 const ClusterControlRootPatch *patch,
+										 ClusterControlRootPublishReason reason,
+										 ClusterControlRootSnapshot *out_snapshot,
+										 ClusterControlRootReadToken *out_token)
 {
 	(void)expected_token;
 	(void)patch;
@@ -231,31 +239,30 @@ GetCurrentTimestamp(void)
 TimestampTz
 TimestampTzPlusMilliseconds(TimestampTz t, int64 ms)
 {
-	return t + (TimestampTz) ms * 1000;
+	return t + (TimestampTz)ms * 1000;
 }
 
 int
 WaitLatch(Latch *latch, int wakeEvents, long timeout, uint32 wait_event_info)
 {
-	(void) latch;
-	(void) wakeEvents;
-	(void) timeout;
-	(void) wait_event_info;
+	(void)latch;
+	(void)wakeEvents;
+	(void)timeout;
+	(void)wait_event_info;
 	return WL_TIMEOUT;
 }
 
 void
 ResetLatch(Latch *latch)
 {
-	(void) latch;
+	(void)latch;
 }
 
 volatile sig_atomic_t InterruptPending = 0;
 
 void
 ProcessInterrupts(void)
-{
-}
+{}
 
 /* recovery path: the retry rebinds the leaver's serving authority on the success
  * path; this fixture never reaches it. */
@@ -455,17 +462,17 @@ UT_TEST(test_recovery_control_witness_is_initial_only_and_survives_gate_open)
 	snapshots[0].local_epoch = 1;
 	snapshots[1] = snapshots[0];
 	snapshot_call = 0;
-	UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(
-				 1, 1, &witness), CLUSTER_FORMATION_WITNESS_UNSTABLE);
+	UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(1, 1, &witness),
+				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
 	UT_ASSERT_NULL(witness);
 	snapshots[0].local_epoch = UINT64_C(0);
 	snapshots[1] = snapshots[0];
 	snapshot_call = 0;
-	UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(
-				 1, 10, &witness), CLUSTER_FORMATION_WITNESS_READY);
+	UT_ASSERT_EQ(cluster_formation_witness_build_recovery_control_wait(1, 10, &witness),
+				 CLUSTER_FORMATION_WITNESS_READY);
 	UT_ASSERT_NOT_NULL(witness);
-	UT_ASSERT(cluster_formation_witness_copy_classification_v1(
-		witness, &origin_thread, &authority, &classification));
+	UT_ASSERT(cluster_formation_witness_copy_classification_v1(witness, &origin_thread, &authority,
+															   &classification));
 	UT_ASSERT_EQ(origin_thread, 1);
 
 	/* StartupXLOG later opens the exact same formation's write gate.  That one
@@ -473,14 +480,14 @@ UT_TEST(test_recovery_control_witness_is_initial_only_and_survives_gate_open)
 	snapshots[0].self_join_admitted = 1;
 	snapshots[1].self_join_admitted = 1;
 	snapshot_call = 0;
-	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(
-				 origin_thread, &authority, &classification),
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(origin_thread, &authority,
+																	&classification),
 				 CLUSTER_FORMATION_WITNESS_READY);
 	snapshots[0].membership.last_admitted_incarnation[0]++;
 	snapshots[1] = snapshots[0];
 	snapshot_call = 0;
-	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(
-				 origin_thread, &authority, &classification),
+	UT_ASSERT_EQ(cluster_formation_classification_revalidate_nowait(origin_thread, &authority,
+																	&classification),
 				 CLUSTER_FORMATION_WITNESS_UNSTABLE);
 	cluster_formation_witness_destroy(&witness);
 }

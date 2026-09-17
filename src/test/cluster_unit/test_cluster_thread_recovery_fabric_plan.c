@@ -13,11 +13,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-	int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name,
-		line_number);
+	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -35,45 +33,43 @@ static RfPageOnlineRecordIdentityV1 observed_identity;
 
 RfPageProofDetailV1
 rf_page_online_plan_create_v1(const RfPageOnlinePlanRequestV1 *request,
-	RfPageOnlinePlanV1 **out_plan)
+							  RfPageOnlinePlanV1 **out_plan)
 {
-	UT_ASSERT(request != NULL && request->system_identifier == 99 &&
-		request->participant_count == 1 &&
-		request->retention_binding_cookie == 41);
-	*out_plan = (RfPageOnlinePlanV1 *) &page_plan_object;
+	UT_ASSERT(request != NULL && request->system_identifier == 99 && request->participant_count == 1
+			  && request->retention_binding_cookie == 41);
+	*out_plan = (RfPageOnlinePlanV1 *)&page_plan_object;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1
 rf_side_online_plan_create_v1(const RfSideOnlinePlanRequestV1 *request,
-	RfSideOnlinePlanV1 **out_plan)
+							  RfSideOnlinePlanV1 **out_plan)
 {
-	UT_ASSERT(request != NULL && request->system_identifier == 99 &&
-		request->participant_count == 1);
-	*out_plan = (RfSideOnlinePlanV1 *) &side_plan_object;
+	UT_ASSERT(request != NULL && request->system_identifier == 99
+			  && request->participant_count == 1);
+	*out_plan = (RfSideOnlinePlanV1 *)&side_plan_object;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1
 rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
-	const RfDetachedOwnerOpsV1 *owner_ops, RfDetachedRecordPlanV1 *plan)
+							  const RfDetachedOwnerOpsV1 *owner_ops, RfDetachedRecordPlanV1 *plan)
 {
 	RfOpcodeRouteV1 route;
 
-	UT_ASSERT(!space_active && owner_ops != NULL &&
-		owner_ops->preflight_side_record != NULL &&
-		owner_ops->preflight_side_component != NULL &&
-		owner_ops->preflight_rebuildable_component != NULL);
+	UT_ASSERT(!space_active && owner_ops != NULL && owner_ops->preflight_side_record != NULL
+			  && owner_ops->preflight_side_component != NULL
+			  && owner_ops->preflight_rebuildable_component != NULL);
 	memset(&route, 0, sizeof(route));
 	route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
-	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route,
-		NULL, NULL), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route, NULL, NULL),
+				 RF_PAGE_PROOF_DETAIL_OK);
 	route.record_owner = RF_ROUTE_OWNER_SIDE_TYPED;
-	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route,
-		NULL, NULL), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route, NULL, NULL),
+				 RF_PAGE_PROOF_DETAIL_OK);
 	route.record_owner = RF_ROUTE_OWNER_INVALID;
-	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route,
-		NULL, NULL), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(owner_ops->preflight_side_record(owner_ops->arg, &route, NULL, NULL),
+				 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 	memset(plan, 0, sizeof(*plan));
 	plan->source_record = record;
 	plan->route.record_owner = RF_ROUTE_OWNER_LOGICAL_NOOP;
@@ -84,33 +80,31 @@ rf_page_detached_preflight_v1(XLogReaderState *record, bool space_active,
 
 RfPageProofDetailV1
 rf_page_online_plan_feed_record_v1(RfPageOnlinePlanV1 *plan,
-	const RfDetachedRecordPlanV1 *record_plan,
-	const RfPageOnlineRecordIdentityV1 *identity)
+								   const RfDetachedRecordPlanV1 *record_plan,
+								   const RfPageOnlineRecordIdentityV1 *identity)
 {
-	UT_ASSERT(plan == (RfPageOnlinePlanV1 *) &page_plan_object &&
-		record_plan != NULL && record_plan->preflight_complete);
+	UT_ASSERT(plan == (RfPageOnlinePlanV1 *)&page_plan_object && record_plan != NULL
+			  && record_plan->preflight_complete);
 	observed_identity = *identity;
 	page_feed_step = ++step;
-	return fail_page_feed ? RF_PAGE_PROOF_DETAIL_EDGE_GAP :
-		RF_PAGE_PROOF_DETAIL_OK;
+	return fail_page_feed ? RF_PAGE_PROOF_DETAIL_EDGE_GAP : RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1
 rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
-	const RfDetachedRecordPlanV1 *record_plan,
-	const RfPageOnlineRecordIdentityV1 *identity)
+								   const RfDetachedRecordPlanV1 *record_plan,
+								   const RfPageOnlineRecordIdentityV1 *identity)
 {
-	UT_ASSERT(plan == (RfSideOnlinePlanV1 *) &side_plan_object &&
-		record_plan != NULL && identity != NULL);
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&side_plan_object && record_plan != NULL
+			  && identity != NULL);
 	side_feed_step = ++step;
-	return fail_side_feed ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE :
-		RF_PAGE_PROOF_DETAIL_OK;
+	return fail_side_feed ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1
 rf_page_online_plan_seal_v1(RfPageOnlinePlanV1 *plan)
 {
-	UT_ASSERT(plan == (RfPageOnlinePlanV1 *) &page_plan_object);
+	UT_ASSERT(plan == (RfPageOnlinePlanV1 *)&page_plan_object);
 	page_seal_step = ++step;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
@@ -118,7 +112,7 @@ rf_page_online_plan_seal_v1(RfPageOnlinePlanV1 *plan)
 RfPageProofDetailV1
 rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 {
-	UT_ASSERT(plan == (RfSideOnlinePlanV1 *) &side_plan_object);
+	UT_ASSERT(plan == (RfSideOnlinePlanV1 *)&side_plan_object);
 	side_seal_step = ++step;
 	return RF_PAGE_PROOF_DETAIL_OK;
 }
@@ -163,8 +157,8 @@ create_plan(void)
 	request.physical_cuts = &cut;
 	request.participant_count = 1;
 	request.retention_binding_cookie = 41;
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_create_v1(&request,
-		&plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_create_v1(&request, &plan),
+				 RF_PAGE_PROOF_DETAIL_OK);
 	return plan;
 }
 
@@ -179,7 +173,7 @@ init_reader(XLogReaderState *reader, DecodedXLogRecord *decoded)
 	reader->EndRecPtr = 0x200;
 	decoded->lsn = reader->ReadRecPtr;
 	decoded->next_lsn = reader->EndRecPtr;
-	decoded->header.xl_crc = (pg_crc32c) 0x12345678;
+	decoded->header.xl_crc = (pg_crc32c)0x12345678;
 	decoded->header.xl_rmid = RM_XLOG_ID;
 	decoded->header.xl_info = 0x50;
 }
@@ -192,8 +186,8 @@ UT_TEST(test_record_is_preflighted_then_fed_to_page_and_side)
 
 	reset_steps();
 	init_reader(&reader, &decoded);
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan,
-		&reader, 0), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan, &reader, 0),
+				 RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(detached_step < page_feed_step && page_feed_step < side_feed_step);
 	UT_ASSERT_EQ(observed_identity.record.system_identifier, 99);
 	UT_ASSERT_EQ(observed_identity.record.origin_thread, 2);
@@ -216,11 +210,11 @@ UT_TEST(test_page_failure_prevents_side_and_poisons_plan)
 	reset_steps();
 	init_reader(&reader, &decoded);
 	fail_page_feed = true;
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan,
-		&reader, 0), RF_PAGE_PROOF_DETAIL_EDGE_GAP);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan, &reader, 0),
+				 RF_PAGE_PROOF_DETAIL_EDGE_GAP);
 	UT_ASSERT_EQ(side_feed_step, 0);
 	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE);
+				 RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE);
 	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
 }
 
@@ -233,11 +227,11 @@ UT_TEST(test_side_failure_poisons_whole_plan)
 	reset_steps();
 	init_reader(&reader, &decoded);
 	fail_side_feed = true;
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan,
-		&reader, 0), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan, &reader, 0),
+				 RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
 	UT_ASSERT(page_feed_step != 0 && side_feed_step != 0);
 	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE);
+				 RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE);
 	cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
 }
 
@@ -249,19 +243,17 @@ UT_TEST(test_seal_closes_page_before_side_and_exposes_both)
 
 	reset_steps();
 	init_reader(&reader, &decoded);
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan,
-		&reader, 0), RF_PAGE_PROOF_DETAIL_OK);
-	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_seal_v1(plan),
-		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_feed_record_v1(plan, &reader, 0),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
 	UT_ASSERT(page_seal_step < side_seal_step);
-	UT_ASSERT(cluster_thread_recovery_fabric_page_plan_v1(plan) ==
-		(RfPageOnlinePlanV1 *) &page_plan_object);
-	UT_ASSERT(cluster_thread_recovery_fabric_side_plan_v1(plan) ==
-		(RfSideOnlinePlanV1 *) &side_plan_object);
+	UT_ASSERT(cluster_thread_recovery_fabric_page_plan_v1(plan)
+			  == (RfPageOnlinePlanV1 *)&page_plan_object);
+	UT_ASSERT(cluster_thread_recovery_fabric_side_plan_v1(plan)
+			  == (RfSideOnlinePlanV1 *)&side_plan_object);
 	UT_ASSERT_EQ(cluster_thread_recovery_fabric_participant_count_v1(plan), 1);
-	UT_ASSERT(cluster_thread_recovery_fabric_identity_matches_v1(plan, 99,
-		(const uint8[16]) {3, 3, 3, 3, 3, 3, 3, 3,
-			3, 3, 3, 3, 3, 3, 3, 3}));
+	UT_ASSERT(cluster_thread_recovery_fabric_identity_matches_v1(
+		plan, 99, (const uint8[16]){ 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3 }));
 	{
 		RfContributorStreamCutV1 cut;
 

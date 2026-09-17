@@ -370,8 +370,7 @@ cluster_clean_leave_serve_gate_allows(bool block_from_leaving, bool leave_flushe
  * clean-leave behavior.  Once the readiness lifecycle is managed, clean leave
  * is an ordinary serving transition and cannot start or advance before OPEN. */
 bool
-cluster_clean_leave_startup_serving_allows(bool authority_managed,
-										 bool serving_ready)
+cluster_clean_leave_startup_serving_allows(bool authority_managed, bool serving_ready)
 {
 	return !authority_managed || serving_ready;
 }
@@ -475,8 +474,7 @@ cluster_clean_leave_ack_payload_valid(const ClusterLeaveAckPayload *p)
 		return false;
 	if (p->leaving_node_id < 0 || p->leaving_node_id >= CLUSTER_CLEAN_LEAVE_MAX_NODE_ID)
 		return false;
-	if (p->phase1_round != 0
-		&& p->phase1_round != CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE)
+	if (p->phase1_round != 0 && p->phase1_round != CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE)
 		return false;
 	if (p->phase1_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE
 		&& (p->_pad0 != 0 || p->_pad1 != 0
@@ -494,54 +492,47 @@ cluster_clean_leave_ack_payload_valid(const ClusterLeaveAckPayload *p)
  * ------------------------------------------------------------------ */
 
 bool
-cluster_clean_leave_phase1_full_stop_plan_valid(
-	const ClusterPhase1FullStopPlan *plan)
+cluster_clean_leave_phase1_full_stop_plan_valid(const ClusterPhase1FullStopPlan *plan)
 {
 	int i;
 
-	if (plan == NULL || !plan->valid || plan->epoch != 0
-		|| plan->attempt_nonce == 0 || plan->attempt_nonce == UINT64_MAX
-		|| plan->absolute_deadline_us == 0
-		|| plan->absolute_deadline_us == UINT64_MAX
-		|| plan->own_wal_started_at <= 0)
+	if (plan == NULL || !plan->valid || plan->epoch != 0 || plan->attempt_nonce == 0
+		|| plan->attempt_nonce == UINT64_MAX || plan->absolute_deadline_us == 0
+		|| plan->absolute_deadline_us == UINT64_MAX || plan->own_wal_started_at <= 0)
 		return false;
 	for (i = 0; i < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; i++) {
-		if (plan->member_incarnations[i] == 0
-			|| plan->member_incarnations[i] == UINT64_MAX)
+		if (plan->member_incarnations[i] == 0 || plan->member_incarnations[i] == UINT64_MAX)
 			return false;
 	}
 	return true;
 }
 
 bool
-cluster_clean_leave_phase1_full_stop_probe_accepts(
-	uint8 producer_kind, bool preflight, int32 envelope_source_node,
-	int32 payload_leaving_node, uint64 envelope_epoch, uint64 payload_epoch,
-	uint64 attempt_nonce, bool local_fast_shutdown, bool exact_phase1_eligible)
+cluster_clean_leave_phase1_full_stop_probe_accepts(uint8 producer_kind, bool preflight,
+												   int32 envelope_source_node,
+												   int32 payload_leaving_node,
+												   uint64 envelope_epoch, uint64 payload_epoch,
+												   uint64 attempt_nonce, bool local_fast_shutdown,
+												   bool exact_phase1_eligible)
 {
-	return producer_kind == CLUSTER_LEAVE_PRODUCER_SHUTDOWN
-		&& preflight
-		&& envelope_source_node >= 0
-		&& envelope_source_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-		&& envelope_source_node == payload_leaving_node
-		&& envelope_epoch == payload_epoch
-		&& payload_epoch == 0
-		&& attempt_nonce != 0 && attempt_nonce != UINT64_MAX
-		&& local_fast_shutdown && exact_phase1_eligible;
+	return producer_kind == CLUSTER_LEAVE_PRODUCER_SHUTDOWN && preflight
+		   && envelope_source_node >= 0
+		   && envelope_source_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		   && envelope_source_node == payload_leaving_node && envelope_epoch == payload_epoch
+		   && payload_epoch == 0 && attempt_nonce != 0 && attempt_nonce != UINT64_MAX
+		   && local_fast_shutdown && exact_phase1_eligible;
 }
 
 bool
-cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
-	bool source_active, bool source_stopped,
-	bool local_active, bool local_stopped)
+cluster_clean_leave_phase1_full_stop_probe_phase_accepts(bool source_active, bool source_stopped,
+														 bool local_active, bool local_stopped)
 {
 	/* The two rounds deliberately reuse one wire shape.  Existing source
 	 * WAL/root evidence is therefore the phase discriminator: an ACTIVE source
 	 * is still in the first round, while STOPPED+CLOSED is the second round.
 	 * A receiver may already have closed while helping a slower first-round
 	 * peer, but it must never ACK a second-round peer before its own close. */
-	if (source_active == source_stopped
-		|| local_active == local_stopped)
+	if (source_active == source_stopped || local_active == local_stopped)
 		return false;
 	if (source_stopped)
 		return local_stopped;
@@ -550,8 +541,8 @@ cluster_clean_leave_phase1_full_stop_probe_phase_accepts(
 
 bool
 cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
-	bool local_stopped, bool request_in_progress, bool shutdown_driven,
-	bool preflight_pending, bool preflight_sent, bool release_pending)
+	bool local_stopped, bool request_in_progress, bool shutdown_driven, bool preflight_pending,
+	bool preflight_sent, bool release_pending)
 {
 	/* The STOPPED after-image becomes an acknowledged local terminal only
 	 * after its publisher has confirmed the CF release and armed this process's
@@ -561,89 +552,73 @@ cluster_clean_leave_phase1_full_stop_post_stopped_receiver_ready(
 	 * release/completion phase is active; accepting a slower peer's replay in
 	 * that interval prevents a one-way completion race without reopening the
 	 * round or refreshing its deadline. */
-	return local_stopped && request_in_progress && shutdown_driven
-		&& preflight_sent && (preflight_pending || release_pending);
+	return local_stopped && request_in_progress && shutdown_driven && preflight_sent
+		   && (preflight_pending || release_pending);
 }
 
 bool
 cluster_clean_leave_phase1_full_stop_release_probe_accepts(
-	uint8 producer_kind, uint8 wire_round, int32 envelope_source_node,
-	int32 payload_leaving_node, uint64 envelope_epoch, uint64 payload_epoch,
-	uint64 nonce, bool source_stopped, bool local_stopped,
-	bool exact_phase1_eligible)
+	uint8 producer_kind, uint8 wire_round, int32 envelope_source_node, int32 payload_leaving_node,
+	uint64 envelope_epoch, uint64 payload_epoch, uint64 nonce, bool source_stopped,
+	bool local_stopped, bool exact_phase1_eligible)
 {
 	return producer_kind == CLUSTER_LEAVE_PRODUCER_SHUTDOWN
-		&& wire_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE
-		&& envelope_source_node >= 0
-		&& envelope_source_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-		&& envelope_source_node == payload_leaving_node
-		&& envelope_epoch == payload_epoch
-		&& payload_epoch == 0
-		&& nonce != 0 && nonce != UINT64_MAX
-		&& source_stopped && local_stopped && exact_phase1_eligible;
+		   && wire_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE && envelope_source_node >= 0
+		   && envelope_source_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		   && envelope_source_node == payload_leaving_node && envelope_epoch == payload_epoch
+		   && payload_epoch == 0 && nonce != 0 && nonce != UINT64_MAX && source_stopped
+		   && local_stopped && exact_phase1_eligible;
 }
 
 bool
-cluster_clean_leave_phase1_full_stop_receipt_accepts(
-	uint8 producer_kind, uint8 wire_round, bool release_pending,
-	uint64 stored_nonce, uint64 receipt_nonce, bool request_seen)
+cluster_clean_leave_phase1_full_stop_receipt_accepts(uint8 producer_kind, uint8 wire_round,
+													 bool release_pending, uint64 stored_nonce,
+													 uint64 receipt_nonce, bool request_seen)
 {
 	/* The exact receipt is peer-consumption evidence for a reply whose local
 	 * reply_sent publication may still be catching up after dispatch.  Do not
 	 * require that local bookkeeping bit here: the terminal predicate checks it
 	 * independently together with every other delivery bit and transport drain. */
 	return producer_kind == CLUSTER_LEAVE_PRODUCER_SHUTDOWN
-		&& wire_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT
-		&& release_pending
-		&& stored_nonce != 0 && stored_nonce != UINT64_MAX
-		&& receipt_nonce == stored_nonce
-		&& request_seen;
+		   && wire_round == CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT && release_pending
+		   && stored_nonce != 0 && stored_nonce != UINT64_MAX && receipt_nonce == stored_nonce
+		   && request_seen;
 }
 
 bool
 cluster_clean_leave_phase1_full_stop_release_complete(
-	const ClusterPhase1FullStopPlan *plan, int32 self_node,
-	const uint8 *request_sent, const uint8 *request_seen,
-	const uint8 *reply_sent, const uint8 *reply_seen,
-	const uint8 *receipt_sent, const uint8 *receipt_seen,
-	int nbytes, bool transport_drained)
+	const ClusterPhase1FullStopPlan *plan, int32 self_node, const uint8 *request_sent,
+	const uint8 *request_seen, const uint8 *reply_sent, const uint8 *reply_seen,
+	const uint8 *receipt_sent, const uint8 *receipt_seen, int nbytes, bool transport_drained)
 {
 	return transport_drained
-		&& cluster_clean_leave_phase1_full_stop_ack_complete(
-			plan, self_node, request_sent, nbytes)
-		&& cluster_clean_leave_phase1_full_stop_ack_complete(
-			plan, self_node, request_seen, nbytes)
-		&& cluster_clean_leave_phase1_full_stop_ack_complete(
-			plan, self_node, reply_sent, nbytes)
-		&& cluster_clean_leave_phase1_full_stop_ack_complete(
-			plan, self_node, reply_seen, nbytes)
-		&& cluster_clean_leave_phase1_full_stop_ack_complete(
-			plan, self_node, receipt_sent, nbytes)
-		&& cluster_clean_leave_phase1_full_stop_ack_complete(
-			plan, self_node, receipt_seen, nbytes);
+		   && cluster_clean_leave_phase1_full_stop_ack_complete(plan, self_node, request_sent,
+																nbytes)
+		   && cluster_clean_leave_phase1_full_stop_ack_complete(plan, self_node, request_seen,
+																nbytes)
+		   && cluster_clean_leave_phase1_full_stop_ack_complete(plan, self_node, reply_sent, nbytes)
+		   && cluster_clean_leave_phase1_full_stop_ack_complete(plan, self_node, reply_seen, nbytes)
+		   && cluster_clean_leave_phase1_full_stop_ack_complete(plan, self_node, receipt_sent,
+																nbytes)
+		   && cluster_clean_leave_phase1_full_stop_ack_complete(plan, self_node, receipt_seen,
+																nbytes);
 }
 
 bool
 cluster_clean_leave_phase1_full_stop_request_ahead_can_consume(
-	bool retained, bool retained_before_local_round,
-	uint64 retained_local_nonce, uint64 retained_deadline_us,
-	uint64 current_local_nonce, uint64 current_deadline_us,
-	bool exact_identity, bool request_in_progress,
-	bool shutdown_driven, bool post_requests_sent)
+	bool retained, bool retained_before_local_round, uint64 retained_local_nonce,
+	uint64 retained_deadline_us, uint64 current_local_nonce, uint64 current_deadline_us,
+	bool exact_identity, bool request_in_progress, bool shutdown_driven, bool post_requests_sent)
 {
-	if (!retained || !exact_identity || !request_in_progress
-		|| !shutdown_driven || !post_requests_sent
-		|| retained_local_nonce == 0
-		|| retained_local_nonce == UINT64_MAX
-		|| retained_deadline_us == 0
-		|| retained_deadline_us == UINT64_MAX
-		|| current_local_nonce == 0
-		|| current_local_nonce == UINT64_MAX
+	if (!retained || !exact_identity || !request_in_progress || !shutdown_driven
+		|| !post_requests_sent || retained_local_nonce == 0 || retained_local_nonce == UINT64_MAX
+		|| retained_deadline_us == 0 || retained_deadline_us == UINT64_MAX
+		|| current_local_nonce == 0 || current_local_nonce == UINT64_MAX
 		|| current_deadline_us != retained_deadline_us)
 		return false;
 	if (retained_before_local_round)
-		return cluster_clean_leave_phase1_full_stop_nonce_fresh(
-			retained_local_nonce, current_local_nonce);
+		return cluster_clean_leave_phase1_full_stop_nonce_fresh(retained_local_nonce,
+																current_local_nonce);
 	return current_local_nonce == retained_local_nonce;
 }
 
@@ -662,38 +637,30 @@ cluster_clean_leave_phase1_full_stop_request_ahead_uses_predecessor_nonce(
 }
 
 bool
-cluster_clean_leave_phase1_full_stop_ack_matches(
-	const ClusterPhase1FullStopPlan *plan, int32 self_node,
-	int32 envelope_source_node, int32 survivor_node, int32 leaving_node,
-	uint64 payload_epoch, uint64 attempt_nonce,
-	uint64 current_survivor_incarnation)
+cluster_clean_leave_phase1_full_stop_ack_matches(const ClusterPhase1FullStopPlan *plan,
+												 int32 self_node, int32 envelope_source_node,
+												 int32 survivor_node, int32 leaving_node,
+												 uint64 payload_epoch, uint64 attempt_nonce,
+												 uint64 current_survivor_incarnation)
 {
-	return cluster_clean_leave_phase1_full_stop_plan_valid(plan)
-		&& self_node >= 0
-		&& self_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-		&& survivor_node >= 0
-		&& survivor_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-		&& survivor_node != self_node
-		&& envelope_source_node == survivor_node
-		&& leaving_node == self_node
-		&& payload_epoch == plan->epoch
-		&& attempt_nonce == plan->attempt_nonce
-		&& current_survivor_incarnation
-			== plan->member_incarnations[survivor_node];
+	return cluster_clean_leave_phase1_full_stop_plan_valid(plan) && self_node >= 0
+		   && self_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT && survivor_node >= 0
+		   && survivor_node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT && survivor_node != self_node
+		   && envelope_source_node == survivor_node && leaving_node == self_node
+		   && payload_epoch == plan->epoch && attempt_nonce == plan->attempt_nonce
+		   && current_survivor_incarnation == plan->member_incarnations[survivor_node];
 }
 
 bool
-cluster_clean_leave_phase1_full_stop_ack_complete(
-	const ClusterPhase1FullStopPlan *plan, int32 self_node,
-	const uint8 *ack_bitmap, int nbytes)
+cluster_clean_leave_phase1_full_stop_ack_complete(const ClusterPhase1FullStopPlan *plan,
+												  int32 self_node, const uint8 *ack_bitmap,
+												  int nbytes)
 {
 	uint8 expected;
 	int i;
 
-	if (!cluster_clean_leave_phase1_full_stop_plan_valid(plan)
-		|| self_node < 0
-		|| self_node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-		|| ack_bitmap == NULL
+	if (!cluster_clean_leave_phase1_full_stop_plan_valid(plan) || self_node < 0
+		|| self_node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || ack_bitmap == NULL
 		|| nbytes != CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES)
 		return false;
 	expected = (uint8)(UINT8_C(0x0f) & ~(UINT8_C(1) << self_node));
@@ -707,20 +674,17 @@ cluster_clean_leave_phase1_full_stop_ack_complete(
 }
 
 bool
-cluster_clean_leave_phase1_full_stop_nonce_fresh(uint64 prior_nonce,
-										uint64 next_nonce)
+cluster_clean_leave_phase1_full_stop_nonce_fresh(uint64 prior_nonce, uint64 next_nonce)
 {
-	return prior_nonce != 0 && prior_nonce != UINT64_MAX
-		&& next_nonce != 0 && next_nonce != UINT64_MAX
-		&& next_nonce != prior_nonce;
+	return prior_nonce != 0 && prior_nonce != UINT64_MAX && next_nonce != 0
+		   && next_nonce != UINT64_MAX && next_nonce != prior_nonce;
 }
 
 ClusterPhase1FullStopProbeNonceDecision
-cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
-	uint64 active_nonce, uint64 stopped_nonce, uint64 incoming_nonce)
+cluster_clean_leave_phase1_full_stop_probe_nonce_decide(uint64 active_nonce, uint64 stopped_nonce,
+														uint64 incoming_nonce)
 {
-	if (active_nonce == 0 || active_nonce == UINT64_MAX
-		|| stopped_nonce == UINT64_MAX
+	if (active_nonce == 0 || active_nonce == UINT64_MAX || stopped_nonce == UINT64_MAX
 		|| incoming_nonce == 0 || incoming_nonce == UINT64_MAX)
 		return CLUSTER_PHASE1_PROBE_NONCE_CONFLICT;
 	if (incoming_nonce == active_nonce)

@@ -1557,7 +1557,9 @@ test_stop_wait(WaitEvent *events)
 		return 0; /* original reply/handoff publication, not the observer */
 	}
 	if (test_stop_case == 9) {
-		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_QUIESCE);
+		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK);
+		cl_state->ack_bitmap[0] = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+		cl_normal_stop->peer_reply_sent = cl_state->ack_bitmap[0];
 		/* Other actual actors are an explicit controller boundary here. */
 		pg_atomic_write_u32(&cl_normal_stop->service_idle_mask,
 							pg_atomic_read_u32(&cl_normal_stop->service_idle_mask) | 1538);
@@ -1587,6 +1589,9 @@ test_stop_wait(WaitEvent *events)
 static void
 test_run_normal_stop_lmon(bool transport, int scenario)
 {
+	int saved_node_id = cluster_node_id;
+
+	cluster_node_id = 0;
 	if (!test_lmon_shmem_found)
 		cluster_lmon_shmem_init();
 	memset(&test_stop_region, 0, sizeof(test_stop_region));
@@ -1669,6 +1674,7 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	UT_ASSERT_EQ(test_stop_lock_depth, 0);
 	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
 	IsUnderPostmaster = false;
+	cluster_node_id = saved_node_id;
 }
 
 UT_TEST(test_stop_real_lmon_both_modes_work_wait_exit)

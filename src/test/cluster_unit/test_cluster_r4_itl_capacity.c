@@ -74,6 +74,8 @@ itl_origin(const ClusterTxLocator *locator, uint64 epoch, ClusterTxResolution *o
 		out->proof_kind = CLUSTER_TX_PROOF_ORIGIN_TWOPHASE;
 	} else if (origin_fault == 4)
 		pg_atomic_write_u64(&ut_itl_census_semantic.record_generation, 74);
+	else if (origin_fault == 6)
+		out->outcome = CLUSTER_TX_ABORTED;
 	return out->outcome;
 }
 
@@ -188,12 +190,70 @@ UT_TEST(test_capacity_keeps_unknown_identity_prepared_and_admission_refusals)
 	}
 }
 
+/* The origin producer's TT-reuse proof is tested in r4_tx_outcome. Here its
+ * exact terminal response traverses the real resolver and real heap census;
+ * all eight old lock-only slots must be terminalized, not left active. */
+UT_TEST(test_origin_abort_releases_eight_lock_only_slots_through_real_census)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	ClusterItlSlotData *slots;
+
+	ut_itl_census_begin(&fixture, &hot, true);
+	origin_fault = 6;
+	origin_calls = active_publications = 0;
+	UT_ASSERT_EQ(cluster_heap_test_itl_capacity_outcome(UT_HOT_BUFFER, 9900, true),
+				 CLUSTER_HEAP_ITL_CAPACITY_READY);
+	slots = ClusterPageGetItlSlots((Page)fixture.live_page);
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		UT_ASSERT_EQ(slots[i].flags, ITL_FLAG_LOCK_ONLY_ABORTED);
+		UT_ASSERT_EQ(slots[i].commit_scn, InvalidScn);
+	}
+	UT_ASSERT_EQ(origin_calls, 8);
+	UT_ASSERT_EQ(active_publications, 0);
+	UT_ASSERT_EQ(ut_itl_wait_calls, 0);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 1);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_lock_capacity_does_not_mistake_self_data_slot_for_lock_capacity)
+{
+	for (int self_lock_slot = 0; self_lock_slot < 2; self_lock_slot++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		PGAlignedBlock before;
+		uint64 deadline = 0;
+		const char *reason = NULL;
+
+		ut_itl_census_begin(&fixture, &hot, true);
+		origin_fault = 0;
+		origin_calls = active_publications = 0;
+		ClusterPageGetItlSlots((Page)fixture.live_page)[0].flags
+			= self_lock_slot ? ITL_FLAG_LOCK_ONLY_ACTIVE : ITL_FLAG_ACTIVE;
+		pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+							CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		UT_ASSERT_EQ(cluster_heap_test_itl_wait_lock_capacity(1, 1200, &deadline, &reason),
+					 self_lock_slot ? CLUSTER_TXW_RETRY : CLUSTER_TXW_RESOLVED);
+		UT_ASSERT_EQ(ut_itl_wait_calls, self_lock_slot ? 0 : 1);
+		if (!self_lock_slot)
+			UT_ASSERT_EQ(ut_itl_wait_locator.xid, 1201);
+		UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		LockBuffer(1, BUFFER_LOCK_EXCLUSIVE); /* fixture teardown only */
+		ut_itl_census_end();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(2);
+	UT_PLAN(4);
 	UT_RUN(test_exact_active_owner_reaches_capacity_wait_through_real_resolver);
 	UT_RUN(test_capacity_keeps_unknown_identity_prepared_and_admission_refusals);
+	UT_RUN(test_origin_abort_releases_eight_lock_only_slots_through_real_census);
+	UT_RUN(test_lock_capacity_does_not_mistake_self_data_slot_for_lock_capacity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

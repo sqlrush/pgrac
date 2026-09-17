@@ -71,7 +71,7 @@ static ClusterPageRedoChange ut_changes[3];
 static void
 ut_setup_globals(void)
 {
-	int			i;
+	int i;
 
 	memset(&ut_id, 0, sizeof(ut_id));
 	ut_id.rlocator.spcOid = 1;
@@ -84,7 +84,7 @@ ut_setup_globals(void)
 		memset(&ut_v[i], 0, sizeof(ut_v[i]));
 		ut_v[i].identity = ut_id;
 		ut_v[i].incarnation = 7;
-		ut_v[i].token = (uint64) (100 + i);
+		ut_v[i].token = (uint64)(100 + i);
 	}
 	for (i = 0; i < 3; i++) {
 		memset(&ut_changes[i], 0, sizeof(ut_changes[i]));
@@ -105,14 +105,12 @@ UT_TEST(test_pu09_pu10_new_init_and_missing_lifecycle)
 
 	memset(&cin, 0, sizeof(cin));
 	cin.rmid = 10;
-	cin.opcode = 0x80;		   /* INIT_PAGE-shaped */
+	cin.opcode = 0x80; /* INIT_PAGE-shaped */
 	cin.forknum = MAIN_FORKNUM;
 	cin.page_absent = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&cin),
-				 (int) CLUSTER_PAGE_CLASS_NEW);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_NEW),
-				 (int) CLUSTER_PAGE_ACTION_INIT);
+	UT_ASSERT_EQ((int)cluster_page_classify(&cin), (int)CLUSTER_PAGE_CLASS_NEW);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_NEW),
+				 (int)CLUSTER_PAGE_ACTION_INIT);
 
 	/* PU-09: the typed UNFORMATTED before-state is present and exact. */
 	memset(&before, 0, sizeof(before));
@@ -141,11 +139,9 @@ UT_TEST(test_pu12_temp_discard_only_with_owner_proof)
 	cin.rmid = 10;
 	cin.opcode = 0x10;
 	cin.forknum = INIT_FORKNUM;
-	UT_ASSERT_EQ((int) cluster_page_classify(&cin),
-				 (int) CLUSTER_PAGE_CLASS_TEMP);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_TEMP),
-				 (int) CLUSTER_PAGE_ACTION_DISCARD);
+	UT_ASSERT_EQ((int)cluster_page_classify(&cin), (int)CLUSTER_PAGE_CLASS_TEMP);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_TEMP),
+				 (int)CLUSTER_PAGE_ACTION_DISCARD);
 	/* The owner/lifecycle proof is the apply layer's; classification and
 	 * action assignment are what the class layer can promise. */
 }
@@ -162,11 +158,9 @@ UT_TEST(test_pu15_pu16_fpi_provenance)
 	cin.opcode = 0x10;
 	cin.forknum = MAIN_FORKNUM;
 	cin.has_full_page_image = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&cin),
-				 (int) CLUSTER_PAGE_CLASS_FULLIMAGE);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_FULLIMAGE),
-				 (int) CLUSTER_PAGE_ACTION_IMAGE);
+	UT_ASSERT_EQ((int)cluster_page_classify(&cin), (int)CLUSTER_PAGE_CLASS_FULLIMAGE);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_FULLIMAGE),
+				 (int)CLUSTER_PAGE_ACTION_IMAGE);
 
 	/* PU-15: a valid source (integrity + lineage + owner) admits the
 	 * image payload path. */
@@ -199,11 +193,9 @@ UT_TEST(test_pu18_pu19_cleanout)
 	cin.forknum = MAIN_FORKNUM;
 	cin.is_cleanout = true;
 	/* Class identifiable from the declaration... */
-	UT_ASSERT_EQ((int) cluster_page_classify(&cin),
-				 (int) CLUSTER_PAGE_CLASS_CLEANOUT);
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_CLEANOUT),
-				 (int) CLUSTER_PAGE_ACTION_APPLY);
+	UT_ASSERT_EQ((int)cluster_page_classify(&cin), (int)CLUSTER_PAGE_CLASS_CLEANOUT);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_CLEANOUT),
+				 (int)CLUSTER_PAGE_ACTION_APPLY);
 	/* ...but the exact codec census is RED: the deterministic apply is
 	 * the apply layer's promise (PGDEL-06), and the decoder_registered
 	 * flag is false for every census row (PU-19: unknown codec stays
@@ -213,8 +205,7 @@ UT_TEST(test_pu18_pu19_cleanout)
 	 * classifier returns UNKNOWN (BLOCKED). */
 	cin.is_cleanout = true;
 	cin.has_will_init = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&cin),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&cin), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
 /* PU-20/PU-21: nonlogged. */
@@ -227,14 +218,12 @@ UT_TEST(test_pu20_pu21_nonlogged)
 	cin.opcode = 0x10;
 	cin.forknum = MAIN_FORKNUM;
 	cin.relation_is_unlogged = true;
-	UT_ASSERT_EQ((int) cluster_page_classify(&cin),
-				 (int) CLUSTER_PAGE_CLASS_NONLOGGED);
+	UT_ASSERT_EQ((int)cluster_page_classify(&cin), (int)CLUSTER_PAGE_CLASS_NONLOGGED);
 	/* Typed rebuild action; the rebuild owner proof is the apply layer's
 	 * — without it the resource stays BLOCKED (PU-21), which the action
 	 * table's REBUILD + the apply-layer owner gate express. */
-	UT_ASSERT_EQ((int) cluster_page_class_recovery_action(
-					 CLUSTER_PAGE_CLASS_NONLOGGED),
-				 (int) CLUSTER_PAGE_ACTION_REBUILD);
+	UT_ASSERT_EQ((int)cluster_page_class_recovery_action(CLUSTER_PAGE_CLASS_NONLOGGED),
+				 (int)CLUSTER_PAGE_ACTION_REBUILD);
 }
 
 /* PU-11/PU-27: incarnation cross + cross-thread rejection. */
@@ -254,12 +243,12 @@ UT_TEST(test_pu11_pu27_old_contributors_rejected)
 	set.contributors = ut_changes;
 	set.n_contributors = 2;
 	old_inc = ut_v[1];
-	old_inc.incarnation = 6;	/* old incarnation */
+	old_inc.incarnation = 6; /* old incarnation */
 	ut_changes[1].expected_before = old_inc;
 	ut_changes[1].result_version = old_inc;
 	ut_changes[1].result_version.token = 102;
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_INCARNATION_CROSS);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set),
+				 (int)CLUSTER_PAGE_CLOSURE_INCARNATION_CROSS);
 
 	/* PU-27: a contributor of another failed origin is never part of
 	 * this block's chain (raw cross-thread LSN has no global ordering). */
@@ -268,8 +257,8 @@ UT_TEST(test_pu11_pu27_old_contributors_rejected)
 	ut_changes[1].expected_before = ut_v[1];
 	ut_changes[1].result_version = ut_v[2];
 	ut_changes[1].failed_origin_thread = 3; /* other origin */
-	UT_ASSERT_EQ((int) cluster_page_contributor_closure(&set),
-				 (int) CLUSTER_PAGE_CLOSURE_THREAD_MISMATCH);
+	UT_ASSERT_EQ((int)cluster_page_contributor_closure(&set),
+				 (int)CLUSTER_PAGE_CLOSURE_THREAD_MISMATCH);
 }
 
 /* PL face: crash-cut legs judged through the §7.7 matrix. */
@@ -277,26 +266,24 @@ UT_TEST(test_pl_legs_unit_level)
 {
 	/* PL-01 death before source proof -> successor re-census (BLOCKED_
 	 * SOURCE). */
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_BEFORE_SOURCE_PROOF),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_BEFORE_SOURCE_PROOF),
+				 (int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
 	/* PL-02 after contributor closure -> local plan ignored (D3′). */
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ((int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_SOURCE_PROOF),
+				 (int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
 	/* PL-03 during target write -> RED/STOP, always. */
-	UT_ASSERT_EQ((int) cluster_page_apply_midwrite_cut(),
-				 (int) CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
+	UT_ASSERT_EQ((int)cluster_page_apply_midwrite_cut(),
+				 (int)CLUSTER_PAGE_OUTCOME_STABLE_BASE_UNRESOLVED);
 	/* PL-04/05/06 map onto the matrix rows. */
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_WRITE_BEFORE_DURABILITY),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_DURABILITY_BEFORE_POST_READ),
-				 (int) CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
-	UT_ASSERT_EQ((int) cluster_page_crash_matrix_verdict(
-					 CLUSTER_PAGE_CUT_AFTER_POST_READ_BEFORE_RELEASE),
-				 (int) CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY);
+	UT_ASSERT_EQ(
+		(int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_WRITE_BEFORE_DURABILITY),
+		(int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ(
+		(int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_DURABILITY_BEFORE_POST_READ),
+		(int)CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE);
+	UT_ASSERT_EQ(
+		(int)cluster_page_crash_matrix_verdict(CLUSTER_PAGE_CUT_AFTER_POST_READ_BEFORE_RELEASE),
+		(int)CLUSTER_PAGE_OUTCOME_STALE_AUTHORITY);
 	/* PL-12 retire-before-proof -> denied. */
 	{
 		ClusterPageHandoffInput hi;

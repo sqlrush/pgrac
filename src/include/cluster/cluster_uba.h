@@ -72,9 +72,9 @@
 #define CLUSTER_UBA_H
 
 #include "c.h"
-#include "cluster/cluster_scn.h"	 /* NodeId, SCN_MAX_VALID_NODE_ID */
-#include "cluster/cluster_tt_slot.h" /* TT_SLOTS_PER_SEGMENT + UBA typedef chain */
-#include "cluster/cluster_undo_segment.h" /* UNDO_BLOCKS_PER_SEGMENT */
+#include "cluster/cluster_scn.h"				/* NodeId, SCN_MAX_VALID_NODE_ID */
+#include "cluster/cluster_tt_slot.h"			/* TT_SLOTS_PER_SEGMENT + UBA typedef chain */
+#include "cluster/cluster_undo_segment.h"		/* UNDO_BLOCKS_PER_SEGMENT */
 #include "cluster/storage/cluster_undo_alloc.h" /* logical segment-range constants */
 
 
@@ -163,18 +163,16 @@ uba_decode(UBA u, uint32 *segment_id, uint32 *block_no, uint16 *tt_slot_offset, 
  *	only after every record-specific predicate succeeds.
  */
 static inline bool
-uba_decode_record(UBA u, uint32 *segment_id, uint32 *block_no,
-				  uint16 *tt_slot_offset, uint16 *row_offset)
+uba_decode_record(UBA u, uint32 *segment_id, uint32 *block_no, uint16 *tt_slot_offset,
+				  uint16 *row_offset)
 {
 	uint32 decoded_segment;
 	uint32 decoded_block;
 	uint16 decoded_slot;
 	uint16 decoded_row;
-	const uint32 max_segment
-		= (uint32)UNDO_OWNER_INSTANCE_MAX * CLUSTER_UNDO_SEGS_PER_INSTANCE;
+	const uint32 max_segment = (uint32)UNDO_OWNER_INSTANCE_MAX * CLUSTER_UNDO_SEGS_PER_INSTANCE;
 
-	if (segment_id == NULL || block_no == NULL || tt_slot_offset == NULL
-		|| row_offset == NULL)
+	if (segment_id == NULL || block_no == NULL || tt_slot_offset == NULL || row_offset == NULL)
 		return false;
 	if (!uba_decode(u, &decoded_segment, &decoded_block, &decoded_slot, &decoded_row))
 		return false;

@@ -352,10 +352,8 @@ typedef enum ClusterMergeClaimVerdict {
  * minus the one own-thread bit, and the ascending vector must name every
  * foreign bit exactly once. */
 static inline bool
-cluster_recovery_fence_plan_shape_valid(uint16 own_thread,
-										const uint64 replay[2],
-										const uint64 foreign[2],
-										const uint16 *origin_threads,
+cluster_recovery_fence_plan_shape_valid(uint16 own_thread, const uint64 replay[2],
+										const uint64 foreign[2], const uint16 *origin_threads,
 										uint16 origin_count)
 {
 	uint64 expected_foreign[2];
@@ -363,37 +361,28 @@ cluster_recovery_fence_plan_shape_valid(uint16 own_thread,
 	uint16 previous = 0;
 	uint16 i;
 
-	if (own_thread == 0 || own_thread > CLUSTER_WAL_STATE_SLOT_COUNT ||
-		replay == NULL || foreign == NULL ||
-		origin_count > CLUSTER_WAL_STATE_SLOT_COUNT ||
-		(origin_count > 0 && origin_threads == NULL))
+	if (own_thread == 0 || own_thread > CLUSTER_WAL_STATE_SLOT_COUNT || replay == NULL
+		|| foreign == NULL || origin_count > CLUSTER_WAL_STATE_SLOT_COUNT
+		|| (origin_count > 0 && origin_threads == NULL))
 		return false;
 	expected_foreign[0] = replay[0];
 	expected_foreign[1] = replay[1];
-	if ((expected_foreign[(own_thread - 1) / 64] &
-		 (UINT64_C(1) << ((own_thread - 1) % 64))) == 0)
+	if ((expected_foreign[(own_thread - 1) / 64] & (UINT64_C(1) << ((own_thread - 1) % 64))) == 0)
 		return false;
-	expected_foreign[(own_thread - 1) / 64] &=
-		~(UINT64_C(1) << ((own_thread - 1) % 64));
-	if (expected_foreign[0] != foreign[0] ||
-		expected_foreign[1] != foreign[1])
+	expected_foreign[(own_thread - 1) / 64] &= ~(UINT64_C(1) << ((own_thread - 1) % 64));
+	if (expected_foreign[0] != foreign[0] || expected_foreign[1] != foreign[1])
 		return false;
 
-	for (i = 0; i < origin_count; i++)
-	{
+	for (i = 0; i < origin_count; i++) {
 		uint16 tid = origin_threads[i];
 
-		if (tid == 0 || tid > CLUSTER_WAL_STATE_SLOT_COUNT ||
-			tid == own_thread || tid <= previous ||
-			(foreign[(tid - 1) / 64] &
-			 (UINT64_C(1) << ((tid - 1) % 64))) == 0)
+		if (tid == 0 || tid > CLUSTER_WAL_STATE_SLOT_COUNT || tid == own_thread || tid <= previous
+			|| (foreign[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) == 0)
 			return false;
 		previous = tid;
 	}
-	for (i = 1; i <= CLUSTER_WAL_STATE_SLOT_COUNT; i++)
-	{
-		if ((foreign[(i - 1) / 64] &
-			 (UINT64_C(1) << ((i - 1) % 64))) != 0)
+	for (i = 1; i <= CLUSTER_WAL_STATE_SLOT_COUNT; i++) {
+		if ((foreign[(i - 1) / 64] & (UINT64_C(1) << ((i - 1) % 64))) != 0)
 			counted++;
 	}
 	return counted == origin_count;
@@ -403,22 +392,18 @@ cluster_recovery_fence_plan_shape_valid(uint16 own_thread,
  * than the chosen replay owner is therefore a foreign destructive restore
  * and must hit the 58R17 negative gate before merged replay. */
 static inline bool
-cluster_recovery_restore_first_foreign(const uint64 bitmap[2],
-									   uint16 own_thread,
+cluster_recovery_restore_first_foreign(const uint64 bitmap[2], uint16 own_thread,
 									   uint16 *foreign_thread)
 {
 	uint16 tid;
 
-	if (bitmap == NULL || own_thread == 0 ||
-		own_thread > CLUSTER_WAL_STATE_SLOT_COUNT || foreign_thread == NULL)
+	if (bitmap == NULL || own_thread == 0 || own_thread > CLUSTER_WAL_STATE_SLOT_COUNT
+		|| foreign_thread == NULL)
 		return true;
 	*foreign_thread = 0;
-	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++)
-	{
-		if (tid != own_thread &&
-			(bitmap[(tid - 1) / 64] &
-			 (UINT64_C(1) << ((tid - 1) % 64))) != 0)
-		{
+	for (tid = 1; tid <= CLUSTER_WAL_STATE_SLOT_COUNT; tid++) {
+		if (tid != own_thread
+			&& (bitmap[(tid - 1) / 64] & (UINT64_C(1) << ((tid - 1) % 64))) != 0) {
 			*foreign_thread = tid;
 			return true;
 		}
@@ -427,13 +412,11 @@ cluster_recovery_restore_first_foreign(const uint64 bitmap[2],
 }
 
 static inline bool
-cluster_recovery_restore_has_foreign(const uint64 bitmap[2],
-									 uint16 own_thread)
+cluster_recovery_restore_has_foreign(const uint64 bitmap[2], uint16 own_thread)
 {
 	uint16 foreign_thread;
 
-	return cluster_recovery_restore_first_foreign(
-		bitmap, own_thread, &foreign_thread);
+	return cluster_recovery_restore_first_foreign(bitmap, own_thread, &foreign_thread);
 }
 
 static inline void
@@ -504,21 +487,17 @@ typedef enum ClusterMergeEngage {
  * AdmissionSet.  The caller obtains the merge claim only after this returns
  * ENGAGE, then acquires the STOP03 guard set and commits the unchanged plan
  * before copying its replay inputs. */
-extern ClusterMergeEngage cluster_recovery_merge_preflight_readonly(
-	uint16 own_thread, XLogRecPtr own_redo, ClusterRecoveryFencePlan **out_plan);
-extern bool cluster_recovery_merge_fence_plan_acquire_serial(
-	ClusterRecoveryFencePlan *plan);
-extern bool cluster_recovery_merge_commit_plan_nowait(
-	ClusterRecoveryFencePlan *plan);
-extern bool cluster_recovery_merge_fence_plan_copy_replay(
-	const ClusterRecoveryFencePlan *plan, uint64 out_bitmap[2],
-	XLogRecPtr *out_start);
-extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(
-	ClusterRecoveryFencePlan *plan);
-extern bool cluster_recovery_merge_fence_plan_release_serial(
-	ClusterRecoveryFencePlan *plan);
-extern void cluster_recovery_merge_fence_plan_destroy(
-	ClusterRecoveryFencePlan **plan);
+extern ClusterMergeEngage
+cluster_recovery_merge_preflight_readonly(uint16 own_thread, XLogRecPtr own_redo,
+										  ClusterRecoveryFencePlan **out_plan);
+extern bool cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_commit_plan_nowait(ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_fence_plan_copy_replay(const ClusterRecoveryFencePlan *plan,
+														  uint64 out_bitmap[2],
+														  XLogRecPtr *out_start);
+extern bool cluster_recovery_merge_fence_plan_revalidate_nowait(ClusterRecoveryFencePlan *plan);
+extern bool cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan);
+extern void cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan);
 
 /* Sole-merger claim lifecycle (spec-6.14 D9 amend; see the pure core
  * above).  acquire_blocking runs in PerformWalRecovery BEFORE the engage

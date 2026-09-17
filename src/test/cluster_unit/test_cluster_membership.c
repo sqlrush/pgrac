@@ -102,8 +102,7 @@ static ClusterMembershipTable seed_tab;
 static uint32
 test_get_le32(const uint8 *p)
 {
-	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16)
-		   | ((uint32)p[3] << 24);
+	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
 }
 
 static uint64
@@ -535,14 +534,12 @@ UT_TEST(test_replacement_marker_v3_exact_codec)
 	ClusterReplacementCommitMarkerV3 out;
 	uint8 bytes[CLUSTER_JCMK_REPLACEMENT_BYTES];
 
-	make_replacement_marker(&in, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED,
-							UINT32_C(0x71727374));
+	make_replacement_marker(&in, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED, UINT32_C(0x71727374));
 	memset(bytes, 0xA5, sizeof(bytes));
 	UT_ASSERT(cluster_replacement_marker_v3_encode(&in, bytes));
 
 	UT_ASSERT_EQ((int)test_get_le32(bytes + 0), (int)CLUSTER_JCMK_MAGIC);
-	UT_ASSERT_EQ((int)test_get_le32(bytes + 4),
-				 (int)CLUSTER_JCMK_REPLACEMENT_VERSION);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 4), (int)CLUSTER_JCMK_REPLACEMENT_VERSION);
 	UT_ASSERT_EQ((int)test_get_le32(bytes + 8), 7);
 	UT_ASSERT_EQ((int)bytes[12], CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED);
 	UT_ASSERT_EQ((int)bytes[13], 0);
@@ -656,8 +653,7 @@ UT_TEST(test_replacement_marker_v3_same_image_majority)
 	UT_ASSERT(cluster_replacement_marker_v3_encode(&b, images[2]));
 	selected = before;
 	agree = 77;
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 7, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 7, &selected, &agree),
 				 -1);
 	UT_ASSERT(memcmp(&selected, &before, sizeof(selected)) == 0);
 	UT_ASSERT_EQ((int)agree, 77);
@@ -667,31 +663,24 @@ UT_TEST(test_replacement_marker_v3_same_image_majority)
 	images[1][44] ^= 1;
 	selected = before;
 	agree = 77;
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 7, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 7, &selected, &agree),
 				 -1);
 	UT_ASSERT(memcmp(&selected, &before, sizeof(selected)) == 0);
 	UT_ASSERT_EQ((int)agree, 77);
 
 	/* Invalid cardinalities and target mismatch preserve every output. */
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 0, 7, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 0, 7, &selected, &agree),
 				 -1);
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 1, 7, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 1, 7, &selected, &agree),
 				 -1);
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 2, 1, 7, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 2, 1, 7, &selected, &agree),
 				 -1);
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 0, 1, 7, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 0, 1, 7, &selected, &agree),
 				 -1);
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 4, 7, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 4, 7, &selected, &agree),
 				 -1);
 	memcpy(images[1], images[0], sizeof(images[1]));
-	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 8, &selected,
-													&agree),
+	UT_ASSERT_EQ(cluster_replacement_marker_v3_select_majority(images, 3, 2, 8, &selected, &agree),
 				 -1);
 	UT_ASSERT(memcmp(&selected, &before, sizeof(selected)) == 0);
 	UT_ASSERT_EQ((int)agree, 77);
@@ -731,8 +720,7 @@ UT_TEST(test_replacement_marker_v3_phase_bases_and_floors)
 	UT_ASSERT(floor == m.fresh_incarnation);
 	UT_ASSERT_EQ((int)ready, (int)UINT32_C(0xA5A5A5A5));
 
-	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED,
-							UINT32_C(0x71727374));
+	make_replacement_marker(&m, CLUSTER_JCMK_REPLACEMENT_PHASE_ADMITTED, UINT32_C(0x71727374));
 	UT_ASSERT(cluster_replacement_marker_v3_encode(&m, bytes));
 	UT_ASSERT(cluster_replacement_marker_v3_floor_basis(bytes, 7, &floor));
 	UT_ASSERT(floor == m.fresh_incarnation);

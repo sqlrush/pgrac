@@ -101,8 +101,7 @@ typedef struct ClusterCurrentMemberProof {
 
 
 static inline void
-ClusterCurrentMemberProofSetCtrcBinding(ClusterCurrentMemberProof *proof,
-										uint32 segment_generation,
+ClusterCurrentMemberProofSetCtrcBinding(ClusterCurrentMemberProof *proof, uint32 segment_generation,
 										uint16 slot_wrap)
 {
 	proof->key.segment_generation = segment_generation;
@@ -113,17 +112,13 @@ ClusterCurrentMemberProofSetCtrcBinding(ClusterCurrentMemberProof *proof,
 
 static inline bool
 ClusterCurrentMemberProofGetStatusKey(const ClusterCurrentMemberProof *proof,
-									  ClusterTTStatusKey *status_key,
-									  uint32 *segment_generation,
+									  ClusterTTStatusKey *status_key, uint32 *segment_generation,
 									  uint16 *slot_wrap)
 {
-	if (proof == NULL || status_key == NULL || segment_generation == NULL
-		|| slot_wrap == NULL
+	if (proof == NULL || status_key == NULL || segment_generation == NULL || slot_wrap == NULL
 		|| (proof->state != CCM_ACTIVE && proof->state != CCM_SELF)
-		|| proof->key.binding_version
-		   != CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION
-		|| proof->key.segment_generation == UINT32_MAX
-		|| proof->key.slot_wrap == UINT16_MAX)
+		|| proof->key.binding_version != CLUSTER_CURRENT_MEMBER_PROOF_BINDING_VERSION
+		|| proof->key.segment_generation == UINT32_MAX || proof->key.slot_wrap == UINT16_MAX)
 		return false;
 	memset(status_key, 0, sizeof(*status_key));
 	status_key->origin_node_id = proof->key.origin_node_id;
@@ -138,8 +133,7 @@ ClusterCurrentMemberProofGetStatusKey(const ClusterCurrentMemberProof *proof,
 
 
 static inline void
-ClusterCurrentMemberProofSetCtrcGrant(ClusterCurrentMemberProof *proof,
-									  uint32 grant_generation)
+ClusterCurrentMemberProofSetCtrcGrant(ClusterCurrentMemberProof *proof, uint32 grant_generation)
 {
 	proof->reserved8[0] = (uint8)(grant_generation & UINT32_C(0xff));
 	proof->reserved8[1] = (uint8)((grant_generation >> 8) & UINT32_C(0xff));
@@ -151,10 +145,8 @@ ClusterCurrentMemberProofSetCtrcGrant(ClusterCurrentMemberProof *proof,
 static inline uint32
 ClusterCurrentMemberProofGetCtrcGrant(const ClusterCurrentMemberProof *proof)
 {
-	return (uint32)proof->reserved8[0]
-		| ((uint32)proof->reserved8[1] << 8)
-		| ((uint32)proof->reserved8[2] << 16)
-		| ((uint32)proof->reserved8[3] << 24);
+	return (uint32)proof->reserved8[0] | ((uint32)proof->reserved8[1] << 8)
+		   | ((uint32)proof->reserved8[2] << 16) | ((uint32)proof->reserved8[3] << 24);
 }
 
 
@@ -313,7 +305,7 @@ typedef struct ClusterCurrentProofChunkView {
 
 
 typedef bool (*ClusterCurrentMxExactLookupFn)(const ClusterTTStatusKey *key,
-											 ClusterTTStatusResult *result, void *arg);
+											  ClusterTTStatusResult *result, void *arg);
 
 
 /*
@@ -409,22 +401,20 @@ extern ClusterMxResolveResult cluster_multixact_current_validate_proof_set(
 	const ClusterCurrentProofChunkView *chunks, uint16 nchunks,
 	ClusterCurrentMemberProof *ordered_proofs);
 extern bool cluster_multixact_current_resolve_origin_member_proof(
-	TransactionId member_xid, uint8 member_status, uint16 member_ordinal,
-	uint16 member_origin_node, uint32 current_epoch, bool requester_self,
-	const ClusterTTStatusKey *initial_key, const ClusterTTStatusResult *initial_result,
-	ClusterCurrentMxExactLookupFn exact_lookup, void *exact_lookup_arg,
-	ClusterCurrentMemberProof *proof);
-extern bool cluster_multixact_current_member_proof_bind_ctrc(
-	ClusterCurrentMemberProof *proof,
-	const struct ClusterCtrcTxnKeyV1 *ctrc_key);
+	TransactionId member_xid, uint8 member_status, uint16 member_ordinal, uint16 member_origin_node,
+	uint32 current_epoch, bool requester_self, const ClusterTTStatusKey *initial_key,
+	const ClusterTTStatusResult *initial_result, ClusterCurrentMxExactLookupFn exact_lookup,
+	void *exact_lookup_arg, ClusterCurrentMemberProof *proof);
+extern bool
+cluster_multixact_current_member_proof_bind_ctrc(ClusterCurrentMemberProof *proof,
+												 const struct ClusterCtrcTxnKeyV1 *ctrc_key);
 extern ClusterUpdaterCandidateVerdict cluster_multixact_current_updater_candidate_verdict(
-	const ClusterTTStatusKey *candidate, TransactionId updater_xid,
-	uint16 updater_origin_node, uint32 current_epoch, ClusterTTStatusKey *current_binding,
+	const ClusterTTStatusKey *candidate, TransactionId updater_xid, uint16 updater_origin_node,
+	uint32 current_epoch, ClusterTTStatusKey *current_binding,
 	ClusterTTStatusResult *current_result);
 extern bool cluster_multixact_current_successor_provenance_well_formed(
-	const ClusterCurrentMxSuccessorAlias *alias,
-	const ClusterTxLocator *locator, TransactionId updater_xid,
-	uint16 updater_origin_node, uint32 current_epoch);
+	const ClusterCurrentMxSuccessorAlias *alias, const ClusterTxLocator *locator,
+	TransactionId updater_xid, uint16 updater_origin_node, uint32 current_epoch);
 extern bool cluster_multixact_current_validate_updater_proof(
 	const ClusterCurrentMxKey *key, const ClusterCurrentMxMemberDesc *members,
 	const ClusterCurrentMemberProof *proofs, uint16 nmembers,
@@ -462,12 +452,12 @@ extern ClusterMxRecomposeResult cluster_multixact_current_recompose(
 	const ClusterCurrentMxMemberDesc *members, const ClusterCurrentMemberProof *proofs,
 	uint16 nmembers, TransactionId requester_xid, MultiXactStatus requester_status,
 	MultiXactMember *normalized_members, uint16 normalized_cap, uint16 *normalized_count);
-extern bool cluster_multixact_current_plan_heap_header(
-	const void *base_header, Size header_size,
-	const ClusterCurrentMxHeapHeaderPlan *plan, void *planned_header);
-extern bool cluster_multixact_current_heap_publish_transition(
-	ClusterCurrentMxHeapPublishStage stage,
-	ClusterCurrentMxHeapPublishEvent event,
-	ClusterCurrentMxHeapPublishStage *next_stage);
+extern bool cluster_multixact_current_plan_heap_header(const void *base_header, Size header_size,
+													   const ClusterCurrentMxHeapHeaderPlan *plan,
+													   void *planned_header);
+extern bool
+cluster_multixact_current_heap_publish_transition(ClusterCurrentMxHeapPublishStage stage,
+												  ClusterCurrentMxHeapPublishEvent event,
+												  ClusterCurrentMxHeapPublishStage *next_stage);
 
 #endif /* CLUSTER_MULTIXACT_CURRENT_H */

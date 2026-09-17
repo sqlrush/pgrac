@@ -41,7 +41,7 @@
 #include "cluster/cluster_itl_touch.h" /* PostPrepare touch-list drop (V-2) */
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_semantic_activation.h"
-#include "cluster/cluster_subtrans.h"  /* sub-link export/reset (D7) */
+#include "cluster/cluster_subtrans.h" /* sub-link export/reset (D7) */
 #include "cluster/cluster_tt_2pc.h"
 #include "cluster/cluster_tt_local.h"			/* binding export/reset */
 #include "cluster/cluster_tt_slot.h"			/* protected-slot map (D6/V-4) */
@@ -225,7 +225,7 @@ cluster_tt_twophase_recover(TransactionId xid, uint16 info, void *recdata, uint3
 		source_request.key = &l->child_key;
 		source_request.parent_key = &l->parent_key;
 		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED,
-										  &source_request, &source_result)
+											  &source_request, &source_result)
 				!= CLUSTER_SEMANTIC_ADMISSION_OK
 			|| !source_result.bool_value)
 			ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
@@ -326,7 +326,7 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 		source_request.status = CLUSTER_TT_STATUS_IN_PROGRESS;
 		source_request.commit_scn = InvalidScn;
 		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL, &source_request,
-										  &source_result)
+											  &source_result)
 				!= CLUSTER_SEMANTIC_ADMISSION_OK
 			|| !source_result.bool_value) {
 			/* capacity / shmem unavailable: degrade, do NOT PANIC the
@@ -349,7 +349,7 @@ cluster_tt_twophase_standby_recover(TransactionId xid, uint16 info, void *recdat
 		source_request.key = &l->child_key;
 		source_request.parent_key = &l->parent_key;
 		if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_SUBCOMMITTED,
-										  &source_request, &source_result)
+											  &source_request, &source_result)
 				!= CLUSTER_SEMANTIC_ADMISSION_OK
 			|| !source_result.bool_value) {
 			/* capacity / shmem unavailable: degrade, do NOT PANIC the
@@ -379,7 +379,7 @@ cluster_tt_twophase_standby_commit_prepared(TransactionId xid, SCN commit_scn)
 	source_request.xid = xid;
 	source_request.commit_scn = commit_scn;
 	if (cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_RESOLVE_PREPARED_COMMIT,
-										&source_request, &source_result)
+										  &source_request, &source_result)
 		!= CLUSTER_SEMANTIC_ADMISSION_OK)
 		return 0;
 	return source_result.int_value;
@@ -392,10 +392,11 @@ cluster_tt_twophase_writable_admission(void)
 	ClusterJoinGateVerdict verdict = cluster_reconfig_self_join_gate_verdict();
 
 	if (verdict == CLUSTER_JOIN_GATE_BLOCK_53R61)
-		ereport(FATAL,
-				(errcode(ERRCODE_CLUSTER_JOIN_REJECTED_STALE),
-				 errmsg("cannot finish a prepared transaction: this node's cluster join was rejected"),
-				 errhint("Restart this node so it presents a fresh cluster incarnation.")));
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_JOIN_REJECTED_STALE),
+			 errmsg("cannot finish a prepared transaction: this node's cluster join was rejected"),
+			 errhint("Restart this node so it presents a fresh cluster incarnation.")));
 	return verdict == CLUSTER_JOIN_GATE_ALLOW;
 }
 
@@ -403,13 +404,14 @@ cluster_tt_twophase_writable_admission(void)
 static void
 cluster_tt_twophase_modifier_recheck_or_error(const ClusterSemanticAdmissionToken *token)
 {
-	if (!cluster_semantic_activation_modifier_recheck(
-			token, cluster_tt_twophase_writable_admission()))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("cannot finish a prepared transaction: cluster reconfiguration in progress"),
-				 errhint("The prepared transaction remains retryable; retry after cluster admission "
-						 "converges.")));
+	if (!cluster_semantic_activation_modifier_recheck(token,
+													  cluster_tt_twophase_writable_admission()))
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+			 errmsg("cannot finish a prepared transaction: cluster reconfiguration in progress"),
+			 errhint("The prepared transaction remains retryable; retry after cluster admission "
+					 "converges.")));
 }
 
 
@@ -446,14 +448,15 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 
 	Assert(cluster_node_id >= 0);
 
-	admission = cluster_semantic_activation_modifier_enter(
-		cluster_tt_twophase_writable_admission(), &modifier_token);
+	admission = cluster_semantic_activation_modifier_enter(cluster_tt_twophase_writable_admission(),
+														   &modifier_token);
 	if (admission != CLUSTER_SEMANTIC_ADMISSION_OK)
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
-				 errmsg("cannot finish a prepared transaction: cluster reconfiguration in progress"),
-				 errhint("The prepared transaction remains retryable; retry after cluster admission "
-						 "converges.")));
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_RECONFIG_IN_PROGRESS),
+			 errmsg("cannot finish a prepared transaction: cluster reconfiguration in progress"),
+			 errhint("The prepared transaction remains retryable; retry after cluster admission "
+					 "converges.")));
 
 	PG_TRY();
 	{
@@ -473,10 +476,9 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 			uint16 origin_node_id;
 
 			if (!cluster_tt_2pc_binding_origin_node(b, &origin_node_id))
-				ereport(ERROR,
-						(errcode(ERRCODE_DATA_CORRUPTED),
-						 errmsg("invalid TT binding segment %u for prepared transaction %u",
-							b->undo_segment_id, xid)));
+				ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("invalid TT binding segment %u for prepared transaction %u",
+									   b->undo_segment_id, xid)));
 			memset(&key, 0, sizeof(key));
 			key.origin_node_id = origin_node_id;
 			key.undo_segment_id = (uint16)b->undo_segment_id;
@@ -489,19 +491,19 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 				cluster_tt_slot_durable_commit(b->undo_segment_id, b->slot_offset, b->xid, b->wrap,
 											   final_scn);
 				cluster_tt_slot_mark_committed(b->undo_segment_id, b->slot_offset, b->xid,
-											  final_scn);
+											   final_scn);
 				memset(&source_request, 0, sizeof(source_request));
 				source_request.key = &key;
 				source_request.status = CLUSTER_TT_STATUS_COMMITTED;
 				source_request.commit_scn = final_scn;
 				(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
-													&source_request, &source_result);
+														&source_request, &source_result);
 				memset(&hint_request, 0, sizeof(hint_request));
 				hint_request.key = &key;
 				hint_request.status = CLUSTER_TT_STATUS_COMMITTED;
 				hint_request.commit_scn = final_scn;
 				(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
-													 &hint_request);
+															 &hint_request);
 			} else {
 				cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
 				cluster_tt_slot_durable_abort(b->undo_segment_id, b->slot_offset, b->xid, b->wrap);
@@ -517,7 +519,7 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 				if (p.heads != NULL && !UBA_is_invalid(p.heads[i])) {
 					cluster_tt_twophase_modifier_recheck_or_error(&modifier_token);
 					cluster_tt_slot_durable_set_head(b->undo_segment_id, b->slot_offset, b->xid,
-												 b->wrap, p.heads[i]);
+													 b->wrap, p.heads[i]);
 				}
 				cluster_tt_slot_mark_aborted(b->undo_segment_id, b->slot_offset, b->xid);
 				memset(&source_request, 0, sizeof(source_request));
@@ -525,13 +527,13 @@ cluster_tt_twophase_prefinish(TransactionId xid, SCN final_scn, bool is_commit, 
 				source_request.status = CLUSTER_TT_STATUS_ABORTED;
 				source_request.commit_scn = InvalidScn;
 				(void)cluster_tt_status_source_dispatch(CLUSTER_TT_SOURCE_INSTALL_LOCAL,
-													&source_request, &source_result);
+														&source_request, &source_result);
 				memset(&hint_request, 0, sizeof(hint_request));
 				hint_request.key = &key;
 				hint_request.status = CLUSTER_TT_STATUS_ABORTED;
 				hint_request.commit_scn = InvalidScn;
 				(void)cluster_tt_status_hint_source_dispatch(CLUSTER_TT_HINT_SOURCE_EMIT,
-													 &hint_request);
+															 &hint_request);
 			}
 		}
 	}

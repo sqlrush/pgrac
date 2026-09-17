@@ -44,8 +44,8 @@
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
 #include "cluster/cluster_clean_leave.h"
-#include "cluster/cluster_guc.h"  /* cluster_node_id */
-#include "cluster/cluster_ic.h"	  /* cluster_ic_send_bytes */
+#include "cluster/cluster_guc.h" /* cluster_node_id */
+#include "cluster/cluster_ic.h"	 /* cluster_ic_send_bytes */
 #include "cluster/cluster_ic_chunk.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
@@ -230,11 +230,9 @@ cluster_ic_send_envelope_chunked(uint8 inner_msg_type, int32 dest_node_id, const
 								   inner_msg_type, inner_info->name)));
 
 		if ((ClusterICPlane)inner_info->plane == CLUSTER_IC_PLANE_DATA
-			&& cluster_authority_readiness_managed()
-			&& !cluster_serving_ready_is_current()) {
-			ereport(ERROR,
-					(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-					 errmsg("cluster IC chunked data plane is not serving-ready")));
+			&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+							errmsg("cluster IC chunked data plane is not serving-ready")));
 			return false;
 		}
 	}

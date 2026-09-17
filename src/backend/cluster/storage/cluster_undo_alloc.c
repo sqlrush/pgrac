@@ -352,8 +352,8 @@ cluster_undo_active_segment_for_node_or_create(int node_id)
 
 	if (cached_node_id == node_id && cached_segment_id == segment_id) {
 		if (!cached_block0_resident
-			&& cluster_undo_block0_current_live_owner_ensure_resident(
-				&logical, 10000) == CLUSTER_UNDO_BLOCK0_OK)
+			&& cluster_undo_block0_current_live_owner_ensure_resident(&logical, 10000)
+				   == CLUSTER_UNDO_BLOCK0_OK)
 			cached_block0_resident = true;
 		return cached_segment_id;
 	}
@@ -414,8 +414,7 @@ read_segment_header_via_smgr(uint32 segment_id, uint8 owner_instance, char *bloc
 }
 
 
-typedef enum ClusterUndoLifecycleMutationKind
-{
+typedef enum ClusterUndoLifecycleMutationKind {
 	CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE = 1,
 	CLUSTER_UNDO_LIFECYCLE_MARK_COMMITTED,
 	CLUSTER_UNDO_LIFECYCLE_MARK_FULL,
@@ -428,9 +427,9 @@ typedef enum ClusterUndoLifecycleMutationKind
  * block-zero current/content-X owner compare and publish it.  This function
  * may wait for 0xFB and therefore must run without lifecycle/content locks. */
 static bool
-cluster_undo_block0_current_live_owner_lifecycle_exact(
-	uint32 segment_id, uint8 owner_instance,
-	ClusterUndoLifecycleMutationKind kind, uint32 arg1, uint32 arg2)
+cluster_undo_block0_current_live_owner_lifecycle_exact(uint32 segment_id, uint8 owner_instance,
+													   ClusterUndoLifecycleMutationKind kind,
+													   uint32 arg1, uint32 arg2)
 {
 	PGAlignedBlock predecessor;
 	PGAlignedBlock successor;
@@ -441,10 +440,8 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(
 	uint64 last;
 	uint32 block;
 
-	if (!read_segment_header_via_smgr(segment_id, owner_instance,
-			predecessor.data, &before)
-		|| !cluster_undo_segment_header_identity_ok(predecessor.data,
-			segment_id, owner_instance)
+	if (!read_segment_header_via_smgr(segment_id, owner_instance, predecessor.data, &before)
+		|| !cluster_undo_segment_header_identity_ok(predecessor.data, segment_id, owner_instance)
 		|| before->wrap_count == UINT32_MAX)
 		return false;
 	memcpy(successor.data, predecessor.data, BLCKSZ);
@@ -457,8 +454,7 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(
 		after->segment_state = SEGMENT_ACTIVE;
 		break;
 	case CLUSTER_UNDO_LIFECYCLE_MARK_COMMITTED:
-		if (before->segment_state != SEGMENT_ACTIVE
-			&& before->segment_state != SEGMENT_COMMITTED)
+		if (before->segment_state != SEGMENT_ACTIVE && before->segment_state != SEGMENT_COMMITTED)
 			return false;
 		after->segment_state = SEGMENT_COMMITTED;
 		break;
@@ -474,15 +470,14 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(
 		after->tail_block = arg1;
 		break;
 	case CLUSTER_UNDO_LIFECYCLE_MARK_BLOCK:
-		if (before->segment_state != SEGMENT_ACTIVE
-			|| arg1 >= UNDO_BLOCKS_PER_SEGMENT)
+		if (before->segment_state != SEGMENT_ACTIVE || arg1 >= UNDO_BLOCKS_PER_SEGMENT)
 			return false;
 		(void)UndoSegmentBitmap_mark_used(after->free_block_bitmap, arg1);
 		break;
 	case CLUSTER_UNDO_LIFECYCLE_CLAIM_RANGE:
 		last = (uint64)arg1 + arg2;
-		if (before->segment_state != SEGMENT_ACTIVE || arg1 < 1
-			|| arg2 == 0 || last > UNDO_BLOCKS_PER_SEGMENT)
+		if (before->segment_state != SEGMENT_ACTIVE || arg1 < 1 || arg2 == 0
+			|| last > UNDO_BLOCKS_PER_SEGMENT)
 			return false;
 		/* An extent claim is intentionally not idempotent: accepting an
 		 * already-used bit could hand the same extent to two local writers. */
@@ -493,8 +488,8 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(
 			if ((before->free_block_bitmap[byte_idx] & bit_mask) != 0)
 				return false;
 		}
-		if (!UndoSegmentBitmap_mark_range_used(after->free_block_bitmap,
-				arg1, arg2, UNDO_BLOCKS_PER_SEGMENT))
+		if (!UndoSegmentBitmap_mark_range_used(after->free_block_bitmap, arg1, arg2,
+											   UNDO_BLOCKS_PER_SEGMENT))
 			return false;
 		break;
 	default:
@@ -505,12 +500,12 @@ cluster_undo_block0_current_live_owner_lifecycle_exact(
 	key.owner_instance = owner_instance;
 	expected.known = true;
 	expected.value = before->wrap_count;
-	if (cluster_undo_block0_current_live_owner_ensure_resident(
-			&key, 10000) != CLUSTER_UNDO_BLOCK0_OK)
+	if (cluster_undo_block0_current_live_owner_ensure_resident(&key, 10000)
+		!= CLUSTER_UNDO_BLOCK0_OK)
 		return false;
-	return cluster_undo_block0_current_live_owner_mutate_exact(
-		&key, &expected, predecessor.data, successor.data, 10000)
-		== CLUSTER_UNDO_BLOCK0_OK;
+	return cluster_undo_block0_current_live_owner_mutate_exact(&key, &expected, predecessor.data,
+															   successor.data, 10000)
+		   == CLUSTER_UNDO_BLOCK0_OK;
 }
 
 
@@ -525,8 +520,7 @@ bool
 cluster_undo_segment_mark_active(uint32 segment_id, uint8 owner_instance)
 {
 	return cluster_undo_block0_current_live_owner_lifecycle_exact(
-		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE,
-		0, 0);
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_ACTIVE, 0, 0);
 }
 
 
@@ -546,8 +540,7 @@ bool
 cluster_undo_segment_mark_committed(uint32 segment_id, uint8 owner_instance)
 {
 	return cluster_undo_block0_current_live_owner_lifecycle_exact(
-		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_COMMITTED,
-		0, 0);
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_COMMITTED, 0, 0);
 }
 
 
@@ -559,21 +552,19 @@ cluster_undo_segment_mark_committed(uint32 segment_id, uint8 owner_instance)
  *	caller's expected epoch; no lifecycle/content lock may be held here.
  */
 ClusterUndoSegTryRecycle
-cluster_undo_segment_try_mark_recyclable(uint32 segment_id,
-	uint8 owner_instance, SCN horizon, uint64 expected_epoch)
+cluster_undo_segment_try_mark_recyclable(uint32 segment_id, uint8 owner_instance, SCN horizon,
+										 uint64 expected_epoch)
 {
 	ClusterUndoBlock0LogicalKey key;
 	ClusterUndoBlock0RecycleResult result;
 
-	if (segment_id == 0 || owner_instance < 1
-		|| owner_instance > UNDO_OWNER_INSTANCE_MAX
-		|| !SCN_VALID(horizon)
-		|| (expected_epoch == 0 && cluster_conf_node_count() != 4))
+	if (segment_id == 0 || owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX
+		|| !SCN_VALID(horizon) || (expected_epoch == 0 && cluster_conf_node_count() != 4))
 		return CLUSTER_SEG_RECYCLE_READ_FAIL;
 	key.owner_instance = owner_instance;
 	key.segment_id = segment_id;
-	result = cluster_undo_block0_current_live_owner_recycle_exact(
-		&key, horizon, expected_epoch, 10000);
+	result = cluster_undo_block0_current_live_owner_recycle_exact(&key, horizon, expected_epoch,
+																  10000);
 	switch (result) {
 	case CLUSTER_UNDO_BLOCK0_RECYCLE_ADVANCED:
 		return CLUSTER_SEG_RECYCLE_ADVANCED;
@@ -611,8 +602,8 @@ cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance, uin
 	ClusterUndoBlock0Generation expected;
 	ClusterUndoBlock0Result result;
 
-	if (segment_id == 0 || old_generation == UINT32_MAX
-		|| owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
+	if (segment_id == 0 || old_generation == UINT32_MAX || owner_instance < 1
+		|| owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return 0;
 
 	cluster_undo_segment_make_header_bytes(segment_id, owner_instance, page.data);
@@ -622,8 +613,7 @@ cluster_undo_segment_reuse_in_place(uint32 segment_id, uint8 owner_instance, uin
 	key.segment_id = segment_id;
 	expected.known = true;
 	expected.value = old_generation;
-	result = cluster_undo_block0_current_live_owner_reuse_exact(
-		&key, &expected, page.data, 10000);
+	result = cluster_undo_block0_current_live_owner_reuse_exact(&key, &expected, page.data, 10000);
 	if (result != CLUSTER_UNDO_BLOCK0_OK)
 		return 0;
 
@@ -674,8 +664,7 @@ bool
 cluster_undo_segment_mark_full(uint32 segment_id, uint8 owner_instance)
 {
 	return cluster_undo_block0_current_live_owner_lifecycle_exact(
-		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_FULL,
-		0, 0);
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_FULL, 0, 0);
 }
 
 
@@ -693,8 +682,7 @@ cluster_undo_segment_tail_block_init(uint32 segment_id, uint8 owner_instance,
 									 BlockNumber initial_tail)
 {
 	return cluster_undo_block0_current_live_owner_lifecycle_exact(
-		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_INIT_TAIL,
-		initial_tail, 0);
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_INIT_TAIL, initial_tail, 0);
 }
 
 
@@ -713,8 +701,7 @@ bool
 cluster_undo_segment_mark_block_used(uint32 segment_id, uint8 owner_instance, uint32 block_no)
 {
 	return cluster_undo_block0_current_live_owner_lifecycle_exact(
-		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_BLOCK,
-		block_no, 0);
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_MARK_BLOCK, block_no, 0);
 }
 
 
@@ -731,8 +718,7 @@ cluster_undo_segment_mark_block_range_used(uint32 segment_id, uint8 owner_instan
 										   uint32 first_block, uint32 nblocks)
 {
 	return cluster_undo_block0_current_live_owner_lifecycle_exact(
-		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_CLAIM_RANGE,
-		first_block, nblocks);
+		segment_id, owner_instance, CLUSTER_UNDO_LIFECYCLE_CLAIM_RANGE, first_block, nblocks);
 }
 
 
@@ -813,8 +799,7 @@ cluster_undo_segment_read_state(uint32 segment_id, uint8 owner_instance)
  * ============================================================ */
 
 bool
-cluster_undo_segment_extend_or_create(
-	uint8 owner_instance, ClusterUndoSegmentExtendPlan *plan)
+cluster_undo_segment_extend_or_create(uint8 owner_instance, ClusterUndoSegmentExtendPlan *plan)
 {
 	uint32 slot;
 	uint32 base_segment_id;
@@ -919,10 +904,9 @@ cluster_undo_segment_extend_or_create(
 
 			close(fd);
 			if (rb == BLCKSZ
-				&& cluster_undo_segment_header_identity_ok(peek.data,
-					new_segment_id, owner_instance)) {
-				UndoSegmentHeaderData *header
-					= (UndoSegmentHeaderData *)peek.data;
+				&& cluster_undo_segment_header_identity_ok(peek.data, new_segment_id,
+														   owner_instance)) {
+				UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)peek.data;
 
 				if (header->segment_state == SEGMENT_RECYCLABLE) {
 					plan->segment_id = new_segment_id;
@@ -931,7 +915,7 @@ cluster_undo_segment_extend_or_create(
 					return true;
 				}
 				if (header->segment_state == SEGMENT_ALLOCATED) {
-					TTSlot empty_slots[TT_SLOTS_PER_SEGMENT] = {{0}};
+					TTSlot empty_slots[TT_SLOTS_PER_SEGMENT] = { { 0 } };
 
 					/* The state byte alone cannot authorize FREE/wrap0. A
 					 * previous incarnation may have bound a TT before its first

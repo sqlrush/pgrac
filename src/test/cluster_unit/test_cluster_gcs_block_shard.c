@@ -420,32 +420,32 @@ UT_TEST(test_r4_extended_route_exact_lengths_and_tag_affinity)
 	UT_ASSERT_EQ(sizeof(legacy_req), GCS_BLOCK_LEGACY_ROUTE_LEN);
 	UT_ASSERT_EQ(sizeof(legacy_fwd), GCS_BLOCK_LEGACY_ROUTE_LEN);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, &legacy_req,
-											 sizeof(legacy_req), CLUSTER_LMS_MAX_WORKERS),
+												 sizeof(legacy_req), CLUSTER_LMS_MAX_WORKERS),
 				 expected);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &legacy_fwd,
-											 sizeof(legacy_fwd), CLUSTER_LMS_MAX_WORKERS),
+												 sizeof(legacy_fwd), CLUSTER_LMS_MAX_WORKERS),
 				 expected);
 
 	make_r4_route_frame(req_a.bytes, GCS_BLOCK_R4_REQUEST_ROUTE_LEN, tag, 0x00);
 	make_r4_route_frame(req_b.bytes, GCS_BLOCK_R4_REQUEST_ROUTE_LEN, tag, 0xA5);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, req_a.bytes,
-											 GCS_BLOCK_R4_REQUEST_ROUTE_LEN,
-											 CLUSTER_LMS_MAX_WORKERS),
+												 GCS_BLOCK_R4_REQUEST_ROUTE_LEN,
+												 CLUSTER_LMS_MAX_WORKERS),
 				 expected);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, req_b.bytes,
-											 GCS_BLOCK_R4_REQUEST_ROUTE_LEN,
-											 CLUSTER_LMS_MAX_WORKERS),
+												 GCS_BLOCK_R4_REQUEST_ROUTE_LEN,
+												 CLUSTER_LMS_MAX_WORKERS),
 				 expected);
 
 	make_r4_route_frame(fwd_a.bytes, GCS_BLOCK_R4_FORWARD_ROUTE_LEN, tag, 0x00);
 	make_r4_route_frame(fwd_b.bytes, GCS_BLOCK_R4_FORWARD_ROUTE_LEN, tag, 0x5A);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, fwd_a.bytes,
-											 GCS_BLOCK_R4_FORWARD_ROUTE_LEN,
-											 CLUSTER_LMS_MAX_WORKERS),
+												 GCS_BLOCK_R4_FORWARD_ROUTE_LEN,
+												 CLUSTER_LMS_MAX_WORKERS),
 				 expected);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, fwd_b.bytes,
-											 GCS_BLOCK_R4_FORWARD_ROUTE_LEN,
-											 CLUSTER_LMS_MAX_WORKERS),
+												 GCS_BLOCK_R4_FORWARD_ROUTE_LEN,
+												 CLUSTER_LMS_MAX_WORKERS),
 				 expected);
 }
 
@@ -474,26 +474,24 @@ UT_TEST(test_r4_kind4_internal_endpoint_routes_only_to_data_worker0)
 	forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
-											 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
 				 0);
 
 	forward.base.requester_backend_id = 1;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
-											 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
 				 ordinary_shard);
 	forward.base.requester_backend_id = CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT;
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
-											 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
 				 ordinary_shard);
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_UNDO_DATA_FETCH;
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
-											 sizeof(forward) - 1,
-											 CLUSTER_LMS_MAX_WORKERS),
+												 sizeof(forward) - 1, CLUSTER_LMS_MAX_WORKERS),
 				 -1);
 	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
-											 sizeof(forward) + 1,
-											 CLUSTER_LMS_MAX_WORKERS),
+												 sizeof(forward) + 1, CLUSTER_LMS_MAX_WORKERS),
 				 -1);
 }
 
@@ -509,10 +507,8 @@ UT_TEST(test_r4_kind2_terminal_census_routes_to_existing_data_worker0)
 	int i;
 
 	for (i = 1; i < 10000 && ordinary_shard == 0; i++) {
-		tag = make_tag(GCS_BLOCK_UNDO_FETCH_TAG_MAGIC, 5, 0,
-					   MAIN_FORKNUM, (BlockNumber)i);
-		ordinary_shard
-			= cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
+		tag = make_tag(GCS_BLOCK_UNDO_FETCH_TAG_MAGIC, 5, 0, MAIN_FORKNUM, (BlockNumber)i);
+		ordinary_shard = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
 	}
 	UT_ASSERT(ordinary_shard > 0);
 	memset(&forward, 0, sizeof(forward));
@@ -520,22 +516,22 @@ UT_TEST(test_r4_kind2_terminal_census_routes_to_existing_data_worker0)
 	forward.base.requester_backend_id = 1;
 	forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_TX_RESOLVE;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward),
-		CLUSTER_LMS_MAX_WORKERS), 0);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+				 0);
 
 	forward.extension.r4_version = 0;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward),
-		CLUSTER_LMS_MAX_WORKERS), ordinary_shard);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+				 ordinary_shard);
 	forward.extension.r4_version = CLUSTER_R4_WIRE_VERSION;
 	forward.extension.r4_kind = CLUSTER_R4_WIRE_CR_BUILD;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward),
-		CLUSTER_LMS_MAX_WORKERS), ordinary_shard);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward, sizeof(forward) - 1,
-		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+												 sizeof(forward), CLUSTER_LMS_MAX_WORKERS),
+				 ordinary_shard);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &forward,
+												 sizeof(forward) - 1, CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 }
 
 /* ======================================================================
@@ -556,14 +552,14 @@ UT_TEST(test_r4_extended_route_length_mismatch_refused)
 
 	make_r4_route_frame(payload.bytes, sizeof(payload.bytes), tag, 0xC3);
 	for (i = 0; i < lengthof(request_bad_lengths); i++)
-		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
-												 payload.bytes, request_bad_lengths[i],
-												 CLUSTER_LMS_MAX_WORKERS),
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, payload.bytes,
+													 request_bad_lengths[i],
+													 CLUSTER_LMS_MAX_WORKERS),
 					 -1);
 	for (i = 0; i < lengthof(forward_bad_lengths); i++)
-		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-												 payload.bytes, forward_bad_lengths[i],
-												 CLUSTER_LMS_MAX_WORKERS),
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, payload.bytes,
+													 forward_bad_lengths[i],
+													 CLUSTER_LMS_MAX_WORKERS),
 					 -1);
 }
 
@@ -589,14 +585,13 @@ UT_TEST(test_current_mx_forward128_routes_by_request_identity)
 	describe.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
 	describe.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
 
-	route_tag = GcsBlockCurrentMxRouteTagMake(
-		describe.prefix.request_id, describe.prefix.epoch,
-		describe.prefix.original_requester_node,
-		describe.prefix.requester_backend_id);
+	route_tag = GcsBlockCurrentMxRouteTagMake(describe.prefix.request_id, describe.prefix.epoch,
+											  describe.prefix.original_requester_node,
+											  describe.prefix.requester_backend_id);
 	expected = cluster_lms_shard_for_tag(&route_tag, CLUSTER_LMS_MAX_WORKERS);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe, sizeof(describe),
-		CLUSTER_LMS_MAX_WORKERS), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe,
+												 sizeof(describe), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
 
 	memset(&proof, 0, sizeof(proof));
 	proof.prefix.request_id = describe.prefix.request_id;
@@ -606,20 +601,20 @@ UT_TEST(test_current_mx_forward128_routes_by_request_identity)
 	proof.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_MEMBER_PROOF;
 	proof.trailer.magic = CLUSTER_CURRENT_MX_WIRE_MAGIC;
 	proof.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof),
-		CLUSTER_LMS_MAX_WORKERS), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof,
+												 sizeof(proof), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
 
 	describe.prefix.kind = GCS_BLOCK_FORWARD_KIND_CURRENT_MX_STATS;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe, sizeof(describe),
-		CLUSTER_LMS_MAX_WORKERS), -1);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof) - 1,
-		CLUSTER_LMS_MAX_WORKERS), -1);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof, sizeof(proof) + 1,
-		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &describe,
+												 sizeof(describe), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof,
+												 sizeof(proof) - 1, CLUSTER_LMS_MAX_WORKERS),
+				 -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &proof,
+												 sizeof(proof) + 1, CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 }
 
 /* MXA-T24: the 136-byte CTRC CLOSE/CERTIFICATE family must use the same
@@ -648,37 +643,37 @@ UT_TEST(test_ctrc_forward136_routes_only_exact_wire_domain)
 	request.wire_length = CLUSTER_CTRC_SEAL_REQUEST_BYTES;
 	request.participant_capability_record_generation = 23;
 
-	route_tag = GcsBlockCurrentMxRouteTagMake(
-		request.request_id, request.cluster_epoch,
-		request.original_requester_node, request.requester_backend_id);
+	route_tag = GcsBlockCurrentMxRouteTagMake(request.request_id, request.cluster_epoch,
+											  request.original_requester_node,
+											  request.requester_backend_id);
 	expected = cluster_lms_shard_for_tag(&route_tag, CLUSTER_LMS_MAX_WORKERS);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
-		CLUSTER_LMS_MAX_WORKERS), expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request,
+												 sizeof(request), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
 
 	request.forward_kind = GCS_BLOCK_FORWARD_KIND_UNDO_FRESHREF_C1B_PAIR;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
-		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request,
+												 sizeof(request), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 	request.forward_kind = CLUSTER_CTRC_FORWARD_KIND;
 	request.wire_version++;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
-		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request,
+												 sizeof(request), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 	request.wire_version = CLUSTER_CTRC_WIRE_VERSION;
 	request.reserved_tail = 1;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
-		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request,
+												 sizeof(request), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 	request.reserved_tail = 0;
 	request.participant_capability_record_generation = 0;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request),
-		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request,
+												 sizeof(request), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 	request.participant_capability_record_generation = 23;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(
-		PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request, sizeof(request) - 1,
-		CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, &request,
+												 sizeof(request) - 1, CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 }
 
 /* Every staged PCM-X frame is tag-affine.  RETIRE/RETIRE_ACK are the only
@@ -714,16 +709,15 @@ UT_TEST(test_pi_durable_note_routes_to_exact_tag_worker)
  * decoded assertion tag; raw offset-16 routing would accept the corrupted
  * companion frame below. */
 static uint16
-make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
-							BufferTag tag, uint8 *bytes, uint16 capacity)
+make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type, BufferTag tag, uint8 *bytes,
+							uint16 capacity)
 {
 	ResourceXDecodedFrame frame;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_BAD_ARGUMENT;
 	uint16 payload_len = 0;
 
 	memset(&frame, 0, sizeof(frame));
-	UT_ASSERT(resource_x_assertion_init(&tag, 3,
-										 &frame.common.logical_assertion));
+	UT_ASSERT(resource_x_assertion_init(&tag, 3, &frame.common.logical_assertion));
 	frame.kind = kind;
 	frame.common.base_authority_generation = 11;
 	frame.common.resource_formation = 12;
@@ -757,15 +751,11 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 		frame.blocked_has_remote_proof = capacity == RESOURCE_X_PROOF_V1_BYTES;
 		if (frame.blocked_has_remote_proof) {
 			frame.body.blocked_to_n.source_carrier_generation = 18;
-			frame.body.blocked_to_n.requester_target_generation
-				= frame.common.assertion_sequence;
-			frame.body.blocked_to_n.source_disposition
-				= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
-			frame.body.blocked_to_n.proof_kind
-				= RESOURCE_X_PROOF_REMOTE_CARRIER;
+			frame.body.blocked_to_n.requester_target_generation = frame.common.assertion_sequence;
+			frame.body.blocked_to_n.source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+			frame.body.blocked_to_n.proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
 			frame.body.blocked_to_n.holder_connection_generation = 20;
-			frame.body.blocked_to_n.acting_formation
-				= frame.common.resource_formation;
+			frame.body.blocked_to_n.acting_formation = frame.common.resource_formation;
 		}
 	} else if (kind == RESOURCE_X_WIRE_RELEASE_X) {
 		frame.common.observed_mode = PCM_STATE_X;
@@ -774,20 +764,15 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 	} else if (kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION) {
 		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 		frame.body.local_proof.local_holder_authority_generation = 21;
-		frame.body.local_proof.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.local_proof.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.local_proof.requester_connection_generation = 23;
 		frame.body.local_proof.local_proof_generation = 24;
 	} else if (kind == RESOURCE_X_WIRE_AUTHORITY_GRANT) {
 		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
-		frame.body.authority_grant.final_authority_generation
-			= frame.common.authority_generation;
-		frame.body.authority_grant.requester_target_generation
-			= frame.common.assertion_sequence;
-		frame.body.authority_grant.proof_kind
-			= RESOURCE_X_PROOF_DURABLE_STORAGE;
-		frame.body.authority_grant.source_disposition
-			= RESOURCE_X_DISPOSITION_DURABLE_STORAGE;
+		frame.body.authority_grant.final_authority_generation = frame.common.authority_generation;
+		frame.body.authority_grant.requester_target_generation = frame.common.assertion_sequence;
+		frame.body.authority_grant.proof_kind = RESOURCE_X_PROOF_DURABLE_STORAGE;
+		frame.body.authority_grant.source_disposition = RESOURCE_X_DISPOSITION_DURABLE_STORAGE;
 		frame.body.authority_grant.requester_connection_generation = 26;
 	} else if (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
 		frame.common.action_node = 7;
@@ -795,13 +780,10 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 		frame.body.image_envelope.conversion_base_generation
 			= frame.common.base_authority_generation;
 		frame.body.image_envelope.source_carrier_generation = 27;
-		frame.body.image_envelope.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.image_envelope.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.image_envelope.image_length = RESOURCE_X_PAGE_BYTES;
-		frame.body.image_envelope.source_disposition
-			= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
-		frame.body.image_envelope.proof_kind
-			= RESOURCE_X_PROOF_REMOTE_CARRIER;
+		frame.body.image_envelope.source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+		frame.body.image_envelope.proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
 	} else if (kind == RESOURCE_X_WIRE_INSTALL_SETTLEMENT) {
 		frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 		frame.body.install_settlement.conversion_base_generation
@@ -809,18 +791,15 @@ make_resource_x_route_frame(ResourceXWireKind kind, uint8 msg_type,
 		frame.body.install_settlement.final_authority_generation
 			= frame.common.authority_generation;
 		frame.body.install_settlement.requester_connection_generation = 29;
-		frame.body.install_settlement.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.install_settlement.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.install_settlement.installed_mode = PCM_STATE_X;
-		frame.body.install_settlement.requester_role
-			= RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+		frame.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
 		frame.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
-		frame.body.install_settlement.terminal_state
-			= RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+		frame.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
 	}
 
-	UT_ASSERT(cluster_resource_x_wire_encode(msg_type, &frame, bytes,
-										 capacity, &payload_len, &reject));
+	UT_ASSERT(
+		cluster_resource_x_wire_encode(msg_type, &frame, bytes, capacity, &payload_len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_NONE);
 	return payload_len;
 }
@@ -832,30 +811,24 @@ UT_TEST(test_resource_x_reused_types_route_only_after_strict_domain_decode)
 		ResourceXWireKind kind;
 		uint16 payload_len;
 	} cases[] = {
-		{ RESOURCE_X_MSG_ASSERT_X,
-		  RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP,
+		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP,
 		  RESOURCE_X_CONTROL_V1_BYTES },
-		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_ASSERT_X,
-		  RESOURCE_X_CONTROL_V1_BYTES },
+		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_ASSERT_X, RESOURCE_X_CONTROL_V1_BYTES },
 		{ RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION,
 		  RESOURCE_X_SHORT_V1_BYTES },
-		{ RESOURCE_X_MSG_BLOCK_TO_N, RESOURCE_X_WIRE_BLOCK_TO_N,
-		  RESOURCE_X_CONTROL_V1_BYTES },
-		{ RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N,
-		  RESOURCE_X_CONTROL_V1_BYTES },
-		{ RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N,
-		  RESOURCE_X_PROOF_V1_BYTES },
+		{ RESOURCE_X_MSG_BLOCK_TO_N, RESOURCE_X_WIRE_BLOCK_TO_N, RESOURCE_X_CONTROL_V1_BYTES },
+		{ RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N, RESOURCE_X_CONTROL_V1_BYTES },
+		{ RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N, RESOURCE_X_PROOF_V1_BYTES },
 		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_AUTHORITY_GRANT,
 		  RESOURCE_X_PROOF_V1_BYTES },
 		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_IMAGE_ENVELOPE,
 		  RESOURCE_X_IMAGE_V1_BYTES },
-		{ RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		  RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP,
+		{ RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP,
 		  RESOURCE_X_CONTROL_V1_BYTES },
 		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_RELEASE_X,
 		  RESOURCE_X_CONTROL_V1_BYTES },
-		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
-		  RESOURCE_X_WIRE_INSTALL_SETTLEMENT, RESOURCE_X_SHORT_V1_BYTES }
+		{ RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_INSTALL_SETTLEMENT,
+		  RESOURCE_X_SHORT_V1_BYTES }
 	};
 	BufferTag tag = make_tag(1663, 5, 37001, FSM_FORKNUM, 771);
 	union {
@@ -866,16 +839,18 @@ UT_TEST(test_resource_x_reused_types_route_only_after_strict_domain_decode)
 	Size i;
 
 	for (i = 0; i < lengthof(cases); i++) {
-		uint16 encoded_len = make_resource_x_route_frame(cases[i].kind,
-			cases[i].msg_type, tag, payload.bytes, cases[i].payload_len);
+		uint16 encoded_len = make_resource_x_route_frame(cases[i].kind, cases[i].msg_type, tag,
+														 payload.bytes, cases[i].payload_len);
 
 		UT_ASSERT_EQ(encoded_len, cases[i].payload_len);
-		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(cases[i].msg_type,
-			payload.bytes, encoded_len, CLUSTER_LMS_MAX_WORKERS), expected);
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(cases[i].msg_type, payload.bytes, encoded_len,
+													 CLUSTER_LMS_MAX_WORKERS),
+					 expected);
 
 		payload.bytes[20] ^= UINT8_C(0x01);
-		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(cases[i].msg_type,
-			payload.bytes, encoded_len, CLUSTER_LMS_MAX_WORKERS), -1);
+		UT_ASSERT_EQ(cluster_gcs_block_payload_shard(cases[i].msg_type, payload.bytes, encoded_len,
+													 CLUSTER_LMS_MAX_WORKERS),
+					 -1);
 		payload.bytes[20] ^= UINT8_C(0x01);
 	}
 }
@@ -891,16 +866,21 @@ UT_TEST(test_resource_x_length_collisions_preserve_legacy_domains)
 	int expected = cluster_lms_shard_for_tag(&tag, CLUSTER_LMS_MAX_WORKERS);
 
 	ack.tag = tag;
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
-		&request, sizeof(request), CLUSTER_LMS_MAX_WORKERS), expected);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE,
-		&invalidate, sizeof(invalidate), CLUSTER_LMS_MAX_WORKERS), expected);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK,
-		&ack, sizeof(ack), CLUSTER_LMS_MAX_WORKERS), expected);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_DONE,
-		&done, sizeof(done), CLUSTER_LMS_MAX_WORKERS), expected);
-	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
-		legacy_reply, sizeof(legacy_reply), CLUSTER_LMS_MAX_WORKERS), -1);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, &request,
+												 sizeof(request), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE, &invalidate,
+												 sizeof(invalidate), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK, &ack,
+												 sizeof(ack), CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_DONE, &done, sizeof(done),
+												 CLUSTER_LMS_MAX_WORKERS),
+				 expected);
+	UT_ASSERT_EQ(cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_REPLY, legacy_reply,
+												 sizeof(legacy_reply), CLUSTER_LMS_MAX_WORKERS),
+				 -1);
 }
 
 int

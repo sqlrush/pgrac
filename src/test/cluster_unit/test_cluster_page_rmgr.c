@@ -57,9 +57,8 @@ typedef struct FakeRecord {
 } FakeRecord;
 
 static XLogReaderState *
-make_record(FakeRecord *fr, RmgrId rmid, uint8 info, uint64 xl_scn,
-			bool has_ref, bool has_image, bool apply_image, uint8 fork_flags,
-			XLogRecPtr endlsn)
+make_record(FakeRecord *fr, RmgrId rmid, uint8 info, uint64 xl_scn, bool has_ref, bool has_image,
+			bool apply_image, uint8 fork_flags, XLogRecPtr endlsn)
 {
 	DecodedXLogRecord *dec = &fr->u.dec;
 
@@ -91,16 +90,13 @@ make_record(FakeRecord *fr, RmgrId rmid, uint8 info, uint64 xl_scn,
 UT_TEST(test_census_heap_delta_rows)
 {
 	ClusterPageRmgrCensusEntry e;
-	int			opcodes[] = { XLOG_HEAP_INSERT, XLOG_HEAP_DELETE,
-		XLOG_HEAP_UPDATE, XLOG_HEAP_HOT_UPDATE
-	};
-	int			i;
+	int opcodes[] = { XLOG_HEAP_INSERT, XLOG_HEAP_DELETE, XLOG_HEAP_UPDATE, XLOG_HEAP_HOT_UPDATE };
+	int i;
 
 	/* The t/256-differenced heap deltas: NORMAL, page-affecting, known. */
-	for (i = 0; i < (int) lengthof(opcodes); i++) {
-		UT_ASSERT(cluster_page_rmgr_census_lookup(RM_HEAP_ID,
-												  (uint16) opcodes[i], &e));
-		UT_ASSERT_EQ((int) e.page_class, (int) CLUSTER_PAGE_CLASS_NORMAL);
+	for (i = 0; i < (int)lengthof(opcodes); i++) {
+		UT_ASSERT(cluster_page_rmgr_census_lookup(RM_HEAP_ID, (uint16)opcodes[i], &e));
+		UT_ASSERT_EQ((int)e.page_class, (int)CLUSTER_PAGE_CLASS_NORMAL);
 		UT_ASSERT(e.affects_page);
 		UT_ASSERT(e.known_delta);
 		/* G3: no deterministic-mutation declaration exists yet. */
@@ -115,7 +111,7 @@ UT_TEST(test_census_heap_unsupported_deltas_not_known)
 	/* LOCK/CONFIRM/INPLACE are page-affecting NORMAL rows WITHOUT
 	 * differential evidence (the matrix fails them closed, 8.A/R11). */
 	UT_ASSERT(cluster_page_rmgr_census_lookup(RM_HEAP_ID, XLOG_HEAP_LOCK, &e));
-	UT_ASSERT_EQ((int) e.page_class, (int) CLUSTER_PAGE_CLASS_NORMAL);
+	UT_ASSERT_EQ((int)e.page_class, (int)CLUSTER_PAGE_CLASS_NORMAL);
 	UT_ASSERT(e.affects_page);
 	UT_ASSERT(!e.known_delta);
 
@@ -126,7 +122,7 @@ UT_TEST(test_census_heap_unsupported_deltas_not_known)
 
 	/* Index data pages: NORMAL row, no evidence yet. */
 	UT_ASSERT(cluster_page_rmgr_census_lookup(RM_BTREE_ID, 0, &e));
-	UT_ASSERT_EQ((int) e.page_class, (int) CLUSTER_PAGE_CLASS_NORMAL);
+	UT_ASSERT_EQ((int)e.page_class, (int)CLUSTER_PAGE_CLASS_NORMAL);
 	UT_ASSERT(e.affects_page);
 	UT_ASSERT(!e.known_delta);
 }
@@ -139,11 +135,11 @@ UT_TEST(test_census_header_class_typed_owner)
 	 * replay must never touch them (§4.5), and there is no differential
 	 * evidence. */
 	UT_ASSERT(cluster_page_rmgr_census_lookup(RM_CLOG_ID, 0, &e));
-	UT_ASSERT_EQ((int) e.page_class, (int) CLUSTER_PAGE_CLASS_HEADER);
+	UT_ASSERT_EQ((int)e.page_class, (int)CLUSTER_PAGE_CLASS_HEADER);
 	UT_ASSERT(e.affects_page);
 	UT_ASSERT(!e.known_delta);
 	UT_ASSERT(cluster_page_rmgr_census_lookup(RM_RELMAP_ID, 0, &e));
-	UT_ASSERT_EQ((int) e.page_class, (int) CLUSTER_PAGE_CLASS_HEADER);
+	UT_ASSERT_EQ((int)e.page_class, (int)CLUSTER_PAGE_CLASS_HEADER);
 }
 
 UT_TEST(test_census_non_page_rmgrs)
@@ -177,9 +173,8 @@ UT_TEST(test_census_heap_init_page_attribute_row)
 	/* INIT_PAGE: NEW-class row carrying the will_init ATTRIBUTE — but no
 	 * §4.6 full-init rule (expected class state + result-version proof),
 	 * so the classifier must still return UNKNOWN for it (PU-17). */
-	UT_ASSERT(cluster_page_rmgr_census_lookup(RM_HEAP_ID, XLOG_HEAP_INIT_PAGE,
-											  &e));
-	UT_ASSERT_EQ((int) e.page_class, (int) CLUSTER_PAGE_CLASS_NEW);
+	UT_ASSERT(cluster_page_rmgr_census_lookup(RM_HEAP_ID, XLOG_HEAP_INIT_PAGE, &e));
+	UT_ASSERT_EQ((int)e.page_class, (int)CLUSTER_PAGE_CLASS_NEW);
 	UT_ASSERT(e.will_init);
 	UT_ASSERT(!e.known_delta);
 }
@@ -213,17 +208,14 @@ UT_TEST(test_populate_known_set_wires_only_proven_deltas)
 	in.opcode = XLOG_HEAP_INSERT;
 	in.forknum = MAIN_FORKNUM;
 	in.header_owner = CLUSTER_PAGE_HEADER_OWNER_NONE;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_NORMAL);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_NORMAL);
 	/* Lock stays UNKNOWN (BLOCKED) until differential evidence lands. */
 	in.opcode = XLOG_HEAP_LOCK;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 	/* INIT_PAGE keeps the WILL_INIT attribute: UNKNOWN without the
 	 * full-init rule (PU-17). */
 	in.opcode = XLOG_HEAP_INIT_PAGE;
-	UT_ASSERT_EQ((int) cluster_page_classify(&in),
-				 (int) CLUSTER_PAGE_CLASS_UNKNOWN);
+	UT_ASSERT_EQ((int)cluster_page_classify(&in), (int)CLUSTER_PAGE_CLASS_UNKNOWN);
 }
 
 /* ==========================================================================
@@ -236,24 +228,22 @@ UT_TEST(test_decode_heap_insert_extracts_facts)
 	XLogReaderState *rec;
 	ClusterPageRedoDecoded out;
 
-	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INSERT,
-					  UINT64_C(0x123456789), true, false, false, 0,
-					  UINT64_C(0x1000));
+	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INSERT, UINT64_C(0x123456789), true, false, false,
+					  0, UINT64_C(0x1000));
 	UT_ASSERT(cluster_page_redo_decode(rec, 0, &out));
-	UT_ASSERT_EQ((int) out.page_class, (int) CLUSTER_PAGE_CLASS_NORMAL);
-	UT_ASSERT_EQ((unsigned long long) out.identity.rlocator.spcOid, 1ULL);
-	UT_ASSERT_EQ((unsigned long long) out.identity.blocknum, 42ULL);
-	UT_ASSERT_EQ((int) out.identity.forknum, (int) MAIN_FORKNUM);
+	UT_ASSERT_EQ((int)out.page_class, (int)CLUSTER_PAGE_CLASS_NORMAL);
+	UT_ASSERT_EQ((unsigned long long)out.identity.rlocator.spcOid, 1ULL);
+	UT_ASSERT_EQ((unsigned long long)out.identity.blocknum, 42ULL);
+	UT_ASSERT_EQ((int)out.identity.forknum, (int)MAIN_FORKNUM);
 	/* §3.1 hints: record-side facts only. */
-	UT_ASSERT_EQ((unsigned long long) out.hints.record_scn,
-				 (unsigned long long) UINT64_C(0x123456789));
-	UT_ASSERT_EQ((unsigned long long) out.hints.record_lsn,
-				 (unsigned long long) UINT64_C(0x1000));
+	UT_ASSERT_EQ((unsigned long long)out.hints.record_scn,
+				 (unsigned long long)UINT64_C(0x123456789));
+	UT_ASSERT_EQ((unsigned long long)out.hints.record_lsn, (unsigned long long)UINT64_C(0x1000));
 	UT_ASSERT(!out.full_image);
 	UT_ASSERT(!out.will_init);
 	/* Page-side hints are the caller's to fill; they start zero. */
-	UT_ASSERT_EQ((unsigned long long) out.hints.page_scn, 0ULL);
-	UT_ASSERT_EQ((unsigned long long) out.hints.page_lsn, 0ULL);
+	UT_ASSERT_EQ((unsigned long long)out.hints.page_scn, 0ULL);
+	UT_ASSERT_EQ((unsigned long long)out.hints.page_lsn, 0ULL);
 }
 
 UT_TEST(test_decode_fpi_and_will_init_attributes)
@@ -263,17 +253,16 @@ UT_TEST(test_decode_fpi_and_will_init_attributes)
 	ClusterPageRedoDecoded out;
 
 	/* FPI present and applied. */
-	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INSERT,
-					  5, true, true, true, 0, 0x2000);
+	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INSERT, 5, true, true, true, 0, 0x2000);
 	UT_ASSERT(cluster_page_redo_decode(rec, 0, &out));
 	UT_ASSERT(out.full_image);
 
 	/* BKPBLOCK_WILL_INIT attribute rides the block fork flags. */
-	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INIT_PAGE,
-					  6, true, false, false, BKPBLOCK_WILL_INIT, 0x3000);
+	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INIT_PAGE, 6, true, false, false,
+					  BKPBLOCK_WILL_INIT, 0x3000);
 	UT_ASSERT(cluster_page_redo_decode(rec, 0, &out));
 	UT_ASSERT(out.will_init);
-	UT_ASSERT_EQ((int) out.page_class, (int) CLUSTER_PAGE_CLASS_NEW);
+	UT_ASSERT_EQ((int)out.page_class, (int)CLUSTER_PAGE_CLASS_NEW);
 }
 
 UT_TEST(test_decode_fail_closed_paths)
@@ -283,8 +272,7 @@ UT_TEST(test_decode_fail_closed_paths)
 	ClusterPageRedoDecoded out;
 
 	/* No block reference: nothing to decode. */
-	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INSERT, 1, false, false,
-					  false, 0, 0x1000);
+	rec = make_record(&fr, RM_HEAP_ID, XLOG_HEAP_INSERT, 1, false, false, false, 0, 0x1000);
 	UT_ASSERT(!cluster_page_redo_decode(rec, 0, &out));
 
 	/* Non-page-affecting rmgr (SMGR): census row says not page-affecting. */

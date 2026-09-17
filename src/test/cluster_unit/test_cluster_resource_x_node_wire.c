@@ -43,11 +43,9 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 }
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# Assert failed: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -69,25 +67,18 @@ UT_TEST(test_wire_kind_and_proof_domains_are_closed)
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_LOCAL_IMAGE, 2);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_DURABLE_STORAGE, 3);
 	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MIN, RESOURCE_X_WIRE_ASSERT_X);
-	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MAX,
-				 RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+	UT_ASSERT_EQ(RESOURCE_X_WIRE_KIND_MAX, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
 	UT_ASSERT_EQ(RESOURCE_X_PROOF_KIND_MIN, RESOURCE_X_PROOF_REMOTE_CARRIER);
-	UT_ASSERT_EQ(RESOURCE_X_PROOF_KIND_MAX,
-				 RESOURCE_X_PROOF_DURABLE_STORAGE);
+	UT_ASSERT_EQ(RESOURCE_X_PROOF_KIND_MAX, RESOURCE_X_PROOF_DURABLE_STORAGE);
 }
 
 UT_TEST(test_reused_message_numbers_remain_exact)
 {
-	UT_ASSERT_EQ(RESOURCE_X_MSG_ASSERT_X,
-				 PGRAC_IC_MSG_GCS_BLOCK_REQUEST);
-	UT_ASSERT_EQ(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-				 PGRAC_IC_MSG_GCS_BLOCK_REPLY);
-	UT_ASSERT_EQ(RESOURCE_X_MSG_BLOCK_TO_N,
-				 PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE);
-	UT_ASSERT_EQ(RESOURCE_X_MSG_BLOCKED_TO_N,
-				 PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK);
-	UT_ASSERT_EQ(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
-				 PGRAC_IC_MSG_GCS_BLOCK_DONE);
+	UT_ASSERT_EQ(RESOURCE_X_MSG_ASSERT_X, PGRAC_IC_MSG_GCS_BLOCK_REQUEST);
+	UT_ASSERT_EQ(RESOURCE_X_MSG_IMAGE_OR_GRANT, PGRAC_IC_MSG_GCS_BLOCK_REPLY);
+	UT_ASSERT_EQ(RESOURCE_X_MSG_BLOCK_TO_N, PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE);
+	UT_ASSERT_EQ(RESOURCE_X_MSG_BLOCKED_TO_N, PGRAC_IC_MSG_GCS_BLOCK_INVALIDATE_ACK);
+	UT_ASSERT_EQ(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, PGRAC_IC_MSG_GCS_BLOCK_DONE);
 }
 
 UT_TEST(test_common_wire_layout_is_exact)
@@ -119,31 +110,23 @@ UT_TEST(test_common_wire_layout_is_exact)
 UT_TEST(test_local_proof_layout_is_exact)
 {
 	UT_ASSERT_EQ(sizeof(ResourceXLocalProofDeclarationV1), 152);
-	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1,
-						  local_holder_authority_generation), 96);
-	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1,
-						  requester_target_generation), 104);
+	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, local_holder_authority_generation), 96);
+	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, requester_target_generation), 104);
 	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, page_scn_lsn), 112);
 	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, dependency_count), 120);
-	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1,
-						  dependency_vector_crc32c), 124);
+	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, dependency_vector_crc32c), 124);
 	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, page_checksum), 128);
-	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1,
-						  local_image_proof_crc32c), 132);
-	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1,
-						  requester_connection_generation), 136);
-	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1,
-						  local_proof_generation), 144);
+	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, local_image_proof_crc32c), 132);
+	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, requester_connection_generation), 136);
+	UT_ASSERT_EQ(offsetof(ResourceXLocalProofDeclarationV1, local_proof_generation), 144);
 }
 
 UT_TEST(test_blocked_to_n_layout_is_exact)
 {
 	UT_ASSERT_EQ(sizeof(ResourceXBlockedToNProofV1), 312);
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, source_fence), 96);
-	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1,
-						  source_carrier_generation), 130);
-	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1,
-						  requester_target_generation), 138);
+	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, source_carrier_generation), 130);
+	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, requester_target_generation), 138);
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, page_scn_lsn), 146);
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, dependency_count), 154);
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, dependencies), 156);
@@ -152,8 +135,7 @@ UT_TEST(test_blocked_to_n_layout_is_exact)
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, source_disposition), 292);
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, proof_kind), 293);
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, proof_flags), 294);
-	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1,
-						  holder_connection_generation), 296);
+	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, holder_connection_generation), 296);
 	UT_ASSERT_EQ(offsetof(ResourceXBlockedToNProofV1, acting_formation), 304);
 }
 
@@ -161,12 +143,9 @@ UT_TEST(test_authority_grant_layout_is_exact)
 {
 	UT_ASSERT_EQ(sizeof(ResourceXAuthorityGrantV1), 312);
 	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, source_fence), 96);
-	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1,
-						  final_authority_generation), 130);
-	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1,
-						  source_carrier_generation), 138);
-	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1,
-						  requester_target_generation), 146);
+	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, final_authority_generation), 130);
+	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, source_carrier_generation), 138);
+	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, requester_target_generation), 146);
 	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, page_scn_lsn), 154);
 	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, dependency_count), 162);
 	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, dependencies), 164);
@@ -175,26 +154,21 @@ UT_TEST(test_authority_grant_layout_is_exact)
 	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, proof_kind), 300);
 	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, source_disposition), 301);
 	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, grant_flags), 302);
-	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1,
-						  requester_connection_generation), 304);
+	UT_ASSERT_EQ(offsetof(ResourceXAuthorityGrantV1, requester_connection_generation), 304);
 }
 
 UT_TEST(test_image_envelope_layout_is_exact)
 {
 	UT_ASSERT_EQ(sizeof(ResourceXImageEnvelopeV1), 8520);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, request_tail), 96);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1,
-						  conversion_base_generation), 116);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, conversion_base_generation), 116);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, source_fence), 124);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1,
-						  source_carrier_generation), 158);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1,
-						  requester_target_generation), 166);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, source_carrier_generation), 158);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, requester_target_generation), 166);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, page_scn_lsn), 174);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, dependency_count), 182);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, dependencies), 184);
-	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1,
-						  dependency_vector_crc32c), 312);
+	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, dependency_vector_crc32c), 312);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, page_checksum), 316);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, image_length), 320);
 	UT_ASSERT_EQ(offsetof(ResourceXImageEnvelopeV1, source_disposition), 324);
@@ -207,18 +181,13 @@ UT_TEST(test_image_envelope_layout_is_exact)
 UT_TEST(test_install_settlement_layout_is_exact)
 {
 	UT_ASSERT_EQ(sizeof(ResourceXInstallSettlementV1), 152);
-	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1,
-						  conversion_base_generation), 96);
-	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1,
-						  final_authority_generation), 104);
-	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1,
-						  requester_connection_generation), 112);
-	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1,
-						  requester_target_generation), 120);
+	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, conversion_base_generation), 96);
+	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, final_authority_generation), 104);
+	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, requester_connection_generation), 112);
+	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, requester_target_generation), 120);
 	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, page_scn_lsn), 128);
 	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, page_checksum), 136);
-	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1,
-						  source_proof_crc32c), 140);
+	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, source_proof_crc32c), 140);
 	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, installed_mode), 144);
 	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, requester_role), 145);
 	UT_ASSERT_EQ(offsetof(ResourceXInstallSettlementV1, terminal_outcome), 146);
@@ -276,34 +245,30 @@ static void test_reseal(uint8 *bytes, uint16 len);
 static ResourceXDecodedFrame
 make_bootstrap_frame(bool ack)
 {
-	ResourceXDecodedFrame frame
-		= make_control_frame(RESOURCE_X_WIRE_ASSERT_X);
+	ResourceXDecodedFrame frame = make_control_frame(RESOURCE_X_WIRE_ASSERT_X);
 
 	frame.kind = RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP;
-	frame.common.base_authority_generation
-		= ack ? UINT64_C(0x0102030405060708) : 0;
+	frame.common.base_authority_generation = ack ? UINT64_C(0x0102030405060708) : 0;
 	frame.common.authority_generation = 0;
 	frame.common.ordered_lane = 0;
 	frame.common.observed_mode = PCM_STATE_N;
 	frame.common.target_mode = PCM_STATE_X;
 	frame.common.source_candidate = 0;
 	frame.common.retain_pi_if_dirty = 0;
-	frame.common.outcome
-		= ack ? RESOURCE_X_OUTCOME_OK : RESOURCE_X_OUTCOME_NONE;
+	frame.common.outcome = ack ? RESOURCE_X_OUTCOME_OK : RESOURCE_X_OUTCOME_NONE;
 	frame.common.flags = 0;
 	return frame;
 }
 
 static void
-assert_bootstrap_encode_rejected(uint8 msg_type,
-								 ResourceXDecodedFrame *frame)
+assert_bootstrap_encode_rejected(uint8 msg_type, ResourceXDecodedFrame *frame)
 {
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 len = 0;
 
-	UT_ASSERT(!cluster_resource_x_wire_encode(
-		msg_type, frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(
+		!cluster_resource_x_wire_encode(msg_type, frame, bytes, sizeof(bytes), &len, &reject));
 	UT_ASSERT(reject != RESOURCE_X_WIRE_REJECT_NONE);
 }
 
@@ -316,25 +281,22 @@ UT_TEST(test_preassert_bootstrap_request_and_ack_are_direction_exact)
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 len = 0;
 
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_ASSERT_X, &request, bytes, sizeof(bytes), &len,
-		&reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &request, bytes,
+											 sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(len, RESOURCE_X_CONTROL_V1_BYTES);
 	UT_ASSERT_EQ(bytes[1], RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP);
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_ASSERT_X, bytes, len, &decoded, &reject));
+	UT_ASSERT(
+		cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len, &decoded, &reject));
 	UT_ASSERT_EQ(decoded.common.base_authority_generation, 0);
 	UT_ASSERT_EQ(decoded.common.authority_generation, 0);
 	UT_ASSERT_EQ(decoded.common.outcome, RESOURCE_X_OUTCOME_NONE);
 
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_IMAGE_OR_GRANT, &ack, bytes, sizeof(bytes), &len,
-		&reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &ack, bytes,
+											 sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(len, RESOURCE_X_CONTROL_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded, &reject));
-	UT_ASSERT_EQ(decoded.common.base_authority_generation,
-		UINT64_C(0x0102030405060708));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											 &reject));
+	UT_ASSERT_EQ(decoded.common.base_authority_generation, UINT64_C(0x0102030405060708));
 	UT_ASSERT_EQ(decoded.common.authority_generation, 0);
 	UT_ASSERT_EQ(decoded.common.outcome, RESOURCE_X_OUTCOME_OK);
 
@@ -438,19 +400,18 @@ UT_TEST(test_preassert_bootstrap_decode_rejects_reserved_length_and_pair_drift)
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 len = 0;
 
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_ASSERT_X, &request, bytes, sizeof(bytes), &len,
-		&reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &request, bytes,
+											 sizeof(bytes), &len, &reject));
 	bytes[82] = 1;
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_ASSERT_X, bytes, len, &decoded, &reject));
+	UT_ASSERT(
+		!cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len, &decoded, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_RESERVED);
-	UT_ASSERT(!cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_ASSERT_X, bytes, len - 1, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, len - 1, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_LEGACY_LENGTH);
-	UT_ASSERT(!cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
+	UT_ASSERT(
+		!cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
 }
 
@@ -462,8 +423,8 @@ UT_TEST(test_control_codec_is_network_order_and_crc_exact)
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 encoded_len = 0;
 
-	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame,
-		bytes, sizeof(bytes), &encoded_len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame, bytes, sizeof(bytes),
+											 &encoded_len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_NONE);
 	UT_ASSERT_EQ(encoded_len, RESOURCE_X_CONTROL_V1_BYTES);
 	UT_ASSERT_EQ(bytes[0], RESOURCE_X_WIRE_VERSION);
@@ -477,74 +438,63 @@ UT_TEST(test_control_codec_is_network_order_and_crc_exact)
 	UT_ASSERT(memcmp(bytes + 4, "\0\0\0\0", 4) != 0);
 
 	memset(&decoded, 0xa5, sizeof(decoded));
-	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes,
-		encoded_len, &decoded, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, encoded_len, &decoded,
+											 &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_NONE);
 	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_ASSERT_X);
 	UT_ASSERT_EQ(decoded.payload_bytes, RESOURCE_X_CONTROL_V1_BYTES);
 	UT_ASSERT(resource_x_assertion_equal(&decoded.common.logical_assertion,
-		&frame.common.logical_assertion));
-	UT_ASSERT_EQ(decoded.common.base_authority_generation,
-		frame.common.base_authority_generation);
+										 &frame.common.logical_assertion));
+	UT_ASSERT_EQ(decoded.common.base_authority_generation, frame.common.base_authority_generation);
 	UT_ASSERT_EQ(decoded.common.ordered_lane, frame.common.ordered_lane);
-	UT_ASSERT_EQ(decoded.common.authority_generation,
-		frame.common.authority_generation);
+	UT_ASSERT_EQ(decoded.common.authority_generation, frame.common.authority_generation);
 }
 
 UT_TEST(test_physical_sender_generation_rebind_preserves_block_semantics)
 {
-	ResourceXDecodedFrame frame
-		= make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
+	ResourceXDecodedFrame frame = make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 encoded_len = 0;
 
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
-		&encoded_len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes,
+											 sizeof(bytes), &encoded_len, &reject));
 	UT_ASSERT_EQ(encoded_len, RESOURCE_X_CONTROL_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(
-		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, 77, &reject));
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT(cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_BLOCK_TO_N, bytes,
+															   encoded_len, 77, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len,
+											 &decoded, &reject));
 	UT_ASSERT_EQ(decoded.common.sender_connection_generation, 77);
 	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_BLOCK_TO_N);
 	UT_ASSERT(resource_x_assertion_equal(&decoded.common.logical_assertion,
-		&frame.common.logical_assertion));
-	UT_ASSERT_EQ(decoded.common.base_authority_generation,
-		frame.common.base_authority_generation);
-	UT_ASSERT_EQ(decoded.common.assertion_sequence,
-		frame.common.assertion_sequence);
+										 &frame.common.logical_assertion));
+	UT_ASSERT_EQ(decoded.common.base_authority_generation, frame.common.base_authority_generation);
+	UT_ASSERT_EQ(decoded.common.assertion_sequence, frame.common.assertion_sequence);
 	UT_ASSERT_EQ(decoded.common.action_node, frame.common.action_node);
 	UT_ASSERT_EQ(decoded.common.observed_mode, frame.common.observed_mode);
 	UT_ASSERT_EQ(decoded.common.target_mode, frame.common.target_mode);
-	UT_ASSERT_EQ(decoded.common.source_candidate,
-		frame.common.source_candidate);
-	UT_ASSERT_EQ(decoded.common.retain_pi_if_dirty,
-		frame.common.retain_pi_if_dirty);
-	UT_ASSERT_EQ(decoded.common.authority_generation,
-		frame.common.authority_generation);
-	UT_ASSERT(!cluster_resource_x_wire_rebind_sender_generation(
-		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, 0, &reject));
+	UT_ASSERT_EQ(decoded.common.source_candidate, frame.common.source_candidate);
+	UT_ASSERT_EQ(decoded.common.retain_pi_if_dirty, frame.common.retain_pi_if_dirty);
+	UT_ASSERT_EQ(decoded.common.authority_generation, frame.common.authority_generation);
+	UT_ASSERT(!cluster_resource_x_wire_rebind_sender_generation(RESOURCE_X_MSG_BLOCK_TO_N, bytes,
+																encoded_len, 0, &reject));
 }
 
 UT_TEST(test_shared_s_carrier_block_to_n_round_trip_is_exact)
 {
-	ResourceXDecodedFrame frame
-		= make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
+	ResourceXDecodedFrame frame = make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 encoded_len = 0;
 
 	frame.common.observed_mode = PCM_STATE_S;
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
-		&encoded_len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes,
+											 sizeof(bytes), &encoded_len, &reject));
 	UT_ASSERT_EQ(encoded_len, RESOURCE_X_CONTROL_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, encoded_len,
+											 &decoded, &reject));
 	UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
 	UT_ASSERT_EQ(decoded.common.target_mode, PCM_STATE_N);
 	UT_ASSERT_EQ(decoded.common.source_candidate, 1);
@@ -553,41 +503,36 @@ UT_TEST(test_shared_s_carrier_block_to_n_round_trip_is_exact)
 
 UT_TEST(test_shared_s_carrier_proof_and_image_round_trip_preserve_mode)
 {
-	ResourceXDecodedFrame proof
-		= make_typed_frame(RESOURCE_X_WIRE_BLOCKED_TO_N);
-	ResourceXDecodedFrame image
-		= make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
+	ResourceXDecodedFrame proof = make_typed_frame(RESOURCE_X_WIRE_BLOCKED_TO_N);
+	ResourceXDecodedFrame image = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
 	uint16 encoded_len = 0;
 
 	proof.common.observed_mode = PCM_STATE_S;
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_BLOCKED_TO_N, &proof, bytes, sizeof(bytes),
-		&encoded_len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &proof, bytes,
+											 sizeof(bytes), &encoded_len, &reject));
 	UT_ASSERT_EQ(encoded_len, RESOURCE_X_PROOF_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCKED_TO_N, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, encoded_len,
+											 &decoded, &reject));
 	UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
 	UT_ASSERT_EQ(decoded.common.target_mode, PCM_STATE_N);
 	UT_ASSERT(decoded.blocked_has_remote_proof);
 
 	image.common.observed_mode = PCM_STATE_S;
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_IMAGE_OR_GRANT, &image, bytes, sizeof(bytes),
-		&encoded_len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &image, bytes,
+											 sizeof(bytes), &encoded_len, &reject));
 	UT_ASSERT_EQ(encoded_len, RESOURCE_X_IMAGE_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, encoded_len, &decoded, &reject));
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, encoded_len,
+											 &decoded, &reject));
 	UT_ASSERT_EQ(decoded.common.observed_mode, PCM_STATE_S);
 	UT_ASSERT_EQ(decoded.common.target_mode, PCM_STATE_X);
 }
 
 UT_TEST(test_block_to_n_source_polarity_truth_table_is_closed)
 {
-	ResourceXDecodedFrame frame
-		= make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
+	ResourceXDecodedFrame frame = make_control_frame(RESOURCE_X_WIRE_BLOCK_TO_N);
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	uint16 encoded_len = 0;
@@ -595,15 +540,13 @@ UT_TEST(test_block_to_n_source_polarity_truth_table_is_closed)
 	frame.common.observed_mode = PCM_STATE_S;
 	frame.common.source_candidate = 1;
 	frame.common.retain_pi_if_dirty = 0;
-	UT_ASSERT(!cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
-		&encoded_len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes,
+											  sizeof(bytes), &encoded_len, &reject));
 
 	frame.common.source_candidate = 0;
 	frame.common.retain_pi_if_dirty = 1;
-	UT_ASSERT(!cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes, sizeof(bytes),
-		&encoded_len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes,
+											  sizeof(bytes), &encoded_len, &reject));
 }
 
 UT_TEST(test_all_control_kind_type_pairs_round_trip)
@@ -611,12 +554,10 @@ UT_TEST(test_all_control_kind_type_pairs_round_trip)
 	static const struct {
 		uint8 msg_type;
 		ResourceXWireKind kind;
-	} cases[] = {
-		{RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_ASSERT_X},
-		{RESOURCE_X_MSG_BLOCK_TO_N, RESOURCE_X_WIRE_BLOCK_TO_N},
-		{RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N},
-		{RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_RELEASE_X}
-	};
+	} cases[] = { { RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_ASSERT_X },
+				  { RESOURCE_X_MSG_BLOCK_TO_N, RESOURCE_X_WIRE_BLOCK_TO_N },
+				  { RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N },
+				  { RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_RELEASE_X } };
 	uint8 bytes[RESOURCE_X_CONTROL_V1_BYTES];
 	Size i;
 
@@ -626,10 +567,10 @@ UT_TEST(test_all_control_kind_type_pairs_round_trip)
 		ResourceXWireReject reject;
 		uint16 encoded_len;
 
-		UT_ASSERT(cluster_resource_x_wire_encode(cases[i].msg_type, &frame,
-			bytes, sizeof(bytes), &encoded_len, &reject));
-		UT_ASSERT(cluster_resource_x_wire_decode(cases[i].msg_type, bytes,
-			encoded_len, &decoded, &reject));
+		UT_ASSERT(cluster_resource_x_wire_encode(cases[i].msg_type, &frame, bytes, sizeof(bytes),
+												 &encoded_len, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(cases[i].msg_type, bytes, encoded_len, &decoded,
+												 &reject));
 		UT_ASSERT_EQ(decoded.kind, cases[i].kind);
 	}
 }
@@ -645,25 +586,25 @@ UT_TEST(test_control_codec_rejects_pair_identity_crc_and_legacy_length)
 
 	memset(&sentinel, 0xa5, sizeof(sentinel));
 	decoded = sentinel;
-	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N,
-		&frame, bytes, sizeof(bytes), &encoded_len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &frame, bytes,
+											  sizeof(bytes), &encoded_len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_TYPE_KIND);
 
 	frame.common.logical_assertion.requester_node = -1;
-	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X,
-		&frame, bytes, sizeof(bytes), &encoded_len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame, bytes, sizeof(bytes),
+											  &encoded_len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_IDENTITY);
 	frame = make_control_frame(RESOURCE_X_WIRE_ASSERT_X);
-	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame,
-		bytes, sizeof(bytes), &encoded_len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame, bytes, sizeof(bytes),
+											 &encoded_len, &reject));
 	bytes[20] ^= 0x01;
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes,
-		encoded_len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes, encoded_len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_CRC);
 	UT_ASSERT(memcmp(&decoded, &sentinel, sizeof(decoded)) == 0);
 
 	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_ASSERT_X, bytes,
-		RESOURCE_X_CONTROL_V1_BYTES - 1, &decoded, &reject));
+											  RESOURCE_X_CONTROL_V1_BYTES - 1, &decoded, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_LEGACY_LENGTH);
 }
 
@@ -676,8 +617,7 @@ make_typed_frame(ResourceXWireKind kind)
 	frame.common.outcome = RESOURCE_X_OUTCOME_OK;
 	if (kind == RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION) {
 		frame.body.local_proof.local_holder_authority_generation = 71;
-		frame.body.local_proof.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.local_proof.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.local_proof.page_scn_lsn = 73;
 		frame.body.local_proof.dependency_count = 2;
 		frame.body.local_proof.dependency_vector_crc32c = UINT32_C(0x01020304);
@@ -685,53 +625,45 @@ make_typed_frame(ResourceXWireKind kind)
 		frame.body.local_proof.local_image_proof_crc32c = UINT32_C(0x21222324);
 		frame.body.local_proof.requester_connection_generation = 74;
 		frame.body.local_proof.local_proof_generation = 75;
-	} else if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N
-			   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+	} else if (kind == RESOURCE_X_WIRE_BLOCKED_TO_N || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
 			   || kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2) {
 		frame.blocked_has_remote_proof = true;
 		frame.common.action_node = 7;
 		frame.common.observed_mode
-			= kind == RESOURCE_X_WIRE_BLOCKED_TO_N
-				? PCM_STATE_X : PCM_STATE_N;
+			= kind == RESOURCE_X_WIRE_BLOCKED_TO_N ? PCM_STATE_X : PCM_STATE_N;
 		frame.common.target_mode = PCM_STATE_N;
 		frame.common.flags
-			= kind == RESOURCE_X_WIRE_BLOCKED_TO_N
-				? RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED : 0;
+			= kind == RESOURCE_X_WIRE_BLOCKED_TO_N ? RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED : 0;
 		if (kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
 			|| kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2) {
 			frame.common.ordered_lane = 0;
 			frame.common.source_candidate = 1;
 			frame.common.retain_pi_if_dirty = 1;
-			frame.common.outcome
-				= kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
-					? RESOURCE_X_OUTCOME_NONE : RESOURCE_X_OUTCOME_OK;
+			frame.common.outcome = kind == RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2
+									   ? RESOURCE_X_OUTCOME_NONE
+									   : RESOURCE_X_OUTCOME_OK;
 		}
 		for (i = 0; i < RESOURCE_X_SOURCE_FENCE_BYTES; i++)
 			frame.body.blocked_to_n.source_fence[i] = (uint8)(i + 1);
 		frame.body.blocked_to_n.source_carrier_generation = 81;
-		frame.body.blocked_to_n.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.blocked_to_n.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.blocked_to_n.page_scn_lsn = 83;
 		frame.body.blocked_to_n.dependency_count = 2;
 		frame.body.blocked_to_n.dependencies[0] = 84;
 		frame.body.blocked_to_n.dependencies[1] = 85;
 		frame.body.blocked_to_n.source_proof_crc32c = UINT32_C(0x31323334);
 		frame.body.blocked_to_n.page_checksum = UINT32_C(0x41424344);
-		frame.body.blocked_to_n.source_disposition
-			= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+		frame.body.blocked_to_n.source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 		frame.body.blocked_to_n.proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
 		frame.body.blocked_to_n.holder_connection_generation = 86;
-		frame.body.blocked_to_n.acting_formation
-			= frame.common.resource_formation;
+		frame.body.blocked_to_n.acting_formation = frame.common.resource_formation;
 	} else if (kind == RESOURCE_X_WIRE_AUTHORITY_GRANT) {
 		frame.common.flags = RESOURCE_X_COMMON_FLAG_REMOTE_IMAGE_REQUIRED;
 		for (i = 0; i < RESOURCE_X_SOURCE_FENCE_BYTES; i++)
 			frame.body.authority_grant.source_fence[i] = (uint8)(0x40 + i);
-		frame.body.authority_grant.final_authority_generation
-			= frame.common.authority_generation;
+		frame.body.authority_grant.final_authority_generation = frame.common.authority_generation;
 		frame.body.authority_grant.source_carrier_generation = 92;
-		frame.body.authority_grant.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.authority_grant.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.authority_grant.page_scn_lsn = 94;
 		frame.body.authority_grant.dependency_count = 2;
 		frame.body.authority_grant.dependencies[0] = 95;
@@ -739,8 +671,7 @@ make_typed_frame(ResourceXWireKind kind)
 		frame.body.authority_grant.source_proof_crc32c = UINT32_C(0x51525354);
 		frame.body.authority_grant.page_checksum = UINT32_C(0x61626364);
 		frame.body.authority_grant.proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
-		frame.body.authority_grant.source_disposition
-			= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+		frame.body.authority_grant.source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 		frame.body.authority_grant.requester_connection_generation = 97;
 	} else if (kind == RESOURCE_X_WIRE_IMAGE_ENVELOPE) {
 		frame.common.action_node = 7;
@@ -751,8 +682,7 @@ make_typed_frame(ResourceXWireKind kind)
 		for (i = 0; i < RESOURCE_X_SOURCE_FENCE_BYTES; i++)
 			frame.body.image_envelope.source_fence[i] = (uint8)(0x60 + i);
 		frame.body.image_envelope.source_carrier_generation = 102;
-		frame.body.image_envelope.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.image_envelope.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.image_envelope.page_scn_lsn = 104;
 		frame.body.image_envelope.dependency_count = 2;
 		frame.body.image_envelope.dependencies[0] = 105;
@@ -760,8 +690,7 @@ make_typed_frame(ResourceXWireKind kind)
 		frame.body.image_envelope.dependency_vector_crc32c = UINT32_C(0x71727374);
 		frame.body.image_envelope.page_checksum = UINT32_C(0x81828384);
 		frame.body.image_envelope.image_length = RESOURCE_X_PAGE_BYTES;
-		frame.body.image_envelope.source_disposition
-			= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+		frame.body.image_envelope.source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 		frame.body.image_envelope.proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
 		for (i = 0; i < RESOURCE_X_PAGE_BYTES; i++)
 			frame.body.image_envelope.page_bytes[i] = (uint8)(i * 37);
@@ -771,112 +700,93 @@ make_typed_frame(ResourceXWireKind kind)
 		frame.body.install_settlement.final_authority_generation
 			= frame.common.authority_generation;
 		frame.body.install_settlement.requester_connection_generation = 113;
-		frame.body.install_settlement.requester_target_generation
-			= frame.common.assertion_sequence;
+		frame.body.install_settlement.requester_target_generation = frame.common.assertion_sequence;
 		frame.body.install_settlement.page_scn_lsn = 115;
 		frame.body.install_settlement.page_checksum = UINT32_C(0x91929394);
 		frame.body.install_settlement.source_proof_crc32c = UINT32_C(0xa1a2a3a4);
 		frame.body.install_settlement.installed_mode = PCM_STATE_X;
-		frame.body.install_settlement.requester_role
-			= RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
+		frame.body.install_settlement.requester_role = RESOURCE_X_REQUESTER_ROLE_ACQUIRER;
 		frame.body.install_settlement.terminal_outcome = RESOURCE_X_OUTCOME_OK;
-		frame.body.install_settlement.terminal_state
-			= RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
+		frame.body.install_settlement.terminal_state = RESOURCE_X_SETTLEMENT_TERMINAL_INSTALLED;
 	}
 	return frame;
 }
 
 static void
-assert_source_settlement_encode_rejected(uint8 msg_type,
-									 ResourceXDecodedFrame *frame)
+assert_source_settlement_encode_rejected(uint8 msg_type, ResourceXDecodedFrame *frame)
 {
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 bytes[RESOURCE_X_PROOF_V1_BYTES];
 	uint16 len = 0;
 
-	UT_ASSERT(!cluster_resource_x_wire_encode(
-		msg_type, frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(
+		!cluster_resource_x_wire_encode(msg_type, frame, bytes, sizeof(bytes), &len, &reject));
 	UT_ASSERT(reject != RESOURCE_X_WIRE_REJECT_NONE);
 }
 
 UT_TEST(test_source_settlement_request_and_ack_are_direction_exact)
 {
-	ResourceXDecodedFrame request
-		= make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
-	ResourceXDecodedFrame ack
-		= make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
+	ResourceXDecodedFrame request = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	ResourceXDecodedFrame ack = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint8 bytes[RESOURCE_X_PROOF_V1_BYTES];
 	uint16 len = 0;
 
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_BLOCK_TO_N, &request, bytes, sizeof(bytes),
-		&len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCK_TO_N, &request, bytes,
+											 sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(len, RESOURCE_X_PROOF_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
+	UT_ASSERT(
+		cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
 	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 	UT_ASSERT_EQ(decoded.common.action_node, 7);
-	UT_ASSERT_EQ(decoded.common.authority_generation,
-		request.common.authority_generation);
+	UT_ASSERT_EQ(decoded.common.authority_generation, request.common.authority_generation);
 	UT_ASSERT_EQ(decoded.body.blocked_to_n.source_carrier_generation,
-		request.body.blocked_to_n.source_carrier_generation);
-	UT_ASSERT(!cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, &decoded, &reject));
+				 request.body.blocked_to_n.source_carrier_generation);
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, &decoded,
+											  &reject));
 
-	UT_ASSERT(cluster_resource_x_wire_encode(
-		RESOURCE_X_MSG_BLOCKED_TO_N, &ack, bytes, sizeof(bytes),
-		&len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack, bytes,
+											 sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(len, RESOURCE_X_PROOF_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, &decoded, &reject));
+	UT_ASSERT(
+		cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCKED_TO_N, bytes, len, &decoded, &reject));
 	UT_ASSERT_EQ(decoded.kind, RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
 	UT_ASSERT_EQ(decoded.common.outcome, RESOURCE_X_OUTCOME_OK);
-	UT_ASSERT(!cluster_resource_x_wire_decode(
-		RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
+	UT_ASSERT(
+		!cluster_resource_x_wire_decode(RESOURCE_X_MSG_BLOCK_TO_N, bytes, len, &decoded, &reject));
 }
 
 UT_TEST(test_source_settlement_truth_tables_fail_closed)
 {
-	ResourceXDecodedFrame frame
-		= make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
+	ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 
 	frame.common.ordered_lane = 1;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCK_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 	frame.common.authority_generation = 0;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCK_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 	frame.common.observed_mode = PCM_STATE_X;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCK_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 	frame.common.target_mode = PCM_STATE_X;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCK_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 	frame.common.source_candidate = 0;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCK_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 	frame.common.retain_pi_if_dirty = 0;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCK_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2);
 	frame.common.outcome = RESOURCE_X_OUTCOME_OK;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCK_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCK_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
 	frame.common.outcome = RESOURCE_X_OUTCOME_NONE;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCKED_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCKED_TO_N, &frame);
 	frame = make_typed_frame(RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2);
 	frame.body.blocked_to_n.source_carrier_generation = 0;
-	assert_source_settlement_encode_rejected(
-		RESOURCE_X_MSG_BLOCKED_TO_N, &frame);
+	assert_source_settlement_encode_rejected(RESOURCE_X_MSG_BLOCKED_TO_N, &frame);
 }
 
 UT_TEST(test_short_typed_frames_round_trip)
@@ -884,11 +794,8 @@ UT_TEST(test_short_typed_frames_round_trip)
 	static const struct {
 		uint8 msg_type;
 		ResourceXWireKind kind;
-	} cases[] = {
-		{RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION},
-		{RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
-		 RESOURCE_X_WIRE_INSTALL_SETTLEMENT}
-	};
+	} cases[] = { { RESOURCE_X_MSG_ASSERT_X, RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION },
+				  { RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, RESOURCE_X_WIRE_INSTALL_SETTLEMENT } };
 	uint8 bytes[RESOURCE_X_SHORT_V1_BYTES];
 	Size i;
 
@@ -898,11 +805,10 @@ UT_TEST(test_short_typed_frames_round_trip)
 		ResourceXWireReject reject;
 		uint16 len;
 
-		UT_ASSERT(cluster_resource_x_wire_encode(cases[i].msg_type, &frame,
-			bytes, sizeof(bytes), &len, &reject));
+		UT_ASSERT(cluster_resource_x_wire_encode(cases[i].msg_type, &frame, bytes, sizeof(bytes),
+												 &len, &reject));
 		UT_ASSERT_EQ(len, RESOURCE_X_SHORT_V1_BYTES);
-		UT_ASSERT(cluster_resource_x_wire_decode(cases[i].msg_type, bytes,
-			len, &decoded, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(cases[i].msg_type, bytes, len, &decoded, &reject));
 		UT_ASSERT_EQ(decoded.kind, cases[i].kind);
 	}
 }
@@ -912,10 +818,8 @@ UT_TEST(test_proof_typed_frames_round_trip)
 	static const struct {
 		uint8 msg_type;
 		ResourceXWireKind kind;
-	} cases[] = {
-		{RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N},
-		{RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_AUTHORITY_GRANT}
-	};
+	} cases[] = { { RESOURCE_X_MSG_BLOCKED_TO_N, RESOURCE_X_WIRE_BLOCKED_TO_N },
+				  { RESOURCE_X_MSG_IMAGE_OR_GRANT, RESOURCE_X_WIRE_AUTHORITY_GRANT } };
 	uint8 bytes[RESOURCE_X_PROOF_V1_BYTES];
 	Size i;
 
@@ -925,11 +829,10 @@ UT_TEST(test_proof_typed_frames_round_trip)
 		ResourceXWireReject reject;
 		uint16 len;
 
-		UT_ASSERT(cluster_resource_x_wire_encode(cases[i].msg_type, &frame,
-			bytes, sizeof(bytes), &len, &reject));
+		UT_ASSERT(cluster_resource_x_wire_encode(cases[i].msg_type, &frame, bytes, sizeof(bytes),
+												 &len, &reject));
 		UT_ASSERT_EQ(len, RESOURCE_X_PROOF_V1_BYTES);
-		UT_ASSERT(cluster_resource_x_wire_decode(cases[i].msg_type, bytes,
-			len, &decoded, &reject));
+		UT_ASSERT(cluster_resource_x_wire_decode(cases[i].msg_type, bytes, len, &decoded, &reject));
 		UT_ASSERT_EQ(decoded.kind, cases[i].kind);
 		if (cases[i].kind == RESOURCE_X_WIRE_BLOCKED_TO_N) {
 			UT_ASSERT(decoded.blocked_has_remote_proof);
@@ -947,15 +850,15 @@ UT_TEST(test_image_envelope_round_trip_preserves_exact_page)
 	uint8 bytes[RESOURCE_X_IMAGE_V1_BYTES];
 	uint16 len;
 
-	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		&frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											 sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(len, RESOURCE_X_IMAGE_V1_BYTES);
-	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
-	UT_ASSERT_EQ(decoded.body.image_envelope.image_length,
-		RESOURCE_X_PAGE_BYTES);
-	UT_ASSERT(memcmp(decoded.body.image_envelope.page_bytes,
-		frame.body.image_envelope.page_bytes, RESOURCE_X_PAGE_BYTES) == 0);
+	UT_ASSERT(cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											 &reject));
+	UT_ASSERT_EQ(decoded.body.image_envelope.image_length, RESOURCE_X_PAGE_BYTES);
+	UT_ASSERT(memcmp(decoded.body.image_envelope.page_bytes, frame.body.image_envelope.page_bytes,
+					 RESOURCE_X_PAGE_BYTES)
+			  == 0);
 }
 
 UT_TEST(test_delegated_block_and_image_keep_exact_wire_layout)
@@ -1051,32 +954,32 @@ UT_TEST(test_typed_body_validation_is_fail_closed)
 
 	frame = make_typed_frame(RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION);
 	frame.body.local_proof.dependency_count = RESOURCE_X_DEPENDENCY_MAX + 1;
-	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame,
-		bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, &frame, bytes, sizeof(bytes),
+											  &len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 
 	frame = make_typed_frame(RESOURCE_X_WIRE_BLOCKED_TO_N);
 	frame.body.blocked_to_n.dependencies[2] = 1;
-	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N,
-		&frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &frame, bytes,
+											  sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 
 	frame = make_typed_frame(RESOURCE_X_WIRE_AUTHORITY_GRANT);
 	frame.body.authority_grant.proof_kind = 0;
-	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		&frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											  sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 
 	frame = make_typed_frame(RESOURCE_X_WIRE_IMAGE_ENVELOPE);
 	frame.body.image_envelope.image_length--;
-	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		&frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											  sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 
 	frame = make_typed_frame(RESOURCE_X_WIRE_AUTHORITY_GRANT);
 	frame.body.authority_grant.requester_target_generation++;
-	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		&frame, bytes, sizeof(bytes), &len, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, bytes,
+											  sizeof(bytes), &len, &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 }
 
@@ -1092,7 +995,7 @@ test_put_u32_be(uint8 *bytes, uint32 value)
 static void
 test_reseal(uint8 *bytes, uint16 len)
 {
-	static const uint8 zero_crc[4] = {0, 0, 0, 0};
+	static const uint8 zero_crc[4] = { 0, 0, 0, 0 };
 	pg_crc32c crc;
 
 	INIT_CRC32C(crc);
@@ -1105,96 +1008,92 @@ test_reseal(uint8 *bytes, uint16 len)
 
 UT_TEST(test_ingress_semantic_mutations_with_valid_crc_are_rejected)
 {
-	ResourceXDecodedFrame frame
-		= make_typed_frame(RESOURCE_X_WIRE_AUTHORITY_GRANT);
+	ResourceXDecodedFrame frame = make_typed_frame(RESOURCE_X_WIRE_AUTHORITY_GRANT);
 	ResourceXDecodedFrame decoded;
 	ResourceXWireReject reject;
 	uint8 original[RESOURCE_X_PROOF_V1_BYTES];
 	uint8 bytes[RESOURCE_X_PROOF_V1_BYTES];
 	uint16 len;
 
-	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		&frame, original, sizeof(original), &len, &reject));
+	UT_ASSERT(cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, &frame, original,
+											 sizeof(original), &len, &reject));
 
 	memcpy(bytes, original, len);
 	bytes[0]++;
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_VERSION);
 
 	memcpy(bytes, original, len);
 	bytes[3]--;
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_DECLARED_LENGTH);
 
 	memcpy(bytes, original, len);
 	test_put_u32_be(bytes + 68, UINT32_MAX);
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_ROLE);
 
 	memcpy(bytes, original, len);
 	test_put_u32_be(bytes + 20, MAX_FORKNUM + 1);
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_IDENTITY);
 
 	memcpy(bytes, original, len);
 	bytes[72] = PCM_STATE_X + 1;
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_ENUM);
 
 	memcpy(bytes, original, len);
 	bytes[81] |= 0x80;
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_FLAGS);
 
 	memcpy(bytes, original, len);
 	bytes[82] = 1;
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_RESERVED);
 
 	memcpy(bytes, original, len);
 	bytes[300] = 0;
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 
 	memcpy(bytes, original, len);
 	bytes[180] = 1;
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 
 	memcpy(bytes, original, len);
 	bytes[302] = 1;
 	test_reseal(bytes, len);
-	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT,
-		bytes, len, &decoded, &reject));
+	UT_ASSERT(!cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, bytes, len, &decoded,
+											  &reject));
 	UT_ASSERT_EQ(reject, RESOURCE_X_WIRE_REJECT_BODY);
 }
 
 UT_TEST(test_resource_x_capability_has_complete_collision_census)
 {
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-		UINT32_C(0x00020000));
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1,
-		UINT32_C(0x00400000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, UINT32_C(0x00020000));
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1, UINT32_C(0x00400000));
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_COUNT, 21);
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_MASK, UINT32_C(0x007BBFFF));
-	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_SUM,
-		PGRAC_IC_HELLO_CAP_DEFINED_MASK);
+	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_SUM, PGRAC_IC_HELLO_CAP_DEFINED_MASK);
 	UT_ASSERT_EQ(PGRAC_IC_HELLO_CAP_DEFINED_MASK & UINT32_C(0x00044000), 0);
 }
 

@@ -3,8 +3,8 @@
 #    linkdb fast-gate CI (Tier 1 of 3-tier CI model).
 #
 #    Implements CLAUDE.md rule 20.A revised — every push / PR runs the
-#    fast gate (target 5-8 min wallclock).  Heavier full coverage runs
-#    in nightly.yml + perf.yml.
+#    fast gate. Current MVP release checks also run in nightly.yml;
+#    historical extended checks remain in legacy-extended.yml.
 #
 # Author: SqlRush <sqlrush@gmail.com>
 #
@@ -19,7 +19,7 @@
 #                                       comment headers / commit msg
 #   2. linux-enable        (~5-7 min): build + install + cluster_unit +
 #                                       cluster_regress + smoke TAP
-#                                       subset (010 / 030 / 050 / 200 / 226)
+#                                       current MVP smoke subset
 #   3. linux-disable       (~3-4 min): build + PG 219 + binary symbol
 #                                       audit (--disable-cluster contract)
 #   4. macos-build-only    (~3-4 min): build only — cross-platform
@@ -29,10 +29,9 @@
 #                                       (cluster sources only)
 #
 # Tag (v*) push intentionally re-runs the same fast gate.  Per CLAUDE.md
-# rule 20.A revised, ship-time verification additionally requires the
-# most recent nightly.yml run on the same commit (or its ancestor) to
-# have completed green;tag push without nightly green coverage is a
-# rule violation.
+# current MVP policy, ship-time verification additionally requires every
+# nightly.yml job on the exact commit to pass. Historical failures remain
+# visible but do not certify or block the narrower MVP release scope.
 # ----------------------------------------------------------------------
 
 name: linkdb fast-gate CI
@@ -46,6 +45,7 @@ on:
     tags: ['v*']
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -77,9 +77,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+          if [[ "${{ github.ref }}" == refs/tags/* || "${{ github.event_name }}" == workflow_dispatch ]]; then
             echo "code_changed=true" >> "$GITHUB_OUTPUT"
-            echo "Tag push: run the full fast gate."
+            echo "Release qualification: run the full fast gate."
             exit 0
           fi
 
@@ -153,6 +153,13 @@ jobs:
       - name: Check release-notes principle-0 (spec-5.21 D7)
         run: ./scripts/ci/check-release-notes-principle0.sh
 
+      - name: Check static-analyzer execution contract
+        if: steps.changes.outputs.code_changed == 'true'
+        run: python3 scripts/ci/test_scan_build.py
+
+      - name: Check MVP release evidence contract
+        run: python3 scripts/ci/test_mvp_ci.py
+
       - name: Lint commit message
         if: github.event_name == 'pull_request'
         run: |
@@ -190,12 +197,15 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          # Unit evidence manifests verify immutable predecessor commits.
+          fetch-depth: 0
 
       - name: Install Linux dependencies
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends \
-            build-essential ccache \
+            build-essential ccache clang \
             libreadline-dev zlib1g-dev libicu-dev \
             liblz4-dev libzstd-dev libssl-dev libxml2-dev \
             libipc-run-perl pkg-config
@@ -230,35 +240,20 @@ jobs:
       - name: Install
         run: make install
 
-      - name: Run cluster_unit (35 binaries, link-level only)
-        run: make -C src/test/cluster_unit check
+      - name: Run cluster_unit (full registered suite)
+        run: make -j$(getconf _NPROCESSORS_ONLN) -C src/test/cluster_unit check
 
-      - name: Run cluster_regress (7 SQL smoke tests)
+      - name: Run cluster_regress (13 SQL smoke tests)
         run: make -C src/test/cluster_regress check
 
-      - name: Run smoke TAP subset (010 + 030 + 050 + 200 + 226)
+      - name: Run current MVP smoke TAP subset
         run: |
-          # Tier 1 fast gate: TAP files covering basic catalog views,
-          # acceptance lifecycle, smgr opt-in workflow + spec-2.40 Stage 2
-          # acceptance capability smoke (t/200) +
-          # spec-3.17 Stage 3 MVCC capability cross-cutting smoke (t/226,
-          # single-node, ~5s).
-          # spec-4.14 Stage 4 recovery capability cross-cutting smoke (t/273,
-          # single-node, ~3s; multi-node hard-gate t/274 + matrix t/275 run in
-          # nightly stage4-wal shard + make check).
-          # t/202 perf smoke runs in nightly Stage 2 acceptance medium.
-          # t/201 fault matrix NOT here (avoid fast-gate inject flake).
-          # t/227 Stage 3 workload perf smoke runs pgbench (>30s) -> nightly.
-          # spec-5.20 Hang Manager capability smoke on fast-gate = the D8
-          # cluster_unit static contract (test_cluster_hang_acceptance, runs in
-          # the unit step above, deterministic ms).  The chaos TAP matrix
-          # (t/340-343: 70-conn hang storm / ABA / 2PC / 3+4-node reconfig) is
-          # kept OFF the fast-gate blocking path (L91 minimal scope + storm
-          # flake risk) and runs in the nightly stage5-hang-acceptance shard.
-          # Full cluster_tap suite + 2-node ClusterPair + heartbeat round-
-          # trip + Stage 2/3 medium perf matrix tests run in nightly.yml.
+          # Scope is explicit, shared with macOS, and validated before use.
+          # Former mixed 2PC/recovery/raw-device deployment cases still run
+          # unchanged in legacy-extended.yml; no failure is converted to PASS.
+          SMOKE="$(python3 scripts/ci/mvp_ci.py --smoke)"
           make -C src/test/cluster_tap check \
-            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/226_stage3_mvcc_acceptance_capability.pl t/273_stage4_recovery_acceptance_capability.pl t/332_block_device_backend.pl t/333_block_device_multinode.pl"
+            PROVE_TESTS="$SMOKE"
 
       - name: Upload regression diffs on failure
         if: failure()
@@ -356,6 +351,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install macOS dependencies
         run: |
@@ -396,7 +393,7 @@ jobs:
       - name: Install + cluster_unit (link-level smoke)
         run: |
           make install
-          make -C src/test/cluster_unit check
+          make -j$(sysctl -n hw.ncpu) -C src/test/cluster_unit check
 
 
   # ====================================================================

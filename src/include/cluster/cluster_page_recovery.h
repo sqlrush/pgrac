@@ -52,16 +52,15 @@
  * proof requirements which the apply layer (PGDEL-06) must satisfy before
  * acting — the action table itself never guesses.
  */
-typedef enum ClusterPageRecoveryAction
-{
+typedef enum ClusterPageRecoveryAction {
 	CLUSTER_PAGE_ACTION_APPLY = 0, /* NORMAL/CLEANOUT: versioned delta apply */
-	CLUSTER_PAGE_ACTION_INIT,	/* NEW: init only under a full-init rule */
-	CLUSTER_PAGE_ACTION_INCARNATE,	/* INCARNATION: close old set, open new */
-	CLUSTER_PAGE_ACTION_DISCARD,	/* TEMP: discard/recreate with owner proof */
-	CLUSTER_PAGE_ACTION_REBUILD,	/* REBUILDABLE/NONLOGGED: rebuild/route */
-	CLUSTER_PAGE_ACTION_ROUTE,	/* HEADER: route to the typed owner */
-	CLUSTER_PAGE_ACTION_IMAGE,	/* FULLIMAGE: image payload under provenance */
-	CLUSTER_PAGE_ACTION_BLOCKED	/* WILLINIT (no rule) / UNKNOWN: mutation=0 */
+	CLUSTER_PAGE_ACTION_INIT,	   /* NEW: init only under a full-init rule */
+	CLUSTER_PAGE_ACTION_INCARNATE, /* INCARNATION: close old set, open new */
+	CLUSTER_PAGE_ACTION_DISCARD,   /* TEMP: discard/recreate with owner proof */
+	CLUSTER_PAGE_ACTION_REBUILD,   /* REBUILDABLE/NONLOGGED: rebuild/route */
+	CLUSTER_PAGE_ACTION_ROUTE,	   /* HEADER: route to the typed owner */
+	CLUSTER_PAGE_ACTION_IMAGE,	   /* FULLIMAGE: image payload under provenance */
+	CLUSTER_PAGE_ACTION_BLOCKED	   /* WILLINIT (no rule) / UNKNOWN: mutation=0 */
 } ClusterPageRecoveryAction;
 
 /*
@@ -71,8 +70,7 @@ typedef enum ClusterPageRecoveryAction
  * produced by the PGDEL-04..06 layers that own those proofs (the enum is
  * defined here once so every layer shares one outcome vocabulary).
  */
-typedef enum ClusterPageRecoveryOutcome
-{
+typedef enum ClusterPageRecoveryOutcome {
 	CLUSTER_PAGE_OUTCOME_APPLY = 0,
 	CLUSTER_PAGE_OUTCOME_SKIP,
 	CLUSTER_PAGE_OUTCOME_BLOCKED_SOURCE,
@@ -89,8 +87,7 @@ typedef enum ClusterPageRecoveryOutcome
  * successor re-enters UNCLASSIFIED (D3′ — predecessor-private progress is
  * never read as correctness).
  */
-typedef enum ClusterPageRecoveryState
-{
+typedef enum ClusterPageRecoveryState {
 	CLUSTER_PAGE_STATE_UNCLASSIFIED = 0,
 	CLUSTER_PAGE_STATE_CLASSIFIED,
 	CLUSTER_PAGE_STATE_SOURCE_PROVEN,
@@ -108,8 +105,7 @@ typedef enum ClusterPageRecoveryState
  * §4.1 recovery-action column: the closed class -> action table.
  * UNKNOWN -> BLOCKED (spec: "unknown default 必须 BLOCKED").
  */
-extern ClusterPageRecoveryAction cluster_page_class_recovery_action(
-	ClusterPageClass page_class);
+extern ClusterPageRecoveryAction cluster_page_class_recovery_action(ClusterPageClass page_class);
 
 /*
  * §3.5 state machine: advance exactly one adjacent step.  Returns true
@@ -124,7 +120,7 @@ extern bool cluster_page_state_advance(ClusterPageRecoveryState *state,
  * The class layer's blocked branch is BLOCKED_CLASS; the finer
  * subdivisions are the PGDEL-04..06 layers' to emit.
  */
-extern ClusterPageRecoveryOutcome cluster_page_dispatcher_verdict(
-	ClusterPageClass page_class, ClusterPageApplyVerdict verdict);
+extern ClusterPageRecoveryOutcome cluster_page_dispatcher_verdict(ClusterPageClass page_class,
+																  ClusterPageApplyVerdict verdict);
 
-#endif							/* CLUSTER_PAGE_RECOVERY_H */
+#endif /* CLUSTER_PAGE_RECOVERY_H */

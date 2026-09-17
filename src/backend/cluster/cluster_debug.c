@@ -82,8 +82,8 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_scn.h"		  /* cluster_scn_current (spec-1.15 D6) */
 #include "cluster/cluster_ges.h" /* cluster_ges_{request,reply}_defer_count (spec-2.13 D4) */
 #include "cluster/cluster_ges_reply_wait.h" /* spec-2.23 D13 reply wait counters */
-#include "cluster/cluster_grd.h"	  /* cluster_grd_* observability accessors (spec-2.14 D6) */
-#include "cluster/cluster_hw.h"		  /* HW relation-extend authority counters (spec-5.7 §3.1c) */
+#include "cluster/cluster_grd.h" /* cluster_grd_* observability accessors (spec-2.14 D6) */
+#include "cluster/cluster_hw.h"	 /* HW relation-extend authority counters (spec-5.7 §3.1c) */
 #include "cluster/cluster_hw_snapshot.h"
 #include "cluster/cluster_dl.h"		  /* DL bulk-load lease counters (spec-5.7 D4) */
 #include "cluster/cluster_ir.h"		  /* IR instance-recovery owner counters (spec-5.7 D8) */
@@ -95,17 +95,17 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_lmd_probe_collector.h" /* spec-5.8 D8 — probe collector counters */
 #include "cluster/cluster_lms.h"	 /* cluster_lms_* observability accessors (spec-2.18 D10) */
 #include "cluster/cluster_tt_slot.h" /* spec-3.12 D5 retention counters */
-#include "cluster/cluster_terminal_authority.h" /* spec-6.2 authority counters */
+#include "cluster/cluster_terminal_authority.h"	 /* spec-6.2 authority counters */
 #include "cluster/cluster_terminal_ref_census.h" /* spec-8.4D CTRC */
-#include "cluster/cluster_sf_dep.h"				/* spec-6.2 Smart Fusion dep counters */
+#include "cluster/cluster_sf_dep.h"				 /* spec-6.2 Smart Fusion dep counters */
 #include "cluster/cluster_undo_record_api.h"  /* cluster_undo_* counter accessors (spec-3.7 D10) */
 #include "cluster/storage/cluster_undo_buf.h" /* spec-3.18 D7: undo buffer counters */
 #include "cluster/cluster_cr.h"				  /* cluster_cr_* counter accessors (spec-3.9 D8) */
 #include "cluster/cluster_r4_observe.h"
-#include "cluster/cluster_cr_pool.h"		  /* cluster_cr_pool_* counters (spec-5.51 D9) */
-#include "cluster/cluster_cr_admit.h"		  /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
-#include "cluster/cluster_cr_tuple.h"		  /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
-#include "cluster/cluster_xnode_profile.h"	  /* xnode profiling buckets (spec-5.59 D1) */
+#include "cluster/cluster_cr_pool.h"	   /* cluster_cr_pool_* counters (spec-5.51 D9) */
+#include "cluster/cluster_cr_admit.h"	   /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
+#include "cluster/cluster_cr_tuple.h"	   /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
+#include "cluster/cluster_xnode_profile.h" /* xnode profiling buckets (spec-5.59 D1) */
 #include "cluster/cluster_xnode_lever.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D6 dump */ /* xnode lever counters (spec-6.12) */
 #include "cluster/cluster_multixact.h"		/* mxid stripe guardrail counters (spec-7.1 D3-a) */
@@ -140,23 +140,23 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_xid_authority.h"	  /* XID authority state (spec-6.15b D7) */
 #include "cluster/cluster_remote_xact.h"	  /* remote outcome counters (spec-4.5a D11) */
 #include "cluster/cluster_ic.h"				  /* ClusterICOps_Active, ClusterICTier */
-#include "cluster/cluster_ic_tier1.h"		 /* listener metadata accessors (Hardening v1.0.1 F3) */
-#include "cluster/cluster_scn.h"			 /* SCN typedef (stage 1.4) */
-#include "cluster/cluster_itl_slot.h"		 /* CLUSTER_ITL_* constants (stage 1.5) */
-#include "cluster/cluster_buffer_desc.h"	 /* BufferType / PcmState enums (stage 1.6) */
-#include "cluster/cluster_pcm_lock.h"		 /* PCM state-machine API + grd helpers */
+#include "cluster/cluster_ic_tier1.h"	 /* listener metadata accessors (Hardening v1.0.1 F3) */
+#include "cluster/cluster_scn.h"		 /* SCN typedef (stage 1.4) */
+#include "cluster/cluster_itl_slot.h"	 /* CLUSTER_ITL_* constants (stage 1.5) */
+#include "cluster/cluster_buffer_desc.h" /* BufferType / PcmState enums (stage 1.6) */
+#include "cluster/cluster_pcm_lock.h"	 /* PCM state-machine API + grd helpers */
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_semantic_activation.h" /* R4 writer-path snapshot */
 #include "cluster/cluster_resource_x_identity.h" /* Resource-X proof readiness */
-#include "cluster/cluster_gcs.h"			 /* GCS request protocol surface (spec-2.32 D8) */
-#include "cluster/cluster_gcs_block.h"		 /* GCS block-ship data plane (spec-2.33 D10) */
+#include "cluster/cluster_gcs.h"				 /* GCS request protocol surface (spec-2.32 D8) */
+#include "cluster/cluster_gcs_block.h"			 /* GCS block-ship data plane (spec-2.33 D10) */
 #include "cluster/cluster_gcs_block_dedup.h" /* per-worker dedup-shard counters (spec-7.3 D5/D9) */
 #include "cluster/cluster_sinval.h"			 /* SI Broadcaster counter accessors (spec-2.38 D10) */
 #include "cluster/cluster_tt_status.h"		 /* TT status overlay counter accessors (spec-3.1 D9) */
 #include "cluster/cluster_tt_status_hint.h"	 /* TT status hint counter accessors (spec-3.2 D8) */
 #include "cluster/cluster_tx_enqueue.h"		 /* TX enqueue wait counters (spec-5.2 D4/D6) */
 #include "cluster/cluster_multixact_current_stats.h"
-#include "cluster/cluster_startup_phase.h"	 /* phase enum + accessors (stage 1.10) */
+#include "cluster/cluster_startup_phase.h" /* phase enum + accessors (stage 1.10) */
 #include "storage/bufpage.h"	   /* PG_PAGE_LAYOUT_VERSION, SizeOfPageHeaderData (stage 1.4) */
 #include "storage/buf_internals.h" /* BufferDesc layout (stage 1.6) */
 #include "cluster/cluster_pgstat.h"
@@ -1970,40 +1970,27 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		[CLUSTER_UNDO_BLOCK0_WAIT_BUDGET_REPOLL] = "block0_exact_reply_budget_repoll_count",
 	};
 	static const char *const reclaim_refusal_keys[PCM_RETIRE_REFUSAL_N] = {
-		[PCM_RETIRE_REFUSAL_GATE_NOT_OPEN]
-			= "pcm_grd_reclaim_refused_gate_not_open_count",
-		[PCM_RETIRE_REFUSAL_IDENTITY_MISMATCH]
-			= "pcm_grd_reclaim_refused_identity_mismatch_count",
+		[PCM_RETIRE_REFUSAL_GATE_NOT_OPEN] = "pcm_grd_reclaim_refused_gate_not_open_count",
+		[PCM_RETIRE_REFUSAL_IDENTITY_MISMATCH] = "pcm_grd_reclaim_refused_identity_mismatch_count",
 		[PCM_RETIRE_REFUSAL_LIFECYCLE_NOT_LIVE]
-			= "pcm_grd_reclaim_refused_lifecycle_not_live_count",
-		[PCM_RETIRE_REFUSAL_PINNED]
-			= "pcm_grd_reclaim_refused_pinned_count",
-		[PCM_RETIRE_REFUSAL_WAITER_PRESENT]
-			= "pcm_grd_reclaim_refused_waiter_present_count",
-		[PCM_RETIRE_REFUSAL_TRANSPORT_PRESENT]
-			= "pcm_grd_reclaim_refused_transport_present_count",
-		[PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N]
-			= "pcm_grd_reclaim_refused_pcm_mode_not_n_count",
-		[PCM_RETIRE_REFUSAL_HOLDER_PRESENT]
-			= "pcm_grd_reclaim_refused_holder_present_count",
-		[PCM_RETIRE_REFUSAL_PI_PRESENT]
-			= "pcm_grd_reclaim_refused_pi_present_count",
-		[PCM_RETIRE_REFUSAL_WATERMARK_PRESENT]
-			= "pcm_grd_reclaim_refused_watermark_present_count",
-		[PCM_RETIRE_REFUSAL_CONVERT_PENDING]
-			= "pcm_grd_reclaim_refused_convert_pending_count",
-		[PCM_RETIRE_REFUSAL_RESOURCE_X_ACTIVE]
-			= "pcm_grd_reclaim_refused_resource_x_active_count",
+		= "pcm_grd_reclaim_refused_lifecycle_not_live_count",
+		[PCM_RETIRE_REFUSAL_PINNED] = "pcm_grd_reclaim_refused_pinned_count",
+		[PCM_RETIRE_REFUSAL_WAITER_PRESENT] = "pcm_grd_reclaim_refused_waiter_present_count",
+		[PCM_RETIRE_REFUSAL_TRANSPORT_PRESENT] = "pcm_grd_reclaim_refused_transport_present_count",
+		[PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N] = "pcm_grd_reclaim_refused_pcm_mode_not_n_count",
+		[PCM_RETIRE_REFUSAL_HOLDER_PRESENT] = "pcm_grd_reclaim_refused_holder_present_count",
+		[PCM_RETIRE_REFUSAL_PI_PRESENT] = "pcm_grd_reclaim_refused_pi_present_count",
+		[PCM_RETIRE_REFUSAL_WATERMARK_PRESENT] = "pcm_grd_reclaim_refused_watermark_present_count",
+		[PCM_RETIRE_REFUSAL_CONVERT_PENDING] = "pcm_grd_reclaim_refused_convert_pending_count",
+		[PCM_RETIRE_REFUSAL_RESOURCE_X_ACTIVE] = "pcm_grd_reclaim_refused_resource_x_active_count",
 		[PCM_RETIRE_REFUSAL_RETAINED_PAIR_PRESENT]
-			= "pcm_grd_reclaim_refused_retained_pair_present_count",
+		= "pcm_grd_reclaim_refused_retained_pair_present_count",
 		[PCM_RETIRE_REFUSAL_REQUESTER_NOT_TERMINAL]
-			= "pcm_grd_reclaim_refused_requester_not_terminal_count",
+		= "pcm_grd_reclaim_refused_requester_not_terminal_count",
 		[PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL]
-			= "pcm_grd_reclaim_refused_sidecar_not_terminal_count",
-		[PCM_RETIRE_REFUSAL_FORMATION_STALE]
-			= "pcm_grd_reclaim_refused_formation_stale_count",
-		[PCM_RETIRE_REFUSAL_ENTRY_LOCK_BUSY]
-			= "pcm_grd_reclaim_refused_entry_lock_busy_count",
+		= "pcm_grd_reclaim_refused_sidecar_not_terminal_count",
+		[PCM_RETIRE_REFUSAL_FORMATION_STALE] = "pcm_grd_reclaim_refused_formation_stale_count",
+		[PCM_RETIRE_REFUSAL_ENTRY_LOCK_BUSY] = "pcm_grd_reclaim_refused_entry_lock_busy_count",
 	};
 	PcmGrdLifecycleStats lifecycle;
 	PcmGrdProtocolDebtStats protocol_debt;
@@ -2052,43 +2039,37 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)cluster_pcm_grd_shmem_size()));
 	emit_row(rsinfo, "pcm", "pcm_grd_active_entries", fmt_int32(cluster_pcm_grd_count()));
 	cluster_pcm_grd_lifecycle_stats_snapshot(&lifecycle);
-	emit_row(rsinfo, "pcm", "pcm_grd_live_entries",
-		fmt_uint64(lifecycle.live_entries));
-	emit_row(rsinfo, "pcm", "pcm_grd_tombstone_slots",
-		fmt_uint64(lifecycle.tombstone_slots));
-	emit_row(rsinfo, "pcm", "pcm_grd_binding_generation",
-		fmt_uint64(lifecycle.binding_generation));
+	emit_row(rsinfo, "pcm", "pcm_grd_live_entries", fmt_uint64(lifecycle.live_entries));
+	emit_row(rsinfo, "pcm", "pcm_grd_tombstone_slots", fmt_uint64(lifecycle.tombstone_slots));
+	emit_row(rsinfo, "pcm", "pcm_grd_binding_generation", fmt_uint64(lifecycle.binding_generation));
 	emit_row(rsinfo, "pcm", "pcm_grd_reclaim_attempt_count",
-		fmt_uint64(lifecycle.reclaim_attempt_count));
+			 fmt_uint64(lifecycle.reclaim_attempt_count));
 	emit_row(rsinfo, "pcm", "pcm_grd_reclaim_success_count",
-		fmt_uint64(lifecycle.reclaim_success_count));
+			 fmt_uint64(lifecycle.reclaim_success_count));
 	emit_row(rsinfo, "pcm", "pcm_grd_reclaim_reuse_count",
-		fmt_uint64(lifecycle.reclaim_reuse_count));
+			 fmt_uint64(lifecycle.reclaim_reuse_count));
 	emit_row(rsinfo, "pcm", "pcm_grd_capacity_retry_count",
-		fmt_uint64(lifecycle.capacity_retry_count));
+			 fmt_uint64(lifecycle.capacity_retry_count));
 	emit_row(rsinfo, "pcm", "pcm_grd_capacity_fail_count",
-		fmt_uint64(lifecycle.capacity_fail_count));
-	emit_row(rsinfo, "pcm", "pcm_grd_peak_live_entries",
-		fmt_uint64(lifecycle.peak_live_entries));
+			 fmt_uint64(lifecycle.capacity_fail_count));
+	emit_row(rsinfo, "pcm", "pcm_grd_peak_live_entries", fmt_uint64(lifecycle.peak_live_entries));
 	cluster_pcm_grd_protocol_debt_snapshot(&protocol_debt);
-	emit_row(rsinfo, "pcm", "pcm_grd_wait_refcount",
-		fmt_uint64(protocol_debt.wait_refcount));
+	emit_row(rsinfo, "pcm", "pcm_grd_wait_refcount", fmt_uint64(protocol_debt.wait_refcount));
 	emit_row(rsinfo, "pcm", "pcm_grd_transport_refcount",
-		fmt_uint64(protocol_debt.transport_refcount));
+			 fmt_uint64(protocol_debt.transport_refcount));
 	emit_row(rsinfo, "pcm", "resource_x_retained_debt_count",
-		fmt_uint64(protocol_debt.retained_entry_count));
+			 fmt_uint64(protocol_debt.retained_entry_count));
 	emit_row(rsinfo, "pcm", "resource_x_active_debt_count",
-		fmt_uint64(protocol_debt.active_resource_x_entry_count));
+			 fmt_uint64(protocol_debt.active_resource_x_entry_count));
 	emit_row(rsinfo, "pcm", "resource_x_local_owner_debt_count",
-		fmt_uint64(protocol_debt.local_owner_entry_count));
+			 fmt_uint64(protocol_debt.local_owner_entry_count));
 	emit_row(rsinfo, "pcm", "resource_x_evicting_debt_count",
-		fmt_uint64(protocol_debt.evicting_entry_count));
+			 fmt_uint64(protocol_debt.evicting_entry_count));
 	emit_row(rsinfo, "pcm", "resource_x_invalid_debt_count",
-		fmt_uint64(protocol_debt.invalid_entry_count));
-	for (refusal = PCM_RETIRE_REFUSAL_GATE_NOT_OPEN;
-		 refusal < PCM_RETIRE_REFUSAL_N; refusal++)
+			 fmt_uint64(protocol_debt.invalid_entry_count));
+	for (refusal = PCM_RETIRE_REFUSAL_GATE_NOT_OPEN; refusal < PCM_RETIRE_REFUSAL_N; refusal++)
 		emit_row(rsinfo, "pcm", reclaim_refusal_keys[refusal],
-			fmt_uint64(lifecycle.reclaim_refused[refusal]));
+				 fmt_uint64(lifecycle.reclaim_refused[refusal]));
 	emit_row(rsinfo, "pcm", "pcm_lock_mode_count", "3");
 	if (cluster_pcm_rx_stats_snapshot(&rx)) {
 		emit_row(rsinfo, "pcm", "rx_stats_available", "true");
@@ -2203,24 +2184,17 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	 */
 	emit_row(rsinfo, "pcm", "pcm_api_state",
 			 (cluster_pcm_grd_max_entries == 0) ? "stub" : "active");
-	emit_row(rsinfo, "pcm", "resource_x_proof_readiness",
-			 resource_x_proof_readiness_status());
+	emit_row(rsinfo, "pcm", "resource_x_proof_readiness", resource_x_proof_readiness_status());
 	memset(&gate_before, 0, sizeof(gate_before));
 	memset(&gate_after, 0, sizeof(gate_after));
+	owner_snapshot_exact = cluster_pcm_lock_resource_x_gate_snapshot(&gate_before);
+	writer_before = cluster_resource_x_writer_path_snapshot(&writer_generation_before);
 	owner_snapshot_exact
-		= cluster_pcm_lock_resource_x_gate_snapshot(&gate_before);
-	writer_before = cluster_resource_x_writer_path_snapshot(
-		&writer_generation_before);
+		= owner_snapshot_exact && cluster_pcm_lock_resource_x_gate_snapshot(&gate_after);
+	writer_after = cluster_resource_x_writer_path_snapshot(&writer_generation_after);
 	owner_snapshot_exact
-		= owner_snapshot_exact
-		  && cluster_pcm_lock_resource_x_gate_snapshot(&gate_after);
-	writer_after = cluster_resource_x_writer_path_snapshot(
-		&writer_generation_after);
-	owner_snapshot_exact
-		= owner_snapshot_exact
-		  && memcmp(&gate_before, &gate_after, sizeof(gate_before)) == 0
-		  && writer_before == writer_after
-		  && writer_generation_before == writer_generation_after;
+		= owner_snapshot_exact && memcmp(&gate_before, &gate_after, sizeof(gate_before)) == 0
+		  && writer_before == writer_after && writer_generation_before == writer_generation_after;
 	if (!owner_snapshot_exact) {
 		gate_phase = "unavailable";
 		writer_path = "closed";
@@ -2228,35 +2202,34 @@ dump_pcm(ReturnSetInfo *rsinfo)
 		writer_generation_before = 0;
 	} else {
 		switch (gate_before.phase) {
-			case RESOURCE_X_GATE_OPEN:
-				gate_phase = "open";
-				break;
-			case RESOURCE_X_GATE_FROZEN:
-				gate_phase = "frozen";
-				break;
-			case RESOURCE_X_GATE_RECOVERY_BLOCKED:
-				gate_phase = "recovery-blocked";
-				break;
-			default:
-				gate_phase = "invalid";
-				break;
+		case RESOURCE_X_GATE_OPEN:
+			gate_phase = "open";
+			break;
+		case RESOURCE_X_GATE_FROZEN:
+			gate_phase = "frozen";
+			break;
+		case RESOURCE_X_GATE_RECOVERY_BLOCKED:
+			gate_phase = "recovery-blocked";
+			break;
+		default:
+			gate_phase = "invalid";
+			break;
 		}
 		switch (writer_before) {
-			case RESOURCE_X_WRITER_SOURCE:
-				writer_path = "source";
-				break;
-			case RESOURCE_X_WRITER_TARGET:
-				writer_path = "target";
-				break;
-			case RESOURCE_X_WRITER_CLOSED:
-			default:
-				writer_path = "closed";
-				break;
+		case RESOURCE_X_WRITER_SOURCE:
+			writer_path = "source";
+			break;
+		case RESOURCE_X_WRITER_TARGET:
+			writer_path = "target";
+			break;
+		case RESOURCE_X_WRITER_CLOSED:
+		default:
+			writer_path = "closed";
+			break;
 		}
 	}
 	emit_row(rsinfo, "pcm", "resource_x_gate_phase", gate_phase);
-	emit_row(rsinfo, "pcm", "resource_x_gate_formation",
-			 fmt_uint64(gate_before.formation));
+	emit_row(rsinfo, "pcm", "resource_x_gate_formation", fmt_uint64(gate_before.formation));
 	emit_row(rsinfo, "pcm", "resource_x_writer_path", writer_path);
 	emit_row(rsinfo, "pcm", "resource_x_writer_r4_generation",
 			 fmt_uint64(writer_generation_before));
@@ -2273,10 +2246,8 @@ dump_pcm(ReturnSetInfo *rsinfo)
 			 fmt_int64((int64)o1.remote_episode_excluded_missing_grant));
 	emit_row(rsinfo, "pcm", "remote_episode_excluded_missing_image",
 			 fmt_int64((int64)o1.remote_episode_excluded_missing_image));
-	emit_row(rsinfo, "pcm", "last_remote_t_image_us",
-			 fmt_int64((int64)o1.last_remote_t_image_us));
-	emit_row(rsinfo, "pcm", "last_remote_t_grant_us",
-			 fmt_int64((int64)o1.last_remote_t_grant_us));
+	emit_row(rsinfo, "pcm", "last_remote_t_image_us", fmt_int64((int64)o1.last_remote_t_image_us));
+	emit_row(rsinfo, "pcm", "last_remote_t_grant_us", fmt_int64((int64)o1.last_remote_t_grant_us));
 	emit_row(rsinfo, "pcm", "last_remote_t_install_us",
 			 fmt_int64((int64)o1.last_remote_t_install_us));
 
@@ -2354,7 +2325,6 @@ dump_pcm(ReturnSetInfo *rsinfo)
 	 * (table full): non-zero means prov_query absence is inconclusive. */
 	emit_row(rsinfo, "pcm", "wm_prov_insert_fail_count",
 			 fmt_int64((int64)cluster_pcm_get_wm_prov_insert_fail_count()));
-
 }
 
 
@@ -2658,8 +2628,7 @@ dump_gcs(ReturnSetInfo *rsinfo)
 	{
 		uint64 metadata_retire_count = cluster_gcs_get_pi_watermark_retire_count();
 
-		emit_row(rsinfo, "gcs", "pi_watermark_retire_count",
-				 fmt_uint64(metadata_retire_count));
+		emit_row(rsinfo, "gcs", "pi_watermark_retire_count", fmt_uint64(metadata_retire_count));
 		emit_row(rsinfo, "gcs", "pi_master_metadata_retire_count",
 				 fmt_uint64(metadata_retire_count));
 	}
@@ -3789,8 +3758,7 @@ dump_write_fence(ReturnSetInfo *rsinfo)
 			 fmt_uint64(cluster_write_fence_get_external_publish_gate_blocked()));
 	emit_row(rsinfo, "write_fence", "external_last_journal_seq",
 			 fmt_uint64(cluster_write_fence_get_external_last_journal_seq()));
-	proof_age_valid =
-		cluster_write_fence_get_external_last_proof_age_ms(&proof_age_ms);
+	proof_age_valid = cluster_write_fence_get_external_last_proof_age_ms(&proof_age_ms);
 	emit_row(rsinfo, "write_fence", "external_last_proof_age_ms",
 			 proof_age_valid ? fmt_uint64(proof_age_ms) : "-");
 }
@@ -4215,7 +4183,7 @@ dump_multixact_current(ReturnSetInfo *rsinfo)
 		[CMX_STAT_RESTART_MAX] = "restart_max",
 		[CMX_STAT_FOREIGN_SLRU_GUARD] = "foreign_slru_guard_count",
 		[CMX_STAT_UPDATER_PROVENANCE_CROSS_SEGMENT_MATCH]
-			= "updater_provenance_cross_segment_match_count",
+		= "updater_provenance_cross_segment_match_count",
 	};
 	int i;
 
@@ -4233,54 +4201,38 @@ dump_ctrc(ReturnSetInfo *rsinfo)
 	int i;
 
 	for (i = 0; i < CTRC_STAT_COUNT; i++)
-		emit_row(rsinfo, "ctrc",
-			cluster_ctrc_stat_name((ClusterCtrcStatId)i),
-			fmt_int64((int64)cluster_ctrc_stat_get(
-				(ClusterCtrcStatId)i)));
+		emit_row(rsinfo, "ctrc", cluster_ctrc_stat_name((ClusterCtrcStatId)i),
+				 fmt_int64((int64)cluster_ctrc_stat_get((ClusterCtrcStatId)i)));
 
 	MemSet(&snapshot, 0, sizeof(snapshot));
 	if (!cluster_ctrc_debug_snapshot(&snapshot))
 		return;
 	reason = cluster_ctrc_cleaner_reason_get();
 	reason_name = cluster_ctrc_cleaner_reason_name(reason);
-	emit_row(rsinfo, "ctrc", "cleaner_reason",
-		reason_name != NULL ? reason_name : "BLOCKED");
-	emit_row(rsinfo, "ctrc", "test_barrier_phase",
-		fmt_int64((int64)snapshot.test_barrier_phase));
+	emit_row(rsinfo, "ctrc", "cleaner_reason", reason_name != NULL ? reason_name : "BLOCKED");
+	emit_row(rsinfo, "ctrc", "test_barrier_phase", fmt_int64((int64)snapshot.test_barrier_phase));
 	emit_row(rsinfo, "ctrc", "test_barrier_hit_count",
-		fmt_int64((int64)snapshot.test_barrier_hit_count));
-	emit_row(rsinfo, "ctrc", "origin_open",
-		fmt_int64((int64)snapshot.origin_open));
-	emit_row(rsinfo, "ctrc", "origin_sealing",
-		fmt_int64((int64)snapshot.origin_sealing));
+			 fmt_int64((int64)snapshot.test_barrier_hit_count));
+	emit_row(rsinfo, "ctrc", "origin_open", fmt_int64((int64)snapshot.origin_open));
+	emit_row(rsinfo, "ctrc", "origin_sealing", fmt_int64((int64)snapshot.origin_sealing));
 	emit_row(rsinfo, "ctrc", "origin_release_proven",
-		fmt_int64((int64)snapshot.origin_release_proven));
-	emit_row(rsinfo, "ctrc", "origin_blocked",
-		fmt_int64((int64)snapshot.origin_blocked));
-	emit_row(rsinfo, "ctrc", "participant_open",
-		fmt_int64((int64)snapshot.participant_open));
+			 fmt_int64((int64)snapshot.origin_release_proven));
+	emit_row(rsinfo, "ctrc", "origin_blocked", fmt_int64((int64)snapshot.origin_blocked));
+	emit_row(rsinfo, "ctrc", "participant_open", fmt_int64((int64)snapshot.participant_open));
 	emit_row(rsinfo, "ctrc", "participant_draining",
-		fmt_int64((int64)snapshot.participant_draining));
+			 fmt_int64((int64)snapshot.participant_draining));
 	emit_row(rsinfo, "ctrc", "participant_ack_ready",
-		fmt_int64((int64)snapshot.participant_ack_ready));
+			 fmt_int64((int64)snapshot.participant_ack_ready));
 	emit_row(rsinfo, "ctrc", "participant_ack_frozen",
-		fmt_int64((int64)snapshot.participant_ack_frozen));
-	emit_row(rsinfo, "ctrc", "participant_blocked",
-		fmt_int64((int64)snapshot.participant_blocked));
-	emit_row(rsinfo, "ctrc", "receipt_prepared",
-		fmt_int64((int64)snapshot.receipt_prepared));
-	emit_row(rsinfo, "ctrc", "receipt_applied",
-		fmt_int64((int64)snapshot.receipt_applied));
-	emit_row(rsinfo, "ctrc", "receipt_cleaned",
-		fmt_int64((int64)snapshot.receipt_cleaned));
-	emit_row(rsinfo, "ctrc", "receipt_cancelled",
-		fmt_int64((int64)snapshot.receipt_cancelled));
-	emit_row(rsinfo, "ctrc", "receipt_ack_frozen",
-		fmt_int64((int64)snapshot.receipt_ack_frozen));
-	emit_row(rsinfo, "ctrc", "receipt_blocked",
-		fmt_int64((int64)snapshot.receipt_blocked));
-	emit_row(rsinfo, "ctrc", "full_refusal_count",
-		fmt_int64((int64)snapshot.full_refusal_count));
+			 fmt_int64((int64)snapshot.participant_ack_frozen));
+	emit_row(rsinfo, "ctrc", "participant_blocked", fmt_int64((int64)snapshot.participant_blocked));
+	emit_row(rsinfo, "ctrc", "receipt_prepared", fmt_int64((int64)snapshot.receipt_prepared));
+	emit_row(rsinfo, "ctrc", "receipt_applied", fmt_int64((int64)snapshot.receipt_applied));
+	emit_row(rsinfo, "ctrc", "receipt_cleaned", fmt_int64((int64)snapshot.receipt_cleaned));
+	emit_row(rsinfo, "ctrc", "receipt_cancelled", fmt_int64((int64)snapshot.receipt_cancelled));
+	emit_row(rsinfo, "ctrc", "receipt_ack_frozen", fmt_int64((int64)snapshot.receipt_ack_frozen));
+	emit_row(rsinfo, "ctrc", "receipt_blocked", fmt_int64((int64)snapshot.receipt_blocked));
+	emit_row(rsinfo, "ctrc", "full_refusal_count", fmt_int64((int64)snapshot.full_refusal_count));
 }
 
 #endif /* USE_PGRAC_CLUSTER */
@@ -4354,7 +4306,7 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_xid_stripe(rsinfo);	/* spec-6.15 D6 */
 		dump_multixact_current(rsinfo);
 		dump_ctrc(rsinfo);
-		dump_catalog(rsinfo);		/* spec-6.14 D10 */
+		dump_catalog(rsinfo); /* spec-6.14 D10 */
 	}
 #else
 	ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

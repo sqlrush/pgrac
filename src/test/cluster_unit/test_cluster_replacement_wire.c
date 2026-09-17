@@ -20,8 +20,7 @@ UT_DEFINE_GLOBALS();
 static uint32
 test_get_le32(const uint8 *p)
 {
-	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16)
-		   | ((uint32)p[3] << 24);
+	return (uint32)p[0] | ((uint32)p[1] << 8) | ((uint32)p[2] << 16) | ((uint32)p[3] << 24);
 }
 
 
@@ -50,8 +49,7 @@ make_valid_message(uint32 phase)
 	message.request_nonce = UINT64_C(0x2122232425262728);
 	message.identity0 = UINT64_C(0x3132333435363738);
 	message.identity1 = UINT64_C(0x4142434445464748);
-	message.grammar_fingerprint
-		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	message.grammar_fingerprint = CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
 	if (phase == CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY) {
 		message.body.phase3.jcmk_generation = UINT64_C(0x5152535455565758);
 		message.body.phase3.episode_state_generation = UINT32_C(0x61626364);
@@ -80,15 +78,13 @@ make_ready_snapshot(void)
 	snapshot.old_admitted_incarnation = UINT64_C(0x3132333435363738);
 	snapshot.fresh_incarnation = UINT64_C(0x4142434445464748);
 	snapshot.committed_epoch = UINT64_C(71);
-	snapshot.grammar_fingerprint
-		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	snapshot.grammar_fingerprint = CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
 	return snapshot;
 }
 
 
 static ClusterICEnvelope
-make_phase3_envelope(int32 source_node_id, int32 dest_node_id,
-					 uint64 epoch)
+make_phase3_envelope(int32 source_node_id, int32 dest_node_id, uint64 epoch)
 {
 	ClusterICEnvelope envelope;
 
@@ -103,15 +99,13 @@ make_phase3_envelope(int32 source_node_id, int32 dest_node_id,
 
 
 static ClusterReplacementPhase3IngressResult
-ingress_phase3(ClusterReplacementPhase3Handoff *handoff,
-			   ClusterICEnvelope *envelope, uint8 *bytes,
-			   int32 authenticated_source, int32 local_node,
-			   uint64 current_epoch, uint32 connection_generation)
+ingress_phase3(ClusterReplacementPhase3Handoff *handoff, ClusterICEnvelope *envelope, uint8 *bytes,
+			   int32 authenticated_source, int32 local_node, uint64 current_epoch,
+			   uint32 connection_generation)
 {
 	return cluster_replacement_wire_phase3_ingress(
-		handoff, envelope, bytes, CLUSTER_REPLACEMENT_WIRE_BYTES,
-		authenticated_source, local_node, current_epoch,
-		connection_generation);
+		handoff, envelope, bytes, CLUSTER_REPLACEMENT_WIRE_BYTES, authenticated_source, local_node,
+		current_epoch, connection_generation);
 }
 
 
@@ -125,13 +119,10 @@ UT_TEST(test_codec_is_exact_72_byte_little_endian)
 	memset(bytes, 0xA5, sizeof(bytes));
 	UT_ASSERT(cluster_replacement_wire_encode(&in, bytes));
 	UT_ASSERT_EQ((int)sizeof(bytes), 72);
-	UT_ASSERT_EQ((int)test_get_le32(bytes + 0),
-				 (int)GES_REQ_OPCODE_REPLACEMENT_EPISODE);
-	UT_ASSERT_EQ((int)test_get_le32(bytes + 4),
-				 (int)CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_REQUEST);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 0), (int)GES_REQ_OPCODE_REPLACEMENT_EPISODE);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 4), (int)CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_REQUEST);
 	UT_ASSERT_EQ((int)test_get_le32(bytes + 8), 3);
-	UT_ASSERT_EQ((int)test_get_le32(bytes + 12),
-				 (int)CLUSTER_REPLACEMENT_WIRE_VERSION);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 12), (int)CLUSTER_REPLACEMENT_WIRE_VERSION);
 	UT_ASSERT(test_get_le64(bytes + 16) == in.epoch);
 	UT_ASSERT(test_get_le64(bytes + 24) == in.request_nonce);
 	UT_ASSERT(test_get_le64(bytes + 32) == in.identity0);
@@ -153,8 +144,7 @@ UT_TEST(test_codec_round_trips_all_four_phase_layouts)
 	uint32 phase;
 
 	for (phase = CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_REQUEST;
-		 phase <= CLUSTER_REPLACEMENT_WIRE_PHASE_FAILSTOP_APPLICATION_ACK;
-		 phase++) {
+		 phase <= CLUSTER_REPLACEMENT_WIRE_PHASE_FAILSTOP_APPLICATION_ACK; phase++) {
 		in = make_valid_message(phase);
 		memset(&out, 0, sizeof(out));
 		UT_ASSERT(cluster_replacement_wire_encode(&in, bytes));
@@ -172,12 +162,10 @@ UT_TEST(test_phase3_maps_exact_generation_ready_and_zero_reserved)
 	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
 	uint8 unchanged[CLUSTER_REPLACEMENT_WIRE_BYTES];
 
-	in = make_valid_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	in = make_valid_message(CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	UT_ASSERT(cluster_replacement_wire_encode(&in, bytes));
 	UT_ASSERT(test_get_le64(bytes + 48) == in.body.phase3.jcmk_generation);
-	UT_ASSERT_EQ((int)test_get_le32(bytes + 56),
-				 (int)in.body.phase3.episode_state_generation);
+	UT_ASSERT_EQ((int)test_get_le32(bytes + 56), (int)in.body.phase3.episode_state_generation);
 	UT_ASSERT_EQ((int)test_get_le32(bytes + 60), 0);
 	memset(bytes, 0xA5, sizeof(bytes));
 	memcpy(unchanged, bytes, sizeof(unchanged));
@@ -211,8 +199,7 @@ UT_TEST(test_phase3_snapshot_encoder_maps_exact_positive_snapshot)
 	memset(bytes, 0xA5, sizeof(bytes));
 	UT_ASSERT(cluster_replacement_wire_encode_phase3_snapshot(&snapshot, bytes));
 	UT_ASSERT(cluster_replacement_wire_decode(bytes, &decoded));
-	UT_ASSERT_EQ((int)decoded.phase,
-				 (int)CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	UT_ASSERT_EQ((int)decoded.phase, (int)CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	UT_ASSERT_EQ(decoded.target_node_id, snapshot.target_node_id);
 	UT_ASSERT(decoded.epoch == snapshot.committed_epoch - 1);
 	UT_ASSERT(decoded.request_nonce == snapshot.request_nonce);
@@ -234,12 +221,12 @@ UT_TEST(test_phase3_snapshot_encoder_rejects_without_output_mutation)
 	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
 	uint8 before[CLUSTER_REPLACEMENT_WIRE_BYTES];
 
-#define ASSERT_SNAPSHOT_REJECTED()                                                        \
-	do {                                                                                    \
-		memset(bytes, 0xA5, sizeof(bytes));                                                   \
-		memcpy(before, bytes, sizeof(before));                                                \
-		UT_ASSERT(!cluster_replacement_wire_encode_phase3_snapshot(&snapshot, bytes));        \
-		UT_ASSERT_EQ(memcmp(bytes, before, sizeof(bytes)), 0);                                \
+#define ASSERT_SNAPSHOT_REJECTED()                                                                 \
+	do {                                                                                           \
+		memset(bytes, 0xA5, sizeof(bytes));                                                        \
+		memcpy(before, bytes, sizeof(before));                                                     \
+		UT_ASSERT(!cluster_replacement_wire_encode_phase3_snapshot(&snapshot, bytes));             \
+		UT_ASSERT_EQ(memcmp(bytes, before, sizeof(bytes)), 0);                                     \
 	} while (0)
 
 	snapshot.ready = false;
@@ -315,8 +302,7 @@ UT_TEST(test_codec_rejects_grammar_fingerprint_drift)
 	in.grammar_fingerprint ^= UINT64_C(1);
 	UT_ASSERT(!cluster_replacement_wire_encode(&in, bytes));
 
-	in.grammar_fingerprint
-		= CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
+	in.grammar_fingerprint = CANDIDATE2_CORRECTED_A1_GRAMMAR_FINGERPRINT;
 	UT_ASSERT(cluster_replacement_wire_encode(&in, bytes));
 	bytes[64] ^= 1;
 	memset(&out, 0xD4, sizeof(out));
@@ -337,26 +323,25 @@ UT_TEST(test_phase3_ingress_rejects_wrong_endpoint_without_handoff_mutation)
 	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
 
 	cluster_replacement_phase3_handoff_init(&handoff);
-	message = make_valid_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	message = make_valid_message(CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	envelope = make_phase3_envelope(message.target_node_id, 1, message.epoch + 1);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
 	before = handoff;
 
 	envelope.msg_type = PGRAC_IC_MSG_GES_REPLY;
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_REJECTED);
 	UT_ASSERT_EQ(memcmp(&handoff, &before, sizeof(handoff)), 0);
 	envelope.msg_type = PGRAC_IC_MSG_GES_REQUEST;
 
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id + 1, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id + 1, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_REJECTED);
 	UT_ASSERT_EQ(memcmp(&handoff, &before, sizeof(handoff)), 0);
 	envelope.dest_node_id = 2;
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_REJECTED);
 	UT_ASSERT_EQ(memcmp(&handoff, &before, sizeof(handoff)), 0);
 }
@@ -373,34 +358,33 @@ UT_TEST(test_phase3_ingress_rejects_wire_drift_without_handoff_mutation)
 	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
 
 	cluster_replacement_phase3_handoff_init(&handoff);
-	message = make_valid_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	message = make_valid_message(CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	envelope = make_phase3_envelope(message.target_node_id, 1, message.epoch + 1);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
 	before = handoff;
 
 	bytes[12] = 2;
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_REJECTED);
 	UT_ASSERT_EQ(memcmp(&handoff, &before, sizeof(handoff)), 0);
 	bytes[12] = CLUSTER_REPLACEMENT_WIRE_VERSION;
 	bytes[64] ^= 1;
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_REJECTED);
 	UT_ASSERT_EQ(memcmp(&handoff, &before, sizeof(handoff)), 0);
 	bytes[64] ^= 1;
 	bytes[60] = 1;
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_REJECTED);
 	UT_ASSERT_EQ(memcmp(&handoff, &before, sizeof(handoff)), 0);
 
 	message = make_valid_message(CLUSTER_REPLACEMENT_WIRE_PHASE_PURGE_ACK);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_REJECTED);
 	UT_ASSERT_EQ(memcmp(&handoff, &before, sizeof(handoff)), 0);
 }
@@ -417,13 +401,12 @@ UT_TEST(test_phase3_ingress_enqueues_only_observation_handoff)
 	uint8 bytes[CLUSTER_REPLACEMENT_WIRE_BYTES];
 
 	cluster_replacement_phase3_handoff_init(&handoff);
-	message = make_valid_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	message = make_valid_message(CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	envelope = make_phase3_envelope(message.target_node_id, 1, message.epoch + 1);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
 
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_ENQUEUED);
 	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending(&handoff), 1);
 	memset(&item, 0xA5, sizeof(item));
@@ -450,16 +433,13 @@ UT_TEST(test_phase3_ingress_maps_wire_baseline_to_outer_committed_epoch)
 	const uint64 committed_epoch = UINT64_C(71);
 
 	cluster_replacement_phase3_handoff_init(&handoff);
-	message = make_valid_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	message = make_valid_message(CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	message.epoch = baseline_epoch;
-	envelope = make_phase3_envelope(
-		message.target_node_id, 1, committed_epoch);
+	envelope = make_phase3_envelope(message.target_node_id, 1, committed_epoch);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
 
-	UT_ASSERT_EQ((int)ingress_phase3(
-					 &handoff, &envelope, bytes, message.target_node_id, 1,
-					 committed_epoch, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 committed_epoch, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_ENQUEUED);
 	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending(&handoff), 1);
 }
@@ -478,14 +458,13 @@ UT_TEST(test_phase3_handoff_is_bounded_fifo_without_overwrite)
 	uint32 i;
 
 	cluster_replacement_phase3_handoff_init(&handoff);
-	message = make_valid_message(
-		CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
+	message = make_valid_message(CLUSTER_REPLACEMENT_WIRE_PHASE_TARGET_RECOVERY_READY);
 	envelope = make_phase3_envelope(message.target_node_id, 1, message.epoch + 1);
 	for (i = 0; i < CLUSTER_REPLACEMENT_PHASE3_HANDOFF_CAPACITY; i++) {
 		message.request_nonce = UINT64_C(1000) + i;
 		UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
-		UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-									 message.target_node_id, 1, message.epoch + 1, 7),
+		UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+										 message.epoch + 1, 7),
 					 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_ENQUEUED);
 	}
 	UT_ASSERT_EQ((int)cluster_replacement_phase3_handoff_pending(&handoff),
@@ -493,8 +472,8 @@ UT_TEST(test_phase3_handoff_is_bounded_fifo_without_overwrite)
 	before_full = handoff;
 	message.request_nonce = UINT64_C(9999);
 	UT_ASSERT(cluster_replacement_wire_encode(&message, bytes));
-	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes,
-								 message.target_node_id, 1, message.epoch + 1, 7),
+	UT_ASSERT_EQ((int)ingress_phase3(&handoff, &envelope, bytes, message.target_node_id, 1,
+									 message.epoch + 1, 7),
 				 (int)CLUSTER_REPLACEMENT_PHASE3_INGRESS_FULL);
 	UT_ASSERT_EQ(memcmp(&handoff, &before_full, sizeof(handoff)), 0);
 

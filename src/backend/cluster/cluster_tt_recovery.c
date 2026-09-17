@@ -307,7 +307,7 @@ typedef struct TTRevertExpect {
  */
 static int
 PGRAC_PCM_X_FENCE_DOMINATED(cluster_bufmgr_pcm_x_ordinary_content_write_permitted)
-revert_one_delete_record(const UndoRecordHeader *hdr, const TTRevertExpect *exp)
+	revert_one_delete_record(const UndoRecordHeader *hdr, const TTRevertExpect *exp)
 {
 	Buffer buf;
 	BufferDesc *desc;

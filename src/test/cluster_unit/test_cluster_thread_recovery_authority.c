@@ -19,11 +19,9 @@
 UT_DEFINE_GLOBALS();
 
 void
-ExceptionalCondition(const char *condition_name, const char *file_name,
-				 int line_number)
+ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
-	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name,
-		   line_number);
+	printf("# unexpected Assert: %s at %s:%d\n", condition_name, file_name, line_number);
 	abort();
 }
 
@@ -65,75 +63,68 @@ static ClusterControlRootReadToken finalize_read_token;
 static ClusterWalPinResult finalize_adopt_result;
 static int finalize_adopt_calls;
 
-#define FORMATION ((const ClusterFormationWitnessV1 *) &formation_object)
-#define NEEDS ((const PgracExternalFenceNeedSetV1 *) &needs_object)
-#define ADMISSIONS ((const PgracExternalFenceAdmissionSetV1 *) &admissions_object)
-#define PIN ((ClusterWalRetentionPin *) &pin_object)
+#define FORMATION ((const ClusterFormationWitnessV1 *)&formation_object)
+#define NEEDS ((const PgracExternalFenceNeedSetV1 *)&needs_object)
+#define ADMISSIONS ((const PgracExternalFenceAdmissionSetV1 *)&admissions_object)
+#define PIN ((ClusterWalRetentionPin *)&pin_object)
 
 ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard)
 {
-	return guard != NULL && serial_current ? CLUSTER_RECOVERY_SERIAL_CURRENT :
-		CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE;
+	return guard != NULL && serial_current ? CLUSTER_RECOVERY_SERIAL_CURRENT
+										   : CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE;
 }
 
 ClusterFormationWitnessResult
-cluster_formation_witness_revalidate_nowait(
-	const ClusterFormationWitnessV1 *formation)
+cluster_formation_witness_revalidate_nowait(const ClusterFormationWitnessV1 *formation)
 {
-	return formation == FORMATION && fence_current ?
-		CLUSTER_FORMATION_WITNESS_READY : CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	return formation == FORMATION && fence_current ? CLUSTER_FORMATION_WITNESS_READY
+												   : CLUSTER_FORMATION_WITNESS_UNSTABLE;
 }
 
 bool
-cluster_external_fence_need_set_revalidate_nowait(
-	const PgracExternalFenceNeedSetV1 *needs,
-	const ClusterFormationWitnessV1 *formation,
-	PgracExternalFenceDenyReason *reason)
+cluster_external_fence_need_set_revalidate_nowait(const PgracExternalFenceNeedSetV1 *needs,
+												  const ClusterFormationWitnessV1 *formation,
+												  PgracExternalFenceDenyReason *reason)
 {
 	if (reason != NULL)
-		*reason = fence_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE :
-			PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
+		*reason
+			= fence_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE : PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
 	return needs == NEEDS && formation == FORMATION && fence_current;
 }
 
 bool
-cluster_external_fence_revalidate_set_nowait(
-	const PgracExternalFenceAdmissionSetV1 *admissions,
-	const PgracExternalFenceNeedSetV1 *needs,
-	const ClusterFormationWitnessV1 *formation,
-	PgracExternalFenceDenyReason *reason)
+cluster_external_fence_revalidate_set_nowait(const PgracExternalFenceAdmissionSetV1 *admissions,
+											 const PgracExternalFenceNeedSetV1 *needs,
+											 const ClusterFormationWitnessV1 *formation,
+											 PgracExternalFenceDenyReason *reason)
 {
 	if (reason != NULL)
-		*reason = fence_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE :
-			PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
-	return admissions == ADMISSIONS && needs == NEEDS &&
-		formation == FORMATION && fence_current;
+		*reason
+			= fence_current ? PGRAC_EXTERNAL_FENCE_DENY_NONE : PGRAC_EXTERNAL_FENCE_DENY_EXPIRED;
+	return admissions == ADMISSIONS && needs == NEEDS && formation == FORMATION && fence_current;
 }
 
 ClusterWalPinResult
 cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
 {
-	return pin == PIN && pin_current ? CLUSTER_WAL_PIN_OK :
-		CLUSTER_WAL_PIN_STALE;
+	return pin == PIN && pin_current ? CLUSTER_WAL_PIN_OK : CLUSTER_WAL_PIN_STALE;
 }
 
 ClusterControlRootResult
-cluster_control_root_recovery_complete_publish_v1(
-	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootPatch *patch,
-	ClusterControlRootSnapshot *out_snapshot,
-	ClusterControlRootReadToken *out_token)
+cluster_control_root_recovery_complete_publish_v1(const ClusterControlRootReadToken *expected_token,
+												  const ClusterControlRootPatch *patch,
+												  ClusterControlRootSnapshot *out_snapshot,
+												  ClusterControlRootReadToken *out_token)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 
-	(void) expected_token;
-	(void) patch;
+	(void)expected_token;
+	(void)patch;
 	if (finalize_publish_calls < finalize_publish_result_count)
 		result = finalize_publish_results[finalize_publish_calls];
 	finalize_publish_calls++;
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-	{
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		*out_snapshot = finalize_published_root;
 		*out_token = finalize_published_token;
 	}
@@ -141,19 +132,18 @@ cluster_control_root_recovery_complete_publish_v1(
 }
 
 ClusterControlRootResult
-cluster_control_root_read_canonical(
-	uint16 origin_thread_id, const ClusterControlRootIdentity *expected_identity,
-	ClusterControlRootReadMode mode,
-	ClusterControlRootSnapshot *out_snapshot,
-	ClusterControlRootReadToken *out_token)
+cluster_control_root_read_canonical(uint16 origin_thread_id,
+									const ClusterControlRootIdentity *expected_identity,
+									ClusterControlRootReadMode mode,
+									ClusterControlRootSnapshot *out_snapshot,
+									ClusterControlRootReadToken *out_token)
 {
-	(void) origin_thread_id;
-	(void) expected_identity;
-	(void) mode;
+	(void)origin_thread_id;
+	(void)expected_identity;
+	(void)mode;
 	finalize_read_calls++;
-	if (finalize_read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ||
-		finalize_read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-	{
+	if (finalize_read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| finalize_read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 		*out_snapshot = finalize_read_root;
 		*out_token = finalize_read_token;
 	}
@@ -162,26 +152,23 @@ cluster_control_root_read_canonical(
 
 ClusterWalPinResult
 cluster_wal_retention_pin_adopt_root_readback_v1(
-	ClusterWalRetentionPin *pin,
-	const ClusterControlRootSnapshot *expected_snapshot,
+	ClusterWalRetentionPin *pin, const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,
 	const ClusterControlRootSnapshot *observed_snapshot,
 	const ClusterControlRootReadToken *observed_token)
 {
-	(void) pin;
-	(void) expected_snapshot;
-	(void) expected_token;
-	(void) observed_snapshot;
-	(void) observed_token;
+	(void)pin;
+	(void)expected_snapshot;
+	(void)expected_token;
+	(void)observed_snapshot;
+	(void)observed_token;
 	finalize_adopt_calls++;
 	return finalize_adopt_result;
 }
 
 static void
-init_case(ClusterRecoveryDutyKey *duty,
-		  ClusterControlRootSnapshot *root,
-		  ClusterControlRootReadToken *token,
-		  ClusterRecoverySerialGuard *serial,
+init_case(ClusterRecoveryDutyKey *duty, ClusterControlRootSnapshot *root,
+		  ClusterControlRootReadToken *token, ClusterRecoverySerialGuard *serial,
 		  ClusterThreadRecoveryAuthorityV1 *authority)
 {
 	memset(duty, 0, sizeof(*duty));
@@ -194,8 +181,8 @@ init_case(ClusterRecoveryDutyKey *duty,
 	memset(duty->authority_uuid, 0x41, sizeof(duty->authority_uuid));
 	root->identity = *duty;
 	root->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
-	root->root_flags = CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID |
-		CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+	root->root_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
 	root->checkpoint_tli = 7;
 	root->tail_tli = 7;
 	root->checkpoint_lower_lsn = 100;
@@ -250,15 +237,15 @@ UT_TEST(test_exact_root_builds_one_pin_interval)
 	ClusterWalRetentionPinThreadRequest request;
 
 	init_case(&duty, &root, &token, &serial, &authority);
-	UT_ASSERT(cluster_thread_recovery_pin_request_build_v1(3, &duty, &root,
-		&token, FORMATION, NEEDS, ADMISSIONS, &interval, &request));
+	UT_ASSERT(cluster_thread_recovery_pin_request_build_v1(3, &duty, &root, &token, FORMATION,
+														   NEEDS, ADMISSIONS, &interval, &request));
 	UT_ASSERT_EQ(interval.thread_id, 3);
 	UT_ASSERT_EQ(interval.tli, 7);
 	UT_ASSERT_EQ(interval.start_lsn, 100);
 	UT_ASSERT_EQ(interval.end_lsn, 500);
 	UT_ASSERT(request.intervals == &interval && request.nintervals == 1);
-	UT_ASSERT(request.formation == FORMATION && request.needs == NEEDS &&
-		request.admissions == ADMISSIONS);
+	UT_ASSERT(request.formation == FORMATION && request.needs == NEEDS
+			  && request.admissions == ADMISSIONS);
 }
 
 UT_TEST(test_foreign_root_identity_is_zero_output)
@@ -275,8 +262,8 @@ UT_TEST(test_foreign_root_identity_is_zero_output)
 	root.identity.root_lineage_seq++;
 	memset(&interval, 0x7f, sizeof(interval));
 	memset(&request, 0x7f, sizeof(request));
-	UT_ASSERT(!cluster_thread_recovery_pin_request_build_v1(3, &duty, &root,
-		&token, FORMATION, NEEDS, ADMISSIONS, &interval, &request));
+	UT_ASSERT(!cluster_thread_recovery_pin_request_build_v1(
+		3, &duty, &root, &token, FORMATION, NEEDS, ADMISSIONS, &interval, &request));
 	UT_ASSERT_EQ(interval.end_lsn, 0);
 	UT_ASSERT(request.intervals == NULL);
 }
@@ -293,8 +280,8 @@ UT_TEST(test_cross_timeline_interval_fails_closed)
 
 	init_case(&duty, &root, &token, &serial, &authority);
 	root.tail_tli++;
-	UT_ASSERT(!cluster_thread_recovery_pin_request_build_v1(3, &duty, &root,
-		&token, FORMATION, NEEDS, ADMISSIONS, &interval, &request));
+	UT_ASSERT(!cluster_thread_recovery_pin_request_build_v1(
+		3, &duty, &root, &token, FORMATION, NEEDS, ADMISSIONS, &interval, &request));
 }
 
 UT_TEST(test_empty_or_reversed_interval_fails_closed)
@@ -309,8 +296,8 @@ UT_TEST(test_empty_or_reversed_interval_fails_closed)
 
 	init_case(&duty, &root, &token, &serial, &authority);
 	root.validated_tail_lsn_exclusive = root.checkpoint_lower_lsn;
-	UT_ASSERT(!cluster_thread_recovery_pin_request_build_v1(3, &duty, &root,
-		&token, FORMATION, NEEDS, ADMISSIONS, &interval, &request));
+	UT_ASSERT(!cluster_thread_recovery_pin_request_build_v1(
+		3, &duty, &root, &token, FORMATION, NEEDS, ADMISSIONS, &interval, &request));
 }
 
 UT_TEST(test_exact_owner_bundle_revalidates)
@@ -322,8 +309,8 @@ UT_TEST(test_exact_owner_bundle_revalidates)
 	ClusterThreadRecoveryAuthorityV1 authority;
 
 	init_case(&duty, &root, &token, &serial, &authority);
-	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(
-		&authority), CLUSTER_THREAD_AUTHORITY_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(&authority),
+				 CLUSTER_THREAD_AUTHORITY_OK);
 }
 
 UT_TEST(test_serial_root_drift_is_stale)
@@ -336,8 +323,8 @@ UT_TEST(test_serial_root_drift_is_stale)
 
 	init_case(&duty, &root, &token, &serial, &authority);
 	serial.root_read_token.root_publish_seq++;
-	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(
-		&authority), CLUSTER_THREAD_AUTHORITY_ROOT_STALE);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(&authority),
+				 CLUSTER_THREAD_AUTHORITY_ROOT_STALE);
 }
 
 UT_TEST(test_fence_drift_is_stale)
@@ -350,8 +337,8 @@ UT_TEST(test_fence_drift_is_stale)
 
 	init_case(&duty, &root, &token, &serial, &authority);
 	fence_current = false;
-	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(
-		&authority), CLUSTER_THREAD_AUTHORITY_FENCE_STALE);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(&authority),
+				 CLUSTER_THREAD_AUTHORITY_FENCE_STALE);
 }
 
 UT_TEST(test_pin_drift_is_stale)
@@ -364,8 +351,8 @@ UT_TEST(test_pin_drift_is_stale)
 
 	init_case(&duty, &root, &token, &serial, &authority);
 	pin_current = false;
-	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(
-		&authority), CLUSTER_THREAD_AUTHORITY_PIN_STALE);
+	UT_ASSERT_EQ(cluster_thread_recovery_authority_revalidate_nowait_v1(&authority),
+				 CLUSTER_THREAD_AUTHORITY_PIN_STALE);
 }
 
 UT_TEST(test_exact_window_is_covered_by_held_pin)
@@ -377,10 +364,8 @@ UT_TEST(test_exact_window_is_covered_by_held_pin)
 	ClusterThreadRecoveryAuthorityV1 authority;
 
 	init_case(&duty, &root, &token, &serial, &authority);
-	UT_ASSERT(cluster_thread_recovery_authority_covers_window_v1(
-		&authority, 3, 100, 500));
-	UT_ASSERT(cluster_thread_recovery_authority_covers_window_v1(
-		&authority, 3, 200, 400));
+	UT_ASSERT(cluster_thread_recovery_authority_covers_window_v1(&authority, 3, 100, 500));
+	UT_ASSERT(cluster_thread_recovery_authority_covers_window_v1(&authority, 3, 200, 400));
 }
 
 UT_TEST(test_window_outside_held_pin_fails_closed)
@@ -392,14 +377,10 @@ UT_TEST(test_window_outside_held_pin_fails_closed)
 	ClusterThreadRecoveryAuthorityV1 authority;
 
 	init_case(&duty, &root, &token, &serial, &authority);
-	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(
-		&authority, 3, 99, 500));
-	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(
-		&authority, 3, 100, 501));
-	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(
-		&authority, 4, 100, 500));
-	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(
-		&authority, 3, 500, 500));
+	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(&authority, 3, 99, 500));
+	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(&authority, 3, 100, 501));
+	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(&authority, 4, 100, 500));
+	UT_ASSERT(!cluster_thread_recovery_authority_covers_window_v1(&authority, 3, 500, 500));
 }
 
 UT_TEST(test_complete_window_builds_exact_root_patch)
@@ -412,27 +393,25 @@ UT_TEST(test_complete_window_builds_exact_root_patch)
 	ClusterControlRootPatch patch;
 
 	init_case(&duty, &root, &token, &serial, &authority);
-	root.root_flags |= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID |
-		CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	root.root_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
 	token.root_flags = root.root_flags;
 	serial.root_read_token = token;
 	root.tail_last_record_lsn = 450;
 	root.tail_last_record_crc32c = 88;
-	UT_ASSERT(cluster_thread_recovery_root_complete_patch_build_v1(
-		&authority, 500, &patch));
-	UT_ASSERT_EQ(patch.mask, CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE |
-		CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS);
-	UT_ASSERT_EQ(patch.expected_lifecycle,
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
-	UT_ASSERT_EQ(patch.desired.lifecycle,
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+	UT_ASSERT(cluster_thread_recovery_root_complete_patch_build_v1(&authority, 500, &patch));
+	UT_ASSERT_EQ(patch.mask, CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE
+								 | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS);
+	UT_ASSERT_EQ(patch.expected_lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+	UT_ASSERT_EQ(patch.desired.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
 	UT_ASSERT_EQ(patch.desired.recovered_tli, 7);
 	UT_ASSERT_EQ(patch.desired.recovered_through_lsn_exclusive, 500);
 	UT_ASSERT_EQ(patch.desired.recovered_last_record_lsn, 450);
 	UT_ASSERT_EQ(patch.desired.recovered_last_record_crc32c, 88);
-	UT_ASSERT((patch.desired.root_flags &
-		(CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID |
-		 CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID)) != 0);
+	UT_ASSERT((patch.desired.root_flags
+			   & (CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+				  | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID))
+			  != 0);
 }
 
 UT_TEST(test_short_window_cannot_build_complete_root_patch)
@@ -445,49 +424,42 @@ UT_TEST(test_short_window_cannot_build_complete_root_patch)
 	ClusterControlRootPatch patch;
 
 	init_case(&duty, &root, &token, &serial, &authority);
-	root.root_flags |= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID |
-		CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	root.root_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
 	token.root_flags = root.root_flags;
 	serial.root_read_token = token;
 	root.tail_last_record_lsn = 450;
 	root.tail_last_record_crc32c = 88;
 	memset(&patch, 0x7f, sizeof(patch));
-	UT_ASSERT(!cluster_thread_recovery_root_complete_patch_build_v1(
-		&authority, 499, &patch));
+	UT_ASSERT(!cluster_thread_recovery_root_complete_patch_build_v1(&authority, 499, &patch));
 	UT_ASSERT_EQ(patch.mask, 0);
 }
 
 static void
-prepare_finalize_case(ClusterRecoveryDutyKey *duty,
-	ClusterControlRootSnapshot *root, ClusterControlRootReadToken *token,
-	ClusterRecoverySerialGuard *serial,
-	ClusterThreadRecoveryAuthorityV1 *authority,
-	ClusterControlRootPatch *patch)
+prepare_finalize_case(ClusterRecoveryDutyKey *duty, ClusterControlRootSnapshot *root,
+					  ClusterControlRootReadToken *token, ClusterRecoverySerialGuard *serial,
+					  ClusterThreadRecoveryAuthorityV1 *authority, ClusterControlRootPatch *patch)
 {
 	init_case(duty, root, token, serial, authority);
-	root->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID |
-		CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	root->root_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
 	token->root_flags = root->root_flags;
 	serial->root_read_token = *token;
 	root->tail_last_record_lsn = 450;
 	root->tail_last_record_crc32c = 88;
-	UT_ASSERT(cluster_thread_recovery_root_complete_patch_build_v1(
-		authority, 500, patch));
+	UT_ASSERT(cluster_thread_recovery_root_complete_patch_build_v1(authority, 500, patch));
 	serial->held = false;
 	finalize_published_root = *root;
-	finalize_published_root.lifecycle =
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	finalize_published_root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
 	finalize_published_root.root_flags = patch->desired.root_flags;
 	finalize_published_root.recovered_tli = patch->desired.recovered_tli;
-	finalize_published_root.recovered_through_lsn_exclusive =
-		patch->desired.recovered_through_lsn_exclusive;
-	finalize_published_root.recovered_last_record_lsn =
-		patch->desired.recovered_last_record_lsn;
-	finalize_published_root.recovered_last_record_crc32c =
-		patch->desired.recovered_last_record_crc32c;
+	finalize_published_root.recovered_through_lsn_exclusive
+		= patch->desired.recovered_through_lsn_exclusive;
+	finalize_published_root.recovered_last_record_lsn = patch->desired.recovered_last_record_lsn;
+	finalize_published_root.recovered_last_record_crc32c
+		= patch->desired.recovered_last_record_crc32c;
 	finalize_published_token = *token;
-	finalize_published_token.lifecycle =
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	finalize_published_token.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
 	finalize_published_token.root_flags = finalize_published_root.root_flags;
 	finalize_published_token.root_publish_seq++;
 	finalize_published_token.record_crc32c++;
@@ -506,12 +478,11 @@ UT_TEST(test_root_finalize_exact_cas_succeeds)
 	prepare_finalize_case(&duty, &root, &token, &serial, &authority, &patch);
 	finalize_publish_results[0] = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	finalize_publish_result_count = 1;
-	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(
-		&authority, &patch, &published), CLUSTER_THREAD_ROOT_FINALIZE_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(&authority, &patch, &published),
+				 CLUSTER_THREAD_ROOT_FINALIZE_OK);
 	UT_ASSERT_EQ(finalize_publish_calls, 1);
 	UT_ASSERT_EQ(finalize_read_calls, 0);
-	UT_ASSERT_EQ(published.lifecycle,
-		CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+	UT_ASSERT_EQ(published.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
 }
 
 UT_TEST(test_root_finalize_stale_token_reconciles_without_page_replay)
@@ -534,8 +505,8 @@ UT_TEST(test_root_finalize_stale_token_reconciles_without_page_replay)
 	finalize_read_token.file_txn_seq++;
 	finalize_read_token.root_publish_seq++;
 	finalize_read_token.record_crc32c++;
-	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(
-		&authority, &patch, &published), CLUSTER_THREAD_ROOT_FINALIZE_OK);
+	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(&authority, &patch, &published),
+				 CLUSTER_THREAD_ROOT_FINALIZE_OK);
 	UT_ASSERT_EQ(finalize_publish_calls, 2);
 	UT_ASSERT_EQ(finalize_read_calls, 1);
 	UT_ASSERT_EQ(finalize_adopt_calls, 1);
@@ -557,9 +528,8 @@ UT_TEST(test_root_finalize_adopts_already_complete_readback)
 	finalize_read_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	finalize_read_root = finalize_published_root;
 	finalize_read_token = finalize_published_token;
-	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(
-		&authority, &patch, &published),
-		CLUSTER_THREAD_ROOT_FINALIZE_ALREADY_COMPLETE);
+	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(&authority, &patch, &published),
+				 CLUSTER_THREAD_ROOT_FINALIZE_ALREADY_COMPLETE);
 	UT_ASSERT_EQ(finalize_publish_calls, 1);
 	UT_ASSERT_EQ(finalize_read_calls, 1);
 	UT_ASSERT_EQ(finalize_adopt_calls, 1);
@@ -583,8 +553,8 @@ UT_TEST(test_root_finalize_immutable_drift_requests_fresh_plan)
 	finalize_read_token = token;
 	finalize_read_token.root_publish_seq++;
 	finalize_adopt_result = CLUSTER_WAL_PIN_STALE;
-	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(
-		&authority, &patch, &published), CLUSTER_THREAD_ROOT_FINALIZE_RETRY);
+	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(&authority, &patch, &published),
+				 CLUSTER_THREAD_ROOT_FINALIZE_RETRY);
 	UT_ASSERT_EQ(finalize_publish_calls, 1);
 	UT_ASSERT_EQ(finalize_adopt_calls, 1);
 }
@@ -602,9 +572,8 @@ UT_TEST(test_root_finalize_release_uncertain_preserves_cleanup_ownership)
 	prepare_finalize_case(&duty, &root, &token, &serial, &authority, &patch);
 	finalize_publish_results[0] = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
 	finalize_publish_result_count = 1;
-	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(
-		&authority, &patch, &published),
-		CLUSTER_THREAD_ROOT_FINALIZE_CLEANUP_UNCERTAIN);
+	UT_ASSERT_EQ(cluster_thread_recovery_root_finalize_after_ir_v1(&authority, &patch, &published),
+				 CLUSTER_THREAD_ROOT_FINALIZE_CLEANUP_UNCERTAIN);
 	UT_ASSERT_EQ(finalize_read_calls, 0);
 }
 

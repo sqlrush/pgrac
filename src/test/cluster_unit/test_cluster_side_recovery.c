@@ -52,7 +52,7 @@ ut_setup_globals(void)
 	ut_id.rlocator.dbOid = 2;
 	ut_id.rlocator.relNumber = 3;
 	ut_id.forknum = MAIN_FORKNUM;
-	ut_id.blocknum = 7;			/* a TT/undo/space canonical page */
+	ut_id.blocknum = 7; /* a TT/undo/space canonical page */
 
 	memset(&ut_expected, 0, sizeof(ut_expected));
 	ut_expected.identity = ut_id;
@@ -130,7 +130,7 @@ UT_TEST(test_side_readiness_per_resource)
 	 * readiness judgement has no side-wide state. */
 	memset(&b, 0, sizeof(b));
 	b.resource_id = 2;
-	b.page_proof_ok = false;	/* B blocked */
+	b.page_proof_ok = false; /* B blocked */
 	UT_ASSERT(!cluster_side_resource_readiness(&b));
 	UT_ASSERT(cluster_side_resource_readiness(&a)); /* A unaffected */
 
@@ -160,41 +160,40 @@ UT_TEST(test_side_retention_proof_verdicts)
 	p.all_bytes_durable = true;
 	p.all_post_read_ok = true;
 	p.consumers_zero = true;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&p),
-				 (int) CLUSTER_SIDE_RETENTION_READY);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&p), (int)CLUSTER_SIDE_RETENTION_READY);
 
 	/* Not durable -> precise denial. */
 	p.all_bytes_durable = false;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&p),
-				 (int) CLUSTER_SIDE_RETENTION_DENY_NOT_DURABLE);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&p),
+				 (int)CLUSTER_SIDE_RETENTION_DENY_NOT_DURABLE);
 	p.all_bytes_durable = true;
 
 	/* Missing post-read -> precise denial (logical DONE never
 	 * substitutes). */
 	p.all_post_read_ok = false;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&p),
-				 (int) CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&p),
+				 (int)CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ);
 	p.all_post_read_ok = true;
 
 	/* Remaining consumer -> precise denial. */
 	p.consumers_zero = false;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&p),
-				 (int) CLUSTER_SIDE_RETENTION_DENY_CONSUMER);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&p),
+				 (int)CLUSTER_SIDE_RETENTION_DENY_CONSUMER);
 	p.consumers_zero = true;
 
 	/* Invalid inputs. */
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(NULL),
-				 (int) CLUSTER_SIDE_RETENTION_DENY_INVALID);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(NULL),
+				 (int)CLUSTER_SIDE_RETENTION_DENY_INVALID);
 	/* D-SIDE-08 production caller (implementation): origin_thread_id unset
 	 * (0) is the judge's fail-closed shape until the orchestrator wires
 	 * the real dead_tid — never READY with an anonymous origin. */
 	p.failed_origin_thread = 0;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&p),
-				 (int) CLUSTER_SIDE_RETENTION_DENY_INVALID);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&p),
+				 (int)CLUSTER_SIDE_RETENTION_DENY_INVALID);
 	p.failed_origin_thread = 2;
 	p.affected_count = 0;
-	UT_ASSERT_EQ((int) cluster_side_retention_proof_ready(&p),
-				 (int) CLUSTER_SIDE_RETENTION_DENY_INVALID);
+	UT_ASSERT_EQ((int)cluster_side_retention_proof_ready(&p),
+				 (int)CLUSTER_SIDE_RETENTION_DENY_INVALID);
 }
 
 int

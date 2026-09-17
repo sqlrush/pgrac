@@ -45,8 +45,32 @@ concurrency:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
+  mvp-ci:
+    name: Verify exact-commit MVP CI
+    needs: principle-0
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Verify all required jobs actually passed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          python3 scripts/ci/mvp_ci.py --verify-release \
+            --repository "$RELEASE_REPOSITORY" --sha "$RELEASE_SHA" \
+            > mvp-ci-evidence.json
+      - name: Preserve release CI evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: mvp-ci-evidence-${{ github.sha }}
+          path: mvp-ci-evidence.json
+          retention-days: 30
+
   # -------------------------------------------------------------------------
   # Principle-0 compliance: the public release artifacts must carry no private
   # design reasoning.  A leak into a public release is permanent, so this is a
@@ -73,7 +97,7 @@ jobs:
   # -------------------------------------------------------------------------
   package:
     name: Package (${{ matrix.os }})
-    needs: principle-0
+    needs: [principle-0, mvp-ci]
     strategy:
       fail-fast: false
       matrix:

@@ -3093,7 +3093,10 @@ typedef struct CtrcTestCase {
 	CtrcTestFn function;
 } CtrcTestCase;
 
-#define CTRC_TEST_ENTRY(name) { #name, name }
+#define CTRC_TEST_ENTRY(name)                                                                      \
+	{                                                                                              \
+		#name, name                                                                                \
+	}
 
 int
 main(void)

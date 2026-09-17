@@ -281,16 +281,17 @@ extern bool cluster_sf_peer_supports_gcs_inval_busy(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_convert(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_rebase(int32 peer_id);
 extern bool cluster_sf_peer_supports_pcm_x_source_floor(int32 peer_id);
-extern bool cluster_sf_peer_multixact_current_capability_generation(
-	int32 peer_id, uint32 *generation_out);
+extern bool cluster_sf_peer_multixact_current_capability_generation(int32 peer_id,
+																	uint32 *generation_out);
 extern bool cluster_sf_peer_pcm_x_source_floor_sample(int32 peer_id, bool *source_floor_out,
-												  uint32 *generation_out);
-extern bool cluster_sf_peer_capability_family_sample(
-	int32 peer_id, uint32 required_capabilities, uint32 optional_capabilities,
-	bool *optional_supported_out, uint32 *generation_out);
-extern bool cluster_sf_peer_capability_word_sample(
-	int32 peer_id, uint32 required_capabilities,
-	uint32 *capability_word_out, uint32 *generation_out);
+													  uint32 *generation_out);
+extern bool cluster_sf_peer_capability_family_sample(int32 peer_id, uint32 required_capabilities,
+													 uint32 optional_capabilities,
+													 bool *optional_supported_out,
+													 uint32 *generation_out);
+extern bool cluster_sf_peer_capability_word_sample(int32 peer_id, uint32 required_capabilities,
+												   uint32 *capability_word_out,
+												   uint32 *generation_out);
 extern bool cluster_sf_peer_capability_generation_matches(int32 peer_id,
 														  uint32 required_capabilities,
 														  uint32 expected_generation);

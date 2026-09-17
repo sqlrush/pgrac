@@ -58,8 +58,8 @@
 #include "cluster/cluster_wal_retention.h" /* RF-ROOT P6 WALR conditional convert */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h" /* spec-5.8 D8 — cluster_ic_send_envelope (REPORT send-back) */
-#include "cluster/cluster_qvotec.h"	   /* cluster_qvotec_in_quorum */
-#include "cluster/cluster_conf.h"	   /* cluster_conf_lookup_node */
+#include "cluster/cluster_qvotec.h" /* cluster_qvotec_in_quorum */
+#include "cluster/cluster_conf.h"	/* cluster_conf_lookup_node */
 #include "cluster/cluster_replacement_wire.h"
 #include "cluster/cluster_sf_dep.h"
 #include "cluster/cluster_startup_phase.h"

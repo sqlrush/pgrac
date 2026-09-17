@@ -25,9 +25,9 @@
 #define CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY UINT8_C(0x01)
 #define CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY UINT8_C(0x02)
 #define CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED UINT8_C(0x08)
-#define CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK                                     \
-	(CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY                                      \
-	 | CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY                                 \
+#define CLUSTER_REPLACEMENT_EPISODE_READINESS_MASK                                                 \
+	(CLUSTER_REPLACEMENT_EPISODE_R4A_TARGET_READY                                                  \
+	 | CLUSTER_REPLACEMENT_EPISODE_GRD_POSTEPOCH_READY                                             \
 	 | CLUSTER_REPLACEMENT_EPISODE_INTENT_CLEARED)
 
 typedef enum ClusterReplacementEpisodePhase {
@@ -42,20 +42,20 @@ typedef enum ClusterReplacementEpisodePhase {
 } ClusterReplacementEpisodePhase;
 
 typedef struct ClusterReplacementEpisode {
-	uint64 request_nonce;					/* 0 */
-	uint64 baseline_epoch;					/* 8 */
-	uint64 reserved_or_committed_epoch;		/* 16: exact baseline+1 */
-	uint64 old_admitted_incarnation;			/* 24 */
-	uint64 fresh_incarnation;				/* 32 */
-	uint64 grammar_fingerprint;				/* 40 */
+	uint64 request_nonce;												/* 0 */
+	uint64 baseline_epoch;												/* 8 */
+	uint64 reserved_or_committed_epoch;									/* 16: exact baseline+1 */
+	uint64 old_admitted_incarnation;									/* 24 */
+	uint64 fresh_incarnation;											/* 32 */
+	uint64 grammar_fingerprint;											/* 40 */
 	uint8 expected_survivors[CLUSTER_REPLACEMENT_EPISODE_BITMAP_BYTES]; /* 48 */
-	uint8 acknowledgements[CLUSTER_REPLACEMENT_EPISODE_BITMAP_BYTES];  /* 64 */
-	int32 target_node_id;					/* 80 */
-	int32 coordinator_node_id;				/* 84 */
-	uint32 state_generation;				/* 88; zero means empty */
-	uint8 phase;							/* 92 */
-	uint8 readiness_flags;					/* 93 */
-	uint8 reserved[2];						/* 94: zero */
+	uint8 acknowledgements[CLUSTER_REPLACEMENT_EPISODE_BITMAP_BYTES];	/* 64 */
+	int32 target_node_id;												/* 80 */
+	int32 coordinator_node_id;											/* 84 */
+	uint32 state_generation;											/* 88; zero means empty */
+	uint8 phase;														/* 92 */
+	uint8 readiness_flags;												/* 93 */
+	uint8 reserved[2];													/* 94: zero */
 } ClusterReplacementEpisode;
 
 StaticAssertDecl(sizeof(ClusterReplacementEpisode) == CLUSTER_REPLACEMENT_EPISODE_BYTES,

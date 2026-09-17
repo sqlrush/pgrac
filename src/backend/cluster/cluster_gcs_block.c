@@ -57,12 +57,12 @@
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-2.34 D1 — counter forward */
 #include "cluster/cluster_grd.h"			 /* spec-4.6 D4 — block_path_failclosed counter */
 #include "cluster/cluster_grd_outbound.h"
-#include "cluster/cluster_membership.h"		 /* spec-5.16 D3b — is_member master-side gate */
+#include "cluster/cluster_membership.h" /* spec-5.16 D3b — is_member master-side gate */
 #include "cluster/cluster_multixact_current_wire.h"
 #include "cluster/cluster_multixact_current_stats.h"
-#include "cluster/cluster_qvotec.h"			 /* spec-5.16 D3b — in_quorum master-side gate */
-#include "cluster/cluster_reconfig.h"		 /* QVOTEC-observed live peer incarnation */
-#include "cluster/cluster_recovery_merge.h"	 /* spec-4.7 D5 — recovered_through redo gate */
+#include "cluster/cluster_qvotec.h"			/* spec-5.16 D3b — in_quorum master-side gate */
+#include "cluster/cluster_reconfig.h"		/* QVOTEC-observed live peer incarnation */
+#include "cluster/cluster_recovery_merge.h" /* spec-4.7 D5 — recovered_through redo gate */
 #include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_runtime_visibility.h"
 #include "cluster/cluster_scn.h"
@@ -71,8 +71,8 @@
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
 #include "cluster/cluster_tt_durable.h"
-#include "cluster/cluster_xnode_profile.h"	 /* spec-5.59 D2/D3/D4 profiling buckets */
-#include "cluster/cluster_xnode_lever.h"	 /* spec-6.12a — downgrade counters */
+#include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2/D3/D4 profiling buckets */
+#include "cluster/cluster_xnode_lever.h"   /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
@@ -156,11 +156,9 @@ typedef enum ClusterGcsBlockReplyDomain {
  * freshness/fail-closed checks. */
 #define GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS 128
 #define GCS_BLOCK_R4_TX_ORIGIN_STEP_BUDGET 6
-#define GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS                                      \
-	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1                                 \
-	 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1                                         \
-	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                            \
-	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
+#define GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS                                                        \
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1                  \
+	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
 
 typedef enum GcsBlockR4TxOriginPhase {
 	GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN = 1,
@@ -223,14 +221,10 @@ typedef struct GcsBlockR4TxOriginContext {
 	ClusterUndoBlock0CurrentGuard guard;
 	ClusterRuntimeVisibilityOriginPlan origin_plan;
 	ClusterCurrentMxProofForwardV2 current_mx_request;
-	ClusterTTSlotPhysicalLocator current_mx_locators[
-		CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
-	ClusterCurrentMemberProof current_mx_proofs[
-		CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
-	ClusterCtrcTxnKeyV1 current_mx_ctrc_keys[
-		CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
-	ClusterTTStatusKey current_mx_sampled_keys[
-		CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterTTSlotPhysicalLocator current_mx_locators[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterCurrentMemberProof current_mx_proofs[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterCtrcTxnKeyV1 current_mx_ctrc_keys[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+	ClusterTTStatusKey current_mx_sampled_keys[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 	ClusterCurrentUpdaterProof current_mx_updater_proof;
 	ClusterMxResolveResult current_mx_result;
 	GcsBlockCurrentMxOriginFailure current_mx_failure;
@@ -248,8 +242,7 @@ typedef struct GcsBlockR4TxOriginContext {
 	uint8 reply_frame[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE + sizeof(ClusterGcsUndoAuthTrailer)];
 } GcsBlockR4TxOriginContext;
 
-static GcsBlockR4TxOriginContext
-	gcs_block_r4_tx_origin_contexts[GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS];
+static GcsBlockR4TxOriginContext gcs_block_r4_tx_origin_contexts[GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS];
 static bool gcs_block_r4_tx_origin_first_denial_logged = false;
 static bool gcs_block_current_mx_origin_first_unknown_logged = false;
 
@@ -276,9 +269,8 @@ typedef enum GcsBlockResourceXDiagnostic {
 } GcsBlockResourceXDiagnostic;
 
 static uint64
-	gcs_block_resource_x_diagnostic_next_log_at
-		[GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_COUNT]
-		[GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_CLASS_COUNT];
+	gcs_block_resource_x_diagnostic_next_log_at[GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_COUNT]
+											   [GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_CLASS_COUNT];
 
 typedef struct ClusterGcsBlockOutstandingSlot {
 	bool in_use;
@@ -349,16 +341,13 @@ typedef struct ClusterGcsBlockBackendBlock {
 } ClusterGcsBlockBackendBlock;
 
 static void
-gcs_block_slot_clear_current_mx_expectation(
-	ClusterGcsBlockOutstandingSlot *slot)
+gcs_block_slot_clear_current_mx_expectation(ClusterGcsBlockOutstandingSlot *slot)
 {
 	slot->expected_reply_status = 0;
 	slot->expected_current_mx_key_valid = false;
-	memset(&slot->expected_current_mx_key, 0,
-		   sizeof(slot->expected_current_mx_key));
+	memset(&slot->expected_current_mx_key, 0, sizeof(slot->expected_current_mx_key));
 	slot->expected_current_mx_proof_valid = false;
-	memset(&slot->expected_current_mx_proof, 0,
-		   sizeof(slot->expected_current_mx_proof));
+	memset(&slot->expected_current_mx_proof, 0, sizeof(slot->expected_current_mx_proof));
 }
 
 static ClusterGcsBlockBackendBlock *gcs_block_backend_blocks = NULL;
@@ -378,18 +367,14 @@ cluster_gcs_block_r4_requester_count(void)
 		return UINT64_MAX;
 
 	for (backend_id = 0; backend_id < MaxBackends; backend_id++) {
-		ClusterGcsBlockBackendBlock *blk
-			= &gcs_block_backend_blocks[backend_id];
+		ClusterGcsBlockBackendBlock *blk = &gcs_block_backend_blocks[backend_id];
 		int slot_id;
 
 		LWLockAcquire(&blk->lock.lock, LW_SHARED);
-		for (slot_id = 0;
-			 slot_id < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND;
-			 slot_id++) {
+		for (slot_id = 0; slot_id < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; slot_id++) {
 			const ClusterGcsBlockOutstandingSlot *slot = &blk->slots[slot_id];
 
-			if (slot->in_use
-				&& slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR)
+			if (slot->in_use && slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR)
 				count++;
 		}
 		LWLockRelease(&blk->lock.lock);
@@ -541,11 +526,11 @@ typedef struct ClusterGcsBlockShared {
 	/* PGRAC: spec-4.7 D6 — GCS/PCM warm-recovery observability (dump category
 	 * 'gcs_recovery'). */
 	pg_atomic_uint64 recovery_block_resources_recovering; /* phase_for_tag → RECOVERING hits */
-	pg_atomic_uint64 recovery_buffers_redeclared;	 /* survivor re-declare sent (D2) */
-	pg_atomic_uint64 recovery_block_state_rebuilt;	 /* master rebuild applied (D2/D3) */
-	pg_atomic_uint64 recovery_redo_boundary_waits;	 /* redo gate: not yet covered (D5) */
-	pg_atomic_uint64 recovery_redo_boundary_reached; /* redo gate: covered (D5) */
-	pg_atomic_uint64 recovery_stale_block_drop;		 /* re-declare dropped: off-epoch/bad (D2) */
+	pg_atomic_uint64 recovery_buffers_redeclared;		  /* survivor re-declare sent (D2) */
+	pg_atomic_uint64 recovery_block_state_rebuilt;		  /* master rebuild applied (D2/D3) */
+	pg_atomic_uint64 recovery_redo_boundary_waits;		  /* redo gate: not yet covered (D5) */
+	pg_atomic_uint64 recovery_redo_boundary_reached;	  /* redo gate: covered (D5) */
+	pg_atomic_uint64 recovery_stale_block_drop; /* re-declare dropped: off-epoch/bad (D2) */
 	pg_atomic_uint64 recovery_ambiguous_owner_failclosed; /* not-double-X conflict (D3) */
 	pg_atomic_uint64 recovery_before_boundary_failclosed; /* served-before-redo gate fail (D5) */
 	/* PGRAC: spec-2.36 D3 (HC116) — master broadcast invalidate slot.
@@ -671,11 +656,12 @@ static ClusterGcsBlockOutstandingSlot *cluster_gcs_block_test_requester_slot = N
  * ============================================================ */
 static ClusterGcsBlockBackendBlock *gcs_block_my_block(void);
 static ClusterGcsBlockOutstandingSlot *gcs_block_reserve_slot(BufferTag tag, uint8 transition_id,
-													  int32 master_node,
-													  uint64 *out_request_id);
-static ClusterGcsBlockOutstandingSlot *gcs_block_try_reserve_r4_slot(
-	BufferTag tag, uint64 request_epoch, int32 expected_master_node,
-	uint64 *out_request_id);
+															  int32 master_node,
+															  uint64 *out_request_id);
+static ClusterGcsBlockOutstandingSlot *gcs_block_try_reserve_r4_slot(BufferTag tag,
+																	 uint64 request_epoch,
+																	 int32 expected_master_node,
+																	 uint64 *out_request_id);
 static ClusterCrBuildResult gcs_block_r4_cr_fetch_and_wait_raw(
 	BufferTag tag, SCN read_scn, int32 real_master_node, char dst_page[GCS_BLOCK_DATA_SIZE],
 	ClusterCrBuildReason *reason_out, const ClusterSemanticAdmissionToken *admission);
@@ -683,14 +669,15 @@ static void gcs_block_release_slot(ClusterGcsBlockOutstandingSlot *slot);
 static void gcs_block_send_reply(int32 dest_node, const GcsBlockRequestPayload *req,
 								 GcsBlockReplyStatus status, XLogRecPtr page_lsn,
 								 const char *block_data);
-static ClusterICSendResult gcs_block_send_envelope_or_loopback(
-	uint8 msg_type, int32 dest_node, const void *payload, uint32 payload_len);
-static bool gcs_block_r4_tx_origin_try_accept(
-	const ClusterICEnvelope *env, const ClusterR4CrForwardPayload *forward);
-static bool gcs_block_current_mx_origin_try_accept(
-	const ClusterICEnvelope *env, const void *payload);
-static void gcs_block_r4_tx_origin_context_clear(
-	GcsBlockR4TxOriginContext *context, bool cancel_guard);
+static ClusterICSendResult gcs_block_send_envelope_or_loopback(uint8 msg_type, int32 dest_node,
+															   const void *payload,
+															   uint32 payload_len);
+static bool gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
+											  const ClusterR4CrForwardPayload *forward);
+static bool gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env,
+												   const void *payload);
+static void gcs_block_r4_tx_origin_context_clear(GcsBlockR4TxOriginContext *context,
+												 bool cancel_guard);
 static bool gcs_block_get_ship_image(BufferTag tag, int32 dest_node, bool allow_live_sge,
 									 XLogRecPtr *out_page_lsn, char *copy_buf,
 									 const char **out_block_payload, uint32 *out_block_lkey,
@@ -794,14 +781,10 @@ cluster_gcs_block_shmem_init(void)
 		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch, 0);
-		pg_atomic_init_u64(
-			&ClusterGcsBlock->resource_x_pre_mutation_backpressure_count, 0);
-		pg_atomic_init_u64(
-			&ClusterGcsBlock->resource_x_authority_drift_count, 0);
-		pg_atomic_init_u64(
-			&ClusterGcsBlock->resource_x_post_mutation_ambiguity_count, 0);
-		pg_atomic_init_u64(
-			&ClusterGcsBlock->resource_x_internal_corruption_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_pre_mutation_backpressure_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_authority_drift_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_post_mutation_ambiguity_count, 0);
+		pg_atomic_init_u64(&ClusterGcsBlock->resource_x_internal_corruption_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->stale_reply_drop_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_sent_count, 0);
 		pg_atomic_init_u64(&ClusterGcsBlock->done_enqueue_drop_count, 0);
@@ -1066,8 +1049,8 @@ gcs_block_reserve_slot(BufferTag tag, uint8 transition_id, int32 master_node,
  * per-backend lock, so capacity cannot consume an id and a wrapped sequence
  * can never be mapped back to one by gcs_reqid_requester(). */
 static ClusterGcsBlockOutstandingSlot *
-gcs_block_try_reserve_r4_slot(BufferTag tag, uint64 request_epoch,
-							   int32 expected_master_node, uint64 *out_request_id)
+gcs_block_try_reserve_r4_slot(BufferTag tag, uint64 request_epoch, int32 expected_master_node,
+							  uint64 *out_request_id)
 {
 	ClusterGcsBlockBackendBlock *blk;
 	ClusterGcsBlockOutstandingSlot *slot = NULL;
@@ -1097,8 +1080,7 @@ gcs_block_try_reserve_r4_slot(BufferTag tag, uint64 request_epoch,
 	memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 	slot->in_use = true;
 	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
-	slot->request_id
-		= gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, sequence);
+	slot->request_id = gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, sequence);
 	slot->transition_id = (uint8)PCM_TRANS_N_TO_S;
 	slot->tag = tag;
 	slot->master_node = expected_master_node;
@@ -1133,10 +1115,9 @@ gcs_block_try_reserve_r4_slot(BufferTag tag, uint64 request_epoch,
 /* Reserve one exact Current-MX describe attempt.  The slot is published in
  * its own reply domain before the 128-byte request can reach the DATA ring. */
 static ClusterGcsBlockOutstandingSlot *
-gcs_block_try_reserve_current_mx_slot(
-	const ClusterCurrentMxKey *key, uint64 request_epoch,
-	int32 expected_origin_node, uint8 expected_reply_status,
-	uint64 *out_request_id)
+gcs_block_try_reserve_current_mx_slot(const ClusterCurrentMxKey *key, uint64 request_epoch,
+									  int32 expected_origin_node, uint8 expected_reply_status,
+									  uint64 *out_request_id)
 {
 	ClusterGcsBlockBackendBlock *blk;
 	ClusterGcsBlockOutstandingSlot *slot = NULL;
@@ -1145,14 +1126,10 @@ gcs_block_try_reserve_current_mx_slot(
 
 	if (out_request_id != NULL)
 		*out_request_id = 0;
-	if (key == NULL || out_request_id == NULL
-		|| MyBackendId <= 0 || MyBackendId > MaxBackends
-		|| expected_origin_node < 0
-		|| expected_origin_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| (expected_reply_status
-				!= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
-			&& expected_reply_status
-				   != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT))
+	if (key == NULL || out_request_id == NULL || MyBackendId <= 0 || MyBackendId > MaxBackends
+		|| expected_origin_node < 0 || expected_origin_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+		|| (expected_reply_status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+			&& expected_reply_status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT))
 		return NULL;
 	blk = gcs_block_my_block();
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
@@ -1162,8 +1139,7 @@ gcs_block_try_reserve_current_mx_slot(
 			break;
 		}
 	sequence = blk->next_request_id;
-	if (slot == NULL || sequence == 0
-		|| sequence > GCS_REQID_REQUESTER_SEQ_MASK) {
+	if (slot == NULL || sequence == 0 || sequence > GCS_REQID_REQUESTER_SEQ_MASK) {
 		LWLockRelease(&blk->lock.lock);
 		return NULL;
 	}
@@ -1173,11 +1149,10 @@ gcs_block_try_reserve_current_mx_slot(
 	memset(slot->reply_block_data, 0, sizeof(slot->reply_block_data));
 	slot->in_use = true;
 	slot->reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX;
-	slot->request_id
-		= gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, sequence);
+	slot->request_id = gcs_reqid_requester(cluster_node_id, (int)MyBackendId - 1, sequence);
 	slot->transition_id = 0;
-	slot->tag = GcsBlockCurrentMxRouteTagMake(
-		slot->request_id, request_epoch, cluster_node_id, (int32)MyBackendId);
+	slot->tag = GcsBlockCurrentMxRouteTagMake(slot->request_id, request_epoch, cluster_node_id,
+											  (int32)MyBackendId);
 	slot->master_node = expected_origin_node;
 	slot->reply_received = false;
 	slot->reply_sf_dep_valid = false;
@@ -1789,7 +1764,7 @@ gcs_block_compute_redeclare_checksum(const GcsBlockRedeclarePayload *p)
  */
 static void
 PGRAC_PCM_X_FENCE_DOMINATED(cluster_bufmgr_pcm_x_content_write_permitted)
-gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn)
+	gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page_lsn)
 {
 	LWLock *content_lock;
 	Page page;
@@ -1828,15 +1803,13 @@ gcs_block_install_block(BufferDesc *buf, const char *block_data, XLogRecPtr page
  * its own exact acquisition-generation proof. */
 static bool
 gcs_block_pcm_x_reserved_image_write_exact(const ClusterPcmOwnSnapshot *live,
-											   const ClusterPcmOwnSnapshot *base,
-											   uint64 reservation_token)
+										   const ClusterPcmOwnSnapshot *base,
+										   uint64 reservation_token)
 {
 	return cluster_pcm_x_grant_reservation_kind(live, base, reservation_token)
-			== CLUSTER_PCM_X_GRANT_RESERVATION_N_NEW
-		   && live->writer_activation_token == 0
-		   && live->resource_x_activation_generation == 0
-		   && base->writer_activation_token == 0
-		   && base->resource_x_activation_generation == 0;
+			   == CLUSTER_PCM_X_GRANT_RESERVATION_N_NEW
+		   && live->writer_activation_token == 0 && live->resource_x_activation_generation == 0
+		   && base->writer_activation_token == 0 && base->resource_x_activation_generation == 0;
 }
 
 
@@ -2271,25 +2244,24 @@ cluster_gcs_block_phase_for_tag(BufferTag tag)
 	return GCS_BLOCK_NORMAL;
 }
 
-#define R4_CR_REQUIRED_HELLO_CAPS                                                        \
-	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1        \
-	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1                                    \
-	 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
+#define R4_CR_REQUIRED_HELLO_CAPS                                                                  \
+	(PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1 | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1                  \
+	 | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1 | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1)
 
 /* A local R4 actor has no peer HELLO record.  Its compiled protocol family is
  * fixed by this binary, while the entered TARGET token binds that capability
  * to the locally committed OPEN/formation generation.  The final route
  * recheck remains the operation's freshness fence. */
 static bool
-gcs_block_r4_local_compiled_capability_matches(
-	const ClusterSemanticAdmissionToken *token, uint32 required_capabilities,
-	uint32 optional_capabilities, bool *optional_supported_out)
+gcs_block_r4_local_compiled_capability_matches(const ClusterSemanticAdmissionToken *token,
+											   uint32 required_capabilities,
+											   uint32 optional_capabilities,
+											   bool *optional_supported_out)
 {
-	uint32 compiled_capabilities
-		= PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
-		  | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
-		  | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
-		  | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1;
+	uint32 compiled_capabilities = PGRAC_IC_HELLO_CAP_SEMANTIC_ACTIVATION_V1
+								   | PGRAC_IC_HELLO_CAP_R4_SYNC_CR_V1
+								   | PGRAC_IC_HELLO_CAP_CANDIDATE2_CORRECTED_A1_V1
+								   | PGRAC_IC_HELLO_CAP_UNDO_ROOT_DESCRIPTOR_V1;
 
 	if (!cluster_ic_suppress_gcs_done_cap)
 		compiled_capabilities |= PGRAC_IC_HELLO_CAP_GCS_DONE_V1;
@@ -2308,19 +2280,16 @@ gcs_block_r4_local_compiled_capability_matches(
  * HELLO generation to substitute, so admit only an exact, nonzero checked
  * conversion under the same entered TARGET token. */
 static bool
-gcs_block_r4_local_capability_generation(
-	const ClusterSemanticAdmissionToken *token, uint32 required_capabilities,
-	uint32 optional_capabilities, bool *optional_supported_out,
-	uint32 *generation_out)
+gcs_block_r4_local_capability_generation(const ClusterSemanticAdmissionToken *token,
+										 uint32 required_capabilities, uint32 optional_capabilities,
+										 bool *optional_supported_out, uint32 *generation_out)
 {
 	if (generation_out == NULL)
 		return false;
 	*generation_out = 0;
 	if (!gcs_block_r4_local_compiled_capability_matches(
-			token, required_capabilities, optional_capabilities,
-			optional_supported_out)
-		|| token->record_generation == 0
-		|| token->record_generation > (uint64)PG_UINT32_MAX)
+			token, required_capabilities, optional_capabilities, optional_supported_out)
+		|| token->record_generation == 0 || token->record_generation > (uint64)PG_UINT32_MAX)
 		return false;
 	*generation_out = (uint32)token->record_generation;
 	return true;
@@ -2336,54 +2305,52 @@ typedef struct GcsBlockR4ReplyExpectation {
 	uint8 reply_domain;
 } GcsBlockR4ReplyExpectation;
 
-static bool gcs_block_decode_r4_reply_payload(
-	const ClusterICEnvelope *env, const void *payload,
-	const GcsBlockR4ReplyExpectation *expected) pg_attribute_unused();
+static bool gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payload,
+											  const GcsBlockR4ReplyExpectation *expected)
+	pg_attribute_unused();
 
 /* Return true when D3 must publish an immediate refusal and false only for
  * the proved admitted FORWARD96 success.  Invalid result/reason pairs close
  * as status 26; they never inherit retry polarity from one member alone. */
 static bool
-gcs_block_r4_refusal_status_for_build(ClusterCrBuildResult result,
-									  ClusterCrBuildReason reason, bool admitted_forward,
-									  GcsBlockReplyStatus *status_out)
+gcs_block_r4_refusal_status_for_build(ClusterCrBuildResult result, ClusterCrBuildReason reason,
+									  bool admitted_forward, GcsBlockReplyStatus *status_out)
 {
 	if (status_out == NULL)
 		return true;
 	*status_out = GCS_BLOCK_REPLY_R4_DENIED;
-	if (result == CLUSTER_CR_BUILD_FULL && reason == CLUSTER_CR_BUILD_NONE
-		&& admitted_forward)
+	if (result == CLUSTER_CR_BUILD_FULL && reason == CLUSTER_CR_BUILD_NONE && admitted_forward)
 		return false;
 	if (result == CLUSTER_CR_BUILD_RETRYABLE) {
 		switch (reason) {
-			case CLUSTER_CR_BUILD_TARGET_DISABLED:
-			case CLUSTER_CR_BUILD_RF_DEFERRED:
-			case CLUSTER_CR_BUILD_WRONG_MASTER:
-			case CLUSTER_CR_BUILD_NO_HOLDER:
-			case CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS:
-			case CLUSTER_CR_BUILD_HOLDER_MOVED:
-			case CLUSTER_CR_BUILD_RECOVERING:
-			case CLUSTER_CR_BUILD_GENERATION_MISMATCH:
-			case CLUSTER_CR_BUILD_CAPACITY:
-			case CLUSTER_CR_BUILD_EPOCH_MISMATCH:
-				*status_out = GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
-				return true;
-			default:
-				break;
+		case CLUSTER_CR_BUILD_TARGET_DISABLED:
+		case CLUSTER_CR_BUILD_RF_DEFERRED:
+		case CLUSTER_CR_BUILD_WRONG_MASTER:
+		case CLUSTER_CR_BUILD_NO_HOLDER:
+		case CLUSTER_CR_BUILD_HOLDER_AMBIGUOUS:
+		case CLUSTER_CR_BUILD_HOLDER_MOVED:
+		case CLUSTER_CR_BUILD_RECOVERING:
+		case CLUSTER_CR_BUILD_GENERATION_MISMATCH:
+		case CLUSTER_CR_BUILD_CAPACITY:
+		case CLUSTER_CR_BUILD_EPOCH_MISMATCH:
+			*status_out = GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+			return true;
+		default:
+			break;
 		}
 	}
 	if (result == CLUSTER_CR_BUILD_FAIL_CLOSED) {
 		switch (reason) {
-			case CLUSTER_CR_BUILD_BAD_LOCATOR:
-			case CLUSTER_CR_BUILD_BAD_UNDO:
-			case CLUSTER_CR_BUILD_CHAIN_LIMIT:
-			case CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD:
-			case CLUSTER_CR_BUILD_CANCELLED:
-			case CLUSTER_CR_BUILD_IO_ERROR:
-			case CLUSTER_CR_BUILD_PROTOCOL:
-				return true;
-			default:
-				break;
+		case CLUSTER_CR_BUILD_BAD_LOCATOR:
+		case CLUSTER_CR_BUILD_BAD_UNDO:
+		case CLUSTER_CR_BUILD_CHAIN_LIMIT:
+		case CLUSTER_CR_BUILD_SNAPSHOT_TOO_OLD:
+		case CLUSTER_CR_BUILD_CANCELLED:
+		case CLUSTER_CR_BUILD_IO_ERROR:
+		case CLUSTER_CR_BUILD_PROTOCOL:
+			return true;
+		default:
+			break;
 		}
 	}
 	return true;
@@ -2418,18 +2385,18 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 	block_data = ((const char *)payload) + sizeof(*header);
 	status = (GcsBlockReplyStatus)header->status;
 	switch (status) {
-		case GCS_BLOCK_REPLY_R4_CR_FULL:
-		case GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT:
-		case GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED:
-		case GCS_BLOCK_REPLY_R4_DENIED:
-			payload_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
-			break;
-		case GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT:
-			payload_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE
-						   + (uint32)sizeof(ClusterGcsUndoAuthTrailer);
-			break;
-		default:
-			return false;
+	case GCS_BLOCK_REPLY_R4_CR_FULL:
+	case GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT:
+	case GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED:
+	case GCS_BLOCK_REPLY_R4_DENIED:
+		payload_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+		break;
+	case GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT:
+		payload_size
+			= GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE + (uint32)sizeof(ClusterGcsUndoAuthTrailer);
+		break;
+	default:
+		return false;
 	}
 	if (env->payload_length != payload_size || header->request_id != expected->request_id
 		|| header->epoch != expected->epoch
@@ -2437,8 +2404,7 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 		|| header->transition_id != expected->transition_id
 		|| expected->transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| header->sender_node != expected->sender_node
-		|| GcsBlockReplyHeaderGetForwardingMasterNode(header)
-			   != expected->forwarding_master_node
+		|| GcsBlockReplyHeaderGetForwardingMasterNode(header) != expected->forwarding_master_node
 		|| header->checksum != gcs_block_compute_checksum(block_data))
 		return false;
 	if (status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
@@ -2455,10 +2421,8 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 	if (status == GCS_BLOCK_REPLY_R4_CR_FULL)
 		return expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
 	if (status == GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT)
-		return expected->forwarding_master_node
-				   == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
-			   && expected->requester_backend_id > 0
-			   && header->page_lsn != 0;
+		return expected->forwarding_master_node == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+			   && expected->requester_backend_id > 0 && header->page_lsn != 0;
 	if (status == GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
 		if (expected->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT
 			|| expected->forwarding_master_node != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
@@ -2481,9 +2445,9 @@ gcs_block_decode_r4_reply_payload(const ClusterICEnvelope *env, const void *payl
 static bool
 gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 							 const ClusterR4CrRequestPayload *request,
-							 uint32 requester_capability_generation,
-							 ClusterCrBuildResult result, ClusterCrBuildReason reason,
-							 bool admitted_forward, int32 current_master_node)
+							 uint32 requester_capability_generation, ClusterCrBuildResult result,
+							 ClusterCrBuildReason reason, bool admitted_forward,
+							 int32 current_master_node)
 {
 	GcsBlockReplyHeader header;
 	GcsBlockReplyStatus status;
@@ -2506,8 +2470,7 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 		&& reason == CLUSTER_CR_BUILD_WRONG_MASTER && current_master_node >= 0
 		&& current_master_node < CLUSTER_MAX_NODES)
 		header.page_lsn = (uint64)(uint32)(current_master_node + 1);
-	GcsBlockReplyHeaderSetForwardingMasterNode(
-		&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 		worker_id, env->source_node_id, &header, R4_CR_REQUIRED_HELLO_CAPS,
 		requester_capability_generation);
@@ -2519,17 +2482,14 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
  * is intentionally distinct from the D3 master-refusal shape above.
  */
 static bool
-gcs_block_r4_publish_holder_refusal(int worker_id,
-								const ClusterR4CrForwardPayload *forward,
-								uint32 requester_capability_generation,
-								ClusterCrBuildResult result,
-								ClusterCrBuildReason reason)
+gcs_block_r4_publish_holder_refusal(int worker_id, const ClusterR4CrForwardPayload *forward,
+									uint32 requester_capability_generation,
+									ClusterCrBuildResult result, ClusterCrBuildReason reason)
 {
 	GcsBlockReplyHeader header;
 	GcsBlockReplyStatus status;
 
-	if (forward == NULL
-		|| !gcs_block_r4_refusal_status_for_build(result, reason, true, &status))
+	if (forward == NULL || !gcs_block_r4_refusal_status_for_build(result, reason, true, &status))
 		return true;
 	cluster_r4_observe_refusal(CLUSTER_R4_REFUSAL_HOLDER_ADMISSION, reason, &forward->base.tag,
 							   forward->base.request_id, forward->base.epoch,
@@ -2550,8 +2510,8 @@ gcs_block_r4_publish_holder_refusal(int worker_id,
 
 static bool
 gcs_block_r4_request_base_valid(const ClusterICEnvelope *env,
-								const ClusterR4CrRequestPayload *request,
-								uint64 current_epoch, SCN *read_scn_out)
+								const ClusterR4CrRequestPayload *request, uint64 current_epoch,
+								SCN *read_scn_out)
 {
 	int i;
 
@@ -2562,8 +2522,8 @@ gcs_block_r4_request_base_valid(const ClusterICEnvelope *env,
 		|| env->payload_length != sizeof(*request)
 		|| env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| env->dest_node_id != (uint32)cluster_node_id
-		|| request->base.sender_node != (int32)env->source_node_id
-		|| request->base.request_id == 0 || request->base.requester_backend_id <= 0
+		|| request->base.sender_node != (int32)env->source_node_id || request->base.request_id == 0
+		|| request->base.requester_backend_id <= 0
 		|| request->base.requester_backend_id > MaxBackends
 		|| request->base.transition_id != (uint8)PCM_TRANS_N_TO_S
 		|| request->base.epoch != env->epoch || request->base.epoch != current_epoch
@@ -2581,8 +2541,8 @@ gcs_block_r4_request_base_valid(const ClusterICEnvelope *env,
  * send publication and final recheck. */
 ClusterCrBuildResult
 cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
-							   const ClusterR4CrRequestPayload *request,
-							   ClusterCrBuildReason *reason_out)
+							  const ClusterR4CrRequestPayload *request,
+							  ClusterCrBuildReason *reason_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -2622,35 +2582,33 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 
 	if (!requester_is_local
 		&& !cluster_sf_peer_capability_family_sample(
-			(int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS,
-			PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &requester_done_capable,
-			&requester_capability_generation)) {
+			(int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS, PGRAC_IC_HELLO_CAP_GCS_DONE_V1,
+			&requester_done_capable, &requester_capability_generation)) {
 		*reason_out = CLUSTER_CR_BUILD_TARGET_DISABLED;
 		return CLUSTER_CR_BUILD_RETRYABLE;
 	}
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		reason = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
 					 ? CLUSTER_CR_BUILD_TARGET_DISABLED
 					 : CLUSTER_CR_BUILD_RF_DEFERRED;
 		result = cluster_cr_build_result_for_reason(reason);
-		(void)gcs_block_r4_publish_refusal(
-			dedup_worker_id, env, request, requester_capability_generation, result, reason,
-			false, -1);
+		(void)gcs_block_r4_publish_refusal(dedup_worker_id, env, request,
+										   requester_capability_generation, result, reason, false,
+										   -1);
 		*reason_out = reason;
 		return result;
 	}
 
 	PG_TRY();
 	{
-		if (requester_is_local
-			? !gcs_block_r4_local_compiled_capability_matches(
-				  &admission, R4_CR_REQUIRED_HELLO_CAPS,
-				  PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &requester_done_capable)
-			: !cluster_semantic_activation_peer_open_matches(
-				  &admission, (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS,
-				  requester_capability_generation)) {
+		if (requester_is_local ? !gcs_block_r4_local_compiled_capability_matches(
+									 &admission, R4_CR_REQUIRED_HELLO_CAPS,
+									 PGRAC_IC_HELLO_CAP_GCS_DONE_V1, &requester_done_capable)
+							   : !cluster_semantic_activation_peer_open_matches(
+									 &admission, (int32)env->source_node_id,
+									 R4_CR_REQUIRED_HELLO_CAPS, requester_capability_generation)) {
 			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
 			goto done;
 		}
@@ -2671,27 +2629,24 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 			goto done;
 		}
 		if (!cluster_pcm_lock_r4_route_snapshot(request->base.tag, &authority,
-												&master_authority_generation,
-												&expected_page_scn)) {
+												&master_authority_generation, &expected_page_scn)) {
 			reason = CLUSTER_CR_BUILD_NO_HOLDER;
 			goto done;
 		}
-		reason = cluster_r4_route_policy_classify(&authority, current_epoch,
-											  master_authority_generation,
-											  &current_holder_node);
+		reason = cluster_r4_route_policy_classify(
+			&authority, current_epoch, master_authority_generation, &current_holder_node);
 		if (reason != CLUSTER_CR_BUILD_NONE)
 			goto done;
 
 		holder_is_local = current_holder_node == cluster_node_id;
-		if (holder_is_local
-			? !gcs_block_r4_local_compiled_capability_matches(
-				  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0, &holder_optional)
-			: (!cluster_sf_peer_capability_family_sample(
-				   current_holder_node, R4_CR_REQUIRED_HELLO_CAPS, 0, &holder_optional,
-				   &holder_capability_generation)
-			   || !cluster_semantic_activation_peer_open_matches(
-					   &admission, current_holder_node, R4_CR_REQUIRED_HELLO_CAPS,
-					   holder_capability_generation))) {
+		if (holder_is_local ? !gcs_block_r4_local_compiled_capability_matches(
+								  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0, &holder_optional)
+							: (!cluster_sf_peer_capability_family_sample(
+								   current_holder_node, R4_CR_REQUIRED_HELLO_CAPS, 0,
+								   &holder_optional, &holder_capability_generation)
+							   || !cluster_semantic_activation_peer_open_matches(
+								   &admission, current_holder_node, R4_CR_REQUIRED_HELLO_CAPS,
+								   holder_capability_generation))) {
 			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
 			goto done;
 		}
@@ -2717,8 +2672,7 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 		fresh_proof.selected_holder_node = current_holder_node;
 
 		if (dedup_worker_id < 0 || dedup_worker_id >= cluster_lms_workers
-			|| cluster_lms_shard_for_tag(&identity.tag, cluster_lms_workers)
-				   != dedup_worker_id) {
+			|| cluster_lms_shard_for_tag(&identity.tag, cluster_lms_workers) != dedup_worker_id) {
 			reason = CLUSTER_CR_BUILD_PROTOCOL;
 			goto done;
 		}
@@ -2728,15 +2682,14 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 			&stored_record);
 		if (arm_result != GCS_BLOCK_R4_ROUTE_ARM_NEW
 			&& arm_result != GCS_BLOCK_R4_ROUTE_ARM_REPLAY) {
-			reason = arm_result == GCS_BLOCK_R4_ROUTE_ARM_FULL ? CLUSTER_CR_BUILD_CAPACITY
-					 : arm_result == GCS_BLOCK_R4_ROUTE_ARM_INVALID
-					 ? CLUSTER_CR_BUILD_PROTOCOL
-					 : CLUSTER_CR_BUILD_HOLDER_MOVED;
+			reason = arm_result == GCS_BLOCK_R4_ROUTE_ARM_FULL		? CLUSTER_CR_BUILD_CAPACITY
+					 : arm_result == GCS_BLOCK_R4_ROUTE_ARM_INVALID ? CLUSTER_CR_BUILD_PROTOCOL
+																	: CLUSTER_CR_BUILD_HOLDER_MOVED;
 			goto done;
 		}
 		if (arm_result == GCS_BLOCK_R4_ROUTE_ARM_NEW)
-			cluster_r4_observe(CLUSTER_R4_EVENT_CR_ROUTE_STARTED,
-						   CLUSTER_TX_RESOLVE_NONE, CLUSTER_CR_BUILD_NONE);
+			cluster_r4_observe(CLUSTER_R4_EVENT_CR_ROUTE_STARTED, CLUSTER_TX_RESOLVE_NONE,
+							   CLUSTER_CR_BUILD_NONE);
 
 		memset(&forward, 0, sizeof(forward));
 		forward.base.request_id = identity.legacy_key.request_id;
@@ -2747,18 +2700,18 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 		forward.base.master_node = stored_record.proof.real_master_node;
 		forward.base.transition_id = (uint8)PCM_TRANS_N_TO_S;
 		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&forward.base,
-												 stored_record.proof.read_scn);
+														stored_record.proof.read_scn);
 		GcsBlockForwardPayloadSetCrRequest(&forward.base, true);
-		ClusterR4ForwardExtensionSetCrProof(
-			&forward.extension, stored_record.proof.master_authority_generation,
-			stored_record.proof.master_resource_transition_count,
-			stored_record.proof.expected_page_scn);
+		ClusterR4ForwardExtensionSetCrProof(&forward.extension,
+											stored_record.proof.master_authority_generation,
+											stored_record.proof.master_resource_transition_count,
+											stored_record.proof.expected_page_scn);
 		if (holder_is_local) {
 			ClusterICSendResult local_send_result;
 
 			local_send_result = gcs_block_send_envelope_or_loopback(
-				PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-				stored_record.proof.selected_holder_node, &forward, sizeof(forward));
+				PGRAC_IC_MSG_GCS_BLOCK_FORWARD, stored_record.proof.selected_holder_node, &forward,
+				sizeof(forward));
 			outbound_admitted = local_send_result == CLUSTER_IC_SEND_DONE;
 		} else
 			outbound_admitted = cluster_lms_outbound_enqueue_cap_bound(
@@ -2769,24 +2722,22 @@ cluster_gcs_block_r4_route_cr(const ClusterICEnvelope *env,
 			dedup_worker_id, &identity, (uint8)PCM_TRANS_N_TO_S, &stored_record.proof,
 			outbound_admitted);
 		if (!outbound_admitted || send_result != GCS_BLOCK_R4_ROUTE_SEND_FORWARDED) {
-			reason = send_result == GCS_BLOCK_R4_ROUTE_SEND_INVALID
-						 ? CLUSTER_CR_BUILD_PROTOCOL
-						 : CLUSTER_CR_BUILD_HOLDER_MOVED;
+			reason = send_result == GCS_BLOCK_R4_ROUTE_SEND_INVALID ? CLUSTER_CR_BUILD_PROTOCOL
+																	: CLUSTER_CR_BUILD_HOLDER_MOVED;
 			goto done;
 		}
 		reason = CLUSTER_CR_BUILD_NONE;
 
-done:
+	done:
 		final_recheck_ok = cluster_semantic_activation_recheck(&admission);
 		if (!final_recheck_ok && reason == CLUSTER_CR_BUILD_NONE)
 			reason = CLUSTER_CR_BUILD_RF_DEFERRED;
 		result = cluster_cr_build_result_for_reason(reason);
-		admitted_forward = final_recheck_ok && reason == CLUSTER_CR_BUILD_NONE
-						   && outbound_admitted
+		admitted_forward = final_recheck_ok && reason == CLUSTER_CR_BUILD_NONE && outbound_admitted
 						   && send_result == GCS_BLOCK_R4_ROUTE_SEND_FORWARDED;
-		(void)gcs_block_r4_publish_refusal(
-			dedup_worker_id, env, request, requester_capability_generation, result, reason,
-			admitted_forward, real_master_node);
+		(void)gcs_block_r4_publish_refusal(dedup_worker_id, env, request,
+										   requester_capability_generation, result, reason,
+										   admitted_forward, real_master_node);
 	}
 	PG_FINALLY();
 	{
@@ -2806,8 +2757,7 @@ gcs_block_try_r4_request80(const ClusterICEnvelope *env, const void *payload)
 	if (env == NULL || payload == NULL || env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REQUEST
 		|| env->payload_length != sizeof(ClusterR4CrRequestPayload))
 		return false;
-	(void)cluster_gcs_block_r4_route_cr(
-		env, (const ClusterR4CrRequestPayload *)payload, &reason);
+	(void)cluster_gcs_block_r4_route_cr(env, (const ClusterR4CrRequestPayload *)payload, &reason);
 	return true;
 }
 
@@ -2841,43 +2791,37 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 			|| forward->extension.r4_kind == (uint8)CLUSTER_R4_WIRE_UNDO_DATA_FETCH))
 		return gcs_block_r4_tx_origin_try_accept(env, forward);
 	memset(&admission, 0, sizeof(admission));
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1, CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return true;
 
 	PG_TRY();
 	{
 		master_is_local = (int32)env->source_node_id == cluster_node_id;
-		requester_is_local
-			= forward->base.original_requester_node == cluster_node_id;
-		if (master_is_local
-				? !gcs_block_r4_local_capability_generation(
-					  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0,
-					  &master_optional_supported, &master_capability_generation)
-				: !cluster_sf_peer_capability_family_sample(
-					  (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS, 0,
-					  &master_optional_supported, &master_capability_generation))
+		requester_is_local = forward->base.original_requester_node == cluster_node_id;
+		if (master_is_local ? !gcs_block_r4_local_capability_generation(
+								  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0,
+								  &master_optional_supported, &master_capability_generation)
+							: !cluster_sf_peer_capability_family_sample(
+								  (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS, 0,
+								  &master_optional_supported, &master_capability_generation))
 			goto done;
 		if (requester_is_local
-				? !gcs_block_r4_local_capability_generation(
-					  &admission, R4_CR_REQUIRED_HELLO_CAPS, 0,
-					  &requester_optional_supported,
-					  &requester_capability_generation)
+				? !gcs_block_r4_local_capability_generation(&admission, R4_CR_REQUIRED_HELLO_CAPS,
+															0, &requester_optional_supported,
+															&requester_capability_generation)
 				: (!cluster_sf_peer_capability_family_sample(
-					   forward->base.original_requester_node,
-					   R4_CR_REQUIRED_HELLO_CAPS, 0,
-					   &requester_optional_supported,
-					   &requester_capability_generation)))
+					  forward->base.original_requester_node, R4_CR_REQUIRED_HELLO_CAPS, 0,
+					  &requester_optional_supported, &requester_capability_generation)))
 			goto done;
 		if ((!master_is_local
 			 && !cluster_semantic_activation_peer_open_matches(
-				 &admission, (int32)env->source_node_id,
-				 R4_CR_REQUIRED_HELLO_CAPS, master_capability_generation))
+				 &admission, (int32)env->source_node_id, R4_CR_REQUIRED_HELLO_CAPS,
+				 master_capability_generation))
 			|| (!requester_is_local
 				&& !cluster_semantic_activation_peer_open_matches(
-					&admission, forward->base.original_requester_node,
-					R4_CR_REQUIRED_HELLO_CAPS,
+					&admission, forward->base.original_requester_node, R4_CR_REQUIRED_HELLO_CAPS,
 					requester_capability_generation)))
 			goto done;
 		if (env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
@@ -2885,8 +2829,7 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 			|| forward->base.original_requester_node < 0
 			|| forward->base.original_requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 			|| forward->base.requester_backend_id <= 0
-			|| forward->base.requester_backend_id > MaxBackends
-			|| forward->base.request_id == 0
+			|| forward->base.requester_backend_id > MaxBackends || forward->base.request_id == 0
 			|| forward->base.transition_id != (uint8)PCM_TRANS_N_TO_S
 			|| forward->base.epoch != env->epoch
 			|| forward->base.epoch != cluster_epoch_get_current()
@@ -2902,18 +2845,16 @@ gcs_block_try_r4_forward96(const ClusterICEnvelope *env, const void *payload)
 				&master_resource_transition_count, &expected_page_scn))
 			goto done;
 
-		submit_result = cluster_lms_cr_submit_r4(
-			forward, &admission, requester_capability_generation,
-			master_capability_generation, &submit_reason);
+		submit_result
+			= cluster_lms_cr_submit_r4(forward, &admission, requester_capability_generation,
+									   master_capability_generation, &submit_reason);
 		if (!cluster_semantic_activation_recheck(&admission))
 			goto done;
 		worker_id = cluster_ic_tier1_my_data_channel();
 		(void)gcs_block_r4_publish_holder_refusal(
-			worker_id, forward, requester_capability_generation, submit_result,
-			submit_reason);
+			worker_id, forward, requester_capability_generation, submit_result, submit_reason);
 
-done:
-		;
+	done:;
 	}
 	PG_FINALLY();
 	{
@@ -2955,19 +2896,19 @@ cluster_gcs_block_test_r4_tx_origin_drain(void)
 }
 
 bool
-cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result,
-									 ClusterCrBuildReason reason, bool admitted_forward,
-									 GcsBlockReplyStatus *status_out)
+cluster_gcs_block_test_r4_refusal_status(ClusterCrBuildResult result, ClusterCrBuildReason reason,
+										 bool admitted_forward, GcsBlockReplyStatus *status_out)
 {
 	return gcs_block_r4_refusal_status_for_build(result, reason, admitted_forward, status_out);
 }
 
 bool
-cluster_gcs_block_test_decode_r4_reply(
-	const ClusterICEnvelope *env, const void *payload, uint64 expected_request_id,
-	uint64 expected_epoch, int32 expected_requester_backend_id, uint8 expected_transition_id,
-	int32 expected_sender_node, int32 expected_forwarding_master_node,
-	uint8 expected_reply_domain)
+cluster_gcs_block_test_decode_r4_reply(const ClusterICEnvelope *env, const void *payload,
+									   uint64 expected_request_id, uint64 expected_epoch,
+									   int32 expected_requester_backend_id,
+									   uint8 expected_transition_id, int32 expected_sender_node,
+									   int32 expected_forwarding_master_node,
+									   uint8 expected_reply_domain)
 {
 	GcsBlockR4ReplyExpectation expected;
 
@@ -2991,10 +2932,8 @@ static ClusterGcsBlockBackendBlock cluster_gcs_block_test_reply_backend;
 static void
 gcs_block_test_reset_r4_reply_table(uint64 next_sequence)
 {
-	memset(&cluster_gcs_block_test_reply_shared, 0,
-		   sizeof(cluster_gcs_block_test_reply_shared));
-	memset(&cluster_gcs_block_test_reply_backend, 0,
-		   sizeof(cluster_gcs_block_test_reply_backend));
+	memset(&cluster_gcs_block_test_reply_shared, 0, sizeof(cluster_gcs_block_test_reply_shared));
+	memset(&cluster_gcs_block_test_reply_backend, 0, sizeof(cluster_gcs_block_test_reply_backend));
 	pg_atomic_init_u64(&cluster_gcs_block_test_reply_shared.stale_reply_drop_count, 0);
 	cluster_gcs_block_test_reply_backend.next_request_id = next_sequence;
 	ClusterGcsBlock = &cluster_gcs_block_test_reply_shared;
@@ -3004,8 +2943,7 @@ gcs_block_test_reset_r4_reply_table(uint64 next_sequence)
 
 bool
 cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id, uint64 request_epoch,
-										 int32 requester_backend_id,
-										 uint8 transition_id,
+										 int32 requester_backend_id, uint8 transition_id,
 										 int32 expected_master_node)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
@@ -3026,11 +2964,9 @@ cluster_gcs_block_test_arm_r4_reply_slot(uint64 request_id, uint64 request_epoch
 }
 
 bool
-cluster_gcs_block_test_arm_legacy_reply_slot(uint64 request_id,
-											uint64 request_epoch,
-											int32 requester_backend_id,
-											uint8 transition_id,
-											int32 expected_master_node)
+cluster_gcs_block_test_arm_legacy_reply_slot(uint64 request_id, uint64 request_epoch,
+											 int32 requester_backend_id, uint8 transition_id,
+											 int32 expected_master_node)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 
@@ -3051,28 +2987,29 @@ cluster_gcs_block_test_arm_legacy_reply_slot(uint64 request_id,
 
 bool
 cluster_gcs_block_test_r4_requester_arm(BufferTag tag, uint64 request_epoch,
-										int32 expected_master_node,
-										uint64 next_sequence, uint64 *request_id_out)
+										int32 expected_master_node, uint64 next_sequence,
+										uint64 *request_id_out)
 {
 	gcs_block_test_reset_r4_reply_table(next_sequence);
-	cluster_gcs_block_test_requester_slot = gcs_block_try_reserve_r4_slot(
-		tag, request_epoch, expected_master_node, request_id_out);
+	cluster_gcs_block_test_requester_slot
+		= gcs_block_try_reserve_r4_slot(tag, request_epoch, expected_master_node, request_id_out);
 	return cluster_gcs_block_test_requester_slot != NULL;
 }
 
 bool
-cluster_gcs_block_test_snapshot_r4_requester_slot(
-	bool *in_use_out, uint8 *reply_domain_out, uint64 *request_id_out,
-	uint8 *transition_id_out, BufferTag *tag_out, uint64 *request_epoch_out,
-	int32 *expected_master_node_out, ClusterGcsBlockDirectState *direct_state_out,
-	bool *direct_target_prepared_out)
+cluster_gcs_block_test_snapshot_r4_requester_slot(bool *in_use_out, uint8 *reply_domain_out,
+												  uint64 *request_id_out, uint8 *transition_id_out,
+												  BufferTag *tag_out, uint64 *request_epoch_out,
+												  int32 *expected_master_node_out,
+												  ClusterGcsBlockDirectState *direct_state_out,
+												  bool *direct_target_prepared_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot = cluster_gcs_block_test_requester_slot;
 
-	if (slot == NULL || in_use_out == NULL || reply_domain_out == NULL
-		|| request_id_out == NULL || transition_id_out == NULL || tag_out == NULL
-		|| request_epoch_out == NULL || expected_master_node_out == NULL
-		|| direct_state_out == NULL || direct_target_prepared_out == NULL)
+	if (slot == NULL || in_use_out == NULL || reply_domain_out == NULL || request_id_out == NULL
+		|| transition_id_out == NULL || tag_out == NULL || request_epoch_out == NULL
+		|| expected_master_node_out == NULL || direct_state_out == NULL
+		|| direct_target_prepared_out == NULL)
 		return false;
 	*in_use_out = slot->in_use;
 	*reply_domain_out = slot->reply_domain;
@@ -3096,8 +3033,7 @@ cluster_gcs_block_test_release_r4_requester_slot(void)
 }
 
 bool
-cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
-										 int32 real_master_node,
+cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn, int32 real_master_node,
 										 char dst_page[GCS_BLOCK_DATA_SIZE])
 {
 	ClusterCrBuildReason reason;
@@ -3110,15 +3046,14 @@ cluster_gcs_block_test_r4_fetch_and_wait(BufferTag tag, SCN read_scn,
 
 bool
 cluster_gcs_block_test_snapshot_r4_reply_slot(GcsBlockReplyHeader *header_out,
-										  char block_out[GCS_BLOCK_DATA_SIZE],
-										  bool *reply_received_out,
-										  uint64 *stale_drop_count_out)
+											  char block_out[GCS_BLOCK_DATA_SIZE],
+											  bool *reply_received_out,
+											  uint64 *stale_drop_count_out)
 {
-	ClusterGcsBlockOutstandingSlot *slot
-		= &cluster_gcs_block_test_reply_backend.slots[0];
+	ClusterGcsBlockOutstandingSlot *slot = &cluster_gcs_block_test_reply_backend.slots[0];
 
-	if (!slot->in_use || header_out == NULL || block_out == NULL
-		|| reply_received_out == NULL || stale_drop_count_out == NULL)
+	if (!slot->in_use || header_out == NULL || block_out == NULL || reply_received_out == NULL
+		|| stale_drop_count_out == NULL)
 		return false;
 	*header_out = slot->reply_header;
 	memcpy(block_out, slot->reply_block_data, GCS_BLOCK_DATA_SIZE);
@@ -3224,13 +3159,11 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 								  cluster_node_id)));
-	if (cluster_authority_readiness_managed()
-		&& !cluster_serving_ready_is_current()) {
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
-				 errmsg("GCS block service is not serving-ready"),
-				 errhint("Complete StartupXLOG and publish SERVING_READY before "
-						 "requesting cache-fusion data.")));
+	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_LMS_UNAVAILABLE),
+						errmsg("GCS block service is not serving-ready"),
+						errhint("Complete StartupXLOG and publish SERVING_READY before "
+								"requesting cache-fusion data.")));
 		return false;
 	}
 
@@ -3733,17 +3666,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			if (final_status != GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
 				awaiting_holder_refusal_master_cleanup = false;
 			if (final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER)
-				ereport(LOG,
-						(errmsg_internal("GCS holder refusal classification diagnostic"),
-						 errdetail("requester=%d request_id=%llu retry=%d/%d "
-								   "master=%d forwarding_master=%d direct_denial=%u "
-								   "transition=%u",
-								   cluster_node_id,
-								   (unsigned long long)request_id,
-								   retry_attempt, max_retries, current_master,
-								   final_forwarding_master,
-								   direct_authoritative_denial ? 1U : 0U,
-								   (unsigned)transition_id)));
+				ereport(LOG, (errmsg_internal("GCS holder refusal classification diagnostic"),
+							  errdetail(
+								  "requester=%d request_id=%llu retry=%d/%d "
+								  "master=%d forwarding_master=%d direct_denial=%u "
+								  "transition=%u",
+								  cluster_node_id, (unsigned long long)request_id, retry_attempt,
+								  max_retries, current_master, final_forwarding_master,
+								  direct_authoritative_denial ? 1U : 0U, (unsigned)transition_id)));
 			/* A direct master FULL precedes registration and any grant.  Only
 			 * this ordinary read can return to bufmgr's exact-abort/yield/rearm
 			 * owner.  It has no dedup entry to complete and publishes no bytes. */
@@ -3804,8 +3734,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			 * close this request identity and let bufmgr exact-abort/rearm its
 			 * GRANT_PENDING reservation before issuing a fresh request. */
 			if (gcs_block_forwarded_s_refusal_requires_fresh_retry(
-					(GcsBlockReplyStatus)final_status, transition_id,
-					final_forwarding_master)) {
+					(GcsBlockReplyStatus)final_status, transition_id, final_forwarding_master)) {
 				awaiting_holder_refusal_master_cleanup = false;
 				retry_denied = true;
 				break;
@@ -3815,10 +3744,9 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			 * marker.  Its one direct cleanup response is part of the same exact
 			 * retry round; a second direct response remains terminal. */
 			if (final_status == GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER
-				&& gcs_block_holder_refusal_retry_exact(
-					final_forwarding_master,
-					&awaiting_holder_refusal_master_cleanup,
-					retry_attempt, max_retries)) {
+				&& gcs_block_holder_refusal_retry_exact(final_forwarding_master,
+														&awaiting_holder_refusal_master_cleanup,
+														retry_attempt, max_retries)) {
 				current_master = cluster_gcs_lookup_master(tag);
 				continue;
 			}
@@ -4170,8 +4098,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 
 bool
 cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
-											 bool force_one_shot,
-											 bool *out_retry_denied)
+											 bool force_one_shot, bool *out_retry_denied)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -4215,8 +4142,7 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 		*out_retry_denied = true;
 		return false;
 	}
-	image_only = force_one_shot
-				 || cluster_gcs_block_resource_x_local_s_barrier_active(tag);
+	image_only = force_one_shot || cluster_gcs_block_resource_x_local_s_barrier_active(tag);
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	/* expected_master == self:  the holder's reply carries forwarding_master =
 	 * self, which the HC108 authorized chain validates against this slot. */
@@ -4365,8 +4291,8 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 					if (slot->reply_header.status
 						== (uint8)GCS_BLOCK_REPLY_S_GRANTED_XHOLDER_DOWNGRADE) {
 						if (!image_only
-							&& cluster_pcm_lock_apply_gcs_transition(
-								tag, PCM_TRANS_N_TO_S, cluster_node_id))
+							&& cluster_pcm_lock_apply_gcs_transition(tag, PCM_TRANS_N_TO_S,
+																	 cluster_node_id))
 							durable_s = true;
 						else
 							cluster_lever_a_note_remote_ack_degraded();
@@ -4383,8 +4309,7 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 			 * GRANT_PENDING identity: return the denial to bufmgr, whose outer
 			 * boundary exact-aborts the reservation and rearms a fresh token and
 			 * request identity under the original deadline. */
-			if (got_reply
-				&& slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X) {
+			if (got_reply && slot->reply_header.status == (uint8)GCS_BLOCK_REPLY_DENIED_PENDING_X) {
 				*out_retry_denied = true;
 				break;
 			}
@@ -4455,10 +4380,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
  * closes that attempt before a bounded fresh-id retry; status 26 closes the
  * operation without retry or caller-page mutation. */
 ClusterMxDescribeResult
-cluster_gcs_current_mx_describe_fetch_and_wait(
-	int32 origin_node, const ClusterCurrentMxKey *key,
-	ClusterCurrentMxMemberDesc *members, uint16 members_cap,
-	uint16 *members_count, uint32 *reported_total_members)
+cluster_gcs_current_mx_describe_fetch_and_wait(int32 origin_node, const ClusterCurrentMxKey *key,
+											   ClusterCurrentMxMemberDesc *members,
+											   uint16 members_cap, uint16 *members_count,
+											   uint32 *reported_total_members)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	ClusterCurrentMxDescribeForwardV2 request;
@@ -4480,22 +4405,19 @@ cluster_gcs_current_mx_describe_fetch_and_wait(
 	if (reported_total_members != NULL)
 		*reported_total_members = 0;
 	request_epoch = cluster_epoch_get_current();
-	if (key == NULL || members == NULL || members_count == NULL
-		|| reported_total_members == NULL || origin_node < 0
-		|| origin_node == cluster_node_id || origin_node >= CLUSTER_MAX_NODES
-		|| key->origin_node_id != (uint16)origin_node
-		|| key->cluster_epoch != request_epoch
-		|| !MultiXactIdIsValid(key->multixact_id)
-		|| !cluster_gcs_block_family_on_data_plane())
+	if (key == NULL || members == NULL || members_count == NULL || reported_total_members == NULL
+		|| origin_node < 0 || origin_node == cluster_node_id || origin_node >= CLUSTER_MAX_NODES
+		|| key->origin_node_id != (uint16)origin_node || key->cluster_epoch != request_epoch
+		|| !MultiXactIdIsValid(key->multixact_id) || !cluster_gcs_block_family_on_data_plane())
 		return CMX_DESC_UNKNOWN;
-	if (!cluster_sf_peer_multixact_current_capability_generation(
-			origin_node, &capability_generation))
+	if (!cluster_sf_peer_multixact_current_capability_generation(origin_node,
+																 &capability_generation))
 		return CMX_DESC_UNKNOWN;
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
-	slot = gcs_block_try_reserve_current_mx_slot(
-		key, request_epoch, origin_node,
-		(uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT, &request_id);
+	slot = gcs_block_try_reserve_current_mx_slot(key, request_epoch, origin_node,
+												 (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT,
+												 &request_id);
 	if (slot == NULL)
 		return CMX_DESC_UNKNOWN;
 
@@ -4515,20 +4437,17 @@ cluster_gcs_current_mx_describe_fetch_and_wait(
 		request.trailer.version = CLUSTER_CURRENT_MX_WIRE_VERSION;
 		request.trailer.flags = CLUSTER_CURRENT_MX_WIRE_FLAGS_NONE;
 
-		route_tag = GcsBlockCurrentMxRouteTagMake(
-			request_id, request_epoch, cluster_node_id, (int32)MyBackendId);
+		route_tag = GcsBlockCurrentMxRouteTagMake(request_id, request_epoch, cluster_node_id,
+												  (int32)MyBackendId);
 		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 		if (worker_id < 0
 			|| !cluster_lms_outbound_enqueue_cap_bound(
-				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-				(uint32)origin_node, &request, sizeof(request),
-				PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
-				capability_generation))
+				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, &request,
+				sizeof(request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1, capability_generation))
 			goto describe_done;
 
 		deadline = GetCurrentTimestamp()
-				   + ((TimestampTz)cluster_gcs_reply_timeout_ms)
-						 * (TimestampTz)1000;
+				   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
 		ConditionVariablePrepareToSleep(&slot->reply_cv);
 		for (;;) {
 			TimestampTz now;
@@ -4551,9 +4470,8 @@ cluster_gcs_current_mx_describe_fetch_and_wait(
 			timeout_ms = (long)((deadline - now) / 1000);
 			if (timeout_ms <= 0)
 				timeout_ms = 1;
-			(void)ConditionVariableTimedSleep(
-				&slot->reply_cv, timeout_ms,
-				WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 		}
 		ConditionVariableCancelSleep();
 
@@ -4564,33 +4482,27 @@ cluster_gcs_current_mx_describe_fetch_and_wait(
 
 		reply_header = slot->reply_header;
 		memcpy(&reply_page, slot->reply_block_data, sizeof(reply_page));
-		if (reply_header.status
-				!= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
-			|| reply_header.sender_node != origin_node
-			|| reply_header.request_id != request_id
+		if (reply_header.status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+			|| reply_header.sender_node != origin_node || reply_header.request_id != request_id
 			|| reply_header.epoch != request_epoch
 			|| reply_header.requester_backend_id != (int32)MyBackendId
 			|| reply_header.transition_id != 0 || reply_header.page_lsn != 0
 			|| GcsBlockReplyHeaderGetForwardingMasterNode(&reply_header)
 				   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
 			|| reply_header.checksum
-				   != cluster_gcs_block_compute_checksum(
-					  (const char *)&reply_page)
+				   != cluster_gcs_block_compute_checksum((const char *)&reply_page)
 			|| cluster_epoch_get_current() != request_epoch) {
 			result = CMX_DESC_UNKNOWN;
 			goto describe_done;
 		}
 
 		result = cluster_multixact_current_wire_validate_describe_reply(
-			&reply_page, sizeof(reply_page), origin_node, request_epoch,
-			request_id, key, members, members_cap, members_count,
-			reported_total_members);
+			&reply_page, sizeof(reply_page), origin_node, request_epoch, request_id, key, members,
+			members_cap, members_count, reported_total_members);
 		if (result == CMX_DESC_OK)
-			gcs_block_stamp_touched(
-				origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+			gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 
-describe_done:
-		;
+	describe_done:;
 	}
 	PG_CATCH();
 	{
@@ -4605,9 +4517,8 @@ describe_done:
 
 ClusterMxResolveResult
 cluster_gcs_current_mx_member_proof_fetch_and_wait(
-	int32 origin_node, ClusterCurrentMxProofForwardV2 *request,
-	ClusterCurrentMemberProof *proofs, uint16 proofs_cap,
-	uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof,
+	int32 origin_node, ClusterCurrentMxProofForwardV2 *request, ClusterCurrentMemberProof *proofs,
+	uint16 proofs_cap, uint16 *proof_count, ClusterCurrentUpdaterProof *updater_proof,
 	uint32 *requester_capability_generation_out, TimestampTz deadline)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
@@ -4638,8 +4549,7 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	if (requester_capability_generation_out != NULL)
 		*requester_capability_generation_out = 0;
 	request_epoch = cluster_epoch_get_current();
-	if (request == NULL || proofs == NULL || proof_count == NULL
-		|| updater_proof == NULL
+	if (request == NULL || proofs == NULL || proof_count == NULL || updater_proof == NULL
 		|| requester_capability_generation_out == NULL || origin_node < 0
 		|| origin_node == cluster_node_id || origin_node >= CLUSTER_MAX_NODES
 		|| !cluster_gcs_block_family_on_data_plane())
@@ -4650,17 +4560,15 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 	request->prefix.original_requester_node = cluster_node_id;
 	request->prefix.requester_backend_id = (int32)MyBackendId;
 	if (!cluster_multixact_current_wire_validate_proof_forward(
-			request, sizeof(*request), cluster_node_id, origin_node,
-			request_epoch, &decoded)
-		|| !cluster_sf_peer_multixact_current_capability_generation(
-			origin_node, &capability_generation))
+			request, sizeof(*request), cluster_node_id, origin_node, request_epoch, &decoded)
+		|| !cluster_sf_peer_multixact_current_capability_generation(origin_node,
+																	&capability_generation))
 		return CMX_RESOLVE_UNKNOWN;
 
 	cluster_gcs_block_dedup_register_backend_exit_hook();
 	slot = gcs_block_try_reserve_current_mx_slot(
 		&request->prefix.mxkey, request_epoch, origin_node,
-		(uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT,
-		&request_id);
+		(uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT, &request_id);
 	if (slot == NULL)
 		return CMX_RESOLVE_UNKNOWN;
 
@@ -4670,8 +4578,7 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 
 		request->prefix.request_id = request_id;
 		if (!cluster_multixact_current_wire_validate_proof_forward(
-				request, sizeof(*request), cluster_node_id, origin_node,
-				request_epoch, &decoded))
+				request, sizeof(*request), cluster_node_id, origin_node, request_epoch, &decoded))
 			goto proof_done;
 		LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
 		if (!slot->in_use || slot->request_id != request_id) {
@@ -4682,15 +4589,13 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 		slot->expected_current_mx_proof = *request;
 		LWLockRelease(&blk->lock.lock);
 
-		route_tag = GcsBlockCurrentMxRouteTagMake(
-			request_id, request_epoch, cluster_node_id, (int32)MyBackendId);
+		route_tag = GcsBlockCurrentMxRouteTagMake(request_id, request_epoch, cluster_node_id,
+												  (int32)MyBackendId);
 		worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 		if (worker_id < 0
 			|| !cluster_lms_outbound_enqueue_cap_bound(
-				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-				(uint32)origin_node, request, sizeof(*request),
-				PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
-				capability_generation))
+				worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, request,
+				sizeof(*request), PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1, capability_generation))
 			goto proof_done;
 
 		ConditionVariablePrepareToSleep(&slot->reply_cv);
@@ -4712,12 +4617,10 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 			now = GetCurrentTimestamp();
 			if (deadline != 0 && now >= deadline)
 				break;
-			timeout_ms = deadline == 0
-				? 1000L : (long)((deadline - now) / 1000);
+			timeout_ms = deadline == 0 ? 1000L : (long)((deadline - now) / 1000);
 			timeout_ms = Max(timeout_ms, 1L);
-			(void)ConditionVariableTimedSleep(
-				&slot->reply_cv, timeout_ms,
-				WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+			(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+											  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 		}
 		ConditionVariableCancelSleep();
 		if (!got_reply) {
@@ -4727,31 +4630,26 @@ cluster_gcs_current_mx_member_proof_fetch_and_wait(
 
 		reply_header = slot->reply_header;
 		memcpy(&reply_page, slot->reply_block_data, sizeof(reply_page));
-		if (reply_header.status
-				!= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
-			|| reply_header.sender_node != origin_node
-			|| reply_header.request_id != request_id
+		if (reply_header.status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+			|| reply_header.sender_node != origin_node || reply_header.request_id != request_id
 			|| reply_header.epoch != request_epoch
 			|| reply_header.requester_backend_id != (int32)MyBackendId
 			|| reply_header.transition_id != 0 || reply_header.page_lsn != 0
 			|| GcsBlockReplyHeaderGetForwardingMasterNode(&reply_header)
 				   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
 			|| reply_header.checksum
-				   != cluster_gcs_block_compute_checksum(
-					  (const char *)&reply_page)
+				   != cluster_gcs_block_compute_checksum((const char *)&reply_page)
 			|| cluster_epoch_get_current() != request_epoch)
 			goto proof_done;
 		if (!cluster_multixact_current_wire_validate_proof_reply_frame(
-				&reply_page, sizeof(reply_page), origin_node, request_epoch,
-				request, &result, proofs, proofs_cap, proof_count,
-				updater_proof, requester_capability_generation_out))
+				&reply_page, sizeof(reply_page), origin_node, request_epoch, request, &result,
+				proofs, proofs_cap, proof_count, updater_proof,
+				requester_capability_generation_out))
 			result = CMX_RESOLVE_UNKNOWN;
 		if (result == CMX_RESOLVE_OK)
-			gcs_block_stamp_touched(
-				origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+			gcs_block_stamp_touched(origin_node, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 
-proof_done:
-		;
+	proof_done:;
 	}
 	PG_CATCH();
 	{
@@ -4861,8 +4759,7 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
-	if (dst_page == NULL || reason_out == NULL || !SCN_VALID(read_scn)
-		|| real_master_node < 0
+	if (dst_page == NULL || reason_out == NULL || !SCN_VALID(read_scn) || real_master_node < 0
 		|| real_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return CLUSTER_CR_BUILD_FAIL_CLOSED;
 	INSTR_TIME_SET_CURRENT(diagnostic.started);
@@ -4889,8 +4786,7 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 		}
 		if (diagnostic.attempts < UINT64_MAX)
 			diagnostic.attempts++;
-		slot = gcs_block_try_reserve_r4_slot(tag, request_epoch, real_master_node,
-											  &request_id);
+		slot = gcs_block_try_reserve_r4_slot(tag, request_epoch, real_master_node, &request_id);
 		if (slot == NULL) {
 			*reason_out = CLUSTER_CR_BUILD_CAPACITY;
 			return CLUSTER_CR_BUILD_RETRYABLE;
@@ -4909,10 +4805,9 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 			request.base.transition_id = (uint8)PCM_TRANS_N_TO_S;
 			GcsBlockRequestPayloadSetLifetimeHintMs(
 				&request.base,
-				cluster_gcs_block_dedup_lifetime_ms(
-					cluster_gcs_block_retransmit_initial_backoff_ms,
-					cluster_gcs_block_retransmit_max_retries,
-					cluster_gcs_reply_timeout_ms));
+				cluster_gcs_block_dedup_lifetime_ms(cluster_gcs_block_retransmit_initial_backoff_ms,
+													cluster_gcs_block_retransmit_max_retries,
+													cluster_gcs_reply_timeout_ms));
 			if (!ClusterR4RequestExtensionSetCr(&request.extension, read_scn)) {
 				invalidated = true;
 				*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
@@ -5036,8 +4931,7 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 			*reason_out = CLUSTER_CR_BUILD_NONE;
 			return CLUSTER_CR_BUILD_FULL;
 		}
-		if (got_reply
-			&& reply_status == (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED) {
+		if (got_reply && reply_status == (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED) {
 			gcs_block_r4_wait_note(&diagnostic, &tag, request_id, request_epoch, real_master_node,
 								   0);
 			gcs_block_r4_retry_backoff();
@@ -5053,10 +4947,10 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 }
 
 ClusterTxOutcome
-cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
-	int32 origin_node, const ClusterTxLocator *locator,
-	uint32 expected_physical_generation, uint64 formation_epoch,
-	ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterTxLocator *locator,
+											   uint32 expected_physical_generation,
+											   uint64 formation_epoch, ClusterTxResolution *out,
+											   ClusterTxResolveReason *reason_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot = NULL;
 	ClusterR4CrForwardPayload forward;
@@ -5083,8 +4977,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 		|| block_no == 0 || uba_origin_node_id(locator->uba) != (NodeId)origin_node)
 		return CLUSTER_TX_UNKNOWN;
 	tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
-	slot = gcs_block_try_reserve_r4_slot(
-		tag, formation_epoch, origin_node, &request_id);
+	slot = gcs_block_try_reserve_r4_slot(tag, formation_epoch, origin_node, &request_id);
 	if (slot == NULL)
 		return CLUSTER_TX_UNKNOWN;
 
@@ -5098,12 +4991,11 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 		forward.base.requester_backend_id = (int32)MyBackendId;
 		forward.base.master_node = origin_node;
 		forward.base.transition_id = (uint8)PCM_TRANS_N_TO_S;
-		if (ClusterR4ForwardExtensionSetLocatorGeneration(
-				&forward.extension, CLUSTER_R4_WIRE_TX_RESOLVE,
-				locator, expected_physical_generation))
+		if (ClusterR4ForwardExtensionSetLocatorGeneration(&forward.extension,
+														  CLUSTER_R4_WIRE_TX_RESOLVE, locator,
+														  expected_physical_generation))
 			sent = cluster_grd_outbound_enqueue_backend_msg(
-				PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node,
-				&forward, sizeof(forward));
+				PGRAC_IC_MSG_GCS_BLOCK_FORWARD, (uint32)origin_node, &forward, sizeof(forward));
 		if (sent) {
 			ClusterGcsBlockBackendBlock *blk = gcs_block_my_block();
 			instr_time started;
@@ -5131,14 +5023,13 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 				INSTR_TIME_SET_CURRENT(now);
 				elapsed = now;
 				INSTR_TIME_SUBTRACT(elapsed, started);
-				remaining_ms = (double)cluster_gcs_reply_timeout_ms
-							   - INSTR_TIME_GET_MILLISEC(elapsed);
+				remaining_ms
+					= (double)cluster_gcs_reply_timeout_ms - INSTR_TIME_GET_MILLISEC(elapsed);
 				if (remaining_ms <= 0)
 					break;
 				timeout_ms = remaining_ms < 1.0 ? 1L : (long)remaining_ms;
-				(void)ConditionVariableTimedSleep(
-					&slot->reply_cv, timeout_ms,
-					WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
+				(void)ConditionVariableTimedSleep(&slot->reply_cv, timeout_ms,
+												  WAIT_EVENT_GCS_BLOCK_SHIP_WAIT);
 			}
 			ConditionVariableCancelSleep();
 		}
@@ -5147,22 +5038,18 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 			reason = CLUSTER_TX_RESOLVE_IO_ERROR;
 			goto tx_done;
 		}
-		if (slot->reply_header.status
-				!= (uint8)GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT) {
+		if (slot->reply_header.status != (uint8)GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT) {
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 			goto tx_done;
 		}
-		if (!ClusterR4TxVerdictPageDecode(
-				(const uint8 *)slot->reply_block_data, locator, &decoded)
-			|| decoded.authority.origin_epoch != formation_epoch
-			|| slot->reply_header.page_lsn == 0
+		if (!ClusterR4TxVerdictPageDecode((const uint8 *)slot->reply_block_data, locator, &decoded)
+			|| decoded.authority.origin_epoch != formation_epoch || slot->reply_header.page_lsn == 0
 			|| !SCN_VALID(decoded.authority.authority_scn)
 			|| cluster_epoch_get_current() != formation_epoch) {
 			reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
 			goto tx_done;
 		}
-		decoded.authority.live_hwm_lsn
-			= (XLogRecPtr)slot->reply_header.page_lsn;
+		decoded.authority.live_hwm_lsn = (XLogRecPtr)slot->reply_header.page_lsn;
 		cluster_scn_observe(decoded.commit_scn);
 		cluster_scn_observe(decoded.horizon_scn);
 		cluster_scn_observe(decoded.authority.authority_scn);
@@ -5170,8 +5057,7 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(
 		outcome = decoded.outcome;
 		reason = CLUSTER_TX_RESOLVE_NONE;
 
-tx_done:
-		;
+	tx_done:;
 	}
 	PG_CATCH();
 	{
@@ -5191,8 +5077,7 @@ tx_done:
  * routing; the raw transport writes only private aligned scratch.  A caller
  * page is published only after the same token's positive final recheck. */
 ClusterCrBuildResult
-cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
-									char dst_page[BLCKSZ],
+cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, char dst_page[BLCKSZ],
 									ClusterCrBuildReason *reason_out)
 {
 	ClusterSemanticAdmissionToken admission;
@@ -5206,9 +5091,8 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
 	if (reason_out != NULL)
 		*reason_out = CLUSTER_CR_BUILD_PROTOCOL;
 	memset(&admission, 0, sizeof(admission));
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		reason = admission_result == CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED
 					 ? CLUSTER_CR_BUILD_TARGET_DISABLED
@@ -5224,8 +5108,7 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
 		if (dst_page == NULL || reason_out == NULL || !SCN_VALID(read_scn))
 			goto done;
 		real_master_node = cluster_gcs_lookup_master(tag);
-		if (real_master_node < 0
-			|| real_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT) {
+		if (real_master_node < 0 || real_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT) {
 			reason = CLUSTER_CR_BUILD_WRONG_MASTER;
 			result = CLUSTER_CR_BUILD_RETRYABLE;
 			goto done;
@@ -5245,8 +5128,7 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn,
 		reason = CLUSTER_CR_BUILD_NONE;
 		result = CLUSTER_CR_BUILD_FULL;
 
-done:
-		;
+	done:;
 	}
 	PG_FINALLY();
 	{
@@ -5652,9 +5534,8 @@ gcs_freshref_pair_log_refusal(const char *phase, int32 origin, BufferTag tag, Tr
 
 static bool
 gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stamped_epoch,
-									 TransactionId xid, SCN freshref_pair_scn,
-									 bool authoritative, bool authority_kind,
-									 GcsBlockReplyHeader *hdr_out,
+									 TransactionId xid, SCN freshref_pair_scn, bool authoritative,
+									 bool authority_kind, GcsBlockReplyHeader *hdr_out,
 									 ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out,
 									 uint64 *authority_scn_out)
 {
@@ -5709,8 +5590,8 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
 			GcsBlockForwardPayloadSetUndoVerdictRequest(&fwd, authoritative);
 		/* Kinds 2/4/5 carry the widened xid here.  Kind 10 binds xid in the
 		 * synthetic tag and carries the exact retained page SCN instead. */
-		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(
-			&fwd, freshref_pair ? freshref_pair_scn : (SCN)(uint64)xid);
+		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, freshref_pair ? freshref_pair_scn
+																			: (SCN)(uint64)xid);
 
 		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 													  (uint32)dest_node, &fwd, sizeof(fwd))) {
@@ -5836,8 +5717,8 @@ gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stam
  */
 bool
 cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_id,
-											  uint32 expected_tt_slot_id,
-											  TransactionId xid, bool authoritative,
+											  uint32 expected_tt_slot_id, TransactionId xid,
+											  bool authoritative,
 											  ClusterGcsUndoVerdictPage *verdict_out,
 											  ClusterLiveAuthority *auth_out)
 {
@@ -5862,10 +5743,9 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 	 */
 	tag = GcsBlockUndoFetchTagMake(segment_id, expected_tt_slot_id);
 
-	if (!gcs_block_undo_verdict_wire_exchange(origin_node, tag, cluster_epoch_get_current(), xid,
-											  InvalidScn, authoritative,
-											  false /* owner-served kind */, &hdr,
-											  &page, &tt_generation, &authority_scn))
+	if (!gcs_block_undo_verdict_wire_exchange(
+			origin_node, tag, cluster_epoch_get_current(), xid, InvalidScn, authoritative,
+			false /* owner-served kind */, &hdr, &page, &tt_generation, &authority_scn))
 		return false;
 
 	if (!cluster_vis_undo_verdict_page_usable(&page, xid)) {
@@ -5888,10 +5768,11 @@ cluster_gcs_block_undo_verdict_fetch_and_wait(int32 origin_node, uint32 segment_
 }
 
 static bool
-gcs_block_undo_freshref_c1b_pair_exchange_current(
-	int32 origin_node, uint32 segment_id, uint32 expected_tt_slot_id,
-	TransactionId xid, uint64 stamped_epoch, SCN proposed_scn,
-	ClusterGcsUndoVerdictPage *verdict_out, ClusterLiveAuthority *auth_out)
+gcs_block_undo_freshref_c1b_pair_exchange_current(int32 origin_node, uint32 segment_id,
+												  uint32 expected_tt_slot_id, TransactionId xid,
+												  uint64 stamped_epoch, SCN proposed_scn,
+												  ClusterGcsUndoVerdictPage *verdict_out,
+												  ClusterLiveAuthority *auth_out)
 {
 	GcsBlockReplyHeader hdr;
 	ClusterGcsUndoVerdictPage page;
@@ -5899,13 +5780,12 @@ gcs_block_undo_freshref_c1b_pair_exchange_current(
 	uint64 authority_scn = 0;
 	BufferTag tag;
 
-	tag = GcsBlockUndoFreshRefC1bTagMake(
-		segment_id, xid, expected_tt_slot_id);
+	tag = GcsBlockUndoFreshRefC1bTagMake(segment_id, xid, expected_tt_slot_id);
 
-	if (!gcs_block_undo_verdict_wire_exchange(
-			origin_node, tag, stamped_epoch, xid, proposed_scn,
-			true /* physical fresh-ref authority */, false /* live owner */, &hdr,
-			&page, &tt_generation, &authority_scn))
+	if (!gcs_block_undo_verdict_wire_exchange(origin_node, tag, stamped_epoch, xid, proposed_scn,
+											  true /* physical fresh-ref authority */,
+											  false /* live owner */, &hdr, &page, &tt_generation,
+											  &authority_scn))
 		return false;
 	if (hdr.sender_node != origin_node || hdr.epoch != stamped_epoch
 		|| cluster_epoch_get_current() != stamped_epoch
@@ -5932,20 +5812,21 @@ gcs_block_undo_freshref_c1b_pair_exchange_current(
  * epoch zero, a current R4 TARGET admission is held across the whole exchange;
  * syntactic epoch equality alone is never authority. */
 bool
-cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
-	int32 origin_node, uint32 segment_id, uint32 expected_tt_slot_id,
-	TransactionId xid, uint32 ref_epoch, SCN proposed_scn,
-	ClusterGcsUndoVerdictPage *verdict_out, ClusterLiveAuthority *auth_out)
+cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(int32 origin_node, uint32 segment_id,
+														uint32 expected_tt_slot_id,
+														TransactionId xid, uint32 ref_epoch,
+														SCN proposed_scn,
+														ClusterGcsUndoVerdictPage *verdict_out,
+														ClusterLiveAuthority *auth_out)
 {
 	ClusterSemanticAdmissionToken zero_epoch_admission;
 	uint64 stamped_epoch;
 	bool result = false;
 
-	if (verdict_out == NULL || auth_out == NULL || origin_node < 0
-		|| origin_node == cluster_node_id || segment_id == 0
-		|| segment_id > UINT16_MAX || expected_tt_slot_id < 1
-		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT
-		|| !TransactionIdIsNormal(xid) || !SCN_VALID(proposed_scn))
+	if (verdict_out == NULL || auth_out == NULL || origin_node < 0 || origin_node == cluster_node_id
+		|| segment_id == 0 || segment_id > UINT16_MAX || expected_tt_slot_id < 1
+		|| expected_tt_slot_id > TT_SLOTS_PER_SEGMENT || !TransactionIdIsNormal(xid)
+		|| !SCN_VALID(proposed_scn))
 		return false;
 	memset(verdict_out, 0, sizeof(*verdict_out));
 	memset(auth_out, 0, sizeof(*auth_out));
@@ -5961,8 +5842,8 @@ cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
 	}
 	if (stamped_epoch != 0)
 		return gcs_block_undo_freshref_c1b_pair_exchange_current(
-			origin_node, segment_id, expected_tt_slot_id, xid, stamped_epoch,
-			proposed_scn, verdict_out, auth_out);
+			origin_node, segment_id, expected_tt_slot_id, xid, stamped_epoch, proposed_scn,
+			verdict_out, auth_out);
 	if (!cluster_runtime_visibility_zero_epoch_pair_admission_enter(&zero_epoch_admission)) {
 		gcs_freshref_pair_log_refusal(
 			"ZERO_EPOCH_ADMISSION", origin_node,
@@ -5973,10 +5854,9 @@ cluster_gcs_block_undo_freshref_c1b_pair_fetch_and_wait(
 	PG_TRY();
 	{
 		result = gcs_block_undo_freshref_c1b_pair_exchange_current(
-			origin_node, segment_id, expected_tt_slot_id, xid, stamped_epoch,
-			proposed_scn, verdict_out, auth_out);
-		if (result
-			&& !cluster_semantic_activation_recheck(&zero_epoch_admission)) {
+			origin_node, segment_id, expected_tt_slot_id, xid, stamped_epoch, proposed_scn,
+			verdict_out, auth_out);
+		if (result && !cluster_semantic_activation_recheck(&zero_epoch_admission)) {
 			gcs_freshref_pair_log_refusal(
 				"RETURN_ADMISSION_DRIFT", origin_node,
 				GcsBlockUndoFreshRefC1bTagMake(segment_id, xid, expected_tt_slot_id), xid,
@@ -6837,16 +6717,14 @@ gcs_block_r4_tx_origin_locator_kind_valid(const ClusterTxLocator *locator, bool 
 		|| (locator->tt_wrap != TT_WRAP_INVALID
 			&& (!undo_data_fetch || locator->tt_wrap > TT_WRAP_MAX)))
 		return false;
-	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE
-				|| locator->itl_kind == ITL_FLAG_COMMITTED
+	data_kind = locator->itl_kind == ITL_FLAG_ACTIVE || locator->itl_kind == ITL_FLAG_COMMITTED
 				|| locator->itl_kind == ITL_FLAG_ABORTED
 				|| locator->itl_kind == ITL_FLAG_NEEDS_CLEANOUT;
 	return data_kind || ITL_FLAG_IS_LOCK_ONLY(locator->itl_kind);
 }
 
 static void
-gcs_block_r4_tx_origin_context_clear(GcsBlockR4TxOriginContext *context,
-									 bool cancel_guard)
+gcs_block_r4_tx_origin_context_clear(GcsBlockR4TxOriginContext *context, bool cancel_guard)
 {
 	if (context == NULL || !context->in_use)
 		return;
@@ -6859,24 +6737,21 @@ gcs_block_r4_tx_origin_context_clear(GcsBlockR4TxOriginContext *context,
 }
 
 static bool
-gcs_block_r4_tx_origin_admission_current(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_admission_current(const GcsBlockR4TxOriginContext *context)
 {
 	if (context == NULL)
 		return false;
 	if (context->resolve_mode == CLUSTER_TX_RESOLVE_VISIBILITY)
 		return cluster_semantic_activation_recheck(&context->admission);
 	if (context->resolve_mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
-		return cluster_semantic_activation_recheck_r4_terminal_census(
-			&context->admission);
+		return cluster_semantic_activation_recheck_r4_terminal_census(&context->admission);
 	return false;
 }
 
 static bool
-gcs_block_r4_tx_origin_resolve_root_current(
-	const GcsBlockR4TxOriginContext *context,
-	const ClusterUndoBlock0LogicalKey *logical,
-	ClusterUndoBlock0ResolvedRoot *root)
+gcs_block_r4_tx_origin_resolve_root_current(const GcsBlockR4TxOriginContext *context,
+											const ClusterUndoBlock0LogicalKey *logical,
+											ClusterUndoBlock0ResolvedRoot *root)
 {
 	bool resolved = false;
 
@@ -6885,19 +6760,17 @@ gcs_block_r4_tx_origin_resolve_root_current(
 	memset(root, 0, sizeof(*root));
 	if (context->resolve_mode == CLUSTER_TX_RESOLVE_VISIBILITY)
 		resolved = cluster_semantic_activation_resolve_shared_undo_root(
-			&context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-			logical->owner_instance, logical->segment_id, root);
+			&context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical->owner_instance,
+			logical->segment_id, root);
 	else if (context->resolve_mode == CLUSTER_TX_RESOLVE_TERMINAL_CENSUS)
-		resolved
-			= cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				&context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical->owner_instance, logical->segment_id, root);
+		resolved = cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
+			&context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical->owner_instance,
+			logical->segment_id, root);
 	return resolved && gcs_block_r4_tx_origin_admission_current(context);
 }
 
 static int
-gcs_block_r4_tx_origin_remaining_timeout_ms(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_remaining_timeout_ms(const GcsBlockR4TxOriginContext *context)
 {
 	TimestampTz now;
 	TimestampTz remaining_us;
@@ -6916,11 +6789,9 @@ gcs_block_r4_tx_origin_remaining_timeout_ms(
 }
 
 static bool
-gcs_block_r4_tx_origin_deadline_expired(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_deadline_expired(const GcsBlockR4TxOriginContext *context)
 {
-	return context != NULL && context->deadline != 0
-		   && GetCurrentTimestamp() >= context->deadline;
+	return context != NULL && context->deadline != 0 && GetCurrentTimestamp() >= context->deadline;
 }
 
 static void
@@ -7003,10 +6874,9 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 	expected_tag = GcsBlockUndoFetchTagMake(segment_id, block_no);
 	if (memcmp(&forward->base.tag, &expected_tag, sizeof(expected_tag)) != 0)
 		return true;
-	if (!cluster_sf_peer_capability_family_sample(
-			forward->base.original_requester_node,
-			GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS, 0, &optional_supported,
-			&capability_generation)
+	if (!cluster_sf_peer_capability_family_sample(forward->base.original_requester_node,
+												  GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS, 0,
+												  &optional_supported, &capability_generation)
 		|| capability_generation == 0)
 		return true;
 
@@ -7014,18 +6884,15 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 	 * conflicting reuse of the same authenticated request identity is
 	 * consumed without a second action or reply. */
 	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
-		GcsBlockR4TxOriginContext *context
-			= &gcs_block_r4_tx_origin_contexts[i];
+		GcsBlockR4TxOriginContext *context = &gcs_block_r4_tx_origin_contexts[i];
 
 		if (!context->in_use) {
 			if (free_context == NULL)
 				free_context = context;
 			continue;
 		}
-		if (context->forward.base.original_requester_node
-				== forward->base.original_requester_node
-			&& context->forward.base.requester_backend_id
-				   == forward->base.requester_backend_id
+		if (context->forward.base.original_requester_node == forward->base.original_requester_node
+			&& context->forward.base.requester_backend_id == forward->base.requester_backend_id
 			&& context->forward.base.request_id == forward->base.request_id
 			&& context->forward.base.epoch == forward->base.epoch)
 			return true;
@@ -7038,9 +6905,8 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 		return true;
 	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
 	logical.segment_id = segment_id;
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result == CLUSTER_SEMANTIC_ADMISSION_OK) {
 		resolve_mode = CLUSTER_TX_RESOLVE_VISIBILITY;
 		if ((undo_data_fetch
@@ -7058,12 +6924,12 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 		if (undo_data_fetch || admission_result != CLUSTER_SEMANTIC_ADMISSION_TARGET_DISABLED)
 			return true;
 		if (cluster_semantic_activation_enter_r4_terminal_census(&admission)
-				!= CLUSTER_SEMANTIC_ADMISSION_OK)
+			!= CLUSTER_SEMANTIC_ADMISSION_OK)
 			return true;
 		resolve_mode = CLUSTER_TX_RESOLVE_TERMINAL_CENSUS;
 		if (!cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical.owner_instance, logical.segment_id, &root)
+				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+				logical.segment_id, &root)
 			|| !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
 			cluster_semantic_activation_leave(&admission);
 			return true;
@@ -7076,10 +6942,10 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 	free_context->domain = GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE;
 	free_context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN;
 	free_context->resolve_mode = resolve_mode;
-	free_context->deadline = cluster_gcs_reply_timeout_ms > 0
-		? TimestampTzPlusMilliseconds(
-			GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms)
-		: 0;
+	free_context->deadline
+		= cluster_gcs_reply_timeout_ms > 0
+			  ? TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms)
+			  : 0;
 	free_context->requester_capability_generation = capability_generation;
 	free_context->forward = *forward;
 	free_context->locator = locator;
@@ -7096,14 +6962,13 @@ gcs_block_r4_tx_origin_try_accept(const ClusterICEnvelope *env,
 }
 
 static bool
-gcs_block_current_mx_origin_locate_physical(
-	TransactionId xid, ClusterTTSlotPhysicalLocator *locator,
-	bool *current_owner_found_out,
-	ClusterTTDurableLocate *durable_locate_result_out)
+gcs_block_current_mx_origin_locate_physical(TransactionId xid,
+											ClusterTTSlotPhysicalLocator *locator,
+											bool *current_owner_found_out,
+											ClusterTTDurableLocate *durable_locate_result_out)
 {
 	ClusterTTSlotCurrentOwner current_owner;
-	ClusterTTDurableLocate durable_locate_result
-		= CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
+	ClusterTTDurableLocate durable_locate_result = CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
 	uint16 segment_id = 0;
 	uint16 slot_offset = 0;
 	uint16 wrap = TT_WRAP_INVALID;
@@ -7111,16 +6976,13 @@ gcs_block_current_mx_origin_locate_physical(
 	if (current_owner_found_out != NULL)
 		*current_owner_found_out = false;
 	if (durable_locate_result_out != NULL)
-		*durable_locate_result_out
-			= CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
-	if (locator == NULL || current_owner_found_out == NULL
-		|| durable_locate_result_out == NULL || cluster_node_id < 0
-		|| cluster_xid_origin_slot(xid) != cluster_node_id)
+		*durable_locate_result_out = CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
+	if (locator == NULL || current_owner_found_out == NULL || durable_locate_result_out == NULL
+		|| cluster_node_id < 0 || cluster_xid_origin_slot(xid) != cluster_node_id)
 		return false;
 	memset(locator, 0, sizeof(*locator));
 	memset(&current_owner, 0, sizeof(current_owner));
-	if (cluster_tt_slot_current_owner_by_xid(
-			cluster_node_id, xid, &current_owner)) {
+	if (cluster_tt_slot_current_owner_by_xid(cluster_node_id, xid, &current_owner)) {
 		*current_owner_found_out = true;
 		locator->segment_id = current_owner.segment_id;
 		locator->xid = xid;
@@ -7142,41 +7004,35 @@ gcs_block_current_mx_origin_locate_physical(
 	locator->xid = xid;
 	locator->slot_offset = slot_offset;
 	locator->wrap = wrap;
-	return locator->segment_id != 0
-		&& locator->slot_offset < TT_SLOTS_PER_SEGMENT
-		&& locator->wrap != TT_WRAP_INVALID;
+	return locator->segment_id != 0 && locator->slot_offset < TT_SLOTS_PER_SEGMENT
+		   && locator->wrap != TT_WRAP_INVALID;
 }
 
 static bool
-gcs_block_current_mx_requester_identity_capture(
-	int32 requester_node, uint32 capability_generation,
-	const ClusterSemanticAdmissionToken *admission,
-	ClusterCtrcParticipantIdentity *identity)
+gcs_block_current_mx_requester_identity_capture(int32 requester_node, uint32 capability_generation,
+												const ClusterSemanticAdmissionToken *admission,
+												ClusterCtrcParticipantIdentity *identity)
 {
 	uint64 observed_incarnation = 0;
 	uint64 observed_generation = 0;
 	uint32 required_capabilities
-		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
-		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
 
 	if (identity == NULL)
 		return false;
 	memset(identity, 0, sizeof(*identity));
-	if (requester_node < 0
-		|| requester_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
-		|| capability_generation == 0 || admission == NULL
-		|| !admission->entered || admission->record_generation == 0
+	if (requester_node < 0 || requester_node >= CLUSTER_CTRC_MAX_PARTICIPANTS
+		|| capability_generation == 0 || admission == NULL || !admission->entered
+		|| admission->record_generation == 0
 		|| admission->formation_epoch != cluster_epoch_get_current()
 		|| !cluster_membership_is_member(requester_node)
-		|| !cluster_reconfig_get_observed_slot(
-			requester_node, &observed_incarnation, &observed_generation)
+		|| !cluster_reconfig_get_observed_slot(requester_node, &observed_incarnation,
+											   &observed_generation)
 		|| observed_incarnation == 0 || observed_generation == 0
-		|| cluster_reconfig_get_observed_epoch(requester_node)
-		   != admission->formation_epoch
-		|| cluster_membership_get_last_admitted_incarnation(requester_node)
-		   != observed_incarnation
-		|| !cluster_sf_peer_capability_generation_matches(
-			requester_node, required_capabilities, capability_generation))
+		|| cluster_reconfig_get_observed_epoch(requester_node) != admission->formation_epoch
+		|| cluster_membership_get_last_admitted_incarnation(requester_node) != observed_incarnation
+		|| !cluster_sf_peer_capability_generation_matches(requester_node, required_capabilities,
+														  capability_generation))
 		return false;
 
 	identity->node_id = (uint16)requester_node;
@@ -7188,27 +7044,22 @@ gcs_block_current_mx_requester_identity_capture(
 }
 
 static bool
-gcs_block_current_mx_requester_identity_current(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_current_mx_requester_identity_current(const GcsBlockR4TxOriginContext *context)
 {
 	ClusterCtrcParticipantIdentity current;
 
-	if (context == NULL
-		|| context->domain != GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+	if (context == NULL || context->domain != GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
 		|| !gcs_block_current_mx_requester_identity_capture(
 			context->current_mx_request.prefix.original_requester_node,
-			context->requester_capability_generation,
-			&context->admission, &current))
+			context->requester_capability_generation, &context->admission, &current))
 		return false;
-	return memcmp(&current, &context->current_mx_requester_identity,
-				  sizeof(current)) == 0;
+	return memcmp(&current, &context->current_mx_requester_identity, sizeof(current)) == 0;
 }
 
 static bool
-gcs_block_current_mx_ctrc_key(
-	const GcsBlockR4TxOriginContext *context, uint16 index,
-	const ClusterUndoBlock0Generation *generation,
-	ClusterCtrcTxnKeyV1 *key)
+gcs_block_current_mx_ctrc_key(const GcsBlockR4TxOriginContext *context, uint16 index,
+							  const ClusterUndoBlock0Generation *generation,
+							  ClusterCtrcTxnKeyV1 *key)
 {
 	const ClusterTTSlotPhysicalLocator *locator;
 	uint64 epoch;
@@ -7216,19 +7067,18 @@ gcs_block_current_mx_ctrc_key(
 	uint64 system_identifier;
 
 	if (context == NULL || generation == NULL || key == NULL
-		|| index >= context->current_mx_locator_count
-		|| !generation->known || generation->value == UINT32_MAX
+		|| index >= context->current_mx_locator_count || !generation->known
+		|| generation->value == UINT32_MAX
 		|| context->tt_root.intent != CLUSTER_UNDO_PATH_RUNTIME_SHARED
-		|| context->tt_root.root_id == 0
-		|| context->tt_root.root_generation == 0
+		|| context->tt_root.root_id == 0 || context->tt_root.root_generation == 0
 		|| context->admission.record_generation == 0)
 		return false;
 	locator = &context->current_mx_locators[index];
 	epoch = cluster_epoch_get_current();
 	boot_incarnation = cluster_qvotec_get_self_incarnation();
 	system_identifier = GetSystemIdentifier();
-	if (epoch > UINT32_MAX || epoch != context->admission.formation_epoch
-		|| boot_incarnation == 0 || system_identifier == 0)
+	if (epoch > UINT32_MAX || epoch != context->admission.formation_epoch || boot_incarnation == 0
+		|| system_identifier == 0)
 		return false;
 
 	memset(key, 0, sizeof(*key));
@@ -7252,8 +7102,7 @@ gcs_block_current_mx_ctrc_key(
 }
 
 static bool
-gcs_block_current_mx_origin_try_accept(
-	const ClusterICEnvelope *env, const void *payload)
+gcs_block_current_mx_origin_try_accept(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterCurrentMxProofForwardV2 request;
 	ClusterSemanticAdmissionToken admission;
@@ -7276,17 +7125,15 @@ gcs_block_current_mx_origin_try_accept(
 	memset(&admission, 0, sizeof(admission));
 	memset(&logical, 0, sizeof(logical));
 	memset(&root, 0, sizeof(root));
-	if (env == NULL || payload == NULL
-		|| env->dest_node_id != (uint32)cluster_node_id
+	if (env == NULL || payload == NULL || env->dest_node_id != (uint32)cluster_node_id
 		|| !cluster_gcs_block_family_on_data_plane()
 		|| !cluster_multixact_current_wire_validate_proof_forward(
-			payload, env->payload_length, (int32)env->source_node_id,
-			cluster_node_id, cluster_epoch_get_current(), &request))
+			payload, env->payload_length, (int32)env->source_node_id, cluster_node_id,
+			cluster_epoch_get_current(), &request))
 		return false;
-	route_tag = GcsBlockCurrentMxRouteTagMake(
-		request.prefix.request_id, request.prefix.epoch,
-		request.prefix.original_requester_node,
-		request.prefix.requester_backend_id);
+	route_tag = GcsBlockCurrentMxRouteTagMake(request.prefix.request_id, request.prefix.epoch,
+											  request.prefix.original_requester_node,
+											  request.prefix.requester_backend_id);
 	recv_worker = cluster_ic_tier1_my_data_channel();
 	expected_worker = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 	Assert(expected_worker == recv_worker);
@@ -7297,14 +7144,12 @@ gcs_block_current_mx_origin_try_accept(
 		|| capability_generation == 0
 		|| !cluster_sf_peer_capability_generation_matches(
 			request.prefix.original_requester_node,
-			PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
-				| PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1,
+			PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1,
 			capability_generation))
 		return false;
 
 	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
-		GcsBlockR4TxOriginContext *context
-			= &gcs_block_r4_tx_origin_contexts[i];
+		GcsBlockR4TxOriginContext *context = &gcs_block_r4_tx_origin_contexts[i];
 
 		if (!context->in_use) {
 			if (free_context == NULL)
@@ -7316,25 +7161,21 @@ gcs_block_current_mx_origin_try_accept(
 				   == request.prefix.original_requester_node
 			&& context->current_mx_request.prefix.requester_backend_id
 				   == request.prefix.requester_backend_id
-			&& context->current_mx_request.prefix.request_id
-				   == request.prefix.request_id
-			&& context->current_mx_request.prefix.epoch
-				   == request.prefix.epoch)
+			&& context->current_mx_request.prefix.request_id == request.prefix.request_id
+			&& context->current_mx_request.prefix.epoch == request.prefix.epoch)
 			return true;
 	}
 	if (free_context == NULL) {
 		if (!gcs_block_current_mx_origin_first_unknown_logged) {
 			gcs_block_current_mx_origin_first_unknown_logged = true;
 			ereport(LOG,
-					(errmsg_internal(
-						 "PGRAC current-MultiXact origin first unknown: "
-						 "requester=%d backend=%d request=" UINT64_FORMAT
-						 " failure=%d xid=0 index=0 contexts=%d",
-						 request.prefix.original_requester_node,
-						 request.prefix.requester_backend_id,
-						 request.prefix.request_id,
-						 (int)GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_CONTEXT_FULL,
-						 GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS)));
+					(errmsg_internal("PGRAC current-MultiXact origin first unknown: "
+									 "requester=%d backend=%d request=" UINT64_FORMAT
+									 " failure=%d xid=0 index=0 contexts=%d",
+									 request.prefix.original_requester_node,
+									 request.prefix.requester_backend_id, request.prefix.request_id,
+									 (int)GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_CONTEXT_FULL,
+									 GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS)));
 		}
 		return true;
 	}
@@ -7342,22 +7183,19 @@ gcs_block_current_mx_origin_try_accept(
 	 * fallback and allocate another context after the original refusal. */
 	if (!cluster_normal_stop_service_new_work(false))
 		return true;
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result = cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														 CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		if (!gcs_block_current_mx_origin_first_unknown_logged) {
 			gcs_block_current_mx_origin_first_unknown_logged = true;
 			ereport(LOG,
-					(errmsg_internal(
-						 "PGRAC current-MultiXact origin first unknown: "
-						 "requester=%d backend=%d request=" UINT64_FORMAT
-						 " failure=%d admission=%d xid=0 index=0",
-						 request.prefix.original_requester_node,
-						 request.prefix.requester_backend_id,
-						 request.prefix.request_id,
-						 (int)GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ADMISSION,
-						 (int)admission_result)));
+					(errmsg_internal("PGRAC current-MultiXact origin first unknown: "
+									 "requester=%d backend=%d request=" UINT64_FORMAT
+									 " failure=%d admission=%d xid=0 index=0",
+									 request.prefix.original_requester_node,
+									 request.prefix.requester_backend_id, request.prefix.request_id,
+									 (int)GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ADMISSION,
+									 (int)admission_result)));
 		}
 		return false;
 	}
@@ -7367,42 +7205,36 @@ gcs_block_current_mx_origin_try_accept(
 	free_context->domain = GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX;
 	free_context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
 	free_context->resolve_mode = CLUSTER_TX_RESOLVE_VISIBILITY;
-	free_context->deadline = cluster_gcs_reply_timeout_ms > 0
-		? TimestampTzPlusMilliseconds(
-			GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms)
-		: 0;
+	free_context->deadline
+		= cluster_gcs_reply_timeout_ms > 0
+			  ? TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_gcs_reply_timeout_ms)
+			  : 0;
 	free_context->requester_capability_generation = capability_generation;
 	free_context->current_mx_request = request;
 	free_context->current_mx_result = CMX_RESOLVE_UNKNOWN;
-	free_context->current_mx_failure
-		= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_NONE;
+	free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_NONE;
 	free_context->current_mx_updater_proof.verdict = CUCP_UNKNOWN;
 	free_context->admission = admission;
 	if (!gcs_block_current_mx_requester_identity_capture(
-			request.prefix.original_requester_node, capability_generation,
-			&admission, &free_context->current_mx_requester_identity)) {
+			request.prefix.original_requester_node, capability_generation, &admission,
+			&free_context->current_mx_requester_identity)) {
 		gcs_block_r4_tx_origin_context_clear(free_context, false);
 		return false;
 	}
 	free_context->outcome = CLUSTER_TX_UNKNOWN;
 	free_context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
 
-	if (request.prefix.body_kind
-			== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
+	if (request.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
 		const ClusterCurrentMxUpdaterChallengeWire *challenge
 			= &request.trailer.body.updater.challenge;
 
 		if (!cluster_multixact_current_successor_provenance_well_formed(
-				&challenge->candidate_next_xmin_alias,
-				&challenge->candidate_next_xmin_locator,
-				challenge->updater_xid, (uint16)cluster_node_id,
-				request.prefix.mxkey.cluster_epoch)
-			|| !uba_decode(challenge->candidate_next_xmin_locator.uba,
-						  &data_segment, &data_block, &data_tt_slot,
-						  &data_row)
+				&challenge->candidate_next_xmin_alias, &challenge->candidate_next_xmin_locator,
+				challenge->updater_xid, (uint16)cluster_node_id, request.prefix.mxkey.cluster_epoch)
+			|| !uba_decode(challenge->candidate_next_xmin_locator.uba, &data_segment, &data_block,
+						   &data_tt_slot, &data_row)
 			|| data_block == 0) {
-			free_context->current_mx_failure
-				= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_LOCATOR;
+			free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_LOCATOR;
 			free_context->current_mx_failure_xid = challenge->updater_xid;
 			return true;
 		}
@@ -7410,13 +7242,10 @@ gcs_block_current_mx_origin_try_accept(
 		logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
 		logical.segment_id = data_segment;
 		if (!cluster_semantic_activation_resolve_shared_undo_root(
-				&free_context->admission,
-				CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+				&free_context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
 				logical.segment_id, &root)
-			|| !cluster_semantic_activation_recheck(
-				&free_context->admission)) {
-			free_context->current_mx_failure
-				= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
+			|| !cluster_semantic_activation_recheck(&free_context->admission)) {
+			free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
 			free_context->current_mx_failure_xid = challenge->updater_xid;
 			return true;
 		}
@@ -7426,31 +7255,24 @@ gcs_block_current_mx_origin_try_accept(
 		return true;
 	}
 
-	owner_count = request.prefix.body_kind
-			== CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS
-		? request.prefix.entry_count : 1;
+	owner_count = request.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS
+					  ? request.prefix.entry_count
+					  : 1;
 	for (i = 0; i < owner_count; i++) {
-		TransactionId xid = request.prefix.body_kind
-				== CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS
-			? request.trailer.body.asks[i].xid
-			: request.trailer.body.updater.challenge.updater_xid;
-		ClusterTTSlotPhysicalLocator *locator
-			= &free_context->current_mx_locators[i];
+		TransactionId xid = request.prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS
+								? request.trailer.body.asks[i].xid
+								: request.trailer.body.updater.challenge.updater_xid;
+		ClusterTTSlotPhysicalLocator *locator = &free_context->current_mx_locators[i];
 		bool current_owner_found = false;
-		ClusterTTDurableLocate durable_locate_result
-			= CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
+		ClusterTTDurableLocate durable_locate_result = CLUSTER_TT_DURABLE_LOCATE_SCAN_UNAVAILABLE;
 
-		if (!gcs_block_current_mx_origin_locate_physical(
-				xid, locator, &current_owner_found,
-				&durable_locate_result)) {
-			free_context->current_mx_failure
-				= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_LOCATOR;
+		if (!gcs_block_current_mx_origin_locate_physical(xid, locator, &current_owner_found,
+														 &durable_locate_result)) {
+			free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_LOCATOR;
 			free_context->current_mx_failure_xid = xid;
 			free_context->current_mx_failure_index = i;
-			free_context->current_mx_current_owner_found
-				= current_owner_found;
-			free_context->current_mx_durable_locate_result
-				= durable_locate_result;
+			free_context->current_mx_current_owner_found = current_owner_found;
+			free_context->current_mx_durable_locate_result = durable_locate_result;
 			return true;
 		}
 	}
@@ -7458,13 +7280,11 @@ gcs_block_current_mx_origin_try_accept(
 	logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
 	logical.segment_id = free_context->current_mx_locators[0].segment_id;
 	if (!cluster_semantic_activation_resolve_shared_undo_root(
-			&free_context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-			logical.owner_instance, logical.segment_id, &root)
+			&free_context->admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+			logical.segment_id, &root)
 		|| !cluster_semantic_activation_recheck(&free_context->admission)) {
-		free_context->current_mx_failure
-			= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
-		free_context->current_mx_failure_xid
-			= free_context->current_mx_locators[0].xid;
+		free_context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
+		free_context->current_mx_failure_xid = free_context->current_mx_locators[0].xid;
 		free_context->current_mx_failure_index = 0;
 		return true;
 	}
@@ -7475,8 +7295,7 @@ gcs_block_current_mx_origin_try_accept(
 }
 
 static bool
-gcs_block_r4_tx_origin_resolution_valid(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_resolution_valid(const GcsBlockR4TxOriginContext *context)
 {
 	const ClusterTxResolution *resolution;
 
@@ -7484,18 +7303,13 @@ gcs_block_r4_tx_origin_resolution_valid(
 		return false;
 	resolution = &context->resolution;
 	if (context->outcome == CLUSTER_TX_PREPARED
-		|| (context->outcome != CLUSTER_TX_COMMITTED
-			&& context->outcome != CLUSTER_TX_ABORTED
+		|| (context->outcome != CLUSTER_TX_COMMITTED && context->outcome != CLUSTER_TX_ABORTED
 			&& context->outcome != CLUSTER_TX_IN_PROGRESS)
-		|| context->outcome != resolution->outcome
-		|| context->reason != CLUSTER_TX_RESOLVE_NONE
-		|| !cluster_tx_locator_reply_matches(&context->locator,
-									 &resolution->locator_echo)
+		|| context->outcome != resolution->outcome || context->reason != CLUSTER_TX_RESOLVE_NONE
+		|| !cluster_tx_locator_reply_matches(&context->locator, &resolution->locator_echo)
 		|| !TransactionIdIsNormal(resolution->top_xid)
-		|| !cluster_tx_outcome_proof_is_valid(resolution->outcome,
-										 resolution->proof_kind)
-		|| resolution->authority.origin_epoch
-			   != context->admission.formation_epoch
+		|| !cluster_tx_outcome_proof_is_valid(resolution->outcome, resolution->proof_kind)
+		|| resolution->authority.origin_epoch != context->admission.formation_epoch
 		|| XLogRecPtrIsInvalid(resolution->authority.live_hwm_lsn)
 		|| !SCN_VALID(resolution->authority.authority_scn))
 		return false;
@@ -7505,9 +7319,8 @@ gcs_block_r4_tx_origin_resolution_valid(
 }
 
 static bool
-gcs_block_r4_tx_origin_failure_transition(
-	GcsBlockR4TxOriginPhase phase_before,
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_failure_transition(GcsBlockR4TxOriginPhase phase_before,
+										  const GcsBlockR4TxOriginContext *context)
 {
 	if (context == NULL || context->reason == CLUSTER_TX_RESOLVE_NONE
 		|| context->outcome != CLUSTER_TX_UNKNOWN)
@@ -7515,8 +7328,7 @@ gcs_block_r4_tx_origin_failure_transition(
 	switch (phase_before) {
 	case GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE:
 	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK:
-		return context->phase
-			   == GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+		return context->phase == GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
 	case GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE:
 		return context->phase == GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_BEGIN
 			   && !context->canonical_sampled;
@@ -7540,8 +7352,7 @@ gcs_block_r4_tx_origin_failure_transition(
 }
 
 static void
-gcs_block_r4_tx_origin_log_first_denied(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_log_first_denied(const GcsBlockR4TxOriginContext *context)
 {
 	ClusterRuntimeVisibilityCanonicalDiagnostic diagnostic;
 	bool diagnostic_valid;
@@ -7551,9 +7362,8 @@ gcs_block_r4_tx_origin_log_first_denied(
 	gcs_block_r4_tx_origin_first_denial_logged = true;
 	memset(&diagnostic, 0, sizeof(diagnostic));
 	diagnostic.resident_copy_result = -1;
-	diagnostic_valid
-		= cluster_runtime_visibility_origin_plan_canonical_diagnostic(
-			&context->origin_plan, &diagnostic);
+	diagnostic_valid = cluster_runtime_visibility_origin_plan_canonical_diagnostic(
+		&context->origin_plan, &diagnostic);
 	ereport(
 		LOG,
 		(errmsg_internal(
@@ -7604,18 +7414,14 @@ gcs_block_r4_tx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 	header->request_id = context->forward.base.request_id;
 	header->epoch = context->forward.base.epoch;
 	header->sender_node = cluster_node_id;
-	header->requester_backend_id
-		= context->forward.base.requester_backend_id;
+	header->requester_backend_id = context->forward.base.requester_backend_id;
 	header->transition_id = context->forward.base.transition_id;
-	GcsBlockReplyHeaderSetForwardingMasterNode(
-		header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	GcsBlockReplyHeaderSetForwardingMasterNode(header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	publish_result = gcs_block_r4_tx_origin_resolution_valid(context)
-					 && ClusterR4TxVerdictPageEncode(
-							page, &context->resolution);
+					 && ClusterR4TxVerdictPageEncode(page, &context->resolution);
 	if (publish_result) {
 		header->status = (uint8)GCS_BLOCK_REPLY_R4_TX_RESOLVE_RESULT;
-		header->page_lsn
-			= (uint64)context->resolution.authority.live_hwm_lsn;
+		header->page_lsn = (uint64)context->resolution.authority.live_hwm_lsn;
 	} else {
 		gcs_block_r4_tx_origin_log_first_denied(context);
 		header->status = (uint8)GCS_BLOCK_REPLY_R4_DENIED;
@@ -7682,54 +7488,41 @@ gcs_block_r4_undo_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 }
 
 static void
-gcs_block_current_mx_origin_log_first_unknown(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_current_mx_origin_log_first_unknown(const GcsBlockR4TxOriginContext *context)
 {
 	const ClusterTTSlotPhysicalLocator *locator = NULL;
 
 	if (context == NULL || gcs_block_current_mx_origin_first_unknown_logged)
 		return;
-	if (context->current_mx_failure_index
-		< CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME)
-		locator = &context->current_mx_locators[
-			context->current_mx_failure_index];
+	if (context->current_mx_failure_index < CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME)
+		locator = &context->current_mx_locators[context->current_mx_failure_index];
 	gcs_block_current_mx_origin_first_unknown_logged = true;
-	ereport(LOG,
-			(errmsg_internal(
-				 "PGRAC current-MultiXact origin first unknown: requester=%d "
-				 "backend=%d request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
-				 " kind=%u entries=%u failure=%d xid=%u index=%u phase=%d "
-				 "current_owner_found=%d durable_locate=%d "
-				 "locator_count=%u sampled=0x%02x locator_segment=%u "
-				 "locator_slot=%u locator_wrap=%u tt_segment=%u root="
-				 UINT64_FORMAT "/" UINT64_FORMAT " admission_formation="
-				 UINT64_FORMAT " admission_generation=" UINT64_FORMAT,
-				 context->current_mx_request.prefix.original_requester_node,
-				 context->current_mx_request.prefix.requester_backend_id,
-				 context->current_mx_request.prefix.request_id,
-				 context->current_mx_request.prefix.epoch,
-				 context->current_mx_request.prefix.body_kind,
-				 context->current_mx_request.prefix.entry_count,
-				 (int)context->current_mx_failure,
-				 context->current_mx_failure_xid,
-				 context->current_mx_failure_index, (int)context->phase,
-				 context->current_mx_current_owner_found,
-				 (int)context->current_mx_durable_locate_result,
-				 context->current_mx_locator_count,
-				 context->current_mx_sampled_bitmap,
-				 locator != NULL ? locator->segment_id : 0,
-				 locator != NULL ? locator->slot_offset : 0,
-				 locator != NULL ? locator->wrap : 0,
-				 context->tt_logical.segment_id,
-				 context->tt_root.root_id,
-				 context->tt_root.root_generation,
-				 context->admission.formation_epoch,
-				 context->admission.record_generation)));
+	ereport(
+		LOG,
+		(errmsg_internal(
+			"PGRAC current-MultiXact origin first unknown: requester=%d "
+			"backend=%d request=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+			" kind=%u entries=%u failure=%d xid=%u index=%u phase=%d "
+			"current_owner_found=%d durable_locate=%d "
+			"locator_count=%u sampled=0x%02x locator_segment=%u "
+			"locator_slot=%u locator_wrap=%u tt_segment=%u root=" UINT64_FORMAT "/" UINT64_FORMAT
+			" admission_formation=" UINT64_FORMAT " admission_generation=" UINT64_FORMAT,
+			context->current_mx_request.prefix.original_requester_node,
+			context->current_mx_request.prefix.requester_backend_id,
+			context->current_mx_request.prefix.request_id, context->current_mx_request.prefix.epoch,
+			context->current_mx_request.prefix.body_kind,
+			context->current_mx_request.prefix.entry_count, (int)context->current_mx_failure,
+			context->current_mx_failure_xid, context->current_mx_failure_index, (int)context->phase,
+			context->current_mx_current_owner_found, (int)context->current_mx_durable_locate_result,
+			context->current_mx_locator_count, context->current_mx_sampled_bitmap,
+			locator != NULL ? locator->segment_id : 0, locator != NULL ? locator->slot_offset : 0,
+			locator != NULL ? locator->wrap : 0, context->tt_logical.segment_id,
+			context->tt_root.root_id, context->tt_root.root_generation,
+			context->admission.formation_epoch, context->admission.record_generation)));
 }
 
 static void
-gcs_block_current_mx_origin_prepare_reply(
-	GcsBlockR4TxOriginContext *context)
+gcs_block_current_mx_origin_prepare_reply(GcsBlockR4TxOriginContext *context)
 {
 	GcsBlockReplyHeader *header;
 	ClusterCurrentMxProofReplyPage *page;
@@ -7738,81 +7531,67 @@ gcs_block_current_mx_origin_prepare_reply(
 	uint16 i;
 
 	if (context->current_mx_result == CMX_RESOLVE_OK
-		&& !gcs_block_current_mx_requester_identity_current(context))
-	{
+		&& !gcs_block_current_mx_requester_identity_current(context)) {
 		context->current_mx_result = CMX_RESOLVE_RETRY;
 		context->current_mx_proof_count = 0;
-		context->current_mx_failure
-			= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
+		context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
 	}
 	/* The proof was sampled before releasing block-0 SCUR.  Revalidate every
 	 * positive CTRC grant immediately before encoding the reply so an origin
 	 * that entered SEALING while the send was delayed cannot leak an old
 	 * ACTIVE/SELF grant. */
-	for (i = 0; context->current_mx_result == CMX_RESOLVE_OK
-			 && i < context->current_mx_proof_count; i++)
-	{
-		const ClusterCurrentMemberProof *proof
-			= &context->current_mx_proofs[i];
+	for (i = 0; context->current_mx_result == CMX_RESOLVE_OK && i < context->current_mx_proof_count;
+		 i++) {
+		const ClusterCurrentMemberProof *proof = &context->current_mx_proofs[i];
 		uint32 grant = ClusterCurrentMemberProofGetCtrcGrant(proof);
 
 		if ((proof->state == CCM_ACTIVE || proof->state == CCM_SELF)
-			&& !cluster_ctrc_origin_grant_publishable(
-				&context->current_mx_ctrc_keys[i],
-				&context->current_mx_requester_identity, grant))
-		{
+			&& !cluster_ctrc_origin_grant_publishable(&context->current_mx_ctrc_keys[i],
+													  &context->current_mx_requester_identity,
+													  grant)) {
 			cluster_ctrc_stat_bump(CTRC_STAT_GRANT_REFUSED);
 			context->current_mx_result = CMX_RESOLVE_RETRY;
 			context->current_mx_proof_count = 0;
-			context->current_mx_failure
-				= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
+			context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
 		}
 	}
 	memset(context->reply_frame, 0, sizeof(context->reply_frame));
 	header = (GcsBlockReplyHeader *)context->reply_frame;
-	page = (ClusterCurrentMxProofReplyPage *)(
-		context->reply_frame + sizeof(*header));
+	page = (ClusterCurrentMxProofReplyPage *)(context->reply_frame + sizeof(*header));
 	if (context->current_mx_result == CMX_RESOLVE_UNKNOWN)
 		gcs_block_current_mx_origin_log_first_unknown(context);
 	if (context->current_mx_result == CMX_RESOLVE_OK)
 		requester_capability_generation
 			= context->current_mx_requester_identity.capability_record_generation;
 	built = cluster_cr_server_current_mx_build_proof_page(
-		(uint16)cluster_node_id, &context->current_mx_request,
-		context->current_mx_result, requester_capability_generation,
-		context->current_mx_proofs,
-		context->current_mx_proof_count,
-		&context->current_mx_updater_proof, page);
+		(uint16)cluster_node_id, &context->current_mx_request, context->current_mx_result,
+		requester_capability_generation, context->current_mx_proofs,
+		context->current_mx_proof_count, &context->current_mx_updater_proof, page);
 	if (built != context->current_mx_result) {
 		context->current_mx_result = CMX_RESOLVE_UNKNOWN;
 		context->current_mx_proof_count = 0;
 		(void)cluster_cr_server_current_mx_build_proof_page(
-			(uint16)cluster_node_id, &context->current_mx_request,
-			CMX_RESOLVE_UNKNOWN, 0, NULL, 0, NULL, page);
+			(uint16)cluster_node_id, &context->current_mx_request, CMX_RESOLVE_UNKNOWN, 0, NULL, 0,
+			NULL, page);
 	}
 	header->request_id = context->current_mx_request.prefix.request_id;
 	header->epoch = context->current_mx_request.prefix.epoch;
 	header->sender_node = cluster_node_id;
-	header->requester_backend_id
-		= context->current_mx_request.prefix.requester_backend_id;
+	header->requester_backend_id = context->current_mx_request.prefix.requester_backend_id;
 	header->transition_id = 0;
-	header->status
-		= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
-	GcsBlockReplyHeaderSetForwardingMasterNode(
-		header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	header->status = (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	header->checksum = gcs_block_compute_checksum((const char *)page);
 }
 
 static bool
-gcs_block_current_mx_origin_sample_held(
-	GcsBlockR4TxOriginContext *context)
+gcs_block_current_mx_origin_sample_held(GcsBlockR4TxOriginContext *context)
 {
 	const ClusterCurrentMxProofForwardV2 *request;
 	uint16 count;
 	uint16 i;
 
-	if (context == NULL
-		|| context->domain != GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+	if (context == NULL || context->domain != GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
 		return false;
 	request = &context->current_mx_request;
 	count = context->current_mx_locator_count;
@@ -7834,82 +7613,66 @@ gcs_block_current_mx_origin_sample_held(
 		memset(&ctrc_key, 0, sizeof(ctrc_key));
 
 		if ((context->current_mx_sampled_bitmap & (uint8)(1U << i)) != 0
-			|| context->current_mx_locators[i].segment_id
-				   != context->tt_logical.segment_id)
+			|| context->current_mx_locators[i].segment_id != context->tt_logical.segment_id)
 			continue;
-		if (request->prefix.body_kind
-				== CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS)
+		if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_MEMBER_ASKS)
 			ask = &request->trailer.body.asks[i];
 		else {
 			memset(&updater_ask, 0, sizeof(updater_ask));
-			updater_ask.xid
-				= request->trailer.body.updater.challenge.updater_xid;
-			updater_ask.member_ordinal
-				= request->trailer.body.updater.challenge.member_ordinal;
-			updater_ask.member_status
-				= request->trailer.body.updater.challenge.member_status;
+			updater_ask.xid = request->trailer.body.updater.challenge.updater_xid;
+			updater_ask.member_ordinal = request->trailer.body.updater.challenge.member_ordinal;
+			updater_ask.member_status = request->trailer.body.updater.challenge.member_status;
 			ask = &updater_ask;
 		}
 		memset(&key, 0, sizeof(key));
 		memset(&result, 0, sizeof(result));
 		if (!cluster_runtime_visibility_physical_locator_sample_held(
-				&context->current_mx_locators[i],
-				&context->admission, &context->guard, &context->tt_root,
-				&key, &result, &ctrc_physical_active))
+				&context->current_mx_locators[i], &context->admission, &context->guard,
+				&context->tt_root, &key, &result, &ctrc_physical_active))
 			return false;
 		context->current_mx_sampled_keys[i] = key;
 		if (!cluster_multixact_current_resolve_origin_member_proof(
-				ask->xid, ask->member_status, ask->member_ordinal,
-				(uint16)cluster_node_id,
-				request->prefix.mxkey.cluster_epoch, false, &key, &result,
-				NULL, NULL, &context->current_mx_proofs[i]))
+				ask->xid, ask->member_status, ask->member_ordinal, (uint16)cluster_node_id,
+				request->prefix.mxkey.cluster_epoch, false, &key, &result, NULL, NULL,
+				&context->current_mx_proofs[i]))
 			return false;
 		if (context->current_mx_proofs[i].state == CCM_ACTIVE
-			|| context->current_mx_proofs[i].state == CCM_SELF)
-		{
+			|| context->current_mx_proofs[i].state == CCM_SELF) {
 			if (!ctrc_physical_active)
 				return false;
-			if (cluster_undo_block0_current_sample_generation(
-					&context->guard, &context->tt_root, &generation)
-				!= CLUSTER_UNDO_BLOCK0_OK
-				|| !gcs_block_current_mx_ctrc_key(
-					context, i, &generation, &ctrc_key))
+			if (cluster_undo_block0_current_sample_generation(&context->guard, &context->tt_root,
+															  &generation)
+					!= CLUSTER_UNDO_BLOCK0_OK
+				|| !gcs_block_current_mx_ctrc_key(context, i, &generation, &ctrc_key))
 				return false;
 			touch_result = cluster_ctrc_origin_touch_exact(
 				&ctrc_key, &context->current_mx_requester_identity,
-				context->current_mx_proofs[i].state == CCM_SELF
-					? CTRC_PROOF_SELF : CTRC_PROOF_ACTIVE,
+				context->current_mx_proofs[i].state == CCM_SELF ? CTRC_PROOF_SELF
+																: CTRC_PROOF_ACTIVE,
 				&ctrc_grant);
 			if ((touch_result != CLUSTER_CTRC_TOUCH_RECORDED
 				 && touch_result != CLUSTER_CTRC_TOUCH_DUPLICATE)
 				|| ctrc_grant == 0
-				|| cluster_undo_block0_current_sample_generation(
-					&context->guard, &context->tt_root, &final_generation)
-				   != CLUSTER_UNDO_BLOCK0_OK
-				|| !final_generation.known
-				|| final_generation.value != generation.value
-				|| !gcs_block_r4_tx_origin_resolve_root_current(
-					context, &context->tt_logical, &final_root)
-				|| !cluster_undo_block0_root_matches(
-					&context->tt_root, &final_root)
+				|| cluster_undo_block0_current_sample_generation(&context->guard, &context->tt_root,
+																 &final_generation)
+					   != CLUSTER_UNDO_BLOCK0_OK
+				|| !final_generation.known || final_generation.value != generation.value
+				|| !gcs_block_r4_tx_origin_resolve_root_current(context, &context->tt_logical,
+																&final_root)
+				|| !cluster_undo_block0_root_matches(&context->tt_root, &final_root)
 				|| !gcs_block_r4_tx_origin_admission_current(context)
-				|| cluster_qvotec_get_self_incarnation()
-				   != ctrc_key.origin_boot_incarnation)
+				|| cluster_qvotec_get_self_incarnation() != ctrc_key.origin_boot_incarnation)
 				return false;
-			ClusterCurrentMemberProofSetCtrcGrant(
-				&context->current_mx_proofs[i], ctrc_grant);
-			if (!cluster_multixact_current_member_proof_bind_ctrc(
-					&context->current_mx_proofs[i], &ctrc_key))
+			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], ctrc_grant);
+			if (!cluster_multixact_current_member_proof_bind_ctrc(&context->current_mx_proofs[i],
+																  &ctrc_key))
 				return false;
 			context->current_mx_ctrc_keys[i] = ctrc_key;
-		}
-		else
-			ClusterCurrentMemberProofSetCtrcGrant(
-				&context->current_mx_proofs[i], 0);
+		} else
+			ClusterCurrentMemberProofSetCtrcGrant(&context->current_mx_proofs[i], 0);
 		context->current_mx_sampled_bitmap |= (uint8)(1U << i);
 	}
-	if (request->prefix.body_kind
-			== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
+	if (request->prefix.body_kind == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE) {
 		const ClusterCurrentMxUpdaterChallengeWire *challenge
 			= &request->trailer.body.updater.challenge;
 
@@ -7918,10 +7681,8 @@ gcs_block_current_mx_origin_sample_held(
 			= challenge->candidate_next_xmin_alias;
 		context->current_mx_updater_proof.candidate_next_xmin_locator
 			= challenge->candidate_next_xmin_locator;
-		context->current_mx_updater_proof.updater_xid
-			= challenge->updater_xid;
-		context->current_mx_updater_proof.member_ordinal
-			= challenge->member_ordinal;
+		context->current_mx_updater_proof.updater_xid = challenge->updater_xid;
+		context->current_mx_updater_proof.member_ordinal = challenge->member_ordinal;
 		/* DATA requalification, not the canonical TT sample alone, promotes
 		 * this exact echo to MATCH. */
 		context->current_mx_updater_proof.verdict = CUCP_UNKNOWN;
@@ -7936,40 +7697,34 @@ typedef enum GcsBlockCurrentMxAdvance {
 } GcsBlockCurrentMxAdvance;
 
 static GcsBlockCurrentMxAdvance
-gcs_block_current_mx_origin_updater_provenance_advance(
-	GcsBlockR4TxOriginContext *context)
+gcs_block_current_mx_origin_updater_provenance_advance(GcsBlockR4TxOriginContext *context)
 {
 	ClusterRuntimeVisibilityOriginStep origin_step;
 	ClusterTxOutcome outcome;
 	bool same_segment = false;
 
-	if (context == NULL
-		|| context->domain != GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+	if (context == NULL || context->domain != GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
 		|| context->current_mx_request.prefix.body_kind
-			!= CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE
+			   != CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE
 		|| gcs_block_r4_tx_origin_remaining_timeout_ms(context) == 0)
 		return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 
 	switch (context->phase) {
 	case GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE:
-		origin_step
-			= cluster_runtime_visibility_origin_plan_freeze_data_held(
-				&context->locator, context->resolve_mode,
-				&context->admission, NULL, &context->guard,
-				&context->root, &context->origin_plan,
-				&context->resolution, &context->reason);
+		origin_step = cluster_runtime_visibility_origin_plan_freeze_data_held(
+			&context->locator, context->resolve_mode, &context->admission, NULL, &context->guard,
+			&context->root, &context->origin_plan, &context->resolution, &context->reason);
 		if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_FAILED
 			|| !cluster_runtime_visibility_origin_plan_canonical_physical(
-				&context->origin_plan, &context->current_mx_locators[0],
-				&same_segment))
+				&context->origin_plan, &context->current_mx_locators[0], &same_segment))
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 		context->current_mx_locator_count = 1;
 		if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL) {
 			if (same_segment
-				|| !cluster_runtime_visibility_origin_plan_canonical_logical(
-					&context->origin_plan, &context->tt_logical)
-				|| !gcs_block_r4_tx_origin_resolve_root_current(
-					context, &context->tt_logical, &context->tt_root))
+				|| !cluster_runtime_visibility_origin_plan_canonical_logical(&context->origin_plan,
+																			 &context->tt_logical)
+				|| !gcs_block_r4_tx_origin_resolve_root_current(context, &context->tt_logical,
+																&context->tt_root))
 				return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT;
 		}
@@ -7981,9 +7736,8 @@ gcs_block_current_mx_origin_updater_provenance_advance(
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 		context->canonical_sampled = true;
 		outcome = cluster_runtime_visibility_origin_plan_recheck_data_held(
-			&context->origin_plan, context->resolve_mode,
-			&context->admission, &context->guard, &context->root,
-			&context->resolution, &context->reason);
+			&context->origin_plan, context->resolve_mode, &context->admission, &context->guard,
+			&context->root, &context->resolution, &context->reason);
 		if (outcome == CLUSTER_TX_UNKNOWN)
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 		context->outcome = outcome;
@@ -7994,9 +7748,8 @@ gcs_block_current_mx_origin_updater_provenance_advance(
 
 	case GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE:
 		if (!cluster_runtime_visibility_origin_plan_sample_canonical_held(
-				&context->origin_plan, context->resolve_mode,
-				&context->admission, &context->guard, &context->tt_root,
-				&context->reason)
+				&context->origin_plan, context->resolve_mode, &context->admission, &context->guard,
+				&context->tt_root, &context->reason)
 			|| !gcs_block_current_mx_origin_sample_held(context))
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 		context->canonical_sampled = true;
@@ -8004,9 +7757,8 @@ gcs_block_current_mx_origin_updater_provenance_advance(
 
 	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK:
 		outcome = cluster_runtime_visibility_origin_plan_recheck_data_held(
-			&context->origin_plan, context->resolve_mode,
-			&context->admission, &context->guard, &context->recheck_root,
-			&context->resolution, &context->reason);
+			&context->origin_plan, context->resolve_mode, &context->admission, &context->guard,
+			&context->recheck_root, &context->resolution, &context->reason);
 		if (outcome == CLUSTER_TX_UNKNOWN)
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 		context->outcome = outcome;
@@ -8021,8 +7773,7 @@ gcs_block_current_mx_origin_updater_provenance_advance(
 }
 
 static GcsBlockCurrentMxAdvance
-gcs_block_current_mx_origin_advance(
-	GcsBlockR4TxOriginContext *context)
+gcs_block_current_mx_origin_advance(GcsBlockR4TxOriginContext *context)
 {
 	uint16 i;
 
@@ -8031,36 +7782,29 @@ gcs_block_current_mx_origin_advance(
 	for (i = 0; i < context->current_mx_locator_count; i++) {
 		if ((context->current_mx_sampled_bitmap & (uint8)(1U << i)) != 0)
 			continue;
-		context->tt_logical.owner_instance
-			= (uint8)((uint32)cluster_node_id + 1);
-		context->tt_logical.segment_id
-			= context->current_mx_locators[i].segment_id;
-		if (!gcs_block_r4_tx_origin_resolve_root_current(
-				context, &context->tt_logical, &context->tt_root)) {
+		context->tt_logical.owner_instance = (uint8)((uint32)cluster_node_id + 1);
+		context->tt_logical.segment_id = context->current_mx_locators[i].segment_id;
+		if (!gcs_block_r4_tx_origin_resolve_root_current(context, &context->tt_logical,
+														 &context->tt_root)) {
 			context->current_mx_result = CMX_RESOLVE_UNKNOWN;
-			context->current_mx_failure
-				= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
-			context->current_mx_failure_xid
-				= context->current_mx_locators[i].xid;
+			context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
+			context->current_mx_failure_xid = context->current_mx_locators[i].xid;
 			context->current_mx_failure_index = i;
 			return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 		}
 		return GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT;
 	}
-	if (!gcs_block_current_mx_requester_identity_current(context))
-	{
+	if (!gcs_block_current_mx_requester_identity_current(context)) {
 		context->current_mx_result = CMX_RESOLVE_RETRY;
 		context->current_mx_proof_count = 0;
-		context->current_mx_failure
-			= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
+		context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
 		return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 	}
 	if (context->current_mx_request.prefix.body_kind
 			== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE
 		&& context->current_mx_updater_proof.verdict != CUCP_MATCH) {
 		context->current_mx_result = CMX_RESOLVE_UNKNOWN;
-		context->current_mx_failure
-			= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
+		context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
 		return GCS_BLOCK_CURRENT_MX_ADVANCE_FAILED;
 	}
 	context->current_mx_proof_count = context->current_mx_locator_count;
@@ -8068,17 +7812,15 @@ gcs_block_current_mx_origin_advance(
 	context->reason = CLUSTER_TX_RESOLVE_NONE;
 	if (context->current_mx_request.prefix.body_kind
 			== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE
-		&& context->current_mx_request.trailer.body.updater.challenge
-			   .candidate_next_xmin_alias.undo_record_segment_id
+		&& context->current_mx_request.trailer.body.updater.challenge.candidate_next_xmin_alias
+				   .undo_record_segment_id
 			   != context->current_mx_locators[0].segment_id)
-		cluster_multixact_current_stats_bump(
-			CMX_STAT_UPDATER_PROVENANCE_CROSS_SEGMENT_MATCH);
+		cluster_multixact_current_stats_bump(CMX_STAT_UPDATER_PROVENANCE_CROSS_SEGMENT_MATCH);
 	return GCS_BLOCK_CURRENT_MX_ADVANCE_COMPLETE;
 }
 
 static GcsBlockR4TxOriginPhase
-gcs_block_current_mx_origin_after_release(
-	GcsBlockR4TxOriginContext *context)
+gcs_block_current_mx_origin_after_release(GcsBlockR4TxOriginContext *context)
 {
 	GcsBlockCurrentMxAdvance advance;
 
@@ -8086,11 +7828,9 @@ gcs_block_current_mx_origin_after_release(
 		return GCS_BLOCK_R4_TX_ORIGIN_SEND;
 	advance = gcs_block_current_mx_origin_advance(context);
 	if (advance == GCS_BLOCK_CURRENT_MX_ADVANCE_COMPLETE)
-		cluster_ctrc_test_barrier_wait(
-			CTRC_TEST_BARRIER_ACTIVE_PROOF_READY);
-	return advance == GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT
-		? GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN
-		: GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		cluster_ctrc_test_barrier_wait(CTRC_TEST_BARRIER_ACTIVE_PROOF_READY);
+	return advance == GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT ? GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN
+														: GCS_BLOCK_R4_TX_ORIGIN_SEND;
 }
 
 /* The status-22 DATA worker is the one bounded resolver for all contexts in
@@ -8098,14 +7838,12 @@ gcs_block_current_mx_origin_after_release(
  * burst must yield in the existing event loop until the current holder has
  * released it.  Each waiting context retains its original deadline. */
 static bool
-gcs_block_r4_tx_origin_scur_available(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_scur_available(const GcsBlockR4TxOriginContext *context)
 {
 	int i;
 
 	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
-		const GcsBlockR4TxOriginContext *other
-			= &gcs_block_r4_tx_origin_contexts[i];
+		const GcsBlockR4TxOriginContext *other = &gcs_block_r4_tx_origin_contexts[i];
 
 		if (other != context && other->in_use && other->guard_active)
 			return false;
@@ -8116,8 +7854,7 @@ gcs_block_r4_tx_origin_scur_available(
 /* Status-22 contexts are owned by worker 0.  Current-MX proof contexts are
  * owned by the DATA shard that accepted their exact request identity. */
 static bool
-gcs_block_r4_tx_origin_worker_current(
-	const GcsBlockR4TxOriginContext *context)
+gcs_block_r4_tx_origin_worker_current(const GcsBlockR4TxOriginContext *context)
 {
 	int current_worker;
 
@@ -8126,13 +7863,11 @@ gcs_block_r4_tx_origin_worker_current(
 	current_worker = cluster_ic_tier1_my_data_channel();
 	if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
 		BufferTag route_tag = GcsBlockCurrentMxRouteTagMake(
-			context->current_mx_request.prefix.request_id,
-			context->current_mx_request.prefix.epoch,
+			context->current_mx_request.prefix.request_id, context->current_mx_request.prefix.epoch,
 			context->current_mx_request.prefix.original_requester_node,
 			context->current_mx_request.prefix.requester_backend_id);
 
-		return current_worker
-			== cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
+		return current_worker == cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 	}
 	return current_worker == 0;
 }
@@ -8147,489 +7882,409 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 	int remaining_timeout_ms;
 
 	switch (context->phase) {
-		case GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN:
-			if (!gcs_block_r4_tx_origin_scur_available(context)) {
-				if (gcs_block_r4_tx_origin_deadline_expired(context))
-					gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			remaining_timeout_ms
-				= gcs_block_r4_tx_origin_remaining_timeout_ms(context);
-			if (context->deadline != 0 && remaining_timeout_ms == 0) {
-				context->reason = CLUSTER_TX_RESOLVE_TIMEOUT;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-				break;
-			}
-			step = cluster_undo_block0_current_acquire_begin_admitted(
-				&context->logical, CLUSTER_UNDO_BLOCK0_SCUR,
-				remaining_timeout_ms, &context->admission,
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
-				context->guard_active = true;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE;
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
-				context->guard_active = true;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_POLL;
-			} else
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_POLL:
-			if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+	case GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_BEGIN:
+		if (!gcs_block_r4_tx_origin_scur_available(context)) {
+			if (gcs_block_r4_tx_origin_deadline_expired(context))
 				gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			step = cluster_undo_block0_current_acquire_poll(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE;
-			else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
-				context->guard_active = false;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			break;
+		}
+		remaining_timeout_ms = gcs_block_r4_tx_origin_remaining_timeout_ms(context);
+		if (context->deadline != 0 && remaining_timeout_ms == 0) {
+			context->reason = CLUSTER_TX_RESOLVE_TIMEOUT;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			break;
+		}
+		step = cluster_undo_block0_current_acquire_begin_admitted(
+			&context->logical, CLUSTER_UNDO_BLOCK0_SCUR, remaining_timeout_ms, &context->admission,
+			&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+			context->guard_active = true;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE;
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			context->guard_active = true;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_POLL;
+		} else
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_ACQUIRE_POLL:
+		if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+			gcs_block_r4_tx_origin_timeout(context);
+			break;
+		}
+		step = cluster_undo_block0_current_acquire_poll(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE;
+		else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			context->guard_active = false;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE:
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+			current_mx_advance = gcs_block_current_mx_origin_updater_provenance_advance(context);
+			if (current_mx_advance == GCS_BLOCK_CURRENT_MX_ADVANCE_COMPLETE)
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+			else if (current_mx_advance == GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT)
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN;
+			else {
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
 			}
 			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_DATA_FREEZE:
-			if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
-				current_mx_advance
-					= gcs_block_current_mx_origin_updater_provenance_advance(
-						context);
-				if (current_mx_advance
-						== GCS_BLOCK_CURRENT_MX_ADVANCE_COMPLETE)
-					context->phase
-						= GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
-				else if (current_mx_advance
-						 == GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT)
-					context->phase
-						= GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN;
-				else {
-					context->current_mx_failure
-						= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
-					context->phase
-						= GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
-				}
-				break;
-			}
-			/* Neither remote consumer must cache this origin's header. Select
+		}
+		/* Neither remote consumer must cache this origin's header. Select
 			 * only before freezing DATA, under the existing own-origin guard;
 			 * the unchanged plan then binds and rechecks this exact generation. */
-			if (!context->expected_generation.known) {
-				ClusterUndoBlock0Generation sampled = { false, 0 };
+		if (!context->expected_generation.known) {
+			ClusterUndoBlock0Generation sampled = { false, 0 };
 
-				if (cluster_undo_block0_current_sample_generation(&context->guard, &context->root,
-																  &sampled)
-						!= CLUSTER_UNDO_BLOCK0_OK
-					|| !sampled.known || sampled.value == UINT32_MAX) {
-					context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-					context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
-					break;
-				}
-				context->expected_generation = sampled;
-			}
-			origin_step
-				= cluster_runtime_visibility_origin_plan_freeze_data_held(
-					&context->locator, context->resolve_mode,
-					&context->admission, &context->expected_generation,
-					&context->guard, &context->root,
-					&context->origin_plan, &context->resolution,
-					&context->reason);
-			if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE) {
-				context->outcome = context->resolution.outcome;
-				if (context->undo_data_fetch)
-					gcs_block_r4_undo_origin_copy_held(context, &context->root);
-				context->phase
-					= GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
-			} else if (origin_step
-					   == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL)
-				context->phase
-					= GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN;
-			else
-				context->phase
-					= GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN:
-			step = cluster_undo_block0_current_release_begin(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				context->guard_active = false;
-				memset(&context->guard, 0, sizeof(context->guard));
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN;
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_POLL;
-			else {
-				context->guard_active = false;
-				context->outcome = CLUSTER_TX_UNKNOWN;
+			if (cluster_undo_block0_current_sample_generation(&context->guard, &context->root,
+															  &sampled)
+					!= CLUSTER_UNDO_BLOCK0_OK
+				|| !sampled.known || sampled.value == UINT32_MAX) {
 				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-				memset(&context->resolution, 0,
-					   sizeof(context->resolution));
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_POLL:
-			if (gcs_block_r4_tx_origin_deadline_expired(context)) {
-				gcs_block_r4_tx_origin_timeout(context);
+				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
 				break;
 			}
-			step = cluster_undo_block0_current_release_poll(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				context->guard_active = false;
-				memset(&context->guard, 0, sizeof(context->guard));
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN;
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
-				context->guard_active = false;
-				context->outcome = CLUSTER_TX_UNKNOWN;
-				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-				memset(&context->resolution, 0,
-					   sizeof(context->resolution));
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN:
-			if (!gcs_block_r4_tx_origin_scur_available(context)) {
-				if (gcs_block_r4_tx_origin_deadline_expired(context))
-					gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			if ((context->domain
-					 == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-				 && (!gcs_block_r4_tx_origin_admission_current(context)
-					 || context->tt_logical.segment_id == 0))
-				|| (context->domain
-						== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE
-					&& (!cluster_runtime_visibility_origin_plan_canonical_logical(
-							&context->origin_plan, &context->tt_logical)
-						|| !gcs_block_r4_tx_origin_resolve_root_current(
-							context, &context->tt_logical,
-							&context->tt_root)))) {
-				context->outcome = CLUSTER_TX_UNKNOWN;
-				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
-				if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
-					context->current_mx_failure
-						= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
-					if (context->current_mx_locator_count != 0)
-						context->current_mx_failure_xid
-							= context->current_mx_locators[0].xid;
-				}
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-				break;
-			}
-			remaining_timeout_ms
-				= gcs_block_r4_tx_origin_remaining_timeout_ms(context);
-			if (context->deadline != 0 && remaining_timeout_ms == 0) {
-				context->reason = CLUSTER_TX_RESOLVE_TIMEOUT;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-				break;
-			}
-			step = cluster_undo_block0_current_acquire_begin_admitted(
-				&context->tt_logical, CLUSTER_UNDO_BLOCK0_SCUR,
-				remaining_timeout_ms, &context->admission,
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
-				context->guard_active = true;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE;
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
-				context->guard_active = true;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_POLL;
-			} else {
-				if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
-					context->current_mx_failure
-						= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_ACQUIRE;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_POLL:
-			if (gcs_block_r4_tx_origin_deadline_expired(context)) {
-				gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			step = cluster_undo_block0_current_acquire_poll(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE;
-			else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
-				context->guard_active = false;
-				if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
-					context->current_mx_failure
-						= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_ACQUIRE;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE:
-			if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-				&& context->current_mx_request.prefix.body_kind
-					== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
-				context->canonical_sampled
-					= gcs_block_current_mx_origin_updater_provenance_advance(
-						context) == GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT;
-			else
-				context->canonical_sampled = context->domain
-						== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-					? gcs_block_current_mx_origin_sample_held(context)
-					: cluster_runtime_visibility_origin_plan_sample_canonical_held(
-						&context->origin_plan, context->resolve_mode,
-						&context->admission, &context->guard,
-						&context->tt_root, &context->reason);
-			if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-				&& !context->canonical_sampled)
-				context->current_mx_failure
-					= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
-			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_BEGIN;
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_BEGIN:
-			step = cluster_undo_block0_current_release_begin(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				context->guard_active = false;
-				memset(&context->guard, 0, sizeof(context->guard));
-				if (context->domain
-						== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-					&& context->current_mx_request.prefix.body_kind
-						== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
-					context->phase = context->canonical_sampled
-						? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
-						: GCS_BLOCK_R4_TX_ORIGIN_SEND;
-				else
-					context->phase = context->domain
-							== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-						? gcs_block_current_mx_origin_after_release(context)
-						: (context->canonical_sampled
-							? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
-							: GCS_BLOCK_R4_TX_ORIGIN_SEND);
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_POLL;
-			else {
-				context->guard_active = false;
-				context->outcome = CLUSTER_TX_UNKNOWN;
-				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-				if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
-					context->current_mx_failure
-						= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_POLL:
-			if (gcs_block_r4_tx_origin_deadline_expired(context)) {
-				gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			step = cluster_undo_block0_current_release_poll(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				context->guard_active = false;
-				memset(&context->guard, 0, sizeof(context->guard));
-				if (context->domain
-						== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-					&& context->current_mx_request.prefix.body_kind
-						== CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
-					context->phase = context->canonical_sampled
-						? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
-						: GCS_BLOCK_R4_TX_ORIGIN_SEND;
-				else
-					context->phase = context->domain
-							== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-						? gcs_block_current_mx_origin_after_release(context)
-						: (context->canonical_sampled
-							? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
-							: GCS_BLOCK_R4_TX_ORIGIN_SEND);
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
-				context->guard_active = false;
-				context->outcome = CLUSTER_TX_UNKNOWN;
-				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-				if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
-					context->current_mx_failure
-						= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN:
-			if (!gcs_block_r4_tx_origin_scur_available(context)) {
-				if (gcs_block_r4_tx_origin_deadline_expired(context))
-					gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			if (!gcs_block_r4_tx_origin_resolve_root_current(
-					context, &context->logical, &context->recheck_root)
-				|| context->recheck_root.intent != context->root.intent
-				|| context->recheck_root.root_id != context->root.root_id
-				|| context->recheck_root.root_generation
-					   != context->root.root_generation) {
-				context->outcome = CLUSTER_TX_UNKNOWN;
-				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-				break;
-			}
-			remaining_timeout_ms
-				= gcs_block_r4_tx_origin_remaining_timeout_ms(context);
-			if (context->deadline != 0 && remaining_timeout_ms == 0) {
-				context->reason = CLUSTER_TX_RESOLVE_TIMEOUT;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-				break;
-			}
-			step = cluster_undo_block0_current_acquire_begin_admitted(
-				&context->logical, CLUSTER_UNDO_BLOCK0_SCUR,
-				remaining_timeout_ms, &context->admission,
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
-				context->guard_active = true;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK;
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
-				context->guard_active = true;
-				context->phase
-					= GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_POLL;
-			} else
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_POLL:
-			if (gcs_block_r4_tx_origin_deadline_expired(context)) {
-				gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			step = cluster_undo_block0_current_acquire_poll(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK;
-			else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
-				context->guard_active = false;
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK:
-			if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
-				(void)gcs_block_current_mx_origin_updater_provenance_advance(
-					context);
-			else if (context->undo_data_fetch)
-				gcs_block_r4_undo_origin_copy_held(context, &context->recheck_root);
-			else
-				context->outcome
-					= cluster_runtime_visibility_origin_plan_recheck_data_held(
-						&context->origin_plan, context->resolve_mode,
-						&context->admission, &context->guard,
-						&context->recheck_root, &context->resolution,
-						&context->reason);
+			context->expected_generation = sampled;
+		}
+		origin_step = cluster_runtime_visibility_origin_plan_freeze_data_held(
+			&context->locator, context->resolve_mode, &context->admission,
+			&context->expected_generation, &context->guard, &context->root, &context->origin_plan,
+			&context->resolution, &context->reason);
+		if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_COMPLETE) {
+			context->outcome = context->resolution.outcome;
+			if (context->undo_data_fetch)
+				gcs_block_r4_undo_origin_copy_held(context, &context->root);
 			context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+		} else if (origin_step == CLUSTER_RUNTIME_VISIBILITY_ORIGIN_NEEDS_CANONICAL)
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN;
+		else
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_BEGIN:
+		step = cluster_undo_block0_current_release_begin(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+			context->guard_active = false;
+			memset(&context->guard, 0, sizeof(context->guard));
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN;
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_POLL;
+		else {
+			context->guard_active = false;
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			memset(&context->resolution, 0, sizeof(context->resolution));
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RELEASE_POLL:
+		if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+			gcs_block_r4_tx_origin_timeout(context);
 			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN:
-			step = cluster_undo_block0_current_release_begin(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				context->guard_active = false;
-				context->phase = context->domain
-						== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-					? gcs_block_current_mx_origin_after_release(context)
-					: GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_POLL;
-			else {
-				context->guard_active = false;
-				context->outcome = CLUSTER_TX_UNKNOWN;
-				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-				memset(&context->resolution, 0,
-					   sizeof(context->resolution));
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
-			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_POLL:
-			if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+		}
+		step = cluster_undo_block0_current_release_poll(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+			context->guard_active = false;
+			memset(&context->guard, 0, sizeof(context->guard));
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN;
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			context->guard_active = false;
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			memset(&context->resolution, 0, sizeof(context->resolution));
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_BEGIN:
+		if (!gcs_block_r4_tx_origin_scur_available(context)) {
+			if (gcs_block_r4_tx_origin_deadline_expired(context))
 				gcs_block_r4_tx_origin_timeout(context);
-				break;
-			}
-			step = cluster_undo_block0_current_release_poll(
-				&context->guard, &failure);
-			if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
-				context->guard_active = false;
-				context->phase = context->domain
-						== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
-					? gcs_block_current_mx_origin_after_release(context)
-					: GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
-				context->guard_active = false;
-				context->outcome = CLUSTER_TX_UNKNOWN;
-				context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
-				memset(&context->resolution, 0,
-					   sizeof(context->resolution));
-				context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
-			}
 			break;
-		case GCS_BLOCK_R4_TX_ORIGIN_SEND:
-		{
-			ClusterICSendResult send_result;
-			uint32 capability_generation = 0;
-			bool optional_supported = false;
-			int32 requester_node;
-			uint64 request_epoch;
-			bool capability_current;
-			uint32 reply_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
-
-			if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
-				requester_node
-					= context->current_mx_request.prefix.original_requester_node;
-				request_epoch = context->current_mx_request.prefix.epoch;
-				capability_current
-					= cluster_sf_peer_multixact_current_capability_generation(
-						requester_node, &capability_generation)
-					&& cluster_sf_peer_capability_generation_matches(
-						requester_node,
-						PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
-						capability_generation);
-			} else {
-				requester_node
-					= context->forward.base.original_requester_node;
-				request_epoch = context->forward.base.epoch;
-				capability_current = cluster_sf_peer_capability_family_sample(
-					requester_node, GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS, 0,
-					&optional_supported, &capability_generation);
+		}
+		if ((context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+			 && (!gcs_block_r4_tx_origin_admission_current(context)
+				 || context->tt_logical.segment_id == 0))
+			|| (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE
+				&& (!cluster_runtime_visibility_origin_plan_canonical_logical(&context->origin_plan,
+																			  &context->tt_logical)
+					|| !gcs_block_r4_tx_origin_resolve_root_current(context, &context->tt_logical,
+																	&context->tt_root)))) {
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_ROOT;
+				if (context->current_mx_locator_count != 0)
+					context->current_mx_failure_xid = context->current_mx_locators[0].xid;
 			}
-
-			if (!gcs_block_r4_tx_origin_worker_current(context)
-				|| cluster_epoch_get_current() != request_epoch
-				|| !capability_current
-					|| capability_generation
-						   != context->requester_capability_generation
-					|| !gcs_block_r4_tx_origin_admission_current(context)) {
-					if (context->domain
-						== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
-						context->current_mx_failure
-							= GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
-						gcs_block_current_mx_origin_log_first_unknown(context);
-					}
-					gcs_block_r4_tx_origin_context_clear(context, true);
-				break;
-			}
-			if (context->domain
-					== GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
-				gcs_block_current_mx_origin_prepare_reply(context);
-			else if (context->undo_data_fetch)
-				reply_size = gcs_block_r4_undo_origin_prepare_reply(context);
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			break;
+		}
+		remaining_timeout_ms = gcs_block_r4_tx_origin_remaining_timeout_ms(context);
+		if (context->deadline != 0 && remaining_timeout_ms == 0) {
+			context->reason = CLUSTER_TX_RESOLVE_TIMEOUT;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			break;
+		}
+		step = cluster_undo_block0_current_acquire_begin_admitted(
+			&context->tt_logical, CLUSTER_UNDO_BLOCK0_SCUR, remaining_timeout_ms,
+			&context->admission, &context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+			context->guard_active = true;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE;
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			context->guard_active = true;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_POLL;
+		} else {
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_ACQUIRE;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_TT_ACQUIRE_POLL:
+		if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+			gcs_block_r4_tx_origin_timeout(context);
+			break;
+		}
+		step = cluster_undo_block0_current_acquire_poll(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE;
+		else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			context->guard_active = false;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_ACQUIRE;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_TT_SAMPLE:
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+			&& context->current_mx_request.prefix.body_kind
+				   == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
+			context->canonical_sampled
+				= gcs_block_current_mx_origin_updater_provenance_advance(context)
+				  == GCS_BLOCK_CURRENT_MX_ADVANCE_NEXT;
+		else
+			context->canonical_sampled
+				= context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+					  ? gcs_block_current_mx_origin_sample_held(context)
+					  : cluster_runtime_visibility_origin_plan_sample_canonical_held(
+							&context->origin_plan, context->resolve_mode, &context->admission,
+							&context->guard, &context->tt_root, &context->reason);
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+			&& !context->canonical_sampled)
+			context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SAMPLE;
+		context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_BEGIN;
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_BEGIN:
+		step = cluster_undo_block0_current_release_begin(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+			context->guard_active = false;
+			memset(&context->guard, 0, sizeof(context->guard));
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+				&& context->current_mx_request.prefix.body_kind
+					   == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
+				context->phase = context->canonical_sampled
+									 ? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
+									 : GCS_BLOCK_R4_TX_ORIGIN_SEND;
 			else
-				gcs_block_r4_tx_origin_prepare_reply(context);
-			send_result = gcs_block_send_envelope_or_loopback(
-				PGRAC_IC_MSG_GCS_BLOCK_REPLY, requester_node, context->reply_frame, reply_size);
-			cluster_gcs_block_note_send_outcome(
-				GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
-			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE
-				&& send_result == CLUSTER_IC_SEND_NOT_ADMITTED)
-				break;
-			if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
-				cluster_lms_data_plane_close_peer_now(
-					context->forward.base.original_requester_node);
-			else if (ClusterGcsBlock != NULL)
-				pg_atomic_fetch_add_u64(
-					&ClusterGcsBlock->block_reply_count, 1);
+				context->phase = context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+									 ? gcs_block_current_mx_origin_after_release(context)
+									 : (context->canonical_sampled
+											? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
+											: GCS_BLOCK_R4_TX_ORIGIN_SEND);
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_POLL;
+		else {
+			context->guard_active = false;
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_TT_RELEASE_POLL:
+		if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+			gcs_block_r4_tx_origin_timeout(context);
+			break;
+		}
+		step = cluster_undo_block0_current_release_poll(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+			context->guard_active = false;
+			memset(&context->guard, 0, sizeof(context->guard));
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+				&& context->current_mx_request.prefix.body_kind
+					   == CLUSTER_CURRENT_MX_PROOF_BODY_UPDATER_CHALLENGE)
+				context->phase = context->canonical_sampled
+									 ? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
+									 : GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			else
+				context->phase = context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+									 ? gcs_block_current_mx_origin_after_release(context)
+									 : (context->canonical_sampled
+											? GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN
+											: GCS_BLOCK_R4_TX_ORIGIN_SEND);
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			context->guard_active = false;
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SCUR_RELEASE;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_BEGIN:
+		if (!gcs_block_r4_tx_origin_scur_available(context)) {
+			if (gcs_block_r4_tx_origin_deadline_expired(context))
+				gcs_block_r4_tx_origin_timeout(context);
+			break;
+		}
+		if (!gcs_block_r4_tx_origin_resolve_root_current(context, &context->logical,
+														 &context->recheck_root)
+			|| context->recheck_root.intent != context->root.intent
+			|| context->recheck_root.root_id != context->root.root_id
+			|| context->recheck_root.root_generation != context->root.root_generation) {
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_STALE;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			break;
+		}
+		remaining_timeout_ms = gcs_block_r4_tx_origin_remaining_timeout_ms(context);
+		if (context->deadline != 0 && remaining_timeout_ms == 0) {
+			context->reason = CLUSTER_TX_RESOLVE_TIMEOUT;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+			break;
+		}
+		step = cluster_undo_block0_current_acquire_begin_admitted(
+			&context->logical, CLUSTER_UNDO_BLOCK0_SCUR, remaining_timeout_ms, &context->admission,
+			&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD) {
+			context->guard_active = true;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK;
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING) {
+			context->guard_active = true;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_POLL;
+		} else
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK_ACQUIRE_POLL:
+		if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+			gcs_block_r4_tx_origin_timeout(context);
+			break;
+		}
+		step = cluster_undo_block0_current_acquire_poll(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_HELD)
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK;
+		else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			context->guard_active = false;
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_DATA_RECHECK:
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+			(void)gcs_block_current_mx_origin_updater_provenance_advance(context);
+		else if (context->undo_data_fetch)
+			gcs_block_r4_undo_origin_copy_held(context, &context->recheck_root);
+		else
+			context->outcome = cluster_runtime_visibility_origin_plan_recheck_data_held(
+				&context->origin_plan, context->resolve_mode, &context->admission, &context->guard,
+				&context->recheck_root, &context->resolution, &context->reason);
+		context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN;
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_BEGIN:
+		step = cluster_undo_block0_current_release_begin(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+			context->guard_active = false;
+			context->phase = context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+								 ? gcs_block_current_mx_origin_after_release(context)
+								 : GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_PENDING)
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_POLL;
+		else {
+			context->guard_active = false;
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			memset(&context->resolution, 0, sizeof(context->resolution));
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_FINAL_RELEASE_POLL:
+		if (gcs_block_r4_tx_origin_deadline_expired(context)) {
+			gcs_block_r4_tx_origin_timeout(context);
+			break;
+		}
+		step = cluster_undo_block0_current_release_poll(&context->guard, &failure);
+		if (step == CLUSTER_UNDO_BLOCK0_CURRENT_RELEASED) {
+			context->guard_active = false;
+			context->phase = context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX
+								 ? gcs_block_current_mx_origin_after_release(context)
+								 : GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		} else if (step == CLUSTER_UNDO_BLOCK0_CURRENT_FAILED) {
+			context->guard_active = false;
+			context->outcome = CLUSTER_TX_UNKNOWN;
+			context->reason = CLUSTER_TX_RESOLVE_AUTHORITY_UNAVAILABLE;
+			memset(&context->resolution, 0, sizeof(context->resolution));
+			context->phase = GCS_BLOCK_R4_TX_ORIGIN_SEND;
+		}
+		break;
+	case GCS_BLOCK_R4_TX_ORIGIN_SEND: {
+		ClusterICSendResult send_result;
+		uint32 capability_generation = 0;
+		bool optional_supported = false;
+		int32 requester_node;
+		uint64 request_epoch;
+		bool capability_current;
+		uint32 reply_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+			requester_node = context->current_mx_request.prefix.original_requester_node;
+			request_epoch = context->current_mx_request.prefix.epoch;
+			capability_current = cluster_sf_peer_multixact_current_capability_generation(
+									 requester_node, &capability_generation)
+								 && cluster_sf_peer_capability_generation_matches(
+									 requester_node, PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1,
+									 capability_generation);
+		} else {
+			requester_node = context->forward.base.original_requester_node;
+			request_epoch = context->forward.base.epoch;
+			capability_current = cluster_sf_peer_capability_family_sample(
+				requester_node, GCS_BLOCK_R4_TX_REQUIRED_HELLO_CAPS, 0, &optional_supported,
+				&capability_generation);
+		}
+
+		if (!gcs_block_r4_tx_origin_worker_current(context)
+			|| cluster_epoch_get_current() != request_epoch || !capability_current
+			|| capability_generation != context->requester_capability_generation
+			|| !gcs_block_r4_tx_origin_admission_current(context)) {
+			if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+				context->current_mx_failure = GCS_BLOCK_CURRENT_MX_ORIGIN_FAILURE_SEND_FRESHNESS;
+				gcs_block_current_mx_origin_log_first_unknown(context);
+			}
 			gcs_block_r4_tx_origin_context_clear(context, true);
 			break;
 		}
-		default:
-			gcs_block_r4_tx_origin_context_clear(context, true);
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX)
+			gcs_block_current_mx_origin_prepare_reply(context);
+		else if (context->undo_data_fetch)
+			reply_size = gcs_block_r4_undo_origin_prepare_reply(context);
+		else
+			gcs_block_r4_tx_origin_prepare_reply(context);
+		send_result = gcs_block_send_envelope_or_loopback(
+			PGRAC_IC_MSG_GCS_BLOCK_REPLY, requester_node, context->reply_frame, reply_size);
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
+		if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_TX_RESOLVE
+			&& send_result == CLUSTER_IC_SEND_NOT_ADMITTED)
 			break;
+		if (send_result == CLUSTER_IC_SEND_HARD_ERROR)
+			cluster_lms_data_plane_close_peer_now(context->forward.base.original_requester_node);
+		else if (ClusterGcsBlock != NULL)
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_reply_count, 1);
+		gcs_block_r4_tx_origin_context_clear(context, true);
+		break;
+	}
+	default:
+		gcs_block_r4_tx_origin_context_clear(context, true);
+		break;
 	}
 	if (context->in_use && failure != CLUSTER_UNDO_BLOCK0_OK
 		&& context->current_failure == CLUSTER_UNDO_BLOCK0_OK)
@@ -8642,15 +8297,12 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 	int i;
 
 	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
-		GcsBlockR4TxOriginContext *context
-			= &gcs_block_r4_tx_origin_contexts[i];
+		GcsBlockR4TxOriginContext *context = &gcs_block_r4_tx_origin_contexts[i];
 		int step_budget;
 
 		if (!context->in_use)
 			continue;
-		for (step_budget = 0;
-			 step_budget < GCS_BLOCK_R4_TX_ORIGIN_STEP_BUDGET;
-			 step_budget++) {
+		for (step_budget = 0; step_budget < GCS_BLOCK_R4_TX_ORIGIN_STEP_BUDGET; step_budget++) {
 			GcsBlockR4TxOriginPhase phase_before = context->phase;
 			MemoryContext saved_context = CurrentMemoryContext;
 
@@ -8677,8 +8329,7 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 			}
 			PG_END_TRY();
 			if (context->in_use && context->failure_phase == 0
-				&& gcs_block_r4_tx_origin_failure_transition(
-					phase_before, context))
+				&& gcs_block_r4_tx_origin_failure_transition(phase_before, context))
 				context->failure_phase = phase_before;
 			if (!context->in_use || context->phase == phase_before)
 				break;
@@ -8747,8 +8398,7 @@ cluster_gcs_block_r4_tx_resolve_wait_timeout(long idle_timeout_ms)
 	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++)
 		if (gcs_block_r4_tx_origin_contexts[i].in_use)
 			active_contexts++;
-	return cluster_gcs_block_r4_tx_resolve_wait_timeout_for_count(
-		idle_timeout_ms, active_contexts);
+	return cluster_gcs_block_r4_tx_resolve_wait_timeout_for_count(idle_timeout_ms, active_contexts);
 }
 
 static void
@@ -8980,8 +8630,7 @@ gcs_block_produce_reply(const GcsBlockRequestPayload *req, char *block_buf, bool
 	if (out_sf_dep_valid != NULL)
 		*out_sf_dep_valid = false;
 	if (preprepared_image
-		&& (*out_block_payload != block_buf
-			|| PageGetLSN((Page)block_buf) != *out_page_lsn)) {
+		&& (*out_block_payload != block_buf || PageGetLSN((Page)block_buf) != *out_page_lsn)) {
 		/* The X->S helper already committed the local downgrade, so never
 		 * recopy or invent a carrier here.  A PostgreSQL page LSN of zero is
 		 * valid (for example, a hint-only page); only disagreement between the
@@ -9151,8 +8800,7 @@ bool
 cluster_gcs_block_resource_x_local_s_barrier_active(BufferTag tag)
 {
 	if (!cluster_pcm_lock_resource_x_s_barrier_active(&tag)
-		&& !cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
-			&tag))
+		&& !cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(&tag))
 		return false;
 	if (ClusterGcsBlock != NULL)
 		pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
@@ -9175,28 +8823,25 @@ gcs_block_pcm_x_saturating_add_us(uint64 base, uint64 delta)
 }
 
 static bool
-gcs_block_resource_x_diagnostic_should_log(
-	GcsBlockResourceXDiagnostic diagnostic, int discriminator)
+gcs_block_resource_x_diagnostic_should_log(GcsBlockResourceXDiagnostic diagnostic,
+										   int discriminator)
 {
 	uint32 diagnostic_class;
 	uint64 now_us;
 	uint64 *next_log_at;
 
-	if (diagnostic < 0
-		|| diagnostic >= GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_COUNT)
+	if (diagnostic < 0 || diagnostic >= GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_COUNT)
 		return false;
-	diagnostic_class = discriminator >= 0
-		&& discriminator < GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_CLASS_COUNT - 1
-		? (uint32)discriminator
-		: GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_CLASS_COUNT - 1;
-	next_log_at
-		= &gcs_block_resource_x_diagnostic_next_log_at[diagnostic]
-			[diagnostic_class];
+	diagnostic_class
+		= discriminator >= 0 && discriminator < GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_CLASS_COUNT - 1
+			  ? (uint32)discriminator
+			  : GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_CLASS_COUNT - 1;
+	next_log_at = &gcs_block_resource_x_diagnostic_next_log_at[diagnostic][diagnostic_class];
 	now_us = gcs_block_pcm_x_monotonic_us();
 	if (now_us < *next_log_at)
 		return false;
-	*next_log_at = gcs_block_pcm_x_saturating_add_us(
-		now_us, GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_INTERVAL_US);
+	*next_log_at
+		= gcs_block_pcm_x_saturating_add_us(now_us, GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_INTERVAL_US);
 	return true;
 }
 
@@ -9224,9 +8869,7 @@ gcs_block_pcm_x_retry_timeout_us(void)
 {
 	uint64 timeout_ms = (uint64)Max(cluster_gcs_reply_timeout_ms, 1);
 
-	return timeout_ms > UINT64_MAX / UINT64_C(1000)
-		? UINT64_MAX
-		: timeout_ms * UINT64_C(1000);
+	return timeout_ms > UINT64_MAX / UINT64_C(1000) ? UINT64_MAX : timeout_ms * UINT64_C(1000);
 }
 
 static bool
@@ -9234,20 +8877,20 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
 {
 	if (msg_type == RESOURCE_X_MSG_ASSERT_X)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			|| payload_length == RESOURCE_X_SHORT_V1_BYTES;
+			   || payload_length == RESOURCE_X_SHORT_V1_BYTES;
 	if (msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			|| payload_length == RESOURCE_X_PROOF_V1_BYTES
-			|| payload_length == RESOURCE_X_IMAGE_V1_BYTES;
+			   || payload_length == RESOURCE_X_PROOF_V1_BYTES
+			   || payload_length == RESOURCE_X_IMAGE_V1_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCK_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			|| payload_length == RESOURCE_X_PROOF_V1_BYTES;
+			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
 	if (msg_type == RESOURCE_X_MSG_BLOCKED_TO_N)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			|| payload_length == RESOURCE_X_PROOF_V1_BYTES;
+			   || payload_length == RESOURCE_X_PROOF_V1_BYTES;
 	if (msg_type == RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE)
 		return payload_length == RESOURCE_X_CONTROL_V1_BYTES
-			|| payload_length == RESOURCE_X_SHORT_V1_BYTES;
+			   || payload_length == RESOURCE_X_SHORT_V1_BYTES;
 	return false;
 }
 
@@ -9255,8 +8898,7 @@ gcs_block_resource_x_payload_candidate(uint8 msg_type, uint32 payload_length)
  * connection (or the local endpoint) advertises the complete Resource-X
  * consumer.  A missing/reconnected peer stays on the legacy queue path. */
 static bool
-gcs_block_pcm_x_resource_x_peer_ready_exact(int32 peer_node,
-											uint32 *connection_generation_out)
+gcs_block_pcm_x_resource_x_peer_ready_exact(int32 peer_node, uint32 *connection_generation_out)
 {
 	uint32 capability_word = 0;
 	uint32 connection_generation = 0;
@@ -9266,8 +8908,8 @@ gcs_block_pcm_x_resource_x_peer_ready_exact(int32 peer_node,
 	if (peer_node < 0 || peer_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return false;
 	if (peer_node == cluster_node_id) {
-		if ((cluster_ic_local_capability_word()
-				 & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1) == 0)
+		if ((cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1)
+			== 0)
 			return false;
 		/* Same-node loopback has no peer HELLO record.  Match the existing
 		 * local DATA projection: capability-current generation 1 is sampled
@@ -9276,9 +8918,9 @@ gcs_block_pcm_x_resource_x_peer_ready_exact(int32 peer_node,
 			*connection_generation_out = 1;
 		return true;
 	}
-	if (!cluster_sf_peer_capability_word_sample(
-		peer_node, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-		&capability_word, &connection_generation)
+	if (!cluster_sf_peer_capability_word_sample(peer_node,
+												PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+												&capability_word, &connection_generation)
 		|| connection_generation == 0)
 		return false;
 	if (connection_generation_out != NULL)
@@ -9328,9 +8970,10 @@ gcs_block_resource_x_stage_ready_tag(const BufferTag *tag)
 }
 
 static PcmXSessionAuthResult
-gcs_block_resource_x_gate_session_snapshot_result(
-	const BufferTag *tag, ResourceXGateSnapshot *gate_out,
-	int32 *master_node_out, uint64 *master_session_out)
+gcs_block_resource_x_gate_session_snapshot_result(const BufferTag *tag,
+												  ResourceXGateSnapshot *gate_out,
+												  int32 *master_node_out,
+												  uint64 *master_session_out)
 {
 	ResourceXGateSnapshot gate;
 	PcmXSessionAuthResult session_result;
@@ -9365,16 +9008,14 @@ gcs_block_resource_x_gate_session_snapshot_result(
 }
 
 static bool
-gcs_block_resource_x_gate_session_snapshot(
-	const BufferTag *tag, ResourceXGateSnapshot *gate_out,
-	int32 *master_node_out, uint64 *master_session_out)
+gcs_block_resource_x_gate_session_snapshot(const BufferTag *tag, ResourceXGateSnapshot *gate_out,
+										   int32 *master_node_out, uint64 *master_session_out)
 {
 	ResourceXGateSnapshot gate;
 	uint64 master_session = 0;
 	int32 master_node = -1;
 
-	if (gcs_block_resource_x_gate_session_snapshot_result(
-			tag, &gate, &master_node, &master_session)
+	if (gcs_block_resource_x_gate_session_snapshot_result(tag, &gate, &master_node, &master_session)
 		!= PCM_X_SESSION_AUTH_OK)
 		return false;
 	if (gate_out != NULL)
@@ -9447,14 +9088,12 @@ gcs_block_resource_x_fail_closed_current(void)
 	ResourceXGateSnapshot gate;
 	ResourceXApplyResult result;
 
-	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-		|| gate.phase != RESOURCE_X_GATE_OPEN)
+	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate) || gate.phase != RESOURCE_X_GATE_OPEN)
 		return;
 	result = cluster_pcm_lock_resource_x_gate_fail_closed_exact(&gate);
 	if (result == RESOURCE_X_APPLY_APPLIED)
-		ereport(LOG,
-				(errmsg_internal("cluster PCM-X runtime fail-closed (recovery blocked): "
-								 "Resource-X gate fenced")));
+		ereport(LOG, (errmsg_internal("cluster PCM-X runtime fail-closed (recovery blocked): "
+									  "Resource-X gate fenced")));
 }
 
 static void
@@ -9476,8 +9115,7 @@ gcs_block_resource_x_put_u64(uint8 *out, uint64 value)
 }
 
 static uint32
-gcs_block_pcm_x_resource_x_dependency_crc(
-	const uint64 dependencies[RESOURCE_X_DEPENDENCY_MAX])
+gcs_block_pcm_x_resource_x_dependency_crc(const uint64 dependencies[RESOURCE_X_DEPENDENCY_MAX])
 {
 	uint8 canonical[RESOURCE_X_DEPENDENCY_VECTOR_BYTES];
 	pg_crc32c crc;
@@ -9485,8 +9123,7 @@ gcs_block_pcm_x_resource_x_dependency_crc(
 
 	memset(canonical, 0, sizeof(canonical));
 	for (i = 0; i < RESOURCE_X_DEPENDENCY_MAX; i++)
-		gcs_block_resource_x_put_u64(canonical + i * 8,
-			dependencies[i]);
+		gcs_block_resource_x_put_u64(canonical + i * 8, dependencies[i]);
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, canonical, sizeof(canonical));
 	FIN_CRC32C(crc);
@@ -9497,50 +9134,33 @@ gcs_block_pcm_x_resource_x_dependency_crc(
  * reads.  The fixed big-endian record is process-local evidence, not a new
  * wire ABI; AuthorityGrant carries only its exact CRC and bound fields. */
 static uint32
-gcs_block_pcm_x_resource_x_durable_proof_crc(
-	const ResourceXDurableProof *proof)
+gcs_block_pcm_x_resource_x_durable_proof_crc(const ResourceXDurableProof *proof)
 {
 	uint8 canonical[96];
 	pg_crc32c crc;
 
-	if (proof == NULL
-		|| !resource_x_assertion_valid(&proof->assertion)
-		|| proof->base_authority_generation == 0
-		|| proof->resource_formation == 0
-		|| proof->master_session_incarnation == 0
-		|| proof->assertion_sequence == 0
+	if (proof == NULL || !resource_x_assertion_valid(&proof->assertion)
+		|| proof->base_authority_generation == 0 || proof->resource_formation == 0
+		|| proof->master_session_incarnation == 0 || proof->assertion_sequence == 0
 		|| proof->requester_target_generation == 0)
 		return 0;
 	memset(canonical, 0, sizeof(canonical));
 	gcs_block_resource_x_put_u32(canonical, UINT32_C(0x52584450)); /* RXDP */
 	canonical[5] = 1;
 	canonical[7] = (uint8)sizeof(canonical);
-	gcs_block_resource_x_put_u32(canonical + 8,
-		proof->assertion.resource.spcOid);
-	gcs_block_resource_x_put_u32(canonical + 12,
-		proof->assertion.resource.dbOid);
-	gcs_block_resource_x_put_u32(canonical + 16,
-		proof->assertion.resource.relNumber);
-	gcs_block_resource_x_put_u32(canonical + 20,
-		(uint32)proof->assertion.resource.forkNum);
-	gcs_block_resource_x_put_u32(canonical + 24,
-		proof->assertion.resource.blockNum);
-	gcs_block_resource_x_put_u32(canonical + 28,
-		(uint32)proof->assertion.requester_node);
-	gcs_block_resource_x_put_u64(canonical + 32,
-		proof->base_authority_generation);
-	gcs_block_resource_x_put_u64(canonical + 40,
-		proof->resource_formation);
-	gcs_block_resource_x_put_u64(canonical + 48,
-		proof->master_session_incarnation);
-	gcs_block_resource_x_put_u64(canonical + 56,
-		proof->assertion_sequence);
-	gcs_block_resource_x_put_u64(canonical + 64,
-		proof->requester_target_generation);
-	gcs_block_resource_x_put_u64(canonical + 72,
-		proof->page_scn_lsn);
-	gcs_block_resource_x_put_u32(canonical + 80,
-		proof->page_checksum);
+	gcs_block_resource_x_put_u32(canonical + 8, proof->assertion.resource.spcOid);
+	gcs_block_resource_x_put_u32(canonical + 12, proof->assertion.resource.dbOid);
+	gcs_block_resource_x_put_u32(canonical + 16, proof->assertion.resource.relNumber);
+	gcs_block_resource_x_put_u32(canonical + 20, (uint32)proof->assertion.resource.forkNum);
+	gcs_block_resource_x_put_u32(canonical + 24, proof->assertion.resource.blockNum);
+	gcs_block_resource_x_put_u32(canonical + 28, (uint32)proof->assertion.requester_node);
+	gcs_block_resource_x_put_u64(canonical + 32, proof->base_authority_generation);
+	gcs_block_resource_x_put_u64(canonical + 40, proof->resource_formation);
+	gcs_block_resource_x_put_u64(canonical + 48, proof->master_session_incarnation);
+	gcs_block_resource_x_put_u64(canonical + 56, proof->assertion_sequence);
+	gcs_block_resource_x_put_u64(canonical + 64, proof->requester_target_generation);
+	gcs_block_resource_x_put_u64(canonical + 72, proof->page_scn_lsn);
+	gcs_block_resource_x_put_u32(canonical + 80, proof->page_checksum);
 	canonical[86] = RESOURCE_X_PROOF_DURABLE_STORAGE;
 	canonical[87] = RESOURCE_X_DISPOSITION_DURABLE_STORAGE;
 	INIT_CRC32C(crc);
@@ -9553,9 +9173,8 @@ gcs_block_pcm_x_resource_x_durable_proof_crc(
  * share one DATA FIFO when LOCAL_PROOF exists.  A clean N requester sends
  * ASSERT_X only and leaves proof selection to the exact no-holder master. */
 static ResourceXApplyResult
-gcs_block_resource_x_assert_stage_exact(
-	int32 master_node, const ResourceXDecodedFrame *assertion,
-	const ResourceXDecodedFrame *local_proof)
+gcs_block_resource_x_assert_stage_exact(int32 master_node, const ResourceXDecodedFrame *assertion,
+										const ResourceXDecodedFrame *local_proof)
 {
 	uint8 assertion_payload[RESOURCE_X_CONTROL_V1_BYTES];
 	uint8 proof_payload[RESOURCE_X_SHORT_V1_BYTES];
@@ -9563,29 +9182,25 @@ gcs_block_resource_x_assert_stage_exact(
 	uint16 assertion_bytes = 0;
 	uint16 proof_bytes = 0;
 
-	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| assertion == NULL
-		|| !cluster_resource_x_wire_encode(
-			RESOURCE_X_MSG_ASSERT_X, assertion, assertion_payload,
-			sizeof(assertion_payload), &assertion_bytes, &reject)
+	if (master_node < 0 || master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || assertion == NULL
+		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, assertion, assertion_payload,
+										   sizeof(assertion_payload), &assertion_bytes, &reject)
 		|| assertion_bytes != RESOURCE_X_CONTROL_V1_BYTES)
 		return RESOURCE_X_APPLY_INVALID;
 	if (local_proof != NULL
-		&& (!cluster_resource_x_wire_encode(
-				RESOURCE_X_MSG_ASSERT_X, local_proof, proof_payload,
-				sizeof(proof_payload), &proof_bytes, &reject)
+		&& (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_ASSERT_X, local_proof, proof_payload,
+											sizeof(proof_payload), &proof_bytes, &reject)
 			|| proof_bytes != RESOURCE_X_SHORT_V1_BYTES))
 		return RESOURCE_X_APPLY_INVALID;
-	if (!cluster_grd_outbound_enqueue_backend_msg(
-			RESOURCE_X_MSG_ASSERT_X, master_node, assertion_payload,
-			assertion_bytes))
+	if (!cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, master_node,
+												  assertion_payload, assertion_bytes))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (local_proof == NULL)
 		return RESOURCE_X_APPLY_APPLIED;
-	return cluster_grd_outbound_enqueue_backend_msg(
-			   RESOURCE_X_MSG_ASSERT_X, master_node, proof_payload,
-			   proof_bytes)
-		? RESOURCE_X_APPLY_APPLIED : RESOURCE_X_APPLY_BAD_STATE;
+	return cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, master_node,
+													proof_payload, proof_bytes)
+			   ? RESOURCE_X_APPLY_APPLIED
+			   : RESOURCE_X_APPLY_BAD_STATE;
 }
 
 /* The kind-9 ASSERT keeps its wire-neutral observed mode, but an exact local
@@ -9707,15 +9322,14 @@ gcs_block_resource_x_delivery_arm_exact(int32 master_node, const ResourceXDecode
 }
 
 static ResourceXApplyResult
-gcs_block_resource_x_native_assert_stage_exact(
-	int32 master_node, const ResourceXDecodedFrame *assertion)
+gcs_block_resource_x_native_assert_stage_exact(int32 master_node,
+											   const ResourceXDecodedFrame *assertion)
 {
 	PGAlignedBlock aligned_page;
 	ClusterPcmOwnSnapshot before;
 	ClusterPcmOwnSnapshot after;
 	ClusterPcmOwnResult own_result;
-	ClusterBufmgrGcsCopyRefusal copy_refusal
-		= CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
+	ClusterBufmgrGcsCopyRefusal copy_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
 	ResourceXAcquisitionRef ref;
 	ResourceXDecodedFrame local_proof;
 	uint64 zero_dependencies[RESOURCE_X_DEPENDENCY_MAX] = { 0 };
@@ -9728,8 +9342,7 @@ gcs_block_resource_x_native_assert_stage_exact(
 	int after_buffer_id = -1;
 	ResourceXApplyResult delivery_result;
 
-	if (assertion == NULL
-		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X
+	if (assertion == NULL || assertion->kind != RESOURCE_X_WIRE_ASSERT_X
 		|| assertion->common.observed_mode != (uint8)PCM_STATE_N
 		|| assertion->common.target_mode != (uint8)PCM_STATE_X)
 		return RESOURCE_X_APPLY_INVALID;
@@ -9742,75 +9355,54 @@ gcs_block_resource_x_native_assert_stage_exact(
 	ref.acquisition_generation = assertion->common.assertion_sequence;
 	if (cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
 			&ref, &direct_generation, &direct_token)) {
-		own_result
-			= cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
-				&ref.assertion.resource, direct_generation, direct_token,
-				&before_buffer_id, &before);
+		own_result = cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_exact(
+			&ref.assertion.resource, direct_generation, direct_token, &before_buffer_id, &before);
 		if (own_result != CLUSTER_PCM_OWN_OK || before_buffer_id < 0)
-			return own_result == CLUSTER_PCM_OWN_BUSY
-				? RESOURCE_X_APPLY_BAD_STATE
-				: own_result == CLUSTER_PCM_OWN_STALE
-				? RESOURCE_X_APPLY_STALE
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			return own_result == CLUSTER_PCM_OWN_BUSY	 ? RESOURCE_X_APPLY_BAD_STATE
+				   : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_APPLY_STALE
+														 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		own_result = cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
 			GetBufferDescriptor(before_buffer_id), &before);
 		if (own_result != CLUSTER_PCM_OWN_OK)
-			return own_result == CLUSTER_PCM_OWN_BUSY
-				? RESOURCE_X_APPLY_BAD_STATE
-				: own_result == CLUSTER_PCM_OWN_STALE
-				? RESOURCE_X_APPLY_STALE
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		return gcs_block_resource_x_assert_stage_exact(
-			master_node, assertion, NULL);
+			return own_result == CLUSTER_PCM_OWN_BUSY	 ? RESOURCE_X_APPLY_BAD_STATE
+				   : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_APPLY_STALE
+														 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return gcs_block_resource_x_assert_stage_exact(master_node, assertion, NULL);
 	}
 
 	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
-		&assertion->common.logical_assertion.resource,
-		&before_buffer_id, &before);
+		&assertion->common.logical_assertion.resource, &before_buffer_id, &before);
 	if (own_result != CLUSTER_PCM_OWN_OK || before_buffer_id < 0)
-		return own_result == CLUSTER_PCM_OWN_BUSY
-			? RESOURCE_X_APPLY_BAD_STATE
-			: own_result == CLUSTER_PCM_OWN_STALE
-			? RESOURCE_X_APPLY_STALE
-			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	if (!BufferTagsEqual(&before.tag,
-			&assertion->common.logical_assertion.resource)
-		|| before.flags != 0
-		|| before.writer_activation_token != 0
-		|| before.resource_x_activation_generation != 0
-		|| before.generation == UINT64_MAX)
+		return own_result == CLUSTER_PCM_OWN_BUSY	 ? RESOURCE_X_APPLY_BAD_STATE
+			   : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_APPLY_STALE
+													 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	if (!BufferTagsEqual(&before.tag, &assertion->common.logical_assertion.resource)
+		|| before.flags != 0 || before.writer_activation_token != 0
+		|| before.resource_x_activation_generation != 0 || before.generation == UINT64_MAX)
 		return RESOURCE_X_APPLY_STALE;
 	if (before.pcm_state == (uint8)PCM_STATE_N) {
 		own_result = cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
 			GetBufferDescriptor(before_buffer_id), &before, NULL);
 		if (own_result != CLUSTER_PCM_OWN_OK)
-			return own_result == CLUSTER_PCM_OWN_BUSY
-				? RESOURCE_X_APPLY_BAD_STATE
-				: own_result == CLUSTER_PCM_OWN_STALE
-				? RESOURCE_X_APPLY_STALE
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		return gcs_block_resource_x_assert_stage_exact(
-			master_node, assertion, NULL);
+			return own_result == CLUSTER_PCM_OWN_BUSY	 ? RESOURCE_X_APPLY_BAD_STATE
+				   : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_APPLY_STALE
+														 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return gcs_block_resource_x_assert_stage_exact(master_node, assertion, NULL);
 	}
 	if (before.generation == 0
-		|| (before.pcm_state != (uint8)PCM_STATE_S
-			&& before.pcm_state != (uint8)PCM_STATE_X))
+		|| (before.pcm_state != (uint8)PCM_STATE_S && before.pcm_state != (uint8)PCM_STATE_X))
 		return RESOURCE_X_APPLY_STALE;
-	if (!cluster_bufmgr_copy_block_for_r4_cr(
-			before.tag, InvalidScn, &page_lsn, &page_scn,
-			aligned_page.data, &copy_refusal))
+	if (!cluster_bufmgr_copy_block_for_r4_cr(before.tag, InvalidScn, &page_lsn, &page_scn,
+											 aligned_page.data, &copy_refusal))
 		return RESOURCE_X_APPLY_BAD_STATE;
 	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
-		&assertion->common.logical_assertion.resource,
-		&after_buffer_id, &after);
-	if (own_result != CLUSTER_PCM_OWN_OK
-		|| before_buffer_id != after_buffer_id
+		&assertion->common.logical_assertion.resource, &after_buffer_id, &after);
+	if (own_result != CLUSTER_PCM_OWN_OK || before_buffer_id != after_buffer_id
 		|| memcmp(&before, &after, sizeof(before)) != 0
 		|| PageGetLSN((Page)aligned_page.data) != page_lsn
 		|| ((PageHeader)aligned_page.data)->pd_block_scn != page_scn)
-		return own_result == CLUSTER_PCM_OWN_CORRUPT
-			? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-			: RESOURCE_X_APPLY_BAD_STATE;
+		return own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+													 : RESOURCE_X_APPLY_BAD_STATE;
 	page_checksum = cluster_gcs_block_compute_checksum(aligned_page.data);
 	memset(&local_proof, 0, sizeof(local_proof));
 	local_proof.kind = RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION;
@@ -9818,10 +9410,8 @@ gcs_block_resource_x_native_assert_stage_exact(
 	local_proof.common = assertion->common;
 	local_proof.common.observed_mode = before.pcm_state;
 	local_proof.common.outcome = RESOURCE_X_OUTCOME_OK;
-	local_proof.body.local_proof.local_holder_authority_generation
-		= before.generation;
-	local_proof.body.local_proof.requester_target_generation
-		= assertion->common.assertion_sequence;
+	local_proof.body.local_proof.local_holder_authority_generation = before.generation;
+	local_proof.body.local_proof.requester_target_generation = assertion->common.assertion_sequence;
 	local_proof.body.local_proof.page_scn_lsn = (uint64)page_scn;
 	local_proof.body.local_proof.dependency_count = 0;
 	local_proof.body.local_proof.dependency_vector_crc32c
@@ -9831,16 +9421,15 @@ gcs_block_resource_x_native_assert_stage_exact(
 	local_proof.body.local_proof.requester_connection_generation
 		= assertion->common.sender_connection_generation;
 	local_proof.body.local_proof.local_proof_generation = before.generation;
-	return gcs_block_resource_x_assert_stage_exact(
-		master_node, assertion, &local_proof);
+	return gcs_block_resource_x_assert_stage_exact(master_node, assertion, &local_proof);
 }
 
 /* PGRAC adaptation: requester round extraction has already released the
  * resource entry lock.  Encode and stage the type-14 bootstrap request only
  * from that frozen copy. */
 static bool
-gcs_block_resource_x_bootstrap_request_stage_exact(
-	int32 master_node, const ResourceXDecodedFrame *request)
+gcs_block_resource_x_bootstrap_request_stage_exact(int32 master_node,
+												   const ResourceXDecodedFrame *request)
 {
 	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
@@ -9852,33 +9441,28 @@ gcs_block_resource_x_bootstrap_request_stage_exact(
 										   sizeof(payload), &payload_bytes, &reject)
 		|| payload_bytes != RESOURCE_X_CONTROL_V1_BYTES)
 		return false;
-	return cluster_grd_outbound_enqueue_backend_msg(
-		RESOURCE_X_MSG_ASSERT_X, (uint32)master_node, payload,
-		payload_bytes);
+	return cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_ASSERT_X, (uint32)master_node,
+													payload, payload_bytes);
 }
 
 /* PGRAC adaptation: the master receipt API has already copied the exact ACK
  * semantic snapshot and released the resource entry lock.  Only then may the
  * DATA-plane producer encode and enqueue the existing type-15 frame. */
 static bool
-gcs_block_resource_x_bootstrap_ack_stage_exact(
-	int32 requester_node, const ResourceXDecodedFrame *ack)
+gcs_block_resource_x_bootstrap_ack_stage_exact(int32 requester_node,
+											   const ResourceXDecodedFrame *ack)
 {
 	uint8 payload[RESOURCE_X_CONTROL_V1_BYTES];
 	ResourceXWireReject reject = RESOURCE_X_WIRE_REJECT_NONE;
 	uint16 payload_bytes = 0;
 
-	if (requester_node < 0
-		|| requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| ack == NULL
-		|| !cluster_resource_x_wire_encode(
-			RESOURCE_X_MSG_IMAGE_OR_GRANT, ack, payload, sizeof(payload),
-			&payload_bytes, &reject)
+	if (requester_node < 0 || requester_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || ack == NULL
+		|| !cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, ack, payload,
+										   sizeof(payload), &payload_bytes, &reject)
 		|| payload_bytes != RESOURCE_X_CONTROL_V1_BYTES)
 		return false;
-	return cluster_grd_outbound_enqueue_backend_msg(
-		RESOURCE_X_MSG_IMAGE_OR_GRANT, (uint32)requester_node, payload,
-		payload_bytes);
+	return cluster_grd_outbound_enqueue_backend_msg(RESOURCE_X_MSG_IMAGE_OR_GRANT,
+													(uint32)requester_node, payload, payload_bytes);
 }
 
 /* A READY probe is still only pre-T1 semantic evidence.  Ownership mutation
@@ -9889,12 +9473,10 @@ gcs_block_resource_x_bootstrap_ack_stage_exact(
  * exact assertion sequence, with no ASSERT_X/BLOCK_TO_N ABI extension. */
 static bool
 gcs_block_pcm_x_resource_x_build_source_frames(
-	const ResourceXDecodedFrame *block,
-	const ClusterPcmOwnSnapshot *revoking, const char page_bytes[BLCKSZ],
-	XLogRecPtr page_lsn, uint64 page_scn, uint32 requester_connection_generation,
-	uint64 source_boot_incarnation, uint8 source_mode,
-	ResourceXDecodedFrame *status,
-	ResourceXDecodedFrame *image)
+	const ResourceXDecodedFrame *block, const ClusterPcmOwnSnapshot *revoking,
+	const char page_bytes[BLCKSZ], XLogRecPtr page_lsn, uint64 page_scn,
+	uint32 requester_connection_generation, uint64 source_boot_incarnation, uint8 source_mode,
+	ResourceXDecodedFrame *status, ResourceXDecodedFrame *image)
 {
 	ResourceXDecodedFrame canonical_image;
 	ResourceXDecodedBlockedToN *blocked_body;
@@ -9904,18 +9486,12 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	uint16 encoded_bytes = 0;
 	uint64 source_carrier_generation;
 
-	if (block == NULL || revoking == NULL || page_bytes == NULL
-		|| status == NULL || image == NULL
-		|| requester_connection_generation == 0
-		|| source_boot_incarnation == 0
-		|| revoking->generation == 0
-		|| revoking->generation == UINT64_MAX
-		|| revoking->reservation_token == 0
-		|| revoking->flags != PCM_OWN_FLAG_REVOKING
-		|| (source_mode != (uint8)PCM_STATE_X
-			&& source_mode != (uint8)PCM_STATE_S)
-		|| revoking->pcm_state != source_mode
-		|| PageGetLSN((Page)page_bytes) != page_lsn)
+	if (block == NULL || revoking == NULL || page_bytes == NULL || status == NULL || image == NULL
+		|| requester_connection_generation == 0 || source_boot_incarnation == 0
+		|| revoking->generation == 0 || revoking->generation == UINT64_MAX
+		|| revoking->reservation_token == 0 || revoking->flags != PCM_OWN_FLAG_REVOKING
+		|| (source_mode != (uint8)PCM_STATE_X && source_mode != (uint8)PCM_STATE_S)
+		|| revoking->pcm_state != source_mode || PageGetLSN((Page)page_bytes) != page_lsn)
 		return false;
 	source_carrier_generation = revoking->generation + 1;
 	memset(status, 0, sizeof(*status));
@@ -9924,14 +9500,12 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	image->kind = RESOURCE_X_WIRE_IMAGE_ENVELOPE;
 	image->payload_bytes = RESOURCE_X_IMAGE_V1_BYTES;
 	image->common = block->common;
-	image->common.action_node
-		= block->common.logical_assertion.requester_node;
+	image->common.action_node = block->common.logical_assertion.requester_node;
 	image->common.observed_mode = source_mode;
 	image->common.target_mode = (uint8)PCM_STATE_X;
 	image->common.source_candidate = 0;
 	image->common.retain_pi_if_dirty = 0;
-	image->common.sender_connection_generation
-		= requester_connection_generation;
+	image->common.sender_connection_generation = requester_connection_generation;
 	image->common.outcome = RESOURCE_X_OUTCOME_OK;
 	image->common.flags = block->common.flags;
 	image->common.authority_generation
@@ -9939,20 +9513,14 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 			  ? block->common.authority_generation
 			  : block->common.base_authority_generation + 1;
 	image_body = &image->body.image_envelope;
-	gcs_block_resource_x_put_u64(image_body->request_tail,
-		(uint64)requester_connection_generation);
-	gcs_block_resource_x_put_u64(image_body->request_tail + 8,
-		block->common.assertion_sequence);
-	image_body->conversion_base_generation
-		= block->common.base_authority_generation;
-	gcs_block_resource_x_put_u32(image_body->source_fence,
-		(uint32)cluster_node_id);
-	gcs_block_resource_x_put_u64(image_body->source_fence + 4,
-		source_boot_incarnation);
+	gcs_block_resource_x_put_u64(image_body->request_tail, (uint64)requester_connection_generation);
+	gcs_block_resource_x_put_u64(image_body->request_tail + 8, block->common.assertion_sequence);
+	image_body->conversion_base_generation = block->common.base_authority_generation;
+	gcs_block_resource_x_put_u32(image_body->source_fence, (uint32)cluster_node_id);
+	gcs_block_resource_x_put_u64(image_body->source_fence + 4, source_boot_incarnation);
 	gcs_block_resource_x_put_u64(image_body->source_fence + 12,
-		(uint64)requester_connection_generation);
-	gcs_block_resource_x_put_u64(image_body->source_fence + 20,
-		revoking->generation);
+								 (uint64)requester_connection_generation);
+	gcs_block_resource_x_put_u64(image_body->source_fence + 20, revoking->generation);
 	image_body->source_fence[28] = source_mode;
 	image_body->source_fence[29] = 1;
 	image_body->source_carrier_generation = source_carrier_generation;
@@ -9960,22 +9528,17 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	image_body->page_scn_lsn = page_scn;
 	image_body->dependency_count = 0;
 	image_body->dependency_vector_crc32c
-		= gcs_block_pcm_x_resource_x_dependency_crc(
-			image_body->dependencies);
-	image_body->page_checksum
-		= cluster_gcs_block_compute_checksum(page_bytes);
+		= gcs_block_pcm_x_resource_x_dependency_crc(image_body->dependencies);
+	image_body->page_checksum = cluster_gcs_block_compute_checksum(page_bytes);
 	image_body->image_length = BLCKSZ;
-	image_body->source_disposition
-		= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+	image_body->source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 	image_body->proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
 	memcpy(image_body->page_bytes, page_bytes, BLCKSZ);
-	if (!cluster_resource_x_wire_encode(
-			RESOURCE_X_MSG_IMAGE_OR_GRANT, image, encoded_image,
-			sizeof(encoded_image), &encoded_bytes, &reject)
+	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_IMAGE_OR_GRANT, image, encoded_image,
+										sizeof(encoded_image), &encoded_bytes, &reject)
 		|| encoded_bytes != RESOURCE_X_IMAGE_V1_BYTES
-		|| !cluster_resource_x_wire_decode(
-			RESOURCE_X_MSG_IMAGE_OR_GRANT, encoded_image, encoded_bytes,
-			&canonical_image, &reject)
+		|| !cluster_resource_x_wire_decode(RESOURCE_X_MSG_IMAGE_OR_GRANT, encoded_image,
+										   encoded_bytes, &canonical_image, &reject)
 		|| canonical_image.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
 		|| canonical_image.common.semantic_crc32c == 0)
 		return false;
@@ -9991,40 +9554,33 @@ gcs_block_pcm_x_resource_x_build_source_frames(
 	status->common.retain_pi_if_dirty = 0;
 	status->common.outcome = RESOURCE_X_OUTCOME_OK;
 	status->common.flags = RESOURCE_X_COMMON_FLAG_PI_ESTABLISHED;
-	status->common.authority_generation
-		= block->common.base_authority_generation;
+	status->common.authority_generation = block->common.base_authority_generation;
 	blocked_body = &status->body.blocked_to_n;
 	memcpy(blocked_body->source_fence, image_body->source_fence,
-		sizeof(blocked_body->source_fence));
-	blocked_body->source_carrier_generation
-		= image_body->source_carrier_generation;
+		   sizeof(blocked_body->source_fence));
+	blocked_body->source_carrier_generation = image_body->source_carrier_generation;
 	blocked_body->requester_target_generation = block->common.assertion_sequence;
 	blocked_body->page_scn_lsn = image_body->page_scn_lsn;
 	blocked_body->dependency_count = image_body->dependency_count;
 	memcpy(blocked_body->dependencies, image_body->dependencies,
-		sizeof(blocked_body->dependencies));
+		   sizeof(blocked_body->dependencies));
 	blocked_body->source_proof_crc32c = image->common.semantic_crc32c;
 	blocked_body->page_checksum = image_body->page_checksum;
-	blocked_body->source_disposition
-		= RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
+	blocked_body->source_disposition = RESOURCE_X_DISPOSITION_REMOTE_NONWRITABLE;
 	blocked_body->proof_kind = RESOURCE_X_PROOF_REMOTE_CARRIER;
-	blocked_body->holder_connection_generation
-		= block->common.sender_connection_generation;
+	blocked_body->holder_connection_generation = block->common.sender_connection_generation;
 	blocked_body->acting_formation = block->common.resource_formation;
 	return true;
 }
 
 static bool
-gcs_block_pcm_x_resource_x_abort_pre_arm(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *revoking)
+gcs_block_pcm_x_resource_x_abort_pre_arm(BufferDesc *buf, const ClusterPcmOwnSnapshot *revoking)
 {
 	ClusterPcmOwnResult abort_result;
 
-	if (revoking != NULL
-		&& revoking->pcm_state == (uint8)PCM_STATE_S)
+	if (revoking != NULL && revoking->pcm_state == (uint8)PCM_STATE_S)
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, revoking);
-	else if (revoking != NULL
-			 && revoking->pcm_state == (uint8)PCM_STATE_X)
+	else if (revoking != NULL && revoking->pcm_state == (uint8)PCM_STATE_X)
 		abort_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, revoking);
 	else
 		abort_result = CLUSTER_PCM_OWN_CORRUPT;
@@ -10036,15 +9592,13 @@ gcs_block_pcm_x_resource_x_abort_pre_arm(
 }
 
 static bool
-gcs_block_resource_x_terminal_owner_release(
-	ResourceXLocalOwnerHandle *handle, bool *held)
+gcs_block_resource_x_terminal_owner_release(ResourceXLocalOwnerHandle *handle, bool *held)
 {
 	ResourceXApplyResult result;
 
 	if (held == NULL || !*held)
 		return true;
-	result = cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(
-		handle);
+	result = cluster_pcm_lock_resource_x_terminal_x_revoke_release_exact(handle);
 	if (result != RESOURCE_X_APPLY_APPLIED) {
 		gcs_block_resource_x_fail_closed_current();
 		return false;
@@ -10266,9 +9820,9 @@ gcs_block_resource_x_source_finish_owned(
 }
 
 static ResourceXApplyResult
-gcs_block_pcm_x_resource_x_source_block_to_n(
-	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
-	uint64 r4_record_generation)
+gcs_block_pcm_x_resource_x_source_block_to_n(const ResourceXDecodedFrame *block,
+											 int32 authenticated_master_node,
+											 uint64 r4_record_generation)
 {
 	PGAlignedBlock aligned_page;
 	BufferDesc *buf;
@@ -10281,8 +9835,7 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	ResourceXLocalOwnerHandle target_revoke_owner;
 	ResourceXTerminalXLineage lineage;
 	ResourceXTerminalXLineage revalidated_lineage;
-	ClusterPcmXRevokeFinishMode target_x_finish_mode
-		= CLUSTER_PCM_X_REVOKE_FINISH_INVALID;
+	ClusterPcmXRevokeFinishMode target_x_finish_mode = CLUSTER_PCM_X_REVOKE_FINISH_INVALID;
 	PcmXSessionAuthResult session_result;
 	ResourceXApplyResult gate_result;
 	ResourceXApplyResult failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -10329,10 +9882,8 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	source_mode = block->common.observed_mode;
 	shared_s_source = source_mode == (uint8)PCM_STATE_S;
 	if (block->kind != RESOURCE_X_WIRE_BLOCK_TO_N
-		|| (source_mode != (uint8)PCM_STATE_X
-			&& source_mode != (uint8)PCM_STATE_S)
-		|| block->common.target_mode != (uint8)PCM_STATE_N
-		|| block->common.source_candidate != 1
+		|| (source_mode != (uint8)PCM_STATE_X && source_mode != (uint8)PCM_STATE_S)
+		|| block->common.target_mode != (uint8)PCM_STATE_N || block->common.source_candidate != 1
 		|| block->common.retain_pi_if_dirty != 1
 		|| block->common.outcome != RESOURCE_X_OUTCOME_NONE)
 		return RESOURCE_X_APPLY_INVALID;
@@ -10367,7 +9918,8 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		if (image_result != RESOURCE_X_APPLY_APPLIED) {
 			failure_stage = "retained-image";
 			failure_result = image_result == RESOURCE_X_APPLY_NOT_FOUND
-				? RESOURCE_X_APPLY_RECOVERY_BLOCKED : image_result;
+								 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+								 : image_result;
 			goto pre_retained_failure;
 		}
 		/* The retained pair's monotonic publication witness separates an exact
@@ -10391,12 +9943,10 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 			goto pre_retained_failure;
 		}
 	} else if (status_result != RESOURCE_X_APPLY_NOT_FOUND
-		&& status_result != RESOURCE_X_APPLY_STALE)
+			   && status_result != RESOURCE_X_APPLY_STALE)
 		return status_result;
-	writer_path = cluster_resource_x_writer_path_snapshot(
-		&writer_r4_generation);
-	if (writer_path != RESOURCE_X_WRITER_TARGET
-		|| writer_r4_generation == 0
+	writer_path = cluster_resource_x_writer_path_snapshot(&writer_r4_generation);
+	if (writer_path != RESOURCE_X_WRITER_TARGET || writer_r4_generation == 0
 		|| writer_r4_generation == UINT64_MAX) {
 		failure_stage = "writer-path";
 		failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -10404,13 +9954,10 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	}
 	tagless_target_x = source_mode == (uint8)PCM_STATE_X;
 	if (tagless_target_x) {
-		target_x_finish_mode =
-			cluster_pcm_x_revoke_finish_mode(
-				&block->common.logical_assertion.resource, 0);
-		target_x_retain = target_x_finish_mode
-			== CLUSTER_PCM_X_REVOKE_FINISH_RETAIN;
-		target_x_drop = target_x_finish_mode
-			== CLUSTER_PCM_X_REVOKE_FINISH_DROP;
+		target_x_finish_mode
+			= cluster_pcm_x_revoke_finish_mode(&block->common.logical_assertion.resource, 0);
+		target_x_retain = target_x_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_RETAIN;
+		target_x_drop = target_x_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP;
 		if (!target_x_retain && !target_x_drop) {
 			failure_stage = "target-x-finish-mode";
 			failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
@@ -10419,15 +9966,15 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	}
 
 	failure_stage = "own-snapshot";
-	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
-		&block->common.logical_assertion.resource, &buffer_id, &current);
+	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&block->common.logical_assertion.resource,
+														&buffer_id, &current);
 	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0) {
 		if (semantic_retained) {
 			gcs_block_resource_x_fail_closed_current();
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
-		failure_result = own_result == CLUSTER_PCM_OWN_BUSY
-			? RESOURCE_X_APPLY_BAD_STATE : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		failure_result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_BAD_STATE
+															: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		goto pre_retained_failure;
 	}
 	buf = GetBufferDescriptor(buffer_id);
@@ -10436,22 +9983,19 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		if (semantic_retained) {
 			if (image.body.image_envelope.source_carrier_generation == 0)
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-			terminal_holder_generation
-				= image.body.image_envelope.source_carrier_generation - 1;
+			terminal_holder_generation = image.body.image_envelope.source_carrier_generation - 1;
 		} else
 			terminal_holder_generation = current.generation;
 		if (!cluster_pcm_lock_resource_x_bootstrap_round_terminal_holder_exact(
-				block, resource_master_node, writer_r4_generation,
-				terminal_holder_generation, &lineage)) {
+				block, resource_master_node, writer_r4_generation, terminal_holder_generation,
+				&lineage)) {
 			failure_result = RESOURCE_X_APPLY_STALE;
 			goto pre_retained_failure;
 		}
 	}
 	if (semantic_retained) {
-		if (current.pcm_state == (uint8)PCM_STATE_N
-			&& current.flags == PCM_OWN_FLAG_REVOKING
-			&& current.generation
-				== image.body.image_envelope.source_carrier_generation)
+		if (current.pcm_state == (uint8)PCM_STATE_N && current.flags == PCM_OWN_FLAG_REVOKING
+			&& current.generation == image.body.image_envelope.source_carrier_generation)
 			finish_required = false;
 		else if (current.generation > image.body.image_envelope.source_carrier_generation) {
 			/* The exact old carrier has already finished and a later local
@@ -10459,12 +10003,10 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 			 * the retained pair below; never apply the old revoke to current X. */
 			carrier_superseded = true;
 			finish_required = false;
-		}
-		else if (current.pcm_state != source_mode
-			|| current.flags != PCM_OWN_FLAG_REVOKING
-			|| current.generation == UINT64_MAX
-			|| current.generation + 1
-				!= image.body.image_envelope.source_carrier_generation) {
+		} else if (current.pcm_state != source_mode || current.flags != PCM_OWN_FLAG_REVOKING
+				   || current.generation == UINT64_MAX
+				   || current.generation + 1
+						  != image.body.image_envelope.source_carrier_generation) {
 			gcs_block_resource_x_fail_closed_current();
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		} else {
@@ -10472,14 +10014,10 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 			 * or exact DEFERRED owner keeps it; only the LMS claim can transfer
 			 * its release obligation. Same-successor replay is owned wait. */
 			if (tagless_target_x) {
-				memset(&revalidated_lineage, 0,
-					   sizeof(revalidated_lineage));
-				replay_result
-					= cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
-						block, resource_master_node, writer_r4_generation,
-						terminal_holder_generation,
-						gcs_block_pcm_x_monotonic_us(),
-						&revalidated_lineage);
+				memset(&revalidated_lineage, 0, sizeof(revalidated_lineage));
+				replay_result = cluster_pcm_lock_resource_x_terminal_x_revoke_replay_exact(
+					block, resource_master_node, writer_r4_generation, terminal_holder_generation,
+					gcs_block_pcm_x_monotonic_us(), &revalidated_lineage);
 				if (replay_result == RESOURCE_X_APPLY_BAD_STATE)
 					return RESOURCE_X_APPLY_BAD_STATE;
 				if (replay_result == RESOURCE_X_APPLY_STALE)
@@ -10519,23 +10057,22 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
 			revoking = current;
-			page_lsn = PageGetLSN(
-				(Page)image.body.image_envelope.page_bytes);
+			page_lsn = PageGetLSN((Page)image.body.image_envelope.page_bytes);
 			page_scn = image.body.image_envelope.page_scn_lsn;
 		}
 	} else {
-		if (current.pcm_state != source_mode || current.flags != 0
-			|| current.generation == 0 || current.generation == UINT64_MAX
+		if (current.pcm_state != source_mode || current.flags != 0 || current.generation == 0
+			|| current.generation == UINT64_MAX
 			|| block->common.base_authority_generation == UINT64_MAX
 			|| block->common.logical_assertion.requester_node == cluster_node_id) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
 		failure_stage = "source-peer";
-		if (!cluster_sf_peer_capability_word_sample(
-				block->common.logical_assertion.requester_node,
-				PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-				&capability_word, &requester_connection_generation)) {
+		if (!cluster_sf_peer_capability_word_sample(block->common.logical_assertion.requester_node,
+													PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+													&capability_word,
+													&requester_connection_generation)) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
@@ -10557,63 +10094,48 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		failure_stage = "source-prepare";
 		if (shared_s_source)
 			own_result = cluster_bufmgr_pcm_own_prepare_s_source_image(
-				buf, &current, (SCN)0, &revoking, aligned_page.data,
-				&page_lsn, &page_scn, &source_prepare_refusal);
+				buf, &current, (SCN)0, &revoking, aligned_page.data, &page_lsn, &page_scn,
+				&source_prepare_refusal);
 		else if (tagless_target_x) {
 			ResourceXApplyResult owner_result;
 
 			failure_stage = "terminal-owner-claim";
-			event_owner_identity
-				= cluster_gcs_resource_x_event_owner_identity(
-					MyProc != NULL ? (int32)MyProc->pgprocno : -1,
-					(int32)getpid());
+			event_owner_identity = cluster_gcs_resource_x_event_owner_identity(
+				MyProc != NULL ? (int32)MyProc->pgprocno : -1, (int32)getpid());
 			if (event_owner_identity < 0) {
 				failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 				goto pre_retained_failure;
 			}
-			memset(&revalidated_lineage, 0,
-				   sizeof(revalidated_lineage));
-			owner_result
-				= cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
-					block, resource_master_node, writer_r4_generation,
-					terminal_holder_generation,
-					current.reservation_token, event_owner_identity,
-					gcs_block_pcm_x_monotonic_us(),
-					&revalidated_lineage, &target_revoke_owner);
+			memset(&revalidated_lineage, 0, sizeof(revalidated_lineage));
+			owner_result = cluster_pcm_lock_resource_x_terminal_x_revoke_claim_exact(
+				block, resource_master_node, writer_r4_generation, terminal_holder_generation,
+				current.reservation_token, event_owner_identity, gcs_block_pcm_x_monotonic_us(),
+				&revalidated_lineage, &target_revoke_owner);
 			if (owner_result == RESOURCE_X_APPLY_APPLIED)
 				target_revoke_owner_held = true;
 			if (owner_result != RESOURCE_X_APPLY_APPLIED
-				|| memcmp(&lineage, &revalidated_lineage,
-					sizeof(lineage)) != 0) {
-				failure_result = owner_result
-					== RESOURCE_X_APPLY_BAD_STATE
-					? RESOURCE_X_APPLY_BAD_STATE
-					: RESOURCE_X_APPLY_STALE;
+				|| memcmp(&lineage, &revalidated_lineage, sizeof(lineage)) != 0) {
+				failure_result = owner_result == RESOURCE_X_APPLY_BAD_STATE
+									 ? RESOURCE_X_APPLY_BAD_STATE
+									 : RESOURCE_X_APPLY_STALE;
 				goto pre_retained_failure;
 			}
 			if (target_x_retain) {
-				own_result
-					= cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(
-						&block->common.logical_assertion.resource, &current,
-						&held_x_revoke);
+				own_result = cluster_bufmgr_pcm_own_begin_x_revoke_held_by_tag(
+					&block->common.logical_assertion.resource, &current, &held_x_revoke);
 				if (own_result == CLUSTER_PCM_OWN_OK) {
 					revoking = held_x_revoke.revoking;
 					held_x_revoke_active = true;
 				}
-			}
-			else if (target_x_drop)
-				own_result = cluster_bufmgr_pcm_own_begin_x_revoke(
-					buf, &current, &revoking);
+			} else if (target_x_drop)
+				own_result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, &current, &revoking);
 			else
 				own_result = CLUSTER_PCM_OWN_CORRUPT;
-		}
-		else
-			own_result = cluster_bufmgr_pcm_own_begin_x_revoke(
-				buf, &current, &revoking);
+		} else
+			own_result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, &current, &revoking);
 		if (own_result != CLUSTER_PCM_OWN_OK) {
-			failure_result = own_result == CLUSTER_PCM_OWN_BUSY
-				? RESOURCE_X_APPLY_BAD_STATE
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+			failure_result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_BAD_STATE
+																: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			goto pre_retained_failure;
 		}
 		revoke_started = true;
@@ -10622,18 +10144,14 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		uint64 current_writer_generation = 0;
 
 		failure_stage = "terminal-lineage-recheck";
-		writer_path = cluster_resource_x_writer_path_snapshot(
-			&current_writer_generation);
+		writer_path = cluster_resource_x_writer_path_snapshot(&current_writer_generation);
 		memset(&revalidated_lineage, 0, sizeof(revalidated_lineage));
 		if (writer_path != RESOURCE_X_WRITER_TARGET
-			|| current_writer_generation != writer_r4_generation
-			|| !target_revoke_owner_held
+			|| current_writer_generation != writer_r4_generation || !target_revoke_owner_held
 			|| !cluster_pcm_lock_resource_x_terminal_x_revoke_revalidate_held_exact(
-				block, resource_master_node, writer_r4_generation,
-				terminal_holder_generation, &target_revoke_owner,
-				&revalidated_lineage)
-			|| memcmp(&lineage, &revalidated_lineage,
-				sizeof(lineage)) != 0) {
+				block, resource_master_node, writer_r4_generation, terminal_holder_generation,
+				&target_revoke_owner, &revalidated_lineage)
+			|| memcmp(&lineage, &revalidated_lineage, sizeof(lineage)) != 0) {
 			failure_result = RESOURCE_X_APPLY_STALE;
 			goto pre_retained_failure;
 		}
@@ -10659,30 +10177,25 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		ResourceXApplyResult yield_result;
 
 		failure_stage = "terminal-content-drain";
-		own_result
-			= cluster_bufmgr_pcm_own_try_drain_held_x_revoke(
-				&held_x_revoke);
+		own_result = cluster_bufmgr_pcm_own_try_drain_held_x_revoke(&held_x_revoke);
 		if (own_result == CLUSTER_PCM_OWN_BUSY) {
 			/* Do not wait in LMON: the pre-existing content-S holder may be
 			 * waiting for this same event loop to deliver a visibility reply.
 			 * No bytes or retained intent have been published, so restore X
 			 * and return the exact observed priority to HANDOFF. */
-			own_result = cluster_bufmgr_pcm_own_abort_held_x_revoke(
-				&held_x_revoke);
+			own_result = cluster_bufmgr_pcm_own_abort_held_x_revoke(&held_x_revoke);
 			if (own_result != CLUSTER_PCM_OWN_OK) {
 				gcs_block_resource_x_fail_closed_current();
 				(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
 					&held_x_revoke);
-				(void)gcs_block_resource_x_terminal_owner_release(
-					&target_revoke_owner, &target_revoke_owner_held);
+				(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+																  &target_revoke_owner_held);
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
 			held_x_revoke_active = false;
 			revoke_started = false;
-			yield_result
-				= cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
-					&target_revoke_owner,
-					gcs_block_pcm_x_monotonic_us());
+			yield_result = cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
+				&target_revoke_owner, gcs_block_pcm_x_monotonic_us());
 			if (yield_result != RESOURCE_X_APPLY_APPLIED) {
 				gcs_block_resource_x_fail_closed_current();
 				if (target_revoke_owner_held)
@@ -10691,15 +10204,14 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 				target_revoke_owner_held = false;
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
-			memset(&target_revoke_owner, 0,
-				   sizeof(target_revoke_owner));
+			memset(&target_revoke_owner, 0, sizeof(target_revoke_owner));
 			target_revoke_owner_held = false;
 			return RESOURCE_X_APPLY_BAD_STATE;
 		}
 		if (own_result != CLUSTER_PCM_OWN_OK) {
 			failure_result = own_result == CLUSTER_PCM_OWN_STALE
-				? RESOURCE_X_APPLY_STALE
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+								 ? RESOURCE_X_APPLY_STALE
+								 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			goto pre_retained_failure;
 		}
 	}
@@ -10707,26 +10219,22 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		ResourceXApplyResult yield_result;
 
 		failure_stage = "terminal-aux-pin-drain";
-		own_result = cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(
-			buf, &revoking);
+		own_result = cluster_bufmgr_pcm_own_try_drain_drop_x_revoke(buf, &revoking);
 		if (own_result == CLUSTER_PCM_OWN_BUSY) {
 			/* REVOKING already refuses every new passive VM/FSM first pin.
 			 * A nonzero refcount therefore names only predecessors.  Do not
 			 * wait in DATA/LMON or publish the pair: restore exact X and yield
 			 * the existing terminal owner to the same HANDOFF identity. */
-			own_result = cluster_bufmgr_pcm_own_abort_x_revoke(
-				buf, &revoking);
+			own_result = cluster_bufmgr_pcm_own_abort_x_revoke(buf, &revoking);
 			if (own_result != CLUSTER_PCM_OWN_OK) {
 				gcs_block_resource_x_fail_closed_current();
-				(void)gcs_block_resource_x_terminal_owner_release(
-					&target_revoke_owner, &target_revoke_owner_held);
+				(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+																  &target_revoke_owner_held);
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
 			revoke_started = false;
-			yield_result
-				= cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
-					&target_revoke_owner,
-					gcs_block_pcm_x_monotonic_us());
+			yield_result = cluster_pcm_lock_resource_x_terminal_x_revoke_yield_exact(
+				&target_revoke_owner, gcs_block_pcm_x_monotonic_us());
 			if (yield_result != RESOURCE_X_APPLY_APPLIED) {
 				gcs_block_resource_x_fail_closed_current();
 				if (target_revoke_owner_held)
@@ -10735,24 +10243,22 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 				target_revoke_owner_held = false;
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
-			memset(&target_revoke_owner, 0,
-				   sizeof(target_revoke_owner));
+			memset(&target_revoke_owner, 0, sizeof(target_revoke_owner));
 			target_revoke_owner_held = false;
 			return RESOURCE_X_APPLY_BAD_STATE;
 		}
 		if (own_result != CLUSTER_PCM_OWN_OK) {
 			failure_result = own_result == CLUSTER_PCM_OWN_STALE
-				? RESOURCE_X_APPLY_STALE
-				: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+								 ? RESOURCE_X_APPLY_STALE
+								 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			goto pre_retained_failure;
 		}
 	}
 	if (!semantic_retained) {
 		failure_stage = "source-copy";
 		if (!shared_s_source
-			&& !cluster_bufmgr_copy_block_for_gcs(
-				block->common.logical_assertion.resource, &page_lsn,
-				aligned_page.data, NULL)) {
+			&& !cluster_bufmgr_copy_block_for_gcs(block->common.logical_assertion.resource,
+												  &page_lsn, aligned_page.data, NULL)) {
 			failure_result = RESOURCE_X_APPLY_BAD_STATE;
 			goto pre_retained_failure;
 		}
@@ -10761,9 +10267,8 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 		failure_stage = "source-frame-build";
 		if (!gcs_block_pcm_x_resource_x_build_source_frames(
 				block, &revoking, aligned_page.data, page_lsn, page_scn,
-				requester_connection_generation, source_boot_incarnation,
-				source_mode,
-				&status, &image)) {
+				requester_connection_generation, source_boot_incarnation, source_mode, &status,
+				&image)) {
 			failure_result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			goto pre_retained_failure;
 		}
@@ -10772,34 +10277,23 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	if (shared_s_source && semantic_retained && !finish_required)
 		result = RESOURCE_X_APPLY_DUPLICATE;
 	else if (shared_s_source)
-		result
-			= cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
-				block, authenticated_master_node, &status, &image, &revoking,
-				page_lsn, page_scn,
-				image.body.image_envelope.page_checksum);
+		result = cluster_pcm_lock_resource_x_block_to_n_prepared_s_source_exact(
+			block, authenticated_master_node, &status, &image, &revoking, page_lsn, page_scn,
+			image.body.image_envelope.page_checksum);
 	else if (tagless_target_x && target_x_drop)
-		result
-			= cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
-				block, authenticated_master_node, &status, &image, &revoking,
-				&target_revoke_owner);
+		result = cluster_pcm_lock_resource_x_block_to_n_drop_x_source_exact(
+			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner);
 	else if (tagless_target_x && target_x_retain)
-		result
-			= cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
-				block, authenticated_master_node, &status, &image, &revoking,
-				&target_revoke_owner);
+		result = cluster_pcm_lock_resource_x_block_to_n_prepared_x_source_exact(
+			block, authenticated_master_node, &status, &image, &revoking, &target_revoke_owner);
 	else
 		result = cluster_pcm_lock_resource_x_block_to_n_source_exact(
 			block, authenticated_master_node, &status, &image);
-	if (result != RESOURCE_X_APPLY_APPLIED
-		&& result != RESOURCE_X_APPLY_DUPLICATE) {
-		if (semantic_retained && carrier_superseded
-			&& result == RESOURCE_X_APPLY_STALE) {
-			pair_result
-				= cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(
-					&block->common.logical_assertion,
-					block->common.assertion_sequence,
-					authenticated_master_node,
-					block->common.master_session_incarnation);
+	if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) {
+		if (semantic_retained && carrier_superseded && result == RESOURCE_X_APPLY_STALE) {
+			pair_result = cluster_pcm_lock_resource_x_holder_pair_supersedes_exact(
+				&block->common.logical_assertion, block->common.assertion_sequence,
+				authenticated_master_node, block->common.master_session_incarnation);
 			if (pair_result == RESOURCE_X_APPLY_APPLIED) {
 				return RESOURCE_X_APPLY_STALE;
 			}
@@ -10813,19 +10307,15 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 	}
 	semantic_retained = true;
 	if (!finish_required) {
-		pair_result
-			= cluster_pcm_lock_resource_x_holder_pair_publish_exact(
-				&block->common.logical_assertion,
-				block->common.assertion_sequence,
-				authenticated_master_node,
-				block->common.master_session_incarnation);
-		if (pair_result != RESOURCE_X_APPLY_APPLIED
-			&& pair_result != RESOURCE_X_APPLY_DUPLICATE) {
+		pair_result = cluster_pcm_lock_resource_x_holder_pair_publish_exact(
+			&block->common.logical_assertion, block->common.assertion_sequence,
+			authenticated_master_node, block->common.master_session_incarnation);
+		if (pair_result != RESOURCE_X_APPLY_APPLIED && pair_result != RESOURCE_X_APPLY_DUPLICATE) {
 			gcs_block_resource_x_fail_closed_current();
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
-		if (!gcs_block_resource_x_terminal_owner_release(
-				&target_revoke_owner, &target_revoke_owner_held)) {
+		if (!gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+														 &target_revoke_owner_held)) {
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
 		return result;
@@ -10839,54 +10329,48 @@ gcs_block_pcm_x_resource_x_source_block_to_n(
 pre_retained_failure:
 	ereport(LOG,
 			(errmsg_internal("Resource-X type-17 holder diagnostic"),
-			 errdetail("stage=%s result=%d requester=%d master=%d source=%d "
-					   "attempt=%llu base=%llu formation=%llu session=%llu "
-					   "status=%d image=%d pair=%d "
-					   "mode=%u buffer=%d tag=%u/%u/%u/%d/%u generation=%llu "
-					   "flags=%u reservation=%llu tagless=%s retained=%s revoke=%s",
-					   failure_stage, (int)failure_result,
-					   block->common.logical_assertion.requester_node,
-					   authenticated_master_node, cluster_node_id,
-					   (unsigned long long)block->common.assertion_sequence,
-					   (unsigned long long)block->common.base_authority_generation,
-					   (unsigned long long)block->common.resource_formation,
-					   (unsigned long long)block->common.master_session_incarnation,
-					   (int)status_result, (int)image_result, (int)pair_result,
-					   (unsigned)source_mode,
-					   buffer_id, block->common.logical_assertion.resource.spcOid,
-					   block->common.logical_assertion.resource.dbOid,
-					   block->common.logical_assertion.resource.relNumber,
-					   (int)block->common.logical_assertion.resource.forkNum,
-					   block->common.logical_assertion.resource.blockNum,
-					   (unsigned long long)current.generation,
-					   (unsigned)current.flags,
-					   (unsigned long long)current.reservation_token,
-					   tagless_target_x ? "true" : "false",
-					   semantic_retained ? "true" : "false",
-					   revoke_started ? "true" : "false")));
+			 errdetail(
+				 "stage=%s result=%d requester=%d master=%d source=%d "
+				 "attempt=%llu base=%llu formation=%llu session=%llu "
+				 "status=%d image=%d pair=%d "
+				 "mode=%u buffer=%d tag=%u/%u/%u/%d/%u generation=%llu "
+				 "flags=%u reservation=%llu tagless=%s retained=%s revoke=%s",
+				 failure_stage, (int)failure_result, block->common.logical_assertion.requester_node,
+				 authenticated_master_node, cluster_node_id,
+				 (unsigned long long)block->common.assertion_sequence,
+				 (unsigned long long)block->common.base_authority_generation,
+				 (unsigned long long)block->common.resource_formation,
+				 (unsigned long long)block->common.master_session_incarnation, (int)status_result,
+				 (int)image_result, (int)pair_result, (unsigned)source_mode, buffer_id,
+				 block->common.logical_assertion.resource.spcOid,
+				 block->common.logical_assertion.resource.dbOid,
+				 block->common.logical_assertion.resource.relNumber,
+				 (int)block->common.logical_assertion.resource.forkNum,
+				 block->common.logical_assertion.resource.blockNum,
+				 (unsigned long long)current.generation, (unsigned)current.flags,
+				 (unsigned long long)current.reservation_token, tagless_target_x ? "true" : "false",
+				 semantic_retained ? "true" : "false", revoke_started ? "true" : "false")));
 	if (revoke_started) {
 		if (held_x_revoke_active) {
-			own_result = cluster_bufmgr_pcm_own_abort_held_x_revoke(
-				&held_x_revoke);
+			own_result = cluster_bufmgr_pcm_own_abort_held_x_revoke(&held_x_revoke);
 			if (own_result != CLUSTER_PCM_OWN_OK) {
 				gcs_block_resource_x_fail_closed_current();
 				(void)cluster_bufmgr_pcm_own_abandon_held_x_revoke_after_fail_closed(
 					&held_x_revoke);
-				(void)gcs_block_resource_x_terminal_owner_release(
-					&target_revoke_owner, &target_revoke_owner_held);
+				(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+																  &target_revoke_owner_held);
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
 			held_x_revoke_active = false;
-		} else if (!gcs_block_pcm_x_resource_x_abort_pre_arm(
-				buf, &revoking)) {
-			(void)gcs_block_resource_x_terminal_owner_release(
-				&target_revoke_owner, &target_revoke_owner_held);
+		} else if (!gcs_block_pcm_x_resource_x_abort_pre_arm(buf, &revoking)) {
+			(void)gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+															  &target_revoke_owner_held);
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
 	}
 	revoke_started = false;
-	if (!gcs_block_resource_x_terminal_owner_release(
-			&target_revoke_owner, &target_revoke_owner_held))
+	if (!gcs_block_resource_x_terminal_owner_release(&target_revoke_owner,
+													 &target_revoke_owner_held))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return failure_result;
 }
@@ -10898,50 +10382,48 @@ pre_retained_failure:
  * type-15 image is copied, and X commit remains a later linearization. */
 static ClusterPcmOwnResult
 PGRAC_PCM_X_FENCE_DOMINATED(gcs_block_pcm_x_reserved_image_write_exact)
-gcs_block_pcm_x_resource_x_install_target_image_exact(
-	BufferDesc *buf, const ClusterPcmOwnSnapshot *reservation_base,
-	uint64 reservation_token, const ResourceXCurrentImage *image)
+	gcs_block_pcm_x_resource_x_install_target_image_exact(
+		BufferDesc *buf, const ClusterPcmOwnSnapshot *reservation_base, uint64 reservation_token,
+		const ResourceXCurrentImage *image)
 {
 	PGAlignedBlock verified;
 	ClusterPcmOwnSnapshot live;
 	ClusterPcmOwnResult own_result;
 	Page page;
 
-	if (buf == NULL || reservation_base == NULL || image == NULL
-		|| image->page_bytes == NULL || image->image_length != BLCKSZ
-		|| reservation_token == 0
+	if (buf == NULL || reservation_base == NULL || image == NULL || image->page_bytes == NULL
+		|| image->image_length != BLCKSZ || reservation_token == 0
 		|| !LWLockHeldByMe(BufferDescriptorGetContentLock(buf)))
 		return CLUSTER_PCM_OWN_INVALID;
 	memcpy(verified.data, image->page_bytes, BLCKSZ);
 	if (PageGetLSN((Page)verified.data) != image->page_lsn
 		|| ((PageHeader)verified.data)->pd_block_scn != image->page_scn
-		|| cluster_gcs_block_compute_checksum(verified.data)
-			!= image->page_checksum)
+		|| cluster_gcs_block_compute_checksum(verified.data) != image->page_checksum)
 		return CLUSTER_PCM_OWN_CORRUPT;
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK)
 		return own_result;
-	if (!gcs_block_pcm_x_reserved_image_write_exact(
-			&live, reservation_base, reservation_token))
-		return cluster_pcm_own_classify_live_flags(
-			live.flags, live.reservation_token) == CLUSTER_PCM_OWN_CORRUPT
-			? CLUSTER_PCM_OWN_CORRUPT : CLUSTER_PCM_OWN_STALE;
+	if (!gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base, reservation_token))
+		return cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token)
+					   == CLUSTER_PCM_OWN_CORRUPT
+				   ? CLUSTER_PCM_OWN_CORRUPT
+				   : CLUSTER_PCM_OWN_STALE;
 
 	page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 	memcpy(page, verified.data, BLCKSZ);
 	gcs_block_note_install_copy();
 	PageSetLSNPreserveOrigin(page, image->page_lsn);
 	((PageHeader)page)->pd_block_scn = image->page_scn;
-	own_result = cluster_bufmgr_pcm_own_publish_installed_x_image(
-		buf, reservation_base, reservation_token);
+	own_result = cluster_bufmgr_pcm_own_publish_installed_x_image(buf, reservation_base,
+																  reservation_token);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		gcs_block_resource_x_fail_closed_current();
 		return CLUSTER_PCM_OWN_CORRUPT;
 	}
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &live);
 	if (own_result != CLUSTER_PCM_OWN_OK
-		|| !gcs_block_pcm_x_reserved_image_write_exact(
-			&live, reservation_base, reservation_token)) {
+		|| !gcs_block_pcm_x_reserved_image_write_exact(&live, reservation_base,
+													   reservation_token)) {
 		gcs_block_resource_x_fail_closed_current();
 		return CLUSTER_PCM_OWN_CORRUPT;
 	}
@@ -10983,23 +10465,19 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 		memset(image_out, 0, sizeof(*image_out));
 	if (committed_generation_out != NULL)
 		*committed_generation_out = 0;
-	if (ref == NULL || expected_local_generation >= UINT64_MAX - 1
-		|| aligned_page == NULL || image_out == NULL
-		|| committed_generation_out == NULL
+	if (ref == NULL || expected_local_generation >= UINT64_MAX - 1 || aligned_page == NULL
+		|| image_out == NULL || committed_generation_out == NULL
 		|| (direct_init_bound
 			&& (!target_native
 				|| !GcsBlockResourceXDirectInitProofAllowedExact(
-					&ref->assertion.resource, require_clean_n,
-					precommit_image != NULL)))
+					&ref->assertion.resource, require_clean_n, precommit_image != NULL)))
 		|| (direct_init_bound && direct_init_reservation_token == 0)
 		|| (!direct_init_bound && direct_init_reservation_token != 0)
-		|| (precommit_image != NULL
-			&& (capture_local_image || require_clean_n)))
+		|| (precommit_image != NULL && (capture_local_image || require_clean_n)))
 		return RESOURCE_X_BUFFER_CORRUPT;
-	direct_init_remote_install = direct_init_bound && !require_clean_n
-		&& precommit_image != NULL
-		&& GcsBlockResourceXDirectInitProofAllowedExact(
-			&ref->assertion.resource, false, true);
+	direct_init_remote_install
+		= direct_init_bound && !require_clean_n && precommit_image != NULL
+		  && GcsBlockResourceXDirectInitProofAllowedExact(&ref->assertion.resource, false, true);
 	expected_committed_generation = expected_local_generation + 1;
 	if (direct_init_bound) {
 		if (!cluster_pcm_lock_resource_x_bootstrap_round_direct_init_snapshot_exact(
@@ -11017,15 +10495,13 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 				&ref->assertion.resource, round_direct_generation, round_direct_token, &buffer_id,
 				&current);
 	} else
-		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
-			&ref->assertion.resource, &buffer_id, &current);
+		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&ref->assertion.resource, &buffer_id,
+															&current);
 	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0)
-		return own_result == CLUSTER_PCM_OWN_BUSY
-			? RESOURCE_X_BUFFER_BUSY
-			: own_result == CLUSTER_PCM_OWN_STALE
-			? RESOURCE_X_BUFFER_STALE
-			: own_result == CLUSTER_PCM_OWN_NOT_READY
-			? RESOURCE_X_BUFFER_ABSENT : RESOURCE_X_BUFFER_CORRUPT;
+		return own_result == CLUSTER_PCM_OWN_BUSY		 ? RESOURCE_X_BUFFER_BUSY
+			   : own_result == CLUSTER_PCM_OWN_STALE	 ? RESOURCE_X_BUFFER_STALE
+			   : own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
+														 : RESOURCE_X_BUFFER_CORRUPT;
 	if (direct_init_bound
 		&& !cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
 			ref, expected_local_generation, direct_init_reservation_token))
@@ -11041,17 +10517,13 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 
 	PG_TRY();
 	{
-		do
-		{
+		do {
 			own_result = cluster_bufmgr_pcm_own_snapshot(buf, &current);
 			if (own_result != CLUSTER_PCM_OWN_OK) {
-				result = own_result == CLUSTER_PCM_OWN_BUSY
-					? RESOURCE_X_BUFFER_BUSY
-					: own_result == CLUSTER_PCM_OWN_STALE
-					? RESOURCE_X_BUFFER_STALE
-					: own_result == CLUSTER_PCM_OWN_NOT_READY
-					? RESOURCE_X_BUFFER_ABSENT
-					: RESOURCE_X_BUFFER_CORRUPT;
+				result = own_result == CLUSTER_PCM_OWN_BUSY		   ? RESOURCE_X_BUFFER_BUSY
+						 : own_result == CLUSTER_PCM_OWN_STALE	   ? RESOURCE_X_BUFFER_STALE
+						 : own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
+																   : RESOURCE_X_BUFFER_CORRUPT;
 				break;
 			}
 			if (!BufferTagsEqual(&current.tag, &ref->assertion.resource)) {
@@ -11073,12 +10545,9 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 				result = RESOURCE_X_BUFFER_BUSY;
 				break;
 			} else if (current.generation != expected_local_generation) {
-				result = current.flags != 0 ? RESOURCE_X_BUFFER_BUSY
-											 : RESOURCE_X_BUFFER_STALE;
+				result = current.flags != 0 ? RESOURCE_X_BUFFER_BUSY : RESOURCE_X_BUFFER_STALE;
 				break;
-			} else if (direct_init_bound
-					   && current.flags
-						  != PCM_OWN_FLAG_GRANT_PENDING) {
+			} else if (direct_init_bound && current.flags != PCM_OWN_FLAG_GRANT_PENDING) {
 				result = RESOURCE_X_BUFFER_STALE;
 				break;
 			} else {
@@ -11108,26 +10577,21 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 							break;
 						}
 					} else if (target_native) {
-						if (!direct_init_bound
-							|| (!require_clean_n
-								&& !direct_init_remote_install)
+						if (!direct_init_bound || (!require_clean_n && !direct_init_remote_install)
 							|| current.pcm_state != (uint8)PCM_STATE_N)
 							own_result = CLUSTER_PCM_OWN_STALE;
 						else
-							own_result
-								= cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
-									buf, &current);
+							own_result = cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
+								buf, &current);
 						if (own_result != CLUSTER_PCM_OWN_OK) {
-							result = own_result == CLUSTER_PCM_OWN_BUSY
-								? RESOURCE_X_BUFFER_BUSY
-								: own_result == CLUSTER_PCM_OWN_STALE
-								? RESOURCE_X_BUFFER_STALE
-								: RESOURCE_X_BUFFER_CORRUPT;
+							result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_BUFFER_BUSY
+									 : own_result == CLUSTER_PCM_OWN_STALE
+										 ? RESOURCE_X_BUFFER_STALE
+										 : RESOURCE_X_BUFFER_CORRUPT;
 							break;
 						}
 						if (!cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
-								ref, current.generation,
-								current.reservation_token)) {
+								ref, current.generation, current.reservation_token)) {
 							result = RESOURCE_X_BUFFER_STALE;
 							break;
 						}
@@ -11149,14 +10613,12 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 				} else if (current.pcm_state == (uint8)PCM_STATE_N) {
 					if (require_clean_n) {
 						own_result
-							= cluster_bufmgr_pcm_own_n_storage_candidate_exact(
-								buf, &current);
+							= cluster_bufmgr_pcm_own_n_storage_candidate_exact(buf, &current);
 						if (own_result != CLUSTER_PCM_OWN_OK) {
-							result = own_result == CLUSTER_PCM_OWN_BUSY
-								? RESOURCE_X_BUFFER_BUSY
-								: own_result == CLUSTER_PCM_OWN_STALE
-								? RESOURCE_X_BUFFER_STALE
-								: RESOURCE_X_BUFFER_CORRUPT;
+							result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_BUFFER_BUSY
+									 : own_result == CLUSTER_PCM_OWN_STALE
+										 ? RESOURCE_X_BUFFER_STALE
+										 : RESOURCE_X_BUFFER_CORRUPT;
 							break;
 						}
 					}
@@ -11167,11 +10629,9 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 						own_result = cluster_bufmgr_pcm_own_begin_x_reservation(buf, &current,
 																				&reservation_token);
 					if (own_result != CLUSTER_PCM_OWN_OK) {
-						result = own_result == CLUSTER_PCM_OWN_BUSY
-							? RESOURCE_X_BUFFER_BUSY
-							: own_result == CLUSTER_PCM_OWN_STALE
-							? RESOURCE_X_BUFFER_STALE
-							: RESOURCE_X_BUFFER_CORRUPT;
+						result = own_result == CLUSTER_PCM_OWN_BUSY	   ? RESOURCE_X_BUFFER_BUSY
+								 : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_BUFFER_STALE
+																	   : RESOURCE_X_BUFFER_CORRUPT;
 						break;
 					}
 					if (target_native) {
@@ -11196,37 +10656,29 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 						}
 					}
 				} else if (current.pcm_state == (uint8)PCM_STATE_S) {
-					own_result = cluster_bufmgr_pcm_own_begin_s_revoke(
-						buf, &current, &revoking);
+					own_result = cluster_bufmgr_pcm_own_begin_s_revoke(buf, &current, &revoking);
 					if (own_result == CLUSTER_PCM_OWN_OK) {
 						base = revoking;
-						own_result
-							= cluster_bufmgr_pcm_own_handoff_s_revoke_to_x_reservation(
-								buf, &revoking, &reservation_token);
+						own_result = cluster_bufmgr_pcm_own_handoff_s_revoke_to_x_reservation(
+							buf, &revoking, &reservation_token);
 					}
 					if (own_result != CLUSTER_PCM_OWN_OK) {
-						result = own_result == CLUSTER_PCM_OWN_BUSY
-							? RESOURCE_X_BUFFER_BUSY
-							: own_result == CLUSTER_PCM_OWN_STALE
-							? RESOURCE_X_BUFFER_STALE
-							: RESOURCE_X_BUFFER_CORRUPT;
+						result = own_result == CLUSTER_PCM_OWN_BUSY	   ? RESOURCE_X_BUFFER_BUSY
+								 : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_BUFFER_STALE
+																	   : RESOURCE_X_BUFFER_CORRUPT;
 						break;
 					}
 				} else if (current.pcm_state == (uint8)PCM_STATE_X) {
-					own_result = cluster_bufmgr_pcm_own_begin_x_revoke(
-						buf, &current, &revoking);
+					own_result = cluster_bufmgr_pcm_own_begin_x_revoke(buf, &current, &revoking);
 					if (own_result == CLUSTER_PCM_OWN_OK) {
 						base = revoking;
-						own_result
-							= cluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(
-								buf, &revoking, &reservation_token);
+						own_result = cluster_bufmgr_pcm_own_handoff_revoke_to_x_reservation(
+							buf, &revoking, &reservation_token);
 					}
 					if (own_result != CLUSTER_PCM_OWN_OK) {
-						result = own_result == CLUSTER_PCM_OWN_BUSY
-							? RESOURCE_X_BUFFER_BUSY
-							: own_result == CLUSTER_PCM_OWN_STALE
-							? RESOURCE_X_BUFFER_STALE
-							: RESOURCE_X_BUFFER_CORRUPT;
+						result = own_result == CLUSTER_PCM_OWN_BUSY	   ? RESOURCE_X_BUFFER_BUSY
+								 : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_BUFFER_STALE
+																	   : RESOURCE_X_BUFFER_CORRUPT;
 						break;
 					}
 				} else {
@@ -11239,55 +10691,42 @@ PGRAC_PCM_X_FENCE_DOMINATED(cluster_pcm_x_resource_x_t2_snapshot_exact)
 						result = RESOURCE_X_BUFFER_CORRUPT;
 						break;
 					}
-					own_result
-						= gcs_block_pcm_x_resource_x_install_target_image_exact(
-							buf, &base, reservation_token,
-							precommit_image);
+					own_result = gcs_block_pcm_x_resource_x_install_target_image_exact(
+						buf, &base, reservation_token, precommit_image);
 					if (own_result != CLUSTER_PCM_OWN_OK) {
-						result = own_result == CLUSTER_PCM_OWN_BUSY
-							? RESOURCE_X_BUFFER_BUSY
-							: own_result == CLUSTER_PCM_OWN_STALE
-							? RESOURCE_X_BUFFER_STALE
-							: RESOURCE_X_BUFFER_CORRUPT;
+						result = own_result == CLUSTER_PCM_OWN_BUSY	   ? RESOURCE_X_BUFFER_BUSY
+								 : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_BUFFER_STALE
+																	   : RESOURCE_X_BUFFER_CORRUPT;
 						break;
 					}
 				}
-				own_result = cluster_bufmgr_pcm_own_finish_x_commit(
-					buf, &base, reservation_token, &committed_generation);
+				own_result = cluster_bufmgr_pcm_own_finish_x_commit(buf, &base, reservation_token,
+																	&committed_generation);
 				if (own_result != CLUSTER_PCM_OWN_OK
 					|| committed_generation != expected_committed_generation) {
-					result = own_result == CLUSTER_PCM_OWN_BUSY
-						? RESOURCE_X_BUFFER_BUSY
-						: own_result == CLUSTER_PCM_OWN_STALE
-						? RESOURCE_X_BUFFER_STALE
-						: RESOURCE_X_BUFFER_CORRUPT;
+					result = own_result == CLUSTER_PCM_OWN_BUSY	   ? RESOURCE_X_BUFFER_BUSY
+							 : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_BUFFER_STALE
+																   : RESOURCE_X_BUFFER_CORRUPT;
 					break;
 				}
 			}
 
 			if (capture_local_image) {
 				own_result = cluster_bufmgr_pcm_own_snapshot(buf, &current);
-				if (own_result != CLUSTER_PCM_OWN_OK
-					|| current.generation != committed_generation
-					|| !cluster_pcm_x_resource_x_t2_snapshot_exact(
-						ref, &current)) {
-					result = own_result == CLUSTER_PCM_OWN_BUSY
-						? RESOURCE_X_BUFFER_BUSY
-						: own_result == CLUSTER_PCM_OWN_NOT_READY
-						? RESOURCE_X_BUFFER_ABSENT
-						: own_result == CLUSTER_PCM_OWN_CORRUPT
-						? RESOURCE_X_BUFFER_CORRUPT
-						: RESOURCE_X_BUFFER_STALE;
+				if (own_result != CLUSTER_PCM_OWN_OK || current.generation != committed_generation
+					|| !cluster_pcm_x_resource_x_t2_snapshot_exact(ref, &current)) {
+					result = own_result == CLUSTER_PCM_OWN_BUSY		   ? RESOURCE_X_BUFFER_BUSY
+							 : own_result == CLUSTER_PCM_OWN_NOT_READY ? RESOURCE_X_BUFFER_ABSENT
+							 : own_result == CLUSTER_PCM_OWN_CORRUPT   ? RESOURCE_X_BUFFER_CORRUPT
+																	   : RESOURCE_X_BUFFER_STALE;
 					break;
 				}
 				page = BufferGetPage(BufferDescriptorGetBuffer(buf));
 				memcpy(aligned_page->data, page, BLCKSZ);
 				image_out->page_bytes = aligned_page->data;
 				image_out->page_lsn = PageGetLSN((Page)aligned_page->data);
-				image_out->page_scn
-					= ((PageHeader)aligned_page->data)->pd_block_scn;
-				image_out->page_checksum
-					= cluster_gcs_block_compute_checksum(aligned_page->data);
+				image_out->page_scn = ((PageHeader)aligned_page->data)->pd_block_scn;
+				image_out->page_checksum = cluster_gcs_block_compute_checksum(aligned_page->data);
 				image_out->image_length = BLCKSZ;
 			}
 			*committed_generation_out = committed_generation;
@@ -11357,17 +10796,15 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 		*terminal_ownership_generation_out = 0;
 	if (terminal_authority_generation_out != NULL)
 		*terminal_authority_generation_out = 0;
-	if (terminal_ref_out == NULL
-		|| terminal_ownership_generation_out == NULL
+	if (terminal_ref_out == NULL || terminal_ownership_generation_out == NULL
 		|| terminal_authority_generation_out == NULL)
 		return RESOURCE_X_APPLY_INVALID;
 
-	result = cluster_pcm_lock_resource_x_requester_join_frames_exact(
-		assertion, &grant, &image_frame, &join);
+	result = cluster_pcm_lock_resource_x_requester_join_frames_exact(assertion, &grant,
+																	 &image_frame, &join);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	if ((join.flags & RESOURCE_X_REQUESTER_JOIN_READY) == 0
-		|| join.requester_target_generation == 0
+	if ((join.flags & RESOURCE_X_REQUESTER_JOIN_READY) == 0 || join.requester_target_generation == 0
 		|| join.requester_target_generation != join.assertion_sequence
 		|| join.final_authority_generation <= join.base_authority_generation
 		|| join.final_authority_generation == UINT64_MAX
@@ -11382,8 +10819,7 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 			&& (image_frame.kind != RESOURCE_X_WIRE_IMAGE_ENVELOPE
 				|| image_frame.body.image_envelope.image_length != BLCKSZ))
 		|| (durable_proof
-			&& (image_frame.kind != 0
-				|| grant.common.flags != 0
+			&& (image_frame.kind != 0 || grant.common.flags != 0
 				|| grant.body.authority_grant.source_carrier_generation != 0
 				|| grant.body.authority_grant.dependency_count != 0)))
 		return RESOURCE_X_APPLY_BAD_STATE;
@@ -11405,8 +10841,8 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 			return RESOURCE_X_APPLY_STALE;
 	}
 	if (direct_init_bound) {
-		if (!GcsBlockResourceXDirectInitProofAllowedExact(
-				&ref.assertion.resource, durable_proof, remote_proof))
+		if (!GcsBlockResourceXDirectInitProofAllowedExact(&ref.assertion.resource, durable_proof,
+														  remote_proof))
 			return RESOURCE_X_APPLY_STALE;
 		if (remote_proof)
 			own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&ref.assertion.resource,
@@ -11416,16 +10852,14 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 				&ref.assertion.resource, direct_init_generation, direct_init_token,
 				&target_buffer_id, &target_base);
 	} else
-		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
-				&ref.assertion.resource, &target_buffer_id, &target_base);
+		own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&ref.assertion.resource,
+															&target_buffer_id, &target_base);
 	if (own_result != CLUSTER_PCM_OWN_OK || target_buffer_id < 0
-			|| !BufferTagsEqual(&target_base.tag, &ref.assertion.resource)
-			|| target_base.generation == UINT64_MAX)
-			return own_result == CLUSTER_PCM_OWN_BUSY
-				? RESOURCE_X_APPLY_BAD_STATE
-				: own_result == CLUSTER_PCM_OWN_CORRUPT
-				? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-				: RESOURCE_X_APPLY_STALE;
+		|| !BufferTagsEqual(&target_base.tag, &ref.assertion.resource)
+		|| target_base.generation == UINT64_MAX)
+		return own_result == CLUSTER_PCM_OWN_BUSY	   ? RESOURCE_X_APPLY_BAD_STATE
+			   : own_result == CLUSTER_PCM_OWN_CORRUPT ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+													   : RESOURCE_X_APPLY_STALE;
 	if (delivery_claim != NULL) {
 		ClusterPcmOwnSnapshot held;
 
@@ -11453,37 +10887,30 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 			if (!GcsBlockResourceXDirectInitProofAllowedExact(&ref.assertion.resource,
 															  durable_proof, remote_proof))
 				return RESOURCE_X_APPLY_STALE;
-			own_result
-				= cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
-					GetBufferDescriptor(target_buffer_id), &target_base);
+			own_result = cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
+				GetBufferDescriptor(target_buffer_id), &target_base);
 			if (own_result != CLUSTER_PCM_OWN_OK)
-				return own_result == CLUSTER_PCM_OWN_BUSY
-					? RESOURCE_X_APPLY_BAD_STATE
-					: own_result == CLUSTER_PCM_OWN_STALE
-					? RESOURCE_X_APPLY_STALE
-					: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+				return own_result == CLUSTER_PCM_OWN_BUSY	 ? RESOURCE_X_APPLY_BAD_STATE
+					   : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_APPLY_STALE
+															 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			direct_init_bound
 				= direct_init_bound
 				  && cluster_pcm_lock_resource_x_bootstrap_round_direct_init_matches_exact(
-					  &ref, target_base.generation,
-					  target_base.reservation_token);
+					  &ref, target_base.generation, target_base.reservation_token);
 			if (!direct_init_bound)
 				return RESOURCE_X_APPLY_STALE;
 		}
 	} else if (target_base.pcm_state == (uint8)PCM_STATE_N) {
-			/* Bootstrap admitted a cold generation-zero N descriptor only
+		/* Bootstrap admitted a cold generation-zero N descriptor only
 			 * through this exact BM_VALID/no-IO predicate.  Revalidate the
 			 * same shape at the type-15 terminal before T1/T2/T3; generation
 			 * zero supplies no authority, while the joined grant and image do. */
-			own_result
-				= cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-					GetBufferDescriptor(target_buffer_id), &target_base, NULL);
-			if (own_result != CLUSTER_PCM_OWN_OK)
-				return own_result == CLUSTER_PCM_OWN_BUSY
-					? RESOURCE_X_APPLY_BAD_STATE
-					: own_result == CLUSTER_PCM_OWN_STALE
-					? RESOURCE_X_APPLY_STALE
-					: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		own_result = cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
+			GetBufferDescriptor(target_buffer_id), &target_base, NULL);
+		if (own_result != CLUSTER_PCM_OWN_OK)
+			return own_result == CLUSTER_PCM_OWN_BUSY	 ? RESOURCE_X_APPLY_BAD_STATE
+				   : own_result == CLUSTER_PCM_OWN_STALE ? RESOURCE_X_APPLY_STALE
+														 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	} else if (target_base.generation == 0)
 		return RESOURCE_X_APPLY_STALE;
 	/* A T1 reservation owns the installation base through I1/I2.  The
@@ -11491,220 +10918,198 @@ gcs_block_pcm_x_resource_x_join_terminal_try(const ResourceXAssertion *assertion
 	expected_local_generation
 		= claim_source == RESOURCE_X_INSTALL_CLAIM_NONE ? target_base.generation : claim_generation;
 	memset(&executor_snapshot, 0, sizeof(executor_snapshot));
-	probe_result = cluster_pcm_lock_resource_x_executor_probe_exact(
-			&ref, &executor_snapshot);
+	probe_result = cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &executor_snapshot);
 	/* A retained exact type-15 replay is one of the existing requester
 	 * scheduling ticks.  It may re-drive a prior conditional content-lock
 	 * miss once, but must not erase identity/image contradictions or spin in
 	 * this LMS callback. */
-	if (probe_result == RESOURCE_X_EXECUTOR_BLOCKED
-		&& scheduled_retry
+	if (probe_result == RESOURCE_X_EXECUTOR_BLOCKED && scheduled_retry
 		&& executor_snapshot.no_progress_generation == ref.acquisition_generation
 		&& executor_snapshot.no_progress_reason == RESOURCE_X_NO_PROGRESS_BUFFER_BUSY) {
 		result = cluster_pcm_lock_resource_x_executor_rearm_exact(&ref);
-		if (result == RESOURCE_X_APPLY_APPLIED
-			|| result == RESOURCE_X_APPLY_DUPLICATE) {
+		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
 			memset(&executor_snapshot, 0, sizeof(executor_snapshot));
-			probe_result = cluster_pcm_lock_resource_x_executor_probe_exact(
-				&ref, &executor_snapshot);
+			probe_result
+				= cluster_pcm_lock_resource_x_executor_probe_exact(&ref, &executor_snapshot);
 		}
 	}
 	if (probe_result == RESOURCE_X_EXECUTOR_COMPLETE) {
-			if (target_base.pcm_state != (uint8)PCM_STATE_X
-				|| target_base.flags != 0
-				|| target_base.writer_activation_token != 0
-				|| target_base.resource_x_activation_generation != 0)
-				return RESOURCE_X_APPLY_STALE;
-			*terminal_ref_out = ref;
-			*terminal_ownership_generation_out = target_base.generation;
-			*terminal_authority_generation_out
-				= join.final_authority_generation;
-			return RESOURCE_X_APPLY_DUPLICATE;
-		}
+		if (target_base.pcm_state != (uint8)PCM_STATE_X || target_base.flags != 0
+			|| target_base.writer_activation_token != 0
+			|| target_base.resource_x_activation_generation != 0)
+			return RESOURCE_X_APPLY_STALE;
+		*terminal_ref_out = ref;
+		*terminal_ownership_generation_out = target_base.generation;
+		*terminal_authority_generation_out = join.final_authority_generation;
+		return RESOURCE_X_APPLY_DUPLICATE;
+	}
 	if (probe_result == RESOURCE_X_EXECUTOR_BLOCKED) {
-			(void)cluster_pcm_lock_resource_x_executor_wait_exact(&ref, 0);
-			return RESOURCE_X_APPLY_BAD_STATE;
-		}
-		/* A terminal round no longer exposes the live direct-init claim; only
+		(void)cluster_pcm_lock_resource_x_executor_wait_exact(&ref, 0);
+		return RESOURCE_X_APPLY_BAD_STATE;
+	}
+	/* A terminal round no longer exposes the live direct-init claim; only
 	 * the COMPLETE branch above may consume that historical lineage. */
-		if (claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT && !direct_init_bound)
-			return RESOURCE_X_APPLY_STALE;
-		if (claim_source != RESOURCE_X_INSTALL_CLAIM_NONE
-			&& target_base.pcm_state == (uint8)PCM_STATE_X
-			&& !cluster_pcm_x_resource_x_claim_installed_exact(&ref, &target_base, claim_generation,
-															   claim_token))
-			return RESOURCE_X_APPLY_STALE;
-		if (probe_result != RESOURCE_X_EXECUTOR_READY
-			&& !(probe_result == RESOURCE_X_EXECUTOR_CHANGED
-				 && executor_snapshot.ref.assertion.requester_node == -1
-				 && executor_snapshot.ref.formation == 0
-				 && executor_snapshot.ref.acquisition_generation == 0
-				 && executor_snapshot.progress_flags == 0
-				 && executor_snapshot.retired_acquisition_generation < ref.acquisition_generation))
-			return probe_result == RESOURCE_X_EXECUTOR_CHANGED ? RESOURCE_X_APPLY_STALE
-															   : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		memset(&gate, 0, sizeof(gate));
-		if (!cluster_pcm_lock_resource_x_executor_enter(&ref, &gate))
-			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		entered = true;
+	if (claim_source == RESOURCE_X_INSTALL_CLAIM_DIRECT_INIT && !direct_init_bound)
+		return RESOURCE_X_APPLY_STALE;
+	if (claim_source != RESOURCE_X_INSTALL_CLAIM_NONE && target_base.pcm_state == (uint8)PCM_STATE_X
+		&& !cluster_pcm_x_resource_x_claim_installed_exact(&ref, &target_base, claim_generation,
+														   claim_token))
+		return RESOURCE_X_APPLY_STALE;
+	if (probe_result != RESOURCE_X_EXECUTOR_READY
+		&& !(probe_result == RESOURCE_X_EXECUTOR_CHANGED
+			 && executor_snapshot.ref.assertion.requester_node == -1
+			 && executor_snapshot.ref.formation == 0
+			 && executor_snapshot.ref.acquisition_generation == 0
+			 && executor_snapshot.progress_flags == 0
+			 && executor_snapshot.retired_acquisition_generation < ref.acquisition_generation))
+		return probe_result == RESOURCE_X_EXECUTOR_CHANGED ? RESOURCE_X_APPLY_STALE
+														   : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	memset(&gate, 0, sizeof(gate));
+	if (!cluster_pcm_lock_resource_x_executor_enter(&ref, &gate))
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	entered = true;
 
-		PG_TRY();
-		{
-			do
-			{
-				result = cluster_pcm_lock_resource_x_t1_grant_delivery_exact(&ref, delivery_claim);
-				if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
-					break;
+	PG_TRY();
+	{
+		do {
+			result = cluster_pcm_lock_resource_x_t1_grant_delivery_exact(&ref, delivery_claim);
+			if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
+				break;
 
-				memset(&image, 0, sizeof(image));
-				memset(&durable_image, 0, sizeof(durable_image));
-				memset(&joined_image, 0, sizeof(joined_image));
-				if (durable_proof) {
-					if (!cluster_bufmgr_read_storage_image_for_resource_x(
-							ref.assertion.resource, aligned_image.data, &storage_lsn,
-							&storage_scn)) {
-						result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-						break;
-					}
-					memset(&durable, 0, sizeof(durable));
-					durable.assertion = grant.common.logical_assertion;
-					durable.base_authority_generation = grant.common.base_authority_generation;
-					durable.resource_formation = grant.common.resource_formation;
-					durable.master_session_incarnation = grant.common.master_session_incarnation;
-					durable.assertion_sequence = grant.common.assertion_sequence;
-					durable.requester_target_generation
-						= grant.body.authority_grant.requester_target_generation;
-					durable.page_scn_lsn = storage_scn;
-					durable.page_checksum = cluster_gcs_block_compute_checksum(aligned_image.data);
-					durable.source_proof_crc32c
-						= gcs_block_pcm_x_resource_x_durable_proof_crc(&durable);
-					if (durable.source_proof_crc32c == 0
-						|| grant.body.authority_grant.page_scn_lsn != durable.page_scn_lsn
-						|| grant.body.authority_grant.page_checksum != durable.page_checksum
-						|| grant.body.authority_grant.source_proof_crc32c
-							   != durable.source_proof_crc32c) {
-						result = RESOURCE_X_APPLY_STALE;
-						break;
-					}
-					durable_image.page_bytes = aligned_image.data;
-					durable_image.page_lsn = storage_lsn;
-					durable_image.page_scn = (SCN)storage_scn;
-					durable_image.page_checksum = durable.page_checksum;
-					durable_image.image_length = BLCKSZ;
-				} else if (remote_proof) {
-					memcpy(aligned_image.data, image_frame.body.image_envelope.page_bytes, BLCKSZ);
-					joined_image.page_bytes = aligned_image.data;
-					joined_image.page_lsn = PageGetLSN((Page)aligned_image.data);
-					joined_image.page_scn = ((PageHeader)aligned_image.data)->pd_block_scn;
-					joined_image.page_checksum = image_frame.body.image_envelope.page_checksum;
-					joined_image.image_length = BLCKSZ;
-					if (image_frame.body.image_envelope.page_scn_lsn
-						!= (uint64)joined_image.page_scn) {
-						result = RESOURCE_X_APPLY_INVALID;
-						break;
-					}
-				}
-
-				buffer_result = gcs_block_pcm_x_resource_x_prepare_target_x(
-					&ref, expected_local_generation, true, direct_init_bound, direct_init_token,
-					local_proof, durable_proof, remote_proof ? &joined_image : NULL, &aligned_image,
-					&image, &committed_generation, delivery_claim);
-				if (buffer_result != RESOURCE_X_BUFFER_T2_INSTALLED
-					&& buffer_result != RESOURCE_X_BUFFER_ALREADY_INSTALLED) {
-					cluster_pcm_lock_resource_x_publish_no_progress_exact(
-						&ref, buffer_result == RESOURCE_X_BUFFER_BUSY
-								  ? RESOURCE_X_NO_PROGRESS_BUFFER_BUSY
-							  : buffer_result == RESOURCE_X_BUFFER_ABSENT
-								  ? RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT
-							  : buffer_result == RESOURCE_X_BUFFER_STALE
-								  ? RESOURCE_X_NO_PROGRESS_BUFFER_STALE
-								  : RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT);
-					result = buffer_result == RESOURCE_X_BUFFER_STALE ? RESOURCE_X_APPLY_STALE
-							 : buffer_result == RESOURCE_X_BUFFER_CORRUPT
-								 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-								 : RESOURCE_X_APPLY_BAD_STATE;
+			memset(&image, 0, sizeof(image));
+			memset(&durable_image, 0, sizeof(durable_image));
+			memset(&joined_image, 0, sizeof(joined_image));
+			if (durable_proof) {
+				if (!cluster_bufmgr_read_storage_image_for_resource_x(
+						ref.assertion.resource, aligned_image.data, &storage_lsn, &storage_scn)) {
+					result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
 				}
+				memset(&durable, 0, sizeof(durable));
+				durable.assertion = grant.common.logical_assertion;
+				durable.base_authority_generation = grant.common.base_authority_generation;
+				durable.resource_formation = grant.common.resource_formation;
+				durable.master_session_incarnation = grant.common.master_session_incarnation;
+				durable.assertion_sequence = grant.common.assertion_sequence;
+				durable.requester_target_generation
+					= grant.body.authority_grant.requester_target_generation;
+				durable.page_scn_lsn = storage_scn;
+				durable.page_checksum = cluster_gcs_block_compute_checksum(aligned_image.data);
+				durable.source_proof_crc32c
+					= gcs_block_pcm_x_resource_x_durable_proof_crc(&durable);
+				if (durable.source_proof_crc32c == 0
+					|| grant.body.authority_grant.page_scn_lsn != durable.page_scn_lsn
+					|| grant.body.authority_grant.page_checksum != durable.page_checksum
+					|| grant.body.authority_grant.source_proof_crc32c
+						   != durable.source_proof_crc32c) {
+					result = RESOURCE_X_APPLY_STALE;
+					break;
+				}
+				durable_image.page_bytes = aligned_image.data;
+				durable_image.page_lsn = storage_lsn;
+				durable_image.page_scn = (SCN)storage_scn;
+				durable_image.page_checksum = durable.page_checksum;
+				durable_image.image_length = BLCKSZ;
+			} else if (remote_proof) {
+				memcpy(aligned_image.data, image_frame.body.image_envelope.page_bytes, BLCKSZ);
+				joined_image.page_bytes = aligned_image.data;
+				joined_image.page_lsn = PageGetLSN((Page)aligned_image.data);
+				joined_image.page_scn = ((PageHeader)aligned_image.data)->pd_block_scn;
+				joined_image.page_checksum = image_frame.body.image_envelope.page_checksum;
+				joined_image.image_length = BLCKSZ;
+				if (image_frame.body.image_envelope.page_scn_lsn != (uint64)joined_image.page_scn) {
+					result = RESOURCE_X_APPLY_INVALID;
+					break;
+				}
+			}
+
+			buffer_result = gcs_block_pcm_x_resource_x_prepare_target_x(
+				&ref, expected_local_generation, true, direct_init_bound, direct_init_token,
+				local_proof, durable_proof, remote_proof ? &joined_image : NULL, &aligned_image,
+				&image, &committed_generation, delivery_claim);
+			if (buffer_result != RESOURCE_X_BUFFER_T2_INSTALLED
+				&& buffer_result != RESOURCE_X_BUFFER_ALREADY_INSTALLED) {
+				cluster_pcm_lock_resource_x_publish_no_progress_exact(
+					&ref, buffer_result == RESOURCE_X_BUFFER_BUSY
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_BUSY
+						  : buffer_result == RESOURCE_X_BUFFER_ABSENT
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT
+						  : buffer_result == RESOURCE_X_BUFFER_STALE
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_STALE
+							  : RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT);
+				result = buffer_result == RESOURCE_X_BUFFER_STALE ? RESOURCE_X_APPLY_STALE
+						 : buffer_result == RESOURCE_X_BUFFER_CORRUPT
+							 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+							 : RESOURCE_X_APPLY_BAD_STATE;
+				break;
+			}
 			if (durable_proof)
 				image = durable_image;
 			else if (remote_proof)
 				image = joined_image;
 			else if (local_proof
-					 && (grant.body.authority_grant.page_scn_lsn
-					   != (uint64)image.page_scn
-				   || grant.body.authority_grant.page_checksum
-						  != image.page_checksum)) {
+					 && (grant.body.authority_grant.page_scn_lsn != (uint64)image.page_scn
+						 || grant.body.authority_grant.page_checksum != image.page_checksum)) {
 				result = RESOURCE_X_APPLY_STALE;
 				break;
 			}
 
 			if (direct_init_bound && !remote_proof)
-				buffer_result
-					= cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
-						&ref, committed_generation, direct_init_token,
-						&install_proof);
+				buffer_result = cluster_bufmgr_pcm_own_direct_init_bind_x_by_tag_exact(
+					&ref, committed_generation, direct_init_token, &install_proof);
 			else
-				buffer_result = cluster_bufmgr_pcm_own_activate_x_by_tag(
-					&ref, &image, &install_proof);
+				buffer_result
+					= cluster_bufmgr_pcm_own_activate_x_by_tag(&ref, &image, &install_proof);
 			if (buffer_result != RESOURCE_X_BUFFER_T2_INSTALLED
 				&& buffer_result != RESOURCE_X_BUFFER_ALREADY_INSTALLED) {
 				cluster_pcm_lock_resource_x_publish_no_progress_exact(
 					&ref, buffer_result == RESOURCE_X_BUFFER_BUSY
-						? RESOURCE_X_NO_PROGRESS_BUFFER_BUSY
-						: buffer_result == RESOURCE_X_BUFFER_ABSENT
-						? RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT
-						: buffer_result == RESOURCE_X_BUFFER_STALE
-						? RESOURCE_X_NO_PROGRESS_BUFFER_STALE
-						: RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT);
-				result = buffer_result == RESOURCE_X_BUFFER_STALE
-					? RESOURCE_X_APPLY_STALE
-					: buffer_result == RESOURCE_X_BUFFER_CORRUPT
-					? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-					: RESOURCE_X_APPLY_BAD_STATE;
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_BUSY
+						  : buffer_result == RESOURCE_X_BUFFER_ABSENT
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT
+						  : buffer_result == RESOURCE_X_BUFFER_STALE
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_STALE
+							  : RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT);
+				result = buffer_result == RESOURCE_X_BUFFER_STALE ? RESOURCE_X_APPLY_STALE
+						 : buffer_result == RESOURCE_X_BUFFER_CORRUPT
+							 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+							 : RESOURCE_X_APPLY_BAD_STATE;
 				break;
 			}
 
 			result = cluster_pcm_lock_resource_x_requester_apply_delivery_exact(
 				&ref, &install_proof, delivery_claim);
-			if (result != RESOURCE_X_APPLY_APPLIED
-				&& result != RESOURCE_X_APPLY_DUPLICATE)
+			if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 				break;
 			if (direct_init_bound && !remote_proof)
-				buffer_result
-					= cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
-						&ref, committed_generation, direct_init_token,
-						&activation_proof);
+				buffer_result = cluster_bufmgr_pcm_own_direct_init_clear_x_by_tag_exact(
+					&ref, committed_generation, direct_init_token, &activation_proof);
 			else
-				buffer_result
-					= cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
-						&ref, &activation_proof);
+				buffer_result = cluster_bufmgr_pcm_own_writer_activation_clear_by_tag_exact(
+					&ref, &activation_proof);
 			if (buffer_result != RESOURCE_X_BUFFER_T2_INSTALLED
 				&& buffer_result != RESOURCE_X_BUFFER_ALREADY_INSTALLED) {
 				cluster_pcm_lock_resource_x_publish_no_progress_exact(
 					&ref, buffer_result == RESOURCE_X_BUFFER_BUSY
-						? RESOURCE_X_NO_PROGRESS_BUFFER_BUSY
-						: buffer_result == RESOURCE_X_BUFFER_ABSENT
-						? RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT
-						: buffer_result == RESOURCE_X_BUFFER_STALE
-						? RESOURCE_X_NO_PROGRESS_BUFFER_STALE
-						: RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT);
-				result = buffer_result == RESOURCE_X_BUFFER_STALE
-					? RESOURCE_X_APPLY_STALE
-					: buffer_result == RESOURCE_X_BUFFER_CORRUPT
-					? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-					: RESOURCE_X_APPLY_BAD_STATE;
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_BUSY
+						  : buffer_result == RESOURCE_X_BUFFER_ABSENT
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_ABSENT
+						  : buffer_result == RESOURCE_X_BUFFER_STALE
+							  ? RESOURCE_X_NO_PROGRESS_BUFFER_STALE
+							  : RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT);
+				result = buffer_result == RESOURCE_X_BUFFER_STALE ? RESOURCE_X_APPLY_STALE
+						 : buffer_result == RESOURCE_X_BUFFER_CORRUPT
+							 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+							 : RESOURCE_X_APPLY_BAD_STATE;
 				break;
 			}
 			result = cluster_pcm_lock_resource_x_requester_activate_delivery_exact(
 				&ref, &activation_proof, delivery_claim);
-			if (result != RESOURCE_X_APPLY_APPLIED
-				&& result != RESOURCE_X_APPLY_DUPLICATE)
+			if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 				break;
 			*terminal_ref_out = ref;
-			*terminal_ownership_generation_out
-				= activation_proof.ownership_generation;
-			*terminal_authority_generation_out
-				= join.final_authority_generation;
+			*terminal_ownership_generation_out = activation_proof.ownership_generation;
+			*terminal_authority_generation_out = join.final_authority_generation;
 			break;
 		} while (false);
 	}
@@ -11808,10 +11213,9 @@ gcs_block_pcm_x_resource_x_join_terminal_owned_try(const ResourceXAcquisitionRef
 }
 
 static ResourceXApplyResult
-gcs_block_pcm_x_resource_x_master_durable_try(
-	const ResourceXDecodedFrame *assertion,
-	const ResourceXMasterSnapshot *captured,
-	ResourceXMasterSnapshot *out)
+gcs_block_pcm_x_resource_x_master_durable_try(const ResourceXDecodedFrame *assertion,
+											  const ResourceXMasterSnapshot *captured,
+											  ResourceXMasterSnapshot *out)
 {
 	PGAlignedBlock aligned_image;
 	ResourceXDurableProof durable;
@@ -11821,47 +11225,36 @@ gcs_block_pcm_x_resource_x_master_durable_try(
 	if (assertion == NULL || captured == NULL || out == NULL
 		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X
 		|| assertion->common.observed_mode != (uint8)PCM_STATE_N
-		|| captured->phase != RESOURCE_X_MASTER_WAIT_PROOF
-		|| captured->is_head != 1
+		|| captured->phase != RESOURCE_X_MASTER_WAIT_PROOF || captured->is_head != 1
 		|| captured->proof_kind != 0
 		|| captured->incompatible_holders_bitmap != captured->blocked_holders_bitmap
-		|| !resource_x_assertion_equal(&captured->assertion,
-			&assertion->common.logical_assertion)
-		|| captured->base_authority_generation
-			!= assertion->common.base_authority_generation
-		|| captured->resource_formation
-			!= assertion->common.resource_formation
-		|| captured->master_session_incarnation
-			!= assertion->common.master_session_incarnation
-		|| captured->assertion_sequence
-			!= assertion->common.assertion_sequence)
+		|| !resource_x_assertion_equal(&captured->assertion, &assertion->common.logical_assertion)
+		|| captured->base_authority_generation != assertion->common.base_authority_generation
+		|| captured->resource_formation != assertion->common.resource_formation
+		|| captured->master_session_incarnation != assertion->common.master_session_incarnation
+		|| captured->assertion_sequence != assertion->common.assertion_sequence)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (!cluster_bufmgr_read_storage_image_for_resource_x(
-			assertion->common.logical_assertion.resource,
-			aligned_image.data, &page_lsn, &page_scn))
+			assertion->common.logical_assertion.resource, aligned_image.data, &page_lsn, &page_scn))
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 
 	memset(&durable, 0, sizeof(durable));
 	durable.assertion = captured->assertion;
 	durable.base_authority_generation = captured->base_authority_generation;
 	durable.resource_formation = captured->resource_formation;
-	durable.master_session_incarnation
-		= captured->master_session_incarnation;
+	durable.master_session_incarnation = captured->master_session_incarnation;
 	durable.assertion_sequence = captured->assertion_sequence;
 	durable.requester_target_generation = captured->assertion_sequence;
 	durable.page_scn_lsn = page_scn;
-	durable.page_checksum
-		= cluster_gcs_block_compute_checksum(aligned_image.data);
-	durable.source_proof_crc32c
-		= gcs_block_pcm_x_resource_x_durable_proof_crc(&durable);
+	durable.page_checksum = cluster_gcs_block_compute_checksum(aligned_image.data);
+	durable.source_proof_crc32c = gcs_block_pcm_x_resource_x_durable_proof_crc(&durable);
 	if (durable.source_proof_crc32c == 0)
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	return cluster_pcm_lock_resource_x_durable_proof_exact(&durable, out);
 }
 
 static ResourceXApplyResult
-gcs_block_pcm_x_resource_x_remote_s_own_result(
-	ClusterPcmOwnResult result)
+gcs_block_pcm_x_resource_x_remote_s_own_result(ClusterPcmOwnResult result)
 {
 	if (result == CLUSTER_PCM_OWN_OK)
 		return RESOURCE_X_APPLY_APPLIED;
@@ -11891,8 +11284,7 @@ gcs_block_resource_x_remote_s_own_result(ClusterPcmOwnResult result)
 }
 
 static void
-gcs_block_resource_x_failure_decision_apply(
-	const ResourceXRemoteSFailureDecision *decision)
+gcs_block_resource_x_failure_decision_apply(const ResourceXRemoteSFailureDecision *decision)
 {
 	if (decision != NULL && decision->global_fail_closed)
 		gcs_block_resource_x_fail_closed_current();
@@ -11997,8 +11389,8 @@ gcs_block_resource_x_next_diagnostic_request_sequence(void)
 }
 
 static bool
-gcs_block_resource_x_first_failure_should_log(
-	const ResourceXFirstFailureEvidence *evidence, uint64 now_us)
+gcs_block_resource_x_first_failure_should_log(const ResourceXFirstFailureEvidence *evidence,
+											  uint64 now_us)
 {
 	ResourceXFirstFailureLogIdentity identity;
 	uint32 i;
@@ -12009,18 +11401,17 @@ gcs_block_resource_x_first_failure_should_log(
 	identity.tag = evidence->tag;
 	identity.request_sequence = evidence->request_sequence;
 	identity.admission_generation = evidence->admission_generation != 0
-		? evidence->admission_generation : evidence->r4_generation;
+										? evidence->admission_generation
+										: evidence->r4_generation;
 	identity.assertion_sequence = evidence->assertion_sequence;
 	identity.formation = evidence->formation;
 	identity.master_session = evidence->master_session;
 	identity.requester_node = evidence->requester_node;
 	identity.in_use = true;
 	for (i = 0; i < RESOURCE_X_FIRST_FAILURE_LOG_SLOTS; i++) {
-		ResourceXFirstFailureLogIdentity *slot
-			= &resource_x_first_failure_log_slots[i];
+		ResourceXFirstFailureLogIdentity *slot = &resource_x_first_failure_log_slots[i];
 
-		if (slot->in_use
-			&& BufferTagsEqual(&slot->tag, &identity.tag)
+		if (slot->in_use && BufferTagsEqual(&slot->tag, &identity.tag)
 			&& slot->request_sequence == identity.request_sequence
 			&& slot->admission_generation == identity.admission_generation
 			&& slot->assertion_sequence == identity.assertion_sequence
@@ -12029,21 +11420,18 @@ gcs_block_resource_x_first_failure_should_log(
 			&& slot->requester_node == identity.requester_node)
 			return false;
 	}
-	resource_x_first_failure_log_slots[resource_x_first_failure_log_next_slot]
-		= identity;
+	resource_x_first_failure_log_slots[resource_x_first_failure_log_next_slot] = identity;
 	resource_x_first_failure_log_next_slot
-		= (resource_x_first_failure_log_next_slot + 1)
-		  % RESOURCE_X_FIRST_FAILURE_LOG_SLOTS;
+		= (resource_x_first_failure_log_next_slot + 1) % RESOURCE_X_FIRST_FAILURE_LOG_SLOTS;
 
 	if (resource_x_first_failure_log_window_start_us == 0
 		|| now_us < resource_x_first_failure_log_window_start_us
 		|| now_us - resource_x_first_failure_log_window_start_us
-			>= RESOURCE_X_FIRST_FAILURE_LOG_INTERVAL_US) {
+			   >= RESOURCE_X_FIRST_FAILURE_LOG_INTERVAL_US) {
 		resource_x_first_failure_log_window_start_us = now_us;
 		resource_x_first_failure_log_window_count = 0;
 	}
-	if (resource_x_first_failure_log_window_count
-		>= RESOURCE_X_FIRST_FAILURE_LOG_RATE_LIMIT)
+	if (resource_x_first_failure_log_window_count >= RESOURCE_X_FIRST_FAILURE_LOG_RATE_LIMIT)
 		return false;
 	resource_x_first_failure_log_window_count++;
 	return true;
@@ -12053,8 +11441,7 @@ gcs_block_resource_x_first_failure_should_log(
  * maps the result nor fences/retries the request.  Callers invoke it at their
  * first local failure boundary after any exact rollback attempt has ended. */
 static void
-gcs_block_resource_x_first_failure_record(
-	const ResourceXFirstFailureEvidence *evidence)
+gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *evidence)
 {
 	PcmGrdLifecycleStats lifecycle;
 	uint64 now_us;
@@ -12069,20 +11456,17 @@ gcs_block_resource_x_first_failure_record(
 	if (ClusterGcsBlock != NULL) {
 		switch (evidence->failure_domain) {
 		case RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE:
-			pg_atomic_fetch_add_u64(
-				&ClusterGcsBlock->resource_x_pre_mutation_backpressure_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->resource_x_pre_mutation_backpressure_count,
+									1);
 			break;
 		case RESOURCE_X_FAIL_AUTHORITY_DRIFT:
-			pg_atomic_fetch_add_u64(
-				&ClusterGcsBlock->resource_x_authority_drift_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->resource_x_authority_drift_count, 1);
 			break;
 		case RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY:
-			pg_atomic_fetch_add_u64(
-				&ClusterGcsBlock->resource_x_post_mutation_ambiguity_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->resource_x_post_mutation_ambiguity_count, 1);
 			break;
 		case RESOURCE_X_FAIL_INTERNAL_CORRUPTION:
-			pg_atomic_fetch_add_u64(
-				&ClusterGcsBlock->resource_x_internal_corruption_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->resource_x_internal_corruption_count, 1);
 			break;
 		case RESOURCE_X_FAIL_NONE:
 			break;
@@ -12094,175 +11478,143 @@ gcs_block_resource_x_first_failure_record(
 	cluster_pcm_grd_lifecycle_stats_snapshot(&lifecycle);
 	live_entries = cluster_pcm_grd_count();
 	capacity_used = live_entries > 0 ? (uint32)live_entries : 0;
-	capacity_limit = cluster_pcm_grd_capacity() > 0
-		? (uint32)cluster_pcm_grd_capacity() : 0;
-	tag_hash = hash_any((const unsigned char *)&evidence->tag,
-		(int)sizeof(evidence->tag));
-	ereport(LOG,
+	capacity_limit = cluster_pcm_grd_capacity() > 0 ? (uint32)cluster_pcm_grd_capacity() : 0;
+	tag_hash = hash_any((const unsigned char *)&evidence->tag, (int)sizeof(evidence->tag));
+	ereport(
+		LOG,
 		(errmsg_internal("Resource-X first-failure diagnostic"),
-		 errdetail("tag_hash=%u binding_generation=%llu "
-				   "request_sequence=%llu admission_generation=%llu "
-				   "buffer_generation_before=%llu buffer_generation_after=%llu "
-				   "buffer_token_before=%llu buffer_token_after=%llu "
-				   "buffer_writer_token_before=%llu buffer_writer_token_after=%llu "
-				   "buffer_resource_x_generation_before=%llu "
-				   "buffer_resource_x_generation_after=%llu "
-				   "buffer_flags_before=0x%08x buffer_flags_after=0x%08x "
-				   "buffer_pcm_state_before=%u buffer_pcm_state_after=%u "
-				   "buffer_own_result=%d "
-				   "formation=%llu master_session=%llu r4_generation=%llu "
-				   "base_authority_generation=%llu authority_generation=%llu "
-				   "assertion_sequence=%llu remote_s_stage=%u "
-				   "source_settlement_stage=%u source_settlement_own_result=%d "
-				   "source_settlement_commit_stage=%u "
-				   "source_settlement_commit_mismatch=0x%08x "
-				   "source_settlement_current_formation=%llu "
-				   "source_settlement_current_master=%d "
-				   "source_settlement_current_session=%llu "
-				   "source_settlement_current_terminal_authority=%llu "
-				   "source_settlement_current_cached_generation=%llu "
-				   "source_settlement_current_round_phase=%u "
-				   "source_settlement_current_owner_state=%u "
-				   "source_settlement_pair_formation=%llu "
-				   "source_settlement_pair_session=%llu "
-				   "source_settlement_pair_sequence=%llu "
-				   "source_settlement_pair_source_generation=%llu "
-				   "source_settlement_pair_observed_mode=%u "
-				   "source_settlement_pair_destination=%u "
-				   "source_settlement_pair_status_valid=%u "
-				   "source_settlement_pair_image_valid=%u "
-				   "source_settlement_status_intent=%u "
-				   "source_settlement_image_intent=%u "
-				   "failure_domain=%u "
-				   "result=%d holder_mutation_started=%s revoke_reversible=%s "
-				   "rollback_cancel_ok=%s rollback_abort_ok=%s "
-				   "status_staged=%s status_published=%s "
-				   "proof_staged=%s proof_published=%s "
-				   "round_terminal=%s round_phase=%u round_progress_flags=0x%08x "
-				   "capacity_kind=%s capacity_used=%u capacity_limit=%u "
-				   "reclaim_attempts=%llu reclaim_successes=%llu "
-				   "reclaim_reuses=%llu capacity_retries=%llu "
-				   "capacity_failures=%llu refused_pcm_mode=%llu "
-				   "refused_holder=%llu refused_pi=%llu refused_watermark=%llu "
-				   "refused_resource_x=%llu refused_retained=%llu "
-				   "refused_requester=%llu refused_sidecar=%llu "
-				   "deadline=%llu",
-				   tag_hash,
-				   (unsigned long long)evidence->binding_generation,
-				   (unsigned long long)evidence->request_sequence,
-				   (unsigned long long)(evidence->admission_generation != 0
-					   ? evidence->admission_generation
-					   : evidence->r4_generation),
-				   (unsigned long long)evidence->buffer_generation_before,
-				   (unsigned long long)evidence->buffer_generation_after,
-				   (unsigned long long)evidence->buffer_token_before,
-				   (unsigned long long)evidence->buffer_token_after,
-				   (unsigned long long)evidence->buffer_writer_token_before,
-				   (unsigned long long)evidence->buffer_writer_token_after,
-				   (unsigned long long)
-					   evidence->buffer_resource_x_generation_before,
-				   (unsigned long long)
-					   evidence->buffer_resource_x_generation_after,
-				   evidence->buffer_flags_before,
-				   evidence->buffer_flags_after,
-				   (unsigned)evidence->buffer_pcm_state_before,
-				   (unsigned)evidence->buffer_pcm_state_after,
-				   evidence->remote_s_stage != RESOURCE_X_REMOTE_S_STAGE_NONE
-					   ? evidence->buffer_own_result : -1,
-				   (unsigned long long)evidence->formation,
-				   (unsigned long long)evidence->master_session,
-				   (unsigned long long)evidence->r4_generation,
-				   (unsigned long long)evidence->base_authority_generation,
-				   (unsigned long long)evidence->authority_generation,
-				   (unsigned long long)evidence->assertion_sequence,
-				   (unsigned)evidence->remote_s_stage,
-				   (unsigned)evidence->source_settlement_stage,
-				   evidence->source_settlement_stage
-						   != RESOURCE_X_SOURCE_SETTLEMENT_STAGE_NONE
-					   ? evidence->source_settlement_own_result : -1,
-				   (unsigned)evidence->source_settlement_commit.commit_stage,
-				   evidence->source_settlement_commit.mismatch_mask,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_resource_formation,
-				   evidence->source_settlement_commit.current_master_node,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_master_session,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_terminal_authority_generation,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_cached_ownership_generation,
-				   (unsigned)evidence->source_settlement_commit
-					   .current_round_phase,
-				   (unsigned)evidence->source_settlement_commit.current_owner_state,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_pair_resource_formation,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_pair_master_session,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_pair_assertion_sequence,
-				   (unsigned long long)evidence->source_settlement_commit
-					   .current_pair_source_generation,
-				   (unsigned)evidence->source_settlement_commit
-					   .current_pair_observed_mode,
-				   evidence->source_settlement_commit
-					   .current_pair_destination_node,
-				   (unsigned)evidence->source_settlement_commit
-					   .current_holder_status_valid,
-				   (unsigned)evidence->source_settlement_commit
-					   .current_holder_image_valid,
-				   (unsigned)evidence->source_settlement_commit
-					   .current_status_intent_state,
-				   (unsigned)evidence->source_settlement_commit
-					   .current_image_intent_state,
-				   (unsigned)evidence->failure_domain,
-				   (int)evidence->result,
-				   evidence->holder_mutation_started ? "true" : "false",
-				   evidence->revoke_reversible ? "true" : "false",
-				   gcs_block_resource_x_rollback_outcome(
-					   evidence->rollback_cancel_attempted,
-					   evidence->rollback_cancel_ok),
-				   gcs_block_resource_x_rollback_outcome(
-					   evidence->rollback_abort_attempted,
-					   evidence->rollback_abort_ok),
-				   evidence->status_staged ? "true" : "false",
-				   evidence->status_published ? "true" : "false",
-				   evidence->proof_staged ? "true" : "false",
-				   evidence->proof_published ? "true" : "false",
-				   evidence->round_terminal ? "true" : "false",
-				   (unsigned)evidence->round_phase,
-				   evidence->round_progress_flags,
-				   "pcm_grd_live",
-				   capacity_used,
-				   capacity_limit,
-				   (unsigned long long)lifecycle.reclaim_attempt_count,
-				   (unsigned long long)lifecycle.reclaim_success_count,
-				   (unsigned long long)lifecycle.reclaim_reuse_count,
-				   (unsigned long long)lifecycle.capacity_retry_count,
-				   (unsigned long long)lifecycle.capacity_fail_count,
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N],
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_HOLDER_PRESENT],
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_PI_PRESENT],
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_WATERMARK_PRESENT],
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_RESOURCE_X_ACTIVE],
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_RETAINED_PAIR_PRESENT],
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_REQUESTER_NOT_TERMINAL],
-				   (unsigned long long)lifecycle.reclaim_refused[
-					   PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL],
-				   (unsigned long long)evidence->absolute_deadline_us)));
+		 errdetail(
+			 "tag_hash=%u binding_generation=%llu "
+			 "request_sequence=%llu admission_generation=%llu "
+			 "buffer_generation_before=%llu buffer_generation_after=%llu "
+			 "buffer_token_before=%llu buffer_token_after=%llu "
+			 "buffer_writer_token_before=%llu buffer_writer_token_after=%llu "
+			 "buffer_resource_x_generation_before=%llu "
+			 "buffer_resource_x_generation_after=%llu "
+			 "buffer_flags_before=0x%08x buffer_flags_after=0x%08x "
+			 "buffer_pcm_state_before=%u buffer_pcm_state_after=%u "
+			 "buffer_own_result=%d "
+			 "formation=%llu master_session=%llu r4_generation=%llu "
+			 "base_authority_generation=%llu authority_generation=%llu "
+			 "assertion_sequence=%llu remote_s_stage=%u "
+			 "source_settlement_stage=%u source_settlement_own_result=%d "
+			 "source_settlement_commit_stage=%u "
+			 "source_settlement_commit_mismatch=0x%08x "
+			 "source_settlement_current_formation=%llu "
+			 "source_settlement_current_master=%d "
+			 "source_settlement_current_session=%llu "
+			 "source_settlement_current_terminal_authority=%llu "
+			 "source_settlement_current_cached_generation=%llu "
+			 "source_settlement_current_round_phase=%u "
+			 "source_settlement_current_owner_state=%u "
+			 "source_settlement_pair_formation=%llu "
+			 "source_settlement_pair_session=%llu "
+			 "source_settlement_pair_sequence=%llu "
+			 "source_settlement_pair_source_generation=%llu "
+			 "source_settlement_pair_observed_mode=%u "
+			 "source_settlement_pair_destination=%u "
+			 "source_settlement_pair_status_valid=%u "
+			 "source_settlement_pair_image_valid=%u "
+			 "source_settlement_status_intent=%u "
+			 "source_settlement_image_intent=%u "
+			 "failure_domain=%u "
+			 "result=%d holder_mutation_started=%s revoke_reversible=%s "
+			 "rollback_cancel_ok=%s rollback_abort_ok=%s "
+			 "status_staged=%s status_published=%s "
+			 "proof_staged=%s proof_published=%s "
+			 "round_terminal=%s round_phase=%u round_progress_flags=0x%08x "
+			 "capacity_kind=%s capacity_used=%u capacity_limit=%u "
+			 "reclaim_attempts=%llu reclaim_successes=%llu "
+			 "reclaim_reuses=%llu capacity_retries=%llu "
+			 "capacity_failures=%llu refused_pcm_mode=%llu "
+			 "refused_holder=%llu refused_pi=%llu refused_watermark=%llu "
+			 "refused_resource_x=%llu refused_retained=%llu "
+			 "refused_requester=%llu refused_sidecar=%llu "
+			 "deadline=%llu",
+			 tag_hash, (unsigned long long)evidence->binding_generation,
+			 (unsigned long long)evidence->request_sequence,
+			 (unsigned long long)(evidence->admission_generation != 0
+									  ? evidence->admission_generation
+									  : evidence->r4_generation),
+			 (unsigned long long)evidence->buffer_generation_before,
+			 (unsigned long long)evidence->buffer_generation_after,
+			 (unsigned long long)evidence->buffer_token_before,
+			 (unsigned long long)evidence->buffer_token_after,
+			 (unsigned long long)evidence->buffer_writer_token_before,
+			 (unsigned long long)evidence->buffer_writer_token_after,
+			 (unsigned long long)evidence->buffer_resource_x_generation_before,
+			 (unsigned long long)evidence->buffer_resource_x_generation_after,
+			 evidence->buffer_flags_before, evidence->buffer_flags_after,
+			 (unsigned)evidence->buffer_pcm_state_before,
+			 (unsigned)evidence->buffer_pcm_state_after,
+			 evidence->remote_s_stage != RESOURCE_X_REMOTE_S_STAGE_NONE
+				 ? evidence->buffer_own_result
+				 : -1,
+			 (unsigned long long)evidence->formation, (unsigned long long)evidence->master_session,
+			 (unsigned long long)evidence->r4_generation,
+			 (unsigned long long)evidence->base_authority_generation,
+			 (unsigned long long)evidence->authority_generation,
+			 (unsigned long long)evidence->assertion_sequence, (unsigned)evidence->remote_s_stage,
+			 (unsigned)evidence->source_settlement_stage,
+			 evidence->source_settlement_stage != RESOURCE_X_SOURCE_SETTLEMENT_STAGE_NONE
+				 ? evidence->source_settlement_own_result
+				 : -1,
+			 (unsigned)evidence->source_settlement_commit.commit_stage,
+			 evidence->source_settlement_commit.mismatch_mask,
+			 (unsigned long long)evidence->source_settlement_commit.current_resource_formation,
+			 evidence->source_settlement_commit.current_master_node,
+			 (unsigned long long)evidence->source_settlement_commit.current_master_session,
+			 (unsigned long long)
+				 evidence->source_settlement_commit.current_terminal_authority_generation,
+			 (unsigned long long)
+				 evidence->source_settlement_commit.current_cached_ownership_generation,
+			 (unsigned)evidence->source_settlement_commit.current_round_phase,
+			 (unsigned)evidence->source_settlement_commit.current_owner_state,
+			 (unsigned long long)evidence->source_settlement_commit.current_pair_resource_formation,
+			 (unsigned long long)evidence->source_settlement_commit.current_pair_master_session,
+			 (unsigned long long)evidence->source_settlement_commit.current_pair_assertion_sequence,
+			 (unsigned long long)evidence->source_settlement_commit.current_pair_source_generation,
+			 (unsigned)evidence->source_settlement_commit.current_pair_observed_mode,
+			 evidence->source_settlement_commit.current_pair_destination_node,
+			 (unsigned)evidence->source_settlement_commit.current_holder_status_valid,
+			 (unsigned)evidence->source_settlement_commit.current_holder_image_valid,
+			 (unsigned)evidence->source_settlement_commit.current_status_intent_state,
+			 (unsigned)evidence->source_settlement_commit.current_image_intent_state,
+			 (unsigned)evidence->failure_domain, (int)evidence->result,
+			 evidence->holder_mutation_started ? "true" : "false",
+			 evidence->revoke_reversible ? "true" : "false",
+			 gcs_block_resource_x_rollback_outcome(evidence->rollback_cancel_attempted,
+												   evidence->rollback_cancel_ok),
+			 gcs_block_resource_x_rollback_outcome(evidence->rollback_abort_attempted,
+												   evidence->rollback_abort_ok),
+			 evidence->status_staged ? "true" : "false",
+			 evidence->status_published ? "true" : "false",
+			 evidence->proof_staged ? "true" : "false",
+			 evidence->proof_published ? "true" : "false",
+			 evidence->round_terminal ? "true" : "false", (unsigned)evidence->round_phase,
+			 evidence->round_progress_flags, "pcm_grd_live", capacity_used, capacity_limit,
+			 (unsigned long long)lifecycle.reclaim_attempt_count,
+			 (unsigned long long)lifecycle.reclaim_success_count,
+			 (unsigned long long)lifecycle.reclaim_reuse_count,
+			 (unsigned long long)lifecycle.capacity_retry_count,
+			 (unsigned long long)lifecycle.capacity_fail_count,
+			 (unsigned long long)lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_PCM_MODE_NOT_N],
+			 (unsigned long long)lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_HOLDER_PRESENT],
+			 (unsigned long long)lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_PI_PRESENT],
+			 (unsigned long long)lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_WATERMARK_PRESENT],
+			 (unsigned long long)lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_RESOURCE_X_ACTIVE],
+			 (unsigned long long)
+				 lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_RETAINED_PAIR_PRESENT],
+			 (unsigned long long)
+				 lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_REQUESTER_NOT_TERMINAL],
+			 (unsigned long long)lifecycle.reclaim_refused[PCM_RETIRE_REFUSAL_SIDECAR_NOT_TERMINAL],
+			 (unsigned long long)evidence->absolute_deadline_us)));
 }
 
 static ResourceXFailureDomain
 gcs_block_resource_x_pre_mutation_domain(ClusterPcmOwnResult own_result)
 {
-	if (own_result == CLUSTER_PCM_OWN_BUSY
-		|| own_result == CLUSTER_PCM_OWN_NOT_READY)
+	if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY)
 		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
 	if (own_result == CLUSTER_PCM_OWN_STALE)
 		return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
@@ -12270,54 +11622,46 @@ gcs_block_resource_x_pre_mutation_domain(ClusterPcmOwnResult own_result)
 }
 
 static ResourceXFailureDomain
-gcs_block_resource_x_target_failure_domain(
-	ResourceXApplyResult result, ResourceXApplyResult round_snapshot_result,
-	const ResourceXBootstrapRoundFailureSnapshot *round,
-	ClusterPcmOwnResult live_snapshot_result)
+gcs_block_resource_x_target_failure_domain(ResourceXApplyResult result,
+										   ResourceXApplyResult round_snapshot_result,
+										   const ResourceXBootstrapRoundFailureSnapshot *round,
+										   ClusterPcmOwnResult live_snapshot_result)
 {
 	if (live_snapshot_result == CLUSTER_PCM_OWN_CORRUPT
 		|| live_snapshot_result == CLUSTER_PCM_OWN_NOT_READY
 		|| round_snapshot_result == RESOURCE_X_APPLY_RECOVERY_BLOCKED
 		|| round_snapshot_result == RESOURCE_X_APPLY_INVALID)
 		return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
-	if (round_snapshot_result == RESOURCE_X_APPLY_STALE
-		|| result == RESOURCE_X_APPLY_STALE)
+	if (round_snapshot_result == RESOURCE_X_APPLY_STALE || result == RESOURCE_X_APPLY_STALE)
 		return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
-	if (round_snapshot_result == RESOURCE_X_APPLY_APPLIED
-		&& round != NULL) {
+	if (round_snapshot_result == RESOURCE_X_APPLY_APPLIED && round != NULL) {
 		if ((round->progress_flags & RESOURCE_X_PROGRESS_T2) != 0)
 			return RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
-		if (round->terminal != 0
-			|| (round->progress_flags & RESOURCE_X_PROGRESS_T1) != 0)
+		if (round->terminal != 0 || (round->progress_flags & RESOURCE_X_PROGRESS_T1) != 0)
 			return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
 	}
-	if (result == RESOURCE_X_APPLY_BAD_STATE
-		|| result == RESOURCE_X_APPLY_NOT_FOUND)
+	if (result == RESOURCE_X_APPLY_BAD_STATE || result == RESOURCE_X_APPLY_NOT_FOUND)
 		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
 	return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
 }
 
 static void
-gcs_block_resource_x_first_failure_from_block(
-	ResourceXFirstFailureEvidence *evidence,
-	const ResourceXDecodedFrame *block, ResourceXRemoteSStage stage,
-	ResourceXFailureDomain domain, ResourceXApplyResult result)
+gcs_block_resource_x_first_failure_from_block(ResourceXFirstFailureEvidence *evidence,
+											  const ResourceXDecodedFrame *block,
+											  ResourceXRemoteSStage stage,
+											  ResourceXFailureDomain domain,
+											  ResourceXApplyResult result)
 {
 	memset(evidence, 0, sizeof(*evidence));
 	if (block != NULL) {
 		evidence->tag = block->common.logical_assertion.resource;
-		evidence->base_authority_generation
-			= block->common.base_authority_generation;
-		evidence->authority_generation
-			= block->common.authority_generation;
-		evidence->assertion_sequence
-			= block->common.assertion_sequence;
+		evidence->base_authority_generation = block->common.base_authority_generation;
+		evidence->authority_generation = block->common.authority_generation;
+		evidence->assertion_sequence = block->common.assertion_sequence;
 		evidence->request_sequence = block->common.assertion_sequence;
-		evidence->requester_node
-			= block->common.logical_assertion.requester_node;
+		evidence->requester_node = block->common.logical_assertion.requester_node;
 		evidence->formation = block->common.resource_formation;
-		evidence->master_session
-			= block->common.master_session_incarnation;
+		evidence->master_session = block->common.master_session_incarnation;
 	}
 	evidence->remote_s_stage = stage;
 	evidence->buffer_own_result = -1;
@@ -12327,8 +11671,7 @@ gcs_block_resource_x_first_failure_from_block(
 }
 
 static ResourceXFailureDomain
-gcs_block_resource_x_source_settlement_apply_domain(
-	ResourceXApplyResult result)
+gcs_block_resource_x_source_settlement_apply_domain(ResourceXApplyResult result)
 {
 	if (result == RESOURCE_X_APPLY_BAD_STATE)
 		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
@@ -12338,16 +11681,14 @@ gcs_block_resource_x_source_settlement_apply_domain(
 }
 
 static ResourceXFailureDomain
-gcs_block_resource_x_source_settlement_own_domain(
-	ClusterPcmOwnResult own_result, bool release_applied)
+gcs_block_resource_x_source_settlement_own_domain(ClusterPcmOwnResult own_result,
+												  bool release_applied)
 {
-	if (own_result == CLUSTER_PCM_OWN_CORRUPT
-		|| own_result == CLUSTER_PCM_OWN_INVALID)
+	if (own_result == CLUSTER_PCM_OWN_CORRUPT || own_result == CLUSTER_PCM_OWN_INVALID)
 		return RESOURCE_X_FAIL_INTERNAL_CORRUPTION;
 	if (release_applied)
 		return RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY;
-	if (own_result == CLUSTER_PCM_OWN_BUSY
-		|| own_result == CLUSTER_PCM_OWN_NOT_READY)
+	if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY)
 		return RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE;
 	if (own_result == CLUSTER_PCM_OWN_STALE)
 		return RESOURCE_X_FAIL_AUTHORITY_DRIFT;
@@ -12358,29 +11699,24 @@ static void
 gcs_block_resource_x_source_settlement_failure_record(
 	const ResourceXDecodedFrame *settlement,
 	const ResourceXSourceSettlementCommitObservation *commit_observation,
-	ResourceXSourceSettlementStage source_settlement_stage,
-	ResourceXFailureDomain failure_domain, ResourceXApplyResult result,
-	uint64 source_generation, int32 source_settlement_own_result,
+	ResourceXSourceSettlementStage source_settlement_stage, ResourceXFailureDomain failure_domain,
+	ResourceXApplyResult result, uint64 source_generation, int32 source_settlement_own_result,
 	bool release_applied, bool status_staged)
 {
 	ClusterSemanticR11CutoverSnapshot cutover;
 	ResourceXFirstFailureEvidence first_failure;
 
 	gcs_block_resource_x_first_failure_from_block(
-		&first_failure, settlement, RESOURCE_X_REMOTE_S_STAGE_NONE,
-		failure_domain, result);
+		&first_failure, settlement, RESOURCE_X_REMOTE_S_STAGE_NONE, failure_domain, result);
 	first_failure.source_settlement_stage = source_settlement_stage;
-	first_failure.source_settlement_own_result
-		= source_settlement_own_result;
+	first_failure.source_settlement_own_result = source_settlement_own_result;
 	if (commit_observation != NULL)
 		first_failure.source_settlement_commit = *commit_observation;
 	first_failure.binding_generation = source_generation;
 	first_failure.holder_mutation_started = release_applied;
 	first_failure.status_staged = status_staged;
-	if (settlement != NULL
-		&& cluster_semantic_activation_r11_cutover_snapshot(&cutover)
-		&& cutover.formation_epoch
-			== settlement->common.resource_formation) {
+	if (settlement != NULL && cluster_semantic_activation_r11_cutover_snapshot(&cutover)
+		&& cutover.formation_epoch == settlement->common.resource_formation) {
 		first_failure.admission_generation = cutover.record_generation;
 		first_failure.r4_generation = cutover.record_generation;
 	}
@@ -12444,10 +11780,8 @@ gcs_block_resource_x_remote_s_authority_result_exact(const ResourceXDecodedFrame
  * registry exists. */
 static ResourceXApplyResult
 gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
-	const ResourceXDecodedFrame *block,
-	int32 authenticated_master_node,
-	uint32 authenticated_capability_generation,
-	uint64 r4_record_generation,
+	const ResourceXDecodedFrame *block, int32 authenticated_master_node,
+	uint32 authenticated_capability_generation, uint64 r4_record_generation,
 	const ClusterSemanticAdmissionToken *admission)
 {
 	BufferDesc *buf;
@@ -12462,8 +11796,7 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	LWLock *content_lock;
 	ResourceXDecodedFrame status;
 	ResourceXFirstFailureEvidence first_failure;
-	ResourceXRemoteSStage remote_s_stage
-		= RESOURCE_X_REMOTE_S_STAGE_VALIDATE;
+	ResourceXRemoteSStage remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_VALIDATE;
 	ResourceXFailureDomain failure_domain = RESOURCE_X_FAIL_NONE;
 	ResourceXRemoteSFailureDecision failure_decision;
 	ResourceXApplyResult mapped_result;
@@ -12481,33 +11814,23 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		|| !resource_x_assertion_valid(&block->common.logical_assertion)
 		|| authenticated_master_node < 0
 		|| authenticated_master_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| authenticated_capability_generation == 0
-		|| r4_record_generation == 0
-		|| r4_record_generation == UINT64_MAX
-		|| admission == NULL || !admission->entered
-		|| admission->record_generation != r4_record_generation
-		|| cluster_node_id < 0
+		|| authenticated_capability_generation == 0 || r4_record_generation == 0
+		|| r4_record_generation == UINT64_MAX || admission == NULL || !admission->entered
+		|| admission->record_generation != r4_record_generation || cluster_node_id < 0
 		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
 		|| block->common.logical_assertion.requester_node == cluster_node_id
 		|| block->common.action_node != cluster_node_id
 		|| block->common.base_authority_generation == 0
 		|| block->common.base_authority_generation == UINT64_MAX
-		|| block->common.authority_generation
-			   != block->common.base_authority_generation
-		|| block->common.resource_formation == 0
-		|| block->common.master_session_incarnation == 0
-		|| block->common.assertion_sequence == 0
-		|| block->common.sender_connection_generation == 0
+		|| block->common.authority_generation != block->common.base_authority_generation
+		|| block->common.resource_formation == 0 || block->common.master_session_incarnation == 0
+		|| block->common.assertion_sequence == 0 || block->common.sender_connection_generation == 0
 		|| block->common.observed_mode != (uint8)PCM_STATE_S
-		|| block->common.target_mode != (uint8)PCM_STATE_N
-		|| block->common.source_candidate != 0
-		|| block->common.retain_pi_if_dirty != 0
-		|| block->common.outcome != RESOURCE_X_OUTCOME_NONE
-		|| cluster_gcs_lookup_master(
-			   block->common.logical_assertion.resource)
+		|| block->common.target_mode != (uint8)PCM_STATE_N || block->common.source_candidate != 0
+		|| block->common.retain_pi_if_dirty != 0 || block->common.outcome != RESOURCE_X_OUTCOME_NONE
+		|| cluster_gcs_lookup_master(block->common.logical_assertion.resource)
 			   != authenticated_master_node
-		|| !cluster_pcm_lock_resource_x_gate_open_exact(
-			block->common.resource_formation))
+		|| !cluster_pcm_lock_resource_x_gate_open_exact(block->common.resource_formation))
 		return RESOURCE_X_APPLY_INVALID;
 	mapped_result = gcs_block_resource_x_remote_s_authority_result_exact(
 		block, authenticated_master_node, authenticated_capability_generation, admission);
@@ -12529,38 +11852,30 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 
 	remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_SNAPSHOT;
 	memset(&current, 0, sizeof(current));
-	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(
-		&block->common.logical_assertion.resource, &buffer_id, &current);
+	own_result = cluster_bufmgr_pcm_own_snapshot_by_tag(&block->common.logical_assertion.resource,
+														&buffer_id, &current);
 	if (own_result != CLUSTER_PCM_OWN_OK || buffer_id < 0) {
 		if (own_result == CLUSTER_PCM_OWN_OK)
 			own_result = CLUSTER_PCM_OWN_CORRUPT;
 		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
 		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, failure_domain,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage, failure_decision.domain,
-			mapped_result);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, failure_domain, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain, mapped_result);
 		first_failure.r4_generation = r4_record_generation;
 		gcs_block_resource_x_first_failure_record(&first_failure);
 		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return mapped_result;
 	}
-	if (current.pcm_state == (uint8)PCM_STATE_N
-		&& current.flags == PCM_OWN_FLAG_GRANT_PENDING) {
-		own_result
-			= cluster_pcm_x_remote_s_holder_pending_grant_result(&current);
+	if (current.pcm_state == (uint8)PCM_STATE_N && current.flags == PCM_OWN_FLAG_GRANT_PENDING) {
+		own_result = cluster_pcm_x_remote_s_holder_pending_grant_result(&current);
 		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
 		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, failure_domain,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage, failure_decision.domain,
-			mapped_result);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, failure_domain, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain, mapped_result);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12575,32 +11890,24 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		 * existing status shape on the current connection.  This branch never
 		 * claims a BufferDesc/PCM owner or changes the local page state. */
 		memset(&revalidated, 0, sizeof(revalidated));
-		own_result
-			= cluster_pcm_x_remote_s_holder_stable_n_result(&current);
+		own_result = cluster_pcm_x_remote_s_holder_stable_n_result(&current);
 		if (own_result == CLUSTER_PCM_OWN_OK)
-			own_result = cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-				buf, &current, &revalidated);
+			own_result
+				= cluster_bufmgr_pcm_own_n_assertion_candidate_exact(buf, &current, &revalidated);
 		if (own_result != CLUSTER_PCM_OWN_OK) {
-			mapped_result
-				= gcs_block_resource_x_remote_s_own_result(own_result);
-			failure_domain
-				= gcs_block_resource_x_pre_mutation_domain(own_result);
-			failure_decision
-				= cluster_gcs_resource_x_remote_s_failure_decide(
-					remote_s_stage, failure_domain,
-					false, false, false, false);
-			gcs_block_resource_x_first_failure_from_block(
-				&first_failure, block, remote_s_stage,
-				failure_decision.domain, mapped_result);
+			mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
+			failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
+			failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, failure_domain, false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+														  failure_decision.domain, mapped_result);
 			first_failure.r4_generation = r4_record_generation;
 			first_failure.buffer_generation_before = current.generation;
 			first_failure.buffer_generation_after = revalidated.generation;
 			first_failure.buffer_token_before = current.reservation_token;
 			first_failure.buffer_token_after = revalidated.reservation_token;
-			first_failure.buffer_writer_token_before
-				= current.writer_activation_token;
-			first_failure.buffer_writer_token_after
-				= revalidated.writer_activation_token;
+			first_failure.buffer_writer_token_before = current.writer_activation_token;
+			first_failure.buffer_writer_token_after = revalidated.writer_activation_token;
 			first_failure.buffer_resource_x_generation_before
 				= current.resource_x_activation_generation;
 			first_failure.buffer_resource_x_generation_after
@@ -12644,21 +11951,16 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		status.common.action_node = cluster_node_id;
 		status.common.source_candidate = 0;
 		status.common.retain_pi_if_dirty = 0;
-		status.common.sender_connection_generation
-			= outbound_connection_generation;
+		status.common.sender_connection_generation = outbound_connection_generation;
 		status.common.outcome = RESOURCE_X_OUTCOME_OK;
-		if (!cluster_resource_x_wire_encode(
-				RESOURCE_X_MSG_BLOCKED_TO_N, &status, payload,
-				sizeof(payload), &payload_len, &reject)
+		if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &status, payload,
+											sizeof(payload), &payload_len, &reject)
 			|| payload_len != RESOURCE_X_CONTROL_V1_BYTES) {
-			failure_decision
-				= cluster_gcs_resource_x_remote_s_failure_decide(
-					remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-					false, false, false, false);
-			gcs_block_resource_x_first_failure_from_block(
-				&first_failure, block, remote_s_stage,
-				failure_decision.domain,
-				RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+			failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION, false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+														  failure_decision.domain,
+														  RESOURCE_X_APPLY_RECOVERY_BLOCKED);
 			first_failure.r4_generation = r4_record_generation;
 			first_failure.buffer_generation_before = current.generation;
 			first_failure.buffer_generation_after = revalidated.generation;
@@ -12666,17 +11968,14 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 			gcs_block_resource_x_failure_decision_apply(&failure_decision);
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
-		worker_id = cluster_lms_shard_for_tag(
-			&block->common.logical_assertion.resource, cluster_lms_workers);
+		worker_id = cluster_lms_shard_for_tag(&block->common.logical_assertion.resource,
+											  cluster_lms_workers);
 		if (worker_id < 0 || worker_id >= cluster_lms_workers) {
-			failure_decision
-				= cluster_gcs_resource_x_remote_s_failure_decide(
-					remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-					false, false, false, false);
-			gcs_block_resource_x_first_failure_from_block(
-				&first_failure, block, remote_s_stage,
-				failure_decision.domain,
-				RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+			failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION, false, false, false, false);
+			gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+														  failure_decision.domain,
+														  RESOURCE_X_APPLY_RECOVERY_BLOCKED);
 			first_failure.r4_generation = r4_record_generation;
 			first_failure.buffer_generation_before = current.generation;
 			first_failure.buffer_generation_after = revalidated.generation;
@@ -12711,18 +12010,15 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 			return mapped_result;
 		}
 		if (!cluster_lms_outbound_enqueue_cap_bound(
-				worker_id, RESOURCE_X_MSG_BLOCKED_TO_N,
-				(uint32)authenticated_master_node, payload, payload_len,
-				PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+				worker_id, RESOURCE_X_MSG_BLOCKED_TO_N, (uint32)authenticated_master_node, payload,
+				payload_len, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
 				outbound_connection_generation)) {
-			failure_decision
-				= cluster_gcs_resource_x_remote_s_failure_decide(
-					remote_s_stage,
-					RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
-					false, false, false, false);
-			gcs_block_resource_x_first_failure_from_block(
-				&first_failure, block, remote_s_stage,
-				failure_decision.domain, RESOURCE_X_APPLY_BAD_STATE);
+			failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+				remote_s_stage, RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE, false, false, false,
+				false);
+			gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+														  failure_decision.domain,
+														  RESOURCE_X_APPLY_BAD_STATE);
 			first_failure.r4_generation = r4_record_generation;
 			first_failure.buffer_generation_before = current.generation;
 			first_failure.buffer_generation_after = revalidated.generation;
@@ -12732,18 +12028,14 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		}
 		return RESOURCE_X_APPLY_APPLIED;
 	}
-	own_result = cluster_bufmgr_pcm_own_s_holder_candidate_exact(
-		buf, &current);
+	own_result = cluster_bufmgr_pcm_own_s_holder_candidate_exact(buf, &current);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
 		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, failure_domain,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage, failure_decision.domain,
-			mapped_result);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, failure_domain, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain, mapped_result);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12760,18 +12052,14 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	status.common.source_candidate = 0;
 	status.common.retain_pi_if_dirty = 0;
 	status.common.outcome = RESOURCE_X_OUTCOME_OK;
-	if (!cluster_resource_x_wire_encode(
-			RESOURCE_X_MSG_BLOCKED_TO_N, &status, payload,
-			sizeof(payload), &payload_len, &reject)
-			|| payload_len != RESOURCE_X_CONTROL_V1_BYTES) {
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage,
-			failure_decision.domain,
-			RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &status, payload,
+										sizeof(payload), &payload_len, &reject)
+		|| payload_len != RESOURCE_X_CONTROL_V1_BYTES) {
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain,
+													  RESOURCE_X_APPLY_RECOVERY_BLOCKED);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12779,17 +12067,14 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
-	worker_id = cluster_lms_shard_for_tag(
-		&block->common.logical_assertion.resource, cluster_lms_workers);
+	worker_id
+		= cluster_lms_shard_for_tag(&block->common.logical_assertion.resource, cluster_lms_workers);
 	if (worker_id < 0 || worker_id >= cluster_lms_workers) {
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage,
-			failure_decision.domain,
-			RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, RESOURCE_X_FAIL_INTERNAL_CORRUPTION, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain,
+													  RESOURCE_X_APPLY_RECOVERY_BLOCKED);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12800,15 +12085,11 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 
 	content_lock = BufferDescriptorGetContentLock(buf);
 	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage,
-				RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage,
-			failure_decision.domain,
-			RESOURCE_X_APPLY_BAD_STATE);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain,
+													  RESOURCE_X_APPLY_BAD_STATE);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12819,26 +12100,20 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 	memset(&revalidated, 0, sizeof(revalidated));
 	memset(&revoking, 0, sizeof(revoking));
 	own_result = cluster_bufmgr_pcm_own_snapshot(buf, &revalidated);
-	if (own_result == CLUSTER_PCM_OWN_OK
-		&& memcmp(&current, &revalidated, sizeof(current)) != 0)
+	if (own_result == CLUSTER_PCM_OWN_OK && memcmp(&current, &revalidated, sizeof(current)) != 0)
 		own_result = CLUSTER_PCM_OWN_STALE;
 	if (own_result == CLUSTER_PCM_OWN_OK)
-		own_result = cluster_bufmgr_pcm_own_s_holder_candidate_exact(
-			buf, &revalidated);
+		own_result = cluster_bufmgr_pcm_own_s_holder_candidate_exact(buf, &revalidated);
 	if (own_result == CLUSTER_PCM_OWN_OK)
-		own_result = cluster_bufmgr_pcm_own_begin_s_revoke(
-			buf, &revalidated, &revoking);
+		own_result = cluster_bufmgr_pcm_own_begin_s_revoke(buf, &revalidated, &revoking);
 	LWLockRelease(content_lock);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		mapped_result = gcs_block_resource_x_remote_s_own_result(own_result);
 		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, failure_domain,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage, failure_decision.domain,
-			mapped_result);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, failure_domain, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain, mapped_result);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = revalidated.generation;
@@ -12850,22 +12125,18 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 
 	memset(&status_handle, 0, sizeof(status_handle));
 	own_result = cluster_lms_outbound_stage_resource_x_remote_s_status_exact(
-		worker_id, (uint32)authenticated_master_node,
-		payload, payload_len, &revoking, &status_handle);
+		worker_id, (uint32)authenticated_master_node, payload, payload_len, &revoking,
+		&status_handle);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
 		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
-		mapped_result = rollback_abort_ok
-			? gcs_block_resource_x_remote_s_own_result(own_result)
-			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		mapped_result = rollback_abort_ok ? gcs_block_resource_x_remote_s_own_result(own_result)
+										  : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, failure_domain,
-				false, false, true, rollback_abort_ok);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage, failure_decision.domain,
-			mapped_result);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, failure_domain, false, false, true, rollback_abort_ok);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain, mapped_result);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = revoking.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12887,8 +12158,7 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		block, authenticated_master_node, authenticated_capability_generation, admission);
 	if (mapped_result != RESOURCE_X_APPLY_APPLIED) {
 		cancel_result
-			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
-				&status_handle);
+			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(&status_handle);
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
 		rollback_cancel_ok = cancel_result == CLUSTER_PCM_OWN_OK;
 		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
@@ -12919,22 +12189,17 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 
 	if (!LWLockConditionalAcquire(content_lock, LW_EXCLUSIVE)) {
 		cancel_result
-			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
-				&status_handle);
+			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(&status_handle);
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
 		rollback_cancel_ok = cancel_result == CLUSTER_PCM_OWN_OK;
 		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage,
-				RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE,
-				true, rollback_cancel_ok, true, rollback_abort_ok);
-		mapped_result = rollback_cancel_ok && rollback_abort_ok
-			? RESOURCE_X_APPLY_BAD_STATE
-			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage, failure_decision.domain,
-			mapped_result);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE, true, rollback_cancel_ok,
+			true, rollback_abort_ok);
+		mapped_result = rollback_cancel_ok && rollback_abort_ok ? RESOURCE_X_APPLY_BAD_STATE
+																: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain, mapped_result);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = revoking.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12947,32 +12212,26 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		first_failure.status_staged = true;
 		gcs_block_resource_x_first_failure_record(&first_failure);
 		gcs_block_resource_x_failure_decision_apply(&failure_decision);
-		return failure_decision.rollback_complete
-			? RESOURCE_X_APPLY_BAD_STATE
-			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return failure_decision.rollback_complete ? RESOURCE_X_APPLY_BAD_STATE
+												  : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	memset(&released, 0, sizeof(released));
-	own_result = cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(
-		buf, &revoking, &released);
+	own_result = cluster_bufmgr_pcm_own_finish_remote_s_block_to_n(buf, &revoking, &released);
 	LWLockRelease(content_lock);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
 		cancel_result
-			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(
-				&status_handle);
+			= cluster_lms_outbound_cancel_resource_x_remote_s_status_exact(&status_handle);
 		abort_result = cluster_bufmgr_pcm_own_abort_s_revoke(buf, &revoking);
 		rollback_cancel_ok = cancel_result == CLUSTER_PCM_OWN_OK;
 		rollback_abort_ok = abort_result == CLUSTER_PCM_OWN_OK;
 		mapped_result = rollback_cancel_ok && rollback_abort_ok
-			? gcs_block_resource_x_remote_s_own_result(own_result)
-			: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+							? gcs_block_resource_x_remote_s_own_result(own_result)
+							: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		failure_domain = gcs_block_resource_x_pre_mutation_domain(own_result);
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage, failure_domain,
-				true, rollback_cancel_ok, true, rollback_abort_ok);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage, failure_decision.domain,
-			mapped_result);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, failure_domain, true, rollback_cancel_ok, true, rollback_abort_ok);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain, mapped_result);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = revoking.generation;
 		first_failure.buffer_generation_after = current.generation;
@@ -12985,23 +12244,18 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		first_failure.status_staged = true;
 		gcs_block_resource_x_first_failure_record(&first_failure);
 		gcs_block_resource_x_failure_decision_apply(&failure_decision);
-		return failure_decision.rollback_complete
-			? mapped_result : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+		return failure_decision.rollback_complete ? mapped_result
+												  : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_COMMITTED_N;
 	own_result
-		= cluster_lms_outbound_publish_resource_x_remote_s_status_exact(
-			&status_handle, &released);
+		= cluster_lms_outbound_publish_resource_x_remote_s_status_exact(&status_handle, &released);
 	if (own_result != CLUSTER_PCM_OWN_OK) {
-		failure_decision
-			= cluster_gcs_resource_x_remote_s_failure_decide(
-				remote_s_stage,
-				RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY,
-				false, false, false, false);
-		gcs_block_resource_x_first_failure_from_block(
-			&first_failure, block, remote_s_stage,
-			failure_decision.domain,
-			RESOURCE_X_APPLY_RECOVERY_BLOCKED);
+		failure_decision = cluster_gcs_resource_x_remote_s_failure_decide(
+			remote_s_stage, RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY, false, false, false, false);
+		gcs_block_resource_x_first_failure_from_block(&first_failure, block, remote_s_stage,
+													  failure_decision.domain,
+													  RESOURCE_X_APPLY_RECOVERY_BLOCKED);
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = revoking.generation;
 		first_failure.buffer_generation_after = released.generation;
@@ -13023,13 +12277,10 @@ gcs_block_resource_x_target_peer_result_exact(const ClusterSemanticAdmissionToke
 	ClusterSemanticResourceXPeerOpenResult peer_result;
 
 	if (admission == NULL || !admission->entered
-		|| admission->feature_bit
-			!= CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
-		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE
-		|| admission->record_generation == 0
-		|| admission->record_generation == UINT64_MAX
-		|| peer_node < 0 || peer_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| authenticated_connection_generation == 0)
+		|| admission->feature_bit != CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1
+		|| admission->side != CLUSTER_SEMANTIC_TARGET_SIDE || admission->record_generation == 0
+		|| admission->record_generation == UINT64_MAX || peer_node < 0
+		|| peer_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT || authenticated_connection_generation == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	if (admission->formation_epoch != cluster_epoch_get_current()
 		|| !cluster_semantic_activation_recheck(admission))
@@ -13402,9 +12653,9 @@ gcs_block_resource_x_cleanup_frame_exact(const ResourceXDecodedFrame *frame, int
  * Resource-X local-owner, and outbound staging work; no branch may resnapshot
  * into the retired source implementation. */
 static ResourceXApplyResult
-gcs_block_resource_x_type17_ingress(
-	const ClusterICEnvelope *env, const ResourceXDecodedFrame *frame,
-	uint32 authenticated_connection_generation)
+gcs_block_resource_x_type17_ingress(const ClusterICEnvelope *env,
+									const ResourceXDecodedFrame *frame,
+									uint32 authenticated_connection_generation)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -13414,8 +12665,7 @@ gcs_block_resource_x_type17_ingress(
 	ResourceXGateSnapshot diagnostic_gate;
 	ResourceXGateSnapshot gate;
 	ResourceXApplyResult result = RESOURCE_X_APPLY_STALE;
-	PcmXSessionAuthResult diagnostic_session_check
-		= PCM_X_SESSION_AUTH_INVALID;
+	PcmXSessionAuthResult diagnostic_session_check = PCM_X_SESSION_AUTH_INVALID;
 	uint64 diagnostic_master_session = 0;
 	uint64 master_session = 0;
 	int32 diagnostic_lookup_master = -1;
@@ -13432,14 +12682,13 @@ gcs_block_resource_x_type17_ingress(
 	PcmXSessionAuthResult session_check = PCM_X_SESSION_AUTH_INVALID;
 
 	memset(&admission, 0, sizeof(admission));
-	if (env == NULL || frame == NULL
-		|| frame->kind != RESOURCE_X_WIRE_BLOCK_TO_N
+	if (env == NULL || frame == NULL || frame->kind != RESOURCE_X_WIRE_BLOCK_TO_N
 		|| authenticated_connection_generation == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	source_node = (int32)env->source_node_id;
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return RESOURCE_X_APPLY_STALE;
 
@@ -13447,8 +12696,7 @@ gcs_block_resource_x_type17_ingress(
 	{
 		if (source_node != cluster_node_id)
 			peer_check = cluster_semantic_activation_resource_x_peer_open_check(
-				&admission, source_node,
-				authenticated_connection_generation);
+				&admission, source_node, authenticated_connection_generation);
 		result = gcs_block_resource_x_target_peer_result_exact(&admission, source_node,
 															   authenticated_connection_generation);
 		peer_exact = result == RESOURCE_X_APPLY_APPLIED;
@@ -13457,8 +12705,7 @@ gcs_block_resource_x_type17_ingress(
 				&frame->common.logical_assertion.resource, &gate, &master_node, &master_session);
 		gate_exact = peer_exact && session_check == PCM_X_SESSION_AUTH_OK;
 		master_exact = peer_exact && master_node == source_node;
-		formation_exact = master_exact
-			&& gate.formation == frame->common.resource_formation;
+		formation_exact = master_exact && gate.formation == frame->common.resource_formation;
 		session_exact = gate_exact && formation_exact
 						&& master_session == frame->common.master_session_incarnation;
 		if (peer_exact) {
@@ -13472,68 +12719,50 @@ gcs_block_resource_x_type17_ingress(
 		admission_exact = result == RESOURCE_X_APPLY_APPLIED;
 		if (admission_exact) {
 			if ((frame->common.observed_mode == (uint8)PCM_STATE_X
-					 || frame->common.observed_mode == (uint8)PCM_STATE_S)
-				&& frame->common.source_candidate == 1
-				&& frame->common.retain_pi_if_dirty == 1)
-				result = gcs_block_pcm_x_resource_x_source_block_to_n(
-					frame, master_node, admission.record_generation);
+				 || frame->common.observed_mode == (uint8)PCM_STATE_S)
+				&& frame->common.source_candidate == 1 && frame->common.retain_pi_if_dirty == 1)
+				result = gcs_block_pcm_x_resource_x_source_block_to_n(frame, master_node,
+																	  admission.record_generation);
 			else if (frame->common.observed_mode == (uint8)PCM_STATE_S
-					 && frame->common.logical_assertion.requester_node
-						!= cluster_node_id)
-				result
-					= gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
-						frame, master_node,
-						authenticated_connection_generation,
-						admission.record_generation, &admission);
+					 && frame->common.logical_assertion.requester_node != cluster_node_id)
+				result = gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
+					frame, master_node, authenticated_connection_generation,
+					admission.record_generation, &admission);
 			else
-				result = cluster_pcm_lock_resource_x_block_to_n_exact(
-					frame, master_node);
+				result = cluster_pcm_lock_resource_x_block_to_n_exact(frame, master_node);
 		} else {
 			memset(&diagnostic_gate, 0, sizeof(diagnostic_gate));
-			memset(&diagnostic_session_sample, 0,
-				   sizeof(diagnostic_session_sample));
-			diagnostic_gate_snapshot
-				= cluster_pcm_lock_resource_x_gate_snapshot(
-					&diagnostic_gate);
-			diagnostic_gate_open = diagnostic_gate_snapshot
-				&& diagnostic_gate.phase == RESOURCE_X_GATE_OPEN;
+			memset(&diagnostic_session_sample, 0, sizeof(diagnostic_session_sample));
+			diagnostic_gate_snapshot = cluster_pcm_lock_resource_x_gate_snapshot(&diagnostic_gate);
+			diagnostic_gate_open
+				= diagnostic_gate_snapshot && diagnostic_gate.phase == RESOURCE_X_GATE_OPEN;
 			if (diagnostic_gate_open) {
-				diagnostic_lookup_master = cluster_gcs_lookup_master(
-					frame->common.logical_assertion.resource);
+				diagnostic_lookup_master
+					= cluster_gcs_lookup_master(frame->common.logical_assertion.resource);
 				if (diagnostic_lookup_master >= 0
-					&& diagnostic_lookup_master
-					   < RESOURCE_X_PROTOCOL_NODE_LIMIT)
-					diagnostic_session_check
-						= gcs_block_pcm_x_authenticated_session_result(
-							diagnostic_lookup_master,
-							cluster_epoch_get_current(),
-							&diagnostic_master_session,
-							&diagnostic_session_sample);
+					&& diagnostic_lookup_master < RESOURCE_X_PROTOCOL_NODE_LIMIT)
+					diagnostic_session_check = gcs_block_pcm_x_authenticated_session_result(
+						diagnostic_lookup_master, cluster_epoch_get_current(),
+						&diagnostic_master_session, &diagnostic_session_sample);
 			}
-			ereport(LOG,
-					(errmsg_internal("Resource-X type-17 ingress predicate diagnostic"),
-					 errdetail("peer=%s peer_check=%d gate=%s master=%s formation=%s "
-							   "session=%s admission=%s source=%d current_master=%d "
-							   "wire_formation=%llu current_formation=%llu "
-							   "wire_session=%llu current_session=%llu "
-							   "connection_generation=%u r4_generation=%llu",
-							   peer_exact ? "true" : "false",
-							   (int)peer_check,
-							   gate_exact ? "true" : "false",
-							   master_exact ? "true" : "false",
-							   formation_exact ? "true" : "false",
-							   session_exact ? "true" : "false",
-							   admission_exact ? "true" : "false",
-							   source_node, master_node,
-							   (unsigned long long)frame->common.resource_formation,
-							   (unsigned long long)(gate_exact
-								   ? gate.formation : 0),
-							   (unsigned long long)frame->common
-								   .master_session_incarnation,
-							   (unsigned long long)master_session,
-							   authenticated_connection_generation,
-							   (unsigned long long)admission.record_generation),
-					 errdetail_log("gate_snapshot=%s gate_phase=%u "
+			ereport(
+				LOG,
+				(errmsg_internal("Resource-X type-17 ingress predicate diagnostic"),
+				 errdetail("peer=%s peer_check=%d gate=%s master=%s formation=%s "
+						   "session=%s admission=%s source=%d current_master=%d "
+						   "wire_formation=%llu current_formation=%llu "
+						   "wire_session=%llu current_session=%llu "
+						   "connection_generation=%u r4_generation=%llu",
+						   peer_exact ? "true" : "false", (int)peer_check,
+						   gate_exact ? "true" : "false", master_exact ? "true" : "false",
+						   formation_exact ? "true" : "false", session_exact ? "true" : "false",
+						   admission_exact ? "true" : "false", source_node, master_node,
+						   (unsigned long long)frame->common.resource_formation,
+						   (unsigned long long)(gate_exact ? gate.formation : 0),
+						   (unsigned long long)frame->common.master_session_incarnation,
+						   (unsigned long long)master_session, authenticated_connection_generation,
+						   (unsigned long long)admission.record_generation),
+				 errdetail_log("gate_snapshot=%s gate_phase=%u "
 							   "gate_formation=%llu gate_freeze=%llu "
 							   "lookup_master=%d session_check=%d "
 							   "sampled_session=%llu slot_before=%s "
@@ -13541,30 +12770,20 @@ gcs_block_resource_x_type17_ingress(
 							   "epoch_after=%llu fresh_before=%s "
 							   "fresh_after=%s connection_before=%s "
 							   "connection_after=%s",
-							   diagnostic_gate_snapshot ? "true" : "false",
-							   diagnostic_gate.phase,
+							   diagnostic_gate_snapshot ? "true" : "false", diagnostic_gate.phase,
 							   (unsigned long long)diagnostic_gate.formation,
-							   (unsigned long long)
-								diagnostic_gate.freeze_generation,
-							   diagnostic_lookup_master,
-							   (int)diagnostic_session_check,
+							   (unsigned long long)diagnostic_gate.freeze_generation,
+							   diagnostic_lookup_master, (int)diagnostic_session_check,
 							   (unsigned long long)diagnostic_master_session,
-							   diagnostic_session_sample.slot_before_valid
-								? "true" : "false",
-							   diagnostic_session_sample.slot_after_valid
-								? "true" : "false",
-							   (unsigned long long)
-								diagnostic_session_sample.observed_epoch_before,
-							   (unsigned long long)
-								diagnostic_session_sample.observed_epoch_after,
-							   diagnostic_session_sample.fresh_before
-								? "true" : "false",
-							   diagnostic_session_sample.fresh_after
-								? "true" : "false",
-							   diagnostic_session_sample.connection_before_valid
-								? "true" : "false",
-							   diagnostic_session_sample.connection_after_valid
-								? "true" : "false")));
+							   diagnostic_session_sample.slot_before_valid ? "true" : "false",
+							   diagnostic_session_sample.slot_after_valid ? "true" : "false",
+							   (unsigned long long)diagnostic_session_sample.observed_epoch_before,
+							   (unsigned long long)diagnostic_session_sample.observed_epoch_after,
+							   diagnostic_session_sample.fresh_before ? "true" : "false",
+							   diagnostic_session_sample.fresh_after ? "true" : "false",
+							   diagnostic_session_sample.connection_before_valid ? "true" : "false",
+							   diagnostic_session_sample.connection_after_valid ? "true"
+																				: "false")));
 		}
 	}
 	PG_CATCH();
@@ -13581,9 +12800,8 @@ gcs_block_resource_x_type17_ingress(
  * receipt/round mutation and frozen-frame extraction complete before either
  * encoder/stager runs; no malformed or stale kind-9 frame reaches legacy. */
 static void
-gcs_block_resource_x_kind9_ingress(
-	const ClusterICEnvelope *env, const ResourceXDecodedFrame *frame,
-	uint32 authenticated_connection_generation)
+gcs_block_resource_x_kind9_ingress(const ClusterICEnvelope *env, const ResourceXDecodedFrame *frame,
+								   uint32 authenticated_connection_generation)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -13601,59 +12819,45 @@ gcs_block_resource_x_kind9_ingress(
 
 	memset(&admission, 0, sizeof(admission));
 	memset(&outbound, 0, sizeof(outbound));
-	if (env == NULL || frame == NULL
-		|| frame->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)
+	if (env == NULL || frame == NULL || frame->kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)
 		return;
 	source_node = (int32)env->source_node_id;
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return;
-	if (!gcs_block_resource_x_target_peer_matches_exact(
-			&admission, source_node, authenticated_connection_generation))
+	if (!gcs_block_resource_x_target_peer_matches_exact(&admission, source_node,
+														authenticated_connection_generation))
 		goto done;
-	if (!gcs_block_resource_x_gate_session_snapshot(
-			&frame->common.logical_assertion.resource, &gate,
-			&master_node, &master_session)
+	if (!gcs_block_resource_x_gate_session_snapshot(&frame->common.logical_assertion.resource,
+													&gate, &master_node, &master_session)
 		|| gate.formation != frame->common.resource_formation
-		|| master_session
-			!= frame->common.master_session_incarnation
+		|| master_session != frame->common.master_session_incarnation
 		|| !cluster_semantic_activation_recheck(&admission))
 		goto done;
 
 	if (env->msg_type == RESOURCE_X_MSG_ASSERT_X) {
 		if (master_node != cluster_node_id
-			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
-				source_node, &outbound_connection_generation))
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(source_node,
+															&outbound_connection_generation))
 			goto done;
 		apply_result = cluster_pcm_lock_resource_x_bootstrap_request_exact(
-			frame, source_node, authenticated_connection_generation,
-			admission.record_generation,
-			master_session,
-			outbound_connection_generation, &outbound);
-		if ((apply_result != RESOURCE_X_APPLY_APPLIED
-				&& apply_result != RESOURCE_X_APPLY_DUPLICATE)
+			frame, source_node, authenticated_connection_generation, admission.record_generation,
+			master_session, outbound_connection_generation, &outbound);
+		if ((apply_result != RESOURCE_X_APPLY_APPLIED && apply_result != RESOURCE_X_APPLY_DUPLICATE)
 			|| gcs_block_resource_x_diagnostic_should_log(
-				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_KIND9_REQUEST,
-				(int)apply_result))
-			ereport(LOG,
-				(errmsg_internal("Resource-X kind-9 request diagnostic"),
-				 errdetail("source=%d requester=%d attempt=%llu result=%d "
-						   "ack_base=%llu formation=%llu session=%llu",
-						   source_node,
-						   frame->common.logical_assertion.requester_node,
-						   (unsigned long long)
-							frame->common.assertion_sequence,
-						   (int)apply_result,
-						   (unsigned long long)
-							outbound.common.base_authority_generation,
-						   (unsigned long long)
-							frame->common.resource_formation,
-						   (unsigned long long)
-							frame->common.master_session_incarnation)));
-		if (apply_result != RESOURCE_X_APPLY_APPLIED
-			&& apply_result != RESOURCE_X_APPLY_DUPLICATE)
+				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_KIND9_REQUEST, (int)apply_result))
+			ereport(LOG, (errmsg_internal("Resource-X kind-9 request diagnostic"),
+						  errdetail("source=%d requester=%d attempt=%llu result=%d "
+									"ack_base=%llu formation=%llu session=%llu",
+									source_node, frame->common.logical_assertion.requester_node,
+									(unsigned long long)frame->common.assertion_sequence,
+									(int)apply_result,
+									(unsigned long long)outbound.common.base_authority_generation,
+									(unsigned long long)frame->common.resource_formation,
+									(unsigned long long)frame->common.master_session_incarnation)));
+		if (apply_result != RESOURCE_X_APPLY_APPLIED && apply_result != RESOURCE_X_APPLY_DUPLICATE)
 			goto done;
 		ready = true;
 		if (outbound.kind == RESOURCE_X_WIRE_ASSERT_X
@@ -13665,24 +12869,19 @@ gcs_block_resource_x_kind9_ingress(
 			goto done;
 		}
 		if (!cluster_semantic_activation_recheck(&admission)
-			|| !gcs_block_resource_x_gate_session_recheck(
-				&frame->common.logical_assertion.resource, &gate,
-				cluster_node_id, master_session)
-			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(
-				source_node, &rechecked_connection_generation)
-			|| rechecked_connection_generation
-				!= outbound_connection_generation)
+			|| !gcs_block_resource_x_gate_session_recheck(&frame->common.logical_assertion.resource,
+														  &gate, cluster_node_id, master_session)
+			|| !gcs_block_pcm_x_resource_x_peer_ready_exact(source_node,
+															&rechecked_connection_generation)
+			|| rechecked_connection_generation != outbound_connection_generation)
 			goto done;
-		(void)gcs_block_resource_x_bootstrap_ack_stage_exact(
-			source_node, &outbound);
+		(void)gcs_block_resource_x_bootstrap_ack_stage_exact(source_node, &outbound);
 	} else if (env->msg_type == RESOURCE_X_MSG_IMAGE_OR_GRANT) {
 		if (master_node != source_node)
 			goto done;
-		round_action
-			= cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
-				frame, source_node, authenticated_connection_generation,
-				admission.record_generation,
-				gcs_block_pcm_x_monotonic_us(), &outbound);
+		round_action = cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+			frame, source_node, authenticated_connection_generation, admission.record_generation,
+			gcs_block_pcm_x_monotonic_us(), &outbound);
 		if (round_action == RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED
 			&& cluster_semantic_activation_recheck(&admission)
 			&& gcs_block_resource_x_cleanup_frame_exact(
@@ -13691,29 +12890,22 @@ gcs_block_resource_x_kind9_ingress(
 				   &outbound)
 				   == RESOURCE_X_APPLY_APPLIED)
 			round_action = RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT;
-		if (gcs_block_resource_x_diagnostic_should_log(
-				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_KIND9_ACK,
-				(int)round_action))
-			ereport(LOG,
-				(errmsg_internal("Resource-X kind-9 ACK diagnostic"),
-				 errdetail("source=%d requester=%d attempt=%llu base=%llu "
-						   "action=%d",
-						   source_node,
-						   frame->common.logical_assertion.requester_node,
-						   (unsigned long long)
-							frame->common.assertion_sequence,
-						   (unsigned long long)
-							frame->common.base_authority_generation,
-						   (int)round_action)));
+		if (gcs_block_resource_x_diagnostic_should_log(GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_KIND9_ACK,
+													   (int)round_action))
+			ereport(LOG, (errmsg_internal("Resource-X kind-9 ACK diagnostic"),
+						  errdetail("source=%d requester=%d attempt=%llu base=%llu "
+									"action=%d",
+									source_node, frame->common.logical_assertion.requester_node,
+									(unsigned long long)frame->common.assertion_sequence,
+									(unsigned long long)frame->common.base_authority_generation,
+									(int)round_action)));
 		if (round_action != RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT
 			|| !cluster_semantic_activation_recheck(&admission))
 			goto done;
-		if (!gcs_block_resource_x_gate_session_recheck(
-				&frame->common.logical_assertion.resource, &gate,
-				master_node, master_session))
+		if (!gcs_block_resource_x_gate_session_recheck(&frame->common.logical_assertion.resource,
+													   &gate, master_node, master_session))
 			goto done;
-		stage_result = gcs_block_resource_x_native_assert_stage_exact(
-			master_node, &outbound);
+		stage_result = gcs_block_resource_x_native_assert_stage_exact(master_node, &outbound);
 		(void)stage_result;
 	}
 
@@ -13724,10 +12916,10 @@ done:
 }
 
 static ResourceXApplyResult
-gcs_block_resource_x_bootstrapped_assert_ingress(
-	const ClusterICEnvelope *env, const ResourceXDecodedFrame *assertion,
-	uint32 authenticated_connection_generation,
-	ResourceXMasterSnapshot *snapshot)
+gcs_block_resource_x_bootstrapped_assert_ingress(const ClusterICEnvelope *env,
+												 const ResourceXDecodedFrame *assertion,
+												 uint32 authenticated_connection_generation,
+												 ResourceXMasterSnapshot *snapshot)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -13741,13 +12933,12 @@ gcs_block_resource_x_bootstrapped_assert_ingress(
 
 	memset(&admission, 0, sizeof(admission));
 	if (env == NULL || assertion == NULL || snapshot == NULL
-		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X
-		|| assertion->common.ordered_lane != 0)
+		|| assertion->kind != RESOURCE_X_WIRE_ASSERT_X || assertion->common.ordered_lane != 0)
 		return RESOURCE_X_APPLY_INVALID;
 	source_node = (int32)env->source_node_id;
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return RESOURCE_X_APPLY_STALE;
 	result = gcs_block_resource_x_target_peer_result_exact(&admission, source_node,
@@ -13776,9 +12967,8 @@ gcs_block_resource_x_bootstrapped_assert_ingress(
 		goto done;
 	}
 	result = cluster_pcm_lock_resource_x_assert_bootstrapped_exact(
-		assertion, source_node, authenticated_connection_generation,
-		admission.record_generation, master_session,
-		master_sender_connection_generation, snapshot);
+		assertion, source_node, authenticated_connection_generation, admission.record_generation,
+		master_session, master_sender_connection_generation, snapshot);
 done:
 	cluster_semantic_activation_leave(&admission);
 	return result;
@@ -13860,9 +13050,10 @@ gcs_block_resource_x_requester_join_ingress(const ClusterICEnvelope *env,
 }
 
 static ResourceXApplyResult
-gcs_block_resource_x_requester_terminal_try(
-	const ClusterICEnvelope *env, const ResourceXDecodedFrame *frame,
-	uint32 authenticated_connection_generation, bool scheduled_retry)
+gcs_block_resource_x_requester_terminal_try(const ClusterICEnvelope *env,
+											const ResourceXDecodedFrame *frame,
+											uint32 authenticated_connection_generation,
+											bool scheduled_retry)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -13878,14 +13069,13 @@ gcs_block_resource_x_requester_terminal_try(
 	int32 master_node = -1;
 	int32 source_node;
 
-	if (env == NULL || frame == NULL
-		|| authenticated_connection_generation == 0)
+	if (env == NULL || frame == NULL || authenticated_connection_generation == 0)
 		return RESOURCE_X_APPLY_INVALID;
 	source_node = (int32)env->source_node_id;
 	memset(&admission, 0, sizeof(admission));
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return RESOURCE_X_APPLY_STALE;
 
@@ -13925,8 +13115,7 @@ gcs_block_resource_x_requester_terminal_try(
 			result = gcs_block_pcm_x_resource_x_join_terminal_owned_try(
 				&delivery_ref, scheduled_retry, &terminal_ref, &terminal_ownership_generation,
 				&terminal_authority_generation);
-			if (result == RESOURCE_X_APPLY_APPLIED
-				|| result == RESOURCE_X_APPLY_DUPLICATE) {
+			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
 				result = gcs_block_resource_x_gate_session_recheck_result(
 					&frame->common.logical_assertion.resource, &gate, master_node, master_session);
 				peer_result = gcs_block_resource_x_target_peer_result_exact(
@@ -13940,11 +13129,8 @@ gcs_block_resource_x_requester_terminal_try(
 				if (result == RESOURCE_X_APPLY_APPLIED) {
 					publish_result
 						= cluster_pcm_lock_resource_x_bootstrap_round_publish_terminal_exact(
-							&terminal_ref,
-							master_session,
-							admission.record_generation,
-							terminal_ownership_generation,
-							terminal_authority_generation,
+							&terminal_ref, master_session, admission.record_generation,
+							terminal_ownership_generation, terminal_authority_generation,
 							gcs_block_pcm_x_monotonic_us());
 					if (publish_result != RESOURCE_X_APPLY_APPLIED
 						&& publish_result != RESOURCE_X_APPLY_DUPLICATE) {
@@ -13970,9 +13156,9 @@ gcs_block_resource_x_requester_terminal_try(
  * response is an ordinary unretained typed ACK; a full outbound queue is
  * healed by the master's still-retained kind-10 debt replay. */
 static ResourceXApplyResult
-gcs_block_resource_x_source_settlement_ingress(
-	const ClusterICEnvelope *env, const ResourceXDecodedFrame *settlement,
-	uint32 sender_connection_generation)
+gcs_block_resource_x_source_settlement_ingress(const ClusterICEnvelope *env,
+											   const ResourceXDecodedFrame *settlement,
+											   uint32 sender_connection_generation)
 {
 	ResourceXDecodedFrame ack;
 	ResourceXSourceSettlementPlan plan;
@@ -13996,102 +13182,76 @@ gcs_block_resource_x_source_settlement_ingress(
 	memset(&plan, 0, sizeof(plan));
 	memset(&commit_observation, 0, sizeof(commit_observation));
 	memset(&prepare_observation, 0, sizeof(prepare_observation));
-	result
-		= cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(
-			settlement, (int32)env->source_node_id, &plan,
-			&prepare_observation);
+	result = cluster_pcm_lock_resource_x_source_settlement_prepare_observed_exact(
+		settlement, (int32)env->source_node_id, &plan, &prepare_observation);
 	if (result == RESOURCE_X_APPLY_APPLIED && !plan.valid) {
 		gcs_block_resource_x_source_settlement_failure_record(
-			settlement, &prepare_observation,
-			RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
-			RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-			RESOURCE_X_APPLY_RECOVERY_BLOCKED,
-			prepare_observation.current_pair_source_generation,
-			-1, false, false);
+			settlement, &prepare_observation, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
+			RESOURCE_X_FAIL_INTERNAL_CORRUPTION, RESOURCE_X_APPLY_RECOVERY_BLOCKED,
+			prepare_observation.current_pair_source_generation, -1, false, false);
 		gcs_block_resource_x_fail_closed_current();
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
 	if (result == RESOURCE_X_APPLY_APPLIED && plan.valid) {
-		settlement_finish_mode
-			= cluster_pcm_x_revoke_finish_mode(&plan.assertion.resource, 0);
+		settlement_finish_mode = cluster_pcm_x_revoke_finish_mode(&plan.assertion.resource, 0);
 		if (settlement_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_RETAIN) {
-			own_result
-				= cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
-				&plan.assertion.resource, plan.source_generation,
-				&carrier_release_complete);
-			if (own_result == CLUSTER_PCM_OWN_BUSY
-				|| own_result == CLUSTER_PCM_OWN_NOT_READY) {
+			own_result = cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
+				&plan.assertion.resource, plan.source_generation, &carrier_release_complete);
+			if (own_result == CLUSTER_PCM_OWN_BUSY || own_result == CLUSTER_PCM_OWN_NOT_READY) {
 				gcs_block_resource_x_source_settlement_failure_record(
-					settlement, NULL,
-					RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
-					gcs_block_resource_x_source_settlement_own_domain(
-						own_result, carrier_release_complete),
-					RESOURCE_X_APPLY_BAD_STATE, plan.source_generation,
-					(int32)own_result, carrier_release_complete, false);
+					settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+					gcs_block_resource_x_source_settlement_own_domain(own_result,
+																	  carrier_release_complete),
+					RESOURCE_X_APPLY_BAD_STATE, plan.source_generation, (int32)own_result,
+					carrier_release_complete, false);
 				return RESOURCE_X_APPLY_BAD_STATE;
 			}
 			if (own_result != CLUSTER_PCM_OWN_OK) {
 				gcs_block_resource_x_source_settlement_failure_record(
-					settlement, NULL,
-					RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
-					gcs_block_resource_x_source_settlement_own_domain(
-						own_result, carrier_release_complete),
-					RESOURCE_X_APPLY_RECOVERY_BLOCKED,
-					plan.source_generation, (int32)own_result,
+					settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+					gcs_block_resource_x_source_settlement_own_domain(own_result,
+																	  carrier_release_complete),
+					RESOURCE_X_APPLY_RECOVERY_BLOCKED, plan.source_generation, (int32)own_result,
 					carrier_release_complete, false);
 				gcs_block_resource_x_fail_closed_current();
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
 			if (!carrier_release_complete) {
 				gcs_block_resource_x_source_settlement_failure_record(
-					settlement, NULL,
-					RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
-					RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-					RESOURCE_X_APPLY_RECOVERY_BLOCKED,
-					plan.source_generation, (int32)own_result,
-					false, false);
+					settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+					RESOURCE_X_FAIL_INTERNAL_CORRUPTION, RESOURCE_X_APPLY_RECOVERY_BLOCKED,
+					plan.source_generation, (int32)own_result, false, false);
 				gcs_block_resource_x_fail_closed_current();
 				return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 			}
-		}
-		else if (settlement_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP) {
+		} else if (settlement_finish_mode == CLUSTER_PCM_X_REVOKE_FINISH_DROP) {
 			/* VM/FSM publish this exact pair only after the unpinned DROP and
 			 * terminal-cover close both succeed.  No BufferDesc remains to
 			 * release; prepare already revalidated the PUBLISHED pair identity. */
 			carrier_release_complete = true;
-		}
-		else {
+		} else {
 			gcs_block_resource_x_source_settlement_failure_record(
-				settlement, NULL,
-				RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
-				RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-				RESOURCE_X_APPLY_RECOVERY_BLOCKED,
-				plan.source_generation, -1,
-				false, false);
+				settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_LOCAL_RELEASE,
+				RESOURCE_X_FAIL_INTERNAL_CORRUPTION, RESOURCE_X_APPLY_RECOVERY_BLOCKED,
+				plan.source_generation, -1, false, false);
 			gcs_block_resource_x_fail_closed_current();
 			return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
 		result = cluster_pcm_lock_resource_x_source_settlement_commit_exact(
-			settlement, (int32)env->source_node_id, &plan,
-			&commit_observation);
-		if (result != RESOURCE_X_APPLY_APPLIED
-			&& result != RESOURCE_X_APPLY_DUPLICATE) {
+			settlement, (int32)env->source_node_id, &plan, &commit_observation);
+		if (result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE) {
 			gcs_block_resource_x_source_settlement_failure_record(
-				settlement, &commit_observation,
-				RESOURCE_X_SOURCE_SETTLEMENT_STAGE_COMMIT,
-				RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY, result,
-				plan.source_generation, -1, carrier_release_complete, false);
+				settlement, &commit_observation, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_COMMIT,
+				RESOURCE_X_FAIL_POST_MUTATION_AMBIGUITY, result, plan.source_generation, -1,
+				carrier_release_complete, false);
 			gcs_block_resource_x_fail_closed_current();
 			return result;
 		}
-	}
-	else if (result != RESOURCE_X_APPLY_DUPLICATE) {
+	} else if (result != RESOURCE_X_APPLY_DUPLICATE) {
 		gcs_block_resource_x_source_settlement_failure_record(
-			settlement, &prepare_observation,
-			RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
-			gcs_block_resource_x_source_settlement_apply_domain(result),
-			result, prepare_observation.current_pair_source_generation,
-			-1, false, false);
+			settlement, &prepare_observation, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_PREPARE,
+			gcs_block_resource_x_source_settlement_apply_domain(result), result,
+			prepare_observation.current_pair_source_generation, -1, false, false);
 		return result;
 	}
 	ack_result = cluster_pcm_lock_resource_x_source_settlement_ack_build_exact(
@@ -14099,44 +13259,35 @@ gcs_block_resource_x_source_settlement_ingress(
 	if (ack_result != RESOURCE_X_APPLY_APPLIED) {
 		gcs_block_resource_x_source_settlement_failure_record(
 			settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_BUILD,
-			RESOURCE_X_FAIL_INTERNAL_CORRUPTION, ack_result,
-			plan.source_generation, -1, carrier_release_complete, false);
-		gcs_block_resource_x_fail_closed_current();
-		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-	}
-	if (!cluster_resource_x_wire_encode(
-			RESOURCE_X_MSG_BLOCKED_TO_N, &ack, payload, sizeof(payload),
-			&payload_bytes, &reject)
-		|| payload_bytes != RESOURCE_X_PROOF_V1_BYTES) {
-		gcs_block_resource_x_source_settlement_failure_record(
-			settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_ENCODE,
-			RESOURCE_X_FAIL_INTERNAL_CORRUPTION,
-			RESOURCE_X_APPLY_INVALID, plan.source_generation, -1,
+			RESOURCE_X_FAIL_INTERNAL_CORRUPTION, ack_result, plan.source_generation, -1,
 			carrier_release_complete, false);
 		gcs_block_resource_x_fail_closed_current();
 		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 	}
+	if (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_BLOCKED_TO_N, &ack, payload, sizeof(payload),
+										&payload_bytes, &reject)
+		|| payload_bytes != RESOURCE_X_PROOF_V1_BYTES) {
+		gcs_block_resource_x_source_settlement_failure_record(
+			settlement, NULL, RESOURCE_X_SOURCE_SETTLEMENT_STAGE_ACK_ENCODE,
+			RESOURCE_X_FAIL_INTERNAL_CORRUPTION, RESOURCE_X_APPLY_INVALID, plan.source_generation,
+			-1, carrier_release_complete, false);
+		gcs_block_resource_x_fail_closed_current();
+		return RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+	}
 	ack_enqueued = cluster_grd_outbound_enqueue_backend_msg(
-		RESOURCE_X_MSG_BLOCKED_TO_N, env->source_node_id, payload,
-		payload_bytes);
+		RESOURCE_X_MSG_BLOCKED_TO_N, env->source_node_id, payload, payload_bytes);
 	if ((result == RESOURCE_X_APPLY_APPLIED || !ack_enqueued)
-		&& ((result != RESOURCE_X_APPLY_APPLIED
-				&& result != RESOURCE_X_APPLY_DUPLICATE)
+		&& ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| !ack_enqueued
 			|| gcs_block_resource_x_diagnostic_should_log(
-				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_SOURCE_SETTLEMENT_ACK,
-				(int)result)))
+				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_SOURCE_SETTLEMENT_ACK, (int)result)))
 		ereport(LOG,
 				(errmsg_internal("Resource-X source settlement ACK diagnostic"),
 				 errdetail("master=%u requester=%d attempt=%llu result=%d "
 						   "source_generation=%llu enqueue=%u sender_generation=%u",
-						   env->source_node_id,
-						   settlement->common.logical_assertion.requester_node,
-						   (unsigned long long)
-							settlement->common.assertion_sequence,
-							(int)result,
-							(unsigned long long)plan.source_generation,
-						   ack_enqueued ? 1U : 0U,
+						   env->source_node_id, settlement->common.logical_assertion.requester_node,
+						   (unsigned long long)settlement->common.assertion_sequence, (int)result,
+						   (unsigned long long)plan.source_generation, ack_enqueued ? 1U : 0U,
 						   sender_connection_generation)));
 	return result;
 }
@@ -14146,8 +13297,7 @@ gcs_block_resource_x_source_settlement_ingress(
  * connection, or unavailable consumer.  Capability publication remains off
  * until the type-15/type-17 consumers and retained C-intent egress close. */
 static bool
-gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
-							   const void *payload)
+gcs_block_try_resource_x_frame(const ClusterICEnvelope *env, const void *payload)
 {
 #ifdef CLUSTER_R4_ROUTE_POLICY_UNIT
 	/* This focused object feeds only R4 non-candidate lengths into the shared
@@ -14165,31 +13315,26 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 	uint32 connection_generation = 0;
 	uint32 authenticated_capability_generation = 0;
 
-	if (env == NULL
-		|| !gcs_block_resource_x_payload_candidate(env->msg_type,
-											 env->payload_length))
+	if (env == NULL || !gcs_block_resource_x_payload_candidate(env->msg_type, env->payload_length))
 		return false;
 	if (payload == NULL || env->source_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| env->dest_node_id != (uint32)cluster_node_id
-		|| env->payload_length > PG_UINT16_MAX
-		|| !cluster_resource_x_wire_decode(env->msg_type, payload,
-			(uint16)env->payload_length, &frame, &reject)) {
+		|| env->dest_node_id != (uint32)cluster_node_id || env->payload_length > PG_UINT16_MAX
+		|| !cluster_resource_x_wire_decode(env->msg_type, payload, (uint16)env->payload_length,
+										   &frame, &reject)) {
 		return true;
 	}
 	cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_RECEIVE, &frame,
-		(int32)env->source_node_id, 0);
+											(int32)env->source_node_id, 0);
 	if (env->epoch != cluster_epoch_get_current()) {
 		return true;
 	}
 	if ((int32)env->source_node_id == cluster_node_id) {
-		if (!gcs_block_pcm_x_resource_x_peer_ready_exact(
-				cluster_node_id, &connection_generation)) {
+		if (!gcs_block_pcm_x_resource_x_peer_ready_exact(cluster_node_id, &connection_generation)) {
 			return true;
 		}
-	} else if (!cluster_sf_peer_capability_word_sample(
-			   (int32)env->source_node_id,
-			   PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-			   &capability_word, &connection_generation)) {
+	} else if (!cluster_sf_peer_capability_word_sample((int32)env->source_node_id,
+													   PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
+													   &capability_word, &connection_generation)) {
 		return true;
 	}
 	/* Tier1 envelope verification has already bound this frame to the
@@ -14211,66 +13356,54 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 
 	switch (frame.kind) {
 	case RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP:
-		gcs_block_resource_x_kind9_ingress(
-			env, &frame, authenticated_capability_generation);
+		gcs_block_resource_x_kind9_ingress(env, &frame, authenticated_capability_generation);
 		break;
 	case RESOURCE_X_WIRE_ASSERT_X:
 		if (frame.common.ordered_lane == 0)
 			result = gcs_block_resource_x_bootstrapped_assert_ingress(
-				env, &frame, authenticated_capability_generation,
-				&snapshot);
-		if ((result == RESOURCE_X_APPLY_APPLIED
-				|| result == RESOURCE_X_APPLY_DUPLICATE)
+				env, &frame, authenticated_capability_generation, &snapshot);
+		if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 			&& snapshot.phase == RESOURCE_X_MASTER_WAIT_PROOF
 			&& frame.common.observed_mode == (uint8)PCM_STATE_N)
-			result = gcs_block_pcm_x_resource_x_master_durable_try(
-				&frame, &snapshot, &snapshot);
+			result = gcs_block_pcm_x_resource_x_master_durable_try(&frame, &snapshot, &snapshot);
 		break;
 	case RESOURCE_X_WIRE_LOCAL_PROOF_DECLARATION:
-		result = cluster_pcm_lock_resource_x_local_proof_exact(
-			&frame, (int32)env->source_node_id, &snapshot);
+		result = cluster_pcm_lock_resource_x_local_proof_exact(&frame, (int32)env->source_node_id,
+															   &snapshot);
 		break;
 	case RESOURCE_X_WIRE_BLOCK_TO_N:
-		result = gcs_block_resource_x_type17_ingress(
-			env, &frame, authenticated_capability_generation);
+		result
+			= gcs_block_resource_x_type17_ingress(env, &frame, authenticated_capability_generation);
 		break;
 	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_V2:
 		result = gcs_block_resource_x_source_settlement_ingress(
 			env, &frame, authenticated_capability_generation);
 		break;
 	case RESOURCE_X_WIRE_BLOCKED_TO_N:
-		result = cluster_pcm_lock_resource_x_blocked_to_n_exact(
-			&frame, (int32)env->source_node_id, &snapshot);
+		result = cluster_pcm_lock_resource_x_blocked_to_n_exact(&frame, (int32)env->source_node_id,
+																&snapshot);
 		break;
 	case RESOURCE_X_WIRE_SOURCE_SETTLEMENT_ACK_V2:
 		result = cluster_pcm_lock_resource_x_source_settlement_ack_exact(
 			&frame, (int32)env->source_node_id, &snapshot);
-		if ((result != RESOURCE_X_APPLY_APPLIED
-				&& result != RESOURCE_X_APPLY_DUPLICATE)
+		if ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| gcs_block_resource_x_diagnostic_should_log(
-				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_SOURCE_SETTLEMENT_ACK_INGRESS,
-				(int)result))
+				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_SOURCE_SETTLEMENT_ACK_INGRESS, (int)result))
 			ereport(LOG,
-				(errmsg_internal("Resource-X source settlement ACK ingress diagnostic"),
-				 errdetail("source=%u requester=%d attempt=%llu result=%d "
-						   "phase=%u final=%llu",
-						   env->source_node_id,
-						   frame.common.logical_assertion.requester_node,
-						   (unsigned long long)
-							frame.common.assertion_sequence,
-						   (int)result, (unsigned)snapshot.phase,
-						   (unsigned long long)
-							snapshot.final_authority_generation)));
+					(errmsg_internal("Resource-X source settlement ACK ingress diagnostic"),
+					 errdetail("source=%u requester=%d attempt=%llu result=%d "
+							   "phase=%u final=%llu",
+							   env->source_node_id, frame.common.logical_assertion.requester_node,
+							   (unsigned long long)frame.common.assertion_sequence, (int)result,
+							   (unsigned)snapshot.phase,
+							   (unsigned long long)snapshot.final_authority_generation)));
 		break;
-	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT:
-	{
+	case RESOURCE_X_WIRE_INSTALL_SETTLEMENT: {
 		result = cluster_pcm_lock_resource_x_install_settlement_exact(
 			&frame, (int32)env->source_node_id, &snapshot);
-		if ((result != RESOURCE_X_APPLY_APPLIED
-				&& result != RESOURCE_X_APPLY_DUPLICATE)
+		if ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| gcs_block_resource_x_diagnostic_should_log(
-				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_INSTALL_SETTLEMENT,
-				(int)result))
+				GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_INSTALL_SETTLEMENT, (int)result))
 			ereport(LOG,
 					(errmsg_internal("Resource-X install settlement diagnostic"),
 					 errdetail("source=%u requester=%d attempt=%llu result=%d "
@@ -14282,19 +13415,18 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 		break;
 	}
 	case RESOURCE_X_WIRE_RELEASE_X:
-		result = cluster_pcm_lock_resource_x_release_x_exact(
-			&frame, (int32)env->source_node_id, &snapshot);
+		result = cluster_pcm_lock_resource_x_release_x_exact(&frame, (int32)env->source_node_id,
+															 &snapshot);
 		break;
 	case RESOURCE_X_WIRE_IMAGE_ENVELOPE:
 	case RESOURCE_X_WIRE_AUTHORITY_GRANT:
 		result = gcs_block_resource_x_requester_join_ingress(
 			env, &frame, authenticated_capability_generation, &join_snapshot);
-		if ((result == RESOURCE_X_APPLY_APPLIED
-				|| result == RESOURCE_X_APPLY_DUPLICATE)
+		if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 			&& (join_snapshot.flags & RESOURCE_X_REQUESTER_JOIN_READY) != 0) {
-			(void)gcs_block_resource_x_requester_terminal_try(
-				env, &frame, authenticated_capability_generation,
-				result == RESOURCE_X_APPLY_DUPLICATE);
+			(void)gcs_block_resource_x_requester_terminal_try(env, &frame,
+															  authenticated_capability_generation,
+															  result == RESOURCE_X_APPLY_DUPLICATE);
 		}
 		break;
 	}
@@ -14316,33 +13448,24 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 	/* Bootstrap owns its own typed action; the local sentinel is not its result. */
 	if (frame.kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP)
 		cluster_pcm_lock_resource_x_trace_frame(RESOURCE_X_TRACE_APPLY, &frame,
-			(int32)env->source_node_id, (int32)result);
-	if (gcs_block_resource_x_frame_diagnostic(frame.kind)
-			!= GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_COUNT
-		&& ((result != RESOURCE_X_APPLY_APPLIED
-				&& result != RESOURCE_X_APPLY_DUPLICATE)
+												(int32)env->source_node_id, (int32)result);
+	if (gcs_block_resource_x_frame_diagnostic(frame.kind) != GCS_BLOCK_RESOURCE_X_DIAGNOSTIC_COUNT
+		&& ((result != RESOURCE_X_APPLY_APPLIED && result != RESOURCE_X_APPLY_DUPLICATE)
 			|| gcs_block_resource_x_diagnostic_should_log(
-				gcs_block_resource_x_frame_diagnostic(frame.kind),
-				(int)result)))
+				gcs_block_resource_x_frame_diagnostic(frame.kind), (int)result)))
 		ereport(LOG,
 				(errmsg_internal("Resource-X frame ingress diagnostic"),
 				 errdetail("kind=%u msg_type=%u source=%u requester=%d "
 						   "attempt=%llu result=%d master_phase=%u head=%u "
 						   "incompatible=0x%08x blocked=0x%08x proof=%u "
 						   "join_flags=0x%08x grant_source=%d image_source=%d",
-						   (unsigned)frame.kind, (unsigned)env->msg_type,
-						   env->source_node_id,
+						   (unsigned)frame.kind, (unsigned)env->msg_type, env->source_node_id,
 						   frame.common.logical_assertion.requester_node,
-						   (unsigned long long)
-							frame.common.assertion_sequence,
-						   (int)result, (unsigned)snapshot.phase,
-						   (unsigned)snapshot.is_head,
-						   snapshot.incompatible_holders_bitmap,
-						   snapshot.blocked_holders_bitmap,
-						   (unsigned)snapshot.proof_kind,
-						   join_snapshot.flags,
-						   join_snapshot.grant_source_node,
-						   join_snapshot.image_source_node)));
+						   (unsigned long long)frame.common.assertion_sequence, (int)result,
+						   (unsigned)snapshot.phase, (unsigned)snapshot.is_head,
+						   snapshot.incompatible_holders_bitmap, snapshot.blocked_holders_bitmap,
+						   (unsigned)snapshot.proof_kind, join_snapshot.flags,
+						   join_snapshot.grant_source_node, join_snapshot.image_source_node)));
 	if (frame.kind != RESOURCE_X_WIRE_PREASSERT_BOOTSTRAP
 		&& (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE))
 		gcs_block_resource_x_stage_ready_tag(&frame.common.logical_assertion.resource);
@@ -14351,8 +13474,7 @@ gcs_block_try_resource_x_frame(const ClusterICEnvelope *env,
 }
 
 static ResourceXApplyResult
-gcs_block_resource_x_target_install_snapshot_result(
-	ClusterPcmOwnResult snapshot_result)
+gcs_block_resource_x_target_install_snapshot_result(ClusterPcmOwnResult snapshot_result)
 {
 	if (snapshot_result == CLUSTER_PCM_OWN_OK)
 		return RESOURCE_X_APPLY_APPLIED;
@@ -14414,8 +13536,8 @@ gcs_block_resource_x_target_install_capture_coherent(
 		*follow_state_out = RESOURCE_X_TARGET_INSTALL_INVALID;
 	if (continuation_out != NULL)
 		memset(continuation_out, 0, sizeof(*continuation_out));
-	if (buf == NULL || assertion == NULL || before == NULL
-		|| follow_state_out == NULL || continuation_out == NULL)
+	if (buf == NULL || assertion == NULL || before == NULL || follow_state_out == NULL
+		|| continuation_out == NULL)
 		return RESOURCE_X_APPLY_INVALID;
 	/* A fresh B returned by a failed header check need not still describe
 	 * this resource.  Coherent B-E-B equality cannot repair that lost
@@ -14430,21 +13552,17 @@ gcs_block_resource_x_target_install_capture_coherent(
 	if (observation_result != RESOURCE_X_APPLY_APPLIED)
 		return observation_result;
 	memset(&candidate, 0, sizeof(candidate));
-	raw_state
-		= cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
-			assertion, current_master_node, resource_formation,
-			master_session_incarnation, r4_record_generation,
-			requester_sender_connection_generation,
-			master_ingress_connection_generation, retry_slice_us,
-			caller_absolute_deadline_us, before, &candidate);
+	raw_state = cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+		assertion, current_master_node, resource_formation, master_session_incarnation,
+		r4_record_generation, requester_sender_connection_generation,
+		master_ingress_connection_generation, retry_slice_us, caller_absolute_deadline_us, before,
+		&candidate);
 	memset(&after, 0, sizeof(after));
 	snapshot_result = cluster_bufmgr_pcm_own_snapshot(buf, &after);
 	if (snapshot_result != CLUSTER_PCM_OWN_OK)
-		return gcs_block_resource_x_target_install_snapshot_result(
-			snapshot_result);
-	*follow_state_out
-		= cluster_pcm_x_target_install_follow_adjudicate_exact(
-			before, &after, raw_state, NULL, &candidate);
+		return gcs_block_resource_x_target_install_snapshot_result(snapshot_result);
+	*follow_state_out = cluster_pcm_x_target_install_follow_adjudicate_exact(
+		before, &after, raw_state, NULL, &candidate);
 	*continuation_out = candidate;
 	return RESOURCE_X_APPLY_APPLIED;
 }
@@ -14454,10 +13572,8 @@ gcs_block_resource_x_target_install_capture_coherent(
  * exact whole-snapshot equality. */
 static ResourceXApplyResult
 gcs_block_resource_x_target_install_classify_coherent(
-	BufferDesc *buf,
-	const ResourceXTargetInstallContinuation *continuation,
-	const ClusterPcmOwnSnapshot *before,
-	ResourceXTargetInstallFollowState *follow_state_out,
+	BufferDesc *buf, const ResourceXTargetInstallContinuation *continuation,
+	const ClusterPcmOwnSnapshot *before, ResourceXTargetInstallFollowState *follow_state_out,
 	ResourceXAcquisitionRef *terminal_ref_out)
 {
 	ClusterPcmOwnSnapshot after;
@@ -14469,21 +13585,18 @@ gcs_block_resource_x_target_install_classify_coherent(
 		*follow_state_out = RESOURCE_X_TARGET_INSTALL_INVALID;
 	if (terminal_ref_out != NULL)
 		memset(terminal_ref_out, 0, sizeof(*terminal_ref_out));
-	if (buf == NULL || continuation == NULL || before == NULL
-		|| follow_state_out == NULL || terminal_ref_out == NULL)
+	if (buf == NULL || continuation == NULL || before == NULL || follow_state_out == NULL
+		|| terminal_ref_out == NULL)
 		return RESOURCE_X_APPLY_INVALID;
 	memset(&candidate_ref, 0, sizeof(candidate_ref));
-	raw_state
-		= cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
-			continuation, before, &candidate_ref);
+	raw_state = cluster_pcm_lock_resource_x_bootstrap_round_target_install_classify_exact(
+		continuation, before, &candidate_ref);
 	memset(&after, 0, sizeof(after));
 	snapshot_result = cluster_bufmgr_pcm_own_snapshot(buf, &after);
 	if (snapshot_result != CLUSTER_PCM_OWN_OK)
-		return gcs_block_resource_x_target_install_snapshot_result(
-			snapshot_result);
-	*follow_state_out
-		= cluster_pcm_x_target_install_follow_adjudicate_exact(
-			before, &after, raw_state, &candidate_ref, NULL);
+		return gcs_block_resource_x_target_install_snapshot_result(snapshot_result);
+	*follow_state_out = cluster_pcm_x_target_install_follow_adjudicate_exact(
+		before, &after, raw_state, &candidate_ref, NULL);
 	*terminal_ref_out = candidate_ref;
 	return RESOURCE_X_APPLY_APPLIED;
 }
@@ -14633,15 +13746,13 @@ gcs_block_resource_x_target_acquire_internal(
 	ClusterSemanticAdmissionResult admission_result;
 	ClusterSemanticResourceXPeerOpenResult peer_open_result
 		= CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_NOT_CHECKED;
-	PcmXSessionAuthResult preflight_session_check
-		= PCM_X_SESSION_AUTH_INVALID;
+	PcmXSessionAuthResult preflight_session_check = PCM_X_SESSION_AUTH_INVALID;
 	ResourceXGateSnapshot gate;
 	ResourceXGateSnapshot terminal_gate;
 	ResourceXAssertion assertion;
 	ResourceXDecodedFrame dispatch;
 	ResourceXAcquisitionRef terminal_ref;
-	ResourceXBootstrapRoundAction action
-		= RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
+	ResourceXBootstrapRoundAction action = RESOURCE_X_BOOTSTRAP_ROUND_FAIL_CLOSED;
 	ResourceXBootstrapRoundFailureSnapshot failure_round;
 	ResourceXTargetInstallContinuation target_install_follow;
 	ResourceXCallerWitness local_caller_witness;
@@ -14654,17 +13765,14 @@ gcs_block_resource_x_target_acquire_internal(
 	ResourceXFirstFailureEvidence first_failure;
 	ResourceXApplyResult wait_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult dispatch_gate_session_result = RESOURCE_X_APPLY_INVALID;
-	ResourceXApplyResult target_install_observation_result
-		= RESOURCE_X_APPLY_INVALID;
+	ResourceXApplyResult target_install_observation_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult ownership_loss_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult failure_snapshot_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult discard_result = RESOURCE_X_APPLY_INVALID;
 	ResourceXApplyResult result = RESOURCE_X_APPLY_BAD_STATE;
 	ClusterPcmOwnResult direct_candidate_result;
-	PcmXSessionAuthResult dispatch_session_check
-		= PCM_X_SESSION_AUTH_INVALID;
-	PcmXSessionAuthResult terminal_session_check
-		= PCM_X_SESSION_AUTH_INVALID;
+	PcmXSessionAuthResult dispatch_session_check = PCM_X_SESSION_AUTH_INVALID;
+	PcmXSessionAuthResult terminal_session_check = PCM_X_SESSION_AUTH_INVALID;
 	ResourceXGateSnapshot rebound_gate;
 	volatile uint64 absolute_deadline_us = 0;
 	uint64 diagnostic_caller_budget_us = gcs_block_pcm_x_retry_timeout_us();
@@ -14682,8 +13790,7 @@ gcs_block_resource_x_target_acquire_internal(
 	uint64 master_session = 0;
 	uint64 rebound_master_session = 0;
 	uint64 terminal_master_session = 0;
-	uint64 pending_terminal_resample_mismatch
-		= RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE;
+	uint64 pending_terminal_resample_mismatch = RESOURCE_X_PENDING_TERMINAL_MISMATCH_NONE;
 	uint64 now_us = 0;
 	uint64 remaining_us;
 	uint64 retry_slice_us = 0;
@@ -14693,8 +13800,7 @@ gcs_block_resource_x_target_acquire_internal(
 	uint32 master_ingress_recheck = 0;
 	uint32 rebound_requester_connection_generation = 0;
 	uint32 rebound_master_connection_generation = 0;
-	uint32 dispatch_recheck_failure_mask
-		= RESOURCE_X_DISPATCH_RECHECK_OK;
+	uint32 dispatch_recheck_failure_mask = RESOURCE_X_DISPATCH_RECHECK_OK;
 	long timeout_ms;
 	int32 master_node = -1;
 	int32 rebound_master_node = -1;
@@ -14740,23 +13846,18 @@ gcs_block_resource_x_target_acquire_internal(
 	memset(&resource, 0, sizeof(resource));
 	direct_init = direct_init_reservation_token != 0;
 	if (buf == NULL || ref_out == NULL
-		|| (!join_only && (r4_record_generation == 0
-			|| r4_record_generation == UINT64_MAX))
+		|| (!join_only && (r4_record_generation == 0 || r4_record_generation == UINT64_MAX))
 		|| (join_only && (r4_record_generation != 0 || !direct_init))
 		|| (!direct_init && direct_init_ownership_generation != 0)
 		|| direct_init_ownership_generation == UINT64_MAX
 		|| direct_init_reservation_token == UINT64_MAX
-		|| (absolute_deadline_us_io != NULL
-			&& *absolute_deadline_us_io == UINT64_MAX)
-		|| cluster_node_id < 0
-		|| cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
+		|| (absolute_deadline_us_io != NULL && *absolute_deadline_us_io == UINT64_MAX)
+		|| cluster_node_id < 0 || cluster_node_id >= RESOURCE_X_PROTOCOL_NODE_LIMIT)
 		return RESOURCE_X_APPLY_INVALID;
 	resource = expected_resource != NULL ? *expected_resource : buf->tag;
 	if (join_only) {
 		now_us = gcs_block_pcm_x_monotonic_us();
-		if (now_us == 0
-			|| !resource_x_assertion_init(
-				&resource, cluster_node_id, &assertion))
+		if (now_us == 0 || !resource_x_assertion_init(&resource, cluster_node_id, &assertion))
 			return RESOURCE_X_APPLY_INVALID;
 		result = cluster_pcm_lock_resource_x_bootstrap_round_direct_init_join_budget_exact(
 			&assertion, direct_init_ownership_generation, direct_init_reservation_token, now_us,
@@ -14764,8 +13865,7 @@ gcs_block_resource_x_target_acquire_internal(
 		if (result != RESOURCE_X_APPLY_APPLIED)
 			return result;
 	}
-	diagnostic_request_sequence
-		= gcs_block_resource_x_next_diagnostic_request_sequence();
+	diagnostic_request_sequence = gcs_block_resource_x_next_diagnostic_request_sequence();
 	if (aux_context != NULL) {
 		if (aux_context->diagnostic_request_sequence == 0)
 			aux_context->diagnostic_request_sequence = diagnostic_request_sequence;
@@ -14777,28 +13877,24 @@ gcs_block_resource_x_target_acquire_internal(
 	wait_diagnostic.request_sequence = diagnostic_request_sequence;
 	wait_diagnostic.budget_us = diagnostic_caller_budget_us;
 	if (direct_init)
-		direct_init_committed_generation
-			= direct_init_ownership_generation + 1;
+		direct_init_committed_generation = direct_init_ownership_generation + 1;
 	memset(&admission, 0, sizeof(admission));
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		ereport(LOG,
-			(errmsg_internal("Resource-X target acquire diagnostic"),
-			 errdetail("stage=semantic-enter result=%d admission=%d buffer=%d",
-				(int)RESOURCE_X_APPLY_BAD_STATE, (int)admission_result,
-				buf->buf_id)));
+				(errmsg_internal("Resource-X target acquire diagnostic"),
+				 errdetail("stage=semantic-enter result=%d admission=%d buffer=%d",
+						   (int)RESOURCE_X_APPLY_BAD_STATE, (int)admission_result, buf->buf_id)));
 		return RESOURCE_X_APPLY_BAD_STATE;
 	}
 	if (admission.record_generation != r4_record_generation) {
-		ereport(LOG,
-			(errmsg_internal("Resource-X target acquire diagnostic"),
-			 errdetail("stage=semantic-generation result=%d record=" UINT64_FORMAT
-				" expected=" UINT64_FORMAT " buffer=%d",
-				(int)RESOURCE_X_APPLY_STALE,
-				admission.record_generation, r4_record_generation,
-				buf->buf_id)));
+		ereport(LOG, (errmsg_internal("Resource-X target acquire diagnostic"),
+					  errdetail("stage=semantic-generation result=%d record=" UINT64_FORMAT
+								" expected=" UINT64_FORMAT " buffer=%d",
+								(int)RESOURCE_X_APPLY_STALE, admission.record_generation,
+								r4_record_generation, buf->buf_id)));
 		cluster_semantic_activation_leave(&admission);
 		return RESOURCE_X_APPLY_STALE;
 	}
@@ -14807,20 +13903,16 @@ gcs_block_resource_x_target_acquire_internal(
 
 	PG_TRY();
 	{
-		do
-		{
+		do {
 			now_us = gcs_block_pcm_x_monotonic_us();
 			retry_slice_us
-				= (uint64)Max(
-					cluster_gcs_block_retransmit_initial_backoff_ms, 1)
-				  * UINT64_C(1000);
+				= (uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1) * UINT64_C(1000);
 			if (absolute_deadline_us_io != NULL && *absolute_deadline_us_io != 0)
 				absolute_deadline_us = *absolute_deadline_us_io;
 			else if (absolute_deadline_us == 0) {
-				absolute_deadline_us = gcs_block_pcm_x_saturating_add_us(
-					now_us, gcs_block_pcm_x_retry_timeout_us());
-				if (absolute_deadline_us_io != NULL
-					&& absolute_deadline_us != UINT64_MAX)
+				absolute_deadline_us
+					= gcs_block_pcm_x_saturating_add_us(now_us, gcs_block_pcm_x_retry_timeout_us());
+				if (absolute_deadline_us_io != NULL && absolute_deadline_us != UINT64_MAX)
 					*absolute_deadline_us_io = absolute_deadline_us;
 			}
 			if (now_us == 0 || now_us == UINT64_MAX || retry_slice_us == 0
@@ -14837,8 +13929,7 @@ gcs_block_resource_x_target_acquire_internal(
 			 * current gate/transport identity, and retry only under the first R7
 			 * absolute deadline.  No round, proof, or image exists to preserve. */
 			diagnostic_stage = "preflight-membership";
-			for (;;)
-			{
+			for (;;) {
 				bool master_ready;
 				bool requester_ready;
 
@@ -14846,20 +13937,15 @@ gcs_block_resource_x_target_acquire_internal(
 				MemSet(&assertion, 0, sizeof(assertion));
 				requester_sender_connection_generation = 0;
 				master_ingress_connection_generation = 0;
-				preflight_session_check
-					= gcs_block_resource_x_gate_session_snapshot_result(
-						&resource, &gate, &master_node, &master_session);
-				if (preflight_session_check != PCM_X_SESSION_AUTH_OK)
-				{
-					if (cluster_gcs_pcm_x_auth_result_retryable(
-							preflight_session_check))
+				preflight_session_check = gcs_block_resource_x_gate_session_snapshot_result(
+					&resource, &gate, &master_node, &master_session);
+				if (preflight_session_check != PCM_X_SESSION_AUTH_OK) {
+					if (cluster_gcs_pcm_x_auth_result_retryable(preflight_session_check))
 						goto preflight_membership_wait;
 					result = RESOURCE_X_APPLY_BAD_STATE;
 					break;
 				}
-				if (!resource_x_assertion_init(
-						&resource, cluster_node_id, &assertion))
-				{
+				if (!resource_x_assertion_init(&resource, cluster_node_id, &assertion)) {
 					result = RESOURCE_X_APPLY_BAD_STATE;
 					break;
 				}
@@ -14867,45 +13953,30 @@ gcs_block_resource_x_target_acquire_internal(
 				 * formation.  gate.formation names this Resource-X entry's
 				 * formation and is frozen with master_session below; the two
 				 * counters are intentionally independent and must not be compared. */
-				if (!cluster_semantic_activation_recheck(&admission))
-				{
+				if (!cluster_semantic_activation_recheck(&admission)) {
 					result = RESOURCE_X_APPLY_STALE;
 					break;
 				}
-				requester_ready
-					= gcs_block_pcm_x_resource_x_peer_ready_exact(
-						master_node,
-						&requester_sender_connection_generation);
-				master_ready
-					= gcs_block_pcm_x_resource_x_peer_ready_exact(
-						master_node,
-						&master_ingress_connection_generation);
-				if (requester_ready && master_ready)
-				{
+				requester_ready = gcs_block_pcm_x_resource_x_peer_ready_exact(
+					master_node, &requester_sender_connection_generation);
+				master_ready = gcs_block_pcm_x_resource_x_peer_ready_exact(
+					master_node, &master_ingress_connection_generation);
+				if (requester_ready && master_ready) {
 					bool peer_matches;
 
-					if (master_node == cluster_node_id)
-					{
-						peer_matches
-							= gcs_block_resource_x_target_peer_matches_exact(
-								&admission, master_node,
-								master_ingress_connection_generation);
-						peer_open_result = peer_matches
-							? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
-							: CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT;
-					}
-					else
-					{
+					if (master_node == cluster_node_id) {
+						peer_matches = gcs_block_resource_x_target_peer_matches_exact(
+							&admission, master_node, master_ingress_connection_generation);
 						peer_open_result
-							= cluster_semantic_activation_resource_x_peer_open_check(
-								&admission, master_node,
-								master_ingress_connection_generation);
+							= peer_matches ? CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH
+										   : CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_INVALID_INPUT;
+					} else {
+						peer_open_result = cluster_semantic_activation_resource_x_peer_open_check(
+							&admission, master_node, master_ingress_connection_generation);
 						peer_matches
-							= peer_open_result
-							  == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
+							= peer_open_result == CLUSTER_SEMANTIC_RESOURCE_X_PEER_OPEN_MATCH;
 					}
-					if (peer_matches)
-					{
+					if (peer_matches) {
 						preflight_current = true;
 						break;
 					}
@@ -14921,10 +13992,9 @@ gcs_block_resource_x_target_acquire_internal(
 					break;
 				}
 				remaining_us = retry_slice_us;
-				timeout_ms = (long) Min(
-					(uint64) Max(
-						cluster_gcs_block_retransmit_initial_backoff_ms, 1),
-					(remaining_us + UINT64_C(999)) / UINT64_C(1000));
+				timeout_ms
+					= (long)Min((uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+								(remaining_us + UINT64_C(999)) / UINT64_C(1000));
 				if (timeout_ms <= 0)
 					timeout_ms = 1;
 				CHECK_FOR_INTERRUPTS();
@@ -14936,48 +14006,47 @@ gcs_block_resource_x_target_acquire_internal(
 
 			diagnostic_stage = "round-loop";
 
-				for (;;) {
-					CHECK_FOR_INTERRUPTS();
-					diagnostic_head_expired = false;
-					now_us = gcs_block_pcm_x_monotonic_us();
-					if (now_us == 0 || now_us == UINT64_MAX) {
-						result = RESOURCE_X_APPLY_INVALID;
-						break;
-					}
-					if (wait_diagnostic.state.started_us != 0)
-						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																 wait_diagnostic.state.reason);
-					target_retained_release_inflight = false;
-					if (direct_init && creation_caller.joined_request.assertion_sequence == 0
-						&& caller_witness->joined_request.assertion_sequence != 0)
-						creation_caller = *caller_witness;
-					result = cluster_pcm_lock_resource_x_caller_observe_exact(
-						&assertion, gate.formation, master_session, admission.record_generation,
-						caller_witness);
-					if (result == RESOURCE_X_APPLY_DUPLICATE) {
-						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																 caller_witness->reobserve_reason);
-						memset(&target_install_follow, 0, sizeof(target_install_follow));
-						target_install_preuse_retry_seen = false;
-						continue;
-					}
-					if (result != RESOURCE_X_APPLY_APPLIED) {
-						diagnostic_stage = "caller-history-reject";
-						break;
-					}
-					if (direct_init && creation_caller.joined_request.assertion_sequence == 0
-						&& caller_witness->joined_request.assertion_sequence != 0)
-						creation_caller = *caller_witness;
-					target_retained_release_post_mutation = false;
-					memset(&own, 0, sizeof(own));
-					diagnostic_stage = "own-snapshot";
-					own_result = cluster_bufmgr_pcm_own_snapshot(buf, &own);
+			for (;;) {
+				CHECK_FOR_INTERRUPTS();
+				diagnostic_head_expired = false;
+				now_us = gcs_block_pcm_x_monotonic_us();
+				if (now_us == 0 || now_us == UINT64_MAX) {
+					result = RESOURCE_X_APPLY_INVALID;
+					break;
+				}
+				if (wait_diagnostic.state.started_us != 0)
+					gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+															 wait_diagnostic.state.reason);
+				target_retained_release_inflight = false;
+				if (direct_init && creation_caller.joined_request.assertion_sequence == 0
+					&& caller_witness->joined_request.assertion_sequence != 0)
+					creation_caller = *caller_witness;
+				result = cluster_pcm_lock_resource_x_caller_observe_exact(
+					&assertion, gate.formation, master_session, admission.record_generation,
+					caller_witness);
+				if (result == RESOURCE_X_APPLY_DUPLICATE) {
+					gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+															 caller_witness->reobserve_reason);
+					memset(&target_install_follow, 0, sizeof(target_install_follow));
+					target_install_preuse_retry_seen = false;
+					continue;
+				}
+				if (result != RESOURCE_X_APPLY_APPLIED) {
+					diagnostic_stage = "caller-history-reject";
+					break;
+				}
+				if (direct_init && creation_caller.joined_request.assertion_sequence == 0
+					&& caller_witness->joined_request.assertion_sequence != 0)
+					creation_caller = *caller_witness;
+				target_retained_release_post_mutation = false;
+				memset(&own, 0, sizeof(own));
+				diagnostic_stage = "own-snapshot";
+				own_result = cluster_bufmgr_pcm_own_snapshot(buf, &own);
 				if (own_result != CLUSTER_PCM_OWN_OK) {
-					result = own_result == CLUSTER_PCM_OWN_BUSY
-						? RESOURCE_X_APPLY_BAD_STATE
-						: own_result == CLUSTER_PCM_OWN_STALE
-						? RESOURCE_X_APPLY_STALE
-						: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+					result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_BAD_STATE
+							 : own_result == CLUSTER_PCM_OWN_STALE
+								 ? RESOURCE_X_APPLY_STALE
+								 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 					break;
 				}
 				if (direct_init && !join_only && creation_reobserve_out != NULL
@@ -15038,188 +14107,155 @@ gcs_block_resource_x_target_acquire_internal(
 					}
 					break;
 				}
-					if (target_install_follow.valid) {
-						diagnostic_stage = "target-install-follow-classify";
-						diagnostic_follow_attempt = target_install_follow.acquisition_generation;
-						diagnostic_follow_generation
-							= target_install_follow.expected_x_ownership_generation;
-						diagnostic_follow_token = target_install_follow.reservation_token;
-						target_install_observation_result
-							= gcs_block_resource_x_target_install_classify_coherent(
-								buf, &target_install_follow, &own,
-								&target_install_follow_state, &terminal_ref);
-						if (target_install_observation_result
-								!= RESOURCE_X_APPLY_APPLIED) {
-							result = target_install_observation_result;
-							break;
-						}
-						if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_RESAMPLE) {
-							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																	 PCM_RX_WAIT_OBSERVATION);
+				if (target_install_follow.valid) {
+					diagnostic_stage = "target-install-follow-classify";
+					diagnostic_follow_attempt = target_install_follow.acquisition_generation;
+					diagnostic_follow_generation
+						= target_install_follow.expected_x_ownership_generation;
+					diagnostic_follow_token = target_install_follow.reservation_token;
+					target_install_observation_result
+						= gcs_block_resource_x_target_install_classify_coherent(
+							buf, &target_install_follow, &own, &target_install_follow_state,
+							&terminal_ref);
+					if (target_install_observation_result != RESOURCE_X_APPLY_APPLIED) {
+						result = target_install_observation_result;
+						break;
+					}
+					if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_RESAMPLE) {
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_OBSERVATION);
+						memset(&target_install_follow, 0, sizeof(target_install_follow));
+						target_install_preuse_retry_seen = false;
+						continue;
+					}
+					if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_TERMINAL) {
+						action = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL;
+						goto target_install_terminal_recheck;
+					}
+					if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
+						target_install_preuse_retry_seen = true;
+						diagnostic_stage = "target-install-preuse-wait";
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_PREUSE);
+						now_us = gcs_block_pcm_x_monotonic_us();
+						remaining_us = retry_slice_us;
+						timeout_ms = (long)Min(
+							(uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+							(remaining_us + UINT64_C(999)) / UINT64_C(1000));
+						if (timeout_ms <= 0)
+							timeout_ms = 1;
+						wait_result
+							= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+								&target_install_follow, RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY,
+								timeout_ms);
+						if (wait_result == RESOURCE_X_APPLY_DUPLICATE) {
 							memset(&target_install_follow, 0, sizeof(target_install_follow));
 							target_install_preuse_retry_seen = false;
 							continue;
 						}
-						if (target_install_follow_state
-								== RESOURCE_X_TARGET_INSTALL_TERMINAL) {
-							action = RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL;
-							goto target_install_terminal_recheck;
-						}
-						if (target_install_follow_state
-								== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
-							target_install_preuse_retry_seen = true;
-							diagnostic_stage = "target-install-preuse-wait";
-							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																	 PCM_RX_WAIT_PREUSE);
-							now_us = gcs_block_pcm_x_monotonic_us();
-							remaining_us = retry_slice_us;
-							timeout_ms = (long) Min(
-								(uint64) Max(
-									cluster_gcs_block_retransmit_initial_backoff_ms,
-									1),
-								(remaining_us + UINT64_C(999))
-									/ UINT64_C(1000));
-							if (timeout_ms <= 0)
-								timeout_ms = 1;
-							wait_result
-								= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
-									&target_install_follow,
-									RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY,
-									timeout_ms);
-							if (wait_result == RESOURCE_X_APPLY_DUPLICATE) {
-								memset(&target_install_follow, 0,
-									sizeof(target_install_follow));
-								target_install_preuse_retry_seen = false;
-								continue;
-							}
-							if (wait_result == RESOURCE_X_APPLY_APPLIED) {
-								memset(&target_install_follow, 0, sizeof(target_install_follow));
-								target_install_preuse_retry_seen = false;
-								continue;
-							}
-							if (wait_result == RESOURCE_X_APPLY_STALE
-								&& target_install_preuse_retry_seen) {
-								memset(&target_install_follow, 0,
-									sizeof(target_install_follow));
-								target_install_preuse_retry_seen = false;
-								continue;
-							}
-							result = wait_result;
-							break;
-						}
-						if (target_install_follow_state
-								== RESOURCE_X_TARGET_INSTALL_INFLIGHT) {
-							diagnostic_stage = "target-install-continuation-wait";
-							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																	 PCM_RX_WAIT_INSTALL);
-							now_us = gcs_block_pcm_x_monotonic_us();
-							remaining_us = retry_slice_us;
-							timeout_ms = (long) Min(
-								(uint64) Max(
-									cluster_gcs_block_retransmit_initial_backoff_ms,
-									1),
-								(remaining_us + UINT64_C(999))
-									/ UINT64_C(1000));
-							if (timeout_ms <= 0)
-								timeout_ms = 1;
-							wait_result
-								= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
-									&target_install_follow,
-									RESOURCE_X_TARGET_INSTALL_INFLIGHT,
-									timeout_ms);
-							if (wait_result == RESOURCE_X_APPLY_APPLIED
-								|| wait_result == RESOURCE_X_APPLY_DUPLICATE) {
-								memset(&target_install_follow, 0, sizeof(target_install_follow));
-								target_install_preuse_retry_seen = false;
-								continue;
-							}
-							if (wait_result == RESOURCE_X_APPLY_STALE
-								&& target_install_preuse_retry_seen) {
-								memset(&target_install_follow, 0,
-									sizeof(target_install_follow));
-								target_install_preuse_retry_seen = false;
-								continue;
-							}
-							result = wait_result;
-							break;
-						}
-						if (target_install_follow_state
-								== RESOURCE_X_TARGET_INSTALL_STALE
-							&& target_install_preuse_retry_seen) {
-							memset(&target_install_follow, 0,
-								sizeof(target_install_follow));
+						if (wait_result == RESOURCE_X_APPLY_APPLIED) {
+							memset(&target_install_follow, 0, sizeof(target_install_follow));
 							target_install_preuse_retry_seen = false;
 							continue;
 						}
-						result = target_install_follow_state
-								== RESOURCE_X_TARGET_INSTALL_STALE
-							? RESOURCE_X_APPLY_STALE
-							: target_install_follow_state
-								== RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED
-							? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-							: RESOURCE_X_APPLY_INVALID;
+						if (wait_result == RESOURCE_X_APPLY_STALE
+							&& target_install_preuse_retry_seen) {
+							memset(&target_install_follow, 0, sizeof(target_install_follow));
+							target_install_preuse_retry_seen = false;
+							continue;
+						}
+						result = wait_result;
 						break;
 					}
-					target_install_observation_result
-						= gcs_block_resource_x_target_install_capture_coherent(
-							buf, &assertion, master_node, gate.formation, master_session,
-							admission.record_generation, requester_sender_connection_generation,
-							master_ingress_connection_generation, retry_slice_us,
-							absolute_deadline_us, &own,
-							aux_context != NULL && !direct_init && !join_only
-								&& ClusterBufferAuxiliaryObservationUnowned(
-									BufferDescriptorGetBuffer(buf)),
-							&target_install_follow_state, &target_install_follow);
-					if (target_install_observation_result
-							!= RESOURCE_X_APPLY_APPLIED) {
-						result = target_install_observation_result;
+					if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_INFLIGHT) {
+						diagnostic_stage = "target-install-continuation-wait";
+						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																 PCM_RX_WAIT_INSTALL);
+						now_us = gcs_block_pcm_x_monotonic_us();
+						remaining_us = retry_slice_us;
+						timeout_ms = (long)Min(
+							(uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+							(remaining_us + UINT64_C(999)) / UINT64_C(1000));
+						if (timeout_ms <= 0)
+							timeout_ms = 1;
+						wait_result
+							= cluster_pcm_lock_resource_x_bootstrap_round_target_install_wait_exact(
+								&target_install_follow, RESOURCE_X_TARGET_INSTALL_INFLIGHT,
+								timeout_ms);
+						if (wait_result == RESOURCE_X_APPLY_APPLIED
+							|| wait_result == RESOURCE_X_APPLY_DUPLICATE) {
+							memset(&target_install_follow, 0, sizeof(target_install_follow));
+							target_install_preuse_retry_seen = false;
+							continue;
+						}
+						if (wait_result == RESOURCE_X_APPLY_STALE
+							&& target_install_preuse_retry_seen) {
+							memset(&target_install_follow, 0, sizeof(target_install_follow));
+							target_install_preuse_retry_seen = false;
+							continue;
+						}
+						result = wait_result;
 						break;
 					}
-					if (target_install_follow_state
-							== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+					if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_STALE
+						&& target_install_preuse_retry_seen) {
+						memset(&target_install_follow, 0, sizeof(target_install_follow));
+						target_install_preuse_retry_seen = false;
 						continue;
-					if (target_install_follow_state
-							== RESOURCE_X_TARGET_INSTALL_INFLIGHT
-						|| target_install_follow_state
-							== RESOURCE_X_TARGET_INSTALL_TERMINAL
-						|| target_install_follow_state
-							== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
-						continue;
-					if (direct_init) {
-					cached_local_x
-						= own.pcm_state == (uint8)PCM_STATE_X
-						  && own.flags == 0
-						  && own.generation
-							== direct_init_committed_generation
-						  && own.writer_activation_token == 0
-						  && own.resource_x_activation_generation == 0;
+					}
+					result = target_install_follow_state == RESOURCE_X_TARGET_INSTALL_STALE
+								 ? RESOURCE_X_APPLY_STALE
+							 : target_install_follow_state
+									 == RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED
+								 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+								 : RESOURCE_X_APPLY_INVALID;
+					break;
+				}
+				target_install_observation_result
+					= gcs_block_resource_x_target_install_capture_coherent(
+						buf, &assertion, master_node, gate.formation, master_session,
+						admission.record_generation, requester_sender_connection_generation,
+						master_ingress_connection_generation, retry_slice_us, absolute_deadline_us,
+						&own,
+						aux_context != NULL && !direct_init && !join_only
+							&& ClusterBufferAuxiliaryObservationUnowned(
+								BufferDescriptorGetBuffer(buf)),
+						&target_install_follow_state, &target_install_follow);
+				if (target_install_observation_result != RESOURCE_X_APPLY_APPLIED) {
+					result = target_install_observation_result;
+					break;
+				}
+				if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+					continue;
+				if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_INFLIGHT
+					|| target_install_follow_state == RESOURCE_X_TARGET_INSTALL_TERMINAL
+					|| target_install_follow_state == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+					continue;
+				if (direct_init) {
+					cached_local_x = own.pcm_state == (uint8)PCM_STATE_X && own.flags == 0
+									 && own.generation == direct_init_committed_generation
+									 && own.writer_activation_token == 0
+									 && own.resource_x_activation_generation == 0;
 					if (!cached_local_x) {
 						direct_init_pending_n
 							= own.pcm_state == (uint8)PCM_STATE_N
-							  && own.flags
-								== PCM_OWN_FLAG_GRANT_PENDING
-							  && own.generation
-								== direct_init_ownership_generation
-							  && own.reservation_token
-								== direct_init_reservation_token
+							  && own.flags == PCM_OWN_FLAG_GRANT_PENDING
+							  && own.generation == direct_init_ownership_generation
+							  && own.reservation_token == direct_init_reservation_token
 							  && own.writer_activation_token == 0
 							  && own.resource_x_activation_generation == 0;
-							if (!direct_init_pending_n) {
-								result = RESOURCE_X_APPLY_STALE;
-								break;
-							}
+						if (!direct_init_pending_n) {
+							result = RESOURCE_X_APPLY_STALE;
+							break;
+						}
 						if (direct_init_pending_n) {
 							direct_candidate_result
-								= cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(
-									buf, &own);
+								= cluster_bufmgr_pcm_own_n_direct_init_candidate_exact(buf, &own);
 							if (direct_candidate_result != CLUSTER_PCM_OWN_OK) {
-								if (direct_candidate_result
-										== CLUSTER_PCM_OWN_STALE) {
-									memset(&failure_live, 0,
-										sizeof(failure_live));
+								if (direct_candidate_result == CLUSTER_PCM_OWN_STALE) {
+									memset(&failure_live, 0, sizeof(failure_live));
 									own_result
-										= cluster_bufmgr_pcm_own_snapshot(
-											buf, &failure_live);
+										= cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
 									if (own_result == CLUSTER_PCM_OWN_OK) {
 										target_install_observation_result
 											= gcs_block_resource_x_target_install_capture_coherent(
@@ -15234,29 +14270,27 @@ gcs_block_resource_x_target_acquire_internal(
 												&target_install_follow_state,
 												&target_install_follow);
 										if (target_install_observation_result
-												!= RESOURCE_X_APPLY_APPLIED) {
+											!= RESOURCE_X_APPLY_APPLIED) {
 											result = target_install_observation_result;
 											break;
 										}
 										if (target_install_follow_state
-												== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+											== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
 											continue;
 										if (target_install_follow_state
 												== RESOURCE_X_TARGET_INSTALL_INFLIGHT
 											|| target_install_follow_state
-												== RESOURCE_X_TARGET_INSTALL_TERMINAL
+												   == RESOURCE_X_TARGET_INSTALL_TERMINAL
 											|| target_install_follow_state
-												== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
-										continue;
+												   == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+											continue;
 									}
 								}
-								result
-									= direct_candidate_result == CLUSTER_PCM_OWN_BUSY
-									? RESOURCE_X_APPLY_BAD_STATE
-									: direct_candidate_result
-											== CLUSTER_PCM_OWN_STALE
-									? RESOURCE_X_APPLY_STALE
-									: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+								result = direct_candidate_result == CLUSTER_PCM_OWN_BUSY
+											 ? RESOURCE_X_APPLY_BAD_STATE
+										 : direct_candidate_result == CLUSTER_PCM_OWN_STALE
+											 ? RESOURCE_X_APPLY_STALE
+											 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 								break;
 							}
 						}
@@ -15307,12 +14341,9 @@ gcs_block_resource_x_target_acquire_internal(
 							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
 																	 PCM_RX_WAIT_RESERVATION);
 							remaining_us = retry_slice_us;
-							timeout_ms = (long) Min(
-								(uint64) Max(
-									cluster_gcs_block_retransmit_initial_backoff_ms,
-									1),
-								(remaining_us + UINT64_C(999))
-									/ UINT64_C(1000));
+							timeout_ms = (long)Min(
+								(uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+								(remaining_us + UINT64_C(999)) / UINT64_C(1000));
 							if (timeout_ms <= 0)
 								timeout_ms = 1;
 							CHECK_FOR_INTERRUPTS();
@@ -15323,15 +14354,12 @@ gcs_block_resource_x_target_acquire_internal(
 					if (own.pcm_state == (uint8)PCM_STATE_N) {
 						ClusterPcmOwnResult n_candidate_result;
 
-						if ((own.flags == PCM_OWN_FLAG_REVOKING
-								|| own.flags == 0)
-							&& own.reservation_token != 0
-							&& own.reservation_token != UINT64_MAX
+						if ((own.flags == PCM_OWN_FLAG_REVOKING || own.flags == 0)
+							&& own.reservation_token != 0 && own.reservation_token != UINT64_MAX
 							&& own.writer_activation_token == 0
 							&& own.resource_x_activation_generation == 0) {
 							ClusterPcmOwnSnapshot resampled;
-							ClusterPcmOwnResult current_candidate_result
-								= CLUSTER_PCM_OWN_INVALID;
+							ClusterPcmOwnResult current_candidate_result = CLUSTER_PCM_OWN_INVALID;
 							bool pair_exact;
 							bool buffer_exact = false;
 							bool undrained_current_predecessor = false;
@@ -15339,9 +14367,8 @@ gcs_block_resource_x_target_acquire_internal(
 							diagnostic_stage = "n-predecessor-observe";
 							pair_exact
 								= cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
-									&assertion.resource, master_node,
-									master_session, gate.formation,
-									own.generation);
+									&assertion.resource, master_node, master_session,
+									gate.formation, own.generation);
 							diagnostic_n_predecessor_pair = pair_exact;
 							diagnostic_n_predecessor_result = CLUSTER_PCM_OWN_INVALID;
 							if (pair_exact) {
@@ -15358,38 +14385,30 @@ gcs_block_resource_x_target_acquire_internal(
 									continue;
 								}
 							}
-							target_retained_release_inflight
-								= pair_exact && buffer_exact;
+							target_retained_release_inflight = pair_exact && buffer_exact;
 							target_retained_release_post_mutation
-								= target_retained_release_inflight
-								  && own.flags == 0;
-							if (pair_exact && !buffer_exact
-								&& own.flags == 0) {
+								= target_retained_release_inflight && own.flags == 0;
+							if (pair_exact && !buffer_exact && own.flags == 0) {
 								/* DROP's clean CURRENT and retained PI classification
 								 * came from one physical observation above. Neither
 								 * grants authority or consumes the predecessor. */
 								undrained_current_predecessor
 									= cluster_gcs_resource_x_target_undrained_current_predecessor_exact(
-										pair_exact, buffer_exact,
-										current_candidate_result, &own);
+										pair_exact, buffer_exact, current_candidate_result, &own);
 							}
-							if ((pair_exact && !buffer_exact
-									&& !undrained_current_predecessor)
+							if ((pair_exact && !buffer_exact && !undrained_current_predecessor)
 								|| (own.flags == PCM_OWN_FLAG_REVOKING
 									&& !target_retained_release_inflight)) {
 								memset(&resampled, 0, sizeof(resampled));
-								own_result = cluster_bufmgr_pcm_own_snapshot(
-									buf, &resampled);
+								own_result = cluster_bufmgr_pcm_own_snapshot(buf, &resampled);
 								if (own_result == CLUSTER_PCM_OWN_OK
-									&& memcmp(&resampled, &own,
-										sizeof(own)) != 0)
+									&& memcmp(&resampled, &own, sizeof(own)) != 0)
 									continue;
 								if (own_result == CLUSTER_PCM_OWN_OK)
 									gcs_block_resource_x_fail_closed_current();
-								result = own_result
-									== CLUSTER_PCM_OWN_STALE
-									? RESOURCE_X_APPLY_STALE
-									: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+								result = own_result == CLUSTER_PCM_OWN_STALE
+											 ? RESOURCE_X_APPLY_STALE
+											 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 								break;
 							}
 						}
@@ -15401,9 +14420,8 @@ gcs_block_resource_x_target_acquire_internal(
 							 * the requester installs only after the exact grant. */
 							memset(&failure_live, 0, sizeof(failure_live));
 							diagnostic_stage = "n-assertion-candidate";
-							n_candidate_result
-								= cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
-									buf, &own, &failure_live);
+							n_candidate_result = cluster_bufmgr_pcm_own_n_assertion_candidate_exact(
+								buf, &own, &failure_live);
 							if (n_candidate_result != CLUSTER_PCM_OWN_OK) {
 								if (n_candidate_result == CLUSTER_PCM_OWN_STALE) {
 									target_install_observation_result
@@ -15418,19 +14436,19 @@ gcs_block_resource_x_target_acquire_internal(
 													BufferDescriptorGetBuffer(buf)),
 											&target_install_follow_state, &target_install_follow);
 									if (target_install_observation_result
-											!= RESOURCE_X_APPLY_APPLIED) {
+										!= RESOURCE_X_APPLY_APPLIED) {
 										result = target_install_observation_result;
 										break;
 									}
 									if (target_install_follow_state
-											== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+										== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
 										continue;
 									if (target_install_follow_state
 											== RESOURCE_X_TARGET_INSTALL_INFLIGHT
 										|| target_install_follow_state
-											== RESOURCE_X_TARGET_INSTALL_TERMINAL
+											   == RESOURCE_X_TARGET_INSTALL_TERMINAL
 										|| target_install_follow_state
-											== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
+											   == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY)
 										continue;
 									now_us = gcs_block_pcm_x_monotonic_us();
 									if (cluster_gcs_resource_x_target_preassert_resample_exact(
@@ -15443,86 +14461,65 @@ gcs_block_resource_x_target_acquire_internal(
 										continue;
 									}
 								}
-									result
-										= gcs_block_pcm_x_resource_x_remote_s_own_result(
-											n_candidate_result);
-									memset(&failure_round, 0,
-										sizeof(failure_round));
-									failure_snapshot_result
-										= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
-											&assertion, master_node, gate.formation,
-											master_session,
-											admission.record_generation,
-											requester_sender_connection_generation,
-											master_ingress_connection_generation,
-											retry_slice_us, &failure_round);
-										memset(&first_failure, 0,
-										sizeof(first_failure));
-									first_failure.tag = assertion.resource;
-									first_failure.request_sequence
-										= diagnostic_request_sequence;
-									first_failure.admission_generation
-										= admission.record_generation;
-									first_failure.requester_node
-										= assertion.requester_node;
-									first_failure.buffer_generation_before
-										= own.generation;
-									first_failure.buffer_generation_after
-										= failure_live.generation;
-									first_failure.buffer_token_before
-										= own.reservation_token;
-									first_failure.buffer_token_after
-										= failure_live.reservation_token;
-									first_failure.buffer_writer_token_before
-										= own.writer_activation_token;
-									first_failure.buffer_writer_token_after
-										= failure_live.writer_activation_token;
-									first_failure.buffer_resource_x_generation_before
-										= own.resource_x_activation_generation;
-									first_failure.buffer_resource_x_generation_after
-										= failure_live.resource_x_activation_generation;
-									first_failure.formation = gate.formation;
-									first_failure.master_session = master_session;
-									first_failure.r4_generation
-										= admission.record_generation;
-									first_failure.absolute_deadline_us
-										= absolute_deadline_us;
-									first_failure.remote_s_stage
-										= RESOURCE_X_REMOTE_S_STAGE_NONE;
-									first_failure.failure_domain
-										= gcs_block_resource_x_pre_mutation_domain(
-											n_candidate_result);
-									first_failure.result = result;
-									if (failure_snapshot_result
-											== RESOURCE_X_APPLY_APPLIED) {
-										first_failure.base_authority_generation
-											= failure_round.base_authority_generation;
-										first_failure.authority_generation
-											= failure_round.authority_generation;
-										first_failure.assertion_sequence
-											= failure_round.ref.acquisition_generation;
-										first_failure.round_terminal
-											= failure_round.terminal != 0;
-										first_failure.round_phase
-											= failure_round.round_phase;
-										first_failure.round_progress_flags
-											= failure_round.progress_flags;
-									}
-									gcs_block_resource_x_first_failure_record(
-										&first_failure);
-									first_failure_recorded = true;
-									break;
+								result = gcs_block_pcm_x_resource_x_remote_s_own_result(
+									n_candidate_result);
+								memset(&failure_round, 0, sizeof(failure_round));
+								failure_snapshot_result
+									= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+										&assertion, master_node, gate.formation, master_session,
+										admission.record_generation,
+										requester_sender_connection_generation,
+										master_ingress_connection_generation, retry_slice_us,
+										&failure_round);
+								memset(&first_failure, 0, sizeof(first_failure));
+								first_failure.tag = assertion.resource;
+								first_failure.request_sequence = diagnostic_request_sequence;
+								first_failure.admission_generation = admission.record_generation;
+								first_failure.requester_node = assertion.requester_node;
+								first_failure.buffer_generation_before = own.generation;
+								first_failure.buffer_generation_after = failure_live.generation;
+								first_failure.buffer_token_before = own.reservation_token;
+								first_failure.buffer_token_after = failure_live.reservation_token;
+								first_failure.buffer_writer_token_before
+									= own.writer_activation_token;
+								first_failure.buffer_writer_token_after
+									= failure_live.writer_activation_token;
+								first_failure.buffer_resource_x_generation_before
+									= own.resource_x_activation_generation;
+								first_failure.buffer_resource_x_generation_after
+									= failure_live.resource_x_activation_generation;
+								first_failure.formation = gate.formation;
+								first_failure.master_session = master_session;
+								first_failure.r4_generation = admission.record_generation;
+								first_failure.absolute_deadline_us = absolute_deadline_us;
+								first_failure.remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_NONE;
+								first_failure.failure_domain
+									= gcs_block_resource_x_pre_mutation_domain(n_candidate_result);
+								first_failure.result = result;
+								if (failure_snapshot_result == RESOURCE_X_APPLY_APPLIED) {
+									first_failure.base_authority_generation
+										= failure_round.base_authority_generation;
+									first_failure.authority_generation
+										= failure_round.authority_generation;
+									first_failure.assertion_sequence
+										= failure_round.ref.acquisition_generation;
+									first_failure.round_terminal = failure_round.terminal != 0;
+									first_failure.round_phase = failure_round.round_phase;
+									first_failure.round_progress_flags
+										= failure_round.progress_flags;
+								}
+								gcs_block_resource_x_first_failure_record(&first_failure);
+								first_failure_recorded = true;
+								break;
 							}
 						}
 					} else if (own.generation == 0) {
 						result = RESOURCE_X_APPLY_STALE;
 						break;
 					}
-					cached_local_x
-						= own.pcm_state == (uint8)PCM_STATE_X
-						  && own.flags == 0
-						  && own.writer_activation_token == 0
-						  && own.resource_x_activation_generation == 0;
+					cached_local_x = own.pcm_state == (uint8)PCM_STATE_X && own.flags == 0
+									 && own.writer_activation_token == 0
+									 && own.resource_x_activation_generation == 0;
 				}
 				if (target_retained_release_inflight) {
 					wait_result = gcs_block_resource_x_gate_session_recheck_result(
@@ -15539,8 +14536,8 @@ gcs_block_resource_x_target_acquire_internal(
 						if (target_retained_release_post_mutation)
 							gcs_block_resource_x_fail_closed_current();
 						result = target_retained_release_post_mutation
-							? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-							: RESOURCE_X_APPLY_STALE;
+									 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+									 : RESOURCE_X_APPLY_STALE;
 						break;
 					}
 					diagnostic_stage = "retained-release-wait";
@@ -15626,72 +14623,59 @@ gcs_block_resource_x_target_acquire_internal(
 					cluster_pcm_vm_metric_note(&resource, PCM_VM_HEAD_JOIN);
 					diagnostic_join_recorded = true;
 				}
-					if (action == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL) {
-						diagnostic_stage = "terminal-recheck";
-						if (target_install_follow.valid) {
-							memset(&failure_live, 0, sizeof(failure_live));
-							own_result = cluster_bufmgr_pcm_own_snapshot(
-								buf, &failure_live);
-							if (own_result != CLUSTER_PCM_OWN_OK) {
-								result = own_result == CLUSTER_PCM_OWN_BUSY
-									? RESOURCE_X_APPLY_BAD_STATE
-									: own_result == CLUSTER_PCM_OWN_STALE
-									? RESOURCE_X_APPLY_STALE
-									: RESOURCE_X_APPLY_RECOVERY_BLOCKED;
-								break;
-							}
-							target_install_observation_result
-								= gcs_block_resource_x_target_install_classify_coherent(
-									buf, &target_install_follow, &failure_live,
-									&target_install_follow_state, &terminal_ref);
-							if (target_install_observation_result
-									!= RESOURCE_X_APPLY_APPLIED) {
-								result = target_install_observation_result;
-								break;
-							}
-							if (target_install_follow_state
-									== RESOURCE_X_TARGET_INSTALL_RESAMPLE)
-								continue;
-							if (target_install_follow_state
-									== RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
-								target_install_preuse_retry_seen = true;
-								continue;
-							}
-							if (target_install_follow_state
-									== RESOURCE_X_TARGET_INSTALL_STALE
-								&& target_install_preuse_retry_seen) {
-								memset(&target_install_follow, 0,
-									sizeof(target_install_follow));
-								target_install_preuse_retry_seen = false;
-								continue;
-							}
-							if (target_install_follow_state
-									!= RESOURCE_X_TARGET_INSTALL_TERMINAL) {
-								result = target_install_follow_state
-										== RESOURCE_X_TARGET_INSTALL_STALE
-									? RESOURCE_X_APPLY_STALE
-									: target_install_follow_state
-										== RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED
-									? RESOURCE_X_APPLY_RECOVERY_BLOCKED
-									: RESOURCE_X_APPLY_INVALID;
-								break;
-							}
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL) {
+					diagnostic_stage = "terminal-recheck";
+					if (target_install_follow.valid) {
+						memset(&failure_live, 0, sizeof(failure_live));
+						own_result = cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
+						if (own_result != CLUSTER_PCM_OWN_OK) {
+							result = own_result == CLUSTER_PCM_OWN_BUSY ? RESOURCE_X_APPLY_BAD_STATE
+									 : own_result == CLUSTER_PCM_OWN_STALE
+										 ? RESOURCE_X_APPLY_STALE
+										 : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
+							break;
 						}
-						terminal_admission_current
-						= cluster_semantic_activation_recheck(&admission);
+						target_install_observation_result
+							= gcs_block_resource_x_target_install_classify_coherent(
+								buf, &target_install_follow, &failure_live,
+								&target_install_follow_state, &terminal_ref);
+						if (target_install_observation_result != RESOURCE_X_APPLY_APPLIED) {
+							result = target_install_observation_result;
+							break;
+						}
+						if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_RESAMPLE)
+							continue;
+						if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_PREUSE_RETRY) {
+							target_install_preuse_retry_seen = true;
+							continue;
+						}
+						if (target_install_follow_state == RESOURCE_X_TARGET_INSTALL_STALE
+							&& target_install_preuse_retry_seen) {
+							memset(&target_install_follow, 0, sizeof(target_install_follow));
+							target_install_preuse_retry_seen = false;
+							continue;
+						}
+						if (target_install_follow_state != RESOURCE_X_TARGET_INSTALL_TERMINAL) {
+							result = target_install_follow_state == RESOURCE_X_TARGET_INSTALL_STALE
+										 ? RESOURCE_X_APPLY_STALE
+									 : target_install_follow_state
+											 == RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED
+										 ? RESOURCE_X_APPLY_RECOVERY_BLOCKED
+										 : RESOURCE_X_APPLY_INVALID;
+							break;
+						}
+					}
+					terminal_admission_current = cluster_semantic_activation_recheck(&admission);
 					if (terminal_admission_current) {
 						memset(&terminal_gate, 0, sizeof(terminal_gate));
 						terminal_master_node = -1;
 						terminal_master_session = 0;
-						terminal_session_check
-							= gcs_block_resource_x_gate_session_snapshot_result(
-								&resource, &terminal_gate,
-								&terminal_master_node,
-								&terminal_master_session);
+						terminal_session_check = gcs_block_resource_x_gate_session_snapshot_result(
+							&resource, &terminal_gate, &terminal_master_node,
+							&terminal_master_session);
 						terminal_gate_session_current
 							= terminal_session_check == PCM_X_SESSION_AUTH_OK
-							  && memcmp(&terminal_gate, &gate,
-								  sizeof(terminal_gate)) == 0
+							  && memcmp(&terminal_gate, &gate, sizeof(terminal_gate)) == 0
 							  && terminal_master_node == master_node
 							  && terminal_master_session == master_session;
 					}
@@ -15707,13 +14691,11 @@ gcs_block_resource_x_target_acquire_internal(
 						gcs_block_resource_x_observation_pause();
 						continue;
 					}
-					if (!terminal_admission_current
-						|| !terminal_gate_session_current) {
+					if (!terminal_admission_current || !terminal_gate_session_current) {
 						result = RESOURCE_X_APPLY_STALE;
 						break;
 					}
-					memset(&target_install_follow, 0,
-						sizeof(target_install_follow));
+					memset(&target_install_follow, 0, sizeof(target_install_follow));
 					target_install_preuse_retry_seen = false;
 					*ref_out = terminal_ref;
 					/* All success paths, including coherent install-follow and
@@ -15763,39 +14745,30 @@ gcs_block_resource_x_target_acquire_internal(
 					bool round_drift_can_resample;
 
 					memset(&failure_live, 0, sizeof(failure_live));
-					own_result
-						= cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
+					own_result = cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
 					memset(&failure_round, 0, sizeof(failure_round));
 					failure_snapshot_result
 						= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
-							&assertion, master_node, gate.formation,
-							master_session, admission.record_generation,
-							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							retry_slice_us, &failure_round);
+							&assertion, master_node, gate.formation, master_session,
+							admission.record_generation, requester_sender_connection_generation,
+							master_ingress_connection_generation, retry_slice_us, &failure_round);
 					requester_sender_recheck = 0;
 					master_ingress_recheck = 0;
-					dispatch_admission_current
-						= cluster_semantic_activation_recheck(&admission);
+					dispatch_admission_current = cluster_semantic_activation_recheck(&admission);
 					dispatch_gate_session_result = gcs_block_resource_x_gate_session_recheck_result(
 						&resource, &gate, master_node, master_session);
 					dispatch_gate_session_current
 						= dispatch_gate_session_result == RESOURCE_X_APPLY_APPLIED;
-					dispatch_requester_sampled
-						= gcs_block_pcm_x_resource_x_peer_ready_exact(
-							master_node, &requester_sender_recheck);
-					dispatch_master_sampled
-						= gcs_block_pcm_x_resource_x_peer_ready_exact(
-							master_node, &master_ingress_recheck);
+					dispatch_requester_sampled = gcs_block_pcm_x_resource_x_peer_ready_exact(
+						master_node, &requester_sender_recheck);
+					dispatch_master_sampled = gcs_block_pcm_x_resource_x_peer_ready_exact(
+						master_node, &master_ingress_recheck);
 					dispatch_recheck_failure_mask
 						= cluster_gcs_resource_x_dispatch_recheck_failure_mask(
-							dispatch_admission_current,
-							dispatch_gate_session_current,
-							dispatch_requester_sampled,
-							dispatch_master_sampled,
+							dispatch_admission_current, dispatch_gate_session_current,
+							dispatch_requester_sampled, dispatch_master_sampled,
 							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							requester_sender_recheck,
+							master_ingress_connection_generation, requester_sender_recheck,
 							master_ingress_recheck);
 					round_drift_peer_result = gcs_block_resource_x_target_peer_result_exact(
 						&admission, master_node, master_ingress_connection_generation);
@@ -15824,8 +14797,8 @@ gcs_block_resource_x_target_acquire_internal(
 						&& failure_live.pcm_state == (uint8)PCM_STATE_N) {
 						round_drift_retained_pair_exact
 							= cluster_pcm_lock_resource_x_holder_pair_retained_fence_exact(
-								&assertion.resource, master_node, master_session,
-								gate.formation, failure_live.generation);
+								&assertion.resource, master_node, master_session, gate.formation,
+								failure_live.generation);
 						round_drift_retained_buffer_exact
 							= round_drift_retained_pair_exact
 							  && cluster_bufmgr_pcm_own_n_retained_release_inflight_exact(
@@ -15850,8 +14823,7 @@ gcs_block_resource_x_target_acquire_internal(
 					result = RESOURCE_X_APPLY_STALE;
 					break;
 				}
-				if (action
-					== RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT) {
+				if (action == RESOURCE_X_BOOTSTRAP_ROUND_PREDECESSOR_WAIT) {
 					/* The exact predecessor pair is older than this local request.
 					 * Keep the requester round empty.  Register against the existing
 					 * settlement predicate on the same entry CV under this caller's
@@ -15896,27 +14868,21 @@ gcs_block_resource_x_target_acquire_internal(
 					diagnostic_stage = "dispatch-recheck";
 					requester_sender_recheck = 0;
 					master_ingress_recheck = 0;
-					dispatch_admission_current
-						= cluster_semantic_activation_recheck(&admission);
+					dispatch_admission_current = cluster_semantic_activation_recheck(&admission);
 					dispatch_gate_session_result = gcs_block_resource_x_gate_session_recheck_result(
 						&resource, &gate, master_node, master_session);
 					dispatch_gate_session_current
 						= dispatch_gate_session_result == RESOURCE_X_APPLY_APPLIED;
-					dispatch_requester_sampled
-						= gcs_block_pcm_x_resource_x_peer_ready_exact(
-							master_node, &requester_sender_recheck);
-					dispatch_master_sampled
-						= gcs_block_pcm_x_resource_x_peer_ready_exact(
-							master_node, &master_ingress_recheck);
+					dispatch_requester_sampled = gcs_block_pcm_x_resource_x_peer_ready_exact(
+						master_node, &requester_sender_recheck);
+					dispatch_master_sampled = gcs_block_pcm_x_resource_x_peer_ready_exact(
+						master_node, &master_ingress_recheck);
 					dispatch_recheck_failure_mask
 						= cluster_gcs_resource_x_dispatch_recheck_failure_mask(
-							dispatch_admission_current,
-							dispatch_gate_session_current,
-							dispatch_requester_sampled,
-							dispatch_master_sampled,
+							dispatch_admission_current, dispatch_gate_session_current,
+							dispatch_requester_sampled, dispatch_master_sampled,
 							requester_sender_connection_generation,
-							master_ingress_connection_generation,
-							requester_sender_recheck,
+							master_ingress_connection_generation, requester_sender_recheck,
 							master_ingress_recheck);
 					/* A missing observation is not pre-ASSERT authority drift.
 					 * Keep the exact round for REQUEST, ASSERT and followers;
@@ -15936,8 +14902,7 @@ gcs_block_resource_x_target_acquire_internal(
 						gcs_block_resource_x_observation_pause();
 						continue;
 					}
-					if (dispatch_recheck_failure_mask
-						!= RESOURCE_X_DISPATCH_RECHECK_OK) {
+					if (dispatch_recheck_failure_mask != RESOURCE_X_DISPATCH_RECHECK_OK) {
 						/* D1 AUTHORITY_DRIFT: a pre-ACK/pre-ASSERT kind-9 round
 						 * is not authority even if its request reached a master
 						 * RECEIVED receipt.  A transient session observation keeps
@@ -15948,9 +14913,8 @@ gcs_block_resource_x_target_acquire_internal(
 						 * authority under that same deadline.  The higher attempt
 						 * replaces any unconsumed old receipt; no proof or image is
 						 * reused. */
-						if (action
-								== RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST
-							&& !join_only && dispatch_admission_current) {
+						if (action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST && !join_only
+							&& dispatch_admission_current) {
 							memset(&rebound_gate, 0, sizeof(rebound_gate));
 							rebound_master_node = -1;
 							rebound_master_session = 0;
@@ -15961,24 +14925,19 @@ gcs_block_resource_x_target_acquire_internal(
 							rebound_peer_matches = false;
 							dispatch_session_check
 								= gcs_block_resource_x_gate_session_snapshot_result(
-									&resource, &rebound_gate,
-									&rebound_master_node,
+									&resource, &rebound_gate, &rebound_master_node,
 									&rebound_master_session);
-							if (cluster_gcs_pcm_x_auth_result_retryable(
-									dispatch_session_check))
+							if (cluster_gcs_pcm_x_auth_result_retryable(dispatch_session_check))
 								goto dispatch_recheck_wait;
-							if (dispatch_session_check
-									== PCM_X_SESSION_AUTH_OK) {
+							if (dispatch_session_check == PCM_X_SESSION_AUTH_OK) {
 								rebound_requester_sampled
 									= gcs_block_pcm_x_resource_x_peer_ready_exact(
 										rebound_master_node,
 										&rebound_requester_connection_generation);
 								rebound_master_sampled
 									= gcs_block_pcm_x_resource_x_peer_ready_exact(
-										rebound_master_node,
-										&rebound_master_connection_generation);
-								if (!rebound_requester_sampled
-									|| !rebound_master_sampled)
+										rebound_master_node, &rebound_master_connection_generation);
+								if (!rebound_requester_sampled || !rebound_master_sampled)
 									goto dispatch_recheck_wait;
 								if (rebound_master_node == cluster_node_id)
 									rebound_peer_matches
@@ -15996,30 +14955,25 @@ gcs_block_resource_x_target_acquire_internal(
 								}
 								if (!rebound_peer_matches)
 									goto dispatch_recheck_wait;
-								if (!cluster_semantic_activation_recheck(
-										&admission)) {
+								if (!cluster_semantic_activation_recheck(&admission)) {
 									result = RESOURCE_X_APPLY_STALE;
 									break;
 								}
-								if (memcmp(&rebound_gate, &gate,
-										sizeof(rebound_gate)) == 0
+								if (memcmp(&rebound_gate, &gate, sizeof(rebound_gate)) == 0
 									&& rebound_master_node == master_node
 									&& rebound_master_session == master_session
 									&& rebound_requester_connection_generation
-										== requester_sender_connection_generation
+										   == requester_sender_connection_generation
 									&& rebound_master_connection_generation
-										== master_ingress_connection_generation)
+										   == master_ingress_connection_generation)
 									continue;
 								discard_result
 									= cluster_pcm_lock_resource_x_bootstrap_round_discard_pre_assert_authority_drift_exact(
-										&dispatch, master_node,
-										admission.record_generation,
-										master_ingress_connection_generation,
-										retry_slice_us, absolute_deadline_us,
-										direct_init_ownership_generation,
+										&dispatch, master_node, admission.record_generation,
+										master_ingress_connection_generation, retry_slice_us,
+										absolute_deadline_us, direct_init_ownership_generation,
 										direct_init_reservation_token);
-								if (discard_result
-										!= RESOURCE_X_APPLY_APPLIED) {
+								if (discard_result != RESOURCE_X_APPLY_APPLIED) {
 									result = discard_result;
 									break;
 								}
@@ -16041,19 +14995,19 @@ gcs_block_resource_x_target_acquire_internal(
 							result = RESOURCE_X_APPLY_STALE;
 							break;
 
-					dispatch_recheck_wait:
-						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																 PCM_RX_WAIT_DISPATCH);
-						now_us = gcs_block_pcm_x_monotonic_us();
-						remaining_us = retry_slice_us;
-						timeout_ms = (long)Min(
-							(uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
-							(remaining_us + UINT64_C(999)) / UINT64_C(1000));
-						if (timeout_ms <= 0)
-							timeout_ms = 1;
-						CHECK_FOR_INTERRUPTS();
-						pg_usleep(timeout_ms * 1000L);
-						continue;
+						dispatch_recheck_wait:
+							gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+																	 PCM_RX_WAIT_DISPATCH);
+							now_us = gcs_block_pcm_x_monotonic_us();
+							remaining_us = retry_slice_us;
+							timeout_ms = (long)Min(
+								(uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+								(remaining_us + UINT64_C(999)) / UINT64_C(1000));
+							if (timeout_ms <= 0)
+								timeout_ms = 1;
+							CHECK_FOR_INTERRUPTS();
+							pg_usleep(timeout_ms * 1000L);
+							continue;
 						}
 						result = RESOURCE_X_APPLY_STALE;
 						break;
@@ -16063,14 +15017,12 @@ gcs_block_resource_x_target_acquire_internal(
 						|| action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
 					if (action == RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST) {
 						diagnostic_stage = "dispatch-bootstrap-request";
-						stage_ok
-							= gcs_block_resource_x_bootstrap_request_stage_exact(
-								master_node, &dispatch);
+						stage_ok = gcs_block_resource_x_bootstrap_request_stage_exact(master_node,
+																					  &dispatch);
 					} else {
 						diagnostic_stage = "dispatch-assert";
 						stage_ok
-							= gcs_block_resource_x_native_assert_stage_exact(
-								master_node, &dispatch)
+							= gcs_block_resource_x_native_assert_stage_exact(master_node, &dispatch)
 							  == RESOURCE_X_APPLY_APPLIED;
 					}
 					(void)stage_ok;
@@ -16086,102 +15038,102 @@ gcs_block_resource_x_target_acquire_internal(
 				 * WAIT only enrolls/rechecks; it cannot revoke its own install. */
 				now_us = gcs_block_pcm_x_monotonic_us();
 				remaining_us = retry_slice_us;
-				timeout_ms = (long)Min(
-					(uint64)Max(
-						cluster_gcs_block_retransmit_initial_backoff_ms, 1),
-					(remaining_us + UINT64_C(999)) / UINT64_C(1000));
+				timeout_ms
+					= (long)Min((uint64)Max(cluster_gcs_block_retransmit_initial_backoff_ms, 1),
+								(remaining_us + UINT64_C(999)) / UINT64_C(1000));
 				if (timeout_ms <= 0)
 					timeout_ms = 1;
 				diagnostic_stage = "round-wait";
-					if (direct_init)
-						wait_result
-							= cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
-								&assertion, master_node, gate.formation, master_session,
-								admission.record_generation, requester_sender_connection_generation,
-								master_ingress_connection_generation, retry_slice_us,
-								direct_init_ownership_generation, direct_init_reservation_token,
-								absolute_deadline_us, timeout_ms);
-					else
-						wait_result = cluster_pcm_lock_resource_x_bootstrap_round_wait_caller_exact(
+				if (direct_init)
+					wait_result
+						= cluster_pcm_lock_resource_x_bootstrap_round_wait_direct_init_exact(
 							&assertion, master_node, gate.formation, master_session,
 							admission.record_generation, requester_sender_connection_generation,
 							master_ingress_connection_generation, retry_slice_us,
-							absolute_deadline_us, timeout_ms, caller_witness);
-					diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure();
-					if (wait_result == RESOURCE_X_APPLY_DUPLICATE
-						&& caller_witness->reobserve_attempt != 0)
-						gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
-																 caller_witness->reobserve_reason);
-					diagnostic_deadline_expired
-						= diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
-					diagnostic_head_expired
-						= diagnostic_wait_failure == PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED;
-					if (wait_result != RESOURCE_X_APPLY_APPLIED
-						&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
-						/* The registered wait and BufferDesc use independent lock
+							direct_init_ownership_generation, direct_init_reservation_token,
+							absolute_deadline_us, timeout_ms);
+				else
+					wait_result = cluster_pcm_lock_resource_x_bootstrap_round_wait_caller_exact(
+						&assertion, master_node, gate.formation, master_session,
+						admission.record_generation, requester_sender_connection_generation,
+						master_ingress_connection_generation, retry_slice_us, absolute_deadline_us,
+						timeout_ms, caller_witness);
+				diagnostic_wait_failure = cluster_pcm_rx_take_wait_failure();
+				if (wait_result == RESOURCE_X_APPLY_DUPLICATE
+					&& caller_witness->reobserve_attempt != 0)
+					gcs_block_resource_x_requester_wait_note(&wait_diagnostic,
+															 caller_witness->reobserve_reason);
+				diagnostic_deadline_expired
+					= diagnostic_wait_failure == PCM_RX_WAIT_CALLER_DEADLINE_EXPIRED;
+				diagnostic_head_expired
+					= diagnostic_wait_failure == PCM_RX_WAIT_HEAD_NO_PROGRESS_EXPIRED;
+				if (wait_result != RESOURCE_X_APPLY_APPLIED
+					&& wait_result != RESOURCE_X_APPLY_DUPLICATE) {
+					/* The registered wait and BufferDesc use independent lock
 					 * domains.  A same-node T1 executor can publish terminal X
 					 * between the wait predicate and this return, making the old
 					 * wait identity STALE even though the exact requested install
 					 * completed.  Admit no generic STALE retry: independently
 					 * resample both domains and require the frozen pending(T) ->
 					 * terminal-X(T+1) proof before restarting the full driver. */
-						if (!direct_init && !join_only && wait_result == RESOURCE_X_APPLY_STALE
-							&& own.pcm_state == (uint8)PCM_STATE_N
-							&& own.flags == PCM_OWN_FLAG_GRANT_PENDING) {
-							diagnostic_stage = "wait-terminal-resample";
-							memset(&failure_live, 0, sizeof(failure_live));
-							own_result = cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
-							memset(&failure_round, 0, sizeof(failure_round));
-							failure_snapshot_result
-								= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
-									&assertion, master_node, gate.formation, master_session,
-									admission.record_generation,
-									requester_sender_connection_generation,
-									master_ingress_connection_generation, retry_slice_us,
-									&failure_round);
-							pending_terminal_resample_mismatch
-								= own_result == CLUSTER_PCM_OWN_OK
-									  ? cluster_gcs_resource_x_pending_terminal_resample_mismatch(
-											&own, &failure_live, failure_snapshot_result,
-											&failure_round)
-									  : RESOURCE_X_PENDING_TERMINAL_MISMATCH_INPUT;
-							ereport(LOG,
+					if (!direct_init && !join_only && wait_result == RESOURCE_X_APPLY_STALE
+						&& own.pcm_state == (uint8)PCM_STATE_N
+						&& own.flags == PCM_OWN_FLAG_GRANT_PENDING) {
+						diagnostic_stage = "wait-terminal-resample";
+						memset(&failure_live, 0, sizeof(failure_live));
+						own_result = cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
+						memset(&failure_round, 0, sizeof(failure_round));
+						failure_snapshot_result
+							= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+								&assertion, master_node, gate.formation, master_session,
+								admission.record_generation, requester_sender_connection_generation,
+								master_ingress_connection_generation, retry_slice_us,
+								&failure_round);
+						pending_terminal_resample_mismatch
+							= own_result == CLUSTER_PCM_OWN_OK
+								  ? cluster_gcs_resource_x_pending_terminal_resample_mismatch(
+										&own, &failure_live, failure_snapshot_result,
+										&failure_round)
+								  : RESOURCE_X_PENDING_TERMINAL_MISMATCH_INPUT;
+						ereport(
+							LOG,
 							(errmsg_internal("Resource-X pending terminal resample diagnostic"),
-							 errdetail("mismatch=0x%016llx live_result=%d round_result=%d "
-								"before_state=%u before_flags=0x%x before_generation=%llu "
-								"before_token=%llu before_writer=%llu before_resource_x=%llu "
-								"live_state=%u live_flags=0x%x live_generation=%llu "
-								"live_token=%llu live_writer=%llu live_resource_x=%llu "
-								"round_terminal=%u round_phase=%u round_buffer_generation=%llu "
-								"round_requester=%d round_formation=%llu round_acquisition=%llu "
-								"round_base_authority=%llu round_authority=%llu round_r4=%llu "
-								"round_session=%llu round_deadline=%llu round_retired=%llu "
-								"round_progress=0x%x",
-								(unsigned long long) pending_terminal_resample_mismatch,
-								(int) own_result, (int) failure_snapshot_result,
-								(unsigned) own.pcm_state, own.flags,
-								(unsigned long long) own.generation,
-								(unsigned long long) own.reservation_token,
-								(unsigned long long) own.writer_activation_token,
-								(unsigned long long) own.resource_x_activation_generation,
-								(unsigned) failure_live.pcm_state, failure_live.flags,
-								(unsigned long long) failure_live.generation,
-								(unsigned long long) failure_live.reservation_token,
-								(unsigned long long) failure_live.writer_activation_token,
-								(unsigned long long) failure_live.resource_x_activation_generation,
-								(unsigned) failure_round.terminal,
-								(unsigned) failure_round.round_phase,
-								(unsigned long long) failure_round.buffer_ownership_generation,
-								failure_round.ref.assertion.requester_node,
-								(unsigned long long) failure_round.ref.formation,
-								(unsigned long long) failure_round.ref.acquisition_generation,
-								(unsigned long long) failure_round.base_authority_generation,
-								(unsigned long long) failure_round.authority_generation,
-								(unsigned long long) failure_round.r4_record_generation,
-								(unsigned long long) failure_round.master_session_incarnation,
-								(unsigned long long) failure_round.absolute_deadline_us,
-								(unsigned long long) failure_round.retired_acquisition_generation,
-								failure_round.progress_flags)));
+							 errdetail(
+								 "mismatch=0x%016llx live_result=%d round_result=%d "
+								 "before_state=%u before_flags=0x%x before_generation=%llu "
+								 "before_token=%llu before_writer=%llu before_resource_x=%llu "
+								 "live_state=%u live_flags=0x%x live_generation=%llu "
+								 "live_token=%llu live_writer=%llu live_resource_x=%llu "
+								 "round_terminal=%u round_phase=%u round_buffer_generation=%llu "
+								 "round_requester=%d round_formation=%llu round_acquisition=%llu "
+								 "round_base_authority=%llu round_authority=%llu round_r4=%llu "
+								 "round_session=%llu round_deadline=%llu round_retired=%llu "
+								 "round_progress=0x%x",
+								 (unsigned long long)pending_terminal_resample_mismatch,
+								 (int)own_result, (int)failure_snapshot_result,
+								 (unsigned)own.pcm_state, own.flags,
+								 (unsigned long long)own.generation,
+								 (unsigned long long)own.reservation_token,
+								 (unsigned long long)own.writer_activation_token,
+								 (unsigned long long)own.resource_x_activation_generation,
+								 (unsigned)failure_live.pcm_state, failure_live.flags,
+								 (unsigned long long)failure_live.generation,
+								 (unsigned long long)failure_live.reservation_token,
+								 (unsigned long long)failure_live.writer_activation_token,
+								 (unsigned long long)failure_live.resource_x_activation_generation,
+								 (unsigned)failure_round.terminal,
+								 (unsigned)failure_round.round_phase,
+								 (unsigned long long)failure_round.buffer_ownership_generation,
+								 failure_round.ref.assertion.requester_node,
+								 (unsigned long long)failure_round.ref.formation,
+								 (unsigned long long)failure_round.ref.acquisition_generation,
+								 (unsigned long long)failure_round.base_authority_generation,
+								 (unsigned long long)failure_round.authority_generation,
+								 (unsigned long long)failure_round.r4_record_generation,
+								 (unsigned long long)failure_round.master_session_incarnation,
+								 (unsigned long long)failure_round.absolute_deadline_us,
+								 (unsigned long long)failure_round.retired_acquisition_generation,
+								 failure_round.progress_flags)));
 					}
 					result = wait_result;
 					break;
@@ -16248,10 +15200,8 @@ gcs_block_resource_x_target_acquire_internal(
 		failure_snapshot_result
 			= cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
 				&assertion, master_node, gate.formation, master_session,
-				admission_record_generation,
-				requester_sender_connection_generation,
-				master_ingress_connection_generation, retry_slice_us,
-				&failure_round);
+				admission_record_generation, requester_sender_connection_generation,
+				master_ingress_connection_generation, retry_slice_us, &failure_round);
 		memset(&failure_live, 0, sizeof(failure_live));
 		own_result = cluster_bufmgr_pcm_own_snapshot(buf, &failure_live);
 		memset(&first_failure, 0, sizeof(first_failure));
@@ -16264,39 +15214,31 @@ gcs_block_resource_x_target_acquire_internal(
 			= own_result == CLUSTER_PCM_OWN_OK ? failure_live.generation : 0;
 		first_failure.buffer_token_before = own.reservation_token;
 		first_failure.buffer_token_after
-			= own_result == CLUSTER_PCM_OWN_OK
-			? failure_live.reservation_token : 0;
-		first_failure.buffer_writer_token_before
-			= own.writer_activation_token;
+			= own_result == CLUSTER_PCM_OWN_OK ? failure_live.reservation_token : 0;
+		first_failure.buffer_writer_token_before = own.writer_activation_token;
 		first_failure.buffer_writer_token_after
-			= own_result == CLUSTER_PCM_OWN_OK
-			? failure_live.writer_activation_token : 0;
-		first_failure.buffer_resource_x_generation_before
-			= own.resource_x_activation_generation;
+			= own_result == CLUSTER_PCM_OWN_OK ? failure_live.writer_activation_token : 0;
+		first_failure.buffer_resource_x_generation_before = own.resource_x_activation_generation;
 		first_failure.buffer_resource_x_generation_after
-			= own_result == CLUSTER_PCM_OWN_OK
-			? failure_live.resource_x_activation_generation : 0;
+			= own_result == CLUSTER_PCM_OWN_OK ? failure_live.resource_x_activation_generation : 0;
 		first_failure.formation = gate.formation;
 		first_failure.master_session = master_session;
 		first_failure.r4_generation = admission_record_generation;
 		first_failure.absolute_deadline_us = absolute_deadline_us;
 		first_failure.remote_s_stage = RESOURCE_X_REMOTE_S_STAGE_NONE;
-		first_failure.failure_domain = preflight_backpressure
-			? RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE
-			: gcs_block_resource_x_target_failure_domain(
-				result, failure_snapshot_result, &failure_round, own_result);
+		first_failure.failure_domain
+			= preflight_backpressure
+				  ? RESOURCE_X_FAIL_PRE_MUTATION_BACKPRESSURE
+				  : gcs_block_resource_x_target_failure_domain(result, failure_snapshot_result,
+															   &failure_round, own_result);
 		first_failure.result = result;
 		if (failure_snapshot_result == RESOURCE_X_APPLY_APPLIED) {
-			first_failure.base_authority_generation
-				= failure_round.base_authority_generation;
-			first_failure.authority_generation
-				= failure_round.authority_generation;
-			first_failure.assertion_sequence
-				= failure_round.ref.acquisition_generation;
+			first_failure.base_authority_generation = failure_round.base_authority_generation;
+			first_failure.authority_generation = failure_round.authority_generation;
+			first_failure.assertion_sequence = failure_round.ref.acquisition_generation;
 			first_failure.round_terminal = failure_round.terminal != 0;
 			first_failure.round_phase = failure_round.round_phase;
-			first_failure.round_progress_flags
-				= failure_round.progress_flags;
+			first_failure.round_progress_flags = failure_round.progress_flags;
 		}
 		gcs_block_resource_x_first_failure_record(&first_failure);
 		first_failure_recorded = true;
@@ -16403,10 +15345,11 @@ gcs_block_resource_x_target_eviction_recheck_result(const BufferTag *tag,
  * exact X+REVOKING residency.  Entry-local EVICTING is lifecycle ownership,
  * never authority; every failure before local commit drops it exactly. */
 ResourceXApplyResult
-cluster_gcs_resource_x_target_evict_prepare_exact(
-	const BufferTag *tag, const ClusterPcmOwnSnapshot *exact_x,
-	uint64 r4_record_generation, uint64 reservation_token,
-	ResourceXTargetEvictionPlan *plan_out)
+cluster_gcs_resource_x_target_evict_prepare_exact(const BufferTag *tag,
+												  const ClusterPcmOwnSnapshot *exact_x,
+												  uint64 r4_record_generation,
+												  uint64 reservation_token,
+												  ResourceXTargetEvictionPlan *plan_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -16428,26 +15371,21 @@ cluster_gcs_resource_x_target_evict_prepare_exact(
 
 	if (plan_out != NULL)
 		memset(plan_out, 0, sizeof(*plan_out));
-	if (tag == NULL || exact_x == NULL || plan_out == NULL
-		|| !BufferTagsEqual(tag, &exact_x->tag)
-		|| exact_x->pcm_state != (uint8)PCM_STATE_X
-		|| exact_x->flags != PCM_OWN_FLAG_REVOKING
-		|| exact_x->generation == 0 || exact_x->generation == UINT64_MAX
-		|| reservation_token == 0 || reservation_token == UINT64_MAX
-		|| exact_x->reservation_token != reservation_token
-		|| exact_x->writer_activation_token != 0
-		|| exact_x->resource_x_activation_generation != 0
-		|| r4_record_generation == 0
-		|| r4_record_generation == UINT64_MAX || MyProc == NULL)
+	if (tag == NULL || exact_x == NULL || plan_out == NULL || !BufferTagsEqual(tag, &exact_x->tag)
+		|| exact_x->pcm_state != (uint8)PCM_STATE_X || exact_x->flags != PCM_OWN_FLAG_REVOKING
+		|| exact_x->generation == 0 || exact_x->generation == UINT64_MAX || reservation_token == 0
+		|| reservation_token == UINT64_MAX || exact_x->reservation_token != reservation_token
+		|| exact_x->writer_activation_token != 0 || exact_x->resource_x_activation_generation != 0
+		|| r4_record_generation == 0 || r4_record_generation == UINT64_MAX || MyProc == NULL)
 		return RESOURCE_X_APPLY_INVALID;
 	memset(&admission, 0, sizeof(admission));
 	memset(&gate, 0, sizeof(gate));
 	memset(&release, 0, sizeof(release));
 	memset(&owner, 0, sizeof(owner));
 	memset((void *)&cleanup_owner, 0, sizeof(cleanup_owner));
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (admission.record_generation != r4_record_generation) {
@@ -16472,21 +15410,17 @@ cluster_gcs_resource_x_target_evict_prepare_exact(
 			result = gcs_block_resource_x_target_peer_result_exact(&admission, master_node,
 																   sender_connection_generation);
 		if (result == RESOURCE_X_APPLY_APPLIED)
-			result
-				= cluster_pcm_lock_resource_x_target_evict_prepare_exact(
-					tag, master_node, gate.formation, master_session,
-					r4_record_generation, exact_x->generation,
-					reservation_token, sender_connection_generation,
-					(int32)MyProc->pgprocno, &release, &owner);
-		if (result == RESOURCE_X_APPLY_APPLIED
-			|| result == RESOURCE_X_APPLY_DUPLICATE) {
+			result = cluster_pcm_lock_resource_x_target_evict_prepare_exact(
+				tag, master_node, gate.formation, master_session, r4_record_generation,
+				exact_x->generation, reservation_token, sender_connection_generation,
+				(int32)MyProc->pgprocno, &release, &owner);
+		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
 			memcpy((void *)&cleanup_owner, &owner, sizeof(owner));
 			owner_claimed = true;
 		}
 		if (owner_claimed
-			&& (!cluster_resource_x_wire_encode(
-					RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &release,
-					payload, sizeof(payload), &payload_bytes, &reject)
+			&& (!cluster_resource_x_wire_encode(RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, &release,
+												payload, sizeof(payload), &payload_bytes, &reject)
 				|| payload_bytes != RESOURCE_X_CONTROL_V1_BYTES
 				|| release.kind != RESOURCE_X_WIRE_RELEASE_X))
 			result = RESOURCE_X_APPLY_INVALID;
@@ -16496,25 +15430,20 @@ cluster_gcs_resource_x_target_evict_prepare_exact(
 			if (recheck_result != RESOURCE_X_APPLY_APPLIED)
 				result = recheck_result;
 		}
-		if (result == RESOURCE_X_APPLY_APPLIED
-			|| result == RESOURCE_X_APPLY_DUPLICATE) {
+		if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE) {
 			plan_out->release = release;
 			plan_out->owner = owner;
 			plan_out->gate = gate;
 			plan_out->tag = *tag;
 			plan_out->cached_ownership_generation = exact_x->generation;
 			plan_out->r4_record_generation = r4_record_generation;
-			plan_out->sender_connection_generation
-				= sender_connection_generation;
+			plan_out->sender_connection_generation = sender_connection_generation;
 			plan_out->master_node = master_node;
 			plan_out->payload_bytes = payload_bytes;
 			memcpy(plan_out->release_payload, payload, payload_bytes);
 			plan_out->prepared = true;
-		}
-		else if (owner_claimed) {
-			abort_result
-				= cluster_pcm_lock_resource_x_target_evict_abort_exact(
-					&owner);
+		} else if (owner_claimed) {
+			abort_result = cluster_pcm_lock_resource_x_target_evict_abort_exact(&owner);
 			if (abort_result != RESOURCE_X_APPLY_APPLIED)
 				result = RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 		}
@@ -16524,11 +15453,8 @@ cluster_gcs_resource_x_target_evict_prepare_exact(
 		if (owner_claimed) {
 			ResourceXLocalOwnerHandle catch_owner;
 
-			memcpy(&catch_owner, (const void *)&cleanup_owner,
-				sizeof(catch_owner));
-			abort_result
-				= cluster_pcm_lock_resource_x_target_evict_abort_exact(
-					&catch_owner);
+			memcpy(&catch_owner, (const void *)&cleanup_owner, sizeof(catch_owner));
+			abort_result = cluster_pcm_lock_resource_x_target_evict_abort_exact(&catch_owner);
 			if (abort_result != RESOURCE_X_APPLY_APPLIED)
 				gcs_block_resource_x_fail_closed_current();
 		}
@@ -16569,9 +15495,9 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 	master_session = plan->release.common.master_session_incarnation;
 	memset(&admission, 0, sizeof(admission));
 	memset(&master_snapshot, 0, sizeof(master_snapshot));
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK)
 		return RESOURCE_X_APPLY_BAD_STATE;
 	if (admission.record_generation != plan->r4_record_generation) {
@@ -16592,16 +15518,14 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 					&plan->release, cluster_node_id, &master_snapshot);
 			else {
 				result = cluster_grd_outbound_enqueue_backend_msg(
-					RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE,
-					(uint32)plan->master_node, plan->release_payload,
-					plan->payload_bytes)
-					? RESOURCE_X_APPLY_APPLIED
-					: RESOURCE_X_APPLY_BAD_STATE;
+							 RESOURCE_X_MSG_SETTLEMENT_OR_RELEASE, (uint32)plan->master_node,
+							 plan->release_payload, plan->payload_bytes)
+							 ? RESOURCE_X_APPLY_APPLIED
+							 : RESOURCE_X_APPLY_BAD_STATE;
 				if (result == RESOURCE_X_APPLY_BAD_STATE)
 					*retry_pending_out = true;
 			}
-			if (result == RESOURCE_X_APPLY_APPLIED
-				|| result == RESOURCE_X_APPLY_DUPLICATE)
+			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 				plan->release_admitted = true;
 		} else if (result == RESOURCE_X_APPLY_APPLIED)
 			result = RESOURCE_X_APPLY_DUPLICATE;
@@ -16615,15 +15539,12 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 			if (recheck_result == RESOURCE_X_APPLY_BAD_STATE)
 				*retry_pending_out = true;
 		}
-		if ((result == RESOURCE_X_APPLY_APPLIED
-				 || result == RESOURCE_X_APPLY_DUPLICATE)
+		if ((result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 			&& plan->release_admitted) {
 			result = cluster_pcm_lock_resource_x_target_evict_commit_exact(
-				&plan->release, plan->master_node,
-				plan->r4_record_generation,
+				&plan->release, plan->master_node, plan->r4_record_generation,
 				plan->cached_ownership_generation, &plan->owner);
-			if (result == RESOURCE_X_APPLY_APPLIED
-				|| result == RESOURCE_X_APPLY_DUPLICATE)
+			if (result == RESOURCE_X_APPLY_APPLIED || result == RESOURCE_X_APPLY_DUPLICATE)
 				plan->prepared = false;
 		}
 	}
@@ -16640,8 +15561,7 @@ cluster_gcs_resource_x_target_evict_publish_exact(ResourceXTargetEvictionPlan *p
 /* PREPARE is reversible only until BufferDesc has committed X->N and before
  * transport/apply owns the frozen release. */
 ResourceXApplyResult
-cluster_gcs_resource_x_target_evict_abort_exact(
-	ResourceXTargetEvictionPlan *plan)
+cluster_gcs_resource_x_target_evict_abort_exact(ResourceXTargetEvictionPlan *plan)
 {
 	ResourceXApplyResult result;
 
@@ -16649,8 +15569,7 @@ cluster_gcs_resource_x_target_evict_abort_exact(
 		return RESOURCE_X_APPLY_INVALID;
 	if (plan->local_n_committed || plan->release_admitted)
 		return RESOURCE_X_APPLY_BAD_STATE;
-	result = cluster_pcm_lock_resource_x_target_evict_abort_exact(
-		&plan->owner);
+	result = cluster_pcm_lock_resource_x_target_evict_abort_exact(&plan->owner);
 	if (result == RESOURCE_X_APPLY_APPLIED) {
 		plan->prepared = false;
 		memset(&plan->owner, 0, sizeof(plan->owner));
@@ -16659,19 +15578,19 @@ cluster_gcs_resource_x_target_evict_abort_exact(
 }
 
 ResourceXApplyResult
-cluster_gcs_resource_x_target_acquire_exact(
-	BufferDesc *buf, uint64 r4_record_generation,
-	ResourceXAcquisitionRef *ref_out)
+cluster_gcs_resource_x_target_acquire_exact(BufferDesc *buf, uint64 r4_record_generation,
+											ResourceXAcquisitionRef *ref_out)
 {
 	return gcs_block_resource_x_target_acquire_internal(buf, NULL, r4_record_generation, 0, 0,
 														false, NULL, NULL, NULL, ref_out);
 }
 
 ResourceXApplyResult
-cluster_gcs_resource_x_target_acquire_until_exact(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	uint64 r4_record_generation,
-	uint64 *absolute_deadline_us_io, ResourceXAcquisitionRef *ref_out)
+cluster_gcs_resource_x_target_acquire_until_exact(BufferDesc *buf,
+												  const BufferTag *expected_resource,
+												  uint64 r4_record_generation,
+												  uint64 *absolute_deadline_us_io,
+												  ResourceXAcquisitionRef *ref_out)
 {
 	if (expected_resource == NULL || absolute_deadline_us_io == NULL)
 		return RESOURCE_X_APPLY_INVALID;
@@ -16729,11 +15648,11 @@ cluster_gcs_resource_x_target_direct_init_acquire_exact(
 }
 
 ResourceXApplyResult
-cluster_gcs_resource_x_target_direct_init_join_exact(
-	BufferDesc *buf, const BufferTag *expected_resource,
-	uint64 direct_init_ownership_generation,
-	uint64 direct_init_reservation_token,
-	ResourceXAcquisitionRef *ref_out)
+cluster_gcs_resource_x_target_direct_init_join_exact(BufferDesc *buf,
+													 const BufferTag *expected_resource,
+													 uint64 direct_init_ownership_generation,
+													 uint64 direct_init_reservation_token,
+													 ResourceXAcquisitionRef *ref_out)
 {
 	if (expected_resource == NULL || direct_init_reservation_token == 0)
 		return RESOURCE_X_APPLY_INVALID;
@@ -16752,13 +15671,10 @@ cluster_gcs_resource_x_target_context_recheck_result_exact(const ResourceXWriter
 	uint64 writer_generation = 0;
 	int32 master_node = -1;
 
-	if (context == NULL
-		|| context->r4_record_generation == 0
-		|| context->r4_record_generation == UINT64_MAX
-		|| context->buffer_ownership_generation == 0
+	if (context == NULL || context->r4_record_generation == 0
+		|| context->r4_record_generation == UINT64_MAX || context->buffer_ownership_generation == 0
 		|| context->buffer_ownership_generation == UINT64_MAX
-		|| context->writer_activation_token != 0
-		|| context->resource_x_activation_generation != 0)
+		|| context->writer_activation_token != 0 || context->resource_x_activation_generation != 0)
 		return RESOURCE_X_APPLY_INVALID;
 	writer_path = cluster_resource_x_writer_path_snapshot(&writer_generation);
 	if (writer_path != RESOURCE_X_WRITER_TARGET
@@ -16800,19 +15716,14 @@ gcs_block_resource_x_target_recycle_inputs_result_exact(const ResourceXWriterUse
 	uint64 writer_generation = 0;
 
 	if (context == NULL || observed == NULL
-		|| !BufferTagsEqual(
-			&context->ref.assertion.resource, &observed->tag)
-		|| context->buffer_ownership_generation
-			!= observed->generation
-		|| observed->reservation_token == 0
-		|| observed->reservation_token == UINT64_MAX
-		|| observed->pcm_state != (uint8)PCM_STATE_X
-		|| observed->flags != 0
+		|| !BufferTagsEqual(&context->ref.assertion.resource, &observed->tag)
+		|| context->buffer_ownership_generation != observed->generation
+		|| observed->reservation_token == 0 || observed->reservation_token == UINT64_MAX
+		|| observed->pcm_state != (uint8)PCM_STATE_X || observed->flags != 0
 		|| observed->writer_activation_token != 0
 		|| observed->resource_x_activation_generation != 0)
 		return RESOURCE_X_APPLY_STALE;
-	writer_path = cluster_resource_x_writer_path_snapshot(
-		&writer_generation);
+	writer_path = cluster_resource_x_writer_path_snapshot(&writer_generation);
 	if (writer_path != RESOURCE_X_WRITER_TARGET
 		|| writer_generation != context->r4_record_generation)
 		return RESOURCE_X_APPLY_STALE;
@@ -16827,10 +15738,9 @@ gcs_block_resource_x_target_recycle_inputs_result_exact(const ResourceXWriterUse
 }
 
 ResourceXApplyResult
-cluster_gcs_resource_x_target_itl_recycle_begin_exact(
-	const ResourceXWriterUseContext *context,
-	const ClusterPcmOwnSnapshot *observed,
-	ResourceXLocalOwnerHandle *handle_out)
+cluster_gcs_resource_x_target_itl_recycle_begin_exact(const ResourceXWriterUseContext *context,
+													  const ClusterPcmOwnSnapshot *observed,
+													  ResourceXLocalOwnerHandle *handle_out)
 {
 	ResourceXGateSnapshot gate;
 	ResourceXApplyResult cancel_result;
@@ -16852,8 +15762,7 @@ cluster_gcs_resource_x_target_itl_recycle_begin_exact(
 		return result;
 	result = cluster_pcm_lock_resource_x_itl_recycle_begin_exact(
 		&context->ref, master_session, context->r4_record_generation,
-		context->buffer_ownership_generation,
-		observed->reservation_token, (int32)MyProc->pgprocno,
+		context->buffer_ownership_generation, observed->reservation_token, (int32)MyProc->pgprocno,
 		gcs_block_pcm_x_monotonic_us(), handle_out);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
@@ -16861,17 +15770,15 @@ cluster_gcs_resource_x_target_itl_recycle_begin_exact(
 															  &gate, master_node, master_session);
 	if (result == RESOURCE_X_APPLY_APPLIED)
 		return RESOURCE_X_APPLY_APPLIED;
-	cancel_result = cluster_pcm_lock_resource_x_itl_recycle_cancel_exact(
-		handle_out);
+	cancel_result = cluster_pcm_lock_resource_x_itl_recycle_cancel_exact(handle_out);
 	memset(handle_out, 0, sizeof(*handle_out));
 	return cancel_result == RESOURCE_X_APPLY_APPLIED ? result : RESOURCE_X_APPLY_RECOVERY_BLOCKED;
 }
 
 ResourceXApplyResult
-cluster_gcs_resource_x_target_itl_recycle_finish_exact(
-	const ResourceXWriterUseContext *context,
-	const ClusterPcmOwnSnapshot *observed,
-	const ResourceXLocalOwnerHandle *handle)
+cluster_gcs_resource_x_target_itl_recycle_finish_exact(const ResourceXWriterUseContext *context,
+													   const ClusterPcmOwnSnapshot *observed,
+													   const ResourceXLocalOwnerHandle *handle)
 {
 	ResourceXGateSnapshot gate;
 	ResourceXApplyResult result;
@@ -16900,13 +15807,12 @@ cluster_gcs_resource_x_target_itl_recycle_finish_exact(
 															  &gate, master_node, master_session);
 	if (result != RESOURCE_X_APPLY_APPLIED)
 		return result;
-	return cluster_pcm_lock_resource_x_itl_recycle_finish_exact(
-		handle, gcs_block_pcm_x_monotonic_us());
+	return cluster_pcm_lock_resource_x_itl_recycle_finish_exact(handle,
+																gcs_block_pcm_x_monotonic_us());
 }
 
 ResourceXApplyResult
-cluster_gcs_resource_x_target_itl_recycle_cancel_exact(
-	const ResourceXLocalOwnerHandle *handle)
+cluster_gcs_resource_x_target_itl_recycle_cancel_exact(const ResourceXLocalOwnerHandle *handle)
 {
 	return cluster_pcm_lock_resource_x_itl_recycle_cancel_exact(handle);
 }
@@ -16970,8 +15876,7 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	cluster_sf_dep_vec_reset(&sf_dep_vec);
 	memset(&s_barrier_authority_before, 0, sizeof(s_barrier_authority_before));
 	memset(&s_barrier_authority_after, 0, sizeof(s_barrier_authority_after));
-	if (cluster_authority_readiness_managed()
-		&& !cluster_serving_ready_is_current())
+	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
 		return;
 	if (gcs_block_try_resource_x_frame(env, payload))
 		return;
@@ -16999,21 +15904,17 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	master_gate_in_quorum = cluster_qvotec_in_quorum();
 	master_gate_member = cluster_membership_is_member(cluster_node_id);
 	master_gate_join_active = cluster_grd_join_remaster_active_for_shard(req->tag);
-	master_gate_join_rebuilt
-		= !master_gate_join_active || cluster_grd_block_view_rebuilt(req->tag);
+	master_gate_join_rebuilt = !master_gate_join_active || cluster_grd_block_view_rebuilt(req->tag);
 	if (!master_gate_in_quorum || !master_gate_member || !master_gate_join_rebuilt) {
 		ereport(LOG,
 				(errmsg_internal("GCS block recovering master-gate diagnostic"),
 				 errdetail_internal("node=%d sender=%d tag=%u/%u/%u/%u in_quorum=%d "
-								"member=%d join_active=%d join_rebuilt=%d",
-								cluster_node_id, req->sender_node, req->tag.spcOid,
-								req->tag.dbOid,
-								(unsigned int)BufTagGetRelNumber(&req->tag),
-								(unsigned int)req->tag.blockNum,
-								master_gate_in_quorum ? 1 : 0,
-								master_gate_member ? 1 : 0,
-								master_gate_join_active ? 1 : 0,
-								master_gate_join_rebuilt ? 1 : 0)));
+									"member=%d join_active=%d join_rebuilt=%d",
+									cluster_node_id, req->sender_node, req->tag.spcOid,
+									req->tag.dbOid, (unsigned int)BufTagGetRelNumber(&req->tag),
+									(unsigned int)req->tag.blockNum, master_gate_in_quorum ? 1 : 0,
+									master_gate_member ? 1 : 0, master_gate_join_active ? 1 : 0,
+									master_gate_join_rebuilt ? 1 : 0)));
 		cluster_grd_inc_join_block_failclosed();
 		gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
 							 InvalidXLogRecPtr, NULL);
@@ -17038,21 +15939,18 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 		if (resource_phase == GCS_BLOCK_RECOVERING) {
 			int static_master = cluster_gcs_lookup_master_static(req->tag);
 			int peer_state = static_master == cluster_node_id
-				? (int)CLUSTER_CSSD_PEER_ALIVE
-				: (int)cluster_cssd_get_peer_state(static_master);
+								 ? (int)CLUSTER_CSSD_PEER_ALIVE
+								 : (int)cluster_cssd_get_peer_state(static_master);
 
 			ereport(LOG,
 					(errmsg_internal("GCS block recovering phase-gate diagnostic"),
 					 errdetail_internal("node=%d sender=%d tag=%u/%u/%u/%u "
-									"static_master=%d peer_state=%d recovery_in_progress=%d",
-									cluster_node_id, req->sender_node, req->tag.spcOid,
-									req->tag.dbOid,
-									(unsigned int)BufTagGetRelNumber(&req->tag),
-									(unsigned int)req->tag.blockNum, static_master,
-									peer_state,
-									cluster_grd_recovery_in_progress() ? 1 : 0)));
-			gcs_block_send_reply(req->sender_node, req,
-								 GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
+										"static_master=%d peer_state=%d recovery_in_progress=%d",
+										cluster_node_id, req->sender_node, req->tag.spcOid,
+										req->tag.dbOid, (unsigned int)BufTagGetRelNumber(&req->tag),
+										(unsigned int)req->tag.blockNum, static_master, peer_state,
+										cluster_grd_recovery_in_progress() ? 1 : 0)));
+			gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_RESOURCE_RECOVERING,
 								 InvalidXLogRecPtr, NULL);
 			return;
 		}
@@ -17105,10 +16003,9 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	memset(&cached_entry, 0, sizeof(cached_entry));
 	if (req->transition_id == PCM_TRANS_N_TO_S) {
 		queue_pending_x_before = gcs_block_queue_pending_x_authoritative(req->tag);
-		resource_x_s_barrier_before =
-			cluster_gcs_block_resource_x_local_s_barrier_active(req->tag);
-		s_barrier_authority_before_valid = cluster_pcm_lock_authority_snapshot(
-			req->tag, &s_barrier_authority_before);
+		resource_x_s_barrier_before = cluster_gcs_block_resource_x_local_s_barrier_active(req->tag);
+		s_barrier_authority_before_valid
+			= cluster_pcm_lock_authority_snapshot(req->tag, &s_barrier_authority_before);
 	}
 
 	dr = cluster_gcs_block_dedup_lookup_or_register(
@@ -17130,24 +16027,21 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 	}
 	if (req->transition_id == PCM_TRANS_N_TO_S) {
 		queue_pending_x_after = gcs_block_queue_pending_x_authoritative(req->tag);
-		resource_x_s_barrier_after =
-			cluster_gcs_block_resource_x_local_s_barrier_active(req->tag);
-		s_barrier_authority_after_valid = cluster_pcm_lock_authority_snapshot(
-			req->tag, &s_barrier_authority_after);
+		resource_x_s_barrier_after = cluster_gcs_block_resource_x_local_s_barrier_active(req->tag);
+		s_barrier_authority_after_valid
+			= cluster_pcm_lock_authority_snapshot(req->tag, &s_barrier_authority_after);
 		s_barrier_read_action = gcs_block_s_barrier_read_action_exact(
-			queue_pending_x_before, queue_pending_x_after,
-			resource_x_s_barrier_before, resource_x_s_barrier_after,
-			&s_barrier_authority_before, s_barrier_authority_before_valid,
-			&s_barrier_authority_after, s_barrier_authority_after_valid,
-			req->sender_node);
+			queue_pending_x_before, queue_pending_x_after, resource_x_s_barrier_before,
+			resource_x_s_barrier_after, &s_barrier_authority_before,
+			s_barrier_authority_before_valid, &s_barrier_authority_after,
+			s_barrier_authority_after_valid, req->sender_node);
 		/* A cached durable S grant cannot be reinterpreted as the narrow
 		 * image-only exception after a native head appears. */
 		if (s_barrier_read_action == GCS_BLOCK_S_BARRIER_IMAGE_ONLY
 			&& dr == GCS_BLOCK_DEDUP_CACHED_REPLY
 			&& cached_entry.status != (uint8)GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
 			s_barrier_read_action = GCS_BLOCK_S_BARRIER_DENY;
-		s_barrier_read_image_only =
-			s_barrier_read_action == GCS_BLOCK_S_BARRIER_IMAGE_ONLY;
+		s_barrier_read_image_only = s_barrier_read_action == GCS_BLOCK_S_BARRIER_IMAGE_ONLY;
 	}
 
 	/* Check both sides of registration.  A legacy queue claim or exact
@@ -17222,15 +16116,14 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				return; /* malformed dedup entry; silent drop */
 			if (!cluster_pcm_lock_authority_snapshot(req->tag, &authority)
 				|| !gcs_block_forward_replay_authority_exact(
-					(GcsBlockReplyStatus)cached_entry.status, req->transition_id,
-					holder_node, req->sender_node, &authority)
+					(GcsBlockReplyStatus)cached_entry.status, req->transition_id, holder_node,
+					req->sender_node, &authority)
 				|| (s_barrier_read_image_only
-					&& memcmp(&authority, &s_barrier_authority_after,
-							  sizeof(authority)) != 0)) {
+					&& memcmp(&authority, &s_barrier_authority_after, sizeof(authority)) != 0)) {
 				cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
 				gcs_block_send_reply(req->sender_node, req,
-								 GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER,
-								 InvalidXLogRecPtr, NULL);
+									 GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER, InvalidXLogRecPtr,
+									 NULL);
 				return;
 			}
 			if (gcs_block_deny_direct_armed_forward_request(req))
@@ -17267,16 +16160,14 @@ cluster_gcs_handle_block_request_envelope(const ClusterICEnvelope *env, const vo
 				/* A reply-13 marker is image-only.  In particular, replay never
 				 * upgrades an earlier one-shot route into a durable X->S request. */
 				if (s_barrier_read_image_only
-					&& !cluster_pcm_lock_authority_matches(
-						req->tag, &s_barrier_authority_after)) {
+					&& !cluster_pcm_lock_authority_matches(req->tag, &s_barrier_authority_after)) {
 					cluster_gcs_block_dedup_remove(dedup_worker_id, &key);
-					gcs_block_send_reply(req->sender_node, req,
-						GCS_BLOCK_REPLY_DENIED_PENDING_X,
-						InvalidXLogRecPtr, NULL);
+					gcs_block_send_reply(req->sender_node, req, GCS_BLOCK_REPLY_DENIED_PENDING_X,
+										 InvalidXLogRecPtr, NULL);
 					return;
 				}
-				fwd_rc = cluster_ic_send_envelope(
-					PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd, sizeof(fwd));
+				fwd_rc = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, holder_node, &fwd,
+												  sizeof(fwd));
 
 				cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, fwd_rc);
 				if (fwd_rc == CLUSTER_IC_SEND_DONE || fwd_rc == CLUSTER_IC_SEND_WOULD_BLOCK) {
@@ -18029,11 +16920,9 @@ x_path_skipped:
 		local_resident = cluster_bufmgr_probe_block_for_gcs(req->tag);
 		holder_node = cluster_pcm_master_holder_node_by_tag(req->tag);
 		if (s_barrier_read_image_only) {
-			if (!cluster_pcm_lock_authority_matches(
-					req->tag, &s_barrier_authority_after)) {
+			if (!cluster_pcm_lock_authority_matches(req->tag, &s_barrier_authority_after)) {
 				status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
-				pg_atomic_fetch_add_u64(
-					&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+				pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
 				goto build_and_send_reply;
 			}
 			pre_state = (PcmLockMode)s_barrier_authority_after.state;
@@ -18077,15 +16966,11 @@ x_path_skipped:
 				 * the requester's cached S copy locally.  Refusal (active ITL /
 				 * state raced / flush unavailable) keeps today's one-shot ship.
 				 */
-				resource_x_successor_result
-					= cluster_pcm_lock_resource_x_current_x_successor_exact(
-						&req->tag, cluster_node_id,
-						&resource_x_preserve_current_x);
+				resource_x_successor_result = cluster_pcm_lock_resource_x_current_x_successor_exact(
+					&req->tag, cluster_node_id, &resource_x_preserve_current_x);
 				if (!s_barrier_read_image_only && cluster_read_scache
-					&& (resource_x_successor_result
-							== RESOURCE_X_APPLY_NOT_FOUND
-						|| (resource_x_successor_result
-								== RESOURCE_X_APPLY_APPLIED
+					&& (resource_x_successor_result == RESOURCE_X_APPLY_NOT_FOUND
+						|| (resource_x_successor_result == RESOURCE_X_APPLY_APPLIED
 							&& !resource_x_preserve_current_x))) {
 					local_downgrade_outcome = cluster_bufmgr_downgrade_x_to_s_for_gcs_prepare_image(
 						req->tag, &page_lsn, block_buf, NULL);
@@ -18116,8 +17001,7 @@ x_path_skipped:
 				cluster_xp_abort(&xp_ship);
 				if (s_barrier_read_image_only) {
 					status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
-					pg_atomic_fetch_add_u64(
-						&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
 					goto build_and_send_reply;
 				}
 				/* Evict race — fall through to the fail-closed master flow. */
@@ -18159,26 +17043,20 @@ x_path_skipped:
 				 * falls back to the read-image ship on refusal; with the GUC
 				 * off this is the pre-㉕ one-shot (counted for D0 ceiling). */
 				resource_x_preserve_current_x = false;
-				resource_x_successor_result
-					= cluster_pcm_lock_resource_x_current_x_successor_exact(
-						&req->tag, holder_node,
-						&resource_x_preserve_current_x);
+				resource_x_successor_result = cluster_pcm_lock_resource_x_current_x_successor_exact(
+					&req->tag, holder_node, &resource_x_preserve_current_x);
 				if (!s_barrier_read_image_only && cluster_read_scache
-					&& (resource_x_successor_result
-							== RESOURCE_X_APPLY_NOT_FOUND
-						|| (resource_x_successor_result
-								== RESOURCE_X_APPLY_APPLIED
+					&& (resource_x_successor_result == RESOURCE_X_APPLY_NOT_FOUND
+						|| (resource_x_successor_result == RESOURCE_X_APPLY_APPLIED
 							&& !resource_x_preserve_current_x)))
 					GcsBlockForwardPayloadSetDowngradeRequest(&fwd, true);
 				else
 					cluster_lever_a_note_fwd_oneshot();
 
 				if (s_barrier_read_image_only
-					&& !cluster_pcm_lock_authority_matches(
-						req->tag, &s_barrier_authority_after)) {
+					&& !cluster_pcm_lock_authority_matches(req->tag, &s_barrier_authority_after)) {
 					status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
-					pg_atomic_fetch_add_u64(
-						&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
 					goto build_and_send_reply;
 				}
 
@@ -18201,8 +17079,7 @@ x_path_skipped:
 				}
 				if (s_barrier_read_image_only) {
 					status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
-					pg_atomic_fetch_add_u64(
-						&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+					pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
 					goto build_and_send_reply;
 				}
 				/* Forward send failed — fall through to the fail-closed flow. */
@@ -18212,8 +17089,7 @@ x_path_skipped:
 		}
 		if (s_barrier_read_image_only) {
 			status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
-			pg_atomic_fetch_add_u64(
-				&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
 			goto build_and_send_reply;
 		}
 
@@ -18513,28 +17389,23 @@ build_and_send_reply: {
 	char *buf;
 	GcsBlockReplyHeader *hdr;
 
-	if (s_barrier_read_image_only
-		&& status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
-		&& !cluster_pcm_lock_authority_matches(
-			req->tag, &s_barrier_authority_after)) {
-		gcs_block_release_ship_image(block_payload_release_cb,
-			block_payload_release_arg);
+	if (s_barrier_read_image_only && status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER
+		&& !cluster_pcm_lock_authority_matches(req->tag, &s_barrier_authority_after)) {
+		gcs_block_release_ship_image(block_payload_release_cb, block_payload_release_arg);
 		block_payload = NULL;
 		block_payload_lkey = 0;
 		block_payload_release_cb = NULL;
 		block_payload_release_arg = NULL;
 		page_lsn = InvalidXLogRecPtr;
 		status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
-		pg_atomic_fetch_add_u64(
-			&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
+		pg_atomic_fetch_add_u64(&ClusterGcsBlock->starvation_denied_pending_x_count, 1);
 	}
 	has_block_payload
-		= (status == GCS_BLOCK_REPLY_GRANTED
-		   || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
+		= (status == GCS_BLOCK_REPLY_GRANTED || status == GCS_BLOCK_REPLY_READ_IMAGE_FROM_XHOLDER)
 		  && block_payload != NULL;
 	send_sf_dep = sf_dep_valid && has_block_payload;
-	header_len = send_sf_dep ? (uint32)sizeof(GcsBlockReplyHeaderV2)
-							 : (uint32)sizeof(GcsBlockReplyHeader);
+	header_len
+		= send_sf_dep ? (uint32)sizeof(GcsBlockReplyHeaderV2) : (uint32)sizeof(GcsBlockReplyHeader);
 	total = header_len + GCS_BLOCK_DATA_SIZE;
 
 	buf = (char *)palloc0(total);
@@ -19138,20 +18009,18 @@ gcs_ctrc_dispatch_prepare(const ClusterCtrcCloseDispatch *dispatch,
 	uint64 participant_observed_generation = 0;
 	uint64 self_incarnation;
 	uint32 required_capabilities
-		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
-		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
 	bool participant_current;
 
 	MemSet(admission, 0, sizeof(*admission));
 	MemSet(&logical, 0, sizeof(logical));
 	MemSet(&root, 0, sizeof(root));
 	if (dispatch == NULL || dispatch->reserved32 != 0
-		|| memcmp(dispatch->reserved8,
-				  (const uint8[sizeof(dispatch->reserved8)]){0},
-				  sizeof(dispatch->reserved8)) != 0
+		|| memcmp(dispatch->reserved8, (const uint8[sizeof(dispatch->reserved8)]){ 0 },
+				  sizeof(dispatch->reserved8))
+			   != 0
 		|| (dispatch->suboperation != CTRC_SEAL_CLOSE_AND_CLEAN
-			&& dispatch->suboperation
-			   != CTRC_SEAL_CERTIFICATE_COMMITTED)
+			&& dispatch->suboperation != CTRC_SEAL_CERTIFICATE_COMMITTED)
 		|| dispatch->request_id == 0 || dispatch->grant_generation == 0
 		|| dispatch->seal_generation == 0 || cluster_node_id < 0
 		|| dispatch->key.origin_node_id != (uint16)cluster_node_id
@@ -19161,15 +18030,13 @@ gcs_ctrc_dispatch_prepare(const ClusterCtrcCloseDispatch *dispatch,
 		|| dispatch->participant.capability_record_generation == 0
 		|| dispatch->key.cluster_epoch != cluster_epoch_get_current()
 		|| dispatch->key.system_identifier != GetSystemIdentifier()
-		|| dispatch->key.formation_epoch
-		   != dispatch->participant.formation_epoch
+		|| dispatch->key.formation_epoch != dispatch->participant.formation_epoch
 		|| dispatch->key.admission_record_generation
-		   != dispatch->participant.admission_record_generation
+			   != dispatch->participant.admission_record_generation
 		|| !cluster_gcs_block_family_on_data_plane()
 		|| !cluster_membership_is_member(cluster_node_id)
 		|| !cluster_membership_is_member(dispatch->participant.node_id)
-		|| (!cluster_write_fence_enforcing()
-			? false : !cluster_write_fence_allowed()))
+		|| (!cluster_write_fence_enforcing() ? false : !cluster_write_fence_allowed()))
 		return false;
 
 	self_incarnation = cluster_qvotec_get_self_incarnation();
@@ -19194,21 +18061,18 @@ gcs_ctrc_dispatch_prepare(const ClusterCtrcCloseDispatch *dispatch,
 									 == required_capabilities;
 	else
 		participant_current
-			= cluster_reconfig_get_observed_slot(
-				dispatch->participant.node_id, &participant_incarnation,
-				&participant_observed_generation)
-			  && participant_incarnation != 0
-			  && participant_observed_generation != 0
-			  && participant_incarnation
-				 == dispatch->participant.boot_incarnation
-			  && cluster_membership_get_last_admitted_incarnation(
-				dispatch->participant.node_id) == participant_incarnation
-			  && cluster_reconfig_get_observed_epoch(
-				dispatch->participant.node_id)
-				 == dispatch->key.formation_epoch
+			= cluster_reconfig_get_observed_slot(dispatch->participant.node_id,
+												 &participant_incarnation,
+												 &participant_observed_generation)
+			  && participant_incarnation != 0 && participant_observed_generation != 0
+			  && participant_incarnation == dispatch->participant.boot_incarnation
+			  && cluster_membership_get_last_admitted_incarnation(dispatch->participant.node_id)
+					 == participant_incarnation
+			  && cluster_reconfig_get_observed_epoch(dispatch->participant.node_id)
+					 == dispatch->key.formation_epoch
 			  && cluster_sf_peer_capability_generation_matches(
-				dispatch->participant.node_id, required_capabilities,
-				dispatch->participant.capability_record_generation);
+				  dispatch->participant.node_id, required_capabilities,
+				  dispatch->participant.capability_record_generation);
 	if (!participant_current)
 		return false;
 
@@ -19239,51 +18103,39 @@ cluster_gcs_ctrc_dispatch_close(const ClusterCtrcCloseDispatch *dispatch)
 	bool dispatched = false;
 
 	if (gcs_ctrc_dispatch_prepare(dispatch, &admission, request)) {
-		if (dispatch->participant.node_id == (uint16)cluster_node_id)
-		{
+		if (dispatch->participant.node_id == (uint16)cluster_node_id) {
 			ClusterCtrcLocalReleaseAckV1 ack;
 			ClusterCtrcSealReplyResult result;
 			uint16 first_reason = CTRC_SEAL_REASON_IDENTITY;
 
 			MemSet(&ack, 0, sizeof(ack));
 			result = cluster_ctrc_participant_request_shared(
-				&dispatch->key, &dispatch->participant,
-				dispatch->grant_generation, dispatch->seal_generation,
-				(ClusterCtrcSealSuboperation)dispatch->suboperation,
+				&dispatch->key, &dispatch->participant, dispatch->grant_generation,
+				dispatch->seal_generation, (ClusterCtrcSealSuboperation)dispatch->suboperation,
 				&first_reason, &ack);
-			if (cluster_semantic_activation_recheck_r4_terminal_census(
-					&admission))
-			{
-				if (dispatch->suboperation
-					== CTRC_SEAL_CERTIFICATE_COMMITTED)
-					dispatched
-						= cluster_ctrc_origin_note_certificate_reply_shared(
-							dispatch->request_id,
-							dispatch->participant.node_id, result);
+			if (cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
+				if (dispatch->suboperation == CTRC_SEAL_CERTIFICATE_COMMITTED)
+					dispatched = cluster_ctrc_origin_note_certificate_reply_shared(
+						dispatch->request_id, dispatch->participant.node_id, result);
 				else if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
-					dispatched = cluster_ctrc_origin_ack_land_shared(
-						dispatch->request_id, &ack);
+					dispatched = cluster_ctrc_origin_ack_land_shared(dispatch->request_id, &ack);
 				else
 					dispatched = cluster_ctrc_origin_note_close_reply_shared(
-						dispatch->request_id,
-						dispatch->participant.node_id, result);
+						dispatch->request_id, dispatch->participant.node_id, result);
 			}
-		}
-		else
-		{
+		} else {
 			BufferTag route_tag
 				= GcsBlockCurrentMxRouteTagMake(dispatch->request_id, dispatch->key.cluster_epoch,
 												cluster_node_id, CLUSTER_CTRC_INTERNAL_ENDPOINT);
 			int worker_id = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 			uint32 required_capabilities
 				= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
-			dispatched = worker_id >= 0
-				&& worker_id < cluster_lms_workers
-				&& cluster_lms_outbound_enqueue_cap_bound(
-					worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-					dispatch->participant.node_id, request,
-					sizeof(request), required_capabilities,
-					dispatch->participant.capability_record_generation);
+			dispatched
+				= worker_id >= 0 && worker_id < cluster_lms_workers
+				  && cluster_lms_outbound_enqueue_cap_bound(
+					  worker_id, PGRAC_IC_MSG_GCS_BLOCK_FORWARD, dispatch->participant.node_id,
+					  request, sizeof(request), required_capabilities,
+					  dispatch->participant.capability_record_generation);
 		}
 	}
 	if (admission.entered)
@@ -19345,7 +18197,8 @@ gcs_ctrc_dispatch_local_certificates(const ClusterCtrcCloseDispatch *dispatches,
 					(accepted_count - i) * sizeof(accepted_to_input[0]));
 		}
 		if (accepted_count != 0
-			&& cluster_ctrc_participant_certificate_batch_shared(accepted, accepted_count, results)) {
+			&& cluster_ctrc_participant_certificate_batch_shared(accepted, accepted_count,
+																 results)) {
 			Size reply_count = 0;
 
 			for (Size i = 0; i < accepted_count; i++)
@@ -19358,8 +18211,8 @@ gcs_ctrc_dispatch_local_certificates(const ClusterCtrcCloseDispatch *dispatches,
 			/* Every surviving token stays entered through the shared census.
 			 * Unsupported input shape retains the original per-item consumer. */
 			if (reply_count != 0
-				&& !cluster_ctrc_origin_note_local_certificate_batch_shared(
-					accepted, results, reply_count))
+				&& !cluster_ctrc_origin_note_local_certificate_batch_shared(accepted, results,
+																			reply_count))
 				for (Size i = 0; i < reply_count; i++)
 					if (cluster_semantic_activation_recheck_r4_terminal_census(
 							&admissions[accepted_to_input[i]]))
@@ -19505,8 +18358,7 @@ cluster_gcs_ctrc_dispatch_batch(const ClusterCtrcCloseDispatch *dispatches, Size
  * Reconstruct the exact staged CLOSE or certificate-notification request and
  * land it in the origin registry before any generic backend-id arithmetic. */
 static bool
-gcs_block_try_land_ctrc_reply(
-	const ClusterICEnvelope *env, const void *payload)
+gcs_block_try_land_ctrc_reply(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockReplyHeader *outer;
 	const uint8 *page;
@@ -19521,32 +18373,27 @@ gcs_block_try_land_ctrc_reply(
 	bool reserved_zero = true;
 	int i;
 
-	if (env == NULL || payload == NULL
-		|| env->payload_length < (uint32)sizeof(GcsBlockReplyHeader))
+	if (env == NULL || payload == NULL || env->payload_length < (uint32)sizeof(GcsBlockReplyHeader))
 		return false;
 	outer = (const GcsBlockReplyHeader *)payload;
-	if (outer->status
-		!= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT)
+	if (outer->status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT)
 		return false;
 	if (env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
 		|| env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE)
 		return true;
 	for (i = 0; i < (int)sizeof(outer->reserved_0); i++)
-		if (outer->reserved_0[i] != 0)
-		{
+		if (outer->reserved_0[i] != 0) {
 			reserved_zero = false;
 			break;
 		}
 	page = (const uint8 *)payload + sizeof(*outer);
-	if (!reserved_zero
-		|| env->source_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
+	if (!reserved_zero || env->source_node_id >= CLUSTER_CTRC_MAX_PARTICIPANTS
 		|| env->dest_node_id != (uint32)cluster_node_id
 		|| outer->sender_node != (int32)env->source_node_id
 		|| outer->requester_backend_id != CLUSTER_CTRC_INTERNAL_ENDPOINT
 		|| outer->transition_id != 0 || outer->page_lsn != 0
 		|| outer->epoch != cluster_epoch_get_current()
-		|| GcsBlockReplyHeaderGetForwardingMasterNode(outer)
-		   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+		|| GcsBlockReplyHeaderGetForwardingMasterNode(outer) != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
 		|| outer->checksum != gcs_block_compute_checksum((const char *)page))
 		return true;
 
@@ -19554,19 +18401,16 @@ gcs_block_try_land_ctrc_reply(
 	MemSet(&identity, 0, sizeof(identity));
 	MemSet(&decoded_ack, 0, sizeof(decoded_ack));
 	MemSet(&reply_header, 0, sizeof(reply_header));
-	if (!cluster_ctrc_origin_request_snapshot_shared(
-			outer->request_id, (uint16)env->source_node_id,
-			&key, &identity, &grant_generation, &seal_generation,
-			&suboperation)
+	if (!cluster_ctrc_origin_request_snapshot_shared(outer->request_id, (uint16)env->source_node_id,
+													 &key, &identity, &grant_generation,
+													 &seal_generation, &suboperation)
 		|| key.origin_node_id != (uint16)cluster_node_id
-		|| !cluster_ctrc_seal_request_encode(
-			&key, outer->request_id, grant_generation, seal_generation,
-			identity.capability_record_generation,
-			suboperation, request, sizeof(request))
-		|| !cluster_ctrc_seal_reply_decode(
-			page, GCS_BLOCK_DATA_SIZE, request, sizeof(request),
-			(int32)env->source_node_id, cluster_node_id,
-			&reply_header, &decoded_ack)
+		|| !cluster_ctrc_seal_request_encode(&key, outer->request_id, grant_generation,
+											 seal_generation, identity.capability_record_generation,
+											 suboperation, request, sizeof(request))
+		|| !cluster_ctrc_seal_reply_decode(page, GCS_BLOCK_DATA_SIZE, request, sizeof(request),
+										   (int32)env->source_node_id, cluster_node_id,
+										   &reply_header, &decoded_ack)
 		|| reply_header.request_id != outer->request_id
 		|| reply_header.cluster_epoch != outer->epoch
 		|| reply_header.source_node != outer->sender_node
@@ -19578,8 +18422,7 @@ gcs_block_try_land_ctrc_reply(
 			outer->request_id, (uint16)env->source_node_id,
 			(ClusterCtrcSealReplyResult)reply_header.result);
 	else if (reply_header.result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK)
-		(void)cluster_ctrc_origin_ack_land_shared(
-			outer->request_id, &decoded_ack);
+		(void)cluster_ctrc_origin_ack_land_shared(outer->request_id, &decoded_ack);
 	else
 		(void)cluster_ctrc_origin_note_close_reply_shared(
 			outer->request_id, (uint16)env->source_node_id,
@@ -19591,8 +18434,7 @@ gcs_block_try_land_ctrc_reply(
  * replies, but a disjoint slot domain and typed Spec-3.6b bodies.  Consume
  * every current-MX candidate here so it can never alias the legacy decoder. */
 static bool
-gcs_block_try_land_current_mx_reply(
-	const ClusterICEnvelope *env, const void *payload)
+gcs_block_try_land_current_mx_reply(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockReplyHeader *hdr;
 	const char *block_data;
@@ -19600,21 +18442,17 @@ gcs_block_try_land_current_mx_reply(
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
 
-	if (env == NULL || payload == NULL
-		|| env->payload_length < (uint32)sizeof(GcsBlockReplyHeader))
+	if (env == NULL || payload == NULL || env->payload_length < (uint32)sizeof(GcsBlockReplyHeader))
 		return false;
 	hdr = (const GcsBlockReplyHeader *)payload;
-	if (hdr->status
-		!= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
-		&& hdr->status
-			   != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT)
+	if (hdr->status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+		&& hdr->status != (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT)
 		return false;
 	if (env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_REPLY
 		|| env->payload_length != GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE)
 		return true;
 	backend_idx = hdr->requester_backend_id - 1;
-	if (backend_idx < 0 || backend_idx >= MaxBackends
-		|| gcs_block_backend_blocks == NULL)
+	if (backend_idx < 0 || backend_idx >= MaxBackends || gcs_block_backend_blocks == NULL)
 		return true;
 	blk = &gcs_block_backend_blocks[backend_idx];
 	block_data = ((const char *)payload) + sizeof(*hdr);
@@ -19622,10 +18460,8 @@ gcs_block_try_land_current_mx_reply(
 	LWLockAcquire(&blk->lock.lock, LW_EXCLUSIVE);
 	for (i = 0; i < MAX_OUTSTANDING_BLOCK_REQUESTS_PER_BACKEND; i++) {
 		ClusterGcsBlockOutstandingSlot *slot = &blk->slots[i];
-		ClusterCurrentMxMemberDesc scratch_members
-			[CLUSTER_CURRENT_MX_MAX_MEMBERS];
-		ClusterCurrentMemberProof scratch_proofs
-			[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
+		ClusterCurrentMxMemberDesc scratch_members[CLUSTER_CURRENT_MX_MAX_MEMBERS];
+		ClusterCurrentMemberProof scratch_proofs[CLUSTER_CURRENT_MX_MAX_PROOF_ASKS_PER_FRAME];
 		ClusterCurrentUpdaterProof scratch_updater;
 		uint16 scratch_count = 0;
 		uint32 scratch_capability_generation = 0;
@@ -19639,103 +18475,82 @@ gcs_block_try_land_current_mx_reply(
 
 		if (!slot->in_use || slot->request_id != hdr->request_id)
 			continue;
-		for (reserved_index = 0;
-			 reserved_index < (int)sizeof(hdr->reserved_0);
-			 reserved_index++)
+		for (reserved_index = 0; reserved_index < (int)sizeof(hdr->reserved_0); reserved_index++)
 			if (hdr->reserved_0[reserved_index] != 0) {
 				reserved_zero = false;
 				break;
 			}
-		outer_valid
-			= slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX
-			&& !slot->reply_received
-			&& slot->direct_state == GCS_BLOCK_DIRECT_UNARMED
-			&& !slot->direct_target_prepared
-			&& slot->expected_reply_status == hdr->status
-			&& env->source_node_id == (uint32)hdr->sender_node
-			&& env->dest_node_id == (uint32)cluster_node_id
-			&& hdr->sender_node == slot->expected_master_node
-			&& hdr->requester_backend_id == backend_idx + 1
-			&& hdr->epoch == slot->request_epoch
-			&& hdr->transition_id == 0 && hdr->page_lsn == 0
-			&& reserved_zero
-			&& GcsBlockReplyHeaderGetForwardingMasterNode(hdr)
-				   == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
-			&& hdr->checksum == gcs_block_compute_checksum(block_data);
+		outer_valid = slot->reply_domain == CLUSTER_GCS_BLOCK_REPLY_DOMAIN_CURRENT_MX
+					  && !slot->reply_received && slot->direct_state == GCS_BLOCK_DIRECT_UNARMED
+					  && !slot->direct_target_prepared && slot->expected_reply_status == hdr->status
+					  && env->source_node_id == (uint32)hdr->sender_node
+					  && env->dest_node_id == (uint32)cluster_node_id
+					  && hdr->sender_node == slot->expected_master_node
+					  && hdr->requester_backend_id == backend_idx + 1
+					  && hdr->epoch == slot->request_epoch && hdr->transition_id == 0
+					  && hdr->page_lsn == 0 && reserved_zero
+					  && GcsBlockReplyHeaderGetForwardingMasterNode(hdr)
+							 == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+					  && hdr->checksum == gcs_block_compute_checksum(block_data);
 		if (outer_valid) {
-			if (hdr->status
-					== (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
+			if (hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_DESCRIBE_RESULT
 				&& slot->expected_current_mx_key_valid) {
-				typed_result
-					= cluster_multixact_current_wire_validate_describe_reply(
-						block_data, GCS_BLOCK_DATA_SIZE,
-						slot->expected_master_node, slot->request_epoch,
-						slot->request_id, &slot->expected_current_mx_key,
-						scratch_members, lengthof(scratch_members),
-						&scratch_count, &scratch_total);
-				typed_valid = typed_result != CMX_DESC_UNKNOWN
-							  && typed_result != CMX_DESC_TIMEOUT;
-			} else if (hdr->status
-						   == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
+				typed_result = cluster_multixact_current_wire_validate_describe_reply(
+					block_data, GCS_BLOCK_DATA_SIZE, slot->expected_master_node,
+					slot->request_epoch, slot->request_id, &slot->expected_current_mx_key,
+					scratch_members, lengthof(scratch_members), &scratch_count, &scratch_total);
+				typed_valid = typed_result != CMX_DESC_UNKNOWN && typed_result != CMX_DESC_TIMEOUT;
+			} else if (hdr->status == (uint8)GCS_BLOCK_REPLY_CURRENT_MX_MEMBER_PROOF_RESULT
 					   && slot->expected_current_mx_proof_valid)
-				typed_valid
-					= cluster_multixact_current_wire_validate_proof_reply_frame(
-						block_data, GCS_BLOCK_DATA_SIZE,
-						slot->expected_master_node, slot->request_epoch,
-						&slot->expected_current_mx_proof, &proof_result,
-						scratch_proofs, lengthof(scratch_proofs),
-						&scratch_count, &scratch_updater,
-						&scratch_capability_generation);
+				typed_valid = cluster_multixact_current_wire_validate_proof_reply_frame(
+					block_data, GCS_BLOCK_DATA_SIZE, slot->expected_master_node,
+					slot->request_epoch, &slot->expected_current_mx_proof, &proof_result,
+					scratch_proofs, lengthof(scratch_proofs), &scratch_count, &scratch_updater,
+					&scratch_capability_generation);
 		}
 		if (!typed_valid) {
 			const ClusterCurrentMxDescribeReplyPage *describe_page
 				= (const ClusterCurrentMxDescribeReplyPage *)block_data;
 
-			ereport(LOG,
-					(errmsg("cluster_gcs_block: dropped stale current-MX reply"),
-					 errdetail("request_id=" UINT64_FORMAT
-							   " outer_valid=%d typed_result=%d domain=%u"
-							   " reply_received=%d direct_state=%d direct_prepared=%d"
-							   " expected_status=%u status=%u env_source=%u env_dest=%u"
-							   " expected_source=%d sender=%d backend=%d expected_backend=%d"
-							   " expected_epoch=" UINT64_FORMAT " epoch=" UINT64_FORMAT
-							   " transition=%u page_lsn=" UINT64_FORMAT
-							   " reserved_zero=%d forwarding_master=%d checksum_match=%d"
-							   " body_magic=%u body_version=%u body_kind=%u body_result=%u"
-							   " body_source=%u body_request=" UINT64_FORMAT
-							   " body_origin=%u body_mxid=%u body_epoch=%u"
-							   " expected_origin=%u expected_mxid=%u expected_key_epoch=%u"
-							   " body_entries=%u body_total=%u body_wire_length=%u",
-							 slot->request_id, outer_valid, (int)typed_result,
-							 (unsigned int)slot->reply_domain, slot->reply_received,
-							 (int)slot->direct_state, slot->direct_target_prepared,
-							 (unsigned int)slot->expected_reply_status,
-							 (unsigned int)hdr->status, env->source_node_id,
-							 env->dest_node_id, slot->expected_master_node,
-							 hdr->sender_node, hdr->requester_backend_id,
-							 backend_idx + 1, slot->request_epoch, hdr->epoch,
-							 (unsigned int)hdr->transition_id, hdr->page_lsn,
-							 reserved_zero,
-							 GcsBlockReplyHeaderGetForwardingMasterNode(hdr),
-							 hdr->checksum
-								 == gcs_block_compute_checksum(block_data),
-							 describe_page->header.magic,
-							 (unsigned int)describe_page->header.version,
-							 (unsigned int)describe_page->header.kind,
-							 (unsigned int)describe_page->header.result,
-							 describe_page->header.source_node_id,
-							 describe_page->header.request_id,
-							 (unsigned int)describe_page->header.mxkey.origin_node_id,
-							 describe_page->header.mxkey.multixact_id,
-							 describe_page->header.mxkey.cluster_epoch,
-							 (unsigned int)slot->expected_current_mx_key.origin_node_id,
-							 slot->expected_current_mx_key.multixact_id,
-							 slot->expected_current_mx_key.cluster_epoch,
-							 (unsigned int)describe_page->header.entry_count,
-							 describe_page->header.total_count,
-							 (unsigned int)describe_page->header.wire_length)));
-			pg_atomic_fetch_add_u64(
-				&ClusterGcsBlock->stale_reply_drop_count, 1);
+			ereport(
+				LOG,
+				(errmsg("cluster_gcs_block: dropped stale current-MX reply"),
+				 errdetail("request_id=" UINT64_FORMAT " outer_valid=%d typed_result=%d domain=%u"
+						   " reply_received=%d direct_state=%d direct_prepared=%d"
+						   " expected_status=%u status=%u env_source=%u env_dest=%u"
+						   " expected_source=%d sender=%d backend=%d expected_backend=%d"
+						   " expected_epoch=" UINT64_FORMAT " epoch=" UINT64_FORMAT
+						   " transition=%u page_lsn=" UINT64_FORMAT
+						   " reserved_zero=%d forwarding_master=%d checksum_match=%d"
+						   " body_magic=%u body_version=%u body_kind=%u body_result=%u"
+						   " body_source=%u body_request=" UINT64_FORMAT
+						   " body_origin=%u body_mxid=%u body_epoch=%u"
+						   " expected_origin=%u expected_mxid=%u expected_key_epoch=%u"
+						   " body_entries=%u body_total=%u body_wire_length=%u",
+						   slot->request_id, outer_valid, (int)typed_result,
+						   (unsigned int)slot->reply_domain, slot->reply_received,
+						   (int)slot->direct_state, slot->direct_target_prepared,
+						   (unsigned int)slot->expected_reply_status, (unsigned int)hdr->status,
+						   env->source_node_id, env->dest_node_id, slot->expected_master_node,
+						   hdr->sender_node, hdr->requester_backend_id, backend_idx + 1,
+						   slot->request_epoch, hdr->epoch, (unsigned int)hdr->transition_id,
+						   hdr->page_lsn, reserved_zero,
+						   GcsBlockReplyHeaderGetForwardingMasterNode(hdr),
+						   hdr->checksum == gcs_block_compute_checksum(block_data),
+						   describe_page->header.magic, (unsigned int)describe_page->header.version,
+						   (unsigned int)describe_page->header.kind,
+						   (unsigned int)describe_page->header.result,
+						   describe_page->header.source_node_id, describe_page->header.request_id,
+						   (unsigned int)describe_page->header.mxkey.origin_node_id,
+						   describe_page->header.mxkey.multixact_id,
+						   describe_page->header.mxkey.cluster_epoch,
+						   (unsigned int)slot->expected_current_mx_key.origin_node_id,
+						   slot->expected_current_mx_key.multixact_id,
+						   slot->expected_current_mx_key.cluster_epoch,
+						   (unsigned int)describe_page->header.entry_count,
+						   describe_page->header.total_count,
+						   (unsigned int)describe_page->header.wire_length)));
+			pg_atomic_fetch_add_u64(&ClusterGcsBlock->stale_reply_drop_count, 1);
 			LWLockRelease(&blk->lock.lock);
 			return true;
 		}
@@ -19771,8 +18586,7 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 	ClusterGcsBlockBackendBlock *blk;
 	int i;
 
-	if (env == NULL || payload == NULL
-		|| env->payload_length < (uint32)sizeof(GcsBlockReplyHeader))
+	if (env == NULL || payload == NULL || env->payload_length < (uint32)sizeof(GcsBlockReplyHeader))
 		return false;
 	hdr = (const GcsBlockReplyHeader *)payload;
 	if (hdr->status != (uint8)GCS_BLOCK_REPLY_R4_CR_FULL
@@ -19791,8 +18605,7 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 	}
 
 	backend_idx = hdr->requester_backend_id - 1;
-	if (backend_idx < 0 || backend_idx >= MaxBackends
-		|| gcs_block_backend_blocks == NULL)
+	if (backend_idx < 0 || backend_idx >= MaxBackends || gcs_block_backend_blocks == NULL)
 		return true;
 	blk = &gcs_block_backend_blocks[backend_idx];
 
@@ -19802,8 +18615,7 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 
 		if (!slot->in_use || slot->request_id != hdr->request_id)
 			continue;
-		if (slot->reply_domain != CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
-			|| slot->reply_received
+		if (slot->reply_domain != CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR || slot->reply_received
 			|| slot->direct_state == GCS_BLOCK_DIRECT_ARMED
 			|| slot->direct_state == GCS_BLOCK_DIRECT_LANDED
 			|| slot->direct_state == GCS_BLOCK_DIRECT_ABORTING) {
@@ -19821,8 +18633,7 @@ gcs_block_try_land_r4_terminal_reply(const ClusterICEnvelope *env, const void *p
 			&& GcsBlockReplyHeaderGetForwardingMasterNode(hdr)
 				   == GCS_BLOCK_REPLY_NO_FORWARDING_MASTER) {
 			expected.sender_node = slot->expected_master_node;
-			expected.forwarding_master_node
-				= GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+			expected.forwarding_master_node = GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
 		} else {
 			expected.sender_node = (int32)env->source_node_id;
 			expected.forwarding_master_node = slot->expected_master_node;
@@ -19891,8 +18702,7 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 	if (hdr->status == (uint8)GCS_BLOCK_REPLY_R4_UNDO_DATA_RESULT) {
 		if (hdr->requester_backend_id != CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT)
 			return;
-		(void)cluster_cr_server_r4_land_foreign_undo(
-			env, hdr, block_data, undo_trailer);
+		(void)cluster_cr_server_r4_land_foreign_undo(env, hdr, block_data, undo_trailer);
 		return;
 	}
 
@@ -19911,8 +18721,8 @@ cluster_gcs_handle_block_reply_envelope(const ClusterICEnvelope *env, const void
 			int32 fwd_master;
 			bool authorized = false;
 			uint8 reply_domain = GcsBlockReplyStatusIsR4((GcsBlockReplyStatus)hdr->status)
-								 ? CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
-								 : CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
+									 ? CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR
+									 : CLUSTER_GCS_BLOCK_REPLY_DOMAIN_LEGACY_ACQUIRE;
 
 			/* Reply identity includes the closed slot domain.  Reject before
 			 * touching reply_received or any other slot-owned result byte. */
@@ -20078,8 +18888,7 @@ gcs_block_forward_reply_immediate_deny(const GcsBlockForwardPayload *fwd)
  * holder logic.  A positive ACK is built only while the exact target R4
  * formation/root and both endpoint identities remain current. */
 static bool
-gcs_block_try_ctrc_forward136(
-	const ClusterICEnvelope *env, const void *payload)
+gcs_block_try_ctrc_forward136(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterCtrcSealRequestV1 request;
 	ClusterCtrcTxnKeyV1 key;
@@ -20094,13 +18903,11 @@ gcs_block_try_ctrc_forward136(
 	uint64 self_incarnation;
 	uint32 source_capability_generation = 0;
 	uint32 required_capabilities
-		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
-		  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
+		= PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1 | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1;
 	uint16 first_reason = CTRC_SEAL_REASON_IDENTITY;
 	ClusterCtrcSealReplyResult result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
 	int expected_worker;
-	uint32 reply_total
-		= (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
+	uint32 reply_total = (uint32)sizeof(GcsBlockReplyHeader) + GCS_BLOCK_DATA_SIZE;
 	char *reply;
 	GcsBlockReplyHeader *outer;
 	uint8 *page;
@@ -20108,8 +18915,7 @@ gcs_block_try_ctrc_forward136(
 	bool source_capability_current;
 	bool bracket_current = false;
 
-	if (env == NULL || payload == NULL
-		|| env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES)
+	if (env == NULL || payload == NULL || env->payload_length != CLUSTER_CTRC_SEAL_REQUEST_BYTES)
 		return false;
 	MemSet(&request, 0, sizeof(request));
 	MemSet(&key, 0, sizeof(key));
@@ -20119,95 +18925,73 @@ gcs_block_try_ctrc_forward136(
 	MemSet(&logical, 0, sizeof(logical));
 	MemSet(&root, 0, sizeof(root));
 	if (env->msg_type != PGRAC_IC_MSG_GCS_BLOCK_FORWARD
-		|| env->dest_node_id != (uint32)cluster_node_id
-		|| env->epoch != cluster_epoch_get_current()
+		|| env->dest_node_id != (uint32)cluster_node_id || env->epoch != cluster_epoch_get_current()
 		|| !cluster_gcs_block_family_on_data_plane()
-		|| !cluster_ctrc_seal_request_decode(
-			(const uint8 *)payload, env->payload_length,
-			GetSystemIdentifier(), (int32)env->source_node_id,
-			cluster_node_id, cluster_epoch_get_current(), &request, &key))
+		|| !cluster_ctrc_seal_request_decode((const uint8 *)payload, env->payload_length,
+											 GetSystemIdentifier(), (int32)env->source_node_id,
+											 cluster_node_id, cluster_epoch_get_current(), &request,
+											 &key))
 		return true;
 
-	route_tag = GcsBlockCurrentMxRouteTagMake(
-		request.request_id, request.cluster_epoch,
-		request.original_requester_node, request.requester_backend_id);
-	expected_worker = cluster_lms_shard_for_tag(&route_tag,
-		cluster_lms_workers);
+	route_tag = GcsBlockCurrentMxRouteTagMake(request.request_id, request.cluster_epoch,
+											  request.original_requester_node,
+											  request.requester_backend_id);
+	expected_worker = cluster_lms_shard_for_tag(&route_tag, cluster_lms_workers);
 	Assert(expected_worker == cluster_ic_tier1_my_data_channel());
 	if (expected_worker != cluster_ic_tier1_my_data_channel())
 		return true;
 
 	self_incarnation = cluster_qvotec_get_self_incarnation();
-	if ((int32)env->source_node_id == cluster_node_id)
-	{
+	if ((int32)env->source_node_id == cluster_node_id) {
 		source_incarnation = self_incarnation;
 		source_observed_generation = self_incarnation;
 		source_capability_current
-			= (cluster_ic_local_capability_word() & required_capabilities)
-			  == required_capabilities;
-	}
-	else
-	{
+			= (cluster_ic_local_capability_word() & required_capabilities) == required_capabilities;
+	} else {
 		source_capability_current
-			= cluster_sf_peer_multixact_current_capability_generation(
-				(int32)env->source_node_id, &source_capability_generation)
+			= cluster_sf_peer_multixact_current_capability_generation((int32)env->source_node_id,
+																	  &source_capability_generation)
 			  && source_capability_generation != 0
 			  && cluster_sf_peer_capability_generation_matches(
-				(int32)env->source_node_id, required_capabilities,
-				source_capability_generation);
-		(void)cluster_reconfig_get_observed_slot(
-			(int32)env->source_node_id, &source_incarnation,
-			&source_observed_generation);
+				  (int32)env->source_node_id, required_capabilities, source_capability_generation);
+		(void)cluster_reconfig_get_observed_slot((int32)env->source_node_id, &source_incarnation,
+												 &source_observed_generation);
 	}
-	if (source_capability_current && source_incarnation != 0
-		&& source_observed_generation != 0 && self_incarnation != 0
-		&& cluster_membership_is_member((int32)env->source_node_id)
+	if (source_capability_current && source_incarnation != 0 && source_observed_generation != 0
+		&& self_incarnation != 0 && cluster_membership_is_member((int32)env->source_node_id)
 		&& cluster_membership_is_member(cluster_node_id)
-		&& cluster_membership_get_last_admitted_incarnation(
-			(int32)env->source_node_id) == source_incarnation
-		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id)
-		   == self_incarnation
+		&& cluster_membership_get_last_admitted_incarnation((int32)env->source_node_id)
+			   == source_incarnation
+		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == self_incarnation
 		&& source_incarnation == key.origin_boot_incarnation
-		&& cluster_reconfig_get_observed_epoch((int32)env->source_node_id)
-		   == key.formation_epoch
-		&& (!cluster_write_fence_enforcing()
-			|| cluster_write_fence_allowed())
+		&& cluster_reconfig_get_observed_epoch((int32)env->source_node_id) == key.formation_epoch
+		&& (!cluster_write_fence_enforcing() || cluster_write_fence_allowed())
 		&& cluster_semantic_activation_enter_r4_terminal_census(&admission)
-		   == CLUSTER_SEMANTIC_ADMISSION_OK)
-	{
+			   == CLUSTER_SEMANTIC_ADMISSION_OK) {
 		logical.owner_instance = key.owner_instance;
 		logical.segment_id = key.segment_id;
 		bracket_current
 			= admission.formation_epoch == key.formation_epoch
-			  && admission.record_generation
-				 == key.admission_record_generation
+			  && admission.record_generation == key.admission_record_generation
 			  && cluster_semantic_activation_resolve_shared_undo_root_r4_terminal_census(
-				&admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED,
-				logical.owner_instance, logical.segment_id, &root)
-			  && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED
-			  && root.root_id == key.root_id
+				  &admission, CLUSTER_UNDO_PATH_RUNTIME_SHARED, logical.owner_instance,
+				  logical.segment_id, &root)
+			  && root.intent == CLUSTER_UNDO_PATH_RUNTIME_SHARED && root.root_id == key.root_id
 			  && root.root_generation == key.root_generation
 			  && key.root_descriptor_incarnation == root.root_generation
-			  && cluster_semantic_activation_recheck_r4_terminal_census(
-				&admission);
-		if (bracket_current)
-		{
+			  && cluster_semantic_activation_recheck_r4_terminal_census(&admission);
+		if (bracket_current) {
 			identity.node_id = (uint16)cluster_node_id;
 			identity.capability_record_generation
 				= request.participant_capability_record_generation;
 			identity.boot_incarnation = self_incarnation;
 			identity.formation_epoch = admission.formation_epoch;
-			identity.admission_record_generation
-				= admission.record_generation;
+			identity.admission_record_generation = admission.record_generation;
 			result = cluster_ctrc_participant_request_shared(
-				&key, &identity, request.grant_generation,
-				request.seal_generation,
-				(ClusterCtrcSealSuboperation)request.suboperation,
-				&first_reason, &ack);
+				&key, &identity, request.grant_generation, request.seal_generation,
+				(ClusterCtrcSealSuboperation)request.suboperation, &first_reason, &ack);
 			if (result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK
-				&& !cluster_semantic_activation_recheck_r4_terminal_census(
-					&admission))
-			{
+				&& !cluster_semantic_activation_recheck_r4_terminal_census(&admission)) {
 				MemSet(&ack, 0, sizeof(ack));
 				first_reason = CTRC_SEAL_REASON_IDENTITY;
 				result = CTRC_SEAL_REPLY_BLOCKED_RETAIN;
@@ -20222,9 +19006,7 @@ gcs_block_try_ctrc_forward136(
 	if (!cluster_ctrc_seal_reply_encode(
 			(const uint8 *)payload, env->payload_length, cluster_node_id,
 			(int32)env->source_node_id, result, first_reason,
-			result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK ? &ack : NULL,
-			page, GCS_BLOCK_DATA_SIZE))
-	{
+			result == CTRC_SEAL_REPLY_LOCAL_RELEASE_ACK ? &ack : NULL, page, GCS_BLOCK_DATA_SIZE)) {
 		pfree(reply);
 		return true;
 	}
@@ -20233,25 +19015,20 @@ gcs_block_try_ctrc_forward136(
 	outer->sender_node = cluster_node_id;
 	outer->requester_backend_id = CLUSTER_CTRC_INTERNAL_ENDPOINT;
 	outer->transition_id = 0;
-	outer->status
-		= (uint8)GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT;
-	GcsBlockReplyHeaderSetForwardingMasterNode(
-		outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+	outer->status = (uint8)GCS_BLOCK_REPLY_CURRENT_MX_CTRC_SEAL_RESULT;
+	GcsBlockReplyHeaderSetForwardingMasterNode(outer, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
 	outer->checksum = gcs_block_compute_checksum((const char *)page);
 
 	if ((int32)env->source_node_id == cluster_node_id)
-		send_result = gcs_block_send_envelope_or_loopback(
-			PGRAC_IC_MSG_GCS_BLOCK_REPLY, cluster_node_id, reply, reply_total);
+		send_result = gcs_block_send_envelope_or_loopback(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+														  cluster_node_id, reply, reply_total);
 	else if (cluster_sf_peer_capability_generation_matches(
-			(int32)env->source_node_id, required_capabilities,
-			source_capability_generation))
-		send_result = cluster_ic_send_envelope(
-			PGRAC_IC_MSG_GCS_BLOCK_REPLY, (int32)env->source_node_id,
-			reply, reply_total);
+				 (int32)env->source_node_id, required_capabilities, source_capability_generation))
+		send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY,
+											   (int32)env->source_node_id, reply, reply_total);
 	else
 		send_result = CLUSTER_IC_SEND_NOT_ADMITTED;
-	cluster_gcs_block_note_send_outcome(
-		GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
 	pfree(reply);
 	return true;
 }
@@ -20259,8 +19036,7 @@ gcs_block_try_ctrc_forward136(
 /* Exact 128-byte Current-MX demultiplexing precedes every legacy BufferTag
  * interpretation.  Kind 8 remains reserved/dormant and is consumed here. */
 static bool
-gcs_block_try_current_mx_forward128(
-	const ClusterICEnvelope *env, const void *payload)
+gcs_block_try_current_mx_forward128(const ClusterICEnvelope *env, const void *payload)
 {
 	const GcsBlockForwardPayload *routing;
 
@@ -20280,8 +19056,7 @@ gcs_block_try_current_mx_forward128(
 
 #ifdef USE_CLUSTER_UNIT
 bool
-cluster_gcs_block_test_current_mx_forward128(
-	const ClusterICEnvelope *env, const void *payload)
+cluster_gcs_block_test_current_mx_forward128(const ClusterICEnvelope *env, const void *payload)
 {
 	return gcs_block_try_current_mx_forward128(env, payload);
 }
@@ -20338,8 +19113,8 @@ cluster_gcs_handle_block_forward_envelope(const ClusterICEnvelope *env, const vo
 			|| env->source_node_id != (uint32)fwd->original_requester_node)
 			return;
 		if (!cluster_cr_server_freshref_c1b_pair_request_decode(
-				fwd, (int32)env->source_node_id, cluster_node_id,
-				cluster_epoch_get_current(), MaxBackends, NULL, NULL, NULL, NULL)) {
+				fwd, (int32)env->source_node_id, cluster_node_id, cluster_epoch_get_current(),
+				MaxBackends, NULL, NULL, NULL, NULL)) {
 			gcs_block_forward_reply_immediate_deny(fwd);
 			return;
 		}
@@ -20954,8 +19729,7 @@ gcs_block_pcm_x_authenticated_session(int32 node_id, uint64 expected_epoch, uint
 static void
 gcs_block_legacy_pcm_x_fail_closed(int32 source_node)
 {
-	if (source_node >= 0
-		&& source_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
+	if (source_node >= 0 && source_node < RESOURCE_X_PROTOCOL_NODE_LIMIT
 		&& source_node != cluster_node_id)
 		cluster_lms_data_plane_close_peer_now(source_node);
 }
@@ -20965,8 +19739,7 @@ gcs_block_legacy_pcm_x_fail_closed(int32 source_node)
  * one shared disposition confirms exact TARGET admission and then drops the
  * frame without resource state, buffer, outbound-ring, allocation, or ACK. */
 static void
-gcs_block_legacy_pcm_x_stale_ingress(
-	const ClusterICEnvelope *env, const void *payload)
+gcs_block_legacy_pcm_x_stale_ingress(const ClusterICEnvelope *env, const void *payload)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -20982,23 +19755,20 @@ gcs_block_legacy_pcm_x_stale_ingress(
 		return;
 	source_node = (int32)env->source_node_id;
 	malformed = env->msg_type < PGRAC_IC_MSG_PCM_X_ENQUEUE
-		|| env->msg_type > PGRAC_IC_MSG_PCM_X_RETIRE_ACK
-		|| source_node < 0
-		|| source_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
-		|| env->dest_node_id != (uint32)cluster_node_id
-		|| env->payload_length == 0
-		|| env->payload_length > PGRAC_IC_PAYLOAD_MAX
-		|| payload == NULL
-		|| env->epoch != cluster_epoch_get_current();
+				|| env->msg_type > PGRAC_IC_MSG_PCM_X_RETIRE_ACK || source_node < 0
+				|| source_node >= RESOURCE_X_PROTOCOL_NODE_LIMIT
+				|| env->dest_node_id != (uint32)cluster_node_id || env->payload_length == 0
+				|| env->payload_length > PGRAC_IC_PAYLOAD_MAX || payload == NULL
+				|| env->epoch != cluster_epoch_get_current();
 	if (malformed) {
 		gcs_block_legacy_pcm_x_fail_closed(source_node);
 		return;
 	}
 
 	memset(&admission, 0, sizeof(admission));
-	admission_result = cluster_semantic_activation_enter(
-		CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
-		CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
+	admission_result
+		= cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R11_RESOURCE_X_D5_CUTOVER_V1,
+											CLUSTER_SEMANTIC_TARGET_SIDE, &admission);
 	if (admission_result != CLUSTER_SEMANTIC_ADMISSION_OK) {
 		gcs_block_legacy_pcm_x_fail_closed(source_node);
 		return;
@@ -21006,28 +19776,27 @@ gcs_block_legacy_pcm_x_stale_ingress(
 	if (source_node == cluster_node_id) {
 		capability_word = cluster_ic_local_capability_word();
 		connection_generation = 1;
-	}
-	else
+	} else
 		peer_sampled = cluster_sf_peer_capability_word_sample(
-			source_node, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1,
-			&capability_word, &connection_generation);
+			source_node, PGRAC_IC_HELLO_CAP_GCS_RESOURCE_X_CONVERT_V1, &capability_word,
+			&connection_generation);
 	(void)capability_word;
 	peer_exact = peer_sampled
-		&& gcs_block_resource_x_target_peer_matches_exact(
-			&admission, source_node, connection_generation);
+				 && gcs_block_resource_x_target_peer_matches_exact(&admission, source_node,
+																   connection_generation);
 	admission_current = cluster_semantic_activation_recheck(&admission);
 	cluster_semantic_activation_leave(&admission);
 	if (!peer_sampled || !peer_exact || !admission_current)
 		gcs_block_legacy_pcm_x_fail_closed(source_node);
 }
 
-#define LEGACY_PCM_X_STALE_INFO(msg, label)                                    \
-	{                                                                          \
-		.msg_type = (msg), .name = (label),                                     \
-		.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS             \
-			| CLUSTER_IC_PRODUCER_LMON | CLUSTER_IC_PRODUCER_LMS_DATA,           \
-		.broadcast_ok = false, .handler = gcs_block_legacy_pcm_x_stale_ingress, \
-		.plane = CLUSTER_IC_PLANE_DATA                                           \
+#define LEGACY_PCM_X_STALE_INFO(msg, label)                                                        \
+	{                                                                                              \
+		.msg_type = (msg), .name = (label),                                                        \
+		.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON     \
+								 | CLUSTER_IC_PRODUCER_LMS_DATA,                                   \
+		.broadcast_ok = false, .handler = gcs_block_legacy_pcm_x_stale_ingress,                    \
+		.plane = CLUSTER_IC_PLANE_DATA                                                             \
 	}
 
 static const ClusterICMsgTypeInfo legacy_pcm_x_stale_infos[] = {
@@ -22163,8 +20932,8 @@ gcs_block_invalidate_execute(const GcsBlockInvalidatePayload *inv)
 	PcmLockMode pre_state;
 	XLogRecPtr page_lsn = InvalidXLogRecPtr;
 	SCN page_scn = InvalidScn; /* spec-2.41 D3 — ACK SCN carrier */
-	uint8 ack_status = 0; /* OK */
-	bool kept_pi = false; /* spec-6.12h D-h2 — drop converted to a PI */
+	uint8 ack_status = 0;	   /* OK */
+	bool kept_pi = false;	   /* spec-6.12h D-h2 — drop converted to a PI */
 	bool woke_local = false;
 	uint64 current_epoch = cluster_epoch_get_current();
 
@@ -22868,8 +21637,8 @@ cluster_gcs_handle_block_invalidate_ack_envelope(const ClusterICEnvelope *env, c
 	 */
 	if ((ack->ack_status == 0 || ack->ack_status == 2) && ack->epoch == cluster_epoch_get_current()
 		&& ack->sender_node >= 0 && ack->sender_node < 32) {
-		(void)cluster_pcm_lock_apply_gcs_transition(
-			ack->tag, PCM_TRANS_S_TO_N_INVALIDATE, ack->sender_node);
+		(void)cluster_pcm_lock_apply_gcs_transition(ack->tag, PCM_TRANS_S_TO_N_INVALIDATE,
+													ack->sender_node);
 		/* PGRAC: spec-6.12h D-h2 — the holder reported its dropped copy was
 		 * kept as a Past Image (D-h1); record it on the PI holder bitmap so
 		 * the discard protocol can target it later.  Runs here (before the
@@ -23799,79 +22568,60 @@ cluster_gcs_block_resource_x_cutover_tick(void)
 
 	if (!cluster_semantic_activation_r11_cutover_snapshot(&cutover))
 		return false;
-	if (cutover.record_generation == 0
-		|| cutover.record_generation == UINT64_MAX
+	if (cutover.record_generation == 0 || cutover.record_generation == UINT64_MAX
 		|| cutover.formation_epoch == UINT64_MAX)
 		return false;
 	if (cutover.phase == CLUSTER_SEMANTIC_R11_CUTOVER_TARGET_OPEN)
 		return false;
 	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)) {
-		if (cutover.phase
-				!= CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED
-			|| !cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(
-				&gate))
+		if (cutover.phase != CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED
+			|| !cluster_pcm_lock_resource_x_cutover_gate_snapshot_exact(&gate))
 			return false;
 	}
 	if (gate.reserved != 0)
 		return false;
 
 	if (cutover.phase == CLUSTER_SEMANTIC_R11_CUTOVER_SOURCE_CLOSED) {
-		if ((gate.phase != RESOURCE_X_GATE_OPEN
-			 && gate.phase != RESOURCE_X_GATE_FROZEN)
-			|| !cluster_resource_x_reconfig_cutover_begin_native_exact(
-				&token)
+		if ((gate.phase != RESOURCE_X_GATE_OPEN && gate.phase != RESOURCE_X_GATE_FROZEN)
+			|| !cluster_resource_x_reconfig_cutover_begin_native_exact(&token)
 			|| !cluster_pcm_lock_resource_x_gate_snapshot(&gate)
-			|| gate.phase != RESOURCE_X_GATE_FROZEN
-			|| gate.formation != token.old_formation
+			|| gate.phase != RESOURCE_X_GATE_FROZEN || gate.formation != token.old_formation
 			|| gate.freeze_generation != token.freeze_generation)
 			return false;
 
 		if (token.new_formation == 0) {
-			for (calls = 0;
-				 calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT;
-				 calls++) {
+			for (calls = 0; calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT; calls++) {
 				result = cluster_resource_x_reconfig_sweep(
-					&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET,
-					&batch);
+					&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET, &batch);
 				if (result == RESOURCE_X_RECONFIG_DONE)
 					break;
-				if (result != RESOURCE_X_RECONFIG_MORE
-					&& result != RESOURCE_X_RECONFIG_RETRY)
+				if (result != RESOURCE_X_RECONFIG_MORE && result != RESOURCE_X_RECONFIG_RETRY)
 					return false;
 			}
 			if (result != RESOURCE_X_RECONFIG_DONE) {
-				return result == RESOURCE_X_RECONFIG_MORE
-					&& batch.examined_count != 0;
+				return result == RESOURCE_X_RECONFIG_MORE && batch.examined_count != 0;
 			}
-			if (!cluster_resource_x_reconfig_cutover_bind_native_successor_exact(
-					&token))
+			if (!cluster_resource_x_reconfig_cutover_bind_native_successor_exact(&token))
 				return false;
 			/* Binding is itself progress.  Resume through the event loop so
 			 * no tick traverses more than one 64-slot checkpoint. */
 			return true;
 		}
-		for (calls = 0;
-			 calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT;
-			 calls++) {
+		for (calls = 0; calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT; calls++) {
 			result = cluster_resource_x_reconfig_sweep(
-				&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET,
-				&batch);
+				&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET, &batch);
 			if (result == RESOURCE_X_RECONFIG_DONE)
 				break;
-			if (result != RESOURCE_X_RECONFIG_MORE
-				&& result != RESOURCE_X_RECONFIG_RETRY)
+			if (result != RESOURCE_X_RECONFIG_MORE && result != RESOURCE_X_RECONFIG_RETRY)
 				return false;
 		}
 		if (result != RESOURCE_X_RECONFIG_DONE) {
-			return result == RESOURCE_X_RECONFIG_MORE
-				&& batch.examined_count != 0;
+			return result == RESOURCE_X_RECONFIG_MORE && batch.examined_count != 0;
 		}
-		if (!cluster_resource_x_reconfig_zero_proof_exact(
-				&token, &zero)
-			|| !cluster_pcm_lock_resource_x_clean_completion_prove_exact(
-				&token, &zero, &clean)
-			|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
-				&observed_token, &observed_zero, &observed_clean)
+		if (!cluster_resource_x_reconfig_zero_proof_exact(&token, &zero)
+			|| !cluster_pcm_lock_resource_x_clean_completion_prove_exact(&token, &zero, &clean)
+			|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(&observed_token, &observed_zero,
+																 &observed_clean)
 			|| memcmp(&observed_token, &token, sizeof(token)) != 0
 			|| memcmp(&observed_zero, &zero, sizeof(zero)) != 0
 			|| memcmp(&observed_clean, &clean, sizeof(clean)) != 0)
@@ -23879,13 +22629,11 @@ cluster_gcs_block_resource_x_cutover_tick(void)
 		return batch.examined_count != 0;
 	}
 
-	if (cutover.phase
-			!= CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL
-		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
-			&token, &zero, &clean)
+	if (cutover.phase != CLUSTER_SEMANTIC_R11_CUTOVER_DURABLE_OPEN_PENDING_LOCAL
+		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(&token, &zero, &clean)
 		|| !cluster_resource_x_reconfig_thaw_exact(&token)
-		|| !cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(
-			&observed_token, &observed_zero, &observed_clean)
+		|| !cluster_pcm_lock_resource_x_cutover_thawed_proofs_exact(&observed_token, &observed_zero,
+																	&observed_clean)
 		|| memcmp(&observed_token, &token, sizeof(token)) != 0
 		|| memcmp(&observed_zero, &zero, sizeof(zero)) != 0
 		|| memcmp(&observed_clean, &clean, sizeof(clean)) != 0)
@@ -23909,8 +22657,7 @@ gcs_block_resource_x_dead_requester_bitmap(
 }
 
 static bool
-gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
-									uint32 dead_requester_bitmap)
+gcs_block_resource_x_reconfig_epoch(uint64 new_epoch, uint32 dead_requester_bitmap)
 {
 	ResourceXGateSnapshot gate;
 	ResourceXReconfigBatch batch;
@@ -23933,15 +22680,13 @@ gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
 		return true;
 	if (new_epoch == 0 || new_epoch == UINT64_MAX)
 		return false;
-	completed_epoch
-		= pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch);
+	completed_epoch = pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch);
 	if (new_epoch <= completed_epoch)
 		return true;
 
 	expected_epoch = 0;
 	claimed_epoch = pg_atomic_compare_exchange_u64(
-		&ClusterGcsBlock->resource_x_reconfig_in_progress_epoch, &expected_epoch,
-		new_epoch);
+		&ClusterGcsBlock->resource_x_reconfig_in_progress_epoch, &expected_epoch, new_epoch);
 	if (!claimed_epoch && expected_epoch != new_epoch)
 		return false;
 	deadline = GetCurrentTimestamp()
@@ -23953,14 +22698,12 @@ gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
 	}
 	for (;;) {
 		expected_actor = 0;
-		if (pg_atomic_compare_exchange_u64(
-				&ClusterGcsBlock->resource_x_reconfig_actor_active, &expected_actor,
-				new_epoch))
+		if (pg_atomic_compare_exchange_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active,
+										   &expected_actor, new_epoch))
 			break;
 		if (expected_actor != new_epoch)
 			return false;
-		completed_epoch
-			= pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch);
+		completed_epoch = pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch);
 		if (completed_epoch >= new_epoch)
 			return true;
 		if (GetCurrentTimestamp() >= deadline)
@@ -23973,21 +22716,18 @@ gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
 	if (!cluster_pcm_lock_resource_x_gate_snapshot(&gate)) {
 		/* No target formation has ever opened, so there is no Resource-X
 		 * authority to sweep for this epoch. */
-		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch,
-							new_epoch);
+		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_completed_epoch, new_epoch);
 		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation, 0);
 		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_in_progress_epoch, 0);
 		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_actor_active, 0);
 		return true;
 	}
 	if (claimed_epoch)
-		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation,
-								gate.formation);
-	expected_epoch
-		= pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation);
+		pg_atomic_write_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation, gate.formation);
+	expected_epoch = pg_atomic_read_u64(&ClusterGcsBlock->resource_x_reconfig_old_formation);
 	if (expected_epoch == 0
-		|| !cluster_resource_x_reconfig_freeze_pending_exact(
-			expected_epoch, dead_requester_bitmap, &token))
+		|| !cluster_resource_x_reconfig_freeze_pending_exact(expected_epoch, dead_requester_bitmap,
+															 &token))
 		goto actor_failed;
 
 	deadline = GetCurrentTimestamp()
@@ -24007,14 +22747,12 @@ gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
 	}
 
 	for (;;) {
-		for (calls = 0; calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT;
-			 calls++) {
+		for (calls = 0; calls < GCS_BLOCK_RESOURCE_X_RECONFIG_CALLS_PER_CHECKPOINT; calls++) {
 			result = cluster_resource_x_reconfig_sweep(
 				&token, GCS_BLOCK_RESOURCE_X_RECONFIG_PROBE_BUDGET, &batch);
 			if (result == RESOURCE_X_RECONFIG_DONE)
 				goto complete;
-			if (result != RESOURCE_X_RECONFIG_MORE
-				&& result != RESOURCE_X_RECONFIG_RETRY)
+			if (result != RESOURCE_X_RECONFIG_MORE && result != RESOURCE_X_RECONFIG_RETRY)
 				goto actor_failed;
 		}
 		if (GetCurrentTimestamp() >= deadline)
@@ -24024,10 +22762,9 @@ gcs_block_resource_x_reconfig_epoch(uint64 new_epoch,
 
 complete:
 	if (!cluster_resource_x_reconfig_zero_proof_exact(&token, &zero)
-		|| !cluster_pcm_lock_resource_x_clean_completion_prove_exact(
-			&token, &zero, &clean)
-		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(
-			&observed_token, &observed_zero, &observed_clean)
+		|| !cluster_pcm_lock_resource_x_clean_completion_prove_exact(&token, &zero, &clean)
+		|| !cluster_pcm_lock_resource_x_cutover_proofs_exact(&observed_token, &observed_zero,
+															 &observed_clean)
 		|| memcmp(&observed_token, &token, sizeof(token)) != 0
 		|| memcmp(&observed_zero, &zero, sizeof(zero)) != 0
 		|| memcmp(&observed_clean, &clean, sizeof(clean)) != 0
@@ -24074,16 +22811,14 @@ actor_failed:
  * ============================================================ */
 void
 cluster_gcs_block_on_epoch_advance_exact(
-	uint64 new_epoch,
-	const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES])
+	uint64 new_epoch, const uint8 dead_bitmap[CLUSTER_RECONFIG_DEAD_BITMAP_BYTES])
 {
 	ResourceXReconfigStats resource_x_stats;
 	uint32 dead_requester_bitmap;
 	int b;
 	int j;
 
-	dead_requester_bitmap
-		= gcs_block_resource_x_dead_requester_bitmap(dead_bitmap);
+	dead_requester_bitmap = gcs_block_resource_x_dead_requester_bitmap(dead_bitmap);
 	if (!gcs_block_resource_x_reconfig_epoch(new_epoch, dead_requester_bitmap)) {
 		gcs_block_resource_x_fail_closed_current();
 		cluster_resource_x_reconfig_stats_snapshot(&resource_x_stats);

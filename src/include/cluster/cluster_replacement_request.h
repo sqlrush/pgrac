@@ -43,40 +43,34 @@ typedef enum ClusterReplacementRequestSlotState {
 	CLUSTER_REPLACEMENT_REQUEST_SLOT_HOLD = 2
 } ClusterReplacementRequestSlotState;
 
-StaticAssertDecl(sizeof(ClusterReplacementRequestMarker)
-					 == CLUSTER_REPLACEMENT_MARKER_BYTES,
+StaticAssertDecl(sizeof(ClusterReplacementRequestMarker) == CLUSTER_REPLACEMENT_MARKER_BYTES,
 				 "replacement request marker host shape must remain 64 bytes");
-StaticAssertDecl(CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET
-					 + CLUSTER_REPLACEMENT_MARKER_BYTES
+StaticAssertDecl(CLUSTER_REPLACEMENT_MARKER_RESERVED1_OFFSET + CLUSTER_REPLACEMENT_MARKER_BYTES
 					 <= CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES,
 				 "replacement request marker must fit the voting-slot reserved1");
 
-extern bool cluster_replacement_request_encode(
-	const ClusterReplacementRequestMarker *marker,
-	uint8 out[CLUSTER_REPLACEMENT_MARKER_BYTES]);
-extern bool cluster_replacement_request_decode(
-	const uint8 bytes[CLUSTER_REPLACEMENT_MARKER_BYTES],
-	int32 expected_target_node, ClusterReplacementRequestMarker *out);
-extern bool cluster_replacement_request_pack(
-	uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES],
-	const ClusterReplacementRequestMarker *marker);
+extern bool cluster_replacement_request_encode(const ClusterReplacementRequestMarker *marker,
+											   uint8 out[CLUSTER_REPLACEMENT_MARKER_BYTES]);
+extern bool cluster_replacement_request_decode(const uint8 bytes[CLUSTER_REPLACEMENT_MARKER_BYTES],
+											   int32 expected_target_node,
+											   ClusterReplacementRequestMarker *out);
+extern bool
+cluster_replacement_request_pack(uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES],
+								 const ClusterReplacementRequestMarker *marker);
 extern bool cluster_replacement_request_unpack(
-	const uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES],
-	int32 expected_target_node, ClusterReplacementRequestMarker *out);
-extern void cluster_replacement_request_clear(
-	uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES]);
+	const uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES], int32 expected_target_node,
+	ClusterReplacementRequestMarker *out);
+extern void
+cluster_replacement_request_clear(uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES]);
 extern bool cluster_replacement_request_is_clear(
 	const uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES]);
 extern ClusterReplacementRequestSlotState cluster_replacement_request_slot_state(
-	uint64 flags,
-	const uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES],
+	uint64 flags, const uint8 reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES],
 	int32 expected_target_node, uint64 expected_slot_incarnation,
 	ClusterReplacementRequestMarker *out);
 extern ClusterReplacementRequestSlotState cluster_replacement_request_preserve_per_disk(
-	uint64 prior_flags,
-	const uint8 prior_reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES],
-	int32 expected_target_node, uint64 expected_slot_incarnation,
-	uint64 *new_flags,
+	uint64 prior_flags, const uint8 prior_reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES],
+	int32 expected_target_node, uint64 expected_slot_incarnation, uint64 *new_flags,
 	uint8 new_reserved1[CLUSTER_REPLACEMENT_REQUEST_RESERVED1_BYTES]);
 
 #endif /* CLUSTER_REPLACEMENT_REQUEST_H */

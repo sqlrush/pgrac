@@ -97,8 +97,8 @@ struct UndoSegmentHeaderData;
 
 extern bool cluster_tt_slot_recyclable(uint8 cts_status, SCN commit_scn, SCN horizon);
 extern bool cluster_undo_segment_recyclable(const struct UndoSegmentHeaderData *hdr, SCN horizon);
-extern bool cluster_undo_segment_recyclable_for_mode(
-	const struct UndoSegmentHeaderData *hdr, SCN horizon, bool peer_mode);
+extern bool cluster_undo_segment_recyclable_for_mode(const struct UndoSegmentHeaderData *hdr,
+													 SCN horizon, bool peer_mode);
 
 
 /*

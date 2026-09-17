@@ -57,7 +57,7 @@
 #include "cluster/cluster_scn.h"		  /* SCN */
 #include "cluster/cluster_tt_slot.h"	  /* ClusterUndoTTSlotRef */
 #include "cluster/cluster_tt_status.h"	  /* ClusterTTStatus */
-#include "cluster/cluster_tx_resolve.h"  /* ClusterTxLocator */
+#include "cluster/cluster_tx_resolve.h"	  /* ClusterTxLocator */
 #include "cluster/cluster_undo_verdict.h" /* ClusterUndoVerdictResult (spec-5.22f D6) */
 
 
@@ -94,9 +94,9 @@ typedef enum ClusterVisEvidence {
 
 typedef struct ClusterVisResolve {
 	ClusterVisEvidence evidence;
-	ClusterTTStatus status;		 /* valid when evidence == REMOTE */
-	SCN commit_scn;				 /* valid for COMMITTED / CLEANED_OUT */
-	bool commit_scn_is_bound;	 /* spec-6.12i CP5: commit_scn is a HORIZON
+	ClusterTTStatus status;	  /* valid when evidence == REMOTE */
+	SCN commit_scn;			  /* valid for COMMITTED / CLEANED_OUT */
+	bool commit_scn_is_bound; /* spec-6.12i CP5: commit_scn is a HORIZON
 								   * BOUND from a below-horizon verdict, not
 								   * the exact commit_scn.  It decides
 								   * correctly against the read_scn this
@@ -105,14 +105,14 @@ typedef struct ClusterVisResolve {
 								   * exact scn (a later smaller read_scn
 								   * would read it as committed-after ->
 								   * false-invisible, Rule 8.A). */
-	ClusterUndoTTSlotRef ref;	 /* copied exact ref (REMOTE/LOCAL/STALE) */
+	ClusterUndoTTSlotRef ref; /* copied exact ref (REMOTE/LOCAL/STALE) */
 	/* Stage-8 PRE adjustment 23: a wait consumer may use only the exact
 	 * page-derived DATA locator captured under the same content lock as the
 	 * verdict.  The ref/raw xid is never promoted into a remote wait key. */
 	bool row_wait_locator_valid;
 	ClusterTxLocator row_wait_locator;
-	uint16 multi_marker_origin;	 /* XMAX_MULTI: origin node of marker, else 0 */
-	bool multi_marker_is_remote; /* XMAX_MULTI: marker hit + origin != self */
+	uint16 multi_marker_origin;	   /* XMAX_MULTI: origin node of marker, else 0 */
+	bool multi_marker_is_remote;   /* XMAX_MULTI: marker hit + origin != self */
 	const char *diagnostic_reason; /* static diagnostic text, not proof or wire */
 } ClusterVisResolve;
 
@@ -220,8 +220,7 @@ typedef enum ClusterVisNativeSelfUpdateVerdict {
 } ClusterVisNativeSelfUpdateVerdict;
 
 extern ClusterVisNativeSelfUpdateVerdict
-cluster_vis_update_native_self_verdict(bool lock_only,
-									   bool cmax_at_or_after_curcid);
+cluster_vis_update_native_self_verdict(bool lock_only, bool cmax_at_or_after_curcid);
 
 /*
  * spec-3.21 §2.3: CR image xmax-side MVCC visibility verdict.
@@ -253,9 +252,8 @@ extern ClusterVisVerdict cluster_vis_dirty_verdict(ClusterTTStatus status, bool 
 
 /* The base OBS-3 verdict remains fail-closed.  Only the typed unique-index
  * owner may turn an exact remote IN_PROGRESS xmax into an unlocked wait. */
-extern bool cluster_vis_dirty_remote_xmax_waitable(ClusterTTStatus status,
-											 bool is_xmax,
-											 bool exact_locator_valid);
+extern bool cluster_vis_dirty_remote_xmax_waitable(ClusterTTStatus status, bool is_xmax,
+												   bool exact_locator_valid);
 
 
 /*

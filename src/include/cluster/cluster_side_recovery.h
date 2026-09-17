@@ -51,15 +51,14 @@
  * version this domain must bind; the consumer never re-parses the page
  * (spec §1.2 D-SIDE-06: 不复制 page parser).
  */
-typedef struct ClusterSidePageConsumeInput
-{
+typedef struct ClusterSidePageConsumeInput {
 	const ClusterPageIdentity *identity;
-	ClusterPageClass page_class;	/* UNKNOWN/UNCLASSIFIED fails */
+	ClusterPageClass page_class;			   /* UNKNOWN/UNCLASSIFIED fails */
 	const ClusterPageVersion *expected_before; /* must be valid */
-	bool		contributor_coverage;	/* RF-PAGE chain closed */
-	bool		durability_barrier_ok;	/* RF-PAGE durability done */
-	bool		post_read_ok;	/* RF-PAGE canonical post-read done */
-	bool		authority_revalidated;	/* RF-PAGE ROOT revalidation done */
+	bool contributor_coverage;				   /* RF-PAGE chain closed */
+	bool durability_barrier_ok;				   /* RF-PAGE durability done */
+	bool post_read_ok;						   /* RF-PAGE canonical post-read done */
+	bool authority_revalidated;				   /* RF-PAGE ROOT revalidation done */
 } ClusterSidePageConsumeInput;
 
 /*
@@ -77,12 +76,11 @@ extern bool cluster_side_page_consumer_ready(const ClusterSidePageConsumeInput *
  * and no whole-instance barrier exists (§4 row "resource A verified、
  * resource B blocked -> A 可 open，B 保持 fenced").
  */
-typedef struct ClusterSideReadinessInput
-{
-	uint16		resource_id;	/* exact resource/thread identity */
-	bool		page_proof_ok;	/* D-SIDE-06 verdict for the resource */
-	bool		side_proof_ok;	/* this domain's truth proof (TT/undo/pending) */
-	bool		authority_fresh;	/* RF-ROOT authority fresh */
+typedef struct ClusterSideReadinessInput {
+	uint16 resource_id;	  /* exact resource/thread identity */
+	bool page_proof_ok;	  /* D-SIDE-06 verdict for the resource */
+	bool side_proof_ok;	  /* this domain's truth proof (TT/undo/pending) */
+	bool authority_fresh; /* RF-ROOT authority fresh */
 } ClusterSideReadinessInput;
 
 extern bool cluster_side_resource_readiness(const ClusterSideReadinessInput *in);
@@ -96,25 +94,23 @@ extern bool cluster_side_resource_readiness(const ClusterSideReadinessInput *in)
  * denial reason (spec §1.2 D-SIDE-08, §2.2, §4 row "all affected
  * TT/undo/space bytes durable 但 post-read 缺一项 -> deny retire").
  */
-typedef enum ClusterSideRetentionVerdict
-{
-	CLUSTER_SIDE_RETENTION_READY = 0,	/* FND-10 SIDE side holds */
-	CLUSTER_SIDE_RETENTION_DENY_NOT_DURABLE,	/* some affected bytes not durable */
-	CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ,	/* some affected post-read missing */
-	CLUSTER_SIDE_RETENTION_DENY_CONSUMER,	/* an exact consumer remains */
-	CLUSTER_SIDE_RETENTION_DENY_INVALID		/* bad input / empty set */
+typedef enum ClusterSideRetentionVerdict {
+	CLUSTER_SIDE_RETENTION_READY = 0,		  /* FND-10 SIDE side holds */
+	CLUSTER_SIDE_RETENTION_DENY_NOT_DURABLE,  /* some affected bytes not durable */
+	CLUSTER_SIDE_RETENTION_DENY_NO_POST_READ, /* some affected post-read missing */
+	CLUSTER_SIDE_RETENTION_DENY_CONSUMER,	  /* an exact consumer remains */
+	CLUSTER_SIDE_RETENTION_DENY_INVALID		  /* bad input / empty set */
 } ClusterSideRetentionVerdict;
 
-typedef struct ClusterSideRetentionProof
-{
-	uint16		failed_origin_thread;
-	uint32		affected_count; /* affected TT/undo/pending/space resources */
-	bool		all_bytes_durable;	/* every affected byte durable */
-	bool		all_post_read_ok;	/* every affected canonical post-read done */
-	bool		consumers_zero; /* no exact resource/thread consumer remains */
+typedef struct ClusterSideRetentionProof {
+	uint16 failed_origin_thread;
+	uint32 affected_count;	/* affected TT/undo/pending/space resources */
+	bool all_bytes_durable; /* every affected byte durable */
+	bool all_post_read_ok;	/* every affected canonical post-read done */
+	bool consumers_zero;	/* no exact resource/thread consumer remains */
 } ClusterSideRetentionProof;
 
-extern ClusterSideRetentionVerdict cluster_side_retention_proof_ready(
-	const ClusterSideRetentionProof *proof);
+extern ClusterSideRetentionVerdict
+cluster_side_retention_proof_ready(const ClusterSideRetentionProof *proof);
 
-#endif							/* CLUSTER_SIDE_RECOVERY_H */
+#endif /* CLUSTER_SIDE_RECOVERY_H */

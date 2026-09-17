@@ -17,8 +17,7 @@ resource_x_retry_saturating_add(uint64 base, uint64 delta)
 
 
 static bool
-resource_x_retry_policy_encode(uint32 max_retries, uint32 initial_backoff_ms,
-							   uint16 *encoded_out)
+resource_x_retry_policy_encode(uint32 max_retries, uint32 initial_backoff_ms, uint16 *encoded_out)
 {
 	uint32 encoded;
 
@@ -27,7 +26,7 @@ resource_x_retry_policy_encode(uint32 max_retries, uint32 initial_backoff_ms,
 		|| initial_backoff_ms > RESOURCE_X_RETRY_MAX_BACKOFF_MS)
 		return false;
 	encoded = max_retries * RESOURCE_X_RETRY_MAX_BACKOFF_MS
-		+ (initial_backoff_ms - RESOURCE_X_RETRY_MIN_BACKOFF_MS);
+			  + (initial_backoff_ms - RESOURCE_X_RETRY_MIN_BACKOFF_MS);
 	if (encoded > UINT16_MAX)
 		return false;
 	*encoded_out = (uint16)encoded;
@@ -45,8 +44,8 @@ resource_x_retry_policy_decode(uint16 encoded, uint32 *max_retries_out,
 	if (max_retries_out == NULL || initial_backoff_ms_out == NULL)
 		return false;
 	max_retries = encoded / RESOURCE_X_RETRY_MAX_BACKOFF_MS;
-	initial_backoff_ms = (encoded % RESOURCE_X_RETRY_MAX_BACKOFF_MS)
-		+ RESOURCE_X_RETRY_MIN_BACKOFF_MS;
+	initial_backoff_ms
+		= (encoded % RESOURCE_X_RETRY_MAX_BACKOFF_MS) + RESOURCE_X_RETRY_MIN_BACKOFF_MS;
 	if (max_retries > RESOURCE_X_RETRY_MAX_RETRIES)
 		return false;
 	*max_retries_out = max_retries;
@@ -66,10 +65,8 @@ resource_x_retry_state_valid(const ResourceXRetryStateV1 *state)
 		|| state->first_submit_mono_us == 0
 		|| state->next_retry_due_mono_us < state->first_submit_mono_us
 		|| state->terminal_deadline_mono_us < state->next_retry_due_mono_us
-		|| !resource_x_retry_policy_decode(state->flags, &max_retries,
-										 &initial_backoff_ms)
-		|| state->retry_count > max_retries
-		|| state->last_phase < RESOURCE_X_RETRY_PRE_NO_RETURN
+		|| !resource_x_retry_policy_decode(state->flags, &max_retries, &initial_backoff_ms)
+		|| state->retry_count > max_retries || state->last_phase < RESOURCE_X_RETRY_PRE_NO_RETURN
 		|| state->last_phase > RESOURCE_X_RETRY_PHASE_RECOVERY_BLOCKED)
 		return false;
 	if (state->last_phase == RESOURCE_X_RETRY_TERMINAL)
@@ -118,8 +115,7 @@ resource_x_terminal_record_publish(const ResourceXRetryStateV1 *terminal,
 {
 	ResourceXTerminalRecordV1 record;
 
-	if (terminal == NULL || record_out == NULL
-		|| !resource_x_retry_state_valid(terminal)
+	if (terminal == NULL || record_out == NULL || !resource_x_retry_state_valid(terminal)
 		|| terminal->last_phase != RESOURCE_X_RETRY_TERMINAL
 		|| terminal->next_retry_due_mono_us != terminal->terminal_deadline_mono_us)
 		return false;
@@ -138,8 +134,7 @@ resource_x_terminal_record_replay(const ResourceXTerminalRecordV1 *record,
 	if (record == NULL || attempt == NULL || state_out == NULL
 		|| !resource_x_retry_state_valid(&record->state)
 		|| record->state.last_phase != RESOURCE_X_RETRY_TERMINAL
-		|| record->state.next_retry_due_mono_us
-		!= record->state.terminal_deadline_mono_us
+		|| record->state.next_retry_due_mono_us != record->state.terminal_deadline_mono_us
 		|| !resource_x_attempt_matches(&record->state.attempt, attempt))
 		return false;
 	*state_out = record->state;
@@ -150,17 +145,14 @@ static bool
 resource_x_retry_transport_valid(const ResourceXTransportWitness *transport)
 {
 	return transport != NULL && transport->cluster_epoch != 0
-		&& transport->peer_session_incarnation != 0
-		&& transport->connection_generation != 0 && transport->flags == 0;
+		   && transport->peer_session_incarnation != 0 && transport->connection_generation != 0
+		   && transport->flags == 0;
 }
 
 bool
-resource_x_retry_state_init(const ResourceXAttemptWitness *attempt,
-							uint64 first_submit_mono_us,
-							uint64 terminal_deadline_mono_us,
-							uint32 max_retries,
-							uint32 initial_backoff_ms,
-							uint32 state_generation,
+resource_x_retry_state_init(const ResourceXAttemptWitness *attempt, uint64 first_submit_mono_us,
+							uint64 terminal_deadline_mono_us, uint32 max_retries,
+							uint32 initial_backoff_ms, uint32 state_generation,
 							ResourceXRetryStateV1 *out)
 {
 	ResourceXRetryStateV1 candidate;
@@ -168,17 +160,14 @@ resource_x_retry_state_init(const ResourceXAttemptWitness *attempt,
 	uint64 next_retry_due_mono_us;
 	uint16 encoded_policy;
 
-	if (attempt == NULL || out == NULL
-		|| !resource_x_attempt_matches(attempt, attempt)
-		|| first_submit_mono_us == 0
-		|| terminal_deadline_mono_us < first_submit_mono_us
-		|| !resource_x_retry_policy_encode(max_retries, initial_backoff_ms,
-										 &encoded_policy)
+	if (attempt == NULL || out == NULL || !resource_x_attempt_matches(attempt, attempt)
+		|| first_submit_mono_us == 0 || terminal_deadline_mono_us < first_submit_mono_us
+		|| !resource_x_retry_policy_encode(max_retries, initial_backoff_ms, &encoded_policy)
 		|| state_generation == 0)
 		return false;
 	initial_delay_us = (uint64)initial_backoff_ms * UINT64_C(1000);
-	next_retry_due_mono_us = resource_x_retry_saturating_add(
-		first_submit_mono_us, initial_delay_us);
+	next_retry_due_mono_us
+		= resource_x_retry_saturating_add(first_submit_mono_us, initial_delay_us);
 	if (next_retry_due_mono_us > terminal_deadline_mono_us)
 		next_retry_due_mono_us = terminal_deadline_mono_us;
 	memset(&candidate, 0, sizeof(candidate));
@@ -213,21 +202,17 @@ resource_x_retry_state_is_clear(const ResourceXRetryStateV1 *state)
 
 
 bool
-resource_x_retry_policy_exact(const ResourceXRetryStateV1 *state,
-							  uint32 *max_retries_out,
+resource_x_retry_policy_exact(const ResourceXRetryStateV1 *state, uint32 *max_retries_out,
 							  uint32 *initial_backoff_ms_out)
 {
 	return state != NULL
-		&& resource_x_retry_policy_decode(state->flags, max_retries_out,
-										  initial_backoff_ms_out);
+		   && resource_x_retry_policy_decode(state->flags, max_retries_out, initial_backoff_ms_out);
 }
 
 
 bool
-resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,
-								uint64 last_admitted_mono_us,
-								uint32 admitted_retry_count,
-								uint64 *next_due_out)
+resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state, uint64 last_admitted_mono_us,
+								uint32 admitted_retry_count, uint64 *next_due_out)
 {
 	uint64 delay_us;
 	uint64 next_due;
@@ -235,15 +220,12 @@ resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,
 	uint32 max_retries;
 
 	if (next_due_out == NULL || !resource_x_retry_state_valid(state)
-		|| !resource_x_retry_policy_exact(state, &max_retries,
-										  &initial_backoff_ms)
-		|| admitted_retry_count > max_retries
-		|| last_admitted_mono_us < state->first_submit_mono_us
+		|| !resource_x_retry_policy_exact(state, &max_retries, &initial_backoff_ms)
+		|| admitted_retry_count > max_retries || last_admitted_mono_us < state->first_submit_mono_us
 		|| last_admitted_mono_us > state->terminal_deadline_mono_us)
 		return false;
 	delay_us = (uint64)initial_backoff_ms * UINT64_C(1000);
-	if (admitted_retry_count >= 64
-		|| delay_us > (UINT64_MAX >> admitted_retry_count))
+	if (admitted_retry_count >= 64 || delay_us > (UINT64_MAX >> admitted_retry_count))
 		delay_us = UINT64_MAX;
 	else
 		delay_us <<= admitted_retry_count;
@@ -257,20 +239,16 @@ resource_x_retry_next_due_exact(const ResourceXRetryStateV1 *state,
 
 ResourceXRetryApplyResult
 resource_x_retry_terminalize_exact(const ResourceXRetryStateV1 *current,
-								   const ResourceXRetryStateV1 *expected,
-								   uint32 terminal_errcode,
-								   uint64 terminal_at_mono_us,
-								   ResourceXRetryStateV1 *terminal_out)
+								   const ResourceXRetryStateV1 *expected, uint32 terminal_errcode,
+								   uint64 terminal_at_mono_us, ResourceXRetryStateV1 *terminal_out)
 {
 	ResourceXRetryStateV1 terminal;
 
 	resource_x_retry_state_clear(terminal_out);
-	if (current == NULL || expected == NULL || terminal_out == NULL
-		|| terminal_errcode == 0 || terminal_at_mono_us == 0
-		|| resource_x_terminal_reason_decode(terminal_errcode)
-			   == RESOURCE_X_TERMINAL_REASON_INVALID
-		|| !resource_x_retry_state_valid(current)
-		|| !resource_x_retry_state_valid(expected))
+	if (current == NULL || expected == NULL || terminal_out == NULL || terminal_errcode == 0
+		|| terminal_at_mono_us == 0
+		|| resource_x_terminal_reason_decode(terminal_errcode) == RESOURCE_X_TERMINAL_REASON_INVALID
+		|| !resource_x_retry_state_valid(current) || !resource_x_retry_state_valid(expected))
 		return RESOURCE_X_RETRY_APPLY_RECOVERY_BLOCKED;
 	if (current->last_phase == RESOURCE_X_RETRY_TERMINAL) {
 		if (!resource_x_attempt_matches(&current->attempt, &expected->attempt))
@@ -306,8 +284,7 @@ ResourceXRetryDecision
 resource_x_retry_classify_exact(const ResourceXRetryStateV1 *state,
 								const ResourceXAttemptWitness *current_attempt,
 								const ResourceXTransportWitness *fresh_transport,
-								uint64 now_mono_us,
-								ResourceXRetryAction *out)
+								uint64 now_mono_us, ResourceXRetryAction *out)
 {
 	ResourceXRetryAction action;
 	uint32 initial_backoff_ms;
@@ -326,14 +303,14 @@ resource_x_retry_classify_exact(const ResourceXRetryStateV1 *state,
 		return RESOURCE_X_RETRY_TERMINAL_DENIED;
 	if (now_mono_us >= state->terminal_deadline_mono_us)
 		return state->last_phase == RESOURCE_X_RETRY_PRE_NO_RETURN
-			? RESOURCE_X_RETRY_TERMINAL_EXHAUSTED
-			: RESOURCE_X_RETRY_ROLL_FORWARD;
+				   ? RESOURCE_X_RETRY_TERMINAL_EXHAUSTED
+				   : RESOURCE_X_RETRY_ROLL_FORWARD;
 	if (!resource_x_retry_policy_exact(state, &max_retries, &initial_backoff_ms))
 		return RESOURCE_X_RETRY_RECOVERY_BLOCKED;
 	if (state->retry_count >= max_retries)
 		return state->last_phase == RESOURCE_X_RETRY_PRE_NO_RETURN
-			? RESOURCE_X_RETRY_TERMINAL_EXHAUSTED
-			: RESOURCE_X_RETRY_ROLL_FORWARD;
+				   ? RESOURCE_X_RETRY_TERMINAL_EXHAUSTED
+				   : RESOURCE_X_RETRY_ROLL_FORWARD;
 	if (now_mono_us < state->next_retry_due_mono_us)
 		return RESOURCE_X_RETRY_NOT_DUE;
 	if (!resource_x_retry_transport_valid(fresh_transport))
