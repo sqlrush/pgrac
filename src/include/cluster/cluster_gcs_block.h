@@ -2036,7 +2036,9 @@ typedef struct ClusterR4TransitionCell {
 #define CLUSTER_R4_UNDO_OWNERS                                                                     \
 	(CLUSTER_R4_OWNER_HOLDER_LMON | CLUSTER_R4_OWNER_HOLDER_LMS | CLUSTER_R4_OWNER_ORIGIN)
 #define CLUSTER_R4_CELL(next, alternate, owner, action, text)                                      \
-	{ (next), (alternate), (owner), (action), (text) }
+	{                                                                                              \
+		(next), (alternate), (owner), (action), (text)                                             \
+	}
 
 static inline const ClusterR4TransitionCell *
 cluster_r4_transition_lookup(ClusterR4OperationState state, ClusterR4OperationEvent event)

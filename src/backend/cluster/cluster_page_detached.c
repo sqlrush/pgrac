@@ -21,8 +21,10 @@ static RfPageProofDetailV1 detached_codec_apply(XLogReaderState *record, uint8 b
 												char new_page[BLCKSZ]);
 
 #define RF_DETACHED_CODEC(codec_, rmid_)                                                           \
-	{ codec_, rmid_, CLUSTER_PAGE_DETACHED_INTERFACE_V1, detached_codec_preflight,                 \
-	  detached_codec_apply }
+	{                                                                                              \
+		codec_, rmid_, CLUSTER_PAGE_DETACHED_INTERFACE_V1, detached_codec_preflight,               \
+			detached_codec_apply                                                                   \
+	}
 
 static const RfDetachedPageCodecV1 detached_codecs[]
 	= { RF_DETACHED_CODEC(RF_ROUTE_CODEC_XLOG_FPI, RM_XLOG_ID),

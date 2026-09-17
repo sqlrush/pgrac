@@ -19791,13 +19791,13 @@ gcs_block_legacy_pcm_x_stale_ingress(const ClusterICEnvelope *env, const void *p
 }
 
 #define LEGACY_PCM_X_STALE_INFO(msg, label)                                                        \
-	{ .msg_type = (msg),                                                                           \
-	  .name = (label),                                                                             \
-	  .allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON       \
-							   | CLUSTER_IC_PRODUCER_LMS_DATA,                                     \
-	  .broadcast_ok = false,                                                                       \
-	  .handler = gcs_block_legacy_pcm_x_stale_ingress,                                             \
-	  .plane = CLUSTER_IC_PLANE_DATA }
+	{                                                                                              \
+		.msg_type = (msg), .name = (label),                                                        \
+		.allowed_producer_mask = CLUSTER_IC_PRODUCER_BUFFER_CLIENTS | CLUSTER_IC_PRODUCER_LMON     \
+								 | CLUSTER_IC_PRODUCER_LMS_DATA,                                   \
+		.broadcast_ok = false, .handler = gcs_block_legacy_pcm_x_stale_ingress,                    \
+		.plane = CLUSTER_IC_PLANE_DATA                                                             \
+	}
 
 static const ClusterICMsgTypeInfo legacy_pcm_x_stale_infos[] = {
 	LEGACY_PCM_X_STALE_INFO(PGRAC_IC_MSG_PCM_X_ENQUEUE, "retired_pcm_x_41"),

@@ -28,9 +28,9 @@
 set -e
 set -o pipefail
 
-# Locate clang-format.  Prefer clang-format 18 because GitHub Actions
-# ubuntu-24.04 installs 18.1.x, and later releases differ on comment
-# alignment in several long-lived cluster files.
+# Locate clang-format.  GitHub Actions ubuntu-24.04 uses 18.1.3.
+# Even 18.1.8 differs on braced macro initializers; use CLANG_FORMAT to
+# select 18.1.3 when the locally installed patch release differs.
 if [ -z "${CLANG_FORMAT:-}" ]; then
     for candidate in \
         clang-format-18 \
