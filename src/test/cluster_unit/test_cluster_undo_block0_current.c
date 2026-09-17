@@ -2763,7 +2763,7 @@ UT_TEST(test_exclusive_pin_refuses_scur_and_nonheld_without_publishing_outputs)
 
 	reset_fixture();
 	memset(&pin, 0xa5, sizeof(pin));
-	sentinel = pin;
+	memcpy(&sentinel, &pin, sizeof(sentinel));
 	UT_ASSERT_EQ(cluster_undo_block0_current_pin_exclusive(&guard, &root, &expected, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	UT_ASSERT_EQ(memcmp(&pin, &sentinel, sizeof(pin)), 0);
@@ -2792,7 +2792,7 @@ UT_TEST(test_exclusive_pin_post_pin_drift_unpins_before_refusal_and_keeps_output
 	acquire_remote_xcur_held(&guard);
 	fake_pin_invalidates_authority = true;
 	memset(&pin, 0xa5, sizeof(pin));
-	sentinel = pin;
+	memcpy(&sentinel, &pin, sizeof(sentinel));
 	UT_ASSERT_EQ(cluster_undo_block0_current_pin_exclusive(&guard, &root, &expected, &pin, &page),
 				 CLUSTER_UNDO_BLOCK0_AUTHORITY_DENIED);
 	UT_ASSERT_EQ(pin_calls, 1);

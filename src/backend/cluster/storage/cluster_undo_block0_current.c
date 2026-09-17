@@ -1637,7 +1637,7 @@ cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
 {
 	ClusterUndoBlock0CurrentGuardData *data;
 	ClusterUndoBlock0AuthorityProof proof;
-	ClusterUndoBlock0Pin original_pin;
+	unsigned char original_pin[sizeof(*pin)];
 	volatile ClusterUndoBlock0CurrentPinCleanup cleanup;
 	ClusterUndoBlock0Result result;
 	char *private_page = NULL;
@@ -1649,7 +1649,8 @@ cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
 	if (result != CLUSTER_UNDO_BLOCK0_OK)
 		return result;
 
-	original_pin = *pin;
+	/* Refusal preserves the caller's complete representation, including padding. */
+	memcpy(original_pin, pin, sizeof(original_pin));
 	cleanup.guard = guard;
 	cleanup.pin = pin;
 	cleanup.local_pin_held = false;
@@ -1670,7 +1671,7 @@ cluster_undo_block0_current_pin_exclusive(ClusterUndoBlock0CurrentGuard *guard,
 	PG_END_ENSURE_ERROR_CLEANUP(current_pin_error_cleanup,
 								PointerGetDatum((ClusterUndoBlock0CurrentPinCleanup *)&cleanup));
 	if (result != CLUSTER_UNDO_BLOCK0_OK) {
-		*pin = original_pin;
+		memcpy(pin, original_pin, sizeof(original_pin));
 		return result;
 	}
 	*page = private_page;

@@ -28,6 +28,8 @@ UT_DEFINE_GLOBALS();
 typedef struct SharedProviderState {
 	volatile uint32 total_actions;
 	volatile uint32 node_actions[PGRAC_FENCED_MAX_NODES];
+	volatile uint32 hold_action;
+	volatile uint32 release_action;
 } SharedProviderState;
 
 static SharedProviderState *provider_state;
@@ -48,10 +50,22 @@ test_actuate(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32
 	uint32 action_number;
 	uint32 loops = 0;
 
-	(void)deadline_mono_ns;
 	*native_status = 0;
 	action_number = __sync_add_and_fetch(&provider_state->total_actions, 1);
 	(void)__sync_add_and_fetch(&provider_state->node_actions[target->victim_node_id], 1);
+	if (provider_state->hold_action) {
+		/* The reload test releases this exact action only after quiescing. */
+		while (!provider_state->release_action) {
+			struct timespec now;
+
+			if (clock_gettime(CLOCK_MONOTONIC, &now) != 0
+				|| (uint64_t)now.tv_sec * UINT64_C(1000000000) + (uint64_t)now.tv_nsec
+					   >= deadline_mono_ns)
+				return PGRAC_FENCED_PROVIDER_UNKNOWN;
+			(void)nanosleep(&pause, NULL);
+		}
+		return PGRAC_FENCED_PROVIDER_OK;
+	}
 	while (action_number <= 2 && provider_state->total_actions < 2 && loops++ < 500)
 		(void)nanosleep(&pause, NULL);
 	return provider_state->total_actions >= 2 ? PGRAC_FENCED_PROVIDER_OK
@@ -575,6 +589,7 @@ UT_TEST(test_reload_during_active_operation_invalidates_queue_without_abort)
 	UT_ASSERT(pgrac_fenced_coordinator_init(&coordinator, &context));
 	make_request(&config, 3, 0xb1, 0xb2, &owner_request);
 	make_request(&config, 3, 0xb3, 0xb4, &queued_request);
+	provider_state->hold_action = 1;
 	UT_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, owner_sockets), 0);
 	UT_ASSERT(write_request(owner_sockets[0], &owner_request));
 	UT_ASSERT(pgrac_fenced_coordinator_accept_fd(&coordinator, owner_sockets[1],
@@ -583,11 +598,23 @@ UT_TEST(test_reload_during_active_operation_invalidates_queue_without_abort)
 	UT_ASSERT(write_request(queued_sockets[0], &queued_request));
 	UT_ASSERT(pgrac_fenced_coordinator_accept_fd(&coordinator, queued_sockets[1],
 												 deadline_after_ms(2000)));
+	/*
+	 * Prove the provider is in flight before reload, then release it explicitly.
+	 * Counting 500 sleeps made this test depend on OS timer coalescing and could
+	 * exhaust the unchanged two-second operation deadline on macOS.
+	 */
+	for (loops = 0; loops < 2000 && provider_state->node_actions[3] == 0; loops++) {
+		UT_ASSERT(pgrac_fenced_coordinator_service(&coordinator, deadline_after_ms(0)));
+		(void)nanosleep(&pause, NULL);
+	}
+	UT_ASSERT_EQ(provider_state->node_actions[3], 1);
+	UT_ASSERT(!try_response(owner_sockets[0], &owner_response));
 	UT_ASSERT_EQ(pgrac_fenced_coordinator_active_worker_count(&coordinator), 1);
 	UT_ASSERT(pgrac_fenced_coordinator_quiesce(&coordinator, 17));
 	UT_ASSERT(try_response(queued_sockets[0], &queued_response));
 	UT_ASSERT_EQ(queued_response.verdict, 4);
 	UT_ASSERT_EQ(queued_response.deny_reason, 17);
+	provider_state->release_action = 1;
 	for (loops = 0; loops < 2000 && pgrac_fenced_coordinator_active_worker_count(&coordinator) > 0;
 		 loops++) {
 		UT_ASSERT(pgrac_fenced_coordinator_service(&coordinator, deadline_after_ms(0)));

@@ -2337,6 +2337,8 @@ cluster_reconfig_bootstrap_proof_node(int32 node_id, uint64 *out_incarnation)
 			*out_incarnation = target_inc;
 		return true;
 	}
+	/* No stable publication was observed; retry on a later membership tick. */
+	return false;
 }
 
 

@@ -1260,10 +1260,11 @@ test_cluster_side_corpus: test_cluster_side_corpus.c unit_test.h \
 # Assert ExceptionalCondition hook.  The durable file round trip (temp +
 # durable_rename) is added to this binary with D3 S3.
 CLUSTER_HW_SNAPSHOT_O = $(top_builddir)/src/backend/cluster/cluster_hw_snapshot.o
-test_cluster_hw_snapshot_io.o: $(top_srcdir)/src/backend/cluster/cluster_hw_snapshot.c \
+test_cluster_hw_snapshot_io.o: test_cluster_hw_snapshot_io.c \
+		$(top_srcdir)/src/backend/cluster/cluster_hw_snapshot.c \
 		$(top_srcdir)/src/include/cluster/cluster_hw_snapshot.h \
 		$(top_srcdir)/src/include/common/cluster_hw_snapshot_codec.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -Dread=hw_snapshot_test_read -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 test_cluster_hw_snapshot_codec_backend.o: $(top_srcdir)/src/common/cluster_hw_snapshot_codec.c \
 		$(top_srcdir)/src/include/common/cluster_hw_snapshot_codec.h
