@@ -8,6 +8,8 @@ Author: SqlRush <sqlrush@gmail.com>
 
 ## 四份文档
 
+首次体验先用[单机四实例 Quick Start（Linux）](quickstart-linux-single-host.md)：从拉取固定标签、编译安装到共享行读写和全体正常关机，附可执行示例。
+
 | 文档 | 内容 |
 |---|---|
 | [一、Linux 四节点部署与共享存储](01-linux-four-node-deployment.md) | 版本获取、依赖、编译安装、四机规划、共享存储契约、seed/join、建库边界、启动检查与正常关机 |
@@ -31,3 +33,5 @@ Author: SqlRush <sqlrush@gmail.com>
 ## 文档验证范围
 
 本次逐项核对了标签源码的参数注册、SQL catalog、视图 producer、CLI 与测试夹具，并检查接口覆盖和链接。没有因编写文档再次运行业务验收，也没有执行四台物理机安装演练。部署篇明确标出目前不能仅靠已发布工具完成认证交付的环节。
+
+Quick Start 另做了单机最小演练：固定标签新构建、四实例共享行读写、全体正常关机及自有 loop 清理通过；不等于重跑 C8、soak、micro 或 PRE。

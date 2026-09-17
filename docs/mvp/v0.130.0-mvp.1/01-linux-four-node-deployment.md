@@ -6,6 +6,8 @@ Author: SqlRush <sqlrush@gmail.com>
 
 ## 1. 先选择部署目标
 
+只想在一台 Linux 主机上快速体验四实例，请直接使用[单机四实例 Quick Start](quickstart-linux-single-host.md)。下文保留四机规划和部署边界。
+
 | 目标 | 本版能够提供的依据 | 本文处理方式 |
 |---|---|---|
 | 同一 Linux 环境中的四个实例 | 发布验收中的受控四节点夹具、共享路径与投票设备配置 | 可参考源码复现；这是测试环境，不是四机高可用 |
@@ -88,7 +90,7 @@ realpath /srv/pgrac-shared
 四节点配置应使用正确初始化、四节点可访问的投票介质并启用严格多数判定，不能以 `cluster.allow_single_node=on` 代替。
 
 - `cluster.voting_disks` 是按固定顺序配置的路径列表。介质内容、索引、身份和长度必须匹配；空文件、全零文件或刚创建的 loop 设备不合格。
-- 发布测试使用受控的文件初始化、全体正常关闭、同一内容映射为 Linux 直接 I/O 设备的流程。**单主机 loop 设备不是可跨四台主机共享的投票盘。**
+- 单机 Quick Start 使用受控的新文件初始化，在四实例尚未启动时映射为 Linux 直接 I/O loop 设备，再启动集群。**单主机 loop 设备不是可跨四台主机共享的投票盘。**不要把历史两阶段测试辅助流程当成通用安装器。
 - 源码中 `PostgreSQL::Test::ClusterVotingDisk` 是**会覆写目标的测试 formatter**，不是运维工具。不要把它用于生产设备。
 - MVP 未提供经过四机认证的投票介质制备/设备接入 CLI。这是四机从零部署尚需补齐的交付环节；应在此记录“部署前提未满足”，不能继续开启业务。
 - `pg_cluster_voting_disks` 的逐盘状态/计数部分仍是占位输出；`unknown`/0 不等于磁盘健康。需结合 quorum 视图、日志和设备检查。
