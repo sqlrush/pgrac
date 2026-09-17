@@ -50,13 +50,14 @@ void
 cluster_multixact_current_stats_shmem_init(void)
 {
 	bool found;
-	int i;
 
 	if (IsBootstrapProcessingMode() || !cluster_enabled || cluster_node_id < 0)
 		return;
 	ClusterCurrentMxStats = ShmemInitStruct("pgrac current multixact stats",
 											sizeof(ClusterCurrentMxStatsShmem), &found);
 	if (!found) {
+		int i;
+
 		ClusterCurrentMxStats->stats_since = GetCurrentTimestamp();
 		for (i = 0; i < CMX_STAT_COUNT; i++)
 			pg_atomic_init_u64(&ClusterCurrentMxStats->counters[i], 0);

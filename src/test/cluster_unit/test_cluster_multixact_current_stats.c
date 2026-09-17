@@ -77,6 +77,8 @@ void *
 ShmemInitStruct(const char *name, Size size, bool *found)
 {
 	static union {
+		/* Enforces alignment of the byte-backed shared-memory fixture. */
+		/* cppcheck-suppress unusedStructMember */
 		uint64 align;
 		unsigned char bytes[4096];
 	} shmem;

@@ -37,6 +37,8 @@ typedef struct ProcessTreePids {
 } ProcessTreePids;
 
 static bool
+/* The array has the exact execve environment ABI, not a const-pointee API. */
+/* cppcheck-suppress constParameter */
 exec_environment_exact(char *const envp[])
 {
 	return envp != NULL && envp[0] != NULL && envp[1] != NULL && envp[2] == NULL
@@ -44,11 +46,12 @@ exec_environment_exact(char *const envp[])
 }
 
 int
+/* This fixture interposes libc fexecve and must keep its exact prototype. */
+/* cppcheck-suppress constParameter */
 fexecve(int fd, char *const argv[], char *const envp[])
 {
 	static const char guid[] = " 00 01 02 03 04 05 06 07 08 09 0a 0b 0c 0d 0e 0f\n";
 	static const char status[] = "Chassis Power is off\n";
-	char overflow[PGRAC_FENCED_IPMI_ACTION_OUTPUT_MAX + 1];
 
 	if (fd < 0 || argv == NULL || !exec_environment_exact(envp) || strcmp(argv[0], "ipmitool") != 0
 		|| argv[16] != NULL)
@@ -108,6 +111,8 @@ fexecve(int fd, char *const argv[], char *const envp[])
 		_exit(0);
 	}
 	if (strcmp(argv[10], "overflow") == 0) {
+		char overflow[PGRAC_FENCED_IPMI_ACTION_OUTPUT_MAX + 1];
+
 		memset(overflow, 'x', sizeof(overflow));
 		(void)write(STDOUT_FILENO, overflow, sizeof(overflow));
 		_exit(0);
@@ -488,6 +493,8 @@ UT_TEST(test_prevalidated_execution_rehashes_each_command)
 														deadline_after_ms(1000), &output),
 				 PGRAC_FENCED_PROVIDER_OK);
 	UT_ASSERT_EQ(output.stdout_len, sizeof("Chassis Power is off\n") - 1);
+	/* Consumed through target.adapter_config by the external runner below. */
+	/* cppcheck-suppress unreadVariable */
 	adapter[32] ^= 1;
 	UT_ASSERT_EQ(pgrac_fenced_ipmi_execute_prevalidated(&target, "admin", password_path,
 														PGRAC_FENCED_IPMI_COMMAND_OFF,

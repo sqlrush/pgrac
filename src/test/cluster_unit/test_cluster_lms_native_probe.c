@@ -254,6 +254,8 @@ cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *data, uin
 		peak_active = Max(peak_active, active);
 	}
 	UT_ASSERT(sends < lengthof(wire_ids));
+	if (sends >= lengthof(wire_ids))
+		abort();
 	wire_ids[sends++] = p->probe_id;
 }
 void

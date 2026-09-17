@@ -153,6 +153,10 @@ jobs:
       - name: Check release-notes principle-0 (spec-5.21 D7)
         run: ./scripts/ci/check-release-notes-principle0.sh
 
+      - name: Check static-analyzer execution contract
+        if: steps.changes.outputs.code_changed == 'true'
+        run: python3 scripts/ci/test_scan_build.py
+
       - name: Lint commit message
         if: github.event_name == 'pull_request'
         run: |
@@ -261,7 +265,7 @@ jobs:
           # Full cluster_tap suite + 2-node ClusterPair + heartbeat round-
           # trip + Stage 2/3 medium perf matrix tests run in nightly.yml.
           make -C src/test/cluster_tap check \
-            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/226_stage3_mvcc_acceptance_capability.pl t/273_stage4_recovery_acceptance_capability.pl t/332_block_device_backend.pl t/333_block_device_multinode.pl"
+            PROVE_TESTS="t/010_views.pl t/030_acceptance.pl t/031_undo_publication_refusal.pl t/050_shared_storage_initdb.pl t/200_stage2_acceptance_capability.pl t/226_stage3_mvcc_acceptance_capability.pl t/273_stage4_recovery_acceptance_capability.pl t/332_block_device_backend.pl t/333_block_device_multinode.pl"
 
       - name: Upload regression diffs on failure
         if: failure()

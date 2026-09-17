@@ -3611,7 +3611,7 @@ pgrac_wal_state_validate_handoff(char *thread_name, size_t thread_name_size)
 	char *resolved_root;
 	char *resolved_xlog;
 	char xlog_parent[MAXPGPATH];
-	char *separator;
+	const char *separator;
 	unsigned int thread_id;
 	char extra;
 
@@ -3660,7 +3660,7 @@ static void
 pgrac_wal_state_check_root_entries(const char *thread_name, bool allow_registry)
 {
 	DIR *dir;
-	struct dirent *entry;
+	const struct dirent *entry;
 	char unexpected[MAXPGPATH] = "";
 
 	dir = opendir(pgrac_wal_state_root);

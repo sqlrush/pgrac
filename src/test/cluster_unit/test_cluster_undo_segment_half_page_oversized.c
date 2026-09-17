@@ -17,6 +17,8 @@
 #include "cluster/cluster_tt_slot.h"
 
 typedef struct ClusterUndoOversizedHalfPageFixture {
+	/* Layout-only prefix is required by the negative offsetof assertion. */
+	/* cppcheck-suppress unusedStructMember */
 	char prefix[112];
 	TTSlot tt_slots[125];
 } ClusterUndoOversizedHalfPageFixture;

@@ -425,14 +425,15 @@ UT_TEST(test_deadline_owner_maps_slow_action_and_readback_to_timeout)
 	PgracFencedConfigV1 config;
 	TestProviderMode modes[] = { TEST_PROVIDER_ACTION_SLOW, TEST_PROVIDER_READBACK_SLOW };
 	char path[64];
-	int fd;
-	size_t count;
 	size_t i;
 
 	make_config(&config);
 	make_ops(&ops);
 	make_request(&config, &request);
 	for (i = 0; i < lengthof(modes); i++) {
+		int fd;
+		size_t count;
+
 		provider_mode = modes[i];
 		fd = open_context(&context, &journal_state, &config, &ops, path);
 		if (fd < 0)
@@ -540,14 +541,15 @@ UT_TEST(test_provider_unavailable_mapping_is_exact_in_journal_and_response)
 		= { PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT, PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT,
 			PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT };
 	char path[64];
-	int fd;
-	size_t count;
 	size_t i;
 
 	make_config(&config);
 	make_ops(&ops);
 	make_request(&config, &request);
 	for (i = 0; i < lengthof(modes); i++) {
+		int fd;
+		size_t count;
+
 		provider_mode = modes[i];
 		fd = open_context(&context, &journal_state, &config, &ops, path);
 		if (fd < 0)
@@ -579,8 +581,6 @@ UT_TEST(test_operation_rotates_full_active_before_next_durable_record)
 	uint8 daemon_boot_id[16];
 	char directory_path[] = "/tmp/pgrac-fenced-operation-rotate.XXXXXX";
 	char active_path[MAXPGPATH];
-	char entry_path[MAXPGPATH];
-	struct dirent *entry;
 	DIR *directory;
 	int directory_fd;
 	int active_fd;
@@ -619,6 +619,9 @@ UT_TEST(test_operation_rotates_full_active_before_next_durable_record)
 	directory = opendir(directory_path);
 	UT_ASSERT_NOT_NULL(directory);
 	if (directory != NULL) {
+		char entry_path[MAXPGPATH];
+		const struct dirent *entry;
+
 		while ((entry = readdir(directory)) != NULL) {
 			if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0)
 				continue;

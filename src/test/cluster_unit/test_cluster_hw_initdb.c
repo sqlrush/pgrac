@@ -235,7 +235,8 @@ run_case(enum Fault injected, bool want_success, const char *reason)
 {
 	char template[] = "/tmp/pgrac-hw-create-XXXXXX";
 	char *base = mkdtemp(template);
-	char *root, *data, *snapshot, *log;
+	char *root, *snapshot, *log;
+	const char *data;
 	pid_t pid;
 	int status, fd;
 	char bytes[4096] = { 0 };

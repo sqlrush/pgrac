@@ -612,12 +612,13 @@ void
 rf_page_online_plan_destroy_v1(RfPageOnlinePlanV1 **plan_pointer)
 {
 	RfPageOnlinePlanV1 *plan;
-	uint32 i;
 
 	if (plan_pointer == NULL || *plan_pointer == NULL)
 		return;
 	plan = *plan_pointer;
 	if (plan->magic == RF_PAGE_ONLINE_PLAN_MAGIC) {
+		uint32 i;
+
 		for (i = 0; i < plan->target_count; i++)
 			target_destroy(plan->targets[i]);
 	}

@@ -387,6 +387,8 @@ UT_TEST(test_v2_crc_and_path_tuple_validation)
 		uint32 magic;
 		uint32 version;
 		uint64 nonce;
+		/* The fixture writes the complete old wire record, including CRC. */
+		/* cppcheck-suppress unusedStructMember */
 		pg_crc32c crc;
 	} ClusterCfPhase2RecordV1;
 	ClusterCfPhase2RecordV1 v1;

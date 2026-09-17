@@ -171,7 +171,7 @@ bool
 cluster_page_redo_decode(XLogReaderState *record, uint8 block_id, ClusterPageRedoDecoded *out)
 {
 	ClusterPageRmgrCensusEntry row;
-	DecodedBkpBlock *blk;
+	const DecodedBkpBlock *blk;
 	uint8 rmid;
 
 	if (record == NULL || out == NULL)

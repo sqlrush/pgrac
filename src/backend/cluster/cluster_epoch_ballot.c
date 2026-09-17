@@ -201,6 +201,8 @@ cluster_epoch_ballot_id_compare(const ClusterEpochBallotId *a, const ClusterEpoc
 
 	Assert(a != NULL);
 	Assert(b != NULL);
+	/* Assert is the caller-contract guard; cppcheck does not model its trap. */
+	/* cppcheck-suppress nullPointerRedundantCheck */
 	EPOCH_BALLOT_CMP_FIELD(counter);
 	EPOCH_BALLOT_CMP_FIELD(proposer_node_id);
 	EPOCH_BALLOT_CMP_FIELD(proposer_admitted_incarnation);

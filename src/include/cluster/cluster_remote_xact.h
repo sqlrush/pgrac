@@ -274,8 +274,7 @@ cluster_remote_xact_entry_encode_terminal_v2(ClusterRemoteXactEntryV2 *entry,
 		|| (outcome != CLUSTER_REMOTE_XACT_COMMITTED && outcome != CLUSTER_REMOTE_XACT_ABORTED))
 		return false;
 	if ((outcome == CLUSTER_REMOTE_XACT_COMMITTED
-		 && (commit_scn == InvalidScn || commit_scn == 0 || commit_timestamp == 0
-			 || (wrap_valid && wrap == 0)))
+		 && (commit_scn == InvalidScn || commit_timestamp == 0 || (wrap_valid && wrap == 0)))
 		|| (outcome == CLUSTER_REMOTE_XACT_ABORTED
 			&& (commit_scn != InvalidScn || commit_timestamp != 0 || wrap_valid || wrap != 0)))
 		return false;
@@ -318,8 +317,8 @@ cluster_remote_xact_entry_decode_terminal_v2(const ClusterRemoteXactEntryV2 *ent
 		memcpy(&candidate.commit_timestamp, entry->payload + 8, sizeof(candidate.commit_timestamp));
 		memcpy(&candidate.wrap, entry->payload + 16, sizeof(candidate.wrap));
 		candidate.wrap_valid = (entry->flags & CLUSTER_REMOTE_XACT_ENTRY_FLAG_WRAP_VALID) != 0;
-		if (candidate.commit_scn == InvalidScn || candidate.commit_scn == 0
-			|| candidate.commit_timestamp == 0 || (candidate.wrap_valid && candidate.wrap == 0)
+		if (candidate.commit_scn == InvalidScn || candidate.commit_timestamp == 0
+			|| (candidate.wrap_valid && candidate.wrap == 0)
 			|| (!candidate.wrap_valid && candidate.wrap != 0))
 			return false;
 	} else {

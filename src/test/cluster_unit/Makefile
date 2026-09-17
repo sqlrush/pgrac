@@ -80,7 +80,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
         test_cluster_wal_thread test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
-        test_cluster_backup \
+        test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
         test_cluster_thread_driver test_cluster_thread_orchestrator \
@@ -350,7 +350,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_cr_native_origin test_cluster_cr_mvcc_
 		test_cluster_resource_x_identity test_cluster_resource_x_node_wire \
 		test_cluster_resource_x_terminal_ingress \
 		test_cluster_resource_x_retry \
-		test_cluster_resource_x_handoff \
+		test_cluster_resource_x_handoff test_cluster_retained_remote \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source \
 		test_cluster_r4_d10_multi_source test_cluster_sf_dep test_cluster_wal_state_rmw \
 		test_cluster_ges_reply_wait \
@@ -2234,7 +2234,9 @@ check_resource_x_send_c1_unit:
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		$(top_srcdir)/src/test/cluster_unit/test_resource_x_send_c1.py
 
-check_resource_x_send_c1:
+# This gate executes and mutates these binaries. Listing it beside TESTS in
+# all does not impose an order, especially in a clean parallel build.
+check_resource_x_send_c1: test_cluster_pcm_lock test_cluster_lms_outbound test_cluster_gcs_block
 	PYTHONDONTWRITEBYTECODE=1 python3 \
 		$(top_srcdir)/src/tools/check_resource_x_send_c1.py \
 		--source-root "$(top_srcdir)" \
@@ -3200,6 +3202,17 @@ test_cluster_r4_tx_locator: test_cluster_r4_tx_locator.c unit_test.h \
 # function-sectioned test object.  Dead stripping keeps this existing R4
 # target focused on the exact-origin provider without stubbing unrelated
 # legacy runtime-visibility services from the same production source file.
+test_cluster_retained_remote.inc: $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c Makefile
+	awk '/^cluster_runtime_visibility_resolve_terminal_census_retained_remote_exact\(/ { print "static ClusterTxOutcome"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0 } \
+	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_retained_remote: test_cluster_retained_remote.c test_cluster_retained_remote.inc unit_test.h \
+		$(top_builddir)/src/backend/cluster/cluster_uba.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_uba.o \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 CLUSTER_R4_RUNTIME_VIS_TEST_O = test_cluster_r4_runtime_visibility_exact.o
 CLUSTER_R4_RUNTIME_VIS_UBA_O = $(top_builddir)/src/backend/cluster/cluster_uba.o
 $(CLUSTER_R4_RUNTIME_VIS_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_runtime_visibility.c

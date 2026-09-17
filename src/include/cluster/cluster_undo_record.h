@@ -429,7 +429,6 @@ cluster_undo_record_decode_payload(const UndoRecordHeader *record, const void *p
 	uint8 expected_kind = ITL_FLAG_ACTIVE;
 	size_t body_length;
 	bool has_history;
-	unsigned i;
 
 	if (body_length_out != NULL)
 		*body_length_out = 0;
@@ -519,6 +518,7 @@ cluster_undo_record_decode_payload(const UndoRecordHeader *record, const void *p
 		uint32 block;
 		uint16 tt;
 		uint16 row;
+		unsigned i;
 
 		if (record->target_block == InvalidBlockNumber
 			|| !OffsetNumberIsValid(record->target_offset)

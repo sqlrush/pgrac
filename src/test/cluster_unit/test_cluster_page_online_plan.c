@@ -90,6 +90,8 @@ typedef struct FakeRecord {
 	RfDetachedRecordPlanV1 plan;
 	union {
 		DecodedXLogRecord decoded;
+		/* Reserves the trailing block array addressed through decoded. */
+		/* cppcheck-suppress unusedStructMember */
 		char padding[sizeof(DecodedXLogRecord)
 					 + RF_PAGE_STABLE_MAX_COMPONENTS * sizeof(DecodedBkpBlock)];
 	} storage;

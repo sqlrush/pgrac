@@ -189,7 +189,7 @@ rf_page_storage_install_execute_v1(const RfPageStorageInstallRequestV1 *request,
 
 	for (i = 0; i < request->component_count; i++) {
 		const RfPageStorageInstallComponentV1 *component = &request->components[i];
-		char *prepared = request->prepared_pages + (Size)i * BLCKSZ;
+		const char *prepared = request->prepared_pages + (Size)i * BLCKSZ;
 		char *target = request->io_pages + (Size)i * BLCKSZ;
 		bool exists;
 		bool torn;

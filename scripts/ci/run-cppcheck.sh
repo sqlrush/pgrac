@@ -8,9 +8,9 @@
 #    Design: pgrac/docs/ci-static-analysis.md
 #
 #    Scans:
-#      - src/backend/cluster/  (~10 .c files, ~3000 LOC)
-#      - src/include/cluster/  (~10 .h files)
-#      - src/test/cluster_unit/  (~14 .c files)
+#      - src/backend/cluster/
+#      - src/include/cluster/
+#      - src/test/cluster_unit/
 #
 #    Excludes PG-upstream code by design (PG has its own cppcheck
 #    buildfarm + Coverity scan; pgrac is only responsible for cluster
@@ -25,8 +25,8 @@
 #
 # NOTES
 #    Exit codes:
-#      0  - always (warn-only at stage 0.27.5 - 0.30; the SARIF
-#           artifact carries the actual findings, not the exit code)
+#      0  - scan completed with no findings beyond the frozen baseline
+#      1  - new findings (strict baseline comparison)
 #      2  - cppcheck binary not found
 #
 #    Configuration:
@@ -36,7 +36,7 @@
 #         'missingInclude' because cppcheck cannot resolve PG's
 #         hand-rolled include layout reliably)
 #      --inline-suppr      enable inline /* cppcheck-suppress xxx */
-#      --suppressions-list scripts/ci/cppcheck-suppressions.txt
+#      --suppress=...     narrowly documented CLI suppressions below
 #      --xml --xml-version=2  machine-readable for artifact upload
 #      -DUSE_PGRAC_CLUSTER=1  match enable-cluster build mode
 #
@@ -98,6 +98,21 @@ PG_HEADER_SUPP=(
   # are out of pgrac scope per spec-0.27.5 §1.2.
   --suppress=constParameterPointer:src/include/port/atomics/generic.h
   --suppress=integerOverflowCond:src/include/port/atomics/generic.h
+  # The initdb fixture includes PG's complete initdb.c and file_utils.c.
+  # These exact sites are unchanged upstream bodies, not PGRAC sections.
+  --suppress=knownConditionTrueFalse:src/common/file_utils.c:432
+  --suppress=knownConditionTrueFalse:src/bin/initdb/initdb.c:1519
+  --suppress=variableScope:src/bin/initdb/initdb.c:888
+  --suppress=variableScope:src/bin/initdb/initdb.c:980
+  --suppress=variableScope:src/bin/initdb/initdb.c:1176
+  --suppress=shadowVariable:src/bin/initdb/initdb.c:857
+  --suppress=shadowVariable:src/bin/initdb/initdb.c:1087
+  --suppress=constVariablePointer:src/bin/initdb/initdb.c:515
+  --suppress=constVariablePointer:src/bin/initdb/initdb.c:2167
+  --suppress=constVariablePointer:src/bin/initdb/initdb.c:2168
+  --suppress=constVariablePointer:src/bin/initdb/initdb.c:2169
+  --suppress=constVariablePointer:src/bin/initdb/initdb.c:2225
+  --suppress=constVariablePointer:src/bin/initdb/initdb.c:2625
 )
 
 # Reason: PG's Assert() is non-trapping by spec to cppcheck (it has no
@@ -226,8 +241,8 @@ UNIT_STUB_SUPP=(
 echo "## cppcheck $(cppcheck --version)"
 echo "Scanning: ${CLUSTER_DIRS[*]}"
 
-# --error-exitcode=0 keeps the exit non-fatal (warn-only).  Findings
-# go to cppcheck.xml; a human-readable summary is built downstream.
+# The scanner writes all findings first; the strict baseline comparison
+# below determines the final exit status without losing the XML artifact.
 cppcheck \
   --enable=warning,style,performance,portability \
   "${GLOBAL_SUPP[@]}" \
@@ -242,6 +257,36 @@ cppcheck \
   -DUSE_PGRAC_CLUSTER=1 \
   '-DHEAPAM_SOURCE_PATH="src/backend/access/heap/heapam.c"' \
   '-DTT_LOCAL_SOURCE_PATH="src/backend/cluster/cluster_tt_local.c"' \
+  "-DCLUSTER_CR_SOURCE_PATH=\"$REPO_ROOT/src/backend/cluster/cluster_cr.c\"" \
+  '-DCR_SERVER_HEADER_PATH="src/include/cluster/cluster_cr_server.h"' \
+  '-DCR_SERVER_SOURCE_PATH="src/backend/cluster/cluster_cr_server.c"' \
+  '-DCR_SOURCE_PATH="src/backend/cluster/cluster_cr.c"' \
+  '-DGCS_HEADER_PATH="src/include/cluster/cluster_gcs_block.h"' \
+  '-DGCS_SOURCE_PATH="src/backend/cluster/cluster_gcs_block.c"' \
+  '-DPCM_HEADER_PATH="src/include/cluster/cluster_pcm_lock.h"' \
+  '-DPCM_SOURCE_PATH="src/backend/cluster/cluster_pcm_lock.c"' \
+  '-DBUFMGR_SOURCE_PATH="src/backend/storage/buffer/bufmgr.c"' \
+  '-DIC_HEADER_PATH="src/include/cluster/cluster_ic.h"' \
+  '-DITL_HEADER_PATH="src/include/cluster/cluster_itl.h"' \
+  '-DHEAP_VIS_SOURCE_PATH="src/backend/access/heap/heapam_visibility.c"' \
+  '-DVIS_RESOLVE_SOURCE_PATH="src/backend/cluster/cluster_visibility_resolve.c"' \
+  '-DTT_STATUS_HEADER_PATH="src/include/cluster/cluster_tt_status.h"' \
+  '-DTT_STATUS_SOURCE_PATH="src/backend/cluster/cluster_tt_status.c"' \
+  '-DTT_HINT_HEADER_PATH="src/include/cluster/cluster_tt_status_hint.h"' \
+  '-DTT_HINT_SOURCE_PATH="src/backend/cluster/cluster_tt_status_hint.c"' \
+  '-DMULTIXACT_HEADER_PATH="src/include/cluster/cluster_multixact.h"' \
+  '-DMULTIXACT_SOURCE_PATH="src/backend/cluster/cluster_multixact.c"' \
+  '-DTX_RESOLVE_HEADER_PATH="src/include/cluster/cluster_tx_resolve.h"' \
+  '-DTX_RESOLVE_SOURCE_PATH="src/backend/cluster/cluster_tx_resolve.c"' \
+  '-DSEMANTIC_HEADER_PATH="src/include/cluster/cluster_semantic_activation.h"' \
+  '-DSEMANTIC_SOURCE_PATH="src/backend/cluster/cluster_semantic_activation.c"' \
+  '-DQVOTEC_SOURCE_PATH="src/backend/cluster/cluster_qvotec.c"' \
+  '-DTT_2PC_SOURCE_PATH="src/backend/cluster/cluster_tt_2pc.c"' \
+  '-DTWOPHASE_SOURCE_PATH="src/backend/access/transam/twophase.c"' \
+  '-DHEAPAM_VISIBILITY_SOURCE_PATH="src/backend/access/heap/heapam_visibility.c"' \
+  '-DXACT_SOURCE_PATH="src/backend/access/transam/xact.c"' \
+  '-DHEAPAM_HANDLER_SOURCE_PATH="src/backend/access/heap/heapam_handler.c"' \
+  '-DNBTINSERT_SOURCE_PATH="src/backend/access/nbtree/nbtinsert.c"' \
   --quiet \
   "${CLUSTER_DIRS[@]}" \
   2> cppcheck.xml

@@ -34,7 +34,7 @@ cluster_remote_xact_prepare_digest_v2(uint64 system_identifier, int origin_node,
 	if (gid_len == 0 || gid_len >= GIDSIZE)
 		return false;
 
-	MemSet(identity, 0, sizeof(identity));
+	memset(identity, 0, sizeof(identity));
 	for (i = 0; i < 8; i++)
 		identity[i] = (uint8)(system_identifier >> (56 - i * 8));
 	identity[8] = (uint8)origin_node;

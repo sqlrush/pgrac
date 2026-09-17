@@ -223,7 +223,7 @@ remote_xact_force_durable(int pageno)
 	 * force the exact segment synchronously before returning to the caller.
 	 */
 	SimpleLruWriteAll(ClusterRemoteXactCtl, true);
-	MemSet(&tag, 0, sizeof(tag));
+	memset(&tag, 0, sizeof(tag));
 	tag.segno = (uint32)(pageno / SLRU_PAGES_PER_SEGMENT);
 	if (SlruSyncFileTag(ClusterRemoteXactCtl, &tag, path) != 0)
 		ereport(ERROR,
@@ -422,7 +422,6 @@ cluster_remote_xact_reset_range_v2(int origin_node, TransactionId first_xid, uin
 			}
 			if (page_changed) {
 				uint32 segno = (uint32)(pageno / SLRU_PAGES_PER_SEGMENT);
-				uint32 i;
 
 				ClusterRemoteXactCtl->shared->page_dirty[slotno] = true;
 				changed = true;
@@ -450,7 +449,7 @@ cluster_remote_xact_reset_range_v2(int origin_node, TransactionId first_xid, uin
 			FileTag tag;
 			char path[MAXPGPATH];
 
-			MemSet(&tag, 0, sizeof(tag));
+			memset(&tag, 0, sizeof(tag));
 			tag.segno = touched_segments[i];
 			if (SlruSyncFileTag(ClusterRemoteXactCtl, &tag, path) != 0)
 				ereport(ERROR,

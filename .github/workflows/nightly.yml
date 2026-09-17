@@ -141,7 +141,7 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          - { name: foundation-core,   ranges: "001-030", unit: true,  regress: true }
+          - { name: foundation-core,   ranges: "001-031", unit: true,  regress: true }
           - { name: foundation-stage1, ranges: "050-071", unit: false, regress: false }
           - { name: stage2-ic-cssd,    ranges: "072-099", unit: false, regress: false }
           - { name: stage2-gcs,        ranges: "100-118", unit: false, regress: false }

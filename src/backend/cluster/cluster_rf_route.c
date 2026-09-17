@@ -15,6 +15,8 @@
 typedef struct RfOpcodeRouteManifestEntryV1 {
 	RfOpcodeRouteV1 route;
 	bool active;
+	/* Retain the manifest label for debugger inspection of generated rows. */
+	/* cppcheck-suppress unusedStructMember */
 	const char *diagnostic_name;
 } RfOpcodeRouteManifestEntryV1;
 

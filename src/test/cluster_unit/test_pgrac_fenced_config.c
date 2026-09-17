@@ -60,6 +60,8 @@ UT_TEST(test_config_rejects_noncanonical_numeric_and_hex)
 	memcpy(changed, valid_config, sizeof(valid_config));
 	at = strstr(changed, "mapping_generation=7");
 	UT_ASSERT_NOT_NULL(at);
+	if (at == NULL)
+		return;
 	memmove(at + strlen("mapping_generation=") + 2, at + strlen("mapping_generation=") + 1,
 			sizeof(valid_config) - (at - changed + strlen("mapping_generation=") + 1));
 	at[strlen("mapping_generation=")] = '0';
@@ -70,6 +72,8 @@ UT_TEST(test_config_rejects_noncanonical_numeric_and_hex)
 	memcpy(changed, valid_config, sizeof(valid_config));
 	at = strstr(changed, "storage_uuid=");
 	UT_ASSERT_NOT_NULL(at);
+	if (at == NULL)
+		return;
 	at[strlen("storage_uuid=") + 20] = 'A';
 	UT_ASSERT_NE(pgrac_fenced_config_parse_v1((const uint8 *)changed, sizeof(changed) - 1, &config),
 				 PGRAC_FENCED_CONFIG_OK);
@@ -104,6 +108,8 @@ UT_TEST(test_config_rejects_mismatched_node_and_oversize)
 	memcpy(changed, valid_config, sizeof(valid_config));
 	at = strstr(changed, "node.0.target_uuid");
 	UT_ASSERT_NOT_NULL(at);
+	if (at == NULL)
+		return;
 	at[5] = '1';
 	UT_ASSERT_NE(pgrac_fenced_config_parse_v1((const uint8 *)changed, sizeof(changed) - 1, &config),
 				 PGRAC_FENCED_CONFIG_OK);
@@ -180,6 +186,8 @@ UT_TEST(test_mapping_reload_generation_rules)
 	memcpy(changed, valid_config, sizeof(changed));
 	at = strstr(changed, "node.0.target_uuid=");
 	UT_ASSERT_NOT_NULL(at);
+	if (at == NULL)
+		return;
 	at[strlen("node.0.target_uuid=")] = 'e';
 	UT_ASSERT_EQ(
 		pgrac_fenced_config_parse_v1((const uint8 *)changed, sizeof(changed) - 1, &candidate),
@@ -193,6 +201,8 @@ UT_TEST(test_mapping_reload_generation_rules)
 	memcpy(changed, valid_config, sizeof(changed));
 	at = strstr(changed, "mapping_generation=7");
 	UT_ASSERT_NOT_NULL(at);
+	if (at == NULL)
+		return;
 	at[strlen("mapping_generation=")] = '8';
 	UT_ASSERT_EQ(
 		pgrac_fenced_config_parse_v1((const uint8 *)changed, sizeof(changed) - 1, &candidate),

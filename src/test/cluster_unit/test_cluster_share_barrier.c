@@ -151,7 +151,7 @@ clean_fixture(void)
 {
 	BarrierFixture fixture;
 
-	MemSet(&fixture, 0, sizeof(fixture));
+	memset(&fixture, 0, sizeof(fixture));
 	fixture.outer_lock = true;
 	fixture.first_buffer_lock = true;
 	fixture.cached_share_cover = true;

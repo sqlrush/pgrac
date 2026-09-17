@@ -117,6 +117,8 @@ build_record(bool edge_first, bool edge_block_mismatch, size_t *record_size)
 	*record_size = SizeOfXLogRecord + edge_len + block_len;
 	record = calloc(1, *record_size);
 	UT_ASSERT(record != NULL);
+	if (record == NULL)
+		abort();
 	record->xl_tot_len = *record_size;
 	target = (uint8 *)record + SizeOfXLogRecord;
 	if (edge_first) {
@@ -142,6 +144,8 @@ build_block_only_record(size_t *record_size)
 				   + sizeof(BlockNumber);
 	record = calloc(1, *record_size);
 	UT_ASSERT(record != NULL);
+	if (record == NULL)
+		abort();
 	record->xl_tot_len = *record_size;
 	target = (uint8 *)record + SizeOfXLogRecord;
 	target += append_block_ref(target, 0);

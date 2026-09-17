@@ -22,9 +22,9 @@
 #
 # NOTES
 #    Exit codes:
-#      0  - always (warn-only at stage 0.27.5 - 0.30; HTML reports in
-#           scan-build-report/ carry the actual findings)
+#      0  - analysis completed (findings retain the existing warn-only policy)
 #      2  - scan-build binary not found
+#      other - preparation, compiler or analyzer execution failed
 #
 #    Enabled checkers:
 #      security      use-after-free / buffer overrun / integer overflow
@@ -37,7 +37,7 @@
 #
 #-------------------------------------------------------------------------
 
-set -uo pipefail
+set -euo pipefail
 
 if ! command -v scan-build >/dev/null 2>&1; then
   echo "ERROR: scan-build not installed" >&2
@@ -46,6 +46,12 @@ fi
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT" || exit 2
+
+CI_ANALYZE_JOBS="${CI_ANALYZE_JOBS:-$(getconf _NPROCESSORS_ONLN)}"
+if ! [[ "$CI_ANALYZE_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "ERROR: CI_ANALYZE_JOBS must be a positive integer" >&2
+  exit 2
+fi
 
 OUT_DIR=scan-build-report
 rm -rf "$OUT_DIR"
@@ -74,14 +80,13 @@ scan-build \
   -disable-checker deadcode.DeadStores \
   -disable-checker security.insecureAPI \
   --keep-empty \
-  make -C src/backend/cluster \
-  2>&1 | tee "$OUT_DIR/scan-build.log" \
-  || true
+  make -j"$CI_ANALYZE_JOBS" -C src/backend/cluster \
+  2>&1 | tee "$OUT_DIR/scan-build.log"
 
 REPORT_COUNT=$(find "$OUT_DIR" -name 'report-*.html' 2>/dev/null | wc -l | tr -d ' ')
 echo "## scan-build summary"
 echo "scan-build issued $REPORT_COUNT bug reports"
 echo "Open: $OUT_DIR/index.html (or any report-*.html)"
 
-# Always succeed; CI artifact carries the findings.
+# Only successful execution reaches here; artifacts carry analyzer findings.
 exit 0

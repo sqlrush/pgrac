@@ -190,7 +190,7 @@ UT_TEST(test_socket_join_fifo_and_different_target_concurrency)
 	PgracFencedConfigV1 config;
 	PgracFencedCoordinatorV1 coordinator;
 	PgracExternalFenceProtocolRequestV1 requests[4];
-	PgracExternalFenceProtocolResponseV1 responses[4];
+	PgracExternalFenceProtocolResponseV1 responses[4] = { 0 };
 	bool received[4] = { false, false, false, false };
 	struct timespec pause = { 0, 1000000 };
 	int sockets[4][2];
@@ -270,8 +270,8 @@ UT_TEST(test_queued_deadline_is_durably_invalidated_without_action)
 	PgracFencedCoordinatorV1 coordinator;
 	PgracExternalFenceProtocolRequestV1 owner_request;
 	PgracExternalFenceProtocolRequestV1 queued_request;
-	PgracExternalFenceProtocolResponseV1 owner_response;
-	PgracExternalFenceProtocolResponseV1 queued_response;
+	PgracExternalFenceProtocolResponseV1 owner_response = { 0 };
+	PgracExternalFenceProtocolResponseV1 queued_response = { 0 };
 	struct timespec pause = { 0, 1000000 };
 	struct timespec expire = { 0, 30000000 };
 	int owner_sockets[2];
@@ -333,7 +333,7 @@ UT_TEST(test_partial_ingress_never_blocks_other_clients_or_workers)
 	PgracFencedConfigV1 config;
 	PgracFencedCoordinatorV1 coordinator;
 	PgracExternalFenceProtocolRequestV1 request;
-	PgracExternalFenceProtocolResponseV1 response;
+	PgracExternalFenceProtocolResponseV1 response = { 0 };
 	uint8 frame[PGRAC_EXTERNAL_FENCE_REQUEST_V1_BYTES];
 	struct timespec pause = { 0, 1000000 };
 	struct timespec expire = { 0, 120000000 };
@@ -401,8 +401,8 @@ UT_TEST(test_clean_shutdown_durably_invalidates_accepted_queue)
 	PgracFencedCoordinatorV1 coordinator;
 	PgracExternalFenceProtocolRequestV1 owner_request;
 	PgracExternalFenceProtocolRequestV1 queued_request;
-	PgracExternalFenceProtocolResponseV1 owner_response;
-	PgracExternalFenceProtocolResponseV1 queued_response;
+	PgracExternalFenceProtocolResponseV1 owner_response = { 0 };
+	PgracExternalFenceProtocolResponseV1 queued_response = { 0 };
 	struct timespec pause = { 0, 1000000 };
 	int owner_sockets[2];
 	int queued_sockets[2];
@@ -466,7 +466,7 @@ UT_TEST(test_mapping_reload_closes_old_admissions_before_new_mapping)
 	PgracExternalFenceProtocolRequestV1 owner_request;
 	PgracExternalFenceProtocolRequestV1 queued_request;
 	PgracExternalFenceProtocolRequestV1 fresh_request;
-	PgracExternalFenceProtocolResponseV1 response;
+	PgracExternalFenceProtocolResponseV1 response = { 0 };
 	uint8 candidate_digest[32];
 	struct timespec pause = { 0, 1000000 };
 	int owner_sockets[2];
@@ -553,8 +553,8 @@ UT_TEST(test_reload_during_active_operation_invalidates_queue_without_abort)
 	PgracFencedCoordinatorV1 coordinator;
 	PgracExternalFenceProtocolRequestV1 owner_request;
 	PgracExternalFenceProtocolRequestV1 queued_request;
-	PgracExternalFenceProtocolResponseV1 owner_response;
-	PgracExternalFenceProtocolResponseV1 queued_response;
+	PgracExternalFenceProtocolResponseV1 owner_response = { 0 };
+	PgracExternalFenceProtocolResponseV1 queued_response = { 0 };
 	struct timespec pause = { 0, 1000000 };
 	int owner_sockets[2];
 	int queued_sockets[2];

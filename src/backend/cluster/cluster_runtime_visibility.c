@@ -2616,7 +2616,8 @@ cluster_runtime_visibility_resolve_terminal_census_retained_remote_exact(
 	return CLUSTER_TX_COMMITTED;
 
 failed:
-	memset(out, 0, sizeof(*out));
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
 	if (reason_out != NULL)
 		*reason_out = reason;
 	return CLUSTER_TX_UNKNOWN;

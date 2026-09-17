@@ -232,7 +232,6 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_BLOCK_WRITE: {
 		xl_undo_block_write rec;
 		uint32 body_len;
-		uint32 expected;
 
 		if (XLogRecGetDataLen(record) < sizeof(rec))
 			return false;
@@ -244,7 +243,8 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 			if (body_len != BLCKSZ || rec.rec_off != 0 || rec.rec_len != 0 || rec.slot_off != 0)
 				return false;
 		} else {
-			expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len + sizeof(UndoSlotDirEntry);
+			uint32 expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len + sizeof(UndoSlotDirEntry);
+
 			if (rec.rec_off < sizeof(UndoBlockHeader) || rec.rec_len == 0
 				|| (uint32)rec.rec_off + rec.rec_len > BLCKSZ
 				|| rec.slot_off < sizeof(UndoBlockHeader)
@@ -267,7 +267,6 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 	case CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI: {
 		xl_undo_block_write_multi rec;
 		uint32 body_len;
-		uint32 expected;
 
 		if (XLogRecGetDataLen(record) < sizeof(rec))
 			return false;
@@ -280,7 +279,8 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 				|| rec.slot_len != 0)
 				return false;
 		} else {
-			expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len + rec.slot_len;
+			uint32 expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len + rec.slot_len;
+
 			if (rec.rec_off < sizeof(UndoBlockHeader) || rec.rec_len == 0
 				|| (uint32)rec.rec_off + rec.rec_len > BLCKSZ
 				|| rec.slot_off < sizeof(UndoBlockHeader) || rec.slot_len == 0
@@ -471,15 +471,11 @@ ClusterUndoTargetPreflightV1
 cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 {
 	TTSlot slot;
-	ClusterTTActiveTransitionDecision bind_decision;
-	ClusterTTTerminalTransitionDecision abort_decision;
-	ClusterUndoTtCtrcReleaseRedoDecision release_decision;
-	xl_undo_tt_slot_ctrc_release_v1 release_record;
 
 	if (!cluster_undo_preflight(decoded))
 		return CLUSTER_UNDO_TARGET_BLOCKED;
 	if (decoded->kind == CLUSTER_UNDO_KIND_TT_BIND) {
-		bind_decision = cluster_tt_durable_bind_preflight_exact(
+		ClusterTTActiveTransitionDecision bind_decision = cluster_tt_durable_bind_preflight_exact(
 			decoded->instance, decoded->segment_id, decoded->expected_generation,
 			decoded->slot_offset, decoded->wrap, decoded->xid);
 		if (bind_decision == CLUSTER_TT_ACTIVE_APPLY)
@@ -492,9 +488,10 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 	}
 	if (decoded->kind == CLUSTER_UNDO_KIND_TT_ABORT
 		&& decoded->format_version == CLUSTER_UNDO_TT_ABORT_EXACT_VERSION) {
-		abort_decision = cluster_tt_durable_abort_preflight_exact(
-			decoded->instance, decoded->segment_id, decoded->expected_generation,
-			decoded->slot_offset, decoded->wrap, decoded->xid);
+		ClusterTTTerminalTransitionDecision abort_decision
+			= cluster_tt_durable_abort_preflight_exact(
+				decoded->instance, decoded->segment_id, decoded->expected_generation,
+				decoded->slot_offset, decoded->wrap, decoded->xid);
 		if (abort_decision == CLUSTER_TT_TERMINAL_APPLY)
 			return CLUSTER_UNDO_TARGET_APPLY;
 		if (abort_decision == CLUSTER_TT_TERMINAL_IDEMPOTENT
@@ -503,6 +500,9 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 		return CLUSTER_UNDO_TARGET_BLOCKED;
 	}
 	if (decoded->kind == CLUSTER_UNDO_KIND_TT_CTRC_RELEASE) {
+		ClusterUndoTtCtrcReleaseRedoDecision release_decision;
+		xl_undo_tt_slot_ctrc_release_v1 release_record;
+
 		if (!cluster_undo_ctrc_release_from_decoded(decoded, &release_record))
 			return CLUSTER_UNDO_TARGET_BLOCKED;
 		release_decision = cluster_tt_durable_ctrc_release_preflight_exact(&release_record);

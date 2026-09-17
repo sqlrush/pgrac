@@ -382,7 +382,6 @@ cluster_cf_phase2_write_ack(const char *shared_dir, int probe_owner, int respond
 	ClusterCfPhase2RecordV2 probe;
 	char final_rel[MAXPGPATH];
 	char tmp_rel[MAXPGPATH];
-	char final_path[MAXPGPATH];
 
 	if (shared_dir == NULL || shared_dir[0] == '\0' || probe_nonce == 0
 		|| !cf_phase2_node_valid(probe_owner) || !cf_phase2_node_valid(responder)
@@ -399,6 +398,8 @@ cluster_cf_phase2_write_ack(const char *shared_dir, int probe_owner, int respond
 	/* A delayed old-nonce writer cannot leave a positive ACK after drift. */
 	if (!cluster_cf_phase2_read_probe(shared_dir, probe_owner, &probe)
 		|| probe.probe_nonce != probe_nonce) {
+		char final_path[MAXPGPATH];
+
 		if (cf_phase2_path(final_path, shared_dir, final_rel))
 			(void)unlink(final_path);
 		return false;
