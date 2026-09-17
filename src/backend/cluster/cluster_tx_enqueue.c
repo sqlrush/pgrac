@@ -738,6 +738,13 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 					final_reason = CLUSTER_TX_RESOLVE_RF_DEFERRED;
 					break;
 				}
+				/* Consume against the published wait before another resolve.
+				 * Leave through the same exact cleanup as every other exit. */
+				if (cluster_cancel_token_consume()) {
+					result = CLUSTER_TXW_DEADLOCK;
+					final_reason = CLUSTER_TX_RESOLVE_NONE;
+					break;
+				}
 				memset(&resolution, 0, sizeof(resolution));
 				current_outcome = cluster_tx_resolve_exact(
 					&target_locator, CLUSTER_TX_RESOLVE_ROW_WAIT, &resolution, &current_reason);
