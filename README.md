@@ -6,14 +6,14 @@ PostgreSQL has never had a shared-disk, multi-active cluster (its HA is
 shared-nothing replication). pgrac brings the Oracle RAC model — many nodes,
 one shared database, Cache Fusion / SCN / GES — to PostgreSQL 16.13.
 
-> **MVP 1: [v0.130.0-mvp.1](docs/release-notes/v0.130.0-mvp.1.md).**
+> **First stable MVP: [v0.130.0](docs/release-notes/v0.130.0.md).**
 >
-> The first frozen MVP has passed four-node point-update workloads with 8 and
-> 16 clients per node, complete million-row data comparisons, health and
-> outstanding-work checks, coordinated normal shutdown, same-data normal
-> restart, and another workload with all checks repeated after restart.
+> The CI-qualified MVP now has four valid four-node point-update samples with
+> 32 clients per node, complete million-row data comparisons, health and
+> outstanding-work checks, and normal shutdown. It also retains the earlier
+> 8/16-client, soak, block-transfer and same-data normal-restart acceptance.
 >
-> **Evaluation only, not production certified.** This acceptance does not
+> **Stable within the tested MVP scope, not production certified.** This does not
 > certify crash recovery, failover, rolling upgrades, all SQL features or
 > performance targets. See the release notes for the exact scope and limitations.
 >
@@ -63,10 +63,11 @@ More diagrams and deep-dives at **[pgrac.dev](https://pgrac.dev)**.
 
 ## Documentation
 
-Start with the version-pinned [MVP 1 manual](docs/mvp/v0.130.0-mvp.1/README.md):
-Linux four-node deployment and shared-storage prerequisites, all added
-parameters, all system-view fields, and core capabilities. It distinguishes
-the validated evaluation scope from unqualified multi-host/failover deployment.
+Start with the [stable MVP guide](docs/mvp/v0.130.0/README.md) and
+[single-host Linux Quick Start](docs/mvp/v0.130.0/quickstart-linux-single-host.md).
+The guide links the parameter, system-view and capability references, and
+distinguishes tested single-host operation from unqualified multi-host/failover
+deployment. The historical prerelease manual remains available unchanged.
 
 User-facing manual:
 
@@ -85,19 +86,19 @@ from the upstream tree.
 
 ## Quick start
 
-For the frozen MVP, first read the
-[deployment guide and known build limits](docs/mvp/v0.130.0-mvp.1/01-linux-four-node-deployment.md).
-The tag is an evaluation source snapshot, not a turnkey production installer.
+For the stable MVP, follow the
+[single-host Linux guide](docs/mvp/v0.130.0/quickstart-linux-single-host.md).
+This is a source release, not a turnkey production installer.
 
 ```bash
-git clone --branch v0.130.0-mvp.1 --single-branch \
+git clone --branch v0.130.0 --single-branch \
   https://github.com/sqlrush/pgrac.git pgrac-mvp1
 cd pgrac-mvp1
 git rev-parse HEAD
 cat PGRAC_VERSION
 ```
 
-Follow the pinned guide for compilation, initialization and the explicit
+Follow the guide for compilation, initialization and the explicit
 four-host deployment-validation boundary. Do not independently initialize four
 databases or share one PGDATA among four postmasters.
 
