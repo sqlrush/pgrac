@@ -95,7 +95,7 @@ unset PGRAC_TEST_TWO_STAGE_VOTING_LOOP
 
 ## 5. 初始化并启动四实例
 
-脚本建立一个数据库身份及四个独立 PGDATA，共享业务数据文件；自动分配端口、配置互联与投票设备，创建 `postgres` 数据库中的 `quickstart_demo` 表。表结构在 seed 阶段创建后克隆；本示例不演示在线 DDL 或 `CREATE DATABASE`。
+脚本建立一个数据库身份及四个独立 PGDATA，共享业务数据文件；自动分配端口、配置互联与投票设备，创建 `postgres` 数据库中的 `quickstart_demo` 表。表结构在 seed 阶段创建后克隆；本示例不启用共享系统目录，请勿在运行后单独建表、改表或执行 `CREATE DATABASE`。
 
 ```bash
 sudo -v
