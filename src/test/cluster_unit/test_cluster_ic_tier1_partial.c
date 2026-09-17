@@ -647,10 +647,21 @@ UT_TEST(test_close_peer_resets_queued_tail)
 {
 	static char frame_c[2048];
 	ClusterICSendResult rc;
+	int sends;
 
 	memset(frame_c, 'C', sizeof(frame_c));
 	(void)ut_fill_until_eagain(ut_tx_fd);
-	rc = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame_c, sizeof(frame_c));
+	/* Model socket room reopening between the fill probe and the smaller
+	 * frame.  A previous EAGAIN does not reserve backpressure for this send. */
+	(void)ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, (long)sizeof(ut_acc));
+	/* Establish the queued-tail precondition through real sends, rather than
+	 * assuming a smaller frame cannot fit after the 4096-byte fill probe.
+	 * Keep the same 64 MB runaway bound as the socket-fill helper. */
+	for (sends = 0; sends < 32768; sends++) {
+		rc = ClusterICOps_Tier1.send_bytes(UT_PEER_ID, frame_c, sizeof(frame_c));
+		if (rc != CLUSTER_IC_SEND_DONE)
+			break;
+	}
 	UT_ASSERT(rc == CLUSTER_IC_SEND_WOULD_BLOCK);
 	UT_ASSERT(cluster_ic_tier1_pending_outbound(UT_PEER_ID));
 
