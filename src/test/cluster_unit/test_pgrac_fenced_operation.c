@@ -44,12 +44,17 @@ typedef enum TestProviderMode {
 static TestProviderMode provider_mode;
 static unsigned int resolve_calls;
 static volatile uint32 *shared_provider_counts;
+static volatile uint32 *timeout_stage_entered;
+static bool delay_before_timeout_stage;
 
 static PgracFencedProviderResult
 test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
 			 int32 *native_status)
 {
 	resolve_calls++;
+	/* Model setup/journal latency before the action/readback fault is reached. */
+	if (delay_before_timeout_stage)
+		(void)usleep(50000);
 	if (provider_mode == TEST_PROVIDER_RESOLVE_SLOW)
 		(void)usleep(200000);
 	if (provider_mode == TEST_PROVIDER_RESOLVE_UNAVAILABLE)
@@ -70,8 +75,11 @@ test_actuate(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32
 	(void)deadline_mono_ns;
 	if (shared_provider_counts != NULL)
 		shared_provider_counts[0]++;
-	if (provider_mode == TEST_PROVIDER_ACTION_SLOW)
-		(void)usleep(200000);
+	if (provider_mode == TEST_PROVIDER_ACTION_SLOW) {
+		if (timeout_stage_entered != NULL)
+			*timeout_stage_entered = TEST_PROVIDER_ACTION_SLOW;
+		(void)usleep(2000000);
+	}
 	if (provider_mode == TEST_PROVIDER_ACTION_UNKNOWN) {
 		*native_status = 71;
 		return PGRAC_FENCED_PROVIDER_UNKNOWN;
@@ -90,8 +98,11 @@ test_readback(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 	memset(out, 0, sizeof(*out));
 	if (shared_provider_counts != NULL)
 		readback_call = ++shared_provider_counts[1];
-	if (provider_mode == TEST_PROVIDER_READBACK_SLOW)
-		(void)usleep(200000);
+	if (provider_mode == TEST_PROVIDER_READBACK_SLOW) {
+		if (timeout_stage_entered != NULL)
+			*timeout_stage_entered = TEST_PROVIDER_READBACK_SLOW;
+		(void)usleep(2000000);
+	}
 	if (provider_mode == TEST_PROVIDER_READBACK_UNAVAILABLE)
 		return PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 	if (provider_mode == TEST_PROVIDER_READBACK_UNKNOWN)
@@ -430,19 +441,35 @@ UT_TEST(test_deadline_owner_maps_slow_action_and_readback_to_timeout)
 	make_config(&config);
 	make_ops(&ops);
 	make_request(&config, &request);
+	timeout_stage_entered = mmap(NULL, sizeof(*timeout_stage_entered), PROT_READ | PROT_WRITE,
+								 MAP_SHARED | MAP_ANON, -1, 0);
+	UT_ASSERT(timeout_stage_entered != MAP_FAILED);
+	if (timeout_stage_entered == MAP_FAILED) {
+		timeout_stage_entered = NULL;
+		return;
+	}
+	delay_before_timeout_stage = true;
 	for (i = 0; i < lengthof(modes); i++) {
 		int fd;
 		size_t count;
 
 		provider_mode = modes[i];
+		*timeout_stage_entered = 0;
 		fd = open_context(&context, &journal_state, &config, &ops, path);
 		if (fd < 0)
-			return;
-		UT_ASSERT(
-			pgrac_fenced_operation_acquire(&context, &request, deadline_after_ms(20), &response));
+			break;
+		/*
+		 * Use the fixture's one-second request budget to reach the target stage;
+		 * its two-second injected stall must then hit the real deadline.  A
+		 * 20ms whole-operation deadline could expire during setup, testing a
+		 * different branch without ever executing the intended provider fault.
+		 */
+		UT_ASSERT(pgrac_fenced_operation_acquire(&context, &request,
+												 deadline_after_ms(request.timeout_ms), &response));
 		UT_ASSERT_EQ(response.verdict, 4);
 		UT_ASSERT_EQ(response.deny_reason, 11);
 		UT_ASSERT_EQ(response.proof_generation, 0);
+		UT_ASSERT_EQ(*timeout_stage_entered, modes[i]);
 		count = read_journal_records(fd, records, lengthof(records));
 		UT_ASSERT(count > 0);
 		if (count > 0) {
@@ -452,6 +479,9 @@ UT_TEST(test_deadline_owner_maps_slow_action_and_readback_to_timeout)
 		(void)close(fd);
 		(void)unlink(path);
 	}
+	delay_before_timeout_stage = false;
+	UT_ASSERT_EQ(munmap((void *)timeout_stage_entered, sizeof(*timeout_stage_entered)), 0);
+	timeout_stage_entered = NULL;
 }
 
 UT_TEST(test_journal_failure_is_sticky_and_prevents_provider_calls)
