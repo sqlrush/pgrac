@@ -48,7 +48,11 @@ Author: SqlRush <sqlrush@gmail.com>
 
 ### 3.1 文件系统后端
 
-首次评估选择 `cluster.shared_storage_backend = 'cluster_fs'`。必须先由操作系统/存储管理员把真正共享的文件系统挂载好，再配置 `cluster.shared_data_dir`。
+本 MVP 的四实例验收使用 `cluster.shared_storage_backend = 'cluster_fs'`，但它只是数据库后端名称，不是用户要安装的文件系统名称。
+
+**四台独立主机的具体准备参考路线：RHEL 9 x86_64 + 共享块存储 + 共享 LVM + GFS2。** 先完成存储集群、DLM、fencing 和四机同卷挂载，再配置 `cluster.shared_data_dir`。这是待验证的四机准备路线，不是已完成的 PGRAC 兼容认证。同一 Linux 内核下四实例共用本地目录，不需要 GFS2，不能混为一种部署。
+
+安装前必须先读并完成[共享存储准备与校验附录](storage-preparation.md)：组件/设备清单、配置值、权限与挂载检查、保持文件打开的跨节点读写检查、锁与持久化边界、停止条件。它不是仅要求“准备一个共享目录”。
 
 | 要求 | 检查内容 | 不满足时的风险 |
 |---|---|---|
@@ -93,9 +97,16 @@ realpath /srv/pgrac-shared
 
 ## 4. Linux 编译安装：四节点保持一致
 
-建议使用相同 Linux 发行版、CPU 架构、编译器与依赖版本。以下包名以 Debian/Ubuntu 为例，不构成发行版认证。
+建议使用相同 Linux 发行版、CPU 架构、编译器与依赖版本。GFS2 四机参考路线使用 RHEL 9；下列开发依赖和存储附录的 HA/文件系统组件是两组不同依赖，都需准备。包可用性依赖所选发行版的软件渠道，不构成 PGRAC 发行版认证。
 
-管理员安装依赖：
+RHEL 9 管理员安装编译依赖（先启用适用的开发软件渠道）：
+
+```sh
+sudo dnf install gcc make git pkgconf-pkg-config bison flex perl perl-IPC-Run \
+  readline-devel zlib-devel libicu-devel lz4-devel libzstd-devel
+```
+
+Debian/Ubuntu 本机评估环境的对应示例；不要把它当作已经验证的 Ubuntu/GFS2 四机方案：
 
 ```sh
 sudo apt-get update

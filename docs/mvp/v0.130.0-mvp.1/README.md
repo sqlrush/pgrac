@@ -17,6 +17,8 @@ Author: SqlRush <sqlrush@gmail.com>
 
 [完整接口附录](reference/README.md)是第二、三份文档的组成部分，不是另一版本的参考资料。
 
+部署前先读[共享存储安装前准备与校验](storage-preparation.md)：明确本机四实例与 GFS2 四机参考路线，列出配置、只读检查、跨节点可见性/锁检查及停止条件。GFS2 路线尚未获得 PGRAC 四机认证。
+
 ## 使用前必读
 
 - 这是源码快照，不提供已签名二进制或生产认证。已验证范围见[不可变发布说明](https://github.com/sqlrush/pgrac/blob/v0.130.0-mvp.1/docs/release-notes/v0.130.0-mvp.1.md)。
