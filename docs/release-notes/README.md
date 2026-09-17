@@ -4,10 +4,14 @@ Author: SqlRush <sqlrush@gmail.com>
 
 ## Current release
 
-[v0.130.0-mvp.1 — MVP 1](v0.130.0-mvp.1.md) is the first MVP baseline.
-It is an evaluation prerelease, not a production or general-availability release.
-Its release notes explicitly retain the outstanding CI limitation; that
-snapshot-specific publication does not waive stable-release qualification.
+[v0.130.0 — first stable MVP](v0.130.0.md) is the current release. It combines
+the MVP release CI gate with four valid four-node correctness samples on the
+CI-fixed kernel. Stable means the documented MVP scope, not production HA,
+independent-host shared-storage certification or a performance guarantee.
+
+[v0.130.0-mvp.1](v0.130.0-mvp.1.md) remains the immutable first evaluation
+snapshot. Its original CI limitation is retained in its historical notes;
+it is not retroactively qualified by this release.
 
 ## Identifying a release
 
@@ -29,6 +33,7 @@ Versions use `MAJOR.MINOR.PATCH`, optionally followed by a prerelease label:
 | Label | Meaning |
 |---|---|
 | `v0.130.0-mvp.1` | First frozen MVP baseline |
+| `v0.130.0` | First stable release within the documented MVP scope |
 | `-mvp.N`, `-alpha.N`, `-beta.N` | Numbered evaluation prereleases |
 | `-rc.N` | Release candidates with their own published qualification scope |
 | No suffix | Stable release; only after its acceptance criteria pass |
@@ -36,8 +41,8 @@ Versions use `MAJOR.MINOR.PATCH`, optionally followed by a prerelease label:
 Existing historical tags remain unchanged. New feature milestones increment
 the minor version; maintenance releases increment the patch version. Revisions
 within one prerelease line increment its numbered suffix. The `1.0.0` name is
-reserved for the first formally qualified stable release; MVP acceptance does
-not grant that status.
+reserved for the first formally qualified full-product stable release;
+qualification of this narrower MVP scope does not grant that status.
 
 `main` is the integration branch. Feature and fix branches start from an exact
 commit; releases are selected commits, not moving branch names. Published tags
@@ -47,8 +52,8 @@ the superseded release's evidence and limitations.
 ## Selecting a version
 
 ```sh
-git fetch origin tag v0.130.0-mvp.1
-git switch --detach v0.130.0-mvp.1
+git fetch origin tag v0.130.0
+git switch --detach v0.130.0
 git rev-parse HEAD
 cat PGRAC_VERSION
 ```
