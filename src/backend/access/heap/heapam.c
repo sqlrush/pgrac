@@ -1885,12 +1885,12 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 			ClusterTxwResult wait_result;
 			const char *wait_reason;
 
-			/* The existing wait owner releases content before exact blocker
-			 * resolution. Its wake cannot validate this DML's old target. */
+			/* The wait releases content, so its wake requires fresh page/tuple
+			 * qualification, not receipt invalidation. Preserve the receipt
+			 * until the requalified pending-target checks prove a change. */
 			wait_result = cluster_heap_itl_wait_capacity_after_census(
 				buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason);
 			*content_unlocked = true;
-			*targets_invalidated = true;
 			if (wait_result == CLUSTER_TXW_RESOLVED || wait_result == CLUSTER_TXW_RETRY)
 				return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 			ereport(ERROR,
