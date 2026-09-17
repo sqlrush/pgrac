@@ -680,19 +680,26 @@ cluster_lms_outbound_resource_x_intent_pump(void)
 static bool
 lms_outbound_r4_refusal_header_valid(const GcsBlockReplyHeader *header)
 {
+	int32 forwarding_master;
 	int i;
 
 	if (header == NULL || !GcsBlockReplyStatusIsR4Refusal((GcsBlockReplyStatus)header->status)
 		|| header->request_id == 0 || header->checksum != 0 || header->sender_node < 0
 		|| header->sender_node >= CLUSTER_MAX_NODES || header->requester_backend_id <= 0
-		|| header->transition_id != (uint8)PCM_TRANS_N_TO_S
-		|| GcsBlockReplyHeaderGetForwardingMasterNode(header)
-			   != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER)
+		|| header->transition_id != (uint8)PCM_TRANS_N_TO_S)
+		return false;
+	forwarding_master = GcsBlockReplyHeaderGetForwardingMasterNode(header);
+	if (forwarding_master < GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+		|| forwarding_master >= CLUSTER_MAX_NODES)
 		return false;
 	for (i = 0; i < (int)sizeof(header->reserved_0); i++)
 		if (header->reserved_0[i] != 0)
 			return false;
-	if (header->status == (uint8)GCS_BLOCK_REPLY_R4_DENIED)
+	/* A holder replies directly with the real forwarding master retained for
+	 * requester authentication. Only a master-produced retry may redirect;
+	 * neither a forwarded refusal nor a denial carries a page LSN. */
+	if (forwarding_master != GCS_BLOCK_REPLY_NO_FORWARDING_MASTER
+		|| header->status == (uint8)GCS_BLOCK_REPLY_R4_DENIED)
 		return header->page_lsn == 0;
 	/* Status 25 optionally carries WRONG_MASTER as node+1.  The encoded
 	 * value is therefore either zero or in [1, CLUSTER_MAX_NODES]. */

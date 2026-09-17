@@ -3567,8 +3567,25 @@ CLUSTER_LMS_OUTBOUND_O = $(top_builddir)/src/backend/cluster/cluster_lms_outboun
 cluster_lms_outbound_test.o: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_LMS_OUTBOUND_UNIT_TEST -c $< -o $@
 
+# Run the real refusal producers and decoder against the real outbound ring.
+# Fail extraction if an owner disappears or is duplicated; do not mirror its
+# implementation in a fixture or stub the enqueue that joins these components.
+test_cluster_r4_refusal_handoff.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef enum ClusterGcsBlockReplyDomain/ { emit=1; domain++ } \
+	     /^typedef struct GcsBlockR4ReplyExpectation/ { emit=1; expectation++ } \
+	     /^gcs_block_compute_checksum\(/ { print "static uint32"; emit=1; checksum++ } \
+	     /^#define R4_CR_REQUIRED_HELLO_CAPS/ { cap=1; caps++ } \
+	     cap { print; if ($$0 !~ /\\$$/) cap=0; next } \
+	     /^gcs_block_r4_refusal_status_for_build\(/ { print "static bool"; emit=1; status++ } \
+	     /^gcs_block_decode_r4_reply_payload\(/ { print "static bool"; emit=1; decode++ } \
+	     /^gcs_block_r4_publish_refusal\(/ { print "static bool"; emit=1; master++ } \
+	     /^gcs_block_r4_publish_holder_refusal\(/ { print "static bool"; emit=1; holder++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (domain != 1 || expectation != 1 || checksum != 1 || caps != 1 || status != 1 || decode != 1 || master != 1 || holder != 1 || emit || cap) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_lms_outbound: test_cluster_lms_outbound.c unit_test.h \
-		$(CLUSTER_VERSION_O) cluster_lms_outbound_test.o
+		test_cluster_r4_refusal_handoff.inc $(CLUSTER_VERSION_O) cluster_lms_outbound_test.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) cluster_lms_outbound_test.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
