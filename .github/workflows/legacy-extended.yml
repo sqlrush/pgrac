@@ -1,0 +1,564 @@
+# Historical extended CI — retained, non-blocking for the current MVP.
+# Tests, failure exits and artifact retention remain unchanged; a red run is
+# still a real failure and is not a current-MVP capability certificate.
+# Author: SqlRush <sqlrush@gmail.com>
+# Portions Copyright (c) 2026, pgrac contributors
+
+name: PGRAC historical extended CI (non-blocking for MVP)
+
+env:
+  CCACHE_DIR: ${{ github.workspace }}/.ccache
+
+on:
+  schedule:
+    - cron: '0 8 * * *'
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # ====================================================================
+  # Tier 2.1a — Linux PG 219 three-mode regression (own job)
+  # --------------------------------------------------------------------
+  # Kept off the cluster_tap shard critical path: PG 219 (~5 min) on any
+  # TAP shard would dominate it.  Build + install + make check only.
+  # ====================================================================
+  linux-pg-regress:
+    name: Linux PG 219 regression
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache clang \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-${{ github.job }}-ccache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-ccache-
+            ${{ runner.os }}-ccache-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=700M
+          ccache --zero-stats
+
+      - name: Configure (--enable-cluster)
+        run: |
+          CC="ccache gcc" ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build and install
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN)
+          ccache --show-stats
+          make install
+
+      - name: Run PG regression tests (219 tests)
+        run: make check
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-pg-regress-diffs
+          path: |
+            src/test/regress/regression.diffs
+            src/test/regress/regression.out
+            src/test/regress/log/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ====================================================================
+  # Tier 2.1b — Linux cluster_tap (9 parallel shards)
+  # --------------------------------------------------------------------
+  # Shards by leading test-file number.  Stage acceptance files are not
+  # duplicated here:
+  #   - 200-202 are owned by stage2-acceptance-medium below.
+  #   - 226-227 are owned by stage3-acceptance-medium below.
+  #
+  # cluster_unit + cluster_regress run only in foundation-core; the other
+  # shards run their TAP slice only.  This saves repeated unit/regress work
+  # and keeps the longest Linux TAP shard below the macOS smoke bound.
+  # ====================================================================
+  linux-cluster-tap:
+    name: Linux cluster_tap (${{ matrix.shard.name }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { name: foundation-core,   ranges: "001-031", unit: true,  regress: true }
+          - { name: foundation-stage1, ranges: "050-071", unit: false, regress: false }
+          - { name: stage2-ic-cssd,    ranges: "072-099", unit: false, regress: false }
+          - { name: stage2-gcs,        ranges: "100-118", unit: false, regress: false }
+          - { name: stage3-core,       ranges: "203-225", unit: false, regress: false }
+          - { name: stage3-recent,     ranges: "228-237", unit: false, regress: false }
+          # 255 = spec-5.22b D2-7 undo-block GCS shared-storage data-plane TAP
+          # (2-node ClusterPair + shared cluster_fs; owner-as-master physical
+          # migration).  Registered here (undo/recovery bucket) so the new file
+          # runs in nightly per the "every new t/ file lands in a shard the same
+          # commit" rule.  NOTE: t/249-254 + t/256-272 remain an un-sharded
+          # pre-existing gap (tracked separately), not opened by this commit.
+          - { name: stage4-wal,        ranges: "242-248 255 273 275", unit: false, regress: false }
+          - { name: stage4-hardgate,   ranges: "274-274", unit: false, regress: false }
+          - { name: stage5-ges-locking, ranges: "276-326", unit: false, regress: false }
+          # spec-5.19 D9: Stage 5 integrated acceptance (heavy 4-node ClusterQuad
+          # + pgbench + crash-recovery) gets its own shard so the multi-node
+          # legs run in parallel and do not extend the ges-locking shard
+          # wallclock.  t/327 HW workload / t/328 MG-B write perf / t/329 MG-D
+          # heap-ITL WAL measure / t/330 production-bench-subset / t/331 4-node
+          # reconfig fault matrix / t/334 spec-5.59 xnode-profile buckets.
+          - { name: stage5-integrated-acceptance, ranges: "327-331 334", unit: false, regress: false }
+          # spec-6.0a production shared-storage backend matrix.  The first
+          # shard covers the CI-portable block_device raw-image e2e; hardware
+          # O_DIRECT / SCSI-3 PR legs remain external/manual.  (334 is the
+          # spec-5.59 profiling TAP and lives in the stage5 shard above.)
+          - { name: stage6-storage, ranges: "332-333 335-339", unit: false, regress: false }
+          # spec-5.20 D9: Hang Manager chaos acceptance (detection matrix /
+          # remediation chaos / diagnostic completeness single-node + reconfig
+          # non-interference 3-node ClusterTriple + 4-node ClusterQuad).  Own
+          # shard so the multi-node reconfig leg (t/343) runs in parallel and
+          # does not extend the ges-locking shard wallclock.
+          - { name: stage5-hang-acceptance, ranges: "340-343", unit: false, regress: false }
+          # spec-5.21 D8: Stage 5 beta close-out.  t/344 = release-level sustained
+          # 4-node chaos soak (kill/leave under continuous load, HG#2); t/345 =
+          # integrated beta acceptance (evidence-completeness + 7 RAC core smoke,
+          # HG#1/HG#3).  Own shard so the multi-node soak runs in parallel.  The
+          # 4-node ClusterQuad soak leg is HG#2a-CI (PASS-or-environment-SKIP);
+          # the release-cut 4-node evidence is HG#2a-CI or HG#2a-EXT (external).
+          - { name: stage5-beta-chaos-soak, ranges: "344-345", unit: false, regress: false }
+          # spec-6.12/6.15 cross-node perf + correctness family (t/346-350:
+          # aged-seed verdict / ledger / 3-node nudge / PI rebuild + crash),
+          # the renumbered t/351-356 family, t/357 multi-xmax alias floor, and
+          # t/361 XID authority native-era adoption.
+          # Closes the 346+ shard hole (every new t/ file must land in a shard
+          # the same commit; see docs/code-review-checklist.md).
+          - { name: stage6-crossnode-a, ranges: "346-350", unit: false, regress: false }
+          - { name: stage6-crossnode-b, ranges: "351-357 361", unit: false, regress: false }
+          # t/358 spec-7.2 data-plane flip e2e + t/360 data-plane fault legs
+          # (conn-reset injection / KNOWN-BLOCKED docs).  Closes the review
+          # P1-3 shard hole: both files predate this shard and were in NO CI
+          # matrix.  Own shard: the t/360 value gate + reconnect deadline
+          # need the wall clock.  (t/359 gapwalk runs in stage7-multixact.)
+          - { name: stage7-data-plane, ranges: "358 360", unit: false, regress: false }
+          # t/362 spec-4.6a 4-node shared_catalog kill self-heal (L464
+          # occupancy verified against origin branches 2026-07-08).  Own
+          # shard: 4-node formation + kill + convergence needs the wall
+          # clock.
+          - { name: stage7-reconfig-liveness, ranges: "362-362", unit: false, regress: false }
+          # t/363 spec-2.29a marker-async LMON liveness.
+          - { name: stage7-marker-async, ranges: "363-363", unit: false, regress: false }
+          # t/364 + t/367 spec-7.3 LMS worker-pool family (single-node pool
+          # smoke + 2-node topology / multi-tag routing / recycle / N=1
+          # sentinel).  Every new t/ file lands in a shard the same commit
+          # (L342).
+          - { name: stage7-lms-pool, ranges: "364 367", unit: false, regress: false }
+          # t/365 spec-7.1a cross-instance write-write MVCC coordination.
+          - { name: stage7-write-write, ranges: "365-365", unit: false, regress: false }
+          # t/366 spec-7.2a GCS block dedup capacity + eager reclaim, plus
+          # t/371 GCS_DONE mixed-version compat (suppressed pre-protocol
+          # binary at the default cap).  Own shard: 2-node shared_catalog
+          # bring-up + cross-node distinct-read dedup pressure + injected
+          # retransmit-dedup correctness needs the wall clock.
+          - { name: stage7-gcs-dedup-capacity, ranges: "366 371", unit: false, regress: false }
+          # t/359 mxid-stripe gapwalk + t/368 multixact member-serve refuse
+          # (spec-7.1 family; 368 renamed from the double-occupied t/360 per
+          # the hub number ledger -- the lms data-plane faults file keeps 360).
+          - { name: stage7-multixact, ranges: "359 368", unit: false, regress: false }
+          # t/369 spec-5.22d dead-owner authority serve + t/370 spec-5.22e
+          # cluster-wide undo retention brake (both 2-node shared-root) +
+          # t/386 spec-2.2 caps-reply directed matrix / rolling-upgrade
+          # compat / generation legs (3-node triple).  Own shard: the brake
+          # legs pin/stall/self-heal on real cleaner cadence and need the
+          # wall clock.
+          - { name: stage5-undo-retention, ranges: "369-370 386 389", unit: false, regress: false }
+          # t/390 GCS block-ship race convergence (3-node triple): PENDING_X
+          # dedup re-evaluation (no reply-timeout burn), invalidate-slot
+          # bounded claim wait, duplicate-reply first-reply-wins.  Own shard:
+          # triple bring-up + injection legs need the wall clock (L342: every
+          # new t/ file lands in a shard the same commit).
+          - { name: stage7-gcs-block-race, ranges: "390-390", unit: false, regress: false }
+          # t/392-397 GCS-race round-2 + ownership-generation wave (2-node
+          # pairs): raw-xid visibility collision, copy->drop lost-write
+          # window, W1 cached-cover / W2 restore-ABA / W3 grant-finalize
+          # window REDs, and the no-injection ownership convergence gate.
+          # Own shard: six ClusterPair bring-ups need the wall clock
+          # (L342: every new t/ file lands in a shard the same commit).
+          - { name: stage7-gcs-ownership-gen, ranges: "392-397", unit: false, regress: false }
+          # t/401 GCS master-direct STALE-ship storage rescue (PR#55) +
+          # t/402 undo cleaner stall-retry cadence (PR#56) + t/403 TT-lane
+          # idle-peer floor pin under write load (all 2-node pairs from the
+          # S3 wave).  t/401/402 predate this shard and were in NO CI
+          # matrix -- closes that hole (L342: every new t/ file lands in a
+          # shard the same commit).  Own shard: three ClusterPair bring-ups
+          # + the t/403 sustained write phase need the wall clock.
+          - { name: stage7-s3-wave, ranges: "401-403", unit: false, regress: false }
+          # t/400 PCM-X convert-queue 4-node liveness (ClusterQuad bring-up)
+          # + t/404 crash-rejoin stale-read/write fence (2-node with a full
+          # crash/restart cycle).  Both were in NO CI matrix (L342: every new
+          # t/ file lands in a shard the same commit).  Own shard: the quad
+          # formation and the rejoin crash cycle dominate the wall clock.
+          - { name: stage7-queue-liveness-rejoin, ranges: "400 404", unit: false, regress: false }
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Unit evidence manifests verify immutable predecessor commits.
+          fetch-depth: 0
+
+      # spec-5.21 D2 Part A (evidence-completeness) checks each Stage 5 sub-spec
+      # ship tag is an ancestor of HEAD.  A default shallow checkout (depth 1)
+      # both omits the tags AND makes `git merge-base --is-ancestor` return
+      # rc=1 (ancestry cannot be established through a truncated history), so
+      # the shard must UNSHALLOW here.  Only the beta shard needs it.  Errors
+      # are NOT swallowed: if this fails the shard goes red rather than silently
+      # skipping the evidence-completeness gate (rule 8.B).
+      - name: Unshallow + fetch tags (beta evidence-completeness)
+        if: matrix.shard.name == 'stage5-beta-chaos-soak'
+        run: |
+          git fetch --unshallow --tags --force origin 2>/dev/null \
+            || git fetch --tags --force origin
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache clang \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-${{ github.job }}-${{ matrix.shard.name }}-ccache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-${{ matrix.shard.name }}-ccache-
+            ${{ runner.os }}-${{ github.job }}-ccache-
+            ${{ runner.os }}-ccache-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=700M
+          ccache --zero-stats
+
+      - name: Configure (--enable-cluster)
+        run: |
+          CC="ccache gcc" ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build and install
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN)
+          ccache --show-stats
+          make install
+
+      - name: Run cluster_unit
+        if: matrix.shard.unit
+        run: make -C src/test/cluster_unit check
+
+      - name: Run cluster_regress (foundation-core shard only)
+        if: matrix.shard.regress
+        run: make -C src/test/cluster_regress check
+
+      - name: Run cluster_tap shard ${{ matrix.shard.name }}
+        env:
+          # Harmless to set everywhere.  The medium Stage 2 acceptance job
+          # owns t/202; keep the env here so manual shard experiments behave
+          # the same if t/202 is temporarily included in a range.
+          STAGE2_PERF_HARD_GATE: '1'
+        run: |
+          SEL=$(cd src/test/cluster_tap && ranges="${{ matrix.shard.ranges }}"; for f in t/*.pl; do \
+            n=$(basename "$f" .pl | cut -d_ -f1); \
+            d=$((10#$n)); \
+            include=0; \
+            for r in $ranges; do \
+              lo=${r%-*}; hi=${r#*-}; \
+              lo_d=$((10#$lo)); hi_d=$((10#$hi)); \
+              if [ "$d" -ge "$lo_d" ] && [ "$d" -le "$hi_d" ]; then \
+                include=1; break; \
+              fi; \
+            done; \
+            if [ "$include" -eq 1 ]; then \
+              printf '%s ' "$f"; \
+            fi; \
+          done)
+          echo "shard ${{ matrix.shard.name }} files: $SEL"
+          test -n "$SEL" || { echo "ERROR: empty shard selection"; exit 1; }
+          make -C src/test/cluster_tap check PROVE_TESTS="$SEL"
+
+      - name: Upload cluster_tap diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-cluster-tap-diffs-${{ matrix.shard.name }}
+          path: |
+            src/test/cluster_regress/regression.diffs
+            src/test/cluster_regress/regression.out
+            src/test/cluster_regress/log/
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ====================================================================
+  # Tier 2.1c — macOS Build+Test (smoke)
+  # --------------------------------------------------------------------
+  # macOS keeps build + PG 219 + cluster_unit + cluster_regress + a curated
+  # cluster_tap SMOKE subset only (the full cluster_tap on macOS was the
+  # ~22min nightly bottleneck; Linux runs the full suite, sharded, above).
+  # The smoke deliberately INCLUDES the concurrency-sensitive spec-3.19
+  # 234/235 (macOS shmem/IPC behaviour is exactly where those matter most).
+  # ====================================================================
+  build-test-macos:
+    name: macOS Build+Test (smoke)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install macOS dependencies
+        run: |
+          brew install readline icu4c lz4 zstd openssl@3 libxml2 cpanminus pkg-config ccache || true
+          cpanm --local-lib=$HOME/perl5 --notest IPC::Run IO::Tty
+          {
+            echo "PERL5LIB=$HOME/perl5/lib/perl5"
+            echo "PKG_CONFIG_PATH=$(brew --prefix icu4c)/lib/pkgconfig:$(brew --prefix openssl@3)/lib/pkgconfig:$(brew --prefix lz4)/lib/pkgconfig:$(brew --prefix zstd)/lib/pkgconfig"
+            echo "LDFLAGS=-L$(brew --prefix readline)/lib -L$(brew --prefix zstd)/lib -L$(brew --prefix lz4)/lib -L$(brew --prefix openssl@3)/lib -L$(brew --prefix icu4c)/lib"
+            echo "CPPFLAGS=-I$(brew --prefix readline)/include -I$(brew --prefix zstd)/include -I$(brew --prefix lz4)/include -I$(brew --prefix openssl@3)/include -I$(brew --prefix icu4c)/include"
+          } >> $GITHUB_ENV
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-${{ github.job }}-ccache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-ccache-
+            ${{ runner.os }}-ccache-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=700M
+          ccache --zero-stats
+
+      - name: Configure (--enable-cluster)
+        run: |
+          CC="ccache clang" ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build and install
+        run: |
+          make -j$(sysctl -n hw.ncpu)
+          ccache --show-stats
+          make install
+
+      - name: Run PG regression tests (219 tests)
+        run: make check
+
+      - name: Run cluster smoke (unit + regress + curated TAP)
+        run: |
+          make -C src/test/cluster_unit check
+          make -C src/test/cluster_regress check
+          SMOKE="t/001_single_node_smoke.pl t/005_wait_events_catalog.pl t/020_shmem_registry.pl t/068_wal_xl_scn.pl t/215_cluster_3_9_cr_construction.pl t/219_cluster_3_11_durable_tt_slot.pl t/226_stage3_mvcc_acceptance_capability.pl t/234_cluster_3_19_dml_boundary.pl t/235_cluster_3_19_snapshot_isolation.pl"
+          make -C src/test/cluster_tap check PROVE_TESTS="$SMOKE"
+
+      - name: Upload regression diffs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nightly-regression-diffs-macos
+          path: |
+            src/test/cluster_regress/regression.diffs
+            src/test/cluster_regress/regression.out
+            src/test/cluster_regress/log/
+            src/test/regress/regression.diffs
+            src/test/regress/regression.out
+            src/test/regress/log/
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 14
+
+  # ====================================================================
+  # Tier 2.2 — Stage 2 acceptance medium representative job
+  # --------------------------------------------------------------------
+  # Self-contained Ubuntu job.  It intentionally rebuilds/install locally
+  # instead of assuming workspace or install artifacts from other jobs.
+  # Runs the Stage 2 acceptance TAPs with longer knobs than fast-gate and
+  # uploads the generated JSON reports.
+  # ====================================================================
+  stage2-acceptance-medium:
+    name: Stage 2 acceptance medium (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache clang \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-${{ github.job }}-ccache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-ccache-
+            ${{ runner.os }}-ccache-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=700M
+          ccache --zero-stats
+
+      - name: Configure (--enable-cluster)
+        run: |
+          CC="ccache gcc" ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build and install
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN)
+          ccache --show-stats
+          make install
+
+      - name: Run Stage 2 acceptance TAP matrix
+        env:
+          STAGE2_TAG: ${{ github.ref_name }}
+          STAGE2_PGBENCH_SECONDS: "20"
+          STAGE2_WORKLOAD_SECONDS: "1"
+          STAGE2_WORKLOAD_ITERATIONS: "20"
+        run: |
+          make -C src/test/cluster_tap check \
+            PROVE_TESTS="t/200_stage2_acceptance_capability.pl t/201_stage2_acceptance_fault_matrix.pl t/202_stage2_acceptance_perf_smoke.pl"
+
+      - name: Upload Stage 2 acceptance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage2-acceptance-medium-${{ github.run_id }}
+          path: |
+            src/test/cluster_tap/tmp/stage2-acceptance-*.json
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 30
+
+  # ====================================================================
+  # Tier 2.3 — Stage 3 MVCC acceptance medium representative job
+  # --------------------------------------------------------------------
+  # Self-contained Ubuntu job (rebuilds/install locally).  Runs the
+  # spec-3.17 Stage 3 acceptance TAPs — capability cross-cutting (t/226)
+  # and the workload perf smoke (t/227, pgbench) — with longer knobs than
+  # fast-gate, plus the static contract unit binary, and uploads the
+  # generated JSON reports.  All perf numbers are report-only (the Stage 3
+  # performance bar is owned by spec-3.18);  this job gates only on the
+  # functional/correctness assertions.
+  # ====================================================================
+  stage3-acceptance-medium:
+    name: Stage 3 acceptance medium (Ubuntu)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends \
+            build-essential ccache clang \
+            libreadline-dev zlib1g-dev libicu-dev \
+            liblz4-dev libzstd-dev libssl-dev libxml2-dev \
+            libipc-run-perl pkg-config
+
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: .ccache
+          key: ${{ runner.os }}-${{ github.job }}-ccache-${{ github.ref_name }}
+          restore-keys: |
+            ${{ runner.os }}-${{ github.job }}-ccache-
+            ${{ runner.os }}-ccache-
+
+      - name: Configure ccache
+        run: |
+          ccache --max-size=700M
+          ccache --zero-stats
+
+      - name: Configure (--enable-cluster)
+        run: |
+          CC="ccache gcc" ./configure \
+            --prefix=$HOME/pgrac-install \
+            --enable-cassert --enable-debug \
+            --with-openssl --with-icu --with-lz4 --with-zstd \
+            --enable-cluster --enable-tap-tests
+
+      - name: Build and install
+        run: |
+          make -j$(getconf _NPROCESSORS_ONLN)
+          ccache --show-stats
+          make install
+
+      - name: Run Stage 3 static contract unit binary
+        run: make -C src/test/cluster_unit check
+
+      - name: Run Stage 3 acceptance TAP matrix
+        env:
+          PGRAC_TAG: ${{ github.ref_name }}
+          STAGE3_PGBENCH_SECONDS: "20"
+        run: |
+          make -C src/test/cluster_tap check \
+            PROVE_TESTS="t/226_stage3_mvcc_acceptance_capability.pl t/227_stage3_mvcc_workload_smoke.pl"
+
+      - name: Upload Stage 3 acceptance reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stage3-acceptance-medium-${{ github.run_id }}
+          path: |
+            src/test/cluster_tap/tmp/stage3-acceptance-*.json
+            src/test/cluster_tap/tmp_check/log/
+          if-no-files-found: ignore
+          retention-days: 30

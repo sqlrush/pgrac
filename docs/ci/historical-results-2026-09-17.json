@@ -1,0 +1,169 @@
+{
+  "conclusion": "failure",
+  "created_at": "2026-09-17T03:46:33Z",
+  "jobs": [
+    {
+      "conclusion": "success",
+      "name": "Linux PG 219 regression",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068171988"
+    },
+    {
+      "conclusion": "failure",
+      "name": "macOS Build+Test (smoke)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172097"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Stage 3 acceptance medium (Ubuntu)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172149"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Stage 2 acceptance medium (Ubuntu)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172166"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (foundation-stage1)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172219"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage3-core)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172240"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage2-ic-cssd)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172241"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-gcs-block-race)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172250"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-data-plane)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172251"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage2-gcs)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172260"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage5-integrated-acceptance)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172261"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-lms-pool)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172265"
+    },
+    {
+      "conclusion": "success",
+      "name": "Linux cluster_tap (stage5-hang-acceptance)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172279"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-s3-wave)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172283"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage5-ges-locking)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172288"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-queue-liveness-rejoin)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172291"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage4-wal)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172292"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (foundation-core)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172296"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-gcs-ownership-gen)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172308"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage3-recent)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172311"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-write-write)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172333"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-marker-async)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172345"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage6-storage)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172351"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage6-crossnode-b)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172360"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-gcs-dedup-capacity)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172361"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage4-hardgate)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172380"
+    },
+    {
+      "conclusion": "success",
+      "name": "Linux cluster_tap (stage5-beta-chaos-soak)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172381"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage5-undo-retention)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172397"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage6-crossnode-a)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172399"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-reconfig-liveness)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172434"
+    },
+    {
+      "conclusion": "failure",
+      "name": "Linux cluster_tap (stage7-multixact)",
+      "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876/job/105068172498"
+    }
+  ],
+  "run_id": 35179423876,
+  "source_commit": "1fad868aeff51de2b7946c766871cf0d427a7286",
+  "url": "https://github.com/sqlrush/pgrac/actions/runs/35179423876",
+  "scope": "Historical extended CI; non-blocking for the current MVP by maintainer decision on 2026-09-17. Failures remain failures; no capability PASS is implied.",
+  "summary": {
+    "success": 3,
+    "failure": 28
+  }
+}
