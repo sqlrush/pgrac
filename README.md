@@ -50,17 +50,23 @@ being built (see the status above) — these diagrams show the design.
 
 ![the stack](diagrams/stack.svg)
 
-**Cache Fusion** — the 3-way GRD protocol *(scaffolded today)*:
+**Cache Fusion** — conceptual GRD/block-transfer flow; see the
+[MVP capability guide](docs/mvp/v0.130.0-mvp.1/04-core-capabilities.md) for the current validated scope:
 
 ![cache fusion protocol](diagrams/cache-fusion.svg)
 
-**Cluster MVCC** — global-SCN visibility + per-node undo *(design)*:
+**Cluster MVCC** — conceptual global-SCN visibility and per-node undo:
 
 ![cluster mvcc](diagrams/mvcc-undo.svg)
 
 More diagrams and deep-dives at **[pgrac.dev](https://pgrac.dev)**.
 
 ## Documentation
+
+Start with the version-pinned [MVP 1 manual](docs/mvp/v0.130.0-mvp.1/README.md):
+Linux four-node deployment and shared-storage prerequisites, all added
+parameters, all system-view fields, and core capabilities. It distinguishes
+the validated evaluation scope from unqualified multi-host/failover deployment.
 
 User-facing manual:
 
@@ -79,28 +85,21 @@ from the upstream tree.
 
 ## Quick start
 
+For the frozen MVP, first read the
+[deployment guide and known build limits](docs/mvp/v0.130.0-mvp.1/01-linux-four-node-deployment.md).
+The tag is an evaluation source snapshot, not a turnkey production installer.
+
 ```bash
-git clone https://github.com/sqlrush/pgrac.git
-cd pgrac
-
-./configure --prefix=$HOME/pgrac-install \
-            --enable-cluster --enable-tap-tests \
-            --with-openssl --with-icu --with-lz4 --with-zstd
-make -j$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu)
-make install
-
-export PATH=$HOME/pgrac-install/bin:$PATH
-
-pgrac-init -D /tmp/pgrac-demo --node-id=0 --cluster-name=demo
-echo "port = 65433"                                  >> /tmp/pgrac-demo/postgresql.conf
-echo "unix_socket_directories = '/tmp'"              >> /tmp/pgrac-demo/postgresql.conf
-echo "listen_addresses = ''"                         >> /tmp/pgrac-demo/postgresql.conf
-
-pgrac-start -D /tmp/pgrac-demo -l /tmp/pgrac-demo.log -w
-psql -h /tmp -p 65433 -d postgres -c 'SELECT * FROM pg_cluster_nodes;'
+git clone --branch v0.130.0-mvp.1 --single-branch \
+  https://github.com/sqlrush/pgrac.git pgrac-mvp1
+cd pgrac-mvp1
+git rev-parse HEAD
+cat PGRAC_VERSION
 ```
 
-See [docs/user-guide/bootstrap.md](docs/user-guide/bootstrap.md) for details.
+Follow the pinned guide for compilation, initialization and the explicit
+four-host deployment-validation boundary. Do not independently initialize four
+databases or share one PGDATA among four postmasters.
 
 ## Building from source
 
