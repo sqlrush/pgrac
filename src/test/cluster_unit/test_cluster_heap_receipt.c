@@ -221,6 +221,45 @@ UT_TEST(final_plan_drift_is_rejected_even_when_intent_is_compatible)
 	cluster_undo_record_cancel_prepared(&receipt);
 }
 
+UT_TEST(own_lock_handoff_gets_fresh_data_receipt_and_full_predecessor)
+{
+	PGAlignedBlock image, before;
+	ClusterUndoRecordPrepareReceipt receipt;
+	ClusterCtrcTargetV1 pending, final_target;
+	ClusterItlSlotData prior;
+	ClusterItlSlotData *slot;
+	uint8 digest[32];
+
+	heap_receipt_fixture(image.data, &receipt, &pending);
+	slot = &ClusterPageGetItlSlots(image.data)[0];
+	slot->xid = 700;
+	slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+	slot->wrap = 12;
+	slot->write_scn = 90;
+	slot->undo_segment_head = uba_encode(1, 7, 0, 0);
+	prior = *slot;
+	memcpy(before.data, image.data, BLCKSZ);
+	UT_ASSERT(heap_receipt_test_plan_capture(&receipt));
+	UT_ASSERT(heap_receipt_test_plan_recheck(&receipt));
+	UT_ASSERT(heap_receipt_test_final(&receipt, &final_target));
+	UT_ASSERT_EQ(final_target.itl_class, 1);
+	UT_ASSERT_EQ(final_target.itl_slot_wrap, 13);
+	UT_ASSERT_EQ(receipt.ctrc_reuse_mask, 0);
+	UT_ASSERT_EQ(receipt_prepare_calls, 1);
+	UT_ASSERT_EQ(receipt_apply_calls, 0);
+	UT_ASSERT_EQ(memcmp(&receipt.itl_history[0].prior, &prior, sizeof(prior)), 0);
+	UT_ASSERT_EQ(receipt.itl_history[0].after_kind, ITL_FLAG_ACTIVE);
+	UT_ASSERT(cluster_ctrc_sha256_exact(&prior, sizeof(prior), digest));
+	UT_ASSERT_EQ(memcmp(digest, final_target.planned_predecessor_sha256, sizeof(digest)), 0);
+	UT_ASSERT(memcmp(final_target.planned_predecessor_sha256, final_target.planned_successor_sha256,
+					 sizeof(digest))
+			  != 0);
+	UT_ASSERT_EQ(memcmp(image.data, before.data, BLCKSZ), 0);
+	slot->wrap++;
+	UT_ASSERT(!heap_receipt_test_plan_recheck(&receipt));
+	cluster_undo_record_cancel_prepared(&receipt);
+}
+
 UT_TEST(reuse_applied_and_identity_drift_are_not_page_version_refreshes)
 {
 	PGAlignedBlock image;
@@ -404,7 +443,8 @@ UT_TEST(insert_undo_target_matches_real_empty_or_reused_line_pointer)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
+	UT_RUN(own_lock_handoff_gets_fresh_data_receipt_and_full_predecessor);
 	UT_RUN(logical_tid_cannot_authorize_another_tuple_address);
 	UT_RUN(insert_undo_target_matches_real_empty_or_reused_line_pointer);
 	UT_RUN(cleanout_preserves_exact_unpublished_resource_after_prepare_deadline);

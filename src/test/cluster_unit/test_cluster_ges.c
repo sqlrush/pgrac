@@ -506,6 +506,9 @@ static uint32 stub_cancel_wait_last_dest = 0;
 static GesCancelWaitPayload stub_cancel_wait_last;
 static uint64 stub_dedup_lookup_count = 0;
 static uint64 stub_dedup_record_count = 0;
+static ClusterGesDedupKey stub_dedup_record_key;
+static GesReplyPayload stub_dedup_record_reply;
+static bool stub_cancel_match;
 static uint64 stub_dedup_remove_completed_count = 0;
 static ClusterGesDedupKey stub_dedup_remove_completed_keys[8];
 
@@ -791,11 +794,12 @@ cluster_ges_dedup_lookup_or_register(const ClusterGesDedupKey *key pg_attribute_
 }
 
 void
-cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key pg_attribute_unused(),
-							   const uint8 *reply pg_attribute_unused(),
-							   uint16 reply_len pg_attribute_unused())
+cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key, const uint8 *reply, uint16 reply_len)
 {
 	stub_dedup_record_count++;
+	stub_dedup_record_key = *key;
+	if (reply_len == sizeof(stub_dedup_record_reply))
+		memcpy(&stub_dedup_record_reply, reply, reply_len);
 }
 
 bool
@@ -1068,7 +1072,7 @@ cluster_grd_cancel_waiter_by_id_seq(const struct ClusterResId *r pg_attribute_un
 									const struct ClusterGrdHolderId *h pg_attribute_unused(),
 									uint64 ws pg_attribute_unused())
 {
-	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	return stub_cancel_match ? CLUSTER_GRD_ENTRY_OK : CLUSTER_GRD_ENTRY_NOT_FOUND;
 }
 
 ClusterGrdEntryResult
@@ -1076,7 +1080,32 @@ cluster_grd_cancel_convert_by_id(const struct ClusterResId *r pg_attribute_unuse
 								 const struct ClusterGrdHolderId *h pg_attribute_unused(),
 								 uint64 ws pg_attribute_unused())
 {
-	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	return stub_cancel_match ? CLUSTER_GRD_ENTRY_OK : CLUSTER_GRD_ENTRY_NOT_FOUND;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_waiter_exact(const ClusterResId *r, const ClusterGrdHolderId *h, uint64 ws,
+								ClusterGrdGrantIdentity *out)
+{
+	ClusterGrdEntryResult result = cluster_grd_cancel_waiter_by_id_seq(r, h, ws);
+	memset(out, 0, sizeof(*out));
+	if (result == CLUSTER_GRD_ENTRY_OK) {
+		out->holder = *h;
+		out->source_node_id = h->node_id;
+		out->request_opcode = GES_REQ_OPCODE_REQUEST;
+		out->shard_master_generation = 71;
+	}
+	return result;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_convert_exact(const ClusterResId *r, const ClusterGrdHolderId *h, uint64 ws,
+								 ClusterGrdGrantIdentity *out)
+{
+	ClusterGrdEntryResult result = cluster_grd_cancel_waiter_exact(r, h, ws, out);
+	if (result == CLUSTER_GRD_ENTRY_OK)
+		out->request_opcode = GES_REQ_OPCODE_CONVERT;
+	return result;
 }
 
 void
@@ -1126,6 +1155,7 @@ static bool stub_clock_advances = false;
 static TimestampTz stub_now = 0;
 static bool stub_cv_timeout_expires = true;
 static TimestampTz stub_cv_now_after_sleep = 0;
+static int stub_cv_waits, stub_cv_grant_on_wait;
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -1161,6 +1191,10 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
 {
 	if (stub_cv_now_after_sleep > 0)
 		stub_now = stub_cv_now_after_sleep;
+	if (stub_cv_grant_on_wait > 0 && ++stub_cv_waits >= stub_cv_grant_on_wait) {
+		stub_reply_wait_entry.ready = true;
+		stub_reply_wait_entry.reject_reason = GES_REJECT_REASON_NONE;
+	}
 	return stub_cv_timeout_expires;
 }
 
@@ -1920,6 +1954,70 @@ UT_TEST(test_ges_request_cv_timeout_retransmits)
 	stub_backend_request_ready_after = 0;
 }
 
+UT_TEST(test_retry_allowance_does_not_preempt_original_wait_deadline)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	uint32 result;
+
+	holder.node_id = 0;
+	holder.procno = 21;
+	holder.request_id = 1001;
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_now = 0;
+	stub_clock_advances = false;
+	stub_cv_timeout_expires = true;
+	stub_cv_waits = 0;
+	stub_cv_grant_on_wait = cluster_ges_retransmit_max_attempts + 3;
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 0;
+	result = cluster_ges_send_request_and_wait(&resid, AccessExclusiveLock, &holder,
+											   holder.request_id, 60000, 0);
+	UT_ASSERT_EQ(result, GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 1 + cluster_ges_retransmit_max_attempts);
+	UT_ASSERT_EQ(stub_cv_waits, stub_cv_grant_on_wait);
+	stub_cv_grant_on_wait = 0;
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+}
+
+UT_TEST(test_exact_cancel_completes_original_dedup_identity)
+{
+	ClusterICEnvelope env = { 0 };
+	GesCancelWaitPayload cancel = { 0 };
+	uint64 before;
+
+	cluster_node_id = 0;
+	env.source_node_id = 2; /* coordinator is not the original requester */
+	env.payload_length = sizeof(cancel);
+	cancel.opcode = GES_REQ_OPCODE_CANCEL_WAIT;
+	cancel.waiter_node_id = 6;
+	cancel.waiter_procno = 27;
+	cancel.waiter_request_id = 1005;
+	cancel.waiter_cluster_epoch = 19;
+	cancel.wait_seq = 31;
+	for (int leg = 0; leg < 2; leg++) {
+		cancel.kind = leg == 0 ? GES_CANCEL_WAIT_KIND_REQUEST : GES_CANCEL_WAIT_KIND_CONVERT;
+		before = stub_dedup_record_count;
+		stub_cancel_match = true;
+		cluster_ges_request_handler(&env, &cancel);
+		UT_ASSERT_EQ(stub_dedup_record_count, before + 1);
+		UT_ASSERT_EQ(stub_dedup_record_key.origin_node_id, 6);
+		UT_ASSERT_EQ(stub_dedup_record_key.request_id, 1005);
+		UT_ASSERT_EQ(stub_dedup_record_key.holder_procno, 27);
+		UT_ASSERT_EQ(stub_dedup_record_key.cluster_epoch, 19);
+		UT_ASSERT_EQ(stub_dedup_record_key.shard_master_generation, 71);
+		UT_ASSERT_EQ(stub_dedup_record_key.opcode,
+					 leg == 0 ? GES_REQ_OPCODE_REQUEST : GES_REQ_OPCODE_CONVERT);
+		UT_ASSERT_EQ(stub_dedup_record_reply.opcode, GES_REPLY_OPCODE_REJECT);
+		UT_ASSERT_EQ(stub_dedup_record_reply.reject_reason, GES_REJECT_REASON_TIMEOUT);
+		stub_cancel_match = false; /* absent / stale / grant-won: do not rewrite */
+		cluster_ges_request_handler(&env, &cancel);
+		UT_ASSERT_EQ(stub_dedup_record_count, before + 1);
+	}
+}
+
 UT_TEST(test_ges_release_cv_timeout_retransmits)
 {
 	ClusterResId resid;
@@ -2039,7 +2137,7 @@ UT_TEST(test_ges_probe_validates_identity_then_obeys_final_stop_seal)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(28);
+	UT_PLAN(30);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -2069,6 +2167,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_release_cv_timeout_retransmits);
 	UT_RUN(test_ges_local_release_requires_exact_holder_and_stable_master);
 	UT_RUN(test_ges_probe_validates_identity_then_obeys_final_stop_seal);
+	UT_RUN(test_retry_allowance_does_not_preempt_original_wait_deadline);
+	UT_RUN(test_exact_cancel_completes_original_dedup_identity);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

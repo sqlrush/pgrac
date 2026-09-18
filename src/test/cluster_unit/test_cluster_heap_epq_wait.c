@@ -151,7 +151,7 @@ ExceptionalCondition(const char *c, const char *f, int l)
 bool
 errstart(int level, const char *domain)
 {
-	if (capture_index_log && level == LOG) {
+	if (capture_index_log && level == DEBUG1) {
 		finishing_index_log = true;
 		return true;
 	}

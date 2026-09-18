@@ -2452,6 +2452,7 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 	GcsBlockReplyHeader header;
 	GcsBlockReplyStatus status;
 	SCN read_scn = InvalidScn;
+	bool queued;
 
 	if (!gcs_block_r4_refusal_status_for_build(result, reason, admitted_forward, &status))
 		return true;
@@ -2471,9 +2472,16 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 		&& current_master_node < CLUSTER_MAX_NODES)
 		header.page_lsn = (uint64)(uint32)(current_master_node + 1);
 	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
-	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+	queued = cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 		worker_id, env->source_node_id, &header, R4_CR_REQUIRED_HELLO_CAPS,
 		requester_capability_generation);
+	/* A non-admitted refusal has no transport owner. The requester's existing
+	 * retransmit still owns recovery; expose the refusal instead of claiming
+	 * delivery or blocking the LMS that must drain the full ring. */
+	if (!queued)
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+											CLUSTER_IC_SEND_NOT_ADMITTED);
+	return queued;
 }
 
 /*
@@ -2488,6 +2496,7 @@ gcs_block_r4_publish_holder_refusal(int worker_id, const ClusterR4CrForwardPaylo
 {
 	GcsBlockReplyHeader header;
 	GcsBlockReplyStatus status;
+	bool queued;
 
 	if (forward == NULL || !gcs_block_r4_refusal_status_for_build(result, reason, true, &status))
 		return true;
@@ -2503,9 +2512,13 @@ gcs_block_r4_publish_holder_refusal(int worker_id, const ClusterR4CrForwardPaylo
 	header.transition_id = forward->base.transition_id;
 	header.status = (uint8)status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(&header, forward->base.master_node);
-	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+	queued = cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 		worker_id, (uint32)forward->base.original_requester_node, &header,
 		R4_CR_REQUIRED_HELLO_CAPS, requester_capability_generation);
+	if (!queued)
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+											CLUSTER_IC_SEND_NOT_ADMITTED);
+	return queued;
 }
 
 static bool
@@ -3123,6 +3136,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	bool terminal_denied = false;
 	bool retry_denied = false;
 	bool read_capacity_refused = false;
+	bool request_admitted = false;
 	bool retransmit_warning_emitted = false;
 	bool suppress_direct_land = false;
 	bool awaiting_holder_refusal_master_cleanup = false;
@@ -3234,6 +3248,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			TimestampTz deadline;
 			bool got_reply = false;
 			bool direct_authoritative_denial = false;
+			bool request_enqueued;
 
 			/* Apply backoff for retry attempts (not the initial send). */
 			if (retry_attempt > 0) {
@@ -3320,9 +3335,11 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			else
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_send_count, 1);
 
-			if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
-														  (uint32)current_master, &payload,
-														  sizeof(payload))) {
+			request_enqueued = cluster_grd_outbound_enqueue_backend_msg(
+				PGRAC_IC_MSG_GCS_BLOCK_REQUEST, (uint32)current_master, &payload, sizeof(payload));
+			if (request_enqueued)
+				request_admitted = true;
+			else if (!request_admitted || !xp_is_read || clean_eligible) {
 				BufferDesc *direct_target_buf = NULL;
 				bool direct_prepared = false;
 
@@ -3344,6 +3361,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				}
 				gcs_block_direct_finish_target(direct_target_buf, direct_prepared, false,
 											   InvalidXLogRecPtr);
+				if (xp_is_read && !clean_eligible && !request_admitted) {
+					/* No frame was published: there is no remote completion to
+					 * acknowledge. The existing bufmgr owner must exact-abort
+					 * its GRANT_PENDING reservation before yielding/rearming. */
+					read_capacity_refused = true;
+					retry_denied = true;
+					break;
+				}
 				ereport(
 					ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -3356,6 +3381,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						 cluster_node_id)));
 			}
 
+			/* If only a retransmit was refused, the original admitted request
+			 * still owns its reply. Use this attempt's existing response period
+			 * and retry allowance, not a new unbounded staging wait: the wire
+			 * lifetime hint also bounds the master's dedup retention. */
 			deadline = GetCurrentTimestamp()
 					   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
 
@@ -11317,6 +11346,8 @@ typedef struct ResourceXFirstFailureEvidence {
 	int32 buffer_own_result;
 	uint8 buffer_pcm_state_before;
 	uint8 buffer_pcm_state_after;
+	uint8 remote_s_image_type;
+	uint32 remote_s_semantic_state;
 	uint64 base_authority_generation;
 	uint64 authority_generation;
 	uint64 assertion_sequence;
@@ -11484,7 +11515,7 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 		LOG,
 		(errmsg_internal("Resource-X first-failure diagnostic"),
 		 errdetail(
-			 "tag_hash=%u binding_generation=%llu "
+			 "tag_hash=%u tag=%u/%u/%u/%u/%u binding_generation=%llu "
 			 "request_sequence=%llu admission_generation=%llu "
 			 "buffer_generation_before=%llu buffer_generation_after=%llu "
 			 "buffer_token_before=%llu buffer_token_after=%llu "
@@ -11493,6 +11524,7 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 			 "buffer_resource_x_generation_after=%llu "
 			 "buffer_flags_before=0x%08x buffer_flags_after=0x%08x "
 			 "buffer_pcm_state_before=%u buffer_pcm_state_after=%u "
+			 "remote_s_image_type=%u remote_s_semantic_state=0x%08x "
 			 "buffer_own_result=%d "
 			 "formation=%llu master_session=%llu r4_generation=%llu "
 			 "base_authority_generation=%llu authority_generation=%llu "
@@ -11531,7 +11563,9 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 			 "refused_resource_x=%llu refused_retained=%llu "
 			 "refused_requester=%llu refused_sidecar=%llu "
 			 "deadline=%llu",
-			 tag_hash, (unsigned long long)evidence->binding_generation,
+			 tag_hash, evidence->tag.spcOid, evidence->tag.dbOid, evidence->tag.relNumber,
+			 (unsigned)evidence->tag.forkNum, evidence->tag.blockNum,
+			 (unsigned long long)evidence->binding_generation,
 			 (unsigned long long)evidence->request_sequence,
 			 (unsigned long long)(evidence->admission_generation != 0
 									  ? evidence->admission_generation
@@ -11546,7 +11580,8 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 			 (unsigned long long)evidence->buffer_resource_x_generation_after,
 			 evidence->buffer_flags_before, evidence->buffer_flags_after,
 			 (unsigned)evidence->buffer_pcm_state_before,
-			 (unsigned)evidence->buffer_pcm_state_after,
+			 (unsigned)evidence->buffer_pcm_state_after, (unsigned)evidence->remote_s_image_type,
+			 evidence->remote_s_semantic_state,
 			 evidence->remote_s_stage != RESOURCE_X_REMOTE_S_STAGE_NONE
 				 ? evidence->buffer_own_result
 				 : -1,
@@ -12039,6 +12074,20 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = current.generation;
+		first_failure.buffer_token_before = current.reservation_token;
+		first_failure.buffer_token_after = current.reservation_token;
+		first_failure.buffer_writer_token_before = current.writer_activation_token;
+		first_failure.buffer_writer_token_after = current.writer_activation_token;
+		first_failure.buffer_resource_x_generation_before
+			= current.resource_x_activation_generation;
+		first_failure.buffer_resource_x_generation_after = current.resource_x_activation_generation;
+		first_failure.buffer_flags_before = current.flags;
+		first_failure.buffer_flags_after = current.flags;
+		first_failure.buffer_pcm_state_before = current.pcm_state;
+		first_failure.buffer_pcm_state_after = current.pcm_state;
+		first_failure.buffer_own_result = (int32)own_result;
+		first_failure.remote_s_image_type = current.buffer_type;
+		first_failure.remote_s_semantic_state = current.semantic_buf_state;
 		gcs_block_resource_x_first_failure_record(&first_failure);
 		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return mapped_result;

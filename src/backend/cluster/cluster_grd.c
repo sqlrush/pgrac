@@ -8341,12 +8341,14 @@ cluster_grd_cancel_reservation_by_id(const ClusterResId *resid, const ClusterGrd
  */
 static ClusterGrdEntryResult
 grd_cancel_waiter_impl(const ClusterResId *resid, const ClusterGrdHolderId *holder, uint64 wait_seq,
-					   bool match_wait_seq)
+					   bool match_wait_seq, ClusterGrdGrantIdentity *cancelled_out)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er = CLUSTER_GRD_ENTRY_NOT_FOUND;
 
 	Assert(resid != NULL && holder != NULL);
+	if (cancelled_out != NULL)
+		memset(cancelled_out, 0, sizeof(*cancelled_out));
 
 	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
 		|| entry == NULL)
@@ -8359,6 +8361,14 @@ grd_cancel_waiter_impl(const ClusterResId *resid, const ClusterGrdHolderId *hold
 			&& entry->waiters[i].cluster_epoch == holder->cluster_epoch
 			&& entry->waiters[i].request_id == holder->request_id
 			&& (!match_wait_seq || entry->waiters[i].wait_seq == wait_seq)) {
+			if (cancelled_out != NULL) {
+				const ClusterGrdWaiter *waiter = &entry->waiters[i];
+				cancelled_out->holder = *holder;
+				cancelled_out->source_node_id = waiter->source_node_id;
+				cancelled_out->request_opcode = waiter->request_opcode;
+				cancelled_out->shard_master_generation = waiter->shard_master_generation;
+				cancelled_out->mode = waiter->mode;
+			}
 			if (i < entry->nwaiters - 1)
 				entry->waiters[i] = entry->waiters[entry->nwaiters - 1];
 			memset(&entry->waiters[entry->nwaiters - 1], 0, sizeof(ClusterGrdWaiter));
@@ -8379,7 +8389,7 @@ grd_cancel_waiter_impl(const ClusterResId *resid, const ClusterGrdHolderId *hold
 ClusterGrdEntryResult
 cluster_grd_cancel_waiter_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder)
 {
-	return grd_cancel_waiter_impl(resid, holder, 0, false);
+	return grd_cancel_waiter_impl(resid, holder, 0, false, NULL);
 }
 
 /*
@@ -8391,7 +8401,15 @@ ClusterGrdEntryResult
 cluster_grd_cancel_waiter_by_id_seq(const ClusterResId *resid, const ClusterGrdHolderId *holder,
 									uint64 wait_seq)
 {
-	return grd_cancel_waiter_impl(resid, holder, wait_seq, true);
+	return grd_cancel_waiter_impl(resid, holder, wait_seq, true, NULL);
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_waiter_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								uint64 wait_seq, ClusterGrdGrantIdentity *cancelled_out)
+{
+	Assert(cancelled_out != NULL);
+	return grd_cancel_waiter_impl(resid, holder, wait_seq, true, cancelled_out);
 }
 
 /*
@@ -8404,13 +8422,15 @@ cluster_grd_cancel_waiter_by_id_seq(const ClusterResId *resid, const ClusterGrdH
  * waiter variant).
  */
 ClusterGrdEntryResult
-cluster_grd_cancel_convert_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder,
-								 uint64 wait_seq)
+cluster_grd_cancel_convert_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								 uint64 wait_seq, ClusterGrdGrantIdentity *cancelled_out)
 {
 	ClusterGrdEntry *entry = NULL;
 	ClusterGrdEntryResult er = CLUSTER_GRD_ENTRY_NOT_FOUND;
 
 	Assert(resid != NULL && holder != NULL);
+	if (cancelled_out != NULL)
+		memset(cancelled_out, 0, sizeof(*cancelled_out));
 
 	if (cluster_grd_entry_lookup_or_create(resid, false, &entry) != CLUSTER_GRD_ENTRY_OK
 		|| entry == NULL)
@@ -8423,6 +8443,14 @@ cluster_grd_cancel_convert_by_id(const ClusterResId *resid, const ClusterGrdHold
 			&& entry->converts[i].cluster_epoch == holder->cluster_epoch
 			&& entry->converts[i].convert_request_id == holder->request_id
 			&& entry->converts[i].wait_seq == wait_seq) {
+			if (cancelled_out != NULL) {
+				const ClusterGrdConvert *convert = &entry->converts[i];
+				cancelled_out->holder = *holder;
+				cancelled_out->source_node_id = convert->source_node_id;
+				cancelled_out->request_opcode = convert->request_opcode;
+				cancelled_out->shard_master_generation = convert->shard_master_generation;
+				cancelled_out->mode = convert->requested_mode;
+			}
 			grd_convert_remove(entry, i);
 			er = CLUSTER_GRD_ENTRY_OK;
 			break;
@@ -8435,4 +8463,11 @@ cluster_grd_cancel_convert_by_id(const ClusterResId *resid, const ClusterGrdHold
 	if (er == CLUSTER_GRD_ENTRY_OK)
 		grd_wfg_resync_entry(resid, holder, 1);
 	return er;
+}
+
+ClusterGrdEntryResult
+cluster_grd_cancel_convert_by_id(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								 uint64 wait_seq)
+{
+	return cluster_grd_cancel_convert_exact(resid, holder, wait_seq, NULL);
 }

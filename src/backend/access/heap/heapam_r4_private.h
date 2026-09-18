@@ -333,6 +333,8 @@ extern ClusterHeapMultiInsertRoute cluster_heap_test_multi_insert_route(
 	bool current_itl_path);
 extern bool cluster_heap_test_update_needs_successor_prediction(
 	bool current_itl_path, bool current_mx_recomposed);
+extern bool cluster_heap_test_update_lock_handoff_allowed(bool temp_locked,
+	uint16 successor_infomask);
 extern bool cluster_heap_test_itl_relation_route(
 	bool storage_mode, bool uses_local_buffers, bool shared_catalog,
 	RelFileNumber rel_number);

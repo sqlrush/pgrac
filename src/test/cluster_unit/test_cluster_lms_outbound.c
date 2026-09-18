@@ -55,9 +55,11 @@
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
+#include "cluster/cluster_r4_observe.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_sf_dep.h"
 #include "miscadmin.h"
+#include "port/pg_crc32c.h"
 #include "storage/lwlock.h"
 #include "storage/shmem.h"
 
@@ -555,6 +557,27 @@ static uint8 ut_local_dispatch_marker = 0;
 static int ut_direct_zero_reply_count = 0;
 static GcsBlockReplyHeader ut_direct_zero_reply_header;
 static int ut_checksum_call_count = 0;
+static bool ut_r4_real_checksum = false;
+static char ut_r4_reply_payload[GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE];
+
+/* Production bodies, including their capability mask and CRC, extracted by
+ * the Makefile. Only observation and the final transport are fixture seams. */
+#include "test_cluster_r4_refusal_handoff.inc"
+
+void
+cluster_r4_observe_refusal(ClusterR4RefusalStage stage, ClusterCrBuildReason reason,
+						   const BufferTag *tag, uint64 request_id, uint64 epoch, int32 requester,
+						   int32 master, SCN read_scn)
+{
+	(void)stage;
+	(void)reason;
+	(void)tag;
+	(void)request_id;
+	(void)epoch;
+	(void)requester;
+	(void)master;
+	(void)read_scn;
+}
 
 bool
 cluster_ic_envelope_build(ClusterICEnvelope *out_env, uint8 msg_type, uint32 source_node_id,
@@ -596,6 +619,8 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 			uint32 i;
 
 			memcpy(&ut_sent_log[ut_sent_n].reply_header, payload, sizeof(GcsBlockReplyHeader));
+			if (payload_len == sizeof(ut_r4_reply_payload))
+				memcpy(ut_r4_reply_payload, payload, payload_len);
 			ut_sent_log[ut_sent_n].reply_block_zero
 				= payload_len == GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
 			for (i = 0; ut_sent_log[ut_sent_n].reply_block_zero && i < GCS_BLOCK_DATA_SIZE; i++)
@@ -611,8 +636,9 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 uint32
 cluster_gcs_block_compute_checksum(const char *block_data)
 {
-	(void)block_data;
 	ut_checksum_call_count++;
+	if (ut_r4_real_checksum)
+		return gcs_block_compute_checksum(block_data);
 	return UINT32_C(0xA55A7E11);
 }
 
@@ -644,6 +670,8 @@ ut_reset_log(void)
 	ut_local_dispatch_marker = 0;
 	ut_direct_zero_reply_count = 0;
 	ut_checksum_call_count = 0;
+	ut_r4_real_checksum = false;
+	memset(ut_r4_reply_payload, 0, sizeof(ut_r4_reply_payload));
 	memset(&ut_direct_zero_reply_header, 0, sizeof(ut_direct_zero_reply_header));
 	ut_cap_guard_drop_count = 0;
 	memset(ut_peer_capabilities, 0, sizeof(ut_peer_capabilities));
@@ -1018,6 +1046,189 @@ UT_TEST(test_r4_cap_bound_zero_reply_drops_drift_before_zero_expansion)
 	UT_ASSERT_EQ(ut_sent_n, 0);
 	UT_ASSERT_EQ(ut_checksum_call_count, 0);
 	UT_ASSERT_EQ(ut_cap_guard_drop_count, 1);
+}
+
+/* Cover the missing handoff: a real holder refusal carries the master identity,
+ * unlike a master refusal. Both enqueue and drain must accept it, and the real
+ * requester decoder must still bind it to that exact master/request/epoch. */
+UT_TEST(test_r4_real_refusal_producers_cross_outbound_and_requester_boundary)
+{
+	const int masters[] = { 0, 1, UT_PEER_X, CLUSTER_MAX_NODES - 1 };
+	const ClusterCrBuildReason reasons[]
+		= { CLUSTER_CR_BUILD_CAPACITY, CLUSTER_CR_BUILD_HOLDER_MOVED, CLUSTER_CR_BUILD_PROTOCOL };
+	int m;
+	int r;
+
+	for (m = 0; m < lengthof(masters); m++) {
+		for (r = 0; r < lengthof(reasons); r++) {
+			ClusterR4CrForwardPayload forward = { 0 };
+			GcsBlockR4ReplyExpectation expected = { 0 };
+			ClusterICEnvelope env = { 0 };
+			ClusterCrBuildResult result
+				= r == 2 ? CLUSTER_CR_BUILD_FAIL_CLOSED : CLUSTER_CR_BUILD_RETRYABLE;
+			bool accepted;
+			bool wrong_master;
+			bool wrong_request;
+			bool wrong_epoch;
+
+			ut_reset_log();
+			ut_r4_real_checksum = true;
+			ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+			ut_peer_capabilities[UT_PEER_X] = R4_CR_REQUIRED_HELLO_CAPS;
+			ut_peer_cap_generation[UT_PEER_X] = 42;
+			forward.base.request_id = 123;
+			forward.base.epoch = 9;
+			forward.base.master_node = masters[m];
+			forward.base.original_requester_node = UT_PEER_X;
+			forward.base.requester_backend_id = 17;
+			forward.base.transition_id = PCM_TRANS_N_TO_S;
+			UT_ASSERT(gcs_block_r4_publish_holder_refusal(2, &forward, 42, result, reasons[r]));
+			UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 1);
+			UT_ASSERT_EQ(ut_sent_n, 0);
+			UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 1);
+			UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 0);
+			UT_ASSERT_EQ(ut_sent_n, 1);
+			UT_ASSERT_EQ(ut_sent_log[0].dest, UT_PEER_X);
+			UT_ASSERT(ut_sent_log[0].reply_block_zero);
+			UT_ASSERT_EQ(ut_sent_log[0].reply_header.status,
+						 r == 2 ? GCS_BLOCK_REPLY_R4_DENIED
+								: GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED);
+			UT_ASSERT_EQ(GcsBlockReplyHeaderGetForwardingMasterNode(&ut_sent_log[0].reply_header),
+						 masters[m]);
+			expected.request_id = forward.base.request_id;
+			expected.epoch = forward.base.epoch;
+			expected.sender_node = cluster_node_id;
+			expected.forwarding_master_node = masters[m];
+			expected.requester_backend_id = forward.base.requester_backend_id;
+			expected.transition_id = PCM_TRANS_N_TO_S;
+			expected.reply_domain = CLUSTER_GCS_BLOCK_REPLY_DOMAIN_R4_CR;
+			env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
+			env.source_node_id = cluster_node_id;
+			env.dest_node_id = UT_PEER_X;
+			env.payload_length = sizeof(ut_r4_reply_payload);
+			cluster_node_id = UT_PEER_X;
+			accepted = gcs_block_decode_r4_reply_payload(&env, ut_r4_reply_payload, &expected);
+			expected.forwarding_master_node = GCS_BLOCK_REPLY_NO_FORWARDING_MASTER;
+			wrong_master = gcs_block_decode_r4_reply_payload(&env, ut_r4_reply_payload, &expected);
+			expected.forwarding_master_node = masters[m];
+			expected.request_id++;
+			wrong_request = gcs_block_decode_r4_reply_payload(&env, ut_r4_reply_payload, &expected);
+			expected.request_id--;
+			expected.epoch++;
+			wrong_epoch = gcs_block_decode_r4_reply_payload(&env, ut_r4_reply_payload, &expected);
+			cluster_node_id = 0;
+			UT_ASSERT(accepted);
+			UT_ASSERT(!wrong_master && !wrong_request && !wrong_epoch);
+		}
+	}
+}
+
+UT_TEST(test_r4_real_master_refusal_preserves_redirect)
+{
+	ClusterR4CrRequestPayload request = { 0 };
+	ClusterICEnvelope env = { 0 };
+
+	ut_reset_log();
+	ut_peer_capabilities[UT_PEER_X] = R4_CR_REQUIRED_HELLO_CAPS;
+	ut_peer_cap_generation[UT_PEER_X] = 42;
+	request.base.request_id = 321;
+	request.base.epoch = 9;
+	request.base.requester_backend_id = 17;
+	request.base.transition_id = PCM_TRANS_N_TO_S;
+	env.source_node_id = UT_PEER_X;
+	UT_ASSERT(gcs_block_r4_publish_refusal(2, &env, &request, 42, CLUSTER_CR_BUILD_RETRYABLE,
+										   CLUSTER_CR_BUILD_WRONG_MASTER, false,
+										   CLUSTER_MAX_NODES - 1));
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	UT_ASSERT_EQ(ut_sent_log[0].reply_header.page_lsn, CLUSTER_MAX_NODES);
+	UT_ASSERT_EQ(GcsBlockReplyHeaderGetForwardingMasterNode(&ut_sent_log[0].reply_header),
+				 GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
+}
+
+UT_TEST(test_r4_holder_refusal_retains_backpressure_and_rejects_reconnect)
+{
+	GcsBlockReplyHeader hdr = ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_DENIED, 0);
+
+	ut_reset_log();
+	GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, 1);
+	ut_peer_capabilities[UT_PEER_X] = R4_CR_REQUIRED_HELLO_CAPS;
+	ut_peer_cap_generation[UT_PEER_X] = 42;
+	UT_ASSERT(cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		2, UT_PEER_X, &hdr, R4_CR_REQUIRED_HELLO_CAPS, 42));
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_NOT_ADMITTED;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 1);
+	UT_ASSERT_EQ(ut_sent_n, 1);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 1);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 0);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ(memcmp(&ut_sent_log[0].reply_header, &ut_sent_log[1].reply_header, sizeof(hdr)),
+				 0);
+	UT_ASSERT(cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+		2, UT_PEER_X, &hdr, R4_CR_REQUIRED_HELLO_CAPS, 42));
+	ut_peer_cap_generation[UT_PEER_X] = 43;
+	UT_ASSERT_EQ(cluster_lms_outbound_drain_send(2), 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 0);
+	UT_ASSERT_EQ(ut_sent_n, 2);
+	UT_ASSERT_EQ(ut_cap_guard_drop_count, 1);
+}
+
+UT_TEST(test_r4_holder_refusal_rejects_malformed_identity)
+{
+	int mutation;
+
+	ut_reset_log();
+	for (mutation = 0; mutation < 12; mutation++) {
+		GcsBlockReplyHeader hdr
+			= ut_r4_refusal_header(GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED, 0);
+
+		GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, 1);
+		switch (mutation) {
+		case 0:
+			GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, -2);
+			break;
+		case 1:
+			GcsBlockReplyHeaderSetForwardingMasterNode(&hdr, CLUSTER_MAX_NODES);
+			break;
+		case 2:
+			hdr.page_lsn = 1;
+			break;
+		case 3:
+			hdr.status = GCS_BLOCK_REPLY_R4_DENIED;
+			hdr.page_lsn = 1;
+			break;
+		case 4:
+			hdr.request_id = 0;
+			break;
+		case 5:
+			hdr.sender_node = -1;
+			break;
+		case 6:
+			hdr.sender_node = CLUSTER_MAX_NODES;
+			break;
+		case 7:
+			hdr.requester_backend_id = 0;
+			break;
+		case 8:
+			hdr.transition_id = PCM_TRANS_N_TO_X;
+			break;
+		case 9:
+			hdr.checksum = 1;
+			break;
+		case 10:
+			hdr.reserved_0[0] = 1;
+			break;
+		case 11:
+			hdr.status = GCS_BLOCK_REPLY_R4_CR_FULL;
+			break;
+		}
+		UT_ASSERT(!cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+			2, UT_PEER_X, &hdr, R4_CR_REQUIRED_HELLO_CAPS, 42));
+	}
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(2), 0);
+	UT_ASSERT_EQ(ut_sent_n, 0);
 }
 
 UT_TEST(test_zero_reply_wrappers_reject_the_other_status_domain)
@@ -1709,7 +1920,7 @@ UT_TEST(test_normal_stop_full_and_bad_frames_remain_debt)
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(40);
 
 	UT_RUN(test_normal_stop_missing_outbound_is_not_empty);
 	UT_RUN(test_ring_shmem_init);
@@ -1722,6 +1933,10 @@ main(void)
 	UT_RUN(test_direct_zero_block_reply_uses_data_owner_direct_lane);
 	UT_RUN(test_r4_cap_bound_zero_reply_sends_only_on_exact_generation);
 	UT_RUN(test_r4_cap_bound_zero_reply_drops_drift_before_zero_expansion);
+	UT_RUN(test_r4_real_refusal_producers_cross_outbound_and_requester_boundary);
+	UT_RUN(test_r4_real_master_refusal_preserves_redirect);
+	UT_RUN(test_r4_holder_refusal_retains_backpressure_and_rejects_reconnect);
+	UT_RUN(test_r4_holder_refusal_rejects_malformed_identity);
 	UT_RUN(test_zero_reply_wrappers_reject_the_other_status_domain);
 	UT_RUN(test_full_worker_ring_refuses_without_overwrite);
 	UT_RUN(test_cap_bound_frame_drops_on_connection_generation_drift);

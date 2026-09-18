@@ -4301,6 +4301,116 @@ UT_TEST(test_remote_s_holder_pending_grant_is_retryable_busy)
 				 CLUSTER_PCM_OWN_INVALID);
 }
 
+UT_TEST(test_real_remote_s_candidate_waits_for_exact_local_reservation)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before, after;
+	uint32 flags[] = { PCM_OWN_FLAG_GRANT_PENDING, PCM_OWN_FLAG_REVOKING };
+	uint64 token;
+	uint32 state;
+
+	for (int i = 0; i < lengthof(flags); i++) {
+		n_predecessor_fixture(&buf, &entry, BUF_TYPE_SCUR);
+		buf.pcm_state = PCM_STATE_S;
+		buf.tag.forkNum = MAIN_FORKNUM;
+		buf.tag.blockNum = 12516;
+		state = transition_lock_header(&buf);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_begin_exact(0, 48, flags[i], &token),
+					 CLUSTER_PCM_OWN_OK);
+		UnlockBufHdr(&buf, state);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &before), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_s_holder_candidate_exact(&buf, &before),
+					 CLUSTER_PCM_OWN_BUSY);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &after), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT(cluster_pcm_own_snapshot_equal_exact(&before, &after));
+		UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_LOCKED) == 0);
+		state = transition_lock_header(&buf);
+		UT_ASSERT_EQ(cluster_pcm_own_reservation_abort_exact(0, 48, token, flags[i]),
+					 CLUSTER_PCM_OWN_OK);
+		UnlockBufHdr(&buf, state);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &after), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_s_holder_candidate_exact(&buf, &after),
+					 CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_s_holder_candidate_exact(&buf, &before),
+					 CLUSTER_PCM_OWN_STALE);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
+UT_TEST(test_real_remote_s_candidate_preserves_corruption_and_observation_guards)
+{
+	BufferDesc buf;
+	ClusterPcmOwnEntry entry;
+	ClusterPcmOwnEntry *saved = ClusterPcmOwnArray;
+	ClusterPcmOwnSnapshot before, after;
+
+	for (int leg = 0; leg < 16; leg++) {
+		n_predecessor_fixture(&buf, &entry, BUF_TYPE_SCUR);
+		buf.pcm_state = PCM_STATE_S;
+		pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_GRANT_PENDING);
+		switch (leg) {
+		case 0:
+			pg_atomic_write_u32(&entry.flags, 3);
+			break;
+		case 1:
+			pg_atomic_write_u32(&entry.flags, 4);
+			break;
+		case 2:
+			pg_atomic_write_u64(&entry.reservation_token, 0);
+			break;
+		case 3:
+			pg_atomic_write_u64(&entry.reservation_token, UINT64_MAX);
+			break;
+		case 4:
+			pg_atomic_write_u64(&entry.generation, UINT64_MAX);
+			break;
+		case 5:
+			pg_atomic_write_u64(&entry.writer_activation_token, 48);
+			break;
+		case 6:
+			pg_atomic_write_u64(&entry.resource_x_activation_generation, 1);
+			break;
+		case 7:
+			buf.buffer_type = BUF_TYPE_PI;
+			break;
+		case 8:
+			pg_atomic_fetch_or_u32(&buf.state, BM_IO_ERROR);
+			break;
+		case 9:
+			pg_atomic_fetch_and_u32(&buf.state, ~BM_VALID);
+			break;
+		case 12:
+		case 13:
+		case 14:
+		case 15:
+			pg_atomic_write_u32(&entry.flags, 0);
+			pg_atomic_fetch_or_u32(&buf.state, leg == 12   ? BM_IO_IN_PROGRESS
+											   : leg == 13 ? BM_DIRTY
+											   : leg == 14 ? BM_JUST_DIRTIED
+														   : BM_CHECKPOINT_NEEDED);
+			break;
+		default:
+			break;
+		}
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &before), CLUSTER_PCM_OWN_OK);
+		if (leg == 10)
+			before.tag.blockNum++;
+		if (leg == 11)
+			before.generation++;
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_s_holder_candidate_exact(&buf, &before),
+					 leg >= 12	 ? CLUSTER_PCM_OWN_BUSY
+					 : leg >= 10 ? CLUSTER_PCM_OWN_STALE
+								 : CLUSTER_PCM_OWN_CORRUPT);
+		UT_ASSERT_EQ(cluster_bufmgr_pcm_own_snapshot(&buf, &after), CLUSTER_PCM_OWN_OK);
+		UT_ASSERT_EQ(after.flags, pg_atomic_read_u32(&entry.flags));
+		UT_ASSERT_EQ(after.reservation_token, pg_atomic_read_u64(&entry.reservation_token));
+		UT_ASSERT((pg_atomic_read_u32(&buf.state) & BM_LOCKED) == 0);
+	}
+	ClusterPcmOwnArray = saved;
+}
+
 UT_TEST(test_remote_s_holder_stable_n_replay_requires_exact_idle_tuple)
 {
 	ClusterPcmOwnSnapshot snapshot;
@@ -7230,7 +7340,7 @@ UT_TEST(test_resource_x_target_writer_context_is_post_t3_and_local_cleanup_only)
 int
 main(void)
 {
-	UT_PLAN(127);
+	UT_PLAN(129);
 	UT_RUN(test_aux_creation_disposition_uses_real_beb_and_excludes_retained_context);
 	UT_RUN(test_real_barrier_refusal_ignores_another_callers_pending);
 	UT_RUN(test_real_barrier_refusal_abort_then_successor_is_not_own_residue);
@@ -7286,6 +7396,8 @@ main(void)
 	UT_RUN(test_begin_abort_is_exact_and_monotonic);
 	UT_RUN(test_invalid_live_flag_shapes_are_corrupt_not_busy);
 	UT_RUN(test_remote_s_holder_pending_grant_is_retryable_busy);
+	UT_RUN(test_real_remote_s_candidate_waits_for_exact_local_reservation);
+	UT_RUN(test_real_remote_s_candidate_preserves_corruption_and_observation_guards);
 	UT_RUN(test_remote_s_holder_stable_n_replay_requires_exact_idle_tuple);
 	UT_RUN(test_grant_commit_is_exact_and_bumps_once);
 	UT_RUN(test_s_revoke_handoff_reuses_exact_token_and_bumps_once);

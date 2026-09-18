@@ -46,6 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+        test_cluster_cr_dependency \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
@@ -1876,7 +1877,7 @@ test_cluster_write_fence: test_cluster_write_fence.c unit_test.h
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-$(filter-out test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
+$(filter-out test_cluster_cr_dependency test_cluster_lms_native_probe test_cluster_bufmgr_stop test_cluster_r4_itl_capacity test_cluster_ctrc_itl_reuse,$(SIMPLE_TESTS)): %: %.c unit_test.h $(CLUSTER_VERSION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) -o $@
 
 # The wire behavior is inline; an updated decoder must rebuild this binary.
@@ -2790,6 +2791,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	awk '/^cluster_pcm_own_bump_failure\(/ { print "static ClusterPcmOwnResult"; emit=1; bump_failure++ } \
 	     /^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; ordinary_snapshot++ } \
 	     /^cluster_bufmgr_pcm_own_n_assertion_candidate_exact\(/ { print "ClusterPcmOwnResult"; emit=1; n_candidate++ } \
+	     /^cluster_bufmgr_pcm_own_s_holder_candidate_exact\(/ { print "ClusterPcmOwnResult"; emit=1; s_candidate++ } \
 	     /^cluster_bufmgr_pcm_own_n_retained_release_inflight_exact\(/ { print "bool"; emit=1; retained_candidate++ } \
 	     /^cluster_bufmgr_pcm_own_n_storage_candidate_exact\(/ { print "ClusterPcmOwnResult"; emit=1; storage_candidate++ } \
 	     /^cluster_bufmgr_pcm_own_n_predecessor_observe_exact\(/ { print "ClusterPcmOwnResult"; emit=1; predecessor_observe++ } \
@@ -2823,7 +2825,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact\(/ { print "ClusterPcmOwnResult"; emit=1; read_delivery++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; grant_abort++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (retained_candidate != 1 || storage_candidate != 1 || predecessor_observe != 1 || read_reclaim != 1 || read_delivery != 1) exit 1 } \
+	     END { if (s_candidate != 1 || retained_candidate != 1 || storage_candidate != 1 || predecessor_observe != 1 || read_reclaim != 1 || read_delivery != 1) exit 1 } \
 	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || wal_copy != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -3276,9 +3278,10 @@ test_cluster_gcs_read_rearm_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_begin_grant_reservation_wait\(/ { print "static ClusterPcmOwnResult"; emit=1; begin_wait++ } \
 	     /^typedef enum ClusterBufmgrPcmRetryRearmResult/ { emit=1; result_type++ } \
 	     /^cluster_bufmgr_pcm_retry_denied_rearm\(/ { print "static ClusterBufmgrPcmRetryRearmResult"; emit=1; rearm++ } \
+	     /^cluster_bufmgr_pcm_acquire_shared_owned\(/ { print "static bool"; emit=1; shared_owner++ } \
 	     /^LockBufHdr\(/ { print "uint32"; emit=1; header_lock++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (begin != 1 || cancel != 1 || observe != 1 || wait_owner != 1 || begin_wait != 1 || result_type != 1 || rearm != 1 || header_lock != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (begin != 1 || cancel != 1 || observe != 1 || wait_owner != 1 || begin_wait != 1 || result_type != 1 || rearm != 1 || shared_owner != 1 || header_lock != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_r4_route_policy: test_cluster_r4_route_policy.c unit_test.h \
@@ -3356,6 +3359,24 @@ $(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/backend/cluster/cluster_cr.c 
 		-Dcluster_cr_build_on_holder_pending_locator=continuation_real_pending \
 		-Dcluster_cr_r4_extract_resident_record=continuation_real_extract \
 		-c $< -o $@
+
+test_cluster_cr_dependency_drain.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
+	awk '/^cluster_lms_cr_drain\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cr_dependency: test_cluster_cr_dependency.c test_cluster_cr_dependency_drain.inc \
+		test_cluster_r4_slot_reservation.c unit_test.h \
+		$(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
+		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DCR_SERVER_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_cr_server.c"' \
+		$< $(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
+		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_r4_slot_reservation: test_cluster_r4_slot_reservation.c unit_test.h \
 		$(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
@@ -3567,8 +3588,25 @@ CLUSTER_LMS_OUTBOUND_O = $(top_builddir)/src/backend/cluster/cluster_lms_outboun
 cluster_lms_outbound_test.o: $(top_srcdir)/src/backend/cluster/cluster_lms_outbound.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_LMS_OUTBOUND_UNIT_TEST -c $< -o $@
 
+# Run the real refusal producers and decoder against the real outbound ring.
+# Fail extraction if an owner disappears or is duplicated; do not mirror its
+# implementation in a fixture or stub the enqueue that joins these components.
+test_cluster_r4_refusal_handoff.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
+	awk '/^typedef enum ClusterGcsBlockReplyDomain/ { emit=1; domain++ } \
+	     /^typedef struct GcsBlockR4ReplyExpectation/ { emit=1; expectation++ } \
+	     /^gcs_block_compute_checksum\(/ { print "static uint32"; emit=1; checksum++ } \
+	     /^#define R4_CR_REQUIRED_HELLO_CAPS/ { cap=1; caps++ } \
+	     cap { print; if ($$0 !~ /\\$$/) cap=0; next } \
+	     /^gcs_block_r4_refusal_status_for_build\(/ { print "static bool"; emit=1; status++ } \
+	     /^gcs_block_decode_r4_reply_payload\(/ { print "static bool"; emit=1; decode++ } \
+	     /^gcs_block_r4_publish_refusal\(/ { print "static bool"; emit=1; master++ } \
+	     /^gcs_block_r4_publish_holder_refusal\(/ { print "static bool"; emit=1; holder++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (domain != 1 || expectation != 1 || checksum != 1 || caps != 1 || status != 1 || decode != 1 || master != 1 || holder != 1 || emit || cap) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_lms_outbound: test_cluster_lms_outbound.c unit_test.h \
-		$(CLUSTER_VERSION_O) cluster_lms_outbound_test.o
+		test_cluster_r4_refusal_handoff.inc $(CLUSTER_VERSION_O) cluster_lms_outbound_test.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) cluster_lms_outbound_test.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
@@ -4554,9 +4592,19 @@ test_cluster_r4_production_reachability: test_cluster_r4_production_reachability
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_heap_update_temp_lock.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^cluster_heap_lock_update_predecessor\(/ { print "static TM_Result"; emit=1; found++ } \
+	awk '/^cluster_heap_resume_update_undo_record_exact\(/ { print "static bool"; emit=1; phase++ } \
+	     /^cluster_heap_lock_update_predecessor\(/ { print "static TM_Result"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || phase != 1 || done != 2) exit 1; \
+	           print "#define PREPARE_RESUME_HAS_PHASE 1" }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_toast_resume.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && /heaptup = heap_toast_insert_or_update/ { after_toast=1 } \
+	     after_toast && /if \(resume_update_receipt/ { emit=1; found++ } \
+	     emit && /^#endif/ { emit=0; after_toast=0; done++ } emit { print } \
+	     /^}/ { in_update=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_update_temp_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -4645,7 +4693,14 @@ test_cluster_heap_prepare_diagnostic.inc: $(top_srcdir)/src/backend/access/heap/
 test_cluster_heap_prepare_diagnostic: test_cluster_heap_prepare_diagnostic.c unit_test.h test_cluster_heap_prepare_diagnostic.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
-test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc
+# PGRAC: actual unlocked UPDATE child-intent decision, including refusal.
+test_cluster_heap_update_child_retry.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/if \(ctrc_target_mismatch && \(ctrc_failure_bits/ { emit=1; found++ } \
+	     emit && /if \(ctrc_prepare_only && !ctrc_target_mismatch\)/ { emit=0; done++ } \
+	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc test_cluster_heap_update_toast_resume.inc test_cluster_heap_update_child_retry.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \

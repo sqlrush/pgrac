@@ -410,7 +410,7 @@ _classify_owners(
 _classify_owners(
     "CTRC_RECEIPT_LIFECYCLE",
     "src/backend/cluster/cluster_undo_record.c",
-    ("cluster_undo_record_cancel_prepared",),
+    ("cluster_undo_record_cancel_prepared", "cluster_undo_record_reset_update_targets"),
     "TERMINAL_PROJECTION_DISCHARGE",
     "CTRC_REF_HEAP_ITL_UBA",
     "CTRC_TARGET_PAGE_PENDING_ITL_SLOT|CTRC_TARGET_EXACT_ITL_SLOT",
@@ -786,7 +786,7 @@ _classify_owners(
 _classify_owners(
     "HEAP_ITL_ALLOC_REUSE",
     "src/backend/cluster/cluster_itl.c",
-    ("cluster_itl_alloc_or_reuse_lock_slot", "cluster_itl_alloc_or_reuse_slot"),
+    ("cluster_itl_alloc_or_reuse_lock_slot", "cluster_itl_alloc_or_reuse_slot", "cluster_itl_alloc_update_slot"),
     "REGISTERED_REFERENCE",
     "CTRC_REF_HEAP_ITL_UBA",
     "CTRC_TARGET_EXACT_ITL_SLOT",

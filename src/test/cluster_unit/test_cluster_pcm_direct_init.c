@@ -466,7 +466,8 @@ UT_TEST(test_bufmgr_consumes_proof_before_reservation_and_wire)
 	char *source = read_source(BUFMGR_SOURCE_PATH);
 	static const char *const order[]
 		= { "cluster_bufmgr_pcm_gate_direct_init(", "cluster_pcm_direct_init_proof_consume",
-			"cluster_pcm_own_reservation_begin_exact", "cluster_pcm_lock_acquire_buffer" };
+			"cluster_pcm_own_reservation_begin_exact",
+			"cluster_gcs_resource_x_target_direct_init_acquire_exact(" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
@@ -618,12 +619,23 @@ UT_TEST(test_valid_n_s_x_without_proof_uses_target_or_s_reservation)
 										 "cluster_bufmgr_pcm_x_writer_prepare_target(",
 										 "else",
 										 "cluster_bufmgr_pcm_begin_grant_reservation_wait(",
-										 "cluster_pcm_lock_acquire_buffer(",
-										 "buf, PCM_LOCK_MODE_S, &retry_denied" };
+										 "cluster_bufmgr_pcm_acquire_shared_owned(",
+										 "buf, &pcm_pending_base, pcm_pending_token" };
+	static const char *const owner[]
+		= { "cluster_bufmgr_pcm_acquire_shared_owned(",
+			"PG_TRY();",
+			"cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied)",
+			"PG_CATCH();",
+			"LockBufHdr(buf)",
+			"BM_IO_IN_PROGRESS",
+			"cluster_pcm_own_reservation_abort_exact(",
+			"UnlockBufHdr(buf, state)",
+			"PG_RE_THROW();" };
 
 	UT_ASSERT(source != NULL);
 	if (source != NULL) {
 		assert_ordered(source, order, lengthof(order));
+		assert_ordered(source, owner, lengthof(owner));
 		free(source);
 	}
 }

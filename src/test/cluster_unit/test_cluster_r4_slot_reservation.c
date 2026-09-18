@@ -26,6 +26,7 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "storage/latch.h"
 #include "storage/shmem.h"
+#include "utils/timestamp.h"
 
 #undef printf
 #undef snprintf
@@ -37,6 +38,15 @@
 #endif
 
 UT_DEFINE_GLOBALS();
+
+int cluster_gcs_reply_timeout_ms = 3000;
+static TimestampTz ut_now = INT64CONST(1000000);
+
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return ut_now;
+}
 
 extern bool cluster_cr_server_test_reserve_legacy_slot(ClusterLmsCrSlot *slot,
 													   uint32 reserved_state);
@@ -353,6 +363,12 @@ errstart_cold(int level, const char *domain)
 
 int
 errmsg(const char *format pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
+int
+errdetail(const char *format pg_attribute_unused(), ...)
 {
 	return 0;
 }
@@ -947,6 +963,7 @@ submit_test_admission(void)
 static void
 reset_submit_fixture(ClusterLmsSharedState *state)
 {
+	ut_now = INT64CONST(1000000);
 	ut_stop_new_work_allowed = true;
 	ut_stop_new_work_calls = 0;
 	ut_stop_poll_during_forget = false;

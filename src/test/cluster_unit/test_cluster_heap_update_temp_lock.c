@@ -34,6 +34,8 @@ static int pins, releases, cancels, lock_calls, prepares, fault;
 static TM_Result lock_result;
 static ClusterUndoRecordPrepareReceipt *outer;
 static bool content_locked, route_enabled;
+static uint64 test_now_us;
+static int preparation_phases;
 static PGAlignedBlock current_page;
 char *BufferBlocks = current_page.data;
 Block *LocalBufferBlockPointers;
@@ -111,13 +113,22 @@ cluster_heap_prepare_undo_record_exact(uint8 record_type, uint16 capacity, uint1
 	UT_ASSERT_EQ(capacity, 128);
 	UT_ASSERT_EQ(segment, 1);
 	UT_ASSERT_EQ(offset, 2);
-	UT_ASSERT_EQ(deadline, 900);
+	UT_ASSERT_EQ(deadline, preparation_phases ? test_now_us + 900 : 900);
 	UT_ASSERT(UBA_is_invalid(previous));
 	UT_ASSERT_EQ(receipt->magic, 0);
-	if (fault == 4)
+	if (fault == 4 || deadline <= test_now_us)
 		return false;
 	receipt->magic = 2;
 	return true;
+}
+
+uint64
+cluster_undo_record_prepare_deadline_us(void)
+{
+	preparation_phases++;
+	UT_ASSERT(!content_locked);
+	UT_ASSERT_EQ(pins, 1);
+	return test_now_us + 900;
 }
 
 static int
@@ -147,6 +158,8 @@ heap_lock_tuple(Relation relation, HeapTuple tuple, CommandId cid, LockTupleMode
 	pins++;
 	if (fault == 1)
 		siglongjmp(*PG_exception_stack, 1);
+	if (fault == 6)
+		test_now_us = 1000; /* The nested producer outlives the cancelled phase. */
 	return lock_result;
 }
 
@@ -212,6 +225,8 @@ UT_TEST(real_update_consumer_requalifies_and_preserves_excluded_routes)
 		canonical_binding.segment_id = 1;
 		canonical_binding.slot_offset = 2;
 		fault = 0;
+		test_now_us = 0;
+		preparation_phases = 0;
 		pins = 1;
 		cancels = releases = prepares = lock_calls = 0;
 		content_locked = true;
@@ -243,11 +258,14 @@ run_adapter(TM_Result expected_result, int failure, bool applied)
 	ItemPointerData tid;
 	volatile bool caught = false;
 	volatile TM_Result result = TM_Invisible;
+	uint64 deadline = 900;
 
 	pins = 1;
 	content_locked = false;
 	releases = cancels = lock_calls = prepares = 0;
 	fault = failure;
+	test_now_us = 0;
+	preparation_phases = 0;
 	lock_result = expected_result;
 	receipt.magic = 1;
 	receipt.ctrc_applied_mask = applied ? 1 : 0;
@@ -258,14 +276,20 @@ run_adapter(TM_Result expected_result, int failure, bool applied)
 	PG_TRY();
 	{
 		result = cluster_heap_lock_update_predecessor((Relation)1, &tid, 7, LockTupleNoKeyExclusive,
-													  LockWaitBlock, &binding, 900, &receipt);
+													  LockWaitBlock, &binding,
+#ifdef PREPARE_RESUME_HAS_PHASE
+													  &deadline,
+#else
+													  deadline,
+#endif
+													  &receipt);
 	}
 	PG_CATCH();
 	{
 		caught = true;
 	}
 	PG_END_TRY();
-	UT_ASSERT_EQ(caught, applied || failure != 0);
+	UT_ASSERT_EQ(caught, applied || (failure != 0 && failure != 6));
 	UT_ASSERT_EQ(pins, 1);
 	UT_ASSERT_EQ(lock_calls, applied || failure == 3 ? 0 : 1);
 	UT_ASSERT_EQ(releases, applied || failure == 3 || failure == 5 ? 0 : 1);
@@ -274,10 +298,70 @@ run_adapter(TM_Result expected_result, int failure, bool applied)
 	if (!caught) {
 		UT_ASSERT_EQ(result, expected_result);
 		UT_ASSERT_EQ(receipt.magic, 2);
+		UT_ASSERT_EQ(deadline, test_now_us + 900);
 	}
 }
 
-UT_TEST(success_preserves_outer_pin_and_original_budget)
+UT_TEST(resume_never_replaces_a_live_receipt_or_renews_without_a_handoff)
+{
+	ClusterUndoRecordPrepareReceipt receipt = { 0 };
+	ClusterCanonicalTxnBinding binding = { 0 };
+	uint64 deadline = 900;
+
+	prepares = preparation_phases = 0;
+	receipt.magic = 1;
+	UT_ASSERT(!cluster_heap_resume_update_undo_record_exact(&binding, &deadline, &receipt));
+	UT_ASSERT(!cluster_heap_resume_update_undo_record_exact(NULL, &deadline, &receipt));
+	UT_ASSERT(!cluster_heap_resume_update_undo_record_exact(&binding, NULL, &receipt));
+	UT_ASSERT(!cluster_heap_resume_update_undo_record_exact(&binding, &deadline, NULL));
+	UT_ASSERT_EQ(receipt.magic, 1);
+	receipt.magic = 0;
+	receipt.ctrc_applied_mask = 1;
+	UT_ASSERT(!cluster_heap_resume_update_undo_record_exact(&binding, &deadline, &receipt));
+	UT_ASSERT_EQ(receipt.ctrc_applied_mask, 1);
+	UT_ASSERT_EQ(deadline, 900);
+	UT_ASSERT_EQ(prepares, 0);
+	UT_ASSERT_EQ(preparation_phases, 0);
+}
+
+UT_TEST(completed_nested_producer_starts_its_own_preparation_phase)
+{
+	run_adapter(TM_Ok, 6, false);
+	UT_ASSERT_EQ(preparation_phases, 1);
+}
+
+UT_TEST(real_toast_return_uses_the_completed_handoff_boundary)
+{
+	for (int leg = 0; leg < 2; leg++) {
+		ClusterUndoRecordPrepareReceipt undo_receipt = { 0 };
+		ClusterCanonicalTxnBinding canonical_binding = { 0 };
+		uint64 undo_prepare_deadline_us = 900;
+		bool resume_update_receipt = leg == 0;
+		volatile bool caught = false;
+
+		canonical_binding.segment_id = 1;
+		canonical_binding.slot_offset = 2;
+		pins = 1;
+		content_locked = false;
+		test_now_us = 1000;
+		preparation_phases = prepares = fault = 0;
+		PG_TRY();
+		{
+#include "test_cluster_heap_update_toast_resume.inc"
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!caught);
+		UT_ASSERT_EQ(prepares, resume_update_receipt ? 1 : 0);
+		UT_ASSERT_EQ(preparation_phases, prepares);
+		UT_ASSERT_EQ(undo_prepare_deadline_us, resume_update_receipt ? 1900 : 900);
+	}
+}
+
+UT_TEST(success_preserves_outer_pin_and_fixes_new_phase_budget)
 {
 	run_adapter(TM_Ok, 0, false);
 }
@@ -398,15 +482,69 @@ UT_TEST(real_successor_preserves_all_other_planner_branches)
 		check_successor_header(leg);
 }
 
+static ClusterUndoTargetResetResult child_reset_result;
+static int child_reset_calls;
+
+ClusterUndoTargetResetResult
+cluster_undo_record_reset_update_targets(ClusterUndoRecordPrepareReceipt *receipt,
+										 const ClusterCtrcTargetV1 *targets, uint8 required_mask)
+{
+	UT_ASSERT(!content_locked);
+	UT_ASSERT_EQ(required_mask, 3);
+	child_reset_calls++;
+	return child_reset_result;
+}
+
+UT_TEST(real_update_child_rebind_refusal_cannot_fall_back)
+{
+	for (int leg = 0; leg < 6; leg++) {
+		ClusterUndoRecordPrepareReceipt undo_receipt = { 0 };
+		ClusterCanonicalTxnBinding canonical_binding = { 0 };
+		ClusterCtrcTargetV1 ctrc_pending_targets[2] = { 0 };
+		uint8 ctrc_required_mask = 3;
+		uint8 ctrc_failure_bits = leg == 4 ? 1 : 0;
+		volatile bool ctrc_target_mismatch = leg != 3;
+		volatile bool ctrc_prepare_only = false;
+		volatile bool caught = false;
+
+		content_locked = false;
+		child_reset_calls = 0;
+		child_reset_result = leg == 1	? CLUSTER_UNDO_TARGET_RESET_REFUSED
+							 : leg == 2 ? CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE
+										: CLUSTER_UNDO_TARGET_RESET_READY;
+		undo_receipt.tt_slot_segment_id = canonical_binding.segment_id = 17;
+		undo_receipt.tt_slot_offset = canonical_binding.slot_offset = 4;
+		if (leg == 5)
+			canonical_binding.slot_offset++;
+		PG_TRY();
+		{
+#include "test_cluster_heap_update_child_retry.inc"
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, leg == 1);
+		UT_ASSERT_EQ(child_reset_calls, leg < 3 ? 1 : 0);
+		UT_ASSERT_EQ(ctrc_prepare_only, leg == 0);
+		UT_ASSERT_EQ(ctrc_target_mismatch, leg != 0 && leg != 3);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
+	UT_RUN(resume_never_replaces_a_live_receipt_or_renews_without_a_handoff);
+	UT_RUN(real_update_child_rebind_refusal_cannot_fall_back);
+	UT_RUN(real_toast_return_uses_the_completed_handoff_boundary);
+	UT_RUN(completed_nested_producer_starts_its_own_preparation_phase);
 	UT_RUN(real_successor_does_not_inherit_own_temporary_lock);
 	UT_RUN(real_successor_preserves_all_other_planner_branches);
 	UT_RUN(real_row_lock_return_cancels_only_unpublished_receipt);
 	UT_RUN(real_update_consumer_requalifies_and_preserves_excluded_routes);
-	UT_RUN(success_preserves_outer_pin_and_original_budget);
+	UT_RUN(success_preserves_outer_pin_and_fixes_new_phase_budget);
 	UT_RUN(updated_is_not_success);
 	UT_RUN(would_block_is_not_success);
 	UT_RUN(error_after_pin_releases_only_nested_pin);

@@ -118,6 +118,8 @@ typedef struct ClusterR4CrWorkerContext {
 	int32 requester_node;
 	int32 requester_backend_id;
 	uint64 request_id;
+	/* Reply period for one unpublished dependency, never a SQL deadline. */
+	TimestampTz foreign_reply_deadline;
 	ClusterSemanticAdmissionToken admission;
 	uint32 expected_foreign_physical_generation;
 	bool foreign_physical_generation_frozen;
@@ -1401,6 +1403,8 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT))
 		return false;
 	pg_read_barrier();
+	context->foreign_reply_deadline
+		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), Max(cluster_gcs_reply_timeout_ms, 1));
 	send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
 										   slot->r4.foreign_origin_node, &forward, sizeof(forward));
 	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_FORWARD, send_result);
@@ -1698,13 +1702,23 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 		memcpy(frame + sizeof(*header), slot->result_page, BLCKSZ);
 	}
 	header->checksum = cluster_gcs_block_compute_checksum(frame + sizeof(*header));
-
 	if (!cr_server_r4_identity_open_matches(&context->admission, slot->requester_node,
 											slot->r4.requester_capability_generation)
-		|| !cluster_semantic_activation_recheck(&context->admission)
-		|| (terminal_state == CLUSTER_LMS_CR_R4_READY_FULL && cluster_write_fence_enforcing()
-			&& !cluster_write_fence_allowed()))
+		|| !cluster_semantic_activation_recheck(&context->admission))
 		return cr_server_r4_release_terminal(slot_index, slot_generation);
+
+	/* A current authenticated requester may retry a fenced image. Never send
+	 * its bytes, or resurrect FULL if transport admission itself must retry. */
+	if (terminal_state == CLUSTER_LMS_CR_R4_READY_FULL && cluster_write_fence_enforcing()
+		&& !cluster_write_fence_allowed()) {
+		terminal_state = CLUSTER_LMS_CR_R4_READY_RETRY;
+		terminal_reason = CLUSTER_CR_BUILD_HOLDER_MOVED;
+		slot->r4.terminal_reason = (uint8)terminal_reason;
+		header->status = (uint8)GCS_BLOCK_REPLY_R4_RETRYABLE_HOLDER_MOVED;
+		header->page_lsn = 0;
+		memset(frame + sizeof(*header), 0, BLCKSZ);
+		header->checksum = cluster_gcs_block_compute_checksum(frame + sizeof(*header));
+	}
 
 	if (terminal_reason != CLUSTER_CR_BUILD_NONE)
 		cluster_r4_observe_refusal(CLUSTER_R4_REFUSAL_HOLDER_SHIP, terminal_reason, &slot->tag,
@@ -1723,6 +1737,7 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 	} else
 		send_result = cluster_ic_send_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, slot->requester_node,
 											   frame, sizeof(frame));
+	cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY, send_result);
 	switch (send_result) {
 	case CLUSTER_IC_SEND_DONE:
 	case CLUSTER_IC_SEND_WOULD_BLOCK:
@@ -1738,7 +1753,60 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 	return false;
 }
 
+/* Worker 0 owns retirement of unpublished dependency continuations. This
+ * maintenance is safe during origin SCUR work: no build, buffer or undo I/O.
+ * The original terminal owner retains the slot until transport accepts its
+ * zero-body retry. Neither an elapsed reply period nor that retry proves any
+ * transaction outcome. Late replies still face the exact in-flight key gate. */
+static void
+cr_server_r4_maintain_dependencies(void)
+{
+	TimestampTz now;
+
+	if (CrServerShared == NULL || cluster_ic_tier1_my_data_channel() != 0 || MyBackendType != B_LMS
+		|| !cluster_gcs_block_family_on_data_plane())
+		return;
+	now = GetCurrentTimestamp();
+	for (uint32 i = 0; i < CLUSTER_LMS_CR_SLOTS; i++) {
+		ClusterLmsCrSlot *slot = &CrServerShared->slots[i];
+		ClusterR4CrWorkerContext *context = &CrServerR4Contexts[i];
+		uint32 state = pg_atomic_read_u32(&slot->state);
+
+		if (!context->in_use || context->foreign_reply_deadline == 0
+			|| now < context->foreign_reply_deadline)
+			continue;
+		if (state == CLUSTER_LMS_CR_R4_UNDO_INFLIGHT) {
+			ClusterR4CrWorkerContext frozen_context = *context;
+
+			if (!cr_server_r4_foreign_landing_key_valid(i, slot, context, &frozen_context))
+				continue;
+			if (!cr_server_r4_publish_foreign_terminal(slot, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT,
+													   CLUSTER_LMS_CR_R4_READY_RETRY,
+													   CLUSTER_CR_BUILD_HOLDER_MOVED))
+				continue;
+			/* Bounded by the four slots and the existing reply period, not by
+			 * the worker polling rate. Ordinary successful work stays silent. */
+			ereport(LOG,
+					(errmsg_internal("R4 CR dependency reply period elapsed"),
+					 errdetail("PGRAC_FAMILY=R4_CR_RETRY "
+							   "PGRAC_REASON=UNDO_REPLY_PERIOD_EXPIRED request=" UINT64_FORMAT
+							   " dependency=" UINT64_FORMAT " slot=%u generation=" UINT64_FORMAT,
+							   slot->request_id, slot->r4.foreign_request_id, i,
+							   context->slot_generation)));
+			state = CLUSTER_LMS_CR_R4_READY_RETRY;
+		}
+		if (state == CLUSTER_LMS_CR_R4_READY_RETRY)
+			(void)cr_server_r4_ship_terminal(i);
+	}
+}
+
 #ifdef USE_CLUSTER_UNIT
+void
+cluster_cr_server_test_r4_maintain_dependencies(void)
+{
+	cr_server_r4_maintain_dependencies();
+}
+
 bool
 cluster_cr_server_test_r4_claim_queued(uint32 slot_index)
 {
@@ -3782,6 +3850,7 @@ cluster_lms_cr_drain(void)
 	 * process-local, so it must progress even when the legacy CR table is
 	 * absent. */
 	cluster_gcs_block_r4_tx_resolve_drain();
+	cr_server_r4_maintain_dependencies();
 	if (cluster_gcs_block_r4_tx_resolve_active()) {
 		cr_server_r4_note_origin_deferral();
 		return;

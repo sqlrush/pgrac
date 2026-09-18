@@ -717,7 +717,7 @@ index_getnext_slot(IndexScanDesc scan, ScanDirection direction, TupleTableSlot *
 		&& scan->xs_snapshot->snapshot_type == SNAPSHOT_MVCC
 		&& scan->xs_snapshot->cluster_source == SNAPSHOT_SOURCE_CLUSTER
 		&& SCN_VALID(scan->xs_snapshot->read_scn))
-		ereport(LOG,
+		ereport(DEBUG1,
 				(errmsg("R4 index selection exhausted"),
 				 errdetail("PGRAC_FAMILY=R4_SELECTION PGRAC_REASON=INDEX_EXHAUSTED "
 						   "node=%d relation=%u index=%u read_scn=" UINT64_FORMAT

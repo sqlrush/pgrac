@@ -481,13 +481,32 @@ cluster_heap_undo_receipt_errdetail(bool ctrc)
 					 cluster_undo_record_receipt_last_reason(), cluster_node_id);
 }
 
+/* Start a new preparation only after an explicitly cancelled outer producer's
+ * nested producer has returned and released its reservation. Ordinary retries
+ * must keep using cluster_heap_retry_undo_record_exact and their fixed budget. */
+static bool
+cluster_heap_resume_update_undo_record_exact(const ClusterCanonicalTxnBinding *binding,
+											uint64 *deadline_us,
+											ClusterUndoRecordPrepareReceipt *receipt)
+{
+	if (binding == NULL || deadline_us == NULL || receipt == NULL || receipt->magic != 0
+		|| receipt->ctrc_applied_mask != 0)
+		return false;
+	*deadline_us = cluster_undo_record_prepare_deadline_us();
+	return *deadline_us != 0
+		   && cluster_heap_prepare_undo_record_exact(
+			   UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
+			   (uint16)binding->segment_id, binding->slot_offset, (UBA)InvalidUba_init,
+			   *deadline_us, receipt);
+}
+
 /* The caller has released content locks and retains its original heap pin.
  * The ordinary row-lock producer owns the locator, undo and publication;
  * this adapter owns only its additional pin and the unpublished outer slot. */
 static TM_Result
 cluster_heap_lock_update_predecessor(Relation relation, ItemPointer tid, CommandId cid,
 									 LockTupleMode mode, LockWaitPolicy wait_policy,
-									 const ClusterCanonicalTxnBinding *binding, uint64 deadline_us,
+									 const ClusterCanonicalTxnBinding *binding, uint64 *deadline_us,
 									 ClusterUndoRecordPrepareReceipt *receipt)
 {
 	HeapTupleData tuple = { 0 };
@@ -526,11 +545,7 @@ cluster_heap_lock_update_predecessor(Relation relation, ItemPointer tid, Command
 			ReleaseBuffer(nested_buffer);
 	}
 	PG_END_TRY();
-	if (resume
-		&& !cluster_heap_prepare_undo_record_exact(
-			UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
-			(uint16)binding->segment_id, binding->slot_offset, (UBA)InvalidUba_init, deadline_us,
-			receipt))
+	if (resume && !cluster_heap_resume_update_undo_record_exact(binding, deadline_us, receipt))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 						errmsg("cluster undo reservation failed after heap temporary lock"),
 						cluster_heap_undo_receipt_errdetail(false)));
@@ -1604,6 +1619,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	uint8 i;
 	int remaining_ms;
 	uint64 wait_deadline;
+	volatile bool wait_finished = false;
 
 	Assert(full_buffer == old_buffer || full_buffer == new_buffer);
 	*diagnostic_reason = "ITL_BLOCKER_UNPROVABLE";
@@ -1732,10 +1748,37 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	}
 	wait_deadline = *deadline_us;
 	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_WAIT_STARTED);
-	result = cluster_tx_enqueue_wait_exact(&blocker, remaining_ms, &wait_reason);
+	PG_TRY();
+	{
+		result = cluster_tx_enqueue_wait_exact(&blocker, remaining_ms, &wait_reason);
+		wait_finished = true;
+	}
+	PG_FINALLY();
+	{
+		/* Error-only causal evidence. The copied census remains valid as an
+		 * observation, never as a new authority; no page is repinned here. */
+		if (!wait_finished || (result != CLUSTER_TXW_RESOLVED && result != CLUSTER_TXW_RETRY)) {
+			ereport(LOG,
+					(errmsg("cluster ITL capacity wait terminated"),
+					 errdetail("PGRAC_FAMILY=ITL_CAPACITY_DIAGNOSTIC PGRAC_REASON=WAIT_TERMINAL "
+							   "waiter_xid=%u blocker_xid=%u blocker_wrap=%u lock_only=%d "
+							   "returned=%d result=%d resolve_reason=%d deadline_us=" UINT64_FORMAT,
+							   xid, blocker.xid, blocker.tt_wrap, lock_only,
+							   wait_finished, wait_finished ? (int)result : -1,
+							   wait_finished ? (int)wait_reason : -1, wait_deadline)));
+			cluster_heap_itl_capacity_diagnostic(&census, capture_result, "WAIT_TERMINAL");
+		}
+	}
+	PG_END_TRY();
 	if (*deadline_us != wait_deadline) {
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_DEADLINE_REFRESH);
 		return CLUSTER_TXW_UNPROVABLE;
+	}
+	/* A consumed, exact deadlock cancellation is the terminal cause even if
+	 * the capacity budget expires during the return/diagnostic boundary. */
+	if (result == CLUSTER_TXW_DEADLOCK) {
+		*diagnostic_reason = "ITL_WAIT_DEADLOCK";
+		return result;
 	}
 	/* Even a terminal reply cannot renew an already spent caller budget. */
 	if (result == CLUSTER_TXW_TIMEOUT
@@ -1822,6 +1865,13 @@ cluster_heap_update_needs_successor_prediction(bool current_itl_path,
 	return current_itl_path || current_mx_recomposed;
 }
 
+static bool
+cluster_heap_update_lock_handoff_allowed(bool temp_locked, uint16 successor_infomask)
+{
+	/* Keep an application lock carrier if the new row would inherit it. */
+	return temp_locked && (successor_infomask & HEAP_XMAX_INVALID) != 0;
+}
+
 
 #ifdef USE_CLUSTER_UNIT
 bool
@@ -1844,6 +1894,12 @@ cluster_heap_test_update_needs_successor_prediction(
 {
 	return cluster_heap_update_needs_successor_prediction(
 		current_itl_path, current_mx_recomposed);
+}
+
+bool
+cluster_heap_test_update_lock_handoff_allowed(bool temp_locked, uint16 successor_infomask)
+{
+	return cluster_heap_update_lock_handoff_allowed(temp_locked, successor_infomask);
 }
 
 bool
@@ -1885,19 +1941,21 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 			ClusterTxwResult wait_result;
 			const char *wait_reason;
 
-			/* The existing wait owner releases content before exact blocker
-			 * resolution. Its wake cannot validate this DML's old target. */
+			/* The wait releases content, so its wake requires fresh page/tuple
+			 * qualification, not receipt invalidation. Preserve the receipt
+			 * until the requalified pending-target checks prove a change. */
 			wait_result = cluster_heap_itl_wait_capacity_after_census(
 				buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason);
 			*content_unlocked = true;
-			*targets_invalidated = true;
 			if (wait_result == CLUSTER_TXW_RESOLVED || wait_result == CLUSTER_TXW_RETRY)
 				return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 			ereport(ERROR,
 				(errcode(wait_result == CLUSTER_TXW_TIMEOUT ? ERRCODE_CLUSTER_GES_TIMEOUT
 					: wait_result == CLUSTER_TXW_DEADLOCK ? ERRCODE_T_R_DEADLOCK_DETECTED
 					: ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("ITL slot OVERFLOW before heap tuple lock (INITRANS=%d full)",
+				 errmsg(wait_result == CLUSTER_TXW_DEADLOCK
+							? "deadlock detected while waiting for heap tuple-lock ITL capacity (INITRANS=%d)"
+							: "ITL slot OVERFLOW before heap tuple lock (INITRANS=%d full)",
 						CLUSTER_ITL_INITRANS_DEFAULT),
 				 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=%s PGRAC_NODE=%d "
 						   "PGRAC_ATTEMPT=0 wait_result=%d deadline_us=" UINT64_FORMAT,
@@ -2007,7 +2065,7 @@ cluster_heap_capture_undo_prior_lock(Page page, uint8 record_type, uint8 target_
 static ClusterHeapPreparedUndoResult
 cluster_heap_itl_plan_prepared_undo_target(
 	Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
-	bool lock_only, ClusterUndoRecordPrepareReceipt *receipt,
+	bool lock_only, bool allow_lock_handoff, ClusterUndoRecordPrepareReceipt *receipt,
 	uint8 target_ordinal, void *payload, uint16 payload_len,
 	ClusterHeapPreparedUndoTargetPlan *plan)
 {
@@ -2029,8 +2087,12 @@ cluster_heap_itl_plan_prepared_undo_target(
 		return receipt->ctrc_applied_mask == 0
 			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
 			: CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
-	if (!cluster_heap_itl_alloc_once(
-			buffer, xid, lock_only, &plan->slot_index))
+	if (!(allow_lock_handoff && receipt->record_type == UNDO_RECORD_UPDATE && target_ordinal == 0
+		  && !lock_only && tuple != NULL
+		  ? cluster_itl_alloc_update_slot(buffer, xid,
+				ItemPointerGetOffsetNumber(&tuple->t_self), &plan->slot_index)
+		  : cluster_heap_itl_alloc_once(
+				buffer, xid, lock_only, &plan->slot_index)))
 		return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 	if (!cluster_heap_dml_authority_guard_bind_itl_slot(
 			buffer, plan->slot_index, &plan->guard))
@@ -4758,7 +4820,11 @@ heap_hot_r4_data_slot(uint8 flags)
  * raw xmin is not a creator locator: it is the approved signal to request a
  * complete holder-built block and restart from the logical HOT root.  A
  * matching creator written after the statement SCN needs the same FULL path;
- * the older version may require another instance's undo.  Our own creator
+ * the older version may require another instance's undo. Another local
+ * transaction also needs FULL: native snapshot membership can still include
+ * it after the predecessor's canonical commit is visible at read_scn. Mixing
+ * those two verdicts loses both versions in the commit-publication window.
+ * Our own creator
  * keeps the ordinary command-id visibility path; a foreign numeric xid match
  * is not our transaction.
  */
@@ -4799,6 +4865,8 @@ heap_hot_r4_updated_xmin_needs_full(Page page, HeapTuple tuple,
 	return heap_hot_r4_data_slot(slot->flags) && cluster_itl_get_tt_ref(page, itl_index, &ref)
 		   && ref.tt_slot_id != 0 && TransactionIdIsNormal(ref.local_xid)
 		   && (!TransactionIdEquals(ref.local_xid, raw_xmin)
+			   || (ref.origin_node_id == cluster_node_id
+				   && !TransactionIdIsCurrentTransactionId(ref.local_xid))
 			   || (SCN_VALID(slot->write_scn)
 				   && !(ref.origin_node_id == cluster_node_id
 						&& TransactionIdIsCurrentTransactionId(ref.local_xid))
@@ -6001,7 +6069,7 @@ cluster_heap_insert_retry:
 				undo_plan_result = CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 				if (OffsetNumberIsValid(undo_target.offnum))
 					undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
-						relation, buffer, NULL, canonical_xid, false,
+						relation, buffer, NULL, canonical_xid, false, false,
 						&undo_receipt, 0, &undo_payload, sizeof(undo_payload),
 						&undo_plan);
 				if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -11141,7 +11209,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			undo_target.blockno = ItemPointerGetBlockNumber(&tp.t_self);
 			undo_target.offnum = ItemPointerGetOffsetNumber(&tp.t_self);
 			undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
-				relation, buffer, &tp, canonical_xid, false, &undo_receipt,
+				relation, buffer, &tp, canonical_xid, false, false, &undo_receipt,
 				0, undo_payload_buf, undo_payload_len, &undo_plan);
 			if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
 			{
@@ -12418,7 +12486,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		lock_result = cluster_heap_lock_update_predecessor(
 			relation, &oldtup.t_self, pgrac_entry_cid, *lockmode,
-			wait ? LockWaitBlock : LockWaitSkip, &canonical_binding, undo_prepare_deadline_us,
+			wait ? LockWaitBlock : LockWaitSkip, &canonical_binding, &undo_prepare_deadline_us,
 			&undo_receipt);
 		old_tuple_temp_locked = lock_result == TM_Ok;
 		cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
@@ -12794,10 +12862,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			newtupsize = MAXALIGN(heaptup->t_len);
 #ifdef USE_PGRAC_CLUSTER
 			if (resume_update_receipt
-				&& !cluster_heap_prepare_undo_record_exact(
-					UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
-					(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
-					(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt))
+				&& !cluster_heap_resume_update_undo_record_exact(
+					&canonical_binding, &undo_prepare_deadline_us, &undo_receipt))
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 								errmsg("cluster undo reservation failed before heap update"),
 								cluster_heap_undo_receipt_errdetail(false)));
@@ -13000,6 +13066,7 @@ l_pgrac_reacquire:
 		uint16 tt_off;
 		bool census_was_pending = cluster_itl_update_census_pending;
 		bool old_capacity;
+		uint8 old_capacity_slot;
 		ClusterHeapItlCapacityResult old_capacity_result;
 		ClusterHeapDmlAuthorityGuard old_dml_guard;
 		ClusterHeapDmlAuthorityGuard new_dml_guard;
@@ -13065,6 +13132,10 @@ l_pgrac_reacquire:
 		if (census_was_pending
 			&& census_apply_result.kind == CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X)
 			old_capacity_result = CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY;
+		else if (cluster_heap_update_lock_handoff_allowed(old_tuple_temp_locked, infomask_new_tuple)
+			&& cluster_itl_alloc_update_slot(buffer, canonical_xid,
+				ItemPointerGetOffsetNumber(&oldtup.t_self), &old_capacity_slot))
+			old_capacity_result = CLUSTER_HEAP_ITL_CAPACITY_READY;
 		else if (newbuf == buffer && !census_was_pending)
 			old_capacity_result
 				= cluster_heap_itl_ensure_capacity_with_terminal_census(
@@ -13394,6 +13465,30 @@ l_pgrac_reacquire:
 					}
 				}
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				/* A different insertion page invalidates its unpublished
+				 * child intent, not an otherwise exact READY undo extent.
+				 * Rebind only a completely captured UPDATE target set, with
+				 * both pages unlocked; the next pass still rechecks and APPLYs
+				 * under current content-X before any reference is published. */
+				if (ctrc_target_mismatch && (ctrc_failure_bits & UINT8_C(3)) == 0
+					&& undo_receipt.tt_slot_segment_id == (uint16)canonical_binding.segment_id
+					&& undo_receipt.tt_slot_offset == canonical_binding.slot_offset)
+				{
+					ClusterUndoTargetResetResult reset_result
+						= cluster_undo_record_reset_update_targets(
+							&undo_receipt, ctrc_pending_targets, ctrc_required_mask);
+
+					if (reset_result == CLUSTER_UNDO_TARGET_RESET_REFUSED)
+						ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+							 errmsg("UPDATE target intent cancellation could not be proved"),
+							 cluster_heap_undo_receipt_errdetail(true)));
+					if (reset_result == CLUSTER_UNDO_TARGET_RESET_READY)
+					{
+						ctrc_target_mismatch = false;
+						ctrc_prepare_only = true;
+					}
+				}
 				if (ctrc_prepare_only && !ctrc_target_mismatch)
 				{
 					for (ctrc_target_ordinal = 0;
@@ -13829,6 +13924,8 @@ l_pgrac_reacquire:
 					undo_plan_result
 						= cluster_heap_itl_plan_prepared_undo_target(
 							relation, buffer, &oldtup, canonical_xid, false,
+							cluster_heap_update_lock_handoff_allowed(old_tuple_temp_locked,
+								infomask_new_tuple),
 							&undo_receipt, 0, undo_payload_buf,
 							cluster_itl_undo_payload_len, &undo_plans[0]);
 					if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -13846,7 +13943,7 @@ l_pgrac_reacquire:
 					{
 						undo_plan_result
 							= cluster_heap_itl_plan_prepared_undo_target(
-								relation, newbuf, NULL, canonical_xid, false,
+								relation, newbuf, NULL, canonical_xid, false, false,
 								&undo_receipt, 1, undo_payload_buf,
 								cluster_itl_undo_payload_len, &undo_plans[1]);
 						if (undo_plan_result
@@ -14456,7 +14553,9 @@ l_pgrac_itl_capacity_wait: {
 				(errcode(wait_result == CLUSTER_TXW_TIMEOUT	   ? ERRCODE_CLUSTER_GES_TIMEOUT
 						 : wait_result == CLUSTER_TXW_DEADLOCK ? ERRCODE_T_R_DEADLOCK_DETECTED
 															   : ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
+				 errmsg(wait_result == CLUSTER_TXW_DEADLOCK
+							? "deadlock detected while waiting for heap update ITL capacity (INITRANS=%d)"
+							: "ITL slot OVERFLOW on heap page (INITRANS=%d full)",
 						CLUSTER_ITL_INITRANS_DEFAULT),
 				 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=%s PGRAC_NODE=%d "
 						   "PGRAC_ATTEMPT=0 wait_result=%d deadline_us=" UINT64_FORMAT,
@@ -16227,7 +16326,7 @@ failed:
 				undo_payload.lock_mode = (uint8) mode;
 				undo_payload.lock_xid = xid;
 				undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
-					relation, *buffer, tuple, canonical_xid, true,
+					relation, *buffer, tuple, canonical_xid, true, false,
 					&undo_receipt, 0, &undo_payload, sizeof(undo_payload),
 					&undo_plan);
 				if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -17584,7 +17683,7 @@ l4:
 				undo_payload.lock_mode = (uint8) mode;
 				undo_payload.lock_xid = xid;
 				plan_result = cluster_heap_itl_plan_prepared_undo_target(
-					rel, buf, &mytup, canonical_xid, true,
+					rel, buf, &mytup, canonical_xid, true, false,
 					&cluster_chain_receipt, 0, &undo_payload,
 					sizeof(undo_payload), &undo_plan);
 				if (plan_result

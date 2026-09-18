@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * test_cluster_heap_prepare_diagnostic.c
- *    Exact production prepare refusal attribution, without changing decisions.
+ *    Exact production prepare refusals and capacity-wait requalification.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -157,9 +157,7 @@ check_prepare(int cause, bool applied, int expected, const char *reason)
 													&invalidated);
 #endif
 	UT_ASSERT_EQ(result, expected);
-	UT_ASSERT_EQ(invalidated,
-				 cause == 7 || cause == 9
-					 || (capacity_requested && request_lock_only && cause == 1 && !applied));
+	UT_ASSERT_EQ(invalidated, cause == 7 || cause == 9);
 	UT_ASSERT_EQ(receipt.ctrc_applied_mask, applied ? 1 : 0);
 	if (reason != NULL) {
 		UT_ASSERT(observed != NULL);
@@ -212,6 +210,72 @@ UT_TEST(unproved_or_failed_wait_is_not_a_retry_success)
 	capacity_requested = false;
 }
 
+UT_TEST(capacity_wait_preserves_receipt_and_original_budgets)
+{
+	const ClusterTxwResult wakes[] = { CLUSTER_TXW_RESOLVED, CLUSTER_TXW_RETRY };
+
+	for (unsigned i = 0; i < lengthof(wakes); i++) {
+		ClusterUndoRecordPrepareReceipt receipt = { 0 }, before;
+		const char *reason = "old cause must not leak";
+		uint64 capacity_deadline = 12345;
+		bool invalidated = true;
+
+		/* The wait must not cancel or renew this previously prepared target.
+		 * Real expired-budget requalification is covered by undo_record. */
+		receipt.absolute_deadline_us = 100;
+		receipt.reservation_sequence = 17;
+		receipt.ctrc_pending_mask = receipt.ctrc_prepared_mask = 1;
+		before = receipt;
+		fault = 1;
+		wait_result = wakes[i];
+		wait_calls = 0;
+		content_unlocked = false;
+		UT_ASSERT_EQ(cluster_heap_itl_prepare_prepared_undo(NULL, 1, NULL, 700, true, &receipt, 64,
+															&invalidated, &reason,
+															&capacity_deadline, &content_unlocked),
+					 CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED);
+		UT_ASSERT(!invalidated);
+		UT_ASSERT(content_unlocked);
+		UT_ASSERT_EQ(wait_calls, 1);
+		UT_ASSERT(reason == NULL);
+		UT_ASSERT_EQ(capacity_deadline, 12345);
+		UT_ASSERT_EQ(memcmp(&receipt, &before, sizeof(receipt)), 0);
+	}
+}
+
+UT_TEST(capacity_wake_does_not_bypass_fresh_target_recheck)
+{
+	const int rechecks[] = { 0, 7, 9 };
+
+	for (unsigned i = 0; i < lengthof(rechecks); i++) {
+		ClusterUndoRecordPrepareReceipt receipt = { 0 };
+		const char *reason = NULL;
+		uint64 capacity_deadline = 12345;
+		bool invalidated = false;
+
+		receipt.ctrc_pending_mask = receipt.ctrc_prepared_mask = 1;
+		fault = 1;
+		wait_result = CLUSTER_TXW_RESOLVED;
+		UT_ASSERT_EQ(cluster_heap_itl_prepare_prepared_undo(NULL, 1, NULL, 700, true, &receipt, 64,
+															&invalidated, &reason,
+															&capacity_deadline, &content_unlocked),
+					 CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED);
+		UT_ASSERT(!invalidated);
+		/* Simulate the caller's fresh page bracket. Actual pending-target
+		 * mismatch still invalidates; a wake alone never publishes READY. */
+		fault = rechecks[i];
+		UT_ASSERT_EQ(cluster_heap_itl_prepare_prepared_undo(NULL, 1, NULL, 700, true, &receipt, 64,
+															&invalidated, &reason,
+															&capacity_deadline, &content_unlocked),
+					 i == 0 ? CLUSTER_HEAP_PREPARED_UNDO_READY
+							: CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED);
+		UT_ASSERT_EQ(invalidated, i != 0);
+		UT_ASSERT(!content_unlocked);
+		UT_ASSERT_EQ(receipt.ctrc_applied_mask, 0);
+		UT_ASSERT_EQ(capacity_deadline, 12345);
+	}
+}
+
 UT_TEST(refusals_have_unique_exact_causes)
 {
 	check_prepare(1, false, CLUSTER_HEAP_PREPARED_UNDO_REFUSED, "ITL_CAPACITY_REFUSED");
@@ -236,11 +300,13 @@ UT_TEST(success_and_preapply_retries_remain_unchanged)
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(6);
 	UT_RUN(refusals_have_unique_exact_causes);
 	UT_RUN(success_and_preapply_retries_remain_unchanged);
 	UT_RUN(full_lock_capacity_waits_then_requalifies_without_apply);
 	UT_RUN(unproved_or_failed_wait_is_not_a_retry_success);
+	UT_RUN(capacity_wait_preserves_receipt_and_original_budgets);
+	UT_RUN(capacity_wake_does_not_bypass_fresh_target_recheck);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

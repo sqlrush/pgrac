@@ -611,6 +611,48 @@ UT_TEST(test_ctrc_receipt_prepare_apply_full_identity_cross_product)
 	UT_ASSERT_EQ(receipt.target.kind, CTRC_TARGET_EXACT_ITL_SLOT);
 }
 
+UT_TEST(test_cancelled_child_attempt_cannot_alias_its_replacement)
+{
+	ClusterCtrcParticipantEntry participant;
+	ClusterCtrcTxnKeyV1 key = test_key();
+	ClusterCtrcParticipantIdentity identity = test_participant_identity(2);
+	ClusterCtrcPublicationIdV1 publication
+		= test_publication(31, CTRC_REF_HEAP_ITL_UBA, CTRC_TARGET_PAGE_PENDING_ITL_SLOT);
+	ClusterCtrcTargetV1 pending = test_pending_itl_target();
+	ClusterCtrcTargetV1 exact = test_exact_itl_target();
+	ClusterCtrcReceipt receipts[8] = { 0 };
+	uint8 probes[8] = { 0 };
+	uint64 old_index, new_index;
+	ClusterCtrcApplyToken token;
+
+	test_open_participant(&participant);
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_table_locked(
+					 &participant, &key, &identity, TEST_GRANT, &publication, &pending, receipts,
+					 probes, lengthof(receipts), 100, &old_index, NULL),
+				 CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(cluster_ctrc_receipt_cancel_prepared(&participant, &receipts[old_index]));
+	publication.attempt_generation++;
+	pending.block_number++;
+	exact.block_number++;
+	UT_ASSERT_EQ(cluster_ctrc_receipt_prepare_table_locked(
+					 &participant, &key, &identity, TEST_GRANT, &publication, &pending, receipts,
+					 probes, lengthof(receipts), 101, &new_index, NULL),
+				 CLUSTER_CTRC_PREPARE_READY);
+	UT_ASSERT(new_index != old_index);
+	UT_ASSERT_EQ(receipts[old_index].state, CTRC_RECEIPT_CANCELLED);
+	UT_ASSERT_EQ(
+		cluster_ctrc_receipt_apply_prepared(&participant, &receipts[old_index], &exact, &token),
+		CLUSTER_CTRC_APPLY_FAIL_CLOSED);
+	UT_ASSERT(!token.valid);
+	UT_ASSERT_EQ(
+		cluster_ctrc_receipt_apply_prepared(&participant, &receipts[new_index], &exact, &token),
+		CLUSTER_CTRC_APPLY_APPLIED);
+	UT_ASSERT(token.valid);
+	UT_ASSERT_EQ(participant.prepared_count, 0);
+	UT_ASSERT_EQ(participant.cancelled_count, 1);
+	UT_ASSERT_EQ(participant.applied_count, 1);
+}
+
 UT_TEST(test_ctrc_unpublished_itl_apply_accepts_forward_page_version)
 {
 	unsigned variant;
@@ -3109,6 +3151,7 @@ main(void)
 		CTRC_TEST_ENTRY(test_ctrc_epoch_zero_identity_is_present_and_exact),
 		CTRC_TEST_ENTRY(test_ctrc_delayed_positive_proof_revalidates_open_grant),
 		CTRC_TEST_ENTRY(test_ctrc_receipt_prepare_apply_full_identity_cross_product),
+		CTRC_TEST_ENTRY(test_cancelled_child_attempt_cannot_alias_its_replacement),
 		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_apply_accepts_forward_page_version),
 		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_reacquired_current_binds_only_at_apply),
 		CTRC_TEST_ENTRY(test_ctrc_unpublished_itl_version_floor_keeps_identity_and_negative_fences),

@@ -638,8 +638,12 @@ WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event)
 		UT_ASSERT(!capacity_content_held);
 		UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
 		UT_ASSERT_EQ(pg_atomic_read_u32(&capacity_buffer.state) & BM_LOCKED, 0);
-	} else
-		UT_ASSERT_EQ(timeout, cluster_gcs_block_retransmit_initial_backoff_ms);
+	} else {
+		long factor = timeout / cluster_gcs_block_retransmit_initial_backoff_ms;
+
+		UT_ASSERT(factor > 0 && (factor & (factor - 1)) == 0);
+		UT_ASSERT_EQ(timeout, factor * cluster_gcs_block_retransmit_initial_backoff_ms);
+	}
 	UT_ASSERT(wait_event != 0);
 	retry_latch_wait_calls++;
 	if (retry_latch_cancel)
@@ -939,6 +943,7 @@ typedef struct RequesterSendCapture {
 	bool suppress_reply;
 	int suppress_reply_calls;
 	int refuse_enqueue_calls;
+	uint32 refuse_enqueue_mask;
 	bool corrupt_reply_checksum;
 	bool corrupt_reply_identity;
 	bool suppress_done_cap;
@@ -962,6 +967,19 @@ typedef struct RequesterSendCapture {
 } RequesterSendCapture;
 
 static RequesterSendCapture requester_send;
+static bool capacity_acquire_success;
+
+bool
+cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *retry_denied)
+{
+	UT_ASSERT_EQ(mode, PCM_LOCK_MODE_S);
+	if (capacity_acquire_success) {
+		*retry_denied = false;
+		return true;
+	}
+	return cluster_gcs_send_block_request_and_wait(buf, PCM_TRANS_N_TO_S, UT_MASTER_NODE, false,
+												   retry_denied);
+}
 
 /* The real bufmgr rearm and header snapshots below are generated verbatim.
  * Only unrelated admission/lock runtime is external: no competing X head,
@@ -1391,7 +1409,9 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 		if (call_index < requester_send.reply_step_count)
 			reply_step = requester_send.reply_steps[call_index];
 	}
-	if (call_index < requester_send.refuse_enqueue_calls)
+	if (call_index < requester_send.refuse_enqueue_calls
+		|| (call_index < 32
+			&& (requester_send.refuse_enqueue_mask & (UINT32_C(1) << call_index)) != 0))
 		return false;
 	if (requester_send.suppress_reply || call_index < requester_send.suppress_reply_calls)
 		return true;
@@ -4039,6 +4059,179 @@ UT_TEST(test_capacity_retry_excludes_write_clean_forwarded_and_unverified_reply)
 	cluster_node_id = saved_node;
 }
 
+/* Real ordinary-read consumer: an unpublished request may return to its
+ * exact reservation owner; a previously admitted one must retain its ID. */
+UT_TEST(test_read_outbound_refusal_preserves_publication_boundary)
+{
+	int saved_node = cluster_node_id;
+	int saved_retries = cluster_gcs_block_retransmit_max_retries;
+	int saved_timeout = cluster_gcs_reply_timeout_ms;
+	int mode;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_block_retransmit_max_retries = 2;
+	cluster_gcs_reply_timeout_ms = 1;
+	for (mode = 0; mode < 5; mode++) {
+		BufferDesc buffer, before;
+		sigjmp_buf jump;
+		sigjmp_buf *saved_stack = PG_exception_stack;
+		volatile bool caught = false;
+		volatile bool granted = false;
+		bool retry_denied = false;
+
+		route_test_reset_public_target_requester();
+		requester_send.legacy_read = true;
+		requester_send.refuse_enqueue_mask = mode < 3 ? 1U : 2U;
+		if (mode >= 3) {
+			requester_send.suppress_reply_calls = 1;
+			route_test_first_reply_retry();
+			requester_send.reply_steps[2] = requester_send.reply_steps[0];
+			requester_send.reply_steps[2].status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
+			requester_send.reply_step_count = 3;
+			if (mode == 4)
+				requester_send.refuse_enqueue_mask = 6U;
+		}
+		memset(&buffer, 0, sizeof(buffer));
+		buffer.tag = route_test_tag();
+		memcpy(&before, &buffer, sizeof(before));
+		route_ereport_armed = true;
+		if (sigsetjmp(jump, 1) == 0) {
+			PG_exception_stack = &jump;
+			granted = cluster_gcs_send_block_request_and_wait(
+				&buffer, mode == 1 ? PCM_TRANS_N_TO_X : PCM_TRANS_N_TO_S, UT_MASTER_NODE, mode == 2,
+				&retry_denied);
+		} else
+			caught = true;
+		PG_exception_stack = saved_stack;
+		route_ereport_armed = false;
+		UT_ASSERT_EQ(caught, mode == 1 || mode == 2 || mode == 4);
+		UT_ASSERT(!granted);
+		UT_ASSERT_EQ(retry_denied, mode == 0 || mode == 3);
+		UT_ASSERT_EQ(requester_send.done_calls, mode == 3 ? 1 : 0);
+		UT_ASSERT_EQ(memcmp(&buffer, &before, sizeof(buffer)), 0);
+		if (mode >= 3) {
+			UT_ASSERT_EQ(requester_send.calls, 3);
+			UT_ASSERT_EQ(requester_send.request_ids[0], requester_send.request_ids[1]);
+			UT_ASSERT_EQ(requester_send.request_ids[1], requester_send.request_ids[2]);
+		}
+		if (mode == 4)
+			UT_ASSERT_EQ(process_interrupt_calls, 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	route_test_reset_public_target_requester();
+	cluster_gcs_reply_timeout_ms = saved_timeout;
+	cluster_gcs_block_retransmit_max_retries = saved_retries;
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
+{
+	ClusterPcmOwnEntry *saved_own = ClusterPcmOwnArray;
+	int saved_buffers = NBuffers;
+	int saved_node = cluster_node_id;
+	int saved_retries = cluster_gcs_block_retransmit_max_retries;
+	int saved_timeout = cluster_gcs_reply_timeout_ms;
+	int mode;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_block_retransmit_max_retries = 0;
+	cluster_gcs_reply_timeout_ms = 1;
+	NBuffers = 1;
+	for (mode = 0; mode < 15; mode++) {
+		ClusterPcmOwnEntry entry, before;
+		ClusterPcmOwnSnapshot base;
+		ClusterPcmGrantBeginWaitReason wait_reason;
+		BufferDesc buffer_before;
+		uint64 token = 0;
+		bool covered = false;
+		bool retry_denied = false;
+		volatile bool caught = false;
+		volatile bool granted = false;
+		sigjmp_buf jump;
+		sigjmp_buf *saved_stack = PG_exception_stack;
+
+		route_test_reset_public_target_requester();
+		requester_send.legacy_read = true;
+		requester_send.suppress_reply = true;
+		cluster_gcs_reply_timeout_ms = mode == 14 ? 10 : 1;
+		reply_cv_timed_sleep_raise = mode == 14;
+		capacity_acquire_success = mode == 12;
+		if (mode == 13)
+			requester_send.refuse_enqueue_calls = 1;
+		memset(&entry, 0, sizeof(entry));
+		pg_atomic_init_u64(&entry.generation, 5);
+		pg_atomic_init_u64(&entry.reservation_token, 7);
+		ClusterPcmOwnArray = &entry;
+		memset(&capacity_buffer, 0, sizeof(capacity_buffer));
+		capacity_buffer.tag = route_test_tag();
+		capacity_buffer.pcm_state = PCM_STATE_N;
+		capacity_buffer.buffer_type = BUF_TYPE_CURRENT;
+		pg_atomic_init_u32(&capacity_buffer.state, BM_VALID | BM_TAG_VALID);
+		UT_ASSERT_EQ(cluster_pcm_own_begin_grant_reservation(&capacity_buffer, PCM_LOCK_MODE_S,
+															 &base, &token, &covered, &wait_reason),
+					 CLUSTER_PCM_OWN_OK);
+		UT_ASSERT(!covered);
+		if (mode == 1)
+			capacity_buffer.tag.blockNum++;
+		if (mode == 2)
+			pg_atomic_write_u64(&entry.generation, 6);
+		if (mode == 3)
+			pg_atomic_write_u64(&entry.reservation_token, 9);
+		if (mode == 4)
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING);
+		if (mode == 5)
+			capacity_buffer.pcm_state = base.pcm_state = PCM_STATE_S;
+		if (mode == 6)
+			capacity_buffer.pcm_state = PCM_STATE_X;
+		if (mode == 7)
+			pg_atomic_fetch_or_u32(&capacity_buffer.state, BM_IO_IN_PROGRESS);
+		if (mode == 8)
+			pg_atomic_write_u64(&entry.writer_activation_token, 8);
+		if (mode == 9)
+			pg_atomic_write_u64(&entry.resource_x_activation_generation, 12);
+		if (mode == 10)
+			pg_atomic_write_u64(&entry.delivery_attempt, 3);
+		if (mode == 11)
+			capacity_buffer.buffer_type = BUF_TYPE_PI;
+		memcpy(&before, &entry, sizeof(before));
+		memcpy(&buffer_before, &capacity_buffer, sizeof(buffer_before));
+		route_ereport_armed = true;
+		if (sigsetjmp(jump, 1) == 0) {
+			PG_exception_stack = &jump;
+			granted = cluster_bufmgr_pcm_acquire_shared_owned(&capacity_buffer, &base, token,
+															  &retry_denied);
+		} else
+			caught = true;
+		PG_exception_stack = saved_stack;
+		route_ereport_armed = false;
+		UT_ASSERT_EQ(caught, mode < 12 || mode == 14);
+		UT_ASSERT_EQ(granted, mode == 12);
+		UT_ASSERT_EQ(retry_denied, mode == 13);
+		UT_ASSERT_EQ(requester_send.done_calls, 0);
+		UT_ASSERT_EQ(memcmp(&capacity_buffer, &buffer_before, sizeof(buffer_before)), 0);
+		if (mode == 0 || mode == 14) {
+			uint64 next_token = 0;
+			ClusterPcmOwnSnapshot next_base;
+
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_begin_grant_reservation(&capacity_buffer, PCM_LOCK_MODE_S,
+																 &next_base, &next_token, &covered,
+																 &wait_reason),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(next_token, token + 1);
+		} else
+			UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(before)), 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	capacity_acquire_success = false;
+	route_test_reset_public_target_requester();
+	ClusterPcmOwnArray = saved_own;
+	NBuffers = saved_buffers;
+	cluster_node_id = saved_node;
+	cluster_gcs_block_retransmit_max_retries = saved_retries;
+	cluster_gcs_reply_timeout_ms = saved_timeout;
+}
+
 UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 {
 	ClusterPcmOwnEntry *saved_own = ClusterPcmOwnArray;
@@ -4050,7 +4243,7 @@ UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 	cluster_node_id = UT_REQUESTER_NODE;
 	cluster_gcs_block_retransmit_max_retries = 0;
 	NBuffers = 1;
-	for (mode = 0; mode < 5; mode++) {
+	for (mode = 0; mode < 10; mode++) {
 		ClusterPcmOwnEntry entry, before;
 		ClusterPcmOwnSnapshot base;
 		ClusterPcmGrantBeginWaitReason wait_reason;
@@ -4063,6 +4256,7 @@ UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 
 		route_test_reset_public_target_requester();
 		requester_send.legacy_read = true;
+		requester_send.refuse_enqueue_calls = mode >= 5 ? 1 : 0;
 		route_test_first_reply_retry();
 		requester_send.reply_steps[0].status = GCS_BLOCK_REPLY_DENIED_DEDUP_FULL;
 		requester_send.reply_steps[1] = requester_send.reply_steps[0];
@@ -4084,12 +4278,22 @@ UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 		UT_ASSERT_EQ(token, 8);
 		UT_ASSERT(!covered);
 		memcpy(&before, &entry, sizeof(before));
-		UT_ASSERT(!cluster_gcs_send_block_request_and_wait(&capacity_buffer, PCM_TRANS_N_TO_S,
-														   UT_MASTER_NODE, false, &retry_denied));
+		route_ereport_armed = true;
+		if (sigsetjmp(jump, 1) == 0) {
+			PG_exception_stack = &jump;
+			UT_ASSERT(!cluster_gcs_send_block_request_and_wait(
+				&capacity_buffer, PCM_TRANS_N_TO_S, UT_MASTER_NODE, false, &retry_denied));
+		} else
+			caught = true;
+		PG_exception_stack = saved_stack;
+		route_ereport_armed = false;
+		UT_ASSERT(!caught);
+		if (caught)
+			continue;
 		UT_ASSERT(retry_denied);
 		UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
 		route_test_assert_public_target_slot_is_canonical();
-		if (mode == 3) {
+		if (mode % 5 == 3) {
 			pg_atomic_write_u64(&entry.generation, 6);
 			pg_atomic_write_u64(&entry.reservation_token, 9);
 			pg_atomic_write_u32(&entry.flags, 0);
@@ -4097,9 +4301,9 @@ UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 			capacity_buffer.buffer_type = BUF_TYPE_SCUR;
 			memcpy(&before, &entry, sizeof(before));
 		}
-		capacity_gate_open = mode != 1;
-		retry_latch_cancel = mode == 2;
-		capacity_content_held = mode == 4;
+		capacity_gate_open = mode % 5 != 1;
+		retry_latch_cancel = mode % 5 == 2;
+		capacity_content_held = mode % 5 == 4;
 		capacity_wait_active = true;
 		route_ereport_armed = true;
 		if (sigsetjmp(jump, 1) == 0) {
@@ -4111,9 +4315,9 @@ UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 		PG_exception_stack = saved_stack;
 		route_ereport_armed = false;
 		capacity_wait_active = false;
-		UT_ASSERT_EQ(caught, mode == 2 || mode == 4);
-		UT_ASSERT_EQ(retry_latch_wait_calls, mode == 0 || mode == 2 ? 1 : 0);
-		if (mode == 0) {
+		UT_ASSERT_EQ(caught, mode % 5 == 2 || mode % 5 == 4);
+		UT_ASSERT_EQ(retry_latch_wait_calls, mode % 5 == 0 || mode % 5 == 2 ? 1 : 0);
+		if (mode % 5 == 0) {
 			UT_ASSERT_EQ(result, CLUSTER_BUFMGR_PCM_RETRY_REARMED);
 			UT_ASSERT_EQ(token, 9);
 			UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), PCM_OWN_FLAG_GRANT_PENDING);
@@ -4126,10 +4330,10 @@ UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 			UT_ASSERT_EQ(requester_send.request_ids[1], UINT64_C(0x0200000000000003));
 			UT_ASSERT_EQ(cluster_pcm_own_abort_grant_reservation(&capacity_buffer, &base, token),
 						 CLUSTER_PCM_OWN_OK);
-		} else if (mode == 1) {
+		} else if (mode % 5 == 1) {
 			UT_ASSERT_EQ(result, CLUSTER_BUFMGR_PCM_RETRY_BARRIER_REFUSED);
 			UT_ASSERT(barrier);
-		} else if (mode == 3) {
+		} else if (mode % 5 == 3) {
 			UT_ASSERT_EQ(result, CLUSTER_BUFMGR_PCM_RETRY_COVERED);
 			UT_ASSERT_EQ(covered_generation, 6);
 			UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(entry)), 0);
@@ -4868,6 +5072,43 @@ UT_TEST(test_forward96_all_local_refuses_open_generation_overflow_before_submit)
 /* A holder-side typed failure is consumed only after the submit result and
  * the decoder's final token recheck.  Reusing the master-side refusal shape,
  * replying to env.source, or publishing after leave breaks this boundary. */
+UT_TEST(test_refusal_queue_nonadmission_is_counted_at_each_producer)
+{
+	ClusterR4CrRequestPayload request = route_test_request80();
+	ClusterR4CrForwardPayload forward = route_test_forward96();
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+
+	for (int phase = 0; phase < 3; phase++) {
+		UT_ASSERT(cluster_gcs_block_test_arm_r4_reply_slot(UT_REQUEST_ID, UT_FORMATION_EPOCH, 1,
+														   PCM_TRANS_N_TO_S, UT_MASTER_NODE));
+		route_seam_reset();
+		route_seam.refusal_enqueue_ok = false;
+		if (phase == 2) {
+			cluster_node_id = UT_HOLDER_NODE;
+			route_seam.holder_submit_result = CLUSTER_CR_BUILD_RETRYABLE;
+			route_seam.holder_submit_reason = CLUSTER_CR_BUILD_CAPACITY;
+			env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE,
+									  UT_HOLDER_NODE, sizeof(forward));
+			UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		} else {
+			cluster_node_id = UT_MASTER_NODE;
+			if (phase == 0)
+				route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+			else
+				route_seam.peer_open_ok = false;
+			env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, UT_REQUESTER_NODE,
+									  UT_MASTER_NODE, sizeof(request));
+			UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
+		}
+		UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 1);
+		UT_ASSERT_EQ(cluster_gcs_get_reply_send_not_admitted_count(), 1);
+		/* A full ring is not a successful delivery or a second transport send. */
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+	}
+	cluster_node_id = saved_node_id;
+}
+
 UT_TEST(test_forward96_holder_submit_failure_publishes_typed_remote_refusal)
 {
 	static const struct {
@@ -6129,7 +6370,8 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(117);
+	UT_PLAN(118);
+	UT_RUN(test_refusal_queue_nonadmission_is_counted_at_each_producer);
 	UT_RUN(test_seal_two_blocks_new_tx_and_undo_contexts_but_not_original_drain);
 	UT_RUN(test_kind2_requester_asks_origin_to_select_and_lands_exact_status22);
 	UT_RUN(test_kind2_origin_generation_selection_and_strict_known_negatives);
@@ -6209,6 +6451,8 @@ main(void)
 	UT_RUN(test_r4_done_missing_capability_or_queue_space_keeps_terminal_result);
 	UT_RUN(test_direct_s_capacity_refusal_returns_owned_retry_without_done);
 	UT_RUN(test_capacity_retry_excludes_write_clean_forwarded_and_unverified_reply);
+	UT_RUN(test_read_outbound_refusal_preserves_publication_boundary);
+	UT_RUN(test_shared_acquire_error_retires_only_its_quiescent_n_reservation);
 	UT_RUN(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor);
 	UT_RUN(test_target_wrapper_status25_beyond_old_limit_waits_for_full);
 	UT_RUN(test_target_wrapper_lost_reply_and_backpressure_redrive_same_id);

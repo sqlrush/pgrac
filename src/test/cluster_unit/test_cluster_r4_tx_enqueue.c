@@ -101,6 +101,7 @@ static int test_wait_latch_calls;
 static int test_set_latch_calls[TEST_NSLOTS];
 static bool test_wait_latch_throws;
 static bool test_wait_latch_sleeps;
+static bool test_wait_latch_delivers_cancel;
 static TransactionId test_local_xid;
 static bool test_legacy_tt_found;
 static ClusterTTStatus test_legacy_tt_status;
@@ -403,6 +404,8 @@ WaitLatch(Latch *latch pg_attribute_unused(), int wakeEvents pg_attribute_unused
 	test_wait_latch_calls++;
 	if (test_wait_latch_throws)
 		siglongjmp(*PG_exception_stack, 1);
+	if (test_wait_latch_delivers_cancel)
+		test_cancel_token_pending = true;
 	if (test_wait_latch_sleeps)
 		pg_usleep((long)Max(timeout, 2) * 1000L);
 	return WL_TIMEOUT;
@@ -573,6 +576,7 @@ reset_fixture(void)
 	memset(test_current_mx_stats, 0, sizeof(test_current_mx_stats));
 	test_wait_latch_throws = false;
 	test_wait_latch_sleeps = false;
+	test_wait_latch_delivers_cancel = false;
 	test_local_xid = (TransactionId)700;
 	test_legacy_tt_found = false;
 	test_legacy_tt_status = CLUSTER_TT_STATUS_IN_PROGRESS;
@@ -856,6 +860,49 @@ UT_TEST(test_monotonic_timeout_uses_only_timeout_counter)
 	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_TIMEOUT);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->timeout_count), 1);
 	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->wait_count), 1);
+	assert_slot_clean();
+}
+
+UT_TEST(test_exact_wait_consumes_deadlock_token_before_repoll)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_fixture();
+	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	script_resolve(1, CLUSTER_TX_COMMITTED, CLUSTER_TX_RESOLVE_NONE);
+	test_cancel_token_pending = true;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_DEADLOCK);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT(!test_cancel_token_pending);
+	UT_ASSERT_EQ(test_resolve_pos, 1);
+	UT_ASSERT_EQ(test_wait_latch_calls, 0);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	UT_ASSERT(!test_wfg_live);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->timeout_count), 0);
+	assert_slot_clean();
+}
+
+UT_TEST(test_exact_wait_consumes_deadlock_token_after_latch_wake)
+{
+	ClusterTxLocator locator = test_locator();
+	ClusterTxResolveReason reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+
+	reset_fixture();
+	script_resolve(0, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	script_resolve(1, CLUSTER_TX_IN_PROGRESS, CLUSTER_TX_RESOLVE_NONE);
+	script_resolve(2, CLUSTER_TX_COMMITTED, CLUSTER_TX_RESOLVE_NONE);
+	test_wait_latch_delivers_cancel = true;
+	UT_ASSERT_EQ(cluster_tx_enqueue_wait_exact(&locator, 1000, &reason), CLUSTER_TXW_DEADLOCK);
+	UT_ASSERT_EQ(reason, CLUSTER_TX_RESOLVE_NONE);
+	UT_ASSERT(!test_cancel_token_pending);
+	UT_ASSERT_EQ(test_resolve_pos, 2);
+	UT_ASSERT_EQ(test_wait_latch_calls, 1);
+	UT_ASSERT_EQ(test_wait_clear_calls, 1);
+	UT_ASSERT_EQ(test_wfg_exact_cancel_calls, 1);
+	UT_ASSERT(!test_wfg_live);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&ClusterTxw->timeout_count), 0);
 	assert_slot_clean();
 }
 
@@ -1486,7 +1533,7 @@ UT_TEST(test_backend_exit_counter_underflow_fails_stop_without_freeing_slot)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(40);
 	UT_RUN(test_exact_wait_abi_and_shmem_size_are_frozen);
 	UT_RUN(test_fixed_false_precedes_malformed_and_shared_state);
 	UT_RUN(test_initial_terminal_never_registers);
@@ -1497,6 +1544,8 @@ main(void)
 	UT_RUN(test_zero_epoch_is_a_valid_stable_formation);
 	UT_RUN(test_zero_to_nonzero_epoch_drift_fails_closed);
 	UT_RUN(test_monotonic_timeout_uses_only_timeout_counter);
+	UT_RUN(test_exact_wait_consumes_deadlock_token_before_repoll);
+	UT_RUN(test_exact_wait_consumes_deadlock_token_after_latch_wake);
 	UT_RUN(test_reentrant_source_and_target_slots_are_not_overwritten);
 	UT_RUN(test_wfg_capacity_refusal_runs_full_cleanup);
 	UT_RUN(test_error_longjmp_runs_same_cleanup_funnel);

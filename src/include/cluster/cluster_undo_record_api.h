@@ -119,7 +119,7 @@ typedef struct ClusterUndoRecordPrepareReceipt {
 	uint8 ctrc_prepared_mask;
 	uint8 ctrc_applied_mask;
 	uint8 ctrc_reuse_mask;
-	uint8 ctrc_reserved8[4];
+	uint32 ctrc_attempt_generation;
 	UndoItlHistoryEntry itl_history[UNDO_ITL_HISTORY_TARGETS];
 	uint8 itl_history_mask;
 	uint8 itl_history_reserved[7];
@@ -155,6 +155,18 @@ extern bool cluster_undo_record_retry_evidence(uint64 reservation_sequence, bool
 extern ClusterUndoRecordPrepareResult
 cluster_undo_record_requalify_for_retry(ClusterUndoRecordPrepareReceipt *receipt,
 										uint16 payload_len, bool targets_invalidated);
+
+/* No heap ownership held. Replace only UPDATE's unpublished page intents;
+ * the exact READY undo reservation and its original deadline are retained. */
+typedef enum ClusterUndoTargetResetResult {
+	CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE = 0,
+	CLUSTER_UNDO_TARGET_RESET_READY,
+	CLUSTER_UNDO_TARGET_RESET_REFUSED
+} ClusterUndoTargetResetResult;
+
+extern ClusterUndoTargetResetResult
+cluster_undo_record_reset_update_targets(ClusterUndoRecordPrepareReceipt *receipt,
+										 const ClusterCtrcTargetV1 *targets, uint8 required_mask);
 
 extern uint64 cluster_undo_record_prepare_deadline_us(void);
 extern ClusterUndoRecordPrepareResult

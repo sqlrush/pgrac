@@ -455,6 +455,10 @@ ges_validate_inbound(const ClusterICEnvelope *env, uint32 payload_node_id, uint6
 	return true;
 }
 
+static void ges_dispatch_reject(int32 source_node_id, const ClusterGrdHolderId *holder,
+								const ClusterResId *resid, uint32 reply_for_opcode,
+								uint32 reject_reason, uint64 shard_master_generation);
+
 void
 cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 {
@@ -590,6 +594,7 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		ClusterResId resid;
 		ClusterGrdHolderId waiter;
 		ClusterGrdEntryResult er;
+		ClusterGrdGrantIdentity cancelled;
 
 		/*
 		 * spec-5.9 D4 — dedicated 64B payload, early-dispatched so it never hits
@@ -614,15 +619,22 @@ cluster_ges_request_handler(const ClusterICEnvelope *env, const void *payload)
 		waiter.request_id = cw->waiter_request_id;
 
 		if (cw->kind == GES_CANCEL_WAIT_KIND_CONVERT)
-			er = cluster_grd_cancel_convert_by_id(&resid, &waiter, cw->wait_seq);
+			er = cluster_grd_cancel_convert_exact(&resid, &waiter, cw->wait_seq, &cancelled);
 		else
-			er = cluster_grd_cancel_waiter_by_id_seq(&resid, &waiter, cw->wait_seq);
+			er = cluster_grd_cancel_waiter_exact(&resid, &waiter, cw->wait_seq, &cancelled);
 
 		/* NOT_FOUND => the named waiter is gone or its wait_seq no longer matches
 		 * (stale / retransmitted CANCEL_WAIT after slot reuse) — never dequeue a
 		 * since-reused identity (Rule 8.A P0#2). */
 		if (er != CLUSTER_GRD_ENTRY_OK)
 			cluster_lmd_cancel_wait_stale_rejected_count_inc(1);
+		else
+			/* Dequeue is terminal, not an in-flight dedup record forever.
+			 * Use only the removed request's original routing/generation after
+			 * releasing GRD locks. A grant-won race never reaches this branch. */
+			ges_dispatch_reject(cancelled.source_node_id, &cancelled.holder, &resid,
+								cancelled.request_opcode, GES_REJECT_REASON_TIMEOUT,
+								cancelled.shard_master_generation);
 
 		/* spec-5.9 D5 — the correlated CANCEL_ACK back to the sender lands here
 		 * (cancel_id is carried on the wire for that purpose). */
@@ -2579,7 +2591,8 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	 *	  >0  → caller-supplied finite timeout.
 	 *
 	 *	cluster.ges_retransmit_max_attempts (HC52):
-	 *	  finite mode:  abort with 53R70 after attempts exhausted.
+	 *	  finite mode: stop retransmitting after attempts exhausted; keep
+	 *	               waiting within the original caller deadline.
 	 *	  perpetual:    warning threshold only (priority starvation observability).
 	 */
 	epoch = cluster_epoch_get_current();
@@ -2773,17 +2786,11 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		}
 
 		if (!perpetual && max_attempts > 0 && attempt > max_attempts) {
-			if (hw_grant != NULL)
-				cluster_ges_hw_grant_abandon(hw_grant);
-			else
-				ges_abandon_wait_or_release(&key, &req, master, send_opcode);
-			ConditionVariableCancelSleep();
-			cluster_xp_end(&xp_wait);	 /* PGRAC: spec-5.59 D2 profiling */
-			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
-			cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_RETRANSMIT_EXHAUSTED, master,
-										   ges_forens_elapsed_ms(forens_start), attempt, -1,
-										   effective_timeout_ms);
-			return GES_REJECT_REASON_TIMEOUT;
+			/* Retransmission exhaustion is not a terminal lock verdict. The
+			 * original waiter still owns this request; only its existing deadline
+			 * or another explicit terminal condition can abandon it. */
+			backoff_ms = 1600;
+			continue;
 		}
 
 		/* HC54 priority starvation observability — two one-shot events per
