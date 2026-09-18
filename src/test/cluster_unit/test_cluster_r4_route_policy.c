@@ -967,6 +967,19 @@ typedef struct RequesterSendCapture {
 } RequesterSendCapture;
 
 static RequesterSendCapture requester_send;
+static bool capacity_acquire_success;
+
+bool
+cluster_pcm_lock_acquire_buffer(BufferDesc *buf, PcmLockMode mode, bool *retry_denied)
+{
+	UT_ASSERT_EQ(mode, PCM_LOCK_MODE_S);
+	if (capacity_acquire_success) {
+		*retry_denied = false;
+		return true;
+	}
+	return cluster_gcs_send_block_request_and_wait(buf, PCM_TRANS_N_TO_S, UT_MASTER_NODE, false,
+												   retry_denied);
+}
 
 /* The real bufmgr rearm and header snapshots below are generated verbatim.
  * Only unrelated admission/lock runtime is external: no competing X head,
@@ -4111,6 +4124,114 @@ UT_TEST(test_read_outbound_refusal_preserves_publication_boundary)
 	cluster_node_id = saved_node;
 }
 
+UT_TEST(test_shared_acquire_error_retires_only_its_quiescent_n_reservation)
+{
+	ClusterPcmOwnEntry *saved_own = ClusterPcmOwnArray;
+	int saved_buffers = NBuffers;
+	int saved_node = cluster_node_id;
+	int saved_retries = cluster_gcs_block_retransmit_max_retries;
+	int saved_timeout = cluster_gcs_reply_timeout_ms;
+	int mode;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	cluster_gcs_block_retransmit_max_retries = 0;
+	cluster_gcs_reply_timeout_ms = 1;
+	NBuffers = 1;
+	for (mode = 0; mode < 15; mode++) {
+		ClusterPcmOwnEntry entry, before;
+		ClusterPcmOwnSnapshot base;
+		ClusterPcmGrantBeginWaitReason wait_reason;
+		BufferDesc buffer_before;
+		uint64 token = 0;
+		bool covered = false;
+		bool retry_denied = false;
+		volatile bool caught = false;
+		volatile bool granted = false;
+		sigjmp_buf jump;
+		sigjmp_buf *saved_stack = PG_exception_stack;
+
+		route_test_reset_public_target_requester();
+		requester_send.legacy_read = true;
+		requester_send.suppress_reply = true;
+		cluster_gcs_reply_timeout_ms = mode == 14 ? 10 : 1;
+		reply_cv_timed_sleep_raise = mode == 14;
+		capacity_acquire_success = mode == 12;
+		if (mode == 13)
+			requester_send.refuse_enqueue_calls = 1;
+		memset(&entry, 0, sizeof(entry));
+		pg_atomic_init_u64(&entry.generation, 5);
+		pg_atomic_init_u64(&entry.reservation_token, 7);
+		ClusterPcmOwnArray = &entry;
+		memset(&capacity_buffer, 0, sizeof(capacity_buffer));
+		capacity_buffer.tag = route_test_tag();
+		capacity_buffer.pcm_state = PCM_STATE_N;
+		capacity_buffer.buffer_type = BUF_TYPE_CURRENT;
+		pg_atomic_init_u32(&capacity_buffer.state, BM_VALID | BM_TAG_VALID);
+		UT_ASSERT_EQ(cluster_pcm_own_begin_grant_reservation(&capacity_buffer, PCM_LOCK_MODE_S,
+															 &base, &token, &covered, &wait_reason),
+					 CLUSTER_PCM_OWN_OK);
+		UT_ASSERT(!covered);
+		if (mode == 1)
+			capacity_buffer.tag.blockNum++;
+		if (mode == 2)
+			pg_atomic_write_u64(&entry.generation, 6);
+		if (mode == 3)
+			pg_atomic_write_u64(&entry.reservation_token, 9);
+		if (mode == 4)
+			pg_atomic_write_u32(&entry.flags, PCM_OWN_FLAG_REVOKING);
+		if (mode == 5)
+			capacity_buffer.pcm_state = base.pcm_state = PCM_STATE_S;
+		if (mode == 6)
+			capacity_buffer.pcm_state = PCM_STATE_X;
+		if (mode == 7)
+			pg_atomic_fetch_or_u32(&capacity_buffer.state, BM_IO_IN_PROGRESS);
+		if (mode == 8)
+			pg_atomic_write_u64(&entry.writer_activation_token, 8);
+		if (mode == 9)
+			pg_atomic_write_u64(&entry.resource_x_activation_generation, 12);
+		if (mode == 10)
+			pg_atomic_write_u64(&entry.delivery_attempt, 3);
+		if (mode == 11)
+			capacity_buffer.buffer_type = BUF_TYPE_PI;
+		memcpy(&before, &entry, sizeof(before));
+		memcpy(&buffer_before, &capacity_buffer, sizeof(buffer_before));
+		route_ereport_armed = true;
+		if (sigsetjmp(jump, 1) == 0) {
+			PG_exception_stack = &jump;
+			granted = cluster_bufmgr_pcm_acquire_shared_owned(&capacity_buffer, &base, token,
+															  &retry_denied);
+		} else
+			caught = true;
+		PG_exception_stack = saved_stack;
+		route_ereport_armed = false;
+		UT_ASSERT_EQ(caught, mode < 12 || mode == 14);
+		UT_ASSERT_EQ(granted, mode == 12);
+		UT_ASSERT_EQ(retry_denied, mode == 13);
+		UT_ASSERT_EQ(requester_send.done_calls, 0);
+		UT_ASSERT_EQ(memcmp(&capacity_buffer, &buffer_before, sizeof(buffer_before)), 0);
+		if (mode == 0 || mode == 14) {
+			uint64 next_token = 0;
+			ClusterPcmOwnSnapshot next_base;
+
+			UT_ASSERT_EQ(cluster_pcm_own_flags_get(0), 0);
+			UT_ASSERT_EQ(cluster_pcm_own_begin_grant_reservation(&capacity_buffer, PCM_LOCK_MODE_S,
+																 &next_base, &next_token, &covered,
+																 &wait_reason),
+						 CLUSTER_PCM_OWN_OK);
+			UT_ASSERT_EQ(next_token, token + 1);
+		} else
+			UT_ASSERT_EQ(memcmp(&entry, &before, sizeof(before)), 0);
+		route_test_assert_public_target_slot_is_canonical();
+	}
+	capacity_acquire_success = false;
+	route_test_reset_public_target_requester();
+	ClusterPcmOwnArray = saved_own;
+	NBuffers = saved_buffers;
+	cluster_node_id = saved_node;
+	cluster_gcs_block_retransmit_max_retries = saved_retries;
+	cluster_gcs_reply_timeout_ms = saved_timeout;
+}
+
 UT_TEST(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor)
 {
 	ClusterPcmOwnEntry *saved_own = ClusterPcmOwnArray;
@@ -6331,6 +6452,7 @@ main(void)
 	UT_RUN(test_direct_s_capacity_refusal_returns_owned_retry_without_done);
 	UT_RUN(test_capacity_retry_excludes_write_clean_forwarded_and_unverified_reply);
 	UT_RUN(test_read_outbound_refusal_preserves_publication_boundary);
+	UT_RUN(test_shared_acquire_error_retires_only_its_quiescent_n_reservation);
 	UT_RUN(test_real_capacity_refusal_to_exact_rearm_cancel_gate_and_successor);
 	UT_RUN(test_target_wrapper_status25_beyond_old_limit_waits_for_full);
 	UT_RUN(test_target_wrapper_lost_reply_and_backpressure_redrive_same_id);

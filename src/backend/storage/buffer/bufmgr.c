@@ -3021,6 +3021,58 @@ cluster_bufmgr_pcm_retry_denied_rearm(BufferDesc *buf, PcmLockMode pcm_mode,
 	return CLUSTER_BUFMGR_PCM_RETRY_REARMED;
 }
 
+/* An error before local S publication must not strand an ordinary N
+ * reservation.  This catch runs BEFORE AbortBufferIO/ResourceOwner cleanup:
+ * a cleared IO bit after generic cleanup would not prove DMA quiescence.
+ * Never release a remote grant speculatively, or touch a successor/retained
+ * authority.  The lower GCS error owner has already retired the TCP reply
+ * slot, so a late generic reply cannot install after this exact abort. */
+static bool
+cluster_bufmgr_pcm_acquire_shared_owned(BufferDesc *buf,
+									   const ClusterPcmOwnSnapshot *base,
+									   uint64 reservation_token,
+									   bool *retry_denied)
+{
+	volatile bool acquired = false;
+
+	PG_TRY();
+	{
+		acquired = cluster_pcm_lock_acquire_buffer(buf, PCM_LOCK_MODE_S, retry_denied);
+	}
+	PG_CATCH();
+	{
+		ClusterPcmOwnResult result = CLUSTER_PCM_OWN_STALE;
+		uint32 state;
+
+		state = LockBufHdr(buf);
+		if (ClusterPcmOwnArray != NULL && base->pcm_state == (uint8) PCM_STATE_N
+			&& base->flags == 0 && base->reservation_token != UINT64_MAX
+			&& reservation_token == base->reservation_token + 1
+			&& BufferTagsEqual(&buf->tag, &base->tag)
+			&& (state & (BM_TAG_VALID | BM_IO_IN_PROGRESS)) == BM_TAG_VALID
+			&& buf->pcm_state == (uint8) PCM_STATE_N
+			&& buf->buffer_type != (uint8) BUF_TYPE_PI
+			&& cluster_pcm_own_gen_get(buf->buf_id) == base->generation
+			&& cluster_pcm_own_reservation_token_get(buf->buf_id) == reservation_token
+			&& cluster_pcm_own_flags_get(buf->buf_id) == PCM_OWN_FLAG_GRANT_PENDING
+			&& cluster_pcm_own_writer_activation_token_get(buf->buf_id) == 0
+			&& cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id) == 0
+			&& cluster_pcm_own_delivery_attempt_get(buf->buf_id) == 0)
+			result = cluster_pcm_own_reservation_abort_exact(
+				buf->buf_id, base->generation, reservation_token, PCM_OWN_FLAG_GRANT_PENDING);
+		UnlockBufHdr(buf, state);
+		if (result != CLUSTER_PCM_OWN_OK)
+			elog(LOG,
+				 "cluster shared acquisition error cleanup not proven: buffer=%d "
+				 "generation=%llu token=%llu result=%d; exact reservation left unchanged",
+				 buf->buf_id, (unsigned long long) base->generation,
+				 (unsigned long long) reservation_token, (int) result);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return acquired;
+}
+
 static ClusterPcmXWriterLedgerEntry *
 cluster_bufmgr_pcm_x_writer_find(BufferDesc *buf)
 {
@@ -10820,8 +10872,9 @@ LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
 							bool retry_denied = false;
 
 							pcm_pending_set = true;
-							pcm_acquired = cluster_pcm_lock_acquire_buffer(
-								buf, PCM_LOCK_MODE_S, &retry_denied);
+							pcm_acquired = cluster_bufmgr_pcm_acquire_shared_owned(
+								buf, &pcm_pending_base, pcm_pending_token,
+								&retry_denied);
 							if (!retry_denied)
 								break;
 							pcm_pending_set = false;
