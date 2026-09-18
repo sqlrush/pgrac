@@ -326,6 +326,12 @@ extern uint8 cluster_itl_stamp_multixact_marker(Buffer buf, MultiXactId multixac
  *	cluster_itl_touch_register() for xact-end finalization.
  */
 extern bool cluster_itl_alloc_or_reuse_slot(Buffer buf, TransactionId top_xid, uint8 *out_slot_idx);
+
+/* UPDATE old-row only, under content-X. A selected own LOCK_ONLY carrier
+ * requires full predecessor history and a fresh DATA receipt before the
+ * atomic slot/tuple publication; other row locks never lose their carrier. */
+extern bool cluster_itl_alloc_update_slot(Buffer buf, TransactionId top_xid,
+										  OffsetNumber old_offset, uint8 *out_slot_idx);
 extern bool cluster_itl_has_allocatable_slot(Buffer buf, TransactionId top_xid, bool lock_only);
 
 /*

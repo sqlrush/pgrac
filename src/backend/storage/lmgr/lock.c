@@ -1186,10 +1186,14 @@ LockAcquireExtended(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock,
 			ereport(ERROR,
 					(errcode(ERRCODE_LOCK_NOT_AVAILABLE), errmsg("cluster lock acquire timeout"),
 					 errdetail("source=%s master=%d elapsed_ms=%ld attempts=%d "
-							   "conflict_holders=%d effective_timeout_ms=%d.",
+							   "conflict_holders=%d effective_timeout_ms=%d "
+							   "tag=%u/%u/%u/%u/%u method=%u mode=%d.",
 							   cluster_ges_timeout_src_text(ges_td->source), ges_td->master_node,
 							   ges_td->elapsed_ms, ges_td->attempts, ges_td->conflict_holders,
-							   ges_td->timeout_ms),
+							   ges_td->timeout_ms, locktag->locktag_type,
+							   locktag->locktag_field1, locktag->locktag_field2,
+							   locktag->locktag_field3, locktag->locktag_field4,
+							   locktag->locktag_lockmethodid, lockmode),
 					 errhint("Consider increasing cluster.ges_request_timeout_ms.")));
 			pg_unreachable();
 		}

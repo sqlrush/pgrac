@@ -4411,6 +4411,7 @@ UT_TEST(test_5_8_d1e_u4a_request_waiter_carries_wait_seq)
 	ClusterGrdHolderId h;
 	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
 	int nc = -1;
+	ClusterGrdGrantIdentity cancelled;
 
 	cluster_node_id = 0;
 	convert_reset();
@@ -4424,12 +4425,28 @@ UT_TEST(test_5_8_d1e_u4a_request_waiter_carries_wait_seq)
 				 (int)CLUSTER_GRD_GRANT_NOW);
 	h = bast_holder(2, 200, 2);
 	UT_ASSERT_EQ((int)cluster_grd_entry_enqueue_or_grant_meta(
-					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 777 }, 0,
+					 &resid, &h, 2, 2, (ClusterGrdWaiterMeta){ (TransactionId)0, 777 }, 71,
 					 UT_GES_OPCODE_REQUEST, ExclusiveLock, conflicts, &nc),
 				 (int)CLUSTER_GRD_ENQUEUED_WAITER);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
 	UT_ASSERT(ut_wfg_waiter_wait_seq(2, 200, 0, 2) == 777);
+	memset(&cancelled, 0x5a, sizeof(cancelled));
+	UT_ASSERT_EQ(cluster_grd_cancel_waiter_exact(&resid, &h, 778, &cancelled),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cancelled.request_opcode, 0);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 1);
+	UT_ASSERT_EQ(cluster_grd_cancel_waiter_exact(&resid, &h, 777, &cancelled),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cancelled.source_node_id, 2);
+	UT_ASSERT_EQ(cancelled.holder.procno, 200);
+	UT_ASSERT_EQ(cancelled.holder.request_id, 2);
+	UT_ASSERT_EQ(cancelled.shard_master_generation, 71);
+	UT_ASSERT_EQ(cancelled.request_opcode, UT_GES_OPCODE_REQUEST);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(2, 200, 0, 2), 0);
+	UT_ASSERT_EQ(cluster_grd_cancel_waiter_exact(&resid, &h, 777, &cancelled),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cancelled.request_opcode, 0);
 
 	cluster_node_id = saved;
 	convert_teardown();
@@ -4443,6 +4460,8 @@ UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
 	ClusterGrdHolderId h;
 	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
 	int nc = -1;
+	ClusterGrdGrantIdentity cancelled;
+	LOCKMODE held_mode;
 
 	cluster_node_id = 0;
 	convert_reset();
@@ -4462,12 +4481,27 @@ UT_TEST(test_5_8_d1e_u4b_convert_waiter_carries_wait_seq)
 
 	nc = -1;
 	UT_ASSERT_EQ((int)cluster_grd_convert_or_enqueue_meta(
-					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1, 0,
+					 &resid, 1, 100, 0, ShareLock, ExclusiveLock, 10, 1, 73,
 					 (ClusterGrdWaiterMeta){ (TransactionId)0, 888 }, conflicts, &nc),
 				 (int)CLUSTER_GRD_CONVERT_ENQUEUED);
 
 	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
 	UT_ASSERT(ut_wfg_waiter_wait_seq(1, 100, 0, 10) == 888);
+	h = bast_holder(1, 100, 10);
+	UT_ASSERT_EQ(cluster_grd_cancel_convert_exact(&resid, &h, 889, &cancelled),
+				 CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cancelled.request_opcode, 0);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 1);
+	UT_ASSERT_EQ(cluster_grd_cancel_convert_exact(&resid, &h, 888, &cancelled),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cancelled.holder.request_id, 10);
+	UT_ASSERT_EQ(cancelled.source_node_id, 1);
+	UT_ASSERT_EQ(cancelled.request_opcode, GES_REQ_OPCODE_CONVERT);
+	UT_ASSERT_EQ(cancelled.shard_master_generation, 73);
+	UT_ASSERT_EQ(ut_wfg_count_waiter(1, 100, 0, 10), 0);
+	h.request_id = 1;
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &h, &held_mode));
+	UT_ASSERT_EQ(held_mode, ShareLock);
 
 	cluster_node_id = saved;
 	convert_teardown();

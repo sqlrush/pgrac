@@ -711,6 +711,88 @@ cluster_itl_alloc_or_reuse_lock_slot(Buffer buf, TransactionId top_xid, uint8 *o
 }
 
 /*
+ * Select an UPDATE DATA carrier without acquiring a ninth slot for its own
+ * sole predecessor lock. Inputs are the content-X buffer, top xid and exact
+ * old tuple offset; output is a slot index or UNALLOCATED on refusal.
+ * This function changes no bytes and has no wait or allocation side effects.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * The caller will replace old_offset's plain lock header in the same UPDATE
+ * publication as the DATA stamp. No other live lock may lose this carrier.
+ * Selection is read-only; the final caller retains the full prior slot in
+ * undo and prepares a new DATA receipt before changing either page field.
+ */
+bool
+cluster_itl_alloc_update_slot(Buffer buf, TransactionId top_xid, OffsetNumber old_offset,
+							  uint8 *out_slot_idx)
+{
+	Page page;
+	PageHeader header;
+	const ClusterItlSlotData *slots;
+	uint8 candidate = CLUSTER_ITL_SLOT_UNALLOCATED;
+	OffsetNumber maxoff;
+	bool found_target = false;
+
+	if (out_slot_idx == NULL)
+		return false;
+	*out_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
+	if (!BufferIsValid(buf) || !TransactionIdIsNormal(top_xid))
+		return false;
+	page = BufferGetPage(buf);
+	header = (PageHeader)page;
+	if (!PageHasItl(page) || header->pd_lower < SizeOfPageHeaderData
+		|| header->pd_lower > header->pd_upper || header->pd_upper > header->pd_special
+		|| header->pd_special > BLCKSZ - CLUSTER_ITL_ARRAY_SIZE
+		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0)
+		return false;
+	if (cluster_itl_alloc_or_reuse_slot(buf, top_xid, out_slot_idx))
+		return true;
+	maxoff = PageGetMaxOffsetNumber(page);
+	if (old_offset < FirstOffsetNumber || old_offset > maxoff)
+		return false;
+	slots = ClusterPageGetItlSlots(page);
+	for (uint8 i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		if (slots[i].flags == ITL_FLAG_FREE || slots[i].xid != top_xid)
+			continue;
+		if (candidate != CLUSTER_ITL_SLOT_UNALLOCATED || slots[i].flags != ITL_FLAG_LOCK_ONLY_ACTIVE
+			|| UBA_is_invalid(slots[i].undo_segment_head) || slots[i].wrap == UINT16_MAX)
+			return false;
+		candidate = i;
+	}
+	if (candidate == CLUSTER_ITL_SLOT_UNALLOCATED)
+		return false;
+	for (OffsetNumber off = FirstOffsetNumber; off <= maxoff; off++) {
+		ItemId lp = PageGetItemId(page, off);
+		HeapTupleHeader tuple;
+
+		if (!ItemIdIsNormal(lp)) {
+			if (off == old_offset)
+				return false;
+			continue;
+		}
+		if (ItemIdGetLength(lp) < SizeofHeapTupleHeader || ItemIdGetOffset(lp) < header->pd_upper
+			|| (uint32)ItemIdGetOffset(lp) + ItemIdGetLength(lp) > header->pd_special)
+			return false;
+		tuple = (HeapTupleHeader)PageGetItem(page, lp);
+		if ((tuple->t_infomask & HEAP_XMAX_INVALID) != 0)
+			continue;
+		/* A descriptor may contain this xid even when raw xmax differs. */
+		if ((tuple->t_infomask & HEAP_XMAX_IS_MULTI) != 0)
+			return false;
+		if (!HEAP_XMAX_IS_LOCKED_ONLY(tuple->t_infomask)
+			|| HeapTupleHeaderGetRawXmax(tuple) != top_xid)
+			continue;
+		if (off != old_offset)
+			return false;
+		found_target = true;
+	}
+	if (!found_target)
+		return false;
+	*out_slot_idx = candidate;
+	return true;
+}
+
+/*
  * cluster_itl_find_multixact_origin_by_xmax (spec-3.6 v0.3 D7b NEW)
  *
  *	Legacy ancillary helper.  Scan page ITL for a marker stamped by D7b and
@@ -1447,6 +1529,16 @@ cluster_itl_alloc_or_reuse_lock_slot(Buffer buf pg_attribute_unused(),
 									 TransactionId top_xid pg_attribute_unused(),
 									 uint8 *out_slot_idx pg_attribute_unused())
 {
+	return false;
+}
+
+bool
+cluster_itl_alloc_update_slot(Buffer buf pg_attribute_unused(),
+							  TransactionId top_xid pg_attribute_unused(),
+							  OffsetNumber old_offset pg_attribute_unused(), uint8 *out_slot_idx)
+{
+	if (out_slot_idx != NULL)
+		*out_slot_idx = CLUSTER_ITL_SLOT_UNALLOCATED;
 	return false;
 }
 

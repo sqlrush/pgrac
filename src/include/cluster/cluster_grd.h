@@ -1442,6 +1442,15 @@ typedef struct ClusterGrdGrantIdentity {
 	LOCKMODE mode;					/* granted mode */
 } ClusterGrdGrantIdentity;
 
+/* Exact cancellation copies the removed request's original reply/dedup
+ * identity under the same lock. NOT_FOUND clears output and changes no holder. */
+extern ClusterGrdEntryResult
+cluster_grd_cancel_waiter_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								uint64 wait_seq, ClusterGrdGrantIdentity *cancelled_out);
+extern ClusterGrdEntryResult
+cluster_grd_cancel_convert_exact(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+								 uint64 wait_seq, ClusterGrdGrantIdentity *cancelled_out);
+
 /*
  * D4 — request a convert against an existing holder (caller holds
  * entry->lock; raw mutator like grant_holder).  out_drain_hint is set

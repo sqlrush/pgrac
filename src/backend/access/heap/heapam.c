@@ -1865,6 +1865,13 @@ cluster_heap_update_needs_successor_prediction(bool current_itl_path,
 	return current_itl_path || current_mx_recomposed;
 }
 
+static bool
+cluster_heap_update_lock_handoff_allowed(bool temp_locked, uint16 successor_infomask)
+{
+	/* Keep an application lock carrier if the new row would inherit it. */
+	return temp_locked && (successor_infomask & HEAP_XMAX_INVALID) != 0;
+}
+
 
 #ifdef USE_CLUSTER_UNIT
 bool
@@ -1887,6 +1894,12 @@ cluster_heap_test_update_needs_successor_prediction(
 {
 	return cluster_heap_update_needs_successor_prediction(
 		current_itl_path, current_mx_recomposed);
+}
+
+bool
+cluster_heap_test_update_lock_handoff_allowed(bool temp_locked, uint16 successor_infomask)
+{
+	return cluster_heap_update_lock_handoff_allowed(temp_locked, successor_infomask);
 }
 
 bool
@@ -2052,7 +2065,7 @@ cluster_heap_capture_undo_prior_lock(Page page, uint8 record_type, uint8 target_
 static ClusterHeapPreparedUndoResult
 cluster_heap_itl_plan_prepared_undo_target(
 	Relation relation, Buffer buffer, HeapTuple tuple, TransactionId xid,
-	bool lock_only, ClusterUndoRecordPrepareReceipt *receipt,
+	bool lock_only, bool allow_lock_handoff, ClusterUndoRecordPrepareReceipt *receipt,
 	uint8 target_ordinal, void *payload, uint16 payload_len,
 	ClusterHeapPreparedUndoTargetPlan *plan)
 {
@@ -2074,8 +2087,12 @@ cluster_heap_itl_plan_prepared_undo_target(
 		return receipt->ctrc_applied_mask == 0
 			? CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED
 			: CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
-	if (!cluster_heap_itl_alloc_once(
-			buffer, xid, lock_only, &plan->slot_index))
+	if (!(allow_lock_handoff && receipt->record_type == UNDO_RECORD_UPDATE && target_ordinal == 0
+		  && !lock_only && tuple != NULL
+		  ? cluster_itl_alloc_update_slot(buffer, xid,
+				ItemPointerGetOffsetNumber(&tuple->t_self), &plan->slot_index)
+		  : cluster_heap_itl_alloc_once(
+				buffer, xid, lock_only, &plan->slot_index)))
 		return CLUSTER_HEAP_PREPARED_UNDO_REFUSED;
 	if (!cluster_heap_dml_authority_guard_bind_itl_slot(
 			buffer, plan->slot_index, &plan->guard))
@@ -6046,7 +6063,7 @@ cluster_heap_insert_retry:
 				undo_plan_result = CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
 				if (OffsetNumberIsValid(undo_target.offnum))
 					undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
-						relation, buffer, NULL, canonical_xid, false,
+						relation, buffer, NULL, canonical_xid, false, false,
 						&undo_receipt, 0, &undo_payload, sizeof(undo_payload),
 						&undo_plan);
 				if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -11186,7 +11203,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			undo_target.blockno = ItemPointerGetBlockNumber(&tp.t_self);
 			undo_target.offnum = ItemPointerGetOffsetNumber(&tp.t_self);
 			undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
-				relation, buffer, &tp, canonical_xid, false, &undo_receipt,
+				relation, buffer, &tp, canonical_xid, false, false, &undo_receipt,
 				0, undo_payload_buf, undo_payload_len, &undo_plan);
 			if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
 			{
@@ -13043,6 +13060,7 @@ l_pgrac_reacquire:
 		uint16 tt_off;
 		bool census_was_pending = cluster_itl_update_census_pending;
 		bool old_capacity;
+		uint8 old_capacity_slot;
 		ClusterHeapItlCapacityResult old_capacity_result;
 		ClusterHeapDmlAuthorityGuard old_dml_guard;
 		ClusterHeapDmlAuthorityGuard new_dml_guard;
@@ -13108,6 +13126,10 @@ l_pgrac_reacquire:
 		if (census_was_pending
 			&& census_apply_result.kind == CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X)
 			old_capacity_result = CLUSTER_HEAP_ITL_CAPACITY_RETRY_REQUALIFY;
+		else if (cluster_heap_update_lock_handoff_allowed(old_tuple_temp_locked, infomask_new_tuple)
+			&& cluster_itl_alloc_update_slot(buffer, canonical_xid,
+				ItemPointerGetOffsetNumber(&oldtup.t_self), &old_capacity_slot))
+			old_capacity_result = CLUSTER_HEAP_ITL_CAPACITY_READY;
 		else if (newbuf == buffer && !census_was_pending)
 			old_capacity_result
 				= cluster_heap_itl_ensure_capacity_with_terminal_census(
@@ -13872,6 +13894,8 @@ l_pgrac_reacquire:
 					undo_plan_result
 						= cluster_heap_itl_plan_prepared_undo_target(
 							relation, buffer, &oldtup, canonical_xid, false,
+							cluster_heap_update_lock_handoff_allowed(old_tuple_temp_locked,
+								infomask_new_tuple),
 							&undo_receipt, 0, undo_payload_buf,
 							cluster_itl_undo_payload_len, &undo_plans[0]);
 					if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -13889,7 +13913,7 @@ l_pgrac_reacquire:
 					{
 						undo_plan_result
 							= cluster_heap_itl_plan_prepared_undo_target(
-								relation, newbuf, NULL, canonical_xid, false,
+								relation, newbuf, NULL, canonical_xid, false, false,
 								&undo_receipt, 1, undo_payload_buf,
 								cluster_itl_undo_payload_len, &undo_plans[1]);
 						if (undo_plan_result
@@ -16272,7 +16296,7 @@ failed:
 				undo_payload.lock_mode = (uint8) mode;
 				undo_payload.lock_xid = xid;
 				undo_plan_result = cluster_heap_itl_plan_prepared_undo_target(
-					relation, *buffer, tuple, canonical_xid, true,
+					relation, *buffer, tuple, canonical_xid, true, false,
 					&undo_receipt, 0, &undo_payload, sizeof(undo_payload),
 					&undo_plan);
 				if (undo_plan_result == CLUSTER_HEAP_PREPARED_UNDO_READY)
@@ -17629,7 +17653,7 @@ l4:
 				undo_payload.lock_mode = (uint8) mode;
 				undo_payload.lock_xid = xid;
 				plan_result = cluster_heap_itl_plan_prepared_undo_target(
-					rel, buf, &mytup, canonical_xid, true,
+					rel, buf, &mytup, canonical_xid, true, false,
 					&cluster_chain_receipt, 0, &undo_payload,
 					sizeof(undo_payload), &undo_plan);
 				if (plan_result

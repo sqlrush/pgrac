@@ -5159,6 +5159,12 @@ UT_TEST(test_75_update_predicts_successor_only_for_receipt_consumers)
 	UT_ASSERT(cluster_heap_test_update_needs_successor_prediction(true, false));
 	UT_ASSERT(cluster_heap_test_update_needs_successor_prediction(false, true));
 	UT_ASSERT(cluster_heap_test_update_needs_successor_prediction(true, true));
+	UT_ASSERT(cluster_heap_test_update_lock_handoff_allowed(true, HEAP_XMAX_INVALID));
+	UT_ASSERT(!cluster_heap_test_update_lock_handoff_allowed(false, HEAP_XMAX_INVALID));
+	UT_ASSERT(!cluster_heap_test_update_lock_handoff_allowed(false, HEAP_XMAX_LOCK_ONLY
+																		| HEAP_XMAX_KEYSHR_LOCK));
+	UT_ASSERT(!cluster_heap_test_update_lock_handoff_allowed(true, HEAP_XMAX_LOCK_ONLY
+																	   | HEAP_XMAX_KEYSHR_LOCK));
 }
 
 /* A local catalog page has no PCM generation and therefore cannot produce a

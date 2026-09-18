@@ -3144,24 +3144,33 @@ UT_TEST(test_page_history_more_than_eight_writers_and_interleaved_heads)
 {
 	unsigned variant;
 
-	for (variant = 0; variant < 4; variant++) {
+	for (variant = 0; variant < 5; variant++) {
 		PGAlignedBlock page;
 		PGAlignedBlock foreign;
 		ClusterR4CrSlotExtension extension = make_builder_extension(607 + variant, 907 + variant);
 		ClusterCrBuildReason reason;
 		unsigned i;
+		bool same_xid = variant == 1 || variant == 4;
 
-		make_many_page_history(page.data, &extension, variant == 1, variant == 2, variant == 3);
-		if (variant == 1)
+		/* The last leg crosses LOCK_ONLY -> DATA for the same xid, not just
+		 * successive different transactions. The full predecessor must survive. */
+		make_many_page_history(page.data, &extension, same_xid, variant == 2,
+							   variant == 3 || variant == 4);
+		if (same_xid)
 			extension.route_proof.read_scn = 195; /* five earlier same-xid creations must survive */
 		UT_ASSERT_EQ(cluster_cr_build_on_holder_step(0, 607 + variant, false, &extension, page.data,
 													 foreign.data, &reason),
 					 CLUSTER_R4_CR_STEP_FULL);
 		UT_ASSERT_EQ(reason, CLUSTER_CR_BUILD_NONE);
-		UT_ASSERT_EQ(ut_undo_get_record_calls, variant == 1 ? 7 : TEST_HISTORY_RECORDS);
+		UT_ASSERT_EQ(ut_undo_get_record_calls, same_xid ? 7 : TEST_HISTORY_RECORDS);
 		for (i = 0; i < TEST_HISTORY_RECORDS; i++)
-			UT_ASSERT_EQ(ItemIdIsNormal(PageGetItemId((Page)page.data, i + 1)),
-						 variant == 1 && i < 5);
+			UT_ASSERT_EQ(ItemIdIsNormal(PageGetItemId((Page)page.data, i + 1)), same_xid && i < 5);
+		if (variant == 4) {
+			HeapTupleHeader prior
+				= (HeapTupleHeader)PageGetItem((Page)page.data, PageGetItemId((Page)page.data, 1));
+			UT_ASSERT((prior->t_infomask & HEAP_XMAX_INVALID) != 0);
+			UT_ASSERT_EQ(ClusterPageGetItlSlots((Page)page.data)[0].flags, ITL_FLAG_ACTIVE);
+		}
 		cluster_cr_build_on_holder_forget(0, 607 + variant);
 		ut_history_sequence = false;
 	}

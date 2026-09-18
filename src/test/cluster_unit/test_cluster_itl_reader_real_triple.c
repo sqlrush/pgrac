@@ -1382,6 +1382,127 @@ append_plain_lock_tuple(Page page, TransactionId xid)
 	return tuple;
 }
 
+/* Counterfactual RED uses the unchanged production DATA selector, not a
+ * simulated allocator. Normal builds exercise the exact UPDATE selector. */
+#ifdef TEST_ITL_BASELINE_SELECTOR
+#define cluster_itl_alloc_update_slot(buf, xid, off, out)                                          \
+	cluster_itl_alloc_or_reuse_slot(buf, xid, out)
+#endif
+
+static Page
+build_eight_locked_rows(void)
+{
+	Page page = build_itl_page();
+
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		ClusterItlSlotData *slot = slot_at(page, i);
+
+		(void)append_plain_lock_tuple(page, 700 + i);
+		slot->xid = 700 + i;
+		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		slot->wrap = 12;
+		slot->undo_segment_head = uba_encode(1, 2, i, 1);
+	}
+	return page;
+}
+
+UT_TEST(update_own_predecessor_lock_does_not_need_a_ninth_slot)
+{
+	for (int i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
+		Page page = build_eight_locked_rows();
+		Buffer buf = marker_buffer_for(page);
+		PGAlignedBlock before;
+		uint8 selected = CLUSTER_ITL_SLOT_UNALLOCATED;
+		bool found;
+
+		memcpy(before.data, page, BLCKSZ);
+		found = cluster_itl_alloc_update_slot(buf, 700 + i, i + 1, &selected);
+		UT_ASSERT(found);
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+		if (!found)
+			continue;
+		UT_ASSERT_EQ(selected, i);
+		/* Selection alone never releases a row lock. Publication retains the
+		 * predecessor via the caller's existing history/receipt boundary. */
+		cluster_itl_stamp_active_with_history(buf, selected, 700 + i, 900, uba_encode(1, 3, i, 1));
+		UT_ASSERT_EQ(slot_at(page, selected)->flags, ITL_FLAG_ACTIVE);
+		UT_ASSERT_EQ(slot_at(page, selected)->wrap, 13);
+		UT_ASSERT_EQ(memcmp(PageGetItem(page, PageGetItemId(page, i + 1)),
+							PageGetItem((Page)before.data, PageGetItemId((Page)before.data, i + 1)),
+							SizeofHeapTupleHeader),
+					 0);
+		for (int j = 0; j < CLUSTER_ITL_INITRANS_DEFAULT; j++)
+			if (j != i)
+				UT_ASSERT_EQ(memcmp(slot_at(page, j), slot_at((Page)before.data, j),
+									sizeof(ClusterItlSlotData)),
+							 0);
+	}
+}
+
+UT_TEST(update_handoff_refuses_unproved_or_still_referenced_lock_slot)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		Page page = build_eight_locked_rows();
+		Buffer buf = marker_buffer_for(page);
+		HeapTupleHeader tuple = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, 1));
+		PGAlignedBlock before;
+		uint8 selected = CLUSTER_ITL_SLOT_UNALLOCATED;
+		OffsetNumber off = 1;
+
+		switch (fault) {
+		case 0:
+			(void)append_plain_lock_tuple(page, 700);
+			break;
+		case 1:
+			tuple->t_infomask |= HEAP_XMAX_IS_MULTI;
+			break;
+		case 2:
+			*slot_at(page, 1) = *slot_at(page, 0);
+			break;
+		case 3:
+			slot_at(page, 0)->undo_segment_head = (UBA)InvalidUba_init;
+			break;
+		case 4:
+			slot_at(page, 0)->wrap = UINT16_MAX;
+			break;
+		case 5:
+			off = 9;
+			break;
+		case 6:
+			HeapTupleHeaderSetXmax(tuple, 701);
+			break;
+		case 7:
+			ItemIdSetNormal(PageGetItemId(page, 1), BLCKSZ - 1, 24);
+			break;
+		case 8:
+			tuple->t_infomask |= HEAP_XMAX_INVALID;
+			break;
+		case 9:
+			append_plain_lock_tuple(page, 901)->t_infomask |= HEAP_XMAX_IS_MULTI;
+			break;
+		}
+		memcpy(before.data, page, BLCKSZ);
+		UT_ASSERT(!cluster_itl_alloc_update_slot(buf, 700, off, &selected));
+		UT_ASSERT_EQ(selected, CLUSTER_ITL_SLOT_UNALLOCATED);
+		UT_ASSERT_EQ(memcmp(before.data, page, BLCKSZ), 0);
+	}
+}
+
+UT_TEST(update_handoff_keeps_ordinary_data_allocation_priority)
+{
+	for (int leg = 0; leg < 2; leg++) {
+		Page page = build_eight_locked_rows();
+		Buffer buf = marker_buffer_for(page);
+		uint8 selected = CLUSTER_ITL_SLOT_UNALLOCATED;
+
+		slot_at(page, 5)->flags = leg == 0 ? ITL_FLAG_FREE : ITL_FLAG_ACTIVE;
+		slot_at(page, 5)->xid = 700;
+		UT_ASSERT(cluster_itl_alloc_update_slot(buf, 700, 1, &selected));
+		UT_ASSERT_EQ(selected, 5);
+		UT_ASSERT_EQ(slot_at(page, 0)->flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
+	}
+}
+
 UT_TEST(completed_lock_reuse_normalizes_only_matching_plain_locks)
 {
 	int leg;
@@ -1608,39 +1729,43 @@ UT_TEST(test_retained_history_stamp_does_not_erase_or_advance_loss_watermark)
 
 UT_TEST(test_retained_history_v4_redo_matches_primary_without_fpi)
 {
-	Page page = build_itl_page();
-	ClusterItlSlotData *slot = slot_at(page, 0);
-	PGAlignedBlock before;
-	PGAlignedBlock primary;
-	xl_heap_itl_delta_block *header = (xl_heap_itl_delta_block *)redo_delta_buf;
-	xl_heap_itl_delta_v3 *delta = (xl_heap_itl_delta_v3 *)(redo_delta_buf + 8);
+	for (int variant = 0; variant < 2; variant++) {
+		Page page = build_itl_page();
+		ClusterItlSlotData *slot = slot_at(page, 0);
+		PGAlignedBlock before;
+		PGAlignedBlock primary;
+		xl_heap_itl_delta_block *header = (xl_heap_itl_delta_block *)redo_delta_buf;
+		xl_heap_itl_delta_v3 *delta = (xl_heap_itl_delta_v3 *)(redo_delta_buf + 8);
 
-	slot->xid = 100;
-	slot->flags = ITL_FLAG_COMMITTED;
-	slot->wrap = 7;
-	slot->write_scn = 500;
-	slot->commit_scn = 600;
-	slot->undo_segment_head = uba_encode(1, 7, 0, 0);
-	ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = 300;
-	memcpy(before.data, page, BLCKSZ);
-	cluster_itl_stamp_active_with_history(marker_buffer_for(page), 0, 101, 700,
-										  uba_encode(1, 7, 1, 0));
-	memcpy(primary.data, page, BLCKSZ);
-	memcpy(page, before.data, BLCKSZ);
-	memset(redo_delta_buf, 0, sizeof(redo_delta_buf));
-	header->ndeltas = 1;
-	header->format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
-	delta->slot_idx = 0;
-	delta->flags_after = ITL_FLAG_ACTIVE;
-	delta->xid = 101;
-	delta->write_scn = 700;
-	delta->undo_segment_head = uba_encode(1, 7, 1, 0);
-	if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
-		UT_ASSERT_EQ(cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf), 40);
-		UT_ASSERT_EQ(cluster_itl_wal_block_consumed_bytes(redo_delta_buf), 40);
-		UT_ASSERT_EQ(memcmp(page, primary.data, BLCKSZ), 0);
-	} else
-		UT_ASSERT(false);
+		slot->xid = variant == 0 ? 100 : 101;
+		slot->flags = variant == 0 ? ITL_FLAG_COMMITTED : ITL_FLAG_LOCK_ONLY_ACTIVE;
+		slot->wrap = 7;
+		slot->write_scn = 500;
+		slot->commit_scn = variant == 0 ? 600 : InvalidScn;
+		slot->undo_segment_head = uba_encode(1, 7, 0, 0);
+		ClusterPageGetItlHeader(page)->itl_recycle_watermark_scn = 300;
+		memcpy(before.data, page, BLCKSZ);
+		cluster_itl_stamp_active_with_history(marker_buffer_for(page), 0, 101, 700,
+											  uba_encode(1, 7, 1, 0));
+		memcpy(primary.data, page, BLCKSZ);
+		memcpy(page, before.data, BLCKSZ);
+		memset(redo_delta_buf, 0, sizeof(redo_delta_buf));
+		header->ndeltas = 1;
+		header->format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
+		delta->slot_idx = 0;
+		delta->flags_after = ITL_FLAG_ACTIVE;
+		delta->xid = 101;
+		delta->write_scn = 700;
+		delta->undo_segment_head = uba_encode(1, 7, 1, 0);
+		if (sigsetjmp(ereport_recover_jmp, 1) == 0) {
+			UT_ASSERT_EQ(cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf), 40);
+			UT_ASSERT_EQ(cluster_itl_wal_block_consumed_bytes(redo_delta_buf), 40);
+			UT_ASSERT_EQ(memcmp(page, primary.data, BLCKSZ), 0);
+			UT_ASSERT_EQ(cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf), 40);
+			UT_ASSERT_EQ(memcmp(page, primary.data, BLCKSZ), 0);
+		} else
+			UT_ASSERT(false);
+	}
 }
 
 UT_TEST(test_retained_history_v4_rejects_complete_array_before_mutation)
@@ -1745,7 +1870,10 @@ UT_TEST(test_retained_lock_history_v4_redo_matches_primary)
 int
 main(void)
 {
-	UT_PLAN(69);
+	UT_PLAN(72);
+	UT_RUN(update_own_predecessor_lock_does_not_need_a_ninth_slot);
+	UT_RUN(update_handoff_refuses_unproved_or_still_referenced_lock_slot);
+	UT_RUN(update_handoff_keeps_ordinary_data_allocation_priority);
 	UT_RUN(test_retained_lock_history_v4_redo_matches_primary);
 	UT_RUN(test_retained_history_v4_rejects_complete_array_before_mutation);
 	UT_RUN(test_retained_history_stamp_does_not_erase_or_advance_loss_watermark);

@@ -98,6 +98,13 @@ RequestAddinShmemSpace(Size size pg_attribute_unused())
 
 #include "utils/guc.h"
 
+void *
+guc_malloc(int elevel pg_attribute_unused(), size_t size)
+{
+	/* The injection-enabled GUC object also references the PG allocator. */
+	return malloc(size);
+}
+
 void
 DefineCustomIntVariable(const char *name pg_attribute_unused(),
 						const char *short_desc pg_attribute_unused(),
