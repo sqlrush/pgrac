@@ -2042,9 +2042,9 @@ UT_TEST(test_heap_prepare_retries_transient_result_under_one_deadline)
 		wrapper_calls++;
 	for (hit = source; (hit = strstr(hit, "cluster_undo_record_prepare(")) != NULL; hit++)
 		raw_prepare_calls++;
-	/* Definition + retry wrapper + unit seam + five initial producer sites.
-	 * Existing retry sites now preserve READY through their dedicated owner. */
-	UT_ASSERT_EQ(helper_mentions, 10); /* Explicit TOAST and ordinary row-lock resume. */
+	/* Definition, retry wrapper, unit seam, five initial producer sites,
+	 * and the shared post-nested-producer preparation phase. */
+	UT_ASSERT_EQ(helper_mentions, 9);
 	UT_ASSERT_EQ(wrapper_calls, 2);
 	UT_ASSERT_EQ(raw_prepare_calls, 0);
 	free(source);
@@ -2135,9 +2135,7 @@ UT_TEST(test_all_heap_dml_callers_reprepare_outside_content_lock)
 	if (source == NULL)
 		return;
 	helper = strstr(source, "\ncluster_heap_prepare_undo_record_exact(");
-	helper_end = helper == NULL
-					 ? NULL
-					 : strstr(helper, "\n}\n\ntypedef enum ClusterHeapPreparedUndoResult");
+	helper_end = helper == NULL ? NULL : strstr(helper, "\n}\n");
 	deadline_parameter = helper == NULL ? NULL : strstr(helper, "uint64 absolute_deadline_us");
 
 	UT_ASSERT_NOT_NULL(helper);
@@ -2938,13 +2936,13 @@ UT_TEST(test_update_toast_releases_outer_receipt_before_nested_producers)
 	toast = update == NULL ? NULL : strstr(update, "heaptup = heap_toast_insert_or_update(");
 	release = update == NULL ? NULL
 							 : strstr(update, "cluster_undo_record_cancel_prepared(&undo_receipt)");
-	resume = toast == NULL ? NULL : strstr(toast, "cluster_heap_prepare_undo_record_exact(");
+	resume = toast == NULL ? NULL : strstr(toast, "cluster_heap_resume_update_undo_record_exact(");
 	relock = toast == NULL ? NULL : strstr(toast, "l_pgrac_reacquire:");
 	UT_ASSERT(update != NULL && release != NULL && toast != NULL && release < toast);
 	UT_ASSERT(resume != NULL && relock != NULL && toast < resume && resume < relock);
 	if (resume != NULL && relock != NULL) {
-		const char *original_budget = strstr(resume, "undo_prepare_deadline_us");
-		UT_ASSERT(original_budget != NULL && original_budget < relock);
+		const char *phase_budget = strstr(resume, "&undo_prepare_deadline_us");
+		UT_ASSERT(phase_budget != NULL && phase_budget < relock);
 	}
 	free(source);
 }

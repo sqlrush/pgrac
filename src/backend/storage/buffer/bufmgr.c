@@ -16741,7 +16741,7 @@ cluster_bufmgr_pcm_own_release_retained_fence_preserve_pi(
 	UnlockBufHdr(buf, buf_state);
 	LWLockRelease(content_lock);
 	if (released)
-		elog(LOG,
+		elog(DEBUG1,
 			 "cluster PCM retained transfer fence released: image=kept-pi buffer=%d rel=%u fork=%d blk=%u gen=%llu token=%llu",
 			 buf->buf_id, tag->relNumber, (int)tag->forkNum, tag->blockNum,
 			 (unsigned long long)committed_generation,

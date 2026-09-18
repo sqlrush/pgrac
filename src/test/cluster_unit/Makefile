@@ -46,6 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+        test_cluster_cr_dependency \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
@@ -3357,6 +3358,24 @@ $(CLUSTER_R4_CONTINUATION_CR_O): $(top_srcdir)/src/backend/cluster/cluster_cr.c 
 		-Dcluster_cr_r4_extract_resident_record=continuation_real_extract \
 		-c $< -o $@
 
+test_cluster_cr_dependency_drain.inc: $(top_srcdir)/src/backend/cluster/cluster_cr_server.c Makefile
+	awk '/^cluster_lms_cr_drain\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_cr_dependency: test_cluster_cr_dependency.c test_cluster_cr_dependency_drain.inc \
+		test_cluster_r4_slot_reservation.c unit_test.h \
+		$(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
+		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) \
+		-DCR_SERVER_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_cr_server.c"' \
+		$< $(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
+		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
+		test_cluster_r4_multi_resolve_product.o $(CLUSTER_CR_APPLY_O) $(CLUSTER_R4_CONTINUATION_PAGE_O) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_r4_slot_reservation: test_cluster_r4_slot_reservation.c unit_test.h \
 		$(CLUSTER_R4_SLOT_RESERVATION_TEST_O) $(CLUSTER_R4_LMS_DATA_PLANE_TEST_O) \
 		$(CLUSTER_R4_SLOT_RESERVATION_UBA_O) $(CLUSTER_R4_CONTINUATION_CR_O) \
@@ -4571,9 +4590,19 @@ test_cluster_r4_production_reachability: test_cluster_r4_production_reachability
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_heap_update_temp_lock.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
-	awk '/^cluster_heap_lock_update_predecessor\(/ { print "static TM_Result"; emit=1; found++ } \
+	awk '/^cluster_heap_resume_update_undo_record_exact\(/ { print "static bool"; emit=1; phase++ } \
+	     /^cluster_heap_lock_update_predecessor\(/ { print "static TM_Result"; emit=1; found++ } \
 	     emit { print } emit && /^}/ { emit=0; done++ } \
-	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	     END { if (found != 1 || phase != 1 || done != 2) exit 1; \
+	           print "#define PREPARE_RESUME_HAS_PHASE 1" }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_toast_resume.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { in_update=1 } \
+	     in_update && /heaptup = heap_toast_insert_or_update/ { after_toast=1 } \
+	     after_toast && /if \(resume_update_receipt/ { emit=1; found++ } \
+	     emit && /^#endif/ { emit=0; after_toast=0; done++ } emit { print } \
+	     /^}/ { in_update=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_update_temp_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -4662,7 +4691,7 @@ test_cluster_heap_prepare_diagnostic.inc: $(top_srcdir)/src/backend/access/heap/
 test_cluster_heap_prepare_diagnostic: test_cluster_heap_prepare_diagnostic.c unit_test.h test_cluster_heap_prepare_diagnostic.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
-test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc
+test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc test_cluster_heap_update_toast_resume.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \

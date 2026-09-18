@@ -402,6 +402,7 @@ cluster_vis_evidence_note(ClusterVisEvidenceMetric metric)
 	ut_evidence_metrics[metric]++;
 }
 static ClusterTxwResult ut_itl_wait_result = CLUSTER_TXW_RESOLVED;
+static bool ut_itl_wait_past_budget;
 static bool ut_itl_pair_active;
 static bool ut_itl_pair_content_lock_held[2];
 static Buffer ut_itl_pair_lock_buffers[4];
@@ -431,6 +432,8 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	UT_ASSERT(!ut_itl_recycle_guard_active);
 	UT_ASSERT_EQ(semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
 	UT_ASSERT(effective_timeout_ms > 0);
+	if (ut_itl_wait_past_budget)
+		pg_usleep((long)(effective_timeout_ms + 20) * 1000L);
 	*reason_out = ut_itl_wait_result == CLUSTER_TXW_TIMEOUT ? CLUSTER_TX_RESOLVE_TIMEOUT
 															: CLUSTER_TX_RESOLVE_NONE;
 	return ut_itl_wait_result;
@@ -4240,6 +4243,7 @@ ut_itl_census_begin(UtR4HotProductFixture *fixture, HeapHotSearchResult *result,
 	memset(ut_evidence_metrics, 0, sizeof(ut_evidence_metrics));
 	memset(&ut_itl_wait_locator, 0, sizeof(ut_itl_wait_locator));
 	ut_itl_wait_result = CLUSTER_TXW_RESOLVED;
+	ut_itl_wait_past_budget = false;
 }
 
 static void

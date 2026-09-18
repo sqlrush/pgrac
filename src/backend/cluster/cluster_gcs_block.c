@@ -2452,6 +2452,7 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 	GcsBlockReplyHeader header;
 	GcsBlockReplyStatus status;
 	SCN read_scn = InvalidScn;
+	bool queued;
 
 	if (!gcs_block_r4_refusal_status_for_build(result, reason, admitted_forward, &status))
 		return true;
@@ -2471,9 +2472,16 @@ gcs_block_r4_publish_refusal(int worker_id, const ClusterICEnvelope *env,
 		&& current_master_node < CLUSTER_MAX_NODES)
 		header.page_lsn = (uint64)(uint32)(current_master_node + 1);
 	GcsBlockReplyHeaderSetForwardingMasterNode(&header, GCS_BLOCK_REPLY_NO_FORWARDING_MASTER);
-	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+	queued = cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 		worker_id, env->source_node_id, &header, R4_CR_REQUIRED_HELLO_CAPS,
 		requester_capability_generation);
+	/* A non-admitted refusal has no transport owner. The requester's existing
+	 * retransmit still owns recovery; expose the refusal instead of claiming
+	 * delivery or blocking the LMS that must drain the full ring. */
+	if (!queued)
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+											CLUSTER_IC_SEND_NOT_ADMITTED);
+	return queued;
 }
 
 /*
@@ -2488,6 +2496,7 @@ gcs_block_r4_publish_holder_refusal(int worker_id, const ClusterR4CrForwardPaylo
 {
 	GcsBlockReplyHeader header;
 	GcsBlockReplyStatus status;
+	bool queued;
 
 	if (forward == NULL || !gcs_block_r4_refusal_status_for_build(result, reason, true, &status))
 		return true;
@@ -2503,9 +2512,13 @@ gcs_block_r4_publish_holder_refusal(int worker_id, const ClusterR4CrForwardPaylo
 	header.transition_id = forward->base.transition_id;
 	header.status = (uint8)status;
 	GcsBlockReplyHeaderSetForwardingMasterNode(&header, forward->base.master_node);
-	return cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
+	queued = cluster_lms_outbound_enqueue_zero_block_reply_cap_bound(
 		worker_id, (uint32)forward->base.original_requester_node, &header,
 		R4_CR_REQUIRED_HELLO_CAPS, requester_capability_generation);
+	if (!queued)
+		cluster_gcs_block_note_send_outcome(GCS_BLOCK_SEND_FAMILY_REPLY,
+											CLUSTER_IC_SEND_NOT_ADMITTED);
+	return queued;
 }
 
 static bool

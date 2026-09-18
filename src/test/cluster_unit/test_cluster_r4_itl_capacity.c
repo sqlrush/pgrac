@@ -246,10 +246,67 @@ UT_TEST(test_lock_capacity_does_not_mistake_self_data_slot_for_lock_capacity)
 	}
 }
 
+UT_TEST(test_deadlock_retains_its_typed_cause_without_relabeling_as_authority)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	PGAlignedBlock before;
+	uint64 deadline = 0;
+	const char *reason = NULL;
+
+	ut_itl_census_begin(&fixture, &hot, true);
+	origin_fault = 0;
+	ut_itl_wait_result = CLUSTER_TXW_DEADLOCK;
+	pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	memcpy(before.data, fixture.live_page, BLCKSZ);
+	ut_itl_capacity_log[0] = '\0';
+	ut_capture_miss_log = true;
+	UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+				 CLUSTER_TXW_DEADLOCK);
+	ut_capture_miss_log = false;
+	UT_ASSERT_STR_EQ(reason, "ITL_WAIT_DEADLOCK");
+	UT_ASSERT(strstr(ut_itl_capacity_log, "waiter_xid=9900 blocker_xid=1200") != NULL);
+	UT_ASSERT(strstr(ut_itl_capacity_log, "stage=WAIT_TERMINAL") != NULL);
+	UT_ASSERT(strstr(ut_itl_capacity_log, "slot=7 xid=1207") != NULL);
+	UT_ASSERT_EQ(ut_itl_wait_calls, 1);
+	UT_ASSERT_EQ(ut_itl_census_dirty_hint_calls, 0);
+	UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+	UT_ASSERT(!ut_hot_content_lock_held);
+	LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+	ut_itl_census_end();
+}
+
+UT_TEST(test_confirmed_deadlock_wins_over_simultaneous_capacity_deadline)
+{
+	UtR4HotProductFixture fixture;
+	HeapHotSearchResult hot;
+	uint64 deadline = 0;
+	const char *reason = NULL;
+	int saved_budget = cluster_ges_request_timeout_ms;
+
+	ut_itl_census_begin(&fixture, &hot, true);
+	origin_fault = 0;
+	ut_itl_wait_result = CLUSTER_TXW_DEADLOCK;
+	ut_itl_wait_past_budget = true;
+	cluster_ges_request_timeout_ms = 1;
+	pg_atomic_write_u64(&ut_itl_census_semantic.active_bits,
+						CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1);
+	UT_ASSERT_EQ(cluster_heap_test_itl_wait_capacity(1, 1, 1, 9900, &deadline, &reason),
+				 CLUSTER_TXW_DEADLOCK);
+	UT_ASSERT_STR_EQ(reason, "ITL_WAIT_DEADLOCK");
+	UT_ASSERT_EQ(ut_itl_wait_calls, 1);
+	cluster_ges_request_timeout_ms = saved_budget;
+	LockBuffer(1, BUFFER_LOCK_EXCLUSIVE);
+	ut_itl_census_end();
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(6);
+	UT_RUN(test_confirmed_deadlock_wins_over_simultaneous_capacity_deadline);
+	UT_RUN(test_deadlock_retains_its_typed_cause_without_relabeling_as_authority);
 	UT_RUN(test_exact_active_owner_reaches_capacity_wait_through_real_resolver);
 	UT_RUN(test_capacity_keeps_unknown_identity_prepared_and_admission_refusals);
 	UT_RUN(test_origin_abort_releases_eight_lock_only_slots_through_real_census);

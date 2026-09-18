@@ -481,13 +481,32 @@ cluster_heap_undo_receipt_errdetail(bool ctrc)
 					 cluster_undo_record_receipt_last_reason(), cluster_node_id);
 }
 
+/* Start a new preparation only after an explicitly cancelled outer producer's
+ * nested producer has returned and released its reservation. Ordinary retries
+ * must keep using cluster_heap_retry_undo_record_exact and their fixed budget. */
+static bool
+cluster_heap_resume_update_undo_record_exact(const ClusterCanonicalTxnBinding *binding,
+											uint64 *deadline_us,
+											ClusterUndoRecordPrepareReceipt *receipt)
+{
+	if (binding == NULL || deadline_us == NULL || receipt == NULL || receipt->magic != 0
+		|| receipt->ctrc_applied_mask != 0)
+		return false;
+	*deadline_us = cluster_undo_record_prepare_deadline_us();
+	return *deadline_us != 0
+		   && cluster_heap_prepare_undo_record_exact(
+			   UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
+			   (uint16)binding->segment_id, binding->slot_offset, (UBA)InvalidUba_init,
+			   *deadline_us, receipt);
+}
+
 /* The caller has released content locks and retains its original heap pin.
  * The ordinary row-lock producer owns the locator, undo and publication;
  * this adapter owns only its additional pin and the unpublished outer slot. */
 static TM_Result
 cluster_heap_lock_update_predecessor(Relation relation, ItemPointer tid, CommandId cid,
 									 LockTupleMode mode, LockWaitPolicy wait_policy,
-									 const ClusterCanonicalTxnBinding *binding, uint64 deadline_us,
+									 const ClusterCanonicalTxnBinding *binding, uint64 *deadline_us,
 									 ClusterUndoRecordPrepareReceipt *receipt)
 {
 	HeapTupleData tuple = { 0 };
@@ -526,11 +545,7 @@ cluster_heap_lock_update_predecessor(Relation relation, ItemPointer tid, Command
 			ReleaseBuffer(nested_buffer);
 	}
 	PG_END_TRY();
-	if (resume
-		&& !cluster_heap_prepare_undo_record_exact(
-			UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
-			(uint16)binding->segment_id, binding->slot_offset, (UBA)InvalidUba_init, deadline_us,
-			receipt))
+	if (resume && !cluster_heap_resume_update_undo_record_exact(binding, deadline_us, receipt))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 						errmsg("cluster undo reservation failed after heap temporary lock"),
 						cluster_heap_undo_receipt_errdetail(false)));
@@ -1604,6 +1619,7 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	uint8 i;
 	int remaining_ms;
 	uint64 wait_deadline;
+	volatile bool wait_finished = false;
 
 	Assert(full_buffer == old_buffer || full_buffer == new_buffer);
 	*diagnostic_reason = "ITL_BLOCKER_UNPROVABLE";
@@ -1732,10 +1748,37 @@ cluster_heap_itl_wait_capacity_after_census(Buffer old_buffer, Buffer new_buffer
 	}
 	wait_deadline = *deadline_us;
 	cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_WAIT_STARTED);
-	result = cluster_tx_enqueue_wait_exact(&blocker, remaining_ms, &wait_reason);
+	PG_TRY();
+	{
+		result = cluster_tx_enqueue_wait_exact(&blocker, remaining_ms, &wait_reason);
+		wait_finished = true;
+	}
+	PG_FINALLY();
+	{
+		/* Error-only causal evidence. The copied census remains valid as an
+		 * observation, never as a new authority; no page is repinned here. */
+		if (!wait_finished || (result != CLUSTER_TXW_RESOLVED && result != CLUSTER_TXW_RETRY)) {
+			ereport(LOG,
+					(errmsg("cluster ITL capacity wait terminated"),
+					 errdetail("PGRAC_FAMILY=ITL_CAPACITY_DIAGNOSTIC PGRAC_REASON=WAIT_TERMINAL "
+							   "waiter_xid=%u blocker_xid=%u blocker_wrap=%u lock_only=%d "
+							   "returned=%d result=%d resolve_reason=%d deadline_us=" UINT64_FORMAT,
+							   xid, blocker.xid, blocker.tt_wrap, lock_only,
+							   wait_finished, wait_finished ? (int)result : -1,
+							   wait_finished ? (int)wait_reason : -1, wait_deadline)));
+			cluster_heap_itl_capacity_diagnostic(&census, capture_result, "WAIT_TERMINAL");
+		}
+	}
+	PG_END_TRY();
 	if (*deadline_us != wait_deadline) {
 		cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ITL_DEADLINE_REFRESH);
 		return CLUSTER_TXW_UNPROVABLE;
+	}
+	/* A consumed, exact deadlock cancellation is the terminal cause even if
+	 * the capacity budget expires during the return/diagnostic boundary. */
+	if (result == CLUSTER_TXW_DEADLOCK) {
+		*diagnostic_reason = "ITL_WAIT_DEADLOCK";
+		return result;
 	}
 	/* Even a terminal reply cannot renew an already spent caller budget. */
 	if (result == CLUSTER_TXW_TIMEOUT
@@ -1897,7 +1940,9 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 				(errcode(wait_result == CLUSTER_TXW_TIMEOUT ? ERRCODE_CLUSTER_GES_TIMEOUT
 					: wait_result == CLUSTER_TXW_DEADLOCK ? ERRCODE_T_R_DEADLOCK_DETECTED
 					: ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("ITL slot OVERFLOW before heap tuple lock (INITRANS=%d full)",
+				 errmsg(wait_result == CLUSTER_TXW_DEADLOCK
+							? "deadlock detected while waiting for heap tuple-lock ITL capacity (INITRANS=%d)"
+							: "ITL slot OVERFLOW before heap tuple lock (INITRANS=%d full)",
 						CLUSTER_ITL_INITRANS_DEFAULT),
 				 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=%s PGRAC_NODE=%d "
 						   "PGRAC_ATTEMPT=0 wait_result=%d deadline_us=" UINT64_FORMAT,
@@ -12418,7 +12463,7 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
 		lock_result = cluster_heap_lock_update_predecessor(
 			relation, &oldtup.t_self, pgrac_entry_cid, *lockmode,
-			wait ? LockWaitBlock : LockWaitSkip, &canonical_binding, undo_prepare_deadline_us,
+			wait ? LockWaitBlock : LockWaitSkip, &canonical_binding, &undo_prepare_deadline_us,
 			&undo_receipt);
 		old_tuple_temp_locked = lock_result == TM_Ok;
 		cluster_heap_lock_with_vm_repin(relation, block, buffer, &vmbuffer);
@@ -12794,10 +12839,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			newtupsize = MAXALIGN(heaptup->t_len);
 #ifdef USE_PGRAC_CLUSTER
 			if (resume_update_receipt
-				&& !cluster_heap_prepare_undo_record_exact(
-					UNDO_RECORD_UPDATE, (uint16)cluster_undo_record_inline_max_bytes,
-					(uint16)canonical_binding.segment_id, canonical_binding.slot_offset,
-					(UBA)InvalidUba_init, undo_prepare_deadline_us, &undo_receipt))
+				&& !cluster_heap_resume_update_undo_record_exact(
+					&canonical_binding, &undo_prepare_deadline_us, &undo_receipt))
 				ereport(ERROR, (errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
 								errmsg("cluster undo reservation failed before heap update"),
 								cluster_heap_undo_receipt_errdetail(false)));
@@ -14456,7 +14499,9 @@ l_pgrac_itl_capacity_wait: {
 				(errcode(wait_result == CLUSTER_TXW_TIMEOUT	   ? ERRCODE_CLUSTER_GES_TIMEOUT
 						 : wait_result == CLUSTER_TXW_DEADLOCK ? ERRCODE_T_R_DEADLOCK_DETECTED
 															   : ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-				 errmsg("ITL slot OVERFLOW on heap page (INITRANS=%d full)",
+				 errmsg(wait_result == CLUSTER_TXW_DEADLOCK
+							? "deadlock detected while waiting for heap update ITL capacity (INITRANS=%d)"
+							: "ITL slot OVERFLOW on heap page (INITRANS=%d full)",
 						CLUSTER_ITL_INITRANS_DEFAULT),
 				 errdetail("PGRAC_FAMILY=ITL_CAPACITY PGRAC_REASON=%s PGRAC_NODE=%d "
 						   "PGRAC_ATTEMPT=0 wait_result=%d deadline_us=" UINT64_FORMAT,

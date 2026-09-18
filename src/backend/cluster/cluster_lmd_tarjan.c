@@ -1479,6 +1479,21 @@ cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms)
 		/* One cancel_id per issued cancel, threaded through the token / CANCEL_
 		 * WAIT / CANCEL_ACK for correlation (spec-5.9 D3/D5). */
 		cancel_id = lmd_next_cancel_id();
+		/* Preserve the already confirmed cycle before cancellation can remove
+		 * its wait edges. This is failure evidence, not a new detector or probe. */
+		for (int i = 0; i < Min(round2.n_cycle_vertices, 32); i++) {
+			const ClusterLmdVertex *member = &round2.cycle_vertices[i];
+
+			ereport(LOG,
+					(errmsg("cluster LMD confirmed cycle member"),
+					 errdetail("PGRAC_FAMILY=DEADLOCK PGRAC_REASON=CONFIRMED_CYCLE "
+							   "cycle=" UINT64_FORMAT " cancel=" UINT64_FORMAT
+							   " member=%d total=%d node=%d procno=%u xid=%u epoch=" UINT64_FORMAT
+							   " request=" UINT64_FORMAT " wait_seq=" UINT64_FORMAT,
+							   round2.cycle_hash, cancel_id, i, round2.n_cycle_vertices,
+							   member->node_id, member->procno, member->xid, member->cluster_epoch,
+							   member->request_id, member->wait_seq)));
+		}
 
 		if (victim.node_id == self_node) {
 			/* Count only a real cancel — D5 revalidate may refuse a victim that

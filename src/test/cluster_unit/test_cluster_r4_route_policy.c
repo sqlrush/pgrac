@@ -4868,6 +4868,43 @@ UT_TEST(test_forward96_all_local_refuses_open_generation_overflow_before_submit)
 /* A holder-side typed failure is consumed only after the submit result and
  * the decoder's final token recheck.  Reusing the master-side refusal shape,
  * replying to env.source, or publishing after leave breaks this boundary. */
+UT_TEST(test_refusal_queue_nonadmission_is_counted_at_each_producer)
+{
+	ClusterR4CrRequestPayload request = route_test_request80();
+	ClusterR4CrForwardPayload forward = route_test_forward96();
+	ClusterICEnvelope env;
+	int saved_node_id = cluster_node_id;
+
+	for (int phase = 0; phase < 3; phase++) {
+		UT_ASSERT(cluster_gcs_block_test_arm_r4_reply_slot(UT_REQUEST_ID, UT_FORMATION_EPOCH, 1,
+														   PCM_TRANS_N_TO_S, UT_MASTER_NODE));
+		route_seam_reset();
+		route_seam.refusal_enqueue_ok = false;
+		if (phase == 2) {
+			cluster_node_id = UT_HOLDER_NODE;
+			route_seam.holder_submit_result = CLUSTER_CR_BUILD_RETRYABLE;
+			route_seam.holder_submit_reason = CLUSTER_CR_BUILD_CAPACITY;
+			env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, UT_MASTER_NODE,
+									  UT_HOLDER_NODE, sizeof(forward));
+			UT_ASSERT(cluster_gcs_block_test_r4_forward96(&env, &forward));
+		} else {
+			cluster_node_id = UT_MASTER_NODE;
+			if (phase == 0)
+				route_seam.admission_result = CLUSTER_SEMANTIC_ADMISSION_CLOSED;
+			else
+				route_seam.peer_open_ok = false;
+			env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REQUEST, UT_REQUESTER_NODE,
+									  UT_MASTER_NODE, sizeof(request));
+			UT_ASSERT(cluster_gcs_block_test_r4_request80(&env, &request));
+		}
+		UT_ASSERT_EQ(route_seam.refusal_enqueue_calls, 1);
+		UT_ASSERT_EQ(cluster_gcs_get_reply_send_not_admitted_count(), 1);
+		/* A full ring is not a successful delivery or a second transport send. */
+		UT_ASSERT_EQ(route_seam.raw_send_calls, 0);
+	}
+	cluster_node_id = saved_node_id;
+}
+
 UT_TEST(test_forward96_holder_submit_failure_publishes_typed_remote_refusal)
 {
 	static const struct {
@@ -6129,7 +6166,8 @@ UT_TEST(test_internal_origin_refusals_do_not_enter_backend_reply_table)
 int
 main(void)
 {
-	UT_PLAN(117);
+	UT_PLAN(118);
+	UT_RUN(test_refusal_queue_nonadmission_is_counted_at_each_producer);
 	UT_RUN(test_seal_two_blocks_new_tx_and_undo_contexts_but_not_original_drain);
 	UT_RUN(test_kind2_requester_asks_origin_to_select_and_lands_exact_status22);
 	UT_RUN(test_kind2_origin_generation_selection_and_strict_known_negatives);
