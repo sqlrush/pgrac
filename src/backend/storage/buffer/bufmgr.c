@@ -1033,10 +1033,7 @@ cluster_bufmgr_pcm_own_s_holder_candidate_exact(
 	uint32 buf_state;
 
 	if (buf == NULL || expected_s == NULL
-		|| expected_s->pcm_state != (uint8)PCM_STATE_S
-		|| expected_s->flags != 0
-		|| expected_s->writer_activation_token != 0
-		|| expected_s->resource_x_activation_generation != 0)
+		|| expected_s->pcm_state != (uint8)PCM_STATE_S)
 		return CLUSTER_PCM_OWN_INVALID;
 	if (ClusterPcmOwnArray == NULL)
 		return CLUSTER_PCM_OWN_NOT_READY;
@@ -1047,8 +1044,17 @@ cluster_bufmgr_pcm_own_s_holder_candidate_exact(
 	else if (!cluster_pcm_x_current_image_shape(
 				 live.pcm_state, live.buffer_type,
 				 (live.semantic_buf_state & BM_VALID) != 0)
-			 || (live.semantic_buf_state & BM_IO_ERROR) != 0)
+			 || (live.semantic_buf_state & BM_IO_ERROR) != 0
+			 || live.generation == UINT64_MAX
+			 || live.reservation_token == UINT64_MAX
+			 || live.writer_activation_token != 0
+			 || live.resource_x_activation_generation != 0)
 		result = CLUSTER_PCM_OWN_CORRUPT;
+	else if (live.flags != 0)
+		/* A concurrent local source reservation still owns this exact S
+		 * image. The remote revoke must wait, not claim corruption or ACK N.
+		 * Unknown/combined flags and a missing token remain hard failures. */
+		result = cluster_pcm_own_classify_live_flags(live.flags, live.reservation_token);
 	else if ((live.semantic_buf_state
 			  & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED
 				 | BM_IO_IN_PROGRESS)) != 0)

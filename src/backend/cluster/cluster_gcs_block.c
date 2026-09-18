@@ -11330,6 +11330,8 @@ typedef struct ResourceXFirstFailureEvidence {
 	int32 buffer_own_result;
 	uint8 buffer_pcm_state_before;
 	uint8 buffer_pcm_state_after;
+	uint8 remote_s_image_type;
+	uint32 remote_s_semantic_state;
 	uint64 base_authority_generation;
 	uint64 authority_generation;
 	uint64 assertion_sequence;
@@ -11497,7 +11499,7 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 		LOG,
 		(errmsg_internal("Resource-X first-failure diagnostic"),
 		 errdetail(
-			 "tag_hash=%u binding_generation=%llu "
+			 "tag_hash=%u tag=%u/%u/%u/%u/%u binding_generation=%llu "
 			 "request_sequence=%llu admission_generation=%llu "
 			 "buffer_generation_before=%llu buffer_generation_after=%llu "
 			 "buffer_token_before=%llu buffer_token_after=%llu "
@@ -11506,6 +11508,7 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 			 "buffer_resource_x_generation_after=%llu "
 			 "buffer_flags_before=0x%08x buffer_flags_after=0x%08x "
 			 "buffer_pcm_state_before=%u buffer_pcm_state_after=%u "
+			 "remote_s_image_type=%u remote_s_semantic_state=0x%08x "
 			 "buffer_own_result=%d "
 			 "formation=%llu master_session=%llu r4_generation=%llu "
 			 "base_authority_generation=%llu authority_generation=%llu "
@@ -11544,7 +11547,9 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 			 "refused_resource_x=%llu refused_retained=%llu "
 			 "refused_requester=%llu refused_sidecar=%llu "
 			 "deadline=%llu",
-			 tag_hash, (unsigned long long)evidence->binding_generation,
+			 tag_hash, evidence->tag.spcOid, evidence->tag.dbOid, evidence->tag.relNumber,
+			 (unsigned)evidence->tag.forkNum, evidence->tag.blockNum,
+			 (unsigned long long)evidence->binding_generation,
 			 (unsigned long long)evidence->request_sequence,
 			 (unsigned long long)(evidence->admission_generation != 0
 									  ? evidence->admission_generation
@@ -11559,7 +11564,8 @@ gcs_block_resource_x_first_failure_record(const ResourceXFirstFailureEvidence *e
 			 (unsigned long long)evidence->buffer_resource_x_generation_after,
 			 evidence->buffer_flags_before, evidence->buffer_flags_after,
 			 (unsigned)evidence->buffer_pcm_state_before,
-			 (unsigned)evidence->buffer_pcm_state_after,
+			 (unsigned)evidence->buffer_pcm_state_after, (unsigned)evidence->remote_s_image_type,
+			 evidence->remote_s_semantic_state,
 			 evidence->remote_s_stage != RESOURCE_X_REMOTE_S_STAGE_NONE
 				 ? evidence->buffer_own_result
 				 : -1,
@@ -12052,6 +12058,20 @@ gcs_block_pcm_x_resource_x_remote_s_holder_block_to_n(
 		first_failure.r4_generation = r4_record_generation;
 		first_failure.buffer_generation_before = current.generation;
 		first_failure.buffer_generation_after = current.generation;
+		first_failure.buffer_token_before = current.reservation_token;
+		first_failure.buffer_token_after = current.reservation_token;
+		first_failure.buffer_writer_token_before = current.writer_activation_token;
+		first_failure.buffer_writer_token_after = current.writer_activation_token;
+		first_failure.buffer_resource_x_generation_before
+			= current.resource_x_activation_generation;
+		first_failure.buffer_resource_x_generation_after = current.resource_x_activation_generation;
+		first_failure.buffer_flags_before = current.flags;
+		first_failure.buffer_flags_after = current.flags;
+		first_failure.buffer_pcm_state_before = current.pcm_state;
+		first_failure.buffer_pcm_state_after = current.pcm_state;
+		first_failure.buffer_own_result = (int32)own_result;
+		first_failure.remote_s_image_type = current.buffer_type;
+		first_failure.remote_s_semantic_state = current.semantic_buf_state;
 		gcs_block_resource_x_first_failure_record(&first_failure);
 		gcs_block_resource_x_failure_decision_apply(&failure_decision);
 		return mapped_result;

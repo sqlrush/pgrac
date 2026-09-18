@@ -2791,6 +2791,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	awk '/^cluster_pcm_own_bump_failure\(/ { print "static ClusterPcmOwnResult"; emit=1; bump_failure++ } \
 	     /^cluster_bufmgr_pcm_own_snapshot\(/ { print "ClusterPcmOwnResult"; emit=1; ordinary_snapshot++ } \
 	     /^cluster_bufmgr_pcm_own_n_assertion_candidate_exact\(/ { print "ClusterPcmOwnResult"; emit=1; n_candidate++ } \
+	     /^cluster_bufmgr_pcm_own_s_holder_candidate_exact\(/ { print "ClusterPcmOwnResult"; emit=1; s_candidate++ } \
 	     /^cluster_bufmgr_pcm_own_n_retained_release_inflight_exact\(/ { print "bool"; emit=1; retained_candidate++ } \
 	     /^cluster_bufmgr_pcm_own_n_storage_candidate_exact\(/ { print "ClusterPcmOwnResult"; emit=1; storage_candidate++ } \
 	     /^cluster_bufmgr_pcm_own_n_predecessor_observe_exact\(/ { print "ClusterPcmOwnResult"; emit=1; predecessor_observe++ } \
@@ -2824,7 +2825,7 @@ test_cluster_pcm_transition_owner.inc: $(top_srcdir)/src/backend/storage/buffer/
 	     /^cluster_bufmgr_pcm_own_reclaim_read_image_for_delivery_exact\(/ { print "ClusterPcmOwnResult"; emit=1; read_delivery++ } \
 	     /^cluster_pcm_own_abort_grant_reservation\(/ { print "static ClusterPcmOwnResult"; emit=1; grant_abort++ } \
 	     emit { print } /^}/ { emit=0 } \
-	     END { if (retained_candidate != 1 || storage_candidate != 1 || predecessor_observe != 1 || read_reclaim != 1 || read_delivery != 1) exit 1 } \
+	     END { if (s_candidate != 1 || retained_candidate != 1 || storage_candidate != 1 || predecessor_observe != 1 || read_reclaim != 1 || read_delivery != 1) exit 1 } \
 	     END { if (ordinary_snapshot != 1 || n_candidate != 1 || bump_failure != 1 || bump != 1 || evict != 1 || shape != 1 || wal_copy != 1 || known_new != 1 || ordinary_lookup != 1 || direct_lookup != 1 || sidecar != 1 || activate != 1 || clear != 1 || copy != 1 || held_valid != 1 || held_validate != 1 || held_adopt != 1 || held_finish != 1 || held_abandon != 1 || drop != 1 || finish != 1 || delivery_begin != 1 || delivery_snapshot != 1 || delivery_release != 1 || normal_reserve != 1 || delivery_reserve != 1 || read_publish != 1 || read_clear != 1 || read_release != 1 || grant_abort != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
