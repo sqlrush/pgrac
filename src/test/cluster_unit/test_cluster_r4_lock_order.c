@@ -2932,6 +2932,62 @@ UT_TEST(test_post_snapshot_matching_xmin_uses_holder_full)
 	BufferBlocks = NULL;
 }
 
+/* A local creator may remain in the native snapshot after its canonical
+ * commit is visible at the statement SCN. The prior version already uses
+ * FULL; this successor must use the same authority, never native xip. */
+UT_TEST(test_local_matching_creator_uses_statement_scn_not_native_membership)
+{
+	for (int leg = 0; leg < 4; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult result;
+		RelationData relation = { 0 };
+		FormData_pg_class form = { 0 };
+		SnapshotData snapshot = { 0 };
+		ItemPointerData tid;
+		HeapHotSearchResultKind kind;
+
+		ut_r4_hot_init_product_fixture(&fixture, &result);
+		ut_hot_live_ref.local_xid = UT_HOT_LIVE_XMIN;
+		ut_hot_live_ref.origin_node_id = cluster_node_id;
+		ClusterPageGetItlSlots((Page)fixture.live_page)[2].write_scn = UT_HOT_READ_SCN - 2;
+		(void)ut_r4_hot_build_page(fixture.full_source, UT_HOT_LIVE_XMIN, 1, UT_HOT_LIVE_XMIN, 4,
+								   UT_HOT_PAYLOAD);
+		ut_r4_hot_tuple_at((Page)fixture.full_source, UT_HOT_ROOT_OFF)->t_infomask
+			= HEAP_XMAX_INVALID;
+		PageSetLSN((Page)fixture.full_source, UINT64_C(0x123450));
+		fixture.mutate_hint_offset = UT_HOT_ROOT_OFF;
+		ut_r4_hot_reset_scratch_authority((Page)result.scratch_page, (Page)fixture.live_page,
+										  UT_HOT_READ_SCN, UINT64_C(0x123450));
+		ut_scratch_expected_ref.local_xid = UT_HOT_LIVE_XMIN;
+		ut_scratch_expected_xid = UT_HOT_LIVE_XMIN;
+		ut_scratch_resolve_status = leg == 2   ? CLUSTER_TT_STATUS_IN_PROGRESS
+									: leg == 3 ? CLUSTER_TT_STATUS_ABORTED
+											   : CLUSTER_TT_STATUS_COMMITTED;
+		ut_scratch_resolve_scn = UT_HOT_READ_SCN + (leg == 1 ? 1 : -1);
+		ut_live_visible_offnum = MaxHeapTuplesPerPage;
+		relation.rd_id = UT_HOT_TABLE_OID;
+		relation.rd_rel = &form;
+		form.relpersistence = RELPERSISTENCE_PERMANENT;
+		snapshot.snapshot_type = SNAPSHOT_MVCC;
+		snapshot.cluster_source = SNAPSHOT_SOURCE_CLUSTER;
+		snapshot.read_scn = UT_HOT_READ_SCN;
+		snapshot.read_epoch = 9;
+		ItemPointerSet(&tid, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+		kind = heap_hot_search_buffer_result(&tid, &relation, UT_HOT_BUFFER, &snapshot, &result,
+											 NULL, true);
+		UT_ASSERT_EQ(kind, leg == 0 ? HEAP_HOT_SEARCH_OWNED_SCRATCH : HEAP_HOT_SEARCH_NOT_FOUND);
+		UT_ASSERT_EQ(fixture.fetch_calls, 1);
+		UT_ASSERT_EQ(ut_live_visibility_calls, 0);
+		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
+		UT_ASSERT(ut_hot_content_lock_held);
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+		ut_hot_production_core_active = false;
+		ut_hot_product_fixture = NULL;
+		ut_hot_live_ref_page = NULL;
+		BufferBlocks = NULL;
+	}
+}
+
 /* Frozen creation is a tuple proof, not a claim that its old page slot still
  * names xmin.  Keep the real scratch evaluator and trap all live-page paths. */
 static void
@@ -6820,6 +6876,7 @@ main(void)
 	UT_RUN(test_post_snapshot_own_xmin_keeps_command_visibility);
 	UT_RUN(test_census_clearing_target_lock_returns_to_dml_owner);
 	UT_RUN(test_post_snapshot_matching_xmin_uses_holder_full);
+	UT_RUN(test_local_matching_creator_uses_statement_scn_not_native_membership);
 	UT_RUN(test_census_changed_page_returns_to_dml_requalification);
 	UT_RUN(test_hot_prune_without_xmin_hint_never_reads_requester_clog);
 	UT_RUN(test_hot_prune_preserves_excluded_tuple_snapshot_and_locator_shapes);

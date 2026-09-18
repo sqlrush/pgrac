@@ -135,6 +135,8 @@ static bool receipt_buffer_locked;
 static int receipt_prepare_calls;
 static int receipt_apply_calls;
 static int receipt_cancel_calls;
+static int receipt_cancel_fail_at;
+static uint32 receipt_child_attempt;
 static int receipt_leave_calls;
 static int receipt_unref_calls;
 static int receipt_install_calls;
@@ -418,6 +420,7 @@ cluster_ctrc_receipt_prepare_shared(
 {
 	UT_ASSERT_EQ(grant, 1);
 	UT_ASSERT_EQ(publication->wire_request_id, cluster_undo_record_reservation.sequence);
+	receipt_child_attempt = publication->attempt_generation;
 	memset(handle, 0, sizeof(*handle));
 	handle->valid = true;
 	receipt_prepare_calls++;
@@ -449,7 +452,7 @@ cluster_ctrc_receipt_cancel_shared(const ClusterCtrcReceiptHandle *handle)
 {
 	UT_ASSERT(handle->valid);
 	receipt_cancel_calls++;
-	return true;
+	return receipt_cancel_calls != receipt_cancel_fail_at;
 }
 
 
@@ -1892,6 +1895,7 @@ UT_TEST(test_terminal_census_precedes_final_receipt_recheck_and_itl_allocation)
 UT_TEST(test_ctrc_cross_page_update_requires_both_prepared_receipts)
 {
 	ClusterUndoRecordPrepareReceipt receipt = { 0 };
+	receipt.ctrc_attempt_generation = 1;
 
 	receipt.ctrc_pending_mask = UINT8_C(3);
 	receipt.ctrc_prepared_mask = UINT8_C(3);
@@ -2532,6 +2536,8 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt_buffer_available = true;
 	receipt_buffer_locked = false;
 	receipt_prepare_calls = receipt_apply_calls = receipt_cancel_calls = 0;
+	receipt_cancel_fail_at = 0;
+	receipt_child_attempt = 0;
 	receipt_leave_calls = receipt_unref_calls = receipt_install_calls = 0;
 	cluster_undo_current_extent.segment_id = 1;
 	cluster_undo_current_extent.first_block = 1;
@@ -2548,6 +2554,7 @@ receipt_fixture_ready(uint8 record_type, ClusterUndoRecordPrepareReceipt *receip
 	receipt->actual_segment_id = 1;
 	receipt->reservation_sequence = 17;
 	receipt->absolute_deadline_us = 100;
+	receipt->ctrc_attempt_generation = 1;
 	receipt->extent = cluster_undo_current_extent;
 	receipt->modifier_admission.entered = true;
 	reservation->active = true;
@@ -2762,6 +2769,155 @@ UT_TEST(test_prepare_budget_remains_ten_seconds_without_refresh)
 	UT_ASSERT_EQ(cluster_undo_record_prepare_deadline_us(), 0);
 	receipt_clock_us = PG_INT64_MAX - 1;
 	UT_ASSERT_EQ(cluster_undo_record_prepare_deadline_us(), 0);
+}
+
+static void
+receipt_update_targets_fixture(ClusterUndoRecordPrepareReceipt *receipt,
+							   ClusterCtrcTargetV1 targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS])
+{
+	receipt_fixture_ready(UNDO_RECORD_UPDATE, receipt);
+	memset(targets, 0, sizeof(*targets) * CLUSTER_UNDO_RECORD_CTRC_TARGETS);
+	for (int i = 0; i < CLUSTER_UNDO_RECORD_CTRC_TARGETS; i++) {
+		targets[i].kind = CTRC_TARGET_PAGE_PENDING_ITL_SLOT;
+		targets[i].spc_oid = 1663;
+		targets[i].db_oid = 5;
+		targets[i].rel_number = 16386;
+		targets[i].fork_number = MAIN_FORKNUM;
+		targets[i].block_number = 16949 + i;
+		targets[i].predecessor_page_lsn_origin_node_id = CLUSTER_CTRC_PAGE_LSN_ORIGIN_INVALID;
+		targets[i].publication_own_generation = 1;
+		targets[i].publication_acquisition_epoch = 7;
+		targets[i].relation_persistence = 'p';
+		targets[i].needs_wal = true;
+		targets[i].page_operation_kind = UNDO_RECORD_UPDATE;
+		receipt->ctrc_pending_targets[i] = targets[i];
+		receipt->ctrc_handles[i].valid = true;
+	}
+	receipt->ctrc_pending_mask = receipt->ctrc_prepared_mask = 3;
+	receipt->itl_history_mask = 3;
+	UT_ASSERT(cluster_undo_record_receipt_sync(receipt));
+	receipt_clock_us = 101;
+}
+
+UT_TEST(test_update_target_retry_keeps_ready_extent_deadline_and_owns_children)
+{
+	ClusterUndoRecordPrepareReceipt receipt, before;
+	ClusterCtrcTargetV1 targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+
+	receipt_update_targets_fixture(&receipt, targets);
+	before = receipt;
+	for (int pass = 0; pass < 3; pass++) {
+		uint8 mask = pass == 1 ? 1 : 3;
+		int cancels_before = receipt_cancel_calls;
+		int expected_cancels = pass == 2 ? 1 : 2;
+
+		targets[1].block_number += 5;
+		UT_ASSERT_EQ(cluster_undo_record_reset_update_targets(&receipt, targets, mask),
+					 CLUSTER_UNDO_TARGET_RESET_READY);
+		UT_ASSERT(cluster_undo_record_reservation.active);
+		UT_ASSERT(cluster_undo_record_reservation.owns_ref);
+		UT_ASSERT_EQ(receipt.magic, before.magic);
+		UT_ASSERT_EQ(receipt.reservation_sequence, before.reservation_sequence);
+		UT_ASSERT_EQ(receipt.absolute_deadline_us, before.absolute_deadline_us);
+		UT_ASSERT_EQ(memcmp(&receipt.extent, &before.extent, sizeof(receipt.extent)), 0);
+		UT_ASSERT_EQ(memcmp(&receipt.modifier_admission, &before.modifier_admission,
+							sizeof(receipt.modifier_admission)),
+					 0);
+		UT_ASSERT_EQ(receipt.ctrc_attempt_generation, 2 + pass);
+		UT_ASSERT_EQ(receipt.ctrc_pending_mask, mask);
+		UT_ASSERT_EQ(receipt.ctrc_prepared_mask | receipt.itl_history_mask, 0);
+		UT_ASSERT_EQ(receipt_cancel_calls - cancels_before, expected_cancels);
+		UT_ASSERT_EQ(receipt_leave_calls + receipt_unref_calls + receipt_apply_calls, 0);
+		UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 0));
+		if (mask == 3)
+			UT_ASSERT(cluster_undo_record_ctrc_prepare_pending(&receipt, 1));
+		UT_ASSERT_EQ(receipt_child_attempt, 2 + pass);
+	}
+}
+
+UT_TEST(test_update_target_retry_refuses_authority_and_publication_drift)
+{
+	for (int leg = 0; leg < 14; leg++) {
+		ClusterUndoRecordPrepareReceipt receipt, before;
+		ClusterCtrcTargetV1 targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+		uint8 mask = 3;
+
+		receipt_update_targets_fixture(&receipt, targets);
+		targets[1].block_number++;
+		switch (leg) {
+		case 0:
+			receipt.record_type = UNDO_RECORD_DELETE;
+			break;
+		case 1:
+			receipt.ctrc_applied_mask = 1;
+			break;
+		case 2:
+			cluster_undo_record_reservation.consume_locked = true;
+			break;
+		case 3:
+			cluster_undo_current_extent.cur_block++;
+			break;
+		case 4:
+			receipt_modifier_valid = false;
+			break;
+		case 5:
+			receipt_block0_valid = false;
+			break;
+		case 6:
+			targets[0].block_number++;
+			break;
+		case 7:
+			targets[1].rel_number++;
+			break;
+		case 8:
+			targets[1].publication_acquisition_epoch++;
+			break;
+		case 9:
+			targets[1].page_operation_kind = UNDO_RECORD_INSERT;
+			break;
+		case 10:
+			receipt.ctrc_attempt_generation = UINT32_MAX;
+			break;
+		case 11:
+			mask = 2;
+			break;
+		case 12:
+			targets[1].publication_own_generation = 0;
+			break;
+		case 13:
+			targets[1].block_number--;
+			break;
+		}
+		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+		before = receipt;
+		UT_ASSERT(!cluster_undo_record_reset_update_targets(&receipt, targets, mask));
+		UT_ASSERT_EQ(memcmp(&receipt, &before, sizeof(receipt)), 0);
+		UT_ASSERT_EQ(receipt_cancel_calls + receipt_leave_calls + receipt_unref_calls, 0);
+	}
+}
+
+UT_TEST(test_update_target_retry_retains_borrowed_and_failed_cancel_owners)
+{
+	for (int leg = 0; leg < 3; leg++) {
+		ClusterUndoRecordPrepareReceipt receipt, before;
+		ClusterCtrcTargetV1 targets[CLUSTER_UNDO_RECORD_CTRC_TARGETS];
+
+		receipt_update_targets_fixture(&receipt, targets);
+		targets[1].block_number++;
+		if (leg == 0)
+			receipt.ctrc_reuse_mask = 1;
+		else
+			receipt_cancel_fail_at = leg;
+		UT_ASSERT(cluster_undo_record_receipt_sync(&receipt));
+		before = receipt;
+		UT_ASSERT_EQ(cluster_undo_record_reset_update_targets(&receipt, targets, 3),
+					 leg == 0 ? CLUSTER_UNDO_TARGET_RESET_READY
+							  : CLUSTER_UNDO_TARGET_RESET_REFUSED);
+		UT_ASSERT_EQ(receipt_cancel_calls, leg == 2 ? 2 : 1);
+		UT_ASSERT_EQ(receipt_leave_calls + receipt_unref_calls + receipt_apply_calls, 0);
+		if (leg != 0)
+			UT_ASSERT_EQ(memcmp(&receipt, &before, sizeof(receipt)), 0);
+	}
 }
 
 UT_TEST(test_heap_retry_preserves_exact_ready_before_considering_cancel)
@@ -3492,6 +3648,9 @@ main(int argc, char **argv)
 	UT_RUN(test_ready_identity_mismatch_is_not_hidden_by_lifetime_fix);
 	UT_RUN(test_partial_apply_cancel_releases_only_unapplied_nonreuse_handle);
 	UT_RUN(test_prepare_budget_remains_ten_seconds_without_refresh);
+	UT_RUN(test_update_target_retry_keeps_ready_extent_deadline_and_owns_children);
+	UT_RUN(test_update_target_retry_refuses_authority_and_publication_drift);
+	UT_RUN(test_update_target_retry_retains_borrowed_and_failed_cancel_owners);
 	UT_RUN(test_heap_retry_preserves_exact_ready_before_considering_cancel);
 	UT_RUN(test_retry_requalification_keeps_ready_and_proves_actual_invalidation);
 	UT_RUN(test_retry_after_apply_refuses_without_canceling_shared_owner);

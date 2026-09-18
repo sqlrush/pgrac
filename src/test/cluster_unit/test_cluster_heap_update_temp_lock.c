@@ -482,11 +482,62 @@ UT_TEST(real_successor_preserves_all_other_planner_branches)
 		check_successor_header(leg);
 }
 
+static ClusterUndoTargetResetResult child_reset_result;
+static int child_reset_calls;
+
+ClusterUndoTargetResetResult
+cluster_undo_record_reset_update_targets(ClusterUndoRecordPrepareReceipt *receipt,
+										 const ClusterCtrcTargetV1 *targets, uint8 required_mask)
+{
+	UT_ASSERT(!content_locked);
+	UT_ASSERT_EQ(required_mask, 3);
+	child_reset_calls++;
+	return child_reset_result;
+}
+
+UT_TEST(real_update_child_rebind_refusal_cannot_fall_back)
+{
+	for (int leg = 0; leg < 6; leg++) {
+		ClusterUndoRecordPrepareReceipt undo_receipt = { 0 };
+		ClusterCanonicalTxnBinding canonical_binding = { 0 };
+		ClusterCtrcTargetV1 ctrc_pending_targets[2] = { 0 };
+		uint8 ctrc_required_mask = 3;
+		uint8 ctrc_failure_bits = leg == 4 ? 1 : 0;
+		volatile bool ctrc_target_mismatch = leg != 3;
+		volatile bool ctrc_prepare_only = false;
+		volatile bool caught = false;
+
+		content_locked = false;
+		child_reset_calls = 0;
+		child_reset_result = leg == 1	? CLUSTER_UNDO_TARGET_RESET_REFUSED
+							 : leg == 2 ? CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE
+										: CLUSTER_UNDO_TARGET_RESET_READY;
+		undo_receipt.tt_slot_segment_id = canonical_binding.segment_id = 17;
+		undo_receipt.tt_slot_offset = canonical_binding.slot_offset = 4;
+		if (leg == 5)
+			canonical_binding.slot_offset++;
+		PG_TRY();
+		{
+#include "test_cluster_heap_update_child_retry.inc"
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, leg == 1);
+		UT_ASSERT_EQ(child_reset_calls, leg < 3 ? 1 : 0);
+		UT_ASSERT_EQ(ctrc_prepare_only, leg == 0);
+		UT_ASSERT_EQ(ctrc_target_mismatch, leg != 0 && leg != 3);
+	}
+}
+
 int
 main(void)
 {
 	UT_PLAN(15);
 	UT_RUN(resume_never_replaces_a_live_receipt_or_renews_without_a_handoff);
+	UT_RUN(real_update_child_rebind_refusal_cannot_fall_back);
 	UT_RUN(real_toast_return_uses_the_completed_handoff_boundary);
 	UT_RUN(completed_nested_producer_starts_its_own_preparation_phase);
 	UT_RUN(real_successor_does_not_inherit_own_temporary_lock);

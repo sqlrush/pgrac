@@ -2338,6 +2338,7 @@ cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity, uint16 t
 	reservation->receipt.actual_segment_id = ext->segment_id;
 	reservation->receipt.reservation_sequence = reservation->sequence;
 	reservation->receipt.absolute_deadline_us = absolute_deadline_us;
+	reservation->receipt.ctrc_attempt_generation = 1;
 	reservation->receipt.extent = *ext;
 	reservation->receipt.block0_publication = publication;
 	reservation->receipt.modifier_admission = modifier_admission;
@@ -2431,9 +2432,7 @@ cluster_undo_record_ctrc_stage_pending(ClusterUndoRecordPrepareReceipt *receipt,
 		|| (receipt->ctrc_prepared_mask & target_bit) != 0
 		|| (receipt->ctrc_applied_mask & target_bit) != 0
 		|| (receipt->ctrc_reuse_mask & target_bit) != 0
-		|| receipt->ctrc_handles[target_ordinal].valid
-		|| !cluster_undo_record_bytes_zero(receipt->ctrc_reserved8,
-										   sizeof(receipt->ctrc_reserved8)))
+		|| receipt->ctrc_handles[target_ordinal].valid || receipt->ctrc_attempt_generation == 0)
 		return false;
 	if ((receipt->ctrc_pending_mask & target_bit) != 0)
 		return cluster_undo_record_ctrc_pending_recheck(receipt, target_ordinal, pending_target);
@@ -2462,8 +2461,7 @@ cluster_undo_record_ctrc_stage_reuse(ClusterUndoRecordPrepareReceipt *receipt, u
 		|| (receipt->ctrc_reuse_mask & target_bit) != 0
 		|| receipt->ctrc_handles[target_ordinal].valid
 		|| !cluster_undo_record_receipt_extent_matches(receipt)
-		|| !cluster_undo_record_bytes_zero(receipt->ctrc_reserved8,
-										   sizeof(receipt->ctrc_reserved8)))
+		|| receipt->ctrc_attempt_generation == 0)
 		return false;
 
 	old_handle = receipt->ctrc_handles[target_ordinal];
@@ -2530,8 +2528,7 @@ cluster_undo_record_ctrc_required_prepared(const ClusterUndoRecordPrepareReceipt
 		|| (receipt->ctrc_prepared_mask & known_mask) != required_mask
 		|| (receipt->ctrc_applied_mask & known_mask) != 0
 		|| (receipt->ctrc_reuse_mask & ~required_mask) != 0
-		|| !cluster_undo_record_bytes_zero(receipt->ctrc_reserved8,
-										   sizeof(receipt->ctrc_reserved8)))
+		|| receipt->ctrc_attempt_generation == 0)
 		return false;
 	for (target_ordinal = 0; target_ordinal < CLUSTER_UNDO_RECORD_CTRC_TARGETS; target_ordinal++) {
 		uint8 target_bit = UINT8_C(1) << target_ordinal;
@@ -2589,7 +2586,7 @@ cluster_undo_record_ctrc_prepare_pending(ClusterUndoRecordPrepareReceipt *receip
 	publication.operation_id = receipt->reservation_sequence + target_ordinal;
 	if (publication.operation_id < receipt->reservation_sequence)
 		return false;
-	publication.attempt_generation = 1;
+	publication.attempt_generation = receipt->ctrc_attempt_generation;
 	publication.descriptor_hash = 0;
 	publication.member_ordinal = UINT16_MAX;
 	publication.member_role = 0;
@@ -2703,6 +2700,83 @@ cluster_undo_record_retry_evidence(uint64 reservation_sequence, bool *exact_read
 	*exact_ready = cluster_undo_retry_cancel_snapshot.exact_ready;
 	*targets_invalidated = cluster_undo_retry_cancel_snapshot.targets_invalidated;
 	return true;
+}
+
+ClusterUndoTargetResetResult
+cluster_undo_record_reset_update_targets(ClusterUndoRecordPrepareReceipt *receipt,
+										 const ClusterCtrcTargetV1 *targets, uint8 required_mask)
+{
+	const ClusterCtrcTargetV1 *source;
+	bool changed;
+
+	cluster_undo_receipt_reason = "UPDATE_TARGET_REBIND_REFUSED";
+	if (receipt == NULL || targets == NULL || (required_mask != 1 && required_mask != 3)
+		|| receipt->record_type != UNDO_RECORD_UPDATE || receipt->ctrc_applied_mask != 0
+		|| cluster_undo_record_reservation.consume_locked || receipt->ctrc_attempt_generation == 0
+		|| receipt->ctrc_attempt_generation == UINT32_MAX
+		|| (receipt->ctrc_pending_mask != 1 && receipt->ctrc_pending_mask != 3)
+		|| (receipt->ctrc_prepared_mask & ~receipt->ctrc_pending_mask) != 0
+		|| (receipt->ctrc_reuse_mask & ~receipt->ctrc_prepared_mask) != 0
+		|| !cluster_undo_record_receipt_extent_matches(receipt))
+		return CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE;
+	source = &receipt->ctrc_pending_targets[0];
+	if (source->page_operation_kind != UNDO_RECORD_UPDATE
+		|| !cluster_undo_record_ctrc_pending_recheck(receipt, 0, &targets[0]))
+		return CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE;
+	changed = required_mask != receipt->ctrc_pending_mask;
+	for (uint8 i = 0; i < CLUSTER_UNDO_RECORD_CTRC_TARGETS; i++) {
+		uint8 bit = UINT8_C(1) << i;
+		const ClusterCtrcTargetV1 *target = &targets[i];
+
+		if (((receipt->ctrc_prepared_mask & bit) != 0) != receipt->ctrc_handles[i].valid)
+			return CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE;
+		if ((required_mask & bit) == 0)
+			continue;
+		/* A destination may move within this relation, not to a different
+		 * namespace, membership or producer. Self-recheck validates every
+		 * pending-only byte before an old child is cancelled. */
+		if (!cluster_ctrc_pending_itl_target_recheck(target, target)
+			|| target->spc_oid != source->spc_oid || target->db_oid != source->db_oid
+			|| target->rel_number != source->rel_number
+			|| target->fork_number != source->fork_number
+			|| target->relation_persistence != source->relation_persistence
+			|| target->needs_wal != source->needs_wal
+			|| target->page_operation_kind != source->page_operation_kind
+			|| target->publication_acquisition_epoch != source->publication_acquisition_epoch)
+			return CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE;
+		changed |= !cluster_undo_record_ctrc_pending_recheck(receipt, i, target);
+	}
+	if (!changed
+		|| !cluster_semantic_activation_modifier_recheck(&receipt->modifier_admission,
+														 cluster_undo_record_writable_admission())
+		|| !cluster_undo_block0_current_live_owner_publication_recheck(
+			&receipt->block0_publication))
+		return CLUSTER_UNDO_TARGET_RESET_NOT_APPLICABLE;
+
+	/* No heap lock is held. A borrowed APPLIED reference is owned by its
+	 * existing touch/cleaner, never by this unpublished UPDATE intent.
+	 * Keep all private identities until every owned cancellation succeeds;
+	 * partial failure is an error, with original handles available to abort. */
+	for (uint8 i = 0; i < CLUSTER_UNDO_RECORD_CTRC_TARGETS; i++) {
+		uint8 bit = UINT8_C(1) << i;
+
+		if ((receipt->ctrc_prepared_mask & bit) != 0 && (receipt->ctrc_reuse_mask & bit) == 0
+			&& !cluster_ctrc_receipt_cancel_shared(&receipt->ctrc_handles[i]))
+			return CLUSTER_UNDO_TARGET_RESET_REFUSED;
+	}
+	memset(receipt->ctrc_handles, 0, sizeof(receipt->ctrc_handles));
+	memset(receipt->ctrc_pending_targets, 0, sizeof(receipt->ctrc_pending_targets));
+	memset(receipt->itl_history, 0, sizeof(receipt->itl_history));
+	receipt->ctrc_prepared_mask = receipt->ctrc_reuse_mask = receipt->itl_history_mask = 0;
+	receipt->ctrc_pending_mask = required_mask;
+	for (uint8 i = 0; i < CLUSTER_UNDO_RECORD_CTRC_TARGETS; i++)
+		if ((required_mask & (UINT8_C(1) << i)) != 0)
+			receipt->ctrc_pending_targets[i] = targets[i];
+	receipt->ctrc_attempt_generation++;
+	if (!cluster_undo_record_receipt_sync(receipt))
+		return CLUSTER_UNDO_TARGET_RESET_REFUSED;
+	cluster_undo_receipt_reason = "NONE";
+	return CLUSTER_UNDO_TARGET_RESET_READY;
 }
 
 ClusterUndoRecordPrepareResult

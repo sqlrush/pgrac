@@ -4691,7 +4691,14 @@ test_cluster_heap_prepare_diagnostic.inc: $(top_srcdir)/src/backend/access/heap/
 test_cluster_heap_prepare_diagnostic: test_cluster_heap_prepare_diagnostic.c unit_test.h test_cluster_heap_prepare_diagnostic.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
-test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc test_cluster_heap_update_toast_resume.inc
+# PGRAC: actual unlocked UPDATE child-intent decision, including refusal.
+test_cluster_heap_update_child_retry.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/if \(ctrc_target_mismatch && \(ctrc_failure_bits/ { emit=1; found++ } \
+	     emit && /if \(ctrc_prepare_only && !ctrc_target_mismatch\)/ { emit=0; done++ } \
+	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_test.h test_cluster_heap_update_temp_lock.inc test_cluster_heap_update_temp_consumer.inc test_cluster_heap_lock_return_receipt.inc test_cluster_heap_update_successor_header.inc test_cluster_heap_update_toast_resume.inc test_cluster_heap_update_child_retry.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \

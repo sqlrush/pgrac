@@ -4820,7 +4820,11 @@ heap_hot_r4_data_slot(uint8 flags)
  * raw xmin is not a creator locator: it is the approved signal to request a
  * complete holder-built block and restart from the logical HOT root.  A
  * matching creator written after the statement SCN needs the same FULL path;
- * the older version may require another instance's undo.  Our own creator
+ * the older version may require another instance's undo. Another local
+ * transaction also needs FULL: native snapshot membership can still include
+ * it after the predecessor's canonical commit is visible at read_scn. Mixing
+ * those two verdicts loses both versions in the commit-publication window.
+ * Our own creator
  * keeps the ordinary command-id visibility path; a foreign numeric xid match
  * is not our transaction.
  */
@@ -4861,6 +4865,8 @@ heap_hot_r4_updated_xmin_needs_full(Page page, HeapTuple tuple,
 	return heap_hot_r4_data_slot(slot->flags) && cluster_itl_get_tt_ref(page, itl_index, &ref)
 		   && ref.tt_slot_id != 0 && TransactionIdIsNormal(ref.local_xid)
 		   && (!TransactionIdEquals(ref.local_xid, raw_xmin)
+			   || (ref.origin_node_id == cluster_node_id
+				   && !TransactionIdIsCurrentTransactionId(ref.local_xid))
 			   || (SCN_VALID(slot->write_scn)
 				   && !(ref.origin_node_id == cluster_node_id
 						&& TransactionIdIsCurrentTransactionId(ref.local_xid))
@@ -13459,6 +13465,30 @@ l_pgrac_reacquire:
 					}
 				}
 				LockBuffer(buffer, BUFFER_LOCK_UNLOCK);
+				/* A different insertion page invalidates its unpublished
+				 * child intent, not an otherwise exact READY undo extent.
+				 * Rebind only a completely captured UPDATE target set, with
+				 * both pages unlocked; the next pass still rechecks and APPLYs
+				 * under current content-X before any reference is published. */
+				if (ctrc_target_mismatch && (ctrc_failure_bits & UINT8_C(3)) == 0
+					&& undo_receipt.tt_slot_segment_id == (uint16)canonical_binding.segment_id
+					&& undo_receipt.tt_slot_offset == canonical_binding.slot_offset)
+				{
+					ClusterUndoTargetResetResult reset_result
+						= cluster_undo_record_reset_update_targets(
+							&undo_receipt, ctrc_pending_targets, ctrc_required_mask);
+
+					if (reset_result == CLUSTER_UNDO_TARGET_RESET_REFUSED)
+						ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_UNDO_RECORD_INVALID_UBA),
+							 errmsg("UPDATE target intent cancellation could not be proved"),
+							 cluster_heap_undo_receipt_errdetail(true)));
+					if (reset_result == CLUSTER_UNDO_TARGET_RESET_READY)
+					{
+						ctrc_target_mismatch = false;
+						ctrc_prepare_only = true;
+					}
+				}
 				if (ctrc_prepare_only && !ctrc_target_mismatch)
 				{
 					for (ctrc_target_ordinal = 0;
