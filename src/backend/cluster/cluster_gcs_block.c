@@ -3136,6 +3136,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 	bool terminal_denied = false;
 	bool retry_denied = false;
 	bool read_capacity_refused = false;
+	bool request_admitted = false;
 	bool retransmit_warning_emitted = false;
 	bool suppress_direct_land = false;
 	bool awaiting_holder_refusal_master_cleanup = false;
@@ -3247,6 +3248,7 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			TimestampTz deadline;
 			bool got_reply = false;
 			bool direct_authoritative_denial = false;
+			bool request_enqueued;
 
 			/* Apply backoff for retry attempts (not the initial send). */
 			if (retry_attempt > 0) {
@@ -3333,9 +3335,11 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 			else
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_send_count, 1);
 
-			if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_REQUEST,
-														  (uint32)current_master, &payload,
-														  sizeof(payload))) {
+			request_enqueued = cluster_grd_outbound_enqueue_backend_msg(
+				PGRAC_IC_MSG_GCS_BLOCK_REQUEST, (uint32)current_master, &payload, sizeof(payload));
+			if (request_enqueued)
+				request_admitted = true;
+			else if (!request_admitted || !xp_is_read || clean_eligible) {
 				BufferDesc *direct_target_buf = NULL;
 				bool direct_prepared = false;
 
@@ -3357,6 +3361,14 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 				}
 				gcs_block_direct_finish_target(direct_target_buf, direct_prepared, false,
 											   InvalidXLogRecPtr);
+				if (xp_is_read && !clean_eligible && !request_admitted) {
+					/* No frame was published: there is no remote completion to
+					 * acknowledge. The existing bufmgr owner must exact-abort
+					 * its GRANT_PENDING reservation before yielding/rearming. */
+					read_capacity_refused = true;
+					retry_denied = true;
+					break;
+				}
 				ereport(
 					ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -3369,6 +3381,10 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 						 cluster_node_id)));
 			}
 
+			/* If only a retransmit was refused, the original admitted request
+			 * still owns its reply. Use this attempt's existing response period
+			 * and retry allowance, not a new unbounded staging wait: the wire
+			 * lifetime hint also bounds the master's dedup retention. */
 			deadline = GetCurrentTimestamp()
 					   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
 
