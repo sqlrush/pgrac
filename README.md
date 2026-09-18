@@ -6,9 +6,9 @@ PostgreSQL has never had a shared-disk, multi-active cluster (its HA is
 shared-nothing replication). pgrac brings the Oracle RAC model — many nodes,
 one shared database, Cache Fusion / SCN / GES — to PostgreSQL 16.13.
 
-> **First stable MVP: [v0.130.0](docs/release-notes/v0.130.0.md).**
+> **Current stable MVP: [v0.130.1](docs/release-notes/v0.130.1.md).**
 >
-> The CI-qualified MVP now has four valid four-node point-update samples with
+> This correctness maintenance release has four valid four-node point-update samples with
 > 32 clients per node, complete million-row data comparisons, health and
 > outstanding-work checks, and normal shutdown. It also retains the earlier
 > 8/16-client, soak, block-transfer and same-data normal-restart acceptance.
@@ -63,8 +63,8 @@ More diagrams and deep-dives at **[pgrac.dev](https://pgrac.dev)**.
 
 ## Documentation
 
-Start with the [stable MVP guide](docs/mvp/v0.130.0/README.md) and
-[single-host Linux Quick Start](docs/mvp/v0.130.0/quickstart-linux-single-host.md).
+Start with the [stable MVP guide](docs/mvp/v0.130.1/README.md) and
+[single-host Linux Quick Start](docs/mvp/v0.130.1/quickstart-linux-single-host.md).
 The guide links the parameter, system-view and capability references, and
 distinguishes tested single-host operation from unqualified multi-host/failover
 deployment. The historical prerelease manual remains available unchanged.
@@ -87,11 +87,11 @@ from the upstream tree.
 ## Quick start
 
 For the stable MVP, follow the
-[single-host Linux guide](docs/mvp/v0.130.0/quickstart-linux-single-host.md).
+[single-host Linux guide](docs/mvp/v0.130.1/quickstart-linux-single-host.md).
 This is a source release, not a turnkey production installer.
 
 ```bash
-git clone --branch v0.130.0 --single-branch \
+git clone --branch v0.130.1 --single-branch \
   https://github.com/sqlrush/pgrac.git pgrac-mvp1
 cd pgrac-mvp1
 git rev-parse HEAD
