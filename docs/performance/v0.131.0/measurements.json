@@ -1,0 +1,629 @@
+{
+  "schema": "pgrac-v0.131.0-performance-report-v1",
+  "author": "SqlRush <sqlrush@gmail.com>",
+  "as_of": "2026-09-20",
+  "product_source_commit": "83d8c5a002643581f153058b7a766afe1ffa1eb0",
+  "main_integration_commit": "7081edf0422ae04f1b3dcc28785b9d4d98e724d7",
+  "scope": {
+    "instances": 4,
+    "clients_per_instance": 32,
+    "warmup_seconds": 5,
+    "measurement_seconds": 35,
+    "rows": 1000000,
+    "postgresql_base": "16.13",
+    "environment": "Single-host Linux virtual-machine laboratory; not a four-physical-host experiment"
+  },
+  "definitions": {
+    "measurement_phase_mean_ms": "exclusive phase total_ns / measurement_successes / 1000000; not per invocation",
+    "executor_conservation": "sum(exclusive_phases.total_ns) + unattributed_ns = timing_ns.server_executor_ns",
+    "client_conservation": "server_executor_ns + outside_executor_ns + client_commit_ns = client_wall_ns",
+    "trace_status": "Control has one real error and is retained as a failed diagnostic; successful records describe mechanisms only. Candidate diagnostic is error-free.",
+    "origin_residence": "Per matched undo dependency on origin monotonic clock. Overlaps requester waiting; not additive to per-UPDATE or client time.",
+    "throughput_scope": "Tracing disabled for ABBA and formal PRE. ABBA arms share correctness fixes; not historical unmodified stable-release comparison.",
+    "prediction": "No throughput prediction is derived from diagnostic averages."
+  },
+  "trace": {
+    "control": {
+      "binary_sha256": "e02b28c3fb9b395abe7ab9b9c0a064992b21a156d100f7ee1ddd698608df910e",
+      "attribution_sha256": "67cffba6a0c2316c941dbadd7654519865169232e0c60cab2a59dfe352f01cbc",
+      "cr_service_sha256": "77c83f3bfc45ec31242090f42f35b581b703cb260fbc6420e577fd1a2467d496",
+      "all_attempts": 25426,
+      "all_status_counts": {
+        "0": 25425,
+        "1": 1
+      },
+      "measurement_successes": 21350,
+      "complete_identity_coverage": true,
+      "client_dropped": 0,
+      "server_record_dropped": 0,
+      "server_event_dropped": 0,
+      "measurement": {
+        "timing_ns": {
+          "client_commit_ns": 325957481358,
+          "client_update_ns": 4199164881668,
+          "client_wall_ns": 4525122363026,
+          "matched_records": 21350,
+          "missing_timing_records": 0,
+          "outside_executor_ns": 6655873109,
+          "server_executor_ns": 4192509008559
+        },
+        "exclusive_phases": [
+          {
+            "phase": "r4_cr_fetch",
+            "total_ns": 2439922868707,
+            "events": 26331
+          },
+          {
+            "phase": "resource_x_acquire",
+            "total_ns": 389601985610,
+            "events": 52191
+          },
+          {
+            "phase": "undo_verdict_rpc",
+            "total_ns": 300644535484,
+            "events": 103043
+          },
+          {
+            "phase": "update_scan",
+            "total_ns": 252146309353,
+            "events": 42700
+          },
+          {
+            "phase": "update_storage",
+            "total_ns": 219458804237,
+            "events": 21933
+          },
+          {
+            "phase": "r_gcs_s_request",
+            "total_ns": 201725470893,
+            "events": 46621
+          },
+          {
+            "phase": "r4_tx_rpc",
+            "total_ns": 139672658861,
+            "events": 5011
+          },
+          {
+            "phase": "buffer_lock",
+            "total_ns": 134595967162,
+            "events": 400931
+          },
+          {
+            "phase": "i_tx_wait",
+            "total_ns": 78840404804,
+            "events": 62
+          },
+          {
+            "phase": "w_ges_wait",
+            "total_ns": 16422375207,
+            "events": 15947
+          },
+          {
+            "phase": "update_index",
+            "total_ns": 10867566546,
+            "events": 478
+          },
+          {
+            "phase": "undo_receipt_prepare",
+            "total_ns": 3373709466,
+            "events": 24126
+          },
+          {
+            "phase": "r_tt_visibility_resolve",
+            "total_ns": 495398509,
+            "events": 96988
+          },
+          {
+            "phase": "w_ges_enqueue",
+            "total_ns": 182660148,
+            "events": 15947
+          },
+          {
+            "phase": "w_hw_extend",
+            "total_ns": 170588069,
+            "events": 27
+          },
+          {
+            "phase": "r_gcs_s_receive",
+            "total_ns": 56492670,
+            "events": 46060
+          },
+          {
+            "phase": "local_undo_itl_wal",
+            "total_ns": 12820257,
+            "events": 67060
+          },
+          {
+            "phase": "i_itl_wait",
+            "total_ns": 34043,
+            "events": 4
+          }
+        ],
+        "unattributed_ns": 4318358533,
+        "accounting_fault_ops": 0
+      },
+      "slowest_client_20_percent": {
+        "count": 4270,
+        "p80_ns": 214179027,
+        "timing_ns": {
+          "client_commit_ns": 67228281011,
+          "client_update_ns": 3046203964671,
+          "client_wall_ns": 3113432245682,
+          "matched_records": 4270,
+          "missing_timing_records": 0,
+          "outside_executor_ns": 1551308804,
+          "server_executor_ns": 3044652655867
+        },
+        "exclusive_phases": [
+          {
+            "phase": "r4_cr_fetch",
+            "total_ns": 2078314086627,
+            "events": 11230
+          },
+          {
+            "phase": "resource_x_acquire",
+            "total_ns": 226829697864,
+            "events": 16159
+          },
+          {
+            "phase": "undo_verdict_rpc",
+            "total_ns": 138866430142,
+            "events": 47793
+          },
+          {
+            "phase": "r4_tx_rpc",
+            "total_ns": 138203660067,
+            "events": 4843
+          },
+          {
+            "phase": "update_scan",
+            "total_ns": 125534436531,
+            "events": 8540
+          },
+          {
+            "phase": "buffer_lock",
+            "total_ns": 102888674166,
+            "events": 121241
+          },
+          {
+            "phase": "i_tx_wait",
+            "total_ns": 78840403263,
+            "events": 61
+          },
+          {
+            "phase": "r_gcs_s_request",
+            "total_ns": 76291172169,
+            "events": 15862
+          },
+          {
+            "phase": "update_storage",
+            "total_ns": 59566938506,
+            "events": 4632
+          },
+          {
+            "phase": "update_index",
+            "total_ns": 10282856465,
+            "events": 417
+          },
+          {
+            "phase": "w_ges_wait",
+            "total_ns": 4425967521,
+            "events": 3240
+          },
+          {
+            "phase": "undo_receipt_prepare",
+            "total_ns": 953444570,
+            "events": 6259
+          },
+          {
+            "phase": "r_tt_visibility_resolve",
+            "total_ns": 418775639,
+            "events": 23046
+          },
+          {
+            "phase": "w_hw_extend",
+            "total_ns": 170588069,
+            "events": 27
+          },
+          {
+            "phase": "w_ges_enqueue",
+            "total_ns": 35040067,
+            "events": 3240
+          },
+          {
+            "phase": "r_gcs_s_receive",
+            "total_ns": 19146375,
+            "events": 15442
+          },
+          {
+            "phase": "local_undo_itl_wal",
+            "total_ns": 3027559,
+            "events": 15505
+          },
+          {
+            "phase": "i_itl_wait",
+            "total_ns": 34043,
+            "events": 4
+          }
+        ],
+        "unattributed_ns": 3008276224
+      },
+      "cr_service": {
+        "complete_episodes": 26335,
+        "selected_physical_requests": 163204,
+        "requests_without_complete_episode": 136869,
+        "incomplete_episodes": 0,
+        "unlinked_episodes": 0,
+        "slot_wall_ns": 339659198135,
+        "phases_ns": {
+          "build_call": 46392453,
+          "claimed_wait": 10039965,
+          "post_build": 6228910,
+          "queued": 134753436529,
+          "shipping": 387534568,
+          "terminal_wait": 4910424,
+          "undo_inflight": 137016423911,
+          "undo_ready_wait": 55155720422,
+          "undo_send_wait": 12278510953
+        },
+        "origin_dependency_requests": 6819,
+        "origin_completed_requests": 6819,
+        "origin_incomplete_intervals": 0,
+        "origin_dependencies_without_send": 0,
+        "origin_phase_ns": {
+          "4:1": 81008917047,
+          "4:10": 5010689620,
+          "4:11": 296454996,
+          "4:12": 5335853538,
+          "4:13": 34743857,
+          "4:14": 51029934,
+          "4:15": 4950865188,
+          "4:16": 85639658,
+          "4:2": 5867381680,
+          "4:3": 36616548,
+          "4:4": 55205779,
+          "4:5": 5510649143,
+          "4:6": 77154905,
+          "4:7": 9398892880,
+          "4:8": 29237823,
+          "4:9": 54501588
+        }
+      }
+    },
+    "candidate": {
+      "binary_sha256": "4cbbc0b87505453b6940e207916b8b975ff93e9cdb49373638d49d41f4ba8550",
+      "attribution_sha256": "c7f1dc0a54ed4f0f04d46e8f1eb334e48a57bbdd55fc1c4bcd411729daf56e19",
+      "cr_service_sha256": "e4bc8e05f48ce9a6767f20ff79a70f728f2bf6da4bfc1c210decd6b5159a272b",
+      "all_attempts": 53880,
+      "all_status_counts": {
+        "0": 53880
+      },
+      "measurement_successes": 48939,
+      "complete_identity_coverage": true,
+      "client_dropped": 0,
+      "server_record_dropped": 0,
+      "server_event_dropped": 0,
+      "measurement": {
+        "timing_ns": {
+          "client_commit_ns": 663145470632,
+          "client_update_ns": 3884923831677,
+          "client_wall_ns": 4548069302309,
+          "matched_records": 48939,
+          "missing_timing_records": 0,
+          "outside_executor_ns": 12602641855,
+          "server_executor_ns": 3872321189822
+        },
+        "exclusive_phases": [
+          {
+            "phase": "resource_x_acquire",
+            "total_ns": 755311464665,
+            "events": 118772
+          },
+          {
+            "phase": "undo_verdict_rpc",
+            "total_ns": 679553257774,
+            "events": 183895
+          },
+          {
+            "phase": "update_scan",
+            "total_ns": 587112704223,
+            "events": 97878
+          },
+          {
+            "phase": "r_gcs_s_request",
+            "total_ns": 574438749878,
+            "events": 103871
+          },
+          {
+            "phase": "r4_cr_fetch",
+            "total_ns": 529027069999,
+            "events": 52043
+          },
+          {
+            "phase": "update_storage",
+            "total_ns": 277044633785,
+            "events": 49627
+          },
+          {
+            "phase": "buffer_lock",
+            "total_ns": 240286573096,
+            "events": 889732
+          },
+          {
+            "phase": "i_tx_wait",
+            "total_ns": 107405728490,
+            "events": 97
+          },
+          {
+            "phase": "r4_tx_rpc",
+            "total_ns": 46480023810,
+            "events": 8900
+          },
+          {
+            "phase": "w_ges_wait",
+            "total_ns": 34626869634,
+            "events": 36725
+          },
+          {
+            "phase": "update_index",
+            "total_ns": 27222482721,
+            "events": 1620
+          },
+          {
+            "phase": "undo_receipt_prepare",
+            "total_ns": 7532831333,
+            "events": 54328
+          },
+          {
+            "phase": "r_tt_visibility_resolve",
+            "total_ns": 995122488,
+            "events": 226504
+          },
+          {
+            "phase": "w_ges_enqueue",
+            "total_ns": 718614945,
+            "events": 36725
+          },
+          {
+            "phase": "w_hw_extend",
+            "total_ns": 607490746,
+            "events": 75
+          },
+          {
+            "phase": "r_gcs_s_receive",
+            "total_ns": 136136356,
+            "events": 102462
+          },
+          {
+            "phase": "local_undo_itl_wal",
+            "total_ns": 27602970,
+            "events": 156606
+          },
+          {
+            "phase": "i_itl_wait",
+            "total_ns": 228778,
+            "events": 38
+          }
+        ],
+        "unattributed_ns": 3793604131,
+        "accounting_fault_ops": 0
+      },
+      "slowest_client_20_percent": {
+        "count": 9788,
+        "p80_ns": 109318107,
+        "timing_ns": {
+          "client_commit_ns": 154171648518,
+          "client_update_ns": 2082626046411,
+          "client_wall_ns": 2236797694929,
+          "matched_records": 9788,
+          "missing_timing_records": 0,
+          "outside_executor_ns": 3048010690,
+          "server_executor_ns": 2079578035721
+        },
+        "exclusive_phases": [
+          {
+            "phase": "resource_x_acquire",
+            "total_ns": 402173083097,
+            "events": 34248
+          },
+          {
+            "phase": "undo_verdict_rpc",
+            "total_ns": 346902725468,
+            "events": 83397
+          },
+          {
+            "phase": "update_scan",
+            "total_ns": 316822217472,
+            "events": 19576
+          },
+          {
+            "phase": "r4_cr_fetch",
+            "total_ns": 310504928519,
+            "events": 20223
+          },
+          {
+            "phase": "r_gcs_s_request",
+            "total_ns": 266650220803,
+            "events": 33836
+          },
+          {
+            "phase": "buffer_lock",
+            "total_ns": 159251499704,
+            "events": 251384
+          },
+          {
+            "phase": "i_tx_wait",
+            "total_ns": 107405728490,
+            "events": 97
+          },
+          {
+            "phase": "update_storage",
+            "total_ns": 85807130130,
+            "events": 10245
+          },
+          {
+            "phase": "r4_tx_rpc",
+            "total_ns": 43967037296,
+            "events": 8028
+          },
+          {
+            "phase": "update_index",
+            "total_ns": 25970705917,
+            "events": 1285
+          },
+          {
+            "phase": "w_ges_wait",
+            "total_ns": 8019559390,
+            "events": 7439
+          },
+          {
+            "phase": "undo_receipt_prepare",
+            "total_ns": 1914313841,
+            "events": 13805
+          },
+          {
+            "phase": "r_tt_visibility_resolve",
+            "total_ns": 844677360,
+            "events": 56875
+          },
+          {
+            "phase": "w_hw_extend",
+            "total_ns": 525077932,
+            "events": 65
+          },
+          {
+            "phase": "w_ges_enqueue",
+            "total_ns": 132689512,
+            "events": 7439
+          },
+          {
+            "phase": "r_gcs_s_receive",
+            "total_ns": 43393429,
+            "events": 32650
+          },
+          {
+            "phase": "local_undo_itl_wal",
+            "total_ns": 7913905,
+            "events": 36519
+          },
+          {
+            "phase": "i_itl_wait",
+            "total_ns": 228778,
+            "events": 38
+          }
+        ],
+        "unattributed_ns": 2634904678
+      },
+      "cr_service": {
+        "complete_episodes": 52043,
+        "selected_physical_requests": 59793,
+        "requests_without_complete_episode": 7750,
+        "incomplete_episodes": 0,
+        "unlinked_episodes": 0,
+        "slot_wall_ns": 99155861845,
+        "phases_ns": {
+          "build_call": 77052602,
+          "claimed_wait": 18083356,
+          "post_build": 9281908,
+          "queued": 76093258585,
+          "shipping": 717378860,
+          "terminal_wait": 8966939,
+          "undo_inflight": 15821558621,
+          "undo_ready_wait": 2924671081,
+          "undo_send_wait": 3485609893
+        },
+        "origin_dependency_requests": 3586,
+        "origin_completed_requests": 3586,
+        "origin_incomplete_intervals": 0,
+        "origin_dependencies_without_send": 0,
+        "origin_phase_ns": {
+          "4:1": 790617025,
+          "4:11": 134509687,
+          "4:12": 21766188,
+          "4:13": 12928025,
+          "4:14": 1286476,
+          "4:16": 34658000,
+          "4:2": 141419303,
+          "4:3": 18962115,
+          "4:4": 1824555,
+          "4:6": 7527839,
+          "4:7": 521209502,
+          "4:8": 9279179,
+          "4:9": 1399992
+        }
+      }
+    }
+  },
+  "throughput": {
+    "abba": [
+      {
+        "order": 1,
+        "arm": "control",
+        "commits": 7450,
+        "seconds": 35,
+        "tps": 212.85714285714286,
+        "correctness": "PASS"
+      },
+      {
+        "order": 2,
+        "arm": "candidate",
+        "commits": 49808,
+        "seconds": 35,
+        "tps": 1423.0857142857142,
+        "correctness": "PASS"
+      },
+      {
+        "order": 3,
+        "arm": "candidate",
+        "commits": 48695,
+        "seconds": 35,
+        "tps": 1391.2857142857142,
+        "correctness": "PASS"
+      },
+      {
+        "order": 4,
+        "arm": "control",
+        "commits": 30766,
+        "seconds": 35,
+        "tps": 879.0285714285715,
+        "correctness": "PASS"
+      }
+    ],
+    "formal_pre_tps_reported": [
+      1364.62,
+      1167.14,
+      1087.36,
+      1082.45
+    ],
+    "formal_pre_commits": [
+      47762,
+      40850,
+      38058,
+      37886
+    ],
+    "formal_pre_median_reported": 1127.25,
+    "formal_pre_peak_reported": 1364.62,
+    "formal_pre_valid_samples": 4,
+    "formal_pre_required_samples": 4,
+    "formal_pre_unexpected_errors": 0,
+    "formal_pre_forced_cancellations": 0,
+    "formal_pre_host_power": "OS reported battery operation; not a matched power/thermal performance comparison",
+    "formal_pre_result_sha256": "ba82f9982e7f3d2d9773a9dfb48a83e485881e8e281f009e1cc25d964ca11acb"
+  },
+  "sources": [
+    {
+      "name": "Frozen product source",
+      "url": "https://github.com/sqlrush/pgrac/tree/83d8c5a002643581f153058b7a766afe1ffa1eb0"
+    },
+    {
+      "name": "Published qualification",
+      "url": "https://github.com/sqlrush/pgrac/releases/download/v0.131.0/v0.131.0-qualification.json",
+      "sha256": "b6f33095d9453259c01390afe2cae7aa2f198c7247d0748328c1230ce17f8356"
+    },
+    {
+      "name": "Published exact-commit CI evidence",
+      "url": "https://github.com/sqlrush/pgrac/releases/download/v0.131.0/v0.131.0-ci-evidence.json",
+      "sha256": "ffad489f5248a0def9cc2e226e6dd1f458596de74a6167f7afea44cc2f1b9fda"
+    }
+  ]
+}
