@@ -39,15 +39,23 @@ jobs:
         run: sudo podman build --network=host -t localhost/pgrac-demo:v0.131.0-demo.1 deploy/demo
       - name: Four Pods, full rows, workload, normal restart, workload
         run: deploy/demo/ci-smoke.sh localhost/pgrac-demo:v0.131.0-demo.1
-      - name: Retain secret-free summaries
+      - name: Retain summaries and runtime-only failure evidence
         if: always()
         run: |
           mkdir -p demo-results
+          sudo podman ps -a > demo-results/containers.txt
+          for node in 0 1 2 3; do
+            sudo podman logs "pgrac-ci-demo-$node-db" > "demo-results/container-$node.log" 2>&1 || true
+            if sudo test -f "/var/lib/pgrac-demo/ci-demo/storage/server-log/node$node.log"; then
+              sudo cp "/var/lib/pgrac-demo/ci-demo/storage/server-log/node$node.log" "demo-results/server-$node.log"
+            fi
+          done
+          # Never export bootstrap logs, credentials, settings or entire PGDATA.
           if sudo test -d /var/lib/pgrac-demo/ci-demo/reports; then
             sudo find /var/lib/pgrac-demo/ci-demo/reports -name summary.json -type f \
               -exec cp --parents '{}' "$PWD/demo-results" \;
-            sudo chown -R "$(id -u):$(id -g)" demo-results
           fi
+          sudo chown -R "$(id -u):$(id -g)" demo-results
       - uses: actions/upload-artifact@v4
         if: always()
         with:
