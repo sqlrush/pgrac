@@ -1,0 +1,42 @@
+# Single-host customer demo. Author: SqlRush <sqlrush@gmail.com>
+FROM docker.io/library/ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential bison flex pkg-config curl ca-certificates libreadline-dev \
+    zlib1g-dev libssl-dev libicu-dev liblz4-dev libzstd-dev perl libipc-run-perl
+WORKDIR /build
+RUN curl --fail --location --retry 3 --output source.tar.gz \
+    https://codeload.github.com/sqlrush/pgrac/tar.gz/83d8c5a002643581f153058b7a766afe1ffa1eb0 \
+    && echo 'c5b37e5413db30d3a882da4eac9b52208e9dafeb7b5175d1d6c5caff3201d1f2  source.tar.gz' | sha256sum -c - \
+    && tar -xzf source.tar.gz --strip-components=1
+RUN ./configure --prefix=/opt/pgrac --enable-cluster --enable-tap-tests \
+    --with-openssl --with-icu --with-lz4 --with-zstd \
+    && make -j4 && make install && make -C src/test/regress pg_regress \
+    && mkdir -p /opt/pgrac/test /opt/pgrac/licenses \
+    && cp -a src/test/perl /opt/pgrac/test/ \
+    && cp src/test/regress/pg_regress /opt/pgrac/test/ \
+    && cp COPYRIGHT /opt/pgrac/licenses/PostgreSQL-COPYRIGHT \
+    && sha256sum /opt/pgrac/bin/postgres > /opt/pgrac/postgres.sha256
+
+FROM docker.io/library/ubuntu:24.04@sha256:008173c23f95b170204355c12626cb5a965d779a7e1283b09e9cffbb1bf33ca3
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates libreadline8t64 zlib1g libssl3t64 libicu74 liblz4-1 libzstd1 \
+    python3 perl libipc-run-perl procps util-linux \
+    && groupadd --gid 10001 pgrac && useradd --uid 10001 --gid 10001 --create-home pgrac
+COPY --from=build /opt/pgrac /opt/pgrac
+COPY bootstrap.pl entrypoint.py demo_lib.py /opt/pgrac/demo/
+COPY sql /opt/pgrac/demo/sql
+LABEL org.opencontainers.image.title="PGRAC single-host four-Pod demo" \
+      org.opencontainers.image.source="https://github.com/sqlrush/pgrac" \
+      org.opencontainers.image.version="v0.131.0-demo.1" \
+      org.opencontainers.image.revision="83d8c5a002643581f153058b7a766afe1ffa1eb0" \
+      org.opencontainers.image.licenses="PostgreSQL"
+ENV PATH="/opt/pgrac/bin:$PATH" LANG=C.UTF-8 \
+    PERL5LIB=/opt/pgrac/test/perl PG_REGRESS=/opt/pgrac/test/pg_regress \
+    PG_TEST_NOCLEAN=1 PG_TEST_TIMEOUT_DEFAULT=180 PGRAC_STAGE8_HAPPY_PATH_ONLY=1 \
+    TESTDATADIR=/demo/tap TESTLOGDIR=/demo/setup-log TEMP_CONFIG=/demo/seed.conf \
+    PGPASSFILE=/demo/client.pgpass PGCONNECT_TIMEOUT=5
+USER 10001:10001
+WORKDIR /demo
+STOPSIGNAL SIGTERM
+# Set NNP after the container's AppArmor transition, before any database code.
+ENTRYPOINT ["setpriv", "--no-new-privs", "python3", "/opt/pgrac/demo/entrypoint.py"]

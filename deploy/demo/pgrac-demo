@@ -1,0 +1,444 @@
+#!/usr/bin/env python3
+"""Single-host four-Pod demo lifecycle. Author: SqlRush <sqlrush@gmail.com>"""
+
+import argparse
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+from demo_lib import (DATABASE_UID, DEFAULT_IMAGE, DEMO_VERSION, SOURCE_REVISION,
+                      check_port_free, exact_loop, pod_documents, removable_pod,
+                      safe_root, sql_startup_ready, start_action, storage_relative)
+
+BASE = Path("/var/lib/pgrac-demo")
+HERE = Path(__file__).resolve().parent
+
+
+def run(args, *, check=True, data=None, stdout=None, timeout=180, cwd=None):
+    result = subprocess.run(args, input=data, text=True, stdout=stdout or subprocess.PIPE,
+                            stderr=subprocess.PIPE, timeout=timeout, cwd=cwd)
+    if check and result.returncode:
+        raise RuntimeError("command failed: " + args[0] + " " + " ".join(args[1:3]) +
+                           "\n" + result.stderr[-3000:])
+    return result
+
+
+def save_json(path, value):
+    with tempfile.NamedTemporaryFile(mode="w", dir=path.parent, prefix=".manifest-",
+                                     delete=False) as output:
+        json.dump(value, output, indent=2)
+        output.write("\n")
+        output.flush()
+        os.fsync(output.fileno())
+        temporary = output.name
+    os.replace(temporary, path)
+    fd = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+class Demo:
+    def __init__(self, args):
+        self.args = args
+        self.root = safe_root(BASE, args.name)
+        self.storage = self.root / "storage"
+        self.control = self.root / "control.json"
+        self.state = json.loads(self.control.read_text()) if self.control.exists() else None
+        if self.state:
+            if self.control.is_symlink() or self.control.stat().st_uid != 0:
+                raise ValueError("controller manifest must be a root-owned regular file")
+            if self.state["name"] != args.name or self.state["version"] != DEMO_VERSION:
+                raise ValueError("deployment identity/version mismatch")
+            current = self.storage.stat()
+            if [current.st_dev, current.st_ino] != self.state["storage_identity"]:
+                raise ValueError("storage directory identity changed")
+
+    def save(self):
+        save_json(self.control, self.state)
+
+    def host_path(self, path):
+        result = self.storage / storage_relative(path)
+        for part in [result, *result.parents]:
+            if part == self.root:
+                break
+            if part.is_symlink():
+                raise ValueError("symlink in managed storage path")
+        return result
+
+    def container(self, node):
+        return "pgrac-" + self.args.name + "-" + str(node) + "-db"
+
+    def client_command(self, node, command, options=()):
+        return ["podman", "exec", *options, self.container(node),
+                "setpriv", "--no-new-privs", *command]
+
+    def image(self):
+        image = self.args.image or (self.state["image"] if self.state else DEFAULT_IMAGE)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.:/@-]+", image):
+            raise ValueError("invalid image reference")
+        if run(["podman", "image", "exists", image], check=False).returncode:
+            run(["podman", "pull", image], stdout=sys.stdout, timeout=900)
+        metadata = json.loads(run(["podman", "image", "inspect", image]).stdout)[0]
+        labels = metadata.get("Labels") or metadata.get("Config", {}).get("Labels") or {}
+        if (labels.get("org.opencontainers.image.revision") != SOURCE_REVISION or
+                labels.get("org.opencontainers.image.version") != DEMO_VERSION):
+            raise ValueError("image is not this frozen demo/source version")
+        return image, metadata["Id"]
+
+    def preflight(self, starting=False):
+        if sys.platform != "linux" or os.geteuid() != 0:
+            raise ValueError("use sudo on a Linux host (rootful Podman; databases remain non-root)")
+        for name in ("podman", "losetup", "blockdev", "findmnt"):
+            if not shutil.which(name):
+                raise ValueError("missing dependency: " + name)
+        version = run(["podman", "--version"]).stdout.strip()
+        if not Path("/dev/loop-control").exists():
+            raise ValueError("/dev/loop-control missing; load the Linux loop module first")
+        parent = self.storage if self.storage.exists() else BASE
+        fs = run(["findmnt", "-n", "-o", "FSTYPE", "-T", str(parent)]).stdout.strip()
+        if fs not in ("ext4", "xfs", "btrfs"):
+            raise ValueError("local ext4/XFS/Btrfs required; rejected filesystem: " + fs)
+        free = shutil.disk_usage(parent).free
+        mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", Path("/proc/meminfo").read_text(), re.M))
+        if free < 10 * 1024**3 or int(mem["MemAvailable"]) < 4 * 1024**2:
+            raise ValueError("need at least 10 GiB free disk and 4 GiB available memory")
+        if starting:
+            base = self.state["port_base"] if self.state else self.args.port_base
+            for port in [*(base+i for i in range(4)), *(base+100+i for i in range(4)),
+                         *(base+200+i for i in range(8))]:
+                check_port_free(port)
+        print(json.dumps({"check": "PASS", "runtime": version, "architecture": os.uname().machine,
+                          "filesystem": fs, "free_disk_GiB": round(free/1024**3, 1),
+                          "available_memory_GiB": round(int(mem["MemAvailable"])/1024**2, 1)}))
+
+    def initialize(self, image, image_id):
+        if self.root.exists():
+            raise ValueError("directory already exists without a valid deployment; not overwriting")
+        self.root.mkdir(mode=0o700)
+        self.storage.mkdir(mode=0o700)
+        os.chown(self.storage, DATABASE_UID, DATABASE_UID)
+        identity = self.storage.stat()
+        self.state = {"name": self.args.name, "version": DEMO_VERSION, "source_revision": SOURCE_REVISION,
+                      "image": image, "image_id": image_id, "phase": "INITIALIZING", "loops": [],
+                      "port_base": self.args.port_base, "storage_identity": [identity.st_dev, identity.st_ino]}
+        self.save()
+        for dirname in ("tap", "setup-log"):
+            path = self.storage / dirname
+            path.mkdir(mode=0o700)
+            os.chown(path, DATABASE_UID, DATABASE_UID)
+        files = {"password": secrets.token_hex(32) + "\n",
+                 "settings.json": json.dumps({"port_base": self.args.port_base}),
+                 "seed.conf": "fsync=on\nfull_page_writes=on\nsynchronous_commit=on\n"
+                 "log_statement=none\nlog_min_error_statement=panic\nlisten_addresses=''\n"}
+        for name, content in files.items():
+            path = self.storage / name
+            with path.open("x") as output:
+                output.write(content)
+            path.chmod(0o600)
+            os.chown(path, DATABASE_UID, DATABASE_UID)
+        with (self.root / "bootstrap.log").open("x") as log:
+            run(["podman", "run", "--rm", "--network=host", "--user=10001:10001", "--cap-drop=ALL",
+                 "--volume", str(self.storage)+":/demo:rw,z", image, "bootstrap"],
+                stdout=log, timeout=900)
+        fixture = json.loads((self.storage / "bootstrap.json").read_text())
+        if fixture["source_revision"] != SOURCE_REVISION or len(fixture["nodes"]) != 4:
+            raise ValueError("invalid bootstrap identity")
+        for node in fixture["nodes"]:
+            self.host_path(node["pgdata"])
+            self.host_path(node["log"])
+        self.host_path(fixture["shared_data"])
+        self.state["fixture"] = fixture
+        voting = []
+        for path in fixture["voting"]:
+            info = self.host_path(path).stat()
+            if not stat.S_ISREG(info.st_mode) or info.st_size != 525824:
+                raise ValueError("invalid voting backing")
+            voting.append({"path": path, "identity": [info.st_dev, info.st_ino], "size": info.st_size})
+        if len(voting) != 3:
+            raise ValueError("three voting backings required")
+        self.state["voting"] = voting
+        self.state["phase"] = "INITIALIZED"
+        self.save()
+
+    def loop_info(self, device):
+        rows = json.loads(run(["losetup", "--json", "--output", "NAME,BACK-FILE,DIO", device]).stdout)["loopdevices"]
+        if len(rows) != 1 or rows[0]["dio"] not in (1, True, "1"):
+            raise ValueError("loop device lacks exact mapping/direct I/O")
+        info = Path(device).stat()
+        if not stat.S_ISBLK(info.st_mode):
+            raise ValueError("voting authority is not a block device")
+        return {"device": device, "backing": rows[0]["back-file"],
+                "major_minor": str(os.major(info.st_rdev))+":"+str(os.minor(info.st_rdev)),
+                "size": int(run(["blockdev", "--getsize64", device]).stdout)}
+
+    def check_loop(self, record):
+        actual = self.loop_info(record["device"])
+        if not exact_loop(*(record[k] for k in ("device", "backing", "major_minor", "size")),
+                          *(actual[k] for k in ("device", "backing", "major_minor", "size"))):
+            raise ValueError("voting loop identity drift; refusing to use or detach it")
+
+    def attach(self):
+        if self.state["loops"]:
+            for record in self.state["loops"]:
+                self.check_loop(record)
+            if len(self.state["loops"]) != 3:
+                raise ValueError("partial prior loop attach; preserve evidence")
+            return
+        for voting in self.state["voting"]:
+            path = self.host_path(voting["path"])
+            info = path.stat()
+            if [info.st_dev, info.st_ino] != voting["identity"] or info.st_size != voting["size"]:
+                raise ValueError("voting backing identity drift")
+            if run(["losetup", "-j", str(path)]).stdout.strip():
+                raise ValueError("backing already mapped outside this controller")
+            device = run(["losetup", "--find", "--show", "--direct-io=on", str(path)]).stdout.strip()
+            if not re.fullmatch(r"/dev/loop\d+", device):
+                raise ValueError("unexpected loop device path")
+            record = self.loop_info(device)
+            if record["backing"] != str(path) or record["size"] != voting["size"]:
+                raise ValueError("new loop does not map exact backing")
+            previous = Path(device).stat()
+            record["permissions"] = [previous.st_uid, previous.st_gid, stat.S_IMODE(previous.st_mode)]
+            self.state["loops"].append(record)
+            self.save()
+            os.chown(device, DATABASE_UID, DATABASE_UID)
+            os.chmod(device, 0o600)
+
+    def running(self):
+        active = []
+        for i in range(4):
+            result = run(["podman", "container", "inspect", self.container(i)], check=False)
+            if result.returncode == 0:
+                info = json.loads(result.stdout)[0]
+                if info["Config"]["Labels"].get("pgrac-demo") != self.args.name:
+                    raise ValueError("container name belongs to another deployment")
+                if info["State"]["Running"]:
+                    active.append(i)
+        return active
+
+    def clean_controls(self):
+        clean = []
+        for node in self.state["fixture"]["nodes"]:
+            result = run(["podman", "run", "--rm", "--network=none", "--user=10001:10001", "--cap-drop=ALL",
+                          "--volume", str(self.storage)+":/demo:ro,z", "--entrypoint", "setpriv",
+                          self.state["image"], "--no-new-privs", "pg_controldata", node["pgdata"]])
+            clean.append(bool(re.search(r"^Database cluster state:\s+shut down\s*$", result.stdout, re.M)))
+        return clean
+
+    def sql(self, node, query, check=True, stdout=None, timeout=600):
+        return run(self.client_command(node, ["psql", "-XAtq", "-v", "ON_ERROR_STOP=1",
+                    "-h", "127.0.0.1", "-p", str(self.state["port_base"]+node),
+                    "-U", "pgrac", "postgres"], ["-i", "-e", "PGOPTIONS=-c statement_timeout=600000"]),
+                   data=query, check=check, stdout=stdout, timeout=timeout)
+
+    def healthy(self, node):
+        query = """SELECT (SELECT in_quorum FROM pg_cluster_quorum_state)
+ AND (SELECT count(*)=4 FROM pg_cluster_membership WHERE node_id BETWEEN 0 AND 3
+ AND state='member' AND NOT removed AND presented_incarnation=last_admitted_incarnation
+ AND presented_incarnation>0)
+ AND (SELECT count(*)=3 FROM pg_cluster_state WHERE category='pcm' AND
+ ((key='resource_x_writer_path' AND value='target') OR (key='resource_x_gate_phase' AND value='open')
+ OR (key='resource_x_proof_readiness' AND value='AVAILABLE_PROOF_KIND')));"""
+        result = self.sql(node, query, check=False, timeout=20)
+        return result.returncode == 0 and result.stdout.strip() == "t"
+
+    def up(self):
+        image, image_id = self.image()
+        run(["podman", "run", "--rm", "--network=host", "--user=10001:10001", "--cap-drop=ALL",
+             image, "runtime-check"], stdout=sys.stdout)
+        if self.state is None:
+            self.preflight(starting=True)
+            self.initialize(image, image_id)
+        action = start_action(self.state["phase"], self.running(),
+                              self.clean_controls() if self.state["phase"] == "CLEAN" else [],
+                              image_id == self.state["image_id"])
+        if action == "verify":
+            if not all(self.healthy(i) for i in range(4)):
+                raise ValueError("running deployment is not healthy")
+            self.status()
+            return
+        self.preflight(starting=True)
+        self.attach()
+        # Remove only stopped, identity-checked Pods. Never use force/replace.
+        for i in range(4):
+            pod = "pgrac-"+self.args.name+"-"+str(i)
+            if run(["podman", "pod", "exists", pod], check=False).returncode == 0:
+                # Unlike legacy `pod inspect`, this is an array on Podman 4 and 5.
+                info = json.loads(run(["podman", "inspect", "--type=pod", pod]).stdout)[0]
+                if not removable_pod(info, self.args.name, i):
+                    raise ValueError("Pod is not an owned stopped deployment; refusing to remove it")
+                run(["podman", "pod", "rm", pod])
+        documents = pod_documents(self.args.name, image, str(self.storage),
+                                  [r["device"] for r in self.state["loops"]])
+        manifest = self.root / "pods.yaml"
+        manifest.write_text("\n---\n".join(json.dumps(p, indent=2) for p in documents)+"\n")
+        self.state["phase"] = "STARTING"
+        self.state["start_log_offsets"] = self.log_offsets()
+        self.save()
+        # Podman probes cwd/<image-name>/Containerfile even with --build=false.
+        # Never run in the downloaded script directory containing pgrac-demo.
+        run(["podman", "kube", "play", "--build=false", str(manifest)],
+            stdout=sys.stdout, cwd=self.root)
+        deadline = time.monotonic() + 180
+        while time.monotonic() < deadline:
+            # A connection during startup itself generates a FATAL rejection.
+            # Wait for this launch's ready messages before actively probing SQL.
+            logs_exist = all(self.host_path(n["log"]).is_file() for n in self.state["fixture"]["nodes"])
+            if (logs_exist and sql_startup_ready(self.new_logs(self.state["start_log_offsets"]))
+                    and all(self.sql(i, "SELECT 1;", check=False, timeout=10).returncode == 0 for i in range(4))):
+                break
+            time.sleep(0.5)
+        else:
+            raise ValueError("four-node SQL startup incomplete; preserve data and logs")
+        if action == "first":
+            for i in range(4):
+                self.activate(i)
+            for _ in range(2):
+                self.activate(0, require_success=True)
+        while time.monotonic() < deadline:
+            if all(self.healthy(i) for i in range(4)):
+                break
+            time.sleep(0.5)
+        else:
+            raise ValueError("cluster target/open readiness not proven")
+        if action == "restart":
+            for i, text in enumerate(self.new_logs(self.state["start_log_offsets"])):
+                if not re.search(r"database system was shut down at", text) or re.search(
+                        r"automatic recovery in progress|redo starts at|PANIC:|FATAL:", text):
+                    raise ValueError("node%d did not demonstrate normal startup" % i)
+        self.state["phase"] = "READY"
+        self.save()
+        self.status()
+
+    def activate(self, node, require_success=False):
+        deadline = time.monotonic()+120
+        while time.monotonic() < deadline:
+            result = self.sql(node, "ALTER SYSTEM ENABLE RAC TWO_STAGE ROLLING UPDATES ALL;",
+                              check=False, timeout=50)
+            if result.returncode == 0:
+                return
+            if not re.search(r"RF_DEFERRED|CONDITION_NOT_YET_MET|activation request was refused", result.stderr):
+                raise RuntimeError("activation rejected: "+result.stderr)
+            if not require_success:
+                return
+            time.sleep(0.2)
+        raise ValueError("initial activation did not complete")
+
+    def log_offsets(self):
+        return [self.host_path(n["log"]).stat().st_size if self.host_path(n["log"]).exists() else 0
+                for n in self.state["fixture"]["nodes"]]
+
+    def new_logs(self, offsets):
+        result = []
+        for node, offset in zip(self.state["fixture"]["nodes"], offsets):
+            with self.host_path(node["log"]).open("rb") as log:
+                if log.seek(0, 2) < offset:
+                    raise ValueError("server log truncated during verification")
+                log.seek(offset)
+                result.append(log.read().decode("utf-8", errors="replace"))
+        return result
+
+    def stop(self):
+        if self.state["phase"] == "CLEAN" and not self.running() and self.clean_controls() == [True]*4:
+            print("Already CLEAN; data retained.")
+            return
+        if self.state["phase"] != "READY" or self.running() != [0, 1, 2, 3]:
+            raise ValueError("not a complete ready deployment; no forced cleanup or crash recovery")
+        offsets = self.log_offsets()
+        self.state["phase"] = "STOPPING"
+        self.save()
+        for node in self.state["fixture"]["nodes"]:
+            run(self.client_command(node["id"], ["pg_ctl", "-D", node["pgdata"],
+                                                 "-m", "fast", "-W", "stop"]))
+        deadline = time.monotonic()+600
+        while self.running():
+            if time.monotonic() >= deadline:
+                raise ValueError("normal shutdown incomplete; no force kill, data/devices retained")
+            time.sleep(0.5)
+        if self.clean_controls() != [True]*4:
+            raise ValueError("not all four durable controls are shut down")
+        for node, text in zip(self.state["fixture"]["nodes"], self.new_logs(offsets)):
+            if (self.host_path(node["pgdata"]+"/postmaster.pid").exists() or
+                    "cluster normal-stop: protocol closed after shutdown checkpoint" not in text or
+                    "database system is shut down" not in text or re.search(r"PANIC:|FATAL:", text)):
+                raise ValueError("normal-stop evidence incomplete; retain devices")
+        for record in reversed(self.state["loops"]):
+            self.check_loop(record)
+            uid, gid, mode = record["permissions"]
+            # Restore before detach: after detach this device number can be reused.
+            os.chown(record["device"], uid, gid)
+            os.chmod(record["device"], mode)
+            run(["losetup", "--detach", record["device"]])
+        self.state["loops"] = []
+        self.state["phase"] = "CLEAN"
+        self.save()
+        print("CLEAN: all four nodes shut down normally; original data retained.")
+
+    def status(self):
+        print(json.dumps({"deployment": self.args.name, "phase": self.state["phase"],
+                          "running_nodes": self.running(), "image": self.state["image"],
+                          "source_revision": SOURCE_REVISION, "root": str(self.root),
+                          "sql_ports": [self.state["port_base"]+i for i in range(4)]}, indent=2))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--name", default="demo")
+    parser.add_argument("--image", help="prebuilt image reference; defaults to frozen public demo")
+    parser.add_argument("--port-base", type=int, default=15432)
+    parser.add_argument("command", choices=("check", "pull", "up", "status", "stop", "verify", "init-data", "bench", "sql"))
+    parser.add_argument("--rows", type=int, default=10000)
+    parser.add_argument("--clients", type=int, default=2, help="connections per node")
+    parser.add_argument("--seconds", type=int, default=30)
+    parser.add_argument("--node", type=int, choices=range(4), default=0)
+    args = parser.parse_args()
+    if sys.platform != "linux" or os.geteuid() != 0:
+        parser.error("run with sudo on Linux; database processes run as non-root")
+    if not 1024 <= args.port_base <= 65000:
+        parser.error("port base must be in 1024..65000")
+    safe_root(BASE, args.name)
+    BASE.mkdir(mode=0o755, exist_ok=True)
+    if BASE.stat().st_uid != 0 or BASE.stat().st_mode & 0o022:
+        raise ValueError("deployment base must be root-owned and not group/world writable")
+    lock_path = BASE / ("."+args.name+".lock")
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        demo = Demo(args)
+        if args.command == "check":
+            demo.preflight()
+        elif args.command == "pull":
+            print(json.dumps(dict(zip(("image", "image_id"), demo.image()))))
+        elif args.command == "up":
+            demo.up()
+        else:
+            if demo.state is None:
+                raise ValueError("deployment does not exist; run up first")
+            if args.command in ("status", "stop"):
+                getattr(demo, args.command)()
+            elif args.command == "sql":
+                result = demo.sql(args.node, sys.stdin.read(), stdout=sys.stdout)
+                return result.returncode
+            else:
+                from workload import execute
+                execute(demo, args)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (ValueError, RuntimeError, OSError, subprocess.TimeoutExpired, KeyError) as error:
+        print("REFUSED/FAILED: "+str(error), file=sys.stderr)
+        sys.exit(1)

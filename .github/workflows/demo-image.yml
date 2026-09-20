@@ -1,0 +1,135 @@
+# Author: SqlRush <sqlrush@gmail.com>
+name: Four-Pod demo image
+
+on:
+  pull_request:
+    branches: [main]
+    paths: ['deploy/demo/**', '.github/workflows/demo-image.yml']
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: 'Publish the tested image (main only, after required CI succeeds)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native demo (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y podman python3 util-linux
+          sudo modprobe loop
+      - name: Build frozen product image natively
+        run: sudo podman build --network=host -t localhost/pgrac-demo:v0.131.0-demo.1 deploy/demo
+      - name: Prove restricted socket admission before database startup
+        run: |
+          set -euo pipefail
+          sudo podman run --rm --network=host --cap-drop=ALL --user=10001:10001 \
+            localhost/pgrac-demo:v0.131.0-demo.1 runtime-check
+      - name: Four Pods, full rows, workload, normal restart, workload
+        run: deploy/demo/ci-smoke.sh localhost/pgrac-demo:v0.131.0-demo.1
+      - name: Retain summaries and runtime-only failure evidence
+        if: always()
+        run: |
+          mkdir -p demo-results
+          sudo dmesg | grep 'apparmor="DENIED"' > demo-results/apparmor-denials.txt || true
+          sudo podman ps -a > demo-results/containers.txt
+          for node in 0 1 2 3; do
+            sudo podman logs "pgrac-ci-demo-$node-db" > "demo-results/container-$node.log" 2>&1 || true
+            if sudo test -f "/var/lib/pgrac-demo/ci-demo/storage/server-log/node$node.log"; then
+              sudo cp "/var/lib/pgrac-demo/ci-demo/storage/server-log/node$node.log" "demo-results/server-$node.log"
+            fi
+          done
+          # Never export bootstrap logs, credentials, settings or entire PGDATA.
+          if sudo test -d /var/lib/pgrac-demo/ci-demo/reports; then
+            sudo find /var/lib/pgrac-demo/ci-demo/reports -name summary.json -type f \
+              -exec cp --parents '{}' "$PWD/demo-results" \;
+          fi
+          sudo chown -R "$(id -u):$(id -g)" demo-results
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: demo-results-${{ matrix.arch }}
+          path: demo-results
+          retention-days: 14
+      - name: Export the exact tested image
+        if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+        run: |
+          sudo podman save --format oci-archive -o "$RUNNER_TEMP/demo-${{ matrix.arch }}.tar" \
+            localhost/pgrac-demo:v0.131.0-demo.1
+          sudo chmod 644 "$RUNNER_TEMP/demo-${{ matrix.arch }}.tar"
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+        with:
+          name: demo-image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/demo-${{ matrix.arch }}.tar
+          retention-days: 2
+
+  publish:
+    if: github.event_name == 'workflow_dispatch' && inputs.publish && github.ref == 'refs/heads/main'
+    needs: native
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      checks: read
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      IMAGE: ghcr.io/sqlrush/pgrac-demo
+      VERSION: v0.131.0-demo.1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Require all protected CI checks on this exact main commit
+        run: |
+          gh api --paginate "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/check-runs?per_page=100" \
+            --jq '.check_runs[] | {name,conclusion,started_at}' > checks.jsonl
+          python3 deploy/demo/release_gate.py checks.jsonl
+      - name: Tools
+        run: sudo apt-get update && sudo apt-get install -y podman
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: demo-image-*
+          path: images
+          merge-multiple: true
+      - name: Publish tested native images and multi-architecture index
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$REGISTRY_TOKEN" | podman login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          # Release names are never overwritten. A new delivery requires a new version.
+          if podman manifest inspect "docker://$IMAGE:$VERSION" >/dev/null 2>&1; then
+            echo 'Version already exists; refusing to overwrite it.' >&2
+            exit 1
+          fi
+          for arch in amd64 arm64; do
+            podman load -i "images/demo-$arch.tar"
+            podman tag localhost/pgrac-demo:v0.131.0-demo.1 "$IMAGE:$VERSION-$GITHUB_RUN_ID-$arch"
+            podman push "$IMAGE:$VERSION-$GITHUB_RUN_ID-$arch"
+          done
+          podman manifest create demo-release \
+            "docker://$IMAGE:$VERSION-$GITHUB_RUN_ID-amd64" \
+            "docker://$IMAGE:$VERSION-$GITHUB_RUN_ID-arm64"
+          podman manifest push --all --digestfile image-digest.txt demo-release "docker://$IMAGE:$VERSION"
+          printf 'Published %s@%s\n' "$IMAGE" "$(cat image-digest.txt)" >> "$GITHUB_STEP_SUMMARY"
+          podman logout ghcr.io
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demo-release-digest
+          path: image-digest.txt
