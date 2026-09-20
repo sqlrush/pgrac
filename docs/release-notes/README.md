@@ -4,11 +4,13 @@ Author: SqlRush <sqlrush@gmail.com>
 
 ## Current release
 
-[v0.130.1 — correctness maintenance release](v0.130.1.md) is the current release.
-It repairs transaction-wait, consistent-read and buffer-cleanup defects and has
-four new valid four-node correctness samples. Stable means the documented MVP
-scope, not production HA, independent-host shared-storage certification or a
-performance guarantee. [v0.130.0 — first stable MVP](v0.130.0.md) is unchanged.
+[v0.131.0 — undo-header locality and UPDATE diagnostics](v0.131.0.md) is the
+current source release line. Stable publication requires the exact-commit CI
+and four-round correctness qualification recorded with its GitHub Release.
+Stable means the documented MVP scope, not production HA, independent-host
+shared-storage certification or a performance guarantee.
+[v0.130.1 — correctness maintenance](v0.130.1.md) and
+[v0.130.0 — first stable MVP](v0.130.0.md) remain unchanged.
 
 [v0.130.0-mvp.1](v0.130.0-mvp.1.md) remains the immutable first evaluation
 snapshot. Its original CI limitation is retained in its historical notes;
@@ -36,6 +38,7 @@ Versions use `MAJOR.MINOR.PATCH`, optionally followed by a prerelease label:
 | `v0.130.0-mvp.1` | First frozen MVP baseline |
 | `v0.130.0` | First stable release within the documented MVP scope |
 | `v0.130.1` | Correctness maintenance release within the same MVP scope |
+| `v0.131.0` | Undo-header locality improvement and optional UPDATE diagnostics |
 | `-mvp.N`, `-alpha.N`, `-beta.N` | Numbered evaluation prereleases |
 | `-rc.N` | Release candidates with their own published qualification scope |
 | No suffix | Stable release; only after its acceptance criteria pass |
@@ -54,8 +57,8 @@ the superseded release's evidence and limitations.
 ## Selecting a version
 
 ```sh
-git fetch origin tag v0.130.1
-git switch --detach v0.130.1
+git fetch origin tag v0.131.0
+git switch --detach v0.131.0
 git rev-parse HEAD
 cat PGRAC_VERSION
 ```
