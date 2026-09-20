@@ -4,7 +4,9 @@ Author: SqlRush <sqlrush@gmail.com>
 """
 
 import importlib.util
+import io
 import json
+import socket
 from pathlib import Path
 import sys
 import tempfile
@@ -147,6 +149,44 @@ class DemoPolicies(unittest.TestCase):
                        if v.get("hostPath", {}).get("type") == "BlockDevice"]
             self.assertEqual(devices, ["/dev/loop7", "/dev/loop8", "/dev/loop9"])
             self.assertEqual(json.loads(json.dumps(pod)), pod)
+
+    def test_population_refuses_existing_data_and_unbounded_geometry(self):
+        self.assertTrue(callable(getattr(core, "population_rows", None)), "population guard missing")
+        self.assertEqual(core.population_rows(0, 10000), 10000)
+        for count, rows in ((1, 10000), (0, 0), (0, -1), (0, 1000001)):
+            with self.assertRaises(ValueError):
+                core.population_rows(count, rows)
+
+    def test_row_snapshot_reads_all_rows_and_rejects_duplicate_keys(self):
+        self.assertTrue(callable(getattr(core, "row_snapshot", None)), "full-row verifier missing")
+        value = core.row_snapshot(io.BytesIO(b"1\t2\tx\n2\t4\ty\n"))
+        self.assertEqual((value["rows"], value["sum"]), (2, 6))
+        for data in (b"1\t2\tx\n1\t4\ty\n", b"2\t3\tx\n1\t4\ty\n", b"1\tx\ty\n"):
+            with self.assertRaises(ValueError):
+                core.row_snapshot(io.BytesIO(data))
+
+    def test_port_check_allows_time_wait_but_rejects_a_listener(self):
+        self.assertTrue(callable(getattr(core, "check_port_free", None)), "port check missing")
+        with socket.socket() as server:
+            server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            server.bind(("127.0.0.1", 0))
+            port = server.getsockname()[1]
+            server.listen()
+            with self.assertRaises(OSError):
+                core.check_port_free(port)
+            with socket.create_connection(("127.0.0.1", port)) as client:
+                accepted, _ = server.accept()
+                accepted.close()
+                self.assertEqual(client.recv(1), b"")
+        core.check_port_free(port)
+
+    def test_foreign_or_running_pod_is_not_removable(self):
+        self.assertTrue(callable(getattr(core, "removable_pod", None)), "pod owner guard missing")
+        owned = {"Name": "pgrac-demo-0", "State": "Exited", "Labels": {"pgrac-demo": "demo"}}
+        self.assertTrue(core.removable_pod(owned, "demo", 0))
+        self.assertFalse(core.removable_pod(dict(owned, Labels={}), "demo", 0))
+        self.assertFalse(core.removable_pod(dict(owned, Name="other"), "demo", 0))
+        self.assertFalse(core.removable_pod(dict(owned, State="Running"), "demo", 0))
 
 
 if __name__ == "__main__":

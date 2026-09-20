@@ -1,0 +1,6 @@
+__pycache__
+tests
+*.pyc
+*.tar
+*.tar.gz
+reports

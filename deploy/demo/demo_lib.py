@@ -3,14 +3,30 @@
 Author: SqlRush <sqlrush@gmail.com>
 """
 
+import hashlib
 import math
 from pathlib import Path, PurePosixPath
 import re
+import socket
 
 SOURCE_REVISION = "83d8c5a002643581f153058b7a766afe1ffa1eb0"
 DEMO_VERSION = "v0.131.0-demo.1"
 DEFAULT_IMAGE = "ghcr.io/sqlrush/pgrac-demo:" + DEMO_VERSION
 DATABASE_UID = 10001
+
+
+def check_port_free(port):
+    # Match PostgreSQL's SO_REUSEADDR: old TIME_WAIT is not a live listener.
+    with socket.socket() as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        sock.bind(("127.0.0.1", port))
+        sock.listen()
+
+
+def removable_pod(info, name, node):
+    return (info.get("Name") == "pgrac-%s-%d" % (name, node)
+            and info.get("Labels", {}).get("pgrac-demo") == name
+            and info.get("State") in ("Exited", "Stopped", "Created"))
 
 
 def validate_name(name):
@@ -122,3 +138,31 @@ def pod_documents(name, image, storage, loops):
                                     "capabilities": {"drop": ["ALL"]}},
                                 "volumeMounts": mounts}], "volumes": volumes}})
     return documents
+
+
+def population_rows(existing, requested):
+    if existing != 0:
+        raise ValueError("demo_account already contains data; initialization never truncates/replaces it")
+    if not isinstance(requested, int) or not 1000 <= requested <= 1000000:
+        raise ValueError("rows must be in 1000..1000000")
+    return requested
+
+
+def row_snapshot(stream):
+    full = hashlib.sha256()
+    immutable = hashlib.sha256()
+    rows = total = previous = 0
+    for line in stream:
+        columns = line.rstrip(b"\n").split(b"\t")
+        if len(columns) != 3:
+            raise ValueError("unexpected COPY row shape")
+        key, value = int(columns[0]), int(columns[1])
+        if key <= previous or value < 0:
+            raise ValueError("duplicate/unsorted key or negative counter")
+        previous = key
+        rows += 1
+        total += value
+        full.update(line)
+        immutable.update(columns[0]+b"\t"+columns[2]+b"\n")
+    return {"rows": rows, "sum": total, "sha256": full.hexdigest(),
+            "key_payload_sha256": immutable.hexdigest()}
