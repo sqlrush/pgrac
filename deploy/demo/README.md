@@ -54,7 +54,9 @@ sudo modprobe loop
 |---|---|---|
 | 部署持久目录 | `/var/lib/pgrac-demo/demo/storage` | 四个 Pod 均映射为 `/demo`，读写同一份宿主机内容 |
 | 共享业务数据 | `storage/tap/<生成的共享目录>` 中的普通数据库文件 | 四节点的 `cluster.shared_data_dir` 指向同一个 `/demo/tap/...` |
-| PGDATA、WAL | 四个独立节点目录 | 每个实例使用自己的 PGDATA 和 WAL，不共用一个 PGDATA |
+| PGDATA | 同一个 `storage` 下的四个实例目录 | 各实例使用自己的运行目录，不让四个进程共用一个 PGDATA |
+| 控制文件 | 各 PGDATA 下的 `global/pg_control` | 当前演示保留四份独立文件，未启用共享控制文件模式 |
+| WAL | 各 PGDATA 下的 `pg_wal`，也位于同一个宿主机持久目录 | 各实例分别写入；四个 Pod 可访问所在目录，但未启用分线程共享 WAL 目录模式 |
 | 投票介质 | 三个专属文件，各映射到一个 loop 块设备 | 四节点访问同一组 `/dev/pgrac-vote0`、`1`、`2` |
 | 管理与校验记录 | 部署根目录下的 `control.json`、`pods.yaml`、`reports/` | 不作为数据库共享关系目录使用 |
 
@@ -80,6 +82,72 @@ sudo modprobe loop
 两个生成目录通常名为 `tmp_test_XXXX`，后缀每次初始化不同，以上尖括号不是需要创建的目录名。
 **这些目录虽然带 `tmp_test`，仍是本演示的持久数据，不可按临时文件清理。**
 实际路径以 `storage/bootstrap.json` 为准，不能复制另一场景的随机后缀。
+
+<a id="control-files-and-wal"></a>
+
+##### 1.1.1 PGDATA、控制文件与 WAL（Oracle RAC 读者必读）
+
+**“各实例分别使用”与“物理存储是否共享”是两个不同概念。**
+四份 PGDATA 表示四个实例的运行目录，不表示业务表有四份复制副本，
+也不表示控制文件必须独立、WAL 必须放在只有本节点可访问的磁盘上。
+
+先明确 Oracle RAC 的公开行为：
+
+- 所有实例使用同一组控制文件；多份控制文件是冗余副本，不是每个实例维护不同的一套。
+  参见 [Oracle 19c CONTROL_FILES](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/CONTROL_FILES.html)。
+- 每个实例分别写自己的 redo thread，但所有线程的日志均放在共享存储上，
+  其他实例可在实例恢复时读取故障实例的日志。不是四个实例同时混写一条 redo 流。
+  参见 [Oracle 19c Online Redo Log Files](https://docs.oracle.com/en/database/oracle/oracle-database/19/rilin/about-online-redo-log-files.html)。
+
+本演示的具体状态如下，不应与 Oracle 的完整部署能力混为一谈：
+
+| 对象 | 当前演示实际使用的方式 | 不应作出的推断 |
+|---|---|---|
+| 实例配置、进程文件 | 各 PGDATA 分开保存；整个宿主机 `storage` 同时挂入四个 Pod 的 `/demo` | 不能让四个数据库进程直接使用同一个 PGDATA |
+| 控制文件 | 四份独立 `global/pg_control`，不是指向同一共享文件的软链接 | 四份 PGDATA 不代表 PGRAC 的共享控制模式也需要四份独立控制文件 |
+| WAL | 各实例写各自的 `pg_wal`；四份目录均位于四个 Pod 可见的宿主机持久存储 | 文件可访问，不等于已启用跨节点 WAL 恢复 |
+| 系统目录、元数据 | 从同一初始化模板生成，当前仍按节点保留 | 不代表任意跨节点 DDL 和共享系统目录已在本包验收 |
+| 业务表、索引 | 通过 `cluster.shared_data_dir` 访问同一份关系文件 | 不是四份业务数据库通过流复制保持同步 |
+
+当前 `bootstrap.pl` 没有启用以下三个配置项，使用的有效默认值为：
+
+| 参数 | 当前演示值 | 代码中已有的可选模式 |
+|---|---|---|
+| `cluster.controlfile_shared_authority` | `off` | 使用共享目录中的一个控制文件，各节点通过软链接访问 |
+| `cluster.wal_threads_dir` | 空字符串 | 按实例线程组织共享 WAL 根目录，并校验本节点 WAL 路径与线程身份 |
+| `cluster.shared_catalog` | `off` | 将系统目录也纳入共享存储 |
+
+**下面两张图仅说明代码中已有的可选模式，当前演示没有启用；不是本包的安装操作步骤。**
+
+共享控制文件模式由初始化/迁移逻辑建立符号链接（软链接）：
+
+```text
+节点 0 的 PGDATA/global/pg_control ─┐
+节点 1 的 PGDATA/global/pg_control ─┤
+节点 2 的 PGDATA/global/pg_control ─┼→ <cluster.shared_data_dir>/global/pg_control
+节点 3 的 PGDATA/global/pg_control ─┘   一个共享控制文件，不是四份文件相互复制
+```
+
+分线程共享 WAL 模式仍是各实例分别写入，只是使用统一可访问的存储布局；
+各实例的 `PGDATA/pg_wal` 指向其自己的线程目录，不指向同一个可写目录：
+
+```text
+<cluster.wal_threads_dir>/
+├─ thread_1/   ← 节点 0 的 PGDATA/pg_wal
+├─ thread_2/   ← 节点 1 的 PGDATA/pg_wal
+├─ thread_3/   ← 节点 2 的 PGDATA/pg_wal
+└─ thread_4/   ← 节点 3 的 PGDATA/pg_wal
+```
+
+这些配置项和代码路径存在，不等于当前容器包已经启用或完成了相应恢复验收。
+**不要在现有演示数据上自行 `ln -s`、搬动 WAL 或仅修改开关来切换模式。**
+切换还涉及初始化、控制文件与 WAL 线程身份、检查点和恢复状态的匹配，
+本包不提供这种迁移操作，也不认证这种组合。
+
+本包的正常停机后原数据重启，与故障后由其他节点接管恢复是两项不同能力。
+共享存储可达只是后者的必要条件之一，还需要日志识别与回放、恢复协调和故障节点写入隔离。
+**不得将本包表述为已验证 Oracle RAC 式跨节点实例恢复或四机存储高可用。**
+当前镜像还存在页首说明的正常停机发布阻塞，此处也不宣告该问题已修复。
 
 #### 1.2 安装前准备文件系统、容量与权限
 
@@ -163,6 +231,9 @@ synchronous_commit = on
 | `cluster.shared_storage_backend` | `cluster_fs`，通过文件系统访问共享关系数据 |
 | `cluster.shared_data_dir` | 初始化时生成的容器内共享目录；四节点必须完全相同 |
 | `cluster.smgr_user_relations` | `on`，用户关系使用共享存储路径 |
+| `cluster.controlfile_shared_authority` | 默认 `off`；本包未启用共享控制文件模式，不能手工改软链接代替切换流程 |
+| `cluster.wal_threads_dir` | 默认空字符串；本包保留各实例 `pg_wal` 路径，不是分线程共享 WAL 根目录配置 |
+| `cluster.shared_catalog` | 默认 `off`；本包保留各节点的系统目录副本 |
 | `cluster.voting_disks` | 三个容器内块设备路径；顺序与 disk0/1/2 映射一致，四节点相同 |
 | `cluster.voting_disk_size_bytes` | `525824`；与三个 backing 文件及设备实际容量一致 |
 | 三个持久性开关 | 全部为 `on`；不要为提高演示 TPS 关闭 |
@@ -195,6 +266,9 @@ for node in 0 1 2 3; do
     'SHOW cluster.shared_storage_backend;' \
     'SHOW cluster.shared_data_dir;' \
     'SHOW cluster.smgr_user_relations;' \
+    'SHOW cluster.controlfile_shared_authority;' \
+    'SHOW cluster.wal_threads_dir;' \
+    'SHOW cluster.shared_catalog;' \
     'SHOW cluster.voting_disks;' \
     'SHOW cluster.voting_disk_size_bytes;' \
     'SHOW fsync;' \
@@ -205,8 +279,10 @@ for node in 0 1 2 3; do
 done
 ```
 
-四个节点应分别输出：`cluster_fs`、同一个实际共享目录、`on`、相同的三个 `/dev/pgrac-vote*`
-路径、`525824`、三个 `on`，最后 quorum 为 `t`。若某节点命令失败、输出缺失或不一致，
+四个节点应分别输出：`cluster_fs`、同一个实际共享目录、`on`、`off`、
+空字符串（`cluster.wal_threads_dir` 的空值，不是漏跑查询）、`off`、
+相同的三个 `/dev/pgrac-vote*` 路径、`525824`、三个 `on`，最后 quorum 为 `t`。
+若某节点命令失败、输出缺失或不一致，
 不要继续初始化/压测，也不要修改阈值让它通过。
 这些配置检查不能代替数据校验：第 4 节初始化后还需运行 `verify`，第 5 节压测还需完整 PASS。
 
