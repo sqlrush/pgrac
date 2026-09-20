@@ -259,6 +259,12 @@ cluster_gcs_try_send_transition_and_wait(BufferTag tag pg_attribute_unused(),
 	abort();
 }
 bool
+cluster_gcs_register_shared_and_wait(BufferTag tag pg_attribute_unused(),
+									 int master pg_attribute_unused())
+{
+	abort();
+}
+bool
 cluster_pcm_lock_pi_watermark_prov_query(BufferTag tag pg_attribute_unused(),
 										 ClusterPcmWmProv *out pg_attribute_unused())
 {

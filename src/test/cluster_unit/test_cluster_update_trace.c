@@ -129,7 +129,8 @@ main(void)
 	cluster_update_trace_interval_leave_at(&interval, false, 510);
 	cluster_update_trace_interval_enter_at(&interval, &event, 600);
 	cluster_update_trace_interval_leave_at(&interval, true, 620);
-	assert(cluster_update_trace_event_snapshot(interval_records++, &observed));
+	assert(cluster_update_trace_event_snapshot(interval_records, &observed));
+	interval_records++;
 	assert(observed.duration_ns == 120 && observed.work_ns == 30);
 	assert(observed.value == 0x401 && !interval.active);
 	/* A different identity cannot inherit the old phase's age. */
@@ -138,9 +139,11 @@ main(void)
 	event.request_id++;
 	cluster_update_trace_interval_enter_at(&interval, &event, 800);
 	cluster_update_trace_interval_leave_at(&interval, true, 810);
-	assert(cluster_update_trace_event_snapshot(interval_records++, &observed));
+	assert(cluster_update_trace_event_snapshot(interval_records, &observed));
+	interval_records++;
 	assert(observed.kind == CLUTRACE_ORIGIN_INCOMPLETE && observed.request_id == 42);
-	assert(cluster_update_trace_event_snapshot(interval_records++, &observed));
+	assert(cluster_update_trace_event_snapshot(interval_records, &observed));
+	interval_records++;
 	assert(observed.request_id == 43 && observed.duration_ns == 10 && observed.work_ns == 10);
 	cluster_update_trace_enabled = false;
 	cluster_update_trace_interval_enter_at(&interval, &event, 850);

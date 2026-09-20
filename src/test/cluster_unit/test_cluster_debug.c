@@ -41,6 +41,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_update_trace.h"
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
 #include "cluster/cluster_debug.h"
@@ -158,6 +159,45 @@ int cluster_smart_fusion_origin_durable_gossip_ms = 50;
  * invoked by the unit test (same as the file's other SRF stubs). */
 bool cluster_xnode_profile_enabled = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
+
+/* Link-only empty observer. Real collection has its own production-C suite. */
+uint32
+cluster_update_trace_snapshot_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_update_trace_dropped_count(void)
+{
+	return 0;
+}
+
+bool
+cluster_update_trace_snapshot(uint32 slot pg_attribute_unused(),
+							  ClusterUpdateTraceSnapshot *snapshot pg_attribute_unused())
+{
+	return false;
+}
+
+uint32
+cluster_update_trace_event_count(void)
+{
+	return 0;
+}
+
+uint64
+cluster_update_trace_event_dropped_count(void)
+{
+	return 0;
+}
+
+bool
+cluster_update_trace_event_snapshot(uint32 slot pg_attribute_unused(),
+									ClusterUpdateTraceEvent *event pg_attribute_unused())
+{
+	return false;
+}
 
 const char *
 cluster_xp_bucket_name(ClusterXnodeBucket b pg_attribute_unused())

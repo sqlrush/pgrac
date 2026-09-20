@@ -401,6 +401,11 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
+
+# The included production wait loop has disabled diagnostic probes.
+test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o -o $@
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
 # cluster_epoch.c references ShmemInitStruct + cluster_shmem_register_region
@@ -1947,9 +1952,9 @@ test_cluster_gviews: test_cluster_gviews.c unit_test.h $(CLUSTER_VERSION_O) \
 # of them since the unit test only takes function addresses (never
 # invokes a path that triggers ereport or CRC computation).
 test_cluster_ic: test_cluster_ic.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_IC_O)
+		$(CLUSTER_IC_O) cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) cluster_unit_port_stubs.o -o $@
 
 # spec-2.3 D8: test_cluster_ic_envelope links cluster_ic_envelope.o
 # standalone + the libpgport_srv archive (for the real pg_crc32c
@@ -1991,9 +1996,9 @@ test_cluster_conf: test_cluster_conf.c unit_test.h $(CLUSTER_VERSION_O) \
 # any ereport / palloc / tuplestore paths are not invoked, so the
 # stubs in test_cluster_ic_mock.c suffice.
 test_cluster_ic_mock: test_cluster_ic_mock.c unit_test.h $(CLUSTER_VERSION_O) \
-		$(CLUSTER_IC_O)
+		$(CLUSTER_IC_O) cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_IC_O) cluster_unit_port_stubs.o -o $@
 
 # test_cluster_inject links cluster_inject.o standalone.  cluster_inject.c
 # references ereport / pg_atomic / pg_usleep / superuser / fmgr / tuple-
@@ -2502,17 +2507,17 @@ test_cluster_quorum_decision: test_cluster_quorum_decision.c unit_test.h \
 # the inline encoding macros.  Runtime advance/observe paths (LWLock-
 # protected SCN counter) are TAP-tested in t/065_scn_encoding.pl.
 test_cluster_scn: test_cluster_scn.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O) cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O) cluster_unit_port_stubs.o -o $@
 
 # spec-7.4 D1: test_cluster_scn_frontier links cluster_scn.o standalone
 # (same stub model as test_cluster_scn) and exercises the durable
 # pending registry real-behavior paths via the in-process shmem buffer.
 test_cluster_scn_frontier: test_cluster_scn_frontier.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O) cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_SCN_O) cluster_unit_port_stubs.o -o $@
 
 # spec-6.4 D1: test_cluster_adg links the dependency-light ADG pure
 # primitives.  SCN comparators are stubbed locally so this binary does not pull
@@ -4714,8 +4719,8 @@ test_cluster_heap_prepare_diagnostic.inc: $(top_srcdir)/src/backend/access/heap/
 	           if (capacity_wait) print "#define PREPARE_HAS_CAPACITY_WAIT 1" }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_heap_prepare_diagnostic: test_cluster_heap_prepare_diagnostic.c unit_test.h test_cluster_heap_prepare_diagnostic.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+test_cluster_heap_prepare_diagnostic: test_cluster_heap_prepare_diagnostic.c unit_test.h test_cluster_heap_prepare_diagnostic.inc cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< cluster_unit_port_stubs.o -o $@
 
 # PGRAC: actual unlocked UPDATE child-intent decision, including refusal.
 test_cluster_heap_update_child_retry.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile

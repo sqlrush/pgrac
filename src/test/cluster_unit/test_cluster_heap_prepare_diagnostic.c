@@ -12,6 +12,7 @@
 #include "postgres.h"
 #include "access/heapam.h"
 #include "cluster/cluster_undo_record_api.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "../../backend/access/heap/heapam_r4_private.h"
 
 #undef printf

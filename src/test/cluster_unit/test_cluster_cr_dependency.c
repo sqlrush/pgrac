@@ -7,6 +7,7 @@ int reservation_fixture_main(void);
 #define main reservation_fixture_main
 #include "test_cluster_r4_slot_reservation.c"
 #undef main
+#include "cluster/cluster_update_trace.h"
 
 static bool dependency_origin_pending;
 static int dependency_legacy_calls;
@@ -26,6 +27,13 @@ cluster_gcs_block_r4_tx_resolve_active(void)
 static void
 dependency_noop(void)
 {}
+
+/* This fixture exercises drain ownership, with the observer disabled. */
+static void
+cr_server_trace_origin_gate(bool active pg_attribute_unused())
+{
+	UT_ASSERT(!cluster_update_trace_enabled);
+}
 
 static void
 dependency_legacy_serve(ClusterLmsCrSlot *slot)
