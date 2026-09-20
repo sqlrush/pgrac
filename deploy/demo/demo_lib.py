@@ -15,6 +15,15 @@ DEFAULT_IMAGE = "ghcr.io/sqlrush/pgrac-demo:" + DEMO_VERSION
 DATABASE_UID = 10001
 
 
+def security_status(text, uid):
+    fields = dict(re.findall(r"^(NoNewPrivs|CapEff|CapBnd|Seccomp):\s+(\S+)", text, re.M))
+    if (uid != DATABASE_UID or fields.get("NoNewPrivs") != "1"
+            or fields.get("CapEff") != "0000000000000000"
+            or fields.get("CapBnd") != "0000000000000000" or fields.get("Seccomp") != "2"):
+        raise ValueError("require UID 10001, no-new-privileges, zero capabilities and seccomp")
+    return fields
+
+
 def check_port_free(port):
     # Match PostgreSQL's SO_REUSEADDR: old TIME_WAIT is not a live listener.
     with socket.socket() as sock:
@@ -134,7 +143,8 @@ def pod_documents(name, image, storage, loops):
                 "containers": [{"name": "db", "image": image, "imagePullPolicy": "Never",
                                 "args": ["node", str(i)], "securityContext": {
                                     "runAsUser": DATABASE_UID, "runAsGroup": DATABASE_UID,
-                                    "allowPrivilegeEscalation": False,
+                                    # The image's setpriv entry point applies NNP after
+                                    # AppArmor admission (Ubuntu crun stub compatibility).
                                     "capabilities": {"drop": ["ALL"]}},
                                 "volumeMounts": mounts}], "volumes": volumes}})
     return documents

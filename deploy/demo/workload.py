@@ -89,11 +89,11 @@ def execute(demo, args):
             for i in range(4):
                 log = (report / ("pgbench-node%d.log" % i)).open("x")
                 outputs.append(log)
-                children.append(subprocess.Popen([
-                    "podman", "exec", demo.container(i), "pgbench", "-h", "127.0.0.1",
+                children.append(subprocess.Popen(demo.client_command(i, [
+                    "pgbench", "-h", "127.0.0.1",
                     "-p", str(demo.state["port_base"]+i), "-U", "pgrac", "-n",
                     "-c", str(args.clients), "-j", str(args.clients), "-T", str(args.seconds),
-                    "-D", "rows="+str(rows), "-f", "/opt/pgrac/demo/sql/update.sql", "postgres"],
+                    "-D", "rows="+str(rows), "-f", "/opt/pgrac/demo/sql/update.sql", "postgres"]),
                     stdout=log, stderr=subprocess.STDOUT))
             # Natural completion only. No forced cancellation is hidden as success.
             codes = [child.wait() for child in children]

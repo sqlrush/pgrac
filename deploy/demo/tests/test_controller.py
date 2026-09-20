@@ -16,6 +16,20 @@ loader.exec_module(controller)
 
 
 class Teardown(unittest.TestCase):
+    def test_runtime_command_uses_explicit_owned_working_directory(self):
+        with patch.object(controller.subprocess, "run", return_value=Mock(returncode=0)) as child:
+            controller.run(["podman", "kube", "play", "--build=false", "/owned/pods.yaml"],
+                           cwd=Path("/owned"))
+            self.assertEqual(child.call_args.kwargs["cwd"], Path("/owned"))
+
+    def test_clients_set_no_new_privileges_before_exec(self):
+        demo = object.__new__(controller.Demo)
+        demo.args = Mock()
+        demo.args.name = "demo"
+        self.assertEqual(demo.client_command(2, ["psql", "-X"], ["-i"]),
+                         ["podman", "exec", "-i", "pgrac-demo-2-db",
+                          "setpriv", "--no-new-privs", "psql", "-X"])
+
     def deployment(self, root):
         demo = object.__new__(controller.Demo)
         demo.args = Mock(name="demo")

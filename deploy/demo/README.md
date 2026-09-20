@@ -59,6 +59,11 @@ sudo modprobe loop
 `--port-base` 可在首次部署时改 SQL 基础端口，控制端口偏移 +100、数据端口偏移 +200；同一部署后续保持原值。
 所有 Pod 使用 host network，数据库进程使用 UID/GID 10001，**不是 privileged 容器**；部署工具使用 sudo 管理本演示专属设备。
 
+镜像入口通过 `setpriv --no-new-privs` 禁止数据库及其子进程提权，并实际校验
+UID 10001、零 capabilities、seccomp 开启。此标志在容器 AppArmor 配置生效之后设置，
+避免部分 Ubuntu 24.04/crun 组合的 TCP 权限缺陷；不关闭主机 AppArmor/SELinux。
+`up` 会在接触数据库目录前实际测试受限容器的 TCP socket；失败时先处理运行环境，不添加 privileged。
+
 ## 2. 下载部署包与镜像
 
 ```bash

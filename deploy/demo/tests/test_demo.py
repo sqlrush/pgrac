@@ -144,10 +144,24 @@ class DemoPolicies(unittest.TestCase):
             self.assertEqual(db["args"], ["node", str(i)])
             self.assertEqual(db["securityContext"]["runAsUser"], 10001)
             self.assertFalse(db["securityContext"].get("privileged", False))
-            self.assertFalse(db["securityContext"]["allowPrivilegeEscalation"])
+            # setpriv applies NNP after the container AppArmor transition.
+            # Runtime-applied NNP stacks Ubuntu's crun stub onto this profile.
+            self.assertNotIn("allowPrivilegeEscalation", db["securityContext"])
             devices = [v["hostPath"]["path"] for v in spec["volumes"]
                        if v.get("hostPath", {}).get("type") == "BlockDevice"]
             self.assertEqual(devices, ["/dev/loop7", "/dev/loop8", "/dev/loop9"])
+
+    def test_entrypoint_requires_actual_kernel_security_not_a_manifest_claim(self):
+        status = "NoNewPrivs:\t1\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nSeccomp:\t2\n"
+        self.assertEqual(core.security_status(status, 10001)["NoNewPrivs"], "1")
+        for invalid in (status.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+                        status.replace("CapEff:\t0000000000000000", "CapEff:\t0000000000000001"),
+                        status.replace("CapBnd:\t0000000000000000", "CapBnd:\t0000000000000001"),
+                        status.replace("Seccomp:\t2", "Seccomp:\t0"), ""):
+            with self.assertRaises(ValueError):
+                core.security_status(invalid, 10001)
+        with self.assertRaises(ValueError):
+            core.security_status(status, 0)
             self.assertEqual(json.loads(json.dumps(pod)), pod)
 
     def test_population_refuses_existing_data_and_unbounded_geometry(self):

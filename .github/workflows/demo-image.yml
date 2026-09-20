@@ -37,15 +37,11 @@ jobs:
           sudo modprobe loop
       - name: Build frozen product image natively
         run: sudo podman build --network=host -t localhost/pgrac-demo:v0.131.0-demo.1 deploy/demo
-      - name: Diagnose restricted socket admission before database startup
+      - name: Prove restricted socket admission before database startup
         run: |
           set -euo pipefail
-          probe='import ctypes, pathlib, socket; print(pathlib.Path("/proc/self/attr/current").read_text(), flush=True); print([x for x in pathlib.Path("/proc/self/status").read_text().splitlines() if x.startswith(("NoNewPrivs:", "CapEff:", "Seccomp:"))], flush=True); c=ctypes.CDLL(None, use_errno=True); assert c.prctl(38, 1, 0, 0, 0)==0; print("NNP set inside entry point", flush=True); s=socket.socket(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP); s.bind(("127.0.0.1", 0)); s.listen(); print("socket PASS", flush=True)'
           sudo podman run --rm --network=host --cap-drop=ALL --user=10001:10001 \
-            --entrypoint python3 localhost/pgrac-demo:v0.131.0-demo.1 -c "$probe"
-          sudo podman run --rm --network=host --cap-drop=ALL --user=10001:10001 \
-            --security-opt=no-new-privileges --entrypoint python3 \
-            localhost/pgrac-demo:v0.131.0-demo.1 -c "$probe"
+            localhost/pgrac-demo:v0.131.0-demo.1 runtime-check
       - name: Four Pods, full rows, workload, normal restart, workload
         run: deploy/demo/ci-smoke.sh localhost/pgrac-demo:v0.131.0-demo.1
       - name: Retain summaries and runtime-only failure evidence

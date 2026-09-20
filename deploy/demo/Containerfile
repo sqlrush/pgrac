@@ -38,4 +38,5 @@ ENV PATH="/opt/pgrac/bin:$PATH" LANG=C.UTF-8 \
 USER 10001:10001
 WORKDIR /demo
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["python3", "/opt/pgrac/demo/entrypoint.py"]
+# Set NNP after the container's AppArmor transition, before any database code.
+ENTRYPOINT ["setpriv", "--no-new-privs", "python3", "/opt/pgrac/demo/entrypoint.py"]
