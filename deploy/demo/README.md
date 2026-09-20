@@ -1,5 +1,12 @@
 # PGRAC 单机四 Pod 安装与演示手册
 
+> 发布状态（2026-09-20）：部署包已合入 main，预发布容器演练曾在 AMD64/ARM64
+> 两种架构通过；但最终镜像发布复测在 AMD64 正常停机阶段发现 FATAL/PANIC，
+> 因此 **v0.131.0-demo.1 镜像尚未发布，暂不可作为客户交付包使用**。
+> 下列镜像拉取命令需等待发布解除阻塞后再执行；不要通过重跑碰运气、忽略错误
+> 或强制重置数据绕过停机检查。失败记录见
+> [发布验证](https://github.com/sqlrush/pgrac/actions/runs/35500993944)。
+
 本包在**一台 Linux 主机**上运行四个独立 PGRAC 实例，四个 Pod 共同访问该主机的持久目录和三个演示投票设备。
 数据库版本为 **v0.131.0**，演示镜像版本为 **v0.131.0-demo.1**。
 
@@ -38,12 +45,188 @@ sudo modprobe loop
 
 ### 存储要求
 
-- `/var/lib/pgrac-demo` 必须位于主机的本地 ext4、XFS 或 Btrfs 文件系统；不得用 NFS、CIFS、FUSE、对象存储或跨主机共享挂载替代。
-- **无需格式化磁盘、修改 fstab、配置 GFS2 或手工创建 loop 设备。**已有本地文件系统即可。
-- 主机没有独立磁盘时，直接使用 `/var/lib` 所在文件系统。若要换磁盘，请由管理员先完成正常挂载，部署开始后不要变更挂载或目录身份。
-- 工具只在 `/var/lib/pgrac-demo/<名称>` 下创建数据。已有同名非受管目录、符号链接、旧数据身份不匹配均拒绝，不会自动覆盖。
-- 用户表数据以普通文件保存在共享目录；投票介质是三个专属文件映射出来的 loop **块设备**，工具验证 direct I/O 后才交给四个 Pod。不是把业务数据库放到裸盘。
-- 三个投票设备仍在同一主机/磁盘上，没有三个独立故障域，也不提供存储高可用。
+#### 1.1 采用什么共享存储
+
+本包的“共享”是**同一台 Linux 主机上的四个 Pod 读写同一份持久数据**，不是四台主机同时挂载同一个 LUN。
+主机文件系统只挂载一次；Pod 通过 `hostPath` 访问同一个目录，因此不需要 GFS2、NFS、SAN 或 Kubernetes PVC。
+
+| 对象 | 宿主机上的存放方式 | 四个 Pod 中的访问方式 |
+|---|---|---|
+| 部署持久目录 | `/var/lib/pgrac-demo/demo/storage` | 四个 Pod 均映射为 `/demo`，读写同一份宿主机内容 |
+| 共享业务数据 | `storage/tap/<生成的共享目录>` 中的普通数据库文件 | 四节点的 `cluster.shared_data_dir` 指向同一个 `/demo/tap/...` |
+| PGDATA、WAL | 四个独立节点目录 | 每个实例使用自己的 PGDATA 和 WAL，不共用一个 PGDATA |
+| 投票介质 | 三个专属文件，各映射到一个 loop 块设备 | 四节点访问同一组 `/dev/pgrac-vote0`、`1`、`2` |
+| 管理与校验记录 | 部署根目录下的 `control.json`、`pods.yaml`、`reports/` | 不作为数据库共享关系目录使用 |
+
+默认部署名称是 `demo`。使用 `--name customer1` 时，根目录变为 `/var/lib/pgrac-demo/customer1`；
+下文示例中的名称和 Pod 名也应相应替换，后续所有命令保持同一名称。
+
+```text
+宿主机 /var/lib/pgrac-demo/demo/
+├─ control.json                     root 管理的设备、镜像与数据身份记录
+├─ pods.yaml                        四份 Pod 定义，含实际 hostPath / loop 映射
+├─ reports/                         初始化、校验、压测结果
+└─ storage/  ─────────────────────→ 四个 Pod 的 /demo
+   ├─ bootstrap.json                实际共享目录、四节点 PGDATA、投票文件路径
+   └─ tap/
+      ├─ t_bootstrap_pgrac_demo_node0_data/pgdata/   节点 0
+      ├─ t_bootstrap_pgrac_demo_node1_data/pgdata/   节点 1
+      ├─ t_bootstrap_pgrac_demo_node2_data/pgdata/   节点 2
+      ├─ t_bootstrap_pgrac_demo_node3_data/pgdata/   节点 3
+      ├─ <生成的共享目录>/                         四节点共享业务数据
+      └─ <生成的投票目录>/disk0、disk1、disk2        三个投票 backing 文件
+```
+
+两个生成目录通常名为 `tmp_test_XXXX`，后缀每次初始化不同，以上尖括号不是需要创建的目录名。
+**这些目录虽然带 `tmp_test`，仍是本演示的持久数据，不可按临时文件清理。**
+实际路径以 `storage/bootstrap.json` 为准，不能复制另一场景的随机后缀。
+
+#### 1.2 安装前准备文件系统、容量与权限
+
+1. 使用主机已有的本地 **ext4、XFS 或 Btrfs** 文件系统；脚本拒绝 NFS、CIFS、FUSE 等其他类型。
+   已有演练在 Ubuntu 24.04/ext4（AMD64、ARM64）及 Rocky Linux/Btrfs（ARM64）上运行；
+   XFS 在预检允许列表中，但本交付尚未做 XFS 专项实测。整包发布状态仍以上方警示为准。
+2. 建议至少 20 GiB 可用空间，预检硬下限为 10 GiB。这个空间供共享数据、四份 PGDATA/WAL、
+   日志和报告共同使用；镜像缓存还会占用 Podman 自己的存储空间，测试数据越多所需空间越大。
+3. 使用默认磁盘时，**无需分区、格式化、修改 fstab 或手工创建 loop 设备**。
+   如果要使用独立数据盘，请管理员在**首次部署之前**将已准备好的本地文件系统持久挂载到
+   `/var/lib/pgrac-demo`，确认重启后仍会挂载同一文件系统；不要在已有场景上覆盖挂载、搬目录或换盘。
+   本包不提供任意数据根路径参数，也不提供数据盘迁移功能。
+4. 挂载根目录须由 root 管理，不允许组或其他用户写入。不要预建 `/var/lib/pgrac-demo/demo`：
+   `up` 必须自己创建新的部署目录；碰到已有非受管同名目录会拒绝，而不是覆盖。
+5. 不手工递归 `chmod/chown`。脚本将部署根目录设为 root 管理、0700，`storage` 设为
+   UID/GID `10001:10001`、0700，并为数据库安排设备访问权限。不要改为 0777 或 privileged 容器。
+
+在第 2 节下载脚本后，先运行只做预检的命令；它可能创建管理根目录，但不会初始化数据库或挂接投票设备：
+
+```bash
+sudo modprobe loop
+test -c /dev/loop-control
+sudo ./pgrac-demo check
+findmnt -T /var/lib/pgrac-demo -o TARGET,SOURCE,FSTYPE,OPTIONS
+df -h /var/lib/pgrac-demo
+sudo stat -c '%U:%G %a %n' /var/lib/pgrac-demo
+```
+
+应看到 `"check": "PASS"`、预期的本地文件系统和足够空间。新建默认管理根目录为 `root:root 755`；
+已有合规根目录可以更严格，但必须 root 所有且组/其他用户不可写。若另挂了数据盘，
+还需人工核对 `findmnt` 的 `SOURCE` 确实是预定磁盘，预检 PASS 不替代这项检查。
+不要直接使用普通 ext4/XFS/Btrfs 同时在多台主机上读写挂载同一个 LUN。
+
+#### 1.3 Voting disk 如何制备与映射
+
+`up` 对**全新部署**自动执行以下步骤，不需要客户运行 `mkfs`、`dd` 或手工 `losetup`：
+
+1. 初始化程序创建 `disk0`、`disk1`、`disk2`，写入 PGRAC 所需的投票介质格式；
+   不是仅创建三个空文件，也不是给它们格式化 ext4。
+2. 每个文件固定为 **525,824 字节**，在映射前完成制备；这是本演示的固定介质大小，
+   不是生产共享盘的容量建议，不能自行扩容后继续沿用原身份记录。
+3. 控制器使用 `losetup --find --show --direct-io=on` 为三个文件分配三个空闲 loop 设备，
+   再检查实际 direct I/O 状态、块设备容量、backing 文件和设备身份；不通过就拒绝启动。
+4. 三个实际设备同时映射给四个 Pod。不是每个 Pod 各创建一份，也不把宿主机整个 `/dev` 挂进去。
+
+```text
+宿主机 backing 文件           宿主机设备（动态分配）       四个 Pod 内一致的设备名
+<投票目录>/disk0 ───────────→ /dev/loopN ───────────────→ /dev/pgrac-vote0
+<投票目录>/disk1 ───────────→ /dev/loopM ───────────────→ /dev/pgrac-vote1
+<投票目录>/disk2 ───────────→ /dev/loopK ───────────────→ /dev/pgrac-vote2
+```
+
+`N/M/K` 代表三个不同的实际编号，不能在脚本或运维命令中假定总是 `loop0/1/2`。
+数据库运行期间访问的是容器内的**块设备**，不是把 backing 文件路径直接当作最终投票配置。
+`bootstrap.json` 的 `voting` 字段记录 backing 文件，而 `pods.yaml` 记录设备映射，二者用途不同。
+控制器管理的设备访问权限为 UID/GID `10001:10001`、0600；成功正常停机后恢复原权限再解除映射。
+
+**三个设备仍位于同一主机、同一底层文件系统，不是三个独立故障域。**
+它们用于演示投票介质访问和四节点协同，不提供存储高可用，也没有替代生产外部 fencing。
+本控制器没有接入客户现有 SAN/LUN 的配置入口，不要将真实共享盘设备替换进生成清单。
+
+#### 1.4 四节点实际数据库配置
+
+以下为脚本生成的配置示意，**无需手工粘贴到现有数据库**：
+
+```conf
+cluster.shared_storage_backend = cluster_fs
+cluster.shared_data_dir = '/demo/tap/<实际生成的共享目录>'
+cluster.smgr_user_relations = on
+
+cluster.voting_disks = '/dev/pgrac-vote0,/dev/pgrac-vote1,/dev/pgrac-vote2'
+cluster.voting_disk_size_bytes = 525824
+
+fsync = on
+full_page_writes = on
+synchronous_commit = on
+```
+
+| 参数 | 本包中的含义与核对要求 |
+|---|---|
+| `cluster.shared_storage_backend` | `cluster_fs`，通过文件系统访问共享关系数据 |
+| `cluster.shared_data_dir` | 初始化时生成的容器内共享目录；四节点必须完全相同 |
+| `cluster.smgr_user_relations` | `on`，用户关系使用共享存储路径 |
+| `cluster.voting_disks` | 三个容器内块设备路径；顺序与 disk0/1/2 映射一致，四节点相同 |
+| `cluster.voting_disk_size_bytes` | `525824`；与三个 backing 文件及设备实际容量一致 |
+| 三个持久性开关 | 全部为 `on`；不要为提高演示 TPS 关闭 |
+
+初始化遗留的较早配置行可能仍包含 backing 文件名；**以运行实例的 `SHOW` 结果为准**，
+不要只取配置文件中第一次出现的 `cluster.voting_disks`。
+
+#### 1.5 启动后逐项核验（完成第 3 节后执行）
+
+先查路径、Pod 清单和设备映射，以下命令不修改数据：
+
+```bash
+sudo ./pgrac-demo status
+sudo python3 -m json.tool /var/lib/pgrac-demo/demo/storage/bootstrap.json
+sudo less /var/lib/pgrac-demo/demo/pods.yaml
+sudo losetup --list --output NAME,BACK-FILE,DIO
+```
+
+`status` 应为 `READY` 且四节点运行；`bootstrap.json` 给出真实目录，
+`pods.yaml` 中四个 Pod 的 storage `hostPath` 必须相同，均挂入 `/demo`。
+在 `losetup` 输出中只核对 backing 路径属于本部署的三行，其 `DIO` 应均为 `1`；
+其他行可能属于宿主机或其他应用，禁止对它们进行解绑或改权限。
+
+然后逐节点查看数据库生效配置及 quorum（只读 SQL）：
+
+```bash
+for node in 0 1 2 3; do
+  printf '\nnode%s\n' "$node"
+  printf '%s\n' \
+    'SHOW cluster.shared_storage_backend;' \
+    'SHOW cluster.shared_data_dir;' \
+    'SHOW cluster.smgr_user_relations;' \
+    'SHOW cluster.voting_disks;' \
+    'SHOW cluster.voting_disk_size_bytes;' \
+    'SHOW fsync;' \
+    'SHOW full_page_writes;' \
+    'SHOW synchronous_commit;' \
+    'SELECT in_quorum FROM pg_cluster_quorum_state;' \
+    | sudo ./pgrac-demo --node "$node" sql || break
+done
+```
+
+四个节点应分别输出：`cluster_fs`、同一个实际共享目录、`on`、相同的三个 `/dev/pgrac-vote*`
+路径、`525824`、三个 `on`，最后 quorum 为 `t`。若某节点命令失败、输出缺失或不一致，
+不要继续初始化/压测，也不要修改阈值让它通过。
+这些配置检查不能代替数据校验：第 4 节初始化后还需运行 `verify`，第 5 节压测还需完整 PASS。
+
+#### 1.6 正常停机、重启与数据保留
+
+| 动作 | 数据和投票设备如何处理 |
+|---|---|
+| 首次 `up` | 新建数据与三个投票文件，校验并挂接设备，启动四节点 |
+| 已是 READY 时再次 `up` | 检查已有四节点健康，不重新初始化 |
+| `stop` 成功 | 四节点正常关闭、控制文件和协议收尾日志都通过后，恢复设备原权限并解除本部署的三个 loop 映射；保留文件和数据，标记 CLEAN |
+| CLEAN 后 `up` | 使用相同镜像和原数据、原投票文件，重新核验身份并挂接；宿主机 loop 编号可能变化，容器内路径不变 |
+| 停机/启动失败或异常退出 | 保留现场，不强杀、不重置、不自动恢复，不手工改成 CLEAN |
+
+停机后 `losetup` 中本部署的三行消失是正常的，**不表示投票文件或数据库被删除**。
+持久数据位于宿主机目录，不在可丢弃的容器可写层；但这不等于支持崩溃恢复。
+只看到 `pg_control` 已 shutdown 也不够，必须由控制器确认完整正常停机条件。
+当前发布复测发现的停机缺陷尚未解决，不能凭本节描述认定该场景已具备客户交付资格。
+
+不要对现有场景重新制备投票文件、执行 `losetup -D`、删除 `tmp_test_*`，或移动/覆盖整个 `storage`。
+若部署身份、设备映射或停机检查不通过，保存报告与日志，按第 7 节处理。
 
 ### 网络要求
 
