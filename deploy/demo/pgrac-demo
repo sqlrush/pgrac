@@ -274,7 +274,8 @@ class Demo:
         for i in range(4):
             pod = "pgrac-"+self.args.name+"-"+str(i)
             if run(["podman", "pod", "exists", pod], check=False).returncode == 0:
-                info = json.loads(run(["podman", "pod", "inspect", pod]).stdout)[0]
+                # Unlike legacy `pod inspect`, this is an array on Podman 4 and 5.
+                info = json.loads(run(["podman", "inspect", "--type=pod", pod]).stdout)[0]
                 if not removable_pod(info, self.args.name, i):
                     raise ValueError("Pod is not an owned stopped deployment; refusing to remove it")
                 run(["podman", "pod", "rm", pod])
