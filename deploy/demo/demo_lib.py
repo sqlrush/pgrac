@@ -24,6 +24,11 @@ def security_status(text, uid):
     return fields
 
 
+def sql_startup_ready(logs):
+    return len(logs) == 4 and all(re.search(
+        r"LOG:\s+database system is ready to accept connections\s*$", text, re.M) for text in logs)
+
+
 def check_port_free(port):
     # Match PostgreSQL's SO_REUSEADDR: old TIME_WAIT is not a live listener.
     with socket.socket() as sock:

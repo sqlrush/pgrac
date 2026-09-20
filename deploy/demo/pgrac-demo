@@ -17,7 +17,7 @@ import time
 
 from demo_lib import (DATABASE_UID, DEFAULT_IMAGE, DEMO_VERSION, SOURCE_REVISION,
                       check_port_free, exact_loop, pod_documents, removable_pod,
-                      safe_root, start_action, storage_relative)
+                      safe_root, sql_startup_ready, start_action, storage_relative)
 
 BASE = Path("/var/lib/pgrac-demo")
 HERE = Path(__file__).resolve().parent
@@ -292,7 +292,11 @@ class Demo:
             stdout=sys.stdout, cwd=self.root)
         deadline = time.monotonic() + 180
         while time.monotonic() < deadline:
-            if all(self.sql(i, "SELECT 1;", check=False, timeout=10).returncode == 0 for i in range(4)):
+            # A connection during startup itself generates a FATAL rejection.
+            # Wait for this launch's ready messages before actively probing SQL.
+            logs_exist = all(self.host_path(n["log"]).is_file() for n in self.state["fixture"]["nodes"])
+            if (logs_exist and sql_startup_ready(self.new_logs(self.state["start_log_offsets"]))
+                    and all(self.sql(i, "SELECT 1;", check=False, timeout=10).returncode == 0 for i in range(4))):
                 break
             time.sleep(0.5)
         else:

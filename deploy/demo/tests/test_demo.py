@@ -150,6 +150,7 @@ class DemoPolicies(unittest.TestCase):
             devices = [v["hostPath"]["path"] for v in spec["volumes"]
                        if v.get("hostPath", {}).get("type") == "BlockDevice"]
             self.assertEqual(devices, ["/dev/loop7", "/dev/loop8", "/dev/loop9"])
+            self.assertEqual(json.loads(json.dumps(pod)), pod)
 
     def test_entrypoint_requires_actual_kernel_security_not_a_manifest_claim(self):
         status = "NoNewPrivs:\t1\nCapEff:\t0000000000000000\nCapBnd:\t0000000000000000\nSeccomp:\t2\n"
@@ -162,7 +163,13 @@ class DemoPolicies(unittest.TestCase):
                 core.security_status(invalid, 10001)
         with self.assertRaises(ValueError):
             core.security_status(status, 0)
-            self.assertEqual(json.loads(json.dumps(pod)), pod)
+
+    def test_sql_probe_waits_for_all_four_current_startup_logs(self):
+        ready = "2026-09-20 UTC [2] LOG:  database system is ready to accept connections\n"
+        self.assertTrue(core.sql_startup_ready([ready]*4))
+        self.assertFalse(core.sql_startup_ready([ready]*3))
+        self.assertFalse(core.sql_startup_ready([ready]*3+["listening on IPv4 address\n"]))
+        self.assertFalse(core.sql_startup_ready([""]*4))
 
     def test_population_refuses_existing_data_and_unbounded_geometry(self):
         self.assertTrue(callable(getattr(core, "population_rows", None)), "population guard missing")
