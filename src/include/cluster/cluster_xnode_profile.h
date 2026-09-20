@@ -94,6 +94,19 @@ typedef enum ClusterXnodeBucket {
 	CLXP_C_COMMIT_TT_STAMP,	   /* pre-commit durable TT slot commit_scn stamp */
 	CLXP_C_COMMIT_WAL_FLUSH,   /* commit-record XLogFlush (incl. group-commit queue) */
 	CLXP_C_COMMIT_QUORUM_READ, /* PRE_COMMIT local quorum/lease read */
+	/* Diagnostic wait classes attached to the storage-UPDATE trace. */
+	CLXP_I_ITL_WAIT,
+	CLXP_I_TX_WAIT,
+	CLXP_UPDATE_SCAN,
+	CLXP_UPDATE_STORAGE,
+	CLXP_UPDATE_INDEX,
+	CLXP_R4_CR_FETCH,
+	CLXP_R4_TX_RPC,
+	CLXP_R4_SOURCE_CR_RPC,
+	CLXP_RESOURCE_X_ACQUIRE,
+	CLXP_BUFFER_LOCK,
+	CLXP_UNDO_RECEIPT_PREPARE,
+	CLXP_UNDO_VERDICT_RPC,
 	CLXP_NBUCKETS
 } ClusterXnodeBucket;
 
@@ -197,6 +210,7 @@ typedef struct ClusterXpScope {
 	bool active;
 	ClusterXnodeBucket bucket;
 	instr_time start;
+	uint64 trace_token;
 } ClusterXpScope;
 
 /* Set once by shmem init; NULL until the region is attached. */
@@ -227,6 +241,10 @@ extern const char *cluster_xp_bucket_name(ClusterXnodeBucket b);
 extern PGDLLIMPORT const uint32 cluster_xp_hist_edge_us[CLXP_HIST_NEDGES];
 extern const char *cluster_xp_hist_component_name(ClusterXpHistComponent c);
 
+/* Per-UPDATE diagnostic sink; no-op unless cluster.update_trace is enabled. */
+extern uint64 cluster_update_trace_phase_begin_at(int bucket, uint64 now);
+extern void cluster_update_trace_phase_end_at(uint64 token, uint64 now);
+
 /*
  * cluster_xp_begin / cluster_xp_end -- wrap a timed interval.
  *
@@ -237,19 +255,30 @@ extern const char *cluster_xp_hist_component_name(ClusterXpHistComponent c);
 static inline void
 cluster_xp_begin(ClusterXpScope *s, ClusterXnodeBucket b)
 {
-	if (likely(!cluster_xnode_profile_enabled) || ClusterXnodeProfileCtl == NULL) {
+	if (likely(!cluster_xnode_profile_enabled && !cluster_update_trace_enabled)
+		|| ClusterXnodeProfileCtl == NULL) {
 		s->active = false;
 		return;
 	}
 	s->active = true;
 	s->bucket = b;
 	INSTR_TIME_SET_CURRENT(s->start);
+	s->trace_token = cluster_update_trace_enabled
+						 ? cluster_update_trace_phase_begin_at(
+							   (int)b, (uint64)INSTR_TIME_GET_NANOSEC(s->start))
+						 : 0;
 }
 
 /* Discard a started scope without accumulating (conditional paths). */
 static inline void
 cluster_xp_abort(ClusterXpScope *s)
 {
+	if (s->active && s->trace_token != 0) {
+		instr_time now;
+
+		INSTR_TIME_SET_CURRENT(now);
+		cluster_update_trace_phase_end_at(s->trace_token, (uint64)INSTR_TIME_GET_NANOSEC(now));
+	}
 	s->active = false;
 }
 
@@ -264,10 +293,14 @@ cluster_xp_end(ClusterXpScope *s)
 		return;
 	s->active = false;
 	INSTR_TIME_SET_CURRENT(now);
+	if (s->trace_token != 0)
+		cluster_update_trace_phase_end_at(s->trace_token, (uint64)INSTR_TIME_GET_NANOSEC(now));
 	INSTR_TIME_SUBTRACT(now, s->start);
 	nanos = (uint64)INSTR_TIME_GET_NANOSEC(now);
-	pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].total_nanos, nanos);
-	pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].n_events, 1);
+	if (cluster_xnode_profile_enabled) {
+		pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].total_nanos, nanos);
+		pg_atomic_fetch_add_u64(&ClusterXnodeProfileCtl->bucket[s->bucket].n_events, 1);
+	}
 
 	/*
 	 * spec-7.4 D4: commit-decomposition buckets also fold the sample into a
@@ -276,7 +309,7 @@ cluster_xp_end(ClusterXpScope *s)
 	 * axes keep their exact prior behaviour.
 	 */
 	slot = cluster_xp_hist_slot_for(s->bucket);
-	if (slot >= 0)
+	if (cluster_xnode_profile_enabled && slot >= 0)
 		pg_atomic_fetch_add_u64(
 			&ClusterXnodeProfileCtl->hist[slot][cluster_xp_hist_bucket_index(nanos)], 1);
 }

@@ -6041,6 +6041,145 @@ UT_TEST(test_resource_x_bootstrap_round_waits_only_for_exact_target_install)
 		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), &installing));
 }
 
+UT_TEST(test_resource_x_pre_t1_reservation_declines_optional_install_capture)
+{
+	BufferTag tag = make_tag(17213);
+	ResourceXAssertion assertion;
+	ResourceXDecodedFrame request;
+	ResourceXDecodedFrame ack;
+	ResourceXDecodedFrame assert_frame;
+	ResourceXAcquisitionRef terminal_ref;
+	ResourceXAcquisitionRef ref;
+	ResourceXTargetInstallContinuation follow;
+	ResourceXBootstrapRoundFailureSnapshot before;
+	ResourceXBootstrapRoundFailureSnapshot after;
+	ClusterPcmOwnSnapshot observed = { 0 };
+	ClusterPcmOwnSnapshot malformed;
+	ResourceXTargetInstallFollowState state;
+	struct StopPcmEntryLayout *entry;
+	struct StopPcmEntryLayout clean_entry;
+	int fault;
+
+	reset_fake_pcm_runtime(4);
+	cluster_node_id = 1;
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_gate_bind_formation_exact(17),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT(resource_x_assertion_init(&tag, 1, &assertion));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_step_exact(
+					 &assertion, 0, 17, 31, 77, 51, 61, UINT64_C(1000), UINT64_C(900),
+					 UINT64_C(100), UINT64_C(50), false, 0, &request, &terminal_ref),
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_REQUEST);
+	ack = make_resource_x_bootstrap_ack_values(&request, UINT64_C(9), UINT32_C(71));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_accept_ack_exact(
+					 &ack, 0, 61, 77, UINT64_C(110), &assert_frame),
+				 RESOURCE_X_BOOTSTRAP_ROUND_DISPATCH_ASSERT);
+	observed.tag = tag;
+	observed.pcm_state = (uint8)PCM_STATE_N;
+	observed.flags = PCM_OWN_FLAG_GRANT_PENDING;
+	observed.generation = 24;
+	observed.reservation_token = 21;
+	memset(&before, 0, sizeof(before));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+					 &assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), &before),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(before.progress_flags, UINT32_C(0));
+	UT_ASSERT(!cluster_pcm_lock_resource_x_bootstrap_round_target_install_inflight_exact(
+		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), &observed));
+	/* A reversible N reservation is not this round's T1 install. Decline
+	 * optional capture, exporting no authority, so the real caller's exact
+	 * local-reservation wait remains reachable. Never invent an installer. */
+	memset(&follow, 0x7f, sizeof(follow));
+	state = cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), UINT64_C(900), &observed, &follow);
+	UT_ASSERT_EQ(state, RESOURCE_X_TARGET_INSTALL_STALE);
+	UT_ASSERT(!follow.valid);
+	UT_ASSERT(cluster_gcs_resource_x_target_local_n_reservation_retry_exact(
+		&observed, CLUSTER_PCM_OWN_OK, &observed, UINT64_C(120), UINT64_C(900)));
+	memset(&after, 0, sizeof(after));
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_bootstrap_round_failure_snapshot_exact(
+					 &assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), &after),
+				 RESOURCE_X_APPLY_APPLIED);
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	for (fault = 0; fault < 6; fault++) {
+		malformed = observed;
+		if (fault == 0)
+			malformed.pcm_state = (uint8)PCM_STATE_S;
+		else if (fault == 1)
+			malformed.pcm_state = (uint8)PCM_STATE_READ_IMAGE;
+		else if (fault == 2)
+			malformed.writer_activation_token = 21;
+		else if (fault == 3)
+			malformed.resource_x_activation_generation = 1;
+		else if (fault == 4)
+			malformed.flags |= PCM_OWN_FLAG_REVOKING;
+		else
+			malformed.flags = 0;
+		state = cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+			&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), UINT64_C(900), &malformed, &follow);
+		UT_ASSERT_EQ(state, RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED);
+		UT_ASSERT(!follow.valid);
+	}
+
+	/* Zero flags alone cannot establish an empty requester ledger. Corrupt
+	 * one field at a time through the production-generated fixture layout;
+	 * the optional observation must not turn corruption or retirement into
+	 * ordinary reservation waiting. No production test hook is involved. */
+	entry = hash_search((HTAB *)&fake_pcm_htab_token, &tag, HASH_FIND, NULL);
+	UT_ASSERT_NOT_NULL(entry);
+	clean_entry = *entry;
+	for (fault = 0; fault < 11; fault++) {
+		*entry = clean_entry;
+		switch (fault) {
+		case 0:
+			entry->resource_x_requester_node = 1;
+			break;
+		case 1:
+			entry->resource_x_formation = 17;
+			break;
+		case 2:
+			entry->resource_x_acquisition_generation = 1;
+			break;
+		case 3:
+			entry->resource_x_no_progress_generation = 1;
+			break;
+		case 4:
+			entry->resource_x_no_progress_reason = RESOURCE_X_NO_PROGRESS_BUFFER_CORRUPT;
+			break;
+		case 5:
+			entry->resource_x_dispatch_phase = 1;
+			break;
+		case 6:
+			entry->resource_x_requester_base_generation = 0;
+			break;
+		case 7:
+			entry->resource_x_requester_base_generation = UINT64_MAX;
+			break;
+		case 8:
+			entry->resource_x_retired_acquisition_generation = UINT64_MAX;
+			break;
+		case 9:
+			entry->resource_x_retired_acquisition_generation = 1;
+			break;
+		case 10:
+			entry->resource_x_retired_acquisition_generation = 2;
+			break;
+		}
+		state = cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+			&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), UINT64_C(900), &observed, &follow);
+		UT_ASSERT_EQ(state, RESOURCE_X_TARGET_INSTALL_RECOVERY_BLOCKED);
+		UT_ASSERT(!follow.valid);
+	}
+	*entry = clean_entry;
+
+	/* The existing T1 owner, not this observation, makes it waitable. */
+	ref = make_resource_x_acquisition_ref(tag, 1, 17, 1);
+	UT_ASSERT_EQ(cluster_pcm_lock_resource_x_t1_grant_exact(&ref), RESOURCE_X_APPLY_APPLIED);
+	state = cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
+		&assertion, 0, 17, 31, 77, 51, 61, UINT64_C(50), UINT64_C(900), &observed, &follow);
+	UT_ASSERT_EQ(state, RESOURCE_X_TARGET_INSTALL_INFLIGHT);
+	UT_ASSERT(follow.valid);
+}
+
 UT_TEST(test_resource_x_bootstrap_round_waits_across_exact_post_t3_cover_window)
 {
 	BufferTag tag = make_tag(214);
@@ -19058,7 +19197,7 @@ UT_TEST(test_stop_seal_keeps_original_identity_validation_first)
 int
 main(void)
 {
-	UT_PLAN(281);
+	UT_PLAN(282);
 	UT_RUN(test_pcm_normal_stop_missing_is_not_empty);
 	UT_RUN(test_pcm_lock_mode_constant_aliases_match_pcm_state);
 	UT_RUN(test_pcm_lock_transition_count_is_9);
@@ -19166,6 +19305,7 @@ main(void)
 	UT_RUN(test_resource_x_drained_drop_pair_rejects_old_requester_attempt);
 	UT_RUN(test_resource_x_drained_drop_pair_requires_new_terminal_authority);
 	UT_RUN(test_resource_x_bootstrap_round_waits_only_for_exact_target_install);
+	UT_RUN(test_resource_x_pre_t1_reservation_declines_optional_install_capture);
 	UT_RUN(test_resource_x_bootstrap_round_waits_across_exact_post_t3_cover_window);
 	UT_RUN(test_resource_x_target_install_continuation_classifies_exact_attempt);
 	UT_RUN(test_resource_x_target_install_stable_direct_init_i0_t2_is_closed);

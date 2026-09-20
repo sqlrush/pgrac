@@ -55,6 +55,7 @@
 #include "cluster/cluster_page_guard.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_update_trace.h"
 
 /*
  * postgres.h transitively pulls in port.h which redirects printf etc.
@@ -626,6 +627,13 @@ cluster_ko_shmem_register(void)
  * harness does not link that object, so provide a no-op. */
 void
 cluster_xnode_profile_shmem_register(void)
+{}
+
+/* PGRAC: the aggregate registration object references opt-in UPDATE tracing.
+ * This link-level fixture does not execute module initialization; the real
+ * trace module is exercised by test_cluster_update_trace and live startup. */
+void
+cluster_update_trace_shmem_register(void)
 {}
 
 /* spec-6.12 stub: cluster_init_shmem_module also calls

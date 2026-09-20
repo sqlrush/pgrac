@@ -10654,7 +10654,43 @@ ClusterObserveBufferBarrierReceipt(ClusterBufferBarrierSiteId site_id,
 }
 
 static void
+LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused,
+				   const ClusterBufferBarrierSiteId *barrier_site_id, bool *pcm_pin_replaced,
+				   bool *pcm_x_transient_refused,
+				   struct ResourceXAuxiliaryAcquireContext *aux_context);
+
+/* PGRAC: observational scope only; preserve every result and exception. */
+static void
 LockBufferInternal(Buffer buffer, int mode, bool *pcm_barrier_refused,
+				   const ClusterBufferBarrierSiteId *barrier_site_id, bool *pcm_pin_replaced,
+				   bool *pcm_x_transient_refused,
+				   struct ResourceXAuxiliaryAcquireContext *aux_context)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterXpScope trace;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled))
+	{
+		LockBufferInternal_trace_impl(buffer, mode, pcm_barrier_refused, barrier_site_id, pcm_pin_replaced, pcm_x_transient_refused, aux_context);
+		return;
+	}
+	cluster_xp_begin(&trace, CLXP_BUFFER_LOCK);
+	PG_TRY();
+	{
+		LockBufferInternal_trace_impl(buffer, mode, pcm_barrier_refused, barrier_site_id, pcm_pin_replaced, pcm_x_transient_refused, aux_context);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+#else
+	LockBufferInternal_trace_impl(buffer, mode, pcm_barrier_refused, barrier_site_id, pcm_pin_replaced, pcm_x_transient_refused, aux_context);
+#endif
+}
+
+static void
+LockBufferInternal_trace_impl(Buffer buffer, int mode, bool *pcm_barrier_refused,
 				   const ClusterBufferBarrierSiteId *barrier_site_id, bool *pcm_pin_replaced,
 				   bool *pcm_x_transient_refused,
 				   struct ResourceXAuxiliaryAcquireContext *aux_context)

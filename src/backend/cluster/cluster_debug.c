@@ -106,6 +106,7 @@ PG_FUNCTION_INFO_V1(cluster_dump_state);
 #include "cluster/cluster_cr_admit.h"	   /* cluster_cr_admit_stat_* counters (spec-5.52 D9) */
 #include "cluster/cluster_cr_tuple.h"	   /* cluster_cr_tuple_stat_* counters (spec-5.54 D5) */
 #include "cluster/cluster_xnode_profile.h" /* xnode profiling buckets (spec-5.59 D1) */
+#include "cluster/cluster_update_trace.h"  /* per-UPDATE diagnostic trace */
 #include "cluster/cluster_xnode_lever.h"
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D6 dump */ /* xnode lever counters (spec-6.12) */
 #include "cluster/cluster_multixact.h"		/* mxid stripe guardrail counters (spec-7.1 D3-a) */
@@ -4006,6 +4007,93 @@ dump_xnode_profile(ReturnSetInfo *rsinfo)
 }
 
 /*
+ * dump_update_trace -- raw whole-UPDATE records for an opt-in
+ * diagnostic window.  The value is a compact, self-describing field list so
+ * the rows can be archived with pg_cluster_state and decoded without a
+ * matching server binary. Inclusive sums describe call cost; exclusive sums
+ * plus unattributed time conserve the parent execution wall time.
+ */
+static void
+dump_update_trace(ReturnSetInfo *rsinfo)
+{
+	uint32 count = cluster_update_trace_snapshot_count();
+	uint32 slot;
+	uint32 rows = 0;
+
+	emit_row(rsinfo, "update_trace", "record_capacity",
+			 fmt_int64(CLUSTER_UPDATE_TRACE_MAX_RECORDS));
+	emit_row(rsinfo, "update_trace", "reserved_count", fmt_int64(count));
+	emit_row(rsinfo, "update_trace", "dropped_count",
+			 fmt_int64(cluster_update_trace_dropped_count()));
+
+	for (slot = 0; slot < count; slot++) {
+		ClusterUpdateTraceSnapshot snapshot;
+		StringInfoData key;
+		StringInfoData value;
+		int i;
+
+		if (!cluster_update_trace_snapshot(slot, &snapshot))
+			continue;
+		initStringInfo(&key);
+		initStringInfo(&value);
+		appendStringInfo(&key, "op.%llu", (unsigned long long)snapshot.op_id);
+		appendStringInfo(&value, "node=%d;backend=%d;pid=%d;status=%u;start_ns=%llu;end_ns=%llu",
+						 snapshot.node_id, snapshot.backend_id, snapshot.pid, snapshot.status,
+						 (unsigned long long)snapshot.start_ns,
+						 (unsigned long long)snapshot.end_ns);
+		appendStringInfo(
+			&value,
+			";backend_sequence=%llu;affected_rows=%llu;unattributed_ns=%llu;accounting_errors=%u",
+			(unsigned long long)snapshot.backend_sequence,
+			(unsigned long long)snapshot.affected_rows,
+			(unsigned long long)snapshot.unattributed_ns, snapshot.accounting_errors);
+		for (i = 0; i < CLXP_NBUCKETS; i++) {
+			if (snapshot.phase_events[i] == 0)
+				continue;
+			appendStringInfo(&value, ";phase.%s=%llu,%u",
+							 cluster_xp_bucket_name((ClusterXnodeBucket)i),
+							 (unsigned long long)snapshot.phase_nanos[i], snapshot.phase_events[i]);
+			appendStringInfo(&value, ";exclusive.%s=%llu",
+							 cluster_xp_bucket_name((ClusterXnodeBucket)i),
+							 (unsigned long long)snapshot.phase_exclusive_nanos[i]);
+		}
+		emit_row(rsinfo, "update_trace", key.data, value.data);
+		pfree(key.data);
+		pfree(value.data);
+		rows++;
+	}
+	emit_row(rsinfo, "update_trace", "rows_emitted", fmt_int64(rows));
+	count = cluster_update_trace_event_count();
+	emit_row(rsinfo, "update_trace_event", "record_capacity",
+			 fmt_int64(CLUSTER_UPDATE_TRACE_MAX_EVENTS));
+	emit_row(rsinfo, "update_trace_event", "reserved_count", fmt_int64(count));
+	emit_row(rsinfo, "update_trace_event", "dropped_count",
+			 fmt_int64(cluster_update_trace_event_dropped_count()));
+	for (slot = 0; slot < count; slot++) {
+		ClusterUpdateTraceEvent event;
+		char key[40];
+		StringInfoData value;
+
+		if (!cluster_update_trace_event_snapshot(slot, &event))
+			continue;
+		snprintf(key, sizeof(key), "event.%u", slot);
+		initStringInfo(&value);
+		appendStringInfo(&value,
+						 "node=%d;pid=%d;kind=%u;value=%u;stamp_ns=%llu;request=%llu;op=%llu;"
+						 "requester=%d;backend=%d;slot=%u;generation=%llu;duration_ns=%llu;"
+						 "work_ns=%llu;dependency=%llu",
+						 event.node_id, event.pid, event.kind, event.value,
+						 (unsigned long long)event.stamp_ns, (unsigned long long)event.request_id,
+						 (unsigned long long)event.op_id, event.requester_node,
+						 event.requester_backend, event.slot, (unsigned long long)event.generation,
+						 (unsigned long long)event.duration_ns, (unsigned long long)event.work_ns,
+						 (unsigned long long)event.dependency_request_id);
+		emit_row(rsinfo, "update_trace_event", key, value.data);
+		pfree(value.data);
+	}
+}
+
+/*
  * dump_xnode_lever -- spec-6.12 per-wave lever counters.
  *
  *	Wave-prefixed keys (c_* = wave 6.12c resolver memo + D0 stamp-evidence
@@ -4302,8 +4390,9 @@ cluster_dump_state(PG_FUNCTION_ARGS)
 		dump_ts(rsinfo);
 		dump_ko(rsinfo);
 		dump_xnode_profile(rsinfo); /* spec-5.59 D1 */
-		dump_xnode_lever(rsinfo);	/* spec-6.12 */
-		dump_xid_stripe(rsinfo);	/* spec-6.15 D6 */
+		dump_update_trace(rsinfo);
+		dump_xnode_lever(rsinfo); /* spec-6.12 */
+		dump_xid_stripe(rsinfo);  /* spec-6.15 D6 */
 		dump_multixact_current(rsinfo);
 		dump_ctrc(rsinfo);
 		dump_catalog(rsinfo); /* spec-6.14 D10 */

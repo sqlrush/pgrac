@@ -155,6 +155,9 @@ extern int cluster_recovery_merge_wait_timeout;
 /* spec-5.59 D1: cross-node profiling switch (default off, zero hot-path cost). */
 extern bool cluster_xnode_profile_enabled;
 
+/* Diagnostic per-storage-UPDATE phase trace (default off). */
+extern bool cluster_update_trace_enabled;
+
 /* spec-6.4: ADG physical standby / read-only service configuration. */
 #define CLUSTER_DG_ROLE_PRIMARY 0
 #define CLUSTER_DG_ROLE_STANDBY 1

@@ -48,6 +48,7 @@
  *		not support RETURNING.)
  */
 
+/* PGRAC MODIFICATIONS: opt-in scan/storage/index timing, preserving outcomes. */
 #include "postgres.h"
 
 #include "access/heapam.h"
@@ -71,6 +72,10 @@
 #include "utils/datum.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_update_trace.h" /* diagnostic per-UPDATE trace */
+#endif
 
 
 typedef struct MTTargetRelLookup
@@ -2007,6 +2012,9 @@ ExecUpdateAct(ModifyTableContext *context, ResultRelInfo *resultRelInfo,
 	Relation	resultRelationDesc = resultRelInfo->ri_RelationDesc;
 	bool		partition_constraint_failed;
 	TM_Result	result;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterXpScope update_trace;
+#endif
 
 	updateCxt->crossPartUpdate = false;
 
@@ -2133,13 +2141,26 @@ lreplace:
 	 * for referential integrity updates in transaction-snapshot mode
 	 * transactions.
 	 */
-	result = table_tuple_update(resultRelationDesc, tupleid, slot,
+#ifdef USE_PGRAC_CLUSTER
+	cluster_xp_begin(&update_trace, CLXP_UPDATE_STORAGE);
+	PG_TRY();
+	{
+#endif
+		result = table_tuple_update(resultRelationDesc, tupleid, slot,
 								estate->es_output_cid,
 								estate->es_snapshot,
 								estate->es_crosscheck_snapshot,
 								true /* wait for commit */ ,
 								&context->tmfd, &updateCxt->lockmode,
 								&updateCxt->updateIndexes);
+#ifdef USE_PGRAC_CLUSTER
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&update_trace);
+	}
+	PG_END_TRY();
+#endif
 	if (result == TM_Ok)
 		updateCxt->updated = true;
 
@@ -2162,11 +2183,28 @@ ExecUpdateEpilogue(ModifyTableContext *context, UpdateContext *updateCxt,
 
 	/* insert index entries for tuple if necessary */
 	if (resultRelInfo->ri_NumIndices > 0 && (updateCxt->updateIndexes != TU_None))
+	{
+#ifdef USE_PGRAC_CLUSTER
+		ClusterXpScope index_trace;
+
+		cluster_xp_begin(&index_trace, CLXP_UPDATE_INDEX);
+		PG_TRY();
+		{
+#endif
 		recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
 											   slot, context->estate,
 											   true, false,
 											   NULL, NIL,
 											   (updateCxt->updateIndexes == TU_Summarizing));
+#ifdef USE_PGRAC_CLUSTER
+		}
+		PG_FINALLY();
+		{
+			cluster_xp_end(&index_trace);
+		}
+		PG_END_TRY();
+#endif
+	}
 
 	/* AFTER ROW UPDATE Triggers */
 	ExecARUpdateTriggers(context->estate, resultRelInfo,
@@ -3825,7 +3863,24 @@ ExecModifyTable(PlanState *pstate)
 		if (pstate->ps_ExprContext)
 			ResetExprContext(pstate->ps_ExprContext);
 
+#ifdef USE_PGRAC_CLUSTER
+		{
+			ClusterXpScope scan_trace;
+
+			cluster_xp_begin(&scan_trace, CLXP_UPDATE_SCAN);
+			PG_TRY();
+			{
+				context.planSlot = ExecProcNode(subplanstate);
+			}
+			PG_FINALLY();
+			{
+				cluster_xp_end(&scan_trace);
+			}
+			PG_END_TRY();
+		}
+#else
 		context.planSlot = ExecProcNode(subplanstate);
+#endif
 
 		/* No more tuples to process? */
 		if (TupIsNull(context.planSlot))

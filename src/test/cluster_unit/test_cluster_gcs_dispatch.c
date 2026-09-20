@@ -47,7 +47,9 @@
 
 #include "cluster/cluster_conf.h" /* ClusterNodeInfo (spec-2.33 D2 stub) */
 #include "cluster/cluster_cssd.h" /* PGRAC_IC_MSG_CSSD_HEARTBEAT */
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_gcs_reqid.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_ic_envelope.h"
@@ -94,13 +96,41 @@ int MaxBackends = 100;
 int MyBackendId = 1;
 sigjmp_buf *PG_exception_stack = NULL;
 struct ErrorContextCallback *error_context_stack = NULL;
+static void *fake_shmem;
+static TimestampTz fake_clock;
+static int fake_error_level;
+static bool fake_control_active;
+static bool fake_master_apply = true;
+static bool fake_drop_reply;
+static bool fake_bad_reply_identity;
+static bool fake_send_refused;
+static int fake_reply_status = -1;
+static uint64 fake_last_request_id;
+static uint64 fake_previous_request_id;
+static int fake_ack_degraded;
+
+/* Only the counter touched by the extracted, real block consumer. */
+static struct {
+	pg_atomic_uint64 block_x_granted_from_holder_count;
+} fake_block_counters, *ClusterGcsBlock = &fake_block_counters;
+
+void cluster_lever_a_note_remote_ack_degraded(void);
+
+void
+cluster_lever_a_note_remote_ack_degraded(void)
+{
+	fake_ack_degraded++;
+}
 
 void *
-ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
-				bool *foundPtr)
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
 {
 	*foundPtr = false;
-	return NULL;
+	free(fake_shmem);
+	if (posix_memalign(&fake_shmem, PG_CACHE_LINE_SIZE, size) != 0)
+		abort();
+	memset(fake_shmem, 0, size);
+	return fake_shmem;
 }
 
 HTAB *
@@ -145,10 +175,10 @@ ConditionVariableSleep(ConditionVariable *cv pg_attribute_unused(),
 {}
 
 bool
-ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
-							long timeout pg_attribute_unused(),
+ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(), long timeout,
 							uint32 wait_event_info pg_attribute_unused())
 {
+	fake_clock += (TimestampTz)timeout * 1000;
 	return true;
 }
 
@@ -169,7 +199,7 @@ ConditionVariableBroadcast(ConditionVariable *cv pg_attribute_unused())
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return (TimestampTz)0;
+	return fake_clock;
 }
 
 Size
@@ -237,8 +267,9 @@ ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 }
 
 bool
-errstart(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	fake_error_level = elevel;
 	return true;
 }
 
@@ -251,7 +282,13 @@ errstart_cold(int elevel, const char *domain)
 void
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())
-{}
+{
+	if (fake_error_level >= ERROR) {
+		if (PG_exception_stack == NULL)
+			abort();
+		siglongjmp(*PG_exception_stack, 1);
+	}
+}
 
 int
 errcode(int sqlerrcode pg_attribute_unused())
@@ -271,10 +308,18 @@ errhint(const char *fmt pg_attribute_unused(), ...)
 	return 0;
 }
 
+int
+errdetail(const char *fmt pg_attribute_unused(), ...)
+{
+	return 0;
+}
+
 void
 pg_re_throw(void)
 {
-	abort();
+	if (PG_exception_stack == NULL)
+		abort();
+	siglongjmp(*PG_exception_stack, 1);
 }
 
 /* cluster module stubs */
@@ -293,11 +338,51 @@ cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unus
 {}
 
 ClusterICSendResult
-cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
-						 int32 dest_node_id pg_attribute_unused(),
-						 const void *payload pg_attribute_unused(),
-						 uint32 payload_len pg_attribute_unused())
+cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
+						 uint32 payload_len)
 {
+	ClusterICEnvelope env;
+	int sender = cluster_node_id;
+
+	if (!fake_control_active)
+		return CLUSTER_IC_SEND_DONE;
+	if (fake_send_refused)
+		return CLUSTER_IC_SEND_NOT_ADMITTED;
+	memset(&env, 0, sizeof(env));
+	env.source_node_id = sender;
+	env.dest_node_id = dest_node_id;
+	env.payload_length = payload_len;
+	if (msg_type == PGRAC_IC_MSG_GCS_REQUEST) {
+		const GcsRequestPayload *req = payload;
+
+		UT_ASSERT_EQ(payload_len, sizeof(*req));
+		fake_previous_request_id = fake_last_request_id;
+		fake_last_request_id = req->request_id;
+		if (fake_drop_reply)
+			return CLUSTER_IC_SEND_DONE;
+		cluster_node_id = dest_node_id;
+		if (fake_reply_status >= 0 || fake_bad_reply_identity) {
+			GcsReplyPayload reply;
+			ClusterICEnvelope reply_env;
+
+			memset(&reply, 0, sizeof(reply));
+			memset(&reply_env, 0, sizeof(reply_env));
+			reply.request_id = req->request_id + (fake_bad_reply_identity ? 1 : 0);
+			reply.transition_id = req->transition_id;
+			reply.status = fake_reply_status >= 0 ? fake_reply_status : GCS_REPLY_GRANTED;
+			reply.sender_node = dest_node_id;
+			reply.epoch = req->epoch;
+			reply_env.source_node_id = dest_node_id;
+			reply_env.payload_length = sizeof(reply);
+			cluster_gcs_handle_reply_envelope(&reply_env, &reply);
+		} else
+			cluster_gcs_handle_request_envelope(&env, payload);
+		cluster_node_id = sender;
+	} else if (msg_type == PGRAC_IC_MSG_GCS_REPLY) {
+		UT_ASSERT_EQ(payload_len, sizeof(GcsReplyPayload));
+		cluster_gcs_handle_reply_envelope(&env, payload);
+	} else
+		UT_ASSERT(false);
 	return CLUSTER_IC_SEND_DONE;
 }
 
@@ -343,7 +428,7 @@ cluster_pcm_lock_apply_gcs_transition(BufferTag tag pg_attribute_unused(),
 									  PcmLockTransition trans pg_attribute_unused(),
 									  int holder_node_id pg_attribute_unused())
 {
-	return true;
+	return fake_master_apply;
 }
 
 void
@@ -734,30 +819,164 @@ UT_TEST(test_gcs_reply_identity_is_exact_across_backends)
 }
 
 
-int
-main(void)
+/* The production block consumer starts inside the already verified/installed
+ * holder-image branch. No checksum, image install or ownership rule is mocked
+ * as a grant: only a successful registration may return durable=true. */
+static bool
+run_holder_registration(uint8 final_status, PcmLockTransition transition_id, bool *out_retry,
+						bool *out_image)
 {
-	UT_PLAN(20);
-	UT_RUN(test_gcs_msg_type_enum_values_no_collision);
-	UT_RUN(test_gcs_payload_sizes_locked);
-	UT_RUN(test_gcs_payload_field_offsets);
-	UT_RUN(test_gcs_handler_symbols_linkable);
-	UT_RUN(test_gcs_reply_status_enum_count_is_4);
-	UT_RUN(test_gcs_lookup_master_symbol_linkable);
-	UT_RUN(test_gcs_d7_recovery_aware_reroute);
-	UT_RUN(test_gcs_send_transition_and_wait_symbol_linkable);
-	UT_RUN(test_gcs_register_msg_types_symbol_linkable);
-	UT_RUN(test_gcs_dump_accessors_all_linkable);
-	UT_RUN(test_gcs_get_api_state_stub_before_init);
-	UT_RUN(test_gcs_max_outstanding_per_backend_constant);
-	UT_RUN(test_gcs_internal_deadline_ms_constant);
-	UT_RUN(test_gcs_transition_id_range_invariant_1_to_9);
-	UT_RUN(test_gcs_pcm_validator_accepts_all_9_transitions);
-	UT_RUN(test_gcs_handler_signature_matches_dispatch_table);
-	UT_RUN(test_gcs_lwlock_tranche_distinct_from_pcm);
-	UT_RUN(test_gcs_hc77_sender_no_double_apply_doc);
-	UT_RUN(test_gcs_module_init_helpers_linkable);
-	UT_RUN(test_gcs_reply_identity_is_exact_across_backends);
-	UT_DONE();
-	return ut_failed_count == 0 ? 0 : 1;
-}
+	BufferTag tag;
+	int final_forwarding_master = 1;
+	bool read_image = false;
+	bool retry_denied = false;
+	bool granted = false;
+
+	memset(&tag, 0, sizeof(tag));
+	tag.spcOid = 1663;
+	tag.dbOid = 5;
+	tag.relNumber = 16386;
+	tag.blockNum = 17123;
+	do {
+		{
+#include "test_cluster_gcs_shared_registration.inc"
+			granted = true;
+		}
+		while (false)
+			;
+		*out_retry = retry_denied;
+		*out_image = read_image;
+		return granted;
+	}
+
+	static void reset_control_fixture(void)
+	{
+		cluster_node_id = 0;
+		MyBackendType = B_LMON;
+		fake_control_active = true;
+		fake_master_apply = true;
+		fake_drop_reply = false;
+		fake_bad_reply_identity = false;
+		fake_send_refused = false;
+		fake_reply_status = -1;
+		fake_clock = 1000;
+		fake_error_level = 0;
+		fake_last_request_id = fake_previous_request_id = 0;
+		fake_ack_degraded = 0;
+		cluster_gcs_shmem_init();
+		pg_atomic_init_u64(&ClusterGcsBlock->block_x_granted_from_holder_count, 0);
+	}
+
+	/* Regression: a real, identity-matched refusal after image arrival must
+ * retire its slot and return to the existing fresh-reservation boundary.
+ * Replacing this branch with the old throwing API fails this test. */
+	UT_TEST(test_forwarded_s_registration_refusal_reenters_without_grant)
+	{
+		volatile bool raised = false;
+		bool retry = false;
+		bool image = false;
+		bool granted = false;
+
+		reset_control_fixture();
+		fake_master_apply = false;
+		PG_TRY();
+		{
+			granted = run_holder_registration(GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, PCM_TRANS_N_TO_S,
+											  &retry, &image);
+		}
+		PG_CATCH();
+		{
+			raised = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(!raised);
+		UT_ASSERT(!granted);
+		UT_ASSERT(retry);
+		UT_ASSERT(!image);
+		UT_ASSERT_EQ(cluster_gcs_get_outstanding_count(), 0);
+		UT_ASSERT_EQ(cluster_gcs_get_reply_timeout_count(), 0);
+		UT_ASSERT_EQ(cluster_gcs_get_handle_request_count(), 1);
+		UT_ASSERT_EQ(cluster_gcs_get_handle_reply_count(), 1);
+		UT_ASSERT_EQ(fake_ack_degraded, 0);
+
+		/* A successor uses another real slot identity and can acquire S. */
+		fake_master_apply = true;
+		granted = run_holder_registration(GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER, PCM_TRANS_N_TO_S,
+										  &retry, &image);
+		UT_ASSERT(granted && !retry && !image);
+		UT_ASSERT(fake_last_request_id != fake_previous_request_id);
+		UT_ASSERT_EQ(cluster_gcs_get_outstanding_count(), 0);
+	}
+
+	UT_TEST(test_forwarded_registration_hard_failures_never_become_retry)
+	{
+		int scenario;
+
+		for (scenario = 0; scenario < 6; scenario++) {
+			volatile bool raised = false;
+			bool retry = false;
+			bool image = false;
+			bool granted = false;
+
+			reset_control_fixture();
+			if (scenario == 0)
+				fake_reply_status = GCS_REPLY_DENIED_VALIDATOR_REJECT;
+			else if (scenario == 1)
+				fake_reply_status = GCS_REPLY_DENIED_EPOCH_STALE;
+			else if (scenario == 2)
+				fake_drop_reply = true;
+			else if (scenario == 3)
+				fake_bad_reply_identity = true;
+			else if (scenario == 4)
+				fake_send_refused = true;
+			else
+				fake_master_apply = false;
+			PG_TRY();
+			{
+				granted = run_holder_registration(
+					scenario == 5 ? GCS_BLOCK_REPLY_X_GRANTED_FROM_HOLDER
+								  : GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER,
+					scenario == 5 ? PCM_TRANS_N_TO_X : PCM_TRANS_N_TO_S, &retry, &image);
+			}
+			PG_CATCH();
+			{
+				raised = true;
+			}
+			PG_END_TRY();
+			UT_ASSERT(raised);
+			UT_ASSERT(!granted && !retry && !image);
+			UT_ASSERT_EQ(cluster_gcs_get_outstanding_count(), 0);
+			UT_ASSERT_EQ(cluster_gcs_get_reply_timeout_count(),
+						 (scenario == 2 || scenario == 3) ? 1 : 0);
+		}
+	}
+
+	int main(void)
+	{
+		UT_PLAN(22);
+		UT_RUN(test_gcs_msg_type_enum_values_no_collision);
+		UT_RUN(test_gcs_payload_sizes_locked);
+		UT_RUN(test_gcs_payload_field_offsets);
+		UT_RUN(test_gcs_handler_symbols_linkable);
+		UT_RUN(test_gcs_reply_status_enum_count_is_4);
+		UT_RUN(test_gcs_lookup_master_symbol_linkable);
+		UT_RUN(test_gcs_d7_recovery_aware_reroute);
+		UT_RUN(test_gcs_send_transition_and_wait_symbol_linkable);
+		UT_RUN(test_gcs_register_msg_types_symbol_linkable);
+		UT_RUN(test_gcs_dump_accessors_all_linkable);
+		UT_RUN(test_gcs_get_api_state_stub_before_init);
+		UT_RUN(test_gcs_max_outstanding_per_backend_constant);
+		UT_RUN(test_gcs_internal_deadline_ms_constant);
+		UT_RUN(test_gcs_transition_id_range_invariant_1_to_9);
+		UT_RUN(test_gcs_pcm_validator_accepts_all_9_transitions);
+		UT_RUN(test_gcs_handler_signature_matches_dispatch_table);
+		UT_RUN(test_gcs_lwlock_tranche_distinct_from_pcm);
+		UT_RUN(test_gcs_hc77_sender_no_double_apply_doc);
+		UT_RUN(test_gcs_module_init_helpers_linkable);
+		UT_RUN(test_gcs_reply_identity_is_exact_across_backends);
+		UT_RUN(test_forwarded_s_registration_refusal_reenters_without_grant);
+		UT_RUN(test_forwarded_registration_hard_failures_never_become_retry);
+		free(fake_shmem);
+		UT_DONE();
+		return ut_failed_count == 0 ? 0 : 1;
+	}

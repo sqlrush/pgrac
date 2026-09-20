@@ -300,6 +300,7 @@ OBJS = \
 	cluster_xid_wrap_barrier.o \
 	cluster_xnode_lever.o \
 	cluster_xnode_profile.o \
+	cluster_update_trace.o \
 	storage/cluster_shared_fs.o \
 	storage/cluster_shared_fs_stub.o \
 	storage/cluster_shared_fs_local.o \

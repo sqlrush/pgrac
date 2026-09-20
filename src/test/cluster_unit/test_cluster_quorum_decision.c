@@ -393,10 +393,171 @@ UT_TEST(test_d_10_null_inputs_lost_defensive)
 }
 
 
+/* Capture the real QVOTEC publication block, extracted at build time. The
+ * quorum decision remains the production function linked above. Only the
+ * shared-memory publication boundary is replaced by a checked receiver. */
+static struct {
+	uint64 incarnation[CLUSTER_MAX_NODES];
+	uint64 generation[CLUSTER_MAX_NODES];
+	bool fresh[CLUSTER_MAX_NODES];
+	bool publishing;
+	bool in_quorum;
+	int begin_count;
+	int end_count;
+} bootstrap_capture;
+
+static void
+capture_bootstrap_begin(void)
+{
+	UT_ASSERT(!bootstrap_capture.publishing);
+	bootstrap_capture.publishing = true;
+	bootstrap_capture.begin_count++;
+}
+
+static void
+capture_bootstrap_end(void)
+{
+	UT_ASSERT(bootstrap_capture.publishing);
+	bootstrap_capture.publishing = false;
+	bootstrap_capture.end_count++;
+}
+
+static void
+capture_bootstrap_slot(int32 node, uint64 incarnation, uint64 generation,
+					   uint64 epoch pg_attribute_unused())
+{
+	UT_ASSERT(bootstrap_capture.publishing);
+	UT_ASSERT(node >= 0 && node < CLUSTER_MAX_NODES);
+	bootstrap_capture.incarnation[node] = incarnation;
+	bootstrap_capture.generation[node] = generation;
+}
+
+static void
+capture_bootstrap_fresh(int32 node, bool fresh)
+{
+	UT_ASSERT(bootstrap_capture.publishing);
+	UT_ASSERT(node >= 0 && node < CLUSTER_MAX_NODES);
+	bootstrap_capture.fresh[node] = fresh;
+}
+
+static void
+capture_bootstrap_quorum(bool in_quorum)
+{
+	UT_ASSERT(bootstrap_capture.publishing);
+	bootstrap_capture.in_quorum = in_quorum;
+}
+
+static void
+publish_bootstrap_fixture(ClusterVotingSlot *qvotec_slot_matrix,
+						  const ClusterVotingDiskIoState *io_states, uint64 now_us,
+						  uint64 heartbeat_timeout_us)
+{
+	const int qvotec_n_disks = N_DISKS;
+	ClusterQuorumDecision decision;
+	uint32 node;
+	int i;
+
+	memset(&bootstrap_capture, 0, sizeof(bootstrap_capture));
+	(void)decide_quorum_view(qvotec_slot_matrix, io_states, N_DISKS, CLUSTER_MAX_NODES, 0, 1000,
+							 now_us, heartbeat_timeout_us, &decision);
+#define cluster_reconfig_bootstrap_publish_begin capture_bootstrap_begin
+#define cluster_reconfig_bootstrap_publish_end capture_bootstrap_end
+#define cluster_reconfig_record_observed_slot capture_bootstrap_slot
+#define cluster_reconfig_record_observed_fresh_alive capture_bootstrap_fresh
+#define cluster_reconfig_bootstrap_publish_in_quorum capture_bootstrap_quorum
+#include "test_cluster_qvotec_bootstrap_publish.inc"
+#undef cluster_reconfig_bootstrap_publish_begin
+#undef cluster_reconfig_bootstrap_publish_end
+#undef cluster_reconfig_record_observed_slot
+#undef cluster_reconfig_record_observed_fresh_alive
+#undef cluster_reconfig_bootstrap_publish_in_quorum
+	UT_ASSERT_EQ(bootstrap_capture.begin_count, 1);
+	UT_ASSERT_EQ(bootstrap_capture.end_count, 1);
+	UT_ASSERT(!bootstrap_capture.publishing);
+}
+
+UT_TEST(test_bootstrap_cannot_pair_clean_old_identity_with_new_alive_bit)
+{
+	ClusterVotingSlot slots[N_DISKS * CLUSTER_MAX_NODES] = { 0 };
+	ClusterVotingDiskIoState io[N_DISKS]
+		= { CLUSTER_VOTING_DISK_IO_OK, CLUSTER_VOTING_DISK_IO_OK, CLUSTER_VOTING_DISK_IO_OK };
+	ClusterQuorumDecision decision;
+	int disk;
+
+	/* An ordinary clean restart resets per-process generation. A read can
+	 * cross the new process's per-disk writes: one new ALIVE slot, two old
+	 * clean tombstones with larger generations. Node-level alive is true,
+	 * but that is not evidence that the selected OLD identity is alive. */
+	make_slot(&slots[1], 0, 1, 2000, 1, 0, CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	for (disk = 1; disk < N_DISKS; disk++)
+		make_slot(&slots[disk * CLUSTER_MAX_NODES + 1], disk, 1, 1000, 900 + disk, 0, 0);
+	(void)decide_quorum_view(slots, io, N_DISKS, CLUSTER_MAX_NODES, 0, 1000, TEST_NOW_US,
+							 TEST_HEARTBEAT_TIMEOUT_US, &decision);
+	UT_ASSERT((decision.alive_bitmap[0] & 2) != 0);
+	publish_bootstrap_fixture(slots, io, TEST_NOW_US, TEST_HEARTBEAT_TIMEOUT_US);
+	UT_ASSERT(bootstrap_capture.in_quorum);
+	UT_ASSERT_EQ(bootstrap_capture.incarnation[1], UINT64_C(1000));
+	UT_ASSERT_EQ(bootstrap_capture.generation[1], UINT64_C(902));
+	UT_ASSERT(!bootstrap_capture.fresh[1]);
+
+	/* The next ordinary poll converges after all disks carry the new writer.
+	 * No consumer-side identity rewrite, extra protocol or timeout needed. */
+	for (disk = 0; disk < N_DISKS; disk++)
+		make_slot(&slots[disk * CLUSTER_MAX_NODES + 1], disk, 1, 2000, 4 + disk, 0,
+				  CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	publish_bootstrap_fixture(slots, io, TEST_NOW_US, TEST_HEARTBEAT_TIMEOUT_US);
+	UT_ASSERT_EQ(bootstrap_capture.incarnation[1], UINT64_C(2000));
+	UT_ASSERT(bootstrap_capture.fresh[1]);
+}
+
+UT_TEST(test_bootstrap_selected_disk_must_be_trusted)
+{
+	ClusterVotingSlot slots[N_DISKS * CLUSTER_MAX_NODES] = { 0 };
+	ClusterVotingDiskIoState io[N_DISKS]
+		= { CLUSTER_VOTING_DISK_IO_OK, CLUSTER_VOTING_DISK_IO_OK, CLUSTER_VOTING_DISK_IO_FAILED };
+
+	make_slot(&slots[1], 0, 1, 2000, 1, 0, CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	make_slot(&slots[2 * CLUSTER_MAX_NODES + 1], 2, 1, 1000, 900, 0,
+			  CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	publish_bootstrap_fixture(slots, io, TEST_NOW_US, TEST_HEARTBEAT_TIMEOUT_US);
+	UT_ASSERT(bootstrap_capture.in_quorum);
+	UT_ASSERT_EQ(bootstrap_capture.incarnation[1], UINT64_C(1000));
+	UT_ASSERT(!bootstrap_capture.fresh[1]);
+}
+
+UT_TEST(test_bootstrap_selected_heartbeat_boundary_and_missing_identity)
+{
+	ClusterVotingSlot slots[N_DISKS * CLUSTER_MAX_NODES] = { 0 };
+	ClusterVotingDiskIoState io[N_DISKS]
+		= { CLUSTER_VOTING_DISK_IO_OK, CLUSTER_VOTING_DISK_IO_OK, CLUSTER_VOTING_DISK_IO_OK };
+	ClusterVotingSlot *selected = &slots[2 * CLUSTER_MAX_NODES + 1];
+	const uint64 timestamps[] = { 0, TEST_NOW_US - TEST_HEARTBEAT_TIMEOUT_US - 1,
+								  TEST_NOW_US - TEST_HEARTBEAT_TIMEOUT_US, TEST_NOW_US + 1, 0 };
+	const bool expected[] = { false, false, true, true, true };
+	int scenario;
+
+	make_slot(&slots[1], 0, 1, 2000, 1, 0, CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	make_slot(selected, 2, 1, 1000, 900, 0, CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	for (scenario = 0; scenario < lengthof(timestamps); scenario++) {
+		selected->heartbeat_ts_us = timestamps[scenario];
+		publish_bootstrap_fixture(slots, io, TEST_NOW_US,
+								  scenario == 4 ? 0 : TEST_HEARTBEAT_TIMEOUT_US);
+		UT_ASSERT_EQ(bootstrap_capture.fresh[1], expected[scenario]);
+	}
+	memset(slots, 0, sizeof(slots));
+	publish_bootstrap_fixture(slots, io, TEST_NOW_US, TEST_HEARTBEAT_TIMEOUT_US);
+	UT_ASSERT_EQ(bootstrap_capture.incarnation[1], UINT64_C(0));
+	UT_ASSERT(!bootstrap_capture.fresh[1]);
+	make_slot(selected, 2, 2, 1000, 900, 0, CLUSTER_VOTING_SLOT_FLAG_ALIVE);
+	publish_bootstrap_fixture(slots, io, TEST_NOW_US, TEST_HEARTBEAT_TIMEOUT_US);
+	UT_ASSERT_EQ(bootstrap_capture.incarnation[1], UINT64_C(0));
+	UT_ASSERT(!bootstrap_capture.fresh[1]);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(test_d_1_three_disks_all_ok_majority);
 	UT_RUN(test_d_2_two_of_three_disks_ok_still_majority);
 	UT_RUN(test_d_3_one_of_three_disks_ok_uncertain);
@@ -411,6 +572,9 @@ main(void)
 	UT_RUN(test_d_12_stale_collision_ignored);
 	UT_RUN(test_d_13_epoch_recovery_includes_stale_slots);
 	UT_RUN(test_d_10_null_inputs_lost_defensive);
+	UT_RUN(test_bootstrap_cannot_pair_clean_old_identity_with_new_alive_bit);
+	UT_RUN(test_bootstrap_selected_disk_must_be_trusted);
+	UT_RUN(test_bootstrap_selected_heartbeat_boundary_and_missing_identity);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

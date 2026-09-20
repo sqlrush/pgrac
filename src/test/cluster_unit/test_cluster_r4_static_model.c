@@ -486,6 +486,15 @@ all_four_d10_dispatches_gate_before_body(void)
 static bool
 d10_admitted_wrappers_have_single_finally_leave(void)
 {
+	const char *const trace_order[]
+		= { "cluster_xp_begin(&trace, CLXP_R_TT_VISIBILITY_RESOLVE)",
+			"PG_TRY();",
+			"result = cluster_tx_resolve_exact_trace_impl(locator, mode, out, reason_out)",
+			"PG_FINALLY();",
+			"cluster_xp_end(&trace)",
+			"PG_END_TRY();",
+			"return result;" };
+
 	/*
 	 * The region for cluster_gcs_block_r4_route_cr ends at the immediately
 	 * following function gcs_block_try_r4_request80: the two try_* test
@@ -501,8 +510,12 @@ d10_admitted_wrappers_have_single_finally_leave(void)
 		   && function_region_has_single_finally_leave(sources.cr_server_source,
 													   "cluster_cr_build_on_holder",
 													   "cluster_cr_server_shmem_size")
+		   /* The observer wrapper owns its timer, not semantic admission. */
+		   && function_region_has_ordered(sources.tx_resolve_source, "cluster_tx_resolve_exact",
+										  "cluster_tx_resolve_exact_trace_impl", trace_order,
+										  lengthof(trace_order))
 		   && function_region_has_single_finally_leave(sources.tx_resolve_source,
-													   "cluster_tx_resolve_exact",
+													   "cluster_tx_resolve_exact_trace_impl",
 													   "cluster_tx_resolve_multixact");
 }
 

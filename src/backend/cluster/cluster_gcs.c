@@ -144,6 +144,7 @@ static ClusterICSendResult gcs_send_envelope_or_loopback(uint8 msg_type, int32 d
 static bool gcs_dispatch_loopback(uint8 msg_type, const void *payload, uint32 payload_len);
 static void gcs_send_reply(int32 dest_node, uint64 request_id, uint8 transition_id,
 						   GcsReplyStatus status);
+static void gcs_report_transition_failure(uint8 final_status, uint8 final_transition);
 
 
 /* ============================================================
@@ -562,7 +563,8 @@ gcs_send_envelope_or_loopback(uint8 msg_type, int32 dest_node, const void *paylo
  */
 static uint8
 gcs_transition_and_wait_internal(BufferTag tag, PcmLockTransition transition_id, int master_node,
-								 bool throw_on_send_fail, uint8 *out_final_transition)
+								 bool throw_on_send_fail, uint8 *out_final_transition,
+								 bool *out_reply_received)
 {
 	ClusterGcsOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -571,6 +573,9 @@ gcs_transition_and_wait_internal(BufferTag tag, PcmLockTransition transition_id,
 	TimestampTz deadline;
 	bool send_failed = false;
 	uint8 final_status = GCS_REPLY_DENIED_INCOMPATIBLE;
+
+	if (out_reply_received != NULL)
+		*out_reply_received = false;
 
 	if (transition_id < PCM_TRANS_N_TO_S || transition_id > PCM_TRANS_S_TO_X_CLEANOUT) {
 		/* Caller passed garbage; receiver would reject too.  Fail fast. */
@@ -651,6 +656,8 @@ gcs_transition_and_wait_internal(BufferTag tag, PcmLockTransition transition_id,
 
 			if (gcs_slot_get_reply(slot, &final_reply)) {
 				final_status = final_reply.status;
+				if (out_reply_received != NULL)
+					*out_reply_received = true;
 				if (out_final_transition)
 					*out_final_transition = final_reply.transition_id;
 			} else {
@@ -678,8 +685,31 @@ cluster_gcs_try_send_transition_and_wait(BufferTag tag, PcmLockTransition transi
 	uint8 final_transition = (uint8)transition_id;
 
 	return gcs_transition_and_wait_internal(tag, transition_id, master_node,
-											/* throw_on_send_fail */ false, &final_transition)
+											/* throw_on_send_fail */ false, &final_transition, NULL)
 		   == GCS_REPLY_GRANTED;
+}
+
+/* PGRAC: an installed forwarded S image is not authority until the master
+ * records this requester. A concurrent writer can legitimately refuse that
+ * late registration. Only an exact received refusal permits the caller to
+ * discard the attempt and re-enter with a new reservation; the identical
+ * internal-timeout marker is not such evidence. Never use the old one-shot
+ * downgrade fallback for this normal S-holder path. */
+bool
+cluster_gcs_register_shared_and_wait(BufferTag tag, int master_node)
+{
+	uint8 final_transition = PCM_TRANS_N_TO_S;
+	uint8 final_status;
+	bool reply_received;
+
+	final_status = gcs_transition_and_wait_internal(tag, PCM_TRANS_N_TO_S, master_node, true,
+													&final_transition, &reply_received);
+	if (final_status == GCS_REPLY_GRANTED)
+		return true;
+	if (reply_received && final_status == GCS_REPLY_DENIED_INCOMPATIBLE)
+		return false;
+	gcs_report_transition_failure(final_status, final_transition);
+	return false; /* error above does not return */
 }
 
 void
@@ -691,7 +721,7 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 
 	final_status
 		= gcs_transition_and_wait_internal(tag, transition_id, master_node,
-										   /* throw_on_send_fail */ true, &final_transition);
+										   /* throw_on_send_fail */ true, &final_transition, NULL);
 
 	if (final_status == GCS_REPLY_GRANTED) {
 		/*
@@ -705,7 +735,12 @@ cluster_gcs_send_transition_and_wait(BufferTag tag, PcmLockTransition transition
 
 	/* All non-GRANTED outcomes ereport so the bufmgr caller doesn't pollute
 	 * BufferDesc with stale ownership (HC76). */
+	gcs_report_transition_failure(final_status, final_transition);
+}
 
+static void
+gcs_report_transition_failure(uint8 final_status, uint8 final_transition)
+{
 	switch ((GcsReplyStatus)final_status) {
 	case GCS_REPLY_DENIED_VALIDATOR_REJECT:
 		ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),

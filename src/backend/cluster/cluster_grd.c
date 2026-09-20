@@ -50,6 +50,7 @@
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_gcs_block.h" /* spec-4.7 D2 — block re-declare scan + send */
 #include "cluster/cluster_signal.h"
+#include "cluster/storage/cluster_undo_block0_current.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_cssd.h"			/* spec-2.16 D8 newly-dead bitmap diff */
 #include "cluster/cluster_ic_tier1.h"		/* cluster_ic_tier1_get_peer_fd (RF-ROOT P6 diag) */
@@ -1141,6 +1142,7 @@ uint64
 cluster_grd_hash_resource(const ClusterResId *resid)
 {
 	uint8 hash_input[14];
+	uint64 hash;
 
 	Assert(resid != NULL);
 
@@ -1154,7 +1156,39 @@ cluster_grd_hash_resource(const ClusterResId *resid)
 	hash_input[12] = resid->type;
 	hash_input[13] = resid->lockmethodid; /* v0.2 P1.1: identity 必含 */
 
-	return hash_bytes_extended(hash_input, sizeof(hash_input), 0);
+	hash = hash_bytes_extended(hash_input, sizeof(hash_input), 0);
+	/* PGRAC: undo-header home affinity. Change the SINGLE hash projection,
+	 * not just lookup_master: HTAB partition locks, server admission and
+	 * recovery must all agree on the same shard. The startup-only declared
+	 * set fixes that shard; live membership/remaster never changes the hash.
+	 * The ordinary master map still owns authority, including after failure. */
+	if (resid->type == CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE
+		&& resid->lockmethodid == DEFAULT_LOCKMETHOD && resid->field2 == 0 && resid->field3 == 0
+		&& resid->field4 >= 1 && resid->field4 <= UNDO_OWNER_INSTANCE_MAX) {
+		uint32 owner = (uint32)resid->field4 - 1;
+		uint32 first = owner * CLUSTER_UNDO_BLOCK0_SLOTS_PER_OWNER + 1;
+		int count = cluster_conf_node_count();
+
+		if (resid->field1 >= first && resid->field1 < first + CLUSTER_UNDO_BLOCK0_SLOTS_PER_OWNER
+			&& count > 0 && count <= CLUSTER_MAX_NODES
+			&& cluster_conf_lookup_node((int32)owner) != NULL) {
+			uint32 ordinal = 0;
+			uint32 node;
+
+			for (node = 0; node < owner; node++)
+				if (cluster_conf_lookup_node((int32)node) != NULL)
+					ordinal++;
+			if (ordinal < (uint32)count) {
+				uint32 choices = 1 + (PGRAC_GRD_SHARD_COUNT - 1 - ordinal) / (uint32)count;
+				uint32 shard = ordinal + (uint32)(hash % choices) * (uint32)count;
+
+				/* Preserve the high hash bits, and therefore a single 32-bit
+				 * dynahash projection with exactly this partition identity. */
+				hash = hash - hash % PGRAC_GRD_SHARD_COUNT + shard;
+			}
+		}
+	}
+	return hash;
 }
 
 uint32

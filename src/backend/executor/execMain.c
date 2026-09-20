@@ -33,9 +33,16 @@
  * IDENTIFICATION
  *	  src/backend/executor/execMain.c
  *
+ * PGRAC MODIFICATIONS
+ *   Opt-in whole UPDATE execution timing, including scan and retry work.
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_update_trace.h"
+#endif
 
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -305,6 +312,30 @@ ExecutorRun(QueryDesc *queryDesc,
 			ScanDirection direction, uint64 count,
 			bool execute_once)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* The disabled path keeps the original call shape and reads no clock. */
+	if (unlikely(cluster_update_trace_enabled) && queryDesc->operation == CMD_UPDATE)
+	{
+		ClusterUpdateTraceScope trace;
+
+		cluster_update_trace_begin(&trace);
+		PG_TRY();
+		{
+			if (ExecutorRun_hook)
+				(*ExecutorRun_hook) (queryDesc, direction, count, execute_once);
+			else
+				standard_ExecutorRun(queryDesc, direction, count, execute_once);
+		}
+		PG_CATCH();
+		{
+			cluster_update_trace_end(&trace, CLUTRACE_STATUS_ERROR, 0);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		cluster_update_trace_end(&trace, CLUTRACE_STATUS_OK, queryDesc->estate->es_processed);
+		return;
+	}
+#endif
 	if (ExecutorRun_hook)
 		(*ExecutorRun_hook) (queryDesc, direction, count, execute_once);
 	else

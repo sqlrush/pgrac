@@ -399,14 +399,15 @@ my @state_categories = (qw(
 	guc hang hw ic inject ir ko lck lmd lmon lms multixact_current normal_start
 	pcm pgstat phase r4 reconfig reconfig_join reconfig_touched recovery
 	resolver_cache scn sequence shared_fs shmem sinval smart_fusion ts tt_2pc
-	tt_recovery tt_status tt_status_hint undo undo_cleaner visibility wal_thread
+	tt_recovery tt_status tt_status_hint undo undo_cleaner update_trace update_trace_event
+	visibility wal_thread
 	write_fence xid_stripe xnode_lever xnode_profile
 ), map { "undo.cleaner.worker.$_" } 0 .. 7);
 is($node->safe_psql('postgres',
 		q{SELECT string_agg(DISTINCT category COLLATE "C", ','
 		                   ORDER BY category COLLATE "C") FROM pg_cluster_state}),
 	join(',', sort @state_categories),
-	'O2 pg_cluster_state has all 68 categories, including normal start and cleaner workers');
+	'O2 pg_cluster_state has all 70 categories, including normal start, cleaner workers and tracing');
 
 is($node->safe_psql('postgres',
 		q{SELECT count(*) FROM pg_cluster_state WHERE value IS NULL}),

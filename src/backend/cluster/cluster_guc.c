@@ -63,6 +63,7 @@
 #include "cluster/cluster_pcm_lock.h"		  /* cluster_pcm_grd_max_entries (stage 1.7) */
 #include "cluster/storage/cluster_shared_fs.h" /* ClusterSharedFsBackendId (stage 1.1) */
 #include "cluster/cluster_xlog.h"
+#include "cluster/cluster_update_trace.h" /* diagnostic per-UPDATE trace */
 
 
 /*
@@ -105,6 +106,8 @@ bool cluster_merged_recovery = false;
 int cluster_recovery_merge_wait_timeout = 10000;
 /* spec-5.59 D1: cross-node profiling switch (default OFF, zero hot-path cost). */
 bool cluster_xnode_profile_enabled = false;
+/* Diagnostic per-storage-UPDATE phase trace; default OFF. */
+bool cluster_update_trace_enabled = false;
 /* spec-6.4: ADG physical standby / read-only service knobs. */
 int cluster_dg_role = CLUSTER_DG_ROLE_PRIMARY;
 int cluster_dg_mode = CLUSTER_DG_MODE_ASYNC;
@@ -1648,6 +1651,17 @@ cluster_init_guc(void)
 							 gettext_noop("Enable cross-node performance profiling buckets."),
 							 gettext_noop("Off keeps all instrumented paths at zero overhead."),
 							 &cluster_xnode_profile_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
+
+	/*
+	 * cluster.update_trace -- attach inclusive/exclusive timers to each whole
+	 * UPDATE execution.  It is intentionally separate from xnode_profile so a
+	 * diagnostic run can retain per-operation records without changing the
+	 * normal profile surface.  The trace is observational and runtime gated.
+	 */
+	DefineCustomBoolVariable(
+		"cluster.update_trace", gettext_noop("Enable whole-UPDATE execution phase tracing."),
+		gettext_noop("A full diagnostic capture drops new records, never overwrites."),
+		&cluster_update_trace_enabled, false, PGC_SUSET, 0, NULL, NULL, NULL);
 
 	/*
 	 * spec-6.4 ADG role and read-only service knobs.  Defaults keep existing

@@ -61,7 +61,8 @@
 #include "cluster/cluster_hw.h"			/* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"		/* spec-5.8 D1b — WFG vertex + submit/cancel edge */
 #include "cluster/cluster_undo_resid.h" /* spec-5.22a D1-5 — undo-class hash-route guard */
-#include "cluster/cluster_reconfig.h"	/* spec-4.6 D1 — ReconfigEvent stub type */
+#include "cluster/storage/cluster_undo_block0_current.h"
+#include "cluster/cluster_reconfig.h" /* spec-4.6 D1 — ReconfigEvent stub type */
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
@@ -1305,6 +1306,95 @@ UT_TEST(test_grd_master_map_sparse_declared_nodes)
 
 		UT_ASSERT(m == 0 || m == 2 || m == 5);
 	}
+}
+
+UT_TEST(test_grd_block0_home_affinity)
+{
+	const int32 dense[] = { 0, 1, 2, 3 };
+	const int32 sparse[] = { 0, 2, 127 };
+	int layout;
+
+	for (layout = 0; layout < 2; layout++) {
+		const int32 *nodes = layout == 0 ? dense : sparse;
+		int count = layout == 0 ? 4 : 3;
+		int owner;
+
+		cluster_grd_shmem_init();
+		set_mock_declared(count, nodes);
+		cluster_grd_master_map_init();
+		for (owner = 0; owner < count; owner++) {
+			uint32 segment;
+
+			for (segment = 1; segment <= CLUSTER_UNDO_BLOCK0_SLOTS_PER_OWNER; segment++) {
+				ClusterResId resid = { 0 };
+				uint64 hash;
+				uint32 shard;
+
+				resid.field1 = nodes[owner] * CLUSTER_UNDO_BLOCK0_SLOTS_PER_OWNER + segment;
+				resid.field4 = nodes[owner] + 1;
+				resid.type = CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE;
+				resid.lockmethodid = DEFAULT_LOCKMETHOD;
+				hash = cluster_grd_hash_resource(&resid);
+				shard = cluster_grd_shard_for_resource(&resid);
+				UT_ASSERT_EQ(shard, cluster_grd_shard_for_hash(hash));
+				UT_ASSERT_EQ(cluster_grd_lookup_master(&resid), nodes[owner]);
+				UT_ASSERT_EQ(cluster_grd_shard_master(shard), nodes[owner]);
+			}
+		}
+	}
+}
+
+UT_TEST(test_grd_block0_affinity_keeps_remaster)
+{
+	const int32 nodes[] = { 0, 1, 2, 3 };
+	ClusterResId resid = { 0 };
+	uint64 dead[2] = { UINT64_C(1) << 2, 0 };
+	uint64 hash;
+	uint32 shard;
+	uint32 generation;
+
+	cluster_grd_shmem_init();
+	set_mock_declared(4, nodes);
+	cluster_grd_master_map_init();
+	resid.field1 = 2 * CLUSTER_UNDO_BLOCK0_SLOTS_PER_OWNER + 17;
+	resid.field4 = 3;
+	resid.type = CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	hash = cluster_grd_hash_resource(&resid);
+	shard = cluster_grd_shard_for_resource(&resid);
+	generation = cluster_grd_shard_master_generation(shard);
+	UT_ASSERT_EQ(cluster_grd_lookup_master(&resid), 2);
+	(void)cluster_grd_master_map_remaster(dead, 7);
+	UT_ASSERT_EQ(cluster_grd_hash_resource(&resid), hash);
+	UT_ASSERT_EQ(cluster_grd_shard_for_resource(&resid), shard);
+	UT_ASSERT_NE(cluster_grd_lookup_master(&resid), 2);
+	UT_ASSERT_EQ(cluster_grd_shard_master_generation(shard), generation + 1);
+}
+
+UT_TEST(test_grd_block0_affinity_has_no_authority_shortcut)
+{
+	const int32 nodes[] = { 0, 2 };
+	ClusterResId resid = { 0 };
+	uint64 raw;
+
+	ut_reset_grd_shmem();
+	cluster_grd_shmem_init();
+	set_mock_declared(2, nodes);
+	resid.field1 = 17;
+	resid.type = CLUSTER_UNDO_BLOCK0_CURRENT_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	raw = cluster_grd_hash_resource(&resid); /* owner zero is not canonical */
+	resid.field4 = 2;						 /* segment 17 cannot belong to owner 2 */
+	UT_ASSERT_EQ(cluster_grd_hash_resource(&resid), raw);
+	resid.field4 = 1;
+	UT_ASSERT_EQ(cluster_grd_lookup_master(&resid), -1); /* map still uninitialized */
+	cluster_grd_master_map_init();
+	UT_ASSERT_EQ(cluster_grd_lookup_master(&resid), 0);
+	resid.field1 = CLUSTER_UNDO_BLOCK0_SLOTS_PER_OWNER + 17;
+	resid.field4 = 0;
+	raw = cluster_grd_hash_resource(&resid);
+	resid.field4 = 2; /* valid range, but node1 was never declared */
+	UT_ASSERT_EQ(cluster_grd_hash_resource(&resid), raw);
 }
 
 UT_TEST(test_grd_is_local_master_matrix)
@@ -5801,7 +5891,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(114);
+	UT_PLAN(117);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -5809,6 +5899,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_grd_shard_lookup_hash_distribution_uniform);
 	UT_RUN(test_grd_uninitialized_master_map_returns_unknown);
 	UT_RUN(test_grd_master_map_sparse_declared_nodes);
+	UT_RUN(test_grd_block0_home_affinity);
+	UT_RUN(test_grd_block0_affinity_keeps_remaster);
+	UT_RUN(test_grd_block0_affinity_has_no_authority_shortcut);
 	UT_RUN(test_grd_is_local_master_matrix);
 	UT_RUN(test_grd_is_cluster_aware_classification);
 

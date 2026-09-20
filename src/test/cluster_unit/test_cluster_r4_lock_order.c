@@ -5556,7 +5556,10 @@ UT_TEST(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck)
 {
 	int leg;
 
-	for (leg = 0; leg < 5; leg++) {
+	/* The current occupant may be local even when the old writer is remote. */
+	for (leg = 0; leg < 10; leg++) {
+		int outcome = leg % 5;
+		TransactionId old_xid = leg < 5 ? 1200 : 1201;
 		UtR4HotProductFixture fixture;
 		HeapHotSearchResult hot_result;
 		HeapTupleData tuple = { 0 };
@@ -5571,30 +5574,100 @@ UT_TEST(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck)
 		tuple.t_data->t_ctid = tuple.t_self;
 		tuple.t_data->t_infomask = HEAP_XMIN_COMMITTED;
 		tuple.t_data->t_itl_slot_idx = 2;
-		HeapTupleHeaderSetXmax(tuple.t_data, 1200);
+		HeapTupleHeaderSetXmax(tuple.t_data, old_xid);
 		memset(&ut_scratch_expected_ref, 0, sizeof(ut_scratch_expected_ref));
-		ut_scratch_expected_ref.origin_node_id = 1;
+		ut_scratch_expected_ref.origin_node_id = leg < 5 ? 1 : 0;
 		ut_scratch_expected_ref.tt_slot_id = 2;
-		ut_scratch_expected_ref.local_xid = 1500;
-		ut_scratch_expected_xid = 1200;
+		ut_scratch_expected_ref.local_xid = leg < 5 ? 1500 : 1536;
+		ut_scratch_expected_xid = old_xid;
 		ut_scratch_expected_lsn = PageGetLSN((Page)fixture.live_page);
 		ut_scratch_expected_read_scn = InvalidScn;
 		ut_scratch_resolve_evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
 		ut_scratch_resolve_status
-			= leg == 1 ? CLUSTER_TT_STATUS_ABORTED : CLUSTER_TT_STATUS_COMMITTED;
-		ut_scratch_resolve_scn = leg == 1 ? InvalidScn : (SCN)9001;
+			= outcome == 1 ? CLUSTER_TT_STATUS_ABORTED : CLUSTER_TT_STATUS_COMMITTED;
+		ut_scratch_resolve_scn = outcome == 1 ? InvalidScn : (SCN)9001;
 		ut_scratch_exact_resolve_calls = 0;
 		ut_writer_bridge_fixture = true;
-		ut_writer_bridge_mutation = leg >= 2 ? leg - 1 : 0;
+		ut_writer_bridge_mutation = outcome >= 2 ? outcome - 1 : 0;
 		ut_writer_bridge_tuple_pulls = 0;
 		memcpy(before.data, fixture.live_page, BLCKSZ);
-		UT_ASSERT(ut_writer_wait_with_relation(1, &tuple, 1200, tuple.t_data->t_infomask, &result));
-		UT_ASSERT_EQ(result, leg >= 2 ? TM_BeingModified : leg == 1 ? TM_Ok : TM_Deleted);
+		UT_ASSERT(
+			ut_writer_wait_with_relation(1, &tuple, old_xid, tuple.t_data->t_infomask, &result));
+		UT_ASSERT_EQ(result, outcome >= 2 ? TM_BeingModified : outcome == 1 ? TM_Ok : TM_Deleted);
 		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, 1);
 		UT_ASSERT_EQ(ut_writer_bridge_tuple_pulls, 0);
 		UT_ASSERT(ut_hot_content_lock_held);
-		if (leg < 2)
+		if (outcome < 2)
 			UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		ut_writer_bridge_fixture = false;
+		ut_itl_census_end();
+	}
+}
+
+UT_TEST(test_local_writer_ref_requires_matching_identity_or_resolver_proof)
+{
+	int leg;
+
+	for (leg = 0; leg < 5; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot_result;
+		HeapTupleData tuple = { 0 };
+		TM_Result result = TM_Invisible;
+		PGAlignedBlock before;
+		volatile bool caught = false;
+		volatile bool handled = false;
+		TransactionId old_xid = leg < 2 ? 1200 : 1201;
+
+		ut_itl_census_begin(&fixture, &hot_result, false);
+		tuple.t_data = ut_r4_hot_tuple_at((Page)fixture.live_page, UT_HOT_ROOT_OFF);
+		tuple.t_len = UT_HOT_TUPLE_LEN;
+		tuple.t_tableOid = UT_HOT_TABLE_OID;
+		ItemPointerSet(&tuple.t_self, UT_HOT_BLOCK, UT_HOT_ROOT_OFF);
+		tuple.t_data->t_ctid = tuple.t_self;
+		tuple.t_data->t_infomask = HEAP_XMIN_COMMITTED;
+		tuple.t_data->t_itl_slot_idx = 2;
+		HeapTupleHeaderSetXmax(tuple.t_data, old_xid);
+		memset(&ut_scratch_expected_ref, 0, sizeof(ut_scratch_expected_ref));
+		ut_scratch_expected_ref.origin_node_id = 0;
+		ut_scratch_expected_ref.tt_slot_id = 2;
+		ut_scratch_expected_ref.local_xid = leg == 0 ? 1200 : 1536;
+		ut_scratch_expected_xid = old_xid;
+		ut_scratch_expected_lsn = PageGetLSN((Page)fixture.live_page);
+		ut_scratch_expected_read_scn = InvalidScn;
+		ut_scratch_resolve_evidence = leg < 2	 ? CLUSTER_VIS_EVIDENCE_LOCAL
+									  : leg == 2 ? CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS
+												 : CLUSTER_VIS_EVIDENCE_REMOTE;
+		ut_scratch_resolve_status = leg == 3   ? CLUSTER_TT_STATUS_IN_PROGRESS
+									: leg == 4 ? CLUSTER_TT_STATUS_COMMITTED
+											   : CLUSTER_TT_STATUS_UNKNOWN;
+		ut_scratch_resolve_scn = InvalidScn;
+		ut_scratch_exact_resolve_calls = 0;
+		ut_writer_bridge_fixture = true;
+		ut_writer_bridge_mutation = 0;
+		ut_writer_bridge_tuple_pulls = 0;
+		memcpy(before.data, fixture.live_page, BLCKSZ);
+		ut_capture_error = true;
+		PG_TRY();
+		{
+			handled = ut_writer_wait_with_relation(1, &tuple, old_xid, tuple.t_data->t_infomask,
+												   &result);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		ut_capture_error = false;
+		UT_ASSERT_EQ(caught, leg >= 2);
+		UT_ASSERT(!handled);
+		UT_ASSERT_EQ(result, TM_Invisible);
+		UT_ASSERT_EQ(ut_scratch_exact_resolve_calls, leg == 0 ? 0 : 1);
+		UT_ASSERT_EQ(ut_writer_bridge_tuple_pulls, 0);
+		UT_ASSERT_EQ(memcmp(before.data, fixture.live_page, BLCKSZ), 0);
+		if (leg < 2)
+			UT_ASSERT(ut_hot_content_lock_held);
+		if (!ut_hot_content_lock_held)
+			LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
 		ut_writer_bridge_fixture = false;
 		ut_itl_census_end();
 	}
@@ -6847,7 +6920,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(136);
+	UT_PLAN(138);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
@@ -6894,6 +6967,7 @@ main(void)
 	UT_RUN(test_update_live_and_committed_writers_never_normalize_xmax);
 	UT_RUN(test_target_writer_uses_bit0_exact_wait_and_requalifies_terminal_proof);
 	UT_RUN(test_recycled_writer_terminal_consumes_proof_only_after_fresh_recheck);
+	UT_RUN(test_local_writer_ref_requires_matching_identity_or_resolver_proof);
 	UT_RUN(test_itl_wait_negative_boundaries_preserve_page_and_close_owners);
 	UT_RUN(test_itl_refusal_reports_capture_or_exact_slot_without_new_reads);
 	UT_RUN(test_itl_capacity_deadline_is_once_only_checked_and_ceil_rounded);
