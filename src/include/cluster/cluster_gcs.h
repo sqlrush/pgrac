@@ -234,6 +234,12 @@ extern bool cluster_gcs_send_transition_nowait(BufferTag tag, PcmLockTransition 
 extern bool cluster_gcs_try_send_transition_and_wait(BufferTag tag, PcmLockTransition transition_id,
 													 int master_node);
 
+/* PGRAC: forwarded-image N->S registration. False means an exact received
+ * INCOMPATIBLE reply: no grant, no usable one-shot image. The caller must
+ * retire its old request and exact-abort/rearm the reservation before retry.
+ * Transport failure, no reply, epoch and validator failures still ERROR. */
+extern bool cluster_gcs_register_shared_and_wait(BufferTag tag, int master_node);
+
 /*
  * cluster_gcs_register_msg_types — postmaster-once registration of
  * GCS_REQUEST + GCS_REPLY in cluster_ic dispatch table.  Called from

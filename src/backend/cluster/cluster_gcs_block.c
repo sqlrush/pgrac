@@ -72,7 +72,8 @@
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 scope gate for online replay */
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_xnode_profile.h" /* spec-5.59 D2/D3/D4 profiling buckets */
-#include "cluster/cluster_xnode_lever.h"   /* spec-6.12a — downgrade counters */
+#include "cluster/cluster_update_trace.h"
+#include "cluster/cluster_xnode_lever.h" /* spec-6.12a — downgrade counters */
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_inject.h"
@@ -3613,6 +3614,17 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 							read_image = true;
 							break;
 						}
+					} else if (final_status == GCS_BLOCK_REPLY_GRANTED_FROM_HOLDER
+							   && transition_id == PCM_TRANS_N_TO_S) {
+						/* The installed bytes do not establish S authority. A
+						 * writer may have won between shipment and registration.
+						 * Retire this request through the normal DONE funnel, then
+						 * let bufmgr exact-abort/rearm before asking for a new image.
+						 * Do not consume this image as granted or one-shot. */
+						if (!cluster_gcs_register_shared_and_wait(tag, final_forwarding_master)) {
+							retry_denied = true;
+							break;
+						}
 					} else
 						cluster_gcs_send_transition_and_wait(tag, (PcmLockTransition)transition_id,
 															 final_forwarding_master);
@@ -4820,6 +4832,15 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 			*reason_out = CLUSTER_CR_BUILD_CAPACITY;
 			return CLUSTER_CR_BUILD_RETRYABLE;
 		}
+		if (unlikely(cluster_update_trace_enabled)) {
+			ClusterUpdateTraceEvent event = { 0 };
+
+			event.kind = CLUTRACE_CR_LINK;
+			event.request_id = request_id;
+			event.requester_node = cluster_node_id;
+			event.requester_backend = MyBackendId;
+			cluster_update_trace_event(&event);
+		}
 
 		PG_TRY();
 		{
@@ -4975,11 +4996,42 @@ gcs_block_r4_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 real_maste
 	}
 }
 
+static ClusterTxOutcome cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
+	int32 origin_node, const ClusterTxLocator *locator, uint32 expected_physical_generation,
+	uint64 formation_epoch, ClusterTxResolution *out, ClusterTxResolveReason *reason_out);
+
+/* PGRAC: observational scope only; preserve every result and exception. */
 ClusterTxOutcome
 cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterTxLocator *locator,
 											   uint32 expected_physical_generation,
 											   uint64 formation_epoch, ClusterTxResolution *out,
 											   ClusterTxResolveReason *reason_out)
+{
+	ClusterXpScope trace;
+	ClusterTxOutcome result;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
+		return cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
+			origin_node, locator, expected_physical_generation, formation_epoch, out, reason_out);
+	}
+	cluster_xp_begin(&trace, CLXP_R4_TX_RPC);
+	PG_TRY();
+	{
+		result = cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
+			origin_node, locator, expected_physical_generation, formation_epoch, out, reason_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ClusterTxOutcome
+cluster_gcs_block_r4_tx_resolve_fetch_and_wait_trace_impl(
+	int32 origin_node, const ClusterTxLocator *locator, uint32 expected_physical_generation,
+	uint64 formation_epoch, ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot = NULL;
 	ClusterR4CrForwardPayload forward;
@@ -5105,9 +5157,38 @@ cluster_gcs_block_r4_tx_resolve_fetch_and_wait(int32 origin_node, const ClusterT
 /* Public TARGET requester boundary.  Admission dominates validation and
  * routing; the raw transport writes only private aligned scratch.  A caller
  * page is published only after the same token's positive final recheck. */
+static ClusterCrBuildResult
+cluster_gcs_block_cr_fetch_and_wait_trace_impl(BufferTag tag, SCN read_scn, char dst_page[BLCKSZ],
+											   ClusterCrBuildReason *reason_out);
+
+/* PGRAC: observational scope only; preserve every result and exception. */
 ClusterCrBuildResult
 cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, char dst_page[BLCKSZ],
 									ClusterCrBuildReason *reason_out)
+{
+	ClusterXpScope trace;
+	ClusterCrBuildResult result;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
+		return cluster_gcs_block_cr_fetch_and_wait_trace_impl(tag, read_scn, dst_page, reason_out);
+	}
+	cluster_xp_begin(&trace, CLXP_R4_CR_FETCH);
+	PG_TRY();
+	{
+		result
+			= cluster_gcs_block_cr_fetch_and_wait_trace_impl(tag, read_scn, dst_page, reason_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ClusterCrBuildResult
+cluster_gcs_block_cr_fetch_and_wait_trace_impl(BufferTag tag, SCN read_scn, char dst_page[BLCKSZ],
+											   ClusterCrBuildReason *reason_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
@@ -5188,9 +5269,39 @@ cluster_gcs_block_cr_fetch_and_wait(BufferTag tag, SCN read_scn, char dst_page[B
  *	         is NEVER installed as current and never flushed; it exists
  *	         only in the caller's CR destination.
  */
+static bool cluster_gcs_block_cr_fetch_and_wait_raw_trace_impl(BufferTag tag, SCN read_scn,
+															   int32 origin_node, char *dst_page,
+															   bool *out_partial);
+
+/* PGRAC: observational scope only; preserve every result and exception. */
 static bool
 cluster_gcs_block_cr_fetch_and_wait_raw(BufferTag tag, SCN read_scn, int32 origin_node,
 										char *dst_page, bool *out_partial)
+{
+	ClusterXpScope trace;
+	bool result;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
+		return cluster_gcs_block_cr_fetch_and_wait_raw_trace_impl(tag, read_scn, origin_node,
+																  dst_page, out_partial);
+	}
+	cluster_xp_begin(&trace, CLXP_R4_SOURCE_CR_RPC);
+	PG_TRY();
+	{
+		result = cluster_gcs_block_cr_fetch_and_wait_raw_trace_impl(tag, read_scn, origin_node,
+																	dst_page, out_partial);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+cluster_gcs_block_cr_fetch_and_wait_raw_trace_impl(BufferTag tag, SCN read_scn, int32 origin_node,
+												   char *dst_page, bool *out_partial)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -5561,12 +5672,45 @@ gcs_freshref_pair_log_refusal(const char *phase, int32 origin, BufferTag tag, Tr
 		 diagnostic == NULL ? -1 : diagnostic->checksum_ok, emitted == 64);
 }
 
+static bool gcs_block_undo_verdict_wire_exchange_trace_impl(
+	int32 dest_node, BufferTag tag, uint64 stamped_epoch, TransactionId xid, SCN freshref_pair_scn,
+	bool authoritative, bool authority_kind, GcsBlockReplyHeader *hdr_out,
+	ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out, uint64 *authority_scn_out);
+
 static bool
 gcs_block_undo_verdict_wire_exchange(int32 dest_node, BufferTag tag, uint64 stamped_epoch,
 									 TransactionId xid, SCN freshref_pair_scn, bool authoritative,
 									 bool authority_kind, GcsBlockReplyHeader *hdr_out,
 									 ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out,
 									 uint64 *authority_scn_out)
+{
+	ClusterXpScope trace;
+	bool result;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled))
+		return gcs_block_undo_verdict_wire_exchange_trace_impl(
+			dest_node, tag, stamped_epoch, xid, freshref_pair_scn, authoritative, authority_kind,
+			hdr_out, page_out, tt_generation_out, authority_scn_out);
+	cluster_xp_begin(&trace, CLXP_UNDO_VERDICT_RPC);
+	PG_TRY();
+	{
+		result = gcs_block_undo_verdict_wire_exchange_trace_impl(
+			dest_node, tag, stamped_epoch, xid, freshref_pair_scn, authoritative, authority_kind,
+			hdr_out, page_out, tt_generation_out, authority_scn_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static bool
+gcs_block_undo_verdict_wire_exchange_trace_impl(
+	int32 dest_node, BufferTag tag, uint64 stamped_epoch, TransactionId xid, SCN freshref_pair_scn,
+	bool authoritative, bool authority_kind, GcsBlockReplyHeader *hdr_out,
+	ClusterGcsUndoVerdictPage *page_out, uint64 *tt_generation_out, uint64 *authority_scn_out)
 {
 	ClusterGcsBlockOutstandingSlot *slot;
 	uint64 request_id = 0;
@@ -8323,6 +8467,7 @@ gcs_block_r4_tx_origin_step(GcsBlockR4TxOriginContext *context)
 void
 cluster_gcs_block_r4_tx_resolve_drain(void)
 {
+	static ClusterUpdateTraceInterval trace_intervals[GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS];
 	int i;
 
 	for (i = 0; i < GCS_BLOCK_R4_TX_ORIGIN_CONTEXTS; i++) {
@@ -8334,6 +8479,30 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 		for (step_budget = 0; step_budget < GCS_BLOCK_R4_TX_ORIGIN_STEP_BUDGET; step_budget++) {
 			GcsBlockR4TxOriginPhase phase_before = context->phase;
 			MemoryContext saved_context = CurrentMemoryContext;
+
+			if (unlikely(cluster_update_trace_enabled)) {
+				ClusterUpdateTraceEvent event = { 0 };
+
+				event.kind = CLUTRACE_ORIGIN_PHASE;
+				event.slot = (uint32)i;
+				if (context->domain == GCS_BLOCK_R4_TX_ORIGIN_DOMAIN_CURRENT_MX) {
+					event.request_id = context->current_mx_request.prefix.request_id;
+					event.requester_node
+						= context->current_mx_request.prefix.original_requester_node;
+					event.requester_backend
+						= context->current_mx_request.prefix.requester_backend_id;
+					event.value = (5U << 8) | (uint32)phase_before;
+				} else {
+					event.request_id = context->forward.base.request_id;
+					event.requester_node = context->forward.base.original_requester_node;
+					event.requester_backend = context->forward.base.requester_backend_id;
+					event.value
+						= ((context->undo_data_fetch ? 4U : 2U) << 8) | (uint32)phase_before;
+				}
+				cluster_update_trace_interval_enter_at(&trace_intervals[i], &event,
+													   cluster_update_trace_now_ns());
+			} else
+				trace_intervals[i].active = false;
 
 			PG_TRY();
 			{
@@ -8357,6 +8526,10 @@ cluster_gcs_block_r4_tx_resolve_drain(void)
 					gcs_block_r4_tx_origin_context_clear(context, true);
 			}
 			PG_END_TRY();
+			if (unlikely(trace_intervals[i].active))
+				cluster_update_trace_interval_leave_at(
+					&trace_intervals[i], !context->in_use || context->phase != phase_before,
+					cluster_update_trace_now_ns());
 			if (context->in_use && context->failure_phase == 0
 				&& gcs_block_r4_tx_origin_failure_transition(phase_before, context))
 				context->failure_phase = phase_before;
@@ -13780,8 +13953,47 @@ gcs_block_resource_x_aux_creation_reobserve_coherent(
 	return result;
 }
 
+static ResourceXApplyResult gcs_block_resource_x_target_acquire_internal_trace_impl(
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
+	uint64 direct_init_ownership_generation, uint64 direct_init_reservation_token, bool join_only,
+	uint64 *absolute_deadline_us_io, ResourceXAuxiliaryAcquireContext *aux_context,
+	bool *creation_reobserve_out, ResourceXAcquisitionRef *ref_out);
+
+/* PGRAC: observational scope only; preserve every result and exception. */
 static ResourceXApplyResult
 gcs_block_resource_x_target_acquire_internal(
+	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
+	uint64 direct_init_ownership_generation, uint64 direct_init_reservation_token, bool join_only,
+	uint64 *absolute_deadline_us_io, ResourceXAuxiliaryAcquireContext *aux_context,
+	bool *creation_reobserve_out, ResourceXAcquisitionRef *ref_out)
+{
+	ClusterXpScope trace;
+	ResourceXApplyResult result;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
+		return gcs_block_resource_x_target_acquire_internal_trace_impl(
+			buf, expected_resource, r4_record_generation, direct_init_ownership_generation,
+			direct_init_reservation_token, join_only, absolute_deadline_us_io, aux_context,
+			creation_reobserve_out, ref_out);
+	}
+	cluster_xp_begin(&trace, CLXP_RESOURCE_X_ACQUIRE);
+	PG_TRY();
+	{
+		result = gcs_block_resource_x_target_acquire_internal_trace_impl(
+			buf, expected_resource, r4_record_generation, direct_init_ownership_generation,
+			direct_init_reservation_token, join_only, absolute_deadline_us_io, aux_context,
+			creation_reobserve_out, ref_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ResourceXApplyResult
+gcs_block_resource_x_target_acquire_internal_trace_impl(
 	BufferDesc *buf, const BufferTag *expected_resource, uint64 r4_record_generation,
 	uint64 direct_init_ownership_generation, uint64 direct_init_reservation_token, bool join_only,
 	uint64 *absolute_deadline_us_io, ResourceXAuxiliaryAcquireContext *aux_context,

@@ -48,6 +48,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_update_trace.h"
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -109,6 +110,8 @@ typedef struct ClusterCrServerShared {
 	ClusterLmsCrSlot slots[CLUSTER_LMS_CR_SLOTS];
 } ClusterCrServerShared;
 
+static ClusterCrServerShared *CrServerShared = NULL;
+
 /* One process-local worker-0 episode per physical R4 slot. */
 typedef struct ClusterR4CrWorkerContext {
 	bool in_use;
@@ -125,6 +128,45 @@ typedef struct ClusterR4CrWorkerContext {
 	bool foreign_physical_generation_frozen;
 	uint8 reserved[2];
 } ClusterR4CrWorkerContext;
+
+/* Immutable finite diagnostic events; never consulted by the slot owner. */
+static void
+cr_server_trace(const ClusterLmsCrSlot *slot, uint32 kind, uint32 state)
+{
+	ClusterUpdateTraceEvent event = { 0 };
+
+	if (likely(!cluster_update_trace_enabled))
+		return;
+	event.kind = kind;
+	event.value = state;
+	event.request_id = slot->request_id;
+	event.requester_node = slot->requester_node;
+	event.requester_backend = slot->requester_backend;
+	event.generation = slot->r4.slot_generation;
+	event.slot = (uint32)(slot - CrServerShared->slots);
+	cluster_update_trace_event(&event);
+}
+
+/* Sample the existing return predicate, not SCUR authority or lock ownership. */
+static void
+cr_server_trace_origin_gate(bool active)
+{
+	static bool initialized;
+	static bool previous;
+	ClusterUpdateTraceEvent event = { 0 };
+
+	if (likely(!cluster_update_trace_enabled)) {
+		initialized = false;
+		return;
+	}
+	if (initialized && previous == active)
+		return;
+	initialized = true;
+	previous = active;
+	event.kind = CLUTRACE_CR_ORIGIN_GATE;
+	event.value = active;
+	cluster_update_trace_event(&event);
+}
 
 /* Process-local refusal detail only. This never decides a transition and
  * must be called after releasing any SCUR guard, using sampled scalars. */
@@ -343,7 +385,6 @@ cluster_cr_build_on_holder(const BufferTag *tag, SCN read_scn, char dst[BLCKSZ],
 	return result;
 }
 
-static ClusterCrServerShared *CrServerShared = NULL;
 static ClusterR4CrWorkerContext CrServerR4Contexts[CLUSTER_LMS_CR_SLOTS];
 static uint32 cluster_lms_cr_legacy_drain_cursor;
 
@@ -800,6 +841,7 @@ cluster_lms_cr_submit_r4(const ClusterR4CrForwardPayload *forward,
 				reason = CLUSTER_CR_BUILD_RF_DEFERRED;
 				result = CLUSTER_CR_BUILD_RETRYABLE;
 			} else {
+				cr_server_trace(slot, CLUTRACE_CR_STATE, CLUSTER_LMS_CR_R4_QUEUED);
 				pg_write_barrier();
 				pg_atomic_write_u32(&slot->state, CLUSTER_LMS_CR_R4_QUEUED);
 				cleanup_needed = false;
@@ -1075,6 +1117,7 @@ cr_server_r4_claim_queued(uint32 slot_index)
 	context->admission = admission;
 	pg_write_barrier();
 	context->in_use = true;
+	cr_server_trace(slot, CLUTRACE_CR_STATE, CLUSTER_LMS_CR_R4_BUILDING);
 	return true;
 }
 
@@ -1122,6 +1165,7 @@ cr_server_r4_terminalize_build_error(uint32 slot_index, ClusterLmsCrSlot *slot,
 	pg_write_barrier();
 	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, terminal_state))
 		return false;
+	cr_server_trace(slot, CLUTRACE_CR_STATE, terminal_state);
 	cr_server_wake_lms();
 	return true;
 }
@@ -1146,6 +1190,7 @@ cr_server_r4_build_step(uint32 slot_index)
 	uint32 entry_state;
 	uint32 expected;
 	bool foreign_undo_ready;
+	bool transitioned;
 
 	if (CrServerShared == NULL || slot_index >= CLUSTER_LMS_CR_SLOTS
 		|| cluster_ic_tier1_my_data_channel() != 0 || MyBackendType != B_LMS)
@@ -1199,6 +1244,7 @@ cr_server_r4_build_step(uint32 slot_index)
 	}
 	key = *context;
 	saved_context = CurrentMemoryContext;
+	cr_server_trace(slot, CLUTRACE_CR_BUILD_BEGIN, entry_state);
 
 	PG_TRY();
 	{
@@ -1222,6 +1268,7 @@ cr_server_r4_build_step(uint32 slot_index)
 		FlushErrorState();
 	}
 	PG_END_TRY();
+	cr_server_trace(slot, CLUTRACE_CR_BUILD_END, (uint32)step_result);
 	if (error_terminalized)
 		return true;
 	switch (step_result) {
@@ -1266,7 +1313,10 @@ cr_server_r4_build_step(uint32 slot_index)
 	slot->r4.terminal_reason = (uint8)reason;
 	pg_write_barrier();
 	expected = CLUSTER_LMS_CR_R4_BUILDING;
-	return pg_atomic_compare_exchange_u32(&slot->state, &expected, terminal_state);
+	transitioned = pg_atomic_compare_exchange_u32(&slot->state, &expected, terminal_state);
+	if (transitioned)
+		cr_server_trace(slot, CLUTRACE_CR_STATE, terminal_state);
+	return transitioned;
 }
 
 static bool
@@ -1274,10 +1324,14 @@ cr_server_r4_publish_foreign_terminal(ClusterLmsCrSlot *slot, uint32 from_state,
 									  uint32 terminal_state, ClusterCrBuildReason reason)
 {
 	uint32 expected = from_state;
+	bool transitioned;
 
 	slot->r4.terminal_reason = (uint8)reason;
 	pg_write_barrier();
-	return pg_atomic_compare_exchange_u32(&slot->state, &expected, terminal_state);
+	transitioned = pg_atomic_compare_exchange_u32(&slot->state, &expected, terminal_state);
+	if (transitioned)
+		cr_server_trace(slot, CLUTRACE_CR_STATE, terminal_state);
+	return transitioned;
 }
 
 static bool
@@ -1402,6 +1456,18 @@ cr_server_r4_send_foreign_undo(uint32 slot_index)
 	expected = CLUSTER_LMS_CR_R4_NEED_UNDO;
 	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT))
 		return false;
+	cr_server_trace(slot, CLUTRACE_CR_STATE, CLUSTER_LMS_CR_R4_UNDO_INFLIGHT);
+	if (unlikely(cluster_update_trace_enabled)) {
+		ClusterUpdateTraceEvent event = { 0 };
+
+		event.kind = CLUTRACE_CR_DEPENDENCY;
+		event.request_id = slot->request_id;
+		event.requester_node = slot->requester_node;
+		event.requester_backend = slot->requester_backend;
+		event.dependency_request_id = slot->r4.foreign_request_id;
+		event.value = CLUSTER_GCS_BLOCK_R4_INTERNAL_ENDPOINT;
+		cluster_update_trace_event(&event);
+	}
 	pg_read_barrier();
 	context->foreign_reply_deadline
 		= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), Max(cluster_gcs_reply_timeout_ms, 1));
@@ -1593,6 +1659,8 @@ cluster_cr_server_r4_land_foreign_undo(const ClusterICEnvelope *env,
 	pg_write_barrier();
 	expected = CLUSTER_LMS_CR_R4_UNDO_INFLIGHT;
 	landed = pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_R4_UNDO_READY);
+	if (landed)
+		cr_server_trace(slot, CLUTRACE_CR_STATE, CLUSTER_LMS_CR_R4_UNDO_READY);
 
 out:
 	if (admitted)
@@ -1609,6 +1677,7 @@ cr_server_r4_release_terminal(uint32 slot_index, uint64 slot_generation)
 	ClusterR4CrWorkerContext *context = &CrServerR4Contexts[slot_index];
 	uint32 expected = CLUSTER_LMS_CR_R4_SHIPPING;
 
+	cr_server_trace(slot, CLUTRACE_CR_RELEASE_ATTEMPT, CLUSTER_LMS_CR_R4_SHIPPING);
 	cr_server_r4_canonicalize_unpublished(slot, slot_generation);
 	pg_write_barrier();
 	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_FREE))
@@ -1687,6 +1756,7 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 	expected = terminal_state;
 	if (!pg_atomic_compare_exchange_u32(&slot->state, &expected, CLUSTER_LMS_CR_R4_SHIPPING))
 		return false;
+	cr_server_trace(slot, CLUTRACE_CR_STATE, CLUSTER_LMS_CR_R4_SHIPPING);
 	pg_read_barrier();
 
 	memset(frame, 0, sizeof(frame));
@@ -1744,7 +1814,8 @@ cr_server_r4_ship_terminal(uint32 slot_index)
 		return cr_server_r4_release_terminal(slot_index, slot_generation);
 	case CLUSTER_IC_SEND_NOT_ADMITTED:
 		expected = CLUSTER_LMS_CR_R4_SHIPPING;
-		(void)pg_atomic_compare_exchange_u32(&slot->state, &expected, terminal_state);
+		if (pg_atomic_compare_exchange_u32(&slot->state, &expected, terminal_state))
+			cr_server_trace(slot, CLUTRACE_CR_STATE, terminal_state);
 		return false;
 	case CLUSTER_IC_SEND_HARD_ERROR:
 		cluster_lms_data_plane_close_peer_now(slot->requester_node);
@@ -3603,8 +3674,37 @@ cluster_cr_server_test_multi_verdict_serve(ClusterLmsCrSlot *slot)
  * validated + populated (submit / serve_inline decode the synthetic address
  * + carrier before calling).
  */
+static void cr_serve_slot_impl(ClusterLmsCrSlot *slot);
+
 static void
 cr_serve_slot(ClusterLmsCrSlot *slot)
+{
+	ClusterUpdateTraceEvent event = { 0 };
+
+	if (likely(!cluster_update_trace_enabled)) {
+		cr_serve_slot_impl(slot);
+		return;
+	}
+	event.request_id = slot->request_id;
+	event.requester_node = slot->requester_node;
+	event.requester_backend = slot->requester_backend;
+	event.value = slot->req_kind;
+	event.kind = CLUTRACE_LEGACY_SERVE_BEGIN;
+	cluster_update_trace_event(&event);
+	PG_TRY();
+	{
+		cr_serve_slot_impl(slot);
+	}
+	PG_FINALLY();
+	{
+		event.kind = CLUTRACE_LEGACY_SERVE_END;
+		cluster_update_trace_event(&event);
+	}
+	PG_END_TRY();
+}
+
+static void
+cr_serve_slot_impl(ClusterLmsCrSlot *slot)
 {
 	slot->result_status = (uint8)GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER;
 
@@ -3845,13 +3945,16 @@ void
 cluster_lms_cr_drain(void)
 {
 	int i;
+	bool origin_active;
 
 	/* M4 Candidate-2 origin work shares this existing worker-0 tick and is
 	 * process-local, so it must progress even when the legacy CR table is
 	 * absent. */
 	cluster_gcs_block_r4_tx_resolve_drain();
 	cr_server_r4_maintain_dependencies();
-	if (cluster_gcs_block_r4_tx_resolve_active()) {
+	origin_active = cluster_gcs_block_r4_tx_resolve_active();
+	cr_server_trace_origin_gate(origin_active);
+	if (origin_active) {
 		cr_server_r4_note_origin_deferral();
 		return;
 	}

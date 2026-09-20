@@ -72,6 +72,11 @@ StaticAssertDecl(CLUSTER_RECONFIG_DEAD_BITMAP_BYTES == CLUSTER_FENCE_MARKER_DEAD
 
 static ClusterWriteFenceShmem *cluster_write_fence_shmem = NULL;
 
+#ifdef USE_CLUSTER_UNIT
+/* PGRAC: pause real publication in the standalone interleaving test only. */
+void (*cluster_write_fence_test_before_lease_publish_hook)(void) = NULL;
+#endif
+
 /*
  * D4 qvotec-side in-flight tracking (qvotec is single-process, so file statics are
  * safe).  last_processed advances only after a marker is fully written + acked, so
@@ -439,13 +444,15 @@ write_fence_allowed_observed(ClusterWriteFenceObservation *out)
 	if (region_attached) {
 		/*
 		 * Read the lease FIRST, then barrier, then epoch + self_fenced.  qvotec
-		 * (the sole writer, cluster_write_fence_refresh_from_marker) invalidates
-		 * the lease, writes epoch/self_fenced, write-barriers, then publishes the
+		 * (cluster_write_fence_refresh_from_marker) invalidates the lease for an
+		 * identity change, writes epoch/self_fenced, write-barriers, then publishes the
 		 * lease LAST.  So a non-expired lease observed here guarantees the epoch /
 		 * self_fenced we read next are the matching freshly-published values -- a
 		 * stale-epoch torn read can only come with a stale (already-invalidated)
 		 * lease, which fails closed.  The only residual is the bounded R4 lease
 		 * window (marker on disk but lease not yet aged out), an accepted risk.
+		 * An identical, already-valid authority renewal only replaces the atomic
+		 * lease value; there are no permission fields to republish in that case.
 		 */
 		lease_expire_us = pg_atomic_read_u64(&cluster_write_fence_shmem->lease_expire_at_us);
 		pg_read_barrier();
@@ -720,6 +727,7 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 {
 	bool self_fenced;
 	uint64 latched_epoch;
+	uint64 latched_lease;
 	uint8 latched_dead[CLUSTER_FENCE_MARKER_DEAD_BITMAP_BYTES];
 
 	if (cluster_write_fence_shmem == NULL)
@@ -740,6 +748,22 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 	}
 
 	self_fenced = cluster_fence_marker_node_is_fenced(m->fenced_dead_bitmap, cluster_node_id);
+
+	/* PGRAC: an unchanged live permission must not flicker to LEASE_ZERO on
+	 * every QVOTEC poll. Only the sole refresh owner extends this lease. Keep
+	 * all identity-changing, first-engage, expired and shortened publications
+	 * on the original invalidate-first path below. In particular, never write
+	 * self_fenced here: a concurrent startup self-check may only tighten it.
+	 * A reader sees either the still-valid old lease or its atomic renewal;
+	 * actual expiry and every existing consumer/ship-time guard remain real. */
+	latched_lease = pg_atomic_read_u64(&cluster_write_fence_shmem->lease_expire_at_us);
+	if (!self_fenced && pg_atomic_read_u32(&cluster_write_fence_shmem->self_fenced) == 0
+		&& pg_atomic_read_u32(&cluster_write_fence_shmem->fence_engaged) == 1
+		&& m->fence_epoch == latched_epoch && latched_epoch == cluster_epoch_get_current()
+		&& m->fence_event_id == pg_atomic_read_u64(&cluster_write_fence_shmem->fence_event_id)
+		&& memcmp(m->fenced_dead_bitmap, latched_dead, sizeof(latched_dead)) == 0
+		&& latched_lease > (uint64)GetCurrentTimestamp() && lease_expire_us >= latched_lease)
+		goto publish_lease;
 
 	/*
 	 * spec-4.12b Hardening v1.0.2 (self-fence grace race, P0 8.A).  If THIS authority
@@ -798,6 +822,11 @@ cluster_write_fence_refresh_from_marker(const ClusterFenceMarker *m, uint64 leas
 	Assert(!self_fenced || pg_atomic_read_u32(&cluster_write_fence_shmem->fence_engaged) != 0);
 
 	/* 3. publish the lease LAST -- this is what makes the token usable. */
+publish_lease:
+#ifdef USE_CLUSTER_UNIT
+	if (cluster_write_fence_test_before_lease_publish_hook != NULL)
+		cluster_write_fence_test_before_lease_publish_hook();
+#endif
 	pg_atomic_write_u64(&cluster_write_fence_shmem->lease_expire_at_us, lease_expire_us);
 
 	/* spec-4.12b D6: record the refresh time so observability can derive the

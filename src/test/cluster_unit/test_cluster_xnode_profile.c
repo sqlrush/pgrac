@@ -79,6 +79,23 @@ UT_DEFINE_GLOBALS();
  * ----------
  */
 bool cluster_xnode_profile_enabled = false;
+bool cluster_update_trace_enabled = false;
+
+/* The separate update-trace test links its real accounting implementation. */
+uint64
+cluster_update_trace_phase_begin_at(int bucket, uint64 now)
+{
+	(void)bucket;
+	(void)now;
+	return 0;
+}
+
+void
+cluster_update_trace_phase_end_at(uint64 token, uint64 now)
+{
+	(void)token;
+	(void)now;
+}
 
 extern void *ShmemInitStruct(const char *name, Size size, bool *foundPtr);
 struct ClusterShmemRegion;
@@ -150,7 +167,7 @@ UT_TEST(test_u1_bucket_enum_complete)
 	int i;
 	int j;
 
-	UT_ASSERT_EQ(CLXP_NBUCKETS, 28);
+	UT_ASSERT_EQ(CLXP_NBUCKETS, 40);
 	for (i = 0; i < CLXP_NBUCKETS; i++) {
 		const char *name = cluster_xp_bucket_name((ClusterXnodeBucket)i);
 
@@ -295,7 +312,8 @@ UT_TEST(test_u4_off_path_zero_syscall)
  * U5 — dump key surface: 28 buckets x {total_nanos, n_events} (56) plus the
  * 5 probe keys (reset_generation, read probe x2, HW locality x2) plus the
  * spec-7.4 D4 commit-latency histogram (5 components x 12 μs buckets = 60)
- * = 121 keys.  The SRF emission itself is covered end-to-end by cluster_tap
+ * = 145 keys with the twelve appended diagnostic buckets. The SRF emission
+ * itself is covered end-to-end by cluster_tap
  * (t/017 category list + t/334 legs); the unit level pins the formula and
  * the name tables the emission iterates.
  * ----------
@@ -305,7 +323,7 @@ UT_TEST(test_u5_dump_key_surface)
 	UT_ASSERT_EQ(CLUSTER_XP_N_PROBE_KEYS, 5);
 	UT_ASSERT_EQ(CLXP_NBUCKETS * 2 + CLUSTER_XP_N_PROBE_KEYS
 					 + CLXP_HIST_NCOMPONENTS * CLXP_HIST_NBUCKETS,
-				 121);
+				 145);
 }
 
 /* ----------

@@ -58,6 +58,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_tx_enqueue.h"
+#include "cluster/cluster_xnode_profile.h" /* diagnostic wait phase trace */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -626,6 +627,7 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	volatile uint64 wait_seq = 0;
 	volatile ClusterTxwResult result = CLUSTER_TXW_UNPROVABLE;
 	volatile ClusterTxResolveReason final_reason = CLUSTER_TX_RESOLVE_PROTOCOL;
+	ClusterXpScope xp_tx;
 
 	Assert(AmRegularBackendProcess());
 	if (reason_out != NULL)
@@ -678,6 +680,7 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	formation_epoch = cluster_epoch_get_current();
 	my_xid = GetTopTransactionIdIfAny();
 	INSTR_TIME_SET_CURRENT(wait_started);
+	cluster_xp_begin(&xp_tx, CLXP_I_TX_WAIT);
 
 	PG_TRY();
 	{
@@ -796,6 +799,7 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	}
 	PG_FINALLY();
 	{
+		cluster_xp_end(&xp_tx);
 		txw_exact_cleanup(procno, CLUSTER_TXW_SLOT_TARGET, (bool)slot_registered,
 						  (bool)wait_state_published, (bool)wfg_registered, formation_epoch, my_xid,
 						  (uint64)wait_seq);

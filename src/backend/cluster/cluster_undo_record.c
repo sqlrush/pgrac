@@ -2161,10 +2161,44 @@ cluster_undo_record_install_prepared_resident_locked(const ClusterUndoRecordPrep
 }
 
 
+static ClusterUndoRecordPrepareResult cluster_undo_record_prepare_trace_impl(
+	uint8 record_type, uint16 payload_capacity, uint16 tt_slot_segment_id, uint16 tt_slot_offset,
+	UBA prev_uba, uint64 absolute_deadline_us, ClusterUndoRecordPrepareReceipt *receipt);
+
+/* PGRAC: observational scope only; preserve every result and exception. */
 ClusterUndoRecordPrepareResult
 cluster_undo_record_prepare(uint8 record_type, uint16 payload_capacity, uint16 tt_slot_segment_id,
 							uint16 tt_slot_offset, UBA prev_uba, uint64 absolute_deadline_us,
 							ClusterUndoRecordPrepareReceipt *receipt)
+{
+	ClusterXpScope trace;
+	ClusterUndoRecordPrepareResult result;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
+		return cluster_undo_record_prepare_trace_impl(record_type, payload_capacity,
+													  tt_slot_segment_id, tt_slot_offset, prev_uba,
+													  absolute_deadline_us, receipt);
+	}
+	cluster_xp_begin(&trace, CLXP_UNDO_RECEIPT_PREPARE);
+	PG_TRY();
+	{
+		result = cluster_undo_record_prepare_trace_impl(record_type, payload_capacity,
+														tt_slot_segment_id, tt_slot_offset,
+														prev_uba, absolute_deadline_us, receipt);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ClusterUndoRecordPrepareResult
+cluster_undo_record_prepare_trace_impl(uint8 record_type, uint16 payload_capacity,
+									   uint16 tt_slot_segment_id, uint16 tt_slot_offset,
+									   UBA prev_uba, uint64 absolute_deadline_us,
+									   ClusterUndoRecordPrepareReceipt *receipt)
 {
 	ClusterUndoRecordReservation *reservation = &cluster_undo_record_reservation;
 	ClusterSemanticAdmissionToken modifier_admission = { 0 };

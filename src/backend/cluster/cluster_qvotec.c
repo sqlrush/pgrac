@@ -3724,6 +3724,8 @@ qvotec_poll_once(void)
 			uint64 best_gen = 0;
 			uint64 best_incarnation = 0;
 			uint64 best_epoch = 0;
+			const ClusterVotingSlot *best_slot = NULL;
+			int best_disk = -1;
 			bool fresh;
 
 			for (i = 0; i < qvotec_n_disks; i++) {
@@ -3733,11 +3735,24 @@ qvotec_poll_once(void)
 					best_gen = cell->generation;
 					best_incarnation = cell->incarnation;
 					best_epoch = cell->current_epoch;
+					best_slot = cell;
+					best_disk = i;
 				}
 			}
 			cluster_reconfig_record_observed_slot((int32)node, best_incarnation, best_gen,
 												  best_epoch);
-			fresh = (decision.alive_bitmap[node / 8] & (uint8)(1u << (node % 8))) != 0;
+			/* A node-level alive bit may come from a different incarnation
+			 * on another disk. A new process restarts generation at zero;
+			 * never lend its freshness to a higher-generation clean tombstone.
+			 * Keep the observed tuple, but require its own trusted, fresh ALIVE
+			 * record before it can contribute to founding membership. */
+			fresh = (decision.alive_bitmap[node / 8] & (uint8)(1u << (node % 8))) != 0
+					&& best_slot != NULL && io_states[best_disk] == CLUSTER_VOTING_DISK_IO_OK
+					&& (best_slot->flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE) != 0
+					&& (heartbeat_timeout_us == 0
+						|| (best_slot->heartbeat_ts_us != 0
+							&& (now_us <= best_slot->heartbeat_ts_us
+								|| now_us - best_slot->heartbeat_ts_us <= heartbeat_timeout_us)));
 			cluster_reconfig_record_observed_fresh_alive((int32)node, fresh);
 		}
 		cluster_reconfig_bootstrap_publish_in_quorum(decision.quorum_state

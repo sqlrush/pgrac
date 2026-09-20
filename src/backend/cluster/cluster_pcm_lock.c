@@ -14145,15 +14145,37 @@ cluster_pcm_lock_resource_x_bootstrap_round_target_install_capture_exact(
 			 || observed->reservation_token == 0 || observed->reservation_token == UINT64_MAX
 			 || observed->generation == UINT64_MAX)
 		state = RESOURCE_X_TARGET_INSTALL_STALE;
-	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
-			 && round->cached_ownership_generation != 0
-			 && round->cached_ownership_generation < UINT64_MAX - 1
+	else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_ASSERT_DISPATCHED
+			 && round->request.assertion_sequence == round->highest_attempt_floor
+			 && round->request.assertion_sequence > round->failed_attempt_floor
+			 && round->request.assertion_sequence > round->cancelled_attempt_floor
+			 && pcm_resource_x_active_empty_locked(entry)
+			 && entry->resource_x_requester_base_generation >= 1
+			 && entry->resource_x_requester_base_generation != UINT64_MAX
+			 && entry->resource_x_retired_acquisition_generation < round->request.assertion_sequence
+			 && round->install_claim_source == RESOURCE_X_INSTALL_CLAIM_NONE
+			 && pcm_resource_x_install_claim_valid_locked(round)
+			 && pcm_resource_x_local_owner_valid_locked(&entry->resource_x_local_owner)
+			 && entry->resource_x_local_owner.state == RESOURCE_X_LOCAL_OWNER_EMPTY
 			 && observed->pcm_state == (uint8)PCM_STATE_N
-			 && (observed->flags == PCM_OWN_FLAG_GRANT_PENDING || observed->flags == 0
-				 || observed->flags == PCM_OWN_FLAG_REVOKING)
-			 && observed->generation == round->cached_ownership_generation + 1
+			 && observed->flags == PCM_OWN_FLAG_GRANT_PENDING
 			 && observed->writer_activation_token == 0
 			 && observed->resource_x_activation_generation == 0) {
+		/* Before T1, this reversible reservation is not an install claim.
+		 * Decline only optional capture, without exporting a continuation or
+		 * changing shared state. The caller's B-E-B check and existing exact
+		 * local-reservation predicate must still prove its wait; no physical
+		 * observation can create T1 or terminal authority. */
+		state = RESOURCE_X_TARGET_INSTALL_STALE;
+	} else if (round->phase == RESOURCE_X_BOOTSTRAP_ROUND_TERMINAL_X_CACHED
+			   && round->cached_ownership_generation != 0
+			   && round->cached_ownership_generation < UINT64_MAX - 1
+			   && observed->pcm_state == (uint8)PCM_STATE_N
+			   && (observed->flags == PCM_OWN_FLAG_GRANT_PENDING || observed->flags == 0
+				   || observed->flags == PCM_OWN_FLAG_REVOKING)
+			   && observed->generation == round->cached_ownership_generation + 1
+			   && observed->writer_activation_token == 0
+			   && observed->resource_x_activation_generation == 0) {
 		/* This first sample already follows the round's cached terminal X.
 		 * It cannot seed an install continuation: doing so would invent an
 		 * expected X at G+2 and intercept the caller's local-pending or

@@ -13,6 +13,25 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_xnode_profile.h"
+
+/* Profiling-aware product objects can link without a diagnostic backend.
+ * Dedicated trace tests override these defaults with the real collector. */
+bool cluster_update_trace_enabled __attribute__((weak)) = false;
+
+uint64 __attribute__((weak))
+cluster_update_trace_phase_begin_at(int bucket pg_attribute_unused(),
+									uint64 now pg_attribute_unused())
+{
+	abort();
+}
+
+void __attribute__((weak))
+cluster_update_trace_phase_end_at(uint64 token pg_attribute_unused(),
+								  uint64 now pg_attribute_unused())
+{
+	abort();
+}
 
 bool __attribute__((weak))
 errstart(int elevel, const char *domain pg_attribute_unused())

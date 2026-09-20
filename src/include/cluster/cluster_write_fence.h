@@ -807,6 +807,8 @@ extern void cluster_write_fence_shmem_register(void);
  *	event_id, then the lease LAST behind a write barrier.  The lease is invalidated
  *	first so a concurrent hot-path reader that sees a stale epoch also sees an
  *	expired lease (fail-closed); see the read-side order in cluster_write_fence.c.
+ *	An identical, engaged, non-self-fenced authority with an unexpired lease may
+ *	renew atomically without clearing it; no permission field changes on that path.
  * cluster_write_fence_note_minority_marker -- a CRC-ok marker was present but did
  *	not reach quorum-majority (P0a) -> ignored; bump the observability counter.  The
  *	token is left untouched so its lease ages out (fail-closed) if no authority

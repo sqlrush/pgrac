@@ -1,5 +1,6 @@
 /*-------------------------------------------------------------------------
  * STOP-02 \u00a717.7 cache publication/invalidation interleaving tests.
+ * Author: SqlRush
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -76,6 +77,12 @@ static int captured_level;
 static int captured_code;
 static char captured_detail[2048];
 static ClusterFenceMarker renewal_marker;
+extern void (*cluster_write_fence_test_before_lease_publish_hook)(void);
+static ClusterWriteFenceObservation publication_observed;
+static unsigned publication_samples;
+static bool startup_fence_during_publish;
+static bool durable_fixture_valid;
+static ClusterFenceMarker durable_fixture;
 
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
@@ -153,7 +160,11 @@ pg_usleep(long microsec)
 ClusterFenceAuthorityReadResult
 cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
 {
-	(void)out;
+	if (durable_fixture_valid) {
+		memset(out, 0, sizeof(*out));
+		out->marker = durable_fixture;
+		return CLUSTER_FENCE_AUTHORITY_OK;
+	}
 	return CLUSTER_FENCE_AUTHORITY_NO_MAJORITY;
 }
 
@@ -240,6 +251,9 @@ cache_marker(uint64 event_id)
 static void
 attach_cache(void)
 {
+	cluster_write_fence_test_before_lease_publish_hook = NULL;
+	publication_samples = 0;
+	startup_fence_during_publish = durable_fixture_valid = false;
 	memset(&fence_shmem, 0, sizeof(fence_shmem));
 	fence_shmem_found = false;
 	fence_region = NULL;
@@ -471,6 +485,128 @@ UT_TEST(test_external_fence_counters_are_exact_and_restart_empty)
 	UT_ASSERT(cluster_write_fence_get_external_last_proof_age_ms(&age_ms));
 }
 
+static void
+observe_before_lease_publish(void)
+{
+	if (startup_fence_during_publish) {
+		durable_fixture_valid = true;
+		if (!cluster_write_fence_startup_self_check())
+			abort();
+		durable_fixture_valid = false;
+	}
+	publication_samples++;
+	cluster_write_fence_observe(&publication_observed);
+}
+
+/* Regression: clearing an unchanged valid lease rejects a concurrent CR/TT
+ * service even though neither the authority nor its permission changed. */
+UT_TEST(test_identical_live_renewal_never_publishes_zero)
+{
+	const uint64 renewals[] = { 500, 900 };
+	int i;
+
+	for (i = 0; i < lengthof(renewals); i++) {
+		ClusterFenceMarker marker = cache_marker(17);
+		ClusterWriteFenceObservation after;
+
+		attach_cache();
+		attach_epoch();
+		marker.fence_epoch = cluster_epoch_get_current();
+		cluster_write_fence_refresh_from_marker(&marker, 500);
+		UT_ASSERT(cluster_write_fence_allowed());
+		cluster_write_fence_test_before_lease_publish_hook = observe_before_lease_publish;
+		cluster_write_fence_refresh_from_marker(&marker, renewals[i]);
+		cluster_write_fence_test_before_lease_publish_hook = NULL;
+		UT_ASSERT_EQ(publication_samples, 1);
+		UT_ASSERT(publication_observed.allowed);
+		UT_ASSERT_EQ(publication_observed.expiry_us, 500);
+		cluster_write_fence_observe(&after);
+		UT_ASSERT(after.allowed);
+		UT_ASSERT_EQ(after.expiry_us, renewals[i]);
+		UT_ASSERT_EQ(after.event_id, 17);
+	}
+}
+
+UT_TEST(test_nonrenewal_keeps_invalidate_then_publish)
+{
+	int leg;
+
+	for (leg = 0; leg < 9; leg++) {
+		ClusterFenceMarker marker = cache_marker(17);
+		uint64 initial_expiry = leg == 4 ? 100 : (leg == 8 ? 0 : 500);
+		uint64 new_expiry = 900;
+		bool allowed_after = true;
+
+		attach_cache();
+		attach_epoch();
+		marker.fence_epoch = cluster_epoch_get_current();
+		cluster_write_fence_refresh_from_marker(&marker, initial_expiry);
+		switch (leg) {
+		case 0:
+			marker.fence_epoch++;
+			allowed_after = false;
+			break;
+		case 1:
+			marker.fence_event_id++;
+			break;
+		case 2:
+			marker.fenced_dead_bitmap[0] = 0x0c;
+			break;
+		case 3:
+			marker.fenced_dead_bitmap[0] = 0x05;
+			allowed_after = false;
+			break;
+		case 4:
+			break; /* prior lease really expired */
+		case 5:
+			new_expiry = 0;
+			allowed_after = false;
+			break;
+		case 6:
+			new_expiry = 99;
+			allowed_after = false;
+			break;
+		case 7:
+			new_expiry = 400;
+			break; /* explicit shortening */
+		case 8:
+			break; /* prior authority not usable */
+		}
+		cluster_write_fence_test_before_lease_publish_hook = observe_before_lease_publish;
+		cluster_write_fence_refresh_from_marker(&marker, new_expiry);
+		cluster_write_fence_test_before_lease_publish_hook = NULL;
+		UT_ASSERT_EQ(publication_samples, 1);
+		UT_ASSERT(!publication_observed.allowed);
+		UT_ASSERT_EQ(publication_observed.expiry_us, 0);
+		UT_ASSERT_EQ(cluster_write_fence_allowed(), allowed_after);
+	}
+}
+
+UT_TEST(test_identical_renewal_cannot_undo_concurrent_startup_fence)
+{
+	ClusterFenceMarker marker = cache_marker(17);
+	ClusterWriteFenceObservation after;
+
+	attach_cache();
+	attach_epoch();
+	marker.fence_epoch = cluster_epoch_get_current();
+	cluster_write_fence_refresh_from_marker(&marker, 500);
+	UT_ASSERT(cluster_write_fence_allowed());
+	durable_fixture = marker;
+	durable_fixture.fenced_dead_bitmap[0] = 0x05;
+	durable_fixture.fence_event_id = 18;
+	startup_fence_during_publish = true;
+	cluster_write_fence_test_before_lease_publish_hook = observe_before_lease_publish;
+	cluster_write_fence_refresh_from_marker(&marker, 900);
+	cluster_write_fence_test_before_lease_publish_hook = NULL;
+	UT_ASSERT_EQ(publication_samples, 1);
+	UT_ASSERT(!publication_observed.allowed && publication_observed.self_fenced);
+	cluster_write_fence_observe(&after);
+	UT_ASSERT(!after.allowed && after.self_fenced);
+	UT_ASSERT_EQ(after.event_id, 18);
+	UT_ASSERT_EQ(after.expiry_us, 900);
+}
+
 UT_TEST(test_passive_fence_snapshot_retains_expiry_without_mutation)
 {
 	ClusterWriteFenceObservation observed;
@@ -644,9 +780,9 @@ int
 main(void)
 {
 #ifdef USE_ASSERT_CHECKING
-	UT_PLAN(14);
+	UT_PLAN(17);
 #else
-	UT_PLAN(13);
+	UT_PLAN(16);
 #endif
 	UT_RUN(test_stop_requires_owning_lmon_and_region);
 	UT_RUN(test_cache_publish_revalidate_and_invalidate);
@@ -658,6 +794,9 @@ main(void)
 	UT_RUN(test_membership_mutation_invalidates_cache_before_change);
 	UT_RUN(test_epoch_mutation_invalidates_cache_before_change);
 	UT_RUN(test_external_fence_counters_are_exact_and_restart_empty);
+	UT_RUN(test_identical_live_renewal_never_publishes_zero);
+	UT_RUN(test_nonrenewal_keeps_invalidate_then_publish);
+	UT_RUN(test_identical_renewal_cannot_undo_concurrent_startup_fence);
 	UT_RUN(test_passive_fence_snapshot_retains_expiry_without_mutation);
 	UT_RUN(test_denial_detail_keeps_original_expiry_after_renewal);
 	UT_RUN(test_critical_zero_lease_remains_panic_with_exact_reason);

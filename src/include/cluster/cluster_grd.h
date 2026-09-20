@@ -518,12 +518,18 @@ extern bool cluster_grd_is_cluster_aware(const LOCKTAG *tag);
 /*
  * Performance hook API (P1.2 v0.2 split — Stage 6 single-swap point).
  *
- *	cluster_grd_hash_resource:  pure hash function.  ONLY function
+ *	cluster_grd_hash_resource:  deterministic hash for a fixed startup topology.
+ *	  ONLY function
  *	  whose body Stage 6 替换 (xxhash3 / RDMA-aware locality hash).
  *	  Hash input is 14 bytes (P1.1 v0.2):
  *	    field1[4] + field2[4] + field3[4] + type[1] + lockmethodid[1]
  *	  Skip ONLY field4 (tuple offset);  lockmethodid IS included for
  *	  identity preservation.
+ *	  Canonical 0xFB undo-header resources additionally project into the
+ *	  owner's initial home-shard subset using the immutable declared topology.
+ *	  All entry/partition/master users consume this same projection. The
+ *	  ordinary shard map and reconfiguration still determine the live master.
+ *	  Changing this projection requires an all-node clean binary transition.
  *	cluster_grd_shard_for_hash:  pure modulo.
  *	cluster_grd_shard_for_resource:  compose hash_resource +
  *	  shard_for_hash (no counter increment).

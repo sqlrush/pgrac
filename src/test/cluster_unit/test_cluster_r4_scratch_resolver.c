@@ -8,6 +8,8 @@
  * the backend-local memo is a fixture boundary.  Every overlay, wire, native
  * CLOG and durable-recovery alternative is trapped and must remain unused.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #define USE_CLUSTER_UNIT 1
@@ -167,6 +169,7 @@ static int ut_recycled_asks;
 static bool ut_recycled_proven;
 static bool ut_recycled_committed;
 static bool ut_recycled_bound;
+static bool ut_recycled_foreign;
 static uint64 ut_evidence_metrics[CLUSTER_VIS_METRIC_COUNT];
 bool cluster_enabled = true;
 int cluster_tt_status_hint_outbound_capacity = 2;
@@ -359,6 +362,7 @@ ut_reset(ClusterTTStatus status, SCN scn)
 	ut_recycled_proven = false;
 	ut_recycled_committed = true;
 	ut_recycled_bound = false;
+	ut_recycled_foreign = false;
 	ut_exit_fixture = false;
 	ut_exit_exact_proof = false;
 	ut_full_scratch_fixture = false;
@@ -708,8 +712,12 @@ cluster_xid_native_prehistory_provable_full(uint64 next_full_xid pg_attribute_un
 }
 
 bool
-cluster_xid_provably_foreign(TransactionId xid pg_attribute_unused())
+cluster_xid_provably_foreign(TransactionId xid)
 {
+	if (ut_recycled_foreign) {
+		UT_ASSERT_EQ(xid, UT_RAW_XID);
+		return true;
+	}
 	ut_calls.clog++;
 	return false;
 }
@@ -1590,30 +1598,34 @@ UT_TEST(test_recycled_data_ref_uses_derived_origin_not_current_slot_owner)
 
 	/* Exact commit, retention bound, abort, and no durable proof.  These
 	 * drive the same product resolver used by all three visibility exits. */
-	for (leg = 0; leg < 4; leg++) {
+	for (leg = 0; leg < 8; leg++) {
+		uint32 outcome = leg % 4;
 		ClusterUndoTTSlotRef ref = ut_exact_peer_ref();
 		ClusterVisResolve out;
 
 		ut_reset(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
 		ref.local_xid++;
-		ref.origin_node_id = UT_PEER_NODE + 1;
+		ref.origin_node_id = leg < 4 ? UT_PEER_NODE + 1 : UT_SELF_NODE;
+		ut_recycled_foreign = leg >= 4;
 		ut_memo_hit = false;
-		ut_recycled_proven = leg < 3;
-		ut_recycled_committed = leg < 2;
-		ut_recycled_bound = leg == 1;
+		ut_recycled_proven = outcome < 3;
+		ut_recycled_committed = outcome < 2;
+		ut_recycled_bound = outcome == 1;
 		cluster_crossnode_runtime_visibility = true;
 		cluster_visibility_resolve_from_ref_scn(UT_RAW_XID, &ref, UT_ANCHOR_LSN, UT_READ_SCN, &out);
 		UT_ASSERT_EQ(ut_recycled_asks, 1);
 		UT_ASSERT_EQ(ut_calls.clog, 0);
 		UT_ASSERT_EQ(ut_calls.memo_install, 0);
-		UT_ASSERT_EQ(out.evidence, leg < 3 ? CLUSTER_VIS_EVIDENCE_REMOTE
-										   : CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
-		UT_ASSERT_EQ(out.status, leg < 2	? CLUSTER_TT_STATUS_COMMITTED
-								 : leg == 2 ? CLUSTER_TT_STATUS_ABORTED
-											: CLUSTER_TT_STATUS_UNKNOWN);
-		UT_ASSERT_EQ(out.commit_scn_is_bound, leg == 1);
-		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_RECYCLED_TERMINAL], leg < 3 ? 1 : 0);
-		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_RECYCLED_UNPROVABLE], leg == 3 ? 1 : 0);
+		UT_ASSERT_EQ(out.evidence, outcome < 3 ? CLUSTER_VIS_EVIDENCE_REMOTE
+											   : CLUSTER_VIS_EVIDENCE_STALE_OR_AMBIGUOUS);
+		UT_ASSERT_EQ(out.status, outcome < 2	? CLUSTER_TT_STATUS_COMMITTED
+								 : outcome == 2 ? CLUSTER_TT_STATUS_ABORTED
+												: CLUSTER_TT_STATUS_UNKNOWN);
+		UT_ASSERT_EQ(out.commit_scn_is_bound, outcome == 1);
+		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_RECYCLED_TERMINAL],
+					 outcome < 3 ? 1 : 0);
+		UT_ASSERT_EQ(ut_evidence_metrics[CLUSTER_VIS_METRIC_RECYCLED_UNPROVABLE],
+					 outcome == 3 ? 1 : 0);
 	}
 }
 

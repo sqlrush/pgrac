@@ -75,6 +75,7 @@
 #include "cluster/cluster_oid_lease.h"	   /* cluster_oid_lease_shmem_register (spec-6.14 D6) */
 #include "cluster/cluster_hw.h"			   /* cluster_hw_shmem_register (spec-5.7 D1) */
 #include "cluster/cluster_xnode_profile.h" /* cluster_xnode_profile_shmem_register (spec-5.59 D1) */
+#include "cluster/cluster_update_trace.h"  /* diagnostic per-UPDATE trace */
 #include "cluster/cluster_xnode_lever.h"   /* cluster_xnode_lever_shmem_register (spec-6.12) */
 #include "cluster/cluster_hw_lease.h"	   /* cluster_hw_lease_shmem_register (spec-6.12d) */
 #include "cluster/cluster_cr_server.h"	   /* cluster_cr_server_shmem_register (spec-6.12b) */
@@ -890,6 +891,10 @@ cluster_init_shmem_module(void)
 	/* spec-5.59 D1: cross-node profiling buckets (fixed size; GUC-gated use). */
 	if (cluster_shmem_lookup_region("pgrac cluster xnode profile") == NULL)
 		cluster_xnode_profile_shmem_register();
+
+	/* Diagnostic per-storage-UPDATE trace (runtime GUC gated). */
+	if (cluster_shmem_lookup_region("pgrac cluster update trace") == NULL)
+		cluster_update_trace_shmem_register();
 
 	/* spec-6.12: per-wave lever counters (fixed size; GUC-gated use). */
 	if (cluster_shmem_lookup_region("pgrac cluster xnode lever") == NULL)

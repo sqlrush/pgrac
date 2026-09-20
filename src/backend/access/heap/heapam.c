@@ -106,6 +106,7 @@
 #include "cluster/cluster_visibility_resolve.h" /* spec-3.14 D5b surely-dead guard */
 #include "cluster/cluster_writer_chain.h" /* spec-7.1a D0 terminal-writer chaining */
 #include "cluster/cluster_xid_stripe.h" /* spec-7.1a D5 foreign-class chain floor */
+#include "cluster/cluster_xnode_profile.h" /* diagnostic wait phase trace */
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
 #include "storage/buf_internals.h"	/* GetBufferDescriptor */
@@ -1944,8 +1945,14 @@ cluster_heap_itl_prepare_prepared_undo(Relation relation, Buffer buffer, HeapTup
 			/* The wait releases content, so its wake requires fresh page/tuple
 			 * qualification, not receipt invalidation. Preserve the receipt
 			 * until the requalified pending-target checks prove a change. */
-			wait_result = cluster_heap_itl_wait_capacity_after_census(
-				buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason);
+			{
+				ClusterXpScope xp_itl;
+
+				cluster_xp_begin(&xp_itl, CLXP_I_ITL_WAIT);
+				wait_result = cluster_heap_itl_wait_capacity_after_census(
+					buffer, buffer, buffer, xid, true, capacity_wait_deadline_us, &wait_reason);
+				cluster_xp_end(&xp_itl);
+			}
 			*content_unlocked = true;
 			if (wait_result == CLUSTER_TXW_RESOLVED || wait_result == CLUSTER_TXW_RETRY)
 				return CLUSTER_HEAP_PREPARED_UNDO_RETRY_REQUIRED;
@@ -9994,11 +10001,13 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 				 errhint("The lock-only selector returned an inconsistent identity.")));
 	} else if (tup->t_data->t_itl_slot_idx == CLUSTER_ITL_SLOT_UNALLOCATED
 			   || !cluster_itl_get_tt_ref(page, tup->t_data->t_itl_slot_idx, &cref)
-			   || cref.tt_slot_id == 0 || (int32) cref.origin_node_id == cluster_node_id)
-		return false; /* local / placeholder / not-this-xid: native wait is correct */
+			   || cref.tt_slot_id == 0)
+		return false; /* no DATA binding: retain the existing native route */
 	else if (cref.local_xid != xwait) {
 		ClusterVisEvidence evidence;
 
+		/* A recycled slot's current owner does not identify the old writer.
+		 * Resolve before selecting native wait, including a local occupant. */
 		recycled_page_lsn = PageGetLSN(page);
 		recycled_slot_index = tup->t_data->t_itl_slot_idx;
 		recycled_slot = ClusterPageGetItlSlots(page)[recycled_slot_index];
@@ -10023,7 +10032,8 @@ cluster_heap_writer_wait_failclosed(Relation relation, Buffer buffer, HeapTuple 
 						   cluster_node_id, xwait, cref.local_xid),
 				 errhint("The existing origin authority could not prove the old transaction's "
 						 "terminal state.")));
-	}
+	} else if ((int32)cref.origin_node_id == cluster_node_id)
+		return false; /* matching local writer: native wait is correct */
 
 	{
 		ClusterTxLocator locator;
@@ -14545,9 +14555,15 @@ l_pgrac_itl_capacity_wait: {
 	const char *wait_reason;
 	ClusterTxwResult wait_result;
 
-	wait_result = cluster_heap_itl_wait_capacity_after_census(
-		buffer, newbuf, itl_capacity_wait_buffer, canonical_xid, false, &itl_capacity_absolute_deadline_us,
-		&wait_reason);
+	{
+		ClusterXpScope xp_itl;
+
+		cluster_xp_begin(&xp_itl, CLXP_I_ITL_WAIT);
+		wait_result = cluster_heap_itl_wait_capacity_after_census(
+			buffer, newbuf, itl_capacity_wait_buffer, canonical_xid, false,
+			&itl_capacity_absolute_deadline_us, &wait_reason);
+		cluster_xp_end(&xp_itl);
+	}
 	if (wait_result != CLUSTER_TXW_RESOLVED && wait_result != CLUSTER_TXW_RETRY)
 		ereport(ERROR,
 				(errcode(wait_result == CLUSTER_TXW_TIMEOUT	   ? ERRCODE_CLUSTER_GES_TIMEOUT

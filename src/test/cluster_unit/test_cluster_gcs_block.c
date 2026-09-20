@@ -2704,7 +2704,9 @@ UT_TEST(test_resource_x_native_target_driver_uses_round_and_no_ticket_family)
 	UT_ASSERT_NOT_NULL(source);
 	if (source == NULL)
 		return;
-	driver = strstr(source, "\ngcs_block_resource_x_target_acquire_internal(");
+	/* The observation-only wrapper preserves results; inspect the real
+	 * driver body, not the wrapper's two trace-on/off forwarding calls. */
+	driver = strstr(source, "\ngcs_block_resource_x_target_acquire_internal_trace_impl(");
 	driver_end = driver != NULL ? strstr(driver, "\n}\n") : NULL;
 	UT_ASSERT_NOT_NULL(driver);
 	UT_ASSERT_NOT_NULL(driver_end);

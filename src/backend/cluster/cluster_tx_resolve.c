@@ -13,6 +13,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_xnode_profile.h" /* Opt-in diagnostic timing. */
 
 #ifdef USE_PGRAC_CLUSTER
 
@@ -374,9 +375,38 @@ cluster_tx_resolve_terminal_census_batch_preflight(void)
 	cluster_runtime_visibility_ensure_exit_hooks();
 }
 
+static ClusterTxOutcome cluster_tx_resolve_exact_trace_impl(const ClusterTxLocator *locator,
+															ClusterTxResolveMode mode,
+															ClusterTxResolution *out,
+															ClusterTxResolveReason *reason_out);
+
+/* PGRAC: observational scope only; preserve every result and exception. */
 ClusterTxOutcome
 cluster_tx_resolve_exact(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
 						 ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
+{
+	ClusterXpScope trace;
+	ClusterTxOutcome result;
+
+	if (likely(!cluster_update_trace_enabled && !cluster_xnode_profile_enabled)) {
+		return cluster_tx_resolve_exact_trace_impl(locator, mode, out, reason_out);
+	}
+	cluster_xp_begin(&trace, CLXP_R_TT_VISIBILITY_RESOLVE);
+	PG_TRY();
+	{
+		result = cluster_tx_resolve_exact_trace_impl(locator, mode, out, reason_out);
+	}
+	PG_FINALLY();
+	{
+		cluster_xp_end(&trace);
+	}
+	PG_END_TRY();
+	return result;
+}
+
+static ClusterTxOutcome
+cluster_tx_resolve_exact_trace_impl(const ClusterTxLocator *locator, ClusterTxResolveMode mode,
+									ClusterTxResolution *out, ClusterTxResolveReason *reason_out)
 {
 	ClusterSemanticAdmissionToken admission;
 	ClusterSemanticAdmissionResult admission_result;
