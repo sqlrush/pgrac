@@ -7050,7 +7050,17 @@ ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
 		return false;
 	slots = ClusterPageGetItlSlots(page);
 	successor = &slots[target->itl_slot_index];
-	if (successor->wrap <= target->itl_slot_wrap || successor->flags == ITL_FLAG_FREE)
+	if (successor->wrap < target->itl_slot_wrap || successor->flags == ITL_FLAG_FREE)
+		return false;
+	/* A same-incarnation UBA advance needs its exact terminal companion.
+	 * Never admit it through a NULL-capture shortcut or raw lock absence:
+	 * those paths cannot prove the newer publication completed durably. */
+	if (successor->wrap == target->itl_slot_wrap
+		&& (!logical_history || carriers == NULL || successor->xid != target->itl_xid
+			|| (target->itl_class == 1 ? (successor->flags != ITL_FLAG_COMMITTED
+										  && successor->flags != ITL_FLAG_ABORTED)
+									   : (successor->flags != ITL_FLAG_LOCK_ONLY_COMMITTED
+										  && successor->flags != ITL_FLAG_LOCK_ONLY_ABORTED))))
 		return false;
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++) {
 		const ClusterItlSlotData *slot = &slots[i];
@@ -7071,8 +7081,8 @@ ctrc_cleaner_retired_itl_page(Page page, const ClusterCtrcTxnKeyV1 *key,
 			continue;
 		}
 		/* Logical history uses the same complete ordinary carrier grammar as
-		 * retained page undo. Initial wrap zero is valid; a successor must
-		 * still have strictly advanced the target's own wrap above. */
+		 * retained page undo. Initial wrap zero is valid; an equal wrap
+		 * needs the same-role terminal companion admitted above. */
 		if (logical_history) {
 			if (!cluster_undo_history_prior_valid(slot))
 				return false;

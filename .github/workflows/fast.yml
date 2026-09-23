@@ -160,6 +160,9 @@ jobs:
       - name: Check MVP release evidence contract
         run: python3 scripts/ci/test_mvp_ci.py
 
+      - name: Check deployment preflight safety contract
+        run: python3 -B -m unittest discover -s scripts/deploy/pre1/tests -v
+
       - name: Lint commit message
         if: github.event_name == 'pull_request'
         run: |

@@ -404,7 +404,9 @@ SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 
 # The included production wait loop has disabled diagnostic probes.
-test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o
+test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
+		$(top_srcdir)/src/backend/cluster/cluster_tx_enqueue.c \
+		$(top_srcdir)/src/include/cluster/cluster_tx_enqueue.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o -o $@
 
 # spec-2.4 D16: test_cluster_epoch links cluster_epoch.o standalone.
@@ -2192,6 +2194,7 @@ test_cluster_lmon_stop_service.inc: $(top_srcdir)/src/backend/cluster/cluster_cl
 	mv $@.tmp $@
 
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_grd_outbound.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) -o $@

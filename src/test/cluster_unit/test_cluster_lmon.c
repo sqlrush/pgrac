@@ -47,6 +47,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_tt_status_hint.h"
+#include "cluster/cluster_sf_dep.h"
 #include "storage/proc.h"
 #include "storage/ipc.h"
 #include "postmaster/auxprocess.h"
@@ -112,6 +113,42 @@ static ClusterNormalStopPollResult test_stop_observation[20];
 static void test_stop_work(bool event);
 static int test_stop_wait(WaitEvent *events);
 #include "test_cluster_lmon_stop_service.inc"
+
+/* Real staging, refusal/requeue, bounded drain and queue observation. Only
+ * the unrelated module observations and transport admission are fixtures. */
+ClusterNormalStopPollResult test_real_outbound_stop_poll(uint32 *slot, const char **reason);
+#define cluster_grd_outbound_normal_stop_poll test_real_outbound_stop_poll
+#include "../../backend/cluster/cluster_grd_outbound.c"
+#undef cluster_grd_outbound_normal_stop_poll
+static ClusterGrdOutboundShared test_outbound_region;
+static LWLockPadded test_outbound_lock;
+static unsigned test_outbound_produced, test_outbound_admitted, test_outbound_attempted;
+static bool test_outbound_transport_pending;
+static bool test_outbound_event_idle;
+ProcessingMode Mode = NormalProcessing;
+int cluster_lms_workers = 2;
+
+static bool
+test_outbound_case(void)
+{
+	return test_stop_on && test_stop_case >= 43 && test_stop_case <= 47;
+}
+
+static void
+test_outbound_publish(void)
+{
+	ClusterSfDurableGossipMsg msg = { 0 };
+
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
+	msg.msg_version = CLUSTER_SF_DURABLE_GOSSIP_VERSION;
+	msg.origin_node = 0;
+	msg.durable_lsn = 3500;
+	for (uint32 peer = 1; peer <= 3; peer++) {
+		UT_ASSERT(cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_SMART_FUSION_DURABLE, peer,
+														   &msg, sizeof(msg)));
+		test_outbound_produced++;
+	}
+}
 
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
@@ -223,6 +260,8 @@ bool
 LWLockConditionalAcquire(LWLock *lock pg_attribute_unused(), LWLockMode mode pg_attribute_unused())
 {
 	test_lwlock_conditional_calls++;
+	if (test_stop_on && test_lwlock_conditional_result)
+		return LWLockAcquire(lock, mode);
 	return test_lwlock_conditional_result;
 }
 void
@@ -243,10 +282,80 @@ void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_unused(),
 				bool *foundPtr)
 {
+	if (strcmp(name, "pgrac cluster grd outbound") == 0) {
+		UT_ASSERT_EQ(size, sizeof(test_outbound_region));
+		*foundPtr = false;
+		return &test_outbound_region;
+	}
 	if (foundPtr != NULL)
 		*foundPtr = test_lmon_shmem_found;
 	test_lmon_shmem_found = true;
 	return &test_lmon_state;
+}
+
+LWLockPadded *
+GetNamedLWLockTranche(const char *name)
+{
+	UT_ASSERT(strcmp(name, "ClusterGrdOutbound") == 0);
+	return &test_outbound_lock;
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	for (unsigned i = 0; i < test_stop_lock_depth; i++)
+		if (test_stop_locks[i] == lock)
+			return true;
+	return false;
+}
+
+void
+cluster_grd_inc_ges_cleanup_deferred(void)
+{}
+void
+cluster_grd_inc_ges_reply_deferred(void)
+{}
+void
+cluster_grd_inc_ges_reply_dropped(void)
+{}
+
+const ClusterICMsgTypeInfo *
+cluster_ic_get_msg_type_info(uint8 type pg_attribute_unused())
+{
+	return NULL; /* Durability gossip is on the CONTROL plane. */
+}
+
+int
+cluster_gcs_block_payload_shard(uint8 type pg_attribute_unused(),
+								const void *payload pg_attribute_unused(),
+								uint16 length pg_attribute_unused(),
+								int workers pg_attribute_unused())
+{
+	abort(); /* This test never stages a DATA-plane frame. */
+}
+
+bool
+cluster_lms_outbound_enqueue(int worker pg_attribute_unused(), uint8 type pg_attribute_unused(),
+							 uint32 peer pg_attribute_unused(),
+							 const void *payload pg_attribute_unused(),
+							 uint16 length pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_grd_work_queue_enqueue(uint32 peer pg_attribute_unused(),
+							   const void *payload pg_attribute_unused(),
+							   uint16 length pg_attribute_unused())
+{
+	abort(); /* No synthetic local cleanup acknowledgement. */
+}
+
+void
+cluster_gcs_block_lmon_prepare_outbound_request(
+	GcsBlockRequestPayload *request pg_attribute_unused(), int32 peer pg_attribute_unused())
+{
+	abort();
 }
 
 #include "cluster/cluster_shmem.h"
@@ -331,6 +440,20 @@ cluster_gcs_block_family_on_data_plane(void)
 
 #include "cluster/cluster_ic_tier1.h"
 
+/* A connected peer's next heartbeat is available while a duty delays the
+ * real LmonMain receive phase. Socket/frame verification remains covered by
+ * test_cluster_ic_tier1_partial; only that boundary is scripted here. */
+static ClusterICPeerStateShmem test_liveness_peer;
+static int test_liveness_fd = -1;
+static unsigned test_liveness_reads, test_liveness_closes;
+static char test_liveness_close_reason[80];
+
+static bool
+test_liveness_case(void)
+{
+	return test_stop_on && test_stop_case >= 39 && test_stop_case <= 42;
+}
+
 int
 cluster_ic_tier1_listener_bind(void)
 {
@@ -350,20 +473,28 @@ cluster_ic_tier1_get_listener_fd(void)
 	return test_stop_on ? 42 : -1;
 }
 int
-cluster_ic_tier1_get_peer_fd(int32 peer_id pg_attribute_unused())
+cluster_ic_tier1_get_peer_fd(int32 peer_id)
 {
+	if (test_liveness_case() && peer_id == 1)
+		return test_liveness_fd;
 	return -1;
 }
 bool
-cluster_ic_tier1_connect_one(int32 peer_id pg_attribute_unused(),
-							 int *out_peer_fd pg_attribute_unused())
+cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 {
+	if (test_liveness_case() && peer_id == 1) {
+		*out_peer_fd = test_liveness_fd = 43;
+		return true;
+	}
 	return false;
 }
 bool
-cluster_ic_tier1_finish_connect(int32 peer_id pg_attribute_unused(),
-								int peer_fd pg_attribute_unused())
+cluster_ic_tier1_finish_connect(int32 peer_id, int peer_fd)
 {
+	if (test_liveness_case() && peer_id == 1 && peer_fd == test_liveness_fd) {
+		test_liveness_peer.last_heartbeat_recv_at = test_stop_now;
+		return true;
+	}
 	return false;
 }
 bool
@@ -375,6 +506,8 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id pg_attribute_unused(),
 ClusterICSendResult
 cluster_ic_tier1_send_heartbeat(int32 peer_id pg_attribute_unused())
 {
+	if (test_liveness_case())
+		return CLUSTER_IC_SEND_DONE;
 	return CLUSTER_IC_SEND_HARD_ERROR;
 }
 bool
@@ -402,6 +535,25 @@ cluster_ic_send_envelope(uint8 msg_type pg_attribute_unused(),
 						 const void *payload pg_attribute_unused(),
 						 uint32 payload_len pg_attribute_unused())
 {
+	if (test_outbound_case()) {
+		const ClusterSfDurableGossipMsg *msg = payload;
+		UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
+		UT_ASSERT_EQ(test_stop_lock_depth, 0);
+		UT_ASSERT_EQ(msg_type, PGRAC_IC_MSG_SMART_FUSION_DURABLE);
+		UT_ASSERT(dest_node_id >= 1 && dest_node_id <= 3);
+		UT_ASSERT_EQ(payload_len, sizeof(*msg));
+		UT_ASSERT_EQ(msg->msg_version, CLUSTER_SF_DURABLE_GOSSIP_VERSION);
+		UT_ASSERT_EQ(msg->origin_node, 0);
+		UT_ASSERT_EQ(msg->durable_lsn, 3500);
+		test_outbound_attempted++;
+		if (test_stop_case == 44)
+			return CLUSTER_IC_SEND_NOT_ADMITTED;
+		test_outbound_admitted++;
+		if (test_stop_case == 45 && test_lmon_wait_calls == 0) {
+			test_outbound_transport_pending = true;
+			return CLUSTER_IC_SEND_WOULD_BLOCK;
+		}
+	}
 	return CLUSTER_IC_SEND_DONE;
 }
 
@@ -492,15 +644,31 @@ cluster_ic_send_bytes(int32 target_node_id pg_attribute_unused(),
 	return CLUSTER_IC_SEND_DONE;
 }
 bool
-cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id pg_attribute_unused(),
-									  int peer_fd pg_attribute_unused())
+cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 {
+	if (test_liveness_case()) {
+		UT_ASSERT_EQ(peer_id, 1);
+		UT_ASSERT_EQ(peer_fd, test_liveness_fd);
+		UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
+		UT_ASSERT_EQ(test_stop_lock_depth, 0);
+		test_liveness_reads++;
+		if (test_stop_case == 39)
+			test_liveness_peer.last_heartbeat_recv_at = test_stop_now;
+		return test_stop_case != 41;
+	}
 	return false;
 }
 void
-cluster_ic_tier1_close_peer(int32 peer_id pg_attribute_unused(),
-							const char *reason pg_attribute_unused())
-{}
+cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
+{
+	if (test_liveness_case()) {
+		UT_ASSERT_EQ(peer_id, 1);
+		if (!cluster_normal_stop_protocol_closed())
+			test_liveness_closes++;
+		test_liveness_fd = -1;
+		snprintf(test_liveness_close_reason, sizeof(test_liveness_close_reason), "%s", reason);
+	}
+}
 
 /* Hardening v1.0.1 stubs (F1 + F2). */
 bool
@@ -526,8 +694,10 @@ void
 cluster_ic_tier1_anon_hello_reset(int anon_slot pg_attribute_unused())
 {}
 const ClusterICPeerStateShmem *
-cluster_ic_tier1_peer_get(int32 peer_id pg_attribute_unused())
+cluster_ic_tier1_peer_get(int32 peer_id)
 {
+	if (test_liveness_case() && peer_id == 1)
+		return &test_liveness_peer;
 	return NULL;
 }
 
@@ -659,12 +829,15 @@ void
 cluster_sf_dep_register_ic_msg_types(void)
 {}
 
-/* The standalone LMON fixture does not run its main loop. The production
- * publisher and rate-limited continuation execute in test_cluster_sf_dep. */
+/* The real publisher/rate cap execute in test_cluster_sf_dep. Here its
+ * due-publication boundary stages actual frames in the real outbound ring. */
 void cluster_sf_origin_durable_lmon_tick(void);
 void
 cluster_sf_origin_durable_lmon_tick(void)
-{}
+{
+	if (test_outbound_case() && test_stop_case != 47)
+		test_outbound_publish();
+}
 
 /* spec-2.2 additive amendment (spec-5.22e D5 prereq) stub:
  * cluster_lmon_shmem_init registers the PEER_CAPS_REPLY msg type; this
@@ -687,8 +860,11 @@ cluster_xid_wrap_barrier_register_ic_msg_types(void)
 
 /* spec-2.2 D5 LMON drive references cluster_conf_lookup_node + cluster_node_id. */
 const struct ClusterNodeInfo *
-cluster_conf_lookup_node(int32 node_id pg_attribute_unused())
+cluster_conf_lookup_node(int32 node_id)
 {
+	static struct ClusterNodeInfo peer;
+	if (test_liveness_case() && node_id == 1)
+		return &peer;
 	return NULL;
 }
 int cluster_node_id = -1;
@@ -728,8 +904,12 @@ void
 FreeWaitEventSet(WaitEventSet *set pg_attribute_unused())
 {
 	if (test_stop_on) {
+		if (test_liveness_case() && cl_normal_stop_service_depth == 1) {
+			UT_ASSERT_EQ(test_stop_lock_depth, 0);
+			return; /* Live connection state changed: rebuild, not exit. */
+		}
 		UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
-		if (test_stop_case == 10)
+		if (test_stop_case == 10 || test_stop_case == 46)
 			UT_ASSERT_EQ(test_stop_polls, 0);
 		else
 			UT_ASSERT(test_stop_polls >= 6);
@@ -969,12 +1149,6 @@ cluster_lms_cr_ship_ready(void)
  * (real impl in cluster_ges_reply_wait.o, not linked into this standalone test). */
 int
 cluster_ges_reply_wait_sweep_timeout(TimestampTz now pg_attribute_unused())
-{
-	return 0;
-}
-
-int
-cluster_grd_outbound_lmon_drain_send(void)
 {
 	return 0;
 }
@@ -1300,6 +1474,14 @@ cluster_grd_work_queue_normal_stop_poll(uint32 *slot, const char **reason)
 ClusterNormalStopPollResult
 cluster_grd_outbound_normal_stop_poll(uint32 *slot, const char **reason)
 {
+	if (test_outbound_case()) {
+		ClusterNormalStopPollResult result;
+		(void)test_stop_poll(1);
+		result = test_real_outbound_stop_poll(slot, reason);
+		if (test_stop_case == 47 && test_stop_events != 0 && test_stop_duties == 1)
+			test_outbound_event_idle = result == CLUSTER_NORMAL_STOP_READY;
+		return result;
+	}
 	*slot = 0;
 	*reason = "FIXTURE_OUTBOUND";
 	return test_stop_poll(1);
@@ -1332,6 +1514,10 @@ cluster_ic_normal_stop_poll(const char **domain, int *peer, uint32 *seq, const c
 	*peer = 1;
 	*seq = 0;
 	*reason = "FIXTURE_RETAINED_TAIL";
+	if (test_outbound_case() && test_outbound_transport_pending) {
+		(void)test_stop_poll(5);
+		return CLUSTER_NORMAL_STOP_PENDING;
+	}
 	return test_stop_poll(5);
 }
 
@@ -1467,6 +1653,14 @@ test_stop_work(bool event)
 		test_stop_events++;
 	else
 		test_stop_duties++;
+	if (test_outbound_case()) {
+		if (!event)
+			test_stop_now += INT64CONST(1000000); /* Every pass spans the gossip period. */
+		else if (test_stop_case == 47)
+			test_outbound_publish();
+	}
+	if (test_liveness_case() && !event && test_stop_duties == 2)
+		test_stop_now += test_stop_case == 42 ? INT64CONST(1000000) : INT64CONST(4000000);
 	if (test_stop_case == 2 && !event && test_stop_duties == 1) {
 		UT_ASSERT(!cluster_normal_stop_requested());
 		pg_atomic_write_u32(&cl_normal_stop->requested, 1); /* postmaster boundary */
@@ -1493,6 +1687,37 @@ test_stop_wait(WaitEvent *events)
 	test_lmon_wait_calls++;
 	if (test_lmon_wait_calls > 3)
 		abort();
+	if (test_outbound_case()) {
+		bool pending = test_stop_case == 44 || (test_stop_case == 45 && test_lmon_wait_calls == 1);
+		if (test_stop_case == 46) {
+			UT_ASSERT(!cluster_normal_stop_requested());
+			UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 3);
+			UT_ASSERT_EQ(test_outbound_admitted, 0);
+			ShutdownRequestPending = true;
+			return 0;
+		}
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_idle_mask) & 1, !pending);
+		if (test_lmon_wait_calls == 1) {
+			test_outbound_transport_pending = false; /* Explicit transport completion. */
+			if (test_stop_case == 47) {
+				events[0].events = WL_SOCKET_READABLE;
+				events[0].fd = 42;
+				events[0].user_data = (void *)(intptr_t)-1;
+				return 1;
+			}
+			return 0;
+		}
+		pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED);
+		ShutdownRequestPending = true;
+		return 0;
+	}
+	if (test_liveness_case() && test_lmon_wait_calls == 1) {
+		UT_ASSERT(events != NULL);
+		events[0].events = WL_SOCKET_WRITEABLE;
+		events[0].fd = 43;
+		events[0].user_data = (void *)(intptr_t)1;
+		return 1; /* Actual connect completion; next duty delays the read. */
+	}
 	if (test_stop_case == 10)
 		UT_ASSERT_EQ(test_stop_polls, 0);
 	else {
@@ -1596,7 +1821,8 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 		cluster_lmon_shmem_init();
 	memset(&test_stop_region, 0, sizeof(test_stop_region));
 	cl_normal_stop = &test_stop_region.normal_stop;
-	pg_atomic_init_u32(&cl_normal_stop->requested, scenario == 2 || scenario == 10 ? 0 : 1);
+	pg_atomic_init_u32(&cl_normal_stop->requested,
+					   scenario == 2 || scenario == 10 || scenario == 46 ? 0 : 1);
 	pg_atomic_init_u32(&cl_normal_stop->frontends_gone, 1);
 	pg_atomic_init_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
 	pg_atomic_init_u32(&cl_normal_stop->failure_reason, 0);
@@ -1609,6 +1835,10 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	cl_normal_stop->peer_requests_seen = 15;
 	cl_normal_stop_service_depth = cl_normal_stop_service_bit = 0;
 	test_stop_case = scenario;
+	memset(&test_liveness_peer, 0, sizeof(test_liveness_peer));
+	test_liveness_fd = -1;
+	test_liveness_reads = test_liveness_closes = 0;
+	test_liveness_close_reason[0] = '\0';
 	test_stop_now += INT64CONST(2000000);
 	test_stop_transport = transport;
 	test_stop_exit_code = -1;
@@ -1666,6 +1896,12 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	ShutdownRequestPending = scenario == 3;
 	test_lmon_state.shutdown_requested = false;
 	test_stop_on = test_lmon_exit_armed = true;
+	if (test_outbound_case()) {
+		cluster_grd_outbound_shmem_init();
+		test_outbound_produced = test_outbound_admitted = test_outbound_attempted = 0;
+		test_outbound_transport_pending = false;
+		test_outbound_event_idle = false;
+	}
 	if (setjmp(test_lmon_exit_jump) == 0)
 		LmonMain();
 	test_stop_on = test_lmon_exit_armed = false;
@@ -1937,10 +2173,80 @@ UT_TEST(test_stop_final_pending_reason_is_not_hidden_by_periodic_log_limit)
 	}
 }
 
+UT_TEST(test_liveness_reads_queued_heartbeat_before_expiring_connection)
+{
+	test_run_normal_stop_lmon(true, 39);
+	UT_ASSERT_EQ(test_stop_exit_code, 0);
+	UT_ASSERT_EQ(test_liveness_closes, 0);
+	UT_ASSERT_EQ(test_liveness_reads, 1);
+}
+
+UT_TEST(test_liveness_empty_or_failed_receive_still_closes_silent_peer)
+{
+	for (int scenario = 40; scenario <= 41; scenario++) {
+		test_run_normal_stop_lmon(true, scenario);
+		UT_ASSERT_EQ(test_liveness_closes, 1);
+		UT_ASSERT_EQ(test_liveness_reads, 1);
+		UT_ASSERT(
+			strstr(test_liveness_close_reason, scenario == 40 ? "liveness timeout" : "recv failed")
+			!= NULL);
+	}
+}
+
+UT_TEST(test_liveness_recent_heartbeat_keeps_normal_receive_schedule)
+{
+	test_run_normal_stop_lmon(true, 42);
+	UT_ASSERT_EQ(test_liveness_closes, 0);
+	UT_ASSERT_EQ(test_liveness_reads, 0);
+}
+
+UT_TEST(test_stop_drains_late_durability_before_each_idle_observation)
+{
+	test_run_normal_stop_lmon(true, 43);
+	UT_ASSERT_EQ(test_stop_exit_code, 0);
+	UT_ASSERT_EQ(test_outbound_produced, 6); /* Supply was not disabled. */
+	UT_ASSERT_EQ(test_outbound_admitted, 6);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 0);
+}
+
+UT_TEST(test_stop_late_send_refusal_retains_frames_and_blocks_exit)
+{
+	test_run_normal_stop_lmon(true, 44);
+	UT_ASSERT_EQ(test_stop_exit_code, 1);
+	UT_ASSERT(test_outbound_attempted > 0);
+	UT_ASSERT_EQ(test_outbound_admitted, 0);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 6);
+}
+
+UT_TEST(test_stop_late_accepted_transport_tail_still_blocks_idle)
+{
+	test_run_normal_stop_lmon(true, 45);
+	UT_ASSERT_EQ(test_stop_exit_code, 0);
+	UT_ASSERT_EQ(test_outbound_admitted, 6);
+	UT_ASSERT_EQ(cluster_grd_outbound_ring_depth(), 0);
+}
+
+UT_TEST(test_online_late_publication_keeps_existing_drain_schedule)
+{
+	test_run_normal_stop_lmon(true, 46);
+	UT_ASSERT_EQ(test_stop_exit_code, 0);
+	UT_ASSERT_EQ(test_outbound_produced, 3);
+	UT_ASSERT_EQ(test_outbound_admitted, 0);
+}
+
+UT_TEST(test_stop_drains_dispatch_created_work_before_post_dispatch_idle)
+{
+	test_run_normal_stop_lmon(true, 47);
+	UT_ASSERT_EQ(test_stop_exit_code, 0);
+	UT_ASSERT(test_outbound_event_idle);
+	UT_ASSERT_EQ(test_outbound_produced, 3);
+	UT_ASSERT_EQ(test_outbound_admitted, 3);
+}
+
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(41);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -1974,6 +2280,14 @@ main(void)
 	UT_RUN(test_stop_real_lmon_dedup_execution_not_cache_count);
 	UT_RUN(test_stop_real_lmon_report_collector_not_diagnostic_cache);
 	UT_RUN(test_stop_final_pending_reason_is_not_hidden_by_periodic_log_limit);
+	UT_RUN(test_liveness_reads_queued_heartbeat_before_expiring_connection);
+	UT_RUN(test_liveness_empty_or_failed_receive_still_closes_silent_peer);
+	UT_RUN(test_liveness_recent_heartbeat_keeps_normal_receive_schedule);
+	UT_RUN(test_stop_drains_late_durability_before_each_idle_observation);
+	UT_RUN(test_stop_late_send_refusal_retains_frames_and_blocks_exit);
+	UT_RUN(test_stop_late_accepted_transport_tail_still_blocks_idle);
+	UT_RUN(test_online_late_publication_keeps_existing_drain_schedule);
+	UT_RUN(test_stop_drains_dispatch_created_work_before_post_dispatch_idle);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

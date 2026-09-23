@@ -1729,7 +1729,25 @@ LmonMain(void)
 							if (last == 0)
 								continue;
 							if (now > last + liveness_to_us) {
-								cluster_ic_tier1_close_peer(pi, "heartbeat liveness timeout");
+								bool received;
+
+								/* A slow duty may leave a heartbeat in the socket
+								 * before this pass reaches its receive events. Use
+								 * the existing bounded, nonblocking verifier before
+								 * declaring silence. Raw bytes, partial frames and
+								 * an empty socket do not renew the heartbeat. This
+								 * runs inside the ordinary service work segment;
+								 * no identity, deadline or idle proof is changed. */
+								received = cluster_ic_tier1_recv_heartbeat_drain(
+									pi, lmon_peer_track[pi].fd);
+								now = GetCurrentTimestamp();
+								p = cluster_ic_tier1_peer_get(pi);
+								if (received && p != NULL && p->last_heartbeat_recv_at != 0
+									&& now <= p->last_heartbeat_recv_at + liveness_to_us)
+									continue;
+								cluster_ic_tier1_close_peer(pi, received
+																	? "heartbeat liveness timeout"
+																	: "heartbeat recv failed");
 								lmon_peer_track[pi].fd = -1;
 								lmon_peer_track[pi].substate = LMON_SUB_DOWN;
 								lmon_peer_track[pi].connect_started_at = 0;
@@ -2001,6 +2019,14 @@ LmonMain(void)
 						wait_ms = 1;
 				}
 
+				/* Normal stop must observe AFTER servicing late producers too.
+				 * Durability gossip follows the ordinary drain and can become
+				 * due on every slow pass. One bounded drain, still under the
+				 * active-service guard, prevents that ordering from keeping us
+				 * permanently non-idle. Refusals and accepted transport tails
+				 * remain visible to the unchanged module/transport observers. */
+				if (cluster_normal_stop_requested())
+					(void)cluster_grd_outbound_lmon_drain_send();
 				lmon_record_iteration(iter_started_at);
 				work_completed = true;
 			}
@@ -2184,6 +2210,9 @@ LmonMain(void)
 						}
 					}
 				}
+				/* Dispatch can create outbound replies after the duty drain. */
+				if (cluster_normal_stop_requested())
+					(void)cluster_grd_outbound_lmon_drain_send();
 				work_completed = true;
 			}
 			PG_FINALLY();

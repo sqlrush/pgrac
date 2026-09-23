@@ -393,6 +393,7 @@ static BufferTag ut_itl_census_tag;
 static int ut_itl_wait_calls;
 static ClusterTxLocator ut_itl_wait_locator;
 static int ut_itl_wait_budget_ms;
+static bool ut_writer_perpetual_wait_expected;
 static uint64 ut_evidence_metrics[CLUSTER_VIS_METRIC_COUNT];
 
 void
@@ -431,7 +432,10 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 	UT_ASSERT(!ut_itl_pair_content_lock_held[1]);
 	UT_ASSERT(!ut_itl_recycle_guard_active);
 	UT_ASSERT_EQ(semantic_activation_local_inflight[CLUSTER_SEMANTIC_TARGET_SIDE][0], 0);
-	UT_ASSERT(effective_timeout_ms > 0);
+	if (ut_writer_perpetual_wait_expected)
+		UT_ASSERT_EQ(effective_timeout_ms, -1);
+	else
+		UT_ASSERT(effective_timeout_ms > 0);
 	if (ut_itl_wait_past_budget)
 		pg_usleep((long)(effective_timeout_ms + 20) * 1000L);
 	*reason_out = ut_itl_wait_result == CLUSTER_TXW_TIMEOUT ? CLUSTER_TX_RESOLVE_TIMEOUT
@@ -5991,6 +5995,65 @@ UT_TEST(test_successor_wait_canonicalizes_and_rejects_unproved_wakes)
 	}
 }
 
+UT_TEST(test_successor_perpetual_wait_reaches_exact_target_and_preserves_mode)
+{
+	volatile int leg;
+	int saved_timeout = cluster_ges_request_timeout_ms;
+
+	for (leg = 0; leg < 2; leg++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		ClusterTxLocator locator = { 0 };
+		uint64 deadline = 0;
+		volatile bool caught = false;
+		volatile bool completed = false;
+
+		ut_itl_census_begin(&fixture, &hot, false);
+		locator.xid = 1200;
+		locator.itl_slot_index = 2;
+		locator.itl_kind = ITL_FLAG_ACTIVE;
+		locator.tt_wrap = 22;
+		locator.uba = uba_encode(CLUSTER_UNDO_SEGS_PER_INSTANCE + 1, 3, 2, 0);
+		ut_successor_proof_fixture = ut_writer_target_fixture = true;
+		ut_successor_proof_fault = 0;
+		ut_writer_target_resolve_calls = 0;
+		ut_writer_target_already_terminal = false;
+		ut_writer_target_outcome = leg == 0 ? CLUSTER_TX_COMMITTED : CLUSTER_TX_ABORTED;
+		ut_writer_perpetual_wait_expected = true;
+		cluster_ges_request_timeout_ms = -1;
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_UNLOCK);
+		ut_capture_error = true;
+		PG_TRY();
+		{
+			completed = cluster_heap_wait_successor(&locator, LockWaitBlock, &deadline);
+			UT_ASSERT_EQ(deadline, UINT64_MAX);
+			/* A new attempt cannot silently replace the original wait mode. */
+			cluster_ges_request_timeout_ms = 1;
+			ut_writer_target_resolve_calls = 0;
+			completed
+				= completed && cluster_heap_wait_successor(&locator, LockWaitBlock, &deadline);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		ut_capture_error = false;
+		UT_ASSERT(!caught);
+		UT_ASSERT(completed);
+		UT_ASSERT_EQ(ut_itl_wait_calls, 2);
+		UT_ASSERT_EQ(ut_itl_wait_budget_ms, -1);
+		UT_ASSERT_EQ(ut_itl_wait_locator.tt_wrap, 42);
+		UT_ASSERT_EQ(deadline, UINT64_MAX);
+		UT_ASSERT(!ut_hot_content_lock_held);
+		ut_writer_perpetual_wait_expected = false;
+		ut_successor_proof_fixture = ut_writer_target_fixture = false;
+		cluster_ges_request_timeout_ms = saved_timeout;
+		LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
+		ut_itl_census_end();
+	}
+}
+
 UT_TEST(test_update_terminal_proof_normalizes_plain_xmax_before_native_consumers)
 {
 	int leg;
@@ -6920,7 +6983,7 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(138);
+	UT_PLAN(139);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);
@@ -7059,6 +7122,7 @@ main(void)
 	UT_RUN(test_pending_writer_enters_unlocked_bridge_without_a_locked_rpc);
 	UT_RUN(test_lock_only_writer_routes_to_unlocked_exact_owner);
 	UT_RUN(test_successor_wait_canonicalizes_and_rejects_unproved_wakes);
+	UT_RUN(test_successor_perpetual_wait_reaches_exact_target_and_preserves_mode);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

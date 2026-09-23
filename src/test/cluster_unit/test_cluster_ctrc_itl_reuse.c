@@ -1287,7 +1287,7 @@ UT_TEST(test_history_recheck_rejects_effective_lock_return)
 /* Build a distinct publication through real prepare/apply/discharge. Only
  * the external page/terminal/durability services remain fixture inputs. */
 static ClusterCtrcReceiptHandle
-reuse_add_companion(unsigned index, uint8 itl_class, bool cleaned)
+reuse_add_companion_at_wrap(unsigned index, uint8 itl_class, bool cleaned, uint16 wrap)
 {
 	ClusterCtrcOriginEntry *origin = &ctrc_origin_entries()[0];
 	ClusterCtrcReceiptHandle companion;
@@ -1303,7 +1303,7 @@ reuse_add_companion(unsigned index, uint8 itl_class, bool cleaned)
 	target = companion.receipt->target;
 	target.kind = CTRC_TARGET_EXACT_ITL_SLOT;
 	target.itl_slot_index = index;
-	target.itl_slot_wrap = 12 + index;
+	target.itl_slot_wrap = wrap;
 	target.itl_xid = reuse_receipt.key.xid;
 	target.itl_class = itl_class;
 	target.planned_predecessor_sha256[0] = 1;
@@ -1336,6 +1336,160 @@ reuse_add_companion(unsigned index, uint8 itl_class, bool cleaned)
 	reuse_handle.participant->seal_generation = origin->seal_generation;
 	reuse_participant = *reuse_handle.participant;
 	return companion;
+}
+
+static ClusterCtrcReceiptHandle
+reuse_add_companion(unsigned index, uint8 itl_class, bool cleaned)
+{
+	return reuse_add_companion_at_wrap(index, itl_class, cleaned, 12 + index);
+}
+
+/* A fresh publication may advance UBA without reallocating the transaction's
+ * slot. Only its exact terminal completion can retire the old publication. */
+static ClusterCtrcReceiptHandle
+reuse_same_incarnation_setup(uint8 itl_class, uint16 wrap, bool aborted, bool cleaned)
+{
+	reuse_data_setup();
+	reuse_handle.receipt->target.itl_class = itl_class;
+	reuse_handle.receipt->target.itl_slot_wrap = wrap;
+	reuse_receipt = *reuse_handle.receipt;
+	if (itl_class == 2)
+		HeapTupleHeaderSetXmin(reuse_tuple(), 800);
+	if (aborted) {
+		reuse_terminal_status = CTRC_TERMINAL_ABORTED;
+		reuse_native_allowed = true;
+		reuse_local_floor = InvalidScn;
+	}
+	return reuse_add_companion_at_wrap(0, itl_class, cleaned, wrap);
+}
+
+UT_TEST(test_same_incarnation_advanced_uba_has_terminal_completion)
+{
+	for (uint8 itl_class = 1; itl_class <= 2; itl_class++) {
+		for (unsigned sample = 0; sample < 4; sample++) {
+			ClusterCtrcReceiptHandle companion;
+			ClusterCtrcReceipt saved;
+			PGAlignedBlock before;
+			bool aborted = sample >= 2;
+
+			companion = reuse_same_incarnation_setup(itl_class, sample % 2 ? 7 : 0, aborted, true);
+			saved = *companion.receipt;
+			before = reuse_page;
+			UT_ASSERT(reuse_run());
+			UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_CLEANED);
+			UT_ASSERT_EQ(reuse_handle.receipt->disposition, CTRC_RELEASE_CLEANED_ABSENT);
+			UT_ASSERT_EQ(reuse_handle.participant->applied_count, 0);
+			UT_ASSERT_EQ(reuse_handle.participant->cleaned_count, 2);
+			UT_ASSERT_EQ(reuse_floor_samples, aborted ? 0 : 2);
+			UT_ASSERT_EQ(reuse_native_reads, aborted ? 2 : 0);
+			UT_ASSERT_EQ(reuse_wal_finishes, 0);
+			UT_ASSERT_EQ(flush_calls, 0);
+			UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+			UT_ASSERT(memcmp(&saved, companion.receipt, sizeof(saved)) == 0);
+		}
+	}
+}
+
+UT_TEST(test_same_incarnation_keeps_terminal_companion_and_history_guards)
+{
+	for (uint8 itl_class = 1; itl_class <= 2; itl_class++) {
+		for (unsigned fault = 0; fault < 25; fault++) {
+			ClusterCtrcReceiptHandle companion;
+			ClusterItlSlotData *slot;
+			PGAlignedBlock before;
+
+			companion = reuse_same_incarnation_setup(itl_class, 7, false, true);
+			slot = &ClusterPageGetItlSlots((Page)reuse_page.data)[0];
+			switch (fault) {
+			case 0:
+				companion.receipt->key.segment_generation++;
+				break;
+			case 1:
+				companion.receipt->key.origin_boot_incarnation++;
+				break;
+			case 2:
+				companion.receipt->key.cluster_epoch++;
+				break;
+			case 3:
+				companion.receipt->publication.journal_slot_generation++;
+				break;
+			case 4:
+				companion.receipt->target.block_number++;
+				break;
+			case 5:
+				companion.receipt->target.itl_slot_wrap++;
+				break;
+			case 6:
+				companion.receipt->target.uba[0] ^= 1;
+				break;
+			case 7:
+				companion.receipt->state = CTRC_RECEIPT_APPLIED;
+				break;
+			case 8:
+				companion.receipt->disposition = CTRC_RELEASE_CLEANED_ABSENT;
+				break;
+			case 9:
+				slot->commit_scn++;
+				break;
+			case 10:
+				reuse_local_floor = 900;
+				break;
+			case 11:
+				companion.receipt->highest_local_wal_lsn = 4001;
+				break;
+			case 12:
+				companion.receipt->required_lsn[1] = 3501;
+				break;
+			case 13:
+				slot->flags = itl_class == 1 ? ITL_FLAG_ACTIVE : ITL_FLAG_LOCK_ONLY_ACTIVE;
+				slot->commit_scn = InvalidScn;
+				break;
+			case 14:
+				slot->flags = itl_class == 1 ? ITL_FLAG_ABORTED : ITL_FLAG_LOCK_ONLY_ABORTED;
+				slot->commit_scn = InvalidScn;
+				break;
+			case 15:
+				slot->flags = itl_class == 1 ? ITL_FLAG_LOCK_ONLY_COMMITTED : ITL_FLAG_COMMITTED;
+				companion.receipt->target.itl_class = itl_class == 1 ? 2 : 1;
+				break;
+			case 16:
+				slot->wrap--;
+				companion.receipt->target.itl_slot_wrap = slot->wrap;
+				break;
+			case 17:
+				memcpy(&slot[1].undo_segment_head, reuse_receipt.target.uba, sizeof(UBA));
+				break;
+			case 18:
+				slot->xid += 16;
+				break;
+			case 19:
+				reuse_return_effective_lock();
+				break;
+			case 20:
+				reuse_tuple()->t_infomask &= ~HEAP_XMAX_INVALID;
+				reuse_tuple()->t_infomask |= HEAP_XMAX_IS_MULTI;
+				break;
+			case 21:
+				reuse_raw_disabled = true;
+				break;
+			case 22:
+				reuse_epoch_fenced = true;
+				break;
+			case 23:
+				reuse_terminal_ok = false;
+				break;
+			case 24:
+				companion.receipt->publication = reuse_receipt.publication;
+				break;
+			}
+			before = reuse_page;
+			UT_ASSERT(!reuse_run());
+			UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+			UT_ASSERT_EQ(reuse_handle.participant->applied_count, 1);
+			UT_ASSERT_EQ(reuse_wal_finishes, 0);
+			UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+		}
+	}
 }
 
 UT_TEST(test_same_key_companion_retires_only_its_distinct_old_receipt)
@@ -1532,7 +1686,56 @@ UT_TEST(test_companions_are_revalidated_after_page_release_at_final_cas)
 }
 
 static void
-reuse_test_selector_order(bool companion_first)
+reuse_restore_companion_old_uba(void)
+{
+	memcpy(&ClusterPageGetItlSlots((Page)reuse_page.data)[1].undo_segment_head,
+		   reuse_receipt.target.uba, sizeof(UBA));
+}
+
+static void
+reuse_advance_companion_page_lsn(void)
+{
+	/* Advance beyond the companion's already merged 3200 dependency. */
+	PageSetLSNPreserveOrigin((Page)reuse_page.data, 3400);
+	PageSetLSNOrigin((Page)reuse_page.data, 1);
+}
+
+UT_TEST(test_same_incarnation_revalidates_current_and_final_proofs)
+{
+	for (uint8 itl_class = 1; itl_class <= 2; itl_class++) {
+		for (unsigned fault = 0; fault < 12; fault++) {
+			PGAlignedBlock before;
+
+			reuse_racing_companion = reuse_same_incarnation_setup(itl_class, 0, fault >= 10, true);
+			before = reuse_page;
+			if (fault < 7) {
+				reuse_companion_fault = fault;
+				durability_calls = 0;
+				durability_hook = reuse_companion_final_drift;
+			} else if (fault == 7)
+				reuse_between_rounds = reuse_restore_companion_old_uba;
+			else if (fault == 8)
+				reuse_between_rounds = reuse_advance_companion_page_lsn;
+			else if (fault == 9)
+				reuse_between_rounds = reuse_regress_peer_floor;
+			else if (fault == 10)
+				reuse_native_allowed = false;
+			else
+				reuse_native_status = TRANSACTION_STATUS_COMMITTED;
+			UT_ASSERT(!reuse_run());
+			UT_ASSERT_EQ(reuse_handle.receipt->state, CTRC_RECEIPT_APPLIED);
+			UT_ASSERT_EQ(reuse_handle.participant->applied_count, 1);
+			UT_ASSERT_EQ(reuse_wal_finishes, 0);
+			UT_ASSERT_EQ(reuse_native_depth, 0);
+			UT_ASSERT_EQ(reuse_truncation_depth, 0);
+			if (fault != 7 && fault != 8)
+				UT_ASSERT(memcmp(&before, &reuse_page, sizeof(before)) == 0);
+		}
+	}
+}
+
+static void
+reuse_test_selector_order(bool companion_first, bool same_incarnation)
 {
 	ClusterCtrcReceiptHandle old;
 	ClusterCtrcReceiptHandle companion;
@@ -1544,8 +1747,10 @@ reuse_test_selector_order(bool companion_first)
 
 	reuse_data_setup();
 	old = reuse_handle;
-	companion = reuse_add_companion(1, 1, false);
-	slot = &ClusterPageGetItlSlots((Page)reuse_page.data)[1];
+	companion = same_incarnation
+					? reuse_add_companion_at_wrap(0, 1, false, reuse_receipt.target.itl_slot_wrap)
+					: reuse_add_companion(1, 1, false);
+	slot = &ClusterPageGetItlSlots((Page)reuse_page.data)[same_incarnation ? 0 : 1];
 	slot->flags = ITL_FLAG_ACTIVE;
 	slot->commit_scn = InvalidScn;
 	/* Position the actual cursor, not either receipt's state. Exercise both
@@ -1584,12 +1789,14 @@ reuse_test_selector_order(bool companion_first)
 
 UT_TEST(test_selector_returns_from_old_receipt_then_completes_exact_companion)
 {
-	reuse_test_selector_order(false);
+	reuse_test_selector_order(false, false);
+	reuse_test_selector_order(false, true);
 }
 
 UT_TEST(test_selector_companion_first_completes_the_same_exact_pair)
 {
-	reuse_test_selector_order(true);
+	reuse_test_selector_order(true, false);
+	reuse_test_selector_order(true, true);
 }
 
 static void
@@ -1769,12 +1976,15 @@ UT_TEST(test_aborted_history_final_guard_rejects_change_after_second_current)
 int
 main(void)
 {
-	UT_PLAN(44);
+	UT_PLAN(47);
 	UT_RUN(test_aborted_history_final_guard_rejects_change_after_second_current);
 	UT_RUN(test_aborted_history_retires_only_with_all_three_proofs_without_floor);
 	UT_RUN(test_aborted_history_never_uses_absence_of_live_owner_as_abort_proof);
 	UT_RUN(test_aborted_history_clog_error_releases_native_locks_pin_and_admission);
 	reuse_history_class = 1;
+	UT_RUN(test_same_incarnation_advanced_uba_has_terminal_completion);
+	UT_RUN(test_same_incarnation_keeps_terminal_companion_and_history_guards);
+	UT_RUN(test_same_incarnation_revalidates_current_and_final_proofs);
 	UT_RUN(test_selector_returns_from_old_receipt_then_completes_exact_companion);
 	UT_RUN(test_selector_companion_first_completes_the_same_exact_pair);
 	UT_RUN(test_companions_are_revalidated_after_page_release_at_final_cas);

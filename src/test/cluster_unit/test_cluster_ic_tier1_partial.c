@@ -182,10 +182,12 @@ cluster_epoch_get_current(void)
 	return 1;
 }
 
+static TimestampTz ut_now;
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
-	return 0;
+	return ut_now;
 }
 
 /* Captured shmem region: init against a malloc'd block. */
@@ -812,6 +814,38 @@ UT_TEST(test_recv_drain_yields_after_bounded_frames)
 	UT_ASSERT_EQ(ut_dispatch_count, 66);
 }
 
+/* A bounded pre-expiry read must not treat an empty socket or unverified
+ * partial bytes as a new heartbeat. Keep the real TCP/parser bookkeeping. */
+UT_TEST(test_empty_and_partial_receive_do_not_renew_heartbeat)
+{
+	ClusterICEnvelope frame;
+	fd_set rfds;
+	struct timeval tv;
+
+	memset(&frame, 0, sizeof(frame));
+	frame.msg_type = PGRAC_IC_MSG_HEARTBEAT;
+	frame.source_node_id = UT_PEER_ID;
+	frame.dest_node_id = cluster_node_id;
+	Tier1Shmem->peers[UT_PEER_ID].last_heartbeat_recv_at = 100;
+	ut_now = 200;
+	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+	UT_ASSERT_EQ(Tier1Shmem->peers[UT_PEER_ID].last_heartbeat_recv_at, 100);
+	for (int part = 0; part < 2; part++) {
+		int offset = part == 0 ? 0 : 12;
+		int length = part == 0 ? 12 : sizeof(frame) - 12;
+
+		UT_ASSERT_EQ(send(ut_rx_fd, (char *)&frame + offset, length, 0), length);
+		FD_ZERO(&rfds);
+		FD_SET(ut_tx_fd, &rfds);
+		tv.tv_sec = 5;
+		tv.tv_usec = 0;
+		UT_ASSERT_EQ(select(ut_tx_fd + 1, &rfds, NULL, NULL, &tv), 1);
+		UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
+		UT_ASSERT_EQ(Tier1Shmem->peers[UT_PEER_ID].last_heartbeat_recv_at, part == 0 ? 100 : 200);
+	}
+	ut_now = 0;
+}
+
 /*
  * T-10 (RED core): a second whole frame handed to tier1 while the first
  * frame's tail is still backpressured must not be lost.  Pre-fix code
@@ -1197,7 +1231,7 @@ UT_TEST(test_stop_poll_malformed_state_overrides_earlier_pending)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(20);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
@@ -1210,6 +1244,7 @@ main(void)
 	UT_RUN(test_drain_on_dead_peer_hard_errors);
 	UT_RUN(test_reconnect_after_close);
 	UT_RUN(test_recv_drain_yields_after_bounded_frames);
+	UT_RUN(test_empty_and_partial_receive_do_not_renew_heartbeat);
 	UT_RUN(test_stop_poll_real_partial_envelope_and_payload);
 	UT_RUN(test_stop_poll_malformed_state_overrides_earlier_pending);
 	UT_RUN(test_second_frame_survives_backpressure);

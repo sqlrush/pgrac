@@ -675,7 +675,9 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 		goto done;
 	}
 
-	if (effective_timeout_ms <= 0)
+	/* Only -1 is perpetual. Other nonpositive internal values retain their
+	 * finite default, without changing SOURCE/current-MX wait contracts. */
+	if (effective_timeout_ms <= 0 && effective_timeout_ms != -1)
 		effective_timeout_ms = CLUSTER_TXW_DEFAULT_TIMEOUT_MS;
 	formation_epoch = cluster_epoch_get_current();
 	my_xid = GetTopTransactionIdIfAny();
@@ -779,14 +781,16 @@ cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator, int effective_tim
 				elapsed = now;
 				INSTR_TIME_SUBTRACT(elapsed, wait_started);
 				elapsed_ms = INSTR_TIME_GET_MILLISEC(elapsed);
-				if (elapsed_ms >= (double)effective_timeout_ms) {
+				if (effective_timeout_ms != -1 && elapsed_ms >= (double)effective_timeout_ms) {
 					result = CLUSTER_TXW_TIMEOUT;
 					final_reason = CLUSTER_TX_RESOLVE_TIMEOUT;
 					pg_atomic_fetch_add_u64(&ClusterTxw->timeout_count, 1);
 					break;
 				}
 
-				wait_ms = (long)((double)effective_timeout_ms - elapsed_ms);
+				wait_ms = effective_timeout_ms == -1
+							  ? CLUSTER_TXW_TICK_MS
+							  : (long)((double)effective_timeout_ms - elapsed_ms);
 				if (wait_ms <= 0)
 					wait_ms = 1;
 				if (wait_ms > CLUSTER_TXW_TICK_MS)
