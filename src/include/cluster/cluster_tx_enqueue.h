@@ -5,8 +5,8 @@
  *
  *	  spec-5.2 D4/D6.  Replaces the spec-3.4d fail-closed (53R98) for a
  *	  remote row lock with a real completion wait:  a backend blocks until
- *	  the remote holder transaction completes (commit/abort) or a finite
- *	  timeout elapses, then re-judges.  The row lock itself lives in the
+ *	  the remote holder transaction completes (commit/abort) or a requested
+ *	  finite timeout elapses, then re-judges.  The row lock itself lives in the
  *	  tuple (xmax / ITL) — this layer only records the WAITING relationship
  *	  and wakes the waiter when the holder's TT status becomes terminal.
  *
@@ -78,7 +78,11 @@ extern ClusterTxwResult cluster_tx_enqueue_wait(const ClusterTTStatusKey *holder
 												int effective_timeout_ms);
 
 /* R4 D9 exact TARGET wait.  The caller owns locator capture and mandatory
- * post-wait page/tuple requalification; this layer never returns visibility. */
+ * post-wait page/tuple requalification; this layer never returns visibility.
+ * -1 means perpetual age semantics with bounded latch/authority repolls;
+ * positive values are finite, and other nonpositive values use the finite
+ * default. Cancellation, deadlock, epoch drift and unprovable authority still
+ * leave through the exact cleanup funnel. SOURCE/current-MX remain bounded. */
 extern ClusterTxwResult cluster_tx_enqueue_wait_exact(const ClusterTxLocator *locator,
 													  int effective_timeout_ms,
 													  ClusterTxResolveReason *reason_out);

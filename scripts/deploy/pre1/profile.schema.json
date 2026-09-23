@@ -1,0 +1,524 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "PGRAC PRE1 planned deployment profile",
+  "description": "A validated plan is not live qualification or permission to format devices.",
+  "type": "object",
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "profile_id": {
+      "type": "string",
+      "enum": [
+        "pre1-gfs2-v1",
+        "pre1-gfs2-arm64-lab-v1"
+      ]
+    },
+    "campaign_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "source_commit": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "source_tree": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "binary_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "configure_args": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4096
+      },
+      "minItems": 1,
+      "maxItems": 64
+    },
+    "compiler": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "package_versions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          },
+          "version": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 4096
+          }
+        },
+        "required": [
+          "name",
+          "version"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 1,
+      "maxItems": 512
+    },
+    "block_size": {
+      "type": "integer",
+      "const": 8192
+    },
+    "encoding": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "locale": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "collation_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "nodes": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/node"
+      },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "data_lun_wwid": {
+      "$ref": "#/$defs/wwid"
+    },
+    "pv_uuid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "vg_uuid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "lv_uuid": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "fs_uuid": {
+      "$ref": "#/$defs/uuid"
+    },
+    "mountpoint": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "votes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "wwid": {
+            "$ref": "#/$defs/wwid"
+          },
+          "size": {
+            "type": "integer",
+            "minimum": 4096,
+            "maximum": 9007199254740991
+          },
+          "logical_sector": {
+            "type": "integer",
+            "const": 512
+          },
+          "index": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 2
+          }
+        },
+        "required": [
+          "wwid",
+          "size",
+          "logical_sector",
+          "index"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 3,
+      "maxItems": 3
+    },
+    "fencing": {
+      "type": "object",
+      "properties": {
+        "vm_map": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "node_id": {
+                "type": "integer",
+                "minimum": 0,
+                "maximum": 3
+              },
+              "vm_uuid": {
+                "$ref": "#/$defs/uuid"
+              }
+            },
+            "required": [
+              "node_id",
+              "vm_uuid"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 4,
+          "maxItems": 4
+        },
+        "agent_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "credential_ref": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "vm_map",
+        "agent_version",
+        "credential_ref"
+      ],
+      "additionalProperties": false
+    },
+    "guc_file_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "guc_runtime_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "pgrac_conf_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "seed_schema_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "seed_backup_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "test_contract_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "judge_sha": {
+      "$ref": "#/$defs/sha256"
+    },
+    "workload_sha": {
+      "$ref": "#/$defs/sha256"
+    },
+    "dataset_id": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,95}$"
+    },
+    "fixture_inventory": {
+      "type": "object",
+      "properties": {
+        "MAIN": {
+          "$ref": "#/$defs/fixture"
+        },
+        "NEGATIVE": {
+          "$ref": "#/$defs/fixture"
+        }
+      },
+      "required": [
+        "MAIN",
+        "NEGATIVE"
+      ],
+      "additionalProperties": false
+    },
+    "clock_offset": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "node_id": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 3
+          },
+          "offset_ms": {
+            "type": "number",
+            "minimum": -86400000,
+            "maximum": 86400000
+          }
+        },
+        "required": [
+          "node_id",
+          "offset_ms"
+        ],
+        "additionalProperties": false
+      },
+      "minItems": 4,
+      "maxItems": 4
+    },
+    "power_policy": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4096
+    },
+    "host_boot_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "authorization": {
+      "type": "object",
+      "properties": {
+        "device_allowlist": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "wwid": {
+                "$ref": "#/$defs/wwid"
+              },
+              "size": {
+                "type": "integer",
+                "minimum": 4096,
+                "maximum": 9007199254740991
+              },
+              "purpose": {
+                "type": "string",
+                "enum": [
+                  "data",
+                  "voting",
+                  "negative-voting",
+                  "scratch"
+                ]
+              },
+              "fresh": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "wwid",
+              "size",
+              "purpose",
+              "fresh"
+            ],
+            "additionalProperties": false
+          },
+          "minItems": 7,
+          "maxItems": 32
+        }
+      },
+      "required": [
+        "device_allowlist"
+      ],
+      "additionalProperties": false
+    }
+  },
+  "required": [
+    "schema_version",
+    "profile_id",
+    "campaign_id",
+    "source_commit",
+    "source_tree",
+    "binary_sha256",
+    "configure_args",
+    "compiler",
+    "package_versions",
+    "block_size",
+    "encoding",
+    "locale",
+    "collation_version",
+    "nodes",
+    "data_lun_wwid",
+    "pv_uuid",
+    "vg_uuid",
+    "lv_uuid",
+    "fs_uuid",
+    "mountpoint",
+    "votes",
+    "fencing",
+    "guc_file_hash",
+    "guc_runtime_hash",
+    "pgrac_conf_hash",
+    "seed_schema_hash",
+    "seed_backup_hash",
+    "test_contract_hash",
+    "judge_sha",
+    "workload_sha",
+    "dataset_id",
+    "fixture_inventory",
+    "clock_offset",
+    "power_policy",
+    "host_boot_id",
+    "authorization"
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "wwid": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:+-]{1,127}$"
+    },
+    "admin": {
+      "type": "object",
+      "properties": {
+        "host": {
+          "type": "string",
+          "pattern": "^[0-9.]{7,15}$"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "user": {
+          "type": "string",
+          "pattern": "^[a-z_][a-z0-9_-]{0,31}$"
+        },
+        "identity_file": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        }
+      },
+      "required": [
+        "host",
+        "port",
+        "user",
+        "identity_file"
+      ],
+      "additionalProperties": false
+    },
+    "node": {
+      "type": "object",
+      "properties": {
+        "node_id": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 3
+        },
+        "vm_uuid": {
+          "$ref": "#/$defs/uuid"
+        },
+        "machine_id": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{32}$"
+        },
+        "boot_id": {
+          "$ref": "#/$defs/uuid"
+        },
+        "admin_endpoint": {
+          "$ref": "#/$defs/admin"
+        },
+        "ssh_host_key": {
+          "type": "string",
+          "pattern": "^ssh-ed25519 [A-Za-z0-9+/]+={0,2}$"
+        },
+        "sql_addr": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "control_addr": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "data_base_addr": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "data_workers": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 64
+        },
+        "pgdata": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "install_root": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "log_root": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "uid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        },
+        "gid": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2147483647
+        }
+      },
+      "required": [
+        "node_id",
+        "vm_uuid",
+        "machine_id",
+        "boot_id",
+        "admin_endpoint",
+        "ssh_host_key",
+        "sql_addr",
+        "control_addr",
+        "data_base_addr",
+        "data_workers",
+        "pgdata",
+        "install_root",
+        "log_root",
+        "uid",
+        "gid"
+      ],
+      "additionalProperties": false
+    },
+    "fixture": {
+      "type": "object",
+      "properties": {
+        "root": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "vote_wwids": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/wwid"
+          },
+          "minItems": 3,
+          "maxItems": 3
+        }
+      },
+      "required": [
+        "root",
+        "vote_wwids"
+      ],
+      "additionalProperties": false
+    }
+  }
+}

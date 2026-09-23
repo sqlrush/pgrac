@@ -47,6 +47,7 @@
 #include "cluster/cluster_xnode_profile.h"
 #include "storage/lwlock.h"
 #include "storage/buf_internals.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/combocid.h"
 #include "utils/snapmgr.h"
@@ -120,6 +121,13 @@ bool cluster_enable_adg = false;
 bool cluster_crossnode_runtime_visibility = false;
 bool cluster_crossnode_write_write = false;
 bool cluster_cf_terminal_authority = false;
+bool cluster_page_scn_shortcut = false;
+static PGPROC ut_bound_proc;
+PGPROC *MyProc = NULL;
+static bool ut_bound_fixture;
+static bool ut_bound_epoch_drift;
+static ClusterUndoTTSlotRef ut_bound_ref;
+static SCN ut_bound_read_scn;
 bool cluster_xnode_profile_enabled = false;
 ClusterXnodeProfileShared *ClusterXnodeProfileCtl = NULL;
 static LWLockPadded ut_main_lwlocks[45];
@@ -328,6 +336,11 @@ ut_exact_peer_ref(void)
 static void
 ut_reset(ClusterTTStatus status, SCN scn)
 {
+	cluster_vis_resolve_abort_reset();
+	cluster_page_scn_shortcut = false;
+	MyProc = NULL;
+	ut_bound_fixture = false;
+	ut_bound_epoch_drift = false;
 	memset(&ut_calls, 0, sizeof(ut_calls));
 	memset(&ut_seen_key, 0xA5, sizeof(ut_seen_key));
 	memset(&ut_installed_key, 0xA5, sizeof(ut_installed_key));
@@ -555,6 +568,19 @@ cluster_undo_verdict_resolve_freshref_c1b_pair(int origin_node, uint32 undo_segm
 {
 	ut_calls.wire++;
 	ut_calls.pair_resolve++;
+	if (ut_bound_fixture) {
+		UT_ASSERT_EQ(origin_node, ut_bound_ref.origin_node_id);
+		UT_ASSERT_EQ(undo_segment_id, ut_bound_ref.undo_segment_id);
+		UT_ASSERT_EQ(raw_xid, ut_bound_ref.local_xid);
+		UT_ASSERT_EQ(ref_xid, ut_bound_ref.local_xid);
+		UT_ASSERT_EQ(expected_tt_slot_id, ut_bound_ref.tt_slot_id);
+		UT_ASSERT_EQ(ref_epoch, ut_bound_ref.cluster_epoch);
+		UT_ASSERT_EQ(cached_commit_scn, ut_bound_ref.cached_commit_scn);
+		UT_ASSERT_EQ(read_scn, ut_bound_read_scn);
+		if (ut_bound_epoch_drift)
+			ut_current_epoch++;
+		return ut_pair_verdict;
+	}
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12) {
 		UT_ASSERT_EQ(origin_node, ut_exit_ref.origin_node_id);
 		UT_ASSERT_EQ(raw_xid, UT_RAW_XID);
@@ -589,6 +615,10 @@ cluster_vis_freshref_c1b_pair_request_eligible(TransactionId raw_xid, Transactio
 											   int32 origin_node, int32 local_node,
 											   uint32 segment_id, uint32 expected_tt_slot_id)
 {
+	/* Script only the existing eligibility boundary, never the memo policy.
+	 * The actual eligibility predicate has its separate production C suite. */
+	if (ut_bound_fixture)
+		return true;
 	if (ut_full_scratch_fixture && ut_full_scratch_scenario >= 12)
 		return raw_xid == UT_RAW_XID && ref_xid == UT_RAW_XID && has_cached_status
 			   && SCN_VALID(cached_commit_scn) && ref_epoch == ut_current_epoch
@@ -1518,6 +1548,142 @@ UT_TEST(test_freshref_nonexact_verdicts_never_enter_terminal_memo)
 	}
 }
 
+static void
+ut_bound_setup(void)
+{
+	ut_reset(CLUSTER_TT_STATUS_UNKNOWN, InvalidScn);
+	ut_memo_hit = false;
+	ut_bound_fixture = true;
+	ut_bound_ref = ut_exact_peer_ref();
+	ut_bound_ref.has_cached_status = true;
+	ut_bound_ref.cached_commit_scn = UT_COMMIT_SCN;
+	ut_bound_read_scn = UT_READ_SCN;
+	memset(&ut_bound_proc, 0, sizeof(ut_bound_proc));
+	ut_bound_proc.lxid = 42;
+	MyProc = &ut_bound_proc;
+	cluster_page_scn_shortcut = true;
+	cluster_crossnode_runtime_visibility = true;
+	ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_COMMITTED_BOUND;
+	ut_pair_verdict.commit_scn = UT_COMMIT_SCN;
+}
+
+static ClusterVisResolve
+ut_bound_classify(void)
+{
+	ClusterVisResolve out;
+
+	memset(&out, 0xA5, sizeof(out));
+	cluster_visibility_resolve_from_ref_scn(ut_bound_ref.local_xid, &ut_bound_ref, UT_ANCHOR_LSN,
+											ut_bound_read_scn, &out);
+	return out;
+}
+
+UT_TEST(test_same_snapshot_bound_reuses_real_resolver_without_exact_memo)
+{
+	int i;
+
+	ut_bound_setup();
+	for (i = 0; i < 100; i++) {
+		ClusterVisResolve out = ut_bound_classify();
+
+		UT_ASSERT_EQ(out.status, CLUSTER_TT_STATUS_COMMITTED);
+		UT_ASSERT_EQ(out.evidence, CLUSTER_VIS_EVIDENCE_REMOTE);
+		UT_ASSERT_EQ(out.commit_scn, UT_COMMIT_SCN);
+		UT_ASSERT(out.commit_scn_is_bound);
+	}
+	UT_ASSERT_EQ(ut_calls.pair_resolve, 1);
+	UT_ASSERT_EQ(ut_calls.memo_install, 0);
+	UT_ASSERT_EQ(ut_calls.peer_stamp, 100);
+}
+
+UT_TEST(test_snapshot_bound_rejects_changed_context)
+{
+	int which;
+
+	for (which = 0; which < 11; which++) {
+		ut_bound_setup();
+		(void)ut_bound_classify();
+		switch (which) {
+		case 0:
+			ut_bound_read_scn++;
+			break;
+		case 1:
+			ut_bound_read_scn--;
+			break;
+		case 2:
+			ut_bound_proc.lxid++;
+			break;
+		case 3:
+			ut_current_epoch++;
+			ut_bound_ref.cluster_epoch++;
+			break;
+		case 4:
+			ut_bound_ref.undo_segment_id++;
+			break;
+		case 5:
+			ut_bound_ref.tt_slot_id++;
+			break;
+		case 6:
+			ut_bound_ref.cached_commit_scn++;
+			break;
+		case 7:
+			ut_bound_ref.local_xid++;
+			break;
+		case 8:
+			cluster_page_scn_shortcut = false;
+			break;
+		case 9:
+			cluster_vis_resolve_abort_reset();
+			break;
+		case 10:
+			MyProc = NULL;
+			break;
+		}
+		(void)ut_bound_classify();
+		UT_ASSERT_EQ(ut_calls.pair_resolve, 2);
+		UT_ASSERT_EQ(ut_calls.memo_install, 0);
+	}
+}
+
+UT_TEST(test_snapshot_bound_never_installs_inadmissible_or_nonterminal_proof)
+{
+	int which;
+
+	for (which = 0; which < 8; which++) {
+		ut_bound_setup();
+		switch (which) {
+		case 0:
+			ut_bound_read_scn = InvalidScn;
+			break;
+		case 1:
+			ut_pair_verdict.commit_scn = InvalidScn;
+			break;
+		case 2:
+			ut_pair_verdict.commit_scn = UT_READ_SCN + 1;
+			break;
+		case 3:
+			ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_IN_PROGRESS;
+			break;
+		case 4:
+			ut_pair_verdict.kind = CLUSTER_UNDO_VERDICT_UNKNOWN_FAIL_CLOSED;
+			break;
+		case 5:
+			ut_bound_epoch_drift = true;
+			break;
+		case 6:
+			ut_bound_proc.lxid = InvalidLocalTransactionId;
+			break;
+		case 7:
+			cluster_page_scn_shortcut = false;
+			break;
+		}
+		(void)ut_bound_classify();
+		(void)ut_bound_classify();
+		UT_ASSERT_EQ(ut_calls.pair_resolve, 2);
+		UT_ASSERT_EQ(ut_calls.memo_install, 0);
+	}
+}
+
 UT_TEST(test_provisional_overlay_cannot_hide_origin_terminal)
 {
 	static const ClusterTTStatus provisional[]
@@ -2168,7 +2334,7 @@ UT_TEST(test_full_scratch_trace_formatter_reports_truncation_without_overrun)
 int
 main(void)
 {
-	UT_PLAN(40);
+	UT_PLAN(43);
 	UT_RUN(test_full_scratch_trace_wrap_keeps_last_decisions_without_io);
 	UT_RUN(test_full_scratch_trace_formatter_reports_truncation_without_overrun);
 	UT_RUN(test_full_scratch_recycled_lock_roles_use_only_original_terminal_proof);
@@ -2187,6 +2353,9 @@ main(void)
 	UT_RUN(test_pair_eligible_freshref_bypasses_slotless_bound);
 	UT_RUN(test_freshref_aborted_installs_then_hits_terminal_memo);
 	UT_RUN(test_freshref_nonexact_verdicts_never_enter_terminal_memo);
+	UT_RUN(test_same_snapshot_bound_reuses_real_resolver_without_exact_memo);
+	UT_RUN(test_snapshot_bound_rejects_changed_context);
+	UT_RUN(test_snapshot_bound_never_installs_inadmissible_or_nonterminal_proof);
 	UT_RUN(test_provisional_overlay_cannot_hide_origin_terminal);
 	UT_RUN(test_hint_miss_uses_existing_origin_and_accepts_only_proven_live);
 	UT_RUN(test_stale_live_hint_without_origin_proof_stays_unknown);

@@ -9811,8 +9811,9 @@ cluster_heap_test_resolve_recycled_writer_ref(Buffer buffer, TransactionId xid,
 }
 #endif
 
-/* One caller-owned budget survives page/tuple requalification. This helper
- * neither renews a deadline nor counts an ordinary row wait as ITL capacity. */
+/* One caller-owned budget survives page/tuple requalification. UINT64_MAX
+ * preserves an explicitly perpetual ordinary row wait across retries; it is
+ * process-local, not a page or wire value. Finite and ITL budgets are unchanged. */
 static int
 cluster_heap_writer_wait_remaining_ms(uint64 *deadline_us)
 {
@@ -9822,10 +9823,16 @@ cluster_heap_writer_wait_remaining_ms(uint64 *deadline_us)
 	if (*deadline_us == 0) {
 		uint64 budget = (uint64)Max(cluster_ges_request_timeout_ms, 1) * UINT64_C(1000);
 
-		if (now_us > UINT64_MAX - budget)
+		if (cluster_ges_request_timeout_ms == -1) {
+			*deadline_us = UINT64_MAX;
+			return -1;
+		}
+		if (now_us >= UINT64_MAX - budget)
 			return 0;
 		*deadline_us = now_us + budget;
 	}
+	if (*deadline_us == UINT64_MAX)
+		return -1;
 	if (now_us >= *deadline_us)
 		return 0;
 	remaining = *deadline_us - now_us;
@@ -9836,7 +9843,7 @@ cluster_heap_writer_wait_remaining_ms(uint64 *deadline_us)
 /* The page lock is already released. R4 SOURCE hints are deliberately closed;
  * the existing TARGET resolver/wait is the sole authority. Upgrade a partial
  * page locator only through the origin's exact undo-record proof, then retain
- * that canonical identity across the existing bounded wait. */
+ * that canonical identity across the caller's finite or perpetual wait. */
 static bool
 cluster_heap_writer_wait_target(const ClusterTxLocator *locator, LockWaitPolicy wait_policy,
 								uint64 *deadline_us, ClusterVisResolve *proof)

@@ -549,7 +549,8 @@ typedef struct UtSentRec {
 	bool reply_block_zero;
 } UtSentRec;
 
-static UtSentRec ut_sent_log[64];
+/* Include a complete worker ring and the next frame admitted after draining. */
+static UtSentRec ut_sent_log[1024];
 static int ut_sent_n = 0;
 static ClusterICSendResult ut_peer_rc[CLUSTER_MAX_NODES];
 static int ut_local_dispatch_count = 0;
@@ -1280,6 +1281,36 @@ UT_TEST(test_full_worker_ring_refuses_without_overwrite)
 	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), 0);
 }
 
+/* The real ring, not a post-refusal depth guess, distinguishes capacity from
+ * an invalid call. A FULL try must own no copy; after one drain only one copy
+ * of the pending frame can become admitted. */
+UT_TEST(test_typed_admission_full_then_drain_never_duplicates)
+{
+	uint8 marker = 0xa6;
+	int accepted = 0;
+
+	ut_reset_log();
+	UT_ASSERT_EQ(cluster_lms_outbound_try_enqueue(-1, UT_MSG_TYPE, UT_PEER_X, &marker, 1),
+				 CLUSTER_LMS_ENQUEUE_INVALID);
+	UT_ASSERT_EQ(cluster_lms_outbound_try_enqueue(1, UT_MSG_TYPE, UT_PEER_X, &marker, UINT16_MAX),
+				 CLUSTER_LMS_ENQUEUE_INVALID);
+	while (accepted < 1024 && ut_enqueue_marker(1, UT_PEER_X, 0xe2))
+		accepted++;
+	UT_ASSERT(accepted > 0 && accepted < 1024);
+	UT_ASSERT_EQ(cluster_lms_outbound_try_enqueue(1, UT_MSG_TYPE, UT_PEER_X, &marker, 1),
+				 CLUSTER_LMS_ENQUEUE_FULL);
+	UT_ASSERT_EQ(cluster_lms_outbound_depth(1), accepted);
+	ut_peer_rc[UT_PEER_X] = CLUSTER_IC_SEND_DONE;
+	UT_ASSERT(cluster_lms_outbound_drain_send(1) > 0);
+	UT_ASSERT_EQ(cluster_lms_outbound_try_enqueue(1, UT_MSG_TYPE, UT_PEER_X, &marker, 1),
+				 CLUSTER_LMS_ENQUEUE_ADMITTED);
+	while (cluster_lms_outbound_depth(1) > 0)
+		(void)cluster_lms_outbound_drain_send(1);
+	UT_ASSERT(ut_sent_n <= (int)lengthof(ut_sent_log));
+	UT_ASSERT_EQ(ut_count_marker(marker), 1);
+	UT_ASSERT_EQ(ut_sent_n, accepted + 1);
+}
+
 /* A V2 wire frame is legal only on the exact HELLO-authenticated connection
  * generation sampled by its producer.  A reconnect or capability downgrade
  * consumes the stale ring copy without transport admission; the reliable
@@ -1939,6 +1970,7 @@ main(void)
 	UT_RUN(test_r4_holder_refusal_rejects_malformed_identity);
 	UT_RUN(test_zero_reply_wrappers_reject_the_other_status_domain);
 	UT_RUN(test_full_worker_ring_refuses_without_overwrite);
+	UT_RUN(test_typed_admission_full_then_drain_never_duplicates);
 	UT_RUN(test_cap_bound_frame_drops_on_connection_generation_drift);
 	UT_RUN(test_cap_bound_frame_drops_on_capability_downgrade);
 	UT_RUN(test_cap_bound_frame_sends_on_exact_connection_capability);

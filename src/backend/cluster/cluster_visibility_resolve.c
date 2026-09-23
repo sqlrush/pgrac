@@ -37,7 +37,8 @@
 #include "access/xlog.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
-#include "storage/lwlock.h"	  /* GCS-race round-3b: XactTruncationLock CLOG gate */
+#include "storage/lwlock.h" /* GCS-race round-3b: XactTruncationLock CLOG gate */
+#include "storage/proc.h"
 #include "utils/wait_event.h" /* spec-6.14 D10b ClusterCatalogVisResolve */
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b counters */
@@ -119,6 +120,68 @@ vis_origin_materialized(int origin)
  */
 static int cluster_vis_resolve_depth = 0;
 
+/*
+ * PGRAC: a bound is not an exact commit SCN and must never enter the exact
+ * terminal memo.  This separate, one-entry derivative reuses only the already
+ * proven predicate committed(X) && commit_scn(X) <= H <= R for the SAME R.
+ * No shared authority, raw-xid-only identity, TTL or page stamping is involved.
+ * Consult it only after the normal fresh-ref/origin/eligibility classifiers.
+ */
+static struct {
+	bool valid;
+	LocalTransactionId lxid;
+	uint64 epoch;
+	SCN read_scn;
+	SCN horizon_scn;
+	ClusterUndoTTSlotRef ref;
+} vis_snapshot_bound;
+
+static bool
+vis_snapshot_bound_context(const ClusterUndoTTSlotRef *ref, SCN read_scn)
+{
+	return cluster_page_scn_shortcut && MyProc != NULL && LocalTransactionIdIsValid(MyProc->lxid)
+		   && SCN_VALID(read_scn) && ref->cluster_epoch == cluster_epoch_get_current();
+}
+
+static bool
+vis_snapshot_bound_probe(const ClusterUndoTTSlotRef *ref, SCN read_scn, ClusterVisResolve *out)
+{
+	const ClusterUndoTTSlotRef *saved = &vis_snapshot_bound.ref;
+
+	if (!vis_snapshot_bound.valid)
+		return false;
+	if (!vis_snapshot_bound_context(ref, read_scn) || vis_snapshot_bound.lxid != MyProc->lxid
+		|| vis_snapshot_bound.epoch != cluster_epoch_get_current()
+		|| vis_snapshot_bound.read_scn != read_scn || saved->origin_node_id != ref->origin_node_id
+		|| saved->undo_segment_id != ref->undo_segment_id || saved->tt_slot_id != ref->tt_slot_id
+		|| saved->cluster_epoch != ref->cluster_epoch || saved->local_xid != ref->local_xid
+		|| saved->has_cached_status != ref->has_cached_status
+		|| saved->cached_commit_scn != ref->cached_commit_scn) {
+		vis_snapshot_bound.valid = false;
+		return false;
+	}
+	out->evidence = CLUSTER_VIS_EVIDENCE_REMOTE;
+	out->status = CLUSTER_TT_STATUS_COMMITTED;
+	out->commit_scn = vis_snapshot_bound.horizon_scn;
+	out->commit_scn_is_bound = true;
+	return true;
+}
+
+static void
+vis_snapshot_bound_install(const ClusterUndoTTSlotRef *ref, SCN read_scn, SCN horizon_scn)
+{
+	vis_snapshot_bound.valid = false;
+	if (!vis_snapshot_bound_context(ref, read_scn) || !SCN_VALID(horizon_scn)
+		|| scn_time_cmp(horizon_scn, read_scn) > 0)
+		return;
+	vis_snapshot_bound.lxid = MyProc->lxid;
+	vis_snapshot_bound.epoch = ref->cluster_epoch;
+	vis_snapshot_bound.read_scn = read_scn;
+	vis_snapshot_bound.horizon_scn = horizon_scn;
+	vis_snapshot_bound.ref = *ref;
+	vis_snapshot_bound.valid = true;
+}
+
 static bool
 cluster_vis_from_exact_tx_resolution(ClusterTxOutcome outcome,
 									 const ClusterTxResolution *resolution, ClusterVisResolve *out)
@@ -164,6 +227,7 @@ void
 cluster_vis_resolve_abort_reset(void)
 {
 	cluster_vis_resolve_depth = 0;
+	vis_snapshot_bound.valid = false;
 }
 
 
@@ -804,6 +868,12 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 				cluster_node_id, (uint32)ref->undo_segment_id, (uint32)ref->tt_slot_id);
 			ClusterUndoVerdictResult v;
 
+			if (freshref_pair && vis_snapshot_bound_probe(ref, read_scn, out)) {
+				cluster_vis_freshref_verdict_note_resolved();
+				return;
+			}
+			if (!freshref_pair)
+				vis_snapshot_bound.valid = false;
 			cluster_vis_evidence_note(CLUSTER_VIS_METRIC_ORIGIN_ASK);
 			v = freshref_pair ? cluster_undo_verdict_resolve_freshref_c1b_pair(
 									(int)ref->origin_node_id, (uint32)ref->undo_segment_id, raw_xid,
@@ -819,8 +889,8 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 											  ? CLUSTER_VIS_METRIC_ORIGIN_LIVE
 											  : CLUSTER_VIS_METRIC_ORIGIN_TERMINAL);
 				/* O2: an origin-proven exact terminal is immutable and may use
-				 * the existing backend-local, lxid-bound memo.  A bound or live
-				 * result remains request/snapshot relative and is never installed. */
+				 * the existing backend-local, lxid-bound EXACT memo.  A bound
+				 * remains snapshot-relative and never enters that exact memo. */
 				if ((v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT && SCN_VALID(v.commit_scn))
 					|| v.kind == CLUSTER_UNDO_VERDICT_ABORTED) {
 					ClusterTTStatusKey memo_key;
@@ -838,6 +908,8 @@ classify_ref_guts(TransactionId raw_xid, const ClusterUndoTTSlotRef *ref, XLogRe
 							: (uint8)CLUSTER_TT_STATUS_ABORTED,
 						v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_EXACT ? v.commit_scn : InvalidScn);
 				}
+				if (freshref_pair && v.kind == CLUSTER_UNDO_VERDICT_COMMITTED_BOUND)
+					vis_snapshot_bound_install(ref, read_scn, v.commit_scn);
 				cluster_vis_freshref_verdict_note_resolved();
 				return;
 			}
