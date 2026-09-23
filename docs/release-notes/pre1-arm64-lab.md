@@ -1,0 +1,107 @@
+# PRE1 four-VM ARM64 laboratory candidate
+
+Author: SqlRush <sqlrush@gmail.com>
+
+Candidate line: 2026-09-23. PostgreSQL base: 16.13. Distribution: source.
+This page describes the candidate and its publication requirements. It is not
+a release announcement, completed qualification or production certificate.
+Use the final GitHub Release for the immutable qualified commit and results.
+The previously released v0.131.0 and its limits remain unchanged.
+
+## Deployment scope
+
+The candidate targets four independent Ubuntu 24.04 ARM64 KVM/libvirt guests,
+one shared iSCSI DATA LUN with shared LVM/DLM/GFS2, and three separate raw
+voting LUNs. Each guest has its own kernel and database processes. The recorded
+laboratory has four 16 GiB guests under a 72 GiB Linux management VM on one Mac;
+it is not four physical failure domains and is not a tested minimum sizing.
+
+Only the named `pre1-gfs2-arm64-lab-v1` combination is eligible for this
+laboratory qualification. RHEL 9 x86_64, other shared filesystems, cloud disks,
+bare-block database storage and production HA need separate acceptance.
+The voting LUNs are raw media, not GFS2 files or the database DATA LUN.
+
+Native PGDATA, catalog, control and WAL remain separate per instance. Shared
+business relations do not mean four postmasters can share one PGDATA or write
+one WAL stream. The database is initialized from one verified common seed;
+runtime cross-node DDL and independently initialized databases are not qualified.
+
+## Included changes
+
+- Guarded deployment inventory, storage and voting-media verification, native
+  seed/clone/configuration, exact-owner start/stop and read-only node status.
+- Complete ordered data comparison and health checks on all four endpoints.
+- Coordinated normal shutdown and same-data restart with complete control,
+  process, protocol and voting closure checks; compatible homogeneous cold
+  patching retains original evidence and data rather than reinitializing them.
+- Remote row-lock waiting no longer fails solely because the internal wait
+  budget elapsed. Caller cancellation, deadlock and safety failures remain
+  effective; this is not a waiver of application-configured timeouts.
+- Reuse of proved terminal transaction observations within the bounded scan
+  path, plus terminal-reference cleanup fixes exercised by loaded shutdown.
+- Synchronous forwarded requests wait interruptibly when their local send
+  queue is temporarily full; identity and safety checks remain in force.
+
+No database persistent or wire-format change, additional transaction slots or
+new service-worker count is included. This is not a rolling-upgrade procedure.
+Use the [operator-assisted installation guide](../deployment/pre1-quickstart.md)
+and [row-lock wait/cancel guide](../deployment/pre1-row-lock-wait.md).
+
+## Qualification required before publication
+
+The release must bind the exact source, binary, configuration, guest and device
+identities to all of the following actually executed checks:
+
+1. Shared filesystem semantics and real storage fencing for each guest.
+2. Same-source initialization and four-node admission.
+3. Directed control/data connectivity, remote consistent read, relation
+   extension, caller cancellation and remote row-lock COMMIT/ROLLBACK waits
+   exceeding 75 seconds.
+4. Both independent negative transaction-terminal tests, with actual lease
+   expiration and the required fail-stop outcome on isolated data/media.
+5. Six single-block microbenchmark phases, retaining correctness, cleanup
+   and outstanding-work checks; throughput is recorded, not a pass threshold.
+6. Four valid formal samples: four nodes with 32 clients each, one million
+   keys, 5-second warmup and 35-second measurement. All attempts retain their
+   raw exit codes. Natural late completion is accepted only with its exact
+   proof and every required correctness check passed.
+7. Zero unexpected client/server errors across the complete attempt, no forced
+   cancellation, complete ordered million-row comparison on every node and
+   health/invariant/debt checks after each sample.
+8. All-member normal shutdown, unchanged-data restart, complete data continuity
+   before business, another business run and complete post-run verification.
+9. A second clean shutdown and independent final control/process readback.
+10. Every required Fast and MVP release CI job on the exact release commit,
+    plus the applicable local regression and deployment-tool checks.
+
+The frozen Linux candidate executable SHA-256 is
+`2c96461810dd18113474e87d87b52133767f9e0b1582f84e4e2d33e11128e201`.
+It is an assertion-enabled ARM64 build with cluster/TAP support, OpenSSL, ICU,
+LZ4 and Zstandard. Version documentation and source labels do not replace this
+binary/configuration binding or the original acceptance predicates.
+
+## Limits and operation
+
+This is an operator-assisted, fixed-schema laboratory deployment, not a
+turnkey installer. Keep it on an isolated trusted network with pinned SSH
+identities and narrowly authorized device access. Do not expose its lab-only
+superuser HBA policy to untrusted clients.
+
+All members must normally stop before a homogeneous binary replacement.
+Restart requires full clean-stop evidence, not just a `shut down` control file.
+Never clear voting ALIVE records, reset the database or guess process identities
+to bypass a rejected restart. Preserve unclean scenes instead of silently
+recovering or overwriting them. See the
+[cold-set procedures](../deployment/pre1-cold-snapshots.md).
+
+Normal shutdown/restart does not certify crash recovery, automatic failover,
+shared native catalog/control/WAL, online membership changes, runtime cross-node
+DDL, arbitrary migration, full SQL/2PC compatibility or production fencing.
+Storage-fence witnesses do not enable database external-fencing admission.
+Performance figures from this assertion-enabled nested laboratory must not be
+presented as a like-for-like comparison with the single-host MVP or Oracle.
+
+Earlier isolated transaction-authority and MultiXact proof refusals remain
+recorded. Their independent root causes are not claimed fixed merely because
+they do not recur in a later accepted sample. Publication reports must retain
+that limitation and all failed attempts rather than relabeling them as passes.

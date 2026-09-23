@@ -75,6 +75,7 @@ User-facing manual:
 | Topic | File |
 |---|---|
 | Installation | [docs/user-guide/install.md](docs/user-guide/install.md) |
+| Four-VM GFS2 lab candidate (separate qualification) | [Operator-assisted installation](docs/deployment/pre1-quickstart.md), [scope and release requirements](docs/release-notes/pre1-arm64-lab.md) |
 | Bootstrap a node | [docs/user-guide/bootstrap.md](docs/user-guide/bootstrap.md) |
 | Configuration (`cluster.*` GUCs + `pgrac.conf`) | [docs/user-guide/configuration.md](docs/user-guide/configuration.md) |
 | System views reference | [docs/reference/system-views.md](docs/reference/system-views.md) |
