@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -31,6 +32,43 @@ def require_same_cold(before, after, *, include_shared):
             or before['control']['state']!='shut down'
             or (include_shared and before['shared_sha256']!=after['shared_sha256'])):
         raise PreflightError('CLEAN_RESTART_STATE_CHANGED')
+
+
+def require_cold_patch(before, after, old_binary, new_binary):
+    """An explicit cold patch may change the executable, never the dataset."""
+    if before['binary_sha256']!=old_binary or after['binary_sha256']!=new_binary:
+        raise PreflightError('COLD_PATCH_BINARY_CHANGED')
+    require_same_cold(dict(before,binary_sha256=new_binary),after,include_shared=True)
+
+
+def rebound_source(base, declaration):
+    """Retain seed provenance; compatibility is an explicit operator attestation."""
+    try:
+        captures=keyed(base['captures'],'node_id',range(4))
+        if (base['kind']!='pre1-clean-restart-prepared' or base['status']!='PASS'
+                or base['state']!='CLEAN_RESTART_PREPARED'
+                or base['closure']['clean_stop_proven'] is not True
+                or base['closure']['state']!='CLEAN_STOPPED'
+                or declaration['kind']!='pre1-format-compatible-cold-patch'
+                or declaration['status']!='APPROVED'
+                or declaration['from_binary_sha256']!=base['binary_sha256']
+                or declaration['to_binary_sha256']==base['binary_sha256']
+                or base['source']['binary_sha256']!=base['binary_sha256']
+                or base['source']['shared_root']!=base['config']['shared_root']
+                or any(c['binary_sha256']!=base['binary_sha256'] for c in captures.values())
+                or any(not re.fullmatch(r'[a-f0-9]{64}',declaration[k]) for k in
+                       ('from_binary_sha256','to_binary_sha256'))
+                or any(not re.fullmatch(r'[a-f0-9]{40}',declaration[k]) for k in
+                       ('from_source_commit','to_source_commit'))
+                or any(declaration[k] is not True for k in ('persistent_format_unchanged',
+                       'wire_unchanged','config_unchanged','no_mixed_version'))):
+            raise ValueError
+    except (KeyError,TypeError,ValueError):
+        raise PreflightError('COLD_PATCH_COMPATIBILITY_UNPROVEN') from None
+    return dict(base['source'],kind='pre1-cold-rebound-source',
+                binary_sha256=declaration['to_binary_sha256'],
+                previous_source=base['source'],compatibility=declaration,
+                previous_prepared_sha256=document_sha(base),bootstrap_ready=False)
 
 
 def require_clear_votes(before, after):
@@ -153,6 +191,56 @@ def prepare(request):
                 closure=closure,bootstrap_ready=False,restart_allowed=False,deployment_qualified=False)
 
 
+def rebind(request):
+    """Recheck an all-member cold patch. Never install, repair or start a member."""
+    base=runtime.read_bound(request['base_prepared'])
+    declaration=runtime.read_bound(request['compatibility'])
+    source=rebound_source(base,declaration)
+    if runtime.read_bound(request['rebound_source'])!=source:
+        raise PreflightError('COLD_PATCH_SOURCE_CHANGED')
+    old=base['request']
+    config=runtime.read_bound(old['config'])
+    bootstrap_config.render(config)
+    before=runtime.read_bound(old['closed_before'])
+    after=runtime.read_bound(old['closed_after'])
+    nodes=sorted(config['nodes'],key=lambda n:n['node_id'])
+    closure=verify_closure(nodes,base['binary_sha256'],after['observations'],base['system_identifier'],
+        before['starts'],after['logs'],before['votes'],after['after_votes'],before['states'],
+        post_stop_not_before_ns=after['post_stop_not_before_ns'])
+    if (config!=base['config'] or runtime.read_bound(old['source'])!=base['source']
+            or after['status']!='PASS' or after['source_binary_sha256']!=base['binary_sha256']
+            or not closure['clean_stop_proven'] or closure!=base['closure']
+            or old['guest_config']['sha256']!=old['config']['sha256']):
+        raise PreflightError('COLD_PATCH_CLOSURE_CHANGED')
+    snapshots=keyed(base['captures'],'node_id',range(4))
+    tools=safe_remote_path(request['guest_tool_root'],'guest_tool_root')
+    program=('import sys,json; sys.path.insert(0,%r); import clean_restart; '
+             'print(json.dumps(clean_restart.capture(json.load(sys.stdin))))')%str(tools)
+    binary=declaration['to_binary_sha256']
+    def one(node):
+        value=dict(config=config,source=source,binary_sha256=binary,
+                   system_identifier=base['system_identifier'],node_id=node['node_id'],observer=old['observer'])
+        transport=remote.run_ssh(node,program,value)
+        if transport['rc'] or transport['timed_out'] or transport['truncated']:
+            raise PreflightError('COLD_PATCH_CAPTURE_FAILED')
+        fresh=json.loads(transport['stdout'])
+        if fresh['node_id']!=node['node_id'] or fresh['tool_sha256']!=tool_digest():
+            raise PreflightError('COLD_PATCH_GUEST_OR_TOOL_CHANGED')
+        previous=snapshots[node['node_id']]
+        require_cold_patch(previous,fresh,base['binary_sha256'],binary)
+        require_clear_votes(previous['votes'],fresh['votes'])
+        require_clear_votes(after['after_votes'],fresh['votes'])
+        return fresh
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        captures=list(pool.map(one,nodes))
+    if len({c['shared_sha256'] for c in captures})!=1:
+        raise PreflightError('COLD_PATCH_SHARED_VIEWS_DIFFER')
+    updated=dict(old,binary_sha256=binary,source=request['rebound_source'],
+                 guest_tool_root=request['guest_tool_root'])
+    return dict(base,request=updated,source=source,binary_sha256=binary,captures=captures,
+                cold_patch=request,qualification_inherited=False)
+
+
 def start_guest(reference,node_id,output):
     prepared=runtime.read_bound(reference)
     if (prepared['kind']!='pre1-clean-restart-prepared' or prepared['status']!='PASS'
@@ -213,7 +301,7 @@ def start_guest(reference,node_id,output):
 def main(argv=None):
     try:
         parser=SafeParser(description=__doc__)
-        parser.add_argument('action',choices=('prepare','start-guest'))
+        parser.add_argument('action',choices=('prepare','rebind','start-guest'))
         parser.add_argument('--request',type=Path,required=True)
         parser.add_argument('--sha256')
         parser.add_argument('--node-id',type=int,choices=range(4))
@@ -221,8 +309,9 @@ def main(argv=None):
         args=parser.parse_args(argv)
         if os.path.lexists(args.out):
             raise PreflightError('ARTIFACT_EXISTS')
-        if args.action=='prepare':
-            result=prepare(load_json(args.request))
+        if args.action in ('prepare','rebind'):
+            operation=prepare if args.action=='prepare' else rebind
+            result=operation(load_json(args.request))
             result['artifact_sha256']=publish_artifact(args.out,result)
         else:
             result=start_guest(dict(path=str(args.request),sha256=args.sha256),args.node_id,args.out)
