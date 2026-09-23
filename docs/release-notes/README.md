@@ -4,13 +4,15 @@ Author: SqlRush <sqlrush@gmail.com>
 
 ## Current release
 
-[v0.132.0-pre1.1](v0.132.0-pre1.1.md) is the four-VM ARM64/GFS2 laboratory
-milestone prerelease line. Publication requires its complete four-VM, normal
-restart and exact-commit CI results; it is not production HA or RHEL/x86
-certification. The stable single-host MVP line remains v0.131.0 below.
+[v0.132.0](v0.132.0.md) is the stable source release for the qualified four-VM
+ARM64/GFS2 laboratory scope. It promotes the accepted
+[v0.132.0-pre1.1](v0.132.0-pre1.1.md) milestone without changing product logic,
+formats, configuration or acceptance requirements. Stable does not mean
+production HA, RHEL/x86 certification or four independent physical hosts.
+Publication still requires complete release CI on the exact final commit.
 
 [v0.131.0 — undo-header locality and UPDATE diagnostics](v0.131.0.md) is the
-current source release line. Stable publication requires the exact-commit CI
+previous single-host MVP source release. Its publication binds exact-commit CI
 and four-round correctness qualification recorded with its GitHub Release.
 Stable means the documented MVP scope, not production HA, independent-host
 shared-storage certification or a performance guarantee.
@@ -45,6 +47,7 @@ Versions use `MAJOR.MINOR.PATCH`, optionally followed by a prerelease label:
 | `v0.130.1` | Correctness maintenance release within the same MVP scope |
 | `v0.131.0` | Undo-header locality improvement and optional UPDATE diagnostics |
 | `v0.132.0-pre1.1` | Four-VM ARM64/GFS2 laboratory milestone prerelease |
+| `v0.132.0` | Stable release within the qualified PRE1 four-VM laboratory scope |
 | `-mvp.N`, `-alpha.N`, `-beta.N` | Numbered evaluation prereleases |
 | `-rc.N` | Release candidates with their own published qualification scope |
 | No suffix | Stable release; only after its acceptance criteria pass |
@@ -63,8 +66,8 @@ the superseded release's evidence and limitations.
 ## Selecting a version
 
 ```sh
-git fetch origin tag v0.131.0
-git switch --detach v0.131.0
+git fetch origin tag v0.132.0
+git switch --detach v0.132.0
 git rev-parse HEAD
 cat PGRAC_VERSION
 ```
