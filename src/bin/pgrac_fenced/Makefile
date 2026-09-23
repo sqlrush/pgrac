@@ -17,7 +17,7 @@ FENCED_OBJS = pgrac_fenced.o pgrac_fenced_config.o pgrac_fenced_core.o \
 FENCED_OBJS += pgrac_fenced_dispatch.o pgrac_fenced_runtime.o \
 	pgrac_fenced_schedule.o pgrac_fenced_async.o pgrac_fenced_rejoin.o
 FENCED_OBJS += pgrac_fenced_rejoin_async.o pgrac_fenced_coordinator.o \
-	pgrac_fenced_rejoin_coordinator.o
+	pgrac_fenced_rejoin_coordinator.o pgrac_fenced_drain.o pgrac_fenced_pacemaker.o
 FENCEDCTL_OBJS = pgrac-fencedctl.o pgrac_fenced_ctl.o \
 	pgrac_fenced_core.o pgrac_fenced_journal.o \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol.o
@@ -26,8 +26,10 @@ PGRAC_FENCED_LIBS = $(top_builddir)/src/common/libpgcommon.a \
 
 all: pgrac-fenced pgrac-fencedctl
 
+pgrac_fenced_pacemaker.o: override CPPFLAGS += $(PACEMAKER_CFLAGS)
+
 pgrac-fenced: $(FENCED_OBJS) | submake-libpgport
-	$(CC) $(CFLAGS) $^ $(PGRAC_FENCED_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+	$(CC) $(CFLAGS) $^ $(PGRAC_FENCED_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(PACEMAKER_LIBS) $(LIBS) -o $@$(X)
 
 pgrac-fencedctl: $(FENCEDCTL_OBJS) | submake-libpgport
 	$(CC) $(CFLAGS) $^ $(PGRAC_FENCED_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)

@@ -128,7 +128,7 @@ read_root_config(PgracFencedConfigV1 *config,
 		used += (size_t) got;
 	}
 	if (fstat(fd, &after) != 0 || !same_config_identity(&before, &after) ||
-		pgrac_fenced_config_parse_v1(bytes, used, config) !=
+		pgrac_fenced_config_parse(bytes, used, config) !=
 			PGRAC_FENCED_CONFIG_OK ||
 		!pgrac_fenced_config_digest_v1(bytes, used, digest))
 		goto done;

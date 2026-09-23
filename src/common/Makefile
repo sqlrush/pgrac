@@ -70,6 +70,8 @@ OBJS_COMMON = \
 	md5_common.o \
 	percentrepl.o \
 	pgrac_external_fence_protocol.o \
+	pgrac_fence_map.o \
+	pgrac_protected_set.o \
 	pg_get_line.o \
 	pg_lzcompress.o \
 	pg_prng.o \

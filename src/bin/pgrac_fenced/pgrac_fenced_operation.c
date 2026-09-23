@@ -75,7 +75,11 @@ monotonic_now_ns(uint64 *out)
 static bool
 config_basic_valid(const PgracFencedConfigV1 *config)
 {
-	return config != NULL && config->format_version == 1 &&
+	return config != NULL &&
+		((config->format_version == 1 &&
+		  config->provider_id != PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1) ||
+		 (config->format_version == 2 && config->storage_backend_id == 3 &&
+		  config->provider_id == PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1)) &&
 		config->mapping_generation != 0 && config->system_identifier != 0 &&
 		(config->storage_backend_id == 2 || config->storage_backend_id == 3) &&
 		bytes_nonzero(config->storage_uuid, sizeof(config->storage_uuid)) &&
@@ -457,9 +461,8 @@ pgrac_fenced_operation_accept(
 		return PGRAC_FENCED_OPERATION_COMPLETE;
 	}
 	if (request->need.system_identifier != context->config->system_identifier ||
-		!pgrac_external_fence_protected_set_digest_v1(
-			context->config->storage_backend_id, context->config->storage_uuid,
-			protected_set_digest) ||
+		!pgrac_fenced_config_protected_set_digest(context->config,
+			request->need.victim_node_id, protected_set_digest) ||
 		memcmp(protected_set_digest, request->need.protected_set_digest,
 			sizeof(protected_set_digest)) != 0 ||
 		!context->config->nodes[request->need.victim_node_id].present)

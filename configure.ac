@@ -238,6 +238,11 @@ PGAC_ARG_BOOL(with, rdma, no,
               [build with RDMA interconnect support])
 AC_SUBST(with_rdma)
 
+# PGRAC: optional native fencing client; no implicit dependency or CLI fallback.
+PGAC_ARG_BOOL(with, pacemaker, no,
+              [build the native Pacemaker fencing client (Linux only)])
+AC_SUBST(with_pacemaker)
+
 #
 # PGRAC: --enable-injection-points (build test-only visibility injection)
 #
@@ -1451,6 +1456,36 @@ elif test "$with_ssl" != no ; then
 fi
 AC_SUBST(with_ssl)
 
+# PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+# Keep the privileged frontend dependency separate from postgres/libpq linkage.
+if test "$with_pacemaker" = yes ; then
+  if test "$PORTNAME" != linux -o "$enable_cluster" != yes -o "$with_ssl" != openssl ; then
+    AC_MSG_ERROR([--with-pacemaker requires Linux, --enable-cluster and --with-ssl=openssl])
+  fi
+  PKG_CHECK_MODULES(PACEMAKER, [pacemaker-fencing >= 2.1.6])
+  pgrac_fence_saved_CPPFLAGS="$CPPFLAGS"
+  pgrac_fence_saved_LIBS="$LIBS"
+  CPPFLAGS="$CPPFLAGS $PACEMAKER_CFLAGS"
+  LIBS="$PACEMAKER_LIBS $LIBS"
+  AC_MSG_CHECKING([for the native Pacemaker fencing API and Ed25519])
+  AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <crm/stonith-ng.h>
+#include <openssl/evp.h>]], [[
+    stonith_t *st = stonith_api_new();
+    int algorithm = EVP_PKEY_ED25519;
+    if (st != 0) {
+      int (*fence)(stonith_t *, int, const char *, const char *, int, int) = st->cmds->fence;
+      (void) fence;
+      stonith_api_delete(st);
+    }
+    return algorithm == 0;
+  ]])], [AC_MSG_RESULT([yes])],
+    [AC_MSG_ERROR([native Pacemaker API and OpenSSL Ed25519 support are required])])
+  CPPFLAGS="$pgrac_fence_saved_CPPFLAGS"
+  LIBS="$pgrac_fence_saved_LIBS"
+  AC_DEFINE([USE_PACEMAKER], 1,
+            [Define to 1 for the native Pacemaker fencing client. (--with-pacemaker)])
+fi
+
 if test "$with_pam" = yes ; then
   AC_CHECK_LIB(pam,    pam_start, [], [AC_MSG_ERROR([library 'pam' is required for PAM])])
 fi
@@ -1622,14 +1657,15 @@ if test "$with_zstd" = yes; then
 fi
 
 if test "$with_rdma" = yes; then
-  AC_CHECK_HEADER(infiniband/verbs.h, [],
+  AC_CHECK_HEADERS(infiniband/verbs.h, [],
                   [AC_MSG_ERROR([infiniband/verbs.h header file is required for RDMA])])
-  AC_CHECK_HEADER(rdma/rdma_cma.h, [],
+  AC_CHECK_HEADERS(rdma/rdma_cma.h, [],
                   [AC_MSG_ERROR([rdma/rdma_cma.h header file is required for RDMA])])
-  AC_CHECK_HEADER(infiniband/mlx5dv.h,
+  AC_CHECK_HEADERS(infiniband/mlx5dv.h,
                   [AC_CHECK_LIB(mlx5, mlx5dv_query_device,
                                 [AC_DEFINE([HAVE_MLX5DV], 1,
-                                           [Define to 1 when mlx5 direct verbs are available for pgrac RDMA tier3.])],
+                                           [Define to 1 when mlx5 direct verbs are available for pgrac RDMA tier3.])
+                                 LIBS="-lmlx5 $LIBS"],
                                 [])],
                   [])
 fi

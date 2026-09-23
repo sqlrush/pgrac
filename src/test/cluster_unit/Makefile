@@ -46,6 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
+        test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker \
         test_cluster_update_trace test_cluster_cr_dependency \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
@@ -381,6 +382,8 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_epq_wait,$(SIMPLE_TESTS))
@@ -1349,9 +1352,29 @@ test_pgrac_external_fence_protocol: \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
 
+test_pgrac_protected_set: test_pgrac_protected_set.c unit_test.h \
+		data/pgrac_fence_map_v2_fixture.h \
+		$(top_builddir)/src/common/libpgcommon.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
+
 PGRAC_FENCED_CONFIG_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_config.o
+test_pgrac_fenced_drain: test_pgrac_fenced_drain.c unit_test.h \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o -o $@
+
+# Test-only stonith_api_new/delete replacements; never link them into the daemon.
+test_pgrac_fenced_pacemaker: test_pgrac_fenced_pacemaker.c unit_test.h \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_pacemaker.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(PACEMAKER_CFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_pacemaker.o -o $@
+
 test_pgrac_fenced_config: test_pgrac_fenced_config.c unit_test.h \
+		data/pgrac_fence_map_v2_fixture.h \
 		$(PGRAC_FENCED_CONFIG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
@@ -1401,6 +1424,7 @@ test_pgrac_fenced_provider: test_pgrac_fenced_provider.c unit_test.h \
 		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
 
 PGRAC_FENCED_OPERATION_O = \
+	$(PGRAC_FENCED_CONFIG_O) \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_operation.o \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
 	$(PGRAC_FENCED_IPMI_O) \
@@ -1411,6 +1435,7 @@ PGRAC_FENCED_SESSION_O = \
 PGRAC_FENCED_DISPATCH_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_dispatch.o
 test_pgrac_fenced_operation: test_pgrac_fenced_operation.c unit_test.h \
+		data/pgrac_fence_map_v2_fixture.h \
 		$(PGRAC_FENCED_OPERATION_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \

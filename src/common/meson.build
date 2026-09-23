@@ -21,6 +21,8 @@ common_sources = files(
   'md5_common.c',
   'percentrepl.c',
   'pgrac_external_fence_protocol.c',
+  'pgrac_fence_map.c',
+  'pgrac_protected_set.c',
   'pg_get_line.c',
   'pg_lzcompress.c',
   'pg_prng.c',

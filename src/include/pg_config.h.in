@@ -756,6 +756,9 @@
 /* Define to 1 to build with OpenSSL support. (--with-ssl=openssl) */
 #undef USE_OPENSSL
 
+/* PGRAC: Define to 1 for the native Pacemaker fencing client. (--with-pacemaker) */
+#undef USE_PACEMAKER
+
 /* Define to 1 to build with PAM support. (--with-pam) */
 #undef USE_PAM
 

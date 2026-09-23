@@ -12,7 +12,10 @@
 #include <unistd.h>
 
 #include "common/cryptohash.h"
+#include "common/pgrac_external_fence_protocol.h"
+#include "common/pgrac_fence_map.h"
 #include "pgrac_fenced_config.h"
+#include "pgrac_fenced_provider.h"
 
 #define PGRAC_FENCED_CONFIG_MAX_LINE (8192 + 64)
 
@@ -272,9 +275,19 @@ done:
 	return config_fd;
 }
 
-PgracFencedConfigResult
-pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
-						 PgracFencedConfigV1 *out)
+static bool
+parse_digest(const ConfigLine *line, uint8 digest[32])
+{
+	size_t decoded = 0;
+
+	return line->value_len == 64
+		&& parse_hex(line->value, line->value_len, digest, 32, &decoded, true)
+		&& decoded == 32;
+}
+
+static PgracFencedConfigResult
+parse_global_fields(const uint8 *bytes, size_t len, size_t *offset,
+	uint32 version, PgracFencedConfigV1 *out)
 {
 	static const char *const global_keys[] = {
 		"format_version", "mapping_generation", "system_identifier",
@@ -282,20 +295,12 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 		"allowed_db_gid", "provider_id", "provider_abi"
 	};
 	uint64 values[9];
-	size_t offset = 0;
 	ConfigLine line;
-	uint32 last_node = 0;
-	bool have_last_node = false;
 	int i;
 
-	if (bytes == NULL || out == NULL || len == 0)
-		return PGRAC_FENCED_CONFIG_BAD_ARGUMENT;
-	memset(out, 0, sizeof(*out));
-	if (len > PGRAC_FENCED_CONFIG_MAX_BYTES)
-		return PGRAC_FENCED_CONFIG_TOO_LARGE;
 	for (i = 0; i < 9; i++)
 	{
-		if (!next_line(bytes, len, &offset, &line) ||
+		if (!next_line(bytes, len, offset, &line) ||
 			!key_equal(&line, global_keys[i]))
 			return PGRAC_FENCED_CONFIG_NONCANONICAL;
 		if (i == 4)
@@ -308,11 +313,14 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 						 &values[i]))
 			return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 	}
-	if (values[0] != 1 || values[1] == 0 || values[2] == 0 ||
+	if (values[0] != version || values[1] == 0 || values[2] == 0 ||
 		(values[3] != 2 && values[3] != 3) ||
 		values[5] > UINT32_MAX || values[6] > UINT32_MAX ||
 		values[7] > UINT16_MAX || values[7] == UINT16_MAX ||
 		values[8] != 1)
+		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
+	if ((version == 2) != (values[7] == PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1)
+		|| (version == 2 && values[3] != 3))
 		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 	out->format_version = (uint32) values[0];
 	out->mapping_generation = values[1];
@@ -322,24 +330,45 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 	out->allowed_db_gid = values[6];
 	out->provider_id = (uint16) values[7];
 	out->provider_abi = (uint16) values[8];
+	if (version == 2
+		&& (!next_line(bytes, len, offset, &line) || !key_equal(&line, "map_public_key")
+			|| !parse_digest(&line, out->map_public_key)))
+		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
+	return PGRAC_FENCED_CONFIG_OK;
+}
+
+static PgracFencedConfigResult
+parse_node_fields(const uint8 *bytes, size_t len, size_t offset, PgracFencedConfigV1 *out)
+{
+	uint32 last_node = 0;
+	bool have_last_node = false;
 
 	while (offset < len)
 	{
+		ConfigLine line;
 		ConfigLine adapter;
 		uint8 target_uuid[PGRAC_FENCED_UUID_BYTES];
 		uint32 node_id;
 		uint32 adapter_node_id;
 		uint32 prior_node;
 		size_t adapter_len = 0;
+		uint8 digest[32];
 
 		if (!next_line(bytes, len, &offset, &line) ||
 			!parse_node_key(&line, ".target_uuid", &node_id) ||
-			!next_line(bytes, len, &offset, &adapter) ||
-			!parse_node_key(&adapter, ".adapter_data", &adapter_node_id) ||
-			adapter_node_id != node_id ||
 			(have_last_node && node_id <= last_node) ||
 			out->nodes[node_id].present ||
-			!parse_uuid(&line, target_uuid) ||
+			!parse_uuid(&line, target_uuid))
+			return PGRAC_FENCED_CONFIG_NONCANONICAL;
+		if (out->format_version == 2
+			&& (!next_line(bytes, len, &offset, &line)
+				|| !parse_node_key(&line, ".protected_set_digest", &adapter_node_id)
+				|| adapter_node_id != node_id
+				|| !parse_digest(&line, out->nodes[node_id].protected_set_digest)))
+			return PGRAC_FENCED_CONFIG_NONCANONICAL;
+		if (!next_line(bytes, len, &offset, &adapter) ||
+			!parse_node_key(&adapter, ".adapter_data", &adapter_node_id) ||
+			adapter_node_id != node_id ||
 			!parse_hex(adapter.value, adapter.value_len,
 					   out->nodes[node_id].adapter_data,
 					   PGRAC_FENCED_ADAPTER_DATA_MAX_BYTES,
@@ -357,6 +386,9 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 			   sizeof(target_uuid));
 		out->nodes[node_id].adapter_data_len = (uint16) adapter_len;
 		out->nodes[node_id].present = true;
+		if (out->format_version == 2
+			&& !pgrac_fenced_config_protected_set_digest(out, node_id, digest))
+			return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 		out->node_count++;
 		last_node = node_id;
 		have_last_node = true;
@@ -364,4 +396,81 @@ pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len,
 	if (out->node_count == 0)
 		return PGRAC_FENCED_CONFIG_VALUE_INVALID;
 	return PGRAC_FENCED_CONFIG_OK;
+}
+
+static PgracFencedConfigResult
+parse_config(const uint8 *bytes, size_t len, uint32 version, PgracFencedConfigV1 *out)
+{
+	PgracFencedConfigResult result;
+	size_t offset = 0;
+
+	if (out == NULL)
+		return PGRAC_FENCED_CONFIG_BAD_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (bytes == NULL || len == 0)
+		return PGRAC_FENCED_CONFIG_BAD_ARGUMENT;
+	if (len > PGRAC_FENCED_CONFIG_MAX_BYTES)
+		return PGRAC_FENCED_CONFIG_TOO_LARGE;
+	result = parse_global_fields(bytes, len, &offset, version, out);
+	if (result == PGRAC_FENCED_CONFIG_OK)
+		result = parse_node_fields(bytes, len, offset, out);
+	if (result != PGRAC_FENCED_CONFIG_OK)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
+PgracFencedConfigResult
+pgrac_fenced_config_parse_v1(const uint8 *bytes, size_t len, PgracFencedConfigV1 *out)
+{
+	return parse_config(bytes, len, 1, out);
+}
+
+PgracFencedConfigResult
+pgrac_fenced_config_parse(const uint8 *bytes, size_t len, PgracFencedConfigV1 *out)
+{
+	static const char v2_prefix[] = "format_version=2\n";
+	uint32 version = 1;
+
+	if (bytes != NULL && len >= sizeof(v2_prefix) - 1
+		&& memcmp(bytes, v2_prefix, sizeof(v2_prefix) - 1) == 0)
+		version = 2;
+	return parse_config(bytes, len, version, out);
+}
+
+bool
+pgrac_fenced_config_protected_set_digest(const PgracFencedConfigV1 *config,
+	int32 node_id, uint8 digest[32])
+{
+	PgracFenceMapExpectedV2 expected;
+	PgracProtectedSetDecodedV2 decoded;
+	const PgracFencedNodeConfigV1 *node;
+
+	if (digest == NULL)
+		return false;
+	memset(digest, 0, PGRAC_FENCED_CONFIG_DIGEST_BYTES);
+	if (config == NULL || node_id < 0 || node_id >= PGRAC_FENCED_MAX_NODES
+		|| !config->nodes[node_id].present)
+		return false;
+	if (config->format_version == 1
+		&& config->provider_id != PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1)
+		return pgrac_external_fence_protected_set_digest_v1(config->storage_backend_id,
+			config->storage_uuid, digest);
+	if (config->format_version != 2 || config->storage_backend_id != 3
+		|| config->provider_id != PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1)
+		return false;
+	node = &config->nodes[node_id];
+	if (node->adapter_data_len > sizeof(node->adapter_data))
+		return false;
+	memset(&expected, 0, sizeof(expected));
+	expected.system_identifier = config->system_identifier;
+	expected.victim_node_id = node_id;
+	expected.mapping_generation = config->mapping_generation;
+	memcpy(expected.protected_set_digest, node->protected_set_digest, 32);
+	if (pgrac_fence_map_v2_verify(node->adapter_data, node->adapter_data_len,
+		config->map_public_key, &expected, &decoded) != PGRAC_FENCE_MAP_OK
+		|| memcmp(decoded.set.guest_uuid, node->target_uuid, 16) != 0
+		|| memcmp(decoded.set.storage_uuid, config->storage_uuid, 16) != 0)
+		return false;
+	memcpy(digest, expected.protected_set_digest, 32);
+	return true;
 }

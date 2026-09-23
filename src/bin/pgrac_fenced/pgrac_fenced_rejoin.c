@@ -270,9 +270,8 @@ build_rejoin_binding(const PgracFencedOperationContextV1 *context,
 		operation->admin_request.candidate_incarnation;
 	binding->target_mapping_generation =
 		context->config->mapping_generation;
-	if (!pgrac_external_fence_protected_set_digest_v1(
-			context->config->storage_backend_id,
-			context->config->storage_uuid, binding->protected_set_digest))
+	if (!pgrac_fenced_config_protected_set_digest(context->config,
+			operation->admin_request.old_node_id, binding->protected_set_digest))
 		return false;
 	binding->predicate_id = 2;
 	binding->predicate_version = 1;

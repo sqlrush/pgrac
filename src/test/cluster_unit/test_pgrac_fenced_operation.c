@@ -26,6 +26,8 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "data/pgrac_fence_map_v2_fixture.h"
+
 typedef enum TestProviderMode {
 	TEST_PROVIDER_EXACT = 0,
 	TEST_PROVIDER_ACTION_UNKNOWN = 1,
@@ -878,10 +880,59 @@ UT_TEST(test_mapping_reload_is_durable_before_activation)
 	(void)unlink(path);
 }
 
+UT_TEST(test_v2_acquire_never_falls_back_to_storage_only_identity)
+{
+	PgracFencedOperationContextV1 context;
+	PgracFencedJournalScanState journal_state;
+	PgracFencedPreparedAcquireV1 prepared;
+	PgracExternalFenceProtocolRequestV1 request;
+	PgracExternalFenceProtocolResponseV1 response;
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedConfigV1 config;
+	char path[64];
+	int fd;
+	PgracFencedConfigResult parsed;
+
+	parsed = pgrac_fenced_config_parse((const uint8 *)fenced_config_v2,
+									   sizeof(fenced_config_v2) - 1, &config);
+#ifndef USE_OPENSSL
+	UT_ASSERT_NE(parsed, PGRAC_FENCED_CONFIG_OK);
+	return;
+#else
+	UT_ASSERT_EQ(parsed, PGRAC_FENCED_CONFIG_OK);
+	if (parsed != PGRAC_FENCED_CONFIG_OK)
+		return;
+#endif
+	make_ops(&ops);
+	/* An injected unit provider verifies the real accept boundary, not deployment. */
+	ops.provider_id = PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1;
+	fd = open_context(&context, &journal_state, &config, &ops, path);
+	if (fd < 0)
+		return;
+	if (!context.available)
+		goto done;
+	make_request(&config, &request);
+	request.need.victim_node_id = 2;
+	memcpy(request.need.protected_set_digest, config.nodes[2].protected_set_digest, 32);
+	UT_ASSERT_EQ(pgrac_fenced_operation_accept(&context, &request, deadline_after_ms(1000),
+											   &prepared, &response),
+				 PGRAC_FENCED_OPERATION_READY);
+	UT_ASSERT(pgrac_external_fence_protected_set_digest_v1(
+		config.storage_backend_id, config.storage_uuid, request.need.protected_set_digest));
+	UT_ASSERT_EQ(pgrac_fenced_operation_accept(&context, &request, deadline_after_ms(1000),
+											   &prepared, &response),
+				 PGRAC_FENCED_OPERATION_COMPLETE);
+	UT_ASSERT_EQ(response.deny_reason, 4);
+
+done:
+	(void)close(fd);
+	(void)unlink(path);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_scalar_acquire_fsyncs_exact_positive_sequence);
 	UT_RUN(test_action_failure_still_accepts_independent_positive_readback);
 	UT_RUN(test_scalar_readback_retries_transient_results_before_proof);
@@ -898,6 +949,7 @@ main(void)
 	UT_RUN(test_restart_uncertainty_forces_readback_before_new_off_action);
 	UT_RUN(test_startup_reconcile_fsyncs_diagnostic_without_provider_action);
 	UT_RUN(test_mapping_reload_is_durable_before_activation);
+	UT_RUN(test_v2_acquire_never_falls_back_to_storage_only_identity);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
