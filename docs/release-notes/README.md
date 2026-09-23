@@ -4,6 +4,11 @@ Author: SqlRush <sqlrush@gmail.com>
 
 ## Current release
 
+[v0.132.0-pre1.1](v0.132.0-pre1.1.md) is the four-VM ARM64/GFS2 laboratory
+milestone prerelease line. Publication requires its complete four-VM, normal
+restart and exact-commit CI results; it is not production HA or RHEL/x86
+certification. The stable single-host MVP line remains v0.131.0 below.
+
 [v0.131.0 — undo-header locality and UPDATE diagnostics](v0.131.0.md) is the
 current source release line. Stable publication requires the exact-commit CI
 and four-round correctness qualification recorded with its GitHub Release.
@@ -39,6 +44,7 @@ Versions use `MAJOR.MINOR.PATCH`, optionally followed by a prerelease label:
 | `v0.130.0` | First stable release within the documented MVP scope |
 | `v0.130.1` | Correctness maintenance release within the same MVP scope |
 | `v0.131.0` | Undo-header locality improvement and optional UPDATE diagnostics |
+| `v0.132.0-pre1.1` | Four-VM ARM64/GFS2 laboratory milestone prerelease |
 | `-mvp.N`, `-alpha.N`, `-beta.N` | Numbered evaluation prereleases |
 | `-rc.N` | Release candidates with their own published qualification scope |
 | No suffix | Stable release; only after its acceptance criteria pass |
