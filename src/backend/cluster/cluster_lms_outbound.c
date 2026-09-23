@@ -209,7 +209,7 @@ cluster_lms_outbound_request_lwlocks(void)
  *	retry machinery).  Publish-before-signal: the slot is visible
  *	before the LMS wakeup fires.
  */
-static bool
+static ClusterLmsEnqueueResult
 lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id,
 							  const void *payload, uint16 payload_len, uint32 required_capability,
 							  uint32 connection_generation)
@@ -219,11 +219,11 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	ClusterLmsOutboundSlot *slot;
 
 	if (worker_id < 0 || worker_id >= CLUSTER_LMS_MAX_WORKERS)
-		return false;
+		return CLUSTER_LMS_ENQUEUE_INVALID;
 	if (cluster_lms_outbound_rings == NULL || OB_LOCK(worker_id) == NULL)
-		return false;
+		return CLUSTER_LMS_ENQUEUE_UNAVAILABLE;
 	if (payload_len > PGRAC_LMS_OUTBOUND_PAYLOAD_MAX)
-		return false;
+		return CLUSTER_LMS_ENQUEUE_INVALID;
 
 	ring = OB_RING(worker_id);
 	lock = OB_LOCK(worker_id);
@@ -231,7 +231,7 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	LWLockAcquire(lock, LW_EXCLUSIVE);
 	if (ring->count >= PGRAC_LMS_OUTBOUND_CAPACITY) {
 		LWLockRelease(lock);
-		return false;
+		return CLUSTER_LMS_ENQUEUE_FULL;
 	}
 	slot = &ring->ring[ring->head];
 	slot->dest_node_id = dest_node_id;
@@ -247,15 +247,23 @@ lms_outbound_enqueue_internal(int worker_id, uint8 msg_type, uint32 dest_node_id
 	LWLockRelease(lock);
 
 	cluster_lms_wakeup(worker_id);
-	return true;
+	return CLUSTER_LMS_ENQUEUE_ADMITTED;
+}
+
+ClusterLmsEnqueueResult
+cluster_lms_outbound_try_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
+								 const void *payload, uint16 payload_len)
+{
+	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len, 0,
+										 0);
 }
 
 bool
 cluster_lms_outbound_enqueue(int worker_id, uint8 msg_type, uint32 dest_node_id,
 							 const void *payload, uint16 payload_len)
 {
-	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len, 0,
-										 0);
+	return cluster_lms_outbound_try_enqueue(worker_id, msg_type, dest_node_id, payload, payload_len)
+		   == CLUSTER_LMS_ENQUEUE_ADMITTED;
 }
 
 /* PGRAC adaptation for a remote non-requester S holder.  The existing DATA
@@ -432,7 +440,8 @@ cluster_lms_outbound_enqueue_cap_bound(int worker_id, uint8 msg_type, uint32 des
 	if (required_capability == 0 || dest_node_id >= CLUSTER_MAX_NODES)
 		return false;
 	return lms_outbound_enqueue_internal(worker_id, msg_type, dest_node_id, payload, payload_len,
-										 required_capability, connection_generation);
+										 required_capability, connection_generation)
+		   == CLUSTER_LMS_ENQUEUE_ADMITTED;
 }
 
 static uint64

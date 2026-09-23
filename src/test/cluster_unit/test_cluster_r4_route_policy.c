@@ -55,6 +55,7 @@
 #include "cluster/storage/cluster_undo_block0_current.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
+#include "storage/ipc.h"
 #include "storage/buf_internals.h"
 
 #undef printf
@@ -114,18 +115,53 @@ sigjmp_buf *PG_exception_stack = NULL;
 MemoryContext CurrentMemoryContext = (MemoryContext)0x1;
 ErrorContextCallback *error_context_stack = NULL;
 volatile sig_atomic_t InterruptPending = false;
+volatile sig_atomic_t QueryCancelPending = false;
+volatile sig_atomic_t ProcDiePending = false;
+volatile uint32 InterruptHoldoffCount = 0;
+volatile uint32 QueryCancelHoldoffCount = 0;
+volatile uint32 CritSectionCount = 0;
 static Latch route_test_latch;
 Latch *MyLatch = &route_test_latch;
 static int retry_latch_wait_calls;
 static bool retry_latch_cancel;
+static bool sync_forward_terminate;
 static bool retry_latch_epoch_drift;
 static bool reply_wait_epoch_drift;
 static bool reply_wait_admission_drift;
+static bool sync_forward_fixture;
+static int sync_forward_full_left;
+static int sync_forward_calls;
+static int sync_forward_admitted;
+static int sync_forward_kind;
+static bool sync_forward_invalid;
+static bool sync_forward_authority_current = true;
+static bool sync_forward_authority_drift;
+static GcsBlockForwardPayload sync_forward_first;
 static int process_interrupt_calls;
 static uint64 route_test_epoch = UINT64_C(9);
 static bool route_ereport_armed;
 static bool route_ereport_caught;
 static int route_ereport_sqlstate;
+static int route_ereport_level;
+static sigjmp_buf *route_fatal_boundary;
+static pg_on_exit_callback route_exit_cleanup;
+static Datum route_exit_cleanup_arg;
+
+void
+before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	UT_ASSERT(route_exit_cleanup == NULL);
+	route_exit_cleanup = callback;
+	route_exit_cleanup_arg = arg;
+}
+
+void
+cancel_before_shmem_exit(pg_on_exit_callback callback, Datum arg)
+{
+	UT_ASSERT(route_exit_cleanup == callback);
+	UT_ASSERT_EQ(route_exit_cleanup_arg, arg);
+	route_exit_cleanup = NULL;
+}
 int MaxBackends = 32;
 bool cluster_enabled = true;
 int cluster_node_id = 1;
@@ -136,6 +172,7 @@ int cluster_lms_workers = 4;
 ClusterConf *ClusterConfShmem = NULL;
 bool cluster_smart_fusion = false;
 BackendId MyBackendId = 1;
+BackendType MyBackendType = B_BACKEND;
 int cluster_gcs_reply_timeout_ms = 5000;
 int cluster_gcs_block_retransmit_max_retries = 4;
 int cluster_gcs_block_retransmit_initial_backoff_ms = 10;
@@ -151,6 +188,7 @@ int cluster_gcs_block_lost_write_action = 0;
 int cluster_gcs_block_starvation_backoff_ms = 1;
 bool cluster_ges_bast = false;
 bool cluster_gcs_block_local_cache = true;
+bool cluster_read_scache = false;
 static BufferDesc capacity_buffer;
 static bool capacity_content_held;
 static bool capacity_gate_open = true;
@@ -273,6 +311,8 @@ cluster_pcm_lock_pi_watermark_prov_query(BufferTag tag pg_attribute_unused(),
 SCN
 cluster_pcm_lock_pi_watermark_scn_query(BufferTag tag pg_attribute_unused())
 {
+	if (sync_forward_fixture && sync_forward_kind == 2)
+		return (SCN)77;
 	abort();
 }
 int32
@@ -652,10 +692,18 @@ WaitLatch(Latch *latch, int wake_events, long timeout, uint32 wait_event)
 	}
 	UT_ASSERT(wait_event != 0);
 	retry_latch_wait_calls++;
-	if (retry_latch_cancel)
+	if (retry_latch_cancel) {
 		InterruptPending = true;
+		QueryCancelPending = true;
+	}
+	if (sync_forward_terminate) {
+		InterruptPending = true;
+		ProcDiePending = true;
+	}
 	if (retry_latch_epoch_drift)
 		route_test_epoch++;
+	if (sync_forward_authority_drift)
+		sync_forward_authority_current = false;
 	return WL_TIMEOUT;
 }
 
@@ -663,7 +711,11 @@ void
 ProcessInterrupts(void)
 {
 	process_interrupt_calls++;
+	/* Match the production guard: a content LWLock defers interrupts. */
+	if (InterruptHoldoffCount != 0 || CritSectionCount != 0)
+		return;
 	InterruptPending = false;
+	QueryCancelPending = false;
 	UT_ASSERT_NOT_NULL(PG_exception_stack);
 	siglongjmp(*PG_exception_stack, 1);
 }
@@ -1314,6 +1366,64 @@ cluster_grd_outbound_enqueue_backend_msg(uint8 msg_type, uint32 dest_node_id, co
 									  .block_fill = 0x6d };
 	int call_index = requester_send.calls;
 
+	/* Transport boundary only: the consumer, slot and reply decoder are real.
+	 * A refused frame owns no queue entry and cannot deliver a reply. */
+	if (sync_forward_fixture) {
+		struct {
+			GcsBlockReplyHeader header;
+			char page[GCS_BLOCK_DATA_SIZE];
+			ClusterGcsUndoAuthTrailer trailer;
+		} tt_reply;
+		const GcsBlockForwardPayload *forward = payload;
+		uint32 reply_size = sizeof(tt_reply);
+
+		UT_ASSERT_EQ(msg_type, PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
+		UT_ASSERT_EQ(payload_len, sizeof(*forward));
+		UT_ASSERT_EQ(reply_lock_acquire_calls, reply_lock_release_calls);
+		if (sync_forward_calls++ == 0)
+			sync_forward_first = *forward;
+		else
+			UT_ASSERT_EQ(memcmp(&sync_forward_first, forward, sizeof(*forward)), 0);
+		if (sync_forward_full_left-- > 0)
+			return false;
+		sync_forward_admitted++;
+		memset(&tt_reply, 0, sizeof(tt_reply));
+		tt_reply.header.request_id = forward->request_id;
+		tt_reply.header.epoch = forward->epoch;
+		tt_reply.header.page_lsn = UINT64_C(0xabcdef);
+		tt_reply.header.sender_node = (int32)dest_node_id;
+		tt_reply.header.requester_backend_id = forward->requester_backend_id;
+		tt_reply.header.transition_id = forward->transition_id;
+		tt_reply.header.status = GCS_BLOCK_REPLY_UNDO_TT_FETCH_RESULT;
+		GcsBlockReplyHeaderSetForwardingMasterNode(&tt_reply.header, cluster_node_id);
+		memset(tt_reply.page, 0x6d, sizeof(tt_reply.page));
+		if (sync_forward_kind == 1) {
+			ClusterGcsUndoVerdictPage verdict = { 0 };
+
+			tt_reply.header.status = GCS_BLOCK_REPLY_UNDO_VERDICT_RESULT;
+			memset(tt_reply.page, 0, sizeof(tt_reply.page));
+			verdict.magic = CLUSTER_GCS_UNDO_VERDICT_MAGIC;
+			verdict.version = CLUSTER_GCS_UNDO_VERDICT_VERSION;
+			verdict.xid_echo = 798;
+			verdict.verdict = CLUSTER_GCS_UNDO_VERDICT_COMMITTED_EXACT;
+			verdict.commit_scn = 101;
+			verdict.wrap = 19;
+			memcpy(tt_reply.page, &verdict, sizeof(verdict));
+		} else if (sync_forward_kind == 2) {
+			tt_reply.header.status = GCS_BLOCK_REPLY_DENIED_PENDING_X;
+			tt_reply.header.page_lsn = 0;
+			memset(tt_reply.page, 0, sizeof(tt_reply.page));
+			reply_size = GCS_BLOCK_REPLY_PAYLOAD_TOTAL_SIZE;
+		}
+		tt_reply.header.checksum = cluster_gcs_block_compute_checksum(tt_reply.page);
+		ClusterGcsUndoAuthTrailerSetTtGeneration(&tt_reply.trailer, UINT64_C(17));
+		ClusterGcsUndoAuthTrailerSetAuthorityScn(&tt_reply.trailer, UINT64_C(103));
+		env = route_test_envelope(PGRAC_IC_MSG_GCS_BLOCK_REPLY, dest_node_id,
+								  (uint32)cluster_node_id, reply_size);
+		cluster_gcs_handle_block_reply_envelope(&env, &tt_reply);
+		return true;
+	}
+
 	if (msg_type == PGRAC_IC_MSG_GCS_BLOCK_DONE) {
 		int i = requester_send.done_calls++;
 		uint8 domain;
@@ -1517,12 +1627,14 @@ FlushErrorState(void)
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	route_ereport_level = elevel;
 	return route_ereport_armed && elevel >= ERROR;
 }
 
 bool
 errstart_cold(int elevel, const char *domain pg_attribute_unused())
 {
+	route_ereport_level = elevel;
 	return route_ereport_armed && elevel >= ERROR;
 }
 
@@ -1558,6 +1670,16 @@ errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_un
 {
 	if (route_ereport_armed) {
 		route_ereport_caught = true;
+		if (route_ereport_level == FATAL && route_fatal_boundary != NULL) {
+			/* Native FATAL runs exit callbacks, never consumer PG_CATCH. */
+			if (route_exit_cleanup != NULL) {
+				pg_on_exit_callback callback = route_exit_cleanup;
+				Datum arg = route_exit_cleanup_arg;
+				route_exit_cleanup = NULL;
+				callback(1, arg);
+			}
+			siglongjmp(*route_fatal_boundary, 1);
+		}
 		UT_ASSERT_NOT_NULL(PG_exception_stack);
 		if (PG_exception_stack != NULL)
 			siglongjmp(*PG_exception_stack, 1);
@@ -1607,7 +1729,49 @@ cluster_ic_get_msg_type_info(uint8 msg_type)
 													.handler = NULL,
 													.plane = CLUSTER_IC_PLANE_DATA };
 
-	return msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY ? &data_info : NULL;
+	return msg_type == PGRAC_IC_MSG_GCS_BLOCK_REPLY || msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD
+			   ? &data_info
+			   : NULL;
+}
+
+ClusterLmsEnqueueResult
+cluster_lms_outbound_try_enqueue(int worker_id, uint8 msg_type, uint32 destination,
+								 const void *payload, uint16 length)
+{
+	UT_ASSERT(worker_id >= 0 && worker_id < cluster_lms_workers);
+	if (sync_forward_invalid)
+		return CLUSTER_LMS_ENQUEUE_INVALID;
+	return cluster_grd_outbound_enqueue_backend_msg(msg_type, destination, payload, length)
+			   ? CLUSTER_LMS_ENQUEUE_ADMITTED
+			   : CLUSTER_LMS_ENQUEUE_FULL;
+}
+
+bool
+cluster_pcm_lock_authority_matches(BufferTag tag pg_attribute_unused(),
+								   const PcmAuthoritySnapshot *expected pg_attribute_unused())
+{
+	return sync_forward_authority_current;
+}
+
+bool
+cluster_pcm_lock_apply_gcs_transition(BufferTag tag pg_attribute_unused(),
+									  PcmLockTransition transition pg_attribute_unused(),
+									  int32 node pg_attribute_unused())
+{
+	abort(); /* No tested refusal is a grant or an install. */
+}
+
+bool
+cluster_pcm_lock_resource_x_s_barrier_active(const BufferTag *tag pg_attribute_unused())
+{
+	abort(); /* The read-image fixture explicitly requests a one-shot image. */
+}
+
+bool
+cluster_pcm_lock_resource_x_requester_s_barrier_active_exact(
+	const BufferTag *tag pg_attribute_unused())
+{
+	abort();
 }
 
 int
@@ -1701,7 +1865,8 @@ cluster_gcs_block_payload_shard(uint8 msg_type, const void *payload, uint16 payl
 	if (payload == NULL || n_workers <= 0)
 		return -1;
 	if (msg_type == PGRAC_IC_MSG_GCS_BLOCK_FORWARD
-		&& payload_len == sizeof(ClusterR4CrForwardPayload))
+		&& (payload_len == sizeof(ClusterR4CrForwardPayload)
+			|| payload_len == sizeof(GcsBlockForwardPayload)))
 		return 0;
 	return -1;
 }
@@ -3793,6 +3958,219 @@ route_test_assert_public_target_slot_is_canonical(void)
 	UT_ASSERT_EQ(expected_master, -1);
 	UT_ASSERT_EQ(direct_state, GCS_BLOCK_DIRECT_UNARMED);
 	UT_ASSERT(!direct_target_prepared);
+}
+
+/* Break caught: a valid unsent undo-TT request must not raise a connection
+ * error merely because the existing DATA ring temporarily has no room. */
+static void
+test_sync_undo_tt_admission(int refused, int kind)
+{
+	char page[GCS_BLOCK_DATA_SIZE];
+	ClusterLiveAuthority authority;
+	ClusterGcsUndoVerdictPage verdict;
+	BufferDesc buffer;
+	PcmAuthoritySnapshot holder;
+	bool retry_denied = false;
+	volatile bool fetched = false;
+	volatile bool caught = false;
+	int saved_node = cluster_node_id;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	route_test_reset_public_target_requester();
+	sync_forward_fixture = true;
+	sync_forward_kind = kind;
+	sync_forward_full_left = refused;
+	sync_forward_calls = sync_forward_admitted = 0;
+	route_ereport_armed = true;
+	memset(page, 0xa5, sizeof(page));
+	memset(&buffer, 0, sizeof(buffer));
+	buffer.tag = route_test_tag();
+	memset(&holder, 0, sizeof(holder));
+	holder.state = PCM_STATE_X;
+	holder.x_holder_node = UT_MASTER_NODE;
+	holder.master_holder.node_id = UT_MASTER_NODE;
+	PG_TRY();
+	{
+		if (kind == 0)
+			fetched
+				= cluster_gcs_block_undo_tt_fetch_and_wait(UT_MASTER_NODE, 5, 0, page, &authority);
+		else if (kind == 1)
+			fetched = cluster_gcs_block_undo_verdict_fetch_and_wait(UT_MASTER_NODE, 5, 7, 798,
+																	false, &verdict, &authority);
+		else {
+			UT_ASSERT(!cluster_gcs_local_master_read_image_and_wait(&buffer, &holder, true,
+																	&retry_denied));
+			fetched = retry_denied;
+		}
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	route_ereport_armed = false;
+	sync_forward_fixture = false;
+	UT_ASSERT(!caught);
+	UT_ASSERT(fetched);
+	if (fetched && kind != 2) {
+		if (kind == 0)
+			UT_ASSERT_EQ((unsigned char)page[0], 0x6d);
+		else {
+			UT_ASSERT_EQ(verdict.xid_echo, UINT64_C(798));
+			UT_ASSERT_EQ(verdict.commit_scn, UINT64_C(101));
+		}
+		UT_ASSERT_EQ(authority.tt_generation, UINT64_C(17));
+		UT_ASSERT_EQ(authority.authority_scn, (SCN)103);
+	}
+	UT_ASSERT_EQ(sync_forward_calls, refused + 1);
+	UT_ASSERT_EQ(sync_forward_admitted, 1);
+	UT_ASSERT_EQ(retry_latch_wait_calls, refused);
+	route_test_assert_public_target_slot_is_canonical();
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_undo_tt_exact_reply_after_one_transport_admission)
+{
+	test_sync_undo_tt_admission(0, 0);
+}
+
+UT_TEST(test_undo_tt_local_full_waits_same_request_without_error_or_duplicate)
+{
+	test_sync_undo_tt_admission(2, 0);
+}
+
+UT_TEST(test_undo_verdict_exact_reply_after_one_transport_admission)
+{
+	test_sync_undo_tt_admission(0, 1);
+}
+
+UT_TEST(test_undo_verdict_full_waits_without_changing_proof)
+{
+	test_sync_undo_tt_admission(2, 1);
+}
+
+UT_TEST(test_read_image_admission_preserves_holder_retry_not_install)
+{
+	test_sync_undo_tt_admission(0, 2);
+}
+
+UT_TEST(test_read_image_full_waits_before_holder_retry)
+{
+	test_sync_undo_tt_admission(2, 2);
+}
+
+/* Breaks caught: swallowing cancellation, adopting a new epoch/holder,
+ * spinning on an invalid route, or parking the LMS that must free capacity. */
+static void
+test_sync_forward_wait_exit(int mode)
+{
+	char page[GCS_BLOCK_DATA_SIZE];
+	ClusterLiveAuthority authority;
+	BufferDesc buffer;
+	PcmAuthoritySnapshot holder;
+	volatile bool caught = false;
+	volatile bool fetched = false;
+	bool retry_denied = false;
+	int saved_node = cluster_node_id;
+	BackendType saved_type = MyBackendType;
+
+	cluster_node_id = UT_REQUESTER_NODE;
+	route_test_reset_public_target_requester();
+	sync_forward_fixture = true;
+	sync_forward_kind = mode == 4 ? 2 : 0;
+	sync_forward_full_left = 3;
+	sync_forward_calls = sync_forward_admitted = 0;
+	sync_forward_invalid = mode == 2;
+	sync_forward_authority_drift = mode == 4;
+	sync_forward_authority_current = true;
+	retry_latch_cancel = mode == 0 || mode == 5;
+	sync_forward_terminate = mode == 6;
+	InterruptHoldoffCount = mode >= 5 ? 1 : 0;
+	retry_latch_epoch_drift = mode == 1;
+	MyBackendType = mode == 3 ? B_LMS : B_BACKEND;
+	route_ereport_armed = true;
+	memset(page, 0xa5, sizeof(page));
+	memset(&buffer, 0, sizeof(buffer));
+	buffer.tag = route_test_tag();
+	memset(&holder, 0, sizeof(holder));
+	holder.state = PCM_STATE_X;
+	holder.x_holder_node = UT_MASTER_NODE;
+	holder.master_holder.node_id = UT_MASTER_NODE;
+	PG_TRY();
+	{
+		if (mode == 6)
+			route_fatal_boundary = PG_exception_stack;
+		if (mode == 4)
+			fetched = cluster_gcs_local_master_read_image_and_wait(&buffer, &holder, true,
+																   &retry_denied);
+		else
+			fetched
+				= cluster_gcs_block_undo_tt_fetch_and_wait(UT_MASTER_NODE, 5, 0, page, &authority);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT_EQ(caught, mode != 4);
+	route_fatal_boundary = NULL;
+	UT_ASSERT_EQ(retry_denied, mode == 4);
+	UT_ASSERT(!fetched);
+	UT_ASSERT_EQ(sync_forward_calls, mode == 2 ? 0 : 1);
+	UT_ASSERT_EQ(sync_forward_admitted, 0);
+	UT_ASSERT_EQ(retry_latch_wait_calls, mode == 2 || mode == 3 ? 0 : 1);
+	if (mode >= 5) {
+		UT_ASSERT(process_interrupt_calls > 0);
+		UT_ASSERT_EQ(route_ereport_sqlstate,
+					 mode == 5 ? ERRCODE_QUERY_CANCELED : ERRCODE_ADMIN_SHUTDOWN);
+	} else
+		UT_ASSERT_EQ(process_interrupt_calls, mode == 0 ? 1 : 0);
+	for (int i = 0; i < sizeof(page); i++)
+		UT_ASSERT_EQ((unsigned char)page[i], 0xa5);
+	route_test_assert_public_target_slot_is_canonical();
+	route_ereport_armed = false;
+	sync_forward_fixture = sync_forward_invalid = sync_forward_authority_drift = false;
+	sync_forward_authority_current = true;
+	retry_latch_cancel = retry_latch_epoch_drift = false;
+	InterruptHoldoffCount = 0;
+	QueryCancelPending = InterruptPending = false;
+	ProcDiePending = sync_forward_terminate = false;
+	route_test_epoch = UT_FORMATION_EPOCH;
+	MyBackendType = saved_type;
+	cluster_node_id = saved_node;
+}
+
+UT_TEST(test_sync_forward_full_cancellation_releases_exact_slot)
+{
+	test_sync_forward_wait_exit(0);
+}
+UT_TEST(test_sync_forward_full_epoch_change_never_submits)
+{
+	test_sync_forward_wait_exit(1);
+}
+UT_TEST(test_sync_forward_invalid_is_not_a_capacity_wait)
+{
+	test_sync_forward_wait_exit(2);
+}
+UT_TEST(test_sync_forward_background_never_waits_for_itself)
+{
+	test_sync_forward_wait_exit(3);
+}
+UT_TEST(test_read_image_full_holder_change_returns_outer_reobserve)
+{
+	test_sync_forward_wait_exit(4);
+}
+
+UT_TEST(test_undo_full_with_content_lock_honors_cancel_before_admission)
+{
+	test_sync_forward_wait_exit(5);
+}
+
+/* Assert the production termination decision; actual FATAL exit cleanup is
+ * supplied by the native backend hook, not simulated as successful delivery. */
+UT_TEST(test_undo_full_with_content_lock_honors_termination_before_admission)
+{
+	test_sync_forward_wait_exit(6);
 }
 
 /* A valid retry is a terminal physical reply, not a failed logical read.
@@ -6497,6 +6875,19 @@ main(void)
 	UT_RUN(test_kind4_origin_error_releases_guard_and_returns_correlated_refusal);
 	UT_RUN(test_kind4_origin_backpressure_retains_same_proven_page_without_reacquiring);
 	UT_RUN(test_kind4_origin_requires_exact_current_open_and_internal_shape);
+	UT_RUN(test_undo_tt_exact_reply_after_one_transport_admission);
+	UT_RUN(test_undo_tt_local_full_waits_same_request_without_error_or_duplicate);
+	UT_RUN(test_undo_verdict_exact_reply_after_one_transport_admission);
+	UT_RUN(test_undo_verdict_full_waits_without_changing_proof);
+	UT_RUN(test_read_image_admission_preserves_holder_retry_not_install);
+	UT_RUN(test_read_image_full_waits_before_holder_retry);
+	UT_RUN(test_sync_forward_full_cancellation_releases_exact_slot);
+	UT_RUN(test_sync_forward_full_epoch_change_never_submits);
+	UT_RUN(test_sync_forward_invalid_is_not_a_capacity_wait);
+	UT_RUN(test_sync_forward_background_never_waits_for_itself);
+	UT_RUN(test_read_image_full_holder_change_returns_outer_reobserve);
+	UT_RUN(test_undo_full_with_content_lock_honors_cancel_before_admission);
+	UT_RUN(test_undo_full_with_content_lock_honors_termination_before_admission);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

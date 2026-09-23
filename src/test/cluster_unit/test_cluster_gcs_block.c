@@ -1244,7 +1244,7 @@ UT_TEST(test_local_master_read_image_retries_holder_busy_with_fresh_identity)
 		= backoff != NULL ? strstr(backoff, "gcs_block_pcm_x_next_request_id(&request_id)") : NULL;
 	slot_id = fresh_id != NULL ? strstr(fresh_id, "slot->request_id = request_id") : NULL;
 	forward_id = slot_id != NULL ? strstr(slot_id, "fwd.request_id = request_id") : NULL;
-	send = forward_id != NULL ? strstr(forward_id, "cluster_grd_outbound_enqueue_backend_msg(")
+	send = forward_id != NULL ? strstr(forward_id, "gcs_block_stage_forward_wait(")
 							  : NULL;
 	retryable_deny = send != NULL ? strstr(send, "GCS_BLOCK_REPLY_DENIED_MASTER_NOT_HOLDER") : NULL;
 	retry = retryable_deny != NULL ? strstr(retryable_deny, "continue;") : NULL;

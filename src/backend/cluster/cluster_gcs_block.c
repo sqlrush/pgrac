@@ -4137,6 +4137,106 @@ cluster_gcs_send_block_request_and_wait(BufferDesc *buf, PcmLockTransition trans
 }
 
 
+static void gcs_block_r4_retry_backoff(void);
+
+/* A local FULL refusal has not sent a request. Keep the synchronous caller's
+ * exact slot/frame until the existing DATA consumer admits it. Never park an
+ * LMS/background producer here: that process may be the required consumer.
+ * Ring and reply-slot locks are released before the interruptible wait. */
+static bool
+gcs_block_stage_forward_wait_impl(int32 destination, const GcsBlockForwardPayload *forward,
+								  const PcmAuthoritySnapshot *expected, bool *retry_denied)
+{
+	const ClusterICMsgTypeInfo *info = cluster_ic_get_msg_type_info(PGRAC_IC_MSG_GCS_BLOCK_FORWARD);
+	int worker;
+	bool noted = false;
+	instr_time began;
+	double next_note_ms = Max(cluster_gcs_reply_timeout_ms, 1);
+
+	if (info == NULL || (ClusterICPlane)info->plane != CLUSTER_IC_PLANE_DATA)
+		return false;
+	worker = cluster_gcs_block_payload_shard(PGRAC_IC_MSG_GCS_BLOCK_FORWARD, forward,
+											 sizeof(*forward), cluster_lms_workers);
+	if (worker < 0)
+		return false;
+	INSTR_TIME_SET_CURRENT(began);
+	for (;;) {
+		ClusterLmsEnqueueResult result;
+		instr_time elapsed;
+		double age_ms;
+
+		CHECK_FOR_INTERRUPTS();
+		/* Content-lock holders defer ProcessInterrupts. This is the same
+		 * ERROR-safe, unsent boundary as a failed enqueue: unwind through
+		 * the owner's exact-slot cleanup, never clear holdoff and continue
+		 * using the caller's protected state. Native abort owns its locks. */
+		if (MyBackendType == B_BACKEND && CritSectionCount == 0 && QueryCancelHoldoffCount == 0) {
+			if (ProcDiePending)
+				ereport(FATAL, (errcode(ERRCODE_ADMIN_SHUTDOWN),
+								errmsg("terminating connection due to administrator command")));
+			if (QueryCancelPending)
+				ereport(ERROR,
+						(errcode(ERRCODE_QUERY_CANCELED),
+						 errmsg("canceling statement while waiting for cluster outbound capacity"),
+						 errdetail("PGRAC_FAMILY=TRANSPORT_DIAGNOSTIC "
+								   "PGRAC_REASON=CALLER_CANCEL_PENDING")));
+		}
+		if (cluster_epoch_get_current() != forward->epoch)
+			return false;
+		if (expected != NULL && !cluster_pcm_lock_authority_matches(forward->tag, expected)) {
+			*retry_denied = true;
+			return false;
+		}
+		result = cluster_lms_outbound_try_enqueue(worker, PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
+												  (uint32)destination, forward, sizeof(*forward));
+		if (result == CLUSTER_LMS_ENQUEUE_ADMITTED)
+			return true;
+		if (result != CLUSTER_LMS_ENQUEUE_FULL || MyBackendType != B_BACKEND
+			|| CritSectionCount != 0 || QueryCancelHoldoffCount != 0)
+			return false;
+		INSTR_TIME_SET_CURRENT(elapsed);
+		INSTR_TIME_SUBTRACT(elapsed, began);
+		age_ms = INSTR_TIME_GET_MILLISEC(elapsed);
+		if (!noted || age_ms >= next_note_ms) {
+			ereport(LOG, (errmsg_internal("GCS foreground waiting for local staging capacity"),
+						  errdetail("PGRAC_FAMILY=TRANSPORT_DIAGNOSTIC PGRAC_REASON=OUTBOUND_FULL "
+									"node=%d worker=%d destination=%d request=" UINT64_FORMAT
+									" epoch=" UINT64_FORMAT " tag=%u/%u/%u/%u/%u age_ms=%.3f",
+									cluster_node_id, worker, destination, forward->request_id,
+									forward->epoch, forward->tag.spcOid, forward->tag.dbOid,
+									forward->tag.relNumber, (unsigned)forward->tag.forkNum,
+									forward->tag.blockNum, age_ms)));
+			noted = true;
+			if (age_ms >= next_note_ms)
+				next_note_ms = Max(next_note_ms * 10.0, age_ms * 10.0);
+		}
+		gcs_block_r4_retry_backoff();
+	}
+}
+
+static void
+gcs_block_unsent_slot_cleanup(int code pg_attribute_unused(), Datum arg)
+{
+	gcs_block_release_slot((ClusterGcsBlockOutstandingSlot *)DatumGetPointer(arg));
+}
+
+/* A native FATAL skips PG_CATCH. Bind the unsent requester slot to both
+ * native error exits while this admission wait owns it. */
+static bool
+gcs_block_stage_forward_wait(ClusterGcsBlockOutstandingSlot *slot, int32 destination,
+							 const GcsBlockForwardPayload *forward,
+							 const PcmAuthoritySnapshot *expected, bool *retry_denied)
+{
+	bool admitted;
+
+	PG_ENSURE_ERROR_CLEANUP(gcs_block_unsent_slot_cleanup, PointerGetDatum(slot));
+	{
+		admitted = gcs_block_stage_forward_wait_impl(destination, forward, expected, retry_denied);
+	}
+	PG_END_ENSURE_ERROR_CLEANUP(gcs_block_unsent_slot_cleanup, PointerGetDatum(slot));
+	return admitted;
+}
+
 bool
 cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthoritySnapshot *expected,
 											 bool force_one_shot, bool *out_retry_denied)
@@ -4262,8 +4362,10 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 				pg_atomic_fetch_add_u64(&ClusterGcsBlock->retransmit_send_count, 1);
 
 			pg_atomic_fetch_add_u64(&ClusterGcsBlock->block_forward_sent_count, 1);
-			if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-														  (uint32)holder_node, &fwd, sizeof(fwd)))
+			if (!gcs_block_stage_forward_wait(slot, holder_node, &fwd, expected,
+											  out_retry_denied)) {
+				if (*out_retry_denied)
+					break;
 				ereport(
 					ERROR,
 					(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -4274,6 +4376,7 @@ cluster_gcs_local_master_read_image_and_wait(BufferDesc *buf, const PcmAuthority
 						 "PGRAC_FAMILY=TRANSPORT PGRAC_REASON=TRANSPORT_OUTBOUND_ENQUEUE_REFUSED "
 						 "PGRAC_NODE=%d PGRAC_ATTEMPT=0 ",
 						 cluster_node_id)));
+			}
 
 			deadline = GetCurrentTimestamp()
 					   + ((TimestampTz)cluster_gcs_reply_timeout_ms) * (TimestampTz)1000;
@@ -5524,8 +5627,7 @@ cluster_gcs_block_undo_tt_fetch_and_wait(int32 origin_node, uint32 segment_id, u
 		fwd.transition_id = (uint8)PCM_TRANS_N_TO_S;
 		GcsBlockForwardPayloadSetUndoTtFetchRequest(&fwd, true);
 
-		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-													  (uint32)origin_node, &fwd, sizeof(fwd)))
+		if (!gcs_block_stage_forward_wait(slot, origin_node, &fwd, NULL, NULL))
 			ereport(
 				ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -5766,8 +5868,7 @@ gcs_block_undo_verdict_wire_exchange_trace_impl(
 		GcsBlockForwardPayloadSetExpectedPiWatermarkScn(&fwd, freshref_pair ? freshref_pair_scn
 																			: (SCN)(uint64)xid);
 
-		if (!cluster_grd_outbound_enqueue_backend_msg(PGRAC_IC_MSG_GCS_BLOCK_FORWARD,
-													  (uint32)dest_node, &fwd, sizeof(fwd))) {
+		if (!gcs_block_stage_forward_wait(slot, dest_node, &fwd, NULL, NULL)) {
 			if (authority_kind)
 				ereport(
 					ERROR,
