@@ -75,6 +75,18 @@ typedef enum ClusterControlRootActivationState {
 	CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE = 2
 } ClusterControlRootActivationState;
 
+/* PGRAC: root-v2 database state encoding; decoding is not admission.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef enum ClusterControlRootDatabaseState {
+	CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED = 1,
+	CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING = 2,
+	CLUSTER_CONTROL_ROOT_DATABASE_OPEN = 3,
+	CLUSTER_CONTROL_ROOT_DATABASE_CLOSING = 4,
+	CLUSTER_CONTROL_ROOT_DATABASE_CLOSED = 5,
+	CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED = 6
+} ClusterControlRootDatabaseState;
+
 typedef enum ClusterControlRootCheckpointSource {
 	CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1 = 1,
 	CLUSTER_CONTROL_ROOT_CHECKPOINT_RECOVERY_ANCHOR_V1 = 2

@@ -42,6 +42,8 @@
 #define CONTROL_ROOT_ENDIAN_TAG UINT32_C(0x01020304)
 #define CONTROL_ROOT_READER_VERSION UINT16_C(1)
 #define CONTROL_ROOT_WRITER_VERSION UINT16_C(1)
+#define CONTROL_ROOT_HEADER_VERSION_V2 UINT16_C(2)
+#define CONTROL_ROOT_RECORD_VERSION_V2 UINT16_C(2)
 #define CONTROL_ROOT_SOURCE_PRIMARY UINT8_C(1)
 #define CONTROL_ROOT_SOURCE_BAK_BLOCKED UINT8_C(2)
 #define CONTROL_ROOT_SOURCE_BOOTSTRAP_PRIMARY UINT8_C(3)
@@ -49,32 +51,6 @@
 #define CONTROL_ROOT_HEADER_CRC_OFFSET 504
 #define CONTROL_ROOT_RECORD_CRC_OFFSET 504
 #define CONTROL_ROOT_BODY_OFFSET CLUSTER_CONTROL_ROOT_HEADER_BYTES
-
-typedef struct ControlRootHeader {
-	uint64 file_txn_seq;
-	uint64 system_identifier;
-	uint8 storage_uuid[16];
-	uint8 authority_uuid[16];
-	uint32 activation_state;
-	int64 created_at_usec;
-	int64 published_at_usec;
-	uint32 body_crc32c;
-	uint8 migration_round_sha256[PG_SHA256_DIGEST_LENGTH];
-	uint8 source_wal_state_sha256[PG_SHA256_DIGEST_LENGTH];
-	uint64 migration_prepare_generation;
-	uint64 migration_transition_epoch;
-	uint64 source_feature_bitmap;
-	uint64 target_feature_bitmap;
-	uint32 header_crc32c;
-} ControlRootHeader;
-
-typedef struct ControlRootImage {
-	uint8 bytes[CLUSTER_CONTROL_ROOT_FILE_BYTES];
-	ControlRootHeader header;
-	ClusterControlRootSnapshot records[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
-	uint32 record_crc32c[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
-	bool present[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
-} ControlRootImage;
 
 static uint16
 read_u16_le(const uint8 *src)
@@ -401,13 +377,49 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* PGRAC: explicit v2 extensions; legacy callers retain strict v1 wrappers.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+common_v2_validate(const ControlRootCommonV2 *common)
+{
+	if (common->reserved4 != 0)
+		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+	if (common->database_state < CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		|| common->database_state > CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (common->database_incarnation == 0 || common->formation_seq == 0
+		|| (common->configured[0] == 0 && common->configured[1] == 0)
+		|| (common->serving[0] & ~common->configured[0]) != 0
+		|| (common->serving[1] & ~common->configured[1]) != 0 || common->config_generation == 0
+		|| bytes_are_zero(common->config_sha256, 32) || common->control_image_generation == 0
+		|| bytes_are_zero(common->control_image_sha256, 32)
+		|| common->catalog_manifest_generation == 0
+		|| bytes_are_zero(common->catalog_manifest_sha256, 32)
+		|| common->global_scn_high_water == 0)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+record_refs_v2_validate(const ControlRootRecordRefsV2 *refs)
+{
+	if ((refs->history_generation == 0) != bytes_are_zero(refs->history_sha256, 32)
+		|| refs->anchor_generation == 0 || bytes_are_zero(refs->anchor_sha256, 32)
+		|| bytes_are_zero(refs->claim_sha256, 32))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static void
-encode_record(uint8 *dst, const ClusterControlRootSnapshot *snapshot, uint64 publisher_incarnation,
-			  uint32 publisher_node, ClusterControlRootPublishReason reason)
+encode_record_version(uint8 *dst, const ClusterControlRootSnapshot *snapshot,
+					  uint64 publisher_incarnation, uint32 publisher_node,
+					  ClusterControlRootPublishReason reason, uint16 version,
+					  const ControlRootRecordRefsV2 *refs)
 {
 	memset(dst, 0, CLUSTER_CONTROL_ROOT_RECORD_BYTES);
 	memcpy(dst, CONTROL_ROOT_RECORD_MAGIC, 4);
-	write_u16_le(dst + 4, CONTROL_ROOT_FORMAT_VERSION);
+	write_u16_le(dst + 4, version);
 	write_u16_le(dst + 6, CLUSTER_CONTROL_ROOT_RECORD_BYTES);
 	write_u16_le(dst + 8, snapshot->identity.origin_thread_id);
 	dst[10] = (uint8)snapshot->lifecycle;
@@ -440,13 +452,29 @@ encode_record(uint8 *dst, const ClusterControlRootSnapshot *snapshot, uint64 pub
 	write_u16_le(dst + 194, snapshot->checkpoint_source_kind);
 	write_u16_le(dst + 196, snapshot->conservative_bound_kind);
 	write_u64_le(dst + 208, snapshot->recovered_last_record_lsn);
+	if (version == CONTROL_ROOT_RECORD_VERSION_V2) {
+		write_u64_le(dst + 216, refs->history_generation);
+		memcpy(dst + 224, refs->history_sha256, 32);
+		write_u64_le(dst + 256, refs->anchor_generation);
+		memcpy(dst + 264, refs->anchor_sha256, 32);
+		memcpy(dst + 296, refs->claim_sha256, 32);
+	}
 	write_u32_le(dst + CONTROL_ROOT_RECORD_CRC_OFFSET,
 				 control_root_crc(dst, CONTROL_ROOT_RECORD_CRC_OFFSET));
 }
 
+static void
+encode_record(uint8 *dst, const ClusterControlRootSnapshot *snapshot, uint64 publisher_incarnation,
+			  uint32 publisher_node, ClusterControlRootPublishReason reason)
+{
+	encode_record_version(dst, snapshot, publisher_incarnation, publisher_node, reason,
+						  CONTROL_ROOT_FORMAT_VERSION, NULL);
+}
+
 static ClusterControlRootResult
 decode_record(const uint8 *src, uint16 expected_thread, const ControlRootHeader *header,
-			  ClusterControlRootSnapshot *snapshot, uint32 *crc_out)
+			  ClusterControlRootSnapshot *snapshot, uint32 *crc_out, uint16 expected_version,
+			  ControlRootRecordRefsV2 *refs)
 {
 	ClusterControlRootResult result;
 	uint64 publisher_incarnation;
@@ -461,14 +489,16 @@ decode_record(const uint8 *src, uint16 expected_thread, const ControlRootHeader 
 	}
 	if (memcmp(src, CONTROL_ROOT_RECORD_MAGIC, 4) != 0)
 		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
-	if (read_u16_le(src + 4) != CONTROL_ROOT_FORMAT_VERSION
+	if (read_u16_le(src + 4) != expected_version
 		|| read_u16_le(src + 6) != CLUSTER_CONTROL_ROOT_RECORD_BYTES)
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	stored_crc = read_u32_le(src + CONTROL_ROOT_RECORD_CRC_OFFSET);
 	if (stored_crc != control_root_crc(src, CONTROL_ROOT_RECORD_CRC_OFFSET))
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (src[11] != 0 || !bytes_are_zero(src + 88, 8) || !bytes_are_zero(src + 198, 10)
-		|| !bytes_are_zero(src + 216, 288) || !bytes_are_zero(src + 508, 4))
+		|| !bytes_are_zero(src + (expected_version == CONTROL_ROOT_RECORD_VERSION_V2 ? 328 : 216),
+						   expected_version == CONTROL_ROOT_RECORD_VERSION_V2 ? 176 : 288)
+		|| !bytes_are_zero(src + 508, 4))
 		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
 	if (read_u16_le(src + 8) != expected_thread)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
@@ -514,18 +544,30 @@ decode_record(const uint8 *src, uint16 expected_thread, const ControlRootHeader 
 							   header->storage_uuid, header->authority_uuid);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	if (expected_version == CONTROL_ROOT_RECORD_VERSION_V2) {
+		if (snapshot->identity.origin_node_id != (int32)expected_thread - 1)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		refs->history_generation = read_u64_le(src + 216);
+		memcpy(refs->history_sha256, src + 224, 32);
+		refs->anchor_generation = read_u64_le(src + 256);
+		memcpy(refs->anchor_sha256, src + 264, 32);
+		memcpy(refs->claim_sha256, src + 296, 32);
+		result = record_refs_v2_validate(refs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
 	*crc_out = stored_crc;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 static void
-encode_header(ControlRootImage *image)
+encode_header_version(ControlRootImage *image, uint16 version)
 {
 	uint8 *dst = image->bytes;
 
 	memset(dst, 0, CLUSTER_CONTROL_ROOT_HEADER_BYTES);
 	memcpy(dst, CONTROL_ROOT_HEADER_MAGIC, 4);
-	write_u16_le(dst + 4, CONTROL_ROOT_FORMAT_VERSION);
+	write_u16_le(dst + 4, version);
 	write_u16_le(dst + 6, CLUSTER_CONTROL_ROOT_HEADER_BYTES);
 	write_u16_le(dst + 8, CLUSTER_CONTROL_ROOT_RECORD_BYTES);
 	write_u16_le(dst + 10, CLUSTER_CONTROL_ROOT_RECORD_COUNT);
@@ -535,8 +577,8 @@ encode_header(ControlRootImage *image)
 	memcpy(dst + 32, image->header.storage_uuid, 16);
 	memcpy(dst + 48, image->header.authority_uuid, 16);
 	write_u64_le(dst + 64, CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1);
-	write_u16_le(dst + 72, CONTROL_ROOT_READER_VERSION);
-	write_u16_le(dst + 74, CONTROL_ROOT_WRITER_VERSION);
+	write_u16_le(dst + 72, version);
+	write_u16_le(dst + 74, version);
 	write_u32_le(dst + 76, image->header.activation_state);
 	write_u64_le(dst + 80, (uint64)image->header.created_at_usec);
 	write_u64_le(dst + 88, (uint64)image->header.published_at_usec);
@@ -550,12 +592,38 @@ encode_header(ControlRootImage *image)
 	write_u64_le(dst + 172, image->header.migration_transition_epoch);
 	write_u64_le(dst + 180, image->header.source_feature_bitmap);
 	write_u64_le(dst + 188, image->header.target_feature_bitmap);
+	image->header.format_version = version;
+	if (version == CONTROL_ROOT_HEADER_VERSION_V2) {
+		const ControlRootCommonV2 *common = &image->header.v2;
+
+		write_u32_le(dst + 196, common->database_state);
+		write_u64_le(dst + 200, common->database_incarnation);
+		write_u64_le(dst + 208, common->formation_seq);
+		write_u64_le(dst + 216, common->configured[0]);
+		write_u64_le(dst + 224, common->configured[1]);
+		write_u64_le(dst + 232, common->serving[0]);
+		write_u64_le(dst + 240, common->serving[1]);
+		write_u64_le(dst + 248, common->config_generation);
+		memcpy(dst + 256, common->config_sha256, 32);
+		write_u64_le(dst + 288, common->control_image_generation);
+		memcpy(dst + 296, common->control_image_sha256, 32);
+		write_u64_le(dst + 328, common->catalog_manifest_generation);
+		write_u64_le(dst + 336, common->global_scn_high_water);
+		memcpy(dst + 344, common->catalog_manifest_sha256, 32);
+	}
 	image->header.header_crc32c = control_root_crc(dst, CONTROL_ROOT_HEADER_CRC_OFFSET);
 	write_u32_le(dst + CONTROL_ROOT_HEADER_CRC_OFFSET, image->header.header_crc32c);
 }
 
+static void
+encode_header(ControlRootImage *image)
+{
+	encode_header_version(image, CONTROL_ROOT_FORMAT_VERSION);
+}
+
 static ClusterControlRootResult
-decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 current_sysid)
+decode_image_version(ControlRootImage *image, const uint8 current_uuid[16], uint64 current_sysid,
+					 uint16 expected_version)
 {
 	const uint8 *src = image->bytes;
 	uint32 stored_crc;
@@ -563,16 +631,18 @@ decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 curre
 
 	memset(&image->header, 0, sizeof(image->header));
 	memset(image->records, 0, sizeof(image->records));
+	memset(image->refs, 0, sizeof(image->refs));
+	memset(image->publisher_incarnation, 0, sizeof(image->publisher_incarnation));
+	memset(image->publisher_node, 0, sizeof(image->publisher_node));
 	memset(image->record_crc32c, 0, sizeof(image->record_crc32c));
 	memset(image->present, 0, sizeof(image->present));
 	if (memcmp(src, CONTROL_ROOT_HEADER_MAGIC, 4) != 0)
 		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
-	if (read_u16_le(src + 4) != CONTROL_ROOT_FORMAT_VERSION
+	if (read_u16_le(src + 4) != expected_version
 		|| read_u16_le(src + 6) != CLUSTER_CONTROL_ROOT_HEADER_BYTES
 		|| read_u16_le(src + 8) != CLUSTER_CONTROL_ROOT_RECORD_BYTES
 		|| read_u16_le(src + 10) != CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| read_u16_le(src + 72) != CONTROL_ROOT_READER_VERSION
-		|| read_u16_le(src + 74) != CONTROL_ROOT_WRITER_VERSION
+		|| read_u16_le(src + 72) != expected_version || read_u16_le(src + 74) != expected_version
 		|| read_u64_le(src + 64) != CLUSTER_CONTROL_ROOT_FORMAT_FLAGS_V1)
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (read_u32_le(src + 12) != CONTROL_ROOT_ENDIAN_TAG)
@@ -580,7 +650,9 @@ decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 curre
 	stored_crc = read_u32_le(src + CONTROL_ROOT_HEADER_CRC_OFFSET);
 	if (stored_crc != control_root_crc(src, CONTROL_ROOT_HEADER_CRC_OFFSET))
 		return CLUSTER_CONTROL_ROOT_BAD_HEADER_CRC;
-	if (!bytes_are_zero(src + 196, 308) || !bytes_are_zero(src + 508, 4))
+	if (!bytes_are_zero(src + (expected_version == CONTROL_ROOT_HEADER_VERSION_V2 ? 376 : 196),
+						expected_version == CONTROL_ROOT_HEADER_VERSION_V2 ? 128 : 308)
+		|| !bytes_are_zero(src + 508, 4))
 		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
 	image->header.file_txn_seq = read_u64_le(src + 16);
 	image->header.system_identifier = read_u64_le(src + 24);
@@ -597,6 +669,7 @@ decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 curre
 	image->header.source_feature_bitmap = read_u64_le(src + 180);
 	image->header.target_feature_bitmap = read_u64_le(src + 188);
 	image->header.header_crc32c = stored_crc;
+	image->header.format_version = expected_version;
 	if (image->header.file_txn_seq == 0 || image->header.system_identifier == 0
 		|| image->header.system_identifier != current_sysid
 		|| memcmp(image->header.storage_uuid, current_uuid, 16) != 0
@@ -614,23 +687,143 @@ decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 curre
 			& PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1)
 			   == 0)
 		return CLUSTER_CONTROL_ROOT_MIXED_VERSION;
+	if (expected_version == CONTROL_ROOT_HEADER_VERSION_V2) {
+		ControlRootCommonV2 *common = &image->header.v2;
+		ClusterControlRootResult result;
+
+		common->database_state = read_u32_le(src + 196);
+		common->database_incarnation = read_u64_le(src + 200);
+		common->formation_seq = read_u64_le(src + 208);
+		common->configured[0] = read_u64_le(src + 216);
+		common->configured[1] = read_u64_le(src + 224);
+		common->serving[0] = read_u64_le(src + 232);
+		common->serving[1] = read_u64_le(src + 240);
+		common->config_generation = read_u64_le(src + 248);
+		memcpy(common->config_sha256, src + 256, 32);
+		common->control_image_generation = read_u64_le(src + 288);
+		memcpy(common->control_image_sha256, src + 296, 32);
+		common->catalog_manifest_generation = read_u64_le(src + 328);
+		common->global_scn_high_water = read_u64_le(src + 336);
+		memcpy(common->catalog_manifest_sha256, src + 344, 32);
+		result = common_v2_validate(common);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
 	if (image->header.body_crc32c
 		!= control_root_crc(src + CONTROL_ROOT_BODY_OFFSET,
 							CLUSTER_CONTROL_ROOT_FILE_BYTES - CONTROL_ROOT_BODY_OFFSET))
 		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
 
 	for (i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; i++) {
+		const uint8 *record = src + CLUSTER_CONTROL_ROOT_HEADER_BYTES
+							  + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES;
 		ClusterControlRootResult result = decode_record(
-			src + CLUSTER_CONTROL_ROOT_HEADER_BYTES + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
-			(uint16)(i + 1), &image->header, &image->records[i], &image->record_crc32c[i]);
+			record, (uint16)(i + 1), &image->header, &image->records[i], &image->record_crc32c[i],
+			expected_version == CONTROL_ROOT_HEADER_VERSION_V2 ? CONTROL_ROOT_RECORD_VERSION_V2
+															   : CONTROL_ROOT_FORMAT_VERSION,
+			&image->refs[i]);
 
 		if (result == CLUSTER_CONTROL_ROOT_ABSENT)
 			continue;
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		image->present[i] = true;
+		image->publisher_incarnation[i] = read_u64_le(record + 144);
+		image->publisher_node[i] = read_u32_le(record + 152);
 	}
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 current_sysid)
+{
+	return decode_image_version(image, current_uuid, current_sysid, CONTROL_ROOT_FORMAT_VERSION);
+}
+
+/* PGRAC: these codecs validate representation, not proof of publication.
+ * Existing v1 file APIs never call them. Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_control_root_v2_decode(const uint8 *bytes, size_t len, const uint8 storage_uuid[16],
+							   uint64 system_identifier, ControlRootImage *out)
+{
+	ClusterControlRootResult result;
+	uint8 expected_uuid[16];
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (bytes == NULL || storage_uuid == NULL || system_identifier == 0
+		|| bytes_are_zero(storage_uuid, 16)) {
+		memset(out, 0, sizeof(*out));
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
+	if (len != CLUSTER_CONTROL_ROOT_FILE_BYTES) {
+		memset(out, 0, sizeof(*out));
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	}
+	memcpy(expected_uuid, storage_uuid, sizeof(expected_uuid));
+	memmove(out->bytes, bytes, len);
+	result = decode_image_version(out, expected_uuid, system_identifier,
+								  CONTROL_ROOT_HEADER_VERSION_V2);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_encode(ControlRootImage *image)
+{
+	ClusterControlRootResult result;
+	uint8 expected_uuid[16];
+	uint64 system_identifier;
+	uint16 i;
+
+	if (image == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(image->bytes, 0, sizeof(image->bytes));
+	if (image->header.format_version != CONTROL_ROOT_HEADER_VERSION_V2)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (bytes_are_zero(image->header.storage_uuid, 16))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = common_v2_validate(&image->header.v2);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	for (i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++i) {
+		if (!image->present[i]) {
+			if (!bytes_are_zero(&image->records[i], sizeof(image->records[i]))
+				|| !bytes_are_zero(&image->refs[i], sizeof(image->refs[i]))
+				|| image->publisher_incarnation[i] != 0 || image->publisher_node[i] != 0)
+				return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+			continue;
+		}
+		result = snapshot_validate(&image->records[i], i + 1, image->header.system_identifier,
+								   image->header.storage_uuid, image->header.authority_uuid);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (image->records[i].identity.origin_node_id != i)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		if (image->publisher_incarnation[i] == 0 || image->publisher_node[i] >= 128)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		result = record_refs_v2_validate(&image->refs[i]);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	for (i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++i)
+		if (image->present[i])
+			encode_record_version(
+				image->bytes + CLUSTER_CONTROL_ROOT_HEADER_BYTES
+					+ (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
+				&image->records[i], image->publisher_incarnation[i], image->publisher_node[i],
+				(ClusterControlRootPublishReason)image->records[i].lifecycle_reason,
+				CONTROL_ROOT_RECORD_VERSION_V2, &image->refs[i]);
+	encode_header_version(image, CONTROL_ROOT_HEADER_VERSION_V2);
+	memcpy(expected_uuid, image->header.storage_uuid, sizeof(expected_uuid));
+	system_identifier = image->header.system_identifier;
+	result = decode_image_version(image, expected_uuid, system_identifier,
+								  CONTROL_ROOT_HEADER_VERSION_V2);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(image->bytes, 0, sizeof(image->bytes));
+	return result;
 }
 
 static ClusterControlRootResult
