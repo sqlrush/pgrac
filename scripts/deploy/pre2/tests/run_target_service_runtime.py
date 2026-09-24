@@ -73,7 +73,14 @@ class ServiceRuntimeTests(unittest.TestCase):
             ssl.PEM_cert_to_DER_cert((self.tls_directory / "server.pem").read_text())).hexdigest(),
             self.registry.inventory_digest)
         self.server = None
+        self.diagnostic_fds = []
+        self.addCleanup(self.close_diagnostics)
         self.addCleanup(self.stop)
+
+    def close_diagnostics(self):
+        for fd in self.diagnostic_fds:
+            os.close(fd)
+        self.diagnostic_fds.clear()
 
     def write_template(self):
         bindings = self.registry.node(2).bindings
@@ -152,10 +159,11 @@ class ServiceRuntimeTests(unittest.TestCase):
                 os.write(2, (reason + "\n").encode())
             os._exit(status)
         os.close(write_fd)
-        try:
-            output = worker_tests.read_pipe(read_fd, 6)
-        finally:
-            os.close(read_fd)
+        # Keep the bounded LOG-once sink open until the server has stopped.
+        # Closing it after readiness turned the next expected refusal log into
+        # EPIPE and killed the fixture's otherwise usable listener.
+        self.diagnostic_fds.append(read_fd)
+        output = worker_tests.read_pipe(read_fd, 6)
         return pid, output
 
     def start(self):
@@ -213,6 +221,21 @@ class ServiceRuntimeTests(unittest.TestCase):
         self.c.document["target_boot_id"] = "ee" * 16
         self.c.write()
         self.refused()
+
+    def test_rejected_request_keeps_listener_diagnostics_and_next_request_live(self):
+        self.start()
+        mapping = self.registry.node(2).mapping
+        with self.assertRaises(TargetJournalError):
+            self.request(dict(version=1, action="prepare_deny", challenge="ab" * 16,
+                node_id=3, system_identifier=mapping.system_identifier,
+                mapping_generation=mapping.mapping_generation, protected_set_digest=mapping.protected_set_digest,
+                operation_id="ad" * 16, attempt=1, daemon_boot_id="ae" * 16, target_boot_id=self.boot_id))
+        try:
+            reply = self.request({"version": 1, "action": "identity", "challenge": "ac" * 16})
+        except TargetJournalError:
+            self.fail("listener stopped serving after a rejected request")
+        self.assertEqual(reply["status"], "IDENTITY_ONLY")
+        self.assertEqual(self.stop(), 0)
 
     def test_bad_signature_refuses_before_native_or_listen(self):
         self.r.document["nodes"][0]["signed_map"] = self.r.packet[:-1].hex() + "00"
