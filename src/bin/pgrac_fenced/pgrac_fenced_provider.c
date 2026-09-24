@@ -22,6 +22,7 @@
 #include <unistd.h>
 
 #include "pgrac_fenced_ipmi.h"
+#include "pgrac_fenced_journal.h"
 #include "pgrac_fenced_provider.h"
 
 #define PGRAC_FENCED_WORKER_MAGIC UINT32_C(0x50465731)
@@ -59,6 +60,13 @@ StaticAssertDecl(sizeof(PgracFencedWorkerMessage) == 48,
 				 "provider worker message size changed");
 
 static uint64_t callback_deadline_mono_ns;
+static const PgracFencedJournalRecordV1 *callback_record;
+
+const struct PgracFencedJournalRecordV1 *
+pgrac_fenced_provider_callback_record(void)
+{
+	return callback_record;
+}
 
 uint64_t
 pgrac_fenced_provider_callback_deadline_mono_ns(void)
@@ -362,11 +370,56 @@ wait_worker_exit(pid_t pid, bool leader_reaped)
 	}
 }
 
+/* PGRAC: owner must already have appended this record; encoding is not proof of fsync. */
+static bool
+execution_record_matches(const PgracFencedProviderOpsV1 *ops, uint32 call_type, bool turn_on,
+						 const PgracFencedTargetV1 *target,
+						 const PgracFencedJournalRecordV1 *record)
+{
+	uint8 frame[PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES];
+	size_t length;
+	int32 node;
+	bool acquire;
+	uint16 opcode = 0;
+
+	if (call_type == PGRAC_FENCED_WORKER_RESOLVE)
+		return record == NULL;
+	if (record == NULL)
+		return ops->provider_id != PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1;
+	if (record->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_NONE
+		|| record->provider_id != ops->provider_id
+		|| record->provider_abi_version != ops->abi_version
+		|| record->mapping_generation != target->mapping_generation
+		|| memcmp(record->intent.target_uuid, target->target_uuid, 16) != 0
+		|| !pgrac_fenced_journal_frame_encode(record, frame, sizeof(frame), &length))
+		return false;
+	acquire = record->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE;
+	node = acquire ? record->intent.request.acquire.need.victim_node_id
+				   : record->intent.request.rejoin.old_node_id;
+	if (node != target->victim_node_id)
+		return false;
+	if (call_type != PGRAC_FENCED_WORKER_ACTUATE)
+		return true;
+	if (record->record_kind != PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED)
+		return false;
+	if (!acquire)
+		opcode = record->intent.request.rejoin.opcode;
+	if (turn_on)
+		return !acquire && opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON
+			   && record->target_state == PGRAC_FENCED_JOURNAL_TARGET_NONE;
+	if (acquire)
+		return record->target_state == PGRAC_FENCED_JOURNAL_TARGET_NONE;
+	/* Compensating OFF is recorded under the same owned ON/REFRESH need. */
+	return (opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON
+			|| opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON)
+		   && record->target_state == PGRAC_FENCED_TARGET_OFF;
+}
+
 static PgracFencedProviderWorkerResult
 run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 		   uint32 call_type, bool turn_on,
-		   const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
-		   PgracFencedWorkerMessage *message)
+		   const PgracFencedTargetV1 *target, const PgracFencedJournalRecordV1 *record,
+		   uint64_t deadline_mono_ns, PgracFencedWorkerMessage *message)
 {
 	struct pollfd poll_fd;
 	uint64_t now;
@@ -384,6 +437,7 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 	message->provider_result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 	if (!pgrac_fenced_provider_ops_valid(ops, allow_test_only) ||
 		!target_valid(target) ||
+		!execution_record_matches(ops, call_type, turn_on, target, record) ||
 		(call_type != PGRAC_FENCED_WORKER_ACTUATE &&
 		 call_type != PGRAC_FENCED_WORKER_READBACK &&
 		 call_type != PGRAC_FENCED_WORKER_RESOLVE) ||
@@ -405,6 +459,7 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 		PgracFencedWorkerMessage child_message;
 		PgracFencedProviderResult provider_result;
 		PgracFencedTargetV1 child_resolved;
+		PgracFencedJournalRecordV1 child_record;
 
 		(void) close(pipe_fds[0]);
 		if (setpgid(0, 0) != 0)
@@ -414,6 +469,13 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 		child_message.magic = PGRAC_FENCED_WORKER_MAGIC;
 		child_message.call_type = call_type;
 		callback_deadline_mono_ns = deadline_mono_ns;
+		/* PGRAC: fork-local only; legacy workers cannot inherit an owner. */
+		callback_record = NULL;
+		if (record != NULL)
+		{
+			child_record = *record;
+			callback_record = &child_record;
+		}
 		if (call_type == PGRAC_FENCED_WORKER_ACTUATE)
 		{
 			provider_result = turn_on ?
@@ -444,6 +506,7 @@ run_worker(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
 			}
 		}
 		callback_deadline_mono_ns = 0;
+		callback_record = NULL;
 		child_message.provider_result = (uint32) provider_result;
 		got = write(pipe_fds[1], &child_message, sizeof(child_message));
 		(void) close(pipe_fds[1]);
@@ -518,7 +581,7 @@ pgrac_fenced_provider_worker_resolve(
 	memset(resolved, 0, sizeof(*resolved));
 	*native_status = 0;
 	worker_result = run_worker(ops, allow_test_only,
-		PGRAC_FENCED_WORKER_RESOLVE, false, configured, deadline_mono_ns,
+		PGRAC_FENCED_WORKER_RESOLVE, false, configured, NULL, deadline_mono_ns,
 		&message);
 	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK)
 	{
@@ -536,10 +599,22 @@ pgrac_fenced_provider_worker_resolve(
 }
 
 PgracFencedProviderWorkerResult
-pgrac_fenced_provider_worker_actuate(
-	const PgracFencedProviderOpsV1 *ops, bool allow_test_only, bool turn_on,
-	const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
-	PgracFencedProviderResult *result, int32 *native_status)
+pgrac_fenced_provider_worker_actuate(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
+									 bool turn_on, const PgracFencedTargetV1 *target,
+									 uint64_t deadline_mono_ns, PgracFencedProviderResult *result,
+									 int32 *native_status)
+{
+	return pgrac_fenced_provider_worker_actuate_owned(ops, allow_test_only, turn_on, target, NULL,
+													  deadline_mono_ns, result, native_status);
+}
+
+PgracFencedProviderWorkerResult
+pgrac_fenced_provider_worker_actuate_owned(const PgracFencedProviderOpsV1 *ops,
+										   bool allow_test_only, bool turn_on,
+										   const PgracFencedTargetV1 *target,
+										   const PgracFencedJournalRecordV1 *record,
+										   uint64_t deadline_mono_ns,
+										   PgracFencedProviderResult *result, int32 *native_status)
 {
 	PgracFencedWorkerMessage message;
 	PgracFencedProviderWorkerResult worker_result;
@@ -548,24 +623,33 @@ pgrac_fenced_provider_worker_actuate(
 		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
 	*result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 	*native_status = 0;
-	worker_result = run_worker(ops, allow_test_only,
-		PGRAC_FENCED_WORKER_ACTUATE, turn_on, target, deadline_mono_ns,
-		&message);
-	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK)
-	{
-		*result = (PgracFencedProviderResult) message.provider_result;
+	worker_result = run_worker(ops, allow_test_only, PGRAC_FENCED_WORKER_ACTUATE, turn_on, target,
+							   record, deadline_mono_ns, &message);
+	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK) {
+		*result = (PgracFencedProviderResult)message.provider_result;
 		*native_status = message.native_status;
-	}
-	else if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE)
+	} else if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE)
 		*result = PGRAC_FENCED_PROVIDER_UNKNOWN;
 	return worker_result;
 }
 
 PgracFencedProviderWorkerResult
-pgrac_fenced_provider_worker_readback(
-	const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
-	const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
-	PgracFencedProviderResult *result, PgracFencedReadbackV1 *readback)
+pgrac_fenced_provider_worker_readback(const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
+									  const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
+									  PgracFencedProviderResult *result,
+									  PgracFencedReadbackV1 *readback)
+{
+	return pgrac_fenced_provider_worker_readback_owned(ops, allow_test_only, target, NULL,
+													   deadline_mono_ns, result, readback);
+}
+
+PgracFencedProviderWorkerResult
+pgrac_fenced_provider_worker_readback_owned(const PgracFencedProviderOpsV1 *ops,
+											bool allow_test_only, const PgracFencedTargetV1 *target,
+											const PgracFencedJournalRecordV1 *record,
+											uint64_t deadline_mono_ns,
+											PgracFencedProviderResult *result,
+											PgracFencedReadbackV1 *readback)
 {
 	PgracFencedWorkerMessage message;
 	PgracFencedProviderWorkerResult worker_result;
@@ -574,41 +658,47 @@ pgrac_fenced_provider_worker_readback(
 		return PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE;
 	*result = PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 	memset(readback, 0, sizeof(*readback));
-	worker_result = run_worker(ops, allow_test_only,
-		PGRAC_FENCED_WORKER_READBACK, false, target, deadline_mono_ns,
-		&message);
-	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK)
-	{
-		*result = (PgracFencedProviderResult) message.provider_result;
+	worker_result = run_worker(ops, allow_test_only, PGRAC_FENCED_WORKER_READBACK, false, target,
+							   record, deadline_mono_ns, &message);
+	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK) {
+		*result = (PgracFencedProviderResult)message.provider_result;
 		*readback = message.payload.readback;
-	}
-	else if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE)
+	} else if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE)
 		*result = PGRAC_FENCED_PROVIDER_UNKNOWN;
 	return worker_result;
 }
 
 static bool
 provider_readback_retryable(PgracFencedProviderWorkerResult worker_result,
-				PgracFencedProviderResult result,
-				const PgracFencedReadbackV1 *readback)
+							PgracFencedProviderResult result, const PgracFencedReadbackV1 *readback)
 {
 	if (worker_result == PGRAC_FENCED_PROVIDER_WORKER_CRASHED)
 		return true;
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		return false;
-	if (result == PGRAC_FENCED_PROVIDER_PENDING ||
-		result == PGRAC_FENCED_PROVIDER_UNKNOWN ||
-		result == PGRAC_FENCED_PROVIDER_IO_ERROR)
+	if (result == PGRAC_FENCED_PROVIDER_PENDING || result == PGRAC_FENCED_PROVIDER_UNKNOWN
+		|| result == PGRAC_FENCED_PROVIDER_IO_ERROR)
 		return true;
-	return result == PGRAC_FENCED_PROVIDER_OK && readback != NULL &&
-		(readback->state == PGRAC_FENCED_TARGET_TRANSITIONING ||
-		 readback->state == PGRAC_FENCED_TARGET_UNKNOWN);
+	return result == PGRAC_FENCED_PROVIDER_OK && readback != NULL
+		   && (readback->state == PGRAC_FENCED_TARGET_TRANSITIONING
+			   || readback->state == PGRAC_FENCED_TARGET_UNKNOWN);
 }
 
 PgracFencedProviderWorkerResult
-pgrac_fenced_provider_worker_readback_retry(
-	const PgracFencedProviderOpsV1 *ops, bool allow_test_only,
-	const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
+pgrac_fenced_provider_worker_readback_retry(const PgracFencedProviderOpsV1 *ops,
+											bool allow_test_only, const PgracFencedTargetV1 *target,
+											uint64_t deadline_mono_ns,
+											PgracFencedProviderResult *result,
+											PgracFencedReadbackV1 *readback)
+{
+	return pgrac_fenced_provider_worker_readback_retry_owned(ops, allow_test_only, target, NULL,
+															 deadline_mono_ns, result, readback);
+}
+
+PgracFencedProviderWorkerResult
+pgrac_fenced_provider_worker_readback_retry_owned(
+	const PgracFencedProviderOpsV1 *ops, bool allow_test_only, const PgracFencedTargetV1 *target,
+	const PgracFencedJournalRecordV1 *record, uint64_t deadline_mono_ns,
 	PgracFencedProviderResult *result, PgracFencedReadbackV1 *readback)
 {
 	PgracFencedProviderWorkerResult worker_result;
@@ -619,23 +709,21 @@ pgrac_fenced_provider_worker_readback_retry(
 	uint64_t now;
 
 	if (result == NULL || readback == NULL)
-		return pgrac_fenced_provider_worker_readback(ops, allow_test_only,
-			target, deadline_mono_ns, result, readback);
-	for (;;)
-	{
-		worker_result = pgrac_fenced_provider_worker_readback(ops,
-			allow_test_only, target, deadline_mono_ns, result, readback);
-		if (!provider_readback_retryable(worker_result, *result, readback) ||
-			!monotonic_now_ns(&now) || now >= deadline_mono_ns)
+		return pgrac_fenced_provider_worker_readback_owned(ops, allow_test_only, target, record,
+														   deadline_mono_ns, result, readback);
+	for (;;) {
+		worker_result = pgrac_fenced_provider_worker_readback_owned(
+			ops, allow_test_only, target, record, deadline_mono_ns, result, readback);
+		if (!provider_readback_retryable(worker_result, *result, readback)
+			|| !monotonic_now_ns(&now) || now >= deadline_mono_ns)
 			return worker_result;
 		delay_ns = delay_ms * UINT64_C(1000000);
 		remaining_ns = deadline_mono_ns - now;
 		if (delay_ns > remaining_ns)
 			delay_ns = remaining_ns;
-		delay.tv_sec = (time_t) (delay_ns / UINT64_C(1000000000));
-		delay.tv_nsec = (long) (delay_ns % UINT64_C(1000000000));
-		while (nanosleep(&delay, &delay) != 0)
-		{
+		delay.tv_sec = (time_t)(delay_ns / UINT64_C(1000000000));
+		delay.tv_nsec = (long)(delay_ns % UINT64_C(1000000000));
+		while (nanosleep(&delay, &delay) != 0) {
 			if (errno != EINTR)
 				return worker_result;
 		}

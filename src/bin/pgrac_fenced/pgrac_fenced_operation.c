@@ -862,8 +862,9 @@ pgrac_fenced_operation_execute_preaccepted(
 			journal_seq, response);
 		return true;
 	}
-	worker_result = pgrac_fenced_provider_worker_actuate(context->provider,
-		context->allow_test_only, false, &resolved, deadline_mono_ns,
+	worker_result = pgrac_fenced_provider_worker_actuate_owned(context->provider,
+		context->allow_test_only, false, &resolved,
+		context->config->format_version == 2 ? &record : NULL, deadline_mono_ns,
 		&provider_result, &native_status);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
@@ -887,8 +888,9 @@ pgrac_fenced_operation_execute_preaccepted(
 	}
 	journal_seq = record.seq;
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(context->provider,
-		context->allow_test_only, &resolved, deadline_mono_ns, &provider_result,
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(context->provider,
+		context->allow_test_only, &resolved,
+		context->config->format_version == 2 ? &record : NULL, deadline_mono_ns, &provider_result,
 		&readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?

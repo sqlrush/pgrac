@@ -1421,7 +1421,7 @@ PGRAC_FENCED_IPMI_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_ipmi.o
 PGRAC_FENCED_PROVIDER_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
-	$(PGRAC_FENCED_IPMI_O)
+	$(PGRAC_FENCED_IPMI_O) $(PGRAC_FENCED_JOURNAL_O)
 test_pgrac_fenced_provider: test_pgrac_fenced_provider.c unit_test.h \
 		$(PGRAC_FENCED_PROVIDER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
@@ -1531,11 +1531,11 @@ pgrac_fenced_live_rejoin_client: pgrac_fenced_live_rejoin_client.c \
 
 test_pgrac_fenced_ipmi: test_pgrac_fenced_ipmi.c unit_test.h \
 		$(PGRAC_FENCED_IPMI_O) \
-		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o $(PGRAC_FENCED_JOURNAL_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
 		$(PGRAC_FENCED_IPMI_O) \
-		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o $(PGRAC_FENCED_JOURNAL_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
 
@@ -1548,11 +1548,11 @@ $(PGRAC_FENCED_IPMI_FEXECVE_O): \
 
 test_pgrac_fenced_ipmi_exec: test_pgrac_fenced_ipmi_exec.c unit_test.h \
 		$(PGRAC_FENCED_IPMI_FEXECVE_O) \
-		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o $(PGRAC_FENCED_JOURNAL_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
 		$(PGRAC_FENCED_IPMI_FEXECVE_O) \
-		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o $(PGRAC_FENCED_JOURNAL_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
 

@@ -48,6 +48,31 @@ static unsigned int resolve_calls;
 static volatile uint32 *shared_provider_counts;
 static volatile uint32 *timeout_stage_entered;
 static bool delay_before_timeout_stage;
+static const char *owned_journal_path;
+static size_t read_journal_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum);
+
+static bool
+callback_matches_durable_event(uint16 kind)
+{
+	PgracFencedJournalRecordV1 records[16];
+	const PgracFencedJournalRecordV1 *actual = pgrac_fenced_provider_callback_record();
+	uint8 observed[768], durable[768];
+	size_t observed_len, durable_len, count;
+	int fd;
+
+	if (owned_journal_path == NULL)
+		return true;
+	fd = open(owned_journal_path, O_RDONLY);
+	if (fd < 0)
+		return false;
+	count = read_journal_records(fd, records, lengthof(records));
+	(void)close(fd);
+	return actual != NULL && count != 0 && actual->record_kind == kind
+		   && pgrac_fenced_journal_frame_encode(actual, observed, sizeof(observed), &observed_len)
+		   && pgrac_fenced_journal_frame_encode(&records[count - 1], durable, sizeof(durable),
+												&durable_len)
+		   && observed_len == durable_len && memcmp(observed, durable, observed_len) == 0;
+}
 
 static PgracFencedProviderResult
 test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
@@ -73,6 +98,8 @@ test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolve
 static PgracFencedProviderResult
 test_actuate(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
 {
+	if (!callback_matches_durable_event(PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED))
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	(void)target;
 	(void)deadline_mono_ns;
 	if (shared_provider_counts != NULL)
@@ -96,6 +123,8 @@ test_readback(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 {
 	uint32 readback_call = 0;
 
+	if (!callback_matches_durable_event(PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT))
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	(void)deadline_mono_ns;
 	memset(out, 0, sizeof(*out));
 	if (shared_provider_counts != NULL)
@@ -1119,8 +1148,10 @@ UT_TEST(test_v2_acquire_persists_one_complete_identity_for_all_events)
 			UT_ASSERT(pgrac_fenced_operation_cancel_preaccepted(&context, &request, &prepared, 16,
 																&response));
 		else {
+			owned_journal_path = path;
 			UT_ASSERT(pgrac_fenced_operation_execute_preaccepted(
 				&context, &request, &prepared, deadline_after_ms(1000), &response));
+			owned_journal_path = NULL;
 			UT_ASSERT_EQ(response.verdict, 1);
 		}
 		count = read_journal_records(fd, records, lengthof(records));
@@ -1247,9 +1278,11 @@ UT_TEST(test_v2_restart_persists_exact_successor_before_redrive)
 	if (shared_provider_counts != MAP_FAILED) {
 		shared_provider_counts[0] = shared_provider_counts[1] = 0;
 		provider_mode = TEST_PROVIDER_EXACT;
+		owned_journal_path = path;
 		UT_ASSERT(pgrac_fenced_operation_execute_preaccepted(
 			&context, &original.intent.request.acquire, &prepared, deadline_after_ms(1000),
 			&response));
+		owned_journal_path = NULL;
 		UT_ASSERT_EQ(response.verdict, 1);
 		/* Old OFF is not an actuation for this attempt, even with exact readback. */
 		UT_ASSERT_EQ(shared_provider_counts[0], 1);

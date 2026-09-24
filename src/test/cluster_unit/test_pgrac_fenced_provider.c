@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "pgrac_fenced_provider.h"
+#include "pgrac_fenced_journal.h"
 
 #undef printf
 #undef fprintf
@@ -27,6 +28,45 @@ UT_DEFINE_GLOBALS();
 static int descendant_pid_fd = -1;
 static uint64_t expected_resolve_deadline;
 static volatile uint32 *retry_state;
+static PgracFencedJournalRecordV1 expected_record;
+static bool expect_record;
+static uint32 context_readback_failures;
+
+static bool
+callback_record_matches(void)
+{
+	const PgracFencedJournalRecordV1 *record = pgrac_fenced_provider_callback_record();
+
+	return expect_record ? record != NULL && memcmp(record, &expected_record, sizeof(*record)) == 0
+						 : record == NULL;
+}
+
+static PgracFencedProviderResult
+context_actuate(const PgracFencedTargetV1 *target, uint64_t deadline, int32 *native_status)
+{
+	(void)target;
+	(void)deadline;
+	retry_state[0]++;
+	*native_status = 57;
+	return callback_record_matches() ? PGRAC_FENCED_PROVIDER_OK
+									 : PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
+}
+
+static PgracFencedProviderResult
+context_readback(const PgracFencedTargetV1 *target, uint64_t deadline, PgracFencedReadbackV1 *out)
+{
+	(void)deadline;
+	retry_state[0]++;
+	if (!callback_record_matches())
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
+	if (retry_state[0] <= context_readback_failures)
+		return PGRAC_FENCED_PROVIDER_UNKNOWN;
+	memset(out, 0, sizeof(*out));
+	out->state = PGRAC_FENCED_TARGET_OFF;
+	out->io_drain_state = PGRAC_FENCED_IO_DRAIN_DRAINED;
+	memcpy(out->observed_target_uuid, target->target_uuid, 16);
+	return PGRAC_FENCED_PROVIDER_OK;
+}
 
 static PgracFencedProviderResult
 test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
@@ -601,6 +641,179 @@ UT_TEST(test_worker_rejects_test_provider_without_test_gate)
 	UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_UNAVAILABLE);
 }
 
+/* PGRAC: catch missing/ambient callback identity and wrong-target execution. */
+static void
+context_fixture(PgracFencedProviderOpsV1 *ops, PgracFencedTargetV1 *target,
+				PgracFencedJournalRecordV1 *record)
+{
+	PgracExternalFenceProtocolBindingV1 binding;
+
+	make_test_ops(ops);
+	ops->provider_id = PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1;
+	ops->actuate_off = context_actuate;
+	ops->actuate_on = context_actuate;
+	ops->readback = context_readback;
+	memset(target, 0, sizeof(*target));
+	target->victim_node_id = 2;
+	target->mapping_generation = 17;
+	memset(target->target_uuid, 0x24, 16);
+	memset(record, 0, sizeof(*record));
+	record->record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED;
+	record->seq = 41;
+	record->event_mono_ns = 900;
+	record->provider_id = 257;
+	record->provider_abi_version = 1;
+	record->mapping_generation = 17;
+	memset(record->operation_id, 0x31, 16);
+	memset(record->daemon_boot_id, 0x32, 16);
+	memset(record->binding_digest, 0x33, 32);
+	memset(record->semantic_config_digest, 0x34, 32);
+	record->intent.kind = PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE;
+	record->intent.attempt = 7;
+	record->intent.system_identifier = 9001;
+	memcpy(record->intent.target_uuid, target->target_uuid, 16);
+	memset(record->intent.protected_set_digest, 0x35, 32);
+	record->intent.request.acquire.need.victim_node_id = 2;
+	record->intent.request.acquire.need.system_identifier = 9001;
+	memset(record->intent.request.acquire.need.protected_set_digest, 0x35, 32);
+	memset(record->intent.request.acquire.request_nonce, 0x36, 16);
+	memset(record->intent.request.acquire.need.canonical_duty_digest, 0x37, 32);
+	record->intent.request.acquire.need.victim_incarnation = 91;
+	record->intent.request.acquire.need.predicate_id = 1;
+	record->intent.request.acquire.need.predicate_version = 1;
+	record->intent.request.acquire.timeout_ms = 1000;
+	UT_ASSERT(pgrac_external_fence_binding_from_request_v1(&record->intent.request.acquire.need,
+														   record->mapping_generation, &binding));
+	UT_ASSERT(pgrac_external_fence_binding_digest_v1(&binding, record->binding_digest));
+	expected_record = *record;
+	expect_record = true;
+	context_readback_failures = 0;
+	retry_state[0] = 0;
+}
+
+UT_TEST(test_owned_callback_is_exact_and_fork_local)
+{
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedTargetV1 target;
+	PgracFencedJournalRecordV1 record;
+	PgracFencedProviderResult result;
+	int32 native;
+
+	context_fixture(&ops, &target, &record);
+	UT_ASSERT_NULL(pgrac_fenced_provider_callback_record());
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(&ops, false, false, &target, &record,
+															deadline_after_ms(1000), &result,
+															&native),
+				 PGRAC_FENCED_PROVIDER_WORKER_OK);
+	UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_OK);
+	UT_ASSERT_EQ(native, 57);
+	UT_ASSERT_EQ(retry_state[0], 1);
+	UT_ASSERT_NULL(pgrac_fenced_provider_callback_record());
+	/* A later legacy callback must not inherit the previous operation. */
+	ops.provider_id = PGRAC_FENCED_PROVIDER_ID_TEST_ONLY;
+	expect_record = false;
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate(&ops, true, false, &target,
+													  deadline_after_ms(1000), &result, &native),
+				 PGRAC_FENCED_PROVIDER_WORKER_OK);
+	UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_OK);
+	UT_ASSERT_EQ(retry_state[0], 2);
+}
+
+UT_TEST(test_owned_readback_retry_keeps_the_same_attempt)
+{
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedTargetV1 target;
+	PgracFencedJournalRecordV1 record;
+	PgracFencedProviderResult result;
+	PgracFencedReadbackV1 readback;
+
+	context_fixture(&ops, &target, &record);
+	record.record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT;
+	record.seq++;
+	expected_record = record;
+	context_readback_failures = 2;
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_readback_retry_owned(
+					 &ops, false, &target, &record, deadline_after_ms(1500), &result, &readback),
+				 PGRAC_FENCED_PROVIDER_WORKER_OK);
+	UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_OK);
+	UT_ASSERT_EQ(retry_state[0], 3);
+	UT_ASSERT_EQ(pgrac_fenced_provider_classify_recovery(result, target.target_uuid, &readback),
+				 PGRAC_FENCED_PROVIDER_TERMINAL_PROVEN);
+	UT_ASSERT_NULL(pgrac_fenced_provider_callback_record());
+}
+
+UT_TEST(test_owned_worker_refuses_inexact_or_unissued_identity)
+{
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedTargetV1 target;
+	PgracFencedJournalRecordV1 original, record;
+	PgracFencedProviderResult result;
+	PgracFencedReadbackV1 readback;
+	int32 native;
+
+	context_fixture(&ops, &target, &original);
+	for (int variant = 0; variant < 13; variant++) {
+		record = original;
+		switch (variant) {
+		case 0:
+			record.seq = 0;
+			break;
+		case 1:
+			record.intent.attempt = 0;
+			break;
+		case 2:
+			record.mapping_generation++;
+			break;
+		case 3:
+			record.intent.target_uuid[0] ^= 1;
+			break;
+		case 4:
+			record.provider_id++;
+			break;
+		case 5:
+			record.provider_abi_version++;
+			break;
+		case 6:
+			memset(record.operation_id, 0, 16);
+			break;
+		case 7:
+			memset(record.daemon_boot_id, 0, 16);
+			break;
+		case 8:
+			record.intent.system_identifier++;
+			break;
+		case 9:
+			record.intent.request.acquire.need.victim_node_id++;
+			break;
+		case 10:
+			record.intent.protected_set_digest[0] ^= 1;
+			break;
+		case 11:
+			record.record_kind = PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+			break;
+		case 12:
+			record.intent.kind = PGRAC_FENCED_JOURNAL_INTENT_NONE;
+			break;
+		}
+		UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(&ops, false, false, &target,
+																&record, deadline_after_ms(1000),
+																&result, &native),
+					 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
+		UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_UNAVAILABLE);
+	}
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(&ops, false, true, &target, &original,
+															deadline_after_ms(1000), &result,
+															&native),
+				 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate(&ops, false, false, &target,
+													  deadline_after_ms(1000), &result, &native),
+				 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_readback(&ops, false, &target,
+													   deadline_after_ms(1000), &result, &readback),
+				 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
+	UT_ASSERT_EQ(retry_state[0], 0);
+}
+
 int
 main(void)
 {
@@ -608,7 +821,7 @@ main(void)
 		= mmap(NULL, sizeof(uint32) * 2, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (retry_state == MAP_FAILED)
 		return 1;
-	UT_PLAN(13);
+	UT_PLAN(16);
 	UT_RUN(test_provider_abi_exact_layout);
 	UT_RUN(test_production_registry_honors_fexecve_gate);
 	UT_RUN(test_test_only_ops_require_explicit_test_validation);
@@ -622,6 +835,9 @@ main(void)
 	UT_RUN(test_worker_timeout_drains_descendant_process_group);
 	UT_RUN(test_worker_success_drains_descendants_after_leader_reap);
 	UT_RUN(test_worker_rejects_test_provider_without_test_gate);
+	UT_RUN(test_owned_callback_is_exact_and_fork_local);
+	UT_RUN(test_owned_readback_retry_keeps_the_same_attempt);
+	UT_RUN(test_owned_worker_refuses_inexact_or_unissued_identity);
 	UT_DONE();
 	(void)munmap((void *)retry_state, sizeof(uint32) * 2);
 	return ut_failed_count == 0 ? 0 : 1;

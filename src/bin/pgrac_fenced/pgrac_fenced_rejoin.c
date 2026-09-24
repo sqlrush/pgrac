@@ -487,8 +487,8 @@ pgrac_fenced_rejoin_cleanup(PgracFencedRejoinContextV1 *context,
 	record.target_state = PGRAC_FENCED_TARGET_OFF;
 	if (!append_owned_record(owner, operation, &record))
 		return false;
-	worker_result = pgrac_fenced_provider_worker_actuate(owner->provider, owner->allow_test_only,
-		false, &operation->target, deadline_mono_ns, &result, &native_status);
+	worker_result = pgrac_fenced_provider_worker_actuate_owned(owner->provider, owner->allow_test_only,
+		false, &operation->target, &operation->last_record, deadline_mono_ns, &result, &native_status);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
 			PGRAC_FENCED_PROVIDER_UNAVAILABLE : PGRAC_FENCED_PROVIDER_UNKNOWN;
@@ -501,8 +501,8 @@ pgrac_fenced_rejoin_cleanup(PgracFencedRejoinContextV1 *context,
 	if (!append_owned_record(owner, operation, &record))
 		return false;
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(owner->provider,
-		owner->allow_test_only, &operation->target, deadline_mono_ns, &result, &readback);
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(owner->provider,
+		owner->allow_test_only, &operation->target, &operation->last_record, deadline_mono_ns, &result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 	{
 		memset(&readback, 0, sizeof(readback));
@@ -786,9 +786,10 @@ pgrac_fenced_rejoin_claim(PgracFencedRejoinContextV1 *context,
 	}
 	operation->target = resolved;
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
 		operation_context->provider, operation_context->allow_test_only,
-		&operation->target, deadline_mono_ns, &provider_result, &readback);
+		&operation->target, operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		deadline_mono_ns, &provider_result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
@@ -1057,9 +1058,10 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 			PGRAC_FENCED_DENY_JOURNAL, response);
 		return true;
 	}
-	worker_result = pgrac_fenced_provider_worker_actuate(
+	worker_result = pgrac_fenced_provider_worker_actuate_owned(
 		operation_context->provider, operation_context->allow_test_only, true,
-		&operation->target, deadline_mono_ns, &provider_result, &native_status);
+		&operation->target, operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		deadline_mono_ns, &provider_result, &native_status);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
@@ -1078,9 +1080,10 @@ pgrac_fenced_rejoin_authorize_on(PgracFencedRejoinContextV1 *context,
 		return true;
 	}
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
 		operation_context->provider, operation_context->allow_test_only,
-		&operation->target, deadline_mono_ns, &provider_result, &readback);
+		&operation->target, operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		deadline_mono_ns, &provider_result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
@@ -1244,9 +1247,10 @@ pgrac_fenced_rejoin_refresh_on(PgracFencedRejoinContextV1 *context,
 	}
 	operation->target = resolved;
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry(
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
 		operation_context->provider, operation_context->allow_test_only,
-		&operation->target, deadline_mono_ns, &provider_result, &readback);
+		&operation->target, operation_context->config->format_version == 2 ? &operation->last_record : NULL,
+		deadline_mono_ns, &provider_result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result ==
 			PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?

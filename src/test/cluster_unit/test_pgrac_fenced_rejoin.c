@@ -31,6 +31,29 @@ static volatile uint32 *provider_state;
 static const char *owned_journal_path;
 static size_t read_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum);
 
+static bool
+callback_matches_durable_event(void)
+{
+	PgracFencedJournalRecordV1 records[30];
+	const PgracFencedJournalRecordV1 *actual = pgrac_fenced_provider_callback_record();
+	uint8 observed[768], durable[768];
+	size_t observed_len, durable_len, count;
+	int fd;
+
+	if (owned_journal_path == NULL)
+		return true;
+	fd = open(owned_journal_path, O_RDONLY);
+	if (fd < 0)
+		return false;
+	count = read_records(fd, records, lengthof(records));
+	(void)close(fd);
+	return actual != NULL && count != 0
+		   && pgrac_fenced_journal_frame_encode(actual, observed, sizeof(observed), &observed_len)
+		   && pgrac_fenced_journal_frame_encode(&records[count - 1], durable, sizeof(durable),
+												&durable_len)
+		   && observed_len == durable_len && memcmp(observed, durable, observed_len) == 0;
+}
+
 static PgracFencedProviderResult
 test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
 			 int32 *native_status)
@@ -48,6 +71,8 @@ test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolve
 static PgracFencedProviderResult
 test_actuate_off(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
 {
+	if (!callback_matches_durable_event())
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	if (owned_journal_path != NULL) {
 		PgracFencedJournalRecordV1 records[30];
 		int fd = open(owned_journal_path, O_RDONLY);
@@ -80,6 +105,8 @@ static PgracFencedProviderResult
 test_readback(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 			  PgracFencedReadbackV1 *readback)
 {
+	if (!callback_matches_durable_event())
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	(void)deadline_mono_ns;
 	provider_state[2]++;
 	if (provider_state[6] > 0) {
@@ -97,6 +124,8 @@ test_readback(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 static PgracFencedProviderResult
 test_actuate_on(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
 {
+	if (!callback_matches_durable_event())
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	if (owned_journal_path != NULL) {
 		PgracFencedJournalRecordV1 records[12];
 		int fd = open(owned_journal_path, O_RDONLY);
