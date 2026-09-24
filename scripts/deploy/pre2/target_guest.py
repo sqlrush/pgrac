@@ -14,6 +14,7 @@ from target_mapping import ProtectedMap
 
 LIBVIRT_VERSION = 10000000
 DOMAIN_SHUTOFF = 5
+DOMAIN_RUNNING = 1
 
 
 @dataclass(frozen=True)
@@ -23,6 +24,17 @@ class GuestOffObservation:
     libvirt_version: int
     state: int
     reason: int
+    observed_mono_ns: int
+
+
+@dataclass(frozen=True)
+class GuestRunningObservation:
+    hypervisor_uuid: str
+    guest_uuid: str
+    libvirt_version: int
+    state: int
+    reason: int
+    runtime_id: int
     observed_mono_ns: int
 
 
@@ -55,17 +67,22 @@ def _host(connection, mapping):
         raise TargetJournalError("TARGET_GUEST_IDENTITY")
 
 
-def _guest(connection, mapping):
+def _guest(connection, mapping, *, running=False):
     domain = connection.lookupByUUIDString(str(uuid.UUID(hex=mapping.guest_uuid)))
     if (_native_uuid(domain.UUIDString()) != mapping.guest_uuid
-            or not _integer(domain.isPersistent(), 1) or not _integer(domain.isActive(), 0)
+            or not _integer(domain.isPersistent(), 1) or not _integer(domain.isActive(), int(running))
             or not _integer(domain.autostart(), 0) or not _integer(domain.hasManagedSaveImage(0), 0)):
-        raise TargetJournalError("TARGET_GUEST_NOT_OFF")
+        raise TargetJournalError("TARGET_GUEST_NOT_RUNNING" if running else "TARGET_GUEST_NOT_OFF")
     state = domain.state(0)
     if (type(state) not in (tuple, list) or len(state) != 2
-            or not _integer(state[0], DOMAIN_SHUTOFF)
+            or not _integer(state[0], DOMAIN_RUNNING if running else DOMAIN_SHUTOFF)
             or type(state[1]) is not int or not 0 <= state[1] <= 0x7fffffff):
-        raise TargetJournalError("TARGET_GUEST_NOT_OFF")
+        raise TargetJournalError("TARGET_GUEST_NOT_RUNNING" if running else "TARGET_GUEST_NOT_OFF")
+    if running:
+        runtime_id = domain.ID()
+        if type(runtime_id) is not int or not 0 < runtime_id < (1 << 32) - 1:
+            raise TargetJournalError("TARGET_GUEST_RUNTIME_ID")
+        return (*state, runtime_id)
     return tuple(state)
 
 
@@ -75,6 +92,19 @@ def observe_off(connection, mapping, deadline_mono_ns):
     Exclusive management ownership and persistent storage denial must outlive
     this readback. Two reads are not an atomic snapshot or future-ON exclusion.
     """
+    return _observe(connection, mapping, deadline_mono_ns, running=False)
+
+
+def observe_running(connection, mapping, deadline_mono_ns):
+    """Native RUNNING only, not rejoin authority, old-I/O drain or database OPEN.
+
+    The current authorized rejoin owner must independently bind its durable gate,
+    new incarnation and target permissions. Runtime IDs are not durable identities.
+    """
+    return _observe(connection, mapping, deadline_mono_ns, running=True)
+
+
+def _observe(connection, mapping, deadline_mono_ns, *, running):
     try:
         if (type(mapping) is not ProtectedMap or mapping.profile != "pre2-kvm-gfs2-v1"
                 or not _hex(mapping.hypervisor_uuid, 32) or not _hex(mapping.guest_uuid, 32)
@@ -82,14 +112,14 @@ def observe_off(connection, mapping, deadline_mono_ns):
                 or time.monotonic_ns() >= deadline_mono_ns):
             raise TargetJournalError("TARGET_GUEST_ARGUMENT")
         _host(connection, mapping)
-        before = _guest(connection, mapping)
+        before = _guest(connection, mapping, running=running)
         _host(connection, mapping)
-        after = _guest(connection, mapping)
+        after = _guest(connection, mapping, running=running)
         now = time.monotonic_ns()
         if before != after or now >= deadline_mono_ns:
             raise TargetJournalError("TARGET_GUEST_CHANGED")
-        return GuestOffObservation(mapping.hypervisor_uuid, mapping.guest_uuid,
-                                   LIBVIRT_VERSION, after[0], after[1], now)
+        observation = GuestRunningObservation if running else GuestOffObservation
+        return observation(mapping.hypervisor_uuid, mapping.guest_uuid, LIBVIRT_VERSION, *after, now)
     except TargetJournalError:
         raise
     except Exception:
