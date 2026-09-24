@@ -184,6 +184,9 @@ extern bool pgrac_fenced_journal_frame_digest(
 /* Internal v2 dispatch; ordinary callers use record_decode. */
 extern bool pgrac_fenced_journal_intent_decode(
 	const uint8 *frame, size_t frame_len, PgracFencedJournalRecordV1 *record);
+extern bool pgrac_fenced_journal_intent_continues(
+	const PgracFencedJournalRecordV1 *previous,
+	const PgracFencedJournalRecordV1 *current);
 extern bool pgrac_fenced_journal_config_digest_v1(
 	const uint8 *config_bytes, size_t config_len,
 	uint8 digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES]);

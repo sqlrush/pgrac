@@ -929,10 +929,140 @@ done:
 	(void)unlink(path);
 }
 
+/* Real file and production replay reducer; no provider callback is permitted. */
+static bool
+seed_owned_pending(PgracFencedOperationContextV1 *context,
+				   PgracFencedJournalReconcileState *pending, PgracFencedJournalRecordV1 *record,
+				   bool rejoin)
+{
+	PgracExternalFenceProtocolBindingV1 binding;
+	uint8 frame[768];
+	PgracFencedJournalRecordV1 decoded;
+
+	memset(record, 0, sizeof(*record));
+	record->record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED;
+	memset(record->operation_id, 0x91, 16);
+	memset(record->daemon_boot_id, 0x92, 16);
+	record->provider_id = 257;
+	record->provider_abi_version = 1;
+	record->provider_result = PGRAC_FENCED_PROVIDER_PENDING;
+	record->event_mono_ns = 1; /* Old daemon clock is not a deadline. */
+	record->mapping_generation = context->config->mapping_generation;
+	memcpy(record->semantic_config_digest, context->semantic_config_digest, 32);
+	record->intent.kind = PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE;
+	record->intent.attempt = 7;
+	record->intent.system_identifier = context->config->system_identifier;
+	memcpy(record->intent.target_uuid, context->config->nodes[2].target_uuid, 16);
+	memcpy(record->intent.protected_set_digest, context->config->nodes[2].protected_set_digest, 32);
+	make_request(context->config, &record->intent.request.acquire);
+	record->intent.request.acquire.need.victim_node_id = 2;
+	memcpy(record->intent.request.acquire.need.protected_set_digest,
+		   record->intent.protected_set_digest, 32);
+	if (!pgrac_external_fence_binding_from_request_v1(&record->intent.request.acquire.need,
+													  record->mapping_generation, &binding)
+		|| !pgrac_external_fence_binding_digest_v1(&binding, record->binding_digest))
+		return false;
+	if (rejoin) {
+		PgracExternalFenceProtocolRejoinFrameV1 *request = &record->intent.request.rejoin;
+		PgracExternalFenceProtocolRejoinBindingV1 rejoin_binding;
+
+		record->record_kind = PGRAC_FENCED_JOURNAL_KIND_INVALIDATED;
+		record->intent.kind = PGRAC_FENCED_JOURNAL_INTENT_REJOIN;
+		memset(&record->intent.request, 0, sizeof(record->intent.request));
+		memset(&rejoin_binding, 0, sizeof(rejoin_binding));
+		request->opcode = PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE;
+		memset(request->transport_nonce, 0x44, 16);
+		request->timeout_ms = 1000;
+		request->old_node_id = rejoin_binding.old_node_id = 2;
+		request->old_incarnation = rejoin_binding.old_incarnation = 91;
+		request->candidate_incarnation = rejoin_binding.candidate_incarnation = 92;
+		rejoin_binding.system_identifier = context->config->system_identifier;
+		rejoin_binding.target_mapping_generation = context->config->mapping_generation;
+		rejoin_binding.predicate_id = 2;
+		rejoin_binding.predicate_version = 1;
+		memcpy(rejoin_binding.protected_set_digest, record->intent.protected_set_digest, 32);
+		if (!pgrac_external_fence_rejoin_binding_digest_v1(&rejoin_binding, record->binding_digest))
+			return false;
+	}
+	if (!pgrac_fenced_operation_append_journal(context, record)
+		|| pread(context->journal_fd, frame, sizeof(frame), 256) != sizeof(frame)
+		|| !pgrac_fenced_journal_record_decode(frame, sizeof(frame), &decoded))
+		return false;
+	pgrac_fenced_journal_reconcile_state_init(pending);
+	return pgrac_fenced_journal_reconcile_observe(pending, &decoded);
+}
+
+UT_TEST(test_v2_startup_preserves_exact_work_and_refuses_mapping_drift)
+{
+	PgracFencedConfigV1 original;
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedConfigResult parsed;
+
+	parsed = pgrac_fenced_config_parse((const uint8 *)fenced_config_v2,
+									   sizeof(fenced_config_v2) - 1, &original);
+#ifndef USE_OPENSSL
+	UT_ASSERT_NE(parsed, PGRAC_FENCED_CONFIG_OK);
+	return;
+#else
+	UT_ASSERT_EQ(parsed, PGRAC_FENCED_CONFIG_OK);
+	if (parsed != PGRAC_FENCED_CONFIG_OK)
+		return;
+#endif
+	make_ops(&ops);
+	ops.provider_id = 257;
+	resolve_calls = 0;
+	for (int variant = 0; variant < 7; ++variant) {
+		PgracFencedConfigV1 config = original;
+		PgracFencedOperationContextV1 context;
+		PgracFencedJournalScanState journal;
+		PgracFencedJournalReconcileState pending;
+		PgracFencedJournalRecordV1 record;
+		struct stat before, after;
+		char path[64];
+		int fd = open_context(&context, &journal, &config, &ops, path);
+
+		if (fd < 0)
+			return;
+		UT_ASSERT(seed_owned_pending(&context, &pending, &record, variant == 6));
+		UT_ASSERT_EQ(fstat(fd, &before), 0);
+		switch (variant) {
+		case 1:
+			config.nodes[2].target_uuid[0] ^= 1;
+			break;
+		case 2:
+			config.nodes[2].protected_set_digest[0] ^= 1;
+			break;
+		case 3:
+			config.system_identifier++;
+			break;
+		case 4:
+			config.mapping_generation++;
+			break;
+		case 5:
+			context.semantic_config_digest[0] ^= 1;
+			break;
+		}
+		UT_ASSERT_EQ(pgrac_fenced_operation_reconcile_startup(&context, &pending),
+					 variant == 0 || variant == 6);
+		UT_ASSERT_EQ(pending.pending_count, 1);
+		UT_ASSERT(memcmp(&pending.pending[0].last_record, &record, sizeof(record)) == 0);
+		UT_ASSERT_EQ(fstat(fd, &after), 0);
+		UT_ASSERT_EQ(before.st_size, after.st_size);
+		UT_ASSERT_EQ(resolve_calls, 0);
+		if (variant == 0 || variant == 6) {
+			UT_ASSERT(context.restart_fresh_readback_required);
+			UT_ASSERT_EQ(context.restart_keep_write_disabled, variant == 6);
+		} else
+			UT_ASSERT(!context.available);
+		(void)close(fd);
+		(void)unlink(path);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(18);
 	UT_RUN(test_scalar_acquire_fsyncs_exact_positive_sequence);
 	UT_RUN(test_action_failure_still_accepts_independent_positive_readback);
 	UT_RUN(test_scalar_readback_retries_transient_results_before_proof);
@@ -950,6 +1080,7 @@ main(void)
 	UT_RUN(test_startup_reconcile_fsyncs_diagnostic_without_provider_action);
 	UT_RUN(test_mapping_reload_is_durable_before_activation);
 	UT_RUN(test_v2_acquire_never_falls_back_to_storage_only_identity);
+	UT_RUN(test_v2_startup_preserves_exact_work_and_refuses_mapping_drift);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

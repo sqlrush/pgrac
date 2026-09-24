@@ -482,6 +482,21 @@ pgrac_fenced_journal_restart_action(
 	*action = PGRAC_FENCED_JOURNAL_RESTART_UNAVAILABLE;
 	if (last_record == NULL)
 		return false;
+	if (last_record->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_REJOIN)
+	{
+		/* A lost caller cannot reopen writes for an unfinished rejoin. */
+		*action = last_record->target_state == PGRAC_FENCED_JOURNAL_TARGET_ON ?
+			PGRAC_FENCED_JOURNAL_RESTART_RETURN_OFF_BEFORE_REJOIN :
+			PGRAC_FENCED_JOURNAL_RESTART_KEEP_WRITE_DISABLED;
+		return true;
+	}
+	if (last_record->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_NONE &&
+		(last_record->record_kind == PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED ||
+		 last_record->record_kind == PGRAC_FENCED_JOURNAL_KIND_INVALIDATED))
+	{
+		*action = PGRAC_FENCED_JOURNAL_RESTART_FRESH_READBACK;
+		return true;
+	}
 	switch (last_record->record_kind)
 	{
 		case PGRAC_FENCED_JOURNAL_KIND_CONFIG_LOADED:
@@ -595,6 +610,9 @@ pgrac_fenced_journal_reconcile_observe(
 	PgracFencedJournalReconcileState *state,
 	const PgracFencedJournalRecordV1 *record)
 {
+	int slot;
+	const PgracFencedJournalRecordV1 *previous;
+
 	if (state == NULL || record == NULL || !state->available ||
 		record->record_kind < PGRAC_FENCED_JOURNAL_KIND_CONFIG_LOADED ||
 		record->record_kind > PGRAC_FENCED_JOURNAL_KIND_RECONCILED)
@@ -602,6 +620,20 @@ pgrac_fenced_journal_reconcile_observe(
 	if (record->record_kind == PGRAC_FENCED_JOURNAL_KIND_CONFIG_LOADED)
 		return true;
 	if (bytes_all_zero(record->operation_id, sizeof(record->operation_id)))
+		goto unavailable;
+	slot = reconcile_find_operation(state, record->operation_id);
+	previous = slot >= 0 ? &state->pending[slot].last_record : NULL;
+	if (record->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_NONE)
+	{
+		if (!pgrac_fenced_journal_intent_continues(previous, record))
+			goto unavailable;
+		if (record->record_kind == PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED)
+			reconcile_remove_operation(state, record->operation_id);
+		else if (!reconcile_remember_operation(state, record))
+			goto unavailable;
+		return true;
+	}
+	if (previous != NULL && previous->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_NONE)
 		goto unavailable;
 	switch (record->record_kind)
 	{

@@ -365,6 +365,31 @@ pgrac_fenced_operation_reserve_proof_generation(
 	return true;
 }
 
+/* PGRAC: never reinterpret an old operation through a replacement mapping. */
+static bool
+pending_intent_matches(const PgracFencedOperationContextV1 *context,
+					   const PgracFencedJournalRecordV1 *record)
+{
+	const PgracFencedJournalIntentV2 *intent = &record->intent;
+	uint8 digest[32];
+	int32 node;
+
+	if (!pgrac_fenced_journal_intent_continues(NULL, record) ||
+		record->provider_id != context->provider->provider_id ||
+		record->provider_abi_version != context->provider->abi_version ||
+		record->mapping_generation != context->config->mapping_generation ||
+		intent->system_identifier != context->config->system_identifier ||
+		memcmp(record->semantic_config_digest, context->semantic_config_digest, 32) != 0)
+		return false;
+	node = intent->kind == PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE ?
+		intent->request.acquire.need.victim_node_id : intent->request.rejoin.old_node_id;
+	return node >= 0 && node < PGRAC_FENCED_MAX_NODES &&
+		context->config->nodes[node].present &&
+		memcmp(intent->target_uuid, context->config->nodes[node].target_uuid, 16) == 0 &&
+		pgrac_fenced_config_protected_set_digest(context->config, node, digest) &&
+		memcmp(intent->protected_set_digest, digest, 32) == 0;
+}
+
 bool
 pgrac_fenced_operation_reconcile_startup(
 	PgracFencedOperationContextV1 *context,
@@ -374,16 +399,32 @@ pgrac_fenced_operation_reconcile_startup(
 	PgracFencedJournalRecordV1 *last;
 	uint64 now;
 	uint32 i;
+	uint32 owned_count = 0;
 
 	if (context == NULL || reconcile == NULL || !context->available ||
 		!reconcile->available ||
 		!pgrac_fenced_journal_reconcile_finish(reconcile))
 		return false;
+	/* Preflight the whole set before a legacy summary can change the journal. */
+	for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
+	{
+		if (!reconcile->pending[i].used ||
+			reconcile->pending[i].last_record.intent.kind == PGRAC_FENCED_JOURNAL_INTENT_NONE)
+			continue;
+		if (!pending_intent_matches(context, &reconcile->pending[i].last_record))
+		{
+			context->available = false;
+			return false;
+		}
+		owned_count++;
+	}
 	for (i = 0; i < PGRAC_FENCED_JOURNAL_MAX_PENDING_OPERATIONS; i++)
 	{
 		if (!reconcile->pending[i].used)
 			continue;
 		last = &reconcile->pending[i].last_record;
+		if (last->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_NONE)
+			continue;
 		if (!monotonic_now_ns(&now))
 			return false;
 		record_base(context, PGRAC_FENCED_JOURNAL_KIND_RECONCILED,
@@ -414,7 +455,7 @@ pgrac_fenced_operation_reconcile_startup(
 	context->restart_keep_write_disabled = reconcile->keep_write_disabled;
 	context->restart_return_off_before_rejoin =
 		reconcile->return_off_before_rejoin;
-	return reconcile->pending_count == 0;
+	return reconcile->pending_count == owned_count;
 }
 
 PgracFencedOperationAcceptResult

@@ -259,3 +259,37 @@ pgrac_fenced_journal_frame_digest(const uint8 *frame, size_t frame_len, uint8 di
 		memset(digest, 0, 32);
 	return ok;
 }
+
+/* PGRAC: a callback cannot replace a different durable need or attempt. */
+bool
+pgrac_fenced_journal_intent_continues(const PgracFencedJournalRecordV1 *previous,
+									  const PgracFencedJournalRecordV1 *current)
+{
+	uint8 before[PGRAC_FENCED_JOURNAL_INTENT_BYTES];
+	uint8 after[PGRAC_FENCED_JOURNAL_INTENT_BYTES];
+	size_t before_len;
+	size_t after_len;
+
+	if (current == NULL || current->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_NONE
+		|| !pgrac_fenced_journal_frame_encode(current, after, sizeof(after), &after_len))
+		return false;
+	if (previous == NULL)
+		return true;
+	if (previous->intent.kind != current->intent.kind || previous->seq >= current->seq
+		|| previous->provider_id != current->provider_id
+		|| previous->provider_abi_version != current->provider_abi_version
+		|| previous->mapping_generation != current->mapping_generation
+		|| memcmp(previous->operation_id, current->operation_id, 16) != 0
+		|| memcmp(previous->binding_digest, current->binding_digest, 32) != 0
+		|| memcmp(previous->semantic_config_digest, current->semantic_config_digest, 32) != 0
+		|| !pgrac_fenced_journal_frame_encode(previous, before, sizeof(before), &before_len)
+		|| before_len != after_len ||
+		/* Canonical request (256), target (16), then sysid/protected-set (40). */
+		memcmp(before + 272, after + 272, 272) != 0 || memcmp(before + 552, after + 552, 40) != 0)
+		return false;
+	if (previous->intent.attempt == current->intent.attempt)
+		return memcmp(previous->daemon_boot_id, current->daemon_boot_id, 16) == 0;
+	return previous->intent.attempt != UINT64_MAX
+		   && current->intent.attempt == previous->intent.attempt + 1
+		   && current->record_kind == PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+}

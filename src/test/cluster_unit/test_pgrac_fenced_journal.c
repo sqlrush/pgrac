@@ -695,6 +695,169 @@ UT_TEST(test_restart_reconcile_keeps_only_last_unfinished_operations)
 	UT_ASSERT(state.available);
 }
 
+static bool
+observe_encoded_intent(PgracFencedJournalReconcileState *state,
+					   const PgracFencedJournalRecordV1 *record)
+{
+	uint8 frame[768];
+	size_t length;
+	PgracFencedJournalRecordV1 decoded;
+	bool encoded = pgrac_fenced_journal_frame_encode(record, frame, sizeof(frame), &length);
+
+	UT_ASSERT(encoded);
+	if (!encoded || !pgrac_fenced_journal_record_decode(frame, length, &decoded))
+		return false;
+	return pgrac_fenced_journal_reconcile_observe(state, &decoded);
+}
+
+UT_TEST(test_owned_intent_survives_accept_cancel_and_reconciliation)
+{
+	const uint16 kinds[] = { 2, 3, 4, 5, 7, 10 };
+	PgracFencedJournalReconcileState state;
+	PgracFencedJournalRecordV1 record;
+	uint8 frame[768];
+
+	UT_ASSERT(make_intent_fixture(frame));
+	UT_ASSERT(pgrac_fenced_journal_record_decode(frame, sizeof(frame), &record));
+	pgrac_fenced_journal_reconcile_state_init(&state);
+	for (size_t i = 0; i < lengthof(kinds); ++i) {
+		record.record_kind = kinds[i];
+		record.seq = i + 1;
+		record.target_state = 4;
+		record.deny_reason = kinds[i] == 7 ? 16 : 9;
+		UT_ASSERT(observe_encoded_intent(&state, &record));
+		UT_ASSERT_EQ(state.pending_count, 1);
+		UT_ASSERT_EQ(state.pending[0].last_record.intent.attempt, 3);
+		UT_ASSERT(pgrac_fenced_journal_reconcile_finish(&state));
+		UT_ASSERT(state.fresh_readback_required);
+	}
+	/* A durable exact proof retires work, not a cancellation or old timestamp. */
+	record.seq++;
+	record.record_kind = 6;
+	record.provider_result = 0;
+	record.target_state = 1;
+	record.io_drain_state = 1;
+	record.deny_reason = 0;
+	record.fresh_until_mono_ns = 101;
+	record.proof_generation = 1;
+	memset(record.target_state_digest, 0x88, 32);
+	UT_ASSERT(observe_encoded_intent(&state, &record));
+	UT_ASSERT_EQ(state.pending_count, 0);
+}
+
+UT_TEST(test_owned_rejoin_keeps_writes_disabled_through_restart)
+{
+	const uint16 kinds[] = { 2, 3, 4, 5, 7, 8, 9, 10 };
+	uint8 frame[768];
+	PgracFencedJournalRecordV1 record;
+
+	UT_ASSERT(make_rejoin_fixture(frame, PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, 2, 91, 92));
+	UT_ASSERT(pgrac_fenced_journal_record_decode(frame, sizeof(frame), &record));
+	for (size_t i = 0; i < lengthof(kinds); ++i) {
+		PgracFencedJournalReconcileState state;
+
+		pgrac_fenced_journal_reconcile_state_init(&state);
+		record.record_kind = kinds[i];
+		record.target_state
+			= kinds[i] == 9 ? PGRAC_FENCED_JOURNAL_TARGET_ON : PGRAC_FENCED_JOURNAL_TARGET_UNKNOWN;
+		UT_ASSERT(observe_encoded_intent(&state, &record));
+		UT_ASSERT(pgrac_fenced_journal_reconcile_finish(&state));
+		UT_ASSERT_EQ(state.pending_count, 1);
+		UT_ASSERT(state.fresh_readback_required);
+		UT_ASSERT(state.keep_write_disabled);
+		UT_ASSERT_EQ(state.return_off_before_rejoin, kinds[i] == 9);
+	}
+}
+
+UT_TEST(test_pending_intent_rejects_identity_drift_without_erasing_work)
+{
+	PgracFencedJournalRecordV1 original;
+	uint8 frame[768];
+
+	UT_ASSERT(make_intent_fixture(frame));
+	UT_ASSERT(pgrac_fenced_journal_record_decode(frame, sizeof(frame), &original));
+	for (int variant = 0; variant < 6; ++variant) {
+		PgracFencedJournalReconcileState state;
+		PgracFencedJournalRecordV1 changed = original;
+		PgracExternalFenceProtocolBindingV1 binding;
+
+		pgrac_fenced_journal_reconcile_state_init(&state);
+		UT_ASSERT(observe_encoded_intent(&state, &original));
+		changed.seq++;
+		switch (variant) {
+		case 0:
+			changed.intent.target_uuid[0] ^= 1;
+			break;
+		case 1:
+			changed.semantic_config_digest[0] ^= 1;
+			break;
+		case 2:
+			changed.mapping_generation++;
+			break;
+		case 3:
+			changed.intent.request.acquire.need.victim_incarnation++;
+			break;
+		case 4:
+			changed.intent.request.acquire.request_nonce[0] ^= 1;
+			break;
+		case 5:
+			changed.intent.request.acquire.timeout_ms++;
+			break;
+		}
+		UT_ASSERT(pgrac_external_fence_binding_from_request_v1(
+			&changed.intent.request.acquire.need, changed.mapping_generation, &binding));
+		UT_ASSERT(pgrac_external_fence_binding_digest_v1(&binding, changed.binding_digest));
+		UT_ASSERT(!observe_encoded_intent(&state, &changed));
+		UT_ASSERT(!state.available);
+		UT_ASSERT_EQ(state.pending_count, 1);
+		UT_ASSERT(memcmp(&state.pending[0].last_record, &original, sizeof(original)) == 0);
+	}
+}
+
+UT_TEST(test_pending_attempt_cannot_be_replaced_by_late_or_legacy_completion)
+{
+	PgracFencedJournalRecordV1 original;
+	uint8 frame[768];
+
+	UT_ASSERT(make_intent_fixture(frame));
+	UT_ASSERT(pgrac_fenced_journal_record_decode(frame, sizeof(frame), &original));
+	for (int variant = 0; variant < 4; ++variant) {
+		PgracFencedJournalReconcileState state;
+		PgracFencedJournalRecordV1 changed = original;
+
+		pgrac_fenced_journal_reconcile_state_init(&state);
+		UT_ASSERT(observe_encoded_intent(&state, &original));
+		changed.seq++;
+		if (variant == 3) {
+			memset(&changed.intent, 0, sizeof(changed.intent));
+			changed.record_kind = 7;
+			UT_ASSERT(!pgrac_fenced_journal_reconcile_observe(&state, &changed));
+		} else {
+			changed.intent.attempt = variant == 0 ? 2 : variant == 1 ? 4 : 5;
+			changed.record_kind = variant == 2 ? 2 : 4;
+			UT_ASSERT(!observe_encoded_intent(&state, &changed));
+		}
+		UT_ASSERT_EQ(state.pending_count, 1);
+		UT_ASSERT_EQ(state.pending[0].last_record.intent.attempt, 3);
+		UT_ASSERT(!state.available);
+	}
+	{
+		PgracFencedJournalReconcileState state;
+		PgracFencedJournalRecordV1 next = original;
+
+		pgrac_fenced_journal_reconcile_state_init(&state);
+		UT_ASSERT(observe_encoded_intent(&state, &original));
+		next.seq++;
+		next.intent.attempt = 4;
+		next.record_kind = 2;
+		/* The new daemon owns a fresh attempt, not the previous callback. */
+		next.daemon_boot_id[0] ^= 1;
+		UT_ASSERT(observe_encoded_intent(&state, &next));
+		UT_ASSERT_EQ(state.pending_count, 1);
+		UT_ASSERT_EQ(state.pending[0].last_record.intent.attempt, 4);
+	}
+}
+
 UT_TEST(test_rotation_seals_exact_name_and_creates_new_active)
 {
 	PgracFencedJournalScanState state;
@@ -993,7 +1156,7 @@ UT_TEST(test_sealed_name_parser_is_canonical_and_full_segment_only)
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(33);
 	UT_RUN(test_journal_exact_codec_roundtrip);
 	UT_RUN(test_restart_decodes_exact_persisted_intent);
 	UT_RUN(test_intent_codec_keeps_complete_identity_and_capacity);
@@ -1014,6 +1177,10 @@ main(void)
 	UT_RUN(test_append_requests_rotation_at_exact_segment_limit);
 	UT_RUN(test_reconcile_actions_cover_all_durable_record_kinds);
 	UT_RUN(test_restart_reconcile_keeps_only_last_unfinished_operations);
+	UT_RUN(test_owned_intent_survives_accept_cancel_and_reconciliation);
+	UT_RUN(test_owned_rejoin_keeps_writes_disabled_through_restart);
+	UT_RUN(test_pending_intent_rejects_identity_drift_without_erasing_work);
+	UT_RUN(test_pending_attempt_cannot_be_replaced_by_late_or_legacy_completion);
 	UT_RUN(test_rotation_seals_exact_name_and_creates_new_active);
 	UT_RUN(test_ninth_rotation_fails_closed_without_rename);
 	UT_RUN(test_semantic_config_digest_has_exact_domain_and_length);
