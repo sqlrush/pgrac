@@ -15,13 +15,16 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from target_journal import DrainIdentity, RejoinIntent, TargetJournal, TargetJournalError
+from target_command import decode_command
 
 
 class RealOwnerSequenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        with tempfile.NamedTemporaryFile(prefix="pgrac-owner-trace-") as trace:
-            result = subprocess.run([EXECUTABLE, str(trace.fileno())], pass_fds=(trace.fileno(),),
+        with (tempfile.NamedTemporaryFile(prefix="pgrac-owner-trace-") as trace,
+              tempfile.NamedTemporaryFile(prefix="pgrac-owner-command-") as commands):
+            result = subprocess.run([EXECUTABLE, str(trace.fileno()), str(commands.fileno())],
+                                    pass_fds=(trace.fileno(), commands.fileno()),
                                     capture_output=True, text=True, timeout=30)
             if result.returncode != 0 or "# All 10 tests passed." not in result.stdout:
                 raise AssertionError(result.stdout + result.stderr)
@@ -36,6 +39,8 @@ class RealOwnerSequenceTests(unittest.TestCase):
                                          int(generation), digest, ("11" * 32, "22" * 32))
                 intent = RejoinIntent(int(sysid), int(node), int(old), int(candidate), gate)
                 cls.records.append((call, identity, intent, int(opcode), int(state)))
+            commands.seek(0)
+            cls.commands = [decode_command(raw) for raw in commands.read().splitlines(keepends=True)]
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="pgrac-real-owner-")
@@ -100,6 +105,29 @@ class RealOwnerSequenceTests(unittest.TestCase):
         self.journal.supersede_rejoin(successor, intent.candidate_incarnation)
         self.assertEqual(self.journal.denied()[0].phases, (0, 0))
         self.assertFalse(self.journal.completion_recorded(successor.operation_id, "cc" * 16))
+
+    def test_actual_callbacks_encode_exact_canonical_target_commands(self):
+        self.assertEqual(len(self.commands), len(self.records))
+        for command, (call, identity, intent, opcode, state) in zip(self.commands, self.records):
+            self.assertEqual(command["operation_id"], identity.operation_id)
+            self.assertEqual(command["attempt"], identity.attempt)
+            self.assertEqual(command["daemon_boot_id"], identity.daemon_boot_id)
+            self.assertEqual(command["mapping_generation"], identity.mapping_generation)
+            self.assertEqual(command["protected_set_digest"], identity.protected_set_digest)
+            self.assertEqual(command["system_identifier"], intent.system_identifier)
+            self.assertEqual(command["node_id"], intent.old_node_id)
+            self.assertEqual(command["target_boot_id"], "cc" * 16)
+            self.assertEqual(command["challenge"], "dd" * 16)
+            expected = "rejoin_prepare_revoke" if call == "off" else (
+                "rejoin_restore" if call == "on" else "complete_off" if opcode == 1 else (
+                    "rejoin_complete_off" if state == 1 else "rejoin_running"))
+            self.assertEqual(command["action"], expected)
+            if opcode != 1:
+                self.assertEqual(command["old_incarnation"], intent.old_incarnation)
+                self.assertEqual(command["candidate_incarnation"], intent.candidate_incarnation)
+                self.assertEqual(command["rejoin_gate_digest"], intent.rejoin_gate_digest)
+            if expected == "rejoin_running":
+                self.assertEqual(command["owner_phase"], "authorize" if opcode == 5 else "refresh")
 
 
 if __name__ == "__main__":

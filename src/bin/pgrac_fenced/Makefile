@@ -20,6 +20,8 @@ FENCED_OBJS += pgrac_fenced_rejoin_async.o pgrac_fenced_coordinator.o \
 	pgrac_fenced_rejoin_coordinator.o pgrac_fenced_drain.o pgrac_fenced_pacemaker.o
 # PGRAC: versioned complete intent remains in the one existing journal chain.
 FENCED_OBJS += pgrac_fenced_journal_intent.o
+# PGRAC: the target management channel consumes the existing durable C owner.
+FENCED_OBJS += pgrac_fenced_target_command.o
 FENCEDCTL_OBJS = pgrac-fencedctl.o pgrac_fenced_ctl.o \
 	pgrac_fenced_core.o pgrac_fenced_journal.o pgrac_fenced_journal_intent.o \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol.o

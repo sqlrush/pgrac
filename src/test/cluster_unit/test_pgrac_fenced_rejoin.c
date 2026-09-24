@@ -18,6 +18,7 @@
 #include <unistd.h>
 
 #include "pgrac_fenced_rejoin.h"
+#include "pgrac_fenced_target_command.h"
 
 #undef printf
 #undef fprintf
@@ -32,6 +33,7 @@ UT_DEFINE_GLOBALS();
 static volatile uint32 *provider_state;
 static const char *owned_journal_path;
 static int target_trace_fd = -1;
+static int target_command_fd = -1;
 static size_t read_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum);
 
 /* Optional scratch-fd bridge: records come from the actual fork-local owner. */
@@ -43,11 +45,40 @@ trace_target_owner(const char *call)
 	char op[33], boot[33], guest[33], digest[65], gate[65];
 	static const char hex[] = "0123456789abcdef";
 
-	if (target_trace_fd < 0 || record == NULL)
+	if ((target_trace_fd < 0 && target_command_fd < 0) || record == NULL)
 		return true;
 	if (record->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN)
 		return false;
 	request = &record->intent.request.rejoin;
+	if (target_command_fd >= 0) {
+		PgracFencedTargetV1 target;
+		PgracFencedTargetCommand action;
+		uint8 boot[16], challenge[16];
+		char command[PGRAC_TARGET_COMMAND_MAX_BYTES];
+		size_t length;
+		memset(&target, 0, sizeof(target));
+		memcpy(target.target_uuid, record->intent.target_uuid, 16);
+		target.victim_node_id = request->old_node_id;
+		target.mapping_generation = record->mapping_generation;
+		memset(boot, 0xcc, 16);
+		memset(challenge, 0xdd, 16);
+		if (strcmp(call, "off") == 0)
+			action = PGRAC_TARGET_REJOIN_PREPARE_REVOKE;
+		else if (strcmp(call, "on") == 0)
+			action = PGRAC_TARGET_REJOIN_RESTORE;
+		else if (request->opcode == PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE)
+			action = PGRAC_TARGET_COMPLETE_OFF;
+		else if (record->target_state == PGRAC_FENCED_TARGET_OFF)
+			action = PGRAC_TARGET_REJOIN_COMPLETE_OFF;
+		else
+			action = PGRAC_TARGET_REJOIN_RUNNING;
+		if (!pgrac_fenced_target_command_encode(action, record, &target, boot, challenge,
+											  command, sizeof(command), &length)
+			|| write(target_command_fd, command, length) != (ssize_t)length)
+			return false;
+	}
+	if (target_trace_fd < 0)
+		return true;
 	for (size_t i = 0; i < 32; ++i) {
 		digest[2 * i] = hex[record->intent.protected_set_digest[i] >> 4];
 		digest[2 * i + 1] = hex[record->intent.protected_set_digest[i] & 15];
@@ -968,19 +999,23 @@ UT_TEST(test_owned_cleanup_needs_new_exact_off_and_drain_not_old_on)
 int
 main(int argc, char **argv)
 {
-	if (argc == 2) {
+	if (argc > 3)
+		return 2;
+	for (int n = 1; n < argc; n++) {
 		char *end;
-		long value = strtol(argv[1], &end, 10);
+		long value = strtol(argv[n], &end, 10);
 		struct stat status;
 
-		if (*argv[1] == '\0' || *end != '\0' || value < 3 || value > INT_MAX
+		if (*argv[n] == '\0' || *end != '\0' || value < 3 || value > INT_MAX
 			|| fstat((int)value, &status) != 0 || !S_ISREG(status.st_mode)
 			|| status.st_uid != geteuid() || status.st_nlink != 1
 			|| (status.st_mode & 0777) != 0600)
 			return 2;
-		target_trace_fd = (int)value;
-	} else if (argc != 1)
-		return 2;
+		if (n == 1)
+			target_trace_fd = (int)value;
+		else
+			target_command_fd = (int)value;
+	}
 	provider_state
 		= mmap(NULL, sizeof(uint32) * 9, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (provider_state == MAP_FAILED)

@@ -48,6 +48,7 @@ endif
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
         test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
+        test_pgrac_fenced_target_command \
         test_cluster_update_trace test_cluster_cr_dependency \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
@@ -385,6 +386,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_edge test_cluster_port_runtime,$(
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker,$(SIMPLE_TESTS))
+# PGRAC: production journal validation is linked into target command tests.
+SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_command,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_epq_wait,$(SIMPLE_TESTS))
@@ -1427,6 +1430,14 @@ test_pgrac_fenced_schedule: test_pgrac_fenced_schedule.c unit_test.h \
 PGRAC_FENCED_JOURNAL_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal_intent.o
+# PGRAC: real frontend command encoder, not a test-only schema implementation.
+PGRAC_FENCED_TARGET_COMMAND_O = $(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_command.o
+test_pgrac_fenced_target_command: test_pgrac_fenced_target_command.c unit_test.h \
+		$(PGRAC_FENCED_TARGET_COMMAND_O) $(PGRAC_FENCED_JOURNAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(PGRAC_FENCED_TARGET_COMMAND_O) $(PGRAC_FENCED_JOURNAL_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(LDFLAGS) $(LIBS) -o $@
 PGRAC_FENCED_RUNTIME_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_runtime.o
 test_pgrac_fenced_journal: test_pgrac_fenced_journal.c unit_test.h \
@@ -1475,10 +1486,10 @@ test_pgrac_fenced_operation: test_pgrac_fenced_operation.c unit_test.h \
 PGRAC_FENCED_REJOIN_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_rejoin.o
 test_pgrac_fenced_rejoin: test_pgrac_fenced_rejoin.c unit_test.h \
-		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O)
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O) $(PGRAC_FENCED_TARGET_COMMAND_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
-		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O) \
+		$(PGRAC_FENCED_OPERATION_O) $(PGRAC_FENCED_REJOIN_O) $(PGRAC_FENCED_TARGET_COMMAND_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
 
