@@ -12,9 +12,14 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres_fe.h"
+#include <limits.h>
 #include "common/pgrac_fence_map.h"
 #include "pgrac_fenced_drain.h"
 #include "pgrac_fenced_drain_sign_filter.h"
+#ifndef WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #ifdef USE_OPENSSL
 #include <openssl/crypto.h>
@@ -106,18 +111,65 @@ done:
 #endif
 }
 
+static bool
+seed_descriptor(const char *text, int *fd)
+{
+	unsigned value = 0;
+	if (text == NULL || *text == '\0' || (*text == '0' && text[1] != '\0'))
+		return false;
+	for (size_t n = 0; text[n] != '\0'; ++n) {
+		unsigned digit = (unsigned char)text[n] - '0';
+		if (digit > 9 || value > ((unsigned)INT_MAX - digit) / 10)
+			return false;
+		value = value * 10 + digit;
+	}
+	if (value < 3)
+		return false;
+	*fd = (int)value;
+	return true;
+}
+
+static bool
+read_seed(int fd, uint8 seed[32])
+{
+#ifndef WIN32
+	struct stat before, after;
+	if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_uid != geteuid()
+		|| (before.st_mode & 07777) != 0600 || before.st_nlink != 1 || before.st_size != 32)
+		return false;
+	if (pread(fd, seed, 32, 0) != 32 || fstat(fd, &after) != 0)
+		return false;
+	/*
+	 * Offset and atime are not identity. Exact pinned public key comparison
+	 * also rejects any changed private bytes before a signature can escape.
+	 */
+	return before.st_dev == after.st_dev && before.st_ino == after.st_ino
+		   && before.st_uid == after.st_uid && before.st_gid == after.st_gid
+		   && before.st_mode == after.st_mode && before.st_nlink == after.st_nlink
+		   && before.st_size == after.st_size && before.st_mtime == after.st_mtime
+		   && before.st_ctime == after.st_ctime;
+#else
+	(void)fd;
+	(void)seed;
+	return false;
+#endif
+}
+
 int
 pgrac_fenced_drain_sign_filter(int argc, char *const *argv, FILE *input, FILE *output)
 {
 	uint8 incoming[32 + PGRAC_DRAIN_FRAME_MAX_BYTES - 64 + 1];
 	uint8 frame[PGRAC_DRAIN_FRAME_MAX_BYTES];
 	uint8 key[32];
-	size_t length, body;
-	int result = 77;
+	size_t length, body, prefix = argc == 3 ? 32 : 0;
+	int result = 77, seed_fd = -1;
 
-	if (argc != 2 || argv == NULL || input == NULL || output == NULL || !public_key(argv[1], key))
+	if ((argc != 2 && argc != 3) || argv == NULL || input == NULL || output == NULL
+		|| !public_key(argv[1], key) || (argc == 3 && !seed_descriptor(argv[2], &seed_fd)))
 		return 2;
-	length = fread(incoming, 1, sizeof(incoming), input);
+	if (argc == 3 && !read_seed(seed_fd, incoming))
+		goto done;
+	length = prefix + fread(incoming + prefix, 1, sizeof(incoming) - prefix, input);
 	if (ferror(input) || !feof(input) || length >= sizeof(incoming)
 		|| length < 32 + PGRAC_DRAIN_FRAME_HEADER_BYTES)
 		goto done;

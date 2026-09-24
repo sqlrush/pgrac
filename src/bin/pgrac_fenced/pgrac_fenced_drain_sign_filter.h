@@ -13,6 +13,7 @@
 #ifndef PGRAC_FENCED_DRAIN_SIGN_FILTER_H
 #define PGRAC_FENCED_DRAIN_SIGN_FILTER_H
 
+/* PUBLIC_KEY [SEED_FD]: optional fd mode never copies key bytes into the owner. */
 extern int pgrac_fenced_drain_sign_filter(int argc, char *const *argv, FILE *input, FILE *output);
 
 #endif

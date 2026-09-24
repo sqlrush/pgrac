@@ -1,6 +1,6 @@
 /*-------------------------------------------------------------------------
  * pgrac-fenced-drain-sign.c
- *    Non-setuid target signing filter. The owner supplies the secret by pipe.
+ *    Non-setuid signing filter. Owner supplies a secret pipe or protected fd.
  *
  * Author: SqlRush <sqlrush@gmail.com>
  * Portions Copyright (c) 2026, pgrac contributors

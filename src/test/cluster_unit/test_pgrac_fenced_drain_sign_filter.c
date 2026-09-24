@@ -13,6 +13,9 @@
 #include "postgres_fe.h"
 #include "pgrac_fenced_drain.h"
 #include "pgrac_fenced_drain_sign_filter.h"
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #ifdef USE_OPENSSL
 #include <openssl/evp.h>
 #endif
@@ -227,10 +230,84 @@ UT_TEST(test_stream_errors_never_report_success)
 	fclose(bad_input);
 }
 
+static void
+run_descriptor(const uint8 *input, size_t length, char *hex, int fd, int expected)
+{
+	FILE *in = tmpfile(), *out = tmpfile();
+	char descriptor[32];
+	char *argv[] = { "sign-filter", hex, descriptor, NULL };
+	uint8 result[PGRAC_DRAIN_FRAME_MAX_BYTES + 1] = { 0 };
+	size_t size;
+	UT_ASSERT(in != NULL && out != NULL);
+	snprintf(descriptor, sizeof(descriptor), "%d", fd);
+	UT_ASSERT_EQ(fwrite(input + 32, 1, length - 32, in), length - 32);
+	rewind(in);
+	UT_ASSERT_EQ(pgrac_fenced_drain_sign_filter(3, argv, in, out), expected);
+	rewind(out);
+	size = fread(result, 1, sizeof(result), out);
+	if (expected == 0) {
+		UT_ASSERT_EQ(size, length - 32 + 64);
+		UT_ASSERT(memcmp(result, input + 32, length - 32) == 0);
+	} else
+		UT_ASSERT_EQ(size, 0);
+	fclose(in);
+	fclose(out);
+}
+
+UT_TEST(test_owned_seed_descriptor_preserves_offset_and_checks_contents)
+{
+	uint8 input[32 + PGRAC_DRAIN_FRAME_MAX_BYTES + 1], key[32];
+	char hex[65], path[] = "/tmp/pgrac-drain-key-XXXXXX";
+	PgracFencedDrainIdentityV1 identity;
+	size_t length = fixture(input, 4, key, hex, &identity);
+	int fd = mkstemp(path);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(fchmod(fd, 0600), 0);
+	UT_ASSERT_EQ(write(fd, input, 32), 32);
+	UT_ASSERT_EQ(lseek(fd, 7, SEEK_SET), 7);
+#ifdef USE_OPENSSL
+	run_descriptor(input, length, hex, fd, 0);
+#else
+	run_descriptor(input, length, hex, fd, 77);
+#endif
+	UT_ASSERT_EQ(lseek(fd, 0, SEEK_CUR), 7);
+	UT_ASSERT_EQ(pwrite(fd, "x", 1, 0), 1);
+	run_descriptor(input, length, hex, fd, 77);
+	close(fd);
+	unlink(path);
+}
+
+UT_TEST(test_unprotected_or_nonregular_seed_descriptor_never_signs)
+{
+	uint8 input[32 + PGRAC_DRAIN_FRAME_MAX_BYTES + 1], key[32];
+	char hex[65], path[] = "/tmp/pgrac-drain-key-XXXXXX";
+	PgracFencedDrainIdentityV1 identity;
+	size_t length = fixture(input, 4, key, hex, &identity);
+	int fd = mkstemp(path), pipefd[2];
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, input, 32), 32);
+	UT_ASSERT_EQ(fchmod(fd, 0640), 0);
+	run_descriptor(input, length, hex, fd, 77);
+	UT_ASSERT_EQ(fchmod(fd, 0600), 0);
+	UT_ASSERT_EQ(ftruncate(fd, 31), 0);
+	run_descriptor(input, length, hex, fd, 77);
+	UT_ASSERT_EQ(ftruncate(fd, 33), 0);
+	run_descriptor(input, length, hex, fd, 77);
+	UT_ASSERT_EQ(ftruncate(fd, 32), 0);
+	UT_ASSERT_EQ(unlink(path), 0); /* No remaining protected pathname. */
+	run_descriptor(input, length, hex, fd, 77);
+	close(fd);
+	UT_ASSERT_EQ(pipe(pipefd), 0);
+	/* No bytes and writer stays open: refusal must not read a blocking pipe. */
+	run_descriptor(input, length, hex, pipefd[0], 77);
+	close(pipefd[0]);
+	close(pipefd[1]);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(9);
 	UT_RUN(test_real_signature_and_maximum_routes);
 	UT_RUN(test_every_truncation_and_extra_tail_emits_nothing);
 	UT_RUN(test_incomplete_or_on_facts_cannot_be_signed);
@@ -238,6 +315,8 @@ main(void)
 	UT_RUN(test_independently_pinned_key_must_match_the_seed);
 	UT_RUN(test_bad_invocations_are_refused_before_output);
 	UT_RUN(test_stream_errors_never_report_success);
+	UT_RUN(test_owned_seed_descriptor_preserves_offset_and_checks_contents);
+	UT_RUN(test_unprotected_or_nonregular_seed_descriptor_never_signs);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
