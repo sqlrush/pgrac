@@ -12,6 +12,7 @@
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_shared_config.h"
 #include "common/cryptohash.h"
+#include "storage/fd.h"
 
 #undef printf
 #undef snprintf
@@ -22,6 +23,18 @@ UT_DEFINE_GLOBALS();
 static bool held = true;
 static LOCKMODE held_mode = ShareLock;
 static unsigned allocations;
+bool enableFsync = true;
+static unsigned sync_calls, fail_sync;
+
+int
+pg_fsync(int fd)
+{
+	if (++sync_calls == fail_sync) {
+		errno = EIO;
+		return -1;
+	}
+	return fsync(fd);
+}
 
 bool
 cluster_cf_held_is_clusterwide(LOCKMODE mode)
@@ -482,10 +495,294 @@ UT_TEST(test_directory_guards)
 	}
 }
 
+static uint8 operation[16] = { 0x55, 0x12, 0x34 };
+static char staged_file[MAXPGPATH];
+
+static void
+stage_paths(const ClusterSharedConfigStage *stage, char *final, char *temp)
+{
+	char hex[65];
+	for (int i = 0; i < 32; ++i)
+		snprintf(hex + 2 * i, 3, "%02x", stage->ref.sha256[i]);
+	snprintf(final, MAXPGPATH, "%s/global/config_images/" UINT64_FORMAT "-%s.conf", root,
+			 stage->ref.identity.generation, hex);
+	for (int i = 0; i < 16; ++i)
+		snprintf(hex + 2 * i, 3, "%02x", stage->operation_uuid[i]);
+	snprintf(temp, MAXPGPATH, "%s/global/config_images/.staging/%s.tmp", root, hex);
+}
+static void
+setup_stage(void)
+{
+	char path[MAXPGPATH], hex[33];
+	setup_file();
+	snprintf(path, sizeof(path), "%s/global/config_images/.staging", root);
+	if (mkdir(path, 0700))
+		abort();
+	for (int i = 0; i < 16; ++i)
+		snprintf(hex + 2 * i, 3, "%02x", operation[i]);
+	snprintf(staged_file, sizeof(staged_file), "%s/%s.tmp", path, hex);
+	sync_calls = fail_sync = 0;
+	enableFsync = true;
+}
+static void
+cleanup_stage(void)
+{
+	char path[MAXPGPATH];
+	(void)unlink(staged_file);
+	snprintf(path, sizeof(path), "%s/global/config_images/.staging", root);
+	(void)rmdir(path);
+	cleanup_file();
+	UT_ASSERT_EQ(allocations, 0);
+}
+static bool
+prepare_stage(ClusterSharedConfigStage *stage)
+{
+	ClusterControlRootResult result = cluster_shared_config_prepare(
+		root, file_bytes, strlen(file_bytes), &file_ref, operation, stage);
+	UT_ASSERT_EQ(result, 0);
+	return result == 0;
+}
+
+UT_TEST(test_prepare_install_and_cancel_preserves_formal)
+{
+	ClusterSharedConfigStage stage;
+	ClusterSharedConfigImage image;
+	struct stat st;
+	setup_stage();
+	(void)unlink(object);
+	if (!prepare_stage(&stage)) {
+		cleanup_stage();
+		return;
+	}
+	UT_ASSERT_EQ(stage.owner_pid, getpid());
+	UT_ASSERT_EQ(stage.bytes, strlen(file_bytes));
+	UT_ASSERT_EQ(stat(staged_file, &st), 0);
+	UT_ASSERT_EQ(st.st_size, stage.bytes);
+	UT_ASSERT(access(object, F_OK) != 0);
+	UT_ASSERT_EQ(cluster_shared_config_install(root, &stage),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	held_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_shared_config_install(root, &stage), 0);
+	UT_ASSERT(access(staged_file, F_OK) != 0);
+	UT_ASSERT_EQ(cluster_shared_config_read_locked(root, &file_ref, &image), 0);
+	cluster_shared_config_free(&image);
+	UT_ASSERT_EQ(cluster_shared_config_discard(root, &stage), 0);
+	UT_ASSERT_EQ(stage.state, 0);
+	UT_ASSERT_EQ(access(object, F_OK), 0);
+	UT_ASSERT(cluster_shared_config_install(root, &stage) != 0);
+	cleanup_stage();
+}
+
+UT_TEST(test_no_clobber_and_identical_retry)
+{
+	ClusterSharedConfigStage stage;
+	struct stat before, after;
+	for (int n = 0; n < 2; ++n) {
+		setup_stage();
+		if (n == 1)
+			write_file(object, "foreign", 7);
+		UT_ASSERT_EQ(stat(object, &before), 0);
+		if (!prepare_stage(&stage)) {
+			cleanup_stage();
+			continue;
+		}
+		held_mode = ExclusiveLock;
+		if (n == 0)
+			UT_ASSERT_EQ(cluster_shared_config_install(root, &stage), 0);
+		else
+			UT_ASSERT(cluster_shared_config_install(root, &stage) != 0);
+		UT_ASSERT_EQ(stat(object, &after), 0);
+		UT_ASSERT_EQ(before.st_ino, after.st_ino);
+		UT_ASSERT_EQ(before.st_size, after.st_size);
+		UT_ASSERT_EQ(cluster_shared_config_discard(root, &stage), 0);
+		cleanup_stage();
+	}
+}
+
+UT_TEST(test_same_generation_different_hash_objects)
+{
+	ClusterSharedConfigStage first, second;
+	ClusterSharedConfigRef other;
+	ClusterSharedConfigImage image;
+	uint8 uuid[16] = { 0x56 };
+	char bytes[1024], final[MAXPGPATH], temp[MAXPGPATH];
+	setup_stage();
+	if (!prepare_stage(&first)) {
+		cleanup_stage();
+		return;
+	}
+	fixture(bytes, sizeof(bytes), "common.cluster.enabled='off'\n", &other);
+	UT_ASSERT_EQ(cluster_shared_config_prepare(root, bytes, strlen(bytes), &other, uuid, &second),
+				 0);
+	if (!second.state) {
+		cluster_shared_config_discard(root, &first);
+		cleanup_stage();
+		return;
+	}
+	held_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_shared_config_install(root, &first), 0);
+	UT_ASSERT_EQ(cluster_shared_config_install(root, &second), 0);
+	UT_ASSERT(memcmp(first.ref.sha256, second.ref.sha256, 32) != 0);
+	UT_ASSERT_EQ(cluster_shared_config_read_locked(root, &other, &image), 0);
+	cluster_shared_config_free(&image);
+	stage_paths(&second, final, temp);
+	UT_ASSERT_EQ(cluster_shared_config_discard(root, &first), 0);
+	UT_ASSERT_EQ(cluster_shared_config_discard(root, &second), 0);
+	(void)unlink(final);
+	(void)unlink(temp);
+	cleanup_stage();
+}
+
+UT_TEST(test_owner_and_file_identity_cannot_be_substituted)
+{
+	ClusterSharedConfigStage stage, bad;
+	char saved[MAXPGPATH];
+	setup_stage();
+	if (!prepare_stage(&stage)) {
+		cleanup_stage();
+		return;
+	}
+	held_mode = ExclusiveLock;
+	for (int n = 0; n < 7; ++n) {
+		bad = stage;
+		if (n == 0)
+			++bad.owner_pid;
+		if (n == 1)
+			++bad.file_ino;
+		if (n == 2)
+			++bad.object_dir_ino;
+		if (n == 3)
+			++bad.staging_dir_ino;
+		if (n == 4)
+			++bad.ref.identity.system_identifier;
+		if (n == 5) {
+			file_bytes[0] ^= 1;
+			write_file(staged_file, file_bytes, strlen(file_bytes));
+		}
+		if (n == 6)
+			UT_ASSERT_EQ(chmod(staged_file, 0666), 0);
+		UT_ASSERT(cluster_shared_config_install(root, &bad) != 0);
+		if (n == 5) {
+			file_bytes[0] ^= 1;
+			write_file(staged_file, file_bytes, strlen(file_bytes));
+		}
+		if (n == 6)
+			UT_ASSERT_EQ(chmod(staged_file, 0600), 0);
+	}
+	snprintf(saved, sizeof(saved), "%s.saved", staged_file);
+	UT_ASSERT_EQ(rename(staged_file, saved), 0);
+	write_file(staged_file, file_bytes, strlen(file_bytes));
+	UT_ASSERT(cluster_shared_config_install(root, &stage) != 0);
+	UT_ASSERT(cluster_shared_config_discard(root, &stage) != 0);
+	UT_ASSERT_EQ(access(staged_file, F_OK), 0);
+	(void)unlink(staged_file);
+	UT_ASSERT_EQ(rename(saved, staged_file), 0);
+	UT_ASSERT_EQ(cluster_shared_config_discard(root, &stage), 0);
+	cleanup_stage();
+}
+
+UT_TEST(test_prepare_failure_and_uuid_collision)
+{
+	ClusterSharedConfigStage stage, second;
+	for (unsigned n = 1; n <= 2; ++n) {
+		setup_stage();
+		fail_sync = n;
+		memset(&stage, 0xa5, sizeof(stage));
+		UT_ASSERT(cluster_shared_config_prepare(root, file_bytes, strlen(file_bytes), &file_ref,
+												operation, &stage)
+				  != 0);
+		UT_ASSERT_EQ(stage.state, 0);
+		UT_ASSERT_EQ(stage.owner_pid, 0);
+		UT_ASSERT(access(staged_file, F_OK) != 0);
+		cleanup_stage();
+	}
+	setup_stage();
+	if (!prepare_stage(&stage)) {
+		cleanup_stage();
+		return;
+	}
+	UT_ASSERT(cluster_shared_config_prepare(root, file_bytes, strlen(file_bytes), &file_ref,
+											operation, &second)
+			  != 0);
+	UT_ASSERT_EQ(second.state, 0);
+	UT_ASSERT_EQ(access(staged_file, F_OK), 0);
+	UT_ASSERT_EQ(cluster_shared_config_discard(root, &stage), 0);
+	cleanup_stage();
+}
+
+UT_TEST(test_install_sync_retry_after_unlink)
+{
+	ClusterSharedConfigStage stage;
+	setup_stage();
+	(void)unlink(object);
+	if (!prepare_stage(&stage)) {
+		cleanup_stage();
+		return;
+	}
+	held_mode = ExclusiveLock;
+	sync_calls = 0;
+	fail_sync = 2;
+	UT_ASSERT_EQ(cluster_shared_config_install(root, &stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(access(staged_file, F_OK) != 0);
+	UT_ASSERT_EQ(access(object, F_OK), 0);
+	fail_sync = 0;
+	UT_ASSERT_EQ(cluster_shared_config_install(root, &stage), 0);
+	UT_ASSERT_EQ(cluster_shared_config_discard(root, &stage), 0);
+	cleanup_stage();
+}
+
+UT_TEST(test_sync_failed_cancel_never_resurrects)
+{
+	ClusterSharedConfigStage stage;
+	for (int n = 0; n < 2; ++n) {
+		setup_stage();
+		if (!prepare_stage(&stage)) {
+			cleanup_stage();
+			continue;
+		}
+		held_mode = ExclusiveLock;
+		if (n == 1)
+			UT_ASSERT_EQ(cluster_shared_config_install(root, &stage), 0);
+		sync_calls = 0;
+		fail_sync = 1;
+		UT_ASSERT_EQ(cluster_shared_config_discard(root, &stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+		UT_ASSERT(access(staged_file, F_OK) != 0);
+		UT_ASSERT(cluster_shared_config_install(root, &stage) != 0);
+		fail_sync = 0;
+		UT_ASSERT_EQ(cluster_shared_config_discard(root, &stage), 0);
+		UT_ASSERT_EQ(access(object, F_OK), 0);
+		cleanup_stage();
+	}
+}
+
+UT_TEST(test_publication_preconditions)
+{
+	ClusterSharedConfigStage stage;
+	uint8 zero[16] = { 0 };
+	setup_stage();
+	enableFsync = false;
+	UT_ASSERT(cluster_shared_config_prepare(root, file_bytes, strlen(file_bytes), &file_ref,
+											operation, &stage)
+			  != 0);
+	UT_ASSERT_EQ(stage.state, 0);
+	enableFsync = true;
+	UT_ASSERT(
+		cluster_shared_config_prepare(root, file_bytes, strlen(file_bytes), &file_ref, zero, &stage)
+		!= 0);
+	UT_ASSERT_EQ(stage.state, 0);
+	file_bytes[0] ^= 1;
+	UT_ASSERT(cluster_shared_config_prepare(root, file_bytes, strlen(file_bytes), &file_ref,
+											operation, &stage)
+			  != 0);
+	UT_ASSERT_EQ(stage.state, 0);
+	UT_ASSERT(access(staged_file, F_OK) != 0);
+	cleanup_stage();
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(21);
 	UT_RUN(test_independent_canonical_input);
 	UT_RUN(test_encoder_matches_independent_bytes);
 	UT_RUN(test_exact_scope_lookup);
@@ -499,6 +796,14 @@ main(void)
 	UT_RUN(test_file_refusals_without_fallback);
 	UT_RUN(test_invalid_arguments);
 	UT_RUN(test_directory_guards);
+	UT_RUN(test_prepare_install_and_cancel_preserves_formal);
+	UT_RUN(test_no_clobber_and_identical_retry);
+	UT_RUN(test_same_generation_different_hash_objects);
+	UT_RUN(test_owner_and_file_identity_cannot_be_substituted);
+	UT_RUN(test_prepare_failure_and_uuid_collision);
+	UT_RUN(test_install_sync_retry_after_unlink);
+	UT_RUN(test_sync_failed_cancel_never_resurrects);
+	UT_RUN(test_publication_preconditions);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -13,6 +13,8 @@
 #include "cluster/cluster_shared_config.h"
 #include "common/cryptohash.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
+#include "storage/fd.h"
 
 #define CONFIG_HEADER_CAPACITY 512
 #define CONFIG_KEY_CAPACITY (CLUSTER_SHARED_CONFIG_MAX_NAME + 9)
@@ -152,14 +154,20 @@ config_text_valid(const char *bytes, size_t len, bool newlines)
 }
 
 static bool
+config_hash_context(pg_cryptohash_ctx *ctx, const char *bytes, size_t len, uint8 hash[32])
+{
+	return pg_cryptohash_init(ctx) >= 0 && pg_cryptohash_update(ctx, (const uint8 *)bytes, len) >= 0
+		   && pg_cryptohash_final(ctx, hash, 32) >= 0;
+}
+
+static bool
 config_hash(const char *bytes, size_t len, uint8 hash[32])
 {
 	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
 	bool ok;
 	if (ctx == NULL)
 		return false;
-	ok = pg_cryptohash_init(ctx) >= 0 && pg_cryptohash_update(ctx, (const uint8 *)bytes, len) >= 0
-		 && pg_cryptohash_final(ctx, hash, 32) >= 0;
+	ok = config_hash_context(ctx, bytes, len, hash);
 	pg_cryptohash_free(ctx);
 	return ok;
 }
@@ -289,26 +297,18 @@ fail:
 	return result;
 }
 
-ClusterControlRootResult
-cluster_shared_config_validate(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
-							   uint32 *count)
+/* Valid arguments/bounds and verified hash required. No backend allocation;
+ * install may call this while holding raw directory descriptors.
+ */
+static ClusterControlRootResult
+config_validate_content(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+						uint32 *count)
 {
 	char header[CONFIG_HEADER_CAPACITY], previous[CONFIG_KEY_CAPACITY] = { 0 };
-	uint8 hash[32];
 	size_t offset;
 	uint32 entries = 0;
 	ConfigLine line;
 
-	if (count != NULL)
-		*count = 0;
-	if (bytes == NULL || count == NULL || !config_ref_valid(ref))
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (len == 0 || len > CLUSTER_SHARED_CONFIG_MAX_BYTES)
-		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
-	if (!config_hash(bytes, len, hash))
-		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	if (memcmp(hash, ref->sha256, 32) != 0)
-		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
 	if (!config_text_valid(bytes, len, true))
 		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
 	offset = config_header(&ref->identity, header);
@@ -323,6 +323,24 @@ cluster_shared_config_validate(const char *bytes, size_t len, const ClusterShare
 	}
 	*count = entries;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_shared_config_validate(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+							   uint32 *count)
+{
+	uint8 hash[32];
+	if (count != NULL)
+		*count = 0;
+	if (bytes == NULL || count == NULL || !config_ref_valid(ref))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (len == 0 || len > CLUSTER_SHARED_CONFIG_MAX_BYTES)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	if (!config_hash(bytes, len, hash))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (memcmp(hash, ref->sha256, 32) != 0)
+		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+	return config_validate_content(bytes, len, ref, count);
 }
 
 ClusterControlRootResult
@@ -464,4 +482,318 @@ cluster_shared_config_free(ClusterSharedConfigImage *image)
 			pfree(image->bytes);
 		memset(image, 0, sizeof(*image));
 	}
+}
+
+#define CONFIG_STAGED 1
+#define CONFIG_INSTALLED 2
+#define CONFIG_DISCARDED 3
+
+typedef struct ConfigStageDirs {
+	int fd[4]; /* root, global, objects, staging */
+	struct stat objects;
+	struct stat staging;
+} ConfigStageDirs;
+
+static void
+config_close(int fd, ClusterControlRootResult *result)
+{
+	if (fd >= 0 && close(fd) != 0)
+		*result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+static void
+config_close_stage_dirs(ConfigStageDirs *dirs, ClusterControlRootResult *result)
+{
+	for (int i = 3; i >= 0; --i) {
+		config_close(dirs->fd[i], result);
+		dirs->fd[i] = -1;
+	}
+}
+
+/* Caller closes on EVERY return. No allocations/error-throwing backend calls. */
+static ClusterControlRootResult
+config_open_stage_dirs(const char *root, ConfigStageDirs *dirs)
+{
+	const char *parts[] = { "global", "config_images", ".staging" };
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	struct stat st;
+	memset(dirs, 0, sizeof(*dirs));
+	for (int i = 0; i < 4; ++i)
+		dirs->fd[i] = -1;
+	if (root == NULL || root[0] != '/')
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	for (int i = 0; i < 4; ++i) {
+		dirs->fd[i] = i == 0 ? open(root, flags) : openat(dirs->fd[i - 1], parts[i - 1], flags);
+		if (dirs->fd[i] < 0 || fstat(dirs->fd[i], &st) != 0 || !config_owned(&st, true))
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (i == 2)
+			dirs->objects = st;
+		if (i == 3)
+			dirs->staging = st;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static void
+config_stage_names(const ClusterSharedConfigStage *stage, char final[96], char temp[40])
+{
+	char hex[65];
+	config_hex(stage->ref.sha256, 32, hex);
+	snprintf(final, 96, UINT64_FORMAT "-%s.conf", stage->ref.identity.generation, hex);
+	config_hex(stage->operation_uuid, 16, hex);
+	snprintf(temp, 40, "%s.tmp", hex);
+}
+
+static bool
+config_stage_valid(const ClusterSharedConfigStage *stage)
+{
+	return stage != NULL && config_ref_valid(&stage->ref)
+		   && config_nonzero(stage->operation_uuid, 16) && stage->owner_pid == (uint32)getpid()
+		   && stage->bytes > 0 && stage->bytes <= CLUSTER_SHARED_CONFIG_MAX_BYTES
+		   && (stage->state == CONFIG_STAGED || stage->state == CONFIG_INSTALLED
+			   || stage->state == CONFIG_DISCARDED);
+}
+
+static bool
+config_dirs_match(const ConfigStageDirs *dirs, const ClusterSharedConfigStage *stage)
+{
+	return (uint64)dirs->objects.st_dev == stage->object_dir_dev
+		   && (uint64)dirs->objects.st_ino == stage->object_dir_ino
+		   && (uint64)dirs->staging.st_dev == stage->staging_dir_dev
+		   && (uint64)dirs->staging.st_ino == stage->staging_dir_ino;
+}
+
+static bool
+config_exact_temp(int dir, const char *temp, const ClusterSharedConfigStage *stage)
+{
+	struct stat st;
+	return fstatat(dir, temp, &st, AT_SYMLINK_NOFOLLOW) == 0 && config_owned(&st, false)
+		   && (uint64)st.st_dev == stage->file_dev && (uint64)st.st_ino == stage->file_ino;
+}
+
+/* Buffer capacity is stage->bytes + 1. The crypto context was allocated
+ * before opening any raw FD. All further validation is allocation-free.
+ */
+static ClusterControlRootResult
+config_stage_read_at(int dir, const char *name, const ClusterSharedConfigStage *stage,
+					 bool exact_inode, char *bytes, pg_cryptohash_ctx *ctx)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	struct stat st;
+	uint8 hash[32];
+	size_t used = 0;
+	uint32 count = 0;
+	int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	if (fd < 0)
+		return errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : result;
+	if (fstat(fd, &st) != 0 || !config_owned(&st, false))
+		goto done;
+	if (exact_inode
+		&& ((uint64)st.st_dev != stage->file_dev || (uint64)st.st_ino != stage->file_ino)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	if (st.st_size < 0 || (uint64)st.st_size != stage->bytes) {
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		goto done;
+	}
+	while (used < stage->bytes + 1) {
+		ssize_t n = read(fd, bytes + used, stage->bytes + 1 - used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0)
+			goto done;
+		if (n == 0)
+			break;
+		used += n;
+	}
+	if (used != stage->bytes) {
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		goto done;
+	}
+	if (!config_hash_context(ctx, bytes, used, hash))
+		goto done;
+	if (memcmp(hash, stage->ref.sha256, 32) != 0) {
+		result = CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+		goto done;
+	}
+	result = config_validate_content(bytes, used, &stage->ref, &count);
+done:
+	config_close(fd, &result);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_shared_config_prepare(const char *shared_root, const char *bytes, size_t len,
+							  const ClusterSharedConfigRef *ref, const uint8 operation_uuid[16],
+							  ClusterSharedConfigStage *out)
+{
+	ClusterSharedConfigStage stage;
+	ClusterControlRootResult result;
+	ConfigStageDirs dirs;
+	char final[96], temp[40];
+	struct stat st;
+	uint32 count;
+	size_t used = 0;
+	int fd = -1;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!enableFsync || operation_uuid == NULL || !config_nonzero(operation_uuid, 16))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_shared_config_validate(bytes, len, ref, &count);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	memset(&stage, 0, sizeof(stage));
+	stage.ref = *ref;
+	stage.bytes = len;
+	stage.owner_pid = (uint32)getpid();
+	memcpy(stage.operation_uuid, operation_uuid, 16);
+	config_stage_names(&stage, final, temp);
+	result = config_open_stage_dirs(shared_root, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	stage.object_dir_dev = dirs.objects.st_dev;
+	stage.object_dir_ino = dirs.objects.st_ino;
+	stage.staging_dir_dev = dirs.staging.st_dev;
+	stage.staging_dir_ino = dirs.staging.st_ino;
+	result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	fd = openat(dirs.fd[3], temp, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | PG_BINARY,
+				0600);
+	if (fd < 0 || fstat(fd, &st) != 0 || !config_owned(&st, false))
+		goto done;
+	stage.file_dev = st.st_dev;
+	stage.file_ino = st.st_ino;
+	stage.state = CONFIG_STAGED;
+	while (used < len) {
+		ssize_t n = write(fd, bytes + used, len - used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto done;
+		used += n;
+	}
+	if (pg_fsync(fd) != 0 || pg_fsync(dirs.fd[3]) != 0)
+		goto done;
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	config_close(fd, &result);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && stage.state == CONFIG_STAGED
+		&& config_exact_temp(dirs.fd[3], temp, &stage)) {
+		if (unlinkat(dirs.fd[3], temp, 0) == 0)
+			(void)pg_fsync(dirs.fd[3]);
+	}
+	config_close_stage_dirs(&dirs, &result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = stage;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_shared_config_install(const char *shared_root, ClusterSharedConfigStage *stage)
+{
+	ClusterControlRootResult result;
+	ConfigStageDirs dirs;
+	char final[96], temp[40];
+	char *staged, *installed;
+	pg_cryptohash_ctx *ctx;
+
+	if (!enableFsync || !config_stage_valid(stage) || stage->state == CONFIG_DISCARDED)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	staged = palloc(stage->bytes + 1);
+	installed = palloc(stage->bytes + 1);
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL) {
+		pfree(staged);
+		pfree(installed);
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	config_stage_names(stage, final, temp);
+	result = config_open_stage_dirs(shared_root, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (!config_dirs_match(&dirs, stage)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	if (stage->state == CONFIG_STAGED) {
+		result = config_stage_read_at(dirs.fd[3], temp, stage, true, staged, ctx);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto done;
+		if (linkat(dirs.fd[3], temp, dirs.fd[2], final, 0) != 0 && errno != EEXIST) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+	}
+	result = config_stage_read_at(dirs.fd[2], final, stage, false, installed, ctx);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (stage->state == CONFIG_STAGED && memcmp(staged, installed, stage->bytes) != 0) {
+		result = CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+		goto done;
+	}
+	if (pg_fsync(dirs.fd[2]) != 0) {
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	if (stage->state == CONFIG_STAGED) {
+		if (!config_exact_temp(dirs.fd[3], temp, stage)) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto done;
+		}
+		if (unlinkat(dirs.fd[3], temp, 0) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+		/* Failed directory sync must retry sync, not resurrect a removed temp. */
+		stage->state = CONFIG_INSTALLED;
+	}
+	if (pg_fsync(dirs.fd[3]) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+done:
+	config_close_stage_dirs(&dirs, &result);
+	pg_cryptohash_free(ctx);
+	pfree(staged);
+	pfree(installed);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_shared_config_discard(const char *shared_root, ClusterSharedConfigStage *stage)
+{
+	ClusterControlRootResult result;
+	ConfigStageDirs dirs;
+	char final[96], temp[40];
+	if (!enableFsync || !config_stage_valid(stage))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	config_stage_names(stage, final, temp);
+	result = config_open_stage_dirs(shared_root, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (!config_dirs_match(&dirs, stage)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	if (stage->state == CONFIG_STAGED) {
+		if (!config_exact_temp(dirs.fd[3], temp, stage)) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto done;
+		}
+		if (unlinkat(dirs.fd[3], temp, 0) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+	}
+	/* Even an INSTALLED descriptor is terminal before the fallible sync. */
+	stage->state = CONFIG_DISCARDED;
+	if (pg_fsync(dirs.fd[3]) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+done:
+	config_close_stage_dirs(&dirs, &result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(stage, 0, sizeof(*stage));
+	return result;
 }

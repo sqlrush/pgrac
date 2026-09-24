@@ -71,4 +71,37 @@ extern ClusterControlRootResult cluster_shared_config_read_locked(const char *sh
 																  ClusterSharedConfigImage *out);
 extern void cluster_shared_config_free(ClusterSharedConfigImage *image);
 
+/* PGRAC: publisher-owned memory, not persistent/wire/shared-memory state.
+ * Prepare does not publish. Install borrows CF-X, held by the same caller
+ * through root CAS. Discard never removes formal objects. No GUC policy or
+ * application ACK is implied by any of these low-level operations.
+ * Inputs and the prepare output must not overlap. I/O-uncertain orphan cleanup
+ * requires the publisher's exact retired-owner proof, never a wall-clock age.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigStage {
+	ClusterSharedConfigRef ref;
+	uint8 operation_uuid[16];
+	uint64 bytes;
+	uint64 object_dir_dev;
+	uint64 object_dir_ino;
+	uint64 staging_dir_dev;
+	uint64 staging_dir_ino;
+	uint64 file_dev;
+	uint64 file_ino;
+	uint32 owner_pid;
+	uint32 state;
+} ClusterSharedConfigStage;
+StaticAssertDecl(sizeof(ClusterSharedConfigStage) == 184, "config staging descriptor");
+
+extern ClusterControlRootResult cluster_shared_config_prepare(const char *shared_root,
+															  const char *bytes, size_t len,
+															  const ClusterSharedConfigRef *ref,
+															  const uint8 operation_uuid[16],
+															  ClusterSharedConfigStage *out);
+extern ClusterControlRootResult cluster_shared_config_install(const char *shared_root,
+															  ClusterSharedConfigStage *stage);
+extern ClusterControlRootResult cluster_shared_config_discard(const char *shared_root,
+															  ClusterSharedConfigStage *stage);
+
 #endif
