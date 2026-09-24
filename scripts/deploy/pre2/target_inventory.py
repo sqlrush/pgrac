@@ -214,7 +214,21 @@ def _storage(item, storage):
         raise TargetJournalError("TARGET_BACKSTORE_MODE")
 
 
-def _resolve_acl(tpg, ports, acl, items, phases, luns, census):
+def _mapped_link(path, expected):
+    """A partially created mapped LUN may have no link, never a different one."""
+    with os.scandir(path) as entries:
+        links = [entry.name for entry in _Census().items(entries) if entry.is_symlink()]
+    if not links:
+        return None
+    if len(links) != 1:
+        raise TargetJournalError("TARGET_LUN_IDENTITY")
+    target = os.readlink(path + "/" + links[0])
+    if len(target) >= 4096 or os.path.normpath(os.path.join(path, target)) != expected:
+        raise TargetJournalError("TARGET_LUN_IDENTITY")
+    return links[0]
+
+
+def _resolve_acl(tpg, ports, acl, items, phases, luns, census, *, revoked=False):
     first = items[0]
     path = tpg.path + "/acls/" + first.initiator
     ordinals = tuple(item.ordinal for item in items)
@@ -224,34 +238,43 @@ def _resolve_acl(tpg, ports, acl, items, phases, luns, census):
             raise TargetJournalError("TARGET_ACL_RECREATED")
         _require_absent(path)
         acl = _AbsentAcl(path)
-    elif acl is None:
+    elif acl is None and not revoked:
         raise TargetJournalError("TARGET_DRAIN_UNPROVEN")
+    elif acl is None:
+        acl = _AbsentAcl(path)
     expected = {(item.portal, item.port, item.mapped_lun) for item in items}
-    mapped = {}
-    if completed:
-        for item in items:
-            prior = mapped.setdefault(item.mapped_lun, item.tpg_lun)
-            if prior != item.tpg_lun:
-                raise TargetJournalError("TARGET_LUN_IDENTITY")
-    else:
+    desired = {}
+    for item in items:
+        prior = desired.setdefault(item.mapped_lun, item.tpg_lun)
+        if prior != item.tpg_lun:
+            raise TargetJournalError("TARGET_LUN_IDENTITY")
+    mapped = dict(desired) if completed else {}
+    if not completed:
         for lun in census.items(acl.mapped_luns):
             if (not _uint(lun.mapped_lun, 255) or lun.mapped_lun in mapped
-                    or lun.path != path + f"/lun_{lun.mapped_lun}"
-                    or not _uint(lun.tpg_lun.lun, 65535)
-                    or lun.tpg_lun.path != tpg.path + f"/lun/lun_{lun.tpg_lun.lun}"):
+                    or lun.path != path + f"/lun_{lun.mapped_lun}"):
                 raise TargetJournalError("TARGET_LUN_IDENTITY")
-            mapped[lun.mapped_lun] = lun.tpg_lun.lun
-    observed = {(ip, port, lun) for ip, port in ports for lun in mapped}
+            if revoked:
+                if lun.mapped_lun not in desired:
+                    raise TargetJournalError("TARGET_LUN_IDENTITY")
+                _mapped_link(lun.path, tpg.path + f"/lun/lun_{desired[lun.mapped_lun]}")
+                mapped[lun.mapped_lun] = desired[lun.mapped_lun]
+            else:
+                if (not _uint(lun.tpg_lun.lun, 65535)
+                        or lun.tpg_lun.path != tpg.path + f"/lun/lun_{lun.tpg_lun.lun}"):
+                    raise TargetJournalError("TARGET_LUN_IDENTITY")
+                mapped[lun.mapped_lun] = lun.tpg_lun.lun
+    observed = {(ip, port, lun) for ip, port in ports for lun in (desired if revoked else mapped)}
     if observed != expected:
         raise TargetJournalError("TARGET_ROUTE_COVERAGE")
     for item in items:
-        if mapped.get(item.mapped_lun) != item.tpg_lun or item.tpg_lun not in luns:
+        if ((desired if revoked else mapped).get(item.mapped_lun) != item.tpg_lun or item.tpg_lun not in luns):
             raise TargetJournalError("TARGET_LUN_IDENTITY")
         _storage(item, luns[item.tpg_lun].storage_object)
     return AclGroup(acl, path, tuple(path + f"/lun_{lun}" for lun in sorted(mapped)), ordinals)
 
 
-def _native_inventory(root, groups, phases):
+def _native_inventory(root, groups, phases, *, revoked=False):
     census, found, targets = _Census(), {}, set()
     victims = {key[2] for key in groups}
     for target in census.items(root.targets):
@@ -285,7 +308,8 @@ def _native_inventory(root, groups, phases):
                 luns[lun.lun] = lun
             for key, items in groups.items():
                 if key[:2] == (target.wwn, tpg.tag):
-                    found[key] = _resolve_acl(tpg, ports, acls.get(key[2]), items, phases, luns, census)
+                    found[key] = _resolve_acl(tpg, ports, acls.get(key[2]), items, phases, luns, census,
+                                              revoked=revoked)
     if found.keys() != groups.keys():
         raise TargetJournalError("TARGET_ROUTE_COVERAGE")
     return tuple(found[key] for key in groups)
@@ -332,5 +356,32 @@ def resolve_routes(root, journal, identity, bindings):
             raise
         if isinstance(error, Exception):
             # Native libraries can embed target/CHAP configuration in errors.
+            raise TargetJournalError("TARGET_INVENTORY_UNPROVEN") from None
+        raise
+
+
+def resolve_rejoin_routes(root, journal, identity, bindings, *, present):
+    """Exact active restore or revoked subset census, never isolation proof.
+
+    Partial mappings are allowed only for an exact revoked rejoin lineage. The
+    caller still needs its fresh native teardown boundary and backing flush.
+    """
+    descriptors = []
+    try:
+        state = journal._current_rejoin_owner(identity)
+        if (type(present) is not bool or state.rejoin is None
+                or state.rejoin.phase not in ((2, 3) if present else (4,))):
+            raise TargetJournalError("TARGET_REJOIN_PHASE")
+        groups = _bindings(identity, bindings)
+        phases = (0,) * len(bindings) if present else state.phases
+        acls = _native_inventory(root, groups, phases, revoked=not present)
+        flushes = _pin_files(bindings, descriptors)
+        return ResolvedRoutes(acls, flushes)
+    except BaseException as error:
+        for fd in descriptors:
+            os.close(fd)
+        if isinstance(error, TargetJournalError):
+            raise
+        if isinstance(error, Exception):
             raise TargetJournalError("TARGET_INVENTORY_UNPROVEN") from None
         raise
