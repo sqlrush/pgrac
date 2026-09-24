@@ -37,6 +37,15 @@ typedef struct PgracFencedRejoinAsyncWorkerV1
 	int wait_status;
 	PgracFencedRejoinAsyncAction action;
 	bool active;
+	/* PGRAC: parent-owned snapshot, never taken from a completion message. */
+	bool owned;
+	uint32 operation_slot;
+	uint32 operation_count;
+	uint64 proof_generation;
+	PgracExternalFenceProtocolRejoinFrameV1 request;
+	PgracFencedRejoinOperationV1 before;
+	PgracFencedJournalRecordV1 identity;
+	PgracFencedJournalRecordV1 last_record;
 } PgracFencedRejoinAsyncWorkerV1;
 
 extern bool pgrac_fenced_rejoin_async_start(

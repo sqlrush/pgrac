@@ -36,10 +36,17 @@ typedef struct PgracFencedRejoinAsyncMessageV1
 	uint32 changed_slot;
 	uint32 operation_count;
 	uint64 proof_generation;
-	PgracFencedJournalRecordV1 record;
-	PgracFencedRejoinOperationV1 operation;
+	/* PGRAC: APPEND and COMPLETE carry disjoint payloads, not two copies. */
+	union
+	{
+		PgracFencedJournalRecordV1 record;
+		PgracFencedRejoinOperationV1 operation;
+	};
 	PgracExternalFenceProtocolRejoinFrameV1 response;
 } PgracFencedRejoinAsyncMessageV1;
+
+StaticAssertDecl(sizeof(PgracFencedRejoinAsyncMessageV1) <= 2048,
+	"rejoin worker message must fit the supported local datagram bound");
 
 static bool
 bytes_nonzero(const uint8 *bytes, size_t len)
@@ -260,6 +267,261 @@ action_matches_request(PgracFencedRejoinAsyncAction action,
 			request->opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON);
 }
 
+static bool
+owned_worker_identity(PgracFencedOperationContextV1 *context,
+					  const PgracFencedRejoinContextV1 *rejoin,
+					  PgracFencedRejoinAsyncAction action,
+					  const PgracExternalFenceProtocolRejoinFrameV1 *request,
+					  const uint8 operation_id[16],
+					  PgracFencedRejoinAsyncWorkerV1 *worker)
+{
+	const PgracFencedTargetV1 *claim = NULL;
+	PgracFencedJournalRecordV1 *identity = &worker->identity;
+	uint32 slot = UINT32_MAX;
+	uint32 free_slot = UINT32_MAX;
+	int32 node;
+
+	if (context->config->format_version != 2)
+		return true;
+	if (action == PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT)
+		claim = pgrac_fenced_rejoin_claim_target(rejoin);
+	for (uint32 i = 0; i < PGRAC_FENCED_REJOIN_MAX_OPERATIONS; ++i)
+	{
+		const PgracFencedRejoinOperationV1 *entry = &rejoin->operations[i];
+
+		if (entry->state == PGRAC_FENCED_REJOIN_OPERATION_UNUSED)
+		{
+			if (free_slot == UINT32_MAX)
+				free_slot = i;
+			continue;
+		}
+		if (action == PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE ?
+			entry->admin_request.old_node_id == request->old_node_id :
+			action == PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT ?
+			&entry->target == claim :
+			memcmp(entry->operation_id, request->operation_id, 16) == 0)
+		{
+			slot = i;
+			break;
+		}
+	}
+	if (slot == UINT32_MAX && action == PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE)
+		slot = free_slot;
+	if (slot == UINT32_MAX)
+		return false;
+	worker->before = rejoin->operations[slot];
+	worker->last_record = worker->before.last_record;
+	worker->request = *request;
+	worker->operation_slot = slot;
+	worker->operation_count = rejoin->operation_count;
+	worker->owned = true;
+	identity->intent.kind = PGRAC_FENCED_JOURNAL_INTENT_REJOIN;
+	identity->intent.attempt = worker->last_record.intent.attempt;
+	if (action != PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT)
+	{
+		if (identity->intent.attempt == UINT64_MAX)
+			return false;
+		identity->intent.attempt++;
+	}
+	identity->intent.request.rejoin = action == PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT ?
+		worker->last_record.intent.request.rejoin : *request;
+	node = identity->intent.request.rejoin.old_node_id;
+	if (node < 0 || node >= PGRAC_FENCED_MAX_NODES ||
+		!context->config->nodes[node].present ||
+		!pgrac_fenced_config_protected_set_digest(context->config, node,
+			identity->intent.protected_set_digest))
+		return false;
+	memcpy(identity->intent.target_uuid, context->config->nodes[node].target_uuid, 16);
+	identity->intent.system_identifier = context->config->system_identifier;
+	memcpy(identity->operation_id,
+		action == PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE &&
+		worker->before.state == PGRAC_FENCED_REJOIN_OPERATION_UNUSED ? operation_id :
+		worker->before.operation_id, 16);
+	memcpy(identity->daemon_boot_id, context->daemon_boot_id, 16);
+	memcpy(identity->semantic_config_digest, context->semantic_config_digest, 32);
+	identity->provider_id = context->provider->provider_id;
+	identity->provider_abi_version = PGRAC_FENCED_PROVIDER_ABI_V1;
+	identity->mapping_generation = context->config->mapping_generation;
+	return true;
+}
+
+static bool
+owned_parent_unchanged(const PgracFencedRejoinContextV1 *context,
+					   const PgracFencedRejoinAsyncWorkerV1 *worker)
+{
+	return !worker->owned ||
+		(context->operation_count == worker->operation_count &&
+		 worker->operation_slot < PGRAC_FENCED_REJOIN_MAX_OPERATIONS &&
+		 memcmp(&context->operations[worker->operation_slot], &worker->before,
+			 sizeof(worker->before)) == 0);
+}
+
+static bool
+owned_record_matches(const PgracFencedRejoinAsyncWorkerV1 *worker,
+					 const PgracFencedJournalRecordV1 *record)
+{
+	const PgracFencedJournalRecordV1 *identity = &worker->identity;
+	PgracFencedJournalRecordV1 check = *record;
+	uint8 expected[PGRAC_EXTERNAL_FENCE_REJOIN_V1_BYTES];
+	uint8 actual[PGRAC_EXTERNAL_FENCE_REJOIN_V1_BYTES];
+	uint8 digest[32];
+	bool kind_ok;
+
+	if (!worker->owned)
+		return true;
+	if (record->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN ||
+		record->intent.attempt != identity->intent.attempt ||
+		record->intent.system_identifier != identity->intent.system_identifier ||
+		memcmp(record->intent.target_uuid, identity->intent.target_uuid, 16) != 0 ||
+		memcmp(record->intent.protected_set_digest, identity->intent.protected_set_digest, 32) != 0 ||
+		memcmp(record->operation_id, identity->operation_id, 16) != 0 ||
+		memcmp(record->daemon_boot_id, identity->daemon_boot_id, 16) != 0 ||
+		memcmp(record->semantic_config_digest, identity->semantic_config_digest, 32) != 0 ||
+		record->provider_id != identity->provider_id ||
+		record->provider_abi_version != identity->provider_abi_version ||
+		record->mapping_generation != identity->mapping_generation ||
+		!pgrac_external_fence_rejoin_v1_encode(&identity->intent.request.rejoin, expected) ||
+		!pgrac_external_fence_rejoin_v1_encode(&record->intent.request.rejoin, actual) ||
+		memcmp(expected, actual, sizeof(expected)) != 0 ||
+		worker->last_record.seq == UINT64_MAX)
+		return false;
+	kind_ok = record->record_kind == PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+	if (worker->action == PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT)
+		kind_ok = record->record_kind == PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT;
+	else if (worker->action == PGRAC_FENCED_REJOIN_ASYNC_AUTHORIZE_ON)
+		kind_ok = kind_ok || record->record_kind == PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED ||
+			record->record_kind == PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT ||
+			record->record_kind == PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT;
+	else if (worker->action == PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON)
+		kind_ok = kind_ok || record->record_kind == PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT;
+	if (!kind_ok)
+		return false;
+	if (record->proof_generation != 0 &&
+		(record->proof_generation != worker->proof_generation ||
+		 !pgrac_external_fence_target_state_digest_v1(record->intent.target_uuid,
+			record->target_state, record->io_drain_state, record->mapping_generation,
+			record->proof_generation, digest) ||
+		 memcmp(digest, record->target_state_digest, sizeof(digest)) != 0))
+		return false;
+	check.seq = worker->last_record.seq + 1;
+	return pgrac_fenced_journal_intent_continues(
+		worker->last_record.seq == 0 ? NULL : &worker->last_record, &check);
+}
+
+static bool
+owned_completion_matches(const PgracFencedOperationContextV1 *context,
+						 const PgracFencedRejoinAsyncWorkerV1 *worker,
+						 const PgracFencedRejoinAsyncMessageV1 *message)
+{
+	const PgracExternalFenceProtocolRejoinFrameV1 *response = &message->response;
+	const PgracFencedJournalRecordV1 *identity = &worker->identity;
+	const PgracFencedJournalRecordV1 *last = &worker->last_record;
+	const PgracExternalFenceProtocolRejoinFrameV1 *need = &identity->intent.request.rejoin;
+	PgracFencedRejoinOperationV1 expected = worker->before;
+	uint32 count = worker->operation_count;
+	uint32 positive_status;
+	uint16 opcode;
+	uint8 frame[PGRAC_EXTERNAL_FENCE_REJOIN_V1_BYTES];
+	bool positive;
+
+	if (!worker->owned)
+		return true;
+	switch (worker->action)
+	{
+		case PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE:
+			opcode = PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE_RESULT;
+			positive_status = PGRAC_FENCED_REJOIN_STATUS_OFFERED;
+			break;
+		case PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT:
+			opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_OFFER;
+			positive_status = PGRAC_FENCED_REJOIN_STATUS_OFFERED;
+			break;
+		case PGRAC_FENCED_REJOIN_ASYNC_AUTHORIZE_ON:
+			opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_ON_RESULT;
+			positive_status = PGRAC_FENCED_REJOIN_STATUS_WAITING_JOINER;
+			break;
+		case PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON:
+			opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_RESULT;
+			positive_status = PGRAC_FENCED_REJOIN_STATUS_READY;
+			break;
+		default:
+			return false;
+	}
+	positive = response->status == positive_status;
+	if (!pgrac_external_fence_rejoin_v1_encode(response, frame) || response->opcode != opcode ||
+		memcmp(response->transport_nonce, worker->request.transport_nonce, 16) != 0 ||
+		memcmp(response->operation_id, identity->operation_id, 16) != 0 ||
+		(!positive && response->status < PGRAC_FENCED_REJOIN_STATUS_REJECTED))
+		return false;
+	if (positive && worker->action != PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE)
+	{
+		bool claim = worker->action == PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT;
+
+		if (last->record_kind != (claim ? PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT :
+				PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT) ||
+			last->provider_result != PGRAC_FENCED_PROVIDER_OK || last->deny_reason != 0 ||
+			last->target_state != (claim ? PGRAC_FENCED_TARGET_OFF : PGRAC_FENCED_TARGET_ON) ||
+			last->io_drain_state != PGRAC_FENCED_IO_DRAIN_DRAINED ||
+			last->proof_generation == 0 || last->proof_generation != worker->proof_generation ||
+			response->system_identifier != identity->intent.system_identifier ||
+			memcmp(response->protected_set_digest, identity->intent.protected_set_digest, 32) != 0 ||
+			memcmp(response->rejoin_gate_digest, need->rejoin_gate_digest, 32) != 0 ||
+			response->old_node_id != need->old_node_id ||
+			response->old_incarnation != need->old_incarnation ||
+			response->candidate_incarnation != need->candidate_incarnation ||
+			response->provider_id != identity->provider_id ||
+			response->provider_abi_version != identity->provider_abi_version ||
+			response->target_mapping_generation != identity->mapping_generation ||
+			memcmp(response->daemon_boot_id, identity->daemon_boot_id, 16) != 0 ||
+			response->journal_seq != last->seq || response->verified_mono_ns != last->event_mono_ns ||
+			response->fresh_until_mono_ns != last->fresh_until_mono_ns ||
+			response->proof_generation != last->proof_generation ||
+			memcmp(response->target_state_digest, last->target_state_digest, 32) != 0)
+			return false;
+	}
+	if (positive)
+	{
+		switch (worker->action)
+		{
+			case PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE:
+				if (expected.state == PGRAC_FENCED_REJOIN_OPERATION_UNUSED)
+				{
+					const PgracFencedNodeConfigV1 *node = &context->config->nodes[need->old_node_id];
+
+					expected.state = PGRAC_FENCED_REJOIN_OPERATION_OFFERED;
+					expected.admin_request = worker->request;
+					memcpy(expected.operation_id, identity->operation_id, 16);
+					memcpy(expected.target.target_uuid, identity->intent.target_uuid, 16);
+					expected.target.victim_node_id = need->old_node_id;
+					expected.target.mapping_generation = identity->mapping_generation;
+					expected.target.adapter_config = node->adapter_data;
+					expected.target.adapter_config_len = node->adapter_data_len;
+					count++;
+				}
+				break;
+			case PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT:
+				expected.state = PGRAC_FENCED_REJOIN_OPERATION_CLAIMED;
+				expected.offer_result = *response;
+				break;
+			case PGRAC_FENCED_REJOIN_ASYNC_AUTHORIZE_ON:
+				expected.state = PGRAC_FENCED_REJOIN_OPERATION_WAITING_JOINER;
+				expected.on_result = *response;
+				break;
+			case PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON:
+				expected.state = PGRAC_FENCED_REJOIN_OPERATION_READY;
+				expected.ready_result = *response;
+				break;
+		}
+	}
+	expected.last_record = *last;
+	if (count != message->operation_count)
+		return false;
+	if (message->changed_slot == UINT32_MAX)
+		return memcmp(&expected, &worker->before, sizeof(expected)) == 0;
+	return message->changed_slot == worker->operation_slot &&
+		memcmp(&expected, &message->operation, sizeof(expected)) == 0;
+}
+
 bool
 pgrac_fenced_rejoin_async_start(
 	PgracFencedOperationContextV1 *operation_context,
@@ -285,6 +547,8 @@ pgrac_fenced_rejoin_async_start(
 			operation_id != NULL) ||
 		(action == PGRAC_FENCED_REJOIN_ASYNC_AUTHORIZE_ON ?
 			!target_admissions_invalidated : target_admissions_invalidated) ||
+		!owned_worker_identity(operation_context, rejoin_context, action, request,
+			operation_id, worker) ||
 		socketpair(AF_UNIX, SOCK_DGRAM, 0, sockets) != 0)
 		return false;
 	pid = fork();
@@ -365,8 +629,12 @@ pgrac_fenced_rejoin_async_service(
 	}
 	if (message.kind == PGRAC_FENCED_REJOIN_ASYNC_MESSAGE_APPEND)
 	{
-		reserved = pgrac_fenced_operation_append_journal(operation_context,
+		reserved = owned_parent_unchanged(rejoin_context, worker) &&
+			owned_record_matches(worker, &message.record) &&
+			pgrac_fenced_operation_append_journal(operation_context,
 			&message.record);
+		if (reserved && worker->owned)
+			worker->last_record = message.record;
 		message.kind =
 			PGRAC_FENCED_REJOIN_ASYNC_MESSAGE_APPEND_RESULT;
 		message.success = reserved ? 1 : 0;
@@ -378,8 +646,11 @@ pgrac_fenced_rejoin_async_service(
 	if (message.kind ==
 		PGRAC_FENCED_REJOIN_ASYNC_MESSAGE_RESERVE_PROOF)
 	{
-		reserved = pgrac_fenced_operation_reserve_proof_generation(
+		reserved = owned_parent_unchanged(rejoin_context, worker) &&
+			pgrac_fenced_operation_reserve_proof_generation(
 			operation_context, &message.proof_generation);
+		if (reserved && worker->owned)
+			worker->proof_generation = message.proof_generation;
 		message.kind =
 			PGRAC_FENCED_REJOIN_ASYNC_MESSAGE_RESERVE_PROOF_RESULT;
 		message.success = reserved ? 1 : 0;
@@ -390,6 +661,8 @@ pgrac_fenced_rejoin_async_service(
 	}
 	if (message.kind != PGRAC_FENCED_REJOIN_ASYNC_MESSAGE_COMPLETE ||
 		message.success != 1 ||
+		!owned_parent_unchanged(rejoin_context, worker) ||
+		!owned_completion_matches(operation_context, worker, &message) ||
 		message.operation_count > PGRAC_FENCED_REJOIN_MAX_OPERATIONS ||
 		(message.changed_slot != UINT32_MAX &&
 		 message.changed_slot >= PGRAC_FENCED_REJOIN_MAX_OPERATIONS))

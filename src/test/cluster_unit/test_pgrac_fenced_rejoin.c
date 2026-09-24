@@ -3,6 +3,8 @@
  * test_pgrac_fenced_rejoin.c
  *    Root-daemon PFRJ rejoin lifecycle tests.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -23,7 +25,11 @@
 
 UT_DEFINE_GLOBALS();
 
+#include "data/pgrac_fence_map_v2_fixture.h"
+
 static volatile uint32 *provider_state;
+static const char *owned_journal_path;
+static size_t read_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum);
 
 static PgracFencedProviderResult
 test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
@@ -70,6 +76,27 @@ test_readback(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 static PgracFencedProviderResult
 test_actuate_on(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
 {
+	if (owned_journal_path != NULL) {
+		PgracFencedJournalRecordV1 records[12];
+		int fd = open(owned_journal_path, O_RDONLY);
+		size_t count = fd < 0 ? 0 : read_records(fd, records, lengthof(records));
+
+		if (count >= 2) {
+			const PgracFencedJournalRecordV1 *accepted = &records[count - 2];
+			const PgracFencedJournalRecordV1 *issued = &records[count - 1];
+
+			provider_state[8] = accepted->record_kind == PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED
+								&& issued->record_kind == PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED
+								&& issued->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_REJOIN
+								&& issued->intent.attempt == 2
+								&& issued->intent.request.rejoin.opcode
+									   == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON
+								&& memcmp(issued->intent.target_uuid, target->target_uuid, 16) == 0
+								&& memcmp(issued->operation_id, accepted->operation_id, 16) == 0;
+		}
+		if (fd >= 0)
+			(void)close(fd);
+	}
 	(void)target;
 	(void)deadline_mono_ns;
 	provider_state[3]++;
@@ -191,21 +218,27 @@ make_bound_request(uint16 opcode, const PgracExternalFenceProtocolRejoinFrameV1 
 static size_t
 read_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum)
 {
-	uint8 frame[PGRAC_FENCED_JOURNAL_RECORD_BYTES];
+	uint8 frame[PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES];
 	size_t count = 0;
+	size_t length;
 	ssize_t got;
 
 	UT_ASSERT_EQ(lseek(fd, 0, SEEK_SET), 0);
 	while (count < maximum) {
 		do {
-			got = read(fd, frame, sizeof(frame));
+			got = read(fd, frame, 16);
 		} while (got < 0 && errno == EINTR);
 		if (got == 0)
 			break;
-		UT_ASSERT_EQ(got, sizeof(frame));
-		if (got != sizeof(frame))
+		UT_ASSERT_EQ(got, 16);
+		if (got != 16)
 			break;
-		UT_ASSERT(pgrac_fenced_journal_record_decode(frame, sizeof(frame), &records[count]));
+		length = pgrac_fenced_journal_frame_size(frame, 16);
+		UT_ASSERT(length >= 16 && length <= sizeof(frame));
+		if (length < 16 || length > sizeof(frame))
+			break;
+		UT_ASSERT_EQ(read(fd, frame + 16, length - 16), length - 16);
+		UT_ASSERT(pgrac_fenced_journal_record_decode(frame, length, &records[count]));
 		count++;
 	}
 	return count;
@@ -468,20 +501,154 @@ UT_TEST(test_refresh_resolve_failure_returns_negative_and_discards_operation)
 	(void)unlink(path);
 }
 
+static bool
+owned_config(PgracFencedConfigV1 *config, PgracFencedProviderOpsV1 *ops)
+{
+	PgracFencedConfigResult parsed = pgrac_fenced_config_parse(
+		(const uint8 *)fenced_config_v2, sizeof(fenced_config_v2) - 1, config);
+
+#ifndef USE_OPENSSL
+	UT_ASSERT_NE(parsed, PGRAC_FENCED_CONFIG_OK);
+	return false;
+#else
+	UT_ASSERT_EQ(parsed, PGRAC_FENCED_CONFIG_OK);
+	make_ops(ops);
+	ops->provider_id = PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1;
+	memset((void *)provider_state, 0, sizeof(uint32) * 9);
+	provider_state[4] = PGRAC_FENCED_TARGET_OFF;
+	provider_state[5] = PGRAC_FENCED_IO_DRAIN_DRAINED;
+	return parsed == PGRAC_FENCED_CONFIG_OK;
+#endif
+}
+
+UT_TEST(test_owned_rejoin_journals_phase_before_on_and_retains_pending)
+{
+	PgracFencedOperationContextV1 operation_context;
+	PgracFencedRejoinContextV1 context;
+	PgracFencedJournalScanState journal_state;
+	PgracFencedJournalReconcileState replay;
+	PgracFencedJournalRecordV1 records[12];
+	PgracFencedConfigV1 config;
+	PgracFencedProviderOpsV1 ops;
+	PgracExternalFenceProtocolRejoinFrameV1 request, response;
+	uint8 operation_id[16];
+	char path[64];
+	int fd;
+	size_t count;
+
+	if (!owned_config(&config, &ops))
+		return;
+	fd = open_context(&operation_context, &context, &journal_state, &config, &ops, path);
+	if (fd < 0)
+		return;
+	owned_journal_path = path;
+	memset(operation_id, 0xa6, sizeof(operation_id));
+	make_prepare(2, 91, 92, 0x81, &request);
+	UT_ASSERT(pgrac_fenced_rejoin_admin_prepare(&context, &request, operation_id,
+												deadline_after_ms(1000), &response));
+	make_claim(0x82, &request);
+	UT_ASSERT(pgrac_fenced_rejoin_claim(&context, &request, deadline_after_ms(1000), &response));
+	make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, &response, 0x83, &request);
+	UT_ASSERT(pgrac_fenced_rejoin_authorize_on(&context, &request, true, deadline_after_ms(1000),
+											   &response));
+	UT_ASSERT_EQ(response.status, PGRAC_FENCED_REJOIN_STATUS_WAITING_JOINER);
+	UT_ASSERT_EQ(provider_state[8], 1);
+	make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON, &response, 0x84, &request);
+	UT_ASSERT(
+		pgrac_fenced_rejoin_refresh_on(&context, &request, deadline_after_ms(1000), &response));
+	UT_ASSERT_EQ(response.status, PGRAC_FENCED_REJOIN_STATUS_READY);
+	count = read_records(fd, records, lengthof(records));
+	UT_ASSERT_EQ(count, 9);
+	pgrac_fenced_journal_reconcile_state_init(&replay);
+	for (size_t i = 0; i < count; ++i) {
+		UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&replay, &records[i]));
+		if (i == 0)
+			continue;
+		UT_ASSERT(memcmp(records[i].operation_id, operation_id, 16) == 0);
+		UT_ASSERT_EQ(records[i].intent.kind, PGRAC_FENCED_JOURNAL_INTENT_REJOIN);
+		UT_ASSERT_EQ(records[i].intent.attempt, i < 3 ? 1 : i < 7 ? 2 : 3);
+		UT_ASSERT_EQ(records[i].intent.request.rejoin.transport_nonce[0], i < 3	  ? 0x81
+																		  : i < 7 ? 0x83
+																				  : 0x84);
+	}
+	UT_ASSERT_EQ(replay.pending_count, 1);
+	memset(&request, 0, sizeof(request));
+	request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CANCEL;
+	memset(request.transport_nonce, 0x85, sizeof(request.transport_nonce));
+	memcpy(request.operation_id, operation_id, 16);
+	UT_ASSERT(pgrac_fenced_rejoin_cancel(&context, &request));
+	UT_ASSERT_EQ(context.operation_count, 1);
+	UT_ASSERT(pgrac_fenced_rejoin_target(&context, operation_id) != NULL);
+	UT_ASSERT_EQ(read_records(fd, records, lengthof(records)), 9);
+	owned_journal_path = NULL;
+	(void)close(fd);
+	(void)unlink(path);
+}
+
+UT_TEST(test_owned_rejoin_negative_does_not_forget_the_target)
+{
+	for (int variant = 0; variant < 3; ++variant) {
+		PgracFencedOperationContextV1 operation_context;
+		PgracFencedRejoinContextV1 context;
+		PgracFencedJournalScanState journal_state;
+		PgracFencedConfigV1 config;
+		PgracFencedProviderOpsV1 ops;
+		PgracExternalFenceProtocolRejoinFrameV1 request, response;
+		uint8 operation_id[16];
+		char path[64];
+		int fd;
+
+		if (!owned_config(&config, &ops))
+			return;
+		fd = open_context(&operation_context, &context, &journal_state, &config, &ops, path);
+		if (fd < 0)
+			return;
+		memset(operation_id, 0xa7, sizeof(operation_id));
+		make_prepare(2, 91, 92, 0x86, &request);
+		UT_ASSERT(pgrac_fenced_rejoin_admin_prepare(&context, &request, operation_id,
+													deadline_after_ms(1000), &response));
+		make_claim(0x87, &request);
+		UT_ASSERT(
+			pgrac_fenced_rejoin_claim(&context, &request, deadline_after_ms(1000), &response));
+		make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, &response, 0x88,
+						   &request);
+		if (variant == 0)
+			provider_state[7] = 1;
+		if (variant == 1)
+			provider_state[5] = PGRAC_FENCED_IO_DRAIN_NOT_DRAINED;
+		UT_ASSERT(pgrac_fenced_rejoin_authorize_on(&context, &request, true,
+												   deadline_after_ms(1000), &response));
+		if (variant == 2) {
+			make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON, &response, 0x89,
+							   &request);
+			provider_state[7] = 1;
+			UT_ASSERT(pgrac_fenced_rejoin_refresh_on(&context, &request, deadline_after_ms(1000),
+													 &response));
+		}
+		UT_ASSERT(response.status >= PGRAC_FENCED_REJOIN_STATUS_REJECTED);
+		UT_ASSERT_EQ(context.operation_count, 1);
+		UT_ASSERT(pgrac_fenced_rejoin_target(&context, operation_id) != NULL);
+		(void)close(fd);
+		(void)unlink(path);
+	}
+}
+
 int
 main(void)
 {
 	provider_state
-		= mmap(NULL, sizeof(uint32) * 8, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+		= mmap(NULL, sizeof(uint32) * 9, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (provider_state == MAP_FAILED)
 		return 1;
-	UT_PLAN(5);
+	UT_PLAN(7);
 	UT_RUN(test_admin_prepare_is_inert_durable_and_duplicate_stable);
 	UT_RUN(test_claim_authorize_refresh_is_exact_and_on_happens_once);
 	UT_RUN(test_nonterminal_claim_releases_offer_and_cancel_discards_it);
 	UT_RUN(test_claim_retries_transient_readback_before_off_proof);
 	UT_RUN(test_refresh_resolve_failure_returns_negative_and_discards_operation);
+	UT_RUN(test_owned_rejoin_journals_phase_before_on_and_retains_pending);
+	UT_RUN(test_owned_rejoin_negative_does_not_forget_the_target);
 	UT_DONE();
-	(void)munmap((void *)provider_state, sizeof(uint32) * 8);
+	(void)munmap((void *)provider_state, sizeof(uint32) * 9);
 	return ut_failed_count == 0 ? 0 : 1;
 }

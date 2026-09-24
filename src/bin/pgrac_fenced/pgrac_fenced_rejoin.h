@@ -41,6 +41,8 @@ typedef struct PgracFencedRejoinOperationV1
 	PgracExternalFenceProtocolRejoinFrameV1 offer_result;
 	PgracExternalFenceProtocolRejoinFrameV1 on_result;
 	PgracExternalFenceProtocolRejoinFrameV1 ready_result;
+	/* PGRAC: current durable phase; transport withdrawal cannot erase it. */
+	PgracFencedJournalRecordV1 last_record;
 } PgracFencedRejoinOperationV1;
 
 typedef struct PgracFencedRejoinContextV1

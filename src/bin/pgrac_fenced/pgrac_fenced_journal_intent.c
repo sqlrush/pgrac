@@ -260,6 +260,52 @@ pgrac_fenced_journal_frame_digest(const uint8 *frame, size_t frame_len, uint8 di
 	return ok;
 }
 
+/* PGRAC: a new REJOIN phase is not permission to replace the target or gate. */
+static bool
+rejoin_phase_continues(const PgracFencedJournalRecordV1 *previous,
+					   const PgracFencedJournalRecordV1 *current)
+{
+	const PgracExternalFenceProtocolRejoinFrameV1 *before = &previous->intent.request.rejoin;
+	const PgracExternalFenceProtocolRejoinFrameV1 *after = &current->intent.request.rejoin;
+	uint32 expected_state;
+	uint16 expected_kind;
+	uint8 digest[32];
+
+	if (previous->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN
+		|| previous->intent.attempt == UINT64_MAX
+		|| current->intent.attempt != previous->intent.attempt + 1
+		|| current->record_kind != PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED
+		|| memcmp(previous->daemon_boot_id, current->daemon_boot_id, 16) != 0
+		|| before->old_node_id != after->old_node_id
+		|| before->old_incarnation != after->old_incarnation
+		|| before->candidate_incarnation != after->candidate_incarnation)
+		return false;
+	if (before->opcode == PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE
+		&& after->opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON) {
+		expected_state = PGRAC_FENCED_JOURNAL_TARGET_OFF;
+		expected_kind = PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT;
+	} else if (before->opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON
+			   && after->opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON
+			   && memcmp(before->rejoin_gate_digest, after->rejoin_gate_digest, 32) == 0) {
+		expected_state = PGRAC_FENCED_JOURNAL_TARGET_ON;
+		expected_kind = PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT;
+	} else
+		return false;
+	return previous->record_kind == expected_kind
+		   && previous->provider_result == PGRAC_FENCED_JOURNAL_PROVIDER_OK
+		   && previous->target_state == expected_state && previous->io_drain_state == 1
+		   && previous->deny_reason == 0 && previous->proof_generation != 0
+		   && current->event_mono_ns >= previous->event_mono_ns
+		   && previous->fresh_until_mono_ns > previous->event_mono_ns
+		   /* AUTHORIZE consumes OFF evidence; REFRESH obtains new ON evidence. */
+		   && (expected_state == PGRAC_FENCED_JOURNAL_TARGET_ON
+			   || current->event_mono_ns < previous->fresh_until_mono_ns)
+		   && pgrac_external_fence_target_state_digest_v1(
+			   previous->intent.target_uuid, expected_state, previous->io_drain_state,
+			   previous->mapping_generation, previous->proof_generation, digest)
+		   && memcmp(digest, previous->target_state_digest, sizeof(digest)) == 0;
+}
+
 /* PGRAC: a callback cannot replace a different durable need or attempt. */
 bool
 pgrac_fenced_journal_intent_continues(const PgracFencedJournalRecordV1 *previous,
@@ -280,13 +326,15 @@ pgrac_fenced_journal_intent_continues(const PgracFencedJournalRecordV1 *previous
 		|| previous->provider_abi_version != current->provider_abi_version
 		|| previous->mapping_generation != current->mapping_generation
 		|| memcmp(previous->operation_id, current->operation_id, 16) != 0
-		|| memcmp(previous->binding_digest, current->binding_digest, 32) != 0
 		|| memcmp(previous->semantic_config_digest, current->semantic_config_digest, 32) != 0
 		|| !pgrac_fenced_journal_frame_encode(previous, before, sizeof(before), &before_len)
 		|| before_len != after_len ||
-		/* Canonical request (256), target (16), then sysid/protected-set (40). */
-		memcmp(before + 272, after + 272, 272) != 0 || memcmp(before + 552, after + 552, 40) != 0)
+		/* Target (16), then sysid/protected-set (40), never change between phases. */
+		memcmp(before + 528, after + 528, 16) != 0 || memcmp(before + 552, after + 552, 40) != 0)
 		return false;
+	if (memcmp(previous->binding_digest, current->binding_digest, 32) != 0
+		|| memcmp(before + 272, after + 272, 256) != 0)
+		return rejoin_phase_continues(previous, current);
 	if (previous->intent.attempt == current->intent.attempt)
 		return memcmp(previous->daemon_boot_id, current->daemon_boot_id, 16) == 0;
 	return previous->intent.attempt != UINT64_MAX

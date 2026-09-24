@@ -3,13 +3,17 @@
  * test_pgrac_fenced_rejoin_async.c
  *    Parent-owned PFRJ state, proof generations and journal serialization.
  *
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 
 #include <fcntl.h>
 #include <poll.h>
+#include <signal.h>
 #include <sys/mman.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -22,6 +26,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+#include "data/pgrac_fence_map_v2_fixture.h"
 
 static volatile uint32 *provider_state;
 
@@ -77,7 +83,7 @@ deadline_after_ms(uint64 milliseconds)
 static int
 open_context(PgracFencedOperationContextV1 *operation_context,
 			 PgracFencedRejoinContextV1 *rejoin_context, PgracFencedJournalScanState *journal_state,
-			 PgracFencedConfigV1 *config, PgracFencedProviderOpsV1 *ops, char path[64])
+			 PgracFencedConfigV1 *config, PgracFencedProviderOpsV1 *ops, char path[64], bool owned)
 {
 	uint8 config_digest[32];
 	uint8 daemon_boot_id[16];
@@ -104,6 +110,19 @@ open_context(PgracFencedOperationContextV1 *operation_context,
 	ops->readback = test_readback;
 	ops->actuate_on = test_actuate;
 	ops->shutdown = test_shutdown;
+	if (owned) {
+		PgracFencedConfigResult parsed = pgrac_fenced_config_parse(
+			(const uint8 *)fenced_config_v2, sizeof(fenced_config_v2) - 1, config);
+#ifndef USE_OPENSSL
+		UT_ASSERT_NE(parsed, PGRAC_FENCED_CONFIG_OK);
+		return -1;
+#else
+		UT_ASSERT_EQ(parsed, PGRAC_FENCED_CONFIG_OK);
+		if (parsed != PGRAC_FENCED_CONFIG_OK)
+			return -1;
+		ops->provider_id = PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1;
+#endif
+	}
 	memset(config_digest, 0x71, sizeof(config_digest));
 	memset(daemon_boot_id, 0x81, sizeof(daemon_boot_id));
 	strcpy(path, "/tmp/pgrac-fenced-rejoin-async.XXXXXX");
@@ -161,7 +180,8 @@ make_bound_request(uint16 opcode, const PgracExternalFenceProtocolRejoinFrameV1 
 	request->timeout_ms = 1000;
 }
 
-UT_TEST(test_parent_serializes_full_async_rejoin_lifecycle)
+static void
+full_async_lifecycle(bool owned)
 {
 	PgracFencedOperationContextV1 operation_context;
 	PgracFencedRejoinContextV1 rejoin_context;
@@ -179,14 +199,14 @@ UT_TEST(test_parent_serializes_full_async_rejoin_lifecycle)
 
 	memset((void *)provider_state, 0, sizeof(uint32) * 4);
 	provider_state[2] = PGRAC_FENCED_TARGET_OFF;
-	journal_fd
-		= open_context(&operation_context, &rejoin_context, &journal_state, &config, &ops, path);
+	journal_fd = open_context(&operation_context, &rejoin_context, &journal_state, &config, &ops,
+							  path, owned);
 	if (journal_fd < 0)
 		return;
 	memset(&request, 0, sizeof(request));
 	request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE;
 	memset(request.transport_nonce, 0x61, sizeof(request.transport_nonce));
-	request.old_node_id = 3;
+	request.old_node_id = owned ? 2 : 3;
 	request.old_incarnation = 70;
 	request.candidate_incarnation = 77;
 	request.timeout_ms = 1000;
@@ -233,6 +253,86 @@ UT_TEST(test_parent_serializes_full_async_rejoin_lifecycle)
 	(void)unlink(path);
 }
 
+UT_TEST(test_parent_serializes_full_async_rejoin_lifecycle)
+{
+	full_async_lifecycle(false);
+}
+
+UT_TEST(test_parent_serializes_owned_async_rejoin_lifecycle)
+{
+	full_async_lifecycle(true);
+}
+
+static void
+stop_test_worker(PgracFencedRejoinAsyncWorkerV1 *worker)
+{
+	if (worker->fd >= 0)
+		(void)close(worker->fd);
+	if (worker->active) {
+		(void)kill(worker->pid, SIGKILL);
+		while (waitpid(worker->pid, NULL, 0) < 0 && errno == EINTR)
+			;
+	}
+}
+
+/* Real child messages must not overwrite a changed parent operation slot. */
+UT_TEST(test_owned_worker_cannot_publish_after_parent_identity_changes)
+{
+	for (int after_journal = 0; after_journal < 3; ++after_journal) {
+		PgracFencedOperationContextV1 operation_context;
+		PgracFencedRejoinContextV1 context;
+		PgracFencedJournalScanState journal_state;
+		PgracFencedConfigV1 config;
+		PgracFencedProviderOpsV1 ops;
+		PgracFencedRejoinAsyncWorkerV1 worker;
+		PgracExternalFenceProtocolRejoinFrameV1 request, response;
+		PgracFencedRejoinAsyncEvent event;
+		uint8 operation_id[16];
+		uint64 next_seq;
+		char path[64];
+		int fd
+			= open_context(&operation_context, &context, &journal_state, &config, &ops, path, true);
+
+		if (fd < 0)
+			return;
+		memset((void *)provider_state, 0, sizeof(uint32) * 4);
+		provider_state[2] = PGRAC_FENCED_TARGET_OFF;
+		memset(&request, 0, sizeof(request));
+		request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE;
+		memset(request.transport_nonce, 0x81, 16);
+		request.old_node_id = 2;
+		request.old_incarnation = 91;
+		request.candidate_incarnation = 92;
+		request.timeout_ms = 1000;
+		memset(operation_id, 0xa8, 16);
+		UT_ASSERT(pgrac_fenced_rejoin_async_start(
+			&operation_context, &context, PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE, &request,
+			operation_id, false, deadline_after_ms(2000), &worker));
+		if (after_journal) {
+			struct pollfd poll_fd = { worker.fd, POLLIN, 0 };
+			UT_ASSERT_EQ(poll(&poll_fd, 1, 2000), 1);
+			UT_ASSERT(pgrac_fenced_rejoin_async_service(&operation_context, &context, &worker,
+														&event, &response));
+			UT_ASSERT_EQ(event, PGRAC_FENCED_REJOIN_ASYNC_JOURNAL);
+		}
+		next_seq = journal_state.next_seq;
+		if (after_journal == 2)
+			worker.last_record.seq++;
+		else {
+			context.operations[0].state = PGRAC_FENCED_REJOIN_OPERATION_OFFERED;
+			memset(context.operations[0].operation_id, 0xdd, 16);
+			context.operation_count = 1;
+		}
+		UT_ASSERT(!finish_worker(&operation_context, &context, &worker, &response));
+		UT_ASSERT_EQ(context.operations[0].operation_id[0], after_journal == 2 ? 0 : 0xdd);
+		UT_ASSERT_EQ(journal_state.next_seq, next_seq);
+		UT_ASSERT_EQ(provider_state[1], 0);
+		stop_test_worker(&worker);
+		(void)close(fd);
+		(void)unlink(path);
+	}
+}
+
 int
 main(void)
 {
@@ -240,8 +340,10 @@ main(void)
 		= mmap(NULL, sizeof(uint32) * 4, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (provider_state == MAP_FAILED)
 		return 1;
-	UT_PLAN(1);
+	UT_PLAN(3);
 	UT_RUN(test_parent_serializes_full_async_rejoin_lifecycle);
+	UT_RUN(test_parent_serializes_owned_async_rejoin_lifecycle);
+	UT_RUN(test_owned_worker_cannot_publish_after_parent_identity_changes);
 	UT_DONE();
 	(void)munmap((void *)provider_state, sizeof(uint32) * 4);
 	return ut_failed_count == 0 ? 0 : 1;

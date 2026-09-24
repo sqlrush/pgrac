@@ -299,6 +299,134 @@ UT_TEST(test_intent_rejoin_preserves_admin_and_on_identities)
 	}
 }
 
+/* A legitimate new phase must not be mistaken for mutation of an old callback. */
+static void
+make_rejoin_phase(uint16 opcode, uint64 seq, uint64 attempt, PgracFencedJournalRecordV1 *record)
+{
+	uint8 frame[768];
+
+	UT_ASSERT(make_rejoin_fixture(frame, opcode, 2, 91, 92));
+	UT_ASSERT(pgrac_fenced_journal_record_decode(frame, sizeof(frame), record));
+	record->seq = seq;
+	record->intent.attempt = attempt;
+	record->record_kind = PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+}
+
+static void
+rejoin_phase_proof(PgracFencedJournalRecordV1 *record, bool on)
+{
+	record->record_kind = on ? PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT
+							 : PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT;
+	record->provider_result = PGRAC_FENCED_JOURNAL_PROVIDER_OK;
+	record->target_state = on ? PGRAC_FENCED_JOURNAL_TARGET_ON : PGRAC_FENCED_JOURNAL_TARGET_OFF;
+	record->io_drain_state = 1;
+	record->deny_reason = 0;
+	record->proof_generation = 7;
+	record->fresh_until_mono_ns = record->event_mono_ns + 1000;
+	UT_ASSERT(pgrac_external_fence_target_state_digest_v1(
+		record->intent.target_uuid, record->target_state, record->io_drain_state,
+		record->mapping_generation, record->proof_generation, record->target_state_digest));
+}
+
+UT_TEST(test_rejoin_successor_phases_preserve_one_owned_identity)
+{
+	PgracFencedJournalRecordV1 admin, authorize, refresh;
+
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE, 1, 1, &admin);
+	rejoin_phase_proof(&admin, false);
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, 2, 2, &authorize);
+	authorize.intent.request.rejoin.transport_nonce[0] = 0x71;
+	authorize.intent.request.rejoin.timeout_ms = 1000;
+	UT_ASSERT(pgrac_fenced_journal_intent_continues(&admin, &authorize));
+	rejoin_phase_proof(&authorize, true);
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON, 3, 3, &refresh);
+	refresh.intent.request.rejoin.transport_nonce[0] = 0x72;
+	refresh.intent.request.rejoin.timeout_ms = 500;
+	UT_ASSERT(pgrac_fenced_journal_intent_continues(&authorize, &refresh));
+	/* REFRESH creates new evidence; waiting for the joiner can outlive ON's proof. */
+	refresh.event_mono_ns = authorize.fresh_until_mono_ns + 1;
+	UT_ASSERT(pgrac_fenced_journal_intent_continues(&authorize, &refresh));
+	/* AUTHORIZE still cannot actuate using an expired OFF offer. */
+	authorize.record_kind = PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+	authorize.event_mono_ns = admin.fresh_until_mono_ns;
+	UT_ASSERT(!pgrac_fenced_journal_intent_continues(&admin, &authorize));
+}
+
+UT_TEST(test_rejoin_phase_cannot_skip_or_replace_authority)
+{
+	PgracFencedJournalRecordV1 admin, authorize, refresh, bad;
+
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE, 1, 1, &admin);
+	rejoin_phase_proof(&admin, false);
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, 2, 2, &authorize);
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON, 2, 2, &refresh);
+	UT_ASSERT(!pgrac_fenced_journal_intent_continues(&admin, &refresh));
+	for (int variant = 0; variant < 8; ++variant) {
+		bad = authorize;
+		switch (variant) {
+		case 0:
+			bad.intent.attempt = 1;
+			break;
+		case 1:
+			bad.intent.attempt = 3;
+			break;
+		case 2:
+			bad.record_kind = PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED;
+			break;
+		case 3:
+			bad.daemon_boot_id[0] ^= 1;
+			break;
+		case 4:
+			bad.intent.target_uuid[0] ^= 1;
+			break;
+		case 5:
+			bad.intent.request.rejoin.candidate_incarnation++;
+			break;
+		case 6:
+			bad.intent.request.rejoin.old_incarnation++;
+			break;
+		case 7:
+			bad.semantic_config_digest[0] ^= 1;
+			break;
+		}
+		UT_ASSERT(!pgrac_fenced_journal_intent_continues(&admin, &bad));
+	}
+	for (int variant = 0; variant < 6; ++variant) {
+		bad = admin;
+		switch (variant) {
+		case 0:
+			bad.provider_result = PGRAC_FENCED_JOURNAL_PROVIDER_UNKNOWN;
+			break;
+		case 1:
+			bad.io_drain_state = 0;
+			break;
+		case 2:
+			bad.deny_reason = 9;
+			break;
+		case 3:
+			bad.proof_generation = 0;
+			break;
+		case 4:
+			bad.target_state_digest[0] ^= 1;
+			break;
+		case 5:
+			bad.record_kind = PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED;
+			break;
+		}
+		UT_ASSERT(!pgrac_fenced_journal_intent_continues(&bad, &authorize));
+	}
+	rejoin_phase_proof(&authorize, true);
+	refresh.seq = 3;
+	refresh.intent.attempt = 3;
+	bad = refresh;
+	bad.intent.request.rejoin.rejoin_gate_digest[0] ^= 1;
+	UT_ASSERT(!pgrac_fenced_journal_intent_continues(&authorize, &bad));
+	bad = authorize;
+	bad.seq++;
+	bad.intent.request.rejoin.transport_nonce[0] ^= 1;
+	UT_ASSERT(!pgrac_fenced_journal_intent_continues(&authorize, &bad));
+}
+
 UT_TEST(test_rejoin_admin_intent_rejects_invalid_identity)
 {
 	const struct {
@@ -1156,13 +1284,15 @@ UT_TEST(test_sealed_name_parser_is_canonical_and_full_segment_only)
 int
 main(void)
 {
-	UT_PLAN(33);
+	UT_PLAN(35);
 	UT_RUN(test_journal_exact_codec_roundtrip);
 	UT_RUN(test_restart_decodes_exact_persisted_intent);
 	UT_RUN(test_intent_codec_keeps_complete_identity_and_capacity);
 	UT_RUN(test_intent_corruption_and_truncation_clear_output);
 	UT_RUN(test_intent_identity_is_checked_beyond_crc);
 	UT_RUN(test_intent_rejoin_preserves_admin_and_on_identities);
+	UT_RUN(test_rejoin_successor_phases_preserve_one_owned_identity);
+	UT_RUN(test_rejoin_phase_cannot_skip_or_replace_authority);
 	UT_RUN(test_rejoin_admin_intent_rejects_invalid_identity);
 	UT_RUN(test_bootstrap_detects_byte_full_mixed_segment);
 	UT_RUN(test_mixed_journal_hashes_the_entire_intent);
