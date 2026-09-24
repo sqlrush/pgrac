@@ -150,8 +150,320 @@ snapshot(xmlNode *root, PgracFencedCibObservation *out)
 	return configuration != NULL && configuration_digest(configuration, out->configuration_digest);
 }
 
+static bool
+name_valid(const char name[PGRAC_CIB_NAME_BYTES])
+{
+	size_t length = strnlen(name, PGRAC_CIB_NAME_BYTES);
+	if (length == 0 || length == PGRAC_CIB_NAME_BYTES)
+		return false;
+	for (size_t n = 0; n < length; n++) {
+		unsigned char ch = name[n];
+		bool alnum
+			= (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
+		if (!alnum && (n == 0 || (ch != '-' && ch != '_' && ch != '.')))
+			return false;
+	}
+	return true;
+}
+
+static bool
+policy_valid(const PgracFencedCibPolicy *policy)
+{
+	static const uint8 zero[32] = { 0 };
+	if (policy == NULL || !name_valid(policy->resource) || policy->nodes == NULL
+		|| policy->node_count == 0 || policy->node_count > PGRAC_CIB_POLICY_MAX_NODES
+		|| memcmp(policy->configuration_digest, zero, 32) == 0)
+		return false;
+	for (unsigned n = 0; n < policy->node_count; n++) {
+		if (!name_valid(policy->nodes[n].name)
+			|| memcmp(policy->nodes[n].guest_uuid, zero, 16) == 0)
+			return false;
+		for (unsigned prior = 0; prior < n; prior++)
+			if (strcmp(policy->nodes[n].name, policy->nodes[prior].name) == 0
+				|| memcmp(policy->nodes[n].guest_uuid, policy->nodes[prior].guest_uuid, 16) == 0)
+				return false;
+	}
+	return true;
+}
+
+static bool
+named(const xmlNode *node, const char *name)
+{
+	return node->type == XML_ELEMENT_NODE && xmlStrEqual(node->name, (const xmlChar *)name);
+}
+
+static bool
+property_is(xmlNode *node, const char *name, const char *value, bool optional)
+{
+	xmlChar *actual = xmlGetProp(node, (const xmlChar *)name);
+	bool result = actual == NULL ? optional : xmlStrEqual(actual, (const xmlChar *)value);
+	xmlFree(actual);
+	return result;
+}
+
+static xmlNode *
+single_child(xmlNode *parent, const char *name)
+{
+	xmlNode *result = NULL;
+	if (parent == NULL)
+		return NULL;
+	for (xmlNode *node = parent->children; node != NULL; node = node->next)
+		if (named(node, name)) {
+			if (result != NULL)
+				return NULL;
+			result = node;
+		}
+	return result;
+}
+
+/* The selected deployment uses literal policy. Do not partially interpret
+ * general rule/template/reference semantics as though they were unconditional.
+ * snapshot() has already bounded this tree's depth, nodes and bytes.
+ */
+static bool
+literal_tree(xmlNode *first)
+{
+	for (xmlNode *node = first; node != NULL; node = node->next) {
+		if (node->type != XML_ELEMENT_NODE)
+			continue;
+		if (named(node, "rule") || named(node, "template") || named(node, "fencing-topology")
+			|| xmlHasProp(node, (const xmlChar *)"id-ref") != NULL
+			|| xmlHasProp(node, (const xmlChar *)"template") != NULL
+			|| !literal_tree(node->children))
+			return false;
+	}
+	return true;
+}
+
+typedef struct CibPairs {
+	unsigned count;
+	xmlChar *names[128];
+	xmlChar *values[128];
+} CibPairs;
+
+static void
+free_pairs(CibPairs *pairs)
+{
+	for (unsigned n = 0; n < pairs->count; n++) {
+		xmlFree(pairs->names[n]);
+		xmlFree(pairs->values[n]);
+	}
+}
+
+static bool
+read_pairs(xmlNode *set, CibPairs *pairs)
+{
+	memset(pairs, 0, sizeof(*pairs));
+	if (set == NULL)
+		return false;
+	for (xmlNode *node = set->children; node != NULL; node = node->next) {
+		unsigned at;
+		if (node->type != XML_ELEMENT_NODE)
+			continue;
+		if (!named(node, "nvpair") || pairs->count == lengthof(pairs->names))
+			return false;
+		at = pairs->count++;
+		pairs->names[at] = xmlGetProp(node, (const xmlChar *)"name");
+		pairs->values[at] = xmlGetProp(node, (const xmlChar *)"value");
+		if (pairs->names[at] == NULL || pairs->names[at][0] == '\0' || pairs->values[at] == NULL
+			|| pairs->values[at][0] == '\0')
+			return false;
+		for (unsigned n = 0; n < at; n++)
+			if (xmlStrEqual(pairs->names[n], pairs->names[at]))
+				return false;
+		for (xmlNode *child = node->children; child != NULL; child = child->next)
+			if (child->type == XML_ELEMENT_NODE)
+				return false;
+	}
+	return true;
+}
+
+static const char *
+pair_value(const CibPairs *pairs, const char *key)
+{
+	for (unsigned n = 0; n < pairs->count; n++)
+		if (xmlStrEqual(pairs->names[n], (const xmlChar *)key))
+			return (const char *)pairs->values[n];
+	return NULL;
+}
+
+static bool
+pair_is(const CibPairs *pairs, const char *key, const char *value, bool optional)
+{
+	const char *actual = pair_value(pairs, key);
+	return actual == NULL ? optional : strcmp(actual, value) == 0;
+}
+
+static bool
+cluster_policy(xmlNode *configuration)
+{
+	CibPairs pairs;
+	bool ok = read_pairs(
+		single_child(single_child(configuration, "crm_config"), "cluster_property_set"), &pairs);
+	ok = ok && pair_is(&pairs, "stonith-enabled", "true", false)
+		 && pair_is(&pairs, "stonith-action", "off", false)
+		 && pair_is(&pairs, "no-quorum-policy", "freeze", false)
+		 && pair_is(&pairs, "maintenance-mode", "false", false);
+	free_pairs(&pairs);
+	return ok;
+}
+
+static int
+expected_node(const PgracFencedCibPolicy *policy, const char *name)
+{
+	if (name != NULL)
+		for (unsigned n = 0; n < policy->node_count; n++)
+			if (strcmp(name, policy->nodes[n].name) == 0)
+				return n;
+	return -1;
+}
+
+static bool
+node_inventory(xmlNode *configuration, const PgracFencedCibPolicy *policy)
+{
+	xmlNode *nodes = single_child(configuration, "nodes");
+	bool seen[PGRAC_CIB_POLICY_MAX_NODES] = { false };
+	unsigned count = 0;
+	if (nodes == NULL)
+		return false;
+	for (xmlNode *node = nodes->children; node != NULL; node = node->next) {
+		xmlChar *name, *id;
+		int index;
+		bool ok;
+		if (node->type != XML_ELEMENT_NODE)
+			continue;
+		name = xmlGetProp(node, (const xmlChar *)"uname");
+		id = xmlGetProp(node, (const xmlChar *)"id");
+		index = expected_node(policy, (const char *)name);
+		ok = named(node, "node") && index >= 0 && !seen[index] && id != NULL && id[0] != '\0'
+			 && property_is(node, "type", "member", true);
+		for (xmlNode *prior = nodes->children; ok && prior != node; prior = prior->next)
+			if (prior->type == XML_ELEMENT_NODE
+				&& property_is(prior, "id", (const char *)id, false))
+				ok = false;
+		xmlFree(name);
+		xmlFree(id);
+		if (!ok)
+			return false;
+		seen[index] = true;
+		count++;
+	}
+	return count == policy->node_count;
+}
+
+static void
+guest_text(const uint8 uuid[16], char text[37])
+{
+	static const char hex[] = "0123456789abcdef";
+	unsigned at = 0;
+	for (unsigned n = 0; n < 16; n++) {
+		if (n == 4 || n == 6 || n == 8 || n == 10)
+			text[at++] = '-';
+		text[at++] = hex[uuid[n] >> 4];
+		text[at++] = hex[uuid[n] & 15];
+	}
+	text[at] = '\0';
+}
+
+static bool
+host_bindings(const char *raw, const PgracFencedCibPolicy *policy, bool mapping)
+{
+	bool seen[PGRAC_CIB_POLICY_MAX_NODES] = { false };
+	char *copy, *part, *cursor;
+	unsigned count = 0;
+	bool ok = raw != NULL && raw[0] != '\0';
+	if (!ok || (copy = strdup(raw)) == NULL)
+		return false;
+	cursor = copy;
+	while ((part = strsep(&cursor, mapping ? ";" : " ,\t\n")) != NULL) {
+		char *uuid = mapping ? strchr(part, ':') : NULL;
+		char wanted[37];
+		int index;
+		if (!mapping && part[0] == '\0')
+			continue;
+		if (uuid != NULL)
+			*uuid++ = '\0';
+		index = expected_node(policy, part);
+		if (index < 0 || seen[index] || (mapping && uuid == NULL)) {
+			ok = false;
+			break;
+		}
+		if (mapping) {
+			guest_text(policy->nodes[index].guest_uuid, wanted);
+			if (strcmp(uuid, wanted) != 0) {
+				ok = false;
+				break;
+			}
+		}
+		seen[index] = true;
+		count++;
+	}
+	free(copy);
+	return ok && count == policy->node_count;
+}
+
+static void
+count_fencers(xmlNode *first, xmlNode **fencer, unsigned *count)
+{
+	for (xmlNode *node = first; node != NULL; node = node->next) {
+		if (named(node, "primitive") && property_is(node, "class", "stonith", false)) {
+			*fencer = node;
+			(*count)++;
+		}
+		count_fencers(node->children, fencer, count);
+	}
+}
+
+static bool
+resource_policy(xmlNode *configuration, const PgracFencedCibPolicy *policy)
+{
+	xmlNode *resources = single_child(configuration, "resources"), *fencer = NULL;
+	CibPairs pairs;
+	unsigned count = 0;
+	bool ok;
+	const char *missing;
+	if (resources == NULL)
+		return false;
+	count_fencers(resources->children, &fencer, &count);
+	if (count != 1 || fencer->parent != resources
+		|| !property_is(fencer, "id", policy->resource, false)
+		|| !property_is(fencer, "type", "fence_virsh", false)
+		|| xmlHasProp(fencer, (const xmlChar *)"provider") != NULL)
+		return false;
+	for (xmlNode *child = fencer->children; child != NULL; child = child->next)
+		if (child->type == XML_ELEMENT_NODE && !named(child, "instance_attributes")
+			&& !named(child, "operations"))
+			return false;
+	ok = read_pairs(single_child(fencer, "instance_attributes"), &pairs);
+	missing = pair_value(&pairs, "missing_as_off");
+	ok = ok && pair_is(&pairs, "pcmk_host_check", "static-list", false)
+		 && pair_is(&pairs, "pcmk_reboot_action", "off", false)
+		 && pair_is(&pairs, "pcmk_off_action", "off", true)
+		 && pair_is(&pairs, "pcmk_on_action", "on", true)
+		 && pair_is(&pairs, "pcmk_host_argument", "port", true)
+		 && (missing == NULL || strcmp(missing, "false") == 0 || strcmp(missing, "0") == 0)
+		 && pair_value(&pairs, "action") == NULL && pair_value(&pairs, "port") == NULL
+		 && pair_value(&pairs, "plug") == NULL
+		 && host_bindings(pair_value(&pairs, "pcmk_host_list"), policy, false)
+		 && host_bindings(pair_value(&pairs, "pcmk_host_map"), policy, true);
+	free_pairs(&pairs);
+	return ok;
+}
+
+static bool
+policy_matches(xmlNode *root, const PgracFencedCibPolicy *policy,
+			   const PgracFencedCibObservation *observation)
+{
+	xmlNode *configuration = single_child(root, "configuration");
+	return memcmp(policy->configuration_digest, observation->configuration_digest, 32) == 0
+		   && configuration != NULL && xmlHasProp(configuration, (const xmlChar *)"id-ref") == NULL
+		   && xmlHasProp(configuration, (const xmlChar *)"template") == NULL
+		   && literal_tree(configuration->children) && cluster_policy(configuration)
+		   && node_inventory(configuration, policy) && resource_policy(configuration, policy);
+}
+
 static PgracFencedProviderResult
-observe_native(uint64 deadline, PgracFencedCibObservation *out)
+observe_native(uint64 deadline, const PgracFencedCibPolicy *policy, PgracFencedCibObservation *out)
 {
 	cib_t *api;
 	xmlNode *root = NULL;
@@ -178,7 +490,8 @@ observe_native(uint64 deadline, PgracFencedCibObservation *out)
 	api->call_timeout = seconds;
 	if (api->cmds->query(api, NULL, &root, cib_sync_call) == 0
 		&& remaining_seconds(deadline, &seconds))
-		ok = snapshot(root, &candidate);
+		ok = snapshot(root, &candidate)
+			 && (policy == NULL || policy_matches(root, policy, &candidate));
 done:
 	if (root != NULL)
 		free_xml(root);
@@ -199,9 +512,27 @@ pgrac_fenced_cib_observe(uint64 deadline_mono_ns, PgracFencedCibObservation *out
 		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	memset(out, 0, sizeof(*out));
 #ifdef USE_PACEMAKER
-	return observe_native(deadline_mono_ns, out);
+	return observe_native(deadline_mono_ns, NULL, out);
 #else
 	(void)deadline_mono_ns;
+	return PGRAC_FENCED_PROVIDER_UNAVAILABLE;
+#endif
+}
+
+PgracFencedProviderResult
+pgrac_fenced_cib_check(uint64 deadline_mono_ns, const PgracFencedCibPolicy *policy,
+					   PgracFencedCibObservation *out)
+{
+	if (out == NULL)
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
+	memset(out, 0, sizeof(*out));
+#ifdef USE_PACEMAKER
+	if (!policy_valid(policy))
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
+	return observe_native(deadline_mono_ns, policy, out);
+#else
+	(void)deadline_mono_ns;
+	(void)policy;
 	return PGRAC_FENCED_PROVIDER_UNAVAILABLE;
 #endif
 }

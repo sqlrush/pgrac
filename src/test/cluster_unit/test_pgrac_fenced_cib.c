@@ -14,7 +14,9 @@
 #include "pgrac_fenced_cib.h"
 #ifdef USE_PACEMAKER
 #include <crm/cib.h>
+#include <libxml/c14n.h>
 #include <libxml/parser.h>
+#include <openssl/evp.h>
 #endif
 #undef printf
 #undef fprintf
@@ -286,12 +288,243 @@ UT_TEST(test_native_tree_work_is_bounded)
 	free(raw);
 	document = valid;
 }
+
+static char *
+policy_fixture(PgracFencedCibPolicy *policy, PgracFencedCibNode nodes[4])
+{
+	/* Independent xmllint C14N + openssl digest, not the production observer. */
+	static const uint8 digest[32]
+		= { 0x1c, 0x3a, 0x95, 0x2b, 0xd4, 0xfe, 0x77, 0xef, 0x23, 0xf0, 0xa5,
+			0x79, 0xee, 0x0f, 0x17, 0xeb, 0x64, 0x00, 0x05, 0x47, 0xcd, 0x39,
+			0x06, 0x52, 0xca, 0x5a, 0xaa, 0x1a, 0x1d, 0xe0, 0xc2, 0x7f };
+	FILE *file = fopen(PGRAC_CIB_POLICY_FIXTURE, "rb");
+	char *raw = calloc(1, 16384);
+	size_t length;
+	if (file == NULL || raw == NULL)
+		abort();
+	length = fread(raw, 1, 16383, file);
+	if (ferror(file) || !feof(file) || length == 0)
+		abort();
+	fclose(file);
+	memset(policy, 0, sizeof(*policy));
+	memset(nodes, 0, sizeof(*nodes) * 4);
+	strcpy(policy->resource, "fence");
+	memcpy(policy->configuration_digest, digest, sizeof(digest));
+	policy->nodes = nodes;
+	policy->node_count = 4;
+	for (unsigned n = 0; n < 4; n++) {
+		snprintf(nodes[n].name, sizeof(nodes[n].name), "node%u", n);
+		nodes[n].guest_uuid[15] = n + 1;
+	}
+	reset();
+	document = raw;
+	return raw;
+}
+
+/* Fixture producer only: recalculate a deliberately changed document's pin
+ * using libxml/OpenSSL directly so a semantic negative cannot pass merely
+ * because the configuration hash changed. Never calls production hashing.
+ */
+static void
+repin_fixture(PgracFencedCibPolicy *policy)
+{
+	xmlDoc *source = xmlReadMemory(document, strlen(document), NULL, NULL, XML_PARSE_NONET);
+	xmlNode *root = xmlDocGetRootElement(source), *configuration = root->children;
+	xmlDoc *copy = xmlNewDoc((const xmlChar *)"1.0");
+	xmlChar *canonical = NULL;
+	EVP_MD_CTX *digest = EVP_MD_CTX_new();
+	int length;
+	unsigned size;
+	while (configuration && !xmlStrEqual(configuration->name, (const xmlChar *)"configuration"))
+		configuration = configuration->next;
+	if (!configuration || !copy || !digest)
+		abort();
+	xmlDocSetRootElement(copy, xmlDocCopyNode(configuration, copy, 1));
+	length = xmlC14NDocDumpMemory(copy, NULL, XML_C14N_1_0, NULL, 0, &canonical);
+	if (length <= 0 || EVP_DigestInit_ex(digest, EVP_sha256(), NULL) != 1
+		|| EVP_DigestUpdate(digest, "PGRAC-NATIVE-CIB-CONFIGURATION-V1", 34) != 1
+		|| EVP_DigestUpdate(digest, canonical, length) != 1
+		|| EVP_DigestFinal_ex(digest, policy->configuration_digest, &size) != 1 || size != 32)
+		abort();
+	EVP_MD_CTX_free(digest);
+	xmlFree(canonical);
+	xmlFreeDoc(copy);
+	xmlFreeDoc(source);
+}
+
+static char *
+replace_fixture(const char *raw, const char *old, const char *replacement)
+{
+	const char *found = strstr(raw, old);
+	size_t prefix;
+	char *result;
+	if (found == NULL)
+		abort();
+	prefix = found - raw;
+	result = malloc(strlen(raw) + strlen(replacement) + 1);
+	if (result == NULL)
+		abort();
+	memcpy(result, raw, prefix);
+	strcpy(result + prefix, replacement);
+	strcpy(result + prefix + strlen(replacement), found + strlen(old));
+	return result;
+}
+
+static void
+check_policy(PgracFencedCibPolicy *policy, PgracFencedProviderResult expected)
+{
+	PgracFencedCibObservation out, zero = { 0 };
+	memset(&out, 0x7f, sizeof(out));
+	UT_ASSERT_EQ(pgrac_fenced_cib_check(now_ns + UINT64_C(2000000000), policy, &out), expected);
+	if (expected == PGRAC_FENCED_PROVIDER_OK) {
+		UT_ASSERT(memcmp(out.configuration_digest, policy->configuration_digest, 32) == 0);
+		UT_ASSERT_EQ(out.epoch, 7);
+	} else
+		UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+}
+
+UT_TEST(test_checked_policy_binds_pin_and_inventory_in_one_native_query)
+{
+	PgracFencedCibPolicy policy;
+	PgracFencedCibNode nodes[4];
+	char *raw = policy_fixture(&policy, nodes);
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_OK);
+	UT_ASSERT_EQ(queried, 1);
+	UT_ASSERT_EQ(disconnected, 1);
+	policy.configuration_digest[0] ^= 1;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_UNKNOWN);
+	policy.configuration_digest[0] ^= 1;
+	nodes[0].guest_uuid[15] = 9;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_UNKNOWN);
+	nodes[0].guest_uuid[15] = 1;
+	strcpy(nodes[0].name, "replacement");
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_UNKNOWN);
+	free(raw);
+}
+
+UT_TEST(test_checked_policy_rejects_requalified_unsafe_or_ambiguous_policy)
+{
+	const char *changes[][2] = {
+		{ "name=\"stonith-enabled\" value=\"true\"", "name=\"stonith-enabled\" value=\"false\"" },
+		{ "name=\"stonith-action\" value=\"off\"", "name=\"stonith-action\" value=\"reboot\"" },
+		{ "value=\"freeze\"", "value=\"ignore\"" },
+		{ "name=\"maintenance-mode\" value=\"false\"", "name=\"maintenance-mode\" value=\"true\"" },
+		{ "value=\"static-list\"", "value=\"dynamic-list\"" },
+		{ "name=\"pcmk_reboot_action\" value=\"off\"", "name=\"pcmk_reboot_action\" value=\"on\"" },
+		{ "</instance_attributes>",
+		  "<nvpair name=\"pcmk_off_action\" value=\"on\"/></instance_attributes>" },
+		{ "</instance_attributes>",
+		  "<nvpair name=\"pcmk_on_action\" value=\"reboot\"/></instance_attributes>" },
+		{ "</instance_attributes>",
+		  "<nvpair name=\"missing_as_off\" value=\"1\"/></instance_attributes>" },
+		{ "</instance_attributes>",
+		  "<nvpair name=\"port\" value=\"other\"/></instance_attributes>" },
+		{ "</instance_attributes>",
+		  "<nvpair name=\"pcmk_host_argument\" value=\"none\"/></instance_attributes>" },
+		{ "</instance_attributes>",
+		  "<nvpair name=\"pcmk_host_check\" value=\"static-list\"/></instance_attributes>" },
+		{ "<instance_attributes id=\"fence-attributes\">",
+		  "<instance_attributes id=\"fence-attributes\" id-ref=\"elsewhere\">" },
+		{ "</instance_attributes>", "<rule id=\"conditional\"/></instance_attributes>" },
+		{ "</primitive><primitive id=\"storage\"",
+		  "<meta_attributes><nvpair name=\"provides\" "
+		  "value=\"unfencing\"/></meta_attributes></primitive><primitive id=\"storage\"" },
+		{ "type=\"fence_virsh\"", "type=\"fence_virsh\" template=\"alternate\"" },
+		{ "<constraints/>", "<constraints/><fencing-topology/>" },
+		{ "</resources>",
+		  "<template id=\"other\" class=\"stonith\" type=\"fence_virsh\"/></resources>" },
+		{ "class=\"ocf\"", "class=\"stonith\"" },
+		{ "value=\"node0 node1 node2 node3\"", "value=\"node0 node0 node2 node3\"" },
+		{ "node1:00000000-0000-0000-0000-000000000002",
+		  "node1:00000000-0000-0000-0000-000000000001" },
+		{ "uname=\"node1\"", "uname=\"node0\"" },
+		{ "<node id=\"4\" uname=\"node3\"/>", "" },
+		{ "<nodes>", "<nodes><node id=\"5\" uname=\"unexpected\"/>" },
+	};
+	PgracFencedCibPolicy policy;
+	PgracFencedCibNode nodes[4];
+	char *raw = policy_fixture(&policy, nodes);
+	for (size_t n = 0; n < lengthof(changes); n++) {
+		char *changed = replace_fixture(raw, changes[n][0], changes[n][1]);
+		document = changed;
+		repin_fixture(&policy);
+		check_policy(&policy, PGRAC_FENCED_PROVIDER_UNKNOWN);
+		free(changed);
+	}
+	free(raw);
+}
+
+UT_TEST(test_checked_policy_accepts_explicit_safe_defaults_and_status_change)
+{
+	PgracFencedCibPolicy policy;
+	PgracFencedCibNode nodes[4];
+	char *raw = policy_fixture(&policy, nodes);
+	char *changed = replace_fixture(
+		raw, "</instance_attributes>",
+		"<nvpair name=\"pcmk_off_action\" value=\"off\"/>"
+		"<nvpair name=\"pcmk_on_action\" value=\"on\"/>"
+		"<nvpair name=\"pcmk_host_argument\" value=\"port\"/>"
+		"<nvpair name=\"missing_as_off\" value=\"false\"/></instance_attributes>");
+	document = changed;
+	repin_fixture(&policy);
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_OK);
+	free(changed);
+	document = raw;
+	repin_fixture(&policy);
+	changed = replace_fixture(raw, "<status/>", "<status><node_state id=\"1\"/></status>");
+	document = changed;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_OK);
+	free(changed);
+	/* Runtime status is not interpreted as configuration, even when it uses
+	 * names that are deliberately unsupported in configuration policy.
+	 */
+	changed = replace_fixture(raw, "<status/>", "<status><rule id=\"runtime-only\"/></status>");
+	document = changed;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_OK);
+	expire_on_query = true;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_UNKNOWN);
+	free(changed);
+	free(raw);
+}
+
+UT_TEST(test_checked_policy_invalid_expectation_never_queries_native)
+{
+	PgracFencedCibPolicy policy;
+	PgracFencedCibNode nodes[4];
+	char *raw = policy_fixture(&policy, nodes);
+	check_policy(NULL, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	policy.node_count = 0;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	policy.node_count = PGRAC_CIB_POLICY_MAX_NODES + 1;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	policy.node_count = 4;
+	memset(policy.resource, 'r', sizeof(policy.resource));
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	strcpy(policy.resource, "fence");
+	memset(nodes[0].name, 'n', sizeof(nodes[0].name));
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	strcpy(nodes[0].name, "node0");
+	nodes[0].guest_uuid[15] = 0;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	nodes[0].guest_uuid[15] = 1;
+	nodes[1] = nodes[0];
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	nodes[1].guest_uuid[15] = 2;
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	strcpy(nodes[1].name, "node1");
+	memset(policy.configuration_digest, 0, sizeof(policy.configuration_digest));
+	check_policy(&policy, PGRAC_FENCED_PROVIDER_CONFIG_ERROR);
+	UT_ASSERT_EQ(created, 0);
+	free(raw);
+}
 #else
 UT_TEST(test_non_native_build_is_unavailable)
 {
 	PgracFencedCibObservation out, zero = { 0 };
 	memset(&out, 0x7f, sizeof(out));
 	UT_ASSERT_EQ(pgrac_fenced_cib_observe(UINT64_MAX, &out), PGRAC_FENCED_PROVIDER_UNAVAILABLE);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+	UT_ASSERT_EQ(pgrac_fenced_cib_check(UINT64_MAX, NULL, &out), PGRAC_FENCED_PROVIDER_UNAVAILABLE);
 	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
 }
 #endif
@@ -300,7 +533,7 @@ int
 main(void)
 {
 #ifdef USE_PACEMAKER
-	UT_PLAN(7);
+	UT_PLAN(11);
 	UT_RUN(test_native_query_only_and_exact_cleanup);
 	UT_RUN(test_configuration_fingerprint_is_not_runtime_status);
 	UT_RUN(test_malformed_configuration_is_not_observed);
@@ -308,6 +541,10 @@ main(void)
 	UT_RUN(test_original_deadline_covers_connect_query_and_publication);
 	UT_RUN(test_uint64_boundary_and_bad_output);
 	UT_RUN(test_native_tree_work_is_bounded);
+	UT_RUN(test_checked_policy_binds_pin_and_inventory_in_one_native_query);
+	UT_RUN(test_checked_policy_rejects_requalified_unsafe_or_ambiguous_policy);
+	UT_RUN(test_checked_policy_accepts_explicit_safe_defaults_and_status_change);
+	UT_RUN(test_checked_policy_invalid_expectation_never_queries_native);
 #else
 	UT_PLAN(1);
 	UT_RUN(test_non_native_build_is_unavailable);

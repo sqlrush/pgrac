@@ -1405,8 +1405,10 @@ test_pgrac_fenced_pacemaker: test_pgrac_fenced_pacemaker.c unit_test.h \
 
 # PGRAC: native CIB replacement is test-only; XML/crypto are real library calls.
 test_pgrac_fenced_cib: test_pgrac_fenced_cib.c unit_test.h \
+		data/pgrac_fenced_cib_policy.xml \
 		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_cib.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(PACEMAKER_CFLAGS) \
+		-DPGRAC_CIB_POLICY_FIXTURE='"$(abspath $(srcdir))/data/pgrac_fenced_cib_policy.xml"' \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
 		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_cib.o \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
