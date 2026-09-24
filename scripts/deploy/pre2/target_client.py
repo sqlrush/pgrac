@@ -27,15 +27,24 @@ class TargetEndpoint:
     inventory_digest: str
 
 
-def _policy(endpoint, context):
+def validate_endpoint(endpoint):
+    """Validate owner configuration without opening a connection or TLS key."""
     label = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
     if (type(endpoint) is not TargetEndpoint or type(endpoint.address) is not str
             or str(ipaddress.IPv4Address(endpoint.address)) != endpoint.address
+            or ipaddress.IPv4Address(endpoint.address).is_unspecified
+            or ipaddress.IPv4Address(endpoint.address).is_multicast
+            or endpoint.address == "255.255.255.255"
             or type(endpoint.port) is not int or not 1 <= endpoint.port <= 65535
             or type(endpoint.server_name) is not str or len(endpoint.server_name) > 253
             or not re.fullmatch(label + r"(?:\." + label + r")*", endpoint.server_name)
-            or not _hex(endpoint.certificate_sha256, 64) or not _hex(endpoint.inventory_digest, 64)
-            or not isinstance(context, ssl.SSLContext) or context.protocol != ssl.PROTOCOL_TLS_CLIENT
+            or not _hex(endpoint.certificate_sha256, 64) or not _hex(endpoint.inventory_digest, 64)):
+        raise TargetJournalError("TARGET_CLIENT_POLICY")
+
+
+def _policy(endpoint, context):
+    validate_endpoint(endpoint)
+    if (not isinstance(context, ssl.SSLContext) or context.protocol != ssl.PROTOCOL_TLS_CLIENT
             or context.verify_mode != ssl.CERT_REQUIRED or not context.check_hostname
             or context.hostname_checks_common_name or context.keylog_filename is not None
             or context.minimum_version != ssl.TLSVersion.TLSv1_3

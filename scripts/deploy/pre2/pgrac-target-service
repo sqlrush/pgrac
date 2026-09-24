@@ -48,8 +48,10 @@ def main():
         return 1
     if sys.argv[1:] == ["--help"]:
         print("Usage: pgrac-target-service --config /absolute/protected/service.json")
+        print("       pgrac-target-service --request --config /absolute/protected/client.json --deadline-ns N")
         return 0
-    if len(sys.argv) != 3 or sys.argv[1] != "--config":
+    client = len(sys.argv) == 6 and sys.argv[1:3] == ["--request", "--config"] and sys.argv[4] == "--deadline-ns"
+    if not client and (len(sys.argv) != 3 or sys.argv[1] != "--config"):
         print("TARGET_SERVICE_ARGUMENT", file=sys.stderr)
         return 1
     os.umask(0o077)
@@ -62,7 +64,15 @@ def main():
         print("TARGET_SERVICE_CODE", file=sys.stderr)
         return 1
     try:
-        run_service(sys.argv[2])
+        if client:
+            from target_client_runtime import run_client_stream
+            text = sys.argv[5]
+            if (not text.isascii() or not text.isdecimal() or len(text) > 20 or text.startswith("0")
+                    or not 0 < int(text) < 1 << 64):
+                raise TargetJournalError("TARGET_CLIENT_UNPROVEN")
+            run_client_stream(sys.argv[3], int(text))
+        else:
+            run_service(sys.argv[2])
         return 0
     except TargetJournalError as error:
         # All these errors are fixed internal reasons, not path/native text.
