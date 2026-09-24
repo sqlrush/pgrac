@@ -68,6 +68,18 @@ UT_DEFINE_GLOBALS();
 
 char *cluster_shared_data_dir = NULL;
 bool cluster_controlfile_shared_authority = false;
+/* PGRAC: immutable image helpers are linked, but not exercised by this legacy
+ * migration test. Never grant their clusterwide authority here.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool enableFsync = true;
+
+bool
+cluster_cf_held_is_clusterwide(LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+
 char *DataDir = NULL;					   /* storage.o's bootstrap orchestrator refs it */
 int cluster_cf_enqueue_timeout_ms = 30000; /* orchestrator liveness wait */
 

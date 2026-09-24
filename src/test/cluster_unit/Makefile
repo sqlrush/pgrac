@@ -1311,12 +1311,15 @@ test_cluster_hw_snapshot: test_cluster_hw_snapshot.c unit_test.h $(CLUSTER_VERSI
 # write round trip against a temp dir.  The fd.c openers, pg_fsync,
 # durable_rename and the ereport machinery are stubbed locally; CRC32C comes
 # from libpgport, so no PG backend is needed.
+# PGRAC: immutable image hashes use libpgcommon and configured crypto libraries.
+# Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_CF_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_cf_authority.o
 test_cluster_cf_authority: test_cluster_cf_authority.c unit_test.h \
-		$(CLUSTER_CF_AUTHORITY_O)
+		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_AUTHORITY_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_root.o
 # migration_wal_scan (contract) drives a real XLogReader over the thread
@@ -1757,10 +1760,11 @@ test_cluster_relmap_authority: test_cluster_relmap_authority.c unit_test.h \
 # authority test; CRC32C from libpgport, no PG backend.
 CLUSTER_CF_STORAGE_O = $(top_builddir)/src/backend/cluster/cluster_cf_storage.o
 test_cluster_cf_storage: test_cluster_cf_storage.c unit_test.h \
-		$(CLUSTER_CF_STORAGE_O) $(CLUSTER_CF_AUTHORITY_O)
+		$(CLUSTER_CF_STORAGE_O) $(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_CF_STORAGE_O) $(CLUSTER_CF_AUTHORITY_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # spec-5.6 Db1: test_cluster_cf_enqueue links cluster_cf_enqueue.o (the pure
 # resid encoder).  No PG backend deps beyond the Assert hook.
