@@ -24,6 +24,8 @@ FENCED_OBJS += pgrac_fenced_journal_intent.o
 FENCED_OBJS += pgrac_fenced_target_command.o pgrac_fenced_target_reply.o
 # PGRAC: fixed local management client remains in the same bounded worker group.
 FENCED_OBJS += pgrac_fenced_target_client.o
+# PGRAC: existing owned request identity and independent reply expectations.
+FENCED_OBJS += pgrac_fenced_target_request.o
 # PGRAC: read-only native configuration, never a shadow/file qualification source.
 FENCED_OBJS += pgrac_fenced_cib.o
 FENCEDCTL_OBJS = pgrac-fencedctl.o pgrac_fenced_ctl.o \

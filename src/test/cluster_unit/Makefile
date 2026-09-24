@@ -49,6 +49,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
+        test_pgrac_fenced_target_request \
         test_cluster_update_trace test_cluster_cr_dependency \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
@@ -388,6 +389,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain te
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
 # PGRAC: production journal validation is linked into target command tests.
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_command test_pgrac_fenced_target_reply,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_client,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
@@ -1453,6 +1455,17 @@ PGRAC_FENCED_JOURNAL_O = \
 # PGRAC: real frontend command encoder, not a test-only schema implementation.
 PGRAC_FENCED_TARGET_COMMAND_O = $(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_command.o
 # PGRAC: strict observations do not populate the independent proof readback.
+test_pgrac_fenced_target_request: test_pgrac_fenced_target_request.c unit_test.h \
+		data/pgrac_fence_map_v2_fixture.h \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_request.o \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_reply.o \
+		$(PGRAC_FENCED_CONFIG_O) $(PGRAC_FENCED_TARGET_COMMAND_O) $(PGRAC_FENCED_JOURNAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_request.o \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_reply.o \
+		$(PGRAC_FENCED_CONFIG_O) $(PGRAC_FENCED_TARGET_COMMAND_O) $(PGRAC_FENCED_JOURNAL_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(LDFLAGS) $(LIBS) -o $@
 test_pgrac_fenced_target_client: test_pgrac_fenced_target_client.c unit_test.h \
 		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_client.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
