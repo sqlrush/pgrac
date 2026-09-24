@@ -144,7 +144,8 @@ pgrac_fenced_journal_record_encode(
 	const PgracFencedJournalRecordV1 *record,
 	uint8 frame[PGRAC_FENCED_JOURNAL_RECORD_BYTES])
 {
-	if (frame == NULL || !record_semantics_valid(record))
+	if (frame == NULL || !record_semantics_valid(record) ||
+		!bytes_all_zero((const uint8 *) &record->intent, sizeof(record->intent)))
 		return false;
 	memset(frame, 0, PGRAC_FENCED_JOURNAL_RECORD_BYTES);
 	memcpy(frame, "PFGJ", 4);
@@ -186,6 +187,10 @@ pgrac_fenced_journal_record_decode(const uint8 *frame, size_t frame_len,
 {
 	PgracFencedJournalRecordV1 decoded;
 
+	if (record != NULL)
+		memset(record, 0, sizeof(*record));
+	if (frame_len == PGRAC_FENCED_JOURNAL_INTENT_BYTES)
+		return pgrac_fenced_journal_intent_decode(frame, frame_len, record);
 	if (frame == NULL || record == NULL ||
 		frame_len != PGRAC_FENCED_JOURNAL_RECORD_BYTES ||
 		memcmp(frame, "PFGJ", 4) != 0 || get_u16_le(frame + 4) != 1 ||
@@ -290,6 +295,21 @@ pgrac_fenced_journal_scan_state_init(PgracFencedJournalScanState *state)
 	state->available = true;
 }
 
+/* PGRAC: shared admission predicate for bootstrap and ordinary append. */
+bool
+pgrac_fenced_journal_has_room(const PgracFencedJournalScanState *state,
+	size_t frame_bytes)
+{
+	return state != NULL && state->available &&
+		(frame_bytes == PGRAC_FENCED_JOURNAL_RECORD_BYTES ||
+		 frame_bytes == PGRAC_FENCED_JOURNAL_INTENT_BYTES) &&
+		state->partial_record_bytes == 0 &&
+		state->segment_record_count < PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS &&
+		state->valid_bytes <= PGRAC_FENCED_JOURNAL_SEGMENT_BYTES &&
+		state->valid_bytes % PGRAC_FENCED_JOURNAL_RECORD_BYTES == 0 &&
+		frame_bytes <= PGRAC_FENCED_JOURNAL_SEGMENT_BYTES - state->valid_bytes;
+}
+
 PgracFencedJournalScanResult
 pgrac_fenced_journal_scan_bytes(const uint8 *bytes, size_t len,
 							bool allow_final_partial,
@@ -300,30 +320,42 @@ pgrac_fenced_journal_scan_bytes(const uint8 *bytes, size_t len,
 
 	if (state == NULL || !state->available || (bytes == NULL && len != 0))
 		return PGRAC_FENCED_JOURNAL_SCAN_CORRUPT;
+	if (len > PGRAC_FENCED_JOURNAL_SEGMENT_BYTES)
+		goto corrupt;
 	next = *state;
 	next.segment_first_seq = next.next_seq;
 	next.segment_record_count = 0;
 	next.valid_bytes = 0;
+	next.last_record_bytes = 0;
+	next.partial_record_bytes = 0;
 	while (len - offset >= PGRAC_FENCED_JOURNAL_RECORD_BYTES)
 	{
 		PgracFencedJournalRecordV1 record;
 		uint8 digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES];
 		const uint8 *frame = bytes + offset;
+		size_t frame_len = pgrac_fenced_journal_frame_size(frame, len - offset);
 
+		if (frame_len == 0)
+			goto corrupt;
+		if (len - offset < frame_len)
+		{
+			next.partial_record_bytes = frame_len;
+			break;
+		}
 		if (next.next_seq == 0 ||
-			!pgrac_fenced_journal_record_decode(frame,
-				PGRAC_FENCED_JOURNAL_RECORD_BYTES, &record) ||
+			!pgrac_fenced_journal_record_decode(frame, frame_len, &record) ||
 			record.seq != next.next_seq ||
 			memcmp(record.previous_record_digest,
 				   next.previous_record_digest,
 				   sizeof(record.previous_record_digest)) != 0 ||
 			next.segment_record_count >= PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS ||
-			!pgrac_fenced_journal_record_digest(frame, digest))
+			!pgrac_fenced_journal_frame_digest(frame, frame_len, digest))
 			goto corrupt;
 		memcpy(next.previous_record_digest, digest, sizeof(digest));
 		next.segment_record_count++;
-		offset += PGRAC_FENCED_JOURNAL_RECORD_BYTES;
+		offset += frame_len;
 		next.valid_bytes = offset;
+		next.last_record_bytes = frame_len;
 		if (next.next_seq == UINT64_MAX)
 		{
 			next.next_seq = 0;
@@ -337,6 +369,12 @@ pgrac_fenced_journal_scan_bytes(const uint8 *bytes, size_t len,
 	{
 		if (!allow_final_partial)
 			goto corrupt;
+		if (next.partial_record_bytes == 0)
+		{
+			next.partial_record_bytes = pgrac_fenced_journal_frame_size(bytes + offset, len - offset);
+			if (next.partial_record_bytes == 0)
+				next.partial_record_bytes = PGRAC_FENCED_JOURNAL_RECORD_BYTES;
+		}
 		*state = next;
 		return PGRAC_FENCED_JOURNAL_SCAN_PARTIAL_TAIL;
 	}
@@ -353,8 +391,9 @@ pgrac_fenced_journal_append_fd(int fd, PgracFencedJournalScanState *state,
 						   PgracFencedJournalRecordV1 *record)
 {
 	PgracFencedJournalRecordV1 candidate;
-	uint8 frame[PGRAC_FENCED_JOURNAL_RECORD_BYTES];
+	uint8 frame[PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES];
 	uint8 digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES];
+	size_t frame_len;
 	ssize_t written;
 	int flags;
 
@@ -370,19 +409,26 @@ pgrac_fenced_journal_append_fd(int fd, PgracFencedJournalScanState *state,
 	candidate.seq = state->next_seq;
 	memcpy(candidate.previous_record_digest, state->previous_record_digest,
 		   sizeof(candidate.previous_record_digest));
-	if (!pgrac_fenced_journal_record_encode(&candidate, frame))
+	if (state->partial_record_bytes != 0 ||
+		!pgrac_fenced_journal_frame_encode(&candidate, frame, sizeof(frame), &frame_len))
 		goto unavailable;
+	if (state->valid_bytes > PGRAC_FENCED_JOURNAL_SEGMENT_BYTES ||
+		state->valid_bytes % PGRAC_FENCED_JOURNAL_RECORD_BYTES != 0)
+		goto unavailable;
+	if (!pgrac_fenced_journal_has_room(state, frame_len))
+		return PGRAC_FENCED_JOURNAL_APPEND_ROTATION_REQUIRED;
 	do
 	{
-		written = write(fd, frame, sizeof(frame));
+		written = write(fd, frame, frame_len);
 	} while (written < 0 && errno == EINTR);
-	if (written != sizeof(frame) || fsync(fd) != 0 ||
-		!pgrac_fenced_journal_record_digest(frame, digest))
+	if (written != (ssize_t) frame_len || fsync(fd) != 0 ||
+		!pgrac_fenced_journal_frame_digest(frame, frame_len, digest))
 		goto unavailable;
 	*record = candidate;
 	memcpy(state->previous_record_digest, digest, sizeof(digest));
 	state->segment_record_count++;
-	state->valid_bytes += sizeof(frame);
+	state->valid_bytes += frame_len;
+	state->last_record_bytes = frame_len;
 	if (state->next_seq == UINT64_MAX)
 	{
 		state->next_seq = 0;
@@ -406,15 +452,18 @@ pgrac_fenced_journal_repair_partial_tail_fd(
 
 	if (fd < 0 || state == NULL || !state->available ||
 		state->valid_bytes % PGRAC_FENCED_JOURNAL_RECORD_BYTES != 0 ||
+		(state->partial_record_bytes != PGRAC_FENCED_JOURNAL_RECORD_BYTES &&
+		 state->partial_record_bytes != PGRAC_FENCED_JOURNAL_INTENT_BYTES) ||
 		state->valid_bytes > PGRAC_FENCED_JOURNAL_SEGMENT_BYTES)
 		goto unavailable;
 	flags = fcntl(fd, F_GETFL);
 	if (flags < 0 || (flags & O_APPEND) == 0 || fstat(fd, &st) != 0 ||
 		!S_ISREG(st.st_mode) || st.st_size <= (off_t) state->valid_bytes ||
 		(uint64) st.st_size >=
-		state->valid_bytes + PGRAC_FENCED_JOURNAL_RECORD_BYTES ||
+		state->valid_bytes + state->partial_record_bytes ||
 		ftruncate(fd, (off_t) state->valid_bytes) != 0 || fsync(fd) != 0)
 		goto unavailable;
+	state->partial_record_bytes = 0;
 	return true;
 
 unavailable:
@@ -682,18 +731,22 @@ pgrac_fenced_journal_rotate_at(int directory_fd, int *active_fd,
 		goto unavailable;
 	if (directory_fd < 0 || active_fd == NULL || *active_fd < 0 ||
 		sealed_name == NULL || sealed_name_size == 0 ||
-		state->segment_record_count !=
-		PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS ||
-		state->valid_bytes != PGRAC_FENCED_JOURNAL_SEGMENT_BYTES ||
+		state->segment_record_count < PGRAC_FENCED_JOURNAL_MIN_SEALED_RECORDS ||
+		state->segment_record_count > PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS ||
+		state->valid_bytes < PGRAC_FENCED_JOURNAL_MIN_SEALED_BYTES ||
+		state->valid_bytes > PGRAC_FENCED_JOURNAL_SEGMENT_BYTES ||
+		state->valid_bytes % PGRAC_FENCED_JOURNAL_RECORD_BYTES != 0 ||
+		state->partial_record_bytes != 0 ||
 		state->segment_first_seq == 0 || state->next_seq == 0 ||
-		state->next_seq <= state->segment_first_seq)
+		state->next_seq <= state->segment_first_seq ||
+		state->next_seq - state->segment_first_seq != state->segment_record_count)
 		goto unavailable;
 	last_seq = state->next_seq - 1;
 	if (!sealed_filename(state->segment_first_seq, last_seq,
 					 state->previous_record_digest, sealed_name,
 					 sealed_name_size) ||
 		fstat(*active_fd, &st) != 0 || !S_ISREG(st.st_mode) ||
-		(uint64) st.st_size != PGRAC_FENCED_JOURNAL_SEGMENT_BYTES ||
+		(uint64) st.st_size != state->valid_bytes ||
 		(st.st_mode & 07777) != 0600)
 		goto unavailable;
 	flags = fcntl(*active_fd, F_GETFL);
@@ -718,6 +771,8 @@ pgrac_fenced_journal_rotate_at(int directory_fd, int *active_fd,
 	state->segment_first_seq = state->next_seq;
 	state->segment_record_count = 0;
 	state->valid_bytes = 0;
+	state->last_record_bytes = 0;
+	state->partial_record_bytes = 0;
 	return true;
 
 unavailable:

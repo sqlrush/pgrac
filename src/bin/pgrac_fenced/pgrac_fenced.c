@@ -266,7 +266,7 @@ open_active_journal(const PgracFencedConfigV1 *config,
 			O_RDONLY | O_APPEND | O_NOFOLLOW);
 		if (sealed_fd < 0 || fstat(sealed_fd, &active_stat) != 0 ||
 			!pgrac_fenced_journal_file_stat_secure(&active_stat) ||
-			(uint64) active_stat.st_size != PGRAC_FENCED_JOURNAL_SEGMENT_BYTES ||
+			(uint64) active_stat.st_size < PGRAC_FENCED_JOURNAL_MIN_SEALED_BYTES ||
 			!pgrac_fenced_journal_load_sealed_reconcile_fd(sealed_fd, state,
 				&last_record, &have_last_record, reconcile) ||
 			!have_last_record ||
@@ -295,7 +295,7 @@ open_active_journal(const PgracFencedConfigV1 *config,
 		  memcmp(last_record.semantic_config_digest, config_digest,
 			  PGRAC_FENCED_CONFIG_DIGEST_BYTES) == 0)))
 		goto fail;
-	if (state->segment_record_count == PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS)
+	if (!pgrac_fenced_journal_has_room(state, PGRAC_FENCED_JOURNAL_RECORD_BYTES))
 	{
 		if (!pgrac_fenced_journal_rotate_at(fd, &journal_fd, count, state,
 				sealed_name, sizeof(sealed_name)))

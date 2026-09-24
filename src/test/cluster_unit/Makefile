@@ -1399,14 +1399,17 @@ test_pgrac_fenced_schedule: test_pgrac_fenced_schedule.c unit_test.h \
 		$(PGRAC_FENCED_SCHEDULE_O) -o $@
 
 PGRAC_FENCED_JOURNAL_O = \
-	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o \
+	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal_intent.o
 PGRAC_FENCED_RUNTIME_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_runtime.o
 test_pgrac_fenced_journal: test_pgrac_fenced_journal.c unit_test.h \
-		$(PGRAC_FENCED_JOURNAL_O) $(PGRAC_FENCED_RUNTIME_O)
+		$(PGRAC_FENCED_JOURNAL_O) $(PGRAC_FENCED_RUNTIME_O) \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_ctl.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
 		$(PGRAC_FENCED_JOURNAL_O) $(PGRAC_FENCED_RUNTIME_O) \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_ctl.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) -lssl -lcrypto -o $@
 
@@ -1428,7 +1431,7 @@ PGRAC_FENCED_OPERATION_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_operation.o \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_provider.o \
 	$(PGRAC_FENCED_IPMI_O) \
-	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal.o \
+	$(PGRAC_FENCED_JOURNAL_O) \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol.o
 PGRAC_FENCED_SESSION_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_session.o

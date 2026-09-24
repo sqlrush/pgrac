@@ -9,12 +9,21 @@
 #define PGRAC_FENCED_JOURNAL_H
 
 #include "c.h"
+#include "common/pgrac_external_fence_protocol.h"
 
 #define PGRAC_FENCED_JOURNAL_RECORD_BYTES 256U
+#define PGRAC_FENCED_JOURNAL_INTENT_BYTES 768U
+#define PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES PGRAC_FENCED_JOURNAL_INTENT_BYTES
 #define PGRAC_FENCED_JOURNAL_DIGEST_BYTES 32U
 #define PGRAC_FENCED_JOURNAL_ID_BYTES 16U
 #define PGRAC_FENCED_JOURNAL_SEGMENT_RECORDS UINT32_C(262144)
 #define PGRAC_FENCED_JOURNAL_SEGMENT_BYTES UINT64_C(67108864)
+#define PGRAC_FENCED_JOURNAL_MIN_SEALED_BYTES \
+	(PGRAC_FENCED_JOURNAL_SEGMENT_BYTES - PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES + \
+	 PGRAC_FENCED_JOURNAL_RECORD_BYTES)
+#define PGRAC_FENCED_JOURNAL_MIN_SEALED_RECORDS \
+	((PGRAC_FENCED_JOURNAL_MIN_SEALED_BYTES + PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES - 1) / \
+	 PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES)
 #define PGRAC_FENCED_JOURNAL_MAX_SEALED UINT32_C(8)
 #define PGRAC_FENCED_JOURNAL_ACTIVE_NAME "journal.active"
 #define PGRAC_FENCED_JOURNAL_SEALED_NAME_MAX 128U
@@ -79,6 +88,28 @@ typedef enum PgracFencedJournalAppendResult
 	PGRAC_FENCED_JOURNAL_APPEND_UNAVAILABLE = 2
 } PgracFencedJournalAppendResult;
 
+/* PGRAC: semantic intent, never a wire struct or an isolation certificate. */
+typedef enum PgracFencedJournalIntentKind
+{
+	PGRAC_FENCED_JOURNAL_INTENT_NONE = 0,
+	PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE = 1,
+	PGRAC_FENCED_JOURNAL_INTENT_REJOIN = 2
+} PgracFencedJournalIntentKind;
+
+typedef struct PgracFencedJournalIntentV2
+{
+	uint16 kind;
+	uint8 target_uuid[16];
+	uint64 attempt;
+	uint64 system_identifier;
+	uint8 protected_set_digest[32];
+	union
+	{
+		PgracExternalFenceProtocolRequestV1 acquire;
+		PgracExternalFenceProtocolRejoinFrameV1 rejoin;
+	} request;
+} PgracFencedJournalIntentV2;
+
 typedef struct PgracFencedJournalRecordV1
 {
 	uint16 record_kind;
@@ -100,6 +131,8 @@ typedef struct PgracFencedJournalRecordV1
 	uint8 semantic_config_digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES];
 	uint32 deny_reason;
 	uint32 io_drain_state;
+	/* Zero for v1 events; complete persistent identity for v2 events. */
+	PgracFencedJournalIntentV2 intent;
 } PgracFencedJournalRecordV1;
 
 typedef struct PgracFencedJournalScanState
@@ -108,6 +141,8 @@ typedef struct PgracFencedJournalScanState
 	uint64 segment_first_seq;
 	uint32 segment_record_count;
 	size_t valid_bytes;
+	size_t last_record_bytes;
+	size_t partial_record_bytes;
 	uint8 previous_record_digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES];
 	bool available;
 } PgracFencedJournalScanState;
@@ -138,11 +173,24 @@ extern bool pgrac_fenced_journal_record_decode(
 extern bool pgrac_fenced_journal_record_digest(
 	const uint8 frame[PGRAC_FENCED_JOURNAL_RECORD_BYTES],
 	uint8 digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES]);
+/* PGRAC: capacity-aware codec and whole-frame digest for mixed journal history. */
+extern bool pgrac_fenced_journal_frame_encode(
+	const PgracFencedJournalRecordV1 *record, uint8 *frame, size_t capacity,
+	size_t *frame_len);
+extern size_t pgrac_fenced_journal_frame_size(const uint8 *frame, size_t available);
+extern bool pgrac_fenced_journal_frame_digest(
+	const uint8 *frame, size_t frame_len,
+	uint8 digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES]);
+/* Internal v2 dispatch; ordinary callers use record_decode. */
+extern bool pgrac_fenced_journal_intent_decode(
+	const uint8 *frame, size_t frame_len, PgracFencedJournalRecordV1 *record);
 extern bool pgrac_fenced_journal_config_digest_v1(
 	const uint8 *config_bytes, size_t config_len,
 	uint8 digest[PGRAC_FENCED_JOURNAL_DIGEST_BYTES]);
 extern void pgrac_fenced_journal_scan_state_init(
 	PgracFencedJournalScanState *state);
+extern bool pgrac_fenced_journal_has_room(
+	const PgracFencedJournalScanState *state, size_t frame_bytes);
 extern PgracFencedJournalScanResult pgrac_fenced_journal_scan_bytes(
 	const uint8 *bytes, size_t len, bool allow_final_partial,
 	PgracFencedJournalScanState *state);

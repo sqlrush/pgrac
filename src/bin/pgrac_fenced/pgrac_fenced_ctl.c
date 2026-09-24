@@ -123,6 +123,7 @@ pgrac_fenced_ctl_journal_scan(const uint8 *bytes, size_t len,
 {
 	PgracFencedJournalRecordV1 first;
 	PgracFencedJournalScanState state;
+	size_t first_len;
 
 	if (summary == NULL || (bytes == NULL && len != 0) ||
 		len > PGRAC_FENCED_JOURNAL_SEGMENT_BYTES ||
@@ -131,8 +132,9 @@ pgrac_fenced_ctl_journal_scan(const uint8 *bytes, size_t len,
 	memset(summary, 0, sizeof(*summary));
 	if (len == 0)
 		return true;
-	if (!pgrac_fenced_journal_record_decode(bytes,
-			PGRAC_FENCED_JOURNAL_RECORD_BYTES, &first))
+	first_len = pgrac_fenced_journal_frame_size(bytes, len);
+	if (first_len == 0 || first_len > len ||
+		!pgrac_fenced_journal_record_decode(bytes, first_len, &first))
 		return false;
 
 	pgrac_fenced_journal_scan_state_init(&state);

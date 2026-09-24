@@ -18,8 +18,10 @@ FENCED_OBJS += pgrac_fenced_dispatch.o pgrac_fenced_runtime.o \
 	pgrac_fenced_schedule.o pgrac_fenced_async.o pgrac_fenced_rejoin.o
 FENCED_OBJS += pgrac_fenced_rejoin_async.o pgrac_fenced_coordinator.o \
 	pgrac_fenced_rejoin_coordinator.o pgrac_fenced_drain.o pgrac_fenced_pacemaker.o
+# PGRAC: versioned complete intent remains in the one existing journal chain.
+FENCED_OBJS += pgrac_fenced_journal_intent.o
 FENCEDCTL_OBJS = pgrac-fencedctl.o pgrac_fenced_ctl.o \
-	pgrac_fenced_core.o pgrac_fenced_journal.o \
+	pgrac_fenced_core.o pgrac_fenced_journal.o pgrac_fenced_journal_intent.o \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol.o
 PGRAC_FENCED_LIBS = $(top_builddir)/src/common/libpgcommon.a \
 	$(top_builddir)/src/port/libpgport.a
