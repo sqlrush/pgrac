@@ -97,9 +97,10 @@ string_token(JsonLexContext *lex, char out[65])
 	length = lex->token_terminator - lex->token_start - 2;
 	if (length == 0 || length > 64)
 		return false;
-	/* All fields in this fixed schema are ASCII identifiers or lowercase hex.
-     * Escaping would make them noncanonical; never compare a truncated string.
-     */
+	/*
+	 * Fields are ASCII identifiers or lowercase hex, without escaped bytes.
+	 * Never compare a truncated string.
+	 */
 	for (size_t n = 0; n < length; n++) {
 		unsigned char c = lex->token_start[n + 1];
 		if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
@@ -200,9 +201,10 @@ parse_fields(const char *bytes, size_t length, ReplyFields *fields)
 		return false;
 	memcpy(input, bytes, length);
 	input[length - 1] = '\0';
-	/* The PG lexer owns syntax checks. This fixed flat schema cannot recurse,
-     * and need_escapes=false avoids per-field allocations on invalid input.
-     */
+	/*
+	 * The PG lexer owns syntax checks; this fixed flat schema cannot recurse.
+	 * need_escapes=false avoids per-field allocations on invalid input.
+	 */
 	lex = makeJsonLexContextCstringLen(input, (int)length - 1, PG_UTF8, false);
 	result = read_fields(lex, fields);
 	free(lex);

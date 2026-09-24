@@ -261,9 +261,10 @@ stop_child(ClientChild *child)
 		if (child->pidfd >= 0)
 			(void)syscall(SYS_pidfd_send_signal, child->pidfd, SIGKILL, NULL, 0);
 		else
-			/* No reaper has run: with default SIGCHLD this exact child still
-             * owns its PID. This is refusal cleanup, never a success path.
-             */
+			/*
+			 * No reaper has run; default SIGCHLD preserves this child's PID.
+			 * This is refusal cleanup, never a success path.
+			 */
 			(void)kill(child->pid, SIGKILL);
 		(void)waitpid(child->pid, &child->status, WNOHANG);
 	}
