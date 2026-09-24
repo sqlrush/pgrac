@@ -5215,6 +5215,19 @@ show_in_hot_standby(void)
 void
 LocalProcessControlFile(bool reset)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: decide the control authority before reading a compatibility
+	 * projection.  Runtime CF/GES is unavailable before shmem sizing; until
+	 * the root-bound bootstrap reader is connected, refuse this profile here.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	process_cluster_gucs();
+	if (cluster_shared_config)
+		ereport(FATAL, (errmsg("PRE2 shared-control startup is not yet available"),
+						errhint("Shared configuration requires the root-bound startup path; the "
+								"local control projection is not an authority.")));
+#endif
 	Assert(reset || ControlFile == NULL);
 	ControlFile = palloc(sizeof(ControlFileData));
 	ReadControlFile();

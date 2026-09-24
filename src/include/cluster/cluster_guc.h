@@ -16,9 +16,9 @@
  *	  - Declare extern storage for every registered cluster GUC C
  *	    variable, so the rest of the cluster code can read its current
  *	    value without going through the SQL GUC layer.
- *	  - Declare cluster_init_guc(), the registration entry point that
- *	    PostmasterMain calls (under #ifdef USE_PGRAC_CLUSTER) right after
- *	    PG's built-in GUCs are loaded.
+ *	  - Declare cluster_init_guc(), the definition routine called by the
+ *	    once-only process_cluster_gucs() startup wrapper after PG's built-in
+ *	    GUC machinery is initialized, before control-file sizing.
  *
  *	  Stage 0.13 does NOT register the ~24 cluster GUCs listed in the
  *	  background-process / error-codes design docs.  Each remaining
@@ -52,13 +52,11 @@
 /*
  * cluster_init_guc -- register all cluster GUC variables.
  *
- *	Called from PostmasterMain after InitializeGUCOptions() has loaded
- *	PG's built-in GUCs.  Subsequent postgresql.conf parsing applies
- *	user-supplied values, so registration must happen first.
- *
- *	Idempotent within a process: PG's GUC layer rejects duplicate
- *	registrations with the same name, so calling this twice would
- *	abort startup.  PostmasterMain only calls it once.
+ *	PGRAC: production startup uses the once-only process_cluster_gucs()
+ *	wrapper in miscinit.c.  Values parsed earlier from postgresql.conf are
+ *	bound from custom placeholders when these definitions are registered.
+ *	The raw routine is NOT idempotent: duplicate definitions are rejected by
+ *	PG.  The wrapper, not this routine, owns process-local registration state.
  *
  *	Implementation lives in src/backend/cluster/cluster_guc.c.
  */

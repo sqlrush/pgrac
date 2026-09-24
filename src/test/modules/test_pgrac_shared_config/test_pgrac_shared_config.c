@@ -13,6 +13,24 @@
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(test_pgrac_config_entry);
 PG_FUNCTION_INFO_V1(test_pgrac_config_object);
+PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
+
+Datum
+test_pgrac_config_registration(PG_FUNCTION_ARGS)
+{
+#ifdef USE_PGRAC_CLUSTER
+	bool old_phase = process_shared_preload_libraries_in_progress;
+	bool old_done = process_shared_preload_libraries_done;
+	if (!superuser())
+		ereport(ERROR, (errmsg("test configuration inspection requires superuser")));
+	process_cluster_gucs();
+	process_cluster_gucs();
+	PG_RETURN_BOOL(old_phase == process_shared_preload_libraries_in_progress
+				   && old_done == process_shared_preload_libraries_done);
+#else
+	PG_RETURN_BOOL(false);
+#endif
+}
 
 #ifdef USE_PGRAC_CLUSTER
 static text *

@@ -1858,21 +1858,47 @@ load_libraries(const char *libraries, const char *gucname, bool restricted)
 	pfree(rawstring);
 }
 
+#ifdef USE_PGRAC_CLUSTER
 /*
- * process any libraries that should be preloaded at postmaster start
+ * PGRAC: bind cluster placeholders before control-file sizing.  This only
+ * registers parameters: library loading and cluster shmem registration stay
+ * in the ordinary preload phase.  Forked children inherit this process-local
+ * state; an EXEC_BACKEND process registers its own definitions once.
  *
- * PGRAC modifications by SqlRush:
- *	What changed:  When USE_PGRAC_CLUSTER is defined, register all pgrac
- *	               cluster custom GUCs (currently cluster_node_id) before
- *	               loading user shared_preload_libraries.
- *	Why:           PG forbids creating PGC_POSTMASTER custom GUCs outside
- *	               this phase (see add_guc_variable in guc.c).  Calling
- *	               cluster_init_guc() here piggybacks on the same flag and
- *	               makes the registration valid.  Loading order matters:
- *	               we register pgrac GUCs FIRST so user preload libraries
- *	               can read or override them if desired.
- *	               See docs/cluster-guc-design.md §2 and
- *	               specs/spec-0.13-guc-framework.md.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+process_cluster_gucs(void)
+{
+	static bool registered = false;
+	bool saved_phase = process_shared_preload_libraries_in_progress;
+
+	if (registered)
+		return;
+	if (process_shared_preload_libraries_done)
+		ereport(FATAL, (errmsg("cluster parameters were not registered before preload completed")));
+
+	PG_TRY();
+	{
+		/* Native custom PGC_POSTMASTER definitions require this phase flag. */
+		process_shared_preload_libraries_in_progress = true;
+		cluster_init_guc();
+		registered = true;
+		process_shared_preload_libraries_in_progress = saved_phase;
+	}
+	PG_CATCH();
+	{
+		process_shared_preload_libraries_in_progress = saved_phase;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+}
+#endif
+
+/*
+ * Process libraries preloaded at postmaster start.
+ * PGRAC: preserve cluster initialization before user preload libraries, with
+ * once-only GUC registration even if control sizing has already bound them.
  */
 void
 process_shared_preload_libraries(void)
@@ -1880,7 +1906,7 @@ process_shared_preload_libraries(void)
 	process_shared_preload_libraries_in_progress = true;
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: register cluster GUCs (PGC_POSTMASTER) before user preload libs. */
-	cluster_init_guc();
+	process_cluster_gucs();
 	/*
 	 * PGRAC (stage 1.3): cluster_init() now registers foundational shmem
 	 * regions (cluster_ctl + cluster_conf) into the cluster shmem
