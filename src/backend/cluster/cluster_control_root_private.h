@@ -96,6 +96,14 @@ cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64
 											ControlRootImage *root, ControlFileData *common,
 											ClusterControlRootFileToken *token);
 
+/* Exact thread projection, with the same held-lock/output contract. This
+ * still does not perform startup, serving or recovery-completion admission.
+ */
+extern ClusterControlRootResult
+cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *self,
+										   ControlRootImage *root, ControlFileData *out,
+										   ClusterControlRootFileToken *token);
+
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
 												 const ClusterControlRootMigrationRoundV1 *round);

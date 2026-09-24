@@ -29,6 +29,7 @@
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster_control_root_private.h"
+#include "cluster_recovery_anchor_private.h"
 #include "cluster/storage/cluster_shared_fs.h"
 #include "common/cryptohash.h"
 #include "common/sha2.h"
@@ -1002,6 +1003,69 @@ cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64
 	/* A valid root alone must not escape after its selected image failed. */
 	memset(root, 0, sizeof(*root));
 	memset(common, 0, sizeof(*common));
+	memset(token, 0, sizeof(*token));
+	return result;
+}
+
+/* PGRAC: root-selected common fields plus this exact thread's restart inputs.
+ * All objects are consumed under the caller's existing CF-S/X; no nested CF
+ * or compatibility fallback. The returned root remains necessary for the
+ * subsequent lifecycle/config/admission checks, which this read cannot grant.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *self,
+										   ControlRootImage *root, ControlFileData *out,
+										   ClusterControlRootFileToken *token)
+{
+	ControlFileData common;
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterControlRootResult result, root_result;
+	int index;
+
+	if (root != NULL)
+		memset(root, 0, sizeof(*root));
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (token != NULL)
+		memset(token, 0, sizeof(*token));
+	if (self == NULL || root == NULL || out == NULL || token == NULL || self->origin_thread_id == 0
+		|| self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	root_result = cluster_control_root_v2_read_control_locked(
+		self->storage_uuid, self->system_identifier, root, &common, token);
+	result = root_result;
+	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		goto fail;
+	index = self->origin_thread_id - 1;
+	if (!root->present[index]) {
+		result = CLUSTER_CONTROL_ROOT_ABSENT;
+		goto fail;
+	}
+	if (!cluster_control_root_identity_equal(self, &root->records[index].identity)) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto fail;
+	}
+	memset(&ref, 0, sizeof(ref));
+	ref.identity = root->records[index].identity;
+	ref.database_incarnation = root->header.v2.database_incarnation;
+	ref.max_config_generation = root->header.v2.config_generation;
+	ref.anchor_generation = root->refs[index].anchor_generation;
+	memcpy(ref.anchor_sha256, root->refs[index].anchor_sha256, 32);
+	memcpy(ref.claim_sha256, root->refs[index].claim_sha256, 32);
+	result = cluster_recovery_anchor_v2_read_locked(&ref, &common, out);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto fail;
+	if (out->checkPointCopy.redo != root->records[index].checkpoint_lower_lsn
+		|| out->checkPointCopy.ThisTimeLineID != root->records[index].checkpoint_tli) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto fail;
+	}
+	return root_result;
+fail:
+	memset(root, 0, sizeof(*root));
+	memset(out, 0, sizeof(*out));
 	memset(token, 0, sizeof(*token));
 	return result;
 }

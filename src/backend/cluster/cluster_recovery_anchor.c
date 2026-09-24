@@ -51,9 +51,11 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
+#include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
@@ -66,8 +68,405 @@
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
+#include "common/cryptohash.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+
+#include "cluster_recovery_anchor_private.h"
+
+/* PGRAC: v2 is explicitly encoded, not an overlay on the native v1 struct.
+ * These are the frozen homogeneous PG16 CheckPoint offsets; a native layout
+ * change requires a deliberate format/manifest update, not a new memcpy.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+StaticAssertDecl(sizeof(CheckPoint) == 88, "anchor v2 CheckPoint layout");
+StaticAssertDecl(offsetof(CheckPoint, nextXid) == 24, "anchor v2 nextXid layout");
+StaticAssertDecl(offsetof(CheckPoint, time) == 64, "anchor v2 time layout");
+StaticAssertDecl(offsetof(CheckPoint, oldestActiveXid) == 80, "anchor v2 final field layout");
+
+static uint64
+anchor_v2_get(const uint8 *bytes, size_t offset, size_t width)
+{
+	uint64 value = 0;
+	size_t i;
+
+	for (i = 0; i < width; ++i)
+		value |= (uint64)bytes[offset + i] << (8 * i);
+	return value;
+}
+
+static void
+anchor_v2_put(uint8 *bytes, size_t offset, uint64 value, size_t width)
+{
+	size_t i;
+
+	for (i = 0; i < width; ++i)
+		bytes[offset + i] = (uint8)(value >> (8 * i));
+}
+
+static bool
+anchor_v2_zero(const void *ptr, size_t len)
+{
+	const uint8 *bytes = ptr;
+	size_t i;
+
+	for (i = 0; i < len; ++i)
+		if (bytes[i] != 0)
+			return false;
+	return true;
+}
+
+static bool
+anchor_v2_identity_valid(const ClusterControlRootIdentity *id)
+{
+	return id->system_identifier != 0 && id->origin_thread_id > 0
+		   && id->origin_thread_id <= CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		   && id->origin_node_id == (int32)id->origin_thread_id - 1 && id->reserved42 == 0
+		   && id->reserved60 == 0 && id->thread_claim_created_at > 0
+		   && id->origin_owner_incarnation != 0 && id->root_lineage_seq != 0
+		   && !anchor_v2_zero(id->storage_uuid, 16) && !anchor_v2_zero(id->authority_uuid, 16);
+}
+
+static bool
+anchor_v2_ref_valid(const ClusterRecoveryAnchorRefV2 *ref)
+{
+	return ref != NULL && anchor_v2_identity_valid(&ref->identity) && ref->database_incarnation != 0
+		   && ref->max_config_generation != 0 && ref->anchor_generation != 0
+		   && !anchor_v2_zero(ref->anchor_sha256, 32) && !anchor_v2_zero(ref->claim_sha256, 32);
+}
+
+static ClusterControlRootResult
+anchor_v2_fields_valid(const ClusterRecoveryAnchorV2 *anchor)
+{
+	if (anchor->identity.reserved42 != 0 || anchor->identity.reserved60 != 0)
+		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+	if (!anchor_v2_identity_valid(&anchor->identity))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (anchor->state > DB_IN_PRODUCTION)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (anchor->database_incarnation == 0 || anchor->config_generation == 0
+		|| anchor->anchor_generation == 0 || anchor_v2_zero(anchor->claim_sha256, 32)
+		|| anchor->checkpoint == InvalidXLogRecPtr
+		|| anchor->checkpoint_copy.redo == InvalidXLogRecPtr
+		|| anchor->checkpoint_copy.ThisTimeLineID == 0
+		|| anchor->checkpoint_copy.PrevTimeLineID == 0 || anchor->backup_end_required)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_encode(const ClusterRecoveryAnchorV2 *anchor,
+								  uint8 bytes[CLUSTER_RECOVERY_ANCHOR_SIZE])
+{
+	ClusterControlRootResult result;
+	pg_crc32c crc;
+
+	if (bytes == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(bytes, 0, CLUSTER_RECOVERY_ANCHOR_SIZE);
+	if (anchor == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = anchor_v2_fields_valid(anchor);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+#define AP(offset, field, width) anchor_v2_put(bytes, offset, anchor->field, width)
+	anchor_v2_put(bytes, 0, CLUSTER_RECOVERY_ANCHOR_MAGIC, 4);
+	anchor_v2_put(bytes, 4, 2, 2);
+	AP(8, identity.origin_node_id, 4);
+	AP(12, state, 4);
+	AP(16, identity.system_identifier, 8);
+	AP(24, checkpoint, 8);
+	AP(32, write_time, 8);
+	AP(40, checkpoint_copy.redo, 8);
+	AP(48, checkpoint_copy.ThisTimeLineID, 4);
+	AP(52, checkpoint_copy.PrevTimeLineID, 4);
+	AP(56, checkpoint_copy.fullPageWrites, 1);
+	anchor_v2_put(bytes, 64, U64FromFullTransactionId(anchor->checkpoint_copy.nextXid), 8);
+	AP(72, checkpoint_copy.nextOid, 4);
+	AP(76, checkpoint_copy.nextMulti, 4);
+	AP(80, checkpoint_copy.nextMultiOffset, 4);
+	AP(84, checkpoint_copy.oldestXid, 4);
+	AP(88, checkpoint_copy.oldestXidDB, 4);
+	AP(92, checkpoint_copy.oldestMulti, 4);
+	AP(96, checkpoint_copy.oldestMultiDB, 4);
+	AP(104, checkpoint_copy.time, 8);
+	AP(112, checkpoint_copy.oldestCommitTsXid, 4);
+	AP(116, checkpoint_copy.newestCommitTsXid, 4);
+	AP(120, checkpoint_copy.oldestActiveXid, 4);
+	AP(128, unlogged_lsn, 8);
+	AP(136, database_incarnation, 8);
+	AP(144, identity.origin_owner_incarnation, 8);
+	memcpy(bytes + 152, anchor->identity.storage_uuid, 16);
+	memcpy(bytes + 168, anchor->identity.authority_uuid, 16);
+	AP(184, identity.root_lineage_seq, 8);
+	AP(192, config_generation, 8);
+	AP(200, anchor_generation, 8);
+	AP(208, identity.origin_thread_id, 2);
+	anchor_v2_put(bytes, 212, UINT64_C(0x01020304), 4);
+	memcpy(bytes + 216, anchor->claim_sha256, 32);
+	AP(248, identity.thread_claim_created_at, 8);
+	AP(256, identity.thread_claim_crc32c, 4);
+	AP(260, min_recovery_point, 8);
+	AP(268, min_recovery_tli, 4);
+	AP(272, backup_start, 8);
+	AP(280, backup_end, 8);
+	AP(288, backup_end_required, 1);
+#undef AP
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, bytes, 508);
+	FIN_CRC32C(crc);
+	anchor_v2_put(bytes, 508, crc, 4);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_decode(const uint8 *bytes, size_t len,
+								  const ClusterRecoveryAnchorRefV2 *ref,
+								  ClusterRecoveryAnchorV2 *out)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterControlRootResult result;
+	pg_crc32c crc;
+	pg_cryptohash_ctx *ctx;
+	uint8 hash[32];
+	bool hash_ok;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (bytes == NULL || !anchor_v2_ref_valid(ref))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (len != CLUSTER_RECOVERY_ANCHOR_SIZE)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, bytes, 508);
+	FIN_CRC32C(crc);
+	if ((uint32)crc != anchor_v2_get(bytes, 508, 4))
+		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+	if (anchor_v2_get(bytes, 0, 4) != CLUSTER_RECOVERY_ANCHOR_MAGIC)
+		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
+	if (anchor_v2_get(bytes, 4, 2) != 2)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (anchor_v2_get(bytes, 212, 4) != UINT64_C(0x01020304))
+		return CLUSTER_CONTROL_ROOT_BAD_ENDIAN;
+	if (!anchor_v2_zero(bytes + 6, 2) || !anchor_v2_zero(bytes + 57, 7)
+		|| !anchor_v2_zero(bytes + 100, 4) || !anchor_v2_zero(bytes + 124, 4)
+		|| !anchor_v2_zero(bytes + 210, 2) || !anchor_v2_zero(bytes + 289, 219) || bytes[56] > 1
+		|| bytes[288] > 1)
+		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+	memset(&anchor, 0, sizeof(anchor));
+#define AG(offset, field, width) anchor.field = anchor_v2_get(bytes, offset, width)
+	AG(8, identity.origin_node_id, 4);
+	AG(12, state, 4);
+	AG(16, identity.system_identifier, 8);
+	AG(24, checkpoint, 8);
+	AG(32, write_time, 8);
+	AG(40, checkpoint_copy.redo, 8);
+	AG(48, checkpoint_copy.ThisTimeLineID, 4);
+	AG(52, checkpoint_copy.PrevTimeLineID, 4);
+	AG(56, checkpoint_copy.fullPageWrites, 1);
+	anchor.checkpoint_copy.nextXid = FullTransactionIdFromU64(anchor_v2_get(bytes, 64, 8));
+	AG(72, checkpoint_copy.nextOid, 4);
+	AG(76, checkpoint_copy.nextMulti, 4);
+	AG(80, checkpoint_copy.nextMultiOffset, 4);
+	AG(84, checkpoint_copy.oldestXid, 4);
+	AG(88, checkpoint_copy.oldestXidDB, 4);
+	AG(92, checkpoint_copy.oldestMulti, 4);
+	AG(96, checkpoint_copy.oldestMultiDB, 4);
+	AG(104, checkpoint_copy.time, 8);
+	AG(112, checkpoint_copy.oldestCommitTsXid, 4);
+	AG(116, checkpoint_copy.newestCommitTsXid, 4);
+	AG(120, checkpoint_copy.oldestActiveXid, 4);
+	AG(128, unlogged_lsn, 8);
+	AG(136, database_incarnation, 8);
+	AG(144, identity.origin_owner_incarnation, 8);
+	memcpy(anchor.identity.storage_uuid, bytes + 152, 16);
+	memcpy(anchor.identity.authority_uuid, bytes + 168, 16);
+	AG(184, identity.root_lineage_seq, 8);
+	AG(192, config_generation, 8);
+	AG(200, anchor_generation, 8);
+	AG(208, identity.origin_thread_id, 2);
+	memcpy(anchor.claim_sha256, bytes + 216, 32);
+	AG(248, identity.thread_claim_created_at, 8);
+	AG(256, identity.thread_claim_crc32c, 4);
+	AG(260, min_recovery_point, 8);
+	AG(268, min_recovery_tli, 4);
+	AG(272, backup_start, 8);
+	AG(280, backup_end, 8);
+	AG(288, backup_end_required, 1);
+#undef AG
+	result = anchor_v2_fields_valid(&anchor);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* The public identity has explicit reserved fields and a locked 80-byte
+	 * layout. Both copies are validated, so this comparison has no padding.
+	 */
+	if (memcmp(&anchor.identity, &ref->identity, sizeof(anchor.identity)) != 0
+		|| anchor.database_incarnation != ref->database_incarnation
+		|| anchor.anchor_generation != ref->anchor_generation
+		|| anchor.config_generation > ref->max_config_generation
+		|| memcmp(anchor.claim_sha256, ref->claim_sha256, 32) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	hash_ok = pg_cryptohash_init(ctx) >= 0 && pg_cryptohash_update(ctx, bytes, len) >= 0
+			  && pg_cryptohash_final(ctx, hash, sizeof(hash)) >= 0;
+	pg_cryptohash_free(ctx);
+	if (!hash_ok)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (memcmp(hash, ref->anchor_sha256, sizeof(hash)) != 0)
+		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+	memcpy(out, &anchor, sizeof(*out));
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_project(const uint8 *bytes, size_t len,
+								   const ClusterRecoveryAnchorRefV2 *ref,
+								   const ControlFileData *common, ControlFileData *out)
+{
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterControlRootResult result;
+	ControlFileData projected;
+	pg_crc32c crc;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (common == NULL || !anchor_v2_ref_valid(ref))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (common->system_identifier != ref->identity.system_identifier)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (common->pg_control_version != PG_CONTROL_VERSION
+		|| common->catalog_version_no != CATALOG_VERSION_NO)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, common, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, common->crc))
+		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	result = cluster_recovery_anchor_v2_decode(bytes, len, ref, &anchor);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (anchor.backup_start != InvalidXLogRecPtr || anchor.backup_end != InvalidXLogRecPtr
+		|| anchor.backup_end_required)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	/* Never replace aggregated allocator/horizon fields with one thread's
+	 * local CheckPoint copy. Per-origin commit-ts bounds are not aggregates.
+	 */
+	memcpy(&projected, common, sizeof(projected));
+	projected.state = (DBState)anchor.state;
+	projected.time = anchor.write_time;
+	projected.checkPoint = anchor.checkpoint;
+	projected.checkPointCopy.redo = anchor.checkpoint_copy.redo;
+	projected.checkPointCopy.ThisTimeLineID = anchor.checkpoint_copy.ThisTimeLineID;
+	projected.checkPointCopy.PrevTimeLineID = anchor.checkpoint_copy.PrevTimeLineID;
+	projected.checkPointCopy.fullPageWrites = anchor.checkpoint_copy.fullPageWrites;
+	projected.checkPointCopy.time = anchor.checkpoint_copy.time;
+	projected.checkPointCopy.oldestCommitTsXid = anchor.checkpoint_copy.oldestCommitTsXid;
+	projected.checkPointCopy.newestCommitTsXid = anchor.checkpoint_copy.newestCommitTsXid;
+	projected.unloggedLSN = anchor.unlogged_lsn;
+	projected.minRecoveryPoint = anchor.min_recovery_point;
+	projected.minRecoveryPointTLI = anchor.min_recovery_tli;
+	projected.backupStartPoint = anchor.backup_start;
+	projected.backupEndPoint = anchor.backup_end;
+	projected.backupEndRequired = anchor.backup_end_required;
+	INIT_CRC32C(projected.crc);
+	COMP_CRC32C(projected.crc, &projected, offsetof(ControlFileData, crc));
+	FIN_CRC32C(projected.crc);
+	memcpy(out, &projected, sizeof(*out));
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static bool
+anchor_v2_owned(const struct stat *st, bool directory)
+{
+	return (directory ? S_ISDIR(st->st_mode) : S_ISREG(st->st_mode)) && st->st_uid == geteuid()
+		   && (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
+									   const ControlFileData *common, ControlFileData *out)
+{
+	const int dirflags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	uint8 bytes[CLUSTER_RECOVERY_ANCHOR_SIZE];
+	char thread[32], generation[48], name[112], hex[65];
+	const char *parts[4];
+	struct stat st;
+	int dirs[5] = { -1, -1, -1, -1, -1 };
+	int fd = -1;
+	size_t i, used = 0;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!anchor_v2_ref_valid(ref) || common == NULL || cluster_shared_data_dir == NULL
+		|| cluster_shared_data_dir[0] == '\0')
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	snprintf(thread, sizeof(thread), "thread_%u", ref->identity.origin_thread_id);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 ref->identity.origin_owner_incarnation);
+	for (i = 0; i < 32; ++i)
+		snprintf(hex + i * 2, 3, "%02x", ref->anchor_sha256[i]);
+	snprintf(name, sizeof(name), "anchor_" UINT64_FORMAT "-%s.bin", ref->anchor_generation, hex);
+	parts[0] = "global";
+	parts[1] = "anchor_images";
+	parts[2] = thread;
+	parts[3] = generation;
+	/* No allocation, elog or interrupt processing with raw FDs open. Decode
+	 * (including crypto allocation) occurs only after every descriptor closes.
+	 */
+	dirs[0] = open(cluster_shared_data_dir, dirflags);
+	if (dirs[0] < 0 || fstat(dirs[0], &st) != 0 || !anchor_v2_owned(&st, true))
+		goto done;
+	for (i = 0; i < lengthof(parts); ++i) {
+		dirs[i + 1] = openat(dirs[i], parts[i], dirflags);
+		if (dirs[i + 1] < 0) {
+			if (errno == ENOENT)
+				result = CLUSTER_CONTROL_ROOT_ABSENT;
+			goto done;
+		}
+		if (fstat(dirs[i + 1], &st) != 0 || !anchor_v2_owned(&st, true))
+			goto done;
+	}
+	fd = openat(dirs[4], name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	if (fd < 0) {
+		if (errno == ENOENT)
+			result = CLUSTER_CONTROL_ROOT_ABSENT;
+		goto done;
+	}
+	if (fstat(fd, &st) != 0 || !anchor_v2_owned(&st, false))
+		goto done;
+	if (st.st_size != sizeof(bytes)) {
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		goto done;
+	}
+	while (used < sizeof(bytes)) {
+		ssize_t n = read(fd, bytes + used, sizeof(bytes) - used);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto done;
+		used += n;
+	}
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	if (fd >= 0 && close(fd) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	for (i = 0; i < lengthof(dirs); ++i)
+		if (dirs[i] >= 0 && close(dirs[i]) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_recovery_anchor_v2_project(bytes, sizeof(bytes), ref, common, out);
+	return result;
+}
 
 /* Suffixes of the torn-safe file family next to the primary. */
 #define ANCHOR_TMP_SUFFIX ".tmp"

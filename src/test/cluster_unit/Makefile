@@ -1327,8 +1327,10 @@ CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_roo
 # unit binary does not drag in backend palloc/elog/ShmemVariableCache
 # machinery; err*/BasicOpenFile are stubbed in the test file.
 test_cluster_control_root: test_cluster_control_root.c unit_test.h \
-		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) xlogreader_fs.o
+		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
+		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
@@ -1693,7 +1695,8 @@ test_cluster_recovery_anchor: test_cluster_recovery_anchor.c unit_test.h \
 		$(CLUSTER_RECOVERY_ANCHOR_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_RECOVERY_ANCHOR_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # spec-6.14a D1: test_cluster_gcs_reqid exercises the pure request-id domain
 # helpers (cluster_gcs_reqid.h, c.h-only); links libpgport for pg_printf.
