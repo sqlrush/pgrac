@@ -103,6 +103,17 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.journal.denied()[0].identity, denied)
         self.assertEqual((self.directory / "deny.journal").read_bytes(), original)
 
+    def test_armed_rejoin_cannot_reuse_old_drain_to_open_exports(self):
+        import target_journal
+        self.assertTrue(hasattr(target_journal, "RejoinIntent"), "durable rejoin intent is missing")
+        denied = self.deny_complete()
+        self.journal.arm_rejoin(denied, target_journal.RejoinIntent(123, 2, 7, 8, "ab" * 32))
+        for phase in (1, 2, 3):
+            if phase != 1:
+                self.journal.advance_rejoin(denied, self.journal.denied()[0].rejoin.intent, phase)
+            self.assert_closed_refusal()
+        self.assertEqual(self.tpg.writes, [])
+
     def test_survivor_acl_remains_available_while_denied_guest_is_excluded(self):
         node = self.registry.nodes[0]
         iqn = "iqn.2026-09.test:survivor"

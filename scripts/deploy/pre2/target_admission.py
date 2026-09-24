@@ -35,7 +35,8 @@ def _enable_value(tpg, expected):
 def _denied(journal, boot):
     result = {}
     for state in journal.denied():
-        if (state.identity.target_boot_id != boot or any(p != 3 for p in state.phases)
+        if (state.identity.target_boot_id != boot
+                or not journal.completion_recorded(state.identity.operation_id, boot)
                 or state.identity.guest_uuid in result):
             raise TargetJournalError("TARGET_ADMISSION_DRAIN_UNPROVEN")
         result[state.identity.guest_uuid] = state
