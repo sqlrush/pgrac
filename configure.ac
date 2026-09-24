@@ -1462,21 +1462,28 @@ if test "$with_pacemaker" = yes ; then
   if test "$PORTNAME" != linux -o "$enable_cluster" != yes -o "$with_ssl" != openssl ; then
     AC_MSG_ERROR([--with-pacemaker requires Linux, --enable-cluster and --with-ssl=openssl])
   fi
-  PKG_CHECK_MODULES(PACEMAKER, [pacemaker-fencing >= 2.1.6])
+  PKG_CHECK_MODULES(PACEMAKER, [pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6])
   pgrac_fence_saved_CPPFLAGS="$CPPFLAGS"
   pgrac_fence_saved_LIBS="$LIBS"
   CPPFLAGS="$CPPFLAGS $PACEMAKER_CFLAGS"
   LIBS="$PACEMAKER_LIBS $LIBS"
   AC_MSG_CHECKING([for the native Pacemaker fencing API and Ed25519])
   AC_LINK_IFELSE([AC_LANG_PROGRAM([[#include <crm/stonith-ng.h>
+#include <crm/cib.h>
+#include <libxml/c14n.h>
 #include <openssl/evp.h>]], [[
     stonith_t *st = stonith_api_new();
+    cib_t *cib = cib_native_new();
+    xmlChar *canonical = 0;
     int algorithm = EVP_PKEY_ED25519;
     if (st != 0) {
       int (*fence)(stonith_t *, int, const char *, const char *, int, int) = st->cmds->fence;
       (void) fence;
       stonith_api_delete(st);
     }
+    if (cib != 0)
+      cib_delete(cib);
+    (void) xmlC14NDocDumpMemory(0, 0, XML_C14N_1_0, 0, 0, &canonical);
     return algorithm == 0;
   ]])], [AC_MSG_RESULT([yes])],
     [AC_MSG_ERROR([native Pacemaker API and OpenSSL Ed25519 support are required])])

@@ -46,7 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
-        test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker \
+        test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
         test_cluster_update_trace test_cluster_cr_dependency \
@@ -385,7 +385,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$(SIMPLE_TESTS))
 # PGRAC: production journal validation is linked into target command tests.
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_command test_pgrac_fenced_target_reply,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_client,$(SIMPLE_TESTS))
@@ -1403,6 +1403,23 @@ test_pgrac_fenced_pacemaker: test_pgrac_fenced_pacemaker.c unit_test.h \
 		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
 		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_pacemaker.o -o $@
 
+# PGRAC: native CIB replacement is test-only; XML/crypto are real library calls.
+test_pgrac_fenced_cib: test_pgrac_fenced_cib.c unit_test.h \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_cib.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(PACEMAKER_CFLAGS) \
+		-I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_cib.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(LDFLAGS) $(LDFLAGS_EX) $(PACEMAKER_LIBS) $(LIBS) -o $@
+
+# PGRAC: explicit read-only smoke, not an automatic test or installed utility.
+probe_pgrac_fenced_cib: probe_pgrac_fenced_cib.c \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_cib.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_cib.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(LDFLAGS) $(LDFLAGS_EX) $(PACEMAKER_LIBS) $(LIBS) -o $@
+
 test_pgrac_fenced_config: test_pgrac_fenced_config.c unit_test.h \
 		data/pgrac_fence_map_v2_fixture.h \
 		$(PGRAC_FENCED_CONFIG_O)
@@ -2373,7 +2390,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS) pgrac_fenced_live_rejoin_client \
+	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_cr_mvcc_gate.inc \
 		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
 		test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc \

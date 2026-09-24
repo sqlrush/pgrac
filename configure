@@ -13302,19 +13302,19 @@ if test "$with_pacemaker" = yes ; then
   fi
 
 pkg_failed=no
-{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for pacemaker-fencing >= 2.1.6" >&5
-$as_echo_n "checking for pacemaker-fencing >= 2.1.6... " >&6; }
+{ $as_echo "$as_me:${as_lineno-$LINENO}: checking for pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" >&5
+$as_echo_n "checking for pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6... " >&6; }
 
 if test -n "$PACEMAKER_CFLAGS"; then
     pkg_cv_PACEMAKER_CFLAGS="$PACEMAKER_CFLAGS"
  elif test -n "$PKG_CONFIG"; then
     if test -n "$PKG_CONFIG" && \
-    { { $as_echo "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"pacemaker-fencing >= 2.1.6\""; } >&5
-  ($PKG_CONFIG --exists --print-errors "pacemaker-fencing >= 2.1.6") 2>&5
+    { { $as_echo "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6") 2>&5
   ac_status=$?
   $as_echo "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
   test $ac_status = 0; }; then
-  pkg_cv_PACEMAKER_CFLAGS=`$PKG_CONFIG --cflags "pacemaker-fencing >= 2.1.6" 2>/dev/null`
+  pkg_cv_PACEMAKER_CFLAGS=`$PKG_CONFIG --cflags "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>/dev/null`
 		      test "x$?" != "x0" && pkg_failed=yes
 else
   pkg_failed=yes
@@ -13326,12 +13326,12 @@ if test -n "$PACEMAKER_LIBS"; then
     pkg_cv_PACEMAKER_LIBS="$PACEMAKER_LIBS"
  elif test -n "$PKG_CONFIG"; then
     if test -n "$PKG_CONFIG" && \
-    { { $as_echo "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"pacemaker-fencing >= 2.1.6\""; } >&5
-  ($PKG_CONFIG --exists --print-errors "pacemaker-fencing >= 2.1.6") 2>&5
+    { { $as_echo "$as_me:${as_lineno-$LINENO}: \$PKG_CONFIG --exists --print-errors \"pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6\""; } >&5
+  ($PKG_CONFIG --exists --print-errors "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6") 2>&5
   ac_status=$?
   $as_echo "$as_me:${as_lineno-$LINENO}: \$? = $ac_status" >&5
   test $ac_status = 0; }; then
-  pkg_cv_PACEMAKER_LIBS=`$PKG_CONFIG --libs "pacemaker-fencing >= 2.1.6" 2>/dev/null`
+  pkg_cv_PACEMAKER_LIBS=`$PKG_CONFIG --libs "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>/dev/null`
 		      test "x$?" != "x0" && pkg_failed=yes
 else
   pkg_failed=yes
@@ -13352,14 +13352,14 @@ else
         _pkg_short_errors_supported=no
 fi
         if test $_pkg_short_errors_supported = yes; then
-	        PACEMAKER_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "pacemaker-fencing >= 2.1.6" 2>&1`
+	        PACEMAKER_PKG_ERRORS=`$PKG_CONFIG --short-errors --print-errors --cflags --libs "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>&1`
         else
-	        PACEMAKER_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "pacemaker-fencing >= 2.1.6" 2>&1`
+	        PACEMAKER_PKG_ERRORS=`$PKG_CONFIG --print-errors --cflags --libs "pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6" 2>&1`
         fi
 	# Put the nasty error message in config.log where it belongs
 	echo "$PACEMAKER_PKG_ERRORS" >&5
 
-	as_fn_error $? "Package requirements (pacemaker-fencing >= 2.1.6) were not met:
+	as_fn_error $? "Package requirements (pacemaker-fencing >= 2.1.6 pacemaker-cib >= 2.1.6) were not met:
 
 $PACEMAKER_PKG_ERRORS
 
@@ -13400,18 +13400,25 @@ $as_echo_n "checking for the native Pacemaker fencing API and Ed25519... " >&6; 
   cat confdefs.h - <<_ACEOF >conftest.$ac_ext
 /* end confdefs.h.  */
 #include <crm/stonith-ng.h>
+#include <crm/cib.h>
+#include <libxml/c14n.h>
 #include <openssl/evp.h>
 int
 main ()
 {
 
     stonith_t *st = stonith_api_new();
+    cib_t *cib = cib_native_new();
+    xmlChar *canonical = 0;
     int algorithm = EVP_PKEY_ED25519;
     if (st != 0) {
       int (*fence)(stonith_t *, int, const char *, const char *, int, int) = st->cmds->fence;
       (void) fence;
       stonith_api_delete(st);
     }
+    if (cib != 0)
+      cib_delete(cib);
+    (void) xmlC14NDocDumpMemory(0, 0, XML_C14N_1_0, 0, 0, &canonical);
     return algorithm == 0;
 
   ;

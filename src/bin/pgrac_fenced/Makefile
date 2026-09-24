@@ -24,6 +24,8 @@ FENCED_OBJS += pgrac_fenced_journal_intent.o
 FENCED_OBJS += pgrac_fenced_target_command.o pgrac_fenced_target_reply.o
 # PGRAC: fixed local management client remains in the same bounded worker group.
 FENCED_OBJS += pgrac_fenced_target_client.o
+# PGRAC: read-only native configuration, never a shadow/file qualification source.
+FENCED_OBJS += pgrac_fenced_cib.o
 FENCEDCTL_OBJS = pgrac-fencedctl.o pgrac_fenced_ctl.o \
 	pgrac_fenced_core.o pgrac_fenced_journal.o pgrac_fenced_journal_intent.o \
 	$(top_builddir)/src/common/pgrac_external_fence_protocol.o
@@ -33,7 +35,7 @@ PGRAC_FENCED_LIBS = $(top_builddir)/src/common/libpgcommon.a \
 # PGRAC: target-side verification reuses the frontend common verifier.
 all: pgrac-fenced pgrac-fencedctl pgrac-fenced-map-verify pgrac-fenced-drain-sign
 
-pgrac_fenced_pacemaker.o: override CPPFLAGS += $(PACEMAKER_CFLAGS)
+pgrac_fenced_pacemaker.o pgrac_fenced_cib.o: override CPPFLAGS += $(PACEMAKER_CFLAGS)
 
 pgrac-fenced: $(FENCED_OBJS) | submake-libpgport
 	$(CC) $(CFLAGS) $^ $(PGRAC_FENCED_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(PACEMAKER_LIBS) $(LIBS) -o $@$(X)
