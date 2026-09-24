@@ -16,6 +16,7 @@
 
 #include "pgrac_fenced_provider.h"
 #include "pgrac_fenced_journal.h"
+#include "pgrac_fenced_config.h"
 
 #undef printf
 #undef fprintf
@@ -31,14 +32,35 @@ static volatile uint32 *retry_state;
 static PgracFencedJournalRecordV1 expected_record;
 static bool expect_record;
 static uint32 context_readback_failures;
+static PgracFencedConfigV1 context_config;
+static const PgracFencedConfigV1 *expected_config;
+static uint8 context_config_digest[32];
 
 static bool
 callback_record_matches(void)
 {
 	const PgracFencedJournalRecordV1 *record = pgrac_fenced_provider_callback_record();
+	const PgracFencedConfigV1 *config = pgrac_fenced_provider_callback_config();
+
+	if (expected_config == NULL
+			? config != NULL
+			: (config == NULL || memcmp(config, expected_config, sizeof(*config)) != 0))
+		return false;
 
 	return expect_record ? record != NULL && memcmp(record, &expected_record, sizeof(*record)) == 0
 						 : record == NULL;
+}
+
+static PgracFencedProviderResult
+context_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
+				int32 *native_status)
+{
+	retry_state[0]++;
+	if (!callback_record_matches())
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
+	*resolved = *configured;
+	*native_status = 58;
+	return PGRAC_FENCED_PROVIDER_OK;
 }
 
 static PgracFencedProviderResult
@@ -686,6 +708,25 @@ context_fixture(PgracFencedProviderOpsV1 *ops, PgracFencedTargetV1 *target,
 														   record->mapping_generation, &binding));
 	UT_ASSERT(pgrac_external_fence_binding_digest_v1(&binding, record->binding_digest));
 	expected_record = *record;
+	memset(&context_config, 0, sizeof(context_config));
+	context_config.format_version = 2;
+	context_config.provider_id = 257;
+	context_config.provider_abi = 1;
+	context_config.mapping_generation = 17;
+	context_config.system_identifier = 9001;
+	context_config.node_count = 1;
+	context_config.nodes[2].present = true;
+	memcpy(context_config.nodes[2].target_uuid, target->target_uuid, 16);
+	memcpy(context_config.nodes[2].protected_set_digest, record->intent.protected_set_digest, 32);
+	context_config.nodes[2].adapter_data_len = 3;
+	memcpy(context_config.nodes[2].adapter_data, "map", 3);
+	target->adapter_config = context_config.nodes[2].adapter_data;
+	target->adapter_config_len = 3;
+	context_config.native.present = true;
+	memcpy(context_config.native.resource, "accepted-policy", 16);
+	memset(context_config.native.cib_digest, 0x61, 32);
+	memcpy(context_config_digest, record->semantic_config_digest, 32);
+	expected_config = &context_config;
 	expect_record = true;
 	context_readback_failures = 0;
 	retry_state[0] = 0;
@@ -701,17 +742,20 @@ UT_TEST(test_owned_callback_is_exact_and_fork_local)
 
 	context_fixture(&ops, &target, &record);
 	UT_ASSERT_NULL(pgrac_fenced_provider_callback_record());
-	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(&ops, false, false, &target, &record,
-															deadline_after_ms(1000), &result,
-															&native),
+	UT_ASSERT_NULL(pgrac_fenced_provider_callback_config());
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(
+					 &ops, false, false, &target, &record, &context_config, context_config_digest,
+					 deadline_after_ms(1000), &result, &native),
 				 PGRAC_FENCED_PROVIDER_WORKER_OK);
 	UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_OK);
 	UT_ASSERT_EQ(native, 57);
 	UT_ASSERT_EQ(retry_state[0], 1);
 	UT_ASSERT_NULL(pgrac_fenced_provider_callback_record());
+	UT_ASSERT_NULL(pgrac_fenced_provider_callback_config());
 	/* A later legacy callback must not inherit the previous operation. */
 	ops.provider_id = PGRAC_FENCED_PROVIDER_ID_TEST_ONLY;
 	expect_record = false;
+	expected_config = NULL;
 	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate(&ops, true, false, &target,
 													  deadline_after_ms(1000), &result, &native),
 				 PGRAC_FENCED_PROVIDER_WORKER_OK);
@@ -733,7 +777,8 @@ UT_TEST(test_owned_readback_retry_keeps_the_same_attempt)
 	expected_record = record;
 	context_readback_failures = 2;
 	UT_ASSERT_EQ(pgrac_fenced_provider_worker_readback_retry_owned(
-					 &ops, false, &target, &record, deadline_after_ms(1500), &result, &readback),
+					 &ops, false, &target, &record, &context_config, context_config_digest,
+					 deadline_after_ms(1500), &result, &readback),
 				 PGRAC_FENCED_PROVIDER_WORKER_OK);
 	UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_OK);
 	UT_ASSERT_EQ(retry_state[0], 3);
@@ -795,15 +840,15 @@ UT_TEST(test_owned_worker_refuses_inexact_or_unissued_identity)
 			record.intent.kind = PGRAC_FENCED_JOURNAL_INTENT_NONE;
 			break;
 		}
-		UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(&ops, false, false, &target,
-																&record, deadline_after_ms(1000),
-																&result, &native),
+		UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(
+						 &ops, false, false, &target, &record, &context_config,
+						 context_config_digest, deadline_after_ms(1000), &result, &native),
 					 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
 		UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_UNAVAILABLE);
 	}
-	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(&ops, false, true, &target, &original,
-															deadline_after_ms(1000), &result,
-															&native),
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(
+					 &ops, false, true, &target, &original, &context_config, context_config_digest,
+					 deadline_after_ms(1000), &result, &native),
 				 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
 	UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate(&ops, false, false, &target,
 													  deadline_after_ms(1000), &result, &native),
@@ -814,6 +859,92 @@ UT_TEST(test_owned_worker_refuses_inexact_or_unissued_identity)
 	UT_ASSERT_EQ(retry_state[0], 0);
 }
 
+/* PGRAC: a matching record must not authorize a different accepted config. */
+UT_TEST(test_worker_configuration_mismatch_prevents_every_callback)
+{
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedTargetV1 target;
+	PgracFencedJournalRecordV1 record;
+	PgracFencedProviderResult result;
+	int32 native;
+	uint8 other_map[3] = { 'b', 'a', 'd' };
+	for (int variant = 0; variant < 12; variant++) {
+		context_fixture(&ops, &target, &record);
+		switch (variant) {
+		case 0:
+			context_config_digest[0] ^= 1;
+			break;
+		case 1:
+			memset(context_config_digest, 0, 32);
+			break;
+		case 2:
+			context_config.system_identifier++;
+			break;
+		case 3:
+			context_config.provider_id++;
+			break;
+		case 4:
+			context_config.provider_abi++;
+			break;
+		case 5:
+			context_config.mapping_generation++;
+			break;
+		case 6:
+			context_config.nodes[2].present = false;
+			break;
+		case 7:
+			context_config.nodes[2].target_uuid[0] ^= 1;
+			break;
+		case 8:
+			context_config.nodes[2].protected_set_digest[0] ^= 1;
+			break;
+		case 9:
+			target.adapter_config = other_map;
+			break;
+		case 10:
+			target.adapter_config_len--;
+			break;
+		case 11:
+			context_config.format_version = 1;
+			break;
+		}
+		UT_ASSERT_EQ(pgrac_fenced_provider_worker_actuate_owned(
+						 &ops, false, false, &target, &record, &context_config,
+						 context_config_digest, deadline_after_ms(1000), &result, &native),
+					 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
+		UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_UNAVAILABLE);
+		UT_ASSERT_EQ(native, 0);
+		UT_ASSERT_EQ(retry_state[0], 0);
+	}
+}
+
+UT_TEST(test_resolve_uses_explicit_snapshot_without_an_operation)
+{
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedTargetV1 target, resolved;
+	PgracFencedJournalRecordV1 record;
+	PgracFencedProviderResult result;
+	int32 native;
+	context_fixture(&ops, &target, &record);
+	ops.resolve = context_resolve;
+	expect_record = false;
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_resolve_configured(
+					 &ops, false, &target, &context_config, context_config_digest,
+					 deadline_after_ms(1000), &result, &resolved, &native),
+				 PGRAC_FENCED_PROVIDER_WORKER_OK);
+	UT_ASSERT_EQ(result, PGRAC_FENCED_PROVIDER_OK);
+	UT_ASSERT_EQ(native, 58);
+	UT_ASSERT_EQ(retry_state[0], 1);
+	UT_ASSERT(resolved.adapter_config == target.adapter_config);
+	UT_ASSERT_NULL(pgrac_fenced_provider_callback_config());
+	UT_ASSERT_NULL(pgrac_fenced_provider_callback_record());
+	UT_ASSERT_EQ(pgrac_fenced_provider_worker_resolve(&ops, false, &target, deadline_after_ms(1000),
+													  &result, &resolved, &native),
+				 PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE);
+	UT_ASSERT_EQ(retry_state[0], 1);
+	expected_config = NULL;
+}
+
 int
 main(void)
 {
@@ -821,7 +952,7 @@ main(void)
 		= mmap(NULL, sizeof(uint32) * 2, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (retry_state == MAP_FAILED)
 		return 1;
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_provider_abi_exact_layout);
 	UT_RUN(test_production_registry_honors_fexecve_gate);
 	UT_RUN(test_test_only_ops_require_explicit_test_validation);
@@ -838,6 +969,8 @@ main(void)
 	UT_RUN(test_owned_callback_is_exact_and_fork_local);
 	UT_RUN(test_owned_readback_retry_keeps_the_same_attempt);
 	UT_RUN(test_owned_worker_refuses_inexact_or_unissued_identity);
+	UT_RUN(test_worker_configuration_mismatch_prevents_every_callback);
+	UT_RUN(test_resolve_uses_explicit_snapshot_without_an_operation);
 	UT_DONE();
 	(void)munmap((void *)retry_state, sizeof(uint32) * 2);
 	return ut_failed_count == 0 ? 0 : 1;

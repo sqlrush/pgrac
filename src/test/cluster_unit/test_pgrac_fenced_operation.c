@@ -56,12 +56,17 @@ callback_matches_durable_event(uint16 kind)
 {
 	PgracFencedJournalRecordV1 records[16];
 	const PgracFencedJournalRecordV1 *actual = pgrac_fenced_provider_callback_record();
+	const PgracFencedConfigV1 *config = pgrac_fenced_provider_callback_config();
 	uint8 observed[768], durable[768];
 	size_t observed_len, durable_len, count;
 	int fd;
 
 	if (owned_journal_path == NULL)
 		return true;
+	if (config == NULL || actual == NULL || config->format_version != 2
+		|| config->system_identifier != actual->intent.system_identifier
+		|| config->mapping_generation != actual->mapping_generation)
+		return false;
 	fd = open(owned_journal_path, O_RDONLY);
 	if (fd < 0)
 		return false;
@@ -79,6 +84,8 @@ test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolve
 			 int32 *native_status)
 {
 	resolve_calls++;
+	if (owned_journal_path != NULL && pgrac_fenced_provider_callback_config() == NULL)
+		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	/* Model setup/journal latency before the action/readback fault is reached. */
 	if (delay_before_timeout_stage)
 		(void)usleep(50000);

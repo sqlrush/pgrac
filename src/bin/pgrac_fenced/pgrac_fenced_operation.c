@@ -731,9 +731,10 @@ pgrac_fenced_operation_execute_preaccepted(
 	memcpy(binding_digest, prepared->binding_digest,
 		sizeof(binding_digest));
 	journal_seq = prepared->accepted_journal_seq;
-	worker_result = pgrac_fenced_provider_worker_resolve(context->provider,
-		context->allow_test_only, &target, deadline_mono_ns, &provider_result,
-		&resolved, &native_status);
+	worker_result = pgrac_fenced_provider_worker_resolve_configured(
+		context->provider, context->allow_test_only, &target, context->config,
+		context->semantic_config_digest, deadline_mono_ns, &provider_result, &resolved,
+		&native_status);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
 			PGRAC_FENCED_PROVIDER_UNAVAILABLE : PGRAC_FENCED_PROVIDER_UNKNOWN;
@@ -862,10 +863,10 @@ pgrac_fenced_operation_execute_preaccepted(
 			journal_seq, response);
 		return true;
 	}
-	worker_result = pgrac_fenced_provider_worker_actuate_owned(context->provider,
-		context->allow_test_only, false, &resolved,
-		context->config->format_version == 2 ? &record : NULL, deadline_mono_ns,
-		&provider_result, &native_status);
+	worker_result = pgrac_fenced_provider_worker_actuate_owned(
+		context->provider, context->allow_test_only, false, &resolved,
+		context->config->format_version == 2 ? &record : NULL, context->config,
+		context->semantic_config_digest, deadline_mono_ns, &provider_result, &native_status);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
 			PGRAC_FENCED_PROVIDER_UNAVAILABLE : PGRAC_FENCED_PROVIDER_UNKNOWN;
@@ -888,10 +889,10 @@ pgrac_fenced_operation_execute_preaccepted(
 	}
 	journal_seq = record.seq;
 	memset(&readback, 0, sizeof(readback));
-	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(context->provider,
-		context->allow_test_only, &resolved,
-		context->config->format_version == 2 ? &record : NULL, deadline_mono_ns, &provider_result,
-		&readback);
+	worker_result = pgrac_fenced_provider_worker_readback_retry_owned(
+		context->provider, context->allow_test_only, &resolved,
+		context->config->format_version == 2 ? &record : NULL, context->config,
+		context->semantic_config_digest, deadline_mono_ns, &provider_result, &readback);
 	if (worker_result != PGRAC_FENCED_PROVIDER_WORKER_OK)
 		provider_result = worker_result == PGRAC_FENCED_PROVIDER_WORKER_UNAVAILABLE ?
 			PGRAC_FENCED_PROVIDER_UNAVAILABLE : PGRAC_FENCED_PROVIDER_UNKNOWN;
