@@ -47,7 +47,7 @@ endif
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
         test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker \
-        test_pgrac_fenced_map_filter \
+        test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_cluster_update_trace test_cluster_cr_dependency \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
@@ -383,7 +383,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_config test_pgrac_fenced_core \
 		test_pgrac_fenced_ctl,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge test_cluster_port_runtime,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_prepare_diagnostic,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
@@ -1369,6 +1369,17 @@ test_pgrac_fenced_map_filter: test_pgrac_fenced_map_filter.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
 		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_map_filter.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
+
+# PGRAC: the target signing boundary uses real crypto and the production consumer.
+test_pgrac_fenced_drain_sign_filter: test_pgrac_fenced_drain_sign_filter.c unit_test.h \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain_sign_filter.o \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o \
+		$(top_builddir)/src/common/libpgcommon.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain_sign_filter.o \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
 		$(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
 

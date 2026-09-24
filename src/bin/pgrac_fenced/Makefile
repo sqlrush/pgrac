@@ -27,7 +27,7 @@ PGRAC_FENCED_LIBS = $(top_builddir)/src/common/libpgcommon.a \
 	$(top_builddir)/src/port/libpgport.a
 
 # PGRAC: target-side verification reuses the frontend common verifier.
-all: pgrac-fenced pgrac-fencedctl pgrac-fenced-map-verify
+all: pgrac-fenced pgrac-fencedctl pgrac-fenced-map-verify pgrac-fenced-drain-sign
 
 pgrac_fenced_pacemaker.o: override CPPFLAGS += $(PACEMAKER_CFLAGS)
 
@@ -40,10 +40,15 @@ pgrac-fencedctl: $(FENCEDCTL_OBJS) | submake-libpgport
 pgrac-fenced-map-verify: pgrac-fenced-map-verify.o pgrac_fenced_map_filter.o | submake-libpgport
 	$(CC) $(CFLAGS) $^ $(PGRAC_FENCED_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
 
+# PGRAC: seed enters only through the restricted owner's pipe; never setuid.
+pgrac-fenced-drain-sign: pgrac-fenced-drain-sign.o pgrac_fenced_drain_sign_filter.o pgrac_fenced_drain.o | submake-libpgport
+	$(CC) $(CFLAGS) $^ $(PGRAC_FENCED_LIBS) $(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@$(X)
+
 install: all installdirs
 	$(INSTALL_PROGRAM) pgrac-fenced$(X) '$(DESTDIR)$(bindir)/pgrac-fenced$(X)'
 	$(INSTALL_PROGRAM) pgrac-fencedctl$(X) '$(DESTDIR)$(bindir)/pgrac-fencedctl$(X)'
 	$(INSTALL_PROGRAM) pgrac-fenced-map-verify$(X) '$(DESTDIR)$(bindir)/pgrac-fenced-map-verify$(X)'
+	$(INSTALL_PROGRAM) pgrac-fenced-drain-sign$(X) '$(DESTDIR)$(bindir)/pgrac-fenced-drain-sign$(X)'
 
 installdirs:
 	$(MKDIR_P) '$(DESTDIR)$(bindir)'
@@ -52,8 +57,10 @@ uninstall:
 	rm -f '$(DESTDIR)$(bindir)/pgrac-fenced$(X)'
 	rm -f '$(DESTDIR)$(bindir)/pgrac-fencedctl$(X)'
 	rm -f '$(DESTDIR)$(bindir)/pgrac-fenced-map-verify$(X)'
+	rm -f '$(DESTDIR)$(bindir)/pgrac-fenced-drain-sign$(X)'
 
 clean distclean maintainer-clean:
 	rm -f pgrac-fenced$(X) pgrac-fencedctl$(X) pgrac-fenced-map-verify$(X) \
 		$(FENCED_OBJS) pgrac-fencedctl.o pgrac_fenced_ctl.o \
-		pgrac-fenced-map-verify.o pgrac_fenced_map_filter.o
+		pgrac-fenced-map-verify.o pgrac_fenced_map_filter.o \
+		pgrac-fenced-drain-sign$(X) pgrac-fenced-drain-sign.o pgrac_fenced_drain_sign_filter.o
