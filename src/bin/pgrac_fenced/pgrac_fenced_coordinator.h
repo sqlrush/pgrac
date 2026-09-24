@@ -37,8 +37,13 @@ typedef struct PgracFencedCoordinatorClientV1
 typedef struct PgracFencedCoordinatorOperationV1
 {
 	bool worker_active;
+	/* PGRAC: queue ownership survives the last caller and worker attempt. */
+	bool owned_pending;
+	bool retry_required;
 	int owner_client_id;
 	PgracFencedScheduleTicketV1 ticket;
+	PgracExternalFenceProtocolRequestV1 request;
+	PgracFencedPreparedAcquireV1 prepared;
 	PgracFencedAsyncWorkerV1 worker;
 } PgracFencedCoordinatorOperationV1;
 
@@ -66,6 +71,14 @@ typedef struct PgracFencedCoordinatorV1
 extern bool pgrac_fenced_coordinator_init(
 	PgracFencedCoordinatorV1 *coordinator,
 	PgracFencedOperationContextV1 *context);
+extern bool pgrac_fenced_coordinator_restore(
+	PgracFencedCoordinatorV1 *coordinator,
+	PgracFencedJournalReconcileState *pending);
+extern bool pgrac_fenced_coordinator_prepare_mapping_reload(
+	PgracFencedCoordinatorV1 *coordinator,
+	const PgracFencedConfigV1 *config,
+	const PgracFencedProviderOpsV1 *provider,
+	const uint8 semantic_config_digest[PGRAC_FENCED_CONFIG_DIGEST_BYTES]);
 extern bool pgrac_fenced_coordinator_accept_fd(
 	PgracFencedCoordinatorV1 *coordinator,
 	int client_fd,

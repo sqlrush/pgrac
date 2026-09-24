@@ -159,14 +159,98 @@ UT_TEST(test_capacity_129_denies_without_mutating_existing_operations)
 	UT_ASSERT_EQ(pgrac_fenced_schedule_active_count(&schedule), PGRAC_FENCED_MAX_OPERATIONS);
 }
 
+UT_TEST(test_owned_last_waiter_withdrawal_keeps_fifo_obligation)
+{
+	PgracFencedScheduleV1 schedule;
+	PgracFencedScheduleTicketV1 active, queued, joiner, started;
+	PgracFencedScheduleSnapshotV1 snapshot;
+	uint8 target[16], binding[32], second[32];
+
+	identity(target, binding, 5);
+	memset(second, 0xa7, sizeof(second));
+	UT_ASSERT(pgrac_fenced_schedule_init_owned(&schedule));
+	UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, 1, target, binding, 100, &active),
+				 PGRAC_FENCED_SCHEDULE_START);
+	UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, 2, target, second, 200, &queued),
+				 PGRAC_FENCED_SCHEDULE_QUEUE);
+	UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, 3, target, second, 300, &joiner),
+				 PGRAC_FENCED_SCHEDULE_JOIN);
+	UT_ASSERT_EQ(joiner.serial, queued.serial);
+	UT_ASSERT(pgrac_fenced_schedule_cancel_client(&schedule, 2, &started));
+	UT_ASSERT(pgrac_fenced_schedule_cancel_client(&schedule, 3, &started));
+	UT_ASSERT(pgrac_fenced_schedule_cancel_client(&schedule, 1, &started));
+	UT_ASSERT_EQ(schedule.client_count, 0);
+	UT_ASSERT_EQ(schedule.operation_count, 2);
+	UT_ASSERT(pgrac_fenced_schedule_snapshot(&schedule, &queued, &snapshot));
+	UT_ASSERT_EQ(snapshot.client_count, 0);
+	UT_ASSERT_EQ(snapshot.deadline_mono_ns, 0);
+	UT_ASSERT(pgrac_fenced_schedule_release(&schedule, &active, &started));
+	UT_ASSERT_EQ(started.serial, queued.serial);
+	UT_ASSERT(pgrac_fenced_schedule_snapshot(&schedule, &started, &snapshot));
+	UT_ASSERT(snapshot.active);
+	UT_ASSERT_EQ(snapshot.client_count, 0);
+}
+
+UT_TEST(test_owned_restart_has_no_synthetic_client_or_caller_deadline)
+{
+	PgracFencedScheduleV1 schedule;
+	PgracFencedScheduleTicketV1 first, second, waiter, started;
+	PgracFencedScheduleSnapshotV1 snapshot;
+	uint8 target[16], binding[32];
+
+	identity(target, binding, 6);
+	UT_ASSERT(pgrac_fenced_schedule_init_owned(&schedule));
+	UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, -1, target, binding, 0, &first),
+				 PGRAC_FENCED_SCHEDULE_START);
+	/* Each replayed UUID owns its obligation; equal bindings do not erase one. */
+	UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, -1, target, binding, 0, &second),
+				 PGRAC_FENCED_SCHEDULE_QUEUE);
+	UT_ASSERT_NE(first.serial, second.serial);
+	UT_ASSERT_EQ(schedule.client_count, 0);
+	UT_ASSERT_EQ(schedule.operation_count, 2);
+	UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, 9, target, binding, 300, &waiter),
+				 PGRAC_FENCED_SCHEDULE_JOIN);
+	UT_ASSERT_EQ(waiter.serial, first.serial);
+	UT_ASSERT_EQ(schedule.client_count, 1);
+	UT_ASSERT(pgrac_fenced_schedule_cancel_client(&schedule, 9, &started));
+	UT_ASSERT(pgrac_fenced_schedule_release(&schedule, &first, &started));
+	UT_ASSERT_EQ(started.serial, second.serial);
+	UT_ASSERT(pgrac_fenced_schedule_snapshot(&schedule, &second, &snapshot));
+	UT_ASSERT_EQ(snapshot.deadline_mono_ns, 0);
+	UT_ASSERT(!pgrac_fenced_schedule_release(&schedule, &first, &waiter));
+}
+
+UT_TEST(test_owned_capacity_counts_obligations_even_without_clients)
+{
+	PgracFencedScheduleV1 schedule;
+	PgracFencedScheduleTicketV1 ticket;
+	uint8 target[16], binding[32];
+
+	UT_ASSERT(pgrac_fenced_schedule_init_owned(&schedule));
+	for (uint32 i = 0; i < PGRAC_FENCED_MAX_OPERATIONS; ++i) {
+		identity(target, binding, (uint8)(i + 1));
+		UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, -1, target, binding, 0, &ticket),
+					 PGRAC_FENCED_SCHEDULE_START);
+	}
+	UT_ASSERT_EQ(schedule.client_count, 0);
+	UT_ASSERT_EQ(schedule.operation_count, PGRAC_FENCED_MAX_OPERATIONS);
+	identity(target, binding, 200);
+	UT_ASSERT_EQ(pgrac_fenced_schedule_submit(&schedule, -1, target, binding, 0, &ticket),
+				 PGRAC_FENCED_SCHEDULE_DENY);
+	UT_ASSERT_EQ(schedule.operation_count, PGRAC_FENCED_MAX_OPERATIONS);
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(7);
 	UT_RUN(test_same_binding_joins_only_live_joinable_operation);
 	UT_RUN(test_same_target_is_strict_fifo_and_different_target_starts);
 	UT_RUN(test_cancel_queued_preserves_fifo_and_stale_ticket_is_rejected);
 	UT_RUN(test_capacity_129_denies_without_mutating_existing_operations);
+	UT_RUN(test_owned_last_waiter_withdrawal_keeps_fifo_obligation);
+	UT_RUN(test_owned_restart_has_no_synthetic_client_or_caller_deadline);
+	UT_RUN(test_owned_capacity_counts_obligations_even_without_clients);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

@@ -468,7 +468,8 @@ static PgracFencedOperationAcceptResult
 persist_prepared_accept(PgracFencedOperationContextV1 *context,
 						const PgracExternalFenceProtocolRequestV1 *request,
 						PgracFencedPreparedAcquireV1 *prepared,
-						PgracExternalFenceProtocolResponseV1 *response)
+						PgracExternalFenceProtocolResponseV1 *response,
+						const PgracFencedJournalRecordV1 *previous)
 {
 	PgracFencedJournalRecordV1 record;
 
@@ -477,7 +478,9 @@ persist_prepared_accept(PgracFencedOperationContextV1 *context,
 	record.provider_result = PGRAC_FENCED_PROVIDER_PENDING;
 	if (context->config->format_version == 2)
 	{
-		if (!pg_strong_random(record.operation_id, sizeof(record.operation_id)) ||
+		if (previous != NULL)
+			memcpy(record.operation_id, previous->operation_id, 16);
+		else if (!pg_strong_random(record.operation_id, sizeof(record.operation_id)) ||
 			!bytes_nonzero(record.operation_id, sizeof(record.operation_id)) ||
 			memcmp(record.operation_id, request->request_nonce, 16) == 0)
 		{
@@ -486,7 +489,7 @@ persist_prepared_accept(PgracFencedOperationContextV1 *context,
 		}
 		memcpy(record.binding_digest, prepared->binding_digest, 32);
 		record.intent.kind = PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE;
-		record.intent.attempt = 1;
+		record.intent.attempt = previous != NULL ? previous->intent.attempt + 1 : 1;
 		record.intent.system_identifier = context->config->system_identifier;
 		memcpy(record.intent.target_uuid, prepared->target.target_uuid, 16);
 		memcpy(record.intent.protected_set_digest, request->need.protected_set_digest, 32);
@@ -505,7 +508,7 @@ persist_prepared_accept(PgracFencedOperationContextV1 *context,
 }
 
 PgracFencedOperationAcceptResult
-pgrac_fenced_operation_accept(
+pgrac_fenced_operation_prepare(
 	PgracFencedOperationContextV1 *context,
 	const PgracExternalFenceProtocolRequestV1 *request,
 	uint64 deadline_mono_ns,
@@ -575,7 +578,42 @@ pgrac_fenced_operation_accept(
 	memcpy(prepared->binding_digest, binding_digest,
 		sizeof(prepared->binding_digest));
 	prepared->accepted_mono_ns = now;
-	return persist_prepared_accept(context, request, prepared, response);
+	return PGRAC_FENCED_OPERATION_READY;
+}
+
+PgracFencedOperationAcceptResult
+pgrac_fenced_operation_accept(PgracFencedOperationContextV1 *context,
+	const PgracExternalFenceProtocolRequestV1 *request, uint64 deadline_mono_ns,
+	PgracFencedPreparedAcquireV1 *prepared, PgracExternalFenceProtocolResponseV1 *response)
+{
+	PgracFencedOperationAcceptResult result;
+
+	result = pgrac_fenced_operation_prepare(context, request, deadline_mono_ns, prepared, response);
+	return result == PGRAC_FENCED_OPERATION_READY ?
+		persist_prepared_accept(context, request, prepared, response, NULL) : result;
+}
+
+PgracFencedOperationAcceptResult
+pgrac_fenced_operation_resume_acquire(PgracFencedOperationContextV1 *context,
+	const PgracFencedJournalRecordV1 *previous, uint64 deadline_mono_ns,
+	PgracFencedPreparedAcquireV1 *prepared, PgracExternalFenceProtocolResponseV1 *response)
+{
+	PgracFencedOperationAcceptResult result;
+	const PgracExternalFenceProtocolRequestV1 *request;
+
+	if (prepared == NULL || response == NULL)
+		return PGRAC_FENCED_OPERATION_ERROR;
+	memset(prepared, 0, sizeof(*prepared));
+	memset(response, 0, sizeof(*response));
+	if (context == NULL || !context->available || context->config->format_version != 2 ||
+		previous == NULL || previous->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE ||
+		previous->record_kind == PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED ||
+		previous->intent.attempt == UINT64_MAX || !pending_intent_matches(context, previous))
+		return PGRAC_FENCED_OPERATION_ERROR;
+	request = &previous->intent.request.acquire;
+	result = pgrac_fenced_operation_prepare(context, request, deadline_mono_ns, prepared, response);
+	return result == PGRAC_FENCED_OPERATION_READY ?
+		persist_prepared_accept(context, request, prepared, response, previous) : result;
 }
 
 static bool
@@ -741,7 +779,7 @@ pgrac_fenced_operation_execute_preaccepted(
 		return true;
 	}
 	memset(&readback, 0, sizeof(readback));
-	if (context->restart_fresh_readback_required)
+	if (context->restart_fresh_readback_required && context->config->format_version != 2)
 	{
 		worker_result = pgrac_fenced_provider_worker_readback_retry(
 			context->provider, context->allow_test_only, &resolved,

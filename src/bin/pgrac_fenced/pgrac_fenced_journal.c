@@ -597,6 +597,7 @@ reconcile_remember_operation(PgracFencedJournalReconcileState *state,
 		if (!state->pending[i].used)
 		{
 			state->pending[i].used = true;
+			state->pending[i].first_seq = record->seq;
 			state->pending[i].last_record = *record;
 			state->pending_count++;
 			return true;

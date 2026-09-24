@@ -1197,10 +1197,124 @@ UT_TEST(test_v2_prepared_handle_rejects_changed_caller_identity_without_append)
 	(void)unlink(path);
 }
 
+UT_TEST(test_v2_restart_persists_exact_successor_before_redrive)
+{
+	PgracFencedConfigV1 config;
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedOperationContextV1 context;
+	PgracFencedJournalScanState journal;
+	PgracFencedJournalReconcileState pending;
+	PgracFencedPreparedAcquireV1 prepared;
+	PgracFencedJournalRecordV1 original, records[10];
+	PgracExternalFenceProtocolResponseV1 response;
+	struct stat before, after;
+	char path[64];
+	int fd;
+	size_t count;
+
+#ifndef USE_OPENSSL
+	return;
+#endif
+	UT_ASSERT_EQ(pgrac_fenced_config_parse((const uint8 *)fenced_config_v2,
+										   sizeof(fenced_config_v2) - 1, &config),
+				 PGRAC_FENCED_CONFIG_OK);
+	make_ops(&ops);
+	ops.provider_id = PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1;
+	fd = open_context(&context, &journal, &config, &ops, path);
+	if (fd < 0)
+		return;
+	UT_ASSERT(seed_owned_pending(&context, &pending, &original, false));
+	UT_ASSERT(pgrac_fenced_operation_reconcile_startup(&context, &pending));
+	UT_ASSERT_EQ(fstat(fd, &before), 0);
+	UT_ASSERT_EQ(pgrac_fenced_operation_prepare(&context, &original.intent.request.acquire,
+												deadline_after_ms(1000), &prepared, &response),
+				 PGRAC_FENCED_OPERATION_READY);
+	UT_ASSERT_EQ(prepared.accepted_journal_seq, 0);
+	UT_ASSERT_EQ(fstat(fd, &after), 0);
+	UT_ASSERT_EQ(before.st_size, after.st_size);
+	UT_ASSERT_EQ(pgrac_fenced_operation_resume_acquire(&context, &original, deadline_after_ms(1000),
+													   &prepared, &response),
+				 PGRAC_FENCED_OPERATION_READY);
+	count = read_journal_records(fd, records, lengthof(records));
+	UT_ASSERT_EQ(count, 3);
+	UT_ASSERT_EQ(records[count - 1].intent.attempt, original.intent.attempt + 1);
+	UT_ASSERT(memcmp(records[count - 1].operation_id, original.operation_id, 16) == 0);
+	UT_ASSERT(memcmp(records[count - 1].daemon_boot_id, context.daemon_boot_id, 16) == 0);
+	UT_ASSERT(pgrac_fenced_journal_intent_continues(&original, &records[count - 1]));
+	shared_provider_counts
+		= mmap(NULL, 2 * sizeof(uint32), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+	UT_ASSERT(shared_provider_counts != MAP_FAILED);
+	if (shared_provider_counts != MAP_FAILED) {
+		shared_provider_counts[0] = shared_provider_counts[1] = 0;
+		provider_mode = TEST_PROVIDER_EXACT;
+		UT_ASSERT(pgrac_fenced_operation_execute_preaccepted(
+			&context, &original.intent.request.acquire, &prepared, deadline_after_ms(1000),
+			&response));
+		UT_ASSERT_EQ(response.verdict, 1);
+		/* Old OFF is not an actuation for this attempt, even with exact readback. */
+		UT_ASSERT_EQ(shared_provider_counts[0], 1);
+		(void)munmap((void *)shared_provider_counts, 2 * sizeof(uint32));
+	}
+	shared_provider_counts = NULL;
+	(void)close(fd);
+	(void)unlink(path);
+}
+
+UT_TEST(test_v2_resume_refuses_wrong_target_completed_work_and_attempt_overflow)
+{
+	PgracFencedConfigV1 config;
+	PgracFencedProviderOpsV1 ops;
+	PgracFencedOperationContextV1 context;
+	PgracFencedJournalScanState journal;
+	PgracFencedJournalReconcileState pending;
+	PgracFencedPreparedAcquireV1 prepared;
+	PgracFencedJournalRecordV1 original, wrong;
+	PgracExternalFenceProtocolResponseV1 response;
+	struct stat before, after;
+	char path[64];
+	int fd;
+
+#ifndef USE_OPENSSL
+	return;
+#endif
+	UT_ASSERT_EQ(pgrac_fenced_config_parse((const uint8 *)fenced_config_v2,
+										   sizeof(fenced_config_v2) - 1, &config),
+				 PGRAC_FENCED_CONFIG_OK);
+	make_ops(&ops);
+	ops.provider_id = PGRAC_FENCED_PROVIDER_ID_PACEMAKER_LIBVIRT_V1;
+	fd = open_context(&context, &journal, &config, &ops, path);
+	if (fd < 0)
+		return;
+	UT_ASSERT(seed_owned_pending(&context, &pending, &original, false));
+	UT_ASSERT_EQ(fstat(fd, &before), 0);
+	resolve_calls = 0;
+	for (int variant = 0; variant < 4; ++variant) {
+		wrong = original;
+		if (variant == 0)
+			wrong.intent.target_uuid[0] ^= 1;
+		if (variant == 1)
+			wrong.intent.attempt = UINT64_MAX;
+		if (variant == 2)
+			wrong.record_kind = PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED;
+		if (variant == 3)
+			wrong.semantic_config_digest[0] ^= 1;
+		memset(&prepared, 0xee, sizeof(prepared));
+		UT_ASSERT_EQ(pgrac_fenced_operation_resume_acquire(
+						 &context, &wrong, deadline_after_ms(1000), &prepared, &response),
+					 PGRAC_FENCED_OPERATION_ERROR);
+		UT_ASSERT_EQ(prepared.accepted_journal_seq, 0);
+		UT_ASSERT_EQ(fstat(fd, &after), 0);
+		UT_ASSERT_EQ(before.st_size, after.st_size);
+		UT_ASSERT_EQ(resolve_calls, 0);
+	}
+	(void)close(fd);
+	(void)unlink(path);
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	UT_PLAN(22);
 	UT_RUN(test_scalar_acquire_fsyncs_exact_positive_sequence);
 	UT_RUN(test_action_failure_still_accepts_independent_positive_readback);
 	UT_RUN(test_scalar_readback_retries_transient_results_before_proof);
@@ -1221,6 +1335,8 @@ main(void)
 	UT_RUN(test_v2_startup_preserves_exact_work_and_refuses_mapping_drift);
 	UT_RUN(test_v2_acquire_persists_one_complete_identity_for_all_events);
 	UT_RUN(test_v2_prepared_handle_rejects_changed_caller_identity_without_append);
+	UT_RUN(test_v2_restart_persists_exact_successor_before_redrive);
+	UT_RUN(test_v2_resume_refuses_wrong_target_completed_work_and_attempt_overflow);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

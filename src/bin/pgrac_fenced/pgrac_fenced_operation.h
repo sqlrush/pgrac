@@ -86,6 +86,18 @@ extern PgracFencedOperationAcceptResult pgrac_fenced_operation_accept(
 	uint64 deadline_mono_ns,
 	PgracFencedPreparedAcquireV1 *prepared,
 	PgracExternalFenceProtocolResponseV1 *response);
+extern PgracFencedOperationAcceptResult pgrac_fenced_operation_prepare(
+	PgracFencedOperationContextV1 *context,
+	const PgracExternalFenceProtocolRequestV1 *request,
+	uint64 deadline_mono_ns,
+	PgracFencedPreparedAcquireV1 *prepared,
+	PgracExternalFenceProtocolResponseV1 *response);
+extern PgracFencedOperationAcceptResult pgrac_fenced_operation_resume_acquire(
+	PgracFencedOperationContextV1 *context,
+	const PgracFencedJournalRecordV1 *previous,
+	uint64 deadline_mono_ns,
+	PgracFencedPreparedAcquireV1 *prepared,
+	PgracExternalFenceProtocolResponseV1 *response);
 extern bool pgrac_fenced_operation_execute_preaccepted(
 	PgracFencedOperationContextV1 *context,
 	const PgracExternalFenceProtocolRequestV1 *request,

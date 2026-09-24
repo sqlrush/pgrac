@@ -150,6 +150,8 @@ typedef struct PgracFencedJournalScanState
 typedef struct PgracFencedJournalReconcileEntry
 {
 	bool used;
+	/* PGRAC: original replay order, not the most recent attempt's sequence. */
+	uint64 first_seq;
 	PgracFencedJournalRecordV1 last_record;
 } PgracFencedJournalReconcileEntry;
 

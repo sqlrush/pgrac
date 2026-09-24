@@ -58,6 +58,7 @@ typedef struct PgracFencedScheduledOperationV1
 
 typedef struct PgracFencedScheduleV1
 {
+	bool caller_independent;
 	uint64 next_serial;
 	uint64 next_queue_order;
 	uint32 operation_count;
@@ -67,6 +68,7 @@ typedef struct PgracFencedScheduleV1
 } PgracFencedScheduleV1;
 
 extern bool pgrac_fenced_schedule_init(PgracFencedScheduleV1 *schedule);
+extern bool pgrac_fenced_schedule_init_owned(PgracFencedScheduleV1 *schedule);
 extern PgracFencedScheduleResult pgrac_fenced_schedule_submit(
 	PgracFencedScheduleV1 *schedule,
 	int client_id,

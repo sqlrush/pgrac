@@ -782,7 +782,9 @@ main(int argc, char **argv)
 			&reconcile) ||
 		!pgrac_fenced_coordinator_init(&coordinator, &operation_context) ||
 		!pgrac_fenced_rejoin_coordinator_init(&rejoin_coordinator,
-			&operation_context, &coordinator))
+			&operation_context, &coordinator) ||
+		!pgrac_fenced_coordinator_restore(&coordinator, &reconcile) ||
+		reconcile.pending_count != 0)
 	{
 		fprintf(stderr, "pgrac-fenced secure runtime bootstrap failed\n");
 		goto done;
@@ -847,7 +849,7 @@ main(int argc, char **argv)
 		if (candidate_provider == NULL || candidate_provider != provider ||
 			!pgrac_fenced_provider_ops_valid(candidate_provider, false) ||
 			candidate_provider->abi_version != candidate_config->provider_abi ||
-			!pgrac_fenced_operation_prepare_mapping_reload(&operation_context,
+			!pgrac_fenced_coordinator_prepare_mapping_reload(&coordinator,
 				candidate_config, candidate_provider, candidate_digest) ||
 			!pgrac_fenced_rejoin_coordinator_shutdown(&rejoin_coordinator) ||
 			!pgrac_fenced_coordinator_shutdown(&coordinator, 17))
