@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_conf.h"
@@ -734,12 +735,6 @@ decode_image_version(ControlRootImage *image, const uint8 current_uuid[16], uint
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
-static ClusterControlRootResult
-decode_image(ControlRootImage *image, const uint8 current_uuid[16], uint64 current_sysid)
-{
-	return decode_image_version(image, current_uuid, current_sysid, CONTROL_ROOT_FORMAT_VERSION);
-}
-
 /* PGRAC: these codecs validate representation, not proof of publication.
  * Existing v1 file APIs never call them. Author: SqlRush <sqlrush@gmail.com>
  */
@@ -861,15 +856,23 @@ read_exact_file(const char *path, uint8 *bytes)
 }
 
 static ClusterControlRootResult
-read_one_image(const char *path, const uint8 current_uuid[16], uint64 current_sysid,
-			   ControlRootImage *image)
+read_one_image_version(const char *path, const uint8 current_uuid[16], uint64 current_sysid,
+					   ControlRootImage *image, uint16 version)
 {
 	ClusterControlRootResult result;
 
 	result = read_exact_file(path, image->bytes);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	return decode_image(image, current_uuid, current_sysid);
+	return decode_image_version(image, current_uuid, current_sysid, version);
+}
+
+static ClusterControlRootResult
+read_one_image(const char *path, const uint8 current_uuid[16], uint64 current_sysid,
+			   ControlRootImage *image)
+{
+	return read_one_image_version(path, current_uuid, current_sysid, image,
+								  CONTROL_ROOT_FORMAT_VERSION);
 }
 
 static bool
@@ -892,25 +895,20 @@ same_immutable_header(const ControlRootImage *left, const ControlRootImage *righ
 }
 
 static ClusterControlRootResult
-read_canonical_pair(ControlRootImage *primary, ControlRootImage *bak)
+read_canonical_pair_version(ControlRootImage *primary, ControlRootImage *bak,
+							const uint8 current_uuid[16], uint64 current_sysid, uint16 version)
 {
 	char primary_path[MAXPGPATH];
 	char bak_path[MAXPGPATH];
-	uint8 current_uuid[16];
-	uint64 current_sysid;
 	ClusterControlRootResult primary_result;
 	ClusterControlRootResult bak_result;
 
-	if (!current_storage_uuid(current_uuid))
-		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
-	current_sysid = GetSystemIdentifier();
-	if (current_sysid == 0)
-		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (!build_control_path(primary_path, sizeof(primary_path), CLUSTER_CONTROL_ROOT_REL_PATH)
 		|| !build_control_path(bak_path, sizeof(bak_path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	primary_result = read_one_image(primary_path, current_uuid, current_sysid, primary);
-	bak_result = read_one_image(bak_path, current_uuid, current_sysid, bak);
+	primary_result
+		= read_one_image_version(primary_path, current_uuid, current_sysid, primary, version);
+	bak_result = read_one_image_version(bak_path, current_uuid, current_sysid, bak, version);
 	if (primary_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		if (bak_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			if (!same_immutable_header(primary, bak)
@@ -927,6 +925,85 @@ read_canonical_pair(ControlRootImage *primary, ControlRootImage *bak)
 	if (primary_result != CLUSTER_CONTROL_ROOT_ABSENT)
 		return primary_result;
 	return bak_result;
+}
+
+static ClusterControlRootResult
+read_canonical_pair(ControlRootImage *primary, ControlRootImage *bak)
+{
+	uint8 current_uuid[16];
+	uint64 current_sysid;
+
+	if (!current_storage_uuid(current_uuid))
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	current_sysid = GetSystemIdentifier();
+	if (current_sysid == 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	return read_canonical_pair_version(primary, bak, current_uuid, current_sysid,
+									   CONTROL_ROOT_FORMAT_VERSION);
+}
+
+/* PGRAC: read the exact common image selected by a primary v2 root. Holding
+ * CF-S/X prevents an installer/GC from replacing the root or unlinking its
+ * selected object during this read. No nested lock, projection or bak fallback.
+ * This is deliberately NOT a per-thread startup view or admission decision.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64 system_identifier,
+											ControlRootImage *root, ControlFileData *common,
+											ClusterControlRootFileToken *token)
+{
+	ControlRootImage *bak;
+	ClusterControlRootResult result;
+	ClusterControlRootResult root_result;
+
+	if (root != NULL)
+		memset(root, 0, sizeof(*root));
+	if (common != NULL)
+		memset(common, 0, sizeof(*common));
+	if (token != NULL)
+		memset(token, 0, sizeof(*token));
+	if (root == NULL || common == NULL || token == NULL || storage_uuid == NULL
+		|| bytes_are_zero(storage_uuid, 16) || system_identifier == 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	/* Never run a write probe while holding CF. The enclosing adapter must
+	 * already have qualified the storage contract and revalidate its writer
+	 * authority separately if it intends to publish anything.
+	 */
+	result = storage_contract_check(storage_uuid, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* A single configured/surviving instance does not turn shared v2 storage
+	 * into the legacy local-file profile. Qualification remains mandatory.
+	 */
+	if (cluster_cf_contract_load(DataDir) != CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED)
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	bak = palloc(sizeof(*bak));
+	root_result = read_canonical_pair_version(root, bak, storage_uuid, system_identifier,
+											  CONTROL_ROOT_HEADER_VERSION_V2);
+	pfree(bak);
+	result = root_result;
+	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		result = cluster_cf_control_image_read_locked(root->header.v2.control_image_generation,
+													  root->header.v2.control_image_sha256,
+													  system_identifier, common);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			make_file_token(root, token);
+			if (token->file_txn_seq == 0)
+				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			else
+				return root_result;
+		}
+	}
+	/* A valid root alone must not escape after its selected image failed. */
+	memset(root, 0, sizeof(*root));
+	memset(common, 0, sizeof(*common));
+	memset(token, 0, sizeof(*token));
+	return result;
 }
 
 /*
@@ -1673,7 +1750,7 @@ make_file_token(const ControlRootImage *image, ClusterControlRootFileToken *toke
 	token->body_crc32c = image->header.body_crc32c;
 	token->header_crc32c = image->header.header_crc32c;
 	token->activation_state = image->header.activation_state;
-	token->format_version = CONTROL_ROOT_FORMAT_VERSION;
+	token->format_version = image->header.format_version;
 	token->record_count = CLUSTER_CONTROL_ROOT_RECORD_COUNT;
 	token->system_identifier = image->header.system_identifier;
 	if (!control_root_sha256(image->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, token->image_sha256))

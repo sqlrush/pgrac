@@ -1327,8 +1327,8 @@ CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_roo
 # unit binary does not drag in backend palloc/elog/ShmemVariableCache
 # machinery; err*/BasicOpenFile are stubbed in the test file.
 test_cluster_control_root: test_cluster_control_root.c unit_test.h \
-		$(CLUSTER_CONTROL_ROOT_O) xlogreader_fs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) \
+		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) xlogreader_fs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \

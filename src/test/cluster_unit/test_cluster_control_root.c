@@ -14,8 +14,11 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "catalog/catversion.h"
 #include "catalog/pg_control.h"
+#include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_wal_retention.h"
@@ -57,6 +60,7 @@ char *cluster_shared_data_dir = NULL;
 char *cluster_wal_threads_dir = NULL;
 char *DataDir = NULL;
 int cluster_node_id = 0;
+bool enableFsync = true;
 
 static char test_root[MAXPGPATH];
 static char test_wal_root[MAXPGPATH];
@@ -67,6 +71,7 @@ static int test_node_count = 4;
 static bool test_local_probe = true;
 static bool test_cf_grant = true;
 static bool test_cf_clusterwide = true;
+static LOCKMODE test_cf_mode = NoLock;
 static bool test_cf_release_confirmed = true;
 static int test_cf_lock_calls = 0;
 static int test_durable_rename_calls = 0;
@@ -137,6 +142,33 @@ errcode(int sqlerrcode pg_attribute_unused())
 {
 	return 0;
 }
+
+/* PGRAC: legacy native-control error/fallback symbols are linked but must
+ * never select a fallback in the v2 view tests. Author: SqlRush <sqlrush@gmail.com>
+ */
+int
+errcode_for_file_access(void)
+{
+	return 0;
+}
+
+bool
+errstart(int elevel, const char *domain pg_attribute_unused())
+{
+	if (elevel >= ERROR)
+		abort();
+	return false;
+}
+
+bool
+cluster_cf_bak_checkpoint_recoverable(const ControlFileData *bak pg_attribute_unused())
+{
+	return false;
+}
+
+void
+cluster_cf_counter_inc(ClusterCfCounter which pg_attribute_unused())
+{}
 
 int
 errmsg(const char *fmt pg_attribute_unused(), ...)
@@ -351,9 +383,9 @@ cluster_cf_lock(LOCKMODE mode pg_attribute_unused())
 }
 
 bool
-cluster_cf_held_is_clusterwide(LOCKMODE mode pg_attribute_unused())
+cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
-	return test_cf_grant && test_cf_clusterwide;
+	return test_cf_grant && test_cf_clusterwide && (test_cf_mode == NoLock || test_cf_mode == mode);
 }
 
 ClusterCfReleaseResult
@@ -504,6 +536,7 @@ wipe_root_files(void)
 	test_local_probe = true;
 	test_cf_grant = true;
 	test_cf_clusterwide = true;
+	test_cf_mode = NoLock;
 	test_cf_release_confirmed = true;
 	test_cf_lock_calls = 0;
 	test_durable_rename_calls = 0;
@@ -2868,6 +2901,287 @@ UT_TEST(test_v1_io_does_not_silently_consume_or_convert_v2)
 	UT_ASSERT(memcmp(out.bytes, bytes, sizeof(bytes)) == 0);
 }
 
+/* PGRAC: real root/immutable-object integration; only CF/storage facts are
+ * controlled. The root fixture is independently encoded, not published by a
+ * bypass of a production authority guard. Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_install_native(ControlFileData *native, ClusterCfImageStage *stage)
+{
+	static uint8 operation = 1;
+	uint8 uuid[16] = { 0 };
+	char dir[MAXPGPATH];
+
+	path_for(dir, sizeof(dir), "global/control_images");
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+		abort();
+	path_for(dir, sizeof(dir), "global/control_images/.staging");
+	if (mkdir(dir, 0700) != 0 && errno != EEXIST)
+		abort();
+	uuid[0] = operation++;
+	uuid[6] = 0x42;
+	uuid[8] = 0x82;
+	if (cluster_cf_control_image_prepare(native, 53, uuid, stage) != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_cf_control_image_install(stage) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		abort();
+}
+
+static void
+v2_view_fixture(uint8 bytes[66048], ControlFileData *native, ClusterCfImageStage *stage)
+{
+	static pg_time_t native_time = 900;
+	char path[MAXPGPATH];
+
+	wipe_root_files();
+	memset(native, 0, sizeof(*native));
+	native->system_identifier = TEST_SYSID;
+	native->pg_control_version = PG_CONTROL_VERSION;
+	native->catalog_version_no = CATALOG_VERSION_NO;
+	native->time = native_time++;
+	native->state = DB_SHUTDOWNED;
+	native->checkPoint = UINT64_C(0x9000000);
+	v2_install_native(native, stage);
+	v2_fixture(bytes);
+	memcpy(bytes + 296, stage->image_sha256, 32);
+	v2_checksums(bytes);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	write_all_or_abort(path, bytes, 66048);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+	write_all_or_abort(path, bytes, 66048);
+}
+
+static bool
+v2_outputs_zero(const ControlRootImage *root, const ControlFileData *common,
+				const ClusterControlRootFileToken *token)
+{
+	return v2_zero(root, sizeof(*root)) && v2_zero(common, sizeof(*common))
+		   && v2_zero(token, sizeof(*token));
+}
+
+UT_TEST(test_v2_view_selects_exact_hash_not_decoy_or_projection)
+{
+	uint8 bytes[66048], hash[32];
+	ControlRootImage root;
+	ControlFileData native, out, decoy;
+	ClusterCfImageStage stage, other;
+	ClusterControlRootFileToken token;
+
+	v2_view_fixture(bytes, &native, &stage);
+	decoy = native;
+	decoy.time += 99;
+	v2_install_native(&decoy, &other);
+	cluster_cf_authority_write(&decoy);
+	test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(token.format_version, 2);
+	UT_ASSERT_EQ(token.file_txn_seq, 7);
+	UT_ASSERT_EQ(out.time, native.time);
+	UT_ASSERT_EQ(out.checkPoint, native.checkPoint);
+	UT_ASSERT(memcmp(root.bytes, bytes, sizeof(bytes)) == 0);
+	sha256_bytes(bytes, sizeof(bytes), hash);
+	UT_ASSERT(memcmp(token.image_sha256, hash, sizeof(hash)) == 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	/* Common native state is NOT the database/thread admission state. */
+	UT_ASSERT_EQ(out.state, DB_SHUTDOWNED);
+	UT_ASSERT_EQ(root.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
+}
+
+UT_TEST(test_v2_view_requires_clusterwide_lock_and_verified_storage)
+{
+	uint8 bytes[66048], foreign[16];
+	ControlRootImage root;
+	ControlFileData native, out;
+	ClusterCfImageStage stage;
+	ClusterControlRootFileToken token;
+	int fault;
+
+	v2_view_fixture(bytes, &native, &stage);
+	for (fault = 0; fault < 3; ++fault) {
+		test_cf_grant = fault != 0;
+		test_cf_clusterwide = fault != 1;
+		test_contract
+			= fault == 2 ? CLUSTER_CF_CONTRACT_UNVERIFIED : CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
+		memset(&root, 0xee, sizeof(root));
+		memset(&out, 0xee, sizeof(out));
+		memset(&token, 0xee, sizeof(token));
+		UT_ASSERT(
+			cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	}
+	test_contract = CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
+	memcpy(foreign, v2_storage, sizeof(foreign));
+	foreign[0]++;
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(foreign, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	UT_ASSERT_EQ(cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID + 1, &root,
+															 &out, &token),
+				 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+}
+
+UT_TEST(test_v2_view_valid_backup_never_substitutes_for_current)
+{
+	uint8 bytes[66048];
+	ControlRootImage root;
+	ControlFileData native, out;
+	ClusterCfImageStage stage;
+	ClusterControlRootFileToken token;
+	char primary[MAXPGPATH];
+
+	v2_view_fixture(bytes, &native, &stage);
+	path_for(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH);
+	bytes[200] ^= 1;
+	write_all_or_abort(primary, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_OK_BAK_BLOCKED);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	UT_ASSERT(unlink(primary) == 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_OK_BAK_BLOCKED);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+}
+
+UT_TEST(test_v2_view_backup_divergence_and_degraded_are_distinct)
+{
+	uint8 bytes[66048];
+	ControlRootImage root;
+	ControlFileData native, out;
+	ClusterCfImageStage stage;
+	ClusterControlRootFileToken token;
+	char bak[MAXPGPATH];
+
+	v2_view_fixture(bytes, &native, &stage);
+	path_for(bak, sizeof(bak), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+	put_u64_le(bytes + 16, 8);
+	v2_checksums(bytes);
+	write_all_or_abort(bak, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_COPY_DIVERGENT);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	put_u64_le(bytes + 16, 7);
+	put_u64_le(bytes + 336, 73);
+	v2_checksums(bytes);
+	write_all_or_abort(bak, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_COPY_DIVERGENT);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	UT_ASSERT(unlink(bak) == 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED);
+	UT_ASSERT_EQ(out.time, native.time);
+	UT_ASSERT_EQ(token.format_version, 2);
+}
+
+UT_TEST(test_v2_view_selected_object_failure_clears_valid_root)
+{
+	uint8 bytes[66048];
+	ControlRootImage root;
+	ControlFileData native, out;
+	ClusterCfImageStage stage;
+	ClusterControlRootFileToken token;
+	char hash[65], object[MAXPGPATH];
+	int i;
+
+	v2_view_fixture(bytes, &native, &stage);
+	for (i = 0; i < 32; ++i)
+		snprintf(hash + 2 * i, 3, "%02x", stage.image_sha256[i]);
+	snprintf(object, sizeof(object), "%s/global/control_images/53-%s.bin", test_root, hash);
+	memset(bytes, 0x5a, PG_CONTROL_FILE_SIZE);
+	write_all_or_abort(object, bytes, PG_CONTROL_FILE_SIZE);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_HASH_MISMATCH);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	UT_ASSERT(unlink(object) == 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_ABSENT);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+}
+
+UT_TEST(test_v2_view_token_covers_whole_root_not_only_control_hash)
+{
+	uint8 bytes[66048];
+	ControlRootImage root;
+	ControlFileData native, out;
+	ClusterCfImageStage stage;
+	ClusterControlRootFileToken before, after;
+	char primary[MAXPGPATH];
+
+	v2_view_fixture(bytes, &native, &stage);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &before),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	put_u64_le(bytes + 16, 8);
+	put_u64_le(bytes + 336, 65);
+	v2_checksums(bytes);
+	path_for(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH);
+	write_all_or_abort(primary, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &after),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(after.file_txn_seq, before.file_txn_seq + 1);
+	UT_ASSERT(memcmp(before.image_sha256, after.image_sha256, 32) != 0);
+	UT_ASSERT_EQ(out.time, native.time);
+}
+
+UT_TEST(test_v2_view_rejects_v1_and_invalid_input_without_conversion)
+{
+	uint8 bytes[66048];
+	ControlRootImage root;
+	ControlFileData out;
+	ClusterControlRootMigrationImage legacy;
+	ClusterControlRootMigrationRoundV1 round;
+	ClusterControlRootFileToken token;
+	char primary[MAXPGPATH];
+
+	wipe_root_files();
+	UT_ASSERT_EQ(create_prepared(&legacy, &round, &token), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	path_for(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(primary, bytes, sizeof(bytes));
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_BAD_VERSION);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	read_all_or_abort(primary, root.bytes, sizeof(root.bytes));
+	UT_ASSERT(memcmp(root.bytes, bytes, sizeof(bytes)) == 0);
+	UT_ASSERT_EQ(cluster_control_root_v2_read_control_locked(NULL, TEST_SYSID, &root, &out, &token),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+}
+
+UT_TEST(test_v2_view_single_node_does_not_bypass_shared_storage_qualification)
+{
+	uint8 bytes[66048];
+	ControlRootImage root;
+	ControlFileData native, out;
+	ClusterCfImageStage stage;
+	ClusterControlRootFileToken token;
+
+	v2_view_fixture(bytes, &native, &stage);
+	test_node_count = 1;
+	test_contract = CLUSTER_CF_CONTRACT_UNVERIFIED;
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED);
+	UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	test_contract = CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token),
+		CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(out.time, native.time);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -2877,7 +3191,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(46);
+	UT_PLAN(54);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -2924,6 +3238,14 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_encoder_refuses_bad_logical_fields_without_bytes);
 	UT_RUN(test_v2_max_generations_remain_readable_without_advancement);
 	UT_RUN(test_v1_io_does_not_silently_consume_or_convert_v2);
+	UT_RUN(test_v2_view_selects_exact_hash_not_decoy_or_projection);
+	UT_RUN(test_v2_view_requires_clusterwide_lock_and_verified_storage);
+	UT_RUN(test_v2_view_valid_backup_never_substitutes_for_current);
+	UT_RUN(test_v2_view_backup_divergence_and_degraded_are_distinct);
+	UT_RUN(test_v2_view_selected_object_failure_clears_valid_root);
+	UT_RUN(test_v2_view_token_covers_whole_root_not_only_control_hash);
+	UT_RUN(test_v2_view_rejects_v1_and_invalid_input_without_conversion);
+	UT_RUN(test_v2_view_single_node_does_not_bypass_shared_storage_qualification);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

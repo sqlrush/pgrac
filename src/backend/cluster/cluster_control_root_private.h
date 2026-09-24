@@ -8,6 +8,7 @@
 #ifndef CLUSTER_CONTROL_ROOT_PRIVATE_H
 #define CLUSTER_CONTROL_ROOT_PRIVATE_H
 
+#include "catalog/pg_control.h"
 #include "cluster/cluster_control_root.h"
 
 /* PGRAC: backend-private decoded carrier, never a disk struct or permission.
@@ -83,6 +84,17 @@ extern ClusterControlRootResult cluster_control_root_v2_decode(const uint8 *byte
 															   uint64 system_identifier,
 															   ControlRootImage *out);
 extern ClusterControlRootResult cluster_control_root_v2_encode(ControlRootImage *image);
+
+/* PGRAC: root-selected COMMON image only, not a per-thread startup projection.
+ * Requires an already held clusterwide CF-S/X and verified storage identity.
+ * No publication, migration, repair or serving admission. All three outputs
+ * are required and cleared on refusal; inputs/outputs must not overlap.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult
+cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64 system_identifier,
+											ControlRootImage *root, ControlFileData *common,
+											ClusterControlRootFileToken *token);
 
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
