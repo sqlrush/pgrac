@@ -69,6 +69,7 @@
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
 #include "common/cryptohash.h"
+#include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 
@@ -219,15 +220,13 @@ cluster_recovery_anchor_v2_encode(const ClusterRecoveryAnchorV2 *anchor,
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
-ClusterControlRootResult
-cluster_recovery_anchor_v2_decode(const uint8 *bytes, size_t len,
-								  const ClusterRecoveryAnchorRefV2 *ref,
-								  ClusterRecoveryAnchorV2 *out)
+static ClusterControlRootResult
+anchor_v2_decode_with_ctx(const uint8 *bytes, size_t len, const ClusterRecoveryAnchorRefV2 *ref,
+						  ClusterRecoveryAnchorV2 *out, pg_cryptohash_ctx *ctx)
 {
 	ClusterRecoveryAnchorV2 anchor;
 	ClusterControlRootResult result;
 	pg_crc32c crc;
-	pg_cryptohash_ctx *ctx;
 	uint8 hash[32];
 	bool hash_ok;
 
@@ -307,18 +306,35 @@ cluster_recovery_anchor_v2_decode(const uint8 *bytes, size_t len,
 		|| anchor.config_generation > ref->max_config_generation
 		|| memcmp(anchor.claim_sha256, ref->claim_sha256, 32) != 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
-	ctx = pg_cryptohash_create(PG_SHA256);
-	if (ctx == NULL)
-		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	hash_ok = pg_cryptohash_init(ctx) >= 0 && pg_cryptohash_update(ctx, bytes, len) >= 0
 			  && pg_cryptohash_final(ctx, hash, sizeof(hash)) >= 0;
-	pg_cryptohash_free(ctx);
 	if (!hash_ok)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	if (memcmp(hash, ref->anchor_sha256, sizeof(hash)) != 0)
 		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
 	memcpy(out, &anchor, sizeof(*out));
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_decode(const uint8 *bytes, size_t len,
+								  const ClusterRecoveryAnchorRefV2 *ref,
+								  ClusterRecoveryAnchorV2 *out)
+{
+	pg_cryptohash_ctx *ctx;
+	ClusterControlRootResult result;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (bytes == NULL || !anchor_v2_ref_valid(ref))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = anchor_v2_decode_with_ctx(bytes, len, ref, out, ctx);
+	pg_cryptohash_free(ctx);
+	return result;
 }
 
 ClusterControlRootResult
@@ -386,42 +402,58 @@ anchor_v2_owned(const struct stat *st, bool directory)
 		   && (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
 }
 
-ClusterControlRootResult
-cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
-									   const ControlFileData *common, ControlFileData *out)
+/* PGRAC: common bounded path handling for exact read and owned installation.
+ * No allocation/ereport while raw descriptors are open.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct AnchorV2Dirs {
+	int objects;
+	int staging;
+	struct stat object_stat;
+	struct stat staging_stat;
+} AnchorV2Dirs;
+
+#define ANCHOR_V2_STAGED 1
+#define ANCHOR_V2_INSTALLED 2
+#define ANCHOR_V2_DISCARDED 3
+
+static void
+anchor_v2_close(int fd, ClusterControlRootResult *result)
+{
+	if (fd >= 0 && close(fd) != 0)
+		*result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+static void
+anchor_v2_close_dirs(AnchorV2Dirs *dirs, ClusterControlRootResult *result)
+{
+	anchor_v2_close(dirs->staging, result);
+	anchor_v2_close(dirs->objects, result);
+	dirs->staging = dirs->objects = -1;
+}
+
+static ClusterControlRootResult
+anchor_v2_open_dirs(const ClusterRecoveryAnchorRefV2 *ref, bool staging, AnchorV2Dirs *out)
 {
 	const int dirflags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
-	uint8 bytes[CLUSTER_RECOVERY_ANCHOR_SIZE];
-	char thread[32], generation[48], name[112], hex[65];
+	char thread[32], generation[48];
 	const char *parts[4];
 	struct stat st;
 	int dirs[5] = { -1, -1, -1, -1, -1 };
-	int fd = -1;
-	size_t i, used = 0;
+	size_t i;
 
-	if (out == NULL)
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
-	if (!anchor_v2_ref_valid(ref) || common == NULL || cluster_shared_data_dir == NULL
-		|| cluster_shared_data_dir[0] == '\0')
+	out->objects = out->staging = -1;
+	if (cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (!cluster_cf_held_is_clusterwide(ShareLock)
-		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	snprintf(thread, sizeof(thread), "thread_%u", ref->identity.origin_thread_id);
 	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
 			 ref->identity.origin_owner_incarnation);
-	for (i = 0; i < 32; ++i)
-		snprintf(hex + i * 2, 3, "%02x", ref->anchor_sha256[i]);
-	snprintf(name, sizeof(name), "anchor_" UINT64_FORMAT "-%s.bin", ref->anchor_generation, hex);
 	parts[0] = "global";
 	parts[1] = "anchor_images";
 	parts[2] = thread;
 	parts[3] = generation;
-	/* No allocation, elog or interrupt processing with raw FDs open. Decode
-	 * (including crypto allocation) occurs only after every descriptor closes.
-	 */
 	dirs[0] = open(cluster_shared_data_dir, dirflags);
 	if (dirs[0] < 0 || fstat(dirs[0], &st) != 0 || !anchor_v2_owned(&st, true))
 		goto done;
@@ -435,7 +467,59 @@ cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 		if (fstat(dirs[i + 1], &st) != 0 || !anchor_v2_owned(&st, true))
 			goto done;
 	}
-	fd = openat(dirs[4], name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	out->object_stat = st;
+	out->objects = dirs[4];
+	dirs[4] = -1;
+	if (staging) {
+		out->staging = openat(out->objects, ".staging", dirflags);
+		if (out->staging < 0 || fstat(out->staging, &out->staging_stat) != 0
+			|| !anchor_v2_owned(&out->staging_stat, true))
+			goto done;
+	}
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	for (i = 0; i < lengthof(dirs); ++i)
+		anchor_v2_close(dirs[i], &result);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		anchor_v2_close_dirs(out, &result);
+	return result;
+}
+
+static void
+anchor_v2_names(const ClusterRecoveryAnchorRefV2 *ref, const uint8 *uuid, char name[112],
+				char temp[40])
+{
+	char hex[65];
+	size_t i;
+
+	for (i = 0; i < 32; ++i)
+		snprintf(hex + i * 2, 3, "%02x", ref->anchor_sha256[i]);
+	snprintf(name, 112, "anchor_" UINT64_FORMAT "-%s.bin", ref->anchor_generation, hex);
+	if (uuid != NULL) {
+		for (i = 0; i < 16; ++i)
+			snprintf(hex + i * 2, 3, "%02x", uuid[i]);
+		snprintf(temp, 40, "%s.tmp", hex);
+	}
+}
+
+static bool
+anchor_v2_exact_entry(int dir, const char *name, const ClusterRecoveryAnchorStageV2 *stage)
+{
+	struct stat st;
+
+	return fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && anchor_v2_owned(&st, false)
+		   && (uint64)st.st_dev == stage->file_dev && (uint64)st.st_ino == stage->file_ino;
+}
+
+static ClusterControlRootResult
+anchor_v2_read_at(int dir, const char *name, const ClusterRecoveryAnchorStageV2 *stage,
+				  uint8 bytes[CLUSTER_RECOVERY_ANCHOR_SIZE])
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	struct stat st;
+	size_t used = 0;
+	int fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+
 	if (fd < 0) {
 		if (errno == ENOENT)
 			result = CLUSTER_CONTROL_ROOT_ABSENT;
@@ -443,12 +527,17 @@ cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 	}
 	if (fstat(fd, &st) != 0 || !anchor_v2_owned(&st, false))
 		goto done;
-	if (st.st_size != sizeof(bytes)) {
+	if (stage != NULL
+		&& ((uint64)st.st_dev != stage->file_dev || (uint64)st.st_ino != stage->file_ino)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	if (st.st_size != CLUSTER_RECOVERY_ANCHOR_SIZE) {
 		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
 		goto done;
 	}
-	while (used < sizeof(bytes)) {
-		ssize_t n = read(fd, bytes + used, sizeof(bytes) - used);
+	while (used < CLUSTER_RECOVERY_ANCHOR_SIZE) {
+		ssize_t n = read(fd, bytes + used, CLUSTER_RECOVERY_ANCHOR_SIZE - used);
 
 		if (n < 0 && errno == EINTR)
 			continue;
@@ -458,13 +547,245 @@ cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 	}
 	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 done:
-	if (fd >= 0 && close(fd) != 0)
-		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
-	for (i = 0; i < lengthof(dirs); ++i)
-		if (dirs[i] >= 0 && close(dirs[i]) != 0)
-			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	anchor_v2_close(fd, &result);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
+									   const ControlFileData *common, ControlFileData *out)
+{
+	ClusterControlRootResult result;
+	AnchorV2Dirs dirs;
+	uint8 bytes[CLUSTER_RECOVERY_ANCHOR_SIZE];
+	char name[112], temp[40];
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!anchor_v2_ref_valid(ref) || common == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	anchor_v2_names(ref, NULL, name, temp);
+	result = anchor_v2_open_dirs(ref, false, &dirs);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = anchor_v2_read_at(dirs.objects, name, NULL, bytes);
+	anchor_v2_close_dirs(&dirs, &result);
+	/* Crypto allocation happens only after all raw descriptors are closed. */
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_recovery_anchor_v2_project(bytes, sizeof(bytes), ref, common, out);
+	return result;
+}
+
+/* PGRAC: owned no-clobber immutable installation. Installation and root CAS
+ * share one CF-X interval; the object by itself conveys no writer authority.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+anchor_v2_stage_valid(const ClusterRecoveryAnchorStageV2 *stage)
+{
+	return stage != NULL && anchor_v2_ref_valid(&stage->ref) && stage->owner_pid == (uint32)getpid()
+		   && !anchor_v2_zero(stage->operation_uuid, 16) && stage->state >= ANCHOR_V2_STAGED
+		   && stage->state <= ANCHOR_V2_DISCARDED;
+}
+
+static bool
+anchor_v2_dirs_match(const AnchorV2Dirs *dirs, const ClusterRecoveryAnchorStageV2 *stage)
+{
+	return (uint64)dirs->object_stat.st_dev == stage->object_dir_dev
+		   && (uint64)dirs->object_stat.st_ino == stage->object_dir_ino
+		   && (uint64)dirs->staging_stat.st_dev == stage->staging_dir_dev
+		   && (uint64)dirs->staging_stat.st_ino == stage->staging_dir_ino;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_prepare(const ClusterRecoveryAnchorV2 *anchor,
+								   const uint8 operation_uuid[16],
+								   ClusterRecoveryAnchorStageV2 *out)
+{
+	ClusterRecoveryAnchorStageV2 stage;
+	ClusterControlRootResult result;
+	AnchorV2Dirs dirs;
+	pg_cryptohash_ctx *ctx;
+	uint8 bytes[CLUSTER_RECOVERY_ANCHOR_SIZE];
+	char name[112], temp[40];
+	struct stat st;
+	size_t used = 0;
+	int fd = -1;
+	bool hash_ok;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!enableFsync || operation_uuid == NULL || anchor_v2_zero(operation_uuid, 16))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_recovery_anchor_v2_encode(anchor, bytes);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	memset(&stage, 0, sizeof(stage));
+	stage.ref.identity = anchor->identity;
+	stage.ref.database_incarnation = anchor->database_incarnation;
+	stage.ref.max_config_generation = anchor->config_generation;
+	stage.ref.anchor_generation = anchor->anchor_generation;
+	memcpy(stage.ref.claim_sha256, anchor->claim_sha256, 32);
+	memcpy(stage.operation_uuid, operation_uuid, 16);
+	stage.owner_pid = (uint32)getpid();
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	hash_ok = pg_cryptohash_init(ctx) >= 0 && pg_cryptohash_update(ctx, bytes, sizeof(bytes)) >= 0
+			  && pg_cryptohash_final(ctx, stage.ref.anchor_sha256, 32) >= 0;
+	pg_cryptohash_free(ctx);
+	if (!hash_ok)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	anchor_v2_names(&stage.ref, operation_uuid, name, temp);
+	result = anchor_v2_open_dirs(&stage.ref, true, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	stage.object_dir_dev = dirs.object_stat.st_dev;
+	stage.object_dir_ino = dirs.object_stat.st_ino;
+	stage.staging_dir_dev = dirs.staging_stat.st_dev;
+	stage.staging_dir_ino = dirs.staging_stat.st_ino;
+	result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	fd = openat(dirs.staging, temp,
+				O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | PG_BINARY, 0600);
+	if (fd < 0 || fstat(fd, &st) != 0 || !anchor_v2_owned(&st, false))
+		goto done;
+	stage.file_dev = st.st_dev;
+	stage.file_ino = st.st_ino;
+	stage.state = ANCHOR_V2_STAGED;
+	while (used < sizeof(bytes)) {
+		ssize_t n = write(fd, bytes + used, sizeof(bytes) - used);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto done;
+		used += n;
+	}
+	if (pg_fsync(fd) != 0 || pg_fsync(dirs.staging) != 0)
+		goto done;
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	anchor_v2_close(fd, &result);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && stage.state == ANCHOR_V2_STAGED
+		&& anchor_v2_exact_entry(dirs.staging, temp, &stage)) {
+		if (unlinkat(dirs.staging, temp, 0) == 0)
+			(void)pg_fsync(dirs.staging);
+	}
+	anchor_v2_close_dirs(&dirs, &result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = stage;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_install(ClusterRecoveryAnchorStageV2 *stage)
+{
+	ClusterControlRootResult result;
+	AnchorV2Dirs dirs;
+	pg_cryptohash_ctx *ctx;
+	ClusterRecoveryAnchorV2 decoded;
+	uint8 staged[512], installed[512];
+	char name[112], temp[40];
+
+	if (!anchor_v2_stage_valid(stage) || stage->state == ANCHOR_V2_DISCARDED || !enableFsync)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	anchor_v2_names(&stage->ref, stage->operation_uuid, name, temp);
+	result = anchor_v2_open_dirs(&stage->ref, true, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (!anchor_v2_dirs_match(&dirs, stage)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	if (stage->state == ANCHOR_V2_STAGED) {
+		result = anchor_v2_read_at(dirs.staging, temp, stage, staged);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = anchor_v2_decode_with_ctx(staged, sizeof(staged), &stage->ref, &decoded, ctx);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto done;
+		if (linkat(dirs.staging, temp, dirs.objects, name, 0) != 0 && errno != EEXIST) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+	}
+	result = anchor_v2_read_at(dirs.objects, name, NULL, installed);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result
+			= anchor_v2_decode_with_ctx(installed, sizeof(installed), &stage->ref, &decoded, ctx);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (stage->state == ANCHOR_V2_STAGED && memcmp(staged, installed, sizeof(staged)) != 0) {
+		result = CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+		goto done;
+	}
+	if (pg_fsync(dirs.objects) != 0) {
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	if (stage->state == ANCHOR_V2_STAGED) {
+		if (!anchor_v2_exact_entry(dirs.staging, temp, stage)) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto done;
+		}
+		if (unlinkat(dirs.staging, temp, 0) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+		/* Preserve install identity across a failed final directory sync. */
+		stage->state = ANCHOR_V2_INSTALLED;
+	}
+	if (pg_fsync(dirs.staging) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+done:
+	anchor_v2_close_dirs(&dirs, &result);
+	pg_cryptohash_free(ctx);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_discard(ClusterRecoveryAnchorStageV2 *stage)
+{
+	ClusterControlRootResult result;
+	AnchorV2Dirs dirs;
+	char name[112], temp[40];
+
+	if (!anchor_v2_stage_valid(stage) || !enableFsync)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	anchor_v2_names(&stage->ref, stage->operation_uuid, name, temp);
+	result = anchor_v2_open_dirs(&stage->ref, true, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!anchor_v2_dirs_match(&dirs, stage)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	if (stage->state == ANCHOR_V2_STAGED) {
+		if (!anchor_v2_exact_entry(dirs.staging, temp, stage)) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto done;
+		}
+		if (unlinkat(dirs.staging, temp, 0) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+	}
+	/* Retire installed operations too, before the fallible final sync. */
+	stage->state = ANCHOR_V2_DISCARDED;
+	if (pg_fsync(dirs.staging) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+done:
+	anchor_v2_close_dirs(&dirs, &result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(stage, 0, sizeof(*stage));
 	return result;
 }
 

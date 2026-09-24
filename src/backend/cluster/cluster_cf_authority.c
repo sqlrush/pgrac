@@ -815,9 +815,9 @@ cluster_cf_control_image_discard(ClusterCfImageStage *stage)
 			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 			goto done;
 		}
-		/* No deletion on retry and no resurrection as an install operation. */
-		stage->state = CF_IMAGE_DISCARDED;
 	}
+	/* No resurrection, including an installed operation whose sync failed. */
+	stage->state = CF_IMAGE_DISCARDED;
 	if (pg_fsync(dirs.staging) != 0)
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 done:

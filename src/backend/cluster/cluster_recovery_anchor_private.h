@@ -41,6 +41,25 @@ typedef struct ClusterRecoveryAnchorRefV2 {
 	uint8 claim_sha256[32];
 } ClusterRecoveryAnchorRefV2;
 
+/* PGRAC: process-owned staged object, not persistent or wire authority.
+ * Caller must keep CF-X from successful install through its root CAS.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterRecoveryAnchorStageV2 {
+	ClusterRecoveryAnchorRefV2 ref;
+	uint8 operation_uuid[16];
+	uint64 object_dir_dev;
+	uint64 object_dir_ino;
+	uint64 staging_dir_dev;
+	uint64 staging_dir_ino;
+	uint64 file_dev;
+	uint64 file_ino;
+	uint32 owner_pid;
+	uint32 state;
+} ClusterRecoveryAnchorStageV2;
+
+StaticAssertDecl(sizeof(ClusterRecoveryAnchorStageV2) == 240, "anchor staging descriptor size");
+
 /* Exact-size codecs. All outputs clear on refusal; inputs/outputs must not
  * overlap. V1 paths do not call these APIs. Hash selects the whole object,
  * CRC classifies damage; neither is a substitute for the expected identity.
@@ -64,5 +83,14 @@ cluster_recovery_anchor_v2_project(const uint8 *bytes, size_t len,
 extern ClusterControlRootResult
 cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 									   const ControlFileData *common, ControlFileData *out);
+
+extern ClusterControlRootResult
+cluster_recovery_anchor_v2_prepare(const ClusterRecoveryAnchorV2 *anchor,
+								   const uint8 operation_uuid[16],
+								   ClusterRecoveryAnchorStageV2 *out);
+extern ClusterControlRootResult
+cluster_recovery_anchor_v2_install(ClusterRecoveryAnchorStageV2 *stage);
+extern ClusterControlRootResult
+cluster_recovery_anchor_v2_discard(ClusterRecoveryAnchorStageV2 *stage);
 
 #endif /* CLUSTER_RECOVERY_ANCHOR_PRIVATE_H */

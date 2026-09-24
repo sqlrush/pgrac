@@ -932,6 +932,14 @@ UT_TEST(test_immutable_discard_sync_failure_cannot_resume_install)
 	UT_ASSERT(cluster_cf_control_image_install(&discarded) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	REQUIRE_IMAGE_OK(cluster_cf_control_image_discard(&discarded));
 	UT_ASSERT(image_zero(&discarded, sizeof(discarded)));
+	/* Already-installed operations must also retire before a fallible sync. */
+	image_fsync_calls = 0;
+	image_fsync_fail_at = 1;
+	UT_ASSERT_EQ(cluster_cf_control_image_discard(&first), CLUSTER_CONTROL_ROOT_IO_ERROR);
+	image_fsync_fail_at = 0;
+	UT_ASSERT_EQ(cluster_cf_control_image_install(&first), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	REQUIRE_IMAGE_OK(cluster_cf_control_image_discard(&first));
+	UT_ASSERT(image_zero(&first, sizeof(first)));
 }
 
 UT_TEST(test_immutable_directory_symlink_and_writable_paths_refuse)
