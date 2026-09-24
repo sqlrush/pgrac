@@ -183,6 +183,7 @@ static bool
 append_provider_record(PgracFencedOperationContextV1 *context,
 				   uint16 kind,
 				   const PgracExternalFenceProtocolRequestV1 *request,
+				   const PgracFencedPreparedAcquireV1 *prepared,
 				   const uint8 binding_digest[32],
 				   PgracFencedProviderResult provider_result,
 				   int32 native_status,
@@ -192,6 +193,11 @@ append_provider_record(PgracFencedOperationContextV1 *context,
 				   PgracFencedJournalRecordV1 *record)
 {
 	record_base(context, kind, request->request_nonce, event_mono_ns, record);
+	if (context->config->format_version == 2)
+	{
+		memcpy(record->operation_id, prepared->accepted_record.operation_id, 16);
+		record->intent = prepared->accepted_record.intent;
+	}
 	if (binding_digest != NULL)
 		memcpy(record->binding_digest, binding_digest,
 			sizeof(record->binding_digest));
@@ -458,6 +464,46 @@ pgrac_fenced_operation_reconcile_startup(
 	return reconcile->pending_count == owned_count;
 }
 
+static PgracFencedOperationAcceptResult
+persist_prepared_accept(PgracFencedOperationContextV1 *context,
+						const PgracExternalFenceProtocolRequestV1 *request,
+						PgracFencedPreparedAcquireV1 *prepared,
+						PgracExternalFenceProtocolResponseV1 *response)
+{
+	PgracFencedJournalRecordV1 record;
+
+	record_base(context, PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED,
+		request->request_nonce, prepared->accepted_mono_ns, &record);
+	record.provider_result = PGRAC_FENCED_PROVIDER_PENDING;
+	if (context->config->format_version == 2)
+	{
+		if (!pg_strong_random(record.operation_id, sizeof(record.operation_id)) ||
+			!bytes_nonzero(record.operation_id, sizeof(record.operation_id)) ||
+			memcmp(record.operation_id, request->request_nonce, 16) == 0)
+		{
+			memset(prepared, 0, sizeof(*prepared));
+			return PGRAC_FENCED_OPERATION_COMPLETE;
+		}
+		memcpy(record.binding_digest, prepared->binding_digest, 32);
+		record.intent.kind = PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE;
+		record.intent.attempt = 1;
+		record.intent.system_identifier = context->config->system_identifier;
+		memcpy(record.intent.target_uuid, prepared->target.target_uuid, 16);
+		memcpy(record.intent.protected_set_digest, request->need.protected_set_digest, 32);
+		record.intent.request.acquire = *request;
+	}
+	if (!append_record(context, &record))
+	{
+		memset(prepared, 0, sizeof(*prepared));
+		response->deny_reason = PGRAC_FENCED_DENY_JOURNAL;
+		return PGRAC_FENCED_OPERATION_COMPLETE;
+	}
+	prepared->accepted_journal_seq = record.seq;
+	if (context->config->format_version == 2)
+		prepared->accepted_record = record;
+	return PGRAC_FENCED_OPERATION_READY;
+}
+
 PgracFencedOperationAcceptResult
 pgrac_fenced_operation_accept(
 	PgracFencedOperationContextV1 *context,
@@ -467,7 +513,6 @@ pgrac_fenced_operation_accept(
 	PgracExternalFenceProtocolResponseV1 *response)
 {
 	PgracExternalFenceProtocolBindingV1 binding;
-	PgracFencedJournalRecordV1 record;
 	PgracFencedTargetV1 target;
 	uint8 binding_digest[32];
 	uint8 protected_set_digest[32];
@@ -525,24 +570,47 @@ pgrac_fenced_operation_accept(
 		context->config->nodes[request->need.victim_node_id].adapter_data;
 	target.adapter_config_len =
 		context->config->nodes[request->need.victim_node_id].adapter_data_len;
-	if (!append_provider_record(context,
-			PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED, request, NULL,
-			PGRAC_FENCED_PROVIDER_PENDING, 0, NULL, 0, now, &record))
-	{
-		response->deny_reason = PGRAC_FENCED_DENY_JOURNAL;
-		return PGRAC_FENCED_OPERATION_COMPLETE;
-	}
 	prepared->binding = binding;
 	prepared->target = target;
 	memcpy(prepared->binding_digest, binding_digest,
 		sizeof(prepared->binding_digest));
 	prepared->accepted_mono_ns = now;
-	prepared->accepted_journal_seq = record.seq;
-	return PGRAC_FENCED_OPERATION_READY;
+	return persist_prepared_accept(context, request, prepared, response);
 }
 
 static bool
-prepared_matches(const PgracFencedOperationContextV1 *context,
+prepared_intent_matches(const PgracFencedOperationContextV1 *context,
+						const PgracExternalFenceProtocolRequestV1 *request,
+						const PgracFencedPreparedAcquireV1 *prepared)
+{
+	const PgracFencedJournalRecordV1 *record = &prepared->accepted_record;
+	uint8 frame[PGRAC_FENCED_JOURNAL_MAX_RECORD_BYTES];
+	uint8 original[PGRAC_EXTERNAL_FENCE_REQUEST_V1_BYTES];
+	uint8 supplied[PGRAC_EXTERNAL_FENCE_REQUEST_V1_BYTES];
+	size_t length;
+
+	if (context->config->format_version != 2)
+		return record->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_NONE;
+	return record->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_ACQUIRE &&
+		record->record_kind == PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED &&
+		record->seq == prepared->accepted_journal_seq &&
+		record->event_mono_ns == prepared->accepted_mono_ns &&
+		record->provider_id == context->provider->provider_id &&
+		record->provider_abi_version == context->provider->abi_version &&
+		record->mapping_generation == context->config->mapping_generation &&
+		record->intent.system_identifier == context->config->system_identifier &&
+		memcmp(record->daemon_boot_id, context->daemon_boot_id, 16) == 0 &&
+		memcmp(record->semantic_config_digest, context->semantic_config_digest, 32) == 0 &&
+		memcmp(record->intent.target_uuid, prepared->target.target_uuid, 16) == 0 &&
+		memcmp(record->binding_digest, prepared->binding_digest, 32) == 0 &&
+		pgrac_external_fence_request_v1_encode(&record->intent.request.acquire, original) &&
+		pgrac_external_fence_request_v1_encode(request, supplied) &&
+		memcmp(original, supplied, sizeof(original)) == 0 &&
+		pgrac_fenced_journal_frame_encode(record, frame, sizeof(frame), &length);
+}
+
+bool
+pgrac_fenced_operation_prepared_matches(const PgracFencedOperationContextV1 *context,
 			 const PgracExternalFenceProtocolRequestV1 *request,
 			 const PgracFencedPreparedAcquireV1 *prepared)
 {
@@ -550,9 +618,10 @@ prepared_matches(const PgracFencedOperationContextV1 *context,
 	uint8 binding_digest[32];
 	const PgracFencedNodeConfigV1 *node;
 
-	if (context == NULL || context->config == NULL || request == NULL ||
+	if (context == NULL || context->config == NULL || context->provider == NULL || request == NULL ||
 		prepared == NULL || prepared->accepted_mono_ns == 0 ||
 		prepared->accepted_journal_seq == 0 ||
+		!prepared_intent_matches(context, request, prepared) ||
 		!pgrac_external_fence_binding_from_request_v1(&request->need,
 			context->config->mapping_generation, &binding) ||
 		!pgrac_external_fence_binding_digest_v1(&binding, binding_digest) ||
@@ -603,7 +672,7 @@ pgrac_fenced_operation_execute_preaccepted(
 	if (response == NULL)
 		return false;
 	memset(response, 0, sizeof(*response));
-	if (!prepared_matches(context, request, prepared))
+	if (!pgrac_fenced_operation_prepared_matches(context, request, prepared))
 		return false;
 	negative_response(context, request, PGRAC_FENCED_VERDICT_UNAVAILABLE,
 		PGRAC_FENCED_DENY_DAEMON_UNAVAILABLE,
@@ -651,7 +720,7 @@ pgrac_fenced_operation_execute_preaccepted(
 			PGRAC_FENCED_DENY_PROVIDER_UNKNOWN;
 		if (
 			!append_provider_record(context,
-				PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT, request,
+				PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT, request, prepared,
 				binding_digest, provider_result, native_status, NULL,
 				resolve_deny_reason, now, &record))
 		{
@@ -710,7 +779,7 @@ pgrac_fenced_operation_execute_preaccepted(
 		else
 			readback_deny_reason = PGRAC_FENCED_DENY_PROVIDER_UNKNOWN;
 		if (!append_provider_record(context,
-				PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT, request,
+				PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT, request, prepared,
 				binding_digest, provider_result, readback.native_status,
 				worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK ?
 				&readback : NULL, readback_deny_reason, now, &record))
@@ -745,7 +814,7 @@ pgrac_fenced_operation_execute_preaccepted(
 	}
 	if (!monotonic_now_ns(&now) || now >= deadline_mono_ns ||
 		!append_provider_record(context,
-			PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED, request,
+			PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED, request, prepared,
 			binding_digest, PGRAC_FENCED_PROVIDER_PENDING, 0, NULL, 0, now,
 			&record))
 	{
@@ -769,7 +838,7 @@ pgrac_fenced_operation_execute_preaccepted(
 		return true;
 	}
 	if (!append_provider_record(context,
-			PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT, request,
+			PGRAC_FENCED_JOURNAL_KIND_ACTUATION_RESULT, request, prepared,
 			binding_digest, provider_result, native_status, NULL, 0, now,
 			&record))
 	{
@@ -809,7 +878,7 @@ pgrac_fenced_operation_execute_preaccepted(
 	else
 		readback_deny_reason = PGRAC_FENCED_DENY_PROVIDER_UNKNOWN;
 	if (!append_provider_record(context,
-			PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT, request,
+			PGRAC_FENCED_JOURNAL_KIND_READBACK_RESULT, request, prepared,
 			binding_digest, provider_result, readback.native_status,
 			worker_result == PGRAC_FENCED_PROVIDER_WORKER_OK ? &readback : NULL,
 			readback_deny_reason,
@@ -868,6 +937,11 @@ verified_readback:
 	}
 	record_base(context, PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED,
 		request->request_nonce, now, &record);
+	if (context->config->format_version == 2)
+	{
+		memcpy(record.operation_id, prepared->accepted_record.operation_id, 16);
+		record.intent = prepared->accepted_record.intent;
+	}
 	memcpy(record.binding_digest, binding_digest,
 		sizeof(record.binding_digest));
 	record.provider_result = PGRAC_FENCED_PROVIDER_OK;
@@ -940,7 +1014,7 @@ pgrac_fenced_operation_serve_joiner(
 	if (response == NULL)
 		return false;
 	memset(response, 0, sizeof(*response));
-	if (!prepared_matches(context, request, prepared) ||
+	if (!pgrac_fenced_operation_prepared_matches(context, request, prepared) ||
 		source_response == NULL || source_response->verdict !=
 			PGRAC_FENCED_VERDICT_WRITE_EXCLUDED ||
 		source_response->deny_reason != 0 ||
@@ -972,6 +1046,11 @@ pgrac_fenced_operation_serve_joiner(
 		return false;
 	record_base(context, PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED,
 		request->request_nonce, source_response->verified_mono_ns, &record);
+	if (context->config->format_version == 2)
+	{
+		memcpy(record.operation_id, prepared->accepted_record.operation_id, 16);
+		record.intent = prepared->accepted_record.intent;
+	}
 	memcpy(record.binding_digest, prepared->binding_digest,
 		sizeof(record.binding_digest));
 	record.provider_result = PGRAC_FENCED_PROVIDER_OK;
@@ -1017,7 +1096,7 @@ pgrac_fenced_operation_cancel_preaccepted(
 	uint32 verdict;
 	uint64 now;
 
-	if (response == NULL || !prepared_matches(context, request, prepared) ||
+	if (response == NULL || !pgrac_fenced_operation_prepared_matches(context, request, prepared) ||
 		(deny_reason != PGRAC_FENCED_DENY_DAEMON_UNAVAILABLE &&
 		 deny_reason != PGRAC_FENCED_DENY_TIMEOUT &&
 		 deny_reason != PGRAC_FENCED_DENY_CONNECTION_CLOSED &&
@@ -1030,6 +1109,10 @@ pgrac_fenced_operation_cancel_preaccepted(
 	verdict = PGRAC_FENCED_VERDICT_UNAVAILABLE;
 	record_base(context, PGRAC_FENCED_JOURNAL_KIND_INVALIDATED,
 		request->request_nonce, now, &record);
+	/* PGRAC: caller withdrawal is a transport event, not owned-work state.
+	 * This must not resurrect work if PROOF_SERVED is durable but its async
+	 * COMPLETE has not yet been delivered. Before proof, accepted work remains.
+	 */
 	memcpy(record.binding_digest, prepared->binding_digest,
 		sizeof(record.binding_digest));
 	record.provider_result = provider_result;

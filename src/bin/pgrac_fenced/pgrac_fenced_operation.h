@@ -37,6 +37,8 @@ typedef struct PgracFencedPreparedAcquireV1
 	uint8 binding_digest[PGRAC_EXTERNAL_FENCE_PROTOCOL_DIGEST_BYTES];
 	uint64 accepted_mono_ns;
 	uint64 accepted_journal_seq;
+	/* PGRAC: immutable durable identity, independent of client-slot lifetime. */
+	PgracFencedJournalRecordV1 accepted_record;
 } PgracFencedPreparedAcquireV1;
 
 typedef struct PgracFencedOperationContextV1
@@ -90,6 +92,10 @@ extern bool pgrac_fenced_operation_execute_preaccepted(
 	const PgracFencedPreparedAcquireV1 *prepared,
 	uint64 deadline_mono_ns,
 	PgracExternalFenceProtocolResponseV1 *response);
+extern bool pgrac_fenced_operation_prepared_matches(
+	const PgracFencedOperationContextV1 *context,
+	const PgracExternalFenceProtocolRequestV1 *request,
+	const PgracFencedPreparedAcquireV1 *prepared);
 extern bool pgrac_fenced_operation_serve_joiner(
 	PgracFencedOperationContextV1 *context,
 	const PgracExternalFenceProtocolRequestV1 *request,
