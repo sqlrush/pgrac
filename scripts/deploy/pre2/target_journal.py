@@ -3,7 +3,7 @@
 Author: SqlRush <sqlrush@gmail.com>
 """
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import fcntl
 import hashlib
 import hmac
@@ -38,6 +38,7 @@ class DrainIdentity:
 class DenyState:
     identity: DrainIdentity
     phases: tuple
+    successor_operation_id: str = ""
 
 
 def _hex(value, size):
@@ -66,6 +67,16 @@ def _identity(value):
 def _canonical(value):
     return (json.dumps(value, sort_keys=True, ensure_ascii=True,
                        separators=(",", ":"), allow_nan=False) + "\n").encode("ascii")
+
+
+def _identity_payload(value):
+    try:
+        if type(value) is not dict or type(value["route_digests"]) is not list:
+            raise ValueError
+        fields = {**value, "route_digests": tuple(value["route_digests"])}
+        return _identity(DrainIdentity(**fields))
+    except (KeyError, TypeError, ValueError):
+        raise TargetJournalError("TARGET_JOURNAL_IDENTITY") from None
 
 
 def _pairs(items):
@@ -170,28 +181,24 @@ class TargetJournal:
             return self._deny_transition(payload)
         if kind == "ROUTE":
             return self._route_transition(payload)
+        if kind == "HANDOFF":
+            return self._handoff_transition(payload)
         raise TargetJournalError("TARGET_JOURNAL_TRANSITION")
 
     def _deny_transition(self, payload):
-        try:
-            fields = dict(payload)
-            if type(fields["route_digests"]) is not list:
-                raise ValueError
-            fields["route_digests"] = tuple(fields["route_digests"])
-            requested = _identity(DrainIdentity(**fields))
-        except (KeyError, TypeError, ValueError):
-            raise TargetJournalError("TARGET_JOURNAL_IDENTITY") from None
+        requested = _identity_payload(payload)
         previous = self.states.get(requested.operation_id)
         phases = (0,) * len(requested.route_digests)
         if previous is not None:
             old = previous.identity
             immutable = ("guest_uuid", "mapping_generation", "protected_set_digest", "route_digests")
-            if (requested.attempt <= old.attempt
+            if (previous.successor_operation_id or requested.attempt <= old.attempt
                     or any(getattr(requested, field) != getattr(old, field) for field in immutable)):
                 raise TargetJournalError("TARGET_JOURNAL_IDENTITY_DRIFT")
             if old.target_boot_id == requested.target_boot_id:
                 phases = previous.phases
-        elif (len(self.states) >= 128 or any(state.identity.guest_uuid == requested.guest_uuid
+        elif (len(self.states) >= 128 or any(not state.successor_operation_id
+                                            and state.identity.guest_uuid == requested.guest_uuid
                                             for state in self.states.values())):
             raise TargetJournalError("TARGET_JOURNAL_OWNER_CONFLICT")
         return {**self.states, requested.operation_id: DenyState(requested, phases)}
@@ -204,7 +211,7 @@ class TargetJournal:
         if not _hex(operation, 32) or not _hex(boot, 32):
             raise TargetJournalError("TARGET_JOURNAL_ROUTE")
         state = self.states.get(operation)
-        if (state is None or state.identity.target_boot_id != boot
+        if (state is None or state.successor_operation_id or state.identity.target_boot_id != boot
                 or type(ordinal) is not int or not 0 <= ordinal < len(state.phases)
                 or type(phase) is not int or not 1 <= phase <= 3
                 or state.phases[ordinal] + 1 != phase):
@@ -212,6 +219,30 @@ class TargetJournal:
         phases = list(state.phases)
         phases[ordinal] = phase
         return {**self.states, operation: DenyState(state.identity, tuple(phases))}
+
+    def _handoff_transition(self, payload):
+        if set(payload) != {"previous", "successor"}:
+            raise TargetJournalError("TARGET_JOURNAL_HANDOFF")
+        reference = payload["previous"]
+        if (type(reference) is not dict or set(reference) != {"operation_id", "identity_digest"}
+                or not _hex(reference["operation_id"], 32) or not _hex(reference["identity_digest"], 64)):
+            raise TargetJournalError("TARGET_JOURNAL_HANDOFF")
+        old = self.states.get(reference["operation_id"])
+        if (old is None or not hmac.compare_digest(reference["identity_digest"],
+                                                  hashlib.sha256(_canonical(asdict(old.identity))).hexdigest())):
+            raise TargetJournalError("TARGET_JOURNAL_HANDOFF")
+        previous = old.identity
+        successor = _identity_payload(payload["successor"])
+        immutable = ("guest_uuid", "target_boot_id", "mapping_generation",
+                     "protected_set_digest", "route_digests")
+        if (old.successor_operation_id
+                or any(phase != 3 for phase in old.phases)
+                or successor.operation_id in self.states or len(self.states) >= 128
+                or any(getattr(previous, field) != getattr(successor, field) for field in immutable)):
+            raise TargetJournalError("TARGET_JOURNAL_HANDOFF")
+        return {**self.states,
+                previous.operation_id: replace(old, successor_operation_id=successor.operation_id),
+                successor.operation_id: DenyState(successor, old.phases)}
 
     def _replay(self):
         chunks, size = [], 0
@@ -283,6 +314,8 @@ class TargetJournal:
         self._usable()
         requested = _identity(requested)
         previous = self.states.get(requested.operation_id)
+        if previous is not None and previous.successor_operation_id:
+            raise TargetJournalError("TARGET_JOURNAL_RETIRED")
         if previous is not None and previous.identity == requested:
             return
         payload = asdict(requested)
@@ -294,13 +327,37 @@ class TargetJournal:
         self._append("ROUTE", {"operation_id": operation_id, "target_boot_id": target_boot_id,
                                "ordinal": ordinal, "phase": phase})
 
+    def handoff(self, previous, successor):
+        """Transfer a completed deny without opening access or dropping history."""
+        previous, successor = _identity(previous), _identity(successor)
+        if self.handoff_recorded(previous, successor):
+            return
+        # The predecessor is already durable. Refer to its exact identity rather
+        # than duplicating 128 routes and exceeding the existing record bound.
+        first = {"operation_id": previous.operation_id,
+                 "identity_digest": hashlib.sha256(_canonical(asdict(previous))).hexdigest()}
+        second = asdict(successor)
+        second["route_digests"] = list(successor.route_digests)
+        self._append("HANDOFF", {"previous": first, "successor": second})
+
+    def handoff_recorded(self, previous, successor):
+        """Recorded exact ownership only, not current native OFF/drain proof."""
+        self._usable()
+        previous, successor = _identity(previous), _identity(successor)
+        old, current = self.states.get(previous.operation_id), self.states.get(successor.operation_id)
+        return (old is not None and old.identity == previous
+                and old.successor_operation_id == successor.operation_id
+                and current is not None and current.identity == successor
+                and not current.successor_operation_id)
+
     def denied(self):
         self._usable()
-        return tuple(self.states.values())
+        return tuple(state for state in self.states.values() if not state.successor_operation_id)
 
     def completion_recorded(self, operation_id, target_boot_id):
         """Past completion facts only; OFF/inventory/deny still need fresh checks."""
         self._usable()
         state = self.states.get(operation_id)
-        return (state is not None and state.identity.target_boot_id == target_boot_id
+        return (state is not None and not state.successor_operation_id
+                and state.identity.target_boot_id == target_boot_id
                 and all(phase == 3 for phase in state.phases))

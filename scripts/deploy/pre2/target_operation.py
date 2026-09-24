@@ -26,12 +26,14 @@ class OffDrainCompletion:
 
 
 def complete_off_drain(registry, journal, root, connection, node_id, operation_id,
-                       attempt, daemon_boot_id, target_boot_id, challenge, deadline_mono_ns):
+                       attempt, daemon_boot_id, target_boot_id, challenge, deadline_mono_ns,
+                       *, handoff_from=None):
     """Run in the authenticated owner's bounded worker with exclusive config.
 
     This does not establish management policy/unsolicited-ON exclusion. A signer
     must additionally verify that policy and export-start deny enforcement.
-    A failed call never clears obligations or re-creates an ACL.
+    A failed call never clears obligations or re-creates an ACL. Only a trusted
+    owned continuation may name a predecessor; no implicit takeover is attempted.
     """
     try:
         if (type(registry) is not TargetRegistry or type(journal) is not TargetJournal
@@ -43,6 +45,15 @@ def complete_off_drain(registry, journal, root, connection, node_id, operation_i
             raise TargetJournalError("TARGET_OPERATION_IDENTITY")
         node = registry.node(node_id)
         identity = registry.drain_identity(node_id, operation_id, attempt, daemon_boot_id, target_boot_id)
+        if handoff_from is not None and not journal.handoff_recorded(handoff_from, identity):
+            with resolve_routes(root, journal, handoff_from, node.bindings):
+                # Continuous same-boot denial can transfer its owner, not its
+                # permission. Journal validates exact identity/full completion;
+                # physical OFF and the entire old route census remain mandatory.
+                observe_off(connection, node.mapping, deadline_mono_ns)
+                if _kernel_boot_id() != target_boot_id or time.monotonic_ns() >= deadline_mono_ns:
+                    raise TargetJournalError("TARGET_OPERATION_CHANGED")
+                journal.handoff(handoff_from, identity)
         with resolve_routes(root, journal, identity, node.bindings) as resolved:
             # Durable obligation precedes all physical action. Native OFF is a
             # separate prerequisite, not inferred from this durable record.

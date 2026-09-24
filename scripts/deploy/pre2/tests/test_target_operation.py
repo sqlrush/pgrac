@@ -145,6 +145,62 @@ class OperationTests(unittest.TestCase):
         self.assertEqual(self.events, [])
         self.assertEqual(self.journal.denied(), ())
 
+    def handoff(self, successor, previous):
+        return complete_off_drain(self.registry, self.journal, self.root, self.connection, 2,
+                                  successor.operation_id, successor.attempt, successor.daemon_boot_id,
+                                  successor.target_boot_id, "dd" * 16, time.monotonic_ns() + 5_000_000_000,
+                                  handoff_from=previous)
+
+    def test_new_owned_operation_can_take_over_completed_deny_without_reteardown(self):
+        old = self.complete_ok().identity
+        new = replace(old, operation_id="ee" * 16, daemon_boot_id="ef" * 16)
+        try:
+            result = self.handoff(new, old)
+        except TargetJournalError as error:
+            self.fail(f"exact physical denial handoff refused: {error}")
+        self.assertEqual(result.identity, new)
+        self.assertEqual(result.phases, (3, 3, 3, 3))
+        self.assertEqual(self.events, ["teardown"])
+        self.assertEqual(self.tpg.node_acls, [])
+        self.assertEqual([s.identity for s in self.journal.denied()], [new])
+        self.assertEqual(self.handoff(new, old).identity, new)
+        with self.assertRaises(TargetJournalError):
+            self.complete()
+
+    def test_native_on_or_recreated_acl_never_hands_off_completed_deny(self):
+        old = self.complete_ok().identity
+        new = replace(old, operation_id="ee" * 16)
+        original = (self.directory / "deny.journal").read_bytes()
+        self.connection.domain.active = 1
+        with self.assertRaises(TargetJournalError):
+            self.handoff(new, old)
+        self.connection.domain.active = 0
+        self.tpg.node_acls = [self.acl]
+        with self.assertRaises(TargetJournalError):
+            self.handoff(new, old)
+        self.assertEqual((self.directory / "deny.journal").read_bytes(), original)
+
+    def test_handoff_still_requires_fresh_off_after_durable_transition(self):
+        old = self.complete_ok().identity
+        new = replace(old, operation_id="ee" * 16)
+        real_sync = os.fsync
+        def changed(fd):
+            real_sync(fd)
+            if fd == self.journal.fd:
+                self.connection.domain.active = 1
+        with patch("target_journal.os.fsync", side_effect=changed), self.assertRaises(TargetJournalError):
+            self.handoff(new, old)
+        self.assertEqual([s.identity for s in self.journal.denied()], [new])
+        self.assertEqual(self.events, ["teardown"])
+
+    def test_new_operation_without_explicit_predecessor_cannot_take_over(self):
+        self.complete_ok()
+        old = self.identity
+        self.identity = replace(old, operation_id="ee" * 16)
+        with self.assertRaises(TargetJournalError):
+            self.complete()
+        self.assertEqual([s.identity for s in self.journal.denied()], [old])
+
 
 if __name__ == "__main__":
     unittest.main()
