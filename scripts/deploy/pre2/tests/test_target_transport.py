@@ -35,7 +35,8 @@ class TargetTransportTests(unittest.TestCase):
         for name in ("server", "client", "other"):
             result = subprocess.run(
                 ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1",
-                 "-subj", f"/CN={name}", "-keyout", str(cls.directory / (name + ".key")),
+                 "-subj", f"/CN={name}", "-addext", f"subjectAltName=DNS:{name}",
+                 "-keyout", str(cls.directory / (name + ".key")),
                  "-out", str(cls.directory / (name + ".pem"))],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15)
             if result.returncode != 0:

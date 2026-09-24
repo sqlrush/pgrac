@@ -1,4 +1,4 @@
-"""Protected TLS loading in the dedicated Linux target owner.
+"""Protected TLS loading in dedicated Linux management owners/workers.
 
 Author: SqlRush <sqlrush@gmail.com>
 Disables core dumps permanently before opening credentials. No key bytes are
@@ -61,6 +61,19 @@ def load_server_context(files, deadline_mono_ns):
     remain frozen afterwards. A worker supervisor bounds blocking native I/O;
     this deadline never provides isolation evidence or changes DB timeouts.
     """
+    return _load_context(files, deadline_mono_ns, client=False)
+
+
+def load_client_context(files, deadline_mono_ns):
+    """Load explicit client identity with mandatory SAN hostname verification.
+
+    Same permanent dump protection and frozen process identity as the server.
+    The separate client also verifies the configured exact server certificate.
+    """
+    return _load_context(files, deadline_mono_ns, client=True)
+
+
+def _load_context(files, deadline_mono_ns, *, client):
     descriptors, identities = [], []
     try:
         if (sys.platform != "linux" or type(files) is not TlsFiles
@@ -74,11 +87,15 @@ def load_server_context(files, deadline_mono_ns):
             identities.append(_credential_info(fd, files.owner_uid))
         if time.monotonic_ns() >= deadline_mono_ns:
             raise TargetJournalError("TARGET_TLS_EXPIRED")
-        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT if client else ssl.PROTOCOL_TLS_SERVER)
         context.minimum_version = context.maximum_version = ssl.TLSVersion.TLSv1_3
         context.verify_mode = ssl.CERT_REQUIRED
         context.options |= ssl.OP_NO_TICKET
-        context.num_tickets = 0
+        if client:
+            context.check_hostname = True
+            context.hostname_checks_common_name = False
+        else:
+            context.num_tickets = 0
         ca, certificate, key = (f"/proc/self/fd/{fd}" for fd in descriptors)
         context.load_verify_locations(cafile=ca)
         context.load_cert_chain(certfile=certificate, keyfile=key, password=_no_password)

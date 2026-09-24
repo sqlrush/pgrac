@@ -22,6 +22,7 @@ from unittest.mock import patch
 import test_target_transport as transport_tests
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from target_journal import TargetJournalError
+import target_credentials
 try:
     from target_credentials import TlsFiles, load_server_context
 except ModuleNotFoundError:
@@ -40,15 +41,54 @@ class TargetCredentialTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory(prefix="pgrac-tls-files-")
         self.addCleanup(temporary.cleanup)
         self.local = Path(temporary.name).resolve()
-        for name in ("server.pem", "server.key", "client.pem"):
+        for name in ("server.pem", "server.key", "client.pem", "client.key"):
             shutil.copyfile(self.directory / name, self.local / name)
             (self.local / name).chmod(0o600)
         self.files = TlsFiles(str(self.local / "client.pem"), str(self.local / "server.pem"),
                               str(self.local / "server.key"), os.geteuid())
+        self.client_files = TlsFiles(str(self.local / "server.pem"), str(self.local / "client.pem"),
+                                    str(self.local / "client.key"), os.geteuid())
 
     def load(self, files=None, deadline=None):
         return load_server_context(self.files if files is None else files,
                                    time.monotonic_ns() + 5_000_000_000 if deadline is None else deadline)
+
+    def load_client(self, files=None):
+        loader = getattr(target_credentials, "load_client_context", None)
+        self.assertTrue(callable(loader), "protected TLS client loading is missing")
+        return loader(self.client_files if files is None else files,
+                      time.monotonic_ns() + 5_000_000_000)
+
+    def test_both_protected_contexts_complete_real_exchange(self):
+        driver = transport_tests.TargetTransportTests()
+        driver.directory, driver.pin = self.directory, self.pin
+        client = self.load_client()
+        self.assertTrue(client.check_hostname)
+        self.assertFalse(client.hostname_checks_common_name)
+        calls, errors, response, _ = driver.exchange(b"\0\0\0\1x", server=self.load(), client=client)
+        self.assertEqual(errors, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(response[4:], b"reply-not-a-proof")
+
+    def test_client_uses_same_pre_open_dump_guard_and_rejects_unsafe_key(self):
+        with patch("target_credentials._lock_secrets", side_effect=OSError("secret")), \
+                patch("target_credentials._open_registry") as opened:
+            with self.assertRaises(TargetJournalError):
+                self.load_client()
+        opened.assert_not_called()
+        (self.local / "client.key").chmod(0o644)
+        with self.assertRaises(TargetJournalError):
+            self.load_client()
+
+    def test_client_keylog_environment_is_ignored_and_wrong_key_refuses(self):
+        path = self.local / "no-client-keylog"
+        with patch.dict(os.environ, {"SSLKEYLOGFILE": str(path)}):
+            self.assertIsNone(self.load_client().keylog_filename)
+        self.assertFalse(path.exists())
+        before = set(os.listdir("/proc/self/fd"))
+        with self.assertRaises(TargetJournalError):
+            self.load_client(replace(self.client_files, private_key=str(self.local / "server.key")))
+        self.assertEqual(set(os.listdir("/proc/self/fd")), before)
 
     def test_loaded_context_completes_real_authenticated_exchange(self):
         # Reuse the real TCP/TLS driver, not a mocked OpenSSL response.

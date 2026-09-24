@@ -4,24 +4,14 @@ Author: SqlRush <sqlrush@gmail.com>
 Responses are observations, never isolation certificates or DB admission.
 """
 
-import json
 import time
 
+from target_command import decode_command
 from target_inventory import resolve_routes
-from target_journal import TargetJournal, TargetJournalError, _canonical, _hex, _pairs, _uint
+from target_journal import TargetJournal, TargetJournalError, _canonical, _hex, _uint
 import target_operation as operation
 from target_registry import TargetRegistry
 from target_transport import AuthenticatedTargetRequest, MAX_FRAME_BYTES
-
-IDENTITY_KEYS = frozenset(("version", "action", "challenge"))
-OPERATION_KEYS = IDENTITY_KEYS | frozenset((
-    "node_id", "system_identifier", "mapping_generation", "protected_set_digest",
-    "operation_id", "attempt", "daemon_boot_id", "target_boot_id"))
-
-
-def _constant(_value):
-    raise TargetJournalError("TARGET_COMMAND_JSON")
-
 
 def _fresh(deadline, target_boot_id):
     if time.monotonic_ns() >= deadline or operation._kernel_boot_id() != target_boot_id:
@@ -46,16 +36,8 @@ def dispatch_target(request, registry, journal, root, connection):
                 or type(registry) is not TargetRegistry or type(journal) is not TargetJournal
                 or registry.inventory_digest != journal.inventory):
             raise TargetJournalError("TARGET_COMMAND_CONTEXT")
-        document = json.loads(request.payload.decode("ascii", errors="strict"),
-                              object_pairs_hook=_pairs, parse_constant=_constant)
-        if (type(document) is not dict or type(document.get("version")) is not int
-                or document["version"] != 1 or not _hex(document.get("challenge"), 32)
-                or _canonical(document) != request.payload):
-            raise TargetJournalError("TARGET_COMMAND_SCHEMA")
-        action = document.get("action")
-        if (type(action) is not str or action not in ("identity", "prepare_deny", "complete_off")
-                or document.keys() != (IDENTITY_KEYS if action == "identity" else OPERATION_KEYS)):
-            raise TargetJournalError("TARGET_COMMAND_SCHEMA")
+        document = decode_command(request.payload)
+        action = document["action"]
         states = journal.denied()  # Also refuses a poisoned or closed journal.
         target_boot = operation._kernel_boot_id()
         if not _hex(target_boot, 32):
