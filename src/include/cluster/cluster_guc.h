@@ -298,6 +298,10 @@ extern char *cluster_shared_data_dir;
  *	context: PGC_POSTMASTER.
  */
 extern bool cluster_controlfile_shared_authority;
+/* PGRAC: PRE2 shared config/root-v2 profile, default off, POSTMASTER.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern bool cluster_shared_config;
 
 
 /*

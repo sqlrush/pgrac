@@ -70,6 +70,7 @@ int cluster_node_id = 0;
 bool enableFsync = true;
 bool cluster_enabled = true;
 bool cluster_controlfile_shared_authority = true;
+bool cluster_shared_config = false;
 
 /* PGRAC: facts, not an authorization stub; real publisher performs checks.
  * Author: SqlRush <sqlrush@gmail.com>
@@ -80,6 +81,7 @@ ErrorContextCallback *error_context_stack;
 static bool test_checkpoint_mode;
 static uint64 test_self_incarnation;
 static uint64 test_epoch;
+static unsigned test_epoch_reads, test_change_epoch_read;
 static bool test_serving, test_fence, test_prebump, test_wal_validated;
 static ClusterMembershipState test_member_state;
 static XLogRecPtr test_flush;
@@ -101,6 +103,8 @@ cluster_epoch_get_current(void)
 {
 	if (!test_checkpoint_mode)
 		abort();
+	if (++test_epoch_reads == test_change_epoch_read)
+		++test_epoch;
 	return test_epoch;
 }
 
@@ -234,6 +238,7 @@ cluster_write_fence_reject_if_fenced(const char *op)
 static char test_root[MAXPGPATH];
 static char test_wal_root[MAXPGPATH];
 static uint64 test_system_identifier = TEST_SYSID;
+static ControlFileData *test_sysid_control;
 static char test_storage_uuid_text[33] = "00112233445566778899aabbccddeeff";
 static ClusterCfContractState test_contract = CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED;
 static int test_node_count = 4;
@@ -516,7 +521,8 @@ cluster_r4_bit22_cutover_latch_verify(void)
 uint64
 GetSystemIdentifier(void)
 {
-	return test_system_identifier;
+	return test_sysid_control != NULL ? test_sysid_control->system_identifier
+									  : test_system_identifier;
 }
 
 int
@@ -4044,6 +4050,151 @@ UT_TEST(test_v2_checkpoint_error_unwind_releases_owned_work)
 	v2_assert_anchor_staging_empty();
 }
 
+/* PGRAC: native CF entry consumes the real root/claim/anchor stack, not a
+ * stubbed success. The compatibility image is valid but has a different
+ * checkpoint so a fallback cannot accidentally satisfy these assertions.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_runtime_fixture(uint8 bytes[66048], ClusterControlRootIdentity *self, ControlFileData *candidate)
+{
+	v2_checkpoint_fixture(bytes, self, candidate);
+	cluster_shared_config = false;
+	cluster_cf_authority_write(candidate);
+	cluster_shared_config = true;
+	test_cf_mode = ShareLock;
+	test_checkpoint_outer_cf = true;
+	MyAuxProcType = NotAnAuxProcess;
+	test_epoch_reads = test_change_epoch_read = 0;
+}
+
+UT_TEST(test_v2_runtime_native_reader_selects_own_thread)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate, out;
+
+	v2_runtime_fixture(bytes, &self, &candidate);
+	UT_ASSERT(cluster_cf_authority_read(&out));
+	UT_ASSERT_EQ(out.checkPoint, candidate.checkPoint - 8192);
+	UT_ASSERT_EQ(out.checkPointCopy.nextOid, 60001);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	cluster_node_id = 127;
+	test_self_incarnation = test_membership_incarnation = 226;
+	test_own_thread = 128;
+	UT_ASSERT(cluster_cf_authority_read(&out));
+	UT_ASSERT_EQ(out.checkPoint, UINT64_C(0x1000000) + 127 * 4096 + 128);
+	UT_ASSERT_EQ(out.checkPointCopy.nextOid, 60001);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_runtime_reader_never_uses_projection_for_bad_facts)
+{
+	for (int fault = 0; fault < 16; ++fault) {
+		uint8 bytes[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate, out;
+		char path[MAXPGPATH];
+
+		v2_runtime_fixture(bytes, &self, &candidate);
+		switch (fault) {
+		case 0:
+			test_cf_clusterwide = false;
+			break;
+		case 1:
+			test_self_incarnation++;
+			break;
+		case 2:
+			test_membership_incarnation++;
+			break;
+		case 3:
+			test_member_state = CLUSTER_MEMBER_DEAD;
+			break;
+		case 4:
+			test_serving = false;
+			break;
+		case 5:
+			test_fence = false;
+			break;
+		case 6:
+			test_prebump = true;
+			break;
+		case 7:
+			test_wal_validated = false;
+			break;
+		case 8:
+			test_own_thread = 2;
+			break;
+		case 9:
+			test_change_epoch_read = 3;
+			break;
+		case 10:
+			v2_claim_path(&self, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+			break;
+		case 11:
+			cluster_controlfile_shared_authority = false;
+			break;
+		case 12:
+			put_u32_le(bytes + 196, CLUSTER_CONTROL_ROOT_DATABASE_CLOSED);
+			break;
+		case 13:
+			put_u64_le(bytes + 232, 0);
+			break;
+		case 14:
+			bytes[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+			break;
+		case 15:
+			put_u32_le(bytes + 76, CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED);
+			break;
+		}
+		if (fault >= 12) {
+			ControlRootImage root;
+
+			v2_checksums(bytes);
+			UT_ASSERT_EQ(
+				cluster_control_root_v2_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root),
+				0);
+			v2_write_roots(bytes);
+		}
+		out = candidate;
+		UT_ASSERT(!cluster_cf_authority_read(&out));
+		UT_ASSERT_EQ(memcmp(&out, &candidate, sizeof(out)), 0);
+		/* Private decoder scratch clears on failure; native shared output is
+		 * untouched, not treated as a successful fallback or new authority.
+		 */
+		test_epoch_reads = 0;
+		if (fault == 9)
+			--test_epoch;
+		UT_ASSERT(cluster_control_root_v2_read_runtime_local_locked(&out)
+				  != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_v2_runtime_native_inplace_identity_is_never_cleared)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate, before;
+
+	v2_runtime_fixture(bytes, &self, &candidate);
+	/* Actual xlog.c shape: CF read's output is also GetSystemIdentifier's
+	 * backing storage. It must never be zeroed while validating a new view.
+	 */
+	test_sysid_control = &candidate;
+	UT_ASSERT(cluster_cf_authority_read(&candidate));
+	UT_ASSERT_EQ(candidate.system_identifier, TEST_SYSID);
+	UT_ASSERT_EQ(candidate.checkPoint, UINT64_C(0x1000000) + 128);
+	before = candidate;
+	test_fence = false;
+	UT_ASSERT(!cluster_cf_authority_read(&candidate));
+	UT_ASSERT_EQ(memcmp(&candidate, &before, sizeof(candidate)), 0);
+	test_sysid_control = NULL;
+	cluster_shared_config = false;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4053,7 +4204,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(67);
+	UT_PLAN(70);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -4121,6 +4272,9 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_checkpoint_postwrite_failure_keeps_fact_but_no_success);
 	UT_RUN(test_v2_checkpoint_error_unwind_releases_owned_work);
 	UT_RUN(test_v2_thread_view_requires_physical_selected_claim);
+	UT_RUN(test_v2_runtime_native_reader_selects_own_thread);
+	UT_RUN(test_v2_runtime_reader_never_uses_projection_for_bad_facts);
+	UT_RUN(test_v2_runtime_native_inplace_identity_is_never_cleared);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

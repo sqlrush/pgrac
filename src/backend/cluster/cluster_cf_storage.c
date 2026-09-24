@@ -835,6 +835,15 @@ cluster_cf_startup_prepare(const char *pgdata)
 	ClusterCfStartupVerdict v;
 	ClusterCfIdentityVerdict idv;
 
+	/* PGRAC: never let the old first-start migration manufacture authority for
+	 * root-v2. Early sizing/config binding and formation must be wired before
+	 * this profile can start. Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("PRE2 shared-control startup is not yet available"),
+						errhint("Keep cluster.shared_config off until the complete root-v2 "
+								"migration and startup path is qualified.")));
 	if (!cluster_controlfile_shared_authority)
 		return; /* off: stock per-node pg_control */
 

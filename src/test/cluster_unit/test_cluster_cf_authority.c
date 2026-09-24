@@ -44,6 +44,7 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "catalog/pg_control.h"
@@ -54,6 +55,7 @@
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
 #include "utils/elog.h"
+#include "../../backend/cluster/cluster_control_root_private.h"
 
 #undef printf
 #undef fprintf
@@ -76,6 +78,18 @@ UT_DEFINE_GLOBALS();
  */
 char *cluster_shared_data_dir = NULL;
 bool enableFsync = true;
+bool cluster_shared_config = false;
+static bool runtime_guard_error_expected;
+static unsigned runtime_read_calls;
+
+/* The root test links the actual adapter; this leaf test only checks routing. */
+ClusterControlRootResult
+cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
+{
+	++runtime_read_calls;
+	memset(out, 0, sizeof(*out));
+	return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+}
 
 /* PGRAC: only lock facts and fsync failures are controlled; file operations
  * exercise the real immutable image implementation. Author: SqlRush <sqlrush@gmail.com>
@@ -109,6 +123,8 @@ bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
 	if (elevel >= ERROR) {
+		if (runtime_guard_error_expected)
+			_exit(90);
 		printf("# unexpected ereport(elevel=%d) -- aborting\n", elevel);
 		abort();
 	}
@@ -1051,12 +1067,56 @@ UT_TEST(test_immutable_fsync_disabled_cannot_claim_durable_success)
 	REQUIRE_IMAGE_OK(cluster_cf_control_image_discard(&stage));
 }
 
+UT_TEST(test_shared_config_dispatches_without_legacy_fallback)
+{
+	ControlFileData in, out;
+
+	image_input(&in);
+	cluster_cf_authority_write(&in);
+	cluster_shared_config = true;
+	runtime_read_calls = 0;
+	out = in;
+	UT_ASSERT(!cluster_cf_authority_read(&out));
+	UT_ASSERT_EQ(runtime_read_calls, 1);
+	UT_ASSERT_EQ(memcmp(&out, &in, sizeof(out)), 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_shared_config_untyped_writer_cannot_modify_projection)
+{
+	ControlFileData before, candidate, after;
+	pid_t child;
+	int status = 0;
+
+	image_input(&before);
+	cluster_cf_authority_write(&before);
+	UT_ASSERT(cluster_cf_authority_read(&before));
+	candidate = before;
+	candidate.checkPoint += 8192;
+	fflush(NULL);
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		cluster_shared_config = true;
+		runtime_guard_error_expected = true;
+		cluster_cf_authority_write(&candidate);
+		_exit(0);
+	}
+	if (child > 0) {
+		UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+		UT_ASSERT(WIFEXITED(status));
+		UT_ASSERT_EQ(WEXITSTATUS(status), 90);
+	}
+	UT_ASSERT(cluster_cf_authority_read(&after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+}
+
 int
 main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(25);
+	UT_PLAN(27);
 	UT_RUN(test_paths);
 	UT_RUN(test_classify_buffer);
 	UT_RUN(test_decide_source);
@@ -1082,6 +1142,8 @@ main(void)
 	UT_RUN(test_immutable_changed_staging_bytes_and_size_refuse);
 	UT_RUN(test_immutable_missing_exact_object_never_falls_back);
 	UT_RUN(test_immutable_fsync_disabled_cannot_claim_durable_success);
+	UT_RUN(test_shared_config_dispatches_without_legacy_fallback);
+	UT_RUN(test_shared_config_untyped_writer_cannot_modify_projection);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

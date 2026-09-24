@@ -52,6 +52,7 @@
 #include "miscadmin.h"
 #include "port/pg_crc32c.h"
 #include "storage/fd.h"
+#include "cluster_control_root_private.h"
 
 /*
  * build_path -- join cluster_shared_data_dir with a relative name into the
@@ -212,6 +213,28 @@ cluster_cf_authority_read(ControlFileData *out)
 	bool bak_strict_ok;
 	ClusterCfReadSource src;
 
+	/* PGRAC: runtime v2 never reads the compatibility projection or .bak.
+	 * The caller already owns CF-S/X; the adapter checks its exact local
+	 * runtime owner again after reading. Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config) {
+		ControlFileData verified;
+		ClusterControlRootResult result;
+
+		if (out == NULL)
+			return false;
+		/* The native caller passes shared ControlFile, which also backs
+		 * GetSystemIdentifier(). Never clear it as decoder scratch or expose
+		 * an unverified partial view. Preserve this API's untouched-on-failure
+		 * contract; a false return is not authority to use the old contents.
+		 */
+		result = cluster_control_root_v2_read_runtime_local_locked(&verified);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			return false;
+		*out = verified;
+		return true;
+	}
 	pv = read_image(cluster_cf_shared_path(), primary_img);
 	if (pv == CLUSTER_CF_VALID) {
 		memcpy(out, primary_img, sizeof(ControlFileData));
@@ -326,6 +349,13 @@ cluster_cf_authority_write(const ControlFileData *cf)
 	char baktmp[MAXPGPATH];
 	ControlFileData local;
 
+	/* PGRAC: an untyped native struct cannot overwrite common/thread authority.
+	 * Use purpose-bound v2 publishers, never the old projection writer.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config)
+		ereport(PANIC, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("root-v2 control update requires a purpose-bound publisher")));
 	if (!build_path(primary, sizeof(primary), CLUSTER_CF_REL_PATH)
 		|| !build_path(bak, sizeof(bak), CLUSTER_CF_BAK_REL_PATH)
 		|| !build_path(tmp, sizeof(tmp), CLUSTER_CF_TMP_REL_PATH)

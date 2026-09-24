@@ -193,6 +193,8 @@ int cluster_storage_fence_driver = CLUSTER_STORAGE_FENCE_DRIVER_AUTO;
  * (shared-nothing-simulation) clusters are unaffected.
  */
 bool cluster_controlfile_shared_authority = false;
+/* PGRAC: root-v2 configuration profile. Author: SqlRush <sqlrush@gmail.com> */
+bool cluster_shared_config = false;
 bool cluster_smgr_user_relations = false;
 /*
  * spec-6.14 D1: shared system-catalog single authority.  Off by default; on
@@ -2278,6 +2280,16 @@ cluster_init_guc(void)
 					 "authority and symlinks to it, failing closed on a per-node or "
 					 "foreign control file.  Off keeps the stock per-node pg_control."),
 		&cluster_controlfile_shared_authority, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+
+	/* PGRAC: do not enable a partially wired root-v2 startup profile.
+	 * The startup gate rejects it until the exact bootstrap adapter is ready.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	DefineCustomBoolVariable(
+		"cluster.shared_config", gettext_noop("Use the shared root-v2 configuration profile."),
+		gettext_noop("Requires a fully qualified root-v2 migration and startup path. "
+					 "The incomplete profile is rejected before legacy control migration."),
+		&cluster_shared_config, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 
 	/*
 	 * cluster.shared_storage_uuid -- optional external-preset identity for

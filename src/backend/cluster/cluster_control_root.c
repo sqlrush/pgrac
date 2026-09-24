@@ -1090,6 +1090,91 @@ fail:
 	return result;
 }
 
+/* PGRAC: a read-only runtime view requires a live exact local owner; this is
+ * not the early postmaster sizing read or the recovery owner's read API.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+runtime_v2_owner_current(uint64 epoch, uint64 incarnation)
+{
+	return cluster_shared_config && cluster_enabled && cluster_controlfile_shared_authority
+		   && cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES && epoch != 0
+		   && incarnation != 0 && cluster_qvotec_get_self_incarnation() == incarnation
+		   && cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER
+		   && cluster_membership_get_last_admitted_incarnation(cluster_node_id) == incarnation
+		   && cluster_wal_thread_dir_validated()
+		   && cluster_wal_thread_id() == (uint16)(cluster_node_id + 1)
+		   && !cluster_reconfig_has_pending_prebump_stage() && cluster_serving_ready_is_current()
+		   && cluster_write_fence_allowed() && cluster_epoch_get_current() == epoch;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
+{
+	ControlRootImage *root;
+	ControlFileData common, thread;
+	ClusterControlRootIdentity self;
+	ClusterControlRootFileToken token;
+	ClusterControlRootResult result;
+	uint8 storage_uuid[16];
+	uint64 epoch, incarnation, sysid;
+	int node;
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	node = cluster_node_id;
+	epoch = cluster_epoch_get_current();
+	incarnation = cluster_qvotec_get_self_incarnation();
+	if (!runtime_v2_owner_current(epoch, incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!current_storage_uuid(storage_uuid))
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	sysid = GetSystemIdentifier();
+	if (sysid == 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	root = palloc(sizeof(*root));
+	result
+		= cluster_control_root_v2_read_control_locked(storage_uuid, sysid, root, &common, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		goto done;
+	if (!root->present[node]
+		|| root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| (root->header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) == 0) {
+		result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		goto done;
+	}
+	self = root->records[node].identity;
+	if (self.origin_owner_incarnation != incarnation) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto done;
+	}
+	/* The same externally held CF interval pins the selected root across both
+	 * reads. The second composes the exact physical claim and thread anchor.
+	 */
+	result = cluster_control_root_v2_read_thread_locked(&self, root, &thread, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		goto done;
+	if (!runtime_v2_owner_current(epoch, incarnation)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	*out = thread;
+done:
+	pfree(root);
+	return result;
+}
+
 /*
  * cluster_control_root_restore_bit22_latch_if_active -- RF-ROOT P9 verification
  *	(contract): re-arm the bit22 cutover latch across a postmaster restart.

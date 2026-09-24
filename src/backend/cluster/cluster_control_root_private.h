@@ -104,6 +104,10 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 										   ControlRootImage *root, ControlFileData *out,
 										   ClusterControlRootFileToken *token);
 
+/* Runtime local owner only. Borrow the caller's CF-S/X; not early startup. */
+extern ClusterControlRootResult
+cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out);
+
 /* PGRAC: normal online checkpoint only. Actual checkpointer/membership/fence
  * and local WAL flush facts authorize this operation, never caller booleans.
  * Owns CF-S read, outside-X staging, WALR-before-CF-X, and exact file CAS.

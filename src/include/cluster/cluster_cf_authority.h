@@ -142,7 +142,11 @@ extern bool cluster_cf_bak_checkpoint_recoverable(const ControlFileData *bak);
  * the strictly-validated .bak.  Returns true and fills *out when a
  * trustworthy image was found; returns false (and leaves *out untouched)
  * when the read must fail-closed -- the caller raises FATAL/ERROR.  Does not
- * itself ereport, so it is safe on the bootstrap early-read path.
+ * itself ereport.  With cluster.shared_config off this retains the legacy
+ * early-read behavior.  With that profile on, it requires an already-held
+ * clusterwide CF-S/X and an exact live local thread owner, selects only the
+ * root-v2 view and never falls back; it is NOT an early bootstrap reader.
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 extern bool cluster_cf_authority_read(ControlFileData *out);
 
@@ -151,7 +155,9 @@ extern bool cluster_cf_authority_read(ControlFileData *out);
  * .bak, write the new image to pg_control.tmp, fsync it, durable_rename it
  * over the primary and fsync the directory.  The caller must hold CF X and
  * is responsible for the lock; on I/O failure this PANICs (mirroring the
- * stock update_controlfile contract).
+ * stock update_controlfile contract).  The shared_config profile rejects this
+ * untyped write; its common/thread fields require purpose-bound root publishers.
+ * Author: SqlRush <sqlrush@gmail.com>
  */
 extern void cluster_cf_authority_write(const ControlFileData *cf);
 
