@@ -17,6 +17,7 @@
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_authority.h"
+#include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_cf_storage.h"
@@ -3112,6 +3113,42 @@ v2_install_native(ControlFileData *native, ClusterCfImageStage *stage)
 		abort();
 }
 
+/* PGRAC: root configuration references name real canonical immutable files,
+ * never a fake validator returning success. Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_install_config(uint8 bytes[66048], bool foreign)
+{
+	ControlRootImage decoded;
+	ClusterSharedConfigIdentity id;
+	ClusterSharedConfigEntry entry = { -1, "cluster.enabled", "on" };
+	char config[1024], path[MAXPGPATH], hex[65];
+	uint8 hash[32];
+	size_t len;
+
+	if (cluster_control_root_v2_decode(bytes, 66048, v2_storage, TEST_SYSID, &decoded) != 0)
+		abort();
+	memset(&id, 0, sizeof(id));
+	id.system_identifier = TEST_SYSID + (foreign ? 1 : 0);
+	id.database_incarnation = decoded.header.v2.database_incarnation;
+	id.generation = decoded.header.v2.config_generation;
+	id.configured[0] = decoded.header.v2.configured[0];
+	id.configured[1] = decoded.header.v2.configured[1];
+	memcpy(id.storage_uuid, decoded.header.storage_uuid, 16);
+	memcpy(id.authority_uuid, decoded.header.authority_uuid, 16);
+	if (cluster_shared_config_encode(&id, &entry, 1, config, sizeof(config), &len, hash) != 0)
+		abort();
+	path_for(path, sizeof(path), "global/config_images");
+	if (mkdir(path, 0700) != 0 && errno != EEXIST)
+		abort();
+	for (int i = 0; i < 32; ++i)
+		snprintf(hex + 2 * i, 3, "%02x", hash[i]);
+	snprintf(path, sizeof(path), "%s/global/config_images/47-%s.conf", test_root, hex);
+	write_all_or_abort(path, (const uint8 *)config, len);
+	memcpy(bytes + 256, hash, 32);
+	v2_checksums(bytes);
+}
+
 static void
 v2_view_fixture(uint8 bytes[66048], ControlFileData *native, ClusterCfImageStage *stage)
 {
@@ -3130,6 +3167,7 @@ v2_view_fixture(uint8 bytes[66048], ControlFileData *native, ClusterCfImageStage
 	v2_fixture(bytes);
 	memcpy(bytes + 296, stage->image_sha256, 32);
 	v2_checksums(bytes);
+	v2_install_config(bytes, false);
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
 	write_all_or_abort(path, bytes, 66048);
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
@@ -4195,6 +4233,42 @@ UT_TEST(test_v2_runtime_native_inplace_identity_is_never_cleared)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_v2_view_requires_exact_config_object)
+{
+	uint8 bytes[66048];
+	ControlFileData native, out;
+	ClusterCfImageStage stage;
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	char object[MAXPGPATH], path[MAXPGPATH], hex[65];
+
+	for (int n = 0; n < 3; ++n) {
+		v2_view_fixture(bytes, &native, &stage);
+		for (int i = 0; i < 32; ++i)
+			snprintf(hex + 2 * i, 3, "%02x", bytes[256 + i]);
+		snprintf(object, sizeof(object), "%s/global/config_images/47-%s.conf", test_root, hex);
+		if (n == 0)
+			UT_ASSERT_EQ(unlink(object), 0);
+		else if (n == 1)
+			write_all_or_abort(object, (const uint8 *)"corrupt", 7);
+		else {
+			/* Even an exact hash cannot substitute a foreign identity. */
+			v2_install_config(bytes, true);
+			path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+			write_all_or_abort(path, bytes, sizeof(bytes));
+			path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+			write_all_or_abort(path, bytes, sizeof(bytes));
+		}
+		memset(&root, 0xa5, sizeof(root));
+		memset(&out, 0xa5, sizeof(out));
+		memset(&token, 0xa5, sizeof(token));
+		UT_ASSERT(
+			cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &out, &token)
+			!= 0);
+		UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4204,7 +4278,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(70);
+	UT_PLAN(71);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -4275,6 +4349,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_runtime_native_reader_selects_own_thread);
 	UT_RUN(test_v2_runtime_reader_never_uses_projection_for_bad_facts);
 	UT_RUN(test_v2_runtime_native_inplace_identity_is_never_cleared);
+	UT_RUN(test_v2_view_requires_exact_config_object);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

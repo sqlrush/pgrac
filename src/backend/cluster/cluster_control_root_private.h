@@ -85,7 +85,8 @@ extern ClusterControlRootResult cluster_control_root_v2_decode(const uint8 *byte
 															   ControlRootImage *out);
 extern ClusterControlRootResult cluster_control_root_v2_encode(ControlRootImage *image);
 
-/* PGRAC: root-selected COMMON image only, not a per-thread startup projection.
+/* PGRAC: root-selected COMMON image plus exact configuration-object binding,
+ * not a per-thread startup projection or GUC-application acknowledgement.
  * Requires an already held clusterwide CF-S/X and verified storage identity.
  * No publication, migration, repair or serving admission. All three outputs
  * are required and cleared on refusal; inputs/outputs must not overlap.

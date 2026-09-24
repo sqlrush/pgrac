@@ -30,6 +30,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
@@ -998,6 +999,27 @@ cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64
 		result = cluster_cf_control_image_read_locked(root->header.v2.control_image_generation,
 													  root->header.v2.control_image_sha256,
 													  system_identifier, common);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			ClusterSharedConfigRef ref;
+			ClusterSharedConfigImage config;
+
+			/* PGRAC: a generation/hash without its exact configuration object
+			 * is not a complete root view. This checks binding/representation,
+			 * not GUC application or permission to serve.
+			 * Author: SqlRush <sqlrush@gmail.com>
+			 */
+			memset(&ref, 0, sizeof(ref));
+			ref.identity.system_identifier = system_identifier;
+			ref.identity.database_incarnation = root->header.v2.database_incarnation;
+			ref.identity.generation = root->header.v2.config_generation;
+			memcpy(ref.identity.storage_uuid, root->header.storage_uuid, 16);
+			memcpy(ref.identity.authority_uuid, root->header.authority_uuid, 16);
+			memcpy(ref.identity.configured, root->header.v2.configured,
+				   sizeof(ref.identity.configured));
+			memcpy(ref.sha256, root->header.v2.config_sha256, 32);
+			result = cluster_shared_config_read_locked(cluster_shared_data_dir, &ref, &config);
+			cluster_shared_config_free(&config);
+		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			make_file_token(root, token);
 			if (token->file_txn_seq == 0)

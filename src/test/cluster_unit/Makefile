@@ -120,6 +120,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_ko \
         test_cluster_hw_snapshot \
         test_cluster_cf_authority \
+		test_cluster_shared_config \
 		test_cluster_control_root \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
@@ -414,6 +415,9 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
+# PGRAC: real configuration object tests have their own link rule.
+# Author: SqlRush <sqlrush@gmail.com>
+SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 
 # The included production wait loop has disabled diagnostic probes.
 test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
@@ -1314,6 +1318,14 @@ test_cluster_hw_snapshot: test_cluster_hw_snapshot.c unit_test.h $(CLUSTER_VERSI
 # PGRAC: immutable image hashes use libpgcommon and configured crypto libraries.
 # Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_CF_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_cf_authority.o
+# PGRAC: real immutable configuration codec and filesystem reader.
+# Author: SqlRush <sqlrush@gmail.com>
+CLUSTER_SHARED_CONFIG_O = $(top_builddir)/src/backend/cluster/cluster_shared_config.o
+test_cluster_shared_config: test_cluster_shared_config.c unit_test.h $(CLUSTER_SHARED_CONFIG_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SHARED_CONFIG_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 test_cluster_cf_authority: test_cluster_cf_authority.c unit_test.h \
 		$(CLUSTER_CF_AUTHORITY_O) $(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -1327,10 +1339,10 @@ CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_roo
 # unit binary does not drag in backend palloc/elog/ShmemVariableCache
 # machinery; err*/BasicOpenFile are stubbed in the test file.
 test_cluster_control_root: test_cluster_control_root.c unit_test.h \
-		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
+		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		xlogreader_fs.o \
