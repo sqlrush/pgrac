@@ -1,0 +1,5 @@
+# Author: SqlRush <sqlrush@gmail.com>
+comment = 'PGRAC native shared-configuration policy tests'
+default_version = '1.0'
+module_pathname = '$libdir/test_pgrac_shared_config'
+relocatable = true

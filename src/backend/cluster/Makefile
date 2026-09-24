@@ -50,6 +50,7 @@ OBJS = \
 	cluster_backup_manifest.o \
 	cluster_cf_authority.o \
 	cluster_shared_config.o \
+	cluster_shared_config_guc.o \
 	cluster_control_root.o \
 	cluster_formation_marker.o \
 	cluster_page_version.o \

@@ -779,10 +779,57 @@ UT_TEST(test_publication_preconditions)
 	cleanup_stage();
 }
 
+static unsigned visit_calls, refuse_visit;
+static ClusterControlRootResult
+check_visit(const ClusterSharedConfigEntry *entry, void *arg)
+{
+	const ClusterSharedConfigEntry *expected = arg;
+	unsigned n = visit_calls++;
+	if (entry->node_id != expected[n].node_id || strcmp(entry->name, expected[n].name)
+		|| strcmp(entry->value, expected[n].value))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	return visit_calls == refuse_visit ? CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+									   : CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+UT_TEST(test_visitor_exact_literals_and_refusal)
+{
+	char bytes[1024];
+	ClusterSharedConfigRef ref;
+	ClusterSharedConfigEntry expected[] = { { -1, "cluster.enabled", "on" },
+											{ -1, "test.label", "a'b\\中文" },
+											{ 0, "port", "5432" },
+											{ 127, "port", "5433" } };
+	fixture(bytes, sizeof(bytes), body, &ref);
+	visit_calls = refuse_visit = 0;
+	UT_ASSERT_EQ(cluster_shared_config_visit(bytes, strlen(bytes), &ref, check_visit, expected), 0);
+	UT_ASSERT_EQ(visit_calls, 4);
+	visit_calls = 0;
+	refuse_visit = 2;
+	UT_ASSERT_EQ(cluster_shared_config_visit(bytes, strlen(bytes), &ref, check_visit, expected),
+				 CLUSTER_CONTROL_ROOT_CAS_CONFLICT);
+	UT_ASSERT_EQ(visit_calls, 2);
+}
+
+UT_TEST(test_visitor_validates_whole_object_first)
+{
+	char bytes[1024];
+	ClusterSharedConfigRef ref;
+	fixture(bytes, sizeof(bytes), body, &ref);
+	visit_calls = refuse_visit = 0;
+	bytes[strlen(bytes) - 1] = 'X';
+	UT_ASSERT(cluster_shared_config_visit(bytes, strlen(bytes), &ref, check_visit, NULL) != 0);
+	UT_ASSERT_EQ(visit_calls, 0);
+	digest(bytes, strlen(bytes), ref.sha256);
+	UT_ASSERT(cluster_shared_config_visit(bytes, strlen(bytes), &ref, check_visit, NULL) != 0);
+	UT_ASSERT_EQ(visit_calls, 0);
+	UT_ASSERT(cluster_shared_config_visit(bytes, strlen(bytes), &ref, NULL, NULL) != 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_independent_canonical_input);
 	UT_RUN(test_encoder_matches_independent_bytes);
 	UT_RUN(test_exact_scope_lookup);
@@ -804,6 +851,8 @@ main(void)
 	UT_RUN(test_install_sync_retry_after_unlink);
 	UT_RUN(test_sync_failed_cancel_never_resurrects);
 	UT_RUN(test_publication_preconditions);
+	UT_RUN(test_visitor_exact_literals_and_refusal);
+	UT_RUN(test_visitor_validates_whole_object_first);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

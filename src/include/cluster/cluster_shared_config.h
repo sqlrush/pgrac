@@ -71,6 +71,52 @@ extern ClusterControlRootResult cluster_shared_config_read_locked(const char *sh
 																  ClusterSharedConfigImage *out);
 extern void cluster_shared_config_free(ClusterSharedConfigImage *image);
 
+/* Read-only inspection. The entire object is validated before the first
+ * callback; callback entries are borrowed only for that invocation. A callback
+ * refusal propagates immediately. This is not an atomic application API.
+ */
+typedef ClusterControlRootResult (*ClusterSharedConfigVisitor)(
+	const ClusterSharedConfigEntry *entry, void *arg);
+extern ClusterControlRootResult cluster_shared_config_visit(const char *bytes, size_t len,
+															const ClusterSharedConfigRef *ref,
+															ClusterSharedConfigVisitor visitor,
+															void *arg);
+
+typedef enum ClusterSharedConfigPolicyReason {
+	CLUSTER_CONFIG_POLICY_OK = 0,
+	CLUSTER_CONFIG_POLICY_FORMAT,
+	CLUSTER_CONFIG_POLICY_UNKNOWN,
+	CLUSTER_CONFIG_POLICY_CONTEXT,
+	CLUSTER_CONFIG_POLICY_UNSUPPORTED,
+	CLUSTER_CONFIG_POLICY_SCOPE,
+	CLUSTER_CONFIG_POLICY_COLD_ONLY,
+	CLUSTER_CONFIG_POLICY_REFERENCE,
+	CLUSTER_CONFIG_POLICY_VALUE
+} ClusterSharedConfigPolicyReason;
+
+/* Diagnostic counts, never an application ACK or a complete-profile permit.
+ * No values (potential secrets) are copied into diagnostics. In-memory only.
+ */
+typedef struct ClusterSharedConfigPolicyReport {
+	ClusterSharedConfigPolicyReason reason;
+	int node_id;
+	char name[CLUSTER_SHARED_CONFIG_MAX_NAME + 1];
+	uint32 checked_entries;
+	uint32 restart_entries;
+	uint32 cold_entries;
+} ClusterSharedConfigPolicyReport;
+
+/* Requires the registered native GUC engine. Checks do not assign settings.
+ * online_change applies to ONE changed entry, not unchanged cold entries in a
+ * full image. SQL permission checks and exact old/new diff belong to publisher.
+ */
+extern ClusterControlRootResult
+cluster_shared_config_check_entry(const ClusterSharedConfigEntry *entry, bool online_change,
+								  ClusterSharedConfigPolicyReport *report);
+extern ClusterControlRootResult
+cluster_shared_config_check_gucs(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+								 ClusterSharedConfigPolicyReport *report);
+
 /* PGRAC: publisher-owned memory, not persistent/wire/shared-memory state.
  * Prepare does not publish. Install borrows CF-X, held by the same caller
  * through root CAS. Discard never removes formal objects. No GUC policy or
@@ -103,5 +149,12 @@ extern ClusterControlRootResult cluster_shared_config_install(const char *shared
 															  ClusterSharedConfigStage *stage);
 extern ClusterControlRootResult cluster_shared_config_discard(const char *shared_root,
 															  ClusterSharedConfigStage *stage);
+
+/* Native policy before any staging I/O. Not a root publish or application. */
+extern ClusterControlRootResult
+cluster_shared_config_prepare_gucs(const char *shared_root, const char *bytes, size_t len,
+								   const ClusterSharedConfigRef *ref,
+								   const uint8 operation_uuid[16], ClusterSharedConfigStage *out,
+								   ClusterSharedConfigPolicyReport *report);
 
 #endif

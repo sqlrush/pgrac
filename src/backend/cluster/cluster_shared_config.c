@@ -344,6 +344,50 @@ cluster_shared_config_validate(const char *bytes, size_t len, const ClusterShare
 }
 
 ClusterControlRootResult
+cluster_shared_config_visit(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+							ClusterSharedConfigVisitor visitor, void *arg)
+{
+	ClusterControlRootResult result;
+	uint32 count;
+	size_t offset;
+	char header[CONFIG_HEADER_CAPACITY];
+	char value[CLUSTER_SHARED_CONFIG_MAX_VALUE + 1];
+	ConfigLine line;
+
+	if (visitor == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_shared_config_validate(bytes, len, ref, &count);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	offset = config_header(&ref->identity, header);
+	while (offset < len) {
+		ClusterSharedConfigEntry entry;
+		size_t used = 0;
+		if (!config_next(bytes, len, &offset, &ref->identity, &line))
+			return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+		if (line.key[0] == 'c') {
+			entry.node_id = CLUSTER_SHARED_CONFIG_COMMON;
+			entry.name = line.key + 7;
+		} else {
+			entry.node_id
+				= (line.key[4] - '0') * 100 + (line.key[5] - '0') * 10 + line.key[6] - '0';
+			entry.name = line.key + 8;
+		}
+		for (const char *pos = line.value; pos < line.end; ++pos) {
+			value[used++] = *pos;
+			if (*pos == '\'')
+				++pos;
+		}
+		value[used] = '\0';
+		entry.value = value;
+		result = visitor(&entry, arg);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
 cluster_shared_config_lookup(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
 							 int node_id, const char *name, char *value, size_t capacity)
 {

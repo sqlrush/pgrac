@@ -4,6 +4,8 @@ subdir = src/test/modules
 top_builddir = ../../..
 include $(top_builddir)/src/Makefile.global
 
+# PGRAC: include the native shared-config policy test module.
+# Author: SqlRush <sqlrush@gmail.com>
 SUBDIRS = \
 		  brin \
 		  commit_ts \
@@ -27,6 +29,7 @@ SUBDIRS = \
 		  test_misc \
 		  test_oat_hooks \
 		  test_pgrac_r4_native_tx \
+		  test_pgrac_shared_config \
 		  test_parser \
 		  test_pg_dump \
 		  test_predtest \
