@@ -51,11 +51,20 @@ class RejoinState:
 
 
 @dataclass(frozen=True)
+class RejoinCommit:
+    database_incarnation: int
+    formation_epoch: int
+    root_generation: int
+    decision_digest: str
+
+
+@dataclass(frozen=True)
 class DenyState:
     identity: DrainIdentity
     phases: tuple
     successor_operation_id: str = ""
     rejoin: RejoinState = None
+    completion: RejoinCommit = None
 
 
 def _hex(value, size):
@@ -103,6 +112,24 @@ def _rejoin_payload(value):
         return _rejoin_intent(RejoinIntent(**value))
     except (TypeError, ValueError):
         raise TargetJournalError("TARGET_REJOIN_INTENT") from None
+
+
+def _rejoin_commit(value):
+    if (type(value) is not RejoinCommit
+            or any(not _uint(getattr(value, field)) for field in
+                   ("database_incarnation", "formation_epoch", "root_generation"))
+            or not _hex(value.decision_digest, 64)):
+        raise TargetJournalError("TARGET_REJOIN_COMMIT")
+    return value
+
+
+def _commit_payload(value):
+    try:
+        if type(value) is not dict:
+            raise ValueError
+        return _rejoin_commit(RejoinCommit(**value))
+    except (TypeError, ValueError):
+        raise TargetJournalError("TARGET_REJOIN_COMMIT") from None
 
 
 def _identity_reference(identity):
@@ -187,6 +214,11 @@ class TargetJournal:
                 os.fsync(self.directory_fd)
             else:
                 self._replay()
+                # A valid tail may still be in page cache after an interrupted
+                # append. Establish durability before exposing replayed state
+                # or allowing an idempotent acknowledgement without a write.
+                os.fsync(self.fd)
+                os.fsync(self.directory_fd)
         except BaseException as error:
             self.close()
             if isinstance(error, OSError):
@@ -230,6 +262,8 @@ class TargetJournal:
             return self._owner_transition(payload)
         if kind == "BOOT_RECONCILE":
             return self._boot_transition(payload)
+        if kind == "REJOIN_COMMIT":
+            return self._commit_transition(payload)
         raise TargetJournalError("TARGET_JOURNAL_TRANSITION")
 
     def _deny_transition(self, payload):
@@ -239,18 +273,27 @@ class TargetJournal:
         if previous is not None:
             old = previous.identity
             immutable = ("guest_uuid", "mapping_generation", "protected_set_digest", "route_digests")
-            if (previous.successor_operation_id or requested.attempt <= old.attempt
+            if (previous.successor_operation_id or previous.completion is not None
+                    or requested.attempt <= old.attempt
                     or (previous.rejoin is not None and previous.rejoin.phase != 4)
                     or (previous.rejoin is not None and old.target_boot_id != requested.target_boot_id)
                     or any(getattr(requested, field) != getattr(old, field) for field in immutable)):
                 raise TargetJournalError("TARGET_JOURNAL_IDENTITY_DRIFT")
             if old.target_boot_id == requested.target_boot_id:
                 phases = previous.phases
-        elif (len(self.states) >= 128 or any(not state.successor_operation_id
+        elif (len(self.states) >= 128 or any(not state.successor_operation_id and state.completion is None
                                             and state.identity.guest_uuid == requested.guest_uuid
                                             for state in self.states.values())):
             raise TargetJournalError("TARGET_JOURNAL_OWNER_CONFLICT")
-        return {**self.states, requested.operation_id:
+        states = dict(self.states)
+        if previous is None:
+            # A fresh fence closes the prior terminal lineage atomically. An
+            # old successful completion can no longer be replied to as current.
+            for key, state in self.states.items():
+                if (not state.successor_operation_id and state.completion is not None
+                        and state.identity.guest_uuid == requested.guest_uuid):
+                    states[key] = replace(state, successor_operation_id=requested.operation_id)
+        return {**states, requested.operation_id:
                 DenyState(requested, phases, rejoin=previous.rejoin if previous else None)}
 
     def _route_transition(self, payload):
@@ -304,7 +347,7 @@ class TargetJournal:
                 or not _hex(reference["operation_id"], 32) or not _hex(reference["identity_digest"], 64)):
             raise TargetJournalError("TARGET_REJOIN_IDENTITY")
         state = self.states.get(reference["operation_id"])
-        if (state is None or state.successor_operation_id
+        if (state is None or state.successor_operation_id or state.completion is not None
                 or not hmac.compare_digest(reference["identity_digest"],
                                             _identity_reference(state.identity)["identity_digest"])):
             raise TargetJournalError("TARGET_REJOIN_IDENTITY")
@@ -340,7 +383,7 @@ class TargetJournal:
                 or not _hex(reference["operation_id"], 32) or not _hex(reference["identity_digest"], 64)):
             raise TargetJournalError("TARGET_REJOIN_IDENTITY")
         state = self.states.get(reference["operation_id"])
-        if (state is None or state.successor_operation_id
+        if (state is None or state.successor_operation_id or state.completion is not None
                 or not hmac.compare_digest(reference["identity_digest"],
                                             _identity_reference(state.identity)["identity_digest"])):
             raise TargetJournalError("TARGET_REJOIN_IDENTITY")
@@ -402,6 +445,17 @@ class TargetJournal:
         rejoin = replace(state.rejoin, phase=4) if state.rejoin is not None else None
         return {**self.states, old.operation_id:
                 replace(state, identity=new, phases=(0,) * len(state.phases), rejoin=rejoin)}
+
+    def _commit_transition(self, payload):
+        if set(payload) != {"identity", "intent", "completion"}:
+            raise TargetJournalError("TARGET_REJOIN_COMMIT_RECORD")
+        state = self._owner_predecessor(payload["identity"])
+        intent, completion = _rejoin_payload(payload["intent"]), _commit_payload(payload["completion"])
+        if (state.rejoin is None or state.rejoin.intent != intent
+                or state.rejoin.phase != 3 or not state.rejoin.refresh_started
+                or any(phase != 3 for phase in state.phases)):
+            raise TargetJournalError("TARGET_REJOIN_COMMIT_UNPREPARED")
+        return {**self.states, state.identity.operation_id: replace(state, completion=completion)}
 
     def _replay(self):
         chunks, size = [], 0
@@ -494,7 +548,7 @@ class TargetJournal:
         if intent is not None:
             intent = _rejoin_intent(intent)
         state = self.states.get(requested.operation_id)
-        if state is None or state.successor_operation_id:
+        if state is None or state.successor_operation_id or state.completion is not None:
             raise TargetJournalError("TARGET_BOOT_IDENTITY")
         if state.identity == requested:
             if ((state.rejoin is None and intent is None)
@@ -536,13 +590,15 @@ class TargetJournal:
     def denied(self):
         """Unresolved/restart-denial obligations, not proof of physical absence."""
         self._usable()
-        return tuple(state for state in self.states.values() if not state.successor_operation_id)
+        return tuple(state for state in self.states.values()
+                     if not state.successor_operation_id and state.completion is None)
 
     def _current_rejoin_owner(self, identity):
         self._usable()
         identity = _identity(identity)
         state = self.states.get(identity.operation_id)
-        if state is None or state.successor_operation_id or state.identity != identity:
+        if (state is None or state.successor_operation_id or state.completion is not None
+                or state.identity != identity):
             raise TargetJournalError("TARGET_REJOIN_IDENTITY")
         return state
 
@@ -578,7 +634,7 @@ class TargetJournal:
         self._usable()
         identity, intent = _identity(identity), _rejoin_intent(intent)
         state = self.states.get(identity.operation_id)
-        if state is None or state.successor_operation_id:
+        if state is None or state.successor_operation_id or state.completion is not None:
             raise TargetJournalError("TARGET_REJOIN_IDENTITY")
         if state.identity == identity and state.rejoin is not None and state.rejoin.intent == intent:
             rejoin = state.rejoin
@@ -610,6 +666,28 @@ class TargetJournal:
         """Retire late grants before compensating OFF/drain under current owner."""
         self._adopt_owner(identity, intent, "revoke")
 
+    def commit_rejoin(self, identity, intent, completion):
+        """Consume the trusted membership owner's durable completion decision.
+
+        Internal journal API only: caller must verify actual committed root
+        evidence before entering. No provider observation or digest alone is
+        authority. This neither changes native permissions nor grants DB OPEN.
+        The same historical REFRESH identity survives a lost ACK/target reboot;
+        it is not reinterpreted as a current-boot isolation proof.
+        """
+        self._usable()
+        identity, intent, completion = _identity(identity), _rejoin_intent(intent), _rejoin_commit(completion)
+        state = self.states.get(identity.operation_id)
+        if (state is None or state.successor_operation_id or state.identity != identity
+                or state.rejoin is None or state.rejoin.intent != intent):
+            raise TargetJournalError("TARGET_REJOIN_COMMIT_IDENTITY")
+        if state.completion is not None:
+            if state.completion != completion:
+                raise TargetJournalError("TARGET_REJOIN_COMMIT_CONFLICT")
+            return
+        self._append("REJOIN_COMMIT", {"identity": _identity_reference(identity),
+                                      "intent": asdict(intent), "completion": asdict(completion)})
+
     def supersede_rejoin(self, identity, victim_incarnation):
         """New authorized fence of the candidate; retain exact revoked lineage.
 
@@ -640,6 +718,7 @@ class TargetJournal:
         self._usable()
         state = self.states.get(operation_id)
         return (state is not None and not state.successor_operation_id
+                and state.completion is None
                 and (state.rejoin is None or state.rejoin.phase == 4)
                 and state.identity.target_boot_id == target_boot_id
                 and all(phase == 3 for phase in state.phases))
