@@ -34,7 +34,7 @@ class ServiceConfigTests(unittest.TestCase):
                                  "certificate": str(self.directory / "server.pem"),
                                  "private_key": str(self.directory / "server.key")},
                          "peer_pins": ["ab" * 32], "target_boot_id": "bc" * 16,
-                         "command_timeout_ms": 120000}
+                         "command_timeout_ms": 120000, "service_mode": "normal"}
         self.write()
 
     def write(self):
@@ -54,6 +54,10 @@ class ServiceConfigTests(unittest.TestCase):
         self.assertEqual(config.tls.private_key, str(self.directory / "server.key"))
         self.assertEqual(config.tls.owner_uid, os.geteuid())
         self.assertEqual(config.state_directory, str(self.directory / "state"))
+        self.assertEqual(config.service_mode, "normal")
+        self.document["service_mode"] = "closed-reconcile"
+        self.write()
+        self.assertEqual(self.load().service_mode, "closed-reconcile")
 
     def test_bad_network_identity_or_envelope_never_defaults(self):
         original = deepcopy(self.document)
@@ -64,7 +68,8 @@ class ServiceConfigTests(unittest.TestCase):
                            ("command_timeout_ms", True), ("version", True),
                            ("target_boot_id", "00" * 16), ("target_boot_id", "bad"),
                            ("peer_pins", []), ("peer_pins", ["ab" * 32] * 2),
-                           ("peer_pins", ["00" * 32]), ("peer_pins", "ab" * 32)):
+                           ("peer_pins", ["00" * 32]), ("peer_pins", "ab" * 32),
+                           ("service_mode", True), ("service_mode", "auto")):
             self.document = {**original, key: value}
             self.write()
             with self.subTest(key=key, value=value), self.assertRaises(TargetJournalError):

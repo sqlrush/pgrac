@@ -6,7 +6,8 @@ Responses are observations, never isolation certificates or DB admission.
 
 import time
 
-from target_command import REJOIN_ACTIONS, decode_command
+from target_command import REJOIN_ACTIONS, decode_command, rejoin_intent
+from target_closed import closed_inventory, complete_closed_drain, prepare_closed_deny
 from target_inventory import resolve_routes
 from target_journal import TargetJournal, TargetJournalError, _canonical, _hex, _uint
 import target_operation as operation
@@ -19,7 +20,7 @@ def _fresh(deadline, target_boot_id):
         raise TargetJournalError("TARGET_COMMAND_CHANGED")
 
 
-def dispatch_target(request, registry, journal, root, connection, *, startup_config=None):
+def dispatch_target(request, registry, journal, root, connection, *, startup_config=None, closed_reconcile=False):
     """Execute serially under the owner's exclusive journal/config ownership.
 
     Only serve_one creates the request after TLS peer verification; no untrusted
@@ -28,7 +29,7 @@ def dispatch_target(request, registry, journal, root, connection, *, startup_con
     The enclosing owner must bound native calls with its worker watchdog.
     """
     try:
-        if (type(request) is not AuthenticatedTargetRequest
+        if (type(closed_reconcile) is not bool or type(request) is not AuthenticatedTargetRequest
                 or not _hex(request.peer_sha256, 64)
                 or not _uint(request.deadline_mono_ns)
                 or time.monotonic_ns() >= request.deadline_mono_ns
@@ -39,11 +40,18 @@ def dispatch_target(request, registry, journal, root, connection, *, startup_con
             raise TargetJournalError("TARGET_COMMAND_CONTEXT")
         document = decode_command(request.payload)
         action = document["action"]
+        if closed_reconcile and action not in ("identity", "prepare_deny", "complete_off",
+                                               "rejoin_prepare_revoke", "rejoin_complete_off"):
+            raise TargetJournalError("TARGET_COMMAND_CLOSED_MODE")
         states = journal.denied()  # Also refuses a poisoned or closed journal.
         target_boot = operation._kernel_boot_id()
         if not _hex(target_boot, 32):
             raise TargetJournalError("TARGET_COMMAND_BOOT")
         if action == "identity":
+            if closed_reconcile:
+                with closed_inventory(registry, journal, root, startup_config,
+                                      target_boot, request.deadline_mono_ns):
+                    pass
             _fresh(request.deadline_mono_ns, target_boot)
             return _canonical({"version": 1, "status": "IDENTITY_ONLY",
                                "challenge": document["challenge"], "target_boot_id": target_boot,
@@ -59,6 +67,21 @@ def dispatch_target(request, registry, journal, root, connection, *, startup_con
         identity = registry.drain_identity(document["node_id"], document["operation_id"],
                                            document["attempt"], document["daemon_boot_id"], target_boot)
         _fresh(request.deadline_mono_ns, target_boot)
+        if closed_reconcile:
+            intent = rejoin_intent(document) if action in REJOIN_ACTIONS else None
+            if action in ("prepare_deny", "rejoin_prepare_revoke"):
+                prepare_closed_deny(registry, journal, root, identity, document["node_id"], startup_config,
+                                    request.deadline_mono_ns, intent=intent)
+                result = {"status": "REJOIN_REVOKED" if intent is not None else "DENY_RECORDED"}
+            else:
+                phases = complete_closed_drain(registry, journal, root, connection, identity, document["node_id"],
+                                               startup_config, request.deadline_mono_ns, intent=intent)
+                result = {"status": "OFF_DRAIN_UNCERTIFIED", "route_phases": list(phases)}
+            _fresh(request.deadline_mono_ns, target_boot)
+            response = {**document, **result, "journal_sequence": journal.sequence,
+                        "journal_digest": journal.digest}
+            del response["action"]
+            return _canonical(response)
         if action in REJOIN_ACTIONS:
             result = rejoin_operation(document, registry, journal, root, connection,
                                       identity, startup_config, request.deadline_mono_ns)

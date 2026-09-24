@@ -104,27 +104,35 @@ class ServiceRuntimeTests(unittest.TestCase):
         bindings = self.registry.node(2).bindings
         target = Object(wwn=bindings[0].target, fabric_module=Object(name="iscsi"), tpgs=[])
         target.path = "/sys/kernel/config/target/iscsi/" + target.wwn
-        config = {}
+        config, stores, links = {}, [], {}
         for b in bindings:
             tpg = Object(tag=b.tpg, parent_target=target, path=target.path + f"/tpgt_{b.tpg}",
                          get_attribute=lambda key: {"generate_node_acls": "0", "cache_dynamic_acls": "0",
                                                      "demo_mode_write_protect": "1"}[key],
                          get_parameter=lambda key: {"ErrorRecoveryLevel": "0"}[key])
             target.tpgs.append(tpg)
+            config[tpg.path + "/enable"] = "0"
             portal = Object(ip_address=b.portal, port=b.port, parent_tpg=tpg,
                             path=tpg.path + f"/np/{b.portal}:{b.port}")
             config[portal.path + "/iser"] = config[portal.path + "/cxgbit"] = "0"
             storage = Object(plugin="fileio", path=b.storage_path, wwn=b.serial,
                              udev_path=b.file_path, size=b.size)
+            stores.append(storage)
             config[storage.path + "/info"] = f"File: {b.file_path}  Size: {b.size}  Mode: O_DSYNC Async: 0\n"
             config[storage.path + "/attrib/emulate_write_cache"] = "0"
             lun = Object(lun=b.tpg_lun, path=tpg.path + f"/lun/lun_{b.tpg_lun}", storage_object=storage)
             acl = Object(node_wwn=b.initiator, parent_tpg=tpg, path=tpg.path + "/acls/" + b.initiator)
             acl.mapped_luns = [Object(mapped_lun=b.mapped_lun, tpg_lun=lun,
                                       path=acl.path + f"/lun_{b.mapped_lun}")]
+            links[acl.mapped_luns[0].path] = lun.path
             tpg.node_acls, tpg.luns, tpg.network_portals = [acl], [lun], [portal]
-        with patch("target_inventory._read_config", side_effect=config.__getitem__):
-            yield Object(targets=[target]), object()
+        def mapped_link(path, expected):
+            if links[path] != expected:
+                raise TargetJournalError("TARGET_LUN_IDENTITY")
+            return "fixture-link"
+        with patch("target_inventory._read_config", side_effect=config.__getitem__), \
+                patch("target_inventory._mapped_link", side_effect=mapped_link):
+            yield Object(targets=[target], storage_objects=stores), object()
 
     def spawn(self):
         read_fd, write_fd = os.pipe()
@@ -229,6 +237,19 @@ class ServiceRuntimeTests(unittest.TestCase):
         reply = self.request({"version": 1, "action": "identity", "challenge": "ab" * 16})
         self.assertEqual(reply["status"], "IDENTITY_ONLY")
         self.assertEqual(self.stop(), 0)
+
+    def test_closed_mode_inspects_old_boot_without_reset_or_permission_restore(self):
+        old = self.registry.drain_identity(2, "ad" * 16, 1, "ae" * 16, "af" * 16)
+        with TargetJournal(str(self.state), self.registry.inventory_digest) as journal:
+            journal.deny(old)
+        before = (self.state / "deny.journal").read_bytes()
+        self.c.document["service_mode"] = "closed-reconcile"
+        self.c.write()
+        self.start()
+        reply = self.request(dict(version=1, action="identity", challenge="ab" * 16))
+        self.assertEqual(reply["target_boot_id"], self.boot_id)
+        self.assertEqual(self.stop(), 0)
+        self.assertEqual((self.state / "deny.journal").read_bytes(), before)
 
 
 if __name__ == "__main__":

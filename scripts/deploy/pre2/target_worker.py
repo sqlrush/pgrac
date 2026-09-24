@@ -67,7 +67,7 @@ class TargetWorker:
     """
 
     def __init__(self, directory, registry, context, peer_pins, native_factory,
-                 *, startup_config=None, owner_uid=0):
+                 *, startup_config=None, owner_uid=0, closed_reconcile=False):
         self.lock_fd = self.directory_fd = self.active_pid = None
         self._reaped_status = None
         self.poisoned = False
@@ -75,8 +75,10 @@ class TargetWorker:
         self.directory, self.owner_uid = directory, owner_uid
         self.registry, self.context, self.peer_pins = registry, context, peer_pins
         self.native_factory, self.startup_config = native_factory, startup_config
+        self.closed_reconcile = closed_reconcile
         if (sys.platform != "linux" or type(registry) is not TargetRegistry
-                or not callable(native_factory) or type(owner_uid) is not int or owner_uid < 0):
+                or not callable(native_factory) or type(owner_uid) is not int or owner_uid < 0
+                or type(closed_reconcile) is not bool):
             raise TargetJournalError("TARGET_WORKER_ARGUMENT")
         _policy(context, peer_pins)
         self._process_policy()
@@ -159,7 +161,8 @@ class TargetWorker:
                                    owner_uid=self.owner_uid) as journal:
                     with self.native_factory() as (root, native_connection):
                         return dispatch_target(request, self.registry, journal, root, native_connection,
-                                               startup_config=self.startup_config)
+                                               startup_config=self.startup_config,
+                                               closed_reconcile=self.closed_reconcile)
             serve_one(connection, self.context, self.peer_pins, deadline, dispatch)
             result = 0
         except BaseException:

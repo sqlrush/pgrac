@@ -33,6 +33,7 @@ class ServiceConfig:
     peer_pins: tuple
     target_boot_id: str
     command_timeout_ms: int
+    service_mode: str
 
 
 def load_service_config(path, *, owner_uid=0):
@@ -43,7 +44,7 @@ def load_service_config(path, *, owner_uid=0):
         document = _read_owned(path, owner_uid)
         _keys(document, {"version", "listen_address", "listen_port", "state_directory",
                          "registry_path", "template_path", "tls", "peer_pins", "target_boot_id",
-                         "command_timeout_ms"})
+                         "command_timeout_ms", "service_mode"})
         address = ipaddress.IPv4Address(document["listen_address"])
         if (type(document["version"]) is not int or document["version"] != 1
                 or type(document["listen_address"]) is not str
@@ -51,6 +52,7 @@ def load_service_config(path, *, owner_uid=0):
                 or address.is_multicast or address == ipaddress.IPv4Address("255.255.255.255")
                 or not _uint(document["listen_port"], 65535, 1)
                 or not _uint(document["command_timeout_ms"], 600000, 1)
+                or document["service_mode"] not in ("normal", "closed-reconcile")
                 or not _hex(document["target_boot_id"], 32)
                 or type(document["peer_pins"]) is not list or not 1 <= len(document["peer_pins"]) <= 4
                 or any(not _hex(pin, 64) for pin in document["peer_pins"])
@@ -64,7 +66,7 @@ def load_service_config(path, *, owner_uid=0):
         return ServiceConfig(document["listen_address"], document["listen_port"],
                              document["state_directory"], document["registry_path"], document["template_path"],
                              TlsFiles(**document["tls"], owner_uid=owner_uid), tuple(document["peer_pins"]),
-                             document["target_boot_id"], document["command_timeout_ms"])
+                             document["target_boot_id"], document["command_timeout_ms"], document["service_mode"])
     except Exception:
         raise TargetJournalError("TARGET_SERVICE_CONFIG") from None
 
@@ -78,7 +80,8 @@ def check_service_boot(owner, target_boot_id):
         raise TargetJournalError("TARGET_SERVICE_RECONCILIATION_REQUIRED")
     with TargetJournal(owner.directory, owner.registry.inventory_digest,
                        owner_uid=owner.owner_uid) as journal:
-        if any(state.identity.target_boot_id != target_boot_id for state in journal.denied()):
+        if not owner.closed_reconcile and any(state.identity.target_boot_id != target_boot_id
+                                              for state in journal.denied()):
             raise TargetJournalError("TARGET_SERVICE_RECONCILIATION_REQUIRED")
 
 
@@ -99,7 +102,8 @@ def run_service(config_path):
         context = load_server_context(config.tls, deadline)
         template = _read_owned(config.template_path, 0)
         with TargetWorker(config.state_directory, registry, context, config.peer_pins,
-                          native_handles, startup_config=template) as owner:
+                          native_handles, startup_config=template,
+                          closed_reconcile=config.service_mode == "closed-reconcile") as owner:
             check_service_boot(owner, config.target_boot_id)
             with TargetJournal(owner.directory, registry.inventory_digest) as journal:
                 _closed_template(template, *_layout(registry, journal))
@@ -132,6 +136,8 @@ def serve_listener(listener, owner, config):
     """
     if (type(config) is not ServiceConfig or type(owner) is not TargetWorker
             or not _uint(config.command_timeout_ms, 600000, 1)
+            or config.service_mode not in ("normal", "closed-reconcile")
+            or owner.closed_reconcile != (config.service_mode == "closed-reconcile")
             or listener.family != socket.AF_INET
             or listener.getsockopt(socket.SOL_SOCKET, socket.SO_TYPE) != socket.SOCK_STREAM
             or listener.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN) != 1):

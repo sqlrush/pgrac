@@ -228,6 +228,8 @@ class TargetJournal:
             return self._rejoin_transition(payload, arm=kind == "REJOIN_ARM")
         if kind == "REJOIN_OWNER":
             return self._owner_transition(payload)
+        if kind == "BOOT_RECONCILE":
+            return self._boot_transition(payload)
         raise TargetJournalError("TARGET_JOURNAL_TRANSITION")
 
     def _deny_transition(self, payload):
@@ -385,6 +387,22 @@ class TargetJournal:
             phases = state.phases if state.rejoin is not None and state.rejoin.phase == 4 else (0,) * len(state.phases)
         return {**self.states, old.operation_id: replace(state, identity=new, phases=phases, rejoin=rejoin)}
 
+    def _boot_transition(self, payload):
+        if set(payload) != {"previous", "successor", "intent"}:
+            raise TargetJournalError("TARGET_BOOT_RECORD")
+        state = self._owner_predecessor(payload["previous"])
+        old, new = state.identity, _identity_payload(payload["successor"])
+        intent = None if payload["intent"] is None else _rejoin_payload(payload["intent"])
+        immutable = ("operation_id", "guest_uuid", "mapping_generation", "protected_set_digest", "route_digests")
+        if (new.attempt <= old.attempt or new.target_boot_id == old.target_boot_id
+                or any(getattr(old, key) != getattr(new, key) for key in immutable)
+                or (state.rejoin is None and intent is not None)
+                or (state.rejoin is not None and state.rejoin.intent != intent)):
+            raise TargetJournalError("TARGET_BOOT_IDENTITY")
+        rejoin = replace(state.rejoin, phase=4) if state.rejoin is not None else None
+        return {**self.states, old.operation_id:
+                replace(state, identity=new, phases=(0,) * len(state.phases), rejoin=rejoin)}
+
     def _replay(self):
         chunks, size = [], 0
         while True:
@@ -463,6 +481,29 @@ class TargetJournal:
         payload = asdict(requested)
         payload["route_digests"] = list(requested.route_digests)
         self._append("DENY", payload)
+
+    def reconcile_boot(self, requested, *, intent=None):
+        """Adopt the authenticated owner's later attempt while exports are closed.
+
+        Caller must validate current kernel boot and complete closed namespace.
+        This never invents an attempt, forgets revocation or proves native drain.
+        An exact retry cannot rewind this boot's already recorded progress.
+        """
+        self._usable()
+        requested = _identity(requested)
+        if intent is not None:
+            intent = _rejoin_intent(intent)
+        state = self.states.get(requested.operation_id)
+        if state is None or state.successor_operation_id:
+            raise TargetJournalError("TARGET_BOOT_IDENTITY")
+        if state.identity == requested:
+            if ((state.rejoin is None and intent is None)
+                    or (state.rejoin is not None and state.rejoin.phase == 4 and state.rejoin.intent == intent)):
+                return
+            raise TargetJournalError("TARGET_BOOT_IDENTITY")
+        self._append("BOOT_RECONCILE", {"previous": _identity_reference(state.identity),
+                     "successor": {**asdict(requested), "route_digests": list(requested.route_digests)},
+                     "intent": asdict(intent) if intent is not None else None})
 
     def advance(self, operation_id, target_boot_id, ordinal, phase):
         """Record an actual adapter edge, never an observation of absent state."""
