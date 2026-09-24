@@ -48,6 +48,22 @@ class TargetJournalTests(unittest.TestCase):
         with self.assertRaises(TargetJournalError):
             self.open()
 
+    def test_writable_ancestor_cannot_substitute_protected_journal_directory(self):
+        leaf = self.directory / "protected-leaf"
+        leaf.mkdir(mode=0o700)
+        with TargetJournal(leaf, self.inventory, initialize=True, owner_uid=os.geteuid()) as journal:
+            journal.deny(identity())
+        for mode in (0o770, 0o777):
+            self.directory.chmod(mode)
+            try:
+                with self.subTest(mode=mode), self.assertRaises(TargetJournalError):
+                    with TargetJournal(leaf, self.inventory, owner_uid=os.geteuid()):
+                        pass
+            finally:
+                self.directory.chmod(0o700)
+        with TargetJournal(leaf, self.inventory, owner_uid=os.geteuid()) as journal:
+            self.assertEqual(journal.denied()[0].identity, identity())
+
     def test_explicit_initialization_is_exclusive_and_persistent(self):
         with self.open(initialize=True) as journal:
             self.assertEqual(journal.denied(), ())

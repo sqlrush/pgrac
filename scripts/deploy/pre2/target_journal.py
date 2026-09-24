@@ -86,6 +86,11 @@ def _directory_fd(directory, owner_uid):
     fd = os.open(path.anchor, flags)
     try:
         for component in path.parts[1:]:
+            status = os.fstat(fd)
+            sticky_root = status.st_uid == 0 and status.st_mode & stat.S_ISVTX
+            if (status.st_uid not in (0, owner_uid)
+                    or (status.st_mode & 0o022 and not sticky_root)):
+                raise TargetJournalError("TARGET_JOURNAL_DIRECTORY")
             child = os.open(component, flags, dir_fd=fd)
             os.close(fd)
             fd = child
