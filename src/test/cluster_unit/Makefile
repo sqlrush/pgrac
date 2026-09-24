@@ -50,6 +50,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
         test_pgrac_fenced_target_request \
+        test_pgrac_fenced_pacemaker_owned \
         test_cluster_update_trace test_cluster_cr_dependency \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
@@ -390,6 +391,7 @@ SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker test_pgrac_fenced_cib,$
 # PGRAC: production journal validation is linked into target command tests.
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_command test_pgrac_fenced_target_reply,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_request,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_pgrac_fenced_pacemaker_owned,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_fenced_target_client,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_hw_handoff,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_edge_reader,$(SIMPLE_TESTS))
@@ -1454,6 +1456,16 @@ PGRAC_FENCED_JOURNAL_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_journal_intent.o
 # PGRAC: real frontend command encoder, not a test-only schema implementation.
 PGRAC_FENCED_TARGET_COMMAND_O = $(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_target_command.o
+# PGRAC: production owner checks; only external actions are test boundaries.
+test_pgrac_fenced_pacemaker_owned: test_pgrac_fenced_pacemaker_owned.c unit_test.h \
+		data/pgrac_fence_map_v2_fixture.h \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_pacemaker_owned.o \
+		$(PGRAC_FENCED_CONFIG_O) $(PGRAC_FENCED_TARGET_COMMAND_O) $(PGRAC_FENCED_JOURNAL_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_pacemaker_owned.o \
+		$(PGRAC_FENCED_CONFIG_O) $(PGRAC_FENCED_TARGET_COMMAND_O) $(PGRAC_FENCED_JOURNAL_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(LDFLAGS) $(LIBS) -o $@
 # PGRAC: strict observations do not populate the independent proof readback.
 test_pgrac_fenced_target_request: test_pgrac_fenced_target_request.c unit_test.h \
 		data/pgrac_fence_map_v2_fixture.h \

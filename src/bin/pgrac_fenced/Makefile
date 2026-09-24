@@ -26,6 +26,8 @@ FENCED_OBJS += pgrac_fenced_target_command.o pgrac_fenced_target_reply.o
 FENCED_OBJS += pgrac_fenced_target_client.o
 # PGRAC: existing owned request identity and independent reply expectations.
 FENCED_OBJS += pgrac_fenced_target_request.o
+# PGRAC: durable target preparation before the existing native power owner.
+FENCED_OBJS += pgrac_fenced_pacemaker_owned.o
 # PGRAC: read-only native configuration, never a shadow/file qualification source.
 FENCED_OBJS += pgrac_fenced_cib.o
 FENCEDCTL_OBJS = pgrac-fencedctl.o pgrac_fenced_ctl.o \
