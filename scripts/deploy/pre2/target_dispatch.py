@@ -6,11 +6,12 @@ Responses are observations, never isolation certificates or DB admission.
 
 import time
 
-from target_command import decode_command
+from target_command import REJOIN_ACTIONS, decode_command
 from target_inventory import resolve_routes
 from target_journal import TargetJournal, TargetJournalError, _canonical, _hex, _uint
 import target_operation as operation
 from target_registry import TargetRegistry
+from target_rejoin_operation import rejoin_operation
 from target_transport import AuthenticatedTargetRequest, MAX_FRAME_BYTES
 
 def _fresh(deadline, target_boot_id):
@@ -18,7 +19,7 @@ def _fresh(deadline, target_boot_id):
         raise TargetJournalError("TARGET_COMMAND_CHANGED")
 
 
-def dispatch_target(request, registry, journal, root, connection):
+def dispatch_target(request, registry, journal, root, connection, *, startup_config=None):
     """Execute serially under the owner's exclusive journal/config ownership.
 
     Only serve_one creates the request after TLS peer verification; no untrusted
@@ -58,6 +59,14 @@ def dispatch_target(request, registry, journal, root, connection):
         identity = registry.drain_identity(document["node_id"], document["operation_id"],
                                            document["attempt"], document["daemon_boot_id"], target_boot)
         _fresh(request.deadline_mono_ns, target_boot)
+        if action in REJOIN_ACTIONS:
+            result = rejoin_operation(document, registry, journal, root, connection,
+                                      identity, startup_config, request.deadline_mono_ns)
+            _fresh(request.deadline_mono_ns, target_boot)
+            response = {**document, **result, "journal_sequence": journal.sequence,
+                        "journal_digest": journal.digest}
+            del response["action"]
+            return _canonical(response)
         if action == "prepare_deny":
             # Native census and backing-file pins precede durable preparation.
             # A live guest is allowed: the caller powers it OFF only after ACK.

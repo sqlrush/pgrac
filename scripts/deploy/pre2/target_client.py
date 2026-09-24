@@ -49,12 +49,16 @@ def _reply(payload, command, endpoint, route_count):
     expected = {key: value for key, value in command.items() if key != "action"}
     action = command["action"]
     status = {"identity": "IDENTITY_ONLY", "prepare_deny": "DENY_RECORDED",
-              "complete_off": "OFF_DRAIN_UNCERTIFIED"}[action]
+              "complete_off": "OFF_DRAIN_UNCERTIFIED", "rejoin_restore": "ACCESS_READY_UNCERTIFIED",
+              "rejoin_running": "REJOIN_RUNNING_UNCERTIFIED", "rejoin_prepare_revoke": "REJOIN_REVOKED",
+              "rejoin_complete_off": "OFF_DRAIN_UNCERTIFIED"}[action]
     expected["status"] = status
     fields = {"target_boot_id", "inventory_digest"} if action == "identity" else {
         "journal_sequence", "journal_digest"}
-    if action == "complete_off":
+    if action in ("complete_off", "rejoin_complete_off"):
         fields.add("route_phases")
+    if action == "rejoin_running":
+        fields.add("runtime_id")
     if (reply.keys() != expected.keys() | fields
             or any(type(reply[key]) is not type(value) or reply[key] != value
                    for key, value in expected.items())):
@@ -64,7 +68,10 @@ def _reply(payload, command, endpoint, route_count):
             raise TargetJournalError("TARGET_CLIENT_REPLY_INVENTORY")
     elif not _uint(reply["journal_sequence"]) or not _hex(reply["journal_digest"], 64):
         raise TargetJournalError("TARGET_CLIENT_REPLY_JOURNAL")
-    if action == "complete_off" and (
+    if action == "rejoin_running" and (type(reply["runtime_id"]) is not int
+                                       or not 0 < reply["runtime_id"] < (1 << 32) - 1):
+        raise TargetJournalError("TARGET_CLIENT_REPLY_RUNTIME")
+    if action in ("complete_off", "rejoin_complete_off") and (
             type(reply["route_phases"]) is not list or len(reply["route_phases"]) != route_count
             or any(type(phase) is not int or phase != 3 for phase in reply["route_phases"])):
         raise TargetJournalError("TARGET_CLIENT_REPLY_INCOMPLETE")

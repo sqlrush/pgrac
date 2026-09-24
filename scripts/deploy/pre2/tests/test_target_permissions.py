@@ -42,7 +42,8 @@ class PermissionTests(unittest.TestCase):
             for phase in (1, 2, 3):
                 self.journal.advance(self.identity.operation_id, self.identity.target_boot_id, n, phase)
         self.intent = RejoinIntent(123, 2, 7, 8, "ab" * 32)
-        self.journal.arm_rejoin(self.identity, self.intent)
+        if getattr(self, "arm_initial", True):
+            self.journal.arm_rejoin(self.identity, self.intent)
         self.tpg.node_acls = []
         self.acl.mapped_luns = []
         self.events = []
