@@ -44,6 +44,9 @@ typedef struct PgracFenceMapExpectedV2 {
 	uint8 protected_set_digest[PGRAC_PROTECTED_SET_DIGEST_BYTES];
 } PgracFenceMapExpectedV2;
 
+/* Public-key prefilter only; EVP still performs point/signature verification. */
+extern bool pgrac_fence_ed25519_key_acceptable(const uint8 key[32]);
+
 /* No input/output aliasing. Successful text views borrow immutable packet bytes. */
 extern PgracFenceMapResult
 pgrac_fence_map_v2_verify(const uint8 *bytes, size_t length,

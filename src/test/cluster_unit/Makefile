@@ -1361,10 +1361,14 @@ test_pgrac_protected_set: test_pgrac_protected_set.c unit_test.h \
 
 PGRAC_FENCED_CONFIG_O = \
 	$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_config.o
+# PGRAC: authenticated management readback uses the configured crypto library.
 test_pgrac_fenced_drain: test_pgrac_fenced_drain.c unit_test.h \
-		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o \
+		$(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I$(top_srcdir)/src/bin/pgrac_fenced $< \
-		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o -o $@
+		$(top_builddir)/src/bin/pgrac_fenced/pgrac_fenced_drain.o \
+		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a \
+		$(LDFLAGS) $(LDFLAGS_EX) $(LIBS) -o $@
 
 # Test-only stonith_api_new/delete replacements; never link them into the daemon.
 test_pgrac_fenced_pacemaker: test_pgrac_fenced_pacemaker.c unit_test.h \

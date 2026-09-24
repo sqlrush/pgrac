@@ -608,10 +608,69 @@ UT_TEST(test_signed_map_rejects_tampering_and_all_truncations)
 	}
 }
 
+UT_TEST(test_identity_public_key_cannot_forge_a_map)
+{
+	PgracFenceMapExpectedV2 expected;
+	PgracProtectedSetDecodedV2 decoded, zero = { 0 };
+	uint8 packet[974], key[32] = { 1 };
+
+	UT_ASSERT(signed_fixture(packet, &expected));
+	memset(packet + 910, 0, 64);
+	packet[910] = 1; /* R = identity, S = 0; no private key exists here. */
+	memset(&decoded, 0xa5, sizeof(decoded));
+	UT_ASSERT_NE(pgrac_fence_map_v2_verify(packet, sizeof(packet), key, &expected, &decoded),
+				 PGRAC_FENCE_MAP_OK);
+	UT_ASSERT(memcmp(&decoded, &zero, sizeof(decoded)) == 0);
+}
+
+UT_TEST(test_small_order_and_noncanonical_key_matrix)
+{
+	/* Independent compressed encodings, including both x signs. */
+	const char *small_order[]
+		= { "0000000000000000000000000000000000000000000000000000000000000000",
+			"0100000000000000000000000000000000000000000000000000000000000000",
+			"ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+			"26e8958fc2b227b045c3f489f2ef98f0d5dfac05d3c63339b13802886d53fc05",
+			"c7176a703d4dd84fba3c0b760d10670f2a2053fa2c39ccc64ec7fd7792ac037a" };
+	PgracFenceMapExpectedV2 expected;
+	PgracProtectedSetDecodedV2 decoded, zero = { 0 };
+	uint8 packet[974], key[32];
+
+	UT_ASSERT(!pgrac_fence_ed25519_key_acceptable(NULL));
+	UT_ASSERT(pgrac_fence_ed25519_key_acceptable(map_public_key));
+	UT_ASSERT(signed_fixture(packet, &expected));
+	memset(packet + 910, 0, 64);
+	packet[910] = 1;
+	for (size_t n = 0; n < lengthof(small_order) + 19; ++n) {
+		if (n < lengthof(small_order)) {
+			for (size_t i = 0; i < 32; ++i) {
+				char hex[3] = { small_order[n][2 * i], small_order[n][2 * i + 1], 0 };
+				key[i] = strtoul(hex, NULL, 16);
+			}
+		} else {
+			memset(key, 0xff, sizeof(key));
+			key[0] = 0xed + n - lengthof(small_order); /* p .. 2^255-1 */
+			key[31] = 0x7f;
+		}
+		for (int sign = 0; sign < 2; ++sign) {
+			key[31] = (key[31] & 0x7f) | (sign << 7);
+			UT_ASSERT(!pgrac_fence_ed25519_key_acceptable(key));
+			memset(&decoded, 0xa5, sizeof(decoded));
+			UT_ASSERT_NE(
+				pgrac_fence_map_v2_verify(packet, sizeof(packet), key, &expected, &decoded),
+				PGRAC_FENCE_MAP_OK);
+			UT_ASSERT(memcmp(&decoded, &zero, sizeof(decoded)) == 0);
+		}
+	}
+	/* p-2 is not filtered; EVP is still responsible for full verification. */
+	key[0] = 0xeb;
+	UT_ASSERT(pgrac_fence_ed25519_key_acceptable(key));
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_golden_and_order_invariance);
 	UT_RUN(test_same_storage_different_wal_voting_and_alternate_route);
 	UT_RUN(test_every_top_level_identity_is_bound);
@@ -626,6 +685,8 @@ main(void)
 	UT_RUN(test_signed_map_authenticates_before_use);
 	UT_RUN(test_signed_map_rejects_replay_and_identity_changes);
 	UT_RUN(test_signed_map_rejects_tampering_and_all_truncations);
+	UT_RUN(test_identity_public_key_cannot_forge_a_map);
+	UT_RUN(test_small_order_and_noncanonical_key_matrix);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

@@ -10,8 +10,8 @@
  *    src/bin/pgrac_fenced/pgrac_fenced_drain.h
  *
  * NOTES
- *    PGRAC-original in-memory contract, not a wire or authentication format.
- *    The caller authenticates the helper and independently binds expectations.
+ *    PGRAC-original evidence consumer and authenticated management reply.
+ *    The caller pins the helper key and independently binds current expectations.
  *
  *-------------------------------------------------------------------------
  */
@@ -31,6 +31,12 @@
 #define PGRAC_DRAIN_INVENTORY_COMPLETE UINT32_C(1)
 #define PGRAC_DRAIN_UNSOLICITED_ON_BLOCKED UINT32_C(2)
 #define PGRAC_DRAIN_GLOBAL_COMPLETE UINT32_C(3)
+
+#define PGRAC_DRAIN_FRAME_HEADER_BYTES 176
+#define PGRAC_DRAIN_FRAME_SIGNATURE_BYTES 64
+#define PGRAC_DRAIN_FRAME_MAX_BYTES                                                                \
+	(PGRAC_DRAIN_FRAME_HEADER_BYTES + 8 * PGRAC_PROTECTED_SET_V2_MAX_ROUTES                        \
+	 + PGRAC_DRAIN_FRAME_SIGNATURE_BYTES)
 
 typedef struct PgracFencedDrainIdentityV1 {
 	uint8 operation_id[16];
@@ -64,12 +70,20 @@ typedef enum PgracFencedDrainResult {
 	PGRAC_DRAIN_IDENTITY_MISMATCH,
 	PGRAC_DRAIN_MALFORMED,
 	PGRAC_DRAIN_TARGET_NOT_OFF,
-	PGRAC_DRAIN_INCOMPLETE
+	PGRAC_DRAIN_INCOMPLETE,
+	PGRAC_DRAIN_BAD_SIGNATURE,
+	PGRAC_DRAIN_UNSUPPORTED
 } PgracFencedDrainResult;
 
 /* No aliasing. Out is zero unless every current, authenticated obligation holds. */
 extern PgracFencedDrainResult pgrac_fenced_drain_verify(const PgracFencedDrainIdentityV1 *expected,
 														const PgracFencedDrainEvidenceV1 *observed,
 														PgracFencedReadbackV1 *out);
+
+/* PGRAC: pinned key and current expectation are independent of reply bytes. */
+extern PgracFencedDrainResult
+pgrac_fenced_drain_verify_frame(const PgracFencedDrainIdentityV1 *expected,
+								const uint8 trusted_key[32], const uint8 *bytes, size_t length,
+								PgracFencedReadbackV1 *out);
 
 #endif /* PGRAC_FENCED_DRAIN_H */

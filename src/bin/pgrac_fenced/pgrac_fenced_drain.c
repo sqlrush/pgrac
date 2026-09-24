@@ -17,7 +17,12 @@
  */
 #include "postgres_fe.h"
 
+#include "common/pgrac_fence_map.h"
 #include "pgrac_fenced_drain.h"
+
+#ifdef USE_OPENSSL
+#include <openssl/evp.h>
+#endif
 
 static bool
 present(const uint8 *bytes, size_t length)
@@ -114,4 +119,95 @@ pgrac_fenced_drain_verify(const PgracFencedDrainIdentityV1 *expected,
 	out->io_drain_state = PGRAC_FENCED_IO_DRAIN_DRAINED;
 	memcpy(out->observed_target_uuid, expected->guest_uuid, sizeof(out->observed_target_uuid));
 	return PGRAC_DRAIN_PROVEN;
+}
+
+static uint32
+frame_u32(const uint8 *bytes)
+{
+	return (uint32)bytes[0] | ((uint32)bytes[1] << 8) | ((uint32)bytes[2] << 16)
+		   | ((uint32)bytes[3] << 24);
+}
+
+static uint64
+frame_u64(const uint8 *bytes)
+{
+	return (uint64)frame_u32(bytes) | ((uint64)frame_u32(bytes + 4) << 32);
+}
+
+static PgracFencedDrainResult
+frame_signature(const uint8 *bytes, size_t signed_length, const uint8 trusted_key[32])
+{
+#if defined(USE_OPENSSL) && defined(EVP_PKEY_ED25519)
+	EVP_PKEY *key = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, trusted_key, 32);
+	EVP_MD_CTX *context = EVP_MD_CTX_new();
+	PgracFencedDrainResult result = PGRAC_DRAIN_UNSUPPORTED;
+
+	if (key != NULL && context != NULL && EVP_DigestVerifyInit(context, NULL, NULL, NULL, key) == 1)
+		result = EVP_DigestVerify(context, bytes + signed_length, PGRAC_DRAIN_FRAME_SIGNATURE_BYTES,
+								  bytes, signed_length)
+						 == 1
+					 ? PGRAC_DRAIN_PROVEN
+					 : PGRAC_DRAIN_BAD_SIGNATURE;
+	EVP_MD_CTX_free(context);
+	EVP_PKEY_free(key);
+	return result;
+#else
+	(void)bytes;
+	(void)signed_length;
+	(void)trusted_key;
+	return PGRAC_DRAIN_UNSUPPORTED;
+#endif
+}
+
+/* Authentication precedes parsing facts; authenticated facts still require all obligations. */
+PgracFencedDrainResult
+pgrac_fenced_drain_verify_frame(const PgracFencedDrainIdentityV1 *expected,
+								const uint8 trusted_key[32], const uint8 *bytes, size_t length,
+								PgracFencedReadbackV1 *out)
+{
+	PgracFencedDrainEvidenceV1 observed;
+	PgracFencedDrainRouteV1 routes[PGRAC_PROTECTED_SET_V2_MAX_ROUTES];
+	PgracFencedDrainResult result;
+	uint32 count;
+	uint32 i;
+
+	if (out == NULL)
+		return PGRAC_DRAIN_BAD_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!expectation_valid(expected) || trusted_key == NULL || bytes == NULL
+		|| !present(trusted_key, 32))
+		return PGRAC_DRAIN_BAD_ARGUMENT;
+	if (length < PGRAC_DRAIN_FRAME_HEADER_BYTES + PGRAC_DRAIN_FRAME_SIGNATURE_BYTES
+		|| length > PGRAC_DRAIN_FRAME_MAX_BYTES || memcmp(bytes, "PGRDRN01", 8) != 0
+		|| bytes[8] != 1 || bytes[9] != 0 || bytes[10] != PGRAC_DRAIN_FRAME_HEADER_BYTES
+		|| bytes[11] != 0 || frame_u32(bytes + 12) != length || present(bytes + 160, 16))
+		return PGRAC_DRAIN_MALFORMED;
+	count = frame_u32(bytes + 156);
+	if (count == 0 || count > PGRAC_PROTECTED_SET_V2_MAX_ROUTES
+		|| length != PGRAC_DRAIN_FRAME_HEADER_BYTES + 8 * count + PGRAC_DRAIN_FRAME_SIGNATURE_BYTES)
+		return PGRAC_DRAIN_MALFORMED;
+	if (!pgrac_fence_ed25519_key_acceptable(trusted_key))
+		return PGRAC_DRAIN_BAD_SIGNATURE;
+	result = frame_signature(bytes, length - PGRAC_DRAIN_FRAME_SIGNATURE_BYTES, trusted_key);
+	if (result != PGRAC_DRAIN_PROVEN)
+		return result;
+	memset(&observed, 0, sizeof(observed));
+	memcpy(observed.identity.operation_id, bytes + 16, 16);
+	observed.identity.attempt = frame_u64(bytes + 32);
+	memcpy(observed.identity.daemon_boot_id, bytes + 40, 16);
+	memcpy(observed.identity.target_boot_id, bytes + 56, 16);
+	memcpy(observed.identity.challenge, bytes + 72, 16);
+	memcpy(observed.identity.guest_uuid, bytes + 88, 16);
+	observed.identity.mapping_generation = frame_u64(bytes + 104);
+	memcpy(observed.identity.protected_set_digest, bytes + 112, 32);
+	observed.identity.route_count = frame_u32(bytes + 144);
+	observed.target_state = frame_u32(bytes + 148);
+	observed.completed = frame_u32(bytes + 152);
+	observed.route_count = count;
+	observed.routes = routes;
+	for (i = 0; i < count; ++i) {
+		routes[i].ordinal = frame_u32(bytes + PGRAC_DRAIN_FRAME_HEADER_BYTES + i * 8);
+		routes[i].completed = frame_u32(bytes + PGRAC_DRAIN_FRAME_HEADER_BYTES + i * 8 + 4);
+	}
+	return pgrac_fenced_drain_verify(expected, &observed, out);
 }
