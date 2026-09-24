@@ -148,6 +148,45 @@ class PermissionTests(unittest.TestCase):
         self.assertEqual(len(self.events), 3)
         self.assertFalse(self.journal.completion_recorded(self.identity.operation_id, self.identity.target_boot_id))
 
+    def test_refresh_cannot_repeat_permission_restore(self):
+        api = self.patch_native()
+        self.restore_access(api)
+        self.identity = replace(self.identity, attempt=self.identity.attempt + 1)
+        self.journal.refresh_rejoin(self.identity, self.intent)
+        before = (self.journal.sequence, list(self.events))
+        with self.assertRaises(TargetJournalError):
+            self.restore_access(api)
+        self.assertEqual((self.journal.sequence, self.events), before)
+        self.assertTrue(self.journal.denied()[0].rejoin.refresh_started)
+
+    def test_later_owner_can_compensate_native_access_but_old_one_cannot_restore(self):
+        api = self.patch_native()
+        self.restore_access(api)
+        old = self.identity
+        self.identity = replace(old, attempt=old.attempt + 1, daemon_boot_id="ee" * 16)
+        self.journal.revoke_rejoin(self.identity, self.intent)
+        result = self.revoke(api)
+        self.assertEqual(result.identity, self.identity)
+        self.assertEqual(self.journal.denied()[0].phases, (3, 3, 3, 3))
+        self.assertEqual(self.tpg.node_acls, [])
+        self.identity = old
+        with self.assertRaises(TargetJournalError):
+            self.restore_access(api)
+
+    def test_refreshed_owner_compensation_reaches_native_cleanup_and_exact_retry(self):
+        api = self.patch_native()
+        self.restore_access(api)
+        self.identity = replace(self.identity, attempt=self.identity.attempt + 1)
+        self.journal.refresh_rejoin(self.identity, self.intent)
+        self.identity = replace(self.identity, attempt=self.identity.attempt + 1, daemon_boot_id="ee" * 16)
+        self.journal.revoke_rejoin(self.identity, self.intent)
+        self.assertTrue(self.journal.denied()[0].rejoin.refresh_started)
+        self.assertEqual(self.revoke(api).phase, 4)
+        before = (self.journal.sequence, list(self.events))
+        self.assertEqual(self.revoke(api).phase, 4)
+        self.assertEqual((self.journal.sequence, self.events), before)
+        self.assertEqual(self.journal.denied()[0].phases, (3, 3, 3, 3))
+
     def test_partial_restore_failure_revokes_and_can_be_drained(self):
         api = self.patch_native()
         create = self.create_lun

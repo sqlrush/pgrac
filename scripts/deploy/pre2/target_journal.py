@@ -47,6 +47,7 @@ class RejoinIntent:
 class RejoinState:
     intent: RejoinIntent
     phase: int  # 1 ARMED, 2 RESTORING, 3 ACCESS_READY, 4 REVOKED
+    refresh_started: bool = False  # Provider readback, never DB OPEN.
 
 
 @dataclass(frozen=True)
@@ -225,6 +226,8 @@ class TargetJournal:
             return self._handoff_transition(payload)
         if kind in ("REJOIN_ARM", "REJOIN_PHASE"):
             return self._rejoin_transition(payload, arm=kind == "REJOIN_ARM")
+        if kind == "REJOIN_OWNER":
+            return self._owner_transition(payload)
         raise TargetJournalError("TARGET_JOURNAL_TRANSITION")
 
     def _deny_transition(self, payload):
@@ -236,6 +239,7 @@ class TargetJournal:
             immutable = ("guest_uuid", "mapping_generation", "protected_set_digest", "route_digests")
             if (previous.successor_operation_id or requested.attempt <= old.attempt
                     or (previous.rejoin is not None and previous.rejoin.phase != 4)
+                    or (previous.rejoin is not None and old.target_boot_id != requested.target_boot_id)
                     or any(getattr(requested, field) != getattr(old, field) for field in immutable)):
                 raise TargetJournalError("TARGET_JOURNAL_IDENTITY_DRIFT")
             if old.target_boot_id == requested.target_boot_id:
@@ -306,22 +310,80 @@ class TargetJournal:
         if type(phase) is not int:
             raise TargetJournalError("TARGET_REJOIN_PHASE")
         if arm:
-            if state.rejoin is not None or phase != 1 or any(value != 3 for value in state.phases):
-                raise TargetJournalError("TARGET_REJOIN_NOT_DRAINED")
-            for old in self.states.values():
-                if old.identity.guest_uuid == state.identity.guest_uuid and old.rejoin is not None:
-                    prior = old.rejoin.intent
-                    if (intent.system_identifier != prior.system_identifier
-                            or intent.old_node_id != prior.old_node_id
-                            or intent.candidate_incarnation <= prior.candidate_incarnation):
-                        raise TargetJournalError("TARGET_REJOIN_CANDIDATE_REUSED")
+            if phase != 1:
+                raise TargetJournalError("TARGET_REJOIN_PHASE")
+            self._new_candidate(state, intent)
         elif (state.rejoin is None or state.rejoin.intent != intent
               or not ((state.rejoin.phase, phase) in ((1, 2), (2, 3))
                       or (state.rejoin.phase in (1, 2, 3) and phase == 4))):
             raise TargetJournalError("TARGET_REJOIN_PHASE")
         phases = (0,) * len(state.phases) if phase == 4 else state.phases
+        rejoin = RejoinState(intent, phase) if arm else replace(state.rejoin, phase=phase)
         return {**self.states, state.identity.operation_id:
-                replace(state, phases=phases, rejoin=RejoinState(intent, phase))}
+                replace(state, phases=phases, rejoin=rejoin)}
+
+    def _new_candidate(self, state, intent):
+        if state.rejoin is not None or any(value != 3 for value in state.phases):
+            raise TargetJournalError("TARGET_REJOIN_NOT_DRAINED")
+        for old in self.states.values():
+            if old.identity.guest_uuid == state.identity.guest_uuid and old.rejoin is not None:
+                prior = old.rejoin.intent
+                if (intent.system_identifier != prior.system_identifier
+                        or intent.old_node_id != prior.old_node_id
+                        or intent.candidate_incarnation <= prior.candidate_incarnation):
+                    raise TargetJournalError("TARGET_REJOIN_CANDIDATE_REUSED")
+
+    def _owner_predecessor(self, reference):
+        if (type(reference) is not dict or set(reference) != {"operation_id", "identity_digest"}
+                or not _hex(reference["operation_id"], 32) or not _hex(reference["identity_digest"], 64)):
+            raise TargetJournalError("TARGET_REJOIN_IDENTITY")
+        state = self.states.get(reference["operation_id"])
+        if (state is None or state.successor_operation_id
+                or not hmac.compare_digest(reference["identity_digest"],
+                                            _identity_reference(state.identity)["identity_digest"])):
+            raise TargetJournalError("TARGET_REJOIN_IDENTITY")
+        return state
+
+    def _owner_transition(self, payload):
+        if set(payload) != {"previous", "successor", "intent", "action"}:
+            raise TargetJournalError("TARGET_REJOIN_OWNER_RECORD")
+        state = self._owner_predecessor(payload["previous"])
+        old, new = state.identity, _identity_payload(payload["successor"])
+        intent, action = _rejoin_payload(payload["intent"]), payload["action"]
+        if type(action) is not str or action not in ("authorize", "refresh", "revoke", "fence"):
+            raise TargetJournalError("TARGET_REJOIN_OWNER_ACTION")
+        immutable = ("guest_uuid", "target_boot_id", "mapping_generation",
+                     "protected_set_digest", "route_digests")
+        if any(getattr(old, name) != getattr(new, name) for name in immutable):
+            raise TargetJournalError("TARGET_REJOIN_IDENTITY")
+        if state.rejoin is not None and state.rejoin.intent != intent:
+            raise TargetJournalError("TARGET_REJOIN_INTENT")
+        if action == "fence":
+            if state.rejoin is None or new.operation_id in self.states or len(self.states) >= 128:
+                raise TargetJournalError("TARGET_REJOIN_OWNER_CONFLICT")
+            return {**self.states,
+                    old.operation_id: replace(state, successor_operation_id=new.operation_id),
+                    new.operation_id: DenyState(new, (0,) * len(state.phases),
+                                               rejoin=RejoinState(intent, 4))}
+        if (old.operation_id != new.operation_id or new.attempt < old.attempt
+                or (new.attempt == old.attempt and (old != new or action != "revoke"))
+                or (action != "revoke" and old.daemon_boot_id != new.daemon_boot_id)):
+            raise TargetJournalError("TARGET_REJOIN_IDENTITY")
+        if action == "authorize":
+            self._new_candidate(state, intent)
+            rejoin, phases = RejoinState(intent, 1), state.phases
+        elif action == "refresh":
+            if state.rejoin is None or state.rejoin.phase != 3 or state.rejoin.refresh_started:
+                raise TargetJournalError("TARGET_REJOIN_PHASE")
+            rejoin, phases = replace(state.rejoin, refresh_started=True), state.phases
+        else:
+            if state.rejoin is None:
+                if new.attempt == old.attempt:
+                    raise TargetJournalError("TARGET_REJOIN_IDENTITY")
+                self._new_candidate(state, intent)
+            rejoin = RejoinState(intent, 4) if state.rejoin is None else replace(state.rejoin, phase=4)
+            phases = state.phases if state.rejoin is not None and state.rejoin.phase == 4 else (0,) * len(state.phases)
+        return {**self.states, old.operation_id: replace(state, identity=new, phases=phases, rejoin=rejoin)}
 
     def _replay(self):
         chunks, size = [], 0
@@ -450,7 +512,8 @@ class TargetJournal:
         and reserve the new incarnation. Exact retries do not rewind a phase.
         """
         state, intent = self._current_rejoin_owner(identity), _rejoin_intent(intent)
-        if state.rejoin is not None and state.rejoin.intent == intent and state.rejoin.phase in (1, 2, 3):
+        if (state.rejoin is not None and not state.rejoin.refresh_started
+                and state.rejoin.intent == intent and state.rejoin.phase in (1, 2, 3)):
             return
         self._append("REJOIN_ARM", {"identity": _identity_reference(identity),
                                    "intent": asdict(intent), "phase": 1})
@@ -464,10 +527,72 @@ class TargetJournal:
         state, intent = self._current_rejoin_owner(identity), _rejoin_intent(intent)
         if type(phase) is not int or phase not in (2, 3, 4):
             raise TargetJournalError("TARGET_REJOIN_PHASE")
-        if state.rejoin == RejoinState(intent, phase):
+        if (state.rejoin is not None and state.rejoin.intent == intent
+                and state.rejoin.phase == phase):
             return
         self._append("REJOIN_PHASE", {"identity": _identity_reference(identity),
                                      "intent": asdict(intent), "phase": phase})
+
+    def _adopt_owner(self, identity, intent, action):
+        self._usable()
+        identity, intent = _identity(identity), _rejoin_intent(intent)
+        state = self.states.get(identity.operation_id)
+        if state is None or state.successor_operation_id:
+            raise TargetJournalError("TARGET_REJOIN_IDENTITY")
+        if state.identity == identity and state.rejoin is not None and state.rejoin.intent == intent:
+            rejoin = state.rejoin
+            if ((action == "authorize" and rejoin.phase in (1, 2, 3) and not rejoin.refresh_started)
+                    or (action == "refresh" and rejoin.phase == 3 and rejoin.refresh_started)
+                    or (action == "revoke" and rejoin.phase == 4)):
+                return
+        successor = {**asdict(identity), "route_digests": list(identity.route_digests)}
+        self._append("REJOIN_OWNER", {"previous": _identity_reference(state.identity),
+                                      "successor": successor, "intent": asdict(intent),
+                                      "action": action})
+
+    def authorize_rejoin(self, identity, intent):
+        """Adopt the C AUTHORIZE_ON attempt and arm, in one durable append.
+
+        Caller already invalidated old admissions and reserved the incarnation;
+        native OFF/route validation must still precede restoring any permission.
+        """
+        self._adopt_owner(identity, intent, "authorize")
+
+    def refresh_rejoin(self, identity, intent):
+        """Adopt the C REFRESH_ON attempt without replaying permission or ON.
+
+        Actual ON/current route readback is separate. This is never DB OPEN.
+        """
+        self._adopt_owner(identity, intent, "refresh")
+
+    def revoke_rejoin(self, identity, intent):
+        """Retire late grants before compensating OFF/drain under current owner."""
+        self._adopt_owner(identity, intent, "revoke")
+
+    def supersede_rejoin(self, identity, victim_incarnation):
+        """New authorized fence of the candidate; retain exact revoked lineage.
+
+        This changes only the obligation owner. It proves neither OFF nor drain.
+        The authenticated C request must target this candidate, not the old one.
+        """
+        self._usable()
+        identity = _identity(identity)
+        if not _uint(victim_incarnation):
+            raise TargetJournalError("TARGET_REJOIN_VICTIM")
+        states = [s for s in self.denied() if s.identity.guest_uuid == identity.guest_uuid]
+        if len(states) != 1:
+            raise TargetJournalError("TARGET_REJOIN_OWNER_CONFLICT")
+        state = states[0]
+        if state.rejoin is None or state.rejoin.intent.candidate_incarnation != victim_incarnation:
+            raise TargetJournalError("TARGET_REJOIN_VICTIM")
+        if (state.identity == identity and state.rejoin.phase == 4
+                and any(s.successor_operation_id == identity.operation_id and s.rejoin is not None
+                        and s.rejoin.intent == state.rejoin.intent for s in self.states.values())):
+            return
+        successor = {**asdict(identity), "route_digests": list(identity.route_digests)}
+        self._append("REJOIN_OWNER", {"previous": _identity_reference(state.identity),
+                                      "successor": successor, "intent": asdict(state.rejoin.intent),
+                                      "action": "fence"})
 
     def completion_recorded(self, operation_id, target_boot_id):
         """Past completion facts only; OFF/inventory/deny still need fresh checks."""

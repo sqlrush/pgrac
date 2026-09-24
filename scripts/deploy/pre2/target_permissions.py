@@ -111,7 +111,7 @@ def restore_rejoin_access(registry, journal, root, connection, identity, intent,
         if state.rejoin.phase == 2:
             journal.advance_rejoin(identity, intent, 4)
             raise TargetJournalError("TARGET_REJOIN_REVOKE_REQUIRED")
-        if state.rejoin.phase not in (1, 3):
+        if state.rejoin.phase not in (1, 3) or state.rejoin.refresh_started:
             raise TargetJournalError("TARGET_REJOIN_PHASE")
         template = _access_template(registry, journal, root, node, config)
         observe_off(connection, node.mapping, deadline)

@@ -10,8 +10,10 @@
 #include "postgres.h"
 
 #include <fcntl.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -29,7 +31,47 @@ UT_DEFINE_GLOBALS();
 
 static volatile uint32 *provider_state;
 static const char *owned_journal_path;
+static int target_trace_fd = -1;
 static size_t read_records(int fd, PgracFencedJournalRecordV1 *records, size_t maximum);
+
+/* Optional scratch-fd bridge: records come from the actual fork-local owner. */
+static bool
+trace_target_owner(const char *call)
+{
+	const PgracFencedJournalRecordV1 *record = pgrac_fenced_provider_callback_record();
+	const PgracExternalFenceProtocolRejoinFrameV1 *request;
+	char op[33], boot[33], guest[33], digest[65], gate[65];
+	static const char hex[] = "0123456789abcdef";
+
+	if (target_trace_fd < 0 || record == NULL)
+		return true;
+	if (record->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN)
+		return false;
+	request = &record->intent.request.rejoin;
+	for (size_t i = 0; i < 32; ++i) {
+		digest[2 * i] = hex[record->intent.protected_set_digest[i] >> 4];
+		digest[2 * i + 1] = hex[record->intent.protected_set_digest[i] & 15];
+		gate[2 * i] = hex[request->rejoin_gate_digest[i] >> 4];
+		gate[2 * i + 1] = hex[request->rejoin_gate_digest[i] & 15];
+		if (i < 16) {
+			op[2 * i] = hex[record->operation_id[i] >> 4];
+			op[2 * i + 1] = hex[record->operation_id[i] & 15];
+			boot[2 * i] = hex[record->daemon_boot_id[i] >> 4];
+			boot[2 * i + 1] = hex[record->daemon_boot_id[i] & 15];
+			guest[2 * i] = hex[record->intent.target_uuid[i] >> 4];
+			guest[2 * i + 1] = hex[record->intent.target_uuid[i] & 15];
+		}
+	}
+	op[32] = boot[32] = guest[32] = digest[64] = gate[64] = '\0';
+	return dprintf(target_trace_fd,
+				   "%s %s " UINT64_FORMAT " %s %s " UINT64_FORMAT " %s " UINT64_FORMAT
+				   " %d " UINT64_FORMAT " " UINT64_FORMAT " %s %u %u\n",
+				   call, op, record->intent.attempt, boot, guest, record->mapping_generation,
+				   digest, record->intent.system_identifier, request->old_node_id,
+				   request->old_incarnation, request->candidate_incarnation, gate,
+				   (unsigned)request->opcode, (unsigned)record->target_state)
+		   > 0;
+}
 
 static bool
 callback_matches_durable_event(void)
@@ -71,7 +113,7 @@ test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolve
 static PgracFencedProviderResult
 test_actuate_off(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
 {
-	if (!callback_matches_durable_event())
+	if (!callback_matches_durable_event() || !trace_target_owner("off"))
 		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	if (owned_journal_path != NULL) {
 		PgracFencedJournalRecordV1 records[30];
@@ -105,7 +147,7 @@ static PgracFencedProviderResult
 test_readback(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 			  PgracFencedReadbackV1 *readback)
 {
-	if (!callback_matches_durable_event())
+	if (!callback_matches_durable_event() || !trace_target_owner("readback"))
 		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	(void)deadline_mono_ns;
 	provider_state[2]++;
@@ -124,7 +166,7 @@ test_readback(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns,
 static PgracFencedProviderResult
 test_actuate_on(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
 {
-	if (!callback_matches_durable_event())
+	if (!callback_matches_durable_event() || !trace_target_owner("on"))
 		return PGRAC_FENCED_PROVIDER_CONFIG_ERROR;
 	if (owned_journal_path != NULL) {
 		PgracFencedJournalRecordV1 records[12];
@@ -924,8 +966,21 @@ UT_TEST(test_owned_cleanup_needs_new_exact_off_and_drain_not_old_on)
 }
 
 int
-main(void)
+main(int argc, char **argv)
 {
+	if (argc == 2) {
+		char *end;
+		long value = strtol(argv[1], &end, 10);
+		struct stat status;
+
+		if (*argv[1] == '\0' || *end != '\0' || value < 3 || value > INT_MAX
+			|| fstat((int)value, &status) != 0 || !S_ISREG(status.st_mode)
+			|| status.st_uid != geteuid() || status.st_nlink != 1
+			|| (status.st_mode & 0777) != 0600)
+			return 2;
+		target_trace_fd = (int)value;
+	} else if (argc != 1)
+		return 2;
 	provider_state
 		= mmap(NULL, sizeof(uint32) * 9, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (provider_state == MAP_FAILED)
