@@ -472,6 +472,39 @@ unavailable:
 	return false;
 }
 
+/* PGRAC: provider completion only; no database OPEN authority is created here. */
+bool
+pgrac_fenced_journal_rejoin_terminal(const PgracFencedJournalRecordV1 *record)
+{
+	uint8 frame[PGRAC_FENCED_JOURNAL_INTENT_BYTES];
+	uint8 digest[32];
+	size_t length;
+	uint16 opcode;
+	uint32 state;
+
+	if (record == NULL || record->intent.kind != PGRAC_FENCED_JOURNAL_INTENT_REJOIN)
+		return false;
+	opcode = record->intent.request.rejoin.opcode;
+	if (record->record_kind == PGRAC_FENCED_JOURNAL_KIND_REENABLE_RESULT &&
+		opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON)
+		state = PGRAC_FENCED_JOURNAL_TARGET_ON;
+	else if (record->record_kind == PGRAC_FENCED_JOURNAL_KIND_RECONCILED &&
+		(opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON ||
+		 opcode == PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON))
+		state = PGRAC_FENCED_JOURNAL_TARGET_OFF;
+	else
+		return false;
+	return record->provider_result == PGRAC_FENCED_JOURNAL_PROVIDER_OK &&
+		record->target_state == state && record->io_drain_state == 1 &&
+		record->deny_reason == 0 && record->proof_generation != 0 &&
+		record->fresh_until_mono_ns > record->event_mono_ns &&
+		pgrac_fenced_journal_frame_encode(record, frame, sizeof(frame), &length) &&
+		pgrac_external_fence_target_state_digest_v1(record->intent.target_uuid,
+			state, record->io_drain_state, record->mapping_generation,
+			record->proof_generation, digest) &&
+		memcmp(digest, record->target_state_digest, sizeof(digest)) == 0;
+}
+
 bool
 pgrac_fenced_journal_restart_action(
 	const PgracFencedJournalRecordV1 *last_record,
@@ -482,6 +515,11 @@ pgrac_fenced_journal_restart_action(
 	*action = PGRAC_FENCED_JOURNAL_RESTART_UNAVAILABLE;
 	if (last_record == NULL)
 		return false;
+	if (pgrac_fenced_journal_rejoin_terminal(last_record))
+	{
+		*action = PGRAC_FENCED_JOURNAL_RESTART_NO_OPERATION;
+		return true;
+	}
 	if (last_record->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_REJOIN)
 	{
 		/* A lost caller cannot reopen writes for an unfinished rejoin. */
@@ -598,6 +636,7 @@ reconcile_remember_operation(PgracFencedJournalReconcileState *state,
 		{
 			state->pending[i].used = true;
 			state->pending[i].first_seq = record->seq;
+			state->pending[i].first_record = *record;
 			state->pending[i].last_record = *record;
 			state->pending_count++;
 			return true;
@@ -628,7 +667,8 @@ pgrac_fenced_journal_reconcile_observe(
 	{
 		if (!pgrac_fenced_journal_intent_continues(previous, record))
 			goto unavailable;
-		if (record->record_kind == PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED)
+		if (record->record_kind == PGRAC_FENCED_JOURNAL_KIND_PROOF_SERVED ||
+			pgrac_fenced_journal_rejoin_terminal(record))
 			reconcile_remove_operation(state, record->operation_id);
 		else if (!reconcile_remember_operation(state, record))
 			goto unavailable;

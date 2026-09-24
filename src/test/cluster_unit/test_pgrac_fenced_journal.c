@@ -897,6 +897,105 @@ UT_TEST(test_owned_rejoin_keeps_writes_disabled_through_restart)
 	}
 }
 
+UT_TEST(test_rejoin_terminal_is_provider_completion_not_database_open)
+{
+	for (int cleanup = 0; cleanup < 2; ++cleanup) {
+		PgracFencedJournalRecordV1 accepted, result;
+		PgracFencedJournalReconcileState replay;
+		PgracFencedJournalRestartAction action;
+
+		make_rejoin_phase(cleanup ? PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON
+								  : PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON,
+						  1, 3, &accepted);
+		result = accepted;
+		result.seq++;
+		rejoin_phase_proof(&result, !cleanup);
+		if (cleanup)
+			result.record_kind = PGRAC_FENCED_JOURNAL_KIND_RECONCILED;
+		pgrac_fenced_journal_reconcile_state_init(&replay);
+		UT_ASSERT(observe_encoded_intent(&replay, &accepted));
+		UT_ASSERT(observe_encoded_intent(&replay, &result));
+		UT_ASSERT_EQ(replay.pending_count, 0);
+		UT_ASSERT(pgrac_fenced_journal_restart_action(&result, &action));
+		UT_ASSERT_EQ(action, PGRAC_FENCED_JOURNAL_RESTART_NO_OPERATION);
+		UT_ASSERT(pgrac_fenced_journal_reconcile_finish(&replay));
+		UT_ASSERT(!replay.return_off_before_rejoin);
+	}
+}
+
+UT_TEST(test_rejoin_near_success_stays_owned)
+{
+	for (int variant = 0; variant < 10; ++variant) {
+		PgracFencedJournalRecordV1 accepted, result;
+		PgracFencedJournalReconcileState replay;
+
+		make_rejoin_phase(variant == 0 ? PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON
+									   : PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON,
+						  1, 3, &accepted);
+		result = accepted;
+		result.seq++;
+		rejoin_phase_proof(&result, true);
+		switch (variant) {
+		case 1:
+			result.provider_result = PGRAC_FENCED_JOURNAL_PROVIDER_UNKNOWN;
+			break;
+		case 2:
+			result.target_state = PGRAC_FENCED_JOURNAL_TARGET_OFF;
+			break;
+		case 3:
+			result.io_drain_state = 0;
+			break;
+		case 4:
+			result.deny_reason = 9;
+			break;
+		case 5:
+			result.proof_generation = 0;
+			break;
+		case 6:
+			result.fresh_until_mono_ns = result.event_mono_ns;
+			break;
+		case 7:
+			result.target_state_digest[0] ^= 1;
+			break;
+		case 8:
+			result.record_kind = PGRAC_FENCED_JOURNAL_KIND_INVALIDATED;
+			break;
+		case 9:
+			result.record_kind = PGRAC_FENCED_JOURNAL_KIND_RECONCILED;
+			break;
+		}
+		pgrac_fenced_journal_reconcile_state_init(&replay);
+		UT_ASSERT(observe_encoded_intent(&replay, &accepted));
+		UT_ASSERT(observe_encoded_intent(&replay, &result));
+		UT_ASSERT_EQ(replay.pending_count, 1);
+	}
+}
+
+UT_TEST(test_rejoin_replay_keeps_original_admin_not_derived_request)
+{
+	PgracFencedJournalRecordV1 admin, offer, authorize;
+	PgracFencedJournalReconcileState replay;
+
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE, 1, 1, &admin);
+	offer = admin;
+	offer.seq = 2;
+	rejoin_phase_proof(&offer, false);
+	make_rejoin_phase(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, 3, 2, &authorize);
+	authorize.intent.request.rejoin.transport_nonce[0] = 0xf1;
+	authorize.intent.request.rejoin.timeout_ms = 2000;
+	pgrac_fenced_journal_reconcile_state_init(&replay);
+	UT_ASSERT(observe_encoded_intent(&replay, &admin));
+	UT_ASSERT(observe_encoded_intent(&replay, &offer));
+	UT_ASSERT(observe_encoded_intent(&replay, &authorize));
+	UT_ASSERT_EQ(replay.pending_count, 1);
+	UT_ASSERT_EQ(replay.pending[0].first_record.seq, 1);
+	UT_ASSERT_EQ(replay.pending[0].first_record.intent.request.rejoin.opcode,
+				 PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE);
+	UT_ASSERT_EQ(replay.pending[0].first_record.intent.request.rejoin.transport_nonce[0], 0x44);
+	UT_ASSERT_EQ(replay.pending[0].first_record.intent.request.rejoin.timeout_ms, 30000);
+	UT_ASSERT_EQ(replay.pending[0].last_record.intent.request.rejoin.transport_nonce[0], 0xf1);
+}
+
 UT_TEST(test_pending_intent_rejects_identity_drift_without_erasing_work)
 {
 	PgracFencedJournalRecordV1 original;
@@ -1284,7 +1383,7 @@ UT_TEST(test_sealed_name_parser_is_canonical_and_full_segment_only)
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(38);
 	UT_RUN(test_journal_exact_codec_roundtrip);
 	UT_RUN(test_restart_decodes_exact_persisted_intent);
 	UT_RUN(test_intent_codec_keeps_complete_identity_and_capacity);
@@ -1309,6 +1408,9 @@ main(void)
 	UT_RUN(test_restart_reconcile_keeps_only_last_unfinished_operations);
 	UT_RUN(test_owned_intent_survives_accept_cancel_and_reconciliation);
 	UT_RUN(test_owned_rejoin_keeps_writes_disabled_through_restart);
+	UT_RUN(test_rejoin_terminal_is_provider_completion_not_database_open);
+	UT_RUN(test_rejoin_near_success_stays_owned);
+	UT_RUN(test_rejoin_replay_keeps_original_admin_not_derived_request);
 	UT_RUN(test_pending_intent_rejects_identity_drift_without_erasing_work);
 	UT_RUN(test_pending_attempt_cannot_be_replaced_by_late_or_legacy_completion);
 	UT_RUN(test_rotation_seals_exact_name_and_creates_new_active);

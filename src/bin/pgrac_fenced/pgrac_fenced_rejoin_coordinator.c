@@ -88,9 +88,25 @@ static bool
 client_release_target(PgracFencedRejoinCoordinatorV1 *coordinator,
 			  PgracFencedRejoinClientV1 *client)
 {
+	bool owned = false;
+	uint32 i;
+
 	if (!client->target_reserved)
 		return true;
-	if (!pgrac_fenced_coordinator_rejoin_release_target(
+	if (coordinator->operation_context->config->format_version == 2)
+	{
+		for (i = 0; i < PGRAC_FENCED_REJOIN_MAX_OPERATIONS; i++)
+		{
+			const PgracFencedRejoinOperationV1 *operation = &coordinator->rejoin_context.operations[i];
+
+			if (operation->state != PGRAC_FENCED_REJOIN_OPERATION_UNUSED &&
+				operation->state != PGRAC_FENCED_REJOIN_OPERATION_OFFERED &&
+				memcmp(operation->target.target_uuid, client->reserved_target, 16) == 0)
+				owned = true;
+		}
+	}
+	/* PGRAC: only detach the waiter while the operation still owns the target. */
+	if (!owned && !pgrac_fenced_coordinator_rejoin_release_target(
 			coordinator->scalar_coordinator, client->reserved_target))
 		return false;
 	client->target_reserved = false;
@@ -102,32 +118,20 @@ static bool
 client_cancel_operation(PgracFencedRejoinCoordinatorV1 *coordinator,
 			PgracFencedRejoinClientV1 *client)
 {
-	PgracExternalFenceProtocolRejoinFrameV1 cancel;
 	bool ok = true;
 
-	if (!client_release_target(coordinator, client))
-		ok = false;
 	if (!client->owns_operation ||
 		!bytes_nonzero(client->operation_id, sizeof(client->operation_id)))
-		return ok;
+		return client_release_target(coordinator, client);
 	if (pgrac_fenced_rejoin_target(&coordinator->rejoin_context,
 			client->operation_id) != NULL)
 	{
-		memset(&cancel, 0, sizeof(cancel));
-		cancel.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CANCEL;
-		if (bytes_nonzero(client->request.transport_nonce,
-				sizeof(client->request.transport_nonce)))
-			memcpy(cancel.transport_nonce, client->request.transport_nonce,
-				   sizeof(cancel.transport_nonce));
-		else
-			memset(cancel.transport_nonce, 1,
-				   sizeof(cancel.transport_nonce));
-		memcpy(cancel.operation_id, client->operation_id,
-			   sizeof(cancel.operation_id));
-		if (!pgrac_fenced_rejoin_cancel(&coordinator->rejoin_context,
-				&cancel))
+		if (!pgrac_fenced_rejoin_detach(&coordinator->rejoin_context,
+				client->operation_id))
 			ok = false;
 	}
+	if (!client_release_target(coordinator, client))
+		ok = false;
 	client->owns_operation = false;
 	memset(client->operation_id, 0, sizeof(client->operation_id));
 	return ok;
@@ -176,6 +180,29 @@ pgrac_fenced_rejoin_coordinator_init(
 		coordinator->clients[i].fd = -1;
 	return pgrac_fenced_rejoin_init(&coordinator->rejoin_context,
 		operation_context);
+}
+
+bool
+pgrac_fenced_rejoin_coordinator_restore(PgracFencedRejoinCoordinatorV1 *coordinator,
+	PgracFencedJournalReconcileState *pending)
+{
+	uint32 i;
+
+	if (coordinator == NULL || coordinator->quiescing || coordinator->client_count != 0 ||
+		coordinator->worker.active || coordinator->worker_owner >= 0 ||
+		!pgrac_fenced_rejoin_restore(&coordinator->rejoin_context, pending))
+		return false;
+	/* PGRAC: reserve all uncertain power work before listeners can admit callers. */
+	for (i = 0; i < PGRAC_FENCED_REJOIN_MAX_OPERATIONS; i++)
+	{
+		const PgracFencedRejoinOperationV1 *operation = &coordinator->rejoin_context.operations[i];
+
+		if (operation->state == PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED &&
+			pgrac_fenced_coordinator_rejoin_acquire_target(coordinator->scalar_coordinator,
+				operation->target.target_uuid) == PGRAC_FENCED_REJOIN_TARGET_ERROR)
+			return false;
+	}
+	return true;
 }
 
 bool
@@ -352,7 +379,7 @@ start_ready_client(PgracFencedRejoinCoordinatorV1 *coordinator,
 	PgracFencedCoordinatorRejoinTargetResult reserved;
 	uint8 operation_id[16];
 
-	if (coordinator->worker_owner >= 0)
+	if (coordinator->worker_owner >= 0 || coordinator->worker.active)
 		return true;
 	switch (client->request.opcode)
 	{
@@ -468,7 +495,7 @@ service_wait_reservation(PgracFencedRejoinCoordinatorV1 *coordinator,
 	if (reserved == PGRAC_FENCED_REJOIN_TARGET_ERROR)
 		return false;
 	if (reserved == PGRAC_FENCED_REJOIN_TARGET_WAITING ||
-		coordinator->worker_owner >= 0)
+		coordinator->worker_owner >= 0 || coordinator->worker.active)
 		return true;
 	if (client->action == PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE)
 		return start_worker(coordinator, slot, client->action,
@@ -531,6 +558,19 @@ service_worker(PgracFencedRejoinCoordinatorV1 *coordinator)
 		return true;
 	owner = coordinator->worker_owner;
 	coordinator->worker_owner = -1;
+	if (coordinator->worker.action == PGRAC_FENCED_REJOIN_ASYNC_CLEANUP)
+	{
+		const PgracFencedRejoinAsyncWorkerV1 *worker = &coordinator->worker;
+
+		if (owner != -1 || !worker->owned)
+			return false;
+		if (!pgrac_fenced_journal_rejoin_terminal(&worker->last_record))
+			return true;
+		return pgrac_fenced_rejoin_detach(&coordinator->rejoin_context,
+			worker->identity.operation_id) &&
+			pgrac_fenced_coordinator_rejoin_release_target(coordinator->scalar_coordinator,
+				worker->identity.intent.target_uuid);
+	}
 	if (owner < 0 || owner >= PGRAC_FENCED_REJOIN_MAX_CLIENTS)
 		return false;
 	client = &coordinator->clients[owner];
@@ -675,6 +715,43 @@ service_clients(PgracFencedRejoinCoordinatorV1 *coordinator,
 	return true;
 }
 
+/* PGRAC: one existing worker services detached operations without a client slot. */
+static bool
+service_owned_cleanup(PgracFencedRejoinCoordinatorV1 *coordinator, uint64 now)
+{
+	uint32 i;
+
+	if (coordinator->operation_context->config->format_version != 2 ||
+		coordinator->worker.active || coordinator->worker_owner >= 0)
+		return true;
+	for (i = 0; i < PGRAC_FENCED_REJOIN_MAX_OPERATIONS; i++)
+	{
+		uint32 slot = (coordinator->cleanup_cursor + i) % PGRAC_FENCED_REJOIN_MAX_OPERATIONS;
+		PgracFencedRejoinOperationV1 *operation = &coordinator->rejoin_context.operations[slot];
+		PgracFencedCoordinatorRejoinTargetResult reserved;
+		uint64 duration;
+
+		if (operation->state != PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED)
+			continue;
+		reserved = pgrac_fenced_coordinator_rejoin_acquire_target(coordinator->scalar_coordinator,
+			operation->target.target_uuid);
+		if (reserved == PGRAC_FENCED_REJOIN_TARGET_ERROR)
+			return false;
+		if (reserved == PGRAC_FENCED_REJOIN_TARGET_WAITING)
+			continue;
+		duration = (uint64) operation->last_record.intent.request.rejoin.timeout_ms * UINT64_C(1000000);
+		if (duration == 0 || UINT64_MAX - now < duration ||
+			!pgrac_fenced_rejoin_async_start(coordinator->operation_context,
+				&coordinator->rejoin_context, PGRAC_FENCED_REJOIN_ASYNC_CLEANUP,
+				&operation->last_record.intent.request.rejoin, NULL, false,
+				now + duration, &coordinator->worker))
+			return false;
+		coordinator->cleanup_cursor = (slot + 1) % PGRAC_FENCED_REJOIN_MAX_OPERATIONS;
+		return true;
+	}
+	return true;
+}
+
 bool
 pgrac_fenced_rejoin_coordinator_service(
 	PgracFencedRejoinCoordinatorV1 *coordinator, uint64 now_mono_ns)
@@ -684,7 +761,7 @@ pgrac_fenced_rejoin_coordinator_service(
 		!service_worker(coordinator))
 		return false;
 	return coordinator->quiescing ? true :
-		service_clients(coordinator, now_mono_ns);
+		service_clients(coordinator, now_mono_ns) && service_owned_cleanup(coordinator, now_mono_ns);
 }
 
 bool

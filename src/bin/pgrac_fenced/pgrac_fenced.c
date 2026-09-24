@@ -784,6 +784,7 @@ main(int argc, char **argv)
 		!pgrac_fenced_rejoin_coordinator_init(&rejoin_coordinator,
 			&operation_context, &coordinator) ||
 		!pgrac_fenced_coordinator_restore(&coordinator, &reconcile) ||
+		!pgrac_fenced_rejoin_coordinator_restore(&rejoin_coordinator, &reconcile) ||
 		reconcile.pending_count != 0)
 	{
 		fprintf(stderr, "pgrac-fenced secure runtime bootstrap failed\n");

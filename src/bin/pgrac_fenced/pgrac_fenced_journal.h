@@ -152,6 +152,8 @@ typedef struct PgracFencedJournalReconcileEntry
 	bool used;
 	/* PGRAC: original replay order, not the most recent attempt's sequence. */
 	uint64 first_seq;
+	/* PGRAC: reconstructed original need, not a new on-disk field. */
+	PgracFencedJournalRecordV1 first_record;
 	PgracFencedJournalRecordV1 last_record;
 } PgracFencedJournalReconcileEntry;
 
@@ -207,6 +209,8 @@ extern bool pgrac_fenced_journal_repair_partial_tail_fd(
 extern bool pgrac_fenced_journal_restart_action(
 	const PgracFencedJournalRecordV1 *last_record,
 	PgracFencedJournalRestartAction *action);
+extern bool pgrac_fenced_journal_rejoin_terminal(
+	const PgracFencedJournalRecordV1 *record);
 extern void pgrac_fenced_journal_reconcile_state_init(
 	PgracFencedJournalReconcileState *state);
 extern bool pgrac_fenced_journal_reconcile_observe(

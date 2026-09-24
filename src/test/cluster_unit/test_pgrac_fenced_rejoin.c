@@ -48,9 +48,30 @@ test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolve
 static PgracFencedProviderResult
 test_actuate_off(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
 {
-	(void)target;
+	if (owned_journal_path != NULL) {
+		PgracFencedJournalRecordV1 records[30];
+		int fd = open(owned_journal_path, O_RDONLY);
+		size_t count = fd < 0 ? 0 : read_records(fd, records, lengthof(records));
+
+		if (count >= 2) {
+			const PgracFencedJournalRecordV1 *accepted = &records[count - 2];
+			const PgracFencedJournalRecordV1 *issued = &records[count - 1];
+
+			provider_state[8] = accepted->record_kind == PGRAC_FENCED_JOURNAL_KIND_REQUEST_ACCEPTED
+								&& issued->record_kind == PGRAC_FENCED_JOURNAL_KIND_ACTUATION_ISSUED
+								&& issued->intent.kind == PGRAC_FENCED_JOURNAL_INTENT_REJOIN
+								&& issued->intent.attempt >= 3
+								&& issued->target_state == PGRAC_FENCED_TARGET_OFF
+								&& issued->daemon_boot_id[0] == 0x82
+								&& memcmp(issued->intent.target_uuid, target->target_uuid, 16) == 0
+								&& memcmp(issued->operation_id, accepted->operation_id, 16) == 0;
+		}
+		if (fd >= 0)
+			(void)close(fd);
+	}
 	(void)deadline_mono_ns;
 	provider_state[1]++;
+	provider_state[4] = PGRAC_FENCED_TARGET_OFF;
 	*native_status = 0;
 	return PGRAC_FENCED_PROVIDER_OK;
 }
@@ -521,7 +542,7 @@ owned_config(PgracFencedConfigV1 *config, PgracFencedProviderOpsV1 *ops)
 #endif
 }
 
-UT_TEST(test_owned_rejoin_journals_phase_before_on_and_retains_pending)
+UT_TEST(test_owned_rejoin_journals_phase_before_on_and_retires_completed_work)
 {
 	PgracFencedOperationContextV1 operation_context;
 	PgracFencedRejoinContextV1 context;
@@ -553,6 +574,11 @@ UT_TEST(test_owned_rejoin_journals_phase_before_on_and_retains_pending)
 											   &response));
 	UT_ASSERT_EQ(response.status, PGRAC_FENCED_REJOIN_STATUS_WAITING_JOINER);
 	UT_ASSERT_EQ(provider_state[8], 1);
+	count = read_records(fd, records, lengthof(records));
+	pgrac_fenced_journal_reconcile_state_init(&replay);
+	for (size_t i = 0; i < count; ++i)
+		UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&replay, &records[i]));
+	UT_ASSERT_EQ(replay.pending_count, 1);
 	make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON, &response, 0x84, &request);
 	UT_ASSERT(
 		pgrac_fenced_rejoin_refresh_on(&context, &request, deadline_after_ms(1000), &response));
@@ -571,14 +597,31 @@ UT_TEST(test_owned_rejoin_journals_phase_before_on_and_retains_pending)
 																		  : i < 7 ? 0x83
 																				  : 0x84);
 	}
-	UT_ASSERT_EQ(replay.pending_count, 1);
+	UT_ASSERT_EQ(replay.pending_count, 0);
+	/* A completed UUID cannot create a new replay root from REFRESH alone. */
+	{
+		PgracFencedRejoinOperationV1 completed = context.operations[0];
+		uint64 generation = operation_context.next_proof_generation;
+		uint32 calls[9];
+
+		provider_state[7] = 1;
+		memcpy(calls, (const void *)provider_state, sizeof(calls));
+		UT_ASSERT(
+			pgrac_fenced_rejoin_refresh_on(&context, &request, deadline_after_ms(1000), &response));
+		UT_ASSERT_EQ(response.status, PGRAC_FENCED_REJOIN_STATUS_STALE);
+		UT_ASSERT(memcmp(&completed, &context.operations[0], sizeof(completed)) == 0);
+		UT_ASSERT_EQ(operation_context.next_proof_generation, generation);
+		UT_ASSERT(memcmp(calls, (const void *)provider_state, sizeof(calls)) == 0);
+		UT_ASSERT_EQ(read_records(fd, records, lengthof(records)), 9);
+		provider_state[7] = 0;
+	}
 	memset(&request, 0, sizeof(request));
 	request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CANCEL;
 	memset(request.transport_nonce, 0x85, sizeof(request.transport_nonce));
 	memcpy(request.operation_id, operation_id, 16);
 	UT_ASSERT(pgrac_fenced_rejoin_cancel(&context, &request));
-	UT_ASSERT_EQ(context.operation_count, 1);
-	UT_ASSERT(pgrac_fenced_rejoin_target(&context, operation_id) != NULL);
+	UT_ASSERT_EQ(context.operation_count, 0);
+	UT_ASSERT(pgrac_fenced_rejoin_target(&context, operation_id) == NULL);
 	UT_ASSERT_EQ(read_records(fd, records, lengthof(records)), 9);
 	owned_journal_path = NULL;
 	(void)close(fd);
@@ -626,11 +669,229 @@ UT_TEST(test_owned_rejoin_negative_does_not_forget_the_target)
 													 &response));
 		}
 		UT_ASSERT(response.status >= PGRAC_FENCED_REJOIN_STATUS_REJECTED);
+		memset(&request, 0, sizeof(request));
+		request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CANCEL;
+		memset(request.transport_nonce, 0x90, 16);
+		memcpy(request.operation_id, operation_id, 16);
+		UT_ASSERT(pgrac_fenced_rejoin_cancel(&context, &request));
 		UT_ASSERT_EQ(context.operation_count, 1);
 		UT_ASSERT(pgrac_fenced_rejoin_target(&context, operation_id) != NULL);
 		(void)close(fd);
 		(void)unlink(path);
 	}
+}
+
+/* Restore reads real accepted phases; no provider action or old proof is inherited. */
+UT_TEST(test_owned_restore_keeps_admin_identity_without_replaying_power)
+{
+	for (int phase = 0; phase < 3; ++phase) {
+		PgracFencedOperationContextV1 operation_context;
+		PgracFencedRejoinContextV1 context;
+		PgracFencedJournalScanState journal_state;
+		PgracFencedJournalReconcileState replay;
+		PgracFencedJournalRecordV1 records[20];
+		PgracFencedConfigV1 config;
+		PgracFencedProviderOpsV1 ops;
+		PgracExternalFenceProtocolRejoinFrameV1 admin, request, response;
+		uint8 operation_id[16];
+		uint8 digest[32], boot[16];
+		uint32 counts[9];
+		char path[64];
+		size_t count;
+		int fd;
+
+		if (!owned_config(&config, &ops))
+			return;
+		fd = open_context(&operation_context, &context, &journal_state, &config, &ops, path);
+		if (fd < 0)
+			return;
+		memset(operation_id, 0xb1, sizeof(operation_id));
+		make_prepare(2, 91, 92, 0x91, &admin);
+		UT_ASSERT(pgrac_fenced_rejoin_admin_prepare(&context, &admin, operation_id,
+													deadline_after_ms(1000), &response));
+		make_claim(0x92, &request);
+		UT_ASSERT(
+			pgrac_fenced_rejoin_claim(&context, &request, deadline_after_ms(1000), &response));
+		if (phase > 0) {
+			make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, &response, 0x93,
+							   &request);
+			UT_ASSERT(pgrac_fenced_rejoin_authorize_on(&context, &request, true,
+													   deadline_after_ms(1000), &response));
+		}
+		if (phase > 1) {
+			make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON, &response, 0x94,
+							   &request);
+			provider_state[7] = 1;
+			UT_ASSERT(pgrac_fenced_rejoin_refresh_on(&context, &request, deadline_after_ms(1000),
+													 &response));
+			provider_state[7] = 0;
+		}
+		count = read_records(fd, records, lengthof(records));
+		pgrac_fenced_journal_reconcile_state_init(&replay);
+		for (size_t i = 0; i < count; ++i)
+			UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&replay, &records[i]));
+		UT_ASSERT_EQ(replay.pending_count, 1);
+		memcpy(counts, (const void *)provider_state, sizeof(counts));
+		memcpy(digest, operation_context.semantic_config_digest, 32);
+		memset(boot, 0x82, 16);
+		UT_ASSERT(pgrac_fenced_operation_context_init(&operation_context, &config, &ops, true,
+													  digest, boot, fd, &journal_state));
+		/* Context startup writes its own BOOT record, not a replayed action. */
+		count = read_records(fd, records, lengthof(records));
+		UT_ASSERT(pgrac_fenced_rejoin_init(&context, &operation_context));
+		UT_ASSERT(pgrac_fenced_rejoin_restore(&context, &replay));
+		UT_ASSERT_EQ(context.operation_count, 1);
+		UT_ASSERT_EQ(replay.pending_count, 0);
+		UT_ASSERT_EQ(context.operations[0].state,
+					 phase == 0 ? PGRAC_FENCED_REJOIN_OPERATION_OFFERED
+								: PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED);
+		UT_ASSERT(memcmp(&context.operations[0].admin_request, &admin, sizeof(admin)) == 0);
+		UT_ASSERT(memcmp(context.operations[0].operation_id, operation_id, 16) == 0);
+		UT_ASSERT(memcmp(counts, (const void *)provider_state, sizeof(counts)) == 0);
+		UT_ASSERT_EQ(context.operations[0].offer_result.proof_generation, 0);
+		UT_ASSERT_EQ(context.operations[0].on_result.proof_generation, 0);
+		UT_ASSERT_EQ(context.operations[0].ready_result.proof_generation, 0);
+		UT_ASSERT_EQ(read_records(fd, records, lengthof(records)), count);
+		if (phase == 0 && context.operation_count == 1) {
+			make_claim(0x95, &request);
+			UT_ASSERT(
+				pgrac_fenced_rejoin_claim(&context, &request, deadline_after_ms(1000), &response));
+			UT_ASSERT_EQ(response.status, PGRAC_FENCED_REJOIN_STATUS_OFFERED);
+			UT_ASSERT_EQ(context.operations[0].last_record.intent.attempt, 2);
+			UT_ASSERT(memcmp(response.daemon_boot_id, boot, 16) == 0);
+			UT_ASSERT_EQ(provider_state[2], counts[2] + 1);
+			UT_ASSERT_EQ(provider_state[1], counts[1]);
+			UT_ASSERT_EQ(provider_state[3], counts[3]);
+		}
+		(void)close(fd);
+		(void)unlink(path);
+	}
+}
+
+UT_TEST(test_owned_restore_preflights_all_identities_before_attachment)
+{
+	PgracFencedOperationContextV1 operation_context;
+	PgracFencedRejoinContextV1 context;
+	PgracFencedJournalScanState journal_state;
+	PgracFencedJournalReconcileState replay, original;
+	PgracFencedJournalRecordV1 records[8];
+	PgracFencedConfigV1 config;
+	PgracFencedProviderOpsV1 ops;
+	PgracExternalFenceProtocolRejoinFrameV1 request, response;
+	uint8 operation_id[16];
+	char path[64];
+	int fd;
+	size_t count;
+
+	if (!owned_config(&config, &ops))
+		return;
+	fd = open_context(&operation_context, &context, &journal_state, &config, &ops, path);
+	if (fd < 0)
+		return;
+	memset(operation_id, 0xb2, 16);
+	make_prepare(2, 91, 92, 0x96, &request);
+	UT_ASSERT(pgrac_fenced_rejoin_admin_prepare(&context, &request, operation_id,
+												deadline_after_ms(1000), &response));
+	count = read_records(fd, records, lengthof(records));
+	pgrac_fenced_journal_reconcile_state_init(&original);
+	for (size_t i = 0; i < count; ++i)
+		UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&original, &records[i]));
+	for (int variant = 0; variant < 4; ++variant) {
+		replay = original;
+		/* The valid first entry must not be attached before rejecting the second. */
+		replay.pending[1] = replay.pending[0];
+		replay.pending_count = 2;
+		if (variant == 0)
+			memset(&replay.pending[1].first_record, 0, sizeof(replay.pending[1].first_record));
+		if (variant == 1)
+			replay.pending[1].last_record.intent.target_uuid[0] ^= 1;
+		if (variant == 2)
+			replay.pending[1].first_seq++;
+		/* variant 3 is two owned operations for one target. */
+		operation_context.available = true;
+		UT_ASSERT(pgrac_fenced_rejoin_init(&context, &operation_context));
+		UT_ASSERT(!pgrac_fenced_rejoin_restore(&context, &replay));
+		UT_ASSERT_EQ(context.operation_count, 0);
+		UT_ASSERT_EQ(replay.pending_count, 2);
+		UT_ASSERT_EQ(provider_state[1], 0);
+		UT_ASSERT_EQ(provider_state[3], 0);
+	}
+	(void)close(fd);
+	(void)unlink(path);
+}
+
+UT_TEST(test_owned_cleanup_needs_new_exact_off_and_drain_not_old_on)
+{
+	PgracFencedOperationContextV1 operation_context;
+	PgracFencedRejoinContextV1 context;
+	PgracFencedJournalScanState journal_state;
+	PgracFencedJournalReconcileState replay;
+	PgracFencedJournalRecordV1 records[30];
+	PgracFencedConfigV1 config;
+	PgracFencedProviderOpsV1 ops;
+	PgracExternalFenceProtocolRejoinFrameV1 request, response;
+	uint8 operation_id[16], digest[32], boot[16];
+	char path[64];
+	int fd;
+	size_t count;
+
+	if (!owned_config(&config, &ops))
+		return;
+	fd = open_context(&operation_context, &context, &journal_state, &config, &ops, path);
+	if (fd < 0)
+		return;
+	memset(operation_id, 0xb3, 16);
+	make_prepare(2, 91, 92, 0x97, &request);
+	UT_ASSERT(pgrac_fenced_rejoin_admin_prepare(&context, &request, operation_id,
+												deadline_after_ms(1000), &response));
+	make_claim(0x98, &request);
+	UT_ASSERT(pgrac_fenced_rejoin_claim(&context, &request, deadline_after_ms(1000), &response));
+	make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_AUTHORIZE_ON, &response, 0x99, &request);
+	UT_ASSERT(pgrac_fenced_rejoin_authorize_on(&context, &request, true, deadline_after_ms(1000),
+											   &response));
+	UT_ASSERT_EQ(response.status, PGRAC_FENCED_REJOIN_STATUS_WAITING_JOINER);
+	count = read_records(fd, records, lengthof(records));
+	pgrac_fenced_journal_reconcile_state_init(&replay);
+	for (size_t i = 0; i < count; ++i)
+		UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&replay, &records[i]));
+	memcpy(digest, operation_context.semantic_config_digest, 32);
+	memset(boot, 0x82, 16);
+	UT_ASSERT(pgrac_fenced_operation_context_init(&operation_context, &config, &ops, true, digest,
+												  boot, fd, &journal_state));
+	UT_ASSERT(pgrac_fenced_rejoin_init(&context, &operation_context));
+	UT_ASSERT(pgrac_fenced_rejoin_restore(&context, &replay));
+	owned_journal_path = path;
+	provider_state[5] = PGRAC_FENCED_IO_DRAIN_NOT_DRAINED;
+	UT_ASSERT(pgrac_fenced_rejoin_cleanup(&context, operation_id, deadline_after_ms(1000)));
+	UT_ASSERT_EQ(provider_state[1], 1);
+	UT_ASSERT_EQ(provider_state[3], 1);
+	UT_ASSERT_EQ(provider_state[8], 1);
+	UT_ASSERT_EQ(context.operations[0].last_record.intent.attempt, 3);
+	UT_ASSERT_EQ(context.operations[0].state, PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED);
+	UT_ASSERT(!pgrac_fenced_journal_rejoin_terminal(&context.operations[0].last_record));
+	UT_ASSERT_EQ(context.operation_count, 1);
+	provider_state[5] = PGRAC_FENCED_IO_DRAIN_DRAINED;
+	UT_ASSERT(pgrac_fenced_rejoin_cleanup(&context, operation_id, deadline_after_ms(1000)));
+	UT_ASSERT_EQ(provider_state[1], 2);
+	UT_ASSERT_EQ(provider_state[3], 1);
+	UT_ASSERT_EQ(context.operations[0].last_record.intent.attempt, 4);
+	UT_ASSERT_EQ(context.operations[0].last_record.record_kind,
+				 PGRAC_FENCED_JOURNAL_KIND_RECONCILED);
+	UT_ASSERT_EQ(context.operations[0].last_record.target_state, PGRAC_FENCED_TARGET_OFF);
+	UT_ASSERT_EQ(context.operations[0].last_record.deny_reason, 0);
+	UT_ASSERT(pgrac_fenced_journal_rejoin_terminal(&context.operations[0].last_record));
+	count = read_records(fd, records, lengthof(records));
+	pgrac_fenced_journal_reconcile_state_init(&replay);
+	for (size_t i = 0; i < count; ++i)
+		UT_ASSERT(pgrac_fenced_journal_reconcile_observe(&replay, &records[i]));
+	UT_ASSERT_EQ(replay.pending_count, 0);
+	/* Durable terminal is not permission to repeat the power operation. */
+	UT_ASSERT(!pgrac_fenced_rejoin_cleanup(&context, operation_id, deadline_after_ms(1000)));
+	UT_ASSERT_EQ(provider_state[1], 2);
+	UT_ASSERT_EQ(provider_state[3], 1);
+	owned_journal_path = NULL;
+	(void)close(fd);
+	(void)unlink(path);
 }
 
 int
@@ -640,14 +901,17 @@ main(void)
 		= mmap(NULL, sizeof(uint32) * 9, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (provider_state == MAP_FAILED)
 		return 1;
-	UT_PLAN(7);
+	UT_PLAN(10);
 	UT_RUN(test_admin_prepare_is_inert_durable_and_duplicate_stable);
 	UT_RUN(test_claim_authorize_refresh_is_exact_and_on_happens_once);
 	UT_RUN(test_nonterminal_claim_releases_offer_and_cancel_discards_it);
 	UT_RUN(test_claim_retries_transient_readback_before_off_proof);
 	UT_RUN(test_refresh_resolve_failure_returns_negative_and_discards_operation);
-	UT_RUN(test_owned_rejoin_journals_phase_before_on_and_retains_pending);
+	UT_RUN(test_owned_rejoin_journals_phase_before_on_and_retires_completed_work);
 	UT_RUN(test_owned_rejoin_negative_does_not_forget_the_target);
+	UT_RUN(test_owned_restore_keeps_admin_identity_without_replaying_power);
+	UT_RUN(test_owned_restore_preflights_all_identities_before_attachment);
+	UT_RUN(test_owned_cleanup_needs_new_exact_off_and_drain_not_old_on);
 	UT_DONE();
 	(void)munmap((void *)provider_state, sizeof(uint32) * 9);
 	return ut_failed_count == 0 ? 0 : 1;

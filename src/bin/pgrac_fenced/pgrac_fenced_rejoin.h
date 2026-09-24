@@ -29,7 +29,8 @@ typedef enum PgracFencedRejoinOperationState
 	PGRAC_FENCED_REJOIN_OPERATION_OFFERED = 1,
 	PGRAC_FENCED_REJOIN_OPERATION_CLAIMED = 2,
 	PGRAC_FENCED_REJOIN_OPERATION_WAITING_JOINER = 3,
-	PGRAC_FENCED_REJOIN_OPERATION_READY = 4
+	PGRAC_FENCED_REJOIN_OPERATION_READY = 4,
+	PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED = 5
 } PgracFencedRejoinOperationState;
 
 typedef struct PgracFencedRejoinOperationV1
@@ -56,6 +57,13 @@ typedef struct PgracFencedRejoinContextV1
 extern bool pgrac_fenced_rejoin_init(
 	PgracFencedRejoinContextV1 *context,
 	PgracFencedOperationContextV1 *operation_context);
+extern bool pgrac_fenced_rejoin_restore(
+	PgracFencedRejoinContextV1 *context,
+	PgracFencedJournalReconcileState *pending);
+extern bool pgrac_fenced_rejoin_cleanup(
+	PgracFencedRejoinContextV1 *context,
+	const uint8 operation_id[PGRAC_EXTERNAL_FENCE_NONCE_V1_BYTES],
+	uint64 deadline_mono_ns);
 extern bool pgrac_fenced_rejoin_admin_prepare(
 	PgracFencedRejoinContextV1 *context,
 	const PgracExternalFenceProtocolRejoinFrameV1 *request,
@@ -81,6 +89,9 @@ extern bool pgrac_fenced_rejoin_refresh_on(
 extern bool pgrac_fenced_rejoin_cancel(
 	PgracFencedRejoinContextV1 *context,
 	const PgracExternalFenceProtocolRejoinFrameV1 *request);
+extern bool pgrac_fenced_rejoin_detach(
+	PgracFencedRejoinContextV1 *context,
+	const uint8 operation_id[PGRAC_EXTERNAL_FENCE_NONCE_V1_BYTES]);
 extern const PgracFencedTargetV1 *pgrac_fenced_rejoin_target(
 	const PgracFencedRejoinContextV1 *context,
 	const uint8 operation_id[PGRAC_EXTERNAL_FENCE_NONCE_V1_BYTES]);

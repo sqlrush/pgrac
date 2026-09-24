@@ -18,6 +18,11 @@
 #include <unistd.h>
 
 #include "pgrac_fenced_rejoin_async.h"
+#include "common/pgrac_fence_map.h"
+
+#ifdef USE_OPENSSL
+#include <openssl/evp.h>
+#endif
 
 #undef printf
 #undef fprintf
@@ -30,6 +35,76 @@ UT_DEFINE_GLOBALS();
 #include "data/pgrac_fence_map_v2_fixture.h"
 
 static volatile uint32 *provider_state;
+static void stop_test_worker(PgracFencedRejoinAsyncWorkerV1 *worker);
+
+/* Two independently identified targets, signed with an ephemeral test-only key. */
+static bool
+add_second_test_target(PgracFencedConfigV1 *config)
+{
+#ifdef USE_OPENSSL
+	PgracFencedNodeConfigV1 original = config->nodes[2];
+	EVP_PKEY_CTX *key_context = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+	EVP_PKEY *key = NULL;
+	EVP_MD_CTX *signer = EVP_MD_CTX_new();
+	size_t key_length = sizeof(config->map_public_key);
+	bool ok = false;
+
+	if (key_context == NULL || signer == NULL || EVP_PKEY_keygen_init(key_context) != 1
+		|| EVP_PKEY_keygen(key_context, &key) != 1
+		|| EVP_PKEY_get_raw_public_key(key, config->map_public_key, &key_length) != 1)
+		goto done;
+	for (int node_id = 2; node_id <= 3; ++node_id) {
+		PgracFencedNodeConfigV1 *node = &config->nodes[node_id];
+		PgracProtectedSetDecodedV2 decoded;
+		size_t payload_length, signature_length = PGRAC_FENCE_MAP_V2_SIGNATURE_BYTES;
+		size_t old_payload = original.adapter_data_len - PGRAC_FENCE_MAP_V2_HEADER_BYTES
+							 - PGRAC_FENCE_MAP_V2_SIGNATURE_BYTES;
+
+		*node = original;
+		if (!pgrac_protected_set_v2_decode(original.adapter_data + PGRAC_FENCE_MAP_V2_HEADER_BYTES,
+										   old_payload, &decoded))
+			goto done;
+		if (node_id == 3) {
+			memset(decoded.set.guest_uuid, 6, 16);
+			for (uint32 route = 0; route < decoded.set.route_count; ++route) {
+				decoded.routes[route].initiator.data = "iqn.2026-09.test:guest3";
+				decoded.routes[route].initiator.length
+					= strlen(decoded.routes[route].initiator.data);
+			}
+		}
+		memcpy(node->target_uuid, decoded.set.guest_uuid, 16);
+		if (!pgrac_external_fence_protected_set_digest_v2(&decoded.set, node->protected_set_digest)
+			|| !pgrac_protected_set_v2_encode(
+				&decoded.set, node->adapter_data + PGRAC_FENCE_MAP_V2_HEADER_BYTES,
+				sizeof(node->adapter_data) - PGRAC_FENCE_MAP_V2_HEADER_BYTES - signature_length,
+				&payload_length))
+			goto done;
+		for (int byte = 0; byte < 4; ++byte) {
+			node->adapter_data[12 + byte] = (uint8)((uint32)node_id >> (byte * 8));
+			node->adapter_data[24 + byte] = (uint8)((uint32)payload_length >> (byte * 8));
+		}
+		if (EVP_DigestSignInit(signer, NULL, NULL, NULL, key) != 1
+			|| EVP_DigestSign(signer,
+							  node->adapter_data + PGRAC_FENCE_MAP_V2_HEADER_BYTES + payload_length,
+							  &signature_length, node->adapter_data,
+							  PGRAC_FENCE_MAP_V2_HEADER_BYTES + payload_length)
+				   != 1)
+			goto done;
+		node->adapter_data_len
+			= PGRAC_FENCE_MAP_V2_HEADER_BYTES + payload_length + signature_length;
+	}
+	config->node_count = 2;
+	ok = true;
+done:
+	EVP_MD_CTX_free(signer);
+	EVP_PKEY_free(key);
+	EVP_PKEY_CTX_free(key_context);
+	return ok;
+#else
+	(void)config;
+	return false;
+#endif
+}
 
 static PgracFencedProviderResult
 test_resolve(const PgracFencedTargetV1 *configured, PgracFencedTargetV1 *resolved,
@@ -49,6 +124,17 @@ test_actuate(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32
 	*native_status = 0;
 	provider_state[1]++;
 	provider_state[2] = PGRAC_FENCED_TARGET_ON;
+	return PGRAC_FENCED_PROVIDER_OK;
+}
+
+static PgracFencedProviderResult
+test_actuate_off(const PgracFencedTargetV1 *target, uint64_t deadline_mono_ns, int32 *native_status)
+{
+	(void)target;
+	(void)deadline_mono_ns;
+	*native_status = 0;
+	provider_state[4]++;
+	provider_state[2] = PGRAC_FENCED_TARGET_OFF;
 	return PGRAC_FENCED_PROVIDER_OK;
 }
 
@@ -106,7 +192,7 @@ open_context(PgracFencedOperationContextV1 *operation_context,
 	ops->provider_id = PGRAC_FENCED_PROVIDER_ID_TEST_ONLY;
 	ops->provider_name = "rejoin-async-test";
 	ops->resolve = test_resolve;
-	ops->actuate_off = test_actuate;
+	ops->actuate_off = test_actuate_off;
 	ops->readback = test_readback;
 	ops->actuate_on = test_actuate;
 	ops->shutdown = test_shutdown;
@@ -181,7 +267,7 @@ make_bound_request(uint16 opcode, const PgracExternalFenceProtocolRejoinFrameV1 
 }
 
 static void
-full_async_lifecycle(bool owned)
+full_async_lifecycle(bool owned, bool restart, bool cleanup, int retirement_stage)
 {
 	PgracFencedOperationContextV1 operation_context;
 	PgracFencedRejoinContextV1 rejoin_context;
@@ -197,12 +283,18 @@ full_async_lifecycle(bool owned)
 	char path[64];
 	int journal_fd;
 
-	memset((void *)provider_state, 0, sizeof(uint32) * 4);
+	memset((void *)provider_state, 0, sizeof(uint32) * 5);
 	provider_state[2] = PGRAC_FENCED_TARGET_OFF;
 	journal_fd = open_context(&operation_context, &rejoin_context, &journal_state, &config, &ops,
 							  path, owned);
 	if (journal_fd < 0)
 		return;
+	if (retirement_stage >= 0 && !add_second_test_target(&config)) {
+		UT_ASSERT(false);
+		(void)close(journal_fd);
+		(void)unlink(path);
+		return;
+	}
 	memset(&request, 0, sizeof(request));
 	request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE;
 	memset(request.transport_nonce, 0x61, sizeof(request.transport_nonce));
@@ -217,6 +309,20 @@ full_async_lifecycle(bool owned)
 	UT_ASSERT(finish_worker(&operation_context, &rejoin_context, &worker, &offer));
 	UT_ASSERT_EQ(rejoin_context.operation_count, 1);
 	UT_ASSERT_EQ(operation_context.next_proof_generation, 1);
+	if (restart) {
+		PgracFencedJournalReconcileState replay;
+		uint8 digest[32], boot[16];
+
+		pgrac_fenced_journal_reconcile_state_init(&replay);
+		UT_ASSERT(pgrac_fenced_journal_reconcile_observe(
+			&replay, &rejoin_context.operations[0].last_record));
+		memcpy(digest, operation_context.semantic_config_digest, 32);
+		memset(boot, 0x82, 16);
+		UT_ASSERT(pgrac_fenced_operation_context_init(&operation_context, &config, &ops, true,
+													  digest, boot, journal_fd, &journal_state));
+		UT_ASSERT(pgrac_fenced_rejoin_init(&rejoin_context, &operation_context));
+		UT_ASSERT(pgrac_fenced_rejoin_restore(&rejoin_context, &replay));
+	}
 
 	memset(&request, 0, sizeof(request));
 	request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_LMON_CLAIM_NEXT;
@@ -237,6 +343,30 @@ full_async_lifecycle(bool owned)
 	UT_ASSERT_EQ(on_result.status, PGRAC_FENCED_REJOIN_STATUS_WAITING_JOINER);
 	UT_ASSERT_EQ(on_result.proof_generation, 2);
 	UT_ASSERT_EQ(provider_state[1], 1);
+	if (cleanup) {
+		bool started;
+
+		rejoin_context.operations[0].state = PGRAC_FENCED_REJOIN_OPERATION_CLEANUP_REQUIRED;
+		request = rejoin_context.operations[0].last_record.intent.request.rejoin;
+		started = pgrac_fenced_rejoin_async_start(&operation_context, &rejoin_context,
+												  PGRAC_FENCED_REJOIN_ASYNC_CLEANUP, &request, NULL,
+												  false, deadline_after_ms(2000), &worker);
+		UT_ASSERT(started);
+		if (started) {
+			UT_ASSERT(finish_worker(&operation_context, &rejoin_context, &worker, &ready));
+			UT_ASSERT_EQ(ready.opcode, 0);
+			UT_ASSERT(
+				pgrac_fenced_journal_rejoin_terminal(&rejoin_context.operations[0].last_record));
+			UT_ASSERT_EQ(rejoin_context.operations[0].last_record.target_state,
+						 PGRAC_FENCED_TARGET_OFF);
+			UT_ASSERT_EQ(provider_state[4], 1);
+			UT_ASSERT_EQ(provider_state[1], 1);
+			UT_ASSERT_EQ(operation_context.next_proof_generation, 4);
+		}
+		(void)close(journal_fd);
+		(void)unlink(path);
+		return;
+	}
 
 	make_bound_request(PGRAC_EXTERNAL_FENCE_REJOIN_LMON_REFRESH_ON, &on_result, 0x64, &request);
 	UT_ASSERT(pgrac_fenced_rejoin_async_start(&operation_context, &rejoin_context,
@@ -249,18 +379,81 @@ full_async_lifecycle(bool owned)
 	UT_ASSERT_EQ(provider_state[1], 1);
 	UT_ASSERT_EQ(provider_state[3], 3);
 	UT_ASSERT_EQ(pgrac_fenced_rejoin_async_fd(&worker), -1);
+	if (owned) {
+		uint64 next_seq = journal_state.next_seq;
+		PgracFencedRejoinOperationV1 completed = rejoin_context.operations[0];
+
+		/* An identical REFRESH must not create another durable attempt or proof. */
+		UT_ASSERT(pgrac_fenced_rejoin_async_start(&operation_context, &rejoin_context,
+												  PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON, &request,
+												  NULL, false, deadline_after_ms(2000), &worker));
+		UT_ASSERT(finish_worker(&operation_context, &rejoin_context, &worker, &ready));
+		UT_ASSERT_EQ(ready.status, PGRAC_FENCED_REJOIN_STATUS_STALE);
+		UT_ASSERT_EQ(journal_state.next_seq, next_seq);
+		UT_ASSERT(memcmp(&completed, &rejoin_context.operations[0], sizeof(completed)) == 0);
+	}
+	if (retirement_stage >= 0) {
+		uint8 next_operation[16];
+		bool finished;
+
+		memset(&request, 0, sizeof(request));
+		request.opcode = PGRAC_EXTERNAL_FENCE_REJOIN_ADMIN_PREPARE;
+		memset(request.transport_nonce, 0x67, 16);
+		request.old_node_id = 3;
+		request.old_incarnation = 80;
+		request.candidate_incarnation = 81;
+		request.timeout_ms = 1000;
+		memset(next_operation, 0xa2, 16);
+		UT_ASSERT(pgrac_fenced_rejoin_async_start(
+			&operation_context, &rejoin_context, PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE, &request,
+			next_operation, false, deadline_after_ms(2000), &worker));
+		if (retirement_stage == 1) {
+			PgracFencedRejoinAsyncEvent event;
+			struct pollfd descriptor = { worker.fd, POLLIN, 0 };
+			UT_ASSERT_EQ(poll(&descriptor, 1, 2000), 1);
+			UT_ASSERT(pgrac_fenced_rejoin_async_service(&operation_context, &rejoin_context,
+														&worker, &event, &ready));
+			UT_ASSERT_EQ(event, PGRAC_FENCED_REJOIN_ASYNC_JOURNAL);
+		}
+		UT_ASSERT(pgrac_fenced_rejoin_detach(&rejoin_context, operation_id));
+		UT_ASSERT_EQ(rejoin_context.operation_count, 0);
+		finished = finish_worker(&operation_context, &rejoin_context, &worker, &offer);
+		UT_ASSERT(finished);
+		if (!finished)
+			stop_test_worker(&worker);
+		UT_ASSERT_EQ(rejoin_context.operation_count, 1);
+		UT_ASSERT_EQ(rejoin_context.operations[0].state, PGRAC_FENCED_REJOIN_OPERATION_UNUSED);
+		UT_ASSERT_EQ(rejoin_context.operations[1].state, PGRAC_FENCED_REJOIN_OPERATION_OFFERED);
+		UT_ASSERT(memcmp(rejoin_context.operations[1].operation_id, next_operation, 16) == 0);
+	}
 	(void)close(journal_fd);
 	(void)unlink(path);
 }
 
 UT_TEST(test_parent_serializes_full_async_rejoin_lifecycle)
 {
-	full_async_lifecycle(false);
+	full_async_lifecycle(false, false, false, -1);
 }
 
 UT_TEST(test_parent_serializes_owned_async_rejoin_lifecycle)
 {
-	full_async_lifecycle(true);
+	full_async_lifecycle(true, false, false, -1);
+}
+
+UT_TEST(test_replayed_admin_claims_fresh_proof_in_new_boot)
+{
+	full_async_lifecycle(true, true, false, -1);
+}
+
+UT_TEST(test_cleanup_worker_uses_owned_identity_and_no_client_reply)
+{
+	full_async_lifecycle(true, false, true, -1);
+}
+
+UT_TEST(test_other_target_retirement_does_not_invalidate_owned_worker)
+{
+	full_async_lifecycle(true, false, false, 0);
+	full_async_lifecycle(true, false, false, 1);
 }
 
 static void
@@ -337,14 +530,17 @@ int
 main(void)
 {
 	provider_state
-		= mmap(NULL, sizeof(uint32) * 4, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
+		= mmap(NULL, sizeof(uint32) * 5, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANON, -1, 0);
 	if (provider_state == MAP_FAILED)
 		return 1;
-	UT_PLAN(3);
+	UT_PLAN(6);
 	UT_RUN(test_parent_serializes_full_async_rejoin_lifecycle);
 	UT_RUN(test_parent_serializes_owned_async_rejoin_lifecycle);
 	UT_RUN(test_owned_worker_cannot_publish_after_parent_identity_changes);
+	UT_RUN(test_replayed_admin_claims_fresh_proof_in_new_boot);
+	UT_RUN(test_cleanup_worker_uses_owned_identity_and_no_client_reply);
+	UT_RUN(test_other_target_retirement_does_not_invalidate_owned_worker);
 	UT_DONE();
-	(void)munmap((void *)provider_state, sizeof(uint32) * 4);
+	(void)munmap((void *)provider_state, sizeof(uint32) * 5);
 	return ut_failed_count == 0 ? 0 : 1;
 }

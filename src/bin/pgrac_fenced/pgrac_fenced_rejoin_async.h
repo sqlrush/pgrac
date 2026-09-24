@@ -19,7 +19,9 @@ typedef enum PgracFencedRejoinAsyncAction
 	PGRAC_FENCED_REJOIN_ASYNC_ADMIN_PREPARE = 1,
 	PGRAC_FENCED_REJOIN_ASYNC_CLAIM_NEXT = 2,
 	PGRAC_FENCED_REJOIN_ASYNC_AUTHORIZE_ON = 3,
-	PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON = 4
+	PGRAC_FENCED_REJOIN_ASYNC_REFRESH_ON = 4,
+	/* PGRAC: internal owner work, not a PFRJ client opcode. */
+	PGRAC_FENCED_REJOIN_ASYNC_CLEANUP = 5
 } PgracFencedRejoinAsyncAction;
 
 typedef enum PgracFencedRejoinAsyncEvent
