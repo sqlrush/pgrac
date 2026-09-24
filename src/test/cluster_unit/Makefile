@@ -1328,9 +1328,11 @@ CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_roo
 # machinery; err*/BasicOpenFile are stubbed in the test file.
 test_cluster_control_root: test_cluster_control_root.c unit_test.h \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
-		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o xlogreader_fs.o
+		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
@@ -5201,17 +5203,15 @@ test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-4.1 D8: test_cluster_wal_thread — 12 pure-helper tests for the
-# per-thread WAL routing surface (identity mapping / dir name / page
-# header validator RL1 matrix / claim fill+validate+corruption).  All
-# helpers are header-inline (cluster_wal_thread.h); libpgcommon +
-# libpgport supply pg_crc32c (the test_cluster_undo_record linkage
-# pattern -- no module .o, no stubs).
+# PGRAC: legacy routing helpers plus real v2 claim codec/filesystem reader.
+# Author: SqlRush <sqlrush@gmail.com>
+CLUSTER_WAL_CLAIM_O = $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 test_cluster_wal_thread: test_cluster_wal_thread.c unit_test.h \
-		$(CLUSTER_VERSION_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_WAL_CLAIM_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) \
-		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # spec-3.8 D12: test_cluster_undo_lifecycle — 10 pure ABI / enum /
 # SQLSTATE / sizeof / offsetof tests for Undo Segment Lifecycle MVP +

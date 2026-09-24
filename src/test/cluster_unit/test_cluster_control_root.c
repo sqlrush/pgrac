@@ -3407,6 +3407,52 @@ v2_write_roots(uint8 bytes[66048])
 }
 
 static void
+v2_claim_path(const ClusterControlRootIdentity *id, char path[MAXPGPATH])
+{
+	snprintf(path, MAXPGPATH, "%s/thread_%u/generation_" UINT64_FORMAT "/pgrac_thread.claim",
+			 cluster_wal_threads_dir, id->origin_thread_id, id->origin_owner_incarnation);
+}
+
+/* PGRAC: independently create the selected claim before constructing anchors.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_claim_object(uint8 bytes[66048], int node, ControlRootImage *root)
+{
+	uint8 image[112] = { 0 }, hash[32];
+	ClusterControlRootIdentity *id = &root->records[node].identity;
+	char dir[MAXPGPATH], path[MAXPGPATH];
+
+	put_u32_le(image, UINT32_C(0x50475443));
+	put_u16_le(image + 4, 2);
+	put_u16_le(image + 6, id->origin_thread_id);
+	put_u32_le(image + 8, id->origin_node_id);
+	put_u64_le(image + 16, id->system_identifier);
+	put_u64_le(image + 24, root->header.v2.database_incarnation);
+	put_u64_le(image + 32, id->origin_owner_incarnation);
+	memcpy(image + 40, id->storage_uuid, 16);
+	memcpy(image + 56, id->authority_uuid, 16);
+	put_u64_le(image + 72, id->root_lineage_seq);
+	put_u64_le(image + 80, id->thread_claim_created_at);
+	put_u64_le(image + 88, root->header.v2.config_generation - 1);
+	put_u64_le(image + 96, 1);
+	id->thread_claim_crc32c = image_crc(image, 104);
+	put_u32_le(image + 104, id->thread_claim_crc32c);
+	sha256_bytes(image, sizeof(image), hash);
+	memcpy(root->refs[node].claim_sha256, hash, 32);
+	memcpy(bytes + 512 + node * 512 + 296, hash, 32);
+	put_u32_le(bytes + 512 + node * 512 + 168, id->thread_claim_crc32c);
+	v2_checksums(bytes);
+	snprintf(dir, sizeof(dir), "%s/thread_%u", cluster_wal_threads_dir, id->origin_thread_id);
+	UT_ASSERT(mkdir(dir, 0700) == 0 || errno == EEXIST);
+	snprintf(dir, sizeof(dir), "%s/thread_%u/generation_" UINT64_FORMAT, cluster_wal_threads_dir,
+			 id->origin_thread_id, id->origin_owner_incarnation);
+	UT_ASSERT(mkdir(dir, 0700) == 0 || errno == EEXIST);
+	v2_claim_path(id, path);
+	write_all_or_abort(path, image, sizeof(image));
+}
+
+static void
 v2_thread_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 {
 	ControlFileData native;
@@ -3427,6 +3473,7 @@ v2_thread_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 		int node = i == 0 ? 0 : 127;
 		ClusterRecoveryAnchorV2 *a = &anchors[i];
 
+		v2_claim_object(bytes, node, &root);
 		a->identity = root.records[node].identity;
 		a->database_incarnation = root.header.v2.database_incarnation;
 		a->config_generation = root.header.v2.config_generation;
@@ -3544,6 +3591,52 @@ UT_TEST(test_v2_thread_view_rejects_selected_foreign_or_inconsistent_anchor)
 		v2_write_roots(bytes);
 		UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(&self, &root, &out, &token),
 					 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+		UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	}
+}
+
+UT_TEST(test_v2_thread_view_requires_physical_selected_claim)
+{
+	for (int fault = 0; fault < 5; ++fault) {
+		uint8 bytes[66048], claim[113];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ControlRootImage root;
+		ControlFileData out;
+		ClusterControlRootFileToken token;
+		char path[MAXPGPATH];
+		ClusterControlRootResult expected;
+
+		v2_thread_fixture(bytes, anchors);
+		v2_claim_path(&anchors[0].identity, path);
+		read_all_or_abort(path, claim, 112);
+		if (fault == 0) {
+			UT_ASSERT_EQ(unlink(path), 0);
+			expected = CLUSTER_CONTROL_ROOT_ABSENT;
+		} else if (fault == 1) {
+			claim[32] ^= 1;
+			write_all_or_abort(path, claim, 112);
+			expected = CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+		} else if (fault == 2) {
+			claim[4] = 1;
+			put_u32_le(claim + 104, image_crc(claim, 104));
+			write_all_or_abort(path, claim, 112);
+			expected = CLUSTER_CONTROL_ROOT_BAD_VERSION;
+		} else if (fault == 3) {
+			claim[112] = 0;
+			write_all_or_abort(path, claim, 113);
+			expected = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		} else {
+			++claim[32];
+			put_u32_le(claim + 104, image_crc(claim, 104));
+			write_all_or_abort(path, claim, 112);
+			expected = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		}
+		memset(&root, 0xa5, sizeof(root));
+		memset(&out, 0xa5, sizeof(out));
+		memset(&token, 0xa5, sizeof(token));
+		UT_ASSERT_EQ(
+			cluster_control_root_v2_read_thread_locked(&anchors[0].identity, &root, &out, &token),
+			expected);
 		UT_ASSERT(v2_outputs_zero(&root, &out, &token));
 	}
 }
@@ -3960,7 +4053,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(66);
+	UT_PLAN(67);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -4027,6 +4120,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_checkpoint_root_io_failure_keeps_old_selection);
 	UT_RUN(test_v2_checkpoint_postwrite_failure_keeps_fact_but_no_success);
 	UT_RUN(test_v2_checkpoint_error_unwind_releases_owned_work);
+	UT_RUN(test_v2_thread_view_requires_physical_selected_claim);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

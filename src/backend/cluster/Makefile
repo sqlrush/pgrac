@@ -290,6 +290,7 @@ OBJS = \
 	cluster_stats.o \
 	cluster_version.o \
 	cluster_views.o \
+	cluster_wal_claim.o \
 	cluster_wal_state.o \
 	cluster_wal_thread.o \
 	cluster_xid_authority.o \

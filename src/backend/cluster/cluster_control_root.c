@@ -30,6 +30,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
@@ -1025,6 +1026,8 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 {
 	ControlFileData common;
 	ClusterRecoveryAnchorRefV2 ref;
+	ClusterWalThreadClaimRefV2 claim_ref;
+	ClusterWalThreadClaimV2 claim;
 	ClusterControlRootResult result, root_result;
 	int index;
 
@@ -1052,6 +1055,18 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 		goto fail;
 	}
+	/* PGRAC: neither the directory name nor an anchor substitutes for the
+	 * physical root-selected generation claim. Keep the existing CF interval.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	memset(&claim_ref, 0, sizeof(claim_ref));
+	claim_ref.identity = root->records[index].identity;
+	claim_ref.database_incarnation = root->header.v2.database_incarnation;
+	claim_ref.max_config_generation = root->header.v2.config_generation;
+	memcpy(claim_ref.claim_sha256, root->refs[index].claim_sha256, 32);
+	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &claim_ref, &claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto fail;
 	memset(&ref, 0, sizeof(ref));
 	ref.identity = root->records[index].identity;
 	ref.database_incarnation = root->header.v2.database_incarnation;
