@@ -104,6 +104,19 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 										   ControlRootImage *root, ControlFileData *out,
 										   ClusterControlRootFileToken *token);
 
+/* PGRAC: normal online checkpoint only. Actual checkpointer/membership/fence
+ * and local WAL flush facts authorize this operation, never caller booleans.
+ * Owns CF-S read, outside-X staging, WALR-before-CF-X, and exact file CAS.
+ * The checkpoint end/CRC must come from the native WAL-readback producer.
+ * Outputs clear on refusal; a failed post-publication check does not undo root.
+ * Startup, shutdown, migration and native compatibility projection are separate
+ * adapter responsibilities. Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult cluster_control_root_v2_checkpoint_publish(
+	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
+	XLogRecPtr checkpoint_end, uint32 checkpoint_crc, ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *out_token);
+
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
 												 const ClusterControlRootMigrationRoundV1 *round);

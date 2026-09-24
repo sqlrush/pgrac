@@ -22,12 +22,17 @@
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_membership.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_write_fence.h"
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
 #include "cluster/storage/cluster_shared_fs.h"
@@ -1825,6 +1830,261 @@ static bool
 file_token_equal(const ClusterControlRootFileToken *left, const ClusterControlRootFileToken *right)
 {
 	return left != NULL && right != NULL && memcmp(left, right, sizeof(*left)) == 0;
+}
+
+/* PGRAC: a normal checkpoint is an owner operation, not a generic root patch.
+ * Root freshness, runtime authority and local WAL durability are independent.
+ * No caller-provided flag can stand in for any of them.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch, TimeLineID tli,
+							XLogRecPtr checkpoint_end)
+{
+	TimeLineID flushed_tli = 0;
+	XLogRecPtr flushed;
+
+	if (!AmCheckpointerProcess() || !cluster_enabled || !cluster_controlfile_shared_authority
+		|| self->origin_node_id != cluster_node_id || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES
+		|| self->origin_thread_id != (uint16)(cluster_node_id + 1)
+		|| self->origin_owner_incarnation == 0
+		|| cluster_qvotec_get_self_incarnation() != self->origin_owner_incarnation
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   != self->origin_owner_incarnation
+		|| !cluster_wal_thread_dir_validated() || cluster_wal_thread_id() != self->origin_thread_id
+		|| cluster_epoch_get_current() != epoch || cluster_reconfig_has_pending_prebump_stage()
+		|| !cluster_serving_ready_is_current() || !cluster_write_fence_allowed())
+		return false;
+	flushed = GetFlushRecPtr(&flushed_tli);
+	return flushed_tli == tli && flushed >= checkpoint_end && cluster_epoch_get_current() == epoch;
+}
+
+typedef struct CheckpointV2Work {
+	ControlRootImage base;
+	ControlRootImage next;
+	ControlFileData old_view;
+	ControlFileData new_view;
+	ClusterControlRootReadToken thread_token;
+	ClusterControlRootFileToken before, after;
+	ClusterRecoveryAnchorStageV2 stage;
+	ClusterWalRootPublishGuard *walr;
+	LOCKMODE cf_mode;
+} CheckpointV2Work;
+
+static ClusterControlRootResult
+checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
+{
+	ClusterControlRootResult discarded;
+
+	if (work->cf_mode != NoLock) {
+		LOCKMODE mode = work->cf_mode;
+
+		work->cf_mode = NoLock;
+		result = release_cf(mode, result);
+	}
+	if (work->walr != NULL
+		&& cluster_wal_retention_root_publish_end(&work->walr) != CLUSTER_WALR_RELEASE_CONFIRMED)
+		result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	/* Discard only the operation's own temporary entry, never a formal object.
+	 * This is also safe after root publication or ERROR during CF acquisition. */
+	if (work->stage.owner_pid != 0) {
+		discarded = cluster_recovery_anchor_v2_discard(&work->stage);
+		if (discarded != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = discarded;
+	}
+	return result;
+}
+
+static ClusterControlRootResult
+checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdentity *self,
+						   const ControlFileData *cf, XLogRecPtr end, uint32 crc, uint64 epoch)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken actual;
+	ClusterControlRootSnapshot *record;
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterWalPinResult walr_result;
+	uint8 uuid[16];
+	int index = self->origin_thread_id - 1;
+
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ShareLock;
+	result = cluster_control_root_v2_read_thread_locked(self, &work->base, &work->old_view,
+														&work->before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	record = &work->base.records[index];
+	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->base.header.v2.database_state != 3
+		|| (work->base.header.v2.serving[cluster_node_id / 64]
+			& (UINT64_C(1) << (cluster_node_id % 64)))
+			   == 0
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| work->old_view.state != DB_IN_PRODUCTION)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX
+		|| work->base.refs[index].anchor_generation == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	if (cf->checkPointCopy.ThisTimeLineID != record->checkpoint_tli
+		|| cf->checkPointCopy.PrevTimeLineID != work->old_view.checkPointCopy.PrevTimeLineID
+		|| cf->checkPointCopy.redo <= record->checkpoint_lower_lsn
+		|| cf->checkPoint <= work->old_view.checkPoint || end < record->validated_tail_lsn_exclusive
+		|| cf->minRecoveryPoint != work->old_view.minRecoveryPoint
+		|| cf->minRecoveryPointTLI != work->old_view.minRecoveryPointTLI
+		|| cf->unloggedLSN < work->old_view.unloggedLSN)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	make_read_token(&work->base, self->origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->thread_token);
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+
+	memset(&anchor, 0, sizeof(anchor));
+	anchor.identity = *self;
+	anchor.database_incarnation = work->base.header.v2.database_incarnation;
+	anchor.config_generation = work->base.header.v2.config_generation;
+	anchor.anchor_generation = work->base.refs[index].anchor_generation + 1;
+	memcpy(anchor.claim_sha256, work->base.refs[index].claim_sha256, 32);
+	anchor.state = cf->state;
+	anchor.write_time = cf->time;
+	anchor.checkpoint = cf->checkPoint;
+	anchor.checkpoint_copy = cf->checkPointCopy;
+	anchor.unlogged_lsn = cf->unloggedLSN;
+	anchor.min_recovery_point = cf->minRecoveryPoint;
+	anchor.min_recovery_tli = cf->minRecoveryPointTLI;
+	if (!pg_strong_random(uuid, sizeof(uuid)))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	uuid[6] = (uuid[6] & 0x0f) | 0x40;
+	uuid[8] = (uuid[8] & 0x3f) | 0x80;
+	result = cluster_recovery_anchor_v2_prepare(&anchor, uuid, &work->stage);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	walr_result
+		= cluster_wal_retention_root_publish_begin_exact(&work->thread_token, false, &work->walr);
+	if (walr_result != CLUSTER_WAL_PIN_OK)
+		return walr_result == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+													: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!acquire_clusterwide_cf(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ExclusiveLock;
+	result
+		= cluster_control_root_v2_read_thread_locked(self, &work->next, &work->new_view, &actual);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (!file_token_equal(&work->before, &actual)
+		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = cluster_recovery_anchor_v2_install(&work->stage);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_recovery_anchor_v2_read_locked(&work->stage.ref, &work->old_view,
+													&work->new_view);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	record = &work->next.records[index];
+	record->checkpoint_tli = cf->checkPointCopy.ThisTimeLineID;
+	record->checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+	record->checkpoint_lower_lsn = cf->checkPointCopy.redo;
+	record->checkpoint_record_crc32c = crc;
+	record->root_flags
+		|= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	record->tail_tli = record->checkpoint_tli;
+	record->tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	record->validated_tail_lsn_exclusive = end;
+	record->tail_last_record_lsn = cf->checkPoint;
+	record->tail_last_record_crc32c = crc;
+	record->root_publish_seq++;
+	record->published_at_usec = GetCurrentTimestamp();
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_CHECKPOINT_ADVANCE;
+	work->next.publisher_incarnation[index] = self->origin_owner_incarnation;
+	work->next.publisher_node[index] = self->origin_node_id;
+	work->next.refs[index].anchor_generation = work->stage.ref.anchor_generation;
+	memcpy(work->next.refs[index].anchor_sha256, work->stage.ref.anchor_sha256, 32);
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = record->published_at_usec;
+	result = cluster_control_root_v2_encode(&work->next);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_control_root_v2_read_thread_locked(self, &work->base, &work->new_view,
+														&work->after);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	if (!checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *self,
+										   const ControlFileData *thread_control,
+										   XLogRecPtr checkpoint_end, uint32 checkpoint_crc,
+										   ClusterControlRootSnapshot *out,
+										   ClusterControlRootFileToken *out_token)
+{
+	CheckpointV2Work *work;
+	ClusterControlRootResult result;
+	uint64 epoch;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (self == NULL || thread_control == NULL || out == NULL || out_token == NULL
+		|| !AmCheckpointerProcess() || !enableFsync || self->origin_thread_id == 0
+		|| self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| thread_control->state != DB_IN_PRODUCTION || checkpoint_crc == 0
+		|| thread_control->backupStartPoint != 0 || thread_control->backupEndPoint != 0
+		|| thread_control->backupEndRequired || thread_control->checkPoint == 0
+		|| thread_control->checkPointCopy.redo == 0
+		|| thread_control->checkPointCopy.redo > thread_control->checkPoint
+		|| checkpoint_end <= thread_control->checkPoint
+		|| self->system_identifier != GetSystemIdentifier()
+		|| thread_control->system_identifier != self->system_identifier
+		|| cluster_cf_classify_buffer((const char *)thread_control, sizeof(*thread_control),
+									  self->system_identifier)
+			   != CLUSTER_CF_VALID)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* Never invert an outer CF hold into WALR acquisition. */
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	epoch = cluster_epoch_get_current();
+	if (!checkpoint_v2_owner_current(self, epoch, thread_control->checkPointCopy.ThisTimeLineID,
+									 checkpoint_end))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		result = checkpoint_v2_publish_work(work, self, thread_control, checkpoint_end,
+											checkpoint_crc, epoch);
+	}
+	PG_CATCH();
+	{
+		(void)checkpoint_v2_cleanup(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	result = checkpoint_v2_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		*out = work->base.records[self->origin_thread_id - 1];
+		*out_token = work->after;
+	}
+	pfree(work);
+	return result;
 }
 
 /*
