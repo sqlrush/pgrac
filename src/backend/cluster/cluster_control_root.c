@@ -292,8 +292,12 @@ snapshot_reserved_zero(const ClusterControlRootSnapshot *snapshot)
 static ClusterControlRootResult
 snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_thread,
 				  uint64 system_identifier, const uint8 storage_uuid[16],
-				  const uint8 authority_uuid[16])
+				  const uint8 authority_uuid[16], bool v2)
 {
+	/* PGRAC: v2 validity flags and exact WAL/claim checks prove presence.
+	 * Zero is a possible CRC32C, not an absence sentinel. Keep v1 unchanged.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
 	uint32 flags;
 	bool checkpoint_valid;
 	bool tail_valid;
@@ -312,7 +316,7 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 		|| snapshot->identity.origin_node_id < 0
 		|| snapshot->identity.origin_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| snapshot->identity.thread_claim_created_at == 0
-		|| snapshot->identity.thread_claim_crc32c == 0
+		|| (!v2 && snapshot->identity.thread_claim_crc32c == 0)
 		|| snapshot->identity.origin_owner_incarnation == 0
 		|| snapshot->identity.root_lineage_seq == 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
@@ -332,7 +336,7 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 	bound_valid = (flags & CLUSTER_CONTROL_ROOT_FLAG_CONSERVATIVE_SCN_VALID) != 0;
 
 	if (!checkpoint_valid || snapshot->checkpoint_tli == 0 || snapshot->checkpoint_lower_lsn == 0
-		|| snapshot->checkpoint_record_crc32c == 0
+		|| (!v2 && snapshot->checkpoint_record_crc32c == 0)
 		|| (snapshot->checkpoint_source_kind != CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1
 			&& snapshot->checkpoint_source_kind
 				   != CLUSTER_CONTROL_ROOT_CHECKPOINT_RECOVERY_ANCHOR_V1))
@@ -347,7 +351,7 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 				|| snapshot->tail_last_record_crc32c != 0)
 				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		} else if (!tail_last_valid || snapshot->tail_last_record_lsn == 0
-				   || snapshot->tail_last_record_crc32c == 0
+				   || (!v2 && snapshot->tail_last_record_crc32c == 0)
 				   || snapshot->tail_last_record_lsn >= snapshot->validated_tail_lsn_exclusive)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	} else if (snapshot->tail_tli != 0 || snapshot->tail_validation_kind != 0
@@ -365,7 +369,7 @@ snapshot_validate(const ClusterControlRootSnapshot *snapshot, uint16 expected_th
 				|| snapshot->recovered_last_record_crc32c != 0)
 				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		} else if (!recovered_last_valid || snapshot->recovered_last_record_lsn == 0
-				   || snapshot->recovered_last_record_crc32c == 0
+				   || (!v2 && snapshot->recovered_last_record_crc32c == 0)
 				   || snapshot->recovered_last_record_lsn
 						  >= snapshot->recovered_through_lsn_exclusive)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
@@ -553,7 +557,8 @@ decode_record(const uint8 *src, uint16 expected_thread, const ControlRootHeader 
 		|| reason > CLUSTER_CONTROL_ROOT_PUBLISH_COPY_REPAIR)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	result = snapshot_validate(snapshot, expected_thread, header->system_identifier,
-							   header->storage_uuid, header->authority_uuid);
+							   header->storage_uuid, header->authority_uuid,
+							   expected_version == CONTROL_ROOT_RECORD_VERSION_V2);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (expected_version == CONTROL_ROOT_RECORD_VERSION_V2) {
@@ -901,7 +906,7 @@ cluster_control_root_v2_encode(ControlRootImage *image)
 			continue;
 		}
 		result = snapshot_validate(&image->records[i], i + 1, image->header.system_identifier,
-								   image->header.storage_uuid, image->header.authority_uuid);
+								   image->header.storage_uuid, image->header.authority_uuid, true);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
 		if (image->records[i].identity.origin_node_id != i)
@@ -1744,7 +1749,7 @@ migration_image_validate(const ClusterControlRootMigrationImage *image,
 			continue;
 		}
 		if (snapshot_validate(snapshot, (uint16)(i + 1), image->system_identifier,
-							  image->storage_uuid, image->authority_uuid)
+							  image->storage_uuid, image->authority_uuid, false)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return false;
 		if (snapshot->identity.root_lineage_seq != 1)
@@ -2105,6 +2110,7 @@ typedef struct CheckpointV2Work {
 	ClusterControlRootResult wal_read_result;
 	ClusterWalDurablePrefixRef prefix_ref;
 	ClusterWalDurablePrefix prefix;
+	uint32 checkpoint_crc;
 } CheckpointV2Work;
 
 /* A readable record plus an in-memory flush LSN is not the durable promise.
@@ -2292,7 +2298,7 @@ checkpoint_v2_wal_paths_current(const CheckpointV2Work *work,
 
 static ClusterControlRootResult
 checkpoint_v2_wal_verify(CheckpointV2Work *work, const ClusterControlRootIdentity *self,
-						 const ControlFileData *control, XLogRecPtr end, uint32 crc)
+						 const ControlFileData *control, XLogRecPtr end)
 {
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	char thread[32], generation[48];
@@ -2333,13 +2339,13 @@ checkpoint_v2_wal_verify(CheckpointV2Work *work, const ClusterControlRootIdentit
 	if (work->wal_read_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return work->wal_read_result;
 	if (record == NULL || work->wal_reader->ReadRecPtr != control->checkPoint
-		|| work->wal_reader->EndRecPtr != end || record->xl_crc != crc
-		|| record->xl_rmid != RM_XLOG_ID
+		|| work->wal_reader->EndRecPtr != end || record->xl_rmid != RM_XLOG_ID
 		|| (record->xl_info & ~XLR_INFO_MASK) != XLOG_CHECKPOINT_ONLINE
 		|| XLogRecGetDataLen(work->wal_reader) != sizeof(CheckPoint)
 		|| XLogRecHasAnyBlockRefs(work->wal_reader))
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	memcpy(&checkpoint, XLogRecGetData(work->wal_reader), sizeof(checkpoint));
+	work->checkpoint_crc = record->xl_crc;
 	return checkpoint_wal_matches(&checkpoint, &control->checkPointCopy)
 			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			   : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
@@ -2380,7 +2386,8 @@ checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
 	if (work->stage.owner_pid != 0) {
 		discarded = cluster_recovery_anchor_v2_discard(&work->stage);
 		if (discarded != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			&& (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| result == CLUSTER_CONTROL_ROOT_CAS_CONFLICT))
 			result = discarded;
 	}
 	return result;
@@ -2388,7 +2395,7 @@ checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
 
 static ClusterControlRootResult
 checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdentity *self,
-						   const ControlFileData *cf, XLogRecPtr end, uint32 crc, uint64 epoch)
+						   const ControlFileData *cf, XLogRecPtr end, uint64 epoch)
 {
 	ClusterControlRootResult result;
 	ClusterControlRootFileToken actual;
@@ -2396,6 +2403,7 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	ClusterRecoveryAnchorV2 anchor;
 	ClusterWalPinResult walr_result;
 	uint8 uuid[16];
+	uint32 crc;
 	int index = self->origin_thread_id - 1;
 
 	if (!acquire_clusterwide_cf(ShareLock))
@@ -2481,10 +2489,11 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (walr_result != CLUSTER_WAL_PIN_OK)
 		return walr_result == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 													: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	result = checkpoint_v2_prefix_observe(work, cf, end, crc);
+	result = checkpoint_v2_wal_verify(work, self, cf, end);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	result = checkpoint_v2_wal_verify(work, self, cf, end, crc);
+	crc = work->checkpoint_crc;
+	result = checkpoint_v2_prefix_observe(work, cf, end, crc);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
@@ -2495,9 +2504,11 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
-	if (!file_token_equal(&work->before, &actual) || !checkpoint_v2_wal_paths_current(work, self)
+	if (!checkpoint_v2_wal_paths_current(work, self)
 		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!file_token_equal(&work->before, &actual))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
 	result = checkpoint_v2_prefix_observe(work, cf, end, crc);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -2556,25 +2567,29 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 ClusterControlRootResult
 cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *self,
 										   const ControlFileData *thread_control,
-										   XLogRecPtr checkpoint_end, uint32 checkpoint_crc,
+										   XLogRecPtr checkpoint_end,
 										   ClusterControlRootSnapshot *out,
-										   ClusterControlRootFileToken *out_token)
+										   ClusterControlRootFileToken *out_token,
+										   ControlFileData *out_control)
 {
 	CheckpointV2Work *work;
 	ClusterControlRootResult result;
 	uint64 epoch;
 
+	if (out_control != NULL && out_control == thread_control)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out_control != NULL)
+		memset(out_control, 0, sizeof(*out_control));
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
 	if (self == NULL || thread_control == NULL || out == NULL || out_token == NULL
-		|| !AmCheckpointerProcess() || !enableFsync || self->origin_thread_id == 0
-		|| self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| thread_control->state != DB_IN_PRODUCTION || checkpoint_crc == 0
-		|| thread_control->backupStartPoint != 0 || thread_control->backupEndPoint != 0
-		|| thread_control->backupEndRequired || thread_control->checkPoint == 0
-		|| thread_control->wal_level < WAL_LEVEL_MINIMAL
+		|| out_control == NULL || !AmCheckpointerProcess() || !enableFsync
+		|| self->origin_thread_id == 0 || self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| thread_control->state != DB_IN_PRODUCTION || thread_control->backupStartPoint != 0
+		|| thread_control->backupEndPoint != 0 || thread_control->backupEndRequired
+		|| thread_control->checkPoint == 0 || thread_control->wal_level < WAL_LEVEL_MINIMAL
 		|| thread_control->wal_level > WAL_LEVEL_LOGICAL || thread_control->MaxConnections <= 0
 		|| thread_control->max_worker_processes < 0 || thread_control->max_wal_senders < 0
 		|| thread_control->max_prepared_xacts < 0 || thread_control->max_locks_per_xact <= 0
@@ -2601,8 +2616,7 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 		work->wal_segments[i] = -1;
 	PG_TRY();
 	{
-		result = checkpoint_v2_publish_work(work, self, thread_control, checkpoint_end,
-											checkpoint_crc, epoch);
+		result = checkpoint_v2_publish_work(work, self, thread_control, checkpoint_end, epoch);
 	}
 	PG_CATCH();
 	{
@@ -2615,6 +2629,7 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		*out = work->base.records[self->origin_thread_id - 1];
 		*out_token = work->after;
+		*out_control = work->new_view;
 	}
 	pfree(work);
 	return result;
@@ -3443,9 +3458,9 @@ cluster_control_root_compare_and_publish(const ClusterControlRootReadToken *expe
 			snapshot.root_publish_seq++;
 			snapshot.published_at_usec = GetCurrentTimestamp();
 			snapshot.lifecycle_reason = reason;
-			result
-				= snapshot_validate(&snapshot, thread_id, updated->header.system_identifier,
-									updated->header.storage_uuid, updated->header.authority_uuid);
+			result = snapshot_validate(&snapshot, thread_id, updated->header.system_identifier,
+									   updated->header.storage_uuid, updated->header.authority_uuid,
+									   false);
 		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 			updated->records[thread_id - 1] = snapshot;

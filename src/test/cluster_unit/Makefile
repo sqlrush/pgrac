@@ -122,6 +122,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_cf_authority \
 		test_cluster_shared_config \
 		test_cluster_control_root \
+		test_cluster_checkpoint_native \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
 		test_cluster_formation_witness \
@@ -422,6 +423,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_durable_prefix test_cluster_wal_durable_publish,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native,$(SIMPLE_TESTS))
 
 # The included production wait loop has disabled diagnostic probes.
 test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
@@ -679,6 +681,23 @@ test_cluster_checkpointer_stop.inc: $(top_srcdir)/src/backend/postmaster/checkpo
 	awk '/^HandleCheckpointerInterrupts\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+
+# PGRAC: execute the native adapter, not source-string assertions.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ClusterCheckpointV2(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^CreateCheckPoint\(/ { owner=1 } owner && /Update the control file\./ { pending=1 } \
+	     owner && pending && /LWLockAcquire\(ControlFileLock/ { emit=1; count++; pending=0 } \
+	     emit { print; if (/LWLockRelease\(ControlFileLock/) emit=0 } /^}/ { owner=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_checkpoint_candidate.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_native_wal_stop.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^cluster_native_wal_shutdown_observe\(/ { print "bool"; emit=1; count++ } \

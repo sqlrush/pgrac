@@ -214,6 +214,11 @@
 #include "cluster/cluster_write_fence.h" /* PGRAC: RF-ROOT P6 checkpoint fence deferral */
 #include "cluster/cluster_lms.h" /* PGRAC: spec-5.6 GES-ready boundary for CF X */
 #include "cluster/cluster_recovery_duty.h" /* PGRAC: RF-ROOT P7 G1a canonical checkpoint advance */
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_startup_phase.h"
+#include "../../cluster/cluster_control_root_private.h"
 #endif
 
 extern uint32 bootstrap_data_checksum_version;
@@ -4926,6 +4931,12 @@ static void
 UpdateControlFile(void)
 {
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: neither native writes nor a legacy bring-up skip can complete
+	 * an unclassified root-v2 lifecycle/configuration publication. */
+	if (cluster_shared_config)
+		ereport(PANIC,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("root-v2 control update requires its native purpose adapter")));
 
 	/*
 	 * PGRAC: spec-5.6 Db3 + increment (ii).  In shared-authority mode the
@@ -7777,6 +7788,111 @@ update_checkpoint_display(int flags, bool restartpoint, bool reset)
 }
 
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: purpose-bound native checkpoint adapter. Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterCheckpointV2Prepare(int flags, ControlFileData *selected)
+{
+	ClusterWalDurablePrefixRef ref;
+	bool readable;
+	uint64 epoch = cluster_epoch_get_current();
+
+	memset(selected, 0, sizeof(*selected));
+	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+		|| (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) != 0
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock) || epoch == 0
+		|| !cluster_external_fence_runtime_active()
+		|| !cluster_wal_thread_current_v2_ref(&ref))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("root-v2 online checkpoint requires its admitted native owner")));
+	if (!cluster_cf_lock(ShareLock))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not acquire control-root read authority for checkpoint")));
+	PG_TRY();
+	{
+		readable = cluster_cf_held_is_clusterwide(ShareLock)
+			&& cluster_cf_authority_read(selected);
+	}
+	PG_CATCH();
+	{
+		(void) cluster_cf_unlock_confirmed(ShareLock);
+		memset(selected, 0, sizeof(*selected));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED
+		|| !readable || selected->state != DB_IN_PRODUCTION
+		|| selected->system_identifier != ref.claim.identity.system_identifier
+		|| selected->checkPointCopy.ThisTimeLineID != ref.timeline
+		|| selected->minRecoveryPoint != InvalidXLogRecPtr
+		|| selected->minRecoveryPointTLI != 0 || selected->backupStartPoint != 0
+		|| selected->backupEndPoint != 0 || selected->backupEndRequired
+		|| cluster_epoch_get_current() != epoch)
+	{
+		memset(selected, 0, sizeof(*selected));
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("root-v2 checkpoint input or read-authority release is unproven")));
+	}
+}
+
+static void
+ClusterCheckpointV2Publish(const ControlFileData *candidate, XLogRecPtr end)
+{
+	ClusterWalDurablePrefixRef ref;
+	ControlFileData selected;
+	ClusterControlRootSnapshot published;
+	ClusterControlRootFileToken token;
+	ClusterControlRootResult result;
+	uint64 epoch = cluster_epoch_get_current();
+
+	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock) || epoch == 0
+		|| !cluster_wal_thread_current_v2_ref(&ref))
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("root-v2 checkpoint publication requires its native owner")));
+	for (;;)
+	{
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_epoch_get_current() != epoch
+			|| cluster_reconfig_has_pending_prebump_stage()
+			|| !cluster_external_fence_runtime_active()
+			|| !cluster_serving_ready_is_current() || !cluster_write_fence_allowed())
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("checkpoint authority changed before control-root publication")));
+		result = cluster_control_root_v2_checkpoint_publish(
+			&ref.claim.identity, candidate, end, &published, &token, &selected);
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+			break;
+		/* A peer won the whole-file CAS. All CF/WALR holds and own staging
+		 * are released before this interruptible owner wait and reobservation.
+		 * STALE identity/namespace and uncertain I/O are not this retry class. */
+		(void) WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+						 20, WAIT_EVENT_CHECKPOINTER_MAIN);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not publish the native checkpoint in the control root"),
+				 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=CHECKPOINT_UNPROVEN result=%d",
+						   (int) result)));
+	/* No native projection or WAL cleanup precedes the durable root result.
+	 * A later lifecycle change does not roll back that durable fact. */
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	*ControlFile = selected;
+	LWLockRelease(ControlFileLock);
+}
+#endif
+
 /*
  * Perform a checkpoint --- either during shutdown, or on-the-fly
  *
@@ -7822,9 +7938,11 @@ CreateCheckPoint(int flags)
 	int			nvxids;
 	int			oldXLogAllowed = 0;
 	XLogRecPtr	slotsMinReqLSN;
+	ControlFileData *checkpoint_control = ControlFile;
 #ifdef USE_PGRAC_CLUSTER
 	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
 	bool		fpw_off_transition = false; /* RF-ROOT P7 G1a-2: W5b FPW-off happened this checkpoint */
+	ControlFileData v2_checkpoint;
 #endif
 
 	/*
@@ -7841,6 +7959,20 @@ CreateCheckPoint(int flags)
 		elog(ERROR, "can't create a checkpoint during recovery");
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: select only this thread before any checkpoint mutation. Startup,
+	 * shutdown and parameter transitions need their distinct purpose owner;
+	 * neither the old CF skip nor EOR exemption grants root-v2 permission. */
+	if (cluster_shared_config)
+	{
+		ClusterCheckpointV2Prepare(flags, &v2_checkpoint);
+		if (fullPageWrites != Insert->fullPageWrites)
+			ereport(ERROR,
+					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+					 errmsg("root-v2 full-page-write transition requires configuration publication")));
+		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+		*ControlFile = v2_checkpoint;
+		LWLockRelease(ControlFileLock);
+	}
 	/*
 	 * RF-B CONSUME: after the EOR sanity check and before checkpoint I/O,
 	 * freshly recheck the shared authority identity.  The identity read completes
@@ -7926,13 +8058,13 @@ CreateCheckPoint(int flags)
 	 * unless the authority is enabled.  The exact one-node EOR owner bypasses
 	 * CF X using its distinct local permission; all later checkpoints use CF X.
 	 */
-	if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window()
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window()
 		&& cluster_cf_owner_eor_local_active())
 	{
 		/* OWNER EOR neither takes CF X nor inherits a stale write-skip. */
 		cluster_cf_set_write_skip(false);
 	}
-	else if (cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window())
+	else if (!cluster_shared_config && cluster_controlfile_shared_authority && !cluster_cf_in_bootstrap_window())
 	{
 		/*
 		 * A multi-node node still in its JOIN_READONLY bring-up window (Phase-2
@@ -8010,7 +8142,7 @@ CreateCheckPoint(int flags)
 	 * verifying its outer CF(X), but before entering the checkpoint critical
 	 * section.  The helper borrows that hold and never reacquires it.
 	 */
-	if ((flags & CHECKPOINT_END_OF_RECOVERY) == 0)
+	if (!cluster_shared_config && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		fpw_off_transition = UpdateFullPageWritesForCheckpoint();
 #endif
 
@@ -8350,13 +8482,21 @@ CreateCheckPoint(int flags)
 	 * Update the control file.
 	 */
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: native candidate is private until the root publisher succeeds. */
+	if (cluster_shared_config)
+	{
+		v2_checkpoint = *ControlFile;
+		checkpoint_control = &v2_checkpoint;
+	}
+#endif
 	if (shutdown)
-		ControlFile->state = DB_SHUTDOWNED;
-	ControlFile->checkPoint = ProcLastRecPtr;
-	ControlFile->checkPointCopy = checkPoint;
+		checkpoint_control->state = DB_SHUTDOWNED;
+	checkpoint_control->checkPoint = ProcLastRecPtr;
+	checkpoint_control->checkPointCopy = checkPoint;
 	/* crash recovery should always recover to the end of WAL */
-	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
-	ControlFile->minRecoveryPointTLI = 0;
+	checkpoint_control->minRecoveryPoint = InvalidXLogRecPtr;
+	checkpoint_control->minRecoveryPointTLI = 0;
 
 	/*
 	 * Persist unloggedLSN value. It's reset on crash recovery, so this goes
@@ -8364,10 +8504,21 @@ CreateCheckPoint(int flags)
 	 * for debugging purposes.
 	 */
 	SpinLockAcquire(&XLogCtl->ulsn_lck);
-	ControlFile->unloggedLSN = XLogCtl->unloggedLSN;
+	checkpoint_control->unloggedLSN = XLogCtl->unloggedLSN;
 	SpinLockRelease(&XLogCtl->ulsn_lck);
 
-	UpdateControlFile();
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+	{
+		checkpoint_control->time = (pg_time_t) time(NULL);
+		INIT_CRC32C(checkpoint_control->crc);
+		COMP_CRC32C(checkpoint_control->crc, checkpoint_control,
+					 offsetof(ControlFileData, crc));
+		FIN_CRC32C(checkpoint_control->crc);
+	}
+	else
+#endif
+		UpdateControlFile();
 	LWLockRelease(ControlFileLock);
 
 #ifdef USE_PGRAC_CLUSTER
@@ -8385,7 +8536,7 @@ CreateCheckPoint(int flags)
 	 * gate: the anchor is a per-node file and must keep advancing even
 	 * while this node's shared-authority writes are suppressed.
 	 */
-	if (cluster_controlfile_shared_authority && cluster_node_id >= 0)
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && cluster_node_id >= 0)
 		cluster_recovery_anchor_publish_checkpoint(ProcLastRecPtr, &checkPoint,
 												   ControlFile->system_identifier,
 												   shutdown ? (uint32) DB_SHUTDOWNED :
@@ -8405,6 +8556,11 @@ CreateCheckPoint(int flags)
 	END_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: root publication precedes every post-checkpoint cleanup. No
+	 * outer CF, native content lock or critical section encloses this wait. */
+	if (cluster_shared_config)
+		ClusterCheckpointV2Publish(&v2_checkpoint, recptr);
+
 	/*
 	 * RF A1 W5a: only a non-EOR checkpoint advertises its now-durable redo
 	 * start.  This is outside the checkpoint critical section and before all
@@ -8412,7 +8568,7 @@ CreateCheckPoint(int flags)
 	 * held.  Failure leaves the prior conservative advert intact and does not
 	 * fail the PostgreSQL checkpoint.
 	 */
-	if ((flags & CHECKPOINT_END_OF_RECOVERY) == 0)
+	if (!cluster_shared_config && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		ClusterWalStatePublishCheckpointRedo(checkPoint.redo);
 
 	/*
@@ -8544,7 +8700,7 @@ CreateCheckPoint(int flags)
 	 * canonical, and its WAL-read/CF interactions inside the recovery
 	 * window stall the phase-3 barrier (observed t243 bail).
 	 */
-	if (ClusterWalStateConfigured()
+	if (!cluster_shared_config && ClusterWalStateConfigured()
 		&& (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 	{
 		uint32		ckpt_record_crc = ClusterCheckpointRecordCrc32(recptr);
