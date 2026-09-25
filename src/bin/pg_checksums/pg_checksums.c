@@ -547,6 +547,11 @@ main(int argc, char *argv[])
 		exit(1);
 	}
 
+	/* PGRAC: do not mutate checksums or report incomplete cluster-wide coverage
+	 * from a non-authoritative native projection. Author: SqlRush <sqlrush@gmail.com>
+	 */
+	reject_pgrac_legacy_operation(DataDir);
+
 	/* Read the control file and check compatibility */
 	ControlFile = get_controlfile(DataDir, &crc_ok);
 	if (!crc_ok)

@@ -75,9 +75,9 @@
 #include "cluster/cluster_undo_segment_init.h"  /* seed segment helper */
 #include "cluster/cluster_wal_state.h"
 #include "common/cluster_hw_snapshot_codec.h"
-#include "common/controldata_utils.h"
 #include "datatype/timestamp.h"
 #endif
+#include "common/controldata_utils.h"
 #include "common/file_perm.h"
 #include "common/file_utils.h"
 #include "common/logging.h"
@@ -4217,6 +4217,10 @@ main(int argc, char *argv[])
 	if (sync_only)
 	{
 		setup_pgdata();
+		/* PGRAC: native fsync is not shared-root qualification.
+		 * Author: SqlRush <sqlrush@gmail.com>
+		 */
+		reject_pgrac_legacy_operation(pg_data);
 
 		/* must check that directory is readable */
 		if (pg_check_dir(pg_data) <= 0)
@@ -4260,6 +4264,12 @@ main(int argc, char *argv[])
 	get_restricted_token();
 
 	setup_pgdata();
+
+	/* PGRAC: refuse marked existing targets before any creation/cleanup owner
+	 * is established. Fresh unmarked initdb is unchanged.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	reject_pgrac_legacy_operation(pg_data);
 
 	setup_bin_paths(argv[0]);
 
