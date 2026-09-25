@@ -6,6 +6,8 @@
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_recovery_duty.h"
+#include "../../backend/cluster/cluster_control_root_private.h"
+#include "cluster/cluster_wal_thread.h"
 #include "postmaster/interrupt.h"
 #include "storage/procsignal.h"
 #include "storage/ipc.h"
@@ -13,6 +15,8 @@
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/guc.h"
+#include "storage/latch.h"
+#include "utils/wait_event.h"
 #include <setjmp.h>
 
 #undef printf
@@ -27,6 +31,13 @@ static int report_calls, config_calls;
 static bool requested, prepare_ok, stopped_ok, complete_ok, fail_checkpoint, fail_at_finish;
 static bool native_mode, native_stopped_ok;
 static unsigned native_stopped_calls;
+bool cluster_shared_config;
+static bool v2_ref_ok, v2_observe_ok;
+static unsigned v2_observe_calls;
+static unsigned v2_cas_left, v2_waits;
+static bool cancel_on_wait;
+static Latch fixture_latch;
+Latch *MyLatch = &fixture_latch;
 static ClusterNormalStopFailure failure;
 static ClusterPhase1FullStopPrepareResult old_prepare_result;
 static char trace[32];
@@ -164,6 +175,48 @@ cluster_wal_state_publish_stopped(void)
 	record('S');
 	return stopped_ok;
 }
+
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->claim.identity.origin_thread_id = 1;
+	return v2_ref_ok;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *ref,
+										 ClusterControlRootSnapshot *out,
+										 ClusterControlRootFileToken *token)
+{
+	UT_ASSERT_EQ(checkpoint_calls, 1);
+	UT_ASSERT_EQ(ref->claim.identity.origin_thread_id, 1);
+	memset(out, 0, sizeof(*out));
+	memset(token, 0, sizeof(*token));
+	v2_observe_calls++;
+	record('V');
+	if (v2_cas_left != 0) {
+		--v2_cas_left;
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	}
+	return v2_observe_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+int
+WaitLatch(Latch *latch, int events, long timeout, uint32 wait_event)
+{
+	UT_ASSERT(latch == MyLatch);
+	UT_ASSERT((events & WL_EXIT_ON_PM_DEATH) != 0);
+	UT_ASSERT_EQ(timeout, 20);
+	UT_ASSERT_EQ(wait_event, WAIT_EVENT_CHECKPOINTER_MAIN);
+	v2_waits++;
+	return WL_TIMEOUT;
+}
+void
+ResetLatch(Latch *latch)
+{
+	UT_ASSERT(latch == MyLatch);
+}
 bool
 cluster_normal_stop_native_wal_mode(void)
 {
@@ -207,11 +260,24 @@ proc_exit(int code)
 			longjmp(exit_boundary, 1);                                                             \
 		}                                                                                          \
 	} while (0)
+#undef CHECK_FOR_INTERRUPTS
+#define CHECK_FOR_INTERRUPTS()                                                                     \
+	do {                                                                                           \
+		if (cancel_on_wait && v2_waits != 0) {                                                     \
+			exit_code = 1;                                                                         \
+			longjmp(exit_boundary, 1);                                                             \
+		}                                                                                          \
+	} while (0)
 #include "test_cluster_checkpointer_stop.inc"
 
 static void
 reset_fixture(void)
 {
+	cluster_shared_config = false;
+	v2_ref_ok = v2_observe_ok = true;
+	v2_observe_calls = 0;
+	v2_cas_left = v2_waits = 0;
+	cancel_on_wait = false;
 	native_mode = false;
 	native_stopped_ok = true;
 	native_stopped_calls = 0;
@@ -369,10 +435,72 @@ UT_TEST(native_control_or_checkpoint_failure_never_closes)
 		assert_no_fallback();
 	}
 }
+
+UT_TEST(v2_uses_root_stop_evidence_not_flat_registry)
+{
+	reset_fixture();
+	cluster_shared_config = true;
+	stopped_ok = false;
+	run_handler();
+	UT_ASSERT_EQ(exit_code, 0);
+	UT_ASSERT(strcmp(trace, "PWVCE") == 0);
+	UT_ASSERT_EQ(stopped_calls, 0);
+	UT_ASSERT_EQ(native_stopped_calls, 0);
+	UT_ASSERT_EQ(v2_observe_calls, 1);
+	assert_no_fallback();
+}
+
+UT_TEST(v2_failed_stop_observation_cannot_complete)
+{
+	for (int fault = 0; fault < 3; ++fault) {
+		reset_fixture();
+		cluster_shared_config = true;
+		v2_ref_ok = fault != 0;
+		v2_observe_ok = fault != 1;
+		fail_checkpoint = fault == 2;
+		run_handler();
+		UT_ASSERT_EQ(exit_code, 1);
+		UT_ASSERT_EQ(complete_calls, 0);
+		UT_ASSERT_EQ(stopped_calls, 0);
+		UT_ASSERT_EQ(v2_observe_calls, fault == 1 ? 1 : 0);
+		assert_no_fallback();
+	}
+}
+
+UT_TEST(v2_missing_producer_cut_never_enters_legacy_drain)
+{
+	reset_fixture();
+	cluster_shared_config = true;
+	requested = false;
+	run_handler();
+	UT_ASSERT_EQ(exit_code, 1);
+	UT_ASSERT_EQ(checkpoint_calls, 0);
+	UT_ASSERT_EQ(v2_observe_calls, 0);
+	UT_ASSERT_EQ(stopped_calls, 0);
+	assert_no_fallback();
+}
+
+UT_TEST(v2_peer_root_publication_reobserves_without_fake_failure)
+{
+	for (int cancel = 0; cancel < 2; ++cancel) {
+		reset_fixture();
+		cluster_shared_config = true;
+		v2_cas_left = 2;
+		cancel_on_wait = cancel;
+		run_handler();
+		UT_ASSERT_EQ(exit_code, cancel ? 1 : 0);
+		UT_ASSERT_EQ(v2_waits, cancel ? 1 : 2);
+		UT_ASSERT_EQ(v2_observe_calls, cancel ? 1 : 3);
+		UT_ASSERT_EQ(complete_calls, cancel ? 0 : 1);
+		UT_ASSERT_EQ(checkpoint_calls, 1);
+		UT_ASSERT_EQ(stopped_calls, 0);
+		assert_no_fallback();
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(15);
 	UT_RUN(no_shutdown_is_not_a_stop_request);
 	UT_RUN(original_noncurrent_path_is_unchanged);
 	UT_RUN(current_calls_real_shutdown_between_two_current_barriers);
@@ -384,6 +512,10 @@ main(void)
 	UT_RUN(preexisting_failure_cannot_run_shutdown_checkpoint);
 	UT_RUN(native_calls_real_shutdown_before_own_durable_observer);
 	UT_RUN(native_control_or_checkpoint_failure_never_closes);
+	UT_RUN(v2_uses_root_stop_evidence_not_flat_registry);
+	UT_RUN(v2_failed_stop_observation_cannot_complete);
+	UT_RUN(v2_missing_producer_cut_never_enters_legacy_drain);
+	UT_RUN(v2_peer_root_publication_reobserves_without_fake_failure);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

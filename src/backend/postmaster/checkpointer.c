@@ -42,8 +42,11 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_clean_leave.h" /* shutdown handoff drain (RF-ROOT P6) */
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_duty.h" /* thread clean-close publish (RF-ROOT P6) */
 #include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_thread.h"
+#include "../cluster/cluster_control_root_private.h"
 #endif
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
@@ -624,6 +627,11 @@ HandleCheckpointerInterrupts(void)
 		memset(&phase1_full_stop_plan, 0, sizeof(phase1_full_stop_plan));
 		memset(&normal_stop_observation, 0, sizeof(normal_stop_observation));
 		phase1_full_stop_prepare_result = CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE;
+		/* PGRAC: the old single-leave fallback may generate WAL after the
+		 * shutdown checkpoint. PRE2 needs its retained producer cut first.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (cluster_shared_config && !current_normal_stop)
+			ereport(PANIC, (errmsg("PRE2 shutdown has no retained producer cut")));
 		if (current_normal_stop) {
 			/* This attempt was selected by the postmaster, not by a failed
 			 * pristine probe. Keep every original owner alive until its
@@ -669,7 +677,28 @@ HandleCheckpointerInterrupts(void)
 		 * reaches STOPPED.  Checkpoint + STOPPED first keeps every
 		 * fence-gated write inside the still-valid pre-handoff authority.
 		 */
-		if (current_normal_stop && cluster_normal_stop_native_wal_mode()) {
+		if (cluster_shared_config) {
+			ClusterWalDurablePrefixRef ref;
+			ClusterControlRootSnapshot stopped;
+			ClusterControlRootFileToken token;
+			ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			/* The checkpoint already published the sole durable evidence.
+			 * Do not write or infer STOPPED in the old flat WAL registry. */
+			if (cluster_wal_thread_current_v2_ref(&ref)) {
+				for (;;) {
+					CHECK_FOR_INTERRUPTS();
+					result = cluster_control_root_v2_shutdown_observe(&ref, &stopped, &token);
+					if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+						break;
+					/* Same owner retry as native checkpoint publication. The
+					 * observer released all CF/WALR holds before this wait. */
+					(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+									WAIT_EVENT_CHECKPOINTER_MAIN);
+					ResetLatch(MyLatch);
+				}
+			}
+			wal_stopped_ok = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		} else if (current_normal_stop && cluster_normal_stop_native_wal_mode()) {
 			int64 native_started_at;
 			wal_stopped_ok = cluster_native_wal_shutdown_observe(true, &native_started_at);
 		} else

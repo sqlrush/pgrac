@@ -10,6 +10,7 @@
 
 #include "catalog/pg_control.h"
 #include "cluster/cluster_control_root.h"
+#include "cluster/cluster_wal_durable_prefix.h"
 
 /* PGRAC: backend-private decoded carrier, never a disk struct or permission.
  * Keep the public identity/snapshot/token ABI unchanged.  Both v1 and v2
@@ -219,6 +220,14 @@ extern ClusterControlRootResult cluster_control_root_v2_shutdown_checkpoint_publ
 	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
+
+/* PGRAC: own checkpointer only; reads the exact root-selected shutdown WAL
+ * and durable prefix. No lifecycle/serving/registry write. Not clean-close.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult
+cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expected,
+										 ClusterControlRootSnapshot *out,
+										 ClusterControlRootFileToken *out_token);
 
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
