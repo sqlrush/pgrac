@@ -1136,6 +1136,13 @@ v2_fixture(uint8 bytes[512], ClusterRecoveryAnchorRefV2 *ref)
 	v2_put(bytes, 256, UINT64_C(0xa1b2c3d4), 4);
 	v2_put(bytes, 260, UINT64_C(0x1234568800), 8);
 	v2_put(bytes, 268, 7, 4);
+	bytes[289] = 1;
+	v2_put(bytes, 292, 2, 4);
+	v2_put(bytes, 296, 311, 4);
+	v2_put(bytes, 300, 24, 4);
+	v2_put(bytes, 304, 12, 4);
+	v2_put(bytes, 308, 11, 4);
+	v2_put(bytes, 312, 129, 4);
 	v2_fix_crc_hash(bytes, ref);
 }
 
@@ -1214,6 +1221,14 @@ UT_TEST(test_v2_exact_fields_and_canonical_roundtrip)
 	UT_ASSERT_EQ(out.backup_start, 0);
 	UT_ASSERT_EQ(out.backup_end, 0);
 	UT_ASSERT(!out.backup_end_required);
+	UT_ASSERT(out.wal_log_hints);
+	UT_ASSERT(!out.track_commit_timestamp);
+	UT_ASSERT_EQ(out.wal_level, 2);
+	UT_ASSERT_EQ(out.max_connections, 311);
+	UT_ASSERT_EQ(out.max_worker_processes, 24);
+	UT_ASSERT_EQ(out.max_wal_senders, 12);
+	UT_ASSERT_EQ(out.max_prepared_xacts, 11);
+	UT_ASSERT_EQ(out.max_locks_per_xact, 129);
 	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&out, encoded), 0);
 	UT_ASSERT(memcmp(bytes, encoded, 512) == 0);
 	/* Logical struct padding must not become part of the persistent image. */
@@ -1226,7 +1241,7 @@ UT_TEST(test_v2_exact_fields_and_canonical_roundtrip)
 
 UT_TEST(test_v2_reserved_and_booleans)
 {
-	const size_t offsets[] = { 6, 7, 57, 63, 100, 103, 124, 127, 210, 211, 289, 507 };
+	const size_t offsets[] = { 6, 7, 57, 63, 100, 103, 124, 127, 210, 211, 291, 316, 507 };
 	uint8 bytes[512];
 	ClusterRecoveryAnchorRefV2 ref;
 	ClusterRecoveryAnchorV2 out;
@@ -1356,6 +1371,14 @@ UT_TEST(test_v2_projection_field_ownership)
 	expected.unloggedLSN = UINT64_C(0x4500000067);
 	expected.minRecoveryPoint = UINT64_C(0x1234568800);
 	expected.minRecoveryPointTLI = 7;
+	expected.wal_log_hints = true;
+	expected.track_commit_timestamp = false;
+	expected.wal_level = 2;
+	expected.MaxConnections = 311;
+	expected.max_worker_processes = 24;
+	expected.max_wal_senders = 12;
+	expected.max_prepared_xacts = 11;
+	expected.max_locks_per_xact = 129;
 	INIT_CRC32C(expected.crc);
 	COMP_CRC32C(expected.crc, &expected, offsetof(ControlFileData, crc));
 	FIN_CRC32C(expected.crc);
@@ -1784,12 +1807,107 @@ UT_TEST(test_v2_stage_requires_fsync_and_clusterwide_x)
 	UT_ASSERT_EQ(cluster_recovery_anchor_v2_install(&stage), 0);
 }
 
+/* PGRAC: historical requirements belong to the selected WAL thread, not the
+ * current common configuration. Literal offsets are independent of the codec.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_parameter_bytes(uint8 bytes[512], ClusterRecoveryAnchorRefV2 *ref)
+{
+	v2_fixture(bytes, ref);
+	bytes[289] = 1;
+	bytes[290] = 0;
+	v2_put(bytes, 292, 2, 4);
+	v2_put(bytes, 296, 811, 4);
+	v2_put(bytes, 300, 28, 4);
+	v2_put(bytes, 304, 19, 4);
+	v2_put(bytes, 308, 13, 4);
+	v2_put(bytes, 312, 259, 4);
+	v2_fix_crc_hash(bytes, ref);
+}
+
+UT_TEST(test_v2_historical_parameters_not_current_common)
+{
+	uint8 bytes[512], encoded[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 anchor;
+	ControlFileData common, out;
+	ClusterControlRootResult result;
+
+	v2_parameter_bytes(bytes, &ref);
+	v2_common(&common);
+	result = cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &out);
+	UT_ASSERT_EQ(result, 0);
+	if (result != 0)
+		return;
+	UT_ASSERT_EQ(out.wal_level, 2);
+	UT_ASSERT(out.wal_log_hints);
+	UT_ASSERT(!out.track_commit_timestamp);
+	UT_ASSERT_EQ(out.MaxConnections, 811);
+	UT_ASSERT_EQ(out.max_worker_processes, 28);
+	UT_ASSERT_EQ(out.max_wal_senders, 19);
+	UT_ASSERT_EQ(out.max_prepared_xacts, 13);
+	UT_ASSERT_EQ(out.max_locks_per_xact, 259);
+	UT_ASSERT_EQ(out.checkPointCopy.nextOid, common.checkPointCopy.nextOid);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &anchor), 0);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&anchor, encoded), 0);
+	UT_ASSERT(memcmp(bytes, encoded, 512) == 0);
+}
+
+UT_TEST(test_v2_parameter_encoding_cannot_be_absent_or_overflow)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+	const size_t capacities[] = { 296, 300, 304, 308, 312 };
+
+	v2_fixture(bytes, &ref);
+	memset(bytes + 289, 0, 27);
+	v2_fix_crc_hash(bytes, &ref);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	for (size_t i = 0; i < lengthof(capacities); ++i) {
+		v2_parameter_bytes(bytes, &ref);
+		v2_put(bytes, capacities[i], UINT32_C(0x80000000), 4);
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+	for (int fault = 0; fault < 3; ++fault) {
+		v2_parameter_bytes(bytes, &ref);
+		v2_put(bytes, fault == 0 ? 292 : fault == 1 ? 296 : 312, fault == 0 ? 3 : 0, 4);
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
+UT_TEST(test_v2_parameter_boolean_and_reserved_bytes)
+{
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterRecoveryAnchorV2 out;
+	const size_t offsets[] = { 289, 290, 291, 316, 507 };
+
+	for (size_t i = 0; i < lengthof(offsets); ++i) {
+		v2_parameter_bytes(bytes, &ref);
+		bytes[offsets[i]] = 2;
+		v2_fix_crc_hash(bytes, &ref);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(bytes, 512, &ref, &out),
+					 CLUSTER_CONTROL_ROOT_BAD_RESERVED);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
 int
 main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);
@@ -1820,6 +1938,9 @@ main(void)
 	UT_RUN(test_v2_stage_owner_and_inode_are_exact);
 	UT_RUN(test_v2_stage_directory_replaced_or_symlinked);
 	UT_RUN(test_v2_stage_requires_fsync_and_clusterwide_x);
+	UT_RUN(test_v2_historical_parameters_not_current_common);
+	UT_RUN(test_v2_parameter_encoding_cannot_be_absent_or_overflow);
+	UT_RUN(test_v2_parameter_boolean_and_reserved_bytes);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

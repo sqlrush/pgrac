@@ -55,6 +55,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "access/xlog.h"
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_enqueue.h"
@@ -150,7 +151,11 @@ anchor_v2_fields_valid(const ClusterRecoveryAnchorV2 *anchor)
 		|| anchor->checkpoint == InvalidXLogRecPtr
 		|| anchor->checkpoint_copy.redo == InvalidXLogRecPtr
 		|| anchor->checkpoint_copy.ThisTimeLineID == 0
-		|| anchor->checkpoint_copy.PrevTimeLineID == 0 || anchor->backup_end_required)
+		|| anchor->checkpoint_copy.PrevTimeLineID == 0 || anchor->backup_end_required
+		|| anchor->wal_level > WAL_LEVEL_LOGICAL || anchor->max_connections == 0
+		|| anchor->max_connections > PG_INT32_MAX || anchor->max_worker_processes > PG_INT32_MAX
+		|| anchor->max_wal_senders > PG_INT32_MAX || anchor->max_prepared_xacts > PG_INT32_MAX
+		|| anchor->max_locks_per_xact == 0 || anchor->max_locks_per_xact > PG_INT32_MAX)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -212,6 +217,14 @@ cluster_recovery_anchor_v2_encode(const ClusterRecoveryAnchorV2 *anchor,
 	AP(272, backup_start, 8);
 	AP(280, backup_end, 8);
 	AP(288, backup_end_required, 1);
+	AP(289, wal_log_hints, 1);
+	AP(290, track_commit_timestamp, 1);
+	AP(292, wal_level, 4);
+	AP(296, max_connections, 4);
+	AP(300, max_worker_processes, 4);
+	AP(304, max_wal_senders, 4);
+	AP(308, max_prepared_xacts, 4);
+	AP(312, max_locks_per_xact, 4);
 #undef AP
 	INIT_CRC32C(crc);
 	COMP_CRC32C(crc, bytes, 508);
@@ -250,8 +263,8 @@ anchor_v2_decode_with_ctx(const uint8 *bytes, size_t len, const ClusterRecoveryA
 		return CLUSTER_CONTROL_ROOT_BAD_ENDIAN;
 	if (!anchor_v2_zero(bytes + 6, 2) || !anchor_v2_zero(bytes + 57, 7)
 		|| !anchor_v2_zero(bytes + 100, 4) || !anchor_v2_zero(bytes + 124, 4)
-		|| !anchor_v2_zero(bytes + 210, 2) || !anchor_v2_zero(bytes + 289, 219) || bytes[56] > 1
-		|| bytes[288] > 1)
+		|| !anchor_v2_zero(bytes + 210, 2) || bytes[291] != 0 || !anchor_v2_zero(bytes + 316, 192)
+		|| bytes[56] > 1 || bytes[288] > 1 || bytes[289] > 1 || bytes[290] > 1)
 		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
 	memset(&anchor, 0, sizeof(anchor));
 #define AG(offset, field, width) anchor.field = anchor_v2_get(bytes, offset, width)
@@ -293,6 +306,14 @@ anchor_v2_decode_with_ctx(const uint8 *bytes, size_t len, const ClusterRecoveryA
 	AG(272, backup_start, 8);
 	AG(280, backup_end, 8);
 	AG(288, backup_end_required, 1);
+	AG(289, wal_log_hints, 1);
+	AG(290, track_commit_timestamp, 1);
+	AG(292, wal_level, 4);
+	AG(296, max_connections, 4);
+	AG(300, max_worker_processes, 4);
+	AG(304, max_wal_senders, 4);
+	AG(308, max_prepared_xacts, 4);
+	AG(312, max_locks_per_xact, 4);
 #undef AG
 	result = anchor_v2_fields_valid(&anchor);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -388,6 +409,17 @@ cluster_recovery_anchor_v2_project(const uint8 *bytes, size_t len,
 	projected.backupStartPoint = anchor.backup_start;
 	projected.backupEndPoint = anchor.backup_end;
 	projected.backupEndRequired = anchor.backup_end_required;
+	/* Recovery checks need this writer's historical requirements. Current GUCs
+	 * are selected separately; neither one substitutes for all-input capacity.
+	 */
+	projected.wal_log_hints = anchor.wal_log_hints;
+	projected.track_commit_timestamp = anchor.track_commit_timestamp;
+	projected.wal_level = anchor.wal_level;
+	projected.MaxConnections = anchor.max_connections;
+	projected.max_worker_processes = anchor.max_worker_processes;
+	projected.max_wal_senders = anchor.max_wal_senders;
+	projected.max_prepared_xacts = anchor.max_prepared_xacts;
+	projected.max_locks_per_xact = anchor.max_locks_per_xact;
 	INIT_CRC32C(projected.crc);
 	COMP_CRC32C(projected.crc, &projected, offsetof(ControlFileData, crc));
 	FIN_CRC32C(projected.crc);

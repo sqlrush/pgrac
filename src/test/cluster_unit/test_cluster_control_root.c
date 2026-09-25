@@ -3534,6 +3534,11 @@ v2_thread_fixture(uint8 bytes[66048], ClusterRecoveryAnchorV2 anchors[2])
 		a->min_recovery_point = a->checkpoint_copy.redo + 64;
 		a->min_recovery_tli = root.records[node].checkpoint_tli;
 		a->unlogged_lsn = UINT64_C(0x2000000) + node;
+		a->max_connections = 300 + node;
+		a->wal_level = 1;
+		a->max_worker_processes = 16;
+		a->max_wal_senders = 5;
+		a->max_locks_per_xact = 64;
 		v2_anchor_object(bytes, a, &a->identity, path);
 	}
 	v2_write_roots(bytes);
@@ -3559,7 +3564,7 @@ UT_TEST(test_v2_thread_view_selects_each_exact_thread)
 		UT_ASSERT_EQ(out.minRecoveryPoint, anchors[i].min_recovery_point);
 		UT_ASSERT_EQ(out.unloggedLSN, anchors[i].unlogged_lsn);
 		UT_ASSERT_EQ(out.state, DB_IN_PRODUCTION);
-		UT_ASSERT_EQ(out.MaxConnections, 300);
+		UT_ASSERT_EQ(out.MaxConnections, i == 0 ? 300 : 427);
 		UT_ASSERT_EQ(out.checkPointCopy.nextOid, 60001);
 		UT_ASSERT_EQ(token.file_txn_seq, 7);
 		UT_ASSERT_EQ(token.format_version, 2);
@@ -3796,6 +3801,129 @@ UT_TEST(test_v2_checkpoint_advances_one_thread_and_preserves_common)
 	UT_ASSERT_EQ(root.records[0].root_publish_seq, 11);
 	UT_ASSERT_EQ(root.records[0].identity.origin_owner_incarnation, 99);
 	v2_assert_anchor_staging_empty();
+}
+
+UT_TEST(test_v2_checkpoint_preserves_historical_parameter_requirements)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlRootImage root;
+	ControlFileData candidate, view;
+
+	v2_checkpoint_fixture(before, &self, &candidate);
+	for (int lower = 0; lower < 2; ++lower) {
+		candidate.MaxConnections = lower ? 100 : 811;
+		candidate.max_worker_processes = lower ? 1 : 28;
+		candidate.max_wal_senders = lower ? 0 : 19;
+		candidate.max_prepared_xacts = lower ? 0 : 13;
+		candidate.max_locks_per_xact = lower ? 1 : 259;
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token), 0);
+		UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(&self, &root, &view, &token), 0);
+		UT_ASSERT_EQ(view.MaxConnections, 811);
+		UT_ASSERT_EQ(view.max_worker_processes, 28);
+		UT_ASSERT_EQ(view.max_wal_senders, 19);
+		UT_ASSERT_EQ(view.max_prepared_xacts, 13);
+		UT_ASSERT_EQ(view.max_locks_per_xact, 259);
+		UT_ASSERT_EQ(view.wal_level, 1);
+		UT_ASSERT(!view.wal_log_hints && !view.track_commit_timestamp);
+		UT_ASSERT(memcmp(root.bytes + 196, before + 196, 180) == 0);
+		UT_ASSERT(memcmp(root.bytes + 1024, before + 1024, 66048 - 1024) == 0);
+		v2_assert_anchor_staging_empty();
+		candidate = view;
+		candidate.checkPoint += 8192;
+		candidate.checkPointCopy.redo += 8192;
+		test_flush = candidate.checkPoint + 64;
+	}
+}
+
+UT_TEST(test_v2_checkpoint_rejects_invalid_parameter_before_max)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate;
+
+	for (int fault = 0; fault < 8; ++fault) {
+		v2_checkpoint_fixture(before, &self, &candidate);
+		switch (fault) {
+		case 0:
+			candidate.MaxConnections = 0;
+			break;
+		case 1:
+			candidate.MaxConnections = -1;
+			break;
+		case 2:
+			candidate.max_worker_processes = -1;
+			break;
+		case 3:
+			candidate.max_wal_senders = -1;
+			break;
+		case 4:
+			candidate.max_prepared_xacts = -1;
+			break;
+		case 5:
+			candidate.max_locks_per_xact = 0;
+			break;
+		case 6:
+			candidate.wal_level = -1;
+			break;
+		case 7:
+			candidate.wal_level = 3;
+			break;
+		}
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+					 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		v2_assert_primary_unchanged(before);
+		v2_assert_anchor_staging_empty();
+	}
+}
+
+UT_TEST(test_v2_checkpoint_cannot_invent_parameter_transition_proof)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate;
+
+	for (int fault = 0; fault < 4; ++fault) {
+		v2_checkpoint_fixture(before, &self, &candidate);
+		switch (fault) {
+		case 0:
+			candidate.wal_level = 0;
+			break;
+		case 1:
+			candidate.wal_level = 2;
+			break;
+		case 2:
+			candidate.wal_log_hints = true;
+			break;
+		case 3:
+			candidate.track_commit_timestamp = true;
+			break;
+		}
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		v2_assert_primary_unchanged(before);
+		v2_assert_anchor_staging_empty();
+	}
 }
 
 UT_TEST(test_v2_checkpoint_rejects_non_owner_facts_before_io)
@@ -4390,7 +4518,7 @@ UT_TEST(test_bootstrap_composes_exact_threads_without_admission)
 					 f.local_anchor.identity.origin_owner_incarnation);
 		UT_ASSERT_EQ(out.control.checkPoint, f.local_anchor.checkpoint);
 		UT_ASSERT_EQ(out.control.minRecoveryPoint, f.local_anchor.min_recovery_point);
-		UT_ASSERT_EQ(out.control.MaxConnections, 300);
+		UT_ASSERT_EQ(out.control.MaxConnections, 300 + node);
 		UT_ASSERT_EQ(out.control.checkPointCopy.nextOid, 60001);
 		UT_ASSERT_EQ(out.config.identity.generation, 47);
 		UT_ASSERT_EQ(out.root_sequence, 7);
@@ -4744,7 +4872,7 @@ UT_TEST(test_bootstrap_read_exact_files_and_owned_config)
 			continue;
 		UT_ASSERT_EQ(out.snapshot.thread.origin_thread_id, node + 1);
 		UT_ASSERT_EQ(out.snapshot.control.checkPoint, f.local_anchor.checkpoint);
-		UT_ASSERT_EQ(out.snapshot.control.MaxConnections, 300);
+		UT_ASSERT_EQ(out.snapshot.control.MaxConnections, 300 + node);
 		UT_ASSERT_EQ(out.config_len, f.input.config.len);
 		UT_ASSERT(memcmp(out.config_bytes, f.config, out.config_len) == 0);
 		UT_ASSERT_EQ(out.config_bytes[out.config_len], '\0');
@@ -5026,7 +5154,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(89);
+	UT_PLAN(92);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -5086,6 +5214,9 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_thread_view_clears_root_after_missing_anchor);
 	UT_RUN(test_v2_thread_view_rejects_selected_foreign_or_inconsistent_anchor);
 	UT_RUN(test_v2_checkpoint_advances_one_thread_and_preserves_common);
+	UT_RUN(test_v2_checkpoint_preserves_historical_parameter_requirements);
+	UT_RUN(test_v2_checkpoint_rejects_invalid_parameter_before_max);
+	UT_RUN(test_v2_checkpoint_cannot_invent_parameter_transition_proof);
 	UT_RUN(test_v2_checkpoint_rejects_non_owner_facts_before_io);
 	UT_RUN(test_v2_checkpoint_rejects_unflushed_wrong_tli_and_bad_inputs);
 	UT_RUN(test_v2_checkpoint_cas_and_epoch_races_do_not_overwrite);

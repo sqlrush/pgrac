@@ -2058,7 +2058,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		|| cf->checkPoint <= work->old_view.checkPoint || end < record->validated_tail_lsn_exclusive
 		|| cf->minRecoveryPoint != work->old_view.minRecoveryPoint
 		|| cf->minRecoveryPointTLI != work->old_view.minRecoveryPointTLI
-		|| cf->unloggedLSN < work->old_view.unloggedLSN)
+		|| cf->unloggedLSN < work->old_view.unloggedLSN || cf->wal_level != work->old_view.wal_level
+		|| cf->wal_log_hints != work->old_view.wal_log_hints
+		|| cf->track_commit_timestamp != work->old_view.track_commit_timestamp)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	make_read_token(&work->base, self->origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
 					&work->thread_token);
@@ -2080,6 +2082,22 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	anchor.unlogged_lsn = cf->unloggedLSN;
 	anchor.min_recovery_point = cf->minRecoveryPoint;
 	anchor.min_recovery_tli = cf->minRecoveryPointTLI;
+	/* A normal checkpoint alone cannot prove every old parameter requirement
+	 * retired. Keep the prior thread obligation; the explicit WAL/recovery
+	 * coverage producer owns any later retirement, not current shared GUCs.
+	 */
+	/* These three are modes, not capacity bounds; a change needs the separate
+	 * PARAMETER_CHANGE producer and was refused above. Never OR in capability.
+	 */
+	anchor.wal_log_hints = cf->wal_log_hints;
+	anchor.track_commit_timestamp = cf->track_commit_timestamp;
+	anchor.wal_level = cf->wal_level;
+	anchor.max_connections = Max(cf->MaxConnections, work->old_view.MaxConnections);
+	anchor.max_worker_processes
+		= Max(cf->max_worker_processes, work->old_view.max_worker_processes);
+	anchor.max_wal_senders = Max(cf->max_wal_senders, work->old_view.max_wal_senders);
+	anchor.max_prepared_xacts = Max(cf->max_prepared_xacts, work->old_view.max_prepared_xacts);
+	anchor.max_locks_per_xact = Max(cf->max_locks_per_xact, work->old_view.max_locks_per_xact);
 	if (!pg_strong_random(uuid, sizeof(uuid)))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	uuid[6] = (uuid[6] & 0x0f) | 0x40;
@@ -2171,6 +2189,10 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 		|| thread_control->state != DB_IN_PRODUCTION || checkpoint_crc == 0
 		|| thread_control->backupStartPoint != 0 || thread_control->backupEndPoint != 0
 		|| thread_control->backupEndRequired || thread_control->checkPoint == 0
+		|| thread_control->wal_level < WAL_LEVEL_MINIMAL
+		|| thread_control->wal_level > WAL_LEVEL_LOGICAL || thread_control->MaxConnections <= 0
+		|| thread_control->max_worker_processes < 0 || thread_control->max_wal_senders < 0
+		|| thread_control->max_prepared_xacts < 0 || thread_control->max_locks_per_xact <= 0
 		|| thread_control->checkPointCopy.redo == 0
 		|| thread_control->checkPointCopy.redo > thread_control->checkPoint
 		|| checkpoint_end <= thread_control->checkPoint

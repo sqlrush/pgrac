@@ -30,6 +30,15 @@ typedef struct ClusterRecoveryAnchorV2 {
 	XLogRecPtr backup_start;
 	XLogRecPtr backup_end;
 	bool backup_end_required;
+	/* Historical requirements, not the current shared configuration. */
+	bool wal_log_hints;
+	bool track_commit_timestamp;
+	uint32 wal_level;
+	uint32 max_connections;
+	uint32 max_worker_processes;
+	uint32 max_wal_senders;
+	uint32 max_prepared_xacts;
+	uint32 max_locks_per_xact;
 } ClusterRecoveryAnchorV2;
 
 typedef struct ClusterRecoveryAnchorRefV2 {
