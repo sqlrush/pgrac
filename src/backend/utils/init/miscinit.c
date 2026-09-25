@@ -49,6 +49,7 @@
 #include "access/parallel.h"
 #include "catalog/pg_authid.h"
 #include "common/file_perm.h"
+#include "common/pgrac_control_binding.h" /* PGRAC: startup downgrade protection */
 #include "libpq/libpq.h"
 #include "libpq/pqsignal.h"
 #include "mb/pg_wchar.h"
@@ -408,6 +409,58 @@ SetDatabasePath(const char *path)
 }
 
 /*
+ * PGRAC: native startup must not bypass an independently retained PRE2 binding
+ * merely because shared_config was omitted, damaged, or compiled out.  This
+ * intermediate guard stays until root-bound startup is implemented; existence
+ * protects even a corrupt marker.  No decode, authority inference or writes.
+ * Unlike destructive frontend tools, legacy pg_control symlinks/root names
+ * alone are not rejected here.  Normal PRE1 startup remains supported.
+ */
+static void
+check_pgrac_control_binding(void)
+{
+	char path[MAXPGPATH];
+	struct stat st;
+	int len;
+
+	len = snprintf(path, sizeof(path), "%s/global", DataDir);
+	if (len < 0 || len >= sizeof(path))
+		ereport(FATAL, (errcode(ERRCODE_NAME_TOO_LONG),
+						errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: data directory path is too long")));
+	if (lstat(path, &st) != 0) {
+		if (errno == ENOENT)
+			return; /* Native bootstrap may be inspecting an empty directory. */
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: could not inspect \"%s\": %m", path)));
+	}
+	/* Do not turn a dangling parent link into proof of marker absence. */
+	if (S_ISLNK(st.st_mode) && stat(path, &st) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: could not inspect \"%s\": %m", path)));
+	if (!S_ISDIR(st.st_mode))
+		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: \"%s\" is not a directory", path)));
+	len = snprintf(path, sizeof(path), "%s/global/%s", DataDir, PGRAC_CONTROL_BINDING_NAME);
+	if (len < 0 || len >= sizeof(path))
+		ereport(FATAL, (errcode(ERRCODE_NAME_TOO_LONG),
+						errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: data directory path is too long")));
+	if (lstat(path, &st) == 0)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("PRE2 shared-control startup is not yet available"),
+			 errdetail("PGRAC_CONTROL_BINDING_REQUIRED: the data directory has a PRE2 binding."),
+			 errhint("Use a qualified root-bound startup adapter; disabling cluster settings "
+					 "does not make the compatibility control file authoritative.")));
+	if (errno != ENOENT)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: could not inspect \"%s\": %m", path)));
+}
+
+/*
  * Validate the proposed data directory.
  *
  * Also initialize file and directory create modes and mode mask.
@@ -486,6 +539,9 @@ checkDataDir(void)
 	umask(pg_mode_mask);
 	data_directory_mode = pg_dir_create_mode;
 #endif
+
+	/* PGRAC: all native server entries pass here before data-lock/WAL writes. */
+	check_pgrac_control_binding();
 
 	/* Check for PG_VERSION */
 	ValidatePgVersion(DataDir);
