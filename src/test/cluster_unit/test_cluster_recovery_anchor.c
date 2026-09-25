@@ -1395,6 +1395,87 @@ UT_TEST(test_v2_projection_field_ownership)
 	UT_ASSERT(v2_zero(&projected, sizeof(projected)));
 }
 
+UT_TEST(test_v2_current_thread_state_matrix_preserves_other_fields)
+{
+	/* Literal expected PG16 DBState, columns DB_STARTUP..DB_IN_PRODUCTION;
+	 * -1 means no supported current-thread projection. */
+	static const int expected[5][7] = { { -1, 6, -1, 6, -1, -1, 6 },
+										{ -1, 4, -1, 4, 4, -1, 4 },
+										{ -1, 4, -1, 4, 4, -1, 4 },
+										{ -1, 1, -1, -1, -1, -1, -1 },
+										{ -1, -1, -1, -1, -1, -1, -1 } };
+	uint8 bytes[512];
+	ClusterRecoveryAnchorRefV2 ref;
+	ClusterControlRootSnapshot record;
+	ControlFileData common, input, view, want;
+	v2_fixture(bytes, &ref);
+	v2_common(&common);
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &input), 0);
+	memset(&record, 0, sizeof(record));
+	record.identity = ref.identity;
+	record.checkpoint_lower_lsn = input.checkPointCopy.redo;
+	record.checkpoint_tli = input.checkPointCopy.ThisTimeLineID;
+	input.minRecoveryPoint = 0;
+	input.minRecoveryPointTLI = 0;
+	for (int life = 1; life <= 5; ++life) {
+		for (int state = 0; state <= 6; ++state) {
+			record.lifecycle = life;
+			input.state = (DBState)state;
+			INIT_CRC32C(input.crc);
+			COMP_CRC32C(input.crc, &input, offsetof(ControlFileData, crc));
+			FIN_CRC32C(input.crc);
+			view = input;
+			if (expected[life - 1][state] < 0) {
+				UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view),
+							 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+				UT_ASSERT(v2_zero(&view, sizeof(view)));
+			} else {
+				UT_ASSERT_EQ(cluster_recovery_anchor_v2_thread_state(&ref, &record, &view), 0);
+				want = input;
+				want.state = (DBState)expected[life - 1][state];
+				INIT_CRC32C(want.crc);
+				COMP_CRC32C(want.crc, &want, offsetof(ControlFileData, crc));
+				FIN_CRC32C(want.crc);
+				UT_ASSERT(memcmp(&want, &view, sizeof(view)) == 0);
+			}
+		}
+	}
+}
+
+UT_TEST(test_v2_current_thread_state_rejects_wrong_identity_or_crc)
+{
+	for (int fault = 0; fault < 8; ++fault) {
+		uint8 bytes[512];
+		ClusterRecoveryAnchorRefV2 ref;
+		ClusterControlRootSnapshot record;
+		ControlFileData common, view;
+		v2_fixture(bytes, &ref);
+		v2_common(&common);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_project(bytes, 512, &ref, &common, &view), 0);
+		memset(&record, 0, sizeof(record));
+		record.identity = ref.identity;
+		record.checkpoint_lower_lsn = view.checkPointCopy.redo;
+		record.checkpoint_tli = view.checkPointCopy.ThisTimeLineID;
+		record.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+		if (fault == 0)
+			record.identity.origin_owner_incarnation++;
+		if (fault == 1)
+			record.checkpoint_tli++;
+		if (fault == 2)
+			record.checkpoint_lower_lsn++;
+		if (fault == 3)
+			view.system_identifier++;
+		if (fault == 4)
+			view.crc ^= 1;
+		if (fault == 5)
+			record.lifecycle = 0;
+		UT_ASSERT(cluster_recovery_anchor_v2_thread_state(fault == 6 ? NULL : &ref,
+														  fault == 7 ? NULL : &record, &view)
+				  != 0);
+		UT_ASSERT(v2_zero(&view, sizeof(view)));
+	}
+}
+
 UT_TEST(test_v2_projection_backup_and_state_refuse)
 {
 	const size_t offsets[] = { 272, 280, 288 };
@@ -1907,7 +1988,7 @@ main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(33);
+	UT_PLAN(35);
 	UT_RUN(test_layout);
 	UT_RUN(test_write_read_roundtrip);
 	UT_RUN(test_classify);
@@ -1927,6 +2008,8 @@ main(void)
 	UT_RUN(test_v2_size_crc_version_endian);
 	UT_RUN(test_v2_config_history_and_invalid_inputs);
 	UT_RUN(test_v2_projection_field_ownership);
+	UT_RUN(test_v2_current_thread_state_matrix_preserves_other_fields);
+	UT_RUN(test_v2_current_thread_state_rejects_wrong_identity_or_crc);
 	UT_RUN(test_v2_projection_backup_and_state_refuse);
 	UT_RUN(test_v2_read_selected_object_only);
 	UT_RUN(test_v2_object_type_size_and_permissions);

@@ -3879,6 +3879,77 @@ UT_TEST(test_v2_thread_view_selects_each_exact_thread)
 	UT_ASSERT_EQ(test_cf_lock_calls, 0);
 }
 
+UT_TEST(test_v2_thread_view_uses_lifecycle_not_old_clean_anchor)
+{
+	for (int life = 1; life <= 5; ++life) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ControlRootImage root;
+		ControlFileData out;
+		ClusterControlRootFileToken token;
+		char path[MAXPGPATH];
+		ClusterControlRootResult result;
+
+		v2_thread_fixture(bytes, anchors);
+		anchors[0].state = DB_SHUTDOWNED;
+		anchors[0].min_recovery_point = 0;
+		anchors[0].min_recovery_tli = 0;
+		v2_anchor_object(bytes, &anchors[0], &anchors[0].identity, path);
+		bytes[512 + 10] = life;
+		v2_checksums(bytes);
+		v2_write_roots(bytes);
+		result
+			= cluster_control_root_v2_read_thread_locked(&anchors[0].identity, &root, &out, &token);
+		if (life == CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED) {
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+			UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+		} else {
+			DBState expected = life == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN ? DB_IN_PRODUCTION
+							   : life == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+								   ? DB_SHUTDOWNED
+								   : DB_IN_CRASH_RECOVERY;
+			pg_crc32c crc;
+			UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+			UT_ASSERT_EQ(out.state, expected);
+			UT_ASSERT_EQ(out.checkPoint, anchors[0].checkpoint);
+			UT_ASSERT_EQ(root.records[127].lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+			UT_ASSERT_EQ(root.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
+			INIT_CRC32C(crc);
+			COMP_CRC32C(crc, &out, offsetof(ControlFileData, crc));
+			FIN_CRC32C(crc);
+			UT_ASSERT(EQ_CRC32C(crc, out.crc));
+		}
+	}
+}
+
+UT_TEST(test_v2_thread_view_rejects_false_clean_or_unsupported_native_state)
+{
+	for (int fault = 0; fault < 5; ++fault) {
+		uint8 bytes[66048];
+		ClusterRecoveryAnchorV2 anchors[2];
+		ControlRootImage root;
+		ControlFileData out;
+		ClusterControlRootFileToken token;
+		char path[MAXPGPATH];
+		v2_thread_fixture(bytes, anchors);
+		if (fault < 2) {
+			bytes[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+			anchors[0].state = fault == 0 ? DB_IN_PRODUCTION : DB_SHUTDOWNED;
+		} else {
+			const DBState forbidden[]
+				= { DB_STARTUP, DB_SHUTDOWNED_IN_RECOVERY, DB_IN_ARCHIVE_RECOVERY };
+			anchors[0].state = forbidden[fault - 2];
+		}
+		v2_anchor_object(bytes, &anchors[0], &anchors[0].identity, path);
+		v2_checksums(bytes);
+		v2_write_roots(bytes);
+		UT_ASSERT_EQ(
+			cluster_control_root_v2_read_thread_locked(&anchors[0].identity, &root, &out, &token),
+			CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+		UT_ASSERT(v2_outputs_zero(&root, &out, &token));
+	}
+}
+
 UT_TEST(test_v2_thread_view_rejects_stale_caller_and_absent_record)
 {
 	uint8 bytes[66048];
@@ -5506,6 +5577,41 @@ bootstrap_replace_anchor(BootstrapFixture *f)
 	memcpy(f->after, f->before, sizeof(f->after));
 }
 
+UT_TEST(test_bootstrap_thread_lifecycle_overrides_old_clean_anchor)
+{
+	for (int life = 1; life <= 5; ++life) {
+		BootstrapFixture f;
+		ClusterControlBootstrapSnapshot out;
+		bootstrap_fixture(&f, 0);
+		f.local_anchor.state = DB_SHUTDOWNED;
+		f.local_anchor.min_recovery_point = 0;
+		f.local_anchor.min_recovery_tli = 0;
+		f.before[512 + 10] = life;
+		bootstrap_replace_anchor(&f);
+		if (life == CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED) {
+			UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+		} else {
+			DBState expected = life == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN ? DB_IN_PRODUCTION
+							   : life == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+								   ? DB_SHUTDOWNED
+								   : DB_IN_CRASH_RECOVERY;
+			UT_ASSERT_EQ(cluster_control_bootstrap_decode(&f.input, &out), 0);
+			UT_ASSERT_EQ(out.control.state, expected);
+			UT_ASSERT_EQ(out.database_state, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
+			UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		}
+	}
+}
+
+UT_TEST(test_bootstrap_closed_thread_requires_clean_anchor)
+{
+	BootstrapFixture f;
+	bootstrap_fixture(&f, 0);
+	f.before[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	bootstrap_replace_anchor(&f);
+	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+}
+
 UT_TEST(test_bootstrap_anchor_requires_exact_redo_and_no_backup)
 {
 	BootstrapFixture f;
@@ -6362,7 +6468,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(112);
+	UT_PLAN(116);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -6423,6 +6529,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_view_rejects_v1_and_invalid_input_without_conversion);
 	UT_RUN(test_v2_view_single_node_does_not_bypass_shared_storage_qualification);
 	UT_RUN(test_v2_thread_view_selects_each_exact_thread);
+	UT_RUN(test_v2_thread_view_uses_lifecycle_not_old_clean_anchor);
+	UT_RUN(test_v2_thread_view_rejects_false_clean_or_unsupported_native_state);
 	UT_RUN(test_v2_thread_view_rejects_stale_caller_and_absent_record);
 	UT_RUN(test_v2_thread_view_clears_root_after_missing_anchor);
 	UT_RUN(test_v2_thread_view_rejects_selected_foreign_or_inconsistent_anchor);
@@ -6451,6 +6559,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_runtime_native_inplace_identity_is_never_cleared);
 	UT_RUN(test_v2_view_requires_exact_config_object);
 	UT_RUN(test_bootstrap_composes_exact_threads_without_admission);
+	UT_RUN(test_bootstrap_thread_lifecycle_overrides_old_clean_anchor);
+	UT_RUN(test_bootstrap_closed_thread_requires_clean_anchor);
 	UT_RUN(test_bootstrap_every_local_root_identity_must_match);
 	UT_RUN(test_bootstrap_changed_root_is_not_a_partial_success);
 	UT_RUN(test_bootstrap_absent_unconfigured_retired_or_revoked);

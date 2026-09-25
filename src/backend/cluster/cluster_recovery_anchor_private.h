@@ -85,6 +85,15 @@ cluster_recovery_anchor_v2_project(const uint8 *bytes, size_t len,
 								   const ClusterRecoveryAnchorRefV2 *ref,
 								   const ControlFileData *common, ControlFileData *out);
 
+/* Compose current native state from the same exact decoded root record, not
+ * an older checkpoint's state. In-place view clears on refusal; no admission
+ * or recovery completion is implied. Raw historical projection stays separate.
+ */
+extern ClusterControlRootResult
+cluster_recovery_anchor_v2_thread_state(const ClusterRecoveryAnchorRefV2 *ref,
+										const ClusterControlRootSnapshot *record,
+										ControlFileData *view);
+
 /* Caller already holds clusterwide CF-S/X and has validated storage/root.
  * Read only the exact immutable path. Never create directories or select a
  * compatibility projection. No serving or recovery-completion decision.

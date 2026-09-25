@@ -1205,11 +1205,9 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 	result = cluster_recovery_anchor_v2_read_locked(&ref, &common, out);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto fail;
-	if (out->checkPointCopy.redo != root->records[index].checkpoint_lower_lsn
-		|| out->checkPointCopy.ThisTimeLineID != root->records[index].checkpoint_tli) {
-		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = cluster_recovery_anchor_v2_thread_state(&ref, &root->records[index], out);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto fail;
-	}
 	return root_result;
 fail:
 	memset(root, 0, sizeof(*root));

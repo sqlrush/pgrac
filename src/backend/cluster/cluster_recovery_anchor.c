@@ -106,6 +106,68 @@ anchor_v2_put(uint8 *bytes, size_t offset, uint64 value, size_t width)
 		bytes[offset + i] = (uint8)(value >> (8 * i));
 }
 
+static bool anchor_v2_ref_valid(const ClusterRecoveryAnchorRefV2 *ref);
+
+/* PGRAC: a reopened thread can still select its previous clean checkpoint.
+ * Only the exact root lifecycle says whether that thread is closed now.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_recovery_anchor_v2_thread_state(const ClusterRecoveryAnchorRefV2 *ref,
+										const ClusterControlRootSnapshot *record,
+										ControlFileData *view)
+{
+	ControlFileData input;
+	pg_crc32c crc;
+	bool native_supported;
+
+	if (view == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	input = *view;
+	memset(view, 0, sizeof(*view));
+	if (!anchor_v2_ref_valid(ref) || record == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (memcmp(&ref->identity, &record->identity, sizeof(ref->identity)) != 0
+		|| input.system_identifier != ref->identity.system_identifier
+		|| input.checkPointCopy.redo != record->checkpoint_lower_lsn
+		|| input.checkPointCopy.ThisTimeLineID != record->checkpoint_tli)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, &input, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, input.crc))
+		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	native_supported = input.state == DB_IN_PRODUCTION || input.state == DB_SHUTDOWNING
+					   || input.state == DB_SHUTDOWNED;
+	switch (record->lifecycle) {
+	case CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN:
+		if (!native_supported)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		input.state = DB_IN_PRODUCTION;
+		break;
+	case CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED:
+	case CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE:
+		if (!native_supported && input.state != DB_IN_CRASH_RECOVERY)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		/* A recovery-terminal record is not a planned clean-close proof.
+		 * The recovery/admission owner must still consume its exact contract. */
+		input.state = DB_IN_CRASH_RECOVERY;
+		break;
+	case CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED:
+		if (input.state != DB_SHUTDOWNED || input.minRecoveryPoint != InvalidXLogRecPtr
+			|| input.minRecoveryPointTLI != 0)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		break;
+	default:
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	}
+	INIT_CRC32C(input.crc);
+	COMP_CRC32C(input.crc, &input, offsetof(ControlFileData, crc));
+	FIN_CRC32C(input.crc);
+	*view = input;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static bool
 anchor_v2_zero(const void *ptr, size_t len)
 {
