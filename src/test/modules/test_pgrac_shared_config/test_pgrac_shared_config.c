@@ -18,6 +18,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_entry);
 PG_FUNCTION_INFO_V1(test_pgrac_config_object);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
+PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PGDLLEXPORT void _PG_init(void);
 
 #ifdef USE_PGRAC_CLUSTER
@@ -175,6 +176,30 @@ test_pgrac_config_entry(PG_FUNCTION_ARGS)
 	entry.value = text_to_cstring(PG_GETARG_TEXT_PP(2));
 	rc = cluster_shared_config_check_entry(&entry, PG_GETARG_BOOL(3), &report);
 	PG_RETURN_TEXT_P(result_text(rc, &report));
+#else
+	ereport(ERROR, (errmsg("configuration inspection requires cluster build")));
+	PG_RETURN_NULL();
+#endif
+}
+
+Datum
+test_pgrac_config_bootstrap(PG_FUNCTION_ARGS)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSharedConfigRef ref;
+	ClusterSharedConfigPolicyReport report;
+	ClusterControlRootResult result;
+	char *bytes;
+	size_t len;
+	if (!superuser())
+		ereport(ERROR, (errmsg("test configuration inspection requires superuser")));
+	bytes = application_fixture(text_to_cstring(PG_GETARG_TEXT_PP(0)), &ref, &len);
+	if (PG_GETARG_BOOL(5))
+		ref.sha256[0] ^= 1;
+	result = cluster_shared_config_check_bootstrap(
+		bytes, len, &ref, PG_GETARG_INT32(1), text_to_cstring(PG_GETARG_TEXT_PP(2)),
+		text_to_cstring(PG_GETARG_TEXT_PP(3)), text_to_cstring(PG_GETARG_TEXT_PP(4)), &report);
+	PG_RETURN_TEXT_P(result_text(result, &report));
 #else
 	ereport(ERROR, (errmsg("configuration inspection requires cluster build")));
 	PG_RETURN_NULL();

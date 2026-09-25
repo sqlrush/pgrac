@@ -8,6 +8,7 @@
 #include "cluster/cluster_shared_config.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
 #include "utils/resowner.h"
@@ -289,6 +290,156 @@ cluster_shared_config_prepare_gucs(const char *shared_root, const char *bytes, s
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	return cluster_shared_config_prepare(shared_root, bytes, len, ref, operation_uuid, out);
+}
+
+/* PGRAC: minimum cold-profile identity bindings, not permission to activate.
+ * Native value hooks run after actual assignment in the startup applier.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef enum ConfigBootstrapKind {
+	CONFIG_BOOTSTRAP_TRUE,
+	CONFIG_BOOTSTRAP_BACKEND,
+	CONFIG_BOOTSTRAP_UUID,
+	CONFIG_BOOTSTRAP_DATA,
+	CONFIG_BOOTSTRAP_WAL,
+	CONFIG_BOOTSTRAP_UNDO
+} ConfigBootstrapKind;
+
+static const struct {
+	const char *name;
+	ConfigBootstrapKind kind;
+} bootstrap_required[] = { { "cluster.controlfile_shared_authority", CONFIG_BOOTSTRAP_TRUE },
+						   { "cluster.enabled", CONFIG_BOOTSTRAP_TRUE },
+						   { "cluster.merged_recovery", CONFIG_BOOTSTRAP_TRUE },
+						   { "cluster.shared_catalog", CONFIG_BOOTSTRAP_TRUE },
+						   { "cluster.shared_config", CONFIG_BOOTSTRAP_TRUE },
+						   { "cluster.shared_data_dir", CONFIG_BOOTSTRAP_DATA },
+						   { "cluster.shared_storage_backend", CONFIG_BOOTSTRAP_BACKEND },
+						   { "cluster.shared_storage_uuid", CONFIG_BOOTSTRAP_UUID },
+						   { "cluster.smgr_user_relations", CONFIG_BOOTSTRAP_TRUE },
+						   { "cluster.undo_tablespace_path", CONFIG_BOOTSTRAP_UNDO },
+						   { "cluster.wal_threads_dir", CONFIG_BOOTSTRAP_WAL } };
+
+typedef struct ConfigBootstrapContext {
+	ConfigPolicyContext policy;
+	const char *paths[3];
+	bool seen[lengthof(bootstrap_required)];
+	uint64 nodes[2];
+} ConfigBootstrapContext;
+
+static bool
+bootstrap_report_overlap(const void *input, size_t len, ClusterSharedConfigPolicyReport *report)
+{
+	uintptr_t a = (uintptr_t)input, b = (uintptr_t)report;
+	if (input == NULL || len == 0)
+		return false;
+	return a <= b ? b - a < len : a - b < sizeof(*report);
+}
+
+static bool
+bootstrap_config_path(const char *path)
+{
+	size_t len = path != NULL ? strnlen(path, MAXPGPATH) : 0;
+	size_t start = 1;
+	if (len < 2 || len >= MAXPGPATH || path[0] != '/')
+		return false;
+	for (size_t i = 1; i <= len; i++) {
+		if (i == len || path[i] == '/') {
+			size_t size = i - start;
+			if (size == 0 || (size == 1 && path[start] == '.')
+				|| (size == 2 && path[start] == '.' && path[start + 1] == '.'))
+				return false;
+			start = i + 1;
+		}
+	}
+	return true;
+}
+
+static ClusterControlRootResult
+bootstrap_config_visit(const ClusterSharedConfigEntry *entry, void *arg)
+{
+	ConfigBootstrapContext *context = arg;
+	ClusterControlRootResult result = policy_visit(entry, &context->policy);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (entry->node_id != CLUSTER_SHARED_CONFIG_COMMON) {
+		/* Static policy already verifies native scope and exact node number. */
+		if (strcmp(entry->name, "cluster.node_id") == 0)
+			context->nodes[entry->node_id / 64] |= UINT64CONST(1) << (entry->node_id % 64);
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	for (size_t i = 0; i < lengthof(bootstrap_required); i++) {
+		ConfigBootstrapKind kind = bootstrap_required[i].kind;
+		bool enabled;
+		if (strcmp(entry->name, bootstrap_required[i].name) != 0)
+			continue;
+		if (kind == CONFIG_BOOTSTRAP_TRUE && (!parse_bool(entry->value, &enabled) || !enabled))
+			return policy_refuse(context->policy.report, entry, CLUSTER_CONFIG_POLICY_VALUE);
+		if ((kind == CONFIG_BOOTSTRAP_BACKEND && pg_strcasecmp(entry->value, "cluster_fs") != 0)
+			|| (kind >= CONFIG_BOOTSTRAP_DATA
+				&& strcmp(entry->value, context->paths[kind - CONFIG_BOOTSTRAP_DATA]) != 0))
+			return policy_refuse(context->policy.report, entry, CLUSTER_CONFIG_POLICY_REFERENCE);
+		/* UUID equality is checked by the shared production policy visitor. */
+		context->seen[i] = true;
+		break;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_shared_config_check_bootstrap(const char *bytes, size_t len,
+									  const ClusterSharedConfigRef *ref, int node_id,
+									  const char *shared_root, const char *wal_root,
+									  const char *undo_root,
+									  ClusterSharedConfigPolicyReport *report)
+{
+	ConfigBootstrapContext context = { 0 };
+	ClusterControlRootResult result;
+	const char *paths[] = { shared_root, wal_root, undo_root };
+	bool alias;
+
+	if (report == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	alias = bootstrap_report_overlap(bytes, len, report)
+			|| bootstrap_report_overlap(ref, sizeof(*ref), report);
+	for (size_t i = 0; i < lengthof(paths); i++)
+		alias |= bootstrap_report_overlap(paths[i], paths[i] ? strnlen(paths[i], MAXPGPATH) + 1 : 0,
+										  report);
+	policy_clear(report);
+	if (alias || ref == NULL || bytes == NULL || len == 0 || len > CLUSTER_SHARED_CONFIG_MAX_BYTES)
+		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_FORMAT);
+	if (node_id < 0 || node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| !(ref->identity.configured[node_id / 64] & (UINT64CONST(1) << (node_id % 64))))
+		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_SCOPE);
+	for (size_t i = 0; i < lengthof(paths); i++) {
+		if (!bootstrap_config_path(paths[i]))
+			return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_REFERENCE);
+		context.paths[i] = paths[i];
+	}
+	context.policy.report = report;
+	context.policy.ref = ref;
+	context.policy.native_check = false;
+	result = cluster_shared_config_visit(bytes, len, ref, bootstrap_config_visit, &context);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		if (report->reason == CLUSTER_CONFIG_POLICY_OK)
+			report->reason = CLUSTER_CONFIG_POLICY_FORMAT;
+		return result;
+	}
+	for (size_t i = 0; i < lengthof(bootstrap_required); i++) {
+		if (!context.seen[i]) {
+			ClusterSharedConfigEntry missing
+				= { CLUSTER_SHARED_CONFIG_COMMON, bootstrap_required[i].name, NULL };
+			return policy_refuse(report, &missing, CLUSTER_CONFIG_POLICY_MISSING);
+		}
+	}
+	for (int node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		uint64 bit = UINT64CONST(1) << (node % 64);
+		if ((ref->identity.configured[node / 64] & bit) && !(context.nodes[node / 64] & bit)) {
+			ClusterSharedConfigEntry missing = { node, "cluster.node_id", NULL };
+			return policy_refuse(report, &missing, CLUSTER_CONFIG_POLICY_MISSING);
+		}
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 typedef struct ConfigApplyContext {

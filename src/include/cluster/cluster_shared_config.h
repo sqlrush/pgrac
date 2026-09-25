@@ -91,7 +91,8 @@ typedef enum ClusterSharedConfigPolicyReason {
 	CLUSTER_CONFIG_POLICY_SCOPE,
 	CLUSTER_CONFIG_POLICY_COLD_ONLY,
 	CLUSTER_CONFIG_POLICY_REFERENCE,
-	CLUSTER_CONFIG_POLICY_VALUE
+	CLUSTER_CONFIG_POLICY_VALUE,
+	CLUSTER_CONFIG_POLICY_MISSING
 } ClusterSharedConfigPolicyReason;
 
 /* Diagnostic counts, never an application ACK or a complete-profile permit.
@@ -116,6 +117,18 @@ cluster_shared_config_check_entry(const ClusterSharedConfigEntry *entry, bool on
 extern ClusterControlRootResult
 cluster_shared_config_check_gucs(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
 								 ClusterSharedConfigPolicyReport *report);
+
+/* Mandatory PRE2 bootstrap bindings only, not application/admission. Requires
+ * native parameter registration. Expected paths/node come from the independent
+ * bootstrap inputs, not from this object. Applies existing static name/scope
+ * policy without testing coupled native hooks against old process values.
+ * Native apply/postchecks, recovery minima and physical qualification remain
+ * mandatory. No I/O/assignment/default filling; inputs must not alias report.
+ */
+extern ClusterControlRootResult cluster_shared_config_check_bootstrap(
+	const char *bytes, size_t len, const ClusterSharedConfigRef *ref, int node_id,
+	const char *shared_root, const char *wal_root, const char *undo_root,
+	ClusterSharedConfigPolicyReport *report);
 
 /* PGRAC: process-local receipt, not a shared ACK or serving permission.
  * Caller must supply the root-selected reference and independently bound node,
