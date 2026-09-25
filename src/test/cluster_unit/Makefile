@@ -46,7 +46,7 @@ endif
 
 # Test source files (each becomes a standalone executable)
 TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_cluster_port_runtime \
-        test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
+        test_pgrac_control_binding test_pgrac_protected_set test_pgrac_fenced_drain test_pgrac_fenced_pacemaker test_pgrac_fenced_cib \
         test_pgrac_fenced_map_filter test_pgrac_fenced_drain_sign_filter \
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
         test_pgrac_fenced_target_request \
@@ -418,6 +418,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
+# PGRAC: shared frontend/backend binding codec uses its real common library.
+SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 
 # The included production wait loop has disabled diagnostic probes.
 test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
@@ -1379,6 +1381,13 @@ test_pgrac_external_fence_protocol: \
 		$(PGRAC_EXTERNAL_FENCE_PROTOCOL_O) \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -lssl -lcrypto -o $@
+
+test_pgrac_control_binding: test_pgrac_control_binding.c unit_test.h \
+		$(top_builddir)/src/common/libpgcommon.a
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/common/libpgcommon.a \
+		$(top_builddir)/src/port/libpgport.a $(LDFLAGS) \
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_pgrac_protected_set: test_pgrac_protected_set.c unit_test.h \
 		data/pgrac_fence_map_v2_fixture.h \

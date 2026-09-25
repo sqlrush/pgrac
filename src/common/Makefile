@@ -69,6 +69,7 @@ OBJS_COMMON = \
 	link-canary.o \
 	md5_common.o \
 	percentrepl.o \
+	pgrac_control_binding.o \
 	pgrac_external_fence_protocol.o \
 	pgrac_fence_map.o \
 	pgrac_protected_set.o \
