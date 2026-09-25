@@ -5266,6 +5266,7 @@ static int bootstrap_root_opens;
 static int bootstrap_race_at;
 static int bootstrap_close_calls;
 static int bootstrap_close_fail_at;
+static bool bootstrap_wal_route_race;
 static uint8 bootstrap_replacement[66048];
 static uint8 bootstrap_binding_replacement[256];
 
@@ -5290,6 +5291,14 @@ unit_bootstrap_openat(int dir, const char *name, int flags, ...)
 	char primary[MAXPGPATH], staging[MAXPGPATH], binding[MAXPGPATH];
 	bool root_open = strcmp(name, "pgrac_control_root") == 0;
 	bool missing_object = bootstrap_race == 2 && strstr(name, ".bin") != NULL;
+	if (bootstrap_wal_route_race && strcmp(name, "pg_wal") == 0) {
+		int fd = openat(dir, name, flags);
+		bootstrap_wal_route_race = false;
+		if (fd < 0 || unlinkat(dir, name, 0) != 0
+			|| symlinkat(cluster_wal_threads_dir, dir, name) != 0)
+			abort();
+		return fd;
+	}
 
 	if (root_open)
 		bootstrap_root_opens++;
@@ -5340,6 +5349,82 @@ bootstrap_read_fixture(BootstrapFixture *f, int node)
 	}
 	snprintf(path, sizeof(path), "%s/global/%s", bootstrap_local, PGRAC_CONTROL_BINDING_NAME);
 	write_all_or_abort(path, f->binding, sizeof(f->binding));
+}
+
+UT_TEST(test_bootstrap_wal_route_exact_generation_and_refusals)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapSnapshot snapshot;
+	ClusterWalDurablePrefix prefix = { .sequence = 1 };
+	char generation[MAXPGPATH], prefix_dir[MAXPGPATH], current[MAXPGPATH];
+	char pgwal[MAXPGPATH], moved[MAXPGPATH];
+	uint8 bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	int before = 0, after = 0;
+
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			before++;
+	for (int fault = 0; fault < 11; fault++) {
+		bootstrap_read_fixture(&f, fault == 0 ? 127 : 0);
+		UT_ASSERT_EQ(cluster_control_bootstrap_decode(&f.input, &snapshot), 0);
+		v2_claim_path(&snapshot.thread, generation);
+		*strrchr(generation, '/') = '\0';
+		snprintf(prefix_dir, sizeof(prefix_dir), "%s/durable_prefix", generation);
+		UT_ASSERT(mkdir(prefix_dir, 0700) == 0 || errno == EEXIST);
+		snprintf(current, sizeof(current), "%s/current", prefix_dir);
+		UT_ASSERT_EQ(cluster_wal_durable_prefix_encode(&snapshot.wal, &prefix, bytes), 0);
+		if (fault == 4)
+			bytes[140] ^= 1;
+		if (fault == 5) {
+			ClusterWalDurablePrefixRef foreign = snapshot.wal;
+			foreign.timeline++;
+			UT_ASSERT_EQ(cluster_wal_durable_prefix_encode(&foreign, &prefix, bytes), 0);
+		}
+		write_all_or_abort(current, bytes, sizeof(bytes));
+		snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", bootstrap_local);
+		UT_ASSERT(unlink(pgwal) == 0 || errno == ENOENT);
+		UT_ASSERT_EQ(symlink(fault == 1 ? cluster_wal_threads_dir : generation, pgwal), 0);
+		if (fault == 2)
+			UT_ASSERT_EQ(unlink(pgwal), 0);
+		if (fault == 3 || fault == 8)
+			UT_ASSERT_EQ(unlink(current), 0);
+		if (fault == 6)
+			UT_ASSERT_EQ(chmod(generation, 0777), 0);
+		if (fault == 7) {
+			snprintf(moved, sizeof(moved), "%s.saved", generation);
+			UT_ASSERT_EQ(rename(generation, moved), 0);
+			UT_ASSERT_EQ(symlink(moved, generation), 0);
+		}
+		if (fault == 8)
+			UT_ASSERT_EQ(mkfifo(current, 0600), 0);
+		bootstrap_wal_route_race = fault == 9;
+		bootstrap_close_fail_at = fault == 10 ? 1 : 0;
+		if (fault == 0)
+			UT_ASSERT_EQ(cluster_control_bootstrap_wal_route(
+							 bootstrap_local, cluster_wal_threads_dir, &snapshot.wal),
+						 0);
+		else
+			UT_ASSERT(cluster_control_bootstrap_wal_route(bootstrap_local, cluster_wal_threads_dir,
+														  &snapshot.wal)
+					  != 0);
+		bootstrap_close_fail_at = 0;
+		if (fault == 6)
+			UT_ASSERT_EQ(chmod(generation, 0700), 0);
+		if (fault == 7) {
+			UT_ASSERT_EQ(unlink(generation), 0);
+			UT_ASSERT_EQ(rename(moved, generation), 0);
+		}
+		if (fault == 8)
+			UT_ASSERT_EQ(unlink(current), 0);
+	}
+	UT_ASSERT(cluster_control_bootstrap_wal_route(NULL, cluster_wal_threads_dir, &snapshot.wal)
+			  != 0);
+	UT_ASSERT(cluster_control_bootstrap_wal_route(bootstrap_local, cluster_wal_threads_dir, NULL)
+			  != 0);
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			after++;
+	UT_ASSERT_EQ(after, before);
 }
 
 static void
@@ -5992,7 +6077,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(107);
+	UT_PLAN(108);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -6089,6 +6174,7 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_read_never_falls_back_to_valid_bak);
 	UT_RUN(test_bootstrap_read_rejects_every_bad_selected_file);
 	UT_RUN(test_bootstrap_read_unsafe_leaves_do_not_block_or_leak);
+	UT_RUN(test_bootstrap_wal_route_exact_generation_and_refusals);
 	UT_RUN(test_bootstrap_read_unsafe_directories_are_refused);
 	UT_RUN(test_bootstrap_read_real_root_replacement_and_binding_races);
 	UT_RUN(test_bootstrap_read_invalid_paths_outputs_and_alias);

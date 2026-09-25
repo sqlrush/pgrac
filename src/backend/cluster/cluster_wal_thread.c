@@ -52,6 +52,7 @@
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster_control_bootstrap_private.h"
 #include "miscadmin.h" /* IsUnderPostmaster, DataDir */
 #include "port/atomics.h"
 #include "storage/fd.h" /* BasicOpenFile, pg_fsync */
@@ -77,6 +78,8 @@ typedef struct ClusterWalThreadShmemData {
 	uint8 dir_validated;  /* routing validation passed */
 	uint8 claim_created;  /* this boot created the claim file */
 	uint8 _pad[3];
+	ClusterWalDurablePrefixRef v2_ref;
+	bool v2_ref_valid;
 
 	/* spec-4.2 D5: WAL-state registry refresh-failure counter (bumped by
 	 * cluster_stats on best-effort refresh failures, read by the dump
@@ -107,6 +110,8 @@ cluster_wal_thread_shmem_init(void)
 		cluster_wal_thread_shmem->dir_validated = 0;
 		cluster_wal_thread_shmem->claim_created = 0;
 		memset(cluster_wal_thread_shmem->_pad, 0, sizeof(cluster_wal_thread_shmem->_pad));
+		memset(&cluster_wal_thread_shmem->v2_ref, 0, sizeof(cluster_wal_thread_shmem->v2_ref));
+		cluster_wal_thread_shmem->v2_ref_valid = false;
 		pg_atomic_init_u64(&cluster_wal_thread_shmem->wal_state_refresh_fail_count, 0);
 		memset(cluster_wal_thread_shmem->_reserved, 0, sizeof(cluster_wal_thread_shmem->_reserved));
 	}
@@ -184,6 +189,22 @@ bool
 cluster_wal_thread_dir_validated(void)
 {
 	return cluster_wal_thread_shmem != NULL && cluster_wal_thread_shmem->dir_validated != 0;
+}
+
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_enabled || !cluster_shared_config || cluster_wal_thread_shmem == NULL
+		|| !cluster_wal_thread_shmem->v2_ref_valid || !cluster_wal_thread_shmem->dir_validated
+		|| cluster_wal_thread_shmem->v2_ref.claim.identity.origin_node_id != cluster_node_id
+		|| cluster_wal_thread_shmem->v2_ref.claim.identity.origin_thread_id
+			   != cluster_wal_thread_id())
+		return false;
+	*out = cluster_wal_thread_shmem->v2_ref;
+	return true;
 }
 
 bool
@@ -386,6 +407,9 @@ cluster_wal_thread_init(void)
 		cluster_wal_thread_shmem->thread_id = tid;
 		cluster_wal_thread_shmem->dir_configured = dir_set ? 1 : 0;
 	}
+	if (cluster_shared_config && !dir_set)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_THREAD_ROUTING_MISMATCH),
+						errmsg("PRE2 shared configuration requires an exact WAL root")));
 
 	if (!dir_set) {
 		if (cluster_shared_catalog && cluster_conf_has_peers())
@@ -417,6 +441,22 @@ cluster_wal_thread_init(void)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_WAL_THREAD_ROUTING_MISMATCH),
 						errmsg("cluster.wal_threads_dir is set but cluster.node_id is not"),
 						errhint("Set cluster.node_id to this node's identifier (0..127).")));
+
+	/* PRE2 never falls back to the v1 claim/create or legacy registry path.
+	 * Preparation and reobservation remain read-only namespace checks. The
+	 * subsequent physical/fence/recovery/serving gates still own admission. */
+	if (cluster_shared_config) {
+		ClusterWalDurablePrefixRef ref;
+		if (cluster_wal_thread_shmem == NULL)
+			ereport(FATAL, (errmsg("shared WAL identity state is not initialized")));
+		/* All actual DataDir reads/crypto stay in the adapter's temporary owner;
+		 * the early postmaster has no transaction ResourceOwner to borrow. */
+		cluster_control_bootstrap_wal_recheck(DataDir, &ref);
+		cluster_wal_thread_shmem->v2_ref = ref;
+		cluster_wal_thread_shmem->dir_validated = 1;
+		cluster_wal_thread_shmem->v2_ref_valid = true;
+		return;
+	}
 
 	CLUSTER_INJECTION_POINT("cluster-wal-thread-validate-pre");
 

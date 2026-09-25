@@ -191,6 +191,13 @@ cluster_wal_thread_dir_name(uint16 thread_id, char *buf, size_t buflen)
 
 #ifndef FRONTEND
 
+#include "cluster/cluster_wal_durable_prefix.h"
+
+/* Root-selected routing reference, not write/flush/recovery authority. False
+ * before the actual postmaster WAL initialization populated shared memory, or
+ * outside the exact PRE2 node/profile. Callers still need their runtime gates. */
+extern bool cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out);
+
 /*
  * cluster_wal_thread_id -- this instance's WAL thread identity.
  *

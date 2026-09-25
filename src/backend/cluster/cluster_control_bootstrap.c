@@ -215,6 +215,8 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 												&common, &snapshot.control);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
+	snapshot.wal.claim = claim_ref;
+	snapshot.wal.timeline = snapshot.control.checkPointCopy.ThisTimeLineID;
 	if (snapshot.control.checkPointCopy.redo != before->records[input->node_id].checkpoint_lower_lsn
 		|| snapshot.control.checkPointCopy.ThisTimeLineID
 			   != before->records[input->node_id].checkpoint_tli) {

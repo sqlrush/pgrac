@@ -2,6 +2,7 @@
  * Author: SqlRush <sqlrush@gmail.com>
  */
 #include "postgres.h"
+#include <unistd.h>
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
@@ -14,6 +15,8 @@
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_wal_claim.h"
+#include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_thread.h"
 #include "../../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "../../../backend/cluster/cluster_control_root_private.h"
 #include "../../../backend/cluster/cluster_recovery_anchor_private.h"
@@ -220,7 +223,7 @@ bootstrap_test_race(int value, void *extra)
 {
 	ResourceOwner saved = CurrentResourceOwner;
 	ResourceOwner owner;
-	if (value == 0)
+	if (value == 0 || value >= 4)
 		return;
 	if (value == 3)
 		ereport(ERROR, (errmsg("test bootstrap assignment exception")));
@@ -260,12 +263,17 @@ bootstrap_test_prepare(void)
 {
 	char local[MAXPGPATH], shared[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH];
 	ClusterControlBootstrapPrepared out;
+	ClusterWalDurablePrefixRef wal_ref;
 	ResourceOwner saved = CurrentResourceOwner;
 	uint64 sysid = GetSystemIdentifier();
 	bootstrap_test_path(local, "local");
 	bootstrap_test_path(shared, "shared");
 	bootstrap_test_path(wal, "wal");
 	bootstrap_test_path(undo, "undo");
+	memset(&wal_ref, 0xa5, sizeof(wal_ref));
+	if (cluster_wal_thread_current_v2_ref(&wal_ref)
+		|| memcmp(&wal_ref, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(wal_ref)) != 0)
+		ereport(FATAL, (errmsg("test uninitialized WAL reference was exposed")));
 	cluster_control_bootstrap_prepare(local, shared, wal, undo, 0, true, &out);
 	if (out.snapshot.binding.system_identifier != sysid || out.snapshot.root_sequence != 7
 		|| out.snapshot.config.identity.generation != 47 || out.applied.node_id != 0
@@ -284,6 +292,25 @@ bootstrap_test_prepare(void)
 		&& (XLOGbuffers != 4096 || !DataChecksumsEnabled()
 			|| strcmp(GetConfigOption("data_checksums", false, false), "on") != 0))
 		ereport(FATAL, (errmsg("test native bootstrap WAL sizing is not exact")));
+	if (test_prepare_race == 4)
+		bootstrap_test_race(1, NULL);
+	else if (test_prepare_race == 5)
+		bootstrap_test_race(2, NULL);
+	else if (test_prepare_race == 6 || test_prepare_race == 7) {
+		char target[MAXPGPATH];
+		bootstrap_test_path(target, test_prepare_race == 6
+										? "local/pg_wal"
+										: "wal/thread_1/generation_99/durable_prefix/current");
+		if (unlink(target) != 0)
+			ereport(FATAL, (errmsg("test WAL recheck unlink failed")));
+	}
+	cluster_control_bootstrap_wal_recheck(test_prepare_race == 8 ? DataDir : local, &wal_ref);
+	if (CurrentResourceOwner != saved || wal_ref.claim.identity.origin_thread_id != 1
+		|| wal_ref.claim.identity.origin_owner_incarnation != 99
+		|| wal_ref.claim.database_incarnation != 41 || wal_ref.claim.max_config_generation != 47
+		|| wal_ref.timeline != out.snapshot.control.checkPointCopy.ThisTimeLineID
+		|| memcmp(&wal_ref, &out.snapshot.wal, sizeof(wal_ref)) != 0)
+		ereport(FATAL, (errmsg("test WAL bootstrap recheck result is not exact")));
 	ereport(FATAL,
 			(errmsg("test native bootstrap prepared; no admission or storage initialization")));
 }
@@ -338,7 +365,7 @@ _PG_init(void)
 							 &test_prepare_bootstrap, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("cluster.native_bootstrap_test_race",
 							"Test-only native assignment race in disposable objects.", NULL,
-							&test_prepare_race, 0, 0, 3, PGC_POSTMASTER, 0, NULL,
+							&test_prepare_race, 0, 0, 8, PGC_POSTMASTER, 0, NULL,
 							bootstrap_test_race, NULL);
 	if (test_prepare_bootstrap)
 		bootstrap_test_prepare();
@@ -417,10 +444,14 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 	ClusterControlRootSnapshot *record;
 	ClusterRecoveryAnchorV2 anchor = { 0 };
 	ClusterWalThreadClaimV2 claim = { 0 };
+	ClusterWalDurablePrefixRef prefix_ref = { 0 };
+	ClusterWalDurablePrefix prefix = { .sequence = 1 };
 	ClusterSharedConfigIdentity config = { 0 };
 	PgracControlBinding binding = { 0 };
 	ControlFileData native;
 	uint8 common[PG_CONTROL_FILE_SIZE], claim_bytes[112], anchor_bytes[512], binding_bytes[256];
+	uint8 prefix_bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	char pgwal[MAXPGPATH], generation[MAXPGPATH];
 	char shared[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH], suffix[MAXPGPATH], hex[65];
 	char config_bytes[8192];
 	size_t config_len;
@@ -507,6 +538,16 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 		entries[3].value = "2";
 	else if (strcmp(mutation, "hook-error") == 0)
 		entries[3].value = "3";
+	else if (strcmp(mutation, "recheck-root") == 0)
+		entries[3].value = "4";
+	else if (strcmp(mutation, "recheck-binding") == 0)
+		entries[3].value = "5";
+	else if (strcmp(mutation, "recheck-route") == 0)
+		entries[3].value = "6";
+	else if (strcmp(mutation, "recheck-prefix") == 0)
+		entries[3].value = "7";
+	else if (strcmp(mutation, "recheck-pgdata") == 0)
+		entries[3].value = "8";
 	if (cluster_shared_config_encode(&config, entries, lengthof(entries), config_bytes,
 									 sizeof(config_bytes), &config_len, header->v2.config_sha256)
 		!= 0)
@@ -597,6 +638,33 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("test bootstrap binding encoding failed")));
 	bootstrap_test_write("local/global/pgrac_control_binding", binding_bytes,
 						 sizeof(binding_bytes));
+	/* Routing/prefix fixture only, not a never-written or physical WAL proof. */
+	prefix_ref.claim.identity = record->identity;
+	prefix_ref.claim.database_incarnation = 41;
+	prefix_ref.claim.max_config_generation = 47;
+	memcpy(prefix_ref.claim.claim_sha256, root->refs[0].claim_sha256, 32);
+	prefix_ref.timeline = native.checkPointCopy.ThisTimeLineID;
+	if (strcmp(mutation, "prefix-identity") == 0)
+		prefix_ref.timeline++;
+	if (cluster_wal_durable_prefix_encode(&prefix_ref, &prefix, prefix_bytes) != 0)
+		ereport(ERROR, (errmsg("test bootstrap prefix encoding failed")));
+	if (strcmp(mutation, "prefix-corrupt") == 0)
+		prefix_bytes[140] ^= 1;
+	bootstrap_test_write("wal/thread_1/generation_99/durable_prefix/current", prefix_bytes,
+						 sizeof(prefix_bytes));
+	if (strcmp(mutation, "prefix-missing") == 0) {
+		bootstrap_test_path(suffix, "wal/thread_1/generation_99/durable_prefix/current");
+		if (unlink(suffix) != 0)
+			ereport(ERROR, (errmsg("test prefix unlink failed")));
+	}
+	bootstrap_test_path(pgwal, "local/pg_wal");
+	bootstrap_test_path(generation, strcmp(mutation, "wal-flat") == 0
+										? "wal/thread_1"
+										: "wal/thread_1/generation_99");
+	if (unlink(pgwal) != 0 && errno != ENOENT)
+		ereport(ERROR, (errmsg("test pg_wal unlink failed")));
+	if (strcmp(mutation, "wal-missing") != 0 && symlink(generation, pgwal) != 0)
+		ereport(ERROR, (errmsg("test pg_wal symlink failed")));
 	pfree(root);
 	PG_RETURN_BOOL(true);
 #else

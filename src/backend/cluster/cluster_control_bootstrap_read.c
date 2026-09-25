@@ -132,6 +132,88 @@ done:
 	return result;
 }
 
+static ClusterControlRootResult read_same_dir(int parent, const char *name, int fd);
+#endif
+
+ClusterControlRootResult
+cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
+									const ClusterWalDurablePrefixRef *ref)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
+	int dirs[5] = { -1, -1, -1, -1, -1 };
+	char thread[32], generation[48];
+	struct stat expected, routed, current;
+	ClusterWalDurablePrefix prefix;
+	ClusterWalDurablePrefix empty = { .sequence = 1 };
+	ClusterWalThreadClaimV2 claim;
+	uint8 check[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	uint8 claim_bytes[CLUSTER_WAL_CLAIM_V2_BYTES + 1];
+	size_t claim_len = 0;
+
+	if (!read_path_valid(pgdata, NULL) || !read_path_valid(wal_root, NULL)
+		|| cluster_wal_durable_prefix_encode(ref, &empty, check) != 0)
+		return result;
+	snprintf(thread, sizeof(thread), "thread_%u", ref->claim.identity.origin_thread_id);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 ref->claim.identity.origin_owner_incarnation);
+	result = read_dir(-1, pgdata, &dirs[0]);
+	if (result != 0)
+		goto done;
+	result = read_dir(-1, wal_root, &dirs[1]);
+	if (result != 0)
+		goto done;
+	result = read_dir(dirs[1], thread, &dirs[2]);
+	if (result != 0)
+		goto done;
+	result = read_dir(dirs[2], generation, &dirs[3]);
+	if (result != 0)
+		goto done;
+	/* Only the native pg_wal leaf may follow a symlink. Its resolved inode,
+	 * not the spelling of the symlink, must match the root-selected directory. */
+	dirs[4] = openat(dirs[0], "pg_wal", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+	if (dirs[4] < 0 || fstat(dirs[3], &expected) != 0 || fstat(dirs[4], &routed) != 0) {
+		result = read_error();
+		goto done;
+	}
+	if (!read_owned(&routed, true) || expected.st_dev != routed.st_dev
+		|| expected.st_ino != routed.st_ino) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto done;
+	}
+	result = read_bytes(dirs[3], CLUSTER_WAL_THREAD_CLAIM_FILENAME, CLUSTER_WAL_CLAIM_V2_BYTES,
+						CLUSTER_WAL_CLAIM_V2_BYTES, claim_bytes, &claim_len);
+	if (result != 0)
+		goto done;
+	/* Allocation-free exact current reader; all its descriptors close locally. */
+	result = cluster_wal_durable_prefix_read(wal_root, ref, &prefix);
+	if (result != 0)
+		goto done;
+	result = read_same_dir(AT_FDCWD, pgdata, dirs[0]);
+	if (result == 0)
+		result = read_same_dir(AT_FDCWD, wal_root, dirs[1]);
+	if (result == 0)
+		result = read_same_dir(dirs[1], thread, dirs[2]);
+	if (result == 0)
+		result = read_same_dir(dirs[2], generation, dirs[3]);
+	if (result != 0)
+		goto done;
+	if (fstatat(dirs[0], "pg_wal", &current, 0) != 0 || !read_owned(&current, true)
+		|| current.st_dev != expected.st_dev || current.st_ino != expected.st_ino)
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+done:
+	for (size_t i = 0; i < lengthof(dirs); i++)
+		read_close(dirs[i], &result);
+	/* Hashing may allocate/use a resource owner: no raw fd remains open. */
+	if (result == 0)
+		result = cluster_wal_claim_v2_decode(claim_bytes, claim_len, &ref->claim, &claim);
+#endif
+	return result;
+}
+
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
 static ClusterControlRootResult
 read_object(int base, const char *const *parts, size_t count, const char *name, size_t minimum,
 			size_t maximum, uint8 *bytes, size_t *length)

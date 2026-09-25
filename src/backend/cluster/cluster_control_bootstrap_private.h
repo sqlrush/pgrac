@@ -8,6 +8,7 @@
 
 #include "catalog/pg_control.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_wal_durable_prefix.h"
 #include "common/pgrac_control_binding.h"
 
 typedef struct ClusterControlBootstrapBytes {
@@ -35,6 +36,7 @@ typedef struct ClusterControlBootstrapInput {
 typedef struct ClusterControlBootstrapSnapshot {
 	PgracControlBinding binding;
 	ClusterControlRootIdentity thread;
+	ClusterWalDurablePrefixRef wal;
 	ClusterSharedConfigRef config;
 	ControlFileData control;
 	uint8 root_sha256[32];
@@ -84,6 +86,13 @@ extern ClusterControlRootResult
 cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, const char *wal_root,
 							   uint32 node_id, ClusterControlBootstrapObservation *out);
 
+/* Read-only route/input check. pg_wal may be a symlink, but must resolve to the
+ * exact owned no-follow generation selected by ref. Does not certify WAL bytes
+ * or grant writer admission, and never creates a missing claim or prefix. */
+extern ClusterControlRootResult
+cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
+									const ClusterWalDurablePrefixRef *ref);
+
 /* Process-local preparation and native control/geometry initialization only,
  * before shared memory or WAL startup. Not admission, physical qualification
  * or final CF validation. Reset has LocalProcessControlFile's native semantics.
@@ -98,5 +107,11 @@ extern void cluster_control_bootstrap_prepare(const char *pgdata, const char *sh
 											  const char *wal_root, const char *undo_root,
 											  uint32 node_id, bool reset,
 											  ClusterControlBootstrapPrepared *out);
+
+/* Postmaster's actual WAL-thread initialization must reobserve the successful
+ * early preparation before putting this read-only reference in shared memory.
+ * FATAL when unprepared, changed, misrouted or called from a child. */
+extern void cluster_control_bootstrap_wal_recheck(const char *pgdata,
+												  ClusterWalDurablePrefixRef *out);
 
 #endif /* CLUSTER_CONTROL_BOOTSTRAP_PRIVATE_H */

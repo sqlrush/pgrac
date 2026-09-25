@@ -1347,12 +1347,14 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
