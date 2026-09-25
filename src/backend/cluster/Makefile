@@ -54,6 +54,7 @@ OBJS = \
 	cluster_control_root.o \
 	cluster_control_bootstrap.o \
 	cluster_control_bootstrap_read.o \
+	cluster_control_bootstrap_native.o \
 	cluster_formation_marker.o \
 	cluster_page_version.o \
 	cluster_page_rmgr.o \

@@ -28,3 +28,11 @@ CREATE FUNCTION test_pgrac_recovery_capacity(text, bigint)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_recovery_capacity'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_recovery_capacity(text, bigint) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_bootstrap_fixture(text)
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_bootstrap_fixture'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_bootstrap_fixture(text) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_bootstrap_late()
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_bootstrap_late'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_bootstrap_late() FROM PUBLIC;

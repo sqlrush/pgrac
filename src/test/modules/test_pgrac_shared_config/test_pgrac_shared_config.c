@@ -11,7 +11,12 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_wal_claim.h"
+#include "../../../backend/cluster/cluster_control_bootstrap_private.h"
+#include "../../../backend/cluster/cluster_control_root_private.h"
+#include "../../../backend/cluster/cluster_recovery_anchor_private.h"
 #include "common/cryptohash.h"
 #include "storage/fd.h"
 #include "utils/guc.h"
@@ -26,6 +31,8 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PG_FUNCTION_INFO_V1(test_pgrac_control_image);
 PG_FUNCTION_INFO_V1(test_pgrac_recovery_capacity);
+PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_fixture);
+PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_late);
 PGDLLEXPORT void _PG_init(void);
 
 Datum
@@ -152,6 +159,126 @@ test_pgrac_control_image(PG_FUNCTION_ARGS)
 static int test_apply_node = -1;
 static bool test_bad_hash;
 static bool test_stop_after_apply;
+static bool test_prepare_bootstrap;
+static int test_prepare_race;
+
+static void
+bootstrap_test_path(char path[MAXPGPATH], const char *suffix)
+{
+	if (snprintf(path, MAXPGPATH, "%s/test_native_bootstrap/%s", DataDir, suffix) >= MAXPGPATH)
+		ereport(ERROR, (errmsg("test bootstrap path too long")));
+}
+
+static void
+bootstrap_test_write(const char *suffix, const void *bytes, size_t len)
+{
+	char path[MAXPGPATH], parent[MAXPGPATH];
+	FILE *file;
+	bootstrap_test_path(path, suffix);
+	strlcpy(parent, path, sizeof(parent));
+	get_parent_directory(parent);
+	if (pg_mkdir_p(parent, 0700) != 0)
+		ereport(ERROR, (errmsg("cannot make test bootstrap directory: %m")));
+	file = AllocateFile(path, "wb");
+	if (!file || fwrite(bytes, 1, len, file) != len || FreeFile(file) != 0)
+		ereport(ERROR, (errmsg("cannot write test bootstrap file: %m")));
+}
+
+static void
+bootstrap_test_read(const char *suffix, void *bytes, size_t len)
+{
+	char path[MAXPGPATH];
+	FILE *file;
+	bootstrap_test_path(path, suffix);
+	file = AllocateFile(path, "rb");
+	if (!file || fread(bytes, 1, len, file) != len || FreeFile(file) != 0)
+		ereport(ERROR, (errmsg("cannot read test bootstrap file: %m")));
+}
+
+static void
+bootstrap_test_hash(const void *bytes, size_t len, uint8 hash[32])
+{
+	pg_cryptohash_ctx *ctx = pg_cryptohash_create(PG_SHA256);
+	if (!ctx || pg_cryptohash_init(ctx) < 0 || pg_cryptohash_update(ctx, bytes, len) < 0
+		|| pg_cryptohash_final(ctx, hash, 32) < 0)
+		ereport(ERROR, (errmsg("test bootstrap hash failed")));
+	pg_cryptohash_free(ctx);
+}
+
+static void
+bootstrap_test_hex(const uint8 hash[32], char hex[65])
+{
+	for (int i = 0; i < 32; i++)
+		snprintf(hex + i * 2, 3, "%02x", hash[i]);
+}
+
+/* Test-only native assign hook: deterministic replacement AFTER application,
+ * never a substitute success predicate or a production injection point. */
+static void
+bootstrap_test_race(int value, void *extra)
+{
+	ResourceOwner saved = CurrentResourceOwner;
+	ResourceOwner owner;
+	if (value == 0)
+		return;
+	if (value == 3)
+		ereport(ERROR, (errmsg("test bootstrap assignment exception")));
+	owner = ResourceOwnerCreate(saved, "test bootstrap race");
+	CurrentResourceOwner = owner;
+	if (value == 1) {
+		ControlRootImage *root = palloc0(sizeof(*root));
+		uint8 storage[16];
+		memset(storage, 1, sizeof(storage));
+		bootstrap_test_read("shared/global/pgrac_control_root", root->bytes, sizeof(root->bytes));
+		if (cluster_control_root_v2_decode(root->bytes, sizeof(root->bytes), storage,
+										   GetSystemIdentifier(), root)
+			!= 0)
+			ereport(ERROR, (errmsg("test race root is invalid")));
+		root->header.file_txn_seq++;
+		if (cluster_control_root_v2_encode(root) != 0)
+			ereport(ERROR, (errmsg("test race root cannot encode")));
+		bootstrap_test_write("shared/global/pgrac_control_root", root->bytes, sizeof(root->bytes));
+		pfree(root);
+	} else if (value == 2) {
+		uint8 bytes[256];
+		PgracControlBinding binding;
+		bootstrap_test_read("local/global/pgrac_control_binding", bytes, sizeof(bytes));
+		if (!pgrac_control_binding_decode(bytes, sizeof(bytes), &binding))
+			ereport(ERROR, (errmsg("test race binding is invalid")));
+		binding.target_qualification_sha256[0] ^= 1;
+		if (!pgrac_control_binding_encode(&binding, bytes, sizeof(bytes)))
+			ereport(ERROR, (errmsg("test race binding cannot encode")));
+		bootstrap_test_write("local/global/pgrac_control_binding", bytes, sizeof(bytes));
+	}
+	CurrentResourceOwner = saved;
+	ResourceOwnerDelete(owner);
+}
+
+static void
+bootstrap_test_prepare(void)
+{
+	char local[MAXPGPATH], shared[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH];
+	ClusterControlBootstrapPrepared out;
+	ResourceOwner saved = CurrentResourceOwner;
+	uint64 sysid = GetSystemIdentifier();
+	int segment = wal_segment_size;
+	bootstrap_test_path(local, "local");
+	bootstrap_test_path(shared, "shared");
+	bootstrap_test_path(wal, "wal");
+	bootstrap_test_path(undo, "undo");
+	cluster_control_bootstrap_prepare(local, shared, wal, undo, 0, &out);
+	if (out.snapshot.binding.system_identifier != sysid || out.snapshot.root_sequence != 7
+		|| out.snapshot.config.identity.generation != 47 || out.applied.node_id != 0
+		|| out.applied.ref.identity.generation != 47 || out.required.current_sources != 1
+		|| out.required.max_connections != 300 || out.snapshot.control.MaxConnections != 300
+		|| CurrentResourceOwner != saved || sysid != GetSystemIdentifier()
+		|| segment != wal_segment_size
+		|| strcmp(GetConfigOption("max_connections", false, false), "320") != 0
+		|| strcmp(GetConfigOption("cluster.shared_data_dir", false, false), shared) != 0)
+		ereport(FATAL, (errmsg("test native bootstrap result is not exact")));
+	ereport(FATAL,
+			(errmsg("test native bootstrap prepared; no admission or storage initialization")));
+}
 
 /* The test creates exact bytes, but production code performs all validation
  * and application. No fake native process identity or mutable engine flags.
@@ -198,6 +325,15 @@ _PG_init(void)
 	DefineCustomBoolVariable("test_pgrac_shared_config.stop_after_apply",
 							 "Stop before initialization.", NULL, &test_stop_after_apply, false,
 							 PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("test_pgrac_shared_config.prepare_bootstrap",
+							 "Test complete native preparation before storage.", NULL,
+							 &test_prepare_bootstrap, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("cluster.native_bootstrap_test_race",
+							"Test-only native assignment race in disposable objects.", NULL,
+							&test_prepare_race, 0, 0, 3, PGC_POSTMASTER, 0, NULL,
+							bootstrap_test_race, NULL);
+	if (test_prepare_bootstrap)
+		bootstrap_test_prepare();
 	if (test_apply_node >= 0) {
 		char path[MAXPGPATH];
 		FILE *file;
@@ -260,6 +396,201 @@ test_pgrac_config_backend_apply(PG_FUNCTION_ARGS)
 #else
 	PG_RETURN_BOOL(false);
 #endif
+}
+
+/* A fixture constructor, NOT migration or qualification. Files live only in
+ * this test extension's dedicated disposable directory under local PGDATA. */
+Datum
+test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ControlRootImage *root;
+	ControlRootHeader *header;
+	ClusterControlRootSnapshot *record;
+	ClusterRecoveryAnchorV2 anchor = { 0 };
+	ClusterWalThreadClaimV2 claim = { 0 };
+	ClusterSharedConfigIdentity config = { 0 };
+	PgracControlBinding binding = { 0 };
+	ControlFileData native;
+	uint8 common[PG_CONTROL_FILE_SIZE], claim_bytes[112], anchor_bytes[512], binding_bytes[256];
+	char shared[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH], suffix[MAXPGPATH], hex[65];
+	char config_bytes[8192];
+	size_t config_len;
+	FILE *file;
+	char *mutation;
+	ClusterSharedConfigEntry entries[]
+		= { { -1, "cluster.controlfile_shared_authority", "on" },
+			{ -1, "cluster.enabled", "on" },
+			{ -1, "cluster.merged_recovery", "on" },
+			{ -1, "cluster.native_bootstrap_test_race", "0" },
+			{ -1, "cluster.shared_catalog", "on" },
+			{ -1, "cluster.shared_config", "on" },
+			{ -1, "cluster.shared_data_dir", shared },
+			{ -1, "cluster.shared_storage_backend", "cluster_fs" },
+			{ -1, "cluster.shared_storage_uuid", "01010101-0101-0101-0101-010101010101" },
+			{ -1, "cluster.smgr_user_relations", "on" },
+			{ -1, "cluster.undo_tablespace_path", undo },
+			{ -1, "cluster.wal_threads_dir", wal },
+			{ -1, "max_connections", "320" },
+			{ 0, "cluster.node_id", "0" } };
+	if (!superuser())
+		ereport(ERROR, (errmsg("test bootstrap fixture requires superuser")));
+	mutation = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	bootstrap_test_path(shared, "shared");
+	bootstrap_test_path(wal, "wal");
+	bootstrap_test_path(undo, "undo");
+	file = AllocateFile(XLOG_CONTROL_FILE, "rb");
+	if (!file || fread(&native, 1, sizeof(native), file) != sizeof(native) || FreeFile(file) != 0)
+		ereport(ERROR, (errmsg("cannot read test native control")));
+	root = palloc0(sizeof(*root));
+	header = &root->header;
+	header->format_version = 2;
+	header->file_txn_seq = 7;
+	header->system_identifier = native.system_identifier;
+	memset(header->storage_uuid, 1, 16);
+	memset(header->authority_uuid, 0xab, 16);
+	header->authority_uuid[6] = 0x4b;
+	header->authority_uuid[8] = 0x8b;
+	header->activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED;
+	header->created_at_usec = header->published_at_usec = 1;
+	memset(header->migration_round_sha256, 0x11, 32);
+	memset(header->source_wal_state_sha256, 0x22, 32);
+	header->migration_prepare_generation = 3;
+	header->migration_transition_epoch = 4;
+	header->source_feature_bitmap = 1;
+	header->target_feature_bitmap = PGRAC_CONTROL_ROOT_FEATURE_RECOVERY_DUTY_IDENTITY_V1;
+	header->v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+	header->v2.database_incarnation = 41;
+	header->v2.formation_seq = 43;
+	header->v2.configured[0] = 1;
+	header->v2.config_generation = 47;
+	header->v2.control_image_generation = 53;
+	header->v2.catalog_manifest_generation = 59;
+	header->v2.global_scn_high_water = 61;
+	memset(header->v2.catalog_manifest_sha256, 0x55, 32);
+	config.system_identifier = native.system_identifier;
+	config.database_incarnation = 41;
+	config.generation = 47;
+	config.configured[0] = 1;
+	memcpy(config.storage_uuid, header->storage_uuid, 16);
+	memcpy(config.authority_uuid, header->authority_uuid, 16);
+	if (strcmp(mutation, "capacity") == 0)
+		entries[12].value = "299";
+	else if (strcmp(mutation, "profile") == 0)
+		entries[0].value = "off";
+	else if (strcmp(mutation, "root-race") == 0)
+		entries[3].value = "1";
+	else if (strcmp(mutation, "binding-race") == 0)
+		entries[3].value = "2";
+	else if (strcmp(mutation, "hook-error") == 0)
+		entries[3].value = "3";
+	if (cluster_shared_config_encode(&config, entries, lengthof(entries), config_bytes,
+									 sizeof(config_bytes), &config_len, header->v2.config_sha256)
+		!= 0)
+		ereport(ERROR, (errmsg("test bootstrap config encoding failed")));
+	bootstrap_test_hex(header->v2.config_sha256, hex);
+	snprintf(suffix, sizeof(suffix), "shared/global/config_images/47-%s.conf", hex);
+	bootstrap_test_write(suffix, config_bytes, config_len);
+	if (strcmp(mutation, "checksum-version") == 0)
+		native.data_checksum_version = 42;
+	else if (strcmp(mutation, "native-format") == 0)
+		native.blcksz++;
+	if (cluster_cf_control_image_encode(&native, common) != 0)
+		ereport(ERROR, (errmsg("test bootstrap common encoding failed")));
+	bootstrap_test_hash(common, sizeof(common), header->v2.control_image_sha256);
+	bootstrap_test_hex(header->v2.control_image_sha256, hex);
+	snprintf(suffix, sizeof(suffix), "shared/global/control_images/53-%s.bin", hex);
+	bootstrap_test_write(suffix, common, sizeof(common));
+	record = &root->records[0];
+	record->identity.system_identifier = native.system_identifier;
+	memcpy(record->identity.storage_uuid, header->storage_uuid, 16);
+	memcpy(record->identity.authority_uuid, header->authority_uuid, 16);
+	record->identity.origin_thread_id = 1;
+	record->identity.origin_node_id = 0;
+	record->identity.origin_owner_incarnation = 99;
+	record->identity.root_lineage_seq = 11;
+	record->identity.thread_claim_created_at = 12345;
+	claim.identity = record->identity;
+	claim.database_incarnation = 41;
+	claim.config_generation = 47;
+	claim.claim_generation = 1;
+	if (cluster_wal_claim_v2_encode(&claim, claim_bytes) != 0)
+		ereport(ERROR, (errmsg("test bootstrap claim encoding failed")));
+	for (int i = 0; i < 4; i++)
+		record->identity.thread_claim_crc32c |= (uint32)claim_bytes[104 + i] << (8 * i);
+	bootstrap_test_hash(claim_bytes, sizeof(claim_bytes), root->refs[0].claim_sha256);
+	bootstrap_test_write("wal/thread_1/generation_99/pgrac_thread.claim", claim_bytes,
+						 sizeof(claim_bytes));
+	root->present[0] = true;
+	root->publisher_incarnation[0] = 777;
+	record->root_publish_seq = 10;
+	record->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT;
+	record->root_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
+	record->checkpoint_tli = native.checkPointCopy.ThisTimeLineID;
+	record->checkpoint_lower_lsn = native.checkPointCopy.redo;
+	record->checkpoint_record_crc32c = 1; /* fixture only; no WAL qualification */
+	record->checkpoint_source_kind = CLUSTER_CONTROL_ROOT_CHECKPOINT_NATIVE_V1;
+	root->refs[0].anchor_generation = 66;
+	anchor.identity = record->identity;
+	anchor.database_incarnation = 41;
+	anchor.config_generation = 47;
+	anchor.anchor_generation = 66;
+	memcpy(anchor.claim_sha256, root->refs[0].claim_sha256, 32);
+	anchor.state = native.state;
+	anchor.checkpoint = native.checkPoint;
+	anchor.checkpoint_copy = native.checkPointCopy;
+	anchor.write_time = native.time;
+	anchor.unlogged_lsn = native.unloggedLSN;
+	anchor.max_connections = 300;
+	anchor.max_worker_processes = 1;
+	anchor.max_locks_per_xact = 1;
+	anchor.wal_level = native.wal_level;
+	if (cluster_recovery_anchor_v2_encode(&anchor, anchor_bytes) != 0)
+		ereport(ERROR, (errmsg("test bootstrap anchor encoding failed")));
+	bootstrap_test_hash(anchor_bytes, sizeof(anchor_bytes), root->refs[0].anchor_sha256);
+	bootstrap_test_hex(root->refs[0].anchor_sha256, hex);
+	snprintf(suffix, sizeof(suffix),
+			 "shared/global/anchor_images/thread_1/generation_99/anchor_66-%s.bin", hex);
+	bootstrap_test_write(suffix, anchor_bytes, sizeof(anchor_bytes));
+	if (cluster_control_root_v2_encode(root) != 0)
+		ereport(ERROR, (errmsg("test bootstrap root encoding failed")));
+	bootstrap_test_write("shared/global/pgrac_control_root", root->bytes, sizeof(root->bytes));
+	binding.system_identifier = native.system_identifier;
+	memcpy(binding.storage_uuid, header->storage_uuid, 16);
+	memcpy(binding.authority_uuid, header->authority_uuid, 16);
+	binding.database_incarnation = 41;
+	memset(binding.operation_uuid, 0x41, 16);
+	memset(binding.source_cold_sha256, 0x42, 32);
+	memset(binding.target_qualification_sha256, 0x43, 32);
+	memcpy(binding.migration_round_sha256, header->migration_round_sha256, 32);
+	memcpy(binding.source_wal_state_sha256, header->source_wal_state_sha256, 32);
+	binding.migration_prepare_generation = 3;
+	binding.migration_transition_epoch = 4;
+	if (strcmp(mutation, "identity") == 0)
+		binding.database_incarnation++;
+	if (!pgrac_control_binding_encode(&binding, binding_bytes, sizeof(binding_bytes)))
+		ereport(ERROR, (errmsg("test bootstrap binding encoding failed")));
+	bootstrap_test_write("local/global/pgrac_control_binding", binding_bytes,
+						 sizeof(binding_bytes));
+	pfree(root);
+	PG_RETURN_BOOL(true);
+#else
+	PG_RETURN_BOOL(false);
+#endif
+}
+
+Datum
+test_pgrac_bootstrap_late(PG_FUNCTION_ARGS)
+{
+#ifdef USE_PGRAC_CLUSTER
+	ClusterControlBootstrapPrepared out;
+	if (!superuser())
+		ereport(ERROR, (errmsg("test bootstrap inspection requires superuser")));
+	cluster_control_bootstrap_prepare(NULL, NULL, NULL, NULL, 0, &out);
+#endif
+	PG_RETURN_BOOL(false);
 }
 
 Datum
