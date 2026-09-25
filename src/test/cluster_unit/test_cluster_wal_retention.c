@@ -25,6 +25,8 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
+#include "cluster/cluster_wal_durable_prefix.h"
+#include "common/cryptohash.h"
 #include "storage/lock.h"
 #include "utils/resowner.h"
 
@@ -39,7 +41,20 @@ UT_DEFINE_GLOBALS();
 int MyProcPid = 42;
 int wal_segment_size = TEST_WAL_SEG_SIZE;
 char *cluster_wal_threads_dir;
+bool cluster_shared_config;
+static bool fake_v2_ref_ready;
+static ClusterWalDurablePrefixRef fake_v2_ref;
 ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)0x1;
+
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!fake_v2_ref_ready)
+		return false;
+	*out = fake_v2_ref;
+	return true;
+}
 
 static ResourceReleaseCallback fake_resource_release_callback;
 static void *fake_resource_release_arg;
@@ -368,6 +383,9 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 static void
 reset_pin_fakes(void)
 {
+	cluster_shared_config = false;
+	fake_v2_ref_ready = false;
+	memset(&fake_v2_ref, 0, sizeof(fake_v2_ref));
 	memset(fake_acquire_results, 0, sizeof(fake_acquire_results));
 	memset(fake_acquire_requests, 0, sizeof(fake_acquire_requests));
 	memset(fake_release_threads, 0, sizeof(fake_release_threads));
@@ -497,6 +515,328 @@ write_test_wal_segment(const char *directory, TimeLineID tli, XLogSegNo segno, c
 	header.xlp_xlog_blcksz = XLOG_BLCKSZ;
 	UT_ASSERT_EQ(pwrite(fd, &header, sizeof(header), 0), sizeof(header));
 	close(fd);
+}
+
+/* PGRAC: actual retention object + real files; authority is the existing
+ * fixture seam, not a claim that root-v2 GC admission is implemented.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct V2ReuseFixture {
+	char root[MAXPGPATH];
+	char thread[MAXPGPATH];
+	char generation[MAXPGPATH];
+	char claim[MAXPGPATH];
+	char flat_wal[MAXPGPATH];
+	char generation_wal[MAXPGPATH];
+	uint8 claim_bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
+	ClusterWalReuseGuardRequest request;
+} V2ReuseFixture;
+
+static void
+v2_reuse_fixture(V2ReuseFixture *f)
+{
+	ClusterWalThreadClaimV2 claim;
+	pg_cryptohash_ctx *hash;
+	int fd;
+
+	reset_pin_fakes();
+	memset(f, 0, sizeof(*f));
+	strlcpy(f->root, "/tmp/pgrac-wal-reuse-v2-XXXXXX", sizeof(f->root));
+	UT_ASSERT_NOT_NULL(mkdtemp(f->root));
+	snprintf(f->thread, sizeof(f->thread), "%s/thread_1", f->root);
+	snprintf(f->generation, sizeof(f->generation), "%s/generation_11", f->thread);
+	snprintf(f->claim, sizeof(f->claim), "%s/pgrac_thread.claim", f->generation);
+	UT_ASSERT_EQ(mkdir(f->thread, 0700), 0);
+	UT_ASSERT_EQ(mkdir(f->generation, 0700), 0);
+	write_test_wal_segment(f->thread, 1, 1, f->flat_wal, sizeof(f->flat_wal));
+	write_test_wal_segment(f->generation, 1, 1, f->generation_wal, sizeof(f->generation_wal));
+	memset(&claim, 0, sizeof(claim));
+	claim.identity = make_duty(1);
+	claim.identity.thread_claim_crc32c = 0;
+	claim.database_incarnation = 7;
+	claim.config_generation = 3;
+	claim.claim_generation = 1;
+	UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&claim, f->claim_bytes),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	claim.identity.thread_claim_crc32c
+		= (uint32)f->claim_bytes[104] | ((uint32)f->claim_bytes[105] << 8)
+		  | ((uint32)f->claim_bytes[106] << 16) | ((uint32)f->claim_bytes[107] << 24);
+	fd = open(f->claim, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, f->claim_bytes, sizeof(f->claim_bytes)), sizeof(f->claim_bytes));
+	UT_ASSERT_EQ(close(fd), 0);
+	fake_v2_ref.claim.identity = claim.identity;
+	fake_v2_ref.claim.database_incarnation = claim.database_incarnation;
+	fake_v2_ref.claim.max_config_generation = claim.config_generation;
+	fake_v2_ref.timeline = 1;
+	hash = pg_cryptohash_create(PG_SHA256);
+	UT_ASSERT_NOT_NULL(hash);
+	UT_ASSERT_EQ(pg_cryptohash_init(hash), 0);
+	UT_ASSERT_EQ(pg_cryptohash_update(hash, f->claim_bytes, sizeof(f->claim_bytes)), 0);
+	UT_ASSERT_EQ(pg_cryptohash_final(hash, fake_v2_ref.claim.claim_sha256, 32), 0);
+	pg_cryptohash_free(hash);
+	fake_v2_ref_ready = true;
+	cluster_shared_config = true;
+	cluster_wal_threads_dir = f->root;
+	f->request.file.thread_id = 1;
+	f->request.file.kind = CLUSTER_WAL_FILE_NORMAL;
+	f->request.file.tli = 1;
+	f->request.file.segno = 1;
+	f->request.entry = CLUSTER_WAL_REUSE_E1_CHECKPOINT_RESTARTPOINT;
+	f->request.action = CLUSTER_WAL_ACTION_RETIRE_RECYCLE_OR_REMOVE;
+	f->request.duty = claim.identity;
+	f->request.root_read = make_root_token(&claim.identity);
+	f->request.root_read.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	f->request.formation = (const ClusterFormationWitnessV1 *)(uintptr_t)0x1000;
+	fake_preflight_root.identity = claim.identity;
+	fake_preflight_root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	fake_preflight_root.root_flags = f->request.root_read.root_flags;
+	fake_preflight_root.root_publish_seq = 1;
+	fake_preflight_root.checkpoint_tli = fake_preflight_root.tail_tli = 1;
+	fake_preflight_root.checkpoint_lower_lsn = TEST_WAL_SEG_SIZE * 4;
+	fake_preflight_root.validated_tail_lsn_exclusive = TEST_WAL_SEG_SIZE * 5;
+	fake_preflight_token = f->request.root_read;
+	fake_preflight_root_ready = true;
+}
+
+static void
+v2_reuse_fixture_cleanup(V2ReuseFixture *f)
+{
+	UT_ASSERT_EQ(unlink(f->flat_wal), 0);
+	UT_ASSERT_EQ(unlink(f->generation_wal), 0);
+	UT_ASSERT_EQ(unlink(f->claim), 0);
+	UT_ASSERT_EQ(rmdir(f->generation), 0);
+	UT_ASSERT_EQ(rmdir(f->thread), 0);
+	UT_ASSERT_EQ(rmdir(f->root), 0);
+	cluster_wal_threads_dir = NULL;
+	reset_pin_fakes();
+}
+
+UT_TEST(test_v2_reuse_selects_exact_generation_not_flat_decoy)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+	struct stat selected;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(stat(f.generation_wal, &selected), 0);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(guard.pre_action_stamp.file_id_lo, selected.st_ino);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_reuse_missing_native_ref_cannot_fallback_flat)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	fake_v2_ref_ready = false;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_OBJECT_STALE);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+static void
+v2_reuse_write_claim(const V2ReuseFixture *f, const uint8 *bytes)
+{
+	int fd = open(f->claim, O_WRONLY | O_TRUNC | O_CREAT, 0600);
+
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(write(fd, bytes, CLUSTER_WAL_CLAIM_V2_BYTES), CLUSTER_WAL_CLAIM_V2_BYTES);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
+UT_TEST(test_v2_reuse_rejects_unproven_namespace_and_claim)
+{
+	for (int which = 0; which < 9; ++which) {
+		V2ReuseFixture f;
+		ClusterWalReuseActionGuard guard = { 0 };
+		ClusterWalReuseDenyReason reason;
+		ClusterWalTerminalOutcome outcome;
+		PgracExternalFenceNeedSetV1 *needs = NULL;
+		char held[MAXPGPATH];
+		uint8 changed[CLUSTER_WAL_CLAIM_V2_BYTES];
+
+		v2_reuse_fixture(&f);
+		memcpy(changed, f.claim_bytes, sizeof(changed));
+		changed[0] ^= 1;
+		snprintf(held, sizeof(held), "%s.held", which == 3 ? f.generation : f.claim);
+		switch (which) {
+		case 0:
+			fake_v2_ref.claim.identity.origin_owner_incarnation++;
+			break;
+		case 1:
+			fake_v2_ref.claim.claim_sha256[0] ^= 1;
+			break;
+		case 2:
+			v2_reuse_write_claim(&f, changed);
+			break;
+		case 3:
+			UT_ASSERT_EQ(rename(f.generation, held), 0);
+			UT_ASSERT_EQ(symlink(held, f.generation), 0);
+			break;
+		case 4:
+			UT_ASSERT_EQ(rename(f.claim, held), 0);
+			UT_ASSERT_EQ(symlink(held, f.claim), 0);
+			break;
+		case 5:
+			UT_ASSERT_EQ(unlink(f.claim), 0);
+			UT_ASSERT_EQ(mkfifo(f.claim, 0600), 0);
+			break;
+		case 6:
+			UT_ASSERT_EQ(unlink(f.generation_wal), 0);
+			UT_ASSERT_EQ(mkfifo(f.generation_wal, 0600), 0);
+			break;
+		case 7:
+			UT_ASSERT_EQ(chmod(f.generation, 0770), 0);
+			break;
+		case 8:
+			fake_v2_ref.timeline++;
+			break;
+		}
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+		alarm(10); /* Test-only watchdog: malformed filesystem input cannot hang. */
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+					 CLUSTER_WAL_GUARD_BLOCKED);
+		alarm(0);
+		UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_OBJECT_STALE);
+		UT_ASSERT_EQ(guard.source_dir_handle, -1);
+		UT_ASSERT_EQ(guard.source_handle, -1);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+					 CLUSTER_WALR_RELEASE_NOT_HELD);
+		UT_ASSERT_EQ(access(f.flat_wal, F_OK), 0);
+		if (which == 3) {
+			UT_ASSERT_EQ(unlink(f.generation), 0);
+			UT_ASSERT_EQ(rename(held, f.generation), 0);
+		} else if (which == 4) {
+			UT_ASSERT_EQ(unlink(f.claim), 0);
+			UT_ASSERT_EQ(rename(held, f.claim), 0);
+		} else if (which == 5) {
+			UT_ASSERT_EQ(unlink(f.claim), 0);
+			v2_reuse_write_claim(&f, f.claim_bytes);
+		} else if (which == 7)
+			UT_ASSERT_EQ(chmod(f.generation, 0700), 0);
+		v2_reuse_fixture_cleanup(&f);
+	}
+}
+
+static void
+v2_reuse_arm(V2ReuseFixture *f, ClusterWalReuseActionGuard *guard)
+{
+	ClusterWalReuseDenyReason reason;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(guard, &f->request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(guard->pre_action_stamp.generation_claim_length, CLUSTER_WAL_CLAIM_V2_BYTES);
+	UT_ASSERT(
+		memcmp(guard->pre_action_stamp.generation_claim, f->claim_bytes, sizeof(f->claim_bytes))
+		== 0);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(guard, NULL, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	fake_acquire_result_count = 1;
+	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+}
+
+UT_TEST(test_v2_reuse_claim_change_blocks_every_physical_recheck)
+{
+	for (int which = 0; which < 4; ++which) {
+		V2ReuseFixture f;
+		ClusterWalReuseActionGuard guard = { 0 };
+		ClusterWalReuseDenyReason reason;
+		ClusterWalTerminalOutcome outcome;
+		ClusterWalFileIdentity destination;
+		ClusterWalReusePhysicalAction physical
+			= which == 2 ? CLUSTER_WAL_PHYSICAL_RECYCLE : CLUSTER_WAL_PHYSICAL_REMOVE;
+		uint8 changed[CLUSTER_WAL_CLAIM_V2_BYTES];
+
+		v2_reuse_fixture(&f);
+		v2_reuse_arm(&f, &guard);
+		if (which != 0)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_OK);
+		memcpy(changed, f.claim_bytes, sizeof(changed));
+		changed[32] ^= 1;
+		v2_reuse_write_claim(&f, changed);
+		if (which == 0)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		else if (which == 1)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		else if (which == 2) {
+			destination = f.request.file;
+			destination.segno = 8;
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_recycle(&guard, &destination, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		} else
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_confirm_zero_mutation(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_BLOCKED);
+		UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_OBJECT_STALE);
+		UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+		UT_ASSERT_EQ(access(f.flat_wal, F_OK), 0);
+		v2_reuse_write_claim(&f, f.claim_bytes);
+		if (which != 0)
+			UT_ASSERT_EQ(cluster_wal_reuse_guard_confirm_zero_mutation(&guard, physical, &reason),
+						 CLUSTER_WAL_GUARD_OK);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+		UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
+		v2_reuse_fixture_cleanup(&f);
+	}
+}
+
+UT_TEST(test_v2_reuse_removes_only_held_generation_object)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	char held[MAXPGPATH], held_wal[MAXPGPATH], held_claim[MAXPGPATH];
+	char wal_name[MAXFNAMELEN];
+
+	v2_reuse_fixture(&f);
+	v2_reuse_arm(&f, &guard);
+	XLogFileName(wal_name, 1, 1, TEST_WAL_SEG_SIZE);
+	snprintf(held, sizeof(held), "%s.held", f.generation);
+	snprintf(held_wal, sizeof(held_wal), "%s/%s", held, wal_name);
+	snprintf(held_claim, sizeof(held_claim), "%s/pgrac_thread.claim", held);
+	UT_ASSERT_EQ(rename(f.generation, held), 0);
+	UT_ASSERT_EQ(mkdir(f.generation, 0700), 0);
+	write_test_wal_segment(f.generation, 1, 1, f.generation_wal, sizeof(f.generation_wal));
+	v2_reuse_write_claim(&f, f.claim_bytes);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_remove(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(access(held_wal, F_OK), -1);
+	UT_ASSERT_EQ(errno, ENOENT);
+	UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+	UT_ASSERT_EQ(access(f.flat_wal, F_OK), 0);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_bookkeep(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_REMOVED);
+	UT_ASSERT_EQ(unlink(held_claim), 0);
+	UT_ASSERT_EQ(rmdir(held), 0);
+	v2_reuse_fixture_cleanup(&f);
 }
 
 static bool
@@ -2091,7 +2431,12 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(39);
+	UT_PLAN(44);
+	UT_RUN(test_v2_reuse_selects_exact_generation_not_flat_decoy);
+	UT_RUN(test_v2_reuse_missing_native_ref_cannot_fallback_flat);
+	UT_RUN(test_v2_reuse_rejects_unproven_namespace_and_claim);
+	UT_RUN(test_v2_reuse_claim_change_blocks_every_physical_recheck);
+	UT_RUN(test_v2_reuse_removes_only_held_generation_object);
 	UT_RUN(test_layout_contracts);
 	UT_RUN(test_thread_directory_exact_parse);
 	UT_RUN(test_wal_basename_exact_parse);

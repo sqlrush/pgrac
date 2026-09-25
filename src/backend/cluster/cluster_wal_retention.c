@@ -1130,8 +1130,12 @@ wal_reuse_request_shape_valid(const ClusterWalReuseGuardRequest *request)
 {
 	bool no_source;
 
-	if (request == NULL || !cluster_wal_file_identity_valid(&request->file, wal_segment_size)
-		|| !cluster_recovery_duty_key_valid_v1(&request->duty)
+	if (request == NULL
+		|| !cluster_wal_file_identity_valid(&request->file, wal_segment_size)
+		/* The v1 predicate regenerates the old 40-byte claim checksum. V2
+		 * requires the actual exact-generation claim in open_target instead;
+		 * skipping that obsolete predicate is not claim/root admission. */
+		|| (!cluster_shared_config && !cluster_recovery_duty_key_valid_v1(&request->duty))
 		|| !root_token_matches_identity(&request->root_read, &request->duty)
 		|| request->file.thread_id != request->duty.origin_thread_id || request->formation == NULL)
 		return false;
@@ -1204,6 +1208,58 @@ wal_reuse_target_basename(const ClusterWalFileIdentity *file, char *basename, Si
 	return written > 0 && written < (int)basename_size;
 }
 
+#ifndef WIN32
+static bool
+wal_reuse_v2_owned(const struct stat *st, bool directory)
+{
+	return (directory ? S_ISDIR(st->st_mode) : S_ISREG(st->st_mode)) && st->st_uid == geteuid()
+		   && (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/* PGRAC: no allocation/crypto/throwing backend call with raw target FDs held.
+ * Initial target selection compares these bytes with the authenticated claim;
+ * later checks compare with the original exact object stamp.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+wal_reuse_v2_claim_read(int dirfd, uint8 out[CLUSTER_WAL_CLAIM_V2_BYTES])
+{
+	uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES + 1];
+	struct stat before, after, named;
+	int fd;
+	size_t used = 0;
+	bool ok = false;
+
+	memset(out, 0, CLUSTER_WAL_CLAIM_V2_BYTES);
+	fd = openat(dirfd, CLUSTER_WAL_THREAD_CLAIM_FILENAME,
+				O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
+	if (fd < 0)
+		return false;
+	if (fstat(fd, &before) != 0 || !wal_reuse_v2_owned(&before, false)
+		|| before.st_size != CLUSTER_WAL_CLAIM_V2_BYTES)
+		goto done;
+	while (used < sizeof(bytes)) {
+		ssize_t n = read(fd, bytes + used, sizeof(bytes) - used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0)
+			goto done;
+		if (n == 0)
+			break;
+		used += n;
+	}
+	ok = used == CLUSTER_WAL_CLAIM_V2_BYTES && fstat(fd, &after) == 0
+		 && fstatat(dirfd, CLUSTER_WAL_THREAD_CLAIM_FILENAME, &named, AT_SYMLINK_NOFOLLOW) == 0
+		 && wal_reuse_same_leaf_stat(&before, &after) && wal_reuse_same_leaf_stat(&after, &named);
+done:
+	if (close(fd) != 0)
+		ok = false;
+	if (ok)
+		memcpy(out, bytes, CLUSTER_WAL_CLAIM_V2_BYTES);
+	return ok;
+}
+#endif
+
 static bool
 wal_reuse_stamp_held_target(const ClusterWalFileIdentity *file, uint64 system_identifier, int dirfd,
 							int fd, ClusterWalFileObjectStamp *out_stamp)
@@ -1243,6 +1299,12 @@ wal_reuse_stamp_held_target(const ClusterWalFileIdentity *file, uint64 system_id
 	if (!cluster_wal_file_long_header_matches(&parsed, &header, system_identifier,
 											  wal_segment_size))
 		return false;
+	if (cluster_shared_config) {
+		if (!wal_reuse_v2_owned(&dir_stat, true) || !wal_reuse_v2_owned(&after, false)
+			|| !wal_reuse_v2_claim_read(dirfd, out_stamp->generation_claim))
+			return false;
+		out_stamp->generation_claim_length = CLUSTER_WAL_CLAIM_V2_BYTES;
+	}
 	out_stamp->platform = CLUSTER_WAL_OBJECT_POSIX;
 	out_stamp->directory_device = (uint64)dir_stat.st_dev;
 	out_stamp->directory_file_id_lo = (uint64)dir_stat.st_ino;
@@ -1265,8 +1327,74 @@ wal_reuse_stamp_held_target(const ClusterWalFileIdentity *file, uint64 system_id
 #endif
 }
 
+#ifndef WIN32
+/* Current native writer only. Historical/recovery namespace selection remains
+ * blocked until its root/history purpose adapter supplies the exact reference.
+ * No path fallback or "newest generation" inference is permitted.
+ */
 static bool
-wal_reuse_open_target(const ClusterWalFileIdentity *file, uint64 system_identifier,
+wal_reuse_open_v2_target(const ClusterWalFileIdentity *file, const ClusterRecoveryDutyKey *duty,
+						 ClusterWalFileObjectStamp *out_stamp, intptr_t *out_dir_handle,
+						 intptr_t *out_handle)
+{
+	ClusterWalDurablePrefixRef ref;
+	ClusterWalThreadClaimV2 claim;
+	uint8 expected[CLUSTER_WAL_CLAIM_V2_BYTES];
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	char thread[32], generation[48], basename[MAXFNAMELEN];
+	int parents[2] = { -1, -1 };
+	int dirfd = -1, fd = -1;
+	struct stat st;
+	bool ok = false;
+
+	/* This call can use backend crypto resources, before any raw target FD. */
+	if (!cluster_wal_thread_current_v2_ref(&ref) || duty == NULL
+		|| memcmp(duty, &ref.claim.identity, sizeof(*duty)) != 0
+		|| file->thread_id != duty->origin_thread_id || file->tli != ref.timeline
+		|| cluster_wal_claim_v2_read(cluster_wal_threads_dir, &ref.claim, &claim)
+			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| cluster_wal_claim_v2_encode(&claim, expected) != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	snprintf(thread, sizeof(thread), "thread_%u", duty->origin_thread_id);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 duty->origin_owner_incarnation);
+	if (!wal_reuse_target_basename(file, basename, sizeof(basename)))
+		return false;
+	parents[0] = open(cluster_wal_threads_dir, flags);
+	if (parents[0] < 0 || fstat(parents[0], &st) != 0 || !wal_reuse_v2_owned(&st, true))
+		goto done;
+	parents[1] = openat(parents[0], thread, flags);
+	if (parents[1] < 0 || fstat(parents[1], &st) != 0 || !wal_reuse_v2_owned(&st, true))
+		goto done;
+	dirfd = openat(parents[1], generation, flags);
+	if (dirfd < 0 || fstat(dirfd, &st) != 0 || !wal_reuse_v2_owned(&st, true))
+		goto done;
+	fd = openat(dirfd, basename, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
+	if (fd < 0 || !wal_reuse_stamp_held_target(file, duty->system_identifier, dirfd, fd, out_stamp)
+		|| out_stamp->generation_claim_length != sizeof(expected)
+		|| memcmp(out_stamp->generation_claim, expected, sizeof(expected)) != 0)
+		goto done;
+	ok = true;
+done:
+	for (size_t i = 0; i < lengthof(parents); ++i)
+		if (parents[i] >= 0 && close(parents[i]) != 0)
+			ok = false;
+	if (ok) {
+		*out_dir_handle = dirfd;
+		*out_handle = fd;
+	} else {
+		if (fd >= 0)
+			close(fd);
+		if (dirfd >= 0)
+			close(dirfd);
+		memset(out_stamp, 0, sizeof(*out_stamp));
+	}
+	return ok;
+}
+#endif
+
+static bool
+wal_reuse_open_target(const ClusterWalFileIdentity *file, const ClusterRecoveryDutyKey *duty,
 					  ClusterWalFileObjectStamp *out_stamp, intptr_t *out_dir_handle,
 					  intptr_t *out_handle)
 {
@@ -1283,6 +1411,8 @@ wal_reuse_open_target(const ClusterWalFileIdentity *file, uint64 system_identifi
 	*out_handle = (intptr_t)-1;
 	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
 		return false;
+	if (cluster_shared_config)
+		return wal_reuse_open_v2_target(file, duty, out_stamp, out_dir_handle, out_handle);
 	cluster_wal_thread_dir_name(file->thread_id, dirname, sizeof(dirname));
 	if (dirname[0] == '\0'
 		|| snprintf(dirpath, sizeof(dirpath), "%s/%s", cluster_wal_threads_dir, dirname)
@@ -1303,7 +1433,8 @@ wal_reuse_open_target(const ClusterWalFileIdentity *file, uint64 system_identifi
 	if (dirfd < 0)
 		return false;
 	fd = openat(dirfd, basename, open_flags);
-	if (fd < 0 || !wal_reuse_stamp_held_target(file, system_identifier, dirfd, fd, out_stamp)) {
+	if (fd < 0
+		|| !wal_reuse_stamp_held_target(file, duty->system_identifier, dirfd, fd, out_stamp)) {
 		if (fd >= 0)
 			close(fd);
 		close(dirfd);
@@ -1314,7 +1445,7 @@ wal_reuse_open_target(const ClusterWalFileIdentity *file, uint64 system_identifi
 	return true;
 #else
 	(void)file;
-	(void)system_identifier;
+	(void)duty;
 	memset(out_stamp, 0, sizeof(*out_stamp));
 	*out_dir_handle = (intptr_t)-1;
 	*out_handle = (intptr_t)-1;
@@ -1434,7 +1565,7 @@ cluster_wal_reuse_guard_preflight(ClusterWalReuseActionGuard *guard,
 		*out_reason = CLUSTER_WAL_DENY_INSTALL_SOURCE_UNPROVEN;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	if (!wal_reuse_open_target(&request->file, request->duty.system_identifier, &target_stamp,
+	if (!wal_reuse_open_target(&request->file, &request->duty, &target_stamp,
 							   &guard->source_dir_handle, &guard->source_handle)) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
@@ -1522,8 +1653,8 @@ cluster_wal_reuse_guard_preflight_active_recovery(ClusterWalReuseActionGuard *gu
 			*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
 			return CLUSTER_WAL_GUARD_BLOCKED;
 		}
-	if (!wal_reuse_open_target(file, thread->duty.system_identifier, &target_stamp,
-							   &guard->source_dir_handle, &guard->source_handle)) {
+	if (!wal_reuse_open_target(file, &thread->duty, &target_stamp, &guard->source_dir_handle,
+							   &guard->source_handle)) {
 		*out_reason = CLUSTER_WAL_DENY_OBJECT_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}

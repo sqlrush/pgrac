@@ -19,6 +19,7 @@
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_wal_claim.h"
 #include "utils/resowner.h"
 
 #define CLUSTER_WAL_RETENTION_MAX_THREADS UINT16_C(128)
@@ -91,6 +92,10 @@ typedef struct ClusterWalFileObjectStamp {
 	uint32 reserved92;
 	ClusterWalFileIdentity parsed_identity;
 	XLogLongPageHeaderData long_header;
+	/* PGRAC: process-local exact generation proof, never an on-disk ABI.
+	 * Zero length denotes the legacy flat layout. Author: SqlRush <sqlrush@gmail.com> */
+	uint32 generation_claim_length;
+	uint8 generation_claim[CLUSTER_WAL_CLAIM_V2_BYTES];
 } ClusterWalFileObjectStamp;
 
 typedef struct ClusterWalrLock {
