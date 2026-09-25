@@ -697,7 +697,17 @@ test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_checkpoint_candidate.inc unit_test.h
+# PGRAC: execute the early shutdown-control branch too, before WAL creation.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^CreateCheckPoint\(/ { owner=1 } \
+	     owner && /START_CRIT_SECTION\(\)/ && !seen { emit=1; seen=1; count++ } \
+	     /Begin filling in the checkpoint WAL record/ { emit=0 } \
+	     emit { print } /^}/ { owner=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.

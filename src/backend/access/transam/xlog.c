@@ -7921,14 +7921,13 @@ ClusterCheckpointV2Prepare(int flags, ControlFileData *selected)
 	memset(selected, 0, sizeof(*selected));
 	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
-		|| (flags & (CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY)) != 0
+		|| (flags & CHECKPOINT_END_OF_RECOVERY) != 0
+		|| ((flags & CHECKPOINT_IS_SHUTDOWN) != 0 && !ShutdownRequestPending)
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
-		|| cluster_cf_held(ExclusiveLock) || epoch == 0
-		|| !cluster_external_fence_runtime_active()
+		|| cluster_cf_held(ExclusiveLock) || epoch == 0 || !cluster_external_fence_runtime_active()
 		|| !cluster_wal_thread_current_v2_ref(&ref))
-		ereport(ERROR,
-				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("root-v2 online checkpoint requires its admitted native owner")));
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("root-v2 checkpoint requires its admitted native owner")));
 	if (!cluster_cf_lock(ShareLock))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -7975,6 +7974,8 @@ ClusterCheckpointV2Publish(const ControlFileData *candidate, XLogRecPtr end)
 		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
 		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
 		|| cluster_cf_held(ExclusiveLock) || epoch == 0
+		|| (candidate->state != DB_IN_PRODUCTION && candidate->state != DB_SHUTDOWNED)
+		|| (candidate->state == DB_SHUTDOWNED && !ShutdownRequestPending)
 		|| !cluster_wal_thread_current_v2_ref(&ref))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -7989,8 +7990,16 @@ ClusterCheckpointV2Publish(const ControlFileData *candidate, XLogRecPtr end)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 					 errmsg("checkpoint authority changed before control-root publication")));
-		result = cluster_control_root_v2_checkpoint_publish(
-			&ref.claim.identity, candidate, end, &published, &token, &selected);
+		/* PGRAC: the native shutdown record needs its distinct WAL verifier.
+		 * This publishes evidence only, not CLOSED or a serving-set change.
+		 * A pending shutdown signal alone cannot reclassify an online candidate.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (candidate->state == DB_SHUTDOWNED)
+			result = cluster_control_root_v2_shutdown_checkpoint_publish(
+				&ref.claim.identity, candidate, end, &published, &token, &selected);
+		else
+			result = cluster_control_root_v2_checkpoint_publish(&ref.claim.identity, candidate, end,
+																&published, &token, &selected);
 		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
 			break;
 		/* A peer won the whole-file CAS. All CF/WALR holds and own staging
@@ -8080,9 +8089,9 @@ CreateCheckPoint(int flags)
 		elog(ERROR, "can't create a checkpoint during recovery");
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: select only this thread before any checkpoint mutation. Startup,
-	 * shutdown and parameter transitions need their distinct purpose owner;
-	 * neither the old CF skip nor EOR exemption grants root-v2 permission. */
+	/* PGRAC: select only this thread before any checkpoint mutation. Native
+	 * shutdown has a distinct evidence publisher; startup/EOR and parameter
+	 * transitions still need their separate owner. No CF skip grants permission. */
 	if (cluster_shared_config)
 	{
 		ClusterCheckpointV2Prepare(flags, &v2_checkpoint);
@@ -8274,10 +8283,19 @@ CreateCheckPoint(int flags)
 
 	if (shutdown)
 	{
-		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-		ControlFile->state = DB_SHUTDOWNING;
-		UpdateControlFile();
-		LWLockRelease(ControlFileLock);
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: root-v2 remains OPEN until its exact close owner finishes.
+		 * Do not enter the legacy writer or expose SHUTDOWNING as authority.
+		 * The private final candidate goes through the shutdown WAL verifier.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (!cluster_shared_config)
+#endif
+		{
+			LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+			ControlFile->state = DB_SHUTDOWNING;
+			UpdateControlFile();
+			LWLockRelease(ControlFileLock);
+		}
 	}
 
 	/* Begin filling in the checkpoint WAL record */

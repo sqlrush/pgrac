@@ -15,6 +15,7 @@
 #include "cluster/cluster_external_fence.h"
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
@@ -30,6 +31,7 @@ bool cluster_controlfile_shared_authority = true;
 AuxProcType MyAuxProcType = CheckpointerProcess;
 volatile uint32 CritSectionCount;
 volatile sig_atomic_t InterruptPending;
+volatile sig_atomic_t ShutdownRequestPending;
 volatile uint32 InterruptHoldoffCount, QueryCancelHoldoffCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -46,7 +48,7 @@ static bool local_lock, ref_ok, lock_ok, read_ok, release_ok, fence_ok, serving_
 static bool provider_ok, prebump, cancel_on_wait, change_epoch_on_wait, read_error;
 static uint64 epoch;
 static unsigned root_calls, waits, local_updates, reads, releases;
-static unsigned native_writes;
+static unsigned native_writes, shutdown_calls;
 static ClusterControlRootResult returns[4];
 
 void
@@ -226,12 +228,41 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 	return returns[root_calls++];
 }
 
+ClusterControlRootResult
+cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIdentity *self,
+													const ControlFileData *c, XLogRecPtr end,
+													ClusterControlRootSnapshot *out,
+													ClusterControlRootFileToken *token,
+													ControlFileData *control)
+{
+	ClusterControlRootResult result;
+	UT_ASSERT(ShutdownRequestPending && c->state == DB_SHUTDOWNED);
+	shutdown_calls++;
+	result = cluster_control_root_v2_checkpoint_publish(self, c, end, out, token, control);
+	/* Real root keeps its OPEN lifecycle until the separate protocol close. */
+	control->state = DB_IN_PRODUCTION;
+	return result;
+}
+
 #include "test_cluster_checkpoint_native.inc"
 
 static void
 UpdateControlFile(void)
 {
 	native_writes++;
+	/* Preserve the actual chokepoint: shared_config cannot use this writer. */
+	if (cluster_shared_config)
+		ereport(PANIC, (errmsg("untyped native control write")));
+}
+
+static bool
+native_shutdown_begin(bool shutdown)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+#include "test_cluster_checkpoint_shutdown_begin.inc"
+	END_CRIT_SECTION();
+	return true;
 }
 /* Only the native lock boundary is substituted. Actual candidate assignments,
  * CRC and old-writer dispatch below come from CreateCheckPoint. */
@@ -276,11 +307,12 @@ reset_fixture(void)
 	epoch = 9;
 	CritSectionCount = InterruptHoldoffCount = QueryCancelHoldoffCount = 0;
 	InterruptPending = false;
+	ShutdownRequestPending = false;
 	PG_exception_stack = NULL;
 	error_context_stack = NULL;
 	MyAuxProcType = CheckpointerProcess;
 	root_calls = waits = local_updates = reads = releases = 0;
-	native_writes = 0;
+	native_writes = shutdown_calls = 0;
 	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
 	memset(returns, 0, sizeof(returns));
 }
@@ -414,10 +446,83 @@ UT_TEST(native_legacy_candidate_keeps_control_write)
 		UT_ASSERT(!local_lock);
 	}
 }
+UT_TEST(shutdown_prepare_requires_native_request_not_eor)
+{
+	reset_fixture();
+	ShutdownRequestPending = true;
+	UT_ASSERT(prepare(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_IMMEDIATE));
+	UT_ASSERT_EQ(candidate.checkPoint, 150);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	reset_fixture();
+	ShutdownRequestPending = true;
+	UT_ASSERT(!prepare(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_END_OF_RECOVERY));
+	UT_ASSERT_EQ(reads, 0);
+}
+UT_TEST(shutdown_dispatch_preserves_open_view_and_retries)
+{
+	reset_fixture();
+	ShutdownRequestPending = true;
+	UT_ASSERT(native_shutdown_begin(true));
+	if (ut_current_failed)
+		return;
+	candidate = native_candidate(true);
+	UT_ASSERT_EQ(candidate.state, DB_SHUTDOWNED);
+	UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
+	UT_ASSERT_EQ(native_writes, 0);
+	local_updates = 0;
+	returns[0] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	UT_ASSERT(publish());
+	UT_ASSERT_EQ(shutdown_calls, 2);
+	UT_ASSERT_EQ(waits, 1);
+	UT_ASSERT_EQ(local_updates, 1);
+	UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
+	UT_ASSERT_EQ(current.checkPoint, 200);
+	UT_ASSERT_EQ(candidate.state, DB_SHUTDOWNED);
+}
+UT_TEST(shutdown_missing_owner_or_publication_never_installs_candidate)
+{
+	for (int f = 0; f < 4; f++) {
+		reset_fixture();
+		candidate.state = f == 3 ? DB_SHUTDOWNING : DB_SHUTDOWNED;
+		ShutdownRequestPending = f != 0;
+		if (f == 1)
+			MyAuxProcType = StartupProcess;
+		if (f == 2)
+			returns[0] = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		UT_ASSERT(!publish());
+		UT_ASSERT_EQ(root_calls, f == 2 ? 1 : 0);
+		UT_ASSERT_EQ(shutdown_calls, f == 2 ? 1 : 0);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
+		UT_ASSERT_EQ(local_updates, 0);
+	}
+}
+UT_TEST(online_checkpoint_during_shutdown_signal_stays_online)
+{
+	reset_fixture();
+	ShutdownRequestPending = true;
+	UT_ASSERT(publish());
+	UT_ASSERT_EQ(shutdown_calls, 0);
+	UT_ASSERT_EQ(root_calls, 1);
+	UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
+}
+UT_TEST(early_shutdown_never_calls_untyped_writer_for_root_v2)
+{
+	for (int f = 0; f < 3; f++) {
+		reset_fixture();
+		cluster_shared_config = f != 2;
+		UT_ASSERT(native_shutdown_begin(f != 0));
+		UT_ASSERT_EQ(native_writes, f == 2 ? 1 : 0);
+		UT_ASSERT_EQ(current.state, f == 2 ? DB_SHUTDOWNING : DB_IN_PRODUCTION);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT(!local_lock);
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(13);
 	UT_RUN(prepare_uses_short_owned_read);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(publish_retries_only_root_competition_before_projection);
@@ -426,5 +531,10 @@ main(void)
 	UT_RUN(publish_installs_root_selected_common_fields);
 	UT_RUN(native_candidate_is_private_until_publication);
 	UT_RUN(native_legacy_candidate_keeps_control_write);
+	UT_RUN(shutdown_prepare_requires_native_request_not_eor);
+	UT_RUN(shutdown_dispatch_preserves_open_view_and_retries);
+	UT_RUN(shutdown_missing_owner_or_publication_never_installs_candidate);
+	UT_RUN(online_checkpoint_during_shutdown_signal_stays_online);
+	UT_RUN(early_shutdown_never_calls_untyped_writer_for_root_v2);
 	UT_DONE();
 }
