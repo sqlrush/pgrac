@@ -38,6 +38,7 @@
 #include "utils/timestamp.h"
 
 #include "../../backend/cluster/cluster_control_root_private.h"
+#include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "../../backend/cluster/cluster_recovery_anchor_private.h"
 
 #undef printf
@@ -4269,6 +4270,326 @@ UT_TEST(test_v2_view_requires_exact_config_object)
 	}
 }
 
+/* PGRAC: exact byte composition cannot turn a valid individual object into
+ * startup permission. All input bytes below came from the real codecs/files.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct BootstrapFixture {
+	ClusterControlBootstrapInput input;
+	uint8 binding[256];
+	uint8 before[66048];
+	uint8 after[66048];
+	uint8 common[PG_CONTROL_FILE_SIZE];
+	uint8 config[4096];
+	uint8 claim[112];
+	uint8 anchor[512];
+	ClusterRecoveryAnchorV2 local_anchor;
+} BootstrapFixture;
+
+static void
+bootstrap_hex(const uint8 hash[32], char hex[65])
+{
+	for (int i = 0; i < 32; i++)
+		snprintf(hex + 2 * i, 3, "%02x", hash[i]);
+}
+
+static void
+bootstrap_fixture(BootstrapFixture *f, int node)
+{
+	ClusterRecoveryAnchorV2 anchors[2];
+	ControlRootImage root;
+	PgracControlBinding binding;
+	char path[MAXPGPATH], hex[65];
+	struct stat st;
+
+	memset(f, 0, sizeof(*f));
+	v2_thread_fixture(f->before, anchors);
+	if (cluster_control_root_v2_decode(f->before, sizeof(f->before), v2_storage, TEST_SYSID, &root)
+		!= 0)
+		abort();
+	f->local_anchor = anchors[node == 0 ? 0 : 1];
+	memset(&binding, 0, sizeof(binding));
+	binding.system_identifier = TEST_SYSID;
+	memcpy(binding.storage_uuid, v2_storage, 16);
+	memcpy(binding.authority_uuid, root.header.authority_uuid, 16);
+	binding.database_incarnation = 41;
+	binding.node_id = node;
+	memset(binding.operation_uuid, 0x41, 16);
+	memset(binding.source_cold_sha256, 0x42, 32);
+	memset(binding.target_qualification_sha256, 0x43, 32);
+	memcpy(binding.migration_round_sha256, root.header.migration_round_sha256, 32);
+	memcpy(binding.source_wal_state_sha256, root.header.source_wal_state_sha256, 32);
+	binding.migration_prepare_generation = 3;
+	binding.migration_transition_epoch = 4;
+	if (!pgrac_control_binding_encode(&binding, f->binding, sizeof(f->binding)))
+		abort();
+
+	bootstrap_hex(root.header.v2.control_image_sha256, hex);
+	snprintf(path, sizeof(path), "%s/global/control_images/53-%s.bin", test_root, hex);
+	read_all_or_abort(path, f->common, sizeof(f->common));
+	bootstrap_hex(root.header.v2.config_sha256, hex);
+	snprintf(path, sizeof(path), "%s/global/config_images/47-%s.conf", test_root, hex);
+	if (stat(path, &st) != 0 || st.st_size <= 0 || st.st_size > sizeof(f->config))
+		abort();
+	read_all_or_abort(path, f->config, st.st_size);
+	f->input.config.data = f->config;
+	f->input.config.len = st.st_size;
+	v2_claim_path(&f->local_anchor.identity, path);
+	read_all_or_abort(path, f->claim, sizeof(f->claim));
+	bootstrap_hex(root.refs[node].anchor_sha256, hex);
+	snprintf(path, sizeof(path),
+			 "%s/global/anchor_images/thread_%u/generation_" UINT64_FORMAT "/anchor_" UINT64_FORMAT
+			 "-%s.bin",
+			 test_root, f->local_anchor.identity.origin_thread_id,
+			 f->local_anchor.identity.origin_owner_incarnation, f->local_anchor.anchor_generation,
+			 hex);
+	read_all_or_abort(path, f->anchor, sizeof(f->anchor));
+	memcpy(f->after, f->before, sizeof(f->after));
+	f->input.node_id = node;
+#define BOOT_INPUT(field, bytes)                                                                   \
+	f->input.field.data = f->bytes;                                                                \
+	f->input.field.len = sizeof(f->bytes)
+	BOOT_INPUT(binding, binding);
+	BOOT_INPUT(root_before, before);
+	BOOT_INPUT(root_after, after);
+	BOOT_INPUT(common, common);
+	BOOT_INPUT(claim, claim);
+	BOOT_INPUT(anchor, anchor);
+#undef BOOT_INPUT
+	/* Composition must not consult these unrelated runtime authorities. */
+	test_cf_grant = false;
+	test_cf_lock_calls = 0;
+	test_contract = CLUSTER_CF_CONTRACT_UNVERIFIED;
+}
+
+static ClusterControlRootResult
+bootstrap_refused(const ClusterControlBootstrapInput *input)
+{
+	ClusterControlBootstrapSnapshot out;
+	ClusterControlRootResult result;
+
+	memset(&out, 0xa5, sizeof(out));
+	result = cluster_control_bootstrap_decode(input, &out);
+	UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	return result;
+}
+
+UT_TEST(test_bootstrap_composes_exact_threads_without_admission)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapSnapshot out;
+	uint8 hash[32];
+
+	for (int node = 0; node <= 127; node += 127) {
+		bootstrap_fixture(&f, node);
+		UT_ASSERT_EQ(cluster_control_bootstrap_decode(&f.input, &out), 0);
+		UT_ASSERT_EQ(out.binding.node_id, node);
+		UT_ASSERT_EQ(out.thread.origin_thread_id, node + 1);
+		UT_ASSERT_EQ(out.thread.origin_owner_incarnation,
+					 f.local_anchor.identity.origin_owner_incarnation);
+		UT_ASSERT_EQ(out.control.checkPoint, f.local_anchor.checkpoint);
+		UT_ASSERT_EQ(out.control.minRecoveryPoint, f.local_anchor.min_recovery_point);
+		UT_ASSERT_EQ(out.control.MaxConnections, 300);
+		UT_ASSERT_EQ(out.control.checkPointCopy.nextOid, 60001);
+		UT_ASSERT_EQ(out.config.identity.generation, 47);
+		UT_ASSERT_EQ(out.root_sequence, 7);
+		UT_ASSERT_EQ(out.database_state, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
+		sha256_bytes(f.before, sizeof(f.before), hash);
+		UT_ASSERT(memcmp(hash, out.root_sha256, 32) == 0);
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	}
+}
+
+UT_TEST(test_bootstrap_every_local_root_identity_must_match)
+{
+	BootstrapFixture f;
+	PgracControlBinding binding;
+
+	bootstrap_fixture(&f, 0);
+	for (int fault = 0; fault < 9; fault++) {
+		UT_ASSERT(pgrac_control_binding_decode(f.binding, sizeof(f.binding), &binding));
+		switch (fault) {
+		case 0:
+			binding.system_identifier++;
+			break;
+		case 1:
+			binding.storage_uuid[0] ^= 1;
+			break;
+		case 2:
+			binding.authority_uuid[0] ^= 1;
+			break;
+		case 3:
+			binding.database_incarnation++;
+			break;
+		case 4:
+			binding.node_id = 127;
+			break;
+		case 5:
+			binding.migration_round_sha256[0] ^= 1;
+			break;
+		case 6:
+			binding.source_wal_state_sha256[0] ^= 1;
+			break;
+		case 7:
+			binding.migration_prepare_generation++;
+			break;
+		case 8:
+			binding.migration_transition_epoch++;
+			break;
+		}
+		UT_ASSERT(pgrac_control_binding_encode(&binding, f.binding, sizeof(f.binding)));
+		UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+		bootstrap_fixture(&f, 0);
+	}
+}
+
+UT_TEST(test_bootstrap_changed_root_is_not_a_partial_success)
+{
+	BootstrapFixture f;
+
+	bootstrap_fixture(&f, 0);
+	put_u64_le(f.after + 16, 8);
+	v2_checksums(f.after);
+	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	/* A revoked after-image is terminal, not a retry that could reopen it. */
+	put_u32_le(f.after + 196, CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED);
+	v2_checksums(f.after);
+	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+	f.after[200] ^= 1;
+	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_BAD_HEADER_CRC);
+}
+
+UT_TEST(test_bootstrap_absent_unconfigured_retired_or_revoked)
+{
+	BootstrapFixture f;
+
+	for (int fault = 0; fault < 4; fault++) {
+		bootstrap_fixture(&f, 0);
+		if (fault == 0)
+			memset(f.before + 512, 0, 512);
+		else if (fault == 1) {
+			put_u64_le(f.before + 216, 0);
+			put_u64_le(f.before + 232, 0);
+		} else if (fault == 2)
+			f.before[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED;
+		else
+			put_u32_le(f.before + 196, CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED);
+		v2_checksums(f.before);
+		memcpy(f.after, f.before, sizeof(f.after));
+		bootstrap_refused(&f.input);
+	}
+}
+
+UT_TEST(test_bootstrap_every_selected_object_is_required)
+{
+	BootstrapFixture f;
+	uint8 *objects[5];
+
+	for (int fault = 0; fault < 5; fault++) {
+		bootstrap_fixture(&f, 0);
+		objects[0] = f.binding;
+		objects[1] = f.common;
+		objects[2] = f.config;
+		objects[3] = f.claim;
+		objects[4] = f.anchor;
+		objects[fault][20] ^= 1;
+		bootstrap_refused(&f.input);
+	}
+	bootstrap_fixture(&f, 0);
+	put_u16_le(f.before + 4, 1);
+	v2_checksums(f.before);
+	memcpy(f.after, f.before, sizeof(f.after));
+	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_BAD_VERSION);
+}
+
+UT_TEST(test_bootstrap_bad_input_lengths_and_alias_clear_output)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapBytes *objects[7];
+	ClusterControlBootstrapSnapshot out;
+
+	bootstrap_fixture(&f, 0);
+	objects[0] = &f.input.binding;
+	objects[1] = &f.input.root_before;
+	objects[2] = &f.input.root_after;
+	objects[3] = &f.input.common;
+	objects[4] = &f.input.config;
+	objects[5] = &f.input.claim;
+	objects[6] = &f.input.anchor;
+	UT_ASSERT_EQ(bootstrap_refused(NULL), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_control_bootstrap_decode(&f.input, NULL),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	for (int i = 0; i < 7; i++) {
+		ClusterControlBootstrapBytes saved = *objects[i];
+
+		objects[i]->data = NULL;
+		bootstrap_refused(&f.input);
+		*objects[i] = saved;
+		objects[i]->len--;
+		bootstrap_refused(&f.input);
+		*objects[i] = saved;
+		objects[i]->len = SIZE_MAX;
+		bootstrap_refused(&f.input);
+		*objects[i] = saved;
+	}
+	f.input.node_id = 128;
+	bootstrap_refused(&f.input);
+	f.input.node_id = 0;
+	UT_ASSERT_EQ(
+		cluster_control_bootstrap_decode(&f.input, (ClusterControlBootstrapSnapshot *)f.before),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(f.before, sizeof(out)));
+}
+
+static void
+bootstrap_replace_anchor(BootstrapFixture *f)
+{
+	uint8 hash[32];
+
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_encode(&f->local_anchor, f->anchor), 0);
+	sha256_bytes(f->anchor, sizeof(f->anchor), hash);
+	memcpy(f->before + 512 + 264, hash, 32);
+	v2_checksums(f->before);
+	memcpy(f->after, f->before, sizeof(f->after));
+}
+
+UT_TEST(test_bootstrap_anchor_requires_exact_redo_and_no_backup)
+{
+	BootstrapFixture f;
+
+	bootstrap_fixture(&f, 0);
+	f.local_anchor.checkpoint_copy.redo += 4096;
+	f.local_anchor.checkpoint += 4096;
+	f.local_anchor.min_recovery_point += 4096;
+	bootstrap_replace_anchor(&f);
+	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	bootstrap_fixture(&f, 0);
+	f.local_anchor.backup_start = UINT64_C(0x1000100);
+	f.local_anchor.backup_end = UINT64_C(0x1000200);
+	f.local_anchor.backup_end_required = false;
+	bootstrap_replace_anchor(&f);
+	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+}
+
+UT_TEST(test_bootstrap_prepared_observation_is_not_open)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapSnapshot out;
+
+	for (int state = 1; state <= 5; state++) {
+		bootstrap_fixture(&f, 0);
+		put_u32_le(f.before + 76, CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED);
+		put_u32_le(f.before + 196, state);
+		v2_checksums(f.before);
+		memcpy(f.after, f.before, sizeof(f.after));
+		UT_ASSERT_EQ(cluster_control_bootstrap_decode(&f.input, &out), 0);
+		UT_ASSERT_EQ(out.activation_state, CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED);
+		UT_ASSERT_EQ(out.database_state, state);
+		UT_ASSERT_EQ(out.control.state, DB_IN_PRODUCTION);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4278,7 +4599,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(71);
+	UT_PLAN(79);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -4350,6 +4671,14 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_runtime_reader_never_uses_projection_for_bad_facts);
 	UT_RUN(test_v2_runtime_native_inplace_identity_is_never_cleared);
 	UT_RUN(test_v2_view_requires_exact_config_object);
+	UT_RUN(test_bootstrap_composes_exact_threads_without_admission);
+	UT_RUN(test_bootstrap_every_local_root_identity_must_match);
+	UT_RUN(test_bootstrap_changed_root_is_not_a_partial_success);
+	UT_RUN(test_bootstrap_absent_unconfigured_retired_or_revoked);
+	UT_RUN(test_bootstrap_every_selected_object_is_required);
+	UT_RUN(test_bootstrap_bad_input_lengths_and_alias_clear_output);
+	UT_RUN(test_bootstrap_anchor_requires_exact_redo_and_no_backup);
+	UT_RUN(test_bootstrap_prepared_observation_is_not_open);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

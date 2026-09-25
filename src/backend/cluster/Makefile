@@ -52,6 +52,7 @@ OBJS = \
 	cluster_shared_config.o \
 	cluster_shared_config_guc.o \
 	cluster_control_root.o \
+	cluster_control_bootstrap.o \
 	cluster_formation_marker.o \
 	cluster_page_version.o \
 	cluster_page_rmgr.o \
