@@ -17,6 +17,8 @@
 #include <unistd.h>
 
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "access/xlogreader.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_storage.h"
@@ -2091,13 +2093,235 @@ typedef struct CheckpointV2Work {
 	ClusterRecoveryAnchorStageV2 stage;
 	ClusterWalRootPublishGuard *walr;
 	LOCKMODE cf_mode;
+	/* PGRAC: exact generation WAL readback, released on all return/ERROR paths. */
+	int wal_dirs[3];
+	/* A native checkpoint fits within two pages, hence at most two segments. */
+	int wal_segments[2];
+	XLogSegNo wal_segment_numbers[2];
+	XLogReaderState *wal_reader;
+	uint16 wal_thread;
+	TimeLineID wal_tli;
+	ClusterControlRootResult wal_read_result;
 } CheckpointV2Work;
+
+static bool
+checkpoint_wal_owned(const struct stat *st, bool directory)
+{
+	return (directory ? S_ISDIR(st->st_mode) : S_ISREG(st->st_mode) && st->st_nlink == 1)
+		   && st->st_uid == geteuid() && (st->st_mode & (S_IWGRP | S_IWOTH)) == 0;
+}
+
+/* Keep each segment pinned across all decoder callbacks and publication. In
+ * particular, a verified long header and its short pages must not come from
+ * different inodes after a pathname replacement. Work cleanup owns every fd,
+ * including on ERROR. Missing segments are a refusal, never natural EOF. */
+static int
+checkpoint_v2_wal_page(XLogReaderState *reader, XLogRecPtr pageptr, int required,
+					   XLogRecPtr recordptr pg_attribute_unused(), char *page)
+{
+	CheckpointV2Work *work = reader->private_data;
+	XLogSegNo segno;
+	char filename[MAXFNAMELEN];
+	struct stat st;
+	int fd = -1;
+	size_t used = 0;
+	XLogPageHeader header;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+
+	if (required < 0 || required > XLOG_BLCKSZ || pageptr % XLOG_BLCKSZ != 0)
+		return XLREAD_FAIL;
+	XLByteToSeg(pageptr, segno, reader->segcxt.ws_segsize);
+	for (size_t i = 0; i < lengthof(work->wal_segments); ++i) {
+		if (work->wal_segments[i] >= 0) {
+			if (work->wal_segment_numbers[i] == segno) {
+				fd = work->wal_segments[i];
+				break;
+			}
+			continue;
+		}
+		XLogFileName(filename, work->wal_tli, segno, reader->segcxt.ws_segsize);
+		fd = openat(work->wal_dirs[2], filename,
+					O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+		if (fd < 0) {
+			work->wal_read_result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : result;
+			return XLREAD_FAIL;
+		}
+		work->wal_segments[i] = fd;
+		work->wal_segment_numbers[i] = segno;
+		break;
+	}
+	if (fd < 0) {
+		work->wal_read_result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		return XLREAD_FAIL;
+	}
+	if (fstat(fd, &st) != 0 || !checkpoint_wal_owned(&st, false))
+		goto done;
+	if (st.st_size != reader->segcxt.ws_segsize) {
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		goto done;
+	}
+	while (used < XLOG_BLCKSZ) {
+		ssize_t count = pread(fd, page + used, XLOG_BLCKSZ - used,
+							  XLogSegmentOffset(pageptr, reader->segcxt.ws_segsize) + used);
+		if (count < 0 && errno == EINTR)
+			continue;
+		if (count <= 0)
+			goto done;
+		used += count;
+	}
+	header = (XLogPageHeader)page;
+	if (header->xlp_thread_id != work->wal_thread || header->xlp_tli != work->wal_tli) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto done;
+	}
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	work->wal_read_result = result;
+	return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? XLOG_BLCKSZ : XLREAD_FAIL;
+}
+
+static bool
+checkpoint_wal_matches(const CheckPoint *actual, const CheckPoint *expected)
+{
+#define CHECK_FIELD(field)                                                                         \
+	if (actual->field != expected->field)                                                          \
+	return false
+	CHECK_FIELD(redo);
+	CHECK_FIELD(ThisTimeLineID);
+	CHECK_FIELD(PrevTimeLineID);
+	CHECK_FIELD(fullPageWrites);
+	if (!FullTransactionIdEquals(actual->nextXid, expected->nextXid))
+		return false;
+	CHECK_FIELD(nextOid);
+	CHECK_FIELD(nextMulti);
+	CHECK_FIELD(nextMultiOffset);
+	CHECK_FIELD(oldestXid);
+	CHECK_FIELD(oldestXidDB);
+	CHECK_FIELD(oldestMulti);
+	CHECK_FIELD(oldestMultiDB);
+	CHECK_FIELD(time);
+	CHECK_FIELD(oldestCommitTsXid);
+	CHECK_FIELD(newestCommitTsXid);
+	CHECK_FIELD(oldestActiveXid);
+#undef CHECK_FIELD
+	return true;
+}
+
+static bool
+checkpoint_v2_wal_paths_current(const CheckpointV2Work *work,
+								const ClusterControlRootIdentity *self)
+{
+	char thread[32], generation[48];
+	const char *parts[] = { thread, generation };
+	struct stat current, pinned;
+
+	snprintf(thread, sizeof(thread), "thread_%u", self->origin_thread_id);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 self->origin_owner_incarnation);
+	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i) {
+		if (work->wal_dirs[i] < 0 || fstat(work->wal_dirs[i], &pinned) != 0
+			|| (i == 0
+					? lstat(cluster_wal_threads_dir, &current)
+					: fstatat(work->wal_dirs[i - 1], parts[i - 1], &current, AT_SYMLINK_NOFOLLOW))
+				   != 0
+			|| !checkpoint_wal_owned(&current, true) || !checkpoint_wal_owned(&pinned, true)
+			|| current.st_dev != pinned.st_dev || current.st_ino != pinned.st_ino)
+			return false;
+	}
+	for (size_t i = 0; i < lengthof(work->wal_segments); ++i) {
+		char filename[MAXFNAMELEN];
+
+		if (work->wal_segments[i] < 0)
+			continue;
+		XLogFileName(filename, work->wal_tli, work->wal_segment_numbers[i],
+					 work->wal_reader->segcxt.ws_segsize);
+		if (fstat(work->wal_segments[i], &pinned) != 0
+			|| fstatat(work->wal_dirs[2], filename, &current, AT_SYMLINK_NOFOLLOW) != 0
+			|| !checkpoint_wal_owned(&current, false) || !checkpoint_wal_owned(&pinned, false)
+			|| current.st_dev != pinned.st_dev || current.st_ino != pinned.st_ino
+			|| pinned.st_size != work->wal_reader->segcxt.ws_segsize
+			|| current.st_size != pinned.st_size)
+			return false;
+	}
+	return true;
+}
+
+static ClusterControlRootResult
+checkpoint_v2_wal_verify(CheckpointV2Work *work, const ClusterControlRootIdentity *self,
+						 const ControlFileData *control, XLogRecPtr end, uint32 crc)
+{
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	char thread[32], generation[48];
+	const char *parts[] = { thread, generation };
+	struct stat st;
+	XLogRecord *record;
+	CheckPoint checkpoint;
+	char *error = NULL;
+
+	if (cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0'
+		|| !IsValidWalSegSize(wal_segment_size))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	snprintf(thread, sizeof(thread), "thread_%u", self->origin_thread_id);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 self->origin_owner_incarnation);
+	work->wal_dirs[0] = open(cluster_wal_threads_dir, flags);
+	if (work->wal_dirs[0] < 0 || fstat(work->wal_dirs[0], &st) != 0
+		|| !checkpoint_wal_owned(&st, true))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	for (size_t i = 0; i < lengthof(parts); ++i) {
+		work->wal_dirs[i + 1] = openat(work->wal_dirs[i], parts[i], flags);
+		if (work->wal_dirs[i + 1] < 0 || fstat(work->wal_dirs[i + 1], &st) != 0
+			|| !checkpoint_wal_owned(&st, true))
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	work->wal_thread = self->origin_thread_id;
+	work->wal_tli = control->checkPointCopy.ThisTimeLineID;
+	work->wal_read_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	work->wal_reader = XLogReaderAllocate(wal_segment_size, NULL,
+										  XL_ROUTINE(.page_read = checkpoint_v2_wal_page), work);
+	if (work->wal_reader == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	work->wal_reader->system_identifier = self->system_identifier;
+	work->wal_reader->cluster_expected_thread_id = self->origin_thread_id;
+	work->wal_reader->seg.ws_tli = work->wal_tli;
+	XLogBeginRead(work->wal_reader, control->checkPoint);
+	record = XLogReadRecord(work->wal_reader, &error);
+	if (work->wal_read_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return work->wal_read_result;
+	if (record == NULL || work->wal_reader->ReadRecPtr != control->checkPoint
+		|| work->wal_reader->EndRecPtr != end || record->xl_crc != crc
+		|| record->xl_rmid != RM_XLOG_ID
+		|| (record->xl_info & ~XLR_INFO_MASK) != XLOG_CHECKPOINT_ONLINE
+		|| XLogRecGetDataLen(work->wal_reader) != sizeof(CheckPoint)
+		|| XLogRecHasAnyBlockRefs(work->wal_reader))
+		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+	memcpy(&checkpoint, XLogRecGetData(work->wal_reader), sizeof(checkpoint));
+	return checkpoint_wal_matches(&checkpoint, &control->checkPointCopy)
+			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			   : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+}
 
 static ClusterControlRootResult
 checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
 {
 	ClusterControlRootResult discarded;
 
+	if (work->wal_reader != NULL) {
+		XLogReaderFree(work->wal_reader);
+		work->wal_reader = NULL;
+	}
+	for (size_t i = 0; i < lengthof(work->wal_segments); ++i) {
+		int fd = work->wal_segments[i];
+		work->wal_segments[i] = -1;
+		if (fd >= 0 && close(fd) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i) {
+		int fd = work->wal_dirs[i];
+		work->wal_dirs[i] = -1;
+		if (fd >= 0 && close(fd) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
 	if (work->cf_mode != NoLock) {
 		LOCKMODE mode = work->cf_mode;
 
@@ -2208,6 +2432,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (walr_result != CLUSTER_WAL_PIN_OK)
 		return walr_result == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 													: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = checkpoint_v2_wal_verify(work, self, cf, end, crc);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work->cf_mode = ExclusiveLock;
@@ -2216,7 +2443,7 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
-	if (!file_token_equal(&work->before, &actual)
+	if (!file_token_equal(&work->before, &actual) || !checkpoint_v2_wal_paths_current(work, self)
 		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	result = cluster_recovery_anchor_v2_install(&work->stage);
@@ -2250,7 +2477,8 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	result = cluster_control_root_v2_encode(&work->next);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (!checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+	if (!checkpoint_v2_wal_paths_current(work, self)
+		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
@@ -2261,7 +2489,8 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		return result;
 	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
 		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
-	if (!checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
+	if (!checkpoint_v2_wal_paths_current(work, self)
+		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -2308,6 +2537,10 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 									 checkpoint_end))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
+	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
+		work->wal_dirs[i] = -1;
+	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
+		work->wal_segments[i] = -1;
 	PG_TRY();
 	{
 		result = checkpoint_v2_publish_work(work, self, thread_control, checkpoint_end,

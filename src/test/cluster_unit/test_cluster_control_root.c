@@ -3975,6 +3975,108 @@ UT_TEST(test_v2_thread_view_requires_physical_selected_claim)
 /* PGRAC: exact-filesystem checkpoint publication, no fake positive publisher.
  * Author: SqlRush <sqlrush@gmail.com>
  */
+static XLogRecPtr test_checkpoint_end;
+static uint32 test_checkpoint_crc;
+
+static void
+v2_checkpoint_wal_path(const ClusterControlRootIdentity *self, XLogRecPtr position, TimeLineID tli,
+					   char path[MAXPGPATH])
+{
+	char filename[MAXFNAMELEN];
+	XLogSegNo segno;
+	XLByteToSeg(position, segno, wal_segment_size);
+	XLogFileName(filename, tli, segno, wal_segment_size);
+	snprintf(path, MAXPGPATH, "%s/thread_%u/generation_" UINT64_FORMAT "/%s",
+			 cluster_wal_threads_dir, self->origin_thread_id, self->origin_owner_incarnation,
+			 filename);
+}
+
+/* Actual native record framing, including page and segment continuation. No
+ * replacement of XLogReader or its record/CRC validation. Faults alter bytes. */
+static void
+v2_checkpoint_wal_record(const ClusterControlRootIdentity *self, const ControlFileData *candidate,
+						 int fault)
+{
+	uint8 record_bytes[SizeOfXLogRecord + 2 + sizeof(CheckPoint)];
+	XLogRecord record;
+	CheckPoint checkpoint = candidate->checkPointCopy;
+	XLogRecPtr position = candidate->checkPoint;
+	XLogSegNo previous_segment = UINT64_MAX;
+	size_t used = 0;
+	pg_crc32c crc;
+
+	memset(&record, 0, sizeof(record));
+	memset(record_bytes, 0, sizeof(record_bytes));
+	if (fault == 6)
+		checkpoint.time++;
+	record.xl_tot_len = sizeof(record_bytes);
+	record.xl_prev = candidate->checkPointCopy.redo;
+	record.xl_info = fault == 5 ? XLOG_CHECKPOINT_SHUTDOWN : XLOG_CHECKPOINT_ONLINE;
+	record.xl_rmid = RM_XLOG_ID;
+	record_bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
+	record_bytes[SizeOfXLogRecord + 1] = sizeof(CheckPoint);
+	memcpy(record_bytes + SizeOfXLogRecord + 2, &checkpoint, sizeof(checkpoint));
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, record_bytes + SizeOfXLogRecord, sizeof(record_bytes) - SizeOfXLogRecord);
+	COMP_CRC32C(crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
+	record.xl_crc = crc;
+	test_checkpoint_crc = crc;
+	memcpy(record_bytes, &record, SizeOfXLogRecord);
+	if (fault == 4)
+		record_bytes[sizeof(record_bytes) - 1] ^= 1;
+	while (used < sizeof(record_bytes)) {
+		uint8 page[XLOG_BLCKSZ];
+		XLogLongPageHeaderData header;
+		XLogRecPtr page_start = position - position % XLOG_BLCKSZ;
+		XLogSegNo segno;
+		size_t offset = position % XLOG_BLCKSZ, count;
+		char path[MAXPGPATH];
+		int fd;
+		XLByteToSeg(position, segno, wal_segment_size);
+		v2_checkpoint_wal_path(self, position, candidate->checkPointCopy.ThisTimeLineID, path);
+		fd = open(path, O_RDWR | O_CREAT | (segno != previous_segment ? O_TRUNC : 0), 0600);
+		if (fd < 0 || ftruncate(fd, wal_segment_size) != 0)
+			abort();
+		memset(&header, 0, sizeof(header));
+		header.std.xlp_magic = XLOG_PAGE_MAGIC;
+		header.std.xlp_info = XLP_LONG_HEADER;
+		header.std.xlp_tli = candidate->checkPointCopy.ThisTimeLineID + (fault == 2);
+		header.std.xlp_thread_id = fault == 1 ? self->origin_thread_id + 1 : self->origin_thread_id;
+		header.std.xlp_pageaddr = segno * wal_segment_size;
+		header.xlp_sysid = self->system_identifier + (fault == 3);
+		header.xlp_seg_size = wal_segment_size;
+		header.xlp_xlog_blcksz = XLOG_BLCKSZ;
+		if (segno != previous_segment) {
+			memset(page, 0, sizeof(page));
+			memcpy(page, &header, SizeOfXLogLongPHD);
+			if (pwrite(fd, page, sizeof(page), 0) != sizeof(page))
+				abort();
+		}
+		memset(page, 0, sizeof(page));
+		header.std.xlp_pageaddr = page_start;
+		if (page_start % wal_segment_size != 0)
+			header.std.xlp_info = 0;
+		if (used != 0) {
+			header.std.xlp_info |= XLP_FIRST_IS_CONTRECORD;
+			header.std.xlp_rem_len = sizeof(record_bytes) - used;
+			offset = page_start % wal_segment_size == 0 ? SizeOfXLogLongPHD : SizeOfXLogShortPHD;
+		}
+		memcpy(page, &header,
+			   page_start % wal_segment_size == 0 ? SizeOfXLogLongPHD : SizeOfXLogShortPHD);
+		count = Min(sizeof(record_bytes) - used, XLOG_BLCKSZ - offset);
+		memcpy(page + offset, record_bytes + used, count);
+		if (pwrite(fd, page, sizeof(page), page_start % wal_segment_size) != sizeof(page)
+			|| close(fd) != 0)
+			abort();
+		used += count;
+		position = page_start + offset + count;
+		previous_segment = segno;
+	}
+	test_checkpoint_end = MAXALIGN(position);
+	test_flush = test_checkpoint_end;
+}
+
 static void
 v2_checkpoint_fixture(uint8 before[66048], ClusterControlRootIdentity *self,
 					  ControlFileData *candidate)
@@ -4007,7 +4109,7 @@ v2_checkpoint_fixture(uint8 before[66048], ClusterControlRootIdentity *self,
 	test_epoch = 97;
 	test_serving = test_fence = test_wal_validated = true;
 	test_prebump = false;
-	test_flush = candidate->checkPoint + 64;
+	v2_checkpoint_wal_record(self, candidate, 0);
 	test_flush_tli = candidate->checkPointCopy.ThisTimeLineID;
 	test_cf_mode = NoLock;
 	test_cf_lock_calls = test_durable_rename_calls = 0;
@@ -4018,8 +4120,8 @@ static ClusterControlRootResult
 v2_checkpoint_publish(const ClusterControlRootIdentity *self, const ControlFileData *candidate,
 					  ClusterControlRootSnapshot *out, ClusterControlRootFileToken *token)
 {
-	return cluster_control_root_v2_checkpoint_publish(self, candidate, candidate->checkPoint + 64,
-													  UINT32_C(0xa17c2456), out, token);
+	return cluster_control_root_v2_checkpoint_publish(self, candidate, test_checkpoint_end,
+													  test_checkpoint_crc, out, token);
 }
 
 static void
@@ -4066,7 +4168,7 @@ UT_TEST(test_v2_checkpoint_advances_one_thread_and_preserves_common)
 	v2_checkpoint_fixture(before, &self, &candidate);
 	UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token), 0);
 	UT_ASSERT_EQ(out.checkpoint_lower_lsn, candidate.checkPointCopy.redo);
-	UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, candidate.checkPoint + 64);
+	UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);
 	UT_ASSERT_EQ(token.file_txn_seq, 8);
 	UT_ASSERT_EQ(token.format_version, 2);
 	UT_ASSERT_EQ(test_walr_begin_calls, 1);
@@ -4118,7 +4220,65 @@ UT_TEST(test_v2_checkpoint_preserves_historical_parameter_requirements)
 		candidate = view;
 		candidate.checkPoint += 8192;
 		candidate.checkPointCopy.redo += 8192;
-		test_flush = candidate.checkPoint + 64;
+		v2_checkpoint_wal_record(&self, &candidate, 0);
+	}
+}
+
+UT_TEST(test_v2_checkpoint_requires_actual_wal_record)
+{
+	for (int fault = 0; fault < 10; ++fault) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootFileToken token;
+		ControlFileData candidate;
+		char path[MAXPGPATH];
+		v2_checkpoint_fixture(before, &self, &candidate);
+		v2_checkpoint_wal_path(&self, candidate.checkPoint, candidate.checkPointCopy.ThisTimeLineID,
+							   path);
+		if (fault == 0)
+			UT_ASSERT_EQ(unlink(path), 0);
+		else if (fault <= 6)
+			v2_checkpoint_wal_record(&self, &candidate, fault);
+		else if (fault == 7)
+			UT_ASSERT_EQ(truncate(path, 1), 0);
+		else if (fault == 8)
+			test_checkpoint_crc ^= 1;
+		else {
+			test_checkpoint_end += 8;
+			test_flush = test_checkpoint_end;
+		}
+		UT_ASSERT(v2_checkpoint_publish(&self, &candidate, &out, &token) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		v2_assert_primary_unchanged(before);
+		v2_assert_anchor_staging_empty();
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		UT_ASSERT_EQ(test_cf_mode, NoLock);
+	}
+}
+
+UT_TEST(test_v2_checkpoint_wal_continuation)
+{
+	for (int segment = 0; segment < 2; ++segment) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootFileToken token;
+		ControlFileData candidate;
+		v2_checkpoint_fixture(before, &self, &candidate);
+		candidate.checkPoint
+			= segment ? (candidate.checkPoint / wal_segment_size + 2) * wal_segment_size - 48
+					  : (candidate.checkPoint / XLOG_BLCKSZ + 2) * XLOG_BLCKSZ - 48;
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		v2_checkpoint_wal_record(&self, &candidate, 0);
+		UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token), 0);
+		UT_ASSERT_EQ(out.tail_last_record_lsn, candidate.checkPoint);
+		UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);
+		UT_ASSERT_EQ(out.tail_last_record_crc32c, test_checkpoint_crc);
+		v2_assert_anchor_staging_empty();
 	}
 }
 
@@ -4318,6 +4478,89 @@ UT_TEST(test_v2_checkpoint_rejects_unflushed_wrong_tli_and_bad_inputs)
 	}
 }
 
+static void
+v2_checkpoint_replace_wal_generation(void)
+{
+	char generation[MAXPGPATH], moved[MAXPGPATH], claim[MAXPGPATH];
+	uint8 bytes[112];
+	test_checkpoint_x_hook = NULL;
+	snprintf(generation, sizeof(generation), "%s/thread_1/generation_99", cluster_wal_threads_dir);
+	snprintf(moved, sizeof(moved), "%s/thread_1/generation_99.moved", cluster_wal_threads_dir);
+	snprintf(claim, sizeof(claim), "%s/%s", generation, CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+	read_all_or_abort(claim, bytes, sizeof(bytes));
+	if (rename(generation, moved) != 0 || mkdir(generation, 0700) != 0)
+		abort();
+	/* Same exact claim passes the final root read, but its WAL is not the
+	 * pinned directory whose bytes were verified. */
+	write_all_or_abort(claim, bytes, sizeof(bytes));
+}
+
+UT_TEST(test_v2_checkpoint_rejects_replaced_wal_directory)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate;
+	char generation[MAXPGPATH], moved[MAXPGPATH], claim[MAXPGPATH];
+	v2_checkpoint_fixture(before, &self, &candidate);
+	test_checkpoint_x_hook = v2_checkpoint_replace_wal_generation;
+	UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	v2_assert_primary_unchanged(before);
+	v2_assert_anchor_staging_empty();
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT_EQ(test_cf_mode, NoLock);
+	snprintf(generation, sizeof(generation), "%s/thread_1/generation_99", cluster_wal_threads_dir);
+	snprintf(moved, sizeof(moved), "%s/thread_1/generation_99.moved", cluster_wal_threads_dir);
+	snprintf(claim, sizeof(claim), "%s/%s", generation, CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+	UT_ASSERT_EQ(unlink(claim), 0);
+	UT_ASSERT_EQ(rmdir(generation), 0);
+	UT_ASSERT_EQ(rename(moved, generation), 0);
+}
+
+static char v2_wal_segment_path[MAXPGPATH];
+static char v2_wal_segment_moved[MAXPGPATH];
+
+static void
+v2_checkpoint_replace_wal_segment(void)
+{
+	uint8 *copy = malloc(wal_segment_size);
+	test_checkpoint_x_hook = NULL;
+	if (copy == NULL)
+		abort();
+	read_all_or_abort(v2_wal_segment_path, copy, wal_segment_size);
+	copy[offsetof(XLogLongPageHeaderData, xlp_sysid)] ^= 1;
+	if (rename(v2_wal_segment_path, v2_wal_segment_moved) != 0)
+		abort();
+	write_all_or_abort(v2_wal_segment_path, copy, wal_segment_size);
+	free(copy);
+}
+
+UT_TEST(test_v2_checkpoint_rejects_replaced_wal_segment)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate;
+	v2_checkpoint_fixture(before, &self, &candidate);
+	v2_checkpoint_wal_path(&self, candidate.checkPoint, candidate.checkPointCopy.ThisTimeLineID,
+						   v2_wal_segment_path);
+	snprintf(v2_wal_segment_moved, sizeof(v2_wal_segment_moved), "%s.moved", v2_wal_segment_path);
+	test_checkpoint_x_hook = v2_checkpoint_replace_wal_segment;
+	UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	v2_assert_primary_unchanged(before);
+	v2_assert_anchor_staging_empty();
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT_EQ(test_cf_mode, NoLock);
+	UT_ASSERT_EQ(unlink(v2_wal_segment_path), 0);
+	UT_ASSERT_EQ(rename(v2_wal_segment_moved, v2_wal_segment_path), 0);
+}
+
 static uint8 v2_race_winner[66048];
 
 static void
@@ -4479,8 +4722,12 @@ UT_TEST(test_v2_checkpoint_error_unwind_releases_owned_work)
 	ClusterControlRootFileToken token;
 	ControlFileData candidate;
 	volatile bool caught = false;
+	int open_before = 0, open_after = 0;
 
 	v2_checkpoint_fixture(before, &self, &candidate);
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			open_before++;
 	test_checkpoint_x_hook = v2_checkpoint_throw_on_x;
 	PG_TRY();
 	{
@@ -4496,6 +4743,10 @@ UT_TEST(test_v2_checkpoint_error_unwind_releases_owned_work)
 	UT_ASSERT_EQ(test_walr_end_calls, 1);
 	v2_assert_primary_unchanged(before);
 	v2_assert_anchor_staging_empty();
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			open_after++;
+	UT_ASSERT_EQ(open_after, open_before);
 }
 
 /* PGRAC: native CF entry consumes the real root/claim/anchor stack, not a
@@ -5741,7 +5992,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(103);
+	UT_PLAN(107);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -5806,6 +6057,10 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_thread_view_clears_root_after_missing_anchor);
 	UT_RUN(test_v2_thread_view_rejects_selected_foreign_or_inconsistent_anchor);
 	UT_RUN(test_v2_checkpoint_advances_one_thread_and_preserves_common);
+	UT_RUN(test_v2_checkpoint_requires_actual_wal_record);
+	UT_RUN(test_v2_checkpoint_wal_continuation);
+	UT_RUN(test_v2_checkpoint_rejects_replaced_wal_directory);
+	UT_RUN(test_v2_checkpoint_rejects_replaced_wal_segment);
 	UT_RUN(test_v2_checkpoint_preserves_historical_parameter_requirements);
 	UT_RUN(test_v2_checkpoint_rejects_invalid_parameter_before_max);
 	UT_RUN(test_v2_checkpoint_cannot_invent_parameter_transition_proof);
