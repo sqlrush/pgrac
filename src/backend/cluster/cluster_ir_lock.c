@@ -181,7 +181,7 @@ recovery_serial_request_valid(const ClusterRecoverySerialRequest *request)
 	return request != NULL
 		   && (request->mode == CLUSTER_RECOVERY_SERIAL_ONLINE
 			   || request->mode == CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
-		   && cluster_recovery_duty_key_valid_v1(&request->duty)
+		   && cluster_recovery_duty_key_valid_for_claim(&request->duty, cluster_shared_config)
 		   && recovery_serial_root_token_matches_duty(&request->expected_root_token, &request->duty)
 		   && request->formation != NULL && request->fence_need_set != NULL
 		   && request->fence_admission_set != NULL && request->acquire_timeout_ms >= 1
@@ -199,8 +199,10 @@ recovery_serial_release_guard_valid(const ClusterRecoverySerialGuard *guard)
 			&& guard->mode != CLUSTER_RECOVERY_SERIAL_COLD_FORMED)
 		|| guard->formation == NULL || guard->fence_need_set == NULL
 		|| guard->fence_admission_set == NULL || guard->release_timeout_ms < 1
-		|| guard->release_timeout_ms > 600000 || !cluster_recovery_duty_key_valid_v1(&guard->duty)
-		|| !cluster_recovery_serial_resid_encode(&guard->duty, &expected_resid)
+		|| guard->release_timeout_ms > 600000
+		|| !cluster_recovery_duty_key_valid_for_claim(&guard->duty, cluster_shared_config)
+		|| !cluster_recovery_serial_resid_encode_for_claim(&guard->duty, cluster_shared_config,
+														   &expected_resid)
 		|| memcmp(&guard->resid, &expected_resid, sizeof(expected_resid)) != 0
 		|| memcmp(&guard->lock_request.resid, &guard->resid, sizeof(guard->resid)) != 0
 		|| guard->lock_request.lockmode != ExclusiveLock
@@ -235,7 +237,8 @@ recovery_serial_preflight(const ClusterRecoverySerialRequest *request)
 	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE;
-	if (cluster_recovery_duty_key_compare(&snapshot.identity, &request->duty)
+	if (cluster_recovery_duty_key_compare_for_claim(&snapshot.identity, &request->duty,
+													cluster_shared_config)
 			!= CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
 		|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 		|| (snapshot.root_flags & required_flags) != required_flags
@@ -276,7 +279,8 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 			IR_BUMP(capability_denied_count);
 		return preflight;
 	}
-	if (!cluster_recovery_serial_resid_encode(&request->duty, &resid))
+	if (!cluster_recovery_serial_resid_encode_for_claim(&request->duty, cluster_shared_config,
+														&resid))
 		return CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE;
 
 	memset(&lock_request, 0, sizeof(lock_request));

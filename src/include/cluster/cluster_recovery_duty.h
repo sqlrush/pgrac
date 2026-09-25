@@ -83,11 +83,14 @@ typedef struct ClusterFormationSnapshotV1 {
 
 StaticAssertDecl(sizeof(ClusterRecoveryDutyDigest) == 32, "ClusterRecoveryDutyDigest ABI");
 
-/* Shared pure validity predicate for every consumer of the exact duty key.
- * Keeping this beside the canonical encoder prevents compact resource ids
- * from accepting an identity that the durable/root layer would reject. */
+/* PGRAC: key syntax is not physical claim proof. V2 stores the CRC of its
+ * generation claim, not the reconstructed legacy 40-byte claim. Its exact
+ * on-disk bytes/hash remain mandatory at the canonical root read boundary.
+ * Explicit profile selection keeps the old API/negative behavior intact.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
 static inline bool
-cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
+cluster_recovery_duty_key_valid_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2)
 {
 	ClusterWalThreadClaim claim;
 	bool storage_nonzero = false;
@@ -106,13 +109,30 @@ cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
 		|| key->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT || key->origin_node_id < 0
 		|| key->origin_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| key->origin_thread_id != (uint16)(key->origin_node_id + 1) || key->reserved42 != 0
-		|| key->thread_claim_created_at == 0 || key->thread_claim_crc32c == 0
+		|| key->thread_claim_created_at == 0 || (!claim_v2 && key->thread_claim_crc32c == 0)
 		|| key->reserved60 != 0 || key->origin_owner_incarnation == 0 || key->root_lineage_seq == 0)
 		return false;
+	if (claim_v2)
+		return key->thread_claim_created_at > 0;
 	cluster_wal_thread_claim_fill(&claim, key->origin_thread_id, key->origin_node_id,
 								  key->thread_claim_created_at);
 	return key->thread_claim_crc32c == claim.crc;
 }
+
+static inline bool
+cluster_recovery_duty_key_valid_v1(const ClusterRecoveryDutyKey *key)
+{
+	return cluster_recovery_duty_key_valid_for_claim(key, false);
+}
+
+extern bool
+cluster_recovery_duty_key_encode_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2,
+										   uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]);
+extern ClusterRecoveryDutyCompare
+cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
+											const ClusterRecoveryDutyKey *observed, bool claim_v2);
+extern bool cluster_recovery_duty_digest_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2,
+												   ClusterRecoveryDutyDigest *out);
 
 extern bool cluster_recovery_duty_key_encode_v1(const ClusterRecoveryDutyKey *key,
 												uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES]);

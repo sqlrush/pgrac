@@ -284,18 +284,27 @@ typedef struct ClusterThreadRecLaunchEligibility {
  * acquire any authority it must match the exact main argument and the live
  * REPLAYING slot/stamp, and it must still carry a valid full duty identity. */
 static inline bool
-cluster_thread_recovery_worker_start_valid(const ClusterThreadRecLaunchEligibility *eligibility,
-										   uint16 main_thread, bool slot_read,
-										   ClusterThreadRecReplayState slot_state,
-										   uint64 slot_stamp)
+cluster_thread_recovery_worker_start_valid_for_claim(
+	const ClusterThreadRecLaunchEligibility *eligibility, uint16 main_thread, bool slot_read,
+	ClusterThreadRecReplayState slot_state, uint64 slot_stamp, bool claim_v2)
 {
 	return eligibility != NULL && main_thread >= XLP_THREAD_ID_FIRST_REAL
 		   && main_thread <= CLUSTER_WAL_THREAD_MAX && eligibility->origin_thread == main_thread
 		   && eligibility->attempt_stamp != 0 && slot_read
 		   && slot_state == CLUSTER_THREADREC_REPLAY_REPLAYING
 		   && slot_stamp == eligibility->attempt_stamp
-		   && cluster_recovery_duty_key_valid_v1(&eligibility->duty)
+		   && cluster_recovery_duty_key_valid_for_claim(&eligibility->duty, claim_v2)
 		   && eligibility->duty.origin_thread_id == main_thread;
+}
+
+static inline bool
+cluster_thread_recovery_worker_start_valid(const ClusterThreadRecLaunchEligibility *eligibility,
+										   uint16 main_thread, bool slot_read,
+										   ClusterThreadRecReplayState slot_state,
+										   uint64 slot_stamp)
+{
+	return cluster_thread_recovery_worker_start_valid_for_claim(eligibility, main_thread, slot_read,
+																slot_state, slot_stamp, false);
 }
 
 extern bool

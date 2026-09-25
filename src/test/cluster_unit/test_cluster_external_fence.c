@@ -28,6 +28,8 @@
 
 UT_DEFINE_GLOBALS();
 
+bool cluster_shared_config = false;
+
 static uint32 stub_local_capabilities;
 static ClusterFormationWitnessResult stub_formation_result;
 static uint16 stub_formation_origin_thread;
@@ -205,9 +207,10 @@ cluster_formation_witness_copy_classification_v1(const ClusterFormationWitnessV1
 }
 
 bool
-cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key, ClusterRecoveryDutyDigest *out)
+cluster_recovery_duty_digest_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2,
+									   ClusterRecoveryDutyDigest *out)
 {
-	if (!cluster_recovery_duty_key_valid_v1(key) || out == NULL)
+	if (!cluster_recovery_duty_key_valid_for_claim(key, claim_v2) || out == NULL)
 		return false;
 	memset(out->bytes, 0xa7, sizeof(out->bytes));
 	return true;
@@ -725,6 +728,33 @@ UT_TEST(test_external_fence_need_set_rejects_incomplete_authority)
 	UT_ASSERT_EQ(cluster_external_fence_need_set_build(&duty, formation, &needs),
 				 PGRAC_EXTERNAL_FENCE_NEED_SET_STORAGE_UNAVAILABLE);
 	UT_ASSERT(needs == NULL);
+	stub_runtime_active = false;
+	stub_protected_set_identity_available = false;
+}
+
+/* PGRAC: claim-profile syntax never substitutes for the formation writer
+ * set or a provider admission. Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_external_fence_v2_claim_still_requires_exact_writer)
+{
+	ClusterRecoveryDutyKey duty;
+	const ClusterFormationWitnessV1 *formation = (const ClusterFormationWitnessV1 *)(uintptr_t)1;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	fill_valid_duty(&duty);
+	prepare_two_writer_formation(&duty);
+	duty.thread_claim_crc32c = 0;
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_OK);
+	UT_ASSERT_EQ(cluster_external_fence_need_set_count(needs), 2);
+	cluster_external_fence_need_set_release(&needs);
+	stub_formation_snapshot.membership.last_admitted_incarnation[duty.origin_node_id]++;
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_WRITER_INCAR_UNPROVEN);
+	UT_ASSERT(needs == NULL);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(cluster_external_fence_need_set_build(&duty, formation, &needs),
+				 PGRAC_EXTERNAL_FENCE_NEED_SET_DUTY_INVALID);
 	stub_runtime_active = false;
 	stub_protected_set_identity_available = false;
 }
@@ -1859,7 +1889,7 @@ cleanup:
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_external_fence_literals);
 	UT_RUN(test_external_fence_enum_ordinals);
 	UT_RUN(test_external_fence_recovery_layouts);
@@ -1869,6 +1899,7 @@ main(void)
 	UT_RUN(test_external_fence_inactive_capability_builds_no_need_set);
 	UT_RUN(test_external_fence_need_set_builds_complete_sorted_writers);
 	UT_RUN(test_external_fence_need_set_rejects_incomplete_authority);
+	UT_RUN(test_external_fence_v2_claim_still_requires_exact_writer);
 	UT_RUN(test_external_fence_provider_zero_is_unavailable_without_admission);
 	UT_RUN(test_external_fence_nonproof_signals_never_admit);
 	UT_RUN(test_external_fence_test_only_exact_response_creates_live_admission);

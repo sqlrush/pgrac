@@ -1305,6 +1305,32 @@ UT_TEST(test_walr_resource_encoding_refuses_invalid_thread)
 	UT_ASSERT_FALSE(cluster_wal_retention_resid_encode(1, NULL));
 }
 
+/* PGRAC: a v2 claim CRC does not prove a usable retention pin. Actual root
+ * revalidation remains required after the grant. Author: SqlRush. */
+UT_TEST(test_v2_pin_key_preserves_root_revalidation)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterWalRetentionPin *pin = NULL;
+
+	request.duty.thread_claim_crc32c = 0;
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_NOT_NULL(pin);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	fake_root_current = false;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_STALE);
+	UT_ASSERT_NULL(pin);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_NULL(pin);
+	reset_pin_fakes();
+}
+
 UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -2563,7 +2589,7 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(48);
+	UT_PLAN(49);
 	UT_RUN(test_v2_e1_consumes_current_root_and_preserves_exact_floor);
 	UT_RUN(test_v2_retention_zero_crc_is_not_absent_authority);
 	UT_RUN(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose);
@@ -2584,6 +2610,7 @@ main(int argc, char **argv)
 	UT_RUN(test_walr_resource_encoding_refuses_invalid_thread);
 	UT_RUN(test_reuse_guard_preflight_stamps_folds_and_builds_needset);
 	UT_RUN(test_pin_one_thread_acquire_and_confirmed_release);
+	UT_RUN(test_v2_pin_key_preserves_root_revalidation);
 	UT_RUN(test_pin_acquire_is_sorted_all_or_none);
 	UT_RUN(test_pin_uncertain_rollback_remains_cleanup_only);
 	UT_RUN(test_pin_bind_revalidate_and_seal_closed_fsm);

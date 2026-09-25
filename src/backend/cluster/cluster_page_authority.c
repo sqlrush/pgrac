@@ -8,6 +8,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_page_authority.h"
+#include "cluster/cluster_guc.h"
 
 #ifdef USE_CLUSTER_UNIT
 #define authority_alloc0(size_) calloc(1, (size_))
@@ -172,7 +173,8 @@ owners_current(const RfPageAuthorityPreflightV1 *preflight,
 		|| serial_guard->fence_admission_set != preflight->fence_admission_set)
 		return RF_PAGE_AUTHORITY_FENCE_STALE;
 	if (preflight->participant_count != 1
-		|| cluster_recovery_duty_key_compare(&preflight->duties[0], &serial_guard->duty)
+		|| cluster_recovery_duty_key_compare_for_claim(&preflight->duties[0], &serial_guard->duty,
+													   cluster_shared_config)
 			   != CLUSTER_RECOVERY_DUTY_COMPARE_EXACT)
 		return RF_PAGE_AUTHORITY_GENERATION_STALE;
 	if (memcmp(&preflight->root_tokens[0], &serial_guard->root_read_token,

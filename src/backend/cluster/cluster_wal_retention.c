@@ -443,7 +443,7 @@ pin_request_valid(const ClusterWalRetentionPinThreadRequest *request, int wal_se
 	Size interval_bytes;
 
 	if (request == NULL || request->intervals == NULL || request->nintervals == 0
-		|| !cluster_recovery_duty_key_valid_v1(&request->duty)
+		|| !cluster_recovery_duty_key_valid_for_claim(&request->duty, cluster_shared_config)
 		|| !root_token_matches_recovery_duty(&request->root_read, &request->duty)
 		|| request->formation == NULL || request->needs == NULL || request->admissions == NULL
 		|| request->nintervals > MaxAllocSize / sizeof(*request->intervals))

@@ -1115,6 +1115,45 @@ UT_TEST(test_domain_separated_digest)
 	UT_ASSERT(memcmp(actual.bytes, expected, sizeof(expected)) == 0);
 }
 
+/* PGRAC: wire key version is independent of physical claim version. This
+ * tests serialization only; actual root/claim decoding is tested separately.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_v2_claim_key_keeps_encoding_and_legacy_refusal)
+{
+	ClusterRecoveryDutyKey key, other;
+	ClusterRecoveryDutyDigest digest, changed, legacy;
+	uint8 encoded[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
+	uint8 expected[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
+
+	build_valid_key(&key);
+	UT_ASSERT(cluster_recovery_duty_digest_v1(&key, &legacy));
+	UT_ASSERT(cluster_recovery_duty_digest_for_claim(&key, true, &digest));
+	UT_ASSERT_EQ(memcmp(&legacy, &digest, sizeof(digest)), 0);
+	for (int i = 0; i < 2; i++) {
+		key.thread_claim_crc32c = i == 0 ? 0 : UINT32_C(0x10203040);
+		build_expected_encoding(&key, expected);
+		UT_ASSERT(!cluster_recovery_duty_key_valid_v1(&key));
+		UT_ASSERT(!cluster_recovery_duty_key_encode_v1(&key, encoded));
+		UT_ASSERT(cluster_recovery_duty_key_encode_for_claim(&key, true, encoded));
+		UT_ASSERT_EQ(memcmp(encoded, expected, sizeof(encoded)), 0);
+		UT_ASSERT(cluster_recovery_duty_digest_for_claim(&key, true, &digest));
+		UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&key, &key, true),
+					 CLUSTER_RECOVERY_DUTY_COMPARE_EXACT);
+		other = key;
+		other.origin_owner_incarnation++;
+		UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&key, &other, true),
+					 CLUSTER_RECOVERY_DUTY_COMPARE_DIFFERENT);
+		UT_ASSERT(cluster_recovery_duty_digest_for_claim(&other, true, &changed));
+		UT_ASSERT_NE(memcmp(&digest, &changed, sizeof(digest)), 0);
+		other.reserved42 = 1;
+		UT_ASSERT(!cluster_recovery_duty_key_encode_for_claim(&other, true, encoded));
+		UT_ASSERT_EQ(cluster_recovery_duty_key_compare_for_claim(&key, &other, true),
+					 CLUSTER_RECOVERY_DUTY_COMPARE_INVALID);
+	}
+	key.thread_claim_created_at = -1;
+	UT_ASSERT(!cluster_recovery_duty_key_valid_for_claim(&key, true));
+}
+
 UT_TEST(test_full_key_compare_has_no_numeric_order)
 {
 	ClusterRecoveryDutyKey expected;
@@ -1293,9 +1332,10 @@ UT_TEST(test_formation_pending_owner_and_full_outage_fail_closed)
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
 	UT_RUN(test_exact_74_byte_encoding);
 	UT_RUN(test_domain_separated_digest);
+	UT_RUN(test_v2_claim_key_keeps_encoding_and_legacy_refusal);
 	UT_RUN(test_full_key_compare_has_no_numeric_order);
 	UT_RUN(test_zero_and_reserved_fields_are_invalid);
 	UT_RUN(test_thread_node_and_claim_binding_are_exact);

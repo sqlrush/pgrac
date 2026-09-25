@@ -112,8 +112,8 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 	/* The launch must have marked the slot REPLAYING; anything else means this
 	 * spawn raced a reset or a newer launch -> moot (do not touch the slot). */
 	slot_read = cluster_thread_recovery_replay_read(dead_tid, &state, &launch_epoch);
-	if (!cluster_thread_recovery_worker_start_valid(eligibility, dead_tid, slot_read, state,
-													launch_epoch))
+	if (!cluster_thread_recovery_worker_start_valid_for_claim(
+			eligibility, dead_tid, slot_read, state, launch_epoch, cluster_shared_config))
 		return CLUSTER_THREADREC_DEFERRED;
 
 	/* L235 BEFORE: a stale launch epoch means the reconfig episode advanced past
@@ -304,8 +304,8 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 		return;
 	memcpy(&eligibility, MyBgworkerEntry->bgw_extra, sizeof(eligibility));
 	slot_read = cluster_thread_recovery_replay_read((uint16)dead_tid, &state, &launch_epoch);
-	if (!cluster_thread_recovery_worker_start_valid(&eligibility, (uint16)dead_tid, slot_read,
-													state, launch_epoch))
+	if (!cluster_thread_recovery_worker_start_valid_for_claim(
+			&eligibility, (uint16)dead_tid, slot_read, state, launch_epoch, cluster_shared_config))
 		return;
 
 	/* Cleanup authority on every controlled exit; scheduler state is reaped only
@@ -359,9 +359,9 @@ static bool
 thread_recovery_eligibility_valid(const ClusterThreadRecLaunchEligibility *eligibility)
 {
 	return eligibility != NULL
-		   && cluster_thread_recovery_worker_start_valid(eligibility, eligibility->origin_thread,
-														 true, CLUSTER_THREADREC_REPLAY_REPLAYING,
-														 eligibility->attempt_stamp);
+		   && cluster_thread_recovery_worker_start_valid_for_claim(
+			   eligibility, eligibility->origin_thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING,
+			   eligibility->attempt_stamp, cluster_shared_config);
 }
 
 static bool

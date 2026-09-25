@@ -231,13 +231,13 @@ write_u64_le(uint8 *dst, uint64 value)
 }
 
 bool
-cluster_recovery_duty_key_encode_v1(const ClusterRecoveryDutyKey *key,
-									uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES])
+cluster_recovery_duty_key_encode_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2,
+										   uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES])
 {
 	if (out == NULL)
 		return false;
 	memset(out, 0, CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES);
-	if (!cluster_recovery_duty_key_valid_v1(key))
+	if (!cluster_recovery_duty_key_valid_for_claim(key, claim_v2))
 		return false;
 	write_u64_le(out, key->system_identifier);
 	memcpy(out + 8, key->storage_uuid, 16);
@@ -252,14 +252,14 @@ cluster_recovery_duty_key_encode_v1(const ClusterRecoveryDutyKey *key,
 }
 
 ClusterRecoveryDutyCompare
-cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
-								  const ClusterRecoveryDutyKey *observed)
+cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
+											const ClusterRecoveryDutyKey *observed, bool claim_v2)
 {
 	uint8 expected_bytes[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
 	uint8 observed_bytes[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
 
-	if (!cluster_recovery_duty_key_encode_v1(expected, expected_bytes)
-		|| !cluster_recovery_duty_key_encode_v1(observed, observed_bytes))
+	if (!cluster_recovery_duty_key_encode_for_claim(expected, claim_v2, expected_bytes)
+		|| !cluster_recovery_duty_key_encode_for_claim(observed, claim_v2, observed_bytes))
 		return CLUSTER_RECOVERY_DUTY_COMPARE_INVALID;
 	return memcmp(expected_bytes, observed_bytes, sizeof(expected_bytes)) == 0
 			   ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
@@ -267,7 +267,8 @@ cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
 }
 
 bool
-cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key, ClusterRecoveryDutyDigest *out)
+cluster_recovery_duty_digest_for_claim(const ClusterRecoveryDutyKey *key, bool claim_v2,
+									   ClusterRecoveryDutyDigest *out)
 {
 	static const uint8 domain[19] = "PGRAC-ROOT-DUTY-V1";
 	uint8 preimage[19 + 4 + CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES];
@@ -279,7 +280,8 @@ cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key, ClusterRecove
 	memset(out, 0, sizeof(*out));
 	memcpy(preimage, domain, sizeof(domain));
 	write_u32_le(preimage + sizeof(domain), CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES);
-	if (!cluster_recovery_duty_key_encode_v1(key, preimage + sizeof(domain) + sizeof(uint32)))
+	if (!cluster_recovery_duty_key_encode_for_claim(key, claim_v2,
+													preimage + sizeof(domain) + sizeof(uint32)))
 		return false;
 	ctx = pg_cryptohash_create(PG_SHA256);
 	if (ctx == NULL)
@@ -291,6 +293,28 @@ cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key, ClusterRecove
 	if (!success)
 		memset(out, 0, sizeof(*out));
 	return success;
+}
+
+/* PGRAC: preserve all legacy entrypoints, including legacy CRC refusals.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_recovery_duty_key_encode_v1(const ClusterRecoveryDutyKey *key,
+									uint8 out[CLUSTER_RECOVERY_DUTY_KEY_V1_BYTES])
+{
+	return cluster_recovery_duty_key_encode_for_claim(key, false, out);
+}
+
+ClusterRecoveryDutyCompare
+cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
+								  const ClusterRecoveryDutyKey *observed)
+{
+	return cluster_recovery_duty_key_compare_for_claim(expected, observed, false);
+}
+
+bool
+cluster_recovery_duty_digest_v1(const ClusterRecoveryDutyKey *key, ClusterRecoveryDutyDigest *out)
+{
+	return cluster_recovery_duty_digest_for_claim(key, false, out);
 }
 
 static bool

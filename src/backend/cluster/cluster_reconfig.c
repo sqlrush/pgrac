@@ -48,6 +48,7 @@
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_guc.h"			 /* PGRAC: frozen recovery claim profile. */
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
 
 /* RF-ROOT P4 online launch producer.  The carrier contains only the exact
@@ -82,7 +83,7 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 																	&snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		|| !cluster_recovery_duty_key_valid_v1(&identity)
+		|| !cluster_recovery_duty_key_valid_for_claim(&identity, cluster_shared_config)
 		|| identity.origin_thread_id != origin_thread || identity.origin_node_id != origin_node
 		|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 		|| memcmp(&snapshot.identity, &identity, sizeof(identity)) != 0)

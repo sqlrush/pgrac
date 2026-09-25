@@ -20,6 +20,8 @@
 
 UT_DEFINE_GLOBALS();
 
+bool cluster_shared_config = false;
+
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
 {
@@ -104,9 +106,10 @@ rf_page_stable_base_proof_matches_v1(
 }
 
 ClusterRecoveryDutyCompare
-cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
-								  const ClusterRecoveryDutyKey *observed)
+cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
+											const ClusterRecoveryDutyKey *observed, bool claim_v2)
 {
+	(void)claim_v2;
 	return expected == &DUTIES[0] && observed != NULL
 				   && observed->origin_thread_id == DUTIES[0].origin_thread_id
 				   && observed->root_lineage_seq == DUTIES[0].root_lineage_seq

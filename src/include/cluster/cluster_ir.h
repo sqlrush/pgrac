@@ -62,6 +62,10 @@ StaticAssertDecl(CLUSTER_IR_RESID_TYPE != CLUSTER_DL_RESID_TYPE,
  * full recovery-duty identity.  Invalid input preserves *out. */
 extern bool cluster_recovery_serial_resid_encode(const ClusterRecoveryDutyKey *duty,
 												 ClusterResId *out);
+/* PGRAC: explicit claim profile, unchanged IR wire/resource shape.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern bool cluster_recovery_serial_resid_encode_for_claim(const ClusterRecoveryDutyKey *duty,
+														   bool claim_v2, ClusterResId *out);
 
 #ifndef FRONTEND
 

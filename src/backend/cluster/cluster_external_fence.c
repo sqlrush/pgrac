@@ -615,7 +615,7 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 
 	if (out == NULL || *out != NULL || duty == NULL || formation == NULL)
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_BAD_ARGUMENT;
-	if (!cluster_recovery_duty_key_valid_v1(duty))
+	if (!cluster_recovery_duty_key_valid_for_claim(duty, cluster_shared_config))
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_DUTY_INVALID;
 	formation_result = cluster_formation_witness_revalidate_nowait(formation);
 	if (formation_result == CLUSTER_FORMATION_WITNESS_UNSTABLE)
@@ -668,7 +668,7 @@ cluster_external_fence_need_set_build(const ClusterRecoveryDutyKey *duty,
 		|| !pgrac_external_fence_protected_set_digest_v1(
 			protected_identity.backend_id, protected_identity.storage_uuid, protected_set_digest))
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_STORAGE_UNAVAILABLE;
-	if (!cluster_recovery_duty_digest_v1(duty, &duty_digest))
+	if (!cluster_recovery_duty_digest_for_claim(duty, cluster_shared_config, &duty_digest))
 		return PGRAC_EXTERNAL_FENCE_NEED_SET_DUTY_INVALID;
 
 	set = palloc0(sizeof(*set));
@@ -1914,7 +1914,7 @@ external_fence_rejoin_root_complete_valid(const PgracExternalFenceRejoinOpV1 *op
 										  const ClusterControlRootSnapshot *snapshot,
 										  const ClusterControlRootReadToken *token)
 {
-	return cluster_recovery_duty_key_valid_v1(identity)
+	return cluster_recovery_duty_key_valid_for_claim(identity, cluster_shared_config)
 		   && identity->system_identifier == op->offer_frame.system_identifier
 		   && identity->origin_node_id == op->offer_frame.old_node_id
 		   && identity->origin_thread_id == (uint16)(op->offer_frame.old_node_id + 1)

@@ -329,6 +329,15 @@ UT_TEST(test_a2_worker_payload_fresh_validation)
 		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_IDLE, UINT64_C(77)));
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
 		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(78)));
+	/* PGRAC: v2 claim CRC is not a v1 checksum; the launch stamp and later
+	 * root/fence owner gates remain independent. Author: SqlRush. */
+	eligibility.duty.thread_claim_crc32c = 0;
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));
+	UT_ASSERT(cluster_thread_recovery_worker_start_valid_for_claim(
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77), true));
+	UT_ASSERT(!cluster_thread_recovery_worker_start_valid_for_claim(
+		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(78), true));
 	eligibility.duty.root_lineage_seq = 0;
 	UT_ASSERT(!cluster_thread_recovery_worker_start_valid(
 		&eligibility, thread, true, CLUSTER_THREADREC_REPLAY_REPLAYING, UINT64_C(77)));

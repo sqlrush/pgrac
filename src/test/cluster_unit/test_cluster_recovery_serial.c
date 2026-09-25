@@ -47,6 +47,7 @@
 UT_DEFINE_GLOBALS();
 
 bool IsUnderPostmaster = false;
+bool cluster_shared_config = false;
 int cluster_ges_request_timeout_ms = 1000;
 
 static union {
@@ -135,11 +136,11 @@ cluster_formation_witness_revalidate_nowait(
 }
 
 ClusterRecoveryDutyCompare
-cluster_recovery_duty_key_compare(const ClusterRecoveryDutyKey *expected,
-								  const ClusterRecoveryDutyKey *observed)
+cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
+											const ClusterRecoveryDutyKey *observed, bool claim_v2)
 {
-	if (!cluster_recovery_duty_key_valid_v1(expected)
-		|| !cluster_recovery_duty_key_valid_v1(observed))
+	if (!cluster_recovery_duty_key_valid_for_claim(expected, claim_v2)
+		|| !cluster_recovery_duty_key_valid_for_claim(observed, claim_v2))
 		return CLUSTER_RECOVERY_DUTY_COMPARE_INVALID;
 	return memcmp(expected, observed, sizeof(*expected)) == 0
 			   ? CLUSTER_RECOVERY_DUTY_COMPARE_EXACT
@@ -674,10 +675,53 @@ UT_TEST(test_recovery_serial_acquire_set_zero_before_first_grant)
 	UT_ASSERT(memcmp(&set, &(ClusterRecoverySerialGuardSet){ 0 }, sizeof(set)) == 0);
 }
 
+/* PGRAC: the canonical v2 reader has already authenticated this claim; its
+ * CRC cannot be reinterpreted as a legacy 40-byte claim. Boundary fixtures
+ * here model root/fence owners, not physical isolation certification.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+UT_TEST(test_recovery_serial_v2_key_reaches_owned_ir)
+{
+	ClusterRecoverySerialRequest request = valid_serial_request();
+	ClusterRecoverySerialGuard guard;
+
+	cluster_shared_config = true;
+	request.duty.thread_claim_crc32c ^= UINT32_C(0x12345678);
+	UT_ASSERT(!cluster_recovery_duty_key_valid_v1(&request.duty));
+	stub_root_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	stub_root_token = request.expected_root_token;
+	stub_formation_ready = stub_need_set_ready = stub_admission_set_ready = true;
+	stub_acquire_calls = 0;
+	stub_acquire_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	stub_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	stub_release_result_count = stub_release_result_index = stub_release_calls = 0;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard),
+				 CLUSTER_RECOVERY_SERIAL_GRANTED);
+	UT_ASSERT_EQ(stub_acquire_calls, 1);
+	if (guard.held) {
+		UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard), CLUSTER_RECOVERY_SERIAL_CURRENT);
+		UT_ASSERT_EQ(cluster_recovery_serial_release(&guard),
+					 CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED);
+	}
+	stub_acquire_calls = 0;
+	stub_root_result = CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard),
+				 CLUSTER_RECOVERY_SERIAL_ROOT_UNAVAILABLE);
+	UT_ASSERT_EQ(stub_acquire_calls, 0);
+	stub_root_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	stub_need_set_ready = false;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard),
+				 CLUSTER_RECOVERY_SERIAL_FENCE_DENIED);
+	UT_ASSERT_EQ(stub_acquire_calls, 0);
+	cluster_shared_config = false;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard),
+				 CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE);
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(17);
 	UT_RUN(test_recovery_serial_resid_encode);
 	UT_RUN(test_ir_resid_namespace_distinct);
 	UT_RUN(test_recovery_serial_resid_thread_and_lineage_distinct);
@@ -694,6 +738,7 @@ main(void)
 	UT_RUN(test_recovery_serial_p4_revalidate_is_two_phase_fail_closed);
 	UT_RUN(test_external_rejoin_new_epoch_invalidates_held_guard);
 	UT_RUN(test_recovery_serial_acquire_set_zero_before_first_grant);
+	UT_RUN(test_recovery_serial_v2_key_reaches_owned_ir);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;
