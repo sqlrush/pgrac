@@ -87,7 +87,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
         test_cluster_wal_thread test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
-        test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact \
+        test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact test_cluster_remote_xact_writer \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
         test_cluster_thread_driver test_cluster_thread_orchestrator \
         test_cluster_write_fence test_cluster_stage4_acceptance \
@@ -415,7 +415,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_producer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_side_online_owner test_cluster_remote_xact_writer,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -637,6 +637,20 @@ test_cluster_touched_peers: test_cluster_touched_peers.c unit_test.h $(CLUSTER_V
 # The runtime driver (shmem / voting-disk marker I/O / ProcSignal / GES-GCS
 # drain / LMON orchestration) is covered by cluster_tap t/NNN (2-node).
 CLUSTER_CLEAN_LEAVE_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_clean_leave_policy.o
+# PGRAC: execute the real remote-outcome mutation bodies without Assert guards.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_remote_xact_writer.inc: $(top_srcdir)/src/backend/cluster/cluster_remote_xact.c Makefile
+	awk '/^#define CLUSTER_REMOTE_XACT_DIR_V2/ { print } \
+	     /^typedef struct RemoteXactTruncateContextV2/ { emit=1; types++ } \
+	     /^(remote_xact_open_page|remote_xact_force_durable|remote_xact_mutation_from_transition|remote_xact_truncate_origin_callback|remote_xact_writer_permitted|cluster_remote_xact_online_writer_push|cluster_remote_xact_online_writer_pop|cluster_remote_xact_online_writer_depth|cluster_remote_xact_store_prepared_v2|cluster_remote_xact_store_terminal_v2|cluster_remote_xact_pending_matches_v2|cluster_remote_xact_range_empty_v2|cluster_remote_xact_reset_range_v2|cluster_remote_xact_truncate_before_v2|cluster_remote_xact_flush)\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 15 || types != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_remote_xact_writer: test_cluster_remote_xact_writer.c test_cluster_remote_xact_writer.inc unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_remote_xact.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
 test_cluster_postmaster_stop.inc: $(top_srcdir)/src/backend/postmaster/postmaster.c Makefile
 	awk '/^\/\* NORMAL_STOP_POSTMASTER_BEGIN/ { emit=1; count++ } \
 	     emit { print } /^\/\* NORMAL_STOP_POSTMASTER_END/ { emit=0; ended++ } \

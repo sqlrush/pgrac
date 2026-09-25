@@ -178,12 +178,13 @@ cluster_remote_xact_blocked_elevel(bool online)
 /*
  * R14 (spec-4.11 3b-2): may THIS process write the per-origin materialization
  * store right now?  Historically the writer was the startup process ONLY
- * (single-threaded cold merged replay; see cluster_remote_xact_set's assert).
+ * (single-threaded cold merged replay).
  * Online thread recovery adds one more legitimate writer -- the recovery-apply
  * bgworker -- but ONLY inside an episode-fenced online-writer scope
  * (cluster_remote_xact_online_writer_push/pop).  Outside startup AND outside
- * that scope, a writer is in an illegal context: the assert must fail closed.
- * PURE so the corruption-critical writer assert is unit-pinned.
+ * that scope, a writer is in an illegal context: production mutation entries
+ * reject it at runtime, including in release builds. The scope owner still
+ * revalidates its authority; this pure predicate is not a recovery credential.
  */
 static inline bool
 cluster_remote_xact_writer_allowed(bool is_startup, int online_writer_depth)

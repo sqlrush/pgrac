@@ -9,8 +9,8 @@
  *	  buffer locks from a dynamically allocated tranche whose id lives in
  *	  shmem so EXEC_BACKEND children register the same id.
  *
- *	  Writers: ONLY the startup process, inside merged replay (single
- *	  threaded).  Readers: any backend after recovery, through
+ *	  Writers: the startup process inside merged replay, or the existing
+ *	  authority-validated online owner scope. Readers: any backend through
  *	  cluster_remote_commit_outcome.  A missing segment/page reads as
  *	  INDOUBT -- the fail-closed default for "this node never
  *	  materialized that origin's outcome".
@@ -86,11 +86,10 @@ static ClusterRemoteXactShared *RemoteXactShared = NULL;
 /*
  * Online-writer scope depth (spec-4.11 3b-2, R14).  Process-local: the online
  * thread-recovery orchestrator brackets its visibility apply with
- * cluster_remote_xact_online_writer_push/pop so that cluster_remote_xact_set's
- * historically startup-only writer assert admits the episode-fenced
- * recovery-apply bgworker.  Process-local is correct (the assert asks "is THIS
- * process a legitimate writer right now"); a FATAL/PANIC tears the process down
- * so a leaked depth cannot outlive it.
+ * cluster_remote_xact_online_writer_push/pop. The runtime check below admits
+ * that owner, not other ordinary backends. The owner must still revalidate its
+ * exact authority and unwind the scope on every exit; a positive depth is not
+ * an independent fencing or recovery-duty proof.
  */
 static int remote_xact_online_writer_depth_v = 0;
 
@@ -112,6 +111,17 @@ int
 cluster_remote_xact_online_writer_depth(void)
 {
 	return remote_xact_online_writer_depth_v;
+}
+
+static bool
+remote_xact_writer_permitted(void)
+{
+	/* PGRAC: enforce the existing writer rule in release builds, too.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 * Standalone replay retains its existing single-process allowance. */
+	return !IsUnderPostmaster
+		   || cluster_remote_xact_writer_allowed(AmStartupProcess(),
+												 remote_xact_online_writer_depth_v);
 }
 
 static bool
@@ -258,12 +268,9 @@ cluster_remote_xact_store_prepared_v2(int origin_node, TransactionId xid,
 	int pageno;
 	int slotno;
 
-	if (RemoteXactShared == NULL || origin_node < 0 || origin_node >= (1 << 7)
-		|| !TransactionIdIsNormal(xid) || digest == NULL)
+	if (RemoteXactShared == NULL || !remote_xact_writer_permitted() || origin_node < 0
+		|| origin_node >= (1 << 7) || !TransactionIdIsNormal(xid) || digest == NULL)
 		return CLUSTER_REMOTE_XACT_MUTATION_INVALID;
-	Assert(!IsUnderPostmaster
-		   || cluster_remote_xact_writer_allowed(AmStartupProcess(),
-												 remote_xact_online_writer_depth_v));
 	pageno = cluster_remote_xact_pageno(origin_node, xid);
 	slotno = remote_xact_open_page(origin_node, xid, true);
 	entry = (ClusterRemoteXactEntryV2 *)(ClusterRemoteXactCtl->shared->page_buffer[slotno]
@@ -294,14 +301,12 @@ cluster_remote_xact_store_terminal_v2(
 	int pageno;
 	int slotno;
 
-	if (RemoteXactShared == NULL || origin_node < 0 || origin_node >= (1 << 7)
-		|| !TransactionIdIsNormal(xid) || (require_prepared && expected_prepare_digest == NULL)
+	if (RemoteXactShared == NULL || !remote_xact_writer_permitted() || origin_node < 0
+		|| origin_node >= (1 << 7) || !TransactionIdIsNormal(xid)
+		|| (require_prepared && expected_prepare_digest == NULL)
 		|| !cluster_remote_xact_entry_encode_terminal_v2(&candidate, outcome, commit_scn,
 														 commit_timestamp, wrap_valid, wrap))
 		return CLUSTER_REMOTE_XACT_MUTATION_INVALID;
-	Assert(!IsUnderPostmaster
-		   || cluster_remote_xact_writer_allowed(AmStartupProcess(),
-												 remote_xact_online_writer_depth_v));
 	pageno = cluster_remote_xact_pageno(origin_node, xid);
 	slotno = remote_xact_open_page(origin_node, xid, true);
 	entry = (ClusterRemoteXactEntryV2 *)(ClusterRemoteXactCtl->shared->page_buffer[slotno]
@@ -389,12 +394,9 @@ cluster_remote_xact_reset_range_v2(int origin_node, TransactionId first_xid, uin
 	uint64 end;
 	bool changed = false;
 
-	if (RemoteXactShared == NULL
+	if (RemoteXactShared == NULL || !remote_xact_writer_permitted()
 		|| !cluster_remote_xact_reset_range_valid_v2(origin_node, first_xid, count))
 		return false;
-	Assert(!IsUnderPostmaster
-		   || cluster_remote_xact_writer_allowed(AmStartupProcess(),
-												 remote_xact_online_writer_depth_v));
 	cursor = first_xid;
 	end = cursor + count;
 	while (cursor < end) {
@@ -493,12 +495,9 @@ cluster_remote_xact_truncate_before_v2(int origin_node, TransactionId oldest_xid
 {
 	RemoteXactTruncateContextV2 context;
 
-	if (RemoteXactShared == NULL || origin_node < 0 || origin_node >= (1 << 7)
-		|| !TransactionIdIsNormal(oldest_xid))
+	if (RemoteXactShared == NULL || !remote_xact_writer_permitted() || origin_node < 0
+		|| origin_node >= (1 << 7) || !TransactionIdIsNormal(oldest_xid))
 		return false;
-	Assert(!IsUnderPostmaster
-		   || cluster_remote_xact_writer_allowed(AmStartupProcess(),
-												 remote_xact_online_writer_depth_v));
 	memset(&context, 0, sizeof(context));
 	context.origin_first_page = cluster_remote_xact_pageno(origin_node, 0);
 	context.origin_end_page
@@ -785,6 +784,10 @@ cluster_remote_xact_flush(void)
 {
 	if (RemoteXactShared == NULL)
 		return;
+	if (!remote_xact_writer_permitted())
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("remote transaction materialization flush requires a recovery writer")));
 	SimpleLruWriteAll(ClusterRemoteXactCtl, true);
 }
 
