@@ -231,6 +231,11 @@ extern void XLOGShmemInit(void);
 extern void BootStrapXLOG(void);
 extern void InitializeWalConsistencyChecking(void);
 extern void LocalProcessControlFile(bool reset);
+/* PGRAC: shared control images use native checks without rereading pg_control.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+struct ControlFileData;
+extern void XLogValidateControlFile(const struct ControlFileData *control);
 extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
 extern void ShutdownXLOG(int code, Datum arg);

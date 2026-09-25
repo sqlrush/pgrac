@@ -20,3 +20,7 @@ CREATE FUNCTION test_pgrac_config_bootstrap(text, integer, text, text, text, boo
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_bootstrap'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_bootstrap(text, integer, text, text, text, boolean) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_control_image(text, bigint)
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_control_image'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_control_image(text, bigint) FROM PUBLIC;

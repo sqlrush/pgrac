@@ -2,9 +2,14 @@
  * Author: SqlRush <sqlrush@gmail.com>
  */
 #include "postgres.h"
+#include "access/xlog.h"
+#include "access/xlog_internal.h"
+#include "catalog/pg_control.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "utils/builtins.h"
+#include "utils/guc.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_shared_config.h"
 #include "common/cryptohash.h"
@@ -19,7 +24,77 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_object);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
+PG_FUNCTION_INFO_V1(test_pgrac_control_image);
 PGDLLEXPORT void _PG_init(void);
+
+/* Only a fixture builder: no global control/GUC state is replaced. */
+Datum
+test_pgrac_control_image(PG_FUNCTION_ARGS)
+{
+	ControlFileData control, before;
+	char *field = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	FILE *file;
+	uint64 sysid = GetSystemIdentifier();
+	int old_segment_size = wal_segment_size;
+	char *old_size = pstrdup(GetConfigOption("wal_segment_size", false, false));
+	char *old_checksums = pstrdup(GetConfigOption("data_checksums", false, false));
+	pg_crc32c crc;
+
+	if (!superuser())
+		ereport(ERROR, (errmsg("test control inspection requires superuser")));
+	file = AllocateFile(XLOG_CONTROL_FILE, "rb");
+	if (file == NULL)
+		ereport(ERROR, (errmsg("could not open test control image")));
+	if (fread(&control, 1, sizeof(control), file) != sizeof(control))
+		ereport(ERROR, (errmsg("could not read test control image")));
+	if (FreeFile(file) != 0)
+		ereport(ERROR, (errmsg("could not close test control image")));
+
+	if (strcmp(field, "version") == 0)
+		control.pg_control_version = 1;
+	else if (strcmp(field, "endian") == 0)
+		control.pg_control_version = 65536;
+	else if (strcmp(field, "catalog") == 0)
+		control.catalog_version_no = 1;
+	else if (strcmp(field, "align") == 0)
+		control.maxAlign++;
+	else if (strcmp(field, "float") == 0)
+		control.floatFormat = 1.0;
+	else if (strcmp(field, "block") == 0)
+		control.blcksz++;
+	else if (strcmp(field, "relseg") == 0)
+		control.relseg_size++;
+	else if (strcmp(field, "walblock") == 0)
+		control.xlog_blcksz++;
+	else if (strcmp(field, "name") == 0)
+		control.nameDataLen++;
+	else if (strcmp(field, "keys") == 0)
+		control.indexMaxKeys++;
+	else if (strcmp(field, "toast") == 0)
+		control.toast_max_chunk_size++;
+	else if (strcmp(field, "lob") == 0)
+		control.loblksize++;
+	else if (strcmp(field, "float8") == 0)
+		control.float8ByVal = !control.float8ByVal;
+	else if (strcmp(field, "walsize") == 0)
+		control.xlog_seg_size = (uint32)PG_GETARG_INT64(1);
+	else if (strcmp(field, "valid") != 0 && strcmp(field, "crc") != 0 && strcmp(field, "null") != 0)
+		ereport(ERROR, (errmsg("unknown test control mutation")));
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, (char *)&control, offsetof(ControlFileData, crc));
+	FIN_CRC32C(crc);
+	control.crc = crc;
+	/* Wrong version must take precedence even when CRC is also wrong. */
+	if (strcmp(field, "crc") == 0 || strcmp(field, "version") == 0 || strcmp(field, "endian") == 0)
+		control.crc ^= 1;
+	memcpy(&before, &control, sizeof(control));
+	XLogValidateControlFile(strcmp(field, "null") == 0 ? NULL : &control);
+	PG_RETURN_BOOL(memcmp(&before, &control, sizeof(control)) == 0 && sysid == GetSystemIdentifier()
+				   && old_segment_size == wal_segment_size
+				   && strcmp(old_size, GetConfigOption("wal_segment_size", false, false)) == 0
+				   && strcmp(old_checksums, GetConfigOption("data_checksums", false, false)) == 0);
+}
 
 #ifdef USE_PGRAC_CLUSTER
 static int test_apply_node = -1;
