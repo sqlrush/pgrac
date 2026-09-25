@@ -61,6 +61,7 @@ cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
 
 typedef struct ClusterControlBootstrapObservation {
 	ClusterControlBootstrapSnapshot snapshot;
+	ClusterControlRecoveryCapacity required;
 	char *config_bytes;
 	size_t config_len;
 } ClusterControlBootstrapObservation;
@@ -68,7 +69,10 @@ typedef struct ClusterControlBootstrapObservation {
 /*
  * One read-only provisional observation, never a lock/admission token. Uses
  * independently configured absolute paths and node, and the retained binding.
- * No .bak/projection fallback, retry, mutation or GUC application. All raw FDs
+ * No .bak/projection fallback, retry, mutation or GUC application. Every present
+ * current and retained writer's claim/anchor contributes recovery capacities;
+ * no lifecycle or serving bit bypasses input checks. These are root-selected
+ * minima, not proof of the full recovery-obligation/WAL input union. All raw FDs
  * close before composition uses the caller's memory/hash resource owner.
  * Successful config_bytes is palloc-owned by the caller; free it before reusing
  * out. Every refusal clears out. Paths and out must not overlap. Earlier path

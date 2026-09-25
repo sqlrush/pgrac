@@ -12,6 +12,7 @@
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
 #include "utils/resowner.h"
+#include "cluster_control_root_private.h"
 
 #define POLICY_COMMON 1
 #define POLICY_INSTANCE 2
@@ -353,6 +354,47 @@ bootstrap_config_path(const char *path)
 		}
 	}
 	return true;
+}
+
+ClusterControlRootResult
+cluster_shared_config_check_recovery_capacity(const ClusterControlRecoveryCapacity *required,
+											  ClusterSharedConfigPolicyReport *report)
+{
+	static const char *const names[]
+		= { "max_connections", "max_worker_processes", "max_wal_senders",
+			"max_prepared_transactions", "max_locks_per_transaction" };
+	uint32 values[5];
+	bool alias;
+
+	if (report == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	alias = bootstrap_report_overlap(required, sizeof(*required), report);
+	policy_clear(report);
+	if (alias || required == NULL || required->current_sources == 0
+		|| required->current_sources > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| required->history_sources > required->current_sources * CLUSTER_WAL_HISTORY_MAX_RECORDS
+		|| required->max_connections == 0 || required->max_locks_per_xact == 0)
+		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_FORMAT);
+	values[0] = required->max_connections;
+	values[1] = required->max_worker_processes;
+	values[2] = required->max_wal_senders;
+	values[3] = required->max_prepared_xacts;
+	values[4] = required->max_locks_per_xact;
+	for (size_t i = 0; i < lengthof(values); i++)
+		if (values[i] > PG_INT32_MAX)
+			return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_FORMAT);
+	for (size_t i = 0; i < lengthof(names); i++) {
+		ClusterSharedConfigEntry entry = { CLUSTER_SHARED_CONFIG_COMMON, names[i], NULL };
+		struct config_generic *record = find_option(names[i], false, true, DEBUG1);
+		int actual;
+		if (record == NULL || record->vartype != PGC_INT || record->context != PGC_POSTMASTER)
+			return policy_refuse(report, &entry, CLUSTER_CONFIG_POLICY_CONTEXT);
+		actual = *((struct config_int *)record)->variable;
+		report->checked_entries++;
+		if (actual < 0 || (uint32)actual < values[i])
+			return policy_refuse(report, &entry, CLUSTER_CONFIG_POLICY_RECOVERY_CAPACITY);
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 static ClusterControlRootResult

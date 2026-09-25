@@ -27,6 +27,12 @@ typedef struct BootstrapReadWork {
 	uint8 common[PG_CONTROL_FILE_SIZE + 1];
 	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES + 1];
 	uint8 anchor[CLUSTER_RECOVERY_ANCHOR_SIZE + 1];
+	uint8 history[CLUSTER_WAL_HISTORY_MAX_BYTES + 1];
+	ClusterWalHistoryImage retained;
+	struct stat shared_dir;
+	struct stat global_dir;
+	struct stat wal_dir;
+	size_t history_len;
 } BootstrapReadWork;
 
 static bool
@@ -189,14 +195,42 @@ read_hex(const uint8 hash[32], char hex[65])
 }
 
 static ClusterControlRootResult
+read_source_files(BootstrapReadWork *work, int global, int wal,
+				  const ClusterControlRootSnapshot *source, const ControlRootRecordRefsV2 *refs)
+{
+	const ClusterControlRootIdentity *self = &source->identity;
+	ClusterControlRootResult result;
+	char hex[65], name[128], thread[32], generation[48];
+	const char *parts[3];
+	size_t length;
+
+	snprintf(thread, sizeof(thread), "thread_%u", self->origin_thread_id);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 self->origin_owner_incarnation);
+	parts[0] = thread;
+	parts[1] = generation;
+	result
+		= read_object(wal, parts, 2, CLUSTER_WAL_THREAD_CLAIM_FILENAME, CLUSTER_WAL_CLAIM_V2_BYTES,
+					  CLUSTER_WAL_CLAIM_V2_BYTES, work->claim, &length);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	parts[0] = "anchor_images";
+	parts[1] = thread;
+	parts[2] = generation;
+	read_hex(refs->anchor_sha256, hex);
+	snprintf(name, sizeof(name), "anchor_" UINT64_FORMAT "-%s.bin", refs->anchor_generation, hex);
+	return read_object(global, parts, 3, name, CLUSTER_RECOVERY_ANCHOR_SIZE,
+					   CLUSTER_RECOVERY_ANCHOR_SIZE, work->anchor, &length);
+}
+
+static ClusterControlRootResult
 read_selected(BootstrapReadWork *work, int global, int wal, uint32 node, uint8 *config,
 			  size_t *config_len)
 {
 	const ControlRootImage *root = &work->before;
-	const ClusterControlRootIdentity *self = &root->records[node].identity;
 	ClusterControlRootResult result;
-	char hex[65], name[128], thread[32], generation[48];
-	const char *parts[3];
+	char hex[65], name[128];
+	const char *parts[1];
 	size_t length;
 
 	read_hex(root->header.v2.control_image_sha256, hex);
@@ -214,24 +248,163 @@ read_selected(BootstrapReadWork *work, int global, int wal, uint32 node, uint8 *
 						 config_len);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	snprintf(thread, sizeof(thread), "thread_%u", self->origin_thread_id);
-	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
-			 self->origin_owner_incarnation);
-	parts[0] = thread;
-	parts[1] = generation;
-	result
-		= read_object(wal, parts, 2, CLUSTER_WAL_THREAD_CLAIM_FILENAME, CLUSTER_WAL_CLAIM_V2_BYTES,
-					  CLUSTER_WAL_CLAIM_V2_BYTES, work->claim, &length);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	return read_source_files(work, global, wal, &root->records[node], &root->refs[node]);
+}
+
+static ClusterControlRootResult
+read_dir_identity(int fd, const struct stat *expected)
+{
+	struct stat current;
+	if (fstat(fd, &current) != 0 || !read_owned(&current, true))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	return current.st_dev == expected->st_dev && current.st_ino == expected->st_ino
+			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			   : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+typedef enum BootstrapReadKind {
+	BOOTSTRAP_SOURCE,
+	BOOTSTRAP_HISTORY,
+	BOOTSTRAP_FINAL_ROOT
+} BootstrapReadKind;
+
+/* Reopen exact initial roots for bounded reads, then close before any hashing
+ * or backend allocation. No FD survives a decoder or caller interrupt. */
+static ClusterControlRootResult
+read_again(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
+		   BootstrapReadKind kind, const ClusterControlRootSnapshot *source,
+		   const ControlRootRecordRefsV2 *refs)
+{
+	int shared = -1, global = -1, wal = -1;
+	ClusterControlRootResult result;
+	size_t length;
+
+	result = read_dir(-1, shared_root, &shared);
+	if (result == 0)
+		result = read_dir_identity(shared, &work->shared_dir);
+	if (result == 0)
+		result = read_dir(shared, "global", &global);
+	if (result == 0)
+		result = read_dir_identity(global, &work->global_dir);
+	if (result == 0)
+		result = read_dir(-1, wal_root, &wal);
+	if (result == 0)
+		result = read_dir_identity(wal, &work->wal_dir);
+	if (result != 0)
+		goto done;
+	if (kind == BOOTSTRAP_SOURCE)
+		result = read_source_files(work, global, wal, source, refs);
+	else if (kind == BOOTSTRAP_HISTORY) {
+		char thread[32], hex[65], name[128];
+		const char *parts[] = { "wal_history", thread };
+		snprintf(thread, sizeof(thread), "thread_%u", source->identity.origin_thread_id);
+		read_hex(refs->history_sha256, hex);
+		snprintf(name, sizeof(name), "history_" UINT64_FORMAT "-%s.bin", refs->history_generation,
+				 hex);
+		result = read_object(global, parts, lengthof(parts), name,
+							 CLUSTER_WAL_HISTORY_HEADER_BYTES + 4, CLUSTER_WAL_HISTORY_MAX_BYTES,
+							 work->history, &work->history_len);
+	} else
+		result = read_bytes(global, "pgrac_control_root", CLUSTER_CONTROL_ROOT_FILE_BYTES,
+							CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_after, &length);
+	if (result == 0)
+		result = read_same_dir(AT_FDCWD, shared_root, shared);
+	if (result == 0)
+		result = read_same_dir(shared, "global", global);
+	if (result == 0)
+		result = read_same_dir(AT_FDCWD, wal_root, wal);
+done:
+	read_close(wal, &result);
+	read_close(global, &result);
+	read_close(shared, &result);
+	return result;
+}
+
+static ClusterControlRootResult
+read_source_capacity(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
+					 const ClusterControlRootSnapshot *source, const ControlRootRecordRefsV2 *refs,
+					 ClusterControlRecoveryCapacity *required)
+{
+	const ControlRootHeader *header = &work->before.header;
+	ClusterWalThreadClaimRefV2 claim_ref = { 0 };
+	ClusterWalThreadClaimV2 claim;
+	ClusterRecoveryAnchorRefV2 anchor_ref = { 0 };
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterControlRootResult result;
+
+	result = read_again(work, shared_root, wal_root, BOOTSTRAP_SOURCE, source, refs);
+	if (result != 0)
 		return result;
-	parts[0] = "anchor_images";
-	parts[1] = thread;
-	parts[2] = generation;
-	read_hex(root->refs[node].anchor_sha256, hex);
-	snprintf(name, sizeof(name), "anchor_" UINT64_FORMAT "-%s.bin",
-			 root->refs[node].anchor_generation, hex);
-	return read_object(global, parts, 3, name, CLUSTER_RECOVERY_ANCHOR_SIZE,
-					   CLUSTER_RECOVERY_ANCHOR_SIZE, work->anchor, &length);
+	claim_ref.identity = source->identity;
+	claim_ref.database_incarnation = header->v2.database_incarnation;
+	claim_ref.max_config_generation = header->v2.config_generation;
+	memcpy(claim_ref.claim_sha256, refs->claim_sha256, 32);
+	result
+		= cluster_wal_claim_v2_decode(work->claim, CLUSTER_WAL_CLAIM_V2_BYTES, &claim_ref, &claim);
+	if (result != 0)
+		return result;
+	anchor_ref.identity = source->identity;
+	anchor_ref.database_incarnation = header->v2.database_incarnation;
+	anchor_ref.max_config_generation = header->v2.config_generation;
+	anchor_ref.anchor_generation = refs->anchor_generation;
+	memcpy(anchor_ref.anchor_sha256, refs->anchor_sha256, 32);
+	memcpy(anchor_ref.claim_sha256, refs->claim_sha256, 32);
+	result = cluster_recovery_anchor_v2_decode(work->anchor, CLUSTER_RECOVERY_ANCHOR_SIZE,
+											   &anchor_ref, &anchor);
+	if (result != 0)
+		return result;
+	if (anchor.backup_start != InvalidXLogRecPtr || anchor.backup_end != InvalidXLogRecPtr
+		|| anchor.backup_end_required)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (anchor.checkpoint_copy.redo != source->checkpoint_lower_lsn
+		|| anchor.checkpoint_copy.ThisTimeLineID != source->checkpoint_tli)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+#define RECOVERY_MAX(field) required->field = Max(required->field, anchor.field)
+	RECOVERY_MAX(max_connections);
+	RECOVERY_MAX(max_worker_processes);
+	RECOVERY_MAX(max_wal_senders);
+	RECOVERY_MAX(max_prepared_xacts);
+	RECOVERY_MAX(max_locks_per_xact);
+#undef RECOVERY_MAX
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
+				ClusterControlRecoveryCapacity *required)
+{
+	const ControlRootImage *root = &work->before;
+	ClusterControlRootResult result;
+
+	memset(required, 0, sizeof(*required));
+	for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
+		if (!root->present[node])
+			continue;
+		result = read_source_capacity(work, shared_root, wal_root, &root->records[node],
+									  &root->refs[node], required);
+		if (result != 0)
+			return result;
+		required->current_sources++;
+		if (root->refs[node].history_generation == 0)
+			continue; /* Root decoder already requires a zero hash as well. */
+		result = read_again(work, shared_root, wal_root, BOOTSTRAP_HISTORY, &root->records[node],
+							&root->refs[node]);
+		if (result != 0)
+			return result;
+		result = cluster_control_root_v2_history_decode(work->history, work->history_len, root,
+														node, &work->retained);
+		if (result != 0)
+			return result;
+		for (uint32 i = 0; i < work->retained.count; i++) {
+			const ClusterWalHistoryRecord *old = &work->retained.records[i];
+			result = read_source_capacity(work, shared_root, wal_root, &old->snapshot, &old->refs,
+										  required);
+			if (result != 0)
+				return result;
+			required->history_sources++;
+		}
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 #endif
 
@@ -244,6 +417,7 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 	&& defined(AT_SYMLINK_NOFOLLOW)
 	ClusterControlBootstrapInput input;
 	ClusterControlBootstrapSnapshot snapshot;
+	ClusterControlRecoveryCapacity required;
 	PgracControlBinding binding, later;
 	uint8 binding_bytes[256], later_bytes[256];
 	BootstrapReadWork *work;
@@ -311,6 +485,10 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 		result = read_same_dir(shared, "global", global);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = read_same_dir(AT_FDCWD, wal_root, wal);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (fstat(shared, &work->shared_dir) != 0 || fstat(global, &work->global_dir) != 0
+			|| fstat(wal, &work->wal_dir) != 0))
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 close_dirs:
 	read_close(wal, &result);
 	read_close(global, &result);
@@ -338,9 +516,38 @@ close_dirs:
 	READ_INPUT(anchor, work->anchor, CLUSTER_RECOVERY_ANCHOR_SIZE);
 #undef READ_INPUT
 	result = cluster_control_bootstrap_decode(&input, &snapshot);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	objects = read_capacities(work, shared_root, wal_root, &required);
+	/* A later root may legitimately retire an object while this provisional
+	 * observation is reading it. Never blame the old object before reobserving. */
+	result = read_again(work, shared_root, wal_root, BOOTSTRAP_FINAL_ROOT, NULL, NULL);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	result = cluster_control_root_v2_decode(work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES,
+											binding.storage_uuid, binding.system_identifier,
+											&work->after);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	result = cluster_control_bootstrap_root_bound(&binding, &work->after);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (memcmp(work->root_before, work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	result = read_binding(pgdata, &later, later_bytes);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (memcmp(binding_bytes, later_bytes, sizeof(binding_bytes)) != 0) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto done;
+	}
+	result = objects;
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		config[config_len] = '\0';
 		out->snapshot = snapshot;
+		out->required = required;
 		out->config_bytes = config;
 		out->config_len = config_len;
 		config = NULL;

@@ -24,3 +24,7 @@ CREATE FUNCTION test_pgrac_control_image(text, bigint)
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_control_image'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_control_image(text, bigint) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_recovery_capacity(text, bigint)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_recovery_capacity'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_recovery_capacity(text, bigint) FROM PUBLIC;

@@ -92,7 +92,8 @@ typedef enum ClusterSharedConfigPolicyReason {
 	CLUSTER_CONFIG_POLICY_COLD_ONLY,
 	CLUSTER_CONFIG_POLICY_REFERENCE,
 	CLUSTER_CONFIG_POLICY_VALUE,
-	CLUSTER_CONFIG_POLICY_MISSING
+	CLUSTER_CONFIG_POLICY_MISSING,
+	CLUSTER_CONFIG_POLICY_RECOVERY_CAPACITY
 } ClusterSharedConfigPolicyReason;
 
 /* Diagnostic counts, never an application ACK or a complete-profile permit.
@@ -106,6 +107,24 @@ typedef struct ClusterSharedConfigPolicyReport {
 	uint32 restart_entries;
 	uint32 cold_entries;
 } ClusterSharedConfigPolicyReport;
+
+/* Root-selected historical minima, not current settings or recovery proof. */
+typedef struct ClusterControlRecoveryCapacity {
+	uint32 current_sources;
+	uint32 history_sources;
+	uint32 max_connections;
+	uint32 max_worker_processes;
+	uint32 max_wal_senders;
+	uint32 max_prepared_xacts;
+	uint32 max_locks_per_xact;
+} ClusterControlRecoveryCapacity;
+
+/* Read already applied native values only. No assignment or bound retirement.
+ * Inputs must not alias report; callers still prove full recovery-input coverage.
+ */
+extern ClusterControlRootResult
+cluster_shared_config_check_recovery_capacity(const ClusterControlRecoveryCapacity *required,
+											  ClusterSharedConfigPolicyReport *report);
 
 /* Requires the registered native GUC engine. Checks do not assign settings.
  * online_change applies to ONE changed entry, not unchanged cold entries in a

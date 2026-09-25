@@ -25,7 +25,59 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PG_FUNCTION_INFO_V1(test_pgrac_control_image);
+PG_FUNCTION_INFO_V1(test_pgrac_recovery_capacity);
 PGDLLEXPORT void _PG_init(void);
+
+Datum
+test_pgrac_recovery_capacity(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test recovery sizing inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterControlRecoveryCapacity required = { 0 };
+		ClusterSharedConfigPolicyReport report;
+		ClusterControlRootResult result;
+		char *field = text_to_cstring(PG_GETARG_TEXT_PP(0));
+		uint32 value = (uint32)PG_GETARG_INT64(1);
+		const char *names[] = { "max_connections", "max_worker_processes", "max_wal_senders",
+								"max_prepared_transactions", "max_locks_per_transaction" };
+		uint32 *fields[] = { &required.max_connections, &required.max_worker_processes,
+							 &required.max_wal_senders, &required.max_prepared_xacts,
+							 &required.max_locks_per_xact };
+		bool found = false;
+		required.current_sources = 2;
+		required.history_sources = 3;
+		for (size_t i = 0; i < lengthof(names); i++) {
+			*fields[i] = (uint32)strtoul(GetConfigOption(names[i], false, false), NULL, 10);
+			if (strcmp(field, names[i]) == 0) {
+				*fields[i] = value;
+				found = true;
+			}
+		}
+		if (strcmp(field, "current") == 0)
+			required.current_sources = value;
+		else if (strcmp(field, "history") == 0)
+			required.history_sources = value;
+		else if (!found && strcmp(field, "valid") && strcmp(field, "null")
+				 && strcmp(field, "report-null") && strcmp(field, "alias"))
+			ereport(ERROR, (errmsg("unknown test recovery capacity mutation")));
+		memset(&report, 0xa5, sizeof(report));
+		result = cluster_shared_config_check_recovery_capacity(
+			strcmp(field, "null") == 0	  ? NULL
+			: strcmp(field, "alias") == 0 ? (ClusterControlRecoveryCapacity *)&report
+										  : &required,
+			strcmp(field, "report-null") == 0 ? NULL : &report);
+		if (strcmp(field, "report-null") == 0)
+			PG_RETURN_TEXT_P(cstring_to_text(result != 0 ? "refused" : "unexpected"));
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d:%u:%u:%s", result == 0, report.reason,
+												  report.checked_entries, report.name)));
+	}
+#else
+	ereport(ERROR, (errmsg("PGRAC cluster build required")));
+	PG_RETURN_NULL();
+#endif
+}
 
 /* Only a fixture builder: no global control/GUC state is replaced. */
 Datum
