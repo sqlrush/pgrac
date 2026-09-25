@@ -115,6 +115,11 @@ cluster_wal_thread_shmem_init(void)
 		pg_atomic_init_u64(&cluster_wal_thread_shmem->wal_state_refresh_fail_count, 0);
 		memset(cluster_wal_thread_shmem->_reserved, 0, sizeof(cluster_wal_thread_shmem->_reserved));
 	}
+	/* PGRAC: allocate process-local flush resources before any WAL critical
+	 * section (also on EXEC_BACKEND attachment). No descriptors are inherited.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_enabled && cluster_shared_config)
+		cluster_wal_durable_publish_init();
 }
 
 static const ClusterShmemRegion cluster_wal_thread_region = {

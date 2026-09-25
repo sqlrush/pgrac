@@ -190,6 +190,7 @@
 #include "cluster/cluster_wal_state.h" /* PGRAC: checkpoint redo / fpw sticky (spec-4.5) */
 #include "cluster/cluster_wal_retention.h" /* PGRAC: STOP-05 guarded WAL reuse */
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_durable_prefix.h" /* PGRAC: durable group-flush promise */
 #include "cluster/cluster_backup.h" /* PGRAC: spec-6.5 durable backup WAL pin */
 #include "cluster/cluster_tt_durable.h" /* PGRAC: spec-4.8 D1 crash-left ACTIVE resolution */
 #include "cluster/cluster_cf_authority.h" /* PGRAC: spec-5.6 shared pg_control authority write */
@@ -2517,6 +2518,29 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 
 		LogwrtResult.Flush = LogwrtResult.Write;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: WAL bytes and their exact durable-prefix promise both precede
+	 * native Flush visibility (commit acknowledgement and DATA writeback).
+	 * A full-page flush may end inside a record; expose only the verified
+	 * complete prefix. WALWriteLock is the sole publisher serialization.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_enabled && cluster_shared_config &&
+		LogwrtResult.Flush > XLogCtl->LogwrtResult.Flush)
+	{
+		XLogRecPtr covered = InvalidXLogRecPtr;
+		ClusterControlRootResult result;
+
+		result = cluster_wal_durable_publish(tli, LogwrtResult.Flush,
+											XLogCtl->LogwrtResult.Flush, &covered);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(PANIC,
+					(errmsg("could not publish durable WAL prefix"),
+					 errdetail("PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=DURABLE_PREFIX_UNPROVEN result=%d",
+							   (int) result)));
+		LogwrtResult.Flush = covered;
+	}
+#endif
 
 	/*
 	 * Update shared-memory status

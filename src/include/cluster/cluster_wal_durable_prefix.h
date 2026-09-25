@@ -46,4 +46,15 @@ extern ClusterControlRootResult
 cluster_wal_durable_prefix_read(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
 								ClusterWalDurablePrefix *out);
 
+#ifndef FRONTEND
+/* Native ordinary-writer adapter. Init is process-local and outside critical
+ * sections. Publish is only valid inside XLogWrite's exclusive WALWriteLock;
+ * the result gates native Flush visibility, never grants writer admission. */
+extern void cluster_wal_durable_publish_init(void);
+extern ClusterControlRootResult cluster_wal_durable_publish(TimeLineID timeline,
+															XLogRecPtr physical_flush,
+															XLogRecPtr previous_flush,
+															XLogRecPtr *covered);
+#endif
+
 #endif /* CLUSTER_WAL_DURABLE_PREFIX_H */
