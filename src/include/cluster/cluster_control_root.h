@@ -219,7 +219,9 @@ typedef enum ClusterControlRootResult {
 	CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED = 24,
 	CLUSTER_CONTROL_ROOT_HASH_MISMATCH = 25,
 	CLUSTER_CONTROL_ROOT_MIGRATION_ROUND_MISMATCH = 26,
-	CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN = 27
+	CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN = 27,
+	/* Native group-flush only: no ACK; release WALWriteLock before waiting. */
+	CLUSTER_CONTROL_ROOT_RECONFIG_WAIT = 28
 } ClusterControlRootResult;
 
 typedef struct ClusterControlRootMigrationImage {

@@ -20,9 +20,12 @@
 #include "common/cryptohash.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/timestamp.h"
+#include "utils/wait_event.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -44,7 +47,9 @@ pg_re_throw(void)
 }
 static LWLockPadded test_lwlocks[NUM_INDIVIDUAL_LWLOCKS];
 LWLockPadded *MainLWLockArray = test_lwlocks;
-static bool held = true, active = true, member = true, fence = true, prebump, have_ref = true;
+static bool held = true, mapping_held, active = true, member = true, fence = true, prebump,
+			have_ref = true;
+static bool fence_epoch_lag, fence_lease_zero, fence_expired, self_fenced;
 static uint64 epoch = 7, incarnation = 99;
 static ClusterWalDurablePrefixRef ref;
 static char scratch[MAXPGPATH], generation[MAXPGPATH], prefix_path[MAXPGPATH];
@@ -93,9 +98,10 @@ ResourceOwnerRelease(ResourceOwner o pg_attribute_unused(),
 					 bool t pg_attribute_unused())
 {}
 bool
-LWLockHeldByMeInMode(LWLock *l pg_attribute_unused(), LWLockMode m)
+LWLockHeldByMeInMode(LWLock *l, LWLockMode m)
 {
-	return held && m == LW_EXCLUSIVE;
+	return m == LW_EXCLUSIVE
+		   && ((l == WALWriteLock && held) || (l == WALBufMappingLock && mapping_held));
 }
 uint64
 GetSystemIdentifier(void)
@@ -137,7 +143,13 @@ cluster_write_fence_observe(ClusterWriteFenceObservation *o)
 {
 	memset(o, 0, sizeof(*o));
 	o->enforcing = o->attached = o->engaged = o->allowed = fence;
-	o->epoch_current = o->authorized_epoch = epoch;
+	o->epoch_current = epoch;
+	o->authorized_epoch = epoch - (fence_epoch_lag ? 1 : 0);
+	o->self_fenced = self_fenced;
+	o->now_us = 100;
+	o->expiry_us = fence_lease_zero ? 0 : fence_expired ? 99 : 10000;
+	if (fence_epoch_lag || fence_lease_zero || fence_expired || self_fenced)
+		o->allowed = false;
 }
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *o)
@@ -177,7 +189,7 @@ errstart(int level, const char *domain pg_attribute_unused())
 {
 	if (level == DEBUG1)
 		return false;
-	if (!expect_panic || level != PANIC)
+	if (!expect_panic || (level != PANIC && level != ERROR))
 		abort();
 	return true;
 }
@@ -250,11 +262,35 @@ publish_test_renameat(int a, const char *b, int c, const char *d)
 typedef struct NativeResult {
 	XLogRecPtr Write, Flush;
 } NativeResult;
+typedef NativeResult XLogwrtRqst;
+typedef struct {
+	int runningBackups;
+} XLogCtlInsert;
 static NativeResult LogwrtResult;
 static struct {
 	NativeResult LogwrtResult, LogwrtRqst;
 	int info_lck;
+	TimeLineID InsertTimeLineID;
+	XLogRecPtr asyncXactLSN;
+	XLogCtlInsert Insert;
+	XLogRecPtr InitializedUpTo, xlblocks[2];
+	int XLogCacheBlck;
+	char pages[2 * XLOG_BLCKSZ];
 } native_ctl;
+static ControlFileData native_control;
+#define ControlFile (&native_control)
+#define XLogRecPtrToBufIdx(p) (((p) / XLOG_BLCKSZ) % (native_ctl.XLogCacheBlck + 1))
+#define CLUSTER_INJECTION_POINT(name) ((void)0)
+#define TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_START() ((void)0)
+#define TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_DONE() ((void)0)
+static struct {
+	uint64 wal_buffers_full;
+} PendingWalStats;
+uint16
+cluster_wal_thread_stamp(void)
+{
+	return 1;
+}
 #define XLogCtl (&native_ctl)
 #define SpinLockAcquire(lock) ((void)(lock))
 #define SpinLockRelease(lock) ((void)(lock))
@@ -262,6 +298,113 @@ static void
 WalSndWakeupRequest(void)
 {}
 #include "test_cluster_wal_publish_tail.inc"
+#include "test_cluster_wal_publish_entry.inc"
+
+/* Native caller control flow and the final write slice are real. WAL buffer
+ * availability and the scheduler clock/authority update are external inputs. */
+static TimestampTz fake_now;
+static int native_waits, native_writes;
+static bool refresh_on_wait = true;
+static bool lag_on_lock, lag_every_lock;
+Latch *MyLatch;
+int CommitDelay, CommitSiblings;
+int WalWriterDelay, WalWriterFlushAfter;
+static int openLogFile = -1;
+static XLogSegNo openLogSegNo;
+bool
+XLogInsertAllowed(void)
+{
+	return true;
+}
+bool
+RecoveryInProgress(void)
+{
+	return false;
+}
+static void
+UpdateMinRecoveryPoint(XLogRecPtr r pg_attribute_unused(), bool f pg_attribute_unused())
+{
+	abort();
+}
+static XLogRecPtr
+WaitXLogInsertionsToFinish(XLogRecPtr r)
+{
+	return r;
+}
+static bool
+MinimumActiveBackends(int n pg_attribute_unused())
+{
+	return false;
+}
+static void
+WalSndWakeupProcessRequests(bool a pg_attribute_unused(), bool b pg_attribute_unused())
+{}
+static void
+XLogFileClose(void)
+{
+	openLogFile = -1;
+}
+static void ClusterWALWaitForPublish(TimeLineID, TimestampTz *);
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return fake_now;
+}
+bool
+TimestampDifferenceExceeds(TimestampTz a, TimestampTz b, int ms)
+{
+	return b - a >= (int64)ms * 1000;
+}
+bool
+LWLockAcquire(LWLock *l, LWLockMode mode)
+{
+	bool *state = l == WALWriteLock ? &held : &mapping_held;
+	Assert((l == WALWriteLock || l == WALBufMappingLock) && mode == LW_EXCLUSIVE && !*state);
+	*state = true;
+	if (l == WALWriteLock && lag_on_lock) {
+		++epoch;
+		fence_epoch_lag = true;
+		lag_on_lock = lag_every_lock;
+	}
+	return true;
+}
+bool
+LWLockAcquireOrWait(LWLock *l, LWLockMode mode)
+{
+	return LWLockAcquire(l, mode);
+}
+void
+LWLockRelease(LWLock *l)
+{
+	bool *state = l == WALWriteLock ? &held : &mapping_held;
+	Assert((l == WALWriteLock || l == WALBufMappingLock) && *state);
+	*state = false;
+}
+int
+WaitLatch(Latch *l pg_attribute_unused(), int events pg_attribute_unused(), long ms, uint32 event)
+{
+	Assert(!held && !mapping_held && event == WAIT_EVENT_RECONFIG_FENCE_WAIT);
+	++native_waits;
+	fake_now += ms * 1000;
+	if (refresh_on_wait) {
+		fence_epoch_lag = fence_lease_zero = prebump = false;
+	}
+	return WL_TIMEOUT;
+}
+void
+ResetLatch(Latch *l pg_attribute_unused())
+{}
+static bool
+XLogWrite(NativeResult request, TimeLineID tli, bool flexible pg_attribute_unused())
+{
+	Assert(held && CritSectionCount > 0);
+	if (!native_write_entry(tli))
+		return false;
+	++native_writes;
+	LogwrtResult.Write = Max(request.Write, native_ctl.LogwrtResult.Write);
+	return native_flush_tail(tli);
+}
+#include "test_cluster_wal_publish_callers.inc"
 #undef XLogCtl
 #undef SpinLockAcquire
 #undef SpinLockRelease
@@ -392,6 +535,8 @@ fixture(void)
 	fail_write = fail_readback = expect_panic = false;
 	mutation_at_sync = mutation_kind = 0;
 	held = active = member = fence = have_ref = true;
+	mapping_held = false;
+	fence_epoch_lag = fence_lease_zero = fence_expired = self_fenced = false;
 	enableFsync = cluster_enabled = cluster_shared_config = true;
 	prebump = false;
 	epoch = 7;
@@ -833,10 +978,218 @@ UT_TEST(test_native_flush_publication_order)
 	UT_ASSERT_EQ(rename_calls, 0);
 }
 
+/* Real final-write hook: healthy epoch/token publication races must retain
+ * the old ACK frontier, not crash the survivor. A later successful call must
+ * validate the actual current file (including a prefix already renamed). */
+static void
+native_reconfig_case(int mutation)
+{
+	ClusterWalDurablePrefix a, b;
+	int before;
+	volatile bool panicked = false;
+
+	fixture();
+	a = base_record();
+	b = record_write(a.exclusive_end, a.record_start, 24);
+	memset(&native_ctl, 0, sizeof(native_ctl));
+	native_ctl.LogwrtResult.Write = native_ctl.LogwrtResult.Flush = a.exclusive_end;
+	LogwrtResult.Write = b.exclusive_end;
+	fence_epoch_lag = mutation == 0;
+	fence_lease_zero = mutation == -1;
+	prebump = mutation == -2;
+	change_epoch = mutation > 0 ? mutation : 0;
+	before = fd_count();
+	expect_panic = true;
+	if (sigsetjmp(native_error, 1) == 0)
+		native_flush_tail(1);
+	else
+		panicked = true;
+	expect_panic = false;
+	UT_ASSERT(!panicked);
+	UT_ASSERT_EQ(fd_count(), before);
+	UT_ASSERT_EQ(native_ctl.LogwrtResult.Flush, a.exclusive_end);
+	UT_ASSERT_EQ(LogwrtResult.Flush, a.exclusive_end);
+	UT_ASSERT_EQ(native_ctl.LogwrtResult.Write, b.exclusive_end);
+	fence_epoch_lag = fence_lease_zero = false;
+	prebump = false;
+	change_epoch = 0;
+	native_flush_tail(1);
+	UT_ASSERT_EQ(native_ctl.LogwrtResult.Flush, b.exclusive_end);
+	check_result(b.exclusive_end, b, 6);
+	UT_ASSERT_EQ(rename_calls, 1);
+}
+
+UT_TEST(test_native_survivor_waits_for_epoch_token)
+{
+	native_reconfig_case(0);
+}
+UT_TEST(test_native_survivor_waits_for_token_publication)
+{
+	native_reconfig_case(-1);
+}
+UT_TEST(test_native_survivor_retries_before_prefix_rename)
+{
+	native_reconfig_case(1);
+}
+UT_TEST(test_native_survivor_rechecks_published_prefix)
+{
+	native_reconfig_case(4);
+}
+UT_TEST(test_native_survivor_waits_for_prebump)
+{
+	native_reconfig_case(-2);
+}
+
+static void
+native_caller_case(bool background, bool lag, bool hang, bool lock_race)
+{
+	ClusterWalDurablePrefix a, b;
+	volatile bool failed = false;
+	fixture();
+	a = base_record();
+	b = record_write(a.exclusive_end, a.record_start, 24);
+	memset(&native_ctl, 0, sizeof(native_ctl));
+	native_ctl.LogwrtResult.Write = native_ctl.LogwrtResult.Flush = a.exclusive_end;
+	LogwrtResult = native_ctl.LogwrtResult;
+	native_ctl.LogwrtRqst.Write = native_ctl.LogwrtRqst.Flush = b.exclusive_end;
+	native_ctl.asyncXactLSN = b.exclusive_end;
+	native_ctl.InsertTimeLineID = 1;
+	native_ctl.XLogCacheBlck = 1;
+	fake_now = 1000000;
+	native_waits = native_writes = 0;
+	held = false;
+	CritSectionCount = 0;
+	fence_epoch_lag = lag;
+	change_epoch = (lag || lock_race) ? 0 : 4;
+	refresh_on_wait = !hang || lock_race;
+	lag_on_lock = lock_race;
+	lag_every_lock = hang;
+	expect_panic = true;
+	if (sigsetjmp(native_error, 1) == 0) {
+		if (background)
+			(void)XLogBackgroundFlush();
+		else
+			XLogFlush(b.exclusive_end);
+	} else
+		failed = true;
+	expect_panic = false;
+	UT_ASSERT_EQ(failed, hang);
+	UT_ASSERT(!held);
+	if (hang) {
+		UT_ASSERT_EQ(native_ctl.LogwrtResult.Flush, a.exclusive_end);
+		UT_ASSERT_EQ(native_writes, 0);
+		UT_ASSERT(fake_now >= 11000000 && fake_now <= 11020000);
+	} else {
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		UT_ASSERT_EQ(native_ctl.LogwrtResult.Flush, b.exclusive_end);
+		UT_ASSERT((lag || lock_race) ? native_waits > 0 : native_writes > 1);
+		check_result(b.exclusive_end, b, 6);
+	}
+	refresh_on_wait = true;
+	lag_on_lock = lag_every_lock = false;
+	CritSectionCount = 1;
+}
+
+UT_TEST(test_foreground_flush_reconfiguration_wait)
+{
+	native_caller_case(false, true, false, false);
+}
+UT_TEST(test_foreground_flush_reconfiguration_race)
+{
+	native_caller_case(false, false, false, false);
+}
+UT_TEST(test_background_flush_reconfiguration_wait)
+{
+	native_caller_case(true, true, false, false);
+}
+UT_TEST(test_background_flush_reconfiguration_race)
+{
+	native_caller_case(true, false, false, false);
+}
+UT_TEST(test_flush_hang_never_acknowledges)
+{
+	native_caller_case(false, true, true, false);
+}
+UT_TEST(test_foreground_entry_rechecks_before_physical_write)
+{
+	native_caller_case(false, false, false, true);
+}
+UT_TEST(test_background_entry_rechecks_before_physical_write)
+{
+	native_caller_case(true, false, false, true);
+}
+UT_TEST(test_repeated_entry_races_do_not_reset_hang_budget)
+{
+	native_caller_case(false, false, true, true);
+}
+
+UT_TEST(test_wal_buffer_reuse_releases_mapping_lock_before_wait)
+{
+	ClusterWalDurablePrefix a, b;
+	fixture();
+	a = base_record();
+	b = record_write(a.exclusive_end, a.record_start,
+					 wal_segment_size + XLOG_BLCKSZ - a.exclusive_end - SizeOfXLogRecord - 5);
+	UT_ASSERT_EQ(b.exclusive_end, wal_segment_size + XLOG_BLCKSZ);
+	memset(&native_ctl, 0, sizeof(native_ctl));
+	native_ctl.LogwrtResult.Write = native_ctl.LogwrtResult.Flush = a.exclusive_end;
+	LogwrtResult = native_ctl.LogwrtResult;
+	native_ctl.InsertTimeLineID = 1;
+	native_ctl.XLogCacheBlck = 1;
+	native_ctl.InitializedUpTo = wal_segment_size + 2 * XLOG_BLCKSZ;
+	native_ctl.xlblocks[0] = b.exclusive_end;
+	fake_now = 1000000;
+	native_waits = native_writes = 0;
+	refresh_on_wait = true;
+	held = false;
+	fence_epoch_lag = true;
+	AdvanceXLInsertBuffer(wal_segment_size + 2 * XLOG_BLCKSZ, 1, false);
+	UT_ASSERT(!held && !mapping_held);
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(native_ctl.InitializedUpTo, wal_segment_size + 3 * XLOG_BLCKSZ);
+	UT_ASSERT_EQ(native_ctl.LogwrtResult.Flush, b.exclusive_end);
+	UT_ASSERT_EQ(native_waits, 1);
+	UT_ASSERT_EQ(native_writes, 1);
+}
+
+UT_TEST(test_waitable_state_never_masks_lost_permission)
+{
+	for (int fault = 0; fault < 4; ++fault) {
+		ClusterWalDurablePrefix a, b;
+		XLogRecPtr covered = 123;
+		ClusterControlRootResult result;
+		fixture();
+		a = base_record();
+		b = record_write(a.exclusive_end, a.record_start, 24);
+		fence_epoch_lag = prebump = true;
+		switch (fault) {
+		case 0:
+			self_fenced = true;
+			break;
+		case 1:
+			fence_expired = true;
+			break;
+		case 2:
+			++incarnation;
+			break;
+		case 3:
+			active = false;
+			break;
+		}
+		result = cluster_wal_durable_publish(1, b.exclusive_end, a.exclusive_end, &covered);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT_EQ(covered, 0);
+		UT_ASSERT_EQ(sync_calls, 0);
+		UT_ASSERT_EQ(rename_calls, 0);
+		check_result(a.exclusive_end, a, 5);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(25);
 	CritSectionCount = 0;
 	cluster_wal_durable_publish_init();
 	UT_RUN(test_group_flush_complete_and_reuse);
@@ -849,6 +1202,21 @@ main(void)
 	UT_RUN(test_namespace_changes_and_owned_cleanup);
 	UT_RUN(test_write_readback_collision_and_reuse_refusal);
 	UT_RUN(test_native_flush_publication_order);
+	UT_RUN(test_native_survivor_waits_for_epoch_token);
+	UT_RUN(test_native_survivor_waits_for_token_publication);
+	UT_RUN(test_native_survivor_retries_before_prefix_rename);
+	UT_RUN(test_native_survivor_rechecks_published_prefix);
+	UT_RUN(test_foreground_flush_reconfiguration_wait);
+	UT_RUN(test_foreground_flush_reconfiguration_race);
+	UT_RUN(test_background_flush_reconfiguration_wait);
+	UT_RUN(test_background_flush_reconfiguration_race);
+	UT_RUN(test_flush_hang_never_acknowledges);
+	UT_RUN(test_native_survivor_waits_for_prebump);
+	UT_RUN(test_wal_buffer_reuse_releases_mapping_lock_before_wait);
+	UT_RUN(test_waitable_state_never_masks_lost_permission);
+	UT_RUN(test_foreground_entry_rechecks_before_physical_write);
+	UT_RUN(test_background_entry_rechecks_before_physical_write);
+	UT_RUN(test_repeated_entry_races_do_not_reset_hang_budget);
 	if (scratch[0] && !rmtree(scratch, true))
 		abort();
 	pfree(cluster_wal_threads_dir);

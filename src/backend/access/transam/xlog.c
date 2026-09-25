@@ -769,7 +769,10 @@ static XLogRecPtr XLogGetReplicationSlotMinimumLSN(void);
 
 static void AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli,
 								  bool opportunistic);
-static void XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible);
+static bool XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible);
+#ifdef USE_PGRAC_CLUSTER
+static void ClusterWALWaitForPublish(TimeLineID tli, TimestampTz *wait_started);
+#endif
 static bool InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 								   bool find_free, XLogSegNo max_segno,
 								   TimeLineID tli);
@@ -1939,6 +1942,9 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 	XLogRecPtr	NewPageBeginPtr;
 	XLogPageHeader NewPage;
 	int			npages pg_attribute_unused() = 0;
+#ifdef USE_PGRAC_CLUSTER
+	TimestampTz publish_wait_started = 0;
+#endif
 
 	LWLockAcquire(WALBufMappingLock, LW_EXCLUSIVE);
 
@@ -1988,6 +1994,9 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 
 				WaitXLogInsertionsToFinish(OldPageRqstPtr);
 
+#ifdef USE_PGRAC_CLUSTER
+				ClusterWALWaitForPublish(tli, &publish_wait_started);
+#endif
 				LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
 
 				LogwrtResult = XLogCtl->LogwrtResult;
@@ -2002,7 +2011,12 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_START();
 					WriteRqst.Write = OldPageRqstPtr;
 					WriteRqst.Flush = 0;
-					XLogWrite(WriteRqst, tli, false);
+					if (!XLogWrite(WriteRqst, tli, false)) {
+#ifdef USE_PGRAC_CLUSTER
+						if (publish_wait_started == 0)
+							publish_wait_started = GetCurrentTimestamp();
+#endif
+					}
 					LWLockRelease(WALWriteLock);
 					PendingWalStats.wal_buffers_full++;
 					TRACE_POSTGRESQL_WAL_BUFFER_WRITE_DIRTY_DONE();
@@ -2244,6 +2258,49 @@ XLogCheckpointNeeded(XLogSegNo new_segno)
 	return false;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: only a healthy same-writer reconfiguration is waitable. This never
+ * authorizes I/O; XLogWrite and the durable-prefix publisher recheck again.
+ * Callers may already be in a native outer critical section (commit or WAL
+ * insertion), which cannot be unwound as a query ERROR. Do not hold the WAL
+ * write/mapping lock while QVOTEC catches up. The existing checkpoint's ten
+ * second hang envelope is retained across retries, not renewed by each race.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ClusterWALWaitForPublish(TimeLineID tli, TimestampTz *wait_started)
+{
+	if (!cluster_enabled || !cluster_shared_config)
+		return;
+	Assert(!LWLockHeldByMeInMode(WALWriteLock, LW_EXCLUSIVE));
+	Assert(!LWLockHeldByMeInMode(WALBufMappingLock, LW_EXCLUSIVE));
+	for (;;) {
+		ClusterControlRootResult result = cluster_wal_durable_publish_ready(tli);
+		TimestampTz now;
+
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			ereport(PANIC,
+					(errmsg("native WAL flush lost writer authority"),
+					 errdetail(
+						 "PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_AUTHORITY_UNPROVEN result=%d",
+						 (int)result)));
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && *wait_started == 0)
+			return;
+		now = GetCurrentTimestamp();
+		if (*wait_started == 0)
+			*wait_started = now;
+		if (TimestampDifferenceExceeds(*wait_started, now, 10000))
+			ereport(PANIC, (errmsg("native WAL flush reconfiguration wait did not complete"),
+							errdetail("PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_RECONFIG_HANG")));
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return;
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_RECONFIG_FENCE_WAIT);
+		ResetLatch(MyLatch);
+	}
+}
+#endif
+
 /*
  * Write and/or fsync the log at least as far as WriteRqst indicates.
  *
@@ -2255,10 +2312,14 @@ XLogCheckpointNeeded(XLogSegNo new_segno)
  * Must be called with WALWriteLock held. WaitXLogInsertionsToFinish(WriteRqst)
  * must be called before grabbing the lock, to make sure the data is ready to
  * write.
+ *
+ * PGRAC: false means reconfiguration deferred completion. Written bytes may
+ * advance Write, but Flush stays at its independently proven old frontier.
  */
-static void
+static bool
 XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 {
+	bool completed = true;
 	bool		ispartialpage;
 	bool		last_iteration;
 	bool		finishing_seg;
@@ -2274,6 +2335,21 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 	 * Update local LogwrtResult (caller probably did this already, but...)
 	 */
 	LogwrtResult = XLogCtl->LogwrtResult;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_enabled && cluster_shared_config) {
+		ClusterControlRootResult result = cluster_wal_durable_publish_ready(tli);
+
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT)
+			return false;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(PANIC,
+					(errmsg("native WAL write lost writer authority"),
+					 errdetail(
+						 "PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=FLUSH_AUTHORITY_UNPROVEN result=%d",
+						 (int)result)));
+	}
+#endif
 
 	/*
 	 * Since successive pages in the xlog cache are consecutively allocated,
@@ -2539,7 +2615,13 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 
 		result = cluster_wal_durable_publish(tli, LogwrtResult.Flush,
 											XLogCtl->LogwrtResult.Flush, &covered);
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		if (result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT) {
+			/* No durability promise may escape from this attempt. The caller
+			 * drops WALWriteLock before waiting; a fresh pass rereads the exact
+			 * prefix even when its rename already completed. */
+			covered = XLogCtl->LogwrtResult.Flush;
+			completed = false;
+		} else if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			ereport(PANIC,
 					(errmsg("could not publish durable WAL prefix"),
 					 errdetail("PGRAC_FAMILY=WAL_THREAD PGRAC_REASON=DURABLE_PREFIX_UNPROVEN result=%d",
@@ -2564,6 +2646,7 @@ XLogWrite(XLogwrtRqst WriteRqst, TimeLineID tli, bool flexible)
 			XLogCtl->LogwrtRqst.Flush = LogwrtResult.Flush;
 		SpinLockRelease(&XLogCtl->info_lck);
 	}
+	return completed;
 }
 
 /*
@@ -2732,6 +2815,9 @@ XLogFlush(XLogRecPtr record)
 	XLogRecPtr	WriteRqstPtr;
 	XLogwrtRqst WriteRqst;
 	TimeLineID	insertTLI = XLogCtl->InsertTimeLineID;
+#ifdef USE_PGRAC_CLUSTER
+	TimestampTz publish_wait_started = 0;
+#endif
 
 	/*
 	 * During REDO, we are reading not writing WAL.  Therefore, instead of
@@ -2758,6 +2844,9 @@ XLogFlush(XLogRecPtr record)
 			 LSN_FORMAT_ARGS(LogwrtResult.Flush));
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+	ClusterWALWaitForPublish(insertTLI, &publish_wait_started);
+#endif
 	START_CRIT_SECTION();
 
 	/*
@@ -2790,6 +2879,9 @@ XLogFlush(XLogRecPtr record)
 		if (record <= LogwrtResult.Flush)
 			break;
 
+#ifdef USE_PGRAC_CLUSTER
+		ClusterWALWaitForPublish(insertTLI, &publish_wait_started);
+#endif
 		/*
 		 * Before actually performing the write, wait for all in-flight
 		 * insertions to the pages we're about to write to finish.
@@ -2852,7 +2944,14 @@ XLogFlush(XLogRecPtr record)
 		WriteRqst.Write = insertpos;
 		WriteRqst.Flush = insertpos;
 
-		XLogWrite(WriteRqst, insertTLI, false);
+		if (!XLogWrite(WriteRqst, insertTLI, false)) {
+			LWLockRelease(WALWriteLock);
+#ifdef USE_PGRAC_CLUSTER
+			if (publish_wait_started == 0)
+				publish_wait_started = GetCurrentTimestamp();
+#endif
+			continue;
+		}
 
 		LWLockRelease(WALWriteLock);
 		/* done */
@@ -2925,6 +3024,9 @@ XLogBackgroundFlush(void)
 	TimestampTz now;
 	int			flushbytes;
 	TimeLineID	insertTLI;
+#ifdef USE_PGRAC_CLUSTER
+	TimestampTz publish_wait_started = 0;
+#endif
 
 	/* XLOG doesn't need flushing during recovery */
 	if (RecoveryInProgress())
@@ -3017,20 +3119,28 @@ XLogBackgroundFlush(void)
 			 LSN_FORMAT_ARGS(LogwrtResult.Flush));
 #endif
 
-	START_CRIT_SECTION();
+	for (;;) {
+		bool completed = true;
 
-	/* now wait for any in-progress insertions to finish and get write lock */
-	WaitXLogInsertionsToFinish(WriteRqst.Write);
-	LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
-	LogwrtResult = XLogCtl->LogwrtResult;
-	if (WriteRqst.Write > LogwrtResult.Write ||
-		WriteRqst.Flush > LogwrtResult.Flush)
-	{
-		XLogWrite(WriteRqst, insertTLI, flexible);
+#ifdef USE_PGRAC_CLUSTER
+		ClusterWALWaitForPublish(insertTLI, &publish_wait_started);
+#endif
+		START_CRIT_SECTION();
+		/* now wait for in-progress insertions to finish and get write lock */
+		WaitXLogInsertionsToFinish(WriteRqst.Write);
+		LWLockAcquire(WALWriteLock, LW_EXCLUSIVE);
+		LogwrtResult = XLogCtl->LogwrtResult;
+		if (WriteRqst.Write > LogwrtResult.Write || WriteRqst.Flush > LogwrtResult.Flush)
+			completed = XLogWrite(WriteRqst, insertTLI, flexible);
+		LWLockRelease(WALWriteLock);
+		END_CRIT_SECTION();
+		if (completed)
+			break;
+#ifdef USE_PGRAC_CLUSTER
+		if (publish_wait_started == 0)
+			publish_wait_started = GetCurrentTimestamp();
+#endif
 	}
-	LWLockRelease(WALWriteLock);
-
-	END_CRIT_SECTION();
 
 	/* wake up walsenders now that we've released heavily contended locks */
 	WalSndWakeupProcessRequests(true, !RecoveryInProgress());

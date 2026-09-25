@@ -5323,13 +5323,31 @@ test_cluster_wal_durable_prefix: test_cluster_wal_durable_prefix.c unit_test.h \
 # real WAL decoder/claim/prefix codecs. Author: SqlRush <sqlrush@gmail.com>
 test_cluster_wal_publish_tail.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^XLogWrite\(/ { owner=1 } \
-	     owner && /^\t\t\/\* signal that we need to wakeup walsenders later/ { emit=1; count++; print "static void native_flush_tail(TimeLineID tli pg_attribute_unused()) { if (true) {"; next } \
+	     owner && /^\t\t\/\* signal that we need to wakeup walsenders later/ { emit=1; count++; print "static bool native_flush_tail(TimeLineID tli pg_attribute_unused()) { bool completed = true; if (true) {"; next } \
 	     emit { print } /^}/ { owner=0; emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# PGRAC: execute native flush callers, not source-order assertions. The device
+# and scheduler boundaries are supplied by the real-file C fixture.
+test_cluster_wal_publish_callers.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^AdvanceXLInsertBuffer\(/ { print "static void"; emit=1; count++ } \
+	     /^ClusterWALWaitForPublish\(/ { print "static void"; emit=1 } \
+	     /^XLogFlush\(/ { print "void"; emit=1; count++ } \
+	     /^XLogBackgroundFlush\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_publish_entry.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^XLogWrite\(/ { owner=1 } \
+	     owner && /^\tLogwrtResult = XLogCtl->LogwrtResult;/ { print "static bool native_write_entry(TimeLineID tli) {"; emit=1; count++ } \
+	     emit { print } emit && /^#endif/ { print "return true; }"; emit=0; owner=0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_durable_publish: test_cluster_wal_durable_publish.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_durable_publish.c \
-		$(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o test_cluster_wal_publish_tail.inc
+		$(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
+		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@

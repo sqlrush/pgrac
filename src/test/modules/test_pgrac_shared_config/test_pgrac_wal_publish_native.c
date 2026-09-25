@@ -71,11 +71,15 @@ native_fence(ClusterWriteFenceObservation *out)
 	memset(out, 0, sizeof(*out));
 	out->enforcing = out->attached = out->engaged = out->allowed = true;
 	out->epoch_current = out->authorized_epoch = 7;
+	out->now_us = 100;
+	out->expiry_us = 10000;
 }
 
 void native_publish_init(void);
+ClusterControlRootResult native_publish_ready(TimeLineID);
 ClusterControlRootResult native_publish_call(TimeLineID, XLogRecPtr, XLogRecPtr, XLogRecPtr *);
 #define cluster_wal_durable_publish_init native_publish_init
+#define cluster_wal_durable_publish_ready native_publish_ready
 #define cluster_wal_durable_publish native_publish_call
 #define cluster_enabled true
 #define cluster_shared_config true

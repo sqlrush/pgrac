@@ -98,29 +98,51 @@ cluster_wal_durable_publish_init(void)
 	}
 }
 
-static bool
+static ClusterControlRootResult
 publish_runtime(const PublishWork *work)
 {
 	ClusterWriteFenceObservation fence;
 	ClusterWalDurablePrefixRef fresh;
 	const ClusterControlRootIdentity *id = &work->ref.claim.identity;
 
-	if (!cluster_enabled || !cluster_shared_config || !enableFsync || CritSectionCount == 0
-		|| !LWLockHeldByMeInMode(WALWriteLock, LW_EXCLUSIVE)
+	if (!cluster_enabled || !cluster_shared_config || !enableFsync
 		|| !cluster_external_fence_runtime_active() || cluster_node_id != id->origin_node_id
 		|| id->system_identifier != GetSystemIdentifier()
 		|| cluster_qvotec_get_self_incarnation() != id->origin_owner_incarnation
 		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
 			   != id->origin_owner_incarnation
-		|| cluster_epoch_get_current() != work->epoch || work->epoch == 0
-		|| cluster_reconfig_has_pending_prebump_stage()
-		|| !cluster_wal_thread_current_v2_ref(&fresh)
+		|| work->epoch == 0 || !cluster_wal_thread_current_v2_ref(&fresh)
 		|| memcmp(&fresh, &work->ref, sizeof(fresh)) != 0)
-		return false;
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	cluster_write_fence_observe(&fence);
-	return fence.enforcing && fence.attached && fence.engaged && fence.allowed && !fence.self_fenced
-		   && fence.epoch_current == work->epoch && fence.authorized_epoch == work->epoch;
+	if (!fence.enforcing || !fence.attached || !fence.engaged || fence.self_fenced
+		|| fence.epoch_current == 0 || (fence.expiry_us != 0 && fence.now_us >= fence.expiry_us))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	/* A healthy survivor's epoch can advance before QVOTEC republishes its
+	 * token (lease is zero during that publication). None of these observations
+	 * permits I/O/ACK. Defer to the native caller, which releases WALWriteLock
+	 * before waiting and starts a fresh exact attempt. Never adopt a new epoch
+	 * inside an already-running prefix publication. */
+	if (fence.expiry_us == 0 || fence.epoch_current != work->epoch
+		|| fence.authorized_epoch != work->epoch || cluster_epoch_get_current() != work->epoch
+		|| cluster_reconfig_has_pending_prebump_stage())
+		return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	return fence.allowed ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_wal_durable_publish_ready(TimeLineID timeline)
+{
+	PublishWork work = { 0 };
+
+	if (publish_context == NULL || publish_owner == NULL || publish_hash == NULL
+		|| !IsValidWalSegSize(wal_segment_size) || cluster_wal_threads_dir == NULL
+		|| cluster_wal_threads_dir[0] == '\0' || DataDir == NULL || DataDir[0] == '\0'
+		|| !cluster_wal_thread_current_v2_ref(&work.ref) || work.ref.timeline != timeline)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	work.epoch = cluster_epoch_get_current();
+	return publish_runtime(&work);
 }
 
 static bool
@@ -387,9 +409,12 @@ publish_persist(PublishWork *work)
 			return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	if (pg_fsync(work->dirs[2]) != 0)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	if (!publish_runtime(work) || !publish_paths(work)
+	if (!publish_paths(work)
 		|| !publish_current_matches(work, work->currentfd, work->previous_bytes))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = publish_runtime(work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (work->next.sequence != work->previous.sequence) {
 		snprintf(work->temporary, sizeof(work->temporary), ".current.%d." UINT64_FORMAT, MyProcPid,
 				 work->next.sequence);
@@ -408,11 +433,14 @@ publish_persist(PublishWork *work)
 		}
 		if (pg_fsync(work->tempfd) != 0)
 			return CLUSTER_CONTROL_ROOT_IO_ERROR;
-		if (!publish_runtime(work) || !publish_paths(work)
+		if (!publish_paths(work)
 			|| !publish_current_matches(work, work->currentfd, work->previous_bytes)
 			|| !publish_entry_matches(work->dirs[3], work->temporary, work->tempfd, false,
 									  sizeof(bytes)))
 			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = publish_runtime(work);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
 		if (renameat(work->dirs[3], work->temporary, work->dirs[3], "current") != 0)
 			return CLUSTER_CONTROL_ROOT_IO_ERROR;
 		work->temp_owned = false;
@@ -424,10 +452,9 @@ publish_persist(PublishWork *work)
 	}
 	if (pg_fsync(work->dirs[3]) != 0)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	if (!publish_runtime(work) || !publish_paths(work)
-		|| !publish_current_matches(work, published_fd, bytes))
+	if (!publish_paths(work) || !publish_current_matches(work, published_fd, bytes))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	return publish_runtime(work);
 }
 
 static ClusterControlRootResult
@@ -475,12 +502,15 @@ cluster_wal_durable_publish(TimeLineID timeline, XLogRecPtr physical_flush,
 	work.datafd = work.routefd = work.claimfd = work.currentfd = work.tempfd = -1;
 	work.epoch = cluster_epoch_get_current();
 	if (publish_context == NULL || publish_owner == NULL || publish_hash == NULL
+		|| CritSectionCount == 0 || !LWLockHeldByMeInMode(WALWriteLock, LW_EXCLUSIVE)
 		|| physical_flush == 0 || physical_flush < previous_flush
 		|| !IsValidWalSegSize(wal_segment_size) || cluster_wal_threads_dir == NULL
 		|| cluster_wal_threads_dir[0] == '\0' || DataDir == NULL || DataDir[0] == '\0'
-		|| !cluster_wal_thread_current_v2_ref(&work.ref) || work.ref.timeline != timeline
-		|| !publish_runtime(&work))
+		|| !cluster_wal_thread_current_v2_ref(&work.ref) || work.ref.timeline != timeline)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = publish_runtime(&work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	saved_context = MemoryContextSwitchTo(publish_context);
 	saved_owner = CurrentResourceOwner;
 	CurrentResourceOwner = publish_owner;
@@ -504,8 +534,9 @@ cluster_wal_durable_publish(TimeLineID timeline, XLogRecPtr physical_flush,
 	MemoryContextSwitchTo(saved_context);
 	MemoryContextReset(publish_context);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-		if (!publish_runtime(&work))
-			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = publish_runtime(&work);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
 		*covered = end;
 	}
 	return result;
