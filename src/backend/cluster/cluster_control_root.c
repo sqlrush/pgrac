@@ -34,6 +34,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_wal_claim.h"
+#include "cluster/cluster_wal_durable_prefix.h"
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
@@ -2102,7 +2103,50 @@ typedef struct CheckpointV2Work {
 	uint16 wal_thread;
 	TimeLineID wal_tli;
 	ClusterControlRootResult wal_read_result;
+	ClusterWalDurablePrefixRef prefix_ref;
+	ClusterWalDurablePrefix prefix;
 } CheckpointV2Work;
+
+/* A readable record plus an in-memory flush LSN is not the durable promise.
+ * Consume the exact selected writer's current promise as a separate gate.
+ * Later group flushes may advance it while CF is held: do not mistake those
+ * for a root race, but never accept a regression or same-sequence divergence.
+ * Root still advertises only the checkpoint record verified below, not the
+ * unconsumed WAL between that checkpoint and a newer prefix end. */
+static ClusterControlRootResult
+checkpoint_v2_prefix_observe(CheckpointV2Work *work, const ControlFileData *control, XLogRecPtr end,
+							 uint32 crc)
+{
+	ClusterWalDurablePrefix fresh;
+	const ClusterWalDurablePrefix *previous = &work->prefix;
+	ClusterControlRootResult result
+		= cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &work->prefix_ref, &fresh);
+
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (fresh.exclusive_end < end)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (fresh.exclusive_end == end
+		&& (fresh.record_start != control->checkPoint || fresh.record_crc != crc))
+		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+	/* Even the first observation must not claim that a later final record
+	 * overlaps the checkpoint whose exact end was independently decoded. */
+	if (fresh.exclusive_end > end && fresh.record_start < end)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (previous->sequence != 0) {
+		if (fresh.sequence == previous->sequence) {
+			if (fresh.exclusive_end != previous->exclusive_end
+				|| fresh.record_start != previous->record_start
+				|| fresh.record_crc != previous->record_crc)
+				return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+		} else if (fresh.sequence < previous->sequence
+				   || fresh.exclusive_end <= previous->exclusive_end
+				   || fresh.record_start < previous->exclusive_end)
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	work->prefix = fresh;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
 
 static bool
 checkpoint_wal_owned(const struct stat *st, bool directory)
@@ -2384,6 +2428,11 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		|| cf->wal_log_hints != work->old_view.wal_log_hints
 		|| cf->track_commit_timestamp != work->old_view.track_commit_timestamp)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	work->prefix_ref.claim.identity = record->identity;
+	work->prefix_ref.claim.database_incarnation = work->base.header.v2.database_incarnation;
+	work->prefix_ref.claim.max_config_generation = work->base.header.v2.config_generation;
+	memcpy(work->prefix_ref.claim.claim_sha256, work->base.refs[index].claim_sha256, 32);
+	work->prefix_ref.timeline = record->checkpoint_tli;
 	make_read_token(&work->base, self->origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
 					&work->thread_token);
 	work->cf_mode = NoLock;
@@ -2432,6 +2481,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (walr_result != CLUSTER_WAL_PIN_OK)
 		return walr_result == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
 													: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = checkpoint_v2_prefix_observe(work, cf, end, crc);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	result = checkpoint_v2_wal_verify(work, self, cf, end, crc);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -2446,6 +2498,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (!file_token_equal(&work->before, &actual) || !checkpoint_v2_wal_paths_current(work, self)
 		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = checkpoint_v2_prefix_observe(work, cf, end, crc);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	result = cluster_recovery_anchor_v2_install(&work->stage);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -2480,6 +2535,9 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (!checkpoint_v2_wal_paths_current(work, self)
 		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = checkpoint_v2_prefix_observe(work, cf, end, crc);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	result = cluster_control_root_v2_read_thread_locked(self, &work->base, &work->new_view,
@@ -2492,7 +2550,7 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (!checkpoint_v2_wal_paths_current(work, self)
 		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	return checkpoint_v2_prefix_observe(work, cf, end, crc);
 }
 
 ClusterControlRootResult

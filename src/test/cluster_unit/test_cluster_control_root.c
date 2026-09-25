@@ -3977,6 +3977,19 @@ UT_TEST(test_v2_thread_view_requires_physical_selected_claim)
  */
 static XLogRecPtr test_checkpoint_end;
 static uint32 test_checkpoint_crc;
+static ClusterWalDurablePrefixRef test_checkpoint_prefix_ref;
+static ClusterWalDurablePrefix test_checkpoint_prefix;
+static char test_checkpoint_prefix_path[MAXPGPATH];
+
+static void
+v2_checkpoint_prefix_write(void)
+{
+	uint8 bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	UT_ASSERT_EQ(cluster_wal_durable_prefix_encode(&test_checkpoint_prefix_ref,
+												   &test_checkpoint_prefix, bytes),
+				 0);
+	write_all_or_abort(test_checkpoint_prefix_path, bytes, sizeof(bytes));
+}
 
 static void
 v2_checkpoint_wal_path(const ClusterControlRootIdentity *self, XLogRecPtr position, TimeLineID tli,
@@ -4075,6 +4088,10 @@ v2_checkpoint_wal_record(const ClusterControlRootIdentity *self, const ControlFi
 	}
 	test_checkpoint_end = MAXALIGN(position);
 	test_flush = test_checkpoint_end;
+	test_checkpoint_prefix
+		= (ClusterWalDurablePrefix){ 11, test_checkpoint_end, candidate->checkPoint,
+									 test_checkpoint_crc };
+	v2_checkpoint_prefix_write();
 }
 
 static void
@@ -4089,6 +4106,16 @@ v2_checkpoint_fixture(uint8 before[66048], ClusterControlRootIdentity *self,
 	v2_thread_fixture(before, anchors);
 	*self = anchors[0].identity;
 	UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(self, &root, candidate, &token), 0);
+	memset(&test_checkpoint_prefix_ref, 0, sizeof(test_checkpoint_prefix_ref));
+	test_checkpoint_prefix_ref.claim.identity = *self;
+	test_checkpoint_prefix_ref.claim.database_incarnation = root.header.v2.database_incarnation;
+	test_checkpoint_prefix_ref.claim.max_config_generation = root.header.v2.config_generation;
+	memcpy(test_checkpoint_prefix_ref.claim.claim_sha256, root.refs[0].claim_sha256, 32);
+	test_checkpoint_prefix_ref.timeline = candidate->checkPointCopy.ThisTimeLineID;
+	snprintf(dir, sizeof(dir), "%s/thread_%u/generation_" UINT64_FORMAT "/durable_prefix",
+			 cluster_wal_threads_dir, self->origin_thread_id, self->origin_owner_incarnation);
+	UT_ASSERT(mkdir(dir, 0700) == 0 || errno == EEXIST);
+	snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path), "%s/current", dir);
 	candidate->checkPoint += 8192;
 	candidate->checkPointCopy.redo += 8192;
 	candidate->time++;
@@ -4252,6 +4279,116 @@ UT_TEST(test_v2_checkpoint_requires_actual_wal_record)
 		UT_ASSERT(v2_zero(&out, sizeof(out)));
 		UT_ASSERT(v2_zero(&token, sizeof(token)));
 		v2_assert_primary_unchanged(before);
+		v2_assert_anchor_staging_empty();
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		UT_ASSERT_EQ(test_cf_mode, NoLock);
+	}
+}
+
+UT_TEST(test_v2_checkpoint_requires_exact_durable_prefix)
+{
+	for (int fault = 0; fault < 10; ++fault) {
+		uint8 before[66048], bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+		ClusterControlRootIdentity self;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootFileToken token;
+		ControlFileData candidate;
+		char moved[MAXPGPATH];
+		v2_checkpoint_fixture(before, &self, &candidate);
+		if (fault == 0)
+			UT_ASSERT_EQ(unlink(test_checkpoint_prefix_path), 0);
+		else if (fault == 1) {
+			read_all_or_abort(test_checkpoint_prefix_path, bytes, sizeof(bytes));
+			bytes[252] ^= 1;
+			write_all_or_abort(test_checkpoint_prefix_path, bytes, sizeof(bytes));
+		} else if (fault == 2) {
+			test_checkpoint_prefix_ref.timeline++;
+			v2_checkpoint_prefix_write();
+		} else if (fault == 3) {
+			test_checkpoint_prefix = (ClusterWalDurablePrefix){ 1, 0, 0, 0 };
+			v2_checkpoint_prefix_write();
+		} else if (fault == 4) {
+			test_checkpoint_prefix.exclusive_end -= 8;
+			v2_checkpoint_prefix_write();
+		} else if (fault == 5)
+			UT_ASSERT_EQ(truncate(test_checkpoint_prefix_path, 12), 0);
+		else if (fault == 6) {
+			snprintf(moved, sizeof(moved), "%s.moved", test_checkpoint_prefix_path);
+			UT_ASSERT_EQ(rename(test_checkpoint_prefix_path, moved), 0);
+			UT_ASSERT_EQ(symlink(moved, test_checkpoint_prefix_path), 0);
+		} else {
+			if (fault == 7)
+				test_checkpoint_prefix.record_crc ^= 1;
+			else if (fault == 8)
+				test_checkpoint_prefix.record_start += 8;
+			else
+				test_checkpoint_prefix.exclusive_end += 128;
+			v2_checkpoint_prefix_write();
+		}
+		UT_ASSERT(v2_checkpoint_publish(&self, &candidate, &out, &token) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+		v2_assert_primary_unchanged(before);
+		v2_assert_anchor_staging_empty();
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		UT_ASSERT_EQ(test_cf_mode, NoLock);
+		if (fault == 6) {
+			UT_ASSERT_EQ(unlink(test_checkpoint_prefix_path), 0);
+			UT_ASSERT_EQ(rename(moved, test_checkpoint_prefix_path), 0);
+		}
+	}
+}
+
+static int test_prefix_race;
+
+static void
+v2_checkpoint_prefix_race(void)
+{
+	test_checkpoint_x_hook = NULL;
+	if (test_prefix_race == 0)
+		test_checkpoint_prefix.sequence--;
+	else if (test_prefix_race == 1)
+		test_checkpoint_prefix.record_crc ^= 1;
+	else if (test_prefix_race == 2)
+		test_checkpoint_prefix.sequence++;
+	else if (test_prefix_race == 3) {
+		test_checkpoint_prefix.sequence++;
+		test_checkpoint_prefix.exclusive_end += 128;
+	} else if (test_prefix_race == 4) {
+		UT_ASSERT_EQ(unlink(test_checkpoint_prefix_path), 0);
+		return;
+	} else {
+		/* A checkpoint need not consume these later records: it must only
+		 * retain coverage of its own independently verified native record. */
+		test_checkpoint_prefix.sequence += 3;
+		test_checkpoint_prefix.record_start = test_checkpoint_prefix.exclusive_end + 16;
+		test_checkpoint_prefix.exclusive_end += 128;
+	}
+	v2_checkpoint_prefix_write();
+}
+
+UT_TEST(test_v2_checkpoint_rechecks_durable_prefix)
+{
+	for (int fault = 0; fault < 7; ++fault) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootFileToken token;
+		ControlFileData candidate;
+		v2_checkpoint_fixture(before, &self, &candidate);
+		test_prefix_race = fault;
+		test_checkpoint_x_hook = v2_checkpoint_prefix_race;
+		if (fault == 6) {
+			v2_checkpoint_prefix_race();
+			/* An already-ahead, nonoverlapping promise is legitimate too. */
+		}
+		if (fault >= 5) {
+			UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token), 0);
+			UT_ASSERT_EQ(out.validated_tail_lsn_exclusive, test_checkpoint_end);
+		} else {
+			UT_ASSERT(v2_checkpoint_publish(&self, &candidate, &out, &token) != 0);
+			UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+			v2_assert_primary_unchanged(before);
+		}
 		v2_assert_anchor_staging_empty();
 		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
 		UT_ASSERT_EQ(test_cf_mode, NoLock);
@@ -6077,7 +6214,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(108);
+	UT_PLAN(110);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -6143,6 +6280,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_thread_view_rejects_selected_foreign_or_inconsistent_anchor);
 	UT_RUN(test_v2_checkpoint_advances_one_thread_and_preserves_common);
 	UT_RUN(test_v2_checkpoint_requires_actual_wal_record);
+	UT_RUN(test_v2_checkpoint_requires_exact_durable_prefix);
+	UT_RUN(test_v2_checkpoint_rechecks_durable_prefix);
 	UT_RUN(test_v2_checkpoint_wal_continuation);
 	UT_RUN(test_v2_checkpoint_rejects_replaced_wal_directory);
 	UT_RUN(test_v2_checkpoint_rejects_replaced_wal_segment);
