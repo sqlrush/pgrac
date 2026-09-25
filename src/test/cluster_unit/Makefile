@@ -85,7 +85,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
-        test_cluster_wal_thread test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
+        test_cluster_wal_thread test_cluster_wal_durable_prefix test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
@@ -420,6 +420,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
+# PGRAC: link the real durable-prefix codec/reader, not a test copy.
+SIMPLE_TESTS := $(filter-out test_cluster_wal_durable_prefix,$(SIMPLE_TESTS))
 
 # The included production wait loop has disabled diagnostic probes.
 test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
@@ -5238,6 +5240,13 @@ test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
 # PGRAC: legacy routing helpers plus real v2 claim codec/filesystem reader.
 # Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_WAL_CLAIM_O = $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
+CLUSTER_WAL_DURABLE_PREFIX_O = $(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o
+test_cluster_wal_durable_prefix: test_cluster_wal_durable_prefix.c unit_test.h \
+		$(CLUSTER_WAL_DURABLE_PREFIX_O) $(top_srcdir)/src/include/cluster/cluster_wal_durable_prefix.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_DURABLE_PREFIX_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 test_cluster_wal_thread: test_cluster_wal_thread.c unit_test.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_WAL_CLAIM_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
