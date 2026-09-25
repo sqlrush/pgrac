@@ -382,6 +382,7 @@ transition_write_context(void *arg)
 #define FlushBuffer transition_production_flush
 #undef AbortBufferIO
 #define AbortBufferIO transition_production_abort
+#undef relpathperm
 #define relpathperm(locator, fork) ((char *)NULL)
 #define pfree(p) free(p)
 #define cluster_bufmgr_pcm_x_retained_image_locked(buf, state) false
