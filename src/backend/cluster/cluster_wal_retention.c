@@ -25,6 +25,7 @@
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster_control_root_private.h"
 #include "portability/instr_time.h"
 #include "storage/lock.h"
 #include "utils/memutils.h"
@@ -418,7 +419,7 @@ root_token_matches_identity(const ClusterControlRootReadToken *token,
 		   && token->source != 0 && token->lifecycle >= CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
 		   && token->lifecycle <= CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED && token->reserved20 == 0
 		   && token->reserved32 == 0 && token->file_txn_seq != 0 && token->root_publish_seq != 0
-		   && token->record_crc32c != 0 && (token->root_flags & required_flags) == required_flags
+		   && (token->root_flags & required_flags) == required_flags
 		   && (token->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) == 0;
 }
 
@@ -892,7 +893,7 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 		|| expected_root->lifecycle > CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED
 		|| expected_root->reserved20 != 0 || expected_root->reserved32 != 0
 		|| expected_root->root_lineage_seq == 0 || expected_root->file_txn_seq == 0
-		|| expected_root->root_publish_seq == 0 || expected_root->record_crc32c == 0
+		|| expected_root->root_publish_seq == 0
 		|| (expected_root->root_flags & ~CLUSTER_CONTROL_ROOT_FLAGS_V1) != 0)
 		return CLUSTER_WAL_PIN_INVALID;
 	thread_id = expected_root->origin_thread_id;
@@ -1453,6 +1454,67 @@ wal_reuse_open_target(const ClusterWalFileIdentity *file, const ClusterRecoveryD
 #endif
 }
 
+/* The physical leg already pins the exact current generation. Old writer
+ * directories remain wholly untouched: neither lifecycle nor a larger LSN
+ * in this generation retires history. Pins share the conservative thread WALR.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterWalReuseGuardResult
+wal_reuse_current_v2_root(const ClusterWalReuseGuardRequest *request, ClusterWalRootFold *fold,
+						  ClusterControlRootSnapshot *target_root,
+						  ClusterWalReuseDenyReason *out_reason)
+{
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult result;
+	ClusterWalRetentionInterval *interval;
+	XLogSegNo first, last;
+	uint32 flags = CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+				   | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+				   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID;
+
+	fold_unknown(fold);
+	memset(target_root, 0, sizeof(*target_root));
+	if (request->file.thread_id != 0
+		&& request->entry != CLUSTER_WAL_REUSE_E1_CHECKPOINT_RESTARTPOINT) {
+		*out_reason = CLUSTER_WAL_DENY_THREAD_SCOPE;
+		return CLUSTER_WAL_GUARD_BLOCKED;
+	}
+	result = cluster_control_root_v2_read_retention_current(&request->duty, target_root, &token);
+	if (!control_root_read_ready(result)) {
+		*out_reason = CLUSTER_WAL_DENY_ROOT_UNAVAILABLE;
+		return CLUSTER_WAL_GUARD_BLOCKED;
+	}
+	if (memcmp(&token, &request->root_read, sizeof(token)) != 0
+		|| memcmp(&target_root->identity, &request->duty, sizeof(request->duty)) != 0) {
+		*out_reason = CLUSTER_WAL_DENY_ROOT_STALE;
+		return CLUSTER_WAL_GUARD_BLOCKED;
+	}
+	if (target_root->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| (target_root->root_flags & flags) != flags || target_root->checkpoint_tli == 0
+		|| target_root->checkpoint_tli != target_root->tail_tli
+		|| target_root->checkpoint_lower_lsn == InvalidXLogRecPtr
+		|| target_root->validated_tail_lsn_exclusive <= target_root->checkpoint_lower_lsn) {
+		*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
+		return CLUSTER_WAL_GUARD_BLOCKED;
+	}
+	interval = &fold->intervals[0];
+	interval->thread_id = request->duty.origin_thread_id;
+	interval->tli = target_root->checkpoint_tli;
+	interval->start_lsn = target_root->checkpoint_lower_lsn;
+	interval->end_lsn = target_root->validated_tail_lsn_exclusive;
+	if (!cluster_wal_retention_interval_segment_bounds(interval, wal_segment_size, &first, &last)
+		|| (request->file.thread_id != 0
+			&& (request->file.tli != interval->tli || request->file.segno >= first))) {
+		fold_unknown(fold);
+		*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
+		return CLUSTER_WAL_GUARD_BLOCKED;
+	}
+	fold->result = CLUSTER_WAL_FOLD_BOUNDED;
+	fold->nintervals = 1;
+	fold->floor_by_thread[request->duty.origin_thread_id - 1] = first;
+	return CLUSTER_WAL_GUARD_OK;
+}
+
 static ClusterWalReuseGuardResult
 wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request, ClusterWalRootFold *fold,
 						  ClusterControlRootSnapshot *target_root,
@@ -1474,6 +1536,18 @@ wal_reuse_preflight_roots(const ClusterWalReuseGuardRequest *request, ClusterWal
 			   != CLUSTER_FORMATION_WITNESS_READY) {
 		*out_reason = CLUSTER_WAL_DENY_FORMATION_STALE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
+	}
+	if (cluster_shared_config) {
+		ClusterWalReuseGuardResult result
+			= wal_reuse_current_v2_root(request, fold, target_root, out_reason);
+		if (result == CLUSTER_WAL_GUARD_OK
+			&& cluster_formation_witness_revalidate_nowait(request->formation)
+				   != CLUSTER_FORMATION_WITNESS_READY) {
+			fold_unknown(fold);
+			*out_reason = CLUSTER_WAL_DENY_FORMATION_STALE;
+			return CLUSTER_WAL_GUARD_BLOCKED;
+		}
+		return result;
 	}
 	for (i = 0; i < CLUSTER_WAL_RETENTION_MAX_THREADS; i++) {
 		ClusterMembershipState state
@@ -1761,6 +1835,23 @@ wal_retention_e1_read_root(ClusterWalRetentionE1Context *context, bool discover_
 	ClusterControlRootSnapshot bootstrap;
 	ClusterControlRootResult result;
 
+	if (cluster_shared_config) {
+		ClusterWalDurablePrefixRef ref;
+		if (!cluster_wal_thread_current_v2_ref(&ref)
+			|| ref.claim.identity.origin_thread_id != context->thread_id)
+			return false;
+		identity = discover_identity ? ref.claim.identity : context->duty;
+		if (memcmp(&identity, &ref.claim.identity, sizeof(identity)) != 0)
+			return false;
+		result = cluster_control_root_v2_read_retention_current(&identity, out_snapshot, out_token);
+		if (!control_root_read_ready(result)
+			|| memcmp(&out_snapshot->identity, &identity, sizeof(identity)) != 0
+			|| !root_token_matches_identity(out_token, &identity))
+			return false;
+		context->duty = identity;
+		context->root_read = *out_token;
+		return true;
+	}
 	if (discover_identity) {
 		result = cluster_control_root_read_canonical(context->thread_id, NULL,
 													 CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,

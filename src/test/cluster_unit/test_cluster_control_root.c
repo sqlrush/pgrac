@@ -84,6 +84,9 @@ static bool test_checkpoint_mode;
 static uint64 test_self_incarnation;
 static uint64 test_epoch;
 static unsigned test_epoch_reads, test_change_epoch_read;
+static unsigned test_throw_epoch_read;
+static bool test_capture_error_level;
+static int test_last_error_level;
 static bool test_serving, test_fence, test_prebump, test_wal_validated;
 static ClusterMembershipState test_member_state;
 static XLogRecPtr test_flush;
@@ -108,7 +111,9 @@ cluster_epoch_get_current(void)
 {
 	if (!test_checkpoint_mode)
 		abort();
-	if (++test_epoch_reads == test_change_epoch_read)
+	if (++test_epoch_reads == test_throw_epoch_read)
+		pg_re_throw();
+	if (test_epoch_reads == test_change_epoch_read)
 		++test_epoch;
 	return test_epoch;
 }
@@ -334,6 +339,10 @@ errcode_for_file_access(void)
 bool
 errstart(int elevel, const char *domain pg_attribute_unused())
 {
+	if (test_capture_error_level && elevel >= ERROR) {
+		test_last_error_level = elevel;
+		pg_re_throw();
+	}
 	if (elevel >= ERROR)
 		abort();
 	return false;
@@ -362,8 +371,10 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 }
 
 bool
-errstart_cold(int elevel pg_attribute_unused(), const char *domain pg_attribute_unused())
+errstart_cold(int elevel, const char *domain)
 {
+	if (test_capture_error_level)
+		return errstart(elevel, domain);
 	return false;
 }
 
@@ -5121,6 +5132,195 @@ v2_runtime_fixture(uint8 bytes[66048], ClusterControlRootIdentity *self, Control
 	test_checkpoint_outer_cf = true;
 	MyAuxProcType = NotAnAuxProcess;
 	test_epoch_reads = test_change_epoch_read = 0;
+	test_throw_epoch_read = 0;
+}
+
+/* PGRAC: actual CF/root/config/claim/anchor retention reader, never a native
+ * projection fallback. Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_retention_fixture(uint8 bytes[66048], ClusterControlRootIdentity *self,
+					 ControlFileData *candidate)
+{
+	v2_runtime_fixture(bytes, self, candidate);
+	test_cf_mode = NoLock;
+	test_checkpoint_outer_cf = false;
+	test_actual_cf = NoLock;
+}
+
+UT_TEST(test_v2_retention_reader_owns_exact_live_thread_and_cf)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	int latch_calls;
+
+	v2_retention_fixture(bytes, &self, &candidate);
+	latch_calls = test_bit22_latch_apply_calls;
+	UT_ASSERT_EQ(cluster_control_root_v2_read_retention_current(&self, &out, &token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(memcmp(&out.identity, &self, sizeof(self)), 0);
+	UT_ASSERT_EQ(out.checkpoint_lower_lsn, candidate.checkPointCopy.redo - 8192);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(token.origin_thread_id, self.origin_thread_id);
+	UT_ASSERT_EQ(token.lifecycle, out.lifecycle);
+	UT_ASSERT(token.file_txn_seq != 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, 1);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, latch_calls);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_retention_refusals_clear_all_outputs)
+{
+	for (int fault = 0; fault < 12; ++fault) {
+		uint8 bytes[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+		char path[MAXPGPATH];
+		volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		volatile bool caught = false;
+
+		v2_retention_fixture(bytes, &self, &candidate);
+		switch (fault) {
+		case 0:
+			self.origin_owner_incarnation++;
+			break;
+		case 1:
+			test_member_state = CLUSTER_MEMBER_DEAD;
+			break;
+		case 2:
+			test_change_epoch_read = 3;
+			break;
+		case 3:
+			test_serving = false;
+			break;
+		case 4:
+			test_fence = false;
+			break;
+		case 5:
+			test_cf_clusterwide = false;
+			break;
+		case 6:
+			test_cf_release_confirmed = false;
+			break;
+		case 7:
+			v2_claim_path(&self, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+			break;
+		case 8:
+			test_checkpoint_outer_cf = true;
+			break;
+		case 9:
+			put_u32_le(bytes + 196, CLUSTER_CONTROL_ROOT_DATABASE_CLOSED);
+			break;
+		case 10:
+			put_u64_le(bytes + 232, 0);
+			break;
+		case 11:
+			bytes[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+			break;
+		}
+		if (fault >= 9) {
+			v2_checksums(bytes);
+			v2_write_roots(bytes);
+		}
+		memset(&out, 0x5a, sizeof(out));
+		memset(&token, 0x5a, sizeof(token));
+		test_capture_error_level = fault == 6;
+		test_last_error_level = 0;
+		PG_TRY();
+		{
+			result = cluster_control_root_v2_read_retention_current(&self, &out, &token);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		test_capture_error_level = false;
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				  && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		if (fault == 6) {
+			UT_ASSERT(caught);
+			UT_ASSERT_EQ(test_last_error_level, FATAL);
+			UT_ASSERT_EQ(test_actual_cf, ShareLock);
+		} else {
+			UT_ASSERT(!caught);
+			UT_ASSERT_EQ(test_actual_cf, NoLock);
+		}
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_v2_retention_exception_releases_owned_cf)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	volatile bool caught = false;
+
+	v2_retention_fixture(bytes, &self, &candidate);
+	test_throw_epoch_read = 3; /* Post-read revalidation, with CF-S owned. */
+	memset(&out, 0x5a, sizeof(out));
+	memset(&token, 0x5a, sizeof(token));
+	PG_TRY();
+	{
+		(void)cluster_control_root_v2_read_retention_current(&self, &out, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_epoch_read = 0;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_cf_lock_calls, 1);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_retention_exception_unconfirmed_release_is_fatal)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	volatile bool caught = false;
+
+	v2_retention_fixture(bytes, &self, &candidate);
+	test_throw_epoch_read = 3;
+	test_cf_release_confirmed = false;
+	test_capture_error_level = true;
+	test_last_error_level = 0;
+	PG_TRY();
+	{
+		(void)cluster_control_root_v2_read_retention_current(&self, &out, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_capture_error_level = false;
+	test_throw_epoch_read = 0;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_last_error_level, FATAL);
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_v2_runtime_native_reader_selects_own_thread)
@@ -6468,7 +6668,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(116);
+	UT_PLAN(120);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -6555,6 +6755,10 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_checkpoint_error_unwind_releases_owned_work);
 	UT_RUN(test_v2_thread_view_requires_physical_selected_claim);
 	UT_RUN(test_v2_runtime_native_reader_selects_own_thread);
+	UT_RUN(test_v2_retention_reader_owns_exact_live_thread_and_cf);
+	UT_RUN(test_v2_retention_refusals_clear_all_outputs);
+	UT_RUN(test_v2_retention_exception_releases_owned_cf);
+	UT_RUN(test_v2_retention_exception_unconfirmed_release_is_fatal);
 	UT_RUN(test_v2_runtime_reader_never_uses_projection_for_bad_facts);
 	UT_RUN(test_v2_runtime_native_inplace_identity_is_never_cleared);
 	UT_RUN(test_v2_view_requires_exact_config_object);

@@ -31,6 +31,7 @@
 #include "utils/resowner.h"
 
 #include "unit_test.h"
+#include "../../backend/cluster/cluster_control_root_private.h"
 
 UT_DEFINE_GLOBALS();
 
@@ -230,6 +231,8 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 									ClusterControlRootSnapshot *out_snapshot,
 									ClusterControlRootReadToken *out_token)
 {
+	if (cluster_shared_config)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (!fake_preflight_root_ready || origin_thread_id != 1)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
 	if (mode == CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE && expected_identity == NULL) {
@@ -243,6 +246,23 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	*out_snapshot = fake_preflight_root;
 	if (out_token != NULL)
 		*out_token = fake_preflight_token;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* The root reader's real filesystem/authority body is tested by the root
+ * suite. Here it is the explicit authority seam for the real retention .o. */
+ClusterControlRootResult
+cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity *self,
+											   ClusterControlRootSnapshot *out,
+											   ClusterControlRootReadToken *token)
+{
+	memset(out, 0, sizeof(*out));
+	memset(token, 0, sizeof(*token));
+	if (!fake_preflight_root_ready || !fake_root_current || self == NULL
+		|| memcmp(self, &fake_preflight_root.identity, sizeof(*self)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	*out = fake_preflight_root;
+	*token = fake_preflight_token;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -633,6 +653,28 @@ UT_TEST(test_v2_reuse_selects_exact_generation_not_flat_decoy)
 	v2_reuse_fixture_cleanup(&f);
 }
 
+UT_TEST(test_v2_e1_consumes_current_root_and_preserves_exact_floor)
+{
+	V2ReuseFixture f;
+	ClusterWalRetentionE1Context context = { 0 };
+	ClusterWalRootFoldResult fold;
+	ClusterWalReuseDenyReason reason;
+	XLogSegNo floor;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(fold, CLUSTER_WAL_FOLD_BOUNDED);
+	UT_ASSERT_EQ(floor, 4);
+	UT_ASSERT(context.coarse_walr.held);
+	if (context.coarse_walr.held)
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_release(&context, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+	cluster_wal_retention_e1_finish(&context);
+	UT_ASSERT_EQ(context.magic, 0);
+	v2_reuse_fixture_cleanup(&f);
+}
+
 UT_TEST(test_v2_reuse_missing_native_ref_cannot_fallback_flat)
 {
 	V2ReuseFixture f;
@@ -649,6 +691,96 @@ UT_TEST(test_v2_reuse_missing_native_ref_cannot_fallback_flat)
 	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_OBJECT_STALE);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_retention_zero_crc_is_not_absent_authority)
+{
+	V2ReuseFixture f;
+	ClusterWalRetentionE1Context context = { 0 };
+	ClusterWalRootFoldResult fold;
+	ClusterWalReuseDenyReason reason;
+	ClusterWalRootPublishGuard *publish = NULL;
+	XLogSegNo floor;
+
+	v2_reuse_fixture(&f);
+	fake_preflight_token.record_crc32c = 0;
+	UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_begin(&context, 1, &fold, &floor, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(floor, 4);
+	if (context.coarse_walr.held)
+		UT_ASSERT_EQ(cluster_wal_retention_e1_coarse_release(&context, &reason),
+					 CLUSTER_WALR_RELEASE_CONFIRMED);
+	cluster_wal_retention_e1_finish(&context);
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&fake_preflight_token, false, &publish),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publish), CLUSTER_WALR_RELEASE_CONFIRMED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose)
+{
+	for (int which = 0; which < 6; ++which) {
+		V2ReuseFixture f;
+		ClusterWalReuseActionGuard guard = { 0 };
+		ClusterWalReuseDenyReason reason;
+		ClusterWalTerminalOutcome outcome;
+		PgracExternalFenceNeedSetV1 *needs = NULL;
+		char extra[MAXPGPATH];
+
+		v2_reuse_fixture(&f);
+		if (which < 2) {
+			f.request.file.segno = which == 0 ? 4 : 9;
+			write_test_wal_segment(f.generation, 1, f.request.file.segno, extra, sizeof(extra));
+		} else if (which == 2)
+			f.request.entry = CLUSTER_WAL_REUSE_E2_APPLY_TIMELINE_SWITCH;
+		else if (which == 3)
+			f.request.root_read.file_txn_seq++;
+		else if (which == 4)
+			fake_preflight_root.validated_tail_lsn_exclusive
+				= fake_preflight_root.checkpoint_lower_lsn;
+		else
+			fake_preflight_root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+					 CLUSTER_WAL_GUARD_BLOCKED);
+		UT_ASSERT_EQ(reason, which == 2	  ? CLUSTER_WAL_DENY_THREAD_SCOPE
+							 : which == 3 ? CLUSTER_WAL_DENY_ROOT_STALE
+										  : CLUSTER_WAL_DENY_ROOT_REQUIRED);
+		UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+					 CLUSTER_WALR_RELEASE_NOT_HELD);
+		UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+		if (which < 2)
+			UT_ASSERT_EQ(unlink(extra), 0);
+		v2_reuse_fixture_cleanup(&f);
+	}
+}
+
+UT_TEST(test_v2_retention_revalidates_root_after_walr_x)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, NULL, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	fake_acquire_result_count = 1;
+	fake_acquire_results[0] = CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
+	fake_preflight_token.root_publish_seq++;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason),
+				 CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_STALE);
+	UT_ASSERT_FALSE(guard.walr.held);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
 	v2_reuse_fixture_cleanup(&f);
 }
 
@@ -2431,7 +2563,11 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(44);
+	UT_PLAN(48);
+	UT_RUN(test_v2_e1_consumes_current_root_and_preserves_exact_floor);
+	UT_RUN(test_v2_retention_zero_crc_is_not_absent_authority);
+	UT_RUN(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose);
+	UT_RUN(test_v2_retention_revalidates_root_after_walr_x);
 	UT_RUN(test_v2_reuse_selects_exact_generation_not_flat_decoy);
 	UT_RUN(test_v2_reuse_missing_native_ref_cannot_fallback_flat);
 	UT_RUN(test_v2_reuse_rejects_unproven_namespace_and_claim);

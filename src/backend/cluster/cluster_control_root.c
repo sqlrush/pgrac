@@ -1478,6 +1478,99 @@ release_cf(LOCKMODE mode, ClusterControlRootResult result)
 	return result;
 }
 
+/* PGRAC: a normal checkpoint may reclaim only its exact live writer's
+ * generation. Never upgrade this purpose into a recovery/history read.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity *self,
+											   ClusterControlRootSnapshot *out,
+											   ClusterControlRootReadToken *token)
+{
+	ControlRootImage *root;
+	ControlFileData thread;
+	ClusterControlRootIdentity expected;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootReadToken selected;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	volatile bool held = false;
+	uint64 epoch, incarnation;
+	uint32 index;
+
+	if (self != NULL)
+		expected = *self;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (token != NULL)
+		memset(token, 0, sizeof(*token));
+	if (self == NULL || out == NULL || token == NULL || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || expected.origin_node_id != cluster_node_id
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| expected.origin_thread_id != cluster_node_id + 1
+		|| expected.system_identifier != GetSystemIdentifier())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	epoch = cluster_epoch_get_current();
+	incarnation = cluster_qvotec_get_self_incarnation();
+	if (!runtime_v2_owner_current(epoch, incarnation)
+		|| expected.origin_owner_incarnation != incarnation)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	index = expected.origin_thread_id - 1;
+	root = palloc(sizeof(*root));
+	PG_TRY();
+	{
+		if (cluster_cf_lock(ShareLock)) {
+			held = true;
+			if (cluster_cf_held_is_clusterwide(ShareLock)) {
+				result = cluster_control_root_v2_read_thread_locked(&expected, root, &thread,
+																	&file_token);
+				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+					if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+						|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+						|| root->records[index].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+						|| (root->header.v2.serving[index / 64] & (UINT64_C(1) << (index % 64)))
+							   == 0)
+						result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+					else if (!runtime_v2_owner_current(epoch, incarnation))
+						result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+					else
+						make_read_token(root, expected.origin_thread_id,
+										CONTROL_ROOT_SOURCE_PRIMARY, &selected);
+				}
+			}
+			result = release_cf(ShareLock, result);
+			held = false;
+		}
+	}
+	PG_CATCH();
+	{
+		ClusterControlRootResult cleanup = CLUSTER_CONTROL_ROOT_IO_ERROR;
+
+		if (held)
+			cleanup = release_cf(ShareLock, cleanup);
+		pfree(root);
+		if (cleanup == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
+			elog(FATAL, "could not confirm control-root retention read-lock cleanup");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		*out = root->records[index];
+		*token = selected;
+	}
+	pfree(root);
+	/* E1 normally treats unavailable authority as retain-and-continue. An
+	 * unconfirmed CF release is not such a refusal: terminate this owner
+	 * instead of leaving a hidden hold that blocks every later checkpoint.
+	 * Keep this at the actual reader so no bool/guard adapter can erase it. */
+	if (result == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
+		elog(FATAL, "could not confirm control-root retention read-lock release");
+	return result;
+}
+
 ClusterControlRootResult
 cluster_control_root_read_canonical(uint16 origin_thread_id,
 									const ClusterControlRootIdentity *expected_identity,

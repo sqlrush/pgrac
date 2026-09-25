@@ -136,6 +136,17 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 extern ClusterControlRootResult
 cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out);
 
+/* PGRAC: normal current-writer checkpoint retention only. Owns CF-S and
+ * revalidates actual local runtime identity; does not read/retire historical
+ * writers or grant recovery/serving permission. Outputs clear on refusal;
+ * an unconfirmed owned CF release is FATAL, never a retain-and-continue result.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult
+cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity *self,
+											   ClusterControlRootSnapshot *out,
+											   ClusterControlRootReadToken *token);
+
 /* Backend-private compatibility output only. Caller just read the selected
  * thread from current root under its held CF-X. Never an authority writer.
  * Author: SqlRush <sqlrush@gmail.com>
