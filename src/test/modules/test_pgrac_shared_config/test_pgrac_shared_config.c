@@ -455,8 +455,10 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 	char shared[MAXPGPATH], wal[MAXPGPATH], undo[MAXPGPATH], suffix[MAXPGPATH], hex[65];
 	char config_bytes[8192];
 	size_t config_len;
+	size_t entry_count;
 	FILE *file;
 	char *mutation;
+	bool native_entry;
 	ClusterSharedConfigEntry entries[]
 		= { { -1, "cluster.controlfile_shared_authority", "on" },
 			{ -1, "cluster.enabled", "on" },
@@ -479,6 +481,9 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 	if (!superuser())
 		ereport(ERROR, (errmsg("test bootstrap fixture requires superuser")));
 	mutation = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	native_entry = strncmp(mutation, "entry-", 6) == 0;
+	if (native_entry)
+		mutation += 6;
 	bootstrap_test_path(shared, "shared");
 	bootstrap_test_path(wal, "wal");
 	bootstrap_test_path(undo, "undo");
@@ -548,7 +553,14 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 		entries[3].value = "7";
 	else if (strcmp(mutation, "recheck-pgdata") == 0)
 		entries[3].value = "8";
-	if (cluster_shared_config_encode(&config, entries, lengthof(entries), config_bytes,
+	entry_count = lengthof(entries);
+	if (native_entry) {
+		/* Actual LocalProcessControlFile precedes test-library registration.
+		 * Omit the test-only assign-hook entry from these initial inputs. */
+		memmove(&entries[3], &entries[4], (entry_count - 4) * sizeof(entries[0]));
+		entry_count--;
+	}
+	if (cluster_shared_config_encode(&config, entries, entry_count, config_bytes,
 									 sizeof(config_bytes), &config_len, header->v2.config_sha256)
 		!= 0)
 		ereport(ERROR, (errmsg("test bootstrap config encoding failed")));

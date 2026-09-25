@@ -523,6 +523,7 @@ static void CloseServerPorts(int status, Datum arg);
 static void unlink_external_pid_file(int status, Datum arg);
 static void getInstallationPaths(const char *argv0);
 static void checkControlFile(void);
+static void checkPostmasterGucCombinations(void);
 static Port *ConnCreate(int serverFd);
 static void ConnFree(Port *port);
 static void handle_pm_pmsignal_signal(SIGNAL_ARGS);
@@ -1241,26 +1242,28 @@ PostmasterMain(int argc, char *argv[])
 	/* Verify that DataDir looks reasonable */
 	checkDataDir();
 
-	/* Check that pg_control exists */
-	checkControlFile();
+	/* PGRAC: a new-profile compatibility projection is neither an input nor
+	 * a prerequisite for the exact root reader. Even opening a FIFO here can
+	 * block that reader. Ordinary startup retains its native presence check. */
+#ifdef USE_PGRAC_CLUSTER
+	process_cluster_gucs();
+	if (!cluster_shared_config)
+#endif
+		checkControlFile();
 
 	/* And switch working directory into it */
 	ChangeToDataDir();
 
 	/*
-	 * Check for invalid combinations of GUC settings.
+	 * PGRAC: preserve ordinary startup's check order. The new shared profile
+	 * must instead check effective common+instance settings after root-bound
+	 * application, before loading modules or sizing shared memory.
+	 * Author: SqlRush <sqlrush@gmail.com>
 	 */
-	if (SuperuserReservedConnections + ReservedConnections >= MaxConnections) {
-		write_stderr("%s: superuser_reserved_connections (%d) plus reserved_connections (%d) must "
-					 "be less than max_connections (%d)\n",
-					 progname, SuperuserReservedConnections, ReservedConnections, MaxConnections);
-		ExitPostmaster(1);
-	}
-	if (XLogArchiveMode > ARCHIVE_MODE_OFF && wal_level == WAL_LEVEL_MINIMAL)
-		ereport(ERROR, (errmsg("WAL archival cannot be enabled when wal_level is \"minimal\"")));
-	if (max_wal_senders > 0 && wal_level == WAL_LEVEL_MINIMAL)
-		ereport(ERROR, (errmsg("WAL streaming (max_wal_senders > 0) requires wal_level \"replica\" "
-							   "or \"logical\"")));
+#ifdef USE_PGRAC_CLUSTER
+	if (!cluster_shared_config)
+#endif
+		checkPostmasterGucCombinations();
 
 	/*
 	 * Other one-time internal sanity checks can go here, if they are fast.
@@ -1321,6 +1324,11 @@ PostmasterMain(int argc, char *argv[])
 	 * repeat the test.
 	 */
 	LocalProcessControlFile(false);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+		checkPostmasterGucCombinations();
+#endif
 
 	/*
 	 * Register the apply launcher.  It's probably a good idea to call this
@@ -1957,6 +1965,23 @@ checkControlFile(void)
 		ExitPostmaster(2);
 	}
 	FreeFile(fp);
+}
+
+/* PGRAC: unchanged native rules, also used after shared settings application. */
+static void
+checkPostmasterGucCombinations(void)
+{
+	if (SuperuserReservedConnections + ReservedConnections >= MaxConnections) {
+		write_stderr("%s: superuser_reserved_connections (%d) plus reserved_connections (%d) must "
+					 "be less than max_connections (%d)\n",
+					 progname, SuperuserReservedConnections, ReservedConnections, MaxConnections);
+		ExitPostmaster(1);
+	}
+	if (XLogArchiveMode > ARCHIVE_MODE_OFF && wal_level == WAL_LEVEL_MINIMAL)
+		ereport(ERROR, (errmsg("WAL archival cannot be enabled when wal_level is \"minimal\"")));
+	if (max_wal_senders > 0 && wal_level == WAL_LEVEL_MINIMAL)
+		ereport(ERROR, (errmsg("WAL streaming (max_wal_senders > 0) requires wal_level \"replica\" "
+							   "or \"logical\"")));
 }
 
 /*

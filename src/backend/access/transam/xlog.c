@@ -219,6 +219,7 @@
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_startup_phase.h"
 #include "../../cluster/cluster_control_root_private.h"
+#include "../../cluster/cluster_control_bootstrap_private.h"
 #endif
 
 extern uint32 bootstrap_data_checksum_version;
@@ -5325,15 +5326,25 @@ LocalProcessControlFile(bool reset)
 #ifdef USE_PGRAC_CLUSTER
 	/*
 	 * PGRAC: decide the control authority before reading a compatibility
-	 * projection.  Runtime CF/GES is unavailable before shmem sizing; until
-	 * the root-bound bootstrap reader is connected, refuse this profile here.
+	 * projection. Runtime CF/GES is unavailable before shmem sizing. Only the
+	 * initial postmaster may prepare process-local state from the exact root;
+	 * the later startup/admission guard remains mandatory and unchanged.
 	 * Author: SqlRush <sqlrush@gmail.com>
 	 */
 	process_cluster_gucs();
-	if (cluster_shared_config)
-		ereport(FATAL, (errmsg("PRE2 shared-control startup is not yet available"),
-						errhint("Shared configuration requires the root-bound startup path; the "
-								"local control projection is not an authority.")));
+	if (cluster_shared_config) {
+		ClusterControlBootstrapPrepared prepared;
+
+		if (reset || !IsPostmasterEnvironment || IsUnderPostmaster || IsBootstrapProcessingMode()
+			|| process_shared_preload_libraries_done)
+			ereport(FATAL, (errmsg("PRE2 shared-control startup is not yet available"),
+							errhint("This entry requires its qualified root-bound startup path; "
+									"the local control projection is not an authority.")));
+		cluster_control_bootstrap_prepare(DataDir, cluster_shared_data_dir, cluster_wal_threads_dir,
+										  cluster_undo_tablespace_path, (uint32)cluster_node_id,
+										  false, &prepared);
+		return; /* Never replace root-selected control with the projection. */
+	}
 #endif
 	Assert(reset || ControlFile == NULL);
 	ControlFile = palloc(sizeof(ControlFileData));

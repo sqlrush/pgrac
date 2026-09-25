@@ -41,7 +41,7 @@ print {$fh} $bytes;
 close($fh) or die "close test control: $!";
 ok(!$bad->start(fail_ok => 1), 'incomplete shared profile refuses startup');
 like(slurp_file($bad->logfile),
-	qr/PRE2 shared-control startup is not yet available/,
+	qr/invalid native bootstrap preparation input/,
 	'profile is bound before reading the corrupt non-authoritative projection');
 unlike(slurp_file($bad->logfile), qr/incorrect checksum in control file/,
 	'legacy projection is not consulted for PRE2 sizing');

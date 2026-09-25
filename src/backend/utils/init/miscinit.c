@@ -411,8 +411,9 @@ SetDatabasePath(const char *path)
 /*
  * PGRAC: native startup must not bypass an independently retained PRE2 binding
  * merely because shared_config was omitted, damaged, or compiled out.  This
- * intermediate guard stays until root-bound startup is implemented; existence
- * protects even a corrupt marker.  No decode, authority inference or writes.
+ * guard protects even a corrupt marker. The initial postmaster's explicit new
+ * profile may continue only to the mandatory exact bootstrap reader, not to
+ * admission. No decode, authority inference or writes occur in this guard.
  * Unlike destructive frontend tools, legacy pg_control symlinks/root names
  * alone are not rejected here.  Normal PRE1 startup remains supported.
  */
@@ -446,7 +447,15 @@ check_pgrac_control_binding(void)
 	if (len < 0 || len >= sizeof(path))
 		ereport(FATAL, (errcode(ERRCODE_NAME_TOO_LONG),
 						errmsg("PGRAC_CONTROL_BINDING_UNKNOWN: data directory path is too long")));
-	if (lstat(path, &st) == 0)
+	if (lstat(path, &st) == 0) {
+#ifdef USE_PGRAC_CLUSTER
+		if (IsPostmasterEnvironment && !IsUnderPostmaster && !IsBootstrapProcessingMode()
+			&& !process_shared_preload_libraries_done) {
+			process_cluster_gucs();
+			if (cluster_shared_config)
+				return; /* Routing only: missing/corrupt inputs still fail in the reader. */
+		}
+#endif
 		ereport(
 			FATAL,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -454,6 +463,7 @@ check_pgrac_control_binding(void)
 			 errdetail("PGRAC_CONTROL_BINDING_REQUIRED: the data directory has a PRE2 binding."),
 			 errhint("Use a qualified root-bound startup adapter; disabling cluster settings "
 					 "does not make the compatibility control file authoritative.")));
+	}
 	if (errno != ENOENT)
 		ereport(FATAL,
 				(errcode_for_file_access(),
