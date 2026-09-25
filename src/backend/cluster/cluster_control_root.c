@@ -1663,6 +1663,115 @@ cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity 
 	return result;
 }
 
+/* PGRAC: recovery owners may inspect a failed peer, not only their own live
+ * writer. Select and authenticate the v2 root/config/claim/anchor under one
+ * owned CF-S interval. This mints an observation, never serving permission,
+ * isolation proof, a retention pin or permission to finish recovery.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_identity,
+				  ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token)
+{
+	ControlRootImage *root;
+	ControlFileData thread;
+	ClusterControlRootIdentity expected;
+	ClusterControlRootFileToken discovered, file_token;
+	ClusterControlRootReadToken selected;
+	ClusterControlRootResult result;
+	volatile bool held = false;
+	uint8 storage_uuid[16];
+	uint64 system_identifier;
+	uint32 index;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (token != NULL)
+		memset(token, 0, sizeof(*token));
+	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
+		|| thread_id == 0 || thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!current_storage_uuid(storage_uuid))
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	system_identifier = GetSystemIdentifier();
+	if (system_identifier == 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (expected_identity != NULL) {
+		expected = *expected_identity;
+		if (expected.origin_thread_id != thread_id
+			|| expected.system_identifier != system_identifier
+			|| memcmp(expected.storage_uuid, storage_uuid, 16) != 0)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	}
+	result = storage_contract_check(storage_uuid, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	index = thread_id - 1;
+	root = palloc(sizeof(*root));
+	result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	PG_TRY();
+	{
+		if (cluster_cf_lock(ShareLock)) {
+			held = true;
+			if (cluster_cf_held_is_clusterwide(ShareLock)) {
+				if (expected_identity == NULL) {
+					result = cluster_control_root_v2_read_control_locked(
+						storage_uuid, system_identifier, root, &thread, &discovered);
+					if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+						|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+						if (!root->present[index])
+							result = CLUSTER_CONTROL_ROOT_ABSENT;
+						else
+							expected = root->records[index].identity;
+					}
+				} else
+					result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+					result = cluster_control_root_v2_read_thread_locked(&expected, root, &thread,
+																		&file_token);
+					if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+						|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+						if (expected_identity == NULL
+							&& memcmp(&discovered, &file_token, sizeof(file_token)) != 0)
+							result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+						else
+							make_read_token(root, thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+											&selected);
+					}
+				}
+			}
+			result = release_cf(ShareLock, result);
+			held = false;
+		}
+	}
+	PG_CATCH();
+	{
+		ClusterControlRootResult cleanup = CLUSTER_CONTROL_ROOT_IO_ERROR;
+
+		if (held)
+			cleanup = release_cf(ShareLock, cleanup);
+		pfree(root);
+		if (cleanup == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
+			elog(FATAL, "could not confirm canonical control-root read-lock cleanup");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		if (out != NULL)
+			*out = root->records[index];
+		if (token != NULL)
+			*token = selected;
+	}
+	pfree(root);
+	if (result == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
+		elog(FATAL, "could not confirm canonical control-root read-lock release");
+	return result;
+}
+
 ClusterControlRootResult
 cluster_control_root_read_canonical(uint16 origin_thread_id,
 									const ClusterControlRootIdentity *expected_identity,
@@ -1688,6 +1797,11 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 			&& mode != CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE)
 		|| (strong && expected_identity == NULL))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_shared_config) {
+		if (!strong)
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		return read_canonical_v2(origin_thread_id, expected_identity, out_snapshot, out_token);
+	}
 	if (expected_identity != NULL)
 		memcpy(expected_storage, expected_identity->storage_uuid, 16);
 	result = storage_contract_check(expected_identity != NULL ? expected_storage : NULL, strong);
@@ -1764,6 +1878,10 @@ cluster_control_root_read_canonical_discovered(uint16 origin_thread_id,
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
+	/* PRE2 discovery is inside the same owned CF interval as the exact
+	 * object reads, never a legacy lock-free bootstrap permission. */
+	if (cluster_shared_config)
+		return read_canonical_v2(origin_thread_id, NULL, out_snapshot, out_token);
 	memset(&bootstrap, 0, sizeof(bootstrap));
 	result = cluster_control_root_read_canonical(
 		origin_thread_id, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE, &bootstrap, NULL);
@@ -1800,7 +1918,10 @@ cluster_control_root_read_canonical_dead_origin(uint16 origin_thread_id,
 
 	if (out_snapshot != NULL)
 		memset(out_snapshot, 0, sizeof(*out_snapshot));
-	if (origin_thread_id == 0 || origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+	/* A failed PRE2 writer does not freeze the shared root: the recovery
+	 * owner and other threads may still publish it. No lock-free fallback. */
+	if (cluster_shared_config || origin_thread_id == 0
+		|| origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = storage_contract_check(NULL, false);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -1846,6 +1967,21 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
 	if (old_node_id < 0 || old_node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	thread_id = (uint16)(old_node_id + 1);
+	if (cluster_shared_config) {
+		result = read_canonical_v2(thread_id, NULL, &snapshot, &token);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+			if (snapshot.identity.origin_node_id != old_node_id)
+				return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			if (out_identity != NULL)
+				*out_identity = snapshot.identity;
+			if (out_snapshot != NULL)
+				*out_snapshot = snapshot;
+			if (out_token != NULL)
+				*out_token = token;
+		}
+		return result;
+	}
 	result = storage_contract_check(NULL, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;

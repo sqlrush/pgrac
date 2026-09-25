@@ -104,6 +104,7 @@ static bool test_projection_sync_fault, test_projection_observe;
 static unsigned test_projection_syncs;
 static LOCKMODE test_actual_cf;
 static unsigned test_history_sync_count, test_history_fail_sync;
+static bool test_throw_root_read;
 
 void
 pg_re_throw(void)
@@ -338,6 +339,8 @@ ExceptionalCondition(const char *conditionName, const char *fileName, int lineNu
 int
 OpenTransientFile(const char *fileName, int fileFlags)
 {
+	if (test_throw_root_read && test_actual_cf == ShareLock)
+		pg_re_throw();
 	return open(fileName, fileFlags, 0600);
 }
 
@@ -819,6 +822,7 @@ wipe_root_files(void)
 	test_stop_share_hook = NULL;
 	test_stop_share_call = 0;
 	test_fence_after_primary = test_release_after_primary = false;
+	test_throw_root_read = false;
 }
 
 static void
@@ -5667,6 +5671,231 @@ v2_retention_fixture(uint8 bytes[66048], ClusterControlRootIdentity *self,
 	test_actual_cf = NoLock;
 }
 
+/* PGRAC: existing recovery owners use these public canonical readers, not
+ * the own-writer checkpoint accessor. Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_v2_canonical_strong_reads_recovery_required_peer)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	int latch_calls;
+	v2_retention_fixture(bytes, &self, &candidate);
+	bytes[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	put_u64_le(bytes + 232, 0); /* No serving claim for this failed origin. */
+	v2_checksums(bytes);
+	v2_write_roots(bytes);
+	cluster_node_id = 1; /* Observer is not the failed origin. */
+	latch_calls = test_bit22_latch_apply_calls;
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+					 self.origin_thread_id, &self, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+	UT_ASSERT_EQ(memcmp(&out.identity, &self, sizeof(self)), 0);
+	UT_ASSERT_EQ(token.lifecycle, out.lifecycle);
+	UT_ASSERT_EQ(token.origin_thread_id, self.origin_thread_id);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_bit22_latch_apply_calls, latch_calls);
+	v2_assert_primary_unchanged(bytes);
+	cluster_shared_config = false;
+	cluster_node_id = 0;
+}
+
+UT_TEST(test_v2_canonical_discovery_lookup_and_revalidate)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self, discovered;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out, lookup;
+	ClusterControlRootReadToken token, looked_up;
+	v2_retention_fixture(bytes, &self, &candidate);
+	UT_ASSERT_EQ(
+		cluster_control_root_read_canonical_discovered(self.origin_thread_id, &out, &token), 0);
+	UT_ASSERT_EQ(cluster_control_root_lookup_owner_by_node_runtime(self.origin_node_id, &discovered,
+																   &lookup, &looked_up),
+				 0);
+	UT_ASSERT_EQ(memcmp(&discovered, &self, sizeof(self)), 0);
+	UT_ASSERT_EQ(memcmp(&out, &lookup, sizeof(out)), 0);
+	UT_ASSERT_EQ(memcmp(&token, &looked_up, sizeof(token)), 0);
+	UT_ASSERT_EQ(cluster_control_root_revalidate(&token, &self, &lookup), 0);
+	/* Another publisher changes the whole-root sequence; same thread bytes
+	 * are not permission to keep consuming the previous token. */
+	put_u64_le(bytes + 16, token.file_txn_seq + 1);
+	v2_checksums(bytes);
+	v2_write_roots(bytes);
+	UT_ASSERT_EQ(cluster_control_root_revalidate(&token, &self, &lookup),
+				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(v2_zero(&lookup, sizeof(lookup)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_canonical_no_missing_claim_or_lockfree_fallback)
+{
+	uint8 bytes[66048];
+	char path[MAXPGPATH];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	v2_retention_fixture(bytes, &self, &candidate);
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, NULL,
+													 CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,
+													 &out, &token),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_control_root_read_canonical_dead_origin(self.origin_thread_id, &out),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	v2_claim_path(&self, path);
+	UT_ASSERT_EQ(unlink(path), 0);
+	memset(&out, 0x5a, sizeof(out));
+	memset(&token, 0x5a, sizeof(token));
+	UT_ASSERT_NE(cluster_control_root_read_canonical(
+					 self.origin_thread_id, &self, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_canonical_unconfirmed_release_is_fatal)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	static ClusterControlRootSnapshot out;
+	static ClusterControlRootReadToken token;
+	volatile bool caught = false;
+	v2_retention_fixture(bytes, &self, &candidate);
+	test_cf_release_confirmed = false;
+	test_capture_error_level = true;
+	test_last_error_level = 0;
+	PG_TRY();
+	{
+		(void)cluster_control_root_read_canonical(self.origin_thread_id, &self,
+												  CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_capture_error_level = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_last_error_level, FATAL);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_canonical_foreign_absent_and_cf_refusals)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self, foreign;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+	int i;
+
+	for (i = 0; i < 5; i++) {
+		v2_retention_fixture(bytes, &self, &candidate);
+		foreign = self;
+		if (i == 0)
+			foreign.origin_owner_incarnation++;
+		else if (i == 1)
+			test_cf_grant = false;
+		else if (i == 2)
+			test_cf_clusterwide = false;
+		else if (i == 3) {
+			test_checkpoint_outer_cf = true;
+			test_cf_mode = ShareLock;
+			test_actual_cf = ShareLock;
+		}
+		memset(&out, 0x5a, sizeof(out));
+		memset(&token, 0x5a, sizeof(token));
+		if (i == 4)
+			UT_ASSERT_EQ(cluster_control_root_read_canonical_discovered(2, &out, &token),
+						 CLUSTER_CONTROL_ROOT_ABSENT);
+		else
+			UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, &foreign,
+															 CLUSTER_CONTROL_ROOT_READ_STRONG, &out,
+															 &token),
+						 i == 0 ? CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH
+								: CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		UT_ASSERT_EQ(test_actual_cf, i == 3 ? ShareLock : NoLock);
+		if (i == 3)
+			UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		v2_assert_primary_unchanged(bytes);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_v2_canonical_error_releases_owned_lock)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	static ClusterControlRootSnapshot out;
+	static ClusterControlRootReadToken token;
+	volatile bool caught = false;
+	v2_retention_fixture(bytes, &self, &candidate);
+	test_throw_root_read = true;
+	PG_TRY();
+	{
+		(void)cluster_control_root_read_canonical(self.origin_thread_id, &self,
+												  CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_root_read = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_canonical_error_unconfirmed_cleanup_is_fatal)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	static ClusterControlRootSnapshot out;
+	static ClusterControlRootReadToken token;
+	volatile bool caught = false;
+
+	v2_retention_fixture(bytes, &self, &candidate);
+	test_throw_root_read = true;
+	test_cf_release_confirmed = false;
+	test_capture_error_level = true;
+	test_last_error_level = 0;
+	PG_TRY();
+	{
+		(void)cluster_control_root_read_canonical_discovered(self.origin_thread_id, &out, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_root_read = false;
+	test_capture_error_level = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(test_last_error_level, FATAL);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_v2_retention_reader_owns_exact_live_thread_and_cf)
 {
 	uint8 bytes[66048];
@@ -7647,7 +7876,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(144);
+	UT_PLAN(151);
 	UT_RUN(test_history_encoder_matches_literal_empty_and_full);
 	UT_RUN(test_history_encoder_rejects_invalid_records_without_partial_output);
 	UT_RUN(test_history_stage_installs_exact_readable_object);
@@ -7764,6 +7993,13 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_retention_refusals_clear_all_outputs);
 	UT_RUN(test_v2_retention_exception_releases_owned_cf);
 	UT_RUN(test_v2_retention_exception_unconfirmed_release_is_fatal);
+	UT_RUN(test_v2_canonical_strong_reads_recovery_required_peer);
+	UT_RUN(test_v2_canonical_discovery_lookup_and_revalidate);
+	UT_RUN(test_v2_canonical_no_missing_claim_or_lockfree_fallback);
+	UT_RUN(test_v2_canonical_unconfirmed_release_is_fatal);
+	UT_RUN(test_v2_canonical_foreign_absent_and_cf_refusals);
+	UT_RUN(test_v2_canonical_error_releases_owned_lock);
+	UT_RUN(test_v2_canonical_error_unconfirmed_cleanup_is_fatal);
 	UT_RUN(test_v2_runtime_reader_never_uses_projection_for_bad_facts);
 	UT_RUN(test_v2_runtime_native_inplace_identity_is_never_cleared);
 	UT_RUN(test_v2_view_requires_exact_config_object);
