@@ -148,7 +148,8 @@ static ClusterPcmOwnResult cluster_bufmgr_pcm_own_finish_x_to_s_downgrade(
 	BufferDesc *buf, const ClusterPcmOwnSnapshot *expected_revoking,
 	ClusterPcmOwnSnapshot *out_shared);
 
-/* Process-local dynamic scope for the exact retain-finish FlushBuffer call. */
+/* Process-local dynamic scope for GCS copy/retain-finish FlushBuffer calls.
+ * Only retain-finish arms the separate fault-injection selector. */
 static bool cluster_pcm_x_finish_retain_flush_active = false;
 #ifdef ENABLE_INJECTION
 static bool cluster_pcm_x_finish_retain_flush_fault_active = false;
@@ -6432,6 +6433,22 @@ InvalidateBufferTry(BufferDesc *buf)
 		return false;			/* foreign pin — caller parks / fail-closes */
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a GCS discard cannot retire DATA/checkpoint work merely because
+	 * WAL is durable. Recheck at the last mapping+header-locked point; dirt
+	 * can arrive after the wrapper staged N. Native relation DROP is separate.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config && cluster_bufmgr_in_gcs_drop
+		&& (buf_state
+			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_IO_IN_PROGRESS))
+			   != 0) {
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(oldPartitionLock);
+		return false;
+	}
+#endif
+
 	return InvalidateBufferCommitLocked(buf, &oldTag, oldHash, oldPartitionLock, buf_state);
 }
 
@@ -9001,7 +9018,7 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 		return;
 
 #ifdef USE_PGRAC_CLUSTER
-	/* The retain-finish caller catches and absorbs this ERROR at the DATA
+	/* The GCS copy/retain-finish caller catches this ERROR at the DATA
 	 * worker boundary.  Remember the exact ResourceOwner-tracked BufferIO so
 	 * that caller can abort it before releasing its raw pin.  Ordinary
 	 * FlushBuffer errors keep PostgreSQL's transaction-abort cleanup. */
@@ -12850,6 +12867,7 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	Page page;
 	volatile bool content_locked = false;
 	volatile bool caller_pinned = false;
+	volatile bool flush_owned = false;
 
 	if (out_refusal != NULL)
 		*out_refusal = CLUSTER_BUFMGR_GCS_COPY_REFUSAL_NONE;
@@ -12995,8 +13013,16 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 				/* A queue handoff may retire this descriptor immediately after
 			 * copying it.  Make the shared-storage fallback at least as current
 			 * as the shipped image before publishing that handoff watermark. */
-				if (needs_flush)
+				if (needs_flush) {
+					Assert(!cluster_pcm_x_finish_retain_flush_active);
+					Assert(!cluster_pcm_x_finish_retain_flush_io_active);
+					Assert(!cluster_pcm_x_finish_retain_flush_error_context_pushed);
+					flush_owned = true;
+					cluster_pcm_x_finish_retain_flush_active = true;
 					FlushBuffer(buf, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+					cluster_pcm_x_finish_retain_flush_active = false;
+					flush_owned = false;
+				}
 
 				buf_state = LockBufHdr(buf);
 				storage_current = BufferTagsEqual(&buf->tag, &tag)
@@ -13055,8 +13081,25 @@ cluster_bufmgr_copy_block_for_gcs(BufferTag tag, XLogRecPtr *out_page_lsn, char 
 	}
 	PG_CATCH();
 	{
-		if (content_locked && LWLockHeldByMe(content_lock))
+		/* IC workers can absorb this ERROR without transaction abort. Only
+		 * StartBufferIO's exact successful registration belongs to us; a
+		 * failure while waiting on another writer must not abort its I/O. */
+		if (flush_owned) {
+			cluster_pcm_x_finish_retain_flush_active = false;
+			if (cluster_pcm_x_finish_retain_flush_error_context_pushed) {
+				error_context_stack = cluster_pcm_x_finish_retain_flush_error_context_previous;
+				cluster_pcm_x_finish_retain_flush_error_context_pushed = false;
+				cluster_pcm_x_finish_retain_flush_error_context_previous = NULL;
+			}
+		}
+		if (content_locked && LWLockHeldByMe(content_lock)) {
+			HOLD_INTERRUPTS();
 			LWLockRelease(content_lock);
+		}
+		if (flush_owned && cluster_pcm_x_finish_retain_flush_io_active) {
+			cluster_pcm_x_finish_retain_flush_io_active = false;
+			AbortBufferIO(BufferDescriptorGetBuffer(buf));
+		}
 		if (caller_pinned)
 			cluster_bufmgr_unpin_for_gcs(buf);
 		PG_RE_THROW();
@@ -14620,6 +14663,24 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 	}
 	was_dirty = (buf_state & BM_DIRTY) != 0;
 
+	/* PGRAC: the existing source-copy owner pins, conditionally locks, flushes
+	 * and revalidates the exact current image. Reuse it only to discharge
+	 * DATA work; its scratch bytes never grant authority or replace a reply.
+	 * Always retry the owned directive after releasing the pin, even if the
+	 * write succeeded. A later pass performs the actual discard independently.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config
+		&& (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0) {
+		PGIOAlignedBlock scratch;
+		XLogRecPtr written_lsn = InvalidXLogRecPtr;
+
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
+
 	/*
 	 * PGRAC: spec-2.41 D3 — read page_lsn AND pd_block_scn under content_lock
 	 * SHARED, not the buffer-header spinlock.  The page-header CONTENTS
@@ -14692,6 +14753,14 @@ cluster_bufmgr_invalidate_block_for_gcs(BufferTag tag, PcmLockMode expected_mode
 
 	saved_pcm_state = buf->pcm_state;
 	staged_gen = cluster_pcm_own_gen_get(buf->buf_id);	/* PGRAC W2 */
+	/* PGRAC: preserve fresh dirt/IO work before staging N or a RAM PI. */
+	if (cluster_shared_config
+		&& (buf_state
+			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_IO_IN_PROGRESS))
+			   != 0) {
+		UnlockBufHdr(buf, buf_state);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
+	}
 	buf->pcm_state = (uint8) PCM_STATE_N;
 
 	/* PGRAC: spec-6.12h D-h1 — keep a Past Image instead of dropping. */
@@ -14914,6 +14983,13 @@ cluster_bufmgr_convert_to_pi_locked(BufferDesc *buf, uint32 buf_state)
 {
 	if (!cluster_past_image)
 		return false;			/* wave off: caller drops as today */
+	/* PGRAC: a RAM PI cannot replace an outstanding DATA sync obligation.
+	 * Keep the caller's header lock and all flags on refusal. */
+	if (cluster_shared_config
+		&& (buf_state
+			& (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED | BM_IO_ERROR | BM_IO_IN_PROGRESS))
+			   != 0)
+		return false;
 	if (BUF_STATE_GET_REFCOUNT(buf_state) != 0)
 	{
 		/* Pinned: fail-safe fallback to the plain drop (single lock-free
@@ -15103,6 +15179,19 @@ cluster_bufmgr_drop_block_for_gcs_no_wire(BufferTag tag, XLogRecPtr expected_lsn
 		Page		page = (Page) BufHdrGetBlock(buf);
 
 		page_lsn = PageGetLSN(page);
+	}
+	/* PGRAC: a live-SGE copy need not have written DATA. Complete that work
+	 * through the existing exact source owner, then force a fresh ship/drop
+	 * attempt. Do not turn this scratch copy into a successful handoff. */
+	if (cluster_shared_config
+		&& (buf_state & (BM_DIRTY | BM_JUST_DIRTIED | BM_CHECKPOINT_NEEDED)) != 0) {
+		PGIOAlignedBlock scratch;
+		XLogRecPtr written_lsn = InvalidXLogRecPtr;
+
+		UnlockBufHdr(buf, buf_state);
+		LWLockRelease(partition_lock);
+		(void)cluster_bufmgr_copy_block_for_gcs(tag, &written_lsn, scratch.data, NULL);
+		return CLUSTER_BUFMGR_GCS_DROP_PINNED;
 	}
 
 	/*

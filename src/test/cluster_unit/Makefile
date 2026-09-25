@@ -2522,6 +2522,8 @@ clean distclean maintainer-clean:
 		test_cluster_heap_vm_delete.inc test_cluster_heap_vm_pretoast.inc \
 		test_cluster_pcm_snapshot_owner.inc \
 		test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_gcs_drop.inc \
+		test_cluster_pcm_flush_owner.inc \
 		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_preassert_owner.inc test_cluster_pcm_preassert_consumer.inc \
 		test_cluster_pcm_pending_consumer.inc \
@@ -3069,6 +3071,26 @@ test_cluster_pcm_source_finish_consumer.inc: $(top_srcdir)/src/backend/cluster/c
 	     END { if (found != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# PGRAC: real bounded discard/PI owners, not copies of their decisions.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_pcm_flush_owner.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^FlushBuffer\(/ { print "static void"; emit=1; flush++ } \
+	     /^StartBufferIO\(/ { print "static bool"; emit=1; start++ } \
+	     /^TerminateBufferIO\(/ { print "static void"; emit=1; finish++ } \
+	     /^AbortBufferIO\(/ { print "static void"; emit=1; abort_io++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (flush != 1 || start != 1 || finish != 1 || abort_io != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_pcm_gcs_drop.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^InvalidateBufferTry\(/ { print "static bool"; emit=1; bounded++ } \
+	     /^cluster_bufmgr_convert_to_pi_locked\(/ { print "static bool"; emit=1; pi++ } \
+	     /^cluster_bufmgr_invalidate_block_for_gcs\(/ { print "ClusterBufmgrGcsDropResult"; emit=1; invalidate++ } \
+	     /^cluster_bufmgr_drop_block_for_gcs_no_wire\(/ { print "ClusterBufmgrGcsDropResult"; emit=1; drop++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (bounded != 1 || pi != 1 || invalidate != 1 || drop != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_pcm_source_finish_tick.inc: $(top_srcdir)/src/backend/cluster/cluster_gcs_block.c Makefile
 	awk '/^cluster_gcs_block_resource_x_source_finish_tick\(/ { print "ResourceXApplyResult"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } \
@@ -3160,6 +3182,8 @@ test_cluster_bufmgr_stop: test_cluster_bufmgr_stop.c unit_test.h \
 
 test_cluster_pcm_own: test_cluster_pcm_own.c unit_test.h \
 		test_cluster_pcm_snapshot_owner.inc test_cluster_pcm_transition_owner.inc \
+		test_cluster_pcm_flush_owner.inc \
+		test_cluster_pcm_gcs_drop.inc \
 		test_cluster_pcm_barrier_proof.inc \
 		test_cluster_pcm_eviction_owner.inc test_cluster_pcm_clock_sweep.inc \
 		test_cluster_pcm_source_finish_consumer.inc \
