@@ -7,8 +7,10 @@
 #include "catalog/pg_authid_d.h"
 #include "cluster/cluster_shared_config.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
+#include "utils/resowner.h"
 
 #define POLICY_COMMON 1
 #define POLICY_INSTANCE 2
@@ -123,7 +125,7 @@ policy_uuid_valid(const char *value)
 }
 
 static ClusterControlRootResult
-policy_check(const ClusterSharedConfigEntry *entry, bool online_change,
+policy_check(const ClusterSharedConfigEntry *entry, bool online_change, bool native_check,
 			 ClusterSharedConfigPolicyReport *report)
 {
 	struct config_generic *record;
@@ -193,13 +195,16 @@ policy_check(const ClusterSharedConfigEntry *entry, bool online_change,
 	 * is not proof of a simultaneously applicable new deployment profile.
 	 * No raw FDs/CF lock are owned here. ERROR from a hook propagates normally.
 	 */
-	if (set_config_option_ext(entry->name, entry->value, PGC_POSTMASTER, PGC_S_FILE,
-							  BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, false, DEBUG1, false)
-		!= -1)
+	if (native_check
+		&& set_config_option_ext(entry->name, entry->value, PGC_POSTMASTER, PGC_S_FILE,
+								 BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, false, DEBUG1, false)
+			   != -1)
 		return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_VALUE);
 	if (strcmp(entry->name, "cluster.node_id") == 0) {
 		int node_id;
-		if (!parse_int(entry->value, &node_id, 0, NULL) || node_id != entry->node_id)
+		if (!parse_int(entry->value, &node_id, 0, NULL))
+			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_VALUE);
+		if (node_id != entry->node_id)
 			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_SCOPE);
 	}
 	++report->checked_entries;
@@ -217,19 +222,21 @@ cluster_shared_config_check_entry(const ClusterSharedConfigEntry *entry, bool on
 	if (report == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	policy_clear(report);
-	return policy_check(entry, online_change, report);
+	return policy_check(entry, online_change, true, report);
 }
 
 typedef struct ConfigPolicyContext {
 	ClusterSharedConfigPolicyReport *report;
 	const ClusterSharedConfigRef *ref;
+	bool native_check;
 } ConfigPolicyContext;
 
 static ClusterControlRootResult
 policy_visit(const ClusterSharedConfigEntry *entry, void *arg)
 {
 	ConfigPolicyContext *context = arg;
-	ClusterControlRootResult result = policy_check(entry, false, context->report);
+	ClusterControlRootResult result
+		= policy_check(entry, false, context->native_check, context->report);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (strcmp(entry->name, "cluster.shared_storage_uuid") == 0) {
@@ -255,7 +262,7 @@ cluster_shared_config_check_gucs(const char *bytes, size_t len, const ClusterSha
 								 ClusterSharedConfigPolicyReport *report)
 {
 	ClusterControlRootResult result;
-	ConfigPolicyContext context = { report, ref };
+	ConfigPolicyContext context = { report, ref, true };
 	if (report == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	policy_clear(report);
@@ -282,4 +289,134 @@ cluster_shared_config_prepare_gucs(const char *shared_root, const char *bytes, s
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	return cluster_shared_config_prepare(shared_root, bytes, len, ref, operation_uuid, out);
+}
+
+typedef struct ConfigApplyContext {
+	int node_id;
+	uint32 applied;
+	bool apply;
+} ConfigApplyContext;
+
+/* Native assignment hooks need not be reversible. A partial startup may exit,
+ * but must not return a usable configuration or a receipt to an admission path.
+ * No values are copied into these diagnostics.
+ */
+static void
+startup_config_refuse(const char *message, const ClusterSharedConfigPolicyReport *report)
+{
+	ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE), errmsg_internal("%s", message),
+					errdetail("Configuration reason=%d node=%d parameter=%s.", report->reason,
+							  report->node_id, report->name)));
+}
+
+static ClusterControlRootResult
+startup_config_visit(const ClusterSharedConfigEntry *entry, void *arg)
+{
+	ConfigApplyContext *context = arg;
+	struct config_generic *record;
+	ClusterSharedConfigPolicyReport report;
+	if (entry->node_id != CLUSTER_SHARED_CONFIG_COMMON && entry->node_id != context->node_id)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	policy_clear(&report);
+	record = find_option(entry->name, false, true, DEBUG1);
+	if (record == NULL) {
+		policy_refuse(&report, entry, CLUSTER_CONFIG_POLICY_UNKNOWN);
+		startup_config_refuse("shared configuration assignment failed", &report);
+	}
+	if (!context->apply) {
+		if (record->source > PGC_S_FILE || record->reset_source > PGC_S_FILE) {
+			policy_refuse(&report, entry, CLUSTER_CONFIG_POLICY_CONTEXT);
+			startup_config_refuse("shared configuration conflicts with a higher-priority source",
+								  &report);
+		}
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (set_config_option_ext(entry->name, entry->value, PGC_POSTMASTER, PGC_S_FILE,
+							  BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, true, DEBUG1, false)
+			!= 1
+		|| record->source != PGC_S_FILE || record->reset_source != PGC_S_FILE
+		|| (record->status & GUC_PENDING_RESTART)) {
+		policy_refuse(&report, entry, CLUSTER_CONFIG_POLICY_VALUE);
+		startup_config_refuse("shared configuration assignment failed", &report);
+	}
+	++context->applied;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static void
+startup_config_release(ResourceOwner owner, ResourceOwner saved_owner, bool success)
+{
+	bool top_level = saved_owner == NULL;
+	/* A parentless startup owner is not a subtransaction and is not the
+	 * TopTransactionResourceOwner. There are no database locks to transfer.
+	 */
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_BEFORE_LOCKS, success, top_level);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_LOCKS, success, top_level);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, success, top_level);
+	CurrentResourceOwner = saved_owner;
+	ResourceOwnerDelete(owner);
+}
+
+void
+cluster_shared_config_apply_startup(const char *bytes, size_t len,
+									const ClusterSharedConfigRef *ref, int node_id,
+									ClusterSharedConfigApplied *out)
+{
+	ClusterSharedConfigPolicyReport report;
+	ConfigPolicyContext policy = { &report, ref, false };
+	ConfigApplyContext context = { node_id, 0, false };
+	ResourceOwner saved_owner = CurrentResourceOwner;
+	ResourceOwner owner;
+	MemoryContext saved_context = CurrentMemoryContext;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (IsUnderPostmaster || IsBootstrapProcessingMode() || process_shared_preload_libraries_done)
+		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("shared configuration application requires early startup")));
+	policy_clear(&report);
+	if (out == NULL || ref == NULL)
+		startup_config_refuse("shared configuration object is not applicable", &report);
+	if (node_id < 0 || node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| !(ref->identity.configured[node_id / 64] & (UINT64CONST(1) << (node_id % 64))))
+		startup_config_refuse("shared configuration node is not configured", &report);
+
+	/* OpenSSL-backed PG hashing requires a resource owner even before shmem or
+	 * a transaction exists. Own it here, not in a test-only startup environment.
+	 */
+	owner = ResourceOwnerCreate(saved_owner, "shared configuration startup");
+	CurrentResourceOwner = owner;
+	PG_TRY();
+	{
+		if (cluster_shared_config_visit(bytes, len, ref, policy_visit, &policy)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			startup_config_refuse("shared configuration object is not applicable", &report);
+		/* Reject priority conflicts for every selected entry before assignments. */
+		if (cluster_shared_config_visit(bytes, len, ref, startup_config_visit, &context)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			startup_config_refuse("shared configuration object is not applicable", &report);
+		context.apply = true;
+		if (cluster_shared_config_visit(bytes, len, ref, startup_config_visit, &context)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			startup_config_refuse("shared configuration assignment failed", &report);
+		/* Recheck native hooks against the applied common context, including
+		 * other nodes' entries. A successful local subset is not a valid image.
+		 */
+		if (cluster_shared_config_check_gucs(bytes, len, ref, &report)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			startup_config_refuse("shared configuration native validation failed", &report);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(saved_context);
+		FlushErrorState();
+		startup_config_release(owner, saved_owner, false);
+		ereport(FATAL, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("shared configuration startup callback failed")));
+	}
+	PG_END_TRY();
+	startup_config_release(owner, saved_owner, true);
+	out->ref = *ref;
+	out->node_id = node_id;
+	out->applied_entries = context.applied;
 }

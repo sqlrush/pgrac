@@ -11,5 +11,5 @@ test_install_data += files(
 tests += {
   'name': 'test_pgrac_shared_config',
   'sd': meson.current_source_dir(), 'bd': meson.current_build_dir(),
-  'tap': {'tests': ['t/001_policy.pl', 't/002_early_startup.pl']},
+  'tap': {'tests': ['t/001_policy.pl', 't/002_early_startup.pl', 't/003_startup_apply.pl']},
 }

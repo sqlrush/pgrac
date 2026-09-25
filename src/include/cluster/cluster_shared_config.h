@@ -117,6 +117,23 @@ extern ClusterControlRootResult
 cluster_shared_config_check_gucs(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
 								 ClusterSharedConfigPolicyReport *report);
 
+/* PGRAC: process-local receipt, not a shared ACK or serving permission.
+ * Caller must supply the root-selected reference and independently bound node,
+ * then revalidate root/profile/recovery minima before admission. Startup only;
+ * any refusal is FATAL because native assign hooks are not reversible. The
+ * receipt stays zero until the whole application succeeds. Inputs/output must
+ * not alias. Does not authorize an online reload or a backend SQL apply.
+ */
+typedef struct ClusterSharedConfigApplied {
+	ClusterSharedConfigRef ref;
+	uint32 node_id;
+	uint32 applied_entries;
+} ClusterSharedConfigApplied;
+StaticAssertDecl(sizeof(ClusterSharedConfigApplied) == 112, "config application receipt");
+extern void cluster_shared_config_apply_startup(const char *bytes, size_t len,
+												const ClusterSharedConfigRef *ref, int node_id,
+												ClusterSharedConfigApplied *out);
+
 /* PGRAC: publisher-owned memory, not persistent/wire/shared-memory state.
  * Prepare does not publish. Install borrows CF-X, held by the same caller
  * through root CAS. Discard never removes formal objects. No GUC policy or

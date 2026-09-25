@@ -12,3 +12,7 @@ CREATE FUNCTION test_pgrac_config_registration()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_registration'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_registration() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_backend_apply()
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_backend_apply'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_backend_apply() FROM PUBLIC;
