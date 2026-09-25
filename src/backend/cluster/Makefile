@@ -53,6 +53,7 @@ OBJS = \
 	cluster_shared_config_guc.o \
 	cluster_control_root.o \
 	cluster_wal_history.o \
+	cluster_wal_tail.o \
 	cluster_control_bootstrap.o \
 	cluster_control_bootstrap_read.o \
 	cluster_control_bootstrap_native.o \

@@ -195,6 +195,15 @@ thread_wal_reader_make(uint16 dead_tid, ThreadWalReadPrivate **priv_out)
 
 	*priv_out = NULL;
 
+	/* PGRAC: PRE2 requires the root-selected generation, source timeline and
+	 * durable promise. A thread number/local timeline is not that identity.
+	 * The recovery owner uses cluster_wal_tail_observe for exact physical
+	 * input and must separately retain its fencing/serial/retention authority.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config)
+		return NULL;
+
 	/* dead_tid must name a real thread slot. */
 	if (dead_tid < 1 || dead_tid > CLUSTER_WAL_STATE_SLOT_COUNT)
 		return NULL;
