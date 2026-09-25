@@ -53,4 +53,31 @@ extern ClusterControlRootResult
 cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 								 ClusterControlBootstrapSnapshot *out);
 
+struct ControlRootImage;
+/* Allocation-free binding check shared by the byte composer and collector. */
+extern ClusterControlRootResult
+cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
+									 const struct ControlRootImage *root);
+
+typedef struct ClusterControlBootstrapObservation {
+	ClusterControlBootstrapSnapshot snapshot;
+	char *config_bytes;
+	size_t config_len;
+} ClusterControlBootstrapObservation;
+
+/*
+ * One read-only provisional observation, never a lock/admission token. Uses
+ * independently configured absolute paths and node, and the retained binding.
+ * No .bak/projection fallback, retry, mutation or GUC application. All raw FDs
+ * close before composition uses the caller's memory/hash resource owner.
+ * Successful config_bytes is palloc-owned by the caller; free it before reusing
+ * out. Every refusal clears out. Paths and out must not overlap. Earlier path
+ * ancestors are trusted deployment paths; final roots and descendants are
+ * no-follow, owned and not writable by group/other. Requires later real CF/root
+ * revalidation, physical qualification and complete startup/admission gates.
+ */
+extern ClusterControlRootResult
+cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, const char *wal_root,
+							   uint32 node_id, ClusterControlBootstrapObservation *out);
+
 #endif /* CLUSTER_CONTROL_BOOTSTRAP_PRIVATE_H */

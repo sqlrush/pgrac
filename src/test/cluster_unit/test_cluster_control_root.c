@@ -4590,6 +4590,433 @@ UT_TEST(test_bootstrap_prepared_observation_is_not_open)
 	}
 }
 
+/* PGRAC: real filesystem collection, with syscall-timed mutation only.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static char bootstrap_local[MAXPGPATH];
+static int bootstrap_race;
+static int bootstrap_root_opens;
+static int bootstrap_close_calls;
+static int bootstrap_close_fail_at;
+static uint8 bootstrap_replacement[66048];
+static uint8 bootstrap_binding_replacement[256];
+
+int unit_bootstrap_openat(int dir, const char *name, int flags, ...);
+int unit_bootstrap_close(int fd);
+
+int
+unit_bootstrap_close(int fd)
+{
+	int result = close(fd);
+
+	if (++bootstrap_close_calls == bootstrap_close_fail_at) {
+		errno = EIO;
+		return -1;
+	}
+	return result;
+}
+
+int
+unit_bootstrap_openat(int dir, const char *name, int flags, ...)
+{
+	char primary[MAXPGPATH], staging[MAXPGPATH], binding[MAXPGPATH];
+	bool root_open = strcmp(name, "pgrac_control_root") == 0;
+	bool missing_object = bootstrap_race == 2 && strstr(name, ".bin") != NULL;
+
+	if (root_open)
+		bootstrap_root_opens++;
+	if ((root_open && bootstrap_root_opens == 2 && bootstrap_race != 0) || missing_object) {
+		path_for(primary, sizeof(primary), CLUSTER_CONTROL_ROOT_REL_PATH);
+		path_for(staging, sizeof(staging), "global/bootstrap-test-new-root");
+		if (bootstrap_race == 6) {
+			path_for(primary, sizeof(primary), "global");
+			path_for(staging, sizeof(staging), "global.bootstrap-saved");
+			if (rename(primary, staging) != 0 || mkdir(primary, 0700) != 0)
+				abort();
+		} else if (bootstrap_race == 5) {
+			snprintf(binding, sizeof(binding), "%s/global/%s", bootstrap_local,
+					 PGRAC_CONTROL_BINDING_NAME);
+			write_all_or_abort(binding, bootstrap_binding_replacement, 256);
+		} else {
+			write_all_or_abort(staging, bootstrap_replacement, 66048);
+			if (rename(staging, primary) != 0)
+				abort();
+		}
+		bootstrap_race = 0;
+		if (missing_object) {
+			/* Retiring an old object after publishing a new root is real I/O. */
+			if (unlinkat(dir, name, 0) != 0)
+				abort();
+		}
+	}
+	return openat(dir, name, flags);
+}
+
+static void
+bootstrap_read_fixture(BootstrapFixture *f, int node)
+{
+	char path[MAXPGPATH];
+
+	bootstrap_race = bootstrap_root_opens = 0;
+	bootstrap_close_calls = bootstrap_close_fail_at = 0;
+	bootstrap_fixture(f, node);
+	if (bootstrap_local[0] == '\0') {
+		strlcpy(bootstrap_local, "/tmp/pgrac-bootstrap-local.XXXXXX", sizeof(bootstrap_local));
+		if (mkdtemp(bootstrap_local) == NULL)
+			abort();
+		snprintf(path, sizeof(path), "%s/global", bootstrap_local);
+		if (mkdir(path, 0700) != 0)
+			abort();
+	}
+	snprintf(path, sizeof(path), "%s/global/%s", bootstrap_local, PGRAC_CONTROL_BINDING_NAME);
+	write_all_or_abort(path, f->binding, sizeof(f->binding));
+}
+
+static void
+bootstrap_selected_path(const BootstrapFixture *f, int object, char path[MAXPGPATH])
+{
+	char hex[65];
+	ControlRootImage root;
+	uint32 node = f->input.node_id;
+
+	if (cluster_control_root_v2_decode(f->before, sizeof(f->before), v2_storage, TEST_SYSID, &root))
+		abort();
+	switch (object) {
+	case 0:
+		bootstrap_hex(root.header.v2.control_image_sha256, hex);
+		snprintf(path, MAXPGPATH, "%s/global/control_images/53-%s.bin", test_root, hex);
+		break;
+	case 1:
+		bootstrap_hex(root.header.v2.config_sha256, hex);
+		snprintf(path, MAXPGPATH, "%s/global/config_images/47-%s.conf", test_root, hex);
+		break;
+	case 2:
+		v2_claim_path(&f->local_anchor.identity, path);
+		break;
+	case 3:
+		bootstrap_hex(root.refs[node].anchor_sha256, hex);
+		snprintf(path, MAXPGPATH,
+				 "%s/global/anchor_images/thread_%u/generation_" UINT64_FORMAT
+				 "/anchor_" UINT64_FORMAT "-%s.bin",
+				 test_root, f->local_anchor.identity.origin_thread_id,
+				 f->local_anchor.identity.origin_owner_incarnation,
+				 f->local_anchor.anchor_generation, hex);
+		break;
+	case 4:
+		path_for(path, MAXPGPATH, CLUSTER_CONTROL_ROOT_REL_PATH);
+		break;
+	case 5:
+		snprintf(path, MAXPGPATH, "%s/global/%s", bootstrap_local, PGRAC_CONTROL_BINDING_NAME);
+		break;
+	default:
+		abort();
+	}
+}
+
+static ClusterControlRootResult
+bootstrap_read_refused(uint32 node)
+{
+	ClusterControlBootstrapObservation out;
+	ClusterControlRootResult result;
+
+	memset(&out, 0xa5, sizeof(out));
+	result = cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, node, &out);
+	UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && out.config_bytes != NULL)
+		pfree(out.config_bytes);
+	return result;
+}
+
+UT_TEST(test_bootstrap_read_exact_files_and_owned_config)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapObservation out;
+
+	for (int node = 0; node <= 127; node += 127) {
+		ClusterControlRootResult result;
+
+		bootstrap_read_fixture(&f, node);
+		result
+			= cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, node, &out);
+		UT_ASSERT_EQ(result, 0);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || out.config_bytes == NULL)
+			continue;
+		UT_ASSERT_EQ(out.snapshot.thread.origin_thread_id, node + 1);
+		UT_ASSERT_EQ(out.snapshot.control.checkPoint, f.local_anchor.checkpoint);
+		UT_ASSERT_EQ(out.snapshot.control.MaxConnections, 300);
+		UT_ASSERT_EQ(out.config_len, f.input.config.len);
+		UT_ASSERT(memcmp(out.config_bytes, f.config, out.config_len) == 0);
+		UT_ASSERT_EQ(out.config_bytes[out.config_len], '\0');
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		UT_ASSERT_EQ(test_durable_rename_calls, 0);
+		UT_ASSERT_EQ(bootstrap_root_opens, 2);
+		v2_assert_primary_unchanged(f.before);
+		pfree(out.config_bytes);
+	}
+}
+
+UT_TEST(test_bootstrap_read_requires_independent_binding_and_node)
+{
+	BootstrapFixture f;
+	char path[MAXPGPATH];
+
+	bootstrap_read_fixture(&f, 0);
+	bootstrap_selected_path(&f, 5, path);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
+	UT_ASSERT_EQ(bootstrap_root_opens, 0);
+	bootstrap_read_fixture(&f, 0);
+	UT_ASSERT_EQ(bootstrap_read_refused(127), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT_EQ(bootstrap_root_opens, 0);
+	UT_ASSERT_EQ(bootstrap_read_refused(128), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+}
+
+UT_TEST(test_bootstrap_read_never_falls_back_to_valid_bak)
+{
+	BootstrapFixture f;
+	char path[MAXPGPATH];
+
+	for (int fault = 0; fault < 3; fault++) {
+		bootstrap_read_fixture(&f, 0);
+		bootstrap_selected_path(&f, 4, path);
+		if (fault == 0)
+			UT_ASSERT_EQ(unlink(path), 0);
+		else {
+			if (fault == 1)
+				f.before[200] ^= 1;
+			else {
+				put_u16_le(f.before + 4, 1);
+				v2_checksums(f.before);
+			}
+			write_all_or_abort(path, f.before, sizeof(f.before));
+		}
+		UT_ASSERT_EQ(bootstrap_read_refused(0), fault == 0	 ? CLUSTER_CONTROL_ROOT_ABSENT
+												: fault == 1 ? CLUSTER_CONTROL_ROOT_BAD_HEADER_CRC
+															 : CLUSTER_CONTROL_ROOT_BAD_VERSION);
+	}
+}
+
+UT_TEST(test_bootstrap_read_rejects_every_bad_selected_file)
+{
+	BootstrapFixture f;
+	char path[MAXPGPATH];
+	uint8 bytes[66049];
+	struct stat st;
+
+	for (int object = 0; object < 6; object++)
+		for (int fault = 0; fault < 4; fault++) {
+			bootstrap_read_fixture(&f, 0);
+			bootstrap_selected_path(&f, object, path);
+			UT_ASSERT_EQ(stat(path, &st), 0);
+			read_all_or_abort(path, bytes, st.st_size);
+			if (fault == 0)
+				UT_ASSERT_EQ(unlink(path), 0);
+			else if (fault == 1) {
+				bytes[20] ^= 1;
+				write_all_or_abort(path, bytes, st.st_size);
+			} else if (fault == 2)
+				UT_ASSERT_EQ(truncate(path, st.st_size - 1), 0);
+			else {
+				bytes[st.st_size] = 0;
+				write_all_or_abort(path, bytes, st.st_size + 1);
+			}
+			bootstrap_read_refused(0);
+		}
+}
+
+UT_TEST(test_bootstrap_read_unsafe_leaves_do_not_block_or_leak)
+{
+	BootstrapFixture f;
+	char path[MAXPGPATH], saved[MAXPGPATH];
+	int open_before = 0, open_after = 0;
+
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			open_before++;
+	for (int object = 0; object < 6; object++)
+		for (int fault = 0; fault < 3; fault++) {
+			bootstrap_read_fixture(&f, 0);
+			bootstrap_selected_path(&f, object, path);
+			if (fault == 0)
+				UT_ASSERT_EQ(chmod(path, 0666), 0);
+			else {
+				snprintf(saved, sizeof(saved), "%s.saved", path);
+				UT_ASSERT_EQ(rename(path, saved), 0);
+				if (fault == 1)
+					UT_ASSERT_EQ(symlink(saved, path), 0);
+				else
+					UT_ASSERT_EQ(mkfifo(path, 0600), 0);
+			}
+			bootstrap_read_refused(0);
+			if (fault == 0)
+				UT_ASSERT_EQ(chmod(path, 0600), 0);
+			else {
+				UT_ASSERT_EQ(unlink(path), 0);
+				UT_ASSERT_EQ(rename(saved, path), 0);
+			}
+		}
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			open_after++;
+	UT_ASSERT_EQ(open_after, open_before);
+}
+
+UT_TEST(test_bootstrap_read_unsafe_directories_are_refused)
+{
+	BootstrapFixture f;
+	char path[MAXPGPATH], saved[MAXPGPATH];
+
+	for (int component = 0; component < 9; component++)
+		for (int fault = 0; fault < 2; fault++) {
+			bootstrap_read_fixture(&f, 0);
+			switch (component) {
+			case 0:
+				strlcpy(path, test_root, sizeof(path));
+				break;
+			case 1:
+				path_for(path, sizeof(path), "global");
+				break;
+			case 2:
+				path_for(path, sizeof(path), "global/control_images");
+				break;
+			case 3:
+				path_for(path, sizeof(path), "global/config_images");
+				break;
+			case 4:
+				path_for(path, sizeof(path), "global/anchor_images");
+				break;
+			case 5:
+				path_for(path, sizeof(path), "global/anchor_images/thread_1");
+				break;
+			case 6:
+				path_for(path, sizeof(path), "global/anchor_images/thread_1/generation_99");
+				break;
+			case 7:
+				strlcpy(path, test_wal_root, sizeof(path));
+				break;
+			case 8:
+				snprintf(path, sizeof(path), "%s/thread_1/generation_99", test_wal_root);
+				break;
+			}
+			if (fault == 0)
+				UT_ASSERT_EQ(chmod(path, 0777), 0);
+			else {
+				snprintf(saved, sizeof(saved), "%s.saved", path);
+				UT_ASSERT_EQ(rename(path, saved), 0);
+				UT_ASSERT_EQ(symlink(saved, path), 0);
+			}
+			bootstrap_read_refused(0);
+			if (fault == 0)
+				UT_ASSERT_EQ(chmod(path, 0700), 0);
+			else {
+				UT_ASSERT_EQ(unlink(path), 0);
+				UT_ASSERT_EQ(rename(saved, path), 0);
+			}
+		}
+}
+
+UT_TEST(test_bootstrap_read_real_root_replacement_and_binding_races)
+{
+	BootstrapFixture f;
+	PgracControlBinding binding;
+
+	for (int race = 1; race <= 5; race++) {
+		bootstrap_read_fixture(&f, 0);
+		memcpy(bootstrap_replacement, f.before, sizeof(f.before));
+		put_u64_le(bootstrap_replacement + 16, 8);
+		if (race == 3)
+			put_u32_le(bootstrap_replacement + 196,
+					   CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED);
+		else if (race == 4)
+			put_u64_le(bootstrap_replacement + 200, 42);
+		v2_checksums(bootstrap_replacement);
+		UT_ASSERT(pgrac_control_binding_decode(f.binding, sizeof(f.binding), &binding));
+		binding.target_qualification_sha256[0] ^= 1;
+		UT_ASSERT(pgrac_control_binding_encode(&binding, bootstrap_binding_replacement, 256));
+		bootstrap_race = race;
+		UT_ASSERT_EQ(bootstrap_read_refused(0), race == 3 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID
+												: race == 4 || race == 5
+													? CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH
+													: CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT_EQ(bootstrap_race, 0);
+		UT_ASSERT_EQ(bootstrap_root_opens, 2);
+	}
+}
+
+UT_TEST(test_bootstrap_read_invalid_paths_outputs_and_alias)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapObservation out;
+	const char *bad[] = { NULL, "", ".", "/", "/tmp/", "/tmp//x", "/tmp/./x", "/tmp/../x" };
+
+	bootstrap_read_fixture(&f, 0);
+	for (int i = 0; i < lengthof(bad); i++)
+		for (int field = 0; field < 3; field++) {
+			const char *paths[3] = { bootstrap_local, test_root, test_wal_root };
+			paths[field] = bad[i];
+			memset(&out, 0xa5, sizeof(out));
+			UT_ASSERT_EQ(cluster_control_bootstrap_read(paths[0], paths[1], paths[2], 0, &out),
+						 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+		}
+	UT_ASSERT_EQ(cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, NULL),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	memset(&out, 0, sizeof(out));
+	strlcpy((char *)&out, bootstrap_local, sizeof(out));
+	UT_ASSERT_EQ(cluster_control_bootstrap_read((char *)&out, test_root, test_wal_root, 0, &out),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(bootstrap_root_opens, 0);
+}
+
+UT_TEST(test_bootstrap_read_pinned_directory_is_not_replacement)
+{
+	BootstrapFixture f;
+	char current[MAXPGPATH], saved[MAXPGPATH];
+
+	bootstrap_read_fixture(&f, 0);
+	bootstrap_race = 6;
+	UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(bootstrap_race, 0);
+	path_for(current, sizeof(current), "global");
+	path_for(saved, sizeof(saved), "global.bootstrap-saved");
+	/* The replacement is our exact newly created empty test directory. */
+	UT_ASSERT_EQ(rmdir(current), 0);
+	UT_ASSERT_EQ(rename(saved, current), 0);
+}
+
+UT_TEST(test_bootstrap_read_close_failure_never_returns_partial_success)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapObservation out;
+	ClusterControlRootResult result;
+	int closes, open_before = 0, open_after = 0;
+
+	bootstrap_read_fixture(&f, 0);
+	result = cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, &out);
+	UT_ASSERT_EQ(result, 0);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return;
+	closes = bootstrap_close_calls;
+	UT_ASSERT(closes > 10);
+	pfree(out.config_bytes);
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			open_before++;
+	for (int i = 1; i <= closes; i++) {
+		bootstrap_read_fixture(&f, 0);
+		bootstrap_close_fail_at = i;
+		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_IO_ERROR);
+		UT_ASSERT(bootstrap_close_calls >= i);
+	}
+	for (int fd = 0; fd < 256; fd++)
+		if (fcntl(fd, F_GETFD) >= 0)
+			open_after++;
+	UT_ASSERT_EQ(open_after, open_before);
+	bootstrap_close_fail_at = 0;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -4599,7 +5026,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(79);
+	UT_PLAN(89);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -4679,6 +5106,16 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_bad_input_lengths_and_alias_clear_output);
 	UT_RUN(test_bootstrap_anchor_requires_exact_redo_and_no_backup);
 	UT_RUN(test_bootstrap_prepared_observation_is_not_open);
+	UT_RUN(test_bootstrap_read_exact_files_and_owned_config);
+	UT_RUN(test_bootstrap_read_requires_independent_binding_and_node);
+	UT_RUN(test_bootstrap_read_never_falls_back_to_valid_bak);
+	UT_RUN(test_bootstrap_read_rejects_every_bad_selected_file);
+	UT_RUN(test_bootstrap_read_unsafe_leaves_do_not_block_or_leak);
+	UT_RUN(test_bootstrap_read_unsafe_directories_are_refused);
+	UT_RUN(test_bootstrap_read_real_root_replacement_and_binding_races);
+	UT_RUN(test_bootstrap_read_invalid_paths_outputs_and_alias);
+	UT_RUN(test_bootstrap_read_pinned_directory_is_not_replacement);
+	UT_RUN(test_bootstrap_read_close_failure_never_returns_partial_success);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

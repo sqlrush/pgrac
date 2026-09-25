@@ -74,11 +74,17 @@ bootstrap_hash(const uint8 *bytes, size_t len, uint8 hash[32])
 	return ok;
 }
 
-static ClusterControlRootResult
-bootstrap_root_bound(const PgracControlBinding *binding, const ControlRootImage *root)
+ClusterControlRootResult
+cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
+									 const ControlRootImage *root)
 {
-	uint32 node = binding->node_id;
-	const ControlRootHeader *header = &root->header;
+	uint32 node;
+	const ControlRootHeader *header;
+
+	if (binding == NULL || root == NULL || binding->node_id >= PGRAC_CONTROL_BINDING_MAX_NODES)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	node = binding->node_id;
+	header = &root->header;
 
 	if (header->system_identifier != binding->system_identifier
 		|| memcmp(header->storage_uuid, binding->storage_uuid, 16) != 0
@@ -158,7 +164,7 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 											snapshot.binding.system_identifier, before);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	result = bootstrap_root_bound(&snapshot.binding, before);
+	result = cluster_control_bootstrap_root_bound(&snapshot.binding, before);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	result = cluster_control_root_v2_decode(input->root_after.data, input->root_after.len,
@@ -166,7 +172,7 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 											snapshot.binding.system_identifier, after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	result = bootstrap_root_bound(&snapshot.binding, after);
+	result = cluster_control_bootstrap_root_bound(&snapshot.binding, after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	if (memcmp(before->bytes, after->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0) {

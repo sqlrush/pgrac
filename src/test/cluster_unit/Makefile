@@ -1343,16 +1343,25 @@ CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_roo
 test_cluster_control_root: test_cluster_control_root.c unit_test.h \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
+		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
+		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
 		-lssl -lcrypto -llz4 -lzstd -o $@
+
+# PGRAC: perturb only syscall timing/failure; all read/decoder/selection code is
+# production code. Author: SqlRush <sqlrush@gmail.com>
+cluster_control_bootstrap_read_test.o: cluster_control_bootstrap_read_test.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_read.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND -c $< -o $@
