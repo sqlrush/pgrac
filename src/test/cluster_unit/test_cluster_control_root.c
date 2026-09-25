@@ -91,6 +91,9 @@ static TimeLineID test_flush_tli;
 static void (*test_checkpoint_x_hook)(void);
 static bool test_fence_after_primary, test_release_after_primary;
 static bool test_checkpoint_outer_cf;
+static bool test_projection_sync_fault, test_projection_observe;
+static unsigned test_projection_syncs;
+static LOCKMODE test_actual_cf;
 
 void
 pg_re_throw(void)
@@ -384,6 +387,19 @@ CloseTransientFile(int fd)
 int
 pg_fsync(int fd)
 {
+	struct stat st;
+	if (test_projection_observe && fstat(fd, &st) == 0 && S_ISREG(st.st_mode)
+		&& st.st_size == PG_CONTROL_FILE_SIZE) {
+		/* The native projection write is after the root's durable rename.
+		 * Immutable common images are not written by ordinary checkpoint. */
+		UT_ASSERT(test_durable_rename_calls > 0);
+		UT_ASSERT(test_actual_cf == ExclusiveLock);
+		test_projection_syncs++;
+		if (test_projection_sync_fault) {
+			errno = EIO;
+			return -1;
+		}
+	}
 	return fsync(fd);
 }
 
@@ -564,6 +580,8 @@ cluster_cf_lock(LOCKMODE mode pg_attribute_unused())
 	test_cf_acquire_order = ++test_order_seq;
 	if (mode == ExclusiveLock && test_checkpoint_x_hook != NULL)
 		test_checkpoint_x_hook();
+	if (test_cf_grant)
+		test_actual_cf = mode;
 	return test_cf_grant;
 }
 
@@ -577,6 +595,8 @@ ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode pg_attribute_unused())
 {
 	test_cf_release_order = ++test_order_seq;
+	if (test_cf_release_confirmed)
+		test_actual_cf = NoLock;
 	return test_cf_release_confirmed ? CLUSTER_CF_RELEASE_CONFIRMED
 									 : CLUSTER_CF_RELEASE_UNCONFIRMED;
 }
@@ -740,6 +760,8 @@ wipe_root_files(void)
 	test_cf_release_order = 0;
 	test_last_rename_order = 0;
 	test_checkpoint_mode = false;
+	test_projection_observe = false;
+	cluster_shared_config = false;
 	test_checkpoint_x_hook = NULL;
 	test_fence_after_primary = test_release_after_primary = false;
 }
@@ -4195,6 +4217,9 @@ v2_checkpoint_fixture(uint8 before[66048], ClusterControlRootIdentity *self,
 	test_cf_mode = NoLock;
 	test_cf_lock_calls = test_durable_rename_calls = 0;
 	test_checkpoint_outer_cf = false;
+	cluster_shared_config = true;
+	test_projection_sync_fault = false;
+	test_projection_syncs = 0;
 }
 
 static ClusterControlRootResult
@@ -4920,6 +4945,49 @@ UT_TEST(test_v2_checkpoint_postwrite_failure_keeps_fact_but_no_success)
 		UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(&self, &root, &view, &token), 0);
 		UT_ASSERT_EQ(view.checkPoint, candidate.checkPoint);
 		UT_ASSERT_EQ(token.file_txn_seq, 8);
+		v2_assert_anchor_staging_empty();
+	}
+}
+
+UT_TEST(test_v2_checkpoint_projection_follows_root_and_cannot_roll_it_back)
+{
+	uint8 before[66048], actual[PG_CONTROL_FILE_SIZE], expected[PG_CONTROL_FILE_SIZE];
+	ClusterControlRootIdentity self;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootFileToken token;
+	ControlFileData candidate, view;
+	ControlRootImage root;
+	char path[MAXPGPATH];
+
+	for (int fault = 0; fault < 2; fault++) {
+		v2_checkpoint_fixture(before, &self, &candidate);
+		path_for(path, sizeof(path), "global/pg_control");
+		/* A damaged old projection is not an input authority. */
+		memset(actual, 0xa5, sizeof(actual));
+		write_all_or_abort(path, actual, sizeof(actual));
+		test_projection_sync_fault = fault != 0;
+		test_projection_observe = true;
+		if (fault == 0)
+			UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token), 0);
+		else {
+			UT_ASSERT_EQ(v2_checkpoint_publish(&self, &candidate, &out, &token),
+						 CLUSTER_CONTROL_ROOT_IO_ERROR);
+			UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+		}
+		UT_ASSERT_EQ(test_projection_syncs, 1);
+		test_projection_sync_fault = false;
+		test_projection_observe = false;
+		UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(&self, &root, &view, &token), 0);
+		UT_ASSERT_EQ(token.file_txn_seq, 8);
+		UT_ASSERT_EQ(view.checkPoint, candidate.checkPoint);
+		read_all_or_abort(path, actual, sizeof(actual));
+		if (fault == 0) {
+			UT_ASSERT_EQ(cluster_cf_control_image_encode(&view, expected), 0);
+			UT_ASSERT(memcmp(expected, actual, sizeof(actual)) == 0);
+		} else {
+			memset(expected, 0xa5, sizeof(expected));
+			UT_ASSERT(memcmp(expected, actual, sizeof(actual)) == 0);
+		}
 		v2_assert_anchor_staging_empty();
 	}
 }
@@ -6294,7 +6362,7 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(111);
+	UT_PLAN(112);
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
@@ -6375,6 +6443,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_checkpoint_boundaries_refuse_without_mutation);
 	UT_RUN(test_v2_checkpoint_root_io_failure_keeps_old_selection);
 	UT_RUN(test_v2_checkpoint_postwrite_failure_keeps_fact_but_no_success);
+	UT_RUN(test_v2_checkpoint_projection_follows_root_and_cannot_roll_it_back);
 	UT_RUN(test_v2_checkpoint_error_unwind_releases_owned_work);
 	UT_RUN(test_v2_thread_view_requires_physical_selected_claim);
 	UT_RUN(test_v2_runtime_native_reader_selects_own_thread);

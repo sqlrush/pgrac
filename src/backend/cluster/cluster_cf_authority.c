@@ -611,6 +611,145 @@ cluster_cf_control_image_encode(const ControlFileData *cf, uint8 bytes[PG_CONTRO
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* PGRAC: compatibility output is not a second control authority. The root
+ * publisher owns CF-X and supplies its just-revalidated selected view.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+cf_projection_same(const struct stat *left, const struct stat *right)
+{
+	return left->st_dev == right->st_dev && left->st_ino == right->st_ino;
+}
+
+static bool
+cf_projection_dirs_current(int root, const struct stat *root_st, const struct stat *global_st)
+{
+	struct stat fresh;
+	int fd = open(cluster_shared_data_dir, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	bool valid = fd >= 0 && fstat(fd, &fresh) == 0 && cf_image_owned(&fresh, true)
+				 && cf_projection_same(root_st, &fresh);
+
+	if (fd >= 0 && close(fd) != 0)
+		valid = false;
+	return valid && fstatat(root, "global", &fresh, AT_SYMLINK_NOFOLLOW) == 0
+		   && cf_image_owned(&fresh, true) && cf_projection_same(global_st, &fresh);
+}
+
+static bool
+cf_projection_entry(int dir, const char *name, const struct stat *expected)
+{
+	struct stat st;
+	return fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0 && cf_image_owned(&st, false)
+		   && st.st_nlink == 1 && cf_projection_same(&st, expected);
+}
+
+static bool
+cf_projection_target_safe(int global)
+{
+	struct stat st;
+	if (fstatat(global, "pg_control", &st, AT_SYMLINK_NOFOLLOW) != 0)
+		return errno == ENOENT;
+	return cf_image_owned(&st, false) && st.st_nlink == 1;
+}
+
+ClusterControlRootResult
+cluster_cf_control_projection_write_locked(const ControlFileData *selected)
+{
+	uint8 bytes[PG_CONTROL_FILE_SIZE], actual[PG_CONTROL_FILE_SIZE], uuid[16];
+	char hex[33], temp[64];
+	struct stat root_st, global_st, temp_st, read_st;
+	int root = -1, global = -1, fd = -1, check = -1;
+	bool owned_temp = false, installed = false;
+	ClusterControlRootResult result;
+	size_t done = 0;
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+
+	if (!cluster_shared_config || !enableFsync || selected == NULL
+		|| cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] != '/')
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (cluster_cf_classify_buffer((const char *)selected, sizeof(*selected),
+								   selected->system_identifier)
+		!= CLUSTER_CF_VALID)
+		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	result = cluster_cf_control_image_encode(selected, bytes);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* Random generation and native canonicalization precede every raw FD. */
+	if (!pg_strong_random(uuid, sizeof(uuid)))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	cf_image_hex(uuid, sizeof(uuid), hex);
+	snprintf(temp, sizeof(temp), ".pg_control-%s.tmp", hex);
+	result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	root = open(cluster_shared_data_dir, flags);
+	if (root < 0 || fstat(root, &root_st) != 0 || !cf_image_owned(&root_st, true))
+		goto cleanup;
+	global = openat(root, "global", flags);
+	if (global < 0 || fstat(global, &global_st) != 0 || !cf_image_owned(&global_st, true)
+		|| !cf_projection_target_safe(global))
+		goto cleanup;
+	fd = openat(global, temp, O_RDWR | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC | PG_BINARY, 0600);
+	if (fd < 0 || fstat(fd, &temp_st) != 0 || !cf_image_owned(&temp_st, false)
+		|| temp_st.st_nlink != 1)
+		goto cleanup;
+	owned_temp = true;
+	while (done < sizeof(bytes)) {
+		ssize_t n = write(fd, bytes + done, sizeof(bytes) - done);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto cleanup;
+		done += n;
+	}
+	if (pg_fsync(fd) != 0)
+		goto cleanup;
+	if (!cf_projection_dirs_current(root, &root_st, &global_st)
+		|| !cf_projection_entry(global, temp, &temp_st) || !cf_projection_target_safe(global)) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto cleanup;
+	}
+	if (renameat(global, temp, global, "pg_control") != 0)
+		goto cleanup;
+	installed = true;
+	/* Once installed, never unlink or restore the previous projection. The
+	 * already published root remains authoritative even if this sync fails. */
+	if (pg_fsync(global) != 0)
+		goto cleanup;
+	check
+		= openat(global, "pg_control", O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	if (check < 0 || fstat(check, &read_st) != 0 || !cf_image_owned(&read_st, false)
+		|| read_st.st_nlink != 1 || read_st.st_size != sizeof(actual)
+		|| !cf_projection_same(&read_st, &temp_st))
+		goto cleanup;
+	done = 0;
+	while (done < sizeof(actual)) {
+		ssize_t n = read(check, actual + done, sizeof(actual) - done);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto cleanup;
+		done += n;
+	}
+	if (memcmp(actual, bytes, sizeof(actual)) != 0
+		|| !cf_projection_dirs_current(root, &root_st, &global_st)
+		|| !cf_projection_entry(global, "pg_control", &temp_st)) {
+		result = CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+		goto cleanup;
+	}
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+cleanup:
+	/* No callback/allocator/interrupt processing while these descriptors are
+	 * live. Failure cleanup can remove only this exact unpublished temp. */
+	if (owned_temp && !installed && cf_projection_entry(global, temp, &temp_st))
+		(void)unlinkat(global, temp, 0);
+	cf_image_close(check, &result);
+	cf_image_close(fd, &result);
+	cf_image_close(global, &result);
+	cf_image_close(root, &result);
+	return result;
+}
+
 static ClusterControlRootResult
 cf_image_read_at(int dir, const char *name, const ClusterCfImageStage *stage,
 				 const uint8 expected_hash[32], uint64 sysid, pg_cryptohash_ctx *ctx,

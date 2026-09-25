@@ -46,6 +46,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <dirent.h>
 
 #include "catalog/pg_control.h"
 #include "catalog/catversion.h"
@@ -99,6 +100,35 @@ static bool image_cf_s;
 static bool image_cf_global;
 static unsigned image_fsync_calls;
 static unsigned image_fsync_fail_at;
+static void (*image_fsync_hook)(int fd);
+static unsigned image_fsync_hook_at;
+static bool projection_random_collision;
+static char projection_random_name[64];
+
+bool
+pg_strong_random(void *bytes, size_t len)
+{
+	static uint8 next = 1;
+	UT_ASSERT_EQ(len, 16);
+	memset(bytes, next++, len);
+	strlcpy(projection_random_name, ".pg_control-", sizeof(projection_random_name));
+	for (size_t i = 0; i < len; i++)
+		snprintf(projection_random_name + 12 + 2 * i, 3, "%02x", ((uint8 *)bytes)[i]);
+	strlcat(projection_random_name, ".tmp", sizeof(projection_random_name));
+	if (projection_random_collision) {
+		char path[MAXPGPATH];
+		int fd;
+		snprintf(path, sizeof(path), "%s/global/%s", cluster_shared_data_dir,
+				 projection_random_name);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		UT_ASSERT(fd >= 0);
+		if (fd >= 0) {
+			UT_ASSERT_EQ(write(fd, "other", 5), 5);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+	}
+	return true;
+}
 
 bool
 cluster_cf_held_is_clusterwide(LOCKMODE mode)
@@ -198,7 +228,13 @@ BasicOpenFilePerm(const char *fileName, int fileFlags, mode_t fileMode)
 int
 pg_fsync(int fd)
 {
-	if (++image_fsync_calls == image_fsync_fail_at) {
+	++image_fsync_calls;
+	if (image_fsync_hook != NULL && image_fsync_calls == image_fsync_hook_at) {
+		void (*hook)(int) = image_fsync_hook;
+		image_fsync_hook = NULL;
+		hook(fd);
+	}
+	if (image_fsync_calls == image_fsync_fail_at) {
 		errno = EIO;
 		return -1;
 	}
@@ -1111,12 +1147,220 @@ UT_TEST(test_shared_config_untyped_writer_cannot_modify_projection)
 	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
 }
 
+static void
+projection_read(uint8 bytes[PG_CONTROL_FILE_SIZE])
+{
+	int fd = open(cluster_cf_shared_path(), O_RDONLY | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0);
+	if (fd >= 0) {
+		UT_ASSERT_EQ(read(fd, bytes, PG_CONTROL_FILE_SIZE), PG_CONTROL_FILE_SIZE);
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+}
+
+UT_TEST(test_projection_writes_canonical_selected_view)
+{
+	ControlFileData in;
+	uint8 expected[PG_CONTROL_FILE_SIZE], actual[PG_CONTROL_FILE_SIZE];
+	image_input(&in);
+	finalize_crc(&in);
+	cluster_shared_config = true;
+	REQUIRE_IMAGE_OK(cluster_cf_control_image_encode(&in, expected));
+	REQUIRE_IMAGE_OK(cluster_cf_control_projection_write_locked(&in));
+	projection_read(actual);
+	UT_ASSERT(memcmp(expected, actual, sizeof(actual)) == 0);
+	UT_ASSERT_EQ(image_fsync_calls, 2);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_projection_refuses_without_permission_or_valid_input)
+{
+	ControlFileData in;
+	uint8 before[PG_CONTROL_FILE_SIZE], after[PG_CONTROL_FILE_SIZE];
+	/* Seed via the existing writer; the new writer is independently tested. */
+	cluster_shared_config = false;
+	image_input(&in);
+	finalize_crc(&in);
+	cluster_cf_authority_write(&in);
+	projection_read(before);
+	for (int fault = 0; fault < 5; fault++) {
+		image_input(&in);
+		finalize_crc(&in);
+		cluster_shared_config = fault != 0;
+		image_cf_x = fault != 1;
+		image_cf_global = fault != 2;
+		enableFsync = fault != 3;
+		if (fault == 4)
+			in.crc ^= 1;
+		UT_ASSERT(cluster_cf_control_projection_write_locked(&in) != 0);
+		UT_ASSERT_EQ(image_fsync_calls, 0);
+		projection_read(after);
+		UT_ASSERT(memcmp(before, after, sizeof(after)) == 0);
+	}
+	enableFsync = true;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_projection_fsync_failure_preserves_publication_boundary)
+{
+	ControlFileData old, in;
+	uint8 before[PG_CONTROL_FILE_SIZE], expected[PG_CONTROL_FILE_SIZE], after[PG_CONTROL_FILE_SIZE];
+	for (unsigned fault = 1; fault <= 2; fault++) {
+		cluster_shared_config = false;
+		image_input(&old);
+		cluster_cf_authority_write(&old);
+		projection_read(before);
+		image_input(&in);
+		finalize_crc(&in);
+		REQUIRE_IMAGE_OK(cluster_cf_control_image_encode(&in, expected));
+		cluster_shared_config = true;
+		image_fsync_fail_at = fault;
+		UT_ASSERT(cluster_cf_control_projection_write_locked(&in) != 0);
+		UT_ASSERT_EQ(image_fsync_calls, fault);
+		projection_read(after);
+		/* File fsync failed: old remains. Parent fsync failed: new is not undone. */
+		UT_ASSERT(memcmp(after, fault == 1 ? before : expected, sizeof(after)) == 0);
+		image_fsync_fail_at = 0;
+		REQUIRE_IMAGE_OK(cluster_cf_control_projection_write_locked(&in));
+		projection_read(after);
+		UT_ASSERT(memcmp(after, expected, sizeof(after)) == 0);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_projection_rejects_unsafe_existing_target)
+{
+	ControlFileData in;
+	char path[MAXPGPATH], saved[MAXPGPATH];
+	cluster_shared_config = false;
+	image_input(&in);
+	finalize_crc(&in);
+	cluster_cf_authority_write(&in);
+	strlcpy(path, cluster_cf_shared_path(), sizeof(path));
+	snprintf(saved, sizeof(saved), "%s/projection-saved", shared_root);
+	UT_ASSERT_EQ(rename(path, saved), 0);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(symlink(saved, path), 0);
+	UT_ASSERT(cluster_cf_control_projection_write_locked(&in) != 0);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(link(saved, path), 0);
+	UT_ASSERT(cluster_cf_control_projection_write_locked(&in) != 0);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(rename(saved, path), 0);
+	UT_ASSERT_EQ(chmod(path, 0666), 0);
+	UT_ASSERT(cluster_cf_control_projection_write_locked(&in) != 0);
+	UT_ASSERT_EQ(chmod(path, 0600), 0);
+	REQUIRE_IMAGE_OK(cluster_cf_control_projection_write_locked(&in));
+	cluster_shared_config = false;
+}
+
+static int projection_race;
+static void
+projection_race_at_sync(int fd pg_attribute_unused())
+{
+	char path[MAXPGPATH], saved[MAXPGPATH];
+	int replacement;
+	if (projection_race == 1) {
+		snprintf(path, sizeof(path), "%s/global", shared_root);
+		snprintf(saved, sizeof(saved), "%s/global.projection-old", shared_root);
+		UT_ASSERT_EQ(rename(path, saved), 0);
+		UT_ASSERT_EQ(mkdir(path, 0700), 0);
+		return;
+	}
+	if (projection_race == 2) {
+		snprintf(saved, sizeof(saved), "%s.projection-old", shared_root);
+		UT_ASSERT_EQ(rename(shared_root, saved), 0);
+		UT_ASSERT_EQ(mkdir(shared_root, 0700), 0);
+		return;
+	}
+	snprintf(path, sizeof(path), "%s/global/%s", shared_root,
+			 projection_race == 0 ? projection_random_name : "pg_control");
+	UT_ASSERT_EQ(unlink(path), 0);
+	replacement = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+	UT_ASSERT(replacement >= 0);
+	if (replacement >= 0) {
+		UT_ASSERT_EQ(write(replacement, "other", 5), 5);
+		UT_ASSERT_EQ(close(replacement), 0);
+	}
+}
+
+UT_TEST(test_projection_replaced_names_cannot_claim_success_or_delete_others)
+{
+	ControlFileData in;
+	char path[MAXPGPATH], saved[MAXPGPATH], mark[5];
+	for (projection_race = 0; projection_race < 4; projection_race++) {
+		int before = 0, after = 0, fd;
+		cluster_shared_config = false;
+		image_input(&in);
+		finalize_crc(&in);
+		cluster_cf_authority_write(&in);
+		cluster_shared_config = true;
+		image_fsync_calls = 0;
+		image_fsync_hook_at = projection_race == 3 ? 2 : 1;
+		image_fsync_hook = projection_race_at_sync;
+		for (fd = 0; fd < 256; fd++)
+			if (fcntl(fd, F_GETFD) >= 0)
+				before++;
+		UT_ASSERT(cluster_cf_control_projection_write_locked(&in) != 0);
+		UT_ASSERT(image_fsync_hook == NULL);
+		for (fd = 0; fd < 256; fd++)
+			if (fcntl(fd, F_GETFD) >= 0)
+				after++;
+		UT_ASSERT_EQ(before, after);
+		if (projection_race == 1) {
+			snprintf(path, sizeof(path), "%s/global", shared_root);
+			snprintf(saved, sizeof(saved), "%s/global.projection-old", shared_root);
+			UT_ASSERT_EQ(rmdir(path), 0);
+			UT_ASSERT_EQ(rename(saved, path), 0);
+		} else if (projection_race == 2) {
+			snprintf(saved, sizeof(saved), "%s.projection-old", shared_root);
+			UT_ASSERT_EQ(rmdir(shared_root), 0);
+			UT_ASSERT_EQ(rename(saved, shared_root), 0);
+		} else {
+			snprintf(path, sizeof(path), "%s/global/%s", shared_root,
+					 projection_race == 0 ? projection_random_name : "pg_control");
+			fd = open(path, O_RDONLY | O_NOFOLLOW);
+			UT_ASSERT(fd >= 0);
+			if (fd >= 0) {
+				UT_ASSERT_EQ(read(fd, mark, sizeof(mark)), sizeof(mark));
+				UT_ASSERT(memcmp(mark, "other", sizeof(mark)) == 0);
+				UT_ASSERT_EQ(close(fd), 0);
+			}
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_projection_collision_does_not_remove_preexisting_temporary)
+{
+	ControlFileData in;
+	char path[MAXPGPATH], bytes[5];
+	int fd;
+	image_input(&in);
+	finalize_crc(&in);
+	cluster_shared_config = true;
+	projection_random_collision = true;
+	UT_ASSERT(cluster_cf_control_projection_write_locked(&in) != 0);
+	projection_random_collision = false;
+	snprintf(path, sizeof(path), "%s/global/%s", shared_root, projection_random_name);
+	fd = open(path, O_RDONLY | O_NOFOLLOW);
+	UT_ASSERT(fd >= 0);
+	if (fd >= 0) {
+		UT_ASSERT_EQ(read(fd, bytes, sizeof(bytes)), sizeof(bytes));
+		UT_ASSERT(memcmp(bytes, "other", sizeof(bytes)) == 0);
+		UT_ASSERT_EQ(close(fd), 0);
+	}
+	UT_ASSERT_EQ(unlink(path), 0);
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
 	setup_shared_root();
 
-	UT_PLAN(27);
+	UT_PLAN(33);
 	UT_RUN(test_paths);
 	UT_RUN(test_classify_buffer);
 	UT_RUN(test_decide_source);
@@ -1144,6 +1388,12 @@ main(void)
 	UT_RUN(test_immutable_fsync_disabled_cannot_claim_durable_success);
 	UT_RUN(test_shared_config_dispatches_without_legacy_fallback);
 	UT_RUN(test_shared_config_untyped_writer_cannot_modify_projection);
+	UT_RUN(test_projection_writes_canonical_selected_view);
+	UT_RUN(test_projection_refuses_without_permission_or_valid_input);
+	UT_RUN(test_projection_fsync_failure_preserves_publication_boundary);
+	UT_RUN(test_projection_rejects_unsafe_existing_target);
+	UT_RUN(test_projection_replaced_names_cannot_claim_success_or_delete_others);
+	UT_RUN(test_projection_collision_does_not_remove_preexisting_temporary);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

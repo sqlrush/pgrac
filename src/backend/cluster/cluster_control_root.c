@@ -2561,7 +2561,13 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (!checkpoint_v2_wal_paths_current(work, self)
 		|| !checkpoint_v2_owner_current(self, epoch, cf->checkPointCopy.ThisTimeLineID, end))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	return checkpoint_v2_prefix_observe(work, cf, end, crc);
+	result = checkpoint_v2_prefix_observe(work, cf, end, crc);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	/* PGRAC: root is already durable and exactly reread. This compatibility
+	 * output cannot roll it back, nor does it authorize native startup. Keep
+	 * CF-X until the selected view and its directory entry are durable. */
+	return cluster_cf_control_projection_write_locked(&work->new_view);
 }
 
 ClusterControlRootResult

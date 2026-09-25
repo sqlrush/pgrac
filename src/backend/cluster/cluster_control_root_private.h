@@ -136,6 +136,13 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 extern ClusterControlRootResult
 cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out);
 
+/* Backend-private compatibility output only. Caller just read the selected
+ * thread from current root under its held CF-X. Never an authority writer.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult
+cluster_cf_control_projection_write_locked(const ControlFileData *selected);
+
 /* PGRAC: normal online checkpoint only. Actual checkpointer/membership/fence
  * and local WAL flush facts authorize this operation, never caller booleans.
  * Owns CF-S read, outside-X staging, WALR-before-CF-X, and exact file CAS.
