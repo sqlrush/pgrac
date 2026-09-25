@@ -236,6 +236,9 @@ extern void LocalProcessControlFile(bool reset);
  */
 struct ControlFileData;
 extern void XLogValidateControlFile(const struct ControlFileData *control);
+/* PGRAC: early process-local initialization, not serving/recovery admission. */
+extern void XLogInstallBootstrapControlFile(const struct ControlFileData *control, bool reset);
+extern void XLogCompleteBootstrapControlFile(void);
 extern WalLevel GetActiveWalLevelOnStandby(void);
 extern void StartupXLOG(void);
 extern void ShutdownXLOG(int code, Datum arg);

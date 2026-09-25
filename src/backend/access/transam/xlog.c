@@ -4771,16 +4771,105 @@ XLogValidateControlFile(const ControlFileData *control)
 									  segment_size, segment_size)));
 }
 
+/* PGRAC: share native initialization without selecting a control file.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+SetControlFileWalSegmentSize(void)
+{
+	static char wal_segsz_str[20];
+
+	wal_segment_size = ControlFile->xlog_seg_size;
+
+	snprintf(wal_segsz_str, sizeof(wal_segsz_str), "%d", wal_segment_size);
+	SetConfigOption("wal_segment_size", wal_segsz_str, PGC_INTERNAL,
+					PGC_S_DYNAMIC_DEFAULT);
+}
+
+static void
+CompleteControlFileParameters(int elevel)
+{
+
+	/* check and update variables dependent on wal_segment_size */
+	if (ConvertToXSegs(min_wal_size_mb, wal_segment_size) < 2)
+		ereport(elevel, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("\"min_wal_size\" must be at least twice \"wal_segment_size\"")));
+
+	if (ConvertToXSegs(max_wal_size_mb, wal_segment_size) < 2)
+		ereport(elevel, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						errmsg("\"max_wal_size\" must be at least twice \"wal_segment_size\"")));
+
+	UsableBytesInSegment =
+		(wal_segment_size / XLOG_BLCKSZ * UsableBytesInPage) -
+		(SizeOfXLogLongPHD - SizeOfXLogShortPHD);
+
+	CalculateCheckpointSegments();
+
+	/* Make the initdb settings visible as GUC variables, too */
+	SetConfigOption("data_checksums", DataChecksumsEnabled() ? "yes" : "no",
+					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+}
+
+/* PGRAC: root selection/qualification belongs to the caller. This pair only
+ * initializes process-local native state before shmem sizing. The intermediate
+ * state is not usable: configuration application must finish, or this process
+ * must exit. No compatibility file read/write or serving proof is involved.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool bootstrap_control_parameters_pending = false;
+
+static void
+CheckControlFileEarlyStartup(void)
+{
+	if (IsUnderPostmaster || IsBootstrapProcessingMode() ||
+		process_shared_preload_libraries_done)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native control initialization requires early startup")));
+}
+
+void
+XLogInstallBootstrapControlFile(const ControlFileData *control, bool reset)
+{
+	ControlFileData *selected;
+
+	CheckControlFileEarlyStartup();
+	if (bootstrap_control_parameters_pending || (!reset && ControlFile != NULL))
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native control initialization is already in progress")));
+	XLogValidateControlFile(control);
+	if (control->data_checksum_version != 0 &&
+		control->data_checksum_version != PG_DATA_CHECKSUM_VERSION)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("unsupported PRE2 data checksum version")));
+	selected = palloc(sizeof(*selected));
+	memcpy(selected, control, sizeof(*selected));
+	/* On reset the old pointer can refer to detached shared memory. */
+	ControlFile = selected;
+	bootstrap_control_parameters_pending = true;
+	SetControlFileWalSegmentSize();
+}
+
+void
+XLogCompleteBootstrapControlFile(void)
+{
+	CheckControlFileEarlyStartup();
+	if (!bootstrap_control_parameters_pending || ControlFile == NULL)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native selected control is not installed")));
+	CompleteControlFileParameters(FATAL);
+	bootstrap_control_parameters_pending = false;
+}
+
 static void
 ReadControlFile(void)
 {
 	int fd;
-	static char wal_segsz_str[20];
 	int r;
 
-	/*
-	 * Read data...
-	 */
 	fd = BasicOpenFile(XLOG_CONTROL_FILE, O_RDWR | PG_BINARY);
 	if (fd < 0)
 		ereport(PANIC, (errcode_for_file_access(),
@@ -4798,35 +4887,11 @@ ReadControlFile(void)
 								   r, sizeof(ControlFileData))));
 	}
 	pgstat_report_wait_end();
-
 	close(fd);
 
-	/* PGRAC: same validation for native and root-selected control images. */
 	XLogValidateControlFile(ControlFile);
-	wal_segment_size = ControlFile->xlog_seg_size;
-
-	snprintf(wal_segsz_str, sizeof(wal_segsz_str), "%d", wal_segment_size);
-	SetConfigOption("wal_segment_size", wal_segsz_str, PGC_INTERNAL,
-					PGC_S_DYNAMIC_DEFAULT);
-
-	/* check and update variables dependent on wal_segment_size */
-	if (ConvertToXSegs(min_wal_size_mb, wal_segment_size) < 2)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("\"min_wal_size\" must be at least twice \"wal_segment_size\"")));
-
-	if (ConvertToXSegs(max_wal_size_mb, wal_segment_size) < 2)
-		ereport(ERROR, (errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-						errmsg("\"max_wal_size\" must be at least twice \"wal_segment_size\"")));
-
-	UsableBytesInSegment =
-		(wal_segment_size / XLOG_BLCKSZ * UsableBytesInPage) -
-		(SizeOfXLogLongPHD - SizeOfXLogShortPHD);
-
-	CalculateCheckpointSegments();
-
-	/* Make the initdb settings visible as GUC variables, too */
-	SetConfigOption("data_checksums", DataChecksumsEnabled() ? "yes" : "no",
-					PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
+	SetControlFileWalSegmentSize();
+	CompleteControlFileParameters(ERROR);
 }
 
 /*

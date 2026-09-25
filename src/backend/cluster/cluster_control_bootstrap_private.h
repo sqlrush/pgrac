@@ -84,10 +84,11 @@ extern ClusterControlRootResult
 cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, const char *wal_root,
 							   uint32 node_id, ClusterControlBootstrapObservation *out);
 
-/* Process-local preparation only. Does not initialize ControlFile/WAL, grant
- * startup admission or replace physical qualification and final CF validation.
- * Native GUC assignment is not reversible: every refusal is FATAL. Paths must
- * be independently selected; inputs/output must not overlap. */
+/* Process-local preparation and native control/geometry initialization only,
+ * before shared memory or WAL startup. Not admission, physical qualification
+ * or final CF validation. Reset has LocalProcessControlFile's native semantics.
+ * Assignment is not reversible: every refusal is FATAL. Independent paths and
+ * output must not overlap. */
 typedef struct ClusterControlBootstrapPrepared {
 	ClusterControlBootstrapSnapshot snapshot;
 	ClusterControlRecoveryCapacity required;
@@ -95,6 +96,7 @@ typedef struct ClusterControlBootstrapPrepared {
 } ClusterControlBootstrapPrepared;
 extern void cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root,
 											  const char *wal_root, const char *undo_root,
-											  uint32 node_id, ClusterControlBootstrapPrepared *out);
+											  uint32 node_id, bool reset,
+											  ClusterControlBootstrapPrepared *out);
 
 #endif /* CLUSTER_CONTROL_BOOTSTRAP_PRIVATE_H */

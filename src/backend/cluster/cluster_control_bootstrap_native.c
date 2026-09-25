@@ -41,7 +41,7 @@ bootstrap_preparation_release(ResourceOwner owner, ResourceOwner saved_owner, bo
 
 void
 cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, const char *wal_root,
-								  const char *undo_root, uint32 node_id,
+								  const char *undo_root, uint32 node_id, bool reset,
 								  ClusterControlBootstrapPrepared *out)
 {
 	const char *inputs[] = { pgdata, shared_root, wal_root, undo_root };
@@ -92,17 +92,13 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			bootstrap_policy_refuse("native bootstrap profile is not applicable", &report);
 
-		/* Pure validation: neither the compatibility pg_control nor process WAL
-		 * geometry may select/replace these root-bound inputs.
-		 */
-		XLogValidateControlFile(&state->before.snapshot.control);
-		if (state->before.snapshot.control.data_checksum_version != 0
-			&& state->before.snapshot.control.data_checksum_version != PG_DATA_CHECKSUM_VERSION)
-			ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							errmsg("unsupported PRE2 data checksum version")));
+		/* Native hooks must observe selected WAL geometry, not a compatibility
+		 * image/default. This installs process-local state only, never admission. */
+		XLogInstallBootstrapControlFile(&state->before.snapshot.control, reset);
 		cluster_shared_config_apply_startup(state->before.config_bytes, state->before.config_len,
 											&state->before.snapshot.config, node_id,
 											&state->applied);
+		XLogCompleteBootstrapControlFile();
 		if (cluster_shared_config_check_recovery_capacity(&state->before.required, &report)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			bootstrap_policy_refuse("native bootstrap recovery capacity is insufficient", &report);

@@ -488,6 +488,7 @@ typedef struct ConfigApplyContext {
 	int node_id;
 	uint32 applied;
 	bool apply;
+	bool wal_buffers_only;
 } ConfigApplyContext;
 
 /* Native assignment hooks need not be reversible. A partial startup may exit,
@@ -509,6 +510,11 @@ startup_config_visit(const ClusterSharedConfigEntry *entry, void *arg)
 	struct config_generic *record;
 	ClusterSharedConfigPolicyReport report;
 	if (entry->node_id != CLUSTER_SHARED_CONFIG_COMMON && entry->node_id != context->node_id)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	/* PGRAC: COMMON precedes INSTANCE in the canonical object. Native -1
+	 * conversion must use final instance shared_buffers and selected geometry.
+	 * Keep the existing hook, but run this one dependent setting last. */
+	if (context->apply && (strcmp(entry->name, "wal_buffers") == 0) != context->wal_buffers_only)
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	policy_clear(&report);
 	record = find_option(entry->name, false, true, DEBUG1);
@@ -557,7 +563,7 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 {
 	ClusterSharedConfigPolicyReport report;
 	ConfigPolicyContext policy = { &report, ref, false };
-	ConfigApplyContext context = { node_id, 0, false };
+	ConfigApplyContext context = { node_id, 0, false, false };
 	ResourceOwner saved_owner = CurrentResourceOwner;
 	ResourceOwner owner;
 	MemoryContext saved_context = CurrentMemoryContext;
@@ -589,6 +595,10 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			startup_config_refuse("shared configuration object is not applicable", &report);
 		context.apply = true;
+		if (cluster_shared_config_visit(bytes, len, ref, startup_config_visit, &context)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			startup_config_refuse("shared configuration assignment failed", &report);
+		context.wal_buffers_only = true;
 		if (cluster_shared_config_visit(bytes, len, ref, startup_config_visit, &context)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			startup_config_refuse("shared configuration assignment failed", &report);

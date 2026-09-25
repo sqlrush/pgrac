@@ -36,3 +36,7 @@ CREATE FUNCTION test_pgrac_bootstrap_late()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_bootstrap_late'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_bootstrap_late() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_bootstrap_control_late(boolean)
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_bootstrap_control_late'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_bootstrap_control_late(boolean) FROM PUBLIC;

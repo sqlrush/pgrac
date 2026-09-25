@@ -33,6 +33,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_control_image);
 PG_FUNCTION_INFO_V1(test_pgrac_recovery_capacity);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_fixture);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_late);
+PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_control_late);
 PGDLLEXPORT void _PG_init(void);
 
 Datum
@@ -261,21 +262,28 @@ bootstrap_test_prepare(void)
 	ClusterControlBootstrapPrepared out;
 	ResourceOwner saved = CurrentResourceOwner;
 	uint64 sysid = GetSystemIdentifier();
-	int segment = wal_segment_size;
 	bootstrap_test_path(local, "local");
 	bootstrap_test_path(shared, "shared");
 	bootstrap_test_path(wal, "wal");
 	bootstrap_test_path(undo, "undo");
-	cluster_control_bootstrap_prepare(local, shared, wal, undo, 0, &out);
+	cluster_control_bootstrap_prepare(local, shared, wal, undo, 0, true, &out);
 	if (out.snapshot.binding.system_identifier != sysid || out.snapshot.root_sequence != 7
 		|| out.snapshot.config.identity.generation != 47 || out.applied.node_id != 0
 		|| out.applied.ref.identity.generation != 47 || out.required.current_sources != 1
 		|| out.required.max_connections != 300 || out.snapshot.control.MaxConnections != 300
 		|| CurrentResourceOwner != saved || sysid != GetSystemIdentifier()
-		|| segment != wal_segment_size
+		|| (int)out.snapshot.control.xlog_seg_size != wal_segment_size
+		|| memcmp(GetMockAuthenticationNonce(), out.snapshot.control.mock_authentication_nonce,
+				  MOCK_AUTH_NONCE_LEN)
+			   != 0
+		|| DataChecksumsEnabled() != (out.snapshot.control.data_checksum_version != 0)
 		|| strcmp(GetConfigOption("max_connections", false, false), "320") != 0
 		|| strcmp(GetConfigOption("cluster.shared_data_dir", false, false), shared) != 0)
 		ereport(FATAL, (errmsg("test native bootstrap result is not exact")));
+	if (wal_segment_size == 128 * 1024 * 1024
+		&& (XLOGbuffers != 4096 || !DataChecksumsEnabled()
+			|| strcmp(GetConfigOption("data_checksums", false, false), "on") != 0))
+		ereport(FATAL, (errmsg("test native bootstrap WAL sizing is not exact")));
 	ereport(FATAL,
 			(errmsg("test native bootstrap prepared; no admission or storage initialization")));
 }
@@ -432,7 +440,11 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 			{ -1, "cluster.undo_tablespace_path", undo },
 			{ -1, "cluster.wal_threads_dir", wal },
 			{ -1, "max_connections", "320" },
-			{ 0, "cluster.node_id", "0" } };
+			{ -1, "max_wal_size", "1024MB" },
+			{ -1, "min_wal_size", "80MB" },
+			{ -1, "wal_buffers", "-1" },
+			{ 0, "cluster.node_id", "0" },
+			{ 0, "shared_buffers", "128MB" } };
 	if (!superuser())
 		ereport(ERROR, (errmsg("test bootstrap fixture requires superuser")));
 	mutation = text_to_cstring(PG_GETARG_TEXT_PP(0));
@@ -442,6 +454,17 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 	file = AllocateFile(XLOG_CONTROL_FILE, "rb");
 	if (!file || fread(&native, 1, sizeof(native), file) != sizeof(native) || FreeFile(file) != 0)
 		ereport(ERROR, (errmsg("cannot read test native control")));
+	/* Selected bytes differ from the compatibility image, without changing its
+	 * identity. These fixture inputs never proceed to WAL/shared-memory startup. */
+	native.mock_authentication_nonce[0] ^= 0x80;
+	if (strcmp(mutation, "geometry") == 0 || strcmp(mutation, "wal-min") == 0
+		|| strcmp(mutation, "wal-max") == 0) {
+		native.xlog_seg_size = 128 * 1024 * 1024;
+		native.data_checksum_version = 1;
+		entries[13].value = strcmp(mutation, "wal-max") == 0 ? "64MB" : "512MB";
+		entries[14].value = strcmp(mutation, "wal-min") == 0 ? "2MB" : "256MB";
+		entries[17].value = "1GB";
+	}
 	root = palloc0(sizeof(*root));
 	header = &root->header;
 	header->format_version = 2;
@@ -588,8 +611,20 @@ test_pgrac_bootstrap_late(PG_FUNCTION_ARGS)
 	ClusterControlBootstrapPrepared out;
 	if (!superuser())
 		ereport(ERROR, (errmsg("test bootstrap inspection requires superuser")));
-	cluster_control_bootstrap_prepare(NULL, NULL, NULL, NULL, 0, &out);
+	cluster_control_bootstrap_prepare(NULL, NULL, NULL, NULL, 0, true, &out);
 #endif
+	PG_RETURN_BOOL(false);
+}
+
+Datum
+test_pgrac_bootstrap_control_late(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test native control inspection requires superuser")));
+	if (PG_GETARG_BOOL(0))
+		XLogInstallBootstrapControlFile(NULL, true);
+	else
+		XLogCompleteBootstrapControlFile();
 	PG_RETURN_BOOL(false);
 }
 

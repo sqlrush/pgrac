@@ -9,6 +9,7 @@ use Test::More;
 
 my $node = PostgreSQL::Test::Cluster->new('native_bootstrap');
 $node->init;
+$node->append_conf('postgresql.conf', 'wal_buffers=32kB');
 $node->start;
 if ($node->safe_psql('postgres',
 	q{SELECT count(*) FROM pg_settings WHERE name='cluster.shared_config'}) eq '0')
@@ -20,9 +21,20 @@ $node->safe_psql('postgres', 'CREATE EXTENSION test_pgrac_shared_config');
 my ($rc, $out, $err) = $node->psql('postgres', 'SELECT test_pgrac_bootstrap_late()');
 ok($rc != 0, 'backend cannot apply startup configuration');
 like($err, qr/native bootstrap preparation requires early startup/, 'native late-entry boundary');
+for my $install ('true', 'false')
+{
+	($rc, $out, $err) = $node->psql('postgres',
+		"SELECT test_pgrac_bootstrap_control_late($install)");
+	ok($rc != 0, "native control initialization $install cannot run in a backend");
+	like($err, qr/native control initialization requires early startup/,
+		"native control initialization $install rejects before mutation");
+}
 my $log_offset = 0;
 for my $case (
 	['valid', qr/test native bootstrap prepared; no admission or storage initialization/],
+	['geometry', qr/test native bootstrap prepared; no admission or storage initialization/],
+	['wal-min', qr/"min_wal_size" must be at least twice "wal_segment_size"/],
+	['wal-max', qr/"max_wal_size" must be at least twice "wal_segment_size"/],
 	['capacity', qr/native bootstrap recovery capacity is insufficient.*max_connections/s],
 	['profile', qr/native bootstrap profile is not applicable/],
 	['native-format', qr/BLCKSZ/],
