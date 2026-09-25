@@ -123,6 +123,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_shared_config \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
+		test_cluster_checkpoint_buffers \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
 		test_cluster_formation_witness \
@@ -423,7 +424,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_durable_prefix test_cluster_wal_durable_publish,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers,$(SIMPLE_TESTS))
 
 # The included production wait loop has disabled diagnostic probes.
 test_cluster_r4_tx_enqueue: test_cluster_r4_tx_enqueue.c unit_test.h $(CLUSTER_VERSION_O) cluster_unit_port_stubs.o \
@@ -698,6 +699,28 @@ test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/
 
 test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_checkpoint_candidate.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
+
+# PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.
+# Sorting/native scheduler and I/O are fixture boundaries, not a second owner.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_checkpoint_buffers_types.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^typedef struct CkptTsStatus/ { emit=1; count++ } \
+	     emit { print } /^} CkptTsStatus;/ { emit=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_buffers.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ts_ckpt_progress_comparator\(/ { print "static int"; emit=1; comparator++ } \
+	     /^ClusterCheckpointBufferDrain\(/ { print "static int"; emit=1 } \
+	     /^BufferSync\(/ { print "static void"; emit=1; scan++ } \
+	     /^SyncOneBuffer\(/ { print "static int"; emit=1; one++ } \
+	     /^TerminateBufferIO\(/ { print "static void"; emit=1; io++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (comparator != 1 || scan != 1 || one != 1 || io != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_buffers: test_cluster_checkpoint_buffers.c test_cluster_checkpoint_buffers.inc test_cluster_checkpoint_buffers_types.inc unit_test.h $(top_builddir)/src/backend/lib/binaryheap.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/lib/binaryheap.o $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 test_cluster_native_wal_stop.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^cluster_native_wal_shutdown_observe\(/ { print "bool"; emit=1; count++ } \

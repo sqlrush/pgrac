@@ -7883,6 +7883,58 @@ UnpinBuffer(BufferDesc *buf)
 #define ST_DEFINE
 #include <lib/sort_template.h>
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: PRE2 checkpoint DATA obligations survive a temporary pin/revoke
+ * refusal.  The native first pass is still fair across tablespaces; retry
+ * only its already marked set, without admitting fresh dirt or writing a
+ * retained image.  The checkpointer owns the wait, never a foreground caller.
+ * A source finish can perform the write meanwhile; ProcessSyncRequests after
+ * BufferSync will absorb that source's local fsync request before publication.
+ * This local drain is not proof of every remote contribution or DATA fsync.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static int
+ClusterCheckpointBufferDrain(int num_to_scan, int flags, WritebackContext *wb_context)
+{
+	int written = 0;
+
+	for (;;) {
+		int i;
+		int pending = 0;
+
+		ResetLatch(MyLatch);
+		CHECK_FOR_INTERRUPTS();
+		for (i = 0; i < num_to_scan; i++) {
+			int buf_id = CkptBufferIds[i].buf_id;
+			BufferDesc *buf = GetBufferDescriptor(buf_id);
+
+			if (pg_atomic_read_u32(&buf->state) & BM_CHECKPOINT_NEEDED) {
+				if (SyncOneBuffer(buf_id, false, wb_context) & BUF_WRITTEN) {
+					TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(buf_id);
+					PendingCheckpointerStats.buf_written_checkpoints++;
+					written++;
+				}
+				if (pg_atomic_read_u32(&buf->state) & BM_CHECKPOINT_NEEDED)
+					pending++;
+			}
+			/* Release every pin/lock before servicing barriers or interrupts.
+			 * Other entries keep progressing even if one handoff is pending. */
+			CheckpointWriteDelay(flags | CHECKPOINT_IMMEDIATE, 1.0);
+			CHECK_FOR_INTERRUPTS();
+		}
+		if (pending == 0)
+			return written;
+
+		AbsorbSyncRequests();
+		/* A repoll interval, not a correctness deadline. Never turn an
+		 * uncompleted obligation into a successful checkpoint on elapsed time. */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20L,
+						WAIT_EVENT_CHECKPOINT_WRITE_DELAY);
+	}
+}
+#endif
+
 /*
  * BufferSync -- Write out all dirty buffers in the pool.
  *
@@ -8141,6 +8193,13 @@ BufferSync(int flags)
 		 */
 		CheckpointWriteDelay(flags, (double) num_processed / num_to_scan);
 	}
+
+	/* PGRAC: SyncOneBuffer can temporarily refuse aux pins/retained images.
+	 * Preserve the frozen DATA set until its real owner completes each item. */
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config)
+		num_written += ClusterCheckpointBufferDrain(num_to_scan, flags, &wb_context);
+#endif
 
 	/*
 	 * Issue all pending flushes. Only checkpointer calls BufferSync(), so
