@@ -168,6 +168,16 @@ extern ClusterControlRootResult cluster_control_root_v2_checkpoint_publish(
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
 
+/* PGRAC: publishes WAL-verified shutdown checkpoint evidence only. Does not
+ * close a thread/database or change membership; returned native view still
+ * obeys the selected root lifecycle. Normal-stop/close admission is separate.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult cluster_control_root_v2_shutdown_checkpoint_publish(
+	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
+	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
+
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
 												 const ClusterControlRootMigrationRoundV1 *round);

@@ -2180,7 +2180,13 @@ checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch
 	return flushed_tli == tli && flushed >= checkpoint_end && cluster_epoch_get_current() == epoch;
 }
 
+typedef enum CheckpointV2Purpose {
+	CHECKPOINT_V2_ONLINE,
+	CHECKPOINT_V2_SHUTDOWN_EVIDENCE
+} CheckpointV2Purpose;
+
 typedef struct CheckpointV2Work {
+	CheckpointV2Purpose purpose;
 	ControlRootImage base;
 	ControlRootImage next;
 	ControlFileData old_view;
@@ -2221,7 +2227,8 @@ checkpoint_v2_prefix_observe(CheckpointV2Work *work, const ControlFileData *cont
 
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (fresh.exclusive_end < end)
+	if (fresh.exclusive_end < end
+		|| (work->purpose == CHECKPOINT_V2_SHUTDOWN_EVIDENCE && fresh.exclusive_end != end))
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (fresh.exclusive_end == end
 		&& (fresh.record_start != control->checkPoint || fresh.record_crc != crc))
@@ -2431,7 +2438,9 @@ checkpoint_v2_wal_verify(CheckpointV2Work *work, const ClusterControlRootIdentit
 		return work->wal_read_result;
 	if (record == NULL || work->wal_reader->ReadRecPtr != control->checkPoint
 		|| work->wal_reader->EndRecPtr != end || record->xl_rmid != RM_XLOG_ID
-		|| (record->xl_info & ~XLR_INFO_MASK) != XLOG_CHECKPOINT_ONLINE
+		|| (record->xl_info & ~XLR_INFO_MASK)
+			   != (work->purpose == CHECKPOINT_V2_ONLINE ? XLOG_CHECKPOINT_ONLINE
+														 : XLOG_CHECKPOINT_SHUTDOWN)
 		|| XLogRecGetDataLen(work->wal_reader) != sizeof(CheckPoint)
 		|| XLogRecHasAnyBlockRefs(work->wal_reader))
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
@@ -2661,13 +2670,11 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	return cluster_cf_control_projection_write_locked(&work->new_view);
 }
 
-ClusterControlRootResult
-cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *self,
-										   const ControlFileData *thread_control,
-										   XLogRecPtr checkpoint_end,
-										   ClusterControlRootSnapshot *out,
-										   ClusterControlRootFileToken *out_token,
-										   ControlFileData *out_control)
+static ClusterControlRootResult
+checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdentity *self,
+					  const ControlFileData *thread_control, XLogRecPtr checkpoint_end,
+					  ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
+					  ControlFileData *out_control)
 {
 	CheckpointV2Work *work;
 	ClusterControlRootResult result;
@@ -2682,11 +2689,15 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
 	if (self == NULL || thread_control == NULL || out == NULL || out_token == NULL
-		|| out_control == NULL || !AmCheckpointerProcess() || !enableFsync
+		|| out_control == NULL || !cluster_shared_config || !AmCheckpointerProcess() || !enableFsync
 		|| self->origin_thread_id == 0 || self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		|| thread_control->state != DB_IN_PRODUCTION || thread_control->backupStartPoint != 0
-		|| thread_control->backupEndPoint != 0 || thread_control->backupEndRequired
-		|| thread_control->checkPoint == 0 || thread_control->wal_level < WAL_LEVEL_MINIMAL
+		|| thread_control->state
+			   != (purpose == CHECKPOINT_V2_ONLINE ? DB_IN_PRODUCTION : DB_SHUTDOWNED)
+		|| (purpose == CHECKPOINT_V2_SHUTDOWN_EVIDENCE
+			&& thread_control->checkPointCopy.redo != thread_control->checkPoint)
+		|| thread_control->backupStartPoint != 0 || thread_control->backupEndPoint != 0
+		|| thread_control->backupEndRequired || thread_control->checkPoint == 0
+		|| thread_control->wal_level < WAL_LEVEL_MINIMAL
 		|| thread_control->wal_level > WAL_LEVEL_LOGICAL || thread_control->MaxConnections <= 0
 		|| thread_control->max_worker_processes < 0 || thread_control->max_wal_senders < 0
 		|| thread_control->max_prepared_xacts < 0 || thread_control->max_locks_per_xact <= 0
@@ -2707,6 +2718,7 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 									 checkpoint_end))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
+	work->purpose = purpose;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
 		work->wal_dirs[i] = -1;
 	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
@@ -2730,6 +2742,34 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 	}
 	pfree(work);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *self,
+										   const ControlFileData *thread_control,
+										   XLogRecPtr checkpoint_end,
+										   ClusterControlRootSnapshot *out,
+										   ClusterControlRootFileToken *out_token,
+										   ControlFileData *out_control)
+{
+	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, thread_control, checkpoint_end, out,
+								 out_token, out_control);
+}
+
+/* PGRAC: shutdown WAL and anchor evidence precede, but never substitute for,
+ * the exact protocol/member clean-close publication. Root lifecycle and all
+ * generic native projections stay OPEN until that separate owner completes.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIdentity *self,
+													const ControlFileData *thread_control,
+													XLogRecPtr checkpoint_end,
+													ClusterControlRootSnapshot *out,
+													ClusterControlRootFileToken *out_token,
+													ControlFileData *out_control)
+{
+	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, thread_control,
+								 checkpoint_end, out, out_token, out_control);
 }
 
 /*
