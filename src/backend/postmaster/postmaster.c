@@ -761,6 +761,22 @@ NormalStopPostmasterPids(pid_t pids[NORMAL_STOP_AUX_COUNT])
 
 static bool NormalStopPostmasterRosterMatches(void);
 
+/* PGRAC: PRE2 needs the original service owners through its own shutdown
+ * barriers. The old four-member R4 hint is neither a PRE2 admission test nor
+ * a reason to terminate those actors early. This predicate selects only a
+ * process roster; the actual protocol/thread/voting proofs still decide
+ * whether shutdown is clean. Postmaster must not acquire shared locks here.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+NormalStopPostmasterNeedsRetention(void)
+{
+	return cluster_enabled
+		   && (cluster_shared_config
+			   || (cluster_conf_node_count() == 4
+				   && cluster_semantic_normal_stop_needs_retention()));
+}
+
 /* Before accepting a normal request, a transiently absent actor is a
  * rejected attempt, not an immutable (and already poisoned) roster. The
  * original server loop may finish starting actors before a later request.
@@ -771,8 +787,7 @@ NormalStopPostmasterPreselectReady(void)
 	pid_t pids[NORMAL_STOP_AUX_COUNT];
 
 	if (normal_stop_pm.selected || IsUnderPostmaster || !IsPostmasterEnvironment || FatalError
-		|| !cluster_enabled || cluster_conf_node_count() != 4
-		|| !cluster_semantic_normal_stop_needs_retention())
+		|| !NormalStopPostmasterNeedsRetention())
 		return true;
 	if (cluster_lms_workers < 1 || cluster_lms_workers > 8 || !cluster_lms_enabled
 		|| LmsWorkerPIDs[0] != 0)
@@ -808,8 +823,7 @@ NormalStopPostmasterBegin(void)
 		(void)NormalStopPostmasterRosterMatches();
 		return true; /* failure does not select a different attempt */
 	}
-	if (!cluster_enabled || cluster_conf_node_count() != 4
-		|| !cluster_semantic_normal_stop_needs_retention())
+	if (!NormalStopPostmasterNeedsRetention())
 		return false;
 	normal_stop_pm.selected = true;
 	normal_stop_pm.lms_workers = cluster_lms_workers;
