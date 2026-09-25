@@ -569,6 +569,104 @@ decode_record(const uint8 *src, uint16 expected_thread, const ControlRootHeader 
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* PGRAC: retained-writer codec; Author: SqlRush <sqlrush@gmail.com>. */
+static bool
+history_overlaps_output(const void *input, size_t len, const ClusterWalHistoryImage *out)
+{
+	uintptr_t a = (uintptr_t)input, b = (uintptr_t)out;
+	return input != NULL && out != NULL && (a <= b ? b - a < len : a - b < sizeof(*out));
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_history_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
+									   uint32 origin_node, ClusterWalHistoryImage *out)
+{
+	ClusterControlRootResult result;
+	uint8 hash[32];
+	uint32 count;
+	bool valid_size = len >= 68 && len <= CLUSTER_WAL_HISTORY_MAX_BYTES;
+	bool alias = history_overlaps_output(root, sizeof(*root), out)
+				 || (valid_size && history_overlaps_output(bytes, len, out));
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || bytes == NULL || root == NULL || origin_node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!valid_size)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	if (root->header.format_version != CONTROL_ROOT_HEADER_VERSION_V2)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (!root->present[origin_node])
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (root->refs[origin_node].history_generation == 0
+		&& bytes_are_zero(root->refs[origin_node].history_sha256, 32))
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (root->refs[origin_node].history_generation == 0
+		|| bytes_are_zero(root->refs[origin_node].history_sha256, 32))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (memcmp(bytes, "PGWH", 4) != 0)
+		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
+	if (read_u16_le(bytes + 4) != 1)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	count = read_u32_le(bytes + 8);
+	if (read_u16_le(bytes + 6) != CLUSTER_WAL_HISTORY_HEADER_BYTES
+		|| count > CLUSTER_WAL_HISTORY_MAX_RECORDS
+		|| read_u32_le(bytes + 12) != CLUSTER_CONTROL_ROOT_RECORD_BYTES
+		|| read_u64_le(bytes + 16) != (uint64)count * CLUSTER_CONTROL_ROOT_RECORD_BYTES
+		|| len
+			   != CLUSTER_WAL_HISTORY_HEADER_BYTES
+					  + (size_t)count * CLUSTER_CONTROL_ROOT_RECORD_BYTES + 4)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	if (read_u64_le(bytes + 24) != root->header.system_identifier
+		|| memcmp(bytes + 32, root->header.storage_uuid, 16) != 0
+		|| memcmp(bytes + 48, root->header.authority_uuid, 16) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (read_u32_le(bytes + len - 4) != control_root_crc(bytes, len - 4))
+		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	if (!control_root_sha256(bytes, len, hash))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (memcmp(hash, root->refs[origin_node].history_sha256, 32) != 0)
+		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+
+	for (uint32 i = 0; i < count; i++) {
+		const uint8 *src = bytes + CLUSTER_WAL_HISTORY_HEADER_BYTES
+						   + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES;
+		ClusterWalHistoryRecord *record = &out->records[i];
+		uint64 incarnation;
+
+		result
+			= decode_record(src, origin_node + 1, &root->header, &record->snapshot,
+							&record->record_crc32c, CONTROL_ROOT_RECORD_VERSION_V2, &record->refs);
+		if (result == CLUSTER_CONTROL_ROOT_ABSENT)
+			result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto refused;
+		incarnation = record->snapshot.identity.origin_owner_incarnation;
+		if (incarnation == root->records[origin_node].identity.origin_owner_incarnation) {
+			result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			goto refused;
+		}
+		/* A flat set preserves all retained writers without recursive traversal.
+		 * Namespace aliases must not create two claims for one generation path.
+		 * Numeric ordering here is canonical encoding only, never a redo order.
+		 */
+		if (record->refs.history_generation != 0 || !bytes_are_zero(record->refs.history_sha256, 32)
+			|| (i > 0
+				&& incarnation <= out->records[i - 1].snapshot.identity.origin_owner_incarnation)) {
+			result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+			goto refused;
+		}
+		record->publisher_incarnation = read_u64_le(src + 144);
+		record->publisher_node = read_u32_le(src + 152);
+	}
+	out->count = count;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+refused:
+	memset(out, 0, sizeof(*out));
+	return result;
+}
+
 static void
 encode_header_version(ControlRootImage *image, uint16 version)
 {

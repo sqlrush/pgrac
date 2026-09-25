@@ -74,6 +74,33 @@ typedef struct ControlRootImage {
 StaticAssertDecl(sizeof(ControlRootCommonV2) == 184, "root-v2 logical common carrier");
 StaticAssertDecl(sizeof(ControlRootRecordRefsV2) == 112, "root-v2 logical record references");
 
+/* PGRAC: bounded retained-writer input, never an authority/retirement proof.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+#define CLUSTER_WAL_HISTORY_MAX_RECORDS 128
+#define CLUSTER_WAL_HISTORY_HEADER_BYTES 64
+#define CLUSTER_WAL_HISTORY_MAX_BYTES (64 + 128 * 512 + 4)
+typedef struct ClusterWalHistoryRecord {
+	ClusterControlRootSnapshot snapshot;
+	ControlRootRecordRefsV2 refs;
+	uint64 publisher_incarnation;
+	uint32 publisher_node;
+	uint32 record_crc32c;
+} ClusterWalHistoryRecord;
+
+typedef struct ClusterWalHistoryImage {
+	uint32 count;
+	ClusterWalHistoryRecord records[CLUSTER_WAL_HISTORY_MAX_RECORDS];
+} ClusterWalHistoryImage;
+
+/* Root is already decoded v2; its exact origin record selects the object.
+ * No I/O, sorting, repair or admission. Caller owns hash resources. Inputs must
+ * not overlap out. Every refusal clears out, including rejected aliases.
+ */
+extern ClusterControlRootResult
+cluster_control_root_v2_history_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
+									   uint32 origin_node, ClusterWalHistoryImage *out);
+
 /* Memory-only codec.  No file I/O, migration, publication or startup authority.
  * Decode refuses v1 and clears the entire output on failure.  Encode emits
  * canonical v2 bytes from the decoded fields, or clears bytes on failure.
