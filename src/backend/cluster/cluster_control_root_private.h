@@ -101,6 +101,48 @@ extern ClusterControlRootResult
 cluster_control_root_v2_history_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
 									   uint32 origin_node, ClusterWalHistoryImage *out);
 
+/* PGRAC: canonical retained set production, not set-completeness or JOIN
+ * authority. Inputs must not overlap outputs. Refusal clears both outputs.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult
+cluster_control_root_v2_history_encode(const ControlRootImage *root, uint32 origin_node,
+									   const ClusterWalHistoryImage *history,
+									   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length);
+
+/* Process-owned immutable file installation. The enclosing root publisher
+ * must retain the same clusterwide CF-X through root CAS. No formal object
+ * is ever removed by discard, including after an ambiguous install failure.
+ */
+typedef struct ClusterWalHistoryStage {
+	uint64 generation;
+	uint64 system_identifier;
+	uint64 current_owner_incarnation;
+	uint8 storage_uuid[16];
+	uint8 authority_uuid[16];
+	uint8 sha256[32];
+	uint8 operation_uuid[16];
+	uint64 object_dir_dev;
+	uint64 object_dir_ino;
+	uint64 staging_dir_dev;
+	uint64 staging_dir_ino;
+	uint64 file_dev;
+	uint64 file_ino;
+	uint32 origin_node;
+	uint32 length;
+	uint32 owner_pid;
+	uint32 state;
+} ClusterWalHistoryStage;
+
+StaticAssertDecl(sizeof(ClusterWalHistoryStage) == 168, "history staging descriptor size");
+
+extern ClusterControlRootResult
+cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
+							const ClusterWalHistoryImage *history, uint64 generation,
+							const uint8 operation_uuid[16], ClusterWalHistoryStage *out);
+extern ClusterControlRootResult cluster_wal_history_install(ClusterWalHistoryStage *stage);
+extern ClusterControlRootResult cluster_wal_history_discard(ClusterWalHistoryStage *stage);
+
 /* Memory-only codec.  No file I/O, migration, publication or startup authority.
  * Decode refuses v1 and clears the entire output on failure.  Encode emits
  * canonical v2 bytes from the decoded fields, or clears bytes on failure.

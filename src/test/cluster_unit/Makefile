@@ -1386,12 +1386,14 @@ CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_roo
 # machinery; err*/BasicOpenFile are stubbed in the test file.
 test_cluster_control_root: test_cluster_control_root.c unit_test.h \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
+		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \

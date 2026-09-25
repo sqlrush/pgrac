@@ -675,6 +675,97 @@ refused:
 	return result;
 }
 
+/* PGRAC: bounded encoder inputs cannot alias either caller-owned output.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+history_ranges_overlap(const void *a, size_t na, const void *b, size_t nb)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	return a != NULL && b != NULL && (x <= y ? y - x < na : x - y < nb);
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_history_encode(const ControlRootImage *root, uint32 origin_node,
+									   const ClusterWalHistoryImage *history,
+									   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length)
+{
+	ClusterControlRootResult result;
+	size_t len;
+	bool alias
+		= history_ranges_overlap(root, sizeof(*root), bytes, CLUSTER_WAL_HISTORY_MAX_BYTES)
+		  || history_ranges_overlap(history, sizeof(*history), bytes, CLUSTER_WAL_HISTORY_MAX_BYTES)
+		  || history_ranges_overlap(root, sizeof(*root), length, sizeof(*length))
+		  || history_ranges_overlap(history, sizeof(*history), length, sizeof(*length))
+		  || history_ranges_overlap(bytes, CLUSTER_WAL_HISTORY_MAX_BYTES, length, sizeof(*length));
+
+	if (bytes != NULL)
+		memset(bytes, 0, CLUSTER_WAL_HISTORY_MAX_BYTES);
+	if (length != NULL)
+		*length = 0;
+	if (alias || root == NULL || history == NULL || bytes == NULL || length == NULL
+		|| origin_node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (root->header.format_version != CONTROL_ROOT_HEADER_VERSION_V2)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (!root->present[origin_node])
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (history->count > CLUSTER_WAL_HISTORY_MAX_RECORDS)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (root->records[origin_node].identity.origin_node_id != (int32)origin_node)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = snapshot_validate(&root->records[origin_node], origin_node + 1,
+							   root->header.system_identifier, root->header.storage_uuid,
+							   root->header.authority_uuid, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	for (uint32 i = 0; i < history->count; i++) {
+		const ClusterWalHistoryRecord *r = &history->records[i];
+		uint64 incarnation = r->snapshot.identity.origin_owner_incarnation;
+		result = snapshot_validate(&r->snapshot, origin_node + 1, root->header.system_identifier,
+								   root->header.storage_uuid, root->header.authority_uuid, true);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = record_refs_v2_validate(&r->refs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (r->snapshot.identity.origin_node_id != (int32)origin_node
+			|| incarnation == root->records[origin_node].identity.origin_owner_incarnation)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		if (r->refs.history_generation != 0 || !bytes_are_zero(r->refs.history_sha256, 32)
+			|| (i > 0
+				&& incarnation
+					   <= history->records[i - 1].snapshot.identity.origin_owner_incarnation))
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (r->publisher_incarnation == 0 || r->publisher_node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
+			|| r->snapshot.lifecycle_reason < CLUSTER_CONTROL_ROOT_PUBLISH_MIGRATION_IMPORT
+			|| r->snapshot.lifecycle_reason > CLUSTER_CONTROL_ROOT_PUBLISH_COPY_REPAIR)
+			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	}
+	len = CLUSTER_WAL_HISTORY_HEADER_BYTES
+		  + (size_t)history->count * CLUSTER_CONTROL_ROOT_RECORD_BYTES + 4;
+	memcpy(bytes, "PGWH", 4);
+	write_u16_le(bytes + 4, 1);
+	write_u16_le(bytes + 6, CLUSTER_WAL_HISTORY_HEADER_BYTES);
+	write_u32_le(bytes + 8, history->count);
+	write_u32_le(bytes + 12, CLUSTER_CONTROL_ROOT_RECORD_BYTES);
+	write_u64_le(bytes + 16, (uint64)history->count * CLUSTER_CONTROL_ROOT_RECORD_BYTES);
+	write_u64_le(bytes + 24, root->header.system_identifier);
+	memcpy(bytes + 32, root->header.storage_uuid, 16);
+	memcpy(bytes + 48, root->header.authority_uuid, 16);
+	for (uint32 i = 0; i < history->count; i++) {
+		const ClusterWalHistoryRecord *r = &history->records[i];
+		encode_record_version(bytes + CLUSTER_WAL_HISTORY_HEADER_BYTES
+								  + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
+							  &r->snapshot, r->publisher_incarnation, r->publisher_node,
+							  (ClusterControlRootPublishReason)r->snapshot.lifecycle_reason,
+							  CONTROL_ROOT_RECORD_VERSION_V2, &r->refs);
+	}
+	write_u32_le(bytes + len - 4, control_root_crc(bytes, len - 4));
+	*length = len;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static void
 encode_header_version(ControlRootImage *image, uint16 version)
 {

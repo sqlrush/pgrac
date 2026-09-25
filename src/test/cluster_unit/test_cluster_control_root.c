@@ -98,6 +98,7 @@ static bool test_checkpoint_outer_cf;
 static bool test_projection_sync_fault, test_projection_observe;
 static unsigned test_projection_syncs;
 static LOCKMODE test_actual_cf;
+static unsigned test_history_sync_count, test_history_fail_sync;
 
 void
 pg_re_throw(void)
@@ -400,6 +401,10 @@ int
 pg_fsync(int fd)
 {
 	struct stat st;
+	if (test_history_fail_sync != 0 && ++test_history_sync_count == test_history_fail_sync) {
+		errno = EIO;
+		return -1;
+	}
 	if (test_projection_observe && fstat(fd, &st) == 0 && S_ISREG(st.st_mode)
 		&& st.st_size == PG_CONTROL_FILE_SIZE) {
 		/* The native projection write is after the root's durable rename.
@@ -6862,6 +6867,466 @@ UT_TEST(test_bootstrap_capacity_final_directory_replacement_is_not_pinned_succes
 	UT_ASSERT_EQ(rename(saved, path), 0);
 }
 
+/* PGRAC: canonical history producer and actual immutable-file lifecycle.
+ * Independent literal bytes above remain the expected encoding.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+history_stage_dirs(uint32 node)
+{
+	char path[MAXPGPATH];
+	path_for(path, sizeof(path), "global/wal_history");
+	if (mkdir(path, 0700) != 0 && errno != EEXIST)
+		abort();
+	snprintf(path, sizeof(path), "%s/global/wal_history/thread_%u", test_root, node + 1);
+	if (mkdir(path, 0700) != 0 && errno != EEXIST)
+		abort();
+	strlcat(path, "/.staging", sizeof(path));
+	if (mkdir(path, 0700) != 0 && errno != EEXIST)
+		abort();
+}
+
+static void
+history_stage_paths(const ClusterWalHistoryStage *stage, char formal[MAXPGPATH],
+					char temp[MAXPGPATH])
+{
+	char digest[65], uuid[33];
+	for (unsigned i = 0; i < 32; i++)
+		snprintf(digest + i * 2, 3, "%02x", stage->sha256[i]);
+	for (unsigned i = 0; i < 16; i++)
+		snprintf(uuid + i * 2, 3, "%02x", stage->operation_uuid[i]);
+	snprintf(formal, MAXPGPATH, "%s/global/wal_history/thread_%u/history_%llu-%s.bin", test_root,
+			 stage->origin_node + 1, (unsigned long long)stage->generation, digest);
+	snprintf(temp, MAXPGPATH, "%s/global/wal_history/thread_%u/.staging/%s.tmp", test_root,
+			 stage->origin_node + 1, uuid);
+}
+
+static void
+history_prepare_fixture(ControlRootImage *root, ClusterWalHistoryImage *history, uint8 uuid[16],
+						uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], uint32 count)
+{
+	static uint64 sequence = 10000;
+	size_t len = history_fixture(bytes, root, 0, count);
+	UT_ASSERT_EQ(cluster_control_root_v2_history_decode(bytes, len, root, 0, history), 0);
+	memset(uuid, 0, 16);
+	put_u64_le(uuid, ++sequence);
+	history_stage_dirs(0);
+	test_cf_grant = test_cf_clusterwide = true;
+	test_cf_mode = ExclusiveLock;
+	enableFsync = true;
+	test_history_fail_sync = test_history_sync_count = 0;
+}
+
+UT_TEST(test_history_encoder_matches_literal_empty_and_full)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	uint8 expected[CLUSTER_WAL_HISTORY_MAX_BYTES], actual[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	uint32 counts[] = { 0, 2, 128 };
+	for (uint32 node = 0; node <= 127; node += 127)
+		for (unsigned i = 0; i < lengthof(counts); i++) {
+			size_t len = history_fixture(expected, &root, node, counts[i]), used = 777;
+			UT_ASSERT_EQ(
+				cluster_control_root_v2_history_decode(expected, len, &root, node, &history), 0);
+			memset(actual, 0xa5, sizeof(actual));
+			UT_ASSERT_EQ(
+				cluster_control_root_v2_history_encode(&root, node, &history, actual, &used), 0);
+			UT_ASSERT_EQ(used, len);
+			UT_ASSERT(memcmp(expected, actual, sizeof(actual)) == 0);
+		}
+}
+
+UT_TEST(test_history_encoder_rejects_invalid_records_without_partial_output)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	for (unsigned fault = 0; fault < 10; fault++) {
+		size_t len = history_fixture(bytes, &root, 0, 2), used = 777;
+		UT_ASSERT_EQ(cluster_control_root_v2_history_decode(bytes, len, &root, 0, &history), 0);
+		switch (fault) {
+		case 0:
+			history.count = 129;
+			break;
+		case 1:
+			history.records[1].snapshot.identity = history.records[0].snapshot.identity;
+			break;
+		case 2:
+			history.records[0].snapshot.identity.origin_owner_incarnation = 99;
+			break;
+		case 3:
+			history.records[0].refs.history_generation = 123;
+			break;
+		case 4:
+			history.records[0].snapshot.identity.origin_node_id = 1;
+			break;
+		case 5:
+			history.records[0].publisher_incarnation = 0;
+			break;
+		case 6:
+			history.records[0].snapshot.lifecycle = 0;
+			break;
+		case 7:
+			memset(history.records[0].refs.claim_sha256, 0, 32);
+			break;
+		case 8:
+			root.header.format_version = 1;
+			break;
+		case 9:
+			root.records[0].identity.origin_node_id = 1;
+			break;
+		}
+		memset(bytes, 0xa5, sizeof(bytes));
+		UT_ASSERT(cluster_control_root_v2_history_encode(&root, 0, &history, bytes, &used) != 0);
+		UT_ASSERT_EQ(used, 0);
+		UT_ASSERT(v2_zero(bytes, sizeof(bytes)));
+	}
+}
+
+UT_TEST(test_history_stage_installs_exact_readable_object)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history, readback;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], got[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH];
+	history_prepare_fixture(&root, &history, uuid, bytes, 128);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7001, uuid, &stage), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(stage.length, sizeof(bytes));
+	history_stage_paths(&stage, formal, temp);
+	UT_ASSERT_EQ(access(temp, F_OK), 0);
+	UT_ASSERT_EQ(access(formal, F_OK), -1);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(access(temp, F_OK), -1);
+	read_all_or_abort(formal, got, stage.length);
+	UT_ASSERT(memcmp(bytes, got, stage.length) == 0);
+	root.refs[0].history_generation = stage.generation;
+	memcpy(root.refs[0].history_sha256, stage.sha256, 32);
+	UT_ASSERT_EQ(cluster_control_root_v2_history_decode(got, stage.length, &root, 0, &readback), 0);
+	UT_ASSERT_EQ(readback.count, 128);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	UT_ASSERT(v2_zero(&stage, sizeof(stage)));
+	UT_ASSERT_EQ(access(formal, F_OK), 0);
+}
+
+UT_TEST(test_history_stage_lock_and_no_clobber)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage first, second, duplicate;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char first_path[MAXPGPATH], second_path[MAXPGPATH], temp[MAXPGPATH];
+	history_prepare_fixture(&root, &history, uuid, bytes, 2);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7002, uuid, &first), 0);
+	if (ut_current_failed)
+		return;
+	test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_wal_history_install(&first), CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	test_cf_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_history_install(&first), 0);
+	uuid[15]++;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7002, uuid, &duplicate), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&duplicate), 0);
+	uuid[15]++;
+	history.records[1].snapshot.published_at_usec++;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7002, uuid, &second), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&second), 0);
+	history_stage_paths(&first, first_path, temp);
+	history_stage_paths(&second, second_path, temp);
+	UT_ASSERT(strcmp(first_path, second_path) != 0);
+	UT_ASSERT_EQ(access(first_path, F_OK), 0);
+	UT_ASSERT_EQ(access(second_path, F_OK), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&first), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&second), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&duplicate), 0);
+}
+
+UT_TEST(test_history_stage_uncertain_sync_keeps_formal_and_can_finish)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH];
+	for (unsigned cut = 1; cut <= 3; cut++) {
+		history_prepare_fixture(&root, &history, uuid, bytes, 2);
+		UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7100 + cut, uuid, &stage), 0);
+		if (ut_current_failed)
+			return;
+		history_stage_paths(&stage, formal, temp);
+		test_history_fail_sync = cut;
+		UT_ASSERT_EQ(cluster_wal_history_install(&stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+		UT_ASSERT_EQ(access(formal, F_OK), 0);
+		test_history_fail_sync = 0;
+		UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+		UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+		UT_ASSERT_EQ(access(formal, F_OK), 0);
+	}
+}
+
+UT_TEST(test_history_encoder_and_prepare_refuse_aliases)
+{
+	union {
+		ControlRootImage root;
+		uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	} storage;
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	size_t used = 999;
+	history_prepare_fixture(&root, &history, uuid, bytes, 2);
+	storage.root = root;
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_history_encode(&storage.root, 0, &history, storage.bytes, &used),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(used, 0);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7200, uuid,
+											 (ClusterWalHistoryStage *)&history.records[3]),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	uuid[15]++;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7201, uuid,
+											 (ClusterWalHistoryStage *)root.bytes),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+}
+
+UT_TEST(test_history_stage_refuses_corrupt_or_unsafe_formal_without_overwrite)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], got[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH];
+	for (unsigned fault = 0; fault < 4; fault++) {
+		history_prepare_fixture(&root, &history, uuid, bytes, 2);
+		UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7210 + fault, uuid, &stage),
+					 0);
+		if (ut_current_failed)
+			return;
+		history_stage_paths(&stage, formal, temp);
+		if (fault == 0) {
+			bytes[0] ^= 1;
+			write_all_or_abort(formal, bytes, stage.length);
+		} else if (fault == 1) {
+			UT_ASSERT_EQ(symlink(temp, formal), 0);
+		} else if (fault == 2) {
+			UT_ASSERT_EQ(mkfifo(formal, 0600), 0);
+		} else {
+			write_all_or_abort(formal, bytes, stage.length);
+			UT_ASSERT_EQ(chmod(formal, 0660), 0);
+		}
+		UT_ASSERT(cluster_wal_history_install(&stage) != 0);
+		UT_ASSERT_EQ(access(temp, F_OK), 0);
+		if (fault == 0) {
+			read_all_or_abort(formal, got, stage.length);
+			UT_ASSERT(memcmp(got, bytes, stage.length) == 0);
+		}
+		UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+		/* Only this test's deliberately unsafe entry; never a product cleanup. */
+		UT_ASSERT_EQ(unlink(formal), 0);
+	}
+}
+
+UT_TEST(test_history_stage_refuses_replaced_temporary_and_directory)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH], saved[MAXPGPATH], dir[MAXPGPATH];
+	history_prepare_fixture(&root, &history, uuid, bytes, 2);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7220, uuid, &stage), 0);
+	if (ut_current_failed)
+		return;
+	history_stage_paths(&stage, formal, temp);
+	snprintf(saved, sizeof(saved), "%s.saved", temp);
+	UT_ASSERT_EQ(rename(temp, saved), 0);
+	write_all_or_abort(temp, bytes, stage.length);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(access(temp, F_OK), 0);
+	UT_ASSERT_EQ(unlink(temp), 0);
+	UT_ASSERT_EQ(rename(saved, temp), 0);
+	path_for(dir, sizeof(dir), "global/wal_history/thread_1/.staging");
+	snprintf(saved, sizeof(saved), "%s.saved", dir);
+	UT_ASSERT_EQ(rename(dir, saved), 0);
+	UT_ASSERT_EQ(mkdir(dir, 0700), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT_EQ(rmdir(dir), 0);
+	UT_ASSERT_EQ(rename(saved, dir), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+}
+
+UT_TEST(test_history_stage_bad_owner_duplicate_and_disabled_sync)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage, duplicate;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH];
+	history_prepare_fixture(&root, &history, uuid, bytes, 2);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7230, uuid, &stage), 0);
+	if (ut_current_failed)
+		return;
+	history_stage_paths(&stage, formal, temp);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7231, uuid, &duplicate),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(v2_zero(&duplicate, sizeof(duplicate)));
+	UT_ASSERT_EQ(access(temp, F_OK), 0);
+	stage.owner_pid++;
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	stage.owner_pid--;
+	enableFsync = false;
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	enableFsync = true;
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	UT_ASSERT_EQ(access(temp, F_OK), -1);
+}
+
+UT_TEST(test_history_prepare_refuses_unsafe_dirs_and_invalid_parameters)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], zero[16] = { 0 };
+	char dir[MAXPGPATH], saved[MAXPGPATH];
+	history_prepare_fixture(&root, &history, uuid, bytes, 2);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 0, uuid, &stage),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7235, zero, &stage),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(NULL, 0, &history, 7235, uuid, &stage),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 128, &history, 7235, uuid, &stage),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	enableFsync = false;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7235, uuid, &stage),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	enableFsync = true;
+	path_for(dir, sizeof(dir), "global/wal_history/thread_1/.staging");
+	snprintf(saved, sizeof(saved), "%s.saved", dir);
+	UT_ASSERT_EQ(chmod(dir, 0770), 0);
+	UT_ASSERT(cluster_wal_history_prepare(&root, 0, &history, 7235, uuid, &stage) != 0);
+	UT_ASSERT(v2_zero(&stage, sizeof(stage)));
+	UT_ASSERT_EQ(chmod(dir, 0700), 0);
+	UT_ASSERT_EQ(rename(dir, saved), 0);
+	UT_ASSERT_EQ(symlink(saved, dir), 0);
+	UT_ASSERT(cluster_wal_history_prepare(&root, 0, &history, 7235, uuid, &stage) != 0);
+	UT_ASSERT_EQ(unlink(dir), 0);
+	UT_ASSERT_EQ(rename(saved, dir), 0);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7235, uuid, &stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+}
+
+UT_TEST(test_history_stage_changed_bytes_refuse_without_install)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH];
+	history_prepare_fixture(&root, &history, uuid, bytes, 2);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7236, uuid, &stage), 0);
+	if (ut_current_failed)
+		return;
+	history_stage_paths(&stage, formal, temp);
+	bytes[100] ^= 1;
+	write_all_or_abort(temp, bytes, stage.length);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), CLUSTER_CONTROL_ROOT_HASH_MISMATCH);
+	UT_ASSERT_EQ(access(formal, F_OK), -1);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+}
+
+UT_TEST(test_history_discard_sync_failure_cannot_resurrect_install)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH];
+	history_prepare_fixture(&root, &history, uuid, bytes, 0);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7240, uuid, &stage), 0);
+	if (ut_current_failed)
+		return;
+	history_stage_paths(&stage, formal, temp);
+	test_history_fail_sync = 1;
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), CLUSTER_CONTROL_ROOT_IO_ERROR);
+	test_history_fail_sync = 0;
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(access(temp, F_OK), -1);
+	UT_ASSERT_EQ(access(formal, F_OK), -1);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+}
+
+UT_TEST(test_history_prepare_sync_failure_clears_output_and_owned_temp)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	char formal[MAXPGPATH], temp[MAXPGPATH];
+	for (unsigned cut = 1; cut <= 2; cut++) {
+		history_prepare_fixture(&root, &history, uuid, bytes, 2);
+		memset(&stage, 0xa5, sizeof(stage));
+		test_history_fail_sync = cut;
+		UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7250 + cut, uuid, &stage),
+					 CLUSTER_CONTROL_ROOT_IO_ERROR);
+		UT_ASSERT(v2_zero(&stage, sizeof(stage)));
+		test_history_fail_sync = 0;
+		/* Same operation UUID succeeds only if its own failed temp was removed. */
+		UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7250 + cut, uuid, &stage), 0);
+		if (ut_current_failed)
+			return;
+		history_stage_paths(&stage, formal, temp);
+		UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+		UT_ASSERT_EQ(access(temp, F_OK), -1);
+	}
+}
+
+UT_TEST(test_history_produced_file_reaches_actual_bootstrap_consumer)
+{
+	BootstrapFixture f;
+	ClusterControlBootstrapObservation out;
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], uuid[16] = { 0x91 };
+	char paths[3][MAXPGPATH];
+	size_t len = 64 + 2 * 512 + 4;
+	bootstrap_read_fixture(&f, 0);
+	bootstrap_history_files(&f, 127, 2, paths);
+	read_all_or_abort(paths[0], bytes, len);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_decode(f.before, sizeof(f.before), v2_storage, TEST_SYSID, &root),
+		0);
+	UT_ASSERT_EQ(cluster_control_root_v2_history_decode(bytes, len, &root, 127, &history), 0);
+	/* Remove only our raw fixture so the reader must consume the real producer. */
+	UT_ASSERT_EQ(unlink(paths[0]), 0);
+	history_stage_dirs(127);
+	test_cf_grant = test_cf_clusterwide = true;
+	test_cf_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 127, &history, 123, uuid, &stage), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(memcmp(stage.sha256, root.refs[127].history_sha256, 32) == 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	test_cf_grant = false;
+	test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, &out),
+				 0);
+	UT_ASSERT_EQ(out.required.history_sources, 2);
+	test_cf_grant = true;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -6871,7 +7336,23 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(124);
+	UT_PLAN(138);
+	UT_RUN(test_history_encoder_matches_literal_empty_and_full);
+	UT_RUN(test_history_encoder_rejects_invalid_records_without_partial_output);
+	UT_RUN(test_history_stage_installs_exact_readable_object);
+	UT_RUN(test_history_stage_lock_and_no_clobber);
+	UT_RUN(test_history_stage_uncertain_sync_keeps_formal_and_can_finish);
+	UT_RUN(test_history_encoder_and_prepare_refuse_aliases);
+	UT_RUN(test_history_stage_refuses_corrupt_or_unsafe_formal_without_overwrite);
+	UT_RUN(test_history_stage_refuses_replaced_temporary_and_directory);
+	UT_RUN(test_history_stage_bad_owner_duplicate_and_disabled_sync);
+	UT_RUN(test_history_prepare_refuses_unsafe_dirs_and_invalid_parameters);
+	UT_RUN(test_history_stage_changed_bytes_refuse_without_install);
+	UT_RUN(test_history_discard_sync_failure_cannot_resurrect_install);
+	UT_RUN(test_history_prepare_sync_failure_clears_output_and_owned_temp);
+	UT_RUN(test_history_produced_file_reaches_actual_bootstrap_consumer);
+	test_history_fail_sync = 0;
+	test_cf_mode = NoLock;
 	UT_RUN(test_abi_identity_and_features);
 	UT_RUN(test_invalid_argument_precedes_authority_io);
 	UT_RUN(test_external_fence_bit24_activation_is_forbidden_without_provider);
