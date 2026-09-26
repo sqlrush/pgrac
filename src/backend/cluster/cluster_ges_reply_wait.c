@@ -379,7 +379,6 @@ cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key, uint32 reply_opcode,
 							   uint32 reject_reason)
 {
 	GesReplyWaitEntry *entry;
-	GesReplyWaitEntry *woke = NULL;
 	GesReplyDeliverResult result;
 	ClusterXpScope xp_wake; /* PGRAC: spec-5.59 D2 profiling */
 
@@ -409,20 +408,20 @@ cluster_ges_reply_wait_deliver(const GesReplyWaitKey *key, uint32 reply_opcode,
 		if (found)
 			pg_atomic_fetch_sub_u64(&reply_wait_state->reply_wait_table_active, 1);
 	} else {
-		/* Live waiter: store the verdict + ready under the lock; broadcast the CV
-		 * AFTER releasing it (the waiter re-checks `ready`, so the broadcast is only a
-		 * wakeup hint — mirrors the lock-free cluster_ges_reply_wait_wake contract). */
+		/* Publish and notify while the table still owns the entry. Cooperative
+		 * poll-consume can delete/recycle it as soon as this LWLock is released.
+		 * Native CV notification does not sleep, and uses the same LWLock→CV
+		 * spinlock order as sleep_exact's enrollment. A ready predicate prevents
+		 * lost wakeups, but does not preserve the notification target's storage. */
 		entry->reply_opcode = reply_opcode;
 		entry->reject_reason = reject_reason;
 		pg_write_barrier();
 		entry->ready = true;
-		woke = entry;
+		ConditionVariableBroadcast(&entry->cv);
 		result = GES_REPLY_DELIVER_WOKE;
 	}
 	LWLockRelease(&reply_wait_state->lwlock);
 
-	if (woke != NULL)
-		ConditionVariableBroadcast(&woke->cv);
 	cluster_xp_end(&xp_wake); /* PGRAC: spec-5.59 D2 profiling */
 	return result;
 }
