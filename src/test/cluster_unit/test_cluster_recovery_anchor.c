@@ -102,6 +102,7 @@ static uint64 test_admitted_incarnation = UINT64_C(77);
 static bool test_owner_eor_active;
 static bool test_exactly_one_declared_node = true;
 static bool test_cf_local_x_held = true;
+static bool test_cf_retiring;
 static int test_write_fence_calls;
 static ClusterStartupPhase test_startup_phase = CLUSTER_PHASE_RUNNING;
 static TimestampTz test_phase4_started_at = 1000;
@@ -214,6 +215,12 @@ bool
 cluster_cf_held(LOCKMODE mode)
 {
 	return mode == ExclusiveLock && test_cf_local_x_held;
+}
+
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
+	return mode == ExclusiveLock && test_cf_local_x_held && !test_cf_retiring;
 }
 
 bool
@@ -404,6 +411,7 @@ wipe_anchor_files(void)
 	cluster_controlfile_shared_authority = true;
 	test_exactly_one_declared_node = true;
 	test_cf_local_x_held = true;
+	test_cf_retiring = false;
 	test_write_fence_calls = 0;
 	test_startup_phase = CLUSTER_PHASE_RUNNING;
 	test_phase4_started_at = 1000;
@@ -860,6 +868,10 @@ UT_TEST(test_checkpoint_publish_native_seed_proof_is_exact)
 
 	configure_exact_native_seed_publisher();
 	test_cf_local_x_held = false;
+	assert_phase4_publish_rejected_before_io(&cp);
+
+	configure_exact_native_seed_publisher();
+	test_cf_retiring = true;
 	assert_phase4_publish_rejected_before_io(&cp);
 
 	configure_exact_native_seed_publisher();

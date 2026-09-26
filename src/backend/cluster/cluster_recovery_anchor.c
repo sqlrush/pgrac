@@ -1212,7 +1212,7 @@ checkpoint_publisher_is_current(uint64 expected_sysid)
 	if (!cluster_enabled && cluster_controlfile_shared_authority && self_incarnation == 0
 		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_ABSENT
 		&& cluster_membership_get_last_admitted_incarnation(cluster_node_id) == 0
-		&& cluster_cf_exactly_one_declared_node() && cluster_cf_held(ExclusiveLock))
+		&& cluster_cf_exactly_one_declared_node() && cluster_cf_held_is_usable(ExclusiveLock))
 		return true;
 	if (self_incarnation != 0
 		&& cluster_membership_get_state(cluster_node_id) == CLUSTER_MEMBER_MEMBER

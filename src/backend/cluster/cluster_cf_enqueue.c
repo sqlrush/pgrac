@@ -47,12 +47,15 @@
  * release can target the exact GRD holder + request_id the acquire
  * registered.  `coordinated` is false when the acquire returned OK_NATIVE
  * (cluster/LMS layer inactive): nothing was registered in the GRD, so the
- * release must not run S6 against a phantom holder.  There is one slot per
- * mode (X / S); CF is not reentrant within a backend for a given mode.
+ * release must not run S6 against a phantom holder.  `release_pending` revokes
+ * local authority before S6 can yield or throw, without forgetting a possibly
+ * live remote holder.  There is one slot per mode (X / S); CF is not reentrant
+ * within a backend for a given mode.
  */
 typedef struct CfHoldState {
 	bool held;
 	bool coordinated;
+	bool release_pending;
 	ClusterLockAcquireRequest req; /* resid + holder + request_id for release */
 } CfHoldState;
 
@@ -193,6 +196,7 @@ cluster_cf_lock(LOCKMODE mode)
 			 */
 		slot->held = true;
 		slot->coordinated = false;
+		slot->release_pending = false;
 		slot->req = req;
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
@@ -214,6 +218,7 @@ cluster_cf_lock(LOCKMODE mode)
 		}
 		slot->held = true;
 		slot->coordinated = true;
+		slot->release_pending = false;
 		slot->req = req; /* holder + request_id for the release */
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
@@ -238,22 +243,16 @@ cluster_cf_lock(LOCKMODE mode)
 void
 cluster_cf_unlock(LOCKMODE mode)
 {
+	/* Legacy callers cannot consume a verdict, but must retain cleanup duty. */
+	(void)cluster_cf_unlock_confirmed(mode);
+}
+
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
 	CfHoldState *slot = cf_slot(mode);
 
-	if (!slot->held)
-		return;
-
-	/*
-	 * Release the exact GRD holder the acquire registered, draining + waking
-	 * any blocked cross-node waiters (S6).  Use the captured request (CF
-	 * resid + holder + request_id) rather than cluster_lock_release(), which
-	 * re-derives the resid from a PG LOCKTAG that CF does not have.
-	 */
-	if (slot->coordinated)
-		(void)cluster_lock_acquire_s6_release(&slot->req);
-
-	slot->held = false;
-	slot->coordinated = false;
+	return slot->held && !slot->release_pending;
 }
 
 bool
@@ -261,7 +260,7 @@ cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
 	CfHoldState *slot = cf_slot(mode);
 
-	return slot->held && slot->coordinated;
+	return cluster_cf_held_is_usable(mode) && slot->coordinated;
 }
 
 ClusterCfReleaseResult
@@ -273,22 +272,24 @@ cluster_cf_unlock_confirmed(LOCKMODE mode)
 	if (!slot->held)
 		return CLUSTER_CF_RELEASE_NOT_HELD;
 	if (!slot->coordinated) {
-		slot->held = false;
-		slot->coordinated = false;
+		memset(slot, 0, sizeof(*slot));
 		return CLUSTER_CF_RELEASE_NOT_HELD;
 	}
 
+	/* S6 may remove the remote holder then lose its reply, or unwind on error.
+	 * Neither case permits another read/write under this old request. Keep
+	 * the exact identity visible to retirement, lock-order and stop checks. */
+	slot->release_pending = true;
 	result = cluster_lock_acquire_s6_release(&slot->req);
 	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 
-	slot->held = false;
-	slot->coordinated = false;
+	memset(slot, 0, sizeof(*slot));
 	return CLUSTER_CF_RELEASE_CONFIRMED;
 }
 
 /*
- * cluster_cf_held -- does this backend hold the CF lock in `mode`?
+ * cluster_cf_held -- does this backend retain ownership/cleanup in `mode`?
  */
 bool
 cluster_cf_held(LOCKMODE mode)
@@ -312,7 +313,8 @@ cluster_cf_set_bootstrap_authority(bool on)
 bool
 cluster_cf_write_permitted(void)
 {
-	return cluster_cf_held(ExclusiveLock) || cf_bootstrap_authority || cf_owner_eor_authority;
+	return cluster_cf_held_is_usable(ExclusiveLock) || cf_bootstrap_authority
+		   || cf_owner_eor_authority;
 }
 
 /*

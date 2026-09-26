@@ -345,6 +345,12 @@ cluster_cf_owner_eor_local_active(void)
 	abort();
 }
 bool
+cluster_cf_held_is_usable(LOCKMODE mode pg_attribute_unused())
+{
+	/* Native clean-seed publication is outside this root fixture. */
+	abort();
+}
+bool
 cluster_write_fence_allowed(void)
 {
 	if (test_checkpoint_mode)

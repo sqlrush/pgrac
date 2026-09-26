@@ -31,6 +31,7 @@
  */
 #include "postgres.h"
 
+#include <setjmp.h>
 #include <unistd.h>
 
 #include "cluster/cluster_cf_enqueue.h"
@@ -151,6 +152,13 @@ static ClusterLockAcquireResult g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static ClusterLockAcquireResult g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 static int g_s6_count = 0;
 static uint8 g_s6_last_resid_type = 0;
+static int g_seven_count;
+static uint64 g_next_request_id = 7;
+static ClusterLockAcquireRequest g_promoted_request;
+static ClusterLockAcquireRequest g_released_request;
+static bool g_s6_observe;
+static bool g_s6_throw;
+static jmp_buf g_s6_jump;
 /* spec-5.6 Dc4b: capture what cluster_cf_lock threaded into the request. */
 static int g_last_timeout_ms = -999;
 static uint32 g_last_wait_event = 0xFFFFFFFFu;
@@ -160,6 +168,7 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 {
 	ClusterLockAcquireRequest *mut = (ClusterLockAcquireRequest *)req;
 
+	g_seven_count++;
 	/* spec-5.6 Dc4b: record the CF acquire's timeout + wait-event override. */
 	g_last_timeout_ms = req->timeout_ms;
 	g_last_wait_event = req->wait_event;
@@ -167,14 +176,16 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	/* simulate S3 fill_request_holder filling the holder + request id */
 	mut->holder.node_id = 1;
 	mut->holder.procno = 42;
-	mut->request_id = 7;
+	mut->holder.cluster_epoch = 9;
+	mut->request_id = g_next_request_id;
+	mut->holder.request_id = g_next_request_id;
 	return g_seven_result;
 }
 
 ClusterLockAcquireResult
 cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 {
-	(void)req;
+	g_promoted_request = *req;
 	return g_s5_result;
 }
 
@@ -183,6 +194,15 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
 	g_s6_count++;
 	g_s6_last_resid_type = req->resid.type;
+	g_released_request = *req;
+	if (g_s6_observe) {
+		/* These are observations of the real CF owner while S6 is in flight. */
+		UT_ASSERT(cluster_cf_held(req->lockmode));
+		UT_ASSERT(!cluster_cf_held_is_clusterwide(req->lockmode));
+		UT_ASSERT(!cluster_cf_write_permitted());
+	}
+	if (g_s6_throw)
+		longjmp(g_s6_jump, 1);
 	return g_s6_result;
 }
 
@@ -507,11 +527,100 @@ UT_TEST(test_confirmed_release_requires_clusterwide_s6_success)
 	g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
 	UT_ASSERT(cluster_cf_held(ExclusiveLock));
-	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT(!cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT(!cluster_cf_write_permitted());
 
 	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_CONFIRMED);
 	UT_ASSERT(!cluster_cf_held(ExclusiveLock));
+}
+
+UT_TEST(test_void_release_retains_exact_request_without_authority)
+{
+	static const ClusterLockAcquireResult failures[]
+		= { CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT, CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE,
+			CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL };
+	int i, j;
+
+	cluster_cf_set_bootstrap_authority(false);
+	cluster_cf_owner_eor_abort();
+	g_seven_result = g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	for (i = 0; i < 2; i++) {
+		LOCKMODE mode = i ? ExclusiveLock : ShareLock;
+		for (j = 0; j < lengthof(failures); j++) {
+			ClusterLockAcquireRequest acquired;
+			UT_ASSERT(cluster_cf_lock(mode));
+			acquired = g_promoted_request;
+			g_s6_result = failures[j];
+			g_s6_observe = true;
+			cluster_cf_unlock(mode);
+			UT_ASSERT(cluster_cf_held(mode));
+			UT_ASSERT(!cluster_cf_held_is_clusterwide(mode));
+			UT_ASSERT(!cluster_cf_write_permitted());
+			UT_ASSERT(memcmp(&g_released_request, &acquired, sizeof(acquired)) == 0);
+			g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+			UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_CONFIRMED);
+			UT_ASSERT(memcmp(&g_released_request, &acquired, sizeof(acquired)) == 0);
+			UT_ASSERT(!cluster_cf_held(mode));
+			g_s6_observe = false;
+		}
+	}
+}
+
+static void
+check_release_interrupt(LOCKMODE mode)
+{
+	g_seven_result = g_s5_result = g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT(cluster_cf_lock(mode));
+	g_s6_throw = g_s6_observe = true;
+	if (setjmp(g_s6_jump) == 0) {
+		cluster_cf_unlock(mode);
+		UT_ASSERT(false); /* The controlled substrate must unwind this call. */
+	}
+	g_s6_throw = false;
+	UT_ASSERT(cluster_cf_held(mode));
+	UT_ASSERT(!cluster_cf_held_is_clusterwide(mode));
+	UT_ASSERT(!cluster_cf_write_permitted());
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT(memcmp(&g_released_request, &g_promoted_request, sizeof(g_released_request)) == 0);
+	UT_ASSERT(!cluster_cf_held(mode));
+	g_s6_observe = false;
+}
+
+UT_TEST(test_release_interrupt_keeps_cleanup_but_no_authority)
+{
+	check_release_interrupt(ShareLock);
+	check_release_interrupt(ExclusiveLock);
+}
+
+UT_TEST(test_reacquire_drains_old_identity_before_creating_new)
+{
+	ClusterLockAcquireRequest original;
+	int acquires;
+
+	g_seven_result = g_s5_result = g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	g_next_request_id = 41;
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	original = g_promoted_request;
+	acquires = g_seven_count;
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	g_next_request_id = 42;
+	UT_ASSERT(!cluster_cf_lock(ExclusiveLock));
+	UT_ASSERT_EQ(g_seven_count, acquires);
+	UT_ASSERT(memcmp(&g_released_request, &original, sizeof(original)) == 0);
+	UT_ASSERT(cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(!cluster_cf_write_permitted());
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	UT_ASSERT_EQ(g_seven_count, acquires + 1);
+	UT_ASSERT(memcmp(&g_released_request, &original, sizeof(original)) == 0);
+	UT_ASSERT_EQ(g_promoted_request.request_id, 42);
+	UT_ASSERT(cluster_cf_held_is_clusterwide(ExclusiveLock));
+	UT_ASSERT(cluster_cf_write_permitted());
+	cluster_cf_unlock(ExclusiveLock);
+	UT_ASSERT_EQ(g_released_request.request_id, 42);
+	g_next_request_id = 7;
 }
 
 UT_TEST(test_native_hold_never_becomes_clusterwide_authority)
@@ -608,6 +717,8 @@ UT_TEST(test_stop_cf_original_holds_and_confirmed_retirement)
 		UT_ASSERT(cluster_cf_held(mode));
 		g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
 		UT_ASSERT_EQ(cluster_cf_unlock_confirmed(mode), CLUSTER_CF_RELEASE_UNCONFIRMED);
+		UT_ASSERT(!cluster_cf_held_is_clusterwide(mode));
+		UT_ASSERT(!cluster_cf_write_permitted());
 		UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_PENDING);
 		g_shared_stop_result = CLUSTER_NORMAL_STOP_INVALID;
 		UT_ASSERT_EQ(cluster_cf_normal_stop_poll(true, &reason), CLUSTER_NORMAL_STOP_INVALID);
@@ -646,7 +757,7 @@ UT_TEST(test_stop_cf_separates_old_skip_from_post_checkpoint_permission)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(18);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -655,6 +766,9 @@ main(void)
 	UT_RUN(test_owner_eor_abort_retains_active_and_blocks_retry);
 	UT_RUN(test_lock_native_no_release);
 	UT_RUN(test_confirmed_release_requires_clusterwide_s6_success);
+	UT_RUN(test_void_release_retains_exact_request_without_authority);
+	UT_RUN(test_release_interrupt_keeps_cleanup_but_no_authority);
+	UT_RUN(test_reacquire_drains_old_identity_before_creating_new);
 	UT_RUN(test_native_hold_never_becomes_clusterwide_authority);
 	UT_RUN(test_lock_failclosed_timeout);
 	UT_RUN(test_lock_s5_fail);

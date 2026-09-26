@@ -207,8 +207,11 @@ static bool stub_lms_ready = true;
 static int32 stub_cf_master = 0;
 static bool stub_cf_lock_ok = true;
 static bool stub_cf_held = false;
+static bool stub_cf_retiring;
 static int stub_cf_lock_count = 0;
 static int stub_cf_unlock_count = 0;
+static int stub_source_writer_count;
+static bool stub_source_writer_enter_ok = true;
 
 bool
 cluster_lms_is_ready(void)
@@ -246,6 +249,13 @@ cluster_cf_held(LOCKMODE mode)
 {
 	UT_ASSERT_EQ(mode, ExclusiveLock);
 	return stub_cf_held;
+}
+
+bool
+cluster_cf_held_is_usable(LOCKMODE mode)
+{
+	UT_ASSERT_EQ(mode, ExclusiveLock);
+	return stub_cf_held && !stub_cf_retiring;
 }
 
 void
@@ -433,6 +443,9 @@ fixture_reset(void)
 	stub_cf_lock_ok = true;
 	stub_cf_held = false;
 	stub_cf_lock_count = 0;
+	stub_cf_retiring = false;
+	stub_source_writer_count = 0;
+	stub_source_writer_enter_ok = true;
 	stub_cf_unlock_count = 0;
 	stub_cf_release_confirmed = true;
 	virtual_file_size = CLUSTER_WAL_STATE_FILE_SIZE;
@@ -470,6 +483,7 @@ telemetry_update(void)
 static void
 assert_no_registry_io(void)
 {
+	UT_ASSERT_EQ(stub_source_writer_count, 0);
 	UT_ASSERT_EQ(open_count, 0);
 	UT_ASSERT_EQ(pwrite_count, 0);
 	UT_ASSERT_EQ(fsync_count, 0);
@@ -479,6 +493,13 @@ assert_no_registry_io(void)
 UT_TEST(test_a1_verified_cf_gate_rejects_before_io)
 {
 	ClusterWalStateUpdate update = telemetry_update();
+
+	fixture_reset();
+	stub_source_writer_enter_ok = false;
+	UT_ASSERT_EQ(cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+				 CLUSTER_WAL_STATE_UPDATE_NOOP);
+	assert_no_registry_io();
+	UT_ASSERT_EQ(stub_cf_lock_count, 0);
 
 	fixture_reset();
 	cluster_controlfile_shared_authority = false;
@@ -606,6 +627,7 @@ UT_TEST(test_a1_short_write_and_fsync_fail_without_compensation)
 				 (int)CLUSTER_WAL_STATE_UPDATE_IO_ERROR);
 	UT_ASSERT_EQ(pwrite_count, 1);
 	UT_ASSERT_EQ(fsync_count, 1);
+	UT_ASSERT_EQ(stub_source_writer_count, 0);
 	UT_ASSERT_EQ(slot_pread_count, 1);
 	UT_ASSERT_EQ(stub_cf_unlock_count, 1);
 }
@@ -650,6 +672,34 @@ UT_TEST(test_a1_borrow_verified_cf_does_not_reenter_or_unlock)
 	assert_no_registry_io();
 	UT_ASSERT_EQ(stub_cf_lock_count, 0);
 	UT_ASSERT_EQ(stub_cf_unlock_count, 0);
+}
+
+UT_TEST(test_retiring_cf_is_not_borrowed_and_still_blocks_reentry)
+{
+	ClusterWalStateUpdate update = telemetry_update();
+	unsigned char before[CLUSTER_WAL_STATE_FILE_SIZE];
+	ClusterWalStateSlot published, sentinel;
+
+	fixture_reset();
+	stub_cf_held = stub_cf_retiring = true;
+	memcpy(before, virtual_file, sizeof(before));
+	memset(&sentinel, 0xa5, sizeof(sentinel));
+	published = sentinel;
+	UT_ASSERT_EQ(cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_BORROW_X, &published),
+				 CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
+	assert_no_registry_io();
+	UT_ASSERT_EQ(event_count, 0);
+	UT_ASSERT(memcmp(before, virtual_file, sizeof(before)) == 0);
+	UT_ASSERT(memcmp(&published, &sentinel, sizeof(published)) == 0);
+	UT_ASSERT(stub_cf_held);
+
+	fixture_reset();
+	stub_cf_held = stub_cf_retiring = true;
+	UT_ASSERT_EQ(cluster_wal_state_update_own(&update, CLUSTER_WAL_STATE_CF_ACQUIRE_X, NULL),
+				 CLUSTER_WAL_STATE_UPDATE_CF_UNAVAILABLE);
+	assert_no_registry_io();
+	UT_ASSERT_EQ(event_count, 0);
+	UT_ASSERT(stub_cf_held);
 }
 
 UT_TEST(test_a1_fresh_header_slot_typed_rejections)
@@ -853,17 +903,23 @@ UT_TEST(test_g4_census_gate_green_all_sites_gate_bound)
 }
 
 
-/* RF-ROOT P9 verification (implementation): source-close writer gate stubs — the
- * unit harness never freezes the source. */
+/* Model the real source-close gate's owned writer count: the RMW consumer
+ * must leave on every post-enter refusal as well as after actual I/O. */
 bool
 cluster_r4_bit22_source_writer_enter(void)
 {
+	if (!stub_source_writer_enter_ok)
+		return false;
+	stub_source_writer_count++;
 	return true;
 }
 
 void
 cluster_r4_bit22_source_writer_leave(void)
-{}
+{
+	UT_ASSERT(stub_source_writer_count > 0);
+	stub_source_writer_count--;
+}
 
 bool
 cluster_r4_bit22_source_close_begin(uint64 transition_epoch pg_attribute_unused(),
@@ -882,7 +938,7 @@ cluster_r4_bit22_source_close_current(uint64 transition_epoch pg_attribute_unuse
 int
 main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 {
-	UT_PLAN(13);
+	UT_PLAN(14);
 
 
 	UT_RUN(test_a1_verified_cf_gate_rejects_before_io);
@@ -891,6 +947,7 @@ main(int argc pg_attribute_unused(), char **argv pg_attribute_unused())
 	UT_RUN(test_a1_short_write_and_fsync_fail_without_compensation);
 	UT_RUN(test_a1_postread_mismatch_fails_without_compensation);
 	UT_RUN(test_a1_borrow_verified_cf_does_not_reenter_or_unlock);
+	UT_RUN(test_retiring_cf_is_not_borrowed_and_still_blocks_reentry);
 	UT_RUN(test_a1_fresh_header_slot_typed_rejections);
 	UT_RUN(test_a1_w1_runtime_ensure_is_validate_only);
 	UT_RUN(test_a1_w1_runtime_validates_every_slot_and_bootstrap_is_early_noop);

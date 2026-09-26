@@ -78,6 +78,8 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
  *
  *	cluster_cf_unlock releases the previously-held lock, draining and waking
  *	any blocked cross-node waiters (via S6 release).  A no-op if not held.
+ *	An unconfirmed release retains the exact cleanup record, not authority.
+ *	Use cluster_cf_unlock_confirmed when the caller must consume the verdict.
  */
 extern bool cluster_cf_lock(LOCKMODE mode);
 extern void cluster_cf_unlock(LOCKMODE mode);
@@ -88,20 +90,24 @@ typedef enum ClusterCfReleaseResult {
 	CLUSTER_CF_RELEASE_UNCONFIRMED = 2
 } ClusterCfReleaseResult;
 
-extern bool cluster_cf_held_is_clusterwide(LOCKMODE mode);
 extern ClusterCfReleaseResult cluster_cf_unlock_confirmed(LOCKMODE mode);
 
 /*
- * cluster_cf_held -- true if this backend currently holds the CF lock in the
- * given mode.  Used by the write path to Assert the caller-level CF X is held
- * before an authority write (spec-5.6).
+ * cluster_cf_held -- retained ownership, including an unconfirmed release.
+ * Use for lock-order, reentry and shutdown checks, never as positive proof
+ * of permission to read or write. Only exact retirement clears this record.
  */
 extern bool cluster_cf_held(LOCKMODE mode);
+
+/* Positive authority ends before the first release attempt can yield/throw.
+ * The usable predicate includes native holds; clusterwide also requires GES. */
+extern bool cluster_cf_held_is_usable(LOCKMODE mode);
+extern bool cluster_cf_held_is_clusterwide(LOCKMODE mode);
 
 /*
  * cluster_cf_write_permitted -- true if a shared-authority control-file write
  * is currently allowed by one of three process-local facts: this backend holds
- * CF X, Startup owns the bootstrap single-node window, or the EOR checkpointer
+ * usable CF X, Startup owns the bootstrap single-node window, or the EOR checkpointer
  * consumed that exact OWNER handoff.  Shared phase alone never grants a write.
  */
 extern bool cluster_cf_write_permitted(void);
