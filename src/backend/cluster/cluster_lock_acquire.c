@@ -1302,6 +1302,8 @@ cluster_grd_redeclare_all_registered(void)
 {
 	uint64 gen;
 	uint64 cur_epoch;
+	uint64 enumerated_count = 0;
+	uint32 registered_count;
 	HTAB *locallocks;
 	HASH_SEQ_STATUS status;
 	LOCALLOCK *locallock;
@@ -1326,10 +1328,12 @@ cluster_grd_redeclare_all_registered(void)
 	gen = cluster_grd_redeclare_generation();
 	if (gen == 0)
 		return; /* no barrier ever armed */
-	if (pg_atomic_read_u64(&MyProc->cluster_grd_redeclare_acked) >= gen)
-		return; /* already acked this generation */
-
 	cur_epoch = cluster_epoch_get_current();
+	if (pg_atomic_read_u64(&MyProc->cluster_grd_redeclare_acked) == gen
+		&& pg_atomic_read_u64(&MyProc->cluster_grd_redeclare_acked_epoch) == cur_epoch)
+		return; /* already acked this exact reconstruction cut */
+
+	registered_count = pg_atomic_read_u32(&MyProc->cluster_grd_registered_count);
 	locallocks = GetLockMethodLocalHash();
 	if (locallocks != NULL) {
 		hash_seq_init(&status, locallocks);
@@ -1343,6 +1347,7 @@ cluster_grd_redeclare_all_registered(void)
 
 			if (!locallock->cluster_registered)
 				continue;
+			enumerated_count++;
 
 			/*
 			 * Release-in-flight guard:  the lock.c cluster release hook
@@ -1393,14 +1398,16 @@ cluster_grd_redeclare_all_registered(void)
 	}
 
 	/*
-	 * P0-1 epoch coherence:  ack ONLY if the epoch did not move while we
-	 * walked.  If it did, the holders we just stamped are already stale;
-	 * leaving this proc un-acked makes LMON's barrier wait, and the next
-	 * generation (re-broadcast under the new episode epoch) re-walks us.
-	 * We publish the ack EPOCH alongside the generation so the barrier
-	 * can reject an ack that pre-dates a mid-episode epoch bump.
+	 * Missing registered records are not an empty census.  The complete
+	 * owner count, generation and epoch must also survive any blocking
+	 * re-declaration; otherwise the next broadcast must walk us again.
+	 * Count release-in-flight records too, without rebinding them above.
+	 * Publish epoch before generation so the barrier can reject an ACK
+	 * that pre-dates a mid-episode epoch bump.
 	 */
-	if (all_ok && cluster_epoch_get_current() == cur_epoch) {
+	if (all_ok && enumerated_count == registered_count
+		&& pg_atomic_read_u32(&MyProc->cluster_grd_registered_count) == registered_count
+		&& cluster_epoch_get_current() == cur_epoch && cluster_grd_redeclare_generation() == gen) {
 		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked_epoch, cur_epoch);
 		pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked, gen);
 	}

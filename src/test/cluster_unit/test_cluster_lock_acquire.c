@@ -57,6 +57,7 @@
 #include "miscadmin.h"
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
 
 /* Drop PG's port.h printf override; unit_test.h uses stdlib printf. */
 #ifdef vprintf
@@ -227,10 +228,7 @@ GetTopTransactionIdIfAny(void)
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_grd.h"
 
-struct PGPROC {
-	int pgprocno;
-};
-struct PGPROC *MyProc = NULL;
+PGPROC *MyProc = NULL;
 AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 int cluster_node_id = 0;
@@ -280,16 +278,27 @@ GetCurrentTimestamp(void)
 	return 0;
 }
 
+/* Controlled enumeration feeds the real owner walker and native PGPROC. */
+static uint64 stub_redeclare_epoch = 1;
+static uint64 stub_redeclare_generation;
+static LOCALLOCK stub_redeclare_locks[2];
+static bool stub_redeclare_hash_available;
+static int stub_redeclare_lock_count;
+static int stub_redeclare_lock_cursor;
+typedef enum RedeclareWalkDrift {
+	REDECLARE_WALK_STABLE,
+	REDECLARE_WALK_EPOCH_CHANGED,
+	REDECLARE_WALK_GENERATION_CHANGED,
+	REDECLARE_WALK_COUNT_CHANGED
+} RedeclareWalkDrift;
+static RedeclareWalkDrift stub_redeclare_drift;
+
 uint64
 cluster_epoch_get_current(void)
 {
-	return 1;
+	return stub_redeclare_epoch;
 }
 
-/* spec-4.6 D3 stubs — the cooperative redeclare walker is inert in the
- * standalone fixture:  cluster_grd_redeclare_generation() == 0 makes
- * cluster_grd_redeclare_all_registered early-return, so the hash_seq /
- * LocalLockHash symbols are link-only and never reached at runtime. */
 bool cluster_enabled = false;
 
 /* spec-4.6 D4 stubs — the freeze gate consults the shard phase (NORMAL
@@ -328,7 +337,7 @@ ProcessInterrupts(void)
 uint64
 cluster_grd_redeclare_generation(void)
 {
-	return 0;
+	return stub_redeclare_generation;
 }
 
 /* spec-4.6 L11/L14 stub:  redeclare-skip sticky probe.  Standalone
@@ -362,16 +371,29 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 HTAB *
 GetLockMethodLocalHash(void)
 {
-	return NULL;
+	/* The opaque hash token is only passed back to hash_seq_init below. */
+	return stub_redeclare_hash_available ? (HTAB *)stub_redeclare_locks : NULL;
 }
 
 void
 hash_seq_init(HASH_SEQ_STATUS *status pg_attribute_unused(), HTAB *hashp pg_attribute_unused())
-{}
+{
+	stub_redeclare_lock_cursor = 0;
+}
 
 void *
 hash_seq_search(HASH_SEQ_STATUS *status pg_attribute_unused())
 {
+	if (stub_redeclare_lock_cursor < stub_redeclare_lock_count)
+		return &stub_redeclare_locks[stub_redeclare_lock_cursor++];
+	/* Change the observed cut after enumeration, before the real ACK write. */
+	if (stub_redeclare_drift == REDECLARE_WALK_EPOCH_CHANGED)
+		stub_redeclare_epoch++;
+	else if (stub_redeclare_drift == REDECLARE_WALK_GENERATION_CHANGED)
+		stub_redeclare_generation++;
+	else if (stub_redeclare_drift == REDECLARE_WALK_COUNT_CHANGED)
+		pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
+	stub_redeclare_drift = REDECLARE_WALK_STABLE;
 	return NULL;
 }
 
@@ -1365,13 +1387,141 @@ UT_TEST(test_s5_not_found_benign_narrow)
 }
 
 
+/* Each fixture starts at accepted epoch 11, reconstruction generation 7. */
+static void
+setup_redeclare_walk(PGPROC *proc, uint32 registered_count, int visible_count)
+{
+	int i;
+
+	memset(proc, 0, sizeof(*proc));
+	pg_atomic_init_u32(&proc->cluster_grd_registered_count, registered_count);
+	pg_atomic_init_u64(&proc->cluster_grd_redeclare_acked, 0);
+	pg_atomic_init_u64(&proc->cluster_grd_redeclare_acked_epoch, 0);
+	MyProc = proc;
+	cluster_enabled = true;
+	stub_redeclare_epoch = 11;
+	stub_redeclare_generation = 7;
+	stub_redeclare_hash_available = true;
+	stub_redeclare_lock_count = visible_count;
+	stub_redeclare_drift = REDECLARE_WALK_STABLE;
+	memset(stub_redeclare_locks, 0, sizeof(stub_redeclare_locks));
+	for (i = 0; i < visible_count; i++) {
+		ClusterGrdHolderId holder = { 0 };
+		LOCALLOCK *lock = &stub_redeclare_locks[i];
+
+		holder.node_id = 0;
+		holder.procno = 3;
+		holder.cluster_epoch = 11;
+		holder.request_id = 91 + i;
+		lock->cluster_registered = true;
+		lock->nLocks = 1;
+		lock->tag.mode = ShareLock;
+		lock->cluster_request_id = holder.request_id;
+		memcpy(lock->cluster_holder_raw, &holder, sizeof(holder));
+	}
+}
+
+static void
+reset_redeclare_walk(void)
+{
+	MyProc = NULL;
+	cluster_enabled = false;
+	stub_redeclare_epoch = 1;
+	stub_redeclare_generation = 0;
+	stub_redeclare_hash_available = false;
+	stub_redeclare_lock_count = 0;
+	stub_redeclare_drift = REDECLARE_WALK_STABLE;
+}
+
+UT_TEST(test_redeclare_walk_requires_complete_registered_census)
+{
+	const struct {
+		uint32 registered_count;
+		int visible_count;
+		bool hash_available;
+		bool want_ack;
+	} cases[] = { { 0, 0, false, true }, { 1, 0, false, false }, { 1, 0, true, false },
+				  { 1, 1, true, true },	 { 2, 1, true, false },	 { 2, 2, true, true } };
+	PGPROC proc;
+	size_t i;
+
+	for (i = 0; i < lengthof(cases); i++) {
+		setup_redeclare_walk(&proc, cases[i].registered_count, cases[i].visible_count);
+		stub_redeclare_hash_available = cases[i].hash_available;
+		cluster_grd_redeclare_all_registered();
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked),
+					 cases[i].want_ack ? 7 : 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch),
+					 cases[i].want_ack ? 11 : 0);
+	}
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_does_not_count_unregistered_records)
+{
+	PGPROC proc;
+
+	setup_redeclare_walk(&proc, 2, 2);
+	stub_redeclare_locks[1].cluster_registered = false;
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 0);
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_requires_stable_cut)
+{
+	PGPROC proc;
+	RedeclareWalkDrift drift;
+
+	for (drift = REDECLARE_WALK_EPOCH_CHANGED; drift <= REDECLARE_WALK_COUNT_CHANGED; drift++) {
+		setup_redeclare_walk(&proc, 1, 1);
+		stub_redeclare_drift = drift;
+		cluster_grd_redeclare_all_registered();
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 0);
+	}
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_cached_ack_requires_exact_epoch)
+{
+	PGPROC proc;
+
+	setup_redeclare_walk(&proc, 0, 0);
+	pg_atomic_write_u64(&proc.cluster_grd_redeclare_acked, 7);
+	pg_atomic_write_u64(&proc.cluster_grd_redeclare_acked_epoch, 10);
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	reset_redeclare_walk();
+}
+
+UT_TEST(test_redeclare_walk_release_in_flight_keeps_old_identity)
+{
+	PGPROC proc;
+	ClusterGrdHolderId holder;
+
+	setup_redeclare_walk(&proc, 1, 1);
+	memcpy(&holder, stub_redeclare_locks[0].cluster_holder_raw, sizeof(holder));
+	holder.cluster_epoch = 10;
+	memcpy(stub_redeclare_locks[0].cluster_holder_raw, &holder, sizeof(holder));
+	stub_redeclare_locks[0].nLocks = 0;
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	UT_ASSERT_EQ(memcmp(stub_redeclare_locks[0].cluster_holder_raw, &holder, sizeof(holder)), 0);
+	UT_ASSERT_EQ(stub_redeclare_locks[0].cluster_request_id, 91);
+	reset_redeclare_walk();
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(18);
+	UT_PLAN(23);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1391,6 +1541,11 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_cf_s4_dead_master_native_is_nonaffirmative);
 	UT_RUN(test_native_probe_same_lock_group_exempt);
 	UT_RUN(test_s5_not_found_benign_narrow);
+	UT_RUN(test_redeclare_walk_requires_complete_registered_census);
+	UT_RUN(test_redeclare_walk_does_not_count_unregistered_records);
+	UT_RUN(test_redeclare_walk_requires_stable_cut);
+	UT_RUN(test_redeclare_walk_cached_ack_requires_exact_epoch);
+	UT_RUN(test_redeclare_walk_release_in_flight_keeps_old_identity);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
