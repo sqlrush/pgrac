@@ -27,4 +27,13 @@ extern ClusterControlRootResult cluster_wal_tail_observe(const char *wal_root,
 														 XLogRecPtr minimum_end,
 														 ClusterWalTailObservation *out);
 
+/* PGRAC: also bind the selected checkpoint record inside the scanned
+ * prefix. A CRC-valid but different checkpoint cannot seal this root.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult
+cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+									int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
+									XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
+									ClusterWalTailObservation *out);
+
 #endif /* CLUSTER_WAL_TAIL_H */

@@ -85,7 +85,9 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| !cluster_recovery_duty_key_valid_for_claim(&identity, cluster_shared_config)
 		|| identity.origin_thread_id != origin_thread || identity.origin_node_id != origin_node
-		|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			&& !(cluster_shared_config
+				 && snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN))
 		|| memcmp(&snapshot.identity, &identity, sizeof(identity)) != 0)
 		return false;
 	out->origin_thread = origin_thread;

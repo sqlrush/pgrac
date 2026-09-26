@@ -229,6 +229,23 @@ cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expec
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *out_token);
 
+/* PGRAC: exact failed-writer control publishers. The request is a carrier,
+ * not authority: each operation authenticates its opaque formation/fence
+ * owners and the current physical v2 root. OPEN clears the checkpoint's old
+ * tail; SEAL owns WALR-S and input-only IR-X, scans physical WAL/PGWP and
+ * publishes the final input. Neither operation replays data or opens serving.
+ * All owned releases must be confirmed before outputs become usable.
+ * Author: SqlRush <sqlrush@gmail.com> */
+struct ClusterRecoverySerialRequest;
+extern ClusterControlRootResult
+cluster_control_root_v2_failure_open_publish(const struct ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_v2_failure_tail_publish(const struct ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token);
+
 extern bool
 cluster_control_root_create_authority_current_v1(const ClusterControlRootMigrationImage *image,
 												 const ClusterControlRootMigrationRoundV1 *round);

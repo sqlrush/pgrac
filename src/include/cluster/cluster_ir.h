@@ -77,7 +77,11 @@ typedef struct PgracExternalFenceAdmissionSetV1 PgracExternalFenceAdmissionSetV1
 
 typedef enum ClusterRecoverySerialMode {
 	CLUSTER_RECOVERY_SERIAL_ONLINE = 1,
-	CLUSTER_RECOVERY_SERIAL_COLD_FORMED = 2
+	CLUSTER_RECOVERY_SERIAL_COLD_FORMED = 2,
+	/* PGRAC: scan/publish input only, never page/side mutation authority.
+	 * Same IR resource; no disk, wire or shared-memory enum change.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CLUSTER_RECOVERY_SERIAL_INPUT_SEAL = 3
 } ClusterRecoverySerialMode;
 
 typedef enum ClusterRecoverySerialAcquireResult {
@@ -146,6 +150,8 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 								ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_input_revalidate(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialReleaseResult
 cluster_recovery_serial_release(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialAcquireResult

@@ -25,6 +25,8 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_external_fence.h"
+#include "cluster/cluster_ir.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_startup_phase.h"
@@ -36,6 +38,7 @@
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_durable_prefix.h"
 #include "cluster/cluster_wal_state.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster_control_root_private.h"
@@ -2998,6 +3001,395 @@ cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIden
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, thread_control,
 								 checkpoint_end, out, out_token, out_control);
+}
+
+/* PGRAC: failure input is a purpose-bound root transition, not a v1 patch
+ * or permission inferred from a dead bitmap. All borrowed evidence remains
+ * owned by the caller until our confirmed lock cleanup.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct FailureInputV2Work {
+	ControlRootImage base;
+	ControlRootImage next;
+	ControlFileData control;
+	ClusterControlRootReadToken token;
+	ClusterWalRootPublishGuard *walr;
+	ClusterRecoverySerialGuard serial;
+	ClusterWalDurablePrefixRef prefix_ref;
+	ClusterWalTailObservation tail;
+	LOCKMODE cf_mode;
+	int32 publisher_node;
+	uint64 publisher_incarnation;
+} FailureInputV2Work;
+
+static bool
+failure_v2_authorized(const ClusterRecoverySerialRequest *request, const FailureInputV2Work *work)
+{
+	ClusterRecoveryDutyDigest digest;
+	PgracExternalFenceDenyReason reason;
+	uint32 count;
+	bool original_owner = false;
+
+	if (cluster_node_id != work->publisher_node
+		|| cluster_qvotec_get_self_incarnation() != work->publisher_incarnation
+		|| work->publisher_incarnation == 0
+		|| (work->publisher_node == request->duty.origin_node_id
+			&& work->publisher_incarnation == request->duty.origin_owner_incarnation)
+		|| !cluster_recovery_duty_digest_for_claim(&request->duty, true, &digest)
+		|| cluster_formation_witness_revalidate_nowait(request->formation)
+			   != CLUSTER_FORMATION_WITNESS_READY
+		|| !cluster_external_fence_need_set_revalidate_nowait(request->fence_need_set,
+															  request->formation, &reason)
+		|| !cluster_external_fence_revalidate_set_nowait(
+			request->fence_admission_set, request->fence_need_set, request->formation, &reason))
+		return false;
+	count = cluster_external_fence_need_set_count(request->fence_need_set);
+	if (count == 0 || count > CLUSTER_MAX_NODES)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		const PgracExternalFenceNeedV1 *need
+			= cluster_external_fence_need_set_at(request->fence_need_set, i);
+
+		if (need == NULL || need->system_identifier != request->duty.system_identifier
+			|| memcmp(&need->canonical_duty_digest, &digest, sizeof(digest)) != 0)
+			return false;
+		if (need->victim_node_id == request->duty.origin_node_id
+			&& need->victim_incarnation == request->duty.origin_owner_incarnation)
+			original_owner = true;
+	}
+	return original_owner;
+}
+
+static ClusterControlRootResult
+failure_v2_cleanup(FailureInputV2Work *work, ClusterControlRootResult result)
+{
+	if (work->cf_mode != NoLock) {
+		LOCKMODE mode = work->cf_mode;
+
+		work->cf_mode = NoLock;
+		result = release_cf(mode, result);
+	}
+	if ((work->serial.held || work->serial.release_uncertain)
+		&& cluster_recovery_serial_release(&work->serial)
+			   != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
+		result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	if (work->walr != NULL
+		&& cluster_wal_retention_root_publish_end(&work->walr) != CLUSTER_WALR_RELEASE_CONFIRMED)
+		result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	if (result == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+			 errmsg("failed-thread input publisher could not confirm lock release"),
+			 errhint("Keep the failed thread closed until recovery ownership is re-established.")));
+	return result;
+}
+
+static bool
+failure_v2_current(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
+{
+	return failure_v2_authorized(request, work)
+		   && cluster_recovery_serial_input_revalidate(&work->serial)
+				  == CLUSTER_RECOVERY_SERIAL_CURRENT;
+}
+
+/* PGRAC: observe under owned CF, but never keep CF over the WAL scan.
+ * The full root token also detects changes to unrelated thread/common state.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+failure_v2_tail_read(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work,
+					 LOCKMODE mode)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken file_token;
+	const ClusterControlRootSnapshot *record;
+	int index = request->duty.origin_thread_id - 1;
+
+	if (!cluster_cf_lock(mode))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = mode;
+	if (!cluster_cf_held_is_clusterwide(mode))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
+														&file_token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	if (!read_token_equal(&work->token, &request->expected_root_token))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	record = &work->base.records[index];
+	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->base.header.v2.database_state < CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		|| work->base.header.v2.database_state > CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+		|| (record->root_flags & ~CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF)
+			   != (CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+				   | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID)
+		|| (work->base.header.v2.serving[request->duty.origin_node_id / 64]
+			& (UINT64_C(1) << (request->duty.origin_node_id % 64)))
+			   != 0)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	return failure_v2_current(request, work) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+											 : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+static ClusterControlRootResult
+failure_v2_tail_commit(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken file_token;
+	ClusterWalDurablePrefix fresh;
+	const ClusterWalDurablePrefix *observed = &work->tail.durable_prefix;
+	ClusterControlRootSnapshot *record;
+	int index = request->duty.origin_thread_id - 1;
+
+	result = failure_v2_tail_read(request, work, ExclusiveLock);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &work->prefix_ref, &fresh);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (fresh.sequence != observed->sequence || fresh.exclusive_end != observed->exclusive_end
+		|| fresh.record_start != observed->record_start || fresh.record_crc != observed->record_crc)
+		return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+	work->next = work->base;
+	record = &work->next.records[index];
+	record->root_flags |= CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+						  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID
+						  | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID;
+	record->tail_tli = record->checkpoint_tli;
+	record->tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	record->validated_tail_lsn_exclusive = work->tail.complete_end;
+	record->tail_last_record_lsn = work->tail.last_record_start;
+	record->tail_last_record_crc32c = work->tail.last_record_crc;
+	record->recovered_tli = record->checkpoint_tli;
+	record->recovered_through_lsn_exclusive = record->checkpoint_lower_lsn;
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_TAIL_VALIDATED;
+	record->root_publish_seq++;
+	record->published_at_usec = GetCurrentTimestamp();
+	work->next.publisher_node[index] = work->publisher_node;
+	work->next.publisher_incarnation[index] = work->publisher_incarnation;
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = record->published_at_usec;
+	result = cluster_control_root_v2_encode(&work->next);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!failure_v2_current(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
+														&file_token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	if (!failure_v2_current(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+failure_v2_tail_work(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
+{
+	ClusterControlRootResult result;
+	ClusterWalPinResult retained;
+	ClusterRecoverySerialAcquireResult acquired;
+	const ClusterControlRootSnapshot *record;
+	int index = request->duty.origin_thread_id - 1;
+
+	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
+															  &work->walr);
+	if (retained != CLUSTER_WAL_PIN_OK)
+		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	acquired = cluster_recovery_serial_acquire(request, &work->serial);
+	if (acquired != CLUSTER_RECOVERY_SERIAL_GRANTED)
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = failure_v2_tail_read(request, work, ShareLock);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	record = &work->base.records[index];
+	if (work->control.checkPoint < record->checkpoint_lower_lsn
+		|| work->control.checkPoint == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	work->prefix_ref.claim.identity = record->identity;
+	work->prefix_ref.claim.database_incarnation = work->base.header.v2.database_incarnation;
+	work->prefix_ref.claim.max_config_generation = work->base.header.v2.config_generation;
+	memcpy(work->prefix_ref.claim.claim_sha256, work->base.refs[index].claim_sha256, 32);
+	work->prefix_ref.timeline = record->checkpoint_tli;
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_tail_observe_checkpoint(
+		cluster_wal_threads_dir, &work->prefix_ref, wal_segment_size, record->checkpoint_lower_lsn,
+		work->control.checkPoint + 1, work->control.checkPoint, record->checkpoint_record_crc32c,
+		&work->tail);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!failure_v2_current(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return failure_v2_tail_commit(request, work);
+}
+
+static ClusterControlRootResult
+failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2Work *work)
+{
+	ClusterControlRootResult result;
+	ClusterWalPinResult retained;
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootSnapshot *record;
+	int index = request->duty.origin_thread_id - 1;
+
+	retained = cluster_wal_retention_root_publish_begin_exact(&request->expected_root_token, false,
+															  &work->walr);
+	if (retained != CLUSTER_WAL_PIN_OK)
+		return retained == CLUSTER_WAL_PIN_STALE ? CLUSTER_CONTROL_ROOT_STALE_TOKEN
+												 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!cluster_cf_lock(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ExclusiveLock;
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
+														&file_token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	if (!read_token_equal(&work->token, &request->expected_root_token))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	record = &work->base.records[index];
+	if (work->base.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->base.header.v2.database_state < CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		|| work->base.header.v2.database_state > CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (work->base.header.file_txn_seq == UINT64_MAX || record->root_publish_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	if (!failure_v2_authorized(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	work->next = work->base;
+	record = &work->next.records[index];
+	record->lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	/* PGRAC: failure cannot erase the failed writer's unsafe-FPW history.
+	 * Sealing input does not discharge this later recovery safety check. */
+	record->root_flags = (record->root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF)
+						 | CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID
+						 | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID;
+	record->tail_tli = 0;
+	record->tail_validation_kind = 0;
+	record->validated_tail_lsn_exclusive = 0;
+	record->tail_last_record_lsn = 0;
+	record->tail_last_record_crc32c = 0;
+	record->recovered_tli = 0;
+	record->recovered_through_lsn_exclusive = 0;
+	record->recovered_last_record_lsn = 0;
+	record->recovered_last_record_crc32c = 0;
+	record->conservative_bound_kind = CLUSTER_CONTROL_ROOT_BOUND_NONE;
+	record->conservative_commit_scn = 0;
+	record->lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_FAILURE_DUTY_OPEN;
+	record->root_publish_seq++;
+	record->published_at_usec = GetCurrentTimestamp();
+	work->next.publisher_node[index] = work->publisher_node;
+	work->next.publisher_incarnation[index] = work->publisher_incarnation;
+	work->next.header.v2.serving[request->duty.origin_node_id / 64]
+		&= ~(UINT64_C(1) << (request->duty.origin_node_id % 64));
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = record->published_at_usec;
+	result = cluster_control_root_v2_encode(&work->next);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!failure_v2_authorized(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
+														&file_token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	if (!failure_v2_authorized(request, work))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+					&work->token);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
+				   ClusterControlRootReadToken *out_token, bool seal_tail)
+{
+	FailureInputV2Work *work;
+	ClusterControlRootResult result;
+	ClusterRecoverySerialRequest saved_request;
+
+	/* PGRAC: permit replacing the caller's expected token in place. */
+	if (request != NULL) {
+		saved_request = *request;
+		request = &saved_request;
+	}
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out_token != NULL)
+		memset(out_token, 0, sizeof(*out_token));
+	if (request == NULL || out == NULL || out_token == NULL || !cluster_shared_config
+		|| !cluster_enabled || !cluster_controlfile_shared_authority || !enableFsync
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| request->mode != CLUSTER_RECOVERY_SERIAL_INPUT_SEAL
+		|| !cluster_recovery_duty_key_valid_for_claim(&request->duty, true)
+		|| request->duty.system_identifier != GetSystemIdentifier() || request->formation == NULL
+		|| request->fence_need_set == NULL || request->fence_admission_set == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work = palloc0(sizeof(*work));
+	work->publisher_node = cluster_node_id;
+	work->publisher_incarnation = cluster_qvotec_get_self_incarnation();
+	PG_TRY();
+	{
+		if (!failure_v2_authorized(request, work))
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else
+			result = seal_tail ? failure_v2_tail_work(request, work)
+							   : failure_v2_open_work(request, work);
+	}
+	PG_CATCH();
+	{
+		(void)failure_v2_cleanup(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	result = failure_v2_cleanup(work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		*out = work->base.records[request->duty.origin_thread_id - 1];
+		*out_token = work->token;
+	}
+	pfree(work);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_failure_open_publish(const ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token)
+{
+	return failure_v2_publish(request, out, out_token, false);
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_failure_tail_publish(const ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token)
+{
+	return failure_v2_publish(request, out, out_token, true);
 }
 
 /* PGRAC: the raw shutdown anchor and native insertion cut are independent

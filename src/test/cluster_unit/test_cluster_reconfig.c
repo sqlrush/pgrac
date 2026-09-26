@@ -591,6 +591,7 @@ errcode(int s pg_attribute_unused())
 #include "cluster/cluster_signal.h"
 
 bool cluster_enabled = false;
+bool cluster_shared_config = false;
 int cluster_node_id = 0;
 bool cluster_touched_peers_trace = false; /* spec-5.14 D4/D6 diag GUC stub */
 volatile sig_atomic_t cluster_reconfig_start_pending = 0;

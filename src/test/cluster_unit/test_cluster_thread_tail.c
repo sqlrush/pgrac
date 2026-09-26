@@ -609,6 +609,23 @@ UT_TEST(checkpoint_floor_and_claim_cannot_be_substituted)
 	UT_ASSERT_NE(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 }
 
+UT_TEST(checkpoint_identity_is_not_implied_by_a_valid_tail)
+{
+	ClusterWalDurablePrefix p;
+	ClusterWalTailObservation out, zero = { 0 };
+	fixture();
+	p = base_record();
+	UT_ASSERT_EQ(cluster_wal_tail_observe_checkpoint(scratch, &ref, wal_segment_size,
+													 p.record_start, p.exclusive_end,
+													 p.record_start, p.record_crc, &out),
+				 0);
+	UT_ASSERT_NE(cluster_wal_tail_observe_checkpoint(scratch, &ref, wal_segment_size,
+													 p.record_start, p.exclusive_end,
+													 p.record_start, p.record_crc ^ 1, &out),
+				 0);
+	UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+}
+
 UT_TEST(foreign_database_after_promise_is_not_a_torn_tail)
 {
 	uint64 other_sysid = 12345678;
@@ -716,7 +733,7 @@ UT_TEST(pre2_cannot_use_flat_decoy_when_exact_generation_missing)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 	UT_RUN(legacy_reader_still_works_without_shared_config);
 	UT_RUN(pre2_cannot_accept_lost_promised_suffix_from_legacy_reader);
 	UT_RUN(pre2_cannot_use_flat_decoy_when_exact_generation_missing);
@@ -737,6 +754,7 @@ main(void)
 	UT_RUN(cancellation_closes_owned_descriptors);
 	UT_RUN(exact_segment_end_allows_missing_unacknowledged_next_segment);
 	UT_RUN(checkpoint_floor_and_claim_cannot_be_substituted);
+	UT_RUN(checkpoint_identity_is_not_implied_by_a_valid_tail);
 	UT_RUN(foreign_database_after_promise_is_not_a_torn_tail);
 	UT_RUN(invalid_lower_does_not_search_forward);
 	UT_RUN(foreign_identity_after_promise_is_not_a_torn_tail);

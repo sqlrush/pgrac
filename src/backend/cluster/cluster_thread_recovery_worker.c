@@ -53,6 +53,7 @@
 #include "storage/ipc.h"
 #include "storage/latch.h"
 #include "utils/memutils.h"
+#include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -66,6 +67,7 @@
 #include "cluster/cluster_semantic_activation.h" /* bit22 cutover latch (contract §B) */
 #include "cluster/cluster_thread_recovery.h"	 /* slot helpers + replay_one + gates          */
 #include "cluster/cluster_thread_recovery_authority.h"
+#include "cluster_control_root_private.h"
 #include "cluster/storage/cluster_shared_fs.h" /* shared backend (scope)                    */
 
 /*
@@ -163,6 +165,36 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 	root_result = cluster_control_root_read_canonical(
 		eligibility->duty.origin_thread_id, &eligibility->duty, CLUSTER_CONTROL_ROOT_READ_STRONG,
 		&root_snapshot, &root_token);
+	/* PGRAC: seal the failed writer's input before acquiring replay owners.
+	 * The input publisher holds its own WALR/IR/CF and returns only after
+	 * confirmed release. Never promote that input-only guard into replay.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& memcmp(&root_snapshot.identity, &eligibility->duty, sizeof(eligibility->duty)) == 0) {
+		memset(&serial_request, 0, sizeof(serial_request));
+		serial_request.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
+		serial_request.duty = eligibility->duty;
+		serial_request.expected_root_token = root_token;
+		serial_request.formation = formation;
+		serial_request.fence_need_set = needs;
+		serial_request.fence_admission_set = admissions;
+		serial_request.acquire_timeout_ms = fence_timeout_ms;
+		serial_request.release_timeout_ms = fence_timeout_ms;
+		if (root_snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
+			root_result = cluster_control_root_v2_failure_open_publish(&serial_request,
+																	   &root_snapshot, &root_token);
+			serial_request.expected_root_token = root_token;
+		}
+		if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& root_snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			&& (root_snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0)
+			root_result = cluster_control_root_v2_failure_tail_publish(&serial_request,
+																	   &root_snapshot, &root_token);
+		if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			root_result = cluster_control_root_read_canonical(
+				eligibility->duty.origin_thread_id, &eligibility->duty,
+				CLUSTER_CONTROL_ROOT_READ_STRONG, &root_snapshot, &root_token);
+	}
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| root_snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
@@ -307,6 +339,12 @@ cluster_thread_recovery_worker_main(Datum main_arg)
 	if (!cluster_thread_recovery_worker_start_valid_for_claim(
 			&eligibility, (uint16)dead_tid, slot_read, state, launch_epoch, cluster_shared_config))
 		return;
+
+	/* PGRAC: SHMEM-only workers do not enter InitPostgres, which normally
+	 * establishes this lifetime. WAL retention and replay resources must have
+	 * an owner before any acquisition; the native helper installs exit cleanup.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CreateAuxProcessResourceOwner();
 
 	/* Cleanup authority on every controlled exit; scheduler state is reaped only
 	 * by the LMON owner after exact BGWH_STOPPED evidence. */

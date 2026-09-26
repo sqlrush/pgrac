@@ -1331,6 +1331,33 @@ UT_TEST(test_v2_pin_key_preserves_root_revalidation)
 	reset_pin_fakes();
 }
 
+UT_TEST(test_root_publisher_requires_resource_owner)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterWalRootPublishGuard *publisher = NULL;
+	ResourceOwner saved_owner = CurrentResourceOwner;
+
+	reset_pin_fakes();
+	CurrentResourceOwner = NULL;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_INVALID);
+	UT_ASSERT_NULL(publisher);
+	UT_ASSERT_EQ(fake_acquire_call_count, 0);
+	CurrentResourceOwner = saved_owner;
+	UT_ASSERT_EQ(
+		cluster_wal_retention_root_publish_begin_exact(&request.root_read, false, &publisher),
+		CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_NOT_NULL(publisher);
+	UT_ASSERT_EQ(cluster_wal_retention_root_publish_end(&publisher),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	UT_ASSERT_NULL(publisher);
+}
+
 UT_TEST(test_pin_one_thread_acquire_and_confirmed_release)
 {
 	ClusterWalRetentionInterval interval = { .thread_id = 1,
@@ -2589,7 +2616,7 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(49);
+	UT_PLAN(50);
 	UT_RUN(test_v2_e1_consumes_current_root_and_preserves_exact_floor);
 	UT_RUN(test_v2_retention_zero_crc_is_not_absent_authority);
 	UT_RUN(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose);
@@ -2610,6 +2637,7 @@ main(int argc, char **argv)
 	UT_RUN(test_walr_resource_encoding_refuses_invalid_thread);
 	UT_RUN(test_reuse_guard_preflight_stamps_folds_and_builds_needset);
 	UT_RUN(test_pin_one_thread_acquire_and_confirmed_release);
+	UT_RUN(test_root_publisher_requires_resource_owner);
 	UT_RUN(test_v2_pin_key_preserves_root_revalidation);
 	UT_RUN(test_pin_acquire_is_sorted_all_or_none);
 	UT_RUN(test_pin_uncertain_rollback_remains_cleanup_only);

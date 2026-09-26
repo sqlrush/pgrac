@@ -1408,13 +1408,27 @@ CLUSTER_CONTROL_ROOT_O = $(top_builddir)/src/backend/cluster/cluster_control_roo
 # stream.  The reader is compiled -DFRONTEND (pg_waldump style) so the
 # unit binary does not drag in backend palloc/elog/ShmemVariableCache
 # machinery; err*/BasicOpenFile are stubbed in the test file.
-test_cluster_control_root: test_cluster_control_root.c unit_test.h \
+test_cluster_control_root_worker.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_worker.c \
+		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_authority.c \
+		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c $(srcdir)/Makefile
+	awk '/^root_owner_exact\(/ { print "static bool"; emit=1; count++ } \
+	     /^cluster_thread_recovery_pin_request_build_v1\(/ || /^cluster_reconfig_thread_recovery_eligibility_consume\(/ { print "bool"; emit=1; count++ } \
+	     /^thread_recovery_worker_run\(/ { print "static ClusterThreadRecResult"; emit=1; count++ } \
+	     /^cluster_thread_recovery_worker_main\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 5) exit 1 }' \
+		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_authority.c \
+		$(top_srcdir)/src/backend/cluster/cluster_reconfig.c \
+		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_worker.c > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_control_root: test_cluster_control_root.c unit_test.h test_cluster_control_root_worker.inc \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
 		cluster_control_bootstrap_read_test.o \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
@@ -1423,6 +1437,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_recovery_anchor.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_claim.o \
 		$(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o \
+		$(top_builddir)/src/backend/cluster/cluster_wal_tail.o \
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
@@ -2535,6 +2550,7 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
+		test_cluster_control_root_worker.inc \
 		test_cluster_cr_mvcc_gate.inc \
 		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
 		test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc \

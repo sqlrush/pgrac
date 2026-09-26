@@ -26,6 +26,8 @@ typedef struct WalTailWork {
 	XLogReaderState *reader;
 	ClusterControlRootResult result;
 	ClusterWalTailObservation observed;
+	XLogRecPtr checkpoint_start;
+	pg_crc32c checkpoint_crc;
 } WalTailWork;
 
 static bool
@@ -203,6 +205,7 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 	XLogRecord *record;
 	char *error = NULL;
 	bool promise_seen = false;
+	bool checkpoint_seen = work->checkpoint_start == 0;
 	struct stat st;
 	ClusterControlRootResult result;
 
@@ -242,6 +245,13 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		CHECK_FOR_INTERRUPTS();
 		if (work->observed.records == 0 && work->reader->ReadRecPtr != lower)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (work->checkpoint_start != 0 && work->reader->ReadRecPtr == work->checkpoint_start) {
+			if (record->xl_crc != work->checkpoint_crc)
+				return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+			checkpoint_seen = true;
+		}
+		if (!checkpoint_seen && work->reader->ReadRecPtr > work->checkpoint_start)
+			return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 		if (work->reader->ReadRecPtr == work->observed.durable_prefix.record_start) {
 			if (work->reader->EndRecPtr != work->observed.durable_prefix.exclusive_end
 				|| record->xl_crc != work->observed.durable_prefix.record_crc)
@@ -257,7 +267,7 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 	}
 	if (work->result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return work->result;
-	if (!promise_seen || work->observed.complete_end < minimum)
+	if (!promise_seen || !checkpoint_seen || work->observed.complete_end < minimum)
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (!wal_tail_close_segment(work))
 		return work->result;
@@ -301,10 +311,11 @@ wal_tail_release(WalTailWork *work, ClusterControlRootResult result)
 	return result;
 }
 
-ClusterControlRootResult
-cluster_wal_tail_observe(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
-						 int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
-						 ClusterWalTailObservation *out)
+static ClusterControlRootResult
+wal_tail_observe_common(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+						int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
+						XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
+						ClusterWalTailObservation *out)
 {
 	WalTailWork *work;
 	ClusterControlRootResult result;
@@ -315,12 +326,16 @@ cluster_wal_tail_observe(const char *wal_root, const ClusterWalDurablePrefixRef 
 	memset(out, 0, sizeof(*out));
 	if (wal_root == NULL || wal_root[0] == '\0' || !IsValidWalSegSize(segment_size)
 		|| scan_lower == 0 || minimum_end <= scan_lower
+		|| (checkpoint_start != 0
+			&& (checkpoint_start < scan_lower || checkpoint_start >= minimum_end))
 		|| cluster_wal_durable_prefix_encode(ref, &empty, validation)
 			   != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
 	work->root = wal_root;
 	work->ref = *ref;
+	work->checkpoint_start = checkpoint_start;
+	work->checkpoint_crc = checkpoint_crc;
 	work->segment_fd = -1;
 	for (size_t i = 0; i < lengthof(work->dirs); ++i)
 		work->dirs[i] = -1;
@@ -340,4 +355,29 @@ cluster_wal_tail_observe(const char *wal_root, const ClusterWalDurablePrefixRef 
 		*out = work->observed;
 	pfree(work);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_tail_observe(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+						 int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
+						 ClusterWalTailObservation *out)
+{
+	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end, 0, 0, out);
+}
+
+/* PGRAC: bind the root-selected checkpoint, not only the final PGWP record.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+									int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
+									XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
+									ClusterWalTailObservation *out)
+{
+	if (checkpoint_start == 0) {
+		if (out != NULL)
+			memset(out, 0, sizeof(*out));
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
+	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end,
+								   checkpoint_start, checkpoint_crc, out);
 }
