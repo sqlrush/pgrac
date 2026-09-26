@@ -477,9 +477,17 @@ cluster_bufmgr_redeclare_scan_chunk(int start_buf, int max_scan,
  * zeroed = pre-existing inert behavior. */
 static ReconfigEvent ut_mock_last_event;
 static ClusterReconfigRejoinFailureSnapshotV1 ut_mock_rejoin_failure;
+static int ut_control_observation_reads;
+static int ut_control_observation_drift;
 void
 cluster_reconfig_get_last_event(ReconfigEvent *out)
 {
+	if (ut_control_observation_drift != 0 && ++ut_control_observation_reads == 2) {
+		if (ut_control_observation_drift == 1)
+			ut_mock_last_event.event_id++;
+		else
+			mock_lms_shard_master_generation++;
+	}
 	*out = ut_mock_last_event;
 }
 
@@ -516,12 +524,14 @@ cluster_reconfig_has_pending_prebump_stage(void)
 /* spec-4.11 D3 stub:  cluster_grd.c's WAIT_CLUSTER->IDLE transition consults the
  * thread-recovery unfreeze gate before P7.  These tests drive the GES/GRD
  * remaster FSM, not online thread recovery, so the gate is out of scope -> no-op
- * false (P7 unfreeze proceeds exactly as before the gate was added). */
+ * false (P7 unfreeze proceeds exactly as before the gate was added). The
+ * recovery-control tests hold this data gate while exercising the real FSM. */
+static bool ut_thread_recovery_blocked;
 bool
 cluster_thread_recovery_gate_unfreeze(const uint64 *dead_bitmap pg_attribute_unused(),
 									  int nwords pg_attribute_unused())
 {
-	return false;
+	return ut_thread_recovery_blocked;
 }
 
 /* spec-4.11 3b-4b Part 3 stub:  cluster_grd.c's WAIT_CLUSTER tick now launches
@@ -5428,6 +5438,177 @@ UT_TEST(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut)
 	memset(&ut_mock_rejoin_failure, 0, sizeof(ut_mock_rejoin_failure));
 }
 
+/* PGRAC: real P0/P4/P5/P6 transitions with an unfinished DATA recovery.
+ * No authority/lock helper is substituted in the snapshot under test.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+setup_recovery_control_fixture(bool peer_done)
+{
+	reset_fake_grd_htab();
+	cluster_grd_max_entries = 16;
+	ut_jr_setup_3node();
+	cluster_enabled = true;
+	cluster_node_id = 0;
+	ut_mock_now = 0;
+	ut_mock_epoch = 8;
+	ut_member_mask = 0x5;
+	ut_qvotec_quorum = true;
+	ut_thread_recovery_blocked = true;
+	ut_control_observation_reads = 0;
+	ut_control_observation_drift = 0;
+	fake_scan_nbuffers = 0;
+	mock_lms_shard_master_generation = (UINT64_C(9) << 32) | 7;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+	cluster_grd_recovery_lmon_tick();
+	ut_mock_last_event.event_id = 701;
+	ut_mock_last_event.old_epoch = 8;
+	ut_mock_last_event.new_epoch = 9;
+	ut_mock_last_event.cssd_dead_generation = 13;
+	ut_mock_last_event.coordinator_node_id = 0;
+	ut_mock_last_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	ut_mock_last_event.dead_bitmap[0] = 2;
+	ut_mock_epoch = 9;
+	cluster_grd_recovery_lmon_tick();
+	if (peer_done) {
+		cluster_grd_recovery_lmon_tick();
+		cluster_grd_recovery_mark_peer_done(2, 9,
+							cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
+	}
+}
+
+static void
+finish_recovery_control_fixture(void)
+{
+	ut_control_observation_drift = 0;
+	ut_thread_recovery_blocked = false;
+	ut_qvotec_quorum = true;
+	ut_member_mask = -1;
+	mock_lms_shard_master_generation = 0;
+	cluster_enabled = false;
+	memset(&ut_mock_last_event, 0, sizeof(ut_mock_last_event));
+}
+
+UT_TEST(test_recovery_control_observes_protocol_cut_without_data_thaw)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+	ClusterGrdRecoveryControlSnapshotV1 zero = { 0 };
+	uint32 shard;
+	uint32 rebuilding = 0;
+
+	setup_recovery_control_fixture(false);
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_BARRIER);
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(!cluster_grd_recovery_control_snapshot(2, &snapshot));
+	UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	UT_ASSERT(!cluster_grd_recovery_control_snapshot(2, &snapshot));
+	cluster_grd_recovery_mark_peer_done(2, 9,
+							cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
+	UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.event_id, 701);
+	UT_ASSERT_EQ(snapshot.episode_epoch, 9);
+	UT_ASSERT_EQ(snapshot.dead_bitmap[0], 2);
+	UT_ASSERT_EQ(snapshot.survivor_bitmap[0], 5);
+	UT_ASSERT(snapshot.redeclare_generation != 0);
+	UT_ASSERT(snapshot.master_map_refresh != 0);
+	UT_ASSERT_EQ(snapshot.routing_generation, (UINT64_C(9) << 32) | 7);
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	for (shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++)
+		if (cluster_grd_shard_phase(shard) == GRD_SHARD_REBUILDING)
+			rebuilding++;
+	UT_ASSERT(rebuilding != 0);
+	UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
+	finish_recovery_control_fixture();
+}
+
+UT_TEST(test_recovery_control_refuses_other_failure_or_live_origin)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+	ClusterGrdRecoveryControlSnapshotV1 zero = { 0 };
+	int drift;
+
+	for (drift = 0; drift < 5; drift++) {
+		setup_recovery_control_fixture(true);
+		UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
+		if (drift == 0)
+			ut_mock_last_event.event_id++;
+		else if (drift == 1)
+			ut_mock_epoch++;
+		else if (drift == 2)
+			ut_mock_last_event.dead_bitmap[0] |= 4;
+		else if (drift == 3)
+			ut_mock_last_event.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+		memset(&snapshot, 0xa5, sizeof(snapshot));
+		UT_ASSERT(!cluster_grd_recovery_control_snapshot(drift == 4 ? 3 : 2, &snapshot));
+		UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+		finish_recovery_control_fixture();
+	}
+}
+
+UT_TEST(test_recovery_control_requires_survivors_quorum_and_usable_map)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+	ClusterGrdRecoveryControlSnapshotV1 zero = { 0 };
+	int drift;
+
+	for (drift = 0; drift < 5; drift++) {
+		setup_recovery_control_fixture(true);
+		UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
+		if (drift == 0)
+			ut_member_mask = 1;
+		else if (drift == 1)
+			ut_qvotec_quorum = false;
+		else if (drift == 2)
+			cluster_grd_shard_set_phase(0, GRD_SHARD_FROZEN);
+		else if (drift == 3)
+			mock_lms_shard_master_generation = 0;
+		else
+			cluster_node_id = 1;
+		memset(&snapshot, 0xa5, sizeof(snapshot));
+		UT_ASSERT(!cluster_grd_recovery_control_snapshot(2, &snapshot));
+		UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+		cluster_node_id = 0;
+		finish_recovery_control_fixture();
+	}
+}
+
+UT_TEST(test_recovery_control_rechecks_event_and_route_after_scan)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+	ClusterGrdRecoveryControlSnapshotV1 zero = { 0 };
+	int drift;
+
+	for (drift = 1; drift <= 2; drift++) {
+		setup_recovery_control_fixture(true);
+		UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
+		ut_control_observation_drift = drift;
+		ut_control_observation_reads = 0;
+		memset(&snapshot, 0xa5, sizeof(snapshot));
+		UT_ASSERT(!cluster_grd_recovery_control_snapshot(2, &snapshot));
+		UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+		finish_recovery_control_fixture();
+	}
+}
+
+UT_TEST(test_recovery_control_refuses_invalid_arguments)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+	ClusterGrdRecoveryControlSnapshotV1 zero = { 0 };
+
+	setup_recovery_control_fixture(true);
+	UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
+	UT_ASSERT(!cluster_grd_recovery_control_snapshot(2, NULL));
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(!cluster_grd_recovery_control_snapshot(0, &snapshot));
+	UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+	memset(&snapshot, 0xa5, sizeof(snapshot));
+	UT_ASSERT(!cluster_grd_recovery_control_snapshot(CLUSTER_MAX_NODES + 1, &snapshot));
+	UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
+	finish_recovery_control_fixture();
+}
+
 static void
 setup_recovery_authority_fixture(ClusterFormationSnapshotV1 *formation)
 {
@@ -5891,7 +6072,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(117);
+	UT_PLAN(122);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6025,6 +6206,11 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	/* spec-4.6a nightly regression — joiner-side DONE accounting liveness. */
 	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
 	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
+	UT_RUN(test_recovery_control_observes_protocol_cut_without_data_thaw);
+	UT_RUN(test_recovery_control_refuses_other_failure_or_live_origin);
+	UT_RUN(test_recovery_control_requires_survivors_quorum_and_usable_map);
+	UT_RUN(test_recovery_control_rechecks_event_and_route_after_scan);
+	UT_RUN(test_recovery_control_refuses_invalid_arguments);
 	UT_RUN(test_recovery_authority_rejects_missing_peer_or_unremastered_map);
 	UT_RUN(test_recovery_authority_postmaster_cannot_execute_blocking_barrier);
 	UT_RUN(test_recovery_authority_lmon_tick_is_sole_blocking_executor);

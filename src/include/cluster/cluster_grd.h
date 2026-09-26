@@ -696,6 +696,22 @@ extern uint32 cluster_grd_recovery_event_coordinator(void);
 extern uint64 cluster_grd_recovery_done_epoch_for(int32 node);
 extern uint64 cluster_grd_recovery_done_bitmap_hash_for(int32 node);
 extern uint64 cluster_grd_recovery_event_bitmap_hash_value(void);
+/* PGRAC: an observation of the failure protocol barrier, not a data or lock
+ * admission. Process-local only; callers reobserve across blocking work.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterGrdRecoveryControlSnapshotV1 {
+	uint64 event_id;
+	uint64 episode_epoch;
+	uint64 dead_bitmap_hash;
+	uint64 redeclare_generation;
+	uint64 master_map_refresh;
+	uint64 routing_generation;
+	uint8 dead_bitmap[(CLUSTER_MAX_NODES + 7) / 8];
+	uint8 survivor_bitmap[(CLUSTER_MAX_NODES + 7) / 8];
+} ClusterGrdRecoveryControlSnapshotV1;
+
+extern bool cluster_grd_recovery_control_snapshot(uint16 origin_thread,
+												  ClusterGrdRecoveryControlSnapshotV1 *out);
 /* Amendment v1.2 (R2): the cross-node DONE key — hash over the dead bitmap
  * ALONE (no dead_generation fold; same kernel as the event_id hash). */
 extern uint64 cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap);

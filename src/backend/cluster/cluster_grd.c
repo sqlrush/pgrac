@@ -2258,6 +2258,114 @@ cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap)
 	return hash_bytes_extended(dead_bitmap, CLUSTER_RECONFIG_DEAD_BITMAP_BYTES, 0);
 }
 
+/*
+ * PGRAC: observe the completed failure PROTOCOL barrier without passing P7's
+ * DATA-recovery gate. This does not acquire a control lock, retire any holder,
+ * certify external fencing, or authorize ordinary access. Consumers reobserve
+ * the whole cut after blocking work; grant/release admission is separate.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool
+cluster_grd_recovery_control_snapshot(uint16 origin_thread,
+									  ClusterGrdRecoveryControlSnapshotV1 *out)
+{
+	ClusterGrdRecoveryControlSnapshotV1 observed = { 0 };
+	ReconfigEvent event = { 0 };
+	ReconfigEvent after = { 0 };
+	uint64 dead[(CLUSTER_MAX_NODES + 63) / 64];
+	uint32 shard;
+	int32 origin_node;
+	int i;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || origin_thread == 0 || origin_thread > CLUSTER_MAX_NODES
+		|| !cluster_enabled || cluster_grd_state == NULL || cluster_grd_entry_htab == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) == 0
+		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage())
+		return false;
+	origin_node = (int32)origin_thread - 1;
+	cluster_reconfig_get_last_event(&event);
+	observed.event_id = event.event_id;
+	observed.episode_epoch = event.new_epoch;
+	observed.dead_bitmap_hash = cluster_grd_dead_bitmap_hash(event.dead_bitmap);
+	observed.redeclare_generation =
+		pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
+	observed.master_map_refresh =
+		pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count);
+	observed.routing_generation = cluster_lms_get_shard_master_generation();
+	memcpy(observed.dead_bitmap, event.dead_bitmap, sizeof(observed.dead_bitmap));
+	if (event.reconfig_kind != RECONFIG_KIND_FAIL_STOP || observed.event_id == 0
+		|| observed.episode_epoch == 0 || observed.dead_bitmap_hash == 0
+		|| observed.redeclare_generation == 0 || observed.master_map_refresh == 0
+		|| observed.routing_generation == 0
+		|| (observed.dead_bitmap[origin_node / 8] & (1u << (origin_node % 8))) == 0
+		|| cluster_epoch_get_current() != observed.episode_epoch
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_state) != GRD_RECOVERY_WAIT_CLUSTER
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction) != GRD_REMASTER_DIR_FAIL
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id) != observed.event_id
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch) != observed.episode_epoch
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash)
+			   != observed.dead_bitmap_hash)
+		return false;
+	for (i = 0; i < lengthof(dead); i++)
+		dead[i] = pg_atomic_read_u64(&cluster_grd_state->recovery_dead_bitmap[i]);
+	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
+		bool failed = (observed.dead_bitmap[i / 8] & (1u << (i % 8))) != 0;
+
+		if (((dead[i / 64] >> (i % 64)) & 1) != (uint64)failed)
+			return false;
+		if (cluster_conf_lookup_node(i) == NULL) {
+			if (failed)
+				return false;
+			continue;
+		}
+		if (failed)
+			continue;
+		if (!cluster_membership_is_member(i)
+			|| pg_atomic_read_u64(&cluster_grd_state->recovery_done_epoch[i])
+				   != observed.episode_epoch
+			|| pg_atomic_read_u64(&cluster_grd_state->recovery_done_bitmap_hash[i])
+				   != observed.dead_bitmap_hash)
+			return false;
+		observed.survivor_bitmap[i / 8] |= (uint8)(1u << (i % 8));
+	}
+	if ((observed.survivor_bitmap[cluster_node_id / 8] & (1u << (cluster_node_id % 8))) == 0)
+		return false;
+	for (shard = 0; shard < PGRAC_GRD_SHARD_COUNT; shard++) {
+		int32 master = (int32)pg_atomic_read_u32(&cluster_grd_state->master[shard]);
+		uint32 phase = pg_atomic_read_u32(&cluster_grd_state->shard_phase[shard]);
+
+		if (master < 0 || master >= CLUSTER_MAX_NODES
+			|| (observed.survivor_bitmap[master / 8] & (1u << (master % 8))) == 0
+			|| (phase != GRD_SHARD_NORMAL && phase != GRD_SHARD_REBUILDING))
+			return false;
+	}
+
+	/* No authority is minted by an observation assembled across a new cut. */
+	cluster_reconfig_get_last_event(&after);
+	if (after.event_id != observed.event_id || after.new_epoch != observed.episode_epoch
+		|| after.reconfig_kind != RECONFIG_KIND_FAIL_STOP
+		|| memcmp(after.dead_bitmap, observed.dead_bitmap, sizeof(observed.dead_bitmap)) != 0
+		|| cluster_epoch_get_current() != observed.episode_epoch
+		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage()
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_state) != GRD_RECOVERY_WAIT_CLUSTER
+		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction) != GRD_REMASTER_DIR_FAIL
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id) != observed.event_id
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch) != observed.episode_epoch
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_event_bitmap_hash)
+			   != observed.dead_bitmap_hash
+		|| pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation)
+			   != observed.redeclare_generation
+		|| pg_atomic_read_u64(&cluster_grd_state->master_map_refresh_count)
+			   != observed.master_map_refresh
+		|| cluster_lms_get_shard_master_generation() != observed.routing_generation)
+		return false;
+	*out = observed;
+	return true;
+}
+
 bool
 cluster_grd_recovery_in_progress(void)
 {

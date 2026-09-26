@@ -49,6 +49,7 @@
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_guc.h"			 /* PGRAC: frozen recovery claim profile. */
+#include "cluster/cluster_grd.h"			 /* PGRAC: pre-CF failure protocol cut. */
 #include "cluster/cluster_xid_stripe_boot.h" /* spec-6.15 D5b joiner gate */
 
 /* RF-ROOT P4 online launch producer.  The carrier contains only the exact
@@ -65,6 +66,11 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 	ClusterControlRootReadToken token;
 	ClusterControlRootResult root_result;
 	int32 origin_node;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterGrdRecoveryControlSnapshotV1 before = { 0 };
+	ClusterGrdRecoveryControlSnapshotV1 after = { 0 };
+	ReconfigEvent current = { 0 };
+#endif
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -79,6 +85,13 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 		|| event.new_epoch == 0
 		|| (event.dead_bitmap[origin_node / 8] & (uint8)(UINT8_C(1) << (origin_node % 8))) == 0)
 		return false;
+	/* PGRAC: LMON must not block on CF before its own protocol barrier can
+	 * progress. This observation is not a lock grant or DATA recovery proof. */
+	if (cluster_shared_config
+		&& (!cluster_grd_recovery_control_snapshot(origin_thread, &before)
+			|| before.event_id != event.event_id || before.episode_epoch != event.new_epoch
+			|| memcmp(before.dead_bitmap, event.dead_bitmap, sizeof(event.dead_bitmap)) != 0))
+		return false;
 	root_result = cluster_control_root_lookup_owner_by_node_runtime(origin_node, &identity,
 																	&snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -90,6 +103,15 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 				 && snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN))
 		|| memcmp(&snapshot.identity, &identity, sizeof(identity)) != 0)
 		return false;
+	if (cluster_shared_config) {
+		cluster_reconfig_get_last_event(&current);
+		if (current.event_id != event.event_id || current.new_epoch != event.new_epoch
+			|| current.reconfig_kind != RECONFIG_KIND_FAIL_STOP
+			|| memcmp(current.dead_bitmap, event.dead_bitmap, sizeof(event.dead_bitmap)) != 0
+			|| !cluster_grd_recovery_control_snapshot(origin_thread, &after)
+			|| memcmp(&before, &after, sizeof(before)) != 0)
+			return false;
+	}
 	out->origin_thread = origin_thread;
 	out->attempt_stamp = event.new_epoch;
 	out->duty = identity;
@@ -124,7 +146,6 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 #include "cluster/cluster_epoch.h"			/* advance + observe + set_changed_at_lsn */
 #include "cluster/cluster_external_fence.h" /* STOP04 rejoin snapshots */
 #include "cluster/cluster_gcs_block.h"		/* spec-2.34 D4 — eager epoch wake hook */
-#include "cluster/cluster_grd.h"			/* spec-5.16 D3b — arm join PCM block fence */
 #include "cluster/cluster_ic.h"				/* Candidate2 HELLO capability */
 #include "cluster/cluster_startup_phase.h"	/* RF-ROOT P04 serving split */
 #include "cluster/cluster_ic_router.h"		/* phase-3 target-LMON CONTROL send */

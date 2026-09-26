@@ -143,6 +143,10 @@ static int32 ut_owner_rejoin_node;
 static uint64 ut_owner_rejoin_incarnation;
 static ClusterControlRootResult ut_recovery_root_result;
 static ClusterControlRootIdentity ut_recovery_root_identity;
+static int ut_recovery_root_calls;
+static int ut_recovery_root_drift;
+static bool ut_recovery_control_ready;
+static ClusterGrdRecoveryControlSnapshotV1 ut_recovery_control;
 static bool ut_rejoin_root_complete;
 static bool ut_external_fence_active;
 static bool ut_authority_managed;
@@ -175,6 +179,20 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id pg_attribute
 												  ClusterControlRootSnapshot *out_snapshot,
 												  ClusterControlRootReadToken *out_token)
 {
+	ut_recovery_root_calls++;
+	if (ut_recovery_root_drift == 1) {
+		ReconfigEvent event;
+
+		cluster_reconfig_get_last_event(&event);
+		event.event_id++;
+		event.new_epoch++;
+		cluster_reconfig_publish_event(&event);
+	} else if (ut_recovery_root_drift == 2)
+		ut_recovery_control_ready = false;
+	else if (ut_recovery_root_drift == 3)
+		ut_recovery_control.routing_generation++;
+	else if (ut_recovery_root_drift == 4)
+		ut_recovery_control.redeclare_generation++;
 	if (out_identity != NULL)
 		*out_identity = ut_recovery_root_identity;
 	if (out_snapshot != NULL) {
@@ -187,6 +205,17 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id pg_attribute
 	if (out_token != NULL)
 		memset(out_token, 0, sizeof(*out_token));
 	return ut_recovery_root_result;
+}
+
+bool
+cluster_grd_recovery_control_snapshot(uint16 origin_thread,
+									  ClusterGrdRecoveryControlSnapshotV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!ut_recovery_control_ready || origin_thread != 1)
+		return false;
+	*out = ut_recovery_control;
+	return true;
 }
 
 bool
@@ -6086,12 +6115,17 @@ UT_TEST(test_reconfig_target_lmon_retransmits_exact_phase3_until_admitted)
  * Main — register + run all tests.
  * ============================================================ */
 
-UT_TEST(test_thread_recovery_eligibility_uses_current_failstop_and_root_duty)
+static ReconfigEvent
+recovery_eligibility_fixture(void)
 {
-	ClusterThreadRecLaunchEligibility eligibility;
 	ClusterWalThreadClaim claim;
 	ReconfigEvent event;
 
+	cluster_shared_config = false;
+	ut_recovery_root_calls = 0;
+	ut_recovery_root_drift = 0;
+	ut_recovery_control_ready = false;
+	ut_rejoin_root_complete = false;
 	cluster_reconfig_shmem_init();
 	memset(&ut_recovery_root_identity, 0, sizeof(ut_recovery_root_identity));
 	ut_recovery_root_identity.system_identifier = UINT64_C(0x1234);
@@ -6114,6 +6148,22 @@ UT_TEST(test_thread_recovery_eligibility_uses_current_failstop_and_root_duty)
 	event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 	event.dead_bitmap[0] = 0x01;
 	cluster_reconfig_publish_event(&event);
+	memset(&ut_recovery_control, 0, sizeof(ut_recovery_control));
+	ut_recovery_control.event_id = 8;
+	ut_recovery_control.episode_epoch = 7;
+	ut_recovery_control.dead_bitmap_hash = 123;
+	ut_recovery_control.redeclare_generation = 1;
+	ut_recovery_control.master_map_refresh = 2;
+	ut_recovery_control.routing_generation = (UINT64_C(7) << 32) | 1;
+	ut_recovery_control.dead_bitmap[0] = 1;
+	ut_recovery_control.survivor_bitmap[0] = 0x0e;
+	return event;
+}
+
+UT_TEST(test_thread_recovery_eligibility_uses_current_failstop_and_root_duty)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+	ReconfigEvent event = recovery_eligibility_fixture();
 
 	memset(&eligibility, 0xA5, sizeof(eligibility));
 	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
@@ -6128,6 +6178,67 @@ UT_TEST(test_thread_recovery_eligibility_uses_current_failstop_and_root_duty)
 	UT_ASSERT(memcmp(&eligibility, &(ClusterThreadRecLaunchEligibility){ 0 }, sizeof(eligibility))
 			  == 0);
 	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, NULL));
+}
+
+/* PGRAC: catch the actual launch producer taking CF before the protocol
+ * barrier, and exporting an old launch after that read crosses a new cut.
+ * The root I/O and GRD observation are boundaries, not replacement drivers. */
+UT_TEST(test_pre2_recovery_launch_waits_before_cf)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+
+	(void)recovery_eligibility_fixture();
+	cluster_shared_config = true;
+	memset(&eligibility, 0xa5, sizeof(eligibility));
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(ut_recovery_root_calls, 0);
+	UT_ASSERT(memcmp(&eligibility, &(ClusterThreadRecLaunchEligibility){ 0 }, sizeof(eligibility)) == 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_recovery_launch_rechecks_event_after_cf)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+
+	(void)recovery_eligibility_fixture();
+	cluster_shared_config = true;
+	ut_recovery_control_ready = true;
+	ut_recovery_root_drift = 1;
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(ut_recovery_root_calls, 1);
+	UT_ASSERT_EQ(eligibility.attempt_stamp, 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_recovery_launch_rechecks_protocol_cut_after_cf)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+	int drift;
+
+	for (drift = 2; drift <= 4; drift++) {
+		(void)recovery_eligibility_fixture();
+		cluster_shared_config = true;
+		ut_recovery_control_ready = true;
+		ut_recovery_root_drift = drift;
+		UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+		UT_ASSERT_EQ(ut_recovery_root_calls, 1);
+		UT_ASSERT_EQ(eligibility.attempt_stamp, 0);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_recovery_launch_same_cut_keeps_exact_duty)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+
+	(void)recovery_eligibility_fixture();
+	cluster_shared_config = true;
+	ut_recovery_control_ready = true;
+	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(ut_recovery_root_calls, 1);
+	UT_ASSERT_EQ(eligibility.attempt_stamp, 7);
+	UT_ASSERT(memcmp(&eligibility.duty, &ut_recovery_root_identity, sizeof(eligibility.duty)) == 0);
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_rejoin_observed_slot_getter_is_coherent)
@@ -6824,7 +6935,7 @@ UT_TEST(test_stop_reconfig_actual_formation_owner)
 int
 main(void)
 {
-	UT_PLAN(121);
+	UT_PLAN(125);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -6833,6 +6944,10 @@ main(void)
 	UT_RUN(test_shared_cf_prior_unclean_rejoin_cannot_fall_back_to_cold_bootstrap);
 
 	UT_RUN(test_thread_recovery_eligibility_uses_current_failstop_and_root_duty);
+	UT_RUN(test_pre2_recovery_launch_waits_before_cf);
+	UT_RUN(test_pre2_recovery_launch_rechecks_event_after_cf);
+	UT_RUN(test_pre2_recovery_launch_rechecks_protocol_cut_after_cf);
+	UT_RUN(test_pre2_recovery_launch_same_cut_keeps_exact_duty);
 	UT_RUN(test_rejoin_observed_slot_getter_is_coherent);
 	UT_RUN(test_rejoin_failure_snapshot_requires_exact_nonempty_survivors_and_floor);
 	UT_RUN(test_rejoin_pending_snapshot_requires_exact_singleton_lineage);

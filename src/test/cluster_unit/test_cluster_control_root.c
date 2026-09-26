@@ -410,6 +410,7 @@ static int test_worker_replays, test_worker_pins, test_worker_normal_ir;
 static bool test_worker_pin_held;
 static ClusterWalRetentionPinThreadRequest test_worker_pin_request;
 static ReconfigEvent test_worker_event;
+static bool test_control_barrier_ready = true;
 int cluster_external_fence_acquire_timeout_ms = 5000;
 static TimestampTz test_now = INT64_C(1700000000000000);
 
@@ -918,6 +919,27 @@ void
 cluster_reconfig_get_last_event(ReconfigEvent *out)
 {
 	*out = test_worker_event;
+}
+
+/* PGRAC: the GRD binary drives the real protocol FSM. This boundary lets the
+ * real launch consumer below exercise canonical root I/O and refuse it before
+ * that barrier. It is not a claim of live GES admission. */
+bool
+cluster_grd_recovery_control_snapshot(uint16 origin_thread,
+									  ClusterGrdRecoveryControlSnapshotV1 *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!test_control_barrier_ready || origin_thread != 1)
+		return false;
+	out->event_id = test_worker_event.event_id;
+	out->episode_epoch = test_worker_event.new_epoch;
+	out->dead_bitmap_hash = 1;
+	out->redeclare_generation = 1;
+	out->master_map_refresh = 1;
+	out->routing_generation = 1;
+	memcpy(out->dead_bitmap, test_worker_event.dead_bitmap, sizeof(out->dead_bitmap));
+	out->survivor_bitmap[15] = 0x80;
+	return true;
 }
 void
 cluster_write_fence_note_external_mutation_gate_blocked(void)
@@ -6247,6 +6269,12 @@ UT_TEST(test_v2_failure_launch_accepts_open_but_not_clean_thread)
 	test_worker_event.event_id = 12;
 	test_worker_event.new_epoch = 123;
 	test_worker_event.dead_bitmap[0] = 1;
+	test_control_barrier_ready = false;
+	test_cf_acquire_order = 0;
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(test_cf_acquire_order, 0);
+	UT_ASSERT_EQ(eligibility.attempt_stamp, 0);
+	test_control_barrier_ready = true;
 	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
 	UT_ASSERT_EQ(eligibility.attempt_stamp, 123);
 	UT_ASSERT_EQ(memcmp(&eligibility.duty, &request.duty, sizeof(request.duty)), 0);
