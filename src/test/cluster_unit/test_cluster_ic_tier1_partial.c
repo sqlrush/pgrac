@@ -169,6 +169,11 @@ static bool ut_peer2_declared = false;
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
 {
+#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
+	static ClusterNodeInfo control_source;
+	if (node_id == 0)
+		return &control_source;
+#endif
 	if (ut_peer_declared && node_id == UT_PEER_ID)
 		return &ut_peer_info;
 	if (ut_peer2_declared && node_id == UT_PEER2_ID)
@@ -336,6 +341,9 @@ cstring_to_text(const char *s)
  * the test never receives an envelope, so these are vacuous. */
 bool cluster_ic_suppress_caps_reply = false;
 static uint64 ut_dispatch_count = 0;
+#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
+static ClusterICSendResult (*ut_send_envelope_hook)(uint8, int32, const void *, uint32);
+#endif
 
 bool
 cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES], ClusterICHelloMsg *out_msg)
@@ -355,6 +363,10 @@ ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
 						 uint32 payload_len)
 {
+#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
+	if (ut_send_envelope_hook != NULL)
+		return ut_send_envelope_hook(msg_type, dest_node_id, payload, payload_len);
+#endif
 	(void)msg_type;
 	(void)dest_node_id;
 	(void)payload;

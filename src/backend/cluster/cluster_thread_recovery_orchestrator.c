@@ -543,6 +543,37 @@ cluster_thread_recovery_replay_one_window(uint16 dead_tid, XLogRecPtr scan_lower
  *
  * Author: SqlRush <sqlrush@gmail.com>
  */
+/* Kept separate so the root-window consumer is exercised with its actual
+ * worker authority, independently of physical replay I/O. */
+static bool
+thread_recovery_root_projection(uint16 dead_tid, uint64 episode_epoch,
+								const ClusterThreadRecoveryAuthorityV1 *authority,
+								ClusterControlRootReadToken *token, uint64 *validated_tail,
+								uint64 *checkpoint_lower, uint64 *lifecycle, uint32 *tail_tli,
+								uint32 *checkpoint_tli)
+{
+	if (cluster_shared_config) {
+		if (episode_epoch == 0 || episode_epoch != cluster_grd_redeclare_episode_epoch()
+			|| authority == NULL || authority->duty == NULL || authority->root_snapshot == NULL
+			|| authority->root_token == NULL || authority->duty->origin_thread_id != dead_tid
+			|| !cluster_control_root_identity_equal(&authority->root_snapshot->identity,
+													authority->duty)
+			|| cluster_thread_recovery_authority_revalidate_nowait_v1(authority)
+				   != CLUSTER_THREAD_AUTHORITY_OK)
+			return false;
+		*token = *authority->root_token;
+		*validated_tail = authority->root_snapshot->validated_tail_lsn_exclusive;
+		*checkpoint_lower = authority->root_snapshot->checkpoint_lower_lsn;
+		*lifecycle = authority->root_snapshot->lifecycle;
+		*tail_tli = authority->root_snapshot->tail_tli;
+		*checkpoint_tli = authority->root_snapshot->checkpoint_tli;
+		return true;
+	}
+	return cluster_thread_recovery_projection_current(dead_tid, episode_epoch, token,
+													  validated_tail, checkpoint_lower, lifecycle,
+													  tail_tli, checkpoint_tli);
+}
+
 ClusterThreadRecResult
 cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 								   const ClusterThreadRecoveryAuthorityV1 *authority)
@@ -581,8 +612,10 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 		return CLUSTER_THREADREC_NOT_APPLICABLE;
 
 	/*
-	 * Window derivation — RF-ROOT P7 (contract §B / follow-up): dual-path
-	 * by the bit22 latch.  Pre-bit22 the wal-state registry is the authority
+	 * PRE2 shared-config derives the window from the worker's sealed and
+	 * still-held authority bundle, never an earlier LMON observation.
+	 * Legacy RF-ROOT P7 (contract §B / follow-up) remains dual-path by the
+	 * bit22 latch.  Pre-bit22 the wal-state registry is the authority
 	 * (frozen §17.8; registry reads need no CF): lower = the dead thread's
 	 * last checkpoint redo, validated_min = the durable-write watermark
 	 * (restored pre-migration shape, bb7fda782e^).  Post-bit22 the canonical
@@ -591,7 +624,7 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 	 * tail.  A window-derivation BLOCKED is a real fail-closed outcome of the
 	 * live FSM path, so it bumps the D5 failclosed counter.
 	 */
-	if (cluster_r4_bit22_cutover_active()) {
+	if (cluster_shared_config || cluster_r4_bit22_cutover_active()) {
 		ClusterControlRootReadToken pin_token;
 		uint64 pin_validated_tail;
 		uint64 pin_checkpoint_lower;
@@ -599,9 +632,9 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 		uint32 pin_tail_tli;
 		uint32 pin_checkpoint_tli;
 
-		if (!cluster_thread_recovery_projection_current(
-				dead_tid, episode_epoch, &pin_token, &pin_validated_tail, &pin_checkpoint_lower,
-				&pin_lifecycle, &pin_tail_tli, &pin_checkpoint_tli)) {
+		if (!thread_recovery_root_projection(dead_tid, episode_epoch, authority, &pin_token,
+											 &pin_validated_tail, &pin_checkpoint_lower,
+											 &pin_lifecycle, &pin_tail_tli, &pin_checkpoint_tli)) {
 			ereport(LOG, (errmsg("cluster thread recovery: dead thread %u canonical projection "
 								 "unavailable -> BLOCKED (kept frozen)",
 								 dead_tid)));

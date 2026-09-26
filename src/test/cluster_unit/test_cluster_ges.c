@@ -56,6 +56,8 @@
 #include "cluster/cluster_ges.h"
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_ges_reply_wait.h"
+#include "cluster/cluster_control_retire.h"
+#include "miscadmin.h"
 #include "cluster/cluster_touched_peers.h" /* spec-5.14 D2 stamp stub */
 #include "cluster/cluster_grd.h"
 #include "cluster/cluster_grd_outbound.h"
@@ -86,6 +88,65 @@
 #undef strerror_r
 
 #include "unit_test.h"
+
+/* PGRAC: these legacy protocol cases do not enter PRE2 retirement.
+ * Its real service/master combinations have dedicated tests.
+ * Author: SqlRush <sqlrush@gmail.com> */
+BackendType MyBackendType = B_BACKEND;
+bool cluster_shared_config;
+bool
+cluster_control_retire_is_frame(const void *bytes pg_attribute_unused(),
+								Size len pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_control_retire_cut(const ClusterResId *resid pg_attribute_unused(),
+						   ClusterControlRequestCut *cut pg_attribute_unused())
+{
+	abort();
+}
+void
+cluster_control_retire_drain(const ClusterGrdWorkItem *item pg_attribute_unused())
+{
+	abort();
+}
+void
+cluster_control_retire_ingress(const ClusterICEnvelope *env pg_attribute_unused(),
+							   const void *bytes pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_ges_dedup_retire_control_request(uint32 node pg_attribute_unused(),
+										 uint32 proc pg_attribute_unused(),
+										 uint64 epoch pg_attribute_unused(),
+										 uint64 req pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE mode pg_attribute_unused())
+{
+	return true;
+}
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid pg_attribute_unused(),
+								   LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+int
+cluster_grd_retire_request_and_drain(const ClusterResId *resid pg_attribute_unused(),
+									 const ClusterGrdHolderId *holder pg_attribute_unused(),
+									 uint64 previous pg_attribute_unused(),
+									 LOCKMODE mode pg_attribute_unused(),
+									 ClusterGrdGrantIdentity *granted pg_attribute_unused(),
+									 int max pg_attribute_unused())
+{
+	abort();
+}
 
 
 /* ============================================================

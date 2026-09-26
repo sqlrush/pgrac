@@ -63,6 +63,9 @@
 #include "cluster/cluster_clean_leave.h" /* cluster_clean_leave_register_ic_msg_types (spec-5.13 D8) */
 #include "cluster/cluster_node_remove.h" /* cluster_node_remove_lmon_tick + register (spec-5.18 D9/D10) */
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_control_retire.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_cssd.h"	   /* cluster_cssd_outbound_slots (spec-2.5 D2.6) */
 #include "cluster/cluster_fence.h"	   /* cluster_fence_lmon_tick (spec-2.28 D5) */
 #include "cluster/cluster_gcs.h"	   /* cluster_gcs_register_msg_types (spec-2.32 D4) */
@@ -1104,7 +1107,7 @@ lmon_normal_stop_observe(bool final_observation)
 	/* Original owners only, never under the leave lock or after transport
 	 * close. The close-control sender may inspect its own private owners
 	 * inside a duty; this does not sign that the outer work segment is idle. */
-	for (int module = 0; module < 20; module++) {
+	for (int module = 0; module < 21; module++) {
 		ClusterNormalStopPollResult result;
 		const char *domain = "NONE", *reason = "NONE";
 		int slot = -1;
@@ -1180,6 +1183,13 @@ lmon_normal_stop_observe(bool final_observation)
 			break;
 		case 18:
 			result = cluster_ges_dedup_normal_stop_poll(&domain, &key, &reason);
+			break;
+		case 20:
+			domain = "CONTROL_REQUEST";
+			reason = "OWNED_OR_UNINITIALIZED";
+			result = !cluster_shared_config || cluster_control_request_empty()
+						 ? CLUSTER_NORMAL_STOP_READY
+						 : CLUSTER_NORMAL_STOP_PENDING;
 			break;
 		default:
 			domain = "LMD_PROBE";
@@ -1274,6 +1284,8 @@ LmonMain(void)
 	Assert(IsUnderPostmaster);
 
 	MyBackendType = B_LMON;
+	if (cluster_shared_config)
+		cluster_control_retire_lmon_start();
 	lmon_normal_stop_exit_verified = false;
 	before_shmem_exit(lmon_normal_stop_exit_callback, 0);
 	init_ps_display(NULL);
@@ -1464,6 +1476,11 @@ LmonMain(void)
 				duty_started_at = GetCurrentTimestamp();
 				INSTR_TIME_SET_CURRENT(iter_started_at);
 
+				/* PGRAC: service-owned control work must progress on latch wake,
+				 * not depend on a client ProcSignal handler. Author: SqlRush <sqlrush@gmail.com> */
+				cluster_cf_retirement_poll();
+				cluster_lock_owners_service_poll();
+
 				/*
 			 * PGRAC: spec-7.2 D1 -- >= 1 Hz floor for the lazy duty
 			 * families (§3.5 backstop): every lazy-able drain runs at
@@ -1540,6 +1557,8 @@ LmonMain(void)
 				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
 												 force_all_duties))
 					cluster_ges_lmon_drain_work_queue();
+				if (cluster_shared_config)
+					cluster_control_retire_lmon_tick();
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
 				if (!cluster_gcs_block_family_on_data_plane()
@@ -2271,6 +2290,8 @@ LmonMain(void)
 				INSTR_TIME_SET_CURRENT(iter_started_at);
 
 				/* PGRAC: spec-7.2 D1 — >= 1 Hz floor (see the TIER_1 loop). */
+				cluster_cf_retirement_poll();
+				cluster_lock_owners_service_poll();
 				dnow = duty_started_at;
 				force_all_duties = (dnow >= next_duty_floor_at);
 				if (force_all_duties)
@@ -2342,6 +2363,8 @@ LmonMain(void)
 				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
 												 force_all_duties))
 					cluster_ges_lmon_drain_work_queue();
+				if (cluster_shared_config)
+					cluster_control_retire_lmon_tick();
 				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */

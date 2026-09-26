@@ -41,6 +41,8 @@
 #include "access/xlogrecovery.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_enqueue.h"
+/* PGRAC: auxiliary control-owner census. Author: SqlRush <sqlrush@gmail.com> */
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_clean_leave.h" /* shutdown handoff drain (RF-ROOT P6) */
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_recovery_duty.h" /* thread clean-close publish (RF-ROOT P6) */
@@ -379,6 +381,13 @@ CheckpointerMain(void)
 		 */
 		AbsorbSyncRequests();
 		HandleCheckpointerInterrupts();
+
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: a latch-only idle checkpoint loop must also advance owned
+		 * control cleanup. Author: SqlRush <sqlrush@gmail.com> */
+		cluster_cf_retirement_poll();
+		cluster_lock_owners_service_poll();
+#endif
 
 		/*
 		 * Detect a pending checkpoint request by checking whether the flags

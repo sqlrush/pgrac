@@ -25,6 +25,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_epoch.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_membership.h"
@@ -1666,6 +1667,83 @@ cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity 
 	return result;
 }
 
+/* PGRAC: one process-local observation, not a cached CF authorization. A
+ * service caller may receive it only after the original exact release and
+ * only at the same input/cut. A background poll can retire the lock even if
+ * this caller never asks again. Author: SqlRush <sqlrush@gmail.com> */
+typedef struct CanonicalAuxRead {
+	bool pending;
+	bool has_expected;
+	uint16 thread;
+	uint64 cookie, epoch, generation, routing;
+	int32 master;
+	ClusterControlRootIdentity expected;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootResult result;
+} CanonicalAuxRead;
+
+static CanonicalAuxRead canonical_aux_read;
+
+static bool
+canonical_aux_actor(void)
+{
+	return cluster_shared_config && (MyBackendType == B_LMON || MyBackendType == B_LMS);
+}
+
+static bool
+canonical_aux_capture_cut(CanonicalAuxRead *read)
+{
+	const ClusterResId resid
+		= { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
+
+	read->epoch = cluster_epoch_get_current();
+	read->generation = cluster_grd_redeclare_generation();
+	read->master = cluster_grd_lookup_master_gen(&resid, &read->routing);
+	return read->epoch != 0 && read->master >= 0 && read->routing != 0
+		   && read->epoch == cluster_epoch_get_current();
+}
+
+static bool
+canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
+					 ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
+					 ClusterControlRootResult *result)
+{
+	CanonicalAuxRead now = { 0 };
+	CanonicalAuxRead *pending = &canonical_aux_read;
+	bool valid;
+
+	cluster_cf_retirement_poll();
+	if (!pending->pending)
+		return false;
+	*result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!cluster_cf_release_completed(ShareLock, pending->cookie)) {
+		/* A different completed owner is not this owner's release proof.
+		 * Discard the observation when no matching pending hold remains. */
+		if (!cluster_cf_held(ShareLock))
+			memset(pending, 0, sizeof(*pending));
+		return true;
+	}
+	valid
+		= pending->thread == thread && pending->has_expected == (expected != NULL)
+		  && (expected == NULL || cluster_control_root_identity_equal(&pending->expected, expected))
+		  && canonical_aux_capture_cut(&now) && now.epoch == pending->epoch
+		  && now.generation == pending->generation && now.master == pending->master
+		  && now.routing == pending->routing;
+	if (valid) {
+		*result = pending->result;
+		if (*result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| *result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+			if (out != NULL)
+				*out = pending->snapshot;
+			if (token != NULL)
+				*token = pending->token;
+		}
+	}
+	memset(pending, 0, sizeof(*pending));
+	return true;
+}
+
 /* PGRAC: recovery owners may inspect a failed peer, not only their own live
  * writer. Select and authenticate the v2 root/config/claim/anchor under one
  * owned CF-S interval. This mints an observation, never serving permission,
@@ -1686,6 +1764,8 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 	uint8 storage_uuid[16];
 	uint64 system_identifier;
 	uint32 index;
+	bool auxiliary = canonical_aux_actor();
+	CanonicalAuxRead continuation = { 0 };
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -1694,8 +1774,6 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
 		|| thread_id == 0 || thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
-		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (!current_storage_uuid(storage_uuid))
 		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
 	system_identifier = GetSystemIdentifier();
@@ -1711,14 +1789,20 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 	result = storage_contract_check(storage_uuid, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	if (auxiliary && canonical_aux_finish(thread_id, expected_identity, out, token, &result))
+		return result;
+	if (cluster_cf_held(ExclusiveLock)
+		|| (cluster_cf_held(ShareLock) && !(auxiliary && cluster_cf_acquire_pending(ShareLock))))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	index = thread_id - 1;
 	root = palloc(sizeof(*root));
 	result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	PG_TRY();
 	{
-		if (cluster_cf_lock(ShareLock)) {
+		if (auxiliary ? cluster_cf_lock_poll(ShareLock) : cluster_cf_lock(ShareLock)) {
 			held = true;
-			if (cluster_cf_held_is_clusterwide(ShareLock)) {
+			if (cluster_cf_held_is_clusterwide(ShareLock)
+				&& (!auxiliary || canonical_aux_capture_cut(&continuation))) {
 				if (expected_identity == NULL) {
 					result = cluster_control_root_v2_read_control_locked(
 						storage_uuid, system_identifier, root, &thread, &discovered);
@@ -1746,8 +1830,32 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 					}
 				}
 			}
+			if (auxiliary) {
+				continuation.cookie = cluster_cf_owner_cookie(ShareLock);
+				continuation.thread = thread_id;
+				continuation.has_expected = expected_identity != NULL;
+				if (expected_identity != NULL)
+					continuation.expected = *expected_identity;
+				continuation.result = result;
+				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+					continuation.snapshot = root->records[index];
+					continuation.token = selected;
+				}
+			}
 			result = release_cf(ShareLock, result);
 			held = false;
+			if (auxiliary) {
+				/* Immediate release is not permission to publish an old-cut
+				 * observation either. Use the same exact completion/cut check
+				 * as a release completed by a later service iteration. */
+				result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+				if (continuation.cookie != 0) {
+					continuation.pending = true;
+					canonical_aux_read = continuation;
+					(void)canonical_aux_finish(thread_id, expected_identity, out, token, &result);
+				}
+			}
 		}
 	}
 	PG_CATCH();
@@ -1757,7 +1865,7 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 		if (held)
 			cleanup = release_cf(ShareLock, cleanup);
 		pfree(root);
-		if (cleanup == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
+		if (!auxiliary && cleanup == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
 			elog(FATAL, "could not confirm canonical control-root read-lock cleanup");
 		PG_RE_THROW();
 	}

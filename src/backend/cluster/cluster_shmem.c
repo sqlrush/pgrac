@@ -98,6 +98,7 @@
 #include "cluster/cluster_block_recovery.h" /* cluster_block_recovery_shmem_register (spec-4.10 D6) */
 #include "cluster/cluster_grd_outbound.h"	/* cluster_grd_outbound_shmem_register (spec-2.16 D4) */
 #include "cluster/cluster_grd_work_queue.h" /* cluster_grd_work_queue_shmem_register (spec-2.16 D5) */
+#include "cluster/cluster_control_request.h"
 #include "cluster/cluster_stats.h"			/* cluster_stats_shmem_register (1.14 Sprint A) */
 #include "cluster/cluster_lmon.h"			/* cluster_lmon_shmem_register (1.11 Sprint A) */
 #include "cluster/cluster_gcs.h"			/* cluster_gcs_module_init (spec-2.32 D2) */
@@ -725,6 +726,8 @@ cluster_init_shmem_module(void)
 		cluster_grd_outbound_shmem_register();
 	if (cluster_shmem_lookup_region("pgrac cluster grd work queue") == NULL)
 		cluster_grd_work_queue_shmem_register();
+	if (cluster_shmem_lookup_region("pgrac control requests") == NULL)
+		cluster_control_request_shmem_register();
 	/* PGRAC: spec-7.2 D4 — DATA-plane outbound ring (Q6-B twin). */
 	if (cluster_shmem_lookup_region("pgrac cluster lms data outbound") == NULL)
 		cluster_lms_outbound_shmem_register();

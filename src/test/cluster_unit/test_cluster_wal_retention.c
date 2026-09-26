@@ -23,6 +23,7 @@
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_wal_durable_prefix.h"
@@ -43,6 +44,50 @@ int MyProcPid = 42;
 int wal_segment_size = TEST_WAL_SEG_SIZE;
 char *cluster_wal_threads_dir;
 bool cluster_shared_config;
+static bool fake_control_owner_current = true;
+static LOCKMODE fake_control_owner_mode = NoLock;
+bool
+cluster_lock_owner_request_usable(const ClusterLockAcquireRequest *request)
+{
+	return fake_control_owner_current
+		   && (fake_control_owner_mode == NoLock || request->lockmode == fake_control_owner_mode);
+}
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+/* PGRAC: this legacy geometry/guard suite retains its S1-S6 fixture boundary.
+ * Actual PRE2 ownership/native unwind is test_cluster_control_walr, not these
+ * scalar fixtures. Author: SqlRush <sqlrush@gmail.com> */
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
+								   ClusterControlNativeFinish finish, void *argument)
+{
+	ClusterLockAcquireResult result = cluster_lock_acquire_seven_step(request);
+
+	if (request->control_owner_id == 0)
+		request->control_owner_id = request->request_id;
+	return result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK ? finish(request, argument) : result;
+}
+ClusterLockAcquireResult
+cluster_lock_owner_request_convert(ClusterLockAcquireRequest *request, uint64 preserve_request_id,
+								   ClusterControlNativeFinish finish, void *argument)
+{
+	if (preserve_request_id != 0)
+		request->request_id = request->holder.request_id = preserve_request_id;
+	return cluster_lock_owner_request_acquire(request, finish, argument);
+}
+ClusterLockAcquireResult
+cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request)
+{
+	return cluster_lock_acquire_s6_release(request);
+}
 static bool fake_v2_ref_ready;
 static ClusterWalDurablePrefixRef fake_v2_ref;
 ResourceOwner CurrentResourceOwner = (ResourceOwner)(uintptr_t)0x1;
@@ -404,6 +449,8 @@ static void
 reset_pin_fakes(void)
 {
 	cluster_shared_config = false;
+	fake_control_owner_current = true;
+	fake_control_owner_mode = NoLock;
 	fake_v2_ref_ready = false;
 	memset(&fake_v2_ref, 0, sizeof(fake_v2_ref));
 	memset(fake_acquire_results, 0, sizeof(fake_acquire_results));
@@ -1328,6 +1375,97 @@ UT_TEST(test_v2_pin_key_preserves_root_revalidation)
 	cluster_shared_config = false;
 	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_INVALID);
 	UT_ASSERT_NULL(pin);
+	reset_pin_fakes();
+}
+
+UT_TEST(test_v2_pin_and_borrowed_publisher_refuse_rebuilding_walr)
+{
+	for (int sealed = 0; sealed < 2; sealed++) {
+		ClusterWalRetentionInterval interval = { .thread_id = 1,
+												 .tli = 1,
+												 .start_lsn = TEST_WAL_SEG_SIZE,
+												 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+		ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+		ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+		ClusterWalRetentionPin *pin = NULL;
+		ClusterWalRootPublishGuard *publisher = NULL;
+
+		reset_pin_fakes();
+		cluster_shared_config = true;
+		UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+		if (sealed)
+			UT_ASSERT_EQ(cluster_wal_retention_pin_seal_for_root_publish(pin), CLUSTER_WAL_PIN_OK);
+		fake_control_owner_current = false;
+		if (sealed) {
+			UT_ASSERT_EQ(cluster_wal_retention_root_publish_begin_exact(&request.root_read, true,
+																		&publisher),
+						 CLUSTER_WAL_PIN_STALE);
+			if (publisher != NULL)
+				(void)cluster_wal_retention_root_publish_end(&publisher);
+		} else
+			UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
+		UT_ASSERT_EQ(cluster_wal_retention_pin_release(&pin), CLUSTER_WALR_RELEASE_CONFIRMED);
+	}
+	reset_pin_fakes();
+}
+
+UT_TEST(test_v2_physical_reuse_requires_current_walr_not_held_boolean)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	ClusterWalReuseGuardResult l3_result;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_fence_admitted_nowait(&guard, NULL, &reason),
+				 CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, NULL, NULL, &reason), CLUSTER_WAL_GUARD_OK);
+	fake_control_owner_current = false;
+	l3_result = cluster_wal_reuse_guard_l3_begin(&guard, CLUSTER_WAL_PHYSICAL_REMOVE, &reason);
+	UT_ASSERT_EQ(l3_result, CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_GES_UNAVAILABLE);
+	UT_ASSERT_EQ(access(f.generation_wal, F_OK), 0);
+	if (l3_result == CLUSTER_WAL_GUARD_OK)
+		(void)cluster_wal_reuse_guard_confirm_zero_mutation(&guard, CLUSTER_WAL_PHYSICAL_REMOVE,
+															&reason);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+				 CLUSTER_WALR_RELEASE_CONFIRMED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+UT_TEST(test_v2_upgraded_pin_requires_its_exact_current_x_owner)
+{
+	ClusterWalRetentionInterval interval = { .thread_id = 1,
+											 .tli = 1,
+											 .start_lsn = TEST_WAL_SEG_SIZE,
+											 .end_lsn = TEST_WAL_SEG_SIZE * 2 };
+	ClusterWalRetentionPinThreadRequest request = make_pin_request(1, &interval, 1);
+	ClusterRecoverySerialGuard serial = make_serial_guard(&request);
+	ClusterWalRetentionPin *pin = NULL;
+	ClusterWalReuseActionGuard guard;
+	ClusterWalReuseDenyReason reason;
+
+	reset_pin_fakes();
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_acquire(&request, 1, &pin), CLUSTER_WAL_PIN_OK);
+	UT_ASSERT_EQ(cluster_wal_retention_pin_bind_one(pin, &serial), CLUSTER_WAL_PIN_OK);
+	prepare_bound_recovery_guard(&guard, &request);
+	fake_s5_result = CLUSTER_LOCK_ACQUIRE_OK_CONVERTED;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_arm(&guard, &serial, pin, &reason), CLUSTER_WAL_GUARD_OK);
+	fake_control_owner_mode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_OK);
+	guard.walr.acquire_request.control_owner_id++;
+	UT_ASSERT_EQ(cluster_wal_retention_pin_revalidate(pin), CLUSTER_WAL_PIN_STALE);
+	guard.walr.acquire_request.control_owner_id--;
+	if (fake_resource_release_callback != NULL)
+		fake_resource_release_callback(RESOURCE_RELEASE_BEFORE_LOCKS, false, false,
+									   fake_resource_release_arg);
 	reset_pin_fakes();
 }
 
@@ -2612,11 +2750,12 @@ UT_TEST(test_fold_empty_open_interval_is_not_bounded)
 int
 main(int argc, char **argv)
 {
+	setvbuf(stdout, NULL, _IONBF, 0);
 	if (argc > 1 && strcmp(argv[1], "--fixture-wal") == 0)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(50);
+	UT_PLAN(53);
 	UT_RUN(test_v2_e1_consumes_current_root_and_preserves_exact_floor);
 	UT_RUN(test_v2_retention_zero_crc_is_not_absent_authority);
 	UT_RUN(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose);
@@ -2639,6 +2778,9 @@ main(int argc, char **argv)
 	UT_RUN(test_pin_one_thread_acquire_and_confirmed_release);
 	UT_RUN(test_root_publisher_requires_resource_owner);
 	UT_RUN(test_v2_pin_key_preserves_root_revalidation);
+	UT_RUN(test_v2_pin_and_borrowed_publisher_refuse_rebuilding_walr);
+	UT_RUN(test_v2_physical_reuse_requires_current_walr_not_held_boolean);
+	UT_RUN(test_v2_upgraded_pin_requires_its_exact_current_x_owner);
 	UT_RUN(test_pin_acquire_is_sorted_all_or_none);
 	UT_RUN(test_pin_uncertain_rollback_remains_cleanup_only);
 	UT_RUN(test_pin_bind_revalidate_and_seal_closed_fsm);

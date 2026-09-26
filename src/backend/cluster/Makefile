@@ -88,6 +88,8 @@ OBJS = \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
 	cluster_lock_owner.o \
+	cluster_control_request.o \
+	cluster_control_retire.o \
 	cluster_cf_phase2.o \
 	cluster_cf_stats.o \
 	cluster_cf_storage.o \

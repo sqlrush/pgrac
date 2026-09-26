@@ -34,6 +34,10 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_control_request.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_ir.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_ges.h"	  /* GesRequestPayload / RELEASE cleanup payload */
 #include "cluster/cluster_ges_mode.h" /* spec-5.1b D1: ges_modes_compatible (frozen matrix) */
 #include "cluster/cluster_grd.h"
@@ -98,6 +102,7 @@ static HTAB *cluster_grd_entry_htab = NULL;
 static int cluster_grd_snapshot_entry_resids(ClusterResId **out_resids);
 static bool join_fence_is_recipient_for(int32 node_id, uint64 ref_epoch);
 static void grd_recovery_authority_clear_seal(void);
+static bool grd_recovery_authority_request_current(uint64 request_generation);
 
 /* spec-2.15 v0.4 P1.1:  HTAB init size = Max(GUC, PGRAC_GRD_SHARD_COUNT)
  * — HASH_PARTITION=4096 forces dynahash nbuckets >= 4096 (nbuckets =
@@ -2377,6 +2382,107 @@ cluster_grd_recovery_in_progress(void)
 	return pg_atomic_read_u32(&cluster_grd_state->recovery_state) != (uint32)GRD_RECOVERY_IDLE;
 }
 
+/* PGRAC: control requests must not race the census even on an unaffected
+ * NORMAL shard. The post-barrier exception admits only the frozen recovery
+ * control surface, not ordinary locks or DATA. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+grd_control_namespace(const ClusterResId *resid)
+{
+	return resid != NULL
+		   && (resid->type == CLUSTER_CF_RESID_TYPE
+			   || resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE
+			   || resid->type == CLUSTER_IR_RESID_TYPE);
+}
+
+static bool
+grd_control_map_current(void)
+{
+	return cluster_enabled && cluster_grd_state != NULL && cluster_grd_entry_htab != NULL
+		   && pg_atomic_read_u32(&cluster_grd_state->master_map_initialized) != 0
+		   && cluster_epoch_get_current() != 0 && cluster_qvotec_in_quorum()
+		   && !cluster_reconfig_has_pending_prebump_stage();
+}
+
+static bool
+grd_control_authority_pending(void)
+{
+	return pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation)
+		   > pg_atomic_read_u64(&cluster_grd_state->recovery_authority_terminal_generation);
+}
+
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid, LOCKMODE mode)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+	ReconfigEvent event = { 0 };
+	bool allowed;
+	int node;
+
+	if (!cluster_shared_config || !grd_control_map_current() || resid == NULL
+		|| resid->lockmethodid != DEFAULT_LOCKMETHOD || resid->field4 != 0
+		|| grd_control_authority_pending())
+		return false;
+	allowed = (resid->type == CLUSTER_CF_RESID_TYPE && mode == ShareLock && resid->field1 == 0
+			   && resid->field2 == 0 && resid->field3 == 0)
+			  || (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE && mode == ExclusiveLock
+				  && resid->field1 > 0 && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
+				  && resid->field2 == 0 && resid->field3 == 0)
+			  || (resid->type == CLUSTER_IR_RESID_TYPE && mode == ExclusiveLock && resid->field1 > 0
+				  && resid->field1 <= CLUSTER_WAL_RETENTION_MAX_THREADS
+				  && (resid->field2 != 0 || resid->field3 != 0));
+	if (!allowed)
+		return false;
+	cluster_reconfig_get_last_event(&event);
+	for (node = 0; node < CLUSTER_MAX_NODES; node++)
+		if ((event.dead_bitmap[node / 8] & (1u << (node % 8))) != 0)
+			return cluster_grd_recovery_control_snapshot((uint16)(node + 1), &snapshot);
+	return false;
+}
+
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid, LOCKMODE mode)
+{
+	uint64 epoch;
+	uint32 state;
+
+	if (!cluster_shared_config || !grd_control_namespace(resid))
+		return true; /* Other namespaces retain their existing admission. */
+	if (!grd_control_map_current() || grd_control_authority_pending())
+		return false;
+	epoch = cluster_epoch_get_current();
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	if (state == GRD_RECOVERY_WAIT_CLUSTER)
+		return cluster_grd_control_recovery_ready(resid, mode);
+	return state == GRD_RECOVERY_IDLE
+		   && cluster_grd_shard_phase(cluster_grd_shard_for_resource(resid)) == GRD_SHARD_NORMAL
+		   && epoch == cluster_epoch_get_current()
+		   && pg_atomic_read_u32(&cluster_grd_state->recovery_state) == GRD_RECOVERY_IDLE
+		   && !grd_control_authority_pending();
+}
+
+bool
+cluster_grd_control_rebuild_frozen(uint64 epoch, uint64 generation)
+{
+	uint64 request;
+	uint32 state;
+	bool frozen;
+
+	if (!cluster_shared_config || !grd_control_map_current() || epoch == 0 || generation == 0
+		|| epoch != cluster_epoch_get_current() || generation != cluster_grd_redeclare_generation())
+		return false;
+	state = pg_atomic_read_u32(&cluster_grd_state->recovery_state);
+	request = pg_atomic_read_u64(&cluster_grd_state->recovery_authority_request_generation);
+	/* A QUIESCED conversion owner prevents its local complete census, so
+	 * restoration belongs before local DONE, never after the common barrier. */
+	frozen = state == GRD_RECOVERY_WAIT_BARRIER
+			 && pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch) == epoch;
+	if (!frozen && state == GRD_RECOVERY_IDLE && grd_control_authority_pending())
+		frozen = grd_recovery_authority_request_current(request);
+	return frozen && epoch == cluster_epoch_get_current()
+		   && generation == cluster_grd_redeclare_generation()
+		   && pg_atomic_read_u32(&cluster_grd_state->recovery_state) == state;
+}
+
 /*
  * spec-2.29a: the pre-reconfig baseline epoch the WAIT_EPOCH gate compares
  * against.  Exposed for diagnostics + the IDLE baseline-hold unit test (the
@@ -2716,15 +2822,18 @@ grd_recovery_broadcast_redeclare(void)
  * Barrier check: every live registered owner has acked the redeclare
  * generation.  Backends born after the broadcast were seeded with the
  * current generation at InitProcess (they hold no stale-epoch grants);
- * backends that exited simply drop out of the scan (their leaked
- * master-side state is exactly what P6 sweeps).
+ * Legacy exited owners drop out for P6. PRE2 control requests instead retain
+ * explicit shared retirement ownership and must close BEFORE local DONE.
  */
 static bool
 grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 {
 	uint32 procno;
+	uint64 control_version = 0;
 
 	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcGlobal->allProcCount == 0)
+		return false;
+	if (cluster_shared_config && !cluster_control_request_census(episode_epoch, &control_version))
 		return false;
 	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
 		PGPROC *proc = &ProcGlobal->allProcs[procno];
@@ -2751,7 +2860,10 @@ grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 		if (pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked_epoch) != episode_epoch)
 			return false;
 	}
-	return true;
+	/* No registry lock crosses the PGPROC scan. An exit/ABA during it must
+	 * invalidate this observation, even when that PGPROC is now empty. */
+	return !cluster_shared_config
+		   || cluster_control_request_census_unchanged(episode_epoch, control_version);
 }
 
 static void

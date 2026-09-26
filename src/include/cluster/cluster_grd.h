@@ -716,6 +716,12 @@ typedef struct ClusterGrdRecoveryControlSnapshotV1 {
 
 extern bool cluster_grd_recovery_control_snapshot(uint16 origin_thread,
 												  ClusterGrdRecoveryControlSnapshotV1 *out);
+/* PGRAC: shared-control acquisitions use the same reconstruction barrier at
+ * requester, master and installation. These predicates never thaw DATA.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern bool cluster_grd_control_acquire_allowed(const ClusterResId *resid, LOCKMODE mode);
+extern bool cluster_grd_control_recovery_ready(const ClusterResId *resid, LOCKMODE mode);
+extern bool cluster_grd_control_rebuild_frozen(uint64 epoch, uint64 generation);
 /* Amendment v1.2 (R2): the cross-node DONE key — hash over the dead bitmap
  * ALONE (no dead_generation fold; same kernel as the event_id hash). */
 extern uint64 cluster_grd_dead_bitmap_hash(const uint8 *dead_bitmap);

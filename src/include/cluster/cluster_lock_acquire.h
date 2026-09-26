@@ -205,6 +205,9 @@ typedef struct ClusterLockAcquireRequest {
 	ClusterGesHwGrant hw_grant;
 	/* Backend-local static typed reason, captured at the failed S5 predicate. */
 	const char *registration_failure_reason;
+	/* PRE2 manual-control owner: process-local stable identity, never a
+	 * pointer into a copyable guard or the wire. Author: SqlRush. */
+	uint64 control_owner_id;
 } ClusterLockAcquireRequest;
 
 /* Error owner around the complete PG-native acquisition body.  The callback

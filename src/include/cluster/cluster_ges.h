@@ -561,6 +561,26 @@ typedef struct ClusterGesRedeclareAttempt {
 	bool invalid;
 } ClusterGesRedeclareAttempt;
 
+/* Ordinary acquisition uses the same local exchange bookkeeping, never
+ * the REDECLARE opcode/authority. Owned by a nonblocking CF caller. */
+typedef struct ClusterGesAcquireAttempt {
+	ClusterGesRedeclareAttempt exchange;
+} ClusterGesAcquireAttempt;
+
+typedef enum ClusterGesAcquireResult {
+	CLUSTER_GES_ACQUIRE_PENDING = 0,
+	CLUSTER_GES_ACQUIRE_GRANTED,
+	CLUSTER_GES_ACQUIRE_REJECTED,
+	CLUSTER_GES_ACQUIRE_CUT_CHANGED,
+	CLUSTER_GES_ACQUIRE_INVALID
+} ClusterGesAcquireResult;
+
+extern ClusterGesAcquireResult cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *attempt,
+														   const struct ClusterResId *resid,
+														   uint32 mode,
+														   const struct ClusterGrdHolderId *holder,
+														   ClusterGesHwGrant *grant);
+
 /*
  * GES reply payload (variant on GES_REPLY msg_type=5).
  *

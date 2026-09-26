@@ -43,6 +43,9 @@
 #include "cluster/cluster_ic_rdma.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_lmon.h"
+#include "cluster/cluster_control_retire.h"
+#include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_thread_recovery.h"
@@ -109,7 +112,33 @@ static char test_stop_last_detail[256];
 static TimestampTz test_stop_now;
 static LWLock *test_stop_locks[8];
 static unsigned test_stop_lock_depth;
-static ClusterNormalStopPollResult test_stop_observation[20];
+static ClusterNormalStopPollResult test_stop_observation[21];
+bool cluster_shared_config;
+static unsigned test_control_owner_polls;
+
+void
+cluster_cf_retirement_poll(void)
+{}
+void
+cluster_control_retire_lmon_start(void)
+{}
+void
+cluster_control_retire_lmon_tick(void)
+{}
+/* PRE2 final-send fencing is exercised with the actual outbound/registry/TCP
+ * in test_cluster_control_transport, not this stop-loop fixture. */
+bool
+cluster_control_retire_outbound_allowed(uint8 type pg_attribute_unused(),
+										const void *payload pg_attribute_unused(),
+										uint16 len pg_attribute_unused())
+{
+	return true;
+}
+void
+cluster_lock_owners_service_poll(void)
+{
+	test_control_owner_polls++;
+}
 static void test_stop_work(bool event);
 static int test_stop_wait(WaitEvent *events);
 #include "test_cluster_lmon_stop_service.inc"
@@ -1464,6 +1493,11 @@ test_stop_poll(unsigned module)
 	test_stop_polls++;
 	return test_stop_observation[module];
 }
+bool
+cluster_control_request_empty(void)
+{
+	return test_stop_poll(20) == CLUSTER_NORMAL_STOP_READY;
+}
 ClusterNormalStopPollResult
 cluster_grd_work_queue_normal_stop_poll(uint32 *slot, const char **reason)
 {
@@ -1727,7 +1761,8 @@ test_stop_wait(WaitEvent *events)
 					  || test_stop_case == 15 || test_stop_case == 17 || test_stop_case == 19
 					  || test_stop_case == 21 || test_stop_case == 23 || test_stop_case == 25
 					  || test_stop_case == 27 || test_stop_case == 29 || test_stop_case == 31
-					  || test_stop_case == 33 || test_stop_case == 35 || test_stop_case == 37)
+					  || test_stop_case == 33 || test_stop_case == 35 || test_stop_case == 37
+					  || test_stop_case == 48)
 							 && test_lmon_wait_calls == 1
 						 ? 0
 						 : 1);
@@ -1735,6 +1770,10 @@ test_stop_wait(WaitEvent *events)
 	if (test_stop_case == 1 && test_lmon_wait_calls == 1) {
 		test_stop_observation[0] = CLUSTER_NORMAL_STOP_READY;
 		return 0; /* real owner becomes idle only in the following pass */
+	}
+	if (test_stop_case == 48 && test_lmon_wait_calls == 1) {
+		test_stop_observation[20] = CLUSTER_NORMAL_STOP_READY;
+		return 0; /* Exact cleanup consumer, not observer, discharges debt. */
 	}
 	if (test_stop_case == 11 && test_lmon_wait_calls == 1) {
 		test_stop_observation[6] = CLUSTER_NORMAL_STOP_READY;
@@ -1843,6 +1882,8 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	test_stop_transport = transport;
 	test_stop_exit_code = -1;
 	test_stop_duties = test_stop_events = test_stop_polls = test_stop_frees = 0;
+	test_control_owner_polls = 0;
+	cluster_shared_config = scenario == 48;
 	test_stop_last_detail[0] = '\0';
 	test_stop_lock_depth = 0;
 	test_lmon_wait_calls = 0;
@@ -1851,6 +1892,8 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	error_context_stack = NULL;
 	for (unsigned i = 0; i < lengthof(test_stop_observation); i++)
 		test_stop_observation[i] = CLUSTER_NORMAL_STOP_READY;
+	if (scenario == 48)
+		test_stop_observation[20] = CLUSTER_NORMAL_STOP_PENDING;
 	if (scenario == 1 || scenario == 6)
 		test_stop_observation[0] = CLUSTER_NORMAL_STOP_PENDING;
 	if (scenario == 6)
@@ -1905,6 +1948,7 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	if (setjmp(test_lmon_exit_jump) == 0)
 		LmonMain();
 	test_stop_on = test_lmon_exit_armed = false;
+	cluster_shared_config = false;
 	PG_exception_stack = NULL;
 	error_context_stack = NULL;
 	UT_ASSERT_EQ(test_stop_lock_depth, 0);
@@ -1965,7 +2009,8 @@ UT_TEST(test_stop_real_lmon_late_invalid_overrides_pending)
 	for (int mode = 0; mode < 2; mode++) {
 		test_run_normal_stop_lmon(mode, 6);
 		UT_ASSERT_EQ(test_stop_exit_code, 1);
-		UT_ASSERT_EQ(test_stop_polls, lengthof(test_stop_observation));
+		/* Legacy profile skips only the new shared-config registry observer. */
+		UT_ASSERT_EQ(test_stop_polls, lengthof(test_stop_observation) - 1);
 		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 	}
 }
@@ -2243,10 +2288,20 @@ UT_TEST(test_stop_drains_dispatch_created_work_before_post_dispatch_idle)
 	UT_ASSERT_EQ(test_outbound_admitted, 3);
 }
 
+UT_TEST(test_stop_control_debt_survives_until_service_completion)
+{
+	for (int mode = 0; mode < 2; ++mode) {
+		test_run_normal_stop_lmon(mode, 48);
+		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT_EQ(test_lmon_wait_calls, 2);
+		UT_ASSERT(test_control_owner_polls >= 2);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(42);
 	UT_RUN(test_lmon_status_enum_values_frozen);
 	UT_RUN(test_lmon_shared_state_size_under_4kb);
 	UT_RUN(test_lmon_status_to_string_lookup);
@@ -2288,6 +2343,7 @@ main(void)
 	UT_RUN(test_stop_late_accepted_transport_tail_still_blocks_idle);
 	UT_RUN(test_online_late_publication_keeps_existing_drain_schedule);
 	UT_RUN(test_stop_drains_dispatch_created_work_before_post_dispatch_idle);
+	UT_RUN(test_stop_control_debt_survives_until_service_completion);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

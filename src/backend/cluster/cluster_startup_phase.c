@@ -994,6 +994,13 @@ bool
 cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE mode,
 										   bool startup_process)
 {
+	/* PRE2: neither the startup components-only path nor the HW recovery
+	 * role can bypass an unfinished common control census. After the exact
+	 * failure barrier, only CF-S/WALR-X/IR-X gain recovery transport access. */
+	if (!cluster_grd_control_acquire_allowed(resid, mode))
+		return false;
+	if (cluster_grd_control_recovery_ready(resid, mode))
+		return cluster_recovery_transport_is_current();
 	/*
 	 * RF-ROOT P6 (clean-reopen / THREAD_OPEN): the recovery-time lock
 	 * admission accepts the components-only transport proof too.  The

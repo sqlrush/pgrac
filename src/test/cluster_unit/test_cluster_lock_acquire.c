@@ -52,6 +52,8 @@
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_lock_owner.h"
+#include "cluster/cluster_control_request.h"
+#include "cluster/cluster_shmem.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-5.3 same-lock-group helper */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_retention.h"
@@ -59,6 +61,10 @@
 #include "port/atomics.h"
 #include "storage/lock.h"
 #include "storage/proc.h"
+#include "storage/ipc.h"
+#include "storage/lwlock.h"
+#include "storage/shmem.h"
+#include "utils/memutils.h"
 
 /* Drop PG's port.h printf override; unit_test.h uses stdlib printf. */
 #ifdef vprintf
@@ -72,6 +78,104 @@
 #endif
 
 #include "unit_test.h"
+
+/* PGRAC: bind the real registry used by the new owner; keep unrelated
+ * transport and PG allocation explicit boundaries of this legacy suite.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool cluster_shared_config;
+BackendType MyBackendType = B_BACKEND;
+int cluster_ges_request_timeout_ms = 60000;
+MemoryContext TopMemoryContext = (MemoryContext)1;
+void *
+MemoryContextAllocZero(MemoryContext context pg_attribute_unused(), Size size)
+{
+	return calloc(1, size);
+}
+void
+pfree(void *ptr)
+{
+	free(ptr);
+}
+void
+before_shmem_exit(pg_on_exit_callback function pg_attribute_unused(),
+				  Datum arg pg_attribute_unused())
+{}
+void
+cluster_lmon_wakeup(void)
+{}
+static LWLock *control_held_lock;
+void *
+ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *found)
+{
+	*found = false;
+	return calloc(1, size);
+}
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region pg_attribute_unused())
+{}
+int
+LWLockNewTrancheId(void)
+{
+	return 201;
+}
+void
+LWLockInitialize(LWLock *lock, int id)
+{
+	lock->tranche = id;
+}
+void
+LWLockRegisterTranche(int id pg_attribute_unused(), const char *name pg_attribute_unused())
+{}
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode pg_attribute_unused())
+{
+	Assert(control_held_lock == NULL);
+	control_held_lock = lock;
+	return true;
+}
+void
+LWLockRelease(LWLock *lock)
+{
+	Assert(control_held_lock == lock);
+	control_held_lock = NULL;
+}
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE mode pg_attribute_unused())
+{
+	return true;
+}
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid pg_attribute_unused(),
+								   LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+bool
+cluster_grd_control_rebuild_frozen(uint64 epoch pg_attribute_unused(),
+								   uint64 gen pg_attribute_unused())
+{
+	return false;
+}
+int
+cluster_grd_retire_request_and_drain(const ClusterResId *resid pg_attribute_unused(),
+									 const ClusterGrdHolderId *holder pg_attribute_unused(),
+									 uint64 previous pg_attribute_unused(),
+									 LOCKMODE mode pg_attribute_unused(),
+									 ClusterGrdGrantIdentity *granted pg_attribute_unused(),
+									 int max pg_attribute_unused())
+{
+	abort();
+}
+ClusterGesAcquireResult
+cluster_ges_cf_request_poll(ClusterGesAcquireAttempt *attempt pg_attribute_unused(),
+							const ClusterResId *resid pg_attribute_unused(),
+							uint32 mode pg_attribute_unused(),
+							const ClusterGrdHolderId *holder pg_attribute_unused(),
+							ClusterGesHwGrant *grant pg_attribute_unused())
+{
+	abort();
+}
 
 
 /* ============================================================
@@ -1600,13 +1704,39 @@ UT_TEST(test_redeclare_walk_includes_actual_private_owner)
 	reset_redeclare_walk();
 }
 
+/* Auxiliary WALR local USERLOCKs are not registered GES holders. The
+ * production walker must skip them even when their local bytes predate the
+ * cut; an empty native hash is also valid, not a reason to sleep on LMON.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_auxiliary_native_walr_does_not_redeclare_or_wait)
+{
+	PGPROC proc;
+	LOCKTAG tag = { 0 };
+	BackendType saved = MyBackendType;
+
+	tag.locktag_type = LOCKTAG_USERLOCK;
+	tag.locktag_lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(!cluster_lock_should_globalize(&tag, ShareLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&tag, ExclusiveLock, false));
+	UT_ASSERT(!cluster_lock_should_globalize(&tag, ShareLock, true));
+	setup_redeclare_walk(&proc, 0, 1);
+	MyBackendType = B_LMON;
+	stub_redeclare_locks[0].tag.lock = tag;
+	stub_redeclare_locks[0].cluster_registered = false;
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	MyBackendType = saved;
+	reset_redeclare_walk();
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(24);
+	UT_PLAN(25);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1632,6 +1762,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_redeclare_walk_cached_ack_requires_exact_epoch);
 	UT_RUN(test_redeclare_walk_release_in_flight_keeps_old_identity);
 	UT_RUN(test_redeclare_walk_includes_actual_private_owner);
+	UT_RUN(test_auxiliary_native_walr_does_not_redeclare_or_wait);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

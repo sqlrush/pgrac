@@ -25,6 +25,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_reconfig.h"
+#include "cluster/cluster_recovery_plan.h"
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_stats.h"
 #include "cluster/cluster_wal_retention.h"
@@ -95,6 +96,10 @@ ErrorContextCallback *error_context_stack;
 static bool test_checkpoint_mode;
 static uint64 test_self_incarnation;
 static uint64 test_epoch;
+BackendType MyBackendType = B_INVALID;
+static uint64 test_cf_cookie, test_cf_completed_cookie;
+static uint64 test_control_generation = 1;
+static bool test_cf_release_cut_change;
 static unsigned test_epoch_reads, test_change_epoch_read;
 static unsigned test_throw_epoch_read;
 static bool test_capture_error_level;
@@ -335,6 +340,8 @@ bool
 cluster_cf_held(LOCKMODE mode)
 {
 	(void)mode;
+	if (MyBackendType == B_LMON || MyBackendType == B_LMS)
+		return test_actual_cf == mode;
 	if (test_checkpoint_mode)
 		return test_checkpoint_outer_cf;
 	abort();
@@ -417,6 +424,15 @@ static bool test_worker_pin_held;
 static ClusterWalRetentionPinThreadRequest test_worker_pin_request;
 static ReconfigEvent test_worker_event;
 static bool test_control_barrier_ready = true;
+static bool test_launch_fixture;
+static unsigned test_launch_stamps, test_launch_registered, test_launch_legacy_pins;
+static bool test_worker_window_consumer;
+static unsigned test_legacy_projection_reads;
+static bool thread_recovery_root_projection(uint16 thread, uint64 epoch,
+											const ClusterThreadRecoveryAuthorityV1 *authority,
+											ClusterControlRootReadToken *token, uint64 *tail,
+											uint64 *lower, uint64 *lifecycle, uint32 *tail_tli,
+											uint32 *checkpoint_tli);
 int cluster_external_fence_acquire_timeout_ms = 5000;
 static TimestampTz test_now = INT64_C(1700000000000000);
 
@@ -747,9 +763,51 @@ cluster_cf_lock(LOCKMODE mode pg_attribute_unused())
 		test_stop_share_hook();
 	if (mode == ExclusiveLock && test_checkpoint_x_hook != NULL)
 		test_checkpoint_x_hook();
-	if (test_cf_grant)
+	if (test_cf_grant) {
 		test_actual_cf = mode;
+		test_cf_cookie++;
+	}
 	return test_cf_grant;
+}
+
+bool
+cluster_cf_lock_poll(LOCKMODE mode)
+{
+	return cluster_cf_lock(mode);
+}
+bool
+cluster_cf_acquire_pending(LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+uint64
+cluster_cf_owner_cookie(LOCKMODE mode)
+{
+	return test_actual_cf == mode ? test_cf_cookie : 0;
+}
+bool
+cluster_cf_release_completed(LOCKMODE mode pg_attribute_unused(), uint64 cookie)
+{
+	return cookie != 0 && cookie == test_cf_completed_cookie;
+}
+void
+cluster_cf_retirement_poll(void)
+{
+	if (test_cf_release_confirmed && test_actual_cf != NoLock) {
+		test_cf_completed_cookie = test_cf_cookie;
+		test_actual_cf = NoLock;
+	}
+}
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return test_control_generation;
+}
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid pg_attribute_unused(), uint64 *generation)
+{
+	*generation = test_control_generation;
+	return 0;
 }
 
 bool
@@ -762,8 +820,12 @@ ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode pg_attribute_unused())
 {
 	test_cf_release_order = ++test_order_seq;
-	if (test_cf_release_confirmed)
+	if (test_cf_release_cut_change)
+		test_control_generation++;
+	if (test_cf_release_confirmed) {
 		test_actual_cf = NoLock;
+		test_cf_completed_cookie = test_cf_cookie;
+	}
 	return test_cf_release_confirmed ? CLUSTER_CF_RELEASE_CONFIRMED
 									 : CLUSTER_CF_RELEASE_UNCONFIRMED;
 }
@@ -911,8 +973,48 @@ cluster_thread_recovery_replay_read(uint16 thread, ClusterThreadRecReplayState *
 									uint64 *epoch)
 {
 	UT_ASSERT_EQ(thread, 1);
-	*state = CLUSTER_THREADREC_REPLAY_REPLAYING;
+	*state
+		= test_launch_fixture ? CLUSTER_THREADREC_REPLAY_IDLE : CLUSTER_THREADREC_REPLAY_REPLAYING;
 	*epoch = 123;
+	return true;
+}
+
+bool
+cluster_thread_recovery_replay_mark_replaying(uint16 thread, uint64 epoch)
+{
+	UT_ASSERT(test_launch_fixture && thread == 1 && epoch == 123);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_launch_stamps++;
+	return true;
+}
+
+bool
+cluster_thread_recovery_pin_projection(uint16 thread, uint64 epoch)
+{
+	UT_ASSERT(thread == 1 && epoch == 123);
+	test_launch_legacy_pins++;
+	return false; /* A second service-side read is not synchronously ready. */
+}
+
+bool
+cluster_thread_recovery_projection_current(
+	uint16 thread pg_attribute_unused(), uint64 epoch pg_attribute_unused(),
+	ClusterControlRootReadToken *token pg_attribute_unused(), uint64 *tail pg_attribute_unused(),
+	uint64 *lower pg_attribute_unused(), uint64 *lifecycle pg_attribute_unused(),
+	uint32 *tail_tli pg_attribute_unused(), uint32 *checkpoint_tli pg_attribute_unused())
+{
+	test_legacy_projection_reads++;
+	return false; /* No prelaunch projection of the newly sealed input exists. */
+}
+
+static bool
+register_one_worker(const ClusterThreadRecLaunchEligibility *eligibility,
+					BackgroundWorkerHandle **handle)
+{
+	UT_ASSERT(test_launch_fixture && eligibility->origin_thread == 1);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_launch_registered++;
+	*handle = (BackgroundWorkerHandle *)(uintptr_t)1;
 	return true;
 }
 
@@ -1004,6 +1106,20 @@ cluster_thread_recovery_replay_one(uint16 thread, uint64 epoch,
 	UT_ASSERT(authority->root_snapshot->validated_tail_lsn_exclusive
 			  > authority->root_snapshot->checkpoint_lower_lsn);
 	UT_ASSERT_EQ(authority->serial_guard->mode, CLUSTER_RECOVERY_SERIAL_ONLINE);
+	if (test_worker_window_consumer) {
+		ClusterControlRootReadToken token = { 0 };
+		uint64 tail = 0, lower = 0, lifecycle = 0;
+		uint32 tail_tli = 0, checkpoint_tli = 0;
+
+		UT_ASSERT(thread_recovery_root_projection(thread, epoch, authority, &token, &tail, &lower,
+												  &lifecycle, &tail_tli, &checkpoint_tli));
+		UT_ASSERT_EQ(memcmp(&token, authority->root_token, sizeof(token)), 0);
+		UT_ASSERT_EQ(tail, authority->root_snapshot->validated_tail_lsn_exclusive);
+		UT_ASSERT_EQ(lower, authority->root_snapshot->checkpoint_lower_lsn);
+		UT_ASSERT(tail > lower && lower != 0);
+		UT_ASSERT(!thread_recovery_root_projection(thread, epoch + 1, authority, &token, &tail,
+												   &lower, &lifecycle, &tail_tli, &checkpoint_tli));
+	}
 	return CLUSTER_THREADREC_DEFERRED; /* No DATA replay is claimed by this fixture. */
 }
 
@@ -6135,6 +6251,106 @@ UT_TEST(test_v2_canonical_no_missing_claim_or_lockfree_fallback)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_v2_service_read_waits_for_exact_retirement_before_output)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	static ClusterControlRootSnapshot out;
+	static ClusterControlRootReadToken token;
+	volatile bool caught = false;
+	volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	int locks;
+
+	v2_retention_fixture(bytes, &self, &candidate);
+	MyBackendType = B_LMON;
+	test_cf_release_confirmed = false;
+	test_capture_error_level = true;
+	PG_TRY();
+	{
+		result = cluster_control_root_read_canonical(
+			self.origin_thread_id, &self, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_capture_error_level = false;
+	UT_ASSERT(!caught);
+	UT_ASSERT_EQ(result, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	locks = test_cf_lock_calls;
+	if (!caught) {
+		UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, &self,
+														 CLUSTER_CONTROL_ROOT_READ_STRONG, &out,
+														 &token),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		test_cf_release_confirmed = true;
+		UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, &self,
+														 CLUSTER_CONTROL_ROOT_READ_STRONG, &out,
+														 &token),
+					 CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(test_cf_lock_calls, locks);
+		UT_ASSERT(cluster_control_root_identity_equal(&out.identity, &self));
+		UT_ASSERT(!v2_zero(&token, sizeof(token)));
+	}
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_service_pending_observation_is_bound_to_input_and_cut)
+{
+	for (int mutation = 0; mutation < 2; mutation++) {
+		uint8 bytes[66048];
+		ClusterControlRootIdentity self, wrong;
+		ControlFileData candidate;
+		ClusterControlRootSnapshot out;
+		ClusterControlRootReadToken token;
+
+		v2_retention_fixture(bytes, &self, &candidate);
+		MyBackendType = B_LMON;
+		test_cf_release_confirmed = false;
+		UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, &self,
+														 CLUSTER_CONTROL_ROOT_READ_STRONG, &out,
+														 &token),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		test_cf_release_confirmed = true;
+		wrong = self;
+		if (mutation == 0)
+			test_control_generation++;
+		else
+			wrong.origin_owner_incarnation++;
+		UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, &wrong,
+														 CLUSTER_CONTROL_ROOT_READ_STRONG, &out,
+														 &token),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+		MyBackendType = B_INVALID;
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_v2_service_immediate_release_also_rechecks_observation_cut)
+{
+	uint8 bytes[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	ClusterControlRootSnapshot out;
+	ClusterControlRootReadToken token;
+
+	v2_retention_fixture(bytes, &self, &candidate);
+	MyBackendType = B_LMON;
+	test_cf_release_cut_change = true;
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+					 self.origin_thread_id, &self, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	test_cf_release_cut_change = false;
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_v2_canonical_unconfirmed_release_is_fatal)
 {
 	uint8 bytes[66048];
@@ -6294,6 +6510,44 @@ UT_TEST(test_v2_failure_launch_accepts_open_but_not_clean_thread)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_v2_lmon_launch_continues_only_after_exact_cf_retirement)
+{
+	uint8 before[66048];
+	ClusterRecoverySerialRequest request;
+	ClusterThreadRecLaunchEligibility eligibility;
+	int locks;
+
+	v2_failure_fixture(before, &request, false);
+	memset(&test_worker_event, 0, sizeof(test_worker_event));
+	test_worker_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	test_worker_event.event_id = 12;
+	test_worker_event.new_epoch = 123;
+	test_worker_event.dead_bitmap[0] = 1;
+	test_control_barrier_ready = true;
+	test_launch_fixture = true;
+	test_launch_stamps = test_launch_registered = test_launch_legacy_pins = 0;
+	test_bit22_latch_active = true;
+	MyBackendType = B_LMON;
+	test_cf_release_confirmed = false;
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(eligibility.attempt_stamp, 0);
+	UT_ASSERT_EQ(test_launch_stamps, 0);
+	locks = test_cf_lock_calls;
+	test_cf_release_confirmed = true;
+	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(test_cf_lock_calls, locks);
+	thread_recovery_launch_one(&eligibility);
+	UT_ASSERT_EQ(test_launch_stamps, 1);
+	UT_ASSERT_EQ(test_launch_registered, 1);
+	UT_ASSERT_EQ(test_launch_legacy_pins, 0);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	memset(thread_recovery_owned, 0, sizeof(thread_recovery_owned));
+	test_launch_fixture = false;
+	test_bit22_latch_active = false;
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_v2_failure_worker_seals_then_acquires_fresh_replay_owners)
 {
 	uint8 before[66048];
@@ -6323,6 +6577,25 @@ UT_TEST(test_v2_failure_worker_seals_then_acquires_fresh_replay_owners)
 	UT_ASSERT_EQ(test_input_acquires, 1);
 	UT_ASSERT_EQ(test_worker_normal_ir, 2);
 	UT_ASSERT_EQ(test_worker_replays, 2);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_v2_worker_window_consumes_its_sealed_authority_not_legacy_projection)
+{
+	uint8 before[66048];
+	ClusterRecoverySerialRequest request;
+	ClusterThreadRecLaunchEligibility eligibility = { 0 };
+
+	v2_failure_fixture(before, &request, false);
+	eligibility.origin_thread = 1;
+	eligibility.attempt_stamp = 123;
+	eligibility.duty = request.duty;
+	test_worker_window_consumer = true;
+	test_legacy_projection_reads = 0;
+	UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+	UT_ASSERT_EQ(test_worker_replays, 1);
+	UT_ASSERT_EQ(test_legacy_projection_reads, 0);
+	test_worker_window_consumer = false;
 	cluster_shared_config = false;
 }
 
@@ -8809,7 +9082,13 @@ main(int argc, char **argv)
 		return fixture_root_main(argc, argv);
 	setup_fixture();
 
-	UT_PLAN(164);
+	if (getenv("PGRAC_PRE2_TEST_ROOT_POLL_RED") != NULL) {
+		UT_PLAN(1);
+		UT_RUN(test_v2_service_read_waits_for_exact_retirement_before_output);
+		UT_DONE();
+		return ut_failed_count ? 1 : 0;
+	}
+	UT_PLAN(169);
 	UT_RUN(test_history_encoder_matches_literal_empty_and_full);
 	UT_RUN(test_history_encoder_rejects_invalid_records_without_partial_output);
 	UT_RUN(test_history_stage_installs_exact_readable_object);
@@ -8930,13 +9209,18 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_canonical_discovery_lookup_and_revalidate);
 	UT_RUN(test_v2_canonical_no_missing_claim_or_lockfree_fallback);
 	UT_RUN(test_v2_canonical_unconfirmed_release_is_fatal);
+	UT_RUN(test_v2_service_read_waits_for_exact_retirement_before_output);
+	UT_RUN(test_v2_service_pending_observation_is_bound_to_input_and_cut);
+	UT_RUN(test_v2_service_immediate_release_also_rechecks_observation_cut);
 	UT_RUN(test_v2_canonical_foreign_absent_and_cf_refusals);
 	UT_RUN(test_v2_canonical_error_releases_owned_lock);
 	UT_RUN(test_v2_canonical_error_unconfirmed_cleanup_is_fatal);
 	UT_RUN(test_v2_failure_open_invalidates_old_tail_and_keeps_other_threads);
 	UT_RUN(test_v2_failure_tail_publishes_real_input_not_terminal);
 	UT_RUN(test_v2_failure_launch_accepts_open_but_not_clean_thread);
+	UT_RUN(test_v2_lmon_launch_continues_only_after_exact_cf_retirement);
 	UT_RUN(test_v2_failure_worker_seals_then_acquires_fresh_replay_owners);
+	UT_RUN(test_v2_worker_window_consumes_its_sealed_authority_not_legacy_projection);
 	UT_RUN(test_v2_failure_worker_entry_establishes_resource_owner);
 	UT_RUN(test_v2_failure_input_preserves_fpw_was_off_history);
 	UT_RUN(test_v2_failure_open_refuses_unproven_owners);

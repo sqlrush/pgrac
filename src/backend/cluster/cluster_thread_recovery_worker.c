@@ -512,9 +512,12 @@ thread_recovery_launch_one(const ClusterThreadRecLaunchEligibility *eligibility)
 	 * pinned fields and never re-acquires CF(S) inside the episode
 	 * (follow-up item 2).  The launch attempt stamp is the projection's
 	 * episode identity.  A pin failure leaves the projection absent ->
-	 * the worker fails closed (window derivation BLOCKED).
+	 * the worker fails closed (window derivation BLOCKED).  PRE2 shared
+	 * config instead seals the input in the worker and consumes its held
+	 * WALR/IR authority.  A second LMON CF read can be pending and predates
+	 * that sealing, so it is not the PRE2 worker's replay authority.
 	 */
-	if (cluster_r4_bit22_cutover_active()) {
+	if (!cluster_shared_config && cluster_r4_bit22_cutover_active()) {
 		(void)cluster_thread_recovery_pin_projection(dead_tid, eligibility->attempt_stamp);
 	}
 	if (register_one_worker(eligibility, &owned->handle)) {

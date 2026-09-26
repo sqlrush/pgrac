@@ -30,6 +30,7 @@
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h"
 #include "cluster/cluster_ir.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_sequence.h"
 #include "cluster/cluster_shmem.h"
 #include "cluster/cluster_wal_thread.h"
@@ -49,6 +50,30 @@ UT_DEFINE_GLOBALS();
 bool IsUnderPostmaster = false;
 bool cluster_shared_config = false;
 int cluster_ges_request_timeout_ms = 1000;
+
+/* PGRAC: existing root/fencing tests retain their explicit acquisition
+ * boundary. Real stable/copyable ownership is test_cluster_control_ir.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterLockAcquireResult
+cluster_lock_owner_request_acquire(ClusterLockAcquireRequest *request,
+								   ClusterControlNativeFinish finish pg_attribute_unused(),
+								   void *argument pg_attribute_unused())
+{
+	ClusterLockAcquireResult result = cluster_lock_acquire_seven_step(request);
+	return result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK
+			   ? cluster_lock_acquire_s5_promote(request)
+			   : result;
+}
+bool
+cluster_lock_owner_request_usable(const ClusterLockAcquireRequest *request)
+{
+	return request != NULL && request->request_id != 0;
+}
+ClusterLockAcquireResult
+cluster_lock_owner_request_release(const ClusterLockAcquireRequest *request)
+{
+	return cluster_lock_acquire_s6_release(request);
+}
 
 static union {
 	uint64 align;

@@ -54,6 +54,8 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_lock_owner.h"
 
 #include <signal.h>
 #include <sys/resource.h> /* PGRAC: spec-7.3 D8 setpriority (cluster.lms_nice) */
@@ -1230,6 +1232,10 @@ LmsMain(void)
 		PG_TRY();
 		{
 			pg_atomic_fetch_add_u64(&cluster_lms_state->lms_drain_empty_count, 1);
+			/* PGRAC: exact control cleanup/reconstruction is nonblocking.
+			 * Author: SqlRush <sqlrush@gmail.com> */
+			cluster_cf_retirement_poll();
+			cluster_lock_owners_service_poll();
 			cluster_lms_native_probe_retry_tick();
 			/* PGRAC: spec-6.12b — construct parked CR-server requests (every
 		 * failure becomes a DENIED result; LMS never exits over a serve). */
@@ -1438,6 +1444,8 @@ LmsWorkerMain(int worker_id)
 			ereport(FATAL, (errmsg_internal("LMS worker cannot enter normal-stop work segment")));
 		PG_TRY();
 		{
+			cluster_cf_retirement_poll();
+			cluster_lock_owners_service_poll();
 			if (cluster_lms_data_plane_enabled()) {
 				/* Current-MX proof requests are sharded by request identity.  The
 			 * origin FSM is process-local, so every DATA worker must advance

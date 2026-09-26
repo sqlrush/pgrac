@@ -1272,7 +1272,7 @@ cluster_recovery_merge_fence_plan_acquire_serial(ClusterRecoveryFencePlan *plan)
 	uint16 i;
 
 	if (!recovery_fence_plan_valid(plan) || !plan->sealed || plan->serial_held || plan->committed
-		|| plan->origin_count == 0)
+		|| plan->origin_count == 0 || plan->serial_guards.count != 0)
 		return false;
 	requests = palloc0(sizeof(*requests) * plan->origin_count);
 	for (i = 0; i < plan->origin_count; i++) {
@@ -1405,8 +1405,11 @@ cluster_recovery_merge_fence_plan_release_serial(ClusterRecoveryFencePlan *plan)
 {
 	ClusterRecoverySerialReleaseResult result;
 
-	if (!recovery_fence_plan_valid(plan) || !plan->serial_held)
+	if (!recovery_fence_plan_valid(plan) || plan->serial_guards.count == 0)
 		return false;
+	/* A failed set acquisition can still own earlier guards. Conversely,
+	 * starting release surrenders full-set authority even while ACKs wait. */
+	plan->serial_held = false;
 	result = cluster_recovery_serial_release_set(&plan->serial_guards);
 	if (result != CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED)
 		return false;
@@ -1422,7 +1425,7 @@ cluster_recovery_merge_fence_plan_destroy(ClusterRecoveryFencePlan **plan)
 	if (plan == NULL || *plan == NULL)
 		return;
 	owned = *plan;
-	if (!recovery_fence_plan_valid(owned) || owned->serial_held)
+	if (!recovery_fence_plan_valid(owned) || owned->serial_held || owned->serial_guards.count != 0)
 		return;
 	recovery_fence_plan_release_members(owned);
 	MemSet(owned, 0, sizeof(*owned));

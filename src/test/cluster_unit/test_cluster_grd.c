@@ -57,6 +57,7 @@
 #include "cluster/cluster_ges_mode.h"	 /* spec-5.1b — frozen matrix + convert classification */
 #include "access/transam.h"				 /* spec-5.8 D1c — InvalidTransactionId */
 #include "cluster/cluster_grd.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_external_fence.h"
 #include "cluster/cluster_hw.h"			/* spec-4.6a HW remaster watchdog stubs */
 #include "cluster/cluster_lmd.h"		/* spec-5.8 D1b — WFG vertex + submit/cancel edge */
@@ -1055,6 +1056,26 @@ ut_wfg_waiter_wait_seq(int32 node, uint32 procno, uint64 epoch, uint64 rid)
 LWLockPadded *MainLWLockArray = NULL;
 int MaxBackends = 100;
 static PGPROC stub_proc_slots[1];
+bool cluster_shared_config = false;
+static bool ut_control_census_ready = true;
+static bool ut_control_census_stable = true;
+
+/* Boundary fixture for the separate real-registry census tests. */
+#ifndef PGRAC_REAL_CONTROL_CENSUS
+bool cluster_control_request_census(uint64 epoch, uint64 *version);
+bool cluster_control_request_census_unchanged(uint64 epoch, uint64 version);
+bool
+cluster_control_request_census(uint64 epoch, uint64 *version)
+{
+	*version = ut_control_census_ready && epoch != 0 ? 17 : 0;
+	return *version != 0;
+}
+bool
+cluster_control_request_census_unchanged(uint64 epoch, uint64 version)
+{
+	return ut_control_census_ready && ut_control_census_stable && epoch != 0 && version == 17;
+}
+#endif
 static PROC_HDR stub_proc_global = { .allProcs = stub_proc_slots, .allProcCount = 1 };
 PROC_HDR *ProcGlobal = &stub_proc_global;
 void *
@@ -5539,6 +5560,59 @@ UT_TEST(test_recovery_control_observes_protocol_cut_without_data_thaw)
 	finish_recovery_control_fixture();
 }
 
+UT_TEST(test_control_acquire_waits_for_common_barrier_even_on_normal_shard)
+{
+	ClusterResId cf = { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
+	ClusterResId walr = { .type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+						  .lockmethodid = DEFAULT_LOCKMETHOD,
+						  .field1 = 2 };
+	uint64 generation;
+
+	setup_recovery_control_fixture(false);
+	cluster_shared_config = true;
+	generation = cluster_grd_redeclare_generation();
+	cluster_grd_shard_set_phase(cluster_grd_shard_for_resource(&cf), GRD_SHARD_NORMAL);
+	UT_ASSERT(cluster_grd_control_rebuild_frozen(9, generation));
+	UT_ASSERT(!cluster_grd_control_rebuild_frozen(8, generation));
+	UT_ASSERT(!cluster_grd_control_rebuild_frozen(9, generation + 1));
+	UT_ASSERT(!cluster_grd_control_acquire_allowed(&cf, ShareLock));
+	UT_ASSERT(!cluster_grd_control_acquire_allowed(&walr, ExclusiveLock));
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT(!cluster_grd_control_acquire_allowed(&cf, ShareLock));
+	cluster_grd_recovery_mark_peer_done(
+		2, 9, cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
+	UT_ASSERT(!cluster_grd_control_rebuild_frozen(9, generation));
+	UT_ASSERT(cluster_grd_control_recovery_ready(&cf, ShareLock));
+	UT_ASSERT(cluster_grd_control_acquire_allowed(&cf, ShareLock));
+	UT_ASSERT(cluster_grd_control_acquire_allowed(&walr, ExclusiveLock));
+	UT_ASSERT(!cluster_grd_control_acquire_allowed(&cf, ExclusiveLock));
+	UT_ASSERT(!cluster_grd_control_acquire_allowed(&walr, ShareLock));
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	UT_ASSERT(cluster_grd_recovery_in_progress());
+	cluster_shared_config = false;
+	finish_recovery_control_fixture();
+}
+
+UT_TEST(test_control_gate_unknown_cut_never_proves_frozen_or_ready)
+{
+	ClusterResId cf = { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
+	uint64 generation;
+
+	setup_recovery_control_fixture(true);
+	cluster_shared_config = true;
+	generation = cluster_grd_redeclare_generation();
+	UT_ASSERT(cluster_grd_control_acquire_allowed(&cf, ShareLock));
+	ut_qvotec_quorum = false;
+	UT_ASSERT(!cluster_grd_control_acquire_allowed(&cf, ShareLock));
+	UT_ASSERT(!cluster_grd_control_rebuild_frozen(9, generation));
+	ut_qvotec_quorum = true;
+	ut_mock_epoch++;
+	UT_ASSERT(!cluster_grd_control_acquire_allowed(&cf, ShareLock));
+	UT_ASSERT(!cluster_grd_control_rebuild_frozen(10, generation));
+	cluster_shared_config = false;
+	finish_recovery_control_fixture();
+}
+
 UT_TEST(test_recovery_control_refuses_other_failure_or_live_origin)
 {
 	ClusterGrdRecoveryControlSnapshotV1 snapshot;
@@ -5633,6 +5707,24 @@ UT_TEST(test_recovery_barrier_does_not_treat_missing_census_as_empty)
 	ProcGlobal = &stub_proc_global;
 	cluster_grd_recovery_lmon_tick();
 	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	finish_recovery_control_fixture();
+}
+
+UT_TEST(test_recovery_barrier_keeps_shared_debt_after_creator_exit)
+{
+	setup_recovery_control_fixture(false);
+	cluster_shared_config = true;
+	ut_control_census_ready = false;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_BARRIER);
+	ut_control_census_ready = true;
+	ut_control_census_stable = false; /* Exit/registration during private census. */
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_BARRIER);
+	ut_control_census_stable = true;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	cluster_shared_config = false;
 	finish_recovery_control_fixture();
 }
 
@@ -6448,7 +6540,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(133);
+	UT_PLAN(136);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6583,9 +6675,12 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
 	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
 	UT_RUN(test_recovery_control_observes_protocol_cut_without_data_thaw);
+	UT_RUN(test_control_acquire_waits_for_common_barrier_even_on_normal_shard);
+	UT_RUN(test_control_gate_unknown_cut_never_proves_frozen_or_ready);
 	UT_RUN(test_recovery_control_uses_accepted_epoch_after_observer_bump);
 	UT_RUN(test_recovery_barrier_waits_for_auxiliary_and_self_owners);
 	UT_RUN(test_recovery_barrier_does_not_treat_missing_census_as_empty);
+	UT_RUN(test_recovery_barrier_keeps_shared_debt_after_creator_exit);
 	UT_RUN(test_recovery_owner_slot_reuse_resets_registration);
 	UT_RUN(test_recovery_control_refuses_other_failure_or_live_origin);
 	UT_RUN(test_recovery_control_requires_survivors_quorum_and_usable_map);

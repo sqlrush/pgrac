@@ -4,6 +4,8 @@
 #include "postgres.h"
 #include LMS_NATIVE_PROBE_SOURCE_PATH
 #include GES_DEDUP_SOURCE_PATH
+#include "cluster/cluster_ir.h"
+#include "cluster/cluster_wal_retention.h"
 #undef printf
 #include "unit_test.h"
 
@@ -1049,10 +1051,64 @@ UT_TEST(normal_stop_ges_invalid_overrides_pending_and_wrong_observer)
 	MyBackendType = B_LMS;
 }
 
+UT_TEST(ordered_control_retirement_removes_pending_and_complete_exact_receipts)
+{
+	ClusterGesDedupKey key = receipt_key(37, 1037);
+	ClusterGesDedupKey other = key;
+	GesReplyPayload reply = { 0 };
+	int i;
+
+	reset();
+	UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	for (i = 0; i < 4; i++) {
+		other = key;
+		if (i == 0)
+			other.origin_node_id++;
+		if (i == 1)
+			other.holder_procno++;
+		if (i == 2)
+			other.cluster_epoch++;
+		if (i == 3)
+			other.request_id++;
+		UT_ASSERT_EQ(lookup_receipt(&other, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	}
+	other = key;
+	other.opcode = GES_REQ_OPCODE_REDECLARE;
+	other.shard_master_generation++;
+	UT_ASSERT_EQ(lookup_receipt(&other, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+	cluster_ges_dedup_record_reply(&other, (uint8 *)&reply, sizeof(reply));
+	UT_ASSERT(cluster_ges_dedup_retire_control_request(1, 37, 9, 1037));
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 4);
+	UT_ASSERT(cluster_ges_dedup_retire_control_request(1, 37, 9, 1037));
+	UT_ASSERT_EQ(cluster_ges_dedup_entry_count(), 4);
+	cluster_ges_dedup_htab = NULL;
+	UT_ASSERT(!cluster_ges_dedup_retire_control_request(1, 37, 9, 1037));
+}
+
+UT_TEST(control_namespaces_have_no_native_probe_continuation)
+{
+	ClusterResId resid = { 0 };
+	const uint8 types[]
+		= { CLUSTER_CF_RESID_TYPE, CLUSTER_WAL_RETENTION_RESID_TYPE, CLUSTER_IR_RESID_TYPE };
+	unsigned i;
+	LOCKMODE mode;
+
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	for (i = 0; i < lengthof(types); ++i) {
+		resid.type = types[i];
+		resid.field1 = i == 0 ? 0 : 1;
+		resid.field2 = i == 2 ? 1 : 0;
+		for (mode = AccessShareLock; mode <= AccessExclusiveLock; ++mode)
+			UT_ASSERT(!cluster_lms_native_probe_required(&resid, mode));
+	}
+	resid.type = LOCKTAG_RELATION;
+	UT_ASSERT(cluster_lms_native_probe_required(&resid, ExclusiveLock));
+}
+
 int
 main(void)
 {
-	printf("1..33\n");
+	printf("1..35\n");
 	UT_RUN(async_origin_generation_is_not_receiver_authority);
 	UT_RUN(async_changed_receiver_cut_cannot_grant);
 	UT_RUN(async_dispatch_keeps_the_original_admitted_cut);
@@ -1086,6 +1142,8 @@ main(void)
 	UT_RUN(native_completion_cannot_overwrite_another_backend_receipt);
 	UT_RUN(only_completed_exact_receipts_can_be_retired);
 	UT_RUN(native_grant_release_cycles_do_not_fill_the_receipt_table);
+	UT_RUN(ordered_control_retirement_removes_pending_and_complete_exact_receipts);
+	UT_RUN(control_namespaces_have_no_native_probe_continuation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

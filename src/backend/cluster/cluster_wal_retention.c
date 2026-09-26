@@ -29,6 +29,7 @@
 #include "portability/instr_time.h"
 #include "storage/lock.h"
 #include "utils/memutils.h"
+#include "cluster/cluster_lock_owner.h"
 #include "utils/resowner.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -328,51 +329,70 @@ walr_native_lock_release_or_fatal(const ClusterLockAcquireRequest *request)
  * holder.  A native refusal cancels the reservation and can never be recorded
  * as a coordinated grant. */
 static ClusterLockAcquireResult
-walr_request_acquire_actual(ClusterLockAcquireRequest *request)
+walr_request_finish_native(ClusterLockAcquireRequest *request, void *argument)
 {
 	ClusterLockAcquireResult result;
+	LockAcquireResult native_result;
+	volatile bool *native_held = argument;
 
-	result = cluster_lock_acquire_seven_step(request);
-	if (result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK) {
-		LockAcquireResult native_result;
-
-		walr_native_locktag_init((uint16)request->resid.field1, &request->locktag);
-		native_result = LockAcquire(&request->locktag, request->lockmode, request->sessionLock,
-									request->dontwait);
-		if (native_result != LOCKACQUIRE_OK) {
-			if (native_result == LOCKACQUIRE_ALREADY_CLEAR
-				|| native_result == LOCKACQUIRE_ALREADY_HELD)
-				walr_native_lock_release_or_fatal(request);
-			(void)cluster_lock_acquire_s7_cleanup(request);
-			return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
-		}
-		result = cluster_lock_acquire_s5_promote(request);
-		if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED
-			&& result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+	walr_native_locktag_init((uint16)request->resid.field1, &request->locktag);
+	native_result = LockAcquire(&request->locktag, request->lockmode, request->sessionLock,
+								request->dontwait);
+	if (native_result != LOCKACQUIRE_OK) {
+		if (native_result == LOCKACQUIRE_ALREADY_CLEAR || native_result == LOCKACQUIRE_ALREADY_HELD)
 			walr_native_lock_release_or_fatal(request);
+		(void)cluster_lock_acquire_s7_cleanup(request);
+		return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
+	}
+	*native_held = true;
+	result = cluster_lock_acquire_s5_promote(request);
+	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED && result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
+		walr_native_lock_release_or_fatal(request);
+		*native_held = false;
 	}
 	return result;
 }
 
-/* Convert one existing WALR holder without creating a second GES holder.
- * preserve_request_id is used by X->S: keeping the confirmed X holder key
- * makes cleanup exact whether the downgrade reply is received or lost. */
 static ClusterLockAcquireResult
-walr_request_convert_actual(ClusterLockAcquireRequest *request, uint64 preserve_request_id,
-							bool *out_cleanup_required)
+walr_request_acquire_actual(ClusterLockAcquireRequest *request)
 {
 	ClusterLockAcquireResult result;
-	LockAcquireResult native_result;
+	volatile bool native_held = false;
+	ClusterLockAcquireRequest native = *request;
 
-	if (out_cleanup_required != NULL)
-		*out_cleanup_required = false;
-	result = cluster_lock_acquire_seven_step(request);
-	if (result != CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
+	if (cluster_shared_config) {
+		walr_native_locktag_init((uint16)native.resid.field1, &native.locktag);
+		PG_TRY();
+		{
+			result = cluster_lock_owner_request_acquire(request, walr_request_finish_native,
+														(void *)&native_held);
+		}
+		PG_CATCH();
+		{
+			if (native_held)
+				walr_native_lock_release_or_fatal(&native);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		/* S5 can succeed before its publication cut changes. The stable
+		 * request owns remote cleanup; no unreturned guard owns native work. */
+		if (native_held && result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+			&& result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+			walr_native_lock_release_or_fatal(request);
 		return result;
-	if (preserve_request_id != 0) {
-		request->request_id = preserve_request_id;
-		request->holder.request_id = preserve_request_id;
 	}
+	result = cluster_lock_acquire_seven_step(request);
+	if (result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
+		result = walr_request_finish_native(request, (void *)&native_held);
+	return result;
+}
+
+static ClusterLockAcquireResult
+walr_convert_finish_native(ClusterLockAcquireRequest *request, void *argument)
+{
+	LockAcquireResult native_result;
+	volatile bool *native_held = argument;
+
 	walr_native_locktag_init((uint16)request->resid.field1, &request->locktag);
 	native_result = LockAcquire(&request->locktag, request->lockmode, request->sessionLock,
 								request->dontwait);
@@ -381,7 +401,53 @@ walr_request_convert_actual(ClusterLockAcquireRequest *request, uint64 preserve_
 			walr_native_lock_release_or_fatal(request);
 		return CLUSTER_LOCK_ACQUIRE_NOT_AVAIL;
 	}
-	result = cluster_lock_acquire_s5_promote(request);
+	*native_held = true;
+	return cluster_lock_acquire_s5_promote(request);
+}
+
+/* Convert one existing WALR holder without creating a second GES holder.
+ * PRE2 registers a fresh S->X identity before dispatch; X->S retains the
+ * confirmed identity and fences queued old-mode frames before dispatch. */
+static ClusterLockAcquireResult
+walr_request_convert_actual(ClusterLockAcquireRequest *request, uint64 preserve_request_id,
+							bool *out_cleanup_required)
+{
+	ClusterLockAcquireResult result;
+	volatile bool native_held = false;
+	ClusterLockAcquireRequest native = *request;
+
+	if (out_cleanup_required != NULL)
+		*out_cleanup_required = false;
+	if (cluster_shared_config) {
+		walr_native_locktag_init((uint16)native.resid.field1, &native.locktag);
+		PG_TRY();
+		{
+			result = cluster_lock_owner_request_convert(
+				request, preserve_request_id, walr_convert_finish_native, (void *)&native_held);
+		}
+		PG_CATCH();
+		{
+			if (native_held)
+				walr_native_lock_release_or_fatal(&native);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		/* The stable owner keeps remote cleanup. No failed conversion
+		 * transfers an untracked extra native ref into the caller's guard. */
+		if (native_held && result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+			walr_native_lock_release_or_fatal(&native);
+		return result;
+	}
+	result = cluster_lock_acquire_seven_step(request);
+	if (result != CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
+		return result;
+	if (preserve_request_id != 0) {
+		request->request_id = preserve_request_id;
+		request->holder.request_id = preserve_request_id;
+	}
+	result = walr_convert_finish_native(request, (void *)&native_held);
+	if (!native_held)
+		return result;
 	if (result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
 		if (request->lockmode == ExclusiveLock && result != CLUSTER_LOCK_ACQUIRE_NOT_AVAIL) {
 			if (out_cleanup_required != NULL)
@@ -399,7 +465,8 @@ walr_request_release_actual(const ClusterLockAcquireRequest *request)
 {
 	ClusterLockAcquireResult result;
 
-	result = cluster_lock_acquire_s6_release(request);
+	result = cluster_shared_config ? cluster_lock_owner_request_release(request)
+								   : cluster_lock_acquire_s6_release(request);
 	if (result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 		walr_native_lock_release_or_fatal(request);
 	return result;
@@ -539,6 +606,36 @@ pin_fail_after_locks(ClusterWalRetentionPin *pin, ClusterWalPinResult result,
 	return result;
 }
 
+/* A held flag owns cleanup; only a current logical owner protects WAL. A
+ * pin temporarily upgraded by its exact reuse guard is protected by that X,
+ * never by an unrelated X or by a copied pre-rebuild S identity. */
+static bool
+walr_request_current(const ClusterLockAcquireRequest *request)
+{
+	return !cluster_shared_config || cluster_lock_owner_request_usable(request);
+}
+
+static bool
+pin_thread_walr_current(const ClusterWalRetentionPin *pin, const ClusterWalPinThread *thread)
+{
+	const ClusterWalReuseActionGuard *guard = active_reuse_guard;
+
+	if (!thread->walr.held || thread->walr.release_uncertain)
+		return false;
+	if (walr_request_current(&thread->walr.request))
+		return true;
+	return guard != NULL && guard->pin_or_null == pin && guard->serial_or_null == thread->serial
+		   && guard->walr.converted_from_pin && guard->walr.held && guard->walr.coordinated
+		   && !guard->walr.release_uncertain && guard->walr.mode == ExclusiveLock
+		   && guard->walr.acquire_request.control_owner_id != 0
+		   && guard->walr.acquire_request.control_owner_id == thread->walr.request.control_owner_id
+		   && memcmp(&guard->duty, &thread->duty, sizeof(thread->duty)) == 0
+		   && memcmp(&guard->root_read, &thread->root_read, sizeof(thread->root_read)) == 0
+		   && memcmp(&guard->walr.resid, &thread->walr.request.resid, sizeof(guard->walr.resid))
+				  == 0
+		   && walr_request_current(&guard->walr.acquire_request);
+}
+
 static ClusterWalPinResult
 pin_current_after_grants(ClusterWalRetentionPin *pin)
 {
@@ -551,7 +648,7 @@ pin_current_after_grants(ClusterWalRetentionPin *pin)
 		PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 
 		result = cluster_control_root_revalidate(&thread->root_read, &thread->duty, &snapshot);
-		if (!control_root_read_ready(result)
+		if (!control_root_read_ready(result) || !pin_thread_walr_current(pin, thread)
 			|| memcmp(&snapshot.identity, &thread->duty, sizeof(thread->duty)) != 0
 			|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 			|| snapshot.root_flags != thread->root_read.root_flags
@@ -675,7 +772,8 @@ cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin,
 		return CLUSTER_WAL_PIN_RELEASE_UNCERTAIN;
 	if (pin->state != CLUSTER_WAL_PIN_STATE_ACQUIRED_UNBOUND || pin->nthreads != 1)
 		return CLUSTER_WAL_PIN_INVALID;
-	if (!serial_matches_thread(held_serial, &pin->threads[0]))
+	if (!pin_thread_walr_current(pin, &pin->threads[0])
+		|| !serial_matches_thread(held_serial, &pin->threads[0]))
 		return CLUSTER_WAL_PIN_STALE;
 	pin->threads[0].serial = held_serial;
 	pin->state = CLUSTER_WAL_PIN_STATE_BOUND_ONE;
@@ -696,7 +794,8 @@ cluster_wal_retention_pin_bind_set(ClusterWalRetentionPin *pin,
 		|| held_set == NULL || held_set->count != pin->nthreads)
 		return CLUSTER_WAL_PIN_INVALID;
 	for (i = 0; i < pin->nthreads; i++)
-		if (!serial_matches_thread(&held_set->guards[i], &pin->threads[i]))
+		if (!pin_thread_walr_current(pin, &pin->threads[i])
+			|| !serial_matches_thread(&held_set->guards[i], &pin->threads[i]))
 			return CLUSTER_WAL_PIN_STALE;
 	for (i = 0; i < pin->nthreads; i++)
 		pin->threads[i].serial = &held_set->guards[i];
@@ -714,7 +813,8 @@ pin_revalidate_bound(ClusterWalRetentionPin *pin)
 		&& pin->state != CLUSTER_WAL_PIN_STATE_BOUND_SET)
 		return CLUSTER_WAL_PIN_INVALID;
 	for (i = 0; i < pin->nthreads; i++)
-		if (!serial_matches_thread(pin->threads[i].serial, &pin->threads[i])) {
+		if (!pin_thread_walr_current(pin, &pin->threads[i])
+			|| !serial_matches_thread(pin->threads[i].serial, &pin->threads[i])) {
 			pin->poisoned = true;
 			return CLUSTER_WAL_PIN_STALE;
 		}
@@ -917,7 +1017,7 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 				break;
 		if (i == active_pin->nthreads
 			|| memcmp(&active_pin->threads[i].root_read, expected_root, sizeof(*expected_root)) != 0
-			|| !active_pin->threads[i].walr.held || active_pin->threads[i].walr.release_uncertain) {
+			|| !pin_thread_walr_current(active_pin, &active_pin->threads[i])) {
 			pfree(guard);
 			return CLUSTER_WAL_PIN_STALE;
 		}
@@ -1966,6 +2066,11 @@ cluster_wal_retention_e1_coarse_begin(ClusterWalRetentionE1Context *context, uin
 	memset(&fold, 0, sizeof(fold));
 	memset(&target_root, 0, sizeof(target_root));
 	result = wal_reuse_preflight_roots(&request, &fold, &target_root, out_reason);
+	if (result == CLUSTER_WAL_GUARD_OK
+		&& !walr_request_current(&context->coarse_walr.acquire_request)) {
+		*out_reason = CLUSTER_WAL_DENY_GES_UNAVAILABLE;
+		result = CLUSTER_WAL_GUARD_BLOCKED;
+	}
 	if (result == CLUSTER_WAL_GUARD_OK && fold.result == CLUSTER_WAL_FOLD_BOUNDED
 		&& fold.floor_by_thread[thread_id - 1] == 0) {
 		*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
@@ -2462,6 +2567,9 @@ cluster_wal_reuse_guard_arm(ClusterWalReuseActionGuard *guard,
 	result = wal_reuse_preflight_roots(&request, &fold, &target_root, out_reason);
 	if (result != CLUSTER_WAL_GUARD_OK)
 		return wal_reuse_guard_rollback_x(guard, result, *out_reason, out_reason);
+	if (!walr_request_current(&guard->walr.acquire_request))
+		return wal_reuse_guard_rollback_x(guard, CLUSTER_WAL_GUARD_BLOCKED,
+										  CLUSTER_WAL_DENY_GES_UNAVAILABLE, out_reason);
 	for (i = 0; i < fold.nintervals; i++)
 		if (cluster_wal_retention_interval_intersects_file(&fold.intervals[i], &guard->file,
 														   wal_segment_size))
@@ -2511,6 +2619,10 @@ cluster_wal_reuse_guard_l3_begin(ClusterWalReuseActionGuard *guard,
 		|| !root_token_matches_identity(&guard->root_read, &guard->duty)) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
+	}
+	if (!walr_request_current(&guard->walr.acquire_request)) {
+		*out_reason = CLUSTER_WAL_DENY_GES_UNAVAILABLE;
+		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	if (guard->walr.converted_from_pin) {
 		pin_thread = pin_find_thread(guard->pin_or_null, guard->duty.origin_thread_id);
@@ -2625,6 +2737,10 @@ cluster_wal_reuse_guard_confirm_zero_mutation(ClusterWalReuseActionGuard *guard,
 		|| !root_token_matches_identity(&guard->root_read, &guard->duty)) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
+	}
+	if (!walr_request_current(&guard->walr.acquire_request)) {
+		*out_reason = CLUSTER_WAL_DENY_GES_UNAVAILABLE;
+		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	if (guard->walr.converted_from_pin) {
 		pin_thread = pin_find_thread(guard->pin_or_null, guard->duty.origin_thread_id);
@@ -2762,6 +2878,10 @@ cluster_wal_reuse_guard_remove(ClusterWalReuseActionGuard *guard,
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
 	}
+	if (!walr_request_current(&guard->walr.acquire_request)) {
+		*out_reason = CLUSTER_WAL_DENY_GES_UNAVAILABLE;
+		return CLUSTER_WAL_GUARD_BLOCKED;
+	}
 	if ((guard->flags & CLUSTER_WAL_GUARD_F_FALLBACK_L3) != 0)
 		physical = CLUSTER_WAL_PHYSICAL_REMOVE;
 	else if (!wal_reuse_guard_primary_physical(guard, &physical)) {
@@ -2848,6 +2968,10 @@ cluster_wal_reuse_guard_recycle(ClusterWalReuseActionGuard *guard,
 									  sizeof(destination_basename))) {
 		*out_reason = CLUSTER_WAL_DENY_GUARD_STATE;
 		return CLUSTER_WAL_GUARD_INVALID;
+	}
+	if (!walr_request_current(&guard->walr.acquire_request)) {
+		*out_reason = CLUSTER_WAL_DENY_GES_UNAVAILABLE;
+		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
 	dirfd = (int)guard->source_dir_handle;
 #ifdef AT_SYMLINK_NOFOLLOW

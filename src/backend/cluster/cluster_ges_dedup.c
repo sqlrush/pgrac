@@ -397,6 +397,31 @@ cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key)
 	return removed;
 }
 
+/* The exact GRD retirement precedes this call on the sole FIFO mutation
+ * owner. Do not reuse it for ordinary RELEASE or native-probe namespaces.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_ges_dedup_retire_control_request(uint32 node, uint32 procno, uint64 epoch, uint64 request)
+{
+	HASH_SEQ_STATUS scan;
+	ClusterGesDedupEntry *entry;
+
+	if (cluster_ges_dedup_htab == NULL || cluster_ges_dedup_lock == NULL
+		|| cluster_ges_dedup_shared == NULL || epoch == 0 || request == 0)
+		return false;
+	LWLockAcquire(cluster_ges_dedup_lock, LW_EXCLUSIVE);
+	hash_seq_init(&scan, cluster_ges_dedup_htab);
+	while ((entry = (ClusterGesDedupEntry *)hash_seq_search(&scan)) != NULL) {
+		if (entry->key.origin_node_id == node && entry->key.holder_procno == procno
+			&& entry->key.cluster_epoch == epoch && entry->key.request_id == request) {
+			(void)hash_search(cluster_ges_dedup_htab, &entry->key, HASH_REMOVE, NULL);
+			pg_atomic_fetch_sub_u32(&cluster_ges_dedup_shared->entry_count, 1);
+		}
+	}
+	LWLockRelease(cluster_ges_dedup_lock);
+	return true;
+}
+
 uint32
 cluster_ges_dedup_drop_stale_entries(void)
 {

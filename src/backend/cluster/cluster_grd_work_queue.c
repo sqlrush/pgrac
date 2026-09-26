@@ -24,6 +24,7 @@
 #include "postgres.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_control_request.h"
 
 #include "cluster/cluster_ges.h" /* GesRequestPayload (spec-5.8 D8 coupling assert) */
 #include "cluster/cluster_grd_work_queue.h"
@@ -42,6 +43,8 @@
  * making the master reject every cross-node REQUEST with WORK_QUEUE_FULL
  * (latent until a 2-node run, as the D1e miss was).
  */
+StaticAssertDecl(sizeof(((ClusterGrdWorkItem *)0)->payload) >= CLUSTER_CONTROL_RETIRE_BYTES,
+				 "GES work-item payload must hold a control retirement frame");
 StaticAssertDecl(sizeof(((ClusterGrdWorkItem *)0)->payload) >= sizeof(GesRequestPayload),
 				 "GES work-item payload buffer must hold a full GesRequestPayload");
 

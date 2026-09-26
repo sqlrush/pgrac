@@ -150,6 +150,13 @@ extern void cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key, const 
  */
 extern bool cluster_ges_dedup_remove_completed(const ClusterGesDedupKey *key);
 
+/* PGRAC: only after the ordered control retirement barrier and exact GRD
+ * removal. Includes queued/in-flight receipts: their producer is closed and
+ * these namespaces have no asynchronous native-probe continuation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern bool cluster_ges_dedup_retire_control_request(uint32 node, uint32 procno, uint64 epoch,
+													 uint64 request);
+
 /*
  * Sweep entries whose shard_master_generation < current LMS generation.
  *

@@ -82,6 +82,11 @@ extern void cluster_cf_resid_encode(ClusterResId *dst);
  *	Use cluster_cf_unlock_confirmed when the caller must consume the verdict.
  */
 extern bool cluster_cf_lock(LOCKMODE mode);
+extern bool cluster_cf_lock_poll(LOCKMODE mode);
+extern bool cluster_cf_acquire_pending(LOCKMODE mode);
+extern uint64 cluster_cf_owner_cookie(LOCKMODE mode);
+extern bool cluster_cf_release_completed(LOCKMODE mode, uint64 cookie);
+extern void cluster_cf_retirement_poll(void);
 extern void cluster_cf_unlock(LOCKMODE mode);
 
 typedef enum ClusterCfReleaseResult {

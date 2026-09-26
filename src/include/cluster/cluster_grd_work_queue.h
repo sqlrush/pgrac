@@ -68,11 +68,11 @@ typedef struct ClusterGrdWorkItem {
 	uint64 routing_generation;
 	uint32 source_node_id;
 	uint16 payload_len;
-	uint8 payload[72]; /* GES_REQUEST payload image (spec-5.8 D1e: 72B) */
+	uint8 payload[80]; /* PGRAC: normal requests and exact control retirement. */
 } ClusterGrdWorkItem;
 
-StaticAssertDecl(sizeof(ClusterGrdWorkItem) == 88,
-				 "ClusterGrdWorkItem local layout (8 cut + 6 metadata + 72 payload + 2 pad)");
+StaticAssertDecl(sizeof(ClusterGrdWorkItem) == 96,
+				 "ClusterGrdWorkItem local layout (8 cut + 6 metadata + 80 payload + 2 pad)");
 
 extern Size cluster_grd_work_queue_shmem_size(void);
 extern void cluster_grd_work_queue_shmem_init(void);

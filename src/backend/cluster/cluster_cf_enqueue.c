@@ -62,6 +62,7 @@ typedef struct CfHoldState {
 
 static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
+static uint64 cf_retired_x, cf_retired_s;
 
 /*
  * spec-5.6: set while this process is the bootstrap single-node authority
@@ -119,12 +120,13 @@ cluster_cf_resid_encode(ClusterResId *dst)
 /*
  * cluster_cf_lock -- acquire the singleton CF lock in `mode` via GES.
  */
-bool
-cluster_cf_lock(LOCKMODE mode)
+static bool
+cf_lock(LOCKMODE mode, bool cooperative)
 {
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
 	ClusterLockAcquireRequest *req = &slot->owner.request;
+	bool resume = cooperative && cluster_cf_acquire_pending(mode);
 
 	/*
 	 * RF-ROOT P6 (shutdown-handoff wiring, "stop new local CF requests"):
@@ -159,7 +161,7 @@ cluster_cf_lock(LOCKMODE mode)
 	 * (native) hold drains to NOT_HELD with the slot cleared, which is
 	 * equally safe to proceed from.
 	 */
-	if (slot->held) {
+	if (slot->held && !resume) {
 		ClusterCfReleaseResult drain = cluster_cf_unlock_confirmed(mode);
 
 		if (drain == CLUSTER_CF_RELEASE_UNCONFIRMED) {
@@ -169,6 +171,8 @@ cluster_cf_lock(LOCKMODE mode)
 			return false;
 		}
 	}
+	if (resume)
+		goto acquire;
 	Assert(!slot->held);
 
 	memset(req, 0, sizeof(*req));
@@ -188,9 +192,11 @@ cluster_cf_lock(LOCKMODE mode)
 	/* Visible cleanup responsibility precedes every possible S3/S4 mutation;
 	 * usable authority still requires the owned S5 completion. */
 	slot->held = slot->coordinated = slot->release_pending = true;
+acquire:
 	PG_TRY();
 	{
-		r = cluster_lock_owner_acquire(&slot->owner);
+		r = cooperative ? cluster_lock_owner_acquire_poll(&slot->owner)
+						: cluster_lock_owner_acquire(&slot->owner);
 	}
 	PG_CATCH();
 	{
@@ -227,6 +233,13 @@ cluster_cf_lock(LOCKMODE mode)
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
+	case CLUSTER_LOCK_ACQUIRE_PENDING:
+		if (cooperative) {
+			if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
+				memset(slot, 0, sizeof(*slot));
+			return false; /* Stable pending request, no new ID and no error. */
+		}
+		/* fall through */
 	default:
 
 		/*
@@ -240,6 +253,57 @@ cluster_cf_lock(LOCKMODE mode)
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
 		ereport(LOG, (errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r)));
 		return false;
+	}
+}
+
+bool
+cluster_cf_lock(LOCKMODE mode)
+{
+	return cf_lock(mode, false);
+}
+
+bool
+cluster_cf_lock_poll(LOCKMODE mode)
+{
+	if (!cluster_shared_config || (MyBackendType != B_LMON && MyBackendType != B_LMS))
+		return false;
+	return cf_lock(mode, true);
+}
+
+bool
+cluster_cf_acquire_pending(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return slot->held && slot->owner.cooperative_acquire
+		   && slot->owner.state == CLUSTER_LOCK_OWNER_ACQUIRING;
+}
+
+uint64
+cluster_cf_owner_cookie(LOCKMODE mode)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return slot->held && slot->coordinated && slot->owner.shared
+			   ? slot->owner.request.control_owner_id
+			   : 0;
+}
+
+bool
+cluster_cf_release_completed(LOCKMODE mode, uint64 cookie)
+{
+	Assert(mode == ShareLock || mode == ExclusiveLock);
+	return cookie != 0 && cookie == (mode == ShareLock ? cf_retired_s : cf_retired_x);
+}
+
+static void
+cf_note_retired(LOCKMODE mode, uint64 cookie)
+{
+	if (cookie != 0) {
+		if (mode == ShareLock)
+			cf_retired_s = cookie;
+		else
+			cf_retired_x = cookie;
 	}
 }
 
@@ -274,6 +338,7 @@ ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode)
 {
 	CfHoldState *slot = cf_slot(mode);
+	uint64 cookie = cluster_cf_owner_cookie(mode);
 
 	if (!slot->held)
 		return CLUSTER_CF_RELEASE_NOT_HELD;
@@ -289,8 +354,34 @@ cluster_cf_unlock_confirmed(LOCKMODE mode)
 	if (!cluster_lock_owner_release(&slot->owner))
 		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 
+	cf_note_retired(mode, cookie);
 	memset(slot, 0, sizeof(*slot));
 	return CLUSTER_CF_RELEASE_CONFIRMED;
+}
+
+/* PGRAC: complete only an explicitly abandoned/releasing private slot.
+ * Service loops never wait for their own CONTROL work; a still-usable hold
+ * or an in-flight acquisition must remain with its caller.
+ * Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_cf_retirement_poll(void)
+{
+	CfHoldState *slots[2] = { &cf_hold_s, &cf_hold_x };
+	unsigned i;
+
+	if (!cluster_shared_config)
+		return;
+	for (i = 0; i < lengthof(slots); ++i) {
+		CfHoldState *slot = slots[i];
+		uint64 cookie = slot->owner.request.control_owner_id;
+
+		if (slot->held && slot->coordinated && slot->release_pending
+			&& slot->owner.state == CLUSTER_LOCK_OWNER_RETIRING
+			&& cluster_lock_owner_release_poll(&slot->owner)) {
+			cf_note_retired(i == 0 ? ShareLock : ExclusiveLock, cookie);
+			memset(slot, 0, sizeof(*slot));
+		}
+	}
 }
 
 /*

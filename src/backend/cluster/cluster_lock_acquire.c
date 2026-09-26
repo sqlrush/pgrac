@@ -171,7 +171,8 @@ cluster_lock_acquire_s1_entry(const ClusterLockAcquireRequest *req)
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
-
+	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 
 	/* RF-ROOT P6 Scheme A: a formed boot is always fail-closed unless it
 	 * holds one of the two explicit readiness proofs.  Recovery readiness
@@ -302,9 +303,13 @@ cluster_lock_acquire_s3_partition_reservation(const ClusterLockAcquireRequest *r
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 
 	mut = (ClusterLockAcquireRequest *)req;
 	fill_request_holder(mut);
+	if (!cluster_lock_owner_request_prepare(mut))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
 	er = cluster_grd_try_reserve(&req->resid, &req->holder, (int)req->lockmode, self_node,
 								 cluster_local_fast_path_enabled ? &fast_path : NULL,
@@ -647,6 +652,8 @@ cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 
 	if (req == NULL)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (!cluster_grd_control_acquire_allowed(&req->resid, req->lockmode))
+		return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
 	mut->registration_failure_reason = NULL;
 
 	/* Retained HW/relation/CF GRANT owns its exact registration, not the S3
@@ -960,8 +967,7 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 
 	/* S1 entry — HC1 fail-closed。*/
 	r = cluster_lock_acquire_s1_entry(req);
-	if (r == CLUSTER_LOCK_ACQUIRE_OK_NATIVE || r == CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE
-		|| r == CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL)
+	if (r != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 		return r;
 
 	/* S2 identity。*/
@@ -998,7 +1004,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 		bool ir_bootstrap_bypass
 			= (req->recovery_bootstrap && req->resid.type == CLUSTER_IR_RESID_TYPE);
 
-		if (!ir_bootstrap_bypass && cluster_grd_shard_phase(gate_shard) != GRD_SHARD_NORMAL) {
+		if (!ir_bootstrap_bypass && cluster_grd_shard_phase(gate_shard) != GRD_SHARD_NORMAL
+			&& !cluster_grd_control_recovery_ready(&req->resid, req->lockmode)) {
 			TimestampTz gate_deadline;
 
 			if (req->dontwait)
@@ -1007,7 +1014,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 			gate_deadline
 				= TimestampTzPlusMilliseconds(GetCurrentTimestamp(), cluster_grd_remaster_wait_ms);
 			for (;;) {
-				if (cluster_grd_shard_phase(gate_shard) == GRD_SHARD_NORMAL)
+				if (cluster_grd_shard_phase(gate_shard) == GRD_SHARD_NORMAL
+					|| cluster_grd_control_recovery_ready(&req->resid, req->lockmode))
 					break;
 				if (GetCurrentTimestamp() >= gate_deadline)
 					return CLUSTER_LOCK_ACQUIRE_FAIL_SHARD_REMASTERING;
@@ -1031,6 +1039,8 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 		ClusterLockAcquireRequest *mut = (ClusterLockAcquireRequest *)req;
 
 		fill_request_holder(mut);
+		if (!cluster_lock_owner_request_prepare(mut))
+			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 		return CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK;
 	}
 

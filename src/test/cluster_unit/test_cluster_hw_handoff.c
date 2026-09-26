@@ -14,6 +14,10 @@
  *    src/test/cluster_unit/test_cluster_hw_handoff.c
  *-------------------------------------------------------------------------
  */
+/* This composition links the real control registry on every platform. */
+#ifndef PGRAC_REAL_CONTROL_CENSUS
+#define PGRAC_REAL_CONTROL_CENSUS
+#endif
 #define main retained_grd_main
 #define ShmemInitStruct retained_grd_shmem
 #define ShmemInitHash retained_grd_hash
@@ -55,6 +59,49 @@
 #include "cluster/cluster_advisory.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "storage/proc.h"
+#include "storage/ipc.h"
+#include "storage/latch.h"
+
+#ifndef PGRAC_HW_HANDOFF_EMBEDDED
+/* The dedicated control service suites execute these boundaries. */
+BackendType MyBackendType = B_BACKEND;
+Latch *MyLatch;
+void
+ResetLatch(Latch *latch pg_attribute_unused())
+{}
+int
+WaitLatch(Latch *latch pg_attribute_unused(), int events pg_attribute_unused(),
+		  long timeout pg_attribute_unused(), uint32 event pg_attribute_unused())
+{
+	abort();
+}
+void
+before_shmem_exit(pg_on_exit_callback callback pg_attribute_unused(),
+				  Datum arg pg_attribute_unused())
+{
+	abort();
+}
+bool
+cluster_recovery_transport_components_current(void)
+{
+	return false;
+}
+bool
+cluster_ges_dedup_retire_control_request(uint32 node pg_attribute_unused(),
+										 uint32 procno pg_attribute_unused(),
+										 uint64 epoch pg_attribute_unused(),
+										 uint64 request pg_attribute_unused())
+{
+	abort();
+}
+ClusterICSendResult
+cluster_ic_send_envelope(uint8 type pg_attribute_unused(), int32 dest pg_attribute_unused(),
+						 const void *payload pg_attribute_unused(),
+						 uint32 len pg_attribute_unused())
+{
+	abort();
+}
+#endif
 
 PROC_HDR *ProcGlobal;
 
@@ -189,6 +236,18 @@ typedef struct MasterPacket {
 void *
 ShmemInitStruct(const char *name, Size size, bool *found)
 {
+#ifdef PGRAC_REAL_CONTROL_CENSUS
+	if (strcmp(name, "pgrac control requests") == 0) {
+		static void *memory;
+
+		if (memory == NULL)
+			memory = calloc(1, size);
+		HW_CHECK(memory != NULL);
+		memset(memory, 0, size);
+		*found = false;
+		return memory;
+	}
+#endif
 	if (strcmp(name, "pgrac cluster ges") == 0
 		|| strcmp(name, "pgrac cluster ges reply wait") == 0) {
 		void *memory = strstr(name, "reply wait") ? reply_memory.bytes : ges_memory.bytes;
@@ -338,7 +397,7 @@ cluster_serving_ready_is_current(void)
 		pg_atomic_write_u32(&shared->master[cluster_grd_shard_for_resource(&resid)], 1);
 		release_route_changed = true;
 	}
-	return !cooperative_case;
+	return !cooperative_case || cf_case;
 }
 ClusterAuthorityReadiness
 cluster_authority_readiness_get(void)
@@ -369,6 +428,8 @@ cluster_recovery_authority_resid_mode_allowed(const ClusterResId *r, LOCKMODE m)
 bool
 cluster_recovery_authority_request_allowed(const ClusterResId *r, LOCKMODE m, bool startup)
 {
+	if (cooperative_case && cf_case)
+		return cluster_grd_control_recovery_ready(r, m);
 	(void)r;
 	(void)m;
 	(void)startup;
@@ -698,8 +759,16 @@ cluster_grd_outbound_enqueue_backend_request(uint32 destination, const void *pay
 		return true;
 	}
 	if (cooperative_case) {
+		if (cf_case
+			&& ((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_REDECLARE_DONE)
+			return retained_grd_enqueue(destination, payload, length);
+		if (cf_case && ((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_BAST) {
+			HW_CHECK(destination == 2);
+			return true; /* Conflict holder notification, not a grant. */
+		}
 		HW_CHECK(destination == 3);
-		HW_CHECK(((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_REDECLARE);
+		HW_CHECK(((const GesRequestPayload *)payload)->opcode
+				 == (cf_case ? GES_REQ_OPCODE_REQUEST : GES_REQ_OPCODE_REDECLARE));
 		if (request_sent > 0)
 			HW_CHECK(memcmp(&master_request, payload, length) == 0);
 		memcpy(&master_request, payload, length);
@@ -1207,6 +1276,53 @@ UT_TEST(release_sender_local_route_really_drains_holder)
 	UT_ASSERT_EQ(request_sent, 0);
 	cf_case = false;
 	MyProc = NULL;
+}
+
+/* The original diagnostic RED proved RELEASE alone is not whole-request
+ * termination. Exercise the new retirement primitive after the real ordinary
+ * sender; the old RELEASE contract itself remains holder-only.
+ * Real sender and GRD run locally; the stable CF owner/service composition
+ * is exercised separately, not replaced by this primitive test.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(control_retirement_clears_the_same_queued_request)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGrdHolderId blocker;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	ClusterGrdEntryResult remaining;
+	uint32 result;
+	int nconflicts = 0;
+
+	cf_case = true;
+	cf_mode = ShareLock;
+	fault = HW_NORMAL;
+	setup_case(&req, false);
+	HW_CHECK(cluster_grd_cancel_reservation_by_id(&req.resid, &req.holder) == CLUSTER_GRD_ENTRY_OK);
+	cluster_node_id = 3;
+	req.holder.node_id = 3;
+	blocker = grd_lifecycle_holder(2, 23, 203);
+	blocker.cluster_epoch = 1;
+	HW_CHECK(cluster_grd_entry_rebind_or_insert_holder(&req.resid, &blocker, 2, ExclusiveLock)
+			 == CLUSTER_GRD_ENTRY_OK);
+	HW_CHECK(cluster_grd_entry_enqueue_or_grant(&req.resid, &req.holder, 3, req.request_id, 9,
+												GES_REQ_OPCODE_REQUEST, req.lockmode, conflicts,
+												&nconflicts)
+			 == CLUSTER_GRD_ENQUEUED_WAITER);
+
+	result = cluster_ges_send_release_and_wait(&req.resid, &req.holder, req.request_id,
+											   req.timeout_ms, 0);
+	UT_ASSERT_EQ(result, GES_REJECT_REASON_NONE);
+	UT_ASSERT(cluster_grd_retire_request_and_drain(&req.resid, &req.holder, 0, NoLock, NULL, 0)
+			  >= 0);
+	/* Exact dequeue both observes and safely tears down the test's remaining
+	 * waiter before the assertion; no queue state leaks into another test. */
+	remaining = cluster_grd_cancel_waiter_by_id(&req.resid, &req.holder);
+	HW_CHECK(cluster_ges_release_and_drain_local(&req.resid, &blocker) == GES_REJECT_REASON_NONE);
+	cf_case = false;
+	MyProc = NULL;
+	printf("# abandoned CF release reason=%u remaining_waiter=%d\n", result, remaining);
+	UT_ASSERT_EQ(remaining, CLUSTER_GRD_ENTRY_NOT_FOUND);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
 }
 
 /* Actual remote master removal/ACK and reply-table ownership. A successful
@@ -1972,12 +2088,13 @@ UT_TEST(queued_origin_generation_is_not_receiver_cut)
 	MyProc = NULL;
 }
 
+#ifndef PGRAC_HW_HANDOFF_EMBEDDED
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(42);
+	UT_PLAN(43);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -1990,6 +2107,7 @@ main(void)
 	UT_RUN(cf_local_grant_and_owned_backout);
 	UT_RUN(release_sender_unknown_master_cannot_confirm);
 	UT_RUN(release_sender_local_route_really_drains_holder);
+	UT_RUN(control_retirement_clears_the_same_queued_request);
 	UT_RUN(release_sender_confirms_exact_verdict_and_unwinds_waiter);
 	UT_RUN(release_sender_keeps_foreign_waiter_and_rejects_bad_identity);
 	UT_RUN(cf_request_refuses_invalid_or_owned_provenance);
@@ -2023,3 +2141,4 @@ main(void)
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
+#endif

@@ -28,6 +28,7 @@
 #include "cluster/cluster_lock_acquire.h"
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_shmem.h"
+#include "cluster/cluster_lock_owner.h"
 #include "miscadmin.h" /* IsUnderPostmaster */
 #include "storage/lock.h"
 #include "storage/shmem.h"
@@ -311,7 +312,9 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 	lock_request.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	lock_request.timeout_ms = Min(request->acquire_timeout_ms, ir_base_timeout_ms);
 	lock_request.wait_event = WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
-	lock_result = cluster_lock_acquire_seven_step(&lock_request);
+	lock_result = cluster_shared_config
+					  ? cluster_lock_owner_request_acquire(&lock_request, NULL, NULL)
+					  : cluster_lock_acquire_seven_step(&lock_request);
 
 	if (lock_result == CLUSTER_LOCK_ACQUIRE_NOT_AVAIL) {
 		IR_BUMP(busy_count);
@@ -322,7 +325,7 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 		IR_BUMP(retry_count);
 		return CLUSTER_RECOVERY_SERIAL_RETRY;
 	}
-	if (lock_result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
+	if (!cluster_shared_config && lock_result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK)
 		lock_result = cluster_lock_acquire_s5_promote(&lock_request);
 	if (lock_result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED
 		&& lock_result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED) {
@@ -378,6 +381,10 @@ recovery_serial_revalidate_purpose(ClusterRecoverySerialGuard *guard, bool input
 	}
 	if (guard == NULL || !guard->held)
 		return CLUSTER_RECOVERY_SERIAL_NOT_HELD;
+	if (cluster_shared_config && !cluster_lock_owner_request_usable(&guard->lock_request)) {
+		IR_BUMP(revalidate_reject_count);
+		return CLUSTER_RECOVERY_SERIAL_MEMBERSHIP_STALE;
+	}
 	if ((guard->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL) != input_only) {
 		IR_BUMP(revalidate_reject_count);
 		return CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE;
@@ -503,7 +510,8 @@ recovery_serial_release_with_timeout(ClusterRecoverySerialGuard *guard, int time
 
 	release_request = guard->lock_request;
 	release_request.timeout_ms = Min(timeout_ms, ir_base_timeout_ms);
-	result = cluster_lock_acquire_s6_release(&release_request);
+	result = cluster_shared_config ? cluster_lock_owner_request_release(&release_request)
+								   : cluster_lock_acquire_s6_release(&release_request);
 	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
 		guard->release_uncertain = true;
 		IR_BUMP(release_unconfirmed_count);
