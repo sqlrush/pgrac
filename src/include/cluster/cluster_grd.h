@@ -448,6 +448,10 @@ typedef struct ClusterGrdShared {
 /* spec-2.17 D28b — extern atomic generation alloc helper(InitProcess hook). */
 extern uint64 cluster_grd_alloc_generation(void);
 
+struct PGPROC;
+/* Reset per-owner GRD identity when a backend or auxiliary slot is assigned. */
+extern void cluster_grd_proc_initialize(struct PGPROC *proc);
+
 /* spec-2.17 D14-D18 — deadlock detector(skeleton phase;Step 5/8 真激活
  * vertex dict + Tarjan + victim selection). */
 extern void cluster_grd_deadlock_lmon_tick(void); /* periodic 500ms */

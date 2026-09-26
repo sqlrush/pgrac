@@ -67,6 +67,7 @@
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "storage/proc.h" /* PGRAC: real layout for the complete owner census. */
 #include "storage/s_lock.h"
 #include "utils/hsearch.h"
 
@@ -590,6 +591,13 @@ SendProcSignal(int pid pg_attribute_unused(), int reason pg_attribute_unused(),
 	return 0;
 }
 
+/* Kernel wake is the substituted boundary; the recovery FSM stays real. */
+void
+SetLatch(Latch *latch)
+{
+	latch->is_set = true;
+}
+
 /* spec-4.6a r2-P1-1: controllable clock (default 0 = pre-existing value). */
 static int64 ut_mock_now = 0;
 static bool ut_drive_authority_lmon_tick = false;
@@ -1046,12 +1054,9 @@ ut_wfg_waiter_wait_seq(int32 node, uint32 procno, uint64 epoch, uint64 rid)
 /* PG runtime stubs needed by D8 cluster_grd_sweep_local_stale_procnos. */
 LWLockPadded *MainLWLockArray = NULL;
 int MaxBackends = 100;
-typedef struct PROC_HDR_STUB {
-	void *allProcs;
-	int allProcCount;
-} PROC_HDR_STUB;
-static PROC_HDR_STUB stub_proc_global = { NULL, 0 };
-void *ProcGlobal = &stub_proc_global;
+static PGPROC stub_proc_slots[1];
+static PROC_HDR stub_proc_global = { .allProcs = stub_proc_slots, .allProcCount = 1 };
+PROC_HDR *ProcGlobal = &stub_proc_global;
 void *
 palloc0(Size sz)
 {
@@ -5579,6 +5584,87 @@ UT_TEST(test_recovery_control_uses_accepted_epoch_after_observer_bump)
 	finish_recovery_control_fixture();
 }
 
+/* PGRAC: an auxiliary owner is outside BackendIdGetProc, but its retained
+ * grant must block local DONE just like a client grant. LMON is not exempt.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_recovery_barrier_waits_for_auxiliary_and_self_owners)
+{
+	PGPROC owners[2];
+	int variant;
+
+	for (variant = 0; variant < 2; variant++) {
+		uint64 generation;
+
+		memset(owners, 0, sizeof(owners));
+		owners[1].pid = variant == 0 ? 7002 : 7001;
+		owners[1].pgprocno = 1;
+		owners[1].backendId = InvalidBackendId;
+		pg_atomic_init_u32(&owners[1].cluster_grd_registered_count, 1);
+		pg_atomic_init_u64(&owners[1].cluster_grd_redeclare_acked, 0);
+		pg_atomic_init_u64(&owners[1].cluster_grd_redeclare_acked_epoch, 0);
+		stub_proc_global.allProcs = owners;
+		stub_proc_global.allProcCount = lengthof(owners);
+		MyProcPid = 7001;
+		setup_recovery_control_fixture(false);
+		generation = cluster_grd_redeclare_generation();
+		UT_ASSERT(owners[1].procLatch.is_set);
+		cluster_grd_recovery_lmon_tick();
+		UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_BARRIER);
+		pg_atomic_write_u64(&owners[1].cluster_grd_redeclare_acked, generation);
+		pg_atomic_write_u64(&owners[1].cluster_grd_redeclare_acked_epoch, 8);
+		cluster_grd_recovery_lmon_tick();
+		UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_BARRIER);
+		pg_atomic_write_u64(&owners[1].cluster_grd_redeclare_acked_epoch, 9);
+		cluster_grd_recovery_lmon_tick();
+		UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+		finish_recovery_control_fixture();
+	}
+	stub_proc_global.allProcs = stub_proc_slots;
+	stub_proc_global.allProcCount = lengthof(stub_proc_slots);
+	MyProcPid = 0;
+}
+
+UT_TEST(test_recovery_barrier_does_not_treat_missing_census_as_empty)
+{
+	setup_recovery_control_fixture(false);
+	ProcGlobal = NULL;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_BARRIER);
+	ProcGlobal = &stub_proc_global;
+	cluster_grd_recovery_lmon_tick();
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	finish_recovery_control_fixture();
+}
+
+/* Reused auxiliary slots must not inherit a predecessor's registration or
+ * ACK. This calls the same initializer as both native process entry points. */
+UT_TEST(test_recovery_owner_slot_reuse_resets_registration)
+{
+	PGPROC owner;
+	uint64 first_generation;
+
+	setup_recovery_control_fixture(false);
+	memset(&owner, 0, sizeof(owner));
+	owner.pid = 7003;
+	owner.cluster_grd_generation = UINT64_MAX;
+	owner.cluster_grd_bast_pending = true;
+	pg_atomic_init_u32(&owner.cluster_grd_registered_count, 7);
+	pg_atomic_init_u64(&owner.cluster_grd_redeclare_acked, UINT64_MAX);
+	pg_atomic_init_u64(&owner.cluster_grd_redeclare_acked_epoch, 8);
+	cluster_grd_proc_initialize(&owner);
+	UT_ASSERT_EQ(owner.pid, 7003);
+	UT_ASSERT(owner.cluster_grd_generation != 0 && owner.cluster_grd_generation != UINT64_MAX);
+	UT_ASSERT(!owner.cluster_grd_bast_pending);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&owner.cluster_grd_registered_count), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&owner.cluster_grd_redeclare_acked),
+				 cluster_grd_redeclare_generation());
+	UT_ASSERT_EQ(pg_atomic_read_u64(&owner.cluster_grd_redeclare_acked_epoch), 9);
+	first_generation = owner.cluster_grd_generation;
+	cluster_grd_proc_initialize(&owner);
+	UT_ASSERT(owner.cluster_grd_generation > first_generation);
+	finish_recovery_control_fixture();
+}
+
 UT_TEST(test_recovery_control_requires_survivors_quorum_and_usable_map)
 {
 	ClusterGrdRecoveryControlSnapshotV1 snapshot;
@@ -6104,7 +6190,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(123);
+	UT_PLAN(126);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6240,6 +6326,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
 	UT_RUN(test_recovery_control_observes_protocol_cut_without_data_thaw);
 	UT_RUN(test_recovery_control_uses_accepted_epoch_after_observer_bump);
+	UT_RUN(test_recovery_barrier_waits_for_auxiliary_and_self_owners);
+	UT_RUN(test_recovery_barrier_does_not_treat_missing_census_as_empty);
+	UT_RUN(test_recovery_owner_slot_reuse_resets_registration);
 	UT_RUN(test_recovery_control_refuses_other_failure_or_live_origin);
 	UT_RUN(test_recovery_control_requires_survivors_quorum_and_usable_map);
 	UT_RUN(test_recovery_control_rechecks_event_and_route_after_scan);

@@ -68,6 +68,7 @@
 #include "cluster/cluster_thread_recovery.h" /* spec-4.11 D3 (L238) — gate_unfreeze proto */
 #include "port/atomics.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
 #include "storage/s_lock.h"
 #include "utils/hsearch.h"
 
@@ -863,12 +864,14 @@ ut_wfg_waiter_wait_seq(int32 node, uint32 procno, uint64 epoch, uint64 rid)
 /* PG runtime stubs needed by D8 cluster_grd_sweep_local_stale_procnos. */
 LWLockPadded *MainLWLockArray = NULL;
 int MaxBackends = 100;
-typedef struct PROC_HDR_STUB {
-	void *allProcs;
-	int allProcCount;
-} PROC_HDR_STUB;
-static PROC_HDR_STUB stub_proc_global = { NULL, 0 };
-void *ProcGlobal = &stub_proc_global;
+static PGPROC stub_proc_slots[1];
+static PROC_HDR stub_proc_global = { .allProcs = stub_proc_slots, .allProcCount = 1 };
+PROC_HDR *ProcGlobal = &stub_proc_global;
+void
+SetLatch(Latch *latch)
+{
+	latch->is_set = true;
+}
 void *
 palloc0(Size sz)
 {

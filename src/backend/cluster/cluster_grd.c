@@ -2684,33 +2684,36 @@ cluster_grd_cleanup_stale_epoch_postbarrier(uint64 current_epoch)
 }
 
 /*
- * Broadcast PROCSIG_CLUSTER_GRD_REDECLARE to every live backend.
- * Pattern mirrors cluster_reconfig_broadcast_local_procsig.
+ * Wake every registered owner, including auxiliary processes and LMON.
+ * Auxiliary processes do not necessarily consume ProcSignal, so wake their
+ * service loop without sending a signal to an unregistered/custom handler.
+ * Their owner-side poll must reconstruct or release private control grants.
  */
 static int
 grd_recovery_broadcast_redeclare(void)
 {
-	int beid;
+	uint32 procno;
 	int signaled = 0;
-	pid_t self_pid = MyProcPid;
 
-	for (beid = 1; beid <= MaxBackends; beid++) {
-		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL)
+		return 0;
+	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
+		PGPROC *proc = &ProcGlobal->allProcs[procno];
 		pid_t pid;
 
-		if (proc == NULL)
-			continue;
 		pid = proc->pid;
-		if (pid == 0 || pid == self_pid)
+		if (pid == 0 || pg_atomic_read_u32(&proc->cluster_grd_registered_count) == 0)
 			continue;
-		(void)SendProcSignal(pid, PROCSIG_CLUSTER_GRD_REDECLARE, (BackendId)beid);
+		SetLatch(&proc->procLatch);
+		if (pid != MyProcPid && proc->backendId != InvalidBackendId)
+			(void)SendProcSignal(pid, PROCSIG_CLUSTER_GRD_REDECLARE, proc->backendId);
 		signaled++;
 	}
 	return signaled;
 }
 
 /*
- * Barrier check:  every live backend has acked the redeclare
+ * Barrier check: every live registered owner has acked the redeclare
  * generation.  Backends born after the broadcast were seeded with the
  * current generation at InitProcess (they hold no stale-epoch grants);
  * backends that exited simply drop out of the scan (their leaked
@@ -2719,15 +2722,14 @@ grd_recovery_broadcast_redeclare(void)
 static bool
 grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 {
-	int beid;
-	pid_t self_pid = MyProcPid;
+	uint32 procno;
 
-	for (beid = 1; beid <= MaxBackends; beid++) {
-		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcGlobal->allProcCount == 0)
+		return false;
+	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
+		PGPROC *proc = &ProcGlobal->allProcs[procno];
 
-		if (proc == NULL)
-			continue;
-		if (proc->pid == 0 || proc->pid == self_pid)
+		if (proc->pid == 0)
 			continue;
 
 		/*
@@ -2755,19 +2757,22 @@ grd_recovery_barrier_complete(uint64 gen, uint64 episode_epoch)
 static void
 grd_recovery_format_waiting_backend(uint64 gen, uint64 episode_epoch, char *buf, Size buflen)
 {
-	int beid;
-	pid_t self_pid = MyProcPid;
+	uint32 procno;
 
 	if (buflen == 0)
 		return;
 	buf[0] = '\0';
-	for (beid = 1; beid <= MaxBackends; beid++) {
-		PGPROC *proc = BackendIdGetProc((BackendId)beid);
+	if (ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcGlobal->allProcCount == 0) {
+		snprintf(buf, buflen, "proc_census_unavailable");
+		return;
+	}
+	for (procno = 0; procno < ProcGlobal->allProcCount; procno++) {
+		PGPROC *proc = &ProcGlobal->allProcs[procno];
 		uint32 registered;
 		uint64 acked;
 		uint64 acked_epoch;
 
-		if (proc == NULL || proc->pid == 0 || proc->pid == self_pid)
+		if (proc->pid == 0)
 			continue;
 		registered = pg_atomic_read_u32(&proc->cluster_grd_registered_count);
 		if (registered == 0)
@@ -2776,9 +2781,10 @@ grd_recovery_format_waiting_backend(uint64 gen, uint64 episode_epoch, char *buf,
 		acked_epoch = pg_atomic_read_u64(&proc->cluster_grd_redeclare_acked_epoch);
 		if (acked < gen || acked_epoch != episode_epoch) {
 			snprintf(buf, buflen,
-					 "beid=%d pid=%d registered=%u acked=" UINT64_FORMAT "/" UINT64_FORMAT
+					 "procno=%u beid=%d pid=%d registered=%u acked=" UINT64_FORMAT "/" UINT64_FORMAT
 					 " target=" UINT64_FORMAT "/" UINT64_FORMAT,
-					 beid, (int)proc->pid, registered, acked, acked_epoch, gen, episode_epoch);
+					 procno, (int)proc->backendId, (int)proc->pid, registered, acked, acked_epoch,
+					 gen, episode_epoch);
 			return;
 		}
 	}
@@ -7581,6 +7587,19 @@ cluster_grd_alloc_generation(void)
 	if (cluster_grd_state == NULL)
 		return 0;
 	return pg_atomic_fetch_add_u64(&cluster_grd_state->next_generation, 1);
+}
+
+void
+cluster_grd_proc_initialize(PGPROC *proc)
+{
+	if (proc == NULL)
+		return;
+	proc->cluster_grd_generation = cluster_grd_alloc_generation();
+	proc->cluster_grd_bast_pending = false;
+	pg_atomic_write_u64(&proc->cluster_grd_redeclare_acked, cluster_grd_redeclare_generation());
+	pg_atomic_write_u64(&proc->cluster_grd_redeclare_acked_epoch,
+						cluster_grd_redeclare_episode_epoch());
+	pg_atomic_write_u32(&proc->cluster_grd_registered_count, 0);
 }
 
 
