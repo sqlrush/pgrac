@@ -694,6 +694,7 @@ cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(), con
 		return false;
 	if (stub_backend_request_ready_after > 0
 		&& stub_backend_request_enqueue_count >= stub_backend_request_ready_after) {
+		stub_reply_wait_entry.reply_opcode = GES_REPLY_OPCODE_GRANT;
 		stub_reply_wait_entry.reject_reason = GES_REJECT_REASON_NONE;
 		stub_reply_wait_entry.ready = true;
 	}

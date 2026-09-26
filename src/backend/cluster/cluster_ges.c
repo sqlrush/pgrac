@@ -3265,10 +3265,30 @@ cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt, const ClusterRes
 	return result;
 }
 
-uint32
-cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
-								  const struct ClusterGrdHolderId *holder, uint64 request_id,
-								  int timeout_ms, uint32 wait_event)
+/* RELEASE cannot create a holder. Its reply entry may always be removed on
+ * ERROR; the caller retains the original holder until an exact ACK is proved.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct GesReleaseWaitOwner {
+	GesReplyWaitKey key;
+	bool registered;
+} GesReleaseWaitOwner;
+
+static void
+ges_release_wait_cleanup(volatile GesReleaseWaitOwner *owner)
+{
+	if (owner->registered) {
+		GesReplyWaitKey key = owner->key;
+
+		ConditionVariableCancelSleep();
+		cluster_ges_reply_wait_delete(&key);
+		owner->registered = false;
+	}
+}
+
+static uint32
+ges_release_send_owned(const struct ClusterResId *resid, const struct ClusterGrdHolderId *holder,
+					   uint64 request_id, int timeout_ms, uint32 wait_event,
+					   volatile GesReleaseWaitOwner *owner)
 {
 	int32 master;
 	GesReplyWaitKey key;
@@ -3280,6 +3300,10 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 
 	if (resid == NULL || holder == NULL)
 		return GES_REJECT_REASON_TIMEOUT;
+	epoch = cluster_epoch_get_current();
+	if (holder->node_id != cluster_node_id || request_id == 0 || request_id != holder->request_id
+		|| holder->cluster_epoch != epoch)
+		return GES_REJECT_REASON_EPOCH_MISMATCH;
 	if (!ges_readiness_allows_local_release_origin(resid))
 		return GES_REJECT_REASON_SHARD_FROZEN;
 
@@ -3304,11 +3328,10 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 	 * Local-master path:  release runs entirely in-process (Step 4 D6
 	 * release_and_pop_compatible_waiter真激活).  No CV round-trip needed.
 	 */
-	if (master < 0 || master == cluster_node_id) {
-		if (cluster_ges_state != NULL)
-			pg_atomic_fetch_add_u64(&cluster_ges_state->reply_defer_count, 1);
-		return 0;
-	}
+	if (master < 0)
+		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
+	if (master == cluster_node_id)
+		return cluster_ges_release_and_drain_local(resid, holder);
 
 	/*
 	 * Remote-master path:  send GES_RELEASE + bounded ACK wait.  Reply
@@ -3322,7 +3345,6 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 	 *	skeleton: just send the RELEASE and bump release_ack_count on
 	 *	GRANT reply.
 	 */
-	epoch = cluster_epoch_get_current();
 	/* spec-2.27 D3 — retransmit RELEASE.  Receiver replay safety comes from
 	 * exact-holder idempotence rather than a retained dedup receipt.  Sample
 	 * shard_master_generation once; perpetual timeout supported. */
@@ -3357,6 +3379,8 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 		entry = cluster_ges_reply_wait_insert(&key, deadline);
 		if (entry == NULL)
 			return GES_REJECT_REASON_TIMEOUT;
+		owner->key = key;
+		owner->registered = true;
 
 		memset(&req, 0, sizeof(req));
 		req.opcode = GES_REQ_OPCODE_RELEASE;
@@ -3372,7 +3396,6 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 		req.shard_master_generation_hi = (uint32)(master_gen >> 32);
 
 		if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
-			cluster_ges_reply_wait_delete(&key);
 			return GES_REJECT_REASON_WORK_QUEUE_FULL;
 		}
 
@@ -3384,13 +3407,16 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			int sleep_ms;
 			long remaining_ms;
 
+			if (cluster_epoch_get_current() != epoch || cluster_grd_lookup_master(resid) != master)
+				return GES_REJECT_REASON_EPOCH_MISMATCH;
+			if (!ges_readiness_allows_local_release_origin(resid))
+				return GES_REJECT_REASON_SHARD_FROZEN;
+
 			/* spec-5.9 D3 — cross-node deadlock victim chosen while blocked in
 			 * this CONVERT wait: honor only on a matching token (8.A P0#1), then
 			 * fail closed as a deadlock (40P01) rather than waiting out the
 			 * finite timeout. */
 			if (cluster_cancel_token_consume()) {
-				cluster_ges_reply_wait_delete(&key);
-				ConditionVariableCancelSleep();
 				return GES_REJECT_REASON_DEADLOCK_VICTIM;
 			}
 
@@ -3399,8 +3425,6 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			} else {
 				TimestampTz now = GetCurrentTimestamp();
 				if (now >= deadline) {
-					cluster_ges_reply_wait_delete(&key);
-					ConditionVariableCancelSleep();
 					return GES_REJECT_REASON_TIMEOUT;
 				}
 				remaining_ms = (long)((deadline - now) / 1000);
@@ -3420,8 +3444,6 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 				continue;
 			}
 			if (!perpetual && max_attempts > 0 && attempt > max_attempts) {
-				cluster_ges_reply_wait_delete(&key);
-				ConditionVariableCancelSleep();
 				return GES_REJECT_REASON_TIMEOUT;
 			}
 
@@ -3447,8 +3469,6 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 			}
 
 			if (!cluster_grd_outbound_enqueue_backend_request((uint32)master, &req, sizeof(req))) {
-				cluster_ges_reply_wait_delete(&key);
-				ConditionVariableCancelSleep();
 				return GES_REJECT_REASON_WORK_QUEUE_FULL;
 			}
 			if (cluster_ges_state != NULL)
@@ -3459,13 +3479,43 @@ cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
 		ConditionVariableCancelSleep();
 	}
 
+	/* Pair reply publication's write barrier before reading its full verdict. */
+	pg_read_barrier();
 	reject_reason = entry->reject_reason;
-	cluster_ges_reply_wait_delete(&key);
+	if (reject_reason == GES_REJECT_REASON_NONE && entry->reply_opcode != GES_REPLY_OPCODE_GRANT)
+		reject_reason = GES_REJECT_REASON_TIMEOUT;
+	ges_release_wait_cleanup(owner);
+	/* A remote ACK names the original master and epoch, not a new route.
+	 * Sender-local LMS restart counts do not invalidate that exact ACK. */
+	if (cluster_epoch_get_current() != epoch || cluster_grd_lookup_master(resid) != master)
+		return GES_REJECT_REASON_EPOCH_MISMATCH;
+	if (!ges_readiness_allows_local_release_origin(resid))
+		return GES_REJECT_REASON_SHARD_FROZEN;
 
 	if (reject_reason == 0)
 		cluster_ges_inc_release_ack();
 
 	return reject_reason;
+}
+
+uint32
+cluster_ges_send_release_and_wait(const struct ClusterResId *resid,
+								  const struct ClusterGrdHolderId *holder, uint64 request_id,
+								  int timeout_ms, uint32 wait_event)
+{
+	volatile GesReleaseWaitOwner owner = { 0 };
+	uint32 result;
+
+	PG_TRY();
+	{
+		result = ges_release_send_owned(resid, holder, request_id, timeout_ms, wait_event, &owner);
+	}
+	PG_FINALLY();
+	{
+		ges_release_wait_cleanup(&owner);
+	}
+	PG_END_TRY();
+	return result;
 }
 
 

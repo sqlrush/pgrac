@@ -742,6 +742,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 {
 	int32 master;
 	uint32 release_result;
+	uint64 epoch;
 
 	ensure_counter_initialized();
 
@@ -755,6 +756,7 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 	 * not confirmation, and the local path must return an actual exact-holder
 	 * removal verdict rather than assuming a void drain succeeded.
 	 */
+	epoch = cluster_epoch_get_current();
 	master = cluster_grd_lookup_master(&req->resid);
 	if (master < 0)
 		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
@@ -784,6 +786,13 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		if (release_result != GES_REJECT_REASON_NONE)
 			return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 	}
+
+	/* The lower release may reobserve routing after this S6 choice. A local
+	 * absence in a newly selected master is not the old remote holder's ACK.
+	 * Keep the caller's cleanup identity on every changed cut.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_epoch_get_current() != epoch || cluster_grd_lookup_master(&req->resid) != master)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 
 	pg_atomic_fetch_add_u64(&stub_s6_release_count, 1);
 	return CLUSTER_LOCK_ACQUIRE_OK_GRANTED;

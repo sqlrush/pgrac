@@ -95,6 +95,21 @@ static bool cf_case;
 static LOCKMODE cf_mode = ShareLock;
 static bool cooperative_case;
 static bool queued_cut_case;
+typedef enum ReleaseFault {
+	RELEASE_NORMAL,
+	RELEASE_REJECT_NONE,
+	RELEASE_POST_EPOCH,
+	RELEASE_POST_MASTER,
+	RELEASE_ORIGIN_RESTART,
+	RELEASE_ERROR_BEFORE_ACK,
+	RELEASE_ERROR_AFTER_ACK,
+	RELEASE_ENQUEUE_REFUSED,
+	RELEASE_DROP_ACK,
+	RELEASE_ENTRY_ROUTE
+} ReleaseFault;
+static bool release_case;
+static ReleaseFault release_fault;
+static bool release_route_changed;
 static int cooperative_sleeps;
 static int cooperative_drift;
 static bool guard_armed;
@@ -151,6 +166,7 @@ static int master_to_requester[2], requester_to_master[2];
 static pid_t master_child = -1;
 static GesRequestPayload master_request;
 static GesReplyPayload master_reply;
+static GesReplyPayload master_release_reply;
 static bool master_work_pending;
 static uint64 master_queued_generation;
 static int master_reply_count;
@@ -311,6 +327,17 @@ cluster_authority_readiness_managed(void)
 bool
 cluster_serving_ready_is_current(void)
 {
+	if (release_case && release_fault == RELEASE_ENTRY_ROUTE && !release_route_changed) {
+		ClusterResId resid;
+		ClusterGrdShared *shared;
+		bool found;
+
+		memcpy(&resid, master_request.resid, sizeof(resid));
+		shared = retained_grd_shmem("pgrac cluster grd", sizeof(*shared), &found);
+		HW_CHECK(found);
+		pg_atomic_write_u32(&shared->master[cluster_grd_shard_for_resource(&resid)], 1);
+		release_route_changed = true;
+	}
 	return !cooperative_case;
 }
 ClusterAuthorityReadiness
@@ -516,6 +543,8 @@ cluster_grd_outbound_enqueue_lmon_reply(uint32 destination, const void *payload,
 	HW_CHECK(destination == master_request.holder_node_id || destination == 2);
 	HW_CHECK(length == sizeof(master_reply));
 	memcpy(&master_reply, payload, length);
+	if (((const GesReplyPayload *)payload)->reply_for_opcode == GES_REQ_OPCODE_RELEASE)
+		memcpy(&master_release_reply, payload, length);
 	master_reply_count++;
 }
 
@@ -595,11 +624,17 @@ run_master(uint32 destination)
 	}
 	for (;;) {
 		transfer_exact(requester_to_master[0], &command, 1, false);
-		if (command == 'R') {
+		if (command == 'R' || command == 'A') {
 			transfer_exact(requester_to_master[0], &master_request, sizeof(master_request), false);
 			HW_CHECK(master_request.opcode == GES_REQ_OPCODE_RELEASE);
+			master_reply_count = 0;
 			stage_master_work();
 			HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
+			if (command == 'A') {
+				packet.reply = master_release_reply;
+				packet.replies = master_reply_count;
+				transfer_exact(master_to_requester[1], &packet, sizeof(packet), true);
+			}
 		} else if (command == 'Q') {
 			mode = NoLock;
 			packet.held_mode
@@ -623,6 +658,45 @@ cluster_grd_outbound_enqueue_backend_request(uint32 destination, const void *pay
 	GesReplyWaitEntry *entry;
 	GesReplyPayload wrong;
 	HW_CHECK(length == sizeof(master_request));
+	if (release_case) {
+		char command = 'A';
+		ClusterResId resid;
+		bool found;
+		ClusterGrdShared *shared;
+
+		HW_CHECK(master_child > 0 && destination == 3);
+		HW_CHECK(((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_RELEASE);
+		if (release_fault == RELEASE_ENQUEUE_REFUSED)
+			return false;
+		transfer_exact(requester_to_master[1], &command, 1, true);
+		transfer_exact(requester_to_master[1], (void *)payload, length, true);
+		transfer_exact(master_to_requester[0], &packet, sizeof(packet), false);
+		HW_CHECK(packet.replies > 0 && packet.reply.opcode == GES_REPLY_OPCODE_GRANT);
+		HW_CHECK(packet.reply.reply_for_opcode == GES_REQ_OPCODE_RELEASE);
+		if (release_fault == RELEASE_ERROR_BEFORE_ACK)
+			ereport(ERROR, (errmsg("release accepted before lost caller")));
+		if (release_fault == RELEASE_DROP_ACK)
+			return true;
+		memset(&env, 0, sizeof(env));
+		env.source_node_id = destination;
+		env.epoch = 1;
+		if (release_fault == RELEASE_REJECT_NONE)
+			packet.reply.opcode = GES_REPLY_OPCODE_REJECT;
+		cluster_ges_reply_handler(&env, &packet.reply);
+		if (release_fault == RELEASE_ERROR_AFTER_ACK)
+			ereport(ERROR, (errmsg("release reply before caller unwind")));
+		if (release_fault == RELEASE_POST_EPOCH)
+			ut_mock_epoch++;
+		if (release_fault == RELEASE_ORIGIN_RESTART)
+			mock_lms_shard_master_generation++;
+		if (release_fault == RELEASE_POST_MASTER) {
+			memcpy(&resid, ((const GesRequestPayload *)payload)->resid, sizeof(resid));
+			shared = retained_grd_shmem("pgrac cluster grd", sizeof(*shared), &found);
+			HW_CHECK(found);
+			pg_atomic_write_u32(&shared->master[cluster_grd_shard_for_resource(&resid)], 1);
+		}
+		return true;
+	}
 	if (cooperative_case) {
 		HW_CHECK(destination == 3);
 		HW_CHECK(((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_REDECLARE);
@@ -1067,6 +1141,185 @@ UT_TEST(cf_local_grant_and_owned_backout)
 		run_local_relation_case(true, false);
 	}
 	cf_case = false;
+}
+
+/* Break caught: the real RELEASE sender used to report success when a second
+ * routing lookup became unknown/local, without touching the actual holder.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(release_sender_unknown_master_cannot_confirm)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGrdShared *shared;
+	bool found;
+
+	cf_case = true;
+	cf_mode = ShareLock;
+	fault = HW_NORMAL;
+	setup_case(&req, false);
+	shared = retained_grd_shmem("pgrac cluster grd", sizeof(*shared), &found);
+	HW_CHECK(found);
+	pg_atomic_write_u32(&shared->master[cluster_grd_shard_for_resource(&req.resid)], UINT32_MAX);
+	UT_ASSERT_NE(cluster_ges_send_release_and_wait(&req.resid, &req.holder, req.request_id,
+												   req.timeout_ms, 0),
+				 GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(request_sent, 0);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	cf_case = false;
+	MyProc = NULL;
+}
+
+UT_TEST(release_sender_local_route_really_drains_holder)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGrdHolderId successor;
+	ClusterGrdConflictHolder conflicts[PGRAC_GRD_MAX_HOLDERS_PUBLIC];
+	LOCKMODE mode = NoLock;
+	int nconflicts = 0;
+
+	cf_case = true;
+	cf_mode = ShareLock;
+	fault = HW_NORMAL;
+	setup_case(&req, false);
+	UT_ASSERT_EQ(cluster_grd_cancel_reservation_by_id(&req.resid, &req.holder),
+				 CLUSTER_GRD_ENTRY_OK);
+	cluster_node_id = 3;
+	req.holder.node_id = 3;
+	UT_ASSERT_EQ(cluster_grd_entry_rebind_or_insert_holder(&req.resid, &req.holder, 3, ShareLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	successor = grd_lifecycle_holder(2, 23, 203);
+	successor.cluster_epoch = 1;
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&req.resid, &successor, 2, 203, 9,
+													GES_REQ_OPCODE_REQUEST, ExclusiveLock,
+													conflicts, &nconflicts),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	/* The transport fixture records the actual successor GRANT. */
+	memset(&master_request, 0, sizeof(master_request));
+	master_request.holder_node_id = 3;
+	UT_ASSERT_EQ(cluster_ges_send_release_and_wait(&req.resid, &req.holder, req.request_id,
+												   req.timeout_ms, 0),
+				 GES_REJECT_REASON_NONE);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&req.resid, &req.holder, &mode));
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&req.resid, &successor, &mode));
+	UT_ASSERT_EQ(mode, ExclusiveLock);
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&req.resid, &successor),
+				 GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	UT_ASSERT_EQ(request_sent, 0);
+	cf_case = false;
+	MyProc = NULL;
+}
+
+/* Actual remote master removal/ACK and reply-table ownership. A successful
+ * removal raced by a new cut is not confirmation for the old caller; retry
+ * can confirm absence only after restoring this fixture's exact original cut. */
+UT_TEST(release_sender_confirms_exact_verdict_and_unwinds_waiter)
+{
+	int mode_index;
+	int selected;
+
+	cf_case = true;
+	for (mode_index = 0; mode_index < 2; mode_index++) {
+		cf_mode = mode_index == 0 ? ShareLock : ExclusiveLock;
+		for (selected = RELEASE_NORMAL; selected <= RELEASE_ENTRY_ROUTE; selected++) {
+			ClusterLockAcquireRequest req;
+			MasterPacket post;
+			volatile uint32 result = GES_REJECT_REASON_TIMEOUT;
+			volatile bool caught = false;
+			bool error
+				= selected == RELEASE_ERROR_BEFORE_ACK || selected == RELEASE_ERROR_AFTER_ACK;
+			bool success = selected == RELEASE_NORMAL || selected == RELEASE_ORIGIN_RESTART;
+			int status;
+			char command = 'Q';
+
+			fault = HW_NORMAL;
+			setup_case(&req, false);
+			UT_ASSERT_EQ(cluster_lock_acquire_s4_remote_request_wait(&req),
+						 CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK);
+			UT_ASSERT_EQ(cluster_lock_acquire_s5_promote(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+			release_case = true;
+			release_fault = (ReleaseFault)selected;
+			release_route_changed = false;
+			printf("# release mode=%d fault=%d\n", cf_mode, selected);
+			PG_TRY();
+			{
+				result = cluster_lock_acquire_s6_release(&req);
+			}
+			PG_CATCH();
+			{
+				caught = true;
+				FlushErrorState();
+			}
+			PG_END_TRY();
+			UT_ASSERT_EQ(caught, error);
+			if (!caught)
+				UT_ASSERT_EQ(result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED, success);
+			UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+			ut_mock_epoch = 1;
+			mock_lms_shard_master_generation = 9;
+			fixture_cf_master(&req.resid);
+			release_fault = RELEASE_NORMAL;
+			UT_ASSERT_EQ(cluster_lock_acquire_s6_release(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+			UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+			transfer_exact(requester_to_master[1], &command, 1, true);
+			transfer_exact(master_to_requester[0], &post, sizeof(post), false);
+			close(requester_to_master[1]);
+			close(master_to_requester[0]);
+			HW_CHECK(waitpid(master_child, &status, 0) == master_child && WIFEXITED(status)
+					 && WEXITSTATUS(status) == 0);
+			master_child = -1;
+			UT_ASSERT_EQ(post.held_mode, NoLock);
+			UT_ASSERT_EQ(post.successor_mode, ExclusiveLock);
+			release_case = false;
+			MyProc = NULL;
+		}
+	}
+	cf_case = false;
+}
+
+UT_TEST(release_sender_keeps_foreign_waiter_and_rejects_bad_identity)
+{
+	ClusterLockAcquireRequest req;
+	GesReplyWaitKey key = { 0 };
+	GesReplyWaitEntry *entry;
+	int invalid;
+
+	cf_case = true;
+	cf_mode = ShareLock;
+	fault = HW_NORMAL;
+	for (invalid = 0; invalid < 4; invalid++) {
+		setup_case(&req, false);
+		if (invalid == 0)
+			req.request_id = 0;
+		else if (invalid == 1)
+			req.request_id++;
+		else if (invalid == 2)
+			req.holder.node_id++;
+		else
+			req.holder.cluster_epoch++;
+		UT_ASSERT_NE(cluster_ges_send_release_and_wait(&req.resid, &req.holder, req.request_id,
+													   req.timeout_ms, 0),
+					 GES_REJECT_REASON_NONE);
+		UT_ASSERT_EQ(request_sent, 0);
+		UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	}
+	setup_case(&req, false);
+	key.request_id = req.request_id;
+	key.source_node_id = 1;
+	key.dest_node_id = 3;
+	key.request_opcode = GES_REQ_OPCODE_RELEASE;
+	key.cluster_epoch = 1;
+	entry = cluster_ges_reply_wait_insert(&key, 0);
+	UT_ASSERT(entry != NULL);
+	UT_ASSERT_NE(cluster_ges_send_release_and_wait(&req.resid, &req.holder, req.request_id,
+												   req.timeout_ms, 0),
+				 GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(request_sent, 0);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 1);
+	UT_ASSERT(cluster_ges_reply_wait_lookup(&key) == entry && !entry->ready);
+	cluster_ges_reply_wait_delete(&key);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	cf_case = false;
+	MyProc = NULL;
 }
 
 /* No malformed singleton, mismatched caller, or already-owned carrier may
@@ -1724,7 +1977,7 @@ main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(38);
+	UT_PLAN(42);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -1735,6 +1988,10 @@ main(void)
 	UT_RUN(relation_local_nowait_keeps_conflict_semantics);
 	UT_RUN(cf_remote_grant_and_exact_cleanup);
 	UT_RUN(cf_local_grant_and_owned_backout);
+	UT_RUN(release_sender_unknown_master_cannot_confirm);
+	UT_RUN(release_sender_local_route_really_drains_holder);
+	UT_RUN(release_sender_confirms_exact_verdict_and_unwinds_waiter);
+	UT_RUN(release_sender_keeps_foreign_waiter_and_rejects_bad_identity);
 	UT_RUN(cf_request_refuses_invalid_or_owned_provenance);
 	UT_RUN(cf_reservation_without_observed_grant_is_not_authority);
 	UT_RUN(post_grant_failure_retains_release_owner);

@@ -607,9 +607,11 @@ StaticAssertDecl(sizeof(GesReplyPayload) == 52,
  *	  等 GES_REPLY(GRANT / REJECT)→ 返回 reject_reason(0=GRANT)。
  *	  timeout_ms 0 表示 dontwait(立即 ConditionalLock 语义)。
  *
- *	cluster_ges_send_release_and_wait():S6 normal release 调用,
- *	  send GES_RELEASE → bounded ACK wait(no retransmit;spec-2.23 BAST
- *	  配套补 retry/retransmit)。返回 0 = ACK OK,non-zero = timeout/error。
+ *	cluster_ges_send_release_and_wait(): S6 exact release. A local master
+ *	  executes the real release/drain; a remote master must return GRANT
+ *	  under the same epoch/route/readiness. Unknown routing cannot confirm.
+ *	  Existing retry/deadline policy is unchanged. ERROR drops only the
+ *	  reply waiter; the caller still owns the holder's cleanup obligation.
  *
  *	返回 0 即成功;非 0 = GesRejectReason 枚举(timeout / conflict /
  *	  deadlock_pending / cancel)。
