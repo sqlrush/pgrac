@@ -646,6 +646,15 @@ extern bool cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant
 												  const struct ClusterResId *resid,
 												  const struct ClusterGrdHolderId *holder,
 												  uint64 request_id, uint32 mode, bool dontwait);
+/* Canonical CF-S/X owns the same exact acquisition provenance through S5/S7. */
+extern uint32 cluster_ges_send_cf_request_and_wait(const struct ClusterResId *resid, uint32 mode,
+												   const struct ClusterGrdHolderId *holder,
+												   uint64 request_id, int timeout_ms,
+												   uint32 wait_event, ClusterGesHwGrant *grant);
+extern bool cluster_ges_cf_grant_is_current(const ClusterGesHwGrant *grant,
+											const struct ClusterResId *resid,
+											const struct ClusterGrdHolderId *holder,
+											uint64 request_id, uint32 mode);
 
 /*
  * spec-5.5 D5 — conditional (NOWAIT) acquire for try-locks.  Returns

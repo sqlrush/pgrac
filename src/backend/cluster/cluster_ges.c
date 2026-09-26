@@ -2228,12 +2228,30 @@ cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant, const Clus
 			   dontwait ? GES_REQ_OPCODE_REQUEST_NOWAIT : GES_REQ_OPCODE_REQUEST, true);
 }
 
+static bool
+ges_cf_request_is_canonical(const ClusterResId *resid, uint32 mode)
+{
+	return resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE && resid->field1 == 0
+		   && resid->field2 == 0 && resid->field3 == 0 && resid->field4 == 0
+		   && resid->lockmethodid == DEFAULT_LOCKMETHOD
+		   && (mode == ShareLock || mode == ExclusiveLock);
+}
+
+bool
+cluster_ges_cf_grant_is_current(const ClusterGesHwGrant *grant, const ClusterResId *resid,
+								const ClusterGrdHolderId *holder, uint64 request_id, uint32 mode)
+{
+	return ges_cf_request_is_canonical(resid, mode)
+		   && ges_request_grant_is_current(grant, resid, holder, request_id, mode,
+										   GES_REQ_OPCODE_REQUEST, true);
+}
+
 void
 cluster_ges_hw_grant_abandon(ClusterGesHwGrant *grant)
 {
 	if (grant == NULL || !grant->cleanup_pending || grant->consumed)
 		return;
-	/* A relation's local grant belongs to the authoritative GRD, not a
+	/* A retained local grant belongs to the authoritative GRD, not a
 	 * requester mirror.  Cancel its queue entry and stage the normal drain;
 	 * never raw-remove a holder and strand its successors. */
 	if (grant->master == (int32)grant->request.holder_node_id) {
@@ -2286,9 +2304,9 @@ cluster_ges_hw_grant_abandon(ClusterGesHwGrant *grant)
 }
 
 static void
-ges_arm_local_relation_grant(ClusterGesHwGrant *grant, const ClusterResId *resid,
-							 const ClusterGrdHolderId *holder, uint32 mode, uint32 opcode,
-							 uint64 master_generation)
+ges_arm_local_request_grant(ClusterGesHwGrant *grant, const ClusterResId *resid,
+							const ClusterGrdHolderId *holder, uint32 mode, uint32 opcode,
+							uint64 master_generation)
 {
 	GesRequestPayload *request = &grant->request;
 
@@ -2337,7 +2355,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	bool perpetual;
 	bool warned_starvation;
 	bool debug1_starvation_fired;
-	bool relation_grant = hw_grant != NULL && resid != NULL && resid->type == LOCKTAG_RELATION;
+	bool retained_local_grant
+		= hw_grant != NULL && resid != NULL
+		  && (resid->type == LOCKTAG_RELATION || ges_cf_request_is_canonical(resid, lockmode));
 	/* spec-5.6 Dc4b: caller-supplied wait-event label (0 = GES default). */
 	uint32 wait_ev = (wait_event != 0) ? wait_event : WAIT_EVENT_CLUSTER_GES_REPLY_WAIT;
 	ClusterXpScope xp_enqueue; /* PGRAC: spec-5.59 D2 profiling */
@@ -2361,7 +2381,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 	}
 
 	master = cluster_grd_lookup_master(resid);
-	if (relation_grant && master < 0) {
+	if (retained_local_grant && master < 0) {
 		cluster_xp_end(&xp_enqueue);
 		return GES_REJECT_REASON_EPOCH_MISMATCH;
 	}
@@ -2439,9 +2459,9 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				return GES_REJECT_REASON_WORK_QUEUE_FULL;
 			}
 		}
-		if (relation_grant) {
+		if (retained_local_grant) {
 			/* Same pre-existing PG-native barrier, now shared by every local
-			 * relation request instead of only the optimistic S3 shortcut. */
+			 * relation request; CF has no PG-native lock and needs no probe. */
 			if (cluster_lms_native_probe_required(resid, (LOCKMODE)lockmode)
 				&& !cluster_lms_native_probe_wait_clear(resid, (LOCKMODE)lockmode, holder, 0)) {
 				cluster_ges_timeout_detail_set(CLUSTER_GES_TSRC_NATIVE_PROBE_TIMEOUT,
@@ -2450,8 +2470,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 				cluster_xp_end(&xp_enqueue);
 				return GES_REJECT_REASON_TIMEOUT;
 			}
-			ges_arm_local_relation_grant(hw_grant, resid, holder, lockmode, send_opcode,
-										 master_gen);
+			ges_arm_local_request_grant(hw_grant, resid, holder, lockmode, send_opcode, master_gen);
 		}
 		/* spec-5.5 D5 — local-master try-lock: conditional grant, never enqueue. */
 		action
@@ -2466,7 +2485,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 						master_gen, send_opcode, (int)lockmode, conflict_holders, &n_conflict);
 
 		if (action == CLUSTER_GRD_GRANT_NOW) {
-			if (relation_grant)
+			if (retained_local_grant)
 				hw_grant->grant_observed = true;
 			if (cluster_ges_state != NULL)
 				pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
@@ -2479,13 +2498,13 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 		 * NOT_AVAIL (false).  Reached only when conditional == true.
 		 */
 		if (action == CLUSTER_GRD_CONFLICT_NOWAIT) {
-			if (relation_grant)
+			if (retained_local_grant)
 				hw_grant->cleanup_pending = false;
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
 			return GES_REJECT_REASON_LOCK_CONFLICT;
 		}
 		if (action != CLUSTER_GRD_ENQUEUED_WAITER) {
-			if (relation_grant)
+			if (retained_local_grant)
 				hw_grant->cleanup_pending = false;
 			/* WAIT_QUEUE_FULL / NOT_READY / ILLEGAL — fail closed, never grant. */
 			cluster_xp_end(&xp_enqueue); /* PGRAC: spec-5.59 D2 profiling */
@@ -2613,7 +2632,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 											   effective_timeout_ms);
 				return GES_REJECT_REASON_TIMEOUT; /* fail closed */
 			}
-			if (relation_grant) {
+			if (retained_local_grant) {
 				LOCKMODE granted_mode = NoLock;
 
 				if (!cluster_grd_holder_mode_by_id(resid, holder, &granted_mode)
@@ -2624,7 +2643,7 @@ ges_send_request_opcode_and_wait(const struct ClusterResId *resid, uint32 lockmo
 			return GES_REJECT_REASON_NONE; /* exact grant won the race */
 		}
 
-		if (relation_grant) {
+		if (retained_local_grant) {
 			GesReplyWaitVerdict verdict;
 			GesReplyWaitPollResult result = cluster_ges_reply_wait_poll_consume(&key, &verdict);
 
@@ -3009,6 +3028,21 @@ cluster_ges_send_relation_request_and_wait(const ClusterResId *resid, uint32 mod
 	return ges_send_request_opcode_and_wait(
 		resid, mode, NoLock, holder, request_id, 0, timeout_ms, wait_event,
 		dontwait ? GES_REQ_OPCODE_REQUEST_NOWAIT : GES_REQ_OPCODE_REQUEST, grant);
+}
+
+uint32
+cluster_ges_send_cf_request_and_wait(const ClusterResId *resid, uint32 mode,
+									 const ClusterGrdHolderId *holder, uint64 request_id,
+									 int timeout_ms, uint32 wait_event, ClusterGesHwGrant *grant)
+{
+	if (!ges_cf_request_is_canonical(resid, mode) || holder == NULL || grant == NULL
+		|| request_id == 0 || grant->cleanup_pending || grant->grant_observed
+		|| grant->local_promoted || grant->consumed || grant->key.request_id != 0
+		|| holder->node_id != cluster_node_id || holder->request_id != request_id
+		|| holder->cluster_epoch != cluster_epoch_get_current())
+		return GES_REJECT_REASON_EPOCH_MISMATCH;
+	return ges_send_request_opcode_and_wait(resid, mode, NoLock, holder, request_id, 0, timeout_ms,
+											wait_event, GES_REQ_OPCODE_REQUEST, grant);
 }
 
 /*

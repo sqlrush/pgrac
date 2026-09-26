@@ -661,12 +661,36 @@ cluster_ges_relation_grant_is_current(const ClusterGesHwGrant *grant pg_attribut
 	return false;
 }
 
+uint32
+cluster_ges_send_cf_request_and_wait(const ClusterResId *resid pg_attribute_unused(),
+									 uint32 mode pg_attribute_unused(),
+									 const ClusterGrdHolderId *holder pg_attribute_unused(),
+									 uint64 request_id pg_attribute_unused(),
+									 int timeout_ms pg_attribute_unused(),
+									 uint32 wait_event pg_attribute_unused(),
+									 ClusterGesHwGrant *grant pg_attribute_unused())
+{
+	/* Reject mapping only; the actual exchange is in test_cluster_hw_handoff. */
+	return stub_ges_reject_reason;
+}
+
+bool
+cluster_ges_cf_grant_is_current(const ClusterGesHwGrant *grant pg_attribute_unused(),
+								const ClusterResId *resid pg_attribute_unused(),
+								const ClusterGrdHolderId *holder pg_attribute_unused(),
+								uint64 request_id pg_attribute_unused(),
+								uint32 mode pg_attribute_unused())
+{
+	/* Census fixture controls the grant boundary, not its wire proof. */
+	return owner_promote_result == CLUSTER_GRD_ENTRY_OK;
+}
+
 ClusterGrdEntryResult
 cluster_grd_confirm_local_grant_exact(const ClusterResId *resid pg_attribute_unused(),
 									  const ClusterGrdHolderId *holder pg_attribute_unused(),
 									  LOCKMODE mode pg_attribute_unused())
 {
-	abort();
+	return owner_promote_result;
 }
 
 ClusterGrdEntryResult
@@ -1330,6 +1354,7 @@ UT_TEST(test_cf_s4_dead_master_native_is_nonaffirmative)
 
 	memset(&req, 0, sizeof(req));
 	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.op = CLUSTER_LOCK_OP_REQUEST;
 	req.lockmode = ExclusiveLock;
 	stub_ges_reject_reason = GES_REJECT_REASON_MASTER_DEAD_NATIVE;
 	result = cluster_lock_acquire_s4_remote_request_wait(&req);
@@ -1550,11 +1575,16 @@ UT_TEST(test_redeclare_walk_includes_actual_private_owner)
 	setup_redeclare_walk(&proc, 1, 1);
 	memset(&owner, 0, sizeof(owner));
 	owner.request.resid.type = CLUSTER_CF_RESID_TYPE;
+	owner.request.op = CLUSTER_LOCK_OP_REQUEST;
 	owner.request.lockmode = ShareLock;
 	owner.request.holder.node_id = cluster_node_id;
 	owner.request.holder.procno = proc.pgprocno;
 	owner.request.holder.cluster_epoch = 11;
 	owner.request.holder.request_id = owner.request.request_id = 92;
+	/* Controlled S4 proof boundary for the census-only test. Actual proof
+	 * production, validation and private installation run in handoff tests. */
+	owner.request.hw_grant.key.request_id = 92;
+	owner.request.hw_grant.master = cluster_node_id;
 	owner_promote_result = CLUSTER_GRD_ENTRY_OK;
 	UT_ASSERT(cluster_lock_owner_install(&owner));
 	UT_ASSERT_EQ(pg_atomic_read_u32(&proc.cluster_grd_registered_count), 2);
