@@ -15,27 +15,110 @@
 static ClusterLockOwner *private_owners;
 static bool private_walk_active;
 
+static void
+lock_owner_register(ClusterLockOwner *owner, ClusterLockOwnerState state)
+{
+	owner->state = state;
+	owner->generation = cluster_grd_redeclare_generation();
+	owner->next = private_owners;
+	private_owners = owner;
+	pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked, 0);
+	pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
+}
+
+static bool
+lock_owner_forget(ClusterLockOwner *owner)
+{
+	ClusterLockOwner **link = &private_owners;
+
+	while (*link != NULL && *link != owner)
+		link = &(*link)->next;
+	if (*link != owner)
+		return false;
+	*link = owner->next;
+	pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
+	memset(owner, 0, sizeof(*owner));
+	return true;
+}
+
+/* The real S1-S4 producer writes directly into process-owned storage. A
+ * failed/throwing request with an allocated identity retains cleanup, even
+ * when S5 was never reached. No temporary acquisition stack is enumerated. */
+ClusterLockAcquireResult
+cluster_lock_owner_acquire(ClusterLockOwner *owner)
+{
+	ClusterLockAcquireResult result;
+
+	if (owner == NULL || owner->state != CLUSTER_LOCK_OWNER_EMPTY)
+		return CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	if (MyProc == NULL) {
+		/* Before PGPROC initialization only an explicit S1 native decision
+		 * may proceed. Never send a request without a census owner. */
+		result = cluster_lock_acquire_s1_entry(&owner->request);
+		return result == CLUSTER_LOCK_ACQUIRE_OK_NATIVE ? result
+														: CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	}
+	lock_owner_register(owner, CLUSTER_LOCK_OWNER_ACQUIRING);
+	PG_TRY();
+	{
+		result = cluster_lock_acquire_seven_step(&owner->request);
+	}
+	PG_CATCH();
+	{
+		owner->state = CLUSTER_LOCK_OWNER_RETIRING;
+		if (owner->request.request_id == 0)
+			(void)lock_owner_forget(owner);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	owner->state = CLUSTER_LOCK_OWNER_RETIRING;
+	if (result == CLUSTER_LOCK_ACQUIRE_OK_NATIVE) {
+		(void)lock_owner_forget(owner);
+		return result;
+	}
+	if (owner->request.request_id == 0) {
+		(void)lock_owner_forget(owner);
+		return result == CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK
+					   || result == CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+					   || result == CLUSTER_LOCK_ACQUIRE_OK_CONVERTED
+				   ? CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL
+				   : result;
+	}
+	if (result != CLUSTER_LOCK_ACQUIRE_NEED_PG_NATIVE_LOCK
+		&& result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED && result != CLUSTER_LOCK_ACQUIRE_OK_CONVERTED)
+		return result;
+	owner->state = CLUSTER_LOCK_OWNER_ACQUIRING;
+	return cluster_lock_owner_install(owner) ? CLUSTER_LOCK_ACQUIRE_OK_GRANTED
+											 : CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+}
+
 /* The scope precedes S5 publication, including any CFI inside S5.  A longjmp
  * retains a retiring owner, rather than a pointer into the caller's stack. */
 bool
 cluster_lock_owner_install(ClusterLockOwner *owner)
 {
 	uint64 epoch = cluster_epoch_get_current();
-	uint64 generation = cluster_grd_redeclare_generation();
+	uint64 generation;
 	ClusterLockAcquireResult result;
 
-	if (owner == NULL || owner->state != CLUSTER_LOCK_OWNER_EMPTY || MyProc == NULL
+	if (owner == NULL || MyProc == NULL
+		|| (owner->state != CLUSTER_LOCK_OWNER_EMPTY
+			&& owner->state != CLUSTER_LOCK_OWNER_ACQUIRING))
+		return false;
+	if (owner->request.holder.cluster_epoch != epoch
 		|| owner->request.holder.node_id != cluster_node_id
 		|| owner->request.holder.procno != (uint32)MyProc->pgprocno
 		|| owner->request.request_id == 0
-		|| owner->request.holder.request_id != owner->request.request_id)
+		|| owner->request.holder.request_id != owner->request.request_id) {
+		if (owner->state == CLUSTER_LOCK_OWNER_ACQUIRING)
+			owner->state = CLUSTER_LOCK_OWNER_RETIRING;
 		return false;
-	owner->state = CLUSTER_LOCK_OWNER_INSTALLING;
-	owner->generation = generation;
-	owner->next = private_owners;
-	private_owners = owner;
-	pg_atomic_write_u64(&MyProc->cluster_grd_redeclare_acked, 0);
-	pg_atomic_fetch_add_u32(&MyProc->cluster_grd_registered_count, 1);
+	}
+	if (owner->state == CLUSTER_LOCK_OWNER_EMPTY)
+		lock_owner_register(owner, CLUSTER_LOCK_OWNER_INSTALLING);
+	else
+		owner->state = CLUSTER_LOCK_OWNER_INSTALLING;
+	generation = owner->generation;
 	PG_TRY();
 	{
 		result = cluster_lock_acquire_s5_promote(&owner->request);
@@ -132,10 +215,10 @@ lock_owner_redeclare(ClusterLockOwner *owner)
 bool
 cluster_lock_owner_release(ClusterLockOwner *owner)
 {
-	ClusterLockOwner **link = &private_owners;
 	ClusterLockAcquireResult result;
 
 	if (owner == NULL || owner->state == CLUSTER_LOCK_OWNER_EMPTY || MyProc == NULL
+		|| owner->state == CLUSTER_LOCK_OWNER_ACQUIRING
 		|| owner->state == CLUSTER_LOCK_OWNER_INSTALLING
 		|| owner->state == CLUSTER_LOCK_OWNER_RELEASING)
 		return false;
@@ -157,14 +240,7 @@ cluster_lock_owner_release(ClusterLockOwner *owner)
 	owner->state = CLUSTER_LOCK_OWNER_RETIRING;
 	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
 		return false;
-	while (*link != NULL && *link != owner)
-		link = &(*link)->next;
-	if (*link != owner)
-		return false;
-	*link = owner->next;
-	pg_atomic_fetch_sub_u32(&MyProc->cluster_grd_registered_count, 1);
-	memset(owner, 0, sizeof(*owner));
-	return true;
+	return lock_owner_forget(owner);
 }
 
 bool

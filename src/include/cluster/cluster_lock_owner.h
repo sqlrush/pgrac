@@ -12,6 +12,7 @@
 
 typedef enum ClusterLockOwnerState {
 	CLUSTER_LOCK_OWNER_EMPTY = 0,
+	CLUSTER_LOCK_OWNER_ACQUIRING,
 	CLUSTER_LOCK_OWNER_INSTALLING,
 	CLUSTER_LOCK_OWNER_HELD,
 	CLUSTER_LOCK_OWNER_RETIRING,
@@ -30,6 +31,7 @@ typedef struct ClusterLockOwner {
 } ClusterLockOwner;
 
 extern bool cluster_lock_owner_install(ClusterLockOwner *owner);
+extern ClusterLockAcquireResult cluster_lock_owner_acquire(ClusterLockOwner *owner);
 extern bool cluster_lock_owner_is_usable(const ClusterLockOwner *owner);
 extern bool cluster_lock_owner_release(ClusterLockOwner *owner);
 extern bool cluster_lock_owners_redeclare(uint64 *enumerated);

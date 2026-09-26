@@ -122,9 +122,9 @@ cluster_cf_resid_encode(ClusterResId *dst)
 bool
 cluster_cf_lock(LOCKMODE mode)
 {
-	ClusterLockAcquireRequest req;
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
+	ClusterLockAcquireRequest *req = &slot->owner.request;
 
 	/*
 	 * RF-ROOT P6 (shutdown-handoff wiring, "stop new local CF requests"):
@@ -171,21 +171,34 @@ cluster_cf_lock(LOCKMODE mode)
 	}
 	Assert(!slot->held);
 
-	memset(&req, 0, sizeof(req));
-	cluster_cf_resid_encode(&req.resid);
+	memset(req, 0, sizeof(*req));
+	cluster_cf_resid_encode(&req->resid);
 	/* locktag left zeroed: not LOCKTAG_ADVISORY, so normal blocking semantics. */
-	req.lockmode = mode;
-	req.op = CLUSTER_LOCK_OP_REQUEST; /* CF never converts (X/S independent) */
-	req.current_mode = NoLock;
-	req.lockmethod_id = DEFAULT_LOCKMETHOD;
-	req.dontwait = false; /* block until granted or timeout */
-	req.sessionLock = false;
-	req.caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
+	req->lockmode = mode;
+	req->op = CLUSTER_LOCK_OP_REQUEST; /* CF never converts (X/S independent) */
+	req->current_mode = NoLock;
+	req->lockmethod_id = DEFAULT_LOCKMETHOD;
+	req->dontwait = false; /* block until granted or timeout */
+	req->sessionLock = false;
+	req->caller_local_start_ts_ms = (uint64)(GetCurrentTimestamp() / 1000);
 	/* spec-5.6 Dc4b: bound the CF acquire wait and label it ClusterCfEnqueueWait. */
-	req.timeout_ms = cluster_cf_enqueue_timeout_ms;
-	req.wait_event = WAIT_EVENT_CLUSTER_CF_ENQUEUE;
+	req->timeout_ms = cluster_cf_enqueue_timeout_ms;
+	req->wait_event = WAIT_EVENT_CLUSTER_CF_ENQUEUE;
 
-	r = cluster_lock_acquire_seven_step(&req);
+	/* Visible cleanup responsibility precedes every possible S3/S4 mutation;
+	 * usable authority still requires the owned S5 completion. */
+	slot->held = slot->coordinated = slot->release_pending = true;
+	PG_TRY();
+	{
+		r = cluster_lock_owner_acquire(&slot->owner);
+	}
+	PG_CATCH();
+	{
+		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
+			memset(slot, 0, sizeof(*slot));
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 
 	switch (r) {
 	case CLUSTER_LOCK_ACQUIRE_OK_NATIVE:
@@ -198,7 +211,6 @@ cluster_cf_lock(LOCKMODE mode)
 		slot->held = true;
 		slot->coordinated = false;
 		slot->release_pending = false;
-		slot->owner.request = req;
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
@@ -206,18 +218,8 @@ cluster_cf_lock(LOCKMODE mode)
 	case CLUSTER_LOCK_ACQUIRE_OK_GRANTED:
 	case CLUSTER_LOCK_ACQUIRE_OK_CONVERTED:
 
-		/*
-			 * Granted at the cluster level.  CF has no PG-native heavyweight
-			 * lock to take, so run the S5 promote directly to turn the S3
-			 * reservation into a registered GRD holder (cross-node conflict
-			 * visibility).  S5 failure cancels the reservation (S7) and we
-			 * fail closed.
-			 */
-		slot->held = true;
-		slot->coordinated = true;
-		slot->release_pending = true;
-		slot->owner.request = req;
-		if (!cluster_lock_owner_install(&slot->owner)) {
+		/* CF has no PG-native lock. Its stable owner already ran S5. */
+		if (!cluster_lock_owner_is_usable(&slot->owner)) {
 			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
 			return false;
 		}
@@ -233,6 +235,8 @@ cluster_cf_lock(LOCKMODE mode)
 			 * could not be proven held: fail closed.  The caller raises the
 			 * appropriate FATAL/ERROR (CF correctness).
 			 */
+		if (slot->owner.state == CLUSTER_LOCK_OWNER_EMPTY)
+			memset(slot, 0, sizeof(*slot));
 		cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
 		ereport(LOG, (errmsg("cluster CF acquire failed (mode %d, result %d)", (int)mode, (int)r)));
 		return false;
