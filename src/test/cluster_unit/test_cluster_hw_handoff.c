@@ -49,6 +49,7 @@
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_touched_peers.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_wal_retention.h"
 #include "cluster/cluster_advisory.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "storage/proc.h"
@@ -89,6 +90,7 @@ static HandoffFault fault;
 static bool relation_case;
 static bool relation_nowait_case;
 static bool cooperative_case;
+static bool queued_cut_case;
 static int cooperative_sleeps;
 static int cooperative_drift;
 static bool guard_armed;
@@ -140,6 +142,7 @@ static pid_t master_child = -1;
 static GesRequestPayload master_request;
 static GesReplyPayload master_reply;
 static bool master_work_pending;
+static uint64 master_queued_generation;
 static int master_reply_count;
 static int local_native_probes;
 static GesRequestPayload local_cleanup_release;
@@ -347,6 +350,7 @@ cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key, const uint8 *reply
 	HW_CHECK(length == sizeof(GesReplyPayload));
 	HW_CHECK(
 		((const GesReplyPayload *)reply)->opcode == GES_REPLY_OPCODE_GRANT
+		|| (queued_cut_case && ((const GesReplyPayload *)reply)->opcode == GES_REPLY_OPCODE_REJECT)
 		|| (cooperative_case && key->opcode == GES_REQ_OPCODE_REQUEST
 			&& ((const GesReplyPayload *)reply)->opcode == GES_REPLY_OPCODE_REJECT
 			&& ((const GesReplyPayload *)reply)->reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL)
@@ -458,12 +462,20 @@ transfer_exact(int fd, void *bytes, size_t length, bool writing)
 	}
 }
 
+static void
+stage_master_work(void)
+{
+	master_queued_generation = cluster_lms_get_shard_master_generation();
+	master_work_pending = true;
+}
+
 bool
 cluster_grd_work_queue_dequeue(ClusterGrdWorkItem *out)
 {
 	if (!master_work_pending)
 		return false;
 	memset(out, 0, sizeof(*out));
+	out->routing_generation = master_queued_generation;
 	out->source_node_id = master_request.holder_node_id;
 	out->payload_len = sizeof(master_request);
 	memcpy(out->payload, &master_request, sizeof(master_request));
@@ -531,7 +543,7 @@ run_master(uint32 destination)
 	HW_CHECK(cluster_grd_lookup_master(&resid) == (int32)destination);
 	if (fault == HW_REJECT || fault == HW_NON_GRANT_NONE)
 		cluster_grd_shard_set_phase(cluster_grd_shard_for_resource(&resid), GRD_SHARD_FROZEN);
-	master_work_pending = true;
+	stage_master_work();
 	master_reply_count = 0;
 	HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
 	memset(&packet, 0, sizeof(packet));
@@ -558,7 +570,7 @@ run_master(uint32 destination)
 		if (command == 'R') {
 			transfer_exact(requester_to_master[0], &master_request, sizeof(master_request), false);
 			HW_CHECK(master_request.opcode == GES_REQ_OPCODE_RELEASE);
-			master_work_pending = true;
+			stage_master_work();
 			HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
 		} else if (command == 'Q') {
 			mode = NoLock;
@@ -940,7 +952,7 @@ run_local_relation_case(bool abandon, bool nowait_conflict)
 		UT_ASSERT_EQ(mode, ShareLock); /* Not raw-removed before its owned drain. */
 		UT_ASSERT_EQ(local_cleanup_release.holder_node_id, req.holder.node_id);
 		master_request = local_cleanup_release;
-		master_work_pending = true;
+		stage_master_work();
 		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
 		UT_ASSERT(!cluster_grd_holder_mode_by_id(&req.resid, &req.holder, &mode));
 		UT_ASSERT(cluster_grd_holder_mode_by_id(&req.resid, &successor, &mode));
@@ -1129,7 +1141,7 @@ UT_TEST(relation_native_error_has_full_interval_cleanup_owner)
 				 CLUSTER_GRD_ENQUEUED_WAITER);
 	if (cleanup_sent == 1) {
 		master_request = local_cleanup_release;
-		master_work_pending = true;
+		stage_master_work();
 		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
 		UT_ASSERT(!cluster_grd_holder_mode_by_id(&req.resid, &req.holder, &mode));
 		UT_ASSERT(cluster_grd_holder_mode_by_id(&req.resid, &successor, &mode));
@@ -1185,7 +1197,7 @@ run_redeclare_master(const ClusterLockAcquireRequest *req, int output)
 	cluster_grd_shard_set_phase(shard, GRD_SHARD_REBUILDING);
 	/* Same-wire replay must rebind idempotently, without opening the shard. */
 	for (int i = 0; i < 2; i++) {
-		master_work_pending = true;
+		stage_master_work();
 		HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
 		HW_CHECK(master_reply.opcode == GES_REPLY_OPCODE_GRANT);
 		HW_CHECK(master_reply.reply_for_opcode == GES_REQ_OPCODE_REDECLARE);
@@ -1199,13 +1211,13 @@ run_redeclare_master(const ClusterLockAcquireRequest *req, int output)
 		ClusterGrdRecoveryCounters before, after;
 
 		cluster_grd_recovery_counters_snapshot(&before);
+		stage_master_work();
 		if (cooperative_drift == 1)
-			master_request.holder_cluster_epoch_lo = 1;
+			ut_mock_epoch = 3;
 		else if (cooperative_drift == 2)
-			master_request.shard_master_generation_lo = 8;
+			mock_lms_shard_master_generation = 10;
 		else
 			cluster_node_id = 0; /* Queue handed to a process no longer master. */
-		master_work_pending = true;
 		HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
 		packet.reply = master_reply;
 		cluster_grd_recovery_counters_snapshot(&after);
@@ -1219,7 +1231,7 @@ run_redeclare_master(const ClusterLockAcquireRequest *req, int output)
 	master_request.holder_node_id = 2;
 	master_request.holder_procno = 23;
 	master_request.holder_request_id_lo = 203;
-	master_work_pending = true;
+	stage_master_work();
 	HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
 	HW_CHECK(master_reply.opcode == GES_REPLY_OPCODE_REJECT);
 	HW_CHECK(master_reply.reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL);
@@ -1372,12 +1384,126 @@ UT_TEST(cooperative_redeclare_stale_queue_cannot_rebind_current_holder)
 	}
 }
 
+/* A queue item was validated before its epoch/map changed. Exercise the
+ * actual mutation owner, not a mocked refusal. Each reset has an empty
+ * requester reservation and an independently chosen retained master hold. */
+static void
+queued_cut_prepare(uint32 opcode, bool conditional_convert, int drift,
+				   ClusterLockAcquireRequest *req, ClusterGrdHolderId *retained)
+{
+	fault = HW_NORMAL;
+	relation_case = relation_nowait_case = cooperative_case = false;
+	setup_case(req, false);
+	HW_CHECK(cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder)
+			 == CLUSTER_GRD_ENTRY_OK);
+	cluster_node_id = 3;
+	ut_mock_epoch = drift == 1 ? 1 : 2;
+	if (conditional_convert) {
+		req->resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+		while (cluster_grd_lookup_master(&req->resid) != 3)
+			req->resid.field1++;
+	}
+	memset(&master_request, 0, sizeof(master_request));
+	master_request.opcode = opcode;
+	master_request.lockmode = ExclusiveLock;
+	master_request.holder_node_id = 1;
+	master_request.holder_procno = 21;
+	master_request.holder_cluster_epoch_lo = drift == 1 ? 1 : 2;
+	master_request.holder_request_id_lo = 201;
+	master_request.shard_master_generation_lo = 47; /* Independent origin token. */
+	memcpy(master_request.resid, &req->resid, sizeof(req->resid));
+	*retained = grd_lifecycle_holder(1, 21, 201);
+	retained->cluster_epoch = master_request.holder_cluster_epoch_lo;
+	if (opcode == GES_REQ_OPCODE_CONVERT || conditional_convert) {
+		retained->request_id = 200;
+		master_request.current_mode = ShareLock;
+		master_request.wait_seq = 200;
+	} else if (opcode == GES_REQ_OPCODE_CONVERT_ROLLBACK) {
+		retained->request_id = 203;
+		master_request.current_mode = ShareLock;
+		master_request.wait_seq = 203;
+	}
+	if ((opcode != GES_REQ_OPCODE_REQUEST && opcode != GES_REQ_OPCODE_REQUEST_NOWAIT)
+		|| conditional_convert) {
+		LOCKMODE mode
+			= opcode == GES_REQ_OPCODE_CONVERT || conditional_convert ? ShareLock : ExclusiveLock;
+		HW_CHECK(cluster_grd_entry_rebind_or_insert_holder(&req->resid, retained, 1, mode)
+				 == CLUSTER_GRD_ENTRY_OK);
+	}
+	stage_master_work();
+	if (drift == 1)
+		ut_mock_epoch = 2;
+	else if (drift == 2)
+		mock_lms_shard_master_generation = 10;
+	else if (drift == 3)
+		cluster_node_id = 0;
+	master_reply_count = 0;
+	memset(&master_reply, 0, sizeof(master_reply));
+}
+
+UT_TEST(queued_mutations_revalidate_the_complete_cut_before_touching_grd)
+{
+	const uint32 opcodes[] = { GES_REQ_OPCODE_REQUEST,		 GES_REQ_OPCODE_REQUEST_NOWAIT,
+							   GES_REQ_OPCODE_CONVERT,		 GES_REQ_OPCODE_CONVERT_ROLLBACK,
+							   GES_REQ_OPCODE_RELEASE,		 GES_REQ_OPCODE_REDECLARE,
+							   GES_REQ_OPCODE_REQUEST_NOWAIT };
+
+	queued_cut_case = true;
+	for (int op = 0; op < lengthof(opcodes); op++) {
+		for (int drift = 1; drift <= 3; drift++) {
+			ClusterLockAcquireRequest req;
+			ClusterGrdHolderId retained;
+			LOCKMODE mode = NoLock;
+			bool has_hold;
+
+			queued_cut_prepare(opcodes[op], op == 6, drift, &req, &retained);
+			printf("# queued opcode=%u conditional_convert=%d drift=%d\n", opcodes[op], op == 6,
+				   drift);
+			UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+			UT_ASSERT_EQ(master_reply_count, 1);
+			UT_ASSERT_EQ(master_reply.opcode, GES_REPLY_OPCODE_REJECT);
+			UT_ASSERT_EQ(master_reply.reply_for_opcode, opcodes[op]);
+			UT_ASSERT_EQ(master_reply.reject_reason, drift == 3
+														 ? GES_REJECT_REASON_MASTER_DEAD_NATIVE
+														 : GES_REJECT_REASON_EPOCH_MISMATCH);
+			has_hold = cluster_grd_holder_mode_by_id(&req.resid, &retained, &mode);
+			UT_ASSERT_EQ(has_hold, op >= 2);
+			if (has_hold)
+				UT_ASSERT_EQ(mode, op == 2 || op == 6 ? ShareLock : ExclusiveLock);
+			if (op < 2)
+				UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+		}
+	}
+	queued_cut_case = false;
+	MyProc = NULL;
+}
+
+/* Sender LMS restart counts are not receiver routing cuts. A valid incoming
+ * request must not fail because two healthy instances have different counts.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(queued_origin_generation_is_not_receiver_cut)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGrdHolderId retained;
+	LOCKMODE mode = NoLock;
+
+	queued_cut_case = true;
+	queued_cut_prepare(GES_REQ_OPCODE_REQUEST, false, 0, &req, &retained);
+	master_request.shard_master_generation_lo = 47;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(master_reply.opcode, GES_REPLY_OPCODE_GRANT);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&req.resid, &retained, &mode));
+	UT_ASSERT_EQ(mode, ExclusiveLock);
+	queued_cut_case = false;
+	MyProc = NULL;
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(31);
+	UT_PLAN(33);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -1409,6 +1535,8 @@ main(void)
 	UT_RUN(cooperative_redeclare_late_cut_cannot_publish_ack);
 	UT_RUN(cooperative_redeclare_malformed_verdict_cannot_restart);
 	UT_RUN(cooperative_redeclare_stale_queue_cannot_rebind_current_holder);
+	UT_RUN(queued_mutations_revalidate_the_complete_cut_before_touching_grd);
+	UT_RUN(queued_origin_generation_is_not_receiver_cut);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

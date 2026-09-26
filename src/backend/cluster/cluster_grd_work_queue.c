@@ -28,6 +28,7 @@
 #include "cluster/cluster_ges.h" /* GesRequestPayload (spec-5.8 D8 coupling assert) */
 #include "cluster/cluster_grd_work_queue.h"
 #include "cluster/cluster_lmon.h" /* PGRAC: spec-7.2 D1 enqueue wakeup */
+#include "cluster/cluster_lms.h"
 #include "cluster/cluster_shmem.h"
 #include "miscadmin.h" /* IsBootstrapProcessingMode */
 #include "storage/lwlock.h"
@@ -158,6 +159,9 @@ cluster_grd_work_queue_enqueue(uint32 source_node_id, const void *payload, uint1
 	}
 
 	slot = &cluster_grd_work_queue_state->items[cluster_grd_work_queue_state->head];
+	/* Preserve this receiver's enqueue cut; the payload's generation belongs
+	 * to the sender and must remain unchanged for retry/dedup correlation. */
+	slot->routing_generation = cluster_lms_get_shard_master_generation();
 	slot->source_node_id = source_node_id;
 	slot->payload_len = payload_len;
 	if (payload_len > 0)

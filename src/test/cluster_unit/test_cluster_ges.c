@@ -1442,6 +1442,7 @@ UT_TEST(test_ges_release_bypasses_dedup_and_reclaims_acquire_receipts)
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueue_before + 1);
 
 	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
 	stub_work_queue_dequeue_item.source_node_id = env.source_node_id;
 	stub_work_queue_dequeue_item.payload_len = sizeof(req);
 	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
@@ -1546,8 +1547,12 @@ UT_TEST(test_ges_recovery_master_rechecks_before_mutation)
 	req.opcode = GES_REQ_OPCODE_REQUEST;
 	req.lockmode = AccessExclusiveLock;
 	req.holder_node_id = 1;
+	req.holder_request_id_lo = 201;
+	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	req.holder_cluster_epoch_hi = (uint32)(stub_current_epoch >> 32);
 	memcpy(req.resid, &resid, sizeof(resid));
 	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
 	stub_work_queue_dequeue_item.source_node_id = 1;
 	stub_work_queue_dequeue_item.payload_len = sizeof(req);
 	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
@@ -1687,6 +1692,7 @@ UT_TEST(test_pre2_survivor_redeclare_master_rechecks_before_rebind)
 	cluster_ges_request_handler(&env, &req);
 	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued + 1);
 	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
 	stub_work_queue_dequeue_item.source_node_id = 1;
 	stub_work_queue_dequeue_item.payload_len = sizeof(req);
 	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
@@ -2410,6 +2416,7 @@ queue_exact_recovery_release(const ClusterResId *resid)
 	req.shard_master_generation_lo = (uint32)stub_master_generation;
 	memcpy(req.resid, resid, sizeof(*resid));
 	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.routing_generation = stub_master_generation;
 	stub_work_queue_dequeue_item.source_node_id = 1;
 	stub_work_queue_dequeue_item.payload_len = sizeof(req);
 	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));

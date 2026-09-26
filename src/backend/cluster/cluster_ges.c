@@ -1338,12 +1338,13 @@ ges_dispatch_reject(int32 source_node_id, const ClusterGrdHolderId *holder,
 	}
 }
 
-/* Ingress validation predates queueing. Rebuild traffic must not overwrite
- * a newer holder after the epoch/map changes while waiting for LMON.
+/* Ingress validation predates queueing. No queued mutation may use an
+ * obsolete epoch, routing generation or master, including a late acquisition
+ * that would otherwise recreate a holder after retirement.
  * Author: SqlRush <sqlrush@gmail.com> */
 static uint32
-ges_redeclare_drain_refusal(const ClusterResId *resid, const ClusterGrdHolderId *holder,
-							int32 source, uint64 request_generation)
+ges_mutation_drain_refusal(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+						   int32 source, uint64 queued_generation)
 {
 	uint64 current_generation;
 	int32 master;
@@ -1354,7 +1355,7 @@ ges_redeclare_drain_refusal(const ClusterResId *resid, const ClusterGrdHolderId 
 	master = cluster_grd_lookup_master_gen(resid, &current_generation);
 	if (master < 0 || master != cluster_node_id)
 		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
-	if (current_generation != request_generation)
+	if (current_generation != queued_generation)
 		return GES_REJECT_REASON_EPOCH_MISMATCH;
 	return GES_REJECT_REASON_NONE;
 }
@@ -1371,6 +1372,7 @@ cluster_ges_lmon_drain_work_queue(void)
 		ClusterResId resid;
 		uint64 holder_epoch;
 		uint64 holder_request_id;
+		uint32 refusal;
 
 		drained++;
 
@@ -1397,6 +1399,14 @@ cluster_ges_lmon_drain_work_queue(void)
 												 &holder)) {
 			ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
 								GES_REJECT_REASON_WORK_QUEUE_FULL,
+								ges_request_shard_master_generation(req));
+			continue;
+		}
+
+		refusal = ges_mutation_drain_refusal(&resid, &holder, (int32)item.source_node_id,
+											 item.routing_generation);
+		if (refusal != GES_REJECT_REASON_NONE) {
+			ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode, refusal,
 								ges_request_shard_master_generation(req));
 			continue;
 		}
@@ -1728,19 +1738,14 @@ cluster_ges_lmon_drain_work_queue(void)
 				 * returning each granted identity tagged REQUEST or CONVERT.
 				 */
 			ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
-			uint64 generation_before;
+			uint64 generation_before = item.routing_generation;
 			uint64 generation_after;
 			int n_granted;
 
-			/* PGRAC: a missing copy on a former master is not retirement proof.
-			 * Match the local path's mutation-adjacent routing/readiness checks.
+			/* The common guard checked this exact receiver cut. Do not replace
+			 * it with an intermediate observation: a cut change before removal
+			 * must still prevent retirement confirmation afterwards.
 			 * Author: SqlRush <sqlrush@gmail.com> */
-			if (cluster_grd_lookup_master_gen(&resid, &generation_before) != cluster_node_id) {
-				ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
-									GES_REJECT_REASON_MASTER_DEAD_NATIVE,
-									ges_request_shard_master_generation(req));
-				break;
-			}
 
 			if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
 				ClusterGrdEntryResult release_result;
@@ -1817,15 +1822,6 @@ cluster_ges_lmon_drain_work_queue(void)
 				 *	this IS the rebuild traffic.
 				 */
 			ClusterGrdEntryResult rr;
-			uint32 refusal
-				= ges_redeclare_drain_refusal(&resid, &holder, (int32)item.source_node_id,
-											  ges_request_shard_master_generation(req));
-
-			if (refusal != GES_REJECT_REASON_NONE) {
-				ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
-									refusal, ges_request_shard_master_generation(req));
-				break;
-			}
 
 			rr = cluster_grd_entry_rebind_or_insert_holder(
 				&resid, &holder, (int32)item.source_node_id, (int)req->lockmode);

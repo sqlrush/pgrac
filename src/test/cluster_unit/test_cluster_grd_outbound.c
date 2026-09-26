@@ -46,6 +46,14 @@ int cluster_lmon_main_loop_interval = 1000;
 int MaxBackends = 200;
 int cluster_node_id = 0;
 
+static uint64 ut_routing_generation;
+
+uint64
+cluster_lms_get_shard_master_generation(void)
+{
+	return ut_routing_generation;
+}
+
 void
 ExceptionalCondition(const char *conditionName, const char *fileName, int lineNumber)
 {
@@ -495,11 +503,31 @@ UT_TEST(test_normal_stop_outbound_geometry_cannot_fake_empty)
 	LWLockRelease(cluster_grd_outbound_lock);
 }
 
+/* Break caught: queue delay must retain the receiver's enqueue cut, while
+ * never rewriting the sender's independent retry/dedup token.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_work_queue_retains_receiver_cut_and_original_payload)
+{
+	ClusterGrdWorkItem item;
+	GesRequestPayload request = ut_release(201);
+
+	ut_reset_state();
+	request.shard_master_generation_lo = 47;
+	ut_routing_generation = UINT64_C(0x200000009);
+	UT_ASSERT(cluster_grd_work_queue_enqueue(1, &request, sizeof(request)));
+	ut_routing_generation = UINT64_C(0x20000000a);
+	UT_ASSERT(cluster_grd_work_queue_dequeue(&item));
+	UT_ASSERT_EQ(item.routing_generation, UINT64_C(0x200000009));
+	UT_ASSERT_EQ(item.source_node_id, 1);
+	UT_ASSERT_EQ(item.payload_len, sizeof(request));
+	UT_ASSERT(memcmp(item.payload, &request, sizeof(request)) == 0);
+}
+
 int
 main(void)
 {
 	cluster_grd_outbound_shmem_register();
-	UT_PLAN(8);
+	UT_PLAN(9);
 
 	UT_RUN(test_normal_stop_required_queues_uninitialized);
 	UT_RUN(test_cleanup_retry_queue_never_overwrites_oldest);
@@ -509,6 +537,7 @@ main(void)
 	UT_RUN(test_normal_stop_all_three_outbound_queues);
 	UT_RUN(test_normal_stop_work_queue_exact_shape_and_lock);
 	UT_RUN(test_normal_stop_outbound_geometry_cannot_fake_empty);
+	UT_RUN(test_work_queue_retains_receiver_cut_and_original_payload);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
