@@ -1599,6 +1599,21 @@ extern int cluster_grd_release_and_drain(const ClusterResId *resid,
 										 const ClusterGrdHolderId *holder,
 										 ClusterGrdGrantIdentity *granted_out, int max_out);
 
+/* PGRAC: atomic table-side retirement, not a network terminal certificate.
+ * The caller first fences the exact producer and validates current master/cut.
+ * Remove its waiter, convert, reservation and holder under one entry lock.
+ * A converting caller supplies its original request/mode to restore an already
+ * granted upgrade; zero/NoLock means discard this identity. Frozen shards never
+ * drain. Negative results use RELEASE_NOT_FOUND/NOT_READY, or RETIRE_INVALID
+ * for an unprovable restore. Other identities are never removed. max_out=0
+ * forbids draining and permits a NULL output; use this for requester shadows.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#define CLUSTER_GRD_RETIRE_INVALID (-3)
+extern int cluster_grd_retire_request_and_drain(const ClusterResId *resid,
+												const ClusterGrdHolderId *holder,
+												uint64 previous_request_id, LOCKMODE previous_mode,
+												ClusterGrdGrantIdentity *granted_out, int max_out);
+
 /*
  * opcode-14 CONVERT_ROLLBACK (§3.1a T4): strict inverse of the convert — locate
  * the upgraded slot by (node_id, procno, upgraded_mode) and restore both its

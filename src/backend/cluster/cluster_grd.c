@@ -6933,6 +6933,151 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 	return n;
 }
 
+/* PGRAC: whole-request table cleanup after the caller has closed its producers.
+ * This is deliberately separate from holder-only RELEASE. It cannot by itself
+ * certify that a wire request will never arrive again.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+grd_request_identity_matches(const ClusterGrdHolderId *id, int32 node, uint32 procno, uint64 epoch,
+							 uint64 request)
+{
+	return id->node_id == (uint32)node && id->procno == procno && id->cluster_epoch == epoch
+		   && id->request_id == request;
+}
+
+int
+cluster_grd_retire_request_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+									 uint64 previous_request_id, LOCKMODE previous_mode,
+									 ClusterGrdGrantIdentity *granted_out, int max_out)
+{
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdEntryResult lookup;
+	ClusterGrdHolderId departed[PGRAC_GRD_MAX_CONVERTS + 2];
+	bool restore = previous_request_id != 0;
+	bool removed = false;
+	bool may_drain;
+	int old_slot = -1, new_slot = -1;
+	int n = 0, i;
+	uint64 epoch;
+
+	if (resid == NULL || holder == NULL || max_out < 0 || (max_out > 0 && granted_out == NULL)
+		|| holder->node_id >= CLUSTER_MAX_NODES || holder->request_id == 0
+		|| holder->cluster_epoch == 0 || previous_request_id == holder->request_id
+		|| (restore ? previous_mode < GES_MODE_FIRST || previous_mode > GES_MODE_LAST
+					: previous_mode != NoLock))
+		return CLUSTER_GRD_RETIRE_INVALID;
+	lookup = cluster_grd_entry_lookup_or_create(resid, false, &entry);
+	if (lookup != CLUSTER_GRD_ENTRY_OK || entry == NULL) {
+		if (restore && lookup == CLUSTER_GRD_ENTRY_NOT_FOUND)
+			return CLUSTER_GRD_RETIRE_INVALID;
+		return lookup == CLUSTER_GRD_ENTRY_NOT_FOUND ? CLUSTER_GRD_RELEASE_NOT_FOUND
+													 : CLUSTER_GRD_RELEASE_NOT_READY;
+	}
+
+	SpinLockAcquire(&entry->lock);
+	/* Validate restoration before any destructive mutation. A request miss
+	 * is not permission to recreate its alleged former shared holder. */
+	for (i = 0; i < entry->ngranted; i++) {
+		const ClusterGrdHolder *h = &entry->holders[i];
+
+		if (grd_request_identity_matches(holder, h->node_id, h->procno, h->cluster_epoch,
+										 h->request_id))
+			new_slot = i;
+		if (restore && h->node_id == (int32)holder->node_id && h->procno == holder->procno
+			&& h->cluster_epoch == holder->cluster_epoch && h->request_id == previous_request_id
+			&& h->mode == previous_mode)
+			old_slot = i;
+	}
+	if (restore
+		&& ((old_slot < 0 && new_slot < 0) || (old_slot >= 0 && new_slot >= 0)
+			|| (new_slot >= 0
+				&& ges_mode_convert_class(previous_mode, entry->holders[new_slot].mode)
+					   != GES_CONVERT_UPGRADE))) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		return CLUSTER_GRD_RETIRE_INVALID;
+	}
+	for (i = 0; i < entry->nwaiters;) {
+		const ClusterGrdWaiter *w = &entry->waiters[i];
+
+		if (!grd_request_identity_matches(holder, w->node_id, w->procno, w->cluster_epoch,
+										  w->request_id)) {
+			i++;
+			continue;
+		}
+		entry->waiters[i] = entry->waiters[--entry->nwaiters];
+		memset(&entry->waiters[entry->nwaiters], 0, sizeof(entry->waiters[0]));
+		entry->generation++;
+		removed = true;
+	}
+	for (i = 0; i < entry->nconverts;) {
+		const ClusterGrdConvert *c = &entry->converts[i];
+
+		if (!grd_request_identity_matches(holder, c->node_id, c->procno, c->cluster_epoch,
+										  c->convert_request_id)) {
+			i++;
+			continue;
+		}
+		grd_convert_remove(entry, i);
+		removed = true;
+	}
+	for (i = 0; i < entry->nreservations;) {
+		const ClusterGrdHolderId *r = &entry->reservations[i].id;
+
+		if (!grd_request_identity_matches(holder, r->node_id, r->procno, r->cluster_epoch,
+										  r->request_id)) {
+			i++;
+			continue;
+		}
+		entry->reservations[i] = entry->reservations[--entry->nreservations];
+		memset(&entry->reservations[entry->nreservations], 0, sizeof(entry->reservations[0]));
+		entry->generation++;
+		removed = true;
+	}
+	if (new_slot >= 0) {
+		if (restore) {
+			entry->holders[new_slot].request_id = previous_request_id;
+			entry->holders[new_slot].mode = previous_mode;
+		} else {
+			entry->holders[new_slot] = entry->holders[--entry->ngranted];
+			memset(&entry->holders[entry->ngranted], 0, sizeof(entry->holders[0]));
+		}
+		entry->generation++;
+		removed = true;
+	}
+
+	/* Only the mutation owner calls this wrapper. Frozen or stale entries
+	 * may retire exact footprints, but must not publish a new grant. Unlike
+	 * the ordinary release sweep we do not delete any other epoch's state. */
+	epoch = cluster_epoch_get_current();
+	/* Ordinary RELEASE frees a slot before calling the legacy drain. A
+	 * cancel or downgrade need not; preserve the waiter at holder capacity. */
+	may_drain
+		= removed && max_out > 0 && entry->ngranted < PGRAC_GRD_MAX_HOLDERS
+		  && cluster_grd_shard_phase(cluster_grd_shard_for_resource(resid)) == GRD_SHARD_NORMAL;
+	for (i = 0; may_drain && i < entry->ngranted; i++)
+		may_drain = entry->holders[i].cluster_epoch == epoch;
+	for (i = 0; may_drain && i < entry->nwaiters; i++)
+		may_drain = entry->waiters[i].cluster_epoch == epoch;
+	for (i = 0; may_drain && i < entry->nconverts; i++)
+		may_drain = entry->converts[i].cluster_epoch == epoch;
+	if (may_drain)
+		n = cluster_grd_entry_drain_converts_then_waiters(entry, granted_out,
+														  Min(max_out, PGRAC_GRD_MAX_CONVERTS + 1));
+	SpinLockRelease(&entry->lock);
+	cluster_grd_entry_release(entry);
+	if (!removed)
+		return restore && old_slot >= 0 ? 0 : CLUSTER_GRD_RELEASE_NOT_FOUND;
+
+	/* The canceled vertex and all newly granted vertices left the WFG.
+	 * Projection takes LWLocks, so it runs only after releasing entry/pin. */
+	departed[0] = *holder;
+	for (i = 0; i < n; i++)
+		departed[i + 1] = granted_out[i].holder;
+	grd_wfg_resync_entry(resid, departed, n + 1);
+	return n;
+}
+
 /*
  * cluster_grd_entry_rollback_convert -- restore a slot upgraded by a convert
  *	back to its pre-convert (old_mode, old_request_id) (spec-5.3 §3.1a T4;

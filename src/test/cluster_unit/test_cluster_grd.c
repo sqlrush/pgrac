@@ -6175,6 +6175,264 @@ UT_TEST(test_normal_stop_grd_bounds_late_invalid_and_lock_order)
 	stop_grd_finish();
 }
 
+/* Table retirement must close all four footprints, not just the holder.
+ * Real GRD mutations/drain run with an in-memory shmem fixture.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_retire_request_removes_all_footprints_without_phantom_grant)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdHolderId abandoned = grd_lifecycle_holder(1, 13, 201);
+	ClusterGrdHolderId blocker = grd_lifecycle_holder(2, 14, 202);
+	ClusterGrdHolderId successor = grd_lifecycle_holder(3, 15, 203);
+	ClusterGrdGrantIdentity grants[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	ClusterGrdConvert convert;
+	bool drain = false;
+
+	grd_lifecycle_reset(4);
+	ut_mock_epoch = 1;
+	grd_lifecycle_resid(6450, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &abandoned, ShareLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &blocker, ShareLock), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_reservation_create(entry, &abandoned, ShareLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_add_waiter(entry, &abandoned, ExclusiveLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	convert = grd_lifecycle_convert_req(1, 13, ShareLock, ExclusiveLock, 201);
+	UT_ASSERT_EQ(cluster_grd_entry_request_convert(entry, &convert, &drain),
+				 CLUSTER_GRD_CONVERT_ENQUEUED);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &successor, 3, 203, 1,
+													GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL,
+													NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &abandoned, 0, NoLock, grants,
+													  lengthof(grants)),
+				 0);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &abandoned, NULL));
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &blocker, grants, lengthof(grants)), 1);
+	UT_ASSERT_EQ(grants[0].holder.request_id, 203);
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &successor, grants, lengthof(grants)), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+}
+
+UT_TEST(test_retire_request_matches_epoch_proc_node_and_request)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdHolderId original = grd_lifecycle_holder(1, 13, 211);
+	ClusterGrdGrantIdentity grants[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	int field;
+
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(6451, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &original, ShareLock), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_reservation_create(entry, &original, ShareLock), CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+	for (field = 0; field < 4; field++) {
+		ClusterGrdHolderId other = original;
+
+		if (field == 0)
+			other.node_id++;
+		if (field == 1)
+			other.procno++;
+		if (field == 2)
+			other.cluster_epoch++;
+		if (field == 3)
+			other.request_id++;
+		UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &other, 0, NoLock, grants,
+														  lengthof(grants)),
+					 CLUSTER_GRD_RELEASE_NOT_FOUND);
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &original, NULL));
+	}
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &original, 0, NoLock, grants,
+													  lengthof(grants)),
+				 0);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+}
+
+UT_TEST(test_retire_convert_preserves_original_share_before_and_after_grant)
+{
+	int already_granted;
+
+	for (already_granted = 0; already_granted < 2; already_granted++) {
+		ClusterResId resid;
+		ClusterGrdEntry *entry = NULL;
+		ClusterGrdHolderId old = grd_lifecycle_holder(1, 13, 221);
+		ClusterGrdHolderId upgrading = grd_lifecycle_holder(1, 13, 222);
+		ClusterGrdHolderId blocker = grd_lifecycle_holder(2, 14, 223);
+		ClusterGrdGrantIdentity grants[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+		ClusterGrdConvert convert;
+		bool drain = false;
+		LOCKMODE mode = NoLock;
+
+		grd_lifecycle_reset(4);
+		ut_mock_epoch = 1;
+		grd_lifecycle_resid(6452, &resid);
+		UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry),
+					 CLUSTER_GRD_ENTRY_OK);
+		UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &old, ShareLock), CLUSTER_GRD_ENTRY_OK);
+		if (!already_granted)
+			UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &blocker, ShareLock),
+						 CLUSTER_GRD_ENTRY_OK);
+		convert = grd_lifecycle_convert_req(1, 13, ShareLock, ExclusiveLock, 222);
+		UT_ASSERT_EQ(cluster_grd_entry_request_convert(entry, &convert, &drain),
+					 already_granted ? CLUSTER_GRD_CONVERT_GRANTED_INPLACE
+									 : CLUSTER_GRD_CONVERT_ENQUEUED);
+		cluster_grd_entry_release(entry);
+		UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &upgrading, 221, ShareLock,
+														  grants, lengthof(grants)),
+					 0);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &upgrading, NULL));
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &old, &mode));
+		UT_ASSERT_EQ(mode, ShareLock);
+		/* A lost retirement ACK is safely repeatable, not a second grant. */
+		UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &upgrading, 221, ShareLock,
+														  grants, lengthof(grants)),
+					 0);
+		if (!already_granted)
+			UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &blocker, grants, lengthof(grants)),
+						 0);
+		UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &old, grants, lengthof(grants)), 0);
+		UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+	}
+}
+
+UT_TEST(test_retire_request_never_thaws_frozen_shard_or_proves_missing_directory)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId abandoned = grd_lifecycle_holder(1, 13, 231);
+	ClusterGrdHolderId successor = grd_lifecycle_holder(2, 14, 232);
+	ClusterGrdGrantIdentity grants[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	uint32 shard;
+
+	grd_lifecycle_reset(0);
+	grd_lifecycle_resid(6453, &resid);
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &abandoned, 0, NoLock, grants,
+													  lengthof(grants)),
+				 CLUSTER_GRD_RELEASE_NOT_READY);
+	grd_lifecycle_reset(4);
+	ut_mock_epoch = 1;
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &abandoned, 1, 231, 1,
+													GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL,
+													NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &successor, 2, 232, 1,
+													GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL,
+													NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	shard = cluster_grd_shard_for_resource(&resid);
+	cluster_grd_shard_set_phase(shard, GRD_SHARD_FROZEN);
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &abandoned, 0, NoLock, grants,
+													  lengthof(grants)),
+				 0);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &successor, NULL));
+	UT_ASSERT_EQ(cluster_grd_shard_phase(shard), GRD_SHARD_FROZEN);
+	UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&resid, &successor), CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_shard_set_phase(shard, GRD_SHARD_NORMAL);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+}
+
+UT_TEST(test_retire_convert_does_not_recreate_an_unproven_previous_holder)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId upgrading = grd_lifecycle_holder(1, 13, 241);
+	ClusterGrdGrantIdentity grants[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	ClusterGrdEntry *entry = NULL;
+
+	grd_lifecycle_reset(4);
+	grd_lifecycle_resid(6454, &resid);
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &upgrading, 240, ShareLock, grants,
+													  lengthof(grants)),
+				 CLUSTER_GRD_RETIRE_INVALID);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	/* A lateral or upward "restore" must not strengthen an existing grant. */
+	UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &upgrading, AccessShareLock),
+				 CLUSTER_GRD_ENTRY_OK);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &upgrading, 240, ShareLock, grants,
+													  lengthof(grants)),
+				 CLUSTER_GRD_RETIRE_INVALID);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &upgrading, NULL));
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &upgrading, 0, NoLock, grants,
+													  lengthof(grants)),
+				 0);
+}
+
+UT_TEST(test_retire_convert_at_holder_capacity_keeps_compatible_waiter_queued)
+{
+	ClusterResId resid;
+	ClusterGrdEntry *entry = NULL;
+	ClusterGrdHolderId old = grd_lifecycle_holder(1, 13, 251);
+	ClusterGrdHolderId upgrading = grd_lifecycle_holder(1, 13, 252);
+	ClusterGrdHolderId waiter = grd_lifecycle_holder(2, 14, 253);
+	ClusterGrdHolderId peers[PGRAC_GRD_MAX_HOLDERS_PUBLIC - 1];
+	ClusterGrdGrantIdentity grants[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+	ClusterGrdConvert convert;
+	bool drain = false;
+	int i;
+
+	grd_lifecycle_reset(4);
+	ut_mock_epoch = 1;
+	grd_lifecycle_resid(6455, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&resid, true, &entry), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &old, ShareLock), CLUSTER_GRD_ENTRY_OK);
+	for (i = 0; i < lengthof(peers); i++) {
+		peers[i] = grd_lifecycle_holder(3, 30 + i, 300 + i);
+		UT_ASSERT_EQ(cluster_grd_entry_grant_holder(entry, &peers[i], AccessShareLock),
+					 CLUSTER_GRD_ENTRY_OK);
+	}
+	convert = grd_lifecycle_convert_req(1, 13, ShareLock, ExclusiveLock, 252);
+	UT_ASSERT_EQ(cluster_grd_entry_request_convert(entry, &convert, &drain),
+				 CLUSTER_GRD_CONVERT_GRANTED_INPLACE);
+	cluster_grd_entry_release(entry);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &waiter, 2, 253, 1,
+													GES_REQ_OPCODE_REQUEST, ShareLock, NULL, NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	/* Restoring S does not free a holder slot. Do not emit an unregistered
+	 * GRANT or remove the waiter until an actual slot becomes available. */
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &upgrading, 251, ShareLock, grants,
+													  lengthof(grants)),
+				 0);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &waiter, NULL));
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &peers[0], grants, lengthof(grants)), 1);
+	UT_ASSERT_EQ(grants[0].holder.request_id, 253);
+	UT_ASSERT(cluster_grd_holder_mode_by_id(&resid, &waiter, NULL));
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &waiter, grants, lengthof(grants)), 0);
+	for (i = 1; i < lengthof(peers); i++)
+		UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &peers[i], grants, lengthof(grants)), 0);
+	UT_ASSERT_EQ(cluster_grd_release_and_drain(&resid, &old, grants, lengthof(grants)), 0);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+}
+
+UT_TEST(test_retire_request_local_shadow_never_grants)
+{
+	ClusterResId resid;
+	ClusterGrdHolderId abandoned = grd_lifecycle_holder(1, 13, 261);
+	ClusterGrdHolderId successor = grd_lifecycle_holder(2, 14, 262);
+
+	grd_lifecycle_reset(4);
+	ut_mock_epoch = 1;
+	grd_lifecycle_resid(6456, &resid);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &abandoned, 1, 261, 1,
+													GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL,
+													NULL),
+				 CLUSTER_GRD_GRANT_NOW);
+	UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(&resid, &successor, 2, 262, 1,
+													GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL,
+													NULL),
+				 CLUSTER_GRD_ENQUEUED_WAITER);
+	/* A requester-local shadow is not an authority, even in a NORMAL shard. */
+	UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&resid, &abandoned, 0, NoLock, NULL, 0), 0);
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &abandoned, NULL));
+	UT_ASSERT(!cluster_grd_holder_mode_by_id(&resid, &successor, NULL));
+	UT_ASSERT_EQ(cluster_grd_cancel_waiter_by_id(&resid, &successor), CLUSTER_GRD_ENTRY_OK);
+	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
+}
+
 int
 /* cppcheck-suppress constParameter
  * Reason: main() keeps the standard test harness signature used by the
@@ -6190,7 +6448,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(126);
+	UT_PLAN(133);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6346,6 +6604,13 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_normal_stop_grd_keeps_master_and_empty_cached_entries);
 	UT_RUN(test_normal_stop_grd_all_four_responsibilities_use_original_release);
 	UT_RUN(test_normal_stop_grd_bounds_late_invalid_and_lock_order);
+	UT_RUN(test_retire_request_removes_all_footprints_without_phantom_grant);
+	UT_RUN(test_retire_request_matches_epoch_proc_node_and_request);
+	UT_RUN(test_retire_convert_preserves_original_share_before_and_after_grant);
+	UT_RUN(test_retire_request_never_thaws_frozen_shard_or_proves_missing_directory);
+	UT_RUN(test_retire_convert_does_not_recreate_an_unproven_previous_holder);
+	UT_RUN(test_retire_convert_at_holder_capacity_keeps_compatible_waiter_queued);
+	UT_RUN(test_retire_request_local_shadow_never_grants);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
