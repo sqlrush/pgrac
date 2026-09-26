@@ -1338,6 +1338,27 @@ ges_dispatch_reject(int32 source_node_id, const ClusterGrdHolderId *holder,
 	}
 }
 
+/* Ingress validation predates queueing. Rebuild traffic must not overwrite
+ * a newer holder after the epoch/map changes while waiting for LMON.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static uint32
+ges_redeclare_drain_refusal(const ClusterResId *resid, const ClusterGrdHolderId *holder,
+							int32 source, uint64 request_generation)
+{
+	uint64 current_generation;
+	int32 master;
+
+	if (holder->cluster_epoch != cluster_epoch_get_current() || holder->request_id == 0
+		|| holder->node_id != (uint32)source)
+		return GES_REJECT_REASON_EPOCH_MISMATCH;
+	master = cluster_grd_lookup_master_gen(resid, &current_generation);
+	if (master < 0 || master != cluster_node_id)
+		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
+	if (current_generation != request_generation)
+		return GES_REJECT_REASON_EPOCH_MISMATCH;
+	return GES_REJECT_REASON_NONE;
+}
+
 int
 cluster_ges_lmon_drain_work_queue(void)
 {
@@ -1786,7 +1807,7 @@ cluster_ges_lmon_drain_work_queue(void)
 				 * spec-4.6 D3 — cooperative holder rebind (insert-or-rebind).
 				 *
 				 *	The payload carries the NEW current-epoch holder
-				 *	(validated above:  payload epoch == accepted epoch).
+				 *	(revalidated here after the work-queue delay).
 				 *	Match key for an existing holder = (node_id, procno,
 				 *	lockmode) + resid;  match → overwrite the holder
 				 *	identity in place (unaffected-shard rebind, idempotent
@@ -1796,6 +1817,15 @@ cluster_ges_lmon_drain_work_queue(void)
 				 *	this IS the rebuild traffic.
 				 */
 			ClusterGrdEntryResult rr;
+			uint32 refusal
+				= ges_redeclare_drain_refusal(&resid, &holder, (int32)item.source_node_id,
+											  ges_request_shard_master_generation(req));
+
+			if (refusal != GES_REJECT_REASON_NONE) {
+				ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+									refusal, ges_request_shard_master_generation(req));
+				break;
+			}
 
 			rr = cluster_grd_entry_rebind_or_insert_holder(
 				&resid, &holder, (int32)item.source_node_id, (int)req->lockmode);
@@ -3030,6 +3060,174 @@ cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 loc
 											/* timeout_ms = GUC default */ 0,
 											/* wait_event = GES default */ 0,
 											GES_REQ_OPCODE_REDECLARE, NULL);
+}
+
+/* Reconstruction is driven by the owning process between service ticks.
+ * The stored exchange is cleanup responsibility, not independent authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ges_redeclare_input_matches(const ClusterGesRedeclareAttempt *attempt, const ClusterResId *resid,
+							uint32 mode, const ClusterGrdHolderId *holder)
+{
+	const GesRequestPayload *request = &attempt->request;
+
+	return request->opcode == GES_REQ_OPCODE_REDECLARE && request->lockmode == mode
+		   && request->current_mode == NoLock && memcmp(request->resid, resid, sizeof(*resid)) == 0
+		   && request->holder_node_id == (uint32)holder->node_id
+		   && request->holder_procno == holder->procno
+		   && ges_request_holder_epoch(request) == holder->cluster_epoch
+		   && ges_request_holder_request_id(request) == holder->request_id
+		   && attempt->key.request_id == holder->request_id
+		   && attempt->key.source_node_id == holder->node_id
+		   && attempt->key.dest_node_id == attempt->master
+		   && attempt->key.cluster_epoch == holder->cluster_epoch
+		   && attempt->key.request_opcode == GES_REQ_OPCODE_REDECLARE
+		   && ges_request_shard_master_generation(request) == attempt->master_generation;
+}
+
+static bool
+ges_redeclare_cut_current(const ClusterGesRedeclareAttempt *attempt, const ClusterResId *resid)
+{
+	uint64 generation;
+	int32 master = cluster_grd_lookup_master_gen(resid, &generation);
+
+	return master >= 0 && master == attempt->master && generation == attempt->master_generation
+		   && attempt->key.cluster_epoch == cluster_epoch_get_current();
+}
+
+static bool
+ges_redeclare_initialize(ClusterGesRedeclareAttempt *attempt, const ClusterResId *resid,
+						 uint32 mode, const ClusterGrdHolderId *holder)
+{
+	uint64 generation;
+	int32 master = cluster_grd_lookup_master_gen(resid, &generation);
+	GesRequestPayload *request = &attempt->request;
+
+	if (master < 0)
+		return false;
+	memset(attempt, 0, sizeof(*attempt));
+	attempt->master = master;
+	attempt->master_generation = generation;
+	attempt->key.request_id = holder->request_id;
+	attempt->key.source_node_id = holder->node_id;
+	attempt->key.dest_node_id = master;
+	attempt->key.request_opcode = GES_REQ_OPCODE_REDECLARE;
+	attempt->key.cluster_epoch = holder->cluster_epoch;
+	request->opcode = GES_REQ_OPCODE_REDECLARE;
+	request->lockmode = mode;
+	request->holder_node_id = (uint32)holder->node_id;
+	request->holder_procno = holder->procno;
+	request->holder_cluster_epoch_lo = (uint32)holder->cluster_epoch;
+	request->holder_cluster_epoch_hi = (uint32)(holder->cluster_epoch >> 32);
+	request->holder_request_id_lo = (uint32)holder->request_id;
+	request->holder_request_id_hi = (uint32)(holder->request_id >> 32);
+	request->shard_master_generation_lo = (uint32)generation;
+	request->shard_master_generation_hi = (uint32)(generation >> 32);
+	memcpy(request->resid, resid, sizeof(*resid));
+	attempt->retry_ms = 100;
+	attempt->initialized = true;
+	if (master != cluster_node_id)
+		cluster_touched_peers_stamp(master, CLUSTER_TOUCH_GES_LOCK);
+	return true;
+}
+
+static ClusterGesRedeclareResult
+ges_redeclare_remote_step(ClusterGesRedeclareAttempt *attempt)
+{
+	GesReplyWaitVerdict verdict;
+	GesReplyWaitPollResult poll;
+	TimestampTz now;
+	bool was_sent;
+
+	if (attempt->wait_registered) {
+		poll = cluster_ges_reply_wait_poll_consume(&attempt->key, &verdict);
+		if (poll == GES_REPLY_WAIT_POLL_DELIVERED) {
+			attempt->wait_registered = false;
+			if (verdict.reply_opcode == GES_REPLY_OPCODE_GRANT
+				&& verdict.reject_reason == GES_REJECT_REASON_NONE) {
+				attempt->confirmed = true;
+				return CLUSTER_GES_REDECLARE_CONFIRMED;
+			}
+			if (verdict.reply_opcode != GES_REPLY_OPCODE_REJECT
+				|| verdict.reject_reason == GES_REJECT_REASON_NONE) {
+				attempt->invalid = true;
+				return CLUSTER_GES_REDECLARE_INVALID;
+			}
+			attempt->rejected = true;
+			attempt->reject_reason = verdict.reject_reason;
+			return CLUSTER_GES_REDECLARE_REJECTED;
+		}
+		/* A missing or abandoned table entry is not a grant, nor permission
+		 * to start a replacement exchange and lose this holder's identity. */
+		if (poll != GES_REPLY_WAIT_POLL_PENDING)
+			return CLUSTER_GES_REDECLARE_PENDING;
+	} else {
+		if (cluster_ges_reply_wait_insert(&attempt->key, 0) == NULL)
+			return CLUSTER_GES_REDECLARE_PENDING;
+		attempt->wait_registered = true;
+	}
+	now = GetCurrentTimestamp();
+	if (now < attempt->next_send_at)
+		return CLUSTER_GES_REDECLARE_PENDING;
+	attempt->next_send_at = TimestampTzPlusMilliseconds(now, attempt->retry_ms);
+	if (attempt->retry_ms < 1600)
+		attempt->retry_ms *= 2;
+	was_sent = attempt->sent;
+	/* Arm before enqueue can accept work and unwind. A normal refusal alone
+	 * proves this particular call did not publish; previous sends still own. */
+	attempt->sent = true;
+	if (!cluster_grd_outbound_enqueue_backend_request((uint32)attempt->master, &attempt->request,
+													  sizeof(attempt->request)))
+		attempt->sent = was_sent;
+	else if (cluster_ges_state != NULL)
+		pg_atomic_fetch_add_u64(&cluster_ges_state->request_defer_count, 1);
+	return CLUSTER_GES_REDECLARE_PENDING;
+}
+
+ClusterGesRedeclareResult
+cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt, const ClusterResId *resid,
+						   uint32 lockmode, const ClusterGrdHolderId *new_holder)
+{
+	ClusterGesRedeclareResult result;
+
+	if (attempt == NULL || resid == NULL || new_holder == NULL || lockmode < AccessShareLock
+		|| lockmode > AccessExclusiveLock || new_holder->request_id == 0
+		|| new_holder->cluster_epoch == 0 || new_holder->node_id != cluster_node_id
+		|| cluster_node_id < 0)
+		return CLUSTER_GES_REDECLARE_INVALID;
+	if (attempt->initialized && !ges_redeclare_input_matches(attempt, resid, lockmode, new_holder))
+		return CLUSTER_GES_REDECLARE_INVALID;
+	if (new_holder->cluster_epoch != cluster_epoch_get_current())
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	if (attempt->initialized && !ges_redeclare_cut_current(attempt, resid))
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	if (!ges_readiness_allows_redeclare(resid, (LOCKMODE)lockmode))
+		return CLUSTER_GES_REDECLARE_PENDING;
+	if (!attempt->initialized && !ges_redeclare_initialize(attempt, resid, lockmode, new_holder))
+		return CLUSTER_GES_REDECLARE_PENDING;
+	if (!ges_redeclare_cut_current(attempt, resid))
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	if (attempt->invalid)
+		return CLUSTER_GES_REDECLARE_INVALID;
+	if (attempt->confirmed)
+		return CLUSTER_GES_REDECLARE_CONFIRMED;
+	if (attempt->rejected)
+		return CLUSTER_GES_REDECLARE_REJECTED;
+	if (attempt->master == cluster_node_id) {
+		attempt->confirmed = cluster_grd_entry_rebind_or_insert_holder(
+								 resid, new_holder, cluster_node_id, (int)lockmode)
+							 == CLUSTER_GRD_ENTRY_OK;
+		result
+			= attempt->confirmed ? CLUSTER_GES_REDECLARE_CONFIRMED : CLUSTER_GES_REDECLARE_PENDING;
+	} else
+		result = ges_redeclare_remote_step(attempt);
+	/* A reply or direct mutation can race the reconstruction cut. Preserve
+	 * its observed outcome for cleanup, but never publish a stale ACK. */
+	if (!ges_redeclare_cut_current(attempt, resid))
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	if (!ges_readiness_allows_redeclare(resid, (LOCKMODE)lockmode))
+		return CLUSTER_GES_REDECLARE_PENDING;
+	return result;
 }
 
 uint32

@@ -535,6 +535,32 @@ typedef struct ClusterGesHwGrant {
 	bool consumed;
 } ClusterGesHwGrant;
 
+/* Process-owned reconstruction exchange, never a fresh lock grant. Keep the
+ * attempt alive until its holder is consumed or exactly retired. */
+typedef enum ClusterGesRedeclareResult {
+	CLUSTER_GES_REDECLARE_PENDING = 0,
+	CLUSTER_GES_REDECLARE_CONFIRMED,
+	CLUSTER_GES_REDECLARE_REJECTED,
+	CLUSTER_GES_REDECLARE_CUT_CHANGED,
+	CLUSTER_GES_REDECLARE_INVALID
+} ClusterGesRedeclareResult;
+
+typedef struct ClusterGesRedeclareAttempt {
+	GesReplyWaitKey key;
+	GesRequestPayload request;
+	int32 master;
+	uint64 master_generation;
+	TimestampTz next_send_at;
+	uint32 retry_ms;
+	uint32 reject_reason;
+	bool initialized;
+	bool wait_registered;
+	bool sent;
+	bool confirmed;
+	bool rejected;
+	bool invalid;
+} ClusterGesRedeclareAttempt;
+
 /*
  * GES reply payload (variant on GES_REPLY msg_type=5).
  *
@@ -666,6 +692,13 @@ extern uint32 cluster_ges_release_and_drain_local(const struct ClusterResId *res
 extern uint32 cluster_ges_send_redeclare_and_wait(const struct ClusterResId *resid, uint32 lockmode,
 												  const struct ClusterGrdHolderId *new_holder,
 												  uint64 request_id);
+
+/* One cooperative step, with no CV sleep and no replacement request identity.
+ * Zero-initialize once. PENDING/CUT_CHANGED never discharge ownership. Only
+ * CONFIRMED permits the caller to publish the supplied current holder. */
+extern ClusterGesRedeclareResult
+cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt, const struct ClusterResId *resid,
+						   uint32 lockmode, const struct ClusterGrdHolderId *new_holder);
 
 /* spec-5.3 D2/D3 — send opcode-2 CONVERT (same-backend upgrade) to the
  * resource's master (local master goes through the in-process work queue,

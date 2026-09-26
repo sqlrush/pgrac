@@ -48,6 +48,7 @@
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_touched_peers.h"
+#include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_advisory.h"
 #include "cluster/cluster_xnode_profile.h"
 #include "storage/proc.h"
@@ -87,6 +88,9 @@ typedef enum HandoffFault {
 static HandoffFault fault;
 static bool relation_case;
 static bool relation_nowait_case;
+static bool cooperative_case;
+static int cooperative_sleeps;
+static int cooperative_drift;
 static bool guard_armed;
 static int guard_reads;
 static int cancel_sent;
@@ -250,6 +254,7 @@ ConditionVariableTimedSleep(ConditionVariable *cv, long ms, uint32 event)
 {
 	(void)cv;
 	(void)event;
+	cooperative_sleeps++;
 	ut_mock_now += ms * 1000;
 	return true;
 }
@@ -293,16 +298,25 @@ cluster_authority_readiness_managed(void)
 bool
 cluster_serving_ready_is_current(void)
 {
-	return true;
+	return !cooperative_case;
+}
+ClusterAuthorityReadiness
+cluster_authority_readiness_get(void)
+{
+	return CLUSTER_AUTHORITY_SERVING_READY;
 }
 bool
 cluster_recovery_transport_is_current(void)
 {
+	if (cooperative_case)
+		return true; /* Exact accepted recovery cut is a formation fixture. */
 	abort();
 }
 bool
 cluster_recovery_authority_is_current(void)
 {
+	if (cooperative_case)
+		return false; /* Reconstruction does not reopen ordinary acquisitions. */
 	abort();
 }
 bool
@@ -333,6 +347,14 @@ cluster_ges_dedup_record_reply(const ClusterGesDedupKey *key, const uint8 *reply
 	HW_CHECK(length == sizeof(GesReplyPayload));
 	HW_CHECK(
 		((const GesReplyPayload *)reply)->opcode == GES_REPLY_OPCODE_GRANT
+		|| (cooperative_case && key->opcode == GES_REQ_OPCODE_REQUEST
+			&& ((const GesReplyPayload *)reply)->opcode == GES_REPLY_OPCODE_REJECT
+			&& ((const GesReplyPayload *)reply)->reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL)
+		|| (cooperative_case && key->opcode == GES_REQ_OPCODE_REDECLARE
+			&& ((const GesReplyPayload *)reply)->opcode == GES_REPLY_OPCODE_REJECT
+			&& (((const GesReplyPayload *)reply)->reject_reason == GES_REJECT_REASON_EPOCH_MISMATCH
+				|| ((const GesReplyPayload *)reply)->reject_reason
+					   == GES_REJECT_REASON_MASTER_DEAD_NATIVE))
 		|| ((fault == HW_REJECT || fault == HW_NON_GRANT_NONE)
 			&& ((const GesReplyPayload *)reply)->opcode == GES_REPLY_OPCODE_REJECT
 			&& ((const GesReplyPayload *)reply)->reject_reason == GES_REJECT_REASON_SHARD_FROZEN));
@@ -561,6 +583,15 @@ cluster_grd_outbound_enqueue_backend_request(uint32 destination, const void *pay
 	GesReplyWaitEntry *entry;
 	GesReplyPayload wrong;
 	HW_CHECK(length == sizeof(master_request));
+	if (cooperative_case) {
+		HW_CHECK(destination == 3);
+		HW_CHECK(((const GesRequestPayload *)payload)->opcode == GES_REQ_OPCODE_REDECLARE);
+		if (request_sent > 0)
+			HW_CHECK(memcmp(&master_request, payload, length) == 0);
+		memcpy(&master_request, payload, length);
+		request_sent++;
+		return true; /* Only queue: the owner must yield before this work runs. */
+	}
 	if (fault == HW_FIRST_ENQUEUE_REFUSED)
 		return false;
 	if (request_sent > 0) {
@@ -1111,12 +1142,242 @@ UT_TEST(relation_native_error_has_full_interval_cleanup_owner)
 	relation_case = false;
 }
 
+/* Existing blocking exchange is the RED control: the same service owner
+ * cannot drain this work while blocked in its own request. Transport, hash
+ * storage and formation are fixtures; rebind, drain and reply handling are not. */
+static void
+setup_cooperative(ClusterLockAcquireRequest *req)
+{
+	fault = HW_NORMAL;
+	relation_case = relation_nowait_case = false;
+	setup_case(req, false);
+	HW_CHECK(cluster_grd_cancel_reservation_by_id(&req->resid, &req->holder)
+			 == CLUSTER_GRD_ENTRY_OK);
+	cooperative_case = true;
+	cooperative_sleeps = 0;
+	cooperative_drift = 0;
+	ut_mock_epoch = req->holder.cluster_epoch = 2;
+}
+
+static void
+run_redeclare_master(const ClusterLockAcquireRequest *req, int output)
+{
+	const int32 nodes[] = { 0, 1, 2, 3 };
+	ClusterGrdHolderId old = req->holder, ordinary;
+	LOCKMODE held = NoLock;
+	GesReplyPayload granted;
+	MasterPacket packet = { 0 };
+	uint32 shard;
+
+	grd_lifecycle_reset(4);
+	set_mock_declared(4, nodes);
+	cluster_grd_master_map_init();
+	cluster_node_id = 3;
+	ut_mock_epoch = 2;
+	ut_qvotec_quorum = true;
+	mock_lms_shard_master_generation = 9;
+	MyProc = NULL;
+	old.cluster_epoch = 1;
+	old.request_id = 200;
+	HW_CHECK(cluster_grd_entry_rebind_or_insert_holder(&req->resid, &old, 1, ExclusiveLock)
+			 == CLUSTER_GRD_ENTRY_OK);
+	shard = cluster_grd_shard_for_resource(&req->resid);
+	cluster_grd_shard_set_phase(shard, GRD_SHARD_REBUILDING);
+	/* Same-wire replay must rebind idempotently, without opening the shard. */
+	for (int i = 0; i < 2; i++) {
+		master_work_pending = true;
+		HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
+		HW_CHECK(master_reply.opcode == GES_REPLY_OPCODE_GRANT);
+		HW_CHECK(master_reply.reply_for_opcode == GES_REQ_OPCODE_REDECLARE);
+		HW_CHECK(cluster_grd_holder_mode_by_id(&req->resid, &req->holder, &held));
+		HW_CHECK(held == ExclusiveLock);
+		HW_CHECK(!cluster_grd_holder_mode_by_id(&req->resid, &old, &held));
+		HW_CHECK(cluster_grd_shard_phase(shard) == GRD_SHARD_REBUILDING);
+	}
+	granted = master_reply;
+	if (cooperative_drift != 0) {
+		ClusterGrdRecoveryCounters before, after;
+
+		cluster_grd_recovery_counters_snapshot(&before);
+		if (cooperative_drift == 1)
+			master_request.holder_cluster_epoch_lo = 1;
+		else if (cooperative_drift == 2)
+			master_request.shard_master_generation_lo = 8;
+		else
+			cluster_node_id = 0; /* Queue handed to a process no longer master. */
+		master_work_pending = true;
+		HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
+		packet.reply = master_reply;
+		cluster_grd_recovery_counters_snapshot(&after);
+		packet.replies = (int)(after.holders_rebound - before.holders_rebound);
+		packet.held_mode
+			= cluster_grd_holder_mode_by_id(&req->resid, &req->holder, &held) ? held : NoLock;
+		transfer_exact(output, &packet, sizeof(packet), true);
+		_exit(0);
+	}
+	master_request.opcode = GES_REQ_OPCODE_REQUEST;
+	master_request.holder_node_id = 2;
+	master_request.holder_procno = 23;
+	master_request.holder_request_id_lo = 203;
+	master_work_pending = true;
+	HW_CHECK(cluster_ges_lmon_drain_work_queue() == 1);
+	HW_CHECK(master_reply.opcode == GES_REPLY_OPCODE_REJECT);
+	HW_CHECK(master_reply.reject_reason == GES_REJECT_REASON_WORK_QUEUE_FULL);
+	ordinary = grd_lifecycle_holder(2, 23, 203);
+	ordinary.cluster_epoch = 2;
+	HW_CHECK(!cluster_grd_holder_mode_by_id(&req->resid, &ordinary, &held));
+	packet.reply = granted;
+	transfer_exact(output, &packet, sizeof(packet), true);
+	_exit(0);
+}
+
+static GesReplyPayload
+drive_redeclare_master(const ClusterLockAcquireRequest *req, MasterPacket *observation)
+{
+	int channel[2], status;
+	pid_t child;
+	MasterPacket packet;
+
+	HW_CHECK(pipe(channel) == 0);
+	child = fork();
+	HW_CHECK(child >= 0);
+	if (child == 0) {
+		close(channel[0]);
+		alarm(10);
+		run_redeclare_master(req, channel[1]);
+	}
+	close(channel[1]);
+	transfer_exact(channel[0], &packet, sizeof(packet), false);
+	close(channel[0]);
+	HW_CHECK(waitpid(child, &status, 0) == child);
+	HW_CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	if (observation != NULL)
+		*observation = packet;
+	return packet.reply;
+}
+
+UT_TEST(cooperative_redeclare_yields_then_consumes_real_grant)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterICEnvelope env = { 0 };
+	GesReplyPayload reply;
+	ClusterGesRedeclareResult result;
+
+	setup_cooperative(&req);
+	if (getenv("PGRAC_PRE2_TEST_BLOCKING_REDECLARE") != NULL) {
+		uint32 reason = cluster_ges_send_redeclare_and_wait(&req.resid, req.lockmode, &req.holder,
+															req.holder.request_id);
+		result = reason == 0 ? CLUSTER_GES_REDECLARE_CONFIRMED : CLUSTER_GES_REDECLARE_REJECTED;
+	} else
+		result = cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder);
+	UT_ASSERT_EQ(result, CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT_EQ(cooperative_sleeps, 0);
+	if (result != CLUSTER_GES_REDECLARE_PENDING) {
+		cooperative_case = false;
+		return;
+	}
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 1);
+	UT_ASSERT_EQ(request_sent, 1);
+	ut_mock_now += 100000;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT_EQ(request_sent, 2);
+	reply = drive_redeclare_master(&req, NULL);
+	env.source_node_id = 3;
+	env.epoch = 2;
+	cluster_ges_reply_handler(&env, &reply);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	UT_ASSERT_EQ(cooperative_sleeps, 0);
+	UT_ASSERT_EQ(request_sent, 2);
+	cooperative_case = false;
+}
+
+UT_TEST(cooperative_redeclare_late_cut_cannot_publish_ack)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterICEnvelope env = { 0 };
+	GesReplyPayload reply;
+
+	setup_cooperative(&req);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	reply = drive_redeclare_master(&req, NULL);
+	ut_mock_epoch = 3;
+	env.source_node_id = 3;
+	env.epoch = 2;
+	cluster_ges_reply_handler(&env, &reply);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_CUT_CHANGED);
+	UT_ASSERT(!attempt.confirmed);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 1);
+	UT_ASSERT_EQ(cooperative_sleeps, 0);
+	cooperative_case = false;
+}
+
+UT_TEST(cooperative_redeclare_malformed_verdict_cannot_restart)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterICEnvelope env = { 0 };
+	GesReplyPayload reply;
+
+	setup_cooperative(&req);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	reply = drive_redeclare_master(&req, NULL);
+	/* The real wire handler permits this shape; it is not a usable verdict.
+	 * Keep the potentially installed holder's identity, without retrying an
+	 * internally contradictory result into a later apparent success. */
+	reply.opcode = GES_REPLY_OPCODE_REJECT;
+	reply.reject_reason = GES_REJECT_REASON_NONE;
+	env.source_node_id = 3;
+	env.epoch = 2;
+	cluster_ges_reply_handler(&env, &reply);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	ut_mock_now += 200000;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	UT_ASSERT(attempt.sent && !attempt.confirmed);
+	UT_ASSERT_EQ(attempt.key.request_id, 201);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	UT_ASSERT_EQ(request_sent, 1);
+	UT_ASSERT_EQ(cooperative_sleeps, 0);
+	cooperative_case = false;
+}
+
+UT_TEST(cooperative_redeclare_stale_queue_cannot_rebind_current_holder)
+{
+	for (int drift = 1; drift <= 3; drift++) {
+		ClusterLockAcquireRequest req;
+		ClusterGesRedeclareAttempt attempt = { 0 };
+		MasterPacket post;
+		GesReplyPayload reply;
+
+		setup_cooperative(&req);
+		UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+					 CLUSTER_GES_REDECLARE_PENDING);
+		cooperative_drift = drift;
+		reply = drive_redeclare_master(&req, &post);
+		UT_ASSERT_EQ(reply.opcode, GES_REPLY_OPCODE_REJECT);
+		UT_ASSERT_EQ(reply.reject_reason, drift == 3 ? GES_REJECT_REASON_MASTER_DEAD_NATIVE
+													 : GES_REJECT_REASON_EPOCH_MISMATCH);
+		UT_ASSERT_EQ(post.held_mode, ExclusiveLock);
+		UT_ASSERT_EQ(post.replies, 0);
+		cooperative_case = false;
+	}
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(27);
+	UT_PLAN(31);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -1144,6 +1405,10 @@ main(void)
 	UT_RUN(local_optimistic_generation_fence);
 	UT_RUN(local_master_uses_existing_holder);
 	UT_RUN(relation_native_error_has_full_interval_cleanup_owner);
+	UT_RUN(cooperative_redeclare_yields_then_consumes_real_grant);
+	UT_RUN(cooperative_redeclare_late_cut_cannot_publish_ack);
+	UT_RUN(cooperative_redeclare_malformed_verdict_cannot_restart);
+	UT_RUN(cooperative_redeclare_stale_queue_cannot_rebind_current_holder);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

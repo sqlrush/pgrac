@@ -452,13 +452,20 @@ cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 event_id)
 	stub_peer_done_hash = event_id;
 }
 
+static int stub_rebind_calls;
+static ClusterGrdHolderId stub_rebind_holder;
+static int stub_rebind_mode;
+static ClusterGrdEntryResult stub_rebind_result = CLUSTER_GRD_ENTRY_OK;
+
 ClusterGrdEntryResult
 cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute_unused(),
-										  const struct ClusterGrdHolderId *nh pg_attribute_unused(),
-										  int32 src pg_attribute_unused(),
-										  int lockmode pg_attribute_unused())
+										  const struct ClusterGrdHolderId *nh,
+										  int32 src pg_attribute_unused(), int lockmode)
 {
-	return CLUSTER_GRD_ENTRY_OK;
+	stub_rebind_calls++;
+	stub_rebind_holder = *nh;
+	stub_rebind_mode = lockmode;
+	return stub_rebind_result;
 }
 
 static int32 stub_remote_master = -1;
@@ -525,6 +532,13 @@ static uint64 stub_backend_request_enqueue_count = 0;
 static GesRequestPayload stub_backend_request_last;
 static GesReplyWaitEntry stub_reply_wait_entry;
 static uint64 stub_backend_request_ready_after = 0;
+static bool stub_cooperative_reply_table;
+static bool stub_cooperative_outbound_full;
+static bool stub_cooperative_reply_present;
+static bool stub_cooperative_change_cut_on_poll;
+static int stub_cooperative_cv_calls;
+static int stub_cooperative_inserts;
+static GesReplyWaitKey stub_cooperative_key;
 static uint64 stub_cancel_wait_enqueue_count = 0;
 static uint32 stub_cancel_wait_last_dest = 0;
 static GesCancelWaitPayload stub_cancel_wait_last;
@@ -676,6 +690,8 @@ cluster_grd_outbound_enqueue_backend_request(uint32 d pg_attribute_unused(), con
 	stub_backend_request_enqueue_count++;
 	if (p != NULL && l == sizeof(GesRequestPayload))
 		memcpy(&stub_backend_request_last, p, sizeof(stub_backend_request_last));
+	if (stub_cooperative_outbound_full)
+		return false;
 	if (stub_backend_request_ready_after > 0
 		&& stub_backend_request_enqueue_count >= stub_backend_request_ready_after) {
 		stub_reply_wait_entry.reject_reason = GES_REJECT_REASON_NONE;
@@ -944,12 +960,20 @@ cluster_grd_outbound_enqueue_lms_native_probe(uint32 dest, const void *p pg_attr
 static bool stub_reply_wait_insert_enabled = false;
 
 GesReplyWaitEntry *
-cluster_ges_reply_wait_insert(const GesReplyWaitKey *k pg_attribute_unused(),
-							  TimestampTz deadline pg_attribute_unused())
+cluster_ges_reply_wait_insert(const GesReplyWaitKey *k, TimestampTz deadline)
 {
 	if (!stub_reply_wait_insert_enabled)
 		return NULL;
+	if (stub_cooperative_reply_table) {
+		if (stub_cooperative_reply_present)
+			abort();
+		stub_cooperative_key = *k;
+		stub_cooperative_reply_present = true;
+		stub_cooperative_inserts++;
+	}
 	memset(&stub_reply_wait_entry, 0, sizeof(stub_reply_wait_entry));
+	stub_reply_wait_entry.key = *k;
+	stub_reply_wait_entry.deadline = deadline;
 	return &stub_reply_wait_entry;
 }
 GesReplyWaitEntry *
@@ -1204,10 +1228,22 @@ ConditionVariablePrepareToSleep(ConditionVariable *cv pg_attribute_unused())
 {}
 /* HW consumes the real reply table in test_cluster_hw_handoff. */
 GesReplyWaitPollResult
-cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key pg_attribute_unused(),
-									GesReplyWaitVerdict *verdict pg_attribute_unused())
+cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key, GesReplyWaitVerdict *verdict)
 {
-	abort();
+	if (!stub_cooperative_reply_table)
+		abort();
+	if (!stub_cooperative_reply_present || memcmp(key, &stub_cooperative_key, sizeof(*key)) != 0)
+		return GES_REPLY_WAIT_POLL_MISSING;
+	if (stub_reply_wait_entry.abandoned)
+		return GES_REPLY_WAIT_POLL_ABANDONED;
+	if (!stub_reply_wait_entry.ready)
+		return GES_REPLY_WAIT_POLL_PENDING;
+	verdict->reply_opcode = stub_reply_wait_entry.reply_opcode;
+	verdict->reject_reason = stub_reply_wait_entry.reject_reason;
+	stub_cooperative_reply_present = false;
+	if (stub_cooperative_change_cut_on_poll)
+		stub_master_generation++;
+	return GES_REPLY_WAIT_POLL_DELIVERED;
 }
 
 bool
@@ -1220,6 +1256,7 @@ ConditionVariableTimedSleep(ConditionVariable *cv pg_attribute_unused(),
 							long timeout pg_attribute_unused(),
 							uint32 wait_event pg_attribute_unused())
 {
+	stub_cooperative_cv_calls++;
 	if (stub_cv_now_after_sleep > 0)
 		stub_now = stub_cv_now_after_sleep;
 	if (stub_cv_grant_on_wait > 0 && ++stub_cv_waits >= stub_cv_grant_on_wait) {
@@ -1638,6 +1675,7 @@ UT_TEST(test_pre2_survivor_redeclare_master_rechecks_before_rebind)
 	req.holder_procno = 41;
 	req.holder_request_id_lo = 99;
 	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	req.shard_master_generation_lo = 1;
 	memcpy(req.resid, &resid, sizeof(resid));
 	env.source_node_id = 1;
 	env.epoch = stub_current_epoch;
@@ -2532,10 +2570,282 @@ UT_TEST(test_ges_probe_validates_identity_then_obeys_final_stop_seal)
 	stub_stop_read_allowed = true;
 }
 
+/* Real GES scheduling with a controlled exact-key transport boundary. The
+ * breaks caught are false ACK, replacement of an in-flight identity, and
+ * blocking the service process on its own reply. Author: SqlRush */
+static void
+cooperative_fixture(ClusterResId *resid, ClusterGrdHolderId *holder)
+{
+	memset(resid, 0, sizeof(*resid));
+	resid->type = CLUSTER_CF_RESID_TYPE;
+	resid->lockmethodid = DEFAULT_LOCKMETHOD;
+	memset(holder, 0, sizeof(*holder));
+	holder->node_id = 0;
+	holder->procno = 41;
+	holder->cluster_epoch = 81;
+	holder->request_id = 5522;
+	cluster_node_id = 0;
+	stub_current_epoch = 81;
+	stub_master_generation = 71;
+	stub_remote_master = 7;
+	stub_master_unknown = false;
+	stub_remaster_on_second_lookup = false;
+	stub_master_gen_lookup_calls = 0;
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	stub_survivor_protocol_ready = true;
+	stub_recovery_ready = stub_recovery_transport_ready = false;
+	stub_cooperative_reply_table = true;
+	stub_reply_wait_insert_enabled = true;
+	stub_cooperative_reply_present = false;
+	stub_cooperative_change_cut_on_poll = false;
+	stub_cooperative_outbound_full = false;
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 0;
+	stub_cooperative_inserts = stub_cooperative_cv_calls = 0;
+	stub_rebind_calls = 0;
+	stub_rebind_result = CLUSTER_GRD_ENTRY_OK;
+	stub_clock_advances = false;
+	stub_now = 1000000;
+	memset(&stub_reply_wait_entry, 0, sizeof(stub_reply_wait_entry));
+}
+
+static void
+cooperative_reply(uint32 opcode, uint32 reason)
+{
+	stub_reply_wait_entry.ready = true;
+	stub_reply_wait_entry.reply_opcode = opcode;
+	stub_reply_wait_entry.reject_reason = reason;
+}
+
+UT_TEST(test_redeclare_poll_pending_keeps_one_identity_without_sleep)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	GesRequestPayload first;
+
+	cooperative_fixture(&resid, &holder);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT(attempt.initialized && attempt.wait_registered && attempt.sent);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 1);
+	UT_ASSERT_EQ(stub_cooperative_inserts, 1);
+	UT_ASSERT_EQ(stub_reply_wait_entry.deadline, 0);
+	first = stub_backend_request_last;
+	UT_ASSERT_EQ(first.opcode, GES_REQ_OPCODE_REDECLARE);
+	UT_ASSERT_EQ(first.holder_request_id_lo, 5522);
+	UT_ASSERT_EQ(first.holder_cluster_epoch_lo, 81);
+	UT_ASSERT_EQ(first.shard_master_generation_lo, 71);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 1);
+	stub_now += 100000;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 2);
+	UT_ASSERT_EQ(memcmp(&first, &stub_backend_request_last, sizeof(first)), 0);
+	UT_ASSERT_EQ(stub_cooperative_inserts, 1);
+	UT_ASSERT_EQ(stub_cooperative_cv_calls, 0);
+}
+
+UT_TEST(test_redeclare_poll_late_grant_confirms_only_exact_attempt)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+
+	cooperative_fixture(&resid, &holder);
+	(void)cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder);
+	stub_now += INT64CONST(120000000);
+	cooperative_reply(GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	UT_ASSERT(attempt.confirmed && !attempt.wait_registered);
+	UT_ASSERT(!stub_cooperative_reply_present);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 1);
+	UT_ASSERT_EQ(stub_cooperative_cv_calls, 0);
+}
+
+UT_TEST(test_redeclare_poll_mismatched_inputs_never_replace_pending)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 }, saved;
+	ClusterResId resid, other;
+	ClusterGrdHolderId holder, changed;
+
+	cooperative_fixture(&resid, &holder);
+	(void)cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder);
+	saved = attempt;
+	other = resid;
+	other.field1 = 999;
+	changed = holder;
+	changed.request_id++;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &other, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ExclusiveLock, &holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &changed),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	UT_ASSERT_EQ(memcmp(&attempt, &saved, sizeof(saved)), 0);
+	UT_ASSERT(stub_cooperative_reply_present);
+	cooperative_reply(GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+}
+
+UT_TEST(test_redeclare_poll_capacity_refusal_retains_reply_and_retry_key)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	GesRequestPayload first;
+
+	cooperative_fixture(&resid, &holder);
+	stub_cooperative_outbound_full = true;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT(attempt.wait_registered);
+	UT_ASSERT(!attempt.sent && !attempt.confirmed);
+	first = stub_backend_request_last;
+	stub_cooperative_outbound_full = false;
+	stub_now += 100000;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT(attempt.sent);
+	UT_ASSERT_EQ(stub_cooperative_inserts, 1);
+	UT_ASSERT_EQ(memcmp(&first, &stub_backend_request_last, sizeof(first)), 0);
+	cooperative_reply(GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+}
+
+UT_TEST(test_redeclare_poll_cut_changes_never_ack_or_forget)
+{
+	for (int scenario = 0; scenario < 4; scenario++) {
+		ClusterGesRedeclareAttempt attempt = { 0 };
+		ClusterResId resid;
+		ClusterGrdHolderId holder;
+
+		cooperative_fixture(&resid, &holder);
+		(void)cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder);
+		if (scenario == 0)
+			stub_current_epoch++;
+		else if (scenario == 1)
+			stub_master_generation++;
+		else if (scenario == 2)
+			stub_remote_master = 3;
+		else
+			stub_master_unknown = true;
+		cooperative_reply(GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);
+		UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+					 CLUSTER_GES_REDECLARE_CUT_CHANGED);
+		UT_ASSERT(!attempt.confirmed && attempt.wait_registered);
+		UT_ASSERT(stub_cooperative_reply_present);
+		UT_ASSERT_EQ(attempt.key.request_id, 5522);
+	}
+}
+
+UT_TEST(test_redeclare_poll_readiness_loss_preserves_late_ack)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+
+	cooperative_fixture(&resid, &holder);
+	(void)cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder);
+	stub_survivor_protocol_ready = false;
+	cooperative_reply(GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT(stub_cooperative_reply_present && !attempt.confirmed);
+	stub_survivor_protocol_ready = true;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	stub_survivor_protocol_ready = false;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+}
+
+UT_TEST(test_redeclare_poll_local_rebind_is_not_fresh_acquisition)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+	uint64 mutations;
+
+	cooperative_fixture(&resid, &holder);
+	stub_remote_master = 0;
+	mutations = stub_master_grant_mutation_count;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	UT_ASSERT_EQ(stub_rebind_calls, 1);
+	UT_ASSERT_EQ(stub_rebind_holder.request_id, 5522);
+	UT_ASSERT_EQ(stub_rebind_mode, ShareLock);
+	UT_ASSERT_EQ(stub_master_grant_mutation_count, mutations);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 0);
+	UT_ASSERT_EQ(stub_cooperative_inserts, 0);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	UT_ASSERT_EQ(stub_rebind_calls, 1);
+}
+
+UT_TEST(test_redeclare_poll_invalid_or_unknown_route_never_grants)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+
+	cooperative_fixture(&resid, &holder);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(NULL, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, NULL, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, NoLock, &holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	holder.request_id = 0;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_INVALID);
+	holder.request_id = 5522;
+	stub_master_unknown = true;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT(!attempt.initialized);
+	UT_ASSERT_EQ(stub_rebind_calls, 0);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 0);
+}
+
+UT_TEST(test_redeclare_poll_reject_and_post_reply_cut_are_not_ack)
+{
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterResId resid;
+	ClusterGrdHolderId holder;
+
+	cooperative_fixture(&resid, &holder);
+	(void)cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder);
+	cooperative_reply(GES_REPLY_OPCODE_REJECT, GES_REJECT_REASON_LOCK_CONFLICT);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_REJECTED);
+	UT_ASSERT_EQ(attempt.reject_reason, GES_REJECT_REASON_LOCK_CONFLICT);
+	UT_ASSERT(!attempt.confirmed && !attempt.wait_registered);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_REJECTED);
+	memset(&attempt, 0, sizeof(attempt));
+	cooperative_fixture(&resid, &holder);
+	(void)cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder);
+	cooperative_reply(GES_REPLY_OPCODE_GRANT, GES_REJECT_REASON_NONE);
+	stub_cooperative_change_cut_on_poll = true;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CUT_CHANGED);
+	UT_ASSERT_EQ(attempt.key.request_id, 5522);
+	UT_ASSERT(!attempt.wait_registered);
+}
+
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(38);
+	UT_PLAN(47);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -2575,6 +2885,15 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_probe_validates_identity_then_obeys_final_stop_seal);
 	UT_RUN(test_retry_allowance_does_not_preempt_original_wait_deadline);
 	UT_RUN(test_exact_cancel_completes_original_dedup_identity);
+	UT_RUN(test_redeclare_poll_pending_keeps_one_identity_without_sleep);
+	UT_RUN(test_redeclare_poll_late_grant_confirms_only_exact_attempt);
+	UT_RUN(test_redeclare_poll_mismatched_inputs_never_replace_pending);
+	UT_RUN(test_redeclare_poll_capacity_refusal_retains_reply_and_retry_key);
+	UT_RUN(test_redeclare_poll_cut_changes_never_ack_or_forget);
+	UT_RUN(test_redeclare_poll_readiness_loss_preserves_late_ack);
+	UT_RUN(test_redeclare_poll_local_rebind_is_not_fresh_acquisition);
+	UT_RUN(test_redeclare_poll_invalid_or_unknown_route_never_grants);
+	UT_RUN(test_redeclare_poll_reject_and_post_reply_cut_are_not_ack);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
