@@ -6241,6 +6241,33 @@ UT_TEST(test_pre2_recovery_launch_same_cut_keeps_exact_duty)
 	cluster_shared_config = false;
 }
 
+/* The event is an observation, not the GRD's later accepted episode.
+ * A PRE2 launch must carry that current accepted epoch to the replay owner. */
+UT_TEST(test_pre2_recovery_launch_stamps_accepted_survivor_episode)
+{
+	ClusterThreadRecLaunchEligibility eligibility;
+	ReconfigEvent event = recovery_eligibility_fixture();
+
+	cluster_shared_config = true;
+	ut_recovery_control_ready = true;
+	event.old_epoch = 6;
+	event.new_epoch = 6;
+	event.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+	cluster_reconfig_publish_event(&event);
+	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(ut_recovery_root_calls, 1);
+	UT_ASSERT_EQ(eligibility.attempt_stamp, 7);
+	UT_ASSERT(memcmp(&eligibility.duty, &ut_recovery_root_identity, sizeof(eligibility.duty)) == 0);
+
+	event.new_epoch = 8;
+	cluster_reconfig_publish_event(&event);
+	ut_recovery_root_calls = 0;
+	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(ut_recovery_root_calls, 0);
+	UT_ASSERT_EQ(eligibility.attempt_stamp, 0);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_rejoin_observed_slot_getter_is_coherent)
 {
 	uint64 incarnation = UINT64_MAX;
@@ -6935,7 +6962,7 @@ UT_TEST(test_stop_reconfig_actual_formation_owner)
 int
 main(void)
 {
-	UT_PLAN(125);
+	UT_PLAN(126);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -6948,6 +6975,7 @@ main(void)
 	UT_RUN(test_pre2_recovery_launch_rechecks_event_after_cf);
 	UT_RUN(test_pre2_recovery_launch_rechecks_protocol_cut_after_cf);
 	UT_RUN(test_pre2_recovery_launch_same_cut_keeps_exact_duty);
+	UT_RUN(test_pre2_recovery_launch_stamps_accepted_survivor_episode);
 	UT_RUN(test_rejoin_observed_slot_getter_is_coherent);
 	UT_RUN(test_rejoin_failure_snapshot_requires_exact_nonempty_survivors_and_floor);
 	UT_RUN(test_rejoin_pending_snapshot_requires_exact_singleton_lineage);

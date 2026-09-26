@@ -2288,7 +2288,9 @@ cluster_grd_recovery_control_snapshot(uint16 origin_thread,
 	origin_node = (int32)origin_thread - 1;
 	cluster_reconfig_get_last_event(&event);
 	observed.event_id = event.event_id;
-	observed.episode_epoch = event.new_epoch;
+	/* A non-coordinator's event retains its pre-piggyback observation.
+	 * The GRD owner, not that historical observation, fixes this cut's epoch. */
+	observed.episode_epoch = pg_atomic_read_u64(&cluster_grd_state->recovery_episode_epoch);
 	observed.dead_bitmap_hash = cluster_grd_dead_bitmap_hash(event.dead_bitmap);
 	observed.redeclare_generation =
 		pg_atomic_read_u64(&cluster_grd_state->recovery_redeclare_generation);
@@ -2297,7 +2299,8 @@ cluster_grd_recovery_control_snapshot(uint16 origin_thread,
 	observed.routing_generation = cluster_lms_get_shard_master_generation();
 	memcpy(observed.dead_bitmap, event.dead_bitmap, sizeof(observed.dead_bitmap));
 	if (event.reconfig_kind != RECONFIG_KIND_FAIL_STOP || observed.event_id == 0
-		|| observed.episode_epoch == 0 || observed.dead_bitmap_hash == 0
+		|| observed.episode_epoch == 0 || event.new_epoch == 0
+		|| event.new_epoch > observed.episode_epoch || observed.dead_bitmap_hash == 0
 		|| observed.redeclare_generation == 0 || observed.master_map_refresh == 0
 		|| observed.routing_generation == 0
 		|| (observed.dead_bitmap[origin_node / 8] & (1u << (origin_node % 8))) == 0
@@ -2345,11 +2348,11 @@ cluster_grd_recovery_control_snapshot(uint16 origin_thread,
 
 	/* No authority is minted by an observation assembled across a new cut. */
 	cluster_reconfig_get_last_event(&after);
-	if (after.event_id != observed.event_id || after.new_epoch != observed.episode_epoch
+	if (after.event_id != observed.event_id || after.new_epoch != event.new_epoch
 		|| after.reconfig_kind != RECONFIG_KIND_FAIL_STOP
 		|| memcmp(after.dead_bitmap, observed.dead_bitmap, sizeof(observed.dead_bitmap)) != 0
-		|| cluster_epoch_get_current() != observed.episode_epoch
-		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage()
+		|| cluster_epoch_get_current() != observed.episode_epoch || !cluster_qvotec_in_quorum()
+		|| cluster_reconfig_has_pending_prebump_stage()
 		|| pg_atomic_read_u32(&cluster_grd_state->recovery_state) != GRD_RECOVERY_WAIT_CLUSTER
 		|| pg_atomic_read_u32(&cluster_grd_state->recovery_direction) != GRD_REMASTER_DIR_FAIL
 		|| pg_atomic_read_u64(&cluster_grd_state->recovery_last_event_id) != observed.event_id

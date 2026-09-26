@@ -135,7 +135,9 @@ ges_request_shard_master_generation(const GesRequestPayload *req)
  * REDECLARE/REDECLARE_DONE traffic that establishes the pre-publication GRD
  * seal.  RECOVERY_READY additionally admits the StartupProcess CF(S)/WALR(X)
  * request and release legs.  SERVING_READY retains the existing full GES
- * surface; an unmanaged pre-Scheme-A boot retains legacy behavior. */
+ * surface. A retained PRE2 survivor may reconstruct existing holders during
+ * its exact failure episode, without granting ordinary acquisitions; an
+ * unmanaged pre-Scheme-A boot retains legacy behavior. */
 static bool
 ges_recovery_release_resid_allowed(const ClusterResId *resid)
 {
@@ -171,13 +173,29 @@ ges_readiness_allows_early_opcode(uint32 opcode)
 		 * done slots) — the strict transport check therefore deadlocks
 		 * the rejoiner (see cluster_recovery_transport_components_current).
 		 * REDECLARE_DONE only mutates monotonic done arrays; every other
-		 * early opcode keeps the strict transport requirement.
+		 * early opcode keeps its own gate. A PRE2 survivor similarly needs
+		 * these DONE inputs before it can republish its serving seal.
 		 */
-		allowed = cluster_recovery_transport_components_current();
+		allowed = cluster_recovery_transport_components_current()
+				  || cluster_recovery_transport_is_current();
 		return allowed;
 	}
 	return opcode == GES_REQ_OPCODE_REQUEST || opcode == GES_REQ_OPCODE_RELEASE
 		   || opcode == GES_REQ_OPCODE_REDECLARE;
+}
+
+/* PGRAC: a current PRE2 failure survivor reconstructs all existing registered
+ * holders. Startup keeps its narrower CF(S)/WALR(X) surface. Neither branch
+ * admits a new acquisition; callers must use this only for REDECLARE.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ges_readiness_allows_redeclare(const ClusterResId *resid, LOCKMODE mode)
+{
+	if (resid == NULL || mode < AccessShareLock || mode > AccessExclusiveLock
+		|| !cluster_recovery_transport_is_current())
+		return false;
+	return cluster_authority_readiness_get() == CLUSTER_AUTHORITY_SERVING_READY
+		   || cluster_recovery_authority_resid_mode_allowed(resid, mode);
 }
 
 static bool
@@ -188,8 +206,7 @@ ges_readiness_allows_protocol_request(uint32 opcode, const ClusterResId *resid, 
 	if (cluster_serving_ready_is_current())
 		return true;
 	if (opcode == GES_REQ_OPCODE_REDECLARE)
-		return cluster_recovery_transport_is_current()
-			   && cluster_recovery_authority_resid_mode_allowed(resid, mode);
+		return ges_readiness_allows_redeclare(resid, mode);
 	if (!cluster_recovery_authority_is_current())
 		return false;
 	if (opcode == GES_REQ_OPCODE_REQUEST)
@@ -224,8 +241,7 @@ ges_readiness_allows_grant(const ClusterGrdGrantIdentity *grant, const ClusterRe
 	if (grant == NULL || resid == NULL)
 		return false;
 	if (grant->request_opcode == GES_REQ_OPCODE_REDECLARE)
-		return cluster_recovery_transport_is_current()
-			   && cluster_recovery_authority_resid_mode_allowed(resid, grant->mode);
+		return ges_readiness_allows_redeclare(resid, grant->mode);
 	return grant->request_opcode == GES_REQ_OPCODE_REQUEST
 		   && cluster_recovery_authority_is_current()
 		   && cluster_recovery_authority_resid_mode_allowed(resid, grant->mode);
@@ -242,8 +258,7 @@ ges_readiness_allows_local_origin(uint32 opcode, const ClusterResId *resid, LOCK
 	if (current_mode != NoLock)
 		return false;
 	if (opcode == GES_REQ_OPCODE_REDECLARE)
-		return cluster_recovery_transport_is_current()
-			   && cluster_recovery_authority_resid_mode_allowed(resid, mode);
+		return ges_readiness_allows_redeclare(resid, mode);
 	if (opcode != GES_REQ_OPCODE_REQUEST)
 		return false;
 	return cluster_recovery_authority_request_allowed(resid, mode, AmStartupProcess());

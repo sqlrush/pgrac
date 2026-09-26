@@ -3635,6 +3635,7 @@ int cluster_phase3_timeout = 600;
 int cluster_phase4_timeout = 30;
 /* Spec-1.11 Sprint B: cluster_startup_phase.c references cluster_enabled */
 bool cluster_enabled = true;
+bool cluster_shared_config = false;
 /* Spec-2.1 D1: cluster_startup_phase.c + cluster_conf.c reference allow_single_node */
 bool cluster_allow_single_node = true;
 /* spec-2.6 Q7 validator: cluster_startup_phase.c reads cluster_voting_disks */
@@ -3785,6 +3786,37 @@ cluster_grd_serving_authority_rebind_leaver(
 
 bool
 cluster_grd_join_remaster_in_progress(void)
+{
+	return false;
+}
+
+/* PGRAC: inert recovery-transport observations for this dump-only binary. */
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_recovery_event_bitmap_hash_value(void)
+{
+	return 0;
+}
+
+uint64
+cluster_grd_dead_bitmap_hash(const uint8 *bitmap pg_attribute_unused())
+{
+	return 0;
+}
+
+void
+cluster_reconfig_get_last_event(ReconfigEvent *out)
+{
+	memset(out, 0, sizeof(*out));
+}
+
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
 {
 	return false;
 }

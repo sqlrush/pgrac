@@ -89,7 +89,7 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 	 * progress. This observation is not a lock grant or DATA recovery proof. */
 	if (cluster_shared_config
 		&& (!cluster_grd_recovery_control_snapshot(origin_thread, &before)
-			|| before.event_id != event.event_id || before.episode_epoch != event.new_epoch
+			|| before.event_id != event.event_id || before.episode_epoch < event.new_epoch
 			|| memcmp(before.dead_bitmap, event.dead_bitmap, sizeof(event.dead_bitmap)) != 0))
 		return false;
 	root_result = cluster_control_root_lookup_owner_by_node_runtime(origin_node, &identity,
@@ -113,7 +113,9 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 			return false;
 	}
 	out->origin_thread = origin_thread;
-	out->attempt_stamp = event.new_epoch;
+	/* Survivor observations may predate the coordinator's epoch piggyback;
+	 * PRE2 attempts belong to the exact accepted protocol cut instead. */
+	out->attempt_stamp = cluster_shared_config ? before.episode_epoch : event.new_epoch;
 	out->duty = identity;
 	return true;
 #endif

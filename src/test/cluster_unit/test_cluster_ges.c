@@ -259,6 +259,7 @@ static bool stub_authority_managed = false;
 static bool stub_serving_ready = false;
 static bool stub_recovery_ready = false;
 static bool stub_recovery_transport_ready = false;
+static bool stub_survivor_protocol_ready = false;
 
 static uint64 stub_replacement_capability_sample_count = 0;
 static uint32 stub_replacement_required_capabilities = 0;
@@ -305,7 +306,14 @@ cluster_recovery_authority_is_current(void)
 bool
 cluster_recovery_transport_is_current(void)
 {
-	return stub_recovery_transport_ready || stub_recovery_ready;
+	return stub_recovery_transport_ready || stub_recovery_ready || stub_survivor_protocol_ready;
+}
+
+ClusterAuthorityReadiness
+cluster_authority_readiness_get(void)
+{
+	return stub_survivor_protocol_ready ? CLUSTER_AUTHORITY_SERVING_READY
+										: CLUSTER_AUTHORITY_STARTING;
 }
 
 /* RF-ROOT P6 (crash-rejoin): the REDECLARE_DONE ingress gate consults the
@@ -430,13 +438,19 @@ cluster_cancel_token_consume(void)
 	return false;
 }
 
-/* spec-4.6 P0#3 stub:  REDECLARE_DONE handler records peer barrier
- * completion.  Standalone fixture has no recovery shmem; no-op. */
+/* Observe the real handler's boundary; GRD convergence is tested separately. */
+static int stub_peer_done_count;
+static int32 stub_peer_done_node;
+static uint64 stub_peer_done_epoch;
+static uint64 stub_peer_done_hash;
 void
-cluster_grd_recovery_mark_peer_done(int32 node pg_attribute_unused(),
-									uint64 epoch pg_attribute_unused(),
-									uint64 event_id pg_attribute_unused())
-{}
+cluster_grd_recovery_mark_peer_done(int32 node, uint64 epoch, uint64 event_id)
+{
+	stub_peer_done_count++;
+	stub_peer_done_node = node;
+	stub_peer_done_epoch = epoch;
+	stub_peer_done_hash = event_id;
+}
 
 ClusterGrdEntryResult
 cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute_unused(),
@@ -1550,6 +1564,135 @@ UT_TEST(test_ges_starting_redeclare_uses_preseal_transport_only)
 }
 
 
+/* Break caught: a retained survivor must rebuild ordinary existing grants,
+ * not only the startup CF(S)/WALR(X) allowlist. New acquisitions stay frozen. */
+UT_TEST(test_pre2_survivor_redeclare_send_does_not_open_requests)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+
+	resid.type = LOCKTAG_RELATION;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	resid.field1 = 5;
+	resid.field2 = 16386;
+	holder.node_id = 0;
+	holder.procno = 41;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = UINT64_C(0x5522);
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	stub_survivor_protocol_ready = true;
+	stub_remote_master = 7;
+	stub_reply_wait_insert_enabled = true;
+	stub_backend_request_enqueue_count = 0;
+	stub_backend_request_ready_after = 1;
+	UT_ASSERT_EQ(cluster_ges_send_redeclare_and_wait(&resid, ShareLock, &holder, holder.request_id),
+				 GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 1);
+	stub_backend_request_enqueue_count = 0;
+	UT_ASSERT_EQ(
+		cluster_ges_send_request_and_wait(&resid, ShareLock, &holder, holder.request_id, 1, 0),
+		GES_REJECT_REASON_SHARD_FROZEN);
+	UT_ASSERT_EQ(stub_backend_request_enqueue_count, 0);
+	stub_survivor_protocol_ready = false;
+	UT_ASSERT_EQ(cluster_ges_send_redeclare_and_wait(&resid, ShareLock, &holder, holder.request_id),
+				 GES_REJECT_REASON_SHARD_FROZEN);
+	stub_authority_managed = false;
+	stub_remote_master = -1;
+	stub_reply_wait_insert_enabled = false;
+	stub_backend_request_ready_after = 0;
+}
+
+UT_TEST(test_pre2_survivor_redeclare_master_rechecks_before_rebind)
+{
+	ClusterResId resid = { 0 };
+	ClusterICEnvelope env = { 0 };
+	GesRequestPayload req = { 0 };
+	uint64 enqueued;
+	uint64 ordinary_mutations;
+
+	resid.type = LOCKTAG_RELATION;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	resid.field1 = 5;
+	resid.field2 = 16386;
+	req.opcode = GES_REQ_OPCODE_REDECLARE;
+	req.lockmode = ShareLock;
+	req.holder_node_id = 1;
+	req.holder_procno = 41;
+	req.holder_request_id_lo = 99;
+	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	memcpy(req.resid, &resid, sizeof(resid));
+	env.source_node_id = 1;
+	env.epoch = stub_current_epoch;
+	env.payload_length = sizeof(req);
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	stub_survivor_protocol_ready = true;
+	enqueued = stub_work_queue_enqueue_count;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued + 1);
+	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.source_node_id = 1;
+	stub_work_queue_dequeue_item.payload_len = sizeof(req);
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+	ordinary_mutations = stub_master_grant_mutation_count;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(stub_lmon_reply_last.opcode, GES_REPLY_OPCODE_GRANT);
+	UT_ASSERT_EQ(stub_lmon_reply_last.reply_for_opcode, GES_REQ_OPCODE_REDECLARE);
+	UT_ASSERT_EQ(stub_master_grant_mutation_count, ordinary_mutations);
+
+	stub_survivor_protocol_ready = false;
+	stub_work_queue_dequeue_pending = true;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(stub_lmon_reply_last.opcode, GES_REPLY_OPCODE_REJECT);
+	stub_survivor_protocol_ready = true;
+	req.opcode = GES_REQ_OPCODE_REQUEST;
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+	UT_ASSERT_EQ(stub_lmon_reply_last.opcode, GES_REPLY_OPCODE_REJECT);
+	UT_ASSERT_EQ(stub_master_grant_mutation_count, ordinary_mutations);
+	stub_survivor_protocol_ready = false;
+	stub_authority_managed = false;
+}
+
+UT_TEST(test_pre2_survivor_done_retains_envelope_checks)
+{
+	ClusterICEnvelope env = { 0 };
+	GesRequestPayload req = { 0 };
+	int before = stub_peer_done_count;
+	uint64 enqueued = stub_work_queue_enqueue_count;
+
+	stub_authority_managed = true;
+	stub_survivor_protocol_ready = true;
+	req.opcode = GES_REQ_OPCODE_REDECLARE_DONE;
+	req.holder_node_id = 1;
+	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	req.holder_request_id_lo = UINT32_C(0x5511);
+	env.source_node_id = 1;
+	env.epoch = stub_current_epoch;
+	env.payload_length = sizeof(req);
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_peer_done_count, before + 1);
+	UT_ASSERT_EQ(stub_peer_done_node, 1);
+	UT_ASSERT_EQ(stub_peer_done_epoch, stub_current_epoch);
+	UT_ASSERT_EQ(stub_peer_done_hash, UINT64_C(0x5511));
+	UT_ASSERT_EQ(stub_work_queue_enqueue_count, enqueued);
+	env.source_node_id = 2;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_peer_done_count, before + 1);
+	env.source_node_id = 1;
+	req.holder_cluster_epoch_lo++;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_peer_done_count, before + 1);
+	req.holder_cluster_epoch_lo--;
+	stub_survivor_protocol_ready = false;
+	cluster_ges_request_handler(&env, &req);
+	UT_ASSERT_EQ(stub_peer_done_count, before + 1);
+	stub_authority_managed = false;
+}
+
 static ClusterReplacementWireMessage
 make_ges_phase3_message(uint32 phase)
 {
@@ -2137,7 +2280,7 @@ UT_TEST(test_ges_probe_validates_identity_then_obeys_final_stop_seal)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(30);
+	UT_PLAN(33);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -2151,6 +2294,9 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_recovery_ingress_exact_allowlist);
 	UT_RUN(test_ges_recovery_master_rechecks_before_mutation);
 	UT_RUN(test_ges_starting_redeclare_uses_preseal_transport_only);
+	UT_RUN(test_pre2_survivor_redeclare_send_does_not_open_requests);
+	UT_RUN(test_pre2_survivor_redeclare_master_rechecks_before_rebind);
+	UT_RUN(test_pre2_survivor_done_retains_envelope_checks);
 	UT_RUN(test_ges_phase3_early_dispatch_enqueues_formation_handoff);
 	UT_RUN(test_ges_nonphase3_opcode18_never_falls_into_legacy_classifier);
 	UT_RUN(test_ges_reply_valid_payload_echoes_local_holder);

@@ -48,6 +48,7 @@
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_grd.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_recovery_duty.h"
@@ -397,6 +398,15 @@ static ClusterMembershipState phase_test_nonmember_state = CLUSTER_MEMBER_JOININ
 static bool phase_test_self_join_admitted = false;
 static uint64 phase_test_episode_epoch = 0;
 static bool phase_test_join_remaster = false;
+bool cluster_shared_config = false;
+static ReconfigEvent phase_test_protocol_event;
+static uint32 phase_test_protocol_state = GRD_RECOVERY_IDLE;
+static uint64 phase_test_protocol_event_id;
+static uint64 phase_test_protocol_hash;
+static uint64 phase_test_protocol_generation;
+static bool phase_test_protocol_prebump;
+static bool phase_test_protocol_drift;
+static int phase_test_protocol_event_reads;
 /* RF-ROOT P6 (contract-verify-early): the phase-3 handler passes DataDir to
  * the verify stub; the pure unit harness has no data directory. */
 char *DataDir = NULL;
@@ -751,6 +761,51 @@ cluster_grd_join_remaster_in_progress(void)
 	return phase_test_join_remaster;
 }
 
+/* Real readiness consumer, substituted shared GRD/event observations. */
+uint32
+cluster_grd_recovery_state_value(void)
+{
+	return phase_test_protocol_state;
+}
+
+uint64
+cluster_grd_recovery_last_event_id(void)
+{
+	return phase_test_protocol_event_id;
+}
+
+uint64
+cluster_grd_recovery_event_bitmap_hash_value(void)
+{
+	return phase_test_protocol_hash;
+}
+
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return phase_test_protocol_generation;
+}
+
+uint64
+cluster_grd_dead_bitmap_hash(const uint8 *bitmap)
+{
+	return bitmap[0] == 2 ? UINT64_C(0x5511) : UINT64_C(0x6611);
+}
+
+bool
+cluster_reconfig_has_pending_prebump_stage(void)
+{
+	return phase_test_protocol_prebump;
+}
+
+void
+cluster_reconfig_get_last_event(ReconfigEvent *out)
+{
+	*out = phase_test_protocol_event;
+	if (phase_test_protocol_drift && ++phase_test_protocol_event_reads > 1)
+		out->event_id++;
+}
+
 /* RF-ROOT P6 (contract-verify-early + THREAD_OPEN wiring): unit stubs for the
  * phase-3 handler's new collaborators.  Deliberate no-ops — the pure unit
  * harness has no DataDir/control-root/epoch subsystem, and the phase4 event-
@@ -878,6 +933,17 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_membership_member = true;
 	phase_test_nonmember_state = CLUSTER_MEMBER_JOINING;
 	phase_test_self_join_admitted = true;
+	cluster_shared_config = false;
+	memset(&phase_test_protocol_event, 0, sizeof(phase_test_protocol_event));
+	phase_test_protocol_state = GRD_RECOVERY_IDLE;
+	phase_test_protocol_event_id = 0;
+	phase_test_protocol_hash = 0;
+	phase_test_protocol_generation = 0;
+	phase_test_protocol_prebump = false;
+	phase_test_protocol_drift = false;
+	phase_test_protocol_event_reads = 0;
+	phase_test_episode_epoch = 0;
+	phase_test_join_remaster = false;
 	cluster_enabled = true;
 	cluster_wal_threads_dir = formed_registry ? "/rf-a1/formed" : NULL;
 	cluster_phase_shmem_init();
@@ -1408,6 +1474,162 @@ UT_TEST(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery)
 	UT_ASSERT(cluster_serving_ready_is_current());
 }
 
+static void
+setup_survivor_protocol_fixture(void)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_run_phase4_sequence();
+	UT_ASSERT(cluster_serving_ready_is_current());
+	cluster_shared_config = true;
+	phase_test_formation_epoch = 2;
+	phase_test_episode_epoch = 2;
+	phase_test_grd_authority_ok = false;
+	phase_test_protocol_event.event_id = 91;
+	phase_test_protocol_event.new_epoch = 2;
+	phase_test_protocol_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	phase_test_protocol_event.dead_bitmap[0] = 2;
+	phase_test_protocol_event_id = 91;
+	phase_test_protocol_hash = UINT64_C(0x5511);
+	phase_test_protocol_generation = 7;
+	phase_test_protocol_state = GRD_RECOVERY_WAIT_BARRIER;
+}
+
+/* Break caught: waiting for the serving seal drops the very REDECLARE
+ * messages that rebuild it. This is not permission to acquire CF or DATA. */
+UT_TEST(test_pre2_survivor_reconstruction_precedes_serving)
+{
+	ClusterResId cf = { 0 };
+
+	setup_survivor_protocol_fixture();
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	phase_test_protocol_state = GRD_RECOVERY_WAIT_CLUSTER;
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	UT_ASSERT(!cluster_recovery_transport_components_current());
+	UT_ASSERT(!cluster_recovery_authority_is_current());
+	cf.type = CLUSTER_CF_RESID_TYPE;
+	cf.lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, true));
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+}
+
+UT_TEST(test_pre2_survivor_reconstruction_rejects_wrong_episode)
+{
+	int variant;
+
+	for (variant = 0; variant < 12; variant++) {
+		setup_survivor_protocol_fixture();
+		UT_ASSERT(cluster_recovery_transport_is_current());
+		switch (variant) {
+		case 0:
+			phase_test_protocol_event_id++;
+			break;
+		case 1:
+			phase_test_protocol_event.new_epoch++;
+			break;
+		case 2:
+			phase_test_episode_epoch++;
+			break;
+		case 3:
+			phase_test_protocol_hash++;
+			break;
+		case 4:
+			phase_test_protocol_state = GRD_RECOVERY_IDLE;
+			break;
+		case 5:
+			phase_test_protocol_state = GRD_RECOVERY_WAIT_EPOCH;
+			break;
+		case 6:
+			phase_test_protocol_event.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+			break;
+		case 7:
+			phase_test_protocol_event.dead_bitmap[0] = 3;
+			break;
+		case 8:
+			phase_test_protocol_prebump = true;
+			break;
+		case 9:
+			phase_test_protocol_generation = 0;
+			break;
+		case 10:
+			phase_test_protocol_event.event_id = 0;
+			break;
+		case 11:
+			phase_test_protocol_event.dead_bitmap[0] = 0;
+			phase_test_protocol_hash = UINT64_C(0x6611);
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_transport_is_current());
+	}
+}
+
+/* The non-coordinator records E before learning the coordinator's E+1.
+ * Requiring that old observation to be rewritten strands valid survivors. */
+UT_TEST(test_pre2_survivor_reconstruction_accepts_prebump_observation)
+{
+	setup_survivor_protocol_fixture();
+	phase_test_protocol_event.old_epoch = 1;
+	phase_test_protocol_event.new_epoch = 1;
+	phase_test_protocol_event.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(!cluster_recovery_transport_components_current());
+	phase_test_protocol_state = GRD_RECOVERY_WAIT_CLUSTER;
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	phase_test_protocol_event.new_epoch = 0;
+	UT_ASSERT(!cluster_recovery_transport_is_current());
+}
+
+UT_TEST(test_pre2_survivor_reconstruction_rejects_component_loss)
+{
+	int variant;
+
+	for (variant = 0; variant < 9; variant++) {
+		setup_survivor_protocol_fixture();
+		UT_ASSERT(cluster_recovery_transport_is_current());
+		switch (variant) {
+		case 0:
+			cluster_shared_config = false;
+			break;
+		case 1:
+			phase4_test_in_quorum = false;
+			break;
+		case 2:
+			phase_test_lms_generation++;
+			break;
+		case 3:
+			phase_test_last_admitted_incarnation++;
+			break;
+		case 4:
+			phase_test_membership_member = false;
+			break;
+		case 5:
+			phase_test_self_join_admitted = false;
+			break;
+		case 6:
+			phase_test_cssd_status = CLUSTER_CSSD_DOWN;
+			break;
+		case 7:
+			phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
+			break;
+		case 8:
+			phase_test_join_remaster = true;
+			break;
+		}
+		UT_ASSERT(!cluster_recovery_transport_is_current());
+	}
+}
+
+UT_TEST(test_pre2_survivor_reconstruction_rechecks_event)
+{
+	setup_survivor_protocol_fixture();
+	UT_ASSERT(cluster_recovery_transport_is_current());
+	phase_test_protocol_drift = true;
+	phase_test_protocol_event_reads = 0;
+	UT_ASSERT(!cluster_recovery_transport_is_current());
+}
+
 UT_TEST(test_rf_a1_readiness_is_monotone_and_generation_bound)
 {
 	ClusterResId recovery_resid;
@@ -1779,7 +2001,7 @@ UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(39);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -1800,6 +2022,11 @@ main(void)
 	UT_RUN(test_rf_a1_phase4_refreshes_expired_recovery_proof_before_serving);
 	UT_RUN(test_rf_a2_serving_does_not_consume_recovery_duty_cache);
 	UT_RUN(test_rf_a2_serving_rebinds_only_after_lmon_closes_recovery);
+	UT_RUN(test_pre2_survivor_reconstruction_precedes_serving);
+	UT_RUN(test_pre2_survivor_reconstruction_rejects_wrong_episode);
+	UT_RUN(test_pre2_survivor_reconstruction_accepts_prebump_observation);
+	UT_RUN(test_pre2_survivor_reconstruction_rejects_component_loss);
+	UT_RUN(test_pre2_survivor_reconstruction_rechecks_event);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
 	UT_RUN(test_rf_a1_readiness_is_monotone_and_generation_bound);
 	UT_RUN(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero);

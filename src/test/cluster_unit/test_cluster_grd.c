@@ -5442,7 +5442,7 @@ UT_TEST(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut)
  * No authority/lock helper is substituted in the snapshot under test.
  * Author: SqlRush <sqlrush@gmail.com> */
 static void
-setup_recovery_control_fixture(bool peer_done)
+setup_recovery_control_fixture_observation(bool peer_done, bool before_bump)
 {
 	reset_fake_grd_htab();
 	cluster_grd_max_entries = 16;
@@ -5462,11 +5462,16 @@ setup_recovery_control_fixture(bool peer_done)
 	cluster_grd_recovery_lmon_tick();
 	ut_mock_last_event.event_id = 701;
 	ut_mock_last_event.old_epoch = 8;
-	ut_mock_last_event.new_epoch = 9;
+	ut_mock_last_event.new_epoch = before_bump ? 8 : 9;
 	ut_mock_last_event.cssd_dead_generation = 13;
 	ut_mock_last_event.coordinator_node_id = 0;
 	ut_mock_last_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 	ut_mock_last_event.dead_bitmap[0] = 2;
+	if (before_bump) {
+		ut_mock_last_event.observer_role = CLUSTER_RECONFIG_OBSERVER_SURVIVOR;
+		cluster_grd_recovery_lmon_tick();
+		UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_EPOCH);
+	}
 	ut_mock_epoch = 9;
 	cluster_grd_recovery_lmon_tick();
 	if (peer_done) {
@@ -5474,6 +5479,12 @@ setup_recovery_control_fixture(bool peer_done)
 		cluster_grd_recovery_mark_peer_done(2, 9,
 							cluster_grd_dead_bitmap_hash(ut_mock_last_event.dead_bitmap));
 	}
+}
+
+static void
+setup_recovery_control_fixture(bool peer_done)
+{
+	setup_recovery_control_fixture_observation(peer_done, false);
 }
 
 static void
@@ -5529,7 +5540,7 @@ UT_TEST(test_recovery_control_refuses_other_failure_or_live_origin)
 	ClusterGrdRecoveryControlSnapshotV1 zero = { 0 };
 	int drift;
 
-	for (drift = 0; drift < 5; drift++) {
+	for (drift = 0; drift < 7; drift++) {
 		setup_recovery_control_fixture(true);
 		UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
 		if (drift == 0)
@@ -5540,11 +5551,32 @@ UT_TEST(test_recovery_control_refuses_other_failure_or_live_origin)
 			ut_mock_last_event.dead_bitmap[0] |= 4;
 		else if (drift == 3)
 			ut_mock_last_event.reconfig_kind = RECONFIG_KIND_JOIN_COMMITTED;
+		else if (drift == 5)
+			ut_mock_last_event.new_epoch = 0;
+		else if (drift == 6)
+			ut_mock_last_event.new_epoch = 10;
 		memset(&snapshot, 0xa5, sizeof(snapshot));
 		UT_ASSERT(!cluster_grd_recovery_control_snapshot(drift == 4 ? 3 : 2, &snapshot));
 		UT_ASSERT(memcmp(&snapshot, &zero, sizeof(snapshot)) == 0);
 		finish_recovery_control_fixture();
 	}
+}
+
+/* Real GRD consumes the observer event before epoch piggyback, then locks
+ * its episode at E+1. The unmodified observer record must not block the cut. */
+UT_TEST(test_recovery_control_uses_accepted_epoch_after_observer_bump)
+{
+	ClusterGrdRecoveryControlSnapshotV1 snapshot;
+
+	setup_recovery_control_fixture_observation(true, true);
+	UT_ASSERT_EQ(ut_mock_last_event.new_epoch, 8);
+	UT_ASSERT_EQ(cluster_grd_recovery_episode_epoch_value(), 9);
+	UT_ASSERT_EQ(cluster_grd_recovery_state_value(), GRD_RECOVERY_WAIT_CLUSTER);
+	UT_ASSERT(cluster_grd_recovery_control_snapshot(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.episode_epoch, 9);
+	UT_ASSERT_EQ(snapshot.event_id, 701);
+	UT_ASSERT_EQ(snapshot.survivor_bitmap[0], 5);
+	finish_recovery_control_fixture();
 }
 
 UT_TEST(test_recovery_control_requires_survivors_quorum_and_usable_map)
@@ -6072,7 +6104,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(122);
+	UT_PLAN(123);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6207,6 +6239,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_idle_joiner_accounts_done_epoch_for_fence);
 	UT_RUN(test_rejoin_clear_snapshot_requires_exact_all_survivor_done_cut);
 	UT_RUN(test_recovery_control_observes_protocol_cut_without_data_thaw);
+	UT_RUN(test_recovery_control_uses_accepted_epoch_after_observer_bump);
 	UT_RUN(test_recovery_control_refuses_other_failure_or_live_origin);
 	UT_RUN(test_recovery_control_requires_survivors_quorum_and_usable_map);
 	UT_RUN(test_recovery_control_rechecks_event_and_route_after_scan);

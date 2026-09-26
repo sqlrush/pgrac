@@ -318,6 +318,8 @@ extern bool cluster_authority_readiness_bind_recovery_generation(uint64 lms_gene
 extern bool cluster_authority_readiness_publish_recovery(uint64 lms_generation);
 extern bool cluster_authority_readiness_publish_serving(void);
 extern void cluster_authority_readiness_clear(void);
+/* Protocol-only: also accepts a retained PRE2 survivor in the exact current
+ * failure-rebuild episode. Never use this predicate to admit acquisitions. */
 extern bool cluster_recovery_transport_is_current(void);
 extern bool cluster_recovery_transport_components_current(void); /* RF-ROOT P6 */
 extern bool cluster_recovery_authority_is_current(void);

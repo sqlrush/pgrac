@@ -582,6 +582,67 @@ cluster_authority_readiness_publish_recovery(uint64 lms_generation)
 	return valid;
 }
 
+/* PGRAC: a retained survivor may reconstruct existing GES holders before
+ * its new serving seal exists. This proof is for REDECLARE/DONE only, never
+ * for CF/DATA acquisition, recovery writes or clearing the DATA barrier.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_survivor_recovery_transport_current(const ClusterAuthorityBindingLocal *binding)
+{
+	ReconfigEvent first = { 0 };
+	ReconfigEvent event = { 0 };
+	ClusterAuthorityBindingLocal after;
+	uint64 generation = 0;
+	uint64 episode_epoch = 0;
+	int pass;
+
+	if (!cluster_shared_config || !cluster_enabled || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES)
+		return false;
+	for (pass = 0; pass < 2; pass++) {
+		uint32 state = cluster_grd_recovery_state_value();
+		uint64 current_generation = cluster_grd_redeclare_generation();
+		uint64 accepted_epoch = cluster_grd_recovery_episode_epoch_value();
+		uint64 hash;
+		bool any_dead = false;
+		int i;
+
+		if (!cluster_serving_generation_current(binding)
+			|| !cluster_membership_is_member(cluster_node_id)
+			|| !cluster_reconfig_self_join_admitted()
+			|| cluster_reconfig_has_pending_prebump_stage()
+			|| cluster_grd_join_remaster_in_progress()
+			|| (state != GRD_RECOVERY_WAIT_BARRIER && state != GRD_RECOVERY_WAIT_CLUSTER)
+			|| current_generation == 0)
+			return false;
+		cluster_reconfig_get_last_event(&event);
+		for (i = 0; i < lengthof(event.dead_bitmap); i++)
+			any_dead |= event.dead_bitmap[i] != 0;
+		hash = cluster_grd_dead_bitmap_hash(event.dead_bitmap);
+		if (!any_dead || event.reconfig_kind != RECONFIG_KIND_FAIL_STOP || event.event_id == 0
+			|| event.new_epoch == 0 || accepted_epoch == 0 || event.new_epoch > accepted_epoch
+			|| hash == 0
+			|| (event.dead_bitmap[cluster_node_id / 8] & (1u << (cluster_node_id % 8))) != 0
+			|| cluster_epoch_get_current() != accepted_epoch
+			|| cluster_grd_recovery_last_event_id() != event.event_id
+			|| cluster_grd_recovery_event_bitmap_hash_value() != hash)
+			return false;
+		if (pass == 0) {
+			first = event;
+			generation = current_generation;
+			episode_epoch = accepted_epoch;
+		} else if (first.event_id != event.event_id || first.new_epoch != event.new_epoch
+				   || generation != current_generation || episode_epoch != accepted_epoch
+				   || memcmp(first.dead_bitmap, event.dead_bitmap, sizeof(first.dead_bitmap)) != 0)
+			return false;
+	}
+	return cluster_authority_binding_copy(&after) && after.state == CLUSTER_AUTHORITY_SERVING_READY
+		   && after.origin_thread == binding->origin_thread
+		   && after.boot_incarnation == binding->boot_incarnation
+		   && after.lms_generation == binding->lms_generation
+		   && cluster_serving_generation_current(&after);
+}
+
 bool
 cluster_recovery_transport_is_current(void)
 {
@@ -590,6 +651,8 @@ cluster_recovery_transport_is_current(void)
 
 	if (!cluster_authority_binding_copy(&binding))
 		return false;
+	if (binding.state == CLUSTER_AUTHORITY_SERVING_READY)
+		return cluster_survivor_recovery_transport_current(&binding);
 	if (binding.state == CLUSTER_AUTHORITY_RECOVERY_READY)
 		return cluster_recovery_authority_is_current();
 	if (binding.state != CLUSTER_AUTHORITY_STARTING)
