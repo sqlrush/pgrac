@@ -63,8 +63,9 @@ cluster_lock_owner_is_usable(const ClusterLockOwner *owner)
 		   && owner->generation == cluster_grd_redeclare_generation();
 }
 
-/* Discard only an obsolete wire waiter, never the still-owned hold.  The
- * drain revalidates both wire epoch and map generation before mutation. */
+/* Discard only an older-epoch wire waiter, never the still-owned hold.
+ * The drain rejects obsolete epochs. A sender-local restart counter
+ * alone cannot retire a remote exchange at the same epoch. */
 static bool
 lock_owner_obsolete_exchange(ClusterLockOwner *owner, uint64 epoch)
 {
@@ -79,9 +80,7 @@ lock_owner_obsolete_exchange(ClusterLockOwner *owner, uint64 epoch)
 		return true;
 	}
 	master = cluster_grd_lookup_master_gen(&owner->request.resid, &generation);
-	if (master < 0 || epoch < attempt->key.cluster_epoch)
-		return false;
-	if (epoch == attempt->key.cluster_epoch && generation <= attempt->master_generation)
+	if (master < 0 || epoch <= attempt->key.cluster_epoch)
 		return false;
 	if (attempt->wait_registered)
 		cluster_ges_reply_wait_delete(&attempt->key);

@@ -165,6 +165,8 @@ static PGPROC owner_proc;
 PGPROC *MyProc = &owner_proc;
 static uint64 owner_epoch = 9;
 static uint64 owner_generation = 1;
+static uint64 owner_routing_generation = 1;
+static unsigned owner_wait_deleted;
 static bool observe_installing;
 static bool drift_during_install;
 static bool observe_releasing;
@@ -224,21 +226,26 @@ cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt, const ClusterRes
 		attempt->key.cluster_epoch = holder->cluster_epoch;
 		attempt->key.request_id = holder->request_id;
 		attempt->master = 0;
-		attempt->master_generation = 1;
+		attempt->master_generation = owner_routing_generation;
+		attempt->wait_registered = true;
 	}
+	if (owner_reply == CLUSTER_GES_REDECLARE_CONFIRMED)
+		attempt->wait_registered = false;
 	return owner_reply;
 }
 
 int32
 cluster_grd_lookup_master_gen(const ClusterResId *resid pg_attribute_unused(), uint64 *generation)
 {
-	*generation = 1;
+	*generation = owner_routing_generation;
 	return 0;
 }
 
 void
 cluster_ges_reply_wait_delete(const GesReplyWaitKey *key pg_attribute_unused())
-{}
+{
+	owner_wait_deleted++;
+}
 /* spec-5.6 Dc4b: capture what cluster_cf_lock threaded into the request. */
 static int g_last_timeout_ms = -999;
 static uint32 g_last_wait_event = 0xFFFFFFFFu;
@@ -1022,6 +1029,34 @@ UT_TEST(test_private_cf_failed_s5_is_not_reconstruction_proof)
 	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
 }
 
+UT_TEST(test_private_cf_same_epoch_cut_keeps_exact_exchange)
+{
+	uint64 enumerated = 0;
+	uint64 request_id;
+
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	owner_epoch++;
+	owner_generation++;
+	owner_reply = CLUSTER_GES_REDECLARE_PENDING;
+	owner_wait_deleted = 0;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	request_id = observed_target.request_id;
+	owner_routing_generation++;
+	owner_reply = CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(owner_wait_deleted, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock));
+	/* Only the exact eventual completion permits release of that identity. */
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(observed_target.request_id, request_id);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(g_released_request.request_id, request_id);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	owner_routing_generation = 1;
+}
+
 int
 main(void)
 {
@@ -1029,7 +1064,7 @@ main(void)
 	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -1055,6 +1090,7 @@ main(void)
 	UT_RUN(test_private_cf_cut_before_route_does_not_strand_old_target);
 	UT_RUN(test_private_cf_s5_error_keeps_exact_cleanup_owner);
 	UT_RUN(test_private_cf_failed_s5_is_not_reconstruction_proof);
+	UT_RUN(test_private_cf_same_epoch_cut_keeps_exact_exchange);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

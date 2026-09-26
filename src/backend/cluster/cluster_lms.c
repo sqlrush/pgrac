@@ -1997,16 +1997,33 @@ native_probe_wake(void)
 }
 
 static bool
-native_probe_authority_current(const ClusterLmsNativeLockProbeSlot *work)
+native_probe_cut_current(const ClusterLmsNativeLockProbeSlot *work)
 {
-	LOCKMODE mode;
+	uint64 generation;
+	int32 master;
 
 	if (work->requester.cluster_epoch != cluster_epoch_get_current())
 		return false;
 	if (!work->grant_on_clear)
 		return true; /* The synchronous caller can still own an S3 reservation. */
-	if (work->shard_master_generation_lo != (uint32)cluster_lms_get_shard_master_generation())
+	master = cluster_grd_lookup_master_gen(&work->resid, &generation);
+	return master == cluster_node_id && work->receiver_generation_lo != 0
+		   && generation
+				  == (((work->requester.cluster_epoch & 0xffffffffu) << 32)
+					  | (uint64)work->receiver_generation_lo)
+		   && cluster_grd_shard_phase(cluster_grd_shard_for_resource(&work->resid))
+				  == GRD_SHARD_NORMAL;
+}
+
+static bool
+native_probe_authority_current(const ClusterLmsNativeLockProbeSlot *work)
+{
+	LOCKMODE mode;
+
+	if (!native_probe_cut_current(work))
 		return false;
+	if (!work->grant_on_clear)
+		return true;
 	if (work->request_opcode == GES_REQ_OPCODE_CONVERT)
 		return true; /* Original precise old-mode locator is checked at commit. */
 	return cluster_grd_holder_mode_by_id(&work->resid, &work->requester, &mode)
@@ -2296,9 +2313,7 @@ native_probe_aggregate(uint32 slot_idx, uint64 probe_id)
 		if (!native_probe_authority_current(&work)) {
 			/* Exact REQUEST holder removed by S7/release: never resurrect it.
 			 * A real epoch/generation change still gets a correlated refusal. */
-			if (work.requester.cluster_epoch != cluster_epoch_get_current()
-				|| work.shard_master_generation_lo
-					   != (uint32)cluster_lms_get_shard_master_generation()) {
+			if (!native_probe_cut_current(&work)) {
 				if (work.request_opcode != GES_REQ_OPCODE_CONVERT)
 					(void)cluster_grd_release_holder_by_id(&work.resid, &work.requester);
 				native_probe_send_reject_reply(&work, GES_REJECT_REASON_SHARD_FROZEN);
@@ -2490,7 +2505,7 @@ bool
 cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lockmode,
 										const ClusterGrdHolderId *requester, int32 source_node_id,
 										uint32 request_opcode, uint64 shard_master_generation,
-										LOCKMODE convert_current_mode)
+										uint64 receiver_generation, LOCKMODE convert_current_mode)
 {
 	ClusterLmsNativeLockProbeSlot work;
 	uint32 slot_idx;
@@ -2506,7 +2521,9 @@ cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lock
 	memset(&work, 0, sizeof(work));
 	cluster_grd_resid_decode(resid, &work.locktag);
 	work.lockmode = lockmode;
-	work.origin_node_id = cluster_node_id;
+	/* Preserve the drain's original receiver cut across async fanout. The
+	 * sender's generation remains solely dedup/conversion provenance. */
+	work.receiver_generation_lo = (uint32)receiver_generation;
 	work.requester_procno = requester->procno;
 	work.requester = *requester;
 	work.resid = *resid;
@@ -2539,7 +2556,6 @@ cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKMODE lockmode
 	memset(&work, 0, sizeof(work));
 	cluster_grd_resid_decode(resid, &work.locktag);
 	work.lockmode = lockmode;
-	work.origin_node_id = cluster_node_id;
 	work.requester_procno = requester->procno;
 	work.requester = *requester;
 	work.resid = *resid;

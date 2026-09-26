@@ -43,6 +43,12 @@ static unsigned sends, grants, rejects, releases, wakes, sleeps, cv_cancels, pea
 static unsigned sleep_mode;
 static bool nested_completion;
 static uint64 epoch;
+static uint32 origin_generation;
+static uint64 admitted_receiver_generation;
+static int32 routing_master;
+static ClusterGrdShardPhase routing_phase;
+static unsigned converts;
+static uint64 convert_generation;
 static uint64 wire_ids[256];
 static ClusterGrdHolderId holders[128];
 static int n_holders;
@@ -167,6 +173,25 @@ uint64
 cluster_epoch_get_current(void)
 {
 	return epoch;
+}
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid, uint64 *generation)
+{
+	UT_ASSERT_EQ(resid->type, LOCKTAG_RELATION);
+	*generation = cluster_lms_get_shard_master_generation();
+	return routing_master;
+}
+uint32
+cluster_grd_shard_for_resource(const ClusterResId *resid)
+{
+	UT_ASSERT_EQ(resid->type, LOCKTAG_RELATION);
+	return 0;
+}
+ClusterGrdShardPhase
+cluster_grd_shard_phase(uint32 shard)
+{
+	UT_ASSERT_EQ(shard, 0);
+	return routing_phase;
 }
 void
 ProcessInterrupts(void)
@@ -315,7 +340,8 @@ cluster_grd_convert_grant_by_backend(const ClusterResId *id, int32 node, uint32 
 	(void)newmode;
 	(void)request;
 	(void)source;
-	(void)gen;
+	converts++;
+	convert_generation = gen;
 	return CLUSTER_GRD_CONVERT_GRANTED_INPLACE;
 }
 static void
@@ -336,6 +362,12 @@ reset(void)
 	sleep_mode = 0;
 	nested_completion = false;
 	epoch = 9;
+	origin_generation = 7;
+	admitted_receiver_generation = (UINT64_C(9) << 32) | 7;
+	routing_master = 0;
+	routing_phase = GRD_SHARD_NORMAL;
+	converts = 0;
+	convert_generation = 0;
 	InterruptPending = 0;
 	memset(wire_ids, 0, sizeof(wire_ids));
 	memset(&dedup_state, 0, sizeof(dedup_state));
@@ -359,8 +391,8 @@ submit_exact(int procno, uint64 request_id, uint32 opcode)
 	holder.request_id = request_id;
 	holders[n_holders++] = holder;
 	return cluster_lms_native_probe_schedule_grant(
-		&id, ShareLock, &holder, 1, opcode, (UINT64_C(9) << 32) | 7,
-		opcode == GES_REQ_OPCODE_CONVERT ? AccessShareLock : NoLock);
+		&id, ShareLock, &holder, 1, opcode, (UINT64_C(9) << 32) | origin_generation,
+		admitted_receiver_generation, opcode == GES_REQ_OPCODE_CONVERT ? AccessShareLock : NoLock);
 }
 static bool
 submit_op(int procno, uint32 opcode)
@@ -659,6 +691,77 @@ UT_TEST(native_clear_completes_the_registered_nonzero_procno_receipt)
 	UT_ASSERT_EQ(occupied(), 0);
 }
 
+UT_TEST(async_origin_generation_is_not_receiver_authority)
+{
+	const uint32 opcodes[] = { GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CONVERT };
+
+	for (unsigned i = 0; i < lengthof(opcodes); i++) {
+		ClusterGesDedupKey key = receipt_key(37, 1037);
+		GesReplyPayload reply = { 0 };
+
+		reset();
+		origin_generation = 47;
+		key.opcode = opcodes[i];
+		key.shard_master_generation = (UINT64_C(9) << 32) | 47;
+		UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_MISS_REGISTERED);
+		UT_ASSERT(submit_op(37, opcodes[i]));
+		UT_ASSERT_EQ(sends, 1);
+		cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+		cluster_lms_native_probe_retry_tick();
+		UT_ASSERT_EQ(grants, 1);
+		UT_ASSERT_EQ(rejects, 0);
+		UT_ASSERT_EQ(occupied(), 0);
+		UT_ASSERT_EQ(lookup_receipt(&key, &reply), CLUSTER_GES_DEDUP_CACHED_REPLY);
+		UT_ASSERT_EQ(reply.opcode, GES_REPLY_OPCODE_GRANT);
+		UT_ASSERT_EQ(reply.reply_for_opcode, opcodes[i]);
+		UT_ASSERT_EQ(reply.holder_procno, 37);
+		if (opcodes[i] == GES_REQ_OPCODE_CONVERT) {
+			UT_ASSERT_EQ(converts, 1);
+			UT_ASSERT_EQ(convert_generation, (UINT64_C(9) << 32) | 47);
+		}
+	}
+}
+
+UT_TEST(async_changed_receiver_cut_cannot_grant)
+{
+	const uint32 opcodes[] = { GES_REQ_OPCODE_REQUEST, GES_REQ_OPCODE_CONVERT };
+
+	for (unsigned i = 0; i < lengthof(opcodes); i++) {
+		for (int drift = 0; drift < 3; drift++) {
+			reset();
+			UT_ASSERT(submit_op(37, opcodes[i]));
+			UT_ASSERT_EQ(sends, 1);
+			if (drift == 2)
+				routing_phase = GRD_SHARD_REBUILDING;
+			else if (drift == 1)
+				routing_master = 1;
+			else
+				pg_atomic_write_u64(&state.lms_restart_generation, 8);
+			cluster_lms_native_probe_recv_reply(wire_ids[0], 1, CLUSTER_NATIVE_LOCK_PROBE_CLEAR);
+			UT_ASSERT_EQ(grants, 0);
+			UT_ASSERT_EQ(converts, 0);
+			UT_ASSERT_EQ(rejects, 1);
+			UT_ASSERT_EQ(occupied(), 0);
+			UT_ASSERT_EQ(releases, opcodes[i] == GES_REQ_OPCODE_CONVERT ? 0 : 1);
+		}
+	}
+}
+
+UT_TEST(async_dispatch_keeps_the_original_admitted_cut)
+{
+	reset();
+	/* The drain accepted receiver7. It must not be relabelled receiver8
+	 * merely because fanout starts after that local restart. */
+	pg_atomic_write_u64(&state.lms_restart_generation, 8);
+	UT_ASSERT(submit(37));
+	cluster_lms_native_probe_retry_tick();
+	UT_ASSERT_EQ(sends, 0);
+	UT_ASSERT_EQ(grants, 0);
+	UT_ASSERT_EQ(rejects, 1);
+	UT_ASSERT_EQ(releases, 1);
+	UT_ASSERT_EQ(occupied(), 0);
+}
+
 UT_TEST(native_timeout_completes_the_exact_reject_receipt)
 {
 	ClusterGesDedupKey key = receipt_key(37, 1037);
@@ -949,7 +1052,10 @@ UT_TEST(normal_stop_ges_invalid_overrides_pending_and_wrong_observer)
 int
 main(void)
 {
-	printf("1..30\n");
+	printf("1..33\n");
+	UT_RUN(async_origin_generation_is_not_receiver_authority);
+	UT_RUN(async_changed_receiver_cut_cannot_grant);
+	UT_RUN(async_dispatch_keeps_the_original_admitted_cut);
 	UT_RUN(normal_stop_probe_owner_and_original_slot_locks);
 	UT_RUN(normal_stop_probe_all_descriptors_and_invalid_priority);
 	UT_RUN(normal_stop_probe_original_finish_not_final_ready);

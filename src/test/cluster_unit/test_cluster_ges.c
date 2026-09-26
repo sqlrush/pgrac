@@ -864,6 +864,7 @@ cluster_lms_native_probe_schedule_grant(
 	const struct ClusterGrdHolderId *requester pg_attribute_unused(),
 	int32 source_node_id pg_attribute_unused(), uint32 request_opcode pg_attribute_unused(),
 	uint64 shard_master_generation pg_attribute_unused(),
+	uint64 receiver_generation pg_attribute_unused(),
 	int convert_current_mode pg_attribute_unused())
 {
 	return false;
@@ -1242,7 +1243,7 @@ cluster_ges_reply_wait_poll_consume(const GesReplyWaitKey *key, GesReplyWaitVerd
 	verdict->reject_reason = stub_reply_wait_entry.reject_reason;
 	stub_cooperative_reply_present = false;
 	if (stub_cooperative_change_cut_on_poll)
-		stub_master_generation++;
+		stub_remote_master = 3;
 	return GES_REPLY_WAIT_POLL_DELIVERED;
 }
 
@@ -2740,7 +2741,7 @@ UT_TEST(test_redeclare_poll_cut_changes_never_ack_or_forget)
 		if (scenario == 0)
 			stub_current_epoch++;
 		else if (scenario == 1)
-			stub_master_generation++;
+			stub_remote_master = 0;
 		else if (scenario == 2)
 			stub_remote_master = 3;
 		else
@@ -2795,6 +2796,13 @@ UT_TEST(test_redeclare_poll_local_rebind_is_not_fresh_acquisition)
 	UT_ASSERT_EQ(stub_cooperative_inserts, 0);
 	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
 				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	UT_ASSERT_EQ(stub_rebind_calls, 1);
+	/* Here this process is the master, so its changed generation really
+	 * does invalidate the retained local authority. It is not the remote
+	 * exchange's unrelated sender counter. */
+	stub_master_generation++;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &resid, ShareLock, &holder),
+				 CLUSTER_GES_REDECLARE_CUT_CHANGED);
 	UT_ASSERT_EQ(stub_rebind_calls, 1);
 }
 

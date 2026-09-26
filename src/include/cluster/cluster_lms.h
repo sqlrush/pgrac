@@ -170,7 +170,7 @@ typedef struct ClusterLmsNativeLockProbeSlot {
 	uint64 probe_id;				   /* monotonic per-shard id (HC36 epoch) */
 	LOCKTAG locktag;				   /* 16B PG LOCKTAG (RELATION / OBJECT) */
 	LOCKMODE lockmode;				   /* 4B PG LOCKMODE */
-	int32 origin_node_id;			   /* local cluster_node_id at acquire */
+	uint32 receiver_generation_lo;	   /* receiver-local enqueue cut, not wire origin */
 	int32 requester_procno;			   /* pgprocno of backend awaiting grant */
 	uint32 shard_master_generation_lo; /* spec-2.27 dedup carry for async grants */
 	ClusterGrdHolderId requester;	   /* HC32a exclude_holder identity */

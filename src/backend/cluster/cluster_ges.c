@@ -1532,6 +1532,7 @@ cluster_ges_lmon_drain_work_queue(void)
 					if (!cluster_lms_native_probe_schedule_grant(
 							&resid, (LOCKMODE)req->lockmode, &holder, (int32)item.source_node_id,
 							req->opcode, ges_request_shard_master_generation(req),
+							item.routing_generation,
 							/* REQUEST: no convert locator */ NoLock)) {
 						GesReplyPayload reject;
 
@@ -1652,7 +1653,7 @@ cluster_ges_lmon_drain_work_queue(void)
 				&& cluster_lms_native_probe_required(&resid, requested_mode)) {
 				bool sched = cluster_lms_native_probe_schedule_grant(
 					&resid, requested_mode, &holder, (int32)item.source_node_id, req->opcode,
-					generation, convert_old_mode);
+					generation, item.routing_generation, convert_old_mode);
 				if (!sched)
 					ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
 										GES_REJECT_REASON_WORK_QUEUE_FULL, generation);
@@ -3087,7 +3088,11 @@ ges_redeclare_cut_current(const ClusterGesRedeclareAttempt *attempt, const Clust
 	uint64 generation;
 	int32 master = cluster_grd_lookup_master_gen(resid, &generation);
 
-	return master >= 0 && master == attempt->master && generation == attempt->master_generation
+	/* A remote attempt retains its sender dedup token across local LMS
+	 * restarts. Only the remote mutation owner can judge its receiver cut;
+	 * our local counter is not evidence that its grant disappeared. */
+	return master >= 0 && master == attempt->master
+		   && (master != cluster_node_id || generation == attempt->master_generation)
 		   && attempt->key.cluster_epoch == cluster_epoch_get_current();
 }
 

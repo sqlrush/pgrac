@@ -375,7 +375,8 @@ cluster_lms_native_probe_required(const ClusterResId *r, LOCKMODE mode)
 bool
 cluster_lms_native_probe_schedule_grant(const ClusterResId *r, LOCKMODE mode,
 										const ClusterGrdHolderId *holder, int32 source,
-										uint32 opcode, uint64 generation, LOCKMODE old)
+										uint32 opcode, uint64 generation,
+										uint64 receiver_generation, LOCKMODE old)
 {
 	GesReplyPayload reply;
 	LOCKMODE actual = NoLock;
@@ -385,6 +386,7 @@ cluster_lms_native_probe_schedule_grant(const ClusterResId *r, LOCKMODE mode,
 	HW_CHECK(relation_case && r->type == LOCKTAG_RELATION && old == NoLock);
 	HW_CHECK(cluster_grd_holder_mode_by_id(r, holder, &actual) && actual == mode);
 	HW_CHECK(generation == 9);
+	HW_CHECK(receiver_generation == master_queued_generation);
 	memset(&reply, 0, sizeof(reply));
 	reply.opcode = GES_REPLY_OPCODE_GRANT;
 	reply.reply_for_opcode = opcode;
@@ -1330,6 +1332,34 @@ UT_TEST(cooperative_redeclare_late_cut_cannot_publish_ack)
 	cooperative_case = false;
 }
 
+UT_TEST(cooperative_remote_exchange_survives_origin_counter_change)
+{
+	ClusterLockAcquireRequest req;
+	ClusterGesRedeclareAttempt attempt = { 0 };
+	ClusterICEnvelope env = { 0 };
+	GesReplyPayload reply;
+
+	setup_cooperative(&req);
+	mock_lms_shard_master_generation = 47;
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_PENDING);
+	UT_ASSERT_EQ(attempt.master_generation, 47);
+	/* The real remote master uses its independent receiver9 cut. */
+	reply = drive_redeclare_master(&req, NULL);
+	mock_lms_shard_master_generation = 48;
+	env.source_node_id = 3;
+	env.epoch = 2;
+	cluster_ges_reply_handler(&env, &reply);
+	UT_ASSERT_EQ(cluster_ges_redeclare_poll(&attempt, &req.resid, req.lockmode, &req.holder),
+				 CLUSTER_GES_REDECLARE_CONFIRMED);
+	UT_ASSERT_EQ(attempt.key.request_id, 201);
+	UT_ASSERT_EQ(attempt.master_generation, 47);
+	UT_ASSERT_EQ(cluster_ges_reply_wait_table_active_count(), 0);
+	UT_ASSERT_EQ(cooperative_sleeps, 0);
+	UT_ASSERT_EQ(request_sent, 1);
+	cooperative_case = false;
+}
+
 UT_TEST(cooperative_redeclare_malformed_verdict_cannot_restart)
 {
 	ClusterLockAcquireRequest req;
@@ -1503,7 +1533,7 @@ main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
 	alarm(30); /* Standalone fixture owner, not a database deadline. */
-	UT_PLAN(33);
+	UT_PLAN(34);
 	UT_RUN(no_sibling_control);
 	UT_RUN(real_grant_sibling_promotes);
 	UT_RUN(relation_share_grant_survives_compatible_sibling);
@@ -1533,6 +1563,7 @@ main(void)
 	UT_RUN(relation_native_error_has_full_interval_cleanup_owner);
 	UT_RUN(cooperative_redeclare_yields_then_consumes_real_grant);
 	UT_RUN(cooperative_redeclare_late_cut_cannot_publish_ack);
+	UT_RUN(cooperative_remote_exchange_survives_origin_counter_change);
 	UT_RUN(cooperative_redeclare_malformed_verdict_cannot_restart);
 	UT_RUN(cooperative_redeclare_stale_queue_cannot_rebind_current_holder);
 	UT_RUN(queued_mutations_revalidate_the_complete_cut_before_touching_grd);

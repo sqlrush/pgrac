@@ -196,11 +196,13 @@ extern bool cluster_lms_native_probe_wait_clear(const ClusterResId *resid, LOCKM
  * an async CONVERT (request_opcode == GES_REQ_OPCODE_CONVERT) so the resolve
  * path locates the OLD holder precisely by (node, procno, current_mode) — a
  * backend may hold multiple cluster modes on one resid.  NoLock (0) for
- * REQUEST. */
+ * REQUEST. receiver_generation is the receiver-local cut already checked by
+ * the GES drain, not a fresh sample or the sender's dedup generation. */
 extern bool cluster_lms_native_probe_schedule_grant(const ClusterResId *resid, LOCKMODE lockmode,
 													const ClusterGrdHolderId *requester,
 													int32 source_node_id, uint32 request_opcode,
 													uint64 shard_master_generation,
+													uint64 receiver_generation,
 													LOCKMODE convert_current_mode);
 
 /* ============================================================
