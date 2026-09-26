@@ -1897,10 +1897,11 @@ test_cluster_cf_storage: test_cluster_cf_storage.c unit_test.h \
 # spec-5.6 Db1: test_cluster_cf_enqueue links cluster_cf_enqueue.o (the pure
 # resid encoder).  No PG backend deps beyond the Assert hook.
 CLUSTER_CF_ENQUEUE_O = $(top_builddir)/src/backend/cluster/cluster_cf_enqueue.o
+CLUSTER_LOCK_OWNER_O = $(top_builddir)/src/backend/cluster/cluster_lock_owner.o
 test_cluster_cf_enqueue: test_cluster_cf_enqueue.c unit_test.h \
-		$(CLUSTER_CF_ENQUEUE_O)
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_CF_ENQUEUE_O) \
+		$(CLUSTER_CF_ENQUEUE_O) $(CLUSTER_LOCK_OWNER_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # spec-5.6 Dc4: test_cluster_cf_stats links cluster_cf_stats.o (the CF
@@ -2936,16 +2937,16 @@ test_cluster_lmd_probe_collector: test_cluster_lmd_probe_collector.c unit_test.h
 # backend symbols locally and exercises S1-S7 individual step API + top-
 # level dispatch + HC1 fail-closed + I1 monotonic forward transition.
 test_cluster_lock_acquire: test_cluster_lock_acquire.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O)
+		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) $(CLUSTER_LOCK_OWNER_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) \
+		$(CLUSTER_VERSION_O) $(CLUSTER_LOCK_ACQUIRE_O) $(CLUSTER_GES_MODE_O) $(CLUSTER_LOCK_OWNER_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # HW handoff uses production objects in two independent address spaces.
 # Section splitting removes unrelated backend entry points, not tested code.
 HW_HANDOFF_OBJECTS = $(addprefix hw_handoff_,cluster_grd.o cluster_ges.o \
-    cluster_ges_reply_wait.o cluster_lock_acquire.o cluster_ges_mode.o cluster_lmd_wait_state.o)
+    cluster_ges_reply_wait.o cluster_lock_acquire.o cluster_lock_owner.o cluster_ges_mode.o cluster_lmd_wait_state.o)
 $(HW_HANDOFF_OBJECTS): hw_handoff_%.o: $(top_srcdir)/src/backend/cluster/%.c \
         $(top_srcdir)/src/include/cluster/cluster_ges.h \
         $(top_srcdir)/src/include/cluster/cluster_lock_acquire.h

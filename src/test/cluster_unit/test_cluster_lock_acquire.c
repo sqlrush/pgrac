@@ -51,6 +51,7 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_lmd_wait_state.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_native_lock_probe.h" /* spec-5.3 same-lock-group helper */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_wal_retention.h"
@@ -174,6 +175,23 @@ pg_re_throw(void)
 {
 	abort(); /* never reached — the stub wait never throws */
 }
+
+void
+FlushErrorState(void)
+{}
+
+ClusterGesRedeclareResult
+cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt pg_attribute_unused(),
+						   const ClusterResId *resid pg_attribute_unused(),
+						   uint32 mode pg_attribute_unused(),
+						   const ClusterGrdHolderId *holder pg_attribute_unused())
+{
+	return CLUSTER_GES_REDECLARE_CONFIRMED;
+}
+
+void
+cluster_ges_reply_wait_delete(const GesReplyWaitKey *key pg_attribute_unused())
+{}
 
 uint64
 cluster_lmd_wait_state_publish(ClusterLmdProcWaitState *ws pg_attribute_unused(),
@@ -432,6 +450,13 @@ cluster_grd_lookup_master(const ClusterResId *resid pg_attribute_unused())
 	return stub_master_node;
 }
 
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid pg_attribute_unused(), uint64 *generation)
+{
+	*generation = 1;
+	return stub_master_node;
+}
+
 /* spec-4.6a: the S4-reject diagnostic references the CSSD peer-state view;
  * fixture has no CSSD shmem — stub DEAD-free defaults. */
 #include "cluster/cluster_cssd.h"
@@ -518,6 +543,8 @@ cluster_grd_try_reserve(const ClusterResId *resid pg_attribute_unused(),
 	return stub_reserve_result;
 }
 
+static ClusterGrdEntryResult owner_promote_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+
 ClusterGrdEntryResult
 cluster_grd_revalidate_and_promote(const ClusterResId *resid pg_attribute_unused(),
 								   const ClusterGrdHolderId *holder pg_attribute_unused(),
@@ -525,7 +552,7 @@ cluster_grd_revalidate_and_promote(const ClusterResId *resid pg_attribute_unused
 								   uint64 gen_snapshot pg_attribute_unused())
 {
 	stub_revalidate_calls++;
-	return CLUSTER_GRD_ENTRY_NOT_FOUND;
+	return owner_promote_result;
 }
 
 ClusterGrdEntryResult
@@ -1515,13 +1542,41 @@ UT_TEST(test_redeclare_walk_release_in_flight_keeps_old_identity)
 	reset_redeclare_walk();
 }
 
+UT_TEST(test_redeclare_walk_includes_actual_private_owner)
+{
+	PGPROC proc;
+	ClusterLockOwner owner;
+
+	setup_redeclare_walk(&proc, 1, 1);
+	memset(&owner, 0, sizeof(owner));
+	owner.request.resid.type = CLUSTER_CF_RESID_TYPE;
+	owner.request.lockmode = ShareLock;
+	owner.request.holder.node_id = cluster_node_id;
+	owner.request.holder.procno = proc.pgprocno;
+	owner.request.holder.cluster_epoch = 11;
+	owner.request.holder.request_id = owner.request.request_id = 92;
+	owner_promote_result = CLUSTER_GRD_ENTRY_OK;
+	UT_ASSERT(cluster_lock_owner_install(&owner));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&proc.cluster_grd_registered_count), 2);
+	cluster_grd_redeclare_all_registered();
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked), 7);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&proc.cluster_grd_redeclare_acked_epoch), 11);
+	stub_master_node = cluster_node_id;
+	stub_local_release_result = GES_REJECT_REASON_NONE;
+	UT_ASSERT(cluster_lock_owner_release(&owner));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&proc.cluster_grd_registered_count), 1);
+	owner_promote_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	stub_master_node = -1;
+	reset_redeclare_walk();
+}
+
 UT_DEFINE_GLOBALS();
 
 
 int
 main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
 
 	UT_RUN(test_7step_api_surface_linkable_and_initial_counters_zero);
 	UT_RUN(test_7step_s1_hc1_fail_closed);
@@ -1546,6 +1601,7 @@ main(int argc pg_attribute_unused(), char **const argv pg_attribute_unused())
 	UT_RUN(test_redeclare_walk_requires_stable_cut);
 	UT_RUN(test_redeclare_walk_cached_ack_requires_exact_epoch);
 	UT_RUN(test_redeclare_walk_release_in_flight_keeps_old_identity);
+	UT_RUN(test_redeclare_walk_includes_actual_private_owner);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

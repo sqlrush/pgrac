@@ -36,6 +36,7 @@
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "miscadmin.h" /* AmStartupProcess / AmCheckpointerProcess */
 #include "storage/fd.h"
 #include "storage/lock.h"
@@ -56,7 +57,7 @@ typedef struct CfHoldState {
 	bool held;
 	bool coordinated;
 	bool release_pending;
-	ClusterLockAcquireRequest req; /* resid + holder + request_id for release */
+	ClusterLockOwner owner; /* Stable S5/reconstruction/S6 ownership. */
 } CfHoldState;
 
 static CfHoldState cf_hold_x;
@@ -197,7 +198,7 @@ cluster_cf_lock(LOCKMODE mode)
 		slot->held = true;
 		slot->coordinated = false;
 		slot->release_pending = false;
-		slot->req = req;
+		slot->owner.request = req;
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
@@ -212,14 +213,15 @@ cluster_cf_lock(LOCKMODE mode)
 			 * visibility).  S5 failure cancels the reservation (S7) and we
 			 * fail closed.
 			 */
-		if (cluster_lock_acquire_s5_promote(&req) != CLUSTER_LOCK_ACQUIRE_OK_GRANTED) {
+		slot->held = true;
+		slot->coordinated = true;
+		slot->release_pending = true;
+		slot->owner.request = req;
+		if (!cluster_lock_owner_install(&slot->owner)) {
 			cluster_cf_counter_inc(CLUSTER_CF_FAILCLOSED);
 			return false;
 		}
-		slot->held = true;
-		slot->coordinated = true;
 		slot->release_pending = false;
-		slot->req = req; /* holder + request_id for the release */
 		cluster_cf_counter_inc(mode == ExclusiveLock ? CLUSTER_CF_X_ACQUIRE : CLUSTER_CF_S_ACQUIRE);
 		return true;
 
@@ -252,7 +254,8 @@ cluster_cf_held_is_usable(LOCKMODE mode)
 {
 	CfHoldState *slot = cf_slot(mode);
 
-	return slot->held && !slot->release_pending;
+	return slot->held && !slot->release_pending
+		   && (!slot->coordinated || cluster_lock_owner_is_usable(&slot->owner));
 }
 
 bool
@@ -267,7 +270,6 @@ ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode)
 {
 	CfHoldState *slot = cf_slot(mode);
-	ClusterLockAcquireResult result;
 
 	if (!slot->held)
 		return CLUSTER_CF_RELEASE_NOT_HELD;
@@ -280,8 +282,7 @@ cluster_cf_unlock_confirmed(LOCKMODE mode)
 	 * Neither case permits another read/write under this old request. Keep
 	 * the exact identity visible to retirement, lock-order and stop checks. */
 	slot->release_pending = true;
-	result = cluster_lock_acquire_s6_release(&slot->req);
-	if (result != CLUSTER_LOCK_ACQUIRE_OK_GRANTED)
+	if (!cluster_lock_owner_release(&slot->owner))
 		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 
 	memset(slot, 0, sizeof(*slot));

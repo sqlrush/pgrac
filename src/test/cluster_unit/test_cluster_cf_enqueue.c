@@ -37,10 +37,13 @@
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_cf_stats.h"
+#include "cluster/cluster_epoch.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_sequence.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/proc.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
 
@@ -158,7 +161,84 @@ static ClusterLockAcquireRequest g_promoted_request;
 static ClusterLockAcquireRequest g_released_request;
 static bool g_s6_observe;
 static bool g_s6_throw;
-static jmp_buf g_s6_jump;
+static PGPROC owner_proc;
+PGPROC *MyProc = &owner_proc;
+static uint64 owner_epoch = 9;
+static uint64 owner_generation = 1;
+static bool observe_installing;
+static bool drift_during_install;
+static bool observe_releasing;
+static bool no_route;
+static bool throw_during_install;
+static ClusterGesRedeclareResult owner_reply = CLUSTER_GES_REDECLARE_PENDING;
+static uint64 owner_next_id = 100;
+static ClusterGrdHolderId observed_target;
+static unsigned owner_poll_count;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+FlushErrorState(void)
+{}
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+uint64
+cluster_epoch_get_current(void)
+{
+	return owner_epoch;
+}
+
+uint64
+cluster_grd_redeclare_generation(void)
+{
+	return owner_generation;
+}
+
+uint64
+cluster_ges_reply_wait_next_request_id(void)
+{
+	return ++owner_next_id;
+}
+
+ClusterGesRedeclareResult
+cluster_ges_redeclare_poll(ClusterGesRedeclareAttempt *attempt, const ClusterResId *resid,
+						   uint32 mode, const ClusterGrdHolderId *holder)
+{
+	UT_ASSERT_EQ(resid->type, CLUSTER_CF_RESID_TYPE);
+	UT_ASSERT(mode == ShareLock || mode == ExclusiveLock);
+	observed_target = *holder;
+	owner_poll_count++;
+	if (holder->cluster_epoch != owner_epoch)
+		return CLUSTER_GES_REDECLARE_CUT_CHANGED;
+	if (no_route)
+		return CLUSTER_GES_REDECLARE_PENDING;
+	if (!attempt->initialized) {
+		attempt->initialized = true;
+		attempt->key.cluster_epoch = holder->cluster_epoch;
+		attempt->key.request_id = holder->request_id;
+		attempt->master = 0;
+		attempt->master_generation = 1;
+	}
+	return owner_reply;
+}
+
+int32
+cluster_grd_lookup_master_gen(const ClusterResId *resid pg_attribute_unused(), uint64 *generation)
+{
+	*generation = 1;
+	return 0;
+}
+
+void
+cluster_ges_reply_wait_delete(const GesReplyWaitKey *key pg_attribute_unused())
+{}
 /* spec-5.6 Dc4b: capture what cluster_cf_lock threaded into the request. */
 static int g_last_timeout_ms = -999;
 static uint32 g_last_wait_event = 0xFFFFFFFFu;
@@ -174,9 +254,9 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 	g_last_wait_event = req->wait_event;
 
 	/* simulate S3 fill_request_holder filling the holder + request id */
-	mut->holder.node_id = 1;
+	mut->holder.node_id = cluster_node_id;
 	mut->holder.procno = 42;
-	mut->holder.cluster_epoch = 9;
+	mut->holder.cluster_epoch = owner_epoch;
 	mut->request_id = g_next_request_id;
 	mut->holder.request_id = g_next_request_id;
 	return g_seven_result;
@@ -185,7 +265,19 @@ cluster_lock_acquire_seven_step(const ClusterLockAcquireRequest *req)
 ClusterLockAcquireResult
 cluster_lock_acquire_s5_promote(const ClusterLockAcquireRequest *req)
 {
+	if (observe_installing) {
+		uint64 enumerated = 0;
+
+		UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+		UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+		UT_ASSERT_EQ(enumerated, 1);
+		UT_ASSERT(!cluster_cf_held_is_usable(req->lockmode));
+	}
 	g_promoted_request = *req;
+	if (throw_during_install)
+		pg_re_throw();
+	if (drift_during_install)
+		owner_epoch++;
 	return g_s5_result;
 }
 
@@ -202,7 +294,19 @@ cluster_lock_acquire_s6_release(const ClusterLockAcquireRequest *req)
 		UT_ASSERT(!cluster_cf_write_permitted());
 	}
 	if (g_s6_throw)
-		longjmp(g_s6_jump, 1);
+		pg_re_throw();
+	if (observe_releasing) {
+		uint64 enumerated = 0;
+		uint64 id = req->request_id;
+		unsigned polls = owner_poll_count;
+
+		owner_epoch++;
+		owner_generation++;
+		UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+		UT_ASSERT_EQ(enumerated, 1);
+		UT_ASSERT_EQ(owner_poll_count, polls);
+		UT_ASSERT_EQ(req->request_id, id);
+	}
 	return g_s6_result;
 }
 
@@ -570,13 +674,23 @@ UT_TEST(test_void_release_retains_exact_request_without_authority)
 static void
 check_release_interrupt(LOCKMODE mode)
 {
+	volatile bool caught = false;
+
 	g_seven_result = g_s5_result = g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
 	UT_ASSERT(cluster_cf_lock(mode));
 	g_s6_throw = g_s6_observe = true;
-	if (setjmp(g_s6_jump) == 0) {
+	PG_TRY();
+	{
 		cluster_cf_unlock(mode);
 		UT_ASSERT(false); /* The controlled substrate must unwind this call. */
 	}
+	PG_CATCH();
+	{
+		caught = true;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
 	g_s6_throw = false;
 	UT_ASSERT(cluster_cf_held(mode));
 	UT_ASSERT(!cluster_cf_held_is_clusterwide(mode));
@@ -660,8 +774,12 @@ UT_TEST(test_lock_s5_fail)
 	g_s6_count = 0;
 
 	UT_ASSERT(!cluster_cf_lock(ExclusiveLock));
-	cluster_cf_unlock(ExclusiveLock); /* not held -> no-op */
-	UT_ASSERT_EQ(g_s6_count, 0);
+	UT_ASSERT(cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(!cluster_cf_held_is_usable(ExclusiveLock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	cluster_cf_unlock(ExclusiveLock); /* S5 failure still owns exact cleanup. */
+	UT_ASSERT_EQ(g_s6_count, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
 
 	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED; /* reset */
 }
@@ -754,10 +872,164 @@ UT_TEST(test_stop_cf_separates_old_skip_from_post_checkpoint_permission)
 	cluster_cf_set_bootstrap_authority(false);
 }
 
+UT_TEST(test_private_cf_is_enumerated_before_s5_and_until_release)
+{
+	uint64 enumerated = 0;
+
+	g_seven_result = g_s5_result = g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	observe_installing = true;
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	observe_installing = false;
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(enumerated, 1);
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_FAIL_TIMEOUT;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	g_s6_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
+UT_TEST(test_private_cf_pending_redeclare_owns_release_identity)
+{
+	uint64 enumerated = 0;
+	ClusterGrdHolderId target;
+	int releases;
+
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	owner_epoch++;
+	owner_generation++;
+	owner_reply = CLUSTER_GES_REDECLARE_PENDING;
+	owner_poll_count = 0;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(enumerated, 1);
+	UT_ASSERT_EQ(owner_poll_count, 1);
+	target = observed_target;
+	releases = g_s6_count;
+	UT_ASSERT(!cluster_cf_held_is_usable(ExclusiveLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(g_s6_count, releases);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	UT_ASSERT_EQ(observed_target.request_id, target.request_id);
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	/* Still no authority: this hold was already requested to retire. */
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(!cluster_cf_held_is_usable(ExclusiveLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(g_released_request.holder.cluster_epoch, target.cluster_epoch);
+	UT_ASSERT_EQ(g_released_request.request_id, target.request_id);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
+UT_TEST(test_private_cf_install_cut_drift_cannot_grant_authority)
+{
+	drift_during_install = true;
+	UT_ASSERT(!cluster_cf_lock(ShareLock));
+	drift_during_install = false;
+	UT_ASSERT(cluster_cf_held(ShareLock));
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
+UT_TEST(test_private_cf_release_in_flight_cannot_rebind)
+{
+	UT_ASSERT(cluster_cf_lock(ExclusiveLock));
+	observe_releasing = true;
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	observe_releasing = false;
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
+UT_TEST(test_private_cf_cut_before_route_does_not_strand_old_target)
+{
+	uint64 enumerated = 0;
+	uint64 first_id;
+
+	UT_ASSERT(cluster_cf_lock(ShareLock));
+	owner_epoch++;
+	owner_generation++;
+	no_route = true;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	first_id = observed_target.request_id;
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	owner_epoch++;
+	owner_generation++;
+	no_route = false;
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated)); /* Retire obsolete target. */
+	UT_ASSERT(cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(observed_target.cluster_epoch, owner_epoch);
+	UT_ASSERT(observed_target.request_id > first_id);
+	UT_ASSERT(cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
+UT_TEST(test_private_cf_s5_error_keeps_exact_cleanup_owner)
+{
+	volatile bool caught = false;
+
+	throw_during_install = true;
+	PG_TRY();
+	{
+		(void)cluster_cf_lock(ExclusiveLock);
+		UT_ASSERT(false);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+		FlushErrorState();
+	}
+	PG_END_TRY();
+	throw_during_install = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(cluster_cf_held(ExclusiveLock));
+	UT_ASSERT(!cluster_cf_held_is_usable(ExclusiveLock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ExclusiveLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
+UT_TEST(test_private_cf_failed_s5_is_not_reconstruction_proof)
+{
+	uint64 epoch = owner_epoch;
+	uint64 generation = owner_generation;
+	uint64 enumerated = 0;
+	unsigned polls;
+
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+	UT_ASSERT(!cluster_cf_lock(ShareLock));
+	g_s5_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	owner_epoch++;
+	owner_generation++;
+	owner_reply = CLUSTER_GES_REDECLARE_CONFIRMED;
+	polls = owner_poll_count;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT_EQ(enumerated, 1);
+	UT_ASSERT_EQ(owner_poll_count, polls);
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 1);
+	/* Fixture teardown restores the original cut to exercise exact S6;
+	 * this is not evidence of post-reconfiguration uncertain cleanup. */
+	owner_epoch = epoch;
+	owner_generation = generation;
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_CONFIRMED);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	owner_proc.pgprocno = 42;
+	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
+	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
+	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
+	UT_PLAN(25);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -776,6 +1048,13 @@ main(void)
 	UT_RUN(test_lock_timeout_and_wait_event);
 	UT_RUN(test_stop_cf_original_holds_and_confirmed_retirement);
 	UT_RUN(test_stop_cf_separates_old_skip_from_post_checkpoint_permission);
+	UT_RUN(test_private_cf_is_enumerated_before_s5_and_until_release);
+	UT_RUN(test_private_cf_pending_redeclare_owns_release_identity);
+	UT_RUN(test_private_cf_install_cut_drift_cannot_grant_authority);
+	UT_RUN(test_private_cf_release_in_flight_cannot_rebind);
+	UT_RUN(test_private_cf_cut_before_route_does_not_strand_old_target);
+	UT_RUN(test_private_cf_s5_error_keeps_exact_cleanup_owner);
+	UT_RUN(test_private_cf_failed_s5_is_not_reconstruction_proof);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

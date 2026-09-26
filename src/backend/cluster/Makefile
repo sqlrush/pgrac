@@ -87,6 +87,7 @@ OBJS = \
 	cluster_side_stats.o \
 	cluster_recovery_duty.o \
 	cluster_cf_enqueue.o \
+	cluster_lock_owner.o \
 	cluster_cf_phase2.o \
 	cluster_cf_stats.o \
 	cluster_cf_storage.o \

@@ -61,6 +61,7 @@
 #include "cluster/cluster_lmd_wait_state.h" /* spec-5.8 D1d — per-proc wait-state */
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_cancel_token.h" /* spec-5.9 D3 cluster_cancel_token_consume */
 #include "cluster/cluster_signal.h"		  /* cluster_ges_cancel_pending sig_atomic_t */
@@ -1303,6 +1304,7 @@ cluster_grd_redeclare_all_registered(void)
 	uint64 gen;
 	uint64 cur_epoch;
 	uint64 enumerated_count = 0;
+	uint64 private_count = 0;
 	uint32 registered_count;
 	HTAB *locallocks;
 	HASH_SEQ_STATUS status;
@@ -1396,6 +1398,12 @@ cluster_grd_redeclare_all_registered(void)
 			}
 		}
 	}
+
+	/* Manual CF/WALR-style holders do not have a native LOCALLOCK.  Their
+	 * stable process-owned records participate in the very same ACK. */
+	if (!cluster_lock_owners_redeclare(&private_count))
+		all_ok = false;
+	enumerated_count += private_count;
 
 	/*
 	 * Missing registered records are not an empty census.  The complete
