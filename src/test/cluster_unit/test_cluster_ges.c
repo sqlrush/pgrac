@@ -462,14 +462,24 @@ cluster_grd_entry_rebind_or_insert_holder(const ClusterResId *resid pg_attribute
 }
 
 static int32 stub_remote_master = -1;
+static bool stub_master_unknown = false;
 static uint64 stub_master_generation = 1;
 static bool stub_remaster_on_second_lookup = false;
 static int stub_master_gen_lookup_calls = 0;
 static int stub_release_and_drain_result = 0;
+static int stub_release_and_drain_calls;
+static ClusterGrdEntryResult stub_exact_release_result = CLUSTER_GRD_ENTRY_OK;
+static int stub_exact_release_calls;
+static bool stub_holder_absent;
+static LOCKMODE stub_holder_mode_override = NoLock;
+static bool stub_readiness_lost_on_release;
+static ClusterGrdHolderId stub_exact_release_holder;
 
 int32
 cluster_grd_lookup_master(const struct ClusterResId *resid pg_attribute_unused())
 {
+	if (stub_master_unknown)
+		return -1;
 	return stub_remote_master >= 0 ? stub_remote_master : cluster_node_id;
 }
 
@@ -903,6 +913,7 @@ cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unus
 							  ClusterGrdGrantIdentity *granted_out pg_attribute_unused(),
 							  int max_out pg_attribute_unused())
 {
+	stub_release_and_drain_calls++;
 	return stub_release_and_drain_result;
 }
 
@@ -1055,9 +1066,13 @@ cluster_grd_entry_release_and_pop_compatible_waiter(
 
 ClusterGrdEntryResult
 cluster_grd_release_holder_by_id(const struct ClusterResId *r pg_attribute_unused(),
-								 const struct ClusterGrdHolderId *h pg_attribute_unused())
+								 const struct ClusterGrdHolderId *h)
 {
-	return CLUSTER_GRD_ENTRY_OK;
+	stub_exact_release_calls++;
+	stub_exact_release_holder = *h;
+	if (stub_readiness_lost_on_release)
+		stub_recovery_ready = false;
+	return stub_exact_release_result;
 }
 
 bool
@@ -1065,10 +1080,12 @@ cluster_grd_holder_mode_by_id(const struct ClusterResId *r,
 							  const struct ClusterGrdHolderId *h pg_attribute_unused(),
 							  LOCKMODE *out_mode)
 {
-	if (r == NULL)
+	if (r == NULL || stub_holder_absent)
 		return false;
 	if (out_mode != NULL)
-		*out_mode = r->type == CLUSTER_CF_RESID_TYPE ? ShareLock : ExclusiveLock;
+		*out_mode = stub_holder_mode_override != NoLock
+						? stub_holder_mode_override
+						: (r->type == CLUSTER_CF_RESID_TYPE ? ShareLock : ExclusiveLock);
 	return r->type == CLUSTER_CF_RESID_TYPE || r->type == CLUSTER_WAL_RETENTION_RESID_TYPE;
 }
 
@@ -2194,7 +2211,7 @@ UT_TEST(test_ges_release_cv_timeout_retransmits)
 	stub_backend_request_ready_after = 0;
 }
 
-UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
+UT_TEST(test_ges_local_release_requires_available_authority_and_stable_master)
 {
 	ClusterResId resid;
 	ClusterGrdHolderId holder;
@@ -2207,7 +2224,7 @@ UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
 	stub_master_generation = 7;
 	stub_master_gen_lookup_calls = 0;
 	stub_remaster_on_second_lookup = false;
-	stub_release_and_drain_result = -1;
+	stub_release_and_drain_result = CLUSTER_GRD_RELEASE_NOT_READY;
 	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_TIMEOUT);
 
 	stub_master_gen_lookup_calls = 0;
@@ -2220,6 +2237,244 @@ UT_TEST(test_ges_local_release_requires_exact_holder_and_stable_master)
 	stub_remaster_on_second_lookup = false;
 	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_NONE);
 	cluster_node_id = saved_node;
+}
+
+/* Break caught: local RELEASE must confirm an exact absent holder just as
+ * the remote RELEASE owner does, but never turn unavailable authority into
+ * absence. The real GRD exact-removal tests cover the substituted boundary. */
+UT_TEST(test_ges_local_release_confirms_absence_only_at_stable_master)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	uint64 replies = stub_lmon_reply_enqueue_count;
+
+	holder.node_id = cluster_node_id;
+	holder.procno = 41;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 987;
+	stub_release_and_drain_result = CLUSTER_GRD_RELEASE_NOT_FOUND;
+	stub_master_gen_lookup_calls = stub_release_and_drain_calls = 0;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, 1);
+	UT_ASSERT_EQ(stub_master_gen_lookup_calls, 2);
+	UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, replies);
+
+	stub_master_gen_lookup_calls = 0;
+	stub_remaster_on_second_lookup = true;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_MASTER_DEAD_NATIVE);
+	stub_remaster_on_second_lookup = false;
+	stub_master_unknown = true;
+	stub_release_and_drain_calls = 0;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder),
+				 GES_REJECT_REASON_MASTER_DEAD_NATIVE);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, 0);
+	stub_master_unknown = false;
+	stub_release_and_drain_result = 0;
+}
+
+UT_TEST(test_ges_recovery_local_retirement_never_drains_ordinary_waiters)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	unsigned int kind;
+
+	holder.node_id = cluster_node_id;
+	holder.procno = 41;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 988;
+	stub_authority_managed = true;
+	stub_recovery_ready = true;
+	stub_serving_ready = false;
+	MyAuxProcType = StartupProcess;
+	stub_holder_absent = true;
+	stub_exact_release_result = CLUSTER_GRD_ENTRY_NOT_FOUND;
+	stub_release_and_drain_calls = 0;
+	for (kind = 0; kind < 2; kind++) {
+		memset(&resid, 0, sizeof(resid));
+		resid.type = kind == 0 ? CLUSTER_CF_RESID_TYPE : CLUSTER_WAL_RETENTION_RESID_TYPE;
+		resid.field1 = kind == 0 ? 0 : 2;
+		resid.lockmethodid = DEFAULT_LOCKMETHOD;
+		stub_exact_release_calls = stub_master_gen_lookup_calls = 0;
+		UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), GES_REJECT_REASON_NONE);
+		UT_ASSERT_EQ(stub_exact_release_calls, 1);
+		UT_ASSERT_EQ(stub_exact_release_holder.request_id, (uint64)988);
+		UT_ASSERT_EQ(stub_master_gen_lookup_calls, 2);
+		UT_ASSERT_EQ(stub_release_and_drain_calls, 0);
+	}
+	stub_holder_absent = false;
+	stub_exact_release_result = CLUSTER_GRD_ENTRY_OK;
+	stub_authority_managed = stub_recovery_ready = false;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+UT_TEST(test_ges_recovery_local_retirement_retains_authority_guards)
+{
+	ClusterResId resid = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	unsigned int scenario;
+	const uint32 expected[] = { GES_REJECT_REASON_MASTER_DEAD_NATIVE,
+								GES_REJECT_REASON_MASTER_DEAD_NATIVE,
+								GES_REJECT_REASON_MASTER_DEAD_NATIVE,
+								GES_REJECT_REASON_SHARD_FROZEN,
+								GES_REJECT_REASON_TIMEOUT,
+								GES_REJECT_REASON_SHARD_FROZEN,
+								GES_REJECT_REASON_SHARD_FROZEN };
+
+	resid.type = CLUSTER_CF_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	holder.node_id = cluster_node_id;
+	holder.procno = 41;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 989;
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	MyAuxProcType = StartupProcess;
+	for (scenario = 0; scenario < lengthof(expected); scenario++) {
+		stub_recovery_ready = true;
+		stub_master_gen_lookup_calls = stub_exact_release_calls = stub_release_and_drain_calls = 0;
+		stub_master_unknown = scenario == 0;
+		stub_remote_master = scenario == 1 ? 7 : -1;
+		stub_remaster_on_second_lookup = scenario == 2;
+		stub_holder_mode_override = scenario == 3 ? ExclusiveLock : NoLock;
+		stub_exact_release_result = scenario == 4 ? CLUSTER_GRD_ENTRY_ERROR : CLUSTER_GRD_ENTRY_OK;
+		stub_readiness_lost_on_release = scenario == 5;
+		resid.field1 = scenario == 6 ? 1 : 0; /* malformed CF, not a new resource */
+		UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&resid, &holder), expected[scenario]);
+		UT_ASSERT_EQ(stub_release_and_drain_calls, 0);
+		UT_ASSERT_EQ(stub_exact_release_calls,
+					 scenario == 2 || scenario == 4 || scenario == 5 ? 1 : 0);
+	}
+	stub_master_unknown = stub_remaster_on_second_lookup = false;
+	stub_remote_master = -1;
+	stub_holder_mode_override = NoLock;
+	stub_exact_release_result = CLUSTER_GRD_ENTRY_OK;
+	stub_readiness_lost_on_release = false;
+	stub_authority_managed = stub_recovery_ready = false;
+	MyAuxProcType = NotAnAuxProcess;
+}
+
+/* Drive the real remote mutation owner; only the GRD/storage and transport
+ * boundaries are substituted. The emitted RELEASE reply is the verdict.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+queue_exact_recovery_release(const ClusterResId *resid)
+{
+	GesRequestPayload req = { 0 };
+
+	req.opcode = GES_REQ_OPCODE_RELEASE;
+	req.holder_node_id = 1;
+	req.holder_procno = 41;
+	req.holder_cluster_epoch_lo = (uint32)stub_current_epoch;
+	req.holder_cluster_epoch_hi = (uint32)(stub_current_epoch >> 32);
+	req.holder_request_id_lo = UINT32_C(0x15161718);
+	req.holder_request_id_hi = UINT32_C(0x11121314);
+	req.shard_master_generation_lo = (uint32)stub_master_generation;
+	memcpy(req.resid, resid, sizeof(*resid));
+	memset(&stub_work_queue_dequeue_item, 0, sizeof(stub_work_queue_dequeue_item));
+	stub_work_queue_dequeue_item.source_node_id = 1;
+	stub_work_queue_dequeue_item.payload_len = sizeof(req);
+	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
+	stub_work_queue_dequeue_pending = true;
+}
+
+/* Break caught: a duplicate release must reach exact removal, not be rejected
+ * merely because the mode lookup no longer finds the already-retired holder. */
+UT_TEST(test_ges_recovery_remote_retirement_confirms_exact_absence)
+{
+	ClusterResId resid = { 0 };
+	unsigned int scenario;
+	uint64 grants = stub_master_grant_mutation_count;
+
+	stub_authority_managed = stub_recovery_ready = true;
+	stub_serving_ready = false;
+	for (scenario = 0; scenario < 4; scenario++) {
+		uint64 replies = stub_lmon_reply_enqueue_count;
+
+		resid.type = scenario < 2 ? CLUSTER_CF_RESID_TYPE : CLUSTER_WAL_RETENTION_RESID_TYPE;
+		resid.field1 = scenario < 2 ? 0 : 2;
+		resid.lockmethodid = DEFAULT_LOCKMETHOD;
+		stub_holder_absent = (scenario % 2) != 0;
+		stub_exact_release_result
+			= stub_holder_absent ? CLUSTER_GRD_ENTRY_NOT_FOUND : CLUSTER_GRD_ENTRY_OK;
+		stub_exact_release_calls = stub_master_gen_lookup_calls = stub_release_and_drain_calls = 0;
+		queue_exact_recovery_release(&resid);
+		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+		UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, replies + 1);
+		UT_ASSERT_EQ(stub_lmon_reply_last.opcode, GES_REPLY_OPCODE_GRANT);
+		UT_ASSERT_EQ(stub_lmon_reply_last.reply_for_opcode, GES_REQ_OPCODE_RELEASE);
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_node_id, 1);
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_procno, 41);
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, UINT32_C(0x15161718));
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_hi, UINT32_C(0x11121314));
+		UT_ASSERT_EQ(stub_exact_release_calls, 1);
+		UT_ASSERT_EQ(stub_release_and_drain_calls, 0);
+		UT_ASSERT_EQ(stub_master_grant_mutation_count, grants);
+	}
+	stub_holder_absent = false;
+	stub_exact_release_result = CLUSTER_GRD_ENTRY_OK;
+	stub_authority_managed = stub_recovery_ready = false;
+}
+
+/* Break caught: neither an absent local copy at the wrong master nor a
+ * readiness/map change across removal certifies remote retirement. */
+UT_TEST(test_ges_recovery_remote_retirement_refuses_unproven_absence)
+{
+	ClusterResId resid = { 0 };
+	unsigned int scenario;
+	const uint32 reasons[] = {
+		GES_REJECT_REASON_MASTER_DEAD_NATIVE, /* unknown current master */
+		GES_REJECT_REASON_MASTER_DEAD_NATIVE, /* another master */
+		GES_REJECT_REASON_MASTER_DEAD_NATIVE, /* routing changed at removal */
+		GES_REJECT_REASON_WORK_QUEUE_FULL,	  /* present disallowed mode */
+		GES_REJECT_REASON_WORK_QUEUE_FULL,	  /* lookup false, GRD not ready */
+		GES_REJECT_REASON_WORK_QUEUE_FULL,	  /* readiness lost at removal */
+		GES_REJECT_REASON_WORK_QUEUE_FULL,	  /* malformed CF identity */
+		GES_REJECT_REASON_WORK_QUEUE_FULL,	  /* readiness lost before removal */
+		GES_REJECT_REASON_WORK_QUEUE_FULL,	  /* real GRD error */
+	};
+	uint64 grants = stub_master_grant_mutation_count;
+
+	resid.type = CLUSTER_CF_RESID_TYPE;
+	resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	stub_authority_managed = true;
+	stub_serving_ready = false;
+	for (scenario = 0; scenario < lengthof(reasons); scenario++) {
+		uint64 replies = stub_lmon_reply_enqueue_count;
+		uint64 forgotten = stub_dedup_remove_completed_count;
+
+		stub_recovery_ready = scenario != 7;
+		stub_master_unknown = scenario == 0;
+		stub_remote_master = scenario == 1 ? 7 : -1;
+		stub_remaster_on_second_lookup = scenario == 2;
+		stub_holder_mode_override = scenario == 3 ? ExclusiveLock : NoLock;
+		stub_holder_absent = scenario == 4;
+		stub_exact_release_result
+			= scenario == 4 ? CLUSTER_GRD_ENTRY_NOT_READY
+							: (scenario == 8 ? CLUSTER_GRD_ENTRY_ERROR : CLUSTER_GRD_ENTRY_OK);
+		stub_readiness_lost_on_release = scenario == 5;
+		resid.field1 = scenario == 6 ? 1 : 0;
+		stub_exact_release_calls = stub_master_gen_lookup_calls = stub_release_and_drain_calls = 0;
+		queue_exact_recovery_release(&resid);
+		UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
+		UT_ASSERT_EQ(stub_lmon_reply_enqueue_count, replies + 1);
+		UT_ASSERT_EQ(stub_lmon_reply_last.opcode, GES_REPLY_OPCODE_REJECT);
+		UT_ASSERT_EQ(stub_lmon_reply_last.reply_for_opcode, GES_REQ_OPCODE_RELEASE);
+		UT_ASSERT_EQ(stub_lmon_reply_last.reject_reason, reasons[scenario]);
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, UINT32_C(0x15161718));
+		UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_hi, UINT32_C(0x11121314));
+		UT_ASSERT_EQ(stub_dedup_remove_completed_count, forgotten);
+		UT_ASSERT_EQ(stub_exact_release_calls,
+					 scenario == 2 || scenario == 4 || scenario == 5 || scenario == 8 ? 1 : 0);
+		UT_ASSERT_EQ(stub_release_and_drain_calls, 0);
+		UT_ASSERT_EQ(stub_master_grant_mutation_count, grants);
+	}
+	stub_master_unknown = stub_remaster_on_second_lookup = false;
+	stub_remote_master = -1;
+	stub_holder_mode_override = NoLock;
+	stub_holder_absent = stub_readiness_lost_on_release = false;
+	stub_exact_release_result = CLUSTER_GRD_ENTRY_OK;
+	stub_authority_managed = stub_recovery_ready = false;
 }
 
 UT_TEST(test_block0_protected_failure_detail_is_not_elapsed_timeout)
@@ -2280,7 +2535,7 @@ UT_TEST(test_ges_probe_validates_identity_then_obeys_final_stop_seal)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(33);
+	UT_PLAN(38);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -2311,7 +2566,12 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_request_timeout_sends_wait_seq_exact_cancel_wait);
 	UT_RUN(test_ges_request_cv_timeout_retransmits);
 	UT_RUN(test_ges_release_cv_timeout_retransmits);
-	UT_RUN(test_ges_local_release_requires_exact_holder_and_stable_master);
+	UT_RUN(test_ges_local_release_requires_available_authority_and_stable_master);
+	UT_RUN(test_ges_local_release_confirms_absence_only_at_stable_master);
+	UT_RUN(test_ges_recovery_local_retirement_never_drains_ordinary_waiters);
+	UT_RUN(test_ges_recovery_local_retirement_retains_authority_guards);
+	UT_RUN(test_ges_recovery_remote_retirement_confirms_exact_absence);
+	UT_RUN(test_ges_recovery_remote_retirement_refuses_unproven_absence);
 	UT_RUN(test_ges_probe_validates_identity_then_obeys_final_stop_seal);
 	UT_RUN(test_retry_allowance_does_not_preempt_original_wait_deadline);
 	UT_RUN(test_exact_cancel_completes_original_dedup_identity);

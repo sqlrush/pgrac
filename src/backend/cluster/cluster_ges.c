@@ -227,8 +227,12 @@ ges_readiness_allows_master_request(uint32 opcode, const ClusterResId *resid, LO
 	if (!cluster_authority_readiness_managed() || cluster_serving_ready_is_current()
 		|| opcode != GES_REQ_OPCODE_RELEASE)
 		return true;
-	return holder != NULL && cluster_grd_holder_mode_by_id(resid, holder, &held_mode)
-		   && cluster_recovery_authority_resid_mode_allowed(resid, held_mode);
+	/* A duplicate RELEASE no longer has a mode to inspect. This only admits
+	 * the exact-removal attempt: its OK/NOT_FOUND result, not a failed mode
+	 * lookup, must prove retirement at the current master before any ACK. */
+	return holder != NULL
+		   && (!cluster_grd_holder_mode_by_id(resid, holder, &held_mode)
+			   || cluster_recovery_authority_resid_mode_allowed(resid, held_mode));
 }
 
 static bool
@@ -1244,9 +1248,10 @@ ges_dispatch_grant_identity(const ClusterGrdGrantIdentity *g, const ClusterResId
  *	false-timeout 53R70 — or hang when cluster.ges_request_timeout_ms = -1.
  *	release_and_drain itself removes the holder, so the caller must NOT also call
  *	release_holder_by_id on this path.  The return value is a GES reject reason:
- *	NONE only after the exact holder was removed under a stable local-master
- *	routing generation; missing holder, unknown/remastered owner, and invalid
- *	input are non-affirmative.
+ *	NONE only after the exact holder was removed or confirmed absent under a
+ *	stable local-master routing generation. Absence is an idempotent release,
+ *	not a grant; unavailable GRD authority, unknown/remastered owner and invalid
+ *	input remain non-affirmative.
  */
 uint32
 cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
@@ -1264,26 +1269,37 @@ cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 		return GES_REJECT_REASON_TIMEOUT;
 	if (!ges_readiness_allows_local_release_origin(resid))
 		return GES_REJECT_REASON_SHARD_FROZEN;
-	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
-		LOCKMODE held_mode;
-
-		if (!cluster_grd_holder_mode_by_id(resid, holder, &held_mode)
-			|| !cluster_recovery_authority_resid_mode_allowed(resid, held_mode))
-			return GES_REJECT_REASON_SHARD_FROZEN;
-		return cluster_grd_release_holder_by_id(resid, holder) == CLUSTER_GRD_ENTRY_OK
-				   ? GES_REJECT_REASON_NONE
-				   : GES_REJECT_REASON_TIMEOUT;
-	}
-
+	/* PGRAC: every local retirement, including recovery, must be witnessed
+	 * by the current master. No missing local copy can certify a remote hold.
+	 * Author: SqlRush <sqlrush@gmail.com> */
 	master_before = cluster_grd_lookup_master_gen(resid, &generation_before);
 	if (master_before != cluster_node_id)
 		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
-	n_granted = cluster_grd_release_and_drain(resid, holder, granted, lengthof(granted));
-	if (n_granted < 0)
-		return GES_REJECT_REASON_TIMEOUT;
+	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
+		LOCKMODE held_mode;
+		ClusterGrdEntryResult release_result;
+
+		if (!ges_recovery_release_resid_allowed(resid)
+			|| (cluster_grd_holder_mode_by_id(resid, holder, &held_mode)
+				&& !cluster_recovery_authority_resid_mode_allowed(resid, held_mode)))
+			return GES_REJECT_REASON_SHARD_FROZEN;
+		release_result = cluster_grd_release_holder_by_id(resid, holder);
+		if (release_result != CLUSTER_GRD_ENTRY_OK && release_result != CLUSTER_GRD_ENTRY_NOT_FOUND)
+			return GES_REJECT_REASON_TIMEOUT;
+		n_granted = 0; /* Repeated release cannot open ordinary waiters. */
+	} else {
+		n_granted = cluster_grd_release_and_drain(resid, holder, granted, lengthof(granted));
+		if (n_granted == CLUSTER_GRD_RELEASE_NOT_FOUND)
+			n_granted = 0;
+		else if (n_granted < 0)
+			return GES_REJECT_REASON_TIMEOUT;
+	}
+
 	master_after = cluster_grd_lookup_master_gen(resid, &generation_after);
 	if (master_after != cluster_node_id || generation_after != generation_before)
 		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
+	if (!ges_readiness_allows_local_release_origin(resid))
+		return GES_REJECT_REASON_SHARD_FROZEN;
 	for (i = 0; i < n_granted; i++)
 		ges_dispatch_grant_identity(&granted[i], resid);
 	return GES_REJECT_REASON_NONE;
@@ -1691,7 +1707,19 @@ cluster_ges_lmon_drain_work_queue(void)
 				 * returning each granted identity tagged REQUEST or CONVERT.
 				 */
 			ClusterGrdGrantIdentity granted[PGRAC_GRD_MAX_CONVERTS_PUBLIC + 1];
+			uint64 generation_before;
+			uint64 generation_after;
 			int n_granted;
+
+			/* PGRAC: a missing copy on a former master is not retirement proof.
+			 * Match the local path's mutation-adjacent routing/readiness checks.
+			 * Author: SqlRush <sqlrush@gmail.com> */
+			if (cluster_grd_lookup_master_gen(&resid, &generation_before) != cluster_node_id) {
+				ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+									GES_REJECT_REASON_MASTER_DEAD_NATIVE,
+									ges_request_shard_master_generation(req));
+				break;
+			}
 
 			if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
 				ClusterGrdEntryResult release_result;
@@ -1719,6 +1747,21 @@ cluster_ges_lmon_drain_work_queue(void)
 				}
 				if (n_granted == CLUSTER_GRD_RELEASE_NOT_FOUND)
 					n_granted = 0;
+			}
+
+			if (cluster_grd_lookup_master_gen(&resid, &generation_after) != cluster_node_id
+				|| generation_after != generation_before) {
+				ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+									GES_REJECT_REASON_MASTER_DEAD_NATIVE,
+									ges_request_shard_master_generation(req));
+				break;
+			}
+			if (!ges_readiness_allows_protocol_request(req->opcode, &resid,
+													   (LOCKMODE)req->lockmode)) {
+				ges_dispatch_reject((int32)item.source_node_id, &holder, &resid, req->opcode,
+									GES_REJECT_REASON_WORK_QUEUE_FULL,
+									ges_request_shard_master_generation(req));
+				break;
 			}
 
 			ges_forget_holder_acquire_receipts((uint32)item.source_node_id, &holder,

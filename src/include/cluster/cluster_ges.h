@@ -652,7 +652,9 @@ extern uint32 cluster_ges_send_release_and_wait(const struct ClusterResId *resid
  * this node, drain + grant + WAKE queued waiters (mirror of the remote
  * GES_RELEASE handler);  release_and_drain removes the holder, so the caller
  * must NOT also call cluster_grd_release_holder_by_id on this path.  Returns
- * GES_REJECT_REASON_NONE only for an exact, stable local-master release.
+ * GES_REJECT_REASON_NONE only for an exact, stable local-master release or
+ * confirmed absence. An absent holder drains no waiters; unavailable authority
+ * is not absence. Recovery-only release also leaves ordinary waiters frozen.
  */
 extern uint32 cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 												  const struct ClusterGrdHolderId *holder);
