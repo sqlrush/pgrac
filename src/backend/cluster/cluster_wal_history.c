@@ -1,5 +1,5 @@
 /*-------------------------------------------------------------------------
- * PGRAC: retained writer history immutable file ownership.
+ * PGRAC: retained history and pending writer startup immutable file ownership.
  * Author: SqlRush <sqlrush@gmail.com>
  *-------------------------------------------------------------------------
  */
@@ -18,6 +18,10 @@
 #define HISTORY_STAGED 1
 #define HISTORY_INSTALLED 2
 #define HISTORY_DISCARDED 3
+
+/* Two fixed backend-private families share the same no-clobber/owned-file
+ * discipline. The separate codecs and public entrypoints decide semantics. */
+typedef enum WalObjectKind { WAL_OBJECT_HISTORY, WAL_OBJECT_STARTUP } WalObjectKind;
 
 typedef struct HistoryDirs {
 	int objects;
@@ -66,13 +70,14 @@ history_close_dirs(HistoryDirs *dirs, ClusterControlRootResult *result)
 
 /* No allocation, mkdir, path traversal through symlinks or authority claim. */
 static ClusterControlRootResult
-history_open_dirs(uint32 node, bool staging, HistoryDirs *out)
+history_open_dirs(uint32 node, bool staging, WalObjectKind kind, HistoryDirs *out)
 {
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	int fds[4] = { -1, -1, -1, -1 };
 	char thread[32];
-	const char *parts[] = { "global", "wal_history", thread };
+	const char *parts[]
+		= { "global", kind == WAL_OBJECT_HISTORY ? "wal_history" : "wal_startup", thread };
 	struct stat st;
 
 	memset(out, 0, sizeof(*out));
@@ -113,28 +118,31 @@ done:
 }
 
 static void
-history_names(const ClusterWalHistoryStage *stage, char formal[112], char temp[40])
+history_names(const ClusterWalHistoryStage *stage, WalObjectKind kind, char formal[112],
+			  char temp[40])
 {
 	char hex[65];
 	for (unsigned i = 0; i < 32; i++)
 		snprintf(hex + i * 2, 3, "%02x", stage->sha256[i]);
-	snprintf(formal, 112, "history_" UINT64_FORMAT "-%s.bin", stage->generation, hex);
+	snprintf(formal, 112, "%s_" UINT64_FORMAT "-%s.bin",
+			 kind == WAL_OBJECT_HISTORY ? "history" : "startup", stage->generation, hex);
 	for (unsigned i = 0; i < 16; i++)
 		snprintf(hex + i * 2, 3, "%02x", stage->operation_uuid[i]);
 	snprintf(temp, 40, "%s.tmp", hex);
 }
 
 static bool
-history_stage_valid(const ClusterWalHistoryStage *stage)
+history_stage_valid(const ClusterWalHistoryStage *stage, WalObjectKind kind)
 {
 	return stage != NULL && stage->generation != 0 && stage->system_identifier != 0
 		   && stage->current_owner_incarnation != 0
 		   && stage->origin_node < CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		   && stage->length >= CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
-		   && stage->length <= CLUSTER_WAL_HISTORY_MAX_BYTES
-		   && (stage->length - CLUSTER_WAL_HISTORY_HEADER_BYTES - 4)
-					  % CLUSTER_CONTROL_ROOT_RECORD_BYTES
-				  == 0
+		   && (kind == WAL_OBJECT_STARTUP ? stage->length == CLUSTER_WAL_STARTUP_BYTES
+										  : (stage->length >= CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
+											 && stage->length <= CLUSTER_WAL_HISTORY_MAX_BYTES
+											 && (stage->length - CLUSTER_WAL_HISTORY_HEADER_BYTES
+												 - 4) % CLUSTER_CONTROL_ROOT_RECORD_BYTES
+													== 0))
 		   && stage->owner_pid == (uint32)getpid() && history_nonzero(stage->storage_uuid, 16)
 		   && history_nonzero(stage->authority_uuid, 16) && history_nonzero(stage->sha256, 32)
 		   && history_nonzero(stage->operation_uuid, 16) && stage->state >= HISTORY_STAGED
@@ -227,36 +235,20 @@ done:
 	return result;
 }
 
-ClusterControlRootResult
-cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
-							const ClusterWalHistoryImage *history, uint64 generation,
-							const uint8 operation_uuid[16], ClusterWalHistoryStage *out)
+/* Inputs were accepted by the family-specific codec before entering here. */
+static ClusterControlRootResult
+history_prepare_encoded(const ControlRootImage *root, uint32 origin_node, const uint8 *bytes,
+						size_t len, uint64 generation, const uint8 operation_uuid[16],
+						WalObjectKind kind, ClusterWalHistoryStage *out)
 {
 	ClusterControlRootResult result;
 	ClusterWalHistoryStage stage;
 	HistoryDirs dirs;
-	uint8 *bytes;
 	pg_cryptohash_ctx *ctx;
 	char formal[112], temp[40];
 	struct stat st;
-	size_t len = 0, used = 0;
+	size_t used = 0;
 	int fd = -1;
-	bool alias = history_overlaps_stage(root, sizeof(*root), out)
-				 || history_overlaps_stage(history, sizeof(*history), out)
-				 || history_overlaps_stage(operation_uuid, 16, out);
-
-	if (out == NULL)
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	memset(out, 0, sizeof(*out));
-	if (alias || !enableFsync || generation == 0 || operation_uuid == NULL
-		|| !history_nonzero(operation_uuid, 16))
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	bytes = palloc(CLUSTER_WAL_HISTORY_MAX_BYTES);
-	result = cluster_control_root_v2_history_encode(root, origin_node, history, bytes, &len);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-		pfree(bytes);
-		return result;
-	}
 	memset(&stage, 0, sizeof(stage));
 	stage.generation = generation;
 	stage.system_identifier = root->header.system_identifier;
@@ -270,16 +262,13 @@ cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
 	ctx = pg_cryptohash_create(PG_SHA256);
 	if (ctx == NULL || !history_hash(ctx, bytes, len, stage.sha256)) {
 		pg_cryptohash_free(ctx);
-		pfree(bytes);
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	}
 	pg_cryptohash_free(ctx);
-	history_names(&stage, formal, temp);
-	result = history_open_dirs(origin_node, true, &dirs);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-		pfree(bytes);
+	history_names(&stage, kind, formal, temp);
+	result = history_open_dirs(origin_node, true, kind, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	}
 	stage.object_dir_dev = dirs.objects_stat.st_dev;
 	stage.object_dir_ino = dirs.objects_stat.st_ino;
 	stage.staging_dir_dev = dirs.staging_stat.st_dev;
@@ -311,14 +300,62 @@ done:
 			(void)pg_fsync(dirs.staging);
 	}
 	history_close_dirs(&dirs, &result);
-	pfree(bytes);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		*out = stage;
 	return result;
 }
 
 ClusterControlRootResult
-cluster_wal_history_install(ClusterWalHistoryStage *stage)
+cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
+							const ClusterWalHistoryImage *history, uint64 generation,
+							const uint8 operation_uuid[16], ClusterWalHistoryStage *out)
+{
+	ClusterControlRootResult result;
+	uint8 *bytes;
+	size_t len = 0;
+	bool alias = history_overlaps_stage(root, sizeof(*root), out)
+				 || history_overlaps_stage(history, sizeof(*history), out)
+				 || history_overlaps_stage(operation_uuid, 16, out);
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || !enableFsync || generation == 0 || operation_uuid == NULL
+		|| !history_nonzero(operation_uuid, 16))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	bytes = palloc(CLUSTER_WAL_HISTORY_MAX_BYTES);
+	result = cluster_control_root_v2_history_encode(root, origin_node, history, bytes, &len);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = history_prepare_encoded(root, origin_node, bytes, len, generation, operation_uuid,
+										 WAL_OBJECT_HISTORY, out);
+	pfree(bytes);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_startup_prepare(const ControlRootImage *root, uint32 origin_node,
+							const ClusterWalStartupImage *startup, ClusterWalStartupStage *out)
+{
+	ClusterControlRootResult result;
+	ControlRootStartupRefV3 ref;
+	uint8 bytes[CLUSTER_WAL_STARTUP_BYTES];
+	bool alias = history_overlaps_stage(root, sizeof(*root), out)
+				 || history_overlaps_stage(startup, sizeof(*startup), out);
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || !enableFsync)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_control_root_v3_startup_encode(root, origin_node, startup, bytes, &ref);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = history_prepare_encoded(root, origin_node, bytes, sizeof(bytes), ref.generation,
+										 startup->operation_uuid, WAL_OBJECT_STARTUP, out);
+	return result;
+}
+
+static ClusterControlRootResult
+history_install(ClusterWalHistoryStage *stage, WalObjectKind kind)
 {
 	ClusterControlRootResult result;
 	HistoryDirs dirs;
@@ -326,7 +363,7 @@ cluster_wal_history_install(ClusterWalHistoryStage *stage)
 	uint8 *staged, *installed;
 	char formal[112], temp[40];
 
-	if (!enableFsync || !history_stage_valid(stage) || stage->state == HISTORY_DISCARDED)
+	if (!enableFsync || !history_stage_valid(stage, kind) || stage->state == HISTORY_DISCARDED)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
@@ -337,8 +374,8 @@ cluster_wal_history_install(ClusterWalHistoryStage *stage)
 		pfree(staged);
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	}
-	history_names(stage, formal, temp);
-	result = history_open_dirs(stage->origin_node, true, &dirs);
+	history_names(stage, kind, formal, temp);
+	result = history_open_dirs(stage->origin_node, true, kind, &dirs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	if (!history_dirs_match(&dirs, stage)) {
@@ -385,17 +422,17 @@ done:
 	return result;
 }
 
-ClusterControlRootResult
-cluster_wal_history_discard(ClusterWalHistoryStage *stage)
+static ClusterControlRootResult
+history_discard(ClusterWalHistoryStage *stage, WalObjectKind kind)
 {
 	ClusterControlRootResult result;
 	HistoryDirs dirs;
 	char formal[112], temp[40];
 
-	if (!enableFsync || !history_stage_valid(stage))
+	if (!enableFsync || !history_stage_valid(stage, kind))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	history_names(stage, formal, temp);
-	result = history_open_dirs(stage->origin_node, true, &dirs);
+	history_names(stage, kind, formal, temp);
+	result = history_open_dirs(stage->origin_node, true, kind, &dirs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!history_dirs_match(&dirs, stage)) {
@@ -422,21 +459,92 @@ done:
 	return result;
 }
 
+ClusterControlRootResult
+cluster_wal_history_install(ClusterWalHistoryStage *stage)
+{
+	return history_install(stage, WAL_OBJECT_HISTORY);
+}
+
+ClusterControlRootResult
+cluster_wal_history_discard(ClusterWalHistoryStage *stage)
+{
+	return history_discard(stage, WAL_OBJECT_HISTORY);
+}
+
+ClusterControlRootResult
+cluster_wal_startup_install(ClusterWalStartupStage *stage)
+{
+	return history_install(stage, WAL_OBJECT_STARTUP);
+}
+
+ClusterControlRootResult
+cluster_wal_startup_discard(ClusterWalStartupStage *stage)
+{
+	return history_discard(stage, WAL_OBJECT_STARTUP);
+}
+
 /* PGRAC: only the selected immutable object is consumed. This is evidence,
  * not publication, recovery completion, old-writer isolation or WAL reuse.
  * Author: SqlRush <sqlrush@gmail.com>
  */
+static ClusterControlRootResult
+history_read_selected(uint32 node, WalObjectKind kind, ClusterWalHistoryStage *selected,
+					  uint8 *bytes)
+{
+	ClusterControlRootResult result;
+	HistoryDirs dirs, current;
+	pg_cryptohash_ctx *ctx;
+	struct stat st;
+	char formal[112], unused[40];
+
+	history_names(selected, kind, formal, unused);
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = history_open_dirs(node, false, kind, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (fstatat(dirs.objects, formal, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+		result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	if (!history_owned(&st, false)) {
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	if (kind == WAL_OBJECT_STARTUP ? st.st_size != CLUSTER_WAL_STARTUP_BYTES
+								   : (st.st_size < CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
+									  || st.st_size > CLUSTER_WAL_HISTORY_MAX_BYTES)) {
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		goto done;
+	}
+	selected->length = st.st_size;
+	selected->file_dev = st.st_dev;
+	selected->file_ino = st.st_ino;
+	result = history_read_at(dirs.objects, formal, selected, true, false, bytes, ctx);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	result = history_open_dirs(node, false, kind, &current);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (dirs.objects_stat.st_dev != current.objects_stat.st_dev
+			|| dirs.objects_stat.st_ino != current.objects_stat.st_ino
+			|| !history_exact_entry(current.objects, formal, selected)))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	history_close_dirs(&current, &result);
+done:
+	history_close_dirs(&dirs, &result);
+	pg_cryptohash_free(ctx);
+	/* No open descriptor survives a decoder allocation/error. */
+	return result;
+}
+
 ClusterControlRootResult
 cluster_wal_history_read_locked(const ControlRootImage *root, uint32 node,
 								ClusterWalHistoryImage *out)
 {
 	ClusterControlRootResult result;
 	ClusterWalHistoryStage selected = { 0 };
-	HistoryDirs dirs, current;
-	pg_cryptohash_ctx *ctx;
-	struct stat st;
 	uint8 *bytes;
-	char formal[112], unused[40];
 	uintptr_t a = (uintptr_t)root, b = (uintptr_t)out;
 	bool alias
 		= root != NULL && out != NULL && (a <= b ? b - a < sizeof(*root) : a - b < sizeof(*out));
@@ -457,48 +565,45 @@ cluster_wal_history_read_locked(const ControlRootImage *root, uint32 node,
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	selected.generation = root->refs[node].history_generation;
 	memcpy(selected.sha256, root->refs[node].history_sha256, 32);
-	history_names(&selected, formal, unused);
 	bytes = palloc(CLUSTER_WAL_HISTORY_MAX_BYTES);
-	ctx = pg_cryptohash_create(PG_SHA256);
-	if (ctx == NULL) {
-		pfree(bytes);
-		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	}
-	result = history_open_dirs(node, false, &dirs);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		goto done;
-	if (fstatat(dirs.objects, formal, &st, AT_SYMLINK_NOFOLLOW) != 0) {
-		result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : CLUSTER_CONTROL_ROOT_IO_ERROR;
-		goto done;
-	}
-	if (!history_owned(&st, false)) {
-		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
-		goto done;
-	}
-	if (st.st_size < CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
-		|| st.st_size > CLUSTER_WAL_HISTORY_MAX_BYTES) {
-		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
-		goto done;
-	}
-	selected.length = st.st_size;
-	selected.file_dev = st.st_dev;
-	selected.file_ino = st.st_ino;
-	result = history_read_at(dirs.objects, formal, &selected, true, false, bytes, ctx);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		goto done;
-	result = history_open_dirs(node, false, &current);
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& (dirs.objects_stat.st_dev != current.objects_stat.st_dev
-			|| dirs.objects_stat.st_ino != current.objects_stat.st_ino
-			|| !history_exact_entry(current.objects, formal, &selected)))
-		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-	history_close_dirs(&current, &result);
-done:
-	history_close_dirs(&dirs, &result);
-	pg_cryptohash_free(ctx);
-	/* No open descriptor survives a decoder allocation/error. */
+	result = history_read_selected(node, WAL_OBJECT_HISTORY, &selected, bytes);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_control_root_v2_history_decode(bytes, selected.length, root, node, out);
 	pfree(bytes);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_startup_read_locked(const ControlRootImage *root, uint32 node,
+								ClusterWalStartupImage *out)
+{
+	ClusterControlRootResult result;
+	ClusterWalStartupStage selected = { 0 };
+	uint8 bytes[CLUSTER_WAL_STARTUP_BYTES];
+	uintptr_t a = (uintptr_t)root, b = (uintptr_t)out;
+	bool alias
+		= root != NULL && out != NULL && (a <= b ? b - a < sizeof(*root) : a - b < sizeof(*out));
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || root == NULL || node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (root->header.format_version != 3)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (!root->present[node])
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (root->startup[node].generation == 0 && !history_nonzero(root->startup[node].sha256, 32))
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (root->startup[node].generation == 0 || !history_nonzero(root->startup[node].sha256, 32))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	selected.generation = root->startup[node].generation;
+	memcpy(selected.sha256, root->startup[node].sha256, 32);
+	result = history_read_selected(node, WAL_OBJECT_STARTUP, &selected, bytes);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_control_root_v3_startup_decode(bytes, sizeof(bytes), root, node, out);
 	return result;
 }

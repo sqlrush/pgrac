@@ -41,6 +41,14 @@ typedef struct ControlRootRecordRefsV2 {
 	uint8 claim_sha256[PG_SHA256_DIGEST_LENGTH];
 } ControlRootRecordRefsV2;
 
+/* PGRAC: explicit v3 extension, separate from the unchanged v2 carrier.
+ * A reference is pending work, never startup or serving permission.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ControlRootStartupRefV3 {
+	uint64 generation;
+	uint8 sha256[PG_SHA256_DIGEST_LENGTH];
+} ControlRootStartupRefV3;
+
 typedef struct ControlRootHeader {
 	uint64 file_txn_seq;
 	uint64 system_identifier;
@@ -66,6 +74,7 @@ typedef struct ControlRootImage {
 	ControlRootHeader header;
 	ClusterControlRootSnapshot records[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
 	ControlRootRecordRefsV2 refs[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
+	ControlRootStartupRefV3 startup[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
 	uint64 publisher_incarnation[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
 	uint32 publisher_node[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
 	uint32 record_crc32c[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
@@ -74,6 +83,7 @@ typedef struct ControlRootImage {
 
 StaticAssertDecl(sizeof(ControlRootCommonV2) == 184, "root-v2 logical common carrier");
 StaticAssertDecl(sizeof(ControlRootRecordRefsV2) == 112, "root-v2 logical record references");
+StaticAssertDecl(sizeof(ControlRootStartupRefV3) == 40, "root-v3 logical startup reference");
 
 /* PGRAC: bounded retained-writer input, never an authority/retirement proof.
  * Author: SqlRush <sqlrush@gmail.com>
@@ -93,6 +103,61 @@ typedef struct ClusterWalHistoryImage {
 	uint32 count;
 	ClusterWalHistoryRecord records[CLUSTER_WAL_HISTORY_MAX_RECORDS];
 } ClusterWalHistoryImage;
+
+/* PGRAC: decoded immutable pending initialization, never an authority token.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#define CLUSTER_WAL_STARTUP_BYTES 1536
+typedef enum ClusterWalStartupPhase {
+	CLUSTER_WAL_STARTUP_RESERVED = 1,
+	CLUSTER_WAL_STARTUP_INITIALIZING = 2,
+	CLUSTER_WAL_STARTUP_DURABLE = 3
+} ClusterWalStartupPhase;
+
+typedef enum ClusterWalStartupInputKind {
+	CLUSTER_WAL_STARTUP_CLEAN = 1,
+	CLUSTER_WAL_STARTUP_RECOVERED = 2,
+	CLUSTER_WAL_STARTUP_IMPORTED = 3
+} ClusterWalStartupInputKind;
+
+typedef struct ClusterWalStartupImage {
+	uint32 phase;
+	uint32 input_kind;
+	uint8 operation_uuid[16];
+	uint64 database_incarnation;
+	uint64 config_generation;
+	uint64 formation_epoch;
+	uint64 predecessor_file_sequence;
+	uint8 predecessor_file_sha256[32];
+	uint64 generation;
+	XLogRecPtr first_segment_lsn;
+	TimeLineID timeline;
+	uint32 segment_size;
+	uint8 predecessor_evidence_sha256[32];
+	XLogRecPtr input_record_start;
+	XLogRecPtr input_record_end;
+	pg_crc32c input_record_crc;
+	TimeLineID input_timeline;
+	XLogRecPtr sealed_input_end;
+	ClusterWalHistoryRecord predecessor;
+	ClusterWalHistoryRecord successor;
+	ClusterWalThreadClaimV2 claim;
+	ClusterWalDurablePrefix prefix;
+	TimeLineID prefix_timeline;
+} ClusterWalStartupImage;
+
+/* Exact selected-object decoding. Does not prove the evidence digest,
+ * inspect physical WAL or authorize a state transition. All output clears on
+ * refusal, and no input may overlap it. Caller owns root/CF qualification. */
+extern ClusterControlRootResult
+cluster_control_root_v3_startup_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
+									   uint32 origin_node, ClusterWalStartupImage *out);
+
+/* Encode for the prospective root, returning its exact immutable reference.
+ * Does not publish the reference or validate physical exit/WAL evidence.
+ * Inputs and outputs must not overlap; both outputs clear on refusal. */
+extern ClusterControlRootResult cluster_control_root_v3_startup_encode(
+	const ControlRootImage *root, uint32 origin_node, const ClusterWalStartupImage *startup,
+	uint8 bytes[CLUSTER_WAL_STARTUP_BYTES], ControlRootStartupRefV3 *out_ref);
 
 /* Root is already decoded v2; its exact origin record selects the object.
  * No I/O, sorting, repair or admission. Caller owns hash resources. Inputs must
@@ -144,6 +209,20 @@ cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
 extern ClusterControlRootResult cluster_wal_history_install(ClusterWalHistoryStage *stage);
 extern ClusterControlRootResult cluster_wal_history_discard(ClusterWalHistoryStage *stage);
 
+/* Same owned immutable-file discipline, but a distinct namespace and fixed
+ * PGWG size. A stage of either family cannot be installed by the other API.
+ * Installation is not root selection, native mutation or serving permission. */
+typedef ClusterWalHistoryStage ClusterWalStartupStage;
+extern ClusterControlRootResult cluster_wal_startup_prepare(const ControlRootImage *root,
+															uint32 origin_node,
+															const ClusterWalStartupImage *startup,
+															ClusterWalStartupStage *out);
+extern ClusterControlRootResult cluster_wal_startup_install(ClusterWalStartupStage *stage);
+extern ClusterControlRootResult cluster_wal_startup_discard(ClusterWalStartupStage *stage);
+extern ClusterControlRootResult cluster_wal_startup_read_locked(const ControlRootImage *root,
+																uint32 origin_node,
+																ClusterWalStartupImage *out);
+
 /* Exact read-only consumption under existing clusterwide CF-S/X. No staging
  * directory or write permission required; refusal clears the whole output. */
 extern ClusterControlRootResult cluster_wal_history_read_locked(const ControlRootImage *root,
@@ -160,6 +239,16 @@ extern ClusterControlRootResult cluster_control_root_v2_decode(const uint8 *byte
 															   uint64 system_identifier,
 															   ControlRootImage *out);
 extern ClusterControlRootResult cluster_control_root_v2_encode(ControlRootImage *image);
+
+/* PGRAC: explicit startup-capable representation only. These APIs do not
+ * change a v1/v2 file reader, publish objects or admit a native startup.
+ * Decode clears all output on refusal; encode clears bytes on refusal.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult cluster_control_root_v3_decode(const uint8 *bytes, size_t len,
+															   const uint8 storage_uuid[16],
+															   uint64 system_identifier,
+															   ControlRootImage *out);
+extern ClusterControlRootResult cluster_control_root_v3_encode(ControlRootImage *image);
 
 /* PGRAC: root-selected COMMON image plus exact configuration-object binding,
  * not a per-thread startup projection or GUC-application acknowledgement.
