@@ -4703,10 +4703,86 @@ UT_TEST(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_rec
 	disconnected_terminal_peer = -1;
 }
 
+UT_TEST(test_pre2_last_receipt_after_terminal_cf_peer_does_not_need_new_cf)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	seed_post_barrier(&plan);
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	for (int node = 0; node < 4; node++)
+		identity_pre2_phase[node] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != cluster_node_id)
+			release_peer_message(peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 3000 + peer);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	release_reply_on_request = true;
+	release_receipt_on_reply = false;
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_release_lmon_tick();
+	UT_ASSERT(cluster_normal_stop_peer_receipt_tail(&identity_open, identity_root, 3, 103));
+	/* The old master has consumed our sixth leg and closed. Its actual
+	 * already received final receipt can still reach us, but it no longer
+	 * services new CF requests. This fixture grants no replacement master. */
+	disconnected_terminal_peer = 3;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	reads = identity_pre2_reads;
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != cluster_node_id)
+			release_peer_message(peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, 3000 + peer);
+	UT_ASSERT_EQ(cl_state->phase1_release_receipt_seen[0], 11);
+	cl_normal_stop_release_lmon_tick();
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT(cluster_normal_stop_protocol_closed());
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	disconnected_terminal_peer = -1;
+}
+
+UT_TEST(test_pre2_release_suffix_keeps_live_identity_and_owner_guards)
+{
+	ClusterPhase1FullStopPlan plan;
+	ClusterNormalStopModuleObservation observation;
+	for (unsigned fault = 0; fault < 9; fault++) {
+		seed_release_exchange(&plan);
+		cluster_shared_config = true;
+		identity_pre2_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		if (fault == 0)
+			identity_formation.membership.last_admitted_incarnation[1]++;
+		if (fault == 1)
+			identity_formation.local_epoch++;
+		if (fault == 2)
+			identity_root[100] ^= 1;
+		if (fault == 3)
+			cl_state->ack_bitmap[0] &= ~2;
+		if (fault == 4)
+			pg_atomic_write_u32(&cl_normal_stop->service_seal, 0);
+		if (fault == 5)
+			fixture_now = plan.absolute_deadline_us;
+		if (fault == 6)
+			pg_atomic_write_u32(&cl_normal_stop->frontends_gone, 0);
+		if (fault == 7)
+			module_results[9] = CLUSTER_NORMAL_STOP_PENDING;
+		if (fault == 8)
+			identity_match_result = CLUSTER_NORMAL_STOP_PENDING;
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, &observation),
+					 fault < 7 ? CLUSTER_NORMAL_STOP_INVALID : CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+		UT_ASSERT_EQ(identity_pre2_reads, 0);
+		if (fault >= 7)
+			UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		if (fault == 7)
+			UT_ASSERT(strcmp(observation.module, "BUFMGR") == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(114);
+	UT_PLAN(116);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
@@ -4821,6 +4897,8 @@ main(void)
 	UT_RUN(test_terminal_peer_tail_requires_real_five_legs_not_last_receipt);
 	UT_RUN(test_terminal_peer_tail_rejects_each_missing_leg_or_changed_binding);
 	UT_RUN(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_reconnect);
+	UT_RUN(test_pre2_last_receipt_after_terminal_cf_peer_does_not_need_new_cf);
+	UT_RUN(test_pre2_release_suffix_keeps_live_identity_and_owner_guards);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

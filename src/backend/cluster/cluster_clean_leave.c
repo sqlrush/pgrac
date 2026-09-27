@@ -137,6 +137,8 @@ static ClNormalStopFrontInbox cl_normal_stop_front_inbox[CLUSTER_PHASE1_FULL_STO
 
 static void cl_normal_stop_fronts_lmon_tick(void);
 static void cl_normal_stop_post_lmon_tick(void);
+static ClusterNormalStopPollResult cl_normal_stop_release_observe(ClusterPhase1FullStopPlan *out,
+																  const char **reason_out);
 static bool cl_phase1_full_stop_send_admitted(ClusterICSendResult result);
 static ClusterICSendResult cl_phase1_full_stop_send_release_announce(int32 dest_node,
 																	 uint8 wire_round, uint64 nonce,
@@ -1042,6 +1044,12 @@ cl_normal_stop_identity_poll(bool post_checkpoint, ClusterPhase1FullStopPlan *ou
 	if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		return CLUSTER_NORMAL_STOP_INVALID;
 
+	/* RELEASE owns only the already admitted terminal exchange. A peer
+	 * master may have completed that exchange and stopped serving CF. */
+	if (cluster_shared_config && post_checkpoint
+		&& pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1)
+		return cl_normal_stop_release_observe(out, reason_out);
+
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	published = pg_atomic_read_u32(&cl_normal_stop->identity_published);
 	if (published == 1) {
@@ -1141,8 +1149,24 @@ cl_normal_stop_identity_recheck(bool post_checkpoint, const ClusterPhase1FullSto
 	if (!cluster_shared_config)
 		return cl_normal_stop_identity_poll(post_checkpoint, out, reason_out);
 	if (sample == NULL || out == NULL || cl_state == NULL || cl_normal_stop == NULL
-		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-		|| !sample->pre2_root_observed
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT)
+		goto done;
+	if (post_checkpoint && pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1) {
+		ClusterPhase1FullStopPlan verified;
+		result = cl_normal_stop_release_observe(&verified, reason_out);
+		if (result == CLUSTER_NORMAL_STOP_READY) {
+			if (sample->epoch != verified.epoch
+				|| sample->own_wal_started_at != verified.own_wal_started_at
+				|| memcmp(sample->member_incarnations, verified.member_incarnations,
+						  sizeof(verified.member_incarnations))
+					   != 0)
+				result = CLUSTER_NORMAL_STOP_INVALID;
+			else
+				*out = verified;
+		}
+		goto done;
+	}
+	if (!sample->pre2_root_observed
 		|| sample->pre2_member_phase[cluster_node_id]
 			   != (post_checkpoint ? CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT
 								   : CLUSTER_CONTROL_ROOT_STOP_ACTIVE))
@@ -2012,6 +2036,18 @@ cl_normal_stop_post_peer_matches(const ClusterPhase1FullStopPlan *plan, int peer
 	bool active = false, stopped = false;
 	if (source_nonce == 0 && peer >= 0 && peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT)
 		source_nonce = cl_state->phase1_release_request_nonce[peer];
+	if (cluster_shared_config && pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1) {
+		/* All source checkpoint replies preceded RELEASE arm. Do not turn
+		 * their exact terminal successor into a fresh phase acquisition. */
+		if (epoch != plan->epoch || peer < 0 || peer >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+			|| peer == cluster_node_id || source_nonce == 0
+			|| source_nonce != cl_state->phase1_release_request_nonce[peer]) {
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+			return false;
+		}
+		return cl_normal_stop_identity_recheck(true, plan, &verified, NULL)
+			   == CLUSTER_NORMAL_STOP_READY;
+	}
 	if (epoch != plan->epoch
 		|| !cl_normal_stop_capture_source_phase(plan, peer, source_nonce, &active, &stopped)
 		|| active || !stopped) {
@@ -2257,6 +2293,65 @@ cl_normal_stop_release_complete_locked(void)
 		   && cl_state->phase1_release_reply_seen[0] == peers
 		   && cl_state->phase1_release_receipt_sent[0] == peers
 		   && cl_state->phase1_release_receipt_seen[0] == peers;
+}
+
+/* PGRAC: RELEASE arm follows every root-authenticated checkpoint reply,
+ * the DATA producer cut and PI retirement. Finish that same exchange using
+ * its exact retained binding and live semantic/formation checks. This is
+ * not a root observation: no root token or pre2_root_observed flag escapes,
+ * and it cannot be used to publish thread/database CLOSED. In particular
+ * the last real receipt must not depend on a peer that has already exited
+ * reacquiring CF for us. All owner/transport censuses still run afterwards.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterNormalStopPollResult
+cl_normal_stop_release_observe(ClusterPhase1FullStopPlan *out, const char **reason_out)
+{
+	ClusterPhase1FullStopPlan observed, verified;
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *reason = "NORMAL_STOP_RELEASE_TRANSCRIPT_INVALID";
+	bool valid;
+
+	memset(out, 0, sizeof(*out));
+	memset(&observed, 0, sizeof(observed));
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	observed.valid = true;
+	observed.epoch = cl_normal_stop->epoch;
+	observed.own_wal_started_at = cl_normal_stop->own_wal_started_at;
+	observed.attempt_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	observed.absolute_deadline_us = cl_state->barrier_deadline_us;
+	memcpy(observed.member_incarnations, cl_normal_stop->member_incarnations,
+		   sizeof(observed.member_incarnations));
+	open = cl_normal_stop->open_record;
+	memcpy(root, cl_normal_stop->root_descriptor, sizeof(root));
+	valid = pg_atomic_read_u32(&cl_normal_stop->phase) == CLUSTER_NORMAL_STOP_POST_STOPPED
+			&& cl_normal_stop_release_state_locked(&observed, cl_normal_stop_config_service_mask(),
+												   true);
+	LWLockRelease(&cl_state->lock);
+	if (!valid || cluster_wal_thread_id() != (uint16)(cluster_node_id + 1))
+		goto done;
+	result = cl_normal_stop_recheck_observation(&open, root, &observed, &verified, &reason);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		goto done;
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	valid = cl_normal_stop_bound_identity_matches(&open, root, &verified)
+			&& pg_atomic_read_u32(&cl_normal_stop->phase) == CLUSTER_NORMAL_STOP_POST_STOPPED
+			&& cl_normal_stop_release_state_locked(&verified, cl_normal_stop_config_service_mask(),
+												   true);
+	LWLockRelease(&cl_state->lock);
+	if (valid)
+		*out = verified;
+	else
+		result = CLUSTER_NORMAL_STOP_INVALID;
+done:
+	if (result == CLUSTER_NORMAL_STOP_INVALID)
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+	if (reason_out != NULL)
+		*reason_out = result == CLUSTER_NORMAL_STOP_READY
+						  ? "NORMAL_STOP_RELEASE_TRANSCRIPT_NOT_ROOT_EVIDENCE"
+						  : reason;
+	return result;
 }
 
 /* Read-only permission from the authenticated, already-bound all-member
