@@ -687,6 +687,7 @@ static ControlFileData *ControlFile = NULL;
 /* PGRAC: process-local native initialization owner; never a serving grant.
  * Author: SqlRush <sqlrush@gmail.com> */
 static ClusterWalStartupImage clusterStartupWriter;
+static bool clusterStartupWriterSelected;
 static bool clusterStartupWriterBound;
 static bool clusterStartupWriterInstalled;
 #endif
@@ -6047,25 +6048,24 @@ CheckRequiredParameterValues(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
-/* PGRAC: after the sealed input has been read, switch the exact native
- * initializer to its independent successor stream. No SQL admission.
+/* PGRAC: select durable initialization ownership before native side effects.
+ * This does not switch pg_wal: old input must remain readable until native
+ * recovery has finished. No SQL admission is granted by either step.
  * Author: SqlRush <sqlrush@gmail.com> */
-static XLogRecPtr
-ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
+static void
+ClusterStartupWriterSelect(void)
 {
 	ClusterWalDurablePrefixRef restart;
-	ClusterWalStartupImage selected, routed;
+	ClusterWalStartupImage selected;
 	ClusterControlRootResult result;
-	XLogRecPtr first = InvalidXLogRecPtr;
 
-	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
-		|| !cluster_controlfile_shared_authority || clusterStartupWriterBound
-		|| clusterStartupWriterInstalled || CritSectionCount != 0 || ShutdownRequestPending
-		|| InRecovery || ArchiveRecoveryRequested || input->standby_signal_file_found
-		|| input->recovery_signal_file_found || input->abortedRecPtr != InvalidXLogRecPtr
-		|| input->missingContrecPtr != InvalidXLogRecPtr || ControlFile->state != DB_SHUTDOWNED
-		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
-		|| cluster_cf_held(ExclusiveLock) || !cluster_wal_thread_restart_v2_ref(&restart))
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || clusterStartupWriterSelected
+		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| ControlFile->state != DB_SHUTDOWNED || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock)
+		|| !cluster_wal_thread_restart_v2_ref(&restart))
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native clean startup has no exact immutable input")));
 	for (;;) {
@@ -6094,16 +6094,52 @@ ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
 		|| selected.first_segment_lsn == 0 || selected.first_segment_lsn % wal_segment_size != 0
 		|| selected.first_segment_lsn < selected.sealed_input_end
 		|| selected.first_segment_lsn > UINT64_MAX - wal_segment_size
-		|| input->endOfLog != selected.sealed_input_end
-		|| input->endOfLog != selected.input_record_end
-		|| input->lastRec != selected.input_record_start
-		|| input->lastRecTLI != selected.input_timeline
-		|| input->endOfLogTLI != selected.input_timeline
+		|| selected.sealed_input_end != selected.input_record_end
 		|| selected.timeline != selected.input_timeline
 		|| ControlFile->checkPoint != selected.predecessor.snapshot.checkpoint_lower_lsn
 		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
 		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native startup contradicts its selected clean input")));
+	clusterStartupWriter = selected;
+	clusterStartupWriterSelected = true;
+}
+
+/* PGRAC: after FinishWalRecovery, revalidate the selected initializer and
+ * bind its independent successor stream before native WAL writes.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static XLogRecPtr
+ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
+{
+	ClusterWalStartupImage selected, routed;
+	ClusterControlRootResult result;
+	XLogRecPtr first = InvalidXLogRecPtr;
+
+	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterSelected
+		|| clusterStartupWriterBound || clusterStartupWriterInstalled || CritSectionCount != 0
+		|| ShutdownRequestPending || InRecovery || ArchiveRecoveryRequested
+		|| input->standby_signal_file_found || input->recovery_signal_file_found
+		|| input->abortedRecPtr != InvalidXLogRecPtr
+		|| input->missingContrecPtr != InvalidXLogRecPtr || ControlFile->state != DB_SHUTDOWNED
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native clean startup has no selected initialization owner")));
+	selected = clusterStartupWriter;
+	if (input->endOfLog != selected.sealed_input_end || input->endOfLog != selected.input_record_end
+		|| input->lastRec != selected.input_record_start
+		|| input->lastRecTLI != selected.input_timeline
+		|| input->endOfLogTLI != selected.input_timeline
+		|| ControlFile->checkPoint != selected.predecessor.snapshot.checkpoint_lower_lsn
+		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
 						errmsg("native recovery result contradicts its selected clean input")));
+	result = cluster_control_root_v3_startup_read_writer(&selected.claim.identity,
+														 selected.operation_uuid, &routed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(&routed, &selected, sizeof(selected)) != 0)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native initialization owner changed before WAL binding")));
 	result = cluster_control_root_v3_startup_route_writer(&selected.claim.identity,
 														  selected.operation_uuid, &routed);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -6376,6 +6412,14 @@ StartupXLOG(void)
 #ifdef XLOG_REPLAY_DELAY
 	if (ControlFile->state != DB_SHUTDOWNED)
 		pg_usleep(60000000L);
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: native startup can change side files before it emits any WAL.
+	 * First make that work belong to the exact recoverable initializer.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config)
+		ClusterStartupWriterSelect();
 #endif
 
 	/*

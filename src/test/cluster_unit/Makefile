@@ -737,8 +737,20 @@ test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	mv $@.tmp $@
 
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	awk '/^ClusterStartupWriterSelect\(/ { print "static void"; emit=1; count++ } \
+	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# PGRAC: execute the real earliest startup-directory mutation call site.
+# Selecting initialization later than this boundary cannot close a killed
+# initializer's side effects. Author: SqlRush <sqlrush@gmail.com>
+test_cluster_startup_early_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } \
+	     owner && /^\#ifdef XLOG_REPLAY_DELAY/ { boundary=1 } \
+	     boundary && /^\#endif/ { emit=1; boundary=0; count++; next } \
+	     emit { print; if (/ValidateXLOGDirectoryStructure\(\);/) emit=0 } \
+	     /^}/ { owner=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_startup_insert_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -775,7 +787,7 @@ test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/tra
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.

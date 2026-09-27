@@ -55,6 +55,9 @@ static unsigned native_writes, shutdown_calls;
 static ClusterControlRootResult returns[4];
 static ClusterWalStartupImage clusterStartupWriter;
 static bool clusterStartupWriterBound, clusterStartupWriterInstalled;
+static bool clusterStartupWriterSelected;
+static unsigned startup_directory_calls;
+static bool directory_before_selection;
 BackendType MyBackendType = B_INVALID;
 static bool startup_binding_ok, startup_view_ok;
 static unsigned startup_calls, install_calls;
@@ -63,8 +66,8 @@ bool InRecovery, ArchiveRecoveryRequested;
 int wal_segment_size = 16 * 1024 * 1024;
 static ClusterWalStartupImage offered;
 static EndOfWalRecoveryInfo input;
-static unsigned advance_calls, route_calls, bind_calls;
-static bool restart_ok, route_ok, bind_ok;
+static unsigned advance_calls, route_calls, bind_calls, writer_read_calls;
+static bool restart_ok, route_ok, bind_ok, writer_read_ok, writer_read_changed;
 static ClusterControlRootResult advance_returns[4];
 
 void *
@@ -365,6 +368,21 @@ cluster_control_root_v3_startup_advance_clean(const ClusterWalDurablePrefixRef *
 }
 
 ClusterControlRootResult
+cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *self,
+											const uint8 uuid[16], ClusterWalStartupImage *out)
+{
+	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
+	UT_ASSERT(clusterStartupWriterSelected && !clusterStartupWriterBound);
+	UT_ASSERT(memcmp(self, &offered.claim.identity, sizeof(*self)) == 0);
+	UT_ASSERT(memcmp(uuid, offered.operation_uuid, 16) == 0);
+	writer_read_calls++;
+	*out = offered;
+	if (writer_read_changed)
+		out->formation_epoch++;
+	return writer_read_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
 cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *self,
 											 const uint8 uuid[16], ClusterWalStartupImage *out)
 {
@@ -467,13 +485,17 @@ reset_fixture(void)
 	memset(install_returns, 0, sizeof(install_returns));
 	memset(&clusterStartupWriter, 0, sizeof(clusterStartupWriter));
 	clusterStartupWriterBound = clusterStartupWriterInstalled = false;
+	clusterStartupWriterSelected = false;
+	startup_directory_calls = 0;
+	directory_before_selection = false;
 	startup_binding_ok = startup_view_ok = true;
 	startup_calls = install_calls = 0;
 	memset(&offered, 0, sizeof(offered));
 	memset(&input, 0, sizeof(input));
 	memset(advance_returns, 0, sizeof(advance_returns));
-	advance_calls = route_calls = bind_calls = 0;
-	restart_ok = route_ok = bind_ok = true;
+	advance_calls = route_calls = bind_calls = writer_read_calls = 0;
+	restart_ok = route_ok = bind_ok = writer_read_ok = true;
+	writer_read_changed = false;
 	InRecovery = ArchiveRecoveryRequested = false;
 }
 static bool
@@ -837,12 +859,104 @@ writer_begin_fixture(void)
 	clusterStartupWriterBound = false;
 }
 
+/* Only the filesystem operation is replaced. The selected boundary and its
+ * order relative to native startup execute the actual StartupXLOG body.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+ValidateXLOGDirectoryStructure(void)
+{
+	startup_directory_calls++;
+	directory_before_selection |= cluster_shared_config && !clusterStartupWriterSelected;
+}
+
+static bool
+startup_first_native_site(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+#include "test_cluster_startup_early_native.inc"
+	return true;
+}
+
 static XLogRecPtr
-writer_begin(void)
+writer_bind(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return InvalidXLogRecPtr;
 	return ClusterStartupWriterBegin(&input);
+}
+
+static XLogRecPtr
+writer_begin(void)
+{
+	return startup_first_native_site() ? writer_bind() : InvalidXLogRecPtr;
+}
+
+UT_TEST(initializer_selection_precedes_first_native_side_effect)
+{
+	writer_begin_fixture();
+	advance_returns[0] = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	UT_ASSERT(startup_first_native_site());
+	UT_ASSERT_EQ(startup_directory_calls, 1);
+	UT_ASSERT(!directory_before_selection);
+	UT_ASSERT(clusterStartupWriterSelected);
+	UT_ASSERT(!clusterStartupWriterBound);
+	UT_ASSERT_EQ(route_calls | bind_calls, 0);
+	UT_ASSERT_EQ(advance_calls, 2);
+	UT_ASSERT_EQ(waits, 1);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+}
+
+UT_TEST(early_selection_refusal_or_cancel_precedes_native_mutation)
+{
+	for (unsigned f = 0; f < 7; ++f) {
+		writer_begin_fixture();
+		if (f == 0)
+			restart_ok = false;
+		if (f == 1)
+			advance_returns[0] = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (f == 2) {
+			advance_returns[0] = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+			cancel_on_wait = true;
+		}
+		if (f == 3)
+			offered.phase = CLUSTER_WAL_STARTUP_DURABLE;
+		if (f == 4)
+			current.state = DB_IN_PRODUCTION;
+		if (f == 5)
+			offered.input_record_end++;
+		if (f == 6)
+			offered.predecessor.snapshot.checkpoint_lower_lsn++;
+		UT_ASSERT(!startup_first_native_site());
+		UT_ASSERT_EQ(startup_directory_calls | route_calls | bind_calls, 0);
+		UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
+	}
+}
+
+UT_TEST(late_binding_requires_same_early_selection)
+{
+	for (unsigned f = 0; f < 3; ++f) {
+		writer_begin_fixture();
+		if (f != 0) {
+			UT_ASSERT(startup_first_native_site());
+			writer_read_ok = f != 1;
+			writer_read_changed = f == 2;
+		}
+		UT_ASSERT_EQ(writer_bind(), InvalidXLogRecPtr);
+		UT_ASSERT_EQ(route_calls | bind_calls, 0);
+		UT_ASSERT(!clusterStartupWriterBound);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+	}
+}
+
+UT_TEST(legacy_startup_does_not_select_shared_initializer)
+{
+	writer_begin_fixture();
+	cluster_shared_config = false;
+	UT_ASSERT(startup_first_native_site());
+	UT_ASSERT_EQ(startup_directory_calls, 1);
+	UT_ASSERT_EQ(advance_calls | writer_read_calls | route_calls | bind_calls, 0);
+	UT_ASSERT(!clusterStartupWriterSelected);
 }
 
 UT_TEST(writer_begin_routes_only_after_all_target_initializing)
@@ -854,6 +968,7 @@ UT_TEST(writer_begin_routes_only_after_all_target_initializing)
 	UT_ASSERT_EQ(advance_calls, 3);
 	UT_ASSERT_EQ(route_calls, 1);
 	UT_ASSERT_EQ(bind_calls, 1);
+	UT_ASSERT_EQ(writer_read_calls, 1);
 	UT_ASSERT_EQ(waits, 2);
 	UT_ASSERT(clusterStartupWriterBound && !clusterStartupWriterInstalled);
 	UT_ASSERT(memcmp(&clusterStartupWriter, &offered, sizeof(offered)) == 0);
@@ -998,7 +1113,7 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(26);
 	UT_RUN(prepare_uses_short_owned_read);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(publish_retries_only_root_competition_before_projection);
@@ -1018,6 +1133,10 @@ main(void)
 	UT_RUN(startup_publish_reobserves_cas_without_holding_locks);
 	UT_RUN(startup_publish_refusal_never_installs_in_memory_candidate);
 	UT_RUN(writer_begin_routes_only_after_all_target_initializing);
+	UT_RUN(initializer_selection_precedes_first_native_side_effect);
+	UT_RUN(early_selection_refusal_or_cancel_precedes_native_mutation);
+	UT_RUN(late_binding_requires_same_early_selection);
+	UT_RUN(legacy_startup_does_not_select_shared_initializer);
 	UT_RUN(writer_begin_rejects_wrong_input_or_failed_route_without_binding);
 	UT_RUN(native_startup_insert_has_no_link_or_page_from_predecessor);
 	UT_RUN(native_first_record_has_zero_xl_prev_only_for_bound_successor);
