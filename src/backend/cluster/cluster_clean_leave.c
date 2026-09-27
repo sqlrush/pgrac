@@ -2489,6 +2489,75 @@ cl_normal_stop_release_stage_valid(const ClusterICEnvelope *env, int peer, uint6
 	return true;
 }
 
+/* PGRAC: after the final cut, the immutable completed exchange is a
+ * duplicate tombstone, not permission to read CF or reopen a round. The
+ * caller has already checked the authenticated envelope and payload. Only
+ * discard an exact terminal replay here; pre-terminal frames still take
+ * the fresh root/formation observation below. No deadline applies to a
+ * discarded duplicate, and this path cannot publish any kind of closure.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cl_normal_stop_release_closed_replay(int peer, uint64 nonce, bool reply)
+{
+	uint32 peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	const uint8 *maps[] = { cl_state->ack_bitmap,
+							cl_state->phase1_post_stopped_reply_pending,
+							cl_state->phase1_post_stopped_reply_sent,
+							cl_state->phase1_release_request_sent,
+							cl_state->phase1_release_request_seen,
+							cl_state->phase1_release_reply_sent,
+							cl_state->phase1_release_reply_seen,
+							cl_state->phase1_release_receipt_sent,
+							cl_state->phase1_release_receipt_seen };
+	bool closed, valid;
+	uint64 own_nonce;
+
+	if (!cluster_shared_config)
+		return false;
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	closed = pg_atomic_read_u32(&cl_normal_stop->phase) == CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED;
+	if (!closed) {
+		LWLockRelease(&cl_state->lock);
+		return false;
+	}
+	own_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
+	valid
+		= pg_atomic_read_u32(&cl_normal_stop->service_seal) == 2
+		  && pg_atomic_read_u32(&cl_normal_stop->identity_published) == 1
+		  && pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
+		  && pg_atomic_read_u32(&cl_state->request_in_progress) == 1
+		  && pg_atomic_read_u32(&cl_state->shutdown_driven) == 1 && cl_state->leaving_node_id == -1
+		  && pg_atomic_read_u32(&cl_state->phase) == CLUSTER_LEAVE_IDLE
+		  && pg_atomic_read_u32(&cl_state->preflight_pending) == 0
+		  && pg_atomic_read_u32(&cl_state->preflight_sent) == 1
+		  && pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1
+		  && pg_atomic_read_u32(&cl_state->phase1_release_transport_drained) == 1
+		  && pg_atomic_read_u32(&cl_state->nak_received) == 0
+		  && cl_normal_stop->peer_requests_seen == 15 && cl_normal_stop->peer_request_sent == peers
+		  && cl_normal_stop->peer_reply_sent == peers && cl_normal_stop->peer_reply_pending == 0
+		  && cl_normal_stop_release_complete_locked()
+		  && cluster_clean_leave_phase1_full_stop_nonce_fresh(
+			  cl_normal_stop->peer_request_nonce[cluster_node_id], own_nonce);
+	for (unsigned i = 0; i < lengthof(maps); i++)
+		if (maps[i][0] != (i == 1 ? 0 : peers)
+			|| !cl_phase1_bytes_zero(maps[i] + 1, CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES - 1))
+			valid = false;
+	for (int node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++)
+		if (cl_normal_stop->member_incarnations[node] == 0
+			|| cl_normal_stop->member_incarnations[node] == UINT64_MAX
+			|| (node == cluster_node_id ? cl_state->phase1_release_request_nonce[node] != 0
+										: !cluster_clean_leave_phase1_full_stop_nonce_fresh(
+											  cl_normal_stop->peer_request_nonce[node],
+											  cl_state->phase1_release_request_nonce[node])))
+			valid = false;
+	if (!valid)
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+	else if (nonce != (reply ? own_nonce : cl_state->phase1_release_request_nonce[peer]))
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+	LWLockRelease(&cl_state->lock);
+	return true;
+}
+
 static void
 cl_normal_stop_release_announce(const ClusterICEnvelope *env, const ClusterLeaveAnnouncePayload *p)
 {
@@ -2508,6 +2577,8 @@ cl_normal_stop_release_announce(const ClusterICEnvelope *env, const ClusterLeave
 		return;
 	}
 	if (!cl_normal_stop_release_stage_valid(env, peer, p->leave_epoch))
+		return;
+	if (cl_normal_stop_release_closed_replay(peer, p->leave_nonce, false))
 		return;
 	inbox = &cl_normal_stop_front_inbox[peer];
 	leg = p->preflight == CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE ? 0 : 1;
@@ -2573,6 +2644,8 @@ cl_normal_stop_release_ack(const ClusterICEnvelope *env, const ClusterLeaveAckPa
 	if (cl_state != NULL && p->leave_nonce != pg_atomic_read_u64(&cl_state->leave_attempt_nonce))
 		return;
 	if (!cl_normal_stop_release_stage_valid(env, peer, p->leave_epoch))
+		return;
+	if (cl_normal_stop_release_closed_replay(peer, p->leave_nonce, true))
 		return;
 	inbox = &cl_normal_stop_front_inbox[peer];
 	if (inbox->release_ack_pending && memcmp(&inbox->release_ack, p, sizeof(*p)) != 0) {

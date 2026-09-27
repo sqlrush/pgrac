@@ -2039,6 +2039,7 @@ static unsigned native_control_reads;
 static ClusterControlRootResult identity_pre2_result;
 static unsigned identity_pre2_reads, identity_pre2_pending_reads;
 static bool identity_pre2_alternate_pending;
+static bool identity_pre2_enforce_cf_admission;
 static uint8 identity_pre2_phase[4];
 static int identity_pre2_change;
 
@@ -2053,6 +2054,11 @@ cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 incarnation,
 		abort();
 	identity_pre2_reads++;
 	memset(out, 0, sizeof(*out));
+	/* A fresh CF read needs a new GES request. At that external boundary
+	 * compose the real admission guard used by a master dedup MISS; do not
+	 * pretend a post-seal read can still complete from a flat WAL file. */
+	if (identity_pre2_enforce_cf_admission && !cluster_normal_stop_service_new_work(false))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (identity_pre2_alternate_pending && (identity_pre2_reads % 2) == 1)
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	if (identity_pre2_pending_reads > 0) {
@@ -2298,6 +2304,7 @@ reset_identity(void)
 	identity_pre2_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	identity_pre2_reads = identity_pre2_pending_reads = 0;
 	identity_pre2_alternate_pending = false;
+	identity_pre2_enforce_cf_admission = false;
 	identity_pre2_change = 0;
 	for (node = 0; node < 4; node++)
 		identity_pre2_phase[node] = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
@@ -4050,6 +4057,97 @@ UT_TEST(test_release_exact_completed_control_replay_cannot_reopen_pending)
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
 }
 
+UT_TEST(test_pre2_sealed_release_replays_do_not_create_control_work)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned reads;
+	seed_release_exchange(&plan);
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	for (int node = 0; node < 4; node++)
+		identity_pre2_phase[node] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 2);
+	reads = identity_pre2_reads;
+	identity_pre2_enforce_cf_admission = true;
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT(cluster_normal_stop_service_enter());
+	release_peer_message(1, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 3001);
+	release_peer_message(1, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, 3001);
+	release_peer_reply(1, plan.attempt_nonce);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	UT_ASSERT(cluster_normal_stop_protocol_closed());
+	UT_ASSERT_EQ(identity_pre2_reads, reads);
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].release_pending[0]);
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].release_pending[1]);
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].release_ack_pending);
+	UT_ASSERT(cluster_normal_stop_service_leave(true));
+	MyAuxProcType = QvotecProcess;
+	UT_ASSERT(cluster_normal_stop_qvotec_complete(true));
+	UT_ASSERT(cluster_normal_stop_qvotec_cleared());
+}
+
+UT_TEST(test_pre2_sealed_replay_after_deadline_is_only_a_duplicate)
+{
+	ClusterPhase1FullStopPlan plan;
+	seed_release_exchange(&plan);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	identity_pre2_enforce_cf_admission = true;
+	fixture_now = plan.absolute_deadline_us + 1;
+	MyAuxProcType = LmonProcess;
+	UT_ASSERT(cluster_normal_stop_service_enter());
+	release_peer_message(1, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, 3001);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	UT_ASSERT(cluster_normal_stop_protocol_closed());
+	UT_ASSERT_EQ(identity_pre2_reads, 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->qvotec_clear_result), 0);
+	UT_ASSERT(cluster_normal_stop_service_leave(true));
+}
+
+UT_TEST(test_pre2_sealed_replay_rejects_incomplete_or_changed_transcript)
+{
+	ClusterPhase1FullStopPlan plan;
+	for (unsigned fault = 0; fault < 11; fault++) {
+		seed_release_exchange(&plan);
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+		cluster_shared_config = true;
+		identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		identity_pre2_enforce_cf_admission = true;
+		if (fault == 0)
+			cl_state->phase1_release_request_seen[0] &= ~2;
+		if (fault == 1)
+			cl_state->phase1_release_receipt_seen[0] &= ~2;
+		if (fault == 2)
+			cl_state->phase1_release_reply_seen[0] &= ~2;
+		if (fault == 3)
+			cl_state->phase1_release_receipt_seen[1] = 1;
+		if (fault == 4)
+			pg_atomic_write_u32(&cl_normal_stop->service_seal, 1);
+		if (fault == 5)
+			pg_atomic_write_u32(&cl_state->phase1_release_transport_drained, 0);
+		if (fault == 6)
+			cl_state->phase1_release_request_nonce[1] = cl_normal_stop->peer_request_nonce[1];
+		if (fault == 7)
+			cl_state->phase1_post_stopped_reply_pending[0] = 2;
+		if (fault == 8)
+			cl_normal_stop->member_incarnations[1] = 0;
+		if (fault == 9)
+			cl_normal_stop->epoch++;
+		MyAuxProcType = LmonProcess;
+		UT_ASSERT(cluster_normal_stop_service_enter());
+		release_peer_message(1, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, fault == 10 ? 3002 : 3001);
+		UT_ASSERT(cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+		UT_ASSERT_EQ(identity_pre2_reads, 0);
+		UT_ASSERT(!cl_normal_stop_front_inbox[1].release_pending[1]);
+	}
+}
+
 UT_TEST(test_release_received_frame_survives_temporary_identity_gap)
 {
 	ClusterPhase1FullStopPlan plan;
@@ -4608,7 +4706,7 @@ UT_TEST(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_rec
 int
 main(void)
 {
-	UT_PLAN(111);
+	UT_PLAN(114);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
@@ -4700,6 +4798,9 @@ main(void)
 	UT_RUN(test_release_final_cut_rechecks_modules_actor_identity_and_full_bitmap);
 	UT_RUN(test_release_identity_contradiction_and_unsolicited_receipt_never_advance);
 	UT_RUN(test_release_exact_completed_control_replay_cannot_reopen_pending);
+	UT_RUN(test_pre2_sealed_release_replays_do_not_create_control_work);
+	UT_RUN(test_pre2_sealed_replay_after_deadline_is_only_a_duplicate);
+	UT_RUN(test_pre2_sealed_replay_rejects_incomplete_or_changed_transcript);
 	UT_RUN(test_release_received_frame_survives_temporary_identity_gap);
 	UT_RUN(test_release_pending_identity_frame_cannot_be_overwritten);
 	UT_RUN(test_actual_prepare_wait_drives_original_quiesce_and_ack);
