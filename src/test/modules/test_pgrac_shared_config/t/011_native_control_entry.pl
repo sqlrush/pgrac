@@ -65,6 +65,13 @@ for my $case (
 	}
 	rename("$data/pg_wal", "$data/fixture_original_wal") or die "preserve fixture WAL: $!";
 	symlink("$base/wal/thread_1/generation_99", "$data/pg_wal") or die "route fixture WAL: $!";
+	for my $family (qw(pg_xact pg_subtrans pg_multixact pg_commit_ts))
+	{
+		rename("$data/$family", "$data/fixture_original_$family")
+			or die "preserve fixture $family: $!";
+		symlink("$base/shared/native_side/origin_0/$family", "$data/$family")
+			or die "route fixture $family: $!";
+	}
 	$node->append_conf('postgresql.conf', qq{
 cluster.shared_config=on
 cluster.node_id=0
@@ -116,6 +123,12 @@ reserved_connections=$reserved
 	}
 	unlink("$data/pg_wal") or die "remove fixture-only WAL route: $!";
 	rename("$data/fixture_original_wal", "$data/pg_wal") or die "restore fixture WAL: $!";
+	for my $family (qw(pg_xact pg_subtrans pg_multixact pg_commit_ts))
+	{
+		unlink("$data/$family") or die "remove fixture-only $family route: $!";
+		rename("$data/fixture_original_$family", "$data/$family")
+			or die "restore fixture $family: $!";
+	}
 	unlink("$data/global/pgrac_control_binding") or die "remove fixture binding: $!"
 		unless $mutation eq 'missing-binding';
 	write_bytes("$data/global/pg_control", $projection);

@@ -2,6 +2,7 @@
  * Author: SqlRush <sqlrush@gmail.com>
  */
 #include "postgres.h"
+#include <sys/stat.h>
 #include <unistd.h>
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
@@ -210,6 +211,53 @@ bootstrap_test_hash(const void *bytes, size_t len, uint8 hash[32])
 }
 
 static void
+bootstrap_test_side_routes(const char *mutation)
+{
+	static const char *const families[]
+		= { "pg_xact", "pg_subtrans", "pg_multixact", "pg_commit_ts" };
+	char path[MAXPGPATH], alias[MAXPGPATH], suffix[MAXPGPATH];
+	struct stat st;
+	for (size_t i = 0; i < lengthof(families); ++i) {
+		snprintf(suffix, sizeof(suffix), "shared/native_side/origin_0/%s", families[i]);
+		bootstrap_test_path(path, suffix);
+		if (pg_mkdir_p(path, 0700) != 0)
+			ereport(ERROR, (errmsg("cannot make test native side directory: %m")));
+		snprintf(suffix, sizeof(suffix), "local/%s", families[i]);
+		bootstrap_test_path(alias, suffix);
+		if (lstat(alias, &st) == 0) {
+			if ((S_ISDIR(st.st_mode) ? rmdir(alias) : unlink(alias)) != 0)
+				ereport(ERROR, (errmsg("cannot reset test native side alias: %m")));
+		} else if (errno != ENOENT)
+			ereport(ERROR, (errmsg("cannot inspect test native side alias: %m")));
+		if (i == 0 && strcmp(mutation, "side-missing") == 0)
+			continue;
+		if (i == 0 && strcmp(mutation, "side-literal") == 0) {
+			if (mkdir(alias, 0700) != 0)
+				ereport(ERROR, (errmsg("cannot make test local side directory: %m")));
+			continue;
+		}
+		if (i == 0 && strcmp(mutation, "side-foreign") == 0)
+			bootstrap_test_path(path, "shared");
+		if (symlink(path, alias) != 0)
+			ereport(ERROR, (errmsg("cannot make test native side alias: %m")));
+	}
+	for (unsigned i = 0; i < 2; ++i) {
+		snprintf(suffix, sizeof(suffix), "shared/native_side/origin_0/pg_multixact/%s",
+				 i == 0 ? "offsets" : "members");
+		bootstrap_test_path(path, suffix);
+		if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode) && unlink(path) != 0)
+			ereport(ERROR, (errmsg("cannot reset test MX child: %m")));
+		if (pg_mkdir_p(path, 0700) != 0)
+			ereport(ERROR, (errmsg("cannot create test MX child: %m")));
+		if (i == 0 && strcmp(mutation, "side-mx-symlink") == 0) {
+			bootstrap_test_path(alias, "shared");
+			if (rmdir(path) != 0 || symlink(alias, path) != 0)
+				ereport(ERROR, (errmsg("cannot substitute test MX child: %m")));
+		}
+	}
+}
+
+static void
 bootstrap_test_hex(const uint8 hash[32], char hex[65])
 {
 	for (int i = 0; i < 32; i++)
@@ -296,9 +344,10 @@ bootstrap_test_prepare(void)
 		bootstrap_test_race(1, NULL);
 	else if (test_prepare_race == 5)
 		bootstrap_test_race(2, NULL);
-	else if (test_prepare_race == 6 || test_prepare_race == 7) {
+	else if (test_prepare_race == 6 || test_prepare_race == 7 || test_prepare_race == 9) {
 		char target[MAXPGPATH];
-		bootstrap_test_path(target, test_prepare_race == 6
+		bootstrap_test_path(target, test_prepare_race == 9 ? "local/pg_xact"
+									: test_prepare_race == 6
 										? "local/pg_wal"
 										: "wal/thread_1/generation_99/durable_prefix/current");
 		if (unlink(target) != 0)
@@ -365,7 +414,7 @@ _PG_init(void)
 							 &test_prepare_bootstrap, false, PGC_POSTMASTER, 0, NULL, NULL, NULL);
 	DefineCustomIntVariable("cluster.native_bootstrap_test_race",
 							"Test-only native assignment race in disposable objects.", NULL,
-							&test_prepare_race, 0, 0, 8, PGC_POSTMASTER, 0, NULL,
+							&test_prepare_race, 0, 0, 9, PGC_POSTMASTER, 0, NULL,
 							bootstrap_test_race, NULL);
 	if (test_prepare_bootstrap)
 		bootstrap_test_prepare();
@@ -553,6 +602,8 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 		entries[3].value = "7";
 	else if (strcmp(mutation, "recheck-pgdata") == 0)
 		entries[3].value = "8";
+	else if (strcmp(mutation, "recheck-side") == 0)
+		entries[3].value = "9";
 	entry_count = lengthof(entries);
 	if (native_entry) {
 		/* Actual LocalProcessControlFile precedes test-library registration.
@@ -677,6 +728,7 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 		ereport(ERROR, (errmsg("test pg_wal unlink failed")));
 	if (strcmp(mutation, "wal-missing") != 0 && symlink(generation, pgwal) != 0)
 		ereport(ERROR, (errmsg("test pg_wal symlink failed")));
+	bootstrap_test_side_routes(mutation);
 	pfree(root);
 	PG_RETURN_BOOL(true);
 #else

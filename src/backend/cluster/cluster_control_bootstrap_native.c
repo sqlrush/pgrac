@@ -144,6 +144,11 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("native bootstrap WAL routing is not exact"),
 							errdetail("WAL routing result=%d.", result)));
+		result = cluster_control_bootstrap_side_route(state->paths[0], state->paths[1], node_id);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("native bootstrap side routing is not exact"),
+							errdetail("Native side routing result=%d.", result)));
 	}
 	PG_CATCH();
 	{
@@ -212,6 +217,11 @@ cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalDurablePrefi
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("native WAL bootstrap route changed"),
 							errdetail("WAL routing result=%d.", result)));
+		result = cluster_control_bootstrap_side_route(pgdata, bootstrap_paths[1], cluster_node_id);
+		if (result != 0)
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("native side bootstrap route changed"),
+							errdetail("Native side routing result=%d.", result)));
 	}
 	PG_CATCH();
 	{

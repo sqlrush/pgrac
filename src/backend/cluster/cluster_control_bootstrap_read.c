@@ -139,6 +139,103 @@ done:
 static ClusterControlRootResult read_same_dir(int parent, const char *name, int fd);
 #endif
 
+ClusterControlRootResult
+cluster_control_bootstrap_side_route(const char *pgdata, const char *shared_root, uint32 node_id)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
+	static const char *const families[]
+		= { "pg_xact", "pg_subtrans", "pg_multixact", "pg_commit_ts" };
+	static const char *const children[] = { "offsets", "members" };
+	int dirs[10] = { -1, -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+	int aliases[4] = { -1, -1, -1, -1 };
+	struct stat links[4], expected, routed, current;
+	char origin[32];
+
+	if (!read_path_valid(pgdata, NULL) || !read_path_valid(shared_root, NULL)
+		|| node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return result;
+	snprintf(origin, sizeof(origin), "origin_%u", node_id);
+	result = read_dir(-1, pgdata, &dirs[0]);
+	if (result != 0)
+		goto done;
+	result = read_dir(-1, shared_root, &dirs[1]);
+	if (result != 0)
+		goto done;
+	result = read_dir(dirs[1], "native_side", &dirs[2]);
+	if (result != 0)
+		goto done;
+	result = read_dir(dirs[2], origin, &dirs[3]);
+	if (result != 0)
+		goto done;
+	for (size_t i = 0; i < lengthof(families); ++i) {
+		result = read_dir(dirs[3], families[i], &dirs[4 + i]);
+		if (result != 0)
+			goto done;
+		if (fstatat(dirs[0], families[i], &links[i], AT_SYMLINK_NOFOLLOW) != 0) {
+			result = read_error();
+			goto done;
+		}
+		if (!S_ISLNK(links[i].st_mode) || links[i].st_uid != geteuid()) {
+			result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			goto done;
+		}
+		/* Only the PGDATA alias is followed. The expected namespace is pinned
+		 * without following any component beneath the configured shared root. */
+		aliases[i] = openat(dirs[0], families[i], O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+		if (aliases[i] < 0) {
+			result = read_error();
+			goto done;
+		}
+		if (fstat(dirs[4 + i], &expected) != 0 || fstat(aliases[i], &routed) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+		if (!read_owned(&routed, true) || expected.st_dev != routed.st_dev
+			|| expected.st_ino != routed.st_ino) {
+			result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			goto done;
+		}
+	}
+	for (size_t i = 0; i < lengthof(children); ++i) {
+		result = read_dir(dirs[6], children[i], &dirs[8 + i]);
+		if (result != 0)
+			goto done;
+	}
+	result = read_same_dir(AT_FDCWD, pgdata, dirs[0]);
+	if (result == 0)
+		result = read_same_dir(AT_FDCWD, shared_root, dirs[1]);
+	if (result == 0)
+		result = read_same_dir(dirs[1], "native_side", dirs[2]);
+	if (result == 0)
+		result = read_same_dir(dirs[2], origin, dirs[3]);
+	for (size_t i = 0; result == 0 && i < lengthof(families); ++i) {
+		result = read_same_dir(dirs[3], families[i], dirs[4 + i]);
+		if (result != 0)
+			break;
+		if (fstatat(dirs[0], families[i], &current, AT_SYMLINK_NOFOLLOW) != 0
+			|| !S_ISLNK(current.st_mode) || current.st_uid != links[i].st_uid
+			|| current.st_dev != links[i].st_dev || current.st_ino != links[i].st_ino) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			break;
+		}
+		if (fstat(aliases[i], &routed) != 0 || fstatat(dirs[0], families[i], &current, 0) != 0
+			|| !read_owned(&current, true) || current.st_dev != routed.st_dev
+			|| current.st_ino != routed.st_ino)
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	for (size_t i = 0; result == 0 && i < lengthof(children); ++i)
+		result = read_same_dir(dirs[6], children[i], dirs[8 + i]);
+done:
+	for (size_t i = 0; i < lengthof(aliases); ++i)
+		read_close(aliases[i], &result);
+	for (size_t i = 0; i < lengthof(dirs); ++i)
+		read_close(dirs[i], &result);
+#endif
+	return result;
+}
+
 static ClusterControlRootResult
 read_wal_routes(const char *pgdata, const char *wal_root, const ClusterWalDurablePrefixRef *ref,
 				const ClusterWalDurablePrefixRef *pending)

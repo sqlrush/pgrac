@@ -113,6 +113,13 @@ extern ClusterControlRootResult
 cluster_control_bootstrap_wal_startup_route(const char *pgdata, const char *wal_root,
 											const ClusterControlBootstrapSnapshot *snapshot);
 
+/* Read-only native SLRU routing observation before shared memory is created.
+ * Local aliases must resolve to this origin's owned shared directories; MX
+ * children must be real directories. Never imports/creates files or grants
+ * mutation, recovery, retention or serving permission. */
+extern ClusterControlRootResult
+cluster_control_bootstrap_side_route(const char *pgdata, const char *shared_root, uint32 node_id);
+
 /* Process-local preparation and native control/geometry initialization only,
  * before shared memory or WAL startup. Not admission, physical qualification
  * or final CF validation. Reset has LocalProcessControlFile's native semantics.

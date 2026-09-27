@@ -11265,6 +11265,233 @@ static int bootstrap_close_fail_at;
 static bool bootstrap_wal_route_race;
 static uint8 bootstrap_replacement[66048];
 static uint8 bootstrap_binding_replacement[256];
+static bool bootstrap_side_race;
+static char bootstrap_side_replace[MAXPGPATH], bootstrap_side_saved[MAXPGPATH];
+
+/* Physical aliases only: not a native-side migration or ownership grant. */
+static const char *const side_names[]
+	= { "pg_xact", "pg_subtrans", "pg_multixact", "pg_commit_ts" };
+typedef struct BootstrapSideFixture {
+	char root[MAXPGPATH];
+	char local[MAXPGPATH];
+	char shared[MAXPGPATH];
+	char origin[MAXPGPATH];
+} BootstrapSideFixture;
+
+static void
+bootstrap_side_fixture(BootstrapSideFixture *f, uint32 node)
+{
+	char path[MAXPGPATH], alias[MAXPGPATH];
+	memset(f, 0, sizeof(*f));
+	strlcpy(f->root, "/tmp/pgrac-native-side.XXXXXX", sizeof(f->root));
+	UT_ASSERT(mkdtemp(f->root) != NULL);
+	snprintf(f->local, sizeof(f->local), "%s/local", f->root);
+	snprintf(f->shared, sizeof(f->shared), "%s/shared", f->root);
+	UT_ASSERT_EQ(mkdir(f->local, 0700), 0);
+	UT_ASSERT_EQ(mkdir(f->shared, 0700), 0);
+	snprintf(path, sizeof(path), "%s/native_side", f->shared);
+	UT_ASSERT_EQ(mkdir(path, 0700), 0);
+	snprintf(f->origin, sizeof(f->origin), "%s/native_side/origin_%u", f->shared, node);
+	UT_ASSERT_EQ(mkdir(f->origin, 0700), 0);
+	for (size_t i = 0; i < lengthof(side_names); ++i) {
+		snprintf(path, sizeof(path), "%s/%s", f->origin, side_names[i]);
+		snprintf(alias, sizeof(alias), "%s/%s", f->local, side_names[i]);
+		UT_ASSERT_EQ(mkdir(path, 0700), 0);
+		UT_ASSERT_EQ(symlink(path, alias), 0);
+	}
+	snprintf(path, sizeof(path), "%s/pg_multixact/offsets", f->origin);
+	UT_ASSERT_EQ(mkdir(path, 0700), 0);
+	snprintf(path, sizeof(path), "%s/pg_multixact/members", f->origin);
+	UT_ASSERT_EQ(mkdir(path, 0700), 0);
+	bootstrap_close_calls = bootstrap_close_fail_at = 0;
+}
+
+static void
+bootstrap_side_cleanup(const BootstrapSideFixture *f)
+{
+	char path[MAXPGPATH];
+	snprintf(path, sizeof(path), "%s/pg_multixact/offsets", f->origin);
+	UT_ASSERT_EQ(rmdir(path), 0);
+	snprintf(path, sizeof(path), "%s/pg_multixact/members", f->origin);
+	UT_ASSERT_EQ(rmdir(path), 0);
+	for (size_t i = 0; i < lengthof(side_names); ++i) {
+		snprintf(path, sizeof(path), "%s/%s", f->local, side_names[i]);
+		UT_ASSERT_EQ(unlink(path), 0);
+		snprintf(path, sizeof(path), "%s/%s", f->origin, side_names[i]);
+		UT_ASSERT_EQ(rmdir(path), 0);
+	}
+	UT_ASSERT_EQ(rmdir(f->origin), 0);
+	snprintf(path, sizeof(path), "%s/native_side", f->shared);
+	UT_ASSERT_EQ(rmdir(path), 0);
+	UT_ASSERT_EQ(rmdir(f->local), 0);
+	UT_ASSERT_EQ(rmdir(f->shared), 0);
+	UT_ASSERT_EQ(rmdir(f->root), 0);
+}
+
+UT_TEST(test_bootstrap_side_routes_require_exact_origin)
+{
+	for (unsigned node = 0; node <= 127; node += 127) {
+		BootstrapSideFixture f;
+		char path[MAXPGPATH];
+		uint8 stored[17], marker[17] = "retained-status";
+		bootstrap_side_fixture(&f, node);
+		if (ut_current_failed)
+			return;
+		snprintf(path, sizeof(path), "%s/pg_subtrans/0000", f.origin);
+		write_all_or_abort(path, marker, sizeof(marker));
+		UT_ASSERT_EQ(cluster_control_bootstrap_side_route(f.local, f.shared, node), 0);
+		read_all_or_abort(path, stored, sizeof(stored));
+		UT_ASSERT(memcmp(marker, stored, sizeof(marker)) == 0);
+		UT_ASSERT_EQ(unlink(path), 0);
+		bootstrap_side_cleanup(&f);
+	}
+}
+
+UT_TEST(test_bootstrap_side_rejects_local_foreign_and_unsafe_aliases)
+{
+	BootstrapSideFixture f;
+	char path[MAXPGPATH], alias[MAXPGPATH], saved[MAXPGPATH];
+	bootstrap_side_fixture(&f, 3);
+	if (ut_current_failed)
+		return;
+	for (size_t i = 0; i < lengthof(side_names); ++i) {
+		snprintf(path, sizeof(path), "%s/%s", f.origin, side_names[i]);
+		snprintf(alias, sizeof(alias), "%s/%s", f.local, side_names[i]);
+		for (unsigned fault = 0; fault < 5; ++fault) {
+			UT_ASSERT_EQ(unlink(alias), 0);
+			if (fault == 1)
+				UT_ASSERT_EQ(mkdir(alias, 0700), 0);
+			else if (fault == 2)
+				UT_ASSERT_EQ(symlink(f.shared, alias), 0);
+			else if (fault == 3)
+				UT_ASSERT_EQ(mkfifo(alias, 0600), 0);
+			else if (fault == 4) {
+				UT_ASSERT_EQ(symlink(path, alias), 0);
+				UT_ASSERT_EQ(chmod(path, 0777), 0);
+			}
+			UT_ASSERT(cluster_control_bootstrap_side_route(f.local, f.shared, 3) != 0);
+			if (fault == 1)
+				UT_ASSERT_EQ(rmdir(alias), 0);
+			else if (fault != 0)
+				UT_ASSERT_EQ(unlink(alias), 0);
+			if (fault == 4)
+				UT_ASSERT_EQ(chmod(path, 0700), 0);
+			UT_ASSERT_EQ(symlink(path, alias), 0);
+		}
+		/* Even a same-inode route is invalid when its canonical family is
+		 * itself a symlink outside the origin namespace. */
+		snprintf(saved, sizeof(saved), "%s.saved", path);
+		UT_ASSERT_EQ(rename(path, saved), 0);
+		UT_ASSERT_EQ(symlink(saved, path), 0);
+		UT_ASSERT(cluster_control_bootstrap_side_route(f.local, f.shared, 3) != 0);
+		UT_ASSERT_EQ(unlink(path), 0);
+		UT_ASSERT_EQ(rename(saved, path), 0);
+	}
+	UT_ASSERT(cluster_control_bootstrap_side_route(f.local, f.shared, 0) != 0);
+	UT_ASSERT_EQ(cluster_control_bootstrap_side_route(f.local, f.shared, 3), 0);
+	bootstrap_side_cleanup(&f);
+}
+
+UT_TEST(test_bootstrap_side_children_parents_and_arguments_are_strict)
+{
+	BootstrapSideFixture f;
+	char path[MAXPGPATH], saved[MAXPGPATH];
+	const char *bad[] = { NULL, "", ".", "/", "/tmp/", "/tmp//x", "/tmp/./x", "/tmp/../x" };
+	bootstrap_side_fixture(&f, 0);
+	if (ut_current_failed)
+		return;
+	for (size_t i = 0; i < lengthof(bad); ++i) {
+		UT_ASSERT(cluster_control_bootstrap_side_route(bad[i], f.shared, 0) != 0);
+		UT_ASSERT(cluster_control_bootstrap_side_route(f.local, bad[i], 0) != 0);
+	}
+	UT_ASSERT(cluster_control_bootstrap_side_route(f.local, f.shared, 128) != 0);
+	for (unsigned object = 0; object < 6; ++object) {
+		if (object == 0)
+			strlcpy(path, f.local, sizeof(path));
+		else if (object == 1)
+			strlcpy(path, f.shared, sizeof(path));
+		else if (object == 2)
+			snprintf(path, sizeof(path), "%s/native_side", f.shared);
+		else if (object == 3)
+			strlcpy(path, f.origin, sizeof(path));
+		else
+			snprintf(path, sizeof(path), "%s/pg_multixact/%s", f.origin,
+					 object == 4 ? "offsets" : "members");
+		for (unsigned fault = 0; fault < 3; ++fault) {
+			if (fault == 0)
+				UT_ASSERT_EQ(chmod(path, 0777), 0);
+			else {
+				snprintf(saved, sizeof(saved), "%s.saved", path);
+				UT_ASSERT_EQ(rename(path, saved), 0);
+				if (fault == 2)
+					UT_ASSERT_EQ(symlink(saved, path), 0);
+			}
+			UT_ASSERT(cluster_control_bootstrap_side_route(f.local, f.shared, 0) != 0);
+			if (fault == 0)
+				UT_ASSERT_EQ(chmod(path, 0700), 0);
+			else {
+				if (fault == 2)
+					UT_ASSERT_EQ(unlink(path), 0);
+				UT_ASSERT_EQ(rename(saved, path), 0);
+			}
+		}
+	}
+	bootstrap_side_cleanup(&f);
+}
+
+UT_TEST(test_bootstrap_side_reobserves_every_namespace_and_closes_all_fds)
+{
+	BootstrapSideFixture f;
+	unsigned before = 0, after = 0;
+	int closes;
+	bootstrap_side_fixture(&f, 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_control_bootstrap_side_route(f.local, f.shared, 0), 0);
+	closes = bootstrap_close_calls;
+	UT_ASSERT(closes > 0);
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++before;
+	for (int i = 1; i <= closes; ++i) {
+		bootstrap_close_calls = 0;
+		bootstrap_close_fail_at = i;
+		UT_ASSERT_EQ(cluster_control_bootstrap_side_route(f.local, f.shared, 0),
+					 CLUSTER_CONTROL_ROOT_IO_ERROR);
+		UT_ASSERT_EQ(bootstrap_close_calls, closes);
+	}
+	bootstrap_close_fail_at = 0;
+	for (unsigned object = 0; object < 10; ++object) {
+		if (object == 0)
+			strlcpy(bootstrap_side_replace, f.local, sizeof(bootstrap_side_replace));
+		else if (object == 1)
+			strlcpy(bootstrap_side_replace, f.shared, sizeof(bootstrap_side_replace));
+		else if (object == 2)
+			snprintf(bootstrap_side_replace, sizeof(bootstrap_side_replace), "%s/native_side",
+					 f.shared);
+		else if (object == 3)
+			strlcpy(bootstrap_side_replace, f.origin, sizeof(bootstrap_side_replace));
+		else if (object < 8)
+			snprintf(bootstrap_side_replace, sizeof(bootstrap_side_replace), "%s/%s", f.origin,
+					 side_names[object - 4]);
+		else
+			snprintf(bootstrap_side_replace, sizeof(bootstrap_side_replace), "%s/pg_multixact/%s",
+					 f.origin, object == 8 ? "offsets" : "members");
+		snprintf(bootstrap_side_saved, sizeof(bootstrap_side_saved), "%s.saved",
+				 bootstrap_side_replace);
+		bootstrap_side_race = true;
+		UT_ASSERT(cluster_control_bootstrap_side_route(f.local, f.shared, 0) != 0);
+		UT_ASSERT(!bootstrap_side_race);
+		UT_ASSERT_EQ(rmdir(bootstrap_side_replace), 0);
+		UT_ASSERT_EQ(rename(bootstrap_side_saved, bootstrap_side_replace), 0);
+	}
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++after;
+	UT_ASSERT_EQ(before, after);
+	UT_ASSERT_EQ(cluster_control_bootstrap_side_route(f.local, f.shared, 0), 0);
+	bootstrap_side_cleanup(&f);
+}
 
 int unit_bootstrap_openat(int dir, const char *name, int flags, ...);
 int unit_bootstrap_close(int fd);
@@ -11287,6 +11514,14 @@ unit_bootstrap_openat(int dir, const char *name, int flags, ...)
 	char primary[MAXPGPATH], staging[MAXPGPATH], binding[MAXPGPATH];
 	bool root_open = strcmp(name, "pgrac_control_root") == 0;
 	bool missing_object = bootstrap_race == 2 && strstr(name, ".bin") != NULL;
+	if (bootstrap_side_race && strcmp(name, "members") == 0) {
+		int fd = openat(dir, name, flags);
+		bootstrap_side_race = false;
+		if (fd < 0 || rename(bootstrap_side_replace, bootstrap_side_saved) != 0
+			|| mkdir(bootstrap_side_replace, 0700) != 0)
+			abort();
+		return fd;
+	}
 	if (bootstrap_wal_route_race && strcmp(name, "pg_wal") == 0) {
 		int fd = openat(dir, name, flags);
 		bootstrap_wal_route_race = false;
@@ -14141,7 +14376,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(264);
+	UT_PLAN(268);
+	UT_RUN(test_bootstrap_side_routes_require_exact_origin);
+	UT_RUN(test_bootstrap_side_rejects_local_foreign_and_unsafe_aliases);
+	UT_RUN(test_bootstrap_side_children_parents_and_arguments_are_strict);
+	UT_RUN(test_bootstrap_side_reobserves_every_namespace_and_closes_all_fds);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
 	UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
