@@ -184,6 +184,13 @@ extern ClusterControlRootResult
 cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *self,
 											const uint8 operation_uuid[16],
 											ClusterWalStartupImage *out);
+/* Exact INITIALIZING owner only. Atomically switch the native pg_wal symlink
+ * from immutable restart input to the selected EMPTY generation and fsync its
+ * parent. No writer admission; uncertain retry only accepts that exact route. */
+extern ClusterControlRootResult
+cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *self,
+											 const uint8 operation_uuid[16],
+											 ClusterWalStartupImage *out);
 /* Actual native EOR checkpoint of this process's selected new writer. Keeps
  * the predecessor current and target non-serving; INSTALL is separate. */
 extern ClusterControlRootResult cluster_control_root_v3_startup_checkpoint(
@@ -291,6 +298,9 @@ extern ClusterControlRootResult cluster_wal_startup_read_locked(const ControlRoo
 extern ClusterControlRootResult cluster_wal_startup_empty_locked(const ControlRootImage *root,
 																 uint32 origin_node, bool create,
 																 bool sync);
+extern ClusterControlRootResult
+cluster_wal_startup_route_locked(const ControlRootImage *root, uint32 origin_node,
+								 const char *pgdata, const ClusterWalDurablePrefixRef *restart);
 
 /* Exact read-only consumption under existing clusterwide CF-S/X. No staging
  * directory or write permission required; refusal clears the whole output. */

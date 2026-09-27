@@ -15,6 +15,7 @@
 #include "common/cryptohash.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 
 #define HISTORY_STAGED 1
@@ -369,6 +370,189 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 done:
 	for (unsigned i = 0; i < lengthof(fds); ++i)
 		history_close(fds[i], &result);
+	return result;
+}
+
+/* PGRAC: only an owned symlink may be exchanged. Directory identities select
+ * the old/new case; a failed claim check never falls back to another route.
+ * No fallible allocation/ERROR call is made while raw descriptors are open.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+startup_route_path(const char *path)
+{
+	size_t len = path != NULL ? strnlen(path, MAXPGPATH) : 0;
+	size_t start = 1;
+	if (len < 2 || len >= MAXPGPATH || path[0] != '/')
+		return false;
+	for (size_t i = 1; i <= len; ++i) {
+		if (i == len || path[i] == '/') {
+			size_t part = i - start;
+			if (part == 0 || (part == 1 && path[start] == '.')
+				|| (part == 2 && path[start] == '.' && path[start + 1] == '.'))
+				return false;
+			start = i + 1;
+		}
+	}
+	return true;
+}
+
+static bool
+startup_route_same(const struct stat *a, const struct stat *b)
+{
+	return a->st_dev == b->st_dev && a->st_ino == b->st_ino;
+}
+
+static bool
+startup_route_link(int dir, const char *name, struct stat *st)
+{
+	return fstatat(dir, name, st, AT_SYMLINK_NOFOLLOW) == 0 && S_ISLNK(st->st_mode)
+		   && st->st_uid == geteuid() && st->st_nlink == 1;
+}
+
+ClusterControlRootResult
+cluster_wal_startup_route_locked(const ControlRootImage *root, uint32 node, const char *pgdata,
+								 const ClusterWalDurablePrefixRef *restart)
+{
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	ClusterWalStartupImage op;
+	ClusterWalDurablePrefixRef next = { 0 };
+	ClusterWalThreadClaimV2 old_claim;
+	ClusterWalDurablePrefix old_prefix, fresh_prefix;
+	ClusterControlRootResult result;
+	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES], random[16];
+	pg_cryptohash_ctx *ctx;
+	char thread[32], oldgen[48], newgen[48], target[MAXPGPATH], temp[64];
+	int fds[] = { -1, -1, -1, -1, -1 };
+	int parents[] = { -1, -1, 1, 2, 2 };
+	const char *names[] = { pgdata, cluster_wal_threads_dir, thread, oldgen, newgen };
+	struct stat opened[5], named, leaf, temporary, routed;
+	bool created = false, renamed = false, already_new, hashed;
+
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!enableFsync || restart == NULL || !startup_route_path(pgdata)
+		|| !startup_route_path(cluster_wal_threads_dir))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_wal_startup_read_locked(root, node, &op);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (op.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| !cluster_control_root_identity_equal(&restart->claim.identity,
+												&op.predecessor.snapshot.identity)
+		|| restart->claim.database_incarnation != op.database_incarnation
+		|| restart->claim.max_config_generation != op.config_generation
+		|| restart->timeline != op.predecessor.snapshot.checkpoint_tli
+		|| memcmp(restart->claim.claim_sha256, op.predecessor.refs.claim_sha256, 32) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &restart->claim, &old_claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, restart, &old_prefix);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (old_prefix.exclusive_end != op.sealed_input_end
+		|| old_prefix.record_start != op.input_record_start
+		|| old_prefix.record_crc != op.input_record_crc)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = cluster_wal_startup_empty_locked(root, node, false, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_claim_v2_encode(&op.claim, claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	hashed = history_hash(ctx, claim, sizeof(claim), next.claim.claim_sha256);
+	pg_cryptohash_free(ctx);
+	if (!hashed || !pg_strong_random(random, sizeof(random)))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	next.claim.identity = op.claim.identity;
+	next.claim.database_incarnation = op.database_incarnation;
+	next.claim.max_config_generation = op.config_generation;
+	next.timeline = op.timeline;
+	snprintf(thread, sizeof(thread), "thread_%u", node + 1);
+	snprintf(oldgen, sizeof(oldgen), "generation_" UINT64_FORMAT,
+			 restart->claim.identity.origin_owner_incarnation);
+	snprintf(newgen, sizeof(newgen), "generation_" UINT64_FORMAT,
+			 op.claim.identity.origin_owner_incarnation);
+	if (snprintf(target, sizeof(target), "%s/%s/%s", cluster_wal_threads_dir, thread, newgen)
+		>= sizeof(target))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	strlcpy(temp, ".pgrac-wal-route-", sizeof(temp));
+	for (unsigned i = 0; i < sizeof(random); ++i)
+		snprintf(temp + 17 + i * 2, 3, "%02x", random[i]);
+	/* Everything below, until close, is bounded raw file I/O only. */
+	result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	for (unsigned i = 0; i < lengthof(fds); ++i) {
+		fds[i] = parents[i] < 0 ? open(names[i], flags) : openat(fds[parents[i]], names[i], flags);
+		if (fds[i] < 0 || fstat(fds[i], &opened[i]) != 0 || !history_owned(&opened[i], true))
+			goto done;
+	}
+	if (!startup_route_link(fds[0], "pg_wal", &leaf) || fstatat(fds[0], "pg_wal", &routed, 0) != 0
+		|| !history_owned(&routed, true))
+		goto done;
+	already_new = startup_route_same(&routed, &opened[4]);
+	if (!already_new && !startup_route_same(&routed, &opened[3])) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto done;
+	}
+	if (!already_new) {
+		if (symlinkat(target, fds[0], temp) != 0)
+			goto done;
+		/* Do not unlink an unobserved/replaced temporary name on failure. */
+		if (!startup_route_link(fds[0], temp, &temporary))
+			goto done;
+		created = true;
+	}
+	/* Authenticate all pinned directories both before and after the exchange. */
+	for (unsigned pass = 0; pass < 2; ++pass) {
+		for (unsigned i = 0; i < lengthof(fds); ++i) {
+			if ((parents[i] < 0 ? lstat(names[i], &named)
+								: fstatat(fds[parents[i]], names[i], &named, AT_SYMLINK_NOFOLLOW))
+					!= 0
+				|| !history_owned(&named, true) || !startup_route_same(&named, &opened[i])) {
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+				goto done;
+			}
+		}
+		if (!startup_route_link(fds[0], "pg_wal", &named)
+			|| !startup_route_same(&named, renamed ? &temporary : &leaf)
+			|| fstatat(fds[0], "pg_wal", &routed, 0) != 0
+			|| !startup_route_same(&routed, (already_new || renamed) ? &opened[4] : &opened[3])) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto done;
+		}
+		if (pass == 0) {
+			if (!already_new) {
+				if (!startup_route_link(fds[0], temp, &named)
+					|| !startup_route_same(&named, &temporary)
+					|| renameat(fds[0], temp, fds[0], "pg_wal") != 0)
+					goto done;
+				renamed = true;
+			}
+			/* Even an already visible successor needs this confirmation. */
+			if (pg_fsync(fds[0]) != 0)
+				goto done;
+		}
+	}
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	if (created && !renamed && startup_route_link(fds[0], temp, &named)
+		&& startup_route_same(&named, &temporary) && unlinkat(fds[0], temp, 0) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	for (unsigned i = 0; i < lengthof(fds); ++i)
+		history_close(fds[i], &result);
+	/* The old stream remains an input; neither success nor refusal erases it. */
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &restart->claim, &old_claim);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, restart, &fresh_prefix);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& memcmp(&fresh_prefix, &old_prefix, sizeof(old_prefix)) != 0)
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_control_bootstrap_wal_route(pgdata, cluster_wal_threads_dir, &next);
 	return result;
 }
 

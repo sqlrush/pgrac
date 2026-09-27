@@ -5653,6 +5653,15 @@ static ControlFileData test_checkpoint_output;
 static ClusterWalDurablePrefixRef test_checkpoint_prefix_ref;
 static ClusterWalDurablePrefix test_checkpoint_prefix;
 static char test_checkpoint_prefix_path[MAXPGPATH];
+static ClusterWalDurablePrefixRef test_restart_ref;
+static bool test_restart_ref_valid;
+
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	*out = test_restart_ref;
+	return test_restart_ref_valid;
+}
 
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
@@ -7922,6 +7931,335 @@ v3_begin_fixture(uint8 before[66048], ControlRootImage *root, ClusterControlRoot
 	test_self_incarnation = test_membership_incarnation
 		= op.claim.identity.origin_owner_incarnation;
 	return op;
+}
+
+/* The mirror is an explicit process boundary; root, PGWG, claims, prefix and
+ * symlink operations below are actual production objects and physical files. */
+static ClusterWalStartupImage
+v3_route_fixture(uint8 before[66048], ControlRootImage *root, char pgdata[MAXPGPATH])
+{
+	ClusterControlRootFileToken token, advanced;
+	ControlFileData common;
+	ClusterWalStartupImage op = v3_begin_fixture(before, root, &token);
+	char pgwal[MAXPGPATH], input[MAXPGPATH];
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(&op.claim.identity, op.operation_uuid,
+															 &token, &advanced),
+				 0);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, root, &common, &token),
+		0);
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(root, 0, &op), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	memcpy(before, root->bytes, 66048);
+	memset(&test_restart_ref, 0, sizeof(test_restart_ref));
+	test_restart_ref.claim.identity = op.predecessor.snapshot.identity;
+	test_restart_ref.claim.database_incarnation = op.database_incarnation;
+	test_restart_ref.claim.max_config_generation = op.config_generation;
+	memcpy(test_restart_ref.claim.claim_sha256, op.predecessor.refs.claim_sha256, 32);
+	test_restart_ref.timeline = op.predecessor.snapshot.checkpoint_tli;
+	test_restart_ref_valid = true;
+	strlcpy(pgdata, "/tmp/pgrac-startup-route.XXXXXX", MAXPGPATH);
+	UT_ASSERT(mkdtemp(pgdata) != NULL);
+	DataDir = pgdata;
+	snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+	snprintf(input, sizeof(input), "%s/thread_%u/generation_" UINT64_FORMAT,
+			 cluster_wal_threads_dir, test_restart_ref.claim.identity.origin_thread_id,
+			 test_restart_ref.claim.identity.origin_owner_incarnation);
+	UT_ASSERT_EQ(symlink(input, pgwal), 0);
+	return op;
+}
+
+UT_TEST(test_v3_startup_route_switches_only_exact_empty_generation)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	char pgdata[MAXPGPATH], pgwal[MAXPGPATH], target[MAXPGPATH];
+	ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), out;
+	struct stat oldlink, newlink, routed, expected;
+	if (ut_current_failed)
+		return;
+	snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+	v3_target_path(target, &op, "");
+	UT_ASSERT_EQ(lstat(pgwal, &oldlink), 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_startup_route_writer(&op.claim.identity, op.operation_uuid, &out),
+		0);
+	if (!ut_current_failed) {
+		UT_ASSERT(memcmp(&out, &op, sizeof(op)) == 0);
+		UT_ASSERT_EQ(stat(pgwal, &routed), 0);
+		UT_ASSERT_EQ(stat(target, &expected), 0);
+		UT_ASSERT(routed.st_dev == expected.st_dev && routed.st_ino == expected.st_ino);
+		UT_ASSERT_EQ(lstat(pgwal, &newlink), 0);
+		UT_ASSERT(S_ISLNK(newlink.st_mode));
+		UT_ASSERT(oldlink.st_ino != newlink.st_ino);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
+																  op.operation_uuid, &out),
+					 0);
+		UT_ASSERT_EQ(lstat(pgwal, &routed), 0);
+		UT_ASSERT(routed.st_dev == newlink.st_dev && routed.st_ino == newlink.st_ino);
+	}
+	v2_assert_primary_unchanged(before);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(unlink(pgwal), 0);
+	UT_ASSERT_EQ(rmdir(pgdata), 0);
+	DataDir = test_root;
+	test_restart_ref_valid = test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_startup_route_requires_exact_owner_and_restart_input)
+{
+	for (unsigned fault = 0; fault < 14; ++fault) {
+		uint8 before[66048], uuid[16];
+		ControlRootImage root;
+		char pgdata[MAXPGPATH], pgwal[MAXPGPATH];
+		ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), out;
+		struct stat original, observed;
+		if (ut_current_failed)
+			return;
+		memcpy(uuid, op.operation_uuid, 16);
+		snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+		UT_ASSERT_EQ(lstat(pgwal, &original), 0);
+		switch (fault) {
+		case 0:
+			MyBackendType = B_BACKEND;
+			break;
+		case 1:
+			test_restart_ref_valid = false;
+			break;
+		case 2:
+			test_restart_ref.claim.identity.origin_owner_incarnation++;
+			break;
+		case 3:
+			test_restart_ref.claim.claim_sha256[0] ^= 1;
+			break;
+		case 4:
+			test_restart_ref.claim.max_config_generation++;
+			break;
+		case 5:
+			test_restart_ref.timeline++;
+			break;
+		case 6:
+			uuid[0] ^= 1;
+			break;
+		case 7:
+			ShutdownRequestPending = true;
+			break;
+		case 8:
+			enableFsync = false;
+			break;
+		case 9:
+			test_reserve_provider = false;
+			break;
+		case 10:
+			test_self_incarnation++;
+			break;
+		case 11:
+			test_reserve_formation.membership.last_admitted_incarnation[3]++;
+			break;
+		case 12:
+			test_actual_cf = test_cf_mode = ShareLock;
+			break;
+		case 13:
+			CritSectionCount = 1;
+			break;
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_control_root_v3_startup_route_writer(&op.claim.identity, uuid, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT_EQ(lstat(pgwal, &observed), 0);
+		UT_ASSERT(original.st_dev == observed.st_dev && original.st_ino == observed.st_ino);
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, fault == 12 ? ShareLock : NoLock);
+		UT_ASSERT_EQ(unlink(pgwal), 0);
+		UT_ASSERT_EQ(rmdir(pgdata), 0);
+		DataDir = test_root;
+		test_actual_cf = test_cf_mode = NoLock;
+		CritSectionCount = 0;
+		ShutdownRequestPending = false;
+		test_restart_ref_valid = test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_startup_route_refuses_unsafe_or_nonempty_namespaces)
+{
+	unsigned fds_before = 0, fds_after = 0;
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++fds_before;
+	for (unsigned fault = 0; fault < 10; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		char pgdata[MAXPGPATH], pgwal[MAXPGPATH], path[MAXPGPATH], moved[MAXPGPATH];
+		ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), out;
+		if (ut_current_failed)
+			return;
+		snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+		if (fault <= 2) {
+			UT_ASSERT_EQ(unlink(pgwal), 0);
+			if (fault == 1)
+				UT_ASSERT_EQ(mkdir(pgwal, 0700), 0);
+			if (fault == 2)
+				UT_ASSERT_EQ(symlink(cluster_wal_threads_dir, pgwal), 0);
+		} else if (fault == 3 || fault == 4) {
+			v2_claim_path(fault == 3 ? &op.predecessor.snapshot.identity : &op.claim.identity,
+						  path);
+			write_all_or_abort(path, "bad", 3);
+		} else if (fault == 5) {
+			v3_target_path(path, &op, "/unexpected-wal");
+			write_all_or_abort(path, "not empty", 9);
+		} else if (fault == 6) {
+			v3_target_path(path, &op, "/durable_prefix/current");
+			write_all_or_abort(path, "bad", 3);
+		} else if (fault == 7) {
+			v3_target_path(path, &op, "");
+			UT_ASSERT_EQ(chmod(path, 0777), 0);
+		} else if (fault == 8) {
+			v3_target_path(path, &op, "");
+			snprintf(moved, sizeof(moved), "%s.saved", path);
+			UT_ASSERT_EQ(rename(path, moved), 0);
+			UT_ASSERT_EQ(symlink(moved, path), 0);
+		} else {
+			snprintf(path, sizeof(path),
+					 "%s/thread_1/generation_" UINT64_FORMAT "/durable_prefix/current",
+					 cluster_wal_threads_dir,
+					 op.predecessor.snapshot.identity.origin_owner_incarnation);
+			write_all_or_abort(path, "bad", 3);
+		}
+		UT_ASSERT(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
+															   op.operation_uuid, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		if (fault == 7)
+			UT_ASSERT_EQ(chmod(path, 0700), 0);
+		if (fault == 8) {
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT_EQ(rename(moved, path), 0);
+		}
+		if (fault == 1)
+			UT_ASSERT_EQ(rmdir(pgwal), 0);
+		else if (fault != 0)
+			UT_ASSERT_EQ(unlink(pgwal), 0);
+		/* Also proves that a rejected operation left no owned temporary name. */
+		UT_ASSERT_EQ(rmdir(pgdata), 0);
+		DataDir = test_root;
+		test_restart_ref_valid = test_reserve_mode = false;
+	}
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++fds_after;
+	UT_ASSERT_EQ(fds_after, fds_before);
+}
+
+UT_TEST(test_v3_startup_route_uncertain_rename_requires_directory_sync)
+{
+	uint8 before[66048], old_bytes[XLOG_BLCKSZ], after_bytes[XLOG_BLCKSZ];
+	ControlRootImage root;
+	char pgdata[MAXPGPATH], pgwal[MAXPGPATH], wal[MAXPGPATH];
+	ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), out;
+	struct stat original, switched = { 0 }, retried;
+	if (ut_current_failed)
+		return;
+	snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+	v2_checkpoint_wal_path(&op.predecessor.snapshot.identity, op.input_record_start,
+						   op.input_timeline, wal);
+	read_all_or_abort(wal, old_bytes, sizeof(old_bytes));
+	UT_ASSERT_EQ(lstat(pgwal, &original), 0);
+	for (unsigned attempt = 0; attempt < 3; ++attempt) {
+		test_history_sync_count = 0;
+		test_history_fail_sync = attempt < 2 ? 1 : 0;
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
+																  op.operation_uuid, &out),
+					 attempt < 2 ? CLUSTER_CONTROL_ROOT_IO_ERROR : CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (attempt < 2) {
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+			UT_ASSERT_EQ(test_history_sync_count, 1);
+		}
+		UT_ASSERT_EQ(lstat(pgwal, &retried), 0);
+		if (attempt == 0)
+			switched = retried;
+		UT_ASSERT(original.st_ino != retried.st_ino);
+		UT_ASSERT(switched.st_dev == retried.st_dev && switched.st_ino == retried.st_ino);
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+	}
+	read_all_or_abort(wal, after_bytes, sizeof(after_bytes));
+	UT_ASSERT(memcmp(old_bytes, after_bytes, sizeof(old_bytes)) == 0);
+	UT_ASSERT_EQ(unlink(pgwal), 0);
+	UT_ASSERT_EQ(rmdir(pgdata), 0);
+	DataDir = test_root;
+	test_restart_ref_valid = test_reserve_mode = false;
+}
+
+static unsigned test_route_cut;
+static char test_route_cut_path[MAXPGPATH], test_route_cut_moved[MAXPGPATH];
+
+static void
+v3_route_late_change(void)
+{
+	test_startup_sync_hook = NULL;
+	switch (test_route_cut) {
+	case 0:
+		test_reserve_provider = false;
+		break;
+	case 1:
+		test_reserve_formation.membership.last_admitted_incarnation[3]++;
+		break;
+	case 2:
+		UT_ASSERT_EQ(unlink(test_route_cut_path), 0);
+		UT_ASSERT_EQ(symlink(cluster_wal_threads_dir, test_route_cut_path), 0);
+		break;
+	case 3:
+	case 4:
+		UT_ASSERT_EQ(rename(test_route_cut_path, test_route_cut_moved), 0);
+		UT_ASSERT_EQ(mkdir(test_route_cut_path, 0700), 0);
+		break;
+	case 5:
+		ShutdownRequestPending = true;
+		break;
+	case 6:
+		test_cf_release_confirmed = false;
+		break;
+	}
+}
+
+UT_TEST(test_v3_startup_route_rechecks_names_and_owner_after_exchange)
+{
+	for (test_route_cut = 0; test_route_cut < 7; ++test_route_cut) {
+		uint8 before[66048];
+		ControlRootImage root;
+		char pgdata[MAXPGPATH], pgwal[MAXPGPATH];
+		ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), out;
+		if (ut_current_failed)
+			return;
+		snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+		strlcpy(test_route_cut_path, test_route_cut == 3 ? pgdata : pgwal,
+				sizeof(test_route_cut_path));
+		if (test_route_cut == 4)
+			v3_target_path(test_route_cut_path, &op, "");
+		snprintf(test_route_cut_moved, sizeof(test_route_cut_moved), "%s.moved",
+				 test_route_cut_path);
+		test_startup_sync_hook = v3_route_late_change;
+		UT_ASSERT(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
+															   op.operation_uuid, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT(test_startup_sync_hook == NULL);
+		v2_assert_primary_unchanged(before);
+		if (test_route_cut == 3 || test_route_cut == 4) {
+			UT_ASSERT_EQ(rmdir(test_route_cut_path), 0);
+			UT_ASSERT_EQ(rename(test_route_cut_moved, test_route_cut_path), 0);
+		}
+		UT_ASSERT_EQ(unlink(pgwal), 0);
+		UT_ASSERT_EQ(rmdir(pgdata), 0);
+		DataDir = test_root;
+		ShutdownRequestPending = false;
+		test_cf_release_confirmed = true;
+		test_restart_ref_valid = test_reserve_mode = false;
+	}
 }
 
 /* Build a real independent successor stream after the production all-member
@@ -13584,7 +13922,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(255);
+	UT_PLAN(260);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
 	UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
@@ -13600,6 +13938,11 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_startup_checkpoint_requires_real_successor_bytes);
 	UT_RUN(test_v3_startup_checkpoint_persistence_and_late_races_keep_obligations);
 	UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
+	UT_RUN(test_v3_startup_route_switches_only_exact_empty_generation);
+	UT_RUN(test_v3_startup_route_requires_exact_owner_and_restart_input);
+	UT_RUN(test_v3_startup_route_refuses_unsafe_or_nonempty_namespaces);
+	UT_RUN(test_v3_startup_route_uncertain_rename_requires_directory_sync);
+	UT_RUN(test_v3_startup_route_rechecks_names_and_owner_after_exchange);
 	UT_RUN(test_v3_target_rejects_wrong_owner_before_creation);
 	UT_RUN(test_v3_target_never_adopts_foreign_or_nonempty_namespace);
 	UT_RUN(test_v3_target_sync_failures_never_grant_initialization);

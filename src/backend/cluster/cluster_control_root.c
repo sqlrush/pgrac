@@ -4037,6 +4037,12 @@ typedef struct StartupTargetWork {
 	bool cf_held;
 } StartupTargetWork;
 
+typedef enum StartupTargetAction {
+	STARTUP_TARGET_PREPARE,
+	STARTUP_TARGET_READ,
+	STARTUP_TARGET_ROUTE
+} StartupTargetAction;
+
 /* Every declared target must still have exactly its selected incarnation.
  * A missing member is never an excuse to shrink a clean-start operation. */
 static ClusterControlRootResult
@@ -4093,13 +4099,14 @@ startup_operation_formation(const ControlRootImage *root, uint32 phase, bool all
 
 static ClusterControlRootResult
 startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootIdentity *self,
-							  const uint8 operation_uuid[16], bool writer)
+							  const uint8 operation_uuid[16], StartupTargetAction action)
 {
 	ControlFileData common;
 	ClusterControlRootFileToken token;
 	ClusterFormationSnapshotV1 formation;
 	ClusterControlRootResult result;
 	unsigned node = self->origin_node_id;
+	bool writer = action != STARTUP_TARGET_PREPARE;
 	uint32 phase = writer ? CLUSTER_WAL_STARTUP_INITIALIZING : CLUSTER_WAL_STARTUP_RESERVED;
 
 	result = read_control_version(self->storage_uuid, self->system_identifier, &work->base, &common,
@@ -4122,6 +4129,14 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 	result = cluster_wal_startup_empty_locked(&work->base, node, !writer, !writer);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
+	if (action == STARTUP_TARGET_ROUTE) {
+		ClusterWalDurablePrefixRef restart;
+		if (!cluster_wal_thread_restart_v2_ref(&restart))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		result = cluster_wal_startup_route_locked(&work->base, node, DataDir, &restart);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
 	result = read_control_version(self->storage_uuid, self->system_identifier, &work->observed,
 								  &common, &token, CONTROL_ROOT_HEADER_VERSION_V3);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -4141,7 +4156,7 @@ startup_prepare_target_locked(StartupTargetWork *work, const ClusterControlRootI
 
 static ClusterControlRootResult
 startup_target_read(const ClusterControlRootIdentity *self, const uint8 operation_uuid[16],
-					ClusterWalStartupImage *out, bool writer)
+					ClusterWalStartupImage *out, StartupTargetAction action)
 {
 	StartupTargetWork *work;
 	ClusterControlRootResult result;
@@ -4170,7 +4185,7 @@ startup_target_read(const ClusterControlRootIdentity *self, const uint8 operatio
 			result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 		else {
 			work->cf_held = true;
-			result = startup_prepare_target_locked(work, self, operation_uuid, writer);
+			result = startup_prepare_target_locked(work, self, operation_uuid, action);
 		}
 	}
 	PG_CATCH();
@@ -4194,7 +4209,7 @@ cluster_control_root_v3_startup_prepare_target(const ClusterControlRootIdentity 
 											   const uint8 operation_uuid[16],
 											   ClusterWalStartupImage *out)
 {
-	return startup_target_read(self, operation_uuid, out, false);
+	return startup_target_read(self, operation_uuid, out, STARTUP_TARGET_PREPARE);
 }
 
 ClusterControlRootResult
@@ -4202,7 +4217,15 @@ cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *se
 											const uint8 operation_uuid[16],
 											ClusterWalStartupImage *out)
 {
-	return startup_target_read(self, operation_uuid, out, true);
+	return startup_target_read(self, operation_uuid, out, STARTUP_TARGET_READ);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *self,
+											 const uint8 operation_uuid[16],
+											 ClusterWalStartupImage *out)
+{
+	return startup_target_read(self, operation_uuid, out, STARTUP_TARGET_ROUTE);
 }
 
 typedef struct StartupBeginWork {
