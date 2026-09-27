@@ -126,6 +126,12 @@
  *	               (the spec-5.6 Phase-2 rendezvous forces concurrent
  *	               boots, breaking spec-4.5a Q3's serialized-cold-merge
  *	               premise).
+ *
+ * PGRAC MODIFICATIONS
+ *	Modified by: SqlRush <sqlrush@gmail.com>
+ *	What changed: XLogFileRead opens the authenticated restart generation
+ *	              independently of the writable pg_wal route.
+ *	Why:          A successor writer must not substitute its WAL for restart input.
  */
 
 #include "postgres.h"
@@ -163,6 +169,7 @@
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_restart_read.h"
 #include "cluster/cluster_write_fence.h"
 #endif
 #include "access/xlogarchive.h"
@@ -5695,6 +5702,10 @@ rescanLatestTimeLine(TimeLineID replayTLI, XLogRecPtr replayLSN)
  *
  * If source == XLOG_FROM_ARCHIVE, the segment is retrieved from archive.
  * Otherwise, it's assumed to be already available in pg_wal.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: shared-config startup opens the selected read-only input.
+ * Why: the writable route must not substitute for retained restart WAL.
  */
 static int
 XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli,
@@ -5706,6 +5717,35 @@ XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli,
 	int			fd;
 
 	XLogFileName(xlogfname, tli, segno, wal_segment_size);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: refuse alternate sources before archive restore can mutate pg_wal.
+	 * An absent segment may be native EOF; an absent identity never is. */
+	if (cluster_enabled && cluster_shared_config)
+	{
+		ClusterWalDurablePrefixRef input;
+		ClusterControlRootResult result;
+
+		if (source != XLOG_FROM_PG_WAL || !cluster_wal_thread_restart_v2_ref(&input))
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("selected restart WAL input is unavailable"),
+					 errhint("Verify the selected WAL generation before restarting; do not substitute local or archived WAL.")));
+		result = cluster_wal_restart_segment_open(cluster_wal_threads_dir, &input,
+												 tli, segno, wal_segment_size, &fd);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && result != CLUSTER_CONTROL_ROOT_ABSENT)
+			ereport(FATAL,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("could not validate selected restart WAL segment"),
+					 errdetail("Thread %u, timeline %u, result %d.",
+							   input.claim.identity.origin_thread_id, tli, result),
+					 errhint("Preserve the selected generation and check its claim and storage; no fallback is permitted.")));
+		snprintf(path, sizeof(path), "selected restart WAL/%s", xlogfname);
+		if (result == CLUSTER_CONTROL_ROOT_ABSENT)
+			errno = ENOENT;
+		goto file_opened;
+	}
+#endif
 
 	switch (source)
 	{
@@ -5747,6 +5787,9 @@ XLogFileRead(XLogSegNo segno, int emode, TimeLineID tli,
 	}
 
 	fd = BasicOpenFile(path, O_RDONLY | PG_BINARY);
+#ifdef USE_PGRAC_CLUSTER
+file_opened:
+#endif
 	if (fd >= 0)
 	{
 		/* Success! */

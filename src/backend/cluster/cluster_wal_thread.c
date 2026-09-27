@@ -80,6 +80,8 @@ typedef struct ClusterWalThreadShmemData {
 	uint8 _pad[3];
 	ClusterWalDurablePrefixRef v2_ref;
 	bool v2_ref_valid;
+	ClusterWalDurablePrefixRef restart_ref;
+	bool restart_ref_valid;
 
 	/* spec-4.2 D5: WAL-state registry refresh-failure counter (bumped by
 	 * cluster_stats on best-effort refresh failures, read by the dump
@@ -112,6 +114,9 @@ cluster_wal_thread_shmem_init(void)
 		memset(cluster_wal_thread_shmem->_pad, 0, sizeof(cluster_wal_thread_shmem->_pad));
 		memset(&cluster_wal_thread_shmem->v2_ref, 0, sizeof(cluster_wal_thread_shmem->v2_ref));
 		cluster_wal_thread_shmem->v2_ref_valid = false;
+		memset(&cluster_wal_thread_shmem->restart_ref, 0,
+			   sizeof(cluster_wal_thread_shmem->restart_ref));
+		cluster_wal_thread_shmem->restart_ref_valid = false;
 		pg_atomic_init_u64(&cluster_wal_thread_shmem->wal_state_refresh_fail_count, 0);
 		memset(cluster_wal_thread_shmem->_reserved, 0, sizeof(cluster_wal_thread_shmem->_reserved));
 	}
@@ -209,6 +214,22 @@ cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 			   != cluster_wal_thread_id())
 		return false;
 	*out = cluster_wal_thread_shmem->v2_ref;
+	return true;
+}
+
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_enabled || !cluster_shared_config || cluster_wal_thread_shmem == NULL
+		|| !cluster_wal_thread_shmem->restart_ref_valid || !cluster_wal_thread_shmem->dir_validated
+		|| cluster_wal_thread_shmem->restart_ref.claim.identity.origin_node_id != cluster_node_id
+		|| cluster_wal_thread_shmem->restart_ref.claim.identity.origin_thread_id
+			   != cluster_wal_thread_id())
+		return false;
+	*out = cluster_wal_thread_shmem->restart_ref;
 	return true;
 }
 
@@ -458,8 +479,10 @@ cluster_wal_thread_init(void)
 		 * the early postmaster has no transaction ResourceOwner to borrow. */
 		cluster_control_bootstrap_wal_recheck(DataDir, &ref);
 		cluster_wal_thread_shmem->v2_ref = ref;
+		cluster_wal_thread_shmem->restart_ref = ref;
 		cluster_wal_thread_shmem->dir_validated = 1;
 		cluster_wal_thread_shmem->v2_ref_valid = true;
+		cluster_wal_thread_shmem->restart_ref_valid = true;
 		return;
 	}
 

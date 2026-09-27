@@ -197,6 +197,9 @@ cluster_wal_thread_dir_name(uint16 thread_id, char *buf, size_t buflen)
  * before the actual postmaster WAL initialization populated shared memory, or
  * outside the exact PRE2 node/profile. Callers still need their runtime gates. */
 extern bool cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out);
+/* Immutable restart input, independent of the ordinary writer reference.
+ * Reading this mirror never authorizes WAL insertion or serving. */
+extern bool cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out);
 
 /*
  * cluster_wal_thread_id -- this instance's WAL thread identity.

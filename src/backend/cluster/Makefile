@@ -301,6 +301,7 @@ OBJS = \
 	cluster_version.o \
 	cluster_views.o \
 	cluster_wal_claim.o \
+	cluster_wal_restart_read.o \
 	cluster_wal_durable_prefix.o \
 	cluster_wal_durable_publish.o \
 	cluster_wal_state.o \

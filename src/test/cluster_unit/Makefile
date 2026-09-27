@@ -85,7 +85,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_r4_itl_capacity \
         test_cluster_retention test_cluster_undo_cleaner test_cluster_visibility_variants test_cluster_writer_chain test_cluster_tt_2pc \
         test_cluster_stage3_acceptance test_cluster_undo_buf test_cluster_undo_extent \
-        test_cluster_wal_thread test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
+        test_cluster_wal_thread test_cluster_wal_restart_read test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail test_cluster_wal_state test_cluster_wal_state_rmw test_cluster_recovery_plan \
         test_cluster_backup test_cluster_retained_remote \
         test_cluster_recovery_worker test_cluster_recovery_merge test_cluster_remote_xact test_cluster_remote_xact_writer \
         test_cluster_block_apply test_cluster_thread_apply test_cluster_thread_replay \
@@ -429,7 +429,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
-SIMPLE_TESTS := $(filter-out test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
@@ -5460,6 +5460,32 @@ test_cluster_recovery_plan: test_cluster_recovery_plan.c unit_test.h \
 # Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_WAL_CLAIM_O = $(top_builddir)/src/backend/cluster/cluster_wal_claim.o
 CLUSTER_WAL_DURABLE_PREFIX_O = $(top_builddir)/src/backend/cluster/cluster_wal_durable_prefix.o
+# PGRAC: actual native segment selection with real generation files.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_native_wal_read.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
+	awk '/^XLogFileRead\(/ { print "static int"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+# PGRAC: actual postmaster mirror initialization and both identity consumers.
+test_cluster_wal_restart_mirror.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_thread.c Makefile
+	awk '/^typedef struct ClusterWalThreadShmemData/ { emit=1; types++ } \
+	     /^cluster_wal_thread_current_v2_ref\(/ || /^cluster_wal_thread_restart_v2_ref\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_wal_thread_init\(/ { owner=1 } \
+	     owner && /^\tif \(cluster_shared_config\) \{/ { print "static void actual_select_input(void) {"; emit=1; branch=1; init++ } \
+	     emit { print } \
+	     branch && /^\t}/ { print "}"; emit=0; branch=0; owner=0 } \
+	     /^} ClusterWalThreadShmemData;/ { print "static ClusterWalThreadShmemData *cluster_wal_thread_shmem;" } \
+	     /^}/ { emit=0 } \
+	     END { if (types != 1 || functions != 2 || init != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_wal_restart_read: test_cluster_wal_restart_read.c test_cluster_native_wal_read.inc test_cluster_wal_restart_mirror.inc unit_test.h $(CLUSTER_WAL_CLAIM_O) \
+		$(top_srcdir)/src/backend/cluster/cluster_wal_restart_read.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_CLAIM_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
 # PGRAC: execute the actual old reader to prove PRE2 cannot silently fall back.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_thread_tail_legacy.inc: $(top_srcdir)/src/backend/cluster/cluster_thread_recovery_driver.c Makefile
