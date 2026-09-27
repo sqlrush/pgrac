@@ -29,6 +29,8 @@
 #include "cluster/cluster_wal_durable_prefix.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_restart_read.h"
+#include "../../backend/cluster/cluster_control_root_private.h"
+#include "../../backend/cluster/cluster_control_bootstrap_private.h"
 #include "common/cryptohash.h"
 #include "port/atomics.h"
 #include "storage/fd.h"
@@ -54,6 +56,10 @@ static XLogSource readSource, XLogReceiptSource;
 static TimestampTz XLogReceiptTime;
 static bool InRedo;
 static ClusterWalDurablePrefixRef input;
+static ClusterWalDurablePrefixRef installed_writer;
+static ClusterControlRootResult install_result, route_result;
+static bool startup_binding, lose_binding_on_route;
+static unsigned install_calls, route_calls;
 static bool error_expected;
 static sigjmp_buf error_jmp;
 static int archive_calls, error_level;
@@ -75,11 +81,42 @@ static int intercepted_close(int fd);
 
 /* The root validator boundary supplies a qualified input. Actual production
  * initialization/accessors must preserve it independently of the writer. */
-static void
+void
 cluster_control_bootstrap_wal_recheck(const char *dir pg_attribute_unused(),
 									  ClusterWalDurablePrefixRef *out)
 {
 	*out = input;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_startup_install_writer(
+	const ClusterWalStartupImage *expected pg_attribute_unused(), ClusterWalDurablePrefixRef *out)
+{
+	++install_calls;
+	memset(out, 0, sizeof(*out));
+	if (install_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = installed_writer;
+	return install_result;
+}
+
+ClusterControlRootResult
+cluster_control_bootstrap_wal_route(const char *pgdata pg_attribute_unused(),
+									const char *wal_root pg_attribute_unused(),
+									const ClusterWalDurablePrefixRef *ref)
+{
+	++route_calls;
+	UT_ASSERT(memcmp(ref, &installed_writer, sizeof(*ref)) == 0);
+	if (lose_binding_on_route)
+		startup_binding = false;
+	return route_result;
+}
+
+bool
+cluster_wal_durable_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
+									XLogRecPtr first)
+{
+	return startup_binding && uuid[0] == 0x27 && first == 2 * wal_segment_size
+		   && memcmp(self, &installed_writer.claim.identity, sizeof(*self)) == 0;
 }
 
 uint16
@@ -251,8 +288,15 @@ fixture(void)
 	cluster_enabled = cluster_shared_config = true;
 	cluster_node_id = 1;
 	memset(&mirror, 0, sizeof(mirror));
+	pg_atomic_init_u32(&mirror.writer_ref_state, 0);
 	cluster_wal_thread_shmem = &mirror;
 	actual_select_input();
+	installed_writer = input;
+	installed_writer.claim.identity.origin_owner_incarnation = 100;
+	install_result = route_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	startup_binding = true;
+	lose_binding_on_route = false;
+	install_calls = route_calls = 0;
 	error_expected = false;
 	error_level = archive_calls = 0;
 	open_action = 0;
@@ -508,12 +552,21 @@ UT_TEST(repeated_refusals_do_not_leak_descriptors)
 UT_TEST(restart_mirror_is_independent_and_profile_bound)
 {
 	ClusterWalDurablePrefixRef observed;
+	ClusterWalStartupImage expected = { 0 };
 	fixture();
-	mirror.v2_ref.claim.identity.origin_owner_incarnation = 100;
+	UT_ASSERT(!cluster_wal_thread_current_v2_ref(&observed));
+	UT_ASSERT(memcmp(&observed, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(observed)) == 0);
+	expected.claim.identity = installed_writer.claim.identity;
+	expected.operation_uuid[0] = 0x27;
+	expected.first_segment_lsn = 2 * wal_segment_size;
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
 	UT_ASSERT(cluster_wal_thread_current_v2_ref(&observed));
 	UT_ASSERT_EQ(observed.claim.identity.origin_owner_incarnation, 100);
 	UT_ASSERT(cluster_wal_thread_restart_v2_ref(&observed));
 	UT_ASSERT_EQ(observed.claim.identity.origin_owner_incarnation, 99);
+	UT_ASSERT_EQ(install_calls, 1);
+	UT_ASSERT_EQ(route_calls, 1);
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
 	for (int fault = 0; fault < 5; ++fault) {
 		fixture();
 		if (fault == 0)
@@ -532,6 +585,88 @@ UT_TEST(restart_mirror_is_independent_and_profile_bound)
 			UT_ASSERT_EQ(((uint8 *)&observed)[i], 0);
 	}
 	UT_ASSERT(!cluster_wal_thread_restart_v2_ref(NULL));
+}
+
+UT_TEST(writer_mirror_requires_install_route_and_live_initializer)
+{
+	for (unsigned fault = 0; fault < 10; ++fault) {
+		ClusterWalStartupImage expected = { 0 };
+		ClusterWalDurablePrefixRef observed;
+		fixture();
+		expected.claim.identity = installed_writer.claim.identity;
+		expected.operation_uuid[0] = 0x27;
+		expected.first_segment_lsn = 2 * wal_segment_size;
+		switch (fault) {
+		case 0:
+			install_result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			break;
+		case 1:
+			route_result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			break;
+		case 2:
+			lose_binding_on_route = true;
+			break;
+		case 3:
+			pg_atomic_write_u32(&mirror.writer_ref_state, 1);
+			break;
+		case 4:
+			++installed_writer.claim.identity.origin_node_id;
+			break;
+		case 5:
+			++installed_writer.claim.identity.origin_thread_id;
+			break;
+		case 6:
+			mirror.restart_ref_valid = false;
+			break;
+		case 7:
+			cluster_shared_config = false;
+			break;
+		case 8:
+			mirror.dir_validated = false;
+			break;
+		case 9:
+			cluster_wal_thread_shmem = NULL;
+			break;
+		}
+		UT_ASSERT(cluster_wal_thread_install_startup(&expected) != 0);
+		UT_ASSERT(!cluster_wal_thread_current_v2_ref(&observed));
+		UT_ASSERT(memcmp(&observed, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(observed)) == 0);
+		UT_ASSERT(memcmp(&mirror.restart_ref, &input, sizeof(input)) == 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&mirror.writer_ref_state), fault == 3 ? 1 : 0);
+		if (fault == 0)
+			UT_ASSERT_EQ(route_calls, 0);
+		if (fault >= 6)
+			UT_ASSERT_EQ(install_calls, 0);
+	}
+	fixture();
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(NULL), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(install_calls, 0);
+}
+
+UT_TEST(writer_mirror_is_once_only_and_hidden_while_copying)
+{
+	ClusterWalStartupImage expected = { 0 };
+	ClusterWalDurablePrefixRef first, observed;
+	fixture();
+	expected.claim.identity = installed_writer.claim.identity;
+	expected.operation_uuid[0] = 0x27;
+	expected.first_segment_lsn = 2 * wal_segment_size;
+	/* A reader must not consume a partly written reference before READY. */
+	pg_atomic_write_u32(&mirror.writer_ref_state, 1);
+	mirror.v2_ref = installed_writer;
+	UT_ASSERT(!cluster_wal_thread_current_v2_ref(&observed));
+	UT_ASSERT(memcmp(&observed, &(ClusterWalDurablePrefixRef){ 0 }, sizeof(observed)) == 0);
+	pg_atomic_write_u32(&mirror.writer_ref_state, 0);
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected), 0);
+	UT_ASSERT(cluster_wal_thread_current_v2_ref(&first));
+	installed_writer.claim.claim_sha256[0] ^= 1;
+	UT_ASSERT_EQ(cluster_wal_thread_install_startup(&expected),
+				 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(cluster_wal_thread_current_v2_ref(&observed));
+	UT_ASSERT(memcmp(&observed, &first, sizeof(first)) == 0);
+	UT_ASSERT(cluster_wal_thread_restart_v2_ref(&observed));
+	UT_ASSERT(memcmp(&observed, &input, sizeof(input)) == 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&mirror.writer_ref_state), 2);
 }
 
 UT_TEST(close_failure_cannot_leak_successful_segment)
@@ -585,7 +720,7 @@ UT_TEST(reading_preserves_both_generations)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(native_reads_retained_input_not_pg_wal);
 	UT_RUN(native_bad_input_never_falls_back);
 	UT_RUN(legacy_keeps_native_route);
@@ -596,6 +731,8 @@ main(void)
 	UT_RUN(invalid_inputs_clear_descriptor);
 	UT_RUN(repeated_refusals_do_not_leak_descriptors);
 	UT_RUN(restart_mirror_is_independent_and_profile_bound);
+	UT_RUN(writer_mirror_requires_install_route_and_live_initializer);
+	UT_RUN(writer_mirror_is_once_only_and_hidden_while_copying);
 	UT_RUN(close_failure_cannot_leak_successful_segment);
 	UT_RUN(reading_preserves_both_generations);
 	if (original_dir < 0 || fchdir(original_dir) || close(original_dir) || !rmtree(scratch, true))

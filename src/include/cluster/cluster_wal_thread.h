@@ -193,13 +193,19 @@ cluster_wal_thread_dir_name(uint16 thread_id, char *buf, size_t buflen)
 
 #include "cluster/cluster_wal_durable_prefix.h"
 
-/* Root-selected routing reference, not write/flush/recovery authority. False
- * before the actual postmaster WAL initialization populated shared memory, or
- * outside the exact PRE2 node/profile. Callers still need their runtime gates. */
+/* Root-selected writer routing reference, not write/flush/recovery authority.
+ * False until the exact initializer completes INSTALL and publishes the new
+ * reference, or outside PRE2. Callers still need their runtime gates. */
 extern bool cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out);
 /* Immutable restart input, independent of the ordinary writer reference.
  * Reading this mirror never authorizes WAL insertion or serving. */
 extern bool cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out);
+struct ClusterWalStartupImage;
+/* StartupProcess-only INSTALL plus exact route check, then once-only shared
+ * writer-reference publication. This never overwrites the restart input and
+ * does not admit serving. Refuses conflicting or partially published state. */
+extern ClusterControlRootResult
+cluster_wal_thread_install_startup(const struct ClusterWalStartupImage *expected);
 
 /*
  * cluster_wal_thread_id -- this instance's WAL thread identity.

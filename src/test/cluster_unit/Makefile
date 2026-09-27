@@ -5475,13 +5475,14 @@ test_cluster_native_wal_read.inc: $(top_srcdir)/src/backend/access/transam/xlogr
 test_cluster_wal_restart_mirror.inc: $(top_srcdir)/src/backend/cluster/cluster_wal_thread.c Makefile
 	awk '/^typedef struct ClusterWalThreadShmemData/ { emit=1; types++ } \
 	     /^cluster_wal_thread_current_v2_ref\(/ || /^cluster_wal_thread_restart_v2_ref\(/ { print "bool"; emit=1; functions++ } \
+	     /^cluster_wal_thread_install_startup\(/ { print "ClusterControlRootResult"; emit=1; installs++ } \
 	     /^cluster_wal_thread_init\(/ { owner=1 } \
 	     owner && /^\tif \(cluster_shared_config\) \{/ { print "static void actual_select_input(void) {"; emit=1; branch=1; init++ } \
 	     emit { print } \
 	     branch && /^\t}/ { print "}"; emit=0; branch=0; owner=0 } \
 	     /^} ClusterWalThreadShmemData;/ { print "static ClusterWalThreadShmemData *cluster_wal_thread_shmem;" } \
 	     /^}/ { emit=0 } \
-	     END { if (types != 1 || functions != 2 || init != 1 || emit) exit 1 }' $< > $@.tmp
+	     END { if (types != 1 || functions != 2 || installs != 1 || init != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_wal_restart_read: test_cluster_wal_restart_read.c test_cluster_native_wal_read.inc test_cluster_wal_restart_mirror.inc unit_test.h $(CLUSTER_WAL_CLAIM_O) \

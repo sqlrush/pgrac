@@ -32,8 +32,8 @@
  *
  *	  Shmem region "pgrac wal thread" exists so the dump accessors work
  *	  under EXEC_BACKEND too (children do not inherit postmaster globals
- *	  there); it carries one counter and a small identity mirror written
- *	  once by the postmaster before any child is forked.
+ *	  there). Restart input is written once by the postmaster. In PRE2 the
+ *	  distinct writer is published once by the qualified startup executor.
  *
  *-------------------------------------------------------------------------
  */
@@ -53,6 +53,7 @@
 #include "cluster/cluster_wal_state.h" /* spec-4.2 ensure() */
 #include "cluster/cluster_wal_thread.h"
 #include "cluster_control_bootstrap_private.h"
+#include "cluster_control_root_private.h"
 #include "miscadmin.h" /* IsUnderPostmaster, DataDir */
 #include "port/atomics.h"
 #include "storage/fd.h" /* BasicOpenFile, pg_fsync */
@@ -68,10 +69,9 @@ typedef struct ClusterWalThreadShmemData {
 	pg_atomic_uint64 page_stamp_count; /* real-id stamps since startup */
 
 	/*
-	 * Identity mirror for the cluster_debug dump accessors.  Written
-	 * exactly once by cluster_wal_thread_init() in the postmaster
-	 * (before any child exists), read-only afterwards -- so plain
-	 * fields are race-free by construction.
+	 * Routing facts and restart input are immutable after postmaster setup.
+	 * The writer reference is separate: 0=unpublished, 1=copying, 2=ready.
+	 * Only the actual initializer publishes it, once, after root INSTALL.
 	 */
 	uint16 thread_id;	  /* cluster_wal_thread_id() at startup */
 	uint8 dir_configured; /* cluster.wal_threads_dir != '' */
@@ -79,7 +79,7 @@ typedef struct ClusterWalThreadShmemData {
 	uint8 claim_created;  /* this boot created the claim file */
 	uint8 _pad[3];
 	ClusterWalDurablePrefixRef v2_ref;
-	bool v2_ref_valid;
+	pg_atomic_uint32 writer_ref_state;
 	ClusterWalDurablePrefixRef restart_ref;
 	bool restart_ref_valid;
 
@@ -113,7 +113,7 @@ cluster_wal_thread_shmem_init(void)
 		cluster_wal_thread_shmem->claim_created = 0;
 		memset(cluster_wal_thread_shmem->_pad, 0, sizeof(cluster_wal_thread_shmem->_pad));
 		memset(&cluster_wal_thread_shmem->v2_ref, 0, sizeof(cluster_wal_thread_shmem->v2_ref));
-		cluster_wal_thread_shmem->v2_ref_valid = false;
+		pg_atomic_init_u32(&cluster_wal_thread_shmem->writer_ref_state, 0);
 		memset(&cluster_wal_thread_shmem->restart_ref, 0,
 			   sizeof(cluster_wal_thread_shmem->restart_ref));
 		cluster_wal_thread_shmem->restart_ref_valid = false;
@@ -208,12 +208,16 @@ cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 		return false;
 	memset(out, 0, sizeof(*out));
 	if (!cluster_enabled || !cluster_shared_config || cluster_wal_thread_shmem == NULL
-		|| !cluster_wal_thread_shmem->v2_ref_valid || !cluster_wal_thread_shmem->dir_validated
-		|| cluster_wal_thread_shmem->v2_ref.claim.identity.origin_node_id != cluster_node_id
-		|| cluster_wal_thread_shmem->v2_ref.claim.identity.origin_thread_id
-			   != cluster_wal_thread_id())
+		|| !cluster_wal_thread_shmem->dir_validated
+		|| pg_atomic_read_u32(&cluster_wal_thread_shmem->writer_ref_state) != 2)
 		return false;
+	pg_read_barrier();
 	*out = cluster_wal_thread_shmem->v2_ref;
+	if (out->claim.identity.origin_node_id != cluster_node_id
+		|| out->claim.identity.origin_thread_id != cluster_wal_thread_id()) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
 	return true;
 }
 
@@ -231,6 +235,46 @@ cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
 		return false;
 	*out = cluster_wal_thread_shmem->restart_ref;
 	return true;
+}
+
+ClusterControlRootResult
+cluster_wal_thread_install_startup(const ClusterWalStartupImage *expected)
+{
+	ClusterWalDurablePrefixRef installed;
+	ClusterControlRootResult result;
+	uint32 state = 0;
+	if (expected == NULL || !cluster_enabled || !cluster_shared_config
+		|| cluster_wal_thread_shmem == NULL || !cluster_wal_thread_shmem->restart_ref_valid
+		|| !cluster_wal_thread_shmem->dir_validated)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* No caller flag stands in for the actual selected writer and its
+	 * durability. This call also qualifies an uncertain same-process retry. */
+	result = cluster_control_root_v3_startup_install_writer(expected, &installed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_control_bootstrap_wal_route(DataDir, cluster_wal_threads_dir, &installed);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (installed.claim.identity.origin_node_id != cluster_node_id
+		|| installed.claim.identity.origin_thread_id != cluster_wal_thread_id()
+		|| !cluster_wal_durable_startup_matches(&installed.claim.identity, expected->operation_uuid,
+												expected->first_segment_lsn))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!pg_atomic_compare_exchange_u32(&cluster_wal_thread_shmem->writer_ref_state, &state, 1)) {
+		if (state != 2)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		pg_read_barrier();
+		return memcmp(&installed, &cluster_wal_thread_shmem->v2_ref, sizeof(installed)) == 0
+				   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				   : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	}
+	/* No I/O, allocation or error-capable work inside the once-only copy.
+	 * Readers inspect READY then use an acquire barrier; bytes never change
+	 * afterwards. The immutable predecessor mirror is never touched here. */
+	cluster_wal_thread_shmem->v2_ref = installed;
+	pg_write_barrier();
+	pg_atomic_write_u32(&cluster_wal_thread_shmem->writer_ref_state, 2);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 bool
@@ -478,10 +522,8 @@ cluster_wal_thread_init(void)
 		/* All actual DataDir reads/crypto stay in the adapter's temporary owner;
 		 * the early postmaster has no transaction ResourceOwner to borrow. */
 		cluster_control_bootstrap_wal_recheck(DataDir, &ref);
-		cluster_wal_thread_shmem->v2_ref = ref;
 		cluster_wal_thread_shmem->restart_ref = ref;
 		cluster_wal_thread_shmem->dir_validated = 1;
-		cluster_wal_thread_shmem->v2_ref_valid = true;
 		cluster_wal_thread_shmem->restart_ref_valid = true;
 		return;
 	}
