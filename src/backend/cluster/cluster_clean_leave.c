@@ -398,7 +398,7 @@ cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_
 		expected_phase = expected_wal_state == CLUSTER_WAL_SLOT_STATE_ACTIVE
 							 ? CLUSTER_CONTROL_ROOT_STOP_ACTIVE
 							 : CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
-		root_result = cluster_control_root_v2_stop_phase_read(
+		root_result = cluster_control_root_v3_stop_phase_read(
 			own_thread, out->member_incarnations[cluster_node_id], &selected);
 		if (root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE) {
 			if (reason_out != NULL)
@@ -2575,7 +2575,7 @@ cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
 	cl_durable_close_owner = &current;
 	PG_TRY();
 	{
-		published = cluster_control_root_v2_normal_stop_close(&current, &all_closed);
+		published = cluster_control_root_v3_normal_stop_close(&current, &all_closed);
 	}
 	PG_CATCH();
 	{

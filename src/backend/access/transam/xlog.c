@@ -5043,11 +5043,11 @@ UpdateControlFile(void)
 {
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: neither native writes nor a legacy bring-up skip can complete
-	 * an unclassified root-v2 lifecycle/configuration publication. */
+	 * an unclassified root-v3 lifecycle/configuration publication. */
 	if (cluster_shared_config)
 		ereport(PANIC,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("root-v2 control update requires its native purpose adapter")));
+				 errmsg("root-v3 control update requires its native purpose adapter")));
 
 	/*
 	 * PGRAC: spec-5.6 Db3 + increment (ii).  In shared-authority mode the
@@ -7918,7 +7918,7 @@ update_checkpoint_display(int flags, bool restartpoint, bool reset)
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: purpose-bound native checkpoint adapter. Author: SqlRush <sqlrush@gmail.com> */
 static void
-ClusterCheckpointV2Prepare(int flags, ControlFileData *selected)
+ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 {
 	ClusterWalDurablePrefixRef ref;
 	bool readable;
@@ -7933,7 +7933,7 @@ ClusterCheckpointV2Prepare(int flags, ControlFileData *selected)
 		|| cluster_cf_held(ExclusiveLock) || epoch == 0 || !cluster_external_fence_runtime_active()
 		|| !cluster_wal_thread_current_v2_ref(&ref))
 		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("root-v2 checkpoint requires its admitted native owner")));
+						errmsg("root-v3 checkpoint requires its admitted native owner")));
 	if (!cluster_cf_lock(ShareLock))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
@@ -7962,12 +7962,12 @@ ClusterCheckpointV2Prepare(int flags, ControlFileData *selected)
 		memset(selected, 0, sizeof(*selected));
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("root-v2 checkpoint input or read-authority release is unproven")));
+				 errmsg("root-v3 checkpoint input or read-authority release is unproven")));
 	}
 }
 
 static void
-ClusterCheckpointV2Publish(const ControlFileData *candidate, XLogRecPtr end)
+ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 {
 	ClusterWalDurablePrefixRef ref;
 	ControlFileData selected;
@@ -7985,7 +7985,7 @@ ClusterCheckpointV2Publish(const ControlFileData *candidate, XLogRecPtr end)
 		|| !cluster_wal_thread_current_v2_ref(&ref))
 		ereport(ERROR,
 				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-				 errmsg("root-v2 checkpoint publication requires its native owner")));
+				 errmsg("root-v3 checkpoint publication requires its native owner")));
 	for (;;)
 	{
 		CHECK_FOR_INTERRUPTS();
@@ -8001,10 +8001,10 @@ ClusterCheckpointV2Publish(const ControlFileData *candidate, XLogRecPtr end)
 		 * A pending shutdown signal alone cannot reclassify an online candidate.
 		 * Author: SqlRush <sqlrush@gmail.com> */
 		if (candidate->state == DB_SHUTDOWNED)
-			result = cluster_control_root_v2_shutdown_checkpoint_publish(
+			result = cluster_control_root_v3_shutdown_checkpoint_publish(
 				&ref.claim.identity, candidate, end, &published, &token, &selected);
 		else
-			result = cluster_control_root_v2_checkpoint_publish(&ref.claim.identity, candidate, end,
+			result = cluster_control_root_v3_checkpoint_publish(&ref.claim.identity, candidate, end,
 																&published, &token, &selected);
 		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
 			break;
@@ -8078,7 +8078,7 @@ CreateCheckPoint(int flags)
 #ifdef USE_PGRAC_CLUSTER
 	bool		cf_x_taken = false; /* PGRAC: spec-5.6 Dc1 — held CF X to release */
 	bool		fpw_off_transition = false; /* RF-ROOT P7 G1a-2: W5b FPW-off happened this checkpoint */
-	ControlFileData v2_checkpoint;
+	ControlFileData v3_checkpoint;
 #endif
 
 	/*
@@ -8100,13 +8100,13 @@ CreateCheckPoint(int flags)
 	 * transitions still need their separate owner. No CF skip grants permission. */
 	if (cluster_shared_config)
 	{
-		ClusterCheckpointV2Prepare(flags, &v2_checkpoint);
+		ClusterCheckpointV3Prepare(flags, &v3_checkpoint);
 		if (fullPageWrites != Insert->fullPageWrites)
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-					 errmsg("root-v2 full-page-write transition requires configuration publication")));
+					 errmsg("root-v3 full-page-write transition requires configuration publication")));
 		LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
-		*ControlFile = v2_checkpoint;
+		*ControlFile = v3_checkpoint;
 		LWLockRelease(ControlFileLock);
 	}
 	/*
@@ -8290,7 +8290,7 @@ CreateCheckPoint(int flags)
 	if (shutdown)
 	{
 #ifdef USE_PGRAC_CLUSTER
-		/* PGRAC: root-v2 remains OPEN until its exact close owner finishes.
+		/* PGRAC: root-v3 remains OPEN until its exact close owner finishes.
 		 * Do not enter the legacy writer or expose SHUTDOWNING as authority.
 		 * The private final candidate goes through the shutdown WAL verifier.
 		 * Author: SqlRush <sqlrush@gmail.com> */
@@ -8631,8 +8631,8 @@ CreateCheckPoint(int flags)
 	/* PGRAC: native candidate is private until the root publisher succeeds. */
 	if (cluster_shared_config)
 	{
-		v2_checkpoint = *ControlFile;
-		checkpoint_control = &v2_checkpoint;
+		v3_checkpoint = *ControlFile;
+		checkpoint_control = &v3_checkpoint;
 	}
 #endif
 	if (shutdown)
@@ -8704,7 +8704,7 @@ CreateCheckPoint(int flags)
 	/* PGRAC: root publication precedes every post-checkpoint cleanup. No
 	 * outer CF, native content lock or critical section encloses this wait. */
 	if (cluster_shared_config)
-		ClusterCheckpointV2Publish(&v2_checkpoint, recptr);
+		ClusterCheckpointV3Publish(&v3_checkpoint, recptr);
 
 	/*
 	 * RF A1 W5a: only a non-EOR checkpoint advertises its now-durable redo

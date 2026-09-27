@@ -85,7 +85,7 @@ static unsigned runtime_read_calls;
 
 /* The root test links the actual adapter; this leaf test only checks routing. */
 ClusterControlRootResult
-cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
+cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out)
 {
 	++runtime_read_calls;
 	memset(out, 0, sizeof(*out));

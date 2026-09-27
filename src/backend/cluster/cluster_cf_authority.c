@@ -213,7 +213,7 @@ cluster_cf_authority_read(ControlFileData *out)
 	bool bak_strict_ok;
 	ClusterCfReadSource src;
 
-	/* PGRAC: runtime v2 never reads the compatibility projection or .bak.
+	/* PGRAC: runtime v3 never reads the compatibility projection or .bak.
 	 * The caller already owns CF-S/X; the adapter checks its exact local
 	 * runtime owner again after reading. Author: SqlRush <sqlrush@gmail.com>
 	 */
@@ -228,7 +228,7 @@ cluster_cf_authority_read(ControlFileData *out)
 		 * an unverified partial view. Preserve this API's untouched-on-failure
 		 * contract; a false return is not authority to use the old contents.
 		 */
-		result = cluster_control_root_v2_read_runtime_local_locked(&verified);
+		result = cluster_control_root_v3_read_runtime_local_locked(&verified);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 			return false;
@@ -355,7 +355,7 @@ cluster_cf_authority_write(const ControlFileData *cf)
 	 */
 	if (cluster_shared_config)
 		ereport(PANIC, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						errmsg("root-v2 control update requires a purpose-bound publisher")));
+						errmsg("root-v3 control update requires a purpose-bound publisher")));
 	if (!build_path(primary, sizeof(primary), CLUSTER_CF_REL_PATH)
 		|| !build_path(bak, sizeof(bak), CLUSTER_CF_BAK_REL_PATH)
 		|| !build_path(tmp, sizeof(tmp), CLUSTER_CF_TMP_REL_PATH)

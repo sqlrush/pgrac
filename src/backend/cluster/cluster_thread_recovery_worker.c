@@ -181,14 +181,14 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 		serial_request.acquire_timeout_ms = fence_timeout_ms;
 		serial_request.release_timeout_ms = fence_timeout_ms;
 		if (root_snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN) {
-			root_result = cluster_control_root_v2_failure_open_publish(&serial_request,
+			root_result = cluster_control_root_v3_failure_open_publish(&serial_request,
 																	   &root_snapshot, &root_token);
 			serial_request.expected_root_token = root_token;
 		}
 		if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			&& root_snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
 			&& (root_snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) == 0)
-			root_result = cluster_control_root_v2_failure_tail_publish(&serial_request,
+			root_result = cluster_control_root_v3_failure_tail_publish(&serial_request,
 																	   &root_snapshot, &root_token);
 		if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			root_result = cluster_control_root_read_canonical(

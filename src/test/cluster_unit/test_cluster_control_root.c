@@ -7181,6 +7181,15 @@ UT_TEST(test_v2_shutdown_checkpoint_races_preserve_durable_fact_not_close)
  * checkpoint so a fallback cannot accidentally satisfy these assertions.
  * Author: SqlRush <sqlrush@gmail.com>
  */
+static void root_fixture_version3(uint8 bytes[66048]);
+
+static void
+runtime_fixture_version3(uint8 bytes[66048])
+{
+	root_fixture_version3(bytes);
+	v2_write_roots(bytes);
+}
+
 static void
 v2_runtime_fixture(uint8 bytes[66048], ClusterControlRootIdentity *self, ControlFileData *candidate)
 {
@@ -7210,7 +7219,7 @@ v2_retention_fixture(uint8 bytes[66048], ClusterControlRootIdentity *self,
 
 /* PGRAC: existing recovery owners use these public canonical readers, not
  * the own-writer checkpoint accessor. Author: SqlRush <sqlrush@gmail.com> */
-UT_TEST(test_v2_canonical_strong_reads_recovery_required_peer)
+UT_TEST(test_runtime_v3_canonical_strong_reads_recovery_required_peer)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
@@ -7219,6 +7228,7 @@ UT_TEST(test_v2_canonical_strong_reads_recovery_required_peer)
 	ClusterControlRootReadToken token;
 	int latch_calls;
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	bytes[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
 	put_u64_le(bytes + 232, 0); /* No serving claim for this failed origin. */
 	v2_checksums(bytes);
@@ -7239,7 +7249,7 @@ UT_TEST(test_v2_canonical_strong_reads_recovery_required_peer)
 	cluster_node_id = 0;
 }
 
-UT_TEST(test_v2_canonical_discovery_lookup_and_revalidate)
+UT_TEST(test_runtime_v3_canonical_discovery_lookup_and_revalidate)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self, discovered;
@@ -7247,6 +7257,7 @@ UT_TEST(test_v2_canonical_discovery_lookup_and_revalidate)
 	ClusterControlRootSnapshot out, lookup;
 	ClusterControlRootReadToken token, looked_up;
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	UT_ASSERT_EQ(
 		cluster_control_root_read_canonical_discovered(self.origin_thread_id, &out, &token), 0);
 	UT_ASSERT_EQ(cluster_control_root_lookup_owner_by_node_runtime(self.origin_node_id, &discovered,
@@ -7268,7 +7279,7 @@ UT_TEST(test_v2_canonical_discovery_lookup_and_revalidate)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_canonical_no_missing_claim_or_lockfree_fallback)
+UT_TEST(test_runtime_v3_canonical_no_missing_claim_or_lockfree_fallback)
 {
 	uint8 bytes[66048];
 	char path[MAXPGPATH];
@@ -7277,6 +7288,7 @@ UT_TEST(test_v2_canonical_no_missing_claim_or_lockfree_fallback)
 	ClusterControlRootSnapshot out;
 	ClusterControlRootReadToken token;
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, NULL,
 													 CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE,
 													 &out, &token),
@@ -9620,7 +9632,7 @@ UT_TEST(test_v2_stop_phase_refuses_wrong_owner_missing_claim_or_late_prefix)
 	}
 }
 
-UT_TEST(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound)
+UT_TEST(test_runtime_v3_stop_phase_service_release_is_input_kind_and_cut_bound)
 {
 	for (int mutation = 0; mutation < 5; mutation++) {
 		uint8 before[66048];
@@ -9633,6 +9645,7 @@ UT_TEST(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound)
 		uint64 incarnation;
 
 		v2_stop_observation_fixture(before, &self, &candidate);
+		runtime_fixture_version3(before);
 		MyBackendType = B_LMON;
 		test_cf_release_confirmed = false;
 		incarnation = self.origin_owner_incarnation;
@@ -9642,7 +9655,7 @@ UT_TEST(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound)
 						 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
 		} else {
 			UT_ASSERT_EQ(
-				cluster_control_root_v2_stop_phase_read(self.origin_thread_id, incarnation, &out),
+				cluster_control_root_v3_stop_phase_read(self.origin_thread_id, incarnation, &out),
 				CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
 			UT_ASSERT(v2_zero(&out, sizeof(out)));
 		}
@@ -9659,7 +9672,7 @@ UT_TEST(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound)
 			UT_ASSERT(v2_zero(&ordinary, sizeof(ordinary)) && v2_zero(&token, sizeof(token)));
 		} else {
 			UT_ASSERT_EQ(
-				cluster_control_root_v2_stop_phase_read(self.origin_thread_id, incarnation, &out),
+				cluster_control_root_v3_stop_phase_read(self.origin_thread_id, incarnation, &out),
 				mutation == 0 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 							  : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
 			if (mutation == 0)
@@ -9702,7 +9715,7 @@ UT_TEST(test_v2_stop_phase_error_cleans_cf_and_cannot_return_evidence)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_service_read_waits_for_exact_retirement_before_output)
+UT_TEST(test_runtime_v3_service_read_waits_for_exact_retirement_before_output)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
@@ -9714,6 +9727,7 @@ UT_TEST(test_v2_service_read_waits_for_exact_retirement_before_output)
 	int locks;
 
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	MyBackendType = B_LMON;
 	test_cf_release_confirmed = false;
 	test_capture_error_level = true;
@@ -9750,7 +9764,7 @@ UT_TEST(test_v2_service_read_waits_for_exact_retirement_before_output)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_service_pending_observation_is_bound_to_input_and_cut)
+UT_TEST(test_runtime_v3_service_pending_observation_is_bound_to_input_and_cut)
 {
 	for (int mutation = 0; mutation < 2; mutation++) {
 		uint8 bytes[66048];
@@ -9760,6 +9774,7 @@ UT_TEST(test_v2_service_pending_observation_is_bound_to_input_and_cut)
 		ClusterControlRootReadToken token;
 
 		v2_retention_fixture(bytes, &self, &candidate);
+		runtime_fixture_version3(bytes);
 		MyBackendType = B_LMON;
 		test_cf_release_confirmed = false;
 		UT_ASSERT_EQ(cluster_control_root_read_canonical(self.origin_thread_id, &self,
@@ -9782,7 +9797,7 @@ UT_TEST(test_v2_service_pending_observation_is_bound_to_input_and_cut)
 	}
 }
 
-UT_TEST(test_v2_service_immediate_release_also_rechecks_observation_cut)
+UT_TEST(test_runtime_v3_service_immediate_release_also_rechecks_observation_cut)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
@@ -9791,6 +9806,7 @@ UT_TEST(test_v2_service_immediate_release_also_rechecks_observation_cut)
 	ClusterControlRootReadToken token;
 
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	MyBackendType = B_LMON;
 	test_cf_release_cut_change = true;
 	UT_ASSERT_EQ(cluster_control_root_read_canonical(
@@ -9802,7 +9818,7 @@ UT_TEST(test_v2_service_immediate_release_also_rechecks_observation_cut)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_canonical_unconfirmed_release_is_fatal)
+UT_TEST(test_runtime_v3_canonical_unconfirmed_release_is_fatal)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
@@ -9811,6 +9827,7 @@ UT_TEST(test_v2_canonical_unconfirmed_release_is_fatal)
 	static ClusterControlRootReadToken token;
 	volatile bool caught = false;
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	test_cf_release_confirmed = false;
 	test_capture_error_level = true;
 	test_last_error_level = 0;
@@ -9848,8 +9865,7 @@ UT_TEST(test_v2_failure_open_invalidates_old_tail_and_keeps_other_threads)
 	ClusterControlRootFileToken file_token;
 
 	v2_retention_fixture(before, &self, &candidate);
-	UT_ASSERT_EQ(cluster_control_root_read_canonical(
-					 self.origin_thread_id, &self, CLUSTER_CONTROL_ROOT_READ_STRONG, &old, &token),
+	UT_ASSERT_EQ(cluster_control_root_v2_read_canonical(self.origin_thread_id, &self, &old, &token),
 				 0);
 	memset(&request, 0, sizeof(request));
 	request.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
@@ -9905,9 +9921,8 @@ v2_failure_fixture(uint8 before[66048], ClusterRecoverySerialRequest *request, b
 	request->fence_need_set = (const PgracExternalFenceNeedSetV1 *)(uintptr_t)2;
 	request->fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)3;
 	request->acquire_timeout_ms = request->release_timeout_ms = 5000;
-	UT_ASSERT_EQ(cluster_control_root_read_canonical(1, &self, CLUSTER_CONTROL_ROOT_READ_STRONG,
-													 &out, &request->expected_root_token),
-				 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_v2_read_canonical(1, &self, &out, &request->expected_root_token), 0);
 	test_failure_formation = test_failure_needs = test_failure_admissions = true;
 	memset(&test_failure_need, 0, sizeof(test_failure_need));
 	test_failure_need.system_identifier = self.system_identifier;
@@ -9931,12 +9946,13 @@ v2_failure_seal_fixture(uint8 before[66048], ClusterRecoverySerialRequest *reque
 	v2_failure_fixture(before, request, true);
 }
 
-UT_TEST(test_v2_failure_launch_accepts_open_but_not_clean_thread)
+UT_TEST(test_runtime_v3_failure_launch_accepts_open_but_not_clean_thread)
 {
 	uint8 before[66048];
 	ClusterRecoverySerialRequest request;
 	ClusterThreadRecLaunchEligibility eligibility;
 	v2_failure_fixture(before, &request, false);
+	runtime_fixture_version3(before);
 	memset(&test_worker_event, 0, sizeof(test_worker_event));
 	test_worker_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 	test_worker_event.event_id = 12;
@@ -9961,7 +9977,7 @@ UT_TEST(test_v2_failure_launch_accepts_open_but_not_clean_thread)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_lmon_launch_continues_only_after_exact_cf_retirement)
+UT_TEST(test_runtime_v3_lmon_launch_continues_only_after_exact_cf_retirement)
 {
 	uint8 before[66048];
 	ClusterRecoverySerialRequest request;
@@ -9969,6 +9985,7 @@ UT_TEST(test_v2_lmon_launch_continues_only_after_exact_cf_retirement)
 	int locks;
 
 	v2_failure_fixture(before, &request, false);
+	runtime_fixture_version3(before);
 	memset(&test_worker_event, 0, sizeof(test_worker_event));
 	test_worker_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
 	test_worker_event.event_id = 12;
@@ -9999,7 +10016,7 @@ UT_TEST(test_v2_lmon_launch_continues_only_after_exact_cf_retirement)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_failure_worker_seals_then_acquires_fresh_replay_owners)
+UT_TEST(test_runtime_v3_failure_worker_seals_then_acquires_fresh_replay_owners)
 {
 	uint8 before[66048];
 	ClusterRecoverySerialRequest request;
@@ -10007,6 +10024,7 @@ UT_TEST(test_v2_failure_worker_seals_then_acquires_fresh_replay_owners)
 	ClusterControlRootSnapshot out;
 	ClusterControlRootReadToken token;
 	v2_failure_fixture(before, &request, false);
+	runtime_fixture_version3(before);
 	memset(&eligibility, 0, sizeof(eligibility));
 	eligibility.origin_thread = 1;
 	eligibility.attempt_stamp = 123;
@@ -10031,13 +10049,14 @@ UT_TEST(test_v2_failure_worker_seals_then_acquires_fresh_replay_owners)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_worker_window_consumes_its_sealed_authority_not_legacy_projection)
+UT_TEST(test_runtime_v3_worker_window_consumes_its_sealed_authority_not_legacy_projection)
 {
 	uint8 before[66048];
 	ClusterRecoverySerialRequest request;
 	ClusterThreadRecLaunchEligibility eligibility = { 0 };
 
 	v2_failure_fixture(before, &request, false);
+	runtime_fixture_version3(before);
 	eligibility.origin_thread = 1;
 	eligibility.attempt_stamp = 123;
 	eligibility.duty = request.duty;
@@ -10075,7 +10094,7 @@ UT_TEST(test_v2_failure_tail_publishes_real_input_not_terminal)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_failure_worker_entry_establishes_resource_owner)
+UT_TEST(test_runtime_v3_failure_worker_entry_establishes_resource_owner)
 {
 	uint8 before[66048];
 	ClusterRecoverySerialRequest request;
@@ -10085,6 +10104,7 @@ UT_TEST(test_v2_failure_worker_entry_establishes_resource_owner)
 	BackgroundWorker worker;
 
 	v2_failure_fixture(before, &request, false);
+	runtime_fixture_version3(before);
 	memset(&eligibility, 0, sizeof(eligibility));
 	eligibility.origin_thread = 1;
 	eligibility.attempt_stamp = 123;
@@ -10127,9 +10147,8 @@ UT_TEST(test_v2_failure_input_preserves_fpw_was_off_history)
 	root.records[0].root_flags |= CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF;
 	UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
 	v2_write_roots(root.bytes);
-	UT_ASSERT_EQ(cluster_control_root_read_canonical(1, &request.duty,
-													 CLUSTER_CONTROL_ROOT_READ_STRONG, &out,
-													 &request.expected_root_token),
+	UT_ASSERT_EQ(cluster_control_root_v2_read_canonical(1, &request.duty, &out,
+														&request.expected_root_token),
 				 0);
 	UT_ASSERT_EQ(cluster_control_root_v2_failure_open_publish(&request, &out, &token), 0);
 	UT_ASSERT((out.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF) != 0);
@@ -10448,7 +10467,7 @@ UT_TEST(test_v2_failure_sealed_tail_release_uncertainty_never_returns_authority)
 	}
 }
 
-UT_TEST(test_v2_canonical_foreign_absent_and_cf_refusals)
+UT_TEST(test_runtime_v3_canonical_foreign_absent_and_cf_refusals)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self, foreign;
@@ -10459,6 +10478,7 @@ UT_TEST(test_v2_canonical_foreign_absent_and_cf_refusals)
 
 	for (i = 0; i < 5; i++) {
 		v2_retention_fixture(bytes, &self, &candidate);
+		runtime_fixture_version3(bytes);
 		foreign = self;
 		if (i == 0)
 			foreign.origin_owner_incarnation++;
@@ -10492,7 +10512,7 @@ UT_TEST(test_v2_canonical_foreign_absent_and_cf_refusals)
 	}
 }
 
-UT_TEST(test_v2_canonical_error_releases_owned_lock)
+UT_TEST(test_runtime_v3_canonical_error_releases_owned_lock)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
@@ -10501,6 +10521,7 @@ UT_TEST(test_v2_canonical_error_releases_owned_lock)
 	static ClusterControlRootReadToken token;
 	volatile bool caught = false;
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	test_throw_root_read = true;
 	PG_TRY();
 	{
@@ -10520,7 +10541,7 @@ UT_TEST(test_v2_canonical_error_releases_owned_lock)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_canonical_error_unconfirmed_cleanup_is_fatal)
+UT_TEST(test_runtime_v3_canonical_error_unconfirmed_cleanup_is_fatal)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
@@ -10530,6 +10551,7 @@ UT_TEST(test_v2_canonical_error_unconfirmed_cleanup_is_fatal)
 	volatile bool caught = false;
 
 	v2_retention_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	test_throw_root_read = true;
 	test_cf_release_confirmed = false;
 	test_capture_error_level = true;
@@ -10728,13 +10750,14 @@ UT_TEST(test_v2_retention_exception_unconfirmed_release_is_fatal)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_runtime_native_reader_selects_own_thread)
+UT_TEST(test_runtime_v3_runtime_native_reader_selects_own_thread)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
 	ControlFileData candidate, out;
 
 	v2_runtime_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	UT_ASSERT(cluster_cf_authority_read(&out));
 	UT_ASSERT_EQ(out.checkPoint, candidate.checkPoint - 8192);
 	UT_ASSERT_EQ(out.checkPointCopy.nextOid, 60001);
@@ -10748,7 +10771,7 @@ UT_TEST(test_v2_runtime_native_reader_selects_own_thread)
 	cluster_shared_config = false;
 }
 
-UT_TEST(test_v2_runtime_reader_never_uses_projection_for_bad_facts)
+UT_TEST(test_runtime_v3_runtime_reader_never_uses_projection_for_bad_facts)
 {
 	for (int fault = 0; fault < 16; ++fault) {
 		uint8 bytes[66048];
@@ -10757,6 +10780,7 @@ UT_TEST(test_v2_runtime_reader_never_uses_projection_for_bad_facts)
 		char path[MAXPGPATH];
 
 		v2_runtime_fixture(bytes, &self, &candidate);
+		runtime_fixture_version3(bytes);
 		switch (fault) {
 		case 0:
 			test_cf_clusterwide = false;
@@ -10813,7 +10837,7 @@ UT_TEST(test_v2_runtime_reader_never_uses_projection_for_bad_facts)
 
 			v2_checksums(bytes);
 			UT_ASSERT_EQ(
-				cluster_control_root_v2_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root),
+				cluster_control_root_v3_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &root),
 				0);
 			v2_write_roots(bytes);
 		}
@@ -10826,20 +10850,21 @@ UT_TEST(test_v2_runtime_reader_never_uses_projection_for_bad_facts)
 		test_epoch_reads = 0;
 		if (fault == 9)
 			--test_epoch;
-		UT_ASSERT(cluster_control_root_v2_read_runtime_local_locked(&out)
+		UT_ASSERT(cluster_control_root_v3_read_runtime_local_locked(&out)
 				  != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 		UT_ASSERT(v2_zero(&out, sizeof(out)));
 		cluster_shared_config = false;
 	}
 }
 
-UT_TEST(test_v2_runtime_native_inplace_identity_is_never_cleared)
+UT_TEST(test_runtime_v3_runtime_native_inplace_identity_is_never_cleared)
 {
 	uint8 bytes[66048];
 	ClusterControlRootIdentity self;
 	ControlFileData candidate, before;
 
 	v2_runtime_fixture(bytes, &self, &candidate);
+	runtime_fixture_version3(bytes);
 	/* Actual xlog.c shape: CF read's output is also GetSystemIdentifier's
 	 * backing storage. It must never be zeroed while validating a new view.
 	 */
@@ -14284,6 +14309,45 @@ UT_TEST(test_v3_runtime_retention_and_canonical_use_exact_new_root)
 	cluster_shared_config = false;
 }
 
+/* The production runtime entrypoints must consume v3, not merely expose a
+ * separate decoder that none of their callers use. Author: SqlRush. */
+UT_TEST(test_shared_runtime_dispatches_only_startup_capable_root)
+{
+	uint8 bytes[66048], legacy[66048];
+	ClusterControlRootIdentity self, discovered;
+	ControlFileData candidate, view;
+	ClusterControlRootSnapshot out, checked;
+	ClusterControlRootReadToken token;
+
+	v2_runtime_fixture(bytes, &self, &candidate);
+	memcpy(legacy, bytes, sizeof(legacy));
+	root_fixture_version3(bytes);
+	v2_write_roots(bytes);
+	UT_ASSERT(cluster_cf_authority_read(&view));
+	UT_ASSERT_EQ(view.checkPoint, candidate.checkPoint - 8192);
+	test_cf_mode = test_actual_cf = NoLock;
+	test_checkpoint_outer_cf = false;
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+					 self.origin_thread_id, &self, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token),
+				 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_read_canonical_discovered(self.origin_thread_id, &out, &token), 0);
+	UT_ASSERT_EQ(cluster_control_root_lookup_owner_by_node_runtime(self.origin_node_id, &discovered,
+																   &out, &token),
+				 0);
+	UT_ASSERT(cluster_control_root_identity_equal(&discovered, &self));
+	UT_ASSERT_EQ(cluster_control_root_revalidate(&token, &self, &checked), 0);
+	UT_ASSERT(memcmp(&checked, &out, sizeof(out)) == 0);
+	/* Old format remains a valid explicit fixture, never a runtime fallback. */
+	memcpy(bytes, legacy, sizeof(bytes));
+	v2_write_roots(bytes);
+	UT_ASSERT_EQ(
+		cluster_control_root_read_canonical_discovered(self.origin_thread_id, &out, &token),
+		CLUSTER_CONTROL_ROOT_BAD_VERSION);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_v3_runtime_pending_cannot_be_clean_or_retention_authority)
 {
 	uint8 bytes[66048];
@@ -14303,6 +14367,18 @@ UT_TEST(test_v3_runtime_pending_cannot_be_clean_or_retention_authority)
 	v2_write_roots(bytes);
 	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(self.origin_thread_id, &self, &out, &token),
 				 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+					 self.origin_thread_id, &self, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &token),
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(
+		cluster_control_root_read_canonical_discovered(self.origin_thread_id, &out, &token),
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(
+		cluster_control_root_lookup_owner_by_node_runtime(self.origin_node_id, NULL, &out, &token),
+		CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
 	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
 	UT_ASSERT_EQ(cluster_control_root_v3_read_retention_current(&self, &out, &token),
 				 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
@@ -14327,8 +14403,7 @@ UT_TEST(test_v3_service_cannot_consume_cached_v2_observation)
 	v2_retention_fixture(bytes, &self, &candidate);
 	MyBackendType = B_LMON;
 	test_cf_release_confirmed = false;
-	UT_ASSERT_EQ(cluster_control_root_read_canonical(1, &self, CLUSTER_CONTROL_ROOT_READ_STRONG,
-													 &out, &token),
+	UT_ASSERT_EQ(cluster_control_root_v2_read_canonical(1, &self, &out, &token),
 				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
 	test_cf_release_confirmed = true;
 	root_fixture_version3(bytes);
@@ -14585,11 +14660,11 @@ main(int argc, char **argv)
 
 	if (getenv("PGRAC_PRE2_TEST_ROOT_POLL_RED") != NULL) {
 		UT_PLAN(1);
-		UT_RUN(test_v2_service_read_waits_for_exact_retirement_before_output);
+		UT_RUN(test_runtime_v3_service_read_waits_for_exact_retirement_before_output);
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(272);
+	UT_PLAN(273);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
@@ -14639,6 +14714,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_normal_close_sparse_pair_preserves_exact_roster);
 	UT_RUN(test_v3_normal_close_cannot_discard_foreign_pending_initialization);
 	UT_RUN(test_v3_runtime_retention_and_canonical_use_exact_new_root);
+	UT_RUN(test_shared_runtime_dispatches_only_startup_capable_root);
 	UT_RUN(test_v3_runtime_pending_cannot_be_clean_or_retention_authority);
 	UT_RUN(test_v3_service_cannot_consume_cached_v2_observation);
 	UT_RUN(test_bootstrap_v3_pending_objects_and_reread_remain_exact);
@@ -14791,16 +14867,16 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_checkpoint_projection_follows_root_and_cannot_roll_it_back);
 	UT_RUN(test_v2_checkpoint_error_unwind_releases_owned_work);
 	UT_RUN(test_v2_thread_view_requires_physical_selected_claim);
-	UT_RUN(test_v2_runtime_native_reader_selects_own_thread);
+	UT_RUN(test_runtime_v3_runtime_native_reader_selects_own_thread);
 	UT_RUN(test_v2_retention_reader_owns_exact_live_thread_and_cf);
 	UT_RUN(test_v2_retention_refusals_clear_all_outputs);
 	UT_RUN(test_v2_retention_exception_releases_owned_cf);
 	UT_RUN(test_v2_retention_exception_unconfirmed_release_is_fatal);
-	UT_RUN(test_v2_canonical_strong_reads_recovery_required_peer);
-	UT_RUN(test_v2_canonical_discovery_lookup_and_revalidate);
-	UT_RUN(test_v2_canonical_no_missing_claim_or_lockfree_fallback);
-	UT_RUN(test_v2_canonical_unconfirmed_release_is_fatal);
-	UT_RUN(test_v2_service_read_waits_for_exact_retirement_before_output);
+	UT_RUN(test_runtime_v3_canonical_strong_reads_recovery_required_peer);
+	UT_RUN(test_runtime_v3_canonical_discovery_lookup_and_revalidate);
+	UT_RUN(test_runtime_v3_canonical_no_missing_claim_or_lockfree_fallback);
+	UT_RUN(test_runtime_v3_canonical_unconfirmed_release_is_fatal);
+	UT_RUN(test_runtime_v3_service_read_waits_for_exact_retirement_before_output);
 	UT_RUN(test_v2_stop_phase_uses_selected_raw_anchor_without_closing);
 	UT_RUN(test_v2_stop_phase_accepts_durable_closed_successor_not_active);
 	UT_RUN(test_v2_normal_close_publishes_exact_durable_root_not_voting_exit);
@@ -14812,20 +14888,20 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_normal_close_refuses_missing_or_nonterminal_history);
 	UT_RUN(test_v2_normal_close_pair_preserves_other_origin_history);
 	UT_RUN(test_v2_stop_phase_refuses_wrong_owner_missing_claim_or_late_prefix);
-	UT_RUN(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound);
+	UT_RUN(test_runtime_v3_stop_phase_service_release_is_input_kind_and_cut_bound);
 	UT_RUN(test_v2_stop_phase_error_cleans_cf_and_cannot_return_evidence);
-	UT_RUN(test_v2_service_pending_observation_is_bound_to_input_and_cut);
-	UT_RUN(test_v2_service_immediate_release_also_rechecks_observation_cut);
-	UT_RUN(test_v2_canonical_foreign_absent_and_cf_refusals);
-	UT_RUN(test_v2_canonical_error_releases_owned_lock);
-	UT_RUN(test_v2_canonical_error_unconfirmed_cleanup_is_fatal);
+	UT_RUN(test_runtime_v3_service_pending_observation_is_bound_to_input_and_cut);
+	UT_RUN(test_runtime_v3_service_immediate_release_also_rechecks_observation_cut);
+	UT_RUN(test_runtime_v3_canonical_foreign_absent_and_cf_refusals);
+	UT_RUN(test_runtime_v3_canonical_error_releases_owned_lock);
+	UT_RUN(test_runtime_v3_canonical_error_unconfirmed_cleanup_is_fatal);
 	UT_RUN(test_v2_failure_open_invalidates_old_tail_and_keeps_other_threads);
 	UT_RUN(test_v2_failure_tail_publishes_real_input_not_terminal);
-	UT_RUN(test_v2_failure_launch_accepts_open_but_not_clean_thread);
-	UT_RUN(test_v2_lmon_launch_continues_only_after_exact_cf_retirement);
-	UT_RUN(test_v2_failure_worker_seals_then_acquires_fresh_replay_owners);
-	UT_RUN(test_v2_worker_window_consumes_its_sealed_authority_not_legacy_projection);
-	UT_RUN(test_v2_failure_worker_entry_establishes_resource_owner);
+	UT_RUN(test_runtime_v3_failure_launch_accepts_open_but_not_clean_thread);
+	UT_RUN(test_runtime_v3_lmon_launch_continues_only_after_exact_cf_retirement);
+	UT_RUN(test_runtime_v3_failure_worker_seals_then_acquires_fresh_replay_owners);
+	UT_RUN(test_runtime_v3_worker_window_consumes_its_sealed_authority_not_legacy_projection);
+	UT_RUN(test_runtime_v3_failure_worker_entry_establishes_resource_owner);
 	UT_RUN(test_v2_failure_input_preserves_fpw_was_off_history);
 	UT_RUN(test_v2_failure_open_refuses_unproven_owners);
 	UT_RUN(test_v2_failure_tail_refuses_unproven_or_borrowed_owners);
@@ -14834,8 +14910,8 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_failure_tail_cancellation_and_uncertain_cleanup);
 	UT_RUN(test_v2_failure_worker_without_fence_never_changes_root);
 	UT_RUN(test_v2_failure_sealed_tail_release_uncertainty_never_returns_authority);
-	UT_RUN(test_v2_runtime_reader_never_uses_projection_for_bad_facts);
-	UT_RUN(test_v2_runtime_native_inplace_identity_is_never_cleared);
+	UT_RUN(test_runtime_v3_runtime_reader_never_uses_projection_for_bad_facts);
+	UT_RUN(test_runtime_v3_runtime_native_inplace_identity_is_never_cleared);
 	UT_RUN(test_v2_view_requires_exact_config_object);
 	UT_RUN(test_bootstrap_composes_exact_threads_without_admission);
 	UT_RUN(test_bootstrap_thread_lifecycle_overrides_old_clean_anchor);

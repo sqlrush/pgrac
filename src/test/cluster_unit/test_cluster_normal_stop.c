@@ -2049,7 +2049,7 @@ static ClusterControlRootResult durable_close_result = CLUSTER_CONTROL_ROOT_OK_P
 /* Root-file/WAL publication is tested by the real root program. This
  * boundary makes the real controller prove that it waits for that result. */
 ClusterControlRootResult
-cluster_control_root_v2_normal_stop_close(const ClusterPhase1FullStopPlan *plan, bool *all_closed)
+cluster_control_root_v3_normal_stop_close(const ClusterPhase1FullStopPlan *plan, bool *all_closed)
 {
 	if (lock_holds != 0 || !AmCheckpointerProcess() || plan == NULL)
 		abort();
@@ -2065,7 +2065,7 @@ cluster_control_root_v2_normal_stop_close(const ClusterPhase1FullStopPlan *plan,
  * explicit boundary drives the real normal-stop consumer across pending,
  * exact completion and an identity change while that observation blocks. */
 ClusterControlRootResult
-cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 incarnation,
+cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 incarnation,
 										ClusterControlRootStopObservation *out)
 {
 	if (lock_holds != 0)

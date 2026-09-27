@@ -365,6 +365,11 @@ extern ClusterControlRootResult
 cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out);
 extern ClusterControlRootResult
 cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out);
+/* Explicit old-format tools/tests only; runtime dispatch must use v3. */
+extern ClusterControlRootResult
+cluster_control_root_v2_read_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
+									   ClusterControlRootSnapshot *out,
+									   ClusterControlRootReadToken *token);
 extern ClusterControlRootResult
 cluster_control_root_v3_read_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
 									   ClusterControlRootSnapshot *out,

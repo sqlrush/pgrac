@@ -209,7 +209,7 @@ WaitLatch(Latch *l, int e, long t, uint32 event)
 	return WL_TIMEOUT;
 }
 ClusterControlRootResult
-cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *self,
+cluster_control_root_v3_checkpoint_publish(const ClusterControlRootIdentity *self,
 										   const ControlFileData *c, XLogRecPtr end,
 										   ClusterControlRootSnapshot *out,
 										   ClusterControlRootFileToken *token,
@@ -229,7 +229,7 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 }
 
 ClusterControlRootResult
-cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIdentity *self,
+cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIdentity *self,
 													const ControlFileData *c, XLogRecPtr end,
 													ClusterControlRootSnapshot *out,
 													ClusterControlRootFileToken *token,
@@ -238,7 +238,7 @@ cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIden
 	ClusterControlRootResult result;
 	UT_ASSERT(ShutdownRequestPending && c->state == DB_SHUTDOWNED);
 	shutdown_calls++;
-	result = cluster_control_root_v2_checkpoint_publish(self, c, end, out, token, control);
+	result = cluster_control_root_v3_checkpoint_publish(self, c, end, out, token, control);
 	/* Real root keeps its OPEN lifecycle until the separate protocol close. */
 	control->state = DB_IN_PRODUCTION;
 	return result;
@@ -271,7 +271,7 @@ native_shutdown_begin(bool shutdown)
 static ControlFileData
 native_candidate(bool shutdown)
 {
-	ControlFileData *checkpoint_control = ControlFile, v2_checkpoint = { 0 };
+	ControlFileData *checkpoint_control = ControlFile, v3_checkpoint = { 0 };
 	CheckPoint checkPoint = candidate.checkPointCopy;
 	XLogRecPtr ProcLastRecPtr = 200;
 	struct {
@@ -321,7 +321,7 @@ prepare(int flags)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV2Prepare(flags, &candidate);
+	ClusterCheckpointV3Prepare(flags, &candidate);
 	return true;
 }
 static bool
@@ -329,7 +329,7 @@ publish(void)
 {
 	if (sigsetjmp(error_boundary, 1))
 		return false;
-	ClusterCheckpointV2Publish(&candidate, 220);
+	ClusterCheckpointV3Publish(&candidate, 220);
 	return true;
 }
 
@@ -507,7 +507,7 @@ UT_TEST(online_checkpoint_during_shutdown_signal_stays_online)
 	UT_ASSERT_EQ(root_calls, 1);
 	UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
 }
-UT_TEST(early_shutdown_never_calls_untyped_writer_for_root_v2)
+UT_TEST(early_shutdown_never_calls_untyped_writer_for_root_v3)
 {
 	for (int f = 0; f < 3; f++) {
 		reset_fixture();
@@ -535,6 +535,6 @@ main(void)
 	UT_RUN(shutdown_dispatch_preserves_open_view_and_retries);
 	UT_RUN(shutdown_missing_owner_or_publication_never_installs_candidate);
 	UT_RUN(online_checkpoint_during_shutdown_signal_stays_online);
-	UT_RUN(early_shutdown_never_calls_untyped_writer_for_root_v2);
+	UT_RUN(early_shutdown_never_calls_untyped_writer_for_root_v3);
 	UT_DONE();
 }

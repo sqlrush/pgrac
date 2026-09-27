@@ -1579,7 +1579,7 @@ wal_reuse_current_v2_root(const ClusterWalReuseGuardRequest *request, ClusterWal
 		*out_reason = CLUSTER_WAL_DENY_THREAD_SCOPE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
-	result = cluster_control_root_v2_read_retention_current(&request->duty, target_root, &token);
+	result = cluster_control_root_v3_read_retention_current(&request->duty, target_root, &token);
 	if (!control_root_read_ready(result)) {
 		*out_reason = CLUSTER_WAL_DENY_ROOT_UNAVAILABLE;
 		return CLUSTER_WAL_GUARD_BLOCKED;
@@ -1943,7 +1943,7 @@ wal_retention_e1_read_root(ClusterWalRetentionE1Context *context, bool discover_
 		identity = discover_identity ? ref.claim.identity : context->duty;
 		if (memcmp(&identity, &ref.claim.identity, sizeof(identity)) != 0)
 			return false;
-		result = cluster_control_root_v2_read_retention_current(&identity, out_snapshot, out_token);
+		result = cluster_control_root_v3_read_retention_current(&identity, out_snapshot, out_token);
 		if (!control_root_read_ready(result)
 			|| memcmp(&out_snapshot->identity, &identity, sizeof(identity)) != 0
 			|| !root_token_matches_identity(out_token, &identity))

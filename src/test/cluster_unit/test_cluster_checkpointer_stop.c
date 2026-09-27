@@ -185,7 +185,7 @@ cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 }
 
 ClusterControlRootResult
-cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *ref,
+cluster_control_root_v3_shutdown_observe(const ClusterWalDurablePrefixRef *ref,
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *token)
 {

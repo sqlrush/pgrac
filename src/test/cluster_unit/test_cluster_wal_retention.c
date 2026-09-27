@@ -297,7 +297,7 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 /* The root reader's real filesystem/authority body is tested by the root
  * suite. Here it is the explicit authority seam for the real retention .o. */
 ClusterControlRootResult
-cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity *self,
+cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity *self,
 											   ClusterControlRootSnapshot *out,
 											   ClusterControlRootReadToken *token)
 {

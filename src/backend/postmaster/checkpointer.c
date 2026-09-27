@@ -696,7 +696,7 @@ HandleCheckpointerInterrupts(void)
 			if (cluster_wal_thread_current_v2_ref(&ref)) {
 				for (;;) {
 					CHECK_FOR_INTERRUPTS();
-					result = cluster_control_root_v2_shutdown_observe(&ref, &stopped, &token);
+					result = cluster_control_root_v3_shutdown_observe(&ref, &stopped, &token);
 					if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
 						break;
 					/* Same owner retry as native checkpoint publication. The

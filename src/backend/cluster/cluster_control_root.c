@@ -2655,6 +2655,14 @@ read_canonical_v2(uint16 thread, const ClusterControlRootIdentity *expected,
 }
 
 ClusterControlRootResult
+cluster_control_root_v2_read_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
+									   ClusterControlRootSnapshot *out,
+									   ClusterControlRootReadToken *token)
+{
+	return read_canonical_v2(thread, expected, out, token, 0, NULL);
+}
+
+ClusterControlRootResult
 cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 admitted_incarnation,
 										ClusterControlRootStopObservation *out)
 {
@@ -2724,8 +2732,8 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	if (cluster_shared_config) {
 		if (!strong)
 			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-		return read_canonical_v2(origin_thread_id, expected_identity, out_snapshot, out_token, 0,
-								 NULL);
+		return cluster_control_root_v3_read_canonical(origin_thread_id, expected_identity,
+													  out_snapshot, out_token);
 	}
 	if (expected_identity != NULL)
 		memcpy(expected_storage, expected_identity->storage_uuid, 16);
@@ -2806,7 +2814,8 @@ cluster_control_root_read_canonical_discovered(uint16 origin_thread_id,
 	/* PRE2 discovery is inside the same owned CF interval as the exact
 	 * object reads, never a legacy lock-free bootstrap permission. */
 	if (cluster_shared_config)
-		return read_canonical_v2(origin_thread_id, NULL, out_snapshot, out_token, 0, NULL);
+		return cluster_control_root_v3_read_canonical(origin_thread_id, NULL, out_snapshot,
+													  out_token);
 	memset(&bootstrap, 0, sizeof(bootstrap));
 	result = cluster_control_root_read_canonical(
 		origin_thread_id, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE, &bootstrap, NULL);
@@ -2893,7 +2902,7 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	thread_id = (uint16)(old_node_id + 1);
 	if (cluster_shared_config) {
-		result = read_canonical_v2(thread_id, NULL, &snapshot, &token, 0, NULL);
+		result = cluster_control_root_v3_read_canonical(thread_id, NULL, &snapshot, &token);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 			if (snapshot.identity.origin_node_id != old_node_id)
