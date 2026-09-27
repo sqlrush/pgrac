@@ -980,7 +980,8 @@ cluster_recovery_authority_resid_mode_allowed(const ClusterResId *resid, LOCKMOD
 	if (resid == NULL)
 		return false;
 	if (resid->type == CLUSTER_CF_RESID_TYPE)
-		return mode == ShareLock && resid->field1 == 0 && resid->field2 == 0 && resid->field3 == 0
+		return (mode == ShareLock || (cluster_shared_config && mode == ExclusiveLock))
+			   && resid->field1 == 0 && resid->field2 == 0 && resid->field3 == 0
 			   && resid->field4 == 0 && resid->lockmethodid == DEFAULT_LOCKMETHOD;
 	if (resid->type == CLUSTER_WAL_RETENTION_RESID_TYPE)
 		return mode == ExclusiveLock && resid->field1 > 0
@@ -999,6 +1000,17 @@ cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE m
 	 * failure barrier, only CF-S/WALR-X/IR-X gain recovery transport access. */
 	if (!cluster_grd_control_acquire_allowed(resid, mode))
 		return false;
+	/* PGRAC: the successor initializer publishes under real CF-X before
+	 * ordinary service. Components-only transport is insufficient for a new
+	 * exclusive holder, and the HW worker must retain its CF-S-only surface.
+	 * This lock admission does not authorize any particular root mutation:
+	 * the startup publisher still proves its exact operation and owner.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE && mode == ExclusiveLock)
+		return cluster_shared_config && startup_process && !cluster_hw_remaster_worker_active()
+			   && cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
+			   && cluster_recovery_authority_resid_mode_allowed(resid, mode)
+			   && cluster_recovery_authority_is_current();
 	if (cluster_grd_control_recovery_ready(resid, mode))
 		return cluster_recovery_transport_is_current();
 	/*

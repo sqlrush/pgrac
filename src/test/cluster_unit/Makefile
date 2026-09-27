@@ -2692,6 +2692,7 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
 		test_cluster_control_root_worker.inc \
+		test_cluster_ges_recovery_modes.inc \
 		test_cluster_cr_mvcc_gate.inc \
 		test_cluster_heap_epq_consumer.inc test_cluster_heap_fetch_consumer.inc \
 		test_cluster_heap_lock_output.inc test_cluster_heap_lock_reacquire.inc \
@@ -2934,7 +2935,12 @@ test_cluster_adg: test_cluster_adg.c unit_test.h \
 # behavior (T-ges-1 a/b/c/d/e).
 # spec-5.1b D1: cluster_ges.o now references ges_modes_compatible (frozen
 # matrix), so link the pure cluster_ges_mode.o (standalone-linkable, no new deps).
-test_cluster_ges: test_cluster_ges.c unit_test.h \
+test_cluster_ges_recovery_modes.inc: $(top_srcdir)/src/backend/cluster/cluster_startup_phase.c Makefile
+	awk '/^cluster_recovery_authority_resid_mode_allowed\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_ges: test_cluster_ges.c unit_test.h test_cluster_ges_recovery_modes.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_GES_O) $(CLUSTER_GES_MODE_O) \
 		$(CLUSTER_REPLACEMENT_WIRE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \

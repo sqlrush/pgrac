@@ -150,13 +150,13 @@ errstart(int e, const char *d pg_attribute_unused())
 	return phase4_capture_fatal;
 }
 
-/* Stage 8 contract (verified implementation): worker identity for the recovery
- * lock-admission gate — this binary never runs inside the hw-remaster
- * bgworker, so the worker window is always closed here. */
+/* Runtime boundary: distinguish the HW worker from the native startup owner. */
+static bool phase_test_hw_worker = false;
+
 bool
 cluster_hw_remaster_worker_active(void)
 {
-	return false;
+	return phase_test_hw_worker;
 }
 bool
 errstart_cold(int e, const char *d pg_attribute_unused())
@@ -694,11 +694,13 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_ge
  * The actual GRD census is exercised by its separate production-object tests.
  * Author: SqlRush <sqlrush@gmail.com>
  */
+static bool phase_test_control_acquire_ready = false;
+
 bool
 cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
 									LOCKMODE mode pg_attribute_unused())
 {
-	return !cluster_shared_config;
+	return !cluster_shared_config || phase_test_control_acquire_ready;
 }
 
 bool
@@ -953,6 +955,8 @@ reset_phase_service_fixture(bool formed_registry)
 	phase_test_nonmember_state = CLUSTER_MEMBER_JOINING;
 	phase_test_self_join_admitted = true;
 	cluster_shared_config = false;
+	phase_test_control_acquire_ready = false;
+	phase_test_hw_worker = false;
 	memset(&phase_test_protocol_event, 0, sizeof(phase_test_protocol_event));
 	phase_test_protocol_state = GRD_RECOVERY_IDLE;
 	phase_test_protocol_event_id = 0;
@@ -1681,6 +1685,67 @@ UT_TEST(test_rf_a1_readiness_is_monotone_and_generation_bound)
 	UT_ASSERT(cluster_authority_readiness_managed());
 }
 
+/* PGRAC: real readiness predicates at the explicit GRD/runtime boundary;
+ * this is not a certificate for cold-formation or native startup.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_pre2_startup_cf_x_needs_sealed_owner)
+{
+	ClusterResId cf = { 0 };
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cf.type = CLUSTER_CF_RESID_TYPE;
+	cf.lockmethodid = DEFAULT_LOCKMETHOD;
+	UT_ASSERT(!cluster_recovery_authority_resid_mode_allowed(&cf, ExclusiveLock));
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	UT_ASSERT(cluster_recovery_authority_resid_mode_allowed(&cf, ExclusiveLock));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, false));
+	phase_test_hw_worker = true;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, false));
+	phase_test_hw_worker = false;
+	cf.field1 = 1;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	cf.field1 = 0;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, AccessExclusiveLock, true));
+	phase_test_control_acquire_ready = false;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_pre2_startup_cf_x_cannot_use_components_only)
+{
+	ClusterResId cf = { 0 };
+	ClusterFenceAuthorityProof authority = { 0 };
+	ClusterFormationSnapshotV1 formation = { 0 };
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	cf.type = CLUSTER_CF_RESID_TYPE;
+	cf.lockmethodid = DEFAULT_LOCKMETHOD;
+	cluster_authority_readiness_clear();
+	formation.membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	formation.membership.last_admitted_incarnation[0] = 11;
+	formation.reserved[0] = phase_test_formation_epoch;
+	UT_ASSERT(cluster_authority_readiness_begin(1, &authority, &formation));
+	UT_ASSERT(cluster_authority_readiness_bind_recovery_generation(phase_test_lms_generation));
+	UT_ASSERT(cluster_recovery_transport_components_current());
+	UT_ASSERT(!cluster_recovery_authority_is_current());
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ShareLock, true));
+	UT_ASSERT(cluster_authority_readiness_publish_recovery(phase_test_lms_generation));
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	phase_test_grd_authority_ok = false;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_OFF);
+	reset_phase_service_fixture(true);
+}
+
 UT_TEST(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero)
 {
 	ClusterFenceAuthorityProof authority;
@@ -2020,7 +2085,7 @@ UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
 int
 main(void)
 {
-	UT_PLAN(39);
+	UT_PLAN(41);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -2048,6 +2113,8 @@ main(void)
 	UT_RUN(test_pre2_survivor_reconstruction_rechecks_event);
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
 	UT_RUN(test_rf_a1_readiness_is_monotone_and_generation_bound);
+	UT_RUN(test_pre2_startup_cf_x_needs_sealed_owner);
+	UT_RUN(test_pre2_startup_cf_x_cannot_use_components_only);
 	UT_RUN(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero);
 	UT_RUN(test_rf_a1_missing_authoritative_grd_stops_before_recovery);
 	UT_RUN(test_rf_a1_refreshes_formation_if_proof_expires_during_lms_start);
