@@ -13323,7 +13323,7 @@ cluster_semantic_normal_stop_match(
 	ClusterSemanticResourceXPeerOpenResult image;
 	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 	uint8 root_after[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
-	uint64 lo, hi, epoch;
+	uint64 lo, hi, epoch, expected_members;
 	int32 coordinator;
 	uint32 caps;
 	int node;
@@ -13337,6 +13337,14 @@ cluster_semantic_normal_stop_match(
 		|| SemanticActivationShmem == NULL || SemanticActivationAckTable == NULL
 		|| SemanticActivationPgrdSnapshot == NULL)
 		goto done;
+	/* The complete OPEN carrier declares participants. Unused profile slots
+	 * cannot contribute shutdown votes or force an otherwise valid pair out. */
+	expected_members = cluster_shared_config ? open_record->admitted_members_lo : UINT64_C(15);
+	if (expected_members == 0
+		|| (expected_members & ~((UINT64_C(1) << CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT) - 1)) != 0
+		|| (expected_members & (UINT64_C(1) << cluster_node_id)) == 0
+		|| (expected_members & UINT64_C(1)) == 0)
+		goto done;
 	if (open_record->phase != CLUSTER_SEMANTIC_PHASE_OPEN || open_record->record_generation < 6
 		|| open_record->record_generation == UINT64_MAX
 		|| open_record->source_feature_bitmap != CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1
@@ -13344,8 +13352,9 @@ cluster_semantic_normal_stop_match(
 		|| open_record->transition_epoch == UINT64_MAX || open_record->coordinator_node != 0
 		|| open_record->coordinator_incarnation == 0
 		|| open_record->coordinator_incarnation == UINT64_MAX
-		|| open_record->admitted_members_lo != UINT64_C(15) || open_record->admitted_members_hi != 0
-		|| open_record->capability_sample_digest == 0 || open_record->rollback_feature_bitmap != 0
+		|| open_record->admitted_members_lo != expected_members
+		|| open_record->admitted_members_hi != 0 || open_record->capability_sample_digest == 0
+		|| open_record->rollback_feature_bitmap != 0
 		|| cluster_undo_root_descriptor_decode(root_descriptor, GetSystemIdentifier(), &descriptor)
 			   != CLUSTER_UNDO_ROOT_DESCRIPTOR_VALID
 		|| descriptor.root_kind != CLUSTER_UNDO_ROOT_KIND_SHARED || descriptor.owner_node != -1)
@@ -13361,8 +13370,8 @@ cluster_semantic_normal_stop_match(
 	reason = "SEMANTIC_STOP_IDENTITY_INVALID";
 	if (before.transition_closed || before.active_bits != target_bits
 		|| before.record_generation != open_record->record_generation
-		|| before.formation_epoch != open_record->transition_epoch || lo != UINT64_C(15) || hi != 0
-		|| epoch != open_record->transition_epoch || coordinator != 0
+		|| before.formation_epoch != open_record->transition_epoch || lo != expected_members
+		|| hi != 0 || epoch != open_record->transition_epoch || coordinator != 0
 		|| table.stage != CLUSTER_SEMANTIC_ACTIVATION_ACK_STAGE_OPEN_APPLIED
 		|| table.flags
 			   != (CLUSTER_SEMANTIC_ACTIVATION_ACK_FLAG_EXPECTED_VALID
@@ -13409,8 +13418,8 @@ cluster_semantic_normal_stop_match(
 		goto done;
 	result = CLUSTER_NORMAL_STOP_INVALID;
 	reason = "SEMANTIC_STOP_IDENTITY_INVALID";
-	if (lo != UINT64_C(15) || hi != 0 || epoch != open_record->transition_epoch || coordinator != 0
-		|| caps != cluster_ic_local_capability_word())
+	if (lo != expected_members || hi != 0 || epoch != open_record->transition_epoch
+		|| coordinator != 0 || caps != cluster_ic_local_capability_word())
 		goto done;
 	image = semantic_activation_ack_complete_image_check_internal(
 		&table_after, lo, hi, epoch, coordinator, cluster_node_id, caps, open_record,
@@ -13424,7 +13433,8 @@ cluster_semantic_normal_stop_match(
 	}
 	if (member_incarnations_out != NULL)
 		for (node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++)
-			member_incarnations_out[node] = table_after.expected[node].admitted_incarnation;
+			if ((expected_members & (UINT64_C(1) << node)) != 0)
+				member_incarnations_out[node] = table_after.expected[node].admitted_incarnation;
 	result = CLUSTER_NORMAL_STOP_READY;
 	reason = "SEMANTIC_STOP_IDENTITY_READY";
 done:

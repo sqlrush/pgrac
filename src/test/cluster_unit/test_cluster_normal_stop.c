@@ -2073,6 +2073,8 @@ cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 incarnation,
 	out->snapshot.identity.thread_claim_created_at = 555;
 	out->phase = identity_pre2_phase[thread - 1];
 	for (int node = 0; node < 4; node++) {
+		if ((identity_open.admitted_members_lo & (UINT64_C(1) << node)) == 0)
+			continue;
 		out->members[node].incarnation = 100 + node;
 		out->members[node].claim_created_at = 555;
 		out->members[node].phase = identity_pre2_phase[node];
@@ -2083,6 +2085,14 @@ cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 incarnation,
 		identity_root[0] ^= 1;
 	if (identity_pre2_change == 3)
 		out->members[1].incarnation++;
+	if (identity_pre2_change == 4)
+		memset(&out->members[0], 0, sizeof(out->members[0]));
+	if (identity_pre2_change == 5 || identity_pre2_change == 6) {
+		int node = identity_pre2_change == 5 ? 2 : CLUSTER_MAX_NODES - 1;
+		out->members[node].incarnation = 100 + node;
+		out->members[node].claim_created_at = 555;
+		out->members[node].phase = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
+	}
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -2292,7 +2302,9 @@ cluster_semantic_normal_stop_match(const ClusterSemanticActivationRecord *open,
 		return CLUSTER_NORMAL_STOP_PENDING;
 	if (incarnations != NULL)
 		for (node = 0; node < 4; node++)
-			incarnations[node] = UINT64_C(100) + node;
+			incarnations[node] = (identity_open.admitted_members_lo & (UINT64_C(1) << node))
+									 ? UINT64_C(100) + node
+									 : 0;
 	return CLUSTER_NORMAL_STOP_READY;
 }
 
@@ -2365,6 +2377,40 @@ reset_identity(void)
 	identity_reads = 0;
 	identity_wal_reads = identity_change_on_wal_read = 0;
 	identity_reserve_on_wal_read = 0;
+}
+
+static void
+reset_pre2_members(uint32 members, int self)
+{
+	reset_identity();
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	cluster_node_id = self;
+	identity_open.admitted_members_lo = members;
+	identity_thread = identity_wal.thread_id = self + 1;
+	identity_wal.node_id = self;
+	identity_formation.victim_incarnation = identity_self_incarnation = 100 + self;
+	for (int node = 0; node < 4; node++)
+		if ((members & (UINT32_C(1) << node)) == 0) {
+			identity_formation.membership.membership_state[node] = CLUSTER_MEMBER_ABSENT;
+			identity_formation.membership.last_admitted_incarnation[node] = 0;
+		}
+}
+
+UT_TEST(test_pre2_stop_identity_uses_declared_members_not_slot_capacity)
+{
+	const uint32 sets[] = { 3, 9, 15 };
+	for (unsigned i = 0; i < lengthof(sets); i++) {
+		ClusterPhase1FullStopPlan out;
+		reset_pre2_members(sets[i], i == 0 ? 1 : 3);
+		UT_ASSERT_EQ(cl_normal_stop_identity_poll(false, &out, NULL), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(cl_normal_stop->open_record.admitted_members_lo, sets[i]);
+		for (int node = 0; node < 4; node++)
+			UT_ASSERT_EQ(out.member_incarnations[node],
+						 (sets[i] & (UINT32_C(1) << node)) ? 100 + node : 0);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	}
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_identity_lmon_binds_once_without_request_or_ack)
@@ -4779,10 +4825,183 @@ UT_TEST(test_pre2_release_suffix_keeps_live_identity_and_owner_guards)
 	}
 }
 
+/* The real front, drain, checkpoint and release consumers execute here.
+ * Root/WAL I/O, remote messages and individual owner censuses remain explicit
+ * boundaries; this is not a claim of live multi-process shutdown/restart. */
+static bool
+pre2_declared_to_checkpoint(uint32 members, int self, ClusterPhase1FullStopPlan *plan)
+{
+	reset_pre2_members(members, self);
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != self && (members & (UINT32_C(1) << peer)))
+			front_peer_request(peer, 1801 + peer);
+	cl_normal_stop_fronts_lmon_tick();
+	front_local_postmaster_cut(true);
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_fronts_lmon_tick();
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_fronts_poll(plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	if (!plan->valid)
+		return false;
+	idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, plan, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	park_and_idle_original_actors();
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, plan, NULL),
+				 CLUSTER_NORMAL_STOP_PENDING);
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != self && (members & (UINT32_C(1) << peer)))
+			front_peer_ack(peer, pg_atomic_read_u64(&cl_state->leave_attempt_nonce), false);
+	MyAuxProcType = LmonProcess;
+	cl_normal_stop_fronts_lmon_tick();
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_checkpoint_poll(2047, plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	return plan->valid;
+}
+
+static bool
+pre2_declared_to_release(uint32 members, int self, ClusterPhase1FullStopPlan *plan)
+{
+	if (!pre2_declared_to_checkpoint(members, self, plan))
+		return false;
+	for (int peer = 0; peer < 4; peer++)
+		identity_pre2_phase[peer] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != self && (members & (UINT32_C(1) << peer)))
+			front_peer_request(peer, 3000 + peer);
+	cl_normal_stop_post_lmon_tick();
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != self && (members & (UINT32_C(1) << peer)))
+			front_peer_ack(peer, plan->attempt_nonce, false);
+	cl_normal_stop_post_lmon_tick();
+	for (int peer = 0; peer < 4; peer++)
+		if (peer != self && (members & (UINT32_C(1) << peer)))
+			release_peer_message(peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 3000 + peer);
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
+	return pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1;
+}
+
+UT_TEST(test_pre2_declared_pair_full_close_requires_last_real_receipt)
+{
+	const uint32 sets[] = { 3, 3, 9, 9, 15 };
+	const int selves[] = { 0, 1, 0, 3, 2 };
+	for (unsigned i = 0; i < lengthof(sets); i++) {
+		ClusterPhase1FullStopPlan plan;
+		uint32 members = sets[i], peers;
+		int self = selves[i];
+		if (!pre2_declared_to_release(members, self, &plan))
+			continue;
+		peers = members & ~(UINT32_C(1) << self);
+		release_reply_on_request = true;
+		release_receipt_on_reply = false;
+		MyAuxProcType = LmonProcess;
+		cl_normal_stop_release_lmon_tick();
+		UT_ASSERT_EQ(cl_state->phase1_release_request_sent[0], peers);
+		UT_ASSERT_EQ(cl_state->phase1_release_receipt_seen[0], 0);
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+		UT_ASSERT(!cluster_normal_stop_qvotec_cleared());
+		for (int peer = 0; peer < 4; peer++)
+			if (peers & (UINT32_C(1) << peer))
+				release_peer_message(peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, 3000 + peer);
+		MyAuxProcType = LmonProcess;
+		cl_normal_stop_release_lmon_tick();
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT(cluster_normal_stop_protocol_closed());
+		for (int peer = 0; peer < 4; peer++)
+			if ((members & (UINT32_C(1) << peer)) == 0) {
+				UT_ASSERT_EQ(front_sends[peer], 0);
+				UT_ASSERT_EQ(cl_normal_stop->peer_request_nonce[peer], 0);
+				UT_ASSERT_EQ(cl_state->phase1_release_request_nonce[peer], 0);
+			}
+		/* Exact duplicates do not acquire new CF after sealing. */
+		{
+			int peer = self == 0 ? (members == 3 ? 1 : 3) : 0;
+			release_peer_message(peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RECEIPT, 3000 + peer);
+		}
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		MyAuxProcType = QvotecProcess;
+		UT_ASSERT(cluster_normal_stop_qvotec_complete(true));
+		UT_ASSERT(cluster_normal_stop_qvotec_cleared());
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_pair_identity_rejects_root_serving_set_mismatch)
+{
+	for (int fault = 4; fault <= 6; fault++) {
+		ClusterPhase1FullStopPlan plan;
+		reset_pre2_members(3, 1);
+		identity_pre2_change = fault;
+		UT_ASSERT_EQ(cl_normal_stop_identity_poll(false, &plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->identity_published), 0);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_pair_release_never_shrinks_or_rebinds_members)
+{
+	for (int fault = 0; fault < 7; fault++) {
+		ClusterPhase1FullStopPlan plan;
+		if (!pre2_declared_to_release(3, 1, &plan))
+			continue;
+		if (fault == 0) {
+			identity_formation.membership.membership_state[0] = CLUSTER_MEMBER_ABSENT;
+			identity_formation.membership.last_admitted_incarnation[0] = 0;
+		} else if (fault == 1) {
+			identity_formation.membership.membership_state[2] = CLUSTER_MEMBER_MEMBER;
+			identity_formation.membership.last_admitted_incarnation[2] = 102;
+		} else if (fault == 2)
+			identity_formation.membership.last_admitted_incarnation[0]++;
+		else if (fault == 3)
+			identity_formation.local_epoch++;
+		else if (fault == 4)
+			identity_open.admitted_members_lo = 7;
+		else if (fault == 5)
+			cl_normal_stop->peer_request_nonce[2] = 999;
+		else
+			cl_state->phase1_release_request_nonce[2] = 999;
+		MyAuxProcType = CheckpointerProcess;
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+		UT_ASSERT(!cluster_normal_stop_qvotec_cleared());
+		UT_ASSERT_EQ(cl_normal_stop->open_record.admitted_members_lo, 3);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal)
+{
+	for (int sealed = 0; sealed < 2; sealed++) {
+		ClusterPhase1FullStopPlan plan;
+		if (!pre2_declared_to_release(3, 1, &plan))
+			continue;
+		if (sealed) {
+			release_reply_on_request = release_receipt_on_reply = true;
+			MyAuxProcType = LmonProcess;
+			cl_normal_stop_release_lmon_tick();
+			MyAuxProcType = CheckpointerProcess;
+			UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+		}
+		release_peer_reply(2, plan.attempt_nonce);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+		UT_ASSERT_EQ(cl_state->phase1_release_reply_seen[0], sealed ? 1 : 0);
+		UT_ASSERT(!cluster_normal_stop_qvotec_cleared());
+	}
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(116);
+	UT_PLAN(121);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
@@ -4899,6 +5118,11 @@ main(void)
 	UT_RUN(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_reconnect);
 	UT_RUN(test_pre2_last_receipt_after_terminal_cf_peer_does_not_need_new_cf);
 	UT_RUN(test_pre2_release_suffix_keeps_live_identity_and_owner_guards);
+	UT_RUN(test_pre2_stop_identity_uses_declared_members_not_slot_capacity);
+	UT_RUN(test_pre2_declared_pair_full_close_requires_last_real_receipt);
+	UT_RUN(test_pre2_pair_release_never_shrinks_or_rebinds_members);
+	UT_RUN(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal);
+	UT_RUN(test_pre2_pair_identity_rejects_root_serving_set_mismatch);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

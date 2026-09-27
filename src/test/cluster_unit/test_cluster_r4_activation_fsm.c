@@ -141,6 +141,7 @@ static ClusterSfPeerCap test_terminal_peer_record;
 static ClusterSemanticActivationRecord test_terminal_peer_open;
 static uint8 test_terminal_peer_root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
 static bool test_stop_real_observation;
+bool cluster_shared_config;
 static int test_stop_not_fresh_peer = -1;
 static bool test_capability_store_missing;
 static uint32 test_local_capability_word;
@@ -9746,6 +9747,40 @@ UT_TEST(test_a148_stop_identity_matches_full_record_root_and_current_members)
 	test_gate_reset();
 }
 
+UT_TEST(test_pre2_semantic_stop_accepts_exact_declared_pair)
+{
+	const uint64 sets[] = { 3, 9 };
+	for (unsigned i = 0; i < lengthof(sets); i++) {
+		ClusterSemanticActivationRecord open;
+		uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+		uint64 incarnations[4];
+		ut_a148_stop_identity(&open, root, 7);
+		cluster_shared_config = true;
+		open.admitted_members_lo = test_membership_snapshot_lo = sets[i];
+		SemanticActivationAckTable->expected_members_lo = sets[i];
+		SemanticActivationAckTable->observed_members_lo = sets[i];
+		for (int node = 0; node < 4; node++)
+			if ((sets[i] & (UINT64_C(1) << node)) == 0) {
+				memset(&SemanticActivationAckTable->expected[node], 0,
+					   sizeof(SemanticActivationAckTable->expected[node]));
+				memset(&SemanticActivationAckTable->observed[node], 0,
+					   sizeof(SemanticActivationAckTable->observed[node]));
+				test_remote_admitted_incarnations[node] = 0;
+			}
+		UT_ASSERT_EQ(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL),
+					 CLUSTER_NORMAL_STOP_READY);
+		for (int node = 0; node < 4; node++)
+			UT_ASSERT_EQ(incarnations[node],
+						 SemanticActivationAckTable->expected[node].admitted_incarnation);
+		/* Losing a declared peer is not permission to shrink the round. */
+		test_membership_snapshot_lo = 1;
+		UT_ASSERT(cluster_semantic_normal_stop_match(&open, root, incarnations, NULL)
+				  != CLUSTER_NORMAL_STOP_READY);
+		cluster_shared_config = false;
+		test_gate_reset();
+	}
+}
+
 UT_TEST(test_a148_stop_identity_rejects_record_and_namespace_contradictions)
 {
 	ClusterSemanticActivationRecord open, bad;
@@ -10536,7 +10571,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(308);
+	UT_PLAN(309);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
@@ -10826,6 +10861,7 @@ main(void)
 	UT_RUN(test_a142_early_ack_duplicate_is_idempotent_but_conflict_refuses);
 	UT_RUN(test_a142_current_member_change_prevents_native_projection);
 	UT_RUN(test_a148_stop_identity_matches_full_record_root_and_current_members);
+	UT_RUN(test_pre2_semantic_stop_accepts_exact_declared_pair);
 	UT_RUN(test_a148_stop_identity_rejects_record_and_namespace_contradictions);
 	UT_RUN(test_a148_stop_identity_observation_gaps_do_not_publish_partial_identity);
 	UT_RUN(test_terminal_peer_disconnect_allows_only_normal_stop_receipt_observation);

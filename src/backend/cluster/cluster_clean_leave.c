@@ -98,6 +98,8 @@ StaticAssertDecl(offsetof(ClusterNormalStopState, service_seal) == 728,
 				 "normal-stop seal offset changed");
 StaticAssertDecl(sizeof(ClusterCleanLeaveSharedState) == 1216, "clean-leave region layout changed");
 StaticAssertDecl(sizeof(ClusterCleanLeaveSharedState) <= 1280, "clean-leave region exceeds budget");
+StaticAssertDecl(CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT <= 8,
+				 "normal-stop profile must fit its first bitmap byte");
 
 /*
  * ProcSignal pending flag for the quiesce request (D7).  Set async-signal-safe
@@ -209,6 +211,47 @@ cl_phase1_member_bit_set(uint8 *bitmap, int32 node)
 	bitmap[node / 8] |= (uint8)(UINT8_C(1) << (node % 8));
 }
 
+/* PGRAC: the published OPEN is immutable for this stop attempt. Readers
+ * either hold the leave lock or acquire its once-only publication before
+ * inspecting it. Capacity is not a vote; absent profile slots do not join
+ * this exchange. Invalid identity returns an unrepresentable required mask,
+ * never an empty set which could make an empty transcript look complete. */
+static uint32
+cl_normal_stop_member_mask(void)
+{
+	const uint32 capacity = (UINT32_C(1) << CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT) - 1;
+	uint64 members;
+	if (!cluster_shared_config)
+		return capacity;
+	if (cl_normal_stop == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| pg_atomic_read_u32(&cl_normal_stop->identity_published) != 1)
+		return UINT32_MAX;
+	pg_read_barrier();
+	members = cl_normal_stop->open_record.admitted_members_lo;
+	if (cl_normal_stop->open_record.admitted_members_hi != 0 || (members & ~((uint64)capacity)) != 0
+		|| (members & (UINT64_C(1) << cluster_node_id)) == 0)
+		return UINT32_MAX;
+	for (int node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++) {
+		uint64 incarnation = cl_normal_stop->member_incarnations[node];
+		bool member = (members & (UINT64_C(1) << node)) != 0;
+		if (incarnation == UINT64_MAX || member != (incarnation != 0))
+			return UINT32_MAX;
+	}
+	return (uint32)members;
+}
+
+/* Caller uses the original leave lock or the immutable stop observation. */
+static bool
+cl_normal_stop_member_nonce_valid(int node, uint64 nonce)
+{
+	uint32 members = cl_normal_stop_member_mask();
+	uint64 incarnation = cl_normal_stop->member_incarnations[node];
+	return members != UINT32_MAX && nonce != UINT64_MAX && incarnation != UINT64_MAX
+		   && ((members & (UINT32_C(1) << node)) != 0) == (incarnation != 0)
+		   && ((members & (UINT32_C(1) << node)) != 0) == (nonce != 0);
+}
+
 static void
 cl_phase1_full_stop_release_state_reset_locked(void)
 {
@@ -294,15 +337,17 @@ cl_full_stop_capture_formation_only(bool require_shutdown_suppressed, uint64 exp
 	if (!cl_phase1_bytes_zero(formation.excluded_bitmap, sizeof(formation.excluded_bitmap)))
 		goto invalid;
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
-		uint8 expected_state = node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT ? CLUSTER_MEMBER_MEMBER
-																			: CLUSTER_MEMBER_ABSENT;
+		bool member = node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+					  && (!cluster_shared_config
+						  || formation.membership.membership_state[node] == CLUSTER_MEMBER_MEMBER);
+		uint8 expected_state = member ? CLUSTER_MEMBER_MEMBER : CLUSTER_MEMBER_ABSENT;
 		uint64 incarnation = formation.membership.last_admitted_incarnation[node];
 
 		reason = "NORMAL_STOP_FORMATION_MEMBER_STATE";
 		if (formation.membership.membership_state[node] != expected_state)
 			goto invalid;
 		reason = "NORMAL_STOP_FORMATION_MEMBER_INCARNATION";
-		if (node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT) {
+		if (member) {
 			if (incarnation == 0 || incarnation == UINT64_MAX)
 				goto invalid;
 			out->member_incarnations[node] = incarnation;
@@ -310,7 +355,8 @@ cl_full_stop_capture_formation_only(bool require_shutdown_suppressed, uint64 exp
 			goto invalid;
 	}
 	reason = "NORMAL_STOP_FORMATION_OWN_INCARNATION";
-	if (formation.victim_incarnation != out->member_incarnations[cluster_node_id]
+	if (out->member_incarnations[cluster_node_id] == 0
+		|| formation.victim_incarnation != out->member_incarnations[cluster_node_id]
 		|| cluster_qvotec_get_self_incarnation() != out->member_incarnations[cluster_node_id])
 		goto invalid;
 	out->epoch = formation.local_epoch;
@@ -378,7 +424,15 @@ cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_
 					  sizeof(out->member_incarnations))
 				   != 0)
 			goto invalid;
-		for (int node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++) {
+		for (int node = 0; node < CLUSTER_MAX_NODES; node++) {
+			if (node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+				|| out->member_incarnations[node] == 0) {
+				if (selected.members[node].incarnation != 0
+					|| selected.members[node].claim_created_at != 0
+					|| selected.members[node].phase != 0)
+					goto invalid;
+				continue;
+			}
 			if (selected.members[node].incarnation != out->member_incarnations[node]
 				|| selected.members[node].claim_created_at <= 0
 				|| (selected.members[node].phase != CLUSTER_CONTROL_ROOT_STOP_ACTIVE
@@ -490,7 +544,8 @@ cl_phase1_full_stop_capture_source_phase(const ClusterPhase1FullStopPlan *curren
 	uint16 source_thread;
 
 	if (current == NULL || source_active_out == NULL || source_stopped_out == NULL
-		|| source_node < 0 || source_node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT)
+		|| source_node < 0 || source_node >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| current->member_incarnations[source_node] == 0)
 		return false;
 	*source_active_out = false;
 	*source_stopped_out = false;
@@ -941,7 +996,7 @@ cl_normal_stop_capture_source_phase(const ClusterPhase1FullStopPlan *current, in
 		} else if (predecessor != 0 && cluster_normal_stop_requested()
 				   && pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
 				   && pg_atomic_read_u32(&cl_normal_stop->phase) >= CLUSTER_NORMAL_STOP_DRAIN
-				   && cl_normal_stop->peer_requests_seen == 15
+				   && cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
 				   && (cl_normal_stop->peer_reply_sent & (UINT32_C(1) << peer)) != 0) {
 			decision = cluster_clean_leave_phase1_full_stop_probe_nonce_decide(
 				predecessor, cl_state->phase1_release_request_nonce[peer], nonce);
@@ -969,7 +1024,7 @@ cluster_normal_stop_peer_receipt_tail(
 		|| peer >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || peer == cluster_node_id
 		|| admitted_incarnation == 0 || admitted_incarnation == UINT64_MAX)
 		return false;
-	peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	bit = UINT32_C(1) << peer;
 	LWLockAcquire(&cl_state->lock, LW_SHARED);
 	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
@@ -991,7 +1046,7 @@ cluster_normal_stop_peer_receipt_tail(
 			&& memcmp(cl_normal_stop->root_descriptor, root_descriptor,
 					  CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES)
 				   == 0
-			&& cl_normal_stop->peer_requests_seen == 15
+			&& cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
 			&& (cl_normal_stop->peer_reply_sent & bit) != 0 && (cl_state->ack_bitmap[0] & bit) != 0
 			&& (cl_state->phase1_post_stopped_reply_sent[0] & bit) != 0
 			&& (cl_state->phase1_post_stopped_reply_pending[0] & bit) == 0
@@ -1284,7 +1339,7 @@ cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char 
 	result = CLUSTER_NORMAL_STOP_PENDING;
 	reason = "NORMAL_STOP_PEER_FRONTENDS_PENDING";
 	own_bit = UINT32_C(1) << cluster_node_id;
-	peer_bits = UINT32_C(15) & ~own_bit;
+	peer_bits = cl_normal_stop_member_mask() & ~own_bit;
 	now = (uint64)GetCurrentTimestamp();
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
@@ -1294,7 +1349,7 @@ cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char 
 		|| pg_atomic_read_u32(&cl_state->shutdown_driven) != 1
 		|| pg_atomic_read_u64(&cl_state->leave_attempt_nonce) != nonce
 		|| cl_state->barrier_deadline_us != deadline
-		|| (cl_normal_stop->peer_requests_seen & ~UINT32_C(15)) != 0
+		|| (cl_normal_stop->peer_requests_seen & ~cl_normal_stop_member_mask()) != 0
 		|| (cl_normal_stop->peer_request_sent & ~peer_bits) != 0)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
 	for (peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
@@ -1309,7 +1364,7 @@ cluster_normal_stop_fronts_poll(ClusterPhase1FullStopPlan *plan_out, const char 
 		cl_normal_stop->peer_requests_seen |= own_bit;
 		if (phase == CLUSTER_NORMAL_STOP_IDLE)
 			pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS);
-		if (cl_normal_stop->peer_requests_seen == 15
+		if (cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
 			&& cl_normal_stop->peer_request_sent == peer_bits) {
 			pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
 			observed.valid = true;
@@ -1545,7 +1600,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 		uint32 bit = UINT32_C(1) << peer;
 		bool needed;
 
-		if (peer == cluster_node_id)
+		if (peer == cluster_node_id || observed.member_incarnations[peer] == 0)
 			continue;
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 		needed
@@ -1603,7 +1658,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 		uint32 bit = UINT32_C(1) << peer;
 		uint64 nonce = 0, deadline = 0;
 		bool needed;
-		if (peer == cluster_node_id)
+		if (peer == cluster_node_id || observed.member_incarnations[peer] == 0)
 			continue;
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 		needed = pg_atomic_read_u32(&cl_normal_stop->phase) == CLUSTER_NORMAL_STOP_WAIT_DRAIN_ACK
@@ -1616,7 +1671,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 				|| pg_atomic_read_u32(&cl_normal_stop->frontends_gone) != 1
 				|| pg_atomic_read_u32(&cl_state->request_in_progress) != 1
 				|| pg_atomic_read_u32(&cl_state->shutdown_driven) != 1
-				|| cl_normal_stop->peer_requests_seen != 15
+				|| cl_normal_stop->peer_requests_seen != cl_normal_stop_member_mask()
 				|| pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) != 1
 				|| pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask) != 255
 				|| pg_atomic_read_u32(&cl_normal_stop->service_seal) != 0 || nonce == 0
@@ -1862,7 +1917,7 @@ static bool
 cl_normal_stop_post_state_locked(const ClusterPhase1FullStopPlan *plan, uint32 phase, uint64 now,
 								 uint32 expected_services, bool release)
 {
-	uint32 peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	uint32 peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	uint32 active = pg_atomic_read_u32(&cl_normal_stop->service_active_mask);
 	uint32 idle = pg_atomic_read_u32(&cl_normal_stop->service_idle_mask);
 	uint64 nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
@@ -1888,14 +1943,18 @@ cl_normal_stop_post_state_locked(const ClusterPhase1FullStopPlan *plan, uint32 p
 		|| pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_IDLE
 		|| pg_atomic_read_u32(&cl_state->nak_received) != 0
 		|| pg_atomic_read_u32(&cl_state->phase1_release_pending) != (uint32)release
-		|| cl_normal_stop->peer_requests_seen != 15 || cl_normal_stop->peer_request_sent != peers
-		|| cl_normal_stop->peer_reply_pending != 0 || cl_normal_stop->peer_reply_sent != peers
+		|| cl_normal_stop->peer_requests_seen != cl_normal_stop_member_mask()
+		|| cl_normal_stop->peer_request_sent != peers || cl_normal_stop->peer_reply_pending != 0
+		|| cl_normal_stop->peer_reply_sent != peers
 		|| pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) != 1
 		|| pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesced_mask) != 255
 		|| pg_atomic_read_u32(&cl_normal_stop->service_seal)
 			   != (phase == CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED ? 2 : 1)
 		|| !cl_normal_stop_service_mask_valid(expected_services))
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+	for (int node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++)
+		if (!cl_normal_stop_member_nonce_valid(node, cl_normal_stop->peer_request_nonce[node]))
+			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 	if ((phase == CLUSTER_NORMAL_STOP_CHECKPOINT
 		 && (cl_normal_stop->peer_request_nonce[cluster_node_id] != nonce
 			 || pg_atomic_read_u32(&cl_state->preflight_pending) != 0
@@ -2040,7 +2099,7 @@ cl_normal_stop_post_peer_matches(const ClusterPhase1FullStopPlan *plan, int peer
 		/* All source checkpoint replies preceded RELEASE arm. Do not turn
 		 * their exact terminal successor into a fresh phase acquisition. */
 		if (epoch != plan->epoch || peer < 0 || peer >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
-			|| peer == cluster_node_id || source_nonce == 0
+			|| peer == cluster_node_id || source_nonce == 0 || plan->member_incarnations[peer] == 0
 			|| source_nonce != cl_state->phase1_release_request_nonce[peer]) {
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 			return false;
@@ -2131,7 +2190,7 @@ cl_normal_stop_post_lmon_tick(void)
 	expected = cl_normal_stop_config_service_mask();
 	if (cl_normal_stop_identity_poll(true, &plan, NULL) != CLUSTER_NORMAL_STOP_READY)
 		return;
-	peer_bits = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	peer_bits = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	plan.valid = true;
 	plan.attempt_nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
@@ -2207,7 +2266,7 @@ cl_normal_stop_post_lmon_tick(void)
 			return;
 	}
 	for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++)
-		if (peer != cluster_node_id
+		if (peer != cluster_node_id && plan.member_incarnations[peer] != 0
 			&& !cl_phase1_member_bit_is_set(cl_phase1_post_stopped_request_sent, peer)
 			&& !cl_normal_stop_post_send(&plan, expected, peer, false, plan.attempt_nonce))
 			return;
@@ -2239,7 +2298,7 @@ cl_normal_stop_release_state_locked(const ClusterPhase1FullStopPlan *plan, uint3
 									bool armed)
 {
 	uint32 phase = pg_atomic_read_u32(&cl_normal_stop->phase);
-	uint32 peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	uint32 peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	const uint8 *maps[]
 		= { cl_state->phase1_post_stopped_reply_pending, cl_state->phase1_post_stopped_reply_sent,
 			cl_state->phase1_release_request_sent,		 cl_state->phase1_release_request_seen,
@@ -2262,7 +2321,7 @@ cl_normal_stop_release_state_locked(const ClusterPhase1FullStopPlan *plan, uint3
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
 	for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
 		uint64 nonce = cl_state->phase1_release_request_nonce[peer];
-		if (peer == cluster_node_id) {
+		if (peer == cluster_node_id || (peers & (UINT32_C(1) << peer)) == 0) {
 			if (nonce != 0)
 				cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 		} else if (nonce != 0
@@ -2286,7 +2345,7 @@ cl_normal_stop_release_state_locked(const ClusterPhase1FullStopPlan *plan, uint3
 static bool
 cl_normal_stop_release_complete_locked(void)
 {
-	uint32 peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	uint32 peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	return cl_state->phase1_release_request_sent[0] == peers
 		   && cl_state->phase1_release_request_seen[0] == peers
 		   && cl_state->phase1_release_reply_sent[0] == peers
@@ -2372,7 +2431,7 @@ cluster_normal_stop_pi_retirement_allowed(void)
 		|| !cluster_normal_stop_requested())
 		return false;
 	now = (uint64)GetCurrentTimestamp();
-	peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	LWLockAcquire(&cl_state->lock, LW_SHARED);
 	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
 	seal = pg_atomic_read_u32(&cl_normal_stop->service_seal);
@@ -2398,7 +2457,7 @@ cluster_normal_stop_pi_retirement_allowed(void)
 			&& cl_normal_stop->post_checkpoint_deadline_us != UINT64_MAX
 			&& cl_normal_stop->post_checkpoint_deadline_us == cl_state->barrier_deadline_us
 			&& now != 0 && now < cl_state->barrier_deadline_us
-			&& cl_normal_stop->peer_requests_seen == 15
+			&& cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
 			&& cl_normal_stop->peer_request_sent == peers
 			&& cl_normal_stop->peer_reply_sent == peers && cl_normal_stop->peer_reply_pending == 0
 			&& cluster_clean_leave_phase1_full_stop_nonce_fresh(
@@ -2413,10 +2472,9 @@ cluster_normal_stop_pi_retirement_allowed(void)
 			if (!cl_phase1_bytes_zero(maps[i] + 1, CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES - 1))
 				valid = false;
 		for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
-			if (cl_normal_stop->member_incarnations[peer] == 0
-				|| cl_normal_stop->member_incarnations[peer] == UINT64_MAX)
+			if (!cl_normal_stop_member_nonce_valid(peer, cl_normal_stop->peer_request_nonce[peer]))
 				valid = false;
-			if (peer == cluster_node_id) {
+			if (peer == cluster_node_id || (peers & (UINT32_C(1) << peer)) == 0) {
 				if (cl_state->phase1_release_request_nonce[peer] != 0)
 					valid = false;
 			} else if (!cluster_clean_leave_phase1_full_stop_nonce_fresh(
@@ -2472,7 +2530,7 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		return CLUSTER_NORMAL_STOP_INVALID;
 	expected = cl_normal_stop_expected_services;
-	peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	armed = pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0;
 	valid = cl_normal_stop_release_state_locked(plan, expected, armed);
@@ -2574,6 +2632,8 @@ cl_normal_stop_release_stage_valid(const ClusterICEnvelope *env, int peer, uint6
 		|| cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE)
 		return false;
 	if (peer < 0 || peer >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || peer == cluster_node_id
+		|| cl_normal_stop_member_mask() == UINT32_MAX
+		|| (cl_normal_stop_member_mask() & (UINT32_C(1) << peer)) == 0
 		|| env->source_node_id != (uint32)peer || env->dest_node_id != (uint32)cluster_node_id
 		|| env->epoch != epoch || pg_atomic_read_u32(&cl_normal_stop->identity_published) != 1
 		|| epoch != cl_normal_stop->epoch
@@ -2594,7 +2654,7 @@ cl_normal_stop_release_stage_valid(const ClusterICEnvelope *env, int peer, uint6
 static bool
 cl_normal_stop_release_closed_replay(int peer, uint64 nonce, bool reply)
 {
-	uint32 peers = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	uint32 peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	const uint8 *maps[] = { cl_state->ack_bitmap,
 							cl_state->phase1_post_stopped_reply_pending,
 							cl_state->phase1_post_stopped_reply_sent,
@@ -2628,9 +2688,9 @@ cl_normal_stop_release_closed_replay(int peer, uint64 nonce, bool reply)
 		  && pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1
 		  && pg_atomic_read_u32(&cl_state->phase1_release_transport_drained) == 1
 		  && pg_atomic_read_u32(&cl_state->nak_received) == 0
-		  && cl_normal_stop->peer_requests_seen == 15 && cl_normal_stop->peer_request_sent == peers
-		  && cl_normal_stop->peer_reply_sent == peers && cl_normal_stop->peer_reply_pending == 0
-		  && cl_normal_stop_release_complete_locked()
+		  && cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
+		  && cl_normal_stop->peer_request_sent == peers && cl_normal_stop->peer_reply_sent == peers
+		  && cl_normal_stop->peer_reply_pending == 0 && cl_normal_stop_release_complete_locked()
 		  && cluster_clean_leave_phase1_full_stop_nonce_fresh(
 			  cl_normal_stop->peer_request_nonce[cluster_node_id], own_nonce);
 	for (unsigned i = 0; i < lengthof(maps); i++)
@@ -2638,12 +2698,12 @@ cl_normal_stop_release_closed_replay(int peer, uint64 nonce, bool reply)
 			|| !cl_phase1_bytes_zero(maps[i] + 1, CLUSTER_CLEAN_LEAVE_ACK_BITMAP_BYTES - 1))
 			valid = false;
 	for (int node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++)
-		if (cl_normal_stop->member_incarnations[node] == 0
-			|| cl_normal_stop->member_incarnations[node] == UINT64_MAX
-			|| (node == cluster_node_id ? cl_state->phase1_release_request_nonce[node] != 0
-										: !cluster_clean_leave_phase1_full_stop_nonce_fresh(
-											  cl_normal_stop->peer_request_nonce[node],
-											  cl_state->phase1_release_request_nonce[node])))
+		if (!cl_normal_stop_member_nonce_valid(node, cl_normal_stop->peer_request_nonce[node])
+			|| (node == cluster_node_id || (peers & (UINT32_C(1) << node)) == 0
+					? cl_state->phase1_release_request_nonce[node] != 0
+					: !cluster_clean_leave_phase1_full_stop_nonce_fresh(
+						  cl_normal_stop->peer_request_nonce[node],
+						  cl_state->phase1_release_request_nonce[node])))
 			valid = false;
 	if (!valid)
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
@@ -2811,7 +2871,7 @@ cl_normal_stop_release_lmon_tick(void)
 	if (!valid)
 		return;
 	for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
-		if (peer == cluster_node_id)
+		if (peer == cluster_node_id || plan.member_incarnations[peer] == 0)
 			continue;
 		for (int leg = 0; leg < 3; leg++) {
 			uint64 nonce;
@@ -2912,7 +2972,7 @@ cluster_clean_leave_normal_stop_local_poll(int *peer_out, const char **reason_ou
 static bool
 cl_normal_stop_checkpoint_state_locked(uint32 expected_services, uint32 phase, uint64 now)
 {
-	uint32 peer_bits = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	uint32 peer_bits = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	uint32 active = pg_atomic_read_u32(&cl_normal_stop->service_active_mask);
 	uint32 idle = pg_atomic_read_u32(&cl_normal_stop->service_idle_mask);
 	uint64 nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
@@ -2929,7 +2989,8 @@ cl_normal_stop_checkpoint_state_locked(uint32 expected_services, uint32 phase, u
 		|| pg_atomic_read_u32(&cl_state->preflight_sent) != 0
 		|| pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
 		|| pg_atomic_read_u32(&cl_state->nak_received) != 0 || nonce == 0 || nonce == UINT64_MAX
-		|| deadline == 0 || deadline == UINT64_MAX || cl_normal_stop->peer_requests_seen != 15
+		|| deadline == 0 || deadline == UINT64_MAX
+		|| cl_normal_stop->peer_requests_seen != cl_normal_stop_member_mask()
 		|| cl_normal_stop->peer_request_sent != peer_bits
 		|| ((cl_normal_stop->peer_reply_pending | cl_normal_stop->peer_reply_sent) & ~peer_bits)
 			   != 0
@@ -2948,8 +3009,7 @@ cl_normal_stop_checkpoint_state_locked(uint32 expected_services, uint32 phase, u
 			&& pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) != 1))
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
 	for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++)
-		if (cl_normal_stop->peer_request_nonce[peer] == 0
-			|| cl_normal_stop->peer_request_nonce[peer] == UINT64_MAX
+		if (!cl_normal_stop_member_nonce_valid(peer, cl_normal_stop->peer_request_nonce[peer])
 			|| (peer == cluster_node_id && cl_normal_stop->peer_request_nonce[peer] != nonce))
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 	if (((active | idle) & ~expected_services) != 0 || (active & idle) != 0)
@@ -3051,7 +3111,7 @@ cluster_normal_stop_checkpoint_poll(uint32 expected_services, ClusterPhase1FullS
 	observation->module = "COORDINATOR";
 	observation->reason = "NORMAL_STOP_AWAIT_DRAIN_ACK_OR_OWNER_IDLE";
 	now = (uint64)GetCurrentTimestamp();
-	peer_bits = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	peer_bits = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	if (!cl_normal_stop_checkpoint_state_locked(expected_services, phase, now))
 		result = CLUSTER_NORMAL_STOP_INVALID;
@@ -3208,7 +3268,7 @@ cluster_normal_stop_maintenance_cut(void)
 		|| cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT || cl_state == NULL
 		|| cl_normal_stop == NULL)
 		return false;
-	peer_bits = UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id);
+	peer_bits = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
 	LWLockAcquire(&cl_state->lock, LW_SHARED);
 	phase = pg_atomic_read_u32(&cl_normal_stop->phase);
 	nonce = pg_atomic_read_u64(&cl_state->leave_attempt_nonce);
@@ -3219,11 +3279,11 @@ cluster_normal_stop_maintenance_cut(void)
 		  && phase >= CLUSTER_NORMAL_STOP_DRAIN && phase <= CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED
 		  && pg_atomic_read_u32(&cl_state->request_in_progress) == 1
 		  && pg_atomic_read_u32(&cl_state->shutdown_driven) == 1
-		  && cl_normal_stop->peer_requests_seen == 15
+		  && cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
 		  && cl_normal_stop->peer_request_sent == peer_bits && nonce != 0 && nonce != UINT64_MAX;
 	for (int peer = 0; cut && peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; peer++) {
 		uint64 peer_nonce = cl_normal_stop->peer_request_nonce[peer];
-		cut = peer_nonce != 0 && peer_nonce != UINT64_MAX
+		cut = cl_normal_stop_member_nonce_valid(peer, peer_nonce)
 			  && (peer != cluster_node_id || peer_nonce == nonce);
 	}
 	LWLockRelease(&cl_state->lock);
@@ -3500,9 +3560,10 @@ cluster_normal_stop_service_seal(uint32 expected_services, uint32 next_seal)
 		result = CLUSTER_NORMAL_STOP_INVALID;
 	else if (pg_atomic_read_u32(&cl_normal_stop->frontends_gone) == 1
 			 && pg_atomic_read_u32(&cl_normal_stop->identity_published) == 1
-			 && cl_normal_stop->peer_requests_seen == 15
+			 && cl_normal_stop->peer_requests_seen == cl_normal_stop_member_mask()
 			 && (next_seal != 1
-				 || (cl_state->ack_bitmap[0] == (UINT32_C(15) & ~(UINT32_C(1) << cluster_node_id))
+				 || (cl_state->ack_bitmap[0]
+						 == (cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id))
 					 && cl_normal_stop->peer_reply_sent == cl_state->ack_bitmap[0]
 					 && cl_normal_stop->peer_reply_pending == 0))
 			 && pg_atomic_read_u32(&cl_normal_stop->cleaner_quiesce_requested) == 1

@@ -341,7 +341,9 @@ typedef enum ClusterLeaveProducerKind {
 /* Stage 8 phase-1 coordinated full-cluster clean stop.  The accepted harness
  * topology is exactly nodes 0..3.  The plan itself is checkpointer-stack-only;
  * the matching runtime proof is bounded, volatile and per-round, and no
- * phase-1 identity can survive process exit. */
+ * phase-1 identity can survive process exit. PRE2 reuses this slot capacity,
+ * not its cardinality: its normal-stop participants are the frozen declared
+ * OPEN/formation/root serving set. Unused slots carry zero incarnation. */
 #define CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT 4
 typedef enum ClusterPhase1FullStopPrepareResult {
 	CLUSTER_PHASE1_FULL_STOP_NOT_APPLICABLE = 0,
