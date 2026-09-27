@@ -357,6 +357,11 @@ cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken
 											   ClusterWalRootPublishGuard **out_guard);
 extern ClusterWalrReleaseResult
 cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard);
+/* PGRAC: post-IR sealed-pin observation; no CF acquisition or new authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern bool
+cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGuard *guard,
+												  const ClusterControlRootReadToken *expected_root);
 extern ClusterWalReuseGuardResult
 cluster_wal_retention_e1_coarse_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
 									  ClusterWalRootFoldResult *out_fold_result,

@@ -489,6 +489,8 @@ static ClusterWalPinResult test_walr_begin_result = CLUSTER_WAL_PIN_OK;
 static ClusterWalrReleaseResult test_walr_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
 static int test_walr_begin_calls = 0;
 static int test_walr_end_calls = 0;
+static bool test_walr_sealed_required;
+static bool test_walr_sealed_current = true;
 static uint16 test_walr_thread = 0;
 static int test_order_seq = 0;
 static int test_walr_begin_order = 0;
@@ -936,13 +938,14 @@ cluster_cf_unlock_confirmed(LOCKMODE mode pg_attribute_unused())
 
 ClusterWalPinResult
 cluster_wal_retention_root_publish_begin_exact(const ClusterControlRootReadToken *expected_root,
-											   bool require_sealed_pin pg_attribute_unused(),
+											   bool require_sealed_pin,
 											   ClusterWalRootPublishGuard **out_guard)
 {
 	/* Match the real WALR precondition; SHMEM-only workers start without it. */
 	if (CurrentResourceOwner == NULL)
 		return CLUSTER_WAL_PIN_INVALID;
 	test_walr_begin_calls++;
+	test_walr_sealed_required = require_sealed_pin;
 	test_walr_thread = expected_root->origin_thread_id;
 	test_walr_begin_order = ++test_order_seq;
 	if (test_walr_begin_result != CLUSTER_WAL_PIN_OK)
@@ -959,6 +962,14 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 	if (test_walr_end_result == CLUSTER_WALR_RELEASE_CONFIRMED)
 		*guard = NULL;
 	return test_walr_end_result;
+}
+
+bool
+cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGuard *guard,
+												  const ClusterControlRootReadToken *expected_root)
+{
+	return guard == (const ClusterWalRootPublishGuard *)(uintptr_t)1 && expected_root != NULL
+		   && test_walr_sealed_current;
 }
 
 /* PGRAC: inject the distributed IR owner, not the physical root/WAL reader.
@@ -1398,6 +1409,8 @@ wipe_root_files(void)
 	test_walr_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
 	test_walr_begin_calls = 0;
 	test_walr_end_calls = 0;
+	test_walr_sealed_required = false;
+	test_walr_sealed_current = true;
 	test_walr_thread = 0;
 	test_order_seq = 0;
 	test_walr_begin_order = 0;
@@ -14730,6 +14743,213 @@ v3_mark_pending(uint8 bytes[66048], unsigned node)
 	v2_checksums(bytes);
 }
 
+static void
+v3_complete_fixture(uint8 before[66048], ClusterControlRootSnapshot *input,
+					ClusterControlRootReadToken *token, ClusterControlRootPatch *patch)
+{
+	ClusterRecoverySerialRequest request;
+	char path[MAXPGPATH];
+	v2_failure_fixture(before, &request, true);
+	root_fixture_version3(before);
+	v3_mark_pending(before, 127);
+	v2_write_roots(before);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &request.duty, input,
+														&request.expected_root_token),
+				 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_failure_tail_publish(&request, input, token), 0);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, before, 66048);
+	memset(patch, 0, sizeof(*patch));
+	patch->mask
+		= CLUSTER_CONTROL_ROOT_PATCH_LIFECYCLE | CLUSTER_CONTROL_ROOT_PATCH_RECOVERY_PROGRESS;
+	patch->expected_lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	patch->expected_flags_mask = patch->expected_flags_value = input->root_flags;
+	patch->desired.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+	patch->desired.root_flags = input->root_flags | CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_VALID
+								| CLUSTER_CONTROL_ROOT_FLAG_RECOVERED_LAST_RECORD_VALID;
+	patch->desired.recovered_tli = input->tail_tli;
+	patch->desired.recovered_through_lsn_exclusive = input->validated_tail_lsn_exclusive;
+	patch->desired.recovered_last_record_lsn = input->tail_last_record_lsn;
+	patch->desired.recovered_last_record_crc32c = input->tail_last_record_crc32c;
+	/* Use the actual held-mode fixture, not the legacy wildcard CF seam. */
+	test_reserve_mode = true;
+}
+
+static ClusterControlRootResult
+v3_complete_publish(const ClusterControlRootReadToken *token, const ClusterControlRootPatch *patch,
+					ClusterControlRootSnapshot *out, ClusterControlRootReadToken *published)
+{
+	return cluster_control_root_compare_and_publish(
+		token, patch, CLUSTER_CONTROL_ROOT_PUBLISH_RECOVERY_COMPLETE, out, published);
+}
+
+UT_TEST(test_v3_recovery_complete_preserves_exact_selected_inputs)
+{
+	uint8 before[66048], after[66048];
+	ClusterControlRootSnapshot input, out;
+	ClusterControlRootReadToken token, published, observed;
+	ClusterControlRootPatch patch;
+	char path[MAXPGPATH];
+	v3_complete_fixture(before, &input, &token, &patch);
+	UT_ASSERT_EQ(v3_complete_publish(&token, &patch, &out, &published), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+	UT_ASSERT_EQ(out.recovered_through_lsn_exclusive, input.validated_tail_lsn_exclusive);
+	UT_ASSERT_EQ(out.recovered_last_record_crc32c, input.tail_last_record_crc32c);
+	UT_ASSERT_EQ(memcmp(&out.identity, &input.identity, sizeof(input.identity)), 0);
+	UT_ASSERT_EQ(out.root_publish_seq, input.root_publish_seq + 1);
+	UT_ASSERT_EQ(published.file_txn_seq, token.file_txn_seq + 1);
+	UT_ASSERT(test_walr_sealed_required);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, after, sizeof(after));
+	UT_ASSERT_EQ(after[4], 3);
+	UT_ASSERT_EQ(memcmp(before + 196, after + 196, 180), 0);
+	UT_ASSERT_EQ(memcmp(before + 512 + 216, after + 512 + 216, 152), 0);
+	UT_ASSERT_EQ(memcmp(before + 1024, after + 1024, sizeof(after) - 1024), 0);
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+					 1, &input.identity, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &observed),
+				 0);
+	UT_ASSERT_EQ(memcmp(&observed, &published, sizeof(observed)), 0);
+}
+
+UT_TEST(test_v3_recovery_complete_never_accepts_partial_or_unowned_terminal)
+{
+	for (int fault = 0; fault < 10; ++fault) {
+		uint8 before[66048];
+		ClusterControlRootSnapshot input, out;
+		ClusterControlRootReadToken token, published;
+		ClusterControlRootPatch patch;
+		v3_complete_fixture(before, &input, &token, &patch);
+		if (fault == 0)
+			patch.desired.recovered_through_lsn_exclusive--;
+		else if (fault == 1)
+			patch.desired.recovered_tli++;
+		else if (fault == 2)
+			patch.desired.recovered_last_record_lsn++;
+		else if (fault == 3)
+			patch.desired.recovered_last_record_crc32c++;
+		else if (fault == 4)
+			test_publish_authorized = false;
+		else if (fault == 5)
+			test_walr_begin_result = CLUSTER_WAL_PIN_STALE;
+		else if (fault == 6)
+			test_walr_sealed_current = false;
+		else if (fault == 7)
+			token.file_txn_seq++;
+		else if (fault == 8) {
+			ControlRootImage decoded;
+			v3_mark_pending(before, 0);
+			v2_write_roots(before);
+			UT_ASSERT_EQ(cluster_control_root_v3_decode(before, sizeof(before),
+														input.identity.storage_uuid,
+														input.identity.system_identifier, &decoded),
+						 0);
+			token.record_crc32c = decoded.record_crc32c[0];
+		} else
+			UT_ASSERT_EQ(unlink(test_checkpoint_prefix_path), 0);
+		memset(&out, 0xa5, sizeof(out));
+		memset(&published, 0xa5, sizeof(published));
+		UT_ASSERT(v3_complete_publish(&token, &patch, &out, &published) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&published, sizeof(published)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+	}
+}
+
+static void
+v3_complete_late_pin_loss(void)
+{
+	test_walr_sealed_current = false;
+}
+
+UT_TEST(test_v3_recovery_complete_late_loss_never_returns_permission)
+{
+	uint8 before[66048];
+	ClusterControlRootSnapshot input, out;
+	ClusterControlRootReadToken token, published;
+	ClusterControlRootPatch patch;
+	v3_complete_fixture(before, &input, &token, &patch);
+	test_checkpoint_published_hook = v3_complete_late_pin_loss;
+	UT_ASSERT_EQ(v3_complete_publish(&token, &patch, &out, &published),
+				 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&published, sizeof(published)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	test_checkpoint_published_hook = NULL;
+	/* Publication may have persisted; no rollback to the earlier root. */
+	UT_ASSERT_EQ(cluster_control_root_read_canonical(
+					 1, &input.identity, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &published),
+				 0);
+	UT_ASSERT_EQ(out.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+}
+
+UT_TEST(test_v3_recovery_complete_errors_unwind_without_reverting_published_fact)
+{
+	for (int fault = 0; fault < 5; ++fault) {
+		uint8 before[66048];
+		ClusterControlRootSnapshot input, out;
+		ClusterControlRootReadToken token, published;
+		ClusterControlRootPatch patch;
+		volatile bool caught = false;
+		volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		v3_complete_fixture(before, &input, &token, &patch);
+		if (fault == 0)
+			test_fail_primary_rename = true;
+		else if (fault == 1)
+			test_fail_after_primary_rename = true;
+		else if (fault == 2)
+			test_release_after_primary = true;
+		else if (fault == 3)
+			test_walr_end_result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		else
+			test_checkpoint_published_hook = v2_checkpoint_throw_on_x;
+		memset(&out, 0xa5, sizeof(out));
+		memset(&published, 0xa5, sizeof(published));
+		PG_TRY();
+		{
+			result = v3_complete_publish(&token, &patch, &out, &published);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(fault == 4 ? caught : result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&published, sizeof(published)));
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		test_checkpoint_published_hook = NULL;
+		test_fail_primary_rename = test_fail_after_primary_rename = false;
+		test_release_after_primary = false;
+		test_cf_release_confirmed = true;
+		test_walr_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
+		cluster_cf_retirement_poll();
+		UT_ASSERT_EQ(cluster_control_root_read_canonical(
+						 1, &input.identity, CLUSTER_CONTROL_ROOT_READ_STRONG, &out, &published),
+					 0);
+		UT_ASSERT_EQ(out.lifecycle, fault == 0 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+											   : CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE);
+	}
+}
+
+UT_TEST(test_v3_recovery_complete_alias_refuses_before_authority)
+{
+	uint8 before[66048];
+	ClusterControlRootSnapshot input, out;
+	ClusterControlRootReadToken token;
+	ClusterControlRootPatch patch;
+	int calls;
+	v3_complete_fixture(before, &input, &token, &patch);
+	calls = test_walr_begin_calls;
+	UT_ASSERT_EQ(v3_complete_publish(&token, &patch, &out, &token),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)) && v2_zero(&token, sizeof(token)));
+	UT_ASSERT_EQ(test_walr_begin_calls, calls);
+	v2_assert_primary_unchanged(before);
+}
+
 UT_TEST(test_v3_failure_publishers_preserve_pending_and_authenticate_native_input)
 {
 	for (int sealed = 0; sealed < 2; sealed++) {
@@ -14964,7 +15184,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(281);
+	UT_PLAN(286);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
@@ -15013,6 +15233,11 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_clean_exit_cut_never_shrinks_missing_members);
 	UT_RUN(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor);
 	UT_RUN(test_v3_failure_publishers_preserve_pending_and_authenticate_native_input);
+	UT_RUN(test_v3_recovery_complete_preserves_exact_selected_inputs);
+	UT_RUN(test_v3_recovery_complete_never_accepts_partial_or_unowned_terminal);
+	UT_RUN(test_v3_recovery_complete_late_loss_never_returns_permission);
+	UT_RUN(test_v3_recovery_complete_errors_unwind_without_reverting_published_fact);
+	UT_RUN(test_v3_recovery_complete_alias_refuses_before_authority);
 	UT_RUN(test_v3_failure_publication_retains_old_authority_and_no_fallback);
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);
 	UT_RUN(test_v3_publishers_do_not_fallback_or_weaken_physical_checks);

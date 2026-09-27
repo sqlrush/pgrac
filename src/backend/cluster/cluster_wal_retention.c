@@ -1076,6 +1076,37 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 	return result;
 }
 
+bool
+cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGuard *guard,
+												  const ClusterControlRootReadToken *expected_root)
+{
+	ClusterWalPinThread *thread;
+	PgracExternalFenceDenyReason reason;
+
+	/* PGRAC: the sealed pin survives confirmed IR release. Recheck only
+	 * borrowed owner evidence here: the caller already holds CF and performs
+	 * its own exact root CAS. Never recursively read/acquire CF.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (guard == NULL || guard != active_root_publish_guard || expected_root == NULL
+		|| guard->magic != CLUSTER_WAL_ROOT_PUBLISH_MAGIC || guard->owner_pid != MyProcPid
+		|| guard->owner != CurrentResourceOwner || !guard->borrowed_from_pin
+		|| guard->thread_id != expected_root->origin_thread_id || !pin_valid(active_pin)
+		|| active_pin->poisoned || active_pin->state != CLUSTER_WAL_PIN_STATE_SEALED)
+		return false;
+	thread = pin_find_thread(active_pin, guard->thread_id);
+	if (thread == NULL || thread->serial == NULL || thread->serial->held
+		|| thread->serial->release_uncertain
+		|| memcmp(&thread->root_read, expected_root, sizeof(*expected_root)) != 0
+		|| !pin_thread_walr_current(active_pin, thread))
+		return false;
+	return cluster_formation_witness_revalidate_nowait(thread->formation)
+			   == CLUSTER_FORMATION_WITNESS_READY
+		   && cluster_external_fence_need_set_revalidate_nowait(thread->needs, thread->formation,
+																&reason)
+		   && cluster_external_fence_revalidate_set_nowait(thread->admissions, thread->needs,
+														   thread->formation, &reason);
+}
+
 static void
 walr_resource_release_callback(ResourceReleasePhase phase, bool isCommit, bool isTopLevel,
 							   void *arg)
