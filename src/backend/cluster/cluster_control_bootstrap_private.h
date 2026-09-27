@@ -37,6 +37,11 @@ typedef struct ClusterControlBootstrapSnapshot {
 	PgracControlBinding binding;
 	ClusterControlRootIdentity thread;
 	ClusterWalDurablePrefixRef wal;
+	/* Physical route alternative only, never a replay/writer grant. The
+	 * collector fills this from the selected own INITIALIZING/DURABLE PGWG;
+	 * the immutable current/restart input above does not change. */
+	ClusterWalDurablePrefixRef pending_wal;
+	bool pending_wal_valid;
 	ClusterSharedConfigRef config;
 	ControlFileData control;
 	uint8 root_sha256[32];
@@ -101,6 +106,12 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 extern ClusterControlRootResult
 cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
 									const ClusterWalDurablePrefixRef *ref);
+/* Before native startup, an interrupted initialization may have durably
+ * exchanged pg_wal while the predecessor remains the immutable read input.
+ * Select by pinned directory identity, not validation-error fallback. */
+extern ClusterControlRootResult
+cluster_control_bootstrap_wal_startup_route(const char *pgdata, const char *wal_root,
+											const ClusterControlBootstrapSnapshot *snapshot);
 
 /* Process-local preparation and native control/geometry initialization only,
  * before shared memory or WAL startup. Not admission, physical qualification

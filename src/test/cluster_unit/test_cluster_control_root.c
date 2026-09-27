@@ -8262,6 +8262,71 @@ UT_TEST(test_v3_startup_route_rechecks_names_and_owner_after_exchange)
 	}
 }
 
+static void
+v3_route_binding(const ControlRootImage *root, const char *pgdata)
+{
+	PgracControlBinding binding = { 0 };
+	uint8 bytes[256];
+	char path[MAXPGPATH];
+	binding.system_identifier = root->header.system_identifier;
+	memcpy(binding.storage_uuid, root->header.storage_uuid, 16);
+	memcpy(binding.authority_uuid, root->header.authority_uuid, 16);
+	binding.database_incarnation = root->header.v2.database_incarnation;
+	binding.node_id = 0;
+	memset(binding.operation_uuid, 0x41, 16);
+	memset(binding.source_cold_sha256, 0x42, 32);
+	memset(binding.target_qualification_sha256, 0x43, 32);
+	memcpy(binding.migration_round_sha256, root->header.migration_round_sha256, 32);
+	memcpy(binding.source_wal_state_sha256, root->header.source_wal_state_sha256, 32);
+	binding.migration_prepare_generation = root->header.migration_prepare_generation;
+	binding.migration_transition_epoch = root->header.migration_transition_epoch;
+	UT_ASSERT(pgrac_control_binding_encode(&binding, bytes, sizeof(bytes)));
+	snprintf(path, sizeof(path), "%s/global", pgdata);
+	UT_ASSERT_EQ(mkdir(path, 0700), 0);
+	snprintf(path, sizeof(path), "%s/global/%s", pgdata, PGRAC_CONTROL_BINDING_NAME);
+	write_all_or_abort(path, bytes, sizeof(bytes));
+}
+
+UT_TEST(test_bootstrap_pending_route_keeps_immutable_restart_input)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	char pgdata[MAXPGPATH], path[MAXPGPATH];
+	ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), observed;
+	ClusterControlBootstrapObservation out;
+	v3_route_binding(&root, pgdata);
+	for (unsigned routed = 0; routed < 2; ++routed) {
+		if (routed)
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(&op.claim.identity,
+																	  op.operation_uuid, &observed),
+						 0);
+		UT_ASSERT_EQ(cluster_control_bootstrap_read(pgdata, test_root, test_wal_root, 0, &out), 0);
+		if (ut_current_failed)
+			break;
+		UT_ASSERT(out.snapshot.pending_wal_valid);
+		UT_ASSERT(cluster_control_root_identity_equal(&out.snapshot.wal.claim.identity,
+													  &op.predecessor.snapshot.identity));
+		UT_ASSERT(cluster_control_root_identity_equal(&out.snapshot.pending_wal.claim.identity,
+													  &op.claim.identity));
+		UT_ASSERT_EQ(
+			cluster_control_bootstrap_wal_startup_route(pgdata, test_wal_root, &out.snapshot), 0);
+		if (routed)
+			UT_ASSERT(cluster_control_bootstrap_wal_route(pgdata, test_wal_root, &out.snapshot.wal)
+					  != 0);
+		pfree(out.config_bytes);
+	}
+	v2_assert_primary_unchanged(before);
+	snprintf(path, sizeof(path), "%s/pg_wal", pgdata);
+	UT_ASSERT_EQ(unlink(path), 0);
+	snprintf(path, sizeof(path), "%s/global/%s", pgdata, PGRAC_CONTROL_BINDING_NAME);
+	UT_ASSERT_EQ(unlink(path), 0);
+	snprintf(path, sizeof(path), "%s/global", pgdata);
+	UT_ASSERT_EQ(rmdir(path), 0);
+	UT_ASSERT_EQ(rmdir(pgdata), 0);
+	DataDir = test_root;
+	test_restart_ref_valid = test_reserve_mode = false;
+}
+
 /* Build a real independent successor stream after the production all-member
  * INITIALIZING CAS. The native checkpoint and PGWP files are not mocked. */
 static void history_stage_dirs(uint32 node);
@@ -13514,6 +13579,9 @@ UT_TEST(test_bootstrap_v3_pending_is_never_missing_from_capacity)
 	UT_ASSERT_EQ(out.required.history_sources, 2);
 	UT_ASSERT_EQ(out.required.pending_sources, 1);
 	UT_ASSERT_EQ(out.required.max_connections, 901);
+	/* Another origin's initialization never changes this node's route. */
+	UT_ASSERT(!out.snapshot.pending_wal_valid);
+	UT_ASSERT(v2_zero(&out.snapshot.pending_wal, sizeof(out.snapshot.pending_wal)));
 	pfree(out.config_bytes);
 	for (int object = 0; object < 3; object++) {
 		bootstrap_pending_fixture(&f, CLUSTER_WAL_STARTUP_DURABLE, paths);
@@ -13523,6 +13591,157 @@ UT_TEST(test_bootstrap_v3_pending_is_never_missing_from_capacity)
 	bootstrap_pending_fixture(&f, CLUSTER_WAL_STARTUP_INITIALIZING, paths);
 	/* Missing real PGWP is not an EMPTY prefix, even with an unselected anchor. */
 	UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
+}
+
+static void
+bootstrap_route_cleanup(const char *pgdata)
+{
+	char path[MAXPGPATH];
+	snprintf(path, sizeof(path), "%s/pg_wal", pgdata);
+	UT_ASSERT_EQ(unlink(path), 0);
+	snprintf(path, sizeof(path), "%s/global/%s", pgdata, PGRAC_CONTROL_BINDING_NAME);
+	UT_ASSERT_EQ(unlink(path), 0);
+	snprintf(path, sizeof(path), "%s/global", pgdata);
+	UT_ASSERT_EQ(rmdir(path), 0);
+	UT_ASSERT_EQ(rmdir(pgdata), 0);
+	DataDir = test_root;
+	test_restart_ref_valid = test_reserve_mode = false;
+}
+
+UT_TEST(test_bootstrap_pending_route_never_masks_bad_inputs_or_namespace)
+{
+	unsigned before_fds = 0, after_fds = 0;
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			before_fds++;
+	for (unsigned routed = 0; routed < 2; ++routed)
+		for (unsigned fault = 0; fault < 9; ++fault) {
+			uint8 before[66048];
+			ControlRootImage root;
+			char pgdata[MAXPGPATH], path[MAXPGPATH], pgwal[MAXPGPATH];
+			ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), observed;
+			ClusterControlBootstrapObservation out;
+			v3_route_binding(&root, pgdata);
+			if (routed)
+				UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(
+								 &op.claim.identity, op.operation_uuid, &observed),
+							 0);
+			UT_ASSERT_EQ(cluster_control_bootstrap_read(pgdata, test_root, test_wal_root, 0, &out),
+						 0);
+			if (ut_current_failed)
+				return;
+			snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+			if (fault < 2) {
+				v2_claim_path(fault == 0 ? &op.predecessor.snapshot.identity : &op.claim.identity,
+							  path);
+				write_all_or_abort(path, "bad", 3);
+			} else if (fault < 4) {
+				const ClusterControlRootIdentity *identity
+					= fault == 2 ? &op.predecessor.snapshot.identity : &op.claim.identity;
+				snprintf(path, sizeof(path),
+						 "%s/thread_1/generation_" UINT64_FORMAT "/durable_prefix/current",
+						 test_wal_root, identity->origin_owner_incarnation);
+				UT_ASSERT_EQ(unlink(path), 0);
+			} else if (fault == 4) {
+				UT_ASSERT_EQ(unlink(pgwal), 0);
+				UT_ASSERT_EQ(symlink(test_wal_root, pgwal), 0);
+			} else if (fault == 5)
+				bootstrap_wal_route_race = true;
+			else if (fault == 6) {
+				bootstrap_close_calls = 0;
+				bootstrap_close_fail_at = 1;
+			} else if (fault == 7)
+				out.snapshot.pending_wal.claim.identity.origin_node_id++;
+			else
+				out.snapshot.pending_wal.claim.identity.origin_owner_incarnation
+					= out.snapshot.wal.claim.identity.origin_owner_incarnation;
+			UT_ASSERT(
+				cluster_control_bootstrap_wal_startup_route(pgdata, test_wal_root, &out.snapshot)
+				!= 0);
+			if (fault == 5)
+				UT_ASSERT(!bootstrap_wal_route_race);
+			bootstrap_close_fail_at = 0;
+			pfree(out.config_bytes);
+			v2_assert_primary_unchanged(before);
+			bootstrap_route_cleanup(pgdata);
+		}
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			after_fds++;
+	UT_ASSERT_EQ(after_fds, before_fds);
+}
+
+UT_TEST(test_bootstrap_pending_route_tracks_durable_and_install_not_authority)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ControlFileData candidate;
+	ClusterControlRootFileToken token;
+	char pgdata[MAXPGPATH];
+	ClusterWalStartupImage op = v3_route_fixture(before, &root, pgdata), observed;
+	ClusterWalDurablePrefixRef writer;
+	ClusterControlBootstrapObservation out;
+	v3_route_binding(&root, pgdata);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_route_writer(&op.claim.identity, op.operation_uuid,
+															  &observed),
+				 0);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&op.predecessor.snapshot.identity,
+															&root, &candidate, &token),
+				 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	v3_startup_native_record(&op, &candidate);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end,
+															&observed),
+				 0);
+	UT_ASSERT_EQ(cluster_control_bootstrap_read(pgdata, test_root, test_wal_root, 0, &out), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(out.snapshot.pending_wal_valid);
+	UT_ASSERT(cluster_control_root_identity_equal(&out.snapshot.wal.claim.identity,
+												  &op.predecessor.snapshot.identity));
+	UT_ASSERT_EQ(cluster_control_bootstrap_wal_startup_route(pgdata, test_wal_root, &out.snapshot),
+				 0);
+	pfree(out.config_bytes);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&observed, &writer), 0);
+	UT_ASSERT_EQ(cluster_control_bootstrap_read(pgdata, test_root, test_wal_root, 0, &out), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(!out.snapshot.pending_wal_valid);
+	UT_ASSERT(v2_zero(&out.snapshot.pending_wal, sizeof(out.snapshot.pending_wal)));
+	UT_ASSERT(
+		cluster_control_root_identity_equal(&out.snapshot.wal.claim.identity, &op.claim.identity));
+	UT_ASSERT_EQ(out.snapshot.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(cluster_control_bootstrap_wal_startup_route(pgdata, test_wal_root, &out.snapshot),
+				 0);
+	pfree(out.config_bytes);
+	bootstrap_route_cleanup(pgdata);
+}
+
+UT_TEST(test_bootstrap_reserved_does_not_offer_a_successor_route)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterWalStartupImage op = v3_target_fixture(before, &root, 0);
+	ClusterControlBootstrapObservation out;
+	char pgdata[MAXPGPATH] = "/tmp/pgrac-bootstrap-reserved.XXXXXX";
+	char pgwal[MAXPGPATH], generation[MAXPGPATH];
+	UT_ASSERT(mkdtemp(pgdata) != NULL);
+	v3_route_binding(&root, pgdata);
+	snprintf(pgwal, sizeof(pgwal), "%s/pg_wal", pgdata);
+	snprintf(generation, sizeof(generation), "%s/thread_1/generation_" UINT64_FORMAT, test_wal_root,
+			 op.predecessor.snapshot.identity.origin_owner_incarnation);
+	UT_ASSERT_EQ(symlink(generation, pgwal), 0);
+	UT_ASSERT_EQ(cluster_control_bootstrap_read(pgdata, test_root, test_wal_root, 0, &out), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(!out.snapshot.pending_wal_valid);
+	UT_ASSERT(v2_zero(&out.snapshot.pending_wal, sizeof(out.snapshot.pending_wal)));
+	UT_ASSERT_EQ(cluster_control_bootstrap_wal_startup_route(pgdata, test_wal_root, &out.snapshot),
+				 0);
+	pfree(out.config_bytes);
+	bootstrap_route_cleanup(pgdata);
 }
 
 UT_TEST(test_bootstrap_v3_pending_objects_and_reread_remain_exact)
@@ -13922,7 +14141,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(260);
+	UT_PLAN(264);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
 	UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
@@ -13943,6 +14162,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_startup_route_refuses_unsafe_or_nonempty_namespaces);
 	UT_RUN(test_v3_startup_route_uncertain_rename_requires_directory_sync);
 	UT_RUN(test_v3_startup_route_rechecks_names_and_owner_after_exchange);
+	UT_RUN(test_bootstrap_pending_route_keeps_immutable_restart_input);
 	UT_RUN(test_v3_target_rejects_wrong_owner_before_creation);
 	UT_RUN(test_v3_target_never_adopts_foreign_or_nonempty_namespace);
 	UT_RUN(test_v3_target_sync_failures_never_grant_initialization);
@@ -13968,6 +14188,9 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_v3_pending_objects_and_reread_remain_exact);
 	UT_RUN(test_bootstrap_v3_reads_exact_current_and_flat_history);
 	UT_RUN(test_bootstrap_v3_pending_is_never_missing_from_capacity);
+	UT_RUN(test_bootstrap_pending_route_never_masks_bad_inputs_or_namespace);
+	UT_RUN(test_bootstrap_pending_route_tracks_durable_and_install_not_authority);
+	UT_RUN(test_bootstrap_reserved_does_not_offer_a_successor_route);
 	UT_RUN(test_v3_history_files_preserve_pending_and_reject_unknown_format);
 	UT_RUN(test_v3_history_keeps_flat_input_separate_from_pending_operation);
 	UT_RUN(test_v3_locked_read_preserves_pending_and_current_projection);

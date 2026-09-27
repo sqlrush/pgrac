@@ -139,29 +139,49 @@ done:
 static ClusterControlRootResult read_same_dir(int parent, const char *name, int fd);
 #endif
 
-ClusterControlRootResult
-cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
-									const ClusterWalDurablePrefixRef *ref)
+static ClusterControlRootResult
+read_wal_routes(const char *pgdata, const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+				const ClusterWalDurablePrefixRef *pending)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 #if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
 	&& defined(AT_SYMLINK_NOFOLLOW)
-	int dirs[5] = { -1, -1, -1, -1, -1 };
-	char thread[32], generation[48];
-	struct stat expected, routed, current;
+	int dirs[6] = { -1, -1, -1, -1, -1, -1 };
+	const ClusterWalDurablePrefixRef *refs[] = { ref, pending };
+	const unsigned generation_fds[] = { 3, 5 };
+	unsigned count = pending != NULL ? 2 : 1;
+	char thread[32], generation[2][48];
+	struct stat expected[2], routed, current;
+	int selected = -1;
 	ClusterWalDurablePrefix prefix;
 	ClusterWalDurablePrefix empty = { .sequence = 1 };
 	ClusterWalThreadClaimV2 claim;
 	uint8 check[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
-	uint8 claim_bytes[CLUSTER_WAL_CLAIM_V2_BYTES + 1];
-	size_t claim_len = 0;
+	uint8 claim_bytes[2][CLUSTER_WAL_CLAIM_V2_BYTES + 1];
+	size_t claim_len[2] = { 0, 0 };
 
 	if (!read_path_valid(pgdata, NULL) || !read_path_valid(wal_root, NULL)
 		|| cluster_wal_durable_prefix_encode(ref, &empty, check) != 0)
 		return result;
+	if (pending != NULL
+		&& (cluster_wal_durable_prefix_encode(pending, &empty, check) != 0
+			|| pending->claim.identity.origin_node_id != ref->claim.identity.origin_node_id
+			|| pending->claim.identity.origin_thread_id != ref->claim.identity.origin_thread_id
+			|| pending->claim.identity.system_identifier != ref->claim.identity.system_identifier
+			|| pending->claim.identity.origin_owner_incarnation
+				   <= ref->claim.identity.origin_owner_incarnation
+			|| pending->claim.database_incarnation != ref->claim.database_incarnation
+			|| pending->claim.max_config_generation != ref->claim.max_config_generation
+			|| memcmp(pending->claim.identity.storage_uuid, ref->claim.identity.storage_uuid, 16)
+				   != 0
+			|| memcmp(pending->claim.identity.authority_uuid, ref->claim.identity.authority_uuid,
+					  16)
+				   != 0))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	snprintf(thread, sizeof(thread), "thread_%u", ref->claim.identity.origin_thread_id);
-	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
-			 ref->claim.identity.origin_owner_incarnation);
+	for (unsigned i = 0; i < count; ++i)
+		snprintf(generation[i], sizeof(generation[i]), "generation_" UINT64_FORMAT,
+				 refs[i]->claim.identity.origin_owner_incarnation);
 	result = read_dir(-1, pgdata, &dirs[0]);
 	if (result != 0)
 		goto done;
@@ -171,49 +191,80 @@ cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
 	result = read_dir(dirs[1], thread, &dirs[2]);
 	if (result != 0)
 		goto done;
-	result = read_dir(dirs[2], generation, &dirs[3]);
-	if (result != 0)
-		goto done;
+	for (unsigned i = 0; i < count; ++i) {
+		result = read_dir(dirs[2], generation[i], &dirs[generation_fds[i]]);
+		if (result != 0)
+			goto done;
+		if (fstat(dirs[generation_fds[i]], &expected[i]) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+	}
 	/* Only the native pg_wal leaf may follow a symlink. Its resolved inode,
 	 * not the spelling of the symlink, must match the root-selected directory. */
 	dirs[4] = openat(dirs[0], "pg_wal", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
-	if (dirs[4] < 0 || fstat(dirs[3], &expected) != 0 || fstat(dirs[4], &routed) != 0) {
+	if (dirs[4] < 0 || fstat(dirs[4], &routed) != 0) {
 		result = read_error();
 		goto done;
 	}
-	if (!read_owned(&routed, true) || expected.st_dev != routed.st_dev
-		|| expected.st_ino != routed.st_ino) {
+	for (unsigned i = 0; i < count; ++i)
+		if (expected[i].st_dev == routed.st_dev && expected[i].st_ino == routed.st_ino)
+			selected = i;
+	if (!read_owned(&routed, true) || selected < 0) {
 		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 		goto done;
 	}
-	result = read_bytes(dirs[3], CLUSTER_WAL_THREAD_CLAIM_FILENAME, CLUSTER_WAL_CLAIM_V2_BYTES,
-						CLUSTER_WAL_CLAIM_V2_BYTES, claim_bytes, &claim_len);
-	if (result != 0)
-		goto done;
-	/* Allocation-free exact current reader; all its descriptors close locally. */
-	result = cluster_wal_durable_prefix_read(wal_root, ref, &prefix);
-	if (result != 0)
-		goto done;
+	/* Validate both inputs regardless of which directory pg_wal uses. Neither
+	 * a bad old claim nor a bad pending claim enables an identity fallback. */
+	for (unsigned i = 0; i < count; ++i) {
+		result = read_bytes(dirs[generation_fds[i]], CLUSTER_WAL_THREAD_CLAIM_FILENAME,
+							CLUSTER_WAL_CLAIM_V2_BYTES, CLUSTER_WAL_CLAIM_V2_BYTES, claim_bytes[i],
+							&claim_len[i]);
+		if (result != 0)
+			goto done;
+		/* Allocation-free exact reader; all its descriptors close locally. */
+		result = cluster_wal_durable_prefix_read(wal_root, refs[i], &prefix);
+		if (result != 0)
+			goto done;
+	}
 	result = read_same_dir(AT_FDCWD, pgdata, dirs[0]);
 	if (result == 0)
 		result = read_same_dir(AT_FDCWD, wal_root, dirs[1]);
 	if (result == 0)
 		result = read_same_dir(dirs[1], thread, dirs[2]);
-	if (result == 0)
-		result = read_same_dir(dirs[2], generation, dirs[3]);
+	for (unsigned i = 0; result == 0 && i < count; ++i)
+		result = read_same_dir(dirs[2], generation[i], dirs[generation_fds[i]]);
 	if (result != 0)
 		goto done;
 	if (fstatat(dirs[0], "pg_wal", &current, 0) != 0 || !read_owned(&current, true)
-		|| current.st_dev != expected.st_dev || current.st_ino != expected.st_ino)
+		|| current.st_dev != expected[selected].st_dev
+		|| current.st_ino != expected[selected].st_ino)
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 done:
 	for (size_t i = 0; i < lengthof(dirs); i++)
 		read_close(dirs[i], &result);
 	/* Hashing may allocate/use a resource owner: no raw fd remains open. */
-	if (result == 0)
-		result = cluster_wal_claim_v2_decode(claim_bytes, claim_len, &ref->claim, &claim);
+	for (unsigned i = 0; result == 0 && i < count; ++i)
+		result = cluster_wal_claim_v2_decode(claim_bytes[i], claim_len[i], &refs[i]->claim, &claim);
 #endif
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_bootstrap_wal_route(const char *pgdata, const char *wal_root,
+									const ClusterWalDurablePrefixRef *ref)
+{
+	return read_wal_routes(pgdata, wal_root, ref, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_bootstrap_wal_startup_route(const char *pgdata, const char *wal_root,
+											const ClusterControlBootstrapSnapshot *snapshot)
+{
+	return snapshot == NULL
+			   ? CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT
+			   : read_wal_routes(pgdata, wal_root, &snapshot->wal,
+								 snapshot->pending_wal_valid ? &snapshot->pending_wal : NULL);
 }
 
 #if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
@@ -466,33 +517,38 @@ read_source_capacity(BootstrapReadWork *work, const char *shared_root, const cha
 }
 
 static ClusterControlRootResult
-read_initializing_capacity(BootstrapReadWork *work, const char *wal_root,
-						   ClusterControlRecoveryCapacity *required)
+read_startup_ref(BootstrapReadWork *work, ClusterWalDurablePrefixRef *ref)
 {
-	ClusterWalDurablePrefixRef ref = { 0 };
-	ClusterWalStartupObservation input;
-	ClusterControlRootResult result;
 	pg_cryptohash_ctx *ctx;
 	bool hashed;
 
-	ref.claim.identity = work->pending.claim.identity;
-	ref.claim.database_incarnation = work->pending.database_incarnation;
-	ref.claim.max_config_generation = work->pending.config_generation;
-	ref.timeline = work->pending.timeline;
+	memset(ref, 0, sizeof(*ref));
+	ref->claim.identity = work->pending.claim.identity;
+	ref->claim.database_incarnation = work->pending.database_incarnation;
+	ref->claim.max_config_generation = work->pending.config_generation;
+	ref->timeline = work->pending.timeline;
 	/* These exact embedded claim bytes were authenticated with the selected
 	 * PGWG. Hash them before opening raw WAL descriptors; never derive the
 	 * expected claim from whatever happens to be in the generation directory. */
 	ctx = pg_cryptohash_create(PG_SHA256);
 	if (ctx == NULL)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	hashed
-		= pg_cryptohash_init(ctx) >= 0
-		  && pg_cryptohash_update(ctx, work->startup + 1280, CLUSTER_WAL_CLAIM_V2_BYTES) >= 0
-		  && pg_cryptohash_final(ctx, ref.claim.claim_sha256, sizeof(ref.claim.claim_sha256)) >= 0;
+	hashed = pg_cryptohash_init(ctx) >= 0
+			 && pg_cryptohash_update(ctx, work->startup + 1280, CLUSTER_WAL_CLAIM_V2_BYTES) >= 0
+			 && pg_cryptohash_final(ctx, ref->claim.claim_sha256, sizeof(ref->claim.claim_sha256))
+					>= 0;
 	pg_cryptohash_free(ctx);
-	if (!hashed)
-		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	result = cluster_wal_startup_observe(wal_root, &ref, work->pending.segment_size,
+	return hashed ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+static ClusterControlRootResult
+read_initializing_capacity(BootstrapReadWork *work, const char *wal_root,
+						   const ClusterWalDurablePrefixRef *ref,
+						   ClusterControlRecoveryCapacity *required)
+{
+	ClusterWalStartupObservation input;
+	ClusterControlRootResult result;
+	result = cluster_wal_startup_observe(wal_root, ref, work->pending.segment_size,
 										 work->pending.first_segment_lsn, &input);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
@@ -508,7 +564,7 @@ read_initializing_capacity(BootstrapReadWork *work, const char *wal_root,
 
 static ClusterControlRootResult
 read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
-				ClusterControlRecoveryCapacity *required)
+				ClusterControlRecoveryCapacity *required, ClusterControlBootstrapSnapshot *snapshot)
 {
 	const ControlRootImage *root = &work->before;
 	ClusterControlRootResult result;
@@ -544,6 +600,7 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			}
 		}
 		if (root->header.format_version == 3 && root->startup[node].generation != 0) {
+			ClusterWalDurablePrefixRef pending;
 			result = read_again(work, shared_root, wal_root, BOOTSTRAP_STARTUP,
 								&root->records[node], NULL);
 			if (result != 0)
@@ -552,12 +609,17 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 				work->startup, CLUSTER_WAL_STARTUP_BYTES, root, node, &work->pending);
 			if (result != 0)
 				return result;
+			if (work->pending.phase != CLUSTER_WAL_STARTUP_RESERVED) {
+				result = read_startup_ref(work, &pending);
+				if (result != 0)
+					return result;
+			}
 			/* A pending generation is not current and need not be serving. Its
 			 * published checkpoint still imposes physical recovery requirements.
 			 * Before that checkpoint, an INITIALIZING WAL scan is required; never
 			 * substitute the predecessor anchor or count it as clean/empty. */
 			if (work->pending.phase == CLUSTER_WAL_STARTUP_INITIALIZING) {
-				result = read_initializing_capacity(work, wal_root, required);
+				result = read_initializing_capacity(work, wal_root, &pending, required);
 				if (result != 0)
 					return result;
 			}
@@ -567,6 +629,11 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 											  &work->pending.successor.refs, required);
 				if (result != 0)
 					return result;
+			}
+			if (node == snapshot->binding.node_id
+				&& work->pending.phase != CLUSTER_WAL_STARTUP_RESERVED) {
+				snapshot->pending_wal = pending;
+				snapshot->pending_wal_valid = true;
 			}
 			required->pending_sources++;
 		}
@@ -685,7 +752,7 @@ close_dirs:
 	result = cluster_control_bootstrap_decode(&input, &snapshot);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	objects = read_capacities(work, shared_root, wal_root, &required);
+	objects = read_capacities(work, shared_root, wal_root, &required, &snapshot);
 	/* A later root may legitimately retire an object while this provisional
 	 * observation is reading it. Never blame the old object before reobserving. */
 	result = read_again(work, shared_root, wal_root, BOOTSTRAP_FINAL_ROOT, NULL, NULL);

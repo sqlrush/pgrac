@@ -138,8 +138,8 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 		if (cluster_shared_config_check_recovery_capacity(&state->after.required, &report)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			bootstrap_policy_refuse("native bootstrap recovery capacity is insufficient", &report);
-		result = cluster_control_bootstrap_wal_route(state->paths[0], state->paths[2],
-													 &state->after.snapshot.wal);
+		result = cluster_control_bootstrap_wal_startup_route(state->paths[0], state->paths[2],
+															 &state->after.snapshot);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("native bootstrap WAL routing is not exact"),
@@ -206,8 +206,8 @@ cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalDurablePrefi
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("native WAL bootstrap preparation changed"),
 							errdetail("Root recheck result=%d.", result)));
-		result
-			= cluster_control_bootstrap_wal_route(pgdata, bootstrap_paths[2], &fresh->snapshot.wal);
+		result = cluster_control_bootstrap_wal_startup_route(pgdata, bootstrap_paths[2],
+															 &fresh->snapshot);
 		if (result != 0)
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("native WAL bootstrap route changed"),
