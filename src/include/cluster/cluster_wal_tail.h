@@ -14,6 +14,31 @@ typedef struct ClusterWalTailObservation {
 	uint64 records;
 } ClusterWalTailObservation;
 
+/* Startup-only physical input, never a close/recovery/serving permission.
+ * Zero maxima mean no PARAMETER_CHANGE record was observed; the caller must
+ * also retain the predecessor/history/configuration requirements. */
+typedef struct ClusterWalStartupObservation {
+	ClusterWalTailObservation tail;
+	int max_connections;
+	int max_worker_processes;
+	int max_wal_senders;
+	int max_prepared_xacts;
+	int max_locks_per_xact;
+} ClusterWalStartupObservation;
+
+/* Read the root-selected independent stream from its fresh segment boundary.
+ * Unlike ordinary tail observation this accepts an actual EMPTY prefix, not
+ * an absent one. It still scans complete unpromised records. The first record
+ * must have no predecessor link. No archive/local/other-generation fallback.
+ * Caller owns immutable, nonaliasing input plus retention/isolation and root
+ * revalidation; provisional bootstrap reads grant none of those permissions.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult cluster_wal_startup_observe(const char *wal_root,
+															const ClusterWalDurablePrefixRef *ref,
+															int segment_size,
+															XLogRecPtr first_segment,
+															ClusterWalStartupObservation *out);
+
 /* Caller supplies a root-selected immutable reference and exact checkpoint
  * record start, NOT an arbitrary point at which to search for a later record.
  * This validates physical input only: the owner must hold/revalidate isolation,

@@ -11276,6 +11276,91 @@ bootstrap_pending_fixture(BootstrapFixture *f, uint32 phase, char paths[3][MAXPG
 	test_cf_mode = NoLock;
 }
 
+static void
+bootstrap_initializing_wal_fixture(BootstrapFixture *f, bool parameters, char paths[3][MAXPGPATH])
+{
+	uint8 operation_bytes[CLUSTER_WAL_STARTUP_BYTES], page[XLOG_BLCKSZ] = { 0 };
+	ControlRootImage root;
+	ClusterWalStartupImage operation;
+	ClusterWalDurablePrefixRef ref = { 0 };
+	ClusterWalDurablePrefix prefix = { 1, 0, 0, 0 };
+	uint8 encoded[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	char dir[MAXPGPATH], path[MAXPGPATH];
+	bootstrap_pending_fixture(f, CLUSTER_WAL_STARTUP_INITIALIZING, paths);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(f->before, sizeof(f->before), v2_storage, TEST_SYSID, &root),
+		0);
+	read_all_or_abort(paths[0], operation_bytes, sizeof(operation_bytes));
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_decode(operation_bytes, sizeof(operation_bytes),
+														&root, 127, &operation),
+				 0);
+	ref.claim.identity = operation.claim.identity;
+	ref.claim.database_incarnation = operation.database_incarnation;
+	ref.claim.max_config_generation = operation.config_generation;
+	sha256_bytes(operation_bytes + 1280, CLUSTER_WAL_CLAIM_V2_BYTES, ref.claim.claim_sha256);
+	ref.timeline = operation.timeline;
+	snprintf(dir, sizeof(dir), "%s/thread_128/generation_" UINT64_FORMAT "/durable_prefix",
+			 test_wal_root, ref.claim.identity.origin_owner_incarnation);
+	UT_ASSERT(mkdir(dir, 0700) == 0 || errno == EEXIST);
+	if (parameters) {
+		XLogLongPageHeaderData header = { 0 };
+		XLogRecord record = { 0 };
+		xl_parameter_change payload = { 1401, 31, 17, 9, 101, WAL_LEVEL_REPLICA, false, false };
+		uint8 *bytes = page + SizeOfXLogLongPHD;
+		header.std.xlp_magic = XLOG_PAGE_MAGIC;
+		header.std.xlp_info = XLP_LONG_HEADER;
+		header.std.xlp_tli = ref.timeline;
+		header.std.xlp_thread_id = 128;
+		header.std.xlp_pageaddr = operation.first_segment_lsn;
+		header.xlp_sysid = TEST_SYSID;
+		header.xlp_seg_size = operation.segment_size;
+		header.xlp_xlog_blcksz = XLOG_BLCKSZ;
+		memcpy(page, &header, SizeOfXLogLongPHD);
+		record.xl_tot_len = SizeOfXLogRecord + 2 + sizeof(payload);
+		record.xl_info = XLOG_PARAMETER_CHANGE;
+		record.xl_rmid = RM_XLOG_ID;
+		bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
+		bytes[SizeOfXLogRecord + 1] = sizeof(payload);
+		memcpy(bytes + SizeOfXLogRecord + 2, &payload, sizeof(payload));
+		INIT_CRC32C(record.xl_crc);
+		COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, 2 + sizeof(payload));
+		COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+		FIN_CRC32C(record.xl_crc);
+		memcpy(bytes, &record, SizeOfXLogRecord);
+		wal_segment_size = operation.segment_size;
+		v2_checkpoint_wal_path(&ref.claim.identity, operation.first_segment_lsn, ref.timeline,
+							   path);
+		write_all_or_abort(path, page, sizeof(page));
+	}
+	UT_ASSERT_EQ(cluster_wal_durable_prefix_encode(&ref, &prefix, encoded), 0);
+	snprintf(path, sizeof(path), "%s/current", dir);
+	write_all_or_abort(path, encoded, sizeof(encoded));
+}
+
+UT_TEST(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor)
+{
+	for (int has_parameters = 0; has_parameters < 2; has_parameters++) {
+		BootstrapFixture f;
+		ClusterControlBootstrapObservation out;
+		char paths[3][MAXPGPATH];
+		bootstrap_initializing_wal_fixture(&f, has_parameters != 0, paths);
+		if (ut_current_failed)
+			return;
+		/* This higher anchor is deliberately unselected before DURABLE. */
+		UT_ASSERT_EQ(unlink(paths[2]), 0);
+		UT_ASSERT_EQ(
+			cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, &out), 0);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(out.required.pending_sources, 1);
+		UT_ASSERT_EQ(out.required.max_connections, has_parameters ? 1401 : 601);
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		pfree(out.config_bytes);
+		UT_ASSERT_EQ(unlink(paths[1]), 0);
+		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
+	}
+}
+
 UT_TEST(test_bootstrap_v3_pending_is_never_missing_from_capacity)
 {
 	BootstrapFixture f;
@@ -11300,9 +11385,8 @@ UT_TEST(test_bootstrap_v3_pending_is_never_missing_from_capacity)
 		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
 	}
 	bootstrap_pending_fixture(&f, CLUSTER_WAL_STARTUP_INITIALIZING, paths);
-	/* No selected successor anchor exists yet: do not invent a sizing proof.
-	 * The interrupted native-initialization scanner must close this cut. */
-	UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+	/* Missing real PGWP is not an EMPTY prefix, even with an unselected anchor. */
+	UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
 }
 
 UT_TEST(test_bootstrap_v3_pending_objects_and_reread_remain_exact)
@@ -11702,7 +11786,8 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(227);
+	UT_PLAN(228);
+	UT_RUN(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor);
 	UT_RUN(test_v3_failure_publishers_preserve_pending_and_authenticate_native_input);
 	UT_RUN(test_v3_failure_publication_retains_old_authority_and_no_fallback);
 	UT_RUN(test_v3_checkpoint_publish_preserves_pending_and_real_wal_guards);

@@ -5,8 +5,10 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "access/xlogreader.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_wal_tail.h"
 #include "miscadmin.h"
 
@@ -28,6 +30,8 @@ typedef struct WalTailWork {
 	ClusterWalTailObservation observed;
 	XLogRecPtr checkpoint_start;
 	pg_crc32c checkpoint_crc;
+	bool startup_mode;
+	ClusterWalStartupObservation startup;
 } WalTailWork;
 
 static bool
@@ -194,6 +198,40 @@ wal_tail_paths_current(WalTailWork *work)
 	return true;
 }
 
+/* Fold every complete native parameter obligation, not only the latest one.
+ * This is early sizing evidence, not permission to apply the configuration. */
+static ClusterControlRootResult
+wal_startup_parameters(WalTailWork *work)
+{
+	XLogReaderState *reader = work->reader;
+	xl_parameter_change parameters;
+	const uint8 *data;
+	ClusterWalStartupObservation *out = &work->startup;
+
+	if (XLogRecGetRmid(reader) != RM_XLOG_ID
+		|| (XLogRecGetInfo(reader) & ~XLR_INFO_MASK) != XLOG_PARAMETER_CHANGE)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	if (XLogRecGetDataLen(reader) != sizeof(parameters) || XLogRecMaxBlockId(reader) >= 0)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	data = (const uint8 *)XLogRecGetData(reader);
+	/* Validate native bool bytes before loading them as C boolean values. */
+	if (data[offsetof(xl_parameter_change, wal_log_hints)] > 1
+		|| data[offsetof(xl_parameter_change, track_commit_timestamp)] > 1)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	memcpy(&parameters, data, sizeof(parameters));
+	if (parameters.MaxConnections <= 0 || parameters.max_worker_processes < 0
+		|| parameters.max_wal_senders < 0 || parameters.max_prepared_xacts < 0
+		|| parameters.max_locks_per_xact <= 0 || parameters.wal_level < WAL_LEVEL_MINIMAL
+		|| parameters.wal_level > WAL_LEVEL_LOGICAL)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	out->max_connections = Max(out->max_connections, parameters.MaxConnections);
+	out->max_worker_processes = Max(out->max_worker_processes, parameters.max_worker_processes);
+	out->max_wal_senders = Max(out->max_wal_senders, parameters.max_wal_senders);
+	out->max_prepared_xacts = Max(out->max_prepared_xacts, parameters.max_prepared_xacts);
+	out->max_locks_per_xact = Max(out->max_locks_per_xact, parameters.max_locks_per_xact);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 static ClusterControlRootResult
 wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr minimum)
 {
@@ -235,8 +273,10 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		= cluster_wal_durable_prefix_read(work->root, &work->ref, &work->observed.durable_prefix);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (work->observed.durable_prefix.record_start < lower
-		|| work->observed.durable_prefix.exclusive_end <= lower)
+	if (work->startup_mode && work->observed.durable_prefix.exclusive_end == 0)
+		promise_seen = true; /* Real EMPTY, never synthesized on read failure. */
+	else if (work->observed.durable_prefix.record_start < lower
+			 || work->observed.durable_prefix.exclusive_end <= lower)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (!wal_tail_paths_current(work))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
@@ -245,6 +285,13 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		CHECK_FOR_INTERRUPTS();
 		if (work->observed.records == 0 && work->reader->ReadRecPtr != lower)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (work->startup_mode) {
+			if (work->observed.records == 0 && record->xl_prev != InvalidXLogRecPtr)
+				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+			result = wal_startup_parameters(work);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				return result;
+		}
 		if (work->checkpoint_start != 0 && work->reader->ReadRecPtr == work->checkpoint_start) {
 			if (record->xl_crc != work->checkpoint_crc)
 				return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
@@ -267,7 +314,9 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 	}
 	if (work->result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return work->result;
-	if (!promise_seen || !checkpoint_seen || work->observed.complete_end < minimum)
+	if (!promise_seen || !checkpoint_seen
+		|| (!(work->startup_mode && work->observed.records == 0)
+			&& work->observed.complete_end < minimum))
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (!wal_tail_close_segment(work))
 		return work->result;
@@ -315,7 +364,7 @@ static ClusterControlRootResult
 wal_tail_observe_common(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
 						int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
 						XLogRecPtr checkpoint_start, pg_crc32c checkpoint_crc,
-						ClusterWalTailObservation *out)
+						ClusterWalTailObservation *out, ClusterWalStartupObservation *startup)
 {
 	WalTailWork *work;
 	ClusterControlRootResult result;
@@ -325,7 +374,8 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalDurablePrefixRef *
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
 	if (wal_root == NULL || wal_root[0] == '\0' || !IsValidWalSegSize(segment_size)
-		|| scan_lower == 0 || minimum_end <= scan_lower
+		|| scan_lower == 0 || minimum_end < scan_lower
+		|| (startup == NULL && minimum_end == scan_lower)
 		|| (checkpoint_start != 0
 			&& (checkpoint_start < scan_lower || checkpoint_start >= minimum_end))
 		|| cluster_wal_durable_prefix_encode(ref, &empty, validation)
@@ -334,6 +384,7 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalDurablePrefixRef *
 	work = palloc0(sizeof(*work));
 	work->root = wal_root;
 	work->ref = *ref;
+	work->startup_mode = startup != NULL;
 	work->checkpoint_start = checkpoint_start;
 	work->checkpoint_crc = checkpoint_crc;
 	work->segment_fd = -1;
@@ -351,8 +402,13 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalDurablePrefixRef *
 	}
 	PG_END_TRY();
 	result = wal_tail_release(work, result);
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		*out = work->observed;
+		if (startup != NULL) {
+			*startup = work->startup;
+			startup->tail = work->observed;
+		}
+	}
 	pfree(work);
 	return result;
 }
@@ -362,7 +418,24 @@ cluster_wal_tail_observe(const char *wal_root, const ClusterWalDurablePrefixRef 
 						 int segment_size, XLogRecPtr scan_lower, XLogRecPtr minimum_end,
 						 ClusterWalTailObservation *out)
 {
-	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end, 0, 0, out);
+	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end, 0, 0, out,
+								   NULL);
+}
+
+ClusterControlRootResult
+cluster_wal_startup_observe(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+							int segment_size, XLogRecPtr first_segment,
+							ClusterWalStartupObservation *out)
+{
+	ClusterWalTailObservation tail;
+	XLogRecPtr lower;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || !IsValidWalSegSize(segment_size) || first_segment == 0
+		|| first_segment % segment_size != 0 || first_segment > UINT64_MAX - SizeOfXLogLongPHD)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	lower = first_segment + SizeOfXLogLongPHD;
+	return wal_tail_observe_common(wal_root, ref, segment_size, lower, lower, 0, 0, &tail, out);
 }
 
 /* PGRAC: bind the root-selected checkpoint, not only the final PGWP record.
@@ -379,5 +452,5 @@ cluster_wal_tail_observe_checkpoint(const char *wal_root, const ClusterWalDurabl
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	}
 	return wal_tail_observe_common(wal_root, ref, segment_size, scan_lower, minimum_end,
-								   checkpoint_start, checkpoint_crc, out);
+								   checkpoint_start, checkpoint_crc, out, NULL);
 }

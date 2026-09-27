@@ -12,6 +12,8 @@
 
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_tail.h"
+#include "common/cryptohash.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
@@ -464,6 +466,47 @@ read_source_capacity(BootstrapReadWork *work, const char *shared_root, const cha
 }
 
 static ClusterControlRootResult
+read_initializing_capacity(BootstrapReadWork *work, const char *wal_root,
+						   ClusterControlRecoveryCapacity *required)
+{
+	ClusterWalDurablePrefixRef ref = { 0 };
+	ClusterWalStartupObservation input;
+	ClusterControlRootResult result;
+	pg_cryptohash_ctx *ctx;
+	bool hashed;
+
+	ref.claim.identity = work->pending.claim.identity;
+	ref.claim.database_incarnation = work->pending.database_incarnation;
+	ref.claim.max_config_generation = work->pending.config_generation;
+	ref.timeline = work->pending.timeline;
+	/* These exact embedded claim bytes were authenticated with the selected
+	 * PGWG. Hash them before opening raw WAL descriptors; never derive the
+	 * expected claim from whatever happens to be in the generation directory. */
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	hashed
+		= pg_cryptohash_init(ctx) >= 0
+		  && pg_cryptohash_update(ctx, work->startup + 1280, CLUSTER_WAL_CLAIM_V2_BYTES) >= 0
+		  && pg_cryptohash_final(ctx, ref.claim.claim_sha256, sizeof(ref.claim.claim_sha256)) >= 0;
+	pg_cryptohash_free(ctx);
+	if (!hashed)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_wal_startup_observe(wal_root, &ref, work->pending.segment_size,
+										 work->pending.first_segment_lsn, &input);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+#define STARTUP_MAX(field) required->field = Max(required->field, input.field)
+	STARTUP_MAX(max_connections);
+	STARTUP_MAX(max_worker_processes);
+	STARTUP_MAX(max_wal_senders);
+	STARTUP_MAX(max_prepared_xacts);
+	STARTUP_MAX(max_locks_per_xact);
+#undef STARTUP_MAX
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
 read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
 				ClusterControlRecoveryCapacity *required)
 {
@@ -513,8 +556,11 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			 * published checkpoint still imposes physical recovery requirements.
 			 * Before that checkpoint, an INITIALIZING WAL scan is required; never
 			 * substitute the predecessor anchor or count it as clean/empty. */
-			if (work->pending.phase == CLUSTER_WAL_STARTUP_INITIALIZING)
-				return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			if (work->pending.phase == CLUSTER_WAL_STARTUP_INITIALIZING) {
+				result = read_initializing_capacity(work, wal_root, required);
+				if (result != 0)
+					return result;
+			}
 			if (work->pending.phase == CLUSTER_WAL_STARTUP_DURABLE) {
 				result = read_source_capacity(work, shared_root, wal_root,
 											  &work->pending.successor.snapshot,

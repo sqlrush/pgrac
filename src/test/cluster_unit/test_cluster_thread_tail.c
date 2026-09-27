@@ -730,10 +730,188 @@ UT_TEST(pre2_cannot_use_flat_decoy_when_exact_generation_missing)
 	UT_ASSERT_EQ(end, 0);
 }
 
+static ClusterControlRootResult
+startup_observe(ClusterWalStartupObservation *out)
+{
+	int before = fd_count();
+	ClusterControlRootResult result
+		= cluster_wal_startup_observe(scratch, &ref, wal_segment_size, wal_segment_size, out);
+	UT_ASSERT_EQ(fd_count(), before);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		ClusterWalStartupObservation zero = { 0 };
+		UT_ASSERT(memcmp(out, &zero, sizeof(zero)) == 0);
+	}
+	return result;
+}
+
+/* Independent native payload/CRC fixture; the production scanner and PGWP
+ * codec do not manufacture the expected parameter maxima. */
+static ClusterWalDurablePrefix
+parameter_record(XLogRecPtr start, XLogRecPtr previous, xl_parameter_change parameters,
+				 bool short_payload)
+{
+	size_t len = sizeof(parameters) - (short_payload ? 1 : 0);
+	uint8 bytes[SizeOfXLogRecord + 2 + sizeof(parameters)] = { 0 };
+	XLogRecord record = { 0 };
+	ClusterWalDurablePrefix prefix = record_write(generation, start, previous, len);
+	record.xl_tot_len = SizeOfXLogRecord + 2 + len;
+	record.xl_prev = previous;
+	record.xl_rmid = RM_XLOG_ID;
+	record.xl_info = XLOG_PARAMETER_CHANGE;
+	bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
+	bytes[SizeOfXLogRecord + 1] = len;
+	memcpy(bytes + SizeOfXLogRecord + 2, &parameters, len);
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, 2 + len);
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	memcpy(bytes, &record, SizeOfXLogRecord);
+	overwrite(start, bytes, record.xl_tot_len);
+	prefix.record_crc = record.xl_crc;
+	return prefix;
+}
+
+UT_TEST(startup_empty_is_actual_input_not_ordinary_tail_authority)
+{
+	ClusterWalStartupObservation out;
+	ClusterWalTailObservation ordinary;
+	fixture();
+	prefix_write((ClusterWalDurablePrefix){ 1, 0, 0, 0 });
+	UT_ASSERT_EQ(startup_observe(&out), 0);
+	UT_ASSERT_EQ(out.tail.durable_prefix.sequence, 1);
+	UT_ASSERT_EQ(out.tail.records, 0);
+	UT_ASSERT_EQ(out.tail.complete_end, 0);
+	UT_ASSERT_EQ(out.max_connections, 0);
+	UT_ASSERT_EQ(observe(wal_segment_size + 200, &ordinary), CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+}
+
+UT_TEST(startup_scans_complete_records_even_after_empty_promise)
+{
+	ClusterWalStartupObservation out;
+	xl_parameter_change parameters = { 900, 31, 17, 9, 81, WAL_LEVEL_REPLICA, false, true };
+	ClusterWalDurablePrefix first, next;
+	fixture();
+	first = parameter_record(wal_segment_size + SizeOfXLogLongPHD, 0, parameters, false);
+	parameters.MaxConnections = 300;
+	parameters.max_worker_processes = 61;
+	parameters.max_wal_senders = 4;
+	parameters.max_prepared_xacts = 2;
+	parameters.max_locks_per_xact = 101;
+	next = parameter_record(first.exclusive_end, first.record_start, parameters, false);
+	prefix_write((ClusterWalDurablePrefix){ 1, 0, 0, 0 });
+	UT_ASSERT_EQ(startup_observe(&out), 0);
+	UT_ASSERT_EQ(out.tail.records, 2);
+	UT_ASSERT_EQ(out.tail.complete_end, next.exclusive_end);
+	UT_ASSERT_EQ(out.tail.durable_prefix.exclusive_end, 0);
+	UT_ASSERT_EQ(out.max_connections, 900);
+	UT_ASSERT_EQ(out.max_worker_processes, 61);
+	UT_ASSERT_EQ(out.max_wal_senders, 17);
+	UT_ASSERT_EQ(out.max_prepared_xacts, 9);
+	UT_ASSERT_EQ(out.max_locks_per_xact, 101);
+	prefix_write(first);
+	UT_ASSERT_EQ(startup_observe(&out), 0);
+	UT_ASSERT_EQ(out.tail.durable_prefix.exclusive_end, first.exclusive_end);
+	UT_ASSERT_EQ(out.max_worker_processes, 61);
+}
+
+UT_TEST(startup_empty_does_not_hide_foreign_wal_or_bad_geometry)
+{
+	ClusterWalStartupObservation out, zero = { 0 };
+	uint64 other_sysid = 7654321;
+	fixture();
+	(void)base_record();
+	prefix_write((ClusterWalDurablePrefix){ 1, 0, 0, 0 });
+	overwrite(wal_segment_size + offsetof(XLogLongPageHeaderData, xlp_sysid), &other_sysid,
+			  sizeof(other_sysid));
+	UT_ASSERT_EQ(startup_observe(&out), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	for (int fault = 0; fault < 4; fault++) {
+		int size = fault == 0 ? 0 : wal_segment_size;
+		XLogRecPtr start = fault == 1 ? 0 : fault == 2 ? wal_segment_size + 1 : UINT64_MAX;
+		memset(&out, 0xff, sizeof(out));
+		UT_ASSERT_EQ(cluster_wal_startup_observe(scratch, &ref, size, start, &out),
+					 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	}
+}
+
+UT_TEST(startup_rejects_nonindependent_stream_and_malformed_parameters)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterWalStartupObservation out;
+		xl_parameter_change parameters = { 900, 31, 17, 9, 81, WAL_LEVEL_REPLICA, false, true };
+		ClusterWalDurablePrefix first;
+		fixture();
+		if (fault == 1)
+			parameters.MaxConnections = -1;
+		else if (fault == 2)
+			parameters.max_locks_per_xact = 0;
+		else if (fault == 3)
+			parameters.wal_level = WAL_LEVEL_LOGICAL + 1;
+		first = parameter_record(wal_segment_size + SizeOfXLogLongPHD,
+								 fault == 0 ? wal_segment_size - 128 : 0, parameters, fault == 4);
+		prefix_write(first);
+		UT_ASSERT(startup_observe(&out) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	}
+}
+
+UT_TEST(startup_preserves_physical_failure_and_cancellation_boundaries)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		ClusterWalStartupObservation out;
+		ClusterWalDurablePrefix first;
+		char path[MAXPGPATH];
+		fixture();
+		first = base_record();
+		if (fault == 0) {
+			segment_path(first.record_start, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 1)
+			UT_ASSERT_EQ(unlink(prefix_path), 0);
+		else if (fault == 2) {
+			changed_prefix = record_write(generation, first.exclusive_end, first.record_start, 40);
+			changed_prefix.sequence = first.sequence + 1;
+			read_action = 2;
+		} else if (fault == 3)
+			read_action = 1;
+		else if (fault == 4) {
+			mutation_position = first.record_start;
+			read_action = 4;
+		} else {
+			snprintf(path, sizeof(path), "%s/pgrac_thread.claim", generation);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		UT_ASSERT(startup_observe(&out) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	}
+	{
+		static ClusterWalStartupObservation out;
+		ClusterWalStartupObservation zero = { 0 };
+		sigjmp_buf caller;
+		int before;
+		fixture();
+		(void)base_record();
+		before = fd_count();
+		PG_exception_stack = &caller;
+		if (sigsetjmp(caller, 0) == 0) {
+			read_action = 5;
+			(void)startup_observe(&out);
+			UT_ASSERT(false);
+		} else {
+			UT_ASSERT_EQ(fd_count(), before);
+			UT_ASSERT(memcmp(&out, &zero, sizeof(out)) == 0);
+		}
+		PG_exception_stack = NULL;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(30);
+	UT_RUN(startup_empty_is_actual_input_not_ordinary_tail_authority);
+	UT_RUN(startup_scans_complete_records_even_after_empty_promise);
+	UT_RUN(startup_empty_does_not_hide_foreign_wal_or_bad_geometry);
+	UT_RUN(startup_rejects_nonindependent_stream_and_malformed_parameters);
+	UT_RUN(startup_preserves_physical_failure_and_cancellation_boundaries);
 	UT_RUN(legacy_reader_still_works_without_shared_config);
 	UT_RUN(pre2_cannot_accept_lost_promised_suffix_from_legacy_reader);
 	UT_RUN(pre2_cannot_use_flat_decoy_when_exact_generation_missing);
