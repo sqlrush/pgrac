@@ -229,6 +229,33 @@ cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expec
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *out_token);
 
+/* PGRAC: normal-stop observation only, not thread close or PI-retirement
+ * permission. Authenticate the raw selected anchor and exact durable prefix
+ * under CF-S. LMON/LMS poll the original release; unavailable clears output.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef enum ClusterControlRootStopPhase {
+	CLUSTER_CONTROL_ROOT_STOP_UNKNOWN = 0,
+	CLUSTER_CONTROL_ROOT_STOP_ACTIVE,
+	CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT
+} ClusterControlRootStopPhase;
+
+typedef struct ClusterControlRootStopObservation {
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootStopPhase phase;
+	/* One CF interval; zero entries are not serving observations. Not cached
+	 * authority and not a replacement for the consumer's formation check. */
+	struct {
+		uint64 incarnation;
+		int64 claim_created_at;
+		ClusterControlRootStopPhase phase;
+	} members[CLUSTER_CONTROL_ROOT_RECORD_COUNT];
+} ClusterControlRootStopObservation;
+
+extern ClusterControlRootResult
+cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 admitted_incarnation,
+										ClusterControlRootStopObservation *out);
+
 /* PGRAC: exact failed-writer control publishers. The request is a carrier,
  * not authority: each operation authenticates its opaque formation/fence
  * owners and the current physical v2 root. OPEN clears the checkpoint's old

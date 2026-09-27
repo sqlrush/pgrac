@@ -374,6 +374,11 @@ typedef struct ClusterPhase1FullStopPlan {
 	uint64 absolute_deadline_us;
 	int64 own_wal_started_at;
 	uint64 member_incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+	/* PGRAC: per-poll selected-root observations, not shared or wire state.
+	 * Consumers recheck formation before using them; a new poll rereads root.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	bool pre2_root_observed;
+	uint8 pre2_member_phase[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
 } ClusterPhase1FullStopPlan;
 
 typedef enum ClusterNormalStopPhase {

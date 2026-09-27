@@ -816,6 +816,7 @@ test_cluster_normal_stop_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.
 
 test_cluster_normal_stop: test_cluster_normal_stop.c test_cluster_normal_stop_cleaner.inc test_cluster_normal_stop_sinval.inc test_cluster_normal_stop_lms.inc unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_lms_data_plane.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h $(CLUSTER_CLEAN_LEAVE_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \

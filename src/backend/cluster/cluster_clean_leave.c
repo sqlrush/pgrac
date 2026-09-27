@@ -81,6 +81,7 @@
 #include "cluster/cluster_voting_disk_io.h" /* leave-slot raw I/O + CLUSTER_VOTING_SLOT_BYTES */
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster_control_root_private.h"
 
 /*
  * The shmem state must stay small enough to embed cheaply (§2.1).  The §2.5
@@ -237,12 +238,10 @@ cluster_normal_stop_native_wal_mode(void)
 }
 
 static ClusterNormalStopPollResult
-cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_shutdown_suppressed,
-										uint64 expected_epoch, bool allow_native,
-										ClusterPhase1FullStopPlan *out, const char **reason_out)
+cl_full_stop_capture_formation_only(bool require_shutdown_suppressed, uint64 expected_epoch,
+									ClusterPhase1FullStopPlan *out, const char **reason_out)
 {
 	ClusterFormationSnapshotV1 formation;
-	ClusterWalStateSlot wal_slot;
 	ReconfigEvent empty_event;
 	uint16 own_thread;
 	int node;
@@ -312,6 +311,83 @@ cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_
 	if (formation.victim_incarnation != out->member_incarnations[cluster_node_id]
 		|| cluster_qvotec_get_self_incarnation() != out->member_incarnations[cluster_node_id])
 		goto invalid;
+	out->epoch = formation.local_epoch;
+	if (reason_out != NULL)
+		*reason_out = "NORMAL_STOP_FORMATION_READY";
+	return CLUSTER_NORMAL_STOP_READY;
+
+invalid:
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return CLUSTER_NORMAL_STOP_INVALID;
+}
+
+static ClusterNormalStopPollResult
+cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_shutdown_suppressed,
+										uint64 expected_epoch, bool allow_native,
+										ClusterPhase1FullStopPlan *out, const char **reason_out)
+{
+	ClusterWalStateSlot wal_slot;
+	ClusterNormalStopPollResult result;
+	uint16 own_thread = cluster_wal_thread_id();
+	const char *reason;
+
+	result = cl_full_stop_capture_formation_only(require_shutdown_suppressed, expected_epoch, out,
+												 reason_out);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		return result;
+	if (cluster_shared_config) {
+		ClusterControlRootStopObservation selected;
+		ClusterPhase1FullStopPlan after;
+		ClusterControlRootResult root_result;
+		ClusterControlRootStopPhase expected_phase;
+
+		reason = "NORMAL_STOP_SELECTED_ROOT_PHASE";
+		if (expected_wal_state != CLUSTER_WAL_SLOT_STATE_ACTIVE
+			&& expected_wal_state != CLUSTER_WAL_SLOT_STATE_STOPPED)
+			goto invalid;
+		expected_phase = expected_wal_state == CLUSTER_WAL_SLOT_STATE_ACTIVE
+							 ? CLUSTER_CONTROL_ROOT_STOP_ACTIVE
+							 : CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+		root_result = cluster_control_root_v2_stop_phase_read(
+			own_thread, out->member_incarnations[cluster_node_id], &selected);
+		if (root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE) {
+			if (reason_out != NULL)
+				*reason_out = "NORMAL_STOP_SELECTED_ROOT_PENDING";
+			return CLUSTER_NORMAL_STOP_PENDING;
+		}
+		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+			|| selected.phase != expected_phase
+			|| selected.snapshot.identity.origin_thread_id != own_thread
+			|| selected.snapshot.identity.origin_node_id != cluster_node_id
+			|| selected.snapshot.identity.origin_owner_incarnation
+				   != out->member_incarnations[cluster_node_id]
+			|| selected.snapshot.identity.thread_claim_created_at <= 0)
+			goto invalid;
+		/* The CF poll may span service iterations. Close that interval with
+		 * the original formation, never a second asynchronous root request. */
+		result = cl_full_stop_capture_formation_only(require_shutdown_suppressed, expected_epoch,
+													 &after, reason_out);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		if (out->epoch != after.epoch
+			|| memcmp(out->member_incarnations, after.member_incarnations,
+					  sizeof(out->member_incarnations))
+				   != 0)
+			goto invalid;
+		for (int node = 0; node < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; node++) {
+			if (selected.members[node].incarnation != out->member_incarnations[node]
+				|| selected.members[node].claim_created_at <= 0
+				|| (selected.members[node].phase != CLUSTER_CONTROL_ROOT_STOP_ACTIVE
+					&& selected.members[node].phase != CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT))
+				goto invalid;
+			out->pre2_member_phase[node] = (uint8)selected.members[node].phase;
+		}
+		out->own_wal_started_at = selected.snapshot.identity.thread_claim_created_at;
+		out->pre2_root_observed = true;
+		return CLUSTER_NORMAL_STOP_READY;
+	}
 	if (allow_native && cluster_normal_stop_native_wal_mode()) {
 		reason = "NORMAL_STOP_NATIVE_CONTROL_INVALID";
 		if ((expected_wal_state != CLUSTER_WAL_SLOT_STATE_ACTIVE
@@ -327,7 +403,6 @@ cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_
 			goto invalid;
 		out->own_wal_started_at = wal_slot.started_at;
 	}
-	out->epoch = formation.local_epoch;
 	if (reason_out != NULL)
 		*reason_out = "NORMAL_STOP_FORMATION_READY";
 	return CLUSTER_NORMAL_STOP_READY;
@@ -417,6 +492,18 @@ cl_phase1_full_stop_capture_source_phase(const ClusterPhase1FullStopPlan *curren
 		return false;
 	*source_active_out = false;
 	*source_stopped_out = false;
+	if (cluster_shared_config) {
+		/* This carrier was authenticated with our own phase under one CF
+		 * interval. Starting another peer CF read here would starve LMON's
+		 * next local-identity read. Callers recheck the same formation. */
+		if (!current->pre2_root_observed)
+			return false;
+		*source_active_out
+			= current->pre2_member_phase[source_node] == CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
+		*source_stopped_out
+			= current->pre2_member_phase[source_node] == CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+		return *source_active_out || *source_stopped_out;
+	}
 	source_thread = cluster_wal_thread_id_for(true, source_node);
 	if (source_thread == 0
 		|| cluster_wal_state_read_slot(source_thread, &source_slot) != CLUSTER_WAL_SLOT_OK
@@ -703,6 +790,42 @@ cluster_normal_stop_failure(void)
 			   : (ClusterNormalStopFailure)pg_atomic_read_u32(&cl_normal_stop->failure_reason);
 }
 
+/* PGRAC: close the blocking observation interval with live formation and
+ * the original semantic identity. This does not mint or refresh root evidence.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterNormalStopPollResult
+cl_normal_stop_recheck_observation(const ClusterSemanticActivationRecord *open,
+								   const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
+								   const ClusterPhase1FullStopPlan *sample,
+								   ClusterPhase1FullStopPlan *out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result;
+	ClusterPhase1FullStopPlan after;
+	uint64 incarnations[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
+
+	result = cluster_semantic_normal_stop_match(open, root, incarnations, reason_out);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		return result;
+	result = cl_full_stop_capture_formation_only(cluster_normal_stop_requested(),
+												 open->transition_epoch, &after, reason_out);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		return result;
+	result = cluster_semantic_normal_stop_match(open, root, incarnations, reason_out);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		return result;
+	if (sample->epoch != after.epoch
+		|| memcmp(sample->member_incarnations, after.member_incarnations,
+				  sizeof(sample->member_incarnations))
+			   != 0
+		|| memcmp(after.member_incarnations, incarnations, sizeof(incarnations)) != 0) {
+		if (reason_out != NULL)
+			*reason_out = "NORMAL_STOP_IDENTITY_CHANGED_DURING_SAMPLE";
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	*out = *sample;
+	return CLUSTER_NORMAL_STOP_READY;
+}
+
 static ClusterNormalStopPollResult
 cl_normal_stop_observe_identity(const ClusterSemanticActivationRecord *open,
 								const uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES],
@@ -720,6 +843,19 @@ cl_normal_stop_observe_identity(const ClusterSemanticActivationRecord *open,
 		if (reason_out != NULL)
 			*reason_out = "NORMAL_STOP_WAL_THREAD_IDENTITY";
 		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	if (cluster_shared_config) {
+		result = cluster_semantic_normal_stop_match(open, root, incarnations, reason_out);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		result = cl_full_stop_capture_formation_identity(wal_state, cluster_normal_stop_requested(),
+														 open->transition_epoch, true, &before,
+														 reason_out);
+		if (result != CLUSTER_NORMAL_STOP_READY)
+			return result;
+		if (memcmp(before.member_incarnations, incarnations, sizeof(incarnations)) != 0)
+			return CLUSTER_NORMAL_STOP_INVALID;
+		return cl_normal_stop_recheck_observation(open, root, &before, out, reason_out);
 	}
 	for (pass = 0; pass < 2; pass++) {
 		ClusterPhase1FullStopPlan *sample = pass == 0 ? &before : &after;
@@ -958,7 +1094,9 @@ cl_normal_stop_identity_poll(bool post_checkpoint, ClusterPhase1FullStopPlan *ou
 		goto done;
 	/* Publication is not permission: revalidate after dropping the leave
 	 * lock, then compare the still-immutable binding before returning it. */
-	result = cl_normal_stop_observe_identity(&open, root, wal_state, &verified, &reason);
+	result = cluster_shared_config
+				 ? cl_normal_stop_recheck_observation(&open, root, &observed, &verified, &reason)
+				 : cl_normal_stop_observe_identity(&open, root, wal_state, &verified, &reason);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		goto done;
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
@@ -985,6 +1123,52 @@ done:
 	}
 	if (reason_out != NULL)
 		*reason_out = result == CLUSTER_NORMAL_STOP_READY ? "NORMAL_STOP_IDENTITY_READY" : reason;
+	return result;
+}
+
+/* A second root read inside one service operation would continually restart
+ * its async CF lifetime. Retain the one observation only on this call stack;
+ * still resample formation/semantic identity before acknowledging anything. */
+static ClusterNormalStopPollResult
+cl_normal_stop_identity_recheck(bool post_checkpoint, const ClusterPhase1FullStopPlan *sample,
+								ClusterPhase1FullStopPlan *out, const char **reason_out)
+{
+	ClusterSemanticActivationRecord open;
+	uint8 root[CLUSTER_UNDO_ROOT_DESCRIPTOR_BYTES];
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	bool bound;
+
+	if (!cluster_shared_config)
+		return cl_normal_stop_identity_poll(post_checkpoint, out, reason_out);
+	if (sample == NULL || out == NULL || cl_state == NULL || cl_normal_stop == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| !sample->pre2_root_observed
+		|| sample->pre2_member_phase[cluster_node_id]
+			   != (post_checkpoint ? CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT
+								   : CLUSTER_CONTROL_ROOT_STOP_ACTIVE))
+		goto done;
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	open = cl_normal_stop->open_record;
+	memcpy(root, cl_normal_stop->root_descriptor, sizeof(root));
+	bound = cl_normal_stop_bound_identity_matches(&open, root, sample);
+	LWLockRelease(&cl_state->lock);
+	if (!bound)
+		goto done;
+	result = cl_normal_stop_recheck_observation(&open, root, sample, out, reason_out);
+	if (result != CLUSTER_NORMAL_STOP_READY)
+		goto done;
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE
+		|| cl_state->leaving_node_id != -1
+		|| pg_atomic_read_u32(&cl_state->phase) != CLUSTER_LEAVE_IDLE
+		|| (pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+			&& pg_atomic_read_u32(&cl_state->shutdown_driven) != 1)
+		|| !cl_normal_stop_bound_identity_matches(&open, root, out))
+		result = CLUSTER_NORMAL_STOP_INVALID;
+	LWLockRelease(&cl_state->lock);
+done:
+	if (result == CLUSTER_NORMAL_STOP_INVALID)
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 	return result;
 }
 
@@ -1271,7 +1455,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 		 * it must never be used as an ACTIVE frontend-cut request. */
 		if (!source_active || source_stopped)
 			continue;
-		result = cl_normal_stop_identity_poll(false, &verified, NULL);
+		result = cl_normal_stop_identity_recheck(false, &observed, &verified, NULL);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return;
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
@@ -1305,7 +1489,7 @@ cl_normal_stop_fronts_lmon_tick(void)
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 			return;
 		}
-		result = cl_normal_stop_identity_poll(false, &verified, NULL);
+		result = cl_normal_stop_identity_recheck(false, &observed, &verified, NULL);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return;
 		LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
@@ -1451,7 +1635,8 @@ cl_normal_stop_fronts_lmon_tick(void)
 
 static ClusterNormalStopPollResult
 cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
-							ClusterNormalStopModuleObservation *observation)
+							ClusterNormalStopModuleObservation *observation,
+							const ClusterPhase1FullStopPlan *current_observation)
 {
 	static const char *const names[]
 		= { "ACTIVE_WRITE", "TT_SLOT", "UNDO_BLOCK0", "CTRC", "PCM",	  "GCS", "SF",
@@ -1481,7 +1666,10 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
 		return CLUSTER_NORMAL_STOP_INVALID;
 	}
-	result = cl_normal_stop_identity_poll(post_checkpoint, &identity, &reason);
+	result = cluster_shared_config && current_observation != NULL
+				 ? cl_normal_stop_identity_recheck(post_checkpoint, current_observation, &identity,
+												   &reason)
+				 : cl_normal_stop_identity_poll(post_checkpoint, &identity, &reason);
 	if (result != CLUSTER_NORMAL_STOP_READY) {
 		observation->reason = reason;
 		return result;
@@ -1602,9 +1790,9 @@ cl_normal_stop_modules_poll(bool post_checkpoint, bool require_pi_retired,
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 		return aggregate;
 	}
-	/* The final original WAL/formation/root sample closes the observation
-	 * interval, not the producer cut. Neither check mutates a module. */
-	result = cl_normal_stop_identity_poll(post_checkpoint, &identity, &reason);
+	/* Close the observation interval, not the producer cut. PRE2 rechecks
+	 * formation/semantic identity without replacing this call's CF result. */
+	result = cl_normal_stop_identity_recheck(post_checkpoint, &identity, &identity, &reason);
 	if (result != CLUSTER_NORMAL_STOP_READY) {
 		observation->module = "IDENTITY";
 		observation->reason = reason;
@@ -1622,7 +1810,7 @@ ClusterNormalStopPollResult
 cluster_normal_stop_modules_poll(bool post_checkpoint,
 								 ClusterNormalStopModuleObservation *observation)
 {
-	return cl_normal_stop_modules_poll(post_checkpoint, true, observation);
+	return cl_normal_stop_modules_poll(post_checkpoint, true, observation, NULL);
 }
 
 static bool
@@ -1765,7 +1953,7 @@ cluster_normal_stop_post_checkpoint_arm(ClusterPhase1FullStopPlan *plan,
 		return result;
 	/* Actual own STOPPED, dirty/IO and every other post-checkpoint owner
 	 * remain mandatory. PI is retired only AFTER all peers prove this cut. */
-	result = cl_normal_stop_modules_poll(true, false, observation);
+	result = cl_normal_stop_modules_poll(true, false, observation, NULL);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	now = (uint64)GetCurrentTimestamp();
@@ -1830,7 +2018,8 @@ cl_normal_stop_post_peer_matches(const ClusterPhase1FullStopPlan *plan, int peer
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
 		return false;
 	}
-	return cl_normal_stop_identity_poll(true, &verified, NULL) == CLUSTER_NORMAL_STOP_READY;
+	return cl_normal_stop_identity_recheck(true, plan, &verified, NULL)
+		   == CLUSTER_NORMAL_STOP_READY;
 }
 
 static bool
@@ -1849,7 +2038,10 @@ cl_normal_stop_post_send(const ClusterPhase1FullStopPlan *plan, uint32 expected,
 			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 		return false;
 	}
-	result = cl_normal_stop_modules_poll(true, false, NULL);
+	/* Keep the outer tick's root observation, but not its owner census.
+	 * Every send still rechecks all owners and the live semantic/formation
+	 * identity. Starting a second async CF read here would starve sends. */
+	result = cl_normal_stop_modules_poll(true, false, NULL, plan);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return false;
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
@@ -2192,7 +2384,7 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 	LWLockRelease(&cl_state->lock);
 	if (!valid)
 		return CLUSTER_NORMAL_STOP_INVALID;
-	result = cl_normal_stop_modules_poll(true, armed, observation);
+	result = cl_normal_stop_modules_poll(true, armed, observation, NULL);
 	if (result != CLUSTER_NORMAL_STOP_READY)
 		return result;
 	if (!armed) {

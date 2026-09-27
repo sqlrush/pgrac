@@ -6251,6 +6251,165 @@ UT_TEST(test_v2_canonical_no_missing_claim_or_lockfree_fallback)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_v2_stop_phase_uses_selected_raw_anchor_without_closing)
+{
+	for (int stopped = 0; stopped < 2; stopped++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate;
+		ClusterControlRootStopObservation out;
+		int writes;
+
+		if (stopped)
+			v2_stop_observation_fixture(before, &self, &candidate);
+		else
+			v2_retention_fixture(before, &self, &candidate);
+		writes = test_durable_rename_calls;
+		UT_ASSERT_EQ(cluster_control_root_v2_stop_phase_read(self.origin_thread_id,
+															 self.origin_owner_incarnation, &out),
+					 0);
+		UT_ASSERT_EQ(out.phase, stopped ? CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT
+										: CLUSTER_CONTROL_ROOT_STOP_ACTIVE);
+		UT_ASSERT(cluster_control_root_identity_equal(&out.snapshot.identity, &self));
+		UT_ASSERT_EQ(out.snapshot.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+		UT_ASSERT_EQ(out.members[0].phase, out.phase);
+		UT_ASSERT_EQ(out.members[127].phase, CLUSTER_CONTROL_ROOT_STOP_ACTIVE);
+		UT_ASSERT_EQ(out.members[127].incarnation, 226);
+		UT_ASSERT_EQ(out.members[127].claim_created_at, 12472);
+		UT_ASSERT_EQ(out.members[1].phase, CLUSTER_CONTROL_ROOT_STOP_UNKNOWN);
+		UT_ASSERT(!v2_zero(&out.token, sizeof(out.token)));
+		UT_ASSERT_EQ(test_durable_rename_calls, writes);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+	}
+}
+
+UT_TEST(test_v2_stop_phase_refuses_wrong_owner_missing_claim_or_late_prefix)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate;
+		ClusterControlRootStopObservation out;
+		char path[MAXPGPATH];
+		uint64 incarnation;
+
+		v2_stop_observation_fixture(before, &self, &candidate);
+		incarnation = self.origin_owner_incarnation;
+		if (fault == 0)
+			incarnation++;
+		else if (fault == 1) {
+			v2_claim_path(&self, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 2) {
+			test_checkpoint_prefix.sequence++;
+			test_checkpoint_prefix.record_start = test_checkpoint_end;
+			test_checkpoint_prefix.exclusive_end += 80;
+			v2_checkpoint_prefix_write();
+		} else if (fault == 3) {
+			/* A recovery-required writer is not an active stop participant. */
+			before[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+			v2_checksums(before);
+			v2_write_roots(before);
+		} else {
+			ClusterControlRootIdentity peer = self;
+			peer.origin_thread_id = 128;
+			peer.origin_owner_incarnation = 226;
+			v2_claim_path(&peer, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_NE(
+			cluster_control_root_v2_stop_phase_read(self.origin_thread_id, incarnation, &out),
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+	}
+}
+
+UT_TEST(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound)
+{
+	for (int mutation = 0; mutation < 5; mutation++) {
+		uint8 before[66048];
+		ClusterControlRootIdentity self;
+		ControlFileData candidate;
+		ClusterControlRootStopObservation out;
+		ClusterControlRootSnapshot ordinary;
+		ClusterControlRootReadToken token;
+		int locks;
+		uint64 incarnation;
+
+		v2_stop_observation_fixture(before, &self, &candidate);
+		MyBackendType = B_LMON;
+		test_cf_release_confirmed = false;
+		incarnation = self.origin_owner_incarnation;
+		if (mutation == 4) {
+			UT_ASSERT_EQ(cluster_control_root_read_canonical_discovered(self.origin_thread_id,
+																		&ordinary, &token),
+						 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		} else {
+			UT_ASSERT_EQ(
+				cluster_control_root_v2_stop_phase_read(self.origin_thread_id, incarnation, &out),
+				CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+		}
+		locks = test_cf_lock_calls;
+		test_cf_release_confirmed = true;
+		if (mutation == 1)
+			incarnation++;
+		if (mutation == 2)
+			test_control_generation++;
+		if (mutation == 3) {
+			UT_ASSERT_EQ(cluster_control_root_read_canonical_discovered(self.origin_thread_id,
+																		&ordinary, &token),
+						 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			UT_ASSERT(v2_zero(&ordinary, sizeof(ordinary)) && v2_zero(&token, sizeof(token)));
+		} else {
+			UT_ASSERT_EQ(
+				cluster_control_root_v2_stop_phase_read(self.origin_thread_id, incarnation, &out),
+				mutation == 0 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+							  : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+			if (mutation == 0)
+				UT_ASSERT_EQ(out.phase, CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT);
+			else
+				UT_ASSERT(v2_zero(&out, sizeof(out)));
+		}
+		UT_ASSERT_EQ(test_cf_lock_calls, locks);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		MyBackendType = B_INVALID;
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_v2_stop_phase_error_cleans_cf_and_cannot_return_evidence)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate;
+	static ClusterControlRootStopObservation out;
+	volatile bool caught = false;
+	v2_retention_fixture(before, &self, &candidate);
+	test_throw_root_read = true;
+	memset(&out, 0xa5, sizeof(out));
+	PG_TRY();
+	{
+		(void)cluster_control_root_v2_stop_phase_read(self.origin_thread_id,
+													  self.origin_owner_incarnation, &out);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_root_read = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	v2_assert_primary_unchanged(before);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_v2_service_read_waits_for_exact_retirement_before_output)
 {
 	uint8 bytes[66048];
@@ -9088,7 +9247,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(169);
+	UT_PLAN(173);
 	UT_RUN(test_history_encoder_matches_literal_empty_and_full);
 	UT_RUN(test_history_encoder_rejects_invalid_records_without_partial_output);
 	UT_RUN(test_history_stage_installs_exact_readable_object);
@@ -9210,6 +9369,10 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_canonical_no_missing_claim_or_lockfree_fallback);
 	UT_RUN(test_v2_canonical_unconfirmed_release_is_fatal);
 	UT_RUN(test_v2_service_read_waits_for_exact_retirement_before_output);
+	UT_RUN(test_v2_stop_phase_uses_selected_raw_anchor_without_closing);
+	UT_RUN(test_v2_stop_phase_refuses_wrong_owner_missing_claim_or_late_prefix);
+	UT_RUN(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound);
+	UT_RUN(test_v2_stop_phase_error_cleans_cf_and_cannot_return_evidence);
 	UT_RUN(test_v2_service_pending_observation_is_bound_to_input_and_cut);
 	UT_RUN(test_v2_service_immediate_release_also_rechecks_observation_cut);
 	UT_RUN(test_v2_canonical_foreign_absent_and_cf_refusals);

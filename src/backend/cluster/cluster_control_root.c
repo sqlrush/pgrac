@@ -1674,7 +1674,10 @@ cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity 
 typedef struct CanonicalAuxRead {
 	bool pending;
 	bool has_expected;
+	bool stop_observation;
 	uint16 thread;
+	uint64 admitted_incarnation;
+	ClusterControlRootStopObservation stop;
 	uint64 cookie, epoch, generation, routing;
 	int32 master;
 	ClusterControlRootIdentity expected;
@@ -1707,6 +1710,7 @@ canonical_aux_capture_cut(CanonicalAuxRead *read)
 static bool
 canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 					 ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
+					 uint64 admitted_incarnation, ClusterControlRootStopObservation *stop,
 					 ClusterControlRootResult *result)
 {
 	CanonicalAuxRead now = { 0 };
@@ -1726,6 +1730,8 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 	}
 	valid
 		= pending->thread == thread && pending->has_expected == (expected != NULL)
+		  && pending->stop_observation == (stop != NULL)
+		  && pending->admitted_incarnation == admitted_incarnation
 		  && (expected == NULL || cluster_control_root_identity_equal(&pending->expected, expected))
 		  && canonical_aux_capture_cut(&now) && now.epoch == pending->epoch
 		  && now.generation == pending->generation && now.master == pending->master
@@ -1738,10 +1744,79 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 				*out = pending->snapshot;
 			if (token != NULL)
 				*token = pending->token;
+			if (stop != NULL) {
+				*stop = pending->stop;
+			}
 		}
 	}
 	memset(pending, 0, sizeof(*pending));
 	return true;
+}
+
+/* The projected native view deliberately says IN_PRODUCTION while the
+ * writer is OPEN. A normal-stop consumer must inspect the selected raw
+ * anchor instead; neither that projection nor a legacy STOPPED slot proves
+ * a shutdown checkpoint. Caller owns CF-S throughout these exact reads. */
+static ClusterControlRootResult
+stop_phase_v2_locked(const ControlRootImage *root, uint32 index, const ControlFileData *view,
+					 uint64 admitted_incarnation, ClusterControlRootStopPhase *phase)
+{
+	const ClusterControlRootSnapshot *record = &root->records[index];
+	ClusterRecoveryAnchorRefV2 anchor = { 0 };
+	ClusterWalDurablePrefixRef ref = { 0 };
+	ClusterWalDurablePrefix prefix;
+	ControlFileData raw;
+	ClusterControlRootResult result;
+
+	*phase = CLUSTER_CONTROL_ROOT_STOP_UNKNOWN;
+	if (record->identity.origin_node_id != (int32)index
+		|| record->identity.origin_owner_incarnation != admitted_incarnation
+		|| record->identity.thread_claim_created_at <= 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+		|| (root->header.v2.serving[index / 64] & (UINT64_C(1) << (index % 64))) == 0)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	anchor.identity = record->identity;
+	anchor.database_incarnation = root->header.v2.database_incarnation;
+	anchor.max_config_generation = root->header.v2.config_generation;
+	anchor.anchor_generation = root->refs[index].anchor_generation;
+	memcpy(anchor.anchor_sha256, root->refs[index].anchor_sha256, 32);
+	memcpy(anchor.claim_sha256, root->refs[index].claim_sha256, 32);
+	result = cluster_recovery_anchor_v2_read_locked(&anchor, view, &raw);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (raw.state == DB_IN_PRODUCTION) {
+		*phase = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (raw.state != DB_SHUTDOWNED || raw.checkPointCopy.redo != raw.checkPoint
+		|| record->checkpoint_lower_lsn != raw.checkPoint
+		|| (record->root_flags
+			& (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+			   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID))
+			   != (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+				   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID)
+		|| record->tail_tli != record->checkpoint_tli
+		|| record->tail_last_record_lsn != raw.checkPoint
+		|| record->tail_last_record_crc32c != record->checkpoint_record_crc32c
+		|| record->validated_tail_lsn_exclusive <= raw.checkPoint)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	ref.claim.identity = record->identity;
+	ref.claim.database_incarnation = root->header.v2.database_incarnation;
+	ref.claim.max_config_generation = root->header.v2.config_generation;
+	memcpy(ref.claim.claim_sha256, root->refs[index].claim_sha256, 32);
+	ref.timeline = record->checkpoint_tli;
+	result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &ref, &prefix);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (prefix.exclusive_end != record->validated_tail_lsn_exclusive
+		|| prefix.record_start != record->tail_last_record_lsn
+		|| prefix.record_crc != record->tail_last_record_crc32c)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	*phase = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 /* PGRAC: recovery owners may inspect a failed peer, not only their own live
@@ -1752,9 +1827,11 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
  */
 static ClusterControlRootResult
 read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_identity,
-				  ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token)
+				  ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
+				  uint64 admitted_incarnation, ClusterControlRootStopObservation *stop)
 {
 	ControlRootImage *root;
+	ControlRootImage *peer_root;
 	ControlFileData thread;
 	ClusterControlRootIdentity expected;
 	ClusterControlRootFileToken discovered, file_token;
@@ -1766,13 +1843,17 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 	uint32 index;
 	bool auxiliary = canonical_aux_actor();
 	CanonicalAuxRead continuation = { 0 };
+	ClusterControlRootStopObservation stop_sample = { 0 };
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (token != NULL)
 		memset(token, 0, sizeof(*token));
+	if (stop != NULL)
+		memset(stop, 0, sizeof(*stop));
 	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
-		|| thread_id == 0 || thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		|| thread_id == 0 || thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| (stop != NULL && (admitted_incarnation == 0 || admitted_incarnation == UINT64_MAX)))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!current_storage_uuid(storage_uuid))
 		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
@@ -1789,13 +1870,16 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 	result = storage_contract_check(storage_uuid, true);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (auxiliary && canonical_aux_finish(thread_id, expected_identity, out, token, &result))
+	if (auxiliary
+		&& canonical_aux_finish(thread_id, expected_identity, out, token, admitted_incarnation,
+								stop, &result))
 		return result;
 	if (cluster_cf_held(ExclusiveLock)
 		|| (cluster_cf_held(ShareLock) && !(auxiliary && cluster_cf_acquire_pending(ShareLock))))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	index = thread_id - 1;
 	root = palloc(sizeof(*root));
+	peer_root = stop != NULL ? palloc(sizeof(*peer_root)) : NULL;
 	result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	PG_TRY();
 	{
@@ -1824,9 +1908,48 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 						if (expected_identity == NULL
 							&& memcmp(&discovered, &file_token, sizeof(file_token)) != 0)
 							result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-						else
+						else {
+							if (stop != NULL) {
+								/* Keep the original selected root immutable. Each
+								 * serving thread must authenticate its own claim,
+								 * anchor and phase under this same CF interval. */
+								for (uint32 peer = 0; peer < CLUSTER_CONTROL_ROOT_RECORD_COUNT;
+									 peer++) {
+									ControlFileData peer_view;
+									ClusterControlRootFileToken peer_token;
+									const ClusterControlRootIdentity *id
+										= &root->records[peer].identity;
+									if ((root->header.v2.serving[peer / 64]
+										 & (UINT64_C(1) << (peer % 64)))
+										== 0)
+										continue;
+									result = cluster_control_root_v2_read_thread_locked(
+										id, peer_root, &peer_view, &peer_token);
+									if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+										&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+										break;
+									if (memcmp(&peer_token, &file_token, sizeof(peer_token)) != 0) {
+										result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+										break;
+									}
+									result = stop_phase_v2_locked(peer_root, peer, &peer_view,
+																  id->origin_owner_incarnation,
+																  &stop_sample.members[peer].phase);
+									if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+										break;
+									stop_sample.members[peer].incarnation
+										= id->origin_owner_incarnation;
+									stop_sample.members[peer].claim_created_at
+										= id->thread_claim_created_at;
+								}
+								if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+									result = stop_phase_v2_locked(root, index, &thread,
+																  admitted_incarnation,
+																  &stop_sample.phase);
+							}
 							make_read_token(root, thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
 											&selected);
+						}
 					}
 				}
 			}
@@ -1834,6 +1957,8 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 				continuation.cookie = cluster_cf_owner_cookie(ShareLock);
 				continuation.thread = thread_id;
 				continuation.has_expected = expected_identity != NULL;
+				continuation.stop_observation = stop != NULL;
+				continuation.admitted_incarnation = admitted_incarnation;
 				if (expected_identity != NULL)
 					continuation.expected = *expected_identity;
 				continuation.result = result;
@@ -1841,6 +1966,11 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 					continuation.snapshot = root->records[index];
 					continuation.token = selected;
+					if (stop != NULL) {
+						stop_sample.snapshot = root->records[index];
+						stop_sample.token = selected;
+						continuation.stop = stop_sample;
+					}
 				}
 			}
 			result = release_cf(ShareLock, result);
@@ -1853,7 +1983,8 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 				if (continuation.cookie != 0) {
 					continuation.pending = true;
 					canonical_aux_read = continuation;
-					(void)canonical_aux_finish(thread_id, expected_identity, out, token, &result);
+					(void)canonical_aux_finish(thread_id, expected_identity, out, token,
+											   admitted_incarnation, stop, &result);
 				}
 			}
 		}
@@ -1864,6 +1995,8 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 
 		if (held)
 			cleanup = release_cf(ShareLock, cleanup);
+		if (peer_root != NULL)
+			pfree(peer_root);
 		pfree(root);
 		if (!auxiliary && cleanup == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
 			elog(FATAL, "could not confirm canonical control-root read-lock cleanup");
@@ -1876,11 +2009,27 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 			*out = root->records[index];
 		if (token != NULL)
 			*token = selected;
+		if (stop != NULL) {
+			stop_sample.snapshot = root->records[index];
+			stop_sample.token = selected;
+			*stop = stop_sample;
+		}
 	}
+	if (peer_root != NULL)
+		pfree(peer_root);
 	pfree(root);
 	if (result == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
 		elog(FATAL, "could not confirm canonical control-root read-lock release");
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 admitted_incarnation,
+										ClusterControlRootStopObservation *out)
+{
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return read_canonical_v2(thread, NULL, NULL, NULL, admitted_incarnation, out);
 }
 
 ClusterControlRootResult
@@ -1911,7 +2060,8 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
 	if (cluster_shared_config) {
 		if (!strong)
 			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-		return read_canonical_v2(origin_thread_id, expected_identity, out_snapshot, out_token);
+		return read_canonical_v2(origin_thread_id, expected_identity, out_snapshot, out_token, 0,
+								 NULL);
 	}
 	if (expected_identity != NULL)
 		memcpy(expected_storage, expected_identity->storage_uuid, 16);
@@ -1992,7 +2142,7 @@ cluster_control_root_read_canonical_discovered(uint16 origin_thread_id,
 	/* PRE2 discovery is inside the same owned CF interval as the exact
 	 * object reads, never a legacy lock-free bootstrap permission. */
 	if (cluster_shared_config)
-		return read_canonical_v2(origin_thread_id, NULL, out_snapshot, out_token);
+		return read_canonical_v2(origin_thread_id, NULL, out_snapshot, out_token, 0, NULL);
 	memset(&bootstrap, 0, sizeof(bootstrap));
 	result = cluster_control_root_read_canonical(
 		origin_thread_id, NULL, CLUSTER_CONTROL_ROOT_READ_BOOTSTRAP_VALIDATE, &bootstrap, NULL);
@@ -2079,7 +2229,7 @@ cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id,
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	thread_id = (uint16)(old_node_id + 1);
 	if (cluster_shared_config) {
-		result = read_canonical_v2(thread_id, NULL, &snapshot, &token);
+		result = read_canonical_v2(thread_id, NULL, &snapshot, &token, 0, NULL);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 			if (snapshot.identity.origin_node_id != old_node_id)

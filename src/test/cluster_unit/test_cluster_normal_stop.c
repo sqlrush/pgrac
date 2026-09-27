@@ -26,6 +26,8 @@
 #include "cluster/cluster_ges_dedup.h"
 #include "cluster/cluster_native_lock_probe.h"
 #include "cluster/cluster_ic_tier1.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_lock_owner.h"
 #include "storage/smgr.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
@@ -72,6 +74,23 @@ static bool lmon_late_actor;
 static void (*checkpoint_wait_action)(void);
 static unsigned checkpoint_waits, checkpoint_resets, checkpoint_wakes;
 static long checkpoint_previous_timeout;
+
+/* The extracted LMS loop retains its control-owner scheduling edge. Its
+ * registry/transport implementation is exercised by the control-owner tests. */
+void
+cluster_lock_owners_service_poll(void)
+{
+	if (lock_holds != 0)
+		abort();
+}
+
+void
+cluster_cf_retirement_poll(void)
+{
+	if (lock_holds != 0)
+		abort();
+}
+
 bool IsUnderPostmaster;
 bool IsPostmasterEnvironment;
 bool cluster_lmd_enabled = true;
@@ -2010,12 +2029,56 @@ static bool identity_snapshot_ok, identity_quorum, identity_suppressed, identity
 static uint64 identity_self_incarnation;
 static uint16 identity_thread;
 bool cluster_enabled;
+bool cluster_shared_config;
 char *cluster_wal_threads_dir = "/shared-wal";
 bool cluster_controlfile_shared_authority = true;
 bool cluster_merged_recovery;
 static bool native_control_stopped;
 static bool native_control_valid = true;
 static unsigned native_control_reads;
+static ClusterControlRootResult identity_pre2_result;
+static unsigned identity_pre2_reads, identity_pre2_pending_reads;
+static bool identity_pre2_alternate_pending;
+static uint8 identity_pre2_phase[4];
+static int identity_pre2_change;
+
+/* CF/file/PGWP behavior is exercised by test_cluster_control_root. This
+ * explicit boundary drives the real normal-stop consumer across pending,
+ * exact completion and an identity change while that observation blocks. */
+ClusterControlRootResult
+cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 incarnation,
+										ClusterControlRootStopObservation *out)
+{
+	if (lock_holds != 0)
+		abort();
+	identity_pre2_reads++;
+	memset(out, 0, sizeof(*out));
+	if (identity_pre2_alternate_pending && (identity_pre2_reads % 2) == 1)
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (identity_pre2_pending_reads > 0) {
+		identity_pre2_pending_reads--;
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
+	if (identity_pre2_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return identity_pre2_result;
+	out->snapshot.identity.origin_thread_id = thread;
+	out->snapshot.identity.origin_node_id = thread - 1;
+	out->snapshot.identity.origin_owner_incarnation = incarnation;
+	out->snapshot.identity.thread_claim_created_at = 555;
+	out->phase = identity_pre2_phase[thread - 1];
+	for (int node = 0; node < 4; node++) {
+		out->members[node].incarnation = 100 + node;
+		out->members[node].claim_created_at = 555;
+		out->members[node].phase = identity_pre2_phase[node];
+	}
+	if (identity_pre2_change == 1)
+		identity_formation.membership.last_admitted_incarnation[1]++;
+	if (identity_pre2_change == 2)
+		identity_root[0] ^= 1;
+	if (identity_pre2_change == 3)
+		out->members[1].incarnation++;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
 
 /* Actual xlog observer is tested separately. Only its native control/IO
  * boundary is supplied here; the real leave owner and protocol execute. */
@@ -2231,6 +2294,13 @@ static void
 reset_identity(void)
 {
 	int node;
+	cluster_shared_config = false;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	identity_pre2_reads = identity_pre2_pending_reads = 0;
+	identity_pre2_alternate_pending = false;
+	identity_pre2_change = 0;
+	for (node = 0; node < 4; node++)
+		identity_pre2_phase[node] = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
 	reset_region();
 	cluster_clean_leave_shmem_init();
 	IsUnderPostmaster = true;
@@ -2316,6 +2386,89 @@ UT_TEST(test_identity_lmon_binds_once_without_request_or_ack)
 	UT_ASSERT_EQ(cl_normal_stop_identity_poll(true, &out, NULL), CLUSTER_NORMAL_STOP_READY);
 	UT_ASSERT_EQ(identity_reads, 2);
 	UT_ASSERT_EQ(memcmp(&before, cl_normal_stop, sizeof(before)), 0);
+}
+
+/* PGRAC: PRE2 never publishes the old flat WAL slot. A perfectly valid
+ * legacy slot cannot stand in for missing root-selected writer evidence.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_pre2_local_identity_cannot_borrow_legacy_wal_phase)
+{
+	for (int stopped = 0; stopped < 2; ++stopped) {
+		ClusterPhase1FullStopPlan out;
+		ClusterNormalStopPollResult result;
+		reset_identity();
+		cluster_shared_config = true;
+		identity_wal.state
+			= stopped ? CLUSTER_WAL_SLOT_STATE_STOPPED : CLUSTER_WAL_SLOT_STATE_ACTIVE;
+		result = cl_full_stop_capture_formation_identity(
+			identity_wal.state, false, identity_open.transition_epoch, true, &out, NULL);
+		cluster_shared_config = false;
+		UT_ASSERT(result != CLUSTER_NORMAL_STOP_READY);
+		UT_ASSERT_EQ(identity_wal_reads, 0);
+	}
+}
+
+UT_TEST(test_pre2_peer_cannot_borrow_legacy_stopped_slot)
+{
+	ClusterPhase1FullStopPlan current;
+	bool active = false, stopped = false, valid;
+	reset_identity();
+	memset(&current, 0, sizeof(current));
+	current.epoch = identity_open.transition_epoch;
+	for (int peer = 0; peer < 4; ++peer)
+		current.member_incarnations[peer]
+			= identity_formation.membership.last_admitted_incarnation[peer];
+	identity_peer_wal[1].state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	cluster_shared_config = true;
+	valid = cl_phase1_full_stop_capture_source_phase(&current, 1, &active, &stopped);
+	cluster_shared_config = false;
+	UT_ASSERT(!valid || (!active && !stopped));
+	UT_ASSERT_EQ(identity_wal_reads, 0);
+}
+
+UT_TEST(test_pre2_identity_async_completion_does_not_start_a_second_read)
+{
+	ClusterPhase1FullStopPlan out;
+	bool active, stopped;
+	reset_identity();
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	identity_pre2_pending_reads = 1;
+	identity_pre2_phase[1] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	UT_ASSERT_EQ(cl_normal_stop_identity_poll(false, &out, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->identity_published), 0);
+	UT_ASSERT_EQ(cl_normal_stop_identity_poll(false, &out, NULL), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(identity_pre2_reads, 2);
+	UT_ASSERT_EQ(identity_wal_reads, 0);
+	UT_ASSERT(out.pre2_root_observed);
+	UT_ASSERT(cl_phase1_full_stop_capture_source_phase(&out, 1, &active, &stopped));
+	UT_ASSERT(!active && stopped);
+	UT_ASSERT_EQ(identity_pre2_reads, 2);
+	UT_ASSERT_EQ(cl_normal_stop_identity_recheck(false, &out, &out, NULL),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(identity_pre2_reads, 2);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_identity_rechecks_formation_semantics_and_peer_incarnation)
+{
+	for (int fault = 1; fault <= 4; fault++) {
+		ClusterPhase1FullStopPlan out;
+		reset_identity();
+		cluster_shared_config = true;
+		identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		if (fault < 4)
+			identity_pre2_change = fault;
+		else
+			identity_lock_countdown = 2; /* Mutation at binding publication. */
+		UT_ASSERT_EQ(cl_normal_stop_identity_poll(false, &out, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+		UT_ASSERT_EQ(identity_pre2_reads, 1);
+		UT_ASSERT_EQ(identity_wal_reads, 0);
+		UT_ASSERT_EQ(out.own_wal_started_at, 0);
+		cluster_shared_config = false;
+	}
 }
 
 UT_TEST(test_identity_role_gaps_and_original_pristine_are_separate)
@@ -2692,6 +2845,31 @@ UT_TEST(test_front_ack_retained_until_identity_and_peer_request_without_local_dr
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->phase), CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS);
 	UT_ASSERT_EQ(cl_state->ack_bitmap[0], 2);
 	UT_ASSERT_EQ(front_ack_sends, 0);
+}
+
+UT_TEST(test_pre2_fronts_pending_then_completes_one_root_read_per_tick)
+{
+	reset_identity();
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	identity_pre2_pending_reads = 1;
+	front_peer_request(0, 1601);
+	front_peer_request(1, 1602);
+	front_peer_request(3, 1604);
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(cl_normal_stop->peer_requests_seen, 0);
+	UT_ASSERT_EQ(identity_pre2_reads, 1);
+	UT_ASSERT(cl_normal_stop_front_inbox[0].pending);
+	cl_normal_stop_fronts_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, 2);
+	UT_ASSERT_EQ(identity_wal_reads, 0);
+	UT_ASSERT_EQ(cl_normal_stop->peer_requests_seen, 11);
+	UT_ASSERT(!cl_normal_stop_front_inbox[0].pending);
+	UT_ASSERT(!cl_normal_stop_front_inbox[1].pending);
+	UT_ASSERT(!cl_normal_stop_front_inbox[3].pending);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	UT_ASSERT_EQ(front_ack_sends, 0); /* Observing peers does not sign a drain ACK. */
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_front_stale_ack_and_exact_nak_do_not_manufacture_clean)
@@ -3388,6 +3566,33 @@ UT_TEST(test_post_control_retains_early_successor_until_own_stopped_and_armed)
 	UT_ASSERT_EQ(front_last_request[0].leave_nonce, plan.attempt_nonce);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
 	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+}
+
+UT_TEST(test_pre2_post_tick_retains_one_observation_through_owner_census)
+{
+	ClusterPhase1FullStopPlan plan;
+	unsigned calls;
+	seed_at_checkpoint(&plan);
+	identity_wal.state = CLUSTER_WAL_SLOT_STATE_STOPPED;
+	UT_ASSERT_EQ(cluster_normal_stop_post_checkpoint_arm(&plan, NULL), CLUSTER_NORMAL_STOP_READY);
+	/* Switch only the I/O boundary: real post-stop scheduler/owners/send
+	 * execute below. Every new CF observation needs a later poll. */
+	cluster_shared_config = true;
+	identity_pre2_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	identity_pre2_alternate_pending = true;
+	for (int node = 0; node < 4; node++)
+		identity_pre2_phase[node] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	MyAuxProcType = LmonProcess;
+	calls = module_calls[0];
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(cl_phase1_post_stopped_request_sent[0], 0);
+	cl_normal_stop_post_lmon_tick();
+	UT_ASSERT_EQ(identity_pre2_reads, 2);
+	UT_ASSERT_EQ(cl_phase1_post_stopped_request_sent[0], 11);
+	UT_ASSERT_EQ(module_calls[0], calls + 3);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_post_control_retries_only_unadmitted_send_before_reply_permission)
@@ -4403,7 +4608,7 @@ UT_TEST(test_terminal_peer_last_real_receipt_after_disconnect_closes_without_rec
 int
 main(void)
 {
-	UT_PLAN(105);
+	UT_PLAN(111);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
@@ -4438,6 +4643,11 @@ main(void)
 	UT_RUN(test_data_actual_tick_seal_during_wait_precedes_dispatch);
 	UT_RUN(test_data_actual_tick_both_errors_clear_active_without_idle);
 	UT_RUN(test_identity_lmon_binds_once_without_request_or_ack);
+	UT_RUN(test_pre2_local_identity_cannot_borrow_legacy_wal_phase);
+	UT_RUN(test_pre2_peer_cannot_borrow_legacy_stopped_slot);
+	UT_RUN(test_pre2_identity_async_completion_does_not_start_a_second_read);
+	UT_RUN(test_pre2_identity_rechecks_formation_semantics_and_peer_incarnation);
+	UT_RUN(test_pre2_fronts_pending_then_completes_one_root_read_per_tick);
 	UT_RUN(test_identity_role_gaps_and_original_pristine_are_separate);
 	UT_RUN(test_identity_real_formation_wal_and_published_drift_refuse);
 	UT_RUN(test_identity_post_publication_recheck_cannot_sign_mixed_root);
@@ -4477,6 +4687,7 @@ main(void)
 	UT_RUN(test_checkpoint_roster_cannot_shrink_or_replace_in_same_attempt);
 	UT_RUN(test_post_control_retains_early_successor_until_own_stopped_and_armed);
 	UT_RUN(test_post_control_retries_only_unadmitted_send_before_reply_permission);
+	UT_RUN(test_pre2_post_tick_retains_one_observation_through_owner_census);
 	UT_RUN(test_post_control_old_active_duplicate_never_replaces_retained_successor);
 	UT_RUN(test_post_control_ack_waits_for_peer_stopped_request_and_original_identity);
 	UT_RUN(test_post_control_request_cannot_use_prior_arm_over_current_actor);
