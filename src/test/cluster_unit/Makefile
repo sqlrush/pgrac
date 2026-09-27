@@ -71,7 +71,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_scn test_cluster_scn_frontier test_cluster_block_format test_cluster_itl_slot \
         test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_resource_x_identity test_cluster_resource_x_node_wire test_cluster_resource_x_retry test_cluster_resource_x_handoff test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance test_cluster_tt_status test_cluster_tt_status_hint test_cluster_visibility_fork test_cluster_visibility_decide_scn test_cluster_snapshot_source test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_uba \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
-        test_cluster_xlog test_cluster_xlog_insert_end test_cluster_tt_slot test_cluster_undo_segment \
+        test_cluster_xlog test_cluster_xlog_insert_end test_cluster_subtrans_startup test_cluster_tt_slot test_cluster_undo_segment \
         test_cluster_epoch test_cluster_epoch_ballot_codec test_cluster_fence test_cluster_reconfig test_cluster_replacement_episode test_cluster_replacement_request test_cluster_replacement_wire test_cluster_undo_root_descriptor test_cluster_marker_async \
         test_cluster_ges test_cluster_ges_reply_wait test_cluster_grd_outbound test_cluster_grd test_cluster_grd_starvation test_cluster_lmd test_cluster_lmd_graph test_cluster_lmd_wait_state test_cluster_cancel_token test_cluster_lmd_probe_collector test_cluster_lock_acquire test_cluster_advisory \
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
@@ -372,7 +372,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_transport test_cluster_cr_nati
 		test_cluster_replacement_episode \
 		test_cluster_replacement_request \
 		test_cluster_undo_root_descriptor \
-		test_cluster_xlog_insert_end \
+		test_cluster_xlog_insert_end test_cluster_subtrans_startup \
 		test_cluster_undo_block0_current \
 		test_cluster_gcs_block_dedup_r4_route test_cluster_r4_route_policy \
 		test_cluster_r4_lms_controls test_cluster_r4_slot_reservation \
@@ -2249,6 +2249,13 @@ test_cluster_xlog_insert_end: test_cluster_xlog_insert_end.c unit_test.h \
 		-DBUFMGR_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_XLOG_INSERT_END_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(PTHREAD_LIBS) -o $@
+
+# PGRAC: actual native startup body; SLRU/locks are explicit test boundaries.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_subtrans_startup: test_cluster_subtrans_startup.c unit_test.h \
+		$(top_srcdir)/src/backend/access/transam/subtrans.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		$< $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # test_cluster_guc additionally links cluster_guc.o + cluster_elog.o
 # (the test stubs DefineCustomIntVariable so no PG backend is needed).

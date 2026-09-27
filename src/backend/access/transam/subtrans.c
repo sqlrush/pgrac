@@ -24,6 +24,10 @@
  *
  * src/backend/access/transam/subtrans.c
  *
+ * PGRAC: shared-origin clean startup preserves retained parentage instead of
+ * applying the single-instance page reset. It does not grant retention or
+ * mutation authority. Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -34,6 +38,11 @@
 #include "pg_trace.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "access/xlogutils.h"
+#include "cluster/cluster_guc.h"
+#include "miscadmin.h"
+#endif
 
 /*
  * Defines for SubTrans page sizes.  A page is the same BLCKSZ as is used
@@ -251,6 +260,40 @@ StartupSUBTRANS(TransactionId oldestActiveXID)
 	FullTransactionId nextXid;
 	int			startPage;
 	int			endPage;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config) {
+		TransactionId next = XidFromFullTransactionId(ShmemVariableCache->nextXid);
+
+		/* Failed-origin replay must finish before this clean-successor cut.
+		 * Prepared transactions and hot standby cannot borrow it. InRecovery
+		 * must also be false so a missing SLRU page is not read as all zeroes. */
+		if (MyBackendType != B_STARTUP || InRecovery || !TransactionIdIsNormal(next)
+			|| !TransactionIdEquals(oldestActiveXID, next))
+			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("shared SUBTRANS startup requires a completed recovery input")));
+		LWLockAcquire(SubtransSLRULock, LW_EXCLUSIVE);
+		endPage = TransactionIdToPage(next);
+		SubTransCtl->shared->latest_page_number = endPage;
+		if (TransactionIdToEntry(next) != 0) {
+			int slotno = SimpleLruReadPage(SubTransCtl, endPage, false, next);
+			const TransactionId *parents
+				= (const TransactionId *)SubTransCtl->shared->page_buffer[slotno];
+
+			for (unsigned i = TransactionIdToEntry(next); i < SUBTRANS_XACTS_PER_PAGE; ++i)
+				if (TransactionIdIsValid(parents[i])) {
+					LWLockRelease(SubtransSLRULock);
+					ereport(FATAL,
+							(errcode(ERRCODE_DATA_CORRUPTED),
+							 errmsg("shared SUBTRANS startup has parentage beyond nextXid")));
+				}
+		}
+		/* At a page boundary the allocator will perform the first allocation.
+		 * Startup does not create or overwrite even an existing boundary page. */
+		LWLockRelease(SubtransSLRULock);
+		return;
+	}
+#endif
 
 	/*
 	 * Since we don't expect pg_subtrans to be valid across crashes, we
