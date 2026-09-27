@@ -48,8 +48,7 @@ typedef enum SyncRequestType
  * Which set of functions to use to handle a given request.  The values of
  * the enumerators must match the indexes of the function table in sync.c.
  */
-typedef enum SyncRequestHandler
-{
+typedef enum SyncRequestHandler {
 	SYNC_HANDLER_MD = 0,
 	SYNC_HANDLER_CLOG,
 	SYNC_HANDLER_COMMIT_TS,
@@ -58,7 +57,12 @@ typedef enum SyncRequestHandler
 #ifdef USE_PGRAC_CLUSTER
 	SYNC_HANDLER_CLUSTER_SHARED,
 #endif
-	SYNC_HANDLER_NONE
+	SYNC_HANDLER_NONE,
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: append without renumbering native handlers or NONE. Shared
+	 * origins retain SUBTRANS across restarts. Author: SqlRush. */
+	SYNC_HANDLER_CLUSTER_SUBTRANS
+#endif
 } SyncRequestHandler;
 
 /*

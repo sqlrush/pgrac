@@ -199,10 +199,17 @@ SUBTRANSShmemSize(void)
 void
 SUBTRANSShmemInit(void)
 {
+	SyncRequestHandler handler = SYNC_HANDLER_NONE;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Retained parentage is durable input, unlike native ephemeral SUBTRANS.
+	 * Use the same queued-fsync/fallback mechanism as the other SLRUs. */
+	if (cluster_shared_config)
+		handler = SYNC_HANDLER_CLUSTER_SUBTRANS;
+#endif
 	SubTransCtl->PagePrecedes = SubTransPagePrecedes;
-	SimpleLruInit(SubTransCtl, "Subtrans", NUM_SUBTRANS_BUFFERS, 0,
-				  SubtransSLRULock, "pg_subtrans",
-				  LWTRANCHE_SUBTRANS_BUFFER, SYNC_HANDLER_NONE);
+	SimpleLruInit(SubTransCtl, "Subtrans", NUM_SUBTRANS_BUFFERS, 0, SubtransSLRULock, "pg_subtrans",
+				  LWTRANCHE_SUBTRANS_BUFFER, handler);
 	SlruPagePrecedesUnitTests(SubTransCtl, SUBTRANS_XACTS_PER_PAGE);
 }
 
@@ -332,11 +339,23 @@ CheckPointSUBTRANS(void)
 	 * This is not actually necessary from a correctness point of view. We do
 	 * it merely to improve the odds that writing of dirty pages is done by
 	 * the checkpoint process and not by backends.
+	 * PGRAC shared origins are the exception: their registered sync handler
+	 * makes these writes part of the retained-input checkpoint obligation.
 	 */
 	TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_START(true);
 	SimpleLruWriteAll(SubTransCtl, true);
 	TRACE_POSTGRESQL_SUBTRANS_CHECKPOINT_DONE(true);
 }
+
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: exact own-origin route is fixed by startup qualification. The native
+ * sync consumer propagates I/O failure; no successful checkpoint on error. */
+int
+subtranssyncfiletag(const FileTag *ftag, char *path)
+{
+	return SlruSyncFileTag(SubTransCtl, ftag, path);
+}
+#endif
 
 
 /*

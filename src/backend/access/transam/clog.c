@@ -28,6 +28,9 @@
  *
  * src/backend/access/transam/clog.c
  *
+ * PGRAC: shared-origin startup verifies unused status instead of erasing
+ * conflicting retained input. Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
@@ -43,6 +46,10 @@
 #include "pgstat.h"
 #include "storage/proc.h"
 #include "storage/sync.h"
+
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 
 /*
  * Defines for CLOG page sizes.  A page is the same BLCKSZ as is used
@@ -827,6 +834,15 @@ TrimCLOG(void)
 	TransactionId xid = XidFromFullTransactionId(ShmemVariableCache->nextXid);
 	int			pageno = TransactionIdToPage(xid);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* A completed qualified input, not a guessed crash horizon, owns this
+	 * read-only startup cut. InRecovery would permit a missing SLRU page to
+	 * be fabricated as zero, so it must already have ended. */
+	if (cluster_shared_config
+		&& (MyBackendType != B_STARTUP || InRecovery || !TransactionIdIsNormal(xid)))
+		ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("shared CLOG startup requires a completed recovery input")));
+#endif
 	LWLockAcquire(XactSLRULock, LW_EXCLUSIVE);
 
 	/*
@@ -851,6 +867,20 @@ TrimCLOG(void)
 		slotno = SimpleLruReadPage(XactCtl, pageno, false, xid);
 		byteptr = XactCtl->shared->page_buffer[slotno] + byteno;
 
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config) {
+			bool unused = ((unsigned char)*byteptr & ~((1 << bshift) - 1)) == 0;
+
+			for (int i = 1; unused && i < BLCKSZ - byteno; i++)
+				unused = byteptr[i] == 0;
+			LWLockRelease(XactSLRULock);
+			if (!unused)
+				ereport(FATAL,
+						(errcode(ERRCODE_DATA_CORRUPTED),
+						 errmsg("shared CLOG startup has transaction status beyond nextXid")));
+			return;
+		}
+#endif
 		/* Zero so-far-unused positions in the current byte */
 		*byteptr &= (1 << bshift) - 1;
 		/* Zero the rest of the page */
