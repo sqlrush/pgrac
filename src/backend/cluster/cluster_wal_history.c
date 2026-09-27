@@ -66,7 +66,7 @@ history_close_dirs(HistoryDirs *dirs, ClusterControlRootResult *result)
 
 /* No allocation, mkdir, path traversal through symlinks or authority claim. */
 static ClusterControlRootResult
-history_open_dirs(uint32 node, HistoryDirs *out)
+history_open_dirs(uint32 node, bool staging, HistoryDirs *out)
 {
 	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
@@ -97,10 +97,12 @@ history_open_dirs(uint32 node, HistoryDirs *out)
 	out->objects = fds[3];
 	fds[3] = -1;
 	out->objects_stat = st;
-	out->staging = openat(out->objects, ".staging", flags);
-	if (out->staging < 0 || fstat(out->staging, &out->staging_stat) != 0
-		|| !history_owned(&out->staging_stat, true))
-		goto done;
+	if (staging) {
+		out->staging = openat(out->objects, ".staging", flags);
+		if (out->staging < 0 || fstat(out->staging, &out->staging_stat) != 0
+			|| !history_owned(&out->staging_stat, true))
+			goto done;
+	}
 	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 done:
 	for (unsigned i = 0; i < lengthof(fds); i++)
@@ -164,18 +166,19 @@ history_hash(pg_cryptohash_ctx *ctx, const uint8 *bytes, size_t len, uint8 hash[
 }
 
 static ClusterControlRootResult
-history_read_at(int dir, const char *name, const ClusterWalHistoryStage *stage, bool staging,
-				uint8 *bytes, pg_cryptohash_ctx *ctx)
+history_read_at(int dir, const char *name, const ClusterWalHistoryStage *stage, bool check_inode,
+				bool sync_file, uint8 *bytes, pg_cryptohash_ctx *ctx)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	struct stat st;
 	uint8 hash[32], extra;
 	size_t used = 0;
 	ssize_t n;
-	/* Native pg_fsync requires a writable regular-file descriptor. Staging
-	 * readback is read-only; the formal object must reestablish durability. */
-	int fd = openat(
-		dir, name, (staging ? O_RDONLY : O_RDWR) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	/* Native pg_fsync requires a writable regular-file descriptor. Only the
+	 * installer reestablishes durability; evidence readers never write. */
+	int fd
+		= openat(dir, name,
+				 (sync_file ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
 
 	if (fd < 0) {
 		if (errno == ENOENT)
@@ -184,7 +187,8 @@ history_read_at(int dir, const char *name, const ClusterWalHistoryStage *stage, 
 	}
 	if (fstat(fd, &st) != 0 || !history_owned(&st, false))
 		goto done;
-	if (staging && ((uint64)st.st_dev != stage->file_dev || (uint64)st.st_ino != stage->file_ino)) {
+	if (check_inode
+		&& ((uint64)st.st_dev != stage->file_dev || (uint64)st.st_ino != stage->file_ino)) {
 		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		goto done;
 	}
@@ -215,7 +219,7 @@ history_read_at(int dir, const char *name, const ClusterWalHistoryStage *stage, 
 	}
 	/* Equal bytes at an existing path do not prove an earlier operation synced
 	 * them. Reestablish file durability before certifying its directory entry. */
-	if (!staging && pg_fsync(fd) != 0)
+	if (sync_file && pg_fsync(fd) != 0)
 		goto done;
 	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 done:
@@ -271,7 +275,7 @@ cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
 	}
 	pg_cryptohash_free(ctx);
 	history_names(&stage, formal, temp);
-	result = history_open_dirs(origin_node, &dirs);
+	result = history_open_dirs(origin_node, true, &dirs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		pfree(bytes);
 		return result;
@@ -334,7 +338,7 @@ cluster_wal_history_install(ClusterWalHistoryStage *stage)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	}
 	history_names(stage, formal, temp);
-	result = history_open_dirs(stage->origin_node, &dirs);
+	result = history_open_dirs(stage->origin_node, true, &dirs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	if (!history_dirs_match(&dirs, stage)) {
@@ -342,7 +346,7 @@ cluster_wal_history_install(ClusterWalHistoryStage *stage)
 		goto done;
 	}
 	if (stage->state == HISTORY_STAGED) {
-		result = history_read_at(dirs.staging, temp, stage, true, staged, ctx);
+		result = history_read_at(dirs.staging, temp, stage, true, false, staged, ctx);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
 		if (linkat(dirs.staging, temp, dirs.objects, formal, 0) != 0 && errno != EEXIST) {
@@ -350,7 +354,7 @@ cluster_wal_history_install(ClusterWalHistoryStage *stage)
 			goto done;
 		}
 	}
-	result = history_read_at(dirs.objects, formal, stage, false, installed, ctx);
+	result = history_read_at(dirs.objects, formal, stage, false, true, installed, ctx);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	if (stage->state == HISTORY_STAGED && memcmp(staged, installed, stage->length) != 0) {
@@ -391,7 +395,7 @@ cluster_wal_history_discard(ClusterWalHistoryStage *stage)
 	if (!enableFsync || !history_stage_valid(stage))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	history_names(stage, formal, temp);
-	result = history_open_dirs(stage->origin_node, &dirs);
+	result = history_open_dirs(stage->origin_node, true, &dirs);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!history_dirs_match(&dirs, stage)) {
@@ -415,5 +419,86 @@ done:
 	history_close_dirs(&dirs, &result);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		memset(stage, 0, sizeof(*stage));
+	return result;
+}
+
+/* PGRAC: only the selected immutable object is consumed. This is evidence,
+ * not publication, recovery completion, old-writer isolation or WAL reuse.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterControlRootResult
+cluster_wal_history_read_locked(const ControlRootImage *root, uint32 node,
+								ClusterWalHistoryImage *out)
+{
+	ClusterControlRootResult result;
+	ClusterWalHistoryStage selected = { 0 };
+	HistoryDirs dirs, current;
+	pg_cryptohash_ctx *ctx;
+	struct stat st;
+	uint8 *bytes;
+	char formal[112], unused[40];
+	uintptr_t a = (uintptr_t)root, b = (uintptr_t)out;
+	bool alias
+		= root != NULL && out != NULL && (a <= b ? b - a < sizeof(*root) : a - b < sizeof(*out));
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || root == NULL || node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (root->header.format_version != 2)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (!root->present[node] || root->refs[node].history_generation == 0)
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (!history_nonzero(root->refs[node].history_sha256, 32))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	selected.generation = root->refs[node].history_generation;
+	memcpy(selected.sha256, root->refs[node].history_sha256, 32);
+	history_names(&selected, formal, unused);
+	bytes = palloc(CLUSTER_WAL_HISTORY_MAX_BYTES);
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL) {
+		pfree(bytes);
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	result = history_open_dirs(node, false, &dirs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (fstatat(dirs.objects, formal, &st, AT_SYMLINK_NOFOLLOW) != 0) {
+		result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	if (!history_owned(&st, false)) {
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	if (st.st_size < CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
+		|| st.st_size > CLUSTER_WAL_HISTORY_MAX_BYTES) {
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		goto done;
+	}
+	selected.length = st.st_size;
+	selected.file_dev = st.st_dev;
+	selected.file_ino = st.st_ino;
+	result = history_read_at(dirs.objects, formal, &selected, true, false, bytes, ctx);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	result = history_open_dirs(node, false, &current);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (dirs.objects_stat.st_dev != current.objects_stat.st_dev
+			|| dirs.objects_stat.st_ino != current.objects_stat.st_ino
+			|| !history_exact_entry(current.objects, formal, &selected)))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	history_close_dirs(&current, &result);
+done:
+	history_close_dirs(&dirs, &result);
+	pg_cryptohash_free(ctx);
+	/* No open descriptor survives a decoder allocation/error. */
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_control_root_v2_history_decode(bytes, selected.length, root, node, out);
+	pfree(bytes);
 	return result;
 }

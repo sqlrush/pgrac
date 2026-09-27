@@ -144,6 +144,12 @@ cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
 extern ClusterControlRootResult cluster_wal_history_install(ClusterWalHistoryStage *stage);
 extern ClusterControlRootResult cluster_wal_history_discard(ClusterWalHistoryStage *stage);
 
+/* Exact read-only consumption under existing clusterwide CF-S/X. No staging
+ * directory or write permission required; refusal clears the whole output. */
+extern ClusterControlRootResult cluster_wal_history_read_locked(const ControlRootImage *root,
+																uint32 origin_node,
+																ClusterWalHistoryImage *out);
+
 /* Memory-only codec.  No file I/O, migration, publication or startup authority.
  * Decode refuses v1 and clears the entire output on failure.  Encode emits
  * canonical v2 bytes from the decoded fields, or clears bytes on failure.

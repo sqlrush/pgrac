@@ -1754,6 +1754,82 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 	return true;
 }
 
+/* PGRAC: the exact persistent tail is required for current and historical
+ * clean records alike; a selected shutdown anchor alone is insufficient.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+shutdown_v2_record_prefix(const ControlRootImage *root, const ClusterControlRootSnapshot *record,
+						  const ControlRootRecordRefsV2 *refs, const ControlFileData *raw)
+{
+	ClusterWalDurablePrefixRef ref = { 0 };
+	ClusterWalDurablePrefix prefix;
+	ClusterControlRootResult result;
+
+	if (raw->state != DB_SHUTDOWNED || raw->checkPointCopy.redo != raw->checkPoint
+		|| record->checkpoint_lower_lsn != raw->checkPoint
+		|| (record->root_flags
+			& (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+			   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID))
+			   != (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+				   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID)
+		|| record->tail_tli != record->checkpoint_tli
+		|| record->tail_last_record_lsn != raw->checkPoint
+		|| record->tail_last_record_crc32c != record->checkpoint_record_crc32c
+		|| record->validated_tail_lsn_exclusive <= raw->checkPoint)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	ref.claim.identity = record->identity;
+	ref.claim.database_incarnation = root->header.v2.database_incarnation;
+	ref.claim.max_config_generation = root->header.v2.config_generation;
+	memcpy(ref.claim.claim_sha256, refs->claim_sha256, 32);
+	ref.timeline = record->checkpoint_tli;
+	result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &ref, &prefix);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (prefix.exclusive_end != record->validated_tail_lsn_exclusive
+		|| prefix.record_start != record->tail_last_record_lsn
+		|| prefix.record_crc != record->tail_last_record_crc32c)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* The selected record may be retained history or a configured non-serving
+ * peer. Do not impose the current serving roster on its old writer identity,
+ * and do not infer recovery-terminal proof from a lifecycle enum. */
+static ClusterControlRootResult
+closed_v2_record_locked(const ControlRootImage *root, const ClusterControlRootSnapshot *record,
+						const ControlRootRecordRefsV2 *refs, const ControlFileData *common)
+{
+	ClusterRecoveryAnchorRefV2 anchor = { 0 };
+	ClusterWalThreadClaimRefV2 claim_ref = { 0 };
+	ClusterWalThreadClaimV2 claim;
+	ControlFileData raw;
+	ClusterControlRootResult result;
+
+	if (record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	claim_ref.identity = record->identity;
+	claim_ref.database_incarnation = root->header.v2.database_incarnation;
+	claim_ref.max_config_generation = root->header.v2.config_generation;
+	memcpy(claim_ref.claim_sha256, refs->claim_sha256, 32);
+	result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &claim_ref, &claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	anchor.identity = record->identity;
+	anchor.database_incarnation = root->header.v2.database_incarnation;
+	anchor.max_config_generation = root->header.v2.config_generation;
+	anchor.anchor_generation = refs->anchor_generation;
+	memcpy(anchor.anchor_sha256, refs->anchor_sha256, 32);
+	memcpy(anchor.claim_sha256, refs->claim_sha256, 32);
+	result = cluster_recovery_anchor_v2_read_locked(&anchor, common, &raw);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_recovery_anchor_v2_thread_state(&anchor, record, &raw);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	return shutdown_v2_record_prefix(root, record, refs, &raw);
+}
+
 /* The projected native view deliberately says IN_PRODUCTION while the
  * writer is OPEN. A normal-stop consumer must inspect the selected raw
  * anchor instead; neither that projection nor a legacy STOPPED slot proves
@@ -1764,8 +1840,6 @@ stop_phase_v2_locked(const ControlRootImage *root, uint32 index, const ControlFi
 {
 	const ClusterControlRootSnapshot *record = &root->records[index];
 	ClusterRecoveryAnchorRefV2 anchor = { 0 };
-	ClusterWalDurablePrefixRef ref = { 0 };
-	ClusterWalDurablePrefix prefix;
 	ControlFileData raw;
 	ClusterControlRootResult result;
 
@@ -1798,30 +1872,9 @@ stop_phase_v2_locked(const ControlRootImage *root, uint32 index, const ControlFi
 		*phase = CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
-	if (raw.state != DB_SHUTDOWNED || raw.checkPointCopy.redo != raw.checkPoint
-		|| record->checkpoint_lower_lsn != raw.checkPoint
-		|| (record->root_flags
-			& (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-			   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID))
-			   != (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
-				   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID)
-		|| record->tail_tli != record->checkpoint_tli
-		|| record->tail_last_record_lsn != raw.checkPoint
-		|| record->tail_last_record_crc32c != record->checkpoint_record_crc32c
-		|| record->validated_tail_lsn_exclusive <= raw.checkPoint)
-		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
-	ref.claim.identity = record->identity;
-	ref.claim.database_incarnation = root->header.v2.database_incarnation;
-	ref.claim.max_config_generation = root->header.v2.config_generation;
-	memcpy(ref.claim.claim_sha256, root->refs[index].claim_sha256, 32);
-	ref.timeline = record->checkpoint_tli;
-	result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &ref, &prefix);
+	result = shutdown_v2_record_prefix(root, record, &root->refs[index], &raw);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (prefix.exclusive_end != record->validated_tail_lsn_exclusive
-		|| prefix.record_start != record->tail_last_record_lsn
-		|| prefix.record_crc != record->tail_last_record_crc32c)
-		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	*phase = record->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 				 ? CLUSTER_CONTROL_ROOT_STOP_CLOSED
 				 : CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
@@ -2687,7 +2740,7 @@ typedef struct CheckpointV2Work {
 	CheckpointV2Purpose purpose;
 	ControlRootImage base;
 	ControlRootImage next;
-	ControlRootImage *close_peer;
+	ClusterWalHistoryImage *close_history;
 	ControlFileData old_view;
 	ControlFileData new_view;
 	ClusterControlRootReadToken thread_token;
@@ -2955,9 +3008,9 @@ checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
 {
 	ClusterControlRootResult discarded;
 
-	if (work->close_peer != NULL) {
-		pfree(work->close_peer);
-		work->close_peer = NULL;
+	if (work->close_history != NULL) {
+		pfree(work->close_history);
+		work->close_history = NULL;
 	}
 	if (work->wal_reader != NULL) {
 		XLogReaderFree(work->wal_reader);
@@ -3882,37 +3935,38 @@ normal_stop_v2_publish_work(CheckpointV2Work *work, const ClusterWalDurablePrefi
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	*complete = true;
-	work->close_peer = palloc(sizeof(*work->close_peer));
+	work->close_history = palloc(sizeof(*work->close_history));
 	for (uint32 node = 0; node < CLUSTER_CONTROL_ROOT_RECORD_COUNT; node++) {
 		const ClusterControlRootSnapshot *record = &work->next.records[node];
 		bool configured
 			= (work->next.header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64))) != 0;
-		ControlFileData view;
-		ClusterControlRootFileToken token;
 		if (!work->next.present[node]) {
 			if (configured)
 				return CLUSTER_CONTROL_ROOT_ABSENT;
 			continue;
 		}
-		/* A retained history must be consumed by the history close proof;
-		 * current-record closure never silently discards that obligation. */
-		if (work->next.refs[node].history_generation != 0)
-			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		if (work->next.refs[node].history_generation != 0) {
+			result = cluster_wal_history_read_locked(&work->next, node, work->close_history);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				return result;
+			for (uint32 i = 0; i < work->close_history->count; i++) {
+				const ClusterWalHistoryRecord *old = &work->close_history->records[i];
+				result = closed_v2_record_locked(&work->next, &old->snapshot, &old->refs,
+												 &work->new_view);
+				if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+					return result;
+			}
+		}
 		if (record->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED) {
 			*complete = false;
 			continue;
 		}
 		if (node == (uint32)index)
 			continue; /* Actual shutdown WAL and exact PGWP verified above. */
-		result = cluster_control_root_v2_read_thread_locked(&record->identity, work->close_peer,
-															&view, &token);
-		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		result
+			= closed_v2_record_locked(&work->next, record, &work->next.refs[node], &work->new_view);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
-		if (!file_token_equal(&work->before, &token))
-			return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
-		if (view.state != DB_SHUTDOWNED)
-			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	}
 	if (work->next.header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_CLOSED && !*complete)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;

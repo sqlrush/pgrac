@@ -6379,6 +6379,8 @@ v2_close_add_peer(uint8 before[66048], int node, ClusterPhase1FullStopPlan *plan
 	root.present[node] = true;
 	root.records[node] = root.records[0];
 	root.refs[node] = root.refs[0];
+	root.refs[node].history_generation = 0;
+	memset(root.refs[node].history_sha256, 0, 32);
 	root.records[node].identity.origin_node_id = node;
 	root.records[node].identity.origin_thread_id = node + 1;
 	root.records[node].identity.origin_owner_incarnation += node;
@@ -9508,6 +9510,335 @@ UT_TEST(test_history_produced_file_reaches_actual_bootstrap_consumer)
 	test_cf_grant = true;
 }
 
+/* PGRAC: retained inputs have their own physical claim, clean anchor and
+ * persistent prefix. No decoder or close predicate is replaced by a stub.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static void
+v2_close_history_fixture(uint8 before[66048], ClusterPhase1FullStopPlan *plan,
+						 ClusterWalHistoryImage *history, ClusterWalHistoryStage *stage,
+						 uint32 count)
+{
+	ControlRootImage root, old;
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterWalDurablePrefixRef saved;
+	ClusterWalDurablePrefix saved_prefix;
+	uint8 bytes[66048], uuid[16] = { 0 };
+	char saved_path[MAXPGPATH], path[MAXPGPATH];
+	static uint64 generation = 30000;
+
+	v2_close_fixture(before, plan);
+	saved = test_checkpoint_prefix_ref;
+	saved_prefix = test_checkpoint_prefix;
+	strlcpy(saved_path, test_checkpoint_prefix_path, sizeof(saved_path));
+	anchor = v2_stop_clean_anchor(before, &saved.claim.identity);
+	UT_ASSERT_EQ(cluster_control_root_v2_decode(before, 66048, v2_storage, TEST_SYSID, &root), 0);
+	memset(history, 0, sizeof(*history));
+	history->count = count;
+	for (uint32 i = 0; i < count; i++) {
+		ClusterRecoveryAnchorV2 historical = anchor;
+		ControlFileData native = { 0 };
+		old = root;
+		old.records[0].identity.origin_owner_incarnation -= count - i;
+		old.records[0].identity.thread_claim_created_at -= count - i;
+		old.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+		old.records[0].lifecycle_reason = CLUSTER_CONTROL_ROOT_PUBLISH_THREAD_CLEAN_CLOSE;
+		old.publisher_incarnation[0] = old.records[0].identity.origin_owner_incarnation;
+		UT_ASSERT_EQ(cluster_control_root_v2_encode(&old), 0);
+		memcpy(bytes, old.bytes, sizeof(bytes));
+		v2_claim_object(bytes, 0, &old);
+		historical.identity = old.records[0].identity;
+		memcpy(historical.claim_sha256, old.refs[0].claim_sha256, 32);
+		v2_anchor_object(bytes, &historical, &historical.identity, path);
+		UT_ASSERT_EQ(
+			cluster_control_root_v2_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &old), 0);
+		test_checkpoint_prefix_ref = saved;
+		test_checkpoint_prefix_ref.claim.identity = historical.identity;
+		memcpy(test_checkpoint_prefix_ref.claim.claim_sha256, historical.claim_sha256, 32);
+		snprintf(path, sizeof(path), "%s/thread_1/generation_" UINT64_FORMAT "/durable_prefix",
+				 cluster_wal_threads_dir, historical.identity.origin_owner_incarnation);
+		UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+		snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path), "%s/current",
+				 path);
+		native.state = DB_SHUTDOWNED;
+		native.checkPoint = historical.checkpoint;
+		native.checkPointCopy = historical.checkpoint_copy;
+		v2_checkpoint_wal_record(&historical.identity, &native, 0);
+		old.records[0].checkpoint_record_crc32c = test_checkpoint_crc;
+		old.records[0].tail_last_record_crc32c = test_checkpoint_crc;
+		old.records[0].validated_tail_lsn_exclusive = test_checkpoint_end;
+		history->records[i].snapshot = old.records[0];
+		history->records[i].refs = old.refs[0];
+		history->records[i].publisher_incarnation = old.publisher_incarnation[0];
+		history->records[i].publisher_node = 0;
+	}
+	test_checkpoint_prefix_ref = saved;
+	test_checkpoint_prefix = saved_prefix;
+	strlcpy(test_checkpoint_prefix_path, saved_path, sizeof(test_checkpoint_prefix_path));
+	history_stage_dirs(0);
+	put_u64_le(uuid, ++generation);
+	test_actual_cf = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, history, generation, uuid, stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(stage), 0);
+	root.refs[0].history_generation = stage->generation;
+	memcpy(root.refs[0].history_sha256, stage->sha256, 32);
+	UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+	memcpy(before, root.bytes, sizeof(root.bytes));
+	v2_write_roots(before);
+	test_actual_cf = NoLock;
+}
+
+UT_TEST(test_v2_normal_close_authenticates_retained_clean_generations)
+{
+	for (uint32 count = 0; count <= 2; count += 2) {
+		uint8 before[66048];
+		ClusterPhase1FullStopPlan plan;
+		ClusterWalHistoryImage history;
+		ClusterWalHistoryStage stage;
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		ControlFileData view;
+		bool complete = false;
+		v2_close_history_fixture(before, &plan, &history, &stage, count);
+		UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &complete), 0);
+		UT_ASSERT(complete);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_actual_cf = ShareLock;
+		UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(
+						 &test_checkpoint_prefix_ref.claim.identity, &root, &view, &token),
+					 0);
+		UT_ASSERT_EQ(root.refs[0].history_generation, stage.generation);
+		UT_ASSERT(memcmp(root.refs[0].history_sha256, stage.sha256, 32) == 0);
+		test_actual_cf = NoLock;
+	}
+}
+
+UT_TEST(test_v2_normal_close_rechecks_closed_peer_persistent_tail)
+{
+	uint8 before[66048], primary[66048], prefix_bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	ClusterPhase1FullStopPlan plan;
+	ClusterWalDurablePrefixRef peer;
+	ClusterWalDurablePrefix prefix;
+	char path[MAXPGPATH];
+	bool complete = true;
+	v2_close_fixture(before, &plan);
+	peer = v2_close_add_peer(before, 1, &plan);
+	UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &complete), 0);
+	UT_ASSERT(!complete);
+	/* The first publisher has already closed node0. A later valid PGWP must
+	 * not be ignored when node1 considers the global-close fold. */
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, primary, sizeof(primary));
+	UT_ASSERT_EQ(cluster_wal_durable_prefix_read(cluster_wal_threads_dir,
+												 &test_checkpoint_prefix_ref, &prefix),
+				 0);
+	prefix.sequence++;
+	prefix.exclusive_end += 8;
+	UT_ASSERT_EQ(
+		cluster_wal_durable_prefix_encode(&test_checkpoint_prefix_ref, &prefix, prefix_bytes), 0);
+	write_all_or_abort(test_checkpoint_prefix_path, prefix_bytes, sizeof(prefix_bytes));
+	cluster_node_id = 1;
+	test_own_thread = 2;
+	test_self_incarnation = test_membership_incarnation
+		= peer.claim.identity.origin_owner_incarnation;
+	test_checkpoint_prefix_ref = peer;
+	plan.own_wal_started_at = peer.claim.identity.thread_claim_created_at;
+	UT_ASSERT(cluster_control_root_v2_normal_stop_close(&plan, &complete) != 0);
+	UT_ASSERT(!complete);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	v2_assert_primary_unchanged(primary);
+}
+
+UT_TEST(test_history_selected_reader_is_read_only_and_needs_no_staging)
+{
+	uint32 counts[] = { 0, 2, 128 };
+	for (unsigned i = 0; i < lengthof(counts); i++) {
+		ControlRootImage root;
+		ClusterWalHistoryImage expected, got;
+		ClusterWalHistoryStage stage;
+		uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+		char formal[MAXPGPATH], temp[MAXPGPATH], dir[MAXPGPATH], saved[MAXPGPATH];
+		unsigned syncs;
+		test_checkpoint_mode = false;
+		history_prepare_fixture(&root, &expected, uuid, bytes, counts[i]);
+		UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &expected, 40000 + i, uuid, &stage), 0);
+		UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+		root.refs[0].history_generation = stage.generation;
+		memcpy(root.refs[0].history_sha256, stage.sha256, 32);
+		history_stage_paths(&stage, formal, temp);
+		path_for(dir, sizeof(dir), "global/wal_history/thread_1/.staging");
+		path_for(saved, sizeof(saved), "global/wal_history/thread_1/.staging-reader-test");
+		UT_ASSERT_EQ(rename(dir, saved), 0);
+		UT_ASSERT_EQ(chmod(formal, 0400), 0);
+		test_cf_mode = ShareLock;
+		syncs = test_history_sync_count;
+		UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 0, &got), 0);
+		UT_ASSERT_EQ(got.count, counts[i]);
+		UT_ASSERT(memcmp(&expected, &got, sizeof(got)) == 0);
+		UT_ASSERT_EQ(test_history_sync_count, syncs);
+		UT_ASSERT_EQ(chmod(formal, 0600), 0);
+		UT_ASSERT_EQ(rename(saved, dir), 0);
+		test_cf_mode = ExclusiveLock;
+		UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	}
+}
+
+UT_TEST(test_history_selected_reader_refuses_unsafe_or_unselected_inputs)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ControlRootImage root;
+		ClusterWalHistoryImage expected, got;
+		ClusterWalHistoryStage stage;
+		uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+		char formal[MAXPGPATH], temp[MAXPGPATH];
+		test_checkpoint_mode = false;
+		history_prepare_fixture(&root, &expected, uuid, bytes, 2);
+		UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &expected, 40100 + fault, uuid, &stage),
+					 0);
+		UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+		root.refs[0].history_generation = stage.generation;
+		memcpy(root.refs[0].history_sha256, stage.sha256, 32);
+		history_stage_paths(&stage, formal, temp);
+		switch (fault) {
+		case 0:
+			UT_ASSERT_EQ(unlink(formal), 0);
+			break;
+		case 1:
+			UT_ASSERT_EQ(truncate(formal, CLUSTER_WAL_HISTORY_MAX_BYTES + 1), 0);
+			break;
+		case 2:
+			UT_ASSERT_EQ(unlink(formal), 0);
+			UT_ASSERT_EQ(symlink("missing-evidence", formal), 0);
+			break;
+		case 3:
+			bytes[stage.length - 1] ^= 1;
+			write_all_or_abort(formal, bytes, stage.length);
+			break;
+		case 4:
+			root.refs[0].history_generation++;
+			break;
+		case 5:
+			test_cf_clusterwide = false;
+			break;
+		case 6:
+			UT_ASSERT_EQ(chmod(formal, 0660), 0);
+			break;
+		case 7:
+			root.present[0] = false;
+			break;
+		case 8:
+			root.refs[0].history_generation = 0;
+			break;
+		}
+		memset(&got, 0xa5, sizeof(got));
+		UT_ASSERT(cluster_wal_history_read_locked(&root, 0, &got) != 0);
+		UT_ASSERT(v2_zero(&got, sizeof(got)));
+		test_cf_clusterwide = true;
+		if (fault == 6)
+			UT_ASSERT_EQ(chmod(formal, 0600), 0);
+		UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	}
+}
+
+UT_TEST(test_v2_normal_close_refuses_missing_or_nonterminal_history)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		uint8 before[66048], prefix_bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+		ClusterPhase1FullStopPlan plan;
+		ClusterWalHistoryImage history;
+		ClusterWalHistoryStage stage;
+		ClusterWalHistoryRecord *old;
+		ClusterWalDurablePrefixRef ref;
+		ClusterWalDurablePrefix prefix;
+		char path[MAXPGPATH], temp[MAXPGPATH], hex[65];
+		bool complete = true;
+		v2_close_history_fixture(before, &plan, &history, &stage, 2);
+		old = &history.records[0];
+		ref = test_checkpoint_prefix_ref;
+		ref.claim.identity = old->snapshot.identity;
+		memcpy(ref.claim.claim_sha256, old->refs.claim_sha256, 32);
+		if (fault == 0) {
+			history_stage_paths(&stage, path, temp);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 1) {
+			v2_claim_path(&old->snapshot.identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 2) {
+			for (int i = 0; i < 32; i++)
+				snprintf(hex + i * 2, 3, "%02x", old->refs.anchor_sha256[i]);
+			snprintf(path, sizeof(path),
+					 "%s/global/anchor_images/thread_1/generation_" UINT64_FORMAT
+					 "/anchor_" UINT64_FORMAT "-%s.bin",
+					 test_root, old->snapshot.identity.origin_owner_incarnation,
+					 old->refs.anchor_generation, hex);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault < 6) {
+			snprintf(path, sizeof(path),
+					 "%s/thread_1/generation_" UINT64_FORMAT "/durable_prefix/current",
+					 cluster_wal_threads_dir, old->snapshot.identity.origin_owner_incarnation);
+			if (fault == 3)
+				UT_ASSERT_EQ(unlink(path), 0);
+			else {
+				UT_ASSERT_EQ(
+					cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &ref, &prefix), 0);
+				if (fault == 5)
+					prefix.exclusive_end += 8;
+				UT_ASSERT_EQ(cluster_wal_durable_prefix_encode(&ref, &prefix, prefix_bytes), 0);
+				if (fault == 4)
+					prefix_bytes[sizeof(prefix_bytes) - 1] ^= 1;
+				write_all_or_abort(path, prefix_bytes, sizeof(prefix_bytes));
+			}
+		} else {
+			ControlRootImage root;
+			uint8 uuid[16] = { 0 };
+			uint64 generation = stage.generation + 100000;
+			old->snapshot.lifecycle = fault == 6 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+												 : CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE;
+			UT_ASSERT_EQ(cluster_control_root_v2_decode(before, sizeof(before), v2_storage,
+														TEST_SYSID, &root),
+						 0);
+			put_u64_le(uuid, generation);
+			test_actual_cf = ExclusiveLock;
+			UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, generation, uuid, &stage),
+						 0);
+			UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+			root.refs[0].history_generation = generation;
+			memcpy(root.refs[0].history_sha256, stage.sha256, 32);
+			UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+			memcpy(before, root.bytes, sizeof(before));
+			v2_write_roots(before);
+			test_actual_cf = NoLock;
+		}
+		UT_ASSERT(cluster_control_root_v2_normal_stop_close(&plan, &complete) != 0);
+		UT_ASSERT(!complete);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+	}
+}
+
+UT_TEST(test_v2_normal_close_pair_preserves_other_origin_history)
+{
+	uint8 before[66048];
+	ClusterPhase1FullStopPlan plan;
+	ClusterWalHistoryImage history;
+	ClusterWalHistoryStage stage;
+	ClusterWalDurablePrefixRef peer;
+	bool complete = true;
+	v2_close_history_fixture(before, &plan, &history, &stage, 2);
+	peer = v2_close_add_peer(before, 3, &plan);
+	UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &complete), 0);
+	UT_ASSERT(!complete);
+	cluster_node_id = 3;
+	test_own_thread = 4;
+	test_self_incarnation = test_membership_incarnation
+		= peer.claim.identity.origin_owner_incarnation;
+	test_checkpoint_prefix_ref = peer;
+	plan.own_wal_started_at = peer.claim.identity.thread_claim_created_at;
+	UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &complete), 0);
+	UT_ASSERT(complete);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -9523,7 +9854,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(173);
+	UT_PLAN(184);
 	UT_RUN(test_history_encoder_matches_literal_empty_and_full);
 	UT_RUN(test_history_encoder_rejects_invalid_records_without_partial_output);
 	UT_RUN(test_history_stage_installs_exact_readable_object);
@@ -9538,6 +9869,8 @@ main(int argc, char **argv)
 	UT_RUN(test_history_discard_sync_failure_cannot_resurrect_install);
 	UT_RUN(test_history_prepare_sync_failure_clears_output_and_owned_temp);
 	UT_RUN(test_history_produced_file_reaches_actual_bootstrap_consumer);
+	UT_RUN(test_history_selected_reader_is_read_only_and_needs_no_staging);
+	UT_RUN(test_history_selected_reader_refuses_unsafe_or_unselected_inputs);
 	test_history_fail_sync = 0;
 	test_cf_mode = NoLock;
 	UT_RUN(test_abi_identity_and_features);
@@ -9651,6 +9984,10 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_normal_close_requires_real_controller_and_exact_native_cut);
 	UT_RUN(test_v2_normal_close_pair_waits_for_last_thread_and_preserves_roster);
 	UT_RUN(test_v2_normal_close_never_returns_success_after_uncertain_release);
+	UT_RUN(test_v2_normal_close_authenticates_retained_clean_generations);
+	UT_RUN(test_v2_normal_close_rechecks_closed_peer_persistent_tail);
+	UT_RUN(test_v2_normal_close_refuses_missing_or_nonterminal_history);
+	UT_RUN(test_v2_normal_close_pair_preserves_other_origin_history);
 	UT_RUN(test_v2_stop_phase_refuses_wrong_owner_missing_claim_or_late_prefix);
 	UT_RUN(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound);
 	UT_RUN(test_v2_stop_phase_error_cleans_cf_and_cannot_return_evidence);
