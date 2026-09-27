@@ -112,6 +112,7 @@ typedef struct ClusterSharedConfigPolicyReport {
 typedef struct ClusterControlRecoveryCapacity {
 	uint32 current_sources;
 	uint32 history_sources;
+	uint32 pending_sources;
 	uint32 max_connections;
 	uint32 max_worker_processes;
 	uint32 max_wal_senders;

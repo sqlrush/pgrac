@@ -176,6 +176,16 @@ cluster_control_root_v2_history_encode(const ControlRootImage *root, uint32 orig
 									   const ClusterWalHistoryImage *history,
 									   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length);
 
+/* Same flat PGWH record-v2 representation selected by an explicit root-v3.
+ * Pending startup is separate and must be included by the enclosing census. */
+extern ClusterControlRootResult
+cluster_control_root_v3_history_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
+									   uint32 origin_node, ClusterWalHistoryImage *out);
+extern ClusterControlRootResult
+cluster_control_root_v3_history_encode(const ControlRootImage *root, uint32 origin_node,
+									   const ClusterWalHistoryImage *history,
+									   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length);
+
 /* Process-owned immutable file installation. The enclosing root publisher
  * must retain the same clusterwide CF-X through root CAS. No formal object
  * is ever removed by discard, including after an ambiguous install failure.
@@ -270,9 +280,26 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 										   ControlRootImage *root, ControlFileData *out,
 										   ClusterControlRootFileToken *token);
 
+/* Explicit startup-capable readers. Preserve pending references; a current
+ * thread projection is not a complete recovery/retention input census. */
+extern ClusterControlRootResult
+cluster_control_root_v3_read_control_locked(const uint8 storage_uuid[16], uint64 system_identifier,
+											ControlRootImage *root, ControlFileData *common,
+											ClusterControlRootFileToken *token);
+extern ClusterControlRootResult
+cluster_control_root_v3_read_thread_locked(const ClusterControlRootIdentity *self,
+										   ControlRootImage *root, ControlFileData *out,
+										   ClusterControlRootFileToken *token);
+
 /* Runtime local owner only. Borrow the caller's CF-S/X; not early startup. */
 extern ClusterControlRootResult
 cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out);
+extern ClusterControlRootResult
+cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out);
+extern ClusterControlRootResult
+cluster_control_root_v3_read_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
+									   ClusterControlRootSnapshot *out,
+									   ClusterControlRootReadToken *token);
 
 /* PGRAC: normal current-writer checkpoint retention only. Owns CF-S and
  * revalidates actual local runtime identity; does not read/retire historical
@@ -282,6 +309,10 @@ cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out);
  */
 extern ClusterControlRootResult
 cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity *self,
+											   ClusterControlRootSnapshot *out,
+											   ClusterControlRootReadToken *token);
+extern ClusterControlRootResult
+cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity *self,
 											   ClusterControlRootSnapshot *out,
 											   ClusterControlRootReadToken *token);
 
@@ -305,6 +336,10 @@ extern ClusterControlRootResult cluster_control_root_v2_checkpoint_publish(
 	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
+extern ClusterControlRootResult cluster_control_root_v3_checkpoint_publish(
+	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
+	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
 
 /* PGRAC: publishes WAL-verified shutdown checkpoint evidence only. Does not
  * close a thread/database or change membership; returned native view still
@@ -312,6 +347,10 @@ extern ClusterControlRootResult cluster_control_root_v2_checkpoint_publish(
  * Author: SqlRush <sqlrush@gmail.com>
  */
 extern ClusterControlRootResult cluster_control_root_v2_shutdown_checkpoint_publish(
+	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
+	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
+	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
+extern ClusterControlRootResult cluster_control_root_v3_shutdown_checkpoint_publish(
 	const ClusterControlRootIdentity *self, const ControlFileData *thread_control,
 	XLogRecPtr checkpoint_end, ClusterControlRootSnapshot *out,
 	ClusterControlRootFileToken *out_token, ControlFileData *out_control);
@@ -323,12 +362,19 @@ extern ClusterControlRootResult
 cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expected,
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_v3_shutdown_observe(const ClusterWalDurablePrefixRef *expected,
+										 ClusterControlRootSnapshot *out,
+										 ClusterControlRootFileToken *out_token);
 
 struct ClusterPhase1FullStopPlan;
 /* Only the actual post-checkpoint normal-stop controller may own this call.
  * Success includes exact CF/WALR retirement, not merely durable root bytes. */
 extern ClusterControlRootResult
 cluster_control_root_v2_normal_stop_close(const struct ClusterPhase1FullStopPlan *plan,
+										  bool *all_closed);
+extern ClusterControlRootResult
+cluster_control_root_v3_normal_stop_close(const struct ClusterPhase1FullStopPlan *plan,
 										  bool *all_closed);
 
 /* PGRAC: normal-stop observation only, not thread close or PI-retirement
@@ -367,6 +413,9 @@ typedef struct ClusterControlRootStopObservation {
 extern ClusterControlRootResult
 cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 admitted_incarnation,
 										ClusterControlRootStopObservation *out);
+extern ClusterControlRootResult
+cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 admitted_incarnation,
+										ClusterControlRootStopObservation *out);
 
 /* PGRAC: exact failed-writer control publishers. The request is a carrier,
  * not authority: each operation authenticates its opaque formation/fence
@@ -382,6 +431,14 @@ cluster_control_root_v2_failure_open_publish(const struct ClusterRecoverySerialR
 											 ClusterControlRootReadToken *out_token);
 extern ClusterControlRootResult
 cluster_control_root_v2_failure_tail_publish(const struct ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_v3_failure_open_publish(const struct ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_v3_failure_tail_publish(const struct ClusterRecoverySerialRequest *request,
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token);
 

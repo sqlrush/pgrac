@@ -56,6 +56,11 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 								 ClusterControlBootstrapSnapshot *out);
 
 struct ControlRootImage;
+/* Exact on-disk version dispatch, not fallback or conversion. V1 is not a
+ * shared-config bootstrap input; every v2/v3 validation remains mandatory. */
+extern ClusterControlRootResult
+cluster_control_bootstrap_root_decode(const uint8 *bytes, size_t len, const uint8 storage_uuid[16],
+									  uint64 system_identifier, struct ControlRootImage *out);
 /* Allocation-free binding check shared by the byte composer and collector. */
 extern ClusterControlRootResult
 cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
@@ -73,6 +78,9 @@ typedef struct ClusterControlBootstrapObservation {
  * independently configured absolute paths and node, and the retained binding.
  * No .bak/projection fallback, retry, mutation or GUC application. Every present
  * current and retained writer's claim/anchor contributes recovery capacities;
+ * selected pending DURABLE writers contribute their own claim/anchor, while
+ * INITIALIZING without an anchor is refused pending its native input scanner.
+ * RESERVED permits no WAL mutation and contributes no new capacity minimum.
  * no lifecycle or serving bit bypasses input checks. These are root-selected
  * minima, not proof of the full recovery-obligation/WAL input union. All raw FDs
  * close before composition uses the caller's memory/hash resource owner.

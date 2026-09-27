@@ -75,6 +75,17 @@ bootstrap_hash(const uint8 *bytes, size_t len, uint8 hash[32])
 }
 
 ClusterControlRootResult
+cluster_control_bootstrap_root_decode(const uint8 *bytes, size_t len, const uint8 storage_uuid[16],
+									  uint64 system_identifier, ControlRootImage *out)
+{
+	/* Only dispatch on the little-endian version tag; do not retry a failed
+	 * decoder under a different version or reinterpret any reserved byte. */
+	if (bytes != NULL && len >= 6 && bytes[4] == 3 && bytes[5] == 0)
+		return cluster_control_root_v3_decode(bytes, len, storage_uuid, system_identifier, out);
+	return cluster_control_root_v2_decode(bytes, len, storage_uuid, system_identifier, out);
+}
+
+ClusterControlRootResult
 cluster_control_bootstrap_root_bound(const PgracControlBinding *binding,
 									 const ControlRootImage *root)
 {
@@ -159,17 +170,17 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 
 	before = palloc(sizeof(*before));
 	after = palloc(sizeof(*after));
-	result = cluster_control_root_v2_decode(input->root_before.data, input->root_before.len,
-											snapshot.binding.storage_uuid,
-											snapshot.binding.system_identifier, before);
+	result = cluster_control_bootstrap_root_decode(input->root_before.data, input->root_before.len,
+												   snapshot.binding.storage_uuid,
+												   snapshot.binding.system_identifier, before);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	result = cluster_control_bootstrap_root_bound(&snapshot.binding, before);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	result = cluster_control_root_v2_decode(input->root_after.data, input->root_after.len,
-											snapshot.binding.storage_uuid,
-											snapshot.binding.system_identifier, after);
+	result = cluster_control_bootstrap_root_decode(input->root_after.data, input->root_after.len,
+												   snapshot.binding.storage_uuid,
+												   snapshot.binding.system_identifier, after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	result = cluster_control_bootstrap_root_bound(&snapshot.binding, after);

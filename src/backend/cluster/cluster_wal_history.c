@@ -324,7 +324,11 @@ cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
 		|| !history_nonzero(operation_uuid, 16))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	bytes = palloc(CLUSTER_WAL_HISTORY_MAX_BYTES);
-	result = cluster_control_root_v2_history_encode(root, origin_node, history, bytes, &len);
+	/* Flat history keeps record-v2 encoding. Select its root contract explicitly;
+	 * this never converts a root or grants permission to ignore pending startup. */
+	result = root != NULL && root->header.format_version == 3
+				 ? cluster_control_root_v3_history_encode(root, origin_node, history, bytes, &len)
+				 : cluster_control_root_v2_history_encode(root, origin_node, history, bytes, &len);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = history_prepare_encoded(root, origin_node, bytes, len, generation, operation_uuid,
 										 WAL_OBJECT_HISTORY, out);
@@ -557,7 +561,7 @@ cluster_wal_history_read_locked(const ControlRootImage *root, uint32 node,
 	if (!cluster_cf_held_is_clusterwide(ShareLock)
 		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	if (root->header.format_version != 2)
+	if (root->header.format_version != 2 && root->header.format_version != 3)
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (!root->present[node] || root->refs[node].history_generation == 0)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
@@ -568,7 +572,10 @@ cluster_wal_history_read_locked(const ControlRootImage *root, uint32 node,
 	bytes = palloc(CLUSTER_WAL_HISTORY_MAX_BYTES);
 	result = history_read_selected(node, WAL_OBJECT_HISTORY, &selected, bytes);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		result = cluster_control_root_v2_history_decode(bytes, selected.length, root, node, out);
+		result
+			= root->header.format_version == 3
+				  ? cluster_control_root_v3_history_decode(bytes, selected.length, root, node, out)
+				  : cluster_control_root_v2_history_decode(bytes, selected.length, root, node, out);
 	pfree(bytes);
 	return result;
 }

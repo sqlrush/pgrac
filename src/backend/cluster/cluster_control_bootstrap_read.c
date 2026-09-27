@@ -28,7 +28,9 @@ typedef struct BootstrapReadWork {
 	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES + 1];
 	uint8 anchor[CLUSTER_RECOVERY_ANCHOR_SIZE + 1];
 	uint8 history[CLUSTER_WAL_HISTORY_MAX_BYTES + 1];
+	uint8 startup[CLUSTER_WAL_STARTUP_BYTES + 1];
 	ClusterWalHistoryImage retained;
+	ClusterWalStartupImage pending;
 	struct stat shared_dir;
 	struct stat global_dir;
 	struct stat wal_dir;
@@ -347,6 +349,7 @@ read_dir_identity(int fd, const struct stat *expected)
 typedef enum BootstrapReadKind {
 	BOOTSTRAP_SOURCE,
 	BOOTSTRAP_HISTORY,
+	BOOTSTRAP_STARTUP,
 	BOOTSTRAP_FINAL_ROOT
 } BootstrapReadKind;
 
@@ -386,6 +389,15 @@ read_again(BootstrapReadWork *work, const char *shared_root, const char *wal_roo
 		result = read_object(global, parts, lengthof(parts), name,
 							 CLUSTER_WAL_HISTORY_HEADER_BYTES + 4, CLUSTER_WAL_HISTORY_MAX_BYTES,
 							 work->history, &work->history_len);
+	} else if (kind == BOOTSTRAP_STARTUP) {
+		const ControlRootStartupRefV3 *ref = &work->before.startup[source->identity.origin_node_id];
+		char thread[32], hex[65], name[128];
+		const char *parts[] = { "wal_startup", thread };
+		snprintf(thread, sizeof(thread), "thread_%u", source->identity.origin_thread_id);
+		read_hex(ref->sha256, hex);
+		snprintf(name, sizeof(name), "startup_" UINT64_FORMAT "-%s.bin", ref->generation, hex);
+		result = read_object(global, parts, lengthof(parts), name, CLUSTER_WAL_STARTUP_BYTES,
+							 CLUSTER_WAL_STARTUP_BYTES, work->startup, &length);
 	} else
 		result = read_bytes(global, "pgrac_control_root", CLUSTER_CONTROL_ROOT_FILE_BYTES,
 							CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_after, &length);
@@ -467,23 +479,50 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 		if (result != 0)
 			return result;
 		required->current_sources++;
-		if (root->refs[node].history_generation == 0)
-			continue; /* Root decoder already requires a zero hash as well. */
-		result = read_again(work, shared_root, wal_root, BOOTSTRAP_HISTORY, &root->records[node],
-							&root->refs[node]);
-		if (result != 0)
-			return result;
-		result = cluster_control_root_v2_history_decode(work->history, work->history_len, root,
-														node, &work->retained);
-		if (result != 0)
-			return result;
-		for (uint32 i = 0; i < work->retained.count; i++) {
-			const ClusterWalHistoryRecord *old = &work->retained.records[i];
-			result = read_source_capacity(work, shared_root, wal_root, &old->snapshot, &old->refs,
-										  required);
+		if (root->refs[node].history_generation != 0) {
+			result = read_again(work, shared_root, wal_root, BOOTSTRAP_HISTORY,
+								&root->records[node], &root->refs[node]);
 			if (result != 0)
 				return result;
-			required->history_sources++;
+			result = root->header.format_version == 3
+						 ? cluster_control_root_v3_history_decode(work->history, work->history_len,
+																  root, node, &work->retained)
+						 : cluster_control_root_v2_history_decode(work->history, work->history_len,
+																  root, node, &work->retained);
+			if (result != 0)
+				return result;
+			for (uint32 i = 0; i < work->retained.count; i++) {
+				const ClusterWalHistoryRecord *old = &work->retained.records[i];
+				result = read_source_capacity(work, shared_root, wal_root, &old->snapshot,
+											  &old->refs, required);
+				if (result != 0)
+					return result;
+				required->history_sources++;
+			}
+		}
+		if (root->header.format_version == 3 && root->startup[node].generation != 0) {
+			result = read_again(work, shared_root, wal_root, BOOTSTRAP_STARTUP,
+								&root->records[node], NULL);
+			if (result != 0)
+				return result;
+			result = cluster_control_root_v3_startup_decode(
+				work->startup, CLUSTER_WAL_STARTUP_BYTES, root, node, &work->pending);
+			if (result != 0)
+				return result;
+			/* A pending generation is not current and need not be serving. Its
+			 * published checkpoint still imposes physical recovery requirements.
+			 * Before that checkpoint, an INITIALIZING WAL scan is required; never
+			 * substitute the predecessor anchor or count it as clean/empty. */
+			if (work->pending.phase == CLUSTER_WAL_STARTUP_INITIALIZING)
+				return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			if (work->pending.phase == CLUSTER_WAL_STARTUP_DURABLE) {
+				result = read_source_capacity(work, shared_root, wal_root,
+											  &work->pending.successor.snapshot,
+											  &work->pending.successor.refs, required);
+				if (result != 0)
+					return result;
+			}
+			required->pending_sources++;
 		}
 	}
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
@@ -533,8 +572,8 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 						CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_before, &length);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
-	result = cluster_control_root_v2_decode(work->root_before, length, binding.storage_uuid,
-											binding.system_identifier, &work->before);
+	result = cluster_control_bootstrap_root_decode(work->root_before, length, binding.storage_uuid,
+												   binding.system_identifier, &work->before);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
 	result = cluster_control_bootstrap_root_bound(&binding, &work->before);
@@ -548,8 +587,8 @@ cluster_control_bootstrap_read(const char *pgdata, const char *shared_root, cons
 						CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_after, &length);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
-	result = cluster_control_root_v2_decode(work->root_after, length, binding.storage_uuid,
-											binding.system_identifier, &work->after);
+	result = cluster_control_bootstrap_root_decode(work->root_after, length, binding.storage_uuid,
+												   binding.system_identifier, &work->after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto close_dirs;
 	result = cluster_control_bootstrap_root_bound(&binding, &work->after);
@@ -606,9 +645,9 @@ close_dirs:
 	result = read_again(work, shared_root, wal_root, BOOTSTRAP_FINAL_ROOT, NULL, NULL);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
-	result = cluster_control_root_v2_decode(work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES,
-											binding.storage_uuid, binding.system_identifier,
-											&work->after);
+	result = cluster_control_bootstrap_root_decode(
+		work->root_after, CLUSTER_CONTROL_ROOT_FILE_BYTES, binding.storage_uuid,
+		binding.system_identifier, &work->after);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
 	result = cluster_control_bootstrap_root_bound(&binding, &work->after);

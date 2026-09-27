@@ -606,9 +606,9 @@ history_overlaps_output(const void *input, size_t len, const ClusterWalHistoryIm
 	return input != NULL && out != NULL && (a <= b ? b - a < len : a - b < sizeof(*out));
 }
 
-ClusterControlRootResult
-cluster_control_root_v2_history_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
-									   uint32 origin_node, ClusterWalHistoryImage *out)
+static ClusterControlRootResult
+decode_history_version(const uint8 *bytes, size_t len, const ControlRootImage *root,
+					   uint32 origin_node, ClusterWalHistoryImage *out, uint16 version)
 {
 	ClusterControlRootResult result;
 	uint8 hash[32];
@@ -624,7 +624,7 @@ cluster_control_root_v2_history_decode(const uint8 *bytes, size_t len, const Con
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (!valid_size)
 		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
-	if (root->header.format_version != CONTROL_ROOT_HEADER_VERSION_V2)
+	if (root->header.format_version != version)
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (!root->present[origin_node])
 		return CLUSTER_CONTROL_ROOT_ABSENT;
@@ -706,10 +706,10 @@ history_ranges_overlap(const void *a, size_t na, const void *b, size_t nb)
 	return a != NULL && b != NULL && (x <= y ? y - x < na : x - y < nb);
 }
 
-ClusterControlRootResult
-cluster_control_root_v2_history_encode(const ControlRootImage *root, uint32 origin_node,
-									   const ClusterWalHistoryImage *history,
-									   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length)
+static ClusterControlRootResult
+encode_history_version(const ControlRootImage *root, uint32 origin_node,
+					   const ClusterWalHistoryImage *history,
+					   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length, uint16 version)
 {
 	ClusterControlRootResult result;
 	size_t len;
@@ -727,7 +727,7 @@ cluster_control_root_v2_history_encode(const ControlRootImage *root, uint32 orig
 	if (alias || root == NULL || history == NULL || bytes == NULL || length == NULL
 		|| origin_node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (root->header.format_version != CONTROL_ROOT_HEADER_VERSION_V2)
+	if (root->header.format_version != version)
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (!root->present[origin_node])
 		return CLUSTER_CONTROL_ROOT_ABSENT;
@@ -785,6 +785,40 @@ cluster_control_root_v2_history_encode(const ControlRootImage *root, uint32 orig
 	write_u32_le(bytes + len - 4, control_root_crc(bytes, len - 4));
 	*length = len;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_history_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
+									   uint32 origin_node, ClusterWalHistoryImage *out)
+{
+	return decode_history_version(bytes, len, root, origin_node, out,
+								  CONTROL_ROOT_HEADER_VERSION_V2);
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_history_encode(const ControlRootImage *root, uint32 origin_node,
+									   const ClusterWalHistoryImage *history,
+									   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length)
+{
+	return encode_history_version(root, origin_node, history, bytes, length,
+								  CONTROL_ROOT_HEADER_VERSION_V2);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_history_decode(const uint8 *bytes, size_t len, const ControlRootImage *root,
+									   uint32 origin_node, ClusterWalHistoryImage *out)
+{
+	return decode_history_version(bytes, len, root, origin_node, out,
+								  CONTROL_ROOT_HEADER_VERSION_V3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_history_encode(const ControlRootImage *root, uint32 origin_node,
+									   const ClusterWalHistoryImage *history,
+									   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length)
+{
+	return encode_history_version(root, origin_node, history, bytes, length,
+								  CONTROL_ROOT_HEADER_VERSION_V3);
 }
 
 static void
@@ -1544,10 +1578,9 @@ read_canonical_pair(ControlRootImage *primary, ControlRootImage *bak)
  * This is deliberately NOT a per-thread startup view or admission decision.
  * Author: SqlRush <sqlrush@gmail.com>
  */
-ClusterControlRootResult
-cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64 system_identifier,
-											ControlRootImage *root, ControlFileData *common,
-											ClusterControlRootFileToken *token)
+static ClusterControlRootResult
+read_control_version(const uint8 storage_uuid[16], uint64 system_identifier, ControlRootImage *root,
+					 ControlFileData *common, ClusterControlRootFileToken *token, uint16 version)
 {
 	ControlRootImage *bak;
 	ClusterControlRootResult result;
@@ -1578,8 +1611,7 @@ cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64
 	if (cluster_cf_contract_load(DataDir) != CLUSTER_CF_CONTRACT_CROSSNODE_VERIFIED)
 		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
 	bak = palloc(sizeof(*bak));
-	root_result = read_canonical_pair_version(root, bak, storage_uuid, system_identifier,
-											  CONTROL_ROOT_HEADER_VERSION_V2);
+	root_result = read_canonical_pair_version(root, bak, storage_uuid, system_identifier, version);
 	pfree(bak);
 	result = root_result;
 	if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
@@ -1629,10 +1661,9 @@ cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64
  * subsequent lifecycle/config/admission checks, which this read cannot grant.
  * Author: SqlRush <sqlrush@gmail.com>
  */
-ClusterControlRootResult
-cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *self,
-										   ControlRootImage *root, ControlFileData *out,
-										   ClusterControlRootFileToken *token)
+static ClusterControlRootResult
+read_thread_version(const ClusterControlRootIdentity *self, ControlRootImage *root,
+					ControlFileData *out, ClusterControlRootFileToken *token, uint16 version)
 {
 	ControlFileData common;
 	ClusterRecoveryAnchorRefV2 ref;
@@ -1650,8 +1681,8 @@ cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *sel
 	if (self == NULL || root == NULL || out == NULL || token == NULL || self->origin_thread_id == 0
 		|| self->origin_thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	root_result = cluster_control_root_v2_read_control_locked(
-		self->storage_uuid, self->system_identifier, root, &common, token);
+	root_result = read_control_version(self->storage_uuid, self->system_identifier, root, &common,
+									   token, version);
 	result = root_result;
 	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
@@ -1698,6 +1729,40 @@ fail:
 	return result;
 }
 
+ClusterControlRootResult
+cluster_control_root_v2_read_control_locked(const uint8 storage_uuid[16], uint64 system_identifier,
+											ControlRootImage *root, ControlFileData *common,
+											ClusterControlRootFileToken *token)
+{
+	return read_control_version(storage_uuid, system_identifier, root, common, token,
+								CONTROL_ROOT_HEADER_VERSION_V2);
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_read_thread_locked(const ClusterControlRootIdentity *self,
+										   ControlRootImage *root, ControlFileData *out,
+										   ClusterControlRootFileToken *token)
+{
+	return read_thread_version(self, root, out, token, CONTROL_ROOT_HEADER_VERSION_V2);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_control_locked(const uint8 storage_uuid[16], uint64 system_identifier,
+											ControlRootImage *root, ControlFileData *common,
+											ClusterControlRootFileToken *token)
+{
+	return read_control_version(storage_uuid, system_identifier, root, common, token,
+								CONTROL_ROOT_HEADER_VERSION_V3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_thread_locked(const ClusterControlRootIdentity *self,
+										   ControlRootImage *root, ControlFileData *out,
+										   ClusterControlRootFileToken *token)
+{
+	return read_thread_version(self, root, out, token, CONTROL_ROOT_HEADER_VERSION_V3);
+}
+
 /* PGRAC: a read-only runtime view requires a live exact local owner; this is
  * not the early postmaster sizing read or the recovery owner's read API.
  * Author: SqlRush <sqlrush@gmail.com>
@@ -1716,8 +1781,8 @@ runtime_v2_owner_current(uint64 epoch, uint64 incarnation)
 		   && cluster_write_fence_allowed() && cluster_epoch_get_current() == epoch;
 }
 
-ClusterControlRootResult
-cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
+static ClusterControlRootResult
+read_runtime_local_version(ControlFileData *out, uint16 version)
 {
 	ControlRootImage *root;
 	ControlFileData common, thread;
@@ -1748,8 +1813,7 @@ cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
 	if (sysid == 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	root = palloc(sizeof(*root));
-	result
-		= cluster_control_root_v2_read_control_locked(storage_uuid, sysid, root, &common, &token);
+	result = read_control_version(storage_uuid, sysid, root, &common, &token, version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		goto done;
@@ -1769,7 +1833,7 @@ cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
 	/* The same externally held CF interval pins the selected root across both
 	 * reads. The second composes the exact physical claim and thread anchor.
 	 */
-	result = cluster_control_root_v2_read_thread_locked(&self, root, &thread, &token);
+	result = read_thread_version(&self, root, &thread, &token, version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		goto done;
@@ -1781,6 +1845,12 @@ cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
 done:
 	pfree(root);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out)
+{
+	return read_runtime_local_version(out, CONTROL_ROOT_HEADER_VERSION_V2);
 }
 
 /*
@@ -1964,10 +2034,9 @@ release_cf(LOCKMODE mode, ClusterControlRootResult result)
  * generation. Never upgrade this purpose into a recovery/history read.
  * Author: SqlRush <sqlrush@gmail.com>
  */
-ClusterControlRootResult
-cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity *self,
-											   ClusterControlRootSnapshot *out,
-											   ClusterControlRootReadToken *token)
+static ClusterControlRootResult
+read_retention_version(const ClusterControlRootIdentity *self, ClusterControlRootSnapshot *out,
+					   ClusterControlRootReadToken *token, uint16 version)
 {
 	ControlRootImage *root;
 	ControlFileData thread;
@@ -2005,8 +2074,7 @@ cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity 
 		if (cluster_cf_lock(ShareLock)) {
 			held = true;
 			if (cluster_cf_held_is_clusterwide(ShareLock)) {
-				result = cluster_control_root_v2_read_thread_locked(&expected, root, &thread,
-																	&file_token);
+				result = read_thread_version(&expected, root, &thread, &file_token, version);
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 					if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
@@ -2053,6 +2121,14 @@ cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity 
 	return result;
 }
 
+ClusterControlRootResult
+cluster_control_root_v2_read_retention_current(const ClusterControlRootIdentity *self,
+											   ClusterControlRootSnapshot *out,
+											   ClusterControlRootReadToken *token)
+{
+	return read_retention_version(self, out, token, CONTROL_ROOT_HEADER_VERSION_V2);
+}
+
 /* PGRAC: one process-local observation, not a cached CF authorization. A
  * service caller may receive it only after the original exact release and
  * only at the same input/cut. A background poll can retire the lock even if
@@ -2061,6 +2137,7 @@ typedef struct CanonicalAuxRead {
 	bool pending;
 	bool has_expected;
 	bool stop_observation;
+	uint16 format_version;
 	uint16 thread;
 	uint64 admitted_incarnation;
 	ClusterControlRootStopObservation stop;
@@ -2097,7 +2174,7 @@ static bool
 canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 					 ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
 					 uint64 admitted_incarnation, ClusterControlRootStopObservation *stop,
-					 ClusterControlRootResult *result)
+					 ClusterControlRootResult *result, uint16 version)
 {
 	CanonicalAuxRead now = { 0 };
 	CanonicalAuxRead *pending = &canonical_aux_read;
@@ -2115,7 +2192,8 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 		return true;
 	}
 	valid
-		= pending->thread == thread && pending->has_expected == (expected != NULL)
+		= pending->format_version == version && pending->thread == thread
+		  && pending->has_expected == (expected != NULL)
 		  && pending->stop_observation == (stop != NULL)
 		  && pending->admitted_incarnation == admitted_incarnation
 		  && (expected == NULL || cluster_control_root_identity_equal(&pending->expected, expected))
@@ -2273,9 +2351,10 @@ stop_phase_v2_locked(const ControlRootImage *root, uint32 index, const ControlFi
  * Author: SqlRush <sqlrush@gmail.com>
  */
 static ClusterControlRootResult
-read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_identity,
-				  ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
-				  uint64 admitted_incarnation, ClusterControlRootStopObservation *stop)
+read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expected_identity,
+					   ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
+					   uint64 admitted_incarnation, ClusterControlRootStopObservation *stop,
+					   uint16 version)
 {
 	ControlRootImage *root;
 	ControlRootImage *peer_root;
@@ -2319,7 +2398,7 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 		return result;
 	if (auxiliary
 		&& canonical_aux_finish(thread_id, expected_identity, out, token, admitted_incarnation,
-								stop, &result))
+								stop, &result, version))
 		return result;
 	if (cluster_cf_held(ExclusiveLock)
 		|| (cluster_cf_held(ShareLock) && !(auxiliary && cluster_cf_acquire_pending(ShareLock))))
@@ -2335,8 +2414,8 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 			if (cluster_cf_held_is_clusterwide(ShareLock)
 				&& (!auxiliary || canonical_aux_capture_cut(&continuation))) {
 				if (expected_identity == NULL) {
-					result = cluster_control_root_v2_read_control_locked(
-						storage_uuid, system_identifier, root, &thread, &discovered);
+					result = read_control_version(storage_uuid, system_identifier, root, &thread,
+												  &discovered, version);
 					if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 						|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 						if (!root->present[index])
@@ -2348,8 +2427,20 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 					result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
-					result = cluster_control_root_v2_read_thread_locked(&expected, root, &thread,
-																		&file_token);
+					result = read_thread_version(&expected, root, &thread, &file_token, version);
+					/* A current-record-only observation cannot certify an unfinished
+					 * successor as the clean predecessor. Full-stop observation must
+					 * also retain non-serving pending participants. */
+					if ((result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+						 || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+						&& version == CONTROL_ROOT_HEADER_VERSION_V3) {
+						for (uint32 peer = 0; peer < CLUSTER_CONTROL_ROOT_RECORD_COUNT; peer++)
+							if ((peer == index || stop != NULL)
+								&& root->startup[peer].generation != 0) {
+								result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+								break;
+							}
+					}
 					if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 						|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
 						if (expected_identity == NULL
@@ -2370,8 +2461,8 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 										 & (UINT64_C(1) << (peer % 64)))
 										== 0)
 										continue;
-									result = cluster_control_root_v2_read_thread_locked(
-										id, peer_root, &peer_view, &peer_token);
+									result = read_thread_version(id, peer_root, &peer_view,
+																 &peer_token, version);
 									if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 										&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 										break;
@@ -2403,6 +2494,7 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 			if (auxiliary) {
 				continuation.cookie = cluster_cf_owner_cookie(ShareLock);
 				continuation.thread = thread_id;
+				continuation.format_version = version;
 				continuation.has_expected = expected_identity != NULL;
 				continuation.stop_observation = stop != NULL;
 				continuation.admitted_incarnation = admitted_incarnation;
@@ -2431,7 +2523,7 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 					continuation.pending = true;
 					canonical_aux_read = continuation;
 					(void)canonical_aux_finish(thread_id, expected_identity, out, token,
-											   admitted_incarnation, stop, &result);
+											   admitted_incarnation, stop, &result, version);
 				}
 			}
 		}
@@ -2470,6 +2562,15 @@ read_canonical_v2(uint16 thread_id, const ClusterControlRootIdentity *expected_i
 	return result;
 }
 
+static ClusterControlRootResult
+read_canonical_v2(uint16 thread, const ClusterControlRootIdentity *expected,
+				  ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
+				  uint64 admitted_incarnation, ClusterControlRootStopObservation *stop)
+{
+	return read_canonical_version(thread, expected, out, token, admitted_incarnation, stop,
+								  CONTROL_ROOT_HEADER_VERSION_V2);
+}
+
 ClusterControlRootResult
 cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 admitted_incarnation,
 										ClusterControlRootStopObservation *out)
@@ -2477,6 +2578,39 @@ cluster_control_root_v2_stop_phase_read(uint16 thread, uint64 admitted_incarnati
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return read_canonical_v2(thread, NULL, NULL, NULL, admitted_incarnation, out);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out)
+{
+	return read_runtime_local_version(out, CONTROL_ROOT_HEADER_VERSION_V3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity *self,
+											   ClusterControlRootSnapshot *out,
+											   ClusterControlRootReadToken *token)
+{
+	return read_retention_version(self, out, token, CONTROL_ROOT_HEADER_VERSION_V3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_canonical(uint16 thread, const ClusterControlRootIdentity *expected,
+									   ClusterControlRootSnapshot *out,
+									   ClusterControlRootReadToken *token)
+{
+	return read_canonical_version(thread, expected, out, token, 0, NULL,
+								  CONTROL_ROOT_HEADER_VERSION_V3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 admitted_incarnation,
+										ClusterControlRootStopObservation *out)
+{
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return read_canonical_version(thread, NULL, NULL, NULL, admitted_incarnation, out,
+								  CONTROL_ROOT_HEADER_VERSION_V3);
 }
 
 ClusterControlRootResult
@@ -3123,6 +3257,7 @@ typedef enum CheckpointV2Purpose {
 
 typedef struct CheckpointV2Work {
 	CheckpointV2Purpose purpose;
+	uint16 format_version;
 	ControlRootImage base;
 	ControlRootImage next;
 	ClusterWalHistoryImage *close_history;
@@ -3450,8 +3585,8 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (!acquire_clusterwide_cf(ShareLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work->cf_mode = ShareLock;
-	result = cluster_control_root_v2_read_thread_locked(self, &work->base, &work->old_view,
-														&work->before);
+	result = read_thread_version(self, &work->base, &work->old_view, &work->before,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -3540,8 +3675,7 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	if (!acquire_clusterwide_cf(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work->cf_mode = ExclusiveLock;
-	result
-		= cluster_control_root_v2_read_thread_locked(self, &work->next, &work->new_view, &actual);
+	result = read_thread_version(self, &work->next, &work->new_view, &actual, work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -3581,7 +3715,7 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 	memcpy(work->next.refs[index].anchor_sha256, work->stage.ref.anchor_sha256, 32);
 	work->next.header.file_txn_seq++;
 	work->next.header.published_at_usec = record->published_at_usec;
-	result = cluster_control_root_v2_encode(&work->next);
+	result = encode_extended_image(&work->next, work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!checkpoint_v2_wal_paths_current(work, self)
@@ -3592,8 +3726,8 @@ checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdent
 		return result;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	result = cluster_control_root_v2_read_thread_locked(self, &work->base, &work->new_view,
-														&work->after);
+	result = read_thread_version(self, &work->base, &work->new_view, &work->after,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -3615,7 +3749,7 @@ static ClusterControlRootResult
 checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdentity *self,
 					  const ControlFileData *thread_control, XLogRecPtr checkpoint_end,
 					  ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
-					  ControlFileData *out_control)
+					  ControlFileData *out_control, uint16 version)
 {
 	CheckpointV2Work *work;
 	ClusterControlRootResult result;
@@ -3660,6 +3794,7 @@ checkpoint_v2_publish(CheckpointV2Purpose purpose, const ClusterControlRootIdent
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	work = palloc0(sizeof(*work));
 	work->purpose = purpose;
+	work->format_version = version;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
 		work->wal_dirs[i] = -1;
 	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
@@ -3694,7 +3829,7 @@ cluster_control_root_v2_checkpoint_publish(const ClusterControlRootIdentity *sel
 										   ControlFileData *out_control)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, thread_control, checkpoint_end, out,
-								 out_token, out_control);
+								 out_token, out_control, 2);
 }
 
 /* PGRAC: shutdown WAL and anchor evidence precede, but never substitute for,
@@ -3710,7 +3845,7 @@ cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIden
 													ControlFileData *out_control)
 {
 	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, thread_control,
-								 checkpoint_end, out, out_token, out_control);
+								 checkpoint_end, out, out_token, out_control, 2);
 }
 
 /* PGRAC: failure input is a purpose-bound root transition, not a v1 patch
@@ -3718,6 +3853,7 @@ cluster_control_root_v2_shutdown_checkpoint_publish(const ClusterControlRootIden
  * owned by the caller until our confirmed lock cleanup.
  * Author: SqlRush <sqlrush@gmail.com> */
 typedef struct FailureInputV2Work {
+	uint16 format_version;
 	ControlRootImage base;
 	ControlRootImage next;
 	ControlFileData control;
@@ -3819,8 +3955,8 @@ failure_v2_tail_read(const ClusterRecoverySerialRequest *request, FailureInputV2
 	work->cf_mode = mode;
 	if (!cluster_cf_held_is_clusterwide(mode))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
-														&file_token);
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
@@ -3883,15 +4019,15 @@ failure_v2_tail_commit(const ClusterRecoverySerialRequest *request, FailureInput
 	work->next.publisher_incarnation[index] = work->publisher_incarnation;
 	work->next.header.file_txn_seq++;
 	work->next.header.published_at_usec = record->published_at_usec;
-	result = cluster_control_root_v2_encode(&work->next);
+	result = encode_extended_image(&work->next, work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!failure_v2_current(request, work))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
-														&file_token);
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
@@ -3966,8 +4102,8 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 	work->cf_mode = ExclusiveLock;
 	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
-														&file_token);
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	make_read_token(&work->base, request->duty.origin_thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
@@ -4012,15 +4148,15 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 		&= ~(UINT64_C(1) << (request->duty.origin_node_id % 64));
 	work->next.header.file_txn_seq++;
 	work->next.header.published_at_usec = record->published_at_usec;
-	result = cluster_control_root_v2_encode(&work->next);
+	result = encode_extended_image(&work->next, work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!failure_v2_authorized(request, work))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	result = cluster_control_root_v2_read_thread_locked(&request->duty, &work->base, &work->control,
-														&file_token);
+	result = read_thread_version(&request->duty, &work->base, &work->control, &file_token,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
@@ -4034,7 +4170,7 @@ failure_v2_open_work(const ClusterRecoverySerialRequest *request, FailureInputV2
 
 static ClusterControlRootResult
 failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRootSnapshot *out,
-				   ClusterControlRootReadToken *out_token, bool seal_tail)
+				   ClusterControlRootReadToken *out_token, bool seal_tail, uint16 version)
 {
 	FailureInputV2Work *work;
 	ClusterControlRootResult result;
@@ -4060,6 +4196,7 @@ failure_v2_publish(const ClusterRecoverySerialRequest *request, ClusterControlRo
 	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work = palloc0(sizeof(*work));
+	work->format_version = version;
 	work->publisher_node = cluster_node_id;
 	work->publisher_incarnation = cluster_qvotec_get_self_incarnation();
 	PG_TRY();
@@ -4091,7 +4228,7 @@ cluster_control_root_v2_failure_open_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, false);
+	return failure_v2_publish(request, out, out_token, false, 2);
 }
 
 ClusterControlRootResult
@@ -4099,7 +4236,23 @@ cluster_control_root_v2_failure_tail_publish(const ClusterRecoverySerialRequest 
 											 ClusterControlRootSnapshot *out,
 											 ClusterControlRootReadToken *out_token)
 {
-	return failure_v2_publish(request, out, out_token, true);
+	return failure_v2_publish(request, out, out_token, true, 2);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_failure_open_publish(const ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token)
+{
+	return failure_v2_publish(request, out, out_token, false, 3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_failure_tail_publish(const ClusterRecoverySerialRequest *request,
+											 ClusterControlRootSnapshot *out,
+											 ClusterControlRootReadToken *out_token)
+{
+	return failure_v2_publish(request, out, out_token, true, 3);
 }
 
 /* PGRAC: the raw shutdown anchor and native insertion cut are independent
@@ -4130,8 +4283,8 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalDurablePrefixRe
 	if (!acquire_clusterwide_cf(ShareLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work->cf_mode = ShareLock;
-	result = cluster_control_root_v2_read_thread_locked(self, &work->base, &work->new_view,
-														&work->before);
+	result = read_thread_version(self, &work->base, &work->new_view, &work->before,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -4216,8 +4369,8 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalDurablePrefixRe
 	if (!acquire_clusterwide_cf(close_plan != NULL ? ExclusiveLock : ShareLock))
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
 	work->cf_mode = close_plan != NULL ? ExclusiveLock : ShareLock;
-	result = cluster_control_root_v2_read_thread_locked(self, &work->next, &work->new_view,
-														&work->after);
+	result = read_thread_version(self, &work->next, &work->new_view, &work->after,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -4232,10 +4385,10 @@ shutdown_v2_observe_work(CheckpointV2Work *work, const ClusterWalDurablePrefixRe
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
-ClusterControlRootResult
-cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expected,
-										 ClusterControlRootSnapshot *out,
-										 ClusterControlRootFileToken *out_token)
+static ClusterControlRootResult
+shutdown_observe_version(const ClusterWalDurablePrefixRef *expected,
+						 ClusterControlRootSnapshot *out, ClusterControlRootFileToken *out_token,
+						 uint16 version)
 {
 	CheckpointV2Work *work;
 	ClusterWalDurablePrefixRef ref;
@@ -4260,6 +4413,7 @@ cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expec
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	work = palloc0(sizeof(*work));
 	work->purpose = CHECKPOINT_V2_SHUTDOWN_EVIDENCE;
+	work->format_version = version;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
 		work->wal_dirs[i] = -1;
 	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
@@ -4330,6 +4484,11 @@ normal_stop_v2_publish_work(CheckpointV2Work *work, const ClusterWalDurablePrefi
 				return CLUSTER_CONTROL_ROOT_ABSENT;
 			continue;
 		}
+		/* A closed predecessor does not close its selected successor's
+		 * initialization. Preserve this reference and leave global close to
+		 * the operation owner; a checkpointer cannot cancel/adopt that work. */
+		if (work->next.startup[node].generation != 0)
+			*complete = false;
 		if (work->next.refs[node].history_generation != 0) {
 			result = cluster_wal_history_read_locked(&work->next, node, work->close_history);
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -4374,7 +4533,7 @@ normal_stop_v2_publish_work(CheckpointV2Work *work, const ClusterWalDurablePrefi
 	work->next.header.published_at_usec = own->published_at_usec;
 	if (*complete)
 		work->next.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_CLOSED;
-	result = cluster_control_root_v2_encode(&work->next);
+	result = encode_extended_image(&work->next, work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
 	if (!cluster_normal_stop_durable_close_owned(plan)
@@ -4387,8 +4546,8 @@ normal_stop_v2_publish_work(CheckpointV2Work *work, const ClusterWalDurablePrefi
 		return result;
 	if (!publish_updated_image(&work->base, &work->next))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	result = cluster_control_root_v2_read_thread_locked(self, &work->base, &work->new_view,
-														&work->after);
+	result = read_thread_version(self, &work->base, &work->new_view, &work->after,
+								 work->format_version);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		return result;
@@ -4400,8 +4559,8 @@ normal_stop_v2_publish_work(CheckpointV2Work *work, const ClusterWalDurablePrefi
 	return cluster_cf_control_projection_write_locked(&work->new_view);
 }
 
-ClusterControlRootResult
-cluster_control_root_v2_normal_stop_close(const ClusterPhase1FullStopPlan *plan, bool *all_closed)
+static ClusterControlRootResult
+normal_stop_close_version(const ClusterPhase1FullStopPlan *plan, bool *all_closed, uint16 version)
 {
 	CheckpointV2Work *work;
 	ClusterWalDurablePrefixRef ref;
@@ -4432,6 +4591,7 @@ cluster_control_root_v2_normal_stop_close(const ClusterPhase1FullStopPlan *plan,
 			members |= UINT64_C(1) << node;
 	work = palloc0(sizeof(*work));
 	work->purpose = CHECKPOINT_V2_SHUTDOWN_EVIDENCE;
+	work->format_version = version;
 	for (size_t i = 0; i < lengthof(work->wal_dirs); ++i)
 		work->wal_dirs[i] = -1;
 	for (size_t i = 0; i < lengthof(work->wal_segments); ++i)
@@ -4459,6 +4619,57 @@ cluster_control_root_v2_normal_stop_close(const ClusterPhase1FullStopPlan *plan,
 		*all_closed = complete;
 	pfree(work);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *ref,
+										 ClusterControlRootSnapshot *out,
+										 ClusterControlRootFileToken *token)
+{
+	return shutdown_observe_version(ref, out, token, 2);
+}
+
+ClusterControlRootResult
+cluster_control_root_v2_normal_stop_close(const ClusterPhase1FullStopPlan *plan, bool *all_closed)
+{
+	return normal_stop_close_version(plan, all_closed, 2);
+}
+
+/* Explicit new-format publishers share physical WAL/claim/anchor checks,
+ * never old-format fallback or loss of another origin's pending reference. */
+ClusterControlRootResult
+cluster_control_root_v3_checkpoint_publish(const ClusterControlRootIdentity *self,
+										   const ControlFileData *control, XLogRecPtr end,
+										   ClusterControlRootSnapshot *out,
+										   ClusterControlRootFileToken *token,
+										   ControlFileData *view)
+{
+	return checkpoint_v2_publish(CHECKPOINT_V2_ONLINE, self, control, end, out, token, view, 3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIdentity *self,
+													const ControlFileData *control, XLogRecPtr end,
+													ClusterControlRootSnapshot *out,
+													ClusterControlRootFileToken *token,
+													ControlFileData *view)
+{
+	return checkpoint_v2_publish(CHECKPOINT_V2_SHUTDOWN_EVIDENCE, self, control, end, out, token,
+								 view, 3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_shutdown_observe(const ClusterWalDurablePrefixRef *ref,
+										 ClusterControlRootSnapshot *out,
+										 ClusterControlRootFileToken *token)
+{
+	return shutdown_observe_version(ref, out, token, 3);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_normal_stop_close(const ClusterPhase1FullStopPlan *plan, bool *all_closed)
+{
+	return normal_stop_close_version(plan, all_closed, 3);
 }
 
 /*

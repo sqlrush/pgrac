@@ -373,7 +373,8 @@ cluster_shared_config_check_recovery_capacity(const ClusterControlRecoveryCapaci
 	if (alias || required == NULL || required->current_sources == 0
 		|| required->current_sources > CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| required->history_sources > required->current_sources * CLUSTER_WAL_HISTORY_MAX_RECORDS
-		|| required->max_connections == 0 || required->max_locks_per_xact == 0)
+		|| required->pending_sources > required->current_sources || required->max_connections == 0
+		|| required->max_locks_per_xact == 0)
 		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_FORMAT);
 	values[0] = required->max_connections;
 	values[1] = required->max_worker_processes;
