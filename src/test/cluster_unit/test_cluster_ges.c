@@ -94,6 +94,10 @@
  * Author: SqlRush <sqlrush@gmail.com> */
 BackendType MyBackendType = B_BACKEND;
 bool cluster_shared_config;
+static bool stub_retire_driver_enabled;
+static ClusterControlRequestCut stub_retire_cut;
+static int stub_retire_drain_budget;
+static ClusterGrdGrantIdentity stub_drained_grant;
 bool
 cluster_control_retire_is_frame(const void *bytes pg_attribute_unused(),
 								Size len pg_attribute_unused())
@@ -102,8 +106,12 @@ cluster_control_retire_is_frame(const void *bytes pg_attribute_unused(),
 }
 bool
 cluster_control_retire_cut(const ClusterResId *resid pg_attribute_unused(),
-						   ClusterControlRequestCut *cut pg_attribute_unused())
+						   ClusterControlRequestCut *cut)
 {
+	if (stub_retire_driver_enabled) {
+		*cut = stub_retire_cut;
+		return true;
+	}
 	abort();
 }
 void
@@ -123,6 +131,8 @@ cluster_ges_dedup_retire_control_request(uint32 node pg_attribute_unused(),
 										 uint64 epoch pg_attribute_unused(),
 										 uint64 req pg_attribute_unused())
 {
+	if (stub_retire_driver_enabled)
+		return true;
 	abort();
 }
 bool
@@ -142,9 +152,16 @@ cluster_grd_retire_request_and_drain(const ClusterResId *resid pg_attribute_unus
 									 const ClusterGrdHolderId *holder pg_attribute_unused(),
 									 uint64 previous pg_attribute_unused(),
 									 LOCKMODE mode pg_attribute_unused(),
-									 ClusterGrdGrantIdentity *granted pg_attribute_unused(),
-									 int max pg_attribute_unused())
+									 ClusterGrdGrantIdentity *granted, int max)
 {
+	if (stub_retire_driver_enabled) {
+		stub_retire_drain_budget = max;
+		if (max > 0) {
+			granted[0] = stub_drained_grant;
+			return 1;
+		}
+		return 0;
+	}
 	abort();
 }
 
@@ -977,10 +994,13 @@ cluster_grd_convert_nowait(const struct ClusterResId *resid pg_attribute_unused(
 int
 cluster_grd_release_and_drain(const struct ClusterResId *resid pg_attribute_unused(),
 							  const struct ClusterGrdHolderId *holder pg_attribute_unused(),
-							  ClusterGrdGrantIdentity *granted_out pg_attribute_unused(),
-							  int max_out pg_attribute_unused())
+							  ClusterGrdGrantIdentity *granted_out, int max_out)
 {
 	stub_release_and_drain_calls++;
+	if (stub_release_and_drain_result == 1) {
+		Assert(granted_out != NULL && max_out > 0);
+		granted_out[0] = stub_drained_grant;
+	}
 	return stub_release_and_drain_result;
 }
 
@@ -1591,7 +1611,7 @@ UT_TEST(test_pre2_startup_cf_x_protocol_owner)
 	ClusterResId cf = { 0 };
 	uint64 enqueued = stub_work_queue_enqueue_count;
 	uint64 mutations = stub_master_grant_mutation_count;
-	uint64 releases = stub_exact_release_calls;
+	uint64 drains = stub_release_and_drain_calls;
 
 	cluster_shared_config = true;
 	stub_authority_managed = true;
@@ -1617,13 +1637,25 @@ UT_TEST(test_pre2_startup_cf_x_protocol_owner)
 
 	stub_holder_mode_override = ExclusiveLock;
 	stub_exact_release_result = CLUSTER_GRD_ENTRY_OK;
+	memset(&stub_drained_grant, 0, sizeof(stub_drained_grant));
+	stub_drained_grant.holder.node_id = 1;
+	stub_drained_grant.holder.procno = 24;
+	stub_drained_grant.holder.cluster_epoch = stub_current_epoch;
+	stub_drained_grant.holder.request_id = 211;
+	stub_drained_grant.source_node_id = 1;
+	stub_drained_grant.shard_master_generation = stub_master_generation;
+	stub_drained_grant.request_opcode = GES_REQ_OPCODE_REQUEST;
+	stub_drained_grant.mode = ExclusiveLock;
+	stub_release_and_drain_result = 1;
 	req.opcode = GES_REQ_OPCODE_RELEASE;
 	memcpy(stub_work_queue_dequeue_item.payload, &req, sizeof(req));
 	stub_work_queue_dequeue_pending = true;
 	UT_ASSERT_EQ(cluster_ges_lmon_drain_work_queue(), 1);
-	UT_ASSERT_EQ(stub_exact_release_calls, releases + 1);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, drains + 1);
 	UT_ASSERT_EQ(stub_lmon_reply_last.opcode, (uint32)GES_REPLY_OPCODE_GRANT);
-	UT_ASSERT_EQ(stub_lmon_reply_last.reply_for_opcode, (uint32)GES_REQ_OPCODE_RELEASE);
+	UT_ASSERT_EQ(stub_lmon_reply_last.reply_for_opcode, (uint32)GES_REQ_OPCODE_REQUEST);
+	UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, 211);
+	stub_release_and_drain_result = 0;
 
 	/* Queued requests must be rechecked; the transport preseal alone cannot
 	 * manufacture the exclusive holder after losing the recovery seal. */
@@ -1689,6 +1721,69 @@ UT_TEST(test_ges_recovery_master_rechecks_before_mutation)
 
 	stub_authority_managed = false;
 	stub_recovery_ready = false;
+}
+
+UT_TEST(test_startup_cf_local_release_and_cancel_handoff)
+{
+	ClusterResId cf = { 0 };
+	ClusterGrdHolderId holder = { 0 };
+	ClusterControlRetireMessage message = { 0 };
+	uint64 before = stub_release_and_drain_calls;
+
+	cluster_shared_config = true;
+	stub_authority_managed = stub_recovery_ready = true;
+	stub_serving_ready = false;
+	MyAuxProcType = StartupProcess;
+	cf.type = CLUSTER_CF_RESID_TYPE;
+	cf.lockmethodid = DEFAULT_LOCKMETHOD;
+	holder.node_id = cluster_node_id;
+	holder.cluster_epoch = stub_current_epoch;
+	holder.request_id = 311;
+	/* Exact GRD queue mutation is tested by the real GRD program. Here the
+	 * returned successor verifies actual local dispatch and retirement gates. */
+	memset(&stub_drained_grant, 0, sizeof(stub_drained_grant));
+	stub_drained_grant.holder = holder;
+	stub_drained_grant.holder.node_id = 1;
+	stub_drained_grant.holder.request_id = 312;
+	stub_drained_grant.source_node_id = 1;
+	stub_drained_grant.shard_master_generation = stub_master_generation;
+	stub_drained_grant.request_opcode = GES_REQ_OPCODE_REQUEST;
+	stub_drained_grant.mode = ExclusiveLock;
+	stub_release_and_drain_result = 1;
+	UT_ASSERT_EQ(cluster_ges_release_and_drain_local(&cf, &holder), GES_REJECT_REASON_NONE);
+	UT_ASSERT_EQ(stub_release_and_drain_calls, before + 1);
+	UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, 312);
+	stub_release_and_drain_result = 0;
+	MyAuxProcType = NotAnAuxProcess;
+
+	stub_retire_driver_enabled = true;
+	memset(&stub_retire_cut, 0, sizeof(stub_retire_cut));
+	stub_retire_cut.master = cluster_node_id;
+	stub_retire_cut.epoch = stub_current_epoch;
+	stub_retire_cut.generation = stub_master_generation;
+	message.key.resid = cf;
+	message.key.holder = holder;
+	message.cleanup_epoch = stub_current_epoch;
+	MyBackendType = B_LMON;
+	UT_ASSERT_EQ(cluster_ges_control_retire_at_master(&message, &stub_retire_cut),
+				 CLUSTER_CONTROL_RETIRED);
+	UT_ASSERT(stub_retire_drain_budget > 0);
+	UT_ASSERT_EQ(stub_lmon_reply_last.holder_request_id_lo, 312);
+	stub_recovery_ready = false;
+	stub_recovery_transport_ready = true;
+	UT_ASSERT_EQ(cluster_ges_control_retire_at_master(&message, &stub_retire_cut),
+				 CLUSTER_CONTROL_RETIRED);
+	UT_ASSERT_EQ(stub_retire_drain_budget, 0);
+	stub_recovery_ready = true;
+	message.key.resid.type = CLUSTER_WAL_RETENTION_RESID_TYPE;
+	message.key.resid.field1 = 1;
+	UT_ASSERT_EQ(cluster_ges_control_retire_at_master(&message, &stub_retire_cut),
+				 CLUSTER_CONTROL_RETIRED);
+	UT_ASSERT_EQ(stub_retire_drain_budget, 0);
+	MyBackendType = B_BACKEND;
+	stub_retire_driver_enabled = false;
+	stub_authority_managed = stub_recovery_ready = stub_recovery_transport_ready = false;
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_ges_starting_redeclare_uses_preseal_transport_only)
@@ -2970,7 +3065,7 @@ UT_TEST(test_redeclare_poll_reject_and_post_reply_cut_are_not_ack)
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(48);
+	UT_PLAN(49);
 	UT_RUN(test_block0_protected_failure_detail_is_not_elapsed_timeout);
 
 	UT_RUN(test_ges_request_handler_linkable);
@@ -2983,6 +3078,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_ges_release_bypasses_dedup_and_reclaims_acquire_receipts);
 	UT_RUN(test_ges_recovery_ingress_exact_allowlist);
 	UT_RUN(test_pre2_startup_cf_x_protocol_owner);
+	UT_RUN(test_startup_cf_local_release_and_cancel_handoff);
 	UT_RUN(test_ges_recovery_master_rechecks_before_mutation);
 	UT_RUN(test_ges_starting_redeclare_uses_preseal_transport_only);
 	UT_RUN(test_pre2_survivor_redeclare_send_does_not_open_requests);

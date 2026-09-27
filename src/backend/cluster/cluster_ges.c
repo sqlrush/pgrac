@@ -304,6 +304,20 @@ ges_readiness_allows_local_release_origin(const ClusterResId *resid)
 		   && cluster_recovery_authority_request_allowed(resid, expected_mode, AmStartupProcess());
 }
 
+/* PGRAC: a sealed startup may hand the singleton CF to its next registered
+ * requester without publishing ordinary service. Components-only/failure
+ * reconstruction and all other namespaces retain removal-only semantics.
+ * The GRD additionally validates every queued CF mode/opcode under its lock.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+ges_startup_cf_handoff_allowed(const ClusterResId *resid)
+{
+	return cluster_shared_config && resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE
+		   && cluster_recovery_authority_resid_mode_allowed(resid, ExclusiveLock)
+		   && cluster_grd_control_acquire_allowed(resid, ExclusiveLock)
+		   && cluster_recovery_authority_is_current();
+}
+
 static inline bool
 ges_request_uses_dedup(uint32 opcode)
 {
@@ -1298,7 +1312,8 @@ cluster_ges_release_and_drain_local(const struct ClusterResId *resid,
 	master_before = cluster_grd_lookup_master_gen(resid, &generation_before);
 	if (master_before != cluster_node_id)
 		return GES_REJECT_REASON_MASTER_DEAD_NATIVE;
-	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
+	if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()
+		&& !ges_startup_cf_handoff_allowed(resid)) {
 		LOCKMODE held_mode;
 		ClusterGrdEntryResult release_result;
 
@@ -1350,9 +1365,10 @@ cluster_ges_control_retire_at_master(const ClusterControlRetireMessage *message,
 		|| message->cleanup_epoch != current.epoch)
 		return CLUSTER_CONTROL_RETIRE_RETRY;
 	holder = &message->key.holder;
-	/* A recovery-time retirement is removal only. Neither this receipt nor
-	 * an empty control entry may thaw DATA or publish ordinary grants. */
+	/* Only the sealed startup singleton CF may hand off before serving.
+	 * Other recovery retirement still cannot thaw DATA or ordinary queues. */
 	budget = !cluster_authority_readiness_managed() || cluster_serving_ready_is_current()
+					 || ges_startup_cf_handoff_allowed(&message->key.resid)
 				 ? lengthof(granted)
 				 : 0;
 	n = cluster_grd_retire_request_and_drain(&message->key.resid, holder, message->previous_request,
@@ -1820,7 +1836,8 @@ cluster_ges_lmon_drain_work_queue(void)
 			 * must still prevent retirement confirmation afterwards.
 			 * Author: SqlRush <sqlrush@gmail.com> */
 
-			if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()) {
+			if (cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()
+				&& !ges_startup_cf_handoff_allowed(&resid)) {
 				ClusterGrdEntryResult release_result;
 
 				/* Recovery releases may remove only the exact CF/WALR holder.

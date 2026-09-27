@@ -6500,6 +6500,83 @@ UT_TEST(test_retire_convert_at_holder_capacity_keeps_compatible_waiter_queued)
 	UT_ASSERT_EQ(cluster_grd_entry_count(), 0);
 }
 
+/* PGRAC: real singleton-CF queue mutations with runtime observations supplied
+ * by the existing shmem fixture. Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_startup_cf_handoff_real_queue)
+{
+	ClusterResId cf = { 0 };
+	ClusterGrdHolderId owner = grd_lifecycle_holder(0, 13, 271);
+	ClusterGrdHolderId next = grd_lifecycle_holder(1, 14, 272);
+	ClusterGrdGrantIdentity grant[1];
+
+	for (int retire = 0; retire < 2; ++retire) {
+		grd_lifecycle_reset(4);
+		ut_mock_epoch = 1;
+		cf.type = CLUSTER_CF_RESID_TYPE;
+		cf.lockmethodid = DEFAULT_LOCKMETHOD;
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &cf, &owner, 0, 271, 1, GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL, NULL),
+					 CLUSTER_GRD_GRANT_NOW);
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &cf, &next, 1, 272, 1, GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL, NULL),
+					 CLUSTER_GRD_ENQUEUED_WAITER);
+		cluster_shared_config = true;
+		UT_ASSERT_EQ(retire ? cluster_grd_retire_request_and_drain(&cf, &owner, 0, NoLock, grant, 1)
+							: cluster_grd_release_and_drain(&cf, &owner, grant, 1),
+					 1);
+		UT_ASSERT_EQ(grant[0].holder.request_id, 272);
+		UT_ASSERT_EQ(grant[0].request_opcode, GES_REQ_OPCODE_REQUEST);
+		UT_ASSERT_EQ(grant[0].mode, ExclusiveLock);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&cf, &owner, NULL));
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&cf, &next, NULL));
+		UT_ASSERT_EQ(cluster_grd_release_and_drain(&cf, &owner, grant, 1),
+					 CLUSTER_GRD_RELEASE_NOT_FOUND);
+		UT_ASSERT_EQ(cluster_grd_release_and_drain(&cf, &next, grant, 1), 0);
+		cluster_shared_config = false;
+	}
+}
+
+UT_TEST(test_startup_cf_handoff_rejects_noncanonical_queue)
+{
+	ClusterResId cf = { 0 };
+	ClusterGrdHolderId owner = grd_lifecycle_holder(0, 13, 281);
+	ClusterGrdHolderId next = grd_lifecycle_holder(1, 14, 282);
+	ClusterGrdGrantIdentity grant[1];
+	ClusterGrdEntry *entry;
+
+	for (int bad = 0; bad < 4; ++bad) {
+		grd_lifecycle_reset(4);
+		ut_mock_epoch = 1;
+		cf.type = CLUSTER_CF_RESID_TYPE;
+		cf.lockmethodid = DEFAULT_LOCKMETHOD;
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &cf, &owner, 0, 281, 1, GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL, NULL),
+					 CLUSTER_GRD_GRANT_NOW);
+		UT_ASSERT_EQ(cluster_grd_entry_enqueue_or_grant(
+						 &cf, &next, 1, 282, 1, GES_REQ_OPCODE_REQUEST, ExclusiveLock, NULL, NULL),
+					 CLUSTER_GRD_ENQUEUED_WAITER);
+		UT_ASSERT_EQ(cluster_grd_entry_lookup_or_create(&cf, false, &entry), CLUSTER_GRD_ENTRY_OK);
+		if (bad == 0)
+			entry->waiters[0].mode = AccessExclusiveLock;
+		if (bad == 1)
+			entry->waiters[0].request_opcode = GES_REQ_OPCODE_CONVERT;
+		if (bad == 2)
+			entry->waiters[0].cluster_epoch = 2;
+		if (bad == 3)
+			entry->nconverts = 1;
+		cluster_grd_entry_release(entry);
+		cluster_shared_config = true;
+		UT_ASSERT_EQ(cluster_grd_release_and_drain(&cf, &owner, grant, 1),
+					 CLUSTER_GRD_RELEASE_NOT_READY);
+		UT_ASSERT(cluster_grd_holder_mode_by_id(&cf, &owner, NULL));
+		/* Whole-request retirement may remove its own footprint but cannot
+		 * publish an invalid successor. The unrelated obligation remains. */
+		UT_ASSERT_EQ(cluster_grd_retire_request_and_drain(&cf, &owner, 0, NoLock, grant, 1), 0);
+		UT_ASSERT(!cluster_grd_holder_mode_by_id(&cf, &next, NULL));
+		cluster_shared_config = false;
+	}
+}
+
 UT_TEST(test_retire_request_local_shadow_never_grants)
 {
 	ClusterResId resid;
@@ -6540,7 +6617,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(136);
+	UT_PLAN(138);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6706,6 +6783,8 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_retire_convert_does_not_recreate_an_unproven_previous_holder);
 	UT_RUN(test_retire_convert_at_holder_capacity_keeps_compatible_waiter_queued);
 	UT_RUN(test_retire_request_local_shadow_never_grants);
+	UT_RUN(test_startup_cf_handoff_real_queue);
+	UT_RUN(test_startup_cf_handoff_rejects_noncanonical_queue);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

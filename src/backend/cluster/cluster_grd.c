@@ -6909,6 +6909,32 @@ static bool cluster_grd_hashremove_if_still_empty(const ClusterResId *resid);
  *	CLUSTER_GRD_RELEASE_NOT_FOUND when the exact holder is absent and no release
  *	occurred, or CLUSTER_GRD_RELEASE_NOT_READY when GRD authority is unavailable.
  */
+/* PGRAC: shared-control CF has no conversion producer. A startup handoff
+ * may promote only its already-registered canonical REQUESTs, never use a
+ * malformed/future queue as permission to open a stronger lock. The caller
+ * owns readiness; this check runs under the entry lock without taking any
+ * other lock. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+grd_shared_cf_queue_safe(const ClusterResId *resid, const ClusterGrdEntry *entry, uint64 epoch)
+{
+	if (!cluster_shared_config || resid->type != CLUSTER_CF_RESID_TYPE)
+		return true;
+	if (resid->field1 != 0 || resid->field2 != 0 || resid->field3 != 0 || resid->field4 != 0
+		|| resid->lockmethodid != DEFAULT_LOCKMETHOD || epoch == 0 || entry->nconverts != 0
+		|| entry->ngranted > PGRAC_GRD_MAX_HOLDERS || entry->nwaiters > PGRAC_GRD_MAX_WAITERS)
+		return false;
+	for (int i = 0; i < entry->ngranted; ++i)
+		if (entry->holders[i].cluster_epoch != epoch
+			|| (entry->holders[i].mode != ShareLock && entry->holders[i].mode != ExclusiveLock))
+			return false;
+	for (int i = 0; i < entry->nwaiters; ++i)
+		if (entry->waiters[i].cluster_epoch != epoch
+			|| entry->waiters[i].request_opcode != GES_REQ_OPCODE_REQUEST
+			|| (entry->waiters[i].mode != ShareLock && entry->waiters[i].mode != ExclusiveLock))
+			return false;
+	return true;
+}
+
 int
 cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderId *holder,
 							  ClusterGrdGrantIdentity *granted_out, int max_out)
@@ -6930,6 +6956,11 @@ cluster_grd_release_and_drain(const ClusterResId *resid, const ClusterGrdHolderI
 															: CLUSTER_GRD_RELEASE_NOT_READY;
 
 	SpinLockAcquire(&entry->lock);
+	if (!grd_shared_cf_queue_safe(resid, entry, cluster_epoch_get_current())) {
+		SpinLockRelease(&entry->lock);
+		cluster_grd_entry_release(entry);
+		return CLUSTER_GRD_RELEASE_NOT_READY;
+	}
 
 	/* (1) Remove the releasing holder by full 4-tuple match (if present). */
 	for (int i = 0; i < entry->ngranted; i++) {
@@ -7166,7 +7197,8 @@ cluster_grd_retire_request_and_drain(const ClusterResId *resid, const ClusterGrd
 	 * cancel or downgrade need not; preserve the waiter at holder capacity. */
 	may_drain
 		= removed && max_out > 0 && entry->ngranted < PGRAC_GRD_MAX_HOLDERS
-		  && cluster_grd_shard_phase(cluster_grd_shard_for_resource(resid)) == GRD_SHARD_NORMAL;
+		  && cluster_grd_shard_phase(cluster_grd_shard_for_resource(resid)) == GRD_SHARD_NORMAL
+		  && grd_shared_cf_queue_safe(resid, entry, epoch);
 	for (i = 0; may_drain && i < entry->ngranted; i++)
 		may_drain = entry->holders[i].cluster_epoch == epoch;
 	for (i = 0; may_drain && i < entry->nwaiters; i++)
