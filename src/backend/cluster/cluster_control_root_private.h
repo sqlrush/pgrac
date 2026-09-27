@@ -166,6 +166,19 @@ typedef struct ClusterWalStartupImage {
 	TimeLineID prefix_timeline;
 } ClusterWalStartupImage;
 
+/* Exact target StartupProcess, RESERVED only. Creates/reobserves empty
+ * physical metadata; owns CF-X and never grants native WAL/data permission.
+ * Refusal clears out. Existing selected files are never overwritten. */
+extern ClusterControlRootResult
+cluster_control_root_v3_startup_prepare_target(const ClusterControlRootIdentity *self,
+											   const uint8 operation_uuid[16],
+											   ClusterWalStartupImage *out);
+/* Coordinator StartupProcess: actual all-target EMPTY readback followed by
+ * exact root CAS to INITIALIZING. Still not an ordinary writer/serving grant. */
+extern ClusterControlRootResult cluster_control_root_v3_startup_begin_clean(
+	const ClusterControlRootIdentity *self, const uint8 operation_uuid[16],
+	const ClusterControlRootFileToken *expected, ClusterControlRootFileToken *out);
+
 /* Exact selected-object decoding. Does not prove the evidence digest,
  * inspect physical WAL or authorize a state transition. All output clears on
  * refusal, and no input may overlap it. Caller owns root/CF qualification. */
@@ -253,6 +266,14 @@ extern ClusterControlRootResult cluster_wal_startup_discard(ClusterWalStartupSta
 extern ClusterControlRootResult cluster_wal_startup_read_locked(const ControlRootImage *root,
 																uint32 origin_node,
 																ClusterWalStartupImage *out);
+
+/* Physical metadata only, under qualified CF-X. The root adapter owns target
+ * and provider admission. create=false refuses missing metadata. sync=true
+ * independently reestablishes physical durability, including when the target
+ * failed after creation. Neither mode selects INITIALIZING or enables insertion. */
+extern ClusterControlRootResult cluster_wal_startup_empty_locked(const ControlRootImage *root,
+																 uint32 origin_node, bool create,
+																 bool sync);
 
 /* Exact read-only consumption under existing clusterwide CF-S/X. No staging
  * directory or write permission required; refusal clears the whole output. */

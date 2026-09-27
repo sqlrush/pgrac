@@ -5,11 +5,13 @@
  */
 #include "postgres.h"
 #include <fcntl.h>
+#include <dirent.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_wal_thread.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
@@ -29,6 +31,8 @@ typedef struct HistoryDirs {
 	struct stat objects_stat;
 	struct stat staging_stat;
 } HistoryDirs;
+
+static bool history_hash(pg_cryptohash_ctx *ctx, const uint8 *bytes, size_t len, uint8 hash[32]);
 
 static bool
 history_nonzero(const uint8 *bytes, size_t len)
@@ -114,6 +118,256 @@ done:
 		history_close(fds[i], &result);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		history_close_dirs(out, &result);
+	return result;
+}
+
+/* PGRAC: RESERVED creates metadata only. No guessed thread parent, overwrite,
+ * WAL segment or native mutation. Selected complete metadata can be fsynced
+ * and reobserved after an uncertain result; malformed partial files remain
+ * refused for the operation's recovery/retirement owner, never repaired here.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+startup_empty_entries(int fd, const char *a, const char *b, const char *c)
+{
+	int copy = dup(fd);
+	DIR *dir;
+	struct dirent *entry;
+	bool valid = true;
+	if (copy < 0)
+		return false;
+	dir = fdopendir(copy);
+	if (dir == NULL) {
+		close(copy);
+		return false;
+	}
+	rewinddir(dir);
+	errno = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		const char *name = entry->d_name;
+		if (strcmp(name, ".") != 0 && strcmp(name, "..") != 0 && (a == NULL || strcmp(name, a) != 0)
+			&& (b == NULL || strcmp(name, b) != 0) && (c == NULL || strcmp(name, c) != 0)) {
+			valid = false;
+			break;
+		}
+	}
+	if (errno != 0)
+		valid = false;
+	return closedir(dir) == 0 && valid;
+}
+
+static int
+startup_empty_dir(int parent, const char *name, bool create, bool *created)
+{
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	struct stat before, after;
+	int fd;
+	*created = false;
+	if (create) {
+		if (mkdirat(parent, name, 0700) == 0)
+			*created = true;
+		else if (errno != EEXIST)
+			return -1;
+	}
+	if (fstatat(parent, name, &before, AT_SYMLINK_NOFOLLOW) != 0 || !history_owned(&before, true))
+		return -1;
+	fd = openat(parent, name, flags);
+	if (fd >= 0
+		&& (fstat(fd, &after) != 0 || after.st_dev != before.st_dev || after.st_ino != before.st_ino
+			|| !history_owned(&after, true))) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+static ClusterControlRootResult
+startup_empty_file(int dir, const char *name, const uint8 *expected, Size length, bool create,
+				   bool sync)
+{
+	uint8 bytes[CLUSTER_WAL_DURABLE_PREFIX_BYTES + 1];
+	struct stat st, named;
+	int flags = O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY;
+	int fd = -1;
+	Size used = 0;
+	bool fresh = false;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (create) {
+		fd = openat(dir, name, flags | O_RDWR | O_CREAT | O_EXCL, 0600);
+		fresh = fd >= 0;
+		if (fd < 0 && errno != EEXIST)
+			return result;
+	}
+	if (fd < 0)
+		fd = openat(dir, name, flags | (sync ? O_RDWR : O_RDONLY));
+	if (fd < 0)
+		return errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : result;
+	if (fstat(fd, &st) != 0 || !history_owned(&st, false) || st.st_nlink != 1)
+		goto done;
+	if (fresh) {
+		while (used < length) {
+			ssize_t n = write(fd, expected + used, length - used);
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n <= 0)
+				goto done;
+			used += n;
+		}
+	}
+	if (lseek(fd, 0, SEEK_SET) != 0)
+		goto done;
+	used = 0;
+	while (used < length + 1) {
+		ssize_t n = read(fd, bytes + used, length + 1 - used);
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n < 0)
+			goto done;
+		if (n == 0)
+			break;
+		used += n;
+	}
+	if (used != length || memcmp(bytes, expected, length) != 0) {
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		goto done;
+	}
+	if (sync && pg_fsync(fd) != 0)
+		goto done;
+	if (fstatat(dir, name, &named, AT_SYMLINK_NOFOLLOW) != 0 || !history_owned(&named, false)
+		|| named.st_nlink != 1 || st.st_dev != named.st_dev || st.st_ino != named.st_ino) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	history_close(fd, &result);
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool create, bool sync)
+{
+	const int flags = O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC;
+	ClusterWalStartupImage op;
+	ClusterWalDurablePrefixRef ref;
+	ClusterWalDurablePrefix empty = { 1, 0, 0, 0 };
+	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES], prefix[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
+	pg_cryptohash_ctx *ctx;
+	char thread[32], generation[48];
+	/* WAL root/thread/generation/prefix/archive; shared/global/anchors/thread/generation/stage. */
+	int fds[11];
+	int parents[] = { -1, 0, 1, 2, 2, -1, 5, 6, 7, 8, 9 };
+	const char *names[] = { cluster_wal_threads_dir,
+							thread,
+							generation,
+							"durable_prefix",
+							"archive_status",
+							cluster_shared_data_dir,
+							"global",
+							"anchor_images",
+							thread,
+							generation,
+							".staging" };
+	struct stat opened[11], named;
+	bool created, hashed;
+	ClusterControlRootResult result;
+
+	if (!cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if ((create && !sync) || (sync && !enableFsync))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_wal_startup_read_locked(root, node, &op);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (op.phase != CLUSTER_WAL_STARTUP_RESERVED || cluster_wal_threads_dir == NULL
+		|| cluster_wal_threads_dir[0] == '\0' || cluster_shared_data_dir == NULL
+		|| cluster_shared_data_dir[0] == '\0')
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	result = cluster_wal_claim_v2_encode(&op.claim, claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	memset(&ref, 0, sizeof(ref));
+	ref.claim.identity = op.claim.identity;
+	ref.claim.database_incarnation = op.database_incarnation;
+	ref.claim.max_config_generation = op.config_generation;
+	ref.timeline = op.timeline;
+	ctx = pg_cryptohash_create(PG_SHA256);
+	if (ctx == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	hashed = history_hash(ctx, claim, sizeof(claim), ref.claim.claim_sha256);
+	pg_cryptohash_free(ctx);
+	if (!hashed)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_wal_durable_prefix_encode(&ref, &empty, prefix);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	snprintf(thread, sizeof(thread), "thread_%u", node + 1);
+	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,
+			 op.claim.identity.origin_owner_incarnation);
+	for (unsigned i = 0; i < lengthof(fds); ++i)
+		fds[i] = -1;
+	result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	for (unsigned i = 0; i < lengthof(fds); ++i) {
+		created = false;
+		if (parents[i] < 0)
+			fds[i] = open(names[i], flags);
+		else
+			fds[i] = startup_empty_dir(fds[parents[i]], names[i],
+									   create && (i == 2 || i == 3 || i == 4 || i == 9 || i == 10),
+									   &created);
+		if (fds[i] < 0 || fstat(fds[i], &opened[i]) != 0 || !history_owned(&opened[i], true)) {
+			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+		if (i == 2) {
+			/* An existing unclaimed directory is not ours to initialize. */
+			result = startup_empty_file(fds[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME, claim,
+										sizeof(claim), create && created, sync);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				goto done;
+			if (!startup_empty_entries(fds[2], CLUSTER_WAL_THREAD_CLAIM_FILENAME, "durable_prefix",
+									   "archive_status")) {
+				result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+				goto done;
+			}
+		}
+		if (i == 3) {
+			if (!startup_empty_entries(fds[3], "current", NULL, NULL)) {
+				result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+				goto done;
+			}
+			result = startup_empty_file(fds[3], "current", prefix, sizeof(prefix), create, sync);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				goto done;
+		}
+		if ((i == 4 || i == 10) && !startup_empty_entries(fds[i], NULL, NULL, NULL)) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			goto done;
+		}
+		if (i == 9 && !startup_empty_entries(fds[i], ".staging", NULL, NULL)) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			goto done;
+		}
+	}
+	/* Persist descendants before parents, then ensure the named tree is still
+	 * exactly the tree just inspected. No allocations/ERROR while FDs are open. */
+	for (int i = lengthof(fds) - 1; i >= 0; --i) {
+		if (sync && pg_fsync(fds[i]) != 0) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+		if ((parents[i] < 0 ? lstat(names[i], &named)
+							: fstatat(fds[parents[i]], names[i], &named, AT_SYMLINK_NOFOLLOW))
+				!= 0
+			|| !history_owned(&named, true) || named.st_dev != opened[i].st_dev
+			|| named.st_ino != opened[i].st_ino) {
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			goto done;
+		}
+	}
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	for (unsigned i = 0; i < lengthof(fds); ++i)
+		history_close(fds[i], &result);
 	return result;
 }
 
