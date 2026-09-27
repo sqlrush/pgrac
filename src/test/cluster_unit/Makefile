@@ -732,8 +732,30 @@ test_cluster_checkpointer_stop.inc: $(top_srcdir)/src/backend/postmaster/checkpo
 # PGRAC: execute the native adapter, not source-string assertions.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^ClusterCheckpointV3(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	awk '/^Cluster(CheckpointV3|StartupCheckpoint)(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_insert_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^StartupXLOG\(/ { owner=1 } owner && /Insert = &XLogCtl->Insert;/ { emit=1; count++ } \
+	     emit { print; if (/XLogCtl->LogwrtRqst.Flush = EndOfLog;/) emit=0 } /^}/ { owner=0 } \
+	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_lsn_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^XLogBytePosTo(End)?RecPtr\(/ { print "static XLogRecPtr"; emit=1; count++ } \
+	     /^XLogRecPtrToBytePos\(/ { print "static uint64"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_reserve_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ReserveXLogInsertLocation\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
@@ -753,7 +775,7 @@ test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/tra
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.

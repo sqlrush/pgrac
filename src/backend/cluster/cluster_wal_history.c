@@ -316,8 +316,18 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 			fds[i] = startup_empty_dir(fds[parents[i]], names[i],
 									   create && (i == 2 || i == 3 || i == 4 || i == 9 || i == 10),
 									   &created);
-		if (fds[i] < 0 || fstat(fds[i], &opened[i]) != 0 || !history_owned(&opened[i], true)) {
+		if (fds[i] < 0) {
 			result = errno == ENOENT ? CLUSTER_CONTROL_ROOT_ABSENT : CLUSTER_CONTROL_ROOT_IO_ERROR;
+			/* PGRAC: only a not-yet-created target generation is waitable
+			 * at the coordinator's RESERVED durability barrier. Missing
+			 * selected input, required parents or a partial target is not. */
+			if (result == CLUSTER_CONTROL_ROOT_ABSENT && i == 2 && !create && sync
+				&& op.phase == CLUSTER_WAL_STARTUP_RESERVED)
+				result = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+			goto done;
+		}
+		if (fstat(fds[i], &opened[i]) != 0 || !history_owned(&opened[i], true)) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 			goto done;
 		}
 		if (i == 2) {

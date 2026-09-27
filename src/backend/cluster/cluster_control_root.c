@@ -4046,6 +4046,158 @@ typedef struct StartupTargetWork {
 	bool cf_held;
 } StartupTargetWork;
 
+/* PGRAC: one native startup observation, never a transport loop under CF.
+ * The existing coordinator reserves/begins the cohort; targets prepare only
+ * their own namespace. Initializing output is intent for the native adapter,
+ * not a general writer or serving capability. Author: SqlRush <sqlrush@gmail.com> */
+typedef struct StartupAdvanceWork {
+	ControlRootImage root;
+	ClusterFormationSnapshotV1 formation;
+	ClusterStartupExitCut cut;
+	ClusterWalStartupImage op;
+	ClusterControlRootFileToken token;
+	bool cf_held;
+} StartupAdvanceWork;
+
+static ClusterControlRootResult
+startup_advance_observe(StartupAdvanceWork *work, const ClusterWalDurablePrefixRef *restart)
+{
+	ControlFileData common;
+	ClusterControlRootResult result;
+	unsigned node = cluster_node_id;
+
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_held = true;
+	result = read_control_version(restart->claim.identity.storage_uuid,
+								  restart->claim.identity.system_identifier, &work->root, &common,
+								  &work->token, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!work->root.present[node]
+		|| work->root.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| (work->root.header.v2.configured[node / 64] & (UINT64_C(1) << (node % 64))) == 0
+		|| !cluster_control_root_identity_equal(&restart->claim.identity,
+												&work->root.records[node].identity)
+		|| restart->claim.database_incarnation != work->root.header.v2.database_incarnation
+		|| restart->claim.max_config_generation != work->root.header.v2.config_generation
+		|| restart->timeline != work->root.records[node].checkpoint_tli
+		|| memcmp(restart->claim.claim_sha256, work->root.refs[node].claim_sha256, 32) != 0
+		|| !startup_owner_current(
+			restart->claim.identity.system_identifier, cluster_epoch_get_current(),
+			cluster_qvotec_get_self_incarnation(), work->root.header.v2.configured))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (work->root.header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_CLOSED) {
+		if (!cluster_reconfig_capture_formation_snapshot_v1(node + 1, &work->formation))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		return cluster_control_root_v3_clean_exit_cut(
+			work->root.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, restart->claim.identity.storage_uuid,
+			restart->claim.identity.system_identifier, &work->formation, &work->cut);
+	}
+	if (work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+		|| work->root.header.v2.serving[0] != 0 || work->root.header.v2.serving[1] != 0
+		|| work->root.startup[node].generation == 0)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	result = cluster_wal_startup_read_locked(&work->root, node, &work->op);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (work->op.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+		|| work->op.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation()
+		|| work->op.formation_epoch != cluster_epoch_get_current())
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+startup_advance_step(StartupAdvanceWork *work, const ClusterWalDurablePrefixRef *restart,
+					 ClusterWalStartupImage *out)
+{
+	ClusterControlRootResult result = startup_advance_observe(work, restart);
+	ClusterControlRootFileToken published;
+	ClusterWalStartupImage prepared;
+	unsigned coordinator = 0;
+
+	if (work->cf_held) {
+		work->cf_held = false;
+		result = release_cf(ShareLock, result);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	while (
+		coordinator < CLUSTER_MAX_NODES
+		&& (work->root.header.v2.configured[coordinator / 64] & (UINT64_C(1) << (coordinator % 64)))
+			   == 0)
+		++coordinator;
+	if (work->root.header.v2.database_state == CLUSTER_CONTROL_ROOT_DATABASE_CLOSED) {
+		if (coordinator != (unsigned)cluster_node_id)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		result = cluster_control_root_v3_reserve_clean(&work->cut, &published);
+		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+														 : result;
+	}
+	if (work->op.phase == CLUSTER_WAL_STARTUP_RESERVED) {
+		result = cluster_control_root_v3_startup_prepare_target(&work->op.claim.identity,
+																work->op.operation_uuid, &prepared);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (coordinator != (unsigned)cluster_node_id)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		result = cluster_control_root_v3_startup_begin_clean(
+			&work->op.claim.identity, work->op.operation_uuid, &work->token, &published);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+		return result;
+	}
+	if (work->op.phase != CLUSTER_WAL_STARTUP_INITIALIZING)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	return cluster_control_root_v3_startup_read_writer(&work->op.claim.identity,
+													   work->op.operation_uuid, out);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_startup_advance_clean(const ClusterWalDurablePrefixRef *restart,
+											  ClusterWalStartupImage *out)
+{
+	StartupAdvanceWork *work;
+	ClusterControlRootResult result;
+	ClusterWalDurablePrefixRef selected;
+	bool alias = history_ranges_overlap(restart, sizeof(*restart), out, sizeof(*out));
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (alias || out == NULL || restart == NULL || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES || CritSectionCount != 0
+		|| MyBackendType != B_STARTUP || ShutdownRequestPending || !cluster_shared_config
+		|| !cluster_enabled || !cluster_controlfile_shared_authority
+		|| !cluster_wal_thread_restart_v2_ref(&selected)
+		|| memcmp(&selected, restart, sizeof(selected)) != 0
+		|| restart->claim.identity.origin_node_id != cluster_node_id
+		|| restart->claim.identity.origin_thread_id != cluster_node_id + 1
+		|| cluster_cf_held_is_clusterwide(ShareLock)
+		|| cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		result = startup_advance_step(work, restart, out);
+	}
+	PG_CATCH();
+	{
+		if (work->cf_held) {
+			work->cf_held = false;
+			(void)release_cf(ShareLock, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		}
+		memset(out, 0, sizeof(*out));
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	pfree(work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
 typedef enum StartupTargetAction {
 	STARTUP_TARGET_PREPARE,
 	STARTUP_TARGET_READ,

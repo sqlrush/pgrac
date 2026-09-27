@@ -166,6 +166,14 @@ typedef struct ClusterWalStartupImage {
 	TimeLineID prefix_timeline;
 } ClusterWalStartupImage;
 
+/* Native StartupProcess advances one exact clean-cohort observation. WAIT
+ * means no native mutation permission; repeat only after releasing all holds.
+ * OK returns this target's INITIALIZING operation, not serving permission.
+ * An interrupted initialized writer needs recovery, never caller adoption. */
+extern ClusterControlRootResult
+cluster_control_root_v3_startup_advance_clean(const ClusterWalDurablePrefixRef *restart,
+											  ClusterWalStartupImage *out);
+
 /* Exact target StartupProcess, RESERVED only. Creates/reobserves empty
  * physical metadata; owns CF-X and never grants native WAL/data permission.
  * Refusal clears out. Existing selected files are never overwritten. */
@@ -292,7 +300,10 @@ extern ClusterControlRootResult cluster_wal_startup_read_locked(const ControlRoo
 																ClusterWalStartupImage *out);
 
 /* Physical metadata only, under qualified CF-X. The root adapter owns target
- * and provider admission. create=false refuses missing metadata. sync=true
+ * and provider admission. create=false refuses missing metadata, except that
+ * a RESERVED generation not created yet returns RECONFIG_WAIT to the sync
+ * barrier. A missing required parent or partial generation is never a wait.
+ * sync=true
  * independently reestablishes physical durability, including when the target
  * failed after creation. Neither mode selects INITIALIZING or enables insertion. */
 extern ClusterControlRootResult cluster_wal_startup_empty_locked(const ControlRootImage *root,

@@ -7634,6 +7634,185 @@ UT_TEST(test_v3_target_creates_only_exact_empty_successor)
 	}
 }
 
+static ClusterWalDurablePrefixRef
+v3_driver_restart(const ControlRootImage *root, unsigned node)
+{
+	ClusterWalDurablePrefixRef ref = { 0 };
+	ref.claim.identity = root->records[node].identity;
+	ref.claim.database_incarnation = root->header.v2.database_incarnation;
+	ref.claim.max_config_generation = root->header.v2.config_generation;
+	memcpy(ref.claim.claim_sha256, root->refs[node].claim_sha256, 32);
+	ref.timeline = root->records[node].checkpoint_tli;
+	test_restart_ref = ref;
+	test_restart_ref_valid = true;
+	cluster_node_id = node;
+	test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[node];
+	return ref;
+}
+
+UT_TEST(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterWalStartupImage op = v3_target_fixture(before, &root, 0), observed;
+	ClusterWalDurablePrefixRef restart = v3_driver_restart(&root, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	v2_assert_primary_unchanged(before);
+	/* The peer can prepare its namespace but cannot publish INITIALIZING. */
+	restart = v3_driver_restart(&root, 3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	v2_assert_primary_unchanged(before);
+	restart = v3_driver_restart(&root, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+	UT_ASSERT(memcmp(observed.operation_uuid, op.operation_uuid, 16) == 0);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	restart = v3_driver_restart(&root, 3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed), 0);
+	UT_ASSERT_EQ(observed.claim.identity.origin_node_id, 3);
+	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	cluster_node_id = 0;
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_native_driver_rejects_foreign_input_and_owner_without_mutation)
+{
+	for (unsigned fault = 0; fault < 5; fault++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterWalStartupImage op = v3_target_fixture(before, &root, 0), observed;
+		ClusterWalDurablePrefixRef restart = v3_driver_restart(&root, 0);
+		(void)op;
+		if (fault == 0)
+			restart.claim.claim_sha256[0] ^= 1;
+		if (fault == 1)
+			test_reserve_provider = false;
+		if (fault == 2)
+			MyBackendType = B_BACKEND;
+		if (fault == 3)
+			ShutdownRequestPending = true;
+		if (fault == 4)
+			test_restart_ref_valid = false;
+		UT_ASSERT(cluster_control_root_v3_startup_advance_clean(&restart, &observed) != 0);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_native_driver_reserves_closed_cohort_only_on_coordinator)
+{
+	uint8 before[66048], after[66048];
+	ControlRootImage root, selected;
+	ClusterWalStartupImage observed;
+	ClusterWalDurablePrefixRef restart;
+	char path[MAXPGPATH];
+	v3_reserve_fixture(before, &root);
+	restart = v3_driver_restart(&root, 3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	v2_assert_primary_unchanged(before);
+	restart = v3_driver_restart(&root, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_advance_clean(&restart, &observed),
+				 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, after, sizeof(after));
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(after, sizeof(after), v2_storage, TEST_SYSID, &selected), 0);
+	UT_ASSERT_EQ(selected.header.file_txn_seq, root.header.file_txn_seq + 1);
+	UT_ASSERT_EQ(selected.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(selected.header.v2.configured[0], 9);
+	UT_ASSERT_EQ(selected.header.v2.serving[0] | selected.header.v2.serving[1], 0);
+	UT_ASSERT(selected.startup[0].generation != 0 && selected.startup[3].generation != 0);
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_native_driver_missing_selected_or_partial_namespace_is_not_wait)
+{
+	for (unsigned fault = 0; fault < 6; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterWalStartupImage peer = v3_target_fixture(before, &root, 3), observed;
+		ClusterWalDurablePrefixRef restart;
+		ClusterControlRootResult result;
+		char path[MAXPGPATH], moved[MAXPGPATH], digest[65];
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_prepare_target(&peer.claim.identity,
+																	peer.operation_uuid, &observed),
+					 0);
+		switch (fault) {
+		case 0:
+			v3_target_path(path, &peer, "/" CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+			break;
+		case 1:
+			v3_target_path(path, &peer, "/durable_prefix/current");
+			break;
+		case 2:
+			v3_target_path(path, &peer, "/archive_status");
+			break;
+		case 3:
+			snprintf(path, sizeof(path),
+					 "%s/global/anchor_images/thread_4/generation_" UINT64_FORMAT, test_root,
+					 peer.claim.identity.origin_owner_incarnation);
+			break;
+		case 4:
+			snprintf(path, sizeof(path), "%s/thread_4", cluster_wal_threads_dir);
+			break;
+		default:
+			for (unsigned i = 0; i < 32; ++i)
+				snprintf(digest + i * 2, 3, "%02x", root.startup[3].sha256[i]);
+			snprintf(path, sizeof(path),
+					 "%s/global/wal_startup/thread_4/startup_" UINT64_FORMAT "-%s.bin", test_root,
+					 root.startup[3].generation, digest);
+			break;
+		}
+		snprintf(moved, sizeof(moved), "%s.moved", path);
+		UT_ASSERT_EQ(rename(path, moved), 0);
+		restart = v3_driver_restart(&root, 0);
+		result = cluster_control_root_v3_startup_advance_clean(&restart, &observed);
+		UT_ASSERT_EQ(rename(moved, path), 0);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_native_driver_uncertain_observation_release_does_not_advance)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterWalStartupImage op = v3_target_fixture(before, &root, 0), observed;
+	ClusterWalDurablePrefixRef restart = v3_driver_restart(&root, 0);
+	ClusterControlRootResult result;
+	char path[MAXPGPATH];
+	struct stat st;
+	test_cf_release_confirmed = false;
+	result = cluster_control_root_v3_startup_advance_clean(&restart, &observed);
+	test_cf_release_confirmed = true;
+	UT_ASSERT(result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			  && result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	v2_assert_primary_unchanged(before);
+	v3_target_path(path, &op, "");
+	UT_ASSERT(lstat(path, &st) < 0 && errno == ENOENT);
+	/* Unconfirmed release is not reported as NoLock or retried by the driver. */
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	test_actual_cf = test_cf_mode = NoLock;
+	test_reserve_mode = false;
+}
+
 UT_TEST(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation)
 {
 	uint8 before[66048], after[66048];
@@ -14664,7 +14843,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(273);
+	UT_PLAN(278);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
@@ -14675,6 +14854,11 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_side_reobserves_every_namespace_and_closes_all_fds);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
+	UT_RUN(test_v3_native_driver_prepares_sparse_targets_then_returns_initializing);
+	UT_RUN(test_v3_native_driver_rejects_foreign_input_and_owner_without_mutation);
+	UT_RUN(test_v3_native_driver_reserves_closed_cohort_only_on_coordinator);
+	UT_RUN(test_v3_native_driver_missing_selected_or_partial_namespace_is_not_wait);
+	UT_RUN(test_v3_native_driver_uncertain_observation_release_does_not_advance);
 	UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
 	UT_RUN(test_v3_startup_checkpoint_retry_requires_selected_root_durability);
 	UT_RUN(test_v3_startup_install_retains_predecessor_without_serving);

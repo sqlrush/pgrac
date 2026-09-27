@@ -683,6 +683,14 @@ static WALInsertLockPadded *WALInsertLocks = NULL;
  */
 static ControlFileData *ControlFile = NULL;
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: process-local native initialization owner; never a serving grant.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterWalStartupImage clusterStartupWriter;
+static bool clusterStartupWriterBound;
+static bool clusterStartupWriterInstalled;
+#endif
+
 /*
  * Calculate the amount of space left on the page after 'endptr'. Beware
  * multiple evaluation!
@@ -1237,6 +1245,17 @@ ReserveXLogInsertLocation(int size, XLogRecPtr *StartPos, XLogRecPtr *EndPos,
 	*StartPos = XLogBytePosToRecPtr(startbytepos);
 	*EndPos = XLogBytePosToEndRecPtr(endbytepos);
 	*PrevPtr = XLogBytePosToRecPtr(prevbytepos);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: usable position zero normally maps to a long-page header,
+	 * not InvalidXLogRecPtr. Only the first record of this exact independent
+	 * initializer has no predecessor; subsequent and legacy links stay native.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && MyBackendType == B_STARTUP && clusterStartupWriterBound
+		&& !clusterStartupWriterInstalled && prevbytepos == 0
+		&& *StartPos == clusterStartupWriter.first_segment_lsn + SizeOfXLogLongPHD)
+		*PrevPtr = InvalidXLogRecPtr;
+#endif
 
 	/*
 	 * Check that the conversions between "usable byte positions" and
@@ -6027,6 +6046,85 @@ CheckRequiredParameterValues(void)
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: after the sealed input has been read, switch the exact native
+ * initializer to its independent successor stream. No SQL admission.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static XLogRecPtr
+ClusterStartupWriterBegin(const EndOfWalRecoveryInfo *input)
+{
+	ClusterWalDurablePrefixRef restart;
+	ClusterWalStartupImage selected, routed;
+	ClusterControlRootResult result;
+	XLogRecPtr first = InvalidXLogRecPtr;
+
+	if (input == NULL || MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || clusterStartupWriterBound
+		|| clusterStartupWriterInstalled || CritSectionCount != 0 || ShutdownRequestPending
+		|| InRecovery || ArchiveRecoveryRequested || input->standby_signal_file_found
+		|| input->recovery_signal_file_found || input->abortedRecPtr != InvalidXLogRecPtr
+		|| input->missingContrecPtr != InvalidXLogRecPtr || ControlFile->state != DB_SHUTDOWNED
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock) || !cluster_wal_thread_restart_v2_ref(&restart))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native clean startup has no exact immutable input")));
+	for (;;) {
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		result = cluster_control_root_v3_startup_advance_clean(&restart, &selected);
+		if (result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+			&& result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+			break;
+		/* The observer dropped CF/WALR. A missing peer target is not a
+		 * timeout or permission to reduce the declared startup cohort. */
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(
+			FATAL,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("could not select the native successor initialization"),
+			 errdetail("PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_COHORT_UNPROVEN result=%d",
+					   (int)result)));
+	if (selected.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| selected.input_kind != CLUSTER_WAL_STARTUP_CLEAN
+		|| selected.segment_size != wal_segment_size || !IsValidWalSegSize(wal_segment_size)
+		|| selected.first_segment_lsn == 0 || selected.first_segment_lsn % wal_segment_size != 0
+		|| selected.first_segment_lsn < selected.sealed_input_end
+		|| selected.first_segment_lsn > UINT64_MAX - wal_segment_size
+		|| input->endOfLog != selected.sealed_input_end
+		|| input->endOfLog != selected.input_record_end
+		|| input->lastRec != selected.input_record_start
+		|| input->lastRecTLI != selected.input_timeline
+		|| input->endOfLogTLI != selected.input_timeline
+		|| selected.timeline != selected.input_timeline
+		|| ControlFile->checkPoint != selected.predecessor.snapshot.checkpoint_lower_lsn
+		|| ControlFile->checkPointCopy.ThisTimeLineID != selected.timeline)
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native recovery result contradicts its selected clean input")));
+	result = cluster_control_root_v3_startup_route_writer(&selected.claim.identity,
+														  selected.operation_uuid, &routed);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& memcmp(&routed, &selected, sizeof(selected)) != 0)
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = cluster_wal_durable_startup_prepare(&selected.claim.identity,
+													 selected.operation_uuid, &first);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || first != selected.first_segment_lsn)
+		ereport(FATAL,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not bind the native successor WAL stream"),
+				 errdetail(
+					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_WAL_ROUTE_UNPROVEN result=%d",
+					 (int)result)));
+	clusterStartupWriter = selected;
+	clusterStartupWriterBound = true;
+	return first;
+}
+#endif
+
 /*
  * This must be called ONCE during postmaster or standalone-backend startup
  */
@@ -6789,6 +6887,12 @@ StartupXLOG(void)
 	 * Allow ordinary WAL segment creation before possibly switching to a new
 	 * timeline, which creates a new segment, and after the last ReadRecord().
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: FinishWalRecovery consumed the old stream. Every following
+	 * native WAL byte, including preallocation, belongs to the bound successor. */
+	if (cluster_shared_config)
+		EndOfLog = ClusterStartupWriterBegin(endOfRecoveryInfo);
+#endif
 	SetInstallXLogFileSegmentActive();
 
 	/*
@@ -6877,6 +6981,11 @@ StartupXLOG(void)
 	 */
 	Insert = &XLogCtl->Insert;
 	Insert->PrevBytePos = XLogRecPtrToBytePos(endOfRecoveryInfo->lastRec);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: never link the independent writer to the predecessor stream. */
+	if (cluster_shared_config)
+		Insert->PrevBytePos = 0;
+#endif
 	Insert->CurrBytePos = XLogRecPtrToBytePos(EndOfLog);
 
 	/*
@@ -7015,6 +7124,13 @@ StartupXLOG(void)
 		promoted = PerformRecoveryXLogAction();
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a clean predecessor does not contain a checkpoint of the NEW
+	 * stream. Execute the real native EOR machinery before INSTALL/admission. */
+	if (cluster_shared_config)
+		CreateCheckPoint(CHECKPOINT_END_OF_RECOVERY | CHECKPOINT_IMMEDIATE | CHECKPOINT_FORCE);
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
 	/*
 	 * RF-B: the synchronous delegated EOR request must have completed the
 	 * INSTALLED -> ACTIVE -> DONE handoff before recovery ownership is released.
@@ -7103,6 +7219,14 @@ StartupXLOG(void)
 	 * there are no race conditions concerning visibility of other recent
 	 * updates to shared memory.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the typed checkpoint installed the actual root-selected OPEN
+	 * writer. This only finishes native startup memory; phase4 still gates SQL. */
+	if (cluster_shared_config
+		&& (!clusterStartupWriterInstalled || ControlFile->state != DB_IN_PRODUCTION))
+		ereport(FATAL, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native startup has no installed successor checkpoint")));
+#endif
 	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
 	ControlFile->state = DB_IN_PRODUCTION;
 
@@ -7110,7 +7234,11 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
-	UpdateControlFile();
+	/* PGRAC: root INSTALL already published this state; no untyped writer. */
+#ifdef USE_PGRAC_CLUSTER
+	if (!cluster_shared_config)
+#endif
+		UpdateControlFile();
 
 #ifdef USE_PGRAC_CLUSTER
 	/*
@@ -7129,7 +7257,7 @@ StartupXLOG(void)
 	 * yet admitted and this process writes none here), so a crash in the
 	 * residual two-file window loses no replayable work.
 	 */
-	if (cluster_controlfile_shared_authority && cluster_node_id >= 0)
+	if (!cluster_shared_config && cluster_controlfile_shared_authority && cluster_node_id >= 0)
 		cluster_recovery_anchor_refresh_state(ControlFile->system_identifier,
 											  (uint32) DB_IN_PRODUCTION);
 #endif
@@ -7918,11 +8046,155 @@ update_checkpoint_display(int flags, bool restartpoint, bool reset)
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: purpose-bound native checkpoint adapter. Author: SqlRush <sqlrush@gmail.com> */
 static void
+ClusterStartupCheckpointPrepare(int flags, ControlFileData *selected)
+{
+	memset(selected, 0, sizeof(*selected));
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterBound
+		|| clusterStartupWriterInstalled || CritSectionCount != 0 || ShutdownRequestPending
+		|| (flags & CHECKPOINT_END_OF_RECOVERY) == 0 || (flags & CHECKPOINT_IS_SHUTDOWN) != 0
+		|| clusterStartupWriter.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| LWLockHeldByMe(ControlFileLock) || cluster_cf_held(ShareLock)
+		|| cluster_cf_held(ExclusiveLock)
+		|| !cluster_wal_durable_startup_matches(&clusterStartupWriter.claim.identity,
+												clusterStartupWriter.operation_uuid,
+												clusterStartupWriter.first_segment_lsn)
+		|| ControlFile->state != DB_SHUTDOWNED
+		|| ControlFile->system_identifier != clusterStartupWriter.claim.identity.system_identifier
+		|| ControlFile->checkPoint != clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn
+		|| ControlFile->checkPointCopy.ThisTimeLineID != clusterStartupWriter.timeline
+		|| ControlFile->minRecoveryPoint != 0 || ControlFile->minRecoveryPointTLI != 0
+		|| ControlFile->backupStartPoint != 0 || ControlFile->backupEndPoint != 0
+		|| ControlFile->backupEndRequired)
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native successor checkpoint requires its bound initializer")));
+	/* Sole startup executor, before checkpointer/SQL admission. This copy is
+	 * input only; the actual checkpoint verifier will re-read the predecessor. */
+	*selected = *ControlFile;
+}
+
+static void
+ClusterStartupCheckpointPublish(const ControlFileData *candidate, XLogRecPtr end)
+{
+	ClusterWalStartupImage durable;
+	ClusterControlRootResult result;
+	ControlRootImage *root;
+	ClusterControlRootFileToken token;
+	ControlFileData selected;
+	bool durable_selected = false;
+	uint32 node = clusterStartupWriter.claim.identity.origin_node_id;
+
+	if (MyBackendType != B_STARTUP || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority || !clusterStartupWriterBound
+		|| clusterStartupWriterInstalled || CritSectionCount != 0 || ShutdownRequestPending
+		|| node >= CLUSTER_MAX_NODES || candidate->state != DB_SHUTDOWNED
+		|| candidate->checkPoint < clusterStartupWriter.first_segment_lsn
+		|| end <= candidate->checkPoint || LWLockHeldByMe(ControlFileLock)
+		|| cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("native successor publication requires its bound initializer")));
+	/* CAS competition alone is retryable. Each API drops its CF/WALR holds;
+	 * uncertain I/O/release and changed identity never become an owned wait. */
+	for (;;) {
+		HandleStartupProcInterrupts();
+		CHECK_FOR_INTERRUPTS();
+		if (ShutdownRequestPending
+			|| !cluster_wal_durable_startup_matches(&clusterStartupWriter.claim.identity,
+													clusterStartupWriter.operation_uuid,
+													clusterStartupWriter.first_segment_lsn))
+			ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							errmsg("native successor publication lost its initialization owner")));
+		if (!durable_selected) {
+			result = cluster_control_root_v3_startup_checkpoint(
+				&clusterStartupWriter.claim.identity, clusterStartupWriter.operation_uuid,
+				candidate, end, &durable);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				durable_selected = true; /* Actual DURABLE selected; INSTALL still required. */
+		} else
+			result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_thread_install_startup(&durable);
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT)
+			break;
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 20,
+						WAIT_EVENT_CLUSTER_STARTUP_PHASE_3);
+		ResetLatch(MyLatch);
+	}
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(ERROR,
+				(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+				 errmsg("could not install the native successor checkpoint"),
+				 errdetail(
+					 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_CHECKPOINT_UNPROVEN result=%d",
+					 (int)result)));
+	/* Runtime CF reads require serving and cannot be used here. Read the exact
+	 * installed thread through the private non-serving projection, then release
+	 * CF before changing native memory. Root installation remains durable even
+	 * if this final observation fails; a replacement must use recovery. */
+	root = palloc(sizeof(*root));
+	if (!cluster_cf_lock(ShareLock)) {
+		pfree(root);
+		ereport(ERROR, (errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+						errmsg("could not read the installed native successor")));
+	}
+	PG_TRY();
+	{
+		result = cluster_cf_held_is_clusterwide(ShareLock)
+					 ? cluster_control_root_v3_read_thread_locked(
+						   &clusterStartupWriter.claim.identity, root, &selected, &token)
+					 : CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	}
+	PG_CATCH();
+	{
+		(void)cluster_cf_unlock_confirmed(ShareLock);
+		pfree(root);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (cluster_cf_unlock_confirmed(ShareLock) != CLUSTER_CF_RELEASE_CONFIRMED)
+		result = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (!root->present[node] || root->startup[node].generation != 0
+			|| root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+			|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
+			|| root->header.v2.serving[0] != 0 || root->header.v2.serving[1] != 0
+			|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN
+			|| memcmp(&root->records[node].identity, &clusterStartupWriter.claim.identity,
+					  sizeof(clusterStartupWriter.claim.identity))
+				   != 0
+			|| selected.state != DB_IN_PRODUCTION || selected.checkPoint != candidate->checkPoint
+			|| selected.system_identifier != clusterStartupWriter.claim.identity.system_identifier
+			|| selected.checkPointCopy.ThisTimeLineID != clusterStartupWriter.timeline
+			|| !cluster_wal_durable_startup_matches(&clusterStartupWriter.claim.identity,
+													clusterStartupWriter.operation_uuid,
+													clusterStartupWriter.first_segment_lsn)))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	pfree(root);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(
+			ERROR,
+			(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+			 errmsg("installed native successor view is unproven"),
+			 errdetail(
+				 "PGRAC_FAMILY=CONTROL_ROOT PGRAC_REASON=STARTUP_INSTALL_VIEW_UNPROVEN result=%d",
+				 (int)result)));
+	LWLockAcquire(ControlFileLock, LW_EXCLUSIVE);
+	*ControlFile = selected;
+	LWLockRelease(ControlFileLock);
+	clusterStartupWriterInstalled = true;
+}
+
+static void
 ClusterCheckpointV3Prepare(int flags, ControlFileData *selected)
 {
 	ClusterWalDurablePrefixRef ref;
 	bool readable;
 	uint64 epoch = cluster_epoch_get_current();
+
+	if (MyBackendType == B_STARTUP && (flags & CHECKPOINT_END_OF_RECOVERY) != 0) {
+		ClusterStartupCheckpointPrepare(flags, selected);
+		return;
+	}
 
 	memset(selected, 0, sizeof(*selected));
 	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
@@ -7975,6 +8247,11 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 	ClusterControlRootFileToken token;
 	ClusterControlRootResult result;
 	uint64 epoch = cluster_epoch_get_current();
+
+	if (MyBackendType == B_STARTUP) {
+		ClusterStartupCheckpointPublish(candidate, end);
+		return;
+	}
 
 	if (!AmCheckpointerProcess() || !cluster_shared_config || !cluster_enabled
 		|| !cluster_controlfile_shared_authority || CritSectionCount != 0
@@ -8920,7 +9197,13 @@ CreateCheckPoint(int flags)
 	 * in subtrans.c).  During recovery, though, we mustn't do this because
 	 * StartupSUBTRANS hasn't been called yet.
 	 */
-	if (!RecoveryInProgress())
+	/* PGRAC: the first successor checkpoint cannot retire predecessor side
+	 * history. Its retention remains pinned across the non-serving INSTALL. */
+	if (!RecoveryInProgress()
+#ifdef USE_PGRAC_CLUSTER
+		&& !(cluster_shared_config && (flags & CHECKPOINT_END_OF_RECOVERY) != 0)
+#endif
+	)
 		TruncateSUBTRANS(GetOldestTransactionIdConsideredRunning());
 
 	/* Real work is done; log and update stats. */

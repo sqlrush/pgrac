@@ -4,10 +4,12 @@
 #include "postgres.h"
 #include <time.h>
 #include "access/xlog.h"
+#include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_wal_durable_prefix.h"
 #include "cluster/cluster_write_fence.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_reconfig.h"
@@ -16,6 +18,7 @@
 #include "../../backend/cluster/cluster_control_root_private.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
+#include "postmaster/startup.h"
 #include "storage/latch.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
@@ -50,6 +53,33 @@ static uint64 epoch;
 static unsigned root_calls, waits, local_updates, reads, releases;
 static unsigned native_writes, shutdown_calls;
 static ClusterControlRootResult returns[4];
+static ClusterWalStartupImage clusterStartupWriter;
+static bool clusterStartupWriterBound, clusterStartupWriterInstalled;
+BackendType MyBackendType = B_INVALID;
+static bool startup_binding_ok, startup_view_ok;
+static unsigned startup_calls, install_calls;
+static ClusterControlRootResult install_returns[4];
+bool InRecovery, ArchiveRecoveryRequested;
+int wal_segment_size = 16 * 1024 * 1024;
+static ClusterWalStartupImage offered;
+static EndOfWalRecoveryInfo input;
+static unsigned advance_calls, route_calls, bind_calls;
+static bool restart_ok, route_ok, bind_ok;
+static ClusterControlRootResult advance_returns[4];
+
+void *
+palloc(Size n)
+{
+	void *p = malloc(n);
+	if (p == NULL)
+		abort();
+	return p;
+}
+void
+pfree(void *p)
+{
+	free(p);
+}
 
 void
 ExceptionalCondition(const char *c, const char *f, int l)
@@ -189,6 +219,12 @@ ProcessInterrupts(void)
 	siglongjmp(error_boundary, 1);
 }
 void
+HandleStartupProcInterrupts(void)
+{
+	if (InterruptPending || ShutdownRequestPending)
+		siglongjmp(error_boundary, 1);
+}
+void
 ResetLatch(Latch *l)
 {
 	UT_ASSERT(l == MyLatch);
@@ -197,7 +233,8 @@ int
 WaitLatch(Latch *l, int e, long t, uint32 event)
 {
 	UT_ASSERT(l == MyLatch && (e & WL_EXIT_ON_PM_DEATH) && t > 0);
-	UT_ASSERT_EQ(event, WAIT_EVENT_CHECKPOINTER_MAIN);
+	UT_ASSERT_EQ(event, MyBackendType == B_STARTUP ? WAIT_EVENT_CLUSTER_STARTUP_PHASE_3
+												   : WAIT_EVENT_CHECKPOINTER_MAIN);
 	UT_ASSERT_EQ(cf_mode, NoLock);
 	UT_ASSERT(!local_lock && CritSectionCount == 0);
 	UT_ASSERT_EQ(current.checkPoint, 100);
@@ -243,6 +280,117 @@ cluster_control_root_v3_shutdown_checkpoint_publish(const ClusterControlRootIden
 	control->state = DB_IN_PRODUCTION;
 	return result;
 }
+
+bool
+cluster_wal_durable_startup_matches(const ClusterControlRootIdentity *self, const uint8 uuid[16],
+									XLogRecPtr first)
+{
+	return startup_binding_ok && fence_ok && provider_ok && !prebump
+		   && epoch == clusterStartupWriter.formation_epoch
+		   && memcmp(self, &clusterStartupWriter.claim.identity, sizeof(*self)) == 0
+		   && memcmp(uuid, clusterStartupWriter.operation_uuid, 16) == 0
+		   && first == clusterStartupWriter.first_segment_lsn;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_startup_checkpoint(const ClusterControlRootIdentity *self,
+										   const uint8 uuid[16], const ControlFileData *c,
+										   XLogRecPtr end, ClusterWalStartupImage *out)
+{
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	UT_ASSERT(!local_lock && CritSectionCount == 0 && MyBackendType == B_STARTUP);
+	UT_ASSERT(
+		cluster_wal_durable_startup_matches(self, uuid, clusterStartupWriter.first_segment_lsn));
+	UT_ASSERT(c == &candidate && c->state == DB_SHUTDOWNED && end == 220);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+	*out = clusterStartupWriter;
+	out->phase = CLUSTER_WAL_STARTUP_DURABLE;
+	UT_ASSERT(startup_calls < lengthof(returns));
+	return returns[startup_calls++];
+}
+
+ClusterControlRootResult
+cluster_wal_thread_install_startup(const ClusterWalStartupImage *durable)
+{
+	UT_ASSERT_EQ(cf_mode, NoLock);
+	UT_ASSERT(!local_lock && CritSectionCount == 0 && startup_calls > 0);
+	UT_ASSERT_EQ(durable->phase, CLUSTER_WAL_STARTUP_DURABLE);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT(install_calls < lengthof(install_returns));
+	return install_returns[install_calls++];
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_read_thread_locked(const ClusterControlRootIdentity *self,
+										   ControlRootImage *root, ControlFileData *out,
+										   ClusterControlRootFileToken *token)
+{
+	UT_ASSERT(install_calls > 0 && cf_mode == ShareLock && !local_lock);
+	UT_ASSERT(memcmp(self, &clusterStartupWriter.claim.identity, sizeof(*self)) == 0);
+	memset(root, 0, sizeof(*root));
+	memset(token, 0, sizeof(*token));
+	root->present[0] = true;
+	root->records[0].identity = *self;
+	root->records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	root->header.activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE;
+	root->header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+	*out = candidate;
+	out->state = DB_IN_PRODUCTION;
+	out->checkPointCopy.nextOid = 60002;
+	if (!startup_view_ok)
+		out->checkPoint++;
+	reads++;
+	if (read_error)
+		ereport(ERROR, (errmsg("startup fixture read error")));
+	return read_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	*out = ref;
+	return restart_ok;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_startup_advance_clean(const ClusterWalDurablePrefixRef *restart,
+											  ClusterWalStartupImage *out)
+{
+	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
+	UT_ASSERT(memcmp(restart, &ref, sizeof(ref)) == 0);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT(advance_calls < lengthof(advance_returns));
+	*out = offered;
+	return advance_returns[advance_calls++];
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_startup_route_writer(const ClusterControlRootIdentity *self,
+											 const uint8 uuid[16], ClusterWalStartupImage *out)
+{
+	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
+	UT_ASSERT(!clusterStartupWriterBound && bind_calls == 0 && advance_calls > 0);
+	UT_ASSERT(memcmp(self, &offered.claim.identity, sizeof(*self)) == 0);
+	UT_ASSERT(memcmp(uuid, offered.operation_uuid, 16) == 0);
+	route_calls++;
+	*out = offered;
+	return route_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+ClusterControlRootResult
+cluster_wal_durable_startup_prepare(const ClusterControlRootIdentity *self, const uint8 uuid[16],
+									XLogRecPtr *first)
+{
+	UT_ASSERT(cf_mode == NoLock && !local_lock && CritSectionCount == 0);
+	UT_ASSERT(!clusterStartupWriterBound && route_calls == 1);
+	UT_ASSERT(memcmp(self, &offered.claim.identity, sizeof(*self)) == 0);
+	UT_ASSERT(memcmp(uuid, offered.operation_uuid, 16) == 0);
+	bind_calls++;
+	*first = offered.first_segment_lsn;
+	return bind_ok ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+}
+
+#include "test_cluster_startup_writer_native.inc"
 
 #include "test_cluster_checkpoint_native.inc"
 
@@ -311,10 +459,22 @@ reset_fixture(void)
 	PG_exception_stack = NULL;
 	error_context_stack = NULL;
 	MyAuxProcType = CheckpointerProcess;
+	MyBackendType = B_CHECKPOINTER;
 	root_calls = waits = local_updates = reads = releases = 0;
 	native_writes = shutdown_calls = 0;
 	cluster_shared_config = cluster_enabled = cluster_controlfile_shared_authority = true;
 	memset(returns, 0, sizeof(returns));
+	memset(install_returns, 0, sizeof(install_returns));
+	memset(&clusterStartupWriter, 0, sizeof(clusterStartupWriter));
+	clusterStartupWriterBound = clusterStartupWriterInstalled = false;
+	startup_binding_ok = startup_view_ok = true;
+	startup_calls = install_calls = 0;
+	memset(&offered, 0, sizeof(offered));
+	memset(&input, 0, sizeof(input));
+	memset(advance_returns, 0, sizeof(advance_returns));
+	advance_calls = route_calls = bind_calls = 0;
+	restart_ok = route_ok = bind_ok = true;
+	InRecovery = ArchiveRecoveryRequested = false;
 }
 static bool
 prepare(int flags)
@@ -519,10 +679,326 @@ UT_TEST(early_shutdown_never_calls_untyped_writer_for_root_v3)
 		UT_ASSERT(!local_lock);
 	}
 }
+
+static void
+startup_fixture(void)
+{
+	reset_fixture();
+	MyBackendType = B_STARTUP;
+	MyAuxProcType = StartupProcess;
+	serving_ok = ref_ok = false;
+	current.state = candidate.state = DB_SHUTDOWNED;
+	current.checkPointCopy.ThisTimeLineID = 1;
+	clusterStartupWriterBound = true;
+	clusterStartupWriter.phase = CLUSTER_WAL_STARTUP_INITIALIZING;
+	clusterStartupWriter.claim.identity = ref.claim.identity;
+	clusterStartupWriter.claim.identity.origin_node_id = 0;
+	clusterStartupWriter.claim.identity.origin_thread_id = 1;
+	clusterStartupWriter.operation_uuid[0] = 5;
+	clusterStartupWriter.formation_epoch = epoch;
+	clusterStartupWriter.timeline = 1;
+	clusterStartupWriter.first_segment_lsn = 128;
+	clusterStartupWriter.predecessor.snapshot.checkpoint_lower_lsn = 100;
+}
+
+static bool
+startup_prepare(int flags)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointV3Prepare(flags, &candidate);
+	return true;
+}
+
+static bool
+startup_publish(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ClusterCheckpointV3Publish(&candidate, 220);
+	return true;
+}
+
+UT_TEST(startup_prepare_uses_only_bound_initializer_without_serving)
+{
+	startup_fixture();
+	UT_ASSERT(startup_prepare(CHECKPOINT_END_OF_RECOVERY | CHECKPOINT_IMMEDIATE));
+	UT_ASSERT_EQ(candidate.checkPoint, 100);
+	UT_ASSERT_EQ(candidate.state, DB_SHUTDOWNED);
+	UT_ASSERT_EQ(reads | local_updates | native_writes, 0);
+}
+
+UT_TEST(startup_prepare_rejects_other_purposes_and_lost_owner)
+{
+	for (unsigned f = 0; f < 10; ++f) {
+		int flags = CHECKPOINT_END_OF_RECOVERY;
+		startup_fixture();
+		if (f == 0)
+			flags = CHECKPOINT_FORCE;
+		if (f == 1)
+			flags |= CHECKPOINT_IS_SHUTDOWN;
+		if (f == 2)
+			MyBackendType = B_CHECKPOINTER;
+		if (f == 3)
+			clusterStartupWriterBound = false;
+		if (f == 4)
+			clusterStartupWriterInstalled = true;
+		if (f == 5)
+			startup_binding_ok = false;
+		if (f == 6)
+			ShutdownRequestPending = true;
+		if (f == 7)
+			current.checkPoint++;
+		if (f == 8)
+			provider_ok = false;
+		if (f == 9)
+			current.backupStartPoint = 1;
+		UT_ASSERT(!startup_prepare(flags));
+		UT_ASSERT_EQ(local_updates | native_writes, 0);
+	}
+}
+
+UT_TEST(startup_publish_installs_only_actual_root_projection)
+{
+	startup_fixture();
+	UT_ASSERT(startup_publish());
+	UT_ASSERT_EQ(startup_calls, 1);
+	UT_ASSERT_EQ(install_calls, 1);
+	UT_ASSERT_EQ(current.checkPoint, 200);
+	UT_ASSERT_EQ(current.state, DB_IN_PRODUCTION);
+	UT_ASSERT_EQ(current.checkPointCopy.nextOid, 60002);
+	UT_ASSERT(clusterStartupWriterInstalled);
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT_EQ(releases, 1);
+	UT_ASSERT_EQ(local_updates, 1);
+	UT_ASSERT_EQ(native_writes, 0);
+	UT_ASSERT_EQ(cf_mode, NoLock);
+}
+
+UT_TEST(startup_publish_reobserves_cas_without_holding_locks)
+{
+	startup_fixture();
+	returns[0] = install_returns[0] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	UT_ASSERT(startup_publish());
+	UT_ASSERT_EQ(startup_calls, 2);
+	UT_ASSERT_EQ(install_calls, 2);
+	UT_ASSERT_EQ(waits, 2);
+	UT_ASSERT_EQ(local_updates, 1);
+}
+
+UT_TEST(startup_publish_refusal_never_installs_in_memory_candidate)
+{
+	for (unsigned f = 0; f < 9; ++f) {
+		startup_fixture();
+		if (f == 0)
+			returns[0] = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (f == 1)
+			install_returns[0] = CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN;
+		if (f == 2)
+			lock_ok = false;
+		if (f == 3)
+			release_ok = false;
+		if (f == 4)
+			read_ok = false;
+		if (f == 5)
+			startup_view_ok = false;
+		if (f == 6)
+			read_error = true;
+		if (f == 7)
+			provider_ok = false;
+		if (f == 8) {
+			returns[0] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+			cancel_on_wait = true;
+		}
+		UT_ASSERT(!startup_publish());
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(current.state, DB_SHUTDOWNED);
+		UT_ASSERT(!clusterStartupWriterInstalled);
+		UT_ASSERT_EQ(local_updates | native_writes, 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+
+static void
+writer_begin_fixture(void)
+{
+	startup_fixture();
+	offered = clusterStartupWriter;
+	offered.input_kind = CLUSTER_WAL_STARTUP_CLEAN;
+	offered.segment_size = wal_segment_size;
+	offered.first_segment_lsn = wal_segment_size;
+	offered.input_record_start = 100;
+	offered.input_record_end = offered.sealed_input_end = 220;
+	offered.input_timeline = 1;
+	input.lastRec = 100;
+	input.endOfLog = 220;
+	input.lastRecTLI = input.endOfLogTLI = 1;
+	memset(&clusterStartupWriter, 0, sizeof(clusterStartupWriter));
+	clusterStartupWriterBound = false;
+}
+
+static XLogRecPtr
+writer_begin(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return InvalidXLogRecPtr;
+	return ClusterStartupWriterBegin(&input);
+}
+
+UT_TEST(writer_begin_routes_only_after_all_target_initializing)
+{
+	writer_begin_fixture();
+	advance_returns[0] = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	advance_returns[1] = CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT_EQ(advance_calls, 3);
+	UT_ASSERT_EQ(route_calls, 1);
+	UT_ASSERT_EQ(bind_calls, 1);
+	UT_ASSERT_EQ(waits, 2);
+	UT_ASSERT(clusterStartupWriterBound && !clusterStartupWriterInstalled);
+	UT_ASSERT(memcmp(&clusterStartupWriter, &offered, sizeof(offered)) == 0);
+	UT_ASSERT_EQ(current.checkPoint, 100);
+	UT_ASSERT_EQ(input.endOfLog, 220);
+	UT_ASSERT_EQ(native_writes | local_updates, 0);
+}
+
+UT_TEST(writer_begin_rejects_wrong_input_or_failed_route_without_binding)
+{
+	for (unsigned f = 0; f < 13; ++f) {
+		writer_begin_fixture();
+		if (f == 0)
+			restart_ok = false;
+		if (f == 1)
+			InRecovery = true;
+		if (f == 2)
+			ArchiveRecoveryRequested = true;
+		if (f == 3)
+			input.abortedRecPtr = 100;
+		if (f == 4)
+			input.endOfLog++;
+		if (f == 5)
+			input.lastRecTLI++;
+		if (f == 6)
+			input.lastRec++;
+		if (f == 7)
+			offered.first_segment_lsn++;
+		if (f == 8)
+			offered.phase = CLUSTER_WAL_STARTUP_DURABLE;
+		if (f == 9)
+			route_ok = false;
+		if (f == 10)
+			bind_ok = false;
+		if (f == 11)
+			advance_returns[0] = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (f == 12) {
+			advance_returns[0] = CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+			cancel_on_wait = true;
+		}
+		UT_ASSERT_EQ(writer_begin(), InvalidXLogRecPtr);
+		UT_ASSERT(!clusterStartupWriterBound);
+		UT_ASSERT_EQ(current.checkPoint, 100);
+		UT_ASSERT_EQ(native_writes | local_updates, 0);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+
+/* Execute the actual StartupXLOG buffer initialization and native address
+ * conversions. Only the shared-memory allocation is a small local fixture. */
+#define UsableBytesInPage (XLOG_BLCKSZ - SizeOfXLogShortPHD)
+static int UsableBytesInSegment;
+#include "test_cluster_startup_lsn_native.inc"
+
+typedef struct {
+	int insertpos_lck;
+	uint64 CurrBytePos, PrevBytePos;
+} XLogCtlInsert;
+static struct {
+	XLogCtlInsert Insert;
+} reserve_ctl, *XLogCtl = &reserve_ctl;
+#define SpinLockAcquire(l) ((void)(l))
+#define SpinLockRelease(l) ((void)(l))
+#include "test_cluster_startup_reserve_native.inc"
+#undef SpinLockAcquire
+#undef SpinLockRelease
+
+UT_TEST(native_first_record_has_zero_xl_prev_only_for_bound_successor)
+{
+	for (unsigned f = 0; f < 4; ++f) {
+		XLogRecPtr start, end, prev, initial;
+		writer_begin_fixture();
+		UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+		UsableBytesInSegment = (wal_segment_size / XLOG_BLCKSZ) * UsableBytesInPage
+							   - (SizeOfXLogLongPHD - SizeOfXLogShortPHD);
+		if (f == 1)
+			cluster_shared_config = false;
+		if (f == 2)
+			clusterStartupWriterBound = false;
+		if (f == 3)
+			clusterStartupWriterInstalled = true;
+		reserve_ctl.Insert.CurrBytePos = XLogRecPtrToBytePos(wal_segment_size);
+		reserve_ctl.Insert.PrevBytePos = 0;
+		ReserveXLogInsertLocation(64, &start, &end, &prev);
+		UT_ASSERT_EQ(start, wal_segment_size + SizeOfXLogLongPHD);
+		UT_ASSERT_EQ(end, start + 64);
+		UT_ASSERT_EQ(prev, f == 0 ? InvalidXLogRecPtr : SizeOfXLogLongPHD);
+		initial = start;
+		ReserveXLogInsertLocation(64, &start, &end, &prev);
+		UT_ASSERT_EQ(prev, initial);
+	}
+}
+
+UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
+{
+	for (unsigned shared = 0; shared < 2; ++shared) {
+		struct {
+			uint64 PrevBytePos, CurrBytePos;
+		} *Insert;
+		struct {
+			typeof(*Insert) Insert;
+			XLogRecPtr InitializedUpTo, xlblocks[2];
+			struct {
+				XLogRecPtr Write, Flush;
+			} LogwrtResult, LogwrtRqst;
+			int XLogCacheBlck;
+			char pages[2 * XLOG_BLCKSZ];
+		} ctl = { 0 }, *XLogCtl = &ctl;
+		typeof(ctl.LogwrtResult) LogwrtResult;
+		EndOfWalRecoveryInfo *endOfRecoveryInfo = &input;
+		XLogRecPtr EndOfLog;
+		char old_page[XLOG_BLCKSZ];
+		writer_begin_fixture();
+		memset(old_page, 0x5a, sizeof(old_page));
+		input.lastPage = old_page;
+		input.lastPageBeginPtr = 0;
+		ctl.XLogCacheBlck = 1;
+		UsableBytesInSegment = (wal_segment_size / XLOG_BLCKSZ) * UsableBytesInPage
+							   - (SizeOfXLogLongPHD - SizeOfXLogShortPHD);
+		EndOfLog = shared ? writer_begin() : input.endOfLog;
+		cluster_shared_config = shared;
+#define XLogRecPtrToBufIdx(p) (((p) / XLOG_BLCKSZ) % (XLogCtl->XLogCacheBlck + 1))
+#include "test_cluster_startup_insert_native.inc"
+#undef XLogRecPtrToBufIdx
+		UT_ASSERT_EQ(XLogBytePosToRecPtr(Insert->CurrBytePos),
+					 shared ? wal_segment_size + SizeOfXLogLongPHD : input.endOfLog);
+		if (shared) {
+			UT_ASSERT_EQ(Insert->PrevBytePos, 0);
+			UT_ASSERT_EQ(ctl.InitializedUpTo, wal_segment_size);
+			UT_ASSERT_EQ(ctl.xlblocks[0] | ctl.xlblocks[1], 0);
+			for (unsigned i = 0; i < sizeof(ctl.pages); ++i)
+				UT_ASSERT_EQ(ctl.pages[i], 0);
+		} else {
+			UT_ASSERT_EQ(XLogBytePosToRecPtr(Insert->PrevBytePos), input.lastRec);
+			UT_ASSERT_EQ(ctl.InitializedUpTo, XLOG_BLCKSZ);
+			UT_ASSERT(memcmp(ctl.pages, old_page, input.endOfLog) == 0);
+		}
+		UT_ASSERT_EQ(ctl.LogwrtResult.Flush, EndOfLog);
+		UT_ASSERT_EQ(ctl.LogwrtRqst.Flush, EndOfLog);
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(22);
 	UT_RUN(prepare_uses_short_owned_read);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(publish_retries_only_root_competition_before_projection);
@@ -536,5 +1012,15 @@ main(void)
 	UT_RUN(shutdown_missing_owner_or_publication_never_installs_candidate);
 	UT_RUN(online_checkpoint_during_shutdown_signal_stays_online);
 	UT_RUN(early_shutdown_never_calls_untyped_writer_for_root_v3);
+	UT_RUN(startup_prepare_uses_only_bound_initializer_without_serving);
+	UT_RUN(startup_prepare_rejects_other_purposes_and_lost_owner);
+	UT_RUN(startup_publish_installs_only_actual_root_projection);
+	UT_RUN(startup_publish_reobserves_cas_without_holding_locks);
+	UT_RUN(startup_publish_refusal_never_installs_in_memory_candidate);
+	UT_RUN(writer_begin_routes_only_after_all_target_initializing);
+	UT_RUN(writer_begin_rejects_wrong_input_or_failed_route_without_binding);
+	UT_RUN(native_startup_insert_has_no_link_or_page_from_predecessor);
+	UT_RUN(native_first_record_has_zero_xl_prev_only_for_bound_successor);
 	UT_DONE();
+	return ut_failed_count != 0;
 }
