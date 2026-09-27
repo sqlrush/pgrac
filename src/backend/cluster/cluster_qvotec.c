@@ -4060,8 +4060,23 @@ ClusterQvotecMain(void)
 			ClusterVotingDiskIoState rrc;
 
 			rrc = cluster_voting_disk_read_slot(qvotec_fds[d], d, (uint32)cluster_node_id, &probe);
-			if (rrc != CLUSTER_VOTING_DISK_IO_OK)
+			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+				/* PGRAC: do not overwrite an unknown predecessor on the first
+				 * poll. A missing observation is neither clean exit nor isolation.
+				 * Legacy profiles retain their original startup classification.
+				 * Author: SqlRush <sqlrush@gmail.com> */
+				if (cluster_shared_config)
+					ereport(FATAL,
+							(errcode(rrc == CLUSTER_VOTING_DISK_IO_TORN ? ERRCODE_DATA_CORRUPTED
+																		: ERRCODE_IO_ERROR),
+							 errmsg("could not verify prior voting identity before startup"),
+							 errdetail("Node %d, voting disk %d, read result %d.", cluster_node_id,
+									   d, rrc),
+							 errhint("Restore access to every configured voting disk and retry "
+									 "startup. Preserve unread or corrupt slots for diagnosis; do "
+									 "not clear them to bypass recovery or isolation.")));
 				continue;
+			}
 			if (probe.generation == 0)
 				continue; /* never written */
 			if (!(probe.flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE))
