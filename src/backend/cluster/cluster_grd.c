@@ -3361,7 +3361,8 @@ cluster_grd_recovery_authority_barrier_wait(const ClusterFormationSnapshotV1 *fo
 	 * until some UNRELATED reconfig lands.
 	 */
 	if ((epoch != formation->applied.new_epoch
-		 && !(formation->self_join_admitted && epoch > formation->applied.new_epoch))
+		 && !((formation->self_join_admitted || formation->startup_formation_generation != 0)
+			  && epoch > formation->applied.new_epoch))
 		|| epoch != cluster_epoch_get_current())
 		return false;
 

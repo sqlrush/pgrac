@@ -38,6 +38,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_wal_thread.h"
 
 #include <stddef.h>
 #include <string.h>
@@ -1034,6 +1035,20 @@ static ClusterXidStripeDiskState ut_xid_stripe_disk_state = CLUSTER_XID_STRIPE_D
 static ClusterWalSlotVerdict ut_wal_slot_verdict[CLUSTER_MAX_NODES];
 static ClusterWalStateSlot ut_wal_slot[CLUSTER_MAX_NODES];
 static bool ut_recovery_in_progress = false;
+/* PGRAC: typed successor INSTALL is a runtime boundary, not a native startup
+ * simulation. Author: SqlRush <sqlrush@gmail.com> */
+static bool ut_startup_writer_installed;
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!ut_startup_writer_installed)
+		return false;
+	out->claim.identity.origin_node_id = cluster_node_id;
+	out->claim.identity.origin_thread_id = cluster_node_id + 1;
+	out->claim.identity.origin_owner_incarnation = cluster_qvotec_get_self_incarnation();
+	return true;
+}
 ClusterXidStripeJoinVerdict
 cluster_xid_stripe_join_gate(bool self_may_seed)
 {
@@ -1360,7 +1375,7 @@ UT_TEST(test_reconfig_replacement_episode_is_embedded_and_zero_initialized)
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
 	memset(&empty_episode, 0, sizeof(empty_episode));
 
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 12640);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13752);
 	UT_ASSERT_EQ(memcmp(&state->replacement_episode, &empty_episode, sizeof(empty_episode)), 0);
 }
 
@@ -5189,7 +5204,7 @@ UT_TEST(test_reconfig_region3_mailbox_request_word_is_exact_duplex)
 
 	ut_join_setup();
 	state = (ClusterReconfigState *)reconfig_shmem_storage;
-	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 12640);
+	UT_ASSERT_EQ(sizeof(ClusterReconfigState), 13752);
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_TARGET_MASK, UINT32_C(0x0000007f));
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_RESERVED_MASK, UINT32_C(0x7fffff80));
 	UT_ASSERT_EQ(CLUSTER_JOIN_MARKER_REQUEST_VERIFY_COMMITTED_CLOSED, UINT32_C(0x80000000));
@@ -6654,6 +6669,161 @@ UT_TEST(test_cold_formation_leg1_writer_crash_midwrite_survivor_admits)
 	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), UINT64_C(77));
 }
 
+/* PGRAC: real cold-formation driver, fixture-backed voting observation and
+ * successor mirror. No startup or serving grant is stubbed into the driver.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterReconfigState *
+pre2_cold_fixture(int bad)
+{
+	ClusterFormationCommitMarker marker = { 0 };
+	uint64 incs[CLUSTER_MAX_NODES] = { 0 };
+	ClusterReconfigState *state;
+
+	cluster_online_join = false;
+	ut_cold_formation_setup_coboot();
+	cluster_shared_config = true;
+	ut_declared_set[1] = true;
+	state = (ClusterReconfigState *)reconfig_shmem_storage;
+	state->self_join_admitted = 0;
+	ut_startup_writer_installed = false;
+	ut_recovery_in_progress = true;
+	marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
+	marker.version = CLUSTER_FORMATION_MARKER_VERSION;
+	marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+	marker.formation_generation = 4;
+	marker.formation_epoch = bad == 1 ? 6 : 5;
+	marker.arbiter_node = 0;
+	marker.arbiter_incarnation = 66;
+	marker.commit_nonce = 1;
+	marker.n_admitted = 2;
+	marker.admitted_nodes[0] = 3;
+	incs[0] = 66;
+	incs[1] = bad == 2 ? 76 : 77;
+	if (bad == 3) {
+		incs[0] = 0;
+		marker.admitted_nodes[0] = 2;
+		marker.n_admitted = 1;
+	}
+	if (bad == 4) {
+		incs[2] = 88;
+		marker.admitted_nodes[0] = 7;
+		marker.n_admitted = 3;
+	}
+	if (bad == 5) {
+		marker.arbiter_node = 1;
+		marker.arbiter_incarnation = 77;
+	}
+	if (bad == 6)
+		state->pending_join_bitmap[0] = 1;
+	if (bad == 7)
+		state->removed_bitmap[0] = 1;
+	cluster_formation_marker_compute_crc(&marker);
+	cluster_reconfig_formation_qvotec_publish_observed(&marker, incs);
+	return state;
+}
+
+UT_TEST(test_pre2_cold_control_before_native_then_stripe)
+{
+	ClusterReconfigState *state = pre2_cold_fixture(0);
+	ClusterFormationSnapshotV1 snapshot;
+
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	for (int i = 0; i < 3; ++i)
+		cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(cluster_membership_get_state(1), CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), 77);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 0);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	UT_ASSERT_EQ(snapshot.self_join_admitted, 0);
+	ut_recovery_in_progress = false;
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 0);
+	ut_startup_writer_installed = true;
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_HOLD;
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 1);
+	ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(state->self_join_admitted, 1);
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 2);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 4);
+	UT_ASSERT_EQ(snapshot.self_join_admitted, 1);
+	cluster_membership_record_admitted(0, 67);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(2, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_cold_control_rejects_wrong_cohort)
+{
+	for (int bad = 1; bad <= 7; ++bad) {
+		ClusterReconfigState *state = pre2_cold_fixture(bad);
+		ut_xid_stripe_verdict = CLUSTER_XID_STRIPE_JOIN_PROCEED;
+		for (int i = 0; i < 3; ++i)
+			cluster_reconfig_cold_formation_tick();
+		UT_ASSERT_EQ(state->self_join_admitted, 0);
+		UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(1), 0);
+		UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 0);
+		cluster_shared_config = false;
+	}
+	ut_recovery_in_progress = false;
+}
+
+UT_TEST(test_pre2_cold_control_sparse_and_torn_observation)
+{
+	ClusterReconfigState *state = pre2_cold_fixture(0);
+	ClusterFormationCommitMarker marker = { 0 };
+	uint64 incs[CLUSTER_MAX_NODES] = { 0 };
+	ClusterFormationSnapshotV1 snapshot;
+	cluster_node_id = 5;
+	ut_declared_set[0] = ut_declared_set[1] = false;
+	ut_declared_set[2] = ut_declared_set[5] = true;
+	cluster_reconfig_record_observed_slot(2, 66, 1, 0);
+	cluster_reconfig_record_observed_fresh_alive(2, true);
+	marker.magic = CLUSTER_FORMATION_MARKER_MAGIC;
+	marker.version = CLUSTER_FORMATION_MARKER_VERSION;
+	marker.phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+	marker.formation_generation = 8;
+	marker.formation_epoch = 5;
+	marker.arbiter_node = 2;
+	marker.arbiter_incarnation = 66;
+	marker.commit_nonce = 9;
+	marker.n_admitted = 2;
+	marker.admitted_nodes[0] = 0x24;
+	incs[2] = 66;
+	incs[5] = 77;
+	cluster_formation_marker_compute_crc(&marker);
+	cluster_reconfig_formation_qvotec_publish_observed(&marker, incs);
+	uint64 seq = pg_atomic_read_u64(&state->observed_formation_marker_seq);
+	pg_atomic_write_u64(&state->observed_formation_marker_seq, seq + 1);
+	for (int i = 0; i < 3; ++i)
+		cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(cluster_membership_get_last_admitted_incarnation(5), 0);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	pg_atomic_write_u64(&state->observed_formation_marker_seq, seq + 2);
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(cluster_membership_get_state(2), CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_state(5), CLUSTER_MEMBER_MEMBER);
+	UT_ASSERT_EQ(cluster_membership_get_state(0), CLUSTER_MEMBER_ABSENT);
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(6, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 8);
+	UT_ASSERT(cluster_epoch_observe_remote(6));
+	ut_recovery_in_progress = false;
+	ut_startup_writer_installed = true;
+	cluster_reconfig_cold_formation_tick();
+	UT_ASSERT_EQ(state->self_join_admitted, 0);
+	UT_ASSERT_EQ(ut_xid_stripe_join_gate_calls, 0);
+	UT_ASSERT(cluster_reconfig_capture_formation_snapshot_v1(6, &snapshot));
+	UT_ASSERT_EQ(snapshot.startup_formation_generation, 0);
+	cluster_shared_config = false;
+}
+
 UT_TEST(test_initial_clean_snapshot_requires_exact_four_node_marker_and_empty_replacement)
 {
 	ClusterReconfigState *state;
@@ -6962,7 +7132,7 @@ UT_TEST(test_stop_reconfig_actual_formation_owner)
 int
 main(void)
 {
-	UT_PLAN(126);
+	UT_PLAN(129);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -7125,6 +7295,9 @@ main(void)
 	UT_RUN(test_cold_formation_leg2_live_survivor_refuses);
 	UT_RUN(test_cold_formation_leg3_divergent_marker_rejected_no_majority);
 
+	UT_RUN(test_pre2_cold_control_before_native_then_stripe);
+	UT_RUN(test_pre2_cold_control_rejects_wrong_cohort);
+	UT_RUN(test_pre2_cold_control_sparse_and_torn_observation);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

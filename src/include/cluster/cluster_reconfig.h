@@ -484,14 +484,18 @@ typedef struct ClusterReconfigState {
 	 *     generation qvotec found across region 7 at startup (0 = none);
 	 *     the arbiter writes max+1 (monotonic takeover rule).
 	 *   observed_formation_marker_* — this node's OWN region-7 slot,
-	 *     re-read by qvotec each poll; valid=1 only when the slot carries
+	 *     re-read by qvotec each poll; generation!=0 only when the slot carries
 	 *     a CRC-valid COMMITTED marker (generation/epoch/arbiter identity
 	 *     + the per-member incarnation table).  The cold-formation
 	 *     admission consumes it (exact incarnation -> record_admitted ->
-	 *     MEMBER).  The table is written by qvotec before valid flips to 1
-	 *     and re-read after (torn-free pairing with the generation latch).
+	 *     MEMBER).  The single publisher brackets all fields with an odd/even
+	 *     sequence; admission requires the same even sequence on both reads.
 	 */
 	pg_atomic_uint64 formation_marker_max_generation;
+	/* PGRAC: single-QVOTEC publication sequence prevents mixed observations.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	pg_atomic_uint64 observed_formation_marker_seq;
+	pg_atomic_uint64 observed_formation_marker_nonce;
 	pg_atomic_uint64 observed_formation_marker_generation; /* 0 = none */
 	pg_atomic_uint64 observed_formation_marker_epoch;
 	pg_atomic_uint64 observed_formation_marker_arbiter_node;
@@ -504,13 +508,18 @@ typedef struct ClusterReconfigState {
 	 * metadata may be published, but it does not open self_join_admitted.
 	 */
 	ClusterReplacementEpisode replacement_episode;
+	/* PGRAC: accepted durable formation, recovery CONTROL only until native
+	 * INSTALL and stripe completion. Protected by lock, never disk authority.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	ClusterFormationCommitMarker startup_formation;
+	uint64 startup_formation_incarnations[CLUSTER_MAX_NODES];
 } ClusterReconfigState;
 
-/* RF-ROOT P9 verification (cold-formation): +16 bytes = the bootstrap
- * publication seqlock (observed_bootstrap_seq) + the same-round in-quorum
- * snapshot (bootstrap_in_quorum). */
-StaticAssertDecl(sizeof(ClusterReconfigState) == 12640,
-				 "cluster reconfig state must remain exactly 12,640 bytes");
+/* PGRAC: includes the observation sequence and exact startup cohort binding;
+ * the allocator uses sizeof, and all processes require the same build.
+ * Author: SqlRush <sqlrush@gmail.com> */
+StaticAssertDecl(sizeof(ClusterReconfigState) == 13752,
+				 "cluster reconfig state must remain exactly 13,752 bytes");
 
 
 /* ============================================================

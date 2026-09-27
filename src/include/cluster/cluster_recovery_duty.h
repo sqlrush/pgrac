@@ -74,6 +74,10 @@ typedef struct ClusterFormationSnapshotV1 {
 	uint8 self_join_admitted;
 	uint8 self_join_failed;
 	uint8 reserved[2];
+	/* PGRAC: nonzero only for an exact accepted cold-start cohort. Derived
+	 * under the reconfig lock, not a serving/physical-recovery grant.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	uint64 startup_formation_generation;
 } ClusterFormationSnapshotV1;
 
 /* AD-023 recovery-control classification tag.  Captured runtime snapshots

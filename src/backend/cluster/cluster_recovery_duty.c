@@ -1118,7 +1118,8 @@ formation_witness_decide_live_v1(const ClusterFormationSnapshotV1 *f1,
 	return CLUSTER_FORMATION_WITNESS_READY;
 }
 
-/* AD-023 recovery-control/serving split.  The cold initial formation is
+/* AD-023 recovery-control/serving split (internal snapshot, never wire).
+ * The cold initial formation is
  * authority for recovery coordination before StartupXLOG, but it is not an
  * ordinary write/serving admission.  This is deliberately narrower than the
  * live witness: only the exact epoch-0 baseline with no reconfiguration debt
@@ -1140,6 +1141,38 @@ formation_witness_decide_recovery_control_v1(const ClusterFormationSnapshotV1 *f
 		return formation_witness_decide_live_v1(f1, authority, f2, origin_thread);
 	if (memcmp(f1, f2, sizeof(*f1)) != 0)
 		return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+	/* PGRAC: only a reconfig-captured exact cold cohort may replace the
+	 * epoch-0-only prerequisite. Its durable fence must still be majority-
+	 * proven at this exact epoch with no excluded writer. No live/duty builder
+	 * uses this arm. Author: SqlRush <sqlrush@gmail.com> */
+	if (f2->startup_formation_generation != 0 && f2->local_epoch > CLUSTER_EPOCH_INITIAL) {
+		if (f2->prebump_sync_active || f2->self_join_failed
+			|| formation_bitmap_nonempty(f2->pending_join_bitmap)
+			|| formation_bitmap_nonempty(f2->clean_departed_bitmap)
+			|| formation_bitmap_nonempty(f2->removed_bitmap)
+			|| formation_bitmap_nonempty(f2->excluded_bitmap)
+			|| formation_bitmap_nonempty(f2->applied.dead_bitmap)
+			|| formation_bitmap_nonempty(f2->applied.join_bitmap)
+			|| f2->applied.reconfig_kind == RECONFIG_KIND_FAIL_STOP
+			|| f2->applied.reconfig_kind == RECONFIG_KIND_JOIN_PENDING
+			|| f2->applied.new_epoch > f2->local_epoch)
+			return CLUSTER_FORMATION_WITNESS_UNSTABLE;
+		if (authority->total_disk_count == 0
+			|| authority->agree_disk_count <= authority->total_disk_count / 2
+			|| !cluster_fence_marker_valid_v1(&authority->marker)
+			|| authority->marker.fence_epoch != f2->local_epoch
+			|| formation_bitmap_nonempty(authority->marker.fenced_dead_bitmap))
+			return CLUSTER_FORMATION_WITNESS_MARKER_UNPROVEN;
+		origin_node = (int32)origin_thread - 1;
+		if (f2->membership.membership_state[origin_node] != CLUSTER_MEMBER_MEMBER
+			|| f2->membership.last_admitted_incarnation[origin_node] == 0)
+			return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+		for (i = 0; i < CLUSTER_MAX_NODES; ++i)
+			if (f2->membership.membership_state[i] == CLUSTER_MEMBER_MEMBER
+				&& f2->membership.last_admitted_incarnation[i] == 0)
+				return CLUSTER_FORMATION_WITNESS_OWNER_MISMATCH;
+		return CLUSTER_FORMATION_WITNESS_READY;
+	}
 	if (f2->prebump_sync_active != 0 || f2->self_join_failed
 		|| formation_bitmap_nonempty(f2->pending_join_bitmap)
 		|| formation_bitmap_nonempty(f2->clean_departed_bitmap)

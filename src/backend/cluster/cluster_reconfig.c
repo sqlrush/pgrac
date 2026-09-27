@@ -269,6 +269,9 @@ typedef struct ClusterColdFormationState {
 
 static ClusterColdFormationState cold_formation_state;
 static uint64 cold_formation_commit_nonce = 0;
+static bool cluster_reconfig_startup_formation_current_locked(void);
+static bool cluster_reconfig_observed_formation_read(ClusterFormationCommitMarker *marker,
+													 uint64 *incarnations);
 
 /*
  * Test-only reset (unit harness drives the state machine directly across
@@ -659,7 +662,7 @@ cluster_reconfig_shmem_init(void)
 		 * the boot-to-first-LMON-tick fail-open window, P1-2).  When online_join
 		 * is off the gate is open: no online membership gating, so bootstrap and
 		 * steady-state writes are unaffected. */
-		ReconfigShmem->self_join_admitted = cluster_online_join ? 0 : 1;
+		ReconfigShmem->self_join_admitted = (cluster_online_join || cluster_shared_config) ? 0 : 1;
 
 		/*
 		 * spec-5.16 D6 — startup invariant (postmaster-once, in the !found shmem
@@ -698,6 +701,8 @@ cluster_reconfig_shmem_init(void)
 		pg_atomic_init_u64(&ReconfigShmem->formation_marker_completion_seq, 0);
 		pg_atomic_init_u32(&ReconfigShmem->formation_marker_result, 0);
 		pg_atomic_init_u64(&ReconfigShmem->formation_marker_max_generation, 0);
+		pg_atomic_init_u64(&ReconfigShmem->observed_formation_marker_seq, 0);
+		pg_atomic_init_u64(&ReconfigShmem->observed_formation_marker_nonce, 0);
 		pg_atomic_init_u64(&ReconfigShmem->observed_formation_marker_generation, 0);
 		pg_atomic_init_u64(&ReconfigShmem->observed_formation_marker_epoch, 0);
 		pg_atomic_init_u64(&ReconfigShmem->observed_formation_marker_arbiter_node, 0);
@@ -825,8 +830,14 @@ cluster_reconfig_capture_formation_snapshot_v1(uint16 origin_thread,
 	out->prebump_sync_active = pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active);
 	out->self_join_admitted = ReconfigShmem->self_join_admitted;
 	out->self_join_failed = ReconfigShmem->self_join_failed;
-	LWLockRelease(&ReconfigShmem->lock);
 	out->local_epoch = cluster_epoch_get_current();
+	if (cluster_reconfig_startup_formation_current_locked())
+		out->startup_formation_generation = ReconfigShmem->startup_formation.formation_generation;
+	LWLockRelease(&ReconfigShmem->lock);
+	if (out->local_epoch != cluster_epoch_get_current()) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
 	return true;
 }
 
@@ -5589,6 +5600,11 @@ cluster_reconfig_joiner_self_tick(void)
 	 */
 	if (cluster_reconfig_is_removed_unlocked(cluster_node_id))
 		return;
+	/* PGRAC: the accepted cold-start owner, not ordinary JOIN, advances this
+	 * non-serving generation. Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && ReconfigShmem->startup_formation.formation_generation != 0
+		&& !cold_formation_state.admission_done)
+		return;
 
 	/* spec-5.15A: ordinary bootstrap/rejoin classification has no authority to
 	 * open or time out an exact replacement ADMITTED episode. */
@@ -6027,6 +6043,8 @@ cluster_reconfig_offpath_rejoin_tick(void)
 							 cluster_node_id)));
 		return;
 	}
+	if (cluster_shared_config && ReconfigShmem->startup_formation.formation_generation != 0)
+		return; /* native startup owns this pending formation; do not start rejoin */
 
 	/*
 	 * RF-ROOT P6 (STOP-01 frozen THREAD_OPEN / THREAD_CLEAN_CLOSE, the
@@ -6253,6 +6271,11 @@ cluster_reconfig_lmon_tick(void)
 	 * and close its service gate.  The tick itself keeps bootstrap admission and
 	 * deadline consumption behind local in-quorum evidence. */
 	cluster_reconfig_membership_floor_diagnostic("before-joiner-self");
+	/* PGRAC: consume an exact co-boot commit before a peer which already
+	 * entered CONTROL can be mistaken for an unrelated serving survivor.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config && cluster_epoch_get_current() > CLUSTER_EPOCH_INITIAL)
+		cluster_reconfig_cold_formation_tick();
 	cluster_reconfig_joiner_self_tick();
 	cluster_reconfig_membership_floor_diagnostic("after-joiner-self");
 
@@ -6441,6 +6464,11 @@ cluster_reconfig_lmon_tick(void)
 		 * closed-gate JOINING fallback below and remains fail-closed. */
 		else if (ReconfigShmem->self_join_failed)
 			cluster_membership_set_state(self_id, CLUSTER_MEMBER_REJECTED);
+		else if (cluster_reconfig_startup_formation_current_locked()) {
+			/* PGRAC: exact internal MEMBER stays non-serving through startup.
+			 * Author: SqlRush <sqlrush@gmail.com> */
+			cluster_membership_set_state(self_id, CLUSTER_MEMBER_MEMBER);
+		}
 		/* AD-023 recovery-control formation: joiner_self_tick may have
 		 * published this exact epoch-0 MEMBER floor while the xid-stripe gate
 		 * is still HOLD.  Preserve only that same retryable, write-closed
@@ -6746,33 +6774,12 @@ cluster_reconfig_lmon_tick(void)
 				&= (uint8) ~(1u << (root_gated_join_node % 8));
 		}
 
-		/*
-		 * RF-ROOT P9 verification / cold-formation cold-formation ruling:
-		 * past the INITIAL epoch with an ABSENT declared peer, drive the
-		 * 5.22 cold-formation state machine (observation window -> arbiter
-		 * formation marker -> marker admission).  Runs under this
-		 * EXCLUSIVE lock: the admission mutates the membership table, and
-		 * the state machine itself only does lock-free shmem reads plus
-		 * the mailbox submit (no blocking).  No-op once every declared
-		 * peer is formed.
-		 */
-		if (cluster_epoch_get_current() > CLUSTER_EPOCH_INITIAL) {
-			bool any_absent = false;
-
-			for (i = 0; i < CLUSTER_MAX_NODES; i++) {
-				if (cluster_conf_lookup_node(i) == NULL)
-					continue;
-				if (cluster_membership_get_state(i) == CLUSTER_MEMBER_ABSENT) {
-					any_absent = true;
-					break;
-				}
-			}
-			if (any_absent)
-				cluster_reconfig_cold_formation_tick();
-		}
-
 		LWLockRelease(&ReconfigShmem->lock);
 		cluster_reconfig_membership_floor_diagnostic("after-membership-reconcile");
+		/* PGRAC: the cold-start driver now owns its membership lock, so the
+		 * WAL-producing stripe leg runs outside it. Author: SqlRush <sqlrush@gmail.com> */
+		if (!cluster_shared_config && cluster_epoch_get_current() > CLUSTER_EPOCH_INITIAL)
+			cluster_reconfig_cold_formation_tick();
 
 		/*
 		 * spec-5.16 (3-node join participation) — publish an observer-role
@@ -8639,9 +8646,15 @@ cluster_reconfig_formation_qvotec_publish_observed(const ClusterFormationCommitM
 												   const uint64 *incarnation_by_node)
 {
 	int i;
+	uint64 seq;
 
 	if (ReconfigShmem == NULL || marker == NULL)
 		return;
+	seq = pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_seq);
+	if ((seq & 1) != 0 || seq >= UINT64_MAX - 1)
+		return;
+	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_seq, seq + 1);
+	pg_write_barrier();
 	for (i = 0; i < CLUSTER_MAX_NODES; i++)
 		pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_incarnation[i],
 							incarnation_by_node != NULL ? incarnation_by_node[i] : 0);
@@ -8650,17 +8663,161 @@ cluster_reconfig_formation_qvotec_publish_observed(const ClusterFormationCommitM
 						marker->arbiter_node);
 	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_arbiter_incarnation,
 						marker->arbiter_incarnation);
+	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_nonce, marker->commit_nonce);
 	pg_write_barrier();
 	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_generation,
 						marker->formation_generation);
+	pg_write_barrier();
+	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_seq, seq + 2);
 }
 
 void
 cluster_reconfig_formation_qvotec_clear_observed(void)
 {
+	uint64 seq;
 	if (ReconfigShmem == NULL)
 		return;
+	seq = pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_seq);
+	if ((seq & 1) != 0 || seq >= UINT64_MAX - 1)
+		return;
+	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_seq, seq + 1);
+	pg_write_barrier();
 	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_generation, 0);
+	pg_write_barrier();
+	pg_atomic_write_u64(&ReconfigShmem->observed_formation_marker_seq, seq + 2);
+}
+
+/* PGRAC: generation is an identity, not a seqlock. QVOTEC may publish the
+ * same generation repeatedly; bracket every field read with its actual
+ * single-writer sequence. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_reconfig_observed_formation_read(ClusterFormationCommitMarker *marker, uint64 *incarnations)
+{
+	uint64 seq = pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_seq);
+	if ((seq & 1) != 0 || seq >= UINT64_MAX - 1)
+		return false;
+	pg_read_barrier();
+	memset(marker, 0, sizeof(*marker));
+	marker->magic = CLUSTER_FORMATION_MARKER_MAGIC;
+	marker->version = CLUSTER_FORMATION_MARKER_VERSION;
+	marker->phase = CLUSTER_FORMATION_MARKER_PHASE_COMMITTED;
+	marker->formation_generation
+		= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_generation);
+	marker->formation_epoch = pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_epoch);
+	marker->arbiter_node
+		= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_arbiter_node);
+	marker->arbiter_incarnation
+		= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_arbiter_incarnation);
+	marker->commit_nonce = pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_nonce);
+	for (int i = 0; i < CLUSTER_MAX_NODES; ++i) {
+		incarnations[i]
+			= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_incarnation[i]);
+		if (incarnations[i] != 0) {
+			marker->admitted_nodes[i / 8] |= (uint8)(1u << (i % 8));
+			marker->n_admitted++;
+		}
+	}
+	pg_read_barrier();
+	return marker->formation_generation != 0
+		   && pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_seq) == seq;
+}
+
+/* PGRAC: accepted cold membership is CONTROL, not serving. All callers hold
+ * the reconfig lock; no I/O or secondary lock occurs in these predicates.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+cluster_reconfig_startup_cohort_valid(const ClusterFormationCommitMarker *marker,
+									  const uint64 *incarnations, bool published)
+{
+	int first = -1;
+	int count = 0;
+	if (!cluster_shared_config || marker->formation_generation == 0 || marker->commit_nonce == 0
+		|| marker->formation_epoch <= CLUSTER_EPOCH_INITIAL
+		|| marker->formation_epoch != cluster_epoch_get_current() || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES || cluster_qvotec_get_self_incarnation() == 0
+		|| incarnations[cluster_node_id] != cluster_qvotec_get_self_incarnation()
+		|| !cluster_qvotec_in_quorum() || ReconfigShmem->self_join_failed
+		|| pg_atomic_read_u32(&ReconfigShmem->prebump_sync_active) != 0
+		|| (ReconfigShmem->last_applied.reconfig_kind != RECONFIG_KIND_NONE
+			&& ReconfigShmem->last_applied.reconfig_kind != RECONFIG_KIND_CLEAN_LEAVE)
+		|| ReconfigShmem->last_applied.new_epoch > marker->formation_epoch
+		|| cluster_reconfig_has_replacement_episode(&ReconfigShmem->replacement_episode))
+		return false;
+	for (int b = 0; b < CLUSTER_RECONFIG_DEAD_BITMAP_BYTES; ++b)
+		if (ReconfigShmem->pending_join_bitmap[b] || ReconfigShmem->removed_bitmap[b]
+			|| ReconfigShmem->last_applied.dead_bitmap[b]
+			|| ReconfigShmem->last_applied.join_bitmap[b])
+			return false;
+	for (int i = 0; i < CLUSTER_MAX_NODES; ++i) {
+		bool declared = cluster_conf_lookup_node(i) != NULL;
+		bool included = (marker->admitted_nodes[i / 8] & (uint8)(1u << (i % 8))) != 0;
+		if (declared != included || included != (incarnations[i] != 0))
+			return false;
+		if (!declared)
+			continue;
+		if (first < 0)
+			first = i;
+		count++;
+		if (cluster_membership_get_state(i) == CLUSTER_MEMBER_REMOVED
+			|| cluster_membership_get_state(i) == CLUSTER_MEMBER_DEAD
+			|| cluster_membership_get_state(i) == CLUSTER_MEMBER_REJECTED
+			|| cluster_membership_get_last_admitted_incarnation(i) > incarnations[i])
+			return false;
+		if (published
+			&& (cluster_membership_get_state(i) != CLUSTER_MEMBER_MEMBER
+				|| cluster_membership_get_last_admitted_incarnation(i) != incarnations[i]))
+			return false;
+	}
+	return first >= 0 && count == marker->n_admitted && marker->arbiter_node == (uint64)first
+		   && marker->arbiter_incarnation == incarnations[first];
+}
+
+static bool
+cluster_reconfig_startup_formation_current_locked(void)
+{
+	return cluster_reconfig_startup_cohort_valid(
+		&ReconfigShmem->startup_formation, ReconfigShmem->startup_formation_incarnations, true);
+}
+
+static void
+cluster_reconfig_startup_formation_progress(void)
+{
+	ClusterWalDurablePrefixRef writer;
+	ClusterXidStripeJoinVerdict stripe;
+	uint64 generation;
+	uint64 incarnation;
+	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (!cluster_reconfig_startup_formation_current_locked() || ReconfigShmem->self_join_admitted
+		|| cold_formation_state.admission_done) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return;
+	}
+	generation = ReconfigShmem->startup_formation.formation_generation;
+	incarnation = ReconfigShmem->startup_formation_incarnations[cluster_node_id];
+	LWLockRelease(&ReconfigShmem->lock);
+	/* The exact native writer is installed only by the typed root/PGWP/anchor
+	 * path. Never call the WAL-producing stripe gate on the predecessor. */
+	if (RecoveryInProgress() || !cluster_wal_thread_current_v2_ref(&writer)
+		|| writer.claim.identity.origin_node_id != cluster_node_id
+		|| writer.claim.identity.origin_owner_incarnation != cluster_qvotec_get_self_incarnation())
+		return;
+	stripe = cluster_xid_stripe_join_gate(false);
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	if (!cluster_reconfig_startup_formation_current_locked()
+		|| ReconfigShmem->startup_formation.formation_generation != generation
+		|| ReconfigShmem->startup_formation_incarnations[cluster_node_id] != incarnation) {
+		LWLockRelease(&ReconfigShmem->lock);
+		return;
+	}
+	if (stripe == CLUSTER_XID_STRIPE_JOIN_REFUSE) {
+		cluster_write_fence_authority_cache_invalidate();
+		ReconfigShmem->self_join_failed = 1;
+	} else if (stripe == CLUSTER_XID_STRIPE_JOIN_PROCEED) {
+		ReconfigShmem->self_join_admitted = 1;
+		joiner_gate_decided = true;
+		cold_formation_state.admission_done = true;
+	}
+	LWLockRelease(&ReconfigShmem->lock);
 }
 
 /* Arbiter submit: stage the marker image + target member set into the
@@ -8754,7 +8911,7 @@ cluster_reconfig_cold_formation_window(uint64 *out_coboot_lo, uint64 *out_coboot
 		return CLUSTER_COLD_FORMATION_SURVIVOR;
 	if (declared == 0)
 		return CLUSTER_COLD_FORMATION_PENDING;
-	if (fresh_count < (declared / 2u) + 1u)
+	if (fresh_count < (declared / 2u) + 1u || (cluster_shared_config && fresh_count != declared))
 		return CLUSTER_COLD_FORMATION_PENDING; /* not yet a quorum */
 	*out_coboot_lo = fresh_lo;
 	*out_coboot_hi = fresh_hi;
@@ -8780,6 +8937,37 @@ cluster_reconfig_cold_formation_admit(const ClusterFormationCommitMarker *marker
 	self_incarnation = cluster_qvotec_get_self_incarnation();
 	if (self_incarnation == 0 || incarnation_by_node[cluster_node_id] != self_incarnation)
 		return;
+	if (cluster_shared_config) {
+		if (!cluster_reconfig_startup_cohort_valid(marker, incarnation_by_node, false))
+			return;
+		/* Validate the entire cohort before changing any floor. No old floor
+		 * or directory is itself permission to skip native initialization. */
+		cluster_write_fence_authority_cache_invalidate();
+		for (i = 0; i < CLUSTER_MAX_NODES; ++i) {
+			if (incarnation_by_node[i] == 0)
+				continue;
+			cluster_membership_record_admitted(i, incarnation_by_node[i]);
+			if (cluster_membership_get_last_admitted_incarnation(i) != incarnation_by_node[i])
+				return;
+		}
+		if (cluster_qvotec_get_self_incarnation() != self_incarnation
+			|| marker->formation_epoch != cluster_epoch_get_current())
+			return;
+		for (i = 0; i < CLUSTER_MAX_NODES; ++i)
+			if (incarnation_by_node[i] != 0) {
+				cluster_membership_set_state(i, CLUSTER_MEMBER_MEMBER);
+				/* The exact new formation supersedes old clean departure, not
+				 * its durable epoch floor used by QVOTEC's fence baseline. */
+				ReconfigShmem->clean_departed_bitmap[i / 8] &= (uint8) ~(1u << (i % 8));
+			}
+		ReconfigShmem->startup_formation = *marker;
+		memcpy(ReconfigShmem->startup_formation_incarnations, incarnation_by_node,
+			   sizeof(ReconfigShmem->startup_formation_incarnations));
+		ReconfigShmem->self_join_admitted = 0;
+		ReconfigShmem->self_join_deadline_us = 0;
+		joiner_gate_decided = false;
+		return; /* native startup, never this marker, earns writer installation */
+	}
 	if (cluster_membership_get_last_admitted_incarnation(cluster_node_id) != 0) {
 		cold_formation_state.admission_done = true;
 		return; /* already admitted */
@@ -8860,8 +9048,8 @@ cluster_reconfig_cold_formation_admit(const ClusterFormationCommitMarker *marker
  * Cold-formation state machine — one call per LMON tick while this node is
  * un-formed and the cluster is past INITIAL with an ABSENT peer.
  */
-void
-cluster_reconfig_cold_formation_tick(void)
+static void
+cluster_reconfig_cold_formation_tick_locked(void)
 {
 	uint64 coboot_lo;
 	uint64 coboot_hi;
@@ -8869,6 +9057,21 @@ cluster_reconfig_cold_formation_tick(void)
 
 	if (cold_formation_state.admission_done)
 		return;
+	if (cluster_shared_config && ReconfigShmem->startup_formation.formation_generation != 0) {
+		return;
+	}
+	if (cluster_shared_config) {
+		ClusterFormationCommitMarker marker;
+		uint64 incarnations[CLUSTER_MAX_NODES];
+		/* An exact commit names this boot and the entire configured cohort.
+		 * A peer already entering CONTROL does not invalidate that durable
+		 * commit. The window is needed to produce it, not to re-create it. */
+		if (cluster_reconfig_observed_formation_read(&marker, incarnations)
+			&& cluster_reconfig_startup_cohort_valid(&marker, incarnations, false)) {
+			cluster_reconfig_cold_formation_admit(&marker, incarnations);
+			return;
+		}
+	}
 
 	/* 1. Observation window (three-state; quorum-stable, no survivor
 	 * past INITIAL). */
@@ -9015,39 +9218,32 @@ cluster_reconfig_cold_formation_tick(void)
 
 	/* ---- non-arbiter: wait for our own region-7 slot marker ---- */
 	{
-		uint64 generation;
+		ClusterFormationCommitMarker marker;
 		uint64 incarnation_by_node[CLUSTER_MAX_NODES];
-		int i;
-
-		generation = pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_generation);
-		if (generation == 0)
-			return; /* arbiter has not written yet */
-		memset(incarnation_by_node, 0, sizeof(incarnation_by_node));
-		for (i = 0; i < CLUSTER_MAX_NODES; i++)
-			incarnation_by_node[i]
-				= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_incarnation[i]);
-		/* Our own incarnation in the marker must be EXACTLY ours. */
-		if (incarnation_by_node[cluster_node_id] != cluster_qvotec_get_self_incarnation())
-			return; /* not our marker: keep waiting */
-		{
-			ClusterFormationCommitMarker marker;
-
-			memset(&marker, 0, sizeof(marker));
-			marker.formation_generation = generation;
-			marker.formation_epoch
-				= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_epoch);
-			marker.arbiter_node
-				= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_arbiter_node);
-			marker.arbiter_incarnation
-				= pg_atomic_read_u64(&ReconfigShmem->observed_formation_marker_arbiter_incarnation);
-			for (i = 0; i < CLUSTER_MAX_NODES; i++)
-				if (incarnation_by_node[i] != 0)
-					marker.admitted_nodes[i / 8] |= (uint8)(1u << (i % 8));
-			marker.n_admitted = (uint16)formation_bitmap_popcount(
-				marker.admitted_nodes, CLUSTER_FORMATION_MARKER_BITMAP_BYTES);
-			cluster_reconfig_cold_formation_admit(&marker, incarnation_by_node);
-		}
+		if (!cluster_reconfig_observed_formation_read(&marker, incarnation_by_node))
+			return;
+		cluster_reconfig_cold_formation_admit(&marker, incarnation_by_node);
 	}
+}
+
+/* PGRAC: keep state mutation under Reconfig, but never hold it over the
+ * shared startup stripe/WAL producer. Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_reconfig_cold_formation_tick(void)
+{
+	bool drive = false;
+	if (ReconfigShmem == NULL)
+		return;
+	LWLockAcquire(&ReconfigShmem->lock, LW_EXCLUSIVE);
+	for (int i = 0; i < CLUSTER_MAX_NODES; ++i)
+		if (cluster_conf_lookup_node(i) != NULL
+			&& cluster_membership_get_state(i) == CLUSTER_MEMBER_ABSENT)
+			drive = true;
+	if (drive || (cluster_shared_config && !cold_formation_state.admission_done))
+		cluster_reconfig_cold_formation_tick_locked();
+	LWLockRelease(&ReconfigShmem->lock);
+	if (cluster_shared_config)
+		cluster_reconfig_startup_formation_progress();
 }
 
 /* Clear the per-process cold-formation latch pointer at exit. */

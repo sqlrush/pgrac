@@ -6010,6 +6010,24 @@ UT_TEST(test_recovery_authority_initial_epoch_zero_is_valid)
 	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
 }
 
+/* PGRAC: the actual barrier accepts the exact cold-start classification,
+ * not an arbitrary past-initial closed gate. Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_recovery_authority_cold_start_before_serving)
+{
+	ClusterFormationSnapshotV1 formation;
+	setup_recovery_authority_singleton_fixture(&formation);
+	formation.applied.new_epoch = 0;
+	ut_drive_authority_lmon_tick = true;
+	cluster_enabled = true;
+	UT_ASSERT(!cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
+	formation.startup_formation_generation = 4;
+	UT_ASSERT(cluster_grd_recovery_authority_barrier_wait(&formation, 11, 7, 10));
+	ut_drive_authority_lmon_tick = false;
+	cluster_enabled = false;
+	UT_ASSERT_EQ(formation.self_join_admitted, 0);
+	UT_ASSERT(cluster_grd_recovery_authority_is_current(11, 7));
+}
+
 UT_TEST(test_recovery_authority_rejects_missing_peer_or_unremastered_map)
 {
 	ClusterFormationSnapshotV1 formation;
@@ -6617,7 +6635,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	 * spec-2.29a:+1 (idle baseline hold during pre-bump stage);
 	 * RF-ROOT P6 contract:+2 (same-composite re-post retention +
 	 * composite-change zeroing). */
-	UT_PLAN(138);
+	UT_PLAN(139);
 	UT_RUN(test_normal_stop_grd_missing_is_not_empty);
 
 	UT_RUN(test_grd_clusterresid_size_16);
@@ -6767,6 +6785,7 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_recovery_authority_postmaster_cannot_execute_blocking_barrier);
 	UT_RUN(test_recovery_authority_lmon_tick_is_sole_blocking_executor);
 	UT_RUN(test_recovery_authority_initial_epoch_zero_is_valid);
+	UT_RUN(test_recovery_authority_cold_start_before_serving);
 	UT_RUN(test_recovery_authority_done_echo_is_bounded_per_requester);
 	/* RF-ROOT P6 contract — same-composite re-post retains done slots;
 	 * composite-change re-post zeroes and requires fresh evidence. */

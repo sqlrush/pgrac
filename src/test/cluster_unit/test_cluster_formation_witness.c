@@ -492,16 +492,63 @@ UT_TEST(test_recovery_control_witness_is_initial_only_and_survives_gate_open)
 	cluster_formation_witness_destroy(&witness);
 }
 
+/* PGRAC: the snapshot's marker binding is supplied by the real reconfig
+ * capture in its companion test; this exercises the actual witness consumer.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_cold_start_control_requires_exact_fence_and_stable_binding)
+{
+	ClusterFormationWitnessV1 *witness = NULL;
+	for (int bad = 0; bad < 6; ++bad) {
+		build_ready_fixture();
+		memset(snapshots, 0, sizeof(snapshots));
+		snapshots[0].local_epoch = 5;
+		snapshots[0].startup_formation_generation = bad == 1 ? 0 : 4;
+		snapshots[0].membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+		snapshots[0].membership.last_admitted_incarnation[0] = 55;
+		if (bad == 4)
+			snapshots[0].pending_join_bitmap[0] = 2;
+		snapshots[1] = snapshots[0];
+		if (bad == 5)
+			snapshots[1].startup_formation_generation++;
+		memset(&durable_proof, 0, sizeof(durable_proof));
+		durable_proof.marker.magic = CLUSTER_FENCE_MARKER_MAGIC;
+		durable_proof.marker.version = CLUSTER_FENCE_MARKER_VERSION;
+		durable_proof.marker.issuer_node_id = CLUSTER_FENCE_BASELINE_INITIAL_ISSUER;
+		durable_proof.marker.marker_kind = CLUSTER_FENCE_MARKER_KIND_BASELINE;
+		durable_proof.marker.fence_epoch = bad == 2 ? 4 : 5;
+		if (bad == 3)
+			durable_proof.marker.fenced_dead_bitmap[0] = 1;
+		durable_proof.agree_disk_count = 2;
+		durable_proof.total_disk_count = 3;
+		snapshot_call = 0;
+		UT_ASSERT_EQ(cluster_formation_witness_build_live_wait(1, 1, &witness),
+					 CLUSTER_FORMATION_WITNESS_UNSTABLE);
+		UT_ASSERT_NULL(witness);
+		snapshot_call = 0;
+		ClusterFormationWitnessResult result
+			= cluster_formation_witness_build_recovery_control_wait(1, 1, &witness);
+		if (bad == 0) {
+			UT_ASSERT_EQ(result, CLUSTER_FORMATION_WITNESS_READY);
+			UT_ASSERT_NOT_NULL(witness);
+		} else {
+			UT_ASSERT(result != CLUSTER_FORMATION_WITNESS_READY);
+			UT_ASSERT_NULL(witness);
+		}
+		cluster_formation_witness_destroy(&witness);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
 	UT_RUN(test_witness_bad_arguments_leave_null);
 	UT_RUN(test_witness_ready_borrow_revalidate_destroy);
 	UT_RUN(test_witness_unstable_or_unavailable_never_installs_handle);
 	UT_RUN(test_witness_revalidate_maps_stale_and_unavailable);
 	UT_RUN(test_live_witness_requires_same_stable_member_formation);
 	UT_RUN(test_recovery_control_witness_is_initial_only_and_survives_gate_open);
+	UT_RUN(test_cold_start_control_requires_exact_fence_and_stable_binding);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
