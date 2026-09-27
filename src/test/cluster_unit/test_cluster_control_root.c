@@ -98,6 +98,7 @@ static bool test_checkpoint_mode;
 static uint64 test_self_incarnation;
 static uint64 test_epoch;
 BackendType MyBackendType = B_INVALID;
+volatile uint32 CritSectionCount;
 static uint64 test_cf_cookie, test_cf_completed_cookie;
 static uint64 test_control_generation = 1;
 static bool test_cf_release_cut_change;
@@ -7594,6 +7595,10 @@ UT_TEST(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation
 				 0);
 	UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 3, &peer), 0);
 	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT(cluster_control_root_v3_startup_read_writer(&self.claim.identity, self.operation_uuid,
+														  &observed)
+			  != 0);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
 	UT_ASSERT(cluster_control_root_v3_startup_begin_clean(&self.claim.identity, self.operation_uuid,
 														  &token, &advanced)
 			  != 0);
@@ -7641,6 +7646,69 @@ UT_TEST(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation
 															 self.operation_uuid, &observed)
 			  != 0);
 	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	/* Native writer admission reads the actual selected INITIALIZING object,
+	 * not the predecessor's CLOSED current record or a caller-made token. */
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_read_writer(&self.claim.identity,
+															 self.operation_uuid, &observed),
+				 0);
+	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+	UT_ASSERT_EQ(observed.first_segment_lsn, self.first_segment_lsn);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	for (int fault = 0; fault < 9; ++fault) {
+		uint8 uuid[16];
+		memcpy(uuid, self.operation_uuid, sizeof(uuid));
+		switch (fault) {
+		case 0:
+			MyBackendType = B_BACKEND;
+			break;
+		case 1:
+			test_reserve_provider = false;
+			break;
+		case 2:
+			++test_self_incarnation;
+			break;
+		case 3:
+			uuid[0] ^= 1;
+			break;
+		case 4:
+			ShutdownRequestPending = true;
+			break;
+		case 5:
+			CritSectionCount = 1;
+			break;
+		case 6:
+			test_actual_cf = test_cf_mode = ShareLock;
+			break;
+		case 7:
+			++test_reserve_formation.membership.last_admitted_incarnation[3];
+			break;
+		case 8:
+			test_reserve_formation.prebump_sync_active = 1;
+			break;
+		}
+		UT_ASSERT(cluster_control_root_v3_startup_read_writer(&self.claim.identity, uuid, &observed)
+				  != 0);
+		UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+		UT_ASSERT_EQ(test_actual_cf, fault == 6 ? ShareLock : NoLock);
+		MyBackendType = B_STARTUP;
+		test_reserve_provider = true;
+		test_self_incarnation = self.claim.identity.origin_owner_incarnation;
+		ShutdownRequestPending = false;
+		CritSectionCount = 0;
+		test_actual_cf = test_cf_mode = NoLock;
+		test_reserve_formation.membership.last_admitted_incarnation[3]
+			= peer.claim.identity.origin_owner_incarnation;
+		test_reserve_formation.prebump_sync_active = 0;
+	}
+	/* Even an INITIALIZING root does not authorize adopting bytes left by a
+	 * different native execution. This API is for the still-EMPTY cut only. */
+	v3_target_path(path, &self, "/unexpected-wal");
+	write_all_or_abort(path, "old", 3);
+	UT_ASSERT(cluster_control_root_v3_startup_read_writer(&self.claim.identity, self.operation_uuid,
+														  &observed)
+			  != 0);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	v2_assert_primary_unchanged(after);
 	test_reserve_mode = false;
 }
 

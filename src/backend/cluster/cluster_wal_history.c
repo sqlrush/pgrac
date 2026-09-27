@@ -278,9 +278,10 @@ cluster_wal_startup_empty_locked(const ControlRootImage *root, uint32 node, bool
 	result = cluster_wal_startup_read_locked(root, node, &op);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	if (op.phase != CLUSTER_WAL_STARTUP_RESERVED || cluster_wal_threads_dir == NULL
-		|| cluster_wal_threads_dir[0] == '\0' || cluster_shared_data_dir == NULL
-		|| cluster_shared_data_dir[0] == '\0')
+	if ((op.phase != CLUSTER_WAL_STARTUP_RESERVED
+		 && !(op.phase == CLUSTER_WAL_STARTUP_INITIALIZING && !create && !sync))
+		|| cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0'
+		|| cluster_shared_data_dir == NULL || cluster_shared_data_dir[0] == '\0')
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	result = cluster_wal_claim_v2_encode(&op.claim, claim);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)

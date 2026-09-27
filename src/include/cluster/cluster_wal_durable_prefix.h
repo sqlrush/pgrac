@@ -51,6 +51,12 @@ cluster_wal_durable_prefix_read(const char *wal_root, const ClusterWalDurablePre
  * sections. Publish is only valid inside XLogWrite's exclusive WALWriteLock;
  * the result gates native Flush visibility, never grants writer admission. */
 extern void cluster_wal_durable_publish_init(void);
+/* Exact StartupProcess only, outside native critical sections. Binds the
+ * root-selected INITIALIZING operation after physical EMPTY verification;
+ * pg_wal must already name its successor. Does not enable WAL insertion. */
+extern ClusterControlRootResult
+cluster_wal_durable_startup_prepare(const ClusterControlRootIdentity *self,
+									const uint8 operation_uuid[16], XLogRecPtr *first_segment);
 /* Nonblocking runtime readiness, not writer admission or a persistent proof.
  * A later epoch race can still defer publish; callers must handle both cuts. */
 extern ClusterControlRootResult cluster_wal_durable_publish_ready(TimeLineID timeline);

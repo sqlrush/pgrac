@@ -21,8 +21,10 @@
 #include "cluster/cluster_wal_durable_prefix.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_write_fence.h"
+#include "cluster_control_root_private.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/memutils.h"
@@ -37,6 +39,7 @@ typedef struct PublishSegment {
 typedef struct PublishWork {
 	ClusterWalDurablePrefixRef ref;
 	uint64 epoch;
+	XLogRecPtr startup_first_lsn;
 	int dirs[4];
 	int datafd, routefd, claimfd, currentfd, tempfd;
 	char thread[32], generation[48], temporary[80];
@@ -53,6 +56,32 @@ typedef struct PublishWork {
 static MemoryContext publish_context;
 static ResourceOwner publish_owner;
 static pg_cryptohash_ctx *publish_hash;
+
+/* Process-local only. No ordinary backend or postmaster child can adopt this
+ * binding; the shared current-writer reference remains a separate INSTALL
+ * obligation. Root selection/CF occurs outside WALWriteLock, never in flush. */
+static struct {
+	bool valid;
+	int pid;
+	uint64 epoch;
+	XLogRecPtr first_lsn;
+	ClusterWalDurablePrefixRef ref;
+} publish_startup;
+
+static bool
+publish_select_writer(PublishWork *work)
+{
+	if (MyBackendType == B_STARTUP) {
+		if (!publish_startup.valid || publish_startup.pid != MyProcPid
+			|| publish_startup.epoch != work->epoch || ShutdownRequestPending)
+			return false;
+		work->ref = publish_startup.ref;
+		work->startup_first_lsn = publish_startup.first_lsn;
+		return true;
+	}
+	work->startup_first_lsn = 0;
+	return cluster_wal_thread_current_v2_ref(&work->ref);
+}
 
 void
 cluster_wal_durable_publish_init(void)
@@ -102,8 +131,9 @@ static ClusterControlRootResult
 publish_runtime(const PublishWork *work)
 {
 	ClusterWriteFenceObservation fence;
-	ClusterWalDurablePrefixRef fresh;
+	PublishWork fresh = { 0 };
 	const ClusterControlRootIdentity *id = &work->ref.claim.identity;
+	fresh.epoch = work->epoch;
 
 	if (!cluster_enabled || !cluster_shared_config || !enableFsync
 		|| !cluster_external_fence_runtime_active() || cluster_node_id != id->origin_node_id
@@ -112,8 +142,9 @@ publish_runtime(const PublishWork *work)
 		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
 		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
 			   != id->origin_owner_incarnation
-		|| work->epoch == 0 || !cluster_wal_thread_current_v2_ref(&fresh)
-		|| memcmp(&fresh, &work->ref, sizeof(fresh)) != 0)
+		|| work->epoch == 0 || !publish_select_writer(&fresh)
+		|| fresh.startup_first_lsn != work->startup_first_lsn
+		|| memcmp(&fresh.ref, &work->ref, sizeof(fresh.ref)) != 0)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	cluster_write_fence_observe(&fence);
 	if (!fence.enforcing || !fence.attached || !fence.engaged || fence.self_fenced
@@ -135,13 +166,13 @@ ClusterControlRootResult
 cluster_wal_durable_publish_ready(TimeLineID timeline)
 {
 	PublishWork work = { 0 };
+	work.epoch = cluster_epoch_get_current();
 
 	if (publish_context == NULL || publish_owner == NULL || publish_hash == NULL
 		|| !IsValidWalSegSize(wal_segment_size) || cluster_wal_threads_dir == NULL
 		|| cluster_wal_threads_dir[0] == '\0' || DataDir == NULL || DataDir[0] == '\0'
-		|| !cluster_wal_thread_current_v2_ref(&work.ref) || work.ref.timeline != timeline)
+		|| !publish_select_writer(&work) || work.ref.timeline != timeline)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	work.epoch = cluster_epoch_get_current();
 	return publish_runtime(&work);
 }
 
@@ -350,13 +381,28 @@ publish_scan(PublishWork *work, XLogRecPtr physical_flush)
 	work->reader->system_identifier = work->ref.claim.identity.system_identifier;
 	work->reader->cluster_expected_thread_id = work->ref.claim.identity.origin_thread_id;
 	work->reader->seg.ws_tli = work->ref.timeline;
-	XLogBeginRead(work->reader, work->previous.record_start);
+	XLogBeginRead(work->reader, work->previous.exclusive_end != 0
+									? work->previous.record_start
+									: work->startup_first_lsn + SizeOfXLogLongPHD);
 	record = XLogReadRecord(work->reader, &error);
-	if (record == NULL || work->reader->ReadRecPtr != work->previous.record_start
-		|| work->reader->EndRecPtr != work->previous.exclusive_end
-		|| record->xl_crc != work->previous.record_crc)
+	if (record == NULL)
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	work->next = work->previous;
+	if (work->previous.exclusive_end == 0) {
+		/* Only the bound native initializer can cross EMPTY. There must be
+		 * a complete independent-stream record; a page header, old partial
+		 * page or an in-memory flush position is never a durable promise. */
+		if (work->startup_first_lsn == 0 || work->previous.sequence != 1
+			|| work->reader->ReadRecPtr != work->startup_first_lsn + SizeOfXLogLongPHD
+			|| record->xl_prev != InvalidXLogRecPtr || work->reader->EndRecPtr > physical_flush)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		work->next.exclusive_end = work->reader->EndRecPtr;
+		work->next.record_start = work->reader->ReadRecPtr;
+		work->next.record_crc = record->xl_crc;
+	} else if (work->reader->ReadRecPtr != work->previous.record_start
+			   || work->reader->EndRecPtr != work->previous.exclusive_end
+			   || record->xl_crc != work->previous.record_crc)
+		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	while (work->next.exclusive_end < physical_flush) {
 		work->boundary = false;
 		record = XLogReadRecord(work->reader, &error);
@@ -484,6 +530,85 @@ publish_cleanup(PublishWork *work, ClusterControlRootResult result)
 }
 
 ClusterControlRootResult
+cluster_wal_durable_startup_prepare(const ClusterControlRootIdentity *self,
+									const uint8 operation_uuid[16], XLogRecPtr *first_segment)
+{
+	ClusterWalStartupImage op;
+	ClusterWalDurablePrefixRef input;
+	ClusterControlRootResult result;
+	PublishWork work = { 0 };
+	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES];
+
+	if (first_segment == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* Do not clear an output which aliases the identity before rejecting it. */
+	if ((self != NULL && (uintptr_t)first_segment < (uintptr_t)self + sizeof(*self)
+		 && (uintptr_t)self < (uintptr_t)first_segment + sizeof(*first_segment))
+		|| (operation_uuid != NULL && (uintptr_t)first_segment < (uintptr_t)operation_uuid + 16
+			&& (uintptr_t)operation_uuid < (uintptr_t)first_segment + sizeof(*first_segment)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	*first_segment = 0;
+	if (self == NULL || operation_uuid == NULL || CritSectionCount != 0
+		|| MyBackendType != B_STARTUP || ShutdownRequestPending || publish_startup.valid
+		|| LWLockHeldByMeInMode(WALWriteLock, LW_EXCLUSIVE) || publish_context == NULL
+		|| publish_owner == NULL || publish_hash == NULL || !cluster_enabled
+		|| !cluster_shared_config || DataDir == NULL || DataDir[0] == '\0'
+		|| cluster_wal_threads_dir == NULL || cluster_wal_threads_dir[0] == '\0')
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_control_root_v3_startup_read_writer(self, operation_uuid, &op);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (op.phase != CLUSTER_WAL_STARTUP_INITIALIZING || op.segment_size != wal_segment_size
+		|| !IsValidWalSegSize(wal_segment_size) || op.first_segment_lsn == 0
+		|| op.first_segment_lsn % wal_segment_size != 0
+		|| op.first_segment_lsn > UINT64_MAX - wal_segment_size
+		|| !cluster_wal_thread_restart_v2_ref(&input)
+		|| memcmp(&input.claim.identity, &op.predecessor.snapshot.identity,
+				  sizeof(input.claim.identity))
+			   != 0
+		|| memcmp(input.claim.claim_sha256, op.predecessor.refs.claim_sha256, 32) != 0
+		|| input.claim.database_incarnation != op.database_incarnation
+		|| input.timeline != op.input_timeline)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	result = cluster_wal_claim_v2_encode(&op.claim, claim);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work.ref.claim.identity = op.claim.identity;
+	work.ref.claim.database_incarnation = op.database_incarnation;
+	work.ref.claim.max_config_generation = op.config_generation;
+	work.ref.timeline = op.timeline;
+	if (pg_cryptohash_init(publish_hash) < 0
+		|| pg_cryptohash_update(publish_hash, claim, sizeof(claim)) < 0
+		|| pg_cryptohash_final(publish_hash, work.ref.claim.claim_sha256, 32) < 0)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	work.epoch = op.formation_epoch;
+	work.startup_first_lsn = op.first_segment_lsn;
+	for (unsigned i = 0; i < lengthof(work.dirs); ++i)
+		work.dirs[i] = -1;
+	work.datafd = work.routefd = work.claimfd = work.currentfd = work.tempfd = -1;
+	publish_startup.valid = true;
+	publish_startup.pid = MyProcPid;
+	publish_startup.epoch = work.epoch;
+	publish_startup.first_lsn = op.first_segment_lsn;
+	publish_startup.ref = work.ref;
+	result = publish_runtime(&work);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = publish_open(&work);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (work.previous.sequence != 1 || work.previous.exclusive_end != 0
+			|| work.previous.record_start != 0 || work.previous.record_crc != 0))
+		result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	result = publish_cleanup(&work, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = publish_runtime(&work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(&publish_startup, 0, sizeof(publish_startup));
+	else
+		*first_segment = op.first_segment_lsn;
+	return result;
+}
+
+ClusterControlRootResult
 cluster_wal_durable_publish(TimeLineID timeline, XLogRecPtr physical_flush,
 							XLogRecPtr previous_flush, XLogRecPtr *covered)
 {
@@ -506,7 +631,7 @@ cluster_wal_durable_publish(TimeLineID timeline, XLogRecPtr physical_flush,
 		|| physical_flush == 0 || physical_flush < previous_flush
 		|| !IsValidWalSegSize(wal_segment_size) || cluster_wal_threads_dir == NULL
 		|| cluster_wal_threads_dir[0] == '\0' || DataDir == NULL || DataDir[0] == '\0'
-		|| !cluster_wal_thread_current_v2_ref(&work.ref) || work.ref.timeline != timeline)
+		|| !publish_select_writer(&work) || work.ref.timeline != timeline)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	result = publish_runtime(&work);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -519,7 +644,9 @@ cluster_wal_durable_publish(TimeLineID timeline, XLogRecPtr physical_flush,
 	 * IO/validation failures below clean their raw fds and leave output zero. */
 	result = publish_open(&work);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-		if (work.previous.exclusive_end == 0 || work.previous.exclusive_end < previous_flush)
+		if (work.previous.exclusive_end == 0
+				? (work.startup_first_lsn == 0 || previous_flush != work.startup_first_lsn)
+				: work.previous.exclusive_end < previous_flush)
 			result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		else
 			result = publish_scan(&work, physical_flush);

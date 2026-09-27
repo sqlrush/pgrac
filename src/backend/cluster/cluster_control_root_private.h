@@ -178,6 +178,12 @@ cluster_control_root_v3_startup_prepare_target(const ClusterControlRootIdentity 
 extern ClusterControlRootResult cluster_control_root_v3_startup_begin_clean(
 	const ClusterControlRootIdentity *self, const uint8 operation_uuid[16],
 	const ClusterControlRootFileToken *expected, ClusterControlRootFileToken *out);
+/* Startup-only, root-selected INITIALIZING and actual empty namespace. Owns
+ * CF-X, returns no ordinary writer/serving permission, creates no files. */
+extern ClusterControlRootResult
+cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *self,
+											const uint8 operation_uuid[16],
+											ClusterWalStartupImage *out);
 
 /* Exact selected-object decoding. Does not prove the evidence digest,
  * inspect physical WAL or authorize a state transition. All output clears on
