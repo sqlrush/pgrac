@@ -747,28 +747,183 @@ startup_observe(ClusterWalStartupObservation *out)
 /* Independent native payload/CRC fixture; the production scanner and PGWP
  * codec do not manufacture the expected parameter maxima. */
 static ClusterWalDurablePrefix
-parameter_record(XLogRecPtr start, XLogRecPtr previous, xl_parameter_change parameters,
-				 bool short_payload)
+startup_record_with_block(XLogRecPtr start, XLogRecPtr previous, uint8 info, TransactionId xid,
+						  const void *data, size_t len, bool block)
 {
-	size_t len = sizeof(parameters) - (short_payload ? 1 : 0);
-	uint8 bytes[SizeOfXLogRecord + 2 + sizeof(parameters)] = { 0 };
+	uint8 bytes[SizeOfXLogRecord + 32 + 255] = { 0 };
 	XLogRecord record = { 0 };
-	ClusterWalDurablePrefix prefix = record_write(generation, start, previous, len);
-	record.xl_tot_len = SizeOfXLogRecord + 2 + len;
+	RelFileLocator locator = { 1663, 5, 42 };
+	XLogRecordBlockHeader block_header = { 0, MAIN_FORKNUM, 0 };
+	BlockNumber block_number = 1;
+	size_t offset = SizeOfXLogRecord;
+	size_t extra = block ? sizeof(block_header) + sizeof(locator) + sizeof(block_number) : 0;
+	ClusterWalDurablePrefix prefix = record_write(generation, start, previous, len + extra);
+	if (len + extra > 255 || start % XLOG_BLCKSZ + SizeOfXLogRecord + 2 + len + extra > XLOG_BLCKSZ)
+		abort();
+	record.xl_tot_len = SizeOfXLogRecord + extra + 2 + len;
 	record.xl_prev = previous;
+	record.xl_xid = xid;
 	record.xl_rmid = RM_XLOG_ID;
-	record.xl_info = XLOG_PARAMETER_CHANGE;
-	bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
-	bytes[SizeOfXLogRecord + 1] = len;
-	memcpy(bytes + SizeOfXLogRecord + 2, &parameters, len);
+	record.xl_info = info;
+	if (block) {
+		memcpy(bytes + offset, &block_header, sizeof(block_header));
+		offset += sizeof(block_header);
+		memcpy(bytes + offset, &locator, sizeof(locator));
+		offset += sizeof(locator);
+		memcpy(bytes + offset, &block_number, sizeof(block_number));
+		offset += sizeof(block_number);
+	}
+	bytes[offset++] = XLR_BLOCK_ID_DATA_SHORT;
+	bytes[offset++] = len;
+	memcpy(bytes + offset, data, len);
 	INIT_CRC32C(record.xl_crc);
-	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, 2 + len);
+	COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, extra + 2 + len);
 	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
 	FIN_CRC32C(record.xl_crc);
 	memcpy(bytes, &record, SizeOfXLogRecord);
 	overwrite(start, bytes, record.xl_tot_len);
 	prefix.record_crc = record.xl_crc;
 	return prefix;
+}
+
+static ClusterWalDurablePrefix
+startup_record(XLogRecPtr start, XLogRecPtr previous, uint8 info, TransactionId xid,
+			   const void *data, size_t len)
+{
+	return startup_record_with_block(start, previous, info, xid, data, len, false);
+}
+
+static ClusterWalDurablePrefix
+parameter_record(XLogRecPtr start, XLogRecPtr previous, xl_parameter_change parameters,
+				 bool short_payload)
+{
+	return startup_record(start, previous, XLOG_PARAMETER_CHANGE, InvalidTransactionId, &parameters,
+						  sizeof(parameters) - (short_payload ? 1 : 0));
+}
+
+UT_TEST(startup_rejects_invalid_fpw_payload)
+{
+	for (int fault = 0; fault < 2; fault++) {
+		uint8 raw[2] = { 2, 0 };
+		ClusterWalStartupObservation out;
+		fixture();
+		prefix_write(startup_record(wal_segment_size + SizeOfXLogLongPHD, 0, XLOG_FPW_CHANGE,
+									InvalidTransactionId, raw, fault == 0 ? 1 : 2));
+		UT_ASSERT_EQ(startup_observe(&out), CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+	}
+}
+
+UT_TEST(startup_rejects_short_checkpoint_payload)
+{
+	CheckPoint checkpoint = { 0 };
+	ClusterWalStartupObservation out;
+	fixture();
+	prefix_write(startup_record(wal_segment_size + SizeOfXLogLongPHD, 0, XLOG_CHECKPOINT_SHUTDOWN,
+								InvalidTransactionId, &checkpoint, sizeof(checkpoint) - 1));
+	UT_ASSERT_EQ(startup_observe(&out), CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+}
+
+UT_TEST(startup_captures_first_real_checkpoint_beyond_empty_promise)
+{
+	ClusterWalStartupObservation out;
+	ClusterWalDurablePrefix first, second, third;
+	CheckPoint checkpoint = { 0 };
+	bool enabled = true;
+	fixture();
+	first = startup_record(wal_segment_size + SizeOfXLogLongPHD, 0, XLOG_FPW_CHANGE,
+						   InvalidTransactionId, &enabled, sizeof(enabled));
+	checkpoint.redo = first.record_start;
+	checkpoint.ThisTimeLineID = checkpoint.PrevTimeLineID = ref.timeline;
+	checkpoint.nextXid = FullTransactionIdFromU64(456);
+	checkpoint.fullPageWrites = true;
+	second = startup_record(first.exclusive_end, first.record_start, XLOG_CHECKPOINT_ONLINE,
+							InvalidTransactionId, &checkpoint, sizeof(checkpoint));
+	checkpoint.redo = second.exclusive_end;
+	third = startup_record(second.exclusive_end, second.record_start, XLOG_CHECKPOINT_SHUTDOWN,
+						   InvalidTransactionId, &checkpoint, sizeof(checkpoint));
+	prefix_write((ClusterWalDurablePrefix){ 1, 0, 0, 0 });
+	UT_ASSERT_EQ(startup_observe(&out), 0);
+	UT_ASSERT_EQ(out.tail.records, 3);
+	UT_ASSERT_EQ(out.tail.complete_end, third.exclusive_end);
+	UT_ASSERT_EQ(out.checkpoint_records, 2);
+	UT_ASSERT_EQ(out.checkpoint_start, second.record_start);
+	UT_ASSERT_EQ(out.checkpoint_end, second.exclusive_end);
+	UT_ASSERT_EQ(out.checkpoint_crc, second.record_crc);
+	UT_ASSERT_EQ(out.checkpoint_info, XLOG_CHECKPOINT_ONLINE);
+	UT_ASSERT_EQ(out.checkpoint.redo, first.record_start);
+	UT_ASSERT_EQ(out.checkpoint.ThisTimeLineID, ref.timeline);
+	UT_ASSERT_EQ(U64FromFullTransactionId(out.checkpoint.nextXid), 456);
+	UT_ASSERT_EQ(out.fpw_records, 1);
+	UT_ASSERT_EQ(out.unsupported_records, 0);
+}
+
+UT_TEST(startup_rejects_checkpoint_identity_and_native_inconsistency)
+{
+	for (int fault = 0; fault < 8; fault++) {
+		ClusterWalStartupObservation out;
+		CheckPoint checkpoint = { 0 };
+		uint8 raw[sizeof(checkpoint)];
+		fixture();
+		checkpoint.redo = wal_segment_size + SizeOfXLogLongPHD;
+		checkpoint.ThisTimeLineID = checkpoint.PrevTimeLineID = ref.timeline;
+		checkpoint.nextXid = FullTransactionIdFromU64(456);
+		if (fault == 0)
+			checkpoint.ThisTimeLineID++;
+		else if (fault == 1)
+			checkpoint.PrevTimeLineID = 0;
+		else if (fault == 2)
+			checkpoint.redo = 0;
+		else if (fault == 3)
+			checkpoint.redo++;
+		else if (fault == 4)
+			checkpoint.nextXid = FullTransactionIdFromU64(1);
+		else if (fault == 5)
+			checkpoint.redo -= 8;
+		else if (fault == 7)
+			checkpoint.nextXid = FullTransactionIdFromU64(UINT64CONST(0x100000001));
+		memcpy(raw, &checkpoint, sizeof(raw));
+		if (fault == 6)
+			raw[offsetof(CheckPoint, fullPageWrites)] = 2;
+		prefix_write(startup_record(wal_segment_size + SizeOfXLogLongPHD, 0,
+									XLOG_CHECKPOINT_SHUTDOWN, InvalidTransactionId, raw,
+									sizeof(raw)));
+		UT_ASSERT_EQ(startup_observe(&out), fault == 0 ? CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH
+													   : CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+	}
+}
+
+UT_TEST(startup_retains_fpw_off_and_unsupported_effects)
+{
+	ClusterWalStartupObservation out;
+	ClusterWalDurablePrefix p;
+	bool enabled = false;
+	fixture();
+	p = startup_record(wal_segment_size + SizeOfXLogLongPHD, 0, XLOG_FPW_CHANGE,
+					   InvalidTransactionId, &enabled, sizeof(enabled));
+	enabled = true;
+	p = startup_record(p.exclusive_end, p.record_start, XLOG_FPW_CHANGE, InvalidTransactionId,
+					   &enabled, sizeof(enabled));
+	/* Valid physical records cannot silently disappear from the closure census. */
+	p = startup_record(p.exclusive_end, p.record_start, XLOG_FPW_CHANGE, 123, &enabled,
+					   sizeof(enabled));
+	p = startup_record(p.exclusive_end, p.record_start, XLOG_NOOP, InvalidTransactionId, &enabled,
+					   sizeof(enabled));
+	p = startup_record_with_block(p.exclusive_end, p.record_start, XLOG_FPI, InvalidTransactionId,
+								  &enabled, sizeof(enabled), true);
+	prefix_write(p);
+	UT_ASSERT_EQ(startup_observe(&out), 0);
+	UT_ASSERT_EQ(out.tail.records, 5);
+	UT_ASSERT_EQ(out.fpw_records, 3);
+	UT_ASSERT(out.fpw_disabled);
+	UT_ASSERT_EQ(out.unsupported_records, 3);
+	UT_ASSERT_EQ(out.checkpoint_records, 0);
+	UT_ASSERT_EQ(out.checkpoint_start, 0);
+	UT_ASSERT_EQ(out.checkpoint_end, 0);
+	UT_ASSERT_EQ(out.checkpoint_crc, 0);
+	{
+		CheckPoint zero = { 0 };
+		UT_ASSERT_EQ(memcmp(&zero, &out.checkpoint, sizeof(zero)), 0);
+	}
 }
 
 UT_TEST(startup_empty_is_actual_input_not_ordinary_tail_authority)
@@ -801,6 +956,7 @@ UT_TEST(startup_scans_complete_records_even_after_empty_promise)
 	prefix_write((ClusterWalDurablePrefix){ 1, 0, 0, 0 });
 	UT_ASSERT_EQ(startup_observe(&out), 0);
 	UT_ASSERT_EQ(out.tail.records, 2);
+	UT_ASSERT_EQ(out.parameter_records, 2);
 	UT_ASSERT_EQ(out.tail.complete_end, next.exclusive_end);
 	UT_ASSERT_EQ(out.tail.durable_prefix.exclusive_end, 0);
 	UT_ASSERT_EQ(out.max_connections, 900);
@@ -906,7 +1062,12 @@ UT_TEST(startup_preserves_physical_failure_and_cancellation_boundaries)
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(35);
+	UT_RUN(startup_rejects_invalid_fpw_payload);
+	UT_RUN(startup_rejects_short_checkpoint_payload);
+	UT_RUN(startup_captures_first_real_checkpoint_beyond_empty_promise);
+	UT_RUN(startup_rejects_checkpoint_identity_and_native_inconsistency);
+	UT_RUN(startup_retains_fpw_off_and_unsupported_effects);
 	UT_RUN(startup_empty_is_actual_input_not_ordinary_tail_authority);
 	UT_RUN(startup_scans_complete_records_even_after_empty_promise);
 	UT_RUN(startup_empty_does_not_hide_foreign_wal_or_bad_geometry);

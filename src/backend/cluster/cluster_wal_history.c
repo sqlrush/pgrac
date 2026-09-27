@@ -24,7 +24,11 @@
 
 /* Two fixed backend-private families share the same no-clobber/owned-file
  * discipline. The separate codecs and public entrypoints decide semantics. */
-typedef enum WalObjectKind { WAL_OBJECT_HISTORY, WAL_OBJECT_STARTUP } WalObjectKind;
+typedef enum WalObjectKind {
+	WAL_OBJECT_HISTORY,
+	WAL_OBJECT_STARTUP,
+	WAL_OBJECT_TERMINAL
+} WalObjectKind;
 
 typedef struct HistoryDirs {
 	int objects;
@@ -581,17 +585,33 @@ history_names(const ClusterWalHistoryStage *stage, WalObjectKind kind, char form
 }
 
 static bool
+history_length_valid(uint32 length)
+{
+	if (length >= CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
+		&& length <= CLUSTER_WAL_HISTORY_HEADER_BYTES + CLUSTER_WAL_HISTORY_MAX_RECORDS * 512 + 4
+		&& (length - CLUSTER_WAL_HISTORY_HEADER_BYTES - 4) % 512 == 0)
+		return true;
+	for (uint32 terminals = 1; terminals <= CLUSTER_WAL_HISTORY_MAX_RECORDS; ++terminals) {
+		uint32 base
+			= CLUSTER_WAL_HISTORY_V2_HEADER_BYTES + terminals * CLUSTER_WAL_TERMINAL_REF_BYTES + 4;
+		if (length >= base && (length - base) % 512 == 0
+			&& (length - base) / 512 <= CLUSTER_WAL_HISTORY_MAX_RECORDS - terminals)
+			return true;
+	}
+	return false;
+}
+
+static bool
 history_stage_valid(const ClusterWalHistoryStage *stage, WalObjectKind kind)
 {
 	return stage != NULL && stage->generation != 0 && stage->system_identifier != 0
 		   && stage->current_owner_incarnation != 0
 		   && stage->origin_node < CLUSTER_CONTROL_ROOT_RECORD_COUNT
-		   && (kind == WAL_OBJECT_STARTUP ? stage->length == CLUSTER_WAL_STARTUP_BYTES
-										  : (stage->length >= CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
-											 && stage->length <= CLUSTER_WAL_HISTORY_MAX_BYTES
-											 && (stage->length - CLUSTER_WAL_HISTORY_HEADER_BYTES
-												 - 4) % CLUSTER_CONTROL_ROOT_RECORD_BYTES
-													== 0))
+		   && (kind == WAL_OBJECT_HISTORY
+				   ? history_length_valid(stage->length)
+				   : stage->length
+						 == (kind == WAL_OBJECT_STARTUP ? CLUSTER_WAL_STARTUP_BYTES
+														: CLUSTER_WAL_TERMINAL_BYTES))
 		   && stage->owner_pid == (uint32)getpid() && history_nonzero(stage->storage_uuid, 16)
 		   && history_nonzero(stage->authority_uuid, 16) && history_nonzero(stage->sha256, 32)
 		   && history_nonzero(stage->operation_uuid, 16) && stage->state >= HISTORY_STAGED
@@ -786,6 +806,29 @@ cluster_wal_history_prepare(const ControlRootImage *root, uint32 origin_node,
 }
 
 ClusterControlRootResult
+cluster_wal_terminal_prepare(const ControlRootImage *root, uint32 node,
+							 const ClusterWalHistoryImage *history,
+							 const ClusterWalTerminalImage *terminal, ClusterWalStartupStage *out)
+{
+	ClusterControlRootResult result;
+	ClusterWalTerminalRef ref;
+	uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES];
+	bool alias = history_overlaps_stage(root, sizeof(*root), out)
+				 || history_overlaps_stage(history, sizeof(*history), out)
+				 || history_overlaps_stage(terminal, sizeof(*terminal), out);
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || !enableFsync)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_wal_terminal_encode(root, node, history, terminal, bytes, &ref);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		result = history_prepare_encoded(root, node, bytes, sizeof(bytes), ref.generation,
+										 terminal->operation_uuid, WAL_OBJECT_TERMINAL, out);
+	return result;
+}
+
+ClusterControlRootResult
 cluster_wal_startup_prepare(const ControlRootImage *root, uint32 origin_node,
 							const ClusterWalStartupImage *startup, ClusterWalStartupStage *out)
 {
@@ -936,6 +979,18 @@ cluster_wal_startup_discard(ClusterWalStartupStage *stage)
 	return history_discard(stage, WAL_OBJECT_STARTUP);
 }
 
+ClusterControlRootResult
+cluster_wal_terminal_install(ClusterWalStartupStage *stage)
+{
+	return history_install(stage, WAL_OBJECT_TERMINAL);
+}
+
+ClusterControlRootResult
+cluster_wal_terminal_discard(ClusterWalStartupStage *stage)
+{
+	return history_discard(stage, WAL_OBJECT_TERMINAL);
+}
+
 /* PGRAC: only the selected immutable object is consumed. This is evidence,
  * not publication, recovery completion, old-writer isolation or WAL reuse.
  * Author: SqlRush <sqlrush@gmail.com>
@@ -965,9 +1020,12 @@ history_read_selected(uint32 node, WalObjectKind kind, ClusterWalHistoryStage *s
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 		goto done;
 	}
-	if (kind == WAL_OBJECT_STARTUP ? st.st_size != CLUSTER_WAL_STARTUP_BYTES
-								   : (st.st_size < CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
-									  || st.st_size > CLUSTER_WAL_HISTORY_MAX_BYTES)) {
+	if (kind != WAL_OBJECT_HISTORY
+			? st.st_size
+				  != (kind == WAL_OBJECT_STARTUP ? CLUSTER_WAL_STARTUP_BYTES
+												 : CLUSTER_WAL_TERMINAL_BYTES)
+			: (st.st_size < CLUSTER_WAL_HISTORY_HEADER_BYTES + 4
+			   || st.st_size > CLUSTER_WAL_HISTORY_MAX_BYTES)) {
 		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
 		goto done;
 	}
@@ -1065,6 +1123,41 @@ cluster_wal_startup_read_locked(const ControlRootImage *root, uint32 node,
 }
 
 ClusterControlRootResult
+cluster_wal_terminal_read_locked(const ControlRootImage *root, uint32 node, uint32 terminal_index,
+								 ClusterWalTerminalImage *out)
+{
+	ClusterControlRootResult result;
+	ClusterWalStartupStage selected = { 0 };
+	ClusterWalHistoryImage *history;
+	uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES];
+	uintptr_t a = (uintptr_t)root, b = (uintptr_t)out;
+	bool alias
+		= root != NULL && out != NULL && (a <= b ? b - a < sizeof(*root) : a - b < sizeof(*out));
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || root == NULL || node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	history = palloc0(sizeof(*history));
+	result = cluster_wal_history_read_locked(root, node, history);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		if (terminal_index >= history->terminal_count)
+			result = CLUSTER_CONTROL_ROOT_ABSENT;
+		else {
+			const ClusterWalTerminalRef *ref = &history->terminals[terminal_index];
+			selected.generation = ref->generation;
+			memcpy(selected.sha256, ref->sha256, 32);
+			result = history_read_selected(node, WAL_OBJECT_TERMINAL, &selected, bytes);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				result = cluster_wal_terminal_decode(bytes, sizeof(bytes), root, node, history, ref,
+													 out);
+		}
+	}
+	pfree(history);
+	return result;
+}
+
+ClusterControlRootResult
 cluster_wal_origin_inputs_read_locked(const ControlRootImage *root, uint32 node,
 									  ClusterWalOriginInputs *out)
 {
@@ -1105,6 +1198,11 @@ cluster_wal_origin_inputs_read_locked(const ControlRootImage *root, uint32 node,
 	inputs->current.record_crc32c = root->record_crc32c[node];
 	if (root->refs[node].history_generation != 0)
 		result = cluster_wal_history_read_locked(root, node, &inputs->history);
+	for (uint32 i = 0;
+		 result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < inputs->history.terminal_count; i++) {
+		ClusterWalTerminalImage terminal;
+		result = cluster_wal_terminal_read_locked(root, node, i, &terminal);
+	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && root->startup[node].generation != 0) {
 		result = cluster_wal_startup_read_locked(root, node, &inputs->pending);
 		inputs->has_pending = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;

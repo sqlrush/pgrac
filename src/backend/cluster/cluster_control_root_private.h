@@ -11,6 +11,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_startup_exit.h"
 
 /* PGRAC: backend-private decoded carrier, never a disk struct or permission.
@@ -111,7 +112,9 @@ cluster_control_root_v3_reserve_clean(const ClusterStartupExitCut *expected,
  */
 #define CLUSTER_WAL_HISTORY_MAX_RECORDS 128
 #define CLUSTER_WAL_HISTORY_HEADER_BYTES 64
-#define CLUSTER_WAL_HISTORY_MAX_BYTES (64 + 128 * 512 + 4)
+#define CLUSTER_WAL_HISTORY_V2_HEADER_BYTES 96
+#define CLUSTER_WAL_TERMINAL_REF_BYTES 48
+#define CLUSTER_WAL_HISTORY_MAX_BYTES (96 + 128 * 512 + 4)
 typedef struct ClusterWalHistoryRecord {
 	ClusterControlRootSnapshot snapshot;
 	ControlRootRecordRefsV2 refs;
@@ -120,9 +123,18 @@ typedef struct ClusterWalHistoryRecord {
 	uint32 record_crc32c;
 } ClusterWalHistoryRecord;
 
+/* A terminal has no checkpoint; it cannot masquerade as an ordinary record. */
+typedef struct ClusterWalTerminalRef {
+	uint64 incarnation;
+	uint64 generation;
+	uint8 sha256[32];
+} ClusterWalTerminalRef;
+
 typedef struct ClusterWalHistoryImage {
 	uint32 count;
 	ClusterWalHistoryRecord records[CLUSTER_WAL_HISTORY_MAX_RECORDS];
+	uint32 terminal_count;
+	ClusterWalTerminalRef terminals[CLUSTER_WAL_HISTORY_MAX_RECORDS];
 } ClusterWalHistoryImage;
 
 /* PGRAC: decoded immutable pending initialization, never an authority token.
@@ -165,6 +177,46 @@ typedef struct ClusterWalStartupImage {
 	ClusterWalDurablePrefix prefix;
 	TimeLineID prefix_timeline;
 } ClusterWalStartupImage;
+
+/* Checkpoint-less initialization terminal. Logical carrier only: the embedded
+ * original and physical census grant neither recovery nor serving permission.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#define CLUSTER_WAL_TERMINAL_BYTES 2304
+#define CLUSTER_WAL_INITIALIZATION_TERMINATED 4
+typedef struct ClusterWalTerminalImage {
+	uint32 closure_version;
+	uint8 operation_uuid[16];
+	uint64 generation;
+	uint64 database_incarnation;
+	uint64 sealing_sequence;
+	uint8 sealing_sha256[32];
+	uint64 formation_epoch;
+	uint64 recoverer_incarnation;
+	uint32 recoverer_node;
+	uint64 ir_request_id;
+	ControlRootStartupRefV3 original_ref;
+	uint8 isolation_sha256[32];
+	uint8 closure_sha256[32];
+	uint8 original[CLUSTER_WAL_STARTUP_BYTES];
+	/* Derived by decoding original[], not another authoritative copy. */
+	ClusterWalStartupImage initialization;
+	ClusterWalStartupObservation observation;
+} ClusterWalTerminalImage;
+
+/* Memory-only terminal codecs. The supplied flat union must contain the
+ * original predecessor; its historical PGWH pointer is never traversed.
+ * Hash/CRC/field validation is not proof of isolation or native closure.
+ * Inputs must not overlap outputs; all outputs clear on refusal. */
+extern ClusterControlRootResult
+cluster_wal_terminal_decode(const uint8 *bytes, size_t length, const ControlRootImage *root,
+							uint32 node, const ClusterWalHistoryImage *history,
+							const ClusterWalTerminalRef *ref, ClusterWalTerminalImage *out);
+extern ClusterControlRootResult cluster_wal_terminal_encode(const ControlRootImage *root,
+															uint32 node,
+															const ClusterWalHistoryImage *history,
+															const ClusterWalTerminalImage *terminal,
+															uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES],
+															ClusterWalTerminalRef *ref);
 
 /* PGRAC: one origin's complete selected metadata, not replay/retention
  * authority. Pending is not a synthetic current record or checkpoint.
@@ -317,6 +369,19 @@ extern ClusterControlRootResult cluster_wal_startup_discard(ClusterWalStartupSta
 extern ClusterControlRootResult cluster_wal_startup_read_locked(const ControlRootImage *root,
 																uint32 origin_node,
 																ClusterWalStartupImage *out);
+
+/* Same immutable directory, distinct terminal-only length and API. Selection
+ * is always through the supplied root's freshly read manifest; no standalone
+ * filename scan or use as an active initialization operation. */
+extern ClusterControlRootResult cluster_wal_terminal_read_locked(const ControlRootImage *root,
+																 uint32 node, uint32 terminal_index,
+																 ClusterWalTerminalImage *out);
+extern ClusterControlRootResult
+cluster_wal_terminal_prepare(const ControlRootImage *root, uint32 node,
+							 const ClusterWalHistoryImage *history,
+							 const ClusterWalTerminalImage *terminal, ClusterWalStartupStage *out);
+extern ClusterControlRootResult cluster_wal_terminal_install(ClusterWalStartupStage *stage);
+extern ClusterControlRootResult cluster_wal_terminal_discard(ClusterWalStartupStage *stage);
 
 /* Physical metadata only, under qualified CF-X. The root adapter owns target
  * and provider admission. create=false refuses missing metadata, except that

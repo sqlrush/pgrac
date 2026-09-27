@@ -229,6 +229,65 @@ wal_startup_parameters(WalTailWork *work)
 	out->max_wal_senders = Max(out->max_wal_senders, parameters.max_wal_senders);
 	out->max_prepared_xacts = Max(out->max_prepared_xacts, parameters.max_prepared_xacts);
 	out->max_locks_per_xact = Max(out->max_locks_per_xact, parameters.max_locks_per_xact);
+	out->parameter_records++;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* Classify every complete startup record, including an unpromised suffix.
+ * A physical observation is not native side-state closure or replay authority.
+ * Unknown effects remain visible so a checkpoint-less finalizer cannot mistake
+ * a valid WAL stream for an empty initialization. Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterControlRootResult
+wal_startup_classify(WalTailWork *work)
+{
+	XLogReaderState *reader = work->reader;
+	ClusterWalStartupObservation *out = &work->startup;
+	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+	const uint8 *data = (const uint8 *)XLogRecGetData(reader);
+	bool supported = XLogRecGetXid(reader) == InvalidTransactionId && XLogRecMaxBlockId(reader) < 0
+					 && (XLogRecGetInfo(reader) & XLR_INFO_MASK) == 0;
+	ClusterControlRootResult result;
+
+	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
+		supported = false;
+	else if (info == XLOG_PARAMETER_CHANGE) {
+		result = wal_startup_parameters(work);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	} else if (info == XLOG_FPW_CHANGE) {
+		if (XLogRecGetDataLen(reader) != sizeof(bool) || data[0] > 1
+			|| XLogRecMaxBlockId(reader) >= 0)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		out->fpw_records++;
+		out->fpw_disabled |= data[0] == 0;
+	} else if (info == XLOG_CHECKPOINT_SHUTDOWN || info == XLOG_CHECKPOINT_ONLINE) {
+		CheckPoint checkpoint;
+		if (XLogRecGetDataLen(reader) != sizeof(checkpoint) || XLogRecMaxBlockId(reader) >= 0
+			|| data[offsetof(CheckPoint, fullPageWrites)] > 1)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		memcpy(&checkpoint, data, sizeof(checkpoint));
+		/* Match the native checkpoint's identity and redo bounds. Promotion
+		 * still validates the complete recovery input and its side files. */
+		if (checkpoint.ThisTimeLineID != work->ref.timeline)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		if (checkpoint.PrevTimeLineID == 0 || checkpoint.PrevTimeLineID > checkpoint.ThisTimeLineID
+			|| checkpoint.redo == InvalidXLogRecPtr || checkpoint.redo > reader->ReadRecPtr
+			|| (info == XLOG_CHECKPOINT_SHUTDOWN && checkpoint.redo != reader->ReadRecPtr)
+			|| !TransactionIdIsNormal(XidFromFullTransactionId(checkpoint.nextXid)))
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (out->checkpoint_records == 0) {
+			out->checkpoint_start = reader->ReadRecPtr;
+			out->checkpoint_end = reader->EndRecPtr;
+			out->checkpoint_crc = reader->record->header.xl_crc;
+			out->checkpoint_info = info;
+			out->checkpoint = checkpoint;
+		}
+		out->checkpoint_records++;
+	} else
+		supported = false;
+	if (!supported)
+		out->unsupported_records++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -288,7 +347,7 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		if (work->startup_mode) {
 			if (work->observed.records == 0 && record->xl_prev != InvalidXLogRecPtr)
 				return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
-			result = wal_startup_parameters(work);
+			result = wal_startup_classify(work);
 			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 				return result;
 		}

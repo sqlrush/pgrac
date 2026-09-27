@@ -4510,6 +4510,268 @@ UT_TEST(test_startup_encoder_matches_literal_phases_without_publishing)
 	}
 }
 
+/* Independent literal terminal, including its original initialization and
+ * exact EMPTY durable promise. No producer is used to manufacture expectations. */
+static void
+terminal_fixture(uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES], ControlRootImage *root,
+				 ClusterWalHistoryImage *history, ClusterWalTerminalRef *ref, bool parameters)
+{
+	uint8 *prefix = bytes + 1792;
+	memset(bytes, 0, CLUSTER_WAL_TERMINAL_BYTES);
+	startup_fixture(bytes + 256, root, CLUSTER_WAL_STARTUP_INITIALIZING);
+	memset(history, 0, sizeof(*history));
+	memcpy(bytes, "PGWG", 4);
+	put_u16_le(bytes + 4, 2);
+	put_u16_le(bytes + 6, 2304);
+	put_u32_le(bytes + 8, 4);
+	put_u32_le(bytes + 12, 1);
+	memcpy(bytes + 16, bytes + 256 + 16, 16);
+	put_u64_le(bytes + 32, 81);
+	put_u64_le(bytes + 40, 41);
+	put_u64_le(bytes + 48, 80);
+	memset(bytes + 56, 0x35, 32);
+	put_u64_le(bytes + 88, 90);
+	put_u64_le(bytes + 96, 999);
+	put_u32_le(bytes + 104, 2);
+	put_u64_le(bytes + 112, 12345);
+	put_u64_le(bytes + 120, root->startup[0].generation);
+	memcpy(bytes + 128, root->startup[0].sha256, 32);
+	memset(bytes + 160, 0x45, 32);
+	memset(bytes + 192, 0x55, 32);
+	memcpy(prefix, "PGWP", 4);
+	put_u16_le(prefix + 4, 1);
+	put_u16_le(prefix + 6, 256);
+	put_u64_le(prefix + 8, TEST_SYSID);
+	put_u64_le(prefix + 16, 41);
+	memcpy(prefix + 24, root->header.storage_uuid, 16);
+	memcpy(prefix + 40, root->header.authority_uuid, 16);
+	put_u32_le(prefix + 56, 0);
+	put_u32_le(prefix + 60, 1);
+	put_u64_le(prefix + 64, 199);
+	put_u32_le(prefix + 72, 1);
+	sha256_bytes(bytes + 256 + 1280, 112, prefix + 80);
+	put_u64_le(prefix + 112, 1);
+	put_u32_le(prefix + 252, image_crc(prefix, 252));
+	put_u32_le(bytes + 2068, 1);
+	if (parameters) {
+		put_u64_le(bytes + 2048, 0x2000100);
+		put_u64_le(bytes + 2056, 0x2000028);
+		put_u32_le(bytes + 2064, 1234);
+		put_u64_le(bytes + 2072, 1);
+		put_u64_le(bytes + 2088, 1);
+		put_u32_le(bytes + 2096, 900);
+		put_u32_le(bytes + 2100, 40);
+		put_u32_le(bytes + 2104, 20);
+		put_u32_le(bytes + 2108, 10);
+		put_u32_le(bytes + 2112, 90);
+	}
+	put_u32_le(bytes + 2300, image_crc(bytes, 2300));
+	ref->incarnation = 199;
+	ref->generation = 81;
+	sha256_bytes(bytes, 2304, ref->sha256);
+	history->terminal_count = 1;
+	history->terminals[0] = *ref;
+	root->header.file_txn_seq = 81;
+	memset(&root->startup[0], 0, sizeof(root->startup[0]));
+	/* The enclosing manifest changed; original PGWG bytes must not change. */
+	root->refs[0].history_generation = 81;
+	memset(root->refs[0].history_sha256, 0x65, 32);
+}
+
+UT_TEST(test_terminal_literal_is_distinct_from_checkpoint_or_active_writer)
+{
+	for (int parameters = 0; parameters < 2; parameters++) {
+		uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES], encoded[CLUSTER_WAL_TERMINAL_BYTES];
+		ControlRootImage root;
+		ClusterWalHistoryImage history;
+		ClusterWalTerminalRef ref, encoded_ref;
+		ClusterWalTerminalImage out;
+		ClusterWalStartupImage active;
+		terminal_fixture(bytes, &root, &history, &ref, parameters != 0);
+		UT_ASSERT_EQ(
+			cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history, &ref, &out), 0);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(out.initialization.claim.identity.origin_owner_incarnation, 199);
+		UT_ASSERT_EQ(out.initialization.predecessor.snapshot.identity.origin_owner_incarnation, 99);
+		UT_ASSERT_EQ(out.observation.tail.records, parameters);
+		UT_ASSERT_EQ(out.observation.checkpoint_records, 0);
+		UT_ASSERT_EQ(out.observation.max_connections, parameters ? 900 : 0);
+		UT_ASSERT_EQ(out.observation.tail.durable_prefix.exclusive_end, 0);
+		UT_ASSERT_EQ(cluster_wal_terminal_encode(&root, 0, &history, &out, encoded, &encoded_ref),
+					 0);
+		UT_ASSERT(memcmp(encoded, bytes, sizeof(bytes)) == 0);
+		UT_ASSERT(memcmp(&ref, &encoded_ref, sizeof(ref)) == 0);
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_startup_decode(bytes, sizeof(bytes), &root, 0, &active),
+			CLUSTER_CONTROL_ROOT_BAD_SIZE);
+		UT_ASSERT(v2_zero(&active, sizeof(active)));
+		out.observation.unsupported_records = 1;
+		UT_ASSERT_EQ(cluster_wal_terminal_encode(&root, 0, &history, &out, encoded, &encoded_ref),
+					 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT(v2_zero(encoded, sizeof(encoded)));
+		UT_ASSERT(v2_zero(&encoded_ref, sizeof(encoded_ref)));
+	}
+}
+
+UT_TEST(test_terminal_recoverer_uses_node_and_incarnation_identity)
+{
+	for (unsigned same_node = 0; same_node < 2; same_node++)
+		for (unsigned same_incarnation = 0; same_incarnation < 2; same_incarnation++) {
+			uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES], encoded[CLUSTER_WAL_TERMINAL_BYTES];
+			ControlRootImage root;
+			ClusterWalHistoryImage history;
+			ClusterWalTerminalRef ref, encoded_ref;
+			ClusterWalTerminalImage out;
+			terminal_fixture(bytes, &root, &history, &ref, false);
+			put_u64_le(bytes + 96, same_incarnation ? 199 : 999);
+			put_u32_le(bytes + 104, same_node ? 0 : 2);
+			put_u32_le(bytes + 2300, image_crc(bytes, 2300));
+			sha256_bytes(bytes, sizeof(bytes), ref.sha256);
+			history.terminals[0] = ref;
+			if (same_node && same_incarnation) {
+				UT_ASSERT_EQ(cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history,
+														 &ref, &out),
+							 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+				UT_ASSERT(v2_zero(&out, sizeof(out)));
+			} else {
+				UT_ASSERT_EQ(cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history,
+														 &ref, &out),
+							 0);
+				if (ut_current_failed)
+					return;
+				UT_ASSERT_EQ(
+					cluster_wal_terminal_encode(&root, 0, &history, &out, encoded, &encoded_ref),
+					0);
+				UT_ASSERT(memcmp(bytes, encoded, sizeof(bytes)) == 0);
+			}
+		}
+}
+
+UT_TEST(test_terminal_rejects_unproven_or_inconsistent_fields)
+{
+	for (unsigned fault = 0; fault < 24; fault++) {
+		uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES];
+		ControlRootImage root;
+		ClusterWalHistoryImage history;
+		ClusterWalTerminalRef ref;
+		ClusterWalTerminalImage out;
+		terminal_fixture(bytes, &root, &history, &ref, true);
+		switch (fault) {
+		case 0:
+			bytes[108] = 1;
+			break;
+		case 1:
+			bytes[224] = 1;
+			break;
+		case 2:
+			bytes[2120] = 1;
+			break;
+		case 3:
+			put_u32_le(bytes + 8, 3);
+			break;
+		case 4:
+			put_u32_le(bytes + 12, 0);
+			break;
+		case 5:
+			put_u64_le(bytes + 40, 99);
+			break;
+		case 6:
+			put_u64_le(bytes + 48, 82);
+			break;
+		case 7:
+			memset(bytes + 56, 0, 32);
+			break;
+		case 8:
+			put_u64_le(bytes + 88, 0);
+			break;
+		case 9:
+			put_u64_le(bytes + 96, 199);
+			put_u32_le(bytes + 104, 0);
+			break;
+		case 10:
+			put_u32_le(bytes + 104, 128);
+			break;
+		case 11:
+			put_u64_le(bytes + 112, 0);
+			break;
+		case 12:
+			memset(bytes + 160, 0, 32);
+			break;
+		case 13:
+			memset(bytes + 192, 0, 32);
+			break;
+		case 14:
+			bytes[128] ^= 1;
+			break;
+		case 15:
+			bytes[16] ^= 1;
+			break;
+		case 16:
+			put_u32_le(bytes + 2068, 2);
+			break;
+		case 17:
+			put_u64_le(bytes + 2072, 0);
+			break;
+		case 18:
+			put_u64_le(bytes + 2080, UINT64_MAX);
+			break;
+		case 19:
+			put_u32_le(bytes + 2096, 0);
+			break;
+		case 20:
+			put_u32_le(bytes + 2116, 2);
+			break;
+		case 21:
+			put_u32_le(bytes + 2108, UINT32_MAX);
+			break;
+		case 22:
+			put_u64_le(bytes + 2056, 8);
+			break;
+		case 23:
+			put_u64_le(bytes + 2048, 0);
+			break;
+		}
+		put_u32_le(bytes + 2300, image_crc(bytes, 2300));
+		sha256_bytes(bytes, sizeof(bytes), ref.sha256);
+		history.terminals[0] = ref;
+		UT_ASSERT(cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history, &ref, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
+UT_TEST(test_terminal_requires_original_predecessor_in_flat_current_union)
+{
+	uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES];
+	ControlRootImage root;
+	ClusterWalHistoryImage history;
+	ClusterWalTerminalRef ref;
+	ClusterWalTerminalImage out;
+	terminal_fixture(bytes, &root, &history, &ref, false);
+	UT_ASSERT_EQ(cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history, &ref, &out),
+				 0);
+	if (ut_current_failed)
+		return;
+	history.count = 1;
+	history.records[0] = out.initialization.predecessor;
+	history.records[0].refs.history_generation = 0;
+	memset(history.records[0].refs.history_sha256, 0, 32);
+	root.records[0].identity.origin_owner_incarnation = 301;
+	root.records[0].identity.root_lineage_seq = 401;
+	root.records[0].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+	root.header.v2.serving[0] |= 1;
+	UT_ASSERT_EQ(cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history, &ref, &out),
+				 0);
+	history.records[0].refs.anchor_sha256[0] ^= 1;
+	UT_ASSERT_EQ(cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	history.count = 0;
+	UT_ASSERT_EQ(cluster_wal_terminal_decode(bytes, sizeof(bytes), &root, 0, &history, &ref, &out),
+				 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+}
+
 UT_TEST(test_startup_encoder_refuses_invalid_logical_input_without_partial_bytes)
 {
 	uint8 bytes[1536], actual[1536];
@@ -8989,7 +9251,7 @@ UT_TEST(test_v3_startup_install_all_sync_and_late_cuts_retain_obligations)
  * prefix and anchor files, then bind that input into the DURABLE fixture. */
 static void
 v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
-					   ClusterWalHistoryImage *history, unsigned count)
+					   ClusterWalHistoryImage *history, unsigned count, bool with_terminal)
 {
 	static uint64 old_generation = 500000;
 	ClusterRecoveryAnchorRefV2 ref = { 0 };
@@ -9064,7 +9326,51 @@ v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
 	test_flush = saved_flush;
 	test_checkpoint_end = saved_end;
 	test_checkpoint_crc = saved_crc;
-	strlcpy(test_checkpoint_prefix_path, saved_path, sizeof(saved_path));
+	strlcpy(test_checkpoint_prefix_path, saved_path, sizeof(test_checkpoint_prefix_path));
+	if (with_terminal) {
+		ClusterWalStartupImage interrupted = *op;
+		ClusterWalTerminalImage terminal = { 0 };
+		ClusterWalStartupStage terminal_stage;
+		uint8 claim_bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
+		interrupted.phase = CLUSTER_WAL_STARTUP_INITIALIZING;
+		memset(&interrupted.successor, 0, sizeof(interrupted.successor));
+		memset(&interrupted.prefix, 0, sizeof(interrupted.prefix));
+		interrupted.prefix_timeline = 0;
+		interrupted.generation = ++old_generation;
+		interrupted.claim.identity.origin_owner_incarnation = old_generation;
+		interrupted.claim.identity.root_lineage_seq = old_generation;
+		interrupted.claim.identity.thread_claim_crc32c = 0;
+		interrupted.claim.claim_generation = old_generation;
+		UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&interrupted.claim, claim_bytes), 0);
+		interrupted.claim.identity.thread_claim_crc32c = image_crc(claim_bytes, 104);
+		put_u64_le(interrupted.operation_uuid, old_generation);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_encode(
+						 root, 0, &interrupted, terminal.original, &terminal.original_ref),
+					 0);
+		terminal.closure_version = 1;
+		memcpy(terminal.operation_uuid, interrupted.operation_uuid, 16);
+		terminal.generation = ++old_generation;
+		terminal.database_incarnation = op->database_incarnation;
+		terminal.sealing_sequence = root->header.file_txn_seq;
+		sha256_bytes(root->bytes, sizeof(root->bytes), terminal.sealing_sha256);
+		terminal.formation_epoch = op->formation_epoch;
+		terminal.recoverer_node = 2;
+		terminal.recoverer_incarnation = 777;
+		terminal.ir_request_id = old_generation;
+		memset(terminal.isolation_sha256, 0x51, 32);
+		memset(terminal.closure_sha256, 0x61, 32);
+		terminal.observation.tail.durable_prefix.sequence = 1;
+		test_actual_cf = test_cf_mode = ExclusiveLock;
+		UT_ASSERT_EQ(cluster_wal_terminal_prepare(root, 0, history, &terminal, &terminal_stage), 0);
+		UT_ASSERT_EQ(cluster_wal_terminal_install(&terminal_stage), 0);
+		if (ut_current_failed)
+			return;
+		history->terminal_count = 1;
+		history->terminals[0].incarnation = interrupted.claim.identity.origin_owner_incarnation;
+		history->terminals[0].generation = terminal_stage.generation;
+		memcpy(history->terminals[0].sha256, terminal_stage.sha256, 32);
+		UT_ASSERT_EQ(cluster_wal_terminal_discard(&terminal_stage), 0);
+	}
 	put_u64_le(uuid, ++old_generation);
 	root->header.file_txn_seq++;
 	test_actual_cf = test_cf_mode = ExclusiveLock;
@@ -9089,7 +9395,9 @@ v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
 
 UT_TEST(test_v3_startup_install_keeps_full_history_and_refuses_overflow)
 {
-	for (unsigned count = 2; count <= 128; count += 126) {
+	for (unsigned scenario = 0; scenario < 4; ++scenario) {
+		bool with_terminal = scenario >= 2;
+		unsigned count = scenario % 2 == 0 ? 2 : with_terminal ? 127 : 128;
 		uint8 before[66048];
 		ControlRootImage root, selected;
 		ControlFileData common;
@@ -9097,11 +9405,11 @@ UT_TEST(test_v3_startup_install_keeps_full_history_and_refuses_overflow)
 		ClusterWalStartupImage op = v3_install_fixture(before, &root);
 		ClusterWalHistoryImage old_history, actual;
 		ClusterWalDurablePrefixRef writer;
-		v3_install_add_history(&root, &op, &old_history, count);
+		v3_install_add_history(&root, &op, &old_history, count, with_terminal);
 		if (ut_current_failed)
 			return;
 		memcpy(before, root.bytes, sizeof(before));
-		if (count == 128) {
+		if (count + old_history.terminal_count == 128) {
 			UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer),
 						 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
 			UT_ASSERT(v2_zero(&writer, sizeof(writer)));
@@ -9115,6 +9423,8 @@ UT_TEST(test_v3_startup_install_keeps_full_history_and_refuses_overflow)
 					 0);
 		UT_ASSERT_EQ(cluster_wal_history_read_locked(&selected, 0, &actual), 0);
 		UT_ASSERT_EQ(actual.count, 3);
+		UT_ASSERT_EQ(actual.terminal_count, with_terminal ? 1 : 0);
+		UT_ASSERT(memcmp(actual.terminals, old_history.terminals, sizeof(actual.terminals)) == 0);
 		for (unsigned i = 0; i < count; ++i) {
 			UT_ASSERT(memcmp(&old_history.records[i].snapshot, &actual.records[i + 1].snapshot,
 							 sizeof(actual.records[0].snapshot))
@@ -9128,6 +9438,21 @@ UT_TEST(test_v3_startup_install_keeps_full_history_and_refuses_overflow)
 					 op.predecessor.snapshot.identity.origin_owner_incarnation);
 		test_actual_cf = test_cf_mode = NoLock;
 		UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+		if (with_terminal) {
+			char path[MAXPGPATH], hex[65];
+			const ClusterWalTerminalRef *terminal = &actual.terminals[0];
+			for (unsigned i = 0; i < 32; ++i)
+				snprintf(hex + 2 * i, 3, "%02x", terminal->sha256[i]);
+			snprintf(path, sizeof(path),
+					 "%s/global/wal_startup/thread_1/startup_" UINT64_FORMAT "-%s.bin", test_root,
+					 terminal->generation, hex);
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer),
+						 CLUSTER_CONTROL_ROOT_ABSENT);
+			UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+			v2_assert_primary_unchanged(selected.bytes);
+			continue;
+		}
 		/* A missing retained claim cannot be silently skipped on retry. */
 		{
 			char path[MAXPGPATH];
@@ -13078,7 +13403,9 @@ UT_TEST(test_history_encoder_matches_literal_empty_and_full)
 	uint32 counts[] = { 0, 2, 128 };
 	for (uint32 node = 0; node <= 127; node += 127)
 		for (unsigned i = 0; i < lengthof(counts); i++) {
-			size_t len = history_fixture(expected, &root, node, counts[i]), used = 777;
+			size_t len, used = 777;
+			memset(expected, 0, sizeof(expected));
+			len = history_fixture(expected, &root, node, counts[i]);
 			UT_ASSERT_EQ(
 				cluster_control_root_v2_history_decode(expected, len, &root, node, &history), 0);
 			memset(actual, 0xa5, sizeof(actual));
@@ -13087,6 +13414,169 @@ UT_TEST(test_history_encoder_matches_literal_empty_and_full)
 			UT_ASSERT_EQ(used, len);
 			UT_ASSERT(memcmp(expected, actual, sizeof(actual)) == 0);
 		}
+}
+
+/* Literal version-2 manifest: normal inputs and checkpoint-less terminal
+ * references are disjoint, sorted sets, not one fake checkpoint sequence. */
+static size_t
+terminal_history_fixture(uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], ControlRootImage *root)
+{
+	(void)history_fixture(bytes, root, 0, 1);
+	root->header.format_version = 3;
+	memmove(bytes + 96, bytes + 64, 512);
+	memset(bytes + 64, 0, 32);
+	put_u16_le(bytes + 4, 2);
+	put_u16_le(bytes + 6, 96);
+	put_u64_le(bytes + 16, 512 + 48);
+	put_u32_le(bytes + 64, 1);
+	put_u32_le(bytes + 68, 48);
+	put_u64_le(bytes + 608, 2000);
+	put_u64_le(bytes + 616, 1234);
+	memset(bytes + 624, 0x36, 32);
+	history_outer_checksum(bytes, 660, root, 0);
+	return 660;
+}
+
+UT_TEST(test_terminal_history_literal_union_and_old_reader_refusal)
+{
+	uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], encoded[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	ControlRootImage root;
+	ClusterWalHistoryImage out;
+	size_t used, len = terminal_history_fixture(bytes, &root);
+	UT_ASSERT_EQ(cluster_control_root_v3_history_decode(bytes, len, &root, 0, &out), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(out.count, 1);
+	UT_ASSERT_EQ(out.records[0].snapshot.identity.origin_owner_incarnation, 1000);
+	UT_ASSERT_EQ(out.terminal_count, 1);
+	UT_ASSERT_EQ(out.terminals[0].incarnation, 2000);
+	UT_ASSERT_EQ(out.terminals[0].generation, 1234);
+	UT_ASSERT(memcmp(out.terminals[0].sha256, bytes + 624, 32) == 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_history_encode(&root, 0, &out, encoded, &used), 0);
+	UT_ASSERT_EQ(used, len);
+	UT_ASSERT(memcmp(encoded, bytes, len) == 0);
+	root.header.format_version = 2;
+	UT_ASSERT_EQ(cluster_control_root_v2_history_decode(bytes, len, &root, 0, &out),
+				 CLUSTER_CONTROL_ROOT_BAD_VERSION);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+}
+
+UT_TEST(test_terminal_history_refuses_aliases_and_malformed_sets)
+{
+	for (unsigned fault = 0; fault < 11; fault++) {
+		uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+		ControlRootImage root;
+		ClusterWalHistoryImage out;
+		size_t len = terminal_history_fixture(bytes, &root);
+		switch (fault) {
+		case 0:
+			put_u64_le(bytes + 608, 1000);
+			break;
+		case 1:
+			put_u64_le(bytes + 608, root.records[0].identity.origin_owner_incarnation);
+			break;
+		case 2:
+			put_u64_le(bytes + 608, 0);
+			break;
+		case 3:
+			put_u64_le(bytes + 616, 0);
+			break;
+		case 4:
+			memset(bytes + 624, 0, 32);
+			break;
+		case 5:
+			put_u32_le(bytes + 64, 128);
+			break;
+		case 6:
+			put_u32_le(bytes + 68, 40);
+			break;
+		case 7:
+			bytes[72] = 1;
+			break;
+		case 8:
+			put_u64_le(bytes + 16, 512);
+			break;
+		case 9:
+			put_u32_le(bytes + 64, 0);
+			break;
+		case 10:
+			memcpy(bytes + 656, bytes + 608, 48);
+			put_u32_le(bytes + 64, 2);
+			put_u64_le(bytes + 16, 512 + 96);
+			len += 48;
+			break;
+		}
+		history_outer_checksum(bytes, len, &root, 0);
+		UT_ASSERT(cluster_control_root_v3_history_decode(bytes, len, &root, 0, &out) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
+UT_TEST(test_terminal_history_real_file_install_and_selected_read)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history, observed;
+	ClusterWalHistoryStage stage;
+	uint8 uuid[16], bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	history_prepare_fixture(&root, &history, uuid, bytes, 1);
+	root.header.format_version = 3;
+	history.terminal_count = 1;
+	history.terminals[0].incarnation = 2000;
+	history.terminals[0].generation = 1234;
+	memset(history.terminals[0].sha256, 0x36, 32);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7020, uuid, &stage), 0);
+	UT_ASSERT_EQ(stage.length, 660);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	if (ut_current_failed)
+		return;
+	root.refs[0].history_generation = stage.generation;
+	memcpy(root.refs[0].history_sha256, stage.sha256, 32);
+	UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 0, &observed), 0);
+	UT_ASSERT_EQ(observed.count, 1);
+	UT_ASSERT_EQ(observed.terminal_count, 1);
+	UT_ASSERT(memcmp(observed.terminals, history.terminals, sizeof(history.terminals)) == 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 0, &observed), 0);
+	{
+		ClusterWalOriginInputs all;
+		/* Metadata decoding alone cannot silently omit the selected terminal
+		 * file. The complete-input consumer must actually read it. */
+		UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&root, 0, &all),
+					 CLUSTER_CONTROL_ROOT_ABSENT);
+		UT_ASSERT(v2_zero(&all, sizeof(all)));
+	}
+}
+
+UT_TEST(test_terminal_history_combined_capacity_does_not_evict_inputs)
+{
+	ControlRootImage root;
+	ClusterWalHistoryImage history, readback;
+	uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES];
+	size_t used, len = history_fixture(bytes, &root, 0, 127);
+	UT_ASSERT_EQ(cluster_control_root_v2_history_decode(bytes, len, &root, 0, &history), 0);
+	root.header.format_version = 3;
+	history.terminal_count = 1;
+	history.terminals[0].incarnation = 2000;
+	history.terminals[0].generation = 1234;
+	memset(history.terminals[0].sha256, 0x36, 32);
+	UT_ASSERT_EQ(cluster_control_root_v3_history_encode(&root, 0, &history, bytes, &used), 0);
+	history_outer_checksum(bytes, used, &root, 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_history_decode(bytes, used, &root, 0, &readback), 0);
+	UT_ASSERT_EQ(readback.count, 127);
+	UT_ASSERT_EQ(readback.terminal_count, 1);
+	history.terminal_count = 2;
+	history.terminals[1] = history.terminals[0];
+	history.terminals[1].incarnation++;
+	UT_ASSERT_EQ(cluster_control_root_v3_history_encode(&root, 0, &history, bytes, &used),
+				 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+	UT_ASSERT_EQ(used, 0);
+	UT_ASSERT(v2_zero(bytes, sizeof(bytes)));
+	UT_ASSERT_EQ(history.count, 127);
+	UT_ASSERT_EQ(history.terminal_count, 2);
+	root.header.format_version = 2;
+	UT_ASSERT_EQ(cluster_control_root_v2_history_encode(&root, 0, &history, bytes, &used),
+				 CLUSTER_CONTROL_ROOT_BAD_VERSION);
 }
 
 UT_TEST(test_history_encoder_rejects_invalid_records_without_partial_output)
@@ -13147,7 +13637,7 @@ UT_TEST(test_history_stage_installs_exact_readable_object)
 	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 0, &history, 7001, uuid, &stage), 0);
 	if (ut_current_failed)
 		return;
-	UT_ASSERT_EQ(stage.length, sizeof(bytes));
+	UT_ASSERT_EQ(stage.length, CLUSTER_WAL_HISTORY_HEADER_BYTES + 128 * 512 + 4);
 	history_stage_paths(&stage, formal, temp);
 	UT_ASSERT_EQ(access(temp, F_OK), 0);
 	UT_ASSERT_EQ(access(formal, F_OK), -1);
@@ -13844,7 +14334,8 @@ UT_TEST(test_v3_history_keeps_flat_input_separate_from_pending_operation)
 		UT_ASSERT_EQ(cluster_control_root_v3_history_encode(&root, 0, &expected, encoded, &used),
 					 0);
 		UT_ASSERT_EQ(used, len);
-		UT_ASSERT(memcmp(bytes, encoded, sizeof(bytes)) == 0);
+		UT_ASSERT(memcmp(bytes, encoded, len) == 0);
+		UT_ASSERT(v2_zero(encoded + len, sizeof(encoded) - len));
 		UT_ASSERT(memcmp(&before, &root, sizeof(root)) == 0);
 		UT_ASSERT_EQ(cluster_control_root_v2_history_decode(bytes, len, &root, 0, &got),
 					 CLUSTER_CONTROL_ROOT_BAD_VERSION);
@@ -14345,6 +14836,209 @@ UT_TEST(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor)
 		pfree(out.config_bytes);
 		UT_ASSERT_EQ(unlink(paths[1]), 0);
 		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
+	}
+}
+
+UT_TEST(test_bootstrap_initializing_refuses_malformed_native_metadata)
+{
+	for (int fault = 0; fault < 2; ++fault) {
+		BootstrapFixture f;
+		ControlRootImage root;
+		ClusterWalStartupImage operation;
+		uint8 startup[CLUSTER_WAL_STARTUP_BYTES], page[XLOG_BLCKSZ];
+		XLogRecord record;
+		char paths[3][MAXPGPATH], path[MAXPGPATH];
+		uint8 *bytes = page + SizeOfXLogLongPHD;
+		bootstrap_initializing_wal_fixture(&f, true, paths);
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage,
+													TEST_SYSID, &root),
+					 0);
+		read_all_or_abort(paths[0], startup, sizeof(startup));
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_decode(startup, sizeof(startup), &root, 127,
+															&operation),
+					 0);
+		v2_checkpoint_wal_path(&operation.claim.identity, operation.first_segment_lsn,
+							   operation.timeline, path);
+		read_all_or_abort(path, page, sizeof(page));
+		memcpy(&record, bytes, sizeof(record));
+		/* Preserve native physical CRC validity. The actual bootstrap consumer
+		 * must reject the wrong metadata size even with an EMPTY promise. */
+		record.xl_info = fault == 0 ? XLOG_FPW_CHANGE : XLOG_CHECKPOINT_SHUTDOWN;
+		INIT_CRC32C(record.xl_crc);
+		COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, record.xl_tot_len - SizeOfXLogRecord);
+		COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+		FIN_CRC32C(record.xl_crc);
+		memcpy(bytes, &record, sizeof(record));
+		write_all_or_abort(path, page, sizeof(page));
+		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+	}
+}
+
+static void
+bootstrap_terminal_fixture(BootstrapFixture *f, bool parameters, char paths[4][MAXPGPATH])
+{
+	ControlRootImage root;
+	ClusterWalTerminalImage terminal = { 0 };
+	ClusterWalHistoryImage history;
+	ClusterWalStartupStage stage;
+	ClusterWalHistoryStage manifest;
+	ClusterWalDurablePrefixRef wal = { 0 };
+	char temp[MAXPGPATH];
+	bootstrap_initializing_wal_fixture(f, parameters, paths);
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(f->before, sizeof(f->before), v2_storage, TEST_SYSID, &root),
+		0);
+	read_all_or_abort(paths[0], terminal.original, sizeof(terminal.original));
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_decode(terminal.original,
+														sizeof(terminal.original), &root, 127,
+														&terminal.initialization),
+				 0);
+	terminal.closure_version = 1;
+	memcpy(terminal.operation_uuid, terminal.initialization.operation_uuid, 16);
+	terminal.generation = terminal.initialization.generation + 1;
+	terminal.database_incarnation = terminal.initialization.database_incarnation;
+	terminal.sealing_sequence = root.header.file_txn_seq;
+	sha256_bytes(f->before, sizeof(f->before), terminal.sealing_sha256);
+	terminal.formation_epoch = terminal.initialization.formation_epoch;
+	terminal.recoverer_incarnation = 777;
+	terminal.recoverer_node = 0;
+	terminal.ir_request_id = 12345;
+	terminal.original_ref = root.startup[127];
+	memset(terminal.isolation_sha256, 0x55, 32);
+	memset(terminal.closure_sha256, 0x66, 32);
+	wal.claim.identity = terminal.initialization.claim.identity;
+	wal.claim.database_incarnation = terminal.database_incarnation;
+	wal.claim.max_config_generation = terminal.initialization.config_generation;
+	sha256_bytes(terminal.original + 1280, 112, wal.claim.claim_sha256);
+	wal.timeline = terminal.initialization.timeline;
+	UT_ASSERT_EQ(cluster_wal_startup_observe(
+					 test_wal_root, &wal, terminal.initialization.segment_size,
+					 terminal.initialization.first_segment_lsn, &terminal.observation),
+				 0);
+	test_actual_cf = test_cf_mode = ExclusiveLock;
+	test_cf_grant = test_cf_clusterwide = true;
+	UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 127, &history), 0);
+	UT_ASSERT_EQ(cluster_wal_terminal_prepare(&root, 127, &history, &terminal, &stage), 0);
+	UT_ASSERT_EQ(cluster_wal_startup_install(&stage), CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_terminal_install(&stage), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_wal_terminal_install(&stage), 0);
+	startup_stage_paths(&stage, paths[3], temp);
+	history.terminal_count = 1;
+	history.terminals[0].incarnation = wal.claim.identity.origin_owner_incarnation;
+	history.terminals[0].generation = stage.generation;
+	memcpy(history.terminals[0].sha256, stage.sha256, 32);
+	history_stage_dirs(127);
+	UT_ASSERT_EQ(cluster_wal_history_prepare(&root, 127, &history, stage.generation,
+											 terminal.operation_uuid, &manifest),
+				 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&manifest), 0);
+	if (ut_current_failed)
+		return;
+	root.refs[127].history_generation = manifest.generation;
+	memcpy(root.refs[127].history_sha256, manifest.sha256, 32);
+	memset(&root.startup[127], 0, sizeof(root.startup[127]));
+	root.header.file_txn_seq++;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+	memcpy(f->before, root.bytes, sizeof(f->before));
+	v2_write_roots(f->before);
+	UT_ASSERT_EQ(cluster_wal_terminal_discard(&stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&manifest), 0);
+	/* The terminal must stand on its embedded selected input, not this file. */
+	UT_ASSERT_EQ(unlink(paths[0]), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+}
+
+UT_TEST(test_bootstrap_terminal_preserves_actual_wal_capacity_without_active_intent)
+{
+	for (unsigned parameters = 0; parameters < 2; parameters++) {
+		BootstrapFixture f;
+		ClusterControlBootstrapObservation out;
+		char paths[4][MAXPGPATH];
+		bootstrap_terminal_fixture(&f, parameters != 0, paths);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(
+			cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, &out), 0);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(out.required.pending_sources, 0);
+		UT_ASSERT_EQ(out.required.history_sources, 3);
+		UT_ASSERT_EQ(out.required.max_connections, parameters ? 1401 : 601);
+		UT_ASSERT(!out.snapshot.pending_wal_valid);
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		pfree(out.config_bytes);
+		UT_ASSERT_EQ(unlink(paths[3]), 0);
+		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
+	}
+}
+
+UT_TEST(test_terminal_selected_reader_and_bootstrap_refuse_incomplete_evidence)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		BootstrapFixture f;
+		ControlRootImage root;
+		ClusterWalTerminalImage terminal;
+		ClusterWalOriginInputs inputs;
+		char paths[4][MAXPGPATH], path[MAXPGPATH];
+		bootstrap_terminal_fixture(&f, true, paths);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage,
+													TEST_SYSID, &root),
+					 0);
+		test_actual_cf = test_cf_mode = ShareLock;
+		UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&root, 127, &inputs), 0);
+		UT_ASSERT_EQ(inputs.history.terminal_count, 1);
+		UT_ASSERT(!inputs.has_pending);
+		UT_ASSERT_EQ(cluster_wal_terminal_read_locked(&root, 127, 0, &terminal), 0);
+		if (ut_current_failed)
+			return;
+		if (fault == 0)
+			UT_ASSERT_EQ(unlink(paths[1]), 0);
+		else if (fault == 1) {
+			snprintf(path, sizeof(path),
+					 "%s/thread_128/generation_" UINT64_FORMAT "/durable_prefix/current",
+					 test_wal_root,
+					 terminal.initialization.claim.identity.origin_owner_incarnation);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 2) {
+			uint8 page[XLOG_BLCKSZ];
+			XLogRecord record;
+			uint8 *bytes = page + SizeOfXLogLongPHD;
+			v2_checkpoint_wal_path(&terminal.initialization.claim.identity,
+								   terminal.initialization.first_segment_lsn,
+								   terminal.initialization.timeline, path);
+			read_all_or_abort(path, page, sizeof(page));
+			memcpy(&record, bytes, sizeof(record));
+			record.xl_info = XLOG_NOOP;
+			INIT_CRC32C(record.xl_crc);
+			COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord,
+						record.xl_tot_len - SizeOfXLogRecord);
+			COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+			FIN_CRC32C(record.xl_crc);
+			memcpy(bytes, &record, sizeof(record));
+			write_all_or_abort(path, page, sizeof(page));
+		} else if (fault == 3)
+			UT_ASSERT_EQ(unlink(paths[3]), 0);
+		else if (fault == 4)
+			UT_ASSERT_EQ(chmod(paths[3], 0660), 0);
+		else if (fault == 5) {
+			UT_ASSERT_EQ(unlink(paths[3]), 0);
+			UT_ASSERT_EQ(symlink("missing-terminal", paths[3]), 0);
+		} else
+			write_all_or_abort(paths[3], "bad", 3);
+		if (fault >= 3) {
+			UT_ASSERT(cluster_wal_terminal_read_locked(&root, 127, 0, &terminal) != 0);
+			UT_ASSERT(v2_zero(&terminal, sizeof(terminal)));
+			UT_ASSERT(cluster_wal_origin_inputs_read_locked(&root, 127, &inputs) != 0);
+			UT_ASSERT(v2_zero(&inputs, sizeof(inputs)));
+		}
+		test_actual_cf = test_cf_mode = NoLock;
+		UT_ASSERT(bootstrap_read_refused(0) != 0);
+		v2_assert_primary_unchanged(f.before);
 	}
 }
 
@@ -15184,7 +15878,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(286);
+	UT_PLAN(297);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
@@ -15232,6 +15926,9 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_clean_exit_cut_keeps_complete_root_roster);
 	UT_RUN(test_v3_clean_exit_cut_never_shrinks_missing_members);
 	UT_RUN(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor);
+	UT_RUN(test_bootstrap_initializing_refuses_malformed_native_metadata);
+	UT_RUN(test_bootstrap_terminal_preserves_actual_wal_capacity_without_active_intent);
+	UT_RUN(test_terminal_selected_reader_and_bootstrap_refuse_incomplete_evidence);
 	UT_RUN(test_v3_failure_publishers_preserve_pending_and_authenticate_native_input);
 	UT_RUN(test_v3_recovery_complete_preserves_exact_selected_inputs);
 	UT_RUN(test_v3_recovery_complete_never_accepts_partial_or_unowned_terminal);
@@ -15267,9 +15964,17 @@ main(int argc, char **argv)
 	UT_RUN(test_startup_file_read_only_needs_no_staging_or_fsync);
 	UT_RUN(test_startup_file_rejects_unselected_unsafe_and_changed_objects);
 	UT_RUN(test_startup_encoder_matches_literal_phases_without_publishing);
+	UT_RUN(test_terminal_literal_is_distinct_from_checkpoint_or_active_writer);
+	UT_RUN(test_terminal_recoverer_uses_node_and_incarnation_identity);
+	UT_RUN(test_terminal_rejects_unproven_or_inconsistent_fields);
+	UT_RUN(test_terminal_requires_original_predecessor_in_flat_current_union);
 	UT_RUN(test_startup_encoder_refuses_invalid_logical_input_without_partial_bytes);
 	UT_RUN(test_startup_encoder_arguments_and_aliases_clear_outputs);
 	UT_RUN(test_history_encoder_matches_literal_empty_and_full);
+	UT_RUN(test_terminal_history_literal_union_and_old_reader_refusal);
+	UT_RUN(test_terminal_history_refuses_aliases_and_malformed_sets);
+	UT_RUN(test_terminal_history_real_file_install_and_selected_read);
+	UT_RUN(test_terminal_history_combined_capacity_does_not_evict_inputs);
 	UT_RUN(test_history_encoder_rejects_invalid_records_without_partial_output);
 	UT_RUN(test_history_stage_installs_exact_readable_object);
 	UT_RUN(test_history_stage_lock_and_no_clobber);

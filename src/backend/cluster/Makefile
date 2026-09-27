@@ -358,4 +358,16 @@ OBJS = cluster_conf.o cluster_debug.o cluster_ic.o cluster_inject.o cluster_undo
 # SQL symbols; --disable-cluster bodies raise ERRCODE_FEATURE_NOT_SUPPORTED.
 endif
 
+# PGRAC: private recovery carriers are shared across actual consumers. Keep
+# incremental builds coherent even without compiler-generated dependencies.
+# Author: SqlRush <sqlrush@gmail.com>
+cluster_control_root.o cluster_control_bootstrap_read.o cluster_wal_history.o \
+cluster_clean_leave.o cluster_cf_authority.o cluster_recovery_duty.o \
+cluster_thread_recovery_finalize.o cluster_thread_recovery_worker.o \
+cluster_wal_thread.o cluster_wal_durable_publish.o cluster_wal_retention.o: \
+	$(srcdir)/cluster_control_root_private.h
+
+cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_root.o \
+cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
+
 include $(top_srcdir)/src/backend/common.mk

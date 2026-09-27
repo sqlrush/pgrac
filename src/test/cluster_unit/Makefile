@@ -1508,7 +1508,9 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h test_cluster_
 # production code. Author: SqlRush <sqlrush@gmail.com>
 cluster_control_bootstrap_read_test.o: cluster_control_bootstrap_read_test.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_read.c \
-		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h
+		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
+		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
+		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c

@@ -607,12 +607,35 @@ history_overlaps_output(const void *input, size_t len, const ClusterWalHistoryIm
 }
 
 static ClusterControlRootResult
+history_terminal_set_validate(const ControlRootImage *root, uint32 node,
+							  const ClusterWalHistoryImage *history)
+{
+	if (history->count > CLUSTER_WAL_HISTORY_MAX_RECORDS
+		|| history->terminal_count > CLUSTER_WAL_HISTORY_MAX_RECORDS - history->count)
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	for (uint32 i = 0; i < history->terminal_count; i++) {
+		const ClusterWalTerminalRef *ref = &history->terminals[i];
+		if (ref->incarnation == 0 || ref->generation == 0 || bytes_are_zero(ref->sha256, 32)
+			|| (i > 0 && ref->incarnation <= history->terminals[i - 1].incarnation))
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (ref->incarnation == root->records[node].identity.origin_owner_incarnation)
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		for (uint32 j = 0; j < history->count; j++)
+			if (ref->incarnation == history->records[j].snapshot.identity.origin_owner_incarnation)
+				return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
 decode_history_version(const uint8 *bytes, size_t len, const ControlRootImage *root,
 					   uint32 origin_node, ClusterWalHistoryImage *out, uint16 version)
 {
 	ClusterControlRootResult result;
 	uint8 hash[32];
-	uint32 count;
+	uint32 count, terminals = 0;
+	uint16 manifest_version, header_bytes;
+	uint64 body_bytes;
 	bool valid_size = len >= 68 && len <= CLUSTER_WAL_HISTORY_MAX_BYTES;
 	bool alias = history_overlaps_output(root, sizeof(*root), out)
 				 || (valid_size && history_overlaps_output(bytes, len, out));
@@ -636,16 +659,28 @@ decode_history_version(const uint8 *bytes, size_t len, const ControlRootImage *r
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (memcmp(bytes, "PGWH", 4) != 0)
 		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
-	if (read_u16_le(bytes + 4) != 1)
+	manifest_version = read_u16_le(bytes + 4);
+	if (manifest_version != 1 && !(manifest_version == 2 && version == 3))
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	header_bytes = manifest_version == 1 ? CLUSTER_WAL_HISTORY_HEADER_BYTES
+										 : CLUSTER_WAL_HISTORY_V2_HEADER_BYTES;
+	if (len < header_bytes + 4)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	if (manifest_version == 2) {
+		terminals = read_u32_le(bytes + 64);
+		if (!bytes_are_zero(bytes + 72, 24))
+			return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+		if (terminals == 0 || terminals > CLUSTER_WAL_HISTORY_MAX_RECORDS
+			|| read_u32_le(bytes + 68) != CLUSTER_WAL_TERMINAL_REF_BYTES)
+			return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	}
 	count = read_u32_le(bytes + 8);
-	if (read_u16_le(bytes + 6) != CLUSTER_WAL_HISTORY_HEADER_BYTES
-		|| count > CLUSTER_WAL_HISTORY_MAX_RECORDS
+	body_bytes = (uint64)count * CLUSTER_CONTROL_ROOT_RECORD_BYTES
+				 + (uint64)terminals * CLUSTER_WAL_TERMINAL_REF_BYTES;
+	if (read_u16_le(bytes + 6) != header_bytes
+		|| count > CLUSTER_WAL_HISTORY_MAX_RECORDS - terminals
 		|| read_u32_le(bytes + 12) != CLUSTER_CONTROL_ROOT_RECORD_BYTES
-		|| read_u64_le(bytes + 16) != (uint64)count * CLUSTER_CONTROL_ROOT_RECORD_BYTES
-		|| len
-			   != CLUSTER_WAL_HISTORY_HEADER_BYTES
-					  + (size_t)count * CLUSTER_CONTROL_ROOT_RECORD_BYTES + 4)
+		|| read_u64_le(bytes + 16) != body_bytes || len != header_bytes + body_bytes + 4)
 		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
 	if (read_u64_le(bytes + 24) != root->header.system_identifier
 		|| memcmp(bytes + 32, root->header.storage_uuid, 16) != 0
@@ -659,8 +694,7 @@ decode_history_version(const uint8 *bytes, size_t len, const ControlRootImage *r
 		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
 
 	for (uint32 i = 0; i < count; i++) {
-		const uint8 *src = bytes + CLUSTER_WAL_HISTORY_HEADER_BYTES
-						   + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES;
+		const uint8 *src = bytes + header_bytes + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES;
 		ClusterWalHistoryRecord *record = &out->records[i];
 		uint64 incarnation;
 
@@ -690,6 +724,17 @@ decode_history_version(const uint8 *bytes, size_t len, const ControlRootImage *r
 		record->publisher_node = read_u32_le(src + 152);
 	}
 	out->count = count;
+	out->terminal_count = terminals;
+	for (uint32 i = 0; i < terminals; i++) {
+		const uint8 *src = bytes + header_bytes + (size_t)count * CLUSTER_CONTROL_ROOT_RECORD_BYTES
+						   + (size_t)i * CLUSTER_WAL_TERMINAL_REF_BYTES;
+		out->terminals[i].incarnation = read_u64_le(src);
+		out->terminals[i].generation = read_u64_le(src + 8);
+		memcpy(out->terminals[i].sha256, src + 16, 32);
+	}
+	result = history_terminal_set_validate(root, origin_node, out);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto refused;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 refused:
 	memset(out, 0, sizeof(*out));
@@ -712,7 +757,7 @@ encode_history_version(const ControlRootImage *root, uint32 origin_node,
 					   uint8 bytes[CLUSTER_WAL_HISTORY_MAX_BYTES], size_t *length, uint16 version)
 {
 	ClusterControlRootResult result;
-	size_t len;
+	size_t len, header_bytes;
 	bool alias
 		= history_ranges_overlap(root, sizeof(*root), bytes, CLUSTER_WAL_HISTORY_MAX_BYTES)
 		  || history_ranges_overlap(history, sizeof(*history), bytes, CLUSTER_WAL_HISTORY_MAX_BYTES)
@@ -731,8 +776,11 @@ encode_history_version(const ControlRootImage *root, uint32 origin_node,
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
 	if (!root->present[origin_node])
 		return CLUSTER_CONTROL_ROOT_ABSENT;
-	if (history->count > CLUSTER_WAL_HISTORY_MAX_RECORDS)
-		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (history->terminal_count != 0 && version != 3)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	result = history_terminal_set_validate(root, origin_node, history);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (root->records[origin_node].identity.origin_node_id != (int32)origin_node)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	result = snapshot_validate(&root->records[origin_node], origin_node + 1,
@@ -763,24 +811,38 @@ encode_history_version(const ControlRootImage *root, uint32 origin_node,
 			|| r->snapshot.lifecycle_reason > CLUSTER_CONTROL_ROOT_PUBLISH_COPY_REPAIR)
 			return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	}
-	len = CLUSTER_WAL_HISTORY_HEADER_BYTES
-		  + (size_t)history->count * CLUSTER_CONTROL_ROOT_RECORD_BYTES + 4;
+	header_bytes = history->terminal_count == 0 ? CLUSTER_WAL_HISTORY_HEADER_BYTES
+												: CLUSTER_WAL_HISTORY_V2_HEADER_BYTES;
+	len = header_bytes + (size_t)history->count * CLUSTER_CONTROL_ROOT_RECORD_BYTES
+		  + (size_t)history->terminal_count * CLUSTER_WAL_TERMINAL_REF_BYTES + 4;
 	memcpy(bytes, "PGWH", 4);
-	write_u16_le(bytes + 4, 1);
-	write_u16_le(bytes + 6, CLUSTER_WAL_HISTORY_HEADER_BYTES);
+	write_u16_le(bytes + 4, history->terminal_count == 0 ? 1 : 2);
+	write_u16_le(bytes + 6, header_bytes);
 	write_u32_le(bytes + 8, history->count);
 	write_u32_le(bytes + 12, CLUSTER_CONTROL_ROOT_RECORD_BYTES);
-	write_u64_le(bytes + 16, (uint64)history->count * CLUSTER_CONTROL_ROOT_RECORD_BYTES);
+	write_u64_le(bytes + 16, len - header_bytes - 4);
 	write_u64_le(bytes + 24, root->header.system_identifier);
 	memcpy(bytes + 32, root->header.storage_uuid, 16);
 	memcpy(bytes + 48, root->header.authority_uuid, 16);
+	if (history->terminal_count != 0) {
+		write_u32_le(bytes + 64, history->terminal_count);
+		write_u32_le(bytes + 68, CLUSTER_WAL_TERMINAL_REF_BYTES);
+	}
 	for (uint32 i = 0; i < history->count; i++) {
 		const ClusterWalHistoryRecord *r = &history->records[i];
-		encode_record_version(bytes + CLUSTER_WAL_HISTORY_HEADER_BYTES
-								  + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
+		encode_record_version(bytes + header_bytes + (size_t)i * CLUSTER_CONTROL_ROOT_RECORD_BYTES,
 							  &r->snapshot, r->publisher_incarnation, r->publisher_node,
 							  (ClusterControlRootPublishReason)r->snapshot.lifecycle_reason,
 							  CONTROL_ROOT_RECORD_VERSION_V2, &r->refs, NULL);
+	}
+	for (uint32 i = 0; i < history->terminal_count; i++) {
+		const ClusterWalTerminalRef *ref = &history->terminals[i];
+		uint8 *dst = bytes + header_bytes
+					 + (size_t)history->count * CLUSTER_CONTROL_ROOT_RECORD_BYTES
+					 + (size_t)i * CLUSTER_WAL_TERMINAL_REF_BYTES;
+		write_u64_le(dst, ref->incarnation);
+		write_u64_le(dst + 8, ref->generation);
+		memcpy(dst + 16, ref->sha256, 32);
 	}
 	write_u32_le(bytes + len - 4, control_root_crc(bytes, len - 4));
 	*length = len;
@@ -1146,9 +1208,45 @@ cluster_control_root_v3_encode(ControlRootImage *image)
 
 /* PGRAC: immutable pending input, not proof of isolation, durable native
  * initialization or permission to serve. Author: SqlRush <sqlrush@gmail.com> */
+static bool
+startup_retained_predecessor_matches(const ClusterWalHistoryRecord *input,
+									 const ClusterControlRootSnapshot *snapshot,
+									 const ControlRootRecordRefsV2 *refs,
+									 uint64 publisher_incarnation, uint32 publisher_node)
+{
+	/* Only the enclosing history reference changes when flattening a set.
+	 * Every actual checkpoint/claim/anchor identity remains exact. */
+	return memcmp(&input->snapshot, snapshot, sizeof(*snapshot)) == 0
+		   && input->publisher_incarnation == publisher_incarnation
+		   && input->publisher_node == publisher_node
+		   && input->refs.anchor_generation == refs->anchor_generation
+		   && memcmp(input->refs.anchor_sha256, refs->anchor_sha256, 32) == 0
+		   && memcmp(input->refs.claim_sha256, refs->claim_sha256, 32) == 0;
+}
+
+static bool
+startup_predecessor_in_union(const ClusterWalHistoryRecord *input, const ControlRootImage *root,
+							 uint32 node, const ClusterWalHistoryImage *history)
+{
+	if (history->count > CLUSTER_WAL_HISTORY_MAX_RECORDS)
+		return false;
+	if (startup_retained_predecessor_matches(input, &root->records[node], &root->refs[node],
+											 root->publisher_incarnation[node],
+											 root->publisher_node[node]))
+		return true;
+	for (uint32 i = 0; i < history->count; i++) {
+		const ClusterWalHistoryRecord *r = &history->records[i];
+		if (startup_retained_predecessor_matches(input, &r->snapshot, &r->refs,
+												 r->publisher_incarnation, r->publisher_node))
+			return true;
+	}
+	return false;
+}
+
 static ClusterControlRootResult
 startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 node,
-					  ClusterWalStartupImage *out)
+					  const ControlRootStartupRefV3 *selected,
+					  const ClusterWalHistoryImage *retained, ClusterWalStartupImage *out)
 {
 	ClusterControlRootResult result;
 	ClusterWalThreadClaimRefV2 claim_ref;
@@ -1160,14 +1258,16 @@ startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 n
 
 	if (root->header.format_version != CONTROL_ROOT_HEADER_VERSION_V3)
 		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
-	if (!root->present[node] || root->startup[node].generation == 0)
+	if (!root->present[node] || selected->generation == 0)
 		return CLUSTER_CONTROL_ROOT_ABSENT;
 	result = common_v2_validate(&root->header.v2);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-	result = startup_ref_validate(root, node);
-	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		return result;
+	if (retained == NULL) {
+		result = startup_ref_validate(root, node);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
 	if (memcmp(bytes, "PGWG", 4) != 0)
 		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
 	if (read_u16_le(bytes + 4) != 1)
@@ -1180,7 +1280,7 @@ startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 n
 		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
 	if (!control_root_sha256(bytes, CLUSTER_WAL_STARTUP_BYTES, hash))
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
-	if (memcmp(hash, root->startup[node].sha256, 32) != 0)
+	if (memcmp(hash, selected->sha256, 32) != 0)
 		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
 
 	out->phase = read_u32_le(bytes + 8);
@@ -1213,7 +1313,7 @@ startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 n
 		|| out->config_generation > root->header.v2.config_generation)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (out->database_incarnation != root->header.v2.database_incarnation
-		|| out->generation != root->startup[node].generation)
+		|| out->generation != selected->generation)
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 
 	result
@@ -1223,10 +1323,12 @@ startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 n
 		return result == CLUSTER_CONTROL_ROOT_ABSENT ? CLUSTER_CONTROL_ROOT_RANGE_INVALID : result;
 	input->publisher_incarnation = read_u64_le(bytes + 256 + 144);
 	input->publisher_node = read_u32_le(bytes + 256 + 152);
-	if (memcmp(&input->snapshot, &root->records[node], sizeof(input->snapshot)) != 0
-		|| memcmp(&input->refs, &root->refs[node], sizeof(input->refs)) != 0
-		|| input->publisher_incarnation != root->publisher_incarnation[node]
-		|| input->publisher_node != root->publisher_node[node])
+	if (retained != NULL
+			? !startup_predecessor_in_union(input, root, node, retained)
+			: (memcmp(&input->snapshot, &root->records[node], sizeof(input->snapshot)) != 0
+			   || memcmp(&input->refs, &root->refs[node], sizeof(input->refs)) != 0
+			   || input->publisher_incarnation != root->publisher_incarnation[node]
+			   || input->publisher_node != root->publisher_node[node]))
 		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
 	if (input->snapshot.lifecycle
 		!= (out->input_kind == CLUSTER_WAL_STARTUP_RECOVERED
@@ -1331,9 +1433,257 @@ cluster_control_root_v3_startup_decode(const uint8 *bytes, size_t len, const Con
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (len != CLUSTER_WAL_STARTUP_BYTES)
 		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
-	result = startup_decode_fields(bytes, root, origin_node, out);
+	result
+		= startup_decode_fields(bytes, root, origin_node, &root->startup[origin_node], NULL, out);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		memset(out, 0, sizeof(*out));
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_terminal_decode(const uint8 *bytes, size_t length, const ControlRootImage *root,
+							uint32 node, const ClusterWalHistoryImage *history,
+							const ClusterWalTerminalRef *ref, ClusterWalTerminalImage *out)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	ClusterWalDurablePrefixRef prefix_ref = { 0 };
+	ClusterWalStartupObservation *observation;
+	uint8 hash[32];
+	bool alias = history_ranges_overlap(root, sizeof(*root), out, sizeof(*out))
+				 || history_ranges_overlap(history, sizeof(*history), out, sizeof(*out))
+				 || history_ranges_overlap(ref, sizeof(*ref), out, sizeof(*out))
+				 || (length == CLUSTER_WAL_TERMINAL_BYTES
+					 && history_ranges_overlap(bytes, length, out, sizeof(*out)));
+
+	if (out == NULL)
+		return result;
+	memset(out, 0, sizeof(*out));
+	if (alias || bytes == NULL || root == NULL || history == NULL || ref == NULL
+		|| node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return result;
+	if (root->header.format_version != 3)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (!root->present[node])
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (length != CLUSTER_WAL_TERMINAL_BYTES)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	if (memcmp(bytes, "PGWG", 4) != 0)
+		return CLUSTER_CONTROL_ROOT_BAD_MAGIC;
+	if (read_u16_le(bytes + 4) != 2)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (read_u16_le(bytes + 6) != CLUSTER_WAL_TERMINAL_BYTES)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	if (read_u32_le(bytes + 8) != CLUSTER_WAL_INITIALIZATION_TERMINATED)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (read_u32_le(bytes + 2300) != control_root_crc(bytes, 2300))
+		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	if (!bytes_are_zero(bytes + 108, 4) || !bytes_are_zero(bytes + 224, 32)
+		|| !bytes_are_zero(bytes + 2120, 180))
+		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+	if (ref->incarnation == 0 || ref->generation == 0 || bytes_are_zero(ref->sha256, 32))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!control_root_sha256(bytes, length, hash))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (memcmp(hash, ref->sha256, 32) != 0)
+		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+	result = history_terminal_set_validate(root, node, history);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+
+	out->closure_version = read_u32_le(bytes + 12);
+	memcpy(out->operation_uuid, bytes + 16, 16);
+	out->generation = read_u64_le(bytes + 32);
+	out->database_incarnation = read_u64_le(bytes + 40);
+	out->sealing_sequence = read_u64_le(bytes + 48);
+	memcpy(out->sealing_sha256, bytes + 56, 32);
+	out->formation_epoch = read_u64_le(bytes + 88);
+	out->recoverer_incarnation = read_u64_le(bytes + 96);
+	out->recoverer_node = read_u32_le(bytes + 104);
+	out->ir_request_id = read_u64_le(bytes + 112);
+	out->original_ref.generation = read_u64_le(bytes + 120);
+	memcpy(out->original_ref.sha256, bytes + 128, 32);
+	memcpy(out->isolation_sha256, bytes + 160, 32);
+	memcpy(out->closure_sha256, bytes + 192, 32);
+	memcpy(out->original, bytes + 256, CLUSTER_WAL_STARTUP_BYTES);
+	result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (out->closure_version != 1 || out->generation != ref->generation
+		|| out->database_incarnation != root->header.v2.database_incarnation
+		|| out->sealing_sequence == 0 || out->sealing_sequence > root->header.file_txn_seq
+		|| bytes_are_zero(out->sealing_sha256, 32) || out->formation_epoch == 0
+		|| out->recoverer_incarnation == 0
+		|| out->recoverer_node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT || out->ir_request_id == 0
+		|| bytes_are_zero(out->isolation_sha256, 32) || bytes_are_zero(out->closure_sha256, 32))
+		goto refused;
+	/* Historical validation retains the original hash and every predecessor
+	 * field except its former enclosing history reference. Never follow that
+	 * obsolete pointer and never interpret this as an active startup intent. */
+	result = startup_decode_fields(out->original, root, node, &out->original_ref, history,
+								   &out->initialization);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto refused;
+	result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (out->initialization.phase != CLUSTER_WAL_STARTUP_INITIALIZING
+		|| out->initialization.claim.identity.origin_owner_incarnation != ref->incarnation
+		|| (out->recoverer_node == out->initialization.claim.identity.origin_node_id
+			&& out->recoverer_incarnation == ref->incarnation)
+		|| memcmp(out->operation_uuid, out->initialization.operation_uuid, 16) != 0
+		|| out->initialization.predecessor_file_sequence >= out->sealing_sequence
+		|| read_u32_le(bytes + 2068) != out->initialization.timeline)
+		goto refused;
+	prefix_ref.claim.identity = out->initialization.claim.identity;
+	prefix_ref.claim.database_incarnation = out->database_incarnation;
+	prefix_ref.claim.max_config_generation = out->initialization.config_generation;
+	prefix_ref.timeline = out->initialization.timeline;
+	if (!control_root_sha256(out->original + 1280, CLUSTER_WAL_CLAIM_V2_BYTES,
+							 prefix_ref.claim.claim_sha256)) {
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto refused;
+	}
+	observation = &out->observation;
+	result = cluster_wal_durable_prefix_decode(bytes + 1792, CLUSTER_WAL_DURABLE_PREFIX_BYTES,
+											   &prefix_ref, &observation->tail.durable_prefix);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto refused;
+	observation->tail.complete_end = read_u64_le(bytes + 2048);
+	observation->tail.last_record_start = read_u64_le(bytes + 2056);
+	observation->tail.last_record_crc = read_u32_le(bytes + 2064);
+	observation->tail.records = read_u64_le(bytes + 2072);
+	observation->fpw_records = read_u64_le(bytes + 2080);
+	observation->parameter_records = read_u64_le(bytes + 2088);
+	result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	for (size_t offset = 2096; offset <= 2112; offset += 4)
+		if (read_u32_le(bytes + offset) > PG_INT32_MAX)
+			goto refused;
+	observation->max_connections = read_u32_le(bytes + 2096);
+	observation->max_worker_processes = read_u32_le(bytes + 2100);
+	observation->max_wal_senders = read_u32_le(bytes + 2104);
+	observation->max_prepared_xacts = read_u32_le(bytes + 2108);
+	observation->max_locks_per_xact = read_u32_le(bytes + 2112);
+	if (read_u32_le(bytes + 2116) > 1)
+		goto refused;
+	observation->fpw_disabled = read_u32_le(bytes + 2116) != 0;
+	if (observation->fpw_records > observation->tail.records
+		|| observation->parameter_records != observation->tail.records - observation->fpw_records
+		|| (observation->fpw_records == 0 && observation->fpw_disabled)
+		|| (observation->parameter_records == 0
+				? !bytes_are_zero(bytes + 2096, 20)
+				: observation->max_connections == 0 || observation->max_locks_per_xact == 0))
+		goto refused;
+	if (observation->tail.records == 0) {
+		if (observation->tail.complete_end != 0 || observation->tail.last_record_start != 0
+			|| observation->tail.last_record_crc != 0
+			|| observation->tail.durable_prefix.exclusive_end != 0)
+			goto refused;
+	} else {
+		const ClusterWalDurablePrefix *p = &observation->tail.durable_prefix;
+		if (observation->tail.last_record_start
+				< out->initialization.first_segment_lsn + SizeOfXLogLongPHD
+			|| observation->tail.complete_end <= observation->tail.last_record_start
+			|| observation->tail.complete_end < p->exclusive_end
+			|| (p->exclusive_end != 0
+				&& (p->record_start < out->initialization.first_segment_lsn + SizeOfXLogLongPHD
+					|| p->record_start > observation->tail.last_record_start))
+			|| (observation->tail.complete_end == p->exclusive_end
+				&& (observation->tail.last_record_start != p->record_start
+					|| observation->tail.last_record_crc != p->record_crc)))
+			goto refused;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+refused:
+	memset(out, 0, sizeof(*out));
+	return result;
+}
+
+ClusterControlRootResult
+cluster_wal_terminal_encode(const ControlRootImage *root, uint32 node,
+							const ClusterWalHistoryImage *history,
+							const ClusterWalTerminalImage *terminal,
+							uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES], ClusterWalTerminalRef *ref)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	ClusterWalTerminalImage check = { 0 };
+	ClusterWalDurablePrefixRef prefix_ref = { 0 };
+	const ClusterWalStartupObservation *o;
+	bool alias
+		= history_ranges_overlap(root, sizeof(*root), bytes, CLUSTER_WAL_TERMINAL_BYTES)
+		  || history_ranges_overlap(history, sizeof(*history), bytes, CLUSTER_WAL_TERMINAL_BYTES)
+		  || history_ranges_overlap(terminal, sizeof(*terminal), bytes, CLUSTER_WAL_TERMINAL_BYTES)
+		  || history_ranges_overlap(root, sizeof(*root), ref, sizeof(*ref))
+		  || history_ranges_overlap(history, sizeof(*history), ref, sizeof(*ref))
+		  || history_ranges_overlap(terminal, sizeof(*terminal), ref, sizeof(*ref))
+		  || history_ranges_overlap(bytes, CLUSTER_WAL_TERMINAL_BYTES, ref, sizeof(*ref));
+	if (bytes != NULL)
+		memset(bytes, 0, CLUSTER_WAL_TERMINAL_BYTES);
+	if (ref != NULL)
+		memset(ref, 0, sizeof(*ref));
+	if (alias || root == NULL || history == NULL || terminal == NULL || bytes == NULL || ref == NULL
+		|| node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return result;
+	result = startup_decode_fields(terminal->original, root, node, &terminal->original_ref, history,
+								   &check.initialization);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	o = &terminal->observation;
+	if (o->checkpoint_records != 0 || o->checkpoint_start != 0 || o->checkpoint_end != 0
+		|| o->checkpoint_crc != 0 || o->checkpoint_info != 0 || o->unsupported_records != 0
+		|| !bytes_are_zero((const uint8 *)&o->checkpoint, sizeof(o->checkpoint)))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	prefix_ref.claim.identity = check.initialization.claim.identity;
+	prefix_ref.claim.database_incarnation = check.initialization.database_incarnation;
+	prefix_ref.claim.max_config_generation = check.initialization.config_generation;
+	prefix_ref.timeline = check.initialization.timeline;
+	if (!control_root_sha256(terminal->original + 1280, CLUSTER_WAL_CLAIM_V2_BYTES,
+							 prefix_ref.claim.claim_sha256))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = cluster_wal_durable_prefix_encode(&prefix_ref, &o->tail.durable_prefix, bytes + 1792);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto refused;
+	memcpy(bytes, "PGWG", 4);
+	write_u16_le(bytes + 4, 2);
+	write_u16_le(bytes + 6, CLUSTER_WAL_TERMINAL_BYTES);
+	write_u32_le(bytes + 8, CLUSTER_WAL_INITIALIZATION_TERMINATED);
+	write_u32_le(bytes + 12, terminal->closure_version);
+	memcpy(bytes + 16, terminal->operation_uuid, 16);
+	write_u64_le(bytes + 32, terminal->generation);
+	write_u64_le(bytes + 40, terminal->database_incarnation);
+	write_u64_le(bytes + 48, terminal->sealing_sequence);
+	memcpy(bytes + 56, terminal->sealing_sha256, 32);
+	write_u64_le(bytes + 88, terminal->formation_epoch);
+	write_u64_le(bytes + 96, terminal->recoverer_incarnation);
+	write_u32_le(bytes + 104, terminal->recoverer_node);
+	write_u64_le(bytes + 112, terminal->ir_request_id);
+	write_u64_le(bytes + 120, terminal->original_ref.generation);
+	memcpy(bytes + 128, terminal->original_ref.sha256, 32);
+	memcpy(bytes + 160, terminal->isolation_sha256, 32);
+	memcpy(bytes + 192, terminal->closure_sha256, 32);
+	memcpy(bytes + 256, terminal->original, CLUSTER_WAL_STARTUP_BYTES);
+	write_u64_le(bytes + 2048, o->tail.complete_end);
+	write_u64_le(bytes + 2056, o->tail.last_record_start);
+	write_u32_le(bytes + 2064, o->tail.last_record_crc);
+	write_u32_le(bytes + 2068, check.initialization.timeline);
+	write_u64_le(bytes + 2072, o->tail.records);
+	write_u64_le(bytes + 2080, o->fpw_records);
+	write_u64_le(bytes + 2088, o->parameter_records);
+	write_u32_le(bytes + 2096, o->max_connections);
+	write_u32_le(bytes + 2100, o->max_worker_processes);
+	write_u32_le(bytes + 2104, o->max_wal_senders);
+	write_u32_le(bytes + 2108, o->max_prepared_xacts);
+	write_u32_le(bytes + 2112, o->max_locks_per_xact);
+	write_u32_le(bytes + 2116, o->fpw_disabled ? 1 : 0);
+	write_u32_le(bytes + 2300, control_root_crc(bytes, 2300));
+	ref->incarnation = check.initialization.claim.identity.origin_owner_incarnation;
+	ref->generation = terminal->generation;
+	if (!control_root_sha256(bytes, CLUSTER_WAL_TERMINAL_BYTES, ref->sha256)) {
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto refused;
+	}
+	result = cluster_wal_terminal_decode(bytes, CLUSTER_WAL_TERMINAL_BYTES, root, node, history,
+										 ref, &check);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+refused:
+	memset(bytes, 0, CLUSTER_WAL_TERMINAL_BYTES);
+	memset(ref, 0, sizeof(*ref));
 	return result;
 }
 
@@ -5010,6 +5360,14 @@ startup_install_history_matches(StartupInstallWork *work, const ControlRootImage
 	size_t length;
 	ClusterControlRootResult result
 		= cluster_wal_history_read_locked(selected, node, &work->observed_history);
+	/* A completed INSTALL retry must still consume the selected terminal
+	 * files. Matching the manifest digest alone does not retain those inputs. */
+	for (uint32 i = 0;
+		 result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && i < work->observed_history.terminal_count;
+		 i++) {
+		ClusterWalTerminalImage terminal;
+		result = cluster_wal_terminal_read_locked(selected, node, i, &terminal);
+	}
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_control_root_v3_history_encode(selected, node, &work->history, encoded,
 														&length);

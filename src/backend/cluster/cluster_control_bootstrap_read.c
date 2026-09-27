@@ -32,6 +32,9 @@ typedef struct BootstrapReadWork {
 	uint8 anchor[CLUSTER_RECOVERY_ANCHOR_SIZE + 1];
 	uint8 history[CLUSTER_WAL_HISTORY_MAX_BYTES + 1];
 	uint8 startup[CLUSTER_WAL_STARTUP_BYTES + 1];
+	uint8 terminal[CLUSTER_WAL_TERMINAL_BYTES + 1];
+	ClusterWalTerminalRef terminal_ref;
+	ClusterWalTerminalImage terminated;
 	ClusterWalHistoryImage retained;
 	ClusterWalStartupImage pending;
 	struct stat shared_dir;
@@ -645,6 +648,7 @@ typedef enum BootstrapReadKind {
 	BOOTSTRAP_SOURCE,
 	BOOTSTRAP_HISTORY,
 	BOOTSTRAP_STARTUP,
+	BOOTSTRAP_TERMINAL,
 	BOOTSTRAP_FINAL_ROOT
 } BootstrapReadKind;
 
@@ -693,6 +697,15 @@ read_again(BootstrapReadWork *work, const char *shared_root, const char *wal_roo
 		snprintf(name, sizeof(name), "startup_" UINT64_FORMAT "-%s.bin", ref->generation, hex);
 		result = read_object(global, parts, lengthof(parts), name, CLUSTER_WAL_STARTUP_BYTES,
 							 CLUSTER_WAL_STARTUP_BYTES, work->startup, &length);
+	} else if (kind == BOOTSTRAP_TERMINAL) {
+		const ClusterWalTerminalRef *ref = &work->terminal_ref;
+		char thread[32], hex[65], name[128];
+		const char *parts[] = { "wal_startup", thread };
+		snprintf(thread, sizeof(thread), "thread_%u", source->identity.origin_thread_id);
+		read_hex(ref->sha256, hex);
+		snprintf(name, sizeof(name), "startup_" UINT64_FORMAT "-%s.bin", ref->generation, hex);
+		result = read_object(global, parts, lengthof(parts), name, CLUSTER_WAL_TERMINAL_BYTES,
+							 CLUSTER_WAL_TERMINAL_BYTES, work->terminal, &length);
 	} else
 		result = read_bytes(global, "pgrac_control_root", CLUSTER_CONTROL_ROOT_FILE_BYTES,
 							CLUSTER_CONTROL_ROOT_FILE_BYTES, work->root_after, &length);
@@ -759,16 +772,17 @@ read_source_capacity(BootstrapReadWork *work, const char *shared_root, const cha
 }
 
 static ClusterControlRootResult
-read_startup_ref(BootstrapReadWork *work, ClusterWalDurablePrefixRef *ref)
+read_startup_ref(const uint8 startup[CLUSTER_WAL_STARTUP_BYTES],
+				 const ClusterWalStartupImage *pending, ClusterWalDurablePrefixRef *ref)
 {
 	pg_cryptohash_ctx *ctx;
 	bool hashed;
 
 	memset(ref, 0, sizeof(*ref));
-	ref->claim.identity = work->pending.claim.identity;
-	ref->claim.database_incarnation = work->pending.database_incarnation;
-	ref->claim.max_config_generation = work->pending.config_generation;
-	ref->timeline = work->pending.timeline;
+	ref->claim.identity = pending->claim.identity;
+	ref->claim.database_incarnation = pending->database_incarnation;
+	ref->claim.max_config_generation = pending->config_generation;
+	ref->timeline = pending->timeline;
 	/* These exact embedded claim bytes were authenticated with the selected
 	 * PGWG. Hash them before opening raw WAL descriptors; never derive the
 	 * expected claim from whatever happens to be in the generation directory. */
@@ -776,11 +790,24 @@ read_startup_ref(BootstrapReadWork *work, ClusterWalDurablePrefixRef *ref)
 	if (ctx == NULL)
 		return CLUSTER_CONTROL_ROOT_IO_ERROR;
 	hashed = pg_cryptohash_init(ctx) >= 0
-			 && pg_cryptohash_update(ctx, work->startup + 1280, CLUSTER_WAL_CLAIM_V2_BYTES) >= 0
+			 && pg_cryptohash_update(ctx, startup + 1280, CLUSTER_WAL_CLAIM_V2_BYTES) >= 0
 			 && pg_cryptohash_final(ctx, ref->claim.claim_sha256, sizeof(ref->claim.claim_sha256))
 					>= 0;
 	pg_cryptohash_free(ctx);
 	return hashed ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+static void
+read_startup_maxima(const ClusterWalStartupObservation *input,
+					ClusterControlRecoveryCapacity *required)
+{
+#define STARTUP_MAX(field) required->field = Max(required->field, input->field)
+	STARTUP_MAX(max_connections);
+	STARTUP_MAX(max_worker_processes);
+	STARTUP_MAX(max_wal_senders);
+	STARTUP_MAX(max_prepared_xacts);
+	STARTUP_MAX(max_locks_per_xact);
+#undef STARTUP_MAX
 }
 
 static ClusterControlRootResult
@@ -794,13 +821,42 @@ read_initializing_capacity(BootstrapReadWork *work, const char *wal_root,
 										 work->pending.first_segment_lsn, &input);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		return result;
-#define STARTUP_MAX(field) required->field = Max(required->field, input.field)
-	STARTUP_MAX(max_connections);
-	STARTUP_MAX(max_worker_processes);
-	STARTUP_MAX(max_wal_senders);
-	STARTUP_MAX(max_prepared_xacts);
-	STARTUP_MAX(max_locks_per_xact);
-#undef STARTUP_MAX
+	read_startup_maxima(&input, required);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* A retained terminal never supplies an active writer route. Still read its
+ * actual claim/promise/WAL and capacity obligations; the recorded native
+ * closure digest is not permission to ignore changed or missing input. */
+static ClusterControlRootResult
+read_terminal_capacity(BootstrapReadWork *work, const char *shared_root, const char *wal_root,
+					   uint32 node, uint32 index, ClusterControlRecoveryCapacity *required)
+{
+	ClusterWalDurablePrefixRef ref;
+	ClusterWalStartupObservation actual;
+	ClusterWalTerminalImage *terminal = &work->terminated;
+	ClusterControlRootResult result;
+	work->terminal_ref = work->retained.terminals[index];
+	result = read_again(work, shared_root, wal_root, BOOTSTRAP_TERMINAL,
+						&work->before.records[node], NULL);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_terminal_decode(work->terminal, CLUSTER_WAL_TERMINAL_BYTES, &work->before,
+										 node, &work->retained, &work->terminal_ref, terminal);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = read_startup_ref(terminal->original, &terminal->initialization, &ref);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_wal_startup_observe(wal_root, &ref, terminal->initialization.segment_size,
+										 terminal->initialization.first_segment_lsn, &actual);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&actual, &terminal->observation, sizeof(actual)) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	read_startup_maxima(&actual, required);
+	/* Historical input count, not a count of checkpoint-bearing writers. */
+	required->history_sources++;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -840,6 +896,11 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 					return result;
 				required->history_sources++;
 			}
+			for (uint32 i = 0; i < work->retained.terminal_count; i++) {
+				result = read_terminal_capacity(work, shared_root, wal_root, node, i, required);
+				if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+					return result;
+			}
 		}
 		if (root->header.format_version == 3 && root->startup[node].generation != 0) {
 			ClusterWalDurablePrefixRef pending;
@@ -852,7 +913,7 @@ read_capacities(BootstrapReadWork *work, const char *shared_root, const char *wa
 			if (result != 0)
 				return result;
 			if (work->pending.phase != CLUSTER_WAL_STARTUP_RESERVED) {
-				result = read_startup_ref(work, &pending);
+				result = read_startup_ref(work->startup, &work->pending, &pending);
 				if (result != 0)
 					return result;
 			}

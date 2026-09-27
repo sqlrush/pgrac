@@ -4,6 +4,7 @@
 #ifndef CLUSTER_WAL_TAIL_H
 #define CLUSTER_WAL_TAIL_H
 
+#include "catalog/pg_control.h"
 #include "cluster/cluster_wal_durable_prefix.h"
 
 typedef struct ClusterWalTailObservation {
@@ -19,6 +20,17 @@ typedef struct ClusterWalTailObservation {
  * also retain the predecessor/history/configuration requirements. */
 typedef struct ClusterWalStartupObservation {
 	ClusterWalTailObservation tail;
+	/* The first actual checkpoint, never copied from a predecessor root. */
+	XLogRecPtr checkpoint_start;
+	XLogRecPtr checkpoint_end;
+	pg_crc32c checkpoint_crc;
+	uint8 checkpoint_info;
+	CheckPoint checkpoint;
+	uint64 checkpoint_records;
+	uint64 fpw_records;
+	uint64 parameter_records;
+	uint64 unsupported_records;
+	bool fpw_disabled;
 	int max_connections;
 	int max_worker_processes;
 	int max_wal_senders;
