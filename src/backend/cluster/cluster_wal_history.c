@@ -1063,3 +1063,54 @@ cluster_wal_startup_read_locked(const ControlRootImage *root, uint32 node,
 		result = cluster_control_root_v3_startup_decode(bytes, sizeof(bytes), root, node, out);
 	return result;
 }
+
+ClusterControlRootResult
+cluster_wal_origin_inputs_read_locked(const ControlRootImage *root, uint32 node,
+									  ClusterWalOriginInputs *out)
+{
+	ClusterWalOriginInputs *inputs;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	uintptr_t a = (uintptr_t)root, b = (uintptr_t)out;
+	bool alias
+		= root != NULL && out != NULL && (a <= b ? b - a < sizeof(*root) : a - b < sizeof(*out));
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (alias || root == NULL || node >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_cf_held_is_clusterwide(ShareLock)
+		&& !cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (root->header.format_version != 3)
+		return CLUSTER_CONTROL_ROOT_BAD_VERSION;
+	if (!root->present[node])
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	if (root->records[node].identity.origin_node_id != node
+		|| root->records[node].identity.origin_thread_id != node + 1)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if ((root->refs[node].history_generation == 0)
+			!= !history_nonzero(root->refs[node].history_sha256, 32)
+		|| (root->startup[node].generation == 0)
+			   != !history_nonzero(root->startup[node].sha256, 32))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+
+	/* Nothing partially collected escapes, including when a decoder throws.
+	 * A missing selected object is an error, never an empty retained set. */
+	inputs = palloc0(sizeof(*inputs));
+	inputs->current.snapshot = root->records[node];
+	inputs->current.refs = root->refs[node];
+	inputs->current.publisher_incarnation = root->publisher_incarnation[node];
+	inputs->current.publisher_node = root->publisher_node[node];
+	inputs->current.record_crc32c = root->record_crc32c[node];
+	if (root->refs[node].history_generation != 0)
+		result = cluster_wal_history_read_locked(root, node, &inputs->history);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && root->startup[node].generation != 0) {
+		result = cluster_wal_startup_read_locked(root, node, &inputs->pending);
+		inputs->has_pending = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = *inputs;
+	pfree(inputs);
+	return result;
+}

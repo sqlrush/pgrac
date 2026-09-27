@@ -14129,6 +14129,127 @@ bootstrap_pending_fixture(BootstrapFixture *f, uint32 phase, char paths[3][MAXPG
 	test_cf_mode = NoLock;
 }
 
+/* PGRAC: actual selected immutable files, not synthetic recovery authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_origin_input_union_preserves_current_history_and_pending)
+{
+	for (uint32 phase = 1; phase <= 3; ++phase) {
+		BootstrapFixture f;
+		ControlRootImage root, before;
+		ClusterWalOriginInputs out;
+		ClusterWalHistoryImage retained;
+		ClusterWalStartupImage pending;
+		char paths[3][MAXPGPATH];
+		bootstrap_pending_fixture(&f, phase, paths);
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage,
+													TEST_SYSID, &root),
+					 0);
+		test_cf_grant = true;
+		test_cf_mode = ShareLock;
+		before = root;
+		UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 127, &retained), 0);
+		UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 127, &pending), 0);
+		UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&root, 127, &out), 0);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(out.current.snapshot.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+		UT_ASSERT(memcmp(&out.current.snapshot, &root.records[127], sizeof(out.current.snapshot))
+				  == 0);
+		UT_ASSERT_EQ(out.current.publisher_node, root.publisher_node[127]);
+		UT_ASSERT(memcmp(&out.history, &retained, sizeof(retained)) == 0);
+		UT_ASSERT_EQ(out.history.count, 2);
+		UT_ASSERT(out.has_pending);
+		UT_ASSERT(memcmp(&out.pending, &pending, sizeof(pending)) == 0);
+		UT_ASSERT_EQ(out.pending.phase, phase);
+		UT_ASSERT(out.pending.claim.identity.origin_owner_incarnation
+				  != out.current.snapshot.identity.origin_owner_incarnation);
+		if (phase != CLUSTER_WAL_STARTUP_DURABLE)
+			UT_ASSERT(v2_zero(&out.pending.successor, sizeof(out.pending.successor)));
+		UT_ASSERT(memcmp(&root, &before, sizeof(root)) == 0);
+		/* Current-only node0 does not inherit another origin's obligation. */
+		UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&root, 0, &out), 0);
+		UT_ASSERT(!out.has_pending && out.history.count == 0);
+		UT_ASSERT(v2_zero(&out.pending, sizeof(out.pending)));
+	}
+}
+
+UT_TEST(test_origin_input_union_refuses_partial_or_unowned_metadata)
+{
+	for (int fault = 0; fault < 8; ++fault) {
+		BootstrapFixture f;
+		ControlRootImage root;
+		ClusterWalOriginInputs out;
+		char paths[3][MAXPGPATH], history_path[MAXPGPATH], digest[65];
+		bootstrap_pending_fixture(&f, CLUSTER_WAL_STARTUP_INITIALIZING, paths);
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage,
+													TEST_SYSID, &root),
+					 0);
+		test_cf_grant = true;
+		test_cf_mode = ShareLock;
+		switch (fault) {
+		case 0:
+			test_cf_grant = false;
+			break;
+		case 1:
+			root.header.format_version = 2;
+			break;
+		case 2:
+			root.present[127] = false;
+			break;
+		case 3:
+			UT_ASSERT_EQ(unlink(paths[0]), 0);
+			break;
+		case 4:
+			root.startup[127].sha256[0] ^= 1;
+			break;
+		case 5:
+			root.startup[127].generation = 0;
+			break;
+		case 6:
+			root.refs[127].history_generation = 0;
+			break;
+		case 7:
+			bootstrap_hex(root.refs[127].history_sha256, digest);
+			snprintf(history_path, sizeof(history_path),
+					 "%s/global/wal_history/thread_128/history_" UINT64_FORMAT "-%s.bin", test_root,
+					 root.refs[127].history_generation, digest);
+			UT_ASSERT_EQ(unlink(history_path), 0);
+			break;
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_wal_origin_inputs_read_locked(&root, 127, &out) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+	}
+}
+
+UT_TEST(test_origin_input_union_alias_and_bounds_clear_all_output)
+{
+	BootstrapFixture f;
+	union {
+		ControlRootImage root;
+		ClusterWalOriginInputs out;
+	} storage;
+	ClusterWalOriginInputs out;
+	char paths[3][MAXPGPATH];
+	bootstrap_pending_fixture(&f, CLUSTER_WAL_STARTUP_DURABLE, paths);
+	UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage, TEST_SYSID,
+												&storage.root),
+				 0);
+	test_cf_grant = true;
+	test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(NULL, 0, &out),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&storage.root, 128, &out),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&storage.root, 127, NULL),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&storage.root, 127, &storage.out),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&storage.out, sizeof(storage.out)));
+}
+
 static void
 bootstrap_initializing_wal_fixture(BootstrapFixture *f, bool parameters, char paths[3][MAXPGPATH])
 {
@@ -14843,7 +14964,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(278);
+	UT_PLAN(281);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
@@ -14902,6 +15023,9 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_runtime_pending_cannot_be_clean_or_retention_authority);
 	UT_RUN(test_v3_service_cannot_consume_cached_v2_observation);
 	UT_RUN(test_bootstrap_v3_pending_objects_and_reread_remain_exact);
+	UT_RUN(test_origin_input_union_preserves_current_history_and_pending);
+	UT_RUN(test_origin_input_union_refuses_partial_or_unowned_metadata);
+	UT_RUN(test_origin_input_union_alias_and_bounds_clear_all_output);
 	UT_RUN(test_bootstrap_v3_reads_exact_current_and_flat_history);
 	UT_RUN(test_bootstrap_v3_pending_is_never_missing_from_capacity);
 	UT_RUN(test_bootstrap_pending_route_never_masks_bad_inputs_or_namespace);

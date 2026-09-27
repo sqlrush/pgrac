@@ -166,6 +166,25 @@ typedef struct ClusterWalStartupImage {
 	TimeLineID prefix_timeline;
 } ClusterWalStartupImage;
 
+/* PGRAC: one origin's complete selected metadata, not replay/retention
+ * authority. Pending is not a synthetic current record or checkpoint.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterWalOriginInputs {
+	ClusterWalHistoryRecord current;
+	ClusterWalHistoryImage history;
+	bool has_pending;
+	ClusterWalStartupImage pending;
+} ClusterWalOriginInputs;
+
+/* Caller supplies an authenticated immutable v3 root and already holds
+ * clusterwide CF-S/X. Consume every selected history/PGWG object, including
+ * RESERVED. This only reads metadata; physical input use still needs exact
+ * WALR/IR/fence owners, claim/anchor/WAL validation and root revalidation.
+ * Every refusal clears the entire output. Inputs and output cannot overlap. */
+extern ClusterControlRootResult cluster_wal_origin_inputs_read_locked(const ControlRootImage *root,
+																	  uint32 node,
+																	  ClusterWalOriginInputs *out);
+
 /* Native StartupProcess advances one exact clean-cohort observation. WAIT
  * means no native mutation permission; repeat only after releasing all holds.
  * OK returns this target's INITIALIZING operation, not serving permission.

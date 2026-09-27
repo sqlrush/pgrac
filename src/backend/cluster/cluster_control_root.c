@@ -4952,7 +4952,24 @@ startup_install_history(StartupInstallWork *work, unsigned node)
 	uint32 position = 0;
 	uint64 incarnation = predecessor.snapshot.identity.origin_owner_incarnation;
 
-	if (work->input_root.refs[node].history_generation != 0) {
+	if (!work->already_installed) {
+		ClusterWalOriginInputs *inputs = palloc(sizeof(*inputs));
+		result = cluster_wal_origin_inputs_read_locked(&work->input_root, node, inputs);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			if (!inputs->has_pending
+				|| memcmp(&inputs->pending, &check->op, sizeof(check->op)) != 0)
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			else {
+				work->history = inputs->history;
+				predecessor = inputs->current;
+			}
+		}
+		pfree(inputs);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	} else if (work->input_root.refs[node].history_generation != 0) {
+		/* A completed retry proves the installed current/history below, not a
+		 * no-longer-selected PGWG file that may be eligible for later GC. */
 		result = cluster_wal_history_read_locked(&work->input_root, node, &work->history);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			return result;
