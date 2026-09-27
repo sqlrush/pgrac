@@ -2735,11 +2735,6 @@ test_cluster_cssd: test_cluster_cssd.c unit_test.h \
 $(CLUSTER_QVOTEC_PGSA_TEST_O): $(top_srcdir)/src/backend/cluster/cluster_qvotec.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DCLUSTER_QVOTEC_PGSA_UNIT_TEST -c $< -o $@
 
-test_cluster_qvotec_startup.inc: $(top_srcdir)/src/backend/cluster/cluster_qvotec.c Makefile
-	awk '/if \(qvotec_n_disks > 0 && cluster_node_id >= 0/ { emit=1; count++ } \
-	     emit { print } emit && /^\t}$$/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
-	mv $@.tmp $@
-
 cluster_qvotec_io_test.o: $(top_srcdir)/src/backend/cluster/cluster_voting_disk_io.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -Dfdatasync=cluster_qvotec_test_fdatasync \
 		-Dpwrite=cluster_qvotec_test_pwrite -c $< -o $@
@@ -2749,7 +2744,7 @@ cluster_qvotec_io_test.o: $(top_srcdir)/src/backend/cluster/cluster_voting_disk_
 test_cluster_qvotec_activation_product.o: $(top_srcdir)/src/backend/cluster/cluster_semantic_activation.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_qvotec: test_cluster_qvotec.c test_cluster_qvotec_startup.inc unit_test.h \
+test_cluster_qvotec: test_cluster_qvotec.c unit_test.h \
 		cluster_unit_no_normal_stop.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_QVOTEC_PGSA_TEST_O) \
 		$(CLUSTER_NODE_REMOVE_POLICY_O) \

@@ -66,8 +66,7 @@
  *	      CollisionDetectionState)
  *	    - 512-byte ClusterVotingSlot disk-resident layout (with
  *	      generation counter + CRC32C for torn-write detection)
- *	    - 448-byte ClusterQvotecShmem (128-byte lease state plus the
- *	      spec-5.15A §2.1A.4 320-byte local SPSC mailbox)
+ *	    - 448-byte lease/mailbox prefix plus a bounded prior-exit observation
  *	    - 7 lifecycle / dump key accessors (per F11)
  *	    - cluster_qvotec_in_quorum() backend hot-path helper
  *	    - cluster_freeze_writes_set / _thaw_writes_set / _currently_frozen
@@ -146,7 +145,8 @@
 /* spec-5.15A §2.1A.4 frozen local QVOTEC mailbox ABI. */
 #define CLUSTER_QVOTEC_SHMEM_PREFIX_BYTES 128
 #define CLUSTER_QVOTEC_MAILBOX_BYTES 320
-#define CLUSTER_QVOTEC_SHMEM_BYTES 448
+#define CLUSTER_QVOTEC_SHMEM_PRIOR_OFFSET 448
+#define CLUSTER_QVOTEC_SHMEM_BYTES (448 + 8 + 16 + 512 * CLUSTER_MAX_VOTING_DISKS)
 #define CLUSTER_QVOTEC_AUTHORITY_VALUE_BYTES 128
 #define CLUSTER_QVOTEC_BALLOT_BYTES 32
 #define CLUSTER_QVOTEC_CONFIGURED_DISK_MASK UINT8_C(0x7f)
@@ -361,6 +361,19 @@ typedef struct ClusterVotingSlot {
 	uint32 crc32c;
 } ClusterVotingSlot;
 
+/* PGRAC: actual pre-heartbeat observations, not restart permission. This
+ * volatile copy is bound to its observing boot; callers still need exact
+ * root/close, provider, formation and reservation qualification.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterQvotecPriorExitObservation {
+	uint64 observing_incarnation;
+	uint32 node_id;
+	uint32 n_disks;
+	ClusterVotingSlot slots[CLUSTER_MAX_VOTING_DISKS];
+} ClusterQvotecPriorExitObservation;
+StaticAssertDecl(sizeof(ClusterQvotecPriorExitObservation) == 16 + 512 * CLUSTER_MAX_VOTING_DISKS,
+				 "prior-exit observation has no uninitialized padding");
+
 #ifdef USE_PGRAC_CLUSTER
 StaticAssertDecl(sizeof(ClusterVotingSlot) == 512, "ClusterVotingSlot must be exactly 512 bytes");
 StaticAssertDecl(offsetof(ClusterVotingSlot, magic) == 0,
@@ -391,7 +404,7 @@ StaticAssertDecl(offsetof(ClusterVotingSlot, crc32c) == 508,
  *
  *	Mirrors cluster_epoch / cluster_diag / cluster_cssd pattern;
  *	registered from cluster_shmem.c (D9).  ClusterQvotecShmem layout
- *	is private to cluster_qvotec.c and exactly 448 bytes.
+ *	is private to cluster_qvotec.c; its original448-byte prefix stays fixed.
  * ---------- */
 extern Size cluster_qvotec_shmem_size(void);
 extern void cluster_qvotec_shmem_init(void);
@@ -501,6 +514,12 @@ extern bool cluster_qvotec_in_quorum(void);
 /* Shape A (crash-rejoin re-declare barrier): prior-incarnation self-slot
  * carried ALIVE at startup => this boot follows an UNCLEAN death. */
 extern bool cluster_qvotec_prior_unclean_death(void);
+/* All configured slots must prove the exact old incarnation was closed.
+ * Never infer this from !prior_unclean_death, a clock or new ALIVE slots.
+ * Refusal clears output; no input may alias that output. */
+extern bool cluster_qvotec_prior_exit_observe(uint32 node_id, uint64 prior_incarnation,
+											  uint64 observing_incarnation,
+											  ClusterQvotecPriorExitObservation *out);
 
 
 /* ----------

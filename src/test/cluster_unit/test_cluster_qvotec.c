@@ -9,7 +9,7 @@
  *	        offset (magic@0 / node_id@8 / incarnation@16 /
  *	        heartbeat_ts_us@24 / current_epoch@32 / flags@40 /
  *	        generation@56 / _alive_bitmap@64 / crc32c@508)
- *	    T-2 ClusterQvotecShmem byte layout — size == 448, with the exact
+ *	    T-2 ClusterQvotecShmem byte layout — unchanged448-byte prefix, with the exact
  *	        spec-5.15A §2.1A.4 320-byte mailbox appended at offset 128
  *	    T-3 lifecycle accessor surface — all 7 dump-key accessors
  *	        symbol-resolve at link time;NULL-safe (return defaults
@@ -152,6 +152,7 @@ cluster_qvotec_test_replacement_request_preserve(ClusterVotingSlot *next,
 extern long cluster_qvotec_test_poll_wait_timeout_ms(uint64 elapsed_us, int poll_interval_ms);
 extern bool cluster_qvotec_test_clean_shutdown(const int *fds, int n_disks, uint64 incarnation,
 											   uint64 generation);
+extern void cluster_qvotec_test_probe_prior_slots(const int *fds, int n_disks, uint64 incarnation);
 #ifdef __APPLE__
 extern void cluster_qvotec_test_poll_pre_injection(void) __attribute__((weak_import));
 extern void cluster_qvotec_test_publish_poll_lease(uint64 now_us) __attribute__((weak_import));
@@ -406,7 +407,7 @@ format_elog_string(const char *f pg_attribute_unused(), ...)
 
 #include "storage/shmem.h"
 /* ShmemInitStruct stub: hand back a writable buffer for shmem_init(). */
-static char shmem_storage[512] __attribute__((aligned(64)));
+static char shmem_storage[CLUSTER_QVOTEC_SHMEM_BYTES] __attribute__((aligned(64)));
 static bool shmem_init_done = false;
 void *
 ShmemInitStruct(const char *name pg_attribute_unused(), Size size, bool *foundPtr)
@@ -1412,7 +1413,8 @@ UT_TEST(test_qvotec_preserves_replacement_request_per_disk_fail_closed)
 
 UT_TEST(test_qvotec_shmem_and_mailbox_layout)
 {
-	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 448);
+	UT_ASSERT_EQ(cluster_qvotec_shmem_size(), 4056);
+	UT_ASSERT_EQ(sizeof(ClusterQvotecPriorExitObservation), 3600);
 	UT_ASSERT_EQ(sizeof(ClusterQvotecMailbox), 320);
 	UT_ASSERT_EQ(offsetof(ClusterQvotecMailbox, request_seq), 0);
 	UT_ASSERT_EQ(offsetof(ClusterQvotecMailbox, completion_seq), 8);
@@ -2088,20 +2090,12 @@ pgrd_test_image(uint8 root_kind, int32 owner_node, uint8 uuid_marker,
 	return cluster_undo_root_descriptor_encode(&descriptor, out);
 }
 
-/* Actual prior-incarnation startup consumer, extracted verbatim from Main.
- * Only PG error unwinding is replaced; voting reads and classification are real.
+/* Actual prior-incarnation startup consumer used by Main, including its real
+ * shared-memory publication. Only process setup/error unwinding is replaced.
  */
 static bool
 normal_stop_startup_probe(const PgsaDiskSet *set, bool *unclean)
 {
-	struct {
-		pg_atomic_uint32 prior_unclean_death;
-	} state;
-	typeof(state) *QvotecShmem = &state;
-	const int *qvotec_fds = set->fds;
-	int qvotec_n_disks = PGSA_TEST_DISKS;
-	uint64 qvotec_self_incarnation = 902;
-
 	*unclean = false;
 	startup_error_level = 0;
 	startup_error_code = 0;
@@ -2110,10 +2104,11 @@ normal_stop_startup_probe(const PgsaDiskSet *set, bool *unclean)
 		startup_error_armed = false;
 		return false;
 	}
-	pg_atomic_init_u32(&state.prior_unclean_death, 0);
-#include "test_cluster_qvotec_startup.inc"
+	shmem_init_done = false; /* A new postmaster's real region initializer. */
+	cluster_qvotec_shmem_init();
+	cluster_qvotec_test_probe_prior_slots(set->fds, PGSA_TEST_DISKS, 902);
 	startup_error_armed = false;
-	*unclean = pg_atomic_read_u32(&state.prior_unclean_death) != 0;
+	*unclean = cluster_qvotec_prior_unclean_death();
 	return true;
 }
 
@@ -2186,6 +2181,7 @@ UT_TEST(test_pre2_startup_unread_predecessor_cannot_reach_ready)
 	for (int d = 0; d < PGSA_TEST_DISKS; d++) {
 		PgsaDiskSet set;
 		ClusterVotingSlot before, after;
+		ClusterQvotecPriorExitObservation exit, zero = { 0 };
 		bool unclean = true;
 		int fd;
 
@@ -2199,6 +2195,8 @@ UT_TEST(test_pre2_startup_unread_predecessor_cannot_reach_ready)
 		UT_ASSERT(!normal_stop_startup_probe(&set, &unclean));
 		UT_ASSERT_EQ(startup_error_level, FATAL);
 		UT_ASSERT_EQ(startup_error_code, ERRCODE_IO_ERROR);
+		UT_ASSERT(!cluster_qvotec_prior_exit_observe(0, 901, 902, &exit));
+		UT_ASSERT_EQ(memcmp(&exit, &zero, sizeof(exit)), 0);
 		cluster_shared_config = false;
 		UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
 		UT_ASSERT(!unclean);
@@ -2214,6 +2212,7 @@ UT_TEST(test_pre2_startup_torn_predecessor_is_not_a_clean_observation)
 {
 	PgsaDiskSet set;
 	ClusterVotingSlot before, after;
+	ClusterQvotecPriorExitObservation exit, zero = { 0 };
 	bool unclean = true;
 
 	UT_ASSERT(normal_stop_disk_set(&set));
@@ -2225,6 +2224,8 @@ UT_TEST(test_pre2_startup_torn_predecessor_is_not_a_clean_observation)
 	UT_ASSERT(!normal_stop_startup_probe(&set, &unclean));
 	UT_ASSERT_EQ(startup_error_level, FATAL);
 	UT_ASSERT_EQ(startup_error_code, ERRCODE_DATA_CORRUPTED);
+	UT_ASSERT(!cluster_qvotec_prior_exit_observe(0, 901, 902, &exit));
+	UT_ASSERT_EQ(memcmp(&exit, &zero, sizeof(exit)), 0);
 	cluster_shared_config = false;
 	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
 	UT_ASSERT(!unclean);
@@ -2255,6 +2256,99 @@ UT_TEST(test_pre2_startup_complete_observations_preserve_classification)
 	}
 	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
 	UT_ASSERT(!unclean); /* Empty observation is not restart/admission authority. */
+	cluster_shared_config = false;
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_prior_exit_retains_exact_preheartbeat_slots)
+{
+	PgsaDiskSet set;
+	ClusterQvotecPriorExitObservation before, after;
+	ClusterVotingSlot old[PGSA_TEST_DISKS];
+	bool unclean;
+	UT_ASSERT(normal_stop_disk_set(&set));
+	UT_ASSERT(cluster_qvotec_test_clean_shutdown(set.fds, 3, 901, 12));
+	for (int d = 0; d < PGSA_TEST_DISKS; d++)
+		UT_ASSERT_EQ(cluster_voting_disk_read_slot(set.fds[d], d, 0, &old[d]), 0);
+	cluster_shared_config = true;
+	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
+	UT_ASSERT(!unclean);
+	UT_ASSERT(cluster_qvotec_prior_exit_observe(0, 901, 902, &before));
+	UT_ASSERT_EQ(before.observing_incarnation, 902);
+	UT_ASSERT_EQ(before.node_id, 0);
+	UT_ASSERT_EQ(before.n_disks, 3);
+	UT_ASSERT_EQ(memcmp(before.slots, old, sizeof(old)), 0);
+	for (int d = 0; d < PGSA_TEST_DISKS; d++) {
+		old[d].incarnation = 902;
+		old[d].flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
+		old[d].generation++;
+		UT_ASSERT_EQ(cluster_voting_disk_write_slot(set.fds[d], &old[d]), 0);
+	}
+	UT_ASSERT(cluster_qvotec_prior_exit_observe(0, 901, 902, &after));
+	UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	cluster_shared_config = false;
+	pgsa_disk_set_close(&set);
+}
+
+UT_TEST(test_prior_exit_refuses_empty_mixed_live_or_other_boot)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		PgsaDiskSet set;
+		ClusterVotingSlot slot;
+		ClusterQvotecPriorExitObservation out, zero = { 0 };
+		bool unclean;
+		UT_ASSERT(normal_stop_disk_set(&set));
+		UT_ASSERT(cluster_qvotec_test_clean_shutdown(set.fds, 3, 901, 12));
+		UT_ASSERT_EQ(cluster_voting_disk_read_slot(set.fds[2], 2, 0, &slot), 0);
+		if (fault == 0)
+			slot.flags = CLUSTER_VOTING_SLOT_FLAG_ALIVE;
+		else if (fault == 1)
+			slot.generation = 0;
+		else if (fault == 2)
+			slot.incarnation = 900;
+		else if (fault == 3)
+			slot.flags = CLUSTER_VOTING_SLOT_FLAG_WRITE_FROZEN;
+		UT_ASSERT_EQ(cluster_voting_disk_write_slot(set.fds[2], &slot), 0);
+		cluster_shared_config = true;
+		UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
+		if (fault == 4)
+			cluster_qvotec_publish_self_incarnation(903);
+		if (fault == 5)
+			cluster_voting_disks = "disk0,disk1";
+		memset(&out, 0xff, sizeof(out));
+		UT_ASSERT(!cluster_qvotec_prior_exit_observe(fault == 6 ? 1 : 0,
+													 fault == 7	  ? 0
+													 : fault == 8 ? 902
+																  : 901,
+													 902, &out));
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		cluster_shared_config = false;
+		pgsa_disk_set_close(&set);
+	}
+}
+
+UT_TEST(test_prior_exit_cannot_be_replaced_by_another_probe)
+{
+	PgsaDiskSet set;
+	ClusterQvotecPriorExitObservation before, after;
+	bool unclean;
+	UT_ASSERT(normal_stop_disk_set(&set));
+	UT_ASSERT(cluster_qvotec_test_clean_shutdown(set.fds, 3, 901, 12));
+	cluster_shared_config = true;
+	UT_ASSERT(normal_stop_startup_probe(&set, &unclean));
+	UT_ASSERT(cluster_qvotec_prior_exit_observe(0, 901, 902, &before));
+	startup_error_armed = true;
+	startup_error_level = 0;
+	if (sigsetjmp(startup_error_env, 1) == 0) {
+		cluster_qvotec_test_probe_prior_slots(set.fds, PGSA_TEST_DISKS, 902);
+		startup_error_armed = false;
+		UT_ASSERT(false);
+	} else {
+		startup_error_armed = false;
+		UT_ASSERT_EQ(startup_error_level, FATAL);
+		UT_ASSERT(cluster_qvotec_prior_exit_observe(0, 901, 902, &after));
+		UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+	}
 	cluster_shared_config = false;
 	pgsa_disk_set_close(&set);
 }
@@ -3738,7 +3832,7 @@ UT_TEST(test_pgsa_source_graph_and_test_linkage_are_exact)
 int
 main(void)
 {
-	UT_PLAN(71);
+	UT_PLAN(74);
 	UT_RUN(test_voting_slot_size_512);
 	UT_RUN(test_voting_slot_field_offsets);
 	UT_RUN(test_qvotec_preserves_replacement_request_per_disk_fail_closed);
@@ -3804,6 +3898,9 @@ main(void)
 	UT_RUN(test_pre2_startup_unread_predecessor_cannot_reach_ready);
 	UT_RUN(test_pre2_startup_torn_predecessor_is_not_a_clean_observation);
 	UT_RUN(test_pre2_startup_complete_observations_preserve_classification);
+	UT_RUN(test_prior_exit_retains_exact_preheartbeat_slots);
+	UT_RUN(test_prior_exit_refuses_empty_mixed_live_or_other_boot);
+	UT_RUN(test_prior_exit_cannot_be_replaced_by_another_probe);
 	UT_RUN(test_normal_stop_third_disk_write_failure_is_not_majority_success);
 	UT_RUN(test_normal_stop_third_disk_read_and_missing_fd_fail);
 	UT_RUN(test_normal_stop_sync_and_short_write_fail_even_after_bytes_change);

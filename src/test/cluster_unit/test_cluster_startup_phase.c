@@ -689,6 +689,25 @@ cluster_grd_recovery_authority_is_current(uint64 boot_incarnation, uint64 lms_ge
 		   && lms_generation == phase_test_lms_generation;
 }
 
+/* PGRAC: this startup consumer fixture has no real control census. Preserve
+ * the legacy admission, but never invent a shared-config control grant here.
+ * The actual GRD census is exercised by its separate production-object tests.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE mode pg_attribute_unused())
+{
+	return !cluster_shared_config;
+}
+
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid pg_attribute_unused(),
+								   LOCKMODE mode pg_attribute_unused())
+{
+	return false;
+}
+
 bool
 cluster_grd_serving_authority_rebind_lmon(const ClusterFormationSnapshotV1 *formation,
 										  uint64 boot_incarnation, uint64 lms_generation)

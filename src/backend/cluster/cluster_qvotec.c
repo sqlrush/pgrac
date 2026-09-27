@@ -13,7 +13,7 @@
  *	  commit gate remain the authoritative durable-write predicate.
  *
  *	  Step 1 scope (this commit):
- *	    - ClusterQvotecShmem private 448-byte region (128-byte Q4 v0.2
+ *	    - ClusterQvotecShmem with original448-byte prefix (128-byte Q4 v0.2
  *	      lease prefix plus the 320-byte spec-5.15A local mailbox)
  *	    - Lifecycle CAS state machine (STARTING → READY → SHUTTING_DOWN
  *	      → DOWN), mirrors spec-2.5 CSSD pattern
@@ -113,7 +113,7 @@
 
 
 /* ============================================================
- * ClusterQvotecShmem — private fixed 448-byte region.
+ * ClusterQvotecShmem — fixed lease/mailbox prefix plus prior-exit evidence.
  *
  *	v0.2 amend per Q4 修订: lease-based quorum_state semantics.  The
  *	backend helper cluster_qvotec_in_quorum() validates BOTH the
@@ -138,6 +138,8 @@
  *	  72..75  uint32 prior_unclean_death   (crash-rejoin barrier)
  *	  76..127 diagnostics only (phase sequence, cycle times, owner and phase)
  *	 128..447 ClusterQvotecMailbox          (spec-5.15A §2.1A.4)
+ *	 448..455 once-publication state and zero padding
+ *	 456..4055 seven-disk prior-exit observation (volatile, never permission)
  * ============================================================ */
 typedef struct ClusterQvotecShmem {
 	pg_atomic_uint32 state;		   /* ClusterQvotecStatus */
@@ -174,10 +176,17 @@ typedef struct ClusterQvotecShmem {
 	pg_atomic_uint32 diagnostic_phase;
 	uint8 _reserved[4];
 	ClusterQvotecMailbox mailbox;
+	pg_atomic_uint32 prior_exit_state; /* 0 absent, 1 incomplete, 2 immutable */
+	uint32 prior_exit_pad;
+	ClusterQvotecPriorExitObservation prior_exit;
 } ClusterQvotecShmem;
 
 StaticAssertDecl(sizeof(ClusterQvotecShmem) == CLUSTER_QVOTEC_SHMEM_BYTES,
-				 "ClusterQvotecShmem must be exactly 448 bytes");
+				 "ClusterQvotecShmem size must include its prior-exit suffix");
+StaticAssertDecl(offsetof(ClusterQvotecShmem, prior_exit_state)
+					 == CLUSTER_QVOTEC_SHMEM_PRIOR_OFFSET,
+				 "prior-exit suffix must not move the original mailbox");
+StaticAssertDecl(offsetof(ClusterQvotecShmem, prior_exit) == 456, "prior-exit payload offset");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, self_incarnation) == 64,
 				 "ClusterQvotecShmem self incarnation offset");
 StaticAssertDecl(offsetof(ClusterQvotecShmem, prior_unclean_death) == 72,
@@ -189,6 +198,7 @@ StaticAssertDecl(offsetof(ClusterQvotecShmem, diagnostic_cycle_started_us) == 80
 
 
 static ClusterQvotecShmem *QvotecShmem = NULL;
+static int qvotec_shutdown_configured_disks(void);
 
 /* Read-only evidence, not a quorum state machine or permission to renew. */
 typedef enum QvotecDiagnosticPhase {
@@ -766,6 +776,9 @@ cluster_qvotec_shmem_init(void)
 		pg_atomic_init_u32(&QvotecShmem->diagnostic_phase, QVOTEC_DIAG_UNKNOWN);
 		memset(QvotecShmem->_reserved, 0, sizeof(QvotecShmem->_reserved));
 		cluster_qvotec_mailbox_restart_reset(&QvotecShmem->mailbox);
+		pg_atomic_init_u32(&QvotecShmem->prior_exit_state, 0);
+		QvotecShmem->prior_exit_pad = 0;
+		memset(&QvotecShmem->prior_exit, 0, sizeof(QvotecShmem->prior_exit));
 	}
 }
 
@@ -919,6 +932,45 @@ cluster_qvotec_prior_unclean_death(void)
 	if (QvotecShmem == NULL)
 		return false;
 	return pg_atomic_read_u32(&QvotecShmem->prior_unclean_death) != 0;
+}
+
+bool
+cluster_qvotec_prior_exit_observe(uint32 node_id, uint64 prior_incarnation,
+								  uint64 observing_incarnation,
+								  ClusterQvotecPriorExitObservation *out)
+{
+	const ClusterQvotecPriorExitObservation *observed;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (out == NULL || QvotecShmem == NULL || !cluster_shared_config || node_id >= CLUSTER_MAX_NODES
+		|| cluster_node_id != (int)node_id || prior_incarnation == 0 || observing_incarnation == 0
+		|| prior_incarnation == observing_incarnation
+		|| pg_atomic_read_u32(&QvotecShmem->prior_exit_state) != 2)
+		return false;
+	pg_read_barrier();
+	observed = &QvotecShmem->prior_exit;
+	if (QvotecShmem->prior_exit_pad != 0 || observed->node_id != node_id
+		|| observed->observing_incarnation != observing_incarnation
+		|| cluster_qvotec_get_self_incarnation() != observing_incarnation || observed->n_disks == 0
+		|| observed->n_disks > CLUSTER_MAX_VOTING_DISKS
+		|| qvotec_shutdown_configured_disks() != (int)observed->n_disks)
+		return false;
+	for (uint32 d = 0; d < observed->n_disks; d++) {
+		const ClusterVotingSlot *slot = &observed->slots[d];
+		if (slot->magic != CLUSTER_VOTING_SLOT_MAGIC || slot->version != CLUSTER_VOTING_SLOT_VERSION
+			|| slot->node_id != node_id || slot->disk_index != d || slot->generation == 0
+			|| slot->incarnation != prior_incarnation || slot->flags != 0
+			|| slot->crc32c != cluster_voting_disk_compute_crc32c(slot))
+			return false;
+	}
+	*out = *observed;
+	pg_read_barrier();
+	if (pg_atomic_read_u32(&QvotecShmem->prior_exit_state) != 2
+		|| cluster_qvotec_get_self_incarnation() != observing_incarnation) {
+		memset(out, 0, sizeof(*out));
+		return false;
+	}
+	return true;
 }
 
 uint64
@@ -3847,6 +3899,101 @@ qvotec_open_disks(void)
 }
 
 
+/* PGRAC: the real pre-heartbeat predecessor read, shared by Main and the
+ * actual-file unit adapter. Keep legacy ghost classification unchanged.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void
+qvotec_probe_prior_slots(void)
+{
+	if (cluster_shared_config) {
+		uint32 expected = 0;
+		if (QvotecShmem == NULL || qvotec_n_disks <= 0 || qvotec_n_disks > CLUSTER_MAX_VOTING_DISKS
+			|| qvotec_shutdown_configured_disks() != qvotec_n_disks || cluster_node_id < 0
+			|| (uint32)cluster_node_id >= CLUSTER_MAX_NODES || qvotec_self_incarnation == 0
+			|| cluster_qvotec_get_self_incarnation() != qvotec_self_incarnation
+			|| !pg_atomic_compare_exchange_u32(&QvotecShmem->prior_exit_state, &expected, 1))
+			ereport(FATAL,
+					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+					 errmsg("prior voting observation requires one complete new-boot capture")));
+		memset(&QvotecShmem->prior_exit, 0, sizeof(QvotecShmem->prior_exit));
+		QvotecShmem->prior_exit.observing_incarnation = qvotec_self_incarnation;
+		QvotecShmem->prior_exit.node_id = cluster_node_id;
+		QvotecShmem->prior_exit.n_disks = qvotec_n_disks;
+	}
+	if (qvotec_n_disks > 0 && cluster_node_id >= 0 && (uint32)cluster_node_id < CLUSTER_MAX_NODES) {
+		uint64 heartbeat_timeout_us = (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
+		uint64 now_us = (uint64)GetCurrentTimestamp();
+		bool ghost_fresh = false;
+		int d;
+
+		for (d = 0; d < qvotec_n_disks; d++) {
+			ClusterVotingSlot probe;
+			ClusterVotingDiskIoState rrc;
+
+			rrc = cluster_voting_disk_read_slot(qvotec_fds[d], d, (uint32)cluster_node_id, &probe);
+			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
+				/* Never overwrite an unread/corrupt predecessor in this profile. */
+				if (cluster_shared_config)
+					ereport(FATAL,
+							(errcode(rrc == CLUSTER_VOTING_DISK_IO_TORN ? ERRCODE_DATA_CORRUPTED
+																		: ERRCODE_IO_ERROR),
+							 errmsg("could not verify prior voting identity before startup"),
+							 errdetail("Node %d, voting disk %d, read result %d.", cluster_node_id,
+									   d, rrc),
+							 errhint("Restore access to every configured voting disk and retry "
+									 "startup. Preserve unread or corrupt slots for diagnosis; do "
+									 "not clear them to bypass recovery or isolation.")));
+				continue;
+			}
+			if (cluster_shared_config)
+				QvotecShmem->prior_exit.slots[d] = probe;
+			if (probe.generation == 0)
+				continue;
+			if (!(probe.flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE))
+				continue;
+			if (probe.incarnation == qvotec_self_incarnation)
+				continue;
+			/* Stale ALIVE still means unclean death, never clean exit. */
+			if (QvotecShmem != NULL)
+				pg_atomic_write_u32(&QvotecShmem->prior_unclean_death, 1);
+			if (probe.heartbeat_ts_us == 0)
+				continue;
+			if (now_us > probe.heartbeat_ts_us
+				&& (now_us - probe.heartbeat_ts_us) > heartbeat_timeout_us)
+				continue;
+			ghost_fresh = true;
+		}
+		if (ghost_fresh) {
+			ereport(LOG, (errmsg("qvotec: prior-incarnation self-slot still fresh, "
+								 "waiting %lu ms for it to age out before first "
+								 "poll (avoids fast-restart Q6 newer-self FATAL)",
+								 (unsigned long)(heartbeat_timeout_us / 1000ULL))));
+			pg_usleep((long)(heartbeat_timeout_us / 1000ULL) * 1000L);
+		}
+	}
+	/* Never publish partial/error input, and never refresh from a new heartbeat.
+	 * This immutable payload lives only for this postmaster's new boot. */
+	if (cluster_shared_config) {
+		pg_write_barrier();
+		pg_atomic_write_u32(&QvotecShmem->prior_exit_state, 2);
+	}
+}
+
+#ifdef CLUSTER_QVOTEC_PGSA_UNIT_TEST
+extern void cluster_qvotec_test_probe_prior_slots(const int *fds, int n_disks, uint64 incarnation);
+void
+cluster_qvotec_test_probe_prior_slots(const int *fds, int n_disks, uint64 incarnation)
+{
+	Assert(n_disks >= 0 && n_disks <= CLUSTER_MAX_VOTING_DISKS);
+	qvotec_n_disks = n_disks;
+	for (int i = 0; i < n_disks; i++)
+		qvotec_fds[i] = fds[i];
+	qvotec_self_incarnation = incarnation;
+	cluster_qvotec_publish_self_incarnation(incarnation);
+	qvotec_probe_prior_slots();
+}
+#endif
+
 /* ============================================================
  * ClusterQvotecMain — aux process entry.
  *
@@ -4049,71 +4196,7 @@ ClusterQvotecMain(void)
 	 * here; the next poll cycle will overwrite it with our fresh
 	 * incarnation naturally.
 	 */
-	if (qvotec_n_disks > 0 && cluster_node_id >= 0 && (uint32)cluster_node_id < CLUSTER_MAX_NODES) {
-		uint64 heartbeat_timeout_us = (uint64)cluster_quorum_poll_interval_ms * 2 * 1000ULL;
-		uint64 now_us = (uint64)GetCurrentTimestamp();
-		bool ghost_fresh = false;
-		int d;
-
-		for (d = 0; d < qvotec_n_disks; d++) {
-			ClusterVotingSlot probe;
-			ClusterVotingDiskIoState rrc;
-
-			rrc = cluster_voting_disk_read_slot(qvotec_fds[d], d, (uint32)cluster_node_id, &probe);
-			if (rrc != CLUSTER_VOTING_DISK_IO_OK) {
-				/* PGRAC: do not overwrite an unknown predecessor on the first
-				 * poll. A missing observation is neither clean exit nor isolation.
-				 * Legacy profiles retain their original startup classification.
-				 * Author: SqlRush <sqlrush@gmail.com> */
-				if (cluster_shared_config)
-					ereport(FATAL,
-							(errcode(rrc == CLUSTER_VOTING_DISK_IO_TORN ? ERRCODE_DATA_CORRUPTED
-																		: ERRCODE_IO_ERROR),
-							 errmsg("could not verify prior voting identity before startup"),
-							 errdetail("Node %d, voting disk %d, read result %d.", cluster_node_id,
-									   d, rrc),
-							 errhint("Restore access to every configured voting disk and retry "
-									 "startup. Preserve unread or corrupt slots for diagnosis; do "
-									 "not clear them to bypass recovery or isolation.")));
-				continue;
-			}
-			if (probe.generation == 0)
-				continue; /* never written */
-			if (!(probe.flags & CLUSTER_VOTING_SLOT_FLAG_ALIVE))
-				continue; /* prior shutdown cleared ALIVE — clean death, ok */
-			if (probe.incarnation == qvotec_self_incarnation)
-				continue; /* same incarnation — impossible but defensive */
-
-			/*
-			 * Crash-rejoin re-declare barrier (Shape A) — a prior-incarnation
-			 * self-slot that still carries ALIVE means the previous postmaster
-			 * of THIS node died WITHOUT running the clean-shutdown blank
-			 * (qvotec_clear_self_alive_on_clean_shutdown), i.e. an UNCLEAN
-			 * death.  Latch it REGARDLESS of freshness: a stale ALIVE ghost is
-			 * still proof we crashed (we just crashed longer ago), and the
-			 * fence must engage on a fast rejoin where the survivor has not yet
-			 * advanced its epoch (the epoch signal is INITIAL on both sides).
-			 * Single writer, before the READY publish; read-only afterwards.
-			 */
-			if (QvotecShmem != NULL)
-				pg_atomic_write_u32(&QvotecShmem->prior_unclean_death, 1);
-
-			if (probe.heartbeat_ts_us == 0)
-				continue;
-			if (now_us > probe.heartbeat_ts_us
-				&& (now_us - probe.heartbeat_ts_us) > heartbeat_timeout_us)
-				continue; /* already stale — no fast-restart Q6 sleep needed */
-			ghost_fresh = true;
-		}
-
-		if (ghost_fresh) {
-			ereport(LOG, (errmsg("qvotec: prior-incarnation self-slot still fresh, "
-								 "waiting %lu ms for it to age out before first "
-								 "poll (avoids fast-restart Q6 newer-self FATAL)",
-								 (unsigned long)(heartbeat_timeout_us / 1000ULL))));
-			pg_usleep((long)(heartbeat_timeout_us / 1000ULL) * 1000L);
-		}
-	}
+	qvotec_probe_prior_slots();
 
 	if (!cluster_reconfig_qvotec_lifecycle_transition(&QvotecShmem->mailbox, &QvotecShmem->state,
 													  CLUSTER_QVOTEC_READY))
@@ -4473,6 +4556,16 @@ cluster_qvotec_get_collision_state_name(void)
 bool
 cluster_qvotec_in_quorum(void)
 {
+	return false;
+}
+bool
+cluster_qvotec_prior_exit_observe(uint32 node_id pg_attribute_unused(),
+								  uint64 prior_incarnation pg_attribute_unused(),
+								  uint64 observing_incarnation pg_attribute_unused(),
+								  ClusterQvotecPriorExitObservation *out)
+{
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
 	return false;
 }
 void
