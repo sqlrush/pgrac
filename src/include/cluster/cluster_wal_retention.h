@@ -240,6 +240,10 @@ typedef struct ClusterWalRetentionPinThreadRequest {
 	uint32 nintervals;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken root_read;
+	/* PGRAC: nonzero only for a pending initializer's whole-thread WALR-S.
+	 * That request has no fabricated checkpoint interval or ordinary token.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *needs;
 	const PgracExternalFenceAdmissionSetV1 *admissions;
@@ -362,6 +366,16 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard);
 extern bool
 cluster_wal_retention_root_publish_sealed_current(const ClusterWalRootPublishGuard *guard,
 												  const ClusterControlRootReadToken *expected_root);
+/* Pending publication borrows the same sealed pin after confirmed IR release;
+ * it cannot manufacture an ordinary checkpoint token or a new WALR grant. */
+extern ClusterWalPinResult
+cluster_wal_retention_pending_publish_begin(const ClusterRecoveryDutyKey *duty,
+											const ClusterControlPendingToken *expected,
+											ClusterWalRootPublishGuard **out_guard);
+extern bool
+cluster_wal_retention_pending_publish_current(const ClusterWalRootPublishGuard *guard,
+											  const ClusterRecoveryDutyKey *duty,
+											  const ClusterControlPendingToken *expected);
 extern ClusterWalReuseGuardResult
 cluster_wal_retention_e1_coarse_begin(ClusterWalRetentionE1Context *context, uint16 thread_id,
 									  ClusterWalRootFoldResult *out_fold_result,

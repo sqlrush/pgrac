@@ -61,6 +61,19 @@ cluster_control_root_read_canonical(uint16 thread pg_attribute_unused(),
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* PGRAC: this native-lock test has only ordinary checkpoint subjects.
+ * Actual pending-file discovery is covered by test_cluster_control_root.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_control_root_read_recovery_subject(uint16 thread pg_attribute_unused(),
+										   const ClusterControlRootIdentity *identity
+											   pg_attribute_unused(),
+										   ClusterControlRecoverySubject *out)
+{
+	memset(out, 0, sizeof(*out));
+	return CLUSTER_CONTROL_ROOT_ABSENT;
+}
+
 ClusterRecoveryDutyCompare
 cluster_recovery_duty_key_compare_for_claim(const ClusterRecoveryDutyKey *expected,
 											const ClusterRecoveryDutyKey *observed, bool claim_v2)

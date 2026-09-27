@@ -2570,6 +2570,7 @@ typedef struct CanonicalAuxRead {
 	bool pending;
 	bool has_expected;
 	bool stop_observation;
+	bool recovery_observation;
 	uint16 format_version;
 	uint16 thread;
 	uint64 admitted_incarnation;
@@ -2579,6 +2580,7 @@ typedef struct CanonicalAuxRead {
 	ClusterControlRootIdentity expected;
 	ClusterControlRootSnapshot snapshot;
 	ClusterControlRootReadToken token;
+	ClusterControlRecoverySubject recovery;
 	ClusterControlRootResult result;
 } CanonicalAuxRead;
 
@@ -2607,7 +2609,8 @@ static bool
 canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 					 ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
 					 uint64 admitted_incarnation, ClusterControlRootStopObservation *stop,
-					 ClusterControlRootResult *result, uint16 version)
+					 ClusterControlRootResult *result, uint16 version,
+					 ClusterControlRecoverySubject *recovery)
 {
 	CanonicalAuxRead now = { 0 };
 	CanonicalAuxRead *pending = &canonical_aux_read;
@@ -2628,6 +2631,7 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 		= pending->format_version == version && pending->thread == thread
 		  && pending->has_expected == (expected != NULL)
 		  && pending->stop_observation == (stop != NULL)
+		  && pending->recovery_observation == (recovery != NULL)
 		  && pending->admitted_incarnation == admitted_incarnation
 		  && (expected == NULL || cluster_control_root_identity_equal(&pending->expected, expected))
 		  && canonical_aux_capture_cut(&now) && now.epoch == pending->epoch
@@ -2644,6 +2648,8 @@ canonical_aux_finish(uint16 thread, const ClusterControlRootIdentity *expected,
 			if (stop != NULL) {
 				*stop = pending->stop;
 			}
+			if (recovery != NULL)
+				*recovery = pending->recovery;
 		}
 	}
 	memset(pending, 0, sizeof(*pending));
@@ -2777,6 +2783,87 @@ stop_phase_v2_locked(const ControlRootImage *root, uint32 index, const ControlFi
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* PGRAC: discover the exact failed generation without relabeling its clean
+ * predecessor. Only a value observation leaves this CF interval; physical
+ * scanning and recovery still require independent isolation/WALR/IR owners.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+read_recovery_subject_locked(uint16 thread_id, const uint8 storage_uuid[16],
+							 uint64 system_identifier, const ClusterControlRootIdentity *expected,
+							 ControlRootImage *root, ClusterControlRecoverySubject *out)
+{
+	ClusterControlRootFileToken before, token;
+	ClusterControlRootIdentity current;
+	ControlFileData view;
+	ClusterWalOriginInputs *inputs;
+	ClusterControlRootResult result;
+	uint32 node = thread_id - 1;
+	memset(out, 0, sizeof(*out));
+	result = read_control_version(storage_uuid, system_identifier, root, &view, &before, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!root->present[node])
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	current = root->records[node].identity;
+	result = read_thread_version(&current, root, &view, &token, 3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&before, &token, sizeof(token)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	inputs = palloc0(sizeof(*inputs));
+	result = cluster_wal_origin_inputs_read_locked(root, node, inputs);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && inputs->has_pending) {
+		const ClusterWalStartupImage *op = &inputs->pending;
+		ClusterWalDurablePrefixRef ref = { 0 };
+		ClusterWalThreadClaimV2 claim;
+		ClusterWalDurablePrefix prefix;
+		uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
+		if ((op->phase != CLUSTER_WAL_STARTUP_INITIALIZING
+			 && op->phase != CLUSTER_WAL_STARTUP_DURABLE)
+			|| (root->header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) != 0) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			goto done;
+		}
+		ref.claim.identity = op->claim.identity;
+		ref.claim.database_incarnation = op->database_incarnation;
+		ref.claim.max_config_generation = op->config_generation;
+		ref.timeline = op->timeline;
+		result = cluster_wal_claim_v2_encode(&op->claim, bytes);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto done;
+		if (!control_root_sha256(bytes, sizeof(bytes), ref.claim.claim_sha256)) {
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			goto done;
+		}
+		result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &ref.claim, &claim);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &ref, &prefix);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			goto done;
+		out->kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+		out->duty = op->claim.identity;
+		out->pending.file = token;
+		out->pending.generation = root->startup[node].generation;
+		memcpy(out->pending.sha256, root->startup[node].sha256, 32);
+		memcpy(out->pending.operation_uuid, op->operation_uuid, 16);
+	} else if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		out->kind = CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT;
+		out->duty = current;
+		out->current = root->records[node];
+		make_read_token(root, thread_id, CONTROL_ROOT_SOURCE_PRIMARY, &out->current_token);
+	}
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && expected != NULL
+		&& !cluster_control_root_identity_equal(expected, &out->duty))
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+done:
+	pfree(inputs);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
 /* PGRAC: recovery owners may inspect a failed peer, not only their own live
  * writer. Select and authenticate the v2 root/config/claim/anchor under one
  * owned CF-S interval. This mints an observation, never serving permission,
@@ -2787,7 +2874,7 @@ static ClusterControlRootResult
 read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expected_identity,
 					   ClusterControlRootSnapshot *out, ClusterControlRootReadToken *token,
 					   uint64 admitted_incarnation, ClusterControlRootStopObservation *stop,
-					   uint16 version)
+					   uint16 version, ClusterControlRecoverySubject *recovery)
 {
 	ControlRootImage *root;
 	ControlRootImage *peer_root;
@@ -2803,6 +2890,7 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 	bool auxiliary = canonical_aux_actor();
 	CanonicalAuxRead continuation = { 0 };
 	ClusterControlRootStopObservation stop_sample = { 0 };
+	ClusterControlRecoverySubject subject = { 0 };
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -2810,6 +2898,8 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 		memset(token, 0, sizeof(*token));
 	if (stop != NULL)
 		memset(stop, 0, sizeof(*stop));
+	if (recovery != NULL)
+		memset(recovery, 0, sizeof(*recovery));
 	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
 		|| thread_id == 0 || thread_id > CLUSTER_CONTROL_ROOT_RECORD_COUNT
 		|| (stop != NULL && (admitted_incarnation == 0 || admitted_incarnation == UINT64_MAX)))
@@ -2831,7 +2921,7 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 		return result;
 	if (auxiliary
 		&& canonical_aux_finish(thread_id, expected_identity, out, token, admitted_incarnation,
-								stop, &result, version))
+								stop, &result, version, recovery))
 		return result;
 	if (cluster_cf_held(ExclusiveLock)
 		|| (cluster_cf_held(ShareLock) && !(auxiliary && cluster_cf_acquire_pending(ShareLock))))
@@ -2846,80 +2936,89 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 			held = true;
 			if (cluster_cf_held_is_clusterwide(ShareLock)
 				&& (!auxiliary || canonical_aux_capture_cut(&continuation))) {
-				if (expected_identity == NULL) {
-					result = read_control_version(storage_uuid, system_identifier, root, &thread,
-												  &discovered, version);
+				if (recovery != NULL)
+					result
+						= read_recovery_subject_locked(thread_id, storage_uuid, system_identifier,
+													   expected_identity, root, &subject);
+				else {
+					if (expected_identity == NULL) {
+						result = read_control_version(storage_uuid, system_identifier, root,
+													  &thread, &discovered, version);
+						if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+							|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+							if (!root->present[index])
+								result = CLUSTER_CONTROL_ROOT_ABSENT;
+							else
+								expected = root->records[index].identity;
+						}
+					} else
+						result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 					if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 						|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
-						if (!root->present[index])
-							result = CLUSTER_CONTROL_ROOT_ABSENT;
-						else
-							expected = root->records[index].identity;
-					}
-				} else
-					result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
-				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
-					result = read_thread_version(&expected, root, &thread, &file_token, version);
-					/* A current-record-only observation cannot certify an unfinished
+						result
+							= read_thread_version(&expected, root, &thread, &file_token, version);
+						/* A current-record-only observation cannot certify an unfinished
 					 * successor as the clean predecessor. Full-stop observation must
 					 * also retain non-serving pending participants. */
-					if ((result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-						 || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-						&& version == CONTROL_ROOT_HEADER_VERSION_V3) {
-						for (uint32 peer = 0; peer < CLUSTER_CONTROL_ROOT_RECORD_COUNT; peer++)
-							if ((peer == index || stop != NULL)
-								&& root->startup[peer].generation != 0) {
-								result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
-								break;
-							}
-					}
-					if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-						|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
-						if (expected_identity == NULL
-							&& memcmp(&discovered, &file_token, sizeof(file_token)) != 0)
-							result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-						else {
-							if (stop != NULL) {
-								/* Keep the original selected root immutable. Each
+						if ((result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+							 || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+							&& version == CONTROL_ROOT_HEADER_VERSION_V3) {
+							for (uint32 peer = 0; peer < CLUSTER_CONTROL_ROOT_RECORD_COUNT; peer++)
+								if ((peer == index || stop != NULL)
+									&& root->startup[peer].generation != 0) {
+									result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+									break;
+								}
+						}
+						if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+							|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+							if (expected_identity == NULL
+								&& memcmp(&discovered, &file_token, sizeof(file_token)) != 0)
+								result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+							else {
+								if (stop != NULL) {
+									/* Keep the original selected root immutable. Each
 								 * serving thread must authenticate its own claim,
 								 * anchor and phase under this same CF interval. */
-								for (uint32 peer = 0; peer < CLUSTER_CONTROL_ROOT_RECORD_COUNT;
-									 peer++) {
-									ControlFileData peer_view;
-									ClusterControlRootFileToken peer_token;
-									const ClusterControlRootIdentity *id
-										= &root->records[peer].identity;
-									if ((root->header.v2.serving[peer / 64]
-										 & (UINT64_C(1) << (peer % 64)))
-										== 0)
-										continue;
-									result = read_thread_version(id, peer_root, &peer_view,
-																 &peer_token, version);
-									if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-										&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-										break;
-									if (memcmp(&peer_token, &file_token, sizeof(peer_token)) != 0) {
-										result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
-										break;
+									for (uint32 peer = 0; peer < CLUSTER_CONTROL_ROOT_RECORD_COUNT;
+										 peer++) {
+										ControlFileData peer_view;
+										ClusterControlRootFileToken peer_token;
+										const ClusterControlRootIdentity *id
+											= &root->records[peer].identity;
+										if ((root->header.v2.serving[peer / 64]
+											 & (UINT64_C(1) << (peer % 64)))
+											== 0)
+											continue;
+										result = read_thread_version(id, peer_root, &peer_view,
+																	 &peer_token, version);
+										if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+											&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+											break;
+										if (memcmp(&peer_token, &file_token, sizeof(peer_token))
+											!= 0) {
+											result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+											break;
+										}
+										result = stop_phase_v2_locked(
+											peer_root, peer, &peer_view,
+											id->origin_owner_incarnation,
+											&stop_sample.members[peer].phase);
+										if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+											break;
+										stop_sample.members[peer].incarnation
+											= id->origin_owner_incarnation;
+										stop_sample.members[peer].claim_created_at
+											= id->thread_claim_created_at;
 									}
-									result = stop_phase_v2_locked(peer_root, peer, &peer_view,
-																  id->origin_owner_incarnation,
-																  &stop_sample.members[peer].phase);
-									if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-										break;
-									stop_sample.members[peer].incarnation
-										= id->origin_owner_incarnation;
-									stop_sample.members[peer].claim_created_at
-										= id->thread_claim_created_at;
+									if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+										result = stop_phase_v2_locked(root, index, &thread,
+																	  admitted_incarnation,
+																	  &stop_sample.phase);
 								}
-								if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-									result = stop_phase_v2_locked(root, index, &thread,
-																  admitted_incarnation,
-																  &stop_sample.phase);
+								make_read_token(root, thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
+												&selected);
 							}
-							make_read_token(root, thread_id, CONTROL_ROOT_SOURCE_PRIMARY,
-											&selected);
 						}
 					}
 				}
@@ -2930,14 +3029,19 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 				continuation.format_version = version;
 				continuation.has_expected = expected_identity != NULL;
 				continuation.stop_observation = stop != NULL;
+				continuation.recovery_observation = recovery != NULL;
 				continuation.admitted_incarnation = admitted_incarnation;
 				if (expected_identity != NULL)
 					continuation.expected = *expected_identity;
 				continuation.result = result;
 				if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 					|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
-					continuation.snapshot = root->records[index];
-					continuation.token = selected;
+					if (recovery != NULL)
+						continuation.recovery = subject;
+					else {
+						continuation.snapshot = root->records[index];
+						continuation.token = selected;
+					}
 					if (stop != NULL) {
 						stop_sample.snapshot = root->records[index];
 						stop_sample.token = selected;
@@ -2956,7 +3060,8 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 					continuation.pending = true;
 					canonical_aux_read = continuation;
 					(void)canonical_aux_finish(thread_id, expected_identity, out, token,
-											   admitted_incarnation, stop, &result, version);
+											   admitted_incarnation, stop, &result, version,
+											   recovery);
 				}
 			}
 		}
@@ -2977,6 +3082,8 @@ read_canonical_version(uint16 thread_id, const ClusterControlRootIdentity *expec
 	PG_END_TRY();
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		if (recovery != NULL)
+			*recovery = subject;
 		if (out != NULL)
 			*out = root->records[index];
 		if (token != NULL)
@@ -3001,7 +3108,7 @@ read_canonical_v2(uint16 thread, const ClusterControlRootIdentity *expected,
 				  uint64 admitted_incarnation, ClusterControlRootStopObservation *stop)
 {
 	return read_canonical_version(thread, expected, out, token, admitted_incarnation, stop,
-								  CONTROL_ROOT_HEADER_VERSION_V2);
+								  CONTROL_ROOT_HEADER_VERSION_V2, NULL);
 }
 
 ClusterControlRootResult
@@ -3041,7 +3148,7 @@ cluster_control_root_v3_read_canonical(uint16 thread, const ClusterControlRootId
 									   ClusterControlRootReadToken *token)
 {
 	return read_canonical_version(thread, expected, out, token, 0, NULL,
-								  CONTROL_ROOT_HEADER_VERSION_V3);
+								  CONTROL_ROOT_HEADER_VERSION_V3, NULL);
 }
 
 ClusterControlRootResult
@@ -3051,7 +3158,18 @@ cluster_control_root_v3_stop_phase_read(uint16 thread, uint64 admitted_incarnati
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	return read_canonical_version(thread, NULL, NULL, NULL, admitted_incarnation, out,
-								  CONTROL_ROOT_HEADER_VERSION_V3);
+								  CONTROL_ROOT_HEADER_VERSION_V3, NULL);
+}
+
+ClusterControlRootResult
+cluster_control_root_read_recovery_subject(uint16 origin_thread,
+										   const ClusterControlRootIdentity *expected,
+										   ClusterControlRecoverySubject *out)
+{
+	if (out == NULL || history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	return read_canonical_version(origin_thread, expected, NULL, NULL, 0, NULL,
+								  CONTROL_ROOT_HEADER_VERSION_V3, out);
 }
 
 ClusterControlRootResult
@@ -5998,6 +6116,163 @@ failure_v2_cleanup(FailureInputV2Work *work, ClusterControlRootResult result)
 			(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 			 errmsg("failed-thread input publisher could not confirm lock release"),
 			 errhint("Keep the failed thread closed until recovery ownership is re-established.")));
+	return result;
+}
+
+/* PGRAC: the initializer inspection owns no new authority. WALR and the
+ * purpose-bound IR remain borrowed from the existing recovery worker. Never
+ * scan WAL while holding CF, nor return a stale observation after releasing it.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct InitializerObserveWork {
+	ControlRootImage root;
+	ClusterControlRecoverySubject subject;
+	ClusterWalInitializerInput input;
+	bool cf_held;
+} InitializerObserveWork;
+
+static bool
+initializer_owner_current(ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin)
+{
+	ClusterRecoveryDutyDigest digest;
+	uint32 count;
+	bool original_owner = false;
+
+	if (cluster_recovery_serial_initializer_revalidate(serial) != CLUSTER_RECOVERY_SERIAL_CURRENT
+		|| cluster_wal_retention_pin_revalidate(pin) != CLUSTER_WAL_PIN_OK || cluster_node_id < 0
+		|| cluster_node_id >= CLUSTER_MAX_NODES || cluster_qvotec_get_self_incarnation() == 0
+		|| (cluster_node_id == serial->duty.origin_node_id
+			&& cluster_qvotec_get_self_incarnation() == serial->duty.origin_owner_incarnation)
+		|| !cluster_recovery_duty_digest_for_claim(&serial->duty, true, &digest))
+		return false;
+	count = cluster_external_fence_need_set_count(serial->fence_need_set);
+	if (count == 0 || count > CLUSTER_MAX_NODES)
+		return false;
+	for (uint32 i = 0; i < count; i++) {
+		const PgracExternalFenceNeedV1 *need
+			= cluster_external_fence_need_set_at(serial->fence_need_set, i);
+		if (need == NULL || need->system_identifier != serial->duty.system_identifier
+			|| memcmp(&need->canonical_duty_digest, &digest, sizeof(digest)) != 0)
+			return false;
+		if (need->victim_node_id == serial->duty.origin_node_id
+			&& need->victim_incarnation == serial->duty.origin_owner_incarnation)
+			original_owner = true;
+	}
+	return original_owner;
+}
+
+static ClusterControlRootResult
+initializer_observe_locked(ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+						   InitializerObserveWork *work)
+{
+	ClusterControlRootResult result;
+	uint8 uuid[16];
+
+	if (!initializer_owner_current(serial, pin))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!current_storage_uuid(uuid) || memcmp(uuid, serial->duty.storage_uuid, sizeof(uuid)) != 0)
+		return CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED;
+	result = storage_contract_check(uuid, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!cluster_cf_lock(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_held = true;
+	if (!cluster_cf_held_is_clusterwide(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = read_recovery_subject_locked(serial->duty.origin_thread_id, uuid,
+										  serial->duty.system_identifier, &serial->duty,
+										  &work->root, &work->subject);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (work->subject.kind != CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
+		|| memcmp(&serial->pending, &work->subject.pending, sizeof(serial->pending)) != 0)
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	return initializer_owner_current(serial, pin) ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+												  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_initializer_observe(ClusterRecoverySerialGuard *serial,
+											ClusterWalRetentionPin *pin,
+											ClusterWalInitializerInput *out)
+{
+	InitializerObserveWork *work;
+	ClusterWalDurablePrefixRef ref = { 0 };
+	ClusterControlRootResult result;
+	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES];
+	bool alias = history_ranges_overlap(serial, sizeof(*serial), out, sizeof(*out));
+
+	if (out == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (alias)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	memset(out, 0, sizeof(*out));
+	if (!cluster_shared_config || !cluster_enabled || !cluster_controlfile_shared_authority
+		|| serial == NULL || pin == NULL || serial->mode != CLUSTER_RECOVERY_SERIAL_INITIALIZER
+		|| !cluster_control_pending_token_matches(&serial->pending, &serial->duty)
+		|| !cluster_recovery_duty_key_valid_for_claim(&serial->duty, true)
+		|| serial->duty.system_identifier != GetSystemIdentifier())
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work = palloc0(sizeof(*work));
+	PG_TRY();
+	{
+		result = initializer_observe_locked(serial, pin, work);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_wal_startup_read_locked(&work->root, serial->duty.origin_node_id,
+													 &work->input.startup);
+		if (work->cf_held) {
+			work->cf_held = false;
+			result = release_cf(ShareLock, result);
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			const ClusterWalStartupImage *op = &work->input.startup;
+			ref.claim.identity = op->claim.identity;
+			ref.claim.database_incarnation = op->database_incarnation;
+			ref.claim.max_config_generation = op->config_generation;
+			ref.timeline = op->timeline;
+			result = cluster_wal_claim_v2_encode(&op->claim, claim);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !control_root_sha256(claim, sizeof(claim), ref.claim.claim_sha256))
+				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& !initializer_owner_current(serial, pin))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				result
+					= cluster_wal_startup_observe(cluster_wal_threads_dir, &ref, op->segment_size,
+												  op->first_segment_lsn, &work->input.observation);
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = initializer_observe_locked(serial, pin, work);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			ClusterWalDurablePrefix current;
+			result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &ref, &current);
+			if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& memcmp(&current, &work->input.observation.tail.durable_prefix, sizeof(current))
+					   != 0)
+				result = CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+		}
+	}
+	PG_CATCH();
+	{
+		ClusterControlRootResult cleanup = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (work->cf_held)
+			cleanup = release_cf(ShareLock, cleanup);
+		pfree(work);
+		if (cleanup == CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN)
+			elog(FATAL, "could not confirm initializer observation lock cleanup");
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (work->cf_held)
+		result = release_cf(ShareLock, result);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && !initializer_owner_current(serial, pin))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = work->input;
+	pfree(work);
 	return result;
 }
 

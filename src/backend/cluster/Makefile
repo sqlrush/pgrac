@@ -370,4 +370,16 @@ cluster_wal_thread.o cluster_wal_durable_publish.o cluster_wal_retention.o: \
 cluster_control_bootstrap.o cluster_control_bootstrap_read.o cluster_control_root.o \
 cluster_wal_tail.o: $(top_srcdir)/src/include/cluster/cluster_wal_tail.h
 
+cluster_reconfig.o cluster_thread_recovery_worker.o: \
+	$(top_srcdir)/src/include/cluster/cluster_thread_recovery.h
+
+cluster_page_authority.o cluster_ir_lock.o cluster_recovery_merge.o \
+cluster_wal_retention.o cluster_thread_recovery_worker.o cluster_control_root.o \
+cluster_thread_recovery_authority.o cluster_thread_recovery_finalize.o: \
+	$(top_srcdir)/src/include/cluster/cluster_ir.h
+
+cluster_wal_retention.o cluster_thread_recovery_authority.o \
+cluster_thread_recovery_worker.o cluster_thread_recovery_finalize.o: \
+	$(top_srcdir)/src/include/cluster/cluster_wal_retention.h
+
 include $(top_srcdir)/src/backend/common.mk

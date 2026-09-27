@@ -228,6 +228,21 @@ typedef struct ClusterWalOriginInputs {
 	ClusterWalStartupImage pending;
 } ClusterWalOriginInputs;
 
+/* PGRAC: a qualified physical observation, not native closure or a terminal.
+ * Current W0 is kept separate from the interrupted initializer W1.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterWalInitializerInput {
+	ClusterWalStartupImage startup;
+	ClusterWalStartupObservation observation;
+} ClusterWalInitializerInput;
+
+struct ClusterRecoverySerialGuard;
+struct ClusterWalRetentionPin;
+extern ClusterControlRootResult
+cluster_control_root_v3_initializer_observe(struct ClusterRecoverySerialGuard *serial,
+											struct ClusterWalRetentionPin *pin,
+											ClusterWalInitializerInput *out);
+
 /* Caller supplies an authenticated immutable v3 root and already holds
  * clusterwide CF-S/X. Consume every selected history/PGWG object, including
  * RESERVED. This only reads metadata; physical input use still needs exact

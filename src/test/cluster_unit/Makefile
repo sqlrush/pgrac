@@ -5910,3 +5910,15 @@ test_cluster_port_runtime: test_cluster_port_runtime.c unit_test.h
 # Append after the source prerequisites so recipes using $< still compile
 # their test source. Changes to the logging boundary must relink every test.
 $(TESTS): cluster_unit_port_stubs.o
+
+# PGRAC: value-owned recovery carriers require consistent test/product layouts.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_recovery_serial test_cluster_control_root test_cluster_wal_retention \
+test_cluster_thread_recovery_authority test_cluster_control_ir: \
+	$(top_srcdir)/src/include/cluster/cluster_ir.h
+test_cluster_control_root test_cluster_reconfig: \
+	$(top_srcdir)/src/include/cluster/cluster_thread_recovery.h
+$(CLUSTER_THREAD_RECOVERY_AUTHORITY_O) test_cluster_wal_retention \
+test_cluster_control_root test_cluster_thread_recovery_authority: \
+	$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
+	$(top_srcdir)/src/include/cluster/cluster_ir.h

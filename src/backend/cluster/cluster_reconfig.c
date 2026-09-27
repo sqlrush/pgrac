@@ -64,6 +64,7 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 	ClusterControlRootIdentity identity;
 	ClusterControlRootSnapshot snapshot;
 	ClusterControlRootReadToken token;
+	ClusterControlRecoverySubject subject = { 0 };
 	ClusterControlRootResult root_result;
 	int32 origin_node;
 #ifdef USE_PGRAC_CLUSTER
@@ -92,16 +93,23 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 			|| before.event_id != event.event_id || before.episode_epoch < event.new_epoch
 			|| memcmp(before.dead_bitmap, event.dead_bitmap, sizeof(event.dead_bitmap)) != 0))
 		return false;
-	root_result = cluster_control_root_lookup_owner_by_node_runtime(origin_node, &identity,
-																	&snapshot, &token);
+	if (cluster_shared_config) {
+		root_result = cluster_control_root_read_recovery_subject(origin_thread, NULL, &subject);
+		identity = subject.duty;
+		snapshot = subject.current;
+		token = subject.current_token;
+	} else
+		root_result = cluster_control_root_lookup_owner_by_node_runtime(origin_node, &identity,
+																		&snapshot, &token);
 	if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 		|| !cluster_recovery_duty_key_valid_for_claim(&identity, cluster_shared_config)
 		|| identity.origin_thread_id != origin_thread || identity.origin_node_id != origin_node
-		|| (snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-			&& !(cluster_shared_config
-				 && snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN))
-		|| memcmp(&snapshot.identity, &identity, sizeof(identity)) != 0)
+		|| (subject.kind != CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
+			&& ((snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+				 && !(cluster_shared_config
+					  && snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN))
+				|| memcmp(&snapshot.identity, &identity, sizeof(identity)) != 0)))
 		return false;
 	if (cluster_shared_config) {
 		cluster_reconfig_get_last_event(&current);
@@ -117,6 +125,10 @@ cluster_reconfig_thread_recovery_eligibility_consume(uint16 origin_thread,
 	 * PRE2 attempts belong to the exact accepted protocol cut instead. */
 	out->attempt_stamp = cluster_shared_config ? before.episode_epoch : event.new_epoch;
 	out->duty = identity;
+	if (subject.kind == CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER) {
+		out->subject_kind = subject.kind;
+		memcpy(out->selected_root_sha256, subject.pending.file.image_sha256, 32);
+	}
 	return true;
 #endif
 }

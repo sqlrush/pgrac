@@ -262,6 +262,53 @@ typedef struct ClusterControlRootFileToken {
 	uint8 image_sha256[32];
 } ClusterControlRootFileToken;
 
+/* PGRAC: checkpoint-less initialization is a separate recovery subject, not
+ * a checkpoint-bearing root record. These value-owned observations confer no
+ * isolation, WAL retention, replay or publication authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef enum ClusterControlRecoverySubjectKind {
+	CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT = 0,
+	CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER = 1
+} ClusterControlRecoverySubjectKind;
+
+typedef struct ClusterControlPendingToken {
+	ClusterControlRootFileToken file;
+	uint64 generation;
+	uint8 sha256[32];
+	uint8 operation_uuid[16];
+} ClusterControlPendingToken;
+
+typedef struct ClusterControlRecoverySubject {
+	ClusterControlRecoverySubjectKind kind;
+	ClusterRecoveryDutyKey duty;
+	ClusterControlRootSnapshot current;
+	ClusterControlRootReadToken current_token;
+	ClusterControlPendingToken pending;
+} ClusterControlRecoverySubject;
+
+/* Syntax/identity only; callers must re-read the selected files and acquire
+ * their existing isolation and lock owners before acting on this token. */
+static inline bool
+cluster_control_pending_token_matches(const ClusterControlPendingToken *token,
+									  const ClusterRecoveryDutyKey *duty)
+{
+	uint8 file_hash = 0, object_hash = 0, operation = 0;
+	if (token == NULL || duty == NULL)
+		return false;
+	for (unsigned i = 0; i < 32; i++) {
+		file_hash |= token->file.image_sha256[i];
+		object_hash |= token->sha256[i];
+	}
+	for (unsigned i = 0; i < 16; i++)
+		operation |= token->operation_uuid[i];
+	return file_hash != 0 && object_hash != 0 && operation != 0 && token->generation != 0
+		   && token->file.file_txn_seq != 0 && token->file.format_version == 3
+		   && token->file.record_count == 128
+		   && token->file.activation_state == CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		   && token->file.system_identifier == duty->system_identifier
+		   && memcmp(token->file.authority_uuid, duty->authority_uuid, 16) == 0;
+}
+
 StaticAssertDecl(sizeof(ClusterControlRootIdentity) == 80, "ClusterControlRootIdentity ABI");
 StaticAssertDecl(offsetof(ClusterControlRootIdentity, system_identifier) == 0,
 				 "control-root system identifier offset");
@@ -475,6 +522,10 @@ cluster_control_root_read_canonical_dead_origin(uint16 origin_thread_id,
 extern ClusterControlRootResult cluster_control_root_lookup_owner_by_node_runtime(
 	int32 old_node_id, ClusterControlRootIdentity *out_identity,
 	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token);
+extern ClusterControlRootResult
+cluster_control_root_read_recovery_subject(uint16 origin_thread,
+										   const ClusterControlRootIdentity *expected,
+										   ClusterControlRecoverySubject *out);
 extern ClusterControlRootResult cluster_control_root_compare_and_publish(
 	const ClusterControlRootReadToken *expected_token, const ClusterControlRootPatch *patch,
 	ClusterControlRootPublishReason reason, ClusterControlRootSnapshot *out_snapshot,

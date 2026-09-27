@@ -86,6 +86,7 @@ static bool stub_need_set_ready;
 static bool stub_admission_set_ready;
 static ClusterControlRootResult stub_root_result;
 static ClusterControlRootReadToken stub_root_token;
+static ClusterControlRecoverySubject stub_subject;
 static ClusterLockAcquireResult stub_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
 static ClusterLockAcquireResult stub_release_results[CLUSTER_RECOVERY_SERIAL_SET_MAX];
 static uint16 stub_release_result_count;
@@ -149,6 +150,17 @@ cluster_control_root_read_canonical(uint16 origin_thread_id pg_attribute_unused(
 	}
 	if (out_token != NULL)
 		*out_token = stub_root_token;
+	return stub_root_result;
+}
+
+ClusterControlRootResult
+cluster_control_root_read_recovery_subject(uint16 thread,
+										   const ClusterControlRootIdentity *expected,
+										   ClusterControlRecoverySubject *out)
+{
+	UT_ASSERT_EQ(thread, stub_subject.duty.origin_thread_id);
+	UT_ASSERT(expected != NULL);
+	*out = stub_subject;
 	return stub_root_result;
 }
 
@@ -906,10 +918,118 @@ UT_TEST(test_recovery_serial_v2_key_reaches_owned_ir)
 				 CLUSTER_RECOVERY_SERIAL_INTERNAL_FAILURE);
 }
 
+static ClusterRecoverySerialRequest
+pending_serial_request(void)
+{
+	ClusterRecoverySerialRequest request = valid_serial_request();
+	cluster_shared_config = true;
+	request.mode = CLUSTER_RECOVERY_SERIAL_INITIALIZER;
+	memset(&request.expected_root_token, 0, sizeof(request.expected_root_token));
+	request.pending.file.system_identifier = request.duty.system_identifier;
+	memcpy(request.pending.file.authority_uuid, request.duty.authority_uuid, 16);
+	request.pending.file.format_version = 3;
+	request.pending.file.record_count = 128;
+	request.pending.file.activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE;
+	request.pending.file.file_txn_seq = 88;
+	memset(request.pending.file.image_sha256, 0x21, 32);
+	request.pending.generation = 77;
+	memset(request.pending.sha256, 0x31, 32);
+	memset(request.pending.operation_uuid, 0x41, 16);
+	memset(&stub_subject, 0, sizeof(stub_subject));
+	stub_subject.kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+	stub_subject.duty = request.duty;
+	stub_subject.pending = request.pending;
+	stub_root_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	stub_formation_ready = stub_need_set_ready = stub_admission_set_ready = true;
+	stub_acquire_result = stub_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+	stub_release_result_count = 0;
+	stub_acquire_calls = 0;
+	return request;
+}
+
+UT_TEST(test_recovery_serial_pending_initializer_does_not_require_fake_checkpoint)
+{
+	ClusterRecoverySerialRequest request = pending_serial_request();
+	ClusterRecoverySerialGuard guard;
+	UT_ASSERT_EQ(cluster_recovery_serial_acquire(&request, &guard),
+				 CLUSTER_RECOVERY_SERIAL_GRANTED);
+	UT_ASSERT_EQ(stub_acquire_calls, 1);
+	if (guard.held) {
+		UT_ASSERT_EQ(cluster_recovery_serial_revalidate(&guard),
+					 CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE);
+		UT_ASSERT_EQ(cluster_recovery_serial_input_revalidate(&guard),
+					 CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE);
+		UT_ASSERT_EQ(cluster_recovery_serial_initializer_revalidate(&guard),
+					 CLUSTER_RECOVERY_SERIAL_CURRENT);
+		stub_release_result = CLUSTER_LOCK_ACQUIRE_FAIL_INTERNAL;
+		UT_ASSERT_EQ(cluster_recovery_serial_release(&guard),
+					 CLUSTER_RECOVERY_SERIAL_RELEASE_UNCONFIRMED);
+		UT_ASSERT(guard.held && guard.release_uncertain);
+		UT_ASSERT_EQ(cluster_recovery_serial_initializer_revalidate(&guard),
+					 CLUSTER_RECOVERY_SERIAL_RELEASE_UNCERTAIN);
+		stub_release_result = CLUSTER_LOCK_ACQUIRE_OK_GRANTED;
+		UT_ASSERT_EQ(cluster_recovery_serial_release(&guard),
+					 CLUSTER_RECOVERY_SERIAL_RELEASE_CONFIRMED);
+	}
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_recovery_serial_pending_rejects_mixed_stale_and_unisolated_subjects)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		ClusterRecoverySerialRequest request = pending_serial_request();
+		ClusterRecoverySerialGuard guard;
+		switch (fault) {
+		case 0:
+			request.expected_root_token.lifecycle
+				= CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+			break;
+		case 1:
+			request.pending.file.format_version = 2;
+			break;
+		case 2:
+			memset(request.pending.operation_uuid, 0, 16);
+			break;
+		case 3:
+			request.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			break;
+		case 4:
+			stub_subject.kind = CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT;
+			break;
+		case 5:
+			stub_subject.duty.origin_owner_incarnation++;
+			break;
+		case 6:
+			stub_subject.pending.file.image_sha256[0] ^= 1;
+			break;
+		case 7:
+			stub_subject.pending.sha256[0] ^= 1;
+			break;
+		case 8:
+			stub_subject.pending.operation_uuid[0] ^= 1;
+			break;
+		case 9:
+			stub_formation_ready = false;
+			break;
+		case 10:
+			stub_need_set_ready = false;
+			break;
+		case 11:
+			stub_admission_set_ready = false;
+			break;
+		}
+		UT_ASSERT(cluster_recovery_serial_acquire(&request, &guard)
+				  != CLUSTER_RECOVERY_SERIAL_GRANTED);
+		UT_ASSERT_EQ(stub_acquire_calls, 0);
+		UT_ASSERT(!guard.held);
+		cluster_shared_config = false;
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_recovery_serial_resid_encode);
 	UT_RUN(test_ir_resid_namespace_distinct);
 	UT_RUN(test_recovery_serial_resid_thread_and_lineage_distinct);
@@ -931,6 +1051,8 @@ main(void)
 	UT_RUN(test_recovery_serial_input_keeps_fpw_history_without_replay_authority);
 	UT_RUN(test_recovery_serial_input_purpose_has_no_replay_fallback);
 	UT_RUN(test_recovery_serial_input_guard_loses_authority_and_keeps_uncertain_release);
+	UT_RUN(test_recovery_serial_pending_initializer_does_not_require_fake_checkpoint);
+	UT_RUN(test_recovery_serial_pending_rejects_mixed_stale_and_unisolated_subjects);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

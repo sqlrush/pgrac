@@ -502,7 +502,9 @@ static bool test_input_current = true, test_input_release = true;
 static int test_input_acquires, test_input_releases, test_input_acquire_order,
 	test_input_release_order;
 static int test_worker_replays, test_worker_pins, test_worker_normal_ir;
+static int test_worker_initializer_ir, test_worker_formations;
 static bool test_worker_pin_held;
+static bool test_worker_pin_release = true;
 static ClusterWalRetentionPinThreadRequest test_worker_pin_request;
 static ReconfigEvent test_worker_event;
 static bool test_control_barrier_ready = true;
@@ -984,6 +986,12 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 		test_input_acquires++;
 		test_input_acquire_order = ++test_order_seq;
 		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls + 1);
+	} else if (request->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER) {
+		test_worker_initializer_ir++;
+		UT_ASSERT(test_worker_pin_held);
+		UT_ASSERT_EQ(
+			memcmp(&request->pending, &test_worker_pin_request.pending, sizeof(request->pending)),
+			0);
 	} else {
 		test_worker_normal_ir++;
 		UT_ASSERT_EQ(request->mode, CLUSTER_RECOVERY_SERIAL_ONLINE);
@@ -1000,6 +1008,10 @@ cluster_recovery_serial_acquire(const ClusterRecoverySerialRequest *request,
 		guard->mode = request->mode;
 		guard->duty = request->duty;
 		guard->root_read_token = request->expected_root_token;
+		guard->pending = request->pending;
+		guard->formation = request->formation;
+		guard->fence_need_set = request->fence_need_set;
+		guard->fence_admission_set = request->fence_admission_set;
 	}
 	return test_input_acquire;
 }
@@ -1008,6 +1020,22 @@ ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_input_revalidate(ClusterRecoverySerialGuard *guard)
 {
 	return guard->held && guard->mode == CLUSTER_RECOVERY_SERIAL_INPUT_SEAL && test_input_current
+			   ? CLUSTER_RECOVERY_SERIAL_CURRENT
+			   : CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE;
+}
+
+ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_initializer_revalidate(ClusterRecoverySerialGuard *guard)
+{
+	PgracExternalFenceDenyReason reason;
+	return guard->held && !guard->release_uncertain
+				   && guard->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER && test_input_current
+				   && cluster_formation_witness_revalidate_nowait(guard->formation)
+						  == CLUSTER_FORMATION_WITNESS_READY
+				   && cluster_external_fence_need_set_revalidate_nowait(guard->fence_need_set,
+																		guard->formation, &reason)
+				   && cluster_external_fence_revalidate_set_nowait(
+					   guard->fence_admission_set, guard->fence_need_set, guard->formation, &reason)
 			   ? CLUSTER_RECOVERY_SERIAL_CURRENT
 			   : CLUSTER_RECOVERY_SERIAL_CAPABILITY_STALE;
 }
@@ -1034,6 +1062,7 @@ ClusterFormationWitnessResult
 cluster_formation_witness_build_wait(uint16 thread, bool opening, int timeout,
 									 ClusterFormationWitnessV1 **out)
 {
+	++test_worker_formations;
 	UT_ASSERT_EQ(thread, 1);
 	UT_ASSERT(!opening);
 	UT_ASSERT_EQ(timeout, 5000);
@@ -1174,9 +1203,15 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 {
 	test_worker_pins++;
 	UT_ASSERT_EQ(count, 1);
-	UT_ASSERT_EQ(request->nintervals, 1);
-	UT_ASSERT(request->intervals[0].end_lsn > request->intervals[0].start_lsn);
-	UT_ASSERT((request->root_read.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) != 0);
+	if (request->pending.generation != 0) {
+		UT_ASSERT_EQ(request->nintervals, 0);
+		UT_ASSERT(request->intervals == NULL);
+		UT_ASSERT(cluster_control_pending_token_matches(&request->pending, &request->duty));
+	} else {
+		UT_ASSERT_EQ(request->nintervals, 1);
+		UT_ASSERT(request->intervals[0].end_lsn > request->intervals[0].start_lsn);
+		UT_ASSERT((request->root_read.root_flags & CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID) != 0);
+	}
 	test_worker_pin_request = *request;
 	test_worker_pin_held = true;
 	*out = (ClusterWalRetentionPin *)(uintptr_t)4;
@@ -1187,14 +1222,25 @@ ClusterWalPinResult
 cluster_wal_retention_pin_bind_one(ClusterWalRetentionPin *pin, ClusterRecoverySerialGuard *guard)
 {
 	UT_ASSERT(pin == (ClusterWalRetentionPin *)(uintptr_t)4 && guard->held);
-	UT_ASSERT_EQ(guard->mode, CLUSTER_RECOVERY_SERIAL_ONLINE);
+	UT_ASSERT(guard->mode == CLUSTER_RECOVERY_SERIAL_ONLINE
+			  || guard->mode == CLUSTER_RECOVERY_SERIAL_INITIALIZER);
 	return CLUSTER_WAL_PIN_OK;
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pin_revalidate(ClusterWalRetentionPin *pin)
+{
+	return pin == (ClusterWalRetentionPin *)(uintptr_t)4 && test_worker_pin_held
+			   ? CLUSTER_WAL_PIN_OK
+			   : CLUSTER_WAL_PIN_STALE;
 }
 
 ClusterWalrReleaseResult
 cluster_wal_retention_pin_release(ClusterWalRetentionPin **pin)
 {
 	UT_ASSERT(*pin == (ClusterWalRetentionPin *)(uintptr_t)4);
+	if (!test_worker_pin_release)
+		return CLUSTER_WALR_RELEASE_UNCONFIRMED;
 	*pin = NULL;
 	test_worker_pin_held = false;
 	return CLUSTER_WALR_RELEASE_CONFIRMED;
@@ -1422,8 +1468,10 @@ wipe_root_files(void)
 	test_input_acquires = test_input_releases = test_input_acquire_order = test_input_release_order
 		= 0;
 	test_worker_replays = test_worker_pins = test_worker_normal_ir = 0;
+	test_worker_initializer_ir = test_worker_formations = 0;
 	test_worker_pin_held = false;
 	CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
+	test_worker_pin_release = true;
 	MyBgworkerEntry = NULL;
 	test_checkpoint_mode = false;
 	test_projection_observe = false;
@@ -10494,6 +10542,296 @@ UT_TEST(test_runtime_v3_failure_launch_accepts_open_but_not_clean_thread)
 	cluster_shared_config = false;
 }
 
+UT_TEST(test_runtime_v3_failure_launch_selects_interrupted_initializer_not_predecessor)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token, advanced;
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterWalStartupImage op = v3_begin_fixture(before, &root, &token);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(&op.claim.identity, op.operation_uuid,
+															 &token, &advanced),
+				 0);
+	if (ut_current_failed)
+		return;
+	cluster_node_id = 127;
+	test_self_incarnation = 991;
+	memset(&test_worker_event, 0, sizeof(test_worker_event));
+	test_worker_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+	test_worker_event.event_id = 12;
+	test_worker_event.new_epoch = 123;
+	test_worker_event.dead_bitmap[0] = 1;
+	test_control_barrier_ready = true;
+	UT_ASSERT(cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
+	UT_ASSERT_EQ(memcmp(&eligibility.duty, &op.claim.identity, sizeof(op.claim.identity)), 0);
+	UT_ASSERT(eligibility.duty.origin_owner_incarnation
+			  != op.predecessor.snapshot.identity.origin_owner_incarnation);
+	UT_ASSERT_EQ(eligibility.subject_kind, CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER);
+	UT_ASSERT(memcmp(eligibility.selected_root_sha256, advanced.image_sha256, 32) == 0);
+	UT_ASSERT_EQ(sizeof(eligibility), BGW_EXTRALEN);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_runtime_pending_observation_is_separate_and_requires_actual_inputs)
+{
+	for (unsigned fault = 0; fault < 4; fault++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token, advanced;
+		ClusterControlRecoverySubject subject;
+		ClusterControlRootSnapshot ordinary;
+		ClusterControlRootReadToken ordinary_token;
+		char path[MAXPGPATH];
+		ClusterWalStartupImage op = v3_begin_fixture(before, &root, &token);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(
+						 &op.claim.identity, op.operation_uuid, &token, &advanced),
+					 0);
+		if (ut_current_failed)
+			return;
+		cluster_node_id = 127;
+		test_self_incarnation = 991;
+		UT_ASSERT_EQ(cluster_control_root_read_recovery_subject(1, &op.claim.identity, &subject),
+					 0);
+		UT_ASSERT_EQ(subject.kind, CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER);
+		UT_ASSERT(v2_zero(&subject.current, sizeof(subject.current)));
+		UT_ASSERT(v2_zero(&subject.current_token, sizeof(subject.current_token)));
+		UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, NULL, &ordinary, &ordinary_token),
+					 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+		if (fault == 0) {
+			UT_ASSERT_EQ(cluster_control_root_read_recovery_subject(
+							 1, &op.predecessor.snapshot.identity, &subject),
+						 CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+		} else {
+			if (fault == 1)
+				v2_claim_path(&op.claim.identity, path);
+			else if (fault == 2)
+				v3_target_path(path, &op, "/durable_prefix/current");
+			else {
+				char hash[65];
+				for (unsigned i = 0; i < 32; i++)
+					snprintf(hash + 2 * i, 3, "%02x", subject.pending.sha256[i]);
+				snprintf(path, sizeof(path),
+						 "%s/global/wal_startup/thread_1/startup_" UINT64_FORMAT "-%s.bin",
+						 test_root, subject.pending.generation, hash);
+			}
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT(cluster_control_root_read_recovery_subject(1, &op.claim.identity, &subject)
+					  != 0);
+		}
+		UT_ASSERT(v2_zero(&subject, sizeof(subject)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_reserve_mode = false;
+	}
+}
+
+/* PGRAC: execute the actual background-worker body. The pending W1 must obtain
+ * its own isolation/WALR/IR route, never use W0's ordinary DATA replay owners.
+ * Author: SqlRush <sqlrush@gmail.com> */
+UT_TEST(test_runtime_pending_worker_owns_exact_subject_before_inspection)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token, advanced;
+		ClusterThreadRecLaunchEligibility eligibility = { 0 };
+		ClusterControlRecoverySubject observed;
+		ClusterWalStartupImage op = v3_begin_fixture(before, &root, &token);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(
+						 &op.claim.identity, op.operation_uuid, &token, &advanced),
+					 0);
+		if (ut_current_failed)
+			return;
+		cluster_node_id = 127;
+		test_self_incarnation = 991;
+		eligibility.origin_thread = 1;
+		eligibility.attempt_stamp = 123;
+		eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+		eligibility.duty = op.claim.identity;
+		memcpy(eligibility.selected_root_sha256, advanced.image_sha256, 32);
+		test_failure_formation = test_failure_needs = test_failure_admissions = true;
+		memset(&test_failure_need, 0, sizeof(test_failure_need));
+		test_failure_need.system_identifier = op.claim.identity.system_identifier;
+		test_failure_need.victim_node_id = op.claim.identity.origin_node_id;
+		test_failure_need.victim_incarnation = op.claim.identity.origin_owner_incarnation;
+		UT_ASSERT(cluster_recovery_duty_digest_for_claim(&op.claim.identity, true,
+														 &test_failure_need.canonical_duty_digest));
+		if (fault == 1)
+			eligibility.selected_root_sha256[0] ^= 1;
+		if (fault == 2)
+			test_failure_admissions = false;
+		if (fault == 3) {
+			char path[MAXPGPATH];
+			v2_claim_path(&op.claim.identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		if (fault == 4)
+			test_input_current = false;
+		if (fault == 5)
+			test_input_release = false;
+		if (fault == 6)
+			test_worker_pin_release = false;
+		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), fault == 2 || fault >= 5
+																   ? CLUSTER_THREADREC_BLOCKED
+																   : CLUSTER_THREADREC_DEFERRED);
+		UT_ASSERT_EQ(test_worker_formations, fault == 1 || fault == 3 ? 0 : 1);
+		UT_ASSERT_EQ(test_worker_pins, fault == 0 || fault >= 4 ? 1 : 0);
+		UT_ASSERT_EQ(test_worker_initializer_ir, fault == 0 || fault >= 4 ? 1 : 0);
+		UT_ASSERT_EQ(test_worker_normal_ir, 0);
+		UT_ASSERT_EQ(test_worker_replays, 0);
+		UT_ASSERT_EQ(test_worker_pin_held, fault >= 5);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		if (fault == 0) {
+			UT_ASSERT_EQ(
+				cluster_control_root_read_recovery_subject(1, &op.claim.identity, &observed), 0);
+			UT_ASSERT_EQ(observed.kind, CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER);
+			UT_ASSERT_EQ(memcmp(observed.pending.file.image_sha256, advanced.image_sha256, 32), 0);
+		}
+		test_reserve_mode = false;
+	}
+}
+
+static ClusterWalStartupImage
+pending_inspection_fixture(ClusterRecoverySerialGuard *serial, bool checkpoint)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ControlFileData control;
+	ClusterControlRootFileToken token, advanced;
+	ClusterControlRecoverySubject subject;
+	ClusterWalStartupImage op;
+	if (checkpoint) {
+		op = v3_startup_checkpoint_fixture(before, &root, &control);
+		/* The older anchor-codec fixture leaves nextXid at zero. This test
+		 * reads native checkpoint payloads, which require a normal nextXid. */
+		control.checkPointCopy.nextXid = FullTransactionIdFromU64(103);
+		v3_startup_native_record(&op, &control);
+	} else {
+		op = v3_begin_fixture(before, &root, &token);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(
+						 &op.claim.identity, op.operation_uuid, &token, &advanced),
+					 0);
+	}
+	cluster_node_id = 127;
+	test_self_incarnation = 991;
+	UT_ASSERT_EQ(cluster_control_root_read_recovery_subject(1, &op.claim.identity, &subject), 0);
+	memset(serial, 0, sizeof(*serial));
+	serial->held = true;
+	serial->mode = CLUSTER_RECOVERY_SERIAL_INITIALIZER;
+	serial->duty = op.claim.identity;
+	serial->pending = subject.pending;
+	serial->formation = (const ClusterFormationWitnessV1 *)(uintptr_t)1;
+	serial->fence_need_set = (const PgracExternalFenceNeedSetV1 *)(uintptr_t)2;
+	serial->fence_admission_set = (const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)3;
+	test_failure_formation = test_failure_needs = test_failure_admissions = true;
+	test_worker_pin_held = true;
+	memset(&test_failure_need, 0, sizeof(test_failure_need));
+	test_failure_need.system_identifier = op.claim.identity.system_identifier;
+	test_failure_need.victim_node_id = op.claim.identity.origin_node_id;
+	test_failure_need.victim_incarnation = op.claim.identity.origin_owner_incarnation;
+	UT_ASSERT(cluster_recovery_duty_digest_for_claim(&op.claim.identity, true,
+													 &test_failure_need.canonical_duty_digest));
+	return op;
+}
+
+UT_TEST(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal)
+{
+	for (unsigned scenario = 0; scenario < 3; scenario++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterWalInitializerInput input;
+		ClusterWalStartupImage op = pending_inspection_fixture(&serial, scenario != 0);
+		if (ut_current_failed)
+			return;
+		if (scenario == 2) {
+			char wal[MAXPGPATH];
+			v2_checkpoint_wal_path(&op.claim.identity, op.first_segment_lsn, op.timeline, wal);
+			UT_ASSERT_EQ(unlink(wal), 0);
+		}
+		if (scenario == 2) {
+			UT_ASSERT(cluster_control_root_v3_initializer_observe(
+						  &serial, (ClusterWalRetentionPin *)(uintptr_t)4, &input)
+					  != 0);
+			UT_ASSERT(v2_zero(&input, sizeof(input)));
+		} else {
+			UT_ASSERT_EQ(cluster_control_root_v3_initializer_observe(
+							 &serial, (ClusterWalRetentionPin *)(uintptr_t)4, &input),
+						 0);
+			UT_ASSERT_EQ(input.startup.phase, CLUSTER_WAL_STARTUP_INITIALIZING);
+			UT_ASSERT_EQ(input.observation.checkpoint_records, scenario);
+			UT_ASSERT_EQ(input.observation.tail.records, scenario);
+			UT_ASSERT_EQ(input.observation.unsupported_records, 0);
+			if (scenario != 0) {
+				UT_ASSERT_EQ(input.observation.checkpoint_start,
+							 op.first_segment_lsn + SizeOfXLogLongPHD);
+				UT_ASSERT(input.observation.checkpoint_start
+						  != op.predecessor.snapshot.checkpoint_lower_lsn);
+			}
+		}
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT(serial.held && test_worker_pin_held);
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_runtime_pending_inspection_refuses_stale_or_unowned_input)
+{
+	for (unsigned fault = 0; fault < 12; fault++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterWalInitializerInput input;
+		ClusterWalStartupImage op = pending_inspection_fixture(&serial, false);
+		if (ut_current_failed)
+			return;
+		switch (fault) {
+		case 0:
+			serial.pending.operation_uuid[0] ^= 1;
+			break;
+		case 1:
+			serial.pending.sha256[0] ^= 1;
+			break;
+		case 2:
+			serial.pending.file.image_sha256[0] ^= 1;
+			break;
+		case 3:
+			serial.release_uncertain = true;
+			break;
+		case 4:
+			serial.mode = CLUSTER_RECOVERY_SERIAL_ONLINE;
+			break;
+		case 5:
+			test_worker_pin_held = false;
+			break;
+		case 6:
+			test_failure_admissions = false;
+			break;
+		case 7:
+			test_failure_need.victim_incarnation++;
+			break;
+		case 8:
+			cluster_node_id = op.claim.identity.origin_node_id;
+			test_self_incarnation = op.claim.identity.origin_owner_incarnation;
+			break;
+		case 9:
+			test_stop_share_hook = v2_checkpoint_root_race;
+			test_stop_share_call = test_cf_lock_calls + 2;
+			break;
+		case 10:
+			test_failure_formation = false;
+			break;
+		case 11:
+			test_cf_release_confirmed = false;
+			break;
+		}
+		UT_ASSERT(cluster_control_root_v3_initializer_observe(
+					  &serial, (ClusterWalRetentionPin *)(uintptr_t)4, &input)
+				  != 0);
+		UT_ASSERT(v2_zero(&input, sizeof(input)));
+		UT_ASSERT(serial.held);
+		if (fault != 11)
+			UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_reserve_mode = false;
+	}
+}
+
 UT_TEST(test_runtime_v3_lmon_launch_continues_only_after_exact_cf_retirement)
 {
 	uint8 before[66048];
@@ -15878,7 +16216,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(297);
+	UT_PLAN(302);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
@@ -16136,6 +16474,11 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_failure_open_invalidates_old_tail_and_keeps_other_threads);
 	UT_RUN(test_v2_failure_tail_publishes_real_input_not_terminal);
 	UT_RUN(test_runtime_v3_failure_launch_accepts_open_but_not_clean_thread);
+	UT_RUN(test_runtime_v3_failure_launch_selects_interrupted_initializer_not_predecessor);
+	UT_RUN(test_runtime_pending_observation_is_separate_and_requires_actual_inputs);
+	UT_RUN(test_runtime_pending_worker_owns_exact_subject_before_inspection);
+	UT_RUN(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal);
+	UT_RUN(test_runtime_pending_inspection_refuses_stale_or_unowned_input);
 	UT_RUN(test_runtime_v3_lmon_launch_continues_only_after_exact_cf_retirement);
 	UT_RUN(test_runtime_v3_failure_worker_seals_then_acquires_fresh_replay_owners);
 	UT_RUN(test_runtime_v3_worker_window_consumes_its_sealed_authority_not_legacy_projection);

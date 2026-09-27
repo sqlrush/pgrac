@@ -59,6 +59,7 @@ typedef struct ClusterWalPinThread {
 	uint32 nintervals;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken root_read;
+	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *needs;
 	const PgracExternalFenceAdmissionSetV1 *admissions;
@@ -508,12 +509,21 @@ pin_request_valid(const ClusterWalRetentionPinThreadRequest *request, int wal_se
 {
 	uint32 i;
 	Size interval_bytes;
+	const ClusterControlPendingToken zero_pending = { 0 };
+	const ClusterControlRootReadToken zero_root = { 0 };
 
-	if (request == NULL || request->intervals == NULL || request->nintervals == 0
+	if (request == NULL
 		|| !cluster_recovery_duty_key_valid_for_claim(&request->duty, cluster_shared_config)
-		|| !root_token_matches_recovery_duty(&request->root_read, &request->duty)
 		|| request->formation == NULL || request->needs == NULL || request->admissions == NULL
 		|| request->nintervals > MaxAllocSize / sizeof(*request->intervals))
+		return false;
+	if (request->pending.generation != 0)
+		return cluster_shared_config && request->intervals == NULL && request->nintervals == 0
+			   && memcmp(&request->root_read, &zero_root, sizeof(zero_root)) == 0
+			   && cluster_control_pending_token_matches(&request->pending, &request->duty);
+	if (request->intervals == NULL || request->nintervals == 0
+		|| memcmp(&request->pending, &zero_pending, sizeof(zero_pending)) != 0
+		|| !root_token_matches_recovery_duty(&request->root_read, &request->duty))
 		return false;
 	interval_bytes = (Size)request->nintervals * sizeof(*request->intervals);
 	if (*total_bytes > MaxAllocSize - interval_bytes)
@@ -624,6 +634,8 @@ pin_thread_walr_current(const ClusterWalRetentionPin *pin, const ClusterWalPinTh
 		return false;
 	if (walr_request_current(&thread->walr.request))
 		return true;
+	if (thread->pending.generation != 0)
+		return false;
 	return guard != NULL && guard->pin_or_null == pin && guard->serial_or_null == thread->serial
 		   && guard->walr.converted_from_pin && guard->walr.held && guard->walr.coordinated
 		   && !guard->walr.release_uncertain && guard->walr.mode == ExclusiveLock
@@ -646,12 +658,24 @@ pin_current_after_grants(ClusterWalRetentionPin *pin)
 		ClusterControlRootSnapshot snapshot;
 		ClusterControlRootResult result;
 		PgracExternalFenceDenyReason reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
-
-		result = cluster_control_root_revalidate(&thread->root_read, &thread->duty, &snapshot);
-		if (!control_root_read_ready(result) || !pin_thread_walr_current(pin, thread)
-			|| memcmp(&snapshot.identity, &thread->duty, sizeof(thread->duty)) != 0
-			|| snapshot.lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
-			|| snapshot.root_flags != thread->root_read.root_flags
+		bool root_current;
+		if (thread->pending.generation != 0) {
+			ClusterControlRecoverySubject subject;
+			result = cluster_control_root_read_recovery_subject(thread->duty.origin_thread_id,
+																&thread->duty, &subject);
+			root_current
+				= result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				  && subject.kind == CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER
+				  && memcmp(&subject.duty, &thread->duty, sizeof(thread->duty)) == 0
+				  && memcmp(&subject.pending, &thread->pending, sizeof(thread->pending)) == 0;
+		} else {
+			result = cluster_control_root_revalidate(&thread->root_read, &thread->duty, &snapshot);
+			root_current = control_root_read_ready(result)
+						   && memcmp(&snapshot.identity, &thread->duty, sizeof(thread->duty)) == 0
+						   && snapshot.lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+						   && snapshot.root_flags == thread->root_read.root_flags;
+		}
+		if (!root_current || !pin_thread_walr_current(pin, thread)
 			|| cluster_formation_witness_revalidate_nowait(thread->formation)
 				   != CLUSTER_FORMATION_WITNESS_READY
 			|| !cluster_external_fence_need_set_revalidate_nowait(thread->needs, thread->formation,
@@ -699,11 +723,14 @@ cluster_wal_retention_pin_acquire(const ClusterWalRetentionPinThreadRequest *req
 		ClusterWalPinThread *thread = &pin->threads[i];
 		Size bytes = (Size)requests[i].nintervals * sizeof(*thread->intervals);
 
-		thread->intervals = palloc0(bytes);
-		memcpy(thread->intervals, requests[i].intervals, bytes);
+		if (bytes != 0) {
+			thread->intervals = palloc0(bytes);
+			memcpy(thread->intervals, requests[i].intervals, bytes);
+		}
 		thread->nintervals = requests[i].nintervals;
 		thread->duty = requests[i].duty;
 		thread->root_read = requests[i].root_read;
+		thread->pending = requests[i].pending;
 		thread->formation = requests[i].formation;
 		thread->needs = requests[i].needs;
 		thread->admissions = requests[i].admissions;
@@ -744,9 +771,13 @@ serial_matches_thread(ClusterRecoverySerialGuard *serial, const ClusterWalPinThr
 	return serial != NULL && serial->held && !serial->release_uncertain
 		   && memcmp(&serial->duty, &thread->duty, sizeof(thread->duty)) == 0
 		   && memcmp(&serial->root_read_token, &thread->root_read, sizeof(thread->root_read)) == 0
+		   && memcmp(&serial->pending, &thread->pending, sizeof(thread->pending)) == 0
 		   && serial->formation == thread->formation && serial->fence_need_set == thread->needs
 		   && serial->fence_admission_set == thread->admissions
-		   && cluster_recovery_serial_revalidate(serial) == CLUSTER_RECOVERY_SERIAL_CURRENT;
+		   && (thread->pending.generation != 0
+				   ? cluster_recovery_serial_initializer_revalidate(serial)
+				   : cluster_recovery_serial_revalidate(serial))
+				  == CLUSTER_RECOVERY_SERIAL_CURRENT;
 }
 
 static ClusterWalPinThread *
@@ -1074,6 +1105,76 @@ cluster_wal_retention_root_publish_end(ClusterWalRootPublishGuard **guard)
 		*guard = NULL;
 	}
 	return result;
+}
+
+/* PGRAC: no root I/O here. Publication owns CF itself and must compare the
+ * selected token again. The pin protects every input of this pending origin
+ * until the caller's exact IR release has been confirmed.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static bool
+pending_pin_released_current(const ClusterRecoveryDutyKey *duty,
+							 const ClusterControlPendingToken *expected)
+{
+	ClusterWalPinThread *thread;
+	ClusterRecoverySerialGuard *serial;
+	PgracExternalFenceDenyReason reason;
+	if (!cluster_shared_config || !cluster_control_pending_token_matches(expected, duty)
+		|| !pin_valid(active_pin) || active_pin->poisoned
+		|| active_pin->state != CLUSTER_WAL_PIN_STATE_SEALED || active_pin->nthreads != 1)
+		return false;
+	thread = &active_pin->threads[0];
+	serial = thread->serial;
+	if (memcmp(&thread->duty, duty, sizeof(*duty)) != 0
+		|| memcmp(&thread->pending, expected, sizeof(*expected)) != 0
+		|| !pin_thread_walr_current(active_pin, thread) || serial == NULL || serial->held
+		|| serial->release_uncertain || serial->mode != CLUSTER_RECOVERY_SERIAL_INITIALIZER
+		|| serial->lock_request.request_id == 0 || memcmp(&serial->duty, duty, sizeof(*duty)) != 0
+		|| memcmp(&serial->pending, expected, sizeof(*expected)) != 0
+		|| serial->formation != thread->formation || serial->fence_need_set != thread->needs
+		|| serial->fence_admission_set != thread->admissions)
+		return false;
+	return cluster_formation_witness_revalidate_nowait(thread->formation)
+			   == CLUSTER_FORMATION_WITNESS_READY
+		   && cluster_external_fence_need_set_revalidate_nowait(thread->needs, thread->formation,
+																&reason)
+		   && cluster_external_fence_revalidate_set_nowait(thread->admissions, thread->needs,
+														   thread->formation, &reason);
+}
+
+ClusterWalPinResult
+cluster_wal_retention_pending_publish_begin(const ClusterRecoveryDutyKey *duty,
+											const ClusterControlPendingToken *expected,
+											ClusterWalRootPublishGuard **out_guard)
+{
+	ClusterWalRootPublishGuard *guard;
+	if (out_guard == NULL || *out_guard != NULL || CurrentResourceOwner == NULL
+		|| !cluster_control_pending_token_matches(expected, duty))
+		return CLUSTER_WAL_PIN_INVALID;
+	if (active_root_publish_guard != NULL)
+		return CLUSTER_WAL_PIN_CAPACITY;
+	if (!pending_pin_released_current(duty, expected))
+		return CLUSTER_WAL_PIN_STALE;
+	guard = palloc0(sizeof(*guard));
+	guard->magic = CLUSTER_WAL_ROOT_PUBLISH_MAGIC;
+	guard->owner_pid = MyProcPid;
+	guard->owner = CurrentResourceOwner;
+	guard->thread_id = duty->origin_thread_id;
+	guard->borrowed_from_pin = true;
+	active_root_publish_guard = guard;
+	*out_guard = guard;
+	return CLUSTER_WAL_PIN_OK;
+}
+
+bool
+cluster_wal_retention_pending_publish_current(const ClusterWalRootPublishGuard *guard,
+											  const ClusterRecoveryDutyKey *duty,
+											  const ClusterControlPendingToken *expected)
+{
+	return guard != NULL && guard == active_root_publish_guard && duty != NULL
+		   && guard->magic == CLUSTER_WAL_ROOT_PUBLISH_MAGIC && guard->owner_pid == MyProcPid
+		   && guard->owner == CurrentResourceOwner && guard->borrowed_from_pin
+		   && guard->thread_id == duty->origin_thread_id
+		   && pending_pin_released_current(duty, expected);
 }
 
 bool

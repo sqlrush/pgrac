@@ -81,7 +81,11 @@ typedef enum ClusterRecoverySerialMode {
 	/* PGRAC: scan/publish input only, never page/side mutation authority.
 	 * Same IR resource; no disk, wire or shared-memory enum change.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	CLUSTER_RECOVERY_SERIAL_INPUT_SEAL = 3
+	CLUSTER_RECOVERY_SERIAL_INPUT_SEAL = 3,
+	/* PGRAC: existing IR for exact pending initialization closure only.
+	 * No checkpoint substitution or ordinary page/side replay permission.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CLUSTER_RECOVERY_SERIAL_INITIALIZER = 4
 } ClusterRecoverySerialMode;
 
 typedef enum ClusterRecoverySerialAcquireResult {
@@ -115,6 +119,7 @@ typedef struct ClusterRecoverySerialRequest {
 	ClusterRecoverySerialMode mode;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken expected_root_token;
+	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *fence_need_set;
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
@@ -129,6 +134,7 @@ typedef struct ClusterRecoverySerialGuard {
 	ClusterResId resid;
 	ClusterRecoveryDutyKey duty;
 	ClusterControlRootReadToken root_read_token;
+	ClusterControlPendingToken pending;
 	const ClusterFormationWitnessV1 *formation;
 	const PgracExternalFenceNeedSetV1 *fence_need_set;
 	const PgracExternalFenceAdmissionSetV1 *fence_admission_set;
@@ -152,6 +158,8 @@ extern ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_revalidate(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialRevalidateResult
 cluster_recovery_serial_input_revalidate(ClusterRecoverySerialGuard *guard);
+extern ClusterRecoverySerialRevalidateResult
+cluster_recovery_serial_initializer_revalidate(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialReleaseResult
 cluster_recovery_serial_release(ClusterRecoverySerialGuard *guard);
 extern ClusterRecoverySerialAcquireResult

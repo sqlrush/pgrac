@@ -40,6 +40,7 @@
 #include "postgres.h"
 #include "cluster/cluster_wal_thread.h"
 
+
 #include <stddef.h>
 #include <string.h>
 #include <sys/wait.h>
@@ -173,6 +174,26 @@ static ClusterReconfigRejoinPendingSnapshotV1 ut_rejoin_pending_seen;
 static ClusterJoinCommitMarker ut_rejoin_committed_seen;
 static char ut_rejoin_op_storage;
 static char ut_rejoin_clear_storage;
+
+/* PGRAC: reuse the ordinary-root fixture and its post-read reconfiguration
+ * races. Actual pending-file discovery is covered by test_cluster_control_root.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_control_root_read_recovery_subject(uint16 thread,
+										   const ClusterControlRootIdentity *identity,
+										   ClusterControlRecoverySubject *out)
+{
+	ClusterControlRootResult result;
+	memset(out, 0, sizeof(*out));
+	result = cluster_control_root_lookup_owner_by_node_runtime(thread - 1, &out->duty,
+															   &out->current, &out->current_token);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && identity != NULL
+		&& memcmp(identity, &out->duty, sizeof(*identity)) != 0)
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
 
 ClusterControlRootResult
 cluster_control_root_lookup_owner_by_node_runtime(int32 old_node_id pg_attribute_unused(),
