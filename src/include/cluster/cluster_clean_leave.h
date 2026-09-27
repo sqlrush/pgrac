@@ -383,6 +383,10 @@ typedef struct ClusterPhase1FullStopPlan {
 	uint8 pre2_member_phase[CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT];
 } ClusterPhase1FullStopPlan;
 
+/* Process-local ownership of the actual durable-close call. A supplied
+ * plan alone is not authority; the controller must have run its census. */
+extern bool cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan);
+
 typedef enum ClusterNormalStopPhase {
 	CLUSTER_NORMAL_STOP_IDLE = 0,
 	CLUSTER_NORMAL_STOP_WAIT_PEER_FRONTS,

@@ -17,6 +17,7 @@
 #include "catalog/catversion.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_authority.h"
+#include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
@@ -122,6 +123,13 @@ static unsigned test_projection_syncs;
 static LOCKMODE test_actual_cf;
 static unsigned test_history_sync_count, test_history_fail_sync;
 static bool test_throw_root_read;
+static bool test_close_owned;
+
+bool
+cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan)
+{
+	return test_close_owned && plan != NULL;
+}
 
 /* PGRAC: root-publisher tests inject formation/provider owners at their API
  * boundary. Their real implementations have separate C suites. Physical
@@ -4625,6 +4633,13 @@ static ClusterWalDurablePrefixRef test_checkpoint_prefix_ref;
 static ClusterWalDurablePrefix test_checkpoint_prefix;
 static char test_checkpoint_prefix_path[MAXPGPATH];
 
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	*out = test_checkpoint_prefix_ref;
+	return test_wal_validated;
+}
+
 static void
 v2_checkpoint_prefix_write(void)
 {
@@ -6282,6 +6297,267 @@ UT_TEST(test_v2_stop_phase_uses_selected_raw_anchor_without_closing)
 		UT_ASSERT_EQ(test_actual_cf, NoLock);
 		v2_assert_primary_unchanged(before);
 	}
+}
+
+/* Remove the fixture's deliberately retained recovery obligation, not a
+ * production safety check. Re-encode an independent immutable anchor. */
+static ClusterRecoveryAnchorV2
+v2_stop_clean_anchor(uint8 bytes[66048], const ClusterControlRootIdentity *self)
+{
+	ControlRootImage root;
+	ControlFileData view;
+	ClusterControlRootFileToken token;
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterRecoveryAnchorRefV2 ref = { 0 };
+	uint8 encoded[512];
+	char hex[65], path[MAXPGPATH];
+
+	UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(self, &root, &view, &token), 0);
+	ref.identity = *self;
+	ref.database_incarnation = root.header.v2.database_incarnation;
+	ref.max_config_generation = root.header.v2.config_generation;
+	ref.anchor_generation = root.refs[self->origin_node_id].anchor_generation;
+	memcpy(ref.anchor_sha256, root.refs[self->origin_node_id].anchor_sha256, 32);
+	memcpy(ref.claim_sha256, root.refs[self->origin_node_id].claim_sha256, 32);
+	for (int i = 0; i < 32; ++i)
+		snprintf(hex + i * 2, 3, "%02x", ref.anchor_sha256[i]);
+	snprintf(path, sizeof(path),
+			 "%s/global/anchor_images/thread_%u/generation_" UINT64_FORMAT "/anchor_" UINT64_FORMAT
+			 "-%s.bin",
+			 test_root, self->origin_thread_id, self->origin_owner_incarnation,
+			 ref.anchor_generation, hex);
+	read_all_or_abort(path, encoded, sizeof(encoded));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(encoded, sizeof(encoded), &ref, &anchor), 0);
+	anchor.min_recovery_point = InvalidXLogRecPtr;
+	anchor.min_recovery_tli = 0;
+	v2_anchor_object(bytes, &anchor, self, path);
+	v2_write_roots(bytes);
+	return anchor;
+}
+
+static void
+v2_close_fixture(uint8 before[66048], ClusterPhase1FullStopPlan *plan)
+{
+	ClusterControlRootIdentity self;
+	ClusterControlRootFileToken token;
+	ControlRootImage root;
+	ControlFileData candidate, view;
+	v2_stop_observation_fixture(before, &self, &candidate);
+	v2_stop_clean_anchor(before, &self);
+	UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(&self, &root, &view, &token), 0);
+	root.header.v2.configured[1] = root.header.v2.serving[1] = 0;
+	root.present[127] = false;
+	memset(&root.records[127], 0, sizeof(root.records[127]));
+	memset(&root.refs[127], 0, sizeof(root.refs[127]));
+	root.publisher_incarnation[127] = root.publisher_node[127] = 0;
+	UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+	memcpy(before, root.bytes, sizeof(root.bytes));
+	v2_install_config(before, false);
+	v2_write_roots(before);
+	memset(plan, 0, sizeof(*plan));
+	plan->valid = plan->pre2_root_observed = true;
+	plan->epoch = test_epoch;
+	plan->member_incarnations[0] = self.origin_owner_incarnation;
+	plan->own_wal_started_at = self.thread_claim_created_at;
+	plan->pre2_member_phase[0] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	test_close_owned = true;
+}
+
+static ClusterWalDurablePrefixRef
+v2_close_add_peer(uint8 before[66048], int node, ClusterPhase1FullStopPlan *plan)
+{
+	ClusterWalDurablePrefixRef saved = test_checkpoint_prefix_ref, peer;
+	ClusterRecoveryAnchorV2 anchor = v2_stop_clean_anchor(before, &saved.claim.identity);
+	ControlRootImage root;
+	ControlFileData candidate = { 0 };
+	char saved_path[MAXPGPATH], path[MAXPGPATH];
+
+	strlcpy(saved_path, test_checkpoint_prefix_path, sizeof(saved_path));
+	UT_ASSERT_EQ(cluster_control_root_v2_decode(before, 66048, v2_storage, TEST_SYSID, &root), 0);
+	root.header.v2.configured[0] |= UINT64_C(1) << node;
+	root.header.v2.serving[0] |= UINT64_C(1) << node;
+	root.present[node] = true;
+	root.records[node] = root.records[0];
+	root.refs[node] = root.refs[0];
+	root.records[node].identity.origin_node_id = node;
+	root.records[node].identity.origin_thread_id = node + 1;
+	root.records[node].identity.origin_owner_incarnation += node;
+	root.records[node].identity.thread_claim_created_at += node;
+	root.publisher_node[node] = node;
+	root.publisher_incarnation[node] = root.records[node].identity.origin_owner_incarnation;
+	UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+	memcpy(before, root.bytes, 66048);
+	v2_claim_object(before, node, &root);
+	anchor.identity = root.records[node].identity;
+	memcpy(anchor.claim_sha256, root.refs[node].claim_sha256, 32);
+	v2_anchor_object(before, &anchor, &anchor.identity, path);
+	v2_install_config(before, false);
+	v2_write_roots(before);
+	peer = saved;
+	peer.claim.identity = anchor.identity;
+	memcpy(peer.claim.claim_sha256, anchor.claim_sha256, 32);
+	test_checkpoint_prefix_ref = peer;
+	snprintf(path, sizeof(path), "%s/thread_%u/generation_" UINT64_FORMAT "/durable_prefix",
+			 cluster_wal_threads_dir, peer.claim.identity.origin_thread_id,
+			 peer.claim.identity.origin_owner_incarnation);
+	UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path), "%s/current", path);
+	candidate.state = DB_SHUTDOWNED;
+	candidate.checkPoint = anchor.checkpoint;
+	candidate.checkPointCopy = anchor.checkpoint_copy;
+	v2_checkpoint_wal_record(&peer.claim.identity, &candidate, 0);
+	UT_ASSERT_EQ(cluster_control_root_v2_decode(before, 66048, v2_storage, TEST_SYSID, &root), 0);
+	root.records[node].checkpoint_record_crc32c = test_checkpoint_crc;
+	root.records[node].tail_last_record_crc32c = test_checkpoint_crc;
+	root.records[node].validated_tail_lsn_exclusive = test_checkpoint_end;
+	UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+	memcpy(before, root.bytes, 66048);
+	v2_write_roots(before);
+	plan->member_incarnations[node] = peer.claim.identity.origin_owner_incarnation;
+	plan->pre2_member_phase[node] = CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+	test_checkpoint_prefix_ref = saved;
+	strlcpy(test_checkpoint_prefix_path, saved_path, sizeof(test_checkpoint_prefix_path));
+	return peer;
+}
+
+UT_TEST(test_v2_normal_close_pair_waits_for_last_thread_and_preserves_roster)
+{
+	const int peers[] = { 1, 3 };
+	for (unsigned i = 0; i < lengthof(peers); i++) {
+		uint8 before[66048];
+		ClusterPhase1FullStopPlan plan;
+		ClusterWalDurablePrefixRef peer;
+		ClusterControlRootStopObservation out;
+		bool complete = true;
+		v2_close_fixture(before, &plan);
+		peer = v2_close_add_peer(before, peers[i], &plan);
+		UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &complete), 0);
+		UT_ASSERT(!complete);
+		UT_ASSERT_EQ(cluster_control_root_v2_stop_phase_read(1, plan.member_incarnations[0], &out),
+					 0);
+		UT_ASSERT_EQ(out.members[0].phase, CLUSTER_CONTROL_ROOT_STOP_CLOSED);
+		UT_ASSERT_EQ(out.members[peers[i]].phase, CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT);
+		UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &complete), 0);
+		UT_ASSERT(!complete);
+		cluster_node_id = peers[i];
+		test_own_thread = peers[i] + 1;
+		test_self_incarnation = test_membership_incarnation
+			= peer.claim.identity.origin_owner_incarnation;
+		test_checkpoint_prefix_ref = peer;
+		plan.own_wal_started_at = peer.claim.identity.thread_claim_created_at;
+		UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &complete), 0);
+		UT_ASSERT(complete);
+		UT_ASSERT_EQ(cluster_control_root_v2_stop_phase_read(1, plan.member_incarnations[0], &out),
+					 0);
+		UT_ASSERT_EQ(out.members[0].phase, CLUSTER_CONTROL_ROOT_STOP_CLOSED);
+		UT_ASSERT_EQ(out.members[peers[i]].phase, CLUSTER_CONTROL_ROOT_STOP_CLOSED);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	}
+}
+
+UT_TEST(test_v2_normal_close_publishes_exact_durable_root_not_voting_exit)
+{
+	uint8 before[66048];
+	ClusterPhase1FullStopPlan plan;
+	ClusterControlRootStopObservation selected;
+	bool all_closed = false;
+	int writes;
+	v2_close_fixture(before, &plan);
+	UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &all_closed), 0);
+	UT_ASSERT(all_closed);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT_EQ(cluster_control_root_v2_stop_phase_read(1, plan.member_incarnations[0], &selected),
+				 0);
+	UT_ASSERT_EQ(selected.phase, CLUSTER_CONTROL_ROOT_STOP_CLOSED);
+	UT_ASSERT_EQ(selected.snapshot.root_publish_seq, 12);
+	writes = test_durable_rename_calls;
+	all_closed = false;
+	UT_ASSERT_EQ(cluster_control_root_v2_normal_stop_close(&plan, &all_closed), 0);
+	UT_ASSERT(all_closed);
+	UT_ASSERT_EQ(test_durable_rename_calls, writes);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+}
+
+UT_TEST(test_v2_normal_close_requires_real_controller_and_exact_native_cut)
+{
+	for (int fault = 0; fault < 6; fault++) {
+		uint8 before[66048];
+		ClusterPhase1FullStopPlan plan;
+		bool all_closed = true;
+		v2_close_fixture(before, &plan);
+		if (fault == 0)
+			test_close_owned = false;
+		if (fault == 1)
+			test_insert += 8;
+		if (fault == 2)
+			plan.member_incarnations[0]++;
+		if (fault == 3)
+			plan.member_incarnations[3] = 102;
+		if (fault == 4)
+			plan.epoch++;
+		if (fault == 5)
+			test_fence = false;
+		UT_ASSERT(cluster_control_root_v2_normal_stop_close(&plan, &all_closed) != 0);
+		UT_ASSERT(!all_closed);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+	}
+}
+
+UT_TEST(test_v2_normal_close_never_returns_success_after_uncertain_release)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		uint8 before[66048];
+		ClusterPhase1FullStopPlan plan;
+		bool complete = true;
+		v2_close_fixture(before, &plan);
+		if (fault == 0)
+			test_cf_release_confirmed = false;
+		if (fault == 1)
+			test_walr_end_result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		if (fault == 2)
+			test_projection_sync_fault = test_projection_observe = true;
+		UT_ASSERT(cluster_control_root_v2_normal_stop_close(&plan, &complete) != 0);
+		UT_ASSERT(!complete);
+		test_projection_sync_fault = false;
+		test_projection_observe = false;
+		test_cf_release_confirmed = true;
+		test_walr_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
+	}
+}
+
+UT_TEST(test_v2_stop_phase_accepts_durable_closed_successor_not_active)
+{
+	uint8 before[66048];
+	ClusterControlRootIdentity self;
+	ControlFileData candidate, view;
+	ClusterControlRootStopObservation out;
+	int writes;
+
+	v2_stop_observation_fixture(before, &self, &candidate);
+	v2_stop_clean_anchor(before, &self);
+	/* Selected durable lifecycle changes; the authenticated raw shutdown
+	 * anchor, exact prefix and original serving roster do not. */
+	before[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	v2_checksums(before);
+	v2_write_roots(before);
+	writes = test_durable_rename_calls;
+	UT_ASSERT_EQ(cluster_control_root_v2_stop_phase_read(self.origin_thread_id,
+														 self.origin_owner_incarnation, &out),
+				 0);
+	UT_ASSERT_EQ(out.phase, CLUSTER_CONTROL_ROOT_STOP_CLOSED);
+	UT_ASSERT_EQ(out.members[0].phase, out.phase);
+	UT_ASSERT_EQ(out.members[127].phase, CLUSTER_CONTROL_ROOT_STOP_ACTIVE);
+	UT_ASSERT_EQ(out.snapshot.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+	UT_ASSERT_EQ(test_durable_rename_calls, writes);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	/* The stop consumer must not widen ordinary writer admission. */
+	test_cf_mode = ExclusiveLock;
+	UT_ASSERT(cluster_control_root_v2_read_runtime_local_locked(&view) != 0);
+	test_cf_mode = NoLock;
+	v2_assert_primary_unchanged(before);
 }
 
 UT_TEST(test_v2_stop_phase_refuses_wrong_owner_missing_claim_or_late_prefix)
@@ -9370,6 +9646,11 @@ main(int argc, char **argv)
 	UT_RUN(test_v2_canonical_unconfirmed_release_is_fatal);
 	UT_RUN(test_v2_service_read_waits_for_exact_retirement_before_output);
 	UT_RUN(test_v2_stop_phase_uses_selected_raw_anchor_without_closing);
+	UT_RUN(test_v2_stop_phase_accepts_durable_closed_successor_not_active);
+	UT_RUN(test_v2_normal_close_publishes_exact_durable_root_not_voting_exit);
+	UT_RUN(test_v2_normal_close_requires_real_controller_and_exact_native_cut);
+	UT_RUN(test_v2_normal_close_pair_waits_for_last_thread_and_preserves_roster);
+	UT_RUN(test_v2_normal_close_never_returns_success_after_uncertain_release);
 	UT_RUN(test_v2_stop_phase_refuses_wrong_owner_missing_claim_or_late_prefix);
 	UT_RUN(test_v2_stop_phase_service_release_is_input_kind_and_cut_bound);
 	UT_RUN(test_v2_stop_phase_error_cleans_cf_and_cannot_return_evidence);

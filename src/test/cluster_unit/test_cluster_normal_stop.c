@@ -2042,6 +2042,24 @@ static bool identity_pre2_alternate_pending;
 static bool identity_pre2_enforce_cf_admission;
 static uint8 identity_pre2_phase[4];
 static int identity_pre2_change;
+static bool durable_close_all = true;
+static unsigned durable_close_calls;
+static ClusterControlRootResult durable_close_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+
+/* Root-file/WAL publication is tested by the real root program. This
+ * boundary makes the real controller prove that it waits for that result. */
+ClusterControlRootResult
+cluster_control_root_v2_normal_stop_close(const ClusterPhase1FullStopPlan *plan, bool *all_closed)
+{
+	if (lock_holds != 0 || !AmCheckpointerProcess() || plan == NULL)
+		abort();
+	UT_ASSERT(cluster_normal_stop_durable_close_owned(plan));
+	durable_close_calls++;
+	*all_closed = durable_close_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && durable_close_all;
+	if (durable_close_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		identity_pre2_phase[cluster_node_id] = CLUSTER_CONTROL_ROOT_STOP_CLOSED;
+	return durable_close_result;
+}
 
 /* CF/file/PGWP behavior is exercised by test_cluster_control_root. This
  * explicit boundary drives the real normal-stop consumer across pending,
@@ -4861,7 +4879,7 @@ pre2_declared_to_checkpoint(uint32 members, int self, ClusterPhase1FullStopPlan 
 }
 
 static bool
-pre2_declared_to_release(uint32 members, int self, ClusterPhase1FullStopPlan *plan)
+pre2_declared_to_post_barrier(uint32 members, int self, ClusterPhase1FullStopPlan *plan)
 {
 	if (!pre2_declared_to_checkpoint(members, self, plan))
 		return false;
@@ -4880,9 +4898,62 @@ pre2_declared_to_release(uint32 members, int self, ClusterPhase1FullStopPlan *pl
 		if (peer != self && (members & (UINT32_C(1) << peer)))
 			release_peer_message(peer, CLUSTER_PHASE1_FULL_STOP_WIRE_RELEASE, 3000 + peer);
 	MyAuxProcType = CheckpointerProcess;
+	return true;
+}
+
+static bool
+pre2_declared_to_release(uint32 members, int self, ClusterPhase1FullStopPlan *plan)
+{
+	if (!pre2_declared_to_post_barrier(members, self, plan))
+		return false;
 	UT_ASSERT_EQ(cluster_normal_stop_close_poll(plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
 	return pg_atomic_read_u32(&cl_state->phase1_release_pending) == 1;
+}
+
+UT_TEST(test_pre2_release_waits_for_durable_global_close)
+{
+	ClusterPhase1FullStopPlan plan;
+	if (!pre2_declared_to_post_barrier(3, 0, &plan))
+		return;
+	durable_close_calls = 0;
+	durable_close_all = false;
+	UT_ASSERT(!cluster_normal_stop_durable_close_owned(&plan));
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(durable_close_calls, 1);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 1);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+	UT_ASSERT(!cluster_normal_stop_qvotec_cleared());
+	durable_close_all = true;
+	UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(durable_close_calls, 2);
+	UT_ASSERT(!cluster_normal_stop_durable_close_owned(&plan));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 1);
+	UT_ASSERT(!cluster_normal_stop_protocol_closed());
+	cluster_shared_config = false;
+}
+
+UT_TEST(test_pre2_durable_close_failure_preserves_terminal_gates)
+{
+	const ClusterControlRootResult outcomes[]
+		= { CLUSTER_CONTROL_ROOT_CAS_CONFLICT, CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE,
+			CLUSTER_CONTROL_ROOT_RELEASE_UNCERTAIN, CLUSTER_CONTROL_ROOT_IO_ERROR };
+	for (unsigned i = 0; i < lengthof(outcomes); ++i) {
+		ClusterPhase1FullStopPlan plan;
+		if (!pre2_declared_to_post_barrier(9, 3, &plan))
+			continue;
+		durable_close_result = outcomes[i];
+		UT_ASSERT_EQ(cluster_normal_stop_close_poll(&plan, NULL),
+					 i < 2 ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_state->phase1_release_pending), 0);
+		UT_ASSERT_EQ(pg_atomic_read_u32(&cl_normal_stop->service_seal), 1);
+		UT_ASSERT(!cluster_normal_stop_protocol_closed());
+		UT_ASSERT(!cluster_normal_stop_qvotec_cleared());
+		UT_ASSERT(!cluster_normal_stop_durable_close_owned(&plan));
+		durable_close_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	cluster_shared_config = false;
 }
 
 UT_TEST(test_pre2_declared_pair_full_close_requires_last_real_receipt)
@@ -5120,6 +5191,8 @@ main(void)
 	UT_RUN(test_pre2_release_suffix_keeps_live_identity_and_owner_guards);
 	UT_RUN(test_pre2_stop_identity_uses_declared_members_not_slot_capacity);
 	UT_RUN(test_pre2_declared_pair_full_close_requires_last_real_receipt);
+	UT_RUN(test_pre2_release_waits_for_durable_global_close);
+	UT_RUN(test_pre2_durable_close_failure_preserves_terminal_gates);
 	UT_RUN(test_pre2_pair_release_never_shrinks_or_rebinds_members);
 	UT_RUN(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal);
 	UT_RUN(test_pre2_pair_identity_rejects_root_serving_set_mismatch);

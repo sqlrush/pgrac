@@ -229,6 +229,13 @@ cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expec
 										 ClusterControlRootSnapshot *out,
 										 ClusterControlRootFileToken *out_token);
 
+struct ClusterPhase1FullStopPlan;
+/* Only the actual post-checkpoint normal-stop controller may own this call.
+ * Success includes exact CF/WALR retirement, not merely durable root bytes. */
+extern ClusterControlRootResult
+cluster_control_root_v2_normal_stop_close(const struct ClusterPhase1FullStopPlan *plan,
+										  bool *all_closed);
+
 /* PGRAC: normal-stop observation only, not thread close or PI-retirement
  * permission. Authenticate the raw selected anchor and exact durable prefix
  * under CF-S. LMON/LMS poll the original release; unavailable clears output.
@@ -236,8 +243,18 @@ cluster_control_root_v2_shutdown_observe(const ClusterWalDurablePrefixRef *expec
 typedef enum ClusterControlRootStopPhase {
 	CLUSTER_CONTROL_ROOT_STOP_UNKNOWN = 0,
 	CLUSTER_CONTROL_ROOT_STOP_ACTIVE,
-	CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT
+	CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT,
+	CLUSTER_CONTROL_ROOT_STOP_CLOSED
 } ClusterControlRootStopPhase;
+
+/* A durable close is a successor of the checkpoint observation, never a
+ * new writer grant. Pre-checkpoint consumers still require ACTIVE. */
+static inline bool
+cluster_control_root_stop_after_checkpoint(ClusterControlRootStopPhase phase)
+{
+	return phase == CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT
+		   || phase == CLUSTER_CONTROL_ROOT_STOP_CLOSED;
+}
 
 typedef struct ClusterControlRootStopObservation {
 	ClusterControlRootSnapshot snapshot;

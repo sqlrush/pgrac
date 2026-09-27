@@ -116,6 +116,7 @@ static uint32 cl_normal_stop_service_depth;
 static uint32 cl_normal_stop_service_bit;
 /* Checkpointer-local immutable roster; never recomputed from surviving PIDs. */
 static uint32 cl_normal_stop_expected_services;
+static const ClusterPhase1FullStopPlan *cl_durable_close_owner;
 
 /* LMON owns transport-consumed early requests until the original durable
  * identity reader finishes. No shared layout, new message or authority. */
@@ -406,7 +407,9 @@ cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_
 		}
 		if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-			|| selected.phase != expected_phase
+			|| (expected_phase == CLUSTER_CONTROL_ROOT_STOP_ACTIVE
+					? selected.phase != expected_phase
+					: !cluster_control_root_stop_after_checkpoint(selected.phase))
 			|| selected.snapshot.identity.origin_thread_id != own_thread
 			|| selected.snapshot.identity.origin_node_id != cluster_node_id
 			|| selected.snapshot.identity.origin_owner_incarnation
@@ -436,7 +439,7 @@ cl_full_stop_capture_formation_identity(uint32 expected_wal_state, bool require_
 			if (selected.members[node].incarnation != out->member_incarnations[node]
 				|| selected.members[node].claim_created_at <= 0
 				|| (selected.members[node].phase != CLUSTER_CONTROL_ROOT_STOP_ACTIVE
-					&& selected.members[node].phase != CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT))
+					&& !cluster_control_root_stop_after_checkpoint(selected.members[node].phase)))
 				goto invalid;
 			out->pre2_member_phase[node] = (uint8)selected.members[node].phase;
 		}
@@ -558,7 +561,7 @@ cl_phase1_full_stop_capture_source_phase(const ClusterPhase1FullStopPlan *curren
 		*source_active_out
 			= current->pre2_member_phase[source_node] == CLUSTER_CONTROL_ROOT_STOP_ACTIVE;
 		*source_stopped_out
-			= current->pre2_member_phase[source_node] == CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT;
+			= cluster_control_root_stop_after_checkpoint(current->pre2_member_phase[source_node]);
 		return *source_active_out || *source_stopped_out;
 	}
 	source_thread = cluster_wal_thread_id_for(true, source_node);
@@ -1222,9 +1225,10 @@ cl_normal_stop_identity_recheck(bool post_checkpoint, const ClusterPhase1FullSto
 		goto done;
 	}
 	if (!sample->pre2_root_observed
-		|| sample->pre2_member_phase[cluster_node_id]
-			   != (post_checkpoint ? CLUSTER_CONTROL_ROOT_STOP_CHECKPOINT
-								   : CLUSTER_CONTROL_ROOT_STOP_ACTIVE))
+		|| (post_checkpoint
+				? !cluster_control_root_stop_after_checkpoint(
+					  sample->pre2_member_phase[cluster_node_id])
+				: sample->pre2_member_phase[cluster_node_id] != CLUSTER_CONTROL_ROOT_STOP_ACTIVE))
 		goto done;
 	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
 	open = cl_normal_stop->open_record;
@@ -2511,6 +2515,85 @@ cl_normal_stop_retire_pi(ClusterNormalStopModuleObservation *observation)
 	return result;
 }
 
+/* PGRAC: the publisher cannot borrow a plan or checkpoint as clean-close
+ * authority. This dynamic owner exists only after the real controller's
+ * producer, PI and module cuts, and is cleared even on ERROR. Control
+ * actors may run inside the publication; DATA is already sealed.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan)
+{
+	ClusterPhase1FullStopPlan verified;
+	bool valid;
+	uint32 peers;
+	if (!cluster_shared_config || !IsUnderPostmaster || !AmCheckpointerProcess() || plan == NULL
+		|| cl_durable_close_owner != plan || cl_state == NULL || cl_normal_stop == NULL
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT
+		|| cl_normal_stop_identity_recheck(true, plan, &verified, NULL)
+			   != CLUSTER_NORMAL_STOP_READY)
+		return false;
+	peers = cl_normal_stop_member_mask() & ~(UINT32_C(1) << cluster_node_id);
+	LWLockAcquire(&cl_state->lock, LW_EXCLUSIVE);
+	valid = cl_normal_stop_release_state_locked(plan, cl_normal_stop_expected_services, false)
+			&& cl_state->ack_bitmap[0] == peers
+			&& cl_state->phase1_post_stopped_reply_sent[0] == peers
+			&& cl_state->phase1_post_stopped_reply_pending[0] == 0;
+	LWLockRelease(&cl_state->lock);
+	return valid;
+}
+
+static ClusterNormalStopPollResult
+cl_normal_stop_durable_close(const ClusterPhase1FullStopPlan *plan,
+							 ClusterNormalStopModuleObservation *observation)
+{
+	ClusterControlRootResult published;
+	ClusterPhase1FullStopPlan current;
+	ClusterNormalStopPollResult observed;
+	bool all_closed = false;
+	if (cl_durable_close_owner != NULL) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_STATE);
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	observation->module = "CONTROL_ROOT";
+	observation->reason = "NORMAL_STOP_DURABLE_CLOSE_PENDING";
+	/* The original stack plan may still carry its pre-checkpoint phase.
+	 * Refresh only the selected-root observation; retain its exact attempt,
+	 * deadline and original member binding, never fabricate a successor. */
+	observed = cl_normal_stop_identity_poll(true, &current, NULL);
+	if (observed != CLUSTER_NORMAL_STOP_READY)
+		return observed;
+	if (current.epoch != plan->epoch || current.own_wal_started_at != plan->own_wal_started_at
+		|| memcmp(current.member_incarnations, plan->member_incarnations,
+				  sizeof(current.member_incarnations))
+			   != 0) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_IDENTITY);
+		return CLUSTER_NORMAL_STOP_INVALID;
+	}
+	current.valid = plan->valid;
+	current.attempt_nonce = plan->attempt_nonce;
+	current.absolute_deadline_us = plan->absolute_deadline_us;
+	cl_durable_close_owner = &current;
+	PG_TRY();
+	{
+		published = cluster_control_root_v2_normal_stop_close(&current, &all_closed);
+	}
+	PG_CATCH();
+	{
+		cl_durable_close_owner = NULL;
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cl_durable_close_owner = NULL;
+	if (published == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return all_closed ? CLUSTER_NORMAL_STOP_READY : CLUSTER_NORMAL_STOP_PENDING;
+	if (published == CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+		|| published == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+		return CLUSTER_NORMAL_STOP_PENDING;
+	snprintf(observation->object, sizeof(observation->object), "root_result=%d", (int)published);
+	cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+	return CLUSTER_NORMAL_STOP_INVALID;
+}
+
 ClusterNormalStopPollResult
 cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 							   ClusterNormalStopModuleObservation *observation)
@@ -2561,6 +2644,26 @@ cluster_normal_stop_close_poll(const ClusterPhase1FullStopPlan *plan,
 		result = cluster_normal_stop_modules_poll(true, observation);
 		if (result != CLUSTER_NORMAL_STOP_READY)
 			return result;
+		if (cluster_shared_config) {
+			/* Finish the original post-barrier before changing its selected
+			 * root phase. No peer may seal control while another still needs
+			 * CF-X to publish its exact durable close. */
+			LWLockAcquire(&cl_state->lock, LW_SHARED);
+			idle = cl_state->ack_bitmap[0] == peers
+				   && cl_state->phase1_post_stopped_reply_sent[0] == peers
+				   && cl_state->phase1_post_stopped_reply_pending[0] == 0;
+			LWLockRelease(&cl_state->lock);
+			if (!idle)
+				return CLUSTER_NORMAL_STOP_PENDING;
+			result = cl_normal_stop_durable_close(plan, observation);
+			if (result != CLUSTER_NORMAL_STOP_READY)
+				return result;
+			/* The actual publication's locks must have retired; independently
+			 * recensus its control/transport effects before final RELEASE. */
+			result = cluster_normal_stop_modules_poll(true, observation);
+			if (result != CLUSTER_NORMAL_STOP_READY)
+				return result;
+		}
 	}
 	observation->module = "COORDINATOR";
 	observation->reason = armed ? "NORMAL_STOP_RELEASE_RECEIPT_OR_TRANSPORT_PENDING"
@@ -3236,6 +3339,10 @@ cl_normal_stop_checkpoint_run(ClusterPhase1FullStopPlan *plan,
 			return false;
 		}
 		timeout_ms = (long)Min((deadline - now + UINT64_C(999)) / UINT64_C(1000), (uint64)INT_MAX);
+		/* Root publication by a peer has no normal-stop wire notification.
+		 * Reuse the shutdown observer cadence within the original deadline. */
+		if (cluster_shared_config && step == 2)
+			timeout_ms = Min(timeout_ms, 20L);
 		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, timeout_ms,
 						WAIT_EVENT_RECONFIG_BARRIER_WAIT);
 		CHECK_FOR_INTERRUPTS();
