@@ -126,6 +126,7 @@
 #include "cluster/cluster_mode.h"			/* cluster_peer_mode_enabled */
 #include "cluster/cluster_epoch.h"			/* cluster_epoch_get_current */
 #include "cluster/cluster_guc.h"			/* cluster_enabled / cluster_node_id */
+#include "cluster/cluster_native_startup.h" /* PGRAC: physical origin inspection */
 #include "cluster/cluster_inject.h"			/* PGRAC: spec-7.1 D3-a half-space limit leg */
 #include "cluster/cluster_multixact.h"		/* overlay install + types */
 #include "cluster/cluster_multixact_current.h" /* requester-local proven create cap */
@@ -185,6 +186,13 @@
 #define MULTIXACT_MEMBERGROUPS_PER_PAGE (BLCKSZ / MULTIXACT_MEMBERGROUP_SIZE)
 #define MULTIXACT_MEMBERS_PER_PAGE                                                                 \
 	(MULTIXACT_MEMBERGROUPS_PER_PAGE * MULTIXACT_MEMBERS_PER_MEMBERGROUP)
+
+#ifdef USE_PGRAC_CLUSTER
+StaticAssertDecl(MULTIXACT_OFFSETS_PER_PAGE == CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE,
+				 "native MX offset inspection geometry");
+StaticAssertDecl(MULTIXACT_MEMBERS_PER_PAGE == CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE,
+				 "native MX member inspection geometry");
+#endif
 
 /*
  * Because the number of items per page is not a divisor of the last item

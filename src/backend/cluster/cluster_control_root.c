@@ -2012,8 +2012,9 @@ read_control_version(const uint8 storage_uuid[16], uint64 system_identifier, Con
  * Author: SqlRush <sqlrush@gmail.com>
  */
 static ClusterControlRootResult
-read_thread_version(const ClusterControlRootIdentity *self, ControlRootImage *root,
-					ControlFileData *out, ClusterControlRootFileToken *token, uint16 version)
+read_thread_input(const ClusterControlRootIdentity *self, ControlRootImage *root,
+				  ControlFileData *out, ClusterControlRootFileToken *token, uint16 version,
+				  bool native_input)
 {
 	ControlFileData common;
 	ClusterRecoveryAnchorRefV2 ref;
@@ -2065,7 +2066,8 @@ read_thread_version(const ClusterControlRootIdentity *self, ControlRootImage *ro
 	ref.anchor_generation = root->refs[index].anchor_generation;
 	memcpy(ref.anchor_sha256, root->refs[index].anchor_sha256, 32);
 	memcpy(ref.claim_sha256, root->refs[index].claim_sha256, 32);
-	result = cluster_recovery_anchor_v2_read_locked(&ref, &common, out);
+	result = native_input ? cluster_recovery_anchor_v2_read_native_locked(&ref, &common, out)
+						  : cluster_recovery_anchor_v2_read_locked(&ref, &common, out);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto fail;
 	result = cluster_recovery_anchor_v2_thread_state(&ref, &root->records[index], out);
@@ -2077,6 +2079,13 @@ fail:
 	memset(out, 0, sizeof(*out));
 	memset(token, 0, sizeof(*token));
 	return result;
+}
+
+static ClusterControlRootResult
+read_thread_version(const ClusterControlRootIdentity *self, ControlRootImage *root,
+					ControlFileData *out, ClusterControlRootFileToken *token, uint16 version)
+{
+	return read_thread_input(self, root, out, token, version, false);
 }
 
 ClusterControlRootResult
@@ -4232,8 +4241,8 @@ reserve_clean_input_locked(ReserveCleanWork *work, unsigned node, bool first)
 	CheckpointV2Work *scan = &work->scan;
 	const ClusterControlRootSnapshot *record = &work->base.records[node];
 	ClusterControlRootResult result
-		= read_thread_version(&record->identity, &scan->base, &scan->old_view, &scan->before,
-							  CONTROL_ROOT_HEADER_VERSION_V3);
+		= read_thread_input(&record->identity, &scan->base, &scan->old_view, &scan->before,
+							CONTROL_ROOT_HEADER_VERSION_V3, true);
 
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
@@ -6125,6 +6134,7 @@ failure_v2_cleanup(FailureInputV2Work *work, ClusterControlRootResult result)
  * Author: SqlRush <sqlrush@gmail.com> */
 typedef struct InitializerObserveWork {
 	ControlRootImage root;
+	ControlRootImage native_root;
 	ClusterControlRecoverySubject subject;
 	ClusterWalInitializerInput input;
 	bool cf_held;
@@ -6191,10 +6201,9 @@ initializer_observe_locked(ClusterRecoverySerialGuard *serial, ClusterWalRetenti
 												  : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
 
-ClusterControlRootResult
-cluster_control_root_v3_initializer_observe(ClusterRecoverySerialGuard *serial,
-											ClusterWalRetentionPin *pin,
-											ClusterWalInitializerInput *out)
+static ClusterControlRootResult
+initializer_inspect(ClusterRecoverySerialGuard *serial, ClusterWalRetentionPin *pin,
+					ClusterWalInitializerInput *out, bool native_census)
 {
 	InitializerObserveWork *work;
 	ClusterWalDurablePrefixRef ref = { 0 };
@@ -6244,6 +6253,36 @@ cluster_control_root_v3_initializer_observe(ClusterRecoverySerialGuard *serial,
 					= cluster_wal_startup_observe(cluster_wal_threads_dir, &ref, op->segment_size,
 												  op->first_segment_lsn, &work->input.observation);
 		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && native_census
+			&& work->input.observation.checkpoint_records == 0
+			&& work->input.observation.unsupported_records == 0) {
+			ClusterControlRootFileToken file;
+			ControlFileData *native = &work->input.native_input;
+			result = initializer_observe_locked(serial, pin, work);
+			if (result == 0)
+				result = read_thread_input(&work->input.startup.predecessor.snapshot.identity,
+										   &work->native_root, native, &file, 3, true);
+			if (result == 0
+				&& (memcmp(work->native_root.bytes, work->root.bytes,
+						   CLUSTER_CONTROL_ROOT_FILE_BYTES)
+						!= 0
+					|| native->state != DB_SHUTDOWNED || native->minRecoveryPoint != 0
+					|| native->backupStartPoint != 0 || native->backupEndPoint != 0
+					|| native->backupEndRequired))
+				result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			if (work->cf_held) {
+				work->cf_held = false;
+				result = release_cf(ShareLock, result);
+			}
+			if (result == 0 && !initializer_owner_current(serial, pin))
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			if (result == 0)
+				result = cluster_control_native_side_observe(cluster_shared_data_dir,
+															 serial->duty.origin_node_id, native,
+															 &work->input.native);
+			if (result == 0)
+				work->input.native_observed = true;
+		}
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			result = initializer_observe_locked(serial, pin, work);
 		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
@@ -6274,6 +6313,22 @@ cluster_control_root_v3_initializer_observe(ClusterRecoverySerialGuard *serial,
 		*out = work->input;
 	pfree(work);
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_initializer_observe(ClusterRecoverySerialGuard *serial,
+											ClusterWalRetentionPin *pin,
+											ClusterWalInitializerInput *out)
+{
+	return initializer_inspect(serial, pin, out, false);
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_initializer_inspect(ClusterRecoverySerialGuard *serial,
+											ClusterWalRetentionPin *pin,
+											ClusterWalInitializerInput *out)
+{
+	return initializer_inspect(serial, pin, out, true);
 }
 
 static bool

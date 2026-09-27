@@ -102,6 +102,13 @@ extern ClusterControlRootResult
 cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 									   const ControlFileData *common, ControlFileData *out);
 
+/* Same immutable object and CF ownership, but the full checkpoint is the
+ * origin's original WAL input, not the common allocator/horizon projection.
+ * Only physical verification/native-input consumers may use this view. */
+extern ClusterControlRootResult
+cluster_recovery_anchor_v2_read_native_locked(const ClusterRecoveryAnchorRefV2 *ref,
+											  const ControlFileData *common, ControlFileData *out);
+
 extern ClusterControlRootResult
 cluster_recovery_anchor_v2_prepare(const ClusterRecoveryAnchorV2 *anchor,
 								   const uint8 operation_uuid[16],

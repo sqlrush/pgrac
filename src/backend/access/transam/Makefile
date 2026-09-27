@@ -46,3 +46,8 @@ xlog.o: xlog.c $(top_srcdir)/src/include/catalog/catversion.h
 # PGRAC: native cold recovery owns value-sized IR guards. Rebuild on carrier
 # changes even when autodepend is disabled. Author: SqlRush <sqlrush@gmail.com>
 xlog.o: $(top_srcdir)/src/include/cluster/cluster_ir.h
+
+# PGRAC: keep native predicates and physical origin inspection identical.
+# Author: SqlRush <sqlrush@gmail.com>
+clog.o subtrans.o multixact.o commit_ts.o: \
+	$(top_srcdir)/src/include/cluster/cluster_native_startup.h

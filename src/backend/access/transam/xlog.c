@@ -4592,6 +4592,7 @@ ValidateXLOGDirectoryStructure(void)
 {
 	char		path[MAXPGPATH];
 	struct stat stat_buf;
+	int status;
 
 	/* Check for pg_wal; if it doesn't exist, error out */
 	if (stat(XLOGDIR, &stat_buf) != 0 ||
@@ -4602,16 +4603,27 @@ ValidateXLOGDirectoryStructure(void)
 
 	/* Check for archive_status */
 	snprintf(path, MAXPGPATH, XLOGDIR "/archive_status");
-	if (stat(path, &stat_buf) == 0)
-	{
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: pg_wal still names the sealed predecessor at this point.
+	 * Missing or redirected children are not authority to repair that input.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config)
+		status = lstat(path, &stat_buf);
+	else
+#endif
+		status = stat(path, &stat_buf);
+	if (status == 0) {
 		/* Check for weird cases where it exists but isn't a directory */
 		if (!S_ISDIR(stat_buf.st_mode))
 			ereport(FATAL,
 					(errmsg("required WAL directory \"%s\" does not exist",
 							path)));
-	}
-	else
-	{
+	} else {
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_shared_config)
+			ereport(FATAL,
+					(errmsg("sealed WAL input directory \"%s\" is missing or unreadable", path)));
+#endif
 		ereport(LOG,
 				(errmsg("creating missing WAL directory \"%s\"", path)));
 		if (MakePGDirectory(path) < 0)

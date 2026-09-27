@@ -14,7 +14,12 @@
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_wal_tail.h"
+#include "cluster/cluster_native_startup.h"
+#include "cluster/cluster_xid_authority.h"
+#include "access/multixact.h"
+#include "access/slru.h"
 #include "common/cryptohash.h"
+#include "miscadmin.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
@@ -552,6 +557,288 @@ read_same_dir(int parent, const char *name, int fd)
 			   ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			   : CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 }
+
+/* No backend ERROR-capable operation while a raw descriptor is owned. The
+ * caller's exact isolation is still required: two matching reads alone are
+ * not permission to race a writer or publish a recovery terminal. */
+static ClusterControlRootResult
+read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
+				 pg_cryptohash_ctx *hash, uint32 *reads)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	char name[16];
+	uint8 again[BLCKSZ], tag[8];
+	struct stat before, after, named;
+	off_t offset = (off_t)(page_no % SLRU_PAGES_PER_SEGMENT) * BLCKSZ;
+	int fd;
+
+	snprintf(name, sizeof(name), "%04X", page_no / SLRU_PAGES_PER_SEGMENT);
+	fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	if (fd < 0)
+		return read_error();
+	if (fstat(fd, &before) != 0 || !read_owned(&before, false) || before.st_nlink != 1)
+		goto done;
+	if (before.st_size < offset + BLCKSZ || before.st_size % BLCKSZ != 0
+		|| before.st_size > (off_t)SLRU_PAGES_PER_SEGMENT * BLCKSZ) {
+		result = CLUSTER_CONTROL_ROOT_BAD_SIZE;
+		goto done;
+	}
+	for (unsigned pass = 0; pass < 2; ++pass) {
+		size_t used = 0;
+		uint8 *bytes = pass == 0 ? page : again;
+		while (used < BLCKSZ) {
+			ssize_t n = pread(fd, bytes + used, BLCKSZ - used, offset + used);
+			if (n < 0 && errno == EINTR && !InterruptPending)
+				continue;
+			if (n <= 0)
+				goto done;
+			used += n;
+		}
+	}
+	if (fstat(fd, &after) != 0 || fstatat(dir, name, &named, AT_SYMLINK_NOFOLLOW) != 0)
+		goto done;
+	if (!read_owned(&after, false) || !read_owned(&named, false) || before.st_dev != after.st_dev
+		|| before.st_ino != after.st_ino || before.st_dev != named.st_dev
+		|| before.st_ino != named.st_ino || before.st_size != after.st_size
+		|| before.st_size != named.st_size || after.st_nlink != 1 || named.st_nlink != 1
+		|| memcmp(page, again, BLCKSZ) != 0) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	for (unsigned i = 0; i < 4; ++i) {
+		tag[i] = family >> (8 * i);
+		tag[i + 4] = page_no >> (8 * i);
+	}
+	if (pg_cryptohash_update(hash, tag, sizeof(tag)) < 0
+		|| pg_cryptohash_update(hash, page, BLCKSZ) < 0)
+		goto done;
+	(*reads)++;
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	read_close(fd, &result);
+	return result;
+}
+
+static ClusterControlRootResult
+read_native_horizon(int root, const ControlFileData *input, ControlFileData *effective,
+					pg_cryptohash_ctx *hash)
+{
+	uint8 bytes[sizeof(ClusterXidAuthorityHeader) + 1];
+	uint8 again[sizeof(bytes)];
+	ClusterXidAuthorityHeader auth;
+	ClusterControlRootResult result;
+	struct stat before, after;
+	size_t length;
+	int global = -1;
+
+	/* PRE2 bootstrap requires shared_catalog. Repeat StartupXLOG's sealed
+	 * native high-water merge using the actual primary, never the recoverer's
+	 * local cursor or a lower .bak. No new allocator/authority is introduced. */
+	if (!TransactionIdIsNormal(XidFromFullTransactionId(input->checkPointCopy.nextXid)))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	result = read_dir(root, "global", &global);
+	if (result == 0 && fstatat(global, "pgrac_xid_authority", &before, AT_SYMLINK_NOFOLLOW) != 0)
+		result = read_error();
+	if (result == 0 && (!read_owned(&before, false) || before.st_nlink != 1))
+		result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (result == 0)
+		result
+			= read_bytes(global, "pgrac_xid_authority", sizeof(auth), sizeof(auth), bytes, &length);
+	if (result == 0)
+		result
+			= read_bytes(global, "pgrac_xid_authority", sizeof(auth), sizeof(auth), again, &length);
+	if (result == 0
+		&& (memcmp(bytes, again, sizeof(auth)) != 0
+			|| cluster_xid_authority_classify((const char *)bytes, sizeof(auth))
+				   != CLUSTER_XID_AUTHORITY_VALID))
+		result = CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+	if (result == 0 && fstatat(global, "pgrac_xid_authority", &after, AT_SYMLINK_NOFOLLOW) != 0)
+		result = read_error();
+	if (result == 0
+		&& (!read_owned(&after, false) || after.st_nlink != 1 || before.st_dev != after.st_dev
+			|| before.st_ino != after.st_ino || before.st_size != after.st_size))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (result == 0) {
+		memcpy(&auth, bytes, sizeof(auth));
+		if (auth.version != CLUSTER_XID_AUTHORITY_VERSION || auth.reserved != 0
+			|| (auth.flags & CLUSTER_XID_AUTHORITY_FLAG_SEALED) == 0
+			|| !TransactionIdIsNormal((TransactionId)auth.native_hw_full))
+			result = CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	}
+	if (result == 0)
+		result = read_same_dir(root, "global", global);
+	if (result == 0 && pg_cryptohash_update(hash, bytes, sizeof(auth)) < 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	read_close(global, &result);
+	if (result == 0) {
+		*effective = *input;
+		if (U64FromFullTransactionId(effective->checkPointCopy.nextXid) < auth.native_hw_full)
+			effective->checkPointCopy.nextXid = FullTransactionIdFromU64(auth.native_hw_full);
+	}
+	return result;
+}
+
+static ClusterControlRootResult
+read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptohash_ctx *hash,
+					uint32 *reads)
+{
+	const CheckPoint *cp = &input->checkPointCopy;
+	TransactionId next = XidFromFullTransactionId(cp->nextXid);
+	MultiXactId sentinel = cp->nextMulti < FirstMultiXactId ? FirstMultiXactId : cp->nextMulti;
+	uint32 expected = cp->nextMultiOffset, observed, oldest;
+	uint8 page[BLCKSZ];
+	ClusterControlRootResult result;
+
+	if (!TransactionIdIsNormal(next) || !MultiXactIdIsValid(cp->oldestMulti))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (next % CLUSTER_NATIVE_CLOG_PER_PAGE != 0) {
+		result
+			= read_native_page(dirs[3], 1, next / CLUSTER_NATIVE_CLOG_PER_PAGE, page, hash, reads);
+		if (result != 0)
+			return result;
+		if (!cluster_native_clog_suffix_unused((const char *)page, next))
+			return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+	}
+	if (next % CLUSTER_NATIVE_SUBTRANS_PER_PAGE != 0) {
+		result = read_native_page(dirs[4], 2, next / CLUSTER_NATIVE_SUBTRANS_PER_PAGE, page, hash,
+								  reads);
+		if (result != 0)
+			return result;
+		if (!cluster_native_subtrans_suffix_unused((const char *)page, next))
+			return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+	}
+	result = read_native_page(dirs[7], 3, sentinel / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE, page, hash,
+							  reads);
+	if (result != 0)
+		return result;
+	memcpy(&observed, page + (sentinel % CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE) * sizeof(uint32),
+		   sizeof(observed));
+	if (expected == 0 && cp->nextMulti != FirstMultiXactId)
+		expected = 1;
+	if (observed != expected)
+		return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+	if (cp->oldestMulti != cp->nextMulti) {
+		result = read_native_page(dirs[7], 3, cp->oldestMulti / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE,
+								  page, hash, reads);
+		if (result != 0)
+			return result;
+		memcpy(&oldest,
+			   page + (cp->oldestMulti % CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE) * sizeof(uint32),
+			   sizeof(oldest));
+		if (oldest == 0)
+			return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
+		result = read_native_page(dirs[8], 4, oldest / CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE, page,
+								  hash, reads);
+		if (result != 0)
+			return result;
+		result = read_native_page(
+			dirs[8], 4, (uint32)(cp->nextMultiOffset - 1) / CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE,
+			page, hash, reads);
+		if (result != 0)
+			return result;
+	}
+	/* Native activation requires the partial next page; disabling must not
+	 * erase existing retained timestamp ranges. At a boundary we do not
+	 * create or infer the contents of the as-yet unallocated next page. */
+	if (input->track_commit_timestamp && next % CLUSTER_NATIVE_COMMIT_TS_PER_PAGE != 0) {
+		result = read_native_page(dirs[6], 5, next / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page, hash,
+								  reads);
+		if (result != 0)
+			return result;
+	}
+	if (TransactionIdIsValid(cp->oldestCommitTsXid) != TransactionIdIsValid(cp->newestCommitTsXid))
+		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+	if (TransactionIdIsValid(cp->oldestCommitTsXid)) {
+		if (!TransactionIdIsNormal(cp->oldestCommitTsXid)
+			|| !TransactionIdIsNormal(cp->newestCommitTsXid)
+			|| NormalTransactionIdPrecedes(cp->newestCommitTsXid, cp->oldestCommitTsXid))
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		result = read_native_page(dirs[6], 5,
+								  cp->oldestCommitTsXid / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page,
+								  hash, reads);
+		if (result != 0)
+			return result;
+		result = read_native_page(dirs[6], 5,
+								  cp->newestCommitTsXid / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page,
+								  hash, reads);
+		if (result != 0)
+			return result;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+#endif
+
+ClusterControlRootResult
+cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
+									const ControlFileData *input, ClusterNativeSideObservation *out)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
+	static const char *const families[]
+		= { "pg_xact", "pg_subtrans", "pg_multixact", "pg_commit_ts", "offsets", "members" };
+	static const unsigned parents[] = { 2, 2, 2, 2, 5, 5 };
+	int dirs[9] = { -1, -1, -1, -1, -1, -1, -1, -1, -1 };
+	ClusterNativeSideObservation observed = { 0 };
+	ControlFileData effective;
+	pg_cryptohash_ctx *hash;
+	char origin[32];
+
+	if (out == NULL)
+		return result;
+	if (input != NULL && (uintptr_t)out < (uintptr_t)input + sizeof(*input)
+		&& (uintptr_t)input < (uintptr_t)out + sizeof(*out))
+		return result;
+	memset(out, 0, sizeof(*out));
+	if (input == NULL || !read_path_valid(shared_root, NULL)
+		|| node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
+		return result;
+	hash = pg_cryptohash_create(PG_SHA256);
+	if (hash == NULL)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (pg_cryptohash_init(hash) < 0) {
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		goto done;
+	}
+	snprintf(origin, sizeof(origin), "origin_%u", node_id);
+	result = read_dir(-1, shared_root, &dirs[0]);
+	if (result == 0)
+		result = read_dir(dirs[0], "native_side", &dirs[1]);
+	if (result == 0)
+		result = read_dir(dirs[1], origin, &dirs[2]);
+	for (unsigned i = 0; result == 0 && i < lengthof(families); ++i)
+		result = read_dir(dirs[parents[i]], families[i], &dirs[3 + i]);
+	if (result == 0)
+		result = read_native_horizon(dirs[0], input, &effective, hash);
+	if (result == 0) {
+		observed.effective_next_xid = U64FromFullTransactionId(effective.checkPointCopy.nextXid);
+		result = read_native_cursors(dirs, &effective, hash, &observed.page_reads);
+	}
+	if (result == 0)
+		result = read_same_dir(AT_FDCWD, shared_root, dirs[0]);
+	if (result == 0)
+		result = read_same_dir(dirs[0], "native_side", dirs[1]);
+	if (result == 0)
+		result = read_same_dir(dirs[1], origin, dirs[2]);
+	for (unsigned i = 0; result == 0 && i < lengthof(families); ++i)
+		result = read_same_dir(dirs[parents[i]], families[i], dirs[3 + i]);
+	if (result == 0 && pg_cryptohash_final(hash, observed.sha256, sizeof(observed.sha256)) < 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+done:
+	for (unsigned i = 0; i < lengthof(dirs); ++i)
+		read_close(dirs[i], &result);
+	pg_cryptohash_free(hash);
+	if (result == 0)
+		*out = observed;
+#else
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+#endif
+	return result;
+}
+
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
 
 static ClusterControlRootResult
 read_binding(const char *pgdata, PgracControlBinding *binding, uint8 bytes[256])

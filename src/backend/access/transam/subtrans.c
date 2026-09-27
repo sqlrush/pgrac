@@ -31,6 +31,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_native_startup.h"
+#endif
 
 #include "access/slru.h"
 #include "access/subtrans.h"
@@ -59,6 +62,11 @@
 
 /* We need four bytes per xact */
 #define SUBTRANS_XACTS_PER_PAGE (BLCKSZ / sizeof(TransactionId))
+
+#ifdef USE_PGRAC_CLUSTER
+StaticAssertDecl(SUBTRANS_XACTS_PER_PAGE == CLUSTER_NATIVE_SUBTRANS_PER_PAGE,
+				 "native SUBTRANS inspection geometry");
+#endif
 
 #define TransactionIdToPage(xid) ((xid) / (TransactionId) SUBTRANS_XACTS_PER_PAGE)
 #define TransactionIdToEntry(xid) ((xid) % (TransactionId) SUBTRANS_XACTS_PER_PAGE)
@@ -284,16 +292,12 @@ StartupSUBTRANS(TransactionId oldestActiveXID)
 		SubTransCtl->shared->latest_page_number = endPage;
 		if (TransactionIdToEntry(next) != 0) {
 			int slotno = SimpleLruReadPage(SubTransCtl, endPage, false, next);
-			const TransactionId *parents
-				= (const TransactionId *)SubTransCtl->shared->page_buffer[slotno];
-
-			for (unsigned i = TransactionIdToEntry(next); i < SUBTRANS_XACTS_PER_PAGE; ++i)
-				if (TransactionIdIsValid(parents[i])) {
-					LWLockRelease(SubtransSLRULock);
-					ereport(FATAL,
-							(errcode(ERRCODE_DATA_CORRUPTED),
-							 errmsg("shared SUBTRANS startup has parentage beyond nextXid")));
-				}
+			if (!cluster_native_subtrans_suffix_unused(SubTransCtl->shared->page_buffer[slotno],
+													   next)) {
+				LWLockRelease(SubtransSLRULock);
+				ereport(FATAL, (errcode(ERRCODE_DATA_CORRUPTED),
+								errmsg("shared SUBTRANS startup has parentage beyond nextXid")));
+			}
 		}
 		/* At a page boundary the allocator will perform the first allocation.
 		 * Startup does not create or overwrite even an existing boundary page. */

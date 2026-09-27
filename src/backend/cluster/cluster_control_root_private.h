@@ -13,6 +13,7 @@
 #include "cluster/cluster_wal_durable_prefix.h"
 #include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_startup_exit.h"
+#include "cluster_control_bootstrap_private.h"
 
 /* PGRAC: backend-private decoded carrier, never a disk struct or permission.
  * Keep the public identity/snapshot/token ABI unchanged.  Both v1 and v2
@@ -234,12 +235,24 @@ typedef struct ClusterWalOriginInputs {
 typedef struct ClusterWalInitializerInput {
 	ClusterWalStartupImage startup;
 	ClusterWalStartupObservation observation;
+	/* Filled only by inspect, only on the checkpoint-less supported branch.
+	 * These are observations, not a durability/admission certificate. */
+	ControlFileData native_input;
+	ClusterNativeSideObservation native;
+	bool native_observed;
 } ClusterWalInitializerInput;
 
 struct ClusterRecoverySerialGuard;
 struct ClusterWalRetentionPin;
 extern ClusterControlRootResult
 cluster_control_root_v3_initializer_observe(struct ClusterRecoverySerialGuard *serial,
+											struct ClusterWalRetentionPin *pin,
+											ClusterWalInitializerInput *out);
+/* Same exact owners, adding actual predecessor/native-side census when no
+ * checkpoint exists. Checkpoint-present inputs still require ordinary replay.
+ * Neither this read nor an EMPTY observation authorizes terminal publication. */
+extern ClusterControlRootResult
+cluster_control_root_v3_initializer_inspect(struct ClusterRecoverySerialGuard *serial,
 											struct ClusterWalRetentionPin *pin,
 											ClusterWalInitializerInput *out);
 

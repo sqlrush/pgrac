@@ -120,6 +120,21 @@ cluster_control_bootstrap_wal_startup_route(const char *pgdata, const char *wal_
 extern ClusterControlRootResult
 cluster_control_bootstrap_side_route(const char *pgdata, const char *shared_root, uint32 node_id);
 
+/* PGRAC: actual failed-origin native startup page census, read-only. This is
+ * not a durability, isolation or terminal proof. The qualified recovery owner
+ * must bind the input to the selected anchor and revalidate its root/IR/WALR.
+ * No recoverer-local SLRU state, missing-page fabrication or file mutation.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ClusterNativeSideObservation {
+	uint8 sha256[32];
+	uint64 effective_next_xid;
+	uint32 page_reads;
+} ClusterNativeSideObservation;
+extern ClusterControlRootResult
+cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
+									const ControlFileData *input,
+									ClusterNativeSideObservation *out);
+
 /* Read-only rejection of native startup inputs whose recovery/cleanup is not
  * supported in this mode. Never removes backup, replication or prepared state.
  * Successful observation is not a clean-state or mutation permission. */

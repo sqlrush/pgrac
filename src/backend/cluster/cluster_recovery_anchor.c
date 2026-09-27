@@ -645,9 +645,9 @@ done:
 	return result;
 }
 
-ClusterControlRootResult
-cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
-									   const ControlFileData *common, ControlFileData *out)
+static ClusterControlRootResult
+anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref, const ControlFileData *common,
+					  ControlFileData *out, bool native_input)
 {
 	ClusterControlRootResult result;
 	AnchorV2Dirs dirs;
@@ -670,7 +670,37 @@ cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
 	/* Crypto allocation happens only after all raw descriptors are closed. */
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		result = cluster_recovery_anchor_v2_project(bytes, sizeof(bytes), ref, common, out);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && native_input) {
+		ClusterRecoveryAnchorV2 anchor;
+		result = cluster_recovery_anchor_v2_decode(bytes, sizeof(bytes), ref, &anchor);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			/* The runtime/common projection intentionally keeps aggregated
+			 * counters. It is not the bytes of this origin's WAL checkpoint. */
+			out->checkPointCopy = anchor.checkpoint_copy;
+			INIT_CRC32C(out->crc);
+			COMP_CRC32C(out->crc, out, offsetof(ControlFileData, crc));
+			FIN_CRC32C(out->crc);
+		} else
+			memset(out, 0, sizeof(*out));
+	}
 	return result;
+}
+
+ClusterControlRootResult
+cluster_recovery_anchor_v2_read_locked(const ClusterRecoveryAnchorRefV2 *ref,
+									   const ControlFileData *common, ControlFileData *out)
+{
+	return anchor_v2_read_locked(ref, common, out, false);
+}
+
+/* PGRAC: physical input verification uses the selected origin checkpoint,
+ * never a common allocator projection. No startup/replay grant is implied.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_recovery_anchor_v2_read_native_locked(const ClusterRecoveryAnchorRefV2 *ref,
+											  const ControlFileData *common, ControlFileData *out)
+{
+	return anchor_v2_read_locked(ref, common, out, true);
 }
 
 /* PGRAC: owned no-clobber immutable installation. Installation and root CAS

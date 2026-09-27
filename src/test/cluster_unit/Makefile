@@ -753,6 +753,11 @@ test_cluster_startup_early_native.inc: $(top_srcdir)/src/backend/access/transam/
 	     /^}/ { owner=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_startup_directory_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^ValidateXLOGDirectoryStructure\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_startup_insert_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^StartupXLOG\(/ { owner=1 } owner && /Insert = &XLogCtl->Insert;/ { emit=1; count++ } \
 	     emit { print; if (/XLogCtl->LogwrtRqst.Flush = EndOfLog;/) emit=0 } /^}/ { owner=0 } \
@@ -787,7 +792,7 @@ test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/tra
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
+test_cluster_checkpoint_native: test_cluster_checkpoint_native.c test_cluster_checkpoint_native.inc test_cluster_startup_writer_native.inc test_cluster_startup_early_native.inc test_cluster_startup_directory_native.inc test_cluster_startup_insert_native.inc test_cluster_startup_lsn_native.inc test_cluster_startup_reserve_native.inc test_cluster_checkpoint_candidate.inc test_cluster_checkpoint_shutdown_begin.inc unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 
 # PGRAC: actual checkpoint scan, pin/refusal consumer and IO-completion bodies.
@@ -1494,7 +1499,15 @@ test_cluster_control_root_worker.inc: $(top_srcdir)/src/backend/cluster/cluster_
 		$(top_srcdir)/src/backend/cluster/cluster_thread_recovery_worker.c > $@.tmp
 	mv $@.tmp $@
 
+# PGRAC: use the real native authority classifier without linking its unrelated
+# writer paths into this raw-file collector test. Author: SqlRush <sqlrush@gmail.com>
+test_cluster_control_native_xid.inc: $(top_srcdir)/src/backend/cluster/cluster_xid_authority.c $(srcdir)/Makefile
+	awk '/^cluster_xid_authority_classify\(/ { print "ClusterXidAuthorityValidity"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_control_root: test_cluster_control_root.c unit_test.h test_cluster_control_root_worker.inc \
+		test_cluster_control_native_xid.inc \
 		$(CLUSTER_CONTROL_ROOT_O) $(CLUSTER_CF_AUTHORITY_O) $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/backend/cluster/cluster_wal_history.o \
 		$(top_builddir)/src/backend/cluster/cluster_control_bootstrap.o \
@@ -1522,7 +1535,8 @@ cluster_control_bootstrap_read_test.o: cluster_control_bootstrap_read_test.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_read.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_bootstrap_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
-		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h
+		$(top_srcdir)/src/include/cluster/cluster_wal_tail.h \
+		$(top_srcdir)/src/include/cluster/cluster_native_startup.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 xlogreader_fs.o: $(top_srcdir)/src/backend/access/transam/xlogreader.c
@@ -2285,6 +2299,11 @@ test_cluster_xlog_insert_end: test_cluster_xlog_insert_end.c unit_test.h \
 		-DBUFMGR_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/storage/buffer/bufmgr.c"' \
 		$< $(CLUSTER_XLOG_INSERT_END_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(PTHREAD_LIBS) -o $@
+
+# PGRAC: shared predicates also change the native-body test binaries.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_clog_startup test_cluster_subtrans_startup test_cluster_multixact_startup \
+test_cluster_commit_ts_startup: $(top_srcdir)/src/include/cluster/cluster_native_startup.h
 
 # PGRAC: actual native startup body; SLRU/locks are explicit test boundaries.
 # Author: SqlRush <sqlrush@gmail.com>

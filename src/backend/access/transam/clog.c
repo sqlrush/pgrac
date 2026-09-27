@@ -49,6 +49,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_native_startup.h"
 #endif
 
 /*
@@ -68,6 +69,11 @@
 #define CLOG_XACTS_PER_BYTE 4
 #define CLOG_XACTS_PER_PAGE (BLCKSZ * CLOG_XACTS_PER_BYTE)
 #define CLOG_XACT_BITMASK	((1 << CLOG_BITS_PER_XACT) - 1)
+
+#ifdef USE_PGRAC_CLUSTER
+StaticAssertDecl(CLOG_XACTS_PER_PAGE == CLUSTER_NATIVE_CLOG_PER_PAGE,
+				 "native CLOG inspection geometry");
+#endif
 
 #define TransactionIdToPage(xid)	((xid) / (TransactionId) CLOG_XACTS_PER_PAGE)
 #define TransactionIdToPgIndex(xid) ((xid) % (TransactionId) CLOG_XACTS_PER_PAGE)
@@ -869,10 +875,8 @@ TrimCLOG(void)
 
 #ifdef USE_PGRAC_CLUSTER
 		if (cluster_shared_config) {
-			bool unused = ((unsigned char)*byteptr & ~((1 << bshift) - 1)) == 0;
-
-			for (int i = 1; unused && i < BLCKSZ - byteno; i++)
-				unused = byteptr[i] == 0;
+			bool unused
+				= cluster_native_clog_suffix_unused(XactCtl->shared->page_buffer[slotno], xid);
 			LWLockRelease(XactSLRULock);
 			if (!unused)
 				ereport(FATAL,

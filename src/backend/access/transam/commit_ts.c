@@ -30,6 +30,7 @@
 #include "catalog/pg_type.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_guc.h" /* PGRAC: retained per-origin startup state */
+#include "cluster/cluster_native_startup.h"
 #endif
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -67,6 +68,11 @@ typedef struct CommitTimestampEntry
 
 #define COMMIT_TS_XACTS_PER_PAGE \
 	(BLCKSZ / SizeOfCommitTimestampEntry)
+
+#ifdef USE_PGRAC_CLUSTER
+StaticAssertDecl(COMMIT_TS_XACTS_PER_PAGE == CLUSTER_NATIVE_COMMIT_TS_PER_PAGE,
+				 "native commit timestamp inspection geometry");
+#endif
 
 #define TransactionIdToCTsPage(xid) \
 	((xid) / (TransactionId) COMMIT_TS_XACTS_PER_PAGE)

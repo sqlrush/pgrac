@@ -3,7 +3,11 @@
  * test_cluster_control_root. Only runtime/lock/root-return facts are replaced. */
 #include "postgres.h"
 #include <time.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include "access/xlog.h"
+#include "access/xlog_internal.h"
 #include "access/xlogrecovery.h"
 #include "catalog/pg_control.h"
 #include "cluster/cluster_cf_authority.h"
@@ -20,6 +24,7 @@
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "storage/latch.h"
+#include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
 #include "port/pg_crc32c.h"
@@ -878,6 +883,66 @@ startup_first_native_site(void)
 	return true;
 }
 
+/* PGRAC: actual directory validator on real scratch files, not a mocked
+ * existence result. Only the ordinary mkdir wrapper is replaced.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static unsigned directory_creates;
+int
+MakePGDirectory(const char *path)
+{
+	directory_creates++;
+	return mkdir(path, 0700);
+}
+#define ValidateXLOGDirectoryStructure ActualValidateXLOGDirectoryStructure
+#include "test_cluster_startup_directory_native.inc"
+#undef ValidateXLOGDirectoryStructure
+
+static bool
+validate_native_directory(void)
+{
+	if (sigsetjmp(error_boundary, 1))
+		return false;
+	ActualValidateXLOGDirectoryStructure();
+	return true;
+}
+
+UT_TEST(shared_startup_never_repairs_immutable_input_directory)
+{
+	char scratch[] = "/tmp/pgrac-native-dir-XXXXXX";
+	int saved = open(".", O_RDONLY);
+	struct stat st;
+
+	UT_ASSERT(saved >= 0 && mkdtemp(scratch) != NULL);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(chdir(scratch), 0);
+	UT_ASSERT_EQ(mkdir("pg_wal", 0700), 0);
+	reset_fixture();
+	directory_creates = 0;
+	UT_ASSERT(!validate_native_directory());
+	UT_ASSERT_EQ(directory_creates, 0);
+	UT_ASSERT(stat("pg_wal/archive_status", &st) != 0 && errno == ENOENT);
+	/* Cleanup also accepts the old implementation's demonstrated mutation. */
+	if (stat("pg_wal/archive_status", &st) == 0)
+		UT_ASSERT_EQ(rmdir("pg_wal/archive_status"), 0);
+	UT_ASSERT_EQ(mkdir("archive_target", 0700), 0);
+	UT_ASSERT_EQ(symlink("../archive_target", "pg_wal/archive_status"), 0);
+	UT_ASSERT(!validate_native_directory());
+	UT_ASSERT_EQ(unlink("pg_wal/archive_status"), 0);
+	UT_ASSERT_EQ(rmdir("archive_target"), 0);
+	cluster_shared_config = false;
+	UT_ASSERT(validate_native_directory());
+	UT_ASSERT_EQ(directory_creates, 1);
+	cluster_shared_config = true;
+	UT_ASSERT(validate_native_directory());
+	UT_ASSERT_EQ(directory_creates, 1);
+	UT_ASSERT_EQ(rmdir("pg_wal/archive_status"), 0);
+	UT_ASSERT_EQ(rmdir("pg_wal"), 0);
+	UT_ASSERT_EQ(fchdir(saved), 0);
+	UT_ASSERT_EQ(close(saved), 0);
+	UT_ASSERT_EQ(rmdir(scratch), 0);
+}
+
 static XLogRecPtr
 writer_bind(void)
 {
@@ -1113,7 +1178,7 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(27);
 	UT_RUN(prepare_uses_short_owned_read);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(publish_retries_only_root_competition_before_projection);
@@ -1137,6 +1202,7 @@ main(void)
 	UT_RUN(early_selection_refusal_or_cancel_precedes_native_mutation);
 	UT_RUN(late_binding_requires_same_early_selection);
 	UT_RUN(legacy_startup_does_not_select_shared_initializer);
+	UT_RUN(shared_startup_never_repairs_immutable_input_directory);
 	UT_RUN(writer_begin_rejects_wrong_input_or_failed_route_without_binding);
 	UT_RUN(native_startup_insert_has_no_link_or_page_from_predecessor);
 	UT_RUN(native_first_record_has_zero_xl_prev_only_for_bound_successor);

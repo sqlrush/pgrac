@@ -383,3 +383,12 @@ cluster_thread_recovery_worker.o cluster_thread_recovery_finalize.o: \
 	$(top_srcdir)/src/include/cluster/cluster_wal_retention.h
 
 include $(top_srcdir)/src/backend/common.mk
+
+# PGRAC: physical origin inspection shares native startup byte predicates.
+# Author: SqlRush <sqlrush@gmail.com>
+cluster_control_bootstrap_read.o: $(top_srcdir)/src/include/cluster/cluster_native_startup.h \
+	$(top_srcdir)/src/include/cluster/cluster_xid_authority.h
+cluster_control_root.o cluster_control_bootstrap.o cluster_control_bootstrap_read.o \
+cluster_wal_history.o cluster_thread_recovery_worker.o: \
+	$(srcdir)/cluster_control_bootstrap_private.h
+cluster_control_root.o cluster_recovery_anchor.o: $(srcdir)/cluster_recovery_anchor_private.h

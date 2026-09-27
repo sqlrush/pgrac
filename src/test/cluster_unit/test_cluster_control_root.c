@@ -19,6 +19,8 @@
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_xid_authority.h"
+#include "access/multixact.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_cf_storage.h"
@@ -58,6 +60,7 @@
 #undef strerror_r
 
 #include "unit_test.h"
+#include "test_cluster_control_native_xid.inc"
 #include "postmaster/interrupt.h"
 #include "cluster/cluster_ir.h"
 #include "cluster/cluster_external_fence.h"
@@ -7788,6 +7791,89 @@ v2_close_add_peer(uint8 before[66048], int node, ClusterPhase1FullStopPlan *plan
 	return peer;
 }
 
+static bool test_native_initializer;
+
+/* Supply real native checkpoint/SLRU inputs before the reservation captures
+ * W0. No anchor/root or embedded PGWG is changed after it becomes selected. */
+static void
+pending_native_seed(uint8 before[66048])
+{
+	ClusterRecoveryAnchorV2 anchor
+		= v2_stop_clean_anchor(before, &test_checkpoint_prefix_ref.claim.identity);
+	ControlFileData native = { 0 };
+	ControlFileData common;
+	ClusterControlRootFileToken common_token;
+	ClusterCfImageStage common_stage;
+	ControlRootImage root;
+	ClusterXidAuthorityHeader auth = { 0 };
+	char path[MAXPGPATH];
+	uint8 page[BLCKSZ] = { 0 };
+	uint32 offset = 5;
+	const char *dirs[] = { "native_side",
+						   "native_side/origin_0",
+						   "native_side/origin_0/pg_xact",
+						   "native_side/origin_0/pg_subtrans",
+						   "native_side/origin_0/pg_multixact",
+						   "native_side/origin_0/pg_multixact/offsets",
+						   "native_side/origin_0/pg_multixact/members",
+						   "native_side/origin_0/pg_commit_ts" };
+	const char *files[] = { "pg_xact/0000", "pg_subtrans/0000", "pg_multixact/offsets/0000" };
+	UT_ASSERT_EQ(cluster_control_root_v2_read_control_locked(v2_storage, TEST_SYSID, &root, &common,
+															 &common_token),
+				 0);
+	/* A real global high-water differs from this origin's checkpoint. Keep it
+	 * high: weakening/resetting the common view would hide the consumer bug. */
+	common.checkPointCopy.nextXid = FullTransactionIdFromU64(1001);
+	common.checkPointCopy.nextMulti = common.checkPointCopy.oldestMulti = 30;
+	common.checkPointCopy.nextMultiOffset = 90;
+	INIT_CRC32C(common.crc);
+	COMP_CRC32C(common.crc, &common, offsetof(ControlFileData, crc));
+	FIN_CRC32C(common.crc);
+	v2_install_native(&common, &common_stage);
+	memcpy(before + 296, common_stage.image_sha256, 32);
+	v2_checksums(before);
+	anchor.checkpoint_copy.nextXid = FullTransactionIdFromU64(101);
+	anchor.checkpoint_copy.nextMulti = anchor.checkpoint_copy.oldestMulti = 3;
+	anchor.checkpoint_copy.nextMultiOffset = offset;
+	anchor.checkpoint_copy.oldestCommitTsXid = anchor.checkpoint_copy.newestCommitTsXid = 0;
+	anchor.track_commit_timestamp = false;
+	v2_anchor_object(before, &anchor, &anchor.identity, path);
+	native.state = DB_SHUTDOWNED;
+	native.checkPoint = anchor.checkpoint;
+	native.checkPointCopy = anchor.checkpoint_copy;
+	v2_checkpoint_wal_record(&anchor.identity, &native, 0);
+	UT_ASSERT_EQ(cluster_control_root_v2_decode(before, 66048, v2_storage, TEST_SYSID, &root), 0);
+	root.records[0].checkpoint_record_crc32c = test_checkpoint_crc;
+	root.records[0].tail_last_record_crc32c = test_checkpoint_crc;
+	root.records[0].validated_tail_lsn_exclusive = test_checkpoint_end;
+	UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+	memcpy(before, root.bytes, 66048);
+	v2_write_roots(before);
+	for (unsigned i = 0; i < lengthof(dirs); i++) {
+		path_for(path, sizeof(path), dirs[i]);
+		UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	}
+	for (unsigned i = 0; i < lengthof(files); i++) {
+		memset(page, 0, sizeof(page));
+		if (i == 0)
+			page[101 / 4] = 4; /* Legitimate native seed below the raised cursor. */
+		if (i == 2)
+			memcpy(page + 3 * sizeof(offset), &offset, sizeof(offset));
+		snprintf(path, sizeof(path), "%s/native_side/origin_0/%s", test_root, files[i]);
+		write_all_or_abort(path, page, sizeof(page));
+	}
+	auth.magic = CLUSTER_XID_AUTHORITY_MAGIC;
+	auth.version = CLUSTER_XID_AUTHORITY_VERSION;
+	auth.flags = CLUSTER_XID_AUTHORITY_FLAG_SEALED;
+	auth.native_hw_full = 105;
+	auth.next_multi = FirstMultiXactId;
+	INIT_CRC32C(auth.crc);
+	COMP_CRC32C(auth.crc, &auth, offsetof(ClusterXidAuthorityHeader, crc));
+	FIN_CRC32C(auth.crc);
+	path_for(path, sizeof(path), CLUSTER_XID_AUTHORITY_REL_PATH);
+	write_all_or_abort(path, (const uint8 *)&auth, sizeof(auth));
+}
+
 static void
 v3_reserve_fixture(uint8 before[66048], ControlRootImage *root)
 {
@@ -7800,6 +7886,8 @@ v3_reserve_fixture(uint8 before[66048], ControlRootImage *root)
 	test_reserve_mode = false;
 	v2_close_fixture(before, &plan);
 	(void)v2_close_add_peer(before, 3, &plan);
+	if (test_native_initializer)
+		pending_native_seed(before);
 	UT_ASSERT_EQ(cluster_control_root_v2_decode(before, 66048, v2_storage, TEST_SYSID, root), 0);
 	root->header.format_version = 3;
 	root->header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_CLOSED;
@@ -10671,9 +10759,12 @@ UT_TEST(test_runtime_pending_worker_owns_exact_subject_before_inspection)
 			test_input_release = false;
 		if (fault == 6)
 			test_worker_pin_release = false;
-		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), fault == 2 || fault >= 5
-																   ? CLUSTER_THREADREC_BLOCKED
-																   : CLUSTER_THREADREC_DEFERRED);
+		/* Empty W1 WAL is insufficient: this old fixture deliberately has no
+		 * native-side input. The worker must classify it as blocked, not as
+		 * an inspected/clean initializer eligible for terminal publication. */
+		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility),
+					 fault == 0 || fault == 2 || fault >= 5 ? CLUSTER_THREADREC_BLOCKED
+															: CLUSTER_THREADREC_DEFERRED);
 		UT_ASSERT_EQ(test_worker_formations, fault == 1 || fault == 3 ? 0 : 1);
 		UT_ASSERT_EQ(test_worker_pins, fault == 0 || fault >= 4 ? 1 : 0);
 		UT_ASSERT_EQ(test_worker_initializer_ir, fault == 0 || fault >= 4 ? 1 : 0);
@@ -10732,6 +10823,67 @@ pending_inspection_fixture(ClusterRecoverySerialGuard *serial, bool checkpoint)
 	UT_ASSERT(cluster_recovery_duty_digest_for_claim(&op.claim.identity, true,
 													 &test_failure_need.canonical_duty_digest));
 	return op;
+}
+
+UT_TEST(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_horizon)
+{
+	for (unsigned fault = 0; fault < 6; fault++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterWalInitializerInput out;
+		char path[MAXPGPATH];
+		ClusterWalStartupImage op;
+		test_native_initializer = true;
+		op = pending_inspection_fixture(&serial, false);
+		test_native_initializer = false;
+		if (ut_current_failed)
+			return;
+		if (fault == 1) {
+			path_for(path, sizeof(path), "native_side/origin_0/pg_xact/0000");
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 2) {
+			path_for(path, sizeof(path), CLUSTER_XID_AUTHORITY_REL_PATH);
+			UT_ASSERT_EQ(unlink(path), 0);
+		} else if (fault == 3) {
+			test_stop_share_hook = v2_checkpoint_root_race;
+			test_stop_share_call = test_cf_lock_calls + 3;
+		} else if (fault == 4) {
+			test_failure_admissions = false;
+		} else if (fault == 5) {
+			path_for(path, sizeof(path), "native_side/origin_0/pg_subtrans/0000");
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT_EQ(symlink("../pg_xact/0000", path), 0);
+		}
+		memset(&out, 0xa5, sizeof(out));
+		if (fault == 0) {
+			ControlRootImage current;
+			ControlFileData projected;
+			ClusterControlRootFileToken token;
+			UT_ASSERT_EQ(cluster_control_root_v3_initializer_inspect(
+							 &serial, (ClusterWalRetentionPin *)(uintptr_t)4, &out),
+						 0);
+			UT_ASSERT(out.native_observed);
+			UT_ASSERT_EQ(out.native.page_reads, 3);
+			UT_ASSERT_EQ(out.native.effective_next_xid, 105);
+			UT_ASSERT_EQ(U64FromFullTransactionId(out.native_input.checkPointCopy.nextXid), 101);
+			UT_ASSERT_EQ(out.observation.tail.records, 0);
+			UT_ASSERT_EQ(out.startup.claim.identity.origin_owner_incarnation,
+						 op.claim.identity.origin_owner_incarnation);
+			test_actual_cf = test_cf_mode = ShareLock;
+			UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(
+							 &op.predecessor.snapshot.identity, &current, &projected, &token),
+						 0);
+			UT_ASSERT_EQ(U64FromFullTransactionId(projected.checkPointCopy.nextXid), 1001);
+			test_actual_cf = test_cf_mode = NoLock;
+		} else {
+			UT_ASSERT(cluster_control_root_v3_initializer_inspect(
+						  &serial, (ClusterWalRetentionPin *)(uintptr_t)4, &out)
+					  != 0);
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+		}
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT(serial.held && test_worker_pin_held);
+		test_reserve_mode = false;
+	}
 }
 
 UT_TEST(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal)
@@ -12408,6 +12560,36 @@ bootstrap_side_cleanup(const BootstrapSideFixture *f)
 	UT_ASSERT_EQ(rmdir(f->root), 0);
 }
 
+/* Same physical, CRC-checked native-era input consumed by StartupXLOG. */
+static void
+native_side_authority(const BootstrapSideFixture *f, uint64 next, bool sealed)
+{
+	ClusterXidAuthorityHeader auth = { 0 };
+	char path[MAXPGPATH];
+	auth.magic = CLUSTER_XID_AUTHORITY_MAGIC;
+	auth.version = CLUSTER_XID_AUTHORITY_VERSION;
+	auth.flags = sealed ? CLUSTER_XID_AUTHORITY_FLAG_SEALED : 0;
+	auth.native_hw_full = next;
+	auth.next_multi = FirstMultiXactId;
+	INIT_CRC32C(auth.crc);
+	COMP_CRC32C(auth.crc, &auth, offsetof(ClusterXidAuthorityHeader, crc));
+	FIN_CRC32C(auth.crc);
+	snprintf(path, sizeof(path), "%s/global", f->shared);
+	UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	snprintf(path, sizeof(path), "%s/%s", f->shared, CLUSTER_XID_AUTHORITY_REL_PATH);
+	write_all_or_abort(path, (const uint8 *)&auth, sizeof(auth));
+}
+
+static void
+native_side_authority_cleanup(const BootstrapSideFixture *f)
+{
+	char path[MAXPGPATH];
+	snprintf(path, sizeof(path), "%s/%s", f->shared, CLUSTER_XID_AUTHORITY_REL_PATH);
+	UT_ASSERT_EQ(unlink(path), 0);
+	snprintf(path, sizeof(path), "%s/global", f->shared);
+	UT_ASSERT_EQ(rmdir(path), 0);
+}
+
 UT_TEST(test_bootstrap_side_routes_require_exact_origin)
 {
 	for (unsigned node = 0; node <= 127; node += 127) {
@@ -12423,6 +12605,166 @@ UT_TEST(test_bootstrap_side_routes_require_exact_origin)
 		read_all_or_abort(path, stored, sizeof(stored));
 		UT_ASSERT(memcmp(marker, stored, sizeof(marker)) == 0);
 		UT_ASSERT_EQ(unlink(path), 0);
+		bootstrap_side_cleanup(&f);
+	}
+}
+
+/* Physical SLRU pages, not a mock that asserts the failed origin is clean. */
+UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
+{
+	BootstrapSideFixture f;
+	ControlFileData control = { 0 };
+	ClusterNativeSideObservation first, second;
+	char page[BLCKSZ] = { 0 }, stored[BLCKSZ], path[MAXPGPATH];
+	const char *files[] = { "pg_xact/0000", "pg_subtrans/0000", "pg_multixact/offsets/0000" };
+	uint32 value = 5;
+
+	bootstrap_side_fixture(&f, 3);
+	native_side_authority(&f, 100, true);
+	control.checkPointCopy.nextXid = FullTransactionIdFromU64(101);
+	control.checkPointCopy.nextMulti = control.checkPointCopy.oldestMulti = 3;
+	control.checkPointCopy.nextMultiOffset = value;
+	for (unsigned i = 0; i < lengthof(files); i++) {
+		memset(page, 0, sizeof(page));
+		if (i == 0)
+			page[0] = 0x55;
+		if (i == 2)
+			memcpy(page + 3 * sizeof(value), &value, sizeof(value));
+		snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+		write_all_or_abort(path, page, sizeof(page));
+	}
+	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &first), 0);
+	UT_ASSERT_EQ(first.page_reads, 3);
+	UT_ASSERT(!v2_zero(first.sha256, 32));
+	UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &second), 0);
+	UT_ASSERT(memcmp(&first, &second, sizeof(first)) == 0);
+	UT_ASSERT(cluster_control_native_side_observe(f.shared, 0, &control, &second) != 0);
+	UT_ASSERT(v2_zero(&second, sizeof(second)));
+	for (unsigned i = 0; i < lengthof(files); i++) {
+		snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+		read_all_or_abort(path, stored, sizeof(stored));
+		if (i == 0)
+			UT_ASSERT_EQ(stored[0], 0x55);
+		if (i == 2)
+			UT_ASSERT(memcmp(stored, page, sizeof(stored)) == 0);
+		UT_ASSERT_EQ(unlink(path), 0);
+	}
+	native_side_authority_cleanup(&f);
+	bootstrap_side_cleanup(&f);
+}
+
+UT_TEST(test_native_side_observation_refuses_missing_contradictory_or_aliased_pages)
+{
+	for (unsigned fault = 0; fault < 10; ++fault) {
+		BootstrapSideFixture f;
+		ControlFileData control = { 0 };
+		ClusterNativeSideObservation out;
+		char page[BLCKSZ] = { 0 }, path[MAXPGPATH];
+		const char *files[] = { "pg_xact/0000", "pg_subtrans/0000", "pg_multixact/offsets/0000" };
+		uint32 value = 5;
+
+		bootstrap_side_fixture(&f, 0);
+		native_side_authority(&f, 100, true);
+		control.checkPointCopy.nextXid = FullTransactionIdFromU64(101);
+		control.checkPointCopy.nextMulti = control.checkPointCopy.oldestMulti = 3;
+		control.checkPointCopy.nextMultiOffset = value;
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			memset(page, 0, sizeof(page));
+			if (i == 2)
+				memcpy(page + 3 * sizeof(value), &value, sizeof(value));
+			if (fault == 0 && i == 0)
+				page[101 / 4] = 4;
+			if (fault == 1 && i == 1)
+				page[101 * sizeof(uint32)] = 1;
+			if (fault == 2 && i == 2)
+				page[3 * sizeof(uint32)] ^= 1;
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			if (fault == 3 && i == 0)
+				continue;
+			if (fault == 4 && i == 0) {
+				UT_ASSERT_EQ(symlink("../pg_subtrans/0000", path), 0);
+				continue;
+			}
+			write_all_or_abort(path, page, fault == 5 && i == 0 ? 17 : sizeof(page));
+			if (fault == 6 && i == 0)
+				UT_ASSERT_EQ(chmod(path, 0660), 0);
+		}
+		if (fault == 7)
+			control.checkPointCopy.nextXid = FullTransactionIdFromU64(2);
+		if (fault == 8)
+			control.track_commit_timestamp = true;
+		if (fault == 9)
+			control.checkPointCopy.oldestMulti = 1;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_control_native_side_observe(f.shared, 0, &control, &out) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			if (fault == 3 && i == 0)
+				continue;
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		native_side_authority_cleanup(&f);
+		bootstrap_side_cleanup(&f);
+	}
+}
+
+UT_TEST(test_native_side_census_requires_sealed_xid_horizon_and_uses_raised_cursor)
+{
+	for (unsigned fault = 0; fault < 7; fault++) {
+		BootstrapSideFixture f;
+		ControlFileData control = { 0 };
+		ClusterNativeSideObservation out;
+		char page[BLCKSZ] = { 0 }, path[MAXPGPATH], backup[MAXPGPATH];
+		const char *files[] = { "pg_xact/0000", "pg_subtrans/0000", "pg_multixact/offsets/0000" };
+		uint32 value = 5;
+		bootstrap_side_fixture(&f, 3);
+		control.checkPointCopy.nextXid = FullTransactionIdFromU64(101);
+		control.checkPointCopy.nextMulti = control.checkPointCopy.oldestMulti = 3;
+		control.checkPointCopy.nextMultiOffset = value;
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			memset(page, 0, sizeof(page));
+			/* Native seed consumed xid 101; the shared cursor is now 105. */
+			if (fault == 3 && i == 0)
+				page[101 / 4] = 4;
+			if (i == 2)
+				memcpy(page + 3 * sizeof(value), &value, sizeof(value));
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			write_all_or_abort(path, page, sizeof(page));
+		}
+		if (fault != 0)
+			native_side_authority(&f, fault == 2 ? 2 : 105, fault != 1);
+		snprintf(path, sizeof(path), "%s/%s", f.shared, CLUSTER_XID_AUTHORITY_REL_PATH);
+		snprintf(backup, sizeof(backup), "%s/%s", f.shared, CLUSTER_XID_AUTHORITY_BAK_REL_PATH);
+		if (fault == 4)
+			UT_ASSERT_EQ(link(path, backup), 0);
+		else if (fault == 5)
+			UT_ASSERT_EQ(rename(path, backup), 0);
+		else if (fault == 6) {
+			uint8 bytes[sizeof(ClusterXidAuthorityHeader)];
+			read_all_or_abort(path, bytes, sizeof(bytes));
+			bytes[16] ^= 1;
+			write_all_or_abort(path, bytes, sizeof(bytes));
+		}
+		memset(&out, 0xa5, sizeof(out));
+		if (fault == 3)
+			UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 3, &control, &out), 0);
+		else {
+			UT_ASSERT(cluster_control_native_side_observe(f.shared, 3, &control, &out) != 0);
+			UT_ASSERT(v2_zero(&out, sizeof(out)));
+		}
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		if (fault == 4)
+			UT_ASSERT_EQ(unlink(backup), 0);
+		if (fault == 5) {
+			snprintf(path, sizeof(path), "%s/%s", f.shared, CLUSTER_XID_AUTHORITY_REL_PATH);
+			UT_ASSERT_EQ(rename(backup, path), 0);
+		}
+		if (fault != 0)
+			native_side_authority_cleanup(&f);
 		bootstrap_side_cleanup(&f);
 	}
 }
@@ -16216,12 +16558,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(302);
+	UT_PLAN(306);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
 	UT_RUN(test_native_inputs_recheck_namespace_and_release_fds);
 	UT_RUN(test_bootstrap_side_routes_require_exact_origin);
+	UT_RUN(test_native_side_observation_reads_origin_and_preserves_bytes);
+	UT_RUN(test_native_side_observation_refuses_missing_contradictory_or_aliased_pages);
+	UT_RUN(test_native_side_census_requires_sealed_xid_horizon_and_uses_raised_cursor);
 	UT_RUN(test_bootstrap_side_rejects_local_foreign_and_unsafe_aliases);
 	UT_RUN(test_bootstrap_side_children_parents_and_arguments_are_strict);
 	UT_RUN(test_bootstrap_side_reobserves_every_namespace_and_closes_all_fds);
@@ -16478,6 +16823,7 @@ main(int argc, char **argv)
 	UT_RUN(test_runtime_pending_observation_is_separate_and_requires_actual_inputs);
 	UT_RUN(test_runtime_pending_worker_owns_exact_subject_before_inspection);
 	UT_RUN(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal);
+	UT_RUN(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_horizon);
 	UT_RUN(test_runtime_pending_inspection_refuses_stale_or_unowned_input);
 	UT_RUN(test_runtime_v3_lmon_launch_continues_only_after_exact_cf_retirement);
 	UT_RUN(test_runtime_v3_failure_worker_seals_then_acquires_fresh_replay_owners);

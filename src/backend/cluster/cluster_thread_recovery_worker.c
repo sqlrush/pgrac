@@ -315,14 +315,20 @@ thread_recovery_worker_run(const ClusterThreadRecLaunchEligibility *eligibility)
 		PG_TRY();
 		{
 			if (pending) {
-				root_result = cluster_control_root_v3_initializer_observe(
+				root_result = cluster_control_root_v3_initializer_inspect(
 					&serial_guard, retention_pin, &initializer_input);
 				/* Inspection is not native closure. Keep this origin non-serving
 				 * until the qualified terminal/promotion publisher consumes it. */
-				result = root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-								 && initializer_input.observation.unsupported_records != 0
-							 ? CLUSTER_THREADREC_BLOCKED
-							 : CLUSTER_THREADREC_DEFERRED;
+				if (root_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+					result = initializer_input.observation.unsupported_records != 0
+								 ? CLUSTER_THREADREC_BLOCKED
+								 : CLUSTER_THREADREC_DEFERRED;
+				else
+					result = root_result == CLUSTER_CONTROL_ROOT_STALE_TOKEN
+									 || root_result == CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+									 || root_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+								 ? CLUSTER_THREADREC_DEFERRED
+								 : CLUSTER_THREADREC_BLOCKED;
 			} else
 				result = cluster_thread_recovery_replay_one(dead_tid, launch_epoch, &authority);
 		}
