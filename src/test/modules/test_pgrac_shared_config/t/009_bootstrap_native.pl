@@ -33,6 +33,10 @@ my $log_offset = 0;
 for my $case (
 	['valid', qr/test native bootstrap prepared; no admission or storage initialization/],
 	['geometry', qr/test native bootstrap prepared; no admission or storage initialization/],
+	['input-signal', qr/native startup inputs require unsupported recovery/],
+	['input-2pc', qr/native startup inputs require unsupported recovery/],
+	['input-slot', qr/native startup inputs require unsupported recovery/],
+	['input-progress', qr/native startup inputs require unsupported recovery/],
 	['wal-flat', qr/native bootstrap WAL routing is not exact/],
 	['wal-missing', qr/native bootstrap WAL routing is not exact/],
 	['side-missing', qr/native bootstrap side routing is not exact/],
@@ -64,6 +68,14 @@ for my $case (
 		"$mutation disposable fixture encoded by production codecs");
 	$node->stop('fast');
 	my $data = $node->data_dir;
+	my %input_files = (
+		'input-signal' => 'standby.signal',
+		'input-2pc' => 'pg_twophase/0000002A',
+		'input-slot' => 'pg_replslot/unfinished.tmp',
+		'input-progress' => 'pg_logical/replorigin_checkpoint');
+	my $input_path = exists $input_files{$mutation}
+		? "$data/test_native_bootstrap/local/$input_files{$mutation}" : undef;
+	my $input_before = defined $input_path ? slurp_file($input_path) : undef;
 	my $control_before = sha256_hex(slurp_file("$data/global/pg_control"));
 	$node->append_conf('postgresql.conf', qq{
 shared_preload_libraries='test_pgrac_shared_config'
@@ -75,6 +87,8 @@ test_pgrac_shared_config.prepare_bootstrap=on
 	like($log, $expected, "$mutation reaches its exact native boundary");
 	is(sha256_hex(slurp_file("$data/global/pg_control")), $control_before,
 		"$mutation leaves compatibility control bytes unchanged");
+	is(slurp_file($input_path), $input_before, "$mutation preserves unsupported input bytes")
+		if defined $input_path;
 	$node->append_conf('postgresql.conf', qq{
 shared_preload_libraries=''
 test_pgrac_shared_config.prepare_bootstrap=off

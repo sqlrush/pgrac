@@ -4,6 +4,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #ifndef WIN32
@@ -137,7 +138,151 @@ done:
 }
 
 static ClusterControlRootResult read_same_dir(int parent, const char *name, int fd);
+
+static ClusterControlRootResult
+read_absent(int dir, const char *name)
+{
+	struct stat st;
+	/* stat(), unlike this no-follow observation, misses dangling signals. */
+	if (fstatat(dir, name, &st, AT_SYMLINK_NOFOLLOW) == 0)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	return errno == ENOENT ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+}
+
+static ClusterControlRootResult
+read_empty(int dir)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	int scan_fd = openat(dir, ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	DIR *scan;
+	struct dirent *entry;
+
+	if (scan_fd < 0)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	scan = fdopendir(scan_fd);
+	if (scan == NULL) {
+		read_close(scan_fd, &result);
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	for (;;) {
+		errno = 0;
+		entry = readdir(scan);
+		if (entry == NULL) {
+			if (errno != 0)
+				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			break;
+		}
+		if (strcmp(entry->d_name, ".") != 0 && strcmp(entry->d_name, "..") != 0) {
+			result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+			break;
+		}
+	}
+	/* closedir owns scan_fd, including on failure; never close it twice. */
+	if (closedir(scan) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	return result;
+}
+
+static ClusterControlRootResult
+read_empty_replication_progress(int logical, bool *present, struct stat *identity)
+{
+	const char *name = "replorigin_checkpoint";
+	uint8 bytes[sizeof(uint32) + sizeof(pg_crc32c) + 1];
+	uint32 magic;
+	pg_crc32c stored, actual;
+	struct stat after;
+	size_t length;
+	ClusterControlRootResult result;
+
+	*present = false;
+	if (fstatat(logical, name, identity, AT_SYMLINK_NOFOLLOW) != 0)
+		return errno == ENOENT ? CLUSTER_CONTROL_ROOT_OK_PRIMARY : CLUSTER_CONTROL_ROOT_IO_ERROR;
+	*present = true;
+	result = read_bytes(logical, name, sizeof(bytes) - 1, sizeof(bytes) - 1, bytes, &length);
+	if (result != 0)
+		return result;
+	if (!read_owned(identity, false) || fstatat(logical, name, &after, AT_SYMLINK_NOFOLLOW) != 0
+		|| !read_owned(&after, false) || identity->st_dev != after.st_dev
+		|| identity->st_ino != after.st_ino || identity->st_size != after.st_size)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	/* PG's native (host-endian) empty progress checkpoint from origin.c:
+	 * REPLICATION_STATE_MAGIC followed immediately by CRC32C. Do not accept
+	 * a nonempty list merely because max_replication_slots is now zero. */
+	memcpy(&magic, bytes, sizeof(magic));
+	memcpy(&stored, bytes + sizeof(magic), sizeof(stored));
+	INIT_CRC32C(actual);
+	COMP_CRC32C(actual, bytes, sizeof(magic));
+	FIN_CRC32C(actual);
+	if (magic != UINT32_C(0x1257DADE) || !EQ_CRC32C(actual, stored))
+		return CLUSTER_CONTROL_ROOT_BAD_BODY_CRC;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
 #endif
+
+ClusterControlRootResult
+cluster_control_bootstrap_native_inputs(const char *pgdata)
+{
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+#if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
+	&& defined(AT_SYMLINK_NOFOLLOW)
+	static const char *const signals[] = { "backup_label",	 "tablespace_map", "recovery.signal",
+										   "standby.signal", "recovery.conf",  "recovery.done" };
+	static const char *const names[]
+		= { "pg_twophase", "pg_replslot", "pg_logical", "snapshots", "mappings" };
+	static const unsigned parents[] = { 0, 0, 0, 3, 3 };
+	int dirs[6] = { -1, -1, -1, -1, -1, -1 };
+	struct stat checkpoint[2];
+	bool present[2];
+
+	if (!read_path_valid(pgdata, NULL))
+		return result;
+	result = read_dir(-1, pgdata, &dirs[0]);
+	if (result != 0)
+		goto done;
+	for (size_t i = 0; i < lengthof(names); ++i) {
+		result = read_dir(dirs[parents[i]], names[i], &dirs[i + 1]);
+		if (result != 0)
+			goto done;
+	}
+	/* Read twice around the origin checkpoint and reobserve every directory.
+	 * This is a provisional observation; StartupXLOG checks again before it
+	 * can run any native cleanup. No directory is created, repaired or adopted. */
+	for (unsigned pass = 0; pass < 2; ++pass) {
+		for (size_t i = 0; i < lengthof(signals); ++i) {
+			result = read_absent(dirs[0], signals[i]);
+			if (result != 0)
+				goto done;
+		}
+		result = read_absent(dirs[3], "replorigin_checkpoint.tmp");
+		if (result != 0)
+			goto done;
+		for (unsigned i = 1; i < lengthof(dirs); ++i) {
+			if (i == 3)
+				continue;
+			result = read_empty(dirs[i]);
+			if (result != 0)
+				goto done;
+		}
+		result = read_empty_replication_progress(dirs[3], &present[pass], &checkpoint[pass]);
+		if (result != 0)
+			goto done;
+	}
+	if (present[0] != present[1]
+		|| (present[0]
+			&& (checkpoint[0].st_dev != checkpoint[1].st_dev
+				|| checkpoint[0].st_ino != checkpoint[1].st_ino))) {
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		goto done;
+	}
+	result = read_same_dir(AT_FDCWD, pgdata, dirs[0]);
+	for (size_t i = 0; result == 0 && i < lengthof(names); ++i)
+		result = read_same_dir(dirs[parents[i]], names[i], dirs[i + 1]);
+done:
+	for (size_t i = 0; i < lengthof(dirs); ++i)
+		read_close(dirs[i], &result);
+#endif
+	return result;
+}
 
 ClusterControlRootResult
 cluster_control_bootstrap_side_route(const char *pgdata, const char *shared_root, uint32 node_id)

@@ -11267,6 +11267,206 @@ static uint8 bootstrap_replacement[66048];
 static uint8 bootstrap_binding_replacement[256];
 static bool bootstrap_side_race;
 static char bootstrap_side_replace[MAXPGPATH], bootstrap_side_saved[MAXPGPATH];
+static bool bootstrap_inputs_race, bootstrap_inputs_race_file;
+static char bootstrap_inputs_replace[MAXPGPATH], bootstrap_inputs_saved[MAXPGPATH];
+
+/* Native input qualification reads these actual files, never a mock result. */
+static const char *const native_input_dirs[]
+	= { "pg_twophase", "pg_replslot", "pg_logical", "pg_logical/snapshots", "pg_logical/mappings" };
+
+static void
+native_input_fixture(char *root)
+{
+	char path[MAXPGPATH];
+	strlcpy(root, "/tmp/pgrac-native-inputs.XXXXXX", MAXPGPATH);
+	UT_ASSERT(mkdtemp(root) != NULL);
+	for (size_t i = 0; i < lengthof(native_input_dirs); ++i) {
+		snprintf(path, sizeof(path), "%s/%s", root, native_input_dirs[i]);
+		UT_ASSERT_EQ(mkdir(path, 0700), 0);
+	}
+	bootstrap_close_calls = bootstrap_close_fail_at = 0;
+}
+
+static void
+native_input_cleanup(const char *root)
+{
+	char path[MAXPGPATH];
+	for (int i = lengthof(native_input_dirs) - 1; i >= 0; --i) {
+		snprintf(path, sizeof(path), "%s/%s", root, native_input_dirs[i]);
+		UT_ASSERT_EQ(rmdir(path), 0);
+	}
+	UT_ASSERT_EQ(rmdir(root), 0);
+}
+
+UT_TEST(test_native_inputs_accept_only_empty_native_progress)
+{
+	char root[MAXPGPATH], path[MAXPGPATH];
+	uint32 magic = UINT32_C(0x1257DADE);
+	pg_crc32c crc;
+	uint8 bytes[9], observed[8];
+
+	native_input_fixture(root);
+	UT_ASSERT_EQ(cluster_control_bootstrap_native_inputs(root), 0);
+	snprintf(path, sizeof(path), "%s/pg_logical/replorigin_checkpoint", root);
+	memcpy(bytes, &magic, sizeof(magic));
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, bytes, sizeof(magic));
+	FIN_CRC32C(crc);
+	memcpy(bytes + sizeof(magic), &crc, sizeof(crc));
+	write_all_or_abort(path, bytes, 8);
+	UT_ASSERT_EQ(cluster_control_bootstrap_native_inputs(root), 0);
+	read_all_or_abort(path, observed, sizeof(observed));
+	UT_ASSERT(memcmp(bytes, observed, sizeof(observed)) == 0);
+	for (unsigned i = 0; i < 8; ++i) {
+		bytes[i] ^= 1;
+		write_all_or_abort(path, bytes, 8);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		bytes[i] ^= 1;
+	}
+	bytes[8] = 1;
+	for (unsigned size = 0; size <= 9; ++size) {
+		if (size == 8)
+			continue;
+		write_all_or_abort(path, bytes, size);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+	}
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(mkfifo(path, 0600), 0);
+	UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(symlink("absent", path), 0);
+	UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+	UT_ASSERT_EQ(unlink(path), 0);
+	native_input_cleanup(root);
+}
+
+UT_TEST(test_native_inputs_refuse_all_recovery_signals_without_cleanup)
+{
+	static const char *const signals[] = { "backup_label",
+										   "tablespace_map",
+										   "recovery.signal",
+										   "standby.signal",
+										   "recovery.conf",
+										   "recovery.done",
+										   "pg_logical/replorigin_checkpoint.tmp" };
+	char root[MAXPGPATH], path[MAXPGPATH];
+	uint8 bytes[17] = "retained-input", observed[17];
+	struct stat st;
+	native_input_fixture(root);
+	for (size_t i = 0; i < lengthof(signals); ++i) {
+		snprintf(path, sizeof(path), "%s/%s", root, signals[i]);
+		write_all_or_abort(path, bytes, sizeof(bytes));
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		read_all_or_abort(path, observed, sizeof(observed));
+		UT_ASSERT(memcmp(bytes, observed, sizeof(bytes)) == 0);
+		UT_ASSERT_EQ(unlink(path), 0);
+		UT_ASSERT_EQ(symlink("absent", path), 0);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		UT_ASSERT_EQ(lstat(path, &st), 0);
+		UT_ASSERT(S_ISLNK(st.st_mode));
+		UT_ASSERT_EQ(unlink(path), 0);
+		UT_ASSERT_EQ(mkfifo(path, 0600), 0);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		UT_ASSERT_EQ(unlink(path), 0);
+	}
+	UT_ASSERT_EQ(cluster_control_bootstrap_native_inputs(root), 0);
+	native_input_cleanup(root);
+}
+
+UT_TEST(test_native_inputs_preserve_slots_and_prepared_files)
+{
+	char root[MAXPGPATH], path[MAXPGPATH], child[MAXPGPATH], saved[MAXPGPATH];
+	uint8 bytes[17] = "retained-progress", observed[17];
+	native_input_fixture(root);
+	for (size_t i = 0; i < lengthof(native_input_dirs); ++i) {
+		/* pg_logical necessarily contains its two native subdirectories. */
+		if (i == 2)
+			continue;
+		snprintf(path, sizeof(path), "%s/%s", root, native_input_dirs[i]);
+		snprintf(child, sizeof(child), "%s/retained.tmp", path);
+		write_all_or_abort(child, bytes, sizeof(bytes));
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		read_all_or_abort(child, observed, sizeof(observed));
+		UT_ASSERT(memcmp(bytes, observed, sizeof(bytes)) == 0);
+		UT_ASSERT_EQ(unlink(child), 0);
+		UT_ASSERT_EQ(mkdir(child, 0700), 0);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		UT_ASSERT_EQ(rmdir(child), 0);
+		UT_ASSERT_EQ(chmod(path, 0770), 0);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		UT_ASSERT_EQ(chmod(path, 0700), 0);
+		snprintf(saved, sizeof(saved), "%s.saved", path);
+		UT_ASSERT_EQ(rename(path, saved), 0);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		UT_ASSERT_EQ(symlink(saved, path), 0);
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		UT_ASSERT_EQ(unlink(path), 0);
+		UT_ASSERT_EQ(rename(saved, path), 0);
+	}
+	UT_ASSERT_EQ(cluster_control_bootstrap_native_inputs(root), 0);
+	native_input_cleanup(root);
+}
+
+UT_TEST(test_native_inputs_recheck_namespace_and_release_fds)
+{
+	char root[MAXPGPATH], checkpoint[MAXPGPATH];
+	uint32 magic = UINT32_C(0x1257DADE);
+	pg_crc32c crc;
+	uint8 bytes[8];
+	int before = 0, after = 0, closes;
+	const char *bad[] = { NULL, "relative", "/", "/tmp/../tmp", "/tmp//input" };
+	for (size_t i = 0; i < lengthof(bad); ++i)
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(bad[i]) != 0);
+	native_input_fixture(root);
+	snprintf(checkpoint, sizeof(checkpoint), "%s/pg_logical/replorigin_checkpoint", root);
+	memcpy(bytes, &magic, sizeof(magic));
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, bytes, sizeof(magic));
+	FIN_CRC32C(crc);
+	memcpy(bytes + sizeof(magic), &crc, sizeof(crc));
+	write_all_or_abort(checkpoint, bytes, sizeof(bytes));
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++before;
+	UT_ASSERT_EQ(cluster_control_bootstrap_native_inputs(root), 0);
+	closes = bootstrap_close_calls;
+	UT_ASSERT(closes > 0);
+	for (int i = 1; i <= closes; ++i) {
+		bootstrap_close_calls = 0;
+		bootstrap_close_fail_at = i;
+		UT_ASSERT_EQ(cluster_control_bootstrap_native_inputs(root), CLUSTER_CONTROL_ROOT_IO_ERROR);
+	}
+	bootstrap_close_fail_at = 0;
+	for (int i = -1; i < (int)lengthof(native_input_dirs); ++i) {
+		if (i < 0)
+			strlcpy(bootstrap_inputs_replace, root, sizeof(bootstrap_inputs_replace));
+		else
+			snprintf(bootstrap_inputs_replace, sizeof(bootstrap_inputs_replace), "%s/%s", root,
+					 native_input_dirs[i]);
+		snprintf(bootstrap_inputs_saved, sizeof(bootstrap_inputs_saved), "%s.saved",
+				 bootstrap_inputs_replace);
+		bootstrap_inputs_race = true;
+		bootstrap_inputs_race_file = false;
+		UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+		UT_ASSERT(!bootstrap_inputs_race);
+		UT_ASSERT_EQ(rmdir(bootstrap_inputs_replace), 0);
+		UT_ASSERT_EQ(rename(bootstrap_inputs_saved, bootstrap_inputs_replace), 0);
+	}
+	strlcpy(bootstrap_inputs_replace, checkpoint, sizeof(bootstrap_inputs_replace));
+	snprintf(bootstrap_inputs_saved, sizeof(bootstrap_inputs_saved), "%s.saved", checkpoint);
+	bootstrap_inputs_race = bootstrap_inputs_race_file = true;
+	UT_ASSERT(cluster_control_bootstrap_native_inputs(root) != 0);
+	UT_ASSERT(!bootstrap_inputs_race);
+	UT_ASSERT_EQ(unlink(checkpoint), 0);
+	UT_ASSERT_EQ(rename(bootstrap_inputs_saved, checkpoint), 0);
+	UT_ASSERT_EQ(cluster_control_bootstrap_native_inputs(root), 0);
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++after;
+	UT_ASSERT_EQ(before, after);
+	UT_ASSERT_EQ(unlink(checkpoint), 0);
+	native_input_cleanup(root);
+}
 
 /* Physical aliases only: not a native-side migration or ownership grant. */
 static const char *const side_names[]
@@ -11514,6 +11714,19 @@ unit_bootstrap_openat(int dir, const char *name, int flags, ...)
 	char primary[MAXPGPATH], staging[MAXPGPATH], binding[MAXPGPATH];
 	bool root_open = strcmp(name, "pgrac_control_root") == 0;
 	bool missing_object = bootstrap_race == 2 && strstr(name, ".bin") != NULL;
+	if (bootstrap_inputs_race && strcmp(name, "replorigin_checkpoint") == 0) {
+		int fd = openat(dir, name, flags);
+		bootstrap_inputs_race = false;
+		if (fd < 0 || rename(bootstrap_inputs_replace, bootstrap_inputs_saved) != 0)
+			abort();
+		if (bootstrap_inputs_race_file) {
+			uint8 bytes[8];
+			read_all_or_abort(bootstrap_inputs_saved, bytes, sizeof(bytes));
+			write_all_or_abort(bootstrap_inputs_replace, bytes, sizeof(bytes));
+		} else if (mkdir(bootstrap_inputs_replace, 0700) != 0)
+			abort();
+		return fd;
+	}
 	if (bootstrap_side_race && strcmp(name, "members") == 0) {
 		int fd = openat(dir, name, flags);
 		bootstrap_side_race = false;
@@ -14376,7 +14589,11 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(268);
+	UT_PLAN(272);
+	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
+	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
+	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
+	UT_RUN(test_native_inputs_recheck_namespace_and_release_fds);
 	UT_RUN(test_bootstrap_side_routes_require_exact_origin);
 	UT_RUN(test_bootstrap_side_rejects_local_foreign_and_unsafe_aliases);
 	UT_RUN(test_bootstrap_side_children_parents_and_arguments_are_strict);

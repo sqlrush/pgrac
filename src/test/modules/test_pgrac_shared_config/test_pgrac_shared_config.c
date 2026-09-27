@@ -211,6 +211,33 @@ bootstrap_test_hash(const void *bytes, size_t len, uint8 hash[32])
 }
 
 static void
+bootstrap_test_native_inputs(const char *mutation)
+{
+	static const char *const directories[]
+		= { "local/pg_twophase", "local/pg_replslot", "local/pg_logical/snapshots",
+			"local/pg_logical/mappings" };
+	static const char *const files[]
+		= { "local/standby.signal", "local/pg_twophase/0000002A",
+			"local/pg_replslot/unfinished.tmp", "local/pg_logical/replorigin_checkpoint" };
+	static const char *const cases[]
+		= { "input-signal", "input-2pc", "input-slot", "input-progress" };
+	const char marker[] = "retained unsupported native input";
+	char path[MAXPGPATH];
+	for (size_t i = 0; i < lengthof(directories); ++i) {
+		bootstrap_test_path(path, directories[i]);
+		if (pg_mkdir_p(path, 0700) != 0)
+			ereport(ERROR, (errmsg("cannot make test native input directory: %m")));
+	}
+	for (size_t i = 0; i < lengthof(files); ++i) {
+		bootstrap_test_path(path, files[i]);
+		if (unlink(path) != 0 && errno != ENOENT)
+			ereport(ERROR, (errmsg("cannot reset test native input: %m")));
+		if (strcmp(mutation, cases[i]) == 0)
+			bootstrap_test_write(files[i], marker, sizeof(marker));
+	}
+}
+
+static void
 bootstrap_test_side_routes(const char *mutation)
 {
 	static const char *const families[]
@@ -729,6 +756,7 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 	if (strcmp(mutation, "wal-missing") != 0 && symlink(generation, pgwal) != 0)
 		ereport(ERROR, (errmsg("test pg_wal symlink failed")));
 	bootstrap_test_side_routes(mutation);
+	bootstrap_test_native_inputs(mutation);
 	pfree(root);
 	PG_RETURN_BOOL(true);
 #else

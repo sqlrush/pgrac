@@ -6063,6 +6063,12 @@ StartupXLOG(void)
 
 #ifdef USE_PGRAC_CLUSTER
 
+	/* PGRAC: shared startup must reject unsupported native recovery/cleanup
+	 * inputs before any startup mutation, including the old bootstrap path.
+	 * Early postmaster observation is not authority and may have aged. */
+	if (cluster_shared_config)
+		cluster_control_bootstrap_native_inputs_require(DataDir);
+
 	/*
 	 * PGRAC: spec-5.6 increment (iii) T6 Phase-2.  Before the bootstrap role
 	 * gate reads the storage contract, a multi-node node that has not yet

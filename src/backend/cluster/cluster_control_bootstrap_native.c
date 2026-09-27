@@ -25,6 +25,19 @@ static bool bootstrap_prepared_valid;
 static ClusterControlBootstrapPrepared bootstrap_prepared;
 static char bootstrap_paths[4][MAXPGPATH];
 
+void
+cluster_control_bootstrap_native_inputs_require(const char *pgdata)
+{
+	ClusterControlRootResult result = cluster_control_bootstrap_native_inputs(pgdata);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("native startup inputs require unsupported recovery"),
+				 errdetail("Native input qualification result=%d. No input was removed.", result),
+				 errhint("Preserve this directory. Qualify backup, replication or prepared state "
+						 "before startup.")));
+}
+
 static void
 bootstrap_policy_refuse(const char *message, const ClusterSharedConfigPolicyReport *report)
 {
@@ -149,6 +162,7 @@ cluster_control_bootstrap_prepare(const char *pgdata, const char *shared_root, c
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("native bootstrap side routing is not exact"),
 							errdetail("Native side routing result=%d.", result)));
+		cluster_control_bootstrap_native_inputs_require(state->paths[0]);
 	}
 	PG_CATCH();
 	{
@@ -222,6 +236,7 @@ cluster_control_bootstrap_wal_recheck(const char *pgdata, ClusterWalDurablePrefi
 			ereport(FATAL, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 							errmsg("native side bootstrap route changed"),
 							errdetail("Native side routing result=%d.", result)));
+		cluster_control_bootstrap_native_inputs_require(pgdata);
 	}
 	PG_CATCH();
 	{
