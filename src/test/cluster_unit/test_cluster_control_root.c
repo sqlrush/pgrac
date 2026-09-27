@@ -7926,13 +7926,42 @@ v3_begin_fixture(uint8 before[66048], ControlRootImage *root, ClusterControlRoot
 
 /* Build a real independent successor stream after the production all-member
  * INITIALIZING CAS. The native checkpoint and PGWP files are not mocked. */
+static void history_stage_dirs(uint32 node);
+
+static void
+v3_startup_native_record(const ClusterWalStartupImage *op, ControlFileData *candidate)
+{
+	uint8 claim[112];
+	UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&op->claim, claim), 0);
+	memset(&test_checkpoint_prefix_ref, 0, sizeof(test_checkpoint_prefix_ref));
+	test_checkpoint_prefix_ref.claim.identity = op->claim.identity;
+	test_checkpoint_prefix_ref.claim.database_incarnation = op->database_incarnation;
+	test_checkpoint_prefix_ref.claim.max_config_generation = op->config_generation;
+	sha256_bytes(claim, sizeof(claim), test_checkpoint_prefix_ref.claim.claim_sha256);
+	test_checkpoint_prefix_ref.timeline = op->timeline;
+	v3_target_path(test_checkpoint_prefix_path, op, "/durable_prefix/current");
+	candidate->state = DB_SHUTDOWNED;
+	candidate->checkPoint = op->first_segment_lsn + SizeOfXLogLongPHD;
+	candidate->checkPointCopy.redo = candidate->checkPoint;
+	candidate->time++;
+	candidate->checkPointCopy.time++;
+	candidate->minRecoveryPoint = 0;
+	candidate->minRecoveryPointTLI = 0;
+	INIT_CRC32C(candidate->crc);
+	COMP_CRC32C(candidate->crc, candidate, offsetof(ControlFileData, crc));
+	FIN_CRC32C(candidate->crc);
+	test_flush_tli = op->timeline;
+	v2_checkpoint_wal_record(&op->claim.identity, candidate, 8);
+	test_startup_operation = *op;
+	test_startup_bound = true;
+}
+
 static ClusterWalStartupImage
 v3_startup_checkpoint_fixture(uint8 before[66048], ControlRootImage *root,
 							  ControlFileData *candidate)
 {
 	ClusterControlRootFileToken token, advanced;
 	ClusterWalStartupImage op = v3_begin_fixture(before, root, &token);
-	uint8 claim[112];
 	UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(&op.claim.identity, op.operation_uuid,
 															 &token, &advanced),
 				 0);
@@ -7943,28 +7972,7 @@ v3_startup_checkpoint_fixture(uint8 before[66048], ControlRootImage *root,
 	UT_ASSERT_EQ(cluster_wal_startup_read_locked(root, 0, &op), 0);
 	test_actual_cf = test_cf_mode = NoLock;
 	memcpy(before, root->bytes, 66048);
-	UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&op.claim, claim), 0);
-	memset(&test_checkpoint_prefix_ref, 0, sizeof(test_checkpoint_prefix_ref));
-	test_checkpoint_prefix_ref.claim.identity = op.claim.identity;
-	test_checkpoint_prefix_ref.claim.database_incarnation = op.database_incarnation;
-	test_checkpoint_prefix_ref.claim.max_config_generation = op.config_generation;
-	sha256_bytes(claim, sizeof(claim), test_checkpoint_prefix_ref.claim.claim_sha256);
-	test_checkpoint_prefix_ref.timeline = op.timeline;
-	v3_target_path(test_checkpoint_prefix_path, &op, "/durable_prefix/current");
-	candidate->state = DB_SHUTDOWNED;
-	candidate->checkPoint = op.first_segment_lsn + SizeOfXLogLongPHD;
-	candidate->checkPointCopy.redo = candidate->checkPoint;
-	candidate->time++;
-	candidate->checkPointCopy.time++;
-	candidate->minRecoveryPoint = 0;
-	candidate->minRecoveryPointTLI = 0;
-	INIT_CRC32C(candidate->crc);
-	COMP_CRC32C(candidate->crc, candidate, offsetof(ControlFileData, crc));
-	FIN_CRC32C(candidate->crc);
-	test_flush_tli = op.timeline;
-	v2_checkpoint_wal_record(&op.claim.identity, candidate, 8);
-	test_startup_operation = op;
-	test_startup_bound = true;
+	v3_startup_native_record(&op, candidate);
 	return op;
 }
 
@@ -8060,6 +8068,518 @@ UT_TEST(test_v3_startup_checkpoint_retry_requires_selected_root_durability)
 	UT_ASSERT(memcmp(before, backup, sizeof(before)) == 0);
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_startup_install_retains_predecessor_without_serving)
+{
+	uint8 before[66048];
+	ControlRootImage root, selected;
+	ControlFileData candidate, common;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate), durable;
+	ClusterWalDurablePrefixRef writer;
+	ClusterWalHistoryImage history;
+	if (ut_current_failed)
+		return;
+	history_stage_dirs(0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end,
+															&durable),
+				 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(cluster_control_root_identity_equal(&writer.claim.identity, &op.claim.identity));
+	UT_ASSERT_EQ(writer.timeline, op.timeline);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &selected,
+															 &common, &token),
+				 0);
+	UT_ASSERT_EQ(selected.header.file_txn_seq, root.header.file_txn_seq + 2);
+	UT_ASSERT_EQ(selected.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(selected.header.v2.serving[0], 0);
+	UT_ASSERT(v2_zero(&selected.startup[0], sizeof(selected.startup[0])));
+	UT_ASSERT(memcmp(&selected.startup[3], &root.startup[3], sizeof(root.startup[3])) == 0);
+	UT_ASSERT(memcmp(&selected.records[3], &root.records[3], sizeof(root.records[3])) == 0);
+	UT_ASSERT(memcmp(&selected.records[0], &durable.successor.snapshot, sizeof(selected.records[0]))
+			  == 0);
+	UT_ASSERT_EQ(cluster_wal_history_read_locked(&selected, 0, &history), 0);
+	UT_ASSERT_EQ(history.count, 1);
+	UT_ASSERT(memcmp(&history.records[0].snapshot, &durable.predecessor.snapshot,
+					 sizeof(durable.predecessor.snapshot))
+			  == 0);
+	UT_ASSERT_EQ(history.records[0].refs.history_generation, 0);
+	memcpy(before, selected.bytes, sizeof(before));
+	test_actual_cf = test_cf_mode = NoLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer), 0);
+	v2_assert_primary_unchanged(before);
+	test_startup_bound = false;
+	UT_ASSERT(cluster_control_root_v3_startup_install_writer(&durable, &writer) != 0);
+	UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	test_reserve_mode = false;
+}
+
+static ClusterWalStartupImage
+v3_install_fixture(uint8 before[66048], ControlRootImage *root)
+{
+	ControlFileData candidate, common;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, root, &candidate), durable;
+	history_stage_dirs(0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end,
+															&durable),
+				 0);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, root, &common, &token),
+		0);
+	memcpy(before, root->bytes, 66048);
+	test_actual_cf = test_cf_mode = NoLock;
+	return durable;
+}
+
+UT_TEST(test_v3_startup_install_refuses_wrong_owner_and_intent)
+{
+	for (unsigned installed = 0; installed < 2; ++installed)
+		for (unsigned fault = 0; fault < 17; ++fault) {
+			uint8 before[66048];
+			char path[MAXPGPATH];
+			ControlRootImage root;
+			ClusterWalStartupImage op = v3_install_fixture(before, &root), expected = op;
+			ClusterWalDurablePrefixRef writer;
+			if (ut_current_failed)
+				return;
+			if (installed) {
+				UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+				path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+				read_all_or_abort(path, before, sizeof(before));
+			}
+			switch (fault) {
+			case 0:
+				test_startup_bound = false;
+				break;
+			case 1:
+				MyBackendType = B_BACKEND;
+				break;
+			case 2:
+				ShutdownRequestPending = true;
+				break;
+			case 3:
+				CritSectionCount = 1;
+				break;
+			case 4:
+				test_reserve_provider = false;
+				break;
+			case 5:
+				++test_self_incarnation;
+				break;
+			case 6:
+				++test_epoch;
+				break;
+			case 7:
+				++test_insert;
+				break;
+			case 8:
+				expected.operation_uuid[0] ^= 1;
+				break;
+			case 9:
+				++expected.successor.snapshot.checkpoint_lower_lsn;
+				break;
+			case 10:
+				expected.predecessor.refs.claim_sha256[0] ^= 1;
+				break;
+			case 11:
+				expected.phase = CLUSTER_WAL_STARTUP_INITIALIZING;
+				break;
+			case 12:
+				enableFsync = false;
+				break;
+			case 13:
+				++test_reserve_formation.membership.last_admitted_incarnation[3];
+				break;
+			case 14:
+				test_actual_cf = test_cf_mode = ShareLock;
+				test_checkpoint_outer_cf = true;
+				break;
+			case 15:
+				++expected.successor.publisher_incarnation;
+				break;
+			case 16:
+				expected.prefix.record_crc ^= 1;
+				break;
+			}
+			memset(&writer, 0xa5, sizeof(writer));
+			UT_ASSERT(cluster_control_root_v3_startup_install_writer(&expected, &writer) != 0);
+			UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+			v2_assert_primary_unchanged(before);
+			UT_ASSERT_EQ(test_actual_cf, fault == 14 ? ShareLock : NoLock);
+			UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+			CritSectionCount = 0;
+			test_checkpoint_outer_cf = false;
+			test_actual_cf = test_cf_mode = NoLock;
+			test_reserve_mode = false;
+		}
+}
+
+UT_TEST(test_v3_startup_install_requires_actual_old_and_new_files)
+{
+	for (unsigned installed = 0; installed < 2; ++installed)
+		for (unsigned fault = 0; fault < 7; ++fault) {
+			uint8 before[66048];
+			char path[MAXPGPATH], hex[65];
+			ControlRootImage root;
+			ClusterWalStartupImage op = v3_install_fixture(before, &root);
+			ClusterWalDurablePrefixRef writer;
+			if (ut_current_failed)
+				return;
+			if (installed) {
+				UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+				path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+				read_all_or_abort(path, before, sizeof(before));
+			}
+			if (fault == 0)
+				v2_claim_path(&op.predecessor.snapshot.identity, path);
+			if (fault == 1)
+				v2_claim_path(&op.claim.identity, path);
+			if (fault == 2)
+				v3_target_path(path, &op, "/durable_prefix/current");
+			if (fault == 3)
+				v2_checkpoint_wal_path(&op.claim.identity, op.prefix.record_start, op.timeline,
+									   path);
+			if (fault >= 4 && fault <= 5) {
+				const ClusterWalHistoryRecord *r = fault == 4 ? &op.predecessor : &op.successor;
+				for (unsigned i = 0; i < 32; ++i)
+					snprintf(hex + 2 * i, 3, "%02x", r->refs.anchor_sha256[i]);
+				snprintf(path, sizeof(path),
+						 "%s/global/anchor_images/thread_1/generation_" UINT64_FORMAT
+						 "/anchor_" UINT64_FORMAT "-%s.bin",
+						 test_root, r->snapshot.identity.origin_owner_incarnation,
+						 r->refs.anchor_generation, hex);
+			}
+			if (fault == 6)
+				snprintf(path, sizeof(path),
+						 "%s/thread_1/generation_" UINT64_FORMAT "/durable_prefix/current",
+						 cluster_wal_threads_dir,
+						 op.predecessor.snapshot.identity.origin_owner_incarnation);
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT(cluster_control_root_v3_startup_install_writer(&op, &writer) != 0);
+			UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+			v2_assert_primary_unchanged(before);
+			UT_ASSERT_EQ(test_actual_cf, NoLock);
+			UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+			test_reserve_mode = false;
+		}
+}
+
+UT_TEST(test_v3_startup_install_uncertain_rename_is_not_success)
+{
+	uint8 before[66048], installed[66048];
+	char path[MAXPGPATH];
+	ControlRootImage root;
+	ClusterWalStartupImage op = v3_install_fixture(before, &root);
+	ClusterWalDurablePrefixRef writer;
+	if (ut_current_failed)
+		return;
+	test_fail_after_primary_rename = true;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, installed, sizeof(installed));
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(installed, sizeof(installed), v2_storage, TEST_SYSID, &root),
+		0);
+	UT_ASSERT_EQ(root.startup[0].generation, 0);
+	UT_ASSERT_EQ(root.records[0].identity.origin_owner_incarnation,
+				 op.claim.identity.origin_owner_incarnation);
+	UT_ASSERT_EQ(root.header.v2.serving[0], 0);
+	test_fail_after_primary_rename = false;
+	test_fail_global_sync = true;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+	v2_assert_primary_unchanged(installed);
+	test_fail_global_sync = false;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+	v2_assert_primary_unchanged(installed);
+	/* The previous DURABLE root is still the backup, not the retry image. */
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+	read_all_or_abort(path, installed, sizeof(installed));
+	UT_ASSERT(memcmp(before, installed, sizeof(before)) == 0);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	test_reserve_mode = false;
+}
+
+static void v3_startup_checkpoint_late_change(void);
+
+UT_TEST(test_v3_startup_install_all_sync_and_late_cuts_retain_obligations)
+{
+	unsigned sync_count;
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterWalStartupImage op = v3_install_fixture(before, &root);
+	ClusterWalDurablePrefixRef writer;
+	if (ut_current_failed)
+		return;
+	test_history_sync_count = 0;
+	test_history_fail_sync = UINT_MAX;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+	sync_count = test_history_sync_count;
+	UT_ASSERT(sync_count > 0 && sync_count < 32);
+	test_history_fail_sync = 0;
+	for (unsigned cut = 1; cut <= sync_count + 5; ++cut) {
+		uint8 after[66048];
+		char path[MAXPGPATH];
+		op = v3_install_fixture(before, &root);
+		if (ut_current_failed)
+			return;
+		test_history_sync_count = 0;
+		if (cut <= sync_count)
+			test_history_fail_sync = cut;
+		else if (cut == sync_count + 1)
+			test_checkpoint_x_hook = v3_startup_checkpoint_late_change;
+		else if (cut == sync_count + 2)
+			test_checkpoint_published_hook = v3_startup_checkpoint_late_change;
+		else if (cut == sync_count + 3)
+			test_fence_after_primary = true;
+		else if (cut == sync_count + 4)
+			test_release_after_primary = true;
+		else
+			test_walr_end_result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		UT_ASSERT(cluster_control_root_v3_startup_install_writer(&op, &writer) != 0);
+		UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, after, sizeof(after));
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_decode(after, sizeof(after), v2_storage, TEST_SYSID, &root), 0);
+		UT_ASSERT_EQ(root.header.v2.serving[0], 0);
+		UT_ASSERT_EQ(root.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+		if (root.startup[0].generation != 0)
+			v2_assert_primary_unchanged(before);
+		else {
+			ClusterWalHistoryImage history;
+			test_actual_cf = test_cf_mode = ShareLock;
+			UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 0, &history), 0);
+			UT_ASSERT_EQ(history.count, 1);
+			UT_ASSERT_EQ(history.records[0].snapshot.identity.origin_owner_incarnation,
+						 op.predecessor.snapshot.identity.origin_owner_incarnation);
+		}
+		test_history_fail_sync = 0;
+		test_cf_release_confirmed = true;
+		test_walr_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
+		test_actual_cf = test_cf_mode = NoLock;
+		test_reserve_mode = false;
+	}
+}
+
+/* Independently construct a prior flat history with real claim, native WAL,
+ * prefix and anchor files, then bind that input into the DURABLE fixture. */
+static void
+v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
+					   ClusterWalHistoryImage *history, unsigned count)
+{
+	static uint64 old_generation = 500000;
+	ClusterRecoveryAnchorRefV2 ref = { 0 };
+	ClusterRecoveryAnchorV2 anchor;
+	ClusterWalHistoryStage stage;
+	ClusterWalStartupStage operation_stage;
+	ClusterWalDurablePrefixRef saved_ref = test_checkpoint_prefix_ref;
+	ClusterWalDurablePrefix saved_prefix = test_checkpoint_prefix;
+	XLogRecPtr saved_insert = test_insert, saved_flush = test_flush,
+			   saved_end = test_checkpoint_end;
+	uint32 saved_crc = test_checkpoint_crc;
+	char path[MAXPGPATH], saved_path[MAXPGPATH], hex[65];
+	uint8 encoded[512], bytes[66048], uuid[16] = { 0x61 };
+	ControlRootImage old;
+	strlcpy(saved_path, test_checkpoint_prefix_path, sizeof(saved_path));
+	ref.identity = op->predecessor.snapshot.identity;
+	ref.database_incarnation = op->database_incarnation;
+	ref.max_config_generation = op->config_generation;
+	ref.anchor_generation = op->predecessor.refs.anchor_generation;
+	memcpy(ref.anchor_sha256, op->predecessor.refs.anchor_sha256, 32);
+	memcpy(ref.claim_sha256, op->predecessor.refs.claim_sha256, 32);
+	for (unsigned i = 0; i < 32; ++i)
+		snprintf(hex + 2 * i, 3, "%02x", ref.anchor_sha256[i]);
+	snprintf(path, sizeof(path),
+			 "%s/global/anchor_images/thread_1/generation_" UINT64_FORMAT "/anchor_" UINT64_FORMAT
+			 "-%s.bin",
+			 test_root, ref.identity.origin_owner_incarnation, ref.anchor_generation, hex);
+	read_all_or_abort(path, encoded, sizeof(encoded));
+	UT_ASSERT_EQ(cluster_recovery_anchor_v2_decode(encoded, sizeof(encoded), &ref, &anchor), 0);
+	memset(history, 0, sizeof(*history));
+	history->count = count;
+	for (unsigned i = 0; i < count; ++i) {
+		ClusterRecoveryAnchorV2 historical = anchor;
+		ControlFileData native = { 0 };
+		old = *root;
+		memset(old.startup, 0, sizeof(old.startup));
+		old.header.format_version = 2;
+		old.records[0].identity.origin_owner_incarnation = ++old_generation;
+		old.records[0].identity.thread_claim_created_at += old_generation;
+		old.publisher_incarnation[0] = old_generation;
+		UT_ASSERT_EQ(cluster_control_root_v2_encode(&old), 0);
+		memcpy(bytes, old.bytes, sizeof(bytes));
+		v2_claim_object(bytes, 0, &old);
+		historical.identity = old.records[0].identity;
+		memcpy(historical.claim_sha256, old.refs[0].claim_sha256, 32);
+		v2_anchor_object(bytes, &historical, &historical.identity, path);
+		UT_ASSERT_EQ(
+			cluster_control_root_v2_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &old), 0);
+		test_checkpoint_prefix_ref = saved_ref;
+		test_checkpoint_prefix_ref.claim.identity = historical.identity;
+		memcpy(test_checkpoint_prefix_ref.claim.claim_sha256, historical.claim_sha256, 32);
+		snprintf(path, sizeof(path), "%s/thread_1/generation_" UINT64_FORMAT "/durable_prefix",
+				 cluster_wal_threads_dir, historical.identity.origin_owner_incarnation);
+		UT_ASSERT_EQ(mkdir(path, 0700), 0);
+		snprintf(test_checkpoint_prefix_path, sizeof(test_checkpoint_prefix_path), "%s/current",
+				 path);
+		native.state = DB_SHUTDOWNED;
+		native.checkPoint = historical.checkpoint;
+		native.checkPointCopy = historical.checkpoint_copy;
+		v2_checkpoint_wal_record(&historical.identity, &native, 0);
+		old.records[0].checkpoint_record_crc32c = test_checkpoint_crc;
+		old.records[0].tail_last_record_crc32c = test_checkpoint_crc;
+		old.records[0].validated_tail_lsn_exclusive = test_checkpoint_end;
+		history->records[i].snapshot = old.records[0];
+		history->records[i].refs = old.refs[0];
+		history->records[i].publisher_incarnation = old.publisher_incarnation[0];
+		history->records[i].publisher_node = 0;
+	}
+	test_checkpoint_prefix_ref = saved_ref;
+	test_checkpoint_prefix = saved_prefix;
+	test_insert = saved_insert;
+	test_flush = saved_flush;
+	test_checkpoint_end = saved_end;
+	test_checkpoint_crc = saved_crc;
+	strlcpy(test_checkpoint_prefix_path, saved_path, sizeof(saved_path));
+	put_u64_le(uuid, ++old_generation);
+	root->header.file_txn_seq++;
+	test_actual_cf = test_cf_mode = ExclusiveLock;
+	UT_ASSERT_EQ(
+		cluster_wal_history_prepare(root, 0, history, root->header.file_txn_seq, uuid, &stage), 0);
+	UT_ASSERT_EQ(cluster_wal_history_install(&stage), 0);
+	root->refs[0].history_generation = stage.generation;
+	memcpy(root->refs[0].history_sha256, stage.sha256, 32);
+	op->predecessor.refs = root->refs[0];
+	op->generation = root->header.file_txn_seq;
+	UT_ASSERT_EQ(cluster_wal_startup_prepare(root, 0, op, &operation_stage), 0);
+	UT_ASSERT_EQ(cluster_wal_startup_install(&operation_stage), 0);
+	root->startup[0].generation = operation_stage.generation;
+	memcpy(root->startup[0].sha256, operation_stage.sha256, 32);
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(root), 0);
+	v2_write_roots(root->bytes);
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(root, 0, op), 0);
+	UT_ASSERT_EQ(cluster_wal_history_discard(&stage), 0);
+	UT_ASSERT_EQ(cluster_wal_startup_discard(&operation_stage), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+}
+
+UT_TEST(test_v3_startup_install_keeps_full_history_and_refuses_overflow)
+{
+	for (unsigned count = 2; count <= 128; count += 126) {
+		uint8 before[66048];
+		ControlRootImage root, selected;
+		ControlFileData common;
+		ClusterControlRootFileToken token;
+		ClusterWalStartupImage op = v3_install_fixture(before, &root);
+		ClusterWalHistoryImage old_history, actual;
+		ClusterWalDurablePrefixRef writer;
+		v3_install_add_history(&root, &op, &old_history, count);
+		if (ut_current_failed)
+			return;
+		memcpy(before, root.bytes, sizeof(before));
+		if (count == 128) {
+			UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer),
+						 CLUSTER_CONTROL_ROOT_RANGE_INVALID);
+			UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+			v2_assert_primary_unchanged(before);
+			continue;
+		}
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+		test_actual_cf = test_cf_mode = ShareLock;
+		UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &selected,
+																 &common, &token),
+					 0);
+		UT_ASSERT_EQ(cluster_wal_history_read_locked(&selected, 0, &actual), 0);
+		UT_ASSERT_EQ(actual.count, 3);
+		for (unsigned i = 0; i < count; ++i) {
+			UT_ASSERT(memcmp(&old_history.records[i].snapshot, &actual.records[i + 1].snapshot,
+							 sizeof(actual.records[0].snapshot))
+					  == 0);
+			UT_ASSERT(memcmp(&old_history.records[i].refs, &actual.records[i + 1].refs,
+							 sizeof(actual.records[0].refs))
+					  == 0);
+		}
+		UT_ASSERT_EQ(actual.records[0].refs.history_generation, 0);
+		UT_ASSERT_EQ(actual.records[0].snapshot.identity.origin_owner_incarnation,
+					 op.predecessor.snapshot.identity.origin_owner_incarnation);
+		test_actual_cf = test_cf_mode = NoLock;
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+		/* A missing retained claim cannot be silently skipped on retry. */
+		{
+			char path[MAXPGPATH];
+			v2_claim_path(&old_history.records[0].snapshot.identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT(cluster_control_root_v3_startup_install_writer(&op, &writer) != 0);
+			UT_ASSERT(v2_zero(&writer, sizeof(writer)));
+			v2_assert_primary_unchanged(selected.bytes);
+		}
+	}
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_startup_install_sparse_pair_has_no_four_member_assumption)
+{
+	uint8 before[66048];
+	ControlRootImage root, selected;
+	ControlFileData common, candidate;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage own = v3_install_fixture(before, &root), peer, durable;
+	ClusterWalDurablePrefixRef writer;
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&own, &writer), 0);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root, &common, &token),
+		0);
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 3, &peer), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&peer.predecessor.snapshot.identity,
+															&selected, &candidate, &token),
+				 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	cluster_node_id = 3;
+	test_self_incarnation = test_membership_incarnation
+		= peer.claim.identity.origin_owner_incarnation;
+	v3_startup_native_record(&peer, &candidate);
+	history_stage_dirs(3);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&peer.claim.identity,
+															peer.operation_uuid, &candidate,
+															test_checkpoint_end, &durable),
+				 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&durable, &writer), 0);
+	UT_ASSERT_EQ(writer.claim.identity.origin_thread_id, 4);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &selected,
+															 &common, &token),
+				 0);
+	UT_ASSERT_EQ(selected.header.v2.configured[0], 9);
+	UT_ASSERT_EQ(selected.header.v2.serving[0], 0);
+	UT_ASSERT_EQ(selected.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(selected.startup[0].generation, 0);
+	UT_ASSERT_EQ(selected.startup[3].generation, 0);
+	UT_ASSERT(memcmp(&selected.records[0], &root.records[0], sizeof(root.records[0])) == 0);
+	UT_ASSERT(memcmp(&selected.refs[0], &root.refs[0], sizeof(root.refs[0])) == 0);
+	UT_ASSERT(memcmp(&selected.records[3], &durable.successor.snapshot, sizeof(selected.records[3]))
+			  == 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	cluster_node_id = 0;
 	test_reserve_mode = false;
 }
 
@@ -13064,11 +13584,18 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(248);
+	UT_PLAN(255);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
 	UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
 	UT_RUN(test_v3_startup_checkpoint_retry_requires_selected_root_durability);
+	UT_RUN(test_v3_startup_install_retains_predecessor_without_serving);
+	UT_RUN(test_v3_startup_install_refuses_wrong_owner_and_intent);
+	UT_RUN(test_v3_startup_install_requires_actual_old_and_new_files);
+	UT_RUN(test_v3_startup_install_uncertain_rename_is_not_success);
+	UT_RUN(test_v3_startup_install_all_sync_and_late_cuts_retain_obligations);
+	UT_RUN(test_v3_startup_install_keeps_full_history_and_refuses_overflow);
+	UT_RUN(test_v3_startup_install_sparse_pair_has_no_four_member_assumption);
 	UT_RUN(test_v3_startup_checkpoint_refuses_runtime_and_control_drift);
 	UT_RUN(test_v3_startup_checkpoint_requires_real_successor_bytes);
 	UT_RUN(test_v3_startup_checkpoint_persistence_and_late_races_keep_obligations);

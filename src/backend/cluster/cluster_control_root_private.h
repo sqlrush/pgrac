@@ -189,6 +189,12 @@ cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *se
 extern ClusterControlRootResult cluster_control_root_v3_startup_checkpoint(
 	const ClusterControlRootIdentity *self, const uint8 operation_uuid[16],
 	const ControlFileData *control, XLogRecPtr end, ClusterWalStartupImage *out);
+/* DURABLE intent must match the selected operation, or the exact already
+ * installed successor and full retained union on retry. Owns WALR/CF, never
+ * admits SQL or publishes the runtime writer mirror. Refusal clears out. */
+extern ClusterControlRootResult
+cluster_control_root_v3_startup_install_writer(const ClusterWalStartupImage *expected,
+											   ClusterWalDurablePrefixRef *out);
 
 /* Exact selected-object decoding. Does not prove the evidence digest,
  * inspect physical WAL or authorize a state transition. All output clears on
