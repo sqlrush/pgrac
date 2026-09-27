@@ -404,7 +404,7 @@ static void ExtendMultiXactMember(MultiXactOffset offset, int nmembers);
 static bool MultiXactOffsetWouldWrap(MultiXactOffset boundary, MultiXactOffset start,
 									 uint32 distance);
 static bool SetOffsetVacuumLimit(bool is_startup);
-static bool find_multixact_start(MultiXactId multi, MultiXactOffset *result);
+static bool find_multixact_start(MultiXactId multi, MultiXactOffset *result, bool read_only);
 static void WriteMZeroPageXlogRec(int pageno, uint8 info);
 static void WriteMTruncateXlogRec(Oid oldestMultiDB, MultiXactId startTruncOff,
 								  MultiXactId endTruncOff, MultiXactOffset startTruncMemb,
@@ -2473,6 +2473,46 @@ TrimMultiXact(void)
 	oldestMXactDB = MultiXactState->oldestMultiXactDB;
 	LWLockRelease(MultiXactGenLock);
 
+#ifdef USE_PGRAC_CLUSTER
+	/*
+	 * PGRAC: a clean shared startup consumes retained per-origin state.  It
+	 * cannot repair a contradictory sentinel or erase bytes merely because
+	 * native PG's end-of-recovery trim normally resets its unused suffix.
+	 */
+	if (cluster_shared_config) {
+		MultiXactId sentinel = nextMXact < FirstMultiXactId ? FirstMultiXactId : nextMXact;
+		MultiXactOffset expected = offset;
+		MultiXactOffset observed;
+		int slotno;
+
+		if (MyBackendType != B_STARTUP || InRecovery || !MultiXactIdIsValid(oldestMXact))
+			ereport(FATAL, (errmsg("shared MultiXact startup requires a clean native input")));
+
+		/* RecordNewMultiXact normalizes the next sentinel, not the counters. */
+		if (offset == 0 && nextMXact != FirstMultiXactId)
+			expected = 1;
+		pageno = MultiXactIdToOffsetPage(sentinel);
+		entryno = MultiXactIdToOffsetEntry(sentinel);
+		LWLockAcquire(MultiXactOffsetSLRULock, LW_EXCLUSIVE);
+		MultiXactOffsetCtl->shared->latest_page_number = pageno;
+		slotno = SimpleLruReadPage(MultiXactOffsetCtl, pageno, false, sentinel);
+		observed = ((MultiXactOffset *)MultiXactOffsetCtl->shared->page_buffer[slotno])[entryno];
+		LWLockRelease(MultiXactOffsetSLRULock);
+		if (observed != expected)
+			ereport(FATAL, (errmsg("shared MultiXact next offset contradicts the native input")));
+
+		/* Unallocated member bytes/flags are not evidence of live members. */
+		LWLockAcquire(MultiXactMemberSLRULock, LW_EXCLUSIVE);
+		MultiXactMemberCtl->shared->latest_page_number = MXOffsetToMemberPage(offset);
+		LWLockRelease(MultiXactMemberSLRULock);
+		LWLockAcquire(MultiXactGenLock, LW_EXCLUSIVE);
+		MultiXactState->finishedStartup = true;
+		LWLockRelease(MultiXactGenLock);
+		SetMultiXactIdLimit(oldestMXact, oldestMXactDB, true);
+		return;
+	}
+#endif
+
 	/* Clean up offsets state */
 	LWLockAcquire(MultiXactOffsetSLRULock, LW_EXCLUSIVE);
 
@@ -2986,6 +3026,12 @@ SetOffsetVacuumLimit(bool is_startup)
 	bool prevOldestOffsetKnown;
 	MultiXactOffset offsetStopLimit = 0;
 	MultiXactOffset prevOffsetStopLimit;
+	bool read_only = false;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: limit discovery is not authority to flush retained startup input. */
+	read_only = cluster_shared_config && is_startup;
+#endif
 
 	/*
 	 * NB: Have to prevent concurrent truncation, we might otherwise try to
@@ -3025,7 +3071,12 @@ SetOffsetVacuumLimit(bool is_startup)
 		 * the supposedly-earliest multixact might not really exist.  We are
 		 * careful not to fail in that case.
 		 */
-		oldestOffsetKnown = find_multixact_start(oldestMultiXactId, &oldestOffset);
+		oldestOffsetKnown = find_multixact_start(oldestMultiXactId, &oldestOffset, read_only);
+		if (read_only && (!oldestOffsetKnown || oldestOffset == 0)) {
+			LWLockRelease(MultiXactTruncationLock);
+			ereport(FATAL,
+					(errmsg("shared MultiXact oldest offset is not present in native input")));
+		}
 
 		if (oldestOffsetKnown)
 			ereport(DEBUG1,
@@ -3139,7 +3190,7 @@ MultiXactOffsetWouldWrap(MultiXactOffset boundary, MultiXactOffset start, uint32
  * required, the caller has to protect against that.
  */
 static bool
-find_multixact_start(MultiXactId multi, MultiXactOffset *result)
+find_multixact_start(MultiXactId multi, MultiXactOffset *result, bool read_only)
 {
 	MultiXactOffset offset;
 	int pageno;
@@ -3155,8 +3206,10 @@ find_multixact_start(MultiXactId multi, MultiXactOffset *result)
 	/*
 	 * Write out dirty data, so PhysicalPageExists can work correctly.
 	 */
-	SimpleLruWriteAll(MultiXactOffsetCtl, true);
-	SimpleLruWriteAll(MultiXactMemberCtl, true);
+	if (!read_only) {
+		SimpleLruWriteAll(MultiXactOffsetCtl, true);
+		SimpleLruWriteAll(MultiXactMemberCtl, true);
+	}
 
 	if (!SimpleLruDoesPhysicalPageExist(MultiXactOffsetCtl, pageno))
 		return false;
@@ -3428,7 +3481,7 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	if (oldestMulti == nextMulti) {
 		/* there are NO MultiXacts */
 		oldestOffset = nextOffset;
-	} else if (!find_multixact_start(oldestMulti, &oldestOffset)) {
+	} else if (!find_multixact_start(oldestMulti, &oldestOffset, false)) {
 		ereport(LOG,
 				(errmsg("oldest MultiXact %u not found, earliest MultiXact %u, skipping truncation",
 						oldestMulti, earliest)));
@@ -3443,7 +3496,7 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	if (newOldestMulti == nextMulti) {
 		/* there are NO MultiXacts */
 		newOldestOffset = nextOffset;
-	} else if (!find_multixact_start(newOldestMulti, &newOldestOffset)) {
+	} else if (!find_multixact_start(newOldestMulti, &newOldestOffset, false)) {
 		ereport(LOG, (errmsg("cannot truncate up to MultiXact %u because it does not exist on "
 							 "disk, skipping truncation",
 							 newOldestMulti)));

@@ -28,6 +28,9 @@
 #include "access/xloginsert.h"
 #include "access/xlogutils.h"
 #include "catalog/pg_type.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h" /* PGRAC: retained per-origin startup state */
+#endif
 #include "funcapi.h"
 #include "miscadmin.h"
 #include "pg_trace.h"
@@ -671,6 +674,14 @@ ActivateCommitTs(void)
 	if (IsBootstrapProcessingMode())
 		return;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: activation consumes native startup input, not a backend repair. */
+	if (cluster_shared_config
+		&& (MyBackendType != B_STARTUP
+			|| !TransactionIdIsNormal(XidFromFullTransactionId(ShmemVariableCache->nextXid))))
+		ereport(FATAL, (errmsg("shared commit timestamp activation requires native startup")));
+#endif
+
 	/* If we've done this already, there's nothing to do */
 	LWLockAcquire(CommitTsLock, LW_EXCLUSIVE);
 	if (commitTsShared->commitTsActive)
@@ -714,13 +725,26 @@ ActivateCommitTs(void)
 	/* Create the current segment file, if necessary */
 	if (!SimpleLruDoesPhysicalPageExist(CommitTsCtl, pageno))
 	{
-		int			slotno;
+#ifdef USE_PGRAC_CLUSTER
+		/*
+		 * PGRAC: an absent partial page may be lost retained history.  Never
+		 * reconstruct it as zeros.  At an unused page boundary the ordinary
+		 * WAL-logged ExtendCommitTs call will create the page on allocation.
+		 */
+		if (cluster_shared_config) {
+			if (TransactionIdToCTsEntry(xid) != 0)
+				ereport(FATAL, (errmsg("shared commit timestamp input page is missing")));
+		} else
+#endif
+		{
+			int slotno;
 
-		LWLockAcquire(CommitTsSLRULock, LW_EXCLUSIVE);
-		slotno = ZeroCommitTsPage(pageno, false);
-		SimpleLruWritePage(CommitTsCtl, slotno);
-		Assert(!CommitTsCtl->shared->page_dirty[slotno]);
-		LWLockRelease(CommitTsSLRULock);
+			LWLockAcquire(CommitTsSLRULock, LW_EXCLUSIVE);
+			slotno = ZeroCommitTsPage(pageno, false);
+			SimpleLruWritePage(CommitTsCtl, slotno);
+			Assert(!CommitTsCtl->shared->page_dirty[slotno]);
+			LWLockRelease(CommitTsSLRULock);
+		}
 	}
 
 	/* Change the activation status in shared memory. */
@@ -760,6 +784,12 @@ DeactivateCommitTs(void)
 	ShmemVariableCache->newestCommitTsXid = InvalidTransactionId;
 
 	LWLockRelease(CommitTsLock);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: disabling answers does not retire retained recovery input. */
+	if (cluster_shared_config)
+		return;
+#endif
 
 	/*
 	 * Remove *all* files.  This is necessary so that there are no leftover
