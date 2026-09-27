@@ -11,6 +11,7 @@
 #include "catalog/pg_control.h"
 #include "cluster/cluster_control_root.h"
 #include "cluster/cluster_wal_durable_prefix.h"
+#include "cluster/cluster_startup_exit.h"
 
 /* PGRAC: backend-private decoded carrier, never a disk struct or permission.
  * Keep the public identity/snapshot/token ABI unchanged.  Both v1 and v2
@@ -84,6 +85,16 @@ typedef struct ControlRootImage {
 StaticAssertDecl(sizeof(ControlRootCommonV2) == 184, "root-v2 logical common carrier");
 StaticAssertDecl(sizeof(ControlRootRecordRefsV2) == 112, "root-v2 logical record references");
 StaticAssertDecl(sizeof(ControlRootStartupRefV3) == 40, "root-v3 logical startup reference");
+
+/* Derive the complete clean-restart observation cut from literal root-v3
+ * bytes and an exact captured formation. No I/O, peer substitution, serving
+ * or reservation. Caller must use a CF-held primary and revalidate the same
+ * root/formation/provider under the actual publication owner before CAS.
+ * Failure clears output; input/output aliasing is refused. */
+struct ClusterFormationSnapshotV1;
+extern ClusterControlRootResult cluster_control_root_v3_clean_exit_cut(
+	const uint8 *bytes, Size length, const uint8 storage_uuid[16], uint64 system_identifier,
+	const struct ClusterFormationSnapshotV1 *formation, ClusterStartupExitCut *out);
 
 /* PGRAC: bounded retained-writer input, never an authority/retirement proof.
  * Author: SqlRush <sqlrush@gmail.com>

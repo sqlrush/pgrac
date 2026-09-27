@@ -3943,6 +3943,115 @@ v3_fixture(uint8 bytes[66048], bool pending)
 	v2_checksums(bytes);
 }
 
+static void
+v3_exit_fixture(uint8 bytes[66048], ClusterFormationSnapshotV1 *formation)
+{
+	v3_fixture(bytes, false);
+	put_u32_le(bytes + 196, CLUSTER_CONTROL_ROOT_DATABASE_CLOSED);
+	bytes[512 + 10] = bytes[512 + 127 * 512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	v2_checksums(bytes);
+	memset(formation, 0, sizeof(*formation));
+	formation->local_epoch = 51;
+	formation->membership.membership_state[0] = CLUSTER_MEMBER_MEMBER;
+	formation->membership.membership_state[127] = CLUSTER_MEMBER_MEMBER;
+	formation->membership.last_admitted_incarnation[0] = 101;
+	formation->membership.last_admitted_incarnation[127] = 228;
+}
+
+UT_TEST(test_v3_clean_exit_cut_keeps_complete_root_roster)
+{
+	uint8 bytes[66048];
+	ClusterFormationSnapshotV1 formation;
+	ClusterStartupExitCut cut, changed;
+	v3_exit_fixture(bytes, &formation);
+	UT_ASSERT_EQ(cluster_control_root_v3_clean_exit_cut(bytes, sizeof(bytes), v2_storage,
+														TEST_SYSID, &formation, &cut),
+				 0);
+	UT_ASSERT_EQ(cut.required[0], 1);
+	UT_ASSERT_EQ(cut.required[1], UINT64_C(1) << 63);
+	UT_ASSERT_EQ(cut.predecessor[0], 99);
+	UT_ASSERT_EQ(cut.predecessor[127], 226);
+	UT_ASSERT_EQ(cut.observer[0], 101);
+	UT_ASSERT_EQ(cut.observer[127], 228);
+	UT_ASSERT_EQ(cut.key.coordinator, 0);
+	UT_ASSERT_EQ(cut.key.coordinator_incarnation, 101);
+	UT_ASSERT_EQ(cut.key.epoch, 51);
+	UT_ASSERT_EQ(cut.key.database_incarnation, 41);
+	UT_ASSERT_EQ(cut.key.config_generation, 47);
+	UT_ASSERT_EQ(cut.key.root_sequence, 7);
+	UT_ASSERT(memcmp(cut.key.storage_uuid, v2_storage, 16) == 0);
+	UT_ASSERT(!v2_zero(cut.key.root_sha256, 32));
+	put_u64_le(bytes + 16, 8);
+	v2_checksums(bytes);
+	UT_ASSERT_EQ(cluster_control_root_v3_clean_exit_cut(bytes, sizeof(bytes), v2_storage,
+														TEST_SYSID, &formation, &changed),
+				 0);
+	UT_ASSERT(memcmp(changed.key.root_sha256, cut.key.root_sha256, 32) != 0);
+}
+
+UT_TEST(test_v3_clean_exit_cut_never_shrinks_missing_members)
+{
+	for (unsigned fault = 0; fault < 15; ++fault) {
+		uint8 bytes[66048];
+		ClusterFormationSnapshotV1 formation;
+		ClusterStartupExitCut cut;
+		v3_exit_fixture(bytes, &formation);
+		switch (fault) {
+		case 0:
+			formation.membership.membership_state[127] = CLUSTER_MEMBER_DEAD;
+			break;
+		case 1:
+			formation.membership.membership_state[127] = CLUSTER_MEMBER_ABSENT;
+			break;
+		case 2:
+			formation.membership.last_admitted_incarnation[127] = 226;
+			break;
+		case 3:
+			formation.membership.last_admitted_incarnation[127] = 0;
+			break;
+		case 4:
+			formation.local_epoch = 0;
+			break;
+		case 5:
+			formation.prebump_sync_active = 1;
+			break;
+		case 6:
+			formation.self_join_failed = 1;
+			break;
+		case 7:
+			formation.pending_join_bitmap[0] = 1;
+			break;
+		case 8:
+			formation.excluded_bitmap[15] = 0x80;
+			break;
+		case 9:
+			formation.membership.membership_state[3] = CLUSTER_MEMBER_MEMBER;
+			break;
+		case 10:
+			bytes[512 + 127 * 512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN;
+			break;
+		case 11:
+			put_u32_le(bytes + 196, CLUSTER_CONTROL_ROOT_DATABASE_OPEN);
+			break;
+		case 12:
+			put_u32_le(bytes + 76, CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED);
+			break;
+		case 13:
+			formation.reserved[1] = 1;
+			break;
+		case 14:
+			bytes[4] = 2;
+			break;
+		}
+		v2_checksums(bytes);
+		memset(&cut, 0xff, sizeof(cut));
+		UT_ASSERT(cluster_control_root_v3_clean_exit_cut(bytes, sizeof(bytes), v2_storage,
+														 TEST_SYSID, &formation, &cut)
+				  != 0);
+		UT_ASSERT(v2_zero(&cut, sizeof(cut)));
+	}
+}
+
 UT_TEST(test_v3_preserves_pending_initialization_in_exact_root)
 {
 	uint8 bytes[66048];
@@ -11786,7 +11895,9 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(228);
+	UT_PLAN(230);
+	UT_RUN(test_v3_clean_exit_cut_keeps_complete_root_roster);
+	UT_RUN(test_v3_clean_exit_cut_never_shrinks_missing_members);
 	UT_RUN(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor);
 	UT_RUN(test_v3_failure_publishers_preserve_pending_and_authenticate_native_input);
 	UT_RUN(test_v3_failure_publication_retains_old_authority_and_no_fallback);

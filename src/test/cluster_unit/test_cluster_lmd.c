@@ -105,6 +105,9 @@ ErrorContextCallback *error_context_stack;
 static sigjmp_buf test_main_exit;
 static bool test_main_running;
 static bool test_probe_waiting;
+/* Legacy stop-loop fixture; PRE2 roster qualification uses the actual
+ * production member-mask body in the normal-stop unit program. */
+bool cluster_shared_config = false;
 static int test_main_case, test_main_waits, test_main_polls, test_main_scans;
 static int test_main_coord_scans;
 static int test_main_exit_code, test_error_level;

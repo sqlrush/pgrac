@@ -51,7 +51,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
         test_pgrac_fenced_target_request \
         test_pgrac_fenced_pacemaker_owned \
-        test_cluster_update_trace test_cluster_cr_dependency \
+        test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
@@ -437,6 +437,15 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_cf_poll,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_walr,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_ir,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
+
+# PGRAC: actual evidence codec/collector with transport/producer boundary fixtures.
+# Author: SqlRush <sqlrush@gmail.com>
+CLUSTER_STARTUP_EXIT_O = $(top_builddir)/src/backend/cluster/cluster_startup_exit.o
+test_cluster_startup_exit: test_cluster_startup_exit.c unit_test.h $(CLUSTER_STARTUP_EXIT_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) cluster_unit_port_stubs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_STARTUP_EXIT_O) \
+		$(CLUSTER_UNIT_CRYPTOHASH_O) $(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(LIBS) -o $@
 
 # PGRAC: real cleanup registry/codec, with only allocation and LWLock fixtures.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -2519,9 +2528,9 @@ test_cluster_lmon_stop_service.inc: $(top_srcdir)/src/backend/cluster/cluster_cl
 	     /^cl_normal_stop_service_mask_valid\(/ { print "static bool"; emit=1; count++ } \
 	     /^cluster_normal_stop_fail\(/ { print "void"; emit=1; count++ } \
 	     /^cluster_normal_stop_failure\(/ { print "ClusterNormalStopFailure"; emit=1; count++ } \
-	     /^cl_normal_stop_actor_bit\(/ { print "static uint32"; emit=1; count++ } \
+	     /^cl_normal_stop_actor_bit\(/ || /^cl_normal_stop_member_mask\(/ { print "static uint32"; emit=1; count++ } \
 	     /^cluster_normal_stop_service_(idle|seal)\(/ { print "ClusterNormalStopPollResult"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 12) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 13) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \

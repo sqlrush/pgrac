@@ -1763,6 +1763,89 @@ cluster_control_root_v3_read_thread_locked(const ClusterControlRootIdentity *sel
 	return read_thread_version(self, root, out, token, CONTROL_ROOT_HEADER_VERSION_V3);
 }
 
+/* PGRAC: derive observations for every configured predecessor, never an
+ * ALIVE-based subset. A decoded clean state is still not exit evidence.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_control_root_v3_clean_exit_cut(const uint8 *bytes, Size length,
+									   const uint8 storage_uuid[16], uint64 system_identifier,
+									   const ClusterFormationSnapshotV1 *formation,
+									   ClusterStartupExitCut *out)
+{
+	ControlRootImage *root;
+	ClusterStartupExitCut cut = { 0 };
+	ClusterControlRootResult result;
+	bool alias = history_ranges_overlap(bytes, length, out, sizeof(*out))
+				 || history_ranges_overlap(storage_uuid, 16, out, sizeof(*out))
+				 || history_ranges_overlap(formation, sizeof(*formation), out, sizeof(*out));
+	int coordinator = -1;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (alias || out == NULL || formation == NULL || bytes == NULL || storage_uuid == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (formation->local_epoch == 0 || formation->prebump_sync_active != 0
+		|| formation->self_join_failed != 0
+		|| !bytes_are_zero(formation->reserved, sizeof(formation->reserved))
+		|| !bytes_are_zero(formation->pending_join_bitmap, sizeof(formation->pending_join_bitmap)))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	root = palloc(sizeof(*root));
+	result = cluster_control_root_v3_decode(bytes, length, storage_uuid, system_identifier, root);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		goto done;
+	if (root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_CLOSED) {
+		result = CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+		goto done;
+	}
+	memcpy(cut.required, root->header.v2.configured, sizeof(cut.required));
+	result = CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
+		uint8 bit = (uint8)(1u << (node % 8));
+		if ((cut.required[node / 64] & (UINT64_C(1) << (node % 64))) == 0) {
+			if (formation->membership.membership_state[node] == CLUSTER_MEMBER_MEMBER)
+				goto done;
+			continue;
+		}
+		if (!root->present[node] || root->startup[node].generation != 0
+			|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
+			|| formation->membership.membership_state[node] != CLUSTER_MEMBER_MEMBER
+			|| ((formation->excluded_bitmap[node / 8] | formation->clean_departed_bitmap[node / 8]
+				 | formation->removed_bitmap[node / 8])
+				& bit)
+				   != 0)
+			goto done;
+		cut.predecessor[node] = root->records[node].identity.origin_owner_incarnation;
+		cut.observer[node] = formation->membership.last_admitted_incarnation[node];
+		if (cut.predecessor[node] == 0 || cut.observer[node] <= cut.predecessor[node])
+			goto done;
+		/* Existing formation coordinator rule: the lowest MEMBER, not a
+		 * new election or an independently liveness-filtered candidate. */
+		if (coordinator < 0)
+			coordinator = (int)node;
+	}
+	if (coordinator < 0)
+		goto done;
+	cut.key.coordinator = (uint32)coordinator;
+	cut.key.coordinator_incarnation = cut.observer[coordinator];
+	cut.key.epoch = formation->local_epoch;
+	cut.key.root_sequence = root->header.file_txn_seq;
+	cut.key.system_identifier = root->header.system_identifier;
+	cut.key.database_incarnation = root->header.v2.database_incarnation;
+	cut.key.config_generation = root->header.v2.config_generation;
+	memcpy(cut.key.storage_uuid, root->header.storage_uuid, 16);
+	memcpy(cut.key.authority_uuid, root->header.authority_uuid, 16);
+	if (!control_root_sha256(root->bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, cut.key.root_sha256)) {
+		result = CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+		goto done;
+	}
+	*out = cut;
+	result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+done:
+	pfree(root);
+	return result;
+}
+
 /* PGRAC: a read-only runtime view requires a live exact local owner; this is
  * not the early postmaster sizing read or the recovery owner's read API.
  * Author: SqlRush <sqlrush@gmail.com>

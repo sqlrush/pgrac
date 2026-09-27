@@ -296,7 +296,11 @@ typedef enum ClusterICMsgType {
 	PGRAC_IC_MSG_PCM_X_DRAIN_ACK = 62,
 	PGRAC_IC_MSG_PCM_X_RETIRE_UP_TO = 63,
 	PGRAC_IC_MSG_PCM_X_RETIRE_ACK = 64
-	/* values 66..255 available for future sub-spec; never reuse 0..65 */
+	/* 65 is the semantic-activation carrier below. */
+	,
+	PGRAC_IC_MSG_STARTUP_EXIT = 66 /* PGRAC: exact prior-exit observation,
+								   * CONTROL, startup-only, never admission. */
+								   /* values 67..254 available; 255 is the chunk carrier */
 } ClusterICMsgType;
 
 /* Spec-8.4C D13 full-member semantic-activation acknowledgement carrier. */

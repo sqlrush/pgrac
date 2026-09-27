@@ -77,6 +77,7 @@
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
+#include "cluster/cluster_startup_exit.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h" /* cluster_hw_register_ic_msg_types (spec-5.7 D1) */
@@ -217,6 +218,10 @@ cluster_lmon_shmem_init(void)
 		};
 
 		cluster_ic_register_msg_type(&heartbeat_info);
+		/* PGRAC: homogeneous shared-control startup only; observations do not
+		 * admit writers. Author: SqlRush <sqlrush@gmail.com> */
+		if (cluster_shared_config)
+			cluster_startup_exit_register();
 		heartbeat_registered = true;
 	}
 

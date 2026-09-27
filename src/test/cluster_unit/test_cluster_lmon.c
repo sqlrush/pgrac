@@ -734,8 +734,16 @@ cluster_ic_tier1_peer_get(int32 peer_id)
  * with cluster_ic_router.  Stub the register API so this address-only
  * link test passes without pulling in the whole router. */
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_startup_exit.h"
 static bool test_semantic_ack_registered;
 static ClusterICMsgTypeInfo test_semantic_ack_registration;
+
+/* PGRAC: this fixture does not certify startup evidence or CONTROL ingress;
+ * the actual registration/handler is tested by test_cluster_startup_exit.
+ * Author: SqlRush <sqlrush@gmail.com> */
+void
+cluster_startup_exit_register(void)
+{}
 
 void
 cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info)
