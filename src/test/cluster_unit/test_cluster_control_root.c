@@ -132,6 +132,18 @@ static ClusterStartupExitResult test_reserve_evidence;
 static ClusterFormationSnapshotV1 test_reserve_formation;
 static ClusterStartupExitCut test_reserve_cut;
 static int test_reserve_fault;
+static bool test_startup_bound;
+static ClusterWalStartupImage test_startup_operation;
+
+bool
+cluster_wal_durable_startup_matches(const ClusterControlRootIdentity *self,
+									const uint8 operation_uuid[16], XLogRecPtr first_segment)
+{
+	return test_startup_bound && MyBackendType == B_STARTUP
+		   && cluster_control_root_identity_equal(self, &test_startup_operation.claim.identity)
+		   && memcmp(operation_uuid, test_startup_operation.operation_uuid, 16) == 0
+		   && first_segment == test_startup_operation.first_segment_lsn;
+}
 
 /* Explicit distributed-owner boundaries. Actual root, configuration, claim,
  * anchor, native WAL and PGWG persistence below remain production code. */
@@ -451,6 +463,9 @@ static bool test_cf_release_confirmed = true;
 static int test_cf_lock_calls = 0;
 static int test_durable_rename_calls = 0;
 static bool test_fail_primary_rename = false;
+static bool test_fail_after_primary_rename = false;
+static bool test_fail_global_sync = false;
+static unsigned test_global_syncs;
 static bool test_create_authorized = true;
 static uint16 test_own_thread = 1;
 /* RF-ROOT P9 verification (contract): stub state for the bit22 latch
@@ -623,6 +638,17 @@ int
 pg_fsync(int fd)
 {
 	struct stat st;
+	struct stat global_st;
+	char global_path[MAXPGPATH];
+	snprintf(global_path, sizeof(global_path), "%s/global", test_root);
+	if (fstat(fd, &st) == 0 && S_ISDIR(st.st_mode) && stat(global_path, &global_st) == 0
+		&& st.st_dev == global_st.st_dev && st.st_ino == global_st.st_ino) {
+		++test_global_syncs;
+		if (test_fail_global_sync) {
+			errno = EIO;
+			return -1;
+		}
+	}
 	if (test_startup_sync_hook != NULL)
 		test_startup_sync_hook();
 	if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)
@@ -669,6 +695,12 @@ durable_rename(const char *oldfile, const char *newfile, int elevel pg_attribute
 	result = rename(oldfile, newfile);
 	if (result == 0 && primary && test_checkpoint_published_hook != NULL)
 		test_checkpoint_published_hook();
+	/* Native durable_rename can fail in its post-rename fsync steps even
+	 * though the new primary is already visible to this process. */
+	if (result == 0 && primary && test_fail_after_primary_rename) {
+		errno = EIO;
+		return -1;
+	}
 	return result;
 }
 
@@ -1357,6 +1389,8 @@ wipe_root_files(void)
 	test_cf_lock_calls = 0;
 	test_durable_rename_calls = 0;
 	test_fail_primary_rename = false;
+	test_fail_after_primary_rename = test_fail_global_sync = false;
+	test_global_syncs = 0;
 	test_create_authorized = true;
 	test_activate_authorized = true;
 	test_publish_authorized = true;
@@ -5669,7 +5703,8 @@ v2_checkpoint_wal_record(const ClusterControlRootIdentity *self, ControlFileData
 	if (fault == 6)
 		checkpoint.time++;
 	record.xl_tot_len = sizeof(record_bytes);
-	record.xl_prev = Min(candidate->checkPointCopy.redo, candidate->checkPoint - 8);
+	record.xl_prev
+		= fault == 8 ? 0 : Min(candidate->checkPointCopy.redo, candidate->checkPoint - 8);
 	record.xl_info = (candidate->state == DB_SHUTDOWNED) != (fault == 5) ? XLOG_CHECKPOINT_SHUTDOWN
 																		 : XLOG_CHECKPOINT_ONLINE;
 	record.xl_rmid = RM_XLOG_ID;
@@ -7887,6 +7922,326 @@ v3_begin_fixture(uint8 before[66048], ControlRootImage *root, ClusterControlRoot
 	test_self_incarnation = test_membership_incarnation
 		= op.claim.identity.origin_owner_incarnation;
 	return op;
+}
+
+/* Build a real independent successor stream after the production all-member
+ * INITIALIZING CAS. The native checkpoint and PGWP files are not mocked. */
+static ClusterWalStartupImage
+v3_startup_checkpoint_fixture(uint8 before[66048], ControlRootImage *root,
+							  ControlFileData *candidate)
+{
+	ClusterControlRootFileToken token, advanced;
+	ClusterWalStartupImage op = v3_begin_fixture(before, root, &token);
+	uint8 claim[112];
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_begin_clean(&op.claim.identity, op.operation_uuid,
+															 &token, &advanced),
+				 0);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&op.predecessor.snapshot.identity, root,
+															candidate, &token),
+				 0);
+	UT_ASSERT_EQ(cluster_wal_startup_read_locked(root, 0, &op), 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	memcpy(before, root->bytes, 66048);
+	UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&op.claim, claim), 0);
+	memset(&test_checkpoint_prefix_ref, 0, sizeof(test_checkpoint_prefix_ref));
+	test_checkpoint_prefix_ref.claim.identity = op.claim.identity;
+	test_checkpoint_prefix_ref.claim.database_incarnation = op.database_incarnation;
+	test_checkpoint_prefix_ref.claim.max_config_generation = op.config_generation;
+	sha256_bytes(claim, sizeof(claim), test_checkpoint_prefix_ref.claim.claim_sha256);
+	test_checkpoint_prefix_ref.timeline = op.timeline;
+	v3_target_path(test_checkpoint_prefix_path, &op, "/durable_prefix/current");
+	candidate->state = DB_SHUTDOWNED;
+	candidate->checkPoint = op.first_segment_lsn + SizeOfXLogLongPHD;
+	candidate->checkPointCopy.redo = candidate->checkPoint;
+	candidate->time++;
+	candidate->checkPointCopy.time++;
+	candidate->minRecoveryPoint = 0;
+	candidate->minRecoveryPointTLI = 0;
+	INIT_CRC32C(candidate->crc);
+	COMP_CRC32C(candidate->crc, candidate, offsetof(ControlFileData, crc));
+	FIN_CRC32C(candidate->crc);
+	test_flush_tli = op.timeline;
+	v2_checkpoint_wal_record(&op.claim.identity, candidate, 8);
+	test_startup_operation = op;
+	test_startup_bound = true;
+	return op;
+}
+
+UT_TEST(test_v3_startup_checkpoint_publishes_only_actual_new_durability)
+{
+	uint8 before[66048];
+	ControlRootImage root, selected;
+	ControlFileData candidate, common;
+	ClusterControlRootFileToken token;
+	ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate), observed;
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end,
+															&observed),
+				 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(observed.phase, CLUSTER_WAL_STARTUP_DURABLE);
+	UT_ASSERT_EQ(observed.successor.snapshot.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN);
+	UT_ASSERT_EQ(observed.successor.snapshot.checkpoint_lower_lsn, candidate.checkPoint);
+	UT_ASSERT_EQ(observed.prefix.exclusive_end, test_checkpoint_end);
+	UT_ASSERT_EQ(observed.prefix.record_crc, test_checkpoint_crc);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_actual_cf = test_cf_mode = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &selected,
+															 &common, &token),
+				 0);
+	UT_ASSERT_EQ(selected.header.file_txn_seq, root.header.file_txn_seq + 1);
+	UT_ASSERT_EQ(selected.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(selected.header.v2.serving[0], 0);
+	UT_ASSERT(memcmp(root.records, selected.records, sizeof(root.records)) == 0);
+	UT_ASSERT(memcmp(root.refs, selected.refs, sizeof(root.refs)) == 0);
+	UT_ASSERT(memcmp(&root.startup[3], &selected.startup[3], sizeof(root.startup[3])) == 0);
+	test_actual_cf = test_cf_mode = NoLock;
+	/* A same-process retry reads the exact selected durable result without
+	 * generating another root/anchor or granting ordinary writer access. */
+	memcpy(before, selected.bytes, sizeof(before));
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end,
+															&observed),
+				 0);
+	v2_assert_primary_unchanged(before);
+	test_startup_bound = false;
+	UT_ASSERT(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+														 &candidate, test_checkpoint_end, &observed)
+			  != 0);
+	UT_ASSERT(v2_zero(&observed, sizeof(observed)));
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_startup_checkpoint_retry_requires_selected_root_durability)
+{
+	uint8 before[66048], selected_bytes[66048], backup[66048];
+	ControlRootImage root;
+	ControlFileData candidate;
+	ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate), out;
+	char path[MAXPGPATH];
+	unsigned syncs, renames;
+	if (ut_current_failed)
+		return;
+	test_fail_after_primary_rename = true;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end, &out),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, selected_bytes, sizeof(selected_bytes));
+	UT_ASSERT(memcmp(before, selected_bytes, sizeof(before)) != 0);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+	read_all_or_abort(path, backup, sizeof(backup));
+	UT_ASSERT(memcmp(before, backup, sizeof(before)) == 0);
+	test_fail_after_primary_rename = false;
+	test_fail_global_sync = true;
+	syncs = test_global_syncs;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end, &out),
+				 CLUSTER_CONTROL_ROOT_IO_ERROR);
+	UT_ASSERT(v2_zero(&out, sizeof(out)));
+	UT_ASSERT(test_global_syncs > syncs);
+	v2_assert_primary_unchanged(selected_bytes);
+	test_fail_global_sync = false;
+	syncs = test_global_syncs;
+	renames = test_durable_rename_calls;
+	UT_ASSERT_EQ(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															&candidate, test_checkpoint_end, &out),
+				 0);
+	UT_ASSERT_EQ(out.phase, CLUSTER_WAL_STARTUP_DURABLE);
+	UT_ASSERT(test_global_syncs > syncs);
+	UT_ASSERT_EQ(test_durable_rename_calls, renames + 1);
+	v2_assert_primary_unchanged(selected_bytes);
+	read_all_or_abort(path, before, sizeof(before));
+	UT_ASSERT(memcmp(before, backup, sizeof(before)) == 0);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_startup_checkpoint_refuses_runtime_and_control_drift)
+{
+	for (int fault = 0; fault < 18; ++fault) {
+		uint8 before[66048], uuid[16];
+		ControlRootImage root;
+		ControlFileData candidate;
+		ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate), out;
+		if (ut_current_failed)
+			return;
+		memcpy(uuid, op.operation_uuid, 16);
+		switch (fault) {
+		case 0:
+			MyBackendType = B_CHECKPOINTER;
+			break;
+		case 1:
+			test_startup_bound = false;
+			break;
+		case 2:
+			ShutdownRequestPending = true;
+			break;
+		case 3:
+			CritSectionCount = 1;
+			break;
+		case 4:
+			test_reserve_provider = false;
+			break;
+		case 5:
+			++test_self_incarnation;
+			break;
+		case 6:
+			++test_epoch;
+			break;
+		case 7:
+			++test_insert;
+			break;
+		case 8:
+			uuid[0] ^= 1;
+			break;
+		case 9:
+			candidate.state = DB_IN_PRODUCTION;
+			break;
+		case 10:
+			candidate.checkPointCopy.redo -= 8;
+			break;
+		case 11:
+			candidate.minRecoveryPoint = 1;
+			break;
+		case 12:
+			candidate.backupStartPoint = 1;
+			break;
+		case 13:
+			++candidate.wal_level;
+			break;
+		case 14:
+			candidate.checkPointCopy.fullPageWrites = !candidate.checkPointCopy.fullPageWrites;
+			break;
+		case 15:
+			++test_reserve_formation.membership.last_admitted_incarnation[3];
+			break;
+		case 16:
+			enableFsync = false;
+			break;
+		case 17:
+			test_actual_cf = test_cf_mode = ShareLock;
+			test_checkpoint_outer_cf = true;
+			break;
+		}
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, uuid, &candidate,
+															 test_checkpoint_end, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		UT_ASSERT_EQ(test_actual_cf, fault == 17 ? ShareLock : NoLock);
+		CritSectionCount = 0;
+		test_checkpoint_outer_cf = false;
+		test_actual_cf = test_cf_mode = NoLock;
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_startup_checkpoint_requires_real_successor_bytes)
+{
+	for (int fault = 0; fault < 10; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ControlFileData candidate;
+		ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate), out;
+		char path[MAXPGPATH];
+		if (ut_current_failed)
+			return;
+		v2_checkpoint_wal_path(&op.claim.identity, candidate.checkPoint, op.timeline, path);
+		if (fault < 6)
+			v2_checkpoint_wal_record(&op.claim.identity, &candidate, fault + 1);
+		if (fault == 6)
+			UT_ASSERT_EQ(unlink(path), 0);
+		if (fault == 7) {
+			test_checkpoint_prefix = (ClusterWalDurablePrefix){ 1, 0, 0, 0 };
+			v2_checkpoint_prefix_write();
+		}
+		if (fault == 8) {
+			test_checkpoint_prefix.record_crc ^= 1;
+			v2_checkpoint_prefix_write();
+		}
+		if (fault == 9) {
+			v2_claim_path(&op.claim.identity, path);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		UT_ASSERT(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															 &candidate, test_checkpoint_end, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		test_reserve_mode = false;
+	}
+}
+
+static void
+v3_startup_checkpoint_late_change(void)
+{
+	test_checkpoint_x_hook = test_checkpoint_published_hook = NULL;
+	++test_reserve_formation.membership.last_admitted_incarnation[3];
+}
+
+UT_TEST(test_v3_startup_checkpoint_persistence_and_late_races_keep_obligations)
+{
+	for (int fault = 0; fault < 10; ++fault) {
+		uint8 before[66048], after[66048];
+		ControlRootImage root;
+		ControlFileData candidate;
+		ClusterWalStartupImage op = v3_startup_checkpoint_fixture(before, &root, &candidate), out;
+		char path[MAXPGPATH];
+		if (ut_current_failed)
+			return;
+		test_history_sync_count = 0;
+		if (fault < 4)
+			test_history_fail_sync = fault + 1;
+		if (fault == 4)
+			test_fail_primary_rename = true;
+		if (fault == 5)
+			test_checkpoint_x_hook = v3_startup_checkpoint_late_change;
+		if (fault == 6)
+			test_checkpoint_published_hook = v3_startup_checkpoint_late_change;
+		if (fault == 7)
+			test_fence_after_primary = true;
+		if (fault == 8)
+			test_release_after_primary = true;
+		if (fault == 9)
+			test_walr_end_result = CLUSTER_WALR_RELEASE_UNCONFIRMED;
+		UT_ASSERT(cluster_control_root_v3_startup_checkpoint(&op.claim.identity, op.operation_uuid,
+															 &candidate, test_checkpoint_end, &out)
+				  != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, after, sizeof(after));
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_decode(after, sizeof(after), v2_storage, TEST_SYSID, &root), 0);
+		UT_ASSERT_EQ(root.header.v2.serving[0], 0);
+		UT_ASSERT(memcmp(after + 512, before + 512, 328) == 0);
+		UT_ASSERT(root.startup[0].generation != 0);
+		if (fault <= 5)
+			v2_assert_primary_unchanged(before);
+		else {
+			/* The root may already have changed. No rollback or erased object
+			 * is allowed simply because the caller could not receive success. */
+			UT_ASSERT(root.header.file_txn_seq > test_reserve_cut.key.root_sequence);
+		}
+		test_cf_release_confirmed = true;
+		test_actual_cf = test_cf_mode = NoLock;
+		test_walr_end_result = CLUSTER_WALR_RELEASE_CONFIRMED;
+		test_history_fail_sync = 0;
+		test_reserve_mode = false;
+	}
 }
 
 UT_TEST(test_v3_begin_failures_preserve_selected_obligations_without_permission)
@@ -12709,9 +13064,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(243);
+	UT_PLAN(248);
 	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
 	UT_RUN(test_v3_target_creates_only_exact_empty_successor);
+	UT_RUN(test_v3_startup_checkpoint_publishes_only_actual_new_durability);
+	UT_RUN(test_v3_startup_checkpoint_retry_requires_selected_root_durability);
+	UT_RUN(test_v3_startup_checkpoint_refuses_runtime_and_control_drift);
+	UT_RUN(test_v3_startup_checkpoint_requires_real_successor_bytes);
+	UT_RUN(test_v3_startup_checkpoint_persistence_and_late_races_keep_obligations);
 	UT_RUN(test_v3_begin_requires_all_declared_empty_targets_before_native_mutation);
 	UT_RUN(test_v3_target_rejects_wrong_owner_before_creation);
 	UT_RUN(test_v3_target_never_adopts_foreign_or_nonempty_namespace);

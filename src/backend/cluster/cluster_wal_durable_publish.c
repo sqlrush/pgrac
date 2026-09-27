@@ -65,6 +65,7 @@ static struct {
 	int pid;
 	uint64 epoch;
 	XLogRecPtr first_lsn;
+	uint8 operation_uuid[16];
 	ClusterWalDurablePrefixRef ref;
 } publish_startup;
 
@@ -590,6 +591,7 @@ cluster_wal_durable_startup_prepare(const ClusterControlRootIdentity *self,
 	publish_startup.pid = MyProcPid;
 	publish_startup.epoch = work.epoch;
 	publish_startup.first_lsn = op.first_segment_lsn;
+	memcpy(publish_startup.operation_uuid, op.operation_uuid, 16);
 	publish_startup.ref = work.ref;
 	result = publish_runtime(&work);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -606,6 +608,19 @@ cluster_wal_durable_startup_prepare(const ClusterControlRootIdentity *self,
 	else
 		*first_segment = op.first_segment_lsn;
 	return result;
+}
+
+bool
+cluster_wal_durable_startup_matches(const ClusterControlRootIdentity *self,
+									const uint8 operation_uuid[16], XLogRecPtr first_segment)
+{
+	PublishWork work = { 0 };
+	work.epoch = cluster_epoch_get_current();
+	return self != NULL && operation_uuid != NULL && MyBackendType == B_STARTUP
+		   && publish_select_writer(&work) && work.startup_first_lsn == first_segment
+		   && memcmp(self, &work.ref.claim.identity, sizeof(*self)) == 0
+		   && memcmp(operation_uuid, publish_startup.operation_uuid, 16) == 0
+		   && publish_runtime(&work) == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 ClusterControlRootResult

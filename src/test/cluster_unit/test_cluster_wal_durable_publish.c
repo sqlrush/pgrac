@@ -723,6 +723,8 @@ UT_TEST(test_startup_first_prefix_requires_real_independent_records)
 		cluster_wal_durable_startup_prepare(&ref.claim.identity, startup_op.operation_uuid, &start),
 		0);
 	UT_ASSERT_EQ(start, wal_segment_size);
+	UT_ASSERT(
+		cluster_wal_durable_startup_matches(&ref.claim.identity, startup_op.operation_uuid, start));
 	if (ut_current_failed)
 		return;
 	a = record_write(start + SizeOfXLogLongPHD, 0, 24);
@@ -734,6 +736,52 @@ UT_TEST(test_startup_first_prefix_requires_real_independent_records)
 	check_result(b.exclusive_end, b, 2);
 	UT_ASSERT_EQ(cluster_wal_durable_publish(1, b.exclusive_end, b.exclusive_end, &covered), 0);
 	check_result(b.exclusive_end, b, 2);
+}
+
+UT_TEST(test_startup_checkpoint_binding_cannot_be_adopted)
+{
+	for (int fault = 0; fault < 9; ++fault) {
+		XLogRecPtr start;
+		uint8 uuid[16];
+		ClusterControlRootIdentity self;
+		startup_fixture();
+		UT_ASSERT_EQ(cluster_wal_durable_startup_prepare(&ref.claim.identity,
+														 startup_op.operation_uuid, &start),
+					 0);
+		self = ref.claim.identity;
+		memcpy(uuid, startup_op.operation_uuid, sizeof(uuid));
+		switch (fault) {
+		case 0:
+			++MyProcPid;
+			break;
+		case 1:
+			++epoch;
+			break;
+		case 2:
+			++incarnation;
+			break;
+		case 3:
+			MyBackendType = B_CHECKPOINTER;
+			break;
+		case 4:
+			ShutdownRequestPending = true;
+			break;
+		case 5:
+			uuid[0] ^= 1;
+			break;
+		case 6:
+			++start;
+			break;
+		case 7:
+			++self.root_lineage_seq;
+			break;
+		case 8:
+			active = false;
+			break;
+		}
+		UT_ASSERT(!cluster_wal_durable_startup_matches(&self, uuid, start));
+		MyProcPid = 79;
+	}
 }
 
 UT_TEST(test_startup_binding_refuses_nonowner_and_nonempty_inputs)
@@ -1482,7 +1530,7 @@ UT_TEST(test_waitable_state_never_masks_lost_permission)
 int
 main(void)
 {
-	UT_PLAN(31);
+	UT_PLAN(32);
 	CritSectionCount = 0;
 	cluster_wal_durable_publish_init();
 	UT_RUN(test_group_flush_complete_and_reuse);
@@ -1511,6 +1559,7 @@ main(void)
 	UT_RUN(test_background_entry_rechecks_before_physical_write);
 	UT_RUN(test_repeated_entry_races_do_not_reset_hang_budget);
 	UT_RUN(test_startup_first_prefix_requires_real_independent_records);
+	UT_RUN(test_startup_checkpoint_binding_cannot_be_adopted);
 	UT_RUN(test_startup_binding_refuses_nonowner_and_nonempty_inputs);
 	UT_RUN(test_startup_empty_does_not_authorize_ordinary_flush);
 	UT_RUN(test_startup_rejects_old_link_partial_header_and_corrupt_first_record);

@@ -184,6 +184,11 @@ extern ClusterControlRootResult
 cluster_control_root_v3_startup_read_writer(const ClusterControlRootIdentity *self,
 											const uint8 operation_uuid[16],
 											ClusterWalStartupImage *out);
+/* Actual native EOR checkpoint of this process's selected new writer. Keeps
+ * the predecessor current and target non-serving; INSTALL is separate. */
+extern ClusterControlRootResult cluster_control_root_v3_startup_checkpoint(
+	const ClusterControlRootIdentity *self, const uint8 operation_uuid[16],
+	const ControlFileData *control, XLogRecPtr end, ClusterWalStartupImage *out);
 
 /* Exact selected-object decoding. Does not prove the evidence digest,
  * inspect physical WAL or authorize a state transition. All output clears on

@@ -57,6 +57,10 @@ extern void cluster_wal_durable_publish_init(void);
 extern ClusterControlRootResult
 cluster_wal_durable_startup_prepare(const ClusterControlRootIdentity *self,
 									const uint8 operation_uuid[16], XLogRecPtr *first_segment);
+/* Process-local initialization ownership, not a root or durability proof. */
+extern bool cluster_wal_durable_startup_matches(const ClusterControlRootIdentity *self,
+												const uint8 operation_uuid[16],
+												XLogRecPtr first_segment);
 /* Nonblocking runtime readiness, not writer admission or a persistent proof.
  * A later epoch race can still defer publish; callers must handle both cuts. */
 extern ClusterControlRootResult cluster_wal_durable_publish_ready(TimeLineID timeline);
