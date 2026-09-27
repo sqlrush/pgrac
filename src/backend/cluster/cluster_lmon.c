@@ -528,6 +528,8 @@ void
 cluster_lmon_shmem_register(void)
 {
 	cluster_shmem_register_region(&cluster_lmon_region);
+	if (cluster_shared_config)
+		cluster_startup_exit_shmem_register();
 }
 
 
@@ -1562,8 +1564,10 @@ LmonMain(void)
 				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
 												 force_all_duties))
 					cluster_ges_lmon_drain_work_queue();
-				if (cluster_shared_config)
+				if (cluster_shared_config) {
 					cluster_control_retire_lmon_tick();
+					cluster_startup_exit_lmon_tick();
+				}
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
 				if (!cluster_gcs_block_family_on_data_plane()
@@ -2368,8 +2372,10 @@ LmonMain(void)
 				if (cluster_lmon_duty_should_run(CLUSTER_LMON_DUTY_GES_WORK_QUEUE,
 												 force_all_duties))
 					cluster_ges_lmon_drain_work_queue();
-				if (cluster_shared_config)
+				if (cluster_shared_config) {
 					cluster_control_retire_lmon_tick();
+					cluster_startup_exit_lmon_tick();
+				}
 				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */

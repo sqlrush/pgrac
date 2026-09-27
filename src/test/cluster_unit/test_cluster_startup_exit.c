@@ -17,10 +17,15 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_lmon.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_startup_exit.h"
+#include "cluster/cluster_shmem.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/timestamp.h"
 
 #undef printf
@@ -43,6 +48,52 @@ static ClusterStartupExitMessage last;
 static int32 last_dest;
 static ClusterICMsgTypeInfo registration;
 static bool drift_on_observe;
+int MyProcPid = 100;
+static unsigned wakeups;
+static const ClusterShmemRegion *registered_region;
+static char shared_bytes[8192] pg_attribute_aligned(MAXIMUM_ALIGNOF);
+static bool shared_found;
+static pg_on_exit_callback exit_callback;
+static Datum exit_callback_arg;
+
+void
+cluster_shmem_register_region(const ClusterShmemRegion *region)
+{
+	registered_region = region;
+}
+
+void *
+ShmemInitStruct(const char *name, Size size, bool *found)
+{
+	UT_ASSERT(strcmp(name, "pgrac startup exit mailbox") == 0);
+	UT_ASSERT(size <= sizeof(shared_bytes));
+	*found = shared_found;
+	shared_found = true;
+	return shared_bytes;
+}
+
+void
+before_shmem_exit(pg_on_exit_callback function, Datum arg)
+{
+	exit_callback = function;
+	exit_callback_arg = arg;
+}
+
+void
+cluster_lmon_wakeup(void)
+{
+	++wakeups;
+}
+
+int
+s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
+{
+	(void)lock;
+	(void)file;
+	(void)line;
+	(void)func;
+	abort();
+}
 
 bool
 pg_strong_random(void *buf, size_t len)
@@ -536,10 +587,119 @@ UT_TEST(codec_aliases_refuse_without_partial_observation)
 		UT_ASSERT_EQ(bytes[i], 0);
 }
 
+UT_TEST(native_executor_uses_actual_lmon_round_without_transporting)
+{
+	ClusterStartupExitCut cut = reset();
+	ClusterStartupExitMessage reply;
+	uint8 digest[32], zero[32] = { 0 };
+	cluster_startup_exit_shmem_register();
+	UT_ASSERT(registered_region != NULL);
+	if (registered_region == NULL)
+		return;
+	shared_found = false;
+	registered_region->init_fn();
+	MyBackendType = B_STARTUP;
+	wakeups = 0;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_WAITING);
+	UT_ASSERT_EQ(sends, 0);
+	UT_ASSERT_EQ(wakeups, 1);
+	MyBackendType = B_LMON;
+	cluster_startup_exit_lmon_tick();
+	UT_ASSERT_EQ(sends, 1);
+	reply = peer_reply(last);
+	ingress(reply, 3, 0);
+	cluster_startup_exit_lmon_tick();
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_READY);
+	UT_ASSERT_NE(memcmp(digest, zero, 32), 0);
+	cluster_startup_exit_request_cancel();
+}
+
+static ClusterStartupExitCut
+mailbox_ready(ClusterStartupExitMessage *reply)
+{
+	ClusterStartupExitCut cut = reset();
+	uint8 digest[32];
+	MyProcPid = 100;
+	shared_found = false;
+	registered_region->init_fn();
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_WAITING);
+	MyBackendType = B_LMON;
+	cluster_startup_exit_lmon_tick();
+	*reply = peer_reply(last);
+	ingress(*reply, 3, 0);
+	cluster_startup_exit_lmon_tick();
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_READY);
+	return cut;
+}
+
+UT_TEST(mailbox_cannot_steal_replay_or_outlive_its_executor)
+{
+	ClusterStartupExitMessage old;
+	ClusterStartupExitCut cut = mailbox_ready(&old);
+	uint8 digest[32], zero[32] = { 0 };
+	MyProcPid = 101;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_UNAVAILABLE);
+	cluster_startup_exit_request_cancel();
+	MyProcPid = 100;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_READY);
+	UT_ASSERT(exit_callback != NULL);
+	if (exit_callback == NULL)
+		return;
+	exit_callback(0, exit_callback_arg);
+	/* No LMON tick between cancellation and resubmission: revision must
+	 * still force a fresh wire nonce instead of reusing the cached proof. */
+	MyProcPid = 101;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_WAITING);
+	MyBackendType = B_LMON;
+	cluster_startup_exit_lmon_tick();
+	UT_ASSERT_NE(last.nonce, old.nonce);
+	ingress(old, 3, 0);
+	cluster_startup_exit_lmon_tick();
+	MyBackendType = B_STARTUP;
+	UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest), CLUSTER_STARTUP_EXIT_WAITING);
+	UT_ASSERT_EQ(memcmp(digest, zero, 32), 0);
+	cluster_startup_exit_request_cancel();
+	MyProcPid = 100;
+}
+
+UT_TEST(mailbox_never_reuses_wrong_cut_or_poisoned_evidence)
+{
+	for (int fault = 0; fault < 5; ++fault) {
+		ClusterStartupExitMessage old;
+		ClusterStartupExitCut cut = mailbox_ready(&old);
+		uint8 digest[32], zero[32] = { 0 };
+		if (fault == 0)
+			++cut.key.root_sequence;
+		if (fault == 1)
+			++incarnations[3];
+		if (fault == 2)
+			quorum = false;
+		if (fault == 3)
+			MyBackendType = B_BACKEND;
+		if (fault == 4) {
+			MyBackendType = B_LMON;
+			old.evidence_sha256[0] ^= 1;
+			ingress(old, 3, 0);
+			MyBackendType = B_STARTUP;
+		}
+		UT_ASSERT_EQ(cluster_startup_exit_request(&cut, digest),
+					 fault == 0 ? CLUSTER_STARTUP_EXIT_WAITING : CLUSTER_STARTUP_EXIT_UNAVAILABLE);
+		UT_ASSERT_EQ(memcmp(digest, zero, 32), 0);
+		MyBackendType = B_STARTUP;
+		cluster_startup_exit_request_cancel();
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
+	UT_RUN(native_executor_uses_actual_lmon_round_without_transporting);
+	UT_RUN(mailbox_cannot_steal_replay_or_outlive_its_executor);
+	UT_RUN(mailbox_never_reuses_wrong_cut_or_poisoned_evidence);
 	UT_RUN(independent_wire_and_encoder);
 	UT_RUN(malformed_wire_never_observation);
 	UT_RUN(sparse_pair_needs_actual_local_and_peer);

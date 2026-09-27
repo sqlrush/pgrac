@@ -124,6 +124,60 @@ static LOCKMODE test_actual_cf;
 static unsigned test_history_sync_count, test_history_fail_sync;
 static bool test_throw_root_read;
 static bool test_close_owned;
+static bool test_reserve_mode, test_reserve_provider, test_reserve_quorum;
+static ClusterStartupExitResult test_reserve_evidence;
+static ClusterFormationSnapshotV1 test_reserve_formation;
+static ClusterStartupExitCut test_reserve_cut;
+static int test_reserve_fault;
+
+/* Explicit distributed-owner boundaries. Actual root, configuration, claim,
+ * anchor, native WAL and PGWG persistence below remain production code. */
+bool
+cluster_external_fence_runtime_active(void)
+{
+	return test_reserve_mode && test_reserve_provider;
+}
+bool
+cluster_qvotec_in_quorum(void)
+{
+	return test_reserve_mode && test_reserve_quorum;
+}
+bool
+cluster_write_fence_enforcing(void)
+{
+	return test_reserve_mode && test_fence;
+}
+ClusterFenceAuthorityReadResult
+cluster_write_fence_read_durable_authority(ClusterFenceAuthorityProof *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!test_reserve_mode || !test_fence)
+		return CLUSTER_FENCE_AUTHORITY_IO_UNAVAILABLE;
+	out->marker.fence_epoch = test_epoch;
+	if (test_reserve_fault == 1)
+		out->marker.fence_epoch++;
+	if (test_reserve_fault == 2)
+		out->marker.fenced_dead_bitmap[0] = 8;
+	return CLUSTER_FENCE_AUTHORITY_OK;
+}
+bool
+cluster_reconfig_capture_formation_snapshot_v1(uint16 thread, ClusterFormationSnapshotV1 *out)
+{
+	if (!test_reserve_mode || thread != cluster_node_id + 1)
+		return false;
+	*out = test_reserve_formation;
+	return true;
+}
+ClusterStartupExitResult
+cluster_startup_exit_request(const ClusterStartupExitCut *cut, uint8 digest[32])
+{
+	memset(digest, 0, 32);
+	if (!test_reserve_mode || memcmp(cut, &test_reserve_cut, sizeof(*cut)) != 0)
+		return CLUSTER_STARTUP_EXIT_UNAVAILABLE;
+	if (test_reserve_evidence == CLUSTER_STARTUP_EXIT_READY)
+		memset(digest, 0x79, 32);
+	return test_reserve_evidence;
+}
 
 bool
 cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan)
@@ -821,6 +875,8 @@ cluster_grd_lookup_master_gen(const ClusterResId *resid pg_attribute_unused(), u
 bool
 cluster_cf_held_is_clusterwide(LOCKMODE mode)
 {
+	if (test_reserve_mode)
+		return test_cf_grant && test_cf_clusterwide && test_actual_cf == mode;
 	return test_cf_grant && test_cf_clusterwide && (test_cf_mode == NoLock || test_cf_mode == mode);
 }
 
@@ -1277,6 +1333,7 @@ static void
 wipe_root_files(void)
 {
 	char path[MAXPGPATH];
+	test_reserve_mode = false;
 
 	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
 	unlink(path);
@@ -7344,6 +7401,293 @@ v2_close_add_peer(uint8 before[66048], int node, ClusterPhase1FullStopPlan *plan
 	return peer;
 }
 
+static void
+v3_reserve_fixture(uint8 before[66048], ControlRootImage *root)
+{
+	ClusterPhase1FullStopPlan plan;
+	char path[MAXPGPATH];
+	const char *dirs[] = { "global/wal_startup", "global/wal_startup/thread_1",
+						   "global/wal_startup/thread_1/.staging", "global/wal_startup/thread_4",
+						   "global/wal_startup/thread_4/.staging" };
+	enableFsync = true;
+	test_reserve_mode = false;
+	v2_close_fixture(before, &plan);
+	(void)v2_close_add_peer(before, 3, &plan);
+	UT_ASSERT_EQ(cluster_control_root_v2_decode(before, 66048, v2_storage, TEST_SYSID, root), 0);
+	root->header.format_version = 3;
+	root->header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_CLOSED;
+	root->records[0].lifecycle = root->records[3].lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED;
+	UT_ASSERT_EQ(cluster_control_root_v3_encode(root), 0);
+	memcpy(before, root->bytes, 66048);
+	v2_write_roots(before);
+	memset(&test_reserve_formation, 0, sizeof(test_reserve_formation));
+	test_reserve_formation.local_epoch = test_epoch;
+	test_reserve_formation.self_join_admitted = 1;
+	for (int node = 0; node <= 3; node += 3) {
+		test_reserve_formation.membership.membership_state[node] = CLUSTER_MEMBER_MEMBER;
+		test_reserve_formation.membership.last_admitted_incarnation[node]
+			= root->records[node].identity.origin_owner_incarnation + 10;
+	}
+	UT_ASSERT_EQ(cluster_control_root_v3_clean_exit_cut(before, 66048, v2_storage, TEST_SYSID,
+														&test_reserve_formation, &test_reserve_cut),
+				 0);
+	test_reserve_mode = test_reserve_provider = test_reserve_quorum = true;
+	test_reserve_fault = 0;
+	test_history_fail_sync = test_history_sync_count = 0;
+	test_reserve_evidence = CLUSTER_STARTUP_EXIT_READY;
+	test_self_incarnation = test_membership_incarnation = test_reserve_cut.observer[0];
+	MyBackendType = B_STARTUP;
+	ShutdownRequestPending = false;
+	test_cf_mode = NoLock;
+	for (unsigned i = 0; i < lengthof(dirs); ++i) {
+		path_for(path, sizeof(path), dirs[i]);
+		UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	}
+}
+
+UT_TEST(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving)
+{
+	uint8 before[66048], actual[66048];
+	ControlRootImage old, root;
+	ClusterControlRootFileToken token;
+	char path[MAXPGPATH];
+	v3_reserve_fixture(before, &old);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(cluster_control_root_v3_reserve_clean(&test_reserve_cut, &token), 0);
+	if (ut_current_failed)
+		return;
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, actual, sizeof(actual));
+	UT_ASSERT_EQ(
+		cluster_control_root_v3_decode(actual, sizeof(actual), v2_storage, TEST_SYSID, &root), 0);
+	UT_ASSERT_EQ(root.header.file_txn_seq, old.header.file_txn_seq + 1);
+	UT_ASSERT_EQ(root.header.v2.database_state, CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED);
+	UT_ASSERT_EQ(root.header.v2.serving[0], 0);
+	UT_ASSERT_EQ(root.header.v2.serving[1], 0);
+	UT_ASSERT_EQ(root.header.v2.configured[0], 9);
+	UT_ASSERT_EQ(token.file_txn_seq, root.header.file_txn_seq);
+	test_cf_mode = ShareLock;
+	test_actual_cf = ShareLock;
+	for (int node = 0; node <= 3; node += 3) {
+		ClusterWalStartupImage startup;
+		UT_ASSERT(memcmp(&root.records[node], &old.records[node], sizeof(root.records[node])) == 0);
+		UT_ASSERT(memcmp(&root.refs[node], &old.refs[node], sizeof(root.refs[node])) == 0);
+		UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, node, &startup), 0);
+		UT_ASSERT_EQ(startup.phase, CLUSTER_WAL_STARTUP_RESERVED);
+		UT_ASSERT_EQ(startup.predecessor_file_sequence, old.header.file_txn_seq);
+		UT_ASSERT(memcmp(startup.predecessor_file_sha256, test_reserve_cut.key.root_sha256, 32)
+				  == 0);
+		UT_ASSERT_EQ(startup.claim.identity.origin_owner_incarnation,
+					 test_reserve_cut.observer[node]);
+		UT_ASSERT_EQ(startup.claim.identity.root_lineage_seq,
+					 old.records[node].identity.root_lineage_seq + 1);
+		UT_ASSERT_EQ(startup.first_segment_lsn % wal_segment_size, 0);
+		UT_ASSERT(startup.first_segment_lsn >= startup.sealed_input_end);
+		UT_ASSERT(v2_zero(&startup.successor, sizeof(startup.successor)));
+		UT_ASSERT(v2_zero(&startup.prefix, sizeof(startup.prefix)));
+	}
+	test_cf_mode = NoLock;
+	test_actual_cf = NoLock;
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_v3_reserve_requires_actual_collective_evidence_and_owner)
+{
+	for (int fault = 0; fault < 13; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		v3_reserve_fixture(before, &root);
+		memset(&token, 0xff, sizeof(token));
+		if (fault == 0)
+			test_reserve_evidence = CLUSTER_STARTUP_EXIT_WAITING;
+		if (fault == 1)
+			test_reserve_evidence = CLUSTER_STARTUP_EXIT_UNAVAILABLE;
+		if (fault == 2)
+			test_reserve_provider = false;
+		if (fault == 3)
+			test_reserve_quorum = false;
+		if (fault == 4)
+			test_fence = false;
+		if (fault == 5)
+			test_reserve_fault = 1;
+		if (fault == 6)
+			test_reserve_fault = 2;
+		if (fault == 7)
+			test_reserve_formation.membership.last_admitted_incarnation[3]++;
+		if (fault == 8)
+			MyBackendType = B_BACKEND;
+		if (fault == 9)
+			ShutdownRequestPending = true;
+		if (fault == 10)
+			test_self_incarnation++;
+		if (fault == 11)
+			enableFsync = false;
+		if (fault == 12)
+			test_system_identifier++;
+		UT_ASSERT(cluster_control_root_v3_reserve_clean(&test_reserve_cut, &token) != 0);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		v2_assert_primary_unchanged(before);
+		if (fault == 12)
+			test_system_identifier--;
+		test_reserve_mode = false;
+	}
+}
+
+static void
+v3_reserve_late_change(void)
+{
+	test_checkpoint_x_hook = NULL;
+	if (test_reserve_fault == 3)
+		test_reserve_formation.membership.last_admitted_incarnation[3]++;
+	else if (test_reserve_fault == 4)
+		test_reserve_provider = false;
+	else if (test_reserve_fault == 5)
+		test_reserve_evidence = CLUSTER_STARTUP_EXIT_WAITING;
+	else if (test_reserve_fault == 6)
+		v2_checkpoint_root_race();
+}
+
+UT_TEST(test_v3_reserve_rechecks_cut_after_wal_scan)
+{
+	for (int fault = 3; fault <= 6; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		v3_reserve_fixture(before, &root);
+		test_reserve_fault = fault;
+		test_checkpoint_x_hook = v3_reserve_late_change;
+		UT_ASSERT(cluster_control_root_v3_reserve_clean(&test_reserve_cut, &token) != 0);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		v2_assert_primary_unchanged(fault == 6 ? v2_race_winner : before);
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_reserve_consumes_real_nonlocal_files)
+{
+	for (int fault = 0; fault < 4; ++fault) {
+		uint8 before[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		char path[MAXPGPATH], saved[MAXPGPATH];
+		v3_reserve_fixture(before, &root);
+		if (fault == 0)
+			v2_checkpoint_wal_path(&root.records[3].identity, root.records[3].checkpoint_lower_lsn,
+								   root.records[3].checkpoint_tli, path);
+		else if (fault == 1)
+			snprintf(path, sizeof(path), "%s/thread_4/generation_" UINT64_FORMAT "/%s",
+					 cluster_wal_threads_dir, root.records[3].identity.origin_owner_incarnation,
+					 CLUSTER_WAL_THREAD_CLAIM_FILENAME);
+		else if (fault == 2)
+			snprintf(path, sizeof(path),
+					 "%s/thread_4/generation_" UINT64_FORMAT "/durable_prefix/current",
+					 cluster_wal_threads_dir, root.records[3].identity.origin_owner_incarnation);
+		else {
+			char digest[65];
+			for (int i = 0; i < 32; i++)
+				snprintf(digest + i * 2, 3, "%02x", root.refs[3].anchor_sha256[i]);
+			snprintf(path, sizeof(path),
+					 "%s/global/anchor_images/thread_4/generation_" UINT64_FORMAT
+					 "/anchor_" UINT64_FORMAT "-%s.bin",
+					 test_root, root.records[3].identity.origin_owner_incarnation,
+					 root.refs[3].anchor_generation, digest);
+		}
+		snprintf(saved, sizeof(saved), "%s.reserve-test-saved", path);
+		UT_ASSERT_EQ(rename(path, saved), 0);
+		UT_ASSERT(cluster_control_root_v3_reserve_clean(&test_reserve_cut, &token) != 0);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+		v2_assert_primary_unchanged(before);
+		UT_ASSERT_EQ(rename(saved, path), 0);
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_reserve_uncertain_publication_never_returns_permission)
+{
+	for (int fault = 0; fault < 6; ++fault) {
+		uint8 before[66048], actual[66048];
+		ControlRootImage root;
+		ClusterControlRootFileToken token;
+		char path[MAXPGPATH];
+		v3_reserve_fixture(before, &root);
+		if (fault == 0)
+			test_fail_primary_rename = true;
+		if (fault == 1)
+			test_fence_after_primary = true;
+		if (fault == 2)
+			test_release_after_primary = true;
+		if (fault == 3)
+			test_history_fail_sync = 1;
+		if (fault == 4) {
+			test_reserve_fault = 3;
+			test_checkpoint_published_hook = v3_reserve_late_change;
+		}
+		if (fault == 5) {
+			test_reserve_fault = 5;
+			test_checkpoint_published_hook = v3_reserve_late_change;
+		}
+		UT_ASSERT(cluster_control_root_v3_reserve_clean(&test_reserve_cut, &token) != 0);
+		UT_ASSERT(v2_zero(&token, sizeof(token)));
+		if (fault == 0 || fault == 3)
+			v2_assert_primary_unchanged(before);
+		else {
+			path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+			read_all_or_abort(path, actual, sizeof(actual));
+			UT_ASSERT_EQ(cluster_control_root_v3_decode(actual, sizeof(actual), v2_storage,
+														TEST_SYSID, &root),
+						 0);
+			UT_ASSERT_EQ(root.header.v2.serving[0], 0);
+			UT_ASSERT(root.startup[0].generation != 0 && root.startup[3].generation != 0);
+		}
+		test_history_fail_sync = 0;
+		test_cf_release_confirmed = true;
+		test_actual_cf = NoLock;
+		test_reserve_mode = false;
+	}
+}
+
+UT_TEST(test_v3_reserve_error_cleanup_keeps_old_authority)
+{
+	uint8 before[66048];
+	ControlRootImage root;
+	ClusterControlRootFileToken token;
+	volatile bool caught = false;
+	int open_before = 0, open_after = 0;
+	v3_reserve_fixture(before, &root);
+	test_stop_share_call = test_cf_lock_calls + 2;
+	test_stop_share_hook = v2_checkpoint_throw_on_x;
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++open_before;
+	PG_TRY();
+	{
+		(void)cluster_control_root_v3_reserve_clean(&test_reserve_cut, &token);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	for (int fd = 0; fd < 256; ++fd)
+		if (fcntl(fd, F_GETFD) >= 0)
+			++open_after;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(open_before, open_after);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_walr_begin_calls, test_walr_end_calls);
+	UT_ASSERT(v2_zero(&token, sizeof(token)));
+	v2_assert_primary_unchanged(before);
+	test_reserve_mode = false;
+}
+
 UT_TEST(test_v2_normal_close_pair_waits_for_last_thread_and_preserves_roster)
 {
 	const int peers[] = { 1, 3 };
@@ -11895,7 +12239,13 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(230);
+	UT_PLAN(236);
+	UT_RUN(test_v3_reserve_clean_publishes_all_sparse_targets_without_serving);
+	UT_RUN(test_v3_reserve_requires_actual_collective_evidence_and_owner);
+	UT_RUN(test_v3_reserve_rechecks_cut_after_wal_scan);
+	UT_RUN(test_v3_reserve_consumes_real_nonlocal_files);
+	UT_RUN(test_v3_reserve_uncertain_publication_never_returns_permission);
+	UT_RUN(test_v3_reserve_error_cleanup_keeps_old_authority);
 	UT_RUN(test_v3_clean_exit_cut_keeps_complete_root_roster);
 	UT_RUN(test_v3_clean_exit_cut_never_shrinks_missing_members);
 	UT_RUN(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor);

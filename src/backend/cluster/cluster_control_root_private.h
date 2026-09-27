@@ -96,6 +96,16 @@ extern ClusterControlRootResult cluster_control_root_v3_clean_exit_cut(
 	const uint8 *bytes, Size length, const uint8 storage_uuid[16], uint64 system_identifier,
 	const struct ClusterFormationSnapshotV1 *formation, ClusterStartupExitCut *out);
 
+/* Coordinator instance's native StartupProcess: consume LMON's full-clean observation and
+ * actual predecessor files, then reserve all required successors in one CAS.
+ * No caller-provided evidence digest, writer installation or serving grant.
+ * Owns CF-X; callers must not hold CF and must supply a CurrentResourceOwner
+ * for the existing WALR lifetime. Refusal clears out, including an
+ * uncertain durable publication; selected objects must then be reobserved. */
+extern ClusterControlRootResult
+cluster_control_root_v3_reserve_clean(const ClusterStartupExitCut *expected,
+									  ClusterControlRootFileToken *out);
+
 /* PGRAC: bounded retained-writer input, never an authority/retirement proof.
  * Author: SqlRush <sqlrush@gmail.com>
  */

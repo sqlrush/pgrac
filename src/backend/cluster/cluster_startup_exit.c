@@ -18,8 +18,13 @@
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_membership.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_shmem.h"
+#include "cluster/cluster_lmon.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "storage/ipc.h"
+#include "storage/shmem.h"
+#include "storage/spin.h"
 #include "utils/timestamp.h"
 
 #define EXIT_RETRY_US INT64CONST(100000)
@@ -35,6 +40,21 @@ static struct {
 	bool seen[CLUSTER_MAX_NODES];
 	uint8 evidence[CLUSTER_MAX_NODES][32];
 } exit_round;
+
+/* Native StartupProcess owns file/CF/WALR work; LMON owns transport. A
+ * volatile observation mailbox is not another root or an admission token. */
+typedef struct StartupExitShared {
+	slock_t lock;
+	int32 owner_pid;
+	uint64 revision;
+	ClusterStartupExitCut cut;
+	ClusterStartupExitResult result;
+	uint8 digest[32];
+} StartupExitShared;
+
+static StartupExitShared *exit_shared;
+static uint64 serviced_revision;
+static bool exit_callback_registered;
 
 static bool
 nonzero(const void *data, Size length)
@@ -168,13 +188,19 @@ member_current(uint32 node, uint64 incarnation)
 }
 
 static bool
-local_current(const ClusterStartupExitKey *key)
+local_identity_current(const ClusterStartupExitKey *key)
 {
-	return cluster_enabled && cluster_shared_config && MyBackendType == B_LMON
-		   && cluster_node_id >= 0 && cluster_node_id < CLUSTER_MAX_NODES && key_valid(key)
-		   && cluster_qvotec_in_quorum() && cluster_epoch_get_current() == key->epoch
+	return cluster_enabled && cluster_shared_config && cluster_node_id >= 0
+		   && cluster_node_id < CLUSTER_MAX_NODES && key_valid(key) && cluster_qvotec_in_quorum()
+		   && cluster_epoch_get_current() == key->epoch
 		   && member_current(key->coordinator, key->coordinator_incarnation)
 		   && member_current((uint32)cluster_node_id, cluster_qvotec_get_self_incarnation());
+}
+
+static bool
+local_current(const ClusterStartupExitKey *key)
+{
+	return MyBackendType == B_LMON && local_identity_current(key);
 }
 
 static bool
@@ -184,9 +210,9 @@ required(const ClusterStartupExitCut *cut, unsigned node)
 }
 
 static bool
-cut_current(const ClusterStartupExitCut *cut)
+cut_identity_current(const ClusterStartupExitCut *cut)
 {
-	if (!local_current(&cut->key) || cut->key.coordinator != (uint32)cluster_node_id
+	if (!local_identity_current(&cut->key) || cut->key.coordinator != (uint32)cluster_node_id
 		|| cut->key.coordinator_incarnation != cluster_qvotec_get_self_incarnation()
 		|| (cut->required[0] == 0 && cut->required[1] == 0))
 		return false;
@@ -201,6 +227,12 @@ cut_current(const ClusterStartupExitCut *cut)
 			return false;
 	}
 	return cluster_epoch_get_current() == cut->key.epoch && cluster_qvotec_in_quorum();
+}
+
+static bool
+cut_current(const ClusterStartupExitCut *cut)
+{
+	return MyBackendType == B_LMON && cut_identity_current(cut);
 }
 
 static ClusterStartupExitMessage
@@ -378,6 +410,15 @@ cluster_startup_exit_ingress(const ClusterICEnvelope *env, const void *payload)
 		if (exit_round.seen[m.node]
 			&& memcmp(m.evidence_sha256, exit_round.evidence[m.node], 32) != 0) {
 			exit_round.poisoned = true;
+			if (exit_shared != NULL) {
+				SpinLockAcquire(&exit_shared->lock);
+				if (exit_shared->owner_pid != 0
+					&& memcmp(&exit_shared->cut, &exit_round.cut, sizeof(exit_round.cut)) == 0) {
+					exit_shared->result = CLUSTER_STARTUP_EXIT_UNAVAILABLE;
+					memset(exit_shared->digest, 0, sizeof(exit_shared->digest));
+				}
+				SpinLockRelease(&exit_shared->lock);
+			}
 			return;
 		}
 		memcpy(exit_round.evidence[m.node], m.evidence_sha256, 32);
@@ -395,4 +436,138 @@ cluster_startup_exit_register(void)
 											   .handler = cluster_startup_exit_ingress,
 											   .plane = CLUSTER_IC_PLANE_CONTROL };
 	cluster_ic_register_msg_type(&info);
+}
+
+static Size
+startup_exit_shmem_size(void)
+{
+	return MAXALIGN(sizeof(StartupExitShared));
+}
+
+static void
+startup_exit_shmem_init(void)
+{
+	bool found;
+	exit_shared = ShmemInitStruct("pgrac startup exit mailbox", startup_exit_shmem_size(), &found);
+	if (!found) {
+		memset(exit_shared, 0, sizeof(*exit_shared));
+		SpinLockInit(&exit_shared->lock);
+	}
+}
+
+void
+cluster_startup_exit_shmem_register(void)
+{
+	static const ClusterShmemRegion region = { .name = "pgrac startup exit mailbox",
+											   .size_fn = startup_exit_shmem_size,
+											   .init_fn = startup_exit_shmem_init,
+											   .lwlock_count = 0,
+											   .owner_subsys = "cluster_startup_exit",
+											   .reserved_flags = 0 };
+	cluster_shmem_register_region(&region);
+}
+
+static void
+startup_exit_request_exit(int code pg_attribute_unused(), Datum arg pg_attribute_unused())
+{
+	cluster_startup_exit_request_cancel();
+}
+
+ClusterStartupExitResult
+cluster_startup_exit_request(const ClusterStartupExitCut *cut, uint8 digest[32])
+{
+	ClusterStartupExitResult result = CLUSTER_STARTUP_EXIT_UNAVAILABLE;
+	bool alias = overlaps(cut, sizeof(*cut), digest, 32);
+	bool wake = false;
+
+	if (digest != NULL)
+		memset(digest, 0, 32);
+	if (alias || cut == NULL || digest == NULL || MyBackendType != B_STARTUP || MyProcPid <= 0
+		|| exit_shared == NULL || !cut_identity_current(cut))
+		return result;
+	if (!exit_callback_registered) {
+		before_shmem_exit(startup_exit_request_exit, (Datum)0);
+		exit_callback_registered = true;
+	}
+	SpinLockAcquire(&exit_shared->lock);
+	if (exit_shared->owner_pid == 0 || exit_shared->owner_pid == MyProcPid) {
+		if (exit_shared->owner_pid == 0 || memcmp(cut, &exit_shared->cut, sizeof(*cut)) != 0) {
+			if (exit_shared->revision != UINT64_MAX) {
+				++exit_shared->revision;
+				exit_shared->owner_pid = MyProcPid;
+				exit_shared->cut = *cut;
+				exit_shared->result = CLUSTER_STARTUP_EXIT_WAITING;
+				memset(exit_shared->digest, 0, sizeof(exit_shared->digest));
+				wake = true;
+			}
+		}
+		if (exit_shared->owner_pid == MyProcPid
+			&& memcmp(cut, &exit_shared->cut, sizeof(*cut)) == 0) {
+			result = exit_shared->result;
+			if (result == CLUSTER_STARTUP_EXIT_READY)
+				memcpy(digest, exit_shared->digest, 32);
+		}
+	}
+	SpinLockRelease(&exit_shared->lock);
+	if (wake)
+		cluster_lmon_wakeup();
+	if (!cut_identity_current(cut)
+		|| (result == CLUSTER_STARTUP_EXIT_READY && !nonzero(digest, 32))) {
+		memset(digest, 0, 32);
+		return CLUSTER_STARTUP_EXIT_UNAVAILABLE;
+	}
+	return result;
+}
+
+void
+cluster_startup_exit_request_cancel(void)
+{
+	bool wake = false;
+	if (MyBackendType != B_STARTUP || MyProcPid <= 0 || exit_shared == NULL)
+		return;
+	SpinLockAcquire(&exit_shared->lock);
+	if (exit_shared->owner_pid == MyProcPid) {
+		exit_shared->owner_pid = 0;
+		exit_shared->result = CLUSTER_STARTUP_EXIT_UNAVAILABLE;
+		memset(exit_shared->digest, 0, sizeof(exit_shared->digest));
+		wake = true;
+	}
+	SpinLockRelease(&exit_shared->lock);
+	if (wake)
+		cluster_lmon_wakeup();
+}
+
+void
+cluster_startup_exit_lmon_tick(void)
+{
+	ClusterStartupExitCut cut;
+	ClusterStartupExitResult result;
+	uint64 revision;
+	int32 owner;
+	uint8 digest[32];
+	if (MyBackendType != B_LMON || exit_shared == NULL)
+		return;
+	SpinLockAcquire(&exit_shared->lock);
+	owner = exit_shared->owner_pid;
+	revision = exit_shared->revision;
+	cut = exit_shared->cut;
+	SpinLockRelease(&exit_shared->lock);
+	if (owner == 0) {
+		cluster_startup_exit_cancel();
+		serviced_revision = 0;
+		return;
+	}
+	if (serviced_revision != revision) {
+		cluster_startup_exit_cancel();
+		serviced_revision = revision;
+	}
+	result = cluster_startup_exit_collect(&cut, digest);
+	/* No allocation, wire send, callback or identity read inside the lock. */
+	SpinLockAcquire(&exit_shared->lock);
+	if (exit_shared->revision == revision && exit_shared->owner_pid == owner
+		&& memcmp(&exit_shared->cut, &cut, sizeof(cut)) == 0) {
+		exit_shared->result = result;
+		memcpy(exit_shared->digest, digest, sizeof(digest));
+	}
+	SpinLockRelease(&exit_shared->lock);
 }

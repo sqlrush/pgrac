@@ -76,4 +76,13 @@ extern void cluster_startup_exit_cancel(void);
 extern void cluster_startup_exit_ingress(const ClusterICEnvelope *env, const void *payload);
 extern void cluster_startup_exit_register(void);
 
+/* Native StartupProcess on the coordinator instance delegates CONTROL work
+ * to LMON and retains its normal lock/I/O owner. Exact volatile evidence only;
+ * caller must still validate root/formation/provider before publication. */
+extern void cluster_startup_exit_shmem_register(void);
+extern ClusterStartupExitResult cluster_startup_exit_request(const ClusterStartupExitCut *cut,
+															 uint8 digest[32]);
+extern void cluster_startup_exit_request_cancel(void);
+extern void cluster_startup_exit_lmon_tick(void);
+
 #endif /* CLUSTER_STARTUP_EXIT_H */

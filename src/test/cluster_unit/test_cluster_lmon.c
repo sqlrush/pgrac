@@ -745,6 +745,15 @@ void
 cluster_startup_exit_register(void)
 {}
 
+/* Mailbox/collector bodies are exercised by test_cluster_startup_exit. */
+void
+cluster_startup_exit_shmem_register(void)
+{}
+
+void
+cluster_startup_exit_lmon_tick(void)
+{}
+
 void
 cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info)
 {

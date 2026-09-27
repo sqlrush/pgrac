@@ -3652,6 +3652,378 @@ checkpoint_v2_cleanup(CheckpointV2Work *work, ClusterControlRootResult result)
 	return result;
 }
 
+/* PGRAC: a clean restart reserves the complete declared roster in one CAS.
+ * Prior-exit evidence is collected by existing LMON, not supplied as a boolean
+ * by the caller. The old generations stay current and immutable; this grants
+ * neither native mutation nor ordinary serving. Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ReserveCleanWork {
+	ControlRootImage base, next;
+	CheckpointV2Work scan;
+	ClusterFormationSnapshotV1 formation;
+	ClusterStartupExitCut cut;
+	ClusterWalStartupImage operations[CLUSTER_MAX_NODES];
+	ClusterWalStartupStage stages[CLUSTER_MAX_NODES];
+	ClusterWalDurablePrefix prefixes[CLUSTER_MAX_NODES];
+	uint8 evidence[32];
+	LOCKMODE cf_mode;
+} ReserveCleanWork;
+
+static bool
+reserve_clean_owner_current(const ClusterStartupExitCut *cut)
+{
+	ClusterFenceAuthorityProof authority;
+
+	if (MyBackendType != B_STARTUP || ShutdownRequestPending || !enableFsync || !cluster_enabled
+		|| !cluster_shared_config || !cluster_controlfile_shared_authority
+		|| cut->key.system_identifier == 0 || GetSystemIdentifier() != cut->key.system_identifier
+		|| cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| cut->key.coordinator != (uint32)cluster_node_id || cut->key.epoch == 0
+		|| cut->key.coordinator_incarnation == 0
+		|| cluster_qvotec_get_self_incarnation() != cut->key.coordinator_incarnation
+		|| cluster_membership_get_state(cluster_node_id) != CLUSTER_MEMBER_MEMBER
+		|| cluster_membership_get_last_admitted_incarnation(cluster_node_id)
+			   != cut->key.coordinator_incarnation
+		|| !cluster_qvotec_in_quorum() || cluster_reconfig_has_pending_prebump_stage()
+		|| !cluster_external_fence_runtime_active() || !cluster_write_fence_enforcing()
+		|| !cluster_write_fence_allowed() || cluster_epoch_get_current() != cut->key.epoch
+		|| cluster_write_fence_read_durable_authority(&authority) != CLUSTER_FENCE_AUTHORITY_OK
+		|| authority.marker.fence_epoch != cut->key.epoch)
+		return false;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node)
+		if ((cut->required[node / 64] & (UINT64_C(1) << (node % 64))) != 0
+			&& cluster_fence_marker_node_is_fenced(authority.marker.fenced_dead_bitmap, node))
+			return false;
+	return cluster_epoch_get_current() == cut->key.epoch && cluster_write_fence_allowed();
+}
+
+/* CF is held only for selection/reselection, never while decoding WAL. Full
+ * formation equality includes the event identity, not just its MEMBER set. */
+static ClusterControlRootResult
+reserve_clean_reobserve(ReserveCleanWork *work, const ClusterStartupExitCut *expected, bool first)
+{
+	ClusterFormationSnapshotV1 formation;
+	ClusterStartupExitCut cut;
+	ClusterControlRootFileToken token;
+	ControlFileData common;
+	uint8 digest[32];
+	ClusterControlRootResult result;
+
+	if (!reserve_clean_owner_current(expected)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result
+		= read_control_version(expected->key.storage_uuid, expected->key.system_identifier,
+							   &work->scan.base, &common, &token, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	result = cluster_control_root_v3_clean_exit_cut(
+		work->scan.base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES, expected->key.storage_uuid,
+		expected->key.system_identifier, &formation, &cut);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(&cut, expected, sizeof(cut)) != 0
+		|| (!first
+			&& (memcmp(&formation, &work->formation, sizeof(formation)) != 0
+				|| memcmp(work->scan.base.bytes, work->base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES)
+					   != 0)))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	if (cluster_startup_exit_request(&cut, digest) != CLUSTER_STARTUP_EXIT_READY)
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (bytes_are_zero(digest, sizeof(digest)))
+		return CLUSTER_CONTROL_ROOT_HASH_MISMATCH;
+	if (!first && memcmp(digest, work->evidence, sizeof(digest)) != 0)
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	if (first) {
+		work->base = work->scan.base;
+		work->formation = formation;
+		work->cut = cut;
+		memcpy(work->evidence, digest, sizeof(digest));
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+reserve_clean_input_locked(ReserveCleanWork *work, unsigned node, bool first)
+{
+	CheckpointV2Work *scan = &work->scan;
+	const ClusterControlRootSnapshot *record = &work->base.records[node];
+	ClusterControlRootResult result
+		= read_thread_version(&record->identity, &scan->base, &scan->old_view, &scan->before,
+							  CONTROL_ROOT_HEADER_VERSION_V3);
+
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (memcmp(scan->base.bytes, work->base.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	if (scan->old_view.state != DB_SHUTDOWNED
+		|| scan->old_view.checkPoint != record->checkpoint_lower_lsn
+		|| scan->old_view.checkPointCopy.redo != record->checkpoint_lower_lsn
+		|| record->tail_last_record_lsn != record->checkpoint_lower_lsn
+		|| record->tail_last_record_crc32c != record->checkpoint_record_crc32c
+		|| record->validated_tail_lsn_exclusive <= record->tail_last_record_lsn
+		|| (record->root_flags
+			& (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+			   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID))
+			   != (CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID
+				   | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID))
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	memset(&scan->prefix_ref, 0, sizeof(scan->prefix_ref));
+	scan->prefix_ref.claim.identity = record->identity;
+	scan->prefix_ref.claim.database_incarnation = work->base.header.v2.database_incarnation;
+	scan->prefix_ref.claim.max_config_generation = work->base.header.v2.config_generation;
+	memcpy(scan->prefix_ref.claim.claim_sha256, work->base.refs[node].claim_sha256, 32);
+	scan->prefix_ref.timeline = record->checkpoint_tli;
+	memset(&scan->prefix, 0, sizeof(scan->prefix));
+	result
+		= checkpoint_v2_prefix_observe(scan, &scan->old_view, record->validated_tail_lsn_exclusive,
+									   record->checkpoint_record_crc32c);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!first && memcmp(&scan->prefix, &work->prefixes[node], sizeof(scan->prefix)) != 0)
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	if (first)
+		work->prefixes[node] = scan->prefix;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+reserve_clean_operation(ReserveCleanWork *work, unsigned node)
+{
+	ClusterWalStartupImage *op = &work->operations[node];
+	const ClusterControlRootSnapshot *record = &work->base.records[node];
+	uint8 claim[CLUSTER_WAL_CLAIM_V2_BYTES];
+	uint64 remainder;
+	ClusterControlRootResult result;
+
+	if (record->identity.root_lineage_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	op->phase = CLUSTER_WAL_STARTUP_RESERVED;
+	op->input_kind = CLUSTER_WAL_STARTUP_CLEAN;
+	if (!pg_strong_random(op->operation_uuid, sizeof(op->operation_uuid))
+		|| bytes_are_zero(op->operation_uuid, sizeof(op->operation_uuid)))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	op->database_incarnation = work->base.header.v2.database_incarnation;
+	op->config_generation = work->base.header.v2.config_generation;
+	op->formation_epoch = work->cut.key.epoch;
+	op->predecessor_file_sequence = work->base.header.file_txn_seq;
+	memcpy(op->predecessor_file_sha256, work->cut.key.root_sha256, 32);
+	op->generation = work->base.header.file_txn_seq + 1;
+	op->timeline = op->input_timeline = record->checkpoint_tli;
+	op->segment_size = wal_segment_size;
+	memcpy(op->predecessor_evidence_sha256, work->evidence, 32);
+	op->input_record_start = record->tail_last_record_lsn;
+	op->sealed_input_end = op->input_record_end = record->validated_tail_lsn_exclusive;
+	op->input_record_crc = record->tail_last_record_crc32c;
+	op->first_segment_lsn = op->sealed_input_end;
+	remainder = op->first_segment_lsn % op->segment_size;
+	if (remainder != 0) {
+		if (op->first_segment_lsn > UINT64_MAX - (op->segment_size - remainder))
+			return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+		op->first_segment_lsn += op->segment_size - remainder;
+	}
+	op->predecessor.snapshot = *record;
+	op->predecessor.refs = work->base.refs[node];
+	op->predecessor.publisher_incarnation = work->base.publisher_incarnation[node];
+	op->predecessor.publisher_node = work->base.publisher_node[node];
+	op->predecessor.record_crc32c = work->base.record_crc32c[node];
+	op->claim.identity = record->identity;
+	op->claim.identity.origin_owner_incarnation = work->cut.observer[node];
+	op->claim.identity.root_lineage_seq++;
+	op->claim.identity.thread_claim_created_at = GetCurrentTimestamp();
+	op->claim.identity.thread_claim_crc32c = 0;
+	op->claim.database_incarnation = op->database_incarnation;
+	op->claim.config_generation = op->config_generation;
+	op->claim.claim_generation = op->generation;
+	result = cluster_wal_claim_v2_encode(&op->claim, claim);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		op->claim.identity.thread_claim_crc32c = read_u32_le(claim + 104);
+	return result;
+}
+
+static ClusterControlRootResult
+reserve_clean_cleanup(ReserveCleanWork *work, ClusterControlRootResult result)
+{
+	result = checkpoint_v2_cleanup(&work->scan, result);
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
+		if (work->stages[node].owner_pid != 0) {
+			ClusterControlRootResult discarded = cluster_wal_startup_discard(&work->stages[node]);
+			if (discarded != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				&& result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				result = discarded;
+		}
+	}
+	if (work->cf_mode != NoLock) {
+		LOCKMODE mode = work->cf_mode;
+		work->cf_mode = NoLock;
+		result = release_cf(mode, result);
+	}
+	return result;
+}
+
+static ClusterControlRootResult
+reserve_clean_publish(ReserveCleanWork *work, const ClusterStartupExitCut *expected,
+					  ClusterControlRootFileToken *out)
+{
+	ClusterControlRootResult result;
+	ClusterFormationSnapshotV1 formation;
+	ControlFileData common;
+	ClusterControlRootFileToken selected;
+	uint8 evidence[32];
+	CheckpointV2Work *scan = &work->scan;
+
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ShareLock;
+	result = reserve_clean_reobserve(work, expected, true);
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, result);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (work->base.header.file_txn_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
+		if ((work->cut.required[node / 64] & (UINT64_C(1) << (node % 64))) == 0)
+			continue;
+		make_read_token(&work->base, node + 1, CONTROL_ROOT_SOURCE_PRIMARY, &scan->thread_token);
+		if (cluster_wal_retention_root_publish_begin_exact(&scan->thread_token, false, &scan->walr)
+			!= CLUSTER_WAL_PIN_OK)
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		if (!acquire_clusterwide_cf(ShareLock))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		scan->cf_mode = ShareLock;
+		result = reserve_clean_input_locked(work, node, true);
+		scan->cf_mode = NoLock;
+		result = release_cf(ShareLock, result);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = checkpoint_v2_wal_verify(scan, &work->base.records[node].identity, &scan->old_view,
+										  work->prefixes[node].exclusive_end);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		if (scan->checkpoint_crc != work->prefixes[node].record_crc
+			|| !checkpoint_v2_wal_paths_current(scan, &work->base.records[node].identity))
+			return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+		result = checkpoint_v2_prefix_observe(
+			scan, &scan->old_view, work->prefixes[node].exclusive_end, scan->checkpoint_crc);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = checkpoint_v2_cleanup(scan, result);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = reserve_clean_operation(work, node);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	if (!acquire_clusterwide_cf(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ExclusiveLock;
+	result = reserve_clean_reobserve(work, expected, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work->next = work->base;
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = GetCurrentTimestamp();
+	work->next.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+	memset(work->next.header.v2.serving, 0, sizeof(work->next.header.v2.serving));
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
+		ClusterWalStartupImage readback;
+		ClusterWalStartupStage *stage = &work->stages[node];
+		if ((work->cut.required[node / 64] & (UINT64_C(1) << (node % 64))) == 0)
+			continue;
+		result = reserve_clean_input_locked(work, node, false);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = cluster_wal_startup_prepare(&work->next, node, &work->operations[node], stage);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		result = cluster_wal_startup_install(stage);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+		work->next.startup[node].generation = stage->generation;
+		memcpy(work->next.startup[node].sha256, stage->sha256, 32);
+		result = cluster_wal_startup_read_locked(&work->next, node, &readback);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	result = cluster_control_root_v3_encode(&work->next);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = reserve_clean_reobserve(work, expected, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	result = read_control_version(expected->key.storage_uuid, expected->key.system_identifier,
+								  &scan->base, &common, &selected, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(scan->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
+		ClusterWalStartupImage readback;
+		if (work->next.startup[node].generation == 0)
+			continue;
+		result = cluster_wal_startup_read_locked(&scan->base, node, &readback);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
+	}
+	if (!reserve_clean_owner_current(expected)
+		|| !cluster_reconfig_capture_formation_snapshot_v1(cluster_node_id + 1, &formation)
+		|| memcmp(&formation, &work->formation, sizeof(formation)) != 0
+		|| cluster_startup_exit_request(&work->cut, evidence) != CLUSTER_STARTUP_EXIT_READY
+		|| memcmp(evidence, work->evidence, sizeof(evidence)) != 0)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	*out = selected;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_reserve_clean(const ClusterStartupExitCut *expected,
+									  ClusterControlRootFileToken *out)
+{
+	ReserveCleanWork *work;
+	ClusterControlRootResult result;
+	bool alias = history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out));
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (alias || expected == NULL || out == NULL || !IsValidWalSegSize(wal_segment_size))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_cf_held_is_clusterwide(ShareLock) || cluster_cf_held_is_clusterwide(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!reserve_clean_owner_current(expected))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = storage_contract_check(expected->key.storage_uuid, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work = palloc0(sizeof(*work));
+	work->scan.purpose = CHECKPOINT_V2_SHUTDOWN_EVIDENCE;
+	work->scan.format_version = CONTROL_ROOT_HEADER_VERSION_V3;
+	for (unsigned i = 0; i < lengthof(work->scan.wal_dirs); ++i)
+		work->scan.wal_dirs[i] = -1;
+	for (unsigned i = 0; i < lengthof(work->scan.wal_segments); ++i)
+		work->scan.wal_segments[i] = -1;
+	PG_TRY();
+	{
+		result = reserve_clean_publish(work, expected, out);
+	}
+	PG_CATCH();
+	{
+		(void)reserve_clean_cleanup(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		memset(out, 0, sizeof(*out));
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	result = reserve_clean_cleanup(work, result);
+	pfree(work);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		memset(out, 0, sizeof(*out));
+	return result;
+}
+
 static ClusterControlRootResult
 checkpoint_v2_publish_work(CheckpointV2Work *work, const ClusterControlRootIdentity *self,
 						   const ControlFileData *cf, XLogRecPtr end, uint64 epoch)
