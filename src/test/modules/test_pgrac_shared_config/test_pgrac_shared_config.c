@@ -30,6 +30,7 @@
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(test_pgrac_config_entry);
 PG_FUNCTION_INFO_V1(test_pgrac_config_object);
+PG_FUNCTION_INFO_V1(test_pgrac_config_change);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
@@ -903,6 +904,81 @@ test_pgrac_config_object(PG_FUNCTION_ARGS)
 	PG_RETURN_TEXT_P(result_text(rc, &report));
 #else
 	ereport(ERROR, (errmsg("configuration inspection requires cluster build")));
+	PG_RETURN_NULL();
+#endif
+}
+
+/* PGRAC: actual policy/staging in this standalone TAP node's private fixture.
+ * Does not replace globals, select a shared root or publish configuration.
+ * Author: SqlRush <sqlrush@gmail.com> */
+Datum
+test_pgrac_config_change(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test configuration change requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigRef ref;
+		ClusterSharedConfigEntry change;
+		ClusterSharedConfigStage stage;
+		ClusterSharedConfigPolicyReport report;
+		ClusterControlRootResult result;
+		ClusterSharedConfigImage image = { 0 };
+		uint8 operation[16] = { 1 };
+		char root[MAXPGPATH], path[MAXPGPATH];
+		char *bytes, *answer;
+		size_t len;
+		bool changed = false;
+		FILE *file;
+		uint32 count;
+		if (PG_ARGISNULL(0) || PG_ARGISNULL(1) || PG_ARGISNULL(2) || PG_ARGISNULL(4))
+			ereport(ERROR, (errmsg("test change arguments missing")));
+		bytes = application_fixture(text_to_cstring(PG_GETARG_TEXT_PP(0)), &ref, &len);
+		change.node_id = PG_GETARG_INT32(1);
+		change.name = text_to_cstring(PG_GETARG_TEXT_PP(2));
+		change.value = PG_ARGISNULL(3) ? NULL : text_to_cstring(PG_GETARG_TEXT_PP(3));
+		if (snprintf(root, sizeof(root), "%s/test_config_change-XXXXXX", DataDir) >= sizeof(root)
+			|| mkdtemp(root) == NULL)
+			ereport(ERROR, (errmsg("cannot create private change fixture")));
+		snprintf(path, sizeof(path), "%s/global/config_images/.staging", root);
+		if (pg_mkdir_p(path, 0700) != 0)
+			ereport(ERROR, (errmsg("cannot create private staging fixture")));
+		if (PG_GETARG_BOOL(4))
+			ref.sha256[0] ^= 1;
+		result = cluster_shared_config_prepare_change(root, bytes, len, &ref, &change, operation,
+													  &stage, &changed, &report);
+		answer = psprintf("%d:%u:%d:%u", result == 0, report.reason, changed, stage.state);
+		snprintf(path, sizeof(path),
+				 "%s/global/config_images/.staging/01000000000000000000000000000000.tmp", root);
+		if (result == 0 && changed) {
+			image.bytes = palloc(stage.bytes + 1);
+			file = AllocateFile(path, "rb");
+			if (file == NULL || fread(image.bytes, 1, stage.bytes, file) != stage.bytes
+				|| fgetc(file) != EOF || FreeFile(file) != 0)
+				ereport(ERROR, (errmsg("staged configuration bytes missing or wrong length")));
+			image.len = stage.bytes;
+			image.bytes[image.len] = '\0';
+			if (stage.ref.identity.generation != ref.identity.generation + 1
+				|| cluster_shared_config_validate(image.bytes, image.len, &stage.ref, &count) != 0)
+				ereport(ERROR, (errmsg("staged configuration is not the exact new object")));
+			if (cluster_shared_config_discard(root, &stage) != 0)
+				ereport(ERROR, (errmsg("private staged configuration did not retire")));
+			cluster_shared_config_free(&image);
+		} else if (stage.state != 0 || changed || access(path, F_OK) == 0)
+			ereport(ERROR, (errmsg("refusal or no-op unexpectedly reached staging")));
+		snprintf(path, sizeof(path), "%s/global/config_images/.staging", root);
+		if (rmdir(path) != 0)
+			ereport(ERROR, (errmsg("private staging fixture was not empty")));
+		snprintf(path, sizeof(path), "%s/global/config_images", root);
+		if (rmdir(path) != 0)
+			ereport(ERROR, (errmsg("private object fixture was not empty")));
+		snprintf(path, sizeof(path), "%s/global", root);
+		if (rmdir(path) != 0 || rmdir(root) != 0)
+			ereport(ERROR, (errmsg("private change fixture cleanup failed")));
+		PG_RETURN_TEXT_P(cstring_to_text(answer));
+	}
+#else
+	ereport(ERROR, (errmsg("configuration change requires cluster build")));
 	PG_RETURN_NULL();
 #endif
 }

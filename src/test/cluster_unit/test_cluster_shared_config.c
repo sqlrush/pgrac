@@ -826,10 +826,192 @@ UT_TEST(test_visitor_validates_whole_object_first)
 	UT_ASSERT(cluster_shared_config_visit(bytes, strlen(bytes), &ref, NULL, NULL) != 0);
 }
 
+UT_TEST(test_amend_preserves_other_scopes_and_exact_literals)
+{
+	static const ClusterSharedConfigEntry changes[] = { { -1, "test.label", "new'\\中文" },
+														{ 127, "port", "6433" },
+														{ 0, "log_filename", "node%p.log" },
+														{ -1, "aaa", "before" },
+														{ 127, "zzz", "after" },
+														{ -1, "test.label", NULL },
+														{ 0, "port", NULL } };
+	static const char *const expected[]
+		= { "common.cluster.enabled='on'\ncommon.test.label='new''\\中文'\nnode000.port='5432'"
+			"\nnode127.port='5433'\n",
+			"common.cluster.enabled='on'\ncommon.test.label='a''b\\中文'\nnode000.port='5432'"
+			"\nnode127.port='6433'\n",
+			"common.cluster.enabled='on'\ncommon.test.label='a''b\\中文'\nnode000.log_filename='"
+			"node%p.log'\nnode000.port='5432'\nnode127.port='5433'\n",
+			"common.aaa='before'\ncommon.cluster.enabled='on'\ncommon.test.label='a''b\\中文'"
+			"\nnode000.port='5432'\nnode127.port='5433'\n",
+			"common.cluster.enabled='on'\ncommon.test.label='a''b\\中文'\nnode000.port='5432'"
+			"\nnode127.port='5433'\nnode127.zzz='after'\n",
+			"common.cluster.enabled='on'\nnode000.port='5432'\nnode127.port='5433'\n",
+			"common.cluster.enabled='on'\ncommon.test.label='a''b\\中文'\nnode127.port='5433'\n" };
+	char bytes[1024], before[1024];
+	ClusterSharedConfigRef ref, original, next;
+	fixture(bytes, sizeof(bytes), body, &ref);
+	memcpy(before, bytes, strlen(bytes) + 1);
+	original = ref;
+	for (size_t i = 0; i < lengthof(changes); i++) {
+		ClusterSharedConfigImage out;
+		ClusterControlRootResult result;
+		bool changed = false;
+		uint32 count = 0;
+		result = cluster_shared_config_amend(bytes, strlen(bytes), &ref, &changes[i], &out, &next,
+											 &changed);
+		UT_ASSERT_EQ(result, 0);
+		if (result != 0)
+			continue;
+		UT_ASSERT(changed);
+		UT_ASSERT_EQ(next.identity.generation, 48);
+		UT_ASSERT_EQ(cluster_shared_config_validate(out.bytes, out.len, &next, &count), 0);
+		UT_ASSERT_EQ(strcmp(strstr(out.bytes, "common."), expected[i]), 0);
+		next.identity.generation--;
+		UT_ASSERT_EQ(memcmp(&next.identity, &original.identity, sizeof(next.identity)), 0);
+		UT_ASSERT_EQ(memcmp(&ref, &original, sizeof(ref)), 0);
+		UT_ASSERT_EQ(strcmp(bytes, before), 0);
+		cluster_shared_config_free(&out);
+		UT_ASSERT_EQ(allocations, 0);
+	}
+}
+
+UT_TEST(test_amend_noop_and_sequence_exhaustion)
+{
+	char bytes[1024];
+	ClusterSharedConfigRef ref, next;
+	ClusterSharedConfigImage out;
+	ClusterSharedConfigEntry change = { -1, "test.label", "a'b\\中文" };
+	fixture(bytes, sizeof(bytes), body, &ref);
+	for (int i = 0; i < 2; i++) {
+		bool changed = true;
+		ClusterControlRootResult result;
+		if (i == 1) {
+			change.name = "missing";
+			change.value = NULL;
+		}
+		result = cluster_shared_config_amend(bytes, strlen(bytes), &ref, &change, &out, &next,
+											 &changed);
+		UT_ASSERT_EQ(result, 0);
+		if (result != 0)
+			continue;
+		UT_ASSERT(!changed);
+		UT_ASSERT_EQ(memcmp(&next, &ref, sizeof(ref)), 0);
+		UT_ASSERT_EQ(strcmp(out.bytes, bytes), 0);
+		cluster_shared_config_free(&out);
+	}
+	ref.identity.generation = UINT64_MAX;
+	UT_ASSERT_EQ(cluster_shared_config_encode(&ref.identity, NULL, 0, bytes, sizeof(bytes),
+											  &out.len, ref.sha256),
+				 0);
+	{
+		bool changed = true;
+		change.name = "new";
+		change.value = "on";
+		UT_ASSERT_EQ(
+			cluster_shared_config_amend(bytes, strlen(bytes), &ref, &change, &out, &next, &changed),
+			CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED);
+		UT_ASSERT_EQ(out.bytes, NULL);
+		UT_ASSERT_EQ(out.len, 0);
+		UT_ASSERT_EQ(next.identity.generation, 0);
+		UT_ASSERT(!changed);
+	}
+	UT_ASSERT_EQ(allocations, 0);
+}
+
+UT_TEST(test_amend_refuses_invalid_input_before_output)
+{
+	for (int i = 0; i < 7; i++) {
+		char bytes[1024];
+		ClusterSharedConfigRef ref, next;
+		ClusterSharedConfigImage out;
+		ClusterSharedConfigEntry change = { -1, "test.label", "next" };
+		bool changed = true;
+		fixture(bytes, sizeof(bytes), body, &ref);
+		if (i == 0)
+			ref.sha256[0] ^= 1;
+		if (i == 1) {
+			bytes[strlen(bytes) - 1] = 'X';
+			digest(bytes, strlen(bytes), ref.sha256);
+		}
+		if (i == 2)
+			change.node_id = 126;
+		if (i == 3)
+			change.name = "other\nsetting";
+		if (i == 4)
+			change.value = "value\nnew";
+		if (i == 5)
+			change.name = NULL;
+		memset(&out, 0xa5, sizeof(out));
+		memset(&next, 0xa5, sizeof(next));
+		UT_ASSERT(cluster_shared_config_amend(bytes, strlen(bytes), i == 6 ? NULL : &ref, &change,
+											  &out, &next, &changed)
+				  != 0);
+		UT_ASSERT_EQ(out.bytes, NULL);
+		UT_ASSERT_EQ(out.len, 0);
+		UT_ASSERT_EQ(next.identity.generation, 0);
+		UT_ASSERT(!changed);
+		UT_ASSERT_EQ(allocations, 0);
+	}
+}
+
+UT_TEST(test_amend_preserves_entry_and_byte_limits)
+{
+	char *bytes = malloc(CLUSTER_SHARED_CONFIG_MAX_BYTES + 1);
+	char *value = malloc(CLUSTER_SHARED_CONFIG_MAX_VALUE + 1);
+	char(*names)[16] = malloc(CLUSTER_SHARED_CONFIG_MAX_ENTRIES * 16);
+	ClusterSharedConfigEntry *entries
+		= malloc(CLUSTER_SHARED_CONFIG_MAX_ENTRIES * sizeof(*entries));
+	ClusterSharedConfigRef ref, next;
+	ClusterSharedConfigImage out;
+	ClusterSharedConfigEntry change = { -1, "zzz", "x" };
+	char small[1024];
+	size_t len;
+	bool changed;
+	if (!bytes || !value || !names || !entries)
+		abort();
+	fixture(small, sizeof(small), body, &ref);
+	memset(value, 'v', CLUSTER_SHARED_CONFIG_MAX_VALUE);
+	value[CLUSTER_SHARED_CONFIG_MAX_VALUE] = '\0';
+	for (int n = 0; n < CLUSTER_SHARED_CONFIG_MAX_ENTRIES; n++) {
+		snprintf(names[n], 16, "a%04d", n);
+		entries[n] = (ClusterSharedConfigEntry){ -1, names[n], "x" };
+	}
+	UT_ASSERT_EQ(
+		cluster_shared_config_encode(&ref.identity, entries, CLUSTER_SHARED_CONFIG_MAX_ENTRIES,
+									 bytes, CLUSTER_SHARED_CONFIG_MAX_BYTES + 1, &len, ref.sha256),
+		0);
+	UT_ASSERT_EQ(cluster_shared_config_amend(bytes, len, &ref, &change, &out, &next, &changed),
+				 CLUSTER_CONTROL_ROOT_BAD_SIZE);
+	UT_ASSERT_EQ(out.bytes, NULL);
+	UT_ASSERT(!changed);
+	change.name = names[0];
+	change.value = "replacement";
+	UT_ASSERT_EQ(cluster_shared_config_amend(bytes, len, &ref, &change, &out, &next, &changed), 0);
+	cluster_shared_config_free(&out);
+	for (int n = 0; n < 127; n++)
+		entries[n].value = value;
+	UT_ASSERT_EQ(cluster_shared_config_encode(&ref.identity, entries, 127, bytes,
+											  CLUSTER_SHARED_CONFIG_MAX_BYTES + 1, &len,
+											  ref.sha256),
+				 0);
+	change.name = "zzz";
+	change.value = value;
+	UT_ASSERT_EQ(cluster_shared_config_amend(bytes, len, &ref, &change, &out, &next, &changed),
+				 CLUSTER_CONTROL_ROOT_BAD_SIZE);
+	UT_ASSERT_EQ(out.bytes, NULL);
+	UT_ASSERT(!changed);
+	UT_ASSERT_EQ(allocations, 0);
+	free(entries);
+	free(names);
+	free(value);
+	free(bytes);
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(27);
 	UT_RUN(test_independent_canonical_input);
 	UT_RUN(test_encoder_matches_independent_bytes);
 	UT_RUN(test_exact_scope_lookup);
@@ -853,6 +1035,10 @@ main(void)
 	UT_RUN(test_publication_preconditions);
 	UT_RUN(test_visitor_exact_literals_and_refusal);
 	UT_RUN(test_visitor_validates_whole_object_first);
+	UT_RUN(test_amend_preserves_other_scopes_and_exact_literals);
+	UT_RUN(test_amend_noop_and_sequence_exhaustion);
+	UT_RUN(test_amend_refuses_invalid_input_before_output);
+	UT_RUN(test_amend_preserves_entry_and_byte_limits);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

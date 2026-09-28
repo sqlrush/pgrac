@@ -293,6 +293,76 @@ cluster_shared_config_prepare_gucs(const char *shared_root, const char *bytes, s
 	return cluster_shared_config_prepare(shared_root, bytes, len, ref, operation_uuid, out);
 }
 
+/* PGRAC: changed-entry production is qualified before publication wiring.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_shared_config_prepare_change(const char *shared_root, const char *bytes, size_t len,
+									 const ClusterSharedConfigRef *ref,
+									 const ClusterSharedConfigEntry *change,
+									 const uint8 operation_uuid[16], ClusterSharedConfigStage *out,
+									 bool *changed, ClusterSharedConfigPolicyReport *report)
+{
+	ClusterSharedConfigImage amended;
+	ClusterSharedConfigRef next;
+	ClusterControlRootResult result;
+	ClusterSharedConfigEntry checked;
+	bool modifies;
+	char old_value[CLUSTER_SHARED_CONFIG_MAX_VALUE + 1];
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (changed != NULL)
+		*changed = false;
+	if (report != NULL)
+		policy_clear(report);
+	if (out == NULL || changed == NULL || report == NULL || change == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	/* A request cannot repair an invalid selected object or silently drop an
+	 * invalid untouched remote-node entry. All checks precede staging I/O. */
+	result = cluster_shared_config_check_gucs(bytes, len, ref, report);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_shared_config_amend(bytes, len, ref, change, &amended, &next, &modifies);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		report->reason = CLUSTER_CONFIG_POLICY_FORMAT;
+		return result;
+	}
+	if (!modifies) {
+		cluster_shared_config_free(&amended);
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	checked = *change;
+	/* Policy needs a literal even for deletion. Checking the old value with
+	 * online_change=true prevents RESET from erasing a cold identity/layout
+	 * entry which SET would correctly refuse. Absence was a no-op above. */
+	if (checked.value == NULL) {
+		result = cluster_shared_config_lookup(bytes, len, ref, checked.node_id, checked.name,
+											  old_value, sizeof(old_value));
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			cluster_shared_config_free(&amended);
+			report->reason = CLUSTER_CONFIG_POLICY_FORMAT;
+			return result;
+		}
+		checked.value = old_value;
+	}
+	PG_TRY();
+	{
+		result = cluster_shared_config_check_entry(&checked, true, report);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_shared_config_prepare_gucs(shared_root, amended.bytes, amended.len,
+														&next, operation_uuid, out, report);
+	}
+	PG_CATCH();
+	{
+		cluster_shared_config_free(&amended);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	cluster_shared_config_free(&amended);
+	*changed = result == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	return result;
+}
+
 /* PGRAC: minimum cold-profile identity bindings, not permission to activate.
  * Native value hooks run after actual assignment in the startup applier.
  * Author: SqlRush <sqlrush@gmail.com>

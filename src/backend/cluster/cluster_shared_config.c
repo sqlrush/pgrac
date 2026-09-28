@@ -387,6 +387,135 @@ cluster_shared_config_visit(const char *bytes, size_t len, const ClusterSharedCo
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
+/* PGRAC: preserve canonical unrelated entries byte-for-byte. This producer
+ * has no authority to select the old object or publish the amended one.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_shared_config_amend(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+							const ClusterSharedConfigEntry *change, ClusterSharedConfigImage *out,
+							ClusterSharedConfigRef *next_ref, bool *changed)
+{
+	ClusterSharedConfigRef next;
+	ClusterControlRootResult result;
+	ConfigLine line;
+	char key[CONFIG_KEY_CAPACITY], header[CONFIG_HEADER_CAPACITY];
+	char previous[CLUSTER_SHARED_CONFIG_MAX_VALUE + 1];
+	char *updated;
+	uint32 count;
+	size_t old_header, new_header, begin, end, offset, used, result_len;
+	size_t value_len = 0, escaped_len = 0, replacement_len = 0;
+	bool found = false, modifies;
+
+	/* Do not erase a caller's input while rejecting an obvious carrier alias. */
+	if ((const void *)ref == (void *)next_ref && ref != NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (next_ref != NULL)
+		memset(next_ref, 0, sizeof(*next_ref));
+	if (changed != NULL)
+		*changed = false;
+	if (out == NULL || next_ref == NULL || changed == NULL || change == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	result = cluster_shared_config_validate(bytes, len, ref, &count);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!config_key(&ref->identity, change->node_id, change->name, key))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (change->value != NULL) {
+		value_len = strnlen(change->value, CLUSTER_SHARED_CONFIG_MAX_VALUE + 1);
+		if (value_len > CLUSTER_SHARED_CONFIG_MAX_VALUE
+			|| !config_text_valid(change->value, value_len, false))
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+		escaped_len = value_len;
+		for (size_t i = 0; i < value_len; i++)
+			if (change->value[i] == '\'')
+				escaped_len++;
+		replacement_len = strlen(key) + escaped_len + 4;
+	}
+	old_header = config_header(&ref->identity, header);
+	begin = end = len;
+	offset = old_header;
+	while (offset < len) {
+		size_t start = offset;
+		int order;
+		if (!config_next(bytes, len, &offset, &ref->identity, &line))
+			return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+		order = strcmp(line.key, key);
+		if (order >= 0) {
+			begin = end = start;
+			if (order == 0) {
+				found = true;
+				end = offset;
+				used = 0;
+				for (const char *p = line.value; p < line.end; p++) {
+					previous[used++] = *p;
+					if (*p == '\'')
+						p++;
+				}
+				previous[used] = '\0';
+			}
+			break;
+		}
+	}
+	modifies = change->value != NULL ? !found || strcmp(previous, change->value) != 0 : found;
+	if (!modifies) {
+		updated = palloc(len + 1);
+		memcpy(updated, bytes, len);
+		updated[len] = '\0';
+		out->bytes = updated;
+		out->len = len;
+		*next_ref = *ref;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (ref->identity.generation == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	if (!found && change->value != NULL && count == CLUSTER_SHARED_CONFIG_MAX_ENTRIES)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	next = *ref;
+	next.identity.generation++;
+	new_header = config_header(&next.identity, header);
+	result_len = new_header + (len - old_header) - (end - begin) + replacement_len;
+	if (result_len > CLUSTER_SHARED_CONFIG_MAX_BYTES)
+		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
+	updated = palloc(result_len + 1);
+	memcpy(updated, header, new_header);
+	used = new_header;
+	memcpy(updated + used, bytes + old_header, begin - old_header);
+	used += begin - old_header;
+	if (change->value != NULL) {
+		size_t key_len = strlen(key);
+		memcpy(updated + used, key, key_len);
+		used += key_len;
+		updated[used++] = '=';
+		updated[used++] = '\'';
+		for (size_t i = 0; i < value_len; i++) {
+			updated[used++] = change->value[i];
+			if (change->value[i] == '\'')
+				updated[used++] = '\'';
+		}
+		updated[used++] = '\'';
+		updated[used++] = '\n';
+	}
+	memcpy(updated + used, bytes + end, len - end);
+	used += len - end;
+	updated[used] = '\0';
+	if (used != result_len || !config_hash(updated, used, next.sha256)) {
+		pfree(updated);
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	result = config_validate_content(updated, used, &next, &count);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		pfree(updated);
+		return result;
+	}
+	out->bytes = updated;
+	out->len = used;
+	*next_ref = next;
+	*changed = true;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 ClusterControlRootResult
 cluster_shared_config_lookup(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
 							 int node_id, const char *name, char *value, size_t capacity)

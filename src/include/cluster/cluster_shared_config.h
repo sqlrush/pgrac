@@ -71,6 +71,18 @@ extern ClusterControlRootResult cluster_shared_config_read_locked(const char *sh
 																  ClusterSharedConfigImage *out);
 extern void cluster_shared_config_free(ClusterSharedConfigImage *image);
 
+/* PGRAC: amend one explicit scope/key in an exact selected object. NULL
+ * change.value means RESET. Preserve all other entries/identity; changed
+ * requests advance generation once, without wrap. No-op returns an owned copy
+ * of the original. No GUC policy, I/O, root publication or admission is implied.
+ * Refusal clears outputs. Inputs/outputs must not overlap; free out normally.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult
+cluster_shared_config_amend(const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+							const ClusterSharedConfigEntry *change, ClusterSharedConfigImage *out,
+							ClusterSharedConfigRef *next_ref, bool *changed);
+
 /* Read-only inspection. The entire object is validated before the first
  * callback; callback entries are borrowed only for that invocation. A callback
  * refusal propagates immediately. This is not an atomic application API.
@@ -206,5 +218,14 @@ cluster_shared_config_prepare_gucs(const char *shared_root, const char *bytes, s
 								   const ClusterSharedConfigRef *ref,
 								   const uint8 operation_uuid[16], ClusterSharedConfigStage *out,
 								   ClusterSharedConfigPolicyReport *report);
+
+/* One online SET/RESET, with native old/changed/new policy before staging.
+ * No-op leaves stage zero and reports changed=false. No assignment, SQL
+ * privilege check, root CAS or application ACK; the publisher owns those.
+ * Inputs/outputs must not alias. Refusal leaves stage/changed clear. */
+extern ClusterControlRootResult cluster_shared_config_prepare_change(
+	const char *shared_root, const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+	const ClusterSharedConfigEntry *change, const uint8 operation_uuid[16],
+	ClusterSharedConfigStage *out, bool *changed, ClusterSharedConfigPolicyReport *report);
 
 #endif
