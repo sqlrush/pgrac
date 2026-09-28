@@ -211,10 +211,13 @@ reset(void)
 	memset(&family, 0, sizeof(family));
 	family.postmaster_pid = PostmasterPid;
 	pg_atomic_init_u64(&family.generation, 1);
+	cluster_config_use_gate_init(&family.cleaner_producer);
+	pg_atomic_init_u32(&family.cleaner_failed, 0);
 	delivery_family = &family;
 	delivery_generation = 1;
 	delivery_work_depth = 0;
 	delivery_waiting_for_idle = false;
+	delivery_cleaner_owned = false;
 	parent_context.type = child_context.type = T_AllocSetContext;
 	CurrentMemoryContext = &parent_context;
 	CurrentResourceOwner = NULL;
@@ -394,10 +397,80 @@ UT_TEST(session_lock_does_not_hold_default_only)
 	UT_ASSERT(cluster_shared_config_delivery_reload());
 	UT_ASSERT_EQ(consumed, 2);
 }
+UT_TEST(cleaner_producer_cut_retains_exact_original_pass)
+{
+	uint32 cut;
+	bool failed;
+	ClusterConfigUseGate *gate;
+	reset();
+	MyBackendType = B_UNDO_CLEANER;
+	MyAuxProcType = UndoCleanerProcess;
+	gate = cluster_shared_config_delivery_cleaner_gate(&failed);
+	UT_ASSERT(gate != NULL && !failed);
+	UT_ASSERT(cluster_shared_config_cleaner_begin());
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+	UT_ASSERT(cluster_config_use_gate_close(gate, &cut));
+	UT_ASSERT(!cluster_config_use_gate_open(gate, cut));
+	expect_deferred();
+	cluster_shared_config_cleaner_end(true);
+	UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 0);
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	cluster_shared_config_delivery_retry_idle();
+	UT_ASSERT_EQ(consumed, 2);
+	UT_ASSERT(cluster_config_use_gate_open(gate, cut));
+	UT_ASSERT(cluster_shared_config_cleaner_begin());
+	cluster_shared_config_cleaner_end(true);
+	UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 0);
+}
+
+UT_TEST(cleaner_producer_failure_is_not_retirement)
+{
+	uint32 cut;
+	bool failed;
+	ClusterConfigUseGate *gate;
+	reset();
+	MyBackendType = B_UNDO_CLEANER;
+	MyAuxProcType = UndoCleanerProcess;
+	UT_ASSERT(cluster_shared_config_cleaner_begin());
+	cluster_shared_config_cleaner_end(false);
+	gate = cluster_shared_config_delivery_cleaner_gate(&failed);
+	UT_ASSERT(gate != NULL && failed);
+	UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+	cluster_shared_config_cleaner_end(true);
+	UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+	UT_ASSERT(cluster_config_use_gate_close(gate, &cut));
+	UT_ASSERT(!cluster_config_use_gate_open(gate, cut));
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	expect_deferred();
+	/* A replacement process's empty private scope is not original retirement. */
+	delivery_cleaner_owned = false;
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+}
+
+UT_TEST(cleaner_producer_requires_actual_family_and_worker)
+{
+	bool failed;
+	reset();
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	MyBackendType = B_UNDO_CLEANER;
+	MyAuxProcType = ClusterUndoCleanerTypeForWorker(1);
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	MyAuxProcType = UndoCleanerProcess;
+	pg_atomic_write_u64(&family.generation, 2);
+	UT_ASSERT(cluster_shared_config_delivery_cleaner_gate(&failed) == NULL && failed);
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	delivery_family = NULL;
+	UT_ASSERT(cluster_shared_config_cleaner_begin());
+	cluster_shared_config_cleaner_end(true);
+	UT_ASSERT(!delivery_cleaner_owned);
+}
+
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(retained_admission_without_transaction_or_command);
 	UT_RUN(gcs_private_work_without_admission);
 	UT_RUN(invalid_gcs_owner_is_not_idle);
@@ -412,6 +485,9 @@ main(void)
 	UT_RUN(policy_failure_cannot_apply_while_owned);
 	UT_RUN(session_owner_survives_native_idle);
 	UT_RUN(session_lock_does_not_hold_default_only);
+	UT_RUN(cleaner_producer_cut_retains_exact_original_pass);
+	UT_RUN(cleaner_producer_failure_is_not_retirement);
+	UT_RUN(cleaner_producer_requires_actual_family_and_worker);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

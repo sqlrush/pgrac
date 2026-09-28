@@ -1501,8 +1501,10 @@ test_cluster_config_delivery_route: test_cluster_config_delivery_route.c unit_te
 # are isolated. Native tests separately cover real assignment and inheritance.
 test_cluster_config_delivery_work: test_cluster_config_delivery_work.c unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_shared_config_delivery.c \
+		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o \
 		$(top_srcdir)/src/include/cluster/cluster_shared_config.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_config_delivery_driver: test_cluster_config_delivery_driver.c unit_test.h \

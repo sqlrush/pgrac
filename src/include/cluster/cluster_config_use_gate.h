@@ -72,6 +72,15 @@ extern ClusterConfigUseGate *cluster_shared_config_delivery_native_gate(void);
 extern ClusterConfigUseTarget *cluster_shared_config_delivery_native_target(void);
 extern bool cluster_shared_config_delivery_work_pending(void);
 
+/* Separate fresh-maintenance producer cut. The real terminal receipt pipeline
+ * is not stopped by this gate. NULL/failed is not an empty producer proof.
+ * Controller must retain its global episode and wake cleaners after OPEN. */
+extern ClusterConfigUseGate *cluster_shared_config_delivery_cleaner_gate(bool *failed);
+extern bool cluster_shared_config_cleaner_begin(void);
+/* Only a complete original pass retires ownership. ERROR keeps a sticky
+ * failed family until native all-old-child retirement; never an idle ACK. */
+extern void cluster_shared_config_cleaner_end(bool completed);
+
 /* Original native lifecycle consumers; no caller-set role or epoch. */
 extern void cluster_shared_config_use_enter(void);
 extern void cluster_shared_config_use_xact_start(void);

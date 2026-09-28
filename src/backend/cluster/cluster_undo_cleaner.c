@@ -66,6 +66,7 @@
 
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_mode.h"				 /* cluster_storage_mode_enabled */
 #include "cluster/cluster_reconfig.h"			 /* ordinary/replacement write gate */
@@ -561,41 +562,13 @@ undo_cleaner_advance_liveness_tick(void)
  *	false, so the continuous mode can never busy-spin.
  */
 static bool
-undo_cleaner_run_pass(bool *out_work_remaining)
+undo_cleaner_run_maintenance(bool *out_work_remaining)
 {
 	ClusterUndoCleanerPassStats stats;
 	ClusterSemanticAdmissionToken modifier_token;
 	bool writable_admission;
 	bool floor_retry_needed = false;
-	bool ctrc_local_progress;
 
-	*out_work_remaining = false;
-
-	if (!cluster_undo_cleaner_enabled)
-		return false;
-	if (!cluster_storage_mode_enabled())
-		return false;
-
-	/* Each bound worker advances only its canonical TT segment shard.
-	 * The helper holds no cleaner lock while sampling or doing physical work. */
-	ctrc_local_progress = cluster_ctrc_cleaner_run_pass();
-	/* SetLatch notifications coalesce.  A completed local CTRC edge proves
-	 * useful work remains in the bounded pipeline, so keep this sole owner
-	 * running until a pass makes no local progress.  Remote enqueue is not a
-	 * completed edge and is excluded by cluster_ctrc_cleaner_run_pass(). */
-	*out_work_remaining = ctrc_local_progress;
-	/* Only coordinator zero owns GC, floor capture, the scan cursor and
-	 * segment advancement. Per-worker progress never duplicates those roles. */
-	if (undo_cleaner_worker != 0)
-		return false;
-	/* After the authenticated all-frontends cut, no allocator needs new
-	 * proactive free-space supply. Keep the CTRC completion pipeline above
-	 * running, but do not continually refill GES/current queues while the
-	 * coordinator waits for their real owners to become idle before park.
-	 * An already admitted maintenance pass still completes and releases its
-	 * modifier normally; this observation grants no shutdown/park authority. */
-	if (cluster_normal_stop_maintenance_cut())
-		return false;
 	writable_admission = cluster_reconfig_self_join_gate_verdict() == CLUSTER_JOIN_GATE_ALLOW;
 	if (cluster_semantic_activation_modifier_enter(writable_admission, &modifier_token)
 		!= CLUSTER_SEMANTIC_ADMISSION_OK)
@@ -831,6 +804,44 @@ pass_account:
 
 	cluster_semantic_activation_leave(&modifier_token);
 	return floor_retry_needed;
+}
+
+/* The original terminal-supply pipeline must remain runnable through a
+ * configuration producer cut. Only fresh optional space maintenance is
+ * bracketed; its actual modifier retires before the bracket completes.
+ * No old receipt is cancelled and no retention decision is changed.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+undo_cleaner_run_pass(bool *out_work_remaining)
+{
+	volatile bool completed = false;
+	volatile bool floor_retry = false;
+
+	*out_work_remaining = false;
+	if (!cluster_undo_cleaner_enabled || !cluster_storage_mode_enabled())
+		return false;
+
+	/* Each original shard continues its canonical receipt completions.
+	 * A real completed edge, not remote enqueue, requests another pass. */
+	*out_work_remaining = cluster_ctrc_cleaner_run_pass();
+	if (undo_cleaner_worker != 0 || cluster_normal_stop_maintenance_cut())
+		return false;
+	if (!cluster_shared_config_cleaner_begin())
+		return false;
+	PG_TRY();
+	{
+		floor_retry = undo_cleaner_run_maintenance(out_work_remaining);
+		completed = true;
+	}
+	PG_FINALLY();
+	{
+		/* ERROR is not a zero-owner acknowledgement. The local family keeps
+		 * failed ownership until its actual native replacement boundary. */
+		cluster_shared_config_cleaner_end(completed);
+	}
+	PG_END_TRY();
+	return floor_retry;
 }
 
 

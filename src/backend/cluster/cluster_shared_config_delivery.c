@@ -46,6 +46,8 @@ typedef struct ConfigDeliveryFamily {
 	pg_atomic_uint32 logger_pid;
 	ClusterConfigUseGate native_use;
 	ClusterConfigUseTarget native_target;
+	ClusterConfigUseGate cleaner_producer;
+	pg_atomic_uint32 cleaner_failed;
 	ClusterSharedConfigDeliverySlot incoming;
 	ClusterSharedConfigDeliverySlot accepted;
 	ClusterSharedConfigSlot logger;
@@ -59,6 +61,7 @@ static bool delivery_waiting_for_idle;
 /* A utility or maintenance command may own work across native transactions.
  * This local nesting count is not a target, node ACK or DATA permission. */
 static uint32 delivery_work_depth;
+static bool delivery_cleaner_owned;
 
 static void
 delivery_release_owner(ResourceOwner owner, ResourceOwner saved, bool success)
@@ -100,6 +103,59 @@ cluster_shared_config_delivery_native_target(void)
 {
 	return cluster_shared_config_delivery_native_gate() != NULL ? &delivery_family->native_target
 																: NULL;
+}
+
+ClusterConfigUseGate *
+cluster_shared_config_delivery_cleaner_gate(bool *failed)
+{
+	if (failed == NULL)
+		return NULL;
+	*failed = true;
+	if (cluster_shared_config_delivery_native_gate() == NULL)
+		return NULL;
+	*failed = pg_atomic_read_u32(&delivery_family->cleaner_failed) != 0;
+	return &delivery_family->cleaner_producer;
+}
+
+bool
+cluster_shared_config_cleaner_begin(void)
+{
+	ClusterConfigUseGate *gate;
+	uint32 epoch;
+	bool failed;
+	if (delivery_cleaner_owned)
+		return false;
+	if (delivery_family == NULL)
+		return true; /* Original non-shared path has no managed owner. */
+	if (!IsUnderPostmaster || MyBackendType != B_UNDO_CLEANER
+		|| ClusterUndoCleanerWorkerIdForType(MyAuxProcType) != 0
+		|| (gate = cluster_shared_config_delivery_cleaner_gate(&failed)) == NULL || failed
+		|| !cluster_config_use_gate_enter(gate, false, &epoch))
+		return false;
+	delivery_cleaner_owned = true;
+	return true;
+}
+
+void
+cluster_shared_config_cleaner_end(bool completed)
+{
+	ClusterConfigUseGate *gate;
+	bool failed;
+	if (!delivery_cleaner_owned)
+		return;
+	gate = cluster_shared_config_delivery_cleaner_gate(&failed);
+	if (gate == NULL)
+		elog(PANIC, "configuration cleaner producer lost its native family");
+	if (!completed || failed) {
+		/* Original cleanup may still own guards/admission after ERROR. Neither
+		 * a replacement worker nor a second end(true) certifies retirement.
+		 * Actual all-old-child family reset is the sole recovery boundary. */
+		pg_atomic_write_u32(&delivery_family->cleaner_failed, 1);
+		return;
+	}
+	if (!cluster_config_use_gate_leave(gate))
+		elog(PANIC, "configuration cleaner producer count is inconsistent");
+	delivery_cleaner_owned = false;
 }
 
 bool
@@ -144,8 +200,8 @@ delivery_has_owned_work(void)
 	int slot;
 	const char *reason;
 
-	if (delivery_work_depth != 0 || IsTransactionState() || IsTransactionOrTransactionBlock()
-		|| cluster_shared_config_use_session_owned()
+	if (delivery_work_depth != 0 || delivery_cleaner_owned || IsTransactionState()
+		|| IsTransactionOrTransactionBlock() || cluster_shared_config_use_session_owned()
 		|| cluster_semantic_activation_backend_has_admission())
 		return true;
 	if ((AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess())
@@ -194,6 +250,8 @@ cluster_shared_config_delivery_start(void)
 	pg_atomic_init_u32(&delivery_family->logger_pid, 0);
 	cluster_config_use_gate_init(&delivery_family->native_use);
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
+	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
+	pg_atomic_init_u32(&delivery_family->cleaner_failed, 0);
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	cluster_shared_config_delivery_slot_init(&delivery_family->accepted);
 	cluster_shared_config_registration_init(&delivery_family->logger);
@@ -220,6 +278,8 @@ cluster_shared_config_delivery_new_shmem(void)
 	pg_atomic_write_u32(&delivery_family->lmon_pid, 0);
 	cluster_config_use_gate_init(&delivery_family->native_use);
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
+	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
+	pg_atomic_write_u32(&delivery_family->cleaner_failed, 0);
 	delivery_generation = generation + 1;
 	pg_atomic_write_u64(&delivery_family->generation, delivery_generation);
 	if (!cluster_shared_config_delivery_parent_publish())
