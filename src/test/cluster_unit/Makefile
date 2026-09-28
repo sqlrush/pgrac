@@ -51,7 +51,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
         test_pgrac_fenced_target_request \
         test_pgrac_fenced_pacemaker_owned \
-        test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members \
+        test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_use_gate \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
@@ -447,6 +447,14 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_walr,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_ir,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_use_gate,$(SIMPLE_TESTS))
+
+# PGRAC: real atomic producer cut, including fork-shared entry/close races.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_use_gate: test_cluster_config_use_gate.c unit_test.h \
+		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: actual member observation codec/collector; native census tested separately.
 # Author: SqlRush <sqlrush@gmail.com>

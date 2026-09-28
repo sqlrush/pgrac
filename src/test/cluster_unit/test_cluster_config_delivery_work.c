@@ -51,6 +51,12 @@ static uint64 target, consumed;
 static unsigned assignments, reads, gcs_polls, cr_polls, cleaner_polls;
 static unsigned contexts, deletes, owners, releases;
 
+/* Native producer lifecycle is exercised by the real-postmaster TAP test.
+ * This unit isolates the retained asynchronous service delivery boundary. */
+void
+cluster_shared_config_use_enter(void)
+{}
+
 MemoryContext
 AllocSetContextCreateInternal(MemoryContext parent, const char *name, Size minsize, Size initsize,
 							  Size maxsize)
@@ -94,7 +100,7 @@ IsTransactionOrTransactionBlock(void)
 	return transaction || transaction_block;
 }
 bool
-LockHasSessionLocks(void)
+cluster_shared_config_use_session_owned(void)
 {
 	return session_locks;
 }

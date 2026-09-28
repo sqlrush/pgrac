@@ -27,6 +27,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -43,6 +44,7 @@ typedef struct ConfigDeliveryFamily {
 	pg_atomic_uint64 generation;
 	pg_atomic_uint32 lmon_pid;
 	pg_atomic_uint32 logger_pid;
+	ClusterConfigUseGate native_use;
 	ClusterSharedConfigDeliverySlot incoming;
 	ClusterSharedConfigDeliverySlot accepted;
 	ClusterSharedConfigSlot logger;
@@ -83,6 +85,21 @@ delivery_is_family(void)
 		   && delivery_family->postmaster_pid == PostmasterPid;
 }
 
+ClusterConfigUseGate *
+cluster_shared_config_delivery_native_gate(void)
+{
+	if (!delivery_is_family()
+		|| pg_atomic_read_u64(&delivery_family->generation) != delivery_generation)
+		return NULL;
+	return &delivery_family->native_use;
+}
+
+bool
+cluster_shared_config_delivery_work_pending(void)
+{
+	return delivery_work_depth != 0;
+}
+
 bool
 cluster_shared_config_delivery_work_enter(void)
 {
@@ -91,6 +108,7 @@ cluster_shared_config_delivery_work_enter(void)
 	if (delivery_work_depth == PG_UINT32_MAX)
 		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("configuration work nesting limit exceeded")));
+	cluster_shared_config_use_enter();
 	++delivery_work_depth;
 	return true;
 }
@@ -119,7 +137,8 @@ delivery_has_owned_work(void)
 	const char *reason;
 
 	if (delivery_work_depth != 0 || IsTransactionState() || IsTransactionOrTransactionBlock()
-		|| LockHasSessionLocks() || cluster_semantic_activation_backend_has_admission())
+		|| cluster_shared_config_use_session_owned()
+		|| cluster_semantic_activation_backend_has_admission())
 		return true;
 	if ((AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess())
 		&& cluster_gcs_block_normal_stop_local_poll(&slot, &reason) != CLUSTER_NORMAL_STOP_READY)
@@ -165,6 +184,7 @@ cluster_shared_config_delivery_start(void)
 	pg_atomic_init_u64(&delivery_family->generation, delivery_generation);
 	pg_atomic_init_u32(&delivery_family->lmon_pid, 0);
 	pg_atomic_init_u32(&delivery_family->logger_pid, 0);
+	cluster_config_use_gate_init(&delivery_family->native_use);
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	cluster_shared_config_delivery_slot_init(&delivery_family->accepted);
 	cluster_shared_config_registration_init(&delivery_family->logger);
@@ -189,6 +209,7 @@ cluster_shared_config_delivery_new_shmem(void)
 	 * parent's accepted sequence, which the detached logger can still read. */
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	pg_atomic_write_u32(&delivery_family->lmon_pid, 0);
+	cluster_config_use_gate_init(&delivery_family->native_use);
 	delivery_generation = generation + 1;
 	pg_atomic_write_u64(&delivery_family->generation, delivery_generation);
 	if (!cluster_shared_config_delivery_parent_publish())

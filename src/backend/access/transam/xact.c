@@ -94,6 +94,10 @@
 #include "postgres.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_config_use_gate.h"
+#endif
+
+#ifdef USE_PGRAC_CLUSTER
 #include "storage/ipc.h"
 #endif
 
@@ -2464,6 +2468,7 @@ StartTransaction(void)
 	 * This retries existing local delivery only, not cluster DATA admission.
 	 * Author: SqlRush <sqlrush@gmail.com> */
 	cluster_shared_config_delivery_retry_idle();
+	cluster_shared_config_use_xact_start();
 #endif
 
 	/*
@@ -2987,6 +2992,8 @@ CommitTransaction(void)
 	 * undo bookkeeping.  Preserve backend caches; PREPARE/ABORT use the full
 	 * teardown.  Spec: spec-4.12a-undo-record-segment-reclaim.md */
 	cluster_undo_record_xact_commit_release();
+	/* PGRAC: actual resource retirement, also before AND CHAIN starts again. */
+	cluster_shared_config_use_xact_end();
 #endif
 
 	RESUME_INTERRUPTS();
@@ -3323,6 +3330,7 @@ PrepareTransaction(void)
 	cluster_touched_peers_reset();
 	/* PGRAC spec-6.2 D6: clear Smart Fusion touched-dep vector on commit. */
 	cluster_sf_xact_reset_deps();
+	cluster_shared_config_use_xact_end();
 #endif
 
 	RESUME_INTERRUPTS();
@@ -3682,6 +3690,10 @@ CleanupTransaction(void)
 	 * default
 	 */
 	s->state = TRANS_DEFAULT;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: AbortTransaction callbacks alone do not retire this owner. */
+	cluster_shared_config_use_xact_end();
+#endif
 }
 
 /*

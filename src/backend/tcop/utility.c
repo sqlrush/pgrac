@@ -16,6 +16,10 @@
  */
 #include "postgres.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_config_use_gate.h"
+#endif
+
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/twophase.h"
@@ -584,6 +588,8 @@ ProcessUtility(PlannedStmt *pstmt,
 		cluster_shared_config_delivery_work_leave(config_work);
 	}
 	PG_END_TRY();
+	/* PGRAC: successful whole-command return, never ERROR's PG_FINALLY. */
+	cluster_shared_config_use_idle();
 #endif
 }
 

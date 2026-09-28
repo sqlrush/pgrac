@@ -23,6 +23,10 @@
  */
 #include "postgres.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_config_use_gate.h"
+#endif
+
 #include <math.h>
 
 #include "access/clog.h"
@@ -504,6 +508,8 @@ vacuum(List *relations, VacuumParams *params, BufferAccessStrategy bstrategy,
 		cluster_shared_config_delivery_work_leave(config_work);
 	}
 	PG_END_TRY();
+	/* PGRAC: only a successful whole vacuum may retire a native owner here. */
+	cluster_shared_config_use_idle();
 #endif
 }
 

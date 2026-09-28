@@ -414,6 +414,8 @@ typedef enum {
 	 * survivors to ACK their cluster-wide removal cleanup (the §4 ACK barrier)
 	 * before writing the REMOVED marker. */
 	WAIT_EVENT_RECONFIG_NODE_REMOVE_CLEANUP_WAIT,
+	/* PGRAC: held native producer cut; scheduling wake is not an error deadline. */
+	WAIT_EVENT_RECONFIG_SHARED_CONFIG_WAIT,
 
 	/* Cluster: Recovery (6 events) -- #86; +1 spec-4.11 D5; +1 spec-4.12 D6 */
 	WAIT_EVENT_RECOVERY_WAL_FETCH = PG_WAIT_CLUSTER_RECOVERY,

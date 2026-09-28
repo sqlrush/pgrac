@@ -318,6 +318,8 @@ struct PGPROC {
 #ifdef USE_PGRAC_CLUSTER
 	/* Native lifetime, including auxiliaries outside ProcSignal. No admission. */
 	ClusterSharedConfigSlot cluster_config;
+	/* PGRAC: exact still-held native configuration owner, never a DATA ACK. */
+	pg_atomic_uint32 cluster_config_use_epoch;
 #endif
 
 	/*

@@ -58,6 +58,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_fixture);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_late);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_control_late);
 PGDLLEXPORT void _PG_init(void);
+extern void test_pgrac_config_gate_init(void);
 extern void test_pgrac_config_work_init(void);
 
 Datum
@@ -682,6 +683,7 @@ _PG_init(void)
 	if (!process_shared_preload_libraries_in_progress || IsUnderPostmaster)
 		return;
 	test_pgrac_config_work_init();
+	test_pgrac_config_gate_init();
 	DefineCustomIntVariable("test_pgrac_shared_config.apply_node", "Test startup application.",
 							NULL, &test_apply_node, -1, -1, 127, PGC_POSTMASTER, 0, NULL, NULL,
 							NULL);

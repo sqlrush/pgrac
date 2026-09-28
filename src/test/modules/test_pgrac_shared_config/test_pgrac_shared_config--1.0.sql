@@ -136,3 +136,7 @@ REVOKE ALL ON FUNCTION test_pgrac_config_selection_cleanup() FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_delivery() RETURNS text
 AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery' LANGUAGE C;
 REVOKE ALL ON FUNCTION test_pgrac_config_delivery() FROM PUBLIC;
+-- PGRAC: local native cut observation only; no distributed permission.
+CREATE FUNCTION test_pgrac_config_gate_state() RETURNS text
+AS 'MODULE_PATHNAME', 'test_pgrac_config_gate_state' LANGUAGE C;
+REVOKE ALL ON FUNCTION test_pgrac_config_gate_state() FROM PUBLIC;

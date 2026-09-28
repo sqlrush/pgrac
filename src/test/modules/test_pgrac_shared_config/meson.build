@@ -2,7 +2,8 @@
 # Author: SqlRush <sqlrush@gmail.com>
 test_pgrac_shared_config = shared_module('test_pgrac_shared_config',
   files('test_pgrac_shared_config.c', 'test_pgrac_wal_publish_native.c',
-        'test_pgrac_wal_history_native.c', 'test_pgrac_config_work.c'),
+        'test_pgrac_wal_history_native.c', 'test_pgrac_config_work.c',
+        'test_pgrac_config_gate.c'),
   kwargs: pg_test_mod_args,
 )
 test_install_libs += test_pgrac_shared_config
@@ -23,5 +24,6 @@ tests += {
                     't/018_native_delivery.pl', 't/019_node_census.pl',
                     't/020_active_profile.pl', 't/021_active_census.pl',
                     't/022_native_service_roles.pl', 't/023_transaction_delivery.pl',
-                    't/024_command_delivery.pl']},
+                    't/024_command_delivery.pl', 't/025_common_use.pl',
+                    't/026_session_lock_delivery.pl', 't/027_native_use_cut.pl']},
 }

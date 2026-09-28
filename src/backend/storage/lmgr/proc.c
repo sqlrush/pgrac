@@ -34,6 +34,10 @@
  */
 #include "postgres.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_config_use_gate.h"
+#endif
+
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -301,6 +305,7 @@ InitProcGlobal(void)
 #ifdef USE_PGRAC_CLUSTER
 		/* PGRAC: spec-5.8 D1d — per-proc cluster wait-state record. */
 		cluster_shared_config_registration_init(&proc->cluster_config);
+		pg_atomic_init_u32(&proc->cluster_config_use_epoch, 0);
 		cluster_lmd_wait_state_init(&(proc->cluster_lmd_wait));
 		/* PGRAC: spec-5.9 D3 — per-proc deadlock-cancel token. */
 		cluster_cancel_token_init(&(proc->cluster_cancel_token));
@@ -965,6 +970,13 @@ ProcKill(int code, Datum arg)
 
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: original resources are now gone, before PGPROC/lock-group reuse.
+	 * An early before_shmem_exit callback would retire this owner too soon.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	cluster_shared_config_use_exit();
+#endif
 
 	/*
 	 * Detach from any lock group of which we are a member.  If the leader
