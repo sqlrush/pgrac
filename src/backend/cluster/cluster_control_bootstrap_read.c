@@ -20,6 +20,7 @@
 #include "access/slru.h"
 #include "common/cryptohash.h"
 #include "miscadmin.h"
+#include "storage/fd.h"
 #include "cluster_control_bootstrap_private.h"
 #include "cluster_control_root_private.h"
 #include "cluster_recovery_anchor_private.h"
@@ -563,7 +564,7 @@ read_same_dir(int parent, const char *name, int fd)
  * not permission to race a writer or publish a recovery terminal. */
 static ClusterControlRootResult
 read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
-				 pg_cryptohash_ctx *hash, uint32 *reads)
+				 pg_cryptohash_ctx *hash, uint32 *reads, bool sync)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	char name[16];
@@ -573,7 +574,7 @@ read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
 	int fd;
 
 	snprintf(name, sizeof(name), "%04X", page_no / SLRU_PAGES_PER_SEGMENT);
-	fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+		fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
 	if (fd < 0)
 		return read_error();
 	if (fstat(fd, &before) != 0 || !read_owned(&before, false) || before.st_nlink != 1)
@@ -586,6 +587,8 @@ read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
 	for (unsigned pass = 0; pass < 2; ++pass) {
 		size_t used = 0;
 		uint8 *bytes = pass == 0 ? page : again;
+		if (pass == 1 && sync && pg_fsync(fd) != 0)
+			goto done;
 		while (used < BLCKSZ) {
 			ssize_t n = pread(fd, bytes + used, BLCKSZ - used, offset + used);
 			if (n < 0 && errno == EINTR && !InterruptPending)
@@ -621,7 +624,7 @@ done:
 
 static ClusterControlRootResult
 read_native_horizon(int root, const ControlFileData *input, ControlFileData *effective,
-					pg_cryptohash_ctx *hash)
+					pg_cryptohash_ctx *hash, bool sync)
 {
 	uint8 bytes[sizeof(ClusterXidAuthorityHeader) + 1];
 	uint8 again[sizeof(bytes)];
@@ -644,6 +647,18 @@ read_native_horizon(int root, const ControlFileData *input, ControlFileData *eff
 	if (result == 0)
 		result
 			= read_bytes(global, "pgrac_xid_authority", sizeof(auth), sizeof(auth), bytes, &length);
+	if (result == 0 && sync) {
+		int fd = openat(global, "pgrac_xid_authority",
+			O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+		struct stat pinned;
+		if (fd < 0 || fstat(fd, &pinned) != 0 || !read_owned(&pinned, false)
+			|| pinned.st_nlink != 1 || pinned.st_dev != before.st_dev
+			|| pinned.st_ino != before.st_ino || pinned.st_size != before.st_size)
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else if (pg_fsync(fd) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+		read_close(fd, &result);
+	}
 	if (result == 0)
 		result
 			= read_bytes(global, "pgrac_xid_authority", sizeof(auth), sizeof(auth), again, &length);
@@ -667,6 +682,10 @@ read_native_horizon(int root, const ControlFileData *input, ControlFileData *eff
 	}
 	if (result == 0)
 		result = read_same_dir(root, "global", global);
+	if (result == 0 && sync && pg_fsync(global) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	if (result == 0 && sync)
+		result = read_same_dir(root, "global", global);
 	if (result == 0 && pg_cryptohash_update(hash, bytes, sizeof(auth)) < 0)
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	read_close(global, &result);
@@ -680,7 +699,7 @@ read_native_horizon(int root, const ControlFileData *input, ControlFileData *eff
 
 static ClusterControlRootResult
 read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptohash_ctx *hash,
-					uint32 *reads)
+					uint32 *reads, bool sync)
 {
 	const CheckPoint *cp = &input->checkPointCopy;
 	TransactionId next = XidFromFullTransactionId(cp->nextXid);
@@ -693,7 +712,7 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (next % CLUSTER_NATIVE_CLOG_PER_PAGE != 0) {
 		result
-			= read_native_page(dirs[3], 1, next / CLUSTER_NATIVE_CLOG_PER_PAGE, page, hash, reads);
+			= read_native_page(dirs[3], 1, next / CLUSTER_NATIVE_CLOG_PER_PAGE, page, hash, reads, sync);
 		if (result != 0)
 			return result;
 		if (!cluster_native_clog_suffix_unused((const char *)page, next))
@@ -701,14 +720,14 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 	}
 	if (next % CLUSTER_NATIVE_SUBTRANS_PER_PAGE != 0) {
 		result = read_native_page(dirs[4], 2, next / CLUSTER_NATIVE_SUBTRANS_PER_PAGE, page, hash,
-								  reads);
+								  reads, sync);
 		if (result != 0)
 			return result;
 		if (!cluster_native_subtrans_suffix_unused((const char *)page, next))
 			return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
 	}
 	result = read_native_page(dirs[7], 3, sentinel / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE, page, hash,
-							  reads);
+							  reads, sync);
 	if (result != 0)
 		return result;
 	memcpy(&observed, page + (sentinel % CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE) * sizeof(uint32),
@@ -719,7 +738,7 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 		return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
 	if (cp->oldestMulti != cp->nextMulti) {
 		result = read_native_page(dirs[7], 3, cp->oldestMulti / CLUSTER_NATIVE_MX_OFFSETS_PER_PAGE,
-								  page, hash, reads);
+								  page, hash, reads, sync);
 		if (result != 0)
 			return result;
 		memcpy(&oldest,
@@ -728,12 +747,12 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 		if (oldest == 0)
 			return CLUSTER_CONTROL_ROOT_COPY_DIVERGENT;
 		result = read_native_page(dirs[8], 4, oldest / CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE, page,
-								  hash, reads);
+								  hash, reads, sync);
 		if (result != 0)
 			return result;
 		result = read_native_page(
 			dirs[8], 4, (uint32)(cp->nextMultiOffset - 1) / CLUSTER_NATIVE_MX_MEMBERS_PER_PAGE,
-			page, hash, reads);
+			page, hash, reads, sync);
 		if (result != 0)
 			return result;
 	}
@@ -742,7 +761,7 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 	 * create or infer the contents of the as-yet unallocated next page. */
 	if (input->track_commit_timestamp && next % CLUSTER_NATIVE_COMMIT_TS_PER_PAGE != 0) {
 		result = read_native_page(dirs[6], 5, next / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page, hash,
-								  reads);
+								  reads, sync);
 		if (result != 0)
 			return result;
 	}
@@ -755,12 +774,12 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		result = read_native_page(dirs[6], 5,
 								  cp->oldestCommitTsXid / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page,
-								  hash, reads);
+								  hash, reads, sync);
 		if (result != 0)
 			return result;
 		result = read_native_page(dirs[6], 5,
 								  cp->newestCommitTsXid / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page,
-								  hash, reads);
+								  hash, reads, sync);
 		if (result != 0)
 			return result;
 	}
@@ -768,9 +787,9 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 }
 #endif
 
-ClusterControlRootResult
-cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
-									const ControlFileData *input, ClusterNativeSideObservation *out)
+static ClusterControlRootResult
+native_side_inspect(const char *shared_root, uint32 node_id,
+		const ControlFileData *input, ClusterNativeSideObservation *out, bool sync)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 #if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
@@ -790,7 +809,7 @@ cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
 		&& (uintptr_t)input < (uintptr_t)out + sizeof(*out))
 		return result;
 	memset(out, 0, sizeof(*out));
-	if (input == NULL || !read_path_valid(shared_root, NULL)
+	if (input == NULL || (sync && !enableFsync) || !read_path_valid(shared_root, NULL)
 		|| node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT)
 		return result;
 	hash = pg_cryptohash_create(PG_SHA256);
@@ -809,11 +828,17 @@ cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
 	for (unsigned i = 0; result == 0 && i < lengthof(families); ++i)
 		result = read_dir(dirs[parents[i]], families[i], &dirs[3 + i]);
 	if (result == 0)
-		result = read_native_horizon(dirs[0], input, &effective, hash);
+		result = read_native_horizon(dirs[0], input, &effective, hash, sync);
 	if (result == 0) {
 		observed.effective_next_xid = U64FromFullTransactionId(effective.checkPointCopy.nextXid);
-		result = read_native_cursors(dirs, &effective, hash, &observed.page_reads);
+		result = read_native_cursors(dirs, &effective, hash, &observed.page_reads, sync);
 	}
+	/* Before-checkpoint native startup performs no writes outside these
+	 * retained cursor files. W0 certifies older state; sync its exact observed
+	 * inputs and all route entries, never an unrelated recoverer SLRU cache. */
+	for (int i = lengthof(dirs) - 1; result == 0 && sync && i >= 0; --i)
+		if (pg_fsync(dirs[i]) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	if (result == 0)
 		result = read_same_dir(AT_FDCWD, shared_root, dirs[0]);
 	if (result == 0)
@@ -835,6 +860,20 @@ done:
 		memset(out, 0, sizeof(*out));
 #endif
 	return result;
+}
+
+ClusterControlRootResult
+cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
+	const ControlFileData *input, ClusterNativeSideObservation *out)
+{
+	return native_side_inspect(shared_root, node_id, input, out, false);
+}
+
+ClusterControlRootResult
+cluster_control_native_side_sync(const char *shared_root, uint32 node_id,
+	const ControlFileData *input, ClusterNativeSideObservation *out)
+{
+	return native_side_inspect(shared_root, node_id, input, out, true);
 }
 
 #if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \

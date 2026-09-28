@@ -131,6 +131,7 @@ static ClusterControlRootSnapshot fake_preflight_root;
 static ClusterControlRootReadToken fake_preflight_token;
 static ClusterControlRecoverySubject fake_pending_subject;
 static bool fake_preflight_root_ready;
+static bool fake_terminal_history_blocked;
 static bool fake_extra_configured_thread;
 static PgracExternalFenceNeedSetResult fake_need_build_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 static ClusterRecoverySerialRevalidateResult fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
@@ -309,7 +310,7 @@ cluster_control_root_read_canonical(uint16 origin_thread_id,
  * suite. Here it is the explicit authority seam for the real retention .o. */
 ClusterControlRootResult
 cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity *self,
-											   ClusterControlRootSnapshot *out,
+																				ClusterControlRootSnapshot *out,
 											   ClusterControlRootReadToken *token)
 {
 	memset(out, 0, sizeof(*out));
@@ -319,6 +320,16 @@ cluster_control_root_v3_read_retention_current(const ClusterControlRootIdentity 
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	*out = fake_preflight_root;
 	*token = fake_preflight_token;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_terminal_history_blocked(const ClusterControlRootIdentity *expected_identity,
+																		 bool *out_blocked)
+{
+	(void)expected_identity;
+	if (out_blocked != NULL)
+		*out_blocked = fake_terminal_history_blocked;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
@@ -497,6 +508,7 @@ reset_pin_fakes(void)
 	memset(&fake_preflight_root, 0, sizeof(fake_preflight_root));
 	memset(&fake_preflight_token, 0, sizeof(fake_preflight_token));
 	fake_preflight_root_ready = false;
+	fake_terminal_history_blocked = false;
 	fake_extra_configured_thread = false;
 	fake_need_build_result = PGRAC_EXTERNAL_FENCE_NEED_SET_OK;
 	fake_serial_result = CLUSTER_RECOVERY_SERIAL_CURRENT;
@@ -715,6 +727,30 @@ UT_TEST(test_v2_reuse_selects_exact_generation_not_flat_decoy)
 	UT_ASSERT_EQ(guard.pre_action_stamp.file_id_lo, selected.st_ino);
 	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
 				 CLUSTER_WALR_RELEASE_NOT_HELD);
+	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
+	v2_reuse_fixture_cleanup(&f);
+}
+
+/* PRE2: a selected checkpoint-less terminal remains a physical retention
+ * input until a typed consumer closes it; a new reservation must not prune it
+ * merely because the current root is otherwise reusable. */
+UT_TEST(test_v2_reuse_terminal_history_blocks_until_consumer_closes)
+{
+	V2ReuseFixture f;
+	ClusterWalReuseActionGuard guard = { 0 };
+	ClusterWalReuseDenyReason reason;
+	ClusterWalTerminalOutcome outcome;
+	PgracExternalFenceNeedSetV1 *needs = NULL;
+
+	v2_reuse_fixture(&f);
+	fake_terminal_history_blocked = true;
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_init(&guard, &reason), CLUSTER_WAL_GUARD_OK);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_preflight(&guard, &f.request, &needs, &reason),
+					 CLUSTER_WAL_GUARD_BLOCKED);
+	UT_ASSERT_EQ(reason, CLUSTER_WAL_DENY_ROOT_REQUIRED);
+	UT_ASSERT_NULL(needs);
+	UT_ASSERT_EQ(cluster_wal_reuse_guard_finish(&guard, &outcome, &reason),
+					 CLUSTER_WALR_RELEASE_NOT_HELD);
 	UT_ASSERT_EQ(outcome, CLUSTER_WAL_TERMINAL_UNCHANGED);
 	v2_reuse_fixture_cleanup(&f);
 }
@@ -2961,12 +2997,13 @@ main(int argc, char **argv)
 		return write_fixture_wal_segment(argc, argv);
 	if (argc != 1)
 		return 2;
-	UT_PLAN(57);
+	UT_PLAN(58);
 	UT_RUN(test_v2_e1_consumes_current_root_and_preserves_exact_floor);
 	UT_RUN(test_v2_retention_zero_crc_is_not_absent_authority);
 	UT_RUN(test_v2_retention_refuses_checkpoint_future_and_wrong_purpose);
 	UT_RUN(test_v2_retention_revalidates_root_after_walr_x);
 	UT_RUN(test_v2_reuse_selects_exact_generation_not_flat_decoy);
+	UT_RUN(test_v2_reuse_terminal_history_blocks_until_consumer_closes);
 	UT_RUN(test_v2_reuse_missing_native_ref_cannot_fallback_flat);
 	UT_RUN(test_v2_reuse_rejects_unproven_namespace_and_claim);
 	UT_RUN(test_v2_reuse_claim_change_blocks_every_physical_recheck);

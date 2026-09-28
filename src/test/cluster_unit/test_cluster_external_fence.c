@@ -277,6 +277,39 @@ cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 	return stub_root_revalidate_result;
 }
 
+ClusterControlRootResult
+cluster_control_root_v3_validate_rejoin_terminal(
+	const ClusterControlRootIdentity *expected_identity, uint64 failed_incarnation,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	ClusterControlRootRejoinTerminalProofV1 *out_proof)
+{
+	(void)expected_identity;
+	(void)failed_incarnation;
+	(void)expected_snapshot;
+	(void)expected_token;
+	if (out_proof != NULL)
+		memset(out_proof, 0, sizeof(*out_proof));
+	return CLUSTER_CONTROL_ROOT_ABSENT;
+}
+
+ClusterControlRootResult
+cluster_control_root_v3_consume_rejoin_terminal(
+	const ClusterControlRootIdentity *expected_identity, uint64 candidate_incarnation,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootRejoinTerminalProofV1 *proof, bool *out_consumed)
+{
+	(void)expected_identity;
+	(void)candidate_incarnation;
+	(void)expected_snapshot;
+	(void)expected_token;
+	(void)proof;
+	if (out_consumed != NULL)
+		*out_consumed = false;
+	return CLUSTER_CONTROL_ROOT_ABSENT;
+}
+
 void
 cluster_join_marker_compute_crc(ClusterJoinCommitMarker *marker)
 {

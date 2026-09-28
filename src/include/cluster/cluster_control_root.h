@@ -160,6 +160,21 @@ typedef struct ClusterControlRootReadToken {
 	uint32 root_flags;
 } ClusterControlRootReadToken;
 
+/* PGRAC PRE2: a typed terminal is a durable, root-selected proof that the
+ * failed initializer was closed without becoming a serving writer.  It is a
+ * rejoin input only; it never changes the root lifecycle or grants serving
+ * authority.  The proof is deliberately fixed-size so callers bind it into
+ * their existing rejoin digest without changing the provider/wire ABI. */
+typedef struct ClusterControlRootRejoinTerminalProofV1 {
+	uint64 failed_incarnation;
+	uint64 terminal_generation;
+	uint8 terminal_sha256[PG_SHA256_DIGEST_LENGTH];
+	uint8 operation_uuid[16];
+} ClusterControlRootRejoinTerminalProofV1;
+
+StaticAssertDecl(sizeof(ClusterControlRootRejoinTerminalProofV1) == 64,
+				 "rejoin terminal proof ABI");
+
 typedef struct ClusterControlRootPatch {
 	uint64 mask;
 	uint32 expected_lifecycle;
@@ -522,6 +537,37 @@ cluster_control_root_read_canonical_dead_origin(uint16 origin_thread_id,
 extern ClusterControlRootResult cluster_control_root_lookup_owner_by_node_runtime(
 	int32 old_node_id, ClusterControlRootIdentity *out_identity,
 	ClusterControlRootSnapshot *out_snapshot, ClusterControlRootReadToken *out_token);
+/* Validate a failed initializer's typed terminal against the exact current
+ * root cut supplied by the caller.  This accepts no lifecycle shortcut: the
+ * selected terminal must be present in the current root's retained union,
+ * match the failed identity/incarnation, and have no pending replacement for
+ * that origin.  Output is cleared on every refusal. */
+extern ClusterControlRootResult
+cluster_control_root_v3_validate_rejoin_terminal(
+	/* expected_identity is the current root namespace; failed_incarnation is
+	 * the distinct initializer claim selected from retained terminal history. */
+	const ClusterControlRootIdentity *expected_identity, uint64 failed_incarnation,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	ClusterControlRootRejoinTerminalProofV1 *out_proof);
+/* A terminal remains a retention input until a consumer explicitly proves
+ * closure.  The current PRE2 consumer is intentionally conservative: any
+ * selected terminal blocks destructive reuse, and no reservation/install path
+ * may prune it. */
+extern ClusterControlRootResult
+cluster_control_root_v3_terminal_history_blocked(const ClusterControlRootIdentity *expected_identity,
+											 bool *out_blocked);
+/* Consume exactly one provider-mediated rejoin terminal after the membership
+ * commit has published the candidate.  The selected terminal's immutable
+ * physical object remains as audit evidence; only its selected history
+ * reference is removed.  A failed or ambiguous publication leaves the old
+ * root selected and therefore keeps retention fail-closed. */
+extern ClusterControlRootResult
+cluster_control_root_v3_consume_rejoin_terminal(
+	const ClusterControlRootIdentity *expected_identity, uint64 candidate_incarnation,
+	const ClusterControlRootSnapshot *expected_snapshot,
+	const ClusterControlRootReadToken *expected_token,
+	const ClusterControlRootRejoinTerminalProofV1 *proof, bool *out_consumed);
 extern ClusterControlRootResult
 cluster_control_root_read_recovery_subject(uint16 origin_thread,
 										   const ClusterControlRootIdentity *expected,

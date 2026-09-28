@@ -23,6 +23,18 @@
 UT_DEFINE_GLOBALS();
 int wal_segment_size = 1024 * 1024;
 bool cluster_shared_config;
+bool enableFsync = true;
+static unsigned tail_sync_count, tail_fail_sync;
+
+int
+pg_fsync(int fd)
+{
+	if (++tail_sync_count == tail_fail_sync) {
+		errno = EIO;
+		return -1;
+	}
+	return fsync(fd);
+}
 char *cluster_wal_threads_dir;
 static char scratch[MAXPGPATH], generation[MAXPGPATH], prefix_path[MAXPGPATH];
 static ClusterWalDurablePrefixRef ref;
@@ -1059,10 +1071,45 @@ UT_TEST(startup_preserves_physical_failure_and_cancellation_boundaries)
 	}
 }
 
+UT_TEST(startup_sync_preserves_actual_promise_and_closes_all_fds)
+{
+	for (unsigned cut = 0; cut <= 7; ++cut) {
+		ClusterWalStartupObservation before, after, zero = { 0 };
+		ClusterWalDurablePrefix promised, current;
+		int fds;
+		fixture();
+		(void)base_record();
+		/* The physical scan must retain an unpromised complete suffix, without
+		 * manufacturing a newer writer promise from the recoverer's fsync. */
+		prefix_write((ClusterWalDurablePrefix){ 1, 0, 0, 0 });
+		UT_ASSERT_EQ(startup_observe(&before), 0);
+		promised = before.tail.durable_prefix;
+		fds = fd_count();
+		tail_sync_count = 0;
+		tail_fail_sync = cut;
+		memset(&after, 0xa5, sizeof(after));
+		if (cut == 0) {
+			UT_ASSERT_EQ(cluster_wal_startup_sync(scratch, &ref, wal_segment_size,
+				wal_segment_size, &after), 0);
+			UT_ASSERT_EQ(tail_sync_count, 7);
+			UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
+		} else {
+			UT_ASSERT(cluster_wal_startup_sync(scratch, &ref, wal_segment_size,
+				wal_segment_size, &after) != 0);
+			UT_ASSERT_EQ(memcmp(&after, &zero, sizeof(after)), 0);
+		}
+		tail_fail_sync = 0;
+		UT_ASSERT_EQ(fd_count(), fds);
+		UT_ASSERT_EQ(cluster_wal_durable_prefix_read(scratch, &ref, &current), 0);
+		UT_ASSERT_EQ(memcmp(&promised, &current, sizeof(promised)), 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(35);
+	UT_PLAN(36);
+	UT_RUN(startup_sync_preserves_actual_promise_and_closes_all_fds);
 	UT_RUN(startup_rejects_invalid_fpw_payload);
 	UT_RUN(startup_rejects_short_checkpoint_payload);
 	UT_RUN(startup_captures_first_real_checkpoint_beyond_empty_promise);

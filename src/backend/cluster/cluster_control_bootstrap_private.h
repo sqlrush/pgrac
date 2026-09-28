@@ -135,6 +135,13 @@ cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
 									const ControlFileData *input,
 									ClusterNativeSideObservation *out);
 
+/* Qualified recovery executor only: fsync the same actual cursor files and
+ * directories, then revalidate the observation. Caller owns exact isolation,
+ * WALR/IR and selected-root revalidation. Does not publish a terminal. */
+extern ClusterControlRootResult
+cluster_control_native_side_sync(const char *shared_root, uint32 node_id,
+	const ControlFileData *input, ClusterNativeSideObservation *out);
+
 /* Read-only rejection of native startup inputs whose recovery/cleanup is not
  * supported in this mode. Never removes backup, replication or prepared state.
  * Successful observation is not a clean-state or mutation permission. */

@@ -51,6 +51,14 @@ extern ClusterControlRootResult cluster_wal_startup_observe(const char *wal_root
 															XLogRecPtr first_segment,
 															ClusterWalStartupObservation *out);
 
+/* Recovery-owner-only physical sync of the exact stream, including observed
+ * unpromised records, claim, promise and directory entries. Never advances the
+ * writer's promise or grants permission. Caller must own/revalidate isolation,
+ * WALR and purpose-bound IR before and after this operation. */
+extern ClusterControlRootResult cluster_wal_startup_sync(const char *wal_root,
+	const ClusterWalDurablePrefixRef *ref, int segment_size, XLogRecPtr first_segment,
+	ClusterWalStartupObservation *out);
+
 /* Caller supplies a root-selected immutable reference and exact checkpoint
  * record start, NOT an arbitrary point at which to search for a later record.
  * This validates physical input only: the owner must hold/revalidate isolation,

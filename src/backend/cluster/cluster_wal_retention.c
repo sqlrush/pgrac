@@ -1729,6 +1729,24 @@ wal_reuse_current_v2_root(const ClusterWalReuseGuardRequest *request, ClusterWal
 		*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
 		return CLUSTER_WAL_GUARD_BLOCKED;
 	}
+	/* PRE2: a checkpoint-less initializer terminal remains a physical input
+	 * until an explicit consumer proves closure.  Do not let a fresh
+	 * reservation or INSTALL silently prune that history; conservatively block
+	 * reuse while the selected current root still carries any terminal. */
+	{
+		bool terminal_blocked = false;
+		ClusterControlRootResult terminal_result
+			= cluster_control_root_v3_terminal_history_blocked(&request->duty,
+																						 &terminal_blocked);
+		if (!control_root_read_ready(terminal_result)) {
+			*out_reason = CLUSTER_WAL_DENY_ROOT_UNAVAILABLE;
+			return CLUSTER_WAL_GUARD_BLOCKED;
+		}
+		if (terminal_blocked) {
+			*out_reason = CLUSTER_WAL_DENY_ROOT_REQUIRED;
+			return CLUSTER_WAL_GUARD_BLOCKED;
+		}
+	}
 	interval = &fold->intervals[0];
 	interval->thread_id = request->duty.origin_thread_id;
 	interval->tli = target_root->checkpoint_tli;

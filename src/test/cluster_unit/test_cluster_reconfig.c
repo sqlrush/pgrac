@@ -374,13 +374,19 @@ cluster_external_fence_rejoin_authorize_on_async(PgracExternalFenceRejoinOpV1 *o
 												 const uint8 protected_set_digest[32],
 												 PgracExternalFenceDenyReason *reason)
 {
-	ut_rejoin_authorize_calls++;
 	if (reason != NULL)
 		*reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 	if (op != (PgracExternalFenceRejoinOpV1 *)&ut_rejoin_op_storage || clear == NULL
 		|| *clear != (PgracExternalFenceRejoinAuthorityClearV1 *)&ut_rejoin_clear_storage
 		|| identity == NULL || snapshot == NULL || token == NULL || protected_set_digest == NULL)
 		return PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE;
+	/* This standalone reconfig fixture models the ordinary COMPLETE-root
+	 * provider path.  A non-complete root has no terminal proof in this seam,
+	 * so retain the pre-terminal waiting behavior rather than granting the
+	 * new production terminal branch implicitly. */
+	if (!ut_rejoin_root_complete)
+		return PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT;
+	ut_rejoin_authorize_calls++;
 	*clear = NULL;
 	ut_rejoin_poll_status = PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_JOINER;
 	return PGRAC_EXTERNAL_FENCE_REJOIN_PENDING;
@@ -418,7 +424,7 @@ cluster_external_fence_rejoin_revalidate_root(PgracExternalFenceRejoinOpV1 *op,
 
 bool
 cluster_external_fence_rejoin_consume_nowait(PgracExternalFenceRejoinOpV1 *op,
-											 const ClusterReconfigRejoinPendingSnapshotV1 *pending,
+													 const ClusterReconfigRejoinPendingSnapshotV1 *pending,
 											 const ClusterJoinCommitMarker *marker,
 											 PgracExternalFenceDenyReason *reason)
 {
@@ -437,6 +443,17 @@ cluster_external_fence_rejoin_consume_nowait(PgracExternalFenceRejoinOpV1 *op,
 	ut_rejoin_pending_seen = *pending;
 	ut_rejoin_committed_seen = *marker;
 	return true;
+}
+
+ClusterControlRootResult
+cluster_external_fence_rejoin_consume_terminal_history(PgracExternalFenceRejoinOpV1 *op,
+														 int32 candidate_node,
+														 uint64 candidate_incarnation)
+{
+	(void)op;
+	(void)candidate_node;
+	(void)candidate_incarnation;
+	return CLUSTER_CONTROL_ROOT_ABSENT;
 }
 
 void

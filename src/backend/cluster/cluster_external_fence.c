@@ -93,6 +93,7 @@ static bool external_fence_monotonic_now(uint64 *out_now_ns);
 
 static const uint8 external_fence_rejoin_clear_domain[] = "PGRAC-REJOIN-AUTHORITY-CLEAR-V1";
 static const uint8 external_fence_rejoin_complete_domain[] = "PGRAC-REJOIN-COMPLETE-V1";
+static const uint8 external_fence_rejoin_terminal_domain[] = "PGRAC-REJOIN-TERMINAL-V1";
 static const uint8 external_fence_rejoin_gate_domain[] = "PGRAC-REJOIN-GATE-V1";
 static const uint8 external_fence_writer_set_domain[] = "PGRAC-PROTECTED-WRITERS-V1";
 
@@ -100,6 +101,8 @@ StaticAssertDecl(sizeof(external_fence_rejoin_clear_domain) == 32,
 				 "rejoin authority-clear digest domain changed");
 StaticAssertDecl(sizeof(external_fence_rejoin_complete_domain) == 25,
 				 "rejoin complete digest domain changed");
+StaticAssertDecl(sizeof(external_fence_rejoin_terminal_domain) == 25,
+				 "rejoin terminal digest domain changed");
 StaticAssertDecl(sizeof(external_fence_rejoin_gate_domain) == 21,
 				 "rejoin gate digest domain changed");
 StaticAssertDecl(sizeof(external_fence_writer_set_domain) == 27,
@@ -174,6 +177,8 @@ struct PgracExternalFenceRejoinOpV1 {
 	ClusterControlRootReadToken saved_root_token;
 	PgracExternalFenceRejoinNeedV1 rejoin_need;
 	uint8 root_completion_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
+	bool root_selected_terminal;
+	ClusterControlRootRejoinTerminalProofV1 terminal_proof;
 	bool root_revalidated;
 	bool consumed;
 	bool authorize_enqueue_pending;
@@ -319,6 +324,79 @@ external_fence_rejoin_root_completion_digest(const ClusterControlRootIdentity *i
 #undef ROOT_APPEND_U16
 #undef ROOT_APPEND_BYTES
 
+	return external_fence_sha256(preimage, sizeof(preimage), digest);
+}
+
+/* A terminal-backed rejoin uses a distinct digest domain and binds the exact
+ * failed incarnation, terminal object and initializer operation. Ordinary
+ * RECOVERY_COMPLETE digests above remain byte-for-byte unchanged. */
+static bool
+external_fence_rejoin_terminal_completion_digest(
+	const ClusterControlRootIdentity *identity, const ClusterControlRootReadToken *token,
+	const ClusterControlRootRejoinTerminalProofV1 *proof,
+	uint8 digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES])
+{
+	uint8 preimage[227];
+	size_t offset = 0;
+
+	if (identity == NULL || token == NULL || proof == NULL || digest == NULL
+		|| proof->failed_incarnation == 0 || proof->terminal_generation == 0
+		|| !bytes_nonzero(proof->terminal_sha256, sizeof(proof->terminal_sha256))
+		|| !bytes_nonzero(proof->operation_uuid, sizeof(proof->operation_uuid)))
+		return false;
+#define TERMINAL_APPEND_BYTES(bytes_, len_)                                                      \
+	do {                                                                                           \
+		memcpy(preimage + offset, (bytes_), (len_));                                               \
+		offset += (len_);                                                                          \
+	} while (0)
+#define TERMINAL_APPEND_U16(value_)                                                              \
+	do {                                                                                           \
+		external_fence_put_u16_le(preimage + offset, (uint16)(value_));                            \
+		offset += 2;                                                                               \
+	} while (0)
+#define TERMINAL_APPEND_U32(value_)                                                              \
+	do {                                                                                           \
+		external_fence_put_u32_le(preimage + offset, (uint32)(value_));                            \
+		offset += 4;                                                                               \
+	} while (0)
+#define TERMINAL_APPEND_U64(value_)                                                              \
+	do {                                                                                           \
+		external_fence_put_u64_le(preimage + offset, (uint64)(value_));                            \
+		offset += 8;                                                                               \
+	} while (0)
+
+	TERMINAL_APPEND_BYTES(external_fence_rejoin_terminal_domain,
+						 sizeof(external_fence_rejoin_terminal_domain));
+	TERMINAL_APPEND_U64(identity->system_identifier);
+	TERMINAL_APPEND_BYTES(identity->storage_uuid, sizeof(identity->storage_uuid));
+	TERMINAL_APPEND_BYTES(identity->authority_uuid, sizeof(identity->authority_uuid));
+	TERMINAL_APPEND_U16(identity->origin_thread_id);
+	TERMINAL_APPEND_U32(identity->origin_node_id);
+	TERMINAL_APPEND_U64(identity->thread_claim_created_at);
+	TERMINAL_APPEND_U32(identity->thread_claim_crc32c);
+	TERMINAL_APPEND_U64(identity->origin_owner_incarnation);
+	TERMINAL_APPEND_U64(identity->root_lineage_seq);
+	TERMINAL_APPEND_BYTES(token->authority_uuid, sizeof(token->authority_uuid));
+	TERMINAL_APPEND_U16(token->origin_thread_id);
+	preimage[offset++] = token->source;
+	preimage[offset++] = token->lifecycle;
+	TERMINAL_APPEND_U32(0);
+	TERMINAL_APPEND_U64(token->root_lineage_seq);
+	TERMINAL_APPEND_U64(0);
+	TERMINAL_APPEND_U64(token->file_txn_seq);
+	TERMINAL_APPEND_U64(token->root_publish_seq);
+	TERMINAL_APPEND_U32(token->record_crc32c);
+	TERMINAL_APPEND_U32(token->root_flags);
+	TERMINAL_APPEND_U64(proof->failed_incarnation);
+	TERMINAL_APPEND_U64(proof->terminal_generation);
+	TERMINAL_APPEND_BYTES(proof->terminal_sha256, sizeof(proof->terminal_sha256));
+	TERMINAL_APPEND_BYTES(proof->operation_uuid, sizeof(proof->operation_uuid));
+	Assert(offset == sizeof(preimage));
+
+#undef TERMINAL_APPEND_U64
+#undef TERMINAL_APPEND_U32
+#undef TERMINAL_APPEND_U16
+#undef TERMINAL_APPEND_BYTES
 	return external_fence_sha256(preimage, sizeof(preimage), digest);
 }
 
@@ -2062,6 +2140,8 @@ cluster_external_fence_rejoin_authorize_on_async(
 	PgracExternalFenceRejoinAuthorityClearV1 *clear;
 	ClusterReconfigRejoinFailureSnapshotV1 current_failure;
 	ClusterGrdRejoinClearSnapshotV1 current_grd_clear;
+	ClusterControlRootRejoinTerminalProofV1 terminal_proof;
+	ClusterControlRootResult terminal_result;
 	uint8 recalculated_clear_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
 	uint8 gate_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
 #ifndef WIN32
@@ -2102,16 +2182,35 @@ cluster_external_fence_rejoin_authorize_on_async(
 		return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
 										  PGRAC_EXTERNAL_FENCE_DENY_AUTHORITY_CLEAR_MISSING,
 										  reason);
-	if (complete_snapshot->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE) {
-		op->status = PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT;
-		op->deny_reason = PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE;
-		return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT,
-										  PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE, reason);
+	op->root_selected_terminal = false;
+	memset(&op->terminal_proof, 0, sizeof(op->terminal_proof));
+	memset(&terminal_proof, 0, sizeof(terminal_proof));
+	if (complete_snapshot->lifecycle == CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE) {
+		if (!external_fence_rejoin_root_complete_valid(op, old_identity, complete_snapshot,
+																   complete_token))
+			return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
+																  PGRAC_EXTERNAL_FENCE_DENY_ROOT_STALE, reason);
+	} else {
+		terminal_result = cluster_control_root_v3_validate_rejoin_terminal(
+			old_identity, op->offer_frame.old_incarnation, complete_snapshot, complete_token,
+			&terminal_proof);
+		if (terminal_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			if (terminal_result == CLUSTER_CONTROL_ROOT_ABSENT
+				|| terminal_result == CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
+				|| terminal_result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE
+				|| terminal_result == CLUSTER_CONTROL_ROOT_STORAGE_CONTRACT_UNVERIFIED) {
+				op->status = PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT;
+				op->deny_reason = PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE;
+				return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_WAITING_ROOT,
+																  PGRAC_EXTERNAL_FENCE_DENY_ROOT_NOT_COMPLETE,
+																  reason);
+			}
+			return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
+																  PGRAC_EXTERNAL_FENCE_DENY_ROOT_STALE, reason);
+		}
+		op->root_selected_terminal = true;
+		op->terminal_proof = terminal_proof;
 	}
-	if (!external_fence_rejoin_root_complete_valid(op, old_identity, complete_snapshot,
-												   complete_token))
-		return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
-										  PGRAC_EXTERNAL_FENCE_DENY_ROOT_STALE, reason);
 	if (!bytes_nonzero(protected_set_digest, PGRAC_EXTERNAL_FENCE_DIGEST_BYTES)
 		|| memcmp(protected_set_digest, op->offer_frame.protected_set_digest,
 				  PGRAC_EXTERNAL_FENCE_DIGEST_BYTES)
@@ -2132,7 +2231,6 @@ cluster_external_fence_rejoin_authorize_on_async(
 			   != 0)
 		return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
 										  PGRAC_EXTERNAL_FENCE_DENY_AUTHORITY_CLEAR_STALE, reason);
-
 #ifdef WIN32
 	return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE,
 									  PGRAC_EXTERNAL_FENCE_DENY_DAEMON_UNAVAILABLE, reason);
@@ -2141,22 +2239,30 @@ cluster_external_fence_rejoin_authorize_on_async(
 		|| now_ns < op->offer_frame.verified_mono_ns
 		|| now_ns >= op->offer_frame.fresh_until_mono_ns)
 		return external_fence_rejoin_terminal(op, PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
-											  PGRAC_EXTERNAL_FENCE_DENY_AUTHORITY_CLEAR_STALE,
-											  reason);
+												  PGRAC_EXTERNAL_FENCE_DENY_AUTHORITY_CLEAR_STALE,
+												  reason);
 	poll_fd.fd = op->socket_fd;
 	poll_fd.events = POLLIN | POLLHUP | POLLERR;
 	poll_fd.revents = 0;
 	if (poll(&poll_fd, 1, 0) != 0)
 		return external_fence_rejoin_terminal(op, PGRAC_EXTERNAL_FENCE_REJOIN_STALE,
-											  PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED, reason);
+												  PGRAC_EXTERNAL_FENCE_DENY_CONNECTION_CLOSED, reason);
 
 	if (!op->authorize_enqueue_pending) {
-		if (!external_fence_rejoin_root_completion_digest(old_identity, complete_token,
-														  op->root_completion_digest)
-			|| !external_fence_rejoin_gate_digest(op->root_completion_digest,
-												  clear->authority_clear_digest, gate_digest)
-			|| !pg_strong_random(op->transport_nonce, sizeof(op->transport_nonce))
-			|| !bytes_nonzero(op->transport_nonce, sizeof(op->transport_nonce)))
+		bool root_digest_ok;
+		bool gate_digest_ok;
+		bool nonce_ok;
+		root_digest_ok = !op->root_selected_terminal
+			? external_fence_rejoin_root_completion_digest(old_identity, complete_token,
+														 op->root_completion_digest)
+			: external_fence_rejoin_terminal_completion_digest(old_identity, complete_token,
+														 &op->terminal_proof,
+														 op->root_completion_digest);
+		gate_digest_ok = external_fence_rejoin_gate_digest(
+			op->root_completion_digest, clear->authority_clear_digest, gate_digest);
+		nonce_ok = pg_strong_random(op->transport_nonce, sizeof(op->transport_nonce))
+			&& bytes_nonzero(op->transport_nonce, sizeof(op->transport_nonce));
+		if (!root_digest_ok || !gate_digest_ok || !nonce_ok)
 			return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE,
 											  PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL, reason);
 		memset(&authorize, 0, sizeof(authorize));
@@ -2182,7 +2288,7 @@ cluster_external_fence_rejoin_authorize_on_async(
 		authorize.deny_reason = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 		if (!pgrac_external_fence_rejoin_v1_encode(&authorize, op->tx_frame))
 			return external_fence_rejoin_fail(PGRAC_EXTERNAL_FENCE_REJOIN_UNAVAILABLE,
-											  PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL, reason);
+													  PGRAC_EXTERNAL_FENCE_DENY_PROTOCOL, reason);
 		op->tx_sent = 0;
 		op->rx_used = 0;
 		op->authorize_enqueue_pending = true;
@@ -2403,6 +2509,8 @@ cluster_external_fence_rejoin_revalidate_root(PgracExternalFenceRejoinOpV1 *op,
 {
 	ClusterControlRootSnapshot fresh_snapshot;
 	ClusterControlRootResult result;
+	ClusterControlRootResult terminal_result = CLUSTER_CONTROL_ROOT_ABSENT;
+	ClusterControlRootRejoinTerminalProofV1 fresh_terminal_proof;
 	uint8 root_completion_digest[PGRAC_EXTERNAL_FENCE_DIGEST_BYTES];
 
 	if (out_fresh_snapshot != NULL)
@@ -2421,16 +2529,29 @@ cluster_external_fence_rejoin_revalidate_root(PgracExternalFenceRejoinOpV1 *op,
 		return false;
 	}
 	op->root_revalidated = false;
+	memset(&fresh_terminal_proof, 0, sizeof(fresh_terminal_proof));
 	memset(&fresh_snapshot, 0, sizeof(fresh_snapshot));
 	result = cluster_control_root_revalidate(&op->saved_root_token, &op->saved_root_identity,
-											 &fresh_snapshot);
+																		 &fresh_snapshot);
+	if (op->root_selected_terminal)
+		terminal_result = cluster_control_root_v3_validate_rejoin_terminal(
+			&op->saved_root_identity, op->terminal_proof.failed_incarnation,
+			&fresh_snapshot, &op->saved_root_token, &fresh_terminal_proof);
 	if ((result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-		|| !external_fence_rejoin_root_complete_valid(op, &op->saved_root_identity, &fresh_snapshot,
-													  &op->saved_root_token)
+			 && result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		|| (op->root_selected_terminal
+			? terminal_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+				|| memcmp(&fresh_terminal_proof, &op->terminal_proof,
+								  sizeof(fresh_terminal_proof)) != 0
+			: !external_fence_rejoin_root_complete_valid(op, &op->saved_root_identity,
+																			 &fresh_snapshot, &op->saved_root_token))
 		|| memcmp(&fresh_snapshot, &op->saved_root_snapshot, sizeof(fresh_snapshot)) != 0
-		|| !external_fence_rejoin_root_completion_digest(
-			&op->saved_root_identity, &op->saved_root_token, root_completion_digest)
+		|| !(op->root_selected_terminal
+				 ? external_fence_rejoin_terminal_completion_digest(
+					 &op->saved_root_identity, &op->saved_root_token, &op->terminal_proof,
+					 root_completion_digest)
+				 : external_fence_rejoin_root_completion_digest(
+					 &op->saved_root_identity, &op->saved_root_token, root_completion_digest))
 		|| memcmp(root_completion_digest, op->root_completion_digest,
 				  sizeof(root_completion_digest))
 			   != 0) {
@@ -2558,6 +2679,26 @@ cluster_external_fence_rejoin_consume_nowait(
 	external_fence_last_deny = PGRAC_EXTERNAL_FENCE_DENY_NONE;
 	return true;
 #endif
+}
+
+ClusterControlRootResult
+cluster_external_fence_rejoin_consume_terminal_history(PgracExternalFenceRejoinOpV1 *op,
+														 int32 candidate_node,
+														 uint64 candidate_incarnation)
+{
+	bool consumed = false;
+
+	if (op == NULL || op->magic != PGRAC_EXTERNAL_FENCE_REJOIN_OP_MAGIC
+		|| op->owner_pid != external_fence_owner_pid()
+		|| candidate_node != op->rejoin_need.old_node_id
+		|| candidate_incarnation != op->rejoin_need.candidate_incarnation
+		|| !op->consumed || op->status != PGRAC_EXTERNAL_FENCE_REJOIN_CONSUMED)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!op->root_selected_terminal)
+		return CLUSTER_CONTROL_ROOT_ABSENT;
+	return cluster_control_root_v3_consume_rejoin_terminal(
+		&op->saved_root_identity, candidate_incarnation, &op->saved_root_snapshot,
+		&op->saved_root_token, &op->terminal_proof, &consumed);
 }
 
 const PgracExternalFenceRejoinBindingV1 *
