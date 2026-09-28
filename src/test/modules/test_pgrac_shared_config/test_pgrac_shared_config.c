@@ -4,12 +4,14 @@
 #include "postgres.h"
 #include <sys/stat.h>
 #include <unistd.h>
+#include "access/parallel.h"
 #include "access/xlog.h"
 #include "access/xlog_internal.h"
 #include "catalog/pg_control.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/fd.h"
+#include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #ifdef USE_PGRAC_CLUSTER
@@ -33,6 +35,9 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_object);
 PG_FUNCTION_INFO_V1(test_pgrac_config_change);
 PG_FUNCTION_INFO_V1(test_pgrac_config_reload);
 PG_FUNCTION_INFO_V1(test_pgrac_config_process);
+PG_FUNCTION_INFO_V1(test_pgrac_config_parallel_observe);
+PG_FUNCTION_INFO_V1(test_pgrac_config_enrollment);
+PG_FUNCTION_INFO_V1(test_pgrac_config_slot_probe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
@@ -1192,5 +1197,121 @@ test_pgrac_config_process(PG_FUNCTION_ARGS)
 #else
 	ereport(ERROR, (errmsg("process inspection requires cluster build")));
 	PG_RETURN_NULL();
+#endif
+}
+
+/* Read-only observation suitable for actual native parallel workers. */
+Datum
+test_pgrac_config_parallel_observe(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test parallel inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigProcess state;
+		bool observed = cluster_shared_config_process_observe(&state);
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d:%d:%llu:%s", IsParallelWorker(), observed,
+												  (unsigned long long)state.ref.identity.generation,
+												  GetConfigOption("work_mem", false, false))));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("plain"));
+#endif
+}
+
+/* Diagnostics only: native slots, never fabricate a process or target. */
+Datum
+test_pgrac_config_enrollment(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test enrollment inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigRegistration state;
+		int pid = PG_GETARG_INT32(0);
+		int index = ProcGlobal->allProcCount;
+		ClusterSharedConfigSlot *slot = &ProcGlobal->cluster_config_postmaster;
+		if (pid != -1) {
+			for (index = 0; index < ProcGlobal->allProcCount; ++index)
+				if (ProcGlobal->allProcs[index].pid == pid)
+					break;
+			if (index == ProcGlobal->allProcCount)
+				PG_RETURN_TEXT_P(cstring_to_text("absent"));
+			slot = &ProcGlobal->allProcs[index].cluster_config;
+		}
+		if (!cluster_shared_config_registration_read(slot, &state))
+			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+		/* A freed native PGPROC can retain its old pid. The registration's
+		 * real exit is the observation, not the stale diagnostic pid field. */
+		if (state.pid == 0)
+			PG_RETURN_TEXT_P(cstring_to_text("absent"));
+		if (pid != -1 && state.pid != pid)
+			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+		PG_RETURN_TEXT_P(cstring_to_text(
+			psprintf("%d:%llu:%llu:%d:%d", index, (unsigned long long)state.registration,
+					 (unsigned long long)state.process.ref.identity.generation,
+					 state.process.failed, state.process.parallel_snapshot)));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("plain"));
+#endif
+}
+
+/* Slot boundary tests complement (not replace) the real process TAP. */
+Datum
+test_pgrac_config_slot_probe(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test slot inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigSlot slot;
+		ClusterSharedConfigRegistration out, before;
+		int mode = PG_GETARG_INT32(0);
+		bool result;
+		if (mode == 4) {
+			ClusterSharedConfigSlot *previous = palloc(sizeof(*previous));
+			ClusterSharedConfigSlot *replacement = palloc(sizeof(*replacement));
+			ClusterSharedConfigProcess original, current;
+			bool attached, first;
+			if (!cluster_shared_config_process_observe(&original))
+				ereport(ERROR, (errmsg("relocation test needs an actual native image")));
+			cluster_shared_config_process_detach();
+			cluster_shared_config_registration_init(previous);
+			first = cluster_shared_config_process_attach(previous);
+			/* Distinct simultaneously live allocations deterministically model
+			 * a relocated replacement mapping; no address-reuse assumption. */
+			cluster_shared_config_process_new_shmem();
+			cluster_shared_config_registration_init(replacement);
+			attached = cluster_shared_config_process_attach(replacement);
+			result = first && attached && cluster_shared_config_process_observe(&current)
+					 && memcmp(&original, &current, sizeof(original)) == 0;
+			cluster_shared_config_process_detach();
+			if (!cluster_shared_config_process_attach(&MyProc->cluster_config))
+				ereport(ERROR, (errmsg("could not restore actual native test registration")));
+			pfree(previous);
+			pfree(replacement);
+			PG_RETURN_BOOL(result);
+		}
+		cluster_shared_config_registration_init(&slot);
+		slot.value.pid = 17;
+		slot.value.registration = 2;
+		slot.value.observed = true;
+		before = slot.value;
+		memset(&out, 0xa5, sizeof(out));
+		if (mode == 2) {
+			result = cluster_shared_config_registration_read(&slot, &slot.value);
+			PG_RETURN_BOOL(!result && memcmp(&before, &slot.value, sizeof(before)) == 0);
+		}
+		if (mode == 1 || mode == 3)
+			pg_atomic_write_u64(&slot.sequence, mode == 1 ? 1 : PG_UINT64_MAX);
+		result = cluster_shared_config_registration_read(&slot, &out);
+		if (mode == 0)
+			PG_RETURN_BOOL(result && memcmp(&before, &out, sizeof(out)) == 0);
+		PG_RETURN_BOOL(!result
+					   && memcmp(&out, &(ClusterSharedConfigRegistration){ 0 }, sizeof(out)) == 0);
+	}
+#else
+	PG_RETURN_BOOL(false);
 #endif
 }

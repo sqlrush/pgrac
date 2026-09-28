@@ -9,6 +9,9 @@
  *
  * src/include/storage/proc.h
  *
+ * PGRAC MODIFICATIONS: exact native process configuration observation slots.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef _PROC_H_
@@ -23,6 +26,9 @@
 #include "storage/lock.h"
 #include "storage/pg_sema.h"
 #include "storage/proclist_types.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_shared_config.h"
+#endif
 
 /*
  * Each backend advertises up to PGPROC_MAX_CACHED_SUBXIDS TransactionIds
@@ -309,6 +315,10 @@ struct PGPROC {
 	 * uninitialized;真值从 1 开始).
 	 */
 	uint64 cluster_grd_generation;
+#ifdef USE_PGRAC_CLUSTER
+	/* Native lifetime, including auxiliaries outside ProcSignal. No admission. */
+	ClusterSharedConfigSlot cluster_config;
+#endif
 
 	/*
 	 * spec-2.17 Q10 + I85 — BAST advisory flag.  BAST handler 仅标
@@ -440,6 +450,10 @@ extern PGDLLIMPORT PGPROC *MyProc;
  * ProcArrayLock.
  */
 typedef struct PROC_HDR {
+#ifdef USE_PGRAC_CLUSTER
+	/* Postmaster has no PGPROC; only the actual parent writes this slot. */
+	ClusterSharedConfigSlot cluster_config_postmaster;
+#endif
 	/* Array of PGPROC structures (not including dummies for prepared txns) */
 	PGPROC *allProcs;
 

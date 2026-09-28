@@ -23,6 +23,7 @@
  * PGRAC MODIFICATIONS: share native FILE removal/default handling with the
  * root-selected configuration consumer; ordinary PG file parsing is unchanged.
  * Census cumulative shared FILE obligations, including removed settings.
+ * Revoke a fork-inheritance receipt before native parallel GUC restoration.
  * Author: SqlRush <sqlrush@gmail.com>
  *
  *--------------------------------------------------------------------
@@ -54,6 +55,9 @@
 #include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/timestamp.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_shared_config.h"
+#endif
 
 
 #define CONFIG_FILENAME "postgresql.conf"
@@ -6163,6 +6167,12 @@ RestoreGUCState(void *gucstate)
 	Size		len;
 	dlist_mutable_iter iter;
 	ErrorContextCallback error_context_callback;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the leader snapshot can predate this worker's PM defaults.
+	 * It cannot retain the inherited configuration application receipt. */
+	cluster_shared_config_process_parallel_restore();
+#endif
 
 	/*
 	 * First, ensure that all potentially-shippable GUCs are reset to their

@@ -60,3 +60,15 @@ CREATE FUNCTION test_pgrac_config_process(integer, text)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_process'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_process(integer, text) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_parallel_observe()
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_parallel_observe'
+LANGUAGE C STRICT PARALLEL SAFE;
+REVOKE ALL ON FUNCTION test_pgrac_config_parallel_observe() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_enrollment(integer)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_enrollment'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_enrollment(integer) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_slot_probe(integer)
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_slot_probe'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_slot_probe(integer) FROM PUBLIC;

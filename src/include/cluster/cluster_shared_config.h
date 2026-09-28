@@ -7,6 +7,7 @@
 #define CLUSTER_SHARED_CONFIG_H
 
 #include "cluster/cluster_control_root.h"
+#include "port/atomics.h"
 
 #define CLUSTER_SHARED_CONFIG_MAX_BYTES (1024 * 1024)
 #define CLUSTER_SHARED_CONFIG_MAX_ENTRIES 8192
@@ -293,6 +294,9 @@ typedef struct ClusterSharedConfigProcess {
 	uint32 deferred_total;
 	int32 applier_pid;
 	bool failed;
+	/* Native parallel restoration replaces inherited defaults with leader
+	 * values. This classified query-owned state has NO ref/application proof. */
+	bool parallel_snapshot;
 } ClusterSharedConfigProcess;
 StaticAssertDecl(sizeof(ClusterSharedConfigProcess) == 128, "native config process outcome");
 
@@ -302,8 +306,39 @@ StaticAssertDecl(sizeof(ClusterSharedConfigProcess) == 128, "native config proce
  * whether this process may serve. Unseeded or failed processes cannot reload.
  */
 extern bool cluster_shared_config_process_observe(ClusterSharedConfigProcess *out);
+extern void cluster_shared_config_process_parallel_restore(void);
 extern ClusterControlRootResult cluster_shared_config_process_reload(
 	const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
 	ClusterSharedConfigProcess *out, ClusterSharedConfigPolicyReport *report);
+
+/* Actual native process-lifetime observations, not a node census/ACK. A slot
+ * is single-writer; readers never wait for its writer. Slot index plus the
+ * registration serial, not PID alone, identifies a lifetime. Native shmem
+ * initialization is the only sequence reset. No disk/wire representation.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigRegistration {
+	uint64 registration;
+	int32 pid;
+	int32 role;
+	ClusterSharedConfigProcess process;
+	bool observed;
+} ClusterSharedConfigRegistration;
+StaticAssertDecl(sizeof(ClusterSharedConfigRegistration) == 152, "config process registration");
+
+typedef struct ClusterSharedConfigSlot {
+	pg_atomic_uint64 sequence;
+	ClusterSharedConfigRegistration value;
+} ClusterSharedConfigSlot;
+StaticAssertDecl(sizeof(ClusterSharedConfigSlot) == 160, "config process observation slot");
+extern void cluster_shared_config_registration_init(ClusterSharedConfigSlot *slot);
+extern void cluster_shared_config_process_new_shmem(void);
+extern bool cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot);
+extern void cluster_shared_config_process_detach(void);
+/* Clear output on a busy/refused read. Input/output must not overlap; an
+ * alias refuses without touching either carrier. An empty slot is observable,
+ * but pid=0 / observed=false is never an active-process proof. */
+extern bool cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
+													ClusterSharedConfigRegistration *out);
 
 #endif

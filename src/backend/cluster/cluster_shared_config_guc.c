@@ -26,6 +26,138 @@
  * shared target/barrier can overwrite the process's actual old image. */
 static ClusterSharedConfigImage config_process_image;
 static ClusterSharedConfigProcess config_process_state;
+static ClusterSharedConfigSlot *config_process_slot;
+static int32 config_process_slot_pid;
+static uint64 config_process_registration;
+static bool reload_overlap(const void *a, size_t na, const void *b, size_t nb);
+
+/* Only the real native owner writes a slot. A reader makes one bounded
+ * attempt, including in the PM: no child-owned lock can strand the parent.
+ * The sequence is never reset on reuse and an odd/exhausted sequence cannot
+ * yield an observation. No hook, allocation, I/O or interrupt in the copy.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+config_registration_write(ClusterSharedConfigSlot *slot,
+						  const ClusterSharedConfigRegistration *value)
+{
+	uint64 sequence = pg_atomic_read_u64(&slot->sequence);
+	if ((sequence & 1) || sequence > PG_UINT64_MAX - 2) {
+		pg_atomic_write_u64(&slot->sequence, PG_UINT64_MAX);
+		return false;
+	}
+	pg_atomic_write_u64(&slot->sequence, sequence + 1);
+	pg_write_barrier();
+	slot->value = *value;
+	pg_write_barrier();
+	pg_atomic_write_u64(&slot->sequence, sequence + 2);
+	return true;
+}
+
+bool
+cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
+										ClusterSharedConfigRegistration *out)
+{
+	ClusterSharedConfigRegistration snapshot;
+	uint64 sequence;
+	if (out == NULL)
+		return false;
+	/* A reader must never clear any part of the live registration it reads. */
+	if (reload_overlap(slot, sizeof(*slot), out, sizeof(*out)))
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (slot == NULL)
+		return false;
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	if (sequence & 1)
+		return false;
+	pg_read_barrier();
+	snapshot = slot->value;
+	pg_read_barrier();
+	if (pg_atomic_read_u64(&slot->sequence) != sequence)
+		return false;
+	*out = snapshot;
+	return true;
+}
+
+void
+cluster_shared_config_registration_init(ClusterSharedConfigSlot *slot)
+{
+	memset(&slot->value, 0, sizeof(slot->value));
+	pg_atomic_init_u64(&slot->sequence, 0);
+}
+
+void
+cluster_shared_config_process_new_shmem(void)
+{
+	/* The PM can recreate shmem without restarting itself. Its old mapping
+	 * need not have the same address: discard the attachment without touching
+	 * it, but retain the actual native image/outcome the PM still owns. */
+	config_process_slot = NULL;
+	config_process_slot_pid = 0;
+	config_process_registration = 0;
+}
+
+bool
+cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot)
+{
+	ClusterSharedConfigRegistration value;
+	uint64 sequence;
+	if (slot == NULL || MyProcPid <= 0
+		|| (config_process_slot != NULL && config_process_slot_pid == MyProcPid))
+		return false;
+	if (!cluster_shared_config_registration_read(slot, &value) || value.pid != 0)
+		return false;
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	if (sequence > PG_UINT64_MAX - 2) {
+		pg_atomic_write_u64(&slot->sequence, PG_UINT64_MAX);
+		return false;
+	}
+	memset(&value, 0, sizeof(value));
+	value.registration = sequence + 2;
+	value.pid = MyProcPid;
+	value.role = MyBackendType;
+	value.observed = cluster_shared_config_process_observe(&value.process);
+	if (!config_registration_write(slot, &value))
+		return false;
+	config_process_slot = slot;
+	config_process_slot_pid = MyProcPid;
+	config_process_registration = value.registration;
+	return true;
+}
+
+static void
+config_process_report(void)
+{
+	ClusterSharedConfigRegistration value;
+	/* Check the local PID BEFORE dereferencing: a newly forked process (in
+	 * particular the detached logger) must not touch the parent's slot. */
+	if (config_process_slot == NULL || config_process_slot_pid != MyProcPid)
+		return;
+	if (!cluster_shared_config_registration_read(config_process_slot, &value)
+		|| value.pid != MyProcPid || value.registration != config_process_registration)
+		return;
+	value.role = MyBackendType;
+	value.observed = cluster_shared_config_process_observe(&value.process);
+	(void)config_registration_write(config_process_slot, &value);
+}
+
+void
+cluster_shared_config_process_detach(void)
+{
+	ClusterSharedConfigRegistration value;
+	if (config_process_slot == NULL || config_process_slot_pid != MyProcPid)
+		return;
+	if (cluster_shared_config_registration_read(config_process_slot, &value)
+		&& value.pid == MyProcPid && value.registration == config_process_registration) {
+		memset(&value, 0, sizeof(value));
+		value.registration = config_process_registration;
+		(void)config_registration_write(config_process_slot, &value);
+	}
+	config_process_slot = NULL;
+	config_process_slot_pid = 0;
+	config_process_registration = 0;
+}
 
 /* Native scalar defaults are common unless explicitly classified here.
  * Strings require an explicit entry: never persist arbitrary command strings,
@@ -290,10 +422,33 @@ cluster_shared_config_process_observe(ClusterSharedConfigProcess *out)
 	if (out == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
-	if (config_process_image.bytes == NULL || config_process_state.applier_pid <= 0)
+	if (!config_process_state.parallel_snapshot
+		&& (config_process_image.bytes == NULL || config_process_state.applier_pid <= 0))
 		return false;
 	*out = config_process_state;
 	return true;
+}
+
+/* The parallel leader's active GUCs are not the image inherited from the PM.
+ * Revoke that receipt BEFORE native reset/assign hooks can run or fail. Query
+ * semantics remain native; the enrollment owner must wait for real worker
+ * exit when a common-dependent change cannot tolerate this deferred state.
+ * No current target is substituted and no new image/reload proof is invented.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+cluster_shared_config_process_parallel_restore(void)
+{
+	uint32 node_id = config_process_state.node_id;
+	bool failed = config_process_state.failed;
+	if (config_process_image.bytes == NULL)
+		return;
+	cluster_shared_config_free(&config_process_image);
+	memset(&config_process_state, 0, sizeof(config_process_state));
+	config_process_state.node_id = node_id;
+	config_process_state.failed = failed;
+	config_process_state.parallel_snapshot = true;
+	config_process_report();
 }
 
 ClusterControlRootResult
@@ -348,12 +503,14 @@ cluster_shared_config_process_reload(const char *bytes, size_t len,
 		 * this potentially partially modified process. The control owner must
 		 * retain its retirement/repair lane while dependent data is held. */
 		config_process_state.failed = true;
+		config_process_report();
 		pfree(replacement);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		config_process_state.failed = true;
+		config_process_report();
 		pfree(replacement);
 		return result;
 	}
@@ -364,6 +521,7 @@ cluster_shared_config_process_reload(const char *bytes, size_t len,
 	config_process_state.pending_restart_total = applied.pending_restart_total;
 	config_process_state.deferred_total = applied.deferred_total;
 	config_process_state.applier_pid = MyProcPid;
+	config_process_report();
 	*out = config_process_state;
 	return result;
 }
@@ -796,6 +954,7 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 	config_process_state.ref = *ref;
 	config_process_state.node_id = node_id;
 	config_process_state.applier_pid = MyProcPid;
+	config_process_report();
 	out->ref = *ref;
 	out->node_id = node_id;
 	out->applied_entries = context.applied;

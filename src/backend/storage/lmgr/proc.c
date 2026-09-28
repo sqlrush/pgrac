@@ -10,6 +10,11 @@
  * IDENTIFICATION
  *	  src/backend/storage/lmgr/proc.c
  *
+ * PGRAC MODIFICATIONS: register actual configuration outcomes for native
+ * process lifetimes, including auxiliaries outside ProcSignal; retire only
+ * at real native cleanup. No configuration admission is implied.
+ * Author: SqlRush <sqlrush@gmail.com>
+ *
  *-------------------------------------------------------------------------
  */
 /*
@@ -166,6 +171,11 @@ InitProcGlobal(void)
 	bool		found;
 	uint32		TotalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a native new-shmem lifetime must not reuse the PM's old mapping. */
+	cluster_shared_config_process_new_shmem();
+#endif
+
 	/* Create the ProcGlobal shared structure */
 	ProcGlobal = (PROC_HDR *)
 		ShmemInitStruct("Proc Header", sizeof(PROC_HDR), &found);
@@ -289,6 +299,7 @@ InitProcGlobal(void)
 		pg_atomic_init_u32(&(proc->cluster_grd_registered_count), 0);
 #ifdef USE_PGRAC_CLUSTER
 		/* PGRAC: spec-5.8 D1d — per-proc cluster wait-state record. */
+		cluster_shared_config_registration_init(&proc->cluster_config);
 		cluster_lmd_wait_state_init(&(proc->cluster_lmd_wait));
 		/* PGRAC: spec-5.9 D3 — per-proc deadlock-cancel token. */
 		cluster_cancel_token_init(&(proc->cluster_cancel_token));
@@ -305,6 +316,12 @@ InitProcGlobal(void)
 	/* Create ProcStructLock spinlock, too */
 	ProcStructLock = (slock_t *) ShmemAlloc(sizeof(slock_t));
 	SpinLockInit(ProcStructLock);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_shared_config_registration_init(&ProcGlobal->cluster_config_postmaster);
+	if (IsPostmasterEnvironment && !IsUnderPostmaster
+		&& !cluster_shared_config_process_attach(&ProcGlobal->cluster_config_postmaster))
+		elog(FATAL, "could not register postmaster configuration state");
+#endif
 }
 
 /*
@@ -471,6 +488,10 @@ InitProcess(void)
 	 * Arrange to clean up at backend exit.
 	 */
 	on_shmem_exit(ProcKill, 0);
+#ifdef USE_PGRAC_CLUSTER
+	if (!cluster_shared_config_process_attach(&MyProc->cluster_config))
+		elog(FATAL, "could not register backend configuration state");
+#endif
 
 	/*
 	 * Now that we have a PGPROC, we could try to acquire locks, so initialize
@@ -670,6 +691,10 @@ InitAuxiliaryProcess(void)
 	 * Arrange to clean up at process exit.
 	 */
 	on_shmem_exit(AuxiliaryProcKill, Int32GetDatum(proctype));
+#ifdef USE_PGRAC_CLUSTER
+	if (!cluster_shared_config_process_attach(&MyProc->cluster_config))
+		elog(FATAL, "could not register auxiliary configuration state");
+#endif
 }
 
 /*
@@ -939,6 +964,9 @@ ProcKill(int code, Datum arg)
 
 	procgloballist = proc->procgloballist;
 	SpinLockAcquire(ProcStructLock);
+#ifdef USE_PGRAC_CLUSTER
+	cluster_shared_config_process_detach();
+#endif
 
 	/*
 	 * If we're still a member of a locking group, that means we're a leader
@@ -1011,6 +1039,9 @@ AuxiliaryProcKill(int code, Datum arg)
 	SpinLockAcquire(ProcStructLock);
 
 	/* Mark auxiliary proc no longer in use */
+#ifdef USE_PGRAC_CLUSTER
+	cluster_shared_config_process_detach();
+#endif
 	proc->pid = 0;
 
 	/* Update shared estimate of spins_per_delay */
