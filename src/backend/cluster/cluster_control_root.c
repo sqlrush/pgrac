@@ -4283,6 +4283,148 @@ cluster_control_root_config_read_locked(const ClusterSharedConfigRef *prior,
 	return result;
 }
 
+/* PGRAC: the control role retains its read until the original CF release.
+ * Only owned value bytes survive between ticks; no CF authority is cached.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static const char config_aux_caller;
+
+typedef struct ConfigAuxCut {
+	uint64 epoch, generation, routing, incarnation;
+	int32 master;
+} ConfigAuxCut;
+
+typedef struct ConfigAuxRead {
+	bool pending;
+	uint64 cookie;
+	ConfigAuxCut cut;
+	ClusterSharedConfigRef prior;
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+	ClusterControlRootResult result;
+} ConfigAuxRead;
+
+static ConfigAuxRead config_aux_read;
+
+static bool
+config_aux_cut(ConfigAuxCut *cut)
+{
+	const ClusterResId resid
+		= { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
+	memset(cut, 0, sizeof(*cut));
+	cut->epoch = cluster_epoch_get_current();
+	cut->generation = cluster_grd_redeclare_generation();
+	cut->incarnation = cluster_qvotec_get_self_incarnation();
+	cut->master = cluster_grd_lookup_master_gen(&resid, &cut->routing);
+	return cut->epoch != 0 && cut->incarnation != 0 && cut->incarnation != UINT64_MAX
+		   && cut->master >= 0 && cut->routing != 0 && cut->epoch == cluster_epoch_get_current();
+}
+
+static void
+config_aux_clear(void)
+{
+	cluster_shared_config_free(&config_aux_read.image);
+	memset(&config_aux_read, 0, sizeof(config_aux_read));
+}
+
+static ClusterControlRootResult
+config_aux_finish(const ClusterSharedConfigRef *prior, ClusterSharedConfigSelected *out,
+				  ClusterSharedConfigImage *image)
+{
+	ConfigAuxRead *pending = &config_aux_read;
+	ConfigAuxCut now;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+
+	cluster_cf_retirement_poll();
+	if (!cluster_cf_release_completed(ShareLock, pending->cookie)) {
+		if (cluster_cf_held_by(ShareLock, &config_aux_caller))
+			return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		config_aux_clear(); /* A different owner's completion is not ours. */
+		return result;
+	}
+	if (memcmp(prior, &pending->prior, sizeof(*prior)) == 0 && config_aux_cut(&now)
+		&& memcmp(&now, &pending->cut, sizeof(now)) == 0) {
+		result = pending->result;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+			*out = pending->selected;
+			*image = pending->image;
+			memset(&pending->image, 0, sizeof(pending->image)); /* Transfer ownership. */
+		}
+	}
+	config_aux_clear();
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
+								 ClusterSharedConfigSelected *out, ClusterSharedConfigImage *image)
+{
+	MemoryContext caller = CurrentMemoryContext;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	ConfigAuxRead *pending = &config_aux_read;
+
+	if (history_ranges_overlap(prior, sizeof(*prior), out, sizeof(*out))
+		|| history_ranges_overlap(prior, sizeof(*prior), image, sizeof(*image))
+		|| history_ranges_overlap(out, sizeof(*out), image, sizeof(*image)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (image != NULL)
+		memset(image, 0, sizeof(*image));
+	if (prior == NULL || out == NULL || image == NULL || prior->identity.generation == 0
+		|| !cluster_shared_config || !cluster_enabled || MyBackendType != B_LMON)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	PG_TRY();
+	{
+		/* An acquisition invalidated by control reconstruction may already
+		 * have been abandoned before any image existed. Keep that duty moving. */
+		cluster_cf_retirement_poll();
+		if (pending->pending)
+			result = config_aux_finish(prior, out, image);
+		else if (!cluster_cf_held(ExclusiveLock)
+				 && (!cluster_cf_held(ShareLock)
+					 || cluster_cf_acquire_pending_owned(ShareLock, &config_aux_caller))
+				 && cluster_cf_lock_poll_owned(ShareLock, &config_aux_caller)) {
+			pending->cookie = cluster_cf_owner_cookie(ShareLock);
+			if (!cluster_cf_held_is_clusterwide(ShareLock) || pending->cookie == 0
+				|| !config_aux_cut(&pending->cut)) {
+				cluster_control_root_config_cancel();
+				result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+			} else {
+				pending->prior = *prior;
+				/* Only the returned image outlives this tick's context. The
+				 * lower reader cleans all of its own scratch on success/ERROR. */
+				MemoryContextSwitchTo(TopMemoryContext);
+				pending->result = cluster_control_root_config_read_locked(prior, &pending->selected,
+																		  &pending->image);
+				MemoryContextSwitchTo(caller);
+				pending->pending = true;
+				(void)cluster_cf_unlock_owned(ShareLock, &config_aux_caller);
+				result = config_aux_finish(prior, out, image);
+			}
+		}
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(caller);
+		cluster_control_root_config_cancel();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	return result;
+}
+
+void
+cluster_control_root_config_cancel(void)
+{
+	if (MyBackendType != B_LMON)
+		return;
+	config_aux_clear();
+	if (cluster_cf_held_by(ShareLock, &config_aux_caller))
+		(void)cluster_cf_unlock_owned(ShareLock, &config_aux_caller);
+}
+
 static ClusterControlRootResult
 config_publish_cleanup(ConfigPublishWork *work, ClusterControlRootResult result)
 {

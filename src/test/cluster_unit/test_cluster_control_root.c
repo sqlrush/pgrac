@@ -133,6 +133,8 @@ static bool test_config_policy_refuse;
 static unsigned test_config_prepares;
 static bool test_config_release_throw;
 static LOCKMODE test_actual_cf;
+static const void *test_cf_local_caller;
+static bool test_cf_tagged_retiring;
 static unsigned test_history_sync_count, test_history_fail_sync;
 static bool test_throw_root_read;
 /* Native MC lifetime boundary only. The standalone fixture uses frontend
@@ -140,6 +142,7 @@ static bool test_throw_root_read;
  * Author: SqlRush <sqlrush@gmail.com> */
 static MemoryContextData config_test_parent = { .type = T_AllocSetContext };
 MemoryContext CurrentMemoryContext = &config_test_parent;
+MemoryContext TopMemoryContext = &config_test_parent;
 static unsigned config_context_created, config_context_deleted;
 
 MemoryContext
@@ -995,6 +998,37 @@ cluster_cf_lock_poll(LOCKMODE mode)
 	return cluster_cf_lock(mode);
 }
 bool
+cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller)
+{
+	if (test_actual_cf != NoLock && test_cf_local_caller != caller)
+		return false;
+	if (!cluster_cf_lock(mode))
+		return false;
+	test_cf_local_caller = caller;
+	return true;
+}
+bool
+cluster_cf_held_by(LOCKMODE mode, const void *caller)
+{
+	return test_actual_cf == mode && test_cf_local_caller == caller;
+}
+bool
+cluster_cf_acquire_pending_owned(LOCKMODE mode pg_attribute_unused(),
+								 const void *caller pg_attribute_unused())
+{
+	return false;
+}
+ClusterCfReleaseResult
+cluster_cf_unlock_owned(LOCKMODE mode, const void *caller)
+{
+	if (test_actual_cf == NoLock)
+		return CLUSTER_CF_RELEASE_NOT_HELD;
+	if (test_cf_local_caller != caller)
+		return CLUSTER_CF_RELEASE_UNCONFIRMED;
+	test_cf_tagged_retiring = true;
+	return cluster_cf_unlock_confirmed(mode);
+}
+bool
 cluster_cf_acquire_pending(LOCKMODE mode pg_attribute_unused())
 {
 	return false;
@@ -1012,9 +1046,12 @@ cluster_cf_release_completed(LOCKMODE mode pg_attribute_unused(), uint64 cookie)
 void
 cluster_cf_retirement_poll(void)
 {
-	if (test_cf_release_confirmed && test_actual_cf != NoLock) {
+	if (test_cf_release_confirmed && test_actual_cf != NoLock
+		&& (test_cf_local_caller == NULL || test_cf_tagged_retiring)) {
 		test_cf_completed_cookie = test_cf_cookie;
 		test_actual_cf = NoLock;
+		test_cf_local_caller = NULL;
+		test_cf_tagged_retiring = false;
 	}
 }
 uint64
@@ -1051,6 +1088,8 @@ cluster_cf_unlock_confirmed(LOCKMODE mode pg_attribute_unused())
 	if (test_cf_release_confirmed) {
 		test_actual_cf = NoLock;
 		test_cf_completed_cookie = test_cf_cookie;
+		test_cf_local_caller = NULL;
+		test_cf_tagged_retiring = false;
 	}
 	return test_cf_release_confirmed ? CLUSTER_CF_RELEASE_CONFIRMED
 									 : CLUSTER_CF_RELEASE_UNCONFIRMED;
@@ -18195,6 +18234,169 @@ UT_TEST(test_config_selected_error_preserves_borrowed_cf_and_empty_outputs)
 	v2_assert_primary_unchanged(before);
 }
 
+static ClusterSharedConfigRef
+config_poll_fixture(void)
+{
+	uint8 before[66048];
+	ClusterSharedConfigRef ref = config_selected_fixture(before);
+	test_actual_cf = NoLock;
+	test_cf_local_caller = NULL;
+	test_cf_tagged_retiring = false;
+	MyBackendType = B_LMON;
+	return ref;
+}
+
+UT_TEST(test_config_poll_delivers_only_after_its_exact_release)
+{
+	ClusterSharedConfigRef prior = config_poll_fixture();
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image = { 0 };
+	unsigned calls = test_cf_lock_calls;
+	test_cf_release_confirmed = false;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	if (image.bytes != NULL)
+		cluster_shared_config_free(&image); /* Keep the RED itself leak-free. */
+	UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	if (image.bytes != NULL)
+		cluster_shared_config_free(&image);
+	UT_ASSERT_EQ(test_cf_lock_calls, calls + 1);
+	test_cf_release_confirmed = true;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image), 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, calls + 1);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT(memcmp(&selected.ref, &prior, sizeof(prior)) == 0);
+	UT_ASSERT(image.bytes != NULL);
+	cluster_shared_config_free(&image);
+	cluster_control_root_config_cancel();
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_config_poll_cut_or_prior_drift_discards_retained_observation)
+{
+	for (int fault = 0; fault < 6; ++fault) {
+		ClusterSharedConfigRef prior = config_poll_fixture();
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image = { 0 };
+		test_cf_release_confirmed = false;
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+					 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+		if (image.bytes != NULL)
+			cluster_shared_config_free(&image);
+		if (fault == 0)
+			test_control_generation++;
+		if (fault == 1)
+			prior.identity.generation++;
+		if (fault == 2)
+			prior.sha256[0] ^= 1;
+		if (fault == 3)
+			test_epoch++;
+		if (fault == 4)
+			test_self_incarnation++;
+		if (fault == 5) {
+			/* Some other completed request cannot stand in for this cookie. */
+			test_actual_cf = NoLock;
+			test_cf_completed_cookie = test_cf_cookie + 1;
+		}
+		test_cf_release_confirmed = true;
+		UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+					 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		if (image.bytes != NULL)
+			cluster_shared_config_free(&image);
+		UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+		cluster_control_root_config_cancel();
+		MyBackendType = B_INVALID;
+	}
+}
+
+UT_TEST(test_config_poll_error_hands_exact_cleanup_to_retirement)
+{
+	ClusterSharedConfigRef prior = config_poll_fixture();
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+	volatile bool caught = false;
+	MemoryContext caller = CurrentMemoryContext;
+	unsigned releases = test_order_seq;
+	test_cf_release_confirmed = false;
+	test_throw_root_read = true;
+	PG_TRY();
+	{
+		(void)cluster_control_root_config_poll(&prior, &selected, &image);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_root_read = false;
+	UT_ASSERT(caught);
+	UT_ASSERT(CurrentMemoryContext == caller);
+	UT_ASSERT(test_cf_release_order > releases);
+	UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	test_cf_release_confirmed = true;
+	cluster_cf_retirement_poll();
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image), 0);
+	cluster_shared_config_free(&image);
+	cluster_control_root_config_cancel();
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_config_poll_cancel_discards_bytes_without_stealing_other_duty)
+{
+	ClusterSharedConfigRef prior = config_poll_fixture();
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image = { 0 };
+	unsigned calls, releases;
+	static const char unrelated;
+	test_cf_release_confirmed = false;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	if (image.bytes != NULL)
+		cluster_shared_config_free(&image);
+	cluster_control_root_config_cancel();
+	test_cf_release_confirmed = true;
+	cluster_cf_retirement_poll();
+	calls = test_cf_lock_calls;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image), 0);
+	UT_ASSERT_EQ(test_cf_lock_calls, calls + 1); /* No cancelled result delivered. */
+	cluster_shared_config_free(&image);
+	test_actual_cf = ShareLock;
+	test_cf_local_caller = &unrelated;
+	releases = test_cf_release_order;
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	cluster_control_root_config_cancel();
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	UT_ASSERT_EQ(test_cf_release_order, releases);
+	test_actual_cf = NoLock;
+	MyBackendType = B_INVALID;
+}
+
+UT_TEST(test_config_poll_requires_background_role_and_preserves_aliased_input)
+{
+	ClusterSharedConfigRef prior = config_poll_fixture(), saved = prior;
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+	unsigned calls = test_cf_lock_calls;
+
+	UT_ASSERT_EQ(
+		cluster_control_root_config_poll(&prior, (ClusterSharedConfigSelected *)&prior, &image),
+		CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(memcmp(&prior, &saved, sizeof(prior)) == 0);
+	MyBackendType = B_BACKEND;
+	memset(&selected, 0xa5, sizeof(selected));
+	memset(&image, 0xa5, sizeof(image));
+	UT_ASSERT_EQ(cluster_control_root_config_poll(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+	UT_ASSERT_EQ(test_cf_lock_calls, calls);
+	MyBackendType = B_INVALID;
+}
+
 int
 main(int argc, char **argv)
 {
@@ -18213,7 +18415,12 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(333);
+	UT_PLAN(338);
+	UT_RUN(test_config_poll_delivers_only_after_its_exact_release);
+	UT_RUN(test_config_poll_cut_or_prior_drift_discards_retained_observation);
+	UT_RUN(test_config_poll_error_hands_exact_cleanup_to_retirement);
+	UT_RUN(test_config_poll_cancel_discards_bytes_without_stealing_other_duty);
+	UT_RUN(test_config_poll_requires_background_role_and_preserves_aliased_input);
 	UT_RUN(test_config_selected_reads_owned_same_and_newer_object);
 	UT_RUN(test_config_selected_does_not_depend_on_data_writer_permission);
 	UT_RUN(test_config_selected_rejects_identity_and_generation_drift);

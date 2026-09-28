@@ -97,6 +97,17 @@ typedef enum ClusterCfReleaseResult {
 
 extern ClusterCfReleaseResult cluster_cf_unlock_confirmed(LOCKMODE mode);
 
+/* Auxiliary tasks share the process CF slot, not each other's request.
+ * caller is a stable, non-NULL process-lifetime address, never a wire or
+ * authority identity. Another caller (including untagged APIs) cannot poll
+ * or retire this slot. Existing background retirement owns abandoned holds.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern bool cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller);
+extern bool cluster_cf_acquire_pending_owned(LOCKMODE mode, const void *caller);
+extern bool cluster_cf_held_by(LOCKMODE mode, const void *caller);
+extern ClusterCfReleaseResult cluster_cf_unlock_owned(LOCKMODE mode, const void *caller);
+
 /*
  * cluster_cf_held -- retained ownership, including an unconfirmed release.
  * Use for lock-order, reentry and shutdown checks, never as positive proof

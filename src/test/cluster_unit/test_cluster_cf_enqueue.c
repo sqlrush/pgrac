@@ -1655,6 +1655,90 @@ UT_TEST(shared_cf_service_cut_change_retires_without_producing_holder)
 	cluster_shared_config = false;
 }
 
+UT_TEST(cf_local_caller_cannot_steal_pending_or_acquired_request)
+{
+	static const char configuration, observer;
+	unsigned polls, prepares, waits = owner_wait_calls;
+	uint64 cookie;
+
+	cluster_shared_config = true;
+	MyBackendType = B_LMON;
+	g_next_request_id++;
+	cf_poll_result = CLUSTER_GES_ACQUIRE_PENDING;
+	UT_ASSERT(!cluster_cf_lock_poll_owned(ShareLock, &configuration));
+	UT_ASSERT(cluster_cf_acquire_pending_owned(ShareLock, &configuration));
+	UT_ASSERT(!cluster_cf_acquire_pending_owned(ShareLock, &observer));
+	UT_ASSERT(!cluster_cf_acquire_pending(ShareLock));
+	UT_ASSERT(cluster_cf_held_by(ShareLock, &configuration));
+	UT_ASSERT(!cluster_cf_held_by(ShareLock, &observer));
+	polls = cf_acquire_polls;
+	prepares = g_seven_count;
+	UT_ASSERT(!cluster_cf_lock_poll_owned(ShareLock, &observer));
+	UT_ASSERT(!cluster_cf_lock_poll(ShareLock));
+	UT_ASSERT_EQ(cf_acquire_polls, polls);
+	UT_ASSERT_EQ(g_seven_count, prepares);
+	cf_poll_result = CLUSTER_GES_ACQUIRE_GRANTED;
+	UT_ASSERT(cluster_cf_lock_poll_owned(ShareLock, &configuration));
+	cookie = cluster_cf_owner_cookie(ShareLock);
+	UT_ASSERT(cookie != 0);
+	UT_ASSERT_EQ(cluster_cf_unlock_owned(ShareLock, &observer), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(!cluster_cf_lock(ShareLock));
+	UT_ASSERT(cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT_EQ(cluster_cf_owner_cookie(ShareLock), cookie);
+	UT_ASSERT_EQ(cluster_cf_unlock_owned(ShareLock, &configuration),
+				 CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	UT_ASSERT(!cluster_cf_held_by(ShareLock, &configuration));
+	UT_ASSERT(cluster_cf_release_completed(ShareLock, cookie));
+	UT_ASSERT_EQ(owner_wait_calls, waits);
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
+UT_TEST(cf_tagged_caller_cannot_take_legacy_request_and_cut_retires_owner)
+{
+	static const char configuration;
+	uint64 enumerated;
+	unsigned polls;
+
+	cluster_shared_config = true;
+	MyBackendType = B_LMON;
+	g_next_request_id++;
+	cf_poll_result = CLUSTER_GES_ACQUIRE_PENDING;
+	UT_ASSERT(!cluster_cf_lock_poll(ShareLock));
+	polls = cf_acquire_polls;
+	UT_ASSERT(!cluster_cf_lock_poll_owned(ShareLock, &configuration));
+	UT_ASSERT(!cluster_cf_held_by(ShareLock, &configuration));
+	UT_ASSERT(!cluster_cf_acquire_pending_owned(ShareLock, &configuration));
+	UT_ASSERT_EQ(cluster_cf_unlock_owned(ShareLock, &configuration),
+				 CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(cluster_cf_acquire_pending(ShareLock));
+	UT_ASSERT_EQ(cf_acquire_polls, polls);
+	UT_ASSERT_EQ(cluster_cf_unlock_confirmed(ShareLock), CLUSTER_CF_RELEASE_UNCONFIRMED);
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	g_next_request_id++;
+	UT_ASSERT(!cluster_cf_lock_poll_owned(ShareLock, &configuration));
+	owner_epoch++;
+	owner_generation++;
+	UT_ASSERT(!cluster_lock_owners_redeclare(&enumerated));
+	UT_ASSERT(!cluster_cf_acquire_pending_owned(ShareLock, &configuration));
+	UT_ASSERT(!cluster_cf_held_is_usable(ShareLock));
+	UT_ASSERT(acknowledge_retirements());
+	cluster_cf_retirement_poll();
+	UT_ASSERT(!cluster_cf_held(ShareLock));
+	UT_ASSERT(!cluster_cf_held_by(ShareLock, &configuration));
+	UT_ASSERT_EQ(pg_atomic_read_u32(&MyProc->cluster_grd_registered_count), 0);
+	MyBackendType = B_INVALID;
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
@@ -1662,7 +1746,7 @@ main(void)
 	pg_atomic_init_u32(&owner_proc.cluster_grd_registered_count, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked, 0);
 	pg_atomic_init_u64(&owner_proc.cluster_grd_redeclare_acked_epoch, 0);
-	UT_PLAN(38);
+	UT_PLAN(40);
 	UT_RUN(test_cf_resid_encode);
 	UT_RUN(test_lock_grant_then_release);
 	UT_RUN(test_held_and_write_permitted);
@@ -1701,6 +1785,8 @@ main(void)
 	UT_RUN(auxiliary_poll_retires_without_sleeping_or_dropping_live_cf);
 	UT_RUN(shared_cf_service_acquisition_keeps_one_identity_across_ticks);
 	UT_RUN(shared_cf_service_cut_change_retires_without_producing_holder);
+	UT_RUN(cf_local_caller_cannot_steal_pending_or_acquired_request);
+	UT_RUN(cf_tagged_caller_cannot_take_legacy_request_and_cut_retires_owner);
 	UT_DONE();
 
 	return ut_failed_count == 0 ? 0 : 1;

@@ -57,12 +57,15 @@ typedef struct CfHoldState {
 	bool held;
 	bool coordinated;
 	bool release_pending;
+	const void *caller;		/* Process-local task lifetime, never remote authority. */
 	ClusterLockOwner owner; /* Stable S5/reconstruction/S6 ownership. */
 } CfHoldState;
 
 static CfHoldState cf_hold_x;
 static CfHoldState cf_hold_s;
 static uint64 cf_retired_x, cf_retired_s;
+
+static ClusterCfReleaseResult cf_unlock(LOCKMODE mode, const void *caller);
 
 /*
  * spec-5.6: set while this process is the bootstrap single-node authority
@@ -121,12 +124,20 @@ cluster_cf_resid_encode(ClusterResId *dst)
  * cluster_cf_lock -- acquire the singleton CF lock in `mode` via GES.
  */
 static bool
-cf_lock(LOCKMODE mode, bool cooperative)
+cf_lock(LOCKMODE mode, bool cooperative, const void *caller)
 {
 	ClusterLockAcquireResult r;
 	CfHoldState *slot = cf_slot(mode);
 	ClusterLockAcquireRequest *req = &slot->owner.request;
-	bool resume = cooperative && cluster_cf_acquire_pending(mode);
+	bool resume;
+
+	/* Several duties share an auxiliary process. Only the initiating duty
+	 * may resume its pending request or drain its old hold. This check must
+	 * precede every poll/release, including the legacy stale-hold cleanup. */
+	if (slot->held && slot->caller != caller)
+		return false;
+	resume = cooperative && slot->held && slot->owner.cooperative_acquire
+			 && slot->owner.state == CLUSTER_LOCK_OWNER_ACQUIRING;
 
 	/*
 	 * RF-ROOT P6 (shutdown-handoff wiring, "stop new local CF requests"):
@@ -162,7 +173,7 @@ cf_lock(LOCKMODE mode, bool cooperative)
 	 * equally safe to proceed from.
 	 */
 	if (slot->held && !resume) {
-		ClusterCfReleaseResult drain = cluster_cf_unlock_confirmed(mode);
+		ClusterCfReleaseResult drain = cf_unlock(mode, caller);
 
 		if (drain == CLUSTER_CF_RELEASE_UNCONFIRMED) {
 			ereport(LOG, (errmsg("cluster CF acquire refused: stale held slot could "
@@ -192,6 +203,7 @@ cf_lock(LOCKMODE mode, bool cooperative)
 	/* Visible cleanup responsibility precedes every possible S3/S4 mutation;
 	 * usable authority still requires the owned S5 completion. */
 	slot->held = slot->coordinated = slot->release_pending = true;
+	slot->caller = caller;
 acquire:
 	PG_TRY();
 	{
@@ -259,7 +271,7 @@ acquire:
 bool
 cluster_cf_lock(LOCKMODE mode)
 {
-	return cf_lock(mode, false);
+	return cf_lock(mode, false, NULL);
 }
 
 bool
@@ -267,7 +279,7 @@ cluster_cf_lock_poll(LOCKMODE mode)
 {
 	if (!cluster_shared_config || (MyBackendType != B_LMON && MyBackendType != B_LMS))
 		return false;
-	return cf_lock(mode, true);
+	return cf_lock(mode, true, NULL);
 }
 
 bool
@@ -275,8 +287,40 @@ cluster_cf_acquire_pending(LOCKMODE mode)
 {
 	CfHoldState *slot = cf_slot(mode);
 
-	return slot->held && slot->owner.cooperative_acquire
+	return slot->held && slot->caller == NULL && slot->owner.cooperative_acquire
 		   && slot->owner.state == CLUSTER_LOCK_OWNER_ACQUIRING;
+}
+
+bool
+cluster_cf_lock_poll_owned(LOCKMODE mode, const void *caller)
+{
+	if (caller == NULL || !cluster_shared_config
+		|| (MyBackendType != B_LMON && MyBackendType != B_LMS))
+		return false;
+	return cf_lock(mode, true, caller);
+}
+
+bool
+cluster_cf_acquire_pending_owned(LOCKMODE mode, const void *caller)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return caller != NULL && slot->held && slot->caller == caller && slot->owner.cooperative_acquire
+		   && slot->owner.state == CLUSTER_LOCK_OWNER_ACQUIRING;
+}
+
+bool
+cluster_cf_held_by(LOCKMODE mode, const void *caller)
+{
+	CfHoldState *slot = cf_slot(mode);
+
+	return caller != NULL && slot->held && slot->caller == caller;
+}
+
+ClusterCfReleaseResult
+cluster_cf_unlock_owned(LOCKMODE mode, const void *caller)
+{
+	return caller != NULL ? cf_unlock(mode, caller) : CLUSTER_CF_RELEASE_UNCONFIRMED;
 }
 
 uint64
@@ -337,11 +381,19 @@ cluster_cf_held_is_clusterwide(LOCKMODE mode)
 ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode)
 {
+	return cf_unlock(mode, NULL);
+}
+
+static ClusterCfReleaseResult
+cf_unlock(LOCKMODE mode, const void *caller)
+{
 	CfHoldState *slot = cf_slot(mode);
 	uint64 cookie = cluster_cf_owner_cookie(mode);
 
 	if (!slot->held)
 		return CLUSTER_CF_RELEASE_NOT_HELD;
+	if (slot->caller != caller)
+		return CLUSTER_CF_RELEASE_UNCONFIRMED;
 	if (!slot->coordinated) {
 		memset(slot, 0, sizeof(*slot));
 		return CLUSTER_CF_RELEASE_NOT_HELD;

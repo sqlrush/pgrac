@@ -88,6 +88,19 @@ cluster_control_root_config_read_locked(const ClusterSharedConfigRef *prior,
 										ClusterSharedConfigSelected *out,
 										ClusterSharedConfigImage *image);
 
+/* LMON-owned cooperative read/retirement. A result is delivered only after
+ * exact CF release at the same control cut/prior input. LOCK_UNAVAILABLE
+ * retains the attempt; ERROR/cancel retains only existing CF cleanup duty.
+ * No native hooks, node ACK or data permission. Caller frees successful bytes.
+ * Alias/refusal behavior is the same as read_locked. Cancel must be called
+ * before the background duty stops polling; it never touches another task.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+extern ClusterControlRootResult
+cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
+								 ClusterSharedConfigSelected *out, ClusterSharedConfigImage *image);
+extern void cluster_control_root_config_cancel(void);
+
 /* PGRAC: amend one explicit scope/key in an exact selected object. NULL
  * change.value means RESET. Preserve all other entries/identity; changed
  * requests advance generation once, without wrap. No-op returns an owned copy
