@@ -11,6 +11,7 @@
 #include <fcntl.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "access/xlog.h"
@@ -485,6 +486,7 @@ cluster_write_fence_reject_if_fenced(const char *op)
 
 static char test_root[MAXPGPATH];
 static char test_wal_root[MAXPGPATH];
+static const char *test_program_path;
 static uint64 test_system_identifier = TEST_SYSID;
 static ControlFileData *test_sysid_control;
 static char test_storage_uuid_text[33] = "00112233445566778899aabbccddeeff";
@@ -7970,9 +7972,16 @@ v3_reserve_fixture(uint8 before[66048], ControlRootImage *root)
 {
 	ClusterPhase1FullStopPlan plan;
 	char path[MAXPGPATH];
-	const char *dirs[] = { "global/wal_startup", "global/wal_startup/thread_1",
-						   "global/wal_startup/thread_1/.staging", "global/wal_startup/thread_4",
-						   "global/wal_startup/thread_4/.staging" };
+	const char *dirs[] = { "global/wal_startup",
+						   "global/wal_startup/thread_1",
+						   "global/wal_startup/thread_1/.staging",
+						   "global/wal_startup/thread_4",
+						   "global/wal_startup/thread_4/.staging",
+						   "global/wal_history",
+						   "global/wal_history/thread_1",
+						   "global/wal_history/thread_1/.staging",
+						   "global/wal_history/thread_4",
+						   "global/wal_history/thread_4/.staging" };
 	enableFsync = true;
 	test_reserve_mode = false;
 	v2_close_fixture(before, &plan);
@@ -14476,6 +14485,231 @@ startup_stage_paths(const ClusterWalStartupStage *stage, char formal[MAXPGPATH],
 			 stage->origin_node + 1, uuid);
 }
 
+/* PGRAC: exec discards every producer-side cache. This reader exercises actual
+ * selected files with fixture CF boundaries; it is not PostgreSQL recovery or
+ * evidence that a native startup guard may be removed.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static int
+initializer_reopen_main(int argc, char **argv)
+{
+	ControlRootImage root;
+	ControlFileData control;
+	ClusterControlRootFileToken file;
+	ClusterWalOriginInputs inputs;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootRejoinTerminalProofV1 proof;
+	ClusterWalTerminalImage terminal;
+	ClusterControlRootResult result;
+	uint64 expected_current, expected_related;
+	bool blocked = false;
+
+	if (argc != 7 || strlen(argv[2]) >= sizeof(test_root)
+		|| strlen(argv[3]) >= sizeof(test_wal_root) || !parse_u64_arg(argv[5], &expected_current)
+		|| !parse_u64_arg(argv[6], &expected_related))
+		return 64;
+	strlcpy(test_root, argv[2], sizeof(test_root));
+	strlcpy(test_wal_root, argv[3], sizeof(test_wal_root));
+	cluster_shared_data_dir = DataDir = test_root;
+	cluster_wal_threads_dir = test_wal_root;
+	cluster_shared_config = test_checkpoint_mode = true;
+	test_epoch = 123;
+	MyBackendType = B_LMON;
+	test_actual_cf = test_cf_mode = ShareLock;
+	result = cluster_control_root_v3_read_control_locked(v2_storage, TEST_SYSID, &root, &control,
+														 &file);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || !root.present[0]
+		|| root.records[0].identity.origin_owner_incarnation != expected_current
+		|| (root.header.v2.serving[0] & 1) != 0)
+		return 65;
+	result = cluster_wal_origin_inputs_read_locked(&root, 0, &inputs);
+	if (strcmp(argv[4], "missing-terminal") == 0)
+		return result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && v2_zero(&inputs, sizeof(inputs)) ? 0
+																							 : 66;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return 67;
+	if (strcmp(argv[4], "pending") == 0)
+		return inputs.has_pending
+					   && inputs.pending.claim.identity.origin_owner_incarnation == expected_related
+					   && inputs.history.terminal_count == 0
+				   ? 0
+				   : 68;
+	if (inputs.has_pending)
+		return 69;
+	if (strcmp(argv[4], "promoted") == 0) {
+		ClusterWalDurablePrefixRef ref = { 0 };
+		ClusterWalTailObservation tail;
+		ClusterControlRootIdentity current = root.records[0].identity;
+		if (root.records[0].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED
+			|| inputs.history.count != 1 || inputs.history.terminal_count != 0
+			|| inputs.history.records[0].snapshot.identity.origin_owner_incarnation
+				   != expected_related)
+			return 70;
+		result = cluster_control_root_v3_read_thread_locked(&current, &root, &control, &file);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY || control.state != DB_IN_CRASH_RECOVERY)
+			return 71;
+		ref.claim.identity = root.records[0].identity;
+		ref.claim.database_incarnation = root.header.v2.database_incarnation;
+		ref.claim.max_config_generation = root.header.v2.config_generation;
+		memcpy(ref.claim.claim_sha256, root.refs[0].claim_sha256, 32);
+		ref.timeline = root.records[0].checkpoint_tli;
+		result = cluster_wal_tail_observe_checkpoint(
+			test_wal_root, &ref, wal_segment_size, control.checkPointCopy.redo,
+			root.records[0].validated_tail_lsn_exclusive, root.records[0].checkpoint_lower_lsn,
+			root.records[0].checkpoint_record_crc32c, &tail);
+		return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+					   && tail.complete_end == root.records[0].validated_tail_lsn_exclusive
+				   ? 0
+				   : 72;
+	}
+	if (strcmp(argv[4], "terminal") != 0 || inputs.history.terminal_count != 1
+		|| root.records[0].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED)
+		return 73;
+	result = cluster_wal_terminal_read_locked(&root, 0, 0, &terminal);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| terminal.initialization.claim.identity.origin_owner_incarnation != expected_related)
+		return 74;
+	test_actual_cf = test_cf_mode = NoLock;
+	result
+		= cluster_control_root_v3_read_canonical(1, &root.records[0].identity, &snapshot, &token);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return 75;
+	result = cluster_control_root_v3_validate_rejoin_terminal(
+		&root.records[0].identity, expected_related, &snapshot, &token, &proof);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| memcmp(proof.operation_uuid, terminal.operation_uuid, 16) != 0)
+		return 76;
+	result = cluster_control_root_v3_terminal_history_blocked(&root.records[0].identity, &blocked);
+	return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && blocked ? 0 : 77;
+}
+
+static int
+initializer_child_status(pid_t child)
+{
+	int status;
+	pid_t waited;
+	if (child < 0)
+		return 125;
+	do {
+		waited = waitpid(child, &status, 0);
+	} while (waited < 0 && errno == EINTR);
+	return waited == child && WIFEXITED(status) ? WEXITSTATUS(status) : 126;
+}
+
+static int
+initializer_reopen(const char *phase, uint64 current, uint64 related)
+{
+	char current_arg[32], related_arg[32];
+	pid_t child;
+	snprintf(current_arg, sizeof(current_arg), "%llu", (unsigned long long)current);
+	snprintf(related_arg, sizeof(related_arg), "%llu", (unsigned long long)related);
+	fflush(NULL);
+	child = fork();
+	if (child == 0) {
+		execl(test_program_path, test_program_path, "--reopen-initializer", test_root,
+			  test_wal_root, phase, current_arg, related_arg, (char *)NULL);
+		_exit(127);
+	}
+	return initializer_child_status(child);
+}
+
+UT_TEST(test_initializer_selected_evidence_survives_producer_exit_and_exec)
+{
+	for (unsigned scenario = 0; scenario < 4; scenario++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterThreadRecLaunchEligibility eligibility = { 0 };
+		ClusterWalStartupImage op;
+		uint8 before[CLUSTER_CONTROL_ROOT_FILE_BYTES];
+		char path[MAXPGPATH];
+		bool checkpoint = scenario >= 2;
+		bool uncertain = (scenario & 1) != 0;
+		pid_t child;
+		if (checkpoint) {
+			op = pending_inspection_fixture(&serial, true);
+			eligibility.origin_thread = 1;
+			eligibility.attempt_stamp = 123;
+			eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+			eligibility.duty = op.claim.identity;
+			memcpy(eligibility.selected_root_sha256, serial.pending.file.image_sha256, 32);
+		} else
+			op = pending_worker_fixture(&serial, &eligibility);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(initializer_reopen("pending",
+										op.predecessor.snapshot.identity.origin_owner_incarnation,
+										op.claim.identity.origin_owner_incarnation),
+					 0);
+		if (ut_current_failed)
+			return;
+		memset(&test_worker_event, 0, sizeof(test_worker_event));
+		test_worker_event.reconfig_kind = RECONFIG_KIND_FAIL_STOP;
+		test_worker_event.event_id = 12;
+		test_worker_event.new_epoch = 123;
+		test_worker_event.dead_bitmap[0] = 1;
+		test_worker_pin_held = false;
+		test_fail_after_primary_rename = uncertain;
+		fflush(NULL);
+		child = fork();
+		if (child == 0) {
+			ClusterThreadRecResult result = thread_recovery_worker_run(&eligibility);
+			ClusterThreadRecResult expected = uncertain	   ? CLUSTER_THREADREC_BLOCKED
+											  : checkpoint ? CLUSTER_THREADREC_DEFERRED
+														   : CLUSTER_THREADREC_DONE;
+			if (result != expected || ut_current_failed || test_worker_pin_held)
+				fprintf(
+					stderr,
+					"# initializer scenario=%u result=%d expected=%d finish=%d failed=%d pin=%d\n",
+					scenario, result, expected, test_initializer_result, ut_current_failed,
+					test_worker_pin_held);
+			_exit(!ut_current_failed && result == expected && !test_worker_pin_held ? 0 : 78);
+		}
+		test_fail_after_primary_rename = false;
+		UT_ASSERT_EQ(initializer_child_status(child), 0);
+		if (ut_current_failed)
+			return;
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, before, sizeof(before));
+		UT_ASSERT_EQ(initializer_reopen(
+						 checkpoint ? "promoted" : "terminal",
+						 checkpoint ? op.claim.identity.origin_owner_incarnation
+									: op.predecessor.snapshot.identity.origin_owner_incarnation,
+						 checkpoint ? op.predecessor.snapshot.identity.origin_owner_incarnation
+									: op.claim.identity.origin_owner_incarnation),
+					 0);
+		v2_assert_primary_unchanged(before);
+		if (ut_current_failed)
+			return;
+		if (!checkpoint) {
+			ControlRootImage root;
+			ControlFileData control;
+			ClusterControlRootFileToken file;
+			ClusterWalHistoryImage history;
+			ClusterWalStartupStage selected = { 0 };
+			char temp[MAXPGPATH];
+			uint8 bytes[CLUSTER_WAL_TERMINAL_BYTES];
+			test_actual_cf = test_cf_mode = ShareLock;
+			UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(
+							 &op.predecessor.snapshot.identity, &root, &control, &file),
+						 0);
+			UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 0, &history), 0);
+			selected.generation = history.terminals[0].generation;
+			memcpy(selected.sha256, history.terminals[0].sha256, 32);
+			startup_stage_paths(&selected, path, temp);
+			read_all_or_abort(path, bytes, sizeof(bytes));
+			UT_ASSERT_EQ(unlink(path), 0);
+			UT_ASSERT_EQ(
+				initializer_reopen("missing-terminal",
+								   op.predecessor.snapshot.identity.origin_owner_incarnation,
+								   op.claim.identity.origin_owner_incarnation),
+				0);
+			v2_assert_primary_unchanged(before);
+			write_all_or_abort(path, bytes, sizeof(bytes));
+		}
+		test_actual_cf = test_cf_mode = NoLock;
+		test_reserve_mode = false;
+	}
+}
+
 UT_TEST(test_startup_file_install_preserves_literal_phases_without_selecting_root)
 {
 	for (uint32 phase = 1; phase <= 3; phase++) {
@@ -17242,6 +17476,9 @@ UT_TEST(test_v3_normal_close_cannot_discard_foreign_pending_initialization)
 int
 main(int argc, char **argv)
 {
+	test_program_path = argv[0];
+	if (argc > 1 && strcmp(argv[1], "--reopen-initializer") == 0)
+		return initializer_reopen_main(argc, argv);
 	if (argc > 1 && strcmp(argv[1], "--fixture-root-cast") == 0)
 		return fixture_cast_main(argc, argv);
 	if (argc > 1)
@@ -17254,7 +17491,8 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(316);
+	UT_PLAN(317);
+	UT_RUN(test_initializer_selected_evidence_survives_producer_exit_and_exec);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
