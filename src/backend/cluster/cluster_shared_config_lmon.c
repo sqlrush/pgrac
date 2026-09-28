@@ -21,9 +21,11 @@
 #include "utils/timestamp.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shared_config.h"
 
 static bool selection_pending;
+static ClusterR4MembershipSnapshot selection_members;
 static TimestampTz next_probe;
 /* Static solely for ERROR cleanup of an owned returned image. It is not an
  * extra configuration authority, and is empty between successful ticks. */
@@ -52,15 +54,69 @@ cluster_shared_config_delivery_lmon_cancel(void)
 	cluster_shared_config_free(&selected_image);
 	cluster_control_root_config_cancel();
 	selection_pending = false;
+	memset(&selection_members, 0, sizeof(selection_members));
 	next_probe = 0;
+}
+
+/* Receiver-local observation generations can advance at every healthy poll.
+ * Both snapshots independently prove freshness; only actual MEMBER identity
+ * belongs to this retained attempt. Never turn heartbeat progress into an ABA
+ * identity or impose a cluster-global meaning on those local counters. */
+static bool
+delivery_same_members(const ClusterR4MembershipSnapshot *a, const ClusterR4MembershipSnapshot *b)
+{
+	return a->formation_epoch == b->formation_epoch
+		   && a->admitted_members_lo == b->admitted_members_lo
+		   && a->admitted_members_hi == b->admitted_members_hi
+		   && a->local_self_boot_incarnation == b->local_self_boot_incarnation
+		   && memcmp(a->admitted_incarnation, b->admitted_incarnation,
+					 sizeof(a->admitted_incarnation))
+				  == 0;
+}
+
+static void
+delivery_attempt(const ClusterSharedConfigProcess *actual, TimestampTz now)
+{
+	ClusterR4MembershipSnapshot before, after;
+	ClusterSharedConfigSelected selected;
+	ClusterControlRootResult result;
+
+	if (cluster_node_id < 0 || cluster_node_id >= CLUSTER_MAX_NODES
+		|| actual->node_id != (uint32)cluster_node_id
+		|| !cluster_reconfig_lmon_snapshot_r4_membership(&before)
+		|| (selection_pending && !delivery_same_members(&selection_members, &before))) {
+		cluster_shared_config_delivery_lmon_cancel();
+		return;
+	}
+	if (!selection_pending)
+		selection_members = before;
+	result = cluster_control_root_config_poll(&actual->ref, &selected, &selected_image);
+	selection_pending = result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (!selection_pending)
+		next_probe = now + INT64CONST(1000000);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return;
+	if (!cluster_reconfig_lmon_snapshot_r4_membership(&after)
+		|| !delivery_same_members(&selection_members, &after)
+		|| (after.admitted_members_lo & ~selected.ref.identity.configured[0]) != 0
+		|| (after.admitted_members_hi & ~selected.ref.identity.configured[1]) != 0) {
+		cluster_shared_config_delivery_lmon_cancel();
+		return;
+	}
+	if (cluster_shared_config_delivery_publish(&selected.ref, &selected_image)
+		&& delivery_needs_signal(&selected.ref, actual->node_id)) {
+		/* No receipt is inferred from kill's return. A missing/failed
+		 * signal leaves real outcomes old and will be retried. */
+		if (PostmasterPid > 0)
+			(void)kill(PostmasterPid, SIGHUP);
+	}
 }
 
 void
 cluster_shared_config_delivery_lmon_tick(void)
 {
 	ClusterSharedConfigProcess actual;
-	ClusterSharedConfigSelected selected;
-	ClusterControlRootResult result;
 	TimestampTz now;
 	if (!IsUnderPostmaster || MyBackendType != B_LMON)
 		return;
@@ -80,19 +136,7 @@ cluster_shared_config_delivery_lmon_tick(void)
 	}
 	PG_TRY();
 	{
-		result = cluster_control_root_config_poll(&actual.ref, &selected, &selected_image);
-		selection_pending = result == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
-		if (!selection_pending)
-			next_probe = now + INT64CONST(1000000);
-		if ((result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-			 || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
-			&& cluster_shared_config_delivery_publish(&selected.ref, &selected_image)
-			&& delivery_needs_signal(&selected.ref, actual.node_id)) {
-			/* No receipt is inferred from kill's return. A missing/failed
-			 * signal leaves real outcomes old and will be retried. */
-			if (PostmasterPid > 0)
-				(void)kill(PostmasterPid, SIGHUP);
-		}
+		delivery_attempt(&actual, now);
 		cluster_shared_config_free(&selected_image);
 	}
 	PG_CATCH();
