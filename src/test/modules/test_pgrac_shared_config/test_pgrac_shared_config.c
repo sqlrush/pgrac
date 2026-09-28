@@ -38,6 +38,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_reload);
 PG_FUNCTION_INFO_V1(test_pgrac_config_process);
 PG_FUNCTION_INFO_V1(test_pgrac_config_parallel_observe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_enrollment);
+PG_FUNCTION_INFO_V1(test_pgrac_config_native_role);
 PG_FUNCTION_INFO_V1(test_pgrac_config_slot_probe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_selection_cleanup);
@@ -1488,6 +1489,43 @@ test_pgrac_config_enrollment(PG_FUNCTION_ARGS)
 			psprintf("%d:%llu:%llu:%d:%d", index, (unsigned long long)state.registration,
 					 (unsigned long long)state.process.ref.identity.generation,
 					 state.process.failed, state.process.parallel_snapshot)));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("plain"));
+#endif
+}
+
+/* Actual native role observation only; never synthesize process enrollment. */
+Datum
+test_pgrac_config_native_role(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test native role inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigRegistration state;
+		int pid = PG_GETARG_INT32(0);
+		bool found = false;
+		if (pid == -1)
+			found = cluster_shared_config_registration_read(&ProcGlobal->cluster_config_postmaster,
+															&state);
+		else if (pid == -2)
+			found = cluster_shared_config_delivery_logger_observe(&state);
+		else {
+			int32 *pids = palloc(sizeof(*pids) * ProcGlobal->allProcCount);
+			if (ProcConfigSnapshotPids(pids, ProcGlobal->allProcCount))
+				for (unsigned i = 0; i < ProcGlobal->allProcCount; ++i)
+					if (pids[i] == pid && pid > 0) {
+						found = cluster_shared_config_registration_read(
+									&ProcGlobal->allProcs[i].cluster_config, &state)
+								&& state.pid == pid;
+						break;
+					}
+			pfree(pids);
+		}
+		if (!found || state.pid <= 0 || state.registration == 0)
+			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d:%d", state.role, state.aux_type)));
 	}
 #else
 	PG_RETURN_TEXT_P(cstring_to_text("plain"));

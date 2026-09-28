@@ -93,6 +93,10 @@ CREATE FUNCTION test_pgrac_config_enrollment(integer)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_enrollment'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_enrollment(integer) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_native_role(integer)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_native_role'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_native_role(integer) FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_slot_probe(integer)
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_slot_probe'
 LANGUAGE C STRICT;

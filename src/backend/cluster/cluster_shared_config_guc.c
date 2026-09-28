@@ -33,6 +33,7 @@ static int32 config_process_slot_pid;
 static uint64 config_process_registration;
 static bool reload_overlap(const void *a, size_t na, const void *b, size_t nb);
 static void startup_config_release(ResourceOwner owner, ResourceOwner saved_owner, bool success);
+StaticAssertDecl(NUM_AUXPROCTYPES <= PG_INT16_MAX, "native auxiliary registration ordinal");
 
 /* Only the real native owner writes a slot. A reader makes one bounded
  * attempt, including in the PM: no child-owned lock can strand the parent.
@@ -120,6 +121,7 @@ cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot)
 	value.registration = sequence + 2;
 	value.pid = MyProcPid;
 	value.role = MyBackendType;
+	value.aux_type = MyAuxProcType;
 	value.observed = cluster_shared_config_process_observe(&value.process);
 	(void)cluster_shared_config_active_profile(&value.active);
 	if (!config_registration_write(slot, &value))
@@ -142,6 +144,7 @@ config_process_report(void)
 		|| value.pid != MyProcPid || value.registration != config_process_registration)
 		return;
 	value.role = MyBackendType;
+	value.aux_type = MyAuxProcType;
 	value.observed = cluster_shared_config_process_observe(&value.process);
 	(void)cluster_shared_config_active_profile(&value.active);
 	(void)config_registration_write(config_process_slot, &value);

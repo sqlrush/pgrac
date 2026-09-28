@@ -404,9 +404,13 @@ typedef struct ClusterSharedConfigRegistration {
 	int32 role;
 	ClusterSharedConfigProcess process;
 	bool observed;
+	/* Actual native ordinal, not the shared LMS/cleaner display role. */
+	int16 aux_type;
 	ClusterSharedConfigActive active;
 } ClusterSharedConfigRegistration;
 StaticAssertDecl(sizeof(ClusterSharedConfigRegistration) == 224, "config process registration");
+StaticAssertDecl(offsetof(ClusterSharedConfigRegistration, active) == 148,
+				 "native auxiliary ordinal must use existing registration padding");
 
 typedef struct ClusterSharedConfigSlot {
 	pg_atomic_uint64 sequence;
@@ -448,7 +452,8 @@ typedef struct ClusterSharedConfigCensus {
 } ClusterSharedConfigCensus;
 /* Owner supplies a validated selected target. No CF/root/member selection.
  * Refusal clears out; aliases leave all storage unchanged. A successful scan
- * does not freeze future births or check that required service roles exist. */
+ * requires every configured primary-profile service ordinal when shared
+ * configuration is enabled; it does not freeze future process births. */
 extern bool cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node_id,
 											  ClusterSharedConfigCensus *out);
 

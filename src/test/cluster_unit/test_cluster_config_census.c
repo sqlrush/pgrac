@@ -24,15 +24,18 @@ UT_DEFINE_GLOBALS();
 
 pid_t PostmasterPid = 120;
 bool Logging_collector = true;
+bool cluster_enabled, cluster_shared_config;
+bool cluster_lms_enabled = true, cluster_lmd_enabled = true;
+int cluster_lms_workers = 2;
 static PROC_HDR procs;
-static PGPROC processes[3];
+static PGPROC processes[64];
 PROC_HDR *ProcGlobal = &procs;
 static ClusterSharedConfigSlot logger;
 static ClusterSharedConfigRef target;
 static unsigned reads, allocations;
 static int mutate;
 static bool logger_missing;
-static bool allocated[3], snapshot_unavailable;
+static bool allocated[64], snapshot_unavailable;
 
 /* Native allocation is a boundary here; t/019 runs the real freelists. */
 bool
@@ -116,6 +119,7 @@ registration(ClusterSharedConfigSlot *slot, int pid, BackendType role)
 	pg_atomic_init_u64(&slot->sequence, 2);
 	slot->value.pid = pid;
 	slot->value.role = role;
+	slot->value.aux_type = NotAnAuxProcess;
 	slot->value.registration = 2;
 	slot->value.observed = true;
 	slot->value.process.ref = target;
@@ -133,6 +137,9 @@ setup(void)
 	memset(&procs, 0, sizeof(procs));
 	memset(processes, 0, sizeof(processes));
 	memset(allocated, 0, sizeof(allocated));
+	cluster_enabled = cluster_shared_config = false;
+	cluster_lms_enabled = cluster_lmd_enabled = true;
+	cluster_lms_workers = 2;
 	snapshot_unavailable = false;
 	memset(&target, 1, sizeof(target));
 	target.identity.configured[0] = 1;
@@ -148,7 +155,8 @@ setup(void)
 		processes[i].pid = 130 + i;
 		registration(&processes[i].cluster_config, 130 + i, B_BACKEND);
 	}
-	pg_atomic_init_u64(&processes[2].cluster_config.sequence, 0);
+	for (unsigned i = 2; i < lengthof(processes); ++i)
+		pg_atomic_init_u64(&processes[i].cluster_config.sequence, 0);
 	reads = 0;
 	mutate = 0;
 	logger_missing = false;
@@ -345,10 +353,114 @@ UT_TEST(profile_schema_and_counts_must_match)
 	UT_ASSERT_EQ(out.failed_processes, 1);
 	UT_ASSERT_EQ(out.static_mismatch_processes, 0);
 }
+
+/* Independent native roster fixture. Production must observe every exact
+ * configured ordinal; a duplicate display role cannot fill a missing one. */
+static unsigned
+service_setup(int workers, bool lmd)
+{
+	static const struct {
+		AuxProcType aux;
+		BackendType role;
+	} core[] = { { BgWriterProcess, B_BG_WRITER },
+				 { CheckpointerProcess, B_CHECKPOINTER },
+				 { WalWriterProcess, B_WAL_WRITER },
+				 { LmonProcess, B_LMON },
+				 { LckProcess, B_LCK },
+				 { CssdProcess, B_CSSD },
+				 { QvotecProcess, B_QVOTEC },
+				 { SinvalBcastProcess, B_SINVAL_BCAST },
+				 { LmsProcess, B_LMS } };
+	unsigned count = 2;
+	setup();
+	cluster_enabled = cluster_shared_config = true;
+	cluster_lms_workers = workers;
+	cluster_lmd_enabled = lmd;
+	for (unsigned i = 0; i < lengthof(core); ++i) {
+		registration(&processes[count].cluster_config, 200 + count, core[i].role);
+		processes[count++].cluster_config.value.aux_type = core[i].aux;
+	}
+	if (lmd) {
+		registration(&processes[count].cluster_config, 200 + count, B_LMD);
+		processes[count++].cluster_config.value.aux_type = LmdProcess;
+	}
+	for (int i = 1; i < workers; ++i) {
+		registration(&processes[count].cluster_config, 200 + count, B_LMS_WORKER);
+		processes[count++].cluster_config.value.aux_type = LmsWorker1Process + i - 1;
+	}
+	for (int i = 0; i < 8; ++i) {
+		registration(&processes[count].cluster_config, 200 + count, B_UNDO_CLEANER);
+		processes[count++].cluster_config.value.aux_type
+			= i == 0 ? UndoCleanerProcess : UndoCleanerWorker1Process + i - 1;
+	}
+	for (unsigned i = 2; i < count; ++i) {
+		allocated[i] = true;
+		processes[i].pid = 200 + i;
+	}
+	return count;
+}
+
+UT_TEST(configured_service_roster_not_live_subset)
+{
+	ClusterSharedConfigCensus out;
+	unsigned count = service_setup(2, true);
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.current_processes, 23);
+	for (unsigned i = 2; i < count; ++i) {
+		service_setup(2, true);
+		allocated[i] = false;
+		memset(&processes[i].cluster_config.value, 0, sizeof(ClusterSharedConfigRegistration));
+		refused();
+	}
+}
+UT_TEST(each_configured_worker_has_own_ordinal)
+{
+	for (int workers = 1; workers <= 8; workers *= 2) {
+		ClusterSharedConfigCensus out;
+		service_setup(workers, false);
+		UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+		UT_ASSERT_EQ(out.current_processes, 20 + workers);
+	}
+	unsigned count = service_setup(8, true);
+	/* Preserve the number of cleaners but duplicate worker6 for worker7. */
+	processes[count - 1].cluster_config.value.aux_type = UndoCleanerWorker6Process;
+	refused();
+	service_setup(8, true);
+	/* Both are LMS workers: role count alone cannot detect this missing worker2. */
+	processes[13].cluster_config.value.aux_type = LmsWorker1Process;
+	refused();
+}
+UT_TEST(service_identity_and_configuration_refuse)
+{
+	service_setup(2, true);
+	processes[2].cluster_config.value.role = B_BACKEND;
+	refused();
+	service_setup(2, true);
+	processes[0].cluster_config.value.aux_type = BgWriterProcess;
+	refused();
+	service_setup(2, true);
+	procs.cluster_config_postmaster.value.aux_type = LmonProcess;
+	refused();
+	service_setup(2, true);
+	logger.value.aux_type = LmonProcess;
+	refused();
+	service_setup(2, true);
+	cluster_lms_workers = 1; /* An unexpected configured-off worker is not evidence. */
+	refused();
+	service_setup(2, true);
+	cluster_lmd_enabled = false;
+	refused();
+	service_setup(2, true);
+	cluster_lms_enabled = false;
+	refused();
+	service_setup(2, true);
+	cluster_lms_workers = 9;
+	refused();
+}
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(17);
 	UT_RUN(all_actual_participants);
 	UT_RUN(parent_cannot_prove_old_child);
 	UT_RUN(failure_and_parallel_are_distinct);
@@ -363,6 +475,9 @@ main(void)
 	UT_RUN(active_profiles_are_independent_of_consumed_ref);
 	UT_RUN(invalidation_and_parent_unavailable_are_not_equality);
 	UT_RUN(profile_schema_and_counts_must_match);
+	UT_RUN(configured_service_roster_not_live_subset);
+	UT_RUN(each_configured_worker_has_own_ordinal);
+	UT_RUN(service_identity_and_configuration_refuse);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

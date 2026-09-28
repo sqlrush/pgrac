@@ -21,13 +21,17 @@
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
+/* Active primary-profile native census configuration. */
+bool cluster_lms_enabled = true, cluster_lmd_enabled = true;
+int cluster_lms_workers = 2;
+
 bool cluster_shared_config = true, cluster_enabled = true;
 int cluster_node_id = 0;
 bool IsUnderPostmaster = true;
 BackendType MyBackendType = B_LMON;
 pid_t PostmasterPid = 120;
 bool Logging_collector = true;
-static PGPROC processes[2];
+static PGPROC processes[32];
 static PROC_HDR procs;
 PROC_HDR *ProcGlobal = &procs;
 static ClusterSharedConfigProcess actual;
@@ -215,6 +219,8 @@ target(ClusterSharedConfigRegistration *value, int pid)
 {
 	memset(value, 0, sizeof(*value));
 	value->pid = pid;
+	value->role = B_BACKEND;
+	value->aux_type = NotAnAuxProcess;
 	value->registration = 2;
 	value->observed = true;
 	value->process = actual;
@@ -222,6 +228,40 @@ target(ClusterSharedConfigRegistration *value, int pid)
 	value->active.version = CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
 	value->active.static_entries = 1;
 	value->active.dynamic_entries = 1;
+}
+
+static void
+native_services(void)
+{
+	static const struct {
+		AuxProcType aux;
+		BackendType role;
+	} services[] = { { BgWriterProcess, B_BG_WRITER },
+					 { CheckpointerProcess, B_CHECKPOINTER },
+					 { WalWriterProcess, B_WAL_WRITER },
+					 { LmonProcess, B_LMON },
+					 { LckProcess, B_LCK },
+					 { CssdProcess, B_CSSD },
+					 { QvotecProcess, B_QVOTEC },
+					 { SinvalBcastProcess, B_SINVAL_BCAST },
+					 { LmsProcess, B_LMS },
+					 { LmdProcess, B_LMD },
+					 { LmsWorker1Process, B_LMS_WORKER },
+					 { UndoCleanerProcess, B_UNDO_CLEANER },
+					 { UndoCleanerWorker1Process, B_UNDO_CLEANER },
+					 { UndoCleanerWorker2Process, B_UNDO_CLEANER },
+					 { UndoCleanerWorker3Process, B_UNDO_CLEANER },
+					 { UndoCleanerWorker4Process, B_UNDO_CLEANER },
+					 { UndoCleanerWorker5Process, B_UNDO_CLEANER },
+					 { UndoCleanerWorker6Process, B_UNDO_CLEANER },
+					 { UndoCleanerWorker7Process, B_UNDO_CLEANER } };
+	for (unsigned i = 0; i < lengthof(services); ++i) {
+		PGPROC *proc = &processes[i + 1];
+		proc->pid = 201 + i;
+		target(&proc->cluster_config.value, proc->pid);
+		proc->cluster_config.value.role = services[i].role;
+		proc->cluster_config.value.aux_type = services[i].aux;
+	}
 }
 
 UT_TEST(select_and_deliver)
@@ -246,6 +286,8 @@ UT_TEST(lost_notification)
 UT_TEST(parent_does_not_prove_children)
 {
 	target(&procs.cluster_config_postmaster.value, PostmasterPid);
+	procs.cluster_config_postmaster.value.role = B_INVALID;
+	native_services();
 	target(&processes[0].cluster_config.value, 130);
 	processes[0].pid = 130;
 	processes[0].cluster_config.value.process.ref.identity.generation = 1;
