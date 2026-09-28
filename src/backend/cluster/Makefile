@@ -58,6 +58,7 @@ OBJS = \
 	cluster_shared_config_census.o \
 	cluster_config_members.o \
 	cluster_config_prefix.o \
+	cluster_config_channels.o \
 	cluster_control_root.o \
 	cluster_wal_history.o \
 	cluster_wal_tail.o \

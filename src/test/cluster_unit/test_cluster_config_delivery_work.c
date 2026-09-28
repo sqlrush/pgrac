@@ -682,10 +682,29 @@ UT_TEST(background_default_only_reload_is_allowed)
 	cluster_shared_config_background_end(true);
 }
 
+UT_TEST(channel_board_is_bound_to_native_family)
+{
+	int32 pid = -1;
+	reset();
+	UT_ASSERT(cluster_shared_config_delivery_channels(&pid) == &family.channels);
+	UT_ASSERT_EQ(pid, 0);
+	pg_atomic_write_u32(&family.lmon_pid, 102);
+	UT_ASSERT(cluster_shared_config_delivery_channels(&pid) == &family.channels);
+	UT_ASSERT_EQ(pid, 102);
+	delivery_generation++;
+	UT_ASSERT(cluster_shared_config_delivery_channels(&pid) == NULL);
+	UT_ASSERT_EQ(pid, 0);
+	delivery_generation--;
+	family.postmaster_pid++;
+	UT_ASSERT(cluster_shared_config_delivery_channels(&pid) == NULL);
+	UT_ASSERT_EQ(pid, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
+	UT_RUN(channel_board_is_bound_to_native_family);
 	UT_RUN(retained_admission_without_transaction_or_command);
 	UT_RUN(gcs_private_work_without_admission);
 	UT_RUN(invalid_gcs_owner_is_not_idle);

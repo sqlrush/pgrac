@@ -131,7 +131,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_config_delivery_route \
 		test_cluster_config_delivery_work \
 		test_cluster_background_config \
-		test_cluster_config_prefix test_cluster_config_prefix_transport \
+		test_cluster_config_prefix test_cluster_config_prefix_transport test_cluster_config_channels test_cluster_config_stream_retire \
 		test_cluster_config_census \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
@@ -438,6 +438,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_work,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_background_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_prefix test_cluster_config_prefix_transport,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_channels,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_stream_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_census,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
@@ -476,6 +478,21 @@ test_cluster_config_prefix: test_cluster_config_prefix.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: actual native-owner adapter with explicit process/transport fixtures.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_channels: test_cluster_config_channels.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_config_channels.c \
+		$(top_srcdir)/src/include/cluster/cluster_config_channels.h \
+		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: real native stream/FIFO/parser plus prefix and envelope production objects.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_stream_retire: test_cluster_config_stream_retire.c test_cluster_ic_tier1_partial.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: real native stream/FIFO/parser plus prefix and envelope production objects.
 # Author: SqlRush <sqlrush@gmail.com>

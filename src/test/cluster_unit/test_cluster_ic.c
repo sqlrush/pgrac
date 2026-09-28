@@ -1017,8 +1017,8 @@ UT_TEST(test_config_members_capability_profile)
 	/* Codec reservation is not an installed/armed native prefix service. */
 	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_CONFIG_PREFIX_V1, 0);
 	cluster_shared_config = true;
-	UT_ASSERT_EQ(cluster_ic_local_capability_word(),
-				 baseline | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1);
+	UT_ASSERT_EQ(cluster_ic_local_capability_word(), baseline | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1
+														 | PGRAC_IC_HELLO_CAP_CONFIG_PREFIX_V1);
 	cluster_shared_config = false;
 	UT_ASSERT_EQ(cluster_ic_local_capability_word(), baseline);
 }

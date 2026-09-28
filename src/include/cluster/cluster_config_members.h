@@ -57,6 +57,11 @@ extern bool cluster_config_members_encode(const ClusterConfigMembersMessage *mes
 extern bool cluster_config_members_decode(const void *bytes, Size length,
 										  ClusterConfigMembersMessage *out);
 
+/* Canonical local admitted-member key; output must not alias either input. */
+extern bool cluster_config_members_make_key(const ClusterSharedConfigRef *ref,
+											const ClusterR4MembershipSnapshot *members,
+											ClusterConfigMembersKey *key);
+
 /* LMON only, after actual CF selection/retirement at this member cut. One
  * observational round, retried by the existing delivery tick; no timeout ACK.
  * Does not freeze births, assignments or remote state after observation.

@@ -80,6 +80,7 @@
 #include "cluster/cluster_startup_exit.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_config_members.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h" /* cluster_hw_register_ic_msg_types (spec-5.7 D1) */
@@ -225,6 +226,7 @@ cluster_lmon_shmem_init(void)
 		if (cluster_shared_config) {
 			cluster_startup_exit_register();
 			cluster_config_members_register();
+			cluster_config_channels_register();
 		}
 		heartbeat_registered = true;
 	}

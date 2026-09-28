@@ -54,6 +54,7 @@
 #include "postgres.h"
 
 #include "cluster/cluster_conf.h" /* CLUSTER_MAX_NODES */
+#include "cluster/cluster_config_prefix.h"
 #include "cluster/cluster_ic.h"	  /* ClusterICOps type for stub */
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_rdma.h"
@@ -321,6 +322,14 @@ static ClusterICPlane router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
 static uint64 router_test_misroute_count = 0;
 static bool router_test_authority_managed = false;
 static bool router_test_serving_ready = false;
+static bool router_test_recovery_transport = false;
+bool cluster_shared_config = false;
+
+bool
+cluster_recovery_transport_is_current(void)
+{
+	return router_test_recovery_transport;
+}
 
 bool
 cluster_authority_readiness_managed(void)
@@ -642,6 +651,90 @@ UT_TEST(test_scheme_a_data_plane_requires_serving_ready)
 	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
 }
 
+/* Exercise the production router; the handler and byte transport are the
+ * boundaries here. Prefix identity validation has its own production suite. */
+static void
+prefix_route_setup(void)
+{
+	static bool registered;
+	const ClusterICMsgTypeInfo info = {
+		.msg_type = PGRAC_IC_MSG_CONFIG_PREFIX_DATA,
+		.name = "config-prefix-data",
+		.allowed_producer_mask = CLUSTER_IC_PRODUCER_LMS,
+		.broadcast_ok = false,
+		.handler = u22_no_op_handler,
+		.plane = CLUSTER_IC_PLANE_DATA,
+	};
+	if (!registered) {
+		cluster_ic_register_msg_type(&info);
+		registered = true;
+	}
+	router_test_my_plane = CLUSTER_IC_PLANE_DATA;
+	router_test_authority_managed = true;
+	router_test_serving_ready = false;
+	router_test_recovery_transport = true;
+	cluster_shared_config = true;
+	MyBackendType = B_LMS;
+	u22_handler_call_count = 0;
+	test_send_bytes_call_count = 0;
+	test_send_bytes_mock_result = CLUSTER_IC_SEND_DONE;
+}
+
+UT_TEST(config_prefix_can_coordinate_while_data_is_held)
+{
+	uint8 bytes[CLUSTER_CONFIG_PREFIX_BYTES] = { 0 };
+	ClusterICEnvelope env = { .msg_type = PGRAC_IC_MSG_CONFIG_PREFIX_DATA,
+		.source_node_id = 1, .dest_node_id = 7, .payload_length = sizeof(bytes) };
+	prefix_route_setup();
+	UT_ASSERT(cluster_ic_dispatch_envelope(&env, bytes, 1));
+	UT_ASSERT_EQ(u22_handler_call_count, 1);
+	UT_ASSERT_EQ(cluster_ic_send_envelope(env.msg_type, 6, bytes, sizeof(bytes)),
+				 CLUSTER_IC_SEND_DONE);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 1);
+}
+
+UT_TEST(config_prefix_does_not_bypass_transport_or_profile)
+{
+	uint8 bytes[CLUSTER_CONFIG_PREFIX_BYTES] = { 0 };
+	ClusterICEnvelope env = { .msg_type = PGRAC_IC_MSG_CONFIG_PREFIX_DATA,
+		.source_node_id = 1, .dest_node_id = 7, .payload_length = sizeof(bytes) };
+	prefix_route_setup();
+	for (int missing = 0; missing < 3; ++missing) {
+		router_test_recovery_transport = missing != 0;
+		cluster_shared_config = missing != 1;
+		env.payload_length = sizeof(bytes) - (missing == 2);
+		UT_ASSERT(cluster_ic_dispatch_envelope(&env, bytes, 1));
+		UT_ASSERT_EQ(cluster_ic_send_envelope(env.msg_type, 6, bytes, env.payload_length),
+					 CLUSTER_IC_SEND_HARD_ERROR);
+	}
+	UT_ASSERT_EQ(u22_handler_call_count, 0);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 0);
+}
+
+UT_TEST(config_prefix_is_not_an_ordinary_data_or_plane_bypass)
+{
+	ClusterICEnvelope env = { .msg_type = 44, .source_node_id = 1,
+		.dest_node_id = 7, .payload_length = 0 };
+	uint8 bytes[CLUSTER_CONFIG_PREFIX_BYTES] = { 0 };
+	uint64 misroutes;
+	prefix_route_setup();
+	MyBackendType = B_INVALID; /* Original type44 producer fixture. */
+	UT_ASSERT(cluster_ic_dispatch_envelope(&env, NULL, 1));
+	UT_ASSERT_EQ(cluster_ic_send_envelope(44, 6, NULL, 0), CLUSTER_IC_SEND_HARD_ERROR);
+	UT_ASSERT_EQ(u22_handler_call_count, 0);
+	UT_ASSERT_EQ(test_send_bytes_call_count, 0);
+	env.msg_type = PGRAC_IC_MSG_CONFIG_PREFIX_DATA;
+	env.payload_length = sizeof(bytes);
+	router_test_my_plane = CLUSTER_IC_PLANE_CONTROL;
+	misroutes = router_test_misroute_count;
+	UT_ASSERT(cluster_ic_dispatch_envelope(&env, bytes, 1));
+	UT_ASSERT_EQ(router_test_misroute_count, misroutes + 1);
+	UT_ASSERT_EQ(u22_handler_call_count, 0);
+	router_test_authority_managed = false;
+	router_test_recovery_transport = false;
+	cluster_shared_config = false;
+}
+
 
 /* ============================================================
  * spec-2.5 D2.5 fanout API tests (T-fanout-1 .. T-fanout-7).
@@ -860,7 +953,7 @@ cluster_lms_obs_note_dispatch(void)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
 
 	/* U6 register HEARTBEAT + count */
 	UT_RUN(test_u6_register_heartbeat_lmon_only);
@@ -880,6 +973,9 @@ main(void)
 	UT_RUN(test_u22_dispatch_rejects_broadcast_when_not_allowed);
 	UT_RUN(test_u22_dispatch_accepts_broadcast_when_allowed);
 	UT_RUN(test_scheme_a_data_plane_requires_serving_ready);
+	UT_RUN(config_prefix_can_coordinate_while_data_is_held);
+	UT_RUN(config_prefix_does_not_bypass_transport_or_profile);
+	UT_RUN(config_prefix_is_not_an_ordinary_data_or_plane_bypass);
 
 	/* T-fanout 1-8: spec-2.5 D2.5 fanout API */
 	UT_RUN(test_t_fanout_1_all_peers_down_writes_peer_down);

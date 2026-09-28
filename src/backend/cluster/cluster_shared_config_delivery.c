@@ -28,6 +28,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
@@ -55,6 +56,7 @@ typedef struct ConfigDeliveryFamily {
 	ClusterSharedConfigDeliverySlot incoming;
 	ClusterSharedConfigDeliverySlot accepted;
 	ClusterSharedConfigSlot logger;
+	ClusterConfigChannelsBoard channels;
 } ConfigDeliveryFamily;
 
 static ConfigDeliveryFamily *delivery_family;
@@ -108,6 +110,18 @@ cluster_shared_config_delivery_native_target(void)
 {
 	return cluster_shared_config_delivery_native_gate() != NULL ? &delivery_family->native_target
 																: NULL;
+}
+
+ClusterConfigChannelsBoard *
+cluster_shared_config_delivery_channels(int32 *lmon_pid)
+{
+	if (lmon_pid == NULL)
+		return NULL;
+	*lmon_pid = 0;
+	if (cluster_shared_config_delivery_native_gate() == NULL)
+		return NULL;
+	*lmon_pid = (int32)pg_atomic_read_u32(&delivery_family->lmon_pid);
+	return &delivery_family->channels;
 }
 
 ClusterConfigUseGate *
@@ -349,6 +363,7 @@ cluster_shared_config_delivery_start(void)
 	pg_atomic_init_u64(&delivery_family->generation, delivery_generation);
 	pg_atomic_init_u32(&delivery_family->lmon_pid, 0);
 	pg_atomic_init_u32(&delivery_family->logger_pid, 0);
+	cluster_config_channels_init(&delivery_family->channels);
 	cluster_config_use_gate_init(&delivery_family->native_use);
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
@@ -384,6 +399,7 @@ cluster_shared_config_delivery_new_shmem(void)
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	pg_atomic_write_u32(&delivery_family->lmon_pid, 0);
 	cluster_config_use_gate_init(&delivery_family->native_use);
+	cluster_config_channels_init(&delivery_family->channels);
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
 	pg_atomic_write_u32(&delivery_family->cleaner_failed, 0);

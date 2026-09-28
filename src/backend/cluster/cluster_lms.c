@@ -55,6 +55,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_lock_owner.h"
 
 #include <signal.h>
@@ -1299,6 +1300,8 @@ LmsMain(void)
 		PG_END_TRY();
 		if (cluster_lms_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 			ereport(FATAL, (errmsg_internal("LMS failed normal-stop responsibility check")));
+		/* PGRAC: coordination remains driven outside ordinary module work. */
+		cluster_config_channels_tick();
 		/* DATA tick owns separate management/dispatch brackets. Neither
 		 * its WaitEventSetWait nor this fallback may retain our active bit. */
 		if (cluster_lms_data_plane_enabled())
@@ -1475,6 +1478,7 @@ LmsWorkerMain(int worker_id)
 		PG_END_TRY();
 		if (cluster_lms_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 			ereport(FATAL, (errmsg_internal("LMS worker failed normal-stop responsibility check")));
+		cluster_config_channels_tick();
 		if (cluster_lms_data_plane_enabled())
 			cluster_lms_data_plane_tick(lms_wait_timeout_ms);
 		else {

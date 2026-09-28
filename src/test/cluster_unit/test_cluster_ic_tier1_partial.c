@@ -162,6 +162,20 @@ cluster_ic_hello_set_worker_fields(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint8 wo
 #define UT_PEER2_ID 5
 #define UT_LISTEN_BACKLOG 4
 
+/* Explicit configuration-consumer boundary. Its actual report invalidation
+ * has a separate production-C adapter test. Record the pre-retirement stamp
+ * so the native transport test can prove callback ordering without a socket. */
+static unsigned ut_config_retire_calls;
+static int32 ut_config_retire_peer;
+static uint64 ut_config_retire_serial;
+void
+cluster_config_channels_stream_retiring(int32 peer)
+{
+	ut_config_retire_calls++;
+	ut_config_retire_peer = peer;
+	ut_config_retire_serial = tier1_stream_serial[peer < 0 ? UT_PEER_ID : peer];
+}
+
 static ClusterNodeInfo ut_peer_info;
 static bool ut_peer_declared = false;
 static ClusterNodeInfo ut_peer2_info;

@@ -24,6 +24,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_config_members.h"
+#include "cluster/cluster_config_channels.h"
 
 static bool selection_pending;
 static ClusterR4MembershipSnapshot selection_members;
@@ -58,6 +59,7 @@ cluster_shared_config_delivery_lmon_cancel(void)
 	cluster_shared_config_free(&selected_image);
 	cluster_control_root_config_cancel();
 	cluster_config_members_cancel();
+	cluster_config_channels_cancel();
 	selection_pending = false;
 	memset(&selection_members, 0, sizeof(selection_members));
 	next_probe = 0;
@@ -138,6 +140,9 @@ cluster_shared_config_delivery_lmon_tick(void)
 		return;
 	}
 	now = GetCurrentTimestamp();
+	/* Prefix traffic progresses independently of the paced CF selection probe.
+	 * Its real owner invalidates retained reports before ERROR unwinds. */
+	cluster_config_channels_tick();
 	/* Scheduling, not a proof/expiry/deadline. A pending exact CF request is
 	 * driven every tick; a backward clock step cannot strand maintenance. */
 	if (!selection_pending && now < next_probe && next_probe - now <= INT64CONST(1000000))

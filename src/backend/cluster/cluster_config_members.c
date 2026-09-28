@@ -245,9 +245,10 @@ cluster_config_members_decode(const void *bytes, Size length, ClusterConfigMembe
 	return true;
 }
 
-static bool
-make_key(const ClusterSharedConfigRef *ref, const ClusterR4MembershipSnapshot *members,
-		 ClusterConfigMembersKey *key)
+bool
+cluster_config_members_make_key(const ClusterSharedConfigRef *ref,
+								const ClusterR4MembershipSnapshot *members,
+								ClusterConfigMembersKey *key)
 {
 	static const uint8 domain[] = "PGRAC config admitted incarnations v1";
 	pg_sha256_ctx hash;
@@ -290,7 +291,7 @@ round_current(void)
 	ClusterConfigMembersKey key;
 	if (!local_role() || !member_round.active
 		|| !cluster_reconfig_lmon_snapshot_r4_membership(&members)
-		|| !make_key(&member_round.report.key.ref, &members, &key)
+		|| !cluster_config_members_make_key(&member_round.report.key.ref, &members, &key)
 		|| memcmp(&key, &member_round.report.key, sizeof(key)) != 0)
 		return false;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node)
@@ -368,8 +369,10 @@ cluster_config_members_poll(const ClusterSharedConfigRef *selected,
 	ClusterICTier1Stream stream[CLUSTER_MAX_NODES] = { 0 };
 	if (!local_role())
 		return;
-	if (!make_key(selected, members, &key) || !cluster_reconfig_lmon_snapshot_r4_membership(&fresh)
-		|| !make_key(selected, &fresh, &current) || memcmp(&key, &current, sizeof(key)) != 0)
+	if (!cluster_config_members_make_key(selected, members, &key)
+		|| !cluster_reconfig_lmon_snapshot_r4_membership(&fresh)
+		|| !cluster_config_members_make_key(selected, &fresh, &current)
+		|| memcmp(&key, &current, sizeof(key)) != 0)
 		goto unavailable;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
 		uint32 word;

@@ -13,6 +13,7 @@
 #include "postmaster/syslogger.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_config_members.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_reconfig.h"
@@ -44,6 +45,19 @@ static ClusterR4MembershipSnapshot members;
 static bool members_available = true;
 static int change_during_poll;
 static unsigned member_polls, member_cancels;
+static unsigned channel_ticks, channel_cancels;
+
+/* Native channel adapter is tested separately with real prefix exchanges. */
+void
+cluster_config_channels_tick(void)
+{
+	channel_ticks++;
+}
+void
+cluster_config_channels_cancel(void)
+{
+	channel_cancels++;
+}
 
 void
 cluster_config_members_poll(const ClusterSharedConfigRef *ref,
@@ -494,11 +508,30 @@ UT_TEST(missing_common_observation_still_requests_delivery)
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT_EQ(sends, before + 1);
 }
+UT_TEST(channels_run_without_waiting_for_next_cf_probe)
+{
+	unsigned ticks, cancellations;
+	cluster_shared_config_delivery_lmon_cancel();
+	stop = leaving = busy = publication_error = false;
+	publication = true;
+	members_available = true;
+	change_during_poll = 0;
+	seed_members();
+	cluster_shared_config_delivery_lmon_tick();
+	ticks = channel_ticks;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(channel_ticks, ticks + 1);
+	cancellations = channel_cancels;
+	stop = true;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(channel_cancels, cancellations + 1);
+}
+
 int
 main(void)
 {
 	seed_members();
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(select_and_deliver);
 	UT_RUN(lost_notification);
 	UT_RUN(parent_does_not_prove_children);
@@ -514,6 +547,7 @@ main(void)
 	UT_RUN(observation_refresh_is_not_member_change);
 	UT_RUN(legal_overlay_needs_no_common_delivery);
 	UT_RUN(missing_common_observation_still_requests_delivery);
+	UT_RUN(channels_run_without_waiting_for_next_cf_probe);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
