@@ -17,5 +17,5 @@ tests += {
                     't/006_native_entry_guard.pl', 't/007_control_image.pl',
                     't/008_recovery_capacity.pl', 't/009_bootstrap_native.pl',
                     't/010_wal_publish_native.pl', 't/011_wal_history_native.pl',
-                    't/012_config_change.pl']},
+                    't/012_config_change.pl', 't/013_config_reload.pl']},
 }

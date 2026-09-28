@@ -248,4 +248,30 @@ cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
 								   ClusterSharedConfigPublication *out,
 								   ClusterSharedConfigPolicyReport *report);
 
+/* PGRAC: process-local reload result, NOT a node/cluster application ACK.
+ * A selected newer generation may skip intermediates; equal generation must
+ * have equal bytes/hash. Native FILE source precedence and SET/SET LOCAL are
+ * preserved. Counts describe this old->new operation, NOT cumulative readiness.
+ * Pending/deferred entries are NOT active new values. A later diff reporting
+ * zero cannot retire a prior restart/deferred obligation; the owner must keep
+ * that obligation until actual process restart/application. The caller
+ * owns root revalidation and admission; a failure may follow native assignments
+ * and clears out without pretending to undo them. Inputs/outputs must not alias.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigReload {
+	ClusterSharedConfigRef old_ref;
+	ClusterSharedConfigRef ref;
+	uint32 node_id;
+	uint32 applied_entries;
+	uint32 removed_entries;
+	uint32 pending_restart_entries;
+	uint32 deferred_entries;
+} ClusterSharedConfigReload;
+
+extern ClusterControlRootResult cluster_shared_config_apply_reload(
+	const char *old_bytes, size_t old_len, const ClusterSharedConfigRef *old_ref,
+	const char *new_bytes, size_t new_len, const ClusterSharedConfigRef *new_ref, int node_id,
+	ClusterSharedConfigReload *out, ClusterSharedConfigPolicyReport *report);
+
 #endif

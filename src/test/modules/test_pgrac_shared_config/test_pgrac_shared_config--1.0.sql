@@ -52,3 +52,7 @@ CREATE FUNCTION test_pgrac_wal_history_native()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_wal_history_native'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_wal_history_native() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_reload(text, text, integer, text)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_reload'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_reload(text, text, integer, text) FROM PUBLIC;

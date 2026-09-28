@@ -11,6 +11,7 @@
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
+#include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "cluster_control_root_private.h"
 
@@ -693,4 +694,235 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 	out->ref = *ref;
 	out->node_id = node_id;
 	out->applied_entries = context.applied;
+}
+
+/* PGRAC: native online application only. The distributed owner must separately
+ * select/revalidate the root, close admission and collect all process outcomes.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ConfigReloadItem {
+	ClusterSharedConfigEntry entry;
+	bool removed;
+} ConfigReloadItem;
+
+typedef struct ConfigReloadList {
+	ConfigReloadItem *items;
+	uint32 count;
+	ConfigPolicyContext policy;
+} ConfigReloadList;
+
+static ClusterControlRootResult
+reload_collect(const ClusterSharedConfigEntry *entry, void *arg)
+{
+	ConfigReloadList *list = arg;
+	ClusterControlRootResult result = policy_visit(entry, &list->policy);
+	ConfigReloadItem *item;
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (list->count >= CLUSTER_SHARED_CONFIG_MAX_ENTRIES)
+		return policy_refuse(list->policy.report, entry, CLUSTER_CONFIG_POLICY_FORMAT);
+	item = &list->items[list->count++];
+	item->entry.node_id = entry->node_id;
+	item->entry.name = pstrdup(entry->name);
+	item->entry.value = pstrdup(entry->value);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static int
+reload_key_compare(const ClusterSharedConfigEntry *a, const ClusterSharedConfigEntry *b)
+{
+	if (a->node_id != b->node_id)
+		return a->node_id < b->node_id ? -1 : 1;
+	return strcmp(a->name, b->name);
+}
+
+static bool
+reload_selected(const ClusterSharedConfigEntry *entry, int node_id)
+{
+	return entry->node_id == CLUSTER_SHARED_CONFIG_COMMON || entry->node_id == node_id;
+}
+
+static ClusterControlRootResult
+reload_diff(ConfigReloadList *old, ConfigReloadList *next, ClusterSharedConfigPolicyReport *report)
+{
+	uint32 a = 0, b = 0;
+	/* Canonical keys are ordered common, then fixed-width instance id, name.
+	 * One merge pass validates ALL changes/deletions before any assignment;
+	 * do not hash and search the whole MiB-sized image once for every key. */
+	while (a < old->count || b < next->count) {
+		ConfigReloadItem *x = a < old->count ? &old->items[a] : NULL;
+		ConfigReloadItem *y = b < next->count ? &next->items[b] : NULL;
+		const ClusterSharedConfigEntry *changed = NULL;
+		int order = x == NULL ? 1 : y == NULL ? -1 : reload_key_compare(&x->entry, &y->entry);
+		if (order < 0) {
+			x->removed = true;
+			changed = &x->entry;
+			++a;
+		} else if (order > 0) {
+			changed = &y->entry;
+			++b;
+		} else {
+			if (strcmp(x->entry.value, y->entry.value) != 0)
+				changed = &y->entry;
+			++a;
+			++b;
+		}
+		if (changed != NULL) {
+			ClusterControlRootResult result = policy_check(changed, true, true, report);
+			if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+				return result;
+		}
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+reload_assign(ConfigReloadList *old, ConfigReloadList *next, int node_id,
+			  ClusterSharedConfigReload *applied, ClusterSharedConfigPolicyReport *report)
+{
+	for (uint32 i = 0; i < old->count; ++i) {
+		ConfigReloadItem *item = &old->items[i];
+		if (!item->removed || !reload_selected(&item->entry, node_id))
+			continue;
+		switch (ClusterResetConfigFileSetting(item->entry.name)) {
+		case GUC_FILE_RESET_DONE:
+			++applied->removed_entries;
+			break;
+		case GUC_FILE_RESET_PENDING_RESTART:
+			++applied->pending_restart_entries;
+			break;
+		case GUC_FILE_RESET_DEFERRED:
+			++applied->deferred_entries;
+			break;
+		default:
+			return policy_refuse(report, &item->entry, CLUSTER_CONFIG_POLICY_VALUE);
+		}
+	}
+	/* Same ordering as ProcessConfigFile: remove FILE values, restore native
+	 * environment/dynamic defaults, then overlay the selected FILE entries. */
+	ClusterRestoreConfigFileDefaults();
+	for (uint32 i = 0; i < next->count; ++i) {
+		ClusterSharedConfigEntry *entry = &next->items[i].entry;
+		struct config_generic *record;
+		int result;
+		if (!reload_selected(entry, node_id))
+			continue;
+		record = find_option(entry->name, false, true, DEBUG1);
+		if (record == NULL)
+			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_UNKNOWN);
+		result = set_config_option_ext(entry->name, entry->value, PGC_SIGHUP, PGC_S_FILE,
+									   BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, true, DEBUG1, false);
+		if (record->context == PGC_POSTMASTER && (record->status & GUC_PENDING_RESTART)) {
+			++applied->pending_restart_entries;
+			continue;
+		}
+		if (result == 0)
+			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_VALUE);
+		if (IsUnderPostmaster
+			&& (record->context == PGC_BACKEND || record->context == PGC_SU_BACKEND))
+			++applied->deferred_entries;
+		else
+			++applied->applied_entries;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static bool
+reload_overlap(const void *a, size_t na, const void *b, size_t nb)
+{
+	uintptr_t x = (uintptr_t)a, y = (uintptr_t)b;
+	if (a == NULL || b == NULL || na == 0 || nb == 0)
+		return false;
+	return x <= y ? y - x < na : x - y < nb;
+}
+
+ClusterControlRootResult
+cluster_shared_config_apply_reload(const char *old_bytes, size_t old_len,
+								   const ClusterSharedConfigRef *old_ref, const char *new_bytes,
+								   size_t new_len, const ClusterSharedConfigRef *new_ref,
+								   int node_id, ClusterSharedConfigReload *out,
+								   ClusterSharedConfigPolicyReport *report)
+{
+	ClusterSharedConfigIdentity same;
+	ClusterControlRootResult result;
+	ClusterSharedConfigReload applied = { 0 };
+	ConfigReloadList old, next;
+	MemoryContext saved_context = CurrentMemoryContext, context;
+	ResourceOwner saved_owner = CurrentResourceOwner, owner;
+	const void *inputs[] = { old_bytes, old_ref, new_bytes, new_ref };
+	size_t sizes[] = { old_len, sizeof(*old_ref), new_len, sizeof(*new_ref) };
+
+	/* Reject carrier aliasing BEFORE clearing the caller's old reference. */
+	if (reload_overlap(out, sizeof(*out), report, sizeof(*report)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	for (size_t i = 0; i < lengthof(inputs); ++i)
+		if (reload_overlap(inputs[i], sizes[i], out, sizeof(*out))
+			|| reload_overlap(inputs[i], sizes[i], report, sizeof(*report)))
+			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (report == NULL)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	policy_clear(report);
+	if (out == NULL || old_ref == NULL || new_ref == NULL || node_id < 0
+		|| node_id >= CLUSTER_CONTROL_ROOT_RECORD_COUNT
+		|| !(new_ref->identity.configured[node_id / 64] & (UINT64CONST(1) << (node_id % 64))))
+		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_FORMAT);
+	same = old_ref->identity;
+	same.generation = new_ref->identity.generation;
+	if (memcmp(&same, &new_ref->identity, sizeof(same)) != 0
+		|| new_ref->identity.generation < old_ref->identity.generation
+		|| (new_ref->identity.generation == old_ref->identity.generation
+			&& memcmp(old_ref->sha256, new_ref->sha256, 32) != 0))
+		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_FORMAT);
+
+	context = AllocSetContextCreate(saved_context, "shared configuration reload",
+									ALLOCSET_DEFAULT_SIZES);
+	owner = ResourceOwnerCreate(saved_owner, "shared configuration reload");
+	CurrentResourceOwner = owner;
+	MemoryContextSwitchTo(context);
+	PG_TRY();
+	{
+		old = (ConfigReloadList){ palloc0(sizeof(ConfigReloadItem)
+										  * CLUSTER_SHARED_CONFIG_MAX_ENTRIES),
+								  0,
+								  { report, old_ref, true } };
+		next = (ConfigReloadList){ palloc0(sizeof(ConfigReloadItem)
+										   * CLUSTER_SHARED_CONFIG_MAX_ENTRIES),
+								   0,
+								   { report, new_ref, true } };
+		result = cluster_shared_config_visit(old_bytes, old_len, old_ref, reload_collect, &old);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result
+				= cluster_shared_config_visit(new_bytes, new_len, new_ref, reload_collect, &next);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && report->reason == CLUSTER_CONFIG_POLICY_OK)
+			report->reason = CLUSTER_CONFIG_POLICY_FORMAT;
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = reload_diff(&old, &next, report);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = reload_assign(&old, &next, node_id, &applied, report);
+		/* Native hooks may depend on other settings. Validate again against the
+		 * actual new context; neither a partial apply nor pending restart proves
+		 * a simultaneously usable deployment profile. */
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cluster_shared_config_check_gucs(new_bytes, new_len, new_ref, report);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(saved_context);
+		startup_config_release(owner, saved_owner, false);
+		MemoryContextDelete(context);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(saved_context);
+	startup_config_release(owner, saved_owner, result == CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	MemoryContextDelete(context);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		applied.old_ref = *old_ref;
+		applied.ref = *new_ref;
+		applied.node_id = node_id;
+		*out = applied;
+	}
+	return result;
 }

@@ -31,6 +31,7 @@ PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(test_pgrac_config_entry);
 PG_FUNCTION_INFO_V1(test_pgrac_config_object);
 PG_FUNCTION_INFO_V1(test_pgrac_config_change);
+PG_FUNCTION_INFO_V1(test_pgrac_config_reload);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
@@ -396,14 +397,15 @@ bootstrap_test_prepare(void)
  * and application. No fake native process identity or mutable engine flags.
  */
 static char *
-application_fixture(const char *body, ClusterSharedConfigRef *ref, size_t *len)
+application_fixture_generation(const char *body, uint64 generation, ClusterSharedConfigRef *ref,
+							   size_t *len)
 {
 	char *bytes = palloc(CLUSTER_SHARED_CONFIG_MAX_BYTES);
 	pg_cryptohash_ctx *ctx;
 	memset(ref, 0, sizeof(*ref));
 	ref->identity.system_identifier = 1234;
 	ref->identity.database_incarnation = 1;
-	ref->identity.generation = 1;
+	ref->identity.generation = generation;
 	ref->identity.configured[0] = 3;
 	memset(ref->identity.storage_uuid, 1, 16);
 	memset(ref->identity.authority_uuid, 2, 16);
@@ -420,6 +422,36 @@ application_fixture(const char *body, ClusterSharedConfigRef *ref, size_t *len)
 		ereport(ERROR, (errmsg("test application digest failed")));
 	pg_cryptohash_free(ctx);
 	return bytes;
+}
+
+static char *
+application_fixture(const char *body, ClusterSharedConfigRef *ref, size_t *len)
+{
+	return application_fixture_generation(body, 1, ref, len);
+}
+
+static ClusterControlRootResult
+reload_seed(const ClusterSharedConfigEntry *entry, void *arg)
+{
+	int node_id = *(int *)arg;
+	if (entry->node_id != -1 && entry->node_id != node_id)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	/* This is only setup in a disposable backend; use actual SIGHUP semantics,
+	 * never pretend to be a postmaster to install an otherwise forbidden value.
+	 * Cold negative fixtures use the real immutable node id. */
+	(void)set_config_option(entry->name, entry->value, PGC_SIGHUP, PGC_S_FILE, GUC_ACTION_SET, true,
+							DEBUG1, false);
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static int reload_test_value;
+
+/* Real registered assign-hook failure; exists only in this test extension. */
+static void
+reload_test_assign(int value, void *extra)
+{
+	if (value == 2)
+		ereport(ERROR, (errmsg("test native reload assignment failure")));
 }
 #endif
 
@@ -979,6 +1011,91 @@ test_pgrac_config_change(PG_FUNCTION_ARGS)
 	}
 #else
 	ereport(ERROR, (errmsg("configuration change requires cluster build")));
+	PG_RETURN_NULL();
+#endif
+}
+
+/* PGRAC: actual backend reload and GUC stacks, no activation/ACK substitution.
+ * Author: SqlRush <sqlrush@gmail.com> */
+Datum
+test_pgrac_config_reload(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test configuration reload requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigRef old_ref, new_ref;
+		ClusterSharedConfigReload applied;
+		ClusterSharedConfigPolicyReport report;
+		ClusterControlRootResult result;
+		char *old_bytes, *new_bytes;
+		size_t old_len, new_len;
+		int node_id = PG_GETARG_INT32(2);
+		char *fault = text_to_cstring(PG_GETARG_TEXT_PP(3));
+		ResourceOwner saved_owner = CurrentResourceOwner;
+		MemoryContext saved_context = CurrentMemoryContext;
+		volatile bool threw = false;
+		if (strcmp(fault, "assign") == 0)
+			DefineCustomIntVariable(
+				"cluster.native_config_reload_failure", "Disposable native assignment failure.",
+				NULL, &reload_test_value, 0, 0, 2, PGC_SIGHUP, 0, NULL, reload_test_assign, NULL);
+		old_bytes = application_fixture_generation(text_to_cstring(PG_GETARG_TEXT_PP(0)),
+												   strcmp(fault, "backwards") == 0 ? 4 : 1,
+												   &old_ref, &old_len);
+		new_bytes = application_fixture_generation(text_to_cstring(PG_GETARG_TEXT_PP(1)),
+												   strcmp(fault, "equal") == 0 ? 1 : 3, &new_ref,
+												   &new_len);
+		if (cluster_shared_config_visit(old_bytes, old_len, &old_ref, reload_seed, &node_id) != 0)
+			ereport(ERROR, (errmsg("invalid old reload fixture")));
+		if (strcmp(fault, "session") == 0 || strcmp(fault, "local") == 0)
+			(void)set_config_option("work_mem", "21MB", PGC_USERSET, PGC_S_SESSION,
+									strcmp(fault, "local") == 0 ? GUC_ACTION_LOCAL : GUC_ACTION_SET,
+									true, ERROR, false);
+		if (strcmp(fault, "oldhash") == 0)
+			old_ref.sha256[0] ^= 1;
+		if (strcmp(fault, "newhash") == 0)
+			new_ref.sha256[0] ^= 1;
+		memset(&applied, 0xa5, sizeof(applied));
+		PG_TRY();
+		{
+			result
+				= cluster_shared_config_apply_reload(old_bytes, old_len, &old_ref, new_bytes,
+													 new_len, &new_ref, node_id, &applied, &report);
+		}
+		PG_CATCH();
+		{
+			ErrorData *error;
+			MemoryContextSwitchTo(saved_context);
+			if (strcmp(fault, "assign") != 0)
+				PG_RE_THROW();
+			error = CopyErrorData();
+			if (strcmp(error->message, "test native reload assignment failure") != 0)
+				PG_RE_THROW();
+			FreeErrorData(error);
+			FlushErrorState();
+			threw = true;
+		}
+		PG_END_TRY();
+		if (threw) {
+			result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+			report.reason = CLUSTER_CONFIG_POLICY_VALUE;
+		}
+		if (CurrentResourceOwner != saved_owner || CurrentMemoryContext != saved_context)
+			ereport(ERROR, (errmsg("reload leaked its native owner or memory context")));
+		if (result != 0
+			&& memcmp(&applied, &(ClusterSharedConfigReload){ 0 }, sizeof(applied)) != 0)
+			ereport(ERROR, (errmsg("failed reload exposed an application receipt")));
+		if (result == 0
+			&& (memcmp(&applied.old_ref, &old_ref, sizeof(old_ref)) != 0
+				|| memcmp(&applied.ref, &new_ref, sizeof(new_ref)) != 0
+				|| applied.node_id != node_id))
+			ereport(ERROR, (errmsg("reload application receipt is not exact")));
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+			"%d:%u:%u:%u:%u:%u", result == 0, report.reason, applied.applied_entries,
+			applied.removed_entries, applied.pending_restart_entries, applied.deferred_entries)));
+	}
+#else
+	ereport(ERROR, (errmsg("configuration reload requires cluster build")));
 	PG_RETURN_NULL();
 #endif
 }
