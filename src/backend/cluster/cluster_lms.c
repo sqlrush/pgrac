@@ -56,6 +56,7 @@
 #include "postgres.h"
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_config_channels.h"
+#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_lock_owner.h"
 
 #include <signal.h>
@@ -1002,67 +1003,28 @@ ClusterNormalStopPollResult
 cluster_lms_normal_stop_idle(void)
 {
 	static TimestampTz last_pending_log;
-	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
-	const char *first_reason = "NONE";
-	const char *first_domain = "NONE";
-	int first_slot = -1;
+	ClusterNormalStopPollResult aggregate;
+	ClusterServiceObservation observation;
 
 	if (!cluster_normal_stop_requested())
 		return CLUSTER_NORMAL_STOP_READY;
-	/* Every poll runs in the real owner outside a work bracket/leave lock.
-	 * Do not let an earlier PENDING hide a later malformed responsibility. */
-	for (int module = 0; module < 5; module++) {
-		ClusterNormalStopPollResult result;
-		const char *reason = "NONE";
-		const char *domain = "NONE";
-		int slot = -1;
-		int worker = -1;
-		uint32 position = 0;
-
-		switch (module) {
-		case 0:
-			domain = "CR";
-			result = cluster_cr_server_normal_stop_poll(&slot, &reason);
-			break;
-		case 1:
-			domain = "NATIVE_PROBE";
-			result = cluster_lms_native_probe_normal_stop_poll(&slot, &reason);
-			break;
-		case 2:
-			domain = "GCS_LOCAL";
-			result = cluster_gcs_block_normal_stop_local_poll(&slot, &reason);
-			break;
-		case 3:
-			domain = "OUTBOUND";
-			result = cluster_lms_outbound_normal_stop_poll(&worker, &position, &reason);
-			slot = worker;
-			break;
-		default:
-			result = cluster_ic_normal_stop_poll(&domain, &slot, &position, &reason);
-			break;
-		}
-		if ((result == CLUSTER_NORMAL_STOP_INVALID && aggregate != CLUSTER_NORMAL_STOP_INVALID)
-			|| (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)) {
-			aggregate = result;
-			first_reason = reason;
-			first_domain = domain;
-			first_slot = slot;
-		}
-	}
+	/* PGRAC: original module observations are also usable online, without
+	 * borrowing this wrapper's stop-request shortcut or one-way seal. */
+	aggregate = cluster_service_normal_stop_observe(&observation);
 	if (aggregate == CLUSTER_NORMAL_STOP_PENDING) {
 		TimestampTz now = GetCurrentTimestamp();
 		if (last_pending_log == 0 || now - last_pending_log >= INT64CONST(1000000)) {
 			last_pending_log = now;
 			ereport(LOG, (errmsg_internal("LMS normal-stop responsibility pending"),
 						  errdetail("aux=%d domain=%s slot=%d reason=%s", (int)MyAuxProcType,
-									first_domain, first_slot, first_reason)));
+									observation.domain, observation.slot, observation.reason)));
 		}
 	}
 	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
-		ereport(LOG,
-				(errmsg_internal("LMS normal-stop responsibility invalid"),
-				 errdetail("domain=%s slot=%d reason=%s", first_domain, first_slot, first_reason)));
+		ereport(LOG, (errmsg_internal("LMS normal-stop responsibility invalid"),
+					  errdetail("domain=%s slot=%d reason=%s", observation.domain, observation.slot,
+								observation.reason)));
 	}
 	return cluster_normal_stop_service_idle(aggregate);
 }

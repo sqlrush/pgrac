@@ -130,6 +130,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_config_delivery_driver \
 		test_cluster_config_delivery_route \
 		test_cluster_config_delivery_work \
+		test_cluster_service_observe \
 		test_cluster_background_config \
 		test_cluster_config_prefix test_cluster_config_prefix_transport test_cluster_config_channels test_cluster_config_stream_retire \
 		test_cluster_config_census \
@@ -436,6 +437,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_work,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_background_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_prefix test_cluster_config_prefix_transport,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_channels,$(SIMPLE_TESTS))
@@ -478,6 +480,18 @@ test_cluster_config_prefix: test_cluster_config_prefix.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: actual native-owner adapter with explicit process/transport fixtures.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_service_observe: test_cluster_service_observe.c unit_test.h \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: role-specific original-loop tests abort on unprovided module boundaries.
+# Author: SqlRush <sqlrush@gmail.com>
+cluster_unit_service_stubs.o: cluster_unit_service_stubs.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
 
 # PGRAC: actual native-owner adapter with explicit process/transport fixtures.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -953,12 +967,14 @@ test_cluster_normal_stop_lms.inc: $(top_srcdir)/src/backend/cluster/cluster_lms.
 	mv $@.tmp $@
 
 test_cluster_normal_stop: test_cluster_normal_stop.c test_cluster_normal_stop_cleaner.inc test_cluster_normal_stop_sinval.inc test_cluster_normal_stop_lms.inc unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_service_observe.c cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_clean_leave.c \
 		$(top_srcdir)/src/backend/cluster/cluster_control_root_private.h \
 		$(top_srcdir)/src/backend/cluster/cluster_lms_data_plane.c \
 		$(top_srcdir)/src/include/cluster/cluster_clean_leave.h $(CLUSTER_CLEAN_LEAVE_POLICY_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_CLEAN_LEAVE_POLICY_O) \
+		cluster_unit_service_stubs.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(CLUSTER_UNDO_TEST_GC_SECTIONS) -o $@
@@ -2746,10 +2762,12 @@ test_cluster_lmon_stop_service.inc: $(top_srcdir)/src/backend/cluster/cluster_cl
 	mv $@.tmp $@
 
 test_cluster_lmon: test_cluster_lmon.c unit_test.h test_cluster_lmon_stop_service.inc \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
 		$(top_srcdir)/src/backend/cluster/cluster_grd_outbound.c \
 		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) -o $@
+		$(CLUSTER_VERSION_O) $(CLUSTER_LMON_O) \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o -o $@
 
 # test_cluster_lck links cluster_lck.o standalone (spec-1.12 Sprint A).
 # Mirrors test_cluster_lmon pattern: cluster_lck.c references shmem /
@@ -3171,9 +3189,11 @@ test_cluster_lmd_pending.inc: $(top_srcdir)/src/backend/cluster/cluster_lmd_tarj
 	mv $@.tmp $@
 
 test_cluster_lmd: test_cluster_lmd.c test_cluster_lmd_pending.inc test_cluster_lmon_stop_service.inc unit_test.h \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
 		$(CLUSTER_VERSION_O) $(top_srcdir)/src/backend/cluster/cluster_lmd.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/backend/cluster/cluster_service_observe.o cluster_unit_service_stubs.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 

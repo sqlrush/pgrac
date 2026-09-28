@@ -55,6 +55,9 @@
 #include "storage/ipc.h"
 #include "postmaster/auxprocess.h"
 #include "utils/elog.h"
+#include "cluster/cluster_config_channels.h"
+#include "cluster/cluster_config_members.h"
+#include "cluster/cluster_shared_config.h"
 
 #undef printf
 #undef fprintf
@@ -115,6 +118,21 @@ static unsigned test_stop_lock_depth;
 static ClusterNormalStopPollResult test_stop_observation[21];
 bool cluster_shared_config;
 static unsigned test_control_owner_polls;
+
+/* Configuration coordination has separate real driver/channel tests. This
+ * original-stop fixture has no selected image or channel command. */
+void
+cluster_config_members_register(void)
+{}
+void
+cluster_config_channels_register(void)
+{}
+void
+cluster_shared_config_delivery_lmon_tick(void)
+{}
+void
+cluster_shared_config_delivery_lmon_cancel(void)
+{}
 
 void
 cluster_cf_retirement_poll(void)

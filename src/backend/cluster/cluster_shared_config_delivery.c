@@ -33,6 +33,7 @@
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_terminal_ref_census.h"
 
@@ -313,6 +314,7 @@ delivery_has_owned_work(void)
 {
 	int slot;
 	const char *reason;
+	ClusterServiceObservation service;
 
 	if (delivery_work_depth != 0 || delivery_cleaner_owned
 		|| delivery_background_owned != CLUSTER_CONFIG_BACKGROUND_COUNT || IsTransactionState()
@@ -325,6 +327,13 @@ delivery_has_owned_work(void)
 	if (AmLmsProcess() && !cluster_cr_server_r4_worker0_drained())
 		return true;
 	if (AmUndoCleanerProcess() && !cluster_ctrc_cleaner_local_idle())
+		return true;
+	/* Private contexts being empty does not retire already accepted shared
+	 * queues or original control owners. This is a local deferral condition;
+	 * an online all-member cut still has to hold producers and drain channels. */
+	if ((AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess() || AmLmdProcess()
+		 || AmSinvalBcastProcess())
+		&& cluster_service_observe(&service) != CLUSTER_NORMAL_STOP_READY)
 		return true;
 	return false;
 }

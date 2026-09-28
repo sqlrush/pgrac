@@ -82,6 +82,7 @@
 
 #include "cluster/cluster_cancel_token.h"
 #include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
@@ -1146,36 +1147,13 @@ cluster_lmd_run_coordinator_tick(void)
 static ClusterNormalStopPollResult
 LmdNormalStopPoll(void)
 {
-	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
-	for (int i = 0; i < 4; i++) {
-		ClusterNormalStopPollResult result;
-		const char *domain = "LMD", *reason = "LMD_OBSERVATION_MISSING";
-		uint64 key = 0;
-		switch (i) {
-		case 0:
-			result = cluster_lmd_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 1:
-			domain = "PENDING_CANCEL";
-			result = cluster_lmd_pending_normal_stop_poll(&key, &reason);
-			break;
-		case 2:
-			domain = "WAIT_GRAPH";
-			result = cluster_lmd_graph_normal_stop_poll(&key, &reason);
-			break;
-		default:
-			domain = "REPORT_COLLECTOR";
-			result = cluster_lmd_probe_normal_stop_poll(&key, &reason);
-			break;
-		}
-		if (result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING) {
-			aggregate = CLUSTER_NORMAL_STOP_INVALID;
-			cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
-			ereport(LOG,
-					(errmsg("LMD normal-stop responsibility invalid"),
-					 errdetail("domain=%s key=" UINT64_FORMAT " reason=%s", domain, key, reason)));
-		} else if (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)
-			aggregate = CLUSTER_NORMAL_STOP_PENDING;
+	ClusterServiceObservation observation;
+	ClusterNormalStopPollResult aggregate = cluster_service_normal_stop_observe(&observation);
+	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
+		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		ereport(LOG, (errmsg("LMD normal-stop responsibility invalid"),
+					  errdetail("domain=%s key=" UINT64_FORMAT " reason=%s", observation.domain,
+								observation.key, observation.reason)));
 	}
 	return aggregate;
 }

@@ -79,6 +79,7 @@
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_startup_exit.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_config_members.h"
 #include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_semantic_activation.h"
@@ -1110,131 +1111,32 @@ static ClusterNormalStopPollResult
 lmon_normal_stop_observe(bool final_observation)
 {
 	static TimestampTz last_pending_log;
-	ClusterNormalStopPollResult aggregate = CLUSTER_NORMAL_STOP_READY;
-	const char *first_domain = "NONE", *first_reason = "NONE";
-	int first_slot = -1;
-	uint64 first_key = 0;
+	ClusterNormalStopPollResult aggregate;
+	ClusterServiceObservation observation;
 
 	if (!cluster_normal_stop_requested())
 		return CLUSTER_NORMAL_STOP_READY;
 	/* Original owners only, never under the leave lock or after transport
 	 * close. The close-control sender may inspect its own private owners
 	 * inside a duty; this does not sign that the outer work segment is idle. */
-	for (int module = 0; module < 21; module++) {
-		ClusterNormalStopPollResult result;
-		const char *domain = "NONE", *reason = "NONE";
-		int slot = -1;
-		uint32 position = 0;
-		uint64 key = 0;
-
-		switch (module) {
-		case 0:
-			domain = "GRD_WORK";
-			result = cluster_grd_work_queue_normal_stop_poll(&position, &reason);
-			slot = (int)position;
-			break;
-		case 1:
-			domain = "GRD_OUTBOUND";
-			result = cluster_grd_outbound_normal_stop_poll(&position, &reason);
-			slot = (int)position;
-			break;
-		case 2:
-			domain = "CR";
-			result = cluster_cr_server_normal_stop_poll(&slot, &reason);
-			break;
-		case 3:
-			domain = "NATIVE_PROBE";
-			result = cluster_lms_native_probe_normal_stop_poll(&slot, &reason);
-			break;
-		case 4:
-			domain = "GCS_LOCAL";
-			result = cluster_gcs_block_normal_stop_local_poll(&slot, &reason);
-			break;
-		case 5:
-			result = cluster_ic_normal_stop_poll(&domain, &slot, &position, &reason);
-			break;
-		case 6:
-			result = cluster_semantic_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 7:
-			result = cluster_scn_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 8:
-			result = cluster_reconfig_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 9:
-			domain = "CLOSE_CONTROL";
-			result = cluster_clean_leave_normal_stop_local_poll(&slot, &reason);
-			break;
-		case 10:
-			result = cluster_node_remove_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 11:
-			result = cluster_fence_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 12:
-			result = cluster_write_fence_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 13:
-			domain = "CF";
-			/* Own holds are strict for LMON. The node-wide join hint is
-			 * consumed by the original checkpoint and checked by its post
-			 * census, not prematurely required before that checkpoint. */
-			result = cluster_cf_normal_stop_poll(false, &reason);
-			break;
-		case 14:
-			result = cluster_recovery_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 15:
-			result = cluster_backup_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 16:
-			result = cluster_mrp_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 17:
-			result = cluster_gcs_dedup_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 18:
-			result = cluster_ges_dedup_normal_stop_poll(&domain, &key, &reason);
-			break;
-		case 20:
-			domain = "CONTROL_REQUEST";
-			reason = "OWNED_OR_UNINITIALIZED";
-			result = !cluster_shared_config || cluster_control_request_empty()
-						 ? CLUSTER_NORMAL_STOP_READY
-						 : CLUSTER_NORMAL_STOP_PENDING;
-			break;
-		default:
-			domain = "LMD_PROBE";
-			result = cluster_lmd_probe_normal_stop_poll(&key, &reason);
-			break;
-		}
-		if (result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING)
-			result = CLUSTER_NORMAL_STOP_INVALID;
-		if ((result == CLUSTER_NORMAL_STOP_INVALID && aggregate != CLUSTER_NORMAL_STOP_INVALID)
-			|| (result == CLUSTER_NORMAL_STOP_PENDING && aggregate == CLUSTER_NORMAL_STOP_READY)) {
-			aggregate = result;
-			first_domain = domain;
-			first_reason = reason;
-			first_slot = slot;
-			first_key = key;
-		}
-	}
+	aggregate = cluster_service_normal_stop_observe(&observation);
 	if (aggregate == CLUSTER_NORMAL_STOP_PENDING) {
 		TimestampTz now = GetCurrentTimestamp();
 		if (final_observation || last_pending_log == 0
 			|| now - last_pending_log >= INT64CONST(1000000)) {
 			last_pending_log = now;
 			ereport(LOG, (errmsg_internal("LMON normal-stop responsibility pending"),
-						  errdetail("domain=%s slot=%d key=%llu reason=%s", first_domain,
-									first_slot, (unsigned long long)first_key, first_reason)));
+						  errdetail("domain=%s slot=%d key=%llu reason=%s", observation.domain,
+									observation.slot, (unsigned long long)observation.key,
+									observation.reason)));
 		}
 	}
 	if (aggregate == CLUSTER_NORMAL_STOP_INVALID) {
 		cluster_normal_stop_fail(CLUSTER_NORMAL_STOP_FAILURE_MODULE);
 		ereport(LOG, (errmsg_internal("LMON normal-stop responsibility invalid"),
-					  errdetail("domain=%s slot=%d key=%llu reason=%s", first_domain, first_slot,
-								(unsigned long long)first_key, first_reason)));
+					  errdetail("domain=%s slot=%d key=%llu reason=%s", observation.domain,
+								observation.slot, (unsigned long long)observation.key,
+								observation.reason)));
 	}
 	return aggregate;
 }

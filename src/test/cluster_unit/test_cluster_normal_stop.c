@@ -21,6 +21,8 @@
 #include "cluster/cluster_sinval_bcast.h"
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_lms.h"
+#include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ges_dedup.h"
@@ -35,6 +37,7 @@
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "../../backend/cluster/cluster_clean_leave.c"
+#include "../../backend/cluster/cluster_service_observe.c"
 
 #undef printf
 #undef fprintf
@@ -91,6 +94,12 @@ cluster_cf_retirement_poll(void)
 		abort();
 }
 
+/* Native channel adapter has its separate real C/TCP tests. These original
+ * shutdown-loop fixtures do not publish a configuration channel command. */
+void
+cluster_config_channels_tick(void)
+{}
+
 bool IsUnderPostmaster;
 bool IsPostmasterEnvironment;
 bool cluster_lmd_enabled = true;
@@ -132,6 +141,14 @@ cluster_lmon_normal_stop_poll(void)
 		lmon_late_actor = false;
 	}
 	return lmon_local_observation;
+}
+
+bool
+LWLockHeldByMe(LWLock *lock)
+{
+	if (lock != &test_region.leave.lock)
+		abort();
+	return lock_holds != 0;
 }
 
 bool
@@ -488,6 +505,96 @@ UT_TEST(test_actual_fresh_initializer_initializes_full_tail_once)
 	UT_ASSERT_EQ(test_region.leave.leaving_node_id, -1);
 	UT_ASSERT_EQ(memcmp(&test_region.normal_stop, &zero, sizeof(zero)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(&test_region.normal_stop.phase), CLUSTER_NORMAL_STOP_IDLE);
+}
+
+/* Real CLOSE dispatch and real owner state: an online empty owner must not
+ * inherit the shutdown-only precondition. No READY module fixture here. */
+UT_TEST(test_online_close_observation_accepts_real_idle_without_shutdown)
+{
+	ClusterServiceObservation observation = { 0 };
+	ClusterCleanLeaveSharedState before;
+	reset_region();
+	cluster_clean_leave_shmem_init();
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	MyAuxProcType = LmonProcess;
+	before = test_region;
+	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL),
+				 CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(service_observe_one(SERVICE_CLOSE, false, &observation), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(service_observe_one(SERVICE_CLOSE, true, &observation), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(memcmp(&before, &test_region, sizeof(before)), 0);
+	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+}
+
+UT_TEST(test_online_close_observation_keeps_actual_shared_and_private_work)
+{
+	for (unsigned fault = 0; fault < 15; ++fault) {
+		ClusterServiceObservation observation = { 0 };
+		ClusterCleanLeaveSharedState before;
+		reset_region();
+		cluster_clean_leave_shmem_init();
+		memset(cl_phase1_post_stopped_request_ahead, 0,
+			   sizeof(cl_phase1_post_stopped_request_ahead));
+		IsUnderPostmaster = true;
+		MyBackendType = B_LMON;
+		MyAuxProcType = LmonProcess;
+		switch (fault) {
+		case 0: pg_atomic_write_u32(&cl_normal_stop->requested, 1); break;
+		case 1: pg_atomic_write_u32(&cl_state->request_in_progress, 1); break;
+		case 2: pg_atomic_write_u32(&cl_state->phase, CLUSTER_LEAVE_REQUESTED); break;
+		case 3: cl_state->leaving_node_id = 1; break;
+		case 4: pg_atomic_write_u32(&cl_state->preflight_pending, 1); break;
+		case 5: pg_atomic_write_u32(&cl_state->preflight_sent, 1); break;
+		case 6: pg_atomic_write_u32(&cl_state->shutdown_driven, 1); break;
+		case 7: pg_atomic_write_u32(&cl_state->phase1_release_pending, 1); break;
+		case 8: pg_atomic_write_u64(&cl_state->marker_request_seq, 1); break;
+		case 9: cl_normal_stop_front_inbox[2].pending = true; break;
+		case 10: cl_normal_stop_front_inbox[2].ack_pending = true; break;
+		case 11: cl_normal_stop_front_inbox[2].release_pending[0] = true; break;
+		case 12: cl_normal_stop_front_inbox[2].release_pending[1] = true; break;
+		case 13: cl_normal_stop_front_inbox[2].release_ack_pending = true; break;
+		case 14: cl_phase1_post_stopped_request_ahead[2].valid = true; break;
+		}
+		before = test_region;
+		UT_ASSERT_EQ(cluster_clean_leave_service_poll(&observation.slot, &observation.reason),
+					 CLUSTER_NORMAL_STOP_PENDING);
+		UT_ASSERT_EQ(memcmp(&before, &test_region, sizeof(before)), 0);
+		UT_ASSERT_EQ(lock_holds, 0);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
+		if (fault >= 9)
+			UT_ASSERT_EQ(observation.slot, 2);
+	}
+	memset(cl_phase1_post_stopped_request_ahead, 0,
+		   sizeof(cl_phase1_post_stopped_request_ahead));
+}
+
+UT_TEST(test_online_close_refuses_wrong_owner_missing_state_and_sticky_failure)
+{
+	for (unsigned fault = 0; fault < 8; ++fault) {
+		ClusterNormalStopFailure before;
+		reset_region();
+		cluster_clean_leave_shmem_init();
+		IsUnderPostmaster = true;
+		MyBackendType = B_LMON;
+		MyAuxProcType = LmonProcess;
+		switch (fault) {
+		case 0: IsUnderPostmaster = false; break;
+		case 1: MyBackendType = B_BACKEND; break;
+		case 2: MyAuxProcType = LmsProcess; break;
+		case 3: cl_state = NULL; break;
+		case 4: cl_normal_stop = NULL; break;
+		case 5:
+			pg_atomic_write_u32(&cl_normal_stop->failure_reason, CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+			break;
+		case 6: pg_atomic_write_u32(&cl_state->phase, UINT32_MAX); break;
+		case 7: pg_atomic_write_u32(&cl_normal_stop->phase, UINT32_MAX); break;
+		}
+		before = cluster_normal_stop_failure();
+		UT_ASSERT_EQ(cluster_clean_leave_service_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
+		UT_ASSERT_EQ(lock_holds, 0);
+		UT_ASSERT_EQ(cluster_normal_stop_failure(), before);
+	}
 }
 
 UT_TEST(test_actual_attach_preserves_normal_stop_and_early_peer_state)
@@ -5072,9 +5179,12 @@ UT_TEST(test_pre2_pair_rejects_nondeclared_release_reply_even_after_seal)
 int
 main(void)
 {
-	UT_PLAN(123);
+	UT_PLAN(126);
 	UT_RUN(test_actual_region_size_matches_frozen_tail);
 	UT_RUN(test_actual_fresh_initializer_initializes_full_tail_once);
+	UT_RUN(test_online_close_observation_accepts_real_idle_without_shutdown);
+	UT_RUN(test_online_close_observation_keeps_actual_shared_and_private_work);
+	UT_RUN(test_online_close_refuses_wrong_owner_missing_state_and_sticky_failure);
 	UT_RUN(test_actual_attach_preserves_normal_stop_and_early_peer_state);
 	UT_RUN(test_postmaster_only_monotonic_intent_without_lwlock);
 	UT_RUN(test_normal_stop_first_failure_is_sticky_even_after_protocol_close);

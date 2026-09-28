@@ -3040,6 +3040,74 @@ cl_normal_stop_release_lmon_tick(void)
 		SetLatch(ProcGlobal->checkpointerLatch);
 }
 
+/*
+ * cluster_clean_leave_service_poll -- Observe the original online CLOSE owner.
+ *
+ * Called by LMON at an unlocked service boundary. Unlike the final-stop poll,
+ * any active leave/stop and any retained control input defers an online change.
+ * Historical completed marker bytes are not live ownership. This read-only
+ * snapshot neither seals ingress nor retires or mutates the original work.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+ClusterNormalStopPollResult
+cluster_clean_leave_service_poll(int *peer_out, const char **reason_out)
+{
+	ClusterNormalStopPollResult result = CLUSTER_NORMAL_STOP_INVALID;
+	const char *reason = "CLOSE_SERVICE_OWNER_OR_SHMEM";
+	uint32 phase, stop_phase;
+	uint64 request, completion;
+	int observed_peer = -1;
+	if (!IsUnderPostmaster || MyBackendType != B_LMON || !AmLmonProcess() || cl_state == NULL
+		|| cl_normal_stop == NULL)
+		goto done;
+	if (LWLockHeldByMe(&cl_state->lock)) {
+		reason = "CLOSE_SERVICE_LOCK_HELD";
+		goto done;
+	}
+	LWLockAcquire(&cl_state->lock, LW_SHARED);
+	phase = pg_atomic_read_u32(&cl_state->phase);
+	stop_phase = pg_atomic_read_u32(&cl_normal_stop->phase);
+	request = pg_atomic_read_u64(&cl_state->marker_request_seq);
+	completion = pg_atomic_read_u64(&cl_state->marker_completion_seq);
+	if (cluster_normal_stop_failure() != CLUSTER_NORMAL_STOP_FAILURE_NONE
+		|| phase > CLUSTER_LEAVE_ABORTED_ESCALATE
+		|| stop_phase > CLUSTER_NORMAL_STOP_PROTOCOL_CLOSED || completion > request) {
+		reason = "CLOSE_SERVICE_STATE_INVALID";
+	} else if (cluster_normal_stop_requested() || stop_phase != CLUSTER_NORMAL_STOP_IDLE
+			   || phase != CLUSTER_LEAVE_IDLE || cl_state->leaving_node_id != -1
+			   || pg_atomic_read_u32(&cl_state->request_in_progress) != 0
+			   || pg_atomic_read_u32(&cl_state->preflight_pending) != 0
+			   || pg_atomic_read_u32(&cl_state->preflight_sent) != 0
+			   || pg_atomic_read_u32(&cl_state->shutdown_driven) != 0
+			   || pg_atomic_read_u32(&cl_state->phase1_release_pending) != 0
+			   || request != completion) {
+		result = CLUSTER_NORMAL_STOP_PENDING;
+		reason = "CLOSE_SERVICE_SHARED_OWNER";
+	} else {
+		result = CLUSTER_NORMAL_STOP_READY;
+		reason = "CLOSE_SERVICE_IDLE";
+	}
+	LWLockRelease(&cl_state->lock);
+	if (result == CLUSTER_NORMAL_STOP_READY)
+		for (int peer = 0; peer < CLUSTER_PHASE1_FULL_STOP_MEMBER_COUNT; ++peer) {
+			const ClNormalStopFrontInbox *inbox = &cl_normal_stop_front_inbox[peer];
+			if (inbox->pending || inbox->ack_pending || inbox->release_pending[0]
+				|| inbox->release_pending[1] || inbox->release_ack_pending
+				|| cl_phase1_post_stopped_request_ahead[peer].valid) {
+				result = CLUSTER_NORMAL_STOP_PENDING;
+				reason = "CLOSE_SERVICE_RETAINED_INPUT";
+				observed_peer = peer;
+				break;
+			}
+		}
+done:
+	if (peer_out != NULL)
+		*peer_out = observed_peer;
+	if (reason_out != NULL)
+		*reason_out = reason;
+	return result;
+}
+
 ClusterNormalStopPollResult
 cluster_clean_leave_normal_stop_local_poll(int *peer_out, const char **reason_out)
 {

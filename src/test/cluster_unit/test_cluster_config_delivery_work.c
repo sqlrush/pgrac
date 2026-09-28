@@ -48,6 +48,7 @@ static bool transaction, transaction_block, admission, cr_idle, cleaner_idle;
 static bool session_locks;
 static bool common_change, available, classification_ok;
 static ClusterNormalStopPollResult gcs_result;
+static ClusterNormalStopPollResult service_result;
 static uint64 target, consumed;
 static unsigned assignments, reads, gcs_polls, cr_polls, cleaner_polls;
 static unsigned contexts, deletes, owners, releases;
@@ -55,6 +56,14 @@ static PGPROC background_proc;
 PGPROC *MyProc = &background_proc;
 static ClusterSharedConfigRegistration background_actual;
 static bool registration_available, registration_changed;
+
+ClusterNormalStopPollResult
+cluster_service_observe(ClusterServiceObservation *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->domain = "fixture original shared service";
+	return service_result;
+}
 
 bool
 cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
@@ -253,6 +262,7 @@ reset(void)
 	transaction = transaction_block = admission = session_locks = false;
 	cr_idle = cleaner_idle = common_change = available = classification_ok = true;
 	gcs_result = CLUSTER_NORMAL_STOP_READY;
+	service_result = CLUSTER_NORMAL_STOP_READY;
 	target = 2;
 	consumed = 1;
 	assignments = reads = gcs_polls = cr_polls = cleaner_polls = 0;
@@ -350,6 +360,31 @@ UT_TEST(default_only_reload_is_not_blocked)
 	UT_ASSERT(cluster_shared_config_delivery_reload());
 	UT_ASSERT_EQ(consumed, 2);
 	UT_ASSERT(!delivery_waiting_for_idle);
+}
+UT_TEST(shared_service_work_defers_common_values)
+{
+	reset();
+	/* Private GCS/CR state and admission are empty. An original shared
+	 * service queue is not empty; no shutdown has been requested. */
+	service_result = CLUSTER_NORMAL_STOP_PENDING;
+	expect_deferred();
+	cluster_shared_config_delivery_retry_idle();
+	UT_ASSERT_EQ(assignments, 0);
+	service_result = CLUSTER_NORMAL_STOP_READY;
+	target = 11;
+	UT_ASSERT(cluster_shared_config_delivery_retry_idle());
+	UT_ASSERT_EQ(consumed, 11);
+}
+UT_TEST(invalid_service_work_does_not_become_empty)
+{
+	reset();
+	service_result = CLUSTER_NORMAL_STOP_INVALID;
+	expect_deferred();
+	UT_ASSERT(!cluster_shared_config_delivery_retry_idle());
+	UT_ASSERT_EQ(assignments, 0);
+	common_change = false;
+	UT_ASSERT(cluster_shared_config_delivery_reload());
+	UT_ASSERT_EQ(consumed, 2);
 }
 UT_TEST(other_native_role_does_not_wait_for_unrelated_owner)
 {
@@ -703,7 +738,7 @@ UT_TEST(channel_board_is_bound_to_native_family)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(26);
 	UT_RUN(channel_board_is_bound_to_native_family);
 	UT_RUN(retained_admission_without_transaction_or_command);
 	UT_RUN(gcs_private_work_without_admission);
@@ -712,6 +747,8 @@ main(void)
 	UT_RUN(cleaner_batch_remains_owned);
 	UT_RUN(incomplete_release_does_not_apply);
 	UT_RUN(default_only_reload_is_not_blocked);
+	UT_RUN(shared_service_work_defers_common_values);
+	UT_RUN(invalid_service_work_does_not_become_empty);
 	UT_RUN(other_native_role_does_not_wait_for_unrelated_owner);
 	UT_RUN(other_role_still_retains_own_admission);
 	UT_RUN(transaction_and_command_boundary_retained);
