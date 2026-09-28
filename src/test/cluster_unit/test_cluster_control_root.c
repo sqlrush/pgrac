@@ -98,6 +98,7 @@ AuxProcType MyAuxProcType = NotAnAuxProcess;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static bool test_checkpoint_mode;
+static bool test_random_leading_zero;
 static uint64 test_self_incarnation;
 static uint64 test_epoch;
 BackendType MyBackendType = B_INVALID;
@@ -209,6 +210,8 @@ cluster_normal_stop_durable_close_owned(const ClusterPhase1FullStopPlan *plan)
  * Author: SqlRush <sqlrush@gmail.com> */
 static bool test_failure_formation, test_failure_needs, test_failure_admissions;
 static PgracExternalFenceNeedV1 test_failure_need;
+static uint32 test_failure_need_count = 1;
+static PgracExternalFenceNeedV1 test_failure_extra_needs[CLUSTER_MAX_NODES];
 static PgracExternalFenceWriterSetDigest test_failure_need_digest;
 static PgracExternalFenceWriterSetDigest test_failure_admission_digest;
 
@@ -219,7 +222,8 @@ cluster_formation_witness_authority(const ClusterFormationWitnessV1 *witness)
 	memset(&proof, 0, sizeof(proof));
 	proof.marker.fence_epoch = 123;
 	return test_failure_formation && witness == (const ClusterFormationWitnessV1 *)(uintptr_t)1
-		? &proof : NULL;
+			   ? &proof
+			   : NULL;
 }
 
 bool
@@ -270,27 +274,30 @@ cluster_external_fence_revalidate_set_nowait(const PgracExternalFenceAdmissionSe
 uint32
 cluster_external_fence_need_set_count(const PgracExternalFenceNeedSetV1 *needs)
 {
-	return needs == (const PgracExternalFenceNeedSetV1 *)(uintptr_t)2 ? 1 : 0;
+	return needs == (const PgracExternalFenceNeedSetV1 *)(uintptr_t)2 ? test_failure_need_count : 0;
 }
 
 const PgracExternalFenceNeedV1 *
 cluster_external_fence_need_set_at(const PgracExternalFenceNeedSetV1 *needs, uint32 index)
 {
-	return cluster_external_fence_need_set_count(needs) == 1 && index == 0 ? &test_failure_need
-																		   : NULL;
+	if (index >= cluster_external_fence_need_set_count(needs))
+		return NULL;
+	return index == 0 ? &test_failure_need : &test_failure_extra_needs[index];
 }
 
 const PgracExternalFenceWriterSetDigest *
 cluster_external_fence_need_set_digest(const PgracExternalFenceNeedSetV1 *set)
 {
-	return set == (const PgracExternalFenceNeedSetV1 *)(uintptr_t)2 ? &test_failure_need_digest : NULL;
+	return set == (const PgracExternalFenceNeedSetV1 *)(uintptr_t)2 ? &test_failure_need_digest
+																	: NULL;
 }
 
 const PgracExternalFenceWriterSetDigest *
 cluster_external_fence_admission_set_digest(const PgracExternalFenceAdmissionSetV1 *set)
 {
 	return set == (const PgracExternalFenceAdmissionSetV1 *)(uintptr_t)3
-		? &test_failure_admission_digest : NULL;
+			   ? &test_failure_admission_digest
+			   : NULL;
 }
 
 void
@@ -747,6 +754,8 @@ pg_strong_random(void *buf, size_t len)
 
 	for (i = 0; i < len; i++)
 		bytes[i] = seed++;
+	if (test_random_leading_zero && len == 16)
+		bytes[0] = 0;
 	return true;
 }
 
@@ -1272,23 +1281,25 @@ cluster_wal_retention_pin_seal_for_root_publish(ClusterWalRetentionPin *pin)
 
 bool
 cluster_wal_retention_pending_publish_current(const ClusterWalRootPublishGuard *guard,
-	const ClusterRecoveryDutyKey *duty, const ClusterControlPendingToken *pending)
+											  const ClusterRecoveryDutyKey *duty,
+											  const ClusterControlPendingToken *pending)
 {
 	return guard == (ClusterWalRootPublishGuard *)(uintptr_t)1 && test_worker_pin_held
-		&& test_worker_pin_sealed && test_worker_bound_serial != NULL
-		&& !test_worker_bound_serial->held && !test_worker_bound_serial->release_uncertain
-		&& memcmp(duty, &test_worker_bound_serial->duty, sizeof(*duty)) == 0
-		&& memcmp(pending, &test_worker_bound_serial->pending, sizeof(*pending)) == 0
-		&& test_walr_sealed_current && test_failure_formation && test_failure_admissions;
+		   && test_worker_pin_sealed && test_worker_bound_serial != NULL
+		   && !test_worker_bound_serial->held && !test_worker_bound_serial->release_uncertain
+		   && memcmp(duty, &test_worker_bound_serial->duty, sizeof(*duty)) == 0
+		   && memcmp(pending, &test_worker_bound_serial->pending, sizeof(*pending)) == 0
+		   && test_walr_sealed_current && test_failure_formation && test_failure_admissions;
 }
 
 ClusterWalPinResult
 cluster_wal_retention_pending_publish_begin(const ClusterRecoveryDutyKey *duty,
-	const ClusterControlPendingToken *pending, ClusterWalRootPublishGuard **out)
+											const ClusterControlPendingToken *pending,
+											ClusterWalRootPublishGuard **out)
 {
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 	if (!cluster_wal_retention_pending_publish_current((ClusterWalRootPublishGuard *)(uintptr_t)1,
-		duty, pending))
+													   duty, pending))
 		return CLUSTER_WAL_PIN_STALE;
 	*out = (ClusterWalRootPublishGuard *)(uintptr_t)1;
 	test_walr_begin_calls++;
@@ -1547,6 +1558,7 @@ wipe_root_files(void)
 	test_input_acquires = test_input_releases = test_input_acquire_order = test_input_release_order
 		= 0;
 	test_worker_replays = test_worker_pins = test_worker_normal_ir = 0;
+	test_failure_need_count = 1;
 	test_worker_initializer_ir = test_worker_formations = 0;
 	test_worker_pin_held = false;
 	CurrentResourceOwner = (ResourceOwner)(uintptr_t)1;
@@ -9466,7 +9478,8 @@ UT_TEST(test_v3_startup_install_all_sync_and_late_cuts_retain_obligations)
  * prefix and anchor files, then bind that input into the DURABLE fixture. */
 static void
 v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
-					   ClusterWalHistoryImage *history, unsigned count, bool with_terminal)
+					   ClusterWalHistoryImage *history, unsigned count, bool with_terminal,
+					   bool retirement_input)
 {
 	static uint64 old_generation = 500000;
 	ClusterRecoveryAnchorRefV2 ref = { 0 };
@@ -9554,6 +9567,11 @@ v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
 		interrupted.generation = ++old_generation;
 		interrupted.claim.identity.origin_owner_incarnation = old_generation;
 		interrupted.claim.identity.root_lineage_seq = old_generation;
+		if (retirement_input) {
+			interrupted.claim.identity.origin_owner_incarnation
+				= op->claim.identity.origin_owner_incarnation - 1;
+			interrupted.claim.identity.root_lineage_seq = op->claim.identity.root_lineage_seq;
+		}
 		interrupted.claim.identity.thread_claim_crc32c = 0;
 		interrupted.claim.claim_generation = old_generation;
 		UT_ASSERT_EQ(cluster_wal_claim_v2_encode(&interrupted.claim, claim_bytes), 0);
@@ -9575,6 +9593,22 @@ v3_install_add_history(ControlRootImage *root, ClusterWalStartupImage *op,
 		memset(terminal.isolation_sha256, 0x51, 32);
 		memset(terminal.closure_sha256, 0x61, 32);
 		terminal.observation.tail.durable_prefix.sequence = 1;
+		if (retirement_input) {
+			/* Literal selected certificate for the checkpoint consumer, not a
+			 * replacement for the separate actual-WAL terminal producer tests. */
+			terminal.observation.tail.records = 2;
+			terminal.observation.tail.last_record_start = op->first_segment_lsn + 128;
+			terminal.observation.tail.complete_end = op->first_segment_lsn + 256;
+			terminal.observation.tail.last_record_crc = 123;
+			terminal.observation.parameter_records = 1;
+			terminal.observation.fpw_records = 1;
+			terminal.observation.fpw_disabled = true;
+			terminal.observation.max_connections = 1401;
+			terminal.observation.max_worker_processes = 131;
+			terminal.observation.max_wal_senders = 117;
+			terminal.observation.max_prepared_xacts = 109;
+			terminal.observation.max_locks_per_xact = 1101;
+		}
 		test_actual_cf = test_cf_mode = ExclusiveLock;
 		UT_ASSERT_EQ(cluster_wal_terminal_prepare(root, 0, history, &terminal, &terminal_stage), 0);
 		UT_ASSERT_EQ(cluster_wal_terminal_install(&terminal_stage), 0);
@@ -9620,7 +9654,7 @@ UT_TEST(test_v3_startup_install_keeps_full_history_and_refuses_overflow)
 		ClusterWalStartupImage op = v3_install_fixture(before, &root);
 		ClusterWalHistoryImage old_history, actual;
 		ClusterWalDurablePrefixRef writer;
-		v3_install_add_history(&root, &op, &old_history, count, with_terminal);
+		v3_install_add_history(&root, &op, &old_history, count, with_terminal, false);
 		if (ut_current_failed)
 			return;
 		memcpy(before, root.bytes, sizeof(before));
@@ -10863,6 +10897,95 @@ UT_TEST(test_runtime_pending_worker_owns_exact_subject_before_inspection)
 	}
 }
 
+/* Actual INSTALL must retain all terminal inputs. Only a later verified
+ * checkpoint of the admitted writer may transfer obligations and retire one. */
+UT_TEST(test_v3_checkpoint_transfers_terminal_obligations_atomically)
+{
+	for (unsigned scenario = 0; scenario < 4; scenario++) {
+		uint8 before[66048];
+		ControlRootImage root, selected;
+		ControlFileData candidate, view;
+		ClusterControlRootFileToken file;
+		ClusterControlRootSnapshot snapshot;
+		ClusterWalHistoryImage history, retained;
+		ClusterWalDurablePrefixRef writer;
+		ClusterWalStartupImage op = v3_install_fixture(before, &root);
+		v3_install_add_history(&root, &op, &history, 2, true, scenario != 1);
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_install_writer(&op, &writer), 0);
+		if (ut_current_failed)
+			return;
+		test_actual_cf = test_cf_mode = ShareLock;
+		UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&op.claim.identity, &root,
+																&candidate, &file),
+					 0);
+		UT_ASSERT_EQ(cluster_wal_history_read_locked(&root, 0, &history), 0);
+		UT_ASSERT_EQ(history.terminal_count, 1);
+		UT_ASSERT_EQ(history.count, 3);
+		/* Fixture supplies existing serving authority; this unit test does
+		 * not claim to execute the final membership/SQL admission handshake. */
+		root.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_OPEN;
+		root.header.v2.serving[0] = 1;
+		root.header.file_txn_seq++;
+		UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+		v2_write_roots(root.bytes);
+		memcpy(before, root.bytes, sizeof(before));
+		test_actual_cf = test_cf_mode = NoLock;
+		test_reserve_mode = false;
+		test_checkpoint_mode = true;
+		MyAuxProcType = CheckpointerProcess;
+		cluster_node_id = 0;
+		test_self_incarnation = test_membership_incarnation
+			= op.claim.identity.origin_owner_incarnation;
+		test_own_thread = 1;
+		test_member_state = CLUSTER_MEMBER_MEMBER;
+		test_serving = scenario != 2;
+		test_fence = test_wal_validated = true;
+		test_prebump = false;
+		candidate.state = DB_IN_PRODUCTION;
+		candidate.checkPoint += 8192;
+		candidate.checkPointCopy.redo += 8192;
+		candidate.time++;
+		candidate.checkPointCopy.time++;
+		INIT_CRC32C(candidate.crc);
+		COMP_CRC32C(candidate.crc, &candidate, offsetof(ControlFileData, crc));
+		FIN_CRC32C(candidate.crc);
+		v2_checkpoint_wal_record(&op.claim.identity, &candidate, 0);
+		test_fail_primary_rename = scenario == 3;
+		if (scenario >= 2) {
+			UT_ASSERT(cluster_control_root_v3_checkpoint_publish(&op.claim.identity, &candidate,
+																 test_checkpoint_end, &snapshot,
+																 &file, &view)
+					  != 0);
+			v2_assert_primary_unchanged(before);
+			test_fail_primary_rename = false;
+			test_serving = true;
+		}
+		UT_ASSERT_EQ(cluster_control_root_v3_checkpoint_publish(&op.claim.identity, &candidate,
+																test_checkpoint_end, &snapshot,
+																&file, &view),
+					 0);
+		if (ut_current_failed)
+			return;
+		test_actual_cf = test_cf_mode = ShareLock;
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_read_thread_locked(&op.claim.identity, &selected, &view, &file),
+			0);
+		UT_ASSERT_EQ(cluster_wal_history_read_locked(&selected, 0, &retained), 0);
+		UT_ASSERT_EQ(retained.count, history.count);
+		UT_ASSERT_EQ(memcmp(retained.records, history.records, sizeof(history.records)), 0);
+		UT_ASSERT_EQ(retained.terminal_count, scenario == 1 ? 1 : 0);
+		if (scenario != 1) {
+			UT_ASSERT(view.MaxConnections >= 1401);
+			UT_ASSERT(view.max_worker_processes >= 131);
+			UT_ASSERT(view.max_wal_senders >= 117);
+			UT_ASSERT(view.max_prepared_xacts >= 109);
+			UT_ASSERT(view.max_locks_per_xact >= 1101);
+			UT_ASSERT(snapshot.root_flags & CLUSTER_CONTROL_ROOT_FLAG_FPW_WAS_OFF);
+		}
+		test_actual_cf = test_cf_mode = NoLock;
+	}
+}
+
 static ClusterWalStartupImage
 pending_inspection_fixture(ClusterRecoverySerialGuard *serial, bool checkpoint)
 {
@@ -10914,7 +11037,7 @@ pending_inspection_fixture(ClusterRecoverySerialGuard *serial, bool checkpoint)
  * recovery or rejoin result.  Author: SqlRush <sqlrush@gmail.com> */
 static ClusterWalStartupImage
 pending_worker_fixture(ClusterRecoverySerialGuard *serial,
-						   ClusterThreadRecLaunchEligibility *eligibility)
+					   ClusterThreadRecLaunchEligibility *eligibility)
 {
 	ClusterWalStartupImage op;
 
@@ -11040,16 +11163,17 @@ UT_TEST(test_runtime_pending_worker_publishes_checkpointless_terminal)
 	UT_ASSERT(!test_worker_pin_held);
 	UT_ASSERT_EQ(test_worker_replays, 0);
 	test_actual_cf = test_cf_mode = ShareLock;
-	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(
-		&op.predecessor.snapshot.identity, root, &control, &token), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&op.predecessor.snapshot.identity, root,
+															&control, &token),
+				 0);
 	UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(root, 0, inputs), 0);
 	UT_ASSERT(!inputs->has_pending);
 	UT_ASSERT_EQ(inputs->current.snapshot.identity.origin_owner_incarnation,
-		op.predecessor.snapshot.identity.origin_owner_incarnation);
+				 op.predecessor.snapshot.identity.origin_owner_incarnation);
 	UT_ASSERT_EQ(inputs->history.terminal_count, 1);
 	UT_ASSERT_EQ(cluster_wal_terminal_read_locked(root, 0, 0, &terminal), 0);
 	UT_ASSERT_EQ(terminal.initialization.claim.identity.origin_owner_incarnation,
-		op.claim.identity.origin_owner_incarnation);
+				 op.claim.identity.origin_owner_incarnation);
 	UT_ASSERT_EQ(terminal.observation.checkpoint_records, 0);
 	UT_ASSERT_EQ(terminal.closure_version, 1);
 	UT_ASSERT_EQ(terminal.recoverer_node, 127);
@@ -11060,30 +11184,30 @@ UT_TEST(test_runtime_pending_worker_publishes_checkpointless_terminal)
 	 * typed terminal selected from its retained history.  A lifecycle value or
 	 * a stale root token alone is not enough. */
 	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(
-						 op.predecessor.snapshot.identity.origin_thread_id,
-						 &op.predecessor.snapshot.identity, &expected_snapshot, &expected_token),
+					 op.predecessor.snapshot.identity.origin_thread_id,
+					 &op.predecessor.snapshot.identity, &expected_snapshot, &expected_token),
 				 0);
 	UT_ASSERT_EQ(cluster_control_root_v3_validate_rejoin_terminal(
-						 &op.predecessor.snapshot.identity,
-						 op.claim.identity.origin_owner_incarnation,
-						 &expected_snapshot, &expected_token, &proof),
+					 &op.predecessor.snapshot.identity, op.claim.identity.origin_owner_incarnation,
+					 &expected_snapshot, &expected_token, &proof),
 				 0);
-	UT_ASSERT_EQ(proof.failed_incarnation,
-				 op.claim.identity.origin_owner_incarnation);
+	UT_ASSERT_EQ(proof.failed_incarnation, op.claim.identity.origin_owner_incarnation);
 	UT_ASSERT_EQ(proof.terminal_generation, terminal.generation);
-	UT_ASSERT(memcmp(proof.operation_uuid, terminal.operation_uuid,
-					 sizeof(proof.operation_uuid)) == 0);
+	UT_ASSERT(memcmp(proof.operation_uuid, terminal.operation_uuid, sizeof(proof.operation_uuid))
+			  == 0);
 	UT_ASSERT(memcmp(proof.terminal_sha256, inputs->history.terminals[0].sha256,
-					 sizeof(proof.terminal_sha256)) == 0);
+					 sizeof(proof.terminal_sha256))
+			  == 0);
 	selected_proof = proof;
-	UT_ASSERT_EQ(cluster_control_root_v3_terminal_history_blocked(
-						 &op.predecessor.snapshot.identity, &history_blocked), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_terminal_history_blocked(&op.predecessor.snapshot.identity,
+																  &history_blocked),
+				 0);
 	UT_ASSERT(history_blocked);
 	memset(&proof, 0xa5, sizeof(proof));
 	UT_ASSERT_EQ(cluster_control_root_v3_validate_rejoin_terminal(
-						 &op.predecessor.snapshot.identity,
-						 op.claim.identity.origin_owner_incarnation + 1,
-						 &expected_snapshot, &expected_token, &proof),
+					 &op.predecessor.snapshot.identity,
+					 op.claim.identity.origin_owner_incarnation + 1, &expected_snapshot,
+					 &expected_token, &proof),
 				 CLUSTER_CONTROL_ROOT_ABSENT);
 	UT_ASSERT(v2_zero(&proof, sizeof(proof)));
 	{
@@ -11092,56 +11216,26 @@ UT_TEST(test_runtime_pending_worker_publishes_checkpointless_terminal)
 		stale_token.root_publish_seq++;
 		memset(&proof, 0xa5, sizeof(proof));
 		UT_ASSERT_EQ(cluster_control_root_v3_validate_rejoin_terminal(
-							 &op.predecessor.snapshot.identity,
-							 op.claim.identity.origin_owner_incarnation,
-							 &expected_snapshot, &stale_token, &proof),
+						 &op.predecessor.snapshot.identity,
+						 op.claim.identity.origin_owner_incarnation, &expected_snapshot,
+						 &stale_token, &proof),
 					 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
 		UT_ASSERT(v2_zero(&proof, sizeof(proof)));
 	}
 	{
-		ClusterControlRootSnapshot consumed_snapshot;
-		ClusterControlRootReadToken consumed_token;
-		bool consumed = false;
-
-		/* Membership has not yet been published in this fixture, but the root
-		 * consumer itself is exercised against the exact selected proof.  The
-		 * physical terminal remains immutable; only the selected history ref is
-		 * removed and the new root/history cut is published. */
+		bool consumed = true;
+		/* Membership success is not retirement of startup parameter/native
+		 * dependencies. The later checkpoint owner must carry them forward. */
 		UT_ASSERT_EQ(cluster_control_root_v3_consume_rejoin_terminal(
 						 &op.predecessor.snapshot.identity,
-						 op.claim.identity.origin_owner_incarnation + 1,
-						 &expected_snapshot, &expected_token, &selected_proof, &consumed),
-					 0);
-		UT_ASSERT(consumed);
-		test_actual_cf = test_cf_mode = ShareLock;
-		UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(
-						 op.predecessor.snapshot.identity.origin_thread_id,
-						 &op.predecessor.snapshot.identity, &consumed_snapshot, &consumed_token),
-					 0);
+						 op.claim.identity.origin_owner_incarnation + 1, &expected_snapshot,
+						 &expected_token, &selected_proof, &consumed),
+					 CLUSTER_CONTROL_ROOT_RECONFIG_WAIT);
+		UT_ASSERT(!consumed);
 		UT_ASSERT_EQ(cluster_control_root_v3_terminal_history_blocked(
 						 &op.predecessor.snapshot.identity, &history_blocked),
 					 0);
-		UT_ASSERT(!history_blocked);
-		test_actual_cf = test_cf_mode = NoLock;
-		/* A retry after the root cut has advanced is idempotent: the immutable
-		 * PGWG remains audit evidence, while its selected history reference is
-		 * already gone.  The old root token is not a second consume authority. */
-		{
-			ClusterControlRootSnapshot retry_snapshot;
-			ClusterControlRootReadToken retry_token;
-			bool retried = true;
-
-			UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(
-						 op.predecessor.snapshot.identity.origin_thread_id,
-						 &op.predecessor.snapshot.identity, &retry_snapshot, &retry_token),
-					 0);
-			UT_ASSERT_EQ(cluster_control_root_v3_consume_rejoin_terminal(
-						 &op.predecessor.snapshot.identity,
-						 op.claim.identity.origin_owner_incarnation + 1,
-						 &retry_snapshot, &retry_token, &selected_proof, &retried),
-					 CLUSTER_CONTROL_ROOT_ABSENT);
-			UT_ASSERT(!retried);
-		}
+		UT_ASSERT(history_blocked);
 	}
 	test_reserve_mode = false;
 	pfree(inputs);
@@ -11177,11 +11271,122 @@ UT_TEST(test_runtime_pending_worker_cancellation_keeps_pending_subject)
 	UT_ASSERT(caught);
 	UT_ASSERT(!test_worker_pin_held);
 	test_actual_cf = test_cf_mode = ShareLock;
-	UT_ASSERT_EQ(cluster_control_root_read_recovery_subject(
-						 op.predecessor.snapshot.identity.origin_thread_id,
-						 &op.claim.identity, &subject), 0);
+	UT_ASSERT_EQ(
+		cluster_control_root_read_recovery_subject(
+			op.predecessor.snapshot.identity.origin_thread_id, &op.claim.identity, &subject),
+		0);
 	UT_ASSERT_EQ(subject.kind, CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER);
 	test_actual_cf = test_cf_mode = NoLock;
+	test_reserve_mode = false;
+}
+
+/* Releasing CF between the caller's strong cut and the manifest lookup must
+ * never turn a replaced root into a successful empty proof or reuse grant. */
+static void
+terminal_consumer_second_read_race(unsigned consumer)
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterWalStartupImage op = pending_worker_fixture(&serial, &eligibility);
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	ClusterControlRootRejoinTerminalProofV1 proof;
+	bool blocked = false;
+	if (ut_current_failed)
+		return;
+	test_worker_pin_held = false;
+	UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DONE);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &op.predecessor.snapshot.identity,
+														&snapshot, &token),
+				 0);
+	test_stop_share_hook = v2_checkpoint_root_race;
+	test_stop_share_call = test_cf_lock_calls + 2;
+	if (consumer == 0) {
+		memset(&proof, 0xa5, sizeof(proof));
+		UT_ASSERT_EQ(cluster_control_root_v3_validate_rejoin_terminal(
+						 &op.predecessor.snapshot.identity,
+						 op.claim.identity.origin_owner_incarnation, &snapshot, &token, &proof),
+					 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT(v2_zero(&proof, sizeof(proof)));
+	} else {
+		UT_ASSERT_EQ(cluster_control_root_v3_terminal_history_blocked(
+						 &op.predecessor.snapshot.identity, &blocked),
+					 CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		UT_ASSERT(blocked);
+	}
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	test_stop_share_hook = NULL;
+	test_reserve_mode = false;
+}
+
+UT_TEST(test_runtime_terminal_rejoin_rejects_second_read_race)
+{
+	terminal_consumer_second_read_race(0);
+}
+
+UT_TEST(test_runtime_terminal_retention_rejects_second_read_race)
+{
+	terminal_consumer_second_read_race(1);
+}
+
+/* A UUID is nonzero as a whole; its first random byte may legitimately be zero. */
+UT_TEST(test_runtime_terminal_rejoin_accepts_nonzero_uuid_with_zero_first_byte)
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterWalStartupImage op;
+	ClusterControlRootRejoinTerminalProofV1 proof;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	test_random_leading_zero = true;
+	op = pending_worker_fixture(&serial, &eligibility);
+	test_random_leading_zero = false;
+	if (ut_current_failed)
+		return;
+	UT_ASSERT_EQ(op.operation_uuid[0], 0);
+	UT_ASSERT(!v2_zero(op.operation_uuid, sizeof(op.operation_uuid)));
+	test_worker_pin_held = false;
+	UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DONE);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &op.predecessor.snapshot.identity,
+														&snapshot, &token),
+				 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_validate_rejoin_terminal(
+					 &op.predecessor.snapshot.identity, op.claim.identity.origin_owner_incarnation,
+					 &snapshot, &token, &proof),
+				 0);
+	UT_ASSERT_EQ(memcmp(proof.operation_uuid, op.operation_uuid, 16), 0);
+	test_reserve_mode = false;
+}
+
+/* The isolation digest serializes every configured victim plus its formation
+ * trailer. Exercise the real terminal producer at the full NeedSet bound. */
+UT_TEST(test_runtime_terminal_isolation_full_needset)
+{
+	ClusterRecoverySerialGuard serial;
+	ClusterThreadRecLaunchEligibility eligibility;
+	ClusterWalStartupImage op = pending_worker_fixture(&serial, &eligibility);
+	ClusterControlRootRejoinTerminalProofV1 proof;
+	ClusterControlRootSnapshot snapshot;
+	ClusterControlRootReadToken token;
+	if (ut_current_failed)
+		return;
+	for (unsigned i = 1; i < CLUSTER_MAX_NODES; i++) {
+		test_failure_extra_needs[i] = test_failure_need;
+		test_failure_extra_needs[i].victim_node_id = i;
+	}
+	test_failure_need_count = CLUSTER_MAX_NODES;
+	test_worker_pin_held = false;
+	UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DONE);
+	UT_ASSERT(!test_worker_pin_held);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_canonical(1, &op.predecessor.snapshot.identity,
+														&snapshot, &token),
+				 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_validate_rejoin_terminal(
+					 &op.predecessor.snapshot.identity, op.claim.identity.origin_owner_incarnation,
+					 &snapshot, &token, &proof),
+				 0);
+	UT_ASSERT_EQ(proof.failed_incarnation, op.claim.identity.origin_owner_incarnation);
+	test_failure_need_count = 1;
 	test_reserve_mode = false;
 }
 
@@ -11214,23 +11419,24 @@ UT_TEST(test_runtime_pending_worker_uncertain_root_publish_retains_terminal)
 	UT_ASSERT(!test_worker_pin_held);
 	test_actual_cf = test_cf_mode = NoLock;
 	read_result = cluster_control_root_read_canonical(
-						 op.predecessor.snapshot.identity.origin_thread_id,
-						 &op.predecessor.snapshot.identity, CLUSTER_CONTROL_ROOT_READ_STRONG,
-						 &snapshot, &token);
+		op.predecessor.snapshot.identity.origin_thread_id, &op.predecessor.snapshot.identity,
+		CLUSTER_CONTROL_ROOT_READ_STRONG, &snapshot, &token);
 	UT_ASSERT(read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
-				 || read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED);
+			  || read_result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED);
 	test_actual_cf = test_cf_mode = ShareLock;
-	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(
-						 &op.predecessor.snapshot.identity, &root, &control, &file_token), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_read_thread_locked(&op.predecessor.snapshot.identity,
+															&root, &control, &file_token),
+				 0);
 	UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(&root, 0, &inputs), 0);
 	UT_ASSERT(!inputs.has_pending);
 	UT_ASSERT_EQ(inputs.history.terminal_count, 1);
 	UT_ASSERT_EQ(cluster_wal_terminal_read_locked(&root, 0, 0, &terminal), 0);
 	UT_ASSERT_EQ(terminal.initialization.claim.identity.origin_owner_incarnation,
-					 op.claim.identity.origin_owner_incarnation);
+				 op.claim.identity.origin_owner_incarnation);
 	test_actual_cf = test_cf_mode = NoLock;
-	UT_ASSERT_EQ(cluster_control_root_v3_terminal_history_blocked(
-						 &op.predecessor.snapshot.identity, &blocked), 0);
+	UT_ASSERT_EQ(cluster_control_root_v3_terminal_history_blocked(&op.predecessor.snapshot.identity,
+																  &blocked),
+				 0);
 	UT_ASSERT(blocked);
 	test_actual_cf = test_cf_mode = NoLock;
 	test_reserve_mode = false;
@@ -11271,6 +11477,146 @@ UT_TEST(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal)
 		}
 		UT_ASSERT_EQ(test_actual_cf, NoLock);
 		UT_ASSERT(serial.held && test_worker_pin_held);
+		test_reserve_mode = false;
+	}
+}
+
+/* A complete first checkpoint is recovery input even when its writer died
+ * before publishing DURABLE. Promotion must retain W0, select W1's real
+ * checkpoint and defer completion to ordinary recovery. */
+UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
+{
+	for (unsigned empty_promise = 0; empty_promise < 2; empty_promise++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterThreadRecLaunchEligibility eligibility = { 0 };
+		ClusterWalStartupImage op = pending_inspection_fixture(&serial, true);
+		ControlRootImage *root = palloc0(sizeof(*root));
+		ClusterWalOriginInputs *inputs = palloc0(sizeof(*inputs));
+		ClusterControlRootFileToken file;
+		ClusterControlRootSnapshot snapshot;
+		ClusterControlRootReadToken token;
+		ClusterRecoveryAnchorRefV2 anchor_ref = { 0 };
+		ControlFileData control, native;
+		if (ut_current_failed)
+			return;
+		if (empty_promise) {
+			memset(&test_checkpoint_prefix, 0, sizeof(test_checkpoint_prefix));
+			test_checkpoint_prefix.sequence = 1;
+			v2_checkpoint_prefix_write();
+		}
+		eligibility.origin_thread = 1;
+		eligibility.attempt_stamp = 123;
+		eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+		eligibility.duty = op.claim.identity;
+		memcpy(eligibility.selected_root_sha256, serial.pending.file.image_sha256, 32);
+		test_worker_pin_held = false;
+		test_history_fail_sync = UINT_MAX;
+		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_read_canonical(1, &op.claim.identity, &snapshot, &token),
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (ut_current_failed)
+			return;
+		UT_ASSERT_EQ(snapshot.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+		UT_ASSERT_EQ(snapshot.checkpoint_lower_lsn, op.first_segment_lsn + SizeOfXLogLongPHD);
+		UT_ASSERT_EQ(snapshot.checkpoint_record_crc32c, test_checkpoint_crc);
+		UT_ASSERT_EQ(snapshot.validated_tail_lsn_exclusive, test_checkpoint_end);
+		UT_ASSERT_EQ(test_worker_replays, 0);
+		UT_ASSERT(!test_worker_pin_held);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		test_actual_cf = test_cf_mode = ShareLock;
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_read_thread_locked(&op.claim.identity, root, &control, &file),
+			0);
+		UT_ASSERT_EQ(cluster_wal_origin_inputs_read_locked(root, 0, inputs), 0);
+		UT_ASSERT_EQ(control.checkPoint, op.first_segment_lsn + SizeOfXLogLongPHD);
+		/* The ordinary reader projects common allocator counters. Verify the
+		 * origin's physical checkpoint through the native-input reader. */
+		anchor_ref.identity = op.claim.identity;
+		anchor_ref.database_incarnation = root->header.v2.database_incarnation;
+		anchor_ref.max_config_generation = root->header.v2.config_generation;
+		anchor_ref.anchor_generation = root->refs[0].anchor_generation;
+		memcpy(anchor_ref.anchor_sha256, root->refs[0].anchor_sha256, 32);
+		memcpy(anchor_ref.claim_sha256, root->refs[0].claim_sha256, 32);
+		UT_ASSERT_EQ(cluster_recovery_anchor_v2_read_native_locked(&anchor_ref, &control, &native),
+					 0);
+		UT_ASSERT_EQ(U64FromFullTransactionId(native.checkPointCopy.nextXid), 103);
+		UT_ASSERT_EQ(control.state, DB_IN_CRASH_RECOVERY);
+		UT_ASSERT(!inputs->has_pending);
+		UT_ASSERT_EQ(inputs->history.count, 1);
+		UT_ASSERT_EQ(inputs->history.terminal_count, 0);
+		UT_ASSERT_EQ(inputs->history.records[0].snapshot.identity.origin_owner_incarnation,
+					 op.predecessor.snapshot.identity.origin_owner_incarnation);
+		UT_ASSERT_EQ(root->header.v2.serving[0], 0);
+		UT_ASSERT_EQ(root->records[3].lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED);
+		test_actual_cf = test_cf_mode = NoLock;
+		/* The retired pending launch cannot revive W1 initialization. A fresh
+		 * ordinary launch reaches the existing replay owner, not DONE. The
+		 * fixture counts entry to replay; it does not fake DATA recovery. */
+		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+		UT_ASSERT_EQ(test_worker_replays, 0);
+		eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT;
+		memset(eligibility.selected_root_sha256, 0, sizeof(eligibility.selected_root_sha256));
+		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+		UT_ASSERT_EQ(test_worker_replays, 1);
+		UT_ASSERT_EQ(test_worker_normal_ir, 1);
+		UT_ASSERT(!test_worker_pin_held);
+		test_reserve_mode = false;
+		pfree(inputs);
+		pfree(root);
+	}
+}
+
+/* Every durability cut preserves either the old pending obligation or the
+ * fully selected ordinary recovery input. Retry cannot publish DONE. */
+UT_TEST(test_runtime_pending_checkpoint_sync_cuts_preserve_recoverable_input)
+{
+	unsigned total_syncs = 0;
+	for (unsigned cut = 0; cut <= total_syncs; cut++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterThreadRecLaunchEligibility eligibility = { 0 };
+		ClusterWalStartupImage op = pending_inspection_fixture(&serial, true);
+		ClusterControlRecoverySubject subject;
+		ClusterControlRootSnapshot snapshot;
+		ClusterControlRootReadToken token;
+		ClusterThreadRecResult result;
+		if (ut_current_failed)
+			return;
+		eligibility.origin_thread = 1;
+		eligibility.attempt_stamp = 123;
+		eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+		eligibility.duty = op.claim.identity;
+		memcpy(eligibility.selected_root_sha256, serial.pending.file.image_sha256, 32);
+		test_worker_pin_held = false;
+		test_history_sync_count = 0;
+		test_history_fail_sync = cut == 0 ? UINT_MAX : cut;
+		result = thread_recovery_worker_run(&eligibility);
+		if (cut == 0) {
+			total_syncs = test_history_sync_count;
+			UT_ASSERT(total_syncs > 4 && total_syncs < 100);
+			UT_ASSERT_EQ(result, CLUSTER_THREADREC_DEFERRED);
+		} else
+			UT_ASSERT_EQ(result, CLUSTER_THREADREC_BLOCKED);
+		test_history_fail_sync = 0;
+		UT_ASSERT_EQ(test_worker_replays, 0);
+		UT_ASSERT(!test_worker_pin_held);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(cluster_control_root_read_recovery_subject(1, &op.claim.identity, &subject),
+					 0);
+		if (subject.kind == CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER) {
+			UT_ASSERT_EQ(memcmp(&subject.pending, &serial.pending, sizeof(serial.pending)), 0);
+			/* Same sealed input, new execution. Installed-but-unselected files
+			 * are not a reason to skip the actual publisher or its readback. */
+			UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+		} else
+			UT_ASSERT_EQ(subject.kind, CLUSTER_CONTROL_RECOVERY_CURRENT_CHECKPOINT);
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_read_canonical(1, &op.claim.identity, &snapshot, &token), 0);
+		UT_ASSERT_EQ(snapshot.lifecycle, CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED);
+		UT_ASSERT_EQ(snapshot.validated_tail_lsn_exclusive, test_checkpoint_end);
+		UT_ASSERT_EQ(test_worker_replays, 0);
+		UT_ASSERT(!test_worker_pin_held);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
 		test_reserve_mode = false;
 	}
 }
@@ -16908,7 +17254,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(309);
+	UT_PLAN(316);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
 	UT_RUN(test_native_inputs_preserve_slots_and_prepared_files);
@@ -16935,6 +17281,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_startup_install_uncertain_rename_is_not_success);
 	UT_RUN(test_v3_startup_install_all_sync_and_late_cuts_retain_obligations);
 	UT_RUN(test_v3_startup_install_keeps_full_history_and_refuses_overflow);
+	UT_RUN(test_v3_checkpoint_transfers_terminal_obligations_atomically);
 	UT_RUN(test_v3_startup_install_sparse_pair_has_no_four_member_assumption);
 	UT_RUN(test_v3_startup_checkpoint_refuses_runtime_and_control_drift);
 	UT_RUN(test_v3_startup_checkpoint_requires_real_successor_bytes);
@@ -17173,9 +17520,15 @@ main(int argc, char **argv)
 	UT_RUN(test_runtime_pending_observation_is_separate_and_requires_actual_inputs);
 	UT_RUN(test_runtime_pending_worker_owns_exact_subject_before_inspection);
 	UT_RUN(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal);
+	UT_RUN(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done);
+	UT_RUN(test_runtime_pending_checkpoint_sync_cuts_preserve_recoverable_input);
 	UT_RUN(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_horizon);
 	UT_RUN(test_runtime_pending_worker_publishes_checkpointless_terminal);
 	UT_RUN(test_runtime_pending_worker_cancellation_keeps_pending_subject);
+	UT_RUN(test_runtime_terminal_rejoin_rejects_second_read_race);
+	UT_RUN(test_runtime_terminal_retention_rejects_second_read_race);
+	UT_RUN(test_runtime_terminal_isolation_full_needset);
+	UT_RUN(test_runtime_terminal_rejoin_accepts_nonzero_uuid_with_zero_first_byte);
 	UT_RUN(test_runtime_pending_worker_uncertain_root_publish_retains_terminal);
 	UT_RUN(test_runtime_pending_inspection_refuses_stale_or_unowned_input);
 	UT_RUN(test_runtime_v3_lmon_launch_continues_only_after_exact_cf_retirement);

@@ -1527,7 +1527,7 @@ test_cluster_control_root: test_cluster_control_root.c unit_test.h test_cluster_
 		xlogreader_fs.o \
 		$(top_builddir)/src/common/libpgcommon.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) \
-		-lssl -lcrypto -llz4 -lzstd -o $@
+		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 # PGRAC: perturb only syscall timing/failure; all read/decoder/selection code is
 # production code. Author: SqlRush <sqlrush@gmail.com>

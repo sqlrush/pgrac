@@ -2972,9 +2972,9 @@ cluster_reconfig_external_rejoin_tick(void)
 			memset(&token, 0, sizeof(token));
 			memset(protected_set_digest, 0, sizeof(protected_set_digest));
 			root_result = cluster_control_root_lookup_owner_by_node_runtime(advance_node, &identity,
-																			 &snapshot, &token);
+																			&snapshot, &token);
 			if ((root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-					&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+				 && root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 				|| !cluster_external_fence_rejoin_protected_set_digest(protected_set_digest))
 				return;
 			status = cluster_external_fence_rejoin_authorize_on_async(
@@ -3542,26 +3542,25 @@ cluster_reconfig_publish_prepared_join_commit(void)
 	cluster_reconfig_clear_clean_departed(join_commit_stage.node_id);
 	cluster_reconfig_publish_event(&join_commit_stage.event);
 	if (join_commit_stage.external_rejoin_consumed) {
-		ClusterExternalRejoinSlot *slot =
-			&external_rejoin_slots[join_commit_stage.node_id];
+		ClusterExternalRejoinSlot *slot = &external_rejoin_slots[join_commit_stage.node_id];
 		ClusterControlRootResult terminal_result;
 
-		/* The durable JOIN_COMMITTED publication is the only existing
-		 * membership boundary after which the provider-mediated interrupted
-		 * initializer may be retired.  Keep the terminal selected if this
-		 * exact history cut cannot be published; the slot is still released
-		 * below and a later rejoin attempt must present a fresh proof. */
+		/* PGRAC: JOIN_COMMITTED consumes provider authority, not retained
+		 * restart inputs. The successor checkpoint owns obligation transfer;
+		 * RECONFIG_WAIT here is normal, not a failed membership transition.
+		 * Author: SqlRush <sqlrush@gmail.com> */
 		terminal_result = cluster_external_fence_rejoin_consume_terminal_history(
 			slot->op, join_commit_stage.node_id, join_commit_stage.admitted_incarnation);
 		if (terminal_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			&& terminal_result != CLUSTER_CONTROL_ROOT_RECONFIG_WAIT
 			&& terminal_result != CLUSTER_CONTROL_ROOT_ABSENT)
 			ereport(LOG,
 					(errmsg("cluster membership: retained interrupted-initializer terminal after "
 							"JOIN_COMMITTED (node=%d result=%d)",
-							join_commit_stage.node_id, (int) terminal_result)));
+							join_commit_stage.node_id, (int)terminal_result)));
 	}
 	cluster_reconfig_fast_rejoin_control_finish(join_commit_stage.node_id,
-														join_commit_stage.admitted_incarnation);
+												join_commit_stage.admitted_incarnation);
 	pg_atomic_fetch_add_u64(&ReconfigShmem->join_apply_count, 1);
 	return true;
 }

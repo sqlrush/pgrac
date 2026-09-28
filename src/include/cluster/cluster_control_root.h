@@ -542,8 +542,7 @@ extern ClusterControlRootResult cluster_control_root_lookup_owner_by_node_runtim
  * selected terminal must be present in the current root's retained union,
  * match the failed identity/incarnation, and have no pending replacement for
  * that origin.  Output is cleared on every refusal. */
-extern ClusterControlRootResult
-cluster_control_root_v3_validate_rejoin_terminal(
+extern ClusterControlRootResult cluster_control_root_v3_validate_rejoin_terminal(
 	/* expected_identity is the current root namespace; failed_incarnation is
 	 * the distinct initializer claim selected from retained terminal history. */
 	const ClusterControlRootIdentity *expected_identity, uint64 failed_incarnation,
@@ -554,16 +553,13 @@ cluster_control_root_v3_validate_rejoin_terminal(
  * closure.  The current PRE2 consumer is intentionally conservative: any
  * selected terminal blocks destructive reuse, and no reservation/install path
  * may prune it. */
-extern ClusterControlRootResult
-cluster_control_root_v3_terminal_history_blocked(const ClusterControlRootIdentity *expected_identity,
-											 bool *out_blocked);
-/* Consume exactly one provider-mediated rejoin terminal after the membership
- * commit has published the candidate.  The selected terminal's immutable
- * physical object remains as audit evidence; only its selected history
- * reference is removed.  A failed or ambiguous publication leaves the old
- * root selected and therefore keeps retention fail-closed. */
-extern ClusterControlRootResult
-cluster_control_root_v3_consume_rejoin_terminal(
+extern ClusterControlRootResult cluster_control_root_v3_terminal_history_blocked(
+	const ClusterControlRootIdentity *expected_identity, bool *out_blocked);
+/* Revalidate the provider-mediated rejoin terminal after membership commit.
+ * This boundary cannot discharge restart dependencies: an exact proof returns
+ * RECONFIG_WAIT with consumed=false. The serving successor's later checkpoint
+ * transfers those dependencies and retires the reference atomically. */
+extern ClusterControlRootResult cluster_control_root_v3_consume_rejoin_terminal(
 	const ClusterControlRootIdentity *expected_identity, uint64 candidate_incarnation,
 	const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,

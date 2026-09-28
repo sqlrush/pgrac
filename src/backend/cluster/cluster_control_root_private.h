@@ -258,11 +258,12 @@ cluster_control_root_v3_initializer_inspect(struct ClusterRecoverySerialGuard *s
 
 /* Existing recovery owner only. Reinspect/sync actual inputs and publish a
  * checkpoint-less terminal after confirmed IR retirement. May release serial;
- * caller still owns WALR/fence/formation cleanup. A real checkpoint returns
- * RECONFIG_WAIT for ordinary recovery promotion, never fabricated completion. */
+ * caller still owns WALR/fence/formation cleanup. A real checkpoint promotes
+ * the input to RECOVERY_REQUIRED and returns RECONFIG_WAIT for ordinary
+ * recovery, never fabricated completion. */
 extern ClusterControlRootResult
 cluster_control_root_v3_initializer_finish(struct ClusterRecoverySerialGuard *serial,
-	struct ClusterWalRetentionPin *pin);
+										   struct ClusterWalRetentionPin *pin);
 
 /* Caller supplies an authenticated immutable v3 root and already holds
  * clusterwide CF-S/X. Consume every selected history/PGWG object, including
@@ -316,22 +317,17 @@ extern ClusterControlRootResult cluster_control_root_v3_startup_checkpoint(
  * admits SQL or publishes the runtime writer mirror. Refusal clears out. */
 extern ClusterControlRootResult
 cluster_control_root_v3_startup_install_writer(const ClusterWalStartupImage *expected,
-															   ClusterWalDurablePrefixRef *out);
+											   ClusterWalDurablePrefixRef *out);
 
-/* PGRAC PRE2: consume one provider-mediated interrupted-initializer terminal
- * only after the rejoin commit has been published.  The terminal proof is the
- * exact root-selected W1 certificate; this operation rewrites the selected
- * history union without deleting the physical terminal object, then publishes
- * the new root/history pair under CF-X.  A failed or ambiguous publication
- * leaves the old root (and therefore the terminal) selected. */
-extern ClusterControlRootResult
-cluster_control_root_v3_consume_rejoin_terminal(
-	const ClusterControlRootIdentity *expected_identity,
-	uint64 candidate_incarnation,
+/* PGRAC: membership consumes the provider operation, not restart history.
+ * An exact terminal stays selected (RECONFIG_WAIT, consumed=false) until the
+ * serving successor's later checkpoint transfers its remaining obligations.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult cluster_control_root_v3_consume_rejoin_terminal(
+	const ClusterControlRootIdentity *expected_identity, uint64 candidate_incarnation,
 	const ClusterControlRootSnapshot *expected_snapshot,
 	const ClusterControlRootReadToken *expected_token,
-	const ClusterControlRootRejoinTerminalProofV1 *proof,
-	bool *out_consumed);
+	const ClusterControlRootRejoinTerminalProofV1 *proof, bool *out_consumed);
 
 /* Exact selected-object decoding. Does not prove the evidence digest,
  * inspect physical WAL or authorize a state transition. All output clears on
