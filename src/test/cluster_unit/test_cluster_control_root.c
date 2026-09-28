@@ -43,6 +43,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "utils/resowner.h"
+#include "utils/memutils.h"
 #include "utils/timestamp.h"
 
 #include "../../backend/cluster/cluster_control_root_private.h"
@@ -134,6 +135,43 @@ static bool test_config_release_throw;
 static LOCKMODE test_actual_cf;
 static unsigned test_history_sync_count, test_history_fail_sync;
 static bool test_throw_root_read;
+/* Native MC lifetime boundary only. The standalone fixture uses frontend
+ * malloc-backed palloc; native TAP separately checks actual context bytes.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static MemoryContextData config_test_parent = { .type = T_AllocSetContext };
+MemoryContext CurrentMemoryContext = &config_test_parent;
+static unsigned config_context_created, config_context_deleted;
+
+MemoryContext
+AllocSetContextCreateInternal(MemoryContext parent, const char *name, Size min_size, Size init_size,
+							  Size max_size)
+{
+	MemoryContext context = palloc0(sizeof(MemoryContextData));
+	(void)min_size;
+	(void)init_size;
+	(void)max_size;
+	context->type = T_AllocSetContext;
+	context->parent = parent;
+	context->name = name;
+	config_context_created++;
+	return context;
+}
+
+void
+MemoryContextDelete(MemoryContext context)
+{
+	if (CurrentMemoryContext != context->parent)
+		abort();
+	config_context_deleted++;
+	pfree(context);
+}
+
+void *
+MemoryContextAlloc(MemoryContext context, Size size)
+{
+	(void)context;
+	return palloc(size);
+}
 static bool test_close_owned;
 static bool test_reserve_mode, test_reserve_provider, test_reserve_quorum;
 static ClusterStartupExitResult test_reserve_evidence;
@@ -17935,6 +17973,228 @@ UT_TEST(test_config_publisher_release_cancel_retires_private_stage)
 	}
 }
 
+/* PGRAC: exact online selection is independent of data permission; it is
+ * still not application/admission. Real immutable files and CF-borrowing C.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static ClusterSharedConfigRef
+config_selected_fixture(uint8 before[66048])
+{
+	ClusterSharedConfigEntry noop = { -1, "cluster.enabled", "on" };
+	ClusterSharedConfigPublication published = { 0 };
+	ClusterSharedConfigPolicyReport policy;
+	config_publish_fixture(before);
+	UT_ASSERT_EQ(cluster_control_root_config_change(&noop, &published, &policy), 0);
+	test_actual_cf = ShareLock;
+	return published.ref;
+}
+
+UT_TEST(test_config_selected_reads_owned_same_and_newer_object)
+{
+	uint8 before[66048];
+	ClusterSharedConfigRef prior = config_selected_fixture(before);
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+	ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+	ClusterSharedConfigPublication published;
+	ClusterSharedConfigPolicyReport policy;
+	char value[32], path[MAXPGPATH], hex[65];
+	UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(memcmp(&selected.ref, &prior, sizeof(prior)) == 0);
+	UT_ASSERT_EQ(selected.root.file_txn_seq, get_u64_le(before + 16));
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	cluster_shared_config_free(&image);
+	test_actual_cf = NoLock;
+	UT_ASSERT_EQ(cluster_control_root_config_change(&change, &published, &policy), 0);
+	test_actual_cf = ShareLock;
+	UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(memcmp(&selected.ref, &published.ref, sizeof(selected.ref)) == 0);
+	UT_ASSERT(memcmp(&selected.root, &published.root, sizeof(selected.root)) == 0);
+	test_actual_cf = NoLock;
+	bootstrap_hex(selected.ref.sha256, hex);
+	snprintf(path, sizeof(path), "%s/global/config_images/48-%s.conf", test_root, hex);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(cluster_shared_config_lookup(image.bytes, image.len, &selected.ref, -1,
+											  "statement_timeout", value, sizeof(value)),
+				 0);
+	UT_ASSERT(strcmp(value, "250") == 0);
+	cluster_shared_config_free(&image);
+}
+
+UT_TEST(test_config_selected_does_not_depend_on_data_writer_permission)
+{
+	uint8 before[66048];
+	ClusterSharedConfigRef prior = config_selected_fixture(before);
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+	unsigned prepares = test_config_prepares;
+	test_serving = test_fence = false;
+	UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image), 0);
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	UT_ASSERT_EQ(test_config_prepares, prepares);
+	cluster_shared_config_free(&image);
+	v2_assert_primary_unchanged(before);
+}
+
+UT_TEST(test_config_selected_rejects_identity_and_generation_drift)
+{
+	for (int fault = 0; fault < 8; ++fault) {
+		uint8 before[66048];
+		ClusterSharedConfigRef prior = config_selected_fixture(before);
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image;
+		if (fault == 0)
+			prior.identity.system_identifier++;
+		if (fault == 1)
+			prior.identity.database_incarnation++;
+		if (fault == 2)
+			prior.identity.storage_uuid[1] ^= 1;
+		if (fault == 3)
+			prior.identity.authority_uuid[1] ^= 1;
+		if (fault == 4)
+			prior.identity.configured[0] ^= 2;
+		if (fault == 5)
+			prior.identity.generation++;
+		if (fault == 6)
+			prior.sha256[1] ^= 1;
+		if (fault == 7)
+			prior.identity.generation = 0;
+		memset(&selected, 0xa5, sizeof(selected));
+		memset(&image, 0xa5, sizeof(image));
+		UT_ASSERT(cluster_control_root_config_read_locked(&prior, &selected, &image) != 0);
+		UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+		UT_ASSERT_EQ(test_actual_cf, ShareLock);
+		v2_assert_primary_unchanged(before);
+	}
+}
+
+UT_TEST(test_config_selected_rejects_missing_corrupt_or_unlocked_input)
+{
+	for (int fault = 0; fault < 7; ++fault) {
+		uint8 before[66048];
+		ClusterSharedConfigRef prior = config_selected_fixture(before);
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image;
+		char path[MAXPGPATH], hex[65];
+		bootstrap_hex(prior.sha256, hex);
+		snprintf(path, sizeof(path), "%s/global/config_images/47-%s.conf", test_root, hex);
+		if (fault == 0)
+			UT_ASSERT_EQ(unlink(path), 0);
+		if (fault == 1)
+			write_all_or_abort(path, (const uint8 *)"bad", 3);
+		if (fault == 2)
+			test_actual_cf = NoLock;
+		if (fault == 3)
+			test_cf_clusterwide = false;
+		if (fault == 4)
+			test_contract = CLUSTER_CF_CONTRACT_LOCAL_PROBED;
+		if (fault == 5) {
+			path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		if (fault == 6) {
+			/* Valid but contradictory equal-sequence backup cannot select. */
+			ControlRootImage root;
+			UT_ASSERT_EQ(cluster_control_root_v3_decode(before, sizeof(before), v2_storage,
+														TEST_SYSID, &root),
+						 0);
+			root.header.published_at_usec++;
+			UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+			path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+			write_all_or_abort(path, root.bytes, sizeof(root.bytes));
+		}
+		memset(&selected, 0xa5, sizeof(selected));
+		memset(&image, 0xa5, sizeof(image));
+		UT_ASSERT(cluster_control_root_config_read_locked(&prior, &selected, &image) > 1);
+		UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+	}
+}
+
+UT_TEST(test_config_selected_rejects_non_online_root)
+{
+	for (int fault = 0; fault < 2; ++fault) {
+		uint8 before[66048];
+		ClusterSharedConfigRef prior = config_selected_fixture(before);
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image;
+		ControlRootImage root;
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_decode(before, sizeof(before), v2_storage, TEST_SYSID, &root),
+			0);
+		if (fault == 0)
+			root.header.activation_state = CLUSTER_CONTROL_ROOT_ACTIVATION_PREPARED;
+		else
+			root.header.v2.database_state = CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED;
+		UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
+		v2_write_roots(root.bytes);
+		UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image),
+					 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+		UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+	}
+}
+
+UT_TEST(test_config_selected_alias_is_read_only_and_degraded_is_explicit)
+{
+	uint8 before[66048];
+	ClusterSharedConfigRef prior = config_selected_fixture(before), saved = prior;
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+	char path[MAXPGPATH];
+	UT_ASSERT_EQ(cluster_control_root_config_read_locked(
+					 &prior, (ClusterSharedConfigSelected *)&prior, &image),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT(memcmp(&prior, &saved, sizeof(prior)) == 0);
+	if (ut_current_failed)
+		return;
+	memset(&selected, 0xa5, sizeof(selected));
+	UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected,
+														 (ClusterSharedConfigImage *)&selected),
+				 CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT);
+	UT_ASSERT_EQ(((uint8 *)&selected)[0], 0xa5);
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_BAK_REL_PATH);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image),
+				 CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED);
+	cluster_shared_config_free(&image);
+}
+
+UT_TEST(test_config_selected_error_preserves_borrowed_cf_and_empty_outputs)
+{
+	uint8 before[66048];
+	ClusterSharedConfigRef prior = config_selected_fixture(before);
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+	volatile bool caught = false;
+	unsigned created = config_context_created, deleted = config_context_deleted;
+	MemoryContext caller = CurrentMemoryContext;
+	test_throw_root_read = true;
+	memset(&selected, 0xa5, sizeof(selected));
+	memset(&image, 0xa5, sizeof(image));
+	PG_TRY();
+	{
+		(void)cluster_control_root_config_read_locked(&prior, &selected, &image);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	test_throw_root_read = false;
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(config_context_created, created + 1);
+	UT_ASSERT_EQ(config_context_deleted, deleted + 1);
+	UT_ASSERT(CurrentMemoryContext == caller);
+	UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+	UT_ASSERT_EQ(test_actual_cf, ShareLock);
+	UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image), 0);
+	cluster_shared_config_free(&image);
+	v2_assert_primary_unchanged(before);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -17953,7 +18213,14 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(326);
+	UT_PLAN(333);
+	UT_RUN(test_config_selected_reads_owned_same_and_newer_object);
+	UT_RUN(test_config_selected_does_not_depend_on_data_writer_permission);
+	UT_RUN(test_config_selected_rejects_identity_and_generation_drift);
+	UT_RUN(test_config_selected_rejects_missing_corrupt_or_unlocked_input);
+	UT_RUN(test_config_selected_rejects_non_online_root);
+	UT_RUN(test_config_selected_alias_is_read_only_and_degraded_is_explicit);
+	UT_RUN(test_config_selected_error_preserves_borrowed_cf_and_empty_outputs);
 	UT_RUN(test_config_publisher_keeps_threads_and_reads_exact_new_object);
 	UT_RUN(test_config_publisher_noop_does_not_advance_root_or_make_object);
 	UT_RUN(test_config_publisher_rejects_unowned_or_incomplete_inputs);

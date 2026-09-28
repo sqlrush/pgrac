@@ -53,6 +53,7 @@
 #include "postmaster/interrupt.h"
 #include "storage/fd.h"
 #include "utils/timestamp.h"
+#include "utils/memutils.h"
 
 #define CONTROL_ROOT_HEADER_MAGIC "PGCH"
 #define CONTROL_ROOT_RECORD_MAGIC "PGRT"
@@ -4179,6 +4180,107 @@ config_publish_read(ConfigPublishWork *work, ControlRootImage *root,
 	if (initial)
 		work->self = self;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+/* PGRAC: copy the selected online input while the caller pins CF. This
+ * read deliberately does not depend on data/writer permission: application
+ * must still be able to progress when a dependent data gate is held.
+ * It neither applies settings nor releases the caller's CF responsibility.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ConfigSelectedWork {
+	ControlRootImage root;
+	ControlFileData common;
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage image;
+} ConfigSelectedWork;
+
+static ClusterControlRootResult
+config_selected_read(const ClusterSharedConfigRef *prior, ConfigSelectedWork *work)
+{
+	ClusterSharedConfigIdentity identity;
+	ClusterControlRootResult root_result, result;
+	root_result = read_control_version(
+		prior->identity.storage_uuid, prior->identity.system_identifier, &work->root, &work->common,
+		&work->selected.root, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& root_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return root_result;
+	if (work->root.header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| work->root.header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	config_root_reference(&work->root, &work->selected.ref);
+	identity = work->selected.ref.identity;
+	identity.generation = prior->identity.generation;
+	if (memcmp(&identity, &prior->identity, sizeof(identity)) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	if (work->selected.ref.identity.generation < prior->identity.generation)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (work->selected.ref.identity.generation == prior->identity.generation
+		&& memcmp(&work->selected.ref, prior, sizeof(*prior)) != 0)
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	/* Read-control validates the full selected composition. Keep the same CF
+	 * interval while retaining the config bytes, so neither GC nor a newer
+	 * publisher can change this input between its selection and owned copy. */
+	result = cluster_shared_config_read_locked(cluster_shared_data_dir, &work->selected.ref,
+											   &work->image);
+	return result == CLUSTER_CONTROL_ROOT_OK_PRIMARY ? root_result : result;
+}
+
+ClusterControlRootResult
+cluster_control_root_config_read_locked(const ClusterSharedConfigRef *prior,
+										ClusterSharedConfigSelected *out,
+										ClusterSharedConfigImage *image)
+{
+	MemoryContext caller = CurrentMemoryContext;
+	MemoryContext context;
+	ClusterSharedConfigSelected selected;
+	ClusterSharedConfigImage copied = { 0 };
+	ClusterControlRootResult result;
+	if (history_ranges_overlap(prior, sizeof(*prior), out, sizeof(*out))
+		|| history_ranges_overlap(prior, sizeof(*prior), image, sizeof(*image))
+		|| history_ranges_overlap(out, sizeof(*out), image, sizeof(*image)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (image != NULL)
+		memset(image, 0, sizeof(*image));
+	if (prior == NULL || out == NULL || image == NULL || prior->identity.generation == 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	context = AllocSetContextCreate(caller, "selected configuration input", ALLOCSET_DEFAULT_SIZES);
+	MemoryContextSwitchTo(context);
+	PG_TRY();
+	{
+		ConfigSelectedWork *work = palloc0(sizeof(*work));
+		result = config_selected_read(prior, work);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+			/* Transfer only the successful owned bytes, never lower readers'
+			 * temporary state. All fallible allocation precedes output. */
+			copied.bytes = MemoryContextAlloc(caller, work->image.len + 1);
+			copied.len = work->image.len;
+			memcpy(copied.bytes, work->image.bytes, copied.len + 1);
+			selected = work->selected;
+		}
+		cluster_shared_config_free(&work->image);
+		pfree(work);
+	}
+	PG_CATCH();
+	{
+		/* Also owns scratch that a lower reader has not yet returned. */
+		MemoryContextSwitchTo(caller);
+		MemoryContextDelete(context);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(caller);
+	MemoryContextDelete(context);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		|| result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		*out = selected;
+		*image = copied;
+	}
+	return result;
 }
 
 static ClusterControlRootResult

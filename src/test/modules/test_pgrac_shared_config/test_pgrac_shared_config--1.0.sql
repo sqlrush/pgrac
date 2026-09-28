@@ -72,3 +72,9 @@ CREATE FUNCTION test_pgrac_config_slot_probe(integer)
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_slot_probe'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_slot_probe(integer) FROM PUBLIC;
+-- PGRAC: read-only native selected-input memory lifetime, no CF admission.
+-- Author: SqlRush <sqlrush@gmail.com>
+CREATE FUNCTION test_pgrac_config_selection_cleanup()
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_selection_cleanup'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_selection_cleanup() FROM PUBLIC;

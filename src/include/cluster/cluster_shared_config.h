@@ -72,6 +72,22 @@ extern ClusterControlRootResult cluster_shared_config_read_locked(const char *sh
 																  ClusterSharedConfigImage *out);
 extern void cluster_shared_config_free(ClusterSharedConfigImage *image);
 
+/* Owned input selected under the caller's cluster-wide CF-S/X, not a node
+ * application or data permit. prior is the consumer's actual last reference.
+ * Refusal clears outputs; aliases refuse without touching either carrier.
+ * ERROR does not release the borrowed CF. Caller frees a successful image.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigSelected {
+	ClusterSharedConfigRef ref;
+	ClusterControlRootFileToken root;
+} ClusterSharedConfigSelected;
+StaticAssertDecl(sizeof(ClusterSharedConfigSelected) == 184, "selected configuration input");
+extern ClusterControlRootResult
+cluster_control_root_config_read_locked(const ClusterSharedConfigRef *prior,
+										ClusterSharedConfigSelected *out,
+										ClusterSharedConfigImage *image);
+
 /* PGRAC: amend one explicit scope/key in an exact selected object. NULL
  * change.value means RESET. Preserve all other entries/identity; changed
  * requests advance generation once, without wrap. No-op returns an owned copy

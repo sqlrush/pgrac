@@ -14,6 +14,7 @@
 #include "storage/proc.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
+#include "utils/memutils.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_shared_config.h"
@@ -39,6 +40,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_parallel_observe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_enrollment);
 PG_FUNCTION_INFO_V1(test_pgrac_config_slot_probe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
+PG_FUNCTION_INFO_V1(test_pgrac_config_selection_cleanup);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PG_FUNCTION_INFO_V1(test_pgrac_control_image);
@@ -47,6 +49,47 @@ PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_fixture);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_late);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_control_late);
 PGDLLEXPORT void _PG_init(void);
+
+/* Actual native context accounting, deliberately without CF authority.
+ * Positive selected-file/ERROR timing is tested in cluster_unit; this test
+ * cannot substitute for a distributed grant or fabricate one.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+Datum
+test_pgrac_config_selection_cleanup(PG_FUNCTION_ARGS)
+{
+#ifdef USE_PGRAC_CLUSTER
+	MemoryContext parent, caller;
+	ClusterSharedConfigRef prior = { 0 };
+	Size before;
+	bool ok = true;
+	if (!superuser())
+		ereport(ERROR, (errmsg("test config selection inspection requires superuser")));
+	parent = AllocSetContextCreate(CurrentMemoryContext, "selection test parent",
+								   ALLOCSET_DEFAULT_SIZES);
+	caller = MemoryContextSwitchTo(parent);
+	before = MemoryContextMemAllocated(parent, true);
+	prior.identity.generation = prior.identity.system_identifier = 1;
+	prior.identity.storage_uuid[0] = 1;
+	for (int i = 0; i < 1000; ++i) {
+		ClusterSharedConfigSelected selected;
+		ClusterSharedConfigImage image;
+		ClusterSharedConfigSelected zero = { 0 };
+		CHECK_FOR_INTERRUPTS();
+		ok &= cluster_control_root_config_read_locked(&prior, &selected, &image)
+			  == CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+		ok &= CurrentMemoryContext == parent && parent->firstchild == NULL;
+		ok &= memcmp(&selected, &zero, sizeof(zero)) == 0 && image.bytes == NULL && image.len == 0;
+		ok &= MemoryContextMemAllocated(parent, true) == before;
+	}
+	MemoryContextSwitchTo(caller);
+	MemoryContextDelete(parent);
+	PG_RETURN_BOOL(ok);
+#else
+	ereport(ERROR, (errmsg("cluster support is not compiled")));
+	PG_RETURN_BOOL(false);
+#endif
+}
 
 Datum
 test_pgrac_recovery_capacity(PG_FUNCTION_ARGS)
