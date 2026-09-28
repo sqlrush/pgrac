@@ -140,3 +140,6 @@ REVOKE ALL ON FUNCTION test_pgrac_config_delivery() FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_gate_state() RETURNS text
 AS 'MODULE_PATHNAME', 'test_pgrac_config_gate_state' LANGUAGE C;
 REVOKE ALL ON FUNCTION test_pgrac_config_gate_state() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_future_launch() RETURNS integer
+AS 'MODULE_PATHNAME', 'test_pgrac_config_future_launch' LANGUAGE C;
+REVOKE ALL ON FUNCTION test_pgrac_config_future_launch() FROM PUBLIC;

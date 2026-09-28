@@ -25,5 +25,6 @@ tests += {
                     't/020_active_profile.pl', 't/021_active_census.pl',
                     't/022_native_service_roles.pl', 't/023_transaction_delivery.pl',
                     't/024_command_delivery.pl', 't/025_common_use.pl',
-                    't/026_session_lock_delivery.pl', 't/027_native_use_cut.pl']},
+                    't/026_session_lock_delivery.pl', 't/027_native_use_cut.pl',
+                    't/028_future_native_use.pl']},
 }

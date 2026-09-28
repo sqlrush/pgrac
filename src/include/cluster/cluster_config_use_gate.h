@@ -18,6 +18,7 @@
 #define CLUSTER_CONFIG_USE_GATE_H
 
 #include "port/atomics.h"
+#include "cluster/cluster_shared_config.h"
 
 typedef struct ClusterConfigUseGate {
 	pg_atomic_uint64 state;
@@ -28,6 +29,26 @@ typedef struct ClusterConfigUseGateState {
 	uint32 epoch;
 	uint32 owners;
 } ClusterConfigUseGateState;
+
+typedef struct ClusterConfigUseTarget {
+	uint32 epoch;
+	uint32 node_id;
+	ClusterSharedConfigRef ref;
+	ClusterSharedConfigActive common;
+} ClusterConfigUseTarget;
+
+/* Single controller only, while exact CLOSED has zero owners. The target is
+ * immutable until all readers leave; OPEN's atomic publication follows bind.
+ * This is a local common-use floor, not a CF/member/service certificate. */
+extern bool cluster_config_use_target_bind(ClusterConfigUseGate *gate,
+										   ClusterConfigUseTarget *target, uint32 cut, uint32 node,
+										   const ClusterSharedConfigRef *ref,
+										   const ClusterSharedConfigActive *common);
+/* Caller owns a counted reservation throughout this read and dependent use.
+ * An unbound target is not proof. Later default-only/pending generations can
+ * preserve the exact actual common values; this is not their application ACK. */
+extern bool cluster_config_use_target_matches(const ClusterConfigUseTarget *target, uint32 epoch,
+											  const ClusterSharedConfigRegistration *actual);
 
 /* Only initialize before children exist / after all old children retire.
  * The single controller must separately prove membership and application.
@@ -48,6 +69,7 @@ extern bool cluster_config_use_gate_leave(ClusterConfigUseGate *gate);
  * must separately own the configuration episode. Never exposed through SQL.
  */
 extern ClusterConfigUseGate *cluster_shared_config_delivery_native_gate(void);
+extern ClusterConfigUseTarget *cluster_shared_config_delivery_native_target(void);
 extern bool cluster_shared_config_delivery_work_pending(void);
 
 /* Original native lifecycle consumers; no caller-set role or epoch. */

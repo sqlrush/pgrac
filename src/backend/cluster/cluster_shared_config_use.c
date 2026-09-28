@@ -81,6 +81,8 @@ void
 cluster_shared_config_use_enter(void)
 {
 	ClusterConfigUseGate *gate;
+	uint64 refreshed_sequence = PG_UINT64_MAX;
+	uint32 refreshed_epoch = 0;
 	if (!use_is_native_producer() || use_held
 		|| (gate = cluster_shared_config_delivery_native_gate()) == NULL)
 		return;
@@ -92,6 +94,8 @@ cluster_shared_config_use_enter(void)
 		CHECK_FOR_INTERRUPTS();
 		if (cluster_config_use_gate_enter(gate, continuation, &epoch)) {
 			bool valid = true;
+			bool refresh = false;
+			uint32 target_epoch = 0;
 			/* Record provisional ownership BEFORE any interruptible operation.
 			 * ERROR/exit can then retire it through the same original cleanup. */
 			use_held = true;
@@ -103,10 +107,42 @@ cluster_shared_config_use_enter(void)
 						&& leader->pid > 0
 						&& pg_atomic_read_u32(&leader->cluster_config_use_epoch) == epoch;
 				LWLockRelease(lock);
+			} else {
+				ClusterConfigUseTarget *target = cluster_shared_config_delivery_native_target();
+				ClusterSharedConfigRegistration actual;
+				uint64 sequence = pg_atomic_read_u64(&MyProc->cluster_config.sequence);
+				/* Our reservation keeps the binding immutable even if CLOSE
+				 * wins immediately after entry. No future-child census substitute.
+				 * Epoch zero is the earlier, still-unarmed local integration path;
+				 * it is never a distributed application certificate. */
+				valid = target != NULL;
+				if (valid && target->epoch != 0) {
+					target_epoch = target->epoch;
+					valid
+						= cluster_shared_config_registration_read(&MyProc->cluster_config, &actual)
+						  && actual.pid == MyProcPid && actual.role == (int32)MyBackendType
+						  && sequence == pg_atomic_read_u64(&MyProc->cluster_config.sequence);
+					if (valid) {
+						valid = cluster_config_use_target_matches(target, epoch, &actual);
+						refresh = !valid && !actual.process.failed
+								  && !actual.process.parallel_snapshot
+								  && (target_epoch != refreshed_epoch
+									  || sequence != refreshed_sequence);
+					}
+				}
 			}
 			if (valid)
 				return;
 			cluster_shared_config_use_exit();
+			if (refresh) {
+				/* First retire only our provisional owner. Native reload can then
+				 * run at this real safe point, never inside an old work lifetime.
+				 * Sticky failure cannot be cleared by this retry. */
+				(void)cluster_shared_config_delivery_reload();
+				refreshed_sequence = pg_atomic_read_u64(&MyProc->cluster_config.sequence);
+				refreshed_epoch = target_epoch;
+				continue;
+			}
 		}
 		/* Service reload only while actually waiting. An open fast path must
 		 * not insert a new native file reload after the existing transaction
@@ -114,6 +150,7 @@ cluster_shared_config_use_enter(void)
 		if (ConfigReloadPending) {
 			ConfigReloadPending = false;
 			ProcessConfigFile(PGC_SIGHUP);
+			refreshed_epoch = 0;
 		}
 		/* The interval schedules another observation, not an error deadline.
 		 * Caller cancellation and native postmaster death still terminate. */

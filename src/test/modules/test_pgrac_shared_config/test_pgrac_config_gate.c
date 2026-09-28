@@ -15,24 +15,68 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <unistd.h>
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "postmaster/bgworker.h"
+#include "postmaster/interrupt.h"
 #include "storage/fd.h"
+#include "storage/ipc.h"
 #include "storage/proc.h"
+#include "tcop/tcopprot.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/wait_event.h"
+#include "utils/timestamp.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_shared_config.h"
 #endif
 
 PG_FUNCTION_INFO_V1(test_pgrac_config_gate_state);
+PG_FUNCTION_INFO_V1(test_pgrac_config_future_launch);
+PGDLLEXPORT void test_pgrac_config_future_main(Datum arg);
 void test_pgrac_config_gate_init(void);
 
 #ifdef USE_PGRAC_CLUSTER
 static int request;
+static int bind_request;
 static uint32 cut;
+
+static void
+future_file(const char *suffix, const char *value)
+{
+	char path[MAXPGPATH];
+	FILE *file;
+	snprintf(path, sizeof(path), "%s/test_config.future_%s", DataDir, suffix);
+	file = AllocateFile(path, "w");
+	if (file == NULL || fputs(value, file) < 0 || FreeFile(file) != 0)
+		ereport(ERROR, (errmsg("cannot write native future fixture: %m")));
+}
+
+/* Test-only control at a genuinely empty local cut. Actual parent values,
+ * not desired file bytes, become this fixture's local comparison target.
+ * No all-node/service/CF agreement is supplied or claimed by this test. */
+static void
+gate_bind(int value, void *extra)
+{
+	ClusterConfigUseGate *gate;
+	ClusterConfigUseTarget *target;
+	ClusterSharedConfigProcess actual;
+	ClusterSharedConfigActive common;
+	bool ok;
+	char result[100];
+	if (value <= 0 || IsUnderPostmaster)
+		return;
+	gate = cluster_shared_config_delivery_native_gate();
+	target = cluster_shared_config_delivery_native_target();
+	ok = gate != NULL && target != NULL && cluster_shared_config_process_observe(&actual)
+		 && !actual.failed && cluster_shared_config_common_profile(&common)
+		 && cluster_config_use_target_bind(gate, target, cut, actual.node_id, &actual.ref, &common);
+	snprintf(result, sizeof(result), "%d:%d:%llu\n", value, ok,
+			 (unsigned long long)(ok ? target->ref.identity.generation : 0));
+	future_file("bind", result);
+}
 
 /* Test input only: deliberately no fabricated CF, membership or service ACK.
  * Ordinary clients cannot control this mapping in a production installation.
@@ -85,7 +129,70 @@ test_pgrac_config_gate_init(void)
 	DefineCustomIntVariable("test_pgrac_shared_config.gate_request",
 							"Test-only local cut control, not global configuration authority.",
 							NULL, &request, 0, 0, 10000, PGC_SIGHUP, 0, NULL, gate_request, NULL);
+	DefineCustomIntVariable("test_pgrac_shared_config.gate_bind",
+							"Test-only native common-use binding.", NULL, &bind_request, 0, 0,
+							10000, PGC_SIGHUP, 0, NULL, gate_bind, NULL);
 #endif
+}
+
+Datum
+test_pgrac_config_future_launch(PG_FUNCTION_ARGS)
+{
+	BackgroundWorker worker = { 0 };
+	BackgroundWorkerHandle *handle;
+	pid_t pid;
+	if (!superuser())
+		ereport(ERROR, (errmsg("native future worker requires superuser")));
+	worker.bgw_flags = BGWORKER_SHMEM_ACCESS | BGWORKER_BACKEND_DATABASE_CONNECTION;
+	worker.bgw_start_time = BgWorkerStart_RecoveryFinished;
+	worker.bgw_restart_time = BGW_NEVER_RESTART;
+	strlcpy(worker.bgw_library_name, "test_pgrac_shared_config", BGW_MAXLEN);
+	strlcpy(worker.bgw_function_name, "test_pgrac_config_future_main", BGW_MAXLEN);
+	strlcpy(worker.bgw_name, "test configuration future child", BGW_MAXLEN);
+	strlcpy(worker.bgw_type, "test configuration future child", BGW_MAXLEN);
+	worker.bgw_notify_pid = MyProcPid;
+	if (!RegisterDynamicBackgroundWorker(&worker, &handle)
+		|| WaitForBackgroundWorkerStartup(handle, &pid) != BGWH_STARTED)
+		ereport(ERROR, (errmsg("could not start native future worker")));
+	PG_RETURN_INT32(pid);
+}
+
+void
+test_pgrac_config_future_main(Datum arg)
+{
+	(void)arg;
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigProcess actual;
+		char path[MAXPGPATH], result[100];
+		TimestampTz start = GetCurrentTimestamp();
+		pqsignal(SIGTERM, die);
+		pqsignal(SIGHUP, SignalHandlerForConfigReload);
+		BackgroundWorkerUnblockSignals();
+		if (!cluster_shared_config_process_observe(&actual))
+			ereport(ERROR, (errmsg("native future child has no inherited configuration")));
+		snprintf(result, sizeof(result), "%d:%llu\n", MyProcPid,
+				 (unsigned long long)actual.ref.identity.generation);
+		future_file("ready", result);
+		snprintf(path, sizeof(path), "%s/test_config.future_go", DataDir);
+		while (access(path, F_OK) != 0) {
+			CHECK_FOR_INTERRUPTS();
+			if (TimestampDifferenceExceeds(start, GetCurrentTimestamp(), 30000))
+				ereport(ERROR, (errmsg("native future fixture was not released")));
+			pg_usleep(10000L);
+		}
+		/* Real native entry after the real fork, never a role/PGPROC substitute.
+		 * Do not manually reload: the production pre-use consumer must do it. */
+		BackgroundWorkerInitializeConnection("postgres", NULL, 0);
+		if (!cluster_shared_config_process_observe(&actual))
+			ereport(ERROR, (errmsg("native future child lost configuration")));
+		snprintf(result, sizeof(result), "%llu:%s\n",
+				 (unsigned long long)actual.ref.identity.generation,
+				 GetConfigOption("cluster.read_scache", false, false));
+		future_file("result", result);
+	}
+#endif
+	proc_exit(0);
 }
 
 Datum

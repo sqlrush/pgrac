@@ -45,6 +45,7 @@ typedef struct ConfigDeliveryFamily {
 	pg_atomic_uint32 lmon_pid;
 	pg_atomic_uint32 logger_pid;
 	ClusterConfigUseGate native_use;
+	ClusterConfigUseTarget native_target;
 	ClusterSharedConfigDeliverySlot incoming;
 	ClusterSharedConfigDeliverySlot accepted;
 	ClusterSharedConfigSlot logger;
@@ -92,6 +93,13 @@ cluster_shared_config_delivery_native_gate(void)
 		|| pg_atomic_read_u64(&delivery_family->generation) != delivery_generation)
 		return NULL;
 	return &delivery_family->native_use;
+}
+
+ClusterConfigUseTarget *
+cluster_shared_config_delivery_native_target(void)
+{
+	return cluster_shared_config_delivery_native_gate() != NULL ? &delivery_family->native_target
+																: NULL;
 }
 
 bool
@@ -185,6 +193,7 @@ cluster_shared_config_delivery_start(void)
 	pg_atomic_init_u32(&delivery_family->lmon_pid, 0);
 	pg_atomic_init_u32(&delivery_family->logger_pid, 0);
 	cluster_config_use_gate_init(&delivery_family->native_use);
+	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	cluster_shared_config_delivery_slot_init(&delivery_family->accepted);
 	cluster_shared_config_registration_init(&delivery_family->logger);
@@ -210,6 +219,7 @@ cluster_shared_config_delivery_new_shmem(void)
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	pg_atomic_write_u32(&delivery_family->lmon_pid, 0);
 	cluster_config_use_gate_init(&delivery_family->native_use);
+	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	delivery_generation = generation + 1;
 	pg_atomic_write_u64(&delivery_family->generation, delivery_generation);
 	if (!cluster_shared_config_delivery_parent_publish())
