@@ -1089,13 +1089,15 @@ UT_TEST(startup_sync_preserves_actual_promise_and_closes_all_fds)
 		tail_fail_sync = cut;
 		memset(&after, 0xa5, sizeof(after));
 		if (cut == 0) {
-			UT_ASSERT_EQ(cluster_wal_startup_sync(scratch, &ref, wal_segment_size,
-				wal_segment_size, &after), 0);
+			UT_ASSERT_EQ(
+				cluster_wal_startup_sync(scratch, &ref, wal_segment_size, wal_segment_size, &after),
+				0);
 			UT_ASSERT_EQ(tail_sync_count, 7);
 			UT_ASSERT_EQ(memcmp(&before, &after, sizeof(before)), 0);
 		} else {
-			UT_ASSERT(cluster_wal_startup_sync(scratch, &ref, wal_segment_size,
-				wal_segment_size, &after) != 0);
+			UT_ASSERT(
+				cluster_wal_startup_sync(scratch, &ref, wal_segment_size, wal_segment_size, &after)
+				!= 0);
 			UT_ASSERT_EQ(memcmp(&after, &zero, sizeof(after)), 0);
 		}
 		tail_fail_sync = 0;
@@ -1105,10 +1107,136 @@ UT_TEST(startup_sync_preserves_actual_promise_and_closes_all_fds)
 	}
 }
 
+typedef struct SealedVisitTest {
+	unsigned calls;
+	int fault;
+} SealedVisitTest;
+
+static bool
+sealed_visit(XLogReaderState *reader, void *arg)
+{
+	SealedVisitTest *test = arg;
+	UT_ASSERT_EQ(reader->seg.ws_tli, ref.timeline);
+	UT_ASSERT_EQ(XLogRecGetRmid(reader), RM_XLOG_ID);
+	test->calls++;
+	if (test->fault == 1)
+		return false;
+	if (test->fault == 2)
+		pg_re_throw();
+	if (test->fault == 3) {
+		ClusterWalDurablePrefix prefix;
+		UT_ASSERT_EQ(cluster_wal_durable_prefix_read(scratch, &ref, &prefix), 0);
+		prefix.sequence++;
+		prefix_write(prefix);
+	}
+	return true;
+}
+
+static ClusterControlRootSnapshot
+sealed_fixture(bool empty)
+{
+	ClusterControlRootSnapshot root = { 0 };
+	ClusterWalDurablePrefix p;
+	CheckPoint cp = { 0 };
+	fixture();
+	cp.redo = wal_segment_size + SizeOfXLogLongPHD;
+	cp.ThisTimeLineID = cp.PrevTimeLineID = ref.timeline;
+	cp.nextXid = FullTransactionIdFromU64(100);
+	p = startup_record(cp.redo, 0, XLOG_CHECKPOINT_SHUTDOWN, InvalidTransactionId, &cp, sizeof(cp));
+	prefix_write(empty ? (ClusterWalDurablePrefix){ 1, 0, 0, 0 } : p);
+	root.identity = ref.claim.identity;
+	root.lifecycle = CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED;
+	root.root_flags
+		= CLUSTER_CONTROL_ROOT_FLAG_CLAIM_VALID | CLUSTER_CONTROL_ROOT_FLAG_CHECKPOINT_VALID
+		  | CLUSTER_CONTROL_ROOT_FLAG_TAIL_VALID | CLUSTER_CONTROL_ROOT_FLAG_TAIL_LAST_RECORD_VALID;
+	root.checkpoint_tli = root.tail_tli = ref.timeline;
+	root.checkpoint_lower_lsn = root.tail_last_record_lsn = p.record_start;
+	root.validated_tail_lsn_exclusive = p.exclusive_end;
+	root.checkpoint_record_crc32c = root.tail_last_record_crc32c = p.record_crc;
+	root.tail_validation_kind = CLUSTER_CONTROL_ROOT_TAIL_WAL_RECORD_SCAN_V1;
+	return root;
+}
+
+UT_TEST(sealed_reader_accepts_promoted_empty_but_not_missing_promise)
+{
+	for (unsigned scenario = 0; scenario < 3; scenario++) {
+		ClusterControlRootSnapshot root = sealed_fixture(scenario != 0);
+		ClusterWalTailObservation out, zero = { 0 };
+		SealedVisitTest visit = { 0 };
+		int before = fd_count();
+		local_tli = 88;
+		if (scenario == 2)
+			UT_ASSERT_EQ(unlink(prefix_path), 0);
+		memset(&out, 0xa5, sizeof(out));
+		if (scenario != 2) {
+			UT_ASSERT_EQ(cluster_wal_tail_visit_sealed(scratch, &ref, wal_segment_size, &root,
+													   root.checkpoint_lower_lsn, sealed_visit,
+													   &visit, &out),
+						 0);
+			UT_ASSERT_EQ(visit.calls, 1);
+			UT_ASSERT_EQ(out.records, 1);
+			UT_ASSERT_EQ(out.complete_end, root.validated_tail_lsn_exclusive);
+			UT_ASSERT_EQ(out.durable_prefix.exclusive_end,
+						 scenario == 0 ? root.validated_tail_lsn_exclusive : 0);
+		} else {
+			UT_ASSERT(cluster_wal_tail_visit_sealed(scratch, &ref, wal_segment_size, &root,
+													root.checkpoint_lower_lsn, sealed_visit, &visit,
+													&out)
+					  != 0);
+			UT_ASSERT_EQ(visit.calls, 0);
+			UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		}
+		UT_ASSERT_EQ(fd_count(), before);
+	}
+}
+
+UT_TEST(sealed_reader_refuses_changed_cut_and_discards_provisional_output)
+{
+	for (int fault = 0; fault < 9; fault++) {
+		ClusterControlRootSnapshot root = sealed_fixture(false);
+		ClusterWalTailObservation out = { 0 }, zero = { 0 };
+		SealedVisitTest visit = { 0 };
+		volatile bool caught = false;
+		int before = fd_count();
+		if (fault < 3)
+			visit.fault = fault + 1;
+		else if (fault == 3)
+			(void)record_write(generation, root.validated_tail_lsn_exclusive,
+							   root.tail_last_record_lsn, 24);
+		else if (fault == 4)
+			root.tail_last_record_crc32c ^= 1;
+		else if (fault == 5)
+			root.checkpoint_record_crc32c ^= 1;
+		else if (fault == 6)
+			root.identity.origin_owner_incarnation++;
+		else if (fault == 7)
+			read_action = 3;
+		else
+			close_action = 1;
+		PG_TRY();
+		{
+			UT_ASSERT(cluster_wal_tail_visit_sealed(scratch, &ref, wal_segment_size, &root,
+													root.checkpoint_lower_lsn, sealed_visit, &visit,
+													&out)
+					  != 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 1);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(fd_count(), before);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(36);
+	UT_PLAN(38);
+	UT_RUN(sealed_reader_accepts_promoted_empty_but_not_missing_promise);
+	UT_RUN(sealed_reader_refuses_changed_cut_and_discards_provisional_output);
 	UT_RUN(startup_sync_preserves_actual_promise_and_closes_all_fds);
 	UT_RUN(startup_rejects_invalid_fpw_payload);
 	UT_RUN(startup_rejects_short_checkpoint_payload);

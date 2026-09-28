@@ -72,7 +72,8 @@
 #include "cluster/cluster_thread_recovery.h"	 /* engine / driver / pure gates                */
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
-#include "cluster/cluster_wal_state.h"		   /* replay-window slot read                     */
+#include "cluster/cluster_wal_state.h" /* replay-window slot read                     */
+#include "cluster/cluster_wal_tail.h"
 #include "cluster/cluster_write_fence.h"	   /* spec-4.12 D6 durable authority verify        */
 #include "cluster/storage/cluster_shared_fs.h" /* CLUSTER_SHARED_FS_BACKEND_CLUSTER_FS         */
 
@@ -700,8 +701,17 @@ cluster_thread_recovery_replay_one(uint16 dead_tid, uint64 episode_epoch,
 	 * validated_min (mid-stream corruption, never a silent truncation of the dead
 	 * thread's committed WAL; 8.A).  BLOCKED here keeps the thread frozen.
 	 */
-	if (cluster_thread_recovery_validated_end(dead_tid, lower, validated_min, &scan_upper)
-		!= CLUSTER_THREADREC_DONE) {
+	if (cluster_shared_config) {
+		ClusterWalTailObservation observed;
+		if (cluster_control_root_recovery_visit(authority->root_snapshot, authority->root_token,
+												NULL, NULL, &observed)
+			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			cluster_thread_recovery_count_blocked();
+			return CLUSTER_THREADREC_BLOCKED;
+		}
+		scan_upper = observed.complete_end;
+	} else if (cluster_thread_recovery_validated_end(dead_tid, lower, validated_min, &scan_upper)
+			   != CLUSTER_THREADREC_DONE) {
 		ereport(LOG, (errmsg("cluster thread recovery: dead thread %u validated-end decode failed "
 							 "(lower %X/%X, validated_min %X/%X) -> BLOCKED (kept frozen)",
 							 dead_tid, LSN_FORMAT_ARGS(lower), LSN_FORMAT_ARGS(validated_min))));

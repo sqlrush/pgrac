@@ -8,9 +8,40 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/xlogreader.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
+#include "cluster/cluster_wal_tail.h"
+
+/* PGRAC: exact-generation records remain provisional until the complete
+ * physical scan and owner revalidation succeed. Author: SqlRush <sqlrush@gmail.com> */
+typedef struct FabricVisitWork {
+	const ClusterThreadRecoveryAuthorityV1 *authority;
+	ClusterThreadRecoveryFabricPlanV1 *plan;
+	RfPageProofDetailV1 detail;
+	uint64 records;
+} FabricVisitWork;
+
+static bool
+fabric_visit_record(XLogReaderState *reader, void *arg)
+{
+	FabricVisitWork *work = arg;
+	if (cluster_thread_recovery_authority_revalidate_nowait_v1(work->authority)
+		!= CLUSTER_THREAD_AUTHORITY_OK) {
+		work->detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
+		return false;
+	}
+	if (work->records == UINT64_MAX) {
+		work->detail = RF_PAGE_PROOF_DETAIL_CAPACITY;
+		return false;
+	}
+	work->detail = cluster_thread_recovery_fabric_plan_feed_record_v1(work->plan, reader, 0);
+	if (work->detail != RF_PAGE_PROOF_DETAIL_OK)
+		return false;
+	work->records++;
+	return true;
+}
 
 static bool
 fabric_scan_root_exact(uint16 dead_thread, XLogRecPtr scan_begin, XLogRecPtr scan_end,
@@ -78,6 +109,35 @@ cluster_thread_recovery_fabric_scan_root_v1(uint16 dead_thread, XLogRecPtr scan_
 	detail = cluster_thread_recovery_fabric_plan_create_v1(&request, &plan);
 	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
+	if (cluster_shared_config) {
+		FabricVisitWork visit = { authority, plan, RF_PAGE_PROOF_DETAIL_OK, 0 };
+		ClusterWalTailObservation observed;
+		ClusterControlRootResult source;
+		PG_TRY();
+		{
+			source = cluster_control_root_recovery_visit(authority->root_snapshot,
+														 authority->root_token, fabric_visit_record,
+														 &visit, &observed);
+		}
+		PG_CATCH();
+		{
+			cluster_thread_recovery_fabric_plan_destroy_v1(&plan);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+		if (source != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			detail = visit.detail == RF_PAGE_PROOF_DETAIL_OK ? RF_PAGE_PROOF_DETAIL_SOURCE_GAP
+															 : visit.detail;
+			goto done;
+		}
+		if (visit.records == 0 || visit.records != observed.records
+			|| observed.complete_end != scan_end_exclusive) {
+			detail = RF_PAGE_PROOF_DETAIL_SOURCE_GAP;
+			goto done;
+		}
+		record_count = visit.records;
+		goto validate_plan;
+	}
 
 	reader = cluster_thread_wal_reader_make(dead_thread, &reader_private);
 	if (reader == NULL || reader_private == NULL) {
@@ -114,6 +174,7 @@ cluster_thread_recovery_fabric_scan_root_v1(uint16 dead_thread, XLogRecPtr scan_
 	}
 	if (!reached_upper)
 		goto done;
+validate_plan:
 	if (cluster_thread_recovery_authority_revalidate_nowait_v1(authority)
 			!= CLUSTER_THREAD_AUTHORITY_OK
 		|| !cluster_thread_recovery_authority_covers_window_v1(

@@ -15,6 +15,27 @@ typedef struct ClusterWalTailObservation {
 	uint64 records;
 } ClusterWalTailObservation;
 
+struct XLogReaderState;
+typedef bool (*ClusterWalRecordVisitor)(struct XLogReaderState *reader, void *arg);
+
+/* Read-only provisional records: a visitor must not publish or mutate shared
+ * state. Later input/revalidation failure invalidates every record it saw.
+ * A real EMPTY promise is allowed only against this exact sealed root cut;
+ * missing promises, different checkpoints or complete suffixes still refuse.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern ClusterControlRootResult
+cluster_wal_tail_visit_sealed(const char *wal_root, const ClusterWalDurablePrefixRef *ref,
+							  int segment_size, const ClusterControlRootSnapshot *sealed,
+							  XLogRecPtr checkpoint_start, ClusterWalRecordVisitor visitor,
+							  void *arg, ClusterWalTailObservation *out);
+
+/* Resolve the selected v3 claim/anchor under CF-S, scan without CF, then
+ * reobserve the exact root token/record. Caller retains and revalidates its
+ * separate IR/fencing/WALR owner bundle. This supplies input, not permission. */
+extern ClusterControlRootResult cluster_control_root_recovery_visit(
+	const ClusterControlRootSnapshot *expected, const ClusterControlRootReadToken *token,
+	ClusterWalRecordVisitor visitor, void *arg, ClusterWalTailObservation *out);
+
 /* Startup-only physical input, never a close/recovery/serving permission.
  * Zero maxima mean no PARAMETER_CHANGE record was observed; the caller must
  * also retain the predecessor/history/configuration requirements. */
@@ -56,8 +77,9 @@ extern ClusterControlRootResult cluster_wal_startup_observe(const char *wal_root
  * writer's promise or grants permission. Caller must own/revalidate isolation,
  * WALR and purpose-bound IR before and after this operation. */
 extern ClusterControlRootResult cluster_wal_startup_sync(const char *wal_root,
-	const ClusterWalDurablePrefixRef *ref, int segment_size, XLogRecPtr first_segment,
-	ClusterWalStartupObservation *out);
+														 const ClusterWalDurablePrefixRef *ref,
+														 int segment_size, XLogRecPtr first_segment,
+														 ClusterWalStartupObservation *out);
 
 /* Caller supplies a root-selected immutable reference and exact checkpoint
  * record start, NOT an arbitrary point at which to search for a later record.

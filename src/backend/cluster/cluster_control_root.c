@@ -9116,6 +9116,103 @@ release_walr:
 	return result;
 }
 
+/* PGRAC: keep the exact shared recovery source inside one owned read scope.
+ * No raw reader/FD escapes to a caller and no provisional record is authority.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct RecoveryWalVisitWork {
+	ControlRootImage image;
+	ClusterControlRootSnapshot expected;
+	ClusterControlRootReadToken token;
+	ClusterWalDurablePrefixRef ref;
+	ControlFileData control;
+	ClusterWalTailObservation tail;
+	LOCKMODE cf_mode;
+} RecoveryWalVisitWork;
+
+static ClusterControlRootResult
+recovery_wal_visit_root(RecoveryWalVisitWork *work)
+{
+	ClusterControlRootFileToken file_token;
+	ClusterControlRootReadToken actual;
+	ClusterControlRootResult result;
+	unsigned node = work->expected.identity.origin_node_id;
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ShareLock;
+	result = read_thread_version(&work->expected.identity, &work->image, &work->control,
+								 &file_token, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		make_read_token(&work->image, node + 1, CONTROL_ROOT_SOURCE_PRIMARY, &actual);
+		if (!read_token_equal(&work->token, &actual)
+			|| memcmp(&work->expected, &work->image.records[node], sizeof(work->expected)) != 0
+			|| work->image.startup[node].generation != 0)
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	}
+	work->cf_mode = NoLock;
+	return release_cf(ShareLock, result);
+}
+
+ClusterControlRootResult
+cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
+									const ClusterControlRootReadToken *token,
+									ClusterWalRecordVisitor visitor, void *arg,
+									ClusterWalTailObservation *out)
+{
+	RecoveryWalVisitWork *work;
+	ClusterControlRootResult result;
+	unsigned node;
+	bool alias = history_ranges_overlap(expected, sizeof(*expected), out, sizeof(*out))
+				 || history_ranges_overlap(token, sizeof(*token), out, sizeof(*out));
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (alias || expected == NULL || token == NULL || out == NULL
+		|| expected->identity.origin_node_id < 0
+		|| expected->identity.origin_node_id >= CLUSTER_MAX_NODES
+		|| expected->identity.origin_thread_id != expected->identity.origin_node_id + 1
+		|| expected->lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_REQUIRED)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (!cluster_enabled || !cluster_shared_config || !cluster_controlfile_shared_authority
+		|| CritSectionCount != 0 || expected->identity.system_identifier != GetSystemIdentifier())
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	result = storage_contract_check(expected->identity.storage_uuid, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work = palloc0(sizeof(*work));
+	work->expected = *expected;
+	work->token = *token;
+	node = expected->identity.origin_node_id;
+	PG_TRY();
+	{
+		result = recovery_wal_visit_root(work);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+			work->ref.claim.identity = work->expected.identity;
+			work->ref.claim.database_incarnation = work->image.header.v2.database_incarnation;
+			work->ref.claim.max_config_generation = work->image.header.v2.config_generation;
+			memcpy(work->ref.claim.claim_sha256, work->image.refs[node].claim_sha256, 32);
+			work->ref.timeline = work->expected.checkpoint_tli;
+			result = cluster_wal_tail_visit_sealed(
+				cluster_wal_threads_dir, &work->ref, wal_segment_size, &work->expected,
+				work->control.checkPoint, visitor, arg, &work->tail);
+		}
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = recovery_wal_visit_root(work);
+	}
+	PG_CATCH();
+	{
+		if (work->cf_mode != NoLock)
+			(void)release_cf(work->cf_mode, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		*out = work->tail;
+	pfree(work);
+	return result;
+}
+
 ClusterControlRootResult
 cluster_control_root_revalidate(const ClusterControlRootReadToken *token,
 								const ClusterControlRootIdentity *expected_identity,

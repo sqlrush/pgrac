@@ -11490,6 +11490,25 @@ UT_TEST(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal)
 	}
 }
 
+typedef struct RecoveryVisitTest {
+	unsigned calls;
+	int fault;
+} RecoveryVisitTest;
+
+static bool
+recovery_visit_record(XLogReaderState *reader, void *arg)
+{
+	RecoveryVisitTest *test = arg;
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(XLogRecGetRmid(reader), RM_XLOG_ID);
+	test->calls++;
+	if (test->fault == 1)
+		v2_checkpoint_root_race();
+	if (test->fault == 2)
+		pg_re_throw();
+	return test->fault != 3;
+}
+
 /* A complete first checkpoint is recovery input even when its writer died
  * before publishing DURABLE. Promotion must retain W0, select W1's real
  * checkpoint and defer completion to ordinary recovery. */
@@ -11533,6 +11552,18 @@ UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
 		UT_ASSERT_EQ(test_worker_replays, 0);
 		UT_ASSERT(!test_worker_pin_held);
 		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		{
+			ClusterWalTailObservation observed;
+			RecoveryVisitTest visit = { 0 };
+			UT_ASSERT_EQ(cluster_control_root_recovery_visit(
+							 &snapshot, &token, recovery_visit_record, &visit, &observed),
+						 0);
+			UT_ASSERT_EQ(visit.calls, 1);
+			UT_ASSERT_EQ(observed.complete_end, snapshot.validated_tail_lsn_exclusive);
+			UT_ASSERT_EQ(observed.last_record_crc, snapshot.tail_last_record_crc32c);
+			UT_ASSERT_EQ(observed.durable_prefix.exclusive_end,
+						 empty_promise ? 0 : test_checkpoint_end);
+		}
 		test_actual_cf = test_cf_mode = ShareLock;
 		UT_ASSERT_EQ(
 			cluster_control_root_v3_read_thread_locked(&op.claim.identity, root, &control, &file),
@@ -11573,6 +11604,59 @@ UT_TEST(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done)
 		test_reserve_mode = false;
 		pfree(inputs);
 		pfree(root);
+	}
+}
+
+UT_TEST(test_exact_recovery_source_discards_stale_or_cancelled_input)
+{
+	for (int fault = 0; fault < 5; fault++) {
+		ClusterRecoverySerialGuard serial;
+		ClusterThreadRecLaunchEligibility eligibility = { 0 };
+		ClusterWalStartupImage op = pending_inspection_fixture(&serial, true);
+		ClusterControlRootSnapshot snapshot;
+		ClusterControlRootReadToken token;
+		ClusterWalTailObservation out, zero = { 0 };
+		RecoveryVisitTest visit = { 0, fault };
+		volatile bool caught = false;
+		if (ut_current_failed)
+			return;
+		eligibility.origin_thread = 1;
+		eligibility.attempt_stamp = 123;
+		eligibility.subject_kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
+		eligibility.duty = op.claim.identity;
+		memcpy(eligibility.selected_root_sha256, serial.pending.file.image_sha256, 32);
+		test_worker_pin_held = false;
+		UT_ASSERT_EQ(thread_recovery_worker_run(&eligibility), CLUSTER_THREADREC_DEFERRED);
+		UT_ASSERT_EQ(
+			cluster_control_root_v3_read_canonical(1, &op.claim.identity, &snapshot, &token), 0);
+		if (ut_current_failed)
+			return;
+		if (fault == 0)
+			token.file_txn_seq++;
+		if (fault == 4)
+			test_cf_release_confirmed = false;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			UT_ASSERT(cluster_control_root_recovery_visit(&snapshot, &token, recovery_visit_record,
+														  &visit, &out)
+					  != 0);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 2);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+		UT_ASSERT_EQ(visit.calls, fault == 0 || fault == 4 ? 0 : 1);
+		if (fault != 4)
+			UT_ASSERT_EQ(test_actual_cf, NoLock);
+		/* The release-negative boundary retains the existing registered CF
+		 * owner. Reset only the fixture after checking refusal, not product state. */
+		test_cf_release_confirmed = true;
+		test_actual_cf = test_cf_mode = NoLock;
+		test_reserve_mode = false;
 	}
 }
 
@@ -17491,7 +17575,7 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(317);
+	UT_PLAN(318);
 	UT_RUN(test_initializer_selected_evidence_survives_producer_exit_and_exec);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
@@ -17759,6 +17843,7 @@ main(int argc, char **argv)
 	UT_RUN(test_runtime_pending_worker_owns_exact_subject_before_inspection);
 	UT_RUN(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal);
 	UT_RUN(test_runtime_pending_checkpoint_promotes_without_claiming_recovery_done);
+	UT_RUN(test_exact_recovery_source_discards_stale_or_cancelled_input);
 	UT_RUN(test_runtime_pending_checkpoint_sync_cuts_preserve_recoverable_input);
 	UT_RUN(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_horizon);
 	UT_RUN(test_runtime_pending_worker_publishes_checkpointless_terminal);

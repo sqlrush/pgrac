@@ -10,9 +10,21 @@
 #include "cluster/cluster_thread_recovery.h"
 #include "cluster/cluster_thread_recovery_authority.h"
 #include "cluster/cluster_thread_recovery_fabric.h"
+#include "cluster/cluster_wal_tail.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+bool cluster_shared_config;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack == NULL)
+		abort();
+	siglongjmp(*PG_exception_stack, 1);
+}
 
 void
 ExceptionalCondition(const char *condition_name, const char *file_name, int line_number)
@@ -41,6 +53,8 @@ static int plan_seal_count;
 static int plan_destroy_count;
 static XLogRecPtr begin_read_lsn;
 static bool authority_current;
+static int exact_source_count;
+static int exact_source_fault;
 
 ClusterThreadRecoveryAuthorityResultV1
 cluster_thread_recovery_authority_revalidate_nowait_v1(
@@ -65,6 +79,11 @@ cluster_thread_wal_reader_make(uint16 dead_thread, void **private_out)
 	UT_ASSERT_EQ(dead_thread, 2);
 	UT_ASSERT(private_out != NULL);
 	reader_make_count++;
+	/* The actual legacy factory refuses PRE2: a tid is not a generation. */
+	if (cluster_shared_config) {
+		*private_out = NULL;
+		return NULL;
+	}
 	memset(&reader, 0, sizeof(reader));
 	reader.seg.ws_tli = 1;
 	*private_out = &reader_private_object;
@@ -100,6 +119,36 @@ XLogReadRecord(XLogReaderState *state, char **error_message)
 	state->EndRecPtr = record_end[index];
 	state->record = &decoded[index];
 	return &raw_records[index];
+}
+
+/* Routing boundary only; real files and the exact production root scanner
+ * are exercised by test_cluster_control_root/test_cluster_thread_tail. */
+ClusterControlRootResult
+cluster_control_root_recovery_visit(const ClusterControlRootSnapshot *expected,
+									const ClusterControlRootReadToken *token,
+									ClusterWalRecordVisitor visitor, void *arg,
+									ClusterWalTailObservation *out)
+{
+	char *error = NULL;
+	UT_ASSERT(expected != NULL && token != NULL && visitor != NULL);
+	exact_source_count++;
+	memset(out, 0, sizeof(*out));
+	memset(&reader, 0, sizeof(reader));
+	reader.seg.ws_tli = 7;
+	XLogBeginRead(&reader, 0x100);
+	while (XLogReadRecord(&reader, &error) != NULL) {
+		if (exact_source_fault == 1 && read_index == 2)
+			authority_current = false;
+		if (exact_source_fault == 3 && read_index == 2)
+			pg_re_throw();
+		if (!visitor(&reader, arg))
+			return CLUSTER_CONTROL_ROOT_RECONFIG_WAIT;
+	}
+	if (exact_source_fault == 2)
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	out->records = record_count;
+	out->complete_end = record_end[record_count - 1];
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 
 RfPageProofDetailV1
@@ -154,6 +203,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 {
 	static ClusterRecoveryDutyKey duty;
 	static ClusterControlRootSnapshot root;
+	static ClusterControlRootReadToken token;
 
 	memset(authority, 0, sizeof(*authority));
 	memset(&duty, 0, sizeof(duty));
@@ -168,6 +218,7 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	root.validated_tail_lsn_exclusive = 0x200;
 	authority->duty = &duty;
 	authority->root_snapshot = &root;
+	authority->root_token = &token;
 	authority->retention_pin = (ClusterWalRetentionPin *)&retention_pin_object;
 	record_begin[0] = 0x100;
 	record_end[0] = 0x140;
@@ -181,6 +232,57 @@ init_case(ClusterThreadRecoveryAuthorityV1 *authority)
 	plan_destroy_count = 0;
 	begin_read_lsn = InvalidXLogRecPtr;
 	authority_current = true;
+	cluster_shared_config = false;
+	exact_source_count = exact_source_fault = 0;
+}
+
+UT_TEST(test_shared_config_uses_exact_source_without_legacy_fallback)
+{
+	ClusterThreadRecoveryAuthorityV1 authority;
+	ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+	uint64 records = 0;
+
+	init_case(&authority);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_thread_recovery_fabric_scan_root_v1(2, 0x100, 0x200, &authority, false,
+															 &plan, &records),
+				 RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(plan == (ClusterThreadRecoveryFabricPlanV1 *)&fabric_object && records == 2);
+	UT_ASSERT_EQ(reader_make_count, 0);
+	UT_ASSERT_EQ(exact_source_count, 1);
+	UT_ASSERT_EQ(plan_feed_count, 2);
+	UT_ASSERT_EQ(plan_seal_count, 1);
+	UT_ASSERT_EQ(plan_destroy_count, 0);
+}
+
+UT_TEST(test_shared_source_failure_discards_every_provisional_record)
+{
+	for (int fault = 1; fault <= 3; fault++) {
+		ClusterThreadRecoveryAuthorityV1 authority;
+		ClusterThreadRecoveryFabricPlanV1 *plan = NULL;
+		uint64 records = 7;
+		volatile bool caught = false;
+		init_case(&authority);
+		cluster_shared_config = true;
+		exact_source_fault = fault;
+		PG_TRY();
+		{
+			RfPageProofDetailV1 detail = cluster_thread_recovery_fabric_scan_root_v1(
+				2, 0x100, 0x200, &authority, false, &plan, &records);
+			UT_ASSERT_EQ(detail, fault == 1 ? RF_PAGE_PROOF_DETAIL_ROOT_STALE
+											: RF_PAGE_PROOF_DETAIL_SOURCE_GAP);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 3);
+		UT_ASSERT(plan == NULL && records == 0);
+		UT_ASSERT_EQ(plan_seal_count, 0);
+		UT_ASSERT_EQ(plan_destroy_count, 1);
+		UT_ASSERT_EQ(reader_make_count, 0);
+	}
 }
 
 UT_TEST(test_scans_exact_root_cut_and_seals_only_at_upper_boundary)
@@ -257,7 +359,9 @@ UT_TEST(test_non_root_window_is_rejected_before_reader_or_plan)
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(6);
+	UT_RUN(test_shared_config_uses_exact_source_without_legacy_fallback);
+	UT_RUN(test_shared_source_failure_discards_every_provisional_record);
 	UT_RUN(test_scans_exact_root_cut_and_seals_only_at_upper_boundary);
 	UT_RUN(test_early_end_destroys_unsealed_plan);
 	UT_RUN(test_feed_failure_poisons_and_destroys_whole_plan);
