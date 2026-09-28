@@ -129,6 +129,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_shared_config \
 		test_cluster_config_delivery_driver \
 		test_cluster_config_delivery_route \
+		test_cluster_config_delivery_work \
 		test_cluster_config_census \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
@@ -431,6 +432,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_work,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_census,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
@@ -1486,6 +1488,14 @@ test_cluster_config_delivery_route.inc: $(top_srcdir)/src/backend/utils/misc/guc
 	     END { if (starts != 1 || ends != 1) exit 1 }' $< > $@.tmp && mv $@.tmp $@
 test_cluster_config_delivery_route: test_cluster_config_delivery_route.c unit_test.h test_cluster_config_delivery_route.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: whole production delivery module; only external runtime boundaries
+# are isolated. Native tests separately cover real assignment and inheritance.
+test_cluster_config_delivery_work: test_cluster_config_delivery_work.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_shared_config_delivery.c \
+		$(top_srcdir)/src/include/cluster/cluster_shared_config.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_config_delivery_driver: test_cluster_config_delivery_driver.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o \

@@ -25,7 +25,12 @@
 #include "storage/ipc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "cluster/cluster_clean_leave.h"
+#include "cluster/cluster_cr_server.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_terminal_ref_census.h"
 
 /* Not main shmem: the native logger deliberately detaches that mapping. This
  * unnamed carrier dies with the last native family process. Neither its bytes
@@ -98,6 +103,31 @@ cluster_shared_config_delivery_work_leave(bool entered)
 	}
 	/* PG_FINALLY can run during ERROR cleanup. Do not assign, allocate, wait,
 	 * or invoke hooks here. The next actual idle boundary owns the retry. */
+}
+
+/* Returning to a service loop is not completion of its asynchronous work.
+ * Observe the original owners, without sealing, parking or cancelling them.
+ * This is only a local deferral condition, not a cluster drain certificate:
+ * shared producers and transport obligations require their separate cut.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+delivery_has_owned_work(void)
+{
+	int slot;
+	const char *reason;
+
+	if (delivery_work_depth != 0 || IsTransactionState() || IsTransactionOrTransactionBlock()
+		|| cluster_semantic_activation_backend_has_admission())
+		return true;
+	if ((AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess())
+		&& cluster_gcs_block_normal_stop_local_poll(&slot, &reason) != CLUSTER_NORMAL_STOP_READY)
+		return true;
+	if (AmLmsProcess() && !cluster_cr_server_r4_worker0_drained())
+		return true;
+	if (AmUndoCleanerProcess() && !cluster_ctrc_cleaner_local_idle())
+		return true;
+	return false;
 }
 
 /* Main-shmem children cannot cross its native reset. The detached logger is
@@ -377,9 +407,7 @@ cluster_shared_config_delivery_reload(void)
 		if (cluster_shared_config_delivery_slot_read(slot, generation, &ref, &image)
 			&& pg_atomic_read_u64(&delivery_family->generation) == generation) {
 			bool can_apply = true;
-			if (IsUnderPostmaster
-				&& (delivery_work_depth != 0 || IsTransactionState()
-					|| IsTransactionOrTransactionBlock())) {
+			if (IsUnderPostmaster && delivery_has_owned_work()) {
 				bool needs_idle;
 				can_apply = cluster_shared_config_process_reload_needs_idle(
 								image.bytes, image.len, &ref, &needs_idle, &report)
@@ -432,8 +460,7 @@ cluster_shared_config_delivery_reload(void)
 void
 cluster_shared_config_delivery_retry_idle(void)
 {
-	if (!delivery_waiting_for_idle || !IsUnderPostmaster || delivery_work_depth != 0
-		|| IsTransactionState() || IsTransactionOrTransactionBlock())
+	if (!delivery_waiting_for_idle || !IsUnderPostmaster || delivery_has_owned_work())
 		return;
 	/* Prevent recursive native hooks from entering this retry again. */
 	delivery_waiting_for_idle = false;

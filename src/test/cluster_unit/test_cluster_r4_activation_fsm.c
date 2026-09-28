@@ -5461,11 +5461,48 @@ UT_TEST(test_106_exit_hook_drains_both_side_ledgers)
 	UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
 												   CLUSTER_SEMANTIC_TARGET_SIDE, &target_token),
 				 CLUSTER_SEMANTIC_ADMISSION_OK);
+	UT_ASSERT(cluster_semantic_activation_backend_has_admission());
 	UT_ASSERT_NOT_NULL(test_exit_callback);
 	if (test_exit_callback != NULL)
 		test_exit_callback(0, test_exit_callback_arg);
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_SOURCE_SIDE, 0)), 0);
 	UT_ASSERT_EQ(pg_atomic_read_u32(test_gate_inflight(CLUSTER_SEMANTIC_TARGET_SIDE, 0)), 0);
+	UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+}
+
+/* PGRAC: configuration reload consumes this local predicate for auxiliary
+ * owners too. Epoch drift or one token's release is not complete retirement;
+ * another process's shared debt is not this process's private ownership.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+UT_TEST(test_local_admission_observation_tracks_actual_auxiliary_lifetime)
+{
+	AuxProcType roles[] = { LmsProcess, LmsWorker1Process, UndoCleanerProcess, LmonProcess };
+	for (size_t role = 0; role < lengthof(roles); role++)
+		for (int side = CLUSTER_SEMANTIC_SOURCE_SIDE; side <= CLUSTER_SEMANTIC_TARGET_SIDE; side++) {
+			ClusterSemanticAdmissionToken first, second;
+			test_gate_reset();
+			MyAuxProcType = roles[role];
+			test_gate_publish(2, side == CLUSTER_SEMANTIC_TARGET_SIDE
+								 ? CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1 : 0,
+							  17, test_current_epoch, false);
+			UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+			UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														   side, &first), CLUSTER_SEMANTIC_ADMISSION_OK);
+			UT_ASSERT_EQ(cluster_semantic_activation_enter(CLUSTER_SEMANTIC_FEATURE_R4_SYNC_CR_V1,
+														   side, &second), CLUSTER_SEMANTIC_ADMISSION_OK);
+			UT_ASSERT(cluster_semantic_activation_backend_has_admission());
+			test_current_epoch++;
+			UT_ASSERT(!cluster_semantic_activation_recheck(&first));
+			UT_ASSERT(cluster_semantic_activation_backend_has_admission());
+			cluster_semantic_activation_leave(&first);
+			UT_ASSERT(cluster_semantic_activation_backend_has_admission());
+			cluster_semantic_activation_leave(&second);
+			UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+			pg_atomic_write_u32(test_gate_inflight(side, 0), 1);
+			UT_ASSERT(!cluster_semantic_activation_backend_has_admission());
+		}
+	test_gate_reset();
 }
 
 UT_TEST(test_107_odd_snapshot_is_bounded_closed_without_debt)
@@ -10571,7 +10608,7 @@ UT_TEST(test_a148_stop_poll_includes_original_phase3_handoff)
 int
 main(void)
 {
-	UT_PLAN(309);
+	UT_PLAN(310);
 	UT_RUN(test_normal_actual_finish_preserves_unconfigured_native_startup);
 	UT_RUN(test_normal_start_pending_ack_does_not_reuse_root_after_valid_mirror_drift);
 	UT_RUN(test_normal_start_confirmed_new_root_permanently_rejects_old_completion);
@@ -10748,6 +10785,7 @@ main(void)
 	UT_RUN(test_104_close_invalidates_recheck_and_leave_balances_once);
 	UT_RUN(test_105_pid_change_discards_inherited_local_ledger_only);
 	UT_RUN(test_106_exit_hook_drains_both_side_ledgers);
+	UT_RUN(test_local_admission_observation_tracks_actual_auxiliary_lifetime);
 	UT_RUN(test_107_odd_snapshot_is_bounded_closed_without_debt);
 	UT_RUN(test_108_nonregistered_feature_is_closed_without_debt);
 	UT_RUN(test_109_lmon_without_validated_majority_remains_closed);
