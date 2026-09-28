@@ -34,6 +34,30 @@ static TimestampTz now = 1000000;
 static unsigned polls, releases, sends, cancels, writes;
 static bool stop, leaving, publication = true, busy, publication_error;
 
+bool
+ProcConfigSnapshotPids(int32 *pids, uint32 capacity)
+{
+	if (capacity != lengthof(processes))
+		return false;
+	for (uint32 i = 0; i < capacity; ++i)
+		pids[i] = processes[i].pid;
+	return true;
+}
+
+void *
+palloc(Size size)
+{
+	void *ptr = malloc(size);
+	if (!ptr)
+		abort();
+	return ptr;
+}
+void
+pfree(void *ptr)
+{
+	free(ptr);
+}
+
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 void
@@ -72,9 +96,11 @@ cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
 	return true;
 }
 bool
-cluster_shared_config_delivery_logger_observe(ClusterSharedConfigRegistration *out)
+cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRegistration *out,
+											   uint64 *sequence)
 {
 	*out = logger;
+	*sequence = 2;
 	return logger.pid != 0;
 }
 void
@@ -152,6 +178,7 @@ UT_TEST(select_and_deliver)
 	procs.allProcs = processes;
 	procs.allProcCount = lengthof(processes);
 	actual.ref.identity.generation = 1;
+	actual.ref.identity.configured[0] = 1;
 	actual.applier_pid = PostmasterPid;
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT(polls == 1 && releases == 1 && writes == 1 && sends == 1);
@@ -168,6 +195,7 @@ UT_TEST(parent_does_not_prove_children)
 {
 	target(&procs.cluster_config_postmaster.value, PostmasterPid);
 	target(&processes[0].cluster_config.value, 130);
+	processes[0].pid = 130;
 	processes[0].cluster_config.value.process.ref.identity.generation = 1;
 	now += 1000000;
 	cluster_shared_config_delivery_lmon_tick();
@@ -177,6 +205,7 @@ UT_TEST(parent_does_not_prove_children)
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT_EQ(sends, 4);
 	target(&logger, 121);
+	logger.role = B_LOGGER;
 	now += 1000000;
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT_EQ(sends, 4);

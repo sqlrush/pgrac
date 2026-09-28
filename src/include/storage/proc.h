@@ -556,6 +556,10 @@ extern void SetStartupBufferPinWaitBufId(int bufid);
 extern int GetStartupBufferPinWaitBufId(void);
 
 extern bool HaveNFreeProcs(int n, int *nfree);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: bounded native allocation snapshot; caller owns capacity entries. */
+extern bool ProcConfigSnapshotPids(int32 *pids, uint32 capacity);
+#endif
 extern void ProcReleaseLocks(bool isCommit);
 
 extern ProcWaitStatus ProcSleep(LOCALLOCK *locallock, LockMethod lockMethodTable);

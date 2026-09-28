@@ -756,6 +756,57 @@ HaveNFreeProcs(int n, int *nfree)
 	return (*nfree == n);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>:
+ * Capture native allocation, not just PGPROC.pid: ProcKill deliberately leaves
+ * the old PID on a normal free-list entry.  Conversely, InitProcess removes a
+ * slot from its list before it sets the new PID and configuration registration.
+ * Zero means proven free; -1 means allocated but not yet initialized.  The
+ * caller must separately validate registrations and recheck this snapshot.
+ * No allocation, callbacks or error reporting while holding ProcStructLock.
+ */
+bool
+ProcConfigSnapshotPids(int32 *pids, uint32 capacity)
+{
+	dlist_head *lists[4];
+	uint32 visited = 0;
+	bool valid = true;
+
+	if (pids == NULL || ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcStructLock == NULL
+		|| MaxBackends <= 0 || capacity != ProcGlobal->allProcCount
+		|| capacity != (uint32)MaxBackends + NUM_AUXILIARY_PROCS)
+		return false;
+	lists[0] = &ProcGlobal->freeProcs;
+	lists[1] = &ProcGlobal->autovacFreeProcs;
+	lists[2] = &ProcGlobal->bgworkerFreeProcs;
+	lists[3] = &ProcGlobal->walsenderFreeProcs;
+	SpinLockAcquire(ProcStructLock);
+	for (uint32 i = 0; i < capacity; ++i) {
+		int32 pid = ((volatile PGPROC *)&ProcGlobal->allProcs[i])->pid;
+
+		pids[i] = (i < (uint32)MaxBackends && pid <= 0) ? -1 : pid;
+	}
+	for (unsigned i = 0; i < lengthof(lists) && valid; ++i) {
+		dlist_iter iter;
+
+		dlist_foreach(iter, lists[i])
+		{
+			PGPROC *proc = dlist_container(PGPROC, links, iter.cur);
+
+			if (++visited > capacity || proc->pgprocno >= (uint32)MaxBackends
+				|| proc != &ProcGlobal->allProcs[proc->pgprocno]) {
+				valid = false;
+				break;
+			}
+			pids[proc->pgprocno] = 0;
+		}
+	}
+	SpinLockRelease(ProcStructLock);
+	return valid;
+}
+#endif
+
 /*
  * Check if the current process is awaiting a lock.
  */

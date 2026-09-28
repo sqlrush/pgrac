@@ -53,6 +53,7 @@ OBJS = \
 	cluster_shared_config_guc.o \
 	cluster_shared_config_delivery.o \
 	cluster_shared_config_lmon.o \
+	cluster_shared_config_census.o \
 	cluster_control_root.o \
 	cluster_wal_history.o \
 	cluster_wal_tail.o \

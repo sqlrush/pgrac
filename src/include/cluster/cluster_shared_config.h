@@ -402,6 +402,31 @@ extern void cluster_shared_config_process_detach(void);
 extern bool cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
 													ClusterSharedConfigRegistration *out);
 
+/* PGRAC: coherent local observation, not member admission or active-value
+ * proof. Current means the selected defaults were fully consumed; pending
+ * static/deferred values are counted separately and need not be active.
+ * A changing native PID/slot makes the entire bounded census unavailable.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigCensus {
+	ClusterSharedConfigRef ref;
+	uint32 node_id;
+	uint32 participants;
+	uint32 current_processes;
+	uint32 waiting_processes;
+	uint32 failed_processes;
+	uint32 parallel_processes;
+	uint32 pending_processes;
+	uint32 deferred_processes;
+	uint64 pending_entries;
+	uint64 deferred_entries;
+} ClusterSharedConfigCensus;
+/* Owner supplies a validated selected target. No CF/root/member selection.
+ * Refusal clears out; aliases leave all storage unchanged. A successful scan
+ * does not freeze future births or check that required service roles exist. */
+extern bool cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node_id,
+											  ClusterSharedConfigCensus *out);
+
 /* Native family transport. Creation/reset are real postmaster-only, before
  * children start / after DATA children exit. No disk state or CF acquisition.
  * logger_started/reaped are called only at the actual native PID boundaries.
@@ -414,6 +439,8 @@ extern void cluster_shared_config_delivery_logger_started(int32 pid);
 extern void cluster_shared_config_delivery_logger_reaped(int32 pid);
 extern void cluster_shared_config_delivery_logger_attach(void);
 extern bool cluster_shared_config_delivery_logger_observe(ClusterSharedConfigRegistration *out);
+extern bool cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRegistration *out,
+														   uint64 *sequence);
 extern bool cluster_shared_config_delivery_publish(const ClusterSharedConfigRef *ref,
 												   const ClusterSharedConfigImage *image);
 extern bool cluster_shared_config_delivery_reload(void);

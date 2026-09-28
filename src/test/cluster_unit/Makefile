@@ -129,6 +129,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_shared_config \
 		test_cluster_config_delivery_driver \
 		test_cluster_config_delivery_route \
+		test_cluster_config_census \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
 		test_cluster_checkpoint_buffers \
@@ -430,6 +431,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_census,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -1477,9 +1479,16 @@ test_cluster_config_delivery_route: test_cluster_config_delivery_route.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_config_delivery_driver: test_cluster_config_delivery_driver.c unit_test.h \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o \
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o \
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_config_census: test_cluster_config_census.c unit_test.h \
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_shared_config: test_cluster_shared_config.c unit_test.h $(CLUSTER_SHARED_CONFIG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SHARED_CONFIG_O) \

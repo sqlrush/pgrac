@@ -4,6 +4,11 @@ CREATE FUNCTION test_pgrac_config_delivery_state()
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_state'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_delivery_state() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_census()
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_census'
+LANGUAGE C VOLATILE;
+REVOKE ALL ON FUNCTION test_pgrac_config_census() FROM PUBLIC;
+
 CREATE FUNCTION test_pgrac_config_delivery_refuse()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_refuse'
 LANGUAGE C STRICT;

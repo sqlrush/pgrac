@@ -220,19 +220,33 @@ cluster_shared_config_delivery_logger_attach(void)
 bool
 cluster_shared_config_delivery_logger_observe(ClusterSharedConfigRegistration *out)
 {
+	uint64 sequence;
+	return cluster_shared_config_delivery_logger_snapshot(out, &sequence);
+}
+
+bool
+cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRegistration *out,
+											   uint64 *sequence)
+{
 	ClusterSharedConfigRegistration value;
 	uint32 pid;
-	if (out == NULL)
+	uint64 before;
+	if (out == NULL || sequence == NULL)
 		return false;
 	memset(out, 0, sizeof(*out));
+	*sequence = 0;
 	if (!delivery_is_family())
 		return false;
 	pid = pg_atomic_read_u32(&delivery_family->logger_pid);
-	if (pid == 0 || !cluster_shared_config_registration_read(&delivery_family->logger, &value)
+	before = pg_atomic_read_u64(&delivery_family->logger.sequence);
+	if (pid == 0 || (before & 1)
+		|| !cluster_shared_config_registration_read(&delivery_family->logger, &value)
 		|| value.pid != (int32)pid || value.role != B_LOGGER || !value.observed
+		|| pg_atomic_read_u64(&delivery_family->logger.sequence) != before
 		|| pg_atomic_read_u32(&delivery_family->logger_pid) != pid)
 		return false;
 	*out = value;
+	*sequence = before;
 	return true;
 }
 

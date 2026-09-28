@@ -44,6 +44,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_selection_cleanup);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_state);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_refuse);
+PG_FUNCTION_INFO_V1(test_pgrac_config_census);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PG_FUNCTION_INFO_V1(test_pgrac_control_image);
@@ -683,6 +684,31 @@ test_pgrac_config_delivery_state(PG_FUNCTION_ARGS)
 		PG_RETURN_TEXT_P(cstring_to_text(
 			psprintf("%llu:%d", (unsigned long long)out.process.ref.identity.generation,
 					 out.process.failed)));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
+#endif
+}
+
+Datum
+test_pgrac_config_census(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test configuration census requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigProcess actual;
+		ClusterSharedConfigCensus out;
+		if (!cluster_shared_config_process_observe(&actual)
+			|| !cluster_shared_config_node_census(&actual.ref, actual.node_id, &out))
+			PG_RETURN_TEXT_P(cstring_to_text("busy"));
+		/* Test-only view of an actual census. This process's actual inherited
+		 * target is not a CF selection or member/common-value admission. */
+		PG_RETURN_TEXT_P(cstring_to_text(psprintf(
+			"%u:%u:%u:%u:%u:%u:%u:%llu:%llu", out.participants, out.current_processes,
+			out.waiting_processes, out.failed_processes, out.parallel_processes,
+			out.pending_processes, out.deferred_processes, (unsigned long long)out.pending_entries,
+			(unsigned long long)out.deferred_entries)));
 	}
 #else
 	PG_RETURN_TEXT_P(cstring_to_text("disabled"));

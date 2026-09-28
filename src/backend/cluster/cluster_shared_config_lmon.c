@@ -29,14 +29,6 @@ static TimestampTz next_probe;
  * extra configuration authority, and is empty between successful ticks. */
 static ClusterSharedConfigImage selected_image;
 
-static bool
-delivery_matches(const ClusterSharedConfigRegistration *value, const ClusterSharedConfigRef *ref)
-{
-	return value->pid > 0 && value->registration != 0 && value->observed && !value->process.failed
-		   && !value->process.parallel_snapshot && value->process.applier_pid > 0
-		   && memcmp(&value->process.ref, ref, sizeof(*ref)) == 0;
-}
-
 /* Notification suppression only, NEVER node admission. This bounded census
  * need not freeze concurrent process births/exits: future forks inherit the
  * actual parent state, and the next maintenance tick rechecks missed changes.
@@ -44,23 +36,12 @@ delivery_matches(const ClusterSharedConfigRegistration *value, const ClusterShar
  * dependent-use owner must separately decide whether those outcomes suffice.
  */
 static bool
-delivery_needs_signal(const ClusterSharedConfigRef *ref)
+delivery_needs_signal(const ClusterSharedConfigRef *ref, int node_id)
 {
-	ClusterSharedConfigRegistration value;
-	if (ProcGlobal == NULL
-		|| !cluster_shared_config_registration_read(&ProcGlobal->cluster_config_postmaster, &value)
-		|| value.pid != PostmasterPid || !delivery_matches(&value, ref))
-		return true;
-	for (uint32 i = 0; i < ProcGlobal->allProcCount; i++) {
-		if (!cluster_shared_config_registration_read(&ProcGlobal->allProcs[i].cluster_config,
-													 &value))
-			return true;
-		if (value.pid != 0 && !delivery_matches(&value, ref))
-			return true;
-	}
-	return Logging_collector
-		   && (!cluster_shared_config_delivery_logger_observe(&value)
-			   || !delivery_matches(&value, ref));
+	ClusterSharedConfigCensus census;
+	return !cluster_shared_config_node_census(ref, node_id, &census)
+		   || census.waiting_processes != 0 || census.failed_processes != 0
+		   || census.parallel_processes != 0;
 }
 
 void
@@ -106,7 +87,7 @@ cluster_shared_config_delivery_lmon_tick(void)
 		if ((result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 			 || result == CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
 			&& cluster_shared_config_delivery_publish(&selected.ref, &selected_image)
-			&& delivery_needs_signal(&selected.ref)) {
+			&& delivery_needs_signal(&selected.ref, actual.node_id)) {
 			/* No receipt is inferred from kill's return. A missing/failed
 			 * signal leaves real outcomes old and will be retried. */
 			if (PostmasterPid > 0)
