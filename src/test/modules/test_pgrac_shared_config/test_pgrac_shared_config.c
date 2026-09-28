@@ -45,6 +45,9 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_delivery);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_state);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_refuse);
 PG_FUNCTION_INFO_V1(test_pgrac_config_census);
+PG_FUNCTION_INFO_V1(test_pgrac_config_active);
+PG_FUNCTION_INFO_V1(test_pgrac_config_define_common);
+PG_FUNCTION_INFO_V1(test_pgrac_config_active_census);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PG_FUNCTION_INFO_V1(test_pgrac_control_image);
@@ -53,6 +56,84 @@ PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_fixture);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_late);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_control_late);
 PGDLLEXPORT void _PG_init(void);
+
+Datum
+test_pgrac_config_define_common(PG_FUNCTION_ARGS)
+{
+	static bool defined;
+	static bool value;
+	if (!superuser())
+		ereport(ERROR, (errmsg("test native registry inspection requires superuser")));
+	if (!defined) {
+		DefineCustomBoolVariable("cluster.native_config_late", "Test native registration", NULL,
+								 &value, false, PGC_SUSET, 0, NULL, NULL, NULL);
+		defined = true;
+	}
+	PG_RETURN_VOID();
+}
+
+Datum
+test_pgrac_config_active_census(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test native active census requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigProcess actual;
+		ClusterSharedConfigCensus census;
+		if (!cluster_shared_config_process_observe(&actual)
+			|| !cluster_shared_config_node_census(&actual.ref, actual.node_id, &census))
+			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+		if (census.participants != census.current_processes)
+			PG_RETURN_TEXT_P(cstring_to_text("not-current"));
+		PG_RETURN_TEXT_P(cstring_to_text(
+			psprintf("%u:%u:%u:%u", census.active.version, census.active_missing_processes,
+					 census.static_mismatch_processes, census.dynamic_mismatch_processes)));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+#endif
+}
+
+/* Actual native values or the actual backend's published observation. This
+ * does not mutate a value, grant permission, or fabricate a process role.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+Datum
+test_pgrac_config_active(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test active configuration inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigActive active;
+		ClusterSharedConfigRegistration registration;
+		char static_hex[65], dynamic_hex[65];
+		static const char hex[] = "0123456789abcdef";
+		if (PG_GETARG_BOOL(0)) {
+			if (MyProc == NULL
+				|| !cluster_shared_config_registration_read(&MyProc->cluster_config, &registration))
+				PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+			active = registration.active;
+		} else if (!cluster_shared_config_active_profile(&active))
+			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+		if (active.version != CLUSTER_SHARED_CONFIG_ACTIVE_VERSION)
+			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+		for (int i = 0; i < 32; ++i) {
+			static_hex[2 * i] = hex[active.static_sha256[i] >> 4];
+			static_hex[2 * i + 1] = hex[active.static_sha256[i] & 15];
+			dynamic_hex[2 * i] = hex[active.dynamic_sha256[i] >> 4];
+			dynamic_hex[2 * i + 1] = hex[active.dynamic_sha256[i] & 15];
+		}
+		static_hex[64] = dynamic_hex[64] = '\0';
+		PG_RETURN_TEXT_P(
+			cstring_to_text(psprintf("%u:%u:%u:%s:%s", active.version, active.static_entries,
+									 active.dynamic_entries, static_hex, dynamic_hex)));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+#endif
+}
 
 /* Actual native context accounting, deliberately without CF authority.
  * Positive selected-file/ERROR timing is tested in cluster_unit; this test

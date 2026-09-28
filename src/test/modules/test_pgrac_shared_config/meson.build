@@ -17,5 +17,9 @@ tests += {
                     't/006_native_entry_guard.pl', 't/007_control_image.pl',
                     't/008_recovery_capacity.pl', 't/009_bootstrap_native.pl',
                     't/010_wal_publish_native.pl', 't/011_wal_history_native.pl',
-                    't/012_config_change.pl', 't/013_config_reload.pl']},
+                    't/012_config_change.pl', 't/013_config_reload.pl',
+                    't/014_process_inheritance.pl', 't/015_parallel_inheritance.pl',
+                    't/016_process_enrollment.pl', 't/017_selection_memory.pl',
+                    't/018_native_delivery.pl', 't/019_node_census.pl',
+                    't/020_active_profile.pl', 't/021_active_census.pl']},
 }

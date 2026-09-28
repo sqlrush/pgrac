@@ -203,6 +203,9 @@ target(ClusterSharedConfigRegistration *value, int pid)
 	value->observed = true;
 	value->process = actual;
 	value->process.ref = published;
+	value->active.version = CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
+	value->active.static_entries = 1;
+	value->active.dynamic_entries = 1;
 }
 
 UT_TEST(select_and_deliver)

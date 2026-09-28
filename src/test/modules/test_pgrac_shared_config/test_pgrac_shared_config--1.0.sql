@@ -1,5 +1,17 @@
 -- PGRAC test-only functions, not part of the product catalog.
 -- Author: SqlRush <sqlrush@gmail.com>
+CREATE FUNCTION test_pgrac_config_active(boolean)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_active(boolean) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_define_common()
+RETURNS void AS 'MODULE_PATHNAME', 'test_pgrac_config_define_common'
+LANGUAGE C VOLATILE;
+REVOKE ALL ON FUNCTION test_pgrac_config_define_common() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_active_census()
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active_census'
+LANGUAGE C VOLATILE;
+REVOKE ALL ON FUNCTION test_pgrac_config_active_census() FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_delivery_state()
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_state'
 LANGUAGE C STRICT;

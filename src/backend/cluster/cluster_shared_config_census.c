@@ -52,6 +52,17 @@ census_count(const ClusterSharedConfigRegistration *value, ClusterSharedConfigCe
 		out->deferred_processes += p->deferred_total != 0;
 		out->pending_entries += (uint64)p->pending_restart_total;
 		out->deferred_entries += (uint64)p->deferred_total;
+		if (value->active.version != CLUSTER_SHARED_CONFIG_ACTIVE_VERSION
+			|| value->active.static_entries == 0 || value->active.dynamic_entries == 0)
+			out->active_missing_processes++;
+		else if (out->active.version == CLUSTER_SHARED_CONFIG_ACTIVE_VERSION) {
+			out->static_mismatch_processes
+				+= value->active.static_entries != out->active.static_entries
+				   || memcmp(value->active.static_sha256, out->active.static_sha256, 32) != 0;
+			out->dynamic_mismatch_processes
+				+= value->active.dynamic_entries != out->active.dynamic_entries
+				   || memcmp(value->active.dynamic_sha256, out->active.dynamic_sha256, 32) != 0;
+		}
 	}
 }
 
@@ -67,6 +78,12 @@ census_capture(ClusterSharedConfigSlot *slot, int32 pid, ConfigCensusSlot *captu
 	if (sequence != pg_atomic_read_u64(&slot->sequence) || value.pid != pid || pid < 0
 		|| (parent && (pid == 0 || value.role != B_INVALID)))
 		return false;
+	if (parent && value.observed && !value.process.failed && !value.process.parallel_snapshot
+		&& value.process.node_id == result->node_id && value.process.applier_pid > 0
+		&& memcmp(&value.process.ref, &result->ref, sizeof(result->ref)) == 0
+		&& value.active.version == CLUSTER_SHARED_CONFIG_ACTIVE_VERSION
+		&& value.active.static_entries != 0 && value.active.dynamic_entries != 0)
+		result->active = value.active;
 	if (pid > 0)
 		census_count(&value, result);
 	else if (value.observed)

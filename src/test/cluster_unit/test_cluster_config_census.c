@@ -120,6 +120,11 @@ registration(ClusterSharedConfigSlot *slot, int pid, BackendType role)
 	slot->value.observed = true;
 	slot->value.process.ref = target;
 	slot->value.process.applier_pid = PostmasterPid;
+	slot->value.active.version = CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
+	slot->value.active.static_entries = 10;
+	slot->value.active.dynamic_entries = 20;
+	memset(slot->value.active.static_sha256, 1, 32);
+	memset(slot->value.active.dynamic_sha256, 2, 32);
 }
 static void
 setup(void)
@@ -299,10 +304,51 @@ UT_TEST(invalid_and_alias_inputs)
 	UT_ASSERT(!cluster_shared_config_node_census(&out.ref, 0, &out));
 	UT_ASSERT_EQ(memcmp(&out, &before, sizeof(out)), 0);
 }
+UT_TEST(active_profiles_are_independent_of_consumed_ref)
+{
+	ClusterSharedConfigCensus out;
+	setup();
+	processes[0].cluster_config.value.active.static_sha256[3] ^= 1;
+	processes[1].cluster_config.value.active.dynamic_sha256[3] ^= 1;
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.current_processes, 4);
+	UT_ASSERT_EQ(out.active.version, CLUSTER_SHARED_CONFIG_ACTIVE_VERSION);
+	UT_ASSERT_EQ(out.active_missing_processes, 0);
+	UT_ASSERT_EQ(out.static_mismatch_processes, 1);
+	UT_ASSERT_EQ(out.dynamic_mismatch_processes, 1);
+}
+UT_TEST(invalidation_and_parent_unavailable_are_not_equality)
+{
+	ClusterSharedConfigCensus out;
+	setup();
+	memset(&processes[0].cluster_config.value.active, 0, sizeof(out.active));
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.current_processes, 4);
+	UT_ASSERT_EQ(out.active_missing_processes, 1);
+	memset(&procs.cluster_config_postmaster.value.active, 0, sizeof(out.active));
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.active.version, 0);
+	UT_ASSERT_EQ(out.active_missing_processes, 2);
+	UT_ASSERT_EQ(out.static_mismatch_processes + out.dynamic_mismatch_processes, 0);
+}
+UT_TEST(profile_schema_and_counts_must_match)
+{
+	ClusterSharedConfigCensus out;
+	setup();
+	processes[0].cluster_config.value.active.version++;
+	processes[1].cluster_config.value.active.static_entries++;
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.active_missing_processes, 1);
+	UT_ASSERT_EQ(out.static_mismatch_processes, 1);
+	processes[1].cluster_config.value.process.failed = true;
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.failed_processes, 1);
+	UT_ASSERT_EQ(out.static_mismatch_processes, 0);
+}
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(14);
 	UT_RUN(all_actual_participants);
 	UT_RUN(parent_cannot_prove_old_child);
 	UT_RUN(failure_and_parallel_are_distinct);
@@ -314,6 +360,9 @@ main(void)
 	UT_RUN(busy_parent_and_logger);
 	UT_RUN(empty_logger_when_disabled);
 	UT_RUN(invalid_and_alias_inputs);
+	UT_RUN(active_profiles_are_independent_of_consumed_ref);
+	UT_RUN(invalidation_and_parent_unavailable_are_not_equality);
+	UT_RUN(profile_schema_and_counts_must_match);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

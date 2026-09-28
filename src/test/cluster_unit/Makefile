@@ -5980,3 +5980,9 @@ $(CLUSTER_THREAD_RECOVERY_AUTHORITY_O) test_cluster_wal_retention \
 test_cluster_control_root test_cluster_thread_recovery_authority: \
 	$(top_srcdir)/src/include/cluster/cluster_wal_retention.h \
 	$(top_srcdir)/src/include/cluster/cluster_ir.h
+
+# PGRAC: native configuration carriers must match the linked production ABI.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_shared_config test_cluster_config_delivery_driver \
+test_cluster_config_census test_cluster_control_root test_cluster_cf_authority: \
+	$(top_srcdir)/src/include/cluster/cluster_shared_config.h

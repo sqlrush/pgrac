@@ -378,20 +378,41 @@ extern ClusterControlRootResult cluster_shared_config_process_reload(
  * initialization is the only sequence reset. No disk/wire representation.
  * Author: SqlRush <sqlrush@gmail.com>
  */
+/* PGRAC: actual native values, not selected defaults or data permission.
+ * Version zero means unavailable. Hashes exclude instance/session defaults.
+ * Memory-only, explicit canonical hash input; never serialize this struct.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+#define CLUSTER_SHARED_CONFIG_ACTIVE_VERSION 1
+typedef struct ClusterSharedConfigActive {
+	uint32 version;
+	uint32 static_entries;
+	uint32 dynamic_entries;
+	uint8 static_sha256[32];
+	uint8 dynamic_sha256[32];
+} ClusterSharedConfigActive;
+StaticAssertDecl(sizeof(ClusterSharedConfigActive) == 76, "native active configuration");
+extern bool cluster_shared_config_active_profile(ClusterSharedConfigActive *out);
+struct config_generic;
+/* Before covered native assignment/restoration, without allocation or hooks.
+ * Invalidates observation only; does not alter PG values, ref or SET semantics. */
+extern void cluster_shared_config_native_value_changing(const struct config_generic *record);
+
 typedef struct ClusterSharedConfigRegistration {
 	uint64 registration;
 	int32 pid;
 	int32 role;
 	ClusterSharedConfigProcess process;
 	bool observed;
+	ClusterSharedConfigActive active;
 } ClusterSharedConfigRegistration;
-StaticAssertDecl(sizeof(ClusterSharedConfigRegistration) == 152, "config process registration");
+StaticAssertDecl(sizeof(ClusterSharedConfigRegistration) == 224, "config process registration");
 
 typedef struct ClusterSharedConfigSlot {
 	pg_atomic_uint64 sequence;
 	ClusterSharedConfigRegistration value;
 } ClusterSharedConfigSlot;
-StaticAssertDecl(sizeof(ClusterSharedConfigSlot) == 160, "config process observation slot");
+StaticAssertDecl(sizeof(ClusterSharedConfigSlot) == 232, "config process observation slot");
 extern void cluster_shared_config_registration_init(ClusterSharedConfigSlot *slot);
 extern void cluster_shared_config_process_new_shmem(void);
 extern bool cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot);
@@ -420,6 +441,10 @@ typedef struct ClusterSharedConfigCensus {
 	uint32 deferred_processes;
 	uint64 pending_entries;
 	uint64 deferred_entries;
+	ClusterSharedConfigActive active; /* real parent's comparison reference */
+	uint32 active_missing_processes;
+	uint32 static_mismatch_processes;
+	uint32 dynamic_mismatch_processes;
 } ClusterSharedConfigCensus;
 /* Owner supplies a validated selected target. No CF/root/member selection.
  * Refusal clears out; aliases leave all storage unchanged. A successful scan

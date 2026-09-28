@@ -4,7 +4,9 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <math.h>
 #include "catalog/pg_authid_d.h"
+#include "common/cryptohash.h"
 #include "cluster/cluster_shared_config.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
@@ -30,6 +32,7 @@ static ClusterSharedConfigSlot *config_process_slot;
 static int32 config_process_slot_pid;
 static uint64 config_process_registration;
 static bool reload_overlap(const void *a, size_t na, const void *b, size_t nb);
+static void startup_config_release(ResourceOwner owner, ResourceOwner saved_owner, bool success);
 
 /* Only the real native owner writes a slot. A reader makes one bounded
  * attempt, including in the PM: no child-owned lock can strand the parent.
@@ -118,6 +121,7 @@ cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot)
 	value.pid = MyProcPid;
 	value.role = MyBackendType;
 	value.observed = cluster_shared_config_process_observe(&value.process);
+	(void)cluster_shared_config_active_profile(&value.active);
 	if (!config_registration_write(slot, &value))
 		return false;
 	config_process_slot = slot;
@@ -139,6 +143,7 @@ config_process_report(void)
 		return;
 	value.role = MyBackendType;
 	value.observed = cluster_shared_config_process_observe(&value.process);
+	(void)cluster_shared_config_active_profile(&value.active);
 	(void)config_registration_write(config_process_slot, &value);
 }
 
@@ -202,6 +207,212 @@ static const struct {
 	{ "log_timezone", POLICY_COMMON | POLICY_STRING },
 	{ "default_text_search_config", POLICY_COMMON | POLICY_STRING }
 };
+
+static unsigned
+config_policy_flags(const char *name)
+{
+	for (size_t i = 0; i < lengthof(config_policies); ++i)
+		if (strcmp(name, config_policies[i].name) == 0)
+			return config_policies[i].policy;
+	return POLICY_COMMON;
+}
+
+/* This is the common protocol/recovery observation set, not the broader
+ * COMMON namespace of session defaults. Unknown common cluster scalars are
+ * included conservatively; unsupported/test/instance entries are not. No
+ * check or SHOW hook runs here, including from native abort restoration.
+ */
+static bool
+config_common_active_record(const struct config_generic *record)
+{
+	static const char *const native[] = { "wal_level",
+										  "wal_log_hints",
+										  "max_connections",
+										  "max_worker_processes",
+										  "max_wal_senders",
+										  "max_prepared_transactions",
+										  "max_locks_per_transaction",
+										  "track_commit_timestamp" };
+	unsigned flags;
+	const char *name;
+	if (record == NULL || record->name == NULL || record->context == PGC_INTERNAL
+		|| (record->flags & (GUC_CUSTOM_PLACEHOLDER | GUC_DISALLOW_IN_FILE)))
+		return false;
+	name = record->name;
+	if (strncmp(name, "cluster.", 8) != 0) {
+		for (size_t i = 0; i < lengthof(native); ++i)
+			if (strcmp(name, native[i]) == 0)
+				return true;
+		return false;
+	}
+	if (strcmp(name, "cluster.injection_points") == 0 || strncmp(name, "cluster.test_", 13) == 0
+		|| strncmp(name, "cluster.gcs_block_drop_", 23) == 0
+		|| strcmp(name, "cluster.xnode_profile") == 0 || strcmp(name, "cluster.update_trace") == 0)
+		return false;
+	flags = config_policy_flags(name);
+	return (flags & POLICY_COMMON) != 0
+		   && (record->vartype != PGC_STRING || (flags & POLICY_STRING) != 0);
+}
+
+void
+cluster_shared_config_native_value_changing(const struct config_generic *record)
+{
+	ClusterSharedConfigRegistration value;
+	/* A forked child must not dereference its parent's attachment. This path
+	 * is also called during abort: no allocation, crypto, hooks or wait. */
+	if (config_process_image.bytes == NULL || config_process_slot == NULL
+		|| config_process_slot_pid != MyProcPid || !config_common_active_record(record))
+		return;
+	if (!cluster_shared_config_registration_read(config_process_slot, &value)
+		|| value.pid != MyProcPid || value.registration != config_process_registration)
+		return;
+	memset(&value.active, 0, sizeof(value.active));
+	(void)config_registration_write(config_process_slot, &value);
+}
+
+static bool
+config_active_u32(pg_cryptohash_ctx *hash, uint32 value)
+{
+	uint8 bytes[4];
+	for (int i = 0; i < 4; ++i)
+		bytes[i] = (uint8)(value >> (8 * i));
+	return pg_cryptohash_update(hash, bytes, sizeof(bytes)) == 0;
+}
+
+static bool
+config_active_value(pg_cryptohash_ctx *hash, const struct config_generic *record)
+{
+	uint8 scalar[8];
+	uint64 bits = 0;
+	const uint8 *bytes = scalar;
+	size_t len = sizeof(scalar);
+	bool is_null = false;
+	switch (record->vartype) {
+	case PGC_BOOL:
+		bits = *((const struct config_bool *)record)->variable ? 1 : 0;
+		break;
+	case PGC_INT:
+		bits = (uint64)(int64) * ((const struct config_int *)record)->variable;
+		break;
+	case PGC_ENUM:
+		bits = (uint64)(int64) * ((const struct config_enum *)record)->variable;
+		break;
+	case PGC_REAL: {
+		double value = *((const struct config_real *)record)->variable;
+		if (!isfinite(value) || sizeof(value) != sizeof(bits))
+			return false;
+		/* Normalize signed zero; all other finite values have one native
+			 * binary64 representation on the homogeneous supported profile. */
+		if (value != 0)
+			memcpy(&bits, &value, sizeof(bits));
+		break;
+	}
+	case PGC_STRING:
+		bytes = (const uint8 *)*((const struct config_string *)record)->variable;
+		is_null = bytes == NULL;
+		len = is_null ? 0 : strnlen((const char *)bytes, CLUSTER_SHARED_CONFIG_MAX_VALUE + 1);
+		if (len > CLUSTER_SHARED_CONFIG_MAX_VALUE)
+			return false;
+		break;
+	default:
+		return false;
+	}
+	if (record->vartype != PGC_STRING)
+		for (int i = 0; i < 8; ++i)
+			scalar[i] = (uint8)(bits >> (8 * i));
+	return config_active_u32(hash, (uint32)strlen(record->name))
+		   && pg_cryptohash_update(hash, (const uint8 *)record->name, strlen(record->name)) == 0
+		   && config_active_u32(hash, (uint32)record->vartype)
+		   && config_active_u32(hash, is_null ? 0 : 1) && config_active_u32(hash, (uint32)len)
+		   && (len == 0 || pg_cryptohash_update(hash, bytes, len) == 0);
+}
+
+static bool
+config_active_build(ClusterSharedConfigActive *out)
+{
+	static const char *const domains[] = { "PGRAC-common-static-v1", "PGRAC-common-dynamic-v1" };
+	pg_cryptohash_ctx *hash[2] = { NULL, NULL };
+	struct config_generic **records;
+	uint32 counts[2] = { 0, 0 };
+	int count;
+	bool valid = false;
+	uint8 digests[2][32];
+	records = get_guc_variables(&count);
+	if (count <= 0 || count > CLUSTER_SHARED_CONFIG_MAX_ENTRIES)
+		goto done;
+	for (int i = 0; i < 2; ++i) {
+		hash[i] = pg_cryptohash_create(PG_SHA256);
+		if (hash[i] == NULL || pg_cryptohash_init(hash[i]) != 0
+			|| pg_cryptohash_update(hash[i], (const uint8 *)domains[i], strlen(domains[i])) != 0)
+			goto done;
+	}
+	for (int i = 0; i < count; ++i) {
+		struct config_generic *record = records[i];
+		int part;
+		if (!config_common_active_record(record))
+			continue;
+		part = record->context == PGC_POSTMASTER ? 0 : 1;
+		if (strlen(record->name) > CLUSTER_SHARED_CONFIG_MAX_NAME
+			|| !config_active_value(hash[part], record))
+			goto done;
+		counts[part]++;
+	}
+	for (int i = 0; i < 2; ++i)
+		if (counts[i] == 0 || !config_active_u32(hash[i], counts[i])
+			|| pg_cryptohash_final(hash[i], digests[i], sizeof(digests[i])) != 0)
+			goto done;
+	out->version = CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
+	out->static_entries = counts[0];
+	out->dynamic_entries = counts[1];
+	memcpy(out->static_sha256, digests[0], 32);
+	memcpy(out->dynamic_sha256, digests[1], 32);
+	valid = true;
+done:
+	for (int i = 0; i < 2; ++i)
+		if (hash[i] != NULL)
+			pg_cryptohash_free(hash[i]);
+	pfree(records);
+	return valid;
+}
+
+bool
+cluster_shared_config_active_profile(ClusterSharedConfigActive *out)
+{
+	ClusterSharedConfigActive result = { 0 };
+	ResourceOwner saved_owner = CurrentResourceOwner, owner;
+	MemoryContext saved_context = CurrentMemoryContext, scratch;
+	bool valid;
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (config_process_image.bytes == NULL || config_process_state.applier_pid <= 0
+		|| config_process_state.failed || config_process_state.parallel_snapshot)
+		return false;
+	/* Real PM/logger have no transaction resource owner. Own crypto/scratch
+	 * here; never use a test-only setup to make their native path succeed. */
+	scratch = AllocSetContextCreate(saved_context, "common native profile", ALLOCSET_SMALL_SIZES);
+	MemoryContextSwitchTo(scratch);
+	owner = ResourceOwnerCreate(saved_owner, "common native profile");
+	CurrentResourceOwner = owner;
+	PG_TRY();
+	{
+		valid = config_active_build(&result);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(saved_context);
+		startup_config_release(owner, saved_owner, false);
+		MemoryContextDelete(scratch);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(saved_context);
+	startup_config_release(owner, saved_owner, true);
+	MemoryContextDelete(scratch);
+	if (valid)
+		*out = result;
+	return valid;
+}
 
 static void
 policy_clear(ClusterSharedConfigPolicyReport *report)
@@ -313,11 +524,7 @@ policy_check(const ClusterSharedConfigEntry *entry, bool online_change, bool nat
 		|| strncmp(entry->name, "cluster.test_", 13) == 0
 		|| strncmp(entry->name, "cluster.gcs_block_drop_", 23) == 0)
 		return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_UNSUPPORTED);
-	for (size_t i = 0; i < lengthof(config_policies); ++i)
-		if (strcmp(entry->name, config_policies[i].name) == 0) {
-			policy = config_policies[i].policy;
-			break;
-		}
+	policy = config_policy_flags(entry->name);
 	if (record->vartype == PGC_STRING && !(policy & POLICY_STRING))
 		return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_UNSUPPORTED);
 	if ((entry->node_id == CLUSTER_SHARED_CONFIG_COMMON && !(policy & POLICY_COMMON))
@@ -503,6 +710,7 @@ cluster_shared_config_process_reload(const char *bytes, size_t len,
 			return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_REFERENCE);
 		/* No hooks, source changes or false child-only deferred obligation when
 		 * this exact default was already inherited/applied in this process. */
+		config_process_report();
 		*out = config_process_state;
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
