@@ -18,7 +18,9 @@
 #ifndef WIN32
 #include <sys/mman.h>
 #endif
+#include "access/xact.h"
 #include "miscadmin.h"
+#include "postmaster/interrupt.h"
 #include "portability/mem.h"
 #include "storage/ipc.h"
 #include "utils/memutils.h"
@@ -42,6 +44,9 @@ typedef struct ConfigDeliveryFamily {
 
 static ConfigDeliveryFamily *delivery_family;
 static uint64 delivery_generation;
+/* Scheduling only, never a retained target. Native fork starts from a parent
+ * which owns no transaction and therefore never sets this indication. */
+static bool delivery_waiting_for_idle;
 
 static void
 delivery_release_owner(ResourceOwner owner, ResourceOwner saved, bool success)
@@ -345,9 +350,27 @@ cluster_shared_config_delivery_reload(void)
 	{
 		if (cluster_shared_config_delivery_slot_read(slot, generation, &ref, &image)
 			&& pg_atomic_read_u64(&delivery_family->generation) == generation) {
-			result = cluster_shared_config_process_reload(image.bytes, image.len, &ref, &process,
-														  &report)
-					 == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+			bool can_apply = true;
+			if (IsUnderPostmaster && (IsTransactionState() || IsTransactionOrTransactionBlock())) {
+				bool needs_idle;
+				can_apply = cluster_shared_config_process_reload_needs_idle(
+								image.bytes, image.len, &ref, &needs_idle, &report)
+							== CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+				if (can_apply && needs_idle) {
+					/* No waiting inside this callback, and no half application.
+					 * COMMIT/ROLLBACK must run with their old native values. The
+					 * next normal command/service loop retries the then-current
+					 * accepted image, not a pointer to this delayed generation.
+					 * Do not signal a latch here and spin an active transaction. */
+					ConfigReloadPending = true;
+					delivery_waiting_for_idle = true;
+					can_apply = false;
+				}
+			}
+			if (can_apply)
+				result = cluster_shared_config_process_reload(image.bytes, image.len, &ref,
+															  &process, &report)
+						 == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 			if (result && delivery_is_parent())
 				result = cluster_shared_config_delivery_parent_publish();
 		}
@@ -367,5 +390,25 @@ cluster_shared_config_delivery_reload(void)
 	MemoryContextSwitchTo(caller);
 	delivery_release_owner(owner, saved, result);
 	MemoryContextDelete(context);
+	if (result)
+		delivery_waiting_for_idle = false;
 	return result;
+}
+
+/* Native COMMIT/ROLLBACK AND CHAIN and a multi-statement simple-query message
+ * can start the next transaction without the frontend's message-level reload
+ * check. Retry before TRANS_START, not from fallible transaction cleanup.
+ * An unavailable family slot retains retry ownership. Unrelated native
+ * reload indications are not consumed here. Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+cluster_shared_config_delivery_retry_idle(void)
+{
+	if (!delivery_waiting_for_idle || !IsUnderPostmaster || IsTransactionState()
+		|| IsTransactionOrTransactionBlock())
+		return;
+	/* Prevent recursive native hooks from entering this retry again. */
+	delivery_waiting_for_idle = false;
+	if (!cluster_shared_config_delivery_reload())
+		delivery_waiting_for_idle = true;
 }

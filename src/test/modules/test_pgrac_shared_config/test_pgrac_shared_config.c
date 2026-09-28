@@ -45,6 +45,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_selection_cleanup);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_state);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_refuse);
+PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_receive);
 PG_FUNCTION_INFO_V1(test_pgrac_config_census);
 PG_FUNCTION_INFO_V1(test_pgrac_config_active);
 PG_FUNCTION_INFO_V1(test_pgrac_config_define_common);
@@ -794,6 +795,20 @@ test_pgrac_config_census(PG_FUNCTION_ARGS)
 	}
 #else
 	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
+#endif
+}
+
+Datum
+test_pgrac_config_delivery_receive(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test delivery requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	/* Invoke the real consumer in the caller's actual native transaction.
+	 * Do not synthesize an idle state or an application outcome. */
+	PG_RETURN_BOOL(cluster_shared_config_delivery_reload());
+#else
+	PG_RETURN_BOOL(false);
 #endif
 }
 

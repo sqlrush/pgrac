@@ -160,6 +160,7 @@
 #include "cluster/cluster_mode.h"		/* cluster_storage_mode_enabled */
 #include "cluster/cluster_inject.h"
 #include "cluster/cluster_guc.h"		/* PGRAC: spec-2.6 cluster_enabled gate */
+#include "cluster/cluster_shared_config.h" /* PGRAC: delayed native configuration */
 #include "cluster/cluster_qvotec.h" /* PGRAC: spec-2.6 in_quorum lease check */
 #include "cluster/cluster_scn.h"
 #ifdef USE_PGRAC_CLUSTER
@@ -2455,6 +2456,15 @@ StartTransaction(void)
 
 	/* check the current transaction state */
 	Assert(s->state == TRANS_DEFAULT);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the real transaction boundary also covers AND CHAIN and several
+	 * transactions in one frontend message. Never apply protocol defaults in
+	 * the old transaction's cleanup or after new resources have been acquired.
+	 * This retries existing local delivery only, not cluster DATA admission.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	cluster_shared_config_delivery_retry_idle();
+#endif
 
 	/*
 	 * Set the current transaction state information appropriately during

@@ -368,6 +368,15 @@ extern bool cluster_shared_config_process_observe(ClusterSharedConfigProcess *ou
 extern bool cluster_shared_config_process_copy(ClusterSharedConfigProcess *out,
 											   ClusterSharedConfigImage *image);
 extern void cluster_shared_config_process_parallel_restore(void);
+/* Read-only classification against actual retained defaults, not application
+ * or permission. Only changed/removed common dynamic settings require an idle
+ * transaction boundary. Validates full objects/native policy before returning;
+ * native pending-static/session defaults are distinct. Refusal clears the
+ * boolean; aliases refuse without changing either input/output carrier. */
+extern ClusterControlRootResult
+cluster_shared_config_process_reload_needs_idle(const char *bytes, size_t len,
+												const ClusterSharedConfigRef *ref, bool *needs_idle,
+												ClusterSharedConfigPolicyReport *report);
 extern ClusterControlRootResult cluster_shared_config_process_reload(
 	const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
 	ClusterSharedConfigProcess *out, ClusterSharedConfigPolicyReport *report);
@@ -474,6 +483,9 @@ extern bool cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRe
 extern bool cluster_shared_config_delivery_publish(const ClusterSharedConfigRef *ref,
 												   const ClusterSharedConfigImage *image);
 extern bool cluster_shared_config_delivery_reload(void);
+/* Real top-level transaction boundary, before new transaction resources.
+ * Retries an already-delayed image only; no wait, file read or DATA grant. */
+extern void cluster_shared_config_delivery_retry_idle(void);
 extern bool cluster_shared_config_delivery_parent_publish(void);
 extern void cluster_shared_config_delivery_lmon_tick(void);
 extern void cluster_shared_config_delivery_lmon_cancel(void);
