@@ -493,9 +493,10 @@ extern bool cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRe
 extern bool cluster_shared_config_delivery_publish(const ClusterSharedConfigRef *ref,
 												   const ClusterSharedConfigImage *image);
 extern bool cluster_shared_config_delivery_reload(void);
-/* Real top-level transaction boundary, before new transaction resources.
- * Retries an already-delayed image only; no wait, file read or DATA grant. */
-extern void cluster_shared_config_delivery_retry_idle(void);
+/* Real native idle boundary, before new operation resources. Retries only an
+ * already-delayed image; true means it was applied, not a DATA grant. Callers
+ * with native shared-value side effects must propagate the new local values. */
+extern bool cluster_shared_config_delivery_retry_idle(void);
 /* Balanced native command lifetime, including internal transaction changes.
  * Enter before PG_TRY; pass its result to leave in PG_FINALLY. Leave never
  * applies an image. This is local scheduling, not distributed admission. */

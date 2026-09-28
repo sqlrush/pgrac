@@ -48,6 +48,7 @@
 #include "cluster/cluster_recovery_duty.h" /* thread clean-close publish (RF-ROOT P6) */
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_shared_config.h" /* PGRAC: idle common-value retry */
 #include "../cluster/cluster_control_root_private.h"
 #endif
 #include "libpq/pqsignal.h"
@@ -607,6 +608,14 @@ HandleCheckpointerInterrupts(void)
 		 */
 		UpdateSharedMemoryConfig();
 	}
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: checkpoint/restartpoint has returned, including native ERROR
+	 * cleanup. Reread the current accepted image, never a saved old target;
+	 * other retained owners still prevent common-value application.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config_delivery_retry_idle())
+		UpdateSharedMemoryConfig();
+#endif
 	if (ShutdownRequestPending)
 	{
 #ifdef USE_PGRAC_CLUSTER

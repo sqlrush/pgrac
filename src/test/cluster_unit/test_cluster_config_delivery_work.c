@@ -250,13 +250,13 @@ UT_TEST(retained_admission_without_transaction_or_command)
 	reset();
 	admission = true;
 	expect_deferred();
-	cluster_shared_config_delivery_retry_idle();
+	UT_ASSERT(!cluster_shared_config_delivery_retry_idle());
 	UT_ASSERT_EQ(reads, 1); /* No repeated allocation or target read while owned. */
 	UT_ASSERT_EQ(assignments, 0);
 	UT_ASSERT(delivery_waiting_for_idle);
 	admission = false;
 	target = 7;
-	cluster_shared_config_delivery_retry_idle();
+	UT_ASSERT(cluster_shared_config_delivery_retry_idle());
 	UT_ASSERT_EQ(assignments, 1);
 	UT_ASSERT_EQ(consumed, 7); /* Reread newest accepted image, not old target2. */
 	UT_ASSERT(!delivery_waiting_for_idle);

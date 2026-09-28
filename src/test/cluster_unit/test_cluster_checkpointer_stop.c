@@ -28,6 +28,7 @@ static jmp_buf exit_boundary;
 static int exit_code, checkpoint_calls, stopped_calls, complete_calls, prepare_calls;
 static int old_prepare_calls, old_close_calls, old_drain_calls, thread_close_calls;
 static int report_calls, config_calls;
+static bool retry_apply, retry_applied, shared_config_saw_retry;
 static bool requested, prepare_ok, stopped_ok, complete_ok, fail_checkpoint, fail_at_finish;
 static bool native_mode, native_stopped_ok;
 static unsigned native_stopped_calls;
@@ -63,6 +64,13 @@ static void
 UpdateSharedMemoryConfig(void)
 {
 	config_calls++;
+	shared_config_saw_retry = retry_applied;
+}
+bool
+cluster_shared_config_delivery_retry_idle(void)
+{
+	retry_applied = retry_apply;
+	return retry_applied;
 }
 void
 ProcessProcSignalBarrier(void)
@@ -273,6 +281,7 @@ proc_exit(int code)
 static void
 reset_fixture(void)
 {
+	retry_apply = retry_applied = shared_config_saw_retry = false;
 	cluster_shared_config = false;
 	v2_ref_ok = v2_observe_ok = true;
 	v2_observe_calls = 0;
@@ -320,6 +329,19 @@ UT_TEST(no_shutdown_is_not_a_stop_request)
 	UT_ASSERT_EQ(exit_code, -1);
 	UT_ASSERT_EQ(checkpoint_calls, 0);
 	assert_no_fallback();
+}
+UT_TEST(idle_retry_updates_native_shared_configuration)
+{
+	for (unsigned pending = 0; pending < 2; ++pending) {
+		reset_fixture();
+		ShutdownRequestPending = false;
+		ConfigReloadPending = pending != 0;
+		retry_apply = true;
+		run_handler();
+		UT_ASSERT(retry_applied);
+		UT_ASSERT(shared_config_saw_retry);
+		UT_ASSERT_EQ(checkpoint_calls, 0);
+	}
 }
 UT_TEST(original_noncurrent_path_is_unchanged)
 {
@@ -500,8 +522,9 @@ UT_TEST(v2_peer_root_publication_reobserves_without_fake_failure)
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(no_shutdown_is_not_a_stop_request);
+	UT_RUN(idle_retry_updates_native_shared_configuration);
 	UT_RUN(original_noncurrent_path_is_unchanged);
 	UT_RUN(current_calls_real_shutdown_between_two_current_barriers);
 	UT_RUN(current_prepare_failure_never_checkpoints_or_falls_back);

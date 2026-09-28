@@ -133,6 +133,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_config_census \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
+		test_cluster_checkpoint_config \
 		test_cluster_checkpoint_buffers \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
@@ -438,7 +439,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_census,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_checkpoint_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
@@ -757,6 +758,15 @@ test_cluster_checkpointer_stop.inc: $(top_srcdir)/src/backend/postmaster/checkpo
 
 # PGRAC: execute the native adapter, not source-string assertions.
 # Author: SqlRush <sqlrush@gmail.com>
+test_cluster_checkpoint_config.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^CreateCheckPoint\(/ { print "void"; emit=1; count++ } \
+	     /^CreateRestartPoint\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_checkpoint_config: test_cluster_checkpoint_config.c test_cluster_checkpoint_config.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
 test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^Cluster(CheckpointV3|StartupCheckpoint)(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
@@ -802,7 +812,7 @@ test_cluster_startup_reserve_native.inc: $(top_srcdir)/src/backend/access/transa
 	mv $@.tmp $@
 
 test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^CreateCheckPoint\(/ { owner=1 } owner && /Update the control file\./ { pending=1 } \
+	awk '/^CreateCheckPointInternal\(/ { owner=1 } owner && /Update the control file\./ { pending=1 } \
 	     owner && pending && /LWLockAcquire\(ControlFileLock/ { emit=1; count++; pending=0 } \
 	     emit { print; if (/LWLockRelease\(ControlFileLock/) emit=0 } /^}/ { owner=0 } \
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
@@ -811,7 +821,7 @@ test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/
 # PGRAC: execute the early shutdown-control branch too, before WAL creation.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^CreateCheckPoint\(/ { owner=1 } \
+	awk '/^CreateCheckPointInternal\(/ { owner=1 } \
 	     owner && /START_CRIT_SECTION\(\)/ && !seen { emit=1; seen=1; count++ } \
 	     /Begin filling in the checkpoint WAL record/ { emit=0 } \
 	     emit { print } /^}/ { owner=0 } \

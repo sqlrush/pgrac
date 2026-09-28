@@ -121,6 +121,11 @@ CREATE FUNCTION test_pgrac_config_native_role(integer)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_native_role'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_native_role(integer) FROM PUBLIC;
+-- PGRAC: actual non-immediate native checkpoint, disposable test nodes only.
+CREATE FUNCTION test_pgrac_config_checkpoint_request(boolean)
+RETURNS void AS 'MODULE_PATHNAME', 'test_pgrac_config_checkpoint_request'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_checkpoint_request(boolean) FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_slot_probe(integer)
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_slot_probe'
 LANGUAGE C STRICT;

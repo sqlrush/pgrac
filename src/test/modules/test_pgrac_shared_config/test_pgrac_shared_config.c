@@ -10,6 +10,7 @@
 #include "catalog/pg_control.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "postmaster/bgwriter.h"
 #include "storage/fd.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
@@ -17,6 +18,7 @@
 #include "utils/memutils.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_authority.h"
+#include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_durable_prefix.h"
@@ -39,6 +41,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_process);
 PG_FUNCTION_INFO_V1(test_pgrac_config_parallel_observe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_enrollment);
 PG_FUNCTION_INFO_V1(test_pgrac_config_native_role);
+PG_FUNCTION_INFO_V1(test_pgrac_config_checkpoint_request);
 PG_FUNCTION_INFO_V1(test_pgrac_config_slot_probe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_selection_cleanup);
@@ -649,7 +652,17 @@ process_test_reload(int generation, void *extra)
 	if (generation < 2 || test_process_defer)
 		return;
 	if (test_process_delivery && IsUnderPostmaster) {
+		ClusterSharedConfigProcess before, after;
+		bool checkpoint = MyBackendType == B_CHECKPOINTER;
+		bool observed = checkpoint && cluster_shared_config_process_observe(&before);
 		(void)cluster_shared_config_delivery_reload();
+		if (observed && cluster_shared_config_process_observe(&after))
+			ereport(
+				LOG,
+				(errmsg("test checkpoint configuration: target=%d before=%llu after=%llu owned=%d",
+						generation, (unsigned long long)before.ref.identity.generation,
+						(unsigned long long)after.ref.identity.generation,
+						cluster_shared_config_delivery_work_pending())));
 		return;
 	}
 	snprintf(path, sizeof(path), "%s/test_config.reload", DataDir);
@@ -1538,6 +1551,17 @@ test_pgrac_config_enrollment(PG_FUNCTION_ARGS)
 #else
 	PG_RETURN_TEXT_P(cstring_to_text("plain"));
 #endif
+}
+
+/* Exercise the real native checkpoint request queue without waiting in the
+ * requesting backend. This test helper creates no configuration permission. */
+Datum
+test_pgrac_config_checkpoint_request(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test checkpoint request requires superuser")));
+	RequestCheckpoint(CHECKPOINT_FORCE | (PG_GETARG_BOOL(0) ? CHECKPOINT_IMMEDIATE : 0));
+	PG_RETURN_VOID();
 }
 
 /* Actual native role observation only; never synthesize process enrollment. */

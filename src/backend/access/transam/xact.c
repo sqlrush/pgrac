@@ -2467,7 +2467,7 @@ StartTransaction(void)
 	 * the old transaction's cleanup or after new resources have been acquired.
 	 * This retries existing local delivery only, not cluster DATA admission.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	cluster_shared_config_delivery_retry_idle();
+	(void) cluster_shared_config_delivery_retry_idle();
 	cluster_shared_config_use_xact_start();
 #endif
 

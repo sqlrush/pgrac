@@ -549,13 +549,16 @@ cluster_shared_config_delivery_reload(void)
  * An unavailable family slot retains retry ownership. Unrelated native
  * reload indications are not consumed here. Author: SqlRush <sqlrush@gmail.com>
  */
-void
+bool
 cluster_shared_config_delivery_retry_idle(void)
 {
 	if (!delivery_waiting_for_idle || !IsUnderPostmaster || delivery_has_owned_work())
-		return;
+		return false;
 	/* Prevent recursive native hooks from entering this retry again. */
 	delivery_waiting_for_idle = false;
-	if (!cluster_shared_config_delivery_reload())
+	if (!cluster_shared_config_delivery_reload()) {
 		delivery_waiting_for_idle = true;
+		return false;
+	}
+	return true;
 }

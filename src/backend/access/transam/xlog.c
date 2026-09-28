@@ -208,6 +208,7 @@
 #include "cluster/cluster_xid_authority.h" /* PGRAC: spec-6.15b native-era XID authority */
 #include "cluster/cluster_xid_wrap_barrier.h" /* PGRAC: GCS-race round-3 P0-1 startup mirror */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_shared_config.h" /* PGRAC: whole-checkpoint common-value lifetime */
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_recovery_anchor.h" /* PGRAC: spec-5.6a per-node recovery anchor */
@@ -768,6 +769,10 @@ static void CheckRequiredParameterValues(void);
 static void XLogReportParameters(void);
 static int	LocalSetXLogInsertAllowed(void);
 static void CreateEndOfRecoveryRecord(void);
+/* PGRAC: preserve native operation bodies behind the configuration bracket.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static void CreateCheckPointInternal(int flags);
+static bool CreateRestartPointInternal(int flags);
 static XLogRecPtr CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn,
 												  XLogRecPtr pagePtr,
 												  TimeLineID newTLI);
@@ -8394,6 +8399,30 @@ ClusterCheckpointV3Publish(const ControlFileData *candidate, XLogRecPtr end)
 void
 CreateCheckPoint(int flags)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: write-delay reload must not change common values in the middle
+	 * of the native checkpoint, including shutdown/EOR and early returns.
+	 * This local stack owner is not an asynchronous CF retirement proof.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	bool entered = cluster_shared_config_delivery_work_enter();
+
+	PG_TRY();
+	{
+		CreateCheckPointInternal(flags);
+	}
+	PG_FINALLY();
+	{
+		cluster_shared_config_delivery_work_leave(entered);
+	}
+	PG_END_TRY();
+#else
+	CreateCheckPointInternal(flags);
+#endif
+}
+
+static void
+CreateCheckPointInternal(int flags)
+{
 	bool		shutdown;
 	CheckPoint	checkPoint;
 	XLogRecPtr	recptr;
@@ -9557,6 +9586,31 @@ RecoveryRestartPoint(const CheckPoint *checkPoint, XLogReaderState *record)
  */
 bool
 CreateRestartPoint(int flags)
+{
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: restartpoint write delays have the same reload boundary. A
+	 * skipped restartpoint remains false; ERROR still reaches native cleanup.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	bool entered = cluster_shared_config_delivery_work_enter();
+	bool result;
+
+	PG_TRY();
+	{
+		result = CreateRestartPointInternal(flags);
+	}
+	PG_FINALLY();
+	{
+		cluster_shared_config_delivery_work_leave(entered);
+	}
+	PG_END_TRY();
+	return result;
+#else
+	return CreateRestartPointInternal(flags);
+#endif
+}
+
+static bool
+CreateRestartPointInternal(int flags)
 {
 	XLogRecPtr	lastCheckPointRecPtr;
 	XLogRecPtr	lastCheckPointEndPtr;
