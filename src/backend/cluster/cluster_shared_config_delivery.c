@@ -23,6 +23,7 @@
 #include "postmaster/interrupt.h"
 #include "portability/mem.h"
 #include "storage/ipc.h"
+#include "storage/lock.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "cluster/cluster_clean_leave.h"
@@ -118,7 +119,7 @@ delivery_has_owned_work(void)
 	const char *reason;
 
 	if (delivery_work_depth != 0 || IsTransactionState() || IsTransactionOrTransactionBlock()
-		|| cluster_semantic_activation_backend_has_admission())
+		|| LockHasSessionLocks() || cluster_semantic_activation_backend_has_admission())
 		return true;
 	if ((AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess())
 		&& cluster_gcs_block_normal_stop_local_poll(&slot, &reason) != CLUSTER_NORMAL_STOP_READY)

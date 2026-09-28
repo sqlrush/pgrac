@@ -44,6 +44,7 @@ static MemoryContextData parent_context, child_context;
 static char test_owner;
 static ConfigDeliveryFamily family;
 static bool transaction, transaction_block, admission, cr_idle, cleaner_idle;
+static bool session_locks;
 static bool common_change, available, classification_ok;
 static ClusterNormalStopPollResult gcs_result;
 static uint64 target, consumed;
@@ -91,6 +92,11 @@ bool
 IsTransactionOrTransactionBlock(void)
 {
 	return transaction || transaction_block;
+}
+bool
+LockHasSessionLocks(void)
+{
+	return session_locks;
 }
 bool
 cluster_semantic_activation_backend_has_admission(void)
@@ -208,7 +214,7 @@ reset(void)
 	CurrentResourceOwner = NULL;
 	MyBackendType = B_LMS;
 	MyAuxProcType = LmsProcess;
-	transaction = transaction_block = admission = false;
+	transaction = transaction_block = admission = session_locks = false;
 	cr_idle = cleaner_idle = common_change = available = classification_ok = true;
 	gcs_result = CLUSTER_NORMAL_STOP_READY;
 	target = 2;
@@ -359,10 +365,33 @@ UT_TEST(policy_failure_cannot_apply_while_owned)
 	UT_ASSERT(!cluster_shared_config_delivery_reload());
 	UT_ASSERT_EQ(assignments, 0);
 }
+UT_TEST(session_owner_survives_native_idle)
+{
+	reset();
+	MyBackendType = B_BACKEND;
+	MyAuxProcType = NotAnAuxProcess;
+	session_locks = true;
+	expect_deferred();
+	cluster_shared_config_delivery_retry_idle();
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT_EQ(assignments, 0);
+	session_locks = false;
+	target = 9;
+	cluster_shared_config_delivery_retry_idle();
+	UT_ASSERT_EQ(consumed, 9);
+}
+UT_TEST(session_lock_does_not_hold_default_only)
+{
+	reset();
+	session_locks = true;
+	common_change = false;
+	UT_ASSERT(cluster_shared_config_delivery_reload());
+	UT_ASSERT_EQ(consumed, 2);
+}
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(retained_admission_without_transaction_or_command);
 	UT_RUN(gcs_private_work_without_admission);
 	UT_RUN(invalid_gcs_owner_is_not_idle);
@@ -375,6 +404,8 @@ main(void)
 	UT_RUN(transaction_and_command_boundary_retained);
 	UT_RUN(missing_new_image_retains_retry_owner);
 	UT_RUN(policy_failure_cannot_apply_while_owned);
+	UT_RUN(session_owner_survives_native_idle);
+	UT_RUN(session_lock_does_not_hold_default_only);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

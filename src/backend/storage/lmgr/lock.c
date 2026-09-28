@@ -604,6 +604,39 @@ LockOrStrongerHeldByMe(const LOCKTAG *locktag, LOCKMODE lockmode)
 	return LockHeldByMeExtended(locktag, lockmode, true);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * PGRAC: session locks outlive native transaction cleanup. Configuration
+ * delivery cannot infer that their owner is idle from transaction state.
+ * The shared PROCLOCK merges session and transaction holds; only the original
+ * local owners distinguish them. This read never assigns, releases or waits.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool
+LockHasSessionLocks(void)
+{
+	HASH_SEQ_STATUS status;
+	LOCALLOCK *locallock;
+
+	if (LockMethodLocalHash == NULL)
+		return false;
+	hash_seq_init(&status, LockMethodLocalHash);
+	while ((locallock = (LOCALLOCK *)hash_seq_search(&status)) != NULL) {
+		/* Failed/pending acquisition entries may remain with no grant. */
+		if (locallock->nLocks <= 0)
+			continue;
+		for (int i = 0; i < locallock->numLockOwners; i++) {
+			LOCALLOCKOWNER *owner = &locallock->lockOwners[i];
+			if (owner->owner == NULL && owner->nLocks > 0) {
+				hash_seq_term(&status);
+				return true;
+			}
+		}
+	}
+	return false;
+}
+#endif
+
 #if defined(USE_ASSERT_CHECKING) || defined(USE_PGRAC_CLUSTER)
 /*
  * GetLockMethodLocalHash -- return the hash of local locks, for modules that
