@@ -91,6 +91,31 @@ is($node->safe_psql('postgres', call_sql('', "common.ignore_system_indexes='on'\
 	"1:0:0:0:0:1\noff", 'BACKEND setting is deferred, never marked active');
 is($node->safe_psql('postgres', call_sql($old, $new, '', 2)),
 	'0:1:0:0:0:0', 'unconfigured node cannot consume a configuration');
+
+# A per-operation count cannot prove that an older removed setting has become
+# active. Keep each sequence in one actual backend, including the empty diff.
+my $old_port = "node000.port='$port'\n";
+my $new_port = "node000.port='$other_port'\n";
+is($node->safe_psql('postgres', call_sql($old_port, $new_port, 'totals')),
+	'1:0:1:0', 'cumulative status includes a POSTMASTER value not yet active');
+is($node->safe_psql('postgres', call_sql($old_port, '', 'totals')
+	. call_sql('', $new, 'totals')),
+	"1:0:1:0\n1:0:1:0", 'removed restart obligation survives an unrelated generation');
+is($node->safe_psql('postgres', call_sql($old_port, '', 'totals')
+	. call_sql('', '', 'totals') . call_sql('', $old_port, 'totals')),
+	"1:0:1:0\n1:0:1:0\n1:0:0:0",
+	'empty reload retains pending removal until the actual value is restored');
+is($node->safe_psql('postgres', call_sql('', $new_port, 'totals')
+	. call_sql('', "common.max_connections='103'\n", 'totals')
+	. call_sql('', $old_port, 'totals')),
+	"1:0:1:0\n1:0:2:0\n1:0:1:0", 'restoring one static value cannot clear a different pending setting');
+is($node->safe_psql('postgres', call_sql('', "common.ignore_system_indexes='on'\n", 'totals')
+	. call_sql("common.ignore_system_indexes='on'\n", '', 'totals')
+	. call_sql('', $new, 'totals')),
+	"1:0:0:1\n1:0:0:1\n1:0:0:1",
+	'existing child retains deferred removal across unrelated generations');
+is($node->safe_psql('postgres', call_sql('', "node001.port='$other_port'\n", 'totals')),
+	'1:0:0:0', 'remote-only pending change does not create a local obligation');
 is($node->safe_psql('postgres', call_sql(
 	"common.check_function_bodies='on'\ncommon.cluster.native_config_reload_failure='1'\n",
 	"common.check_function_bodies='off'\ncommon.cluster.native_config_reload_failure='2'\n",

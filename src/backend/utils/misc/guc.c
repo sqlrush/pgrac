@@ -22,6 +22,7 @@
  *
  * PGRAC MODIFICATIONS: share native FILE removal/default handling with the
  * root-selected configuration consumer; ordinary PG file parsing is unchanged.
+ * Census cumulative shared FILE obligations, including removed settings.
  * Author: SqlRush <sqlrush@gmail.com>
  *
  *--------------------------------------------------------------------
@@ -332,6 +333,33 @@ void
 ClusterRestoreConfigFileDefaults(void)
 {
 	restore_config_file_defaults();
+}
+
+/* PGRAC: process-local gauges, not latest-diff counts or application ACKs.
+ * Only the shared consumer marks these records. Native pending_restart stays
+ * authoritative even after a name disappears from subsequent selected images.
+ * Existing-child deferred state is deliberately not cleared by an unrelated
+ * reload or by session SET/RESET. No assignment, allocation or wait here.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+void
+ClusterConfigFilePending(uint32 *restart, uint32 *deferred)
+{
+	HASH_SEQ_STATUS status;
+	GUCHashEntry *hentry;
+
+	*restart = *deferred = 0;
+	hash_seq_init(&status, guc_hashtab);
+	while ((hentry = (GUCHashEntry *)hash_seq_search(&status)) != NULL) {
+		struct config_generic *gconf = hentry->gucvar;
+
+		if (!(gconf->status & GUC_SHARED_FILE))
+			continue;
+		if (gconf->status & GUC_PENDING_RESTART)
+			++*restart;
+		if (gconf->status & GUC_SHARED_DEFERRED)
+			++*deferred;
+	}
 }
 #endif
 

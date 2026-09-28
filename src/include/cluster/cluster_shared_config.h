@@ -267,11 +267,43 @@ typedef struct ClusterSharedConfigReload {
 	uint32 removed_entries;
 	uint32 pending_restart_entries;
 	uint32 deferred_entries;
+	/* Cumulative native gauges, including removed settings from older refs.
+	 * These are not node ACKs or proof that pending values are active. */
+	uint32 pending_restart_total;
+	uint32 deferred_total;
 } ClusterSharedConfigReload;
+StaticAssertDecl(sizeof(ClusterSharedConfigReload) == 240, "native config reload outcome");
 
 extern ClusterControlRootResult cluster_shared_config_apply_reload(
 	const char *old_bytes, size_t old_len, const ClusterSharedConfigRef *old_ref,
 	const char *new_bytes, size_t new_len, const ClusterSharedConfigRef *new_ref, int node_id,
 	ClusterSharedConfigReload *out, ClusterSharedConfigPolicyReport *report);
+
+/* Actual process-local defaults, inherited with native values at fork. A
+ * generation/barrier number supplied by another process is never a substitute.
+ * ref is the last fully consumed target, NOT proof that pending values are
+ * active. failed is sticky after potentially partial native application.
+ * Neither an observation nor an applier PID is a node/application ACK.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigProcess {
+	ClusterSharedConfigRef ref;
+	uint32 node_id;
+	uint32 pending_restart_total;
+	uint32 deferred_total;
+	int32 applier_pid;
+	bool failed;
+} ClusterSharedConfigProcess;
+StaticAssertDecl(sizeof(ClusterSharedConfigProcess) == 128, "native config process outcome");
+
+/* Refusal clears out. Caller owns target selection, identity revalidation,
+ * registration and admission. No lock/I/O/shared state or implicit restart.
+ * Inputs/outputs must not overlap. Observe returns whether state exists, not
+ * whether this process may serve. Unseeded or failed processes cannot reload.
+ */
+extern bool cluster_shared_config_process_observe(ClusterSharedConfigProcess *out);
+extern ClusterControlRootResult cluster_shared_config_process_reload(
+	const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
+	ClusterSharedConfigProcess *out, ClusterSharedConfigPolicyReport *report);
 
 #endif

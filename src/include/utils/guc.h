@@ -377,6 +377,7 @@ typedef enum
 } GucFileResetResult;
 extern GucFileResetResult ClusterResetConfigFileSetting(const char *name);
 extern void ClusterRestoreConfigFileDefaults(void);
+extern void ClusterConfigFilePending(uint32 *restart, uint32 *deferred);
 #endif
 extern char *convert_GUC_name_for_parameter_acl(const char *name);
 extern bool check_GUC_name_for_parameter_acl(const char *name);

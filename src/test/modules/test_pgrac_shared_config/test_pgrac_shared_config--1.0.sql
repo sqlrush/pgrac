@@ -56,3 +56,7 @@ CREATE FUNCTION test_pgrac_config_reload(text, text, integer, text)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_reload'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_reload(text, text, integer, text) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_process(integer, text)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_process'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_process(integer, text) FROM PUBLIC;

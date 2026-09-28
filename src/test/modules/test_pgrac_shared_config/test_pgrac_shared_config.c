@@ -32,6 +32,7 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_entry);
 PG_FUNCTION_INFO_V1(test_pgrac_config_object);
 PG_FUNCTION_INFO_V1(test_pgrac_config_change);
 PG_FUNCTION_INFO_V1(test_pgrac_config_reload);
+PG_FUNCTION_INFO_V1(test_pgrac_config_process);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
@@ -168,6 +169,9 @@ static bool test_bad_hash;
 static bool test_stop_after_apply;
 static bool test_prepare_bootstrap;
 static int test_prepare_race;
+static int test_process_generation;
+static int test_process_failure;
+static bool test_process_defer;
 
 static void
 bootstrap_test_path(char path[MAXPGPATH], const char *suffix)
@@ -453,6 +457,45 @@ reload_test_assign(int value, void *extra)
 	if (value == 2)
 		ereport(ERROR, (errmsg("test native reload assignment failure")));
 }
+
+/* Test-only driver into the actual consumer in a real postmaster/child.
+ * This does not select a CF root, publish an ACK or change process roles. */
+static void
+process_test_reload(int generation, void *extra)
+{
+	char path[MAXPGPATH];
+	char *body, *bytes;
+	size_t len;
+	FILE *file;
+	ResourceOwner saved_owner = CurrentResourceOwner;
+	ResourceOwner owner;
+	ClusterSharedConfigRef ref;
+	ClusterSharedConfigProcess out;
+	ClusterSharedConfigPolicyReport report;
+	ClusterControlRootResult result;
+
+	if (generation < 2 || test_process_defer)
+		return;
+	snprintf(path, sizeof(path), "%s/test_config.reload", DataDir);
+	body = palloc(CLUSTER_SHARED_CONFIG_MAX_BYTES + 1);
+	file = AllocateFile(path, "rb");
+	if (!file)
+		ereport(ERROR, (errmsg("cannot open process reload fixture")));
+	len = fread(body, 1, CLUSTER_SHARED_CONFIG_MAX_BYTES + 1, file);
+	if (ferror(file) || len > CLUSTER_SHARED_CONFIG_MAX_BYTES || FreeFile(file) != 0)
+		ereport(ERROR, (errmsg("cannot read process reload fixture")));
+	body[len] = '\0';
+	owner = ResourceOwnerCreate(saved_owner, "test process reload fixture");
+	CurrentResourceOwner = owner;
+	bytes = application_fixture_generation(body, generation, &ref, &len);
+	CurrentResourceOwner = saved_owner;
+	ResourceOwnerDelete(owner);
+	result = cluster_shared_config_process_reload(bytes, len, &ref, &out, &report);
+	ereport(LOG, (errmsg("test process configuration consume: generation=%d ok=%d pid=%d",
+						 generation, result == 0, MyProcPid)));
+	pfree(bytes);
+	pfree(body);
+}
 #endif
 
 void
@@ -476,6 +519,15 @@ _PG_init(void)
 							"Test-only native assignment race in disposable objects.", NULL,
 							&test_prepare_race, 0, 0, 9, PGC_POSTMASTER, 0, NULL,
 							bootstrap_test_race, NULL);
+	DefineCustomIntVariable("test_pgrac_shared_config.reload_generation",
+							"Test-only native process reload.", NULL, &test_process_generation, 0,
+							0, 100, PGC_SIGHUP, 0, NULL, process_test_reload, NULL);
+	DefineCustomBoolVariable("test_pgrac_shared_config.defer_process",
+							 "Test-only delayed process application.", NULL, &test_process_defer,
+							 false, PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomIntVariable("cluster.native_config_process_failure",
+							"Test-only partial process application.", NULL, &test_process_failure,
+							0, 0, 2, PGC_SIGHUP, 0, NULL, reload_test_assign, NULL);
 	if (test_prepare_bootstrap)
 		bootstrap_test_prepare();
 	if (test_apply_node >= 0) {
@@ -1090,12 +1142,55 @@ test_pgrac_config_reload(PG_FUNCTION_ARGS)
 				|| memcmp(&applied.ref, &new_ref, sizeof(new_ref)) != 0
 				|| applied.node_id != node_id))
 			ereport(ERROR, (errmsg("reload application receipt is not exact")));
+		if (strcmp(fault, "totals") == 0)
+			PG_RETURN_TEXT_P(
+				cstring_to_text(psprintf("%d:%u:%u:%u", result == 0, report.reason,
+										 applied.pending_restart_total, applied.deferred_total)));
 		PG_RETURN_TEXT_P(cstring_to_text(psprintf(
 			"%d:%u:%u:%u:%u:%u", result == 0, report.reason, applied.applied_entries,
 			applied.removed_entries, applied.pending_restart_entries, applied.deferred_entries)));
 	}
 #else
 	ereport(ERROR, (errmsg("configuration reload requires cluster build")));
+	PG_RETURN_NULL();
+#endif
+}
+
+/* Persistent process state, never an externally supplied old configuration. */
+Datum
+test_pgrac_config_process(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test process inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		int generation = PG_GETARG_INT32(0);
+		ClusterSharedConfigProcess state, out;
+		ClusterSharedConfigRef ref;
+		ClusterSharedConfigPolicyReport report;
+		ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		char *prefix = "";
+		if (generation != 0) {
+			size_t len;
+			char *bytes = application_fixture_generation(text_to_cstring(PG_GETARG_TEXT_PP(1)),
+														 generation, &ref, &len);
+			memset(&out, 0xa5, sizeof(out));
+			result = cluster_shared_config_process_reload(bytes, len, &ref, &out, &report);
+			if (result != 0 && memcmp(&out, &(ClusterSharedConfigProcess){ 0 }, sizeof(out)))
+				ereport(ERROR, (errmsg("failed process apply exposed a receipt")));
+			if (result == 0 && (out.failed || memcmp(&out.ref, &ref, sizeof(ref))))
+				ereport(ERROR, (errmsg("process receipt not bound to applied target")));
+			prefix = result == 0 ? "ok:" : "refused:";
+		}
+		if (!cluster_shared_config_process_observe(&state))
+			PG_RETURN_TEXT_P(cstring_to_text(psprintf("%sunseeded", prefix)));
+		PG_RETURN_TEXT_P(cstring_to_text(
+			psprintf("%s%llu:%u:%u:%d:%d", prefix,
+					 (unsigned long long)state.ref.identity.generation, state.pending_restart_total,
+					 state.deferred_total, state.failed, state.applier_pid == (int32)getppid())));
+	}
+#else
+	ereport(ERROR, (errmsg("process inspection requires cluster build")));
 	PG_RETURN_NULL();
 #endif
 }

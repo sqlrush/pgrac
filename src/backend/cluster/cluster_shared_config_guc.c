@@ -22,6 +22,11 @@
 #define POLICY_PATH 16
 #define POLICY_UUID 32
 
+/* Fork inherits these bytes together with the actual native defaults. No
+ * shared target/barrier can overwrite the process's actual old image. */
+static ClusterSharedConfigImage config_process_image;
+static ClusterSharedConfigProcess config_process_state;
+
 /* Native scalar defaults are common unless explicitly classified here.
  * Strings require an explicit entry: never persist arbitrary command strings,
  * connection strings, credentials or extension-loading instructions.
@@ -272,6 +277,94 @@ cluster_shared_config_check_gucs(const char *bytes, size_t len, const ClusterSha
 	result = cluster_shared_config_visit(bytes, len, ref, policy_visit, &context);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY && report->reason == CLUSTER_CONFIG_POLICY_OK)
 		report->reason = CLUSTER_CONFIG_POLICY_FORMAT;
+	return result;
+}
+
+/* Observation only: failed/pending state and an inherited PID never grant
+ * admission. The caller must compare the exact required ref and registration.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+bool
+cluster_shared_config_process_observe(ClusterSharedConfigProcess *out)
+{
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (config_process_image.bytes == NULL || config_process_state.applier_pid <= 0)
+		return false;
+	*out = config_process_state;
+	return true;
+}
+
+ClusterControlRootResult
+cluster_shared_config_process_reload(const char *bytes, size_t len,
+									 const ClusterSharedConfigRef *ref,
+									 ClusterSharedConfigProcess *out,
+									 ClusterSharedConfigPolicyReport *report)
+{
+	ClusterSharedConfigIdentity identity;
+	ClusterSharedConfigReload applied;
+	ClusterControlRootResult result;
+	char *replacement;
+
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (report != NULL)
+		policy_clear(report);
+	if (out == NULL || report == NULL || ref == NULL || bytes == NULL || len == 0
+		|| len > CLUSTER_SHARED_CONFIG_MAX_BYTES || config_process_image.bytes == NULL
+		|| config_process_state.failed || config_process_state.applier_pid <= 0)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	identity = ref->identity;
+	identity.generation = config_process_state.ref.identity.generation;
+	if (memcmp(&identity, &config_process_state.ref.identity, sizeof(identity)) != 0
+		|| ref->identity.generation < identity.generation)
+		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_REFERENCE);
+	if (ref->identity.generation == identity.generation) {
+		if (memcmp(ref, &config_process_state.ref, sizeof(*ref)) != 0
+			|| len != config_process_image.len || memcmp(bytes, config_process_image.bytes, len))
+			return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_REFERENCE);
+		/* No hooks, source changes or false child-only deferred obligation when
+		 * this exact default was already inherited/applied in this process. */
+		*out = config_process_state;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+
+	/* Own the next image before any assign hook. A caller's transaction context
+	 * or cancellation must not free the old/new process-lifetime defaults. */
+	replacement = MemoryContextAlloc(TopMemoryContext, len + 1);
+	memcpy(replacement, bytes, len);
+	replacement[len] = '\0';
+	PG_TRY();
+	{
+		result = cluster_shared_config_apply_reload(
+			config_process_image.bytes, config_process_image.len, &config_process_state.ref,
+			replacement, len, ref, config_process_state.node_id, &applied, report);
+	}
+	PG_CATCH();
+	{
+		/* Native hook side effects are not transactional. Keep the last
+		 * successful ref for diagnosis, but never issue another success from
+		 * this potentially partially modified process. The control owner must
+		 * retain its retirement/repair lane while dependent data is held. */
+		config_process_state.failed = true;
+		pfree(replacement);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		config_process_state.failed = true;
+		pfree(replacement);
+		return result;
+	}
+	pfree(config_process_image.bytes);
+	config_process_image.bytes = replacement;
+	config_process_image.len = len;
+	config_process_state.ref = applied.ref;
+	config_process_state.pending_restart_total = applied.pending_restart_total;
+	config_process_state.deferred_total = applied.deferred_total;
+	config_process_state.applier_pid = MyProcPid;
+	*out = config_process_state;
 	return result;
 }
 
@@ -639,6 +732,7 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 	ResourceOwner saved_owner = CurrentResourceOwner;
 	ResourceOwner owner;
 	MemoryContext saved_context = CurrentMemoryContext;
+	char *remembered = NULL;
 
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
@@ -666,6 +760,9 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 		if (cluster_shared_config_visit(bytes, len, ref, startup_config_visit, &context)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			startup_config_refuse("shared configuration object is not applicable", &report);
+		remembered = MemoryContextAlloc(TopMemoryContext, len + 1);
+		memcpy(remembered, bytes, len);
+		remembered[len] = '\0';
 		context.apply = true;
 		if (cluster_shared_config_visit(bytes, len, ref, startup_config_visit, &context)
 			!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
@@ -691,6 +788,14 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 	}
 	PG_END_TRY();
 	startup_config_release(owner, saved_owner, true);
+	if (config_process_image.bytes != NULL)
+		pfree(config_process_image.bytes);
+	config_process_image.bytes = remembered;
+	config_process_image.len = len;
+	memset(&config_process_state, 0, sizeof(config_process_state));
+	config_process_state.ref = *ref;
+	config_process_state.node_id = node_id;
+	config_process_state.applier_pid = MyProcPid;
 	out->ref = *ref;
 	out->node_id = node_id;
 	out->applied_entries = context.applied;
@@ -703,6 +808,7 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 typedef struct ConfigReloadItem {
 	ClusterSharedConfigEntry entry;
 	bool removed;
+	bool changed;
 } ConfigReloadItem;
 
 typedef struct ConfigReloadList {
@@ -760,10 +866,13 @@ reload_diff(ConfigReloadList *old, ConfigReloadList *next, ClusterSharedConfigPo
 			++a;
 		} else if (order > 0) {
 			changed = &y->entry;
+			y->changed = true;
 			++b;
 		} else {
-			if (strcmp(x->entry.value, y->entry.value) != 0)
+			if (strcmp(x->entry.value, y->entry.value) != 0) {
 				changed = &y->entry;
+				y->changed = true;
+			}
 			++a;
 			++b;
 		}
@@ -782,16 +891,23 @@ reload_assign(ConfigReloadList *old, ConfigReloadList *next, int node_id,
 {
 	for (uint32 i = 0; i < old->count; ++i) {
 		ConfigReloadItem *item = &old->items[i];
+		struct config_generic *record;
 		if (!item->removed || !reload_selected(&item->entry, node_id))
 			continue;
+		record = find_option(item->entry.name, false, true, DEBUG1);
+		if (record == NULL)
+			return policy_refuse(report, &item->entry, CLUSTER_CONFIG_POLICY_UNKNOWN);
+		record->status |= GUC_SHARED_FILE;
 		switch (ClusterResetConfigFileSetting(item->entry.name)) {
 		case GUC_FILE_RESET_DONE:
+			record->status &= ~GUC_SHARED_DEFERRED;
 			++applied->removed_entries;
 			break;
 		case GUC_FILE_RESET_PENDING_RESTART:
 			++applied->pending_restart_entries;
 			break;
 		case GUC_FILE_RESET_DEFERRED:
+			record->status |= GUC_SHARED_DEFERRED;
 			++applied->deferred_entries;
 			break;
 		default:
@@ -810,6 +926,7 @@ reload_assign(ConfigReloadList *old, ConfigReloadList *next, int node_id,
 		record = find_option(entry->name, false, true, DEBUG1);
 		if (record == NULL)
 			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_UNKNOWN);
+		record->status |= GUC_SHARED_FILE;
 		result = set_config_option_ext(entry->name, entry->value, PGC_SIGHUP, PGC_S_FILE,
 									   BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, true, DEBUG1, false);
 		if (record->context == PGC_POSTMASTER && (record->status & GUC_PENDING_RESTART)) {
@@ -819,10 +936,20 @@ reload_assign(ConfigReloadList *old, ConfigReloadList *next, int node_id,
 		if (result == 0)
 			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_VALUE);
 		if (IsUnderPostmaster
-			&& (record->context == PGC_BACKEND || record->context == PGC_SU_BACKEND))
-			++applied->deferred_entries;
-		else
+			&& (record->context == PGC_BACKEND || record->context == PGC_SU_BACKEND)) {
+			/* Native SIGHUP ignores even unchanged BACKEND entries. Do not
+			 * manufacture deferred debt for defaults actually inherited from
+			 * the parent. Existing debt survives an unrelated generation. */
+			if (next->items[i].changed)
+				record->status |= GUC_SHARED_DEFERRED;
+			if (record->status & GUC_SHARED_DEFERRED)
+				++applied->deferred_entries;
+			else
+				++applied->applied_entries;
+		} else {
+			record->status &= ~GUC_SHARED_DEFERRED;
 			++applied->applied_entries;
+		}
 	}
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -919,6 +1046,7 @@ cluster_shared_config_apply_reload(const char *old_bytes, size_t old_len,
 	startup_config_release(owner, saved_owner, result == CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	MemoryContextDelete(context);
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		ClusterConfigFilePending(&applied.pending_restart_total, &applied.deferred_total);
 		applied.old_ref = *old_ref;
 		applied.ref = *new_ref;
 		applied.node_id = node_id;
