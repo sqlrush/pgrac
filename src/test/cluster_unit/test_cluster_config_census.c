@@ -129,6 +129,8 @@ registration(ClusterSharedConfigSlot *slot, int pid, BackendType role)
 	slot->value.active.dynamic_entries = 20;
 	memset(slot->value.active.static_sha256, 1, 32);
 	memset(slot->value.active.dynamic_sha256, 2, 32);
+	slot->value.common = slot->value.active;
+	slot->value.common.version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
 }
 static void
 setup(void)
@@ -457,10 +459,50 @@ UT_TEST(service_identity_and_configuration_refuse)
 	cluster_lms_workers = 9;
 	refused();
 }
+#define COMMON_VALUE(slot) ((slot).value.common)
+UT_TEST(common_comparison_is_not_raw_overlay_equality)
+{
+	ClusterSharedConfigCensus out;
+	setup();
+	processes[0].cluster_config.value.active.dynamic_sha256[3] ^= 1;
+	UT_ASSERT(cluster_shared_config_node_common_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.dynamic_mismatch_processes, 0);
+	UT_ASSERT_EQ(out.current_processes, 4);
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.dynamic_mismatch_processes, 1);
+}
+UT_TEST(common_missing_and_mismatch_are_not_raw_success)
+{
+	ClusterSharedConfigCensus out;
+	setup();
+	memset(&COMMON_VALUE(processes[0].cluster_config), 0, sizeof(out.active));
+	COMMON_VALUE(processes[1].cluster_config).static_sha256[3] ^= 1;
+	UT_ASSERT(cluster_shared_config_node_common_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.active_missing_processes, 1);
+	UT_ASSERT_EQ(out.static_mismatch_processes, 1);
+	UT_ASSERT(cluster_shared_config_node_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.active_missing_processes + out.static_mismatch_processes, 0);
+}
+UT_TEST(common_collection_retains_lifetime_validation)
+{
+	ClusterSharedConfigCensus out, zero = { 0 };
+	setup();
+	mutate = 1;
+	memset(&out, 0xa5, sizeof(out));
+	UT_ASSERT(!cluster_shared_config_node_common_census(&target, 0, &out));
+	UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	UT_ASSERT_EQ(allocations, 0);
+	setup();
+	processes[0].cluster_config.value.process.failed = true;
+	processes[1].cluster_config.value.process.parallel_snapshot = true;
+	UT_ASSERT(cluster_shared_config_node_common_census(&target, 0, &out));
+	UT_ASSERT_EQ(out.failed_processes, 1);
+	UT_ASSERT_EQ(out.parallel_processes, 1);
+}
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(20);
 	UT_RUN(all_actual_participants);
 	UT_RUN(parent_cannot_prove_old_child);
 	UT_RUN(failure_and_parallel_are_distinct);
@@ -478,6 +520,9 @@ main(void)
 	UT_RUN(configured_service_roster_not_live_subset);
 	UT_RUN(each_configured_worker_has_own_ordinal);
 	UT_RUN(service_identity_and_configuration_refuse);
+	UT_RUN(common_comparison_is_not_raw_overlay_equality);
+	UT_RUN(common_missing_and_mismatch_are_not_raw_success);
+	UT_RUN(common_collection_retains_lifetime_validation);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

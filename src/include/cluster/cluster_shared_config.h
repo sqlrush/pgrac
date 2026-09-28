@@ -393,6 +393,7 @@ extern ClusterControlRootResult cluster_shared_config_process_reload(
  * Author: SqlRush <sqlrush@gmail.com>
  */
 #define CLUSTER_SHARED_CONFIG_ACTIVE_VERSION 1
+#define CLUSTER_SHARED_CONFIG_COMMON_VERSION 2
 typedef struct ClusterSharedConfigActive {
 	uint32 version;
 	uint32 static_entries;
@@ -402,6 +403,10 @@ typedef struct ClusterSharedConfigActive {
 } ClusterSharedConfigActive;
 StaticAssertDecl(sizeof(ClusterSharedConfigActive) == 76, "native active configuration");
 extern bool cluster_shared_config_active_profile(ClusterSharedConfigActive *out);
+/* Separate comparison of common POSTMASTER/SIGHUP values. Native session
+ * overlays remain visible in active_profile, but are not required equality.
+ * Neither profile grants permission or proves a stable producer cut. */
+extern bool cluster_shared_config_common_profile(ClusterSharedConfigActive *out);
 struct config_generic;
 /* Before covered native assignment/restoration, without allocation or hooks.
  * Invalidates observation only; does not alter PG values, ref or SET semantics. */
@@ -416,8 +421,9 @@ typedef struct ClusterSharedConfigRegistration {
 	/* Actual native ordinal, not the shared LMS/cleaner display role. */
 	int16 aux_type;
 	ClusterSharedConfigActive active;
+	ClusterSharedConfigActive common;
 } ClusterSharedConfigRegistration;
-StaticAssertDecl(sizeof(ClusterSharedConfigRegistration) == 224, "config process registration");
+StaticAssertDecl(sizeof(ClusterSharedConfigRegistration) == 304, "config process registration");
 StaticAssertDecl(offsetof(ClusterSharedConfigRegistration, active) == 148,
 				 "native auxiliary ordinal must use existing registration padding");
 
@@ -425,7 +431,7 @@ typedef struct ClusterSharedConfigSlot {
 	pg_atomic_uint64 sequence;
 	ClusterSharedConfigRegistration value;
 } ClusterSharedConfigSlot;
-StaticAssertDecl(sizeof(ClusterSharedConfigSlot) == 232, "config process observation slot");
+StaticAssertDecl(sizeof(ClusterSharedConfigSlot) == 312, "config process observation slot");
 extern void cluster_shared_config_registration_init(ClusterSharedConfigSlot *slot);
 extern void cluster_shared_config_process_new_shmem(void);
 extern bool cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot);
@@ -465,6 +471,10 @@ typedef struct ClusterSharedConfigCensus {
  * configuration is enabled; it does not freeze future process births. */
 extern bool cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node_id,
 											  ClusterSharedConfigCensus *out);
+/* Same lifetime census, using common rather than raw active observations.
+ * Version2 results must not be encoded as version1 diagnostic wire reports. */
+extern bool cluster_shared_config_node_common_census(const ClusterSharedConfigRef *target,
+													 int node_id, ClusterSharedConfigCensus *out);
 
 /* Native family transport. Creation/reset are real postmaster-only, before
  * children start / after DATA children exit. No disk state or CF acquisition.

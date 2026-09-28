@@ -122,9 +122,13 @@ census_overlap(const void *a, size_t alen, const void *b, size_t blen)
 }
 
 static void
-census_count(const ClusterSharedConfigRegistration *value, ClusterSharedConfigCensus *out)
+census_count(const ClusterSharedConfigRegistration *value, ClusterSharedConfigCensus *out,
+			 bool common)
 {
 	const ClusterSharedConfigProcess *p = &value->process;
+	const ClusterSharedConfigActive *active = common ? &value->common : &value->active;
+	uint32 version
+		= common ? CLUSTER_SHARED_CONFIG_COMMON_VERSION : CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
 	out->participants++;
 	if (!value->observed || value->registration == 0)
 		out->waiting_processes++;
@@ -141,25 +145,29 @@ census_count(const ClusterSharedConfigRegistration *value, ClusterSharedConfigCe
 		out->deferred_processes += p->deferred_total != 0;
 		out->pending_entries += (uint64)p->pending_restart_total;
 		out->deferred_entries += (uint64)p->deferred_total;
-		if (value->active.version != CLUSTER_SHARED_CONFIG_ACTIVE_VERSION
-			|| value->active.static_entries == 0 || value->active.dynamic_entries == 0)
+		if (active->version != version || active->static_entries == 0
+			|| active->dynamic_entries == 0)
 			out->active_missing_processes++;
-		else if (out->active.version == CLUSTER_SHARED_CONFIG_ACTIVE_VERSION) {
+		else if (out->active.version == version) {
 			out->static_mismatch_processes
-				+= value->active.static_entries != out->active.static_entries
-				   || memcmp(value->active.static_sha256, out->active.static_sha256, 32) != 0;
+				+= active->static_entries != out->active.static_entries
+				   || memcmp(active->static_sha256, out->active.static_sha256, 32) != 0;
 			out->dynamic_mismatch_processes
-				+= value->active.dynamic_entries != out->active.dynamic_entries
-				   || memcmp(value->active.dynamic_sha256, out->active.dynamic_sha256, 32) != 0;
+				+= active->dynamic_entries != out->active.dynamic_entries
+				   || memcmp(active->dynamic_sha256, out->active.dynamic_sha256, 32) != 0;
 		}
 	}
 }
 
 static bool
 census_capture(ClusterSharedConfigSlot *slot, int32 pid, ConfigCensusSlot *captured,
-			   ClusterSharedConfigCensus *result, bool parent, uint64 required, uint64 *seen)
+			   ClusterSharedConfigCensus *result, bool parent, uint64 required, uint64 *seen,
+			   bool common)
 {
 	ClusterSharedConfigRegistration value;
+	const ClusterSharedConfigActive *active = common ? &value.common : &value.active;
+	uint32 version
+		= common ? CLUSTER_SHARED_CONFIG_COMMON_VERSION : CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
 	uint64 sequence = pg_atomic_read_u64(&slot->sequence);
 	if ((sequence & 1) || !cluster_shared_config_registration_read(slot, &value))
 		return false;
@@ -173,11 +181,11 @@ census_capture(ClusterSharedConfigSlot *slot, int32 pid, ConfigCensusSlot *captu
 	if (parent && value.observed && !value.process.failed && !value.process.parallel_snapshot
 		&& value.process.node_id == result->node_id && value.process.applier_pid > 0
 		&& memcmp(&value.process.ref, &result->ref, sizeof(result->ref)) == 0
-		&& value.active.version == CLUSTER_SHARED_CONFIG_ACTIVE_VERSION
-		&& value.active.static_entries != 0 && value.active.dynamic_entries != 0)
-		result->active = value.active;
+		&& active->version == version && active->static_entries != 0
+		&& active->dynamic_entries != 0)
+		result->active = *active;
 	if (pid > 0)
-		census_count(&value, result);
+		census_count(&value, result, common);
 	else if (value.observed)
 		return false;
 	captured->sequence = sequence;
@@ -185,9 +193,9 @@ census_capture(ClusterSharedConfigSlot *slot, int32 pid, ConfigCensusSlot *captu
 	return true;
 }
 
-bool
-cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node_id,
-								  ClusterSharedConfigCensus *out)
+static bool
+config_node_census(const ClusterSharedConfigRef *target, int node_id,
+				   ClusterSharedConfigCensus *out, bool common)
 {
 	ClusterSharedConfigCensus result = { 0 };
 	ClusterSharedConfigRegistration logger, logger_recheck;
@@ -224,19 +232,19 @@ cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node
 	if (!ProcConfigSnapshotPids(pids, count))
 		goto done;
 	if (!census_capture(&ProcGlobal->cluster_config_postmaster, PostmasterPid, &parent, &result,
-						true, required, &seen))
+						true, required, &seen, common))
 		goto done;
 	if (Logging_collector) {
 		if (!cluster_shared_config_delivery_logger_snapshot(&logger, &logger_sequence)
 			|| logger.pid <= 0 || logger.role != B_LOGGER
 			|| (required != 0 && logger.aux_type != NotAnAuxProcess))
 			goto done;
-		census_count(&logger, &result);
+		census_count(&logger, &result, common);
 	}
 	for (uint32 i = 0; i < count; ++i) {
 		PGPROC *proc = &ProcGlobal->allProcs[i];
 		if (!census_capture(&proc->cluster_config, pids[i], &slots[i], &result, false, required,
-							&seen))
+							&seen, common))
 			goto done;
 	}
 	/* Missing configured services are not an empty live subset. Their native
@@ -265,4 +273,18 @@ cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node
 done:
 	pfree(slots);
 	return valid;
+}
+
+bool
+cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node_id,
+								  ClusterSharedConfigCensus *out)
+{
+	return config_node_census(target, node_id, out, false);
+}
+
+bool
+cluster_shared_config_node_common_census(const ClusterSharedConfigRef *target, int node_id,
+										 ClusterSharedConfigCensus *out)
+{
+	return config_node_census(target, node_id, out, true);
 }

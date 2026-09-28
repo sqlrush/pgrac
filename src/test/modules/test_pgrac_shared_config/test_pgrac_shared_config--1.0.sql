@@ -16,14 +16,26 @@ CREATE FUNCTION test_pgrac_config_active(boolean)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_active(boolean) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_active(boolean, boolean)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_active(boolean, boolean) FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_define_common()
 RETURNS void AS 'MODULE_PATHNAME', 'test_pgrac_config_define_common'
 LANGUAGE C VOLATILE;
 REVOKE ALL ON FUNCTION test_pgrac_config_define_common() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_define_common(boolean)
+RETURNS void AS 'MODULE_PATHNAME', 'test_pgrac_config_define_common'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_define_common(boolean) FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_active_census()
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active_census'
 LANGUAGE C VOLATILE;
 REVOKE ALL ON FUNCTION test_pgrac_config_active_census() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_active_census(boolean)
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active_census'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_active_census(boolean) FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_delivery_state()
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_state'
 LANGUAGE C STRICT;

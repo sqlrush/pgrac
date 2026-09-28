@@ -228,6 +228,8 @@ target(ClusterSharedConfigRegistration *value, int pid)
 	value->active.version = CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
 	value->active.static_entries = 1;
 	value->active.dynamic_entries = 1;
+	value->common = value->active;
+	value->common.version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
 }
 
 static void
@@ -466,11 +468,37 @@ UT_TEST(observation_refresh_is_not_member_change)
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT_EQ(writes, before + 1);
 }
+UT_TEST(legal_overlay_needs_no_common_delivery)
+{
+	unsigned before;
+	member_fixture();
+	target(&procs.cluster_config_postmaster.value, PostmasterPid);
+	procs.cluster_config_postmaster.value.role = B_INVALID;
+	native_services();
+	target(&processes[0].cluster_config.value, 130);
+	processes[0].pid = 130;
+	target(&logger, 121);
+	logger.role = B_LOGGER;
+	memset(&processes[0].cluster_config.value.active, 0, sizeof(logger.active));
+	before = sends;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(sends, before);
+}
+UT_TEST(missing_common_observation_still_requests_delivery)
+{
+	unsigned before;
+	member_fixture();
+	target(&processes[0].cluster_config.value, 130);
+	memset(&processes[0].cluster_config.value.common, 0, sizeof(logger.active));
+	before = sends;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(sends, before + 1);
+}
 int
 main(void)
 {
 	seed_members();
-	UT_PLAN(13);
+	UT_PLAN(15);
 	UT_RUN(select_and_deliver);
 	UT_RUN(lost_notification);
 	UT_RUN(parent_does_not_prove_children);
@@ -484,6 +512,8 @@ main(void)
 	UT_RUN(changed_completion_cannot_publish);
 	UT_RUN(undeclared_member_or_wrong_local_node);
 	UT_RUN(observation_refresh_is_not_member_change);
+	UT_RUN(legal_overlay_needs_no_common_delivery);
+	UT_RUN(missing_common_observation_still_requests_delivery);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

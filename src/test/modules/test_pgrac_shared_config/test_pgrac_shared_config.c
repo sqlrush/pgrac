@@ -65,8 +65,19 @@ test_pgrac_config_define_common(PG_FUNCTION_ARGS)
 {
 	static bool defined;
 	static bool value;
+	static bool common_defined;
+	static bool common_value;
 	if (!superuser())
 		ereport(ERROR, (errmsg("test native registry inspection requires superuser")));
+	if (PG_NARGS() > 0 && PG_GETARG_BOOL(0)) {
+		if (!common_defined) {
+			DefineCustomBoolVariable("cluster.native_config_late_sighup",
+									 "Test native registration", NULL, &common_value, false,
+									 PGC_SIGHUP, 0, NULL, NULL, NULL);
+			common_defined = true;
+		}
+		PG_RETURN_VOID();
+	}
 	if (!defined) {
 		DefineCustomBoolVariable("cluster.native_config_late", "Test native registration", NULL,
 								 &value, false, PGC_SUSET, 0, NULL, NULL, NULL);
@@ -84,8 +95,15 @@ test_pgrac_config_active_census(PG_FUNCTION_ARGS)
 	{
 		ClusterSharedConfigProcess actual;
 		ClusterSharedConfigCensus census;
-		if (!cluster_shared_config_process_observe(&actual)
-			|| !cluster_shared_config_node_census(&actual.ref, actual.node_id, &census))
+		bool observed;
+		if (!cluster_shared_config_process_observe(&actual))
+			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
+		if (PG_NARGS() > 0 && PG_GETARG_BOOL(0))
+			observed
+				= cluster_shared_config_node_common_census(&actual.ref, actual.node_id, &census);
+		else
+			observed = cluster_shared_config_node_census(&actual.ref, actual.node_id, &census);
+		if (!observed)
 			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
 		if (census.participants != census.current_processes)
 			PG_RETURN_TEXT_P(cstring_to_text("not-current"));
@@ -113,14 +131,22 @@ test_pgrac_config_active(PG_FUNCTION_ARGS)
 		ClusterSharedConfigRegistration registration;
 		char static_hex[65], dynamic_hex[65];
 		static const char hex[] = "0123456789abcdef";
+		bool common = PG_NARGS() > 1 && PG_GETARG_BOOL(1);
+		uint32 version
+			= common ? CLUSTER_SHARED_CONFIG_COMMON_VERSION : CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
 		if (PG_GETARG_BOOL(0)) {
 			if (MyProc == NULL
 				|| !cluster_shared_config_registration_read(&MyProc->cluster_config, &registration))
 				PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
 			active = registration.active;
+			if (common)
+				active = registration.common;
+		} else if (common) {
+			if (!cluster_shared_config_common_profile(&active))
+				PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
 		} else if (!cluster_shared_config_active_profile(&active))
 			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		if (active.version != CLUSTER_SHARED_CONFIG_ACTIVE_VERSION)
+		if (active.version != version)
 			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
 		for (int i = 0; i < 32; ++i) {
 			static_hex[2 * i] = hex[active.static_sha256[i] >> 4];

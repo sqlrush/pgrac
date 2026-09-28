@@ -124,6 +124,7 @@ cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot)
 	value.aux_type = MyAuxProcType;
 	value.observed = cluster_shared_config_process_observe(&value.process);
 	(void)cluster_shared_config_active_profile(&value.active);
+	(void)cluster_shared_config_common_profile(&value.common);
 	if (!config_registration_write(slot, &value))
 		return false;
 	config_process_slot = slot;
@@ -147,6 +148,7 @@ config_process_report(void)
 	value.aux_type = MyAuxProcType;
 	value.observed = cluster_shared_config_process_observe(&value.process);
 	(void)cluster_shared_config_active_profile(&value.active);
+	(void)cluster_shared_config_common_profile(&value.common);
 	(void)config_registration_write(config_process_slot, &value);
 }
 
@@ -257,6 +259,13 @@ config_common_active_record(const struct config_generic *record)
 		   && (record->vartype != PGC_STRING || (flags & POLICY_STRING) != 0);
 }
 
+static bool
+config_common_use_record(const struct config_generic *record)
+{
+	return config_common_active_record(record)
+		   && (record->context == PGC_POSTMASTER || record->context == PGC_SIGHUP);
+}
+
 void
 cluster_shared_config_native_value_changing(const struct config_generic *record)
 {
@@ -270,6 +279,8 @@ cluster_shared_config_native_value_changing(const struct config_generic *record)
 		|| value.pid != MyProcPid || value.registration != config_process_registration)
 		return;
 	memset(&value.active, 0, sizeof(value.active));
+	if (config_common_use_record(record))
+		memset(&value.common, 0, sizeof(value.common));
 	(void)config_registration_write(config_process_slot, &value);
 }
 
@@ -331,9 +342,12 @@ config_active_value(pg_cryptohash_ctx *hash, const struct config_generic *record
 }
 
 static bool
-config_active_build(ClusterSharedConfigActive *out)
+config_active_build(ClusterSharedConfigActive *out, bool common)
 {
-	static const char *const domains[] = { "PGRAC-common-static-v1", "PGRAC-common-dynamic-v1" };
+	static const char *const raw_domains[]
+		= { "PGRAC-common-static-v1", "PGRAC-common-dynamic-v1" };
+	static const char *const common_domains[] = { "PGRAC-use-static-v2", "PGRAC-use-dynamic-v2" };
+	const char *const *domains = common ? common_domains : raw_domains;
 	pg_cryptohash_ctx *hash[2] = { NULL, NULL };
 	struct config_generic **records;
 	uint32 counts[2] = { 0, 0 };
@@ -352,7 +366,7 @@ config_active_build(ClusterSharedConfigActive *out)
 	for (int i = 0; i < count; ++i) {
 		struct config_generic *record = records[i];
 		int part;
-		if (!config_common_active_record(record))
+		if (!(common ? config_common_use_record(record) : config_common_active_record(record)))
 			continue;
 		part = record->context == PGC_POSTMASTER ? 0 : 1;
 		if (strlen(record->name) > CLUSTER_SHARED_CONFIG_MAX_NAME
@@ -364,7 +378,8 @@ config_active_build(ClusterSharedConfigActive *out)
 		if (counts[i] == 0 || !config_active_u32(hash[i], counts[i])
 			|| pg_cryptohash_final(hash[i], digests[i], sizeof(digests[i])) != 0)
 			goto done;
-	out->version = CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
+	out->version
+		= common ? CLUSTER_SHARED_CONFIG_COMMON_VERSION : CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
 	out->static_entries = counts[0];
 	out->dynamic_entries = counts[1];
 	memcpy(out->static_sha256, digests[0], 32);
@@ -378,8 +393,8 @@ done:
 	return valid;
 }
 
-bool
-cluster_shared_config_active_profile(ClusterSharedConfigActive *out)
+static bool
+config_native_profile(ClusterSharedConfigActive *out, bool common)
 {
 	ClusterSharedConfigActive result = { 0 };
 	ResourceOwner saved_owner = CurrentResourceOwner, owner;
@@ -399,7 +414,7 @@ cluster_shared_config_active_profile(ClusterSharedConfigActive *out)
 	CurrentResourceOwner = owner;
 	PG_TRY();
 	{
-		valid = config_active_build(&result);
+		valid = config_active_build(&result, common);
 	}
 	PG_CATCH();
 	{
@@ -415,6 +430,18 @@ cluster_shared_config_active_profile(ClusterSharedConfigActive *out)
 	if (valid)
 		*out = result;
 	return valid;
+}
+
+bool
+cluster_shared_config_active_profile(ClusterSharedConfigActive *out)
+{
+	return config_native_profile(out, false);
+}
+
+bool
+cluster_shared_config_common_profile(ClusterSharedConfigActive *out)
+{
+	return config_native_profile(out, true);
 }
 
 static void

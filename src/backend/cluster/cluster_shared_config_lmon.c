@@ -42,7 +42,10 @@ static bool
 delivery_needs_signal(const ClusterSharedConfigRef *ref, int node_id)
 {
 	ClusterSharedConfigCensus census;
-	return !cluster_shared_config_node_census(ref, node_id, &census)
+	/* A legal session override can invalidate raw diagnostics without changing
+	 * common POSTMASTER/SIGHUP values. Do not repeatedly signal the family for
+	 * that expected state; old/failed/unknown common application still retries. */
+	return !cluster_shared_config_node_common_census(ref, node_id, &census)
 		   || census.waiting_processes != 0 || census.failed_processes != 0
 		   || census.parallel_processes != 0 || census.active_missing_processes != 0;
 }
