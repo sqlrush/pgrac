@@ -12,6 +12,7 @@
 #include "storage/proc.h"
 #include "postmaster/syslogger.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_config_members.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_reconfig.h"
@@ -38,6 +39,21 @@ static bool stop, leaving, publication = true, busy, publication_error;
 static ClusterR4MembershipSnapshot members;
 static bool members_available = true;
 static int change_during_poll;
+static unsigned member_polls, member_cancels;
+
+void
+cluster_config_members_poll(const ClusterSharedConfigRef *ref,
+							const ClusterR4MembershipSnapshot *cut)
+{
+	UT_ASSERT(memcmp(ref, &published, sizeof(*ref)) == 0);
+	UT_ASSERT_EQ(cut->formation_epoch, members.formation_epoch);
+	member_polls++;
+}
+void
+cluster_config_members_cancel(void)
+{
+	member_cancels++;
+}
 
 bool
 cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnapshot *out)
@@ -217,6 +233,7 @@ UT_TEST(select_and_deliver)
 	actual.applier_pid = PostmasterPid;
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT(polls == 1 && releases == 1 && writes == 1 && sends == 1);
+	UT_ASSERT_EQ(member_polls, 1);
 }
 UT_TEST(lost_notification)
 {
@@ -269,9 +286,11 @@ UT_TEST(pending_not_paced)
 UT_TEST(stop_and_leave_cancel)
 {
 	unsigned before_cancel = cancels, before = polls;
+	unsigned before_members = member_cancels;
 	stop = true;
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT(cancels > before_cancel && polls == before);
+	UT_ASSERT(member_cancels > before_members);
 	stop = false;
 	leaving = true;
 	before_cancel = cancels;
@@ -281,12 +300,14 @@ UT_TEST(stop_and_leave_cancel)
 UT_TEST(refused_delivery)
 {
 	unsigned before = sends;
+	unsigned before_member_polls = member_polls;
 	leaving = busy = false;
 	publication = false;
 	cluster_shared_config_delivery_lmon_cancel();
 	now += 1000000;
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT_EQ(sends, before);
+	UT_ASSERT_EQ(member_polls, before_member_polls);
 }
 UT_TEST(publication_error_cleanup)
 {

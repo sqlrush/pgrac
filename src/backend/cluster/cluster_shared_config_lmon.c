@@ -23,6 +23,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_config_members.h"
 
 static bool selection_pending;
 static ClusterR4MembershipSnapshot selection_members;
@@ -53,6 +54,7 @@ cluster_shared_config_delivery_lmon_cancel(void)
 		return;
 	cluster_shared_config_free(&selected_image);
 	cluster_control_root_config_cancel();
+	cluster_config_members_cancel();
 	selection_pending = false;
 	memset(&selection_members, 0, sizeof(selection_members));
 	next_probe = 0;
@@ -95,8 +97,11 @@ delivery_attempt(const ClusterSharedConfigProcess *actual, TimestampTz now)
 	if (!selection_pending)
 		next_probe = now + INT64CONST(1000000);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
-		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED) {
+		if (!selection_pending)
+			cluster_config_members_cancel();
 		return;
+	}
 	if (!cluster_reconfig_lmon_snapshot_r4_membership(&after)
 		|| !delivery_same_members(&selection_members, &after)
 		|| (after.admitted_members_lo & ~selected.ref.identity.configured[0]) != 0
@@ -104,8 +109,12 @@ delivery_attempt(const ClusterSharedConfigProcess *actual, TimestampTz now)
 		cluster_shared_config_delivery_lmon_cancel();
 		return;
 	}
-	if (cluster_shared_config_delivery_publish(&selected.ref, &selected_image)
-		&& delivery_needs_signal(&selected.ref, actual->node_id)) {
+	if (!cluster_shared_config_delivery_publish(&selected.ref, &selected_image)) {
+		cluster_config_members_cancel();
+		return;
+	}
+	cluster_config_members_poll(&selected.ref, &after);
+	if (delivery_needs_signal(&selected.ref, actual->node_id)) {
 		/* No receipt is inferred from kill's return. A missing/failed
 		 * signal leaves real outcomes old and will be retried. */
 		if (PostmasterPid > 0)
