@@ -47,6 +47,9 @@ static uint64 delivery_generation;
 /* Scheduling only, never a retained target. Native fork starts from a parent
  * which owns no transaction and therefore never sets this indication. */
 static bool delivery_waiting_for_idle;
+/* A utility or maintenance command may own work across native transactions.
+ * This local nesting count is not a target, node ACK or DATA permission. */
+static uint32 delivery_work_depth;
 
 static void
 delivery_release_owner(ResourceOwner owner, ResourceOwner saved, bool success)
@@ -72,6 +75,29 @@ delivery_is_family(void)
 {
 	return delivery_family != NULL && IsPostmasterEnvironment
 		   && delivery_family->postmaster_pid == PostmasterPid;
+}
+
+bool
+cluster_shared_config_delivery_work_enter(void)
+{
+	if (!IsUnderPostmaster || !delivery_is_family())
+		return false;
+	if (delivery_work_depth == PG_UINT32_MAX)
+		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						errmsg("configuration work nesting limit exceeded")));
+	++delivery_work_depth;
+	return true;
+}
+
+void
+cluster_shared_config_delivery_work_leave(bool entered)
+{
+	if (entered) {
+		Assert(delivery_work_depth > 0);
+		--delivery_work_depth;
+	}
+	/* PG_FINALLY can run during ERROR cleanup. Do not assign, allocate, wait,
+	 * or invoke hooks here. The next actual idle boundary owns the retry. */
 }
 
 /* Main-shmem children cannot cross its native reset. The detached logger is
@@ -351,7 +377,9 @@ cluster_shared_config_delivery_reload(void)
 		if (cluster_shared_config_delivery_slot_read(slot, generation, &ref, &image)
 			&& pg_atomic_read_u64(&delivery_family->generation) == generation) {
 			bool can_apply = true;
-			if (IsUnderPostmaster && (IsTransactionState() || IsTransactionOrTransactionBlock())) {
+			if (IsUnderPostmaster
+				&& (delivery_work_depth != 0 || IsTransactionState()
+					|| IsTransactionOrTransactionBlock())) {
 				bool needs_idle;
 				can_apply = cluster_shared_config_process_reload_needs_idle(
 								image.bytes, image.len, &ref, &needs_idle, &report)
@@ -404,8 +432,8 @@ cluster_shared_config_delivery_reload(void)
 void
 cluster_shared_config_delivery_retry_idle(void)
 {
-	if (!delivery_waiting_for_idle || !IsUnderPostmaster || IsTransactionState()
-		|| IsTransactionOrTransactionBlock())
+	if (!delivery_waiting_for_idle || !IsUnderPostmaster || delivery_work_depth != 0
+		|| IsTransactionState() || IsTransactionOrTransactionBlock())
 		return;
 	/* Prevent recursive native hooks from entering this retry again. */
 	delivery_waiting_for_idle = false;

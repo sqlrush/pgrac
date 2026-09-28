@@ -43,6 +43,9 @@
 #include "commands/cluster.h"
 #include "commands/defrem.h"
 #include "commands/vacuum.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_shared_config.h"
+#endif
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
 #include "pgstat.h"
@@ -107,6 +110,9 @@ pg_atomic_uint32 *VacuumActiveNWorkers = NULL;
 int			VacuumCostBalanceLocal = 0;
 
 /* non-export function prototypes */
+static void vacuum_run(List *relations, VacuumParams *params,
+					   BufferAccessStrategy bstrategy, MemoryContext vac_context,
+					   bool isTopLevel);
 static List *expand_vacuum_rel(VacuumRelation *vrel,
 							   MemoryContext vac_context, int options);
 static List *get_all_vacuum_rels(MemoryContext vac_context, int options);
@@ -478,6 +484,32 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 void
 vacuum(List *relations, VacuumParams *params, BufferAccessStrategy bstrategy,
 	   MemoryContext vac_context, bool isTopLevel)
+{
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: autovacuum enters here without ProcessUtility. Internal commits
+	 * do not end the command's session locks or its recursive TOAST work.
+	 * Balance on ERROR as well; never assign configuration from cleanup.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	bool		config_work = cluster_shared_config_delivery_work_enter();
+
+	PG_TRY();
+	{
+#endif
+		vacuum_run(relations, params, bstrategy, vac_context, isTopLevel);
+#ifdef USE_PGRAC_CLUSTER
+	}
+	PG_FINALLY();
+	{
+		cluster_shared_config_delivery_work_leave(config_work);
+	}
+	PG_END_TRY();
+#endif
+}
+
+static void
+vacuum_run(List *relations, VacuumParams *params, BufferAccessStrategy bstrategy,
+		   MemoryContext vac_context, bool isTopLevel)
 {
 	static bool in_vacuum = false;
 

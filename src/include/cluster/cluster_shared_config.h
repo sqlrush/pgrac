@@ -486,6 +486,11 @@ extern bool cluster_shared_config_delivery_reload(void);
 /* Real top-level transaction boundary, before new transaction resources.
  * Retries an already-delayed image only; no wait, file read or DATA grant. */
 extern void cluster_shared_config_delivery_retry_idle(void);
+/* Balanced native command lifetime, including internal transaction changes.
+ * Enter before PG_TRY; pass its result to leave in PG_FINALLY. Leave never
+ * applies an image. This is local scheduling, not distributed admission. */
+extern bool cluster_shared_config_delivery_work_enter(void);
+extern void cluster_shared_config_delivery_work_leave(bool entered);
 extern bool cluster_shared_config_delivery_parent_publish(void);
 extern void cluster_shared_config_delivery_lmon_tick(void);
 extern void cluster_shared_config_delivery_lmon_cancel(void);
