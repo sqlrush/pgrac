@@ -821,10 +821,95 @@ UT_TEST(periodic_service_requires_actual_native_kind_and_common_target)
 	UT_ASSERT(!cluster_shared_config_service_producer_begin(CLUSTER_CONFIG_BACKGROUND_COUNT));
 }
 
+UT_TEST(managed_cleaner_requires_actual_native_process)
+{
+	reset();
+	MyBackendType = B_UNDO_CLEANER;
+	MyAuxProcType = UndoCleanerProcess;
+	MyProc = NULL;
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	UT_ASSERT_EQ(cluster_config_use_gate_read(&family.cleaner_producer).owners, 0);
+}
+
+static void
+cleaner_bind(void)
+{
+	uint32 cut;
+	ClusterConfigUseTarget *bound;
+	/* Reuse this fixture's valid native profile; the cleaner has its own cut. */
+	background_bind(CLUSTER_CONFIG_BACKGROUND_CHECKPOINTER);
+	MyBackendType = B_UNDO_CLEANER;
+	MyAuxProcType = UndoCleanerProcess;
+	background_actual.role = MyBackendType;
+	background_actual.aux_type = MyAuxProcType;
+	bound = cluster_shared_config_delivery_cleaner_target();
+	UT_ASSERT(bound != NULL);
+	UT_ASSERT(cluster_config_use_gate_close(&family.cleaner_producer, &cut));
+	UT_ASSERT(cluster_config_use_target_bind(&family.cleaner_producer, bound, cut, 0,
+											 &background_actual.process.ref,
+											 &background_actual.common));
+	UT_ASSERT(cluster_config_use_gate_open(&family.cleaner_producer, cut));
+}
+
+UT_TEST(future_cleaner_common_values_are_checked_before_fresh_work)
+{
+	reset();
+	cleaner_bind();
+	UT_ASSERT(cluster_shared_config_cleaner_begin());
+	cluster_shared_config_cleaner_end(true);
+	background_actual.common.dynamic_sha256[0]++;
+	UT_ASSERT(!cluster_shared_config_cleaner_begin());
+	UT_ASSERT_EQ(cluster_config_use_gate_read(&family.cleaner_producer).owners, 0);
+	UT_ASSERT(ConfigReloadPending && delivery_waiting_for_idle);
+	UT_ASSERT_EQ(assignments, 0);
+	background_actual.common.dynamic_sha256[0]--;
+	UT_ASSERT(cluster_shared_config_cleaner_begin());
+	cluster_shared_config_cleaner_end(true);
+	pg_atomic_write_u64(&family.generation, 2);
+	UT_ASSERT(cluster_shared_config_delivery_cleaner_target() == NULL);
+}
+
+UT_TEST(future_cleaner_refuses_unknown_or_replaced_native_registration)
+{
+	for (int bad = 0; bad < 8; ++bad) {
+		reset();
+		cleaner_bind();
+		switch (bad) {
+		case 0:
+			registration_available = false;
+			break;
+		case 1:
+			registration_changed = true;
+			break;
+		case 2:
+			background_actual.pid++;
+			break;
+		case 3:
+			background_actual.role = B_LMS;
+			break;
+		case 4:
+			background_actual.aux_type = UndoCleanerWorker1Process;
+			break;
+		case 5:
+			background_actual.process.failed = true;
+			break;
+		case 6:
+			background_actual.process.parallel_snapshot = true;
+			break;
+		case 7:
+			background_actual.process.ref.sha256[0]++;
+			break;
+		}
+		UT_ASSERT(!cluster_shared_config_cleaner_begin());
+		UT_ASSERT_EQ(cluster_config_use_gate_read(&family.cleaner_producer).owners, 0);
+		UT_ASSERT(!delivery_cleaner_owned && ConfigReloadPending && delivery_waiting_for_idle);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(32);
 	UT_RUN(channel_board_is_bound_to_native_family);
 	UT_RUN(retained_admission_without_transaction_or_command);
 	UT_RUN(gcs_private_work_without_admission);
@@ -854,6 +939,9 @@ main(void)
 	UT_RUN(periodic_service_cut_retains_old_pass_and_independent_producers);
 	UT_RUN(periodic_service_error_keeps_failed_original_owner);
 	UT_RUN(periodic_service_requires_actual_native_kind_and_common_target);
+	UT_RUN(managed_cleaner_requires_actual_native_process);
+	UT_RUN(future_cleaner_common_values_are_checked_before_fresh_work);
+	UT_RUN(future_cleaner_refuses_unknown_or_replaced_native_registration);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

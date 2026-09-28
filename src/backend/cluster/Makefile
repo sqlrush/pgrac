@@ -53,6 +53,7 @@ OBJS = \
 	cluster_shared_config_guc.o \
 	cluster_shared_config_delivery.o \
 	cluster_config_use_gate.o \
+	cluster_config_producers.o \
 	cluster_shared_config_use.o \
 	cluster_shared_config_lmon.o \
 	cluster_shared_config_census.o \

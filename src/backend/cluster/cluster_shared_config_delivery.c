@@ -50,6 +50,7 @@ typedef struct ConfigDeliveryFamily {
 	ClusterConfigUseGate native_use;
 	ClusterConfigUseTarget native_target;
 	ClusterConfigUseGate cleaner_producer;
+	ClusterConfigUseTarget cleaner_target;
 	pg_atomic_uint32 cleaner_failed;
 	ClusterConfigUseGate background[CLUSTER_CONFIG_BACKGROUND_COUNT];
 	ClusterConfigUseTarget background_target[CLUSTER_CONFIG_BACKGROUND_COUNT];
@@ -137,23 +138,49 @@ cluster_shared_config_delivery_cleaner_gate(bool *failed)
 	return &delivery_family->cleaner_producer;
 }
 
+ClusterConfigUseTarget *
+cluster_shared_config_delivery_cleaner_target(void)
+{
+	return cluster_shared_config_delivery_native_gate() != NULL ? &delivery_family->cleaner_target
+																: NULL;
+}
+
 bool
 cluster_shared_config_cleaner_begin(void)
 {
 	ClusterConfigUseGate *gate;
+	ClusterConfigUseTarget *target;
+	ClusterSharedConfigRegistration actual;
+	uint64 sequence;
 	uint32 epoch;
 	bool failed;
 	if (delivery_cleaner_owned)
 		return false;
 	if (delivery_family == NULL)
 		return true; /* Original non-shared path has no managed owner. */
-	if (!IsUnderPostmaster || MyBackendType != B_UNDO_CLEANER
+	if (!IsUnderPostmaster || MyProc == NULL || MyBackendType != B_UNDO_CLEANER
 		|| ClusterUndoCleanerWorkerIdForType(MyAuxProcType) != 0
 		|| (gate = cluster_shared_config_delivery_cleaner_gate(&failed)) == NULL || failed
 		|| !cluster_config_use_gate_enter(gate, false, &epoch))
 		return false;
-	delivery_cleaner_owned = true;
-	return true;
+	target = &delivery_family->cleaner_target;
+	sequence = pg_atomic_read_u64(&MyProc->cluster_config.sequence);
+	if (target->epoch == 0
+		|| (cluster_shared_config_registration_read(&MyProc->cluster_config, &actual)
+			&& actual.pid == MyProcPid && actual.role == B_UNDO_CLEANER
+			&& actual.aux_type == UndoCleanerProcess
+			&& sequence == pg_atomic_read_u64(&MyProc->cluster_config.sequence)
+			&& cluster_config_use_target_matches(target, epoch, &actual))) {
+		delivery_cleaner_owned = true;
+		return true;
+	}
+	/* Only this provisional reservation is retired; original async terminal
+	 * work is neither skipped nor certified by a common-target mismatch. */
+	if (!cluster_config_use_gate_leave(gate))
+		elog(PANIC, "configuration cleaner provisional count is inconsistent");
+	ConfigReloadPending = true;
+	delivery_waiting_for_idle = true;
+	return false;
 }
 
 void
@@ -403,6 +430,7 @@ cluster_shared_config_delivery_start(void)
 	cluster_config_use_gate_init(&delivery_family->native_use);
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
+	memset(&delivery_family->cleaner_target, 0, sizeof(delivery_family->cleaner_target));
 	pg_atomic_init_u32(&delivery_family->cleaner_failed, 0);
 	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
 		cluster_config_use_gate_init(&delivery_family->background[i]);
@@ -438,6 +466,7 @@ cluster_shared_config_delivery_new_shmem(void)
 	cluster_config_channels_init(&delivery_family->channels);
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
+	memset(&delivery_family->cleaner_target, 0, sizeof(delivery_family->cleaner_target));
 	pg_atomic_write_u32(&delivery_family->cleaner_failed, 0);
 	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
 		cluster_config_use_gate_init(&delivery_family->background[i]);

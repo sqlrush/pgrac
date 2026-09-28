@@ -76,6 +76,7 @@ extern bool cluster_shared_config_delivery_work_pending(void);
  * is not stopped by this gate. NULL/failed is not an empty producer proof.
  * Controller must retain its global episode and wake cleaners after OPEN. */
 extern ClusterConfigUseGate *cluster_shared_config_delivery_cleaner_gate(bool *failed);
+extern ClusterConfigUseTarget *cluster_shared_config_delivery_cleaner_target(void);
 extern bool cluster_shared_config_cleaner_begin(void);
 /* Only a complete original pass retires ownership. ERROR keeps a sticky
  * failed family until native all-old-child retirement; never an idle ACK. */
