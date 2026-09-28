@@ -1,5 +1,13 @@
 -- PGRAC test-only functions, not part of the product catalog.
 -- Author: SqlRush <sqlrush@gmail.com>
+CREATE FUNCTION test_pgrac_config_delivery_state()
+RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_state'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_delivery_state() FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_delivery_refuse()
+RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_refuse'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_delivery_refuse() FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_entry(integer, text, text, boolean)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_entry'
 LANGUAGE C STRICT;
@@ -78,3 +86,8 @@ CREATE FUNCTION test_pgrac_config_selection_cleanup()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_selection_cleanup'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_selection_cleanup() FROM PUBLIC;
+-- PGRAC: exact detached process observation; no runtime mutation capability.
+-- Author: SqlRush <sqlrush@gmail.com>
+CREATE FUNCTION test_pgrac_config_delivery() RETURNS text
+AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery' LANGUAGE C;
+REVOKE ALL ON FUNCTION test_pgrac_config_delivery() FROM PUBLIC;

@@ -41,6 +41,9 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_enrollment);
 PG_FUNCTION_INFO_V1(test_pgrac_config_slot_probe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_selection_cleanup);
+PG_FUNCTION_INFO_V1(test_pgrac_config_delivery);
+PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_state);
+PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_refuse);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PG_FUNCTION_INFO_V1(test_pgrac_control_image);
@@ -220,6 +223,8 @@ static int test_prepare_race;
 static int test_process_generation;
 static int test_process_failure;
 static bool test_process_defer;
+static bool test_process_delivery;
+static int test_logger_failure;
 
 static void
 bootstrap_test_path(char path[MAXPGPATH], const char *suffix)
@@ -506,6 +511,13 @@ reload_test_assign(int value, void *extra)
 		ereport(ERROR, (errmsg("test native reload assignment failure")));
 }
 
+static void
+logger_test_assign(int value, void *extra)
+{
+	if (value == 2 && IsUnderPostmaster && MyBackendType == B_LOGGER)
+		ereport(ERROR, (errmsg("test detached logger assignment failure")));
+}
+
 /* Test-only driver into the actual consumer in a real postmaster/child.
  * This does not select a CF root, publish an ACK or change process roles. */
 static void
@@ -524,6 +536,10 @@ process_test_reload(int generation, void *extra)
 
 	if (generation < 2 || test_process_defer)
 		return;
+	if (test_process_delivery && IsUnderPostmaster) {
+		(void)cluster_shared_config_delivery_reload();
+		return;
+	}
 	snprintf(path, sizeof(path), "%s/test_config.reload", DataDir);
 	body = palloc(CLUSTER_SHARED_CONFIG_MAX_BYTES + 1);
 	file = AllocateFile(path, "rb");
@@ -539,6 +555,8 @@ process_test_reload(int generation, void *extra)
 	CurrentResourceOwner = saved_owner;
 	ResourceOwnerDelete(owner);
 	result = cluster_shared_config_process_reload(bytes, len, &ref, &out, &report);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY && test_process_delivery && !IsUnderPostmaster)
+		(void)cluster_shared_config_delivery_parent_publish();
 	ereport(LOG, (errmsg("test process configuration consume: generation=%d ok=%d pid=%d",
 						 generation, result == 0, MyProcPid)));
 	pfree(bytes);
@@ -573,9 +591,16 @@ _PG_init(void)
 	DefineCustomBoolVariable("test_pgrac_shared_config.defer_process",
 							 "Test-only delayed process application.", NULL, &test_process_defer,
 							 false, PGC_SUSET, 0, NULL, NULL, NULL);
+	DefineCustomBoolVariable("test_pgrac_shared_config.delivery",
+							 "Test-only native family delivery with injected selected source.",
+							 NULL, &test_process_delivery, false, PGC_POSTMASTER, 0, NULL, NULL,
+							 NULL);
 	DefineCustomIntVariable("cluster.native_config_process_failure",
 							"Test-only partial process application.", NULL, &test_process_failure,
 							0, 0, 2, PGC_SIGHUP, 0, NULL, reload_test_assign, NULL);
+	DefineCustomIntVariable(
+		"cluster.native_config_logger_failure", "Test-only detached logger assignment failure.",
+		NULL, &test_logger_failure, 0, 0, 2, PGC_SIGHUP, 0, NULL, logger_test_assign, NULL);
 	if (test_prepare_bootstrap)
 		bootstrap_test_prepare();
 	if (test_apply_node >= 0) {
@@ -617,10 +642,72 @@ _PG_init(void)
 						(unsigned long long)applied.ref.identity.generation)));
 		pfree(bytes);
 		pfree(body);
+		if (test_process_delivery)
+			cluster_shared_config_delivery_start();
 		if (test_stop_after_apply)
 			ereport(FATAL,
 					(errmsg("test application completed; no storage initialization requested")));
 	}
+#endif
+}
+
+Datum
+test_pgrac_config_delivery(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test delivery inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigRegistration out;
+		if (!cluster_shared_config_delivery_logger_observe(&out))
+			PG_RETURN_TEXT_P(cstring_to_text("none"));
+		PG_RETURN_TEXT_P(cstring_to_text(
+			psprintf("%llu:%llu:%d:%d", (unsigned long long)out.process.ref.identity.generation,
+					 (unsigned long long)out.registration, out.pid, out.role == B_LOGGER)));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
+#endif
+}
+
+Datum
+test_pgrac_config_delivery_state(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test delivery inspection requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigRegistration out;
+		if (!cluster_shared_config_delivery_logger_observe(&out))
+			PG_RETURN_TEXT_P(cstring_to_text("none"));
+		PG_RETURN_TEXT_P(cstring_to_text(
+			psprintf("%llu:%d", (unsigned long long)out.process.ref.identity.generation,
+					 out.process.failed)));
+	}
+#else
+	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
+#endif
+}
+
+Datum
+test_pgrac_config_delivery_refuse(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test delivery requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		ClusterSharedConfigProcess process;
+		ClusterSharedConfigImage image;
+		bool refused;
+		if (!cluster_shared_config_process_copy(&process, &image))
+			PG_RETURN_BOOL(false);
+		refused = !cluster_shared_config_delivery_parent_publish()
+				  && !cluster_shared_config_delivery_publish(&process.ref, &image);
+		cluster_shared_config_free(&image);
+		PG_RETURN_BOOL(refused);
+	}
+#else
+	PG_RETURN_BOOL(false);
 #endif
 }
 

@@ -22,6 +22,11 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: actual detached logger configuration outcome, not signal receipt.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#include "cluster/cluster_shared_config.h"
+#endif
 
 #include <fcntl.h>
 #include <limits.h>
@@ -181,6 +186,9 @@ SysLoggerMain(int argc, char *argv[])
 #endif							/* EXEC_BACKEND */
 
 	MyBackendType = B_LOGGER;
+#ifdef USE_PGRAC_CLUSTER
+	cluster_shared_config_delivery_logger_attach();
+#endif
 	init_ps_display(NULL);
 
 	/*
@@ -696,6 +704,9 @@ SysLogger_Start(void)
 
 		default:
 			/* success, in postmaster */
+#ifdef USE_PGRAC_CLUSTER
+			cluster_shared_config_delivery_logger_started(sysloggerPid);
+#endif
 
 			/* now we redirect stderr, if not done already */
 			if (!redirection_done)

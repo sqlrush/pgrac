@@ -19,6 +19,10 @@
 #include "storage/fd.h"
 #include "utils/conffiles.h"
 #include "utils/memutils.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_shared_config.h"
+#endif
 }
 
 
@@ -128,6 +132,19 @@ ProcessConfigFile(GucContext context)
 	 */
 	Assert((context == PGC_POSTMASTER && !IsUnderPostmaster) ||
 		   context == PGC_SIGHUP);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: online shared defaults come only from the selected-root delivery.
+	 * A busy/missing delivery retains the actual old outcome; local files are
+	 * not a second authority. Bootstrap still reads its local locator/profile,
+	 * and postmaster's HBA/ident/SSL work remains on its native separate path.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (context == PGC_SIGHUP && cluster_shared_config)
+	{
+		(void) cluster_shared_config_delivery_reload();
+		return;
+	}
+#endif
 
 	/*
 	 * To avoid cluttering the log, only the postmaster bleats loudly about

@@ -78,6 +78,7 @@
 #include "cluster/cluster_grd_outbound.h"
 #include "cluster/cluster_reconfig.h" /* cluster_reconfig_lmon_tick (spec-2.29 Step 2 D3) */
 #include "cluster/cluster_startup_exit.h"
+#include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h" /* cluster_hw_register_ic_msg_types (spec-5.7 D1) */
@@ -1473,6 +1474,7 @@ LmonMain(void)
 			}
 
 			if (ShutdownRequestPending || cluster_lmon_shutdown_requested_public()) {
+				cluster_shared_config_delivery_lmon_cancel();
 				break;
 			}
 
@@ -1567,6 +1569,7 @@ LmonMain(void)
 				if (cluster_shared_config) {
 					cluster_control_retire_lmon_tick();
 					cluster_startup_exit_lmon_tick();
+					cluster_shared_config_delivery_lmon_tick();
 				}
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS
 			 * constructed them; only LMON owns the IC connections). */
@@ -2288,6 +2291,7 @@ LmonMain(void)
 			}
 
 			if (ShutdownRequestPending || cluster_lmon_shutdown_requested_public()) {
+				cluster_shared_config_delivery_lmon_cancel();
 				break;
 			}
 
@@ -2375,6 +2379,7 @@ LmonMain(void)
 				if (cluster_shared_config) {
 					cluster_control_retire_lmon_tick();
 					cluster_startup_exit_lmon_tick();
+					cluster_shared_config_delivery_lmon_tick();
 				}
 				(void)cluster_gcs_block_lmon_drain_direct_land_aborts();
 				/* PGRAC: spec-6.12b — ship finished CR-server results (LMS

@@ -695,7 +695,7 @@ static void ShmemBackendArrayRemove(Backend *bn);
 #define StartWalWriter() StartChildProcess(WalWriterProcess)
 #define StartWalReceiver() StartChildProcess(WalReceiverProcess)
 #ifdef USE_PGRAC_CLUSTER
-#define StartLmon() StartChildProcess(LmonProcess)
+static pid_t StartLmon(void);
 #define StartLck() StartChildProcess(LckProcess)
 #define StartDiag() StartChildProcess(DiagProcess)
 #define StartClusterStats() StartChildProcess(ClusterStatsProcess)
@@ -1438,6 +1438,12 @@ PostmasterMain(int argc, char *argv[])
 	 * normally choose the same IPC keys.  This helps ensure that we will
 	 * clean up dead IPC objects if the postmaster crashes and is restarted.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: detached logger shares only this ephemeral config carrier.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (cluster_shared_config)
+		cluster_shared_config_delivery_start();
+#endif
 	CreateSharedMemoryAndSemaphores();
 
 #ifdef USE_PGRAC_CLUSTER
@@ -3792,6 +3798,7 @@ process_pm_child_exit(void)
 		 * Spec: spec-1.11-lmon-skeleton.md Sprint A D5 + HC5.
 		 */
 		if (pid == LmonPID) {
+			cluster_shared_config_delivery_lmon_reaped(pid);
 			LmonPID = 0;
 			if (!EXIT_STATUS_0(exitstatus))
 				HandleChildCrash(pid, exitstatus, _("LMON process"));
@@ -3996,6 +4003,10 @@ process_pm_child_exit(void)
 
 		/* Was it the system logger?  If so, try to start a new one */
 		if (pid == SysLoggerPID) {
+#ifdef USE_PGRAC_CLUSTER
+			/* Native waitpid, not an age or a main-shmem reset, ends this lifetime. */
+			cluster_shared_config_delivery_logger_reaped(pid);
+#endif
 			SysLoggerPID = 0;
 			/* for safety's sake, launch new logger *first* */
 			SysLoggerPID = SysLogger_Start();
@@ -6460,6 +6471,19 @@ StartAutovacuumWorker(void)
 }
 
 #ifdef USE_PGRAC_CLUSTER
+/* PGRAC: one fork boundary for initial and normally respawned LMON. The
+ * corresponding native waitpid branch retires the old delivery writer.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static pid_t
+StartLmon(void)
+{
+	pid_t pid = StartChildProcess(LmonProcess);
+	if (pid > 0)
+		cluster_shared_config_delivery_lmon_started(pid);
+	return pid;
+}
+
 /*
  * cluster_postmaster_start_lmon -- spawn the LMON aux process.
  *

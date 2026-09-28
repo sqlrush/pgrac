@@ -970,3 +970,153 @@ done:
 		memset(stage, 0, sizeof(*stage));
 	return result;
 }
+
+/* PGRAC: bounded single-writer native delivery. No GUC/CF authority lives in
+ * this carrier. Native lifetime ownership must be established by its caller.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+config_delivery_overlap(const void *a, size_t alen, const void *b, size_t blen)
+{
+	uintptr_t av = (uintptr_t)a, bv = (uintptr_t)b;
+	return a != NULL && b != NULL && (av <= bv ? bv - av < alen : av - bv < blen);
+}
+
+void
+cluster_shared_config_delivery_slot_init(ClusterSharedConfigDeliverySlot *slot)
+{
+	memset(slot, 0, sizeof(*slot));
+	pg_atomic_init_u64(&slot->sequence, 0);
+}
+
+bool
+cluster_shared_config_delivery_slot_retire(ClusterSharedConfigDeliverySlot *slot, int32 pid)
+{
+	uint64 sequence;
+	if (slot == NULL || pid <= 0 || (slot->writer_pid != 0 && slot->writer_pid != pid))
+		return false;
+	/* Caller has reaped this exact process; it cannot finish an interrupted
+	 * copy. Preserve sequence across replacement (including same-PID reuse),
+	 * since the postmaster reaper can interrupt a reader of incoming. */
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	if (sequence > UINT64_MAX - 2) {
+		pg_atomic_write_u64(&slot->sequence, UINT64_MAX);
+		return false;
+	}
+	pg_atomic_write_u64(&slot->sequence, sequence | UINT64CONST(1));
+	pg_write_barrier();
+	slot->writer_pid = 0;
+	slot->local_generation = 0;
+	slot->length = 0;
+	memset(&slot->ref, 0, sizeof(slot->ref));
+	pg_write_barrier();
+	pg_atomic_write_u64(&slot->sequence, (sequence | UINT64CONST(1)) + 1);
+	return true;
+}
+
+bool
+cluster_shared_config_delivery_slot_write(ClusterSharedConfigDeliverySlot *slot, uint64 generation,
+										  int32 pid, const ClusterSharedConfigRef *ref,
+										  const char *bytes, size_t len)
+{
+	uint64 sequence;
+	uint32 entries;
+	ClusterSharedConfigIdentity identity;
+
+	if (slot == NULL || generation == 0 || generation == UINT64_MAX || pid <= 0 || ref == NULL
+		|| bytes == NULL || len == 0 || len > CLUSTER_SHARED_CONFIG_MAX_BYTES
+		|| config_delivery_overlap(slot, sizeof(*slot), ref, sizeof(*ref))
+		|| config_delivery_overlap(slot, sizeof(*slot), bytes, len))
+		return false;
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	if ((sequence & 1) != 0 || sequence >= UINT64_MAX - 1
+		|| (slot->writer_pid != 0 && slot->writer_pid != pid)
+		|| generation < slot->local_generation)
+		return false;
+	if (slot->writer_pid != 0) {
+		identity = ref->identity;
+		identity.generation = slot->ref.identity.generation;
+		if (memcmp(&identity, &slot->ref.identity, sizeof(identity)) != 0
+			|| ref->identity.generation < slot->ref.identity.generation
+			|| (ref->identity.generation == slot->ref.identity.generation
+				&& memcmp(ref, &slot->ref, sizeof(*ref)) != 0))
+			return false;
+	}
+	if (cluster_shared_config_validate(bytes, len, ref, &entries)
+		!= CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return false;
+	/* Single writer, already validated owned input. No fallible call may
+	 * leave a half-published native value in this copy interval. */
+	pg_atomic_write_u64(&slot->sequence, sequence + 1);
+	pg_write_barrier();
+	slot->local_generation = generation;
+	slot->writer_pid = pid;
+	slot->length = len;
+	slot->ref = *ref;
+	memcpy(slot->bytes, bytes, len);
+	slot->bytes[len] = '\0';
+	pg_write_barrier();
+	pg_atomic_write_u64(&slot->sequence, sequence + 2);
+	return true;
+}
+
+bool
+cluster_shared_config_delivery_slot_read(ClusterSharedConfigDeliverySlot *slot, uint64 generation,
+										 ClusterSharedConfigRef *ref,
+										 ClusterSharedConfigImage *image)
+{
+	uint64 sequence, selected_generation;
+	uint32 len, entries;
+	int32 writer;
+	ClusterSharedConfigRef selected;
+	ClusterSharedConfigImage copy = { 0 };
+	bool valid;
+	if (config_delivery_overlap(slot, sizeof(*slot), ref, sizeof(*ref))
+		|| config_delivery_overlap(slot, sizeof(*slot), image, sizeof(*image))
+		|| config_delivery_overlap(ref, sizeof(*ref), image, sizeof(*image)))
+		return false;
+	if (ref != NULL)
+		memset(ref, 0, sizeof(*ref));
+	if (image != NULL)
+		memset(image, 0, sizeof(*image));
+	if (slot == NULL || ref == NULL || image == NULL || generation == 0 || generation == UINT64_MAX)
+		return false;
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	if (sequence == 0 || (sequence & 1) != 0)
+		return false;
+	pg_read_barrier();
+	selected_generation = slot->local_generation;
+	len = slot->length;
+	writer = slot->writer_pid;
+	selected = slot->ref;
+	if (selected_generation != generation || writer <= 0 || len == 0
+		|| len > CLUSTER_SHARED_CONFIG_MAX_BYTES)
+		return false;
+	copy.bytes = palloc(len + 1);
+	copy.len = len;
+	memcpy(copy.bytes, slot->bytes, len);
+	copy.bytes[len] = '\0';
+	pg_read_barrier();
+	if (sequence != pg_atomic_read_u64(&slot->sequence)) {
+		cluster_shared_config_free(&copy);
+		return false;
+	}
+	PG_TRY();
+	{
+		valid = cluster_shared_config_validate(copy.bytes, copy.len, &selected, &entries)
+				== CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	PG_CATCH();
+	{
+		cluster_shared_config_free(&copy);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (!valid) {
+		cluster_shared_config_free(&copy);
+		return false;
+	}
+	*ref = selected;
+	*image = copy;
+	return true;
+}

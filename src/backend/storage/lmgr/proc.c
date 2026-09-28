@@ -174,6 +174,7 @@ InitProcGlobal(void)
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: a native new-shmem lifetime must not reuse the PM's old mapping. */
 	cluster_shared_config_process_new_shmem();
+	cluster_shared_config_delivery_new_shmem();
 #endif
 
 	/* Create the ProcGlobal shared structure */

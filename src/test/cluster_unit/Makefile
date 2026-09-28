@@ -127,6 +127,8 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_control_walr \
 		test_cluster_control_ir \
 		test_cluster_shared_config \
+		test_cluster_config_delivery_driver \
+		test_cluster_config_delivery_route \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
 		test_cluster_checkpoint_buffers \
@@ -426,6 +428,8 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 # PGRAC: real configuration object tests have their own link rule.
 # Author: SqlRush <sqlrush@gmail.com>
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -1463,6 +1467,20 @@ CLUSTER_CF_AUTHORITY_O = $(top_builddir)/src/backend/cluster/cluster_cf_authorit
 # PGRAC: real immutable configuration codec and filesystem reader.
 # Author: SqlRush <sqlrush@gmail.com>
 CLUSTER_SHARED_CONFIG_O = $(top_builddir)/src/backend/cluster/cluster_shared_config.o
+# PGRAC: execute the exact production router, not a source-text assertion.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_delivery_route.inc: $(top_srcdir)/src/backend/utils/misc/guc-file.l
+	@awk '/^ProcessConfigFile\(GucContext context\)/ { print "void"; emit=1; starts++ } \
+	     emit { print } emit && /^}/ { emit=0; ends++ } \
+	     END { if (starts != 1 || ends != 1) exit 1 }' $< > $@.tmp && mv $@.tmp $@
+test_cluster_config_delivery_route: test_cluster_config_delivery_route.c unit_test.h test_cluster_config_delivery_route.inc
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_config_delivery_driver: test_cluster_config_delivery_driver.c unit_test.h \
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
 test_cluster_shared_config: test_cluster_shared_config.c unit_test.h $(CLUSTER_SHARED_CONFIG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SHARED_CONFIG_O) \
 		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \

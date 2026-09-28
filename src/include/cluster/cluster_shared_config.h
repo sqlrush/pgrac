@@ -101,6 +101,34 @@ cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
 								 ClusterSharedConfigSelected *out, ClusterSharedConfigImage *image);
 extern void cluster_control_root_config_cancel(void);
 
+/* Ephemeral native-family delivery, not configuration authority or an ACK.
+ * One real process writes a slot; sequence protects a bounded value copy.
+ * Owner replacement/reset requires the native postmaster lifecycle barrier.
+ * No pointers, paths, native hooks or disk/wire representation in the slot.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigDeliverySlot {
+	pg_atomic_uint64 sequence;
+	uint64 local_generation;
+	int32 writer_pid;
+	uint32 length;
+	ClusterSharedConfigRef ref;
+	char bytes[CLUSTER_SHARED_CONFIG_MAX_BYTES + 1];
+} ClusterSharedConfigDeliverySlot;
+
+extern void cluster_shared_config_delivery_slot_init(ClusterSharedConfigDeliverySlot *slot);
+/* Only after native waitpid proves this exact writer dead; not a timeout. */
+extern bool cluster_shared_config_delivery_slot_retire(ClusterSharedConfigDeliverySlot *slot,
+													   int32 writer_pid);
+extern bool cluster_shared_config_delivery_slot_write(ClusterSharedConfigDeliverySlot *slot,
+													  uint64 local_generation, int32 writer_pid,
+													  const ClusterSharedConfigRef *ref,
+													  const char *bytes, size_t len);
+extern bool cluster_shared_config_delivery_slot_read(ClusterSharedConfigDeliverySlot *slot,
+													 uint64 local_generation,
+													 ClusterSharedConfigRef *ref,
+													 ClusterSharedConfigImage *image);
+
 /* PGRAC: amend one explicit scope/key in an exact selected object. NULL
  * change.value means RESET. Preserve all other entries/identity; changed
  * requests advance generation once, without wrap. No-op returns an owned copy
@@ -335,6 +363,10 @@ StaticAssertDecl(sizeof(ClusterSharedConfigProcess) == 128, "native config proce
  * whether this process may serve. Unseeded or failed processes cannot reload.
  */
 extern bool cluster_shared_config_process_observe(ClusterSharedConfigProcess *out);
+/* Copy only actual fully consumed defaults. Not a selected-root read or ACK;
+ * failed/parallel/unseeded states refuse. Successful image is caller-owned. */
+extern bool cluster_shared_config_process_copy(ClusterSharedConfigProcess *out,
+											   ClusterSharedConfigImage *image);
 extern void cluster_shared_config_process_parallel_restore(void);
 extern ClusterControlRootResult cluster_shared_config_process_reload(
 	const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
@@ -369,5 +401,24 @@ extern void cluster_shared_config_process_detach(void);
  * but pid=0 / observed=false is never an active-process proof. */
 extern bool cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
 													ClusterSharedConfigRegistration *out);
+
+/* Native family transport. Creation/reset are real postmaster-only, before
+ * children start / after DATA children exit. No disk state or CF acquisition.
+ * logger_started/reaped are called only at the actual native PID boundaries.
+ */
+extern void cluster_shared_config_delivery_start(void);
+extern void cluster_shared_config_delivery_new_shmem(void);
+extern void cluster_shared_config_delivery_lmon_started(int32 pid);
+extern void cluster_shared_config_delivery_lmon_reaped(int32 pid);
+extern void cluster_shared_config_delivery_logger_started(int32 pid);
+extern void cluster_shared_config_delivery_logger_reaped(int32 pid);
+extern void cluster_shared_config_delivery_logger_attach(void);
+extern bool cluster_shared_config_delivery_logger_observe(ClusterSharedConfigRegistration *out);
+extern bool cluster_shared_config_delivery_publish(const ClusterSharedConfigRef *ref,
+												   const ClusterSharedConfigImage *image);
+extern bool cluster_shared_config_delivery_reload(void);
+extern bool cluster_shared_config_delivery_parent_publish(void);
+extern void cluster_shared_config_delivery_lmon_tick(void);
+extern void cluster_shared_config_delivery_lmon_cancel(void);
 
 #endif

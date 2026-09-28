@@ -8,17 +8,30 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/wait.h>
 
 #include "cluster/cluster_cf_enqueue.h"
 #include "cluster/cluster_shared_config.h"
 #include "common/cryptohash.h"
 #include "storage/fd.h"
+#include "portability/mem.h"
 
 #undef printf
 #undef snprintf
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
 
 static bool held = true;
 static LOCKMODE held_mode = ShareLock;
@@ -1008,10 +1021,207 @@ UT_TEST(test_amend_preserves_entry_and_byte_limits)
 	free(bytes);
 }
 
+UT_TEST(test_delivery_exact_copy_and_owner_lifetime)
+{
+	ClusterSharedConfigDeliverySlot *slot = malloc(sizeof(*slot));
+	char bytes[1024];
+	ClusterSharedConfigRef ref, observed;
+	ClusterSharedConfigImage image;
+	uint64 sequence;
+	fixture(bytes, sizeof(bytes), body, &ref);
+	cluster_shared_config_delivery_slot_init(slot);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_read(slot, 1, &observed, &image));
+	UT_ASSERT(cluster_shared_config_delivery_slot_write(slot, 1, 42, &ref, bytes, strlen(bytes)));
+	UT_ASSERT(cluster_shared_config_delivery_slot_read(slot, 1, &observed, &image));
+	if (image.bytes != NULL) {
+		UT_ASSERT(memcmp(&observed, &ref, sizeof(ref)) == 0);
+		UT_ASSERT(strcmp(image.bytes, bytes) == 0);
+		UT_ASSERT(image.bytes != slot->bytes);
+		cluster_shared_config_free(&image);
+	}
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_write(slot, 1, 43, &ref, bytes, strlen(bytes)));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), sequence);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_read(slot, 2, &observed, &image));
+	UT_ASSERT(image.bytes == NULL);
+	UT_ASSERT(cluster_shared_config_delivery_slot_write(slot, 2, 42, &ref, bytes, strlen(bytes)));
+	UT_ASSERT(!cluster_shared_config_delivery_slot_read(slot, 1, &observed, &image));
+	UT_ASSERT(cluster_shared_config_delivery_slot_read(slot, 2, &observed, &image));
+	cluster_shared_config_free(&image);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_write(slot, 1, 42, &ref, bytes, strlen(bytes)));
+	free(slot);
+	UT_ASSERT_EQ(allocations, 0);
+}
+
+UT_TEST(test_delivery_refuses_busy_torn_alias_and_sequence_wrap)
+{
+	ClusterSharedConfigDeliverySlot *slot = malloc(sizeof(*slot));
+	char bytes[1024];
+	ClusterSharedConfigRef ref, bad, observed;
+	ClusterSharedConfigImage image;
+	uint64 sequence;
+	fixture(bytes, sizeof(bytes), body, &ref);
+	cluster_shared_config_delivery_slot_init(slot);
+	UT_ASSERT(cluster_shared_config_delivery_slot_write(slot, 1, 42, &ref, bytes, strlen(bytes)));
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	bad = ref;
+	bad.sha256[0] ^= 1;
+	UT_ASSERT(!cluster_shared_config_delivery_slot_write(slot, 1, 42, &bad, bytes, strlen(bytes)));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), sequence);
+	pg_atomic_write_u64(&slot->sequence, sequence | 1);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_read(slot, 1, &observed, &image));
+	UT_ASSERT(!cluster_shared_config_delivery_slot_write(slot, 1, 42, &ref, bytes, strlen(bytes)));
+	pg_atomic_write_u64(&slot->sequence, UINT64_MAX - 1);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_write(slot, 1, 42, &ref, bytes, strlen(bytes)));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), UINT64_MAX - 1);
+	pg_atomic_write_u64(&slot->sequence, sequence);
+	slot->bytes[0] ^= 1;
+	UT_ASSERT(!cluster_shared_config_delivery_slot_read(slot, 1, &observed, &image));
+	UT_ASSERT(image.bytes == NULL);
+	slot->bytes[0] ^= 1;
+	UT_ASSERT(!cluster_shared_config_delivery_slot_read(slot, 1, &slot->ref, &image));
+	UT_ASSERT(memcmp(&slot->ref, &ref, sizeof(ref)) == 0);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_write(slot, 1, 42, &slot->ref, slot->bytes,
+														 slot->length));
+	free(slot);
+	UT_ASSERT_EQ(allocations, 0);
+}
+
+UT_TEST(test_delivery_real_fork_observes_only_complete_parent_image)
+{
+	ClusterSharedConfigDeliverySlot *slot
+		= mmap(NULL, sizeof(*slot), PROT_READ | PROT_WRITE, PG_MMAP_FLAGS, -1, 0);
+	char bytes[1024];
+	ClusterSharedConfigRef ref;
+	int fds[2], status = 0;
+	pid_t child;
+	UT_ASSERT(slot != MAP_FAILED);
+	if (slot == MAP_FAILED)
+		return;
+	cluster_shared_config_delivery_slot_init(slot);
+	fixture(bytes, sizeof(bytes), body, &ref);
+	UT_ASSERT_EQ(pipe(fds), 0);
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		ClusterSharedConfigRef observed;
+		ClusterSharedConfigImage image;
+		char ready;
+		bool ok;
+		close(fds[1]);
+		ok = read(fds[0], &ready, 1) == 1
+			 && cluster_shared_config_delivery_slot_read(slot, 1, &observed, &image);
+		if (ok) {
+			ok = memcmp(&observed, &ref, sizeof(ref)) == 0 && strcmp(image.bytes, bytes) == 0;
+			cluster_shared_config_free(&image);
+		}
+		_exit(ok ? 0 : 1);
+	}
+	close(fds[0]);
+	UT_ASSERT(
+		cluster_shared_config_delivery_slot_write(slot, 1, getpid(), &ref, bytes, strlen(bytes)));
+	UT_ASSERT_EQ(write(fds[1], "x", 1), 1);
+	close(fds[1]);
+	UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+	UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	UT_ASSERT_EQ(munmap(slot, sizeof(*slot)), 0);
+}
+
+UT_TEST(test_delivery_reaped_writer_replacement_real_fork)
+{
+	ClusterSharedConfigDeliverySlot *slot;
+	ClusterSharedConfigRef ref, out;
+	ClusterSharedConfigImage image;
+	char bytes[1024];
+	pid_t first, second;
+	int status;
+	uint64 sequence;
+	fixture(bytes, sizeof(bytes), body, &ref);
+	slot = mmap(NULL, sizeof(*slot), PROT_READ | PROT_WRITE, PG_MMAP_FLAGS, -1, 0);
+	UT_ASSERT(slot != MAP_FAILED);
+	if (slot == MAP_FAILED)
+		return;
+	cluster_shared_config_delivery_slot_init(slot);
+	first = fork();
+	UT_ASSERT(first >= 0);
+	if (first == 0)
+		_exit(
+			cluster_shared_config_delivery_slot_write(slot, 9, getpid(), &ref, bytes, strlen(bytes))
+				? 0
+				: 1);
+	if (first < 0) {
+		munmap(slot, sizeof(*slot));
+		return;
+	}
+	UT_ASSERT_EQ(waitpid(first, &status, 0), first);
+	UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	sequence = pg_atomic_read_u64(&slot->sequence);
+	UT_ASSERT(
+		!cluster_shared_config_delivery_slot_write(slot, 9, getpid(), &ref, bytes, strlen(bytes)));
+	UT_ASSERT(!cluster_shared_config_delivery_slot_retire(slot, getpid()));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), sequence);
+	UT_ASSERT(cluster_shared_config_delivery_slot_retire(slot, first));
+	UT_ASSERT(pg_atomic_read_u64(&slot->sequence) > sequence);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_read(slot, 9, &out, &image));
+	if (image.bytes != NULL)
+		cluster_shared_config_free(&image);
+	second = fork();
+	UT_ASSERT(second >= 0);
+	if (second == 0)
+		_exit(
+			cluster_shared_config_delivery_slot_write(slot, 9, getpid(), &ref, bytes, strlen(bytes))
+				? 0
+				: 1);
+	if (second > 0) {
+		UT_ASSERT_EQ(waitpid(second, &status, 0), second);
+		UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+		UT_ASSERT(cluster_shared_config_delivery_slot_read(slot, 9, &out, &image));
+		if (image.bytes != NULL) {
+			UT_ASSERT_EQ(strcmp(image.bytes, bytes), 0);
+			cluster_shared_config_free(&image);
+		}
+		UT_ASSERT_EQ(slot->writer_pid, second);
+		UT_ASSERT(pg_atomic_read_u64(&slot->sequence) > sequence);
+	}
+	UT_ASSERT_EQ(munmap(slot, sizeof(*slot)), 0);
+	UT_ASSERT_EQ(allocations, 0);
+}
+
+UT_TEST(test_delivery_reap_odd_and_exhaustion_without_aba)
+{
+	ClusterSharedConfigDeliverySlot *slot = malloc(sizeof(*slot));
+	ClusterSharedConfigRef ref;
+	char bytes[1024];
+	fixture(bytes, sizeof(bytes), body, &ref);
+	cluster_shared_config_delivery_slot_init(slot);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_retire(NULL, 21));
+	UT_ASSERT(!cluster_shared_config_delivery_slot_retire(slot, 0));
+	slot->writer_pid = 21;
+	slot->length = 100;
+	pg_atomic_write_u64(&slot->sequence, 7);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_retire(slot, 22));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), 7);
+	UT_ASSERT(cluster_shared_config_delivery_slot_retire(slot, 21));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), 8);
+	UT_ASSERT_EQ(slot->length, 0);
+	UT_ASSERT(cluster_shared_config_delivery_slot_write(slot, 9, 22, &ref, bytes, strlen(bytes)));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), 10);
+	pg_atomic_write_u64(&slot->sequence, UINT64_MAX - 1);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_retire(slot, 22));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&slot->sequence), UINT64_MAX);
+	UT_ASSERT(!cluster_shared_config_delivery_slot_write(slot, 9, 23, &ref, bytes, strlen(bytes)));
+	free(slot);
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(32);
+	UT_RUN(test_delivery_reaped_writer_replacement_real_fork);
+	UT_RUN(test_delivery_reap_odd_and_exhaustion_without_aba);
+	UT_RUN(test_delivery_exact_copy_and_owner_lifetime);
+	UT_RUN(test_delivery_refuses_busy_torn_alias_and_sequence_wrap);
+	UT_RUN(test_delivery_real_fork_observes_only_complete_parent_image);
 	UT_RUN(test_independent_canonical_input);
 	UT_RUN(test_encoder_matches_independent_bytes);
 	UT_RUN(test_exact_scope_lookup);

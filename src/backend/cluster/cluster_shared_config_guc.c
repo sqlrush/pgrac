@@ -429,6 +429,28 @@ cluster_shared_config_process_observe(ClusterSharedConfigProcess *out)
 	return true;
 }
 
+bool
+cluster_shared_config_process_copy(ClusterSharedConfigProcess *out, ClusterSharedConfigImage *image)
+{
+	ClusterSharedConfigImage copy = { 0 };
+	if (reload_overlap(out, sizeof(*out), image, sizeof(*image)))
+		return false;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (image != NULL)
+		memset(image, 0, sizeof(*image));
+	if (out == NULL || image == NULL || config_process_image.bytes == NULL
+		|| config_process_state.failed || config_process_state.parallel_snapshot
+		|| config_process_state.applier_pid <= 0)
+		return false;
+	copy.bytes = palloc(config_process_image.len + 1);
+	copy.len = config_process_image.len;
+	memcpy(copy.bytes, config_process_image.bytes, copy.len + 1);
+	*out = config_process_state;
+	*image = copy;
+	return true;
+}
+
 /* The parallel leader's active GUCs are not the image inherited from the PM.
  * Revoke that receipt BEFORE native reset/assign hooks can run or fail. Query
  * semantics remain native; the enrollment owner must wait for real worker
