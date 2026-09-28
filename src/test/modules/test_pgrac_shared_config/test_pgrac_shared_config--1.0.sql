@@ -148,3 +148,8 @@ REVOKE ALL ON FUNCTION test_pgrac_config_gate_state() FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_future_launch() RETURNS integer
 AS 'MODULE_PATHNAME', 'test_pgrac_config_future_launch' LANGUAGE C;
 REVOKE ALL ON FUNCTION test_pgrac_config_future_launch() FROM PUBLIC;
+-- PGRAC: disposable fixture control only, never production SQL authority.
+-- Author: SqlRush <sqlrush@gmail.com>
+CREATE FUNCTION test_pgrac_config_background(integer, text, integer DEFAULT 0) RETURNS text
+AS 'MODULE_PATHNAME', 'test_pgrac_config_background' LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_background(integer, text, integer) FROM PUBLIC;

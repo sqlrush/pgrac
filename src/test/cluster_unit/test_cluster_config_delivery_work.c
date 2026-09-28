@@ -21,6 +21,7 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "nodes/memnodes.h"
+#include "storage/proc.h"
 #include "../../backend/cluster/cluster_shared_config_delivery.c"
 #undef printf
 #include "unit_test.h"
@@ -50,6 +51,21 @@ static ClusterNormalStopPollResult gcs_result;
 static uint64 target, consumed;
 static unsigned assignments, reads, gcs_polls, cr_polls, cleaner_polls;
 static unsigned contexts, deletes, owners, releases;
+static PGPROC background_proc;
+PGPROC *MyProc = &background_proc;
+static ClusterSharedConfigRegistration background_actual;
+static bool registration_available, registration_changed;
+
+bool
+cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
+										ClusterSharedConfigRegistration *out)
+{
+	UT_ASSERT(slot == &background_proc.cluster_config);
+	*out = background_actual;
+	if (registration_changed)
+		pg_atomic_fetch_add_u64(&background_proc.cluster_config.sequence, 2);
+	return registration_available;
+}
 
 /* Native producer lifecycle is exercised by the real-postmaster TAP test.
  * This unit isolates the retained asynchronous service delivery boundary. */
@@ -218,6 +234,17 @@ reset(void)
 	delivery_work_depth = 0;
 	delivery_waiting_for_idle = false;
 	delivery_cleaner_owned = false;
+	delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+		cluster_config_use_gate_init(&family.background[i]);
+		pg_atomic_init_u32(&family.background_failed[i], 0);
+	}
+	memset(&background_proc, 0, sizeof(background_proc));
+	pg_atomic_init_u64(&background_proc.cluster_config.sequence, 2);
+	memset(&background_actual, 0, sizeof(background_actual));
+	registration_available = true;
+	registration_changed = false;
+	MyProc = &background_proc;
 	parent_context.type = child_context.type = T_AllocSetContext;
 	CurrentMemoryContext = &parent_context;
 	CurrentResourceOwner = NULL;
@@ -467,10 +494,198 @@ UT_TEST(cleaner_producer_requires_actual_family_and_worker)
 	UT_ASSERT(!delivery_cleaner_owned);
 }
 
+static void
+background_role(int kind)
+{
+	BackendType roles[] = { B_CHECKPOINTER, B_BG_WRITER, B_WAL_WRITER };
+	AuxProcType auxiliary[] = { CheckpointerProcess, BgWriterProcess, WalWriterProcess };
+	MyBackendType = roles[kind];
+	MyAuxProcType = auxiliary[kind];
+}
+
+UT_TEST(background_close_preserves_original_owner)
+{
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+		uint32 cut;
+		bool failed;
+		ClusterConfigUseGate *gate;
+		reset();
+		background_role(i);
+		gate = cluster_shared_config_delivery_background_gate(i, &failed);
+		UT_ASSERT(gate != NULL && !failed);
+		UT_ASSERT(cluster_shared_config_background_begin());
+		UT_ASSERT(!cluster_shared_config_background_begin());
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+		UT_ASSERT(cluster_config_use_gate_close(gate, &cut));
+		UT_ASSERT(!cluster_config_use_gate_open(gate, cut));
+		expect_deferred();
+		cluster_shared_config_background_end(true);
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 0);
+		UT_ASSERT(!cluster_shared_config_background_begin());
+		UT_ASSERT(cluster_shared_config_delivery_retry_idle());
+		UT_ASSERT_EQ(consumed, 2);
+		UT_ASSERT(cluster_config_use_gate_open(gate, cut));
+		UT_ASSERT(cluster_shared_config_background_begin());
+		cluster_shared_config_background_end(true);
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 0);
+	}
+}
+
+UT_TEST(background_error_is_not_retirement_or_respawn)
+{
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+		bool failed;
+		uint32 cut;
+		ClusterConfigUseGate *gate;
+		reset();
+		background_role(i);
+		UT_ASSERT(cluster_shared_config_background_begin());
+		cluster_shared_config_background_end(false);
+		gate = cluster_shared_config_delivery_background_gate(i, &failed);
+		UT_ASSERT(gate != NULL && failed);
+		cluster_shared_config_background_end(true);
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+		UT_ASSERT(cluster_config_use_gate_close(gate, &cut));
+		UT_ASSERT(!cluster_config_use_gate_open(gate, cut));
+		UT_ASSERT(!cluster_shared_config_background_begin());
+		expect_deferred();
+		/* Empty process-local state is not the old worker's completion. */
+		delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
+		UT_ASSERT(!cluster_shared_config_background_begin());
+		/* A different original role must still be able to finish its work. */
+		background_role((i + 1) % CLUSTER_CONFIG_BACKGROUND_COUNT);
+		UT_ASSERT(cluster_shared_config_background_begin());
+		cluster_shared_config_background_end(true);
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+	}
+}
+
+UT_TEST(background_actual_role_and_family_required)
+{
+	bool failed;
+	reset();
+	UT_ASSERT(!cluster_shared_config_background_begin());
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+		background_role(i);
+		MyAuxProcType = NotAnAuxProcess;
+		UT_ASSERT(!cluster_shared_config_background_begin());
+	}
+	UT_ASSERT(cluster_shared_config_delivery_background_gate(-1, &failed) == NULL && failed);
+	UT_ASSERT(
+		cluster_shared_config_delivery_background_gate(CLUSTER_CONFIG_BACKGROUND_COUNT, &failed)
+			== NULL
+		&& failed);
+	background_role(0);
+	pg_atomic_write_u64(&family.generation, 2);
+	UT_ASSERT(!cluster_shared_config_background_begin());
+	UT_ASSERT(cluster_shared_config_delivery_background_target(0) == NULL);
+	delivery_family = NULL;
+	UT_ASSERT(cluster_shared_config_background_begin());
+	cluster_shared_config_background_end(true);
+	UT_ASSERT_EQ(delivery_background_owned, CLUSTER_CONFIG_BACKGROUND_COUNT);
+}
+
+static void
+background_bind(int kind)
+{
+	ClusterConfigUseGate *gate;
+	ClusterConfigUseTarget *bound;
+	bool failed;
+	uint32 cut;
+	background_role(kind);
+	background_actual.pid = MyProcPid;
+	background_actual.role = MyBackendType;
+	background_actual.registration = 2;
+	background_actual.observed = true;
+	background_actual.process.applier_pid = MyProcPid;
+	background_actual.process.ref.identity.system_identifier = 11;
+	background_actual.process.ref.identity.database_incarnation = 12;
+	background_actual.process.ref.identity.generation = 2;
+	background_actual.process.ref.identity.configured[0] = 1;
+	background_actual.process.ref.identity.storage_uuid[0] = 1;
+	background_actual.process.ref.identity.authority_uuid[0] = 2;
+	background_actual.process.ref.sha256[0] = 3;
+	background_actual.common.version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
+	background_actual.common.static_entries = 1;
+	background_actual.common.dynamic_entries = 1;
+	background_actual.common.static_sha256[0] = 4;
+	background_actual.common.dynamic_sha256[0] = 5;
+	gate = cluster_shared_config_delivery_background_gate(kind, &failed);
+	bound = cluster_shared_config_delivery_background_target(kind);
+	UT_ASSERT(gate != NULL && bound != NULL && !failed);
+	UT_ASSERT(cluster_config_use_gate_close(gate, &cut));
+	UT_ASSERT(cluster_config_use_target_bind(gate, bound, cut, 0, &background_actual.process.ref,
+											 &background_actual.common));
+	UT_ASSERT(cluster_config_use_gate_open(gate, cut));
+}
+
+UT_TEST(background_bound_target_uses_actual_native_values)
+{
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+		reset();
+		background_bind(i);
+		UT_ASSERT(cluster_shared_config_background_begin());
+		cluster_shared_config_background_end(true);
+		background_actual.common.dynamic_sha256[0]++;
+		UT_ASSERT(!cluster_shared_config_background_begin());
+		UT_ASSERT_EQ(cluster_config_use_gate_read(&family.background[i]).owners, 0);
+		UT_ASSERT(ConfigReloadPending && delivery_waiting_for_idle);
+		UT_ASSERT_EQ(assignments, 0); /* No assignment inside begin/end. */
+		background_actual.common.dynamic_sha256[0]--;
+		UT_ASSERT(cluster_shared_config_background_begin());
+		cluster_shared_config_background_end(true);
+	}
+}
+
+UT_TEST(background_bound_target_rejects_unproven_registration)
+{
+	for (int bad = 0; bad < 7; bad++) {
+		reset();
+		background_bind(0);
+		switch (bad) {
+		case 0:
+			registration_available = false;
+			break;
+		case 1:
+			registration_changed = true;
+			break;
+		case 2:
+			background_actual.pid++;
+			break;
+		case 3:
+			background_actual.role = B_BACKEND;
+			break;
+		case 4:
+			background_actual.process.failed = true;
+			break;
+		case 5:
+			background_actual.process.parallel_snapshot = true;
+			break;
+		case 6:
+			MyProc = NULL;
+			break;
+		}
+		UT_ASSERT(!cluster_shared_config_background_begin());
+		UT_ASSERT_EQ(cluster_config_use_gate_read(&family.background[0]).owners, 0);
+		UT_ASSERT_EQ(assignments, 0);
+	}
+}
+
+UT_TEST(background_default_only_reload_is_allowed)
+{
+	reset();
+	background_role(1);
+	UT_ASSERT(cluster_shared_config_background_begin());
+	common_change = false;
+	UT_ASSERT(cluster_shared_config_delivery_reload());
+	UT_ASSERT_EQ(consumed, 2);
+	cluster_shared_config_background_end(true);
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(23);
 	UT_RUN(retained_admission_without_transaction_or_command);
 	UT_RUN(gcs_private_work_without_admission);
 	UT_RUN(invalid_gcs_owner_is_not_idle);
@@ -488,6 +703,12 @@ main(void)
 	UT_RUN(cleaner_producer_cut_retains_exact_original_pass);
 	UT_RUN(cleaner_producer_failure_is_not_retirement);
 	UT_RUN(cleaner_producer_requires_actual_family_and_worker);
+	UT_RUN(background_close_preserves_original_owner);
+	UT_RUN(background_error_is_not_retirement_or_respawn);
+	UT_RUN(background_actual_role_and_family_required);
+	UT_RUN(background_bound_target_uses_actual_native_values);
+	UT_RUN(background_bound_target_rejects_unproven_registration);
+	UT_RUN(background_default_only_reload_is_allowed);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

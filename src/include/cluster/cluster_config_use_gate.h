@@ -81,6 +81,27 @@ extern bool cluster_shared_config_cleaner_begin(void);
  * failed family until native all-old-child retirement; never an idle ACK. */
 extern void cluster_shared_config_cleaner_end(bool completed);
 
+typedef enum ClusterConfigBackgroundKind {
+	CLUSTER_CONFIG_BACKGROUND_CHECKPOINTER,
+	CLUSTER_CONFIG_BACKGROUND_BGWRITER,
+	CLUSTER_CONFIG_BACKGROUND_WALWRITER,
+	CLUSTER_CONFIG_BACKGROUND_COUNT
+} ClusterConfigBackgroundKind;
+
+/* Separate cuts for original native pass owners, not their asynchronous
+ * completion certificate. In particular, the controller must keep WAL/BOC
+ * completion runnable until old foreground/service work no longer needs it.
+ * Raw gate/target access is for that retained controller, never SQL authority. */
+extern ClusterConfigUseGate *
+cluster_shared_config_delivery_background_gate(ClusterConfigBackgroundKind kind, bool *failed);
+extern ClusterConfigUseTarget *
+cluster_shared_config_delivery_background_target(ClusterConfigBackgroundKind kind);
+/* Native BackendType AND AuxProcType choose the entry. No caller-set role.
+ * Refusal preserves queued work. ERROR retains a failed original owner until
+ * real all-old-child reconstruction; no respawn or later success clears it. */
+extern bool cluster_shared_config_background_begin(void);
+extern void cluster_shared_config_background_end(bool completed);
+
 /* Original native lifecycle consumers; no caller-set role or epoch. */
 extern void cluster_shared_config_use_enter(void);
 extern void cluster_shared_config_use_xact_start(void);

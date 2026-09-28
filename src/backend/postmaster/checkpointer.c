@@ -49,6 +49,7 @@
 #include "cluster/cluster_wal_state.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/cluster_shared_config.h" /* PGRAC: idle common-value retry */
+#include "cluster/cluster_config_use_gate.h" /* PGRAC: fresh checkpoint cut */
 #include "../cluster/cluster_control_root_private.h"
 #endif
 #include "libpq/pqsignal.h"
@@ -373,6 +374,9 @@ CheckpointerMain(void)
 		pg_time_t	now;
 		int			elapsed_secs;
 		int			cur_timeout;
+#ifdef USE_PGRAC_CLUSTER
+		volatile bool config_pass_completed = false;
+#endif
 
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
@@ -388,167 +392,197 @@ CheckpointerMain(void)
 		 * control cleanup. Author: SqlRush <sqlrush@gmail.com> */
 		cluster_cf_retirement_poll();
 		cluster_lock_owners_service_poll();
+		/* PGRAC: preserve requests until this actual producer can start.
+		 * Old work and control retirement run before the local cut; it is not
+		 * a distributed IO/service completion proof.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (!cluster_shared_config_background_begin())
+		{
+			(void) WaitLatch(MyLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 100L, WAIT_EVENT_RECONFIG_SHARED_CONFIG_WAIT);
+			continue;
+		}
+		PG_TRY();
+		{
 #endif
 
-		/*
-		 * Detect a pending checkpoint request by checking whether the flags
-		 * word in shared memory is nonzero.  We shouldn't need to acquire the
-		 * ckpt_lck for this.
-		 */
-		if (((volatile CheckpointerShmemStruct *) CheckpointerShmem)->ckpt_flags)
-		{
-			do_checkpoint = true;
-			PendingCheckpointerStats.requested_checkpoints++;
-		}
-
-		/*
-		 * Force a checkpoint if too much time has elapsed since the last one.
-		 * Note that we count a timed checkpoint in stats only when this
-		 * occurs without an external request, but we set the CAUSE_TIME flag
-		 * bit even if there is also an external request.
-		 */
-		now = (pg_time_t) time(NULL);
-		elapsed_secs = now - last_checkpoint_time;
-		if (elapsed_secs >= CheckPointTimeout)
-		{
-			if (!do_checkpoint)
-				PendingCheckpointerStats.timed_checkpoints++;
-			do_checkpoint = true;
-			flags |= CHECKPOINT_CAUSE_TIME;
-		}
-
-		/*
-		 * Do a checkpoint if requested.
-		 */
-		if (do_checkpoint)
-		{
-			bool		ckpt_performed = false;
-			bool		do_restartpoint;
-
-			/* Check if we should perform a checkpoint or a restartpoint. */
-			do_restartpoint = RecoveryInProgress();
-
 			/*
-			 * Atomically fetch the request flags to figure out what kind of a
-			 * checkpoint we should perform, and increase the started-counter
-			 * to acknowledge that we've started a new checkpoint.
+			 * Detect a pending checkpoint request by checking whether the flags
+			 * word in shared memory is nonzero.  We shouldn't need to acquire the
+			 * ckpt_lck for this.
 			 */
-			SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
-			flags |= CheckpointerShmem->ckpt_flags;
-			CheckpointerShmem->ckpt_flags = 0;
-			CheckpointerShmem->ckpt_started++;
-			SpinLockRelease(&CheckpointerShmem->ckpt_lck);
-
-			ConditionVariableBroadcast(&CheckpointerShmem->start_cv);
-
-			/*
-			 * The end-of-recovery checkpoint is a real checkpoint that's
-			 * performed while we're still in recovery.
-			 */
-			if (flags & CHECKPOINT_END_OF_RECOVERY)
-				do_restartpoint = false;
-
-			/*
-			 * We will warn if (a) too soon since last checkpoint (whatever
-			 * caused it) and (b) somebody set the CHECKPOINT_CAUSE_XLOG flag
-			 * since the last checkpoint start.  Note in particular that this
-			 * implementation will not generate warnings caused by
-			 * CheckPointTimeout < CheckPointWarning.
-			 */
-			if (!do_restartpoint &&
-				(flags & CHECKPOINT_CAUSE_XLOG) &&
-				elapsed_secs < CheckPointWarning)
-				ereport(LOG,
-						(errmsg_plural("checkpoints are occurring too frequently (%d second apart)",
-									   "checkpoints are occurring too frequently (%d seconds apart)",
-									   elapsed_secs,
-									   elapsed_secs),
-						 errhint("Consider increasing the configuration parameter \"max_wal_size\".")));
-
-			/*
-			 * Initialize checkpointer-private variables used during
-			 * checkpoint.
-			 */
-			ckpt_active = true;
-			if (do_restartpoint)
-				ckpt_start_recptr = GetXLogReplayRecPtr(NULL);
-			else
-				ckpt_start_recptr = GetInsertRecPtr();
-			ckpt_start_time = now;
-			ckpt_cached_elapsed = 0;
-
-			/*
-			 * Do the checkpoint.
-			 */
-			if (!do_restartpoint)
+			if (((volatile CheckpointerShmemStruct *) CheckpointerShmem)->ckpt_flags)
 			{
-				CreateCheckPoint(flags);
-				ckpt_performed = true;
+				do_checkpoint = true;
+				PendingCheckpointerStats.requested_checkpoints++;
 			}
-			else
-				ckpt_performed = CreateRestartPoint(flags);
 
 			/*
-			 * After any checkpoint, close all smgr files.  This is so we
-			 * won't hang onto smgr references to deleted files indefinitely.
+			 * Force a checkpoint if too much time has elapsed since the last one.
+			 * Note that we count a timed checkpoint in stats only when this
+			 * occurs without an external request, but we set the CAUSE_TIME flag
+			 * bit even if there is also an external request.
 			 */
-			smgrcloseall();
+			now = (pg_time_t) time(NULL);
+			elapsed_secs = now - last_checkpoint_time;
+			if (elapsed_secs >= CheckPointTimeout)
+			{
+				if (!do_checkpoint)
+					PendingCheckpointerStats.timed_checkpoints++;
+				do_checkpoint = true;
+				flags |= CHECKPOINT_CAUSE_TIME;
+			}
+
+			/*
+			 * Do a checkpoint if requested.
+			 */
+			if (do_checkpoint)
+			{
+				bool		ckpt_performed = false;
+				bool		do_restartpoint;
+
+				/* Check if we should perform a checkpoint or a restartpoint. */
+				do_restartpoint = RecoveryInProgress();
+
+				/*
+				 * Atomically fetch the request flags to figure out what kind of a
+				 * checkpoint we should perform, and increase the started-counter
+				 * to acknowledge that we've started a new checkpoint.
+				 */
+				SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+				flags |= CheckpointerShmem->ckpt_flags;
+				CheckpointerShmem->ckpt_flags = 0;
+				CheckpointerShmem->ckpt_started++;
+				SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+
+				ConditionVariableBroadcast(&CheckpointerShmem->start_cv);
+
+				/*
+				 * The end-of-recovery checkpoint is a real checkpoint that's
+				 * performed while we're still in recovery.
+				 */
+				if (flags & CHECKPOINT_END_OF_RECOVERY)
+					do_restartpoint = false;
+
+				/*
+				 * We will warn if (a) too soon since last checkpoint (whatever
+				 * caused it) and (b) somebody set the CHECKPOINT_CAUSE_XLOG flag
+				 * since the last checkpoint start.  Note in particular that this
+				 * implementation will not generate warnings caused by
+				 * CheckPointTimeout < CheckPointWarning.
+				 */
+				if (!do_restartpoint &&
+					(flags & CHECKPOINT_CAUSE_XLOG) &&
+					elapsed_secs < CheckPointWarning)
+					ereport(LOG,
+							(errmsg_plural("checkpoints are occurring too frequently (%d second apart)",
+										   "checkpoints are occurring too frequently (%d seconds apart)",
+										   elapsed_secs,
+										   elapsed_secs),
+							 errhint("Consider increasing the configuration parameter \"max_wal_size\".")));
+
+				/*
+				 * Initialize checkpointer-private variables used during
+				 * checkpoint.
+				 */
+				ckpt_active = true;
+				if (do_restartpoint)
+					ckpt_start_recptr = GetXLogReplayRecPtr(NULL);
+				else
+					ckpt_start_recptr = GetInsertRecPtr();
+				ckpt_start_time = now;
+				ckpt_cached_elapsed = 0;
+
+				/*
+				 * Do the checkpoint.
+				 */
+				if (!do_restartpoint)
+				{
+					CreateCheckPoint(flags);
+					ckpt_performed = true;
+				}
+				else
+					ckpt_performed = CreateRestartPoint(flags);
+
+				/*
+				 * After any checkpoint, close all smgr files.  This is so we
+				 * won't hang onto smgr references to deleted files indefinitely.
+				 */
+				smgrcloseall();
 
 #ifdef USE_PGRAC_CLUSTER
-			/*
-			 * RF-B COMPLETE: publish DONE only after the whole delegated EOR
-			 * checkpoint, including its smgr close, succeeded and before waking
-			 * Startup through ckpt_done.
-			 */
-			if ((flags & CHECKPOINT_END_OF_RECOVERY) != 0
-				&& cluster_cf_owner_eor_local_active()
-				&& !cluster_cf_owner_eor_complete())
-				ereport(ERROR,
-						(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
-						 errmsg("could not complete the end-of-recovery control-file OWNER handoff")));
+				/*
+				 * RF-B COMPLETE: publish DONE only after the whole delegated EOR
+				 * checkpoint, including its smgr close, succeeded and before waking
+				 * Startup through ckpt_done.
+				 */
+				if ((flags & CHECKPOINT_END_OF_RECOVERY) != 0
+					&& cluster_cf_owner_eor_local_active()
+					&& !cluster_cf_owner_eor_complete())
+					ereport(ERROR,
+							(errcode(ERRCODE_CLUSTER_CONTROLFILE_AUTHORITY_UNAVAILABLE),
+							 errmsg("could not complete the end-of-recovery control-file OWNER handoff")));
 #endif
 
-			/*
-			 * Indicate checkpoint completion to any waiting backends.
-			 */
-			SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
-			CheckpointerShmem->ckpt_done = CheckpointerShmem->ckpt_started;
-			SpinLockRelease(&CheckpointerShmem->ckpt_lck);
-
-			ConditionVariableBroadcast(&CheckpointerShmem->done_cv);
-
-			if (ckpt_performed)
-			{
 				/*
-				 * Note we record the checkpoint start time not end time as
-				 * last_checkpoint_time.  This is so that time-driven
-				 * checkpoints happen at a predictable spacing.
+				 * Indicate checkpoint completion to any waiting backends.
 				 */
-				last_checkpoint_time = now;
-			}
-			else
-			{
-				/*
-				 * We were not able to perform the restartpoint (checkpoints
-				 * throw an ERROR in case of error).  Most likely because we
-				 * have not received any new checkpoint WAL records since the
-				 * last restartpoint. Try again in 15 s.
-				 */
-				last_checkpoint_time = now - CheckPointTimeout + 15;
+				SpinLockAcquire(&CheckpointerShmem->ckpt_lck);
+				CheckpointerShmem->ckpt_done = CheckpointerShmem->ckpt_started;
+				SpinLockRelease(&CheckpointerShmem->ckpt_lck);
+
+				ConditionVariableBroadcast(&CheckpointerShmem->done_cv);
+
+				if (ckpt_performed)
+				{
+					/*
+					 * Note we record the checkpoint start time not end time as
+					 * last_checkpoint_time.  This is so that time-driven
+					 * checkpoints happen at a predictable spacing.
+					 */
+					last_checkpoint_time = now;
+				}
+				else
+				{
+					/*
+					 * We were not able to perform the restartpoint (checkpoints
+					 * throw an ERROR in case of error).  Most likely because we
+					 * have not received any new checkpoint WAL records since the
+					 * last restartpoint. Try again in 15 s.
+					 */
+					last_checkpoint_time = now - CheckPointTimeout + 15;
+				}
+
+				ckpt_active = false;
+#ifndef USE_PGRAC_CLUSTER
+				/* We may have received an interrupt during the checkpoint. */
+				HandleCheckpointerInterrupts();
+#endif
 			}
 
-			ckpt_active = false;
+			/* Check for archive_timeout and switch xlog files if necessary. */
+			CheckArchiveTimeout();
 
-			/* We may have received an interrupt during the checkpoint. */
-			HandleCheckpointerInterrupts();
+			/* Report pending statistics to the cumulative stats system */
+			pgstat_report_checkpointer();
+			pgstat_report_wal(true);
+
+#ifdef USE_PGRAC_CLUSTER
+			config_pass_completed = true;
 		}
-
-		/* Check for archive_timeout and switch xlog files if necessary. */
-		CheckArchiveTimeout();
-
-		/* Report pending statistics to the cumulative stats system */
-		pgstat_report_checkpointer();
-		pgstat_report_wal(true);
+		PG_FINALLY();
+		{
+			cluster_shared_config_background_end(config_pass_completed);
+		}
+		PG_END_TRY();
+		/* PGRAC: process native shutdown/reload after retiring the entire
+		 * pass, never from inside its counted scope. Native checkpoint ERROR
+		 * still follows its original cleanup; it is not a successful pass.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		if (do_checkpoint)
+			HandleCheckpointerInterrupts();
+#endif
 
 		/*
 		 * If any checkpoint flags have been set, redo the loop to handle the

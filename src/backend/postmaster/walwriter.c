@@ -77,7 +77,10 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: spec-1.17 BOC tick + spec-6.4 ADG barrier heartbeat. */
 #include "cluster/cluster_adg_xlog.h"
+#include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_lock_owner.h"
 #include "cluster/cluster_scn.h"
 #endif
 #include "pgstat.h"
@@ -262,6 +265,9 @@ WalWriterMain(void)
 	for (;;)
 	{
 		long		cur_timeout;
+#ifdef USE_PGRAC_CLUSTER
+		volatile bool config_pass_completed = false;
+#endif
 
 		/*
 		 * Advertise whether we might hibernate in this cycle.  We do this
@@ -284,72 +290,101 @@ WalWriterMain(void)
 		/* Process any signals received recently */
 		HandleWalWriterInterrupts();
 
-		/*
-		 * Do what we're here for; then, if XLogBackgroundFlush() found useful
-		 * work to do, reset hibernation counter.
-		 */
-		if (XLogBackgroundFlush())
-			left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
-		else if (left_till_hibernate > 0)
-			left_till_hibernate--;
-
 #ifdef USE_PGRAC_CLUSTER
-		/*
-		 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
-		 * What changed: cluster_scn_boc_tick() runs after WAL flush work
-		 * but before pgstat emit.  Tick internally throttles by
-		 * cluster.boc_sweep_interval_ms; cluster.enabled=off path
-		 * silently no-ops (spec-1.16.1 L20 lesson inheritance).
-		 * Why: spec-1.17 v0.2 Q4 anchor; ereport-safe (no critical
-		 * section); see cluster_scn.c::cluster_scn_boc_tick().
-		 *
-		 * Hardening v1.0.1 (round 10 P1): the cur_timeout cap and
-		 * hibernate inhibition are now gated behind cluster_enabled
-		 * (was: always-on with internal no-op).  Reason: when
-		 * cluster.enabled=off, capping cur_timeout to
-		 * cluster_boc_sweep_interval_ms (default 1ms) caused walwriter
-		 * to wake 200x more often than vanilla PG (wal_writer_delay
-		 * default 200ms).  That broke the "cluster.enabled=off
-		 * degrades to vanilla PG" runtime contract: idle CPU/wake-rate
-		 * regression even though boc_tick itself was a no-op.
-		 */
-		cluster_scn_boc_tick();
-
-		/*
-		 * PGRAC: hibernate inhibition (spec-1.17 v0.2 Q4).  Gated on
-		 * cluster_enabled (round 10 P1) -- when cluster.enabled=off,
-		 * BOC sweep doesn't run and "pending since last sweep" is
-		 * meaningless; walwriter should hibernate per vanilla PG.
-		 */
-		if (cluster_enabled
-			&& cluster_scn_boc_pending_since_last_sweep() > 0)
-			left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
-
-		/*
-		 * spec-6.4 D5b: idle primary threads must still publish a
-		 * thread-safe-SCN barrier, otherwise an ADG standby read floor can
-		 * freeze until the next user commit on that thread.  Commit paths
-		 * emit pre/post barriers for the precommit gap; this heartbeat covers
-		 * quiet periods and is gated by ADG primary configuration.
-		 */
-		if (cluster_enabled && cluster_enable_adg
-			&& cluster_dg_role == CLUSTER_DG_ROLE_PRIMARY
-			&& cluster_adg_barrier_interval_ms > 0)
+		/* PGRAC: retain old control completion even while fresh passes wait.
+		 * The controller must close this separate gate only after old work no
+		 * longer requires WAL/BOC. A closed gate is not that proof.
+		 * Author: SqlRush <sqlrush@gmail.com> */
+		cluster_cf_retirement_poll();
+		cluster_lock_owners_service_poll();
+		(void) cluster_shared_config_delivery_retry_idle();
+		if (!cluster_shared_config_background_begin())
 		{
-			int64		now_ms = (int64) (GetCurrentTimestamp() / 1000);
-
-			if (last_adg_barrier_ms == 0
-				|| now_ms < last_adg_barrier_ms
-				|| now_ms - last_adg_barrier_ms >= cluster_adg_barrier_interval_ms)
-			{
-				(void) cluster_adg_emit_thread_barrier();
-				last_adg_barrier_ms = now_ms;
-			}
+			(void) WaitLatch(MyLatch,
+							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
+							 100L, WAIT_EVENT_RECONFIG_SHARED_CONFIG_WAIT);
+			continue;
 		}
+		PG_TRY();
+		{
 #endif
 
-		/* report pending statistics to the cumulative stats system */
-		pgstat_report_wal(false);
+			/*
+			 * Do what we're here for; then, if XLogBackgroundFlush() found useful
+			 * work to do, reset hibernation counter.
+			 */
+			if (XLogBackgroundFlush())
+				left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
+			else if (left_till_hibernate > 0)
+				left_till_hibernate--;
+
+#ifdef USE_PGRAC_CLUSTER
+			/*
+			 * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+			 * What changed: cluster_scn_boc_tick() runs after WAL flush work
+			 * but before pgstat emit.  Tick internally throttles by
+			 * cluster.boc_sweep_interval_ms; cluster.enabled=off path
+			 * silently no-ops (spec-1.16.1 L20 lesson inheritance).
+			 * Why: spec-1.17 v0.2 Q4 anchor; ereport-safe (no critical
+			 * section); see cluster_scn.c::cluster_scn_boc_tick().
+			 *
+			 * Hardening v1.0.1 (round 10 P1): the cur_timeout cap and
+			 * hibernate inhibition are now gated behind cluster_enabled
+			 * (was: always-on with internal no-op).  Reason: when
+			 * cluster.enabled=off, capping cur_timeout to
+			 * cluster_boc_sweep_interval_ms (default 1ms) caused walwriter
+			 * to wake 200x more often than vanilla PG (wal_writer_delay
+			 * default 200ms).  That broke the "cluster.enabled=off
+			 * degrades to vanilla PG" runtime contract: idle CPU/wake-rate
+			 * regression even though boc_tick itself was a no-op.
+			 */
+			cluster_scn_boc_tick();
+
+			/*
+			 * PGRAC: hibernate inhibition (spec-1.17 v0.2 Q4).  Gated on
+			 * cluster_enabled (round 10 P1) -- when cluster.enabled=off,
+			 * BOC sweep doesn't run and "pending since last sweep" is
+			 * meaningless; walwriter should hibernate per vanilla PG.
+			 */
+			if (cluster_enabled
+				&& cluster_scn_boc_pending_since_last_sweep() > 0)
+				left_till_hibernate = LOOPS_UNTIL_HIBERNATE;
+
+			/*
+			 * spec-6.4 D5b: idle primary threads must still publish a
+			 * thread-safe-SCN barrier, otherwise an ADG standby read floor can
+			 * freeze until the next user commit on that thread.  Commit paths
+			 * emit pre/post barriers for the precommit gap; this heartbeat covers
+			 * quiet periods and is gated by ADG primary configuration.
+			 */
+			if (cluster_enabled && cluster_enable_adg
+				&& cluster_dg_role == CLUSTER_DG_ROLE_PRIMARY
+				&& cluster_adg_barrier_interval_ms > 0)
+			{
+				int64		now_ms = (int64) (GetCurrentTimestamp() / 1000);
+
+				if (last_adg_barrier_ms == 0
+					|| now_ms < last_adg_barrier_ms
+					|| now_ms - last_adg_barrier_ms >= cluster_adg_barrier_interval_ms)
+				{
+					(void) cluster_adg_emit_thread_barrier();
+					last_adg_barrier_ms = now_ms;
+				}
+			}
+#endif
+
+			/* report pending statistics to the cumulative stats system */
+			pgstat_report_wal(false);
+
+#ifdef USE_PGRAC_CLUSTER
+			config_pass_completed = true;
+		}
+		PG_FINALLY();
+		{
+			cluster_shared_config_background_end(config_pass_completed);
+		}
+		PG_END_TRY();
+#endif
 
 		/*
 		 * Sleep until we are signaled or WalWriterDelay has elapsed.  If we

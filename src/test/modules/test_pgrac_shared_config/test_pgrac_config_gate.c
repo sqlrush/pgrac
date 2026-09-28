@@ -35,6 +35,7 @@
 
 PG_FUNCTION_INFO_V1(test_pgrac_config_gate_state);
 PG_FUNCTION_INFO_V1(test_pgrac_config_future_launch);
+PG_FUNCTION_INFO_V1(test_pgrac_config_background);
 PGDLLEXPORT void test_pgrac_config_future_main(Datum arg);
 void test_pgrac_config_gate_init(void);
 
@@ -209,6 +210,60 @@ test_pgrac_config_gate_state(PG_FUNCTION_ARGS)
 		state = cluster_config_use_gate_read(gate);
 		PG_RETURN_TEXT_P(
 			cstring_to_text(psprintf("%d:%u:%u", state.closed, state.epoch, state.owners)));
+	}
+#else
+	PG_RETURN_NULL();
+#endif
+}
+
+/* Test-only local controller in a disposable native family. This neither
+ * supplies nor simulates distributed membership, service or CF agreement.
+ * Targets come from this actual native process, not arbitrary SQL bytes. */
+Datum
+test_pgrac_config_background(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("native background cut requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	{
+		int kind = PG_GETARG_INT32(0);
+		char *action = text_to_cstring(PG_GETARG_TEXT_PP(1));
+		uint32 cookie = (uint32)PG_GETARG_INT32(2);
+		ClusterConfigUseGate *gate;
+		ClusterConfigUseGateState state;
+		ClusterConfigUseTarget *target;
+		ClusterSharedConfigProcess actual;
+		ClusterSharedConfigActive common;
+		BackendType roles[] = { B_CHECKPOINTER, B_BG_WRITER, B_WAL_WRITER };
+		bool failed, ok = false;
+		gate = cluster_shared_config_delivery_background_gate(kind, &failed);
+		target = cluster_shared_config_delivery_background_target(kind);
+		if (gate == NULL || target == NULL)
+			ereport(ERROR, (errmsg("native background cut is unavailable")));
+		if (strcmp(action, "state") == 0)
+			ok = true;
+		else if (strcmp(action, "close") == 0)
+			ok = cluster_config_use_gate_close(gate, &cookie);
+		else if (strcmp(action, "open") == 0)
+			ok = !failed && cluster_config_use_gate_open(gate, cookie);
+		else if (strcmp(action, "bind") == 0)
+			ok = !failed && cluster_shared_config_process_observe(&actual) && !actual.failed
+				 && cluster_shared_config_common_profile(&common)
+				 && cluster_config_use_target_bind(gate, target, cookie, actual.node_id,
+												   &actual.ref, &common);
+		else
+			ereport(ERROR, (errmsg("unknown native background cut action")));
+		state = cluster_config_use_gate_read(gate);
+		for (uint32 i = 0; i < ProcGlobal->allProcCount; i++) {
+			PGPROC *proc = &ProcGlobal->allProcs[i];
+			ClusterSharedConfigRegistration registration;
+			if (cluster_shared_config_registration_read(&proc->cluster_config, &registration)
+				&& registration.pid > 0 && registration.pid == proc->pid
+				&& registration.role == roles[kind])
+				SetLatch(&proc->procLatch);
+		}
+		PG_RETURN_TEXT_P(cstring_to_text(
+			psprintf("%d:%d:%u:%u:%d", ok, state.closed, state.epoch, state.owners, failed)));
 	}
 #else
 	PG_RETURN_NULL();

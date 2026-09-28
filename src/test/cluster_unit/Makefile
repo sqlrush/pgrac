@@ -130,6 +130,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_config_delivery_driver \
 		test_cluster_config_delivery_route \
 		test_cluster_config_delivery_work \
+		test_cluster_background_config \
 		test_cluster_config_census \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
@@ -434,6 +435,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_work,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_background_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_census,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
@@ -765,6 +767,20 @@ test_cluster_checkpoint_config.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	mv $@.tmp $@
 
 test_cluster_checkpoint_config: test_cluster_checkpoint_config.c test_cluster_checkpoint_config.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+
+# PGRAC: execute the complete original loop body; only the test scheduler
+# bounds it to one iteration. Native IO/control calls are explicit boundaries.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_background_%.inc: $(top_srcdir)/src/backend/postmaster/%.c Makefile
+	awk '/^\tfor \(;;\)/ && !seen { seen=1; emit=1; print "for (; native_next_iteration(); )"; next } \
+	     emit && /^}/ { emit=0; done++ } emit { print } \
+	     END { if (seen != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_background_config: test_cluster_background_config.c unit_test.h \
+		test_cluster_background_checkpointer.inc test_cluster_background_bgwriter.inc \
+		test_cluster_background_walwriter.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile

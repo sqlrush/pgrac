@@ -24,6 +24,7 @@
 #include "portability/mem.h"
 #include "storage/ipc.h"
 #include "storage/lock.h"
+#include "storage/proc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "cluster/cluster_clean_leave.h"
@@ -48,6 +49,9 @@ typedef struct ConfigDeliveryFamily {
 	ClusterConfigUseTarget native_target;
 	ClusterConfigUseGate cleaner_producer;
 	pg_atomic_uint32 cleaner_failed;
+	ClusterConfigUseGate background[CLUSTER_CONFIG_BACKGROUND_COUNT];
+	ClusterConfigUseTarget background_target[CLUSTER_CONFIG_BACKGROUND_COUNT];
+	pg_atomic_uint32 background_failed[CLUSTER_CONFIG_BACKGROUND_COUNT];
 	ClusterSharedConfigDeliverySlot incoming;
 	ClusterSharedConfigDeliverySlot accepted;
 	ClusterSharedConfigSlot logger;
@@ -62,6 +66,7 @@ static bool delivery_waiting_for_idle;
  * This local nesting count is not a target, node ACK or DATA permission. */
 static uint32 delivery_work_depth;
 static bool delivery_cleaner_owned;
+static ClusterConfigBackgroundKind delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
 
 static void
 delivery_release_owner(ResourceOwner owner, ResourceOwner saved, bool success)
@@ -158,6 +163,101 @@ cluster_shared_config_cleaner_end(bool completed)
 	delivery_cleaner_owned = false;
 }
 
+ClusterConfigUseGate *
+cluster_shared_config_delivery_background_gate(ClusterConfigBackgroundKind kind, bool *failed)
+{
+	if (failed == NULL)
+		return NULL;
+	*failed = true;
+	if (kind < 0 || kind >= CLUSTER_CONFIG_BACKGROUND_COUNT
+		|| cluster_shared_config_delivery_native_gate() == NULL)
+		return NULL;
+	*failed = pg_atomic_read_u32(&delivery_family->background_failed[kind]) != 0;
+	return &delivery_family->background[kind];
+}
+
+ClusterConfigUseTarget *
+cluster_shared_config_delivery_background_target(ClusterConfigBackgroundKind kind)
+{
+	bool failed;
+	return cluster_shared_config_delivery_background_gate(kind, &failed) != NULL
+			   ? &delivery_family->background_target[kind]
+			   : NULL;
+}
+
+static ClusterConfigBackgroundKind
+delivery_background_kind(void)
+{
+	if (IsUnderPostmaster && MyProc != NULL) {
+		if (MyBackendType == B_CHECKPOINTER && MyAuxProcType == CheckpointerProcess)
+			return CLUSTER_CONFIG_BACKGROUND_CHECKPOINTER;
+		if (MyBackendType == B_BG_WRITER && MyAuxProcType == BgWriterProcess)
+			return CLUSTER_CONFIG_BACKGROUND_BGWRITER;
+		if (MyBackendType == B_WAL_WRITER && MyAuxProcType == WalWriterProcess)
+			return CLUSTER_CONFIG_BACKGROUND_WALWRITER;
+	}
+	return CLUSTER_CONFIG_BACKGROUND_COUNT;
+}
+
+bool
+cluster_shared_config_background_begin(void)
+{
+	ClusterConfigBackgroundKind kind;
+	ClusterConfigUseGate *gate;
+	ClusterConfigUseTarget *target;
+	ClusterSharedConfigRegistration actual;
+	uint64 sequence;
+	uint32 epoch;
+	bool failed;
+	if (delivery_background_owned != CLUSTER_CONFIG_BACKGROUND_COUNT)
+		return false;
+	if (delivery_family == NULL)
+		return true; /* Original non-shared loop is unmanaged. */
+	kind = delivery_background_kind();
+	gate = cluster_shared_config_delivery_background_gate(kind, &failed);
+	if (gate == NULL || failed || !cluster_config_use_gate_enter(gate, false, &epoch))
+		return false;
+	/* Counted reservation keeps the target immutable, including concurrent
+	 * CLOSE. This provisional owner has not started a native pass yet. */
+	delivery_background_owned = kind;
+	target = &delivery_family->background_target[kind];
+	if (target->epoch == 0)
+		return true; /* Guarded integration only, never global application proof. */
+	sequence = pg_atomic_read_u64(&MyProc->cluster_config.sequence);
+	if (cluster_shared_config_registration_read(&MyProc->cluster_config, &actual)
+		&& actual.pid == MyProcPid && actual.role == (int32)MyBackendType
+		&& sequence == pg_atomic_read_u64(&MyProc->cluster_config.sequence)
+		&& cluster_config_use_target_matches(target, epoch, &actual))
+		return true;
+	cluster_shared_config_background_end(true);
+	/* Let the next original signal/idle path apply the accepted image. No
+	 * assignment, lock wait or target change inside the reservation boundary. */
+	ConfigReloadPending = true;
+	delivery_waiting_for_idle = true;
+	return false;
+}
+
+void
+cluster_shared_config_background_end(bool completed)
+{
+	ClusterConfigUseGate *gate;
+	bool failed;
+	if (delivery_background_owned == CLUSTER_CONFIG_BACKGROUND_COUNT)
+		return;
+	gate = cluster_shared_config_delivery_background_gate(delivery_background_owned, &failed);
+	if (gate == NULL || delivery_background_kind() != delivery_background_owned)
+		elog(PANIC, "configuration background producer lost its native owner");
+	if (!completed || failed) {
+		/* ERROR does not certify asynchronous CF/WALR or IO retirement. Keep
+		 * the original count through later passes and auxiliary replacement. */
+		pg_atomic_write_u32(&delivery_family->background_failed[delivery_background_owned], 1);
+		return;
+	}
+	if (!cluster_config_use_gate_leave(gate))
+		elog(PANIC, "configuration background producer count is inconsistent");
+	delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
+}
+
 bool
 cluster_shared_config_delivery_work_pending(void)
 {
@@ -200,7 +300,8 @@ delivery_has_owned_work(void)
 	int slot;
 	const char *reason;
 
-	if (delivery_work_depth != 0 || delivery_cleaner_owned || IsTransactionState()
+	if (delivery_work_depth != 0 || delivery_cleaner_owned
+		|| delivery_background_owned != CLUSTER_CONFIG_BACKGROUND_COUNT || IsTransactionState()
 		|| IsTransactionOrTransactionBlock() || cluster_shared_config_use_session_owned()
 		|| cluster_semantic_activation_backend_has_admission())
 		return true;
@@ -252,6 +353,12 @@ cluster_shared_config_delivery_start(void)
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
 	pg_atomic_init_u32(&delivery_family->cleaner_failed, 0);
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+		cluster_config_use_gate_init(&delivery_family->background[i]);
+		memset(&delivery_family->background_target[i], 0,
+			   sizeof(delivery_family->background_target[i]));
+		pg_atomic_init_u32(&delivery_family->background_failed[i], 0);
+	}
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	cluster_shared_config_delivery_slot_init(&delivery_family->accepted);
 	cluster_shared_config_registration_init(&delivery_family->logger);
@@ -280,6 +387,12 @@ cluster_shared_config_delivery_new_shmem(void)
 	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
 	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
 	pg_atomic_write_u32(&delivery_family->cleaner_failed, 0);
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+		cluster_config_use_gate_init(&delivery_family->background[i]);
+		memset(&delivery_family->background_target[i], 0,
+			   sizeof(delivery_family->background_target[i]));
+		pg_atomic_write_u32(&delivery_family->background_failed[i], 0);
+	}
 	delivery_generation = generation + 1;
 	pg_atomic_write_u64(&delivery_family->generation, delivery_generation);
 	if (!cluster_shared_config_delivery_parent_publish())
