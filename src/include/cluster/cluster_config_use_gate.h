@@ -85,6 +85,10 @@ typedef enum ClusterConfigBackgroundKind {
 	CLUSTER_CONFIG_BACKGROUND_CHECKPOINTER,
 	CLUSTER_CONFIG_BACKGROUND_BGWRITER,
 	CLUSTER_CONFIG_BACKGROUND_WALWRITER,
+	CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT,
+	CLUSTER_CONFIG_BACKGROUND_HORIZON = CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT,
+	CLUSTER_CONFIG_BACKGROUND_DURABILITY,
+	CLUSTER_CONFIG_BACKGROUND_DEADLOCK_PROBE,
 	CLUSTER_CONFIG_BACKGROUND_COUNT
 } ClusterConfigBackgroundKind;
 
@@ -101,6 +105,9 @@ cluster_shared_config_delivery_background_target(ClusterConfigBackgroundKind kin
  * real all-old-child reconstruction; no respawn or later success clears it. */
 extern bool cluster_shared_config_background_begin(void);
 extern void cluster_shared_config_background_end(bool completed);
+/* Only a fresh periodic round in its original LMON/LMD owner. This does not
+ * gate existing queue/cancel retirement or direct foreground publication. */
+extern bool cluster_shared_config_service_producer_begin(ClusterConfigBackgroundKind kind);
 
 /* Original native lifecycle consumers; no caller-set role or epoch. */
 extern void cluster_shared_config_use_enter(void);

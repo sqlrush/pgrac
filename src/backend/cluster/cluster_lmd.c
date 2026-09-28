@@ -77,6 +77,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_config_use_gate.h"
 
 #include <signal.h>
 
@@ -1100,6 +1101,7 @@ static void
 cluster_lmd_run_coordinator_tick(void)
 {
 	TimestampTz now;
+	volatile bool completed = false;
 
 	if (!cluster_lmd_deadlock_detection_enabled)
 		return;
@@ -1124,8 +1126,19 @@ cluster_lmd_run_coordinator_tick(void)
 		&& !TimestampDifferenceExceeds(lmd_last_coord_scan, now, cluster_lmd_global_dd_interval_ms))
 		return; /* not yet time for the next coordinator scan */
 
-	lmd_last_coord_scan = now;
-	cluster_lmd_tarjan_run_coordinator_scan(0); /* 0 → cluster.lmd_probe_collect_timeout_ms */
+	if (!cluster_shared_config_service_producer_begin(CLUSTER_CONFIG_BACKGROUND_DEADLOCK_PROBE))
+		return;
+	PG_TRY();
+	{
+		lmd_last_coord_scan = now;
+		cluster_lmd_tarjan_run_coordinator_scan(0); /* 0 → cluster.lmd_probe_collect_timeout_ms */
+		completed = true;
+	}
+	PG_FINALLY();
+	{
+		cluster_shared_config_background_end(completed);
+	}
+	PG_END_TRY();
 }
 
 

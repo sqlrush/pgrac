@@ -214,10 +214,22 @@ delivery_background_kind(void)
 	return CLUSTER_CONFIG_BACKGROUND_COUNT;
 }
 
-bool
-cluster_shared_config_background_begin(void)
+static bool
+delivery_background_role_valid(ClusterConfigBackgroundKind kind)
 {
-	ClusterConfigBackgroundKind kind;
+	if (!IsUnderPostmaster || MyProc == NULL)
+		return false;
+	if (kind >= 0 && kind < CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT)
+		return delivery_background_kind() == kind;
+	if (kind == CLUSTER_CONFIG_BACKGROUND_HORIZON || kind == CLUSTER_CONFIG_BACKGROUND_DURABILITY)
+		return MyBackendType == B_LMON && AmLmonProcess();
+	return kind == CLUSTER_CONFIG_BACKGROUND_DEADLOCK_PROBE && MyBackendType == B_LMD
+		   && AmLmdProcess();
+}
+
+static bool
+delivery_background_enter(ClusterConfigBackgroundKind kind)
+{
 	ClusterConfigUseGate *gate;
 	ClusterConfigUseTarget *target;
 	ClusterSharedConfigRegistration actual;
@@ -228,7 +240,8 @@ cluster_shared_config_background_begin(void)
 		return false;
 	if (delivery_family == NULL)
 		return true; /* Original non-shared loop is unmanaged. */
-	kind = delivery_background_kind();
+	if (!delivery_background_role_valid(kind))
+		return false;
 	gate = cluster_shared_config_delivery_background_gate(kind, &failed);
 	if (gate == NULL || failed || !cluster_config_use_gate_enter(gate, false, &epoch))
 		return false;
@@ -252,6 +265,20 @@ cluster_shared_config_background_begin(void)
 	return false;
 }
 
+bool
+cluster_shared_config_background_begin(void)
+{
+	return delivery_background_enter(delivery_background_kind());
+}
+
+bool
+cluster_shared_config_service_producer_begin(ClusterConfigBackgroundKind kind)
+{
+	if (kind < CLUSTER_CONFIG_BACKGROUND_HORIZON || kind >= CLUSTER_CONFIG_BACKGROUND_COUNT)
+		return false;
+	return delivery_background_enter(kind);
+}
+
 void
 cluster_shared_config_background_end(bool completed)
 {
@@ -260,7 +287,7 @@ cluster_shared_config_background_end(bool completed)
 	if (delivery_background_owned == CLUSTER_CONFIG_BACKGROUND_COUNT)
 		return;
 	gate = cluster_shared_config_delivery_background_gate(delivery_background_owned, &failed);
-	if (gate == NULL || delivery_background_kind() != delivery_background_owned)
+	if (gate == NULL || !delivery_background_role_valid(delivery_background_owned))
 		elog(PANIC, "configuration background producer lost its native owner");
 	if (!completed || failed) {
 		/* ERROR does not certify asynchronous CF/WALR or IO retirement. Keep

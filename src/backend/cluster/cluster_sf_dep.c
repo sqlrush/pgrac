@@ -18,6 +18,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_config_use_gate.h"
 
 #include "access/xlog.h"
 #include "miscadmin.h"
@@ -1036,6 +1037,7 @@ cluster_sf_origin_durable_lmon_tick(void)
 {
 	static TimestampTz last_publish;
 	TimestampTz now;
+	volatile bool completed = false;
 
 	if (!cluster_enabled || ClusterSfDep == NULL || !cluster_sf_dep_origin_valid(cluster_node_id))
 		return;
@@ -1043,8 +1045,19 @@ cluster_sf_origin_durable_lmon_tick(void)
 	if (last_publish != 0 && now >= last_publish
 		&& now - last_publish < (int64)cluster_smart_fusion_origin_durable_gossip_ms * 1000)
 		return;
-	last_publish = now;
-	cluster_sf_publish_origin_durable_lsn();
+	if (!cluster_shared_config_service_producer_begin(CLUSTER_CONFIG_BACKGROUND_DURABILITY))
+		return;
+	PG_TRY();
+	{
+		last_publish = now;
+		cluster_sf_publish_origin_durable_lsn();
+		completed = true;
+	}
+	PG_FINALLY();
+	{
+		cluster_shared_config_background_end(completed);
+	}
+	PG_END_TRY();
 }
 
 void

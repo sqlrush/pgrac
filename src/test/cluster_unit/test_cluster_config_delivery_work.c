@@ -532,15 +532,16 @@ UT_TEST(cleaner_producer_requires_actual_family_and_worker)
 static void
 background_role(int kind)
 {
-	BackendType roles[] = { B_CHECKPOINTER, B_BG_WRITER, B_WAL_WRITER };
-	AuxProcType auxiliary[] = { CheckpointerProcess, BgWriterProcess, WalWriterProcess };
+	BackendType roles[] = { B_CHECKPOINTER, B_BG_WRITER, B_WAL_WRITER, B_LMON, B_LMON, B_LMD };
+	AuxProcType auxiliary[] = { CheckpointerProcess, BgWriterProcess, WalWriterProcess,
+								LmonProcess,		 LmonProcess,	  LmdProcess };
 	MyBackendType = roles[kind];
 	MyAuxProcType = auxiliary[kind];
 }
 
 UT_TEST(background_close_preserves_original_owner)
 {
-	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT; i++) {
 		uint32 cut;
 		bool failed;
 		ClusterConfigUseGate *gate;
@@ -568,7 +569,7 @@ UT_TEST(background_close_preserves_original_owner)
 
 UT_TEST(background_error_is_not_retirement_or_respawn)
 {
-	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT; i++) {
 		bool failed;
 		uint32 cut;
 		ClusterConfigUseGate *gate;
@@ -588,7 +589,7 @@ UT_TEST(background_error_is_not_retirement_or_respawn)
 		delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
 		UT_ASSERT(!cluster_shared_config_background_begin());
 		/* A different original role must still be able to finish its work. */
-		background_role((i + 1) % CLUSTER_CONFIG_BACKGROUND_COUNT);
+		background_role((i + 1) % CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT);
 		UT_ASSERT(cluster_shared_config_background_begin());
 		cluster_shared_config_background_end(true);
 		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
@@ -600,7 +601,7 @@ UT_TEST(background_actual_role_and_family_required)
 	bool failed;
 	reset();
 	UT_ASSERT(!cluster_shared_config_background_begin());
-	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT; i++) {
 		background_role(i);
 		MyAuxProcType = NotAnAuxProcess;
 		UT_ASSERT(!cluster_shared_config_background_begin());
@@ -656,7 +657,7 @@ background_bind(int kind)
 
 UT_TEST(background_bound_target_uses_actual_native_values)
 {
-	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
+	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT; i++) {
 		reset();
 		background_bind(i);
 		UT_ASSERT(cluster_shared_config_background_begin());
@@ -735,10 +736,95 @@ UT_TEST(channel_board_is_bound_to_native_family)
 	UT_ASSERT_EQ(pid, 0);
 }
 
+UT_TEST(periodic_service_cut_retains_old_pass_and_independent_producers)
+{
+	for (int kind = CLUSTER_CONFIG_BACKGROUND_HORIZON; kind < CLUSTER_CONFIG_BACKGROUND_COUNT;
+		 ++kind) {
+		uint32 cut;
+		bool failed;
+		ClusterConfigUseGate *gate;
+		reset();
+		background_role(kind);
+		gate = cluster_shared_config_delivery_background_gate(kind, &failed);
+		UT_ASSERT(gate != NULL && !failed);
+		UT_ASSERT(!cluster_shared_config_background_begin());
+		UT_ASSERT(cluster_shared_config_service_producer_begin(kind));
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		UT_ASSERT(cluster_config_use_gate_close(gate, &cut));
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+		UT_ASSERT(!cluster_config_use_gate_open(gate, cut));
+		expect_deferred();
+		cluster_shared_config_background_end(true);
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 0);
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		/* The original WAL writer can still finish old durability work. */
+		background_role(CLUSTER_CONFIG_BACKGROUND_WALWRITER);
+		UT_ASSERT(cluster_shared_config_background_begin());
+		cluster_shared_config_background_end(true);
+		background_role(kind);
+		UT_ASSERT(cluster_config_use_gate_open(gate, cut));
+		UT_ASSERT(cluster_shared_config_service_producer_begin(kind));
+		cluster_shared_config_background_end(true);
+	}
+}
+
+UT_TEST(periodic_service_error_keeps_failed_original_owner)
+{
+	for (int kind = CLUSTER_CONFIG_BACKGROUND_HORIZON; kind < CLUSTER_CONFIG_BACKGROUND_COUNT;
+		 ++kind) {
+		bool failed;
+		ClusterConfigUseGate *gate;
+		reset();
+		background_role(kind);
+		UT_ASSERT(cluster_shared_config_service_producer_begin(kind));
+		cluster_shared_config_background_end(false);
+		gate = cluster_shared_config_delivery_background_gate(kind, &failed);
+		UT_ASSERT(failed);
+		cluster_shared_config_background_end(true);
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+		delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		UT_ASSERT_EQ(cluster_config_use_gate_read(gate).owners, 1);
+	}
+}
+
+UT_TEST(periodic_service_requires_actual_native_kind_and_common_target)
+{
+	for (int kind = CLUSTER_CONFIG_BACKGROUND_HORIZON; kind < CLUSTER_CONFIG_BACKGROUND_COUNT;
+		 ++kind) {
+		reset();
+		background_bind(kind);
+		UT_ASSERT(cluster_shared_config_service_producer_begin(kind));
+		cluster_shared_config_background_end(true);
+		background_actual.common.dynamic_sha256[0]++;
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		UT_ASSERT_EQ(cluster_config_use_gate_read(&family.background[kind]).owners, 0);
+		UT_ASSERT(ConfigReloadPending && delivery_waiting_for_idle);
+		UT_ASSERT_EQ(assignments, 0);
+		background_actual.common.dynamic_sha256[0]--;
+		MyBackendType = B_LMS;
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		background_role(kind);
+		MyAuxProcType = LmsProcess;
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		background_role(kind);
+		MyProc = NULL;
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		MyProc = &background_proc;
+		IsUnderPostmaster = false;
+		UT_ASSERT(!cluster_shared_config_service_producer_begin(kind));
+		IsUnderPostmaster = true;
+		UT_ASSERT(cluster_shared_config_service_producer_begin(kind));
+		cluster_shared_config_background_end(true);
+	}
+	UT_ASSERT(!cluster_shared_config_service_producer_begin(CLUSTER_CONFIG_BACKGROUND_BGWRITER));
+	UT_ASSERT(!cluster_shared_config_service_producer_begin(CLUSTER_CONFIG_BACKGROUND_COUNT));
+}
+
 int
 main(void)
 {
-	UT_PLAN(26);
+	UT_PLAN(29);
 	UT_RUN(channel_board_is_bound_to_native_family);
 	UT_RUN(retained_admission_without_transaction_or_command);
 	UT_RUN(gcs_private_work_without_admission);
@@ -765,6 +851,9 @@ main(void)
 	UT_RUN(background_bound_target_uses_actual_native_values);
 	UT_RUN(background_bound_target_rejects_unproven_registration);
 	UT_RUN(background_default_only_reload_is_allowed);
+	UT_RUN(periodic_service_cut_retains_old_pass_and_independent_producers);
+	UT_RUN(periodic_service_error_keeps_failed_original_owner);
+	UT_RUN(periodic_service_requires_actual_native_kind_and_common_target);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
