@@ -228,4 +228,24 @@ extern ClusterControlRootResult cluster_shared_config_prepare_change(
 	const ClusterSharedConfigEntry *change, const uint8 operation_uuid[16],
 	ClusterSharedConfigStage *out, bool *changed, ClusterSharedConfigPolicyReport *report);
 
+/* PGRAC: one internal publication attempt, not an application ACK. Native
+ * SQL permissions/audit must precede this call. Owns CF-S then CF-X, stages
+ * outside CF, and preserves all thread/recovery inputs. CAS/initializer
+ * competition is retryable by the caller; never loop while holding CF.
+ * Refusal clears out, even when a root write may already have occurred.
+ * Published work must subsequently be applied by the background owner;
+ * caller cancellation cannot revoke it. Inputs/outputs must not overlap.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterSharedConfigPublication {
+	ClusterSharedConfigRef ref;
+	ClusterControlRootFileToken root;
+	bool changed;
+} ClusterSharedConfigPublication;
+
+extern ClusterControlRootResult
+cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
+								   ClusterSharedConfigPublication *out,
+								   ClusterSharedConfigPolicyReport *report);
+
 #endif

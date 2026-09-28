@@ -4103,6 +4103,246 @@ checkpoint_v2_owner_current(const ClusterControlRootIdentity *self, uint64 epoch
 	return flushed_tli == tli && flushed >= checkpoint_end && cluster_epoch_get_current() == epoch;
 }
 
+/* PGRAC: configuration has one root publication, not a local auto.conf truth.
+ * Keep all fallible ownership on heap so ERROR unwinds staging and CF without
+ * reverting a possibly published root. No native assign hooks run under CF.
+ * Author: SqlRush <sqlrush@gmail.com> */
+typedef struct ConfigPublishWork {
+	ControlRootImage base;
+	ControlRootImage next;
+	ControlFileData thread;
+	ClusterControlRootIdentity self;
+	ClusterControlRootFileToken before, after;
+	ClusterSharedConfigRef ref;
+	ClusterSharedConfigImage image;
+	ClusterSharedConfigStage stage;
+	LOCKMODE cf_mode;
+	uint64 epoch;
+	uint64 incarnation;
+	uint8 storage_uuid[16];
+	bool changed;
+} ConfigPublishWork;
+
+static void
+config_root_reference(const ControlRootImage *root, ClusterSharedConfigRef *ref)
+{
+	memset(ref, 0, sizeof(*ref));
+	ref->identity.system_identifier = root->header.system_identifier;
+	ref->identity.database_incarnation = root->header.v2.database_incarnation;
+	ref->identity.generation = root->header.v2.config_generation;
+	memcpy(ref->identity.storage_uuid, root->header.storage_uuid, 16);
+	memcpy(ref->identity.authority_uuid, root->header.authority_uuid, 16);
+	memcpy(ref->identity.configured, root->header.v2.configured, sizeof(ref->identity.configured));
+	memcpy(ref->sha256, root->header.v2.config_sha256, 32);
+}
+
+static ClusterControlRootResult
+config_publish_read(ConfigPublishWork *work, ControlRootImage *root,
+					ClusterControlRootFileToken *token, bool initial)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootIdentity self;
+	int node = cluster_node_id;
+
+	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = read_control_version(work->storage_uuid, GetSystemIdentifier(), root, &work->thread,
+								  token, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (!root->present[node]
+		|| root->header.activation_state != CLUSTER_CONTROL_ROOT_ACTIVATION_ACTIVE
+		|| root->header.v2.database_state != CLUSTER_CONTROL_ROOT_DATABASE_OPEN
+		|| (root->header.v2.serving[node / 64] & (UINT64_C(1) << (node % 64))) == 0
+		|| root->records[node].lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_OPEN)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	self = root->records[node].identity;
+	if (self.origin_node_id != node || self.origin_thread_id != node + 1
+		|| self.origin_owner_incarnation != work->incarnation
+		|| (!initial && !cluster_control_root_identity_equal(&self, &work->self)))
+		return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+	/* A pending initializer pins its config generation. Let its existing
+	 * owner close it; do not invalidate that exact operation or shrink the
+	 * scan to currently serving/ALIVE peers. Even another origin matters. */
+	for (int i = 0; i < CLUSTER_CONTROL_ROOT_RECORD_COUNT; ++i)
+		if (root->startup[i].generation != 0)
+			return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	result = read_thread_version(&self, root, &work->thread, token, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& result != CLUSTER_CONTROL_ROOT_OK_PRIMARY_DEGRADED)
+		return result;
+	if (work->thread.state != DB_IN_PRODUCTION)
+		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
+	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (initial)
+		work->self = self;
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
+static ClusterControlRootResult
+config_publish_cleanup(ConfigPublishWork *work, ClusterControlRootResult result)
+{
+	LOCKMODE mode = work->cf_mode;
+	/* Release can consume caller cancellation while waiting for retirement.
+	 * Retire private staging first, before that fallible wait loses the query
+	 * context. No formal object or root can be removed by discard. */
+	cluster_shared_config_free(&work->image);
+	if (work->stage.state != 0) {
+		ClusterControlRootResult cleanup
+			= cluster_shared_config_discard(cluster_shared_data_dir, &work->stage);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			result = cleanup;
+	}
+	work->cf_mode = NoLock;
+	if (mode != NoLock)
+		result = release_cf(mode, result);
+	return result;
+}
+
+static ClusterControlRootResult
+config_publish_work(ConfigPublishWork *work, const ClusterSharedConfigEntry *change,
+					ClusterSharedConfigPolicyReport *report)
+{
+	ClusterControlRootResult result;
+	ClusterControlRootFileToken observed;
+	ClusterSharedConfigRef installed;
+	uint8 uuid[16];
+
+	if (!acquire_clusterwide_cf(ShareLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ShareLock;
+	result = config_publish_read(work, &work->base, &work->before, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	config_root_reference(&work->base, &work->ref);
+	result = cluster_shared_config_read_locked(cluster_shared_data_dir, &work->ref, &work->image);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work->cf_mode = NoLock;
+	result = release_cf(ShareLock, CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!pg_strong_random(uuid, sizeof(uuid)))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	uuid[6] = (uuid[6] & 0x0f) | 0x40;
+	uuid[8] = (uuid[8] & 0x3f) | 0x80;
+	result = cluster_shared_config_prepare_change(cluster_shared_data_dir, work->image.bytes,
+												  work->image.len, &work->ref, change, uuid,
+												  &work->stage, &work->changed, report);
+	cluster_shared_config_free(&work->image);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!acquire_clusterwide_cf(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	work->cf_mode = ExclusiveLock;
+	result = config_publish_read(work, &work->next, &observed, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!file_token_equal(&work->before, &observed))
+		return CLUSTER_CONTROL_ROOT_CAS_CONFLICT;
+	if (!work->changed) {
+		work->after = observed;
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	}
+	if (work->next.header.file_txn_seq == UINT64_MAX)
+		return CLUSTER_CONTROL_ROOT_SEQUENCE_EXHAUSTED;
+	result = cluster_shared_config_install(cluster_shared_data_dir, &work->stage);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	result = cluster_shared_config_read_locked(cluster_shared_data_dir, &work->stage.ref,
+											   &work->image);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	cluster_shared_config_free(&work->image);
+	work->next.header.v2.config_generation = work->stage.ref.identity.generation;
+	memcpy(work->next.header.v2.config_sha256, work->stage.ref.sha256, 32);
+	work->next.header.file_txn_seq++;
+	work->next.header.published_at_usec = GetCurrentTimestamp();
+	result = encode_extended_image(&work->next, CONTROL_ROOT_HEADER_VERSION_V3);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (!runtime_v2_owner_current(work->epoch, work->incarnation))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	if (!publish_updated_image(&work->base, &work->next))
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	/* Post-read, never rollback. A failed write or caller cancellation can
+	 * leave the new root durable; its application no longer belongs to SQL. */
+	result = config_publish_read(work, &work->base, &work->after, false);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	if (memcmp(work->base.bytes, work->next.bytes, CLUSTER_CONTROL_ROOT_FILE_BYTES) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	config_root_reference(&work->base, &installed);
+	if (memcmp(&installed, &work->stage.ref, sizeof(installed)) != 0)
+		return CLUSTER_CONTROL_ROOT_POSTREAD_FAILED;
+	work->ref = installed;
+	result = cluster_cf_control_projection_write_locked(&work->thread);
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& !runtime_v2_owner_current(work->epoch, work->incarnation))
+		result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	return result;
+}
+
+ClusterControlRootResult
+cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
+								   ClusterSharedConfigPublication *out,
+								   ClusterSharedConfigPolicyReport *report)
+{
+	ConfigPublishWork *work;
+	ClusterControlRootResult result;
+	uint8 uuid[16];
+	uint64 epoch, incarnation;
+
+	if (history_ranges_overlap(change, sizeof(*change), out, sizeof(*out))
+		|| history_ranges_overlap(change, sizeof(*change), report, sizeof(*report))
+		|| history_ranges_overlap(out, sizeof(*out), report, sizeof(*report)))
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (out != NULL)
+		memset(out, 0, sizeof(*out));
+	if (report != NULL)
+		memset(report, 0, sizeof(*report));
+	if (change == NULL || out == NULL || report == NULL || change->name == NULL
+		|| MyBackendType != B_BACKEND || !enableFsync || !cluster_shared_config || !cluster_enabled
+		|| !cluster_controlfile_shared_authority)
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	epoch = cluster_epoch_get_current();
+	incarnation = cluster_qvotec_get_self_incarnation();
+	if (!runtime_v2_owner_current(epoch, incarnation) || !current_storage_uuid(uuid))
+		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+	result = storage_contract_check(uuid, true);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
+	work = palloc0(sizeof(*work));
+	work->epoch = epoch;
+	work->incarnation = incarnation;
+	memcpy(work->storage_uuid, uuid, sizeof(uuid));
+	PG_TRY();
+	{
+		result = config_publish_work(work, change, report);
+		result = config_publish_cleanup(work, result);
+	}
+	PG_CATCH();
+	{
+		(void)config_publish_cleanup(work, CLUSTER_CONTROL_ROOT_IO_ERROR);
+		pfree(work);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
+		out->ref = work->ref;
+		out->root = work->after;
+		out->changed = work->changed;
+	}
+	pfree(work);
+	return result;
+}
+
 typedef enum CheckpointV2Purpose {
 	CHECKPOINT_V2_ONLINE,
 	CHECKPOINT_V2_SHUTDOWN_EVIDENCE

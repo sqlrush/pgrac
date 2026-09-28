@@ -128,6 +128,9 @@ static bool test_fence_after_primary, test_release_after_primary;
 static bool test_checkpoint_outer_cf;
 static bool test_projection_sync_fault, test_projection_observe;
 static unsigned test_projection_syncs;
+static bool test_config_policy_refuse;
+static unsigned test_config_prepares;
+static bool test_config_release_throw;
 static LOCKMODE test_actual_cf;
 static unsigned test_history_sync_count, test_history_fail_sync;
 static bool test_throw_root_read;
@@ -761,6 +764,37 @@ pg_strong_random(void *buf, size_t len)
 	return true;
 }
 
+/* Native registry/check hooks are verified in the PostgreSQL module TAP.
+ * This explicit boundary keeps the root unit linked to the real canonical
+ * change producer, actual staging files and production CAS/cleanup code.
+ * Author: SqlRush <sqlrush@gmail.com> */
+ClusterControlRootResult
+cluster_shared_config_prepare_change(const char *shared_root, const char *bytes, size_t len,
+									 const ClusterSharedConfigRef *ref,
+									 const ClusterSharedConfigEntry *change, const uint8 uuid[16],
+									 ClusterSharedConfigStage *out, bool *changed,
+									 ClusterSharedConfigPolicyReport *report)
+{
+	ClusterSharedConfigImage image = { 0 };
+	ClusterSharedConfigRef next;
+	ClusterControlRootResult result;
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	++test_config_prepares;
+	memset(report, 0, sizeof(*report));
+	memset(out, 0, sizeof(*out));
+	*changed = false;
+	if (test_config_policy_refuse) {
+		report->reason = CLUSTER_CONFIG_POLICY_COLD_ONLY;
+		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
+	}
+	result = cluster_shared_config_amend(bytes, len, ref, change, &image, &next, changed);
+	if (result == 0 && *changed)
+		result
+			= cluster_shared_config_prepare(shared_root, image.bytes, image.len, &next, uuid, out);
+	cluster_shared_config_free(&image);
+	return result;
+}
+
 TimestampTz
 GetCurrentTimestamp(void)
 {
@@ -969,6 +1003,11 @@ ClusterCfReleaseResult
 cluster_cf_unlock_confirmed(LOCKMODE mode pg_attribute_unused())
 {
 	test_cf_release_order = ++test_order_seq;
+	if (mode == ExclusiveLock && test_config_release_throw) {
+		test_config_release_throw = false;
+		/* The real CF request keeps its retirement owner after cancellation. */
+		pg_re_throw();
+	}
 	if (test_cf_release_cut_change)
 		test_control_generation++;
 	if (test_cf_release_confirmed) {
@@ -17557,6 +17596,345 @@ UT_TEST(test_v3_normal_close_cannot_discard_foreign_pending_initialization)
 	UT_ASSERT_EQ(test_actual_cf, NoLock);
 }
 
+/* PGRAC: production config publisher, actual objects/root/thread inputs.
+ * Only runtime authority/syscall timing and native-policy boundary are faked.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static uint64
+get_u64_le(const uint8 *bytes)
+{
+	uint64 value = 0;
+	for (int i = 7; i >= 0; --i)
+		value = (value << 8) | bytes[i];
+	return value;
+}
+
+static void
+config_publish_fixture(uint8 before[66048])
+{
+	ClusterControlRootIdentity self;
+	ControlFileData cf;
+	char path[MAXPGPATH];
+	v2_checkpoint_fixture(before, &self, &cf);
+	root_fixture_version3(before);
+	v2_write_roots(before);
+	path_for(path, sizeof(path), "global/config_images/.staging");
+	UT_ASSERT(mkdir(path, 0700) == 0 || errno == EEXIST);
+	test_reserve_mode = true;
+	test_actual_cf = NoLock;
+	test_config_policy_refuse = false;
+	test_config_prepares = 0;
+	test_config_release_throw = false;
+	test_epoch_reads = test_change_epoch_read = test_throw_epoch_read = 0;
+	MyAuxProcType = NotAnAuxProcess;
+	MyBackendType = B_BACKEND;
+}
+
+static void
+config_staging_empty(void)
+{
+	char path[MAXPGPATH];
+	DIR *dir;
+	struct dirent *entry;
+	path_for(path, sizeof(path), "global/config_images/.staging");
+	dir = opendir(path);
+	UT_ASSERT(dir != NULL);
+	if (dir == NULL)
+		return;
+	while ((entry = readdir(dir)) != NULL)
+		UT_ASSERT(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0);
+	closedir(dir);
+}
+
+static void
+config_primary_read(uint8 bytes[66048])
+{
+	char path[MAXPGPATH];
+	path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+	read_all_or_abort(path, bytes, 66048);
+}
+
+UT_TEST(test_config_publisher_keeps_threads_and_reads_exact_new_object)
+{
+	uint8 before[66048], after[66048];
+	ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+	ClusterSharedConfigPublication out;
+	ClusterSharedConfigPolicyReport policy;
+	ClusterSharedConfigImage image;
+	char value[32];
+	config_publish_fixture(before);
+	test_projection_observe = true;
+	UT_ASSERT_EQ(cluster_control_root_config_change(&change, &out, &policy), 0);
+	if (ut_current_failed)
+		return;
+	UT_ASSERT(out.changed);
+	UT_ASSERT_EQ(out.ref.identity.generation, 48);
+	UT_ASSERT_EQ(out.root.file_txn_seq, get_u64_le(before + 16) + 1);
+	UT_ASSERT_EQ(out.root.format_version, 3);
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT_EQ(test_config_prepares, 1);
+	UT_ASSERT_EQ(test_projection_syncs, 1);
+	UT_ASSERT_EQ(test_walr_begin_calls, 0);
+	config_primary_read(after);
+	UT_ASSERT(memcmp(after + 512, before + 512, 66048 - 512) == 0);
+	UT_ASSERT(memcmp(after + 196, before + 196, 52) == 0);
+	UT_ASSERT(memcmp(after + 288, before + 288, 216) == 0);
+	UT_ASSERT(memcmp(after + 256, out.ref.sha256, 32) == 0);
+	test_actual_cf = ShareLock;
+	UT_ASSERT_EQ(cluster_shared_config_read_locked(test_root, &out.ref, &image), 0);
+	UT_ASSERT_EQ(cluster_shared_config_lookup(image.bytes, image.len, &out.ref, -1,
+											  "statement_timeout", value, sizeof(value)),
+				 0);
+	UT_ASSERT(strcmp(value, "250") == 0);
+	cluster_shared_config_free(&image);
+	test_actual_cf = NoLock;
+	config_staging_empty();
+	/* A second exact publication may delete the key; it must not regress
+	 * the old thread claims/anchors that predate both config generations. */
+	change.value = NULL;
+	UT_ASSERT_EQ(cluster_control_root_config_change(&change, &out, &policy), 0);
+	UT_ASSERT(out.changed);
+	UT_ASSERT_EQ(out.ref.identity.generation, 49);
+	test_actual_cf = ShareLock;
+	UT_ASSERT_EQ(cluster_shared_config_read_locked(test_root, &out.ref, &image), 0);
+	UT_ASSERT_EQ(cluster_shared_config_lookup(image.bytes, image.len, &out.ref, -1,
+											  "statement_timeout", value, sizeof(value)),
+				 CLUSTER_CONTROL_ROOT_ABSENT);
+	cluster_shared_config_free(&image);
+	test_actual_cf = NoLock;
+	config_primary_read(after);
+	UT_ASSERT(memcmp(after + 512, before + 512, 66048 - 512) == 0);
+	config_staging_empty();
+}
+
+UT_TEST(test_config_publisher_noop_does_not_advance_root_or_make_object)
+{
+	for (int reset = 0; reset < 2; ++reset) {
+		uint8 before[66048];
+		ClusterSharedConfigEntry change
+			= { -1, reset ? "work_mem" : "cluster.enabled", reset ? NULL : "on" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		config_publish_fixture(before);
+		UT_ASSERT_EQ(cluster_control_root_config_change(&change, &out, &policy), 0);
+		UT_ASSERT(!out.changed);
+		UT_ASSERT_EQ(out.ref.identity.generation, 47);
+		UT_ASSERT_EQ(out.root.file_txn_seq, get_u64_le(before + 16));
+		UT_ASSERT_EQ(test_durable_rename_calls, 0);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+		config_staging_empty();
+	}
+}
+
+UT_TEST(test_config_publisher_rejects_unowned_or_incomplete_inputs)
+{
+	for (int fault = 0; fault < 11; ++fault) {
+		uint8 before[66048];
+		ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		config_publish_fixture(before);
+		if (fault == 0)
+			MyBackendType = B_LMON;
+		else if (fault == 1)
+			test_self_incarnation++;
+		else if (fault == 2)
+			test_fence = false;
+		else if (fault == 3)
+			test_contract = CLUSTER_CF_CONTRACT_LOCAL_PROBED;
+		else if (fault == 4)
+			test_prebump = true;
+		else if (fault == 5)
+			test_serving = false;
+		else if (fault == 6)
+			test_config_policy_refuse = true;
+		else if (fault == 7) {
+			before[232] &= ~1u;
+			v2_checksums(before);
+			v2_write_roots(before);
+		} else if (fault == 8) {
+			put_u64_le(before + 16, UINT64_MAX);
+			v2_checksums(before);
+			v2_write_roots(before);
+		} else if (fault == 9) {
+			put_u32_le(before + 196, CLUSTER_CONTROL_ROOT_DATABASE_CLOSING);
+			v2_checksums(before);
+			v2_write_roots(before);
+		} else
+			enableFsync = false;
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT(cluster_control_root_config_change(&change, &out, &policy) != 0);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		UT_ASSERT_EQ(test_durable_rename_calls, 0);
+		v2_assert_primary_unchanged(before);
+		config_staging_empty();
+		enableFsync = true;
+	}
+}
+
+UT_TEST(test_config_publisher_cas_and_epoch_losers_keep_winner)
+{
+	for (int fault = 0; fault < 2; ++fault) {
+		uint8 before[66048];
+		ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		config_publish_fixture(before);
+		test_checkpoint_x_hook = fault ? v2_checkpoint_epoch_race : v2_checkpoint_root_race;
+		UT_ASSERT_EQ(cluster_control_root_config_change(&change, &out, &policy),
+					 fault ? CLUSTER_CONTROL_ROOT_STALE_TOKEN : CLUSTER_CONTROL_ROOT_CAS_CONFLICT);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		v2_assert_primary_unchanged(fault ? before : v2_race_winner);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		config_staging_empty();
+	}
+}
+
+static void
+config_pending_race(void)
+{
+	config_primary_read(v2_race_winner);
+	v3_mark_pending(v2_race_winner, 127);
+	put_u64_le(v2_race_winner + 16, get_u64_le(v2_race_winner + 16) + 1);
+	v2_checksums(v2_race_winner);
+	v2_write_roots(v2_race_winner);
+	test_checkpoint_x_hook = NULL;
+}
+
+UT_TEST(test_config_publisher_waits_for_selected_initializer_not_age)
+{
+	for (int late = 0; late < 2; ++late) {
+		uint8 before[66048];
+		ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		config_publish_fixture(before);
+		if (late)
+			test_checkpoint_x_hook = config_pending_race;
+		else {
+			v3_mark_pending(before, 127);
+			v2_write_roots(before);
+		}
+		UT_ASSERT_EQ(cluster_control_root_config_change(&change, &out, &policy),
+					 CLUSTER_CONTROL_ROOT_CAS_CONFLICT);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		v2_assert_primary_unchanged(late ? v2_race_winner : before);
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		config_staging_empty();
+	}
+}
+
+UT_TEST(test_config_publisher_late_failure_never_rolls_back_or_claims_ack)
+{
+	for (int fault = 0; fault < 6; ++fault) {
+		uint8 before[66048], after[66048];
+		ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		volatile bool caught = false;
+		volatile ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+		config_publish_fixture(before);
+		test_projection_observe = true;
+		if (fault == 0)
+			test_fail_primary_rename = true;
+		else if (fault == 1)
+			test_fail_after_primary_rename = true;
+		else if (fault == 2)
+			test_release_after_primary = true;
+		else if (fault == 3)
+			test_fence_after_primary = true;
+		else if (fault == 4)
+			test_projection_sync_fault = true;
+		else
+			test_checkpoint_published_hook = v2_checkpoint_throw_on_x;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			result = cluster_control_root_config_change(&change, &out, &policy);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(fault == 5 ? caught : result != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		config_primary_read(after);
+		UT_ASSERT_EQ(get_u64_le(after + 248), fault == 0 ? 47 : 48);
+		UT_ASSERT(memcmp(after + 512, before + 512, 66048 - 512) == 0);
+		test_cf_release_confirmed = true;
+		cluster_cf_retirement_poll();
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		config_staging_empty();
+	}
+}
+
+UT_TEST(test_config_publisher_errors_unwind_read_and_staged_work)
+{
+	for (int late = 0; late < 2; ++late) {
+		uint8 before[66048];
+		ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		volatile bool caught = false;
+		config_publish_fixture(before);
+		if (late)
+			test_checkpoint_x_hook = v2_checkpoint_throw_on_x;
+		else
+			test_throw_root_read = true;
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			(void)cluster_control_root_config_change(&change, &out, &policy);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		test_throw_root_read = false;
+		UT_ASSERT(caught);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		v2_assert_primary_unchanged(before);
+		config_staging_empty();
+	}
+}
+
+UT_TEST(test_config_publisher_release_cancel_retires_private_stage)
+{
+	for (int published = 0; published < 2; ++published) {
+		uint8 before[66048], after[66048];
+		ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+		ClusterSharedConfigPublication out;
+		ClusterSharedConfigPolicyReport policy;
+		volatile bool caught = false;
+		config_publish_fixture(before);
+		test_config_release_throw = true;
+		if (!published)
+			test_checkpoint_x_hook = v2_checkpoint_root_race;
+		PG_TRY();
+		{
+			(void)cluster_control_root_config_change(&change, &out, &policy);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		config_staging_empty();
+		cluster_cf_retirement_poll();
+		UT_ASSERT_EQ(test_actual_cf, NoLock);
+		config_primary_read(after);
+		UT_ASSERT_EQ(get_u64_le(after + 248), published ? 48 : 47);
+		if (!published)
+			v2_assert_primary_unchanged(v2_race_winner);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -17575,7 +17953,15 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(318);
+	UT_PLAN(326);
+	UT_RUN(test_config_publisher_keeps_threads_and_reads_exact_new_object);
+	UT_RUN(test_config_publisher_noop_does_not_advance_root_or_make_object);
+	UT_RUN(test_config_publisher_rejects_unowned_or_incomplete_inputs);
+	UT_RUN(test_config_publisher_cas_and_epoch_losers_keep_winner);
+	UT_RUN(test_config_publisher_waits_for_selected_initializer_not_age);
+	UT_RUN(test_config_publisher_late_failure_never_rolls_back_or_claims_ack);
+	UT_RUN(test_config_publisher_errors_unwind_read_and_staged_work);
+	UT_RUN(test_config_publisher_release_cancel_retires_private_stage);
 	UT_RUN(test_initializer_selected_evidence_survives_producer_exit_and_exec);
 	UT_RUN(test_native_inputs_accept_only_empty_native_progress);
 	UT_RUN(test_native_inputs_refuse_all_recovery_signals_without_cleanup);
