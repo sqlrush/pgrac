@@ -170,7 +170,7 @@ static bool ut_peer2_declared = false;
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
 {
-#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
+#if defined(PGRAC_CONTROL_TRANSPORT_EMBEDDED) || defined(PGRAC_PREFIX_TRANSPORT_EMBEDDED)
 	static ClusterNodeInfo control_source;
 	if (node_id == 0)
 		return &control_source;
@@ -339,13 +339,13 @@ cstring_to_text(const char *s)
 	return NULL;
 }
 
-/* Router / envelope / chunk / smart-fusion deps of the recv paths —
- * the test never receives an envelope, so these are vacuous. */
+/* Router / envelope / chunk / smart-fusion boundaries. The prefix integration
+ * fixture supplies the real envelope codec and its own actual ingress hook. */
 bool cluster_ic_suppress_caps_reply = false;
 static uint64 ut_dispatch_count = 0;
 static bool ut_hello_valid;
 static ClusterICHelloMsg ut_hello;
-#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
+#if defined(PGRAC_CONTROL_TRANSPORT_EMBEDDED) || defined(PGRAC_PREFIX_TRANSPORT_EMBEDDED)
 static ClusterICSendResult (*ut_send_envelope_hook)(uint8, int32, const void *, uint32);
 #endif
 
@@ -367,7 +367,7 @@ ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
 						 uint32 payload_len)
 {
-#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
+#if defined(PGRAC_CONTROL_TRANSPORT_EMBEDDED) || defined(PGRAC_PREFIX_TRANSPORT_EMBEDDED)
 	if (ut_send_envelope_hook != NULL)
 		return ut_send_envelope_hook(msg_type, dest_node_id, payload, payload_len);
 #endif
@@ -378,6 +378,7 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	return CLUSTER_IC_SEND_DONE;
 }
 
+#ifndef PGRAC_PREFIX_TRANSPORT_EMBEDDED
 bool
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
@@ -399,6 +400,7 @@ cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env, const void 
 	(void)peer_id;
 	return CLUSTER_IC_ENVELOPE_OK;
 }
+#endif
 
 void
 cluster_ic_chunk_reset_peer(int32 peer_id)

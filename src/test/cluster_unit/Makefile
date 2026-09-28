@@ -131,6 +131,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_config_delivery_route \
 		test_cluster_config_delivery_work \
 		test_cluster_background_config \
+		test_cluster_config_prefix test_cluster_config_prefix_transport \
 		test_cluster_config_census \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
@@ -436,6 +437,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS)
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_work,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_background_config,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_prefix test_cluster_config_prefix_transport,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_census,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
@@ -467,6 +469,25 @@ test_cluster_config_members: test_cluster_config_members.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_config_members.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_config_members.o \
 		$(top_builddir)/src/common/sha2_srv.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: actual prefix codec/driver, explicit native transport boundaries.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_prefix: test_cluster_config_prefix.c unit_test.h \
+		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
+		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: real native stream/FIFO/parser plus prefix and envelope production objects.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_prefix_transport: test_cluster_config_prefix_transport.c test_cluster_ic_tier1_partial.c unit_test.h \
+		$(CLUSTER_VERSION_O) $(top_builddir)/src/backend/cluster/cluster_config_prefix.o \
+		$(top_builddir)/src/backend/cluster/cluster_ic_envelope.o \
+		$(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c \
+		$(top_srcdir)/src/backend/cluster/cluster_ic_mux.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) \
+		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o \
+		$(top_builddir)/src/backend/cluster/cluster_ic_envelope.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: actual evidence codec/collector with transport/producer boundary fixtures.
 # Author: SqlRush <sqlrush@gmail.com>
