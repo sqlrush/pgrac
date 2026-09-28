@@ -387,6 +387,24 @@ extern int cluster_ic_tier1_get_listener_fd(void);
  */
 extern int cluster_ic_tier1_get_peer_fd(int32 peer_id);
 
+/* Actual native byte-stream lifetime, private to the capturing process.
+ * Not serializable, transferable, a FIFO-prefix ACK or configuration/DATA
+ * permission. A future channel cut must separately retain its native owner,
+ * exact members and accepted-prefix evidence. No fd/clock/diagnostic counter
+ * substitutes for this serial. Exhaustion yields no stamp, never wraparound.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+typedef struct ClusterICTier1Stream {
+	uint64 serial;
+	uint64 epoch;
+	int32 owner_pid;
+	int32 peer;
+	int32 plane;
+	int32 channel;
+} ClusterICTier1Stream;
+extern bool cluster_ic_tier1_stream_capture(int32 peer, ClusterICTier1Stream *out);
+extern bool cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream);
+
 /*
  * Hardening v1.0.1 F3: listener metadata accessors -- read from shmem
  * (visible to any backend; not the fd itself which is process-local).

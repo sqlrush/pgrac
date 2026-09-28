@@ -210,6 +210,30 @@ static int tier1_listener_fd = -1;
 static int tier1_peer_fds[CLUSTER_MAX_NODES];
 static bool tier1_peer_fds_initialised = false;
 
+/* A private native-owner lifetime, not shared diagnostic reconnect_count.
+ * A frame boundary consumer may retain this only in the same process.
+ * Exhaustion removes proof, not transport availability. */
+static pid_t tier1_stream_owner;
+static uint64 tier1_stream_next;
+static uint64 tier1_stream_serial[CLUSTER_MAX_NODES];
+static bool tier1_stream_exhausted;
+
+static void
+tier1_stream_bind(int32 peer)
+{
+	pid_t self = getpid();
+	if (tier1_stream_owner != self) {
+		/* Inherited parent descriptors/stamps are not this child's proof. */
+		tier1_stream_owner = self;
+		tier1_stream_next = 0;
+		tier1_stream_exhausted = false;
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
+	}
+	if (tier1_stream_next == PG_UINT64_MAX)
+		tier1_stream_exhausted = true;
+	tier1_stream_serial[peer] = tier1_stream_exhausted ? 0 : ++tier1_stream_next;
+}
+
 /*
  * Per-peer recv buffer for accumulating partial ClusterMsgHeader frames
  * across multiple WL_SOCKET_READABLE wakeups.  TCP can deliver bytes
@@ -482,6 +506,54 @@ cluster_ic_tier1_normal_stop_poll(int *peer_out, const char **reason_out)
 	return result;
 }
 
+bool
+cluster_ic_tier1_stream_capture(int32 peer, ClusterICTier1Stream *out)
+{
+	uint64 epoch;
+	int worker = AmLmsProcess()
+					 ? 0
+					 : (AmLmsWorkerProcess() ? ClusterLmsWorkerIdForType(MyAuxProcType) : -1);
+	if (out == NULL)
+		return false;
+	memset(out, 0, sizeof(*out));
+	if (!IsUnderPostmaster || MyProcPid != getpid() || tier1_stream_owner != getpid()
+		|| tier1_stream_exhausted || peer < 0 || peer >= CLUSTER_MAX_NODES
+		|| !tier1_peer_fds_initialised
+		|| (AmLmonProcess() ? tier1_my_plane != CLUSTER_IC_PLANE_CONTROL
+							: (worker < 0 || tier1_my_plane != CLUSTER_IC_PLANE_DATA
+							   || tier1_my_data_channel != worker || tier1_my_n_workers <= worker
+							   || tier1_my_n_workers > CLUSTER_IC_TIER1_DATA_CHANNELS)))
+		return false;
+	if (Tier1Shmem == NULL
+		|| Tier1Shmem != Tier1ShmemSlots[tier1_slot_of(tier1_my_plane, tier1_my_data_channel)]
+		|| Tier1Shmem->magic != PGRAC_IC_TIER1_SHMEM_MAGIC || tier1_peer_fds[peer] < 0
+		|| tier1_stream_serial[peer] == 0
+		|| Tier1Shmem->peers[peer].state != CLUSTER_IC_PEER_CONNECTED
+		|| tier1_hello_send_remaining[peer] != 0)
+		return false;
+	epoch = cluster_epoch_get_current();
+	if (epoch == 0
+		|| (tier1_my_plane == CLUSTER_IC_PLANE_DATA && Tier1Shmem->peers[peer].conn_epoch != epoch))
+		return false;
+	out->serial = tier1_stream_serial[peer];
+	out->epoch = epoch;
+	out->owner_pid = MyProcPid;
+	out->peer = peer;
+	out->plane = tier1_my_plane;
+	out->channel = tier1_my_plane == CLUSTER_IC_PLANE_DATA ? tier1_my_data_channel : -1;
+	return true;
+}
+
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream)
+{
+	ClusterICTier1Stream current;
+	return stream != NULL && cluster_ic_tier1_stream_capture(stream->peer, &current)
+		   && current.serial == stream->serial && current.epoch == stream->epoch
+		   && current.owner_pid == stream->owner_pid && current.plane == stream->plane
+		   && current.channel == stream->channel;
+}
+
 
 /* ============================================================
  * Static helpers.
@@ -750,6 +822,8 @@ cluster_ic_tier1_set_my_plane(ClusterICPlane plane)
 	int slot;
 
 	Assert(plane >= 0 && plane < CLUSTER_IC_PLANE_N);
+	if (plane != tier1_my_plane)
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 	tier1_my_plane = plane;
 	/* set_my_plane alone keeps the DATA channel at its current value (0 =
 	 * worker 0 by default);  set_my_data_channel selects a worker channel. */
@@ -773,6 +847,9 @@ cluster_ic_tier1_set_my_data_channel(int channel, int n_workers)
 	Assert(channel >= 0 && channel < CLUSTER_IC_TIER1_DATA_CHANNELS);
 	Assert(n_workers >= 1 && n_workers <= CLUSTER_IC_TIER1_DATA_CHANNELS);
 
+	if (tier1_my_plane != CLUSTER_IC_PLANE_DATA || tier1_my_data_channel != channel
+		|| tier1_my_n_workers != n_workers)
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 	tier1_my_plane = CLUSTER_IC_PLANE_DATA;
 	tier1_my_data_channel = channel;
 	tier1_my_n_workers = n_workers;
@@ -1613,6 +1690,7 @@ tier1_tier_shutdown(void)
 	int i;
 
 	peer_fds_lazy_init();
+	memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (tier1_peer_fds[i] >= 0) {
@@ -1917,6 +1995,7 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 	}
 
 	tier1_peer_fds[peer_id] = fd;
+	tier1_stream_bind(peer_id);
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTING;
 	if (out_peer_fd != NULL)
 		*out_peer_fd = fd;
@@ -2338,6 +2417,7 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	if (peer_id < 0) {
 		peer_id = msg.source_node_id;
 		tier1_peer_fds[peer_id] = peer_fd;
+		tier1_stream_bind(peer_id);
 	}
 
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
@@ -2559,6 +2639,7 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 	/* Bind learned peer_id; record state CONNECTED. */
 	learned = msg.source_node_id;
 	tier1_peer_fds[learned] = peer_fd;
+	tier1_stream_bind(learned);
 	if (Tier1Shmem != NULL) {
 		peer_record_error(learned, 0, "", "%s", ""); /* clear any prior */
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
@@ -2903,6 +2984,7 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
+	tier1_stream_serial[peer_id] = 0;
 
 	if (tier1_peer_fds[peer_id] >= 0) {
 		(void)close(tier1_peer_fds[peer_id]);

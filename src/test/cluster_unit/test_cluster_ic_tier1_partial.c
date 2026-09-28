@@ -55,6 +55,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "cluster/cluster_conf.h"
@@ -181,10 +182,11 @@ cluster_conf_lookup_node(int32 node_id)
 	return NULL;
 }
 
+static uint64 ut_epoch = 1;
 uint64
 cluster_epoch_get_current(void)
 {
-	return 1;
+	return ut_epoch;
 }
 
 static TimestampTz ut_now;
@@ -341,6 +343,8 @@ cstring_to_text(const char *s)
  * the test never receives an envelope, so these are vacuous. */
 bool cluster_ic_suppress_caps_reply = false;
 static uint64 ut_dispatch_count = 0;
+static bool ut_hello_valid;
+static ClusterICHelloMsg ut_hello;
 #ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
 static ClusterICSendResult (*ut_send_envelope_hook)(uint8, int32, const void *, uint32);
 #endif
@@ -349,8 +353,8 @@ bool
 cluster_ic_parse_hello(const uint8 in_buf[PGRAC_IC_HELLO_BYTES], ClusterICHelloMsg *out_msg)
 {
 	(void)in_buf;
-	(void)out_msg;
-	return false;
+	*out_msg = ut_hello;
+	return ut_hello_valid;
 }
 
 void
@@ -578,6 +582,7 @@ static int ut_rx2_fd = -1;			  /* second peer: our end */
 static char ut_acc[64 * 1024 * 1024]; /* shared stream accumulator */
 static long ut_junk_a = 0;			  /* junk bytes written ahead of frame A / frame B */
 static long ut_junk_b = 0;
+static ClusterICTier1Stream ut_first_stream;
 
 static ClusterNormalStopPollResult
 ut_stop_poll(void)
@@ -634,6 +639,41 @@ UT_TEST(test_connect_registers_peer_fd)
 	UT_ASSERT(cluster_ic_tier1_finish_connect(UT_PEER_ID, ut_tx_fd));
 	UT_ASSERT(cluster_ic_tier1_hello_send_remaining(UT_PEER_ID) == 0);
 	(void)close(listener);
+}
+
+UT_TEST(test_stream_capture_is_actual_native_connected_owner)
+{
+	ClusterICTier1Stream stream;
+	int saved_pid = MyProcPid;
+	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &ut_first_stream));
+	UT_ASSERT(ut_first_stream.serial != 0);
+	UT_ASSERT_EQ(ut_first_stream.owner_pid, getpid());
+	UT_ASSERT_EQ(ut_first_stream.plane, CLUSTER_IC_PLANE_CONTROL);
+	UT_ASSERT(cluster_ic_tier1_stream_current(&ut_first_stream));
+	UT_ASSERT(!cluster_ic_tier1_stream_capture(-1, &stream));
+	UT_ASSERT_EQ(stream.serial, 0);
+	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, NULL));
+	UT_ASSERT(!cluster_ic_tier1_stream_current(NULL));
+	UT_ASSERT(!cluster_ic_tier1_stream_capture(7, &stream));
+	MyProcPid = saved_pid + 1;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
+	MyProcPid = saved_pid;
+	MyAuxProcType = CheckpointerProcess;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
+	MyAuxProcType = LmonProcess;
+	IsUnderPostmaster = false;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
+	IsUnderPostmaster = true;
+	Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_CONNECTING;
+	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
+	Tier1Shmem->peers[UT_PEER_ID].state = CLUSTER_IC_PEER_CONNECTED;
+	tier1_hello_send_remaining[UT_PEER_ID] = 1;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
+	tier1_hello_send_remaining[UT_PEER_ID] = 0;
+	++ut_epoch;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
+	--ut_epoch;
+	UT_ASSERT(cluster_ic_tier1_stream_current(&ut_first_stream));
 }
 
 UT_TEST(test_initial_eagain_queues_full_frame)
@@ -753,7 +793,8 @@ UT_TEST(test_drain_on_dead_peer_hard_errors)
  * ============================================================ */
 
 /* T-9: bring the peer back up after T-7 closed it (fresh wire). */
-UT_TEST(test_reconnect_after_close)
+static void
+ut_reconnect_peer(void)
 {
 	int listener;
 	int port;
@@ -765,9 +806,14 @@ UT_TEST(test_reconnect_after_close)
 	listener = ut_open_listener(&port);
 	snprintf(ut_peer_info.interconnect_addr, sizeof(ut_peer_info.interconnect_addr), "127.0.0.1:%d",
 			 port);
+	snprintf(ut_peer_info.data_addr, sizeof(ut_peer_info.data_addr), "127.0.0.1:%d", port);
 
 	UT_ASSERT(cluster_ic_tier1_connect_one(UT_PEER_ID, &ut_tx_fd));
 	UT_ASSERT(ut_tx_fd >= 0);
+	if (ut_tx_fd < 0) {
+		close(listener);
+		return;
+	}
 
 	ut_rx_fd = accept(listener, (struct sockaddr *)&sa, &salen);
 	UT_ASSERT(ut_rx_fd >= 0);
@@ -784,6 +830,11 @@ UT_TEST(test_reconnect_after_close)
 	/* Drain the fresh-connection HELLO off the wire so the multi-frame
 	 * legs below start from a clean, empty stream. */
 	(void)ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, (long)sizeof(ut_acc));
+}
+
+UT_TEST(test_reconnect_after_close)
+{
+	ut_reconnect_peer();
 }
 
 /*
@@ -824,6 +875,18 @@ UT_TEST(test_recv_drain_yields_after_bounded_frames)
 
 	UT_ASSERT(cluster_ic_tier1_recv_heartbeat_drain(UT_PEER_ID, ut_tx_fd));
 	UT_ASSERT_EQ(ut_dispatch_count, 66);
+}
+
+UT_TEST(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity)
+{
+	ClusterICTier1Stream current;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
+	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &current));
+	UT_ASSERT_EQ(current.epoch, ut_first_stream.epoch);
+	UT_ASSERT(current.serial != ut_first_stream.serial);
+	Tier1Shmem->peers[UT_PEER_ID].reconnect_count = 0;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&ut_first_stream));
+	UT_ASSERT(cluster_ic_tier1_stream_current(&current));
 }
 
 /* A bounded pre-expiry read must not treat an empty socket or unverified
@@ -1240,13 +1303,120 @@ UT_TEST(test_stop_poll_malformed_state_overrides_earlier_pending)
 	UT_ASSERT_EQ(ut_stop_poll(), CLUSTER_NORMAL_STOP_READY);
 }
 
+UT_TEST(test_stream_accept_bindings_do_not_reuse_fd_identity)
+{
+	int sockets[2], learned = -1;
+	char hello[PGRAC_IC_HELLO_BYTES] = { 0 };
+	ClusterICTier1Stream first, next;
+	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	if (ut_rx_fd >= 0)
+		close(ut_rx_fd);
+	ut_rx_fd = -1;
+	UT_ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets), 0);
+	memset(&ut_hello, 0, sizeof(ut_hello));
+	ut_hello.hello_version = PGRAC_IC_HELLO_VERSION_V1;
+	ut_hello.envelope_version = PGRAC_IC_ENVELOPE_VERSION_V1;
+	ut_hello.source_node_id = UT_PEER_ID;
+	ut_hello_valid = true;
+	UT_ASSERT_EQ(send(sockets[1], hello, sizeof(hello), 0), sizeof(hello));
+	UT_ASSERT(cluster_ic_tier1_recv_and_verify_hello(-1, sockets[0]));
+	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &first));
+	UT_ASSERT_EQ(cluster_ic_tier1_get_peer_fd(UT_PEER_ID), sockets[0]);
+	/* Native anonymous binding executes again on the identical descriptor:
+	 * a saved stamp may never mistake rebinding for the original stream.
+	 * HELLO parsing is the explicit boundary stub, not authentication proof. */
+	UT_ASSERT_EQ(send(sockets[1], hello, sizeof(hello), 0), sizeof(hello));
+	cluster_ic_tier1_anon_hello_reset(0);
+	UT_ASSERT(cluster_ic_tier1_continue_hello_recv(0, sockets[0], &learned));
+	UT_ASSERT_EQ(learned, UT_PEER_ID);
+	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &next));
+	UT_ASSERT(next.serial != first.serial);
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&first));
+	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&next));
+	close(sockets[1]);
+	ut_hello_valid = false;
+}
+
+UT_TEST(test_stream_data_epoch_role_and_native_fork)
+{
+	ClusterICTier1Stream stream;
+	pid_t child;
+	int status;
+	MyAuxProcType = LmsProcess;
+	cluster_ic_tier1_set_my_data_channel(0, 1);
+	ut_reconnect_peer();
+	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
+	UT_ASSERT_EQ(stream.plane, CLUSTER_IC_PLANE_DATA);
+	UT_ASSERT_EQ(stream.channel, 0);
+	MyAuxProcType = LmsWorker1Process;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
+	MyAuxProcType = LmsProcess;
+	++ut_epoch;
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
+	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, &ut_first_stream));
+	--ut_epoch;
+	child = fork();
+	UT_ASSERT(child >= 0);
+	if (child == 0) {
+		ClusterICTier1Stream inherited;
+		MyProcPid = getpid();
+		_exit(cluster_ic_tier1_stream_current(&stream)
+			  || cluster_ic_tier1_stream_capture(UT_PEER_ID, &inherited));
+	}
+	if (child > 0) {
+		UT_ASSERT_EQ(waitpid(child, &status, 0), child);
+		UT_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	}
+	UT_ASSERT(cluster_ic_tier1_stream_current(&stream));
+	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
+	cluster_ic_tier1_set_my_data_channel(0, 1);
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
+	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	close(ut_rx_fd);
+	ut_rx_fd = -1;
+	MyAuxProcType = LmonProcess;
+	cluster_ic_tier1_set_my_plane(CLUSTER_IC_PLANE_CONTROL);
+}
+
+UT_TEST(test_stream_shutdown_and_exhaustion_never_wrap)
+{
+	ClusterICTier1Stream stream;
+	ut_reconnect_peer();
+	UT_ASSERT(cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
+	ClusterICOps_Tier1.tier_shutdown();
+	UT_ASSERT(!cluster_ic_tier1_stream_current(&stream));
+	close(ut_rx_fd);
+	ut_rx_fd = -1;
+	/* Exact private overflow injection, followed by a real new connection. */
+	tier1_stream_next = PG_UINT64_MAX;
+	ut_reconnect_peer();
+	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
+	UT_ASSERT_EQ(stream.serial, 0);
+	UT_ASSERT(tier1_stream_exhausted);
+	UT_ASSERT_EQ(ClusterICOps_Tier1.send_bytes(UT_PEER_ID, "still live", 10), CLUSTER_IC_SEND_DONE);
+	UT_ASSERT_EQ(ut_drain_all_and_sweep(UT_PEER_ID, ut_rx_fd, ut_acc, sizeof(ut_acc)), 10);
+	UT_ASSERT(memcmp(ut_acc, "still live", 10) == 0);
+	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	close(ut_rx_fd);
+	ut_rx_fd = -1;
+	ut_reconnect_peer();
+	UT_ASSERT(!cluster_ic_tier1_stream_capture(UT_PEER_ID, &stream));
+	UT_ASSERT_EQ(tier1_stream_next, PG_UINT64_MAX);
+	cluster_ic_tier1_close_peer(UT_PEER_ID, NULL);
+	close(ut_rx_fd);
+	ut_rx_fd = -1;
+}
+
 int
 main(void)
 {
-	UT_PLAN(20);
+	MyProcPid = getpid();
+	UT_PLAN(25);
 
 	UT_RUN(test_stop_poll_requires_initialized_actual_plane_owner);
 	UT_RUN(test_connect_registers_peer_fd);
+	UT_RUN(test_stream_capture_is_actual_native_connected_owner);
 	UT_RUN(test_initial_eagain_queues_full_frame);
 	UT_RUN(test_drain_delivers_frame_a_intact);
 	UT_RUN(test_smaller_frame_reuses_grown_buffer);
@@ -1255,6 +1425,7 @@ main(void)
 	UT_RUN(test_close_peer_resets_queued_tail);
 	UT_RUN(test_drain_on_dead_peer_hard_errors);
 	UT_RUN(test_reconnect_after_close);
+	UT_RUN(test_stream_reconnect_is_not_same_epoch_or_diagnostic_identity);
 	UT_RUN(test_recv_drain_yields_after_bounded_frames);
 	UT_RUN(test_empty_and_partial_receive_do_not_renew_heartbeat);
 	UT_RUN(test_stop_poll_real_partial_envelope_and_payload);
@@ -1265,6 +1436,9 @@ main(void)
 	UT_RUN(test_fifo_full_refuses_honestly);
 	UT_RUN(test_close_peer_clears_fifo);
 	UT_RUN(test_stop_poll_owner_channel_and_idle_capacity);
+	UT_RUN(test_stream_accept_bindings_do_not_reuse_fd_identity);
+	UT_RUN(test_stream_data_epoch_role_and_native_fork);
+	UT_RUN(test_stream_shutdown_and_exhaustion_never_wrap);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

@@ -460,6 +460,7 @@ test_cluster_config_use_gate: test_cluster_config_use_gate.c unit_test.h \
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_config_members: test_cluster_config_members.c unit_test.h \
 		$(top_builddir)/src/backend/cluster/cluster_config_members.o \
+		$(top_srcdir)/src/include/cluster/cluster_ic_tier1.h \
 		$(top_srcdir)/src/include/cluster/cluster_config_members.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_config_members.o \
 		$(top_builddir)/src/common/sha2_srv.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
@@ -4130,6 +4131,7 @@ test_cluster_ic_chunk_stop: test_cluster_ic_chunk_stop.c unit_test.h \
 # frame survives a pending tail, submission order preserved, cross-peer
 # isolation).
 test_cluster_ic_tier1_partial: test_cluster_ic_tier1_partial.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic_tier1.h \
 		$(CLUSTER_VERSION_O) $(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(CLUSTER_VERSION_O) \
@@ -4139,6 +4141,7 @@ test_cluster_ic_tier1_partial: test_cluster_ic_tier1_partial.c unit_test.h \
 # PGRAC: actual control retirement across the real TCP tail/FIFO and reconnect.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_control_transport: test_cluster_control_transport.c test_cluster_ic_tier1_partial.c unit_test.h \
+		$(top_srcdir)/src/include/cluster/cluster_ic_tier1.h \
 		$(CLUSTER_VERSION_O) $(CLUSTER_CONTROL_REQUEST_O) $(CLUSTER_CONTROL_RETIRE_O) \
 		$(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c \
 		$(top_srcdir)/src/backend/cluster/cluster_grd_outbound.c \

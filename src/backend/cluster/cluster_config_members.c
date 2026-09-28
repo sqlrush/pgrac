@@ -15,6 +15,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
 #include "miscadmin.h"
 #include "../../common/sha2_int.h"
@@ -24,6 +25,7 @@ static struct {
 	bool active;
 	uint64 incarnation[CLUSTER_MAX_NODES];
 	uint32 connection[CLUSTER_MAX_NODES];
+	ClusterICTier1Stream stream[CLUSTER_MAX_NODES];
 	ClusterConfigMembersObservation report;
 } member_round;
 
@@ -293,8 +295,9 @@ round_current(void)
 		return false;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node)
 		if (in_set(key.required, node) && node != (uint32)cluster_node_id
-			&& !cluster_sf_peer_capability_generation_matches(
-				node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1, member_round.connection[node]))
+			&& (!cluster_ic_tier1_stream_current(&member_round.stream[node])
+				|| !cluster_sf_peer_capability_generation_matches(
+					node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1, member_round.connection[node])))
 			return false;
 	return true;
 }
@@ -362,6 +365,7 @@ cluster_config_members_poll(const ClusterSharedConfigRef *selected,
 	ClusterConfigMembersKey key, current;
 	ClusterR4MembershipSnapshot fresh;
 	uint32 connection[CLUSTER_MAX_NODES] = { 0 };
+	ClusterICTier1Stream stream[CLUSTER_MAX_NODES] = { 0 };
 	if (!local_role())
 		return;
 	if (!make_key(selected, members, &key) || !cluster_reconfig_lmon_snapshot_r4_membership(&fresh)
@@ -370,8 +374,9 @@ cluster_config_members_poll(const ClusterSharedConfigRef *selected,
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
 		uint32 word;
 		if (in_set(key.required, node) && node != (uint32)cluster_node_id
-			&& !cluster_sf_peer_capability_word_sample(node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1,
-													   &word, &connection[node]))
+			&& (!cluster_ic_tier1_stream_capture(node, &stream[node])
+				|| !cluster_sf_peer_capability_word_sample(
+					node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1, &word, &connection[node])))
 			goto unavailable;
 	}
 	if (!member_round.active || !round_current() || complete()
@@ -385,6 +390,7 @@ cluster_config_members_poll(const ClusterSharedConfigRef *selected,
 		memcpy(member_round.incarnation, fresh.admitted_incarnation,
 			   sizeof(member_round.incarnation));
 		memcpy(member_round.connection, connection, sizeof(connection));
+		memcpy(member_round.stream, stream, sizeof(stream));
 		member_round.active = true;
 	}
 	/* Native capture precedes remote sends. A membership change in capture

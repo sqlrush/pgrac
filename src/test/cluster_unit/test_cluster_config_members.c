@@ -17,6 +17,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
 #include "cluster/cluster_ic_router.h"
+#include "cluster/cluster_ic_tier1.h"
 #include "cluster/cluster_sf_dep.h"
 #include "miscadmin.h"
 #undef printf
@@ -29,6 +30,8 @@ int cluster_node_id;
 static ClusterSharedConfigRef target;
 static ClusterR4MembershipSnapshot live;
 static uint32 connections[CLUSTER_MAX_NODES];
+static uint64 streams[CLUSTER_MAX_NODES];
+static bool stream_available, stream_change_during_census;
 static bool member_available, census_available, change_during_census, caps_available, random_ok;
 static unsigned sends, captures;
 static uint64 nonce_source;
@@ -72,6 +75,24 @@ cluster_sf_peer_capability_generation_matches(int32 node, uint32 bits, uint32 ge
 {
 	return caps_available && bits == UINT32_C(0x00800000) && connections[node] == gen;
 }
+/* Explicit transport boundary; actual stream binding/retirement has real
+ * TCP tests, not a fabricated capability counter in this collector test. */
+bool
+cluster_ic_tier1_stream_capture(int32 node, ClusterICTier1Stream *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (!stream_available)
+		return false;
+	out->peer = node;
+	out->serial = streams[node];
+	return true;
+}
+bool
+cluster_ic_tier1_stream_current(const ClusterICTier1Stream *stream)
+{
+	return stream_available && stream->peer >= 0 && stream->peer < CLUSTER_MAX_NODES
+		   && stream->serial != 0 && stream->serial == streams[stream->peer];
+}
 bool
 pg_strong_random(void *out, size_t len)
 {
@@ -105,6 +126,8 @@ cluster_shared_config_node_census(const ClusterSharedConfigRef *ref, int node,
 	out->ref = *ref;
 	if (change_during_census)
 		++live.formation_epoch;
+	if (stream_change_during_census)
+		++streams[3];
 	return census_available;
 }
 ClusterICSendResult
@@ -152,6 +175,8 @@ reset(void)
 	cluster_enabled = cluster_shared_config = true;
 	member_available = census_available = caps_available = random_ok = true;
 	change_during_census = false;
+	stream_available = true;
+	stream_change_during_census = false;
 	census_error = send_error = false;
 	send_result = CLUSTER_IC_SEND_DONE;
 	sends = captures = 0;
@@ -171,8 +196,10 @@ reset(void)
 	memset(target.identity.storage_uuid, 0x11, 16);
 	memset(target.identity.authority_uuid, 0x22, 16);
 	memset(target.sha256, 0x55, 32);
-	for (unsigned i = 0; i < CLUSTER_MAX_NODES; ++i)
+	for (unsigned i = 0; i < CLUSTER_MAX_NODES; ++i) {
 		connections[i] = 1;
+		streams[i] = 1;
+	}
 }
 static void
 deliver(const ClusterConfigMembersMessage *m, int source, uint64 epoch)
@@ -441,6 +468,38 @@ UT_TEST(ordinary_refresh_does_not_churn_identity)
 	cluster_config_members_poll(&target, &live);
 	UT_ASSERT_EQ(sent[3].nonce, nonce);
 }
+UT_TEST(native_stream_replacement_retires_same_capability_generation)
+{
+	ClusterConfigMembersMessage old;
+	reset();
+	cluster_config_members_poll(&target, &live);
+	old = reply(3);
+	++streams[3]; /* Same epoch, member and legacy uint32 diagnostic. */
+	deliver(&old, 3, 7);
+	UT_ASSERT(!cluster_config_members_observe(&observation));
+	UT_ASSERT(zero(&observation, sizeof(observation)));
+	cluster_config_members_poll(&target, &live);
+	UT_ASSERT(sent[3].nonce != old.nonce);
+	deliver(&old, 3, 7);
+	UT_ASSERT(cluster_config_members_observe(&observation));
+	UT_ASSERT_EQ(observation.observed[0], 1);
+}
+UT_TEST(no_native_stream_is_not_capability_proof)
+{
+	reset();
+	stream_available = false;
+	cluster_config_members_poll(&target, &live);
+	UT_ASSERT_EQ(sends, 0);
+	UT_ASSERT(!cluster_config_members_observe(&observation));
+}
+UT_TEST(native_stream_changed_during_census_cannot_send)
+{
+	reset();
+	stream_change_during_census = true;
+	cluster_config_members_poll(&target, &live);
+	UT_ASSERT_EQ(sends, 0);
+	UT_ASSERT(!cluster_config_members_observe(&observation));
+}
 UT_TEST(changed_selection_cancels_old_reply)
 {
 	ClusterConfigMembersMessage old;
@@ -586,7 +645,7 @@ UT_TEST(ingress_error_retires_observation)
 int
 main(void)
 {
-	UT_PLAN(19);
+	UT_PLAN(22);
 	UT_RUN(literal_request);
 	UT_RUN(sparse_members_and_retry);
 	UT_RUN(reply_counts_and_profiles);
@@ -597,6 +656,9 @@ main(void)
 	UT_RUN(send_refusal_never_completes);
 	UT_RUN(member_change_retires_round);
 	UT_RUN(connection_change_retires_round);
+	UT_RUN(native_stream_replacement_retires_same_capability_generation);
+	UT_RUN(no_native_stream_is_not_capability_proof);
+	UT_RUN(native_stream_changed_during_census_cannot_send);
 	UT_RUN(ordinary_refresh_does_not_churn_identity);
 	UT_RUN(changed_selection_cancels_old_reply);
 	UT_RUN(no_partial_membership_or_missing_capability);
