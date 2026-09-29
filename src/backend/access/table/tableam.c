@@ -709,8 +709,11 @@ table_block_relation_size(Relation rel, ForkNumber forkNumber)
 	/* InvalidForkNumber indicates returning the size for all forks */
 	if (forkNumber == InvalidForkNumber)
 	{
-		for (int i = 0; i < MAX_FORKNUM; i++)
-			nblocks += smgrnblocks(RelationGetSmgr(rel), i);
+		/* PGRAC: INIT is not necessarily the highest numbered fork.
+		 * Preserve its native exclusion while including SPACE metadata. */
+		for (int i = 0; i <= MAX_FORKNUM; i++)
+			if (i != INIT_FORKNUM)
+				nblocks += smgrnblocks(RelationGetSmgr(rel), i);
 	}
 	else
 		nblocks = smgrnblocks(RelationGetSmgr(rel), forkNumber);

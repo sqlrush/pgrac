@@ -51,6 +51,7 @@ OBJS_COMMON = \
 	base64.o \
 	checksum_helper.o \
 	cluster_hw_snapshot_codec.o \
+	cluster_space_identity.o \
 	cluster_undo_segment_init.o \
 	compression.o \
 	config_info.o \

@@ -34,7 +34,11 @@ const char *const forkNames[] = {
 	"main",						/* MAIN_FORKNUM */
 	"fsm",						/* FSM_FORKNUM */
 	"vm",						/* VISIBILITYMAP_FORKNUM */
-	"init"						/* INIT_FORKNUM */
+	"init",						/* INIT_FORKNUM */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: dedicated persistent metadata, not an extra ordinary data fork. */
+	"space"						/* SPACE_FORKNUM */
+#endif
 };
 
 StaticAssertDecl(lengthof(forkNames) == (MAX_FORKNUM + 1),
@@ -60,7 +64,11 @@ forkname_to_number(const char *forkName)
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 			 errmsg("invalid fork name"),
 			 errhint("Valid fork names are \"main\", \"fsm\", "
+#ifdef USE_PGRAC_CLUSTER
+					 "\"vm\", \"init\", and \"space\".")));
+#else
 					 "\"vm\", and \"init\".")));
+#endif
 #endif
 
 	return InvalidForkNumber;

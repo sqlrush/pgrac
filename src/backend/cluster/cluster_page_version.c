@@ -227,6 +227,11 @@ cluster_page_classify(const ClusterPageClassifyInput *input)
 	if (input == NULL)
 		return CLUSTER_PAGE_CLASS_UNKNOWN;
 
+	/* PGRAC: SPACE cannot borrow an ordinary rmgr's registration or FPI.
+	 * Only its declared typed SIDE owner can interpret lifecycle metadata. */
+	if (input->forknum == SPACE_FORKNUM && input->header_owner != CLUSTER_PAGE_HEADER_OWNER_SIDE)
+		return CLUSTER_PAGE_CLASS_UNKNOWN;
+
 	/*
 	 * Multi-match guards first: any combination of two row-owners is
 	 * ambiguous and therefore UNKNOWN (spec §4.1 "multi-match ... BLOCKED").

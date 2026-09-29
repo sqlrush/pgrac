@@ -124,6 +124,7 @@
 #define BUFPAGE_H
 
 #include "access/xlogdefs.h"
+#include "common/relpath.h"
 #include "storage/block.h"
 #include "storage/item.h"
 #include "storage/off.h"
@@ -356,7 +357,9 @@ typedef PageHeaderData *PageHeader;
 #define PD_LSN_ORIGIN_SHIFT 7
 #define PD_LSN_ORIGIN_MASK 0x0780
 #define PGRAC_PAGE_LSN_ORIGIN_MAX 15
-#define PD_VALID_FLAG_BITS 0x07FF /* OR of all valid pd_flags bits */
+/* PGRAC: SPACE is disjoint from ITL, undo-header and qualified LSN bits. */
+#define PD_SPACE_METADATA 0x0800
+#define PD_VALID_FLAG_BITS 0x0FFF /* OR of all valid pd_flags bits */
 #else
 #define PD_VALID_FLAG_BITS 0x0007 /* OR of all valid pd_flags bits */
 #endif
@@ -923,6 +926,9 @@ PageIsUndoSegmentHeader(Page page)
 }
 #endif
 extern bool PageIsVerifiedExtended(Page page, BlockNumber blkno, int flags);
+/* PGRAC: bind the page type to its actual storage fork on read. */
+extern bool PageIsVerifiedForFork(Page page, ForkNumber forknum,
+								  BlockNumber blkno, int flags);
 extern OffsetNumber PageAddItemExtended(Page page, Item item, Size size, OffsetNumber offsetNumber,
 										int flags);
 extern Page PageGetTempPage(Page page);

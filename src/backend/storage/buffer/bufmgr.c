@@ -5494,7 +5494,7 @@ ReadBuffer_common(SMgrRelation smgr, char relpersistence, ForkNumber forkNum,
 								IOOP_READ, io_start, 1);
 
 		/* check for garbage data */
-		verified = PageIsVerifiedExtended((Page) bufBlock, blockNum,
+		verified = PageIsVerifiedForFork((Page) bufBlock, forkNum, blockNum,
 										  PIV_LOG_WARNING | PIV_REPORT_STAT);
 
 #ifdef USE_PGRAC_CLUSTER
@@ -12615,7 +12615,7 @@ cluster_bufmgr_read_storage_scn_for_gcs(BufferTag tag, SCN *out_page_scn)
 
 	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
 	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-	if (!PageIsVerifiedExtended((Page) scratch.data, tag.blockNum,
+	if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		return false;
 
@@ -12644,7 +12644,7 @@ cluster_bufmgr_read_storage_image_for_resource_x(
 
 	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
 	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-	if (!PageIsVerifiedExtended(page, tag.blockNum,
+	if (!PageIsVerifiedForFork(page, BufTagGetForkNum(&tag), tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		return false;
 	memcpy(block_data, scratch.data, BLCKSZ);
@@ -14916,7 +14916,7 @@ cluster_bufmgr_refresh_block_from_storage_for_gcs(BufferDesc *buf, SCN *out_page
 	 */
 	reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
 	smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-	if (!PageIsVerifiedExtended((Page) scratch.data, tag.blockNum,
+	if (!PageIsVerifiedForFork((Page) scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT))
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
@@ -15526,7 +15526,7 @@ cluster_bufmgr_pcm_own_prepare_n_source_image(BufferDesc *buf,
 	{
 		reln = smgropen(BufTagGetRelFileLocator(&tag), InvalidBackendId);
 		smgrread(reln, BufTagGetForkNum(&tag), tag.blockNum, scratch.data);
-		if (!PageIsVerifiedExtended((Page)scratch.data, tag.blockNum,
+		if (!PageIsVerifiedForFork((Page)scratch.data, BufTagGetForkNum(&tag), tag.blockNum,
 									PIV_LOG_WARNING | PIV_REPORT_STAT))
 		{
 			result = CLUSTER_PCM_OWN_CORRUPT;
@@ -15914,7 +15914,7 @@ cluster_bufmgr_pcm_own_prepare_s_source_image(
 		reln = smgropen(BufTagGetRelFileLocator(&expected_s->tag), InvalidBackendId);
 		smgrread(reln, BufTagGetForkNum(&expected_s->tag), expected_s->tag.blockNum,
 				 scratch.data);
-		if (!PageIsVerifiedExtended(storage_page, expected_s->tag.blockNum,
+		if (!PageIsVerifiedForFork(storage_page, BufTagGetForkNum(&expected_s->tag), expected_s->tag.blockNum,
 								PIV_LOG_WARNING | PIV_REPORT_STAT)) {
 			hard_failure_reason = CLUSTER_PCM_S_SOURCE_HARD_STORAGE_VERIFY;
 			result = CLUSTER_PCM_OWN_CORRUPT;

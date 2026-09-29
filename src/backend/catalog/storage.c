@@ -551,7 +551,7 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 
 		smgrread(src, forkNum, blkno, buf.data);
 
-		if (!PageIsVerifiedExtended(page, blkno,
+		if (!PageIsVerifiedForFork(page, forkNum, blkno,
 									PIV_LOG_WARNING | PIV_REPORT_STAT))
 		{
 			/*
