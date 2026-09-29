@@ -119,6 +119,12 @@
 #include "storage/smgr.h"
 #include "utils/inval.h"
 
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
+
 
 
 /*#define TRACE_VISIBILITYMAP */
@@ -261,7 +267,7 @@ visibilitymap_pin(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	/* Reuse the old pinned buffer if possible */
 	if (BufferIsValid(*vmbuf))
 	{
-		if (BufferGetBlockNumber(*vmbuf) == mapBlock)
+		if (visibilitymap_pin_ok(heapBlk, *vmbuf))
 			return;
 
 		ReleaseBuffer(*vmbuf);
@@ -291,6 +297,15 @@ visibilitymap_pin_recent(Relation rel, BlockNumber heapBlk, Buffer recent_buffer
 	if (!ReadRecentBuffer(RelationGetSmgr(rel)->smgr_rlocator.locator,
 						  VISIBILITYMAP_FORKNUM, mapBlock, recent_buffer))
 		return false;
+#ifdef USE_PGRAC_CLUSTER
+	/* A read-only zero page has no versioned write base yet. Do not do I/O
+	 * below the caller's heap content lock; return to the original pin path. */
+	if (cluster_shared_config && PageIsNew(BufferGetPage(recent_buffer)))
+	{
+		ReleaseBuffer(recent_buffer);
+		return false;
+	}
+#endif
 	*vmbuf = recent_buffer;
 	return true;
 }
@@ -308,7 +323,13 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 
-	return BufferIsValid(vmbuf) && BufferGetBlockNumber(vmbuf) == mapBlock;
+	if (!BufferIsValid(vmbuf) || BufferGetBlockNumber(vmbuf) != mapBlock)
+		return false;
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && PageIsNew(BufferGetPage(vmbuf)))
+		return false;
+#endif
+	return true;
 }
 
 /*
@@ -610,6 +631,16 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 
 		LockBuffer(mapBuffer, BUFFER_LOCK_EXCLUSIVE);
 
+#ifdef USE_PGRAC_CLUSTER
+		/* A real zero VM tail already represents no visible blocks. Recheck
+		 * under authority, but do not create an unversioned dirty header. */
+		if (cluster_shared_config && PageIsNew(page))
+		{
+			UnlockReleaseBuffer(mapBuffer);
+			goto check_vm_size;
+		}
+#endif
+
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
 
@@ -647,6 +678,9 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 	else
 		newnblocks = truncBlock;
 
+#ifdef USE_PGRAC_CLUSTER
+check_vm_size:
+#endif
 	if (smgrnblocks(RelationGetSmgr(rel), VISIBILITYMAP_FORKNUM) <= newnblocks)
 	{
 		/* nothing to do, the file was already smaller than requested size */
@@ -667,30 +701,28 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 {
 	Buffer		buf;
 	SMgrRelation reln;
+	bool		versioned = false;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity identity;
+
+	versioned = cluster_shared_config && RelationIsPermanent(rel)
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	/* Cache miss can read SPACE; resolve before any VM pin/content lock. */
+	if (versioned && extend
+		&& (!RelationNeedsWAL(rel) || !cluster_space_relation_get_identity(rel, &identity)))
+		elog(ERROR, "shared VM initialization requires a live SPACE identity");
+#endif
 
 	/*
 	 * Caution: re-using this smgr pointer could fail if the relcache entry
 	 * gets closed.  It's safe as long as we only do smgr-level operations
 	 * between here and the last use of the pointer.
 	 */
-	reln = RelationGetSmgr(rel);
-
 	/*
-	 * If we haven't cached the size of the visibility map fork yet, check it
-	 * first.
-	 */
-	if (reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] == InvalidBlockNumber)
-	{
-		if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
-			smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
-		else
-			reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
-	}
-
-	/*
-	 * For reading we use ZERO_ON_ERROR mode, and initialize the page if
-	 * necessary. It's always safe to clear bits, so it's better to clear
-	 * corrupt pages than error out.
+	 * The native profile uses ZERO_ON_ERROR and initializes when necessary.
+	 * The versioned shared profile must preserve the actual predecessor:
+	 * corrupt storage refuses, while genuine zero pages stay read-only until
+	 * their write-pin owner records a versioned initialization.
 	 *
 	 * We use the same path below to initialize pages when extending the
 	 * relation, as a concurrent extension can end up with vm_extend()
@@ -698,6 +730,16 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 	 */
 	for (;;)
 	{
+		/* The init wait can release the pin and invalidate SMgr; reacquire
+		 * the original relation's mapping on every retry. */
+		reln = RelationGetSmgr(rel);
+		if (reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] == InvalidBlockNumber)
+		{
+			if (smgrexists(reln, VISIBILITYMAP_FORKNUM))
+				smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
+			else
+				reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM] = 0;
+		}
 		if (blkno >= reln->smgr_cached_nblocks[VISIBILITYMAP_FORKNUM])
 		{
 			if (extend)
@@ -707,7 +749,12 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 		}
 		else
 			buf = ReadBufferExtended(rel, VISIBILITYMAP_FORKNUM, blkno,
-									 RBM_ZERO_ON_ERROR, NULL);
+									 versioned ? RBM_NORMAL : RBM_ZERO_ON_ERROR, NULL);
+
+		/* Reads of a genuine zero page already return an all-clear bitmap;
+		 * they must not create an unlogged/unversioned initialization. */
+		if (versioned && !extend)
+			return buf;
 
 		/*
 		 * Initializing the page when needed is trickier than it looks, because
@@ -723,7 +770,17 @@ vm_readbuf(Relation rel, BlockNumber blkno, bool extend)
 			if (!BufferIsValid(buf))
 				continue;
 			if (PageIsNew(BufferGetPage(buf)))
-				PageInit(BufferGetPage(buf), BLCKSZ, 0);
+			{
+#ifdef USE_PGRAC_CLUSTER
+				if (versioned)
+				{
+					if (!cluster_space_init_vm_buffer_wal(&identity, buf))
+						elog(ERROR, "shared VM initialization requires a zero version base");
+				}
+				else
+#endif
+					PageInit(BufferGetPage(buf), BLCKSZ, 0);
+			}
 			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 		}
 		return buf;
@@ -738,12 +795,21 @@ static Buffer
 vm_extend(Relation rel, BlockNumber vm_nblocks)
 {
 	Buffer		buf;
+	ReadBufferMode mode = RBM_ZERO_ON_ERROR;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: a concurrent extension can return an existing target page.
+	 * Corruption there must not be converted into a fresh zero predecessor. */
+	if (cluster_shared_config && RelationIsPermanent(rel) &&
+		cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+		mode = RBM_NORMAL;
+#endif
 
 	buf = ExtendBufferedRelTo(BMR_REL(rel), VISIBILITYMAP_FORKNUM, NULL,
 							  EB_CREATE_FORK_IF_NEEDED |
 							  EB_CLEAR_SIZE_CACHE,
 							  vm_nblocks,
-							  RBM_ZERO_ON_ERROR);
+							  mode);
 
 	/*
 	 * Send a shared-inval message to force other backends to close any smgr

@@ -379,6 +379,25 @@ cluster_space_init_heap_buffer_wal(const ClusterSpaceIdentity *identity, Buffer 
 }
 
 bool
+cluster_space_init_vm_buffer_wal(const ClusterSpaceIdentity *identity, Buffer destination)
+{
+	PGAlignedBlock initialized;
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+
+	if (!BufferIsValid(destination) || BufferIsLocal(destination))
+		return false;
+	BufferGetTag(destination, &locator, &forknum, &block);
+	if (forknum != VISIBILITYMAP_FORKNUM)
+		return false;
+	/* VM has no heap tuples or ITL area. The buffered publisher proves the
+	 * actual zero predecessor and stamps this private native-layout image. */
+	PageInit(initialized.data, BLCKSZ, 0);
+	return cluster_space_copy_buffer_wal(identity, initialized.data, destination);
+}
+
+bool
 cluster_space_relation_create(RelFileLocator locator)
 {
 	ClusterSpaceWalChange change;

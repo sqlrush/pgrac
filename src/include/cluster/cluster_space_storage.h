@@ -70,6 +70,11 @@ extern bool cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, 
 extern bool cluster_space_init_heap_buffer_wal(const ClusterSpaceIdentity *identity,
 											   Buffer destination);
 
+/* Original VM write-pin initializer, with the same exact zero-before and WAL
+ * ownership contract. Publishes native VM layout, never heap/ITL layout. */
+extern bool cluster_space_init_vm_buffer_wal(const ClusterSpaceIdentity *identity,
+											 Buffer destination);
+
 /* Original recovery executor only, with its existing isolation and selected
  * WAL inputs. Decode/identity success is not recovery admission. False MUST
  * reject replay; an unsupported structural action is never silently skipped. */

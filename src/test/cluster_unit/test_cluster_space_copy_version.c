@@ -801,10 +801,53 @@ UT_TEST(test_heap_init_refuses_nonzero_new_page_and_wrong_fork)
 	UT_ASSERT_EQ(dirties, 0);
 }
 
+UT_TEST(test_vm_init_versions_zero_before_without_heap_layout)
+{
+	reset(VISIBILITYMAP_FORKNUM);
+	buffered = true;
+	data_pins[0] = data_pins[1] = data_locks[0] = data_locks[1] = true;
+	UT_ASSERT(cluster_space_init_vm_buffer_wal(&identity, 3));
+	UT_ASSERT(!PageHasItl(target_page.data));
+	UT_ASSERT_EQ(((PageHeader)target_page.data)->pd_special, BLCKSZ);
+	UT_ASSERT_EQ(((PageHeader)target_page.data)->pd_lower, SizeOfPageHeaderData);
+	UT_ASSERT_EQ(((PageHeader)target_page.data)->pd_block_scn, 100);
+	UT_ASSERT_EQ(entry.before_kind, RF_PAGE_STATE_UNFORMATTED);
+	UT_ASSERT_EQ(entry.before.mutation_token, 0);
+	UT_ASSERT(memcmp(entry.before.segment_incarnation, identity.incarnation, 16) == 0);
+	UT_ASSERT_EQ(entry.result_kind, RF_PAGE_STATE_PRESENT);
+	UT_ASSERT_EQ(PageGetLSN(target_page.data), 200);
+	UT_ASSERT_EQ(new_wal, 1);
+	UT_ASSERT_EQ(dirties, 1);
+	UT_ASSERT_EQ(flushes, 0);
+}
+
+UT_TEST(test_vm_init_refuses_nonzero_before_and_wrong_fork)
+{
+	PGAlignedBlock before;
+
+	reset(VISIBILITYMAP_FORKNUM);
+	buffered = true;
+	data_pins[0] = data_pins[1] = data_locks[0] = data_locks[1] = true;
+	target_page.data[BLCKSZ - 1] = 1;
+	before = target_page;
+	UT_ASSERT(!cluster_space_init_vm_buffer_wal(&identity, 3));
+	UT_ASSERT(memcmp(&before, &target_page, BLCKSZ) == 0);
+	memset(&target_page, 0, BLCKSZ);
+	test_fork = MAIN_FORKNUM;
+	UT_ASSERT(!cluster_space_init_vm_buffer_wal(&identity, 3));
+	test_fork = VISIBILITYMAP_FORKNUM;
+	identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	UT_ASSERT(!cluster_space_init_vm_buffer_wal(&identity, 3));
+	UT_ASSERT_EQ(new_wal, 0);
+	UT_ASSERT_EQ(dirties, 0);
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(15);
+	UT_RUN(test_vm_init_versions_zero_before_without_heap_layout);
+	UT_RUN(test_vm_init_refuses_nonzero_before_and_wrong_fork);
 	UT_RUN(test_heap_init_records_actual_zero_before_and_native_layout);
 	UT_RUN(test_heap_init_refuses_nonzero_new_page_and_wrong_fork);
 	UT_RUN(test_copy_main_has_new_identity_edge_and_wal_before_data);

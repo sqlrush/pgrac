@@ -69,7 +69,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_ic_mock test_cluster_inject test_cluster_pgstat \
         test_cluster_debug test_cluster_shared_fs test_cluster_shared_fs_sharedfs test_cluster_shared_fs_block_device test_cluster_raw_device_capacity test_cluster_smgr \
         test_cluster_scn test_cluster_scn_frontier test_cluster_block_format test_cluster_itl_slot \
-        test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version \
+        test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version \
         test_cluster_buffer_desc test_cluster_pcm_lock test_cluster_pcm_own test_cluster_pcm_direct_init test_cluster_resource_x_identity test_cluster_resource_x_node_wire test_cluster_resource_x_retry test_cluster_resource_x_handoff test_cluster_share_barrier test_cluster_heap_barrier test_cluster_bufmgr_pcm_hook test_cluster_gcs_dispatch test_cluster_gcs_block test_cluster_gcs_block_retransmit test_cluster_gcs_block_2way test_cluster_gcs_block_3way test_cluster_gcs_block_lost_write test_cluster_gcs_block_dedup_reclaim test_cluster_gcs_block_dedup_htab test_cluster_sinval test_cluster_sinval_ack test_cluster_stage2_acceptance test_cluster_tt_status test_cluster_tt_status_hint test_cluster_visibility_fork test_cluster_visibility_decide_scn test_cluster_snapshot_source test_cluster_itl_touch test_cluster_active_itl_transfer test_cluster_itl_wal test_cluster_uba \
         test_cluster_startup_phase test_cluster_lmon test_cluster_lck test_cluster_diag test_cluster_stats test_cluster_cssd test_cluster_qvotec test_cluster_voting_disk_io test_cluster_quorum_decision \
         test_cluster_xlog test_cluster_xlog_insert_end test_cluster_subtrans_startup test_cluster_subtrans_durability test_cluster_clog_startup test_cluster_multixact_startup test_cluster_commit_ts_startup test_cluster_tt_slot test_cluster_undo_segment \
@@ -421,7 +421,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_thread_recovery_authority,$(SIMPLE_TES
 SIMPLE_TESTS := $(filter-out test_cluster_page_online_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1287,6 +1287,24 @@ test_cluster_space_xid_precedes.inc: $(top_srcdir)/src/backend/access/transam/tr
 
 test_cluster_space_bufpage_product.o: $(top_srcdir)/src/backend/storage/page/bufpage.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+# PGRAC: original VM lookup and pin/reuse consumers, no rewritten product branch.
+test_cluster_vm_version.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^visibilitymap_pin\(/ { print "void"; emit=1; pins++ } \
+	     /^visibilitymap_pin_ok\(/ { print "bool"; emit=1; pinok++ } \
+	     /^visibilitymap_pin_recent\(/ { print "bool"; emit=1; recent++ } \
+	     /^visibilitymap_prepare_truncate\(/ { print "BlockNumber"; emit=1; truncs++ } \
+	     /^vm_readbuf\(/ { print "static Buffer"; emit=1; reads++ } \
+	     /^vm_extend\(/ { print "static Buffer"; emit=1; extends++ } \
+	     emit { print } /^}/ { emit=0 } \
+	     END { if (pins != 1 || pinok != 1 || recent != 1 || truncs != 1 || reads != 1 || extends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_version: test_cluster_vm_version.c test_cluster_vm_version.inc unit_test.h \
+		test_cluster_space_bufpage_product.o $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_heap_insert_version: test_cluster_heap_insert_version.c unit_test.h \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
@@ -2996,6 +3014,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
+		test_cluster_vm_version.inc \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
 		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
 		test_cluster_control_root_worker.inc \
