@@ -30,6 +30,11 @@
 #include "storage/bufmgr.h"
 #include "storage/shm_toc.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: original mutation owners carry a pre-lock SPACE identity value. */
+#include "cluster/cluster_space_storage.h"
+#endif
+
 /* There's room for a 16-bit vacuum cycle ID in BTPageOpaqueData */
 typedef uint16 BTCycleId;
 
@@ -340,6 +345,9 @@ typedef struct BTVacState
 	void	   *callback_state;
 	BTCycleId	cycleid;
 	MemoryContext pagedelcontext;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity version_identity;
+#endif
 
 	/*
 	 * _bt_pendingfsm_finalize() state
@@ -840,6 +848,9 @@ typedef struct BTInsertStateData
 	 * with an existing posting list tuple that has its LP_DEAD bit set.
 	 */
 	int			postingoff;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity version_identity;
+#endif
 } BTInsertStateData;
 
 typedef BTInsertStateData *BTInsertState;
@@ -1192,9 +1203,17 @@ extern void _bt_parallel_advance_array_keys(IndexScanDesc scan);
  * prototypes for functions in nbtdedup.c
  */
 extern void _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem,
-						   Size newitemsz, bool bottomupdedup);
+						   Size newitemsz, bool bottomupdedup
+#ifdef USE_PGRAC_CLUSTER
+						   , const ClusterSpaceIdentity *identity
+#endif
+						   );
 extern bool _bt_bottomupdel_pass(Relation rel, Buffer buf, Relation heapRel,
-								 Size newitemsz);
+								 Size newitemsz
+#ifdef USE_PGRAC_CLUSTER
+								 , const ClusterSpaceIdentity *identity
+#endif
+								 );
 extern void _bt_dedup_start_pending(BTDedupState state, IndexTuple base,
 									OffsetNumber baseoff);
 extern bool _bt_dedup_save_htid(BTDedupState state, IndexTuple itup);
@@ -1249,10 +1268,25 @@ extern void _bt_upgradelockbufcleanup(Relation rel, Buffer buf);
 extern void _bt_pageinit(Page page, Size size);
 extern void _bt_delitems_vacuum(Relation rel, Buffer buf,
 								OffsetNumber *deletable, int ndeletable,
-								BTVacuumPosting *updatable, int nupdatable);
+								BTVacuumPosting *updatable, int nupdatable
+#ifdef USE_PGRAC_CLUSTER
+								, const ClusterSpaceIdentity *identity
+#endif
+								);
 extern void _bt_delitems_delete_check(Relation rel, Buffer buf,
 									  Relation heapRel,
-									  TM_IndexDeleteOp *delstate);
+									  TM_IndexDeleteOp *delstate
+#ifdef USE_PGRAC_CLUSTER
+									  , const ClusterSpaceIdentity *identity
+#endif
+									  );
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: identity loading may read storage; capture only reads locked bytes. */
+extern void _bt_get_version_identity(Relation rel, ClusterSpaceIdentity *identity);
+extern bool _bt_prepare_page_version(Relation rel, Buffer buf,
+									 const ClusterSpaceIdentity *identity,
+									 RfPageProducerBatchV1 *batch);
+#endif
 extern void _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate);
 extern void _bt_pendingfsm_init(Relation rel, BTVacState *vstate,
 								bool cleanuponly);

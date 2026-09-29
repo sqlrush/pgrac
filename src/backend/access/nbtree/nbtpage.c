@@ -37,12 +37,22 @@
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: pre-lock identity transport and native versioned WAL producers. */
+#include "cluster/cluster_guc.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
+
 static BTMetaPageData *_bt_getmeta(Relation rel, Buffer metabuf);
 static void _bt_delitems_delete(Relation rel, Buffer buf,
 								TransactionId snapshotConflictHorizon,
 								bool isCatalogRel,
 								OffsetNumber *deletable, int ndeletable,
-								BTVacuumPosting *updatable, int nupdatable);
+								BTVacuumPosting *updatable, int nupdatable
+#ifdef USE_PGRAC_CLUSTER
+								, const ClusterSpaceIdentity *identity
+#endif
+								);
 static char *_bt_delitems_update(BTVacuumPosting *updatable, int nupdatable,
 								 OffsetNumber *updatedoffsets,
 								 Size *updatedbuflen, bool needswal);
@@ -222,6 +232,38 @@ _bt_vacuum_needs_cleanup(Relation rel)
 	return false;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* The original index lifecycle lock is held; no content lock may be held. */
+void
+_bt_get_version_identity(Relation rel, ClusterSpaceIdentity *identity)
+{
+	memset(identity, 0, sizeof(*identity));
+	if (cluster_shared_config && RelationIsPermanent(rel)
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1
+		&& (!RelationNeedsWAL(rel)
+			|| !cluster_space_relation_get_identity(rel, identity)))
+		elog(ERROR, "PGRAC shared btree mutation requires pre-lock SPACE identity");
+}
+
+/* Memory-only capture of the original owner's pinned, write-locked page. */
+bool
+_bt_prepare_page_version(Relation rel, Buffer buf,
+						 const ClusterSpaceIdentity *identity,
+						 RfPageProducerBatchV1 *batch)
+{
+	const uint8 block_id = 0;
+
+	if (!cluster_shared_config || !RelationIsPermanent(rel)
+		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1)
+		return false;
+	if (!RelationNeedsWAL(rel) || identity == NULL
+		|| !RelFileLocatorEquals(identity->key.locator, rel->rd_locator)
+		|| !cluster_space_prepare_buffer_versions(identity, &buf, &block_id, 1, batch))
+		elog(ERROR, "PGRAC shared btree mutation requires exact SPACE page version");
+	return true;
+}
+#endif
+
 /*
  * _bt_set_cleanup_info() -- Update metapage for btvacuumcleanup.
  *
@@ -234,6 +276,14 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 	Buffer		metabuf;
 	Page		metapg;
 	BTMetaPageData *metad;
+
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity identity;
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned;
+
+	_bt_get_version_identity(rel, &identity);
+#endif
 
 	/*
 	 * On-disk compatibility note: The btm_last_cleanup_num_delpages metapage
@@ -270,7 +320,15 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 	_bt_unlockbuf(rel, metabuf);
 	_bt_lockbuf(rel, metabuf, BT_WRITE);
 
+#ifdef USE_PGRAC_CLUSTER
+	versioned = _bt_prepare_page_version(rel, metabuf, &identity, &version_batch);
+#endif
 	START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC btree metadata version changed before mutation");
+#endif
 
 	/* upgrade meta-page if needed */
 	if (metad->btm_version < BTREE_NOVAC_VERSION)
@@ -301,6 +359,10 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
 
 		XLogRegisterBufData(0, (char *) &md, sizeof(xl_btree_metadata));
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree metadata version changed before WAL");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_META_CLEANUP);
 
 		PageSetLSN(metapg, recptr);
@@ -1153,7 +1215,11 @@ _bt_pageinit(Page page, Size size)
 void
 _bt_delitems_vacuum(Relation rel, Buffer buf,
 					OffsetNumber *deletable, int ndeletable,
-					BTVacuumPosting *updatable, int nupdatable)
+					BTVacuumPosting *updatable, int nupdatable
+#ifdef USE_PGRAC_CLUSTER
+					, const ClusterSpaceIdentity *identity
+#endif
+					)
 {
 	Page		page = BufferGetPage(buf);
 	BTPageOpaque opaque;
@@ -1161,6 +1227,10 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 	char	   *updatedbuf = NULL;
 	Size		updatedbuflen = 0;
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned = _bt_prepare_page_version(rel, buf, identity, &version_batch);
+#endif
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
@@ -1173,6 +1243,11 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 
 	/* No ereport(ERROR) until changes are logged */
 	START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC btree vacuum version changed before mutation");
+#endif
 
 	/*
 	 * Handle posting tuple updates.
@@ -1247,6 +1322,10 @@ _bt_delitems_vacuum(Relation rel, Buffer buf,
 			XLogRegisterBufData(0, updatedbuf, updatedbuflen);
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree vacuum version changed before WAL");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_VACUUM);
 
 		PageSetLSN(page, recptr);
@@ -1284,7 +1363,11 @@ static void
 _bt_delitems_delete(Relation rel, Buffer buf,
 					TransactionId snapshotConflictHorizon, bool isCatalogRel,
 					OffsetNumber *deletable, int ndeletable,
-					BTVacuumPosting *updatable, int nupdatable)
+					BTVacuumPosting *updatable, int nupdatable
+#ifdef USE_PGRAC_CLUSTER
+					, const ClusterSpaceIdentity *identity
+#endif
+					)
 {
 	Page		page = BufferGetPage(buf);
 	BTPageOpaque opaque;
@@ -1292,6 +1375,10 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	char	   *updatedbuf = NULL;
 	Size		updatedbuflen = 0;
 	OffsetNumber updatedoffsets[MaxIndexTuplesPerPage];
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned = _bt_prepare_page_version(rel, buf, identity, &version_batch);
+#endif
 
 	/* Shouldn't be called unless there's something to do */
 	Assert(ndeletable > 0 || nupdatable > 0);
@@ -1306,6 +1393,10 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 	START_CRIT_SECTION();
 
 	/* Handle updates and deletes just like _bt_delitems_vacuum */
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC btree delete version changed before mutation");
+#endif
 	for (int i = 0; i < nupdatable; i++)
 	{
 		OffsetNumber updatedoffset = updatedoffsets[i];
@@ -1366,6 +1457,10 @@ _bt_delitems_delete(Relation rel, Buffer buf,
 			XLogRegisterBufData(0, updatedbuf, updatedbuflen);
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree delete version changed before WAL");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DELETE);
 
 		PageSetLSN(page, recptr);
@@ -1516,7 +1611,11 @@ _bt_delitems_cmp(const void *a, const void *b)
  */
 void
 _bt_delitems_delete_check(Relation rel, Buffer buf, Relation heapRel,
-						  TM_IndexDeleteOp *delstate)
+						  TM_IndexDeleteOp *delstate
+#ifdef USE_PGRAC_CLUSTER
+						  , const ClusterSpaceIdentity *identity
+#endif
+						  )
 {
 	Page		page = BufferGetPage(buf);
 	TransactionId snapshotConflictHorizon;
@@ -1676,7 +1775,11 @@ _bt_delitems_delete_check(Relation rel, Buffer buf, Relation heapRel,
 
 	/* Physically delete tuples (or TIDs) using deletable (or updatable) */
 	_bt_delitems_delete(rel, buf, snapshotConflictHorizon, isCatalogRel,
-						deletable, ndeletable, updatable, nupdatable);
+						deletable, ndeletable, updatable, nupdatable
+#ifdef USE_PGRAC_CLUSTER
+						, identity
+#endif
+						);
 
 	/* be tidy */
 	for (int i = 0; i < nupdatable; i++)

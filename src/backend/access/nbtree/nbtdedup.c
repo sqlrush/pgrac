@@ -56,7 +56,11 @@ static bool _bt_posting_valid(IndexTuple posting);
  */
 void
 _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
-			   bool bottomupdedup)
+			   bool bottomupdedup
+#ifdef USE_PGRAC_CLUSTER
+			   , const ClusterSpaceIdentity *identity
+#endif
+			   )
 {
 	OffsetNumber offnum,
 				minoff,
@@ -68,6 +72,10 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 	Size		pagesaving PG_USED_FOR_ASSERTS_ONLY = 0;
 	bool		singlevalstrat = false;
 	int			nkeyatts = IndexRelationGetNumberOfKeyAttributes(rel);
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned;
+#endif
 
 	/* Passed-in newitemsz is MAXALIGNED but does not include line pointer */
 	newitemsz += sizeof(ItemIdData);
@@ -237,9 +245,19 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 		nopaque->btpo_flags &= ~BTP_HAS_GARBAGE;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: capture the locked original, not the private replacement image. */
+	versioned = _bt_prepare_page_version(rel, buf, identity, &version_batch);
+	if (versioned)
+		((PageHeader) newpage)->pd_block_scn = ((PageHeader) page)->pd_block_scn;
+#endif
 	START_CRIT_SECTION();
 
 	PageRestoreTempPage(newpage, page);
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC btree dedup version changed before mutation");
+#endif
 	MarkBufferDirty(buf);
 
 	/* XLOG stuff */
@@ -262,6 +280,10 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
 		XLogRegisterBufData(0, (char *) state->intervals,
 							state->nintervals * sizeof(BTDedupInterval));
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree dedup version changed before WAL");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_DEDUP);
 
 		PageSetLSN(page, recptr);
@@ -305,7 +327,11 @@ _bt_dedup_pass(Relation rel, Buffer buf, IndexTuple newitem, Size newitemsz,
  */
 bool
 _bt_bottomupdel_pass(Relation rel, Buffer buf, Relation heapRel,
-					 Size newitemsz)
+					 Size newitemsz
+#ifdef USE_PGRAC_CLUSTER
+					 , const ClusterSpaceIdentity *identity
+#endif
+					 )
 {
 	OffsetNumber offnum,
 				minoff,
@@ -407,7 +433,11 @@ _bt_bottomupdel_pass(Relation rel, Buffer buf, Relation heapRel,
 	pfree(state);
 
 	/* Ask tableam which TIDs are deletable, then physically delete them */
-	_bt_delitems_delete_check(rel, buf, heapRel, &delstate);
+	_bt_delitems_delete_check(rel, buf, heapRel, &delstate
+#ifdef USE_PGRAC_CLUSTER
+							  , identity
+#endif
+							  );
 
 	pfree(delstate.deltids);
 	pfree(delstate.status);

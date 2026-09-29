@@ -94,7 +94,11 @@ static void _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 static void _bt_simpledel_pass(Relation rel, Buffer buffer, Relation heapRel,
 							   OffsetNumber *deletable, int ndeletable,
 							   IndexTuple newitem, OffsetNumber minoff,
-							   OffsetNumber maxoff);
+							   OffsetNumber maxoff
+#ifdef USE_PGRAC_CLUSTER
+							   , const ClusterSpaceIdentity *identity
+#endif
+							   );
 static BlockNumber *_bt_deadblocks(Page page, OffsetNumber *deletable,
 								   int ndeletable, IndexTuple newitem,
 								   int *nblocks);
@@ -133,6 +137,11 @@ _bt_doinsert(Relation rel, IndexTuple itup,
 	BTScanInsert itup_key;
 	BTStack		stack;
 	bool		checkingunique = (checkUnique != UNIQUE_CHECK_NO);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: one identity value before any index content lock or scankey read. */
+	_bt_get_version_identity(rel, &insertstate.version_identity);
+#endif
 
 	/* we need an insertion scan key to do our search, so build one */
 	itup_key = _bt_mkscankey(rel, itup);
@@ -2927,7 +2936,11 @@ _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 	if (ndeletable > 0)
 	{
 		_bt_simpledel_pass(rel, buffer, heapRel, deletable, ndeletable,
-						   insertstate->itup, minoff, maxoff);
+						   insertstate->itup, minoff, maxoff
+#ifdef USE_PGRAC_CLUSTER
+						   , &insertstate->version_identity
+#endif
+						   );
 		insertstate->bounds_valid = false;
 
 		/* Return when a page split has already been avoided */
@@ -2978,13 +2991,21 @@ _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 	 * apply.  We deliberately omit an index-is-allequalimage test here.
 	 */
 	if ((indexUnchanged || uniquedup) &&
-		_bt_bottomupdel_pass(rel, buffer, heapRel, insertstate->itemsz))
+		_bt_bottomupdel_pass(rel, buffer, heapRel, insertstate->itemsz
+#ifdef USE_PGRAC_CLUSTER
+							, &insertstate->version_identity
+#endif
+							))
 		return;
 
 	/* Perform deduplication pass (when enabled and index-is-allequalimage) */
 	if (BTGetDeduplicateItems(rel) && itup_key->allequalimage)
 		_bt_dedup_pass(rel, buffer, insertstate->itup, insertstate->itemsz,
-					   (indexUnchanged || uniquedup));
+					   (indexUnchanged || uniquedup)
+#ifdef USE_PGRAC_CLUSTER
+					   , &insertstate->version_identity
+#endif
+					   );
 }
 
 /*
@@ -3017,7 +3038,11 @@ _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
 static void
 _bt_simpledel_pass(Relation rel, Buffer buffer, Relation heapRel,
 				   OffsetNumber *deletable, int ndeletable, IndexTuple newitem,
-				   OffsetNumber minoff, OffsetNumber maxoff)
+				   OffsetNumber minoff, OffsetNumber maxoff
+#ifdef USE_PGRAC_CLUSTER
+				   , const ClusterSpaceIdentity *identity
+#endif
+				   )
 {
 	Page		page = BufferGetPage(buffer);
 	BlockNumber *deadblocks;
@@ -3115,7 +3140,11 @@ _bt_simpledel_pass(Relation rel, Buffer buffer, Relation heapRel,
 	Assert(delstate.ndeltids >= ndeletable);
 
 	/* Physically delete LP_DEAD tuples (plus any delete-safe extra TIDs) */
-	_bt_delitems_delete_check(rel, buffer, heapRel, &delstate);
+	_bt_delitems_delete_check(rel, buffer, heapRel, &delstate
+#ifdef USE_PGRAC_CLUSTER
+							  , identity
+#endif
+							  );
 
 	pfree(delstate.deltids);
 	pfree(delstate.status);

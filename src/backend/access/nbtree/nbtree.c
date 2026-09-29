@@ -958,6 +958,11 @@ btvacuumscan(IndexVacuumInfo *info, IndexBulkDeleteResult *stats,
 	BlockNumber scanblkno;
 	bool		needLock;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: VACUUM carries an identity value; never read SPACE under a page lock. */
+	_bt_get_version_identity(rel, &vstate.version_identity);
+#endif
+
 	/*
 	 * Reset fields that track information about the entire index now.  This
 	 * avoids double-counting in the case where a single VACUUM command
@@ -1320,7 +1325,11 @@ backtrack:
 		{
 			Assert(nhtidsdead >= ndeletable + nupdatable);
 			_bt_delitems_vacuum(rel, buf, deletable, ndeletable, updatable,
-								nupdatable);
+								nupdatable
+#ifdef USE_PGRAC_CLUSTER
+								, &vstate->version_identity
+#endif
+								);
 
 			stats->tuples_removed += nhtidsdead;
 			/* must recompute maxoff */
