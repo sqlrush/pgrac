@@ -348,6 +348,8 @@ read_seq_tuple(Relation rel, Buffer *buffer, HeapTuple out)
 	out->t_len = ItemIdGetLength(PageGetItemId(page_data.data, 1));
 	return (Form_pg_sequence_data)GETSTRUCT(out);
 }
+/* The native sequence helper's header is extracted below this fixture. */
+void cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer);
 void
 cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
 {
