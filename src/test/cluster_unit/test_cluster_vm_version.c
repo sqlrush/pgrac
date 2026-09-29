@@ -19,7 +19,9 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_scn.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
@@ -39,7 +41,7 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = true, cluster_enabled = true, InRecovery;
 bool wal_log_hints;
-int NBuffers = 1, NLocBuffer, wal_level = WAL_LEVEL_REPLICA;
+int NBuffers = 1, NLocBuffer, wal_level = WAL_LEVEL_REPLICA, cluster_node_id;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
@@ -54,6 +56,11 @@ static unsigned reads, identities, init_calls, locks, unlocks, pins, releases, d
 static bool identity_ok, expecting_error, release_on_lock, installed_remote;
 static bool corrupt_extension_fallback;
 static unsigned extensions, invalidations;
+static unsigned prepared, version_edges, wal_records, legacy_wal;
+static uint64 token;
+static bool begun;
+static RfPageVersionEdgeEntryV1 wal_edge;
+static PGAlignedBlock wal_image;
 static ReadBufferMode read_mode;
 static jmp_buf error_jump;
 
@@ -266,12 +273,74 @@ DataChecksumsEnabled(void)
 	return false;
 }
 
+/* The storage seam is a fixture; version capture/stamp/register are real. */
+bool
+cluster_space_prepare_buffer_versions(const ClusterSpaceIdentity *identity, const Buffer *buffers,
+									  const uint8 *ids, uint8 count, RfPageProducerBatchV1 *batch)
+{
+	RfPageProducerComponentV1 component = { 0 };
+	if (count != 1 || buffers[0] != 1 || ids[0] != 0 || pins != 1 || locks != unlocks + 1
+		|| CritSectionCount != 0 || identities != 1
+		|| !RelFileLocatorEquals(identity->key.locator, relation.rd_locator))
+		abort();
+	component.page = vm.data;
+	component.page_class = RF_PAGE_CLASS_ORDINARY;
+	component.before_kind = RF_PAGE_STATE_PRESENT;
+	memset(component.segment_incarnation, 7, 16);
+	prepared++;
+	return rf_page_producer_prepare_v1(&component, 1, batch);
+}
+
+SCN
+cluster_scn_advance(void)
+{
+	return ++token;
+}
+
+void
+XLogBeginInsert(void)
+{
+	if (begun || locks != unlocks + 1 || CritSectionCount == 0 || dirty != 1)
+		abort();
+	begun = true;
+}
+
+void
+XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)
+{
+	if (!begun || id != 0 || buffer != 1 || flags != REGBUF_FORCE_IMAGE)
+		abort();
+	wal_image = vm;
+}
+
+void
+XLogRegisterPageVersionEdge(uint64 result, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
+{
+	if (!begun || count != 1 || result != token)
+		abort();
+	wal_edge = entries[0];
+	version_edges++;
+}
+
+XLogRecPtr
+XLogInsert(RmgrId rmid, uint8 info)
+{
+	if (!begun || rmid != RM_XLOG_ID || info != XLOG_FPI || version_edges != 1
+		|| ((PageHeader)wal_image.data)->pd_block_scn != token)
+		abort();
+	begun = false;
+	wal_records++;
+	return 200;
+}
+
 XLogRecPtr
 log_newpage_buffer(Buffer buffer, bool standard)
 {
-	(void)buffer;
-	(void)standard;
-	abort();
+	if (buffer != 1 || standard || locks != unlocks + 1 || CritSectionCount == 0)
+		abort();
+	legacy_wal++;
+	PageSetLSN(vm.data, 100);
+	return 100;
 }
 
 bool
@@ -324,6 +393,10 @@ reset(bool shared)
 	cluster_shared_config = shared;
 	reads = identities = init_calls = locks = unlocks = pins = releases = dirty = 0;
 	extensions = invalidations = 0;
+	prepared = version_edges = wal_records = legacy_wal = 0;
+	token = 200;
+	begun = wal_log_hints = false;
+	memset(&wal_edge, 0, sizeof(wal_edge));
 	identity_ok = true;
 	expecting_error = release_on_lock = installed_remote = InRecovery = false;
 	corrupt_extension_fallback = false;
@@ -429,6 +502,103 @@ UT_TEST(test_truncate_zero_tail_does_not_dirty_an_unformatted_page)
 	UT_ASSERT_EQ(pins, 0);
 }
 
+static void
+truncate_page(bool shared)
+{
+	reset(shared);
+	PageInit(vm.data, BLCKSZ, 0);
+	((PageHeader)vm.data)->pd_block_scn = 55;
+	memset(PageGetContents(vm.data), 0xff, MAPSIZE);
+}
+
+UT_TEST(test_truncate_changed_tail_has_one_exact_fpi)
+{
+	const BlockNumber boundaries[] = { 1, 4, 10, HEAPBLOCKS_PER_PAGE - 1 };
+	for (int hints = 0; hints < 2; hints++)
+		for (int i = 0; i < lengthof(boundaries); i++) {
+			PGAlignedBlock expected;
+			BlockNumber n = boundaries[i];
+			char *map;
+			truncate_page(true);
+			wal_log_hints = hints;
+			expected = vm;
+			map = PageGetContents(expected.data);
+			map[HEAPBLK_TO_MAPBYTE(n)] &= (1 << HEAPBLK_TO_OFFSET(n)) - 1;
+			memset(map + HEAPBLK_TO_MAPBYTE(n) + 1, 0, MAPSIZE - HEAPBLK_TO_MAPBYTE(n) - 1);
+			UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, n), 1);
+			UT_ASSERT_EQ(identities, 1);
+			UT_ASSERT_EQ(prepared, 1);
+			UT_ASSERT_EQ(version_edges, 1);
+			UT_ASSERT_EQ(wal_records, 1);
+			UT_ASSERT_EQ(legacy_wal, 0);
+			UT_ASSERT_EQ(wal_edge.before.mutation_token, 55);
+			UT_ASSERT_EQ(wal_edge.before_kind, RF_PAGE_STATE_PRESENT);
+			UT_ASSERT_EQ(((PageHeader)vm.data)->pd_block_scn, 201);
+			UT_ASSERT_EQ(PageGetLSN(vm.data), 200);
+			UT_ASSERT(memcmp(PageGetContents(vm.data), PageGetContents(expected.data), MAPSIZE)
+					  == 0);
+			UT_ASSERT(
+				memcmp(PageGetContents(wal_image.data), PageGetContents(expected.data), MAPSIZE)
+				== 0);
+			UT_ASSERT_EQ(pins, 0);
+			UT_ASSERT_EQ(locks, unlocks);
+		}
+}
+
+UT_TEST(test_truncate_unchanged_tail_and_page_boundary_are_noops)
+{
+	PGAlignedBlock before;
+	truncate_page(true);
+	memset(PageGetContents(vm.data) + 2, 0, MAPSIZE - 2);
+	PageGetContents(vm.data)[2] = 0x0f;
+	before = vm;
+	UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, 10), 1);
+	UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(prepared + dirty + wal_records + legacy_wal, 0);
+	truncate_page(true);
+	before = vm;
+	UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, HEAPBLOCKS_PER_PAGE), 1);
+	UT_ASSERT_EQ(identities + reads + prepared + dirty + wal_records, 0);
+	UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+}
+
+UT_TEST(test_truncate_bad_identity_or_token_fails_before_mutation)
+{
+	for (int bad_token = 0; bad_token < 2; bad_token++) {
+		PGAlignedBlock before;
+		truncate_page(true);
+		identity_ok = bad_token;
+		if (bad_token)
+			((PageHeader)vm.data)->pd_block_scn = 0;
+		before = vm;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			(void)visibilitymap_prepare_truncate(&relation, 10);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT(memcmp(before.data, vm.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(dirty + wal_records + legacy_wal, 0);
+		UT_ASSERT_EQ(reads, bad_token);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+
+UT_TEST(test_truncate_native_and_recovery_do_not_read_runtime_identity)
+{
+	for (int shared = 0; shared < 2; shared++)
+		for (int hints = 0; hints < 2; hints++) {
+			truncate_page(shared);
+			InRecovery = shared;
+			wal_log_hints = hints;
+			UT_ASSERT_EQ(visibilitymap_prepare_truncate(&relation, 10), 1);
+			UT_ASSERT_EQ(identities + prepared + wal_records + version_edges, 0);
+			UT_ASSERT_EQ(legacy_wal, !shared && hints);
+			UT_ASSERT_EQ(((PageHeader)vm.data)->pd_block_scn, 55);
+			UT_ASSERT_EQ((uint8)PageGetContents(vm.data)[2], 0x0f);
+			UT_ASSERT_EQ(dirty, 1);
+		}
+}
+
 UT_TEST(test_legacy_read_keeps_native_initialization)
 {
 	Buffer buffer;
@@ -511,13 +681,17 @@ UT_TEST(test_legacy_extension_keeps_native_zero_on_error)
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(14);
 	UT_RUN(test_shared_read_observes_zero_without_initialization);
 	UT_RUN(test_write_pin_reinitializes_read_only_zero_with_version);
 	UT_RUN(test_recent_pin_refuses_unformatted_without_leaking_pin);
 	UT_RUN(test_missing_identity_fails_before_vm_access);
 	UT_RUN(test_retry_and_remote_initialization_keep_original_ownership);
 	UT_RUN(test_truncate_zero_tail_does_not_dirty_an_unformatted_page);
+	UT_RUN(test_truncate_changed_tail_has_one_exact_fpi);
+	UT_RUN(test_truncate_unchanged_tail_and_page_boundary_are_noops);
+	UT_RUN(test_truncate_bad_identity_or_token_fails_before_mutation);
+	UT_RUN(test_truncate_native_and_recovery_do_not_read_runtime_identity);
 	UT_RUN(test_legacy_read_keeps_native_initialization);
 	UT_RUN(test_shared_extension_preserves_existing_and_zero_predecessors);
 	UT_RUN(test_shared_extension_corruption_cannot_become_zero_base);

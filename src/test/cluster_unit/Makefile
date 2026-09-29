@@ -1799,8 +1799,10 @@ test_cluster_vm_version.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap
 	mv $@.tmp $@
 
 test_cluster_vm_version: test_cluster_vm_version.c test_cluster_vm_version.inc unit_test.h \
-		test_cluster_space_bufpage_product.o $(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 

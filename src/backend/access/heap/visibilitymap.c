@@ -120,6 +120,7 @@
 #include "utils/inval.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -869,6 +870,19 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 		Buffer		mapBuffer;
 		Page		page;
 		char	   *map;
+#ifdef USE_PGRAC_CLUSTER
+		ClusterSpaceIdentity identity;
+		RfPageProducerBatchV1 version_batch;
+		bool		versioned = !InRecovery && cluster_shared_config &&
+			RelationIsPermanent(rel) &&
+			cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+
+		/* PGRAC: resolve once before VM pin/content lock, not inside WAL. */
+		if (versioned &&
+			(!RelationNeedsWAL(rel) ||
+			 !cluster_space_relation_get_identity(rel, &identity)))
+			elog(ERROR, "shared VM truncation requires a live SPACE identity");
+#endif
 
 		newnblocks = truncBlock + 1;
 
@@ -892,10 +906,32 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 			UnlockReleaseBuffer(mapBuffer);
 			goto check_vm_size;
 		}
+		if (versioned)
+		{
+			uint8		block_id = 0;
+			bool		changed = ((uint8) map[truncByte] &
+								   ~((1 << truncOffset) - 1)) != 0;
+
+			for (uint32 i = truncByte + 1; !changed && i < MAPSIZE; i++)
+				changed = map[i] != 0;
+			if (!changed)
+			{
+				UnlockReleaseBuffer(mapBuffer);
+				goto check_vm_size;
+			}
+			if (!cluster_space_prepare_buffer_versions(&identity, &mapBuffer,
+													   &block_id, 1, &version_batch))
+				elog(ERROR, "shared VM truncation requires an exact predecessor");
+		}
 #endif
 
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+			elog(PANIC, "shared VM truncation predecessor changed");
+#endif
 
 		/* Clear out the unwanted bytes. */
 		MemSet(&map[truncByte + 1], 0, MAPSIZE - (truncByte + 1));
@@ -921,6 +957,22 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 		 * during recovery.
 		 */
 		MarkBufferDirty(mapBuffer);
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: preserve the complete bitmap and its before/result edge,
+		 * including configurations that need no native hint FPI. */
+		if (versioned)
+		{
+			XLogRecPtr recptr;
+
+			XLogBeginInsert();
+			XLogRegisterBuffer(0, mapBuffer, REGBUF_FORCE_IMAGE);
+			if (!rf_page_producer_register_wal_v1(&version_batch))
+				elog(PANIC, "shared VM truncation version registration failed");
+			recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+			PageSetLSN(page, recptr);
+		}
+		else
+#endif
 		if (!InRecovery && RelationNeedsWAL(rel) && XLogHintBitIsNeeded())
 			log_newpage_buffer(mapBuffer, false);
 
