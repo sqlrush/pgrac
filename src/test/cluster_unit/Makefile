@@ -428,6 +428,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_btree_structure_version
+TESTS += test_cluster_sequence_version
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1269,6 +1270,30 @@ test_cluster_page_install: test_cluster_page_install.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 CLUSTER_PAGE_PRODUCER_O = cluster_page_producer_test.o
+
+# PGRAC: run native sequence producers with explicit external I/O fixtures.
+test_cluster_sequence_version_helpers.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^cluster_sq_compute_write_scn\(/ { print "static uint64"; emit=1 } \
+	     /^cluster_seq_version_identity\(/ { print "static bool"; emit=1 } \
+	     /^cluster_seq_prepare_version\(/ { print "static void"; emit=1 } \
+	     emit { print } /^}/ { emit=0 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_sequence_version_native.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^(cluster_sq_refill_page|fill_seq_fork_with_data|do_setval)\(/ { print "static void"; emit=1; found++ } \
+	     /^nextval_internal\(/ { print "int64"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_sequence_version: test_cluster_sequence_version.c unit_test.h \
+		test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
+		test_cluster_space_storage_product.o $(CLUSTER_SEQUENCE_O) \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(CLUSTER_SEQUENCE_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: execute native allocation and structural mutation bodies.
 test_cluster_btree_structure_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
@@ -3451,6 +3476,7 @@ clean distclean maintainer-clean:
 		test_cluster_btree_structure_delete.inc \
 		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
 		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc
+	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
