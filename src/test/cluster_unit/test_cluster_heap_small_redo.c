@@ -35,17 +35,19 @@
 
 UT_DEFINE_GLOBALS();
 bool cluster_enabled = true, cluster_shared_config = true;
-int cluster_node_id, NBuffers = 1, NLocBuffer;
+int cluster_node_id, NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 HotStandbyState standbyState = STANDBY_DISABLED;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
-static PGAlignedBlock native_page, detached_page, original, main_data;
+static PGAlignedBlock native_pages[2], detached_page, original, main_data;
+#define native_page (native_pages[0])
 static XLogReaderState reader;
 static DecodedXLogRecord *decoded;
 static unsigned dirties, releases, vm_calls;
 static bool locked;
+static bool buffer_locked[2];
 static const BlockNumber block_number = 17;
 static char inplace_data[8] = "newvalue";
 
@@ -59,9 +61,10 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 XLogRedoAction
 XLogReadBufferForRedo(XLogReaderState *record, uint8 id, Buffer *buffer)
 {
-	UT_ASSERT(record == &reader && id == 0 && !locked);
+	UT_ASSERT(record == &reader && id < 2 && !buffer_locked[id]);
+	buffer_locked[id] = true;
 	locked = true;
-	*buffer = 1;
+	*buffer = id + 1;
 	return BLK_NEEDS_REDO;
 }
 Buffer
@@ -96,27 +99,29 @@ XLogRecordPageWithFreeSpace(RelFileLocator locator, BlockNumber block, Size spac
 BlockNumber
 BufferGetBlockNumber(Buffer buffer)
 {
-	UT_ASSERT(buffer == 1 && locked);
-	return block_number;
+	UT_ASSERT(buffer >= 1 && buffer <= 2 && buffer_locked[buffer - 1]);
+	return block_number + buffer - 1;
 }
 void
 MarkBufferDirty(Buffer buffer)
 {
-	UT_ASSERT(buffer == 1 && locked);
+	UT_ASSERT(buffer >= 1 && buffer <= 2 && buffer_locked[buffer - 1]);
 	dirties++;
 }
 void
 UnlockReleaseBuffer(Buffer buffer)
 {
-	UT_ASSERT(buffer == 1 && locked);
-	locked = false;
+	UT_ASSERT(buffer >= 1 && buffer <= 2 && buffer_locked[buffer - 1]);
+	buffer_locked[buffer - 1] = false;
+	locked = buffer_locked[0] || buffer_locked[1];
 	releases++;
 }
 void
 visibilitymap_clear_redo(XLogReaderState *record, RelFileLocator locator, BlockNumber block,
 						 uint8 flags)
 {
-	UT_ASSERT(record == &reader && locator.relNumber == 900 && block == block_number);
+	UT_ASSERT(record == &reader && locator.relNumber == 900
+			  && (block == block_number || block == block_number + 1));
 	UT_ASSERT(flags == 0 || flags == VISIBILITYMAP_ALL_FROZEN || flags == VISIBILITYMAP_VALID_BITS);
 	vm_calls++;
 }
@@ -262,6 +267,7 @@ reset(uint8 rmid, uint8 opcode, int itl_format)
 	BufferBlocks = native_page.data;
 	dirties = releases = vm_calls = 0;
 	locked = false;
+	memset(buffer_locked, 0, sizeof(buffer_locked));
 }
 
 static void
@@ -654,6 +660,223 @@ UT_TEST(test_insert_delete_bad_shapes_do_not_modify_output)
 	}
 }
 
+static PGAlignedBlock original_old, detached_old;
+
+static void
+reset_update(bool cross, bool init, bool hot, int format, int compression, bool visible)
+{
+	xl_heap_update *rec;
+	xl_heap_header header;
+	char delta[128];
+	Size delta_size, main_size, cursor = 0;
+	uint16 prefix = compression & 1 ? 2 : 0;
+	uint16 suffix = compression & 2 ? 2 : 0;
+	Size padding = MAXALIGN(SizeofHeapTupleHeader) - SizeofHeapTupleHeader;
+	reset_insert(false, false, format, 0);
+	delta_size = format >= 0 ? decoded->main_data_len - SizeOfHeapInsert : 0;
+	if (delta_size != 0)
+		memcpy(delta, main_data.data + SizeOfHeapInsert, delta_size);
+	memset(&main_data, 0, sizeof(main_data));
+	memset(&maintenance_data, 0, sizeof(maintenance_data));
+	decoded->header.xl_info
+		= (hot ? XLOG_HEAP_HOT_UPDATE : XLOG_HEAP_UPDATE) | (init ? XLOG_HEAP_INIT_PAGE : 0);
+	if (cross) {
+		decoded
+			= realloc(decoded, offsetof(DecodedXLogRecord, blocks) + 2 * sizeof(DecodedBkpBlock));
+		reader.record = decoded;
+		decoded->max_block_id = 1;
+		decoded->blocks[1] = decoded->blocks[0];
+		decoded->blocks[1].has_data = false;
+		decoded->blocks[1].data = NULL;
+		decoded->blocks[1].data_len = 0;
+		decoded->blocks[1].blkno = block_number + 1;
+	}
+	rec = (xl_heap_update *)main_data.data;
+	rec->old_xmax = 200;
+	rec->old_offnum = 1;
+	rec->old_infobits_set = XLHL_KEYS_UPDATED;
+	rec->new_offnum = init ? 1 : 2;
+	rec->new_xmax = InvalidTransactionId;
+	if (prefix != 0)
+		rec->flags |= XLH_UPDATE_PREFIX_FROM_OLD;
+	if (suffix != 0)
+		rec->flags |= XLH_UPDATE_SUFFIX_FROM_OLD;
+	if (visible)
+		rec->flags |= XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED | XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED;
+	main_size = SizeOfHeapUpdate;
+	if (delta_size != 0) {
+		rec->flags |= XLH_UPDATE_ITL_DELTA;
+		memcpy(main_data.data + main_size, delta, delta_size);
+		main_size += delta_size;
+		if (cross) {
+			xl_heap_itl_delta *entry
+				= (xl_heap_itl_delta *)(delta + offsetof(xl_heap_itl_delta_block, deltas));
+			entry->slot_idx = 3;
+			entry->write_scn = 450;
+			memcpy(main_data.data + main_size, delta, delta_size);
+			main_size += delta_size;
+		}
+	}
+	decoded->main_data_len = main_size;
+	if (prefix != 0) {
+		memcpy(maintenance_data.data + cursor, &prefix, sizeof(prefix));
+		cursor += sizeof(prefix);
+	}
+	if (suffix != 0) {
+		memcpy(maintenance_data.data + cursor, &suffix, sizeof(suffix));
+		cursor += sizeof(suffix);
+	}
+	memset(&header, 0, sizeof(header));
+	header.t_infomask = HEAP_XMAX_INVALID;
+	header.t_infomask2 = hot ? HEAP_ONLY_TUPLE | 1 : 1;
+	header.t_hoff = MAXALIGN(SizeofHeapTupleHeader);
+	memcpy(maintenance_data.data + cursor, &header, SizeOfHeapHeader);
+	cursor += SizeOfHeapHeader;
+	memset(maintenance_data.data + cursor, 0, padding);
+	cursor += padding;
+	memcpy(maintenance_data.data + cursor, &"newvalue"[prefix], 8 - prefix - suffix);
+	cursor += 8 - prefix - suffix;
+	decoded->blocks[0].data_len = cursor;
+	if (visible)
+		PageSetAllVisible(original.data);
+	original_old = original;
+	if (init) {
+		decoded->blocks[0].flags |= BKPBLOCK_WILL_INIT;
+		memset(&original, 0, sizeof(original));
+	}
+	native_page = detached_page = original;
+	native_pages[1] = detached_old = original_old;
+}
+
+UT_TEST(test_update_variants_match_native)
+{
+	for (int shared = 0; shared < 2; shared++)
+		for (int shape = 0; shape < 4; shape++)
+			for (int format = -1; format <= 3; format++)
+				for (int visible = 0; visible < 2; visible++)
+					for (int compression = 0; compression < (shape < 2 ? 4 : 1); compression++) {
+						bool cross = shape >= 2, hot = shape == 1;
+						ClusterBlkApplyResult result;
+						cluster_shared_config = shared;
+						reset_update(cross, shape == 3, hot, format, compression, visible);
+						heap_xlog_update(&reader, hot);
+						result = cluster_block_apply_one(&reader, 0, detached_page.data);
+						UT_ASSERT_EQ(result, CLUSTER_BLKAPPLY_OK);
+						if (result == CLUSTER_BLKAPPLY_OK)
+							UT_ASSERT(memcmp(native_page.data, detached_page.data, BLCKSZ) == 0);
+						if (cross) {
+							result = cluster_block_apply_one(&reader, 1, detached_old.data);
+							UT_ASSERT_EQ(result, CLUSTER_BLKAPPLY_OK);
+							if (result == CLUSTER_BLKAPPLY_OK)
+								UT_ASSERT(memcmp(native_pages[1].data, detached_old.data, BLCKSZ)
+										  == 0);
+						}
+						UT_ASSERT_EQ(dirties, 2);
+						UT_ASSERT_EQ(releases, cross ? 2 : 1);
+						UT_ASSERT(!locked);
+					}
+}
+
+UT_TEST(test_update_bad_shapes_do_not_modify_output)
+{
+	for (int bad = 0; bad < 24; bad++) {
+		PGAlignedBlock saved;
+		ClusterBlkApplyResult result;
+		xl_heap_update *rec;
+		uint8 target = 0;
+		reset_update(false, false, false, 3, 3, true);
+		rec = (xl_heap_update *)main_data.data;
+		switch (bad) {
+		case 0:
+			decoded->main_data_len = SizeOfHeapUpdate - 1;
+			break;
+		case 1:
+			rec->old_offnum = 0;
+			break;
+		case 2:
+			rec->old_offnum = 2;
+			break;
+		case 3:
+			rec->new_offnum = 0;
+			break;
+		case 4:
+			rec->new_offnum = 1;
+			break;
+		case 5:
+			decoded->blocks[0].data_len = 1;
+			break;
+		case 6:
+			decoded->blocks[0].data_len = 3;
+			break;
+		case 7:
+			decoded->blocks[0].data_len = 4 + SizeOfHeapHeader - 1;
+			break;
+		case 8:
+		case 9:
+			((uint16 *)maintenance_data.data)[bad - 8] = 9;
+			break;
+		case 10:
+			((xl_heap_header *)(maintenance_data.data + 4))->t_hoff = 255;
+			break;
+		case 11:
+			decoded->blocks[0].has_data = false;
+			break;
+		case 12:
+			decoded->blocks[0].forknum = VISIBILITYMAP_FORKNUM;
+			break;
+		case 13:
+			decoded->main_data_len--;
+			break;
+		case 14:
+			((xl_heap_itl_delta_v3 *)(main_data.data + SizeOfHeapUpdate
+									  + offsetof(xl_heap_itl_delta_block, deltas)))
+				->slot_idx = 8;
+			break;
+		case 15:
+			decoded->header.xl_info |= XLOG_HEAP_INIT_PAGE;
+			decoded->blocks[0].flags |= BKPBLOCK_WILL_INIT;
+			break;
+		case 16:
+			reset_update(true, false, true, 3, 0, true);
+			break;
+		case 17:
+			reset_update(true, false, false, 3, 1, true);
+			break;
+		case 18:
+			reset_update(true, false, false, 3, 0, true);
+			decoded->blocks[1].blkno = block_number;
+			break;
+		case 19:
+			reset_update(true, false, false, 3, 0, true);
+			decoded->blocks[1].rlocator.relNumber++;
+			break;
+		case 20:
+			reset_update(true, false, false, 3, 0, true);
+			decoded->main_data_len--;
+			break;
+		case 21:
+			reset_update(true, false, false, 3, 0, true);
+			((xl_heap_update *)main_data.data)->old_offnum = 2;
+			target = 1;
+			break;
+		case 22:
+			/* Old tuple has already changed privately when new tuple fails. */
+			decoded->blocks[0].data_len = BLCKSZ;
+			break;
+		case 23:
+			reset_update(true, true, false, 3, 0, true);
+			decoded->blocks[0].flags &= ~BKPBLOCK_WILL_INIT;
+			break;
+		}
+		if (target == 1)
+			detached_page = detached_old;
+		saved = detached_page;
+		result = cluster_block_apply_one(&reader, target, detached_page.data);
+		UT_ASSERT(result == CLUSTER_BLKAPPLY_FAILED || result == CLUSTER_BLKAPPLY_UNSUPPORTED);
+		UT_ASSERT(memcmp(saved.data, detached_page.data, BLCKSZ) == 0);
+	}
+}
+
 static void
 reset_maintenance(uint8 opcode, bool itl_page)
 {
@@ -875,7 +1098,7 @@ UT_TEST(test_bad_maintenance_does_not_modify_output)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(14);
 	UT_RUN(test_confirm_and_inplace_match_native);
 	UT_RUN(test_lock_and_updated_lock_match_native);
 	UT_RUN(test_zero_length_inplace_payload_matches_native);
@@ -888,6 +1111,8 @@ main(void)
 	UT_RUN(test_delete_variants_match_native);
 	UT_RUN(test_insert_reuses_unused_pointer_and_delete_logical_trailer);
 	UT_RUN(test_insert_delete_bad_shapes_do_not_modify_output);
+	UT_RUN(test_update_variants_match_native);
+	UT_RUN(test_update_bad_shapes_do_not_modify_output);
 	UT_DONE();
 	free(decoded);
 	return ut_failed_count != 0;

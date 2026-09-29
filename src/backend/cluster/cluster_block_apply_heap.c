@@ -85,202 +85,6 @@ fix_infomask_from_infobits(uint8 infobits, uint16 *infomask, uint16 *infomask2)
 		*infomask2 |= HEAP_KEYS_UPDATED;
 }
 
-/*
- * apply_heap_update -- mirror heap_xlog_update()'s BLK_NEEDS_REDO branches on a
- *		detached page, for the SAME-PAGE case only (old and new tuple on the
- *		one block being reconstructed).
- *
- *	Same-page is the dominant case (HOT updates, and any update with room on the
- *	page); both the old-tuple modification and the new-tuple insertion happen on
- *	block 0, so a single detached page is self-contained -- the new tuple's
- *	prefix/suffix come from the old tuple on the same page.
- *
- *	Off the starter matrix -> fail closed (UNSUPPORTED), not differential-proven:
- *	  - CROSS-PAGE update (separate old block 1): the new tuple's reconstruction
- *	    and the old tuple's update live on different pages; single-block
- *	    reconstruction of one cannot see the other.  A later matrix entry.
- *	  - XLOG_HEAP_INIT_PAGE, XLH_UPDATE_{OLD,NEW}_ALL_VISIBLE_CLEARED: as for
- *	    insert/delete, never reached on an FPI-base delta chain here.
- */
-static ClusterBlkApplyResult
-apply_heap_update(XLogReaderState *record, uint8 block_id, char *page, bool hot_update)
-{
-	xl_heap_update *xlrec = (xl_heap_update *)XLogRecGetData(record);
-	BlockNumber oldblk;
-	BlockNumber newblk;
-	bool has_old_block;
-	ItemPointerData newtid;
-	OffsetNumber offnum;
-	ItemId lp;
-	HeapTupleData oldtup;
-	HeapTupleHeader htup;
-	uint16 prefixlen = 0;
-	uint16 suffixlen = 0;
-	char *newp;
-	union {
-		HeapTupleHeaderData hdr;
-		/* cppcheck-suppress unusedStructMember */
-		char data[MaxHeapTupleSize]; /* sizes the union for a max tuple */
-	} tbuf;
-	xl_heap_header xlhdr;
-	uint32 newlen;
-	char *recdata;
-	const char *recdata_end;
-	Size datalen;
-	Size tuplen;
-	bool cluster_itl_new_replay_active = false;
-	uint8 cluster_itl_new_replay_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
-
-	oldtup.t_data = NULL;
-	oldtup.t_len = 0;
-
-	XLogRecGetBlockTag(record, 0, NULL, NULL, &newblk);
-	has_old_block = XLogRecGetBlockTagExtended(record, 1, NULL, NULL, &oldblk, NULL);
-	if (!has_old_block)
-		oldblk = newblk;
-
-	/* Starter matrix: same-page update only. */
-	if (block_id != 0 || oldblk != newblk)
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-
-	/* Off the matrix (see header): fail closed. */
-	if (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE)
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-	if (xlrec->flags & (XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED | XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED))
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-
-	ItemPointerSet(&newtid, newblk, xlrec->new_offnum);
-
-	/* ---- old tuple version (same page) ---- */
-	offnum = xlrec->old_offnum;
-	if (PageGetMaxOffsetNumber(page) < offnum)
-		return CLUSTER_BLKAPPLY_FAILED;
-	lp = PageGetItemId(page, offnum);
-	if (!ItemIdIsNormal(lp))
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	htup = (HeapTupleHeader)PageGetItem(page, lp);
-	oldtup.t_data = htup;
-	oldtup.t_len = ItemIdGetLength(lp);
-
-	htup->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
-	htup->t_infomask2 &= ~HEAP_KEYS_UPDATED;
-	if (hot_update)
-		HeapTupleHeaderSetHotUpdated(htup);
-	else
-		HeapTupleHeaderClearHotUpdated(htup);
-	fix_infomask_from_infobits(xlrec->old_infobits_set, &htup->t_infomask, &htup->t_infomask2);
-	HeapTupleHeaderSetXmax(htup, xlrec->old_xmax);
-	HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
-	/* Set forward chain link in t_ctid */
-	htup->t_ctid = newtid;
-	/* Mark the page as a candidate for pruning */
-	PageSetPrunable(page, XLogRecGetXid(record));
-	/* (same-page: the old-block ITL delta branch is cross-page only) */
-
-	/* ---- new tuple version (same page) ---- */
-	recdata = XLogRecGetBlockData(record, 0, &datalen);
-	if (recdata == NULL)
-		return CLUSTER_BLKAPPLY_FAILED;
-	recdata_end = recdata + datalen;
-
-	if (xlrec->flags & XLH_UPDATE_ITL_DELTA) {
-		const char *itl_cursor = (char *)xlrec + SizeOfHeapUpdate;
-
-		cluster_itl_new_replay_slot = (uint8)cluster_itl_wal_block_first_slot_idx(itl_cursor);
-		cluster_itl_new_replay_active = true;
-	}
-
-	offnum = xlrec->new_offnum;
-	if (PageGetMaxOffsetNumber(page) + 1 < offnum)
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	if (xlrec->flags & XLH_UPDATE_PREFIX_FROM_OLD) {
-		memcpy(&prefixlen, recdata, sizeof(uint16));
-		recdata += sizeof(uint16);
-	}
-	if (xlrec->flags & XLH_UPDATE_SUFFIX_FROM_OLD) {
-		memcpy(&suffixlen, recdata, sizeof(uint16));
-		recdata += sizeof(uint16);
-	}
-
-	memcpy((char *)&xlhdr, recdata, SizeOfHeapHeader);
-	recdata += SizeOfHeapHeader;
-
-	tuplen = recdata_end - recdata;
-	if (tuplen > MaxHeapTupleSize)
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	htup = &tbuf.hdr;
-	memset((char *)htup, 0, SizeofHeapTupleHeader);
-
-	/*
-	 * Reconstruct the new tuple from the prefix/suffix of the old tuple (on
-	 * this same page) and the data in the WAL record.
-	 */
-	newp = (char *)htup + SizeofHeapTupleHeader;
-	if (prefixlen > 0) {
-		int len;
-
-		/* copy bitmap [+ padding] [+ oid] from WAL record */
-		len = xlhdr.t_hoff - SizeofHeapTupleHeader;
-		memcpy(newp, recdata, len);
-		recdata += len;
-		newp += len;
-
-		/* copy prefix from old tuple */
-		memcpy(newp, (char *)oldtup.t_data + oldtup.t_data->t_hoff, prefixlen);
-		newp += prefixlen;
-
-		/* copy new tuple data from WAL record */
-		len = tuplen - (xlhdr.t_hoff - SizeofHeapTupleHeader);
-		memcpy(newp, recdata, len);
-		recdata += len;
-		newp += len;
-	} else {
-		/* copy bitmap [+ padding] [+ oid] + data from record, all in one go */
-		memcpy(newp, recdata, tuplen);
-		recdata += tuplen;
-		newp += tuplen;
-	}
-	if (recdata != recdata_end)
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	/* copy suffix from old tuple */
-	if (suffixlen > 0)
-		memcpy(newp, (char *)oldtup.t_data + oldtup.t_len - suffixlen, suffixlen);
-
-	newlen = SizeofHeapTupleHeader + tuplen + prefixlen + suffixlen;
-	htup->t_infomask2 = xlhdr.t_infomask2;
-	htup->t_infomask = xlhdr.t_infomask;
-	htup->t_hoff = xlhdr.t_hoff;
-	ClusterHeapTupleHeaderInitItlSlot(htup);
-	if (cluster_itl_new_replay_active)
-		htup->t_itl_slot_idx = cluster_itl_new_replay_slot;
-
-	HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
-	HeapTupleHeaderSetCmin(htup, FirstCommandId);
-	HeapTupleHeaderSetXmax(htup, xlrec->new_xmax);
-	/* Make sure there is no forward chain link in t_ctid */
-	htup->t_ctid = newtid;
-
-	if (PageAddItem(page, (Item)htup, newlen, offnum, true, true) == InvalidOffsetNumber)
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	/*
-	 * Replay the block-local ITL delta from MAIN data (same-page: one array,
-	 * patches the shared (page, top_xid) slot; htup_patch is the old tuple).
-	 */
-	if (xlrec->flags & XLH_UPDATE_ITL_DELTA) {
-		const char *itl_cursor = (char *)xlrec + SizeOfHeapUpdate;
-
-		cluster_itl_redo_apply_block_local_delta(page, oldtup.t_data, itl_cursor);
-	}
-
-	PageSetLSN(page, record->EndRecPtr);
-	return CLUSTER_BLKAPPLY_OK;
-}
-
 static bool
 heap_delta_page_header_valid(Page page)
 {
@@ -850,6 +654,191 @@ apply_heap_delete(XLogReaderState *record, uint8 block_id, char *page)
 	return CLUSTER_BLKAPPLY_OK;
 }
 
+/* Skip an ITL array for the other page without reading that page. The matching
+ * page codec must validate the entries against its own exact predecessor. */
+static bool
+heap_delta_array_extent(const char *data, Size available, Size *extent)
+{
+	xl_heap_itl_delta_block header;
+	Size prefix = offsetof(xl_heap_itl_delta_block, deltas), width;
+
+	if (available < prefix)
+		return false;
+	memcpy(&header, data, prefix);
+	if (header.reserved != 0 || header.ndeltas == 0 || header.ndeltas > CLUSTER_ITL_INITRANS_DEFAULT
+		|| header.format_version > CLUSTER_ITL_DELTA_FORMAT_V4)
+		return false;
+	width = header.format_version == CLUSTER_ITL_DELTA_FORMAT_V1   ? sizeof(xl_heap_itl_delta)
+			: header.format_version == CLUSTER_ITL_DELTA_FORMAT_V2 ? sizeof(xl_heap_itl_delta_v2)
+																   : sizeof(xl_heap_itl_delta_v3);
+	*extent = prefix + header.ndeltas * width;
+	return *extent <= available;
+}
+
+/* A cross-page new tuple is self-contained in native WAL. Prefix/suffix reuse
+ * is valid only on a same-page update. Neither codec needs another page's
+ * bytes; the outer whole-record plan still installs all components together. */
+static ClusterBlkApplyResult
+apply_heap_update(XLogReaderState *record, uint8 block_id, char *page, bool hot_update)
+{
+	PGAlignedBlock scratch, tuple_space;
+	xl_heap_update rec;
+	const char *main_data = XLogRecGetData(record);
+	Size main_length = XLogRecGetDataLen(record), used = SizeOfHeapUpdate;
+	const DecodedBkpBlock *new_block, *old_block;
+	bool cross = XLogRecHasBlockRef(record, 1);
+	bool init = (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) != 0;
+	const char *new_delta = NULL, *old_delta = NULL, *delta;
+	Size new_extent = 0, old_extent = 0, consumed;
+	HeapTupleHeader old_tuple = NULL;
+	Size old_length = 0;
+	ItemPointerData newtid;
+
+	if (!XLogRecHasBlockRef(record, 0) || block_id > (cross ? 1 : 0) || main_data == NULL
+		|| main_length < used || (init && !cross) || (cross && hot_update))
+		return CLUSTER_BLKAPPLY_FAILED;
+	new_block = XLogRecGetBlock(record, 0);
+	old_block = cross ? XLogRecGetBlock(record, 1) : new_block;
+	memcpy(&rec, main_data, used);
+	if (new_block->forknum != MAIN_FORKNUM || old_block->forknum != MAIN_FORKNUM
+		|| !RelFileLocatorEquals(new_block->rlocator, old_block->rlocator)
+		|| (cross && new_block->blkno == old_block->blkno)
+		|| init != ((new_block->flags & BKPBLOCK_WILL_INIT) != 0)
+		|| (cross && (old_block->flags & BKPBLOCK_WILL_INIT))
+		|| (cross && (rec.flags & (XLH_UPDATE_PREFIX_FROM_OLD | XLH_UPDATE_SUFFIX_FROM_OLD)))
+		|| rec.old_offnum < FirstOffsetNumber || rec.new_offnum < FirstOffsetNumber
+		|| rec.old_offnum > MaxHeapTuplesPerPage || rec.new_offnum > MaxHeapTuplesPerPage
+		|| (rec.old_infobits_set
+			& ~(XLHL_XMAX_IS_MULTI | XLHL_XMAX_LOCK_ONLY | XLHL_XMAX_EXCL_LOCK
+				| XLHL_XMAX_KEYSHR_LOCK | XLHL_KEYS_UPDATED)))
+		return CLUSTER_BLKAPPLY_FAILED;
+	if (block_id == 0 && init)
+		PageInitHeapPage(scratch.data, BLCKSZ, 0);
+	else {
+		if (!heap_maintenance_page_valid(page))
+			return CLUSTER_BLKAPPLY_FAILED;
+		memcpy(scratch.data, page, BLCKSZ);
+	}
+	if (rec.flags & XLH_UPDATE_ITL_DELTA) {
+		new_delta = main_data + used;
+		if (!heap_delta_array_extent(new_delta, main_length - used, &new_extent))
+			return CLUSTER_BLKAPPLY_FAILED;
+		used += new_extent;
+		if (cross) {
+			old_delta = main_data + used;
+			if (!heap_delta_array_extent(old_delta, main_length - used, &old_extent))
+				return CLUSTER_BLKAPPLY_FAILED;
+			used += old_extent;
+		}
+		delta = block_id == 1 ? old_delta : new_delta;
+		if (!heap_delta_array_valid(scratch.data, delta, block_id == 1 ? old_extent : new_extent,
+									ITL_FLAG_ACTIVE, true, &consumed))
+			return CLUSTER_BLKAPPLY_FAILED;
+	}
+	if (!(rec.flags & XLH_UPDATE_CONTAINS_OLD) && used != main_length)
+		return CLUSTER_BLKAPPLY_FAILED;
+	ItemPointerSet(&newtid, new_block->blkno, rec.new_offnum);
+	if (!cross || block_id == 1) {
+		old_tuple = heap_small_tuple(scratch.data, rec.old_offnum);
+		if (old_tuple == NULL)
+			return CLUSTER_BLKAPPLY_FAILED;
+		old_length = ItemIdGetLength(PageGetItemId(scratch.data, rec.old_offnum));
+		old_tuple->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+		old_tuple->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+		if (hot_update)
+			HeapTupleHeaderSetHotUpdated(old_tuple);
+		else
+			HeapTupleHeaderClearHotUpdated(old_tuple);
+		fix_infomask_from_infobits(rec.old_infobits_set, &old_tuple->t_infomask,
+								   &old_tuple->t_infomask2);
+		HeapTupleHeaderSetXmax(old_tuple, rec.old_xmax);
+		HeapTupleHeaderSetCmax(old_tuple, FirstCommandId, false);
+		old_tuple->t_ctid = newtid;
+		PageSetPrunable(scratch.data, XLogRecGetXid(record));
+		if (rec.flags & XLH_UPDATE_OLD_ALL_VISIBLE_CLEARED)
+			PageClearAllVisible(scratch.data);
+		if (cross && old_delta != NULL)
+			cluster_itl_redo_apply_block_local_delta(scratch.data, old_tuple, old_delta);
+	}
+	if (block_id == 0) {
+		Size length, cursor = 0, payload, tuple_length, padding;
+		const char *data = XLogRecGetBlockData(record, 0, &length);
+		uint16 prefix = 0, suffix = 0;
+		xl_heap_header header;
+		HeapTupleHeader tuple = (HeapTupleHeader)tuple_space.data;
+		char *destination = (char *)tuple + SizeofHeapTupleHeader;
+
+		if (data == NULL)
+			return CLUSTER_BLKAPPLY_FAILED;
+		if (rec.flags & XLH_UPDATE_PREFIX_FROM_OLD) {
+			if (length - cursor < sizeof(prefix))
+				return CLUSTER_BLKAPPLY_FAILED;
+			memcpy(&prefix, data + cursor, sizeof(prefix));
+			cursor += sizeof(prefix);
+		}
+		if (rec.flags & XLH_UPDATE_SUFFIX_FROM_OLD) {
+			if (length - cursor < sizeof(suffix))
+				return CLUSTER_BLKAPPLY_FAILED;
+			memcpy(&suffix, data + cursor, sizeof(suffix));
+			cursor += sizeof(suffix);
+		}
+		if (length - cursor < SizeOfHeapHeader)
+			return CLUSTER_BLKAPPLY_FAILED;
+		memcpy(&header, data + cursor, SizeOfHeapHeader);
+		cursor += SizeOfHeapHeader;
+		payload = length - cursor;
+		tuple_length = SizeofHeapTupleHeader + payload + prefix + suffix;
+		if (tuple_length > MaxHeapTupleSize || header.t_hoff < SizeofHeapTupleHeader
+			|| header.t_hoff > tuple_length
+			|| rec.new_offnum > PageGetMaxOffsetNumber(scratch.data) + 1
+			|| (rec.new_offnum <= PageGetMaxOffsetNumber(scratch.data)
+				&& ItemIdIsUsed(PageGetItemId(scratch.data, rec.new_offnum))))
+			return CLUSTER_BLKAPPLY_FAILED;
+		padding = header.t_hoff - SizeofHeapTupleHeader;
+		if (padding > payload
+			|| ((prefix != 0 || suffix != 0)
+				&& (old_tuple == NULL || prefix > old_length - old_tuple->t_hoff
+					|| suffix > old_length - old_tuple->t_hoff)))
+			return CLUSTER_BLKAPPLY_FAILED;
+		memset(tuple, 0, SizeofHeapTupleHeader);
+		if (prefix != 0) {
+			memcpy(destination, data + cursor, padding);
+			destination += padding;
+			cursor += padding;
+			memcpy(destination, (char *)old_tuple + old_tuple->t_hoff, prefix);
+			destination += prefix;
+			memcpy(destination, data + cursor, payload - padding);
+			destination += payload - padding;
+		} else {
+			memcpy(destination, data + cursor, payload);
+			destination += payload;
+		}
+		if (suffix != 0)
+			memcpy(destination, (char *)old_tuple + old_length - suffix, suffix);
+		tuple->t_infomask = header.t_infomask;
+		tuple->t_infomask2 = header.t_infomask2;
+		tuple->t_hoff = header.t_hoff;
+		ClusterHeapTupleHeaderInitItlSlot(tuple);
+		if (new_delta != NULL)
+			tuple->t_itl_slot_idx = (uint8)cluster_itl_wal_block_first_slot_idx(new_delta);
+		HeapTupleHeaderSetXmin(tuple, XLogRecGetXid(record));
+		HeapTupleHeaderSetCmin(tuple, FirstCommandId);
+		HeapTupleHeaderSetXmax(tuple, rec.new_xmax);
+		tuple->t_ctid = newtid;
+		if (PageAddItem(scratch.data, (Item)tuple, tuple_length, rec.new_offnum, true, true)
+			== InvalidOffsetNumber)
+			return CLUSTER_BLKAPPLY_FAILED;
+		if (rec.flags & XLH_UPDATE_NEW_ALL_VISIBLE_CLEARED)
+			PageClearAllVisible(scratch.data);
+		if (new_delta != NULL)
+			cluster_itl_redo_apply_block_local_delta(scratch.data, cross ? NULL : old_tuple,
+													 new_delta);
+	}
+	PageSetLSN(scratch.data, record->EndRecPtr);
+	memcpy(page, scratch.data, BLCKSZ);
+	return CLUSTER_BLKAPPLY_OK;
+}
+
 /*
  * cluster_block_apply_heap -- dispatch a no-image heap delta to its per-record
  *		single-block applicator.  Record types not on the differential matrix
@@ -859,11 +848,10 @@ apply_heap_delete(XLogReaderState *record, uint8 block_id, char *page)
  *	WAL trust boundary (8.A threat model): online recovery rebuilds a corrupt
  *	PAGE from CRC-validated WAL (the only caller reads records via
  *	XLogReadRecord, which validates each record's CRC); the WAL is the trusted
- *	source of truth.  Record-internal structure (incl. the ITL delta array read
- *	by cluster_itl_redo_apply_block_local_delta) is therefore trusted to the
- *	same degree as PG's own heap_xlog_* redo, which uses the identical helper.
- *	A future caller that ingests WAL through any path weaker than XLogReadRecord
- *	must add ITL-region bounds before reaching these handlers.
+ *	source of truth. Retained handlers additionally validate native payload,
+ *	page and ITL-array bounds before invoking native helpers in private memory.
+ *	These checks do not replace record CRC validation, exact predecessor proof
+ *	or the caller's whole-record install protocol.
  */
 ClusterBlkApplyResult
 cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
