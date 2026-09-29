@@ -38,6 +38,9 @@
 #include "replication/logical.h"
 #include "replication/message.h"
 #include "utils/memutils.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 
 /*
  * Write logical decoding message into XLog.
@@ -47,6 +50,15 @@ LogLogicalMessage(const char *prefix, const char *message, size_t size,
 				  bool transactional)
 {
 	xl_logical_message xlrec;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: explicit message functions also write WAL at replica level. */
+	if (cluster_shared_config || cluster_shared_catalog)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("logical messages are not supported in shared mode"),
+				 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=LOGICAL_WAL_UNSUPPORTED")));
+#endif
 
 	/*
 	 * Force xid to be allocated if we're emitting a transactional message.

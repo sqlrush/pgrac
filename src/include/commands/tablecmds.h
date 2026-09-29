@@ -31,6 +31,11 @@ extern void RemoveRelations(DropStmt *drop);
 
 extern Oid	AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode);
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: read-only rewrite classification before utility side effects. */
+extern void CheckClusterSharedAlterTable(AlterTableStmt *stmt, const char *queryString);
+#endif
+
 extern void AlterTable(AlterTableStmt *stmt, LOCKMODE lockmode,
 					   struct AlterTableUtilityContext *context);
 

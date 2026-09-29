@@ -28,6 +28,7 @@
 #include "catalog/pg_am.h"
 #include "catalog/pg_control.h"
 #include "commands/defrem.h"
+#include "commands/tablecmds.h"
 #include "common/controldata_utils.h"
 #include "miscadmin.h"
 #include "nodes/value.h"
@@ -77,6 +78,14 @@ pfree(void *p)
 void
 check_stack_depth(void)
 {}
+/* Dynamic rewrite classification has native SQL tests; this fixture covers
+ * only the preceding raw utility routing and index entry points. */
+void
+CheckClusterSharedAlterTable(AlterTableStmt *stmt, const char *queryString)
+{
+	(void)stmt;
+	(void)queryString;
+}
 void
 ExceptionalCondition(const char *c, const char *f, int line)
 {
@@ -205,6 +214,7 @@ defGetString(DefElem *def)
 #include "test_cluster_fresh_read.inc"
 #include "test_cluster_fresh_startup.inc"
 #include "test_cluster_fresh_boolean.inc"
+#include "test_cluster_shared_utility.inc"
 #include "test_cluster_fresh_index.inc"
 #include "test_cluster_fresh_catalog_index.inc"
 
@@ -214,6 +224,7 @@ sql_entry(Node *node)
 	PlannedStmt plan = { 0 };
 	PlannedStmt *pstmt = &plan;
 	Node *parsetree;
+	const char *queryString = "";
 	plan.utilityStmt = node;
 #include "test_cluster_fresh_utility.inc"
 	(void)parsetree;
@@ -419,7 +430,7 @@ UT_TEST(test_reindex_kinds_and_false_option)
 						else
 							ExecReindex(NULL, &stmt, true);
 					}
-					UT_ASSERT_EQ(caught, mode != 0 && value != 0);
+					UT_ASSERT_EQ(caught, mode != 0);
 					if (caught)
 						UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
 				}
@@ -585,10 +596,143 @@ UT_TEST(test_primary_unique_and_nonindex_constraints_keep_native_admission)
 	}
 }
 
+static void
+check_utility_scope(Node *stmt, bool refused)
+{
+	int mode;
+
+	for (mode = 0; mode < 3; mode++) {
+		int caught;
+
+		cluster_shared_config = mode == 1;
+		cluster_shared_catalog = mode == 2;
+		reset_error();
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			sql_entry(stmt);
+		UT_ASSERT_EQ(caught, mode != 0 && refused);
+		if (caught)
+			UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+	}
+}
+
+UT_TEST(test_shared_removed_commands_refuse_at_native_utility_entry)
+{
+	NodeTag refused[] = { T_ClusterStmt,		  T_CreatedbStmt,		  T_DropdbStmt,
+						  T_CreateTableSpaceStmt, T_DropTableSpaceStmt,	  T_CreateExtensionStmt,
+						  T_RefreshMatViewStmt,	  T_AlterTableMoveAllStmt };
+	VacuumStmt vacuum = { 0 };
+	DefElem full = { 0 };
+	Integer boolean = { 0 };
+	List options;
+	ListCell opt;
+	unsigned i;
+
+	for (i = 0; i < lengthof(refused); i++) {
+		Node stmt = { .type = refused[i] };
+		check_utility_scope(&stmt, true);
+	}
+	vacuum.type = T_VacuumStmt;
+	vacuum.is_vacuumcmd = true;
+	check_utility_scope((Node *)&vacuum, false);
+	full.type = T_DefElem;
+	full.defname = "full";
+	boolean.type = T_Integer;
+	boolean.ival = 0;
+	full.arg = (Node *)&boolean;
+	one_element(&options, &opt, &full);
+	vacuum.options = &options;
+	check_utility_scope((Node *)&vacuum, false);
+	boolean.ival = 1;
+	check_utility_scope((Node *)&vacuum, true);
+	full.arg = NULL;
+	check_utility_scope((Node *)&vacuum, true);
+}
+
+UT_TEST(test_unlogged_and_matview_create_and_alter_refuse_before_work)
+{
+	RangeVar target = { 0 };
+	CreateStmt create = { 0 };
+	CreateTableAsStmt ctas = { 0 };
+	IntoClause into = { 0 };
+	AlterTableStmt alter = { 0 };
+	AlterTableCmd command = { 0 };
+	DropStmt drop = { 0 };
+	RenameStmt rename = { 0 };
+	AlterObjectSchemaStmt schema = { 0 };
+	List cmds;
+	ListCell cmd;
+
+	target.type = T_RangeVar;
+	target.relpersistence = RELPERSISTENCE_UNLOGGED;
+	create.type = T_CreateStmt;
+	create.relation = &target;
+	check_utility_scope((Node *)&create, true);
+	ctas.type = T_CreateTableAsStmt;
+	ctas.objtype = OBJECT_TABLE;
+	ctas.into = &into;
+	into.type = T_IntoClause;
+	into.rel = &target;
+	check_utility_scope((Node *)&ctas, true);
+	target.relpersistence = RELPERSISTENCE_PERMANENT;
+	check_utility_scope((Node *)&create, false);
+	check_utility_scope((Node *)&ctas, false);
+	ctas.objtype = OBJECT_MATVIEW;
+	check_utility_scope((Node *)&ctas, true);
+	alter.type = T_AlterTableStmt;
+	alter.objtype = OBJECT_TABLE;
+	command.type = T_AlterTableCmd;
+	command.subtype = AT_SetUnLogged;
+	one_element(&cmds, &cmd, &command);
+	alter.cmds = &cmds;
+	check_utility_scope((Node *)&alter, true);
+	command.subtype = AT_SetTableSpace;
+	check_utility_scope((Node *)&alter, true);
+	command.subtype = AT_SetStatistics;
+	check_utility_scope((Node *)&alter, false);
+	alter.objtype = OBJECT_MATVIEW;
+	check_utility_scope((Node *)&alter, true);
+	drop.type = T_DropStmt;
+	drop.removeType = OBJECT_MATVIEW;
+	check_utility_scope((Node *)&drop, true);
+	drop.removeType = OBJECT_INDEX;
+	check_utility_scope((Node *)&drop, false);
+	rename.type = T_RenameStmt;
+	rename.renameType = OBJECT_MATVIEW;
+	check_utility_scope((Node *)&rename, true);
+	schema.type = T_AlterObjectSchemaStmt;
+	schema.objectType = OBJECT_MATVIEW;
+	check_utility_scope((Node *)&schema, true);
+}
+
+UT_TEST(test_schema_prechecks_removed_children_but_retains_supported_commands)
+{
+	CreateSchemaStmt schema = { 0 };
+	CreateStmt create = { 0 };
+	RangeVar target = { 0 };
+	List children;
+	ListCell child;
+	Node trunc = { .type = T_TruncateStmt };
+	Node view = { .type = T_ViewStmt };
+
+	schema.type = T_CreateSchemaStmt;
+	create.type = T_CreateStmt;
+	create.relation = &target;
+	target.type = T_RangeVar;
+	target.relpersistence = RELPERSISTENCE_UNLOGGED;
+	one_element(&children, &child, &create);
+	schema.schemaElts = &children;
+	check_utility_scope((Node *)&schema, true);
+	target.relpersistence = RELPERSISTENCE_PERMANENT;
+	check_utility_scope((Node *)&schema, false);
+	check_utility_scope(&trunc, false);
+	check_utility_scope(&view, false);
+}
+
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(15);
 	UT_RUN(test_pre1_startup_refuses_before_root_and_without_writes);
 	UT_RUN(test_selected_pre1_image_and_corruption_are_distinct);
 	UT_RUN(test_nonshared_startup_remains_native);
@@ -601,6 +745,9 @@ main(void)
 	UT_RUN(test_schema_checks_nested_index_before_namespace_creation);
 	UT_RUN(test_native_index_create_requires_builtin_btree_oid);
 	UT_RUN(test_primary_unique_and_nonindex_constraints_keep_native_admission);
+	UT_RUN(test_shared_removed_commands_refuse_at_native_utility_entry);
+	UT_RUN(test_unlogged_and_matview_create_and_alter_refuse_before_work);
+	UT_RUN(test_schema_prechecks_removed_children_but_retains_supported_commands);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

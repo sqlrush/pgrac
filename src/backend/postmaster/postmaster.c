@@ -1992,6 +1992,14 @@ checkControlFile(void)
 static void
 checkPostmasterGucCombinations(void)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: also cover catalog-only startup without a selected config image. */
+	if ((cluster_shared_config || cluster_shared_catalog)
+		&& wal_level == WAL_LEVEL_LOGICAL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("wal_level=logical is not supported in shared mode")));
+#endif
 	if (SuperuserReservedConnections + ReservedConnections >= MaxConnections) {
 		write_stderr("%s: superuser_reserved_connections (%d) plus reserved_connections (%d) must "
 					 "be less than max_connections (%d)\n",

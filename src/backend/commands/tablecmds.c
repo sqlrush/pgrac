@@ -4208,6 +4208,196 @@ AlterTableLookupRelation(AlterTableStmt *stmt, LOCKMODE lockmode)
 									(void *) stmt);
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: classify the complete command while the original relation shape is
+ * locked. Parse transformation may return sequence/catalog commands, but none
+ * may execute before all possible rewrites have been rejected.
+ * Author: SqlRush <sqlrush@gmail.com>
+ */
+static bool
+ClusterAlterDropsColumn(List *cmds, const char *name)
+{
+	ListCell *lc;
+
+	foreach(lc, cmds)
+	{
+		AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+		if (cmd->subtype == AT_DropColumn && strcmp(cmd->name, name) == 0)
+			return true;
+	}
+	return false;
+}
+
+static bool
+ClusterAlterAddColumnRewrites(Relation rel, ColumnDef *def, const char *queryString)
+{
+	Oid typeid;
+	int32 typmod;
+	Node *value;
+	ParseState *pstate;
+
+	/* Serial and identity sequences have not been created in this preflight. */
+	if (def->identitySequence != NULL || def->identity || def->generated)
+		return true;
+	typenameTypeIdAndMod(NULL, def->typeName, &typeid, &typmod);
+	if (DomainHasConstraints(typeid))
+		return true;
+	pstate = make_parsestate(NULL);
+	pstate->p_sourcetext = queryString;
+	if (def->raw_default != NULL)
+		value = cookDefault(pstate, copyObject(def->raw_default), typeid,
+							typmod, def->colname, '\0');
+	else
+	{
+		value = def->cooked_default ? copyObject(def->cooked_default) : get_typdefault(typeid);
+		if (value != NULL)
+		{
+			value = coerce_to_target_type(pstate, value, exprType(value), typeid,
+										  typmod, COERCION_ASSIGNMENT, COERCE_IMPLICIT_CAST, -1);
+			if (value == NULL)
+				ereport(ERROR, (errcode(ERRCODE_DATATYPE_MISMATCH),
+								errmsg("default for column \"%s\" cannot be cast to its type",
+									   def->colname)));
+		}
+	}
+	free_parsestate(pstate);
+	if (value == NULL)
+		return false;
+	/* This is the native fast-default test, not evaluation of the default. */
+	return rel->rd_rel->relkind != RELKIND_RELATION
+		|| contain_volatile_functions_after_planning((Expr *) value);
+}
+
+void
+CheckClusterSharedAlterTable(AlterTableStmt *stmt, const char *queryString)
+{
+	List *candidates = NIL;
+	ListCell *lc;
+	LOCKMODE lockmode;
+	Oid relid;
+	Relation root;
+
+	if (!cluster_shared_config && !cluster_shared_catalog)
+		return;
+	foreach(lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
+
+		if (cmd->subtype == AT_AddColumn || cmd->subtype == AT_AlterColumnType
+			|| cmd->subtype == AT_SetAccessMethod || cmd->subtype == AT_SetLogged)
+			candidates = lappend(candidates, cmd);
+	}
+	if (candidates == NIL)
+		return;
+	lockmode = AlterTableGetLockLevel(stmt->cmds);
+	relid = AlterTableLookupRelation(stmt, lockmode);
+	if (!OidIsValid(relid))
+		return;
+	root = relation_open(relid, NoLock);
+
+	foreach(lc, candidates)
+	{
+		AlterTableCmd *original = lfirst_node(AlterTableCmd, lc);
+		bool column_change = original->subtype == AT_AddColumn
+			|| original->subtype == AT_AlterColumnType;
+		List *targets = list_make1_oid(relid);
+		ListCell *target;
+
+		/* Native IF NOT EXISTS skips the whole recursive ADD when it matches. */
+		if (original->subtype == AT_AddColumn && original->missing_ok)
+		{
+			ColumnDef *def = castNode(ColumnDef, original->def);
+
+			if (get_attnum(relid, def->colname) > 0
+				&& !ClusterAlterDropsColumn(stmt->cmds, def->colname))
+				continue;
+		}
+		if (column_change && stmt->relation->inh)
+			targets = find_all_inheritors(relid, lockmode, NULL);
+		if (column_change && root->rd_rel->relkind == RELKIND_COMPOSITE_TYPE)
+		{
+			List *typed = find_typed_table_dependencies(root->rd_rel->reltype,
+														 RelationGetRelationName(root), original->behavior);
+			ListCell *child;
+
+			foreach(child, typed)
+			{
+				/* find_all_inheritors locks descendants, not its root. */
+				LockRelationOid(lfirst_oid(child), lockmode);
+				targets = list_concat_unique_oid(targets,
+					find_all_inheritors(lfirst_oid(child), lockmode, NULL));
+			}
+		}
+		foreach(target, targets)
+		{
+			Oid targetid = lfirst_oid(target);
+			Relation rel = relation_open(targetid, NoLock);
+			bool rewrite = false;
+
+			if (RELKIND_HAS_STORAGE(rel->rd_rel->relkind))
+			{
+				if (column_change)
+				{
+					AlterTableStmt *parsed = copyObject(stmt);
+					AlterTableCmd *cmd = copyObject(original);
+					List *before = NIL, *after = NIL;
+					ListCell *item;
+
+					/* A child with its own column merges the inherited ADD. */
+					if (cmd->subtype == AT_AddColumn && targetid != relid)
+					{
+						ColumnDef *def = castNode(ColumnDef, cmd->def);
+
+						if (get_attnum(targetid, def->colname) > 0
+							&& !ClusterAlterDropsColumn(stmt->cmds, def->colname))
+						{
+							relation_close(rel, NoLock);
+							continue;
+						}
+					}
+					parsed->cmds = list_make1(cmd);
+					parsed->relation = makeRangeVar(get_namespace_name(RelationGetNamespace(rel)),
+						pstrdup(RelationGetRelationName(rel)), -1);
+					parsed = transformAlterTableStmt(targetid, parsed, queryString, &before, &after);
+					/* Deliberately do not execute before/after utility commands. */
+					foreach(item, parsed->cmds)
+					{
+						AlterTableCmd *prepared = lfirst_node(AlterTableCmd, item);
+
+						if (prepared->subtype == AT_AddColumn)
+							rewrite |= ClusterAlterAddColumnRewrites(rel,
+								castNode(ColumnDef, prepared->def), queryString);
+						else if (prepared->subtype == AT_AlterColumnType)
+						{
+							List *queue = NIL;
+							AlteredTableInfo *tab = ATGetQueueEntry(&queue, rel);
+
+							/* Native expression/typmod rewrite classifier, one locked
+							 * storage relation at a time; no recursive executor. */
+							ATPrepAlterColumnType(&queue, tab, rel, false, true,
+												  prepared, lockmode, NULL);
+							rewrite |= tab->rewrite != 0;
+						}
+					}
+				}
+				else if (original->subtype == AT_SetAccessMethod)
+					rewrite = rel->rd_rel->relam != get_table_am_oid(original->name, false);
+				else if (original->subtype == AT_SetLogged)
+					rewrite = rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT;
+			}
+			if (rewrite)
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("table rewrite is not supported in shared mode"),
+						 errdetail("PGRAC_FAMILY=SHARED_SCOPE PGRAC_REASON=TABLE_REWRITE_UNSUPPORTED")));
+			relation_close(rel, NoLock);
+		}
+	}
+	relation_close(root, NoLock);
+}
+#endif
+
 /*
  * AlterTable
  *		Execute ALTER TABLE, which can be a list of subcommands
@@ -4263,6 +4453,13 @@ AlterTable(AlterTableStmt *stmt, LOCKMODE lockmode,
 		   AlterTableUtilityContext *context)
 {
 	Relation	rel;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: ddl_command_start has run since the utility preflight.  It may
+	 * change coercion context (notably TimeZone) even though the relation is
+	 * locked.  Recheck before preparing any catalog or sequence commands. */
+	CheckClusterSharedAlterTable(stmt, context->queryString);
+#endif
 
 	/* Caller is required to provide an adequate lock. */
 	rel = relation_open(context->relid, NoLock);

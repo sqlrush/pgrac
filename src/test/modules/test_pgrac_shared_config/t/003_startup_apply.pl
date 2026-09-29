@@ -86,13 +86,27 @@ refused('apply_commit_ts_on', "common.track_commit_timestamp='on'\n", 0, '',
 refused('apply_inherited_commit_ts_on', "common.work_mem='6MB'\n", 0,
 	"track_commit_timestamp=on\n",
 	qr/shared configuration requires track_commit_timestamp=off/);
+
+refused('apply_logical', "common.wal_level='logical'\n", 0, '',
+	qr/shared configuration object is not applicable/);
+refused('apply_inherited_logical', $body, 0, "wal_level=logical\n",
+	qr/shared configuration does not support wal_level=logical/);
 my $standalone = PostgreSQL::Test::Cluster->new('native_commit_ts_on');
 $standalone->init;
-$standalone->append_conf('postgresql.conf', "track_commit_timestamp=on\n");
+$standalone->append_conf('postgresql.conf', "track_commit_timestamp=on\nwal_level=logical\n");
 $standalone->start;
 is($standalone->safe_psql('postgres', 'SHOW track_commit_timestamp'), 'on',
 	'ordinary non-shared native PG can still enable commit-ts');
+is($standalone->safe_psql('postgres', 'SHOW wal_level'), 'logical',
+	'ordinary non-shared native PG can still enable logical WAL');
 $standalone->stop('fast');
+
+my $catalog_logical = PostgreSQL::Test::Cluster->new('catalog_logical');
+$catalog_logical->init;
+$catalog_logical->append_conf('postgresql.conf', "cluster.shared_catalog=on\nwal_level=logical\n");
+ok(!$catalog_logical->start(fail_ok => 1), 'shared catalog alone refuses logical WAL');
+like(slurp_file($catalog_logical->logfile), qr/wal_level=logical is not supported in shared mode/,
+	'catalog-only mode refuses before storage or worker initialization');
 
 refused('apply_bad_hash', $body, 0, "test_pgrac_shared_config.bad_hash=on\n",
 	qr/shared configuration object is not applicable/);

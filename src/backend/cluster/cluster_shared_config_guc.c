@@ -6,6 +6,7 @@
 #include "postgres.h"
 #include <math.h>
 #include "access/commit_ts.h"
+#include "access/xlog.h"
 #include "catalog/pg_authid_d.h"
 #include "common/cryptohash.h"
 #include "cluster/cluster_shared_config.h"
@@ -483,6 +484,8 @@ policy_check(const ClusterSharedConfigEntry *entry, bool online_change, bool nat
 		if (enabled)
 			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_UNSUPPORTED);
 	}
+	if (strcmp(entry->name, "wal_level") == 0 && pg_strcasecmp(entry->value, "logical") == 0)
+		return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_UNSUPPORTED);
 
 	/* Native parsing/ranges/enums/check hooks, including cross-GUC safety hooks.
 	 * changeVal=false does not assign, push a GUC stack, set pending_restart or
@@ -1126,6 +1129,11 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("shared configuration requires track_commit_timestamp=off"),
 				 errdetail("PGRAC_FAMILY=SHARED_CONFIG PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
+	if (wal_level == WAL_LEVEL_LOGICAL)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared configuration does not support wal_level=logical"),
+				 errdetail("PGRAC_FAMILY=SHARED_CONFIG PGRAC_REASON=LOGICAL_WAL_UNSUPPORTED")));
 	if (config_process_image.bytes != NULL)
 		pfree(config_process_image.bytes);
 	config_process_image.bytes = remembered;

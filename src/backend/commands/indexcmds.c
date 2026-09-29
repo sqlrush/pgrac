@@ -145,20 +145,15 @@ CheckClusterIndexSupport(Node *statement)
 			CheckClusterIndexSupport((Node *) lfirst(lc));
 	}
 	else if (IsA(statement, ReindexStmt))
-	{
-		foreach(lc, ((ReindexStmt *) statement)->params)
-		{
-			DefElem *opt = (DefElem *) lfirst(lc);
-
-			if (strcmp(opt->defname, "concurrently") == 0)
-				concurrently = defGetBoolean(opt);
-		}
-	}
+		/* PGRAC: only user commands, not TRUNCATE's internal index rebuild. */
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("REINDEX is not supported in shared mode")));
 	if (concurrently)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("concurrent index creation or reindexing is not supported in shared mode"),
-				 errhint("Use CREATE INDEX or REINDEX without CONCURRENTLY.")));
+				 errhint("Use CREATE INDEX without CONCURRENTLY.")));
 }
 #endif
 

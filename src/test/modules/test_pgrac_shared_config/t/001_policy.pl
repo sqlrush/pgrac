@@ -47,6 +47,15 @@ like(entry(-1, 'track_commit_timestamp', 'off', 'true'), qr/^1:0:1:1:/,
 	'shared commit-ts off remains an explicit static default');
 like(entry(-1, 'track_commit_timestamp', 'garbage', 'false'), qr/^0:8:/,
 	'invalid boolean is distinguished from an unsupported true value');
+for my $level ('logical', 'LOGICAL')
+{
+	like(entry(-1, 'wal_level', $level, 'false'), qr/^0:4:/,
+		"shared WAL level $level is outside the physical recovery profile");
+	like(entry(-1, 'wal_level', $level, 'true'), qr/^0:4:/,
+		"shared publication cannot stage WAL level $level");
+}
+like(entry(-1, 'wal_level', 'replica', 'false'), qr/^1:0:/,
+	'physical WAL level remains supported');
 
 like(entry(-1, 'statement_timeout', '5s', 'true'), qr/^1:0:1:0:0:/,
 	'native session parameter may have a shared default');
