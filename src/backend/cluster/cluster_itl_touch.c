@@ -96,7 +96,8 @@ itl_touch_handle_matches(const ClusterItlTouchHandle *left, const ClusterItlTouc
  */
 static void
 itl_touch_append(const ClusterItlTouchHandle *handle, const ClusterItlTerminalProof *proof,
-				 const ClusterCtrcReceiptHandle *ctrc_handle)
+				 const ClusterCtrcReceiptHandle *ctrc_handle,
+				 const ClusterSpaceIdentity *space_identity)
 {
 	if (touch_list == NULL) {
 		MemoryContext oldcxt;
@@ -121,6 +122,9 @@ itl_touch_append(const ClusterItlTouchHandle *handle, const ClusterItlTerminalPr
 	MemSet(&touch_list[touch_count].ctrc_handle, 0, sizeof(touch_list[touch_count].ctrc_handle));
 	if (ctrc_handle != NULL && ctrc_handle->valid)
 		touch_list[touch_count].ctrc_handle = *ctrc_handle;
+	MemSet(&touch_list[touch_count].space_identity, 0, sizeof(ClusterSpaceIdentity));
+	if (space_identity != NULL)
+		touch_list[touch_count].space_identity = *space_identity;
 	touch_count++;
 }
 
@@ -147,7 +151,7 @@ cluster_itl_touch_register(const ClusterItlTouchHandle *handle)
 	}
 
 	memset(&proof, 0, sizeof(proof));
-	itl_touch_append(handle, &proof, NULL);
+	itl_touch_append(handle, &proof, NULL, NULL);
 }
 
 /*
@@ -212,7 +216,8 @@ itl_touch_capture_proof(const ClusterItlTouchHandle *handle, Buffer buffer, Tran
 
 static void
 itl_touch_register_exact_internal(const ClusterItlTouchHandle *handle, Buffer buffer,
-								  TransactionId xid, const ClusterCtrcReceiptHandle *ctrc_handle)
+								  TransactionId xid, const ClusterCtrcReceiptHandle *ctrc_handle,
+								  const ClusterSpaceIdentity *space_identity)
 {
 	ClusterItlTerminalProof proof;
 	uint32 range_start = 0;
@@ -222,6 +227,10 @@ itl_touch_register_exact_internal(const ClusterItlTouchHandle *handle, Buffer bu
 	Assert(handle->slot_idx < CLUSTER_ITL_INITRANS_DEFAULT);
 
 	itl_touch_capture_proof(handle, buffer, xid, &proof);
+	if (cluster_shared_config
+		&& (space_identity == NULL || space_identity->state != CLUSTER_SPACE_IDENTITY_LIVE
+			|| !RelFileLocatorEquals(space_identity->key.locator, handle->rloc)))
+		proof.valid = false;
 
 	/*
 	 * Dedupe by (rloc, fork, block, slot, xid, slot_wrap) within the
@@ -249,8 +258,11 @@ itl_touch_register_exact_internal(const ClusterItlTouchHandle *handle, Buffer bu
 		 */
 		existing->key.flags |= (handle->flags & CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL);
 		MemSet(&existing->ctrc_handle, 0, sizeof(existing->ctrc_handle));
+		MemSet(&existing->space_identity, 0, sizeof(existing->space_identity));
 		if (proof.valid) {
 			existing->proof = proof;
+			if (space_identity != NULL)
+				existing->space_identity = *space_identity;
 			if (ctrc_handle != NULL && ctrc_handle->valid)
 				existing->ctrc_handle = *ctrc_handle;
 		} else
@@ -267,27 +279,28 @@ itl_touch_register_exact_internal(const ClusterItlTouchHandle *handle, Buffer bu
 	if (!proof.valid)
 		return;
 
-	itl_touch_append(handle, &proof, ctrc_handle);
+	itl_touch_append(handle, &proof, ctrc_handle, space_identity);
 }
 
 void
 cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle, Buffer buffer,
 								 TransactionId xid)
 {
-	itl_touch_register_exact_internal(handle, buffer, xid, NULL);
+	itl_touch_register_exact_internal(handle, buffer, xid, NULL, NULL);
 }
 
 void
 cluster_itl_touch_register_exact_ctrc(const ClusterItlTouchHandle *handle, Buffer buffer,
 									  TransactionId xid,
-									  const ClusterCtrcReceiptHandle *ctrc_handle)
+									  const ClusterCtrcReceiptHandle *ctrc_handle,
+									  const ClusterSpaceIdentity *space_identity)
 {
 	/* Every caller reaches this point only after the protected page/WAL
 	 * mutation has completed.  Record the causal ordering while the exact
 	 * receipt handle is still backend-owned. */
 	if (ctrc_handle != NULL)
 		cluster_ctrc_note_publication_after_apply(ctrc_handle, false);
-	itl_touch_register_exact_internal(handle, buffer, xid, ctrc_handle);
+	itl_touch_register_exact_internal(handle, buffer, xid, ctrc_handle, space_identity);
 }
 
 bool
@@ -664,11 +677,12 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 	if (bctx->nruns == 0)
 		return;
 
-	state = GenericXLogStartLogged(bctx->needs_wal);
+	state = GenericXLogStartInternal(bctx->needs_wal, GENERIC_XLOG_ITL_FINISH);
 
 	for (p = 0; p < bctx->nruns; p++) {
 		const ItlFinishPageRun *run = &bctx->runs[p];
 		const ClusterItlTerminalProof *used = NULL;
+		const ClusterSpaceIdentity *used_identity = NULL;
 		ClusterItlStampSkipReason reason;
 		Buffer buf = InvalidBuffer;
 		Page live_page;
@@ -689,6 +703,7 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 			buf = cluster_bufmgr_lock_resident_for_exact_itl_stamp(record, &reason);
 			if (BufferIsValid(buf)) {
 				used = &record->proof;
+				used_identity = &record->space_identity;
 				break;
 			}
 		}
@@ -716,6 +731,9 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 				 && record->proof.own_generation == used->own_generation
 				 && record->proof.acquisition_epoch == used->acquisition_epoch
 				 && record->key.slot_idx < CLUSTER_ITL_INITRANS_DEFAULT;
+			if (ok && cluster_shared_config)
+				ok = memcmp(record->space_identity.incarnation, used_identity->incarnation, 16)
+					 == 0;
 			if (ok) {
 				slot = &ClusterPageGetItlSlots(live_page)[record->key.slot_idx];
 				ok = slot->xid == record->proof.xid && slot->wrap == record->proof.slot_wrap
@@ -747,7 +765,7 @@ itl_finish_flush_batch(ItlFinishBatchCtx *bctx)
 
 		cluster_sf_dep_vec_reset(&dependency_vecs[p]);
 		(void)cluster_sf_dep_vec_for_ship(buf, &dependency_vecs[p]);
-		image = GenericXLogRegisterBuffer(state, buf, 0);
+		image = GenericXLogRegisterBufferVersioned(state, buf, 0, used_identity);
 		for (r = 0; r < run->count && r < lengthof(stampable); r++) {
 			const ClusterItlTouchRecord *record = &touch_list[run->first + r];
 
@@ -967,7 +985,8 @@ void
 cluster_itl_touch_register_exact_ctrc(
 	const ClusterItlTouchHandle *handle pg_attribute_unused(), Buffer buffer pg_attribute_unused(),
 	TransactionId xid pg_attribute_unused(),
-	const ClusterCtrcReceiptHandle *ctrc_handle pg_attribute_unused())
+	const ClusterCtrcReceiptHandle *ctrc_handle pg_attribute_unused(),
+	const ClusterSpaceIdentity *space_identity pg_attribute_unused())
 {}
 
 bool

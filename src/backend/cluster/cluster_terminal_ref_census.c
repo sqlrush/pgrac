@@ -46,6 +46,7 @@
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
@@ -7934,6 +7935,7 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	ClusterCtrcCleanResult clean_result;
 	ClusterMxDescribeResult describe_result = CMX_DESC_UNKNOWN;
 	ClusterMxResolveResult resolve_result = CMX_RESOLVE_UNKNOWN;
+	ClusterSpaceIdentity space_identity = { 0 };
 	RelFileLocator locator;
 	SMgrRelation smgr;
 	GenericXLogState *xlog_state;
@@ -7976,6 +7978,12 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 	locator.spcOid = receipt->target.spc_oid;
 	locator.dbOid = receipt->target.db_oid;
 	locator.relNumber = receipt->target.rel_number;
+	/* No heap content lock is held here. The APPLIED receipt and exact
+	 * target rechecks remain mandatory; SPACE lookup is not an authority. */
+	if (cluster_shared_config && !cluster_space_relation_read_identity(locator, &space_identity)) {
+		cluster_semantic_activation_leave(&admission);
+		return false;
+	}
 	smgr = smgropen(locator, InvalidBackendId);
 	if (!smgrexists(smgr, (ForkNumber)receipt->target.fork_number)
 		|| smgrnblocks(smgr, (ForkNumber)receipt->target.fork_number)
@@ -8167,8 +8175,8 @@ ctrc_cleaner_clean_current_mx_receipt(const ClusterCtrcParticipantEntry *partici
 		cluster_semantic_activation_leave(&admission);
 		return false;
 	}
-	xlog_state = GenericXLogStartLogged(receipt->target.needs_wal);
-	image = GenericXLogRegisterBuffer(xlog_state, buffer, 0);
+	xlog_state = GenericXLogStartInternal(receipt->target.needs_wal, GENERIC_XLOG_CTRC_MX);
+	image = GenericXLogRegisterBufferVersioned(xlog_state, buffer, 0, &space_identity);
 	image_item = PageGetItemId(image, (OffsetNumber)receipt->target.offset_number);
 	if (!ItemIdIsNormal(image_item) || ItemIdGetLength(image_item) < SizeofHeapTupleHeader) {
 		GenericXLogAbort(xlog_state);
@@ -8317,6 +8325,7 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	ClusterCtrcDurability durability;
 	ClusterSfDepVec first_dependencies;
 	ClusterSfDepVec final_dependencies;
+	ClusterSpaceIdentity space_identity = { 0 };
 	RelFileLocator locator;
 	SMgrRelation smgr;
 	GenericXLogState *xlog_state;
@@ -8366,6 +8375,10 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 	locator.spcOid = receipt->target.spc_oid;
 	locator.dbOid = receipt->target.db_oid;
 	locator.relNumber = receipt->target.rel_number;
+	if (cluster_shared_config && !cluster_space_relation_read_identity(locator, &space_identity)) {
+		cluster_semantic_activation_leave(&admission);
+		return false;
+	}
 	smgr = smgropen(locator, InvalidBackendId);
 	if (!smgrexists(smgr, (ForkNumber)receipt->target.fork_number)
 		|| smgrnblocks(smgr, (ForkNumber)receipt->target.fork_number)
@@ -8535,8 +8548,8 @@ ctrc_cleaner_clean_itl_receipt(const ClusterCtrcParticipantEntry *participant,
 			return false;
 		goto itl_discharge;
 	}
-	xlog_state = GenericXLogStartLogged(receipt->target.needs_wal);
-	image = GenericXLogRegisterBuffer(xlog_state, buffer, 0);
+	xlog_state = GenericXLogStartInternal(receipt->target.needs_wal, GENERIC_XLOG_CTRC_ITL);
+	image = GenericXLogRegisterBufferVersioned(xlog_state, buffer, 0, &space_identity);
 	apply_result = cluster_ctrc_itl_cleanout_slot(
 		&receipt->key, &receipt->target, terminal_status, commit_scn,
 		&ClusterPageGetItlSlots(image)[receipt->target.itl_slot_index]);

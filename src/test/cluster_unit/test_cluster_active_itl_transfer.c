@@ -76,6 +76,7 @@ Block *LocalBufferBlockPointers = NULL;
 MemoryContext CurrentMemoryContext = (MemoryContext)1;
 MemoryContext TopTransactionContext = (MemoryContext)1;
 bool cluster_enabled = true;
+bool cluster_shared_config;
 int cluster_node_id = 0;
 
 void
@@ -164,14 +165,21 @@ cluster_lever_g_note_stamp_skipped(void)
 }
 
 GenericXLogState *
-GenericXLogStartLogged(bool is_logged pg_attribute_unused())
+GenericXLogStartInternal(bool is_logged pg_attribute_unused(), GenericXLogInternalOwner owner)
 {
+	UT_ASSERT_EQ(owner, GENERIC_XLOG_ITL_FINISH);
 	return (GenericXLogState *)&test_generic_state_storage;
 }
 
 Page
-GenericXLogRegisterBuffer(GenericXLogState *state, Buffer buffer, int flags pg_attribute_unused())
+GenericXLogRegisterBufferVersioned(GenericXLogState *state, Buffer buffer,
+								   int flags pg_attribute_unused(),
+								   const ClusterSpaceIdentity *identity)
 {
+	if (cluster_shared_config) {
+		UT_ASSERT(identity != NULL);
+		UT_ASSERT_EQ(identity->incarnation[0], 77);
+	}
 	UT_ASSERT(state == (GenericXLogState *)&test_generic_state_storage);
 	UT_ASSERT_EQ(buffer, 1);
 	test_generic_register_calls++;
@@ -451,7 +459,7 @@ UT_TEST(u35_uba_drift_preserves_active_slot)
 	slot->undo_segment_head.raw[1] = UINT64_C(0x5555666677778888);
 	ctrc = registration_ctrc_handle(0, &handle, slot);
 	test_capture_authority = true;
-	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc);
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc, NULL);
 	slot->undo_segment_head.raw[1]++;
 	cluster_itl_xact_abort_finish(xid);
 
@@ -477,7 +485,7 @@ UT_TEST(u36_abort_discharge_waits_for_terminal_wal_and_dependency_frontier)
 	test_local_flush_lsn = 250;
 	test_dependency_vec.required[4] = 400;
 	test_origin_durable[4] = 400;
-	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc, NULL);
 	cluster_itl_xact_abort_finish(xid);
 
 	UT_ASSERT_EQ(test_discharge_calls, 1);
@@ -509,7 +517,7 @@ UT_TEST(u37_data_commit_retains_applied_receipt_for_lazy_cleanout)
 	ctrc = registration_ctrc_handle(0, &touch, slot);
 	test_capture_authority = true;
 	test_generic_finish_lsn = 300;
-	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc, NULL);
 	cluster_itl_xact_precommit_finish(xid, 99);
 
 	UT_ASSERT_EQ(slot->flags, ITL_FLAG_NEEDS_CLEANOUT);
@@ -530,7 +538,7 @@ UT_TEST(u38_lock_precommit_retains_authority_until_real_terminal_proof)
 	ctrc = registration_ctrc_handle(0, &touch, slot);
 	test_capture_authority = true;
 	test_generic_finish_lsn = 500;
-	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc, NULL);
 	cluster_itl_xact_precommit_finish(xid, 99);
 
 	/* This hook precedes both the commit record and terminal TT publication. */
@@ -567,7 +575,7 @@ UT_TEST(lock_terminal_finish_preserves_precommit_and_clears_only_exact_abort)
 		ctrc = registration_ctrc_handle(0, &touch, slot);
 		test_capture_authority = true;
 		test_generic_finish_lsn = 500;
-		cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc);
+		cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &ctrc, NULL);
 		if (leg == 2)
 			slot->undo_segment_head.raw[0]++;
 		if (leg == 0)
@@ -597,10 +605,10 @@ UT_TEST(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle)
 	slot->undo_segment_head.raw[0] = 31;
 	first = registration_ctrc_handle(0, &touch, slot);
 	test_capture_authority = true;
-	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &first);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &first, NULL);
 	slot->undo_segment_head.raw[0] = 32;
 	second = registration_ctrc_handle(1, &touch, slot);
-	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &second);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &second, NULL);
 	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
 	cluster_itl_xact_abort_finish(xid);
 
@@ -621,7 +629,7 @@ UT_TEST(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt)
 	slot->undo_segment_head.raw[1] = UINT64_C(0x5555666677778888);
 	registered = registration_ctrc_handle(0, &touch, slot);
 	test_capture_authority = true;
-	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &registered);
+	cluster_itl_touch_register_exact_ctrc(&touch, 1, xid, &registered, NULL);
 
 	MemSet(&found, 0, sizeof(found));
 	UT_ASSERT(cluster_itl_touch_lookup_reusable_ctrc(&touch, 1, xid, &found));
@@ -647,7 +655,7 @@ UT_TEST(u21_first_failed_capture_does_not_append)
 
 	slot = reset_registration_fixture(xid);
 	ctrc = registration_ctrc_handle(0, &handle, slot);
-	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc);
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc, NULL);
 	UT_ASSERT_EQ(cluster_itl_touch_count(), 0);
 	cluster_itl_xact_abort_finish(xid);
 	UT_ASSERT_EQ(test_discharge_calls, 0);
@@ -663,7 +671,7 @@ UT_TEST(u22_failed_recapture_invalidates_one_existing_record)
 	slot = reset_registration_fixture(xid);
 	ctrc = registration_ctrc_handle(0, &handle, slot);
 	test_capture_authority = true;
-	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc);
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, &ctrc, NULL);
 	UT_ASSERT_EQ(cluster_itl_touch_count(), 1);
 
 	test_capture_authority = false;
@@ -882,10 +890,48 @@ UT_TEST(u34_epoch_drift_preserves_active_slot)
 	UT_ASSERT_EQ(test_stamp_skip_calls, 1);
 }
 
+UT_TEST(shared_finish_without_space_identity_must_skip)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+
+	cluster_shared_config = true;
+	test_capture_authority = true;
+	handle.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, NULL, NULL);
+	cluster_itl_xact_precommit_finish(xid, 99);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_ACTIVE);
+	UT_ASSERT_EQ(test_generic_register_calls, 0);
+	cluster_shared_config = false;
+}
+
+UT_TEST(shared_finish_retains_dml_identity_without_fetch)
+{
+	ClusterItlTouchHandle handle = registration_handle();
+	TransactionId xid = 700;
+	ClusterItlSlotData *slot = reset_registration_fixture(xid);
+	ClusterSpaceIdentity identity = { 0 };
+
+	cluster_shared_config = true;
+	test_capture_authority = true;
+	handle.flags = CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL;
+	identity.key.locator = handle.rloc;
+	identity.state = CLUSTER_SPACE_IDENTITY_LIVE;
+	identity.incarnation[0] = 77;
+	cluster_itl_touch_register_exact_ctrc(&handle, 1, xid, NULL, &identity);
+	identity.incarnation[0] = 88; /* backend record owns a copy, not this pointer */
+	cluster_itl_xact_precommit_finish(xid, 99);
+	UT_ASSERT_EQ(slot->flags, ITL_FLAG_NEEDS_CLEANOUT);
+	UT_ASSERT_EQ(test_generic_register_calls, 1);
+	UT_ASSERT_EQ(test_stamp_lock_calls, 1);
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(29);
+	UT_PLAN(31);
 	UT_RUN(lock_terminal_finish_preserves_precommit_and_clears_only_exact_abort);
 	UT_RUN(u13_exact_owner_proof_matches);
 	UT_RUN(u14_missing_owner_proof_is_rejected);
@@ -915,6 +961,8 @@ main(void)
 	UT_RUN(u38_lock_precommit_retains_authority_until_real_terminal_proof);
 	UT_RUN(u39_same_slot_recapture_replaces_only_the_eager_receipt_handle);
 	UT_RUN(u40_reuse_lookup_returns_only_the_exact_live_itl_receipt);
+	UT_RUN(shared_finish_without_space_identity_must_skip);
+	UT_RUN(shared_finish_retains_dml_identity_without_fetch);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

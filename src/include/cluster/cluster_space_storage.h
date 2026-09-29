@@ -45,6 +45,13 @@ extern bool cluster_space_relation_read_redo_identity(RelFileLocator locator,
  * existing reliable invalidation barrier before releasing lifecycle locks. */
 extern bool cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out);
 
+/* Memory-only single-component capture for native owners whose WAL batch can
+ * span relations. Same locked-buffer/identity contract as prepare below, but
+ * no token allocation; the owner prepares one token for the complete batch. */
+extern bool cluster_space_buffer_version_component(const ClusterSpaceIdentity *identity,
+												   Buffer buffer, uint8 block_id, uint16 ordinal,
+												   RfPageProducerComponentV1 *component);
+
 /* Capture the original mutation owner's locked, initialized MAIN/VM pages.
  * Identity was read before acquiring content locks; this call performs no
  * storage I/O or buffer acquisition. It validates the whole batch before

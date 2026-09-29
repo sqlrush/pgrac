@@ -63,6 +63,7 @@
 #include "cluster/cluster_buffer_desc.h" /* PCM_STATE_N / PCM_STATE_X */
 #include "cluster/cluster_itl_slot.h"	 /* CLUSTER_ITL_INITRANS_DEFAULT (spec-3.4c D14) */
 #include "cluster/cluster_scn.h"		 /* SCN */
+#include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_terminal_ref_census.h"
 
 /*
@@ -186,6 +187,9 @@ typedef struct ClusterItlTouchRecord {
 	ClusterItlTouchHandle key; /* frozen 24-byte public value */
 	ClusterItlTerminalProof proof;
 	ClusterCtrcReceiptHandle ctrc_handle;
+	/* Copied under the DML owner's lifecycle lock; terminal finish never
+	 * fetches SPACE or consults relcache while holding a heap content lock. */
+	ClusterSpaceIdentity space_identity;
 } ClusterItlTouchRecord;
 
 /*
@@ -238,7 +242,8 @@ extern void cluster_itl_touch_register_exact(const ClusterItlTouchHandle *handle
  * ClusterItlTouchHandle remains the frozen 24-byte public ABI. */
 extern void cluster_itl_touch_register_exact_ctrc(const ClusterItlTouchHandle *handle,
 												  Buffer buffer, TransactionId xid,
-												  const ClusterCtrcReceiptHandle *ctrc_handle);
+												  const ClusterCtrcReceiptHandle *ctrc_handle,
+												  const ClusterSpaceIdentity *space_identity);
 
 /* Lookup-only accelerator for same-transaction, same-ITL receipt reuse.
  * The caller holds the page content lock EXCLUSIVE.  A hit requires the

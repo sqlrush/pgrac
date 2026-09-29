@@ -52,7 +52,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_pgrac_fenced_target_request \
         test_pgrac_fenced_pacemaker_owned \
         test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_mount \
-        test_cluster_heap_prepare_diagnostic \
+        test_cluster_heap_prepare_diagnostic test_cluster_generic_version test_cluster_generic_redo \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
         test_cluster_ctrc_capacity test_cluster_undo_cleaner_capacity test_cluster_ctrc_itl_reuse test_cluster_normal_stop test_cluster_ic_chunk_stop test_cluster_gcs_stop test_cluster_sinval_stop test_cluster_ko_stop test_cluster_rdma_stop test_cluster_rdma_stop_disabled test_cluster_ic_stop \
@@ -422,6 +422,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_online_plan,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1507,6 +1508,25 @@ test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_
 
 test_cluster_space_producer_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_producer.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+# PGRAC: native generic producer, with only buffer/WAL I/O replaced by fixtures.
+test_cluster_generic_product.o: $(top_srcdir)/src/backend/access/transam/generic_xlog.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_generic_redo: test_cluster_generic_redo.c unit_test.h \
+		test_cluster_generic_product.o test_cluster_vm_redo_reader.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_generic_product.o test_cluster_vm_redo_reader.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
+
+test_cluster_generic_version: test_cluster_generic_version.c unit_test.h \
+		test_cluster_generic_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_generic_product.o \
+		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
 	awk '/^RelationCopyStorageUsingBuffer\(/ { print "static void"; emit=1; count++ } \

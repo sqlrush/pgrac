@@ -6429,7 +6429,8 @@ cluster_heap_insert_retry:
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, buffer, canonical_xid,
-			cluster_heap_ctrc_retained_handle(&cluster_itl_ctrc_handle));
+			cluster_heap_ctrc_retained_handle(&cluster_itl_ctrc_handle),
+			cluster_page_versioned ? &cluster_page_identity : NULL);
 	}
 #endif
 
@@ -11643,7 +11644,8 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		handle.flags = RelationNeedsWAL(relation) ? CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, buffer, canonical_xid,
-			cluster_heap_ctrc_retained_handle(&cluster_itl_ctrc_handle));
+			cluster_heap_ctrc_retained_handle(&cluster_itl_ctrc_handle),
+			cluster_page_versioned ? &cluster_page_identity : NULL);
 	}
 #endif
 
@@ -14668,7 +14670,8 @@ l_pgrac_reacquire:
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, buffer, canonical_xid,
 			cluster_heap_ctrc_retained_handle(
-				&cluster_itl_ctrc_handles[0]));
+				&cluster_itl_ctrc_handles[0]),
+			cluster_page_versioned ? &cluster_page_identity : NULL);
 	}
 	if (cluster_itl_new_active && newbuf != buffer)
 	{
@@ -14682,7 +14685,8 @@ l_pgrac_reacquire:
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, newbuf, canonical_xid,
 			cluster_heap_ctrc_retained_handle(
-				&cluster_itl_ctrc_handles[1]));
+				&cluster_itl_ctrc_handles[1]),
+			cluster_page_versioned ? &cluster_page_identity : NULL);
 	}
 #endif
 
@@ -16911,7 +16915,8 @@ failed:
 			CLUSTER_ITL_TOUCH_FLAG_NEEDS_WAL : 0;
 		cluster_itl_touch_register_exact_ctrc(
 			&handle, *buffer, canonical_xid,
-			cluster_heap_ctrc_retained_handle(&cluster_lock_ctrc_handle));
+			cluster_heap_ctrc_retained_handle(&cluster_lock_ctrc_handle),
+			cluster_page_versioned ? &cluster_page_identity : NULL);
 	}
 	if (cluster_did_multixact_member_bind)
 	{
@@ -18197,7 +18202,8 @@ l4:
 			cluster_itl_touch_register_exact_ctrc(
 				&chain_handle, buf, canonical_xid,
 				cluster_heap_ctrc_retained_handle(
-					&cluster_chain_ctrc_handle));
+					&cluster_chain_ctrc_handle),
+				cluster_page_versioned ? &cluster_page_identity : NULL);
 		}
 #endif
 

@@ -257,46 +257,58 @@ space_copy_prepare(const ClusterSpaceIdentity *identity, ForkNumber forknum, Blo
 }
 
 bool
-cluster_space_prepare_buffer_versions(const ClusterSpaceIdentity *identity, const Buffer *buffers,
-									  const uint8 *block_ids, uint8 count,
-									  RfPageProducerBatchV1 *batch)
+cluster_space_buffer_version_component(const ClusterSpaceIdentity *identity, Buffer buffer,
+									   uint8 block_id, uint16 ordinal,
+									   RfPageProducerComponentV1 *component)
 {
 	ClusterSpaceIdentityKey expected;
 	ClusterSpaceIdentity checked;
 	uint8 encoded[CLUSTER_SPACE_IDENTITY_BYTES];
-	RfPageProducerComponentV1 components[RF_PAGE_PRODUCER_MAX_COMPONENTS];
-	int i;
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+	Page page;
+	RfPageProducerComponentV1 captured;
 
-	if (identity == NULL || buffers == NULL || block_ids == NULL || batch == NULL || count == 0
-		|| count > RF_PAGE_PRODUCER_MAX_COMPONENTS || RecoveryInProgress()
+	if (identity == NULL || component == NULL || RecoveryInProgress()
 		|| !space_namespace(identity->key.locator, false, &expected, NULL)
 		|| !cluster_space_identity_encode(identity, encoded, sizeof(encoded))
 		|| !cluster_space_identity_decode(encoded, sizeof(encoded), &expected, &checked)
-		|| checked.state != CLUSTER_SPACE_IDENTITY_LIVE)
+		|| checked.state != CLUSTER_SPACE_IDENTITY_LIVE || !BufferIsValid(buffer)
+		|| BufferIsLocal(buffer) || !BufferIsPermanent(buffer))
 		return false;
-	memset(components, 0, sizeof(components));
-	for (i = 0; i < count; i++) {
-		RelFileLocator locator;
-		ForkNumber forknum;
-		BlockNumber block;
-		Page page;
+	BufferGetTag(buffer, &locator, &forknum, &block);
+	page = BufferGetPage(buffer);
+	if (!RelFileLocatorEquals(locator, checked.key.locator) || block == InvalidBlockNumber
+		|| (forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM)
+		|| (((PageHeader)page)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0)
+		return false;
+	memset(&captured, 0, sizeof(captured));
+	captured.block_id = block_id;
+	captured.component_ordinal = ordinal;
+	captured.page_class = RF_PAGE_CLASS_ORDINARY;
+	captured.before_kind = RF_PAGE_STATE_PRESENT;
+	captured.page = page;
+	memcpy(captured.segment_incarnation, checked.incarnation, 16);
+	*component = captured;
+	return true;
+}
 
-		if (!BufferIsValid(buffers[i]) || BufferIsLocal(buffers[i])
-			|| !BufferIsPermanent(buffers[i]))
+bool
+cluster_space_prepare_buffer_versions(const ClusterSpaceIdentity *identity, const Buffer *buffers,
+									  const uint8 *block_ids, uint8 count,
+									  RfPageProducerBatchV1 *batch)
+{
+	RfPageProducerComponentV1 components[RF_PAGE_PRODUCER_MAX_COMPONENTS];
+	int i;
+
+	if (buffers == NULL || block_ids == NULL || batch == NULL || count == 0
+		|| count > RF_PAGE_PRODUCER_MAX_COMPONENTS)
+		return false;
+	for (i = 0; i < count; i++)
+		if (!cluster_space_buffer_version_component(identity, buffers[i], block_ids[i], i,
+													&components[i]))
 			return false;
-		BufferGetTag(buffers[i], &locator, &forknum, &block);
-		page = BufferGetPage(buffers[i]);
-		if (!RelFileLocatorEquals(locator, checked.key.locator) || block == InvalidBlockNumber
-			|| (forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM)
-			|| (((PageHeader)page)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0)
-			return false;
-		components[i].block_id = block_ids[i];
-		components[i].component_ordinal = i;
-		components[i].page_class = RF_PAGE_CLASS_ORDINARY;
-		components[i].before_kind = RF_PAGE_STATE_PRESENT;
-		components[i].page = page;
-		memcpy(components[i].segment_incarnation, checked.incarnation, 16);
-	}
 	return rf_page_producer_prepare_v1(components, count, batch);
 }
 
