@@ -35,6 +35,7 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true, cluster_shared_config = true;
 int cluster_node_id = 0, wal_level = WAL_LEVEL_REPLICA;
+static bool minimal_wal_copy;
 int NBuffers = 3, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
@@ -470,6 +471,7 @@ reset(ForkNumber forknum)
 {
 	PageHeader header;
 
+	wal_level = minimal_wal_copy ? WAL_LEVEL_MINIMAL : WAL_LEVEL_REPLICA;
 	memset(&source, 0, sizeof(source));
 	memset(&destination, 0, sizeof(destination));
 	memset(&source_page, 0, sizeof(source_page));
@@ -842,12 +844,22 @@ UT_TEST(test_vm_init_refuses_nonzero_before_and_wrong_fork)
 	UT_ASSERT_EQ(dirties, 0);
 }
 
+UT_TEST(test_minimal_wal_copy_uses_versioned_producers)
+{
+	minimal_wal_copy = true;
+	test_copy_main_has_new_identity_edge_and_wal_before_data();
+	test_native_copy_reopens_handles_after_identity_buffer_read();
+	test_buffer_copy_reopens_after_identity_read();
+	minimal_wal_copy = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(16);
 	UT_RUN(test_vm_init_versions_zero_before_without_heap_layout);
 	UT_RUN(test_vm_init_refuses_nonzero_before_and_wrong_fork);
+	UT_RUN(test_minimal_wal_copy_uses_versioned_producers);
 	UT_RUN(test_heap_init_records_actual_zero_before_and_native_layout);
 	UT_RUN(test_heap_init_refuses_nonzero_new_page_and_wrong_fork);
 	UT_RUN(test_copy_main_has_new_identity_edge_and_wal_before_data);

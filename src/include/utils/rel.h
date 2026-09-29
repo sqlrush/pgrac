@@ -9,6 +9,10 @@
  *
  * src/include/utils/rel.h
  *
+ * PGRAC MODIFICATIONS
+ *    Shared-config permanent relations always log their physical changes;
+ *    a new relfilenumber must not elide its exact page-version WAL chain.
+ *
  *-------------------------------------------------------------------------
  */
 #ifndef REL_H
@@ -20,6 +24,9 @@
 #include "catalog/pg_class.h"
 #include "catalog/pg_index.h"
 #include "catalog/pg_publication.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#endif
 #include "nodes/bitmapset.h"
 #include "partitioning/partdefs.h"
 #include "rewrite/prs2lock.h"
@@ -625,11 +632,21 @@ RelationCloseSmgr(Relation relation)
  * Returns false if wal_level = minimal and this relation is created or
  * truncated in the current transaction.  See "Skipping WAL for New
  * RelFileLocator" in src/backend/access/transam/README.
+ * PGRAC: the shared-config profile instead uses a consistent all-WAL policy
+ * for permanent relations, including new/truncated relfilenumbers. This must
+ * agree with AddPendingSync/RelFileLocatorSkippingWAL in catalog/storage.c.
  */
+#ifdef USE_PGRAC_CLUSTER
+#define RelationNeedsWAL(relation) \
+	(RelationIsPermanent(relation) && (cluster_shared_config || XLogIsNeeded() || \
+	  ((relation)->rd_createSubid == InvalidSubTransactionId && \
+	   (relation)->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)))
+#else
 #define RelationNeedsWAL(relation)										\
 	(RelationIsPermanent(relation) && (XLogIsNeeded() ||				\
 	  (relation->rd_createSubid == InvalidSubTransactionId &&			\
 	   relation->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)))
+#endif
 
 /*
  * RelationUsesLocalBuffers

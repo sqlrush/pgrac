@@ -10053,6 +10053,10 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	 * the init fork.
 	 */
 	use_wal = XLogIsNeeded() && (permanent || forkNum == INIT_FORKNUM);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: permanent shared-profile files never use new-relation WAL elision. */
+	use_wal = use_wal || (cluster_shared_config && permanent);
+#endif
 
 	/* Get number of blocks in the source relation. */
 	nblocks = smgrnblocks(smgropen(srclocator, InvalidBackendId),

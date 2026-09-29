@@ -102,6 +102,14 @@ AddPendingSync(const RelFileLocator *rlocator)
 	PendingRelSync *pending;
 	bool		found;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: shared permanent relations always WAL-log page versions, even
+	 * with minimal WAL. Do not mark them as WAL-skipping or emit a later
+	 * unversioned whole-file image. Applies to parallel-worker restore too. */
+	if (cluster_shared_config)
+		return;
+#endif
+
 	/* create the hash if not yet */
 	if (!pendingSyncHash)
 	{
@@ -561,6 +569,9 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 		(relpersistence == RELPERSISTENCE_PERMANENT || copying_initfork);
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: agree with RelationNeedsWAL for a new shared-profile relation. */
+	use_wal = use_wal || (cluster_shared_config &&
+						   relpersistence == RELPERSISTENCE_PERMANENT);
 	if (cluster_shared_config && relpersistence == RELPERSISTENCE_PERMANENT &&
 		cluster_smgr_which_for(dst->smgr_rlocator.locator, dst->smgr_rlocator.backend) == 1)
 	{

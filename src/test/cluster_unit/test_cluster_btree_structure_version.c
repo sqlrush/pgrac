@@ -61,6 +61,7 @@ static uint8 expected_info;
 static bool locked[6], new_from_fsm, recyclable = true, error_expected, begun;
 volatile sig_atomic_t InterruptPending;
 static unsigned pending_fsm;
+static unsigned minimal_new_relation;
 static jmp_buf error_jump;
 static const BlockNumber blocks[6] = { 7, 8, 9, 0, 6, 10 };
 
@@ -512,6 +513,9 @@ run_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf, Buf
 	relation_data.rd_index = &indexform;
 	relation_data.rd_locator = (RelFileLocator){ 1663, 5, 900 };
 	relation_data.rd_backend = InvalidBackendId;
+	wal_level = minimal_new_relation ? WAL_LEVEL_MINIMAL : WAL_LEVEL_REPLICA;
+	relation_data.rd_createSubid = minimal_new_relation == 1 ? 1 : 0;
+	relation_data.rd_firstRelfilelocatorSubid = minimal_new_relation == 2 ? 2 : 0;
 	relform.relpersistence = RELPERSISTENCE_PERMANENT;
 	relform.relkind = RELKIND_INDEX;
 	relform.relam = BTREE_AM_OID;
@@ -839,10 +843,24 @@ UT_TEST(test_unlink_versions_exact_native_component_sets)
 		}
 	}
 }
+UT_TEST(test_new_or_truncated_minimal_relations_log_exact_versions)
+{
+	for (minimal_new_relation = 1; minimal_new_relation <= 2; minimal_new_relation++) {
+		test_native_insert_has_one_version();
+		test_native_split_captures_zero_new_page();
+		test_native_newlevel_versions_root_child_and_meta();
+		test_first_root_preserves_zero_or_recycled_predecessor();
+		test_upper_insert_versions_child_and_fastroot();
+		test_internal_split_versions_all_four_native_blocks();
+		test_mark_halfdead_versions_leaf_and_parent();
+		test_unlink_versions_exact_native_component_sets();
+	}
+	minimal_new_relation = 0;
+}
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_shared_allocator_preserves_exact_predecessor);
 	UT_RUN(test_native_insert_has_one_version);
 	UT_RUN(test_native_split_captures_zero_new_page);
@@ -854,6 +872,7 @@ main(void)
 	UT_RUN(test_nonshared_first_root_preserves_native_wal);
 	UT_RUN(test_mark_halfdead_versions_leaf_and_parent);
 	UT_RUN(test_unlink_versions_exact_native_component_sets);
+	UT_RUN(test_new_or_truncated_minimal_relations_log_exact_versions);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
