@@ -84,20 +84,17 @@ cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentit
 	return valid;
 }
 
-bool
-cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
-							BlockNumber block, void *page, XLogRecPtr *lsn)
+static bool
+space_copy_prepare(const ClusterSpaceIdentity *identity, ForkNumber forknum, BlockNumber block,
+				   const void *source, Page before, uint8 before_kind, Page result,
+				   RfPageProducerBatchV1 *batch)
 {
 	ClusterSpaceIdentityKey expected;
 	ClusterSpaceIdentity checked;
 	uint8 encoded[CLUSTER_SPACE_IDENTITY_BYTES];
 	RfPageProducerComponentV1 component;
-	RfPageProducerBatchV1 batch;
-	PGAlignedBlock result;
-	XLogRecPtr recptr;
 
-	if (identity == NULL || page == NULL || lsn == NULL || block == InvalidBlockNumber
-		|| RecoveryInProgress()
+	if (identity == NULL || source == NULL || block == InvalidBlockNumber || RecoveryInProgress()
 		|| (forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM && forknum != FSM_FORKNUM)
 		|| !space_namespace(identity->key.locator, false, &expected, NULL)
 		|| !cluster_space_identity_encode(identity, encoded, sizeof(encoded))
@@ -106,43 +103,107 @@ cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber for
 		return false;
 	/* An unformatted ordinary source is not PRESENT. Its typed structural
 	 * replay must be supplied before that copy shape can be admitted. */
-	if ((((PageHeader)page)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0
-		|| (forknum != FSM_FORKNUM && PageIsNew(page)))
+	if ((((PageHeader)source)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0
+		|| (forknum != FSM_FORKNUM && PageIsNew((Page)source)))
 		return false;
 	memset(&component, 0, sizeof(component));
-	memset(&result, 0, sizeof(result));
+	memset(result, 0, BLCKSZ);
+	if (before_kind == RF_PAGE_STATE_UNFORMATTED) {
+		/* A zero header with surviving bytes is not the new-fork base. The
+		 * native copy owner holds its exclusive content lock across this
+		 * exact before observation and publication. */
+		if (before == NULL || memcmp(before, result, BLCKSZ) != 0)
+			return false;
+	} else if (before_kind != RF_PAGE_STATE_ABSENT || before != NULL)
+		return false;
 	if (forknum == FSM_FORKNUM) {
 		component.page_class = RF_PAGE_CLASS_REBUILDABLE_FSM;
 		component.before_kind = RF_PAGE_STATE_REBUILDABLE;
 	} else {
 		component.page_class = RF_PAGE_CLASS_ORDINARY;
-		component.before_kind = RF_PAGE_STATE_ABSENT;
-		component.page = result.data;
+		component.before_kind = before_kind;
+		component.page = result;
 		memcpy(component.segment_incarnation, checked.incarnation, 16);
 	}
-	/* Capture the new destination's absent state before copying any source
-	 * bytes. The original relation owner, not this codec, proves an empty
-	 * destination fork and retains the object lifecycle lock. */
-	if (!rf_page_producer_prepare_v1(&component, 1, &batch))
+	/* Capture before copying source bytes. The original owner proves the
+	 * initially empty fork and retains the object lifecycle lock. */
+	if (!rf_page_producer_prepare_v1(&component, 1, batch))
 		return false;
-	memcpy(result.data, page, BLCKSZ);
+	memcpy(result, source, BLCKSZ);
 	if (forknum != FSM_FORKNUM)
-		((PageHeader)result.data)->pd_block_scn = 0;
-	if (!rf_page_producer_stamp_v1(&batch))
-		return false;
-	XLogBeginInsert();
-	XLogRegisterBlock(0, &checked.key.locator, forknum, block, result.data, REGBUF_FORCE_IMAGE);
-	if (!rf_page_producer_register_wal_v1(&batch))
+		((PageHeader)result)->pd_block_scn = 0;
+	return rf_page_producer_stamp_v1(batch);
+}
+
+static XLogRecPtr
+space_copy_insert(const ClusterSpaceIdentity *identity, ForkNumber forknum, BlockNumber block,
+				  Page result, const RfPageProducerBatchV1 *batch)
+{
+	RelFileLocator locator = identity->key.locator;
+	XLogRecPtr recptr;
+
+	XLogRegisterBlock(0, &locator, forknum, block, result, REGBUF_FORCE_IMAGE);
+	if (!rf_page_producer_register_wal_v1(batch))
 		elog(ERROR, "new SPACE page version changed before WAL registration");
 	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
-	if (!PageIsNew(result.data)) {
+	if (!PageIsNew(result)) {
 		if (forknum == FSM_FORKNUM)
-			PageSetLSN(result.data, recptr);
+			PageSetLSN(result, recptr);
 		else
-			space_set_lsn(result.data, recptr, batch.result_token);
+			space_set_lsn(result, recptr, batch->result_token);
 	}
+	return recptr;
+}
+
+bool
+cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
+							BlockNumber block, void *page, XLogRecPtr *lsn)
+{
+	RfPageProducerBatchV1 batch;
+	PGAlignedBlock result;
+	XLogRecPtr recptr;
+
+	if (lsn == NULL
+		|| !space_copy_prepare(identity, forknum, block, page, NULL, RF_PAGE_STATE_ABSENT,
+							   result.data, &batch))
+		return false;
+	XLogBeginInsert();
+	recptr = space_copy_insert(identity, forknum, block, result.data, &batch);
 	memcpy(page, result.data, BLCKSZ);
 	*lsn = recptr;
+	return true;
+}
+
+bool
+cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *source,
+							  Buffer destination)
+{
+	RfPageProducerBatchV1 batch;
+	PGAlignedBlock result;
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+	Page target;
+
+	if (identity == NULL || !BufferIsValid(destination) || BufferIsLocal(destination)
+		|| !BufferIsPermanent(destination))
+		return false;
+	BufferGetTag(destination, &locator, &forknum, &block);
+	target = BufferGetPage(destination);
+	if (!RelFileLocatorEquals(locator, identity->key.locator) || source == target
+		|| !space_copy_prepare(identity, forknum, block, source, target, RF_PAGE_STATE_UNFORMATTED,
+							   result.data, &batch))
+		return false;
+	XLogBeginInsert();
+	START_CRIT_SECTION();
+	/* A checkpoint whose redo follows this FPI must already select the
+	 * destination. Its content lock prevents writeout until publication;
+	 * marking it only after WAL insertion could leave a zero DATA page
+	 * behind that checkpoint's redo boundary. */
+	MarkBufferDirty(destination);
+	(void)space_copy_insert(identity, forknum, block, result.data, &batch);
+	memcpy(target, result.data, BLCKSZ);
+	END_CRIT_SECTION();
 	return true;
 }
 

@@ -76,6 +76,8 @@
 #include "cluster/cluster_pcm_own.h" /* ownership-generation wave — per-buffer gen + flags */
 #include "cluster/cluster_pcm_x_bufmgr.h" /* spec-2.36a C1 opaque reservation API */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
 
 /*
  * PGRAC (spec-4.10 D1): ignore_checksum_failure is defined in bufpage.c with
@@ -10040,6 +10042,10 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	PGIOAlignedBlock buf;
 	BufferAccessStrategy bstrategy_src;
 	BufferAccessStrategy bstrategy_dst;
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned_copy = false;
+	ClusterSpaceIdentity copy_identity;
+#endif
 
 	/*
 	 * In general, we want to write WAL whenever wal_level > 'minimal', but we
@@ -10055,6 +10061,22 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	/* Nothing to copy; just return. */
 	if (nblocks == 0)
 		return;
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && permanent &&
+		cluster_smgr_which_for(dstlocator, InvalidBackendId) == 1)
+	{
+		/* PGRAC: SPACE access precedes ordinary content locks. Reopen the
+		 * destination by value afterward; the read may invalidate handles. */
+		if (!use_wal || (forkNum != MAIN_FORKNUM && forkNum != FSM_FORKNUM &&
+						 forkNum != VISIBILITYMAP_FORKNUM) ||
+			!cluster_space_relation_read_identity(dstlocator, &copy_identity))
+			elog(ERROR, "cannot bind new buffer copy to exact SPACE identity");
+		if (smgrnblocks(smgropen(dstlocator, InvalidBackendId), forkNum) != 0)
+			elog(ERROR, "versioned buffer copy requires an empty destination fork");
+		versioned_copy = true;
+	}
+#endif
 
 	/*
 	 * Bulk extend the destination relation of the same size as the source
@@ -10085,17 +10107,30 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 										   permanent);
 		dstPage = BufferGetPage(dstBuf);
 
-		START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned_copy)
+		{
+			/* PGRAC: bulk extension created an actual zero-page predecessor,
+			 * not an absent block. Keep both native content locks until the
+			 * new version/FPI and dirty destination are published together. */
+			if (!cluster_space_copy_buffer_wal(&copy_identity, srcPage, dstBuf))
+				elog(ERROR, "cannot WAL-log new SPACE buffer version");
+		}
+		else
+#endif
+		{
+			START_CRIT_SECTION();
 
-		/* Copy page data from the source to the destination. */
-		memcpy(dstPage, srcPage, BLCKSZ);
-		MarkBufferDirty(dstBuf);
+			/* Copy page data from the source to the destination. */
+			memcpy(dstPage, srcPage, BLCKSZ);
+			MarkBufferDirty(dstBuf);
 
-		/* WAL-log the copied page. */
-		if (use_wal)
-			log_newpage_buffer(dstBuf, true);
+			/* WAL-log the copied page. */
+			if (use_wal)
+				log_newpage_buffer(dstBuf, true);
 
-		END_CRIT_SECTION();
+			END_CRIT_SECTION();
+		}
 
 		UnlockReleaseBuffer(dstBuf);
 		UnlockReleaseBuffer(srcBuf);

@@ -16,6 +16,7 @@
 
 #include "access/xlogreader.h"
 #include "cluster/cluster_space_identity.h"
+#include "storage/buf.h"
 
 /* Caller is the original relation-create owner, after registering native
  * abort-time deletion (or under CREATE DATABASE's whole-directory cleanup).
@@ -34,6 +35,14 @@ extern bool cluster_space_relation_read_identity(RelFileLocator locator, Cluster
  * flushes returned WAL before DATA and retains its final native fsync. */
 extern bool cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
 										BlockNumber block, void *page, XLogRecPtr *lsn);
+
+/* Original new-fork buffer-copy owner only: source content is share-locked,
+ * destination is pinned/exclusively content-locked and must be entirely zero
+ * after native extension. Captures UNFORMATTED before copying; emits the same
+ * FPI+version record and publishes dirty bytes atomically. Native buffer
+ * writeback owns WAL-before-DATA. Refusal leaves destination unchanged. */
+extern bool cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *source,
+										  Buffer destination);
 
 /* Original recovery executor only, with its existing isolation and selected
  * WAL inputs. Decode/identity success is not recovery admission. False MUST

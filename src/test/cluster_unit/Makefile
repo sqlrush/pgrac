@@ -1234,7 +1234,12 @@ test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_
 test_cluster_space_producer_product.o: $(top_srcdir)/src/backend/cluster/cluster_page_producer.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_space_copy_version: test_cluster_space_copy_version.c unit_test.h \
+test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^RelationCopyStorageUsingBuffer\(/ { print "static void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_copy_version: test_cluster_space_copy_version.c test_cluster_space_copy_buffer.inc unit_test.h \
 		test_cluster_space_catalog_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_catalog_product.o \
