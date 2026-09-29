@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_heap_insert_version.c
- *    Execute native INSERT's critical mutation and WAL publication block.
+ *    Execute native INSERT/DELETE critical mutation and WAL publication.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -58,6 +58,7 @@ static ClusterWalDurablePrefixRef ref;
 static RelFileLocator tags[2];
 static ForkNumber forks[2];
 static bool permanent, claim_ready, recovering;
+static bool deleting;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -201,9 +202,9 @@ XLogRegisterData(char *bytes, uint32 len)
 	if (!begun)
 		abort();
 	if (data_calls++ == 0) {
-		if (len != SizeOfHeapInsert)
+		if (len != (deleting ? SizeOfHeapDelete : SizeOfHeapInsert))
 			abort();
-		heap_flags = ((xl_heap_insert *)bytes)->flags;
+		heap_flags = deleting ? ((xl_heap_delete *)bytes)->flags : ((xl_heap_insert *)bytes)->flags;
 	}
 }
 
@@ -243,7 +244,8 @@ XLogSetRecordFlags(uint8 flags)
 XLogRecPtr
 XLogInsert(RmgrId rmid, uint8 info)
 {
-	if (!begun || rmid != RM_HEAP_ID || (info & XLOG_HEAP_OPMASK) != XLOG_HEAP_INSERT)
+	if (!begun || rmid != RM_HEAP_ID
+		|| (info & XLOG_HEAP_OPMASK) != (deleting ? XLOG_HEAP_DELETE : XLOG_HEAP_INSERT))
 		abort();
 	UT_ASSERT(dirty[0]);
 	if (edge_count == 2)
@@ -296,6 +298,8 @@ errfinish(const char *file, int line, const char *func)
 }
 
 #include "test_cluster_heap_put_tuple.inc"
+#include "test_cluster_heap_infobits.inc"
+#include "test_cluster_space_xid_precedes.inc"
 
 static void
 run_insert(bool versioned, bool active_itl, int options)
@@ -316,6 +320,43 @@ run_insert(bool versioned, bool active_itl, int options)
 	(void)cluster_page_versioned;
 	(void)cluster_page_versions;
 #include "test_cluster_heap_insert_version.inc"
+}
+
+static void
+run_delete(bool versioned, bool vm, bool recomposed)
+{
+	Relation relation = &relation_data;
+	Buffer buffer = 1, vmbuffer = vm ? 2 : InvalidBuffer;
+	Page page = pages[0].data;
+	HeapTupleData tp = tuple;
+	HeapTuple old_key_tuple = NULL;
+	TransactionId xid = 501, canonical_xid = 501, new_xmax = 501;
+	CommandId cid = 2;
+	uint16 new_infomask = 0, new_infomask2 = 0;
+	bool all_visible_cleared = false, iscombo = false, changingPart = false;
+	bool cluster_itl_active = true, cluster_current_mx_recomposed = recomposed;
+	uint8 cluster_itl_slot = 0;
+	SCN cluster_itl_write_scn = 810;
+	UBA cluster_itl_uba = InvalidUba_init;
+	uint8 cluster_current_mx_planned_header[SizeofHeapTupleHeader] pg_attribute_aligned(
+		MAXIMUM_ALIGNOF);
+	bool cluster_page_versioned = versioned;
+	RfPageProducerBatchV1 cluster_page_versions = prepared;
+
+	tp.t_data = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+	memcpy(cluster_current_mx_planned_header, tp.t_data, SizeofHeapTupleHeader);
+	if (recomposed) {
+		HeapTupleHeader planned = (HeapTupleHeader)cluster_current_mx_planned_header;
+
+		new_xmax = 900;
+		planned->t_itl_slot_idx = 0;
+		planned->t_infomask = HEAP_XMAX_IS_MULTI;
+		HeapTupleHeaderSetXmax(planned, new_xmax);
+	}
+	(void)cluster_page_versioned;
+	(void)cluster_page_versions;
+	deleting = true;
+#include "test_cluster_heap_delete_version.inc"
 }
 
 static void
@@ -350,7 +391,7 @@ reset(bool versioned, bool vm, bool bit_set)
 	forks[0] = MAIN_FORKNUM;
 	forks[1] = VISIBILITYMAP_FORKNUM;
 	permanent = claim_ready = true;
-	recovering = false;
+	recovering = deleting = false;
 	NLocBuffer = 1;
 	BufferBlocks = pages[0].data;
 	PageInitHeapPage(pages[0].data, BLCKSZ, 0);
@@ -561,16 +602,78 @@ UT_TEST(test_same_transaction_second_insert_has_distinct_before_and_result)
 	UT_ASSERT((wal_info & XLOG_HEAP_INIT_PAGE) == 0);
 }
 
+UT_TEST(test_native_delete_has_heap_vm_edge_and_retains_recomposed_header)
+{
+	int mode;
+
+	for (mode = 0; mode < 3; mode++) {
+		Buffer buffers[2] = { 1, 2 };
+		uint8 ids[2] = { 0, 1 };
+		bool vm = mode > 0;
+		HeapTupleHeader deleted;
+
+		reset(true, false, false);
+		run_insert(true, true, 0);
+		want_vm = vm;
+		if (vm)
+			PageSetAllVisible(pages[0].data);
+		pages[1].data[SizeOfPageHeaderData] = mode == 1 ? 3 : 0;
+		UT_ASSERT(
+			cluster_space_prepare_buffer_versions(&identity, buffers, ids, vm ? 2 : 1, &prepared));
+		memset(registered, 0, sizeof(registered));
+		memset(dirty, 0, sizeof(dirty));
+		edge_count = data_calls = 0;
+		run_delete(true, vm, mode == 2);
+		deleted = (HeapTupleHeader)PageGetItem(pages[0].data,
+											   PageGetItemId(pages[0].data, FirstOffsetNumber));
+		UT_ASSERT_EQ(edge_count, vm ? 2 : 1);
+		UT_ASSERT_EQ(edge_token, 101);
+		UT_ASSERT_EQ(edges[0].before.mutation_token, 100);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 101);
+		UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(deleted), mode == 2 ? 900 : 501);
+		UT_ASSERT_EQ(deleted->t_itl_slot_idx, 0);
+		UT_ASSERT((heap_flags & XLH_DELETE_ITL_DELTA) != 0);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_prune_xid, 501);
+		if (vm) {
+			UT_ASSERT_EQ(edges[1].before.mutation_token, 31);
+			UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 101);
+			UT_ASSERT_EQ(PageGetLSN(pages[1].data), 200);
+			UT_ASSERT(dirty[1] && registered[1]);
+			UT_ASSERT_EQ(register_flags[1], REGBUF_FORCE_IMAGE);
+			UT_ASSERT_EQ(images[1].data[BLCKSZ - 1], 42);
+		}
+	}
+}
+
+UT_TEST(test_legacy_delete_keeps_implicit_vm_wal_shape)
+{
+	reset(false, false, false);
+	run_insert(false, true, 0);
+	want_vm = true;
+	PageSetAllVisible(pages[0].data);
+	pages[1].data[SizeOfPageHeaderData] = 3;
+	memset(registered, 0, sizeof(registered));
+	data_calls = 0;
+	run_delete(false, true, false);
+	UT_ASSERT_EQ(edge_count, 0);
+	UT_ASSERT(!registered[1]);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
+	UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 31);
+	UT_ASSERT_EQ(inserts, 2);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(test_native_insert_publishes_heap_edge_with_itl_delta);
 	UT_RUN(test_native_insert_covers_vm_even_when_bit_was_already_clear);
 	UT_RUN(test_legacy_insert_keeps_existing_wal_shape);
 	UT_RUN(test_buffer_capture_has_no_mutation_before_apply);
 	UT_RUN(test_capture_refuses_whole_batch_without_token_or_byte_change);
 	UT_RUN(test_same_transaction_second_insert_has_distinct_before_and_result);
+	UT_RUN(test_native_delete_has_heap_vm_edge_and_retains_recomposed_header);
+	UT_RUN(test_legacy_delete_keeps_implicit_vm_wal_shape);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

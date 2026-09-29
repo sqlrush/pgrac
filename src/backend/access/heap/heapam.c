@@ -10602,6 +10602,10 @@ heap_delete(Relation relation, ItemPointer tid,
 	bool		old_key_copied = false;
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	/* PGRAC: exact versions of this DELETE and its optional VM mutation. */
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
 	/* PGRAC (spec-3.4a D5 / spec-3.4b D5): hoisted ITL state for delete path. */
 	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_active = false;
@@ -10640,6 +10644,16 @@ heap_delete(Relation relation, ItemPointer tid,
 				 errmsg("cannot delete tuples during a parallel operation")));
 
 #ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_read_identity(relation->rd_locator,
+													&cluster_page_identity))
+			elog(ERROR, "shared heap delete requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_write_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -11263,6 +11277,19 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		uint8 mx_publication_count = 0;
 		bool zero_apply_retry = false;
 
+		/* PGRAC: after final VM acquisition, before the exact undo/MX APPLY.
+		 * Only private before-state is prepared; l1 retries capture afresh. */
+		if (cluster_page_versioned)
+		{
+			Buffer version_buffers[2] = {buffer, vmbuffer};
+			uint8 version_ids[2] = {0, 1};
+
+			if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+													   version_buffers, version_ids,
+													   vm_locked ? 2 : 1,
+													   &cluster_page_versions))
+				elog(ERROR, "shared heap delete cannot capture exact page versions");
+		}
 		MemSet(&undo_plan, 0, sizeof(undo_plan));
 		MemSet(&mx_publication, 0, sizeof(mx_publication));
 		MemSet(&undo_target, 0, sizeof(undo_target));
@@ -11415,6 +11442,14 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 	START_CRIT_SECTION();
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: do not invalidate receipt or MX fingerprints before APPLY. */
+	if (cluster_page_versioned)
+	{
+		if (!rf_page_producer_stamp_v1(&cluster_page_versions))
+			elog(PANIC, "heap delete page version changed after receipt APPLY");
+		if (cluster_page_versions.entry_count == 2)
+			MarkBufferDirty(vmbuffer);
+	}
 	if (cluster_itl_active)
 	{
 		cluster_itl_stamp_active_with_history(buffer, cluster_itl_slot, canonical_xid,
@@ -11561,9 +11596,22 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		/* filtering by origin on a row level is much more efficient */
 		XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			if (cluster_page_versions.entry_count == 2)
+				XLogRegisterBuffer(1, vmbuffer, REGBUF_FORCE_IMAGE);
+			if (!rf_page_producer_register_wal_v1(&cluster_page_versions))
+				elog(PANIC, "heap delete page-version WAL registration failed");
+		}
+#endif
 		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_DELETE);
 
 		PageSetLSN(page, recptr);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned && cluster_page_versions.entry_count == 2)
+			PageSetLSN(BufferGetPage(vmbuffer), recptr);
+#endif
 	}
 
 	END_CRIT_SECTION();

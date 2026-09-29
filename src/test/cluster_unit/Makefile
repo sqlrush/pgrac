@@ -1229,11 +1229,30 @@ test_cluster_heap_put_tuple.inc: $(top_srcdir)/src/backend/access/heap/hio.c Mak
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_delete_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_delete\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { emit=1; starts++ } \
+	     emit { print } \
+	     inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_infobits.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^compute_infobits\(/ { print "static uint8"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_xid_precedes.inc: $(top_srcdir)/src/backend/access/transam/transam.c Makefile
+	awk '/^TransactionIdPrecedes\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_space_bufpage_product.o: $(top_srcdir)/src/backend/storage/page/bufpage.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_heap_insert_version: test_cluster_heap_insert_version.c unit_test.h \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
+		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
@@ -2910,6 +2929,7 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
+		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
 		test_cluster_control_root_worker.inc \
 		test_cluster_ges_recovery_modes.inc \
 		test_cluster_cr_mvcc_gate.inc \
