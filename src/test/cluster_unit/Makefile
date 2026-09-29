@@ -435,6 +435,44 @@ SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
+
+# PGRAC: execute original entry-point prologues before any native mutation.
+TESTS += test_cluster_fresh_scope
+test_cluster_fresh_control.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^XLogValidateControlFile\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_startup.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
+	awk '/^LocalProcessControlFile\(/ { print "void"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_read.inc: $(top_srcdir)/src/common/controldata_utils.c Makefile
+	awk '/^get_controlfile\(/ { print "ControlFileData *"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_boolean.inc: $(top_srcdir)/src/backend/commands/define.c Makefile
+	awk '/^defGetBoolean\(/ { print "bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_index.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
+	awk '/^CheckClusterIndexConcurrency\(/ { print "void"; emit=1 } \
+	     /^DefineIndex\(/ { print "ObjectAddress"; emit=1; create=1; count++ } \
+	     /^ExecReindex\(/ { print "void"; emit=1; reindex=1; count++ } \
+	     create && /root_save_nestlevel = NewGUCNestLevel/ { print "return InvalidObjectAddress; }"; emit=0; create=0 } \
+	     reindex && /params.options =/ { print "return; }"; emit=0; reindex=0 } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefile
+	awk '/^standard_ProcessUtility\(/ { inside=1 } \
+	     inside && /parsetree = pstmt->utilityStmt;/ { emit=1; count++ } \
+	     /readonly_flags = ClassifyUtilityCommandAsReadOnly/ { emit=0 } \
+	     emit { print } /^}/ { inside=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
+		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
+		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc
+	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
+		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers,$(SIMPLE_TESTS))
@@ -2927,6 +2965,8 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
+		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
 		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \

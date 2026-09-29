@@ -4185,9 +4185,9 @@ UT_TEST(test_v2_database_state_validation_is_not_an_open_decision)
 		v2_checksums(bytes);
 		UT_ASSERT_EQ(
 			cluster_control_root_v2_decode(bytes, sizeof(bytes), v2_storage, TEST_SYSID, &out),
-			state >= 1 && state <= 6 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
+			state >= 1 && state <= 5 ? CLUSTER_CONTROL_ROOT_OK_PRIMARY
 									 : CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
-		if (state >= 1 && state <= 6)
+		if (state >= 1 && state <= 5)
 			UT_ASSERT_EQ(out.header.v2.database_state, state);
 		else
 			UT_ASSERT(v2_zero(&out, sizeof(out)));
@@ -5404,7 +5404,7 @@ UT_TEST(test_startup_durable_prefix_must_bind_new_checkpoint_and_claim)
 	UT_ASSERT_EQ(out.prefix.record_crc, 0);
 }
 
-UT_TEST(test_startup_recovery_import_and_old_config_remain_distinct)
+UT_TEST(test_startup_rejects_import_and_preserves_recovery)
 {
 	uint8 bytes[1536];
 	ControlRootImage root;
@@ -5413,8 +5413,10 @@ UT_TEST(test_startup_recovery_import_and_old_config_remain_distinct)
 	startup_fixture(bytes, &root, 1);
 	put_u32_le(bytes + 12, 3);
 	startup_checksum(bytes, &root);
-	UT_ASSERT_EQ(cluster_control_root_v3_startup_decode(bytes, sizeof(bytes), &root, 0, &out), 0);
-	UT_ASSERT_EQ(out.input_kind, CLUSTER_WAL_STARTUP_IMPORTED);
+	UT_ASSERT_EQ(startup_refused(bytes, sizeof(bytes), &root, 0),
+				 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
+	put_u32_le(bytes + 12, 1);
+	startup_checksum(bytes, &root);
 	/* Reading an old pending operation after configuration advances is not
 	 * permission to resume that old initializer under a new configuration. */
 	root.header.v2.config_generation++;
@@ -9094,9 +9096,6 @@ v3_route_binding(const ControlRootImage *root, const char *pgdata)
 	memcpy(binding.authority_uuid, root->header.authority_uuid, 16);
 	binding.database_incarnation = root->header.v2.database_incarnation;
 	binding.node_id = 0;
-	memset(binding.operation_uuid, 0x41, 16);
-	memset(binding.source_cold_sha256, 0x42, 32);
-	memset(binding.target_qualification_sha256, 0x43, 32);
 	memcpy(binding.migration_round_sha256, root->header.migration_round_sha256, 32);
 	memcpy(binding.source_wal_state_sha256, root->header.source_wal_state_sha256, 32);
 	binding.migration_prepare_generation = root->header.migration_prepare_generation;
@@ -12882,9 +12881,6 @@ bootstrap_fixture(BootstrapFixture *f, int node)
 	memcpy(binding.authority_uuid, root.header.authority_uuid, 16);
 	binding.database_incarnation = 41;
 	binding.node_id = node;
-	memset(binding.operation_uuid, 0x41, 16);
-	memset(binding.source_cold_sha256, 0x42, 32);
-	memset(binding.target_qualification_sha256, 0x43, 32);
 	memcpy(binding.migration_round_sha256, root.header.migration_round_sha256, 32);
 	memcpy(binding.source_wal_state_sha256, root.header.source_wal_state_sha256, 32);
 	binding.migration_prepare_generation = 3;
@@ -13021,7 +13017,7 @@ UT_TEST(test_bootstrap_changed_root_is_not_a_partial_success)
 	v2_checksums(f.after);
 	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_STALE_TOKEN);
 	/* A revoked after-image is terminal, not a retry that could reopen it. */
-	put_u32_le(f.after + 196, CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED);
+	put_u32_le(f.after + 196, 6); /* withdrawn cold-import rollback */
 	v2_checksums(f.after);
 	UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
 	f.after[200] ^= 1;
@@ -13042,7 +13038,7 @@ UT_TEST(test_bootstrap_absent_unconfigured_retired_or_revoked)
 		} else if (fault == 2)
 			f.before[512 + 10] = CLUSTER_CONTROL_ROOT_LIFECYCLE_RETIRED;
 		else
-			put_u32_le(f.before + 196, CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED);
+			put_u32_le(f.before + 196, 6);
 		v2_checksums(f.before);
 		memcpy(f.after, f.before, sizeof(f.after));
 		bootstrap_refused(&f.input);
@@ -14332,13 +14328,12 @@ UT_TEST(test_bootstrap_read_real_root_replacement_and_binding_races)
 		memcpy(bootstrap_replacement, f.before, sizeof(f.before));
 		put_u64_le(bootstrap_replacement + 16, 8);
 		if (race == 3)
-			put_u32_le(bootstrap_replacement + 196,
-					   CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED);
+			put_u32_le(bootstrap_replacement + 196, 6); /* withdrawn cold-import rollback */
 		else if (race == 4)
 			put_u64_le(bootstrap_replacement + 200, 42);
 		v2_checksums(bootstrap_replacement);
 		UT_ASSERT(pgrac_control_binding_decode(f.binding, sizeof(f.binding), &binding));
-		binding.target_qualification_sha256[0] ^= 1;
+		binding.migration_round_sha256[0] ^= 1;
 		UT_ASSERT(pgrac_control_binding_encode(&binding, bootstrap_binding_replacement, 256));
 		bootstrap_race = race;
 		UT_ASSERT_EQ(bootstrap_read_refused(0), race == 3 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID
@@ -14635,13 +14630,12 @@ UT_TEST(test_bootstrap_capacity_reobserves_after_collection)
 			memcpy(bootstrap_replacement, f.before, sizeof(f.before));
 			put_u64_le(bootstrap_replacement + 16, 8);
 			if (race == 3)
-				put_u32_le(bootstrap_replacement + 196,
-						   CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED);
+				put_u32_le(bootstrap_replacement + 196, 6); /* withdrawn cold-import rollback */
 			else if (race == 4)
 				put_u64_le(bootstrap_replacement + 200, 42);
 			v2_checksums(bootstrap_replacement);
 			UT_ASSERT(pgrac_control_binding_decode(f.binding, sizeof(f.binding), &binding));
-			binding.target_qualification_sha256[0] ^= 1;
+			binding.migration_round_sha256[0] ^= 1;
 			UT_ASSERT(pgrac_control_binding_encode(&binding, bootstrap_binding_replacement, 256));
 			bootstrap_race = race;
 			bootstrap_race_at = 3;
@@ -18790,7 +18784,7 @@ main(int argc, char **argv)
 	UT_RUN(test_startup_new_claim_requires_same_database_and_fresh_writer);
 	UT_RUN(test_startup_unfinished_phase_has_no_successor_or_prefix);
 	UT_RUN(test_startup_durable_prefix_must_bind_new_checkpoint_and_claim);
-	UT_RUN(test_startup_recovery_import_and_old_config_remain_distinct);
+	UT_RUN(test_startup_rejects_import_and_preserves_recovery);
 	UT_RUN(test_startup_invalid_arguments_and_aliases_cannot_leave_partial_input);
 	UT_RUN(test_v2_view_selects_exact_hash_not_decoy_or_projection);
 	UT_RUN(test_v2_view_requires_clusterwide_lock_and_verified_storage);

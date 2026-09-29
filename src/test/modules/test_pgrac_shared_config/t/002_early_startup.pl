@@ -41,13 +41,13 @@ print {$fh} $bytes;
 close($fh) or die "close test control: $!";
 ok(!$bad->start(fail_ok => 1), 'incomplete shared profile refuses startup');
 like(slurp_file($bad->logfile),
-	qr/invalid native bootstrap preparation input/,
-	'profile is bound before reading the corrupt non-authoritative projection');
-unlike(slurp_file($bad->logfile), qr/incorrect checksum in control file/,
-	'legacy projection is not consulted for PRE2 sizing');
+	qr/incorrect checksum in control file/,
+	'unbound legacy input is diagnosed before new bootstrap objects');
+unlike(slurp_file($bad->logfile), qr/PRE1 data directory/,
+	'corrupt unbound input is not misreported as a verified old format');
 is(slurp_file($control), $bytes, 'startup refusal does not rewrite control bytes');
 command_fails_like(['postgres', '--single', '-D', $bad->data_dir, 'postgres'],
-	qr/PRE2 shared-control startup is not yet available/,
-	'standalone entry also binds profile before control read');
+	qr/incorrect checksum in control file/,
+	'standalone entry also rejects corrupt unbound input');
 is(slurp_file($control), $bytes, 'standalone refusal leaves the projection untouched');
 done_testing();

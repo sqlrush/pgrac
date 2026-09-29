@@ -459,7 +459,7 @@ bootstrap_test_race(int value, void *extra)
 		bootstrap_test_read("local/global/pgrac_control_binding", bytes, sizeof(bytes));
 		if (!pgrac_control_binding_decode(bytes, sizeof(bytes), &binding))
 			ereport(ERROR, (errmsg("test race binding is invalid")));
-		binding.target_qualification_sha256[0] ^= 1;
+		binding.migration_round_sha256[0] ^= 1;
 		if (!pgrac_control_binding_encode(&binding, bytes, sizeof(bytes)))
 			ereport(ERROR, (errmsg("test race binding cannot encode")));
 		bootstrap_test_write("local/global/pgrac_control_binding", bytes, sizeof(bytes));
@@ -979,9 +979,6 @@ test_pgrac_bootstrap_fixture(PG_FUNCTION_ARGS)
 	memcpy(binding.storage_uuid, header->storage_uuid, 16);
 	memcpy(binding.authority_uuid, header->authority_uuid, 16);
 	binding.database_incarnation = 41;
-	memset(binding.operation_uuid, 0x41, 16);
-	memset(binding.source_cold_sha256, 0x42, 32);
-	memset(binding.target_qualification_sha256, 0x43, 32);
 	memcpy(binding.migration_round_sha256, header->migration_round_sha256, 32);
 	memcpy(binding.source_wal_state_sha256, header->source_wal_state_sha256, 32);
 	binding.migration_prepare_generation = 3;

@@ -70,6 +70,39 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: shared catalog does not implement global concurrent-index phases.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#include "cluster/cluster_guc.h"
+
+void
+CheckClusterIndexConcurrency(Node *statement)
+{
+	bool concurrently = false;
+
+	if (!cluster_shared_config && !cluster_shared_catalog)
+		return;
+	if (IsA(statement, IndexStmt))
+		concurrently = ((IndexStmt *) statement)->concurrent;
+	else if (IsA(statement, ReindexStmt))
+	{
+		ListCell *lc;
+
+		foreach(lc, ((ReindexStmt *) statement)->params)
+		{
+			DefElem *opt = (DefElem *) lfirst(lc);
+
+			if (strcmp(opt->defname, "concurrently") == 0)
+				concurrently = defGetBoolean(opt);
+		}
+	}
+	if (concurrently)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("concurrent index creation or reindexing is not supported in shared mode"),
+				 errhint("Use CREATE INDEX or REINDEX without CONCURRENTLY.")));
+}
+#endif
 
 /* non-export function prototypes */
 static bool CompareOpclassOptions(Datum *opts1, Datum *opts2, int natts);
@@ -580,6 +613,10 @@ DefineIndex(Oid relationId,
 	int			root_save_sec_context;
 	int			root_save_nestlevel;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: also cover callers outside ProcessUtility, before any mutation. */
+	CheckClusterIndexConcurrency((Node *) stmt);
+#endif
 	root_save_nestlevel = NewGUCNestLevel();
 
 	/*
@@ -2718,6 +2755,10 @@ ExecReindex(ParseState *pstate, ReindexStmt *stmt, bool isTopLevel)
 					 parser_errposition(pstate, opt->location)));
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: reject before native phase commits, locks or catalog writes. */
+	CheckClusterIndexConcurrency((Node *) stmt);
+#endif
 	if (concurrently)
 		PreventInTransactionBlock(isTopLevel,
 								  "REINDEX CONCURRENTLY");

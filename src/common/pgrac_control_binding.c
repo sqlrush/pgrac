@@ -1,5 +1,5 @@
 /*-------------------------------------------------------------------------
- * PGRAC: cold-import binding codec and bounded read-only bootstrap I/O.
+ * PGRAC: new-database binding codec and bounded read-only bootstrap I/O.
  * Author: SqlRush <sqlrush@gmail.com>
  * Portions Copyright (c) 2026, pgrac contributors
  *-------------------------------------------------------------------------
@@ -19,7 +19,7 @@
 #include "common/pgrac_control_binding.h"
 #include "port/pg_crc32c.h"
 
-StaticAssertDecl(sizeof(PgracControlBinding) == 216, "local binding carrier size");
+StaticAssertDecl(sizeof(PgracControlBinding) == 136, "local binding carrier size");
 
 static bool
 binding_zero(const void *ptr, size_t length)
@@ -51,9 +51,6 @@ binding_valid(const PgracControlBinding *binding)
 		   && binding->node_id < PGRAC_CONTROL_BINDING_MAX_NODES && binding->reserved == 0
 		   && binding->migration_prepare_generation != 0 && binding->migration_transition_epoch != 0
 		   && !binding_zero(binding->storage_uuid, 16) && !binding_zero(binding->authority_uuid, 16)
-		   && !binding_zero(binding->operation_uuid, 16)
-		   && !binding_zero(binding->source_cold_sha256, 32)
-		   && !binding_zero(binding->target_qualification_sha256, 32)
 		   && !binding_zero(binding->migration_round_sha256, 32)
 		   && !binding_zero(binding->source_wal_state_sha256, 32);
 }
@@ -98,7 +95,7 @@ pgrac_control_binding_encode(const PgracControlBinding *binding, uint8 *bytes, s
 		|| !binding_valid(binding))
 		return false;
 	memcpy(bytes, "PGCB", 4);
-	binding_put(bytes, 4, 1, 2);
+	binding_put(bytes, 4, 2, 2);
 	binding_put(bytes, 6, PGRAC_CONTROL_BINDING_BYTES, 2);
 	binding_put(bytes, 8, UINT32_C(0x01020304), 4);
 	binding_put(bytes, 16, binding->system_identifier, 8);
@@ -106,9 +103,6 @@ pgrac_control_binding_encode(const PgracControlBinding *binding, uint8 *bytes, s
 	memcpy(bytes + 40, binding->authority_uuid, 16);
 	binding_put(bytes, 56, binding->database_incarnation, 8);
 	binding_put(bytes, 64, binding->node_id, 4);
-	memcpy(bytes + 72, binding->operation_uuid, 16);
-	memcpy(bytes + 88, binding->source_cold_sha256, 32);
-	memcpy(bytes + 120, binding->target_qualification_sha256, 32);
 	memcpy(bytes + 152, binding->migration_round_sha256, 32);
 	memcpy(bytes + 184, binding->source_wal_state_sha256, 32);
 	binding_put(bytes, 216, binding->migration_prepare_generation, 8);
@@ -127,11 +121,12 @@ pgrac_control_binding_decode(const uint8 *bytes, size_t length, PgracControlBind
 		memset(out, 0, sizeof(*out));
 	if (overlap || out == NULL || bytes == NULL || length != PGRAC_CONTROL_BINDING_BYTES)
 		return false;
-	if (memcmp(bytes, "PGCB", 4) != 0 || binding_get(bytes, 4, 2) != 1
+	if (memcmp(bytes, "PGCB", 4) != 0 || binding_get(bytes, 4, 2) != 2
 		|| binding_get(bytes, 6, 2) != PGRAC_CONTROL_BINDING_BYTES
 		|| binding_get(bytes, 8, 4) != UINT32_C(0x01020304) || !binding_zero(bytes + 12, 4)
-		|| !binding_zero(bytes + 68, 4) || !binding_zero(bytes + 232, 16)
-		|| !binding_zero(bytes + 252, 4) || binding_get(bytes, 248, 4) != binding_crc(bytes))
+		|| !binding_zero(bytes + 72, 80) || !binding_zero(bytes + 68, 4)
+		|| !binding_zero(bytes + 232, 16) || !binding_zero(bytes + 252, 4)
+		|| binding_get(bytes, 248, 4) != binding_crc(bytes))
 		return false;
 	memset(&decoded, 0, sizeof(decoded));
 	decoded.system_identifier = binding_get(bytes, 16, 8);
@@ -139,9 +134,6 @@ pgrac_control_binding_decode(const uint8 *bytes, size_t length, PgracControlBind
 	memcpy(decoded.authority_uuid, bytes + 40, 16);
 	decoded.database_incarnation = binding_get(bytes, 56, 8);
 	decoded.node_id = binding_get(bytes, 64, 4);
-	memcpy(decoded.operation_uuid, bytes + 72, 16);
-	memcpy(decoded.source_cold_sha256, bytes + 88, 32);
-	memcpy(decoded.target_qualification_sha256, bytes + 120, 32);
 	memcpy(decoded.migration_round_sha256, bytes + 152, 32);
 	memcpy(decoded.source_wal_state_sha256, bytes + 184, 32);
 	decoded.migration_prepare_generation = binding_get(bytes, 216, 8);

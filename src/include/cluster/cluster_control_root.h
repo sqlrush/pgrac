@@ -83,8 +83,8 @@ typedef enum ClusterControlRootDatabaseState {
 	CLUSTER_CONTROL_ROOT_DATABASE_RECOVERING = 2,
 	CLUSTER_CONTROL_ROOT_DATABASE_OPEN = 3,
 	CLUSTER_CONTROL_ROOT_DATABASE_CLOSING = 4,
-	CLUSTER_CONTROL_ROOT_DATABASE_CLOSED = 5,
-	CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED = 6
+	CLUSTER_CONTROL_ROOT_DATABASE_CLOSED = 5
+	/* Value 6 was cold-import rollback; deliberately not reused. */
 } ClusterControlRootDatabaseState;
 
 typedef enum ClusterControlRootCheckpointSource {

@@ -60,7 +60,9 @@ for my $case (
 	['checksum-version', qr/unsupported PRE2 data checksum version/],
 	['identity', qr/native bootstrap observation failed/],
 	['root-race', qr/native bootstrap observation changed during configuration application/],
-	['binding-race', qr/native bootstrap observation changed during configuration application/],
+	# The retained first-OPEN identity now replaces the removed cold-import
+	# digest in this race, so the exact reader rejects before byte comparison.
+	['binding-race', qr/native bootstrap observation could not be revalidated/],
 	['hook-error', qr/shared configuration startup callback failed/])
 {
 	my ($mutation, $expected) = @$case;

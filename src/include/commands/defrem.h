@@ -24,6 +24,11 @@
 extern void RemoveObjects(DropStmt *stmt);
 
 /* commands/indexcmds.c */
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: shared-mode concurrency restriction before native side effects.
+ * Author: SqlRush <sqlrush@gmail.com> */
+extern void CheckClusterIndexConcurrency(Node *statement);
+#endif
 extern ObjectAddress DefineIndex(Oid relationId,
 								 IndexStmt *stmt,
 								 Oid indexRelationId,

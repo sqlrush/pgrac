@@ -431,7 +431,7 @@ common_v2_validate(const ControlRootCommonV2 *common)
 	if (common->reserved4 != 0)
 		return CLUSTER_CONTROL_ROOT_BAD_RESERVED;
 	if (common->database_state < CLUSTER_CONTROL_ROOT_DATABASE_MOUNTED
-		|| common->database_state > CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED)
+		|| common->database_state > CLUSTER_CONTROL_ROOT_DATABASE_CLOSED)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	if (common->database_incarnation == 0 || common->formation_seq == 0
 		|| (common->configured[0] == 0 && common->configured[1] == 0)
@@ -982,8 +982,7 @@ startup_ref_validate(const ControlRootImage *image, uint16 node)
 	if ((common->serving[node / 64] & bit) != 0
 		|| (lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_CLOSED
 			&& lifecycle != CLUSTER_CONTROL_ROOT_LIFECYCLE_RECOVERY_COMPLETE)
-		|| common->database_state == CLUSTER_CONTROL_ROOT_DATABASE_CLOSED
-		|| common->database_state == CLUSTER_CONTROL_ROOT_DATABASE_MIGRATION_REVOKED)
+		|| common->database_state >= CLUSTER_CONTROL_ROOT_DATABASE_CLOSED)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
@@ -1324,7 +1323,7 @@ startup_decode_fields(const uint8 *bytes, const ControlRootImage *root, uint32 n
 	out->sealed_input_end = read_u64_le(bytes + 176);
 	if (out->phase < CLUSTER_WAL_STARTUP_RESERVED || out->phase > CLUSTER_WAL_STARTUP_DURABLE
 		|| out->input_kind < CLUSTER_WAL_STARTUP_CLEAN
-		|| out->input_kind > CLUSTER_WAL_STARTUP_IMPORTED)
+		|| out->input_kind > CLUSTER_WAL_STARTUP_RECOVERED)
 		return CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID;
 	if (bytes_are_zero(out->operation_uuid, 16) || bytes_are_zero(out->predecessor_file_sha256, 32)
 		|| bytes_are_zero(out->predecessor_evidence_sha256, 32) || out->formation_epoch == 0

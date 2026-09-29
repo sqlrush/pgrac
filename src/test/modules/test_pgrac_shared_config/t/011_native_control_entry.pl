@@ -30,7 +30,7 @@ if ($node->safe_psql('postgres',
 $node->safe_psql('postgres', 'CREATE EXTENSION test_pgrac_shared_config');
 my $data = $node->data_dir;
 my $base = "$data/test_native_bootstrap";
-my $later_guard = qr/Keep cluster.shared_config off until the complete root-v2 migration and startup path is qualified/;
+my $later_guard = qr/Keep cluster.shared_config off until the complete root-v2 fresh initialization and startup path is qualified/;
 for my $case (
 	['valid', 0, $later_guard],
 	['valid', 200, $later_guard],

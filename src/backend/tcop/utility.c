@@ -605,6 +605,12 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 		pstmt = copyObject(pstmt);
 	parsetree = pstmt->utilityStmt;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: reject unsupported shared index phases before event triggers.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	CheckClusterIndexConcurrency(parsetree);
+#endif
+
 	/* Prohibit read/write commands in read-only states. */
 	readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);
 	if (readonly_flags != COMMAND_IS_STRICTLY_READ_ONLY &&

@@ -843,7 +843,7 @@ cluster_cf_startup_prepare(const char *pgdata)
 		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("PRE2 shared-control startup is not yet available"),
 						errhint("Keep cluster.shared_config off until the complete root-v2 "
-								"migration and startup path is qualified.")));
+								"fresh initialization and startup path is qualified.")));
 	if (!cluster_controlfile_shared_authority)
 		return; /* off: stock per-node pg_control */
 

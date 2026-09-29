@@ -40,6 +40,7 @@
 #include "cluster/cluster_cf_authority.h"
 #include "cluster/cluster_xid_authority.h" /* epoch-witness stub signature (review F3) */
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_cf_phase2.h"
 #include "cluster/cluster_cf_stats.h"
 #include "cluster/cluster_cf_storage.h"
 #include "cluster/cluster_recovery_anchor.h"
@@ -78,6 +79,11 @@ ClusterControlRootResult
 cluster_control_root_v2_read_runtime_local_locked(ControlFileData *out pg_attribute_unused())
 {
 	abort(); /* Legacy migration must never invoke the v2 runtime reader. */
+}
+ClusterControlRootResult
+cluster_control_root_v3_read_runtime_local_locked(ControlFileData *out pg_attribute_unused())
+{
+	abort(); /* The PRE2 startup refusal also precedes the v3 reader. */
 }
 /* PGRAC: immutable image helpers are linked, but not exercised by this legacy
  * migration test. Never grant their clusterwide authority here.

@@ -1,5 +1,5 @@
 /*-------------------------------------------------------------------------
- * PGRAC: independently retained local cold-import identity.
+ * PGRAC: independently retained new-database bootstrap identity.
  * Author: SqlRush <sqlrush@gmail.com>
  * Portions Copyright (c) 2026, pgrac contributors
  *-------------------------------------------------------------------------
@@ -21,9 +21,6 @@ typedef struct PgracControlBinding {
 	uint64 database_incarnation;
 	uint32 node_id;
 	uint32 reserved;
-	uint8 operation_uuid[16];
-	uint8 source_cold_sha256[32];
-	uint8 target_qualification_sha256[32];
 	uint8 migration_round_sha256[32];
 	uint8 source_wal_state_sha256[32];
 	uint64 migration_prepare_generation;
@@ -43,7 +40,7 @@ typedef enum PgracControlBindingResult {
  * Exact-size codec. Input and output must not overlap; overlap is refused.
  * Output is cleared on refusal: sizeof(*out) for decode, at most
  * Min(capacity, PGRAC_CONTROL_BINDING_BYTES) for encode.
- * CRC detects damage, not authenticity, migration completion or admission.
+ * CRC detects damage, not authenticity, first-OPEN completion or admission.
  */
 extern bool pgrac_control_binding_encode(const PgracControlBinding *binding, uint8 *bytes,
 										 size_t capacity);

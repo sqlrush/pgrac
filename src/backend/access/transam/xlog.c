@@ -4851,6 +4851,20 @@ XLogValidateControlFile(const ControlFileData *control)
 		ereport(FATAL,
 				(errmsg("incorrect checksum in control file")));
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: no PRE1 physical import into the shared PRE2 format. Test only
+	 * after native version/CRC validation; a corrupt image is not an old one.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if ((cluster_shared_config || cluster_shared_catalog)
+		&& control->catalog_version_no == 202609120)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("PRE1 data directory is not supported by PRE2 shared mode"),
+				 errhint("Preserve the original directory. Initialize a new database with "
+						 "this version and reload the data; in-place migration is not supported.")));
+#endif
+
 	/*
 	 * Do compatibility checking immediately.  If the database isn't
 	 * compatible with the backend executable, we want to abort before we can
@@ -5475,6 +5489,24 @@ LocalProcessControlFile(bool reset)
 	 * Author: SqlRush <sqlrush@gmail.com>
 	 */
 	process_cluster_gucs();
+	if (cluster_shared_config || cluster_shared_catalog) {
+		PgracControlBinding binding;
+
+		/* PGRAC: PRE1 has no independent binding. Diagnose only that route;
+		 * a bound database must not read a stale/missing/FIFO compatibility
+		 * projection. Its selected root control is validated separately.
+		 * Invalid/unsafe bindings remain for the exact reader to refuse.
+		 * Author: SqlRush <sqlrush@gmail.com>
+		 */
+		if (pgrac_control_binding_read(DataDir, &binding) == PGRAC_CONTROL_BINDING_MISSING) {
+			ControlFileData *local;
+			bool crc_ok;
+
+			local = get_controlfile(DataDir, &crc_ok);
+			XLogValidateControlFile(local);
+			pfree(local);
+		}
+	}
 	if (cluster_shared_config) {
 		ClusterControlBootstrapPrepared prepared;
 
