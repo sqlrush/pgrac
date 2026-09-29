@@ -44,6 +44,10 @@ extern bool visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf);
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: callers copy this identity before acquiring page content locks. */
 struct ClusterSpaceIdentity;
+/* True only after exact shared VM replay; false selects native nonshared redo. */
+extern bool visibilitymap_set_versioned_redo(struct XLogReaderState *record,
+											RelFileLocator locator, BlockNumber heapBlk,
+											uint8 flags);
 #endif
 extern void visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 							  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,

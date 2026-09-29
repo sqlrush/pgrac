@@ -50,6 +50,8 @@
 #include "access/rmgr.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
+#include "access/xlog.h"
+#include "access/visibilitymap.h"
 #include "storage/bufpage.h"
 #include "storage/itemptr.h"
 #include "storage/off.h"
@@ -839,6 +841,30 @@ apply_heap_update(XLogReaderState *record, uint8 block_id, char *page, bool hot_
 	return CLUSTER_BLKAPPLY_OK;
 }
 
+static ClusterBlkApplyResult
+apply_heap_visible(XLogReaderState *record, uint8 block_id, char *page)
+{
+	xl_heap_visible rec;
+	const DecodedBkpBlock *heap = XLogRecGetBlock(record, block_id);
+	const DecodedBkpBlock *vm;
+
+	/* VM is the independent block-0 FPI. Only heap-1 has a delta codec. */
+	if (block_id != 1 || !XLogRecHasBlockRef(record, 0) || XLogRecGetData(record) == NULL
+		|| XLogRecGetDataLen(record) != SizeOfHeapVisible || heap->forknum != MAIN_FORKNUM
+		|| (heap->flags & BKPBLOCK_WILL_INIT) || !heap_delta_page_header_valid(page))
+		return CLUSTER_BLKAPPLY_FAILED;
+	vm = XLogRecGetBlock(record, 0);
+	memcpy(&rec, XLogRecGetData(record), SizeOfHeapVisible);
+	if (vm->forknum != VISIBILITYMAP_FORKNUM || !RelFileLocatorEquals(heap->rlocator, vm->rlocator)
+		|| vm->blkno != heap->blkno / ((BLCKSZ - MAXALIGN(SizeOfPageHeaderData)) * 4)
+		|| (rec.flags & ~VISIBILITYMAP_XLOG_VALID_BITS) || !(rec.flags & VISIBILITYMAP_ALL_VISIBLE))
+		return CLUSTER_BLKAPPLY_FAILED;
+	PageSetAllVisible(page);
+	if (XLogHintBitIsNeeded() || XLogRecHasPageVersionEdge(record))
+		PageSetLSN(page, record->EndRecPtr);
+	return CLUSTER_BLKAPPLY_OK;
+}
+
 /*
  * cluster_block_apply_heap -- dispatch a no-image heap delta to its per-record
  *		single-block applicator.  Record types not on the differential matrix
@@ -860,6 +886,8 @@ cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
 
 	if (XLogRecGetRmid(record) == RM_HEAP2_ID) {
 		switch (info) {
+		case XLOG_HEAP2_VISIBLE:
+			return apply_heap_visible(record, block_id, page);
 		case XLOG_HEAP2_LOCK_UPDATED:
 			return apply_heap_small(record, block_id, page, XLOG_HEAP_LOCK, true);
 		case XLOG_HEAP2_MULTI_INSERT:

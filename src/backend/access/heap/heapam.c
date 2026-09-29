@@ -22653,7 +22653,9 @@ heap_xlog_visible(XLogReaderState *record)
 
 		PageSetAllVisible(page);
 
-		if (XLogHintBitIsNeeded())
+		/* PGRAC: versioned VISIBLE producers retain normal FPI eligibility
+		 * and advance the heap LSN even without checksums or hint logging. */
+		if (XLogHintBitIsNeeded() || XLogRecHasPageVersionEdge(record))
 			PageSetLSN(page, lsn);
 
 		MarkBufferDirty(buffer);
@@ -22700,6 +22702,13 @@ heap_xlog_visible(XLogReaderState *record)
 	 * the visibility map bit does so before checking the page LSN, so any
 	 * bits that need to be cleared will still be cleared.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the recorded VM image has a restart identity, not a runtime
+	 * fake-relcache initialization. Heap content locks have been released. */
+	if (visibilitymap_set_versioned_redo(record, rlocator, blkno,
+									   xlrec->flags & VISIBILITYMAP_VALID_BITS))
+		return;
+#endif
 	if (XLogReadBufferForRedoExtended(record, 0, RBM_ZERO_ON_ERROR, false,
 									  &vmbuffer) == BLK_NEEDS_REDO)
 	{

@@ -218,8 +218,8 @@ vm_redo_page_valid(Page page)
  * recovery isolation/dependency selection remain the executor's obligation.
  * No numeric token/foreign LSN comparison, new identity, token, or WAL. */
 static void
-vm_clear_versioned_redo(XLogReaderState *record, RelFileLocator locator,
-						BlockNumber heapBlk, uint8 flags)
+vm_image_versioned_redo(XLogReaderState *record, RelFileLocator locator,
+						BlockNumber heapBlk, uint8 flags, bool setting)
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	ClusterSpaceIdentity identity;
@@ -277,7 +277,8 @@ vm_clear_versioned_redo(XLogReaderState *record, RelFileLocator locator,
 		(XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0 ||
 		!RestoreBlockImage(record, block_id, image.data) || !vm_redo_page_valid(image.data) ||
 		((PageHeader) image.data)->pd_block_scn != edge->result_token ||
-		(PageGetContents(image.data)[HEAPBLK_TO_MAPBYTE(heapBlk)] & mask) != 0)
+		(PageGetContents(image.data)[HEAPBLK_TO_MAPBYTE(heapBlk)] & mask) !=
+			(setting ? mask : 0))
 		elog(ERROR, "shared VM redo has no exact recorded result image");
 
 	/* Unlike XLogReadBufferForRedo, this cannot restore the FPI before checking
@@ -316,6 +317,36 @@ vm_clear_versioned_redo(XLogReaderState *record, RelFileLocator locator,
 	END_CRIT_SECTION();
 	UnlockReleaseBuffer(buffer);
 }
+
+bool
+visibilitymap_set_versioned_redo(XLogReaderState *record, RelFileLocator locator,
+								 BlockNumber heapBlk, uint8 flags)
+{
+	const DecodedBkpBlock *heap;
+	const DecodedBkpBlock *vm;
+	xl_heap_visible rec;
+
+	if (!cluster_shared_config || cluster_smgr_which_for(locator, InvalidBackendId) != 1)
+		return false;
+	if (XLogRecGetRmid(record) != RM_HEAP2_ID ||
+		(XLogRecGetInfo(record) & ~XLR_INFO_MASK) != XLOG_HEAP2_VISIBLE ||
+		!XLogRecHasBlockRef(record, 0) || !XLogRecHasBlockRef(record, 1) ||
+		XLogRecGetData(record) == NULL || XLogRecGetDataLen(record) != SizeOfHeapVisible)
+		elog(ERROR, "shared VM visible redo has invalid record shape");
+	heap = XLogRecGetBlock(record, 1);
+	vm = XLogRecGetBlock(record, 0);
+	memcpy(&rec, XLogRecGetData(record), SizeOfHeapVisible);
+	if ((flags != VISIBILITYMAP_ALL_VISIBLE && flags != VISIBILITYMAP_VALID_BITS) ||
+		(rec.flags & ~VISIBILITYMAP_XLOG_VALID_BITS) != 0 ||
+		(rec.flags & VISIBILITYMAP_VALID_BITS) != flags ||
+		heap->forknum != MAIN_FORKNUM || heap->blkno != heapBlk ||
+		!RelFileLocatorEquals(heap->rlocator, locator) ||
+		vm->forknum != VISIBILITYMAP_FORKNUM || vm->blkno != HEAPBLK_TO_MAPBLOCK(heapBlk) ||
+		!RelFileLocatorEquals(vm->rlocator, locator))
+		elog(ERROR, "shared VM visible redo has invalid set flags");
+	vm_image_versioned_redo(record, locator, heapBlk, flags, true);
+	return true;
+}
 #endif
 
 void
@@ -330,7 +361,7 @@ visibilitymap_clear_redo(XLogReaderState *record, RelFileLocator locator,
 #ifdef USE_PGRAC_CLUSTER
 	if (cluster_shared_config && cluster_smgr_which_for(locator, InvalidBackendId) == 1)
 	{
-		vm_clear_versioned_redo(record, locator, heapBlk, flags);
+		vm_image_versioned_redo(record, locator, heapBlk, flags, false);
 		return;
 	}
 #endif

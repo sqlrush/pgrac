@@ -34,7 +34,7 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
-bool cluster_enabled = true, cluster_shared_config = true;
+bool cluster_enabled = true, cluster_shared_config = true, wal_log_hints;
 int cluster_node_id, NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
@@ -47,6 +47,7 @@ static XLogReaderState reader;
 static DecodedXLogRecord *decoded;
 static unsigned dirties, releases, vm_calls;
 static bool locked;
+static bool checksums;
 static bool buffer_locked[2];
 static const BlockNumber block_number = 17;
 static char inplace_data[8] = "newvalue";
@@ -78,6 +79,13 @@ XLogRedoAction
 XLogReadBufferForRedoExtended(XLogReaderState *record, uint8 id, ReadBufferMode mode, bool cleanup,
 							  Buffer *buffer)
 {
+	if ((XLogRecGetRmid(record) == RM_HEAP2_ID)
+		&& (XLogRecGetInfo(record) & XLOG_HEAP_OPMASK) == XLOG_HEAP2_VISIBLE) {
+		/* VM bytes have a separate real implementation test. */
+		UT_ASSERT(id == 0 && mode == RBM_ZERO_ON_ERROR && !cleanup && !locked);
+		*buffer = InvalidBuffer;
+		return BLK_DONE;
+	}
 	UT_ASSERT(mode == RBM_NORMAL);
 	UT_ASSERT_EQ(cleanup, (XLogRecGetInfo(record) & XLOG_HEAP_OPMASK) == XLOG_HEAP2_PRUNE);
 	return XLogReadBufferForRedo(record, id, buffer);
@@ -93,7 +101,8 @@ ResolveRecoveryConflictWithSnapshot(TransactionId xid, bool catalog, RelFileLoca
 void
 XLogRecordPageWithFreeSpace(RelFileLocator locator, BlockNumber block, Size space)
 {
-	UT_ASSERT(locator.relNumber == 900 && block == block_number && !locked);
+	UT_ASSERT(locator.relNumber == 900 && (block == block_number || block == block_number + 1)
+			  && !locked);
 	UT_ASSERT(space <= BLCKSZ);
 }
 BlockNumber
@@ -124,6 +133,70 @@ visibilitymap_clear_redo(XLogReaderState *record, RelFileLocator locator, BlockN
 			  && (block == block_number || block == block_number + 1));
 	UT_ASSERT(flags == 0 || flags == VISIBILITYMAP_ALL_FROZEN || flags == VISIBILITYMAP_VALID_BITS);
 	vm_calls++;
+}
+bool
+DataChecksumsEnabled(void)
+{
+	return checksums;
+}
+/* Boundary only: exact VM image replay is tested by test_cluster_vm_redo. */
+bool visibilitymap_set_versioned_redo(XLogReaderState *record, RelFileLocator locator,
+									  BlockNumber block, uint8 flags);
+bool
+visibilitymap_set_versioned_redo(XLogReaderState *record, RelFileLocator locator, BlockNumber block,
+								 uint8 flags)
+{
+	UT_ASSERT(record == &reader && locator.relNumber == 900 && block == block_number + 1);
+	UT_ASSERT(!locked && (flags & VISIBILITYMAP_ALL_VISIBLE));
+	vm_calls++;
+	return cluster_shared_config;
+}
+void
+LockBuffer(Buffer buffer, int mode)
+{
+	(void)buffer;
+	(void)mode;
+	abort();
+}
+void
+ReleaseBuffer(Buffer buffer)
+{
+	(void)buffer;
+	abort();
+}
+Relation
+CreateFakeRelcacheEntry(RelFileLocator locator)
+{
+	(void)locator;
+	abort();
+}
+void
+FreeFakeRelcacheEntry(Relation rel)
+{
+	(void)rel;
+	abort();
+}
+void
+visibilitymap_pin(Relation rel, BlockNumber block, Buffer *buffer)
+{
+	(void)rel;
+	(void)block;
+	(void)buffer;
+	abort();
+}
+void
+visibilitymap_set(Relation rel, BlockNumber block, Buffer heapbuf, XLogRecPtr lsn, Buffer vmbuf,
+				  TransactionId cutoff, uint8 flags, const struct ClusterSpaceIdentity *identity)
+{
+	(void)rel;
+	(void)block;
+	(void)heapbuf;
+	(void)lsn;
+	(void)vmbuf;
+	(void)cutoff;
+	(void)flags;
+	(void)identity;
+	abort();
 }
 char *
 XLogRecGetBlockData(XLogReaderState *record, uint8 id, Size *length)
@@ -878,6 +951,85 @@ UT_TEST(test_update_bad_shapes_do_not_modify_output)
 }
 
 static void
+reset_visible(bool versioned, uint8 flags)
+{
+	xl_heap_visible rec;
+	reset(RM_HEAP2_ID, XLOG_HEAP2_VISIBLE, -1);
+	decoded = realloc(decoded, offsetof(DecodedXLogRecord, blocks) + 2 * sizeof(DecodedBkpBlock));
+	reader.record = decoded;
+	decoded->max_block_id = 1;
+	decoded->blocks[1] = decoded->blocks[0];
+	decoded->blocks[1].blkno = block_number + 1;
+	decoded->blocks[0].forknum = VISIBILITYMAP_FORKNUM;
+	decoded->blocks[0].blkno = 0;
+	decoded->has_page_version_edge = versioned;
+	memset(&rec, 0, sizeof(rec));
+	rec.flags = flags;
+	memcpy(main_data.data, &rec, SizeOfHeapVisible);
+	decoded->main_data_len = SizeOfHeapVisible;
+	native_pages[1] = detached_page = original;
+}
+
+UT_TEST(test_visible_heap_matches_native_and_producer_lsn)
+{
+	for (int versioned = 0; versioned < 2; versioned++)
+		for (int hints = 0; hints < 3; hints++)
+			for (int frozen = 0; frozen < 2; frozen++) {
+				cluster_shared_config = versioned;
+				checksums = hints == 1;
+				wal_log_hints = hints == 2;
+				reset_visible(versioned,
+							  VISIBILITYMAP_ALL_VISIBLE | (frozen ? VISIBILITYMAP_ALL_FROZEN : 0));
+				heap_xlog_visible(&reader);
+				UT_ASSERT(PageIsAllVisible(native_pages[1].data));
+				UT_ASSERT_EQ(PageGetLSN(native_pages[1].data),
+							 versioned || hints ? reader.EndRecPtr : PageGetLSN(original.data));
+				UT_ASSERT_EQ(cluster_block_apply_one(&reader, 1, detached_page.data),
+							 CLUSTER_BLKAPPLY_OK);
+				UT_ASSERT(memcmp(native_pages[1].data, detached_page.data, BLCKSZ) == 0);
+				UT_ASSERT_EQ(dirties, 1);
+				UT_ASSERT_EQ(releases, 1);
+				UT_ASSERT(!locked);
+			}
+	checksums = wal_log_hints = false;
+}
+
+UT_TEST(test_bad_visible_heap_leaves_output_unchanged)
+{
+	for (int bad = 0; bad < 7; bad++) {
+		PGAlignedBlock saved;
+		reset_visible(true, VISIBILITYMAP_ALL_VISIBLE);
+		switch (bad) {
+		case 0:
+			decoded->main_data_len--;
+			break;
+		case 1:
+			((xl_heap_visible *)main_data.data)->flags = VISIBILITYMAP_ALL_FROZEN;
+			break;
+		case 2:
+			decoded->blocks[0].rlocator.relNumber++;
+			break;
+		case 3:
+			decoded->blocks[0].blkno++;
+			break;
+		case 4:
+			decoded->blocks[1].forknum = VISIBILITYMAP_FORKNUM;
+			break;
+		case 5:
+			decoded->blocks[1].flags |= BKPBLOCK_WILL_INIT;
+			break;
+		case 6:
+			((PageHeader)detached_page.data)->pd_pagesize_version = 0;
+			break;
+		}
+		saved = detached_page;
+		UT_ASSERT_EQ(cluster_block_apply_one(&reader, 1, detached_page.data),
+					 CLUSTER_BLKAPPLY_FAILED);
+		UT_ASSERT(memcmp(saved.data, detached_page.data, BLCKSZ) == 0);
+	}
+}
+
+static void
 reset_maintenance(uint8 opcode, bool itl_page)
 {
 	PGAlignedBlock tuple;
@@ -1098,7 +1250,7 @@ UT_TEST(test_bad_maintenance_does_not_modify_output)
 int
 main(void)
 {
-	UT_PLAN(14);
+	UT_PLAN(16);
 	UT_RUN(test_confirm_and_inplace_match_native);
 	UT_RUN(test_lock_and_updated_lock_match_native);
 	UT_RUN(test_zero_length_inplace_payload_matches_native);
@@ -1113,6 +1265,8 @@ main(void)
 	UT_RUN(test_insert_delete_bad_shapes_do_not_modify_output);
 	UT_RUN(test_update_variants_match_native);
 	UT_RUN(test_update_bad_shapes_do_not_modify_output);
+	UT_RUN(test_visible_heap_matches_native_and_producer_lsn);
+	UT_RUN(test_bad_visible_heap_leaves_output_unchanged);
 	UT_DONE();
 	free(decoded);
 	return ut_failed_count != 0;

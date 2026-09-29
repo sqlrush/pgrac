@@ -607,10 +607,91 @@ UT_TEST(test_already_clear_but_versioned_vm_still_replays)
 	UT_ASSERT_EQ(dirty, 0);
 }
 
+static bool
+run_visible(uint8 flags)
+{
+	bool ok;
+	((xl_heap_visible *)payload)->flags = flags;
+	error_ready = true;
+	if (setjmp(error_jump) == 0)
+		ok = visibilitymap_set_versioned_redo(&reader, locator, 0, flags);
+	else
+		ok = false;
+	error_ready = false;
+	return ok;
+}
+
+static void
+reset_visible(void)
+{
+	DecodedBkpBlock vm;
+	reset(0);
+	vm = decoded->blocks[2];
+	decoded->blocks[1] = decoded->blocks[0];
+	decoded->blocks[0] = vm;
+	decoded->blocks[0].component_ordinal = 0;
+	decoded->blocks[2].in_use = false;
+	decoded->max_block_id = 1;
+	decoded->page_version_edge.entries[0].block_id = 0;
+	decoded->page_version_edge.entries[0].component_ordinal = 0;
+	decoded->header.xl_rmid = RM_HEAP2_ID;
+	decoded->header.xl_info = XLOG_HEAP2_VISIBLE;
+	decoded->main_data_len = SizeOfHeapVisible;
+}
+
+UT_TEST(test_visible_exact_image_and_repeat)
+{
+	for (int frozen = 0; frozen < 2; frozen++) {
+		uint8 flags = VISIBILITYMAP_ALL_VISIBLE | (frozen ? VISIBILITYMAP_ALL_FROZEN : 0);
+		reset_visible();
+		PageGetContents(pages[0].data)[0] = 0;
+		PageGetContents(images[0].data)[0] = flags;
+		UT_ASSERT(run_visible(flags));
+		UT_ASSERT_EQ(PageGetContents(pages[0].data)[0], flags);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 200);
+		UT_ASSERT_EQ(dirty, 1);
+		UT_ASSERT(run_visible(flags));
+		UT_ASSERT_EQ(dirty, 1);
+		UT_ASSERT_EQ(runtime_reads, 0);
+		UT_ASSERT_EQ(fake_count, 0);
+		UT_ASSERT(!pins[0] && !pins[1] && !locks[0] && !locks[1]);
+	}
+}
+
+UT_TEST(test_visible_refuses_wrong_result_and_predecessor)
+{
+	for (int bad = 0; bad < 7; bad++) {
+		PGAlignedBlock saved;
+		uint8 flags = VISIBILITYMAP_VALID_BITS;
+		reset_visible();
+		PageGetContents(pages[0].data)[0] = 0;
+		PageGetContents(images[0].data)[0] = flags;
+		if (bad == 0)
+			PageGetContents(images[0].data)[0] = VISIBILITYMAP_ALL_VISIBLE;
+		else if (bad == 1)
+			((PageHeader)pages[0].data)->pd_block_scn = 300;
+		else if (bad == 2)
+			flags = VISIBILITYMAP_ALL_FROZEN;
+		else if (bad == 3)
+			flags = 0;
+		else if (bad == 4)
+			flags = 128;
+		else if (bad == 5)
+			decoded->header.xl_info = XLOG_HEAP2_FREEZE_PAGE;
+		else
+			decoded->blocks[1].blkno = VM_HEAP_BLOCKS;
+		saved = pages[0];
+		UT_ASSERT(!run_visible(flags));
+		UT_ASSERT(memcmp(saved.data, pages[0].data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(dirty, 0);
+		UT_ASSERT(!pins[0] && !locks[0]);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(17);
+	UT_PLAN(19);
 	UT_RUN(test_delete);
 	UT_RUN(test_insert);
 	UT_RUN(test_multi_insert);
@@ -628,6 +709,8 @@ main(void)
 	UT_RUN(test_redo_lsn_hook_cannot_replace_version);
 	UT_RUN(test_no_clear_flag_requires_no_vm_work);
 	UT_RUN(test_already_clear_but_versioned_vm_still_replays);
+	UT_RUN(test_visible_exact_image_and_repeat);
+	UT_RUN(test_visible_refuses_wrong_result_and_predecessor);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -1277,8 +1277,8 @@ CLUSTER_PAGE_PRODUCER_O = cluster_page_producer_test.o
 # PGRAC: native heap redo differential; only buffer/VM I/O is a fixture.
 test_cluster_heap_small_native.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^fix_infomask_from_infobits\(/ { print "static void"; emit=1; found++ } \
-	     /^heap_xlog_(confirm|lock|lock_updated|inplace|insert|multi_insert|delete|update)\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 9) exit 1 }' $< > $@.tmp
+	     /^heap_xlog_(confirm|lock|lock_updated|inplace|insert|multi_insert|delete|update|visible)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 10) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_heap_small_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
