@@ -210,8 +210,8 @@ cluster_block_apply_sequence(XLogReaderState *record, uint8 block_id, char *page
 	return CLUSTER_BLKAPPLY_OK;
 }
 
-/* Only verified detached handlers enter this dispatch. HEAP2/btree delta
- * coverage remains separate work; their absence is never silent success. */
+/* Only verified detached handlers enter this dispatch. The heap matrix
+ * rejects not-yet-implemented HEAP2 opcodes; absence is never success. */
 static ClusterBlkApplyResult
 cluster_block_apply_delta(XLogReaderState *record, uint8 block_id, char *page)
 {
@@ -220,6 +220,7 @@ cluster_block_apply_delta(XLogReaderState *record, uint8 block_id, char *page)
 		return cluster_block_apply_generic(record, block_id, page);
 
 	case RM_HEAP_ID:
+	case RM_HEAP2_ID:
 		return cluster_block_apply_heap(record, block_id, page);
 
 	case RM_SEQ_ID:

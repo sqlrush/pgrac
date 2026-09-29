@@ -430,6 +430,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_btree_structure_version
 TESTS += test_cluster_sequence_version
 TESTS += test_cluster_relation_wal_policy
+TESTS += test_cluster_heap_small_redo
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1272,6 +1273,35 @@ test_cluster_page_install: test_cluster_page_install.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 CLUSTER_PAGE_PRODUCER_O = cluster_page_producer_test.o
+
+# PGRAC: native heap redo differential; only buffer/VM I/O is a fixture.
+test_cluster_heap_small_native.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^fix_infomask_from_infobits\(/ { print "static void"; emit=1; found++ } \
+	     /^heap_xlog_(confirm|lock|lock_updated|inplace)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_small_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c Makefile
+	awk '/^scn_time_cmp\(/ { print "int"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_block_apply_heap_product.o: $(top_srcdir)/src/backend/cluster/cluster_block_apply_heap.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_heap_redo_uba_product.o: $(top_srcdir)/src/backend/cluster/cluster_uba.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_heap_small_redo: test_cluster_heap_small_redo.c unit_test.h \
+		test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc \
+		test_cluster_block_apply_heap_product.o test_cluster_space_bufpage_product.o \
+		test_cluster_ctrc_itl_roles_product.o test_cluster_heap_redo_uba_product.o \
+		test_cluster_ctrc_transam_product.o $(CLUSTER_BLOCK_APPLY_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_block_apply_heap_product.o \
+		test_cluster_space_bufpage_product.o test_cluster_ctrc_itl_roles_product.o \
+		test_cluster_heap_redo_uba_product.o test_cluster_ctrc_transam_product.o \
+		$(CLUSTER_BLOCK_APPLY_O) $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: actual shared/nonshared relation WAL-elision decisions.
 test_cluster_btree_structure_version test_cluster_btree_leaf_version \
@@ -3506,6 +3536,7 @@ clean distclean maintainer-clean:
 		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc
 	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc
 	rm -f test_cluster_relation_wal_types.inc test_cluster_relation_wal_native.inc
+	rm -f test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
