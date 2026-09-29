@@ -21827,7 +21827,8 @@ bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate)
  * If checksums or wal_log_hints are enabled, we may also generate a full-page
  * image of heap_buffer. Otherwise, we optimize away the FPI (by specifying
  * REGBUF_NO_IMAGE for the heap buffer), in which case the caller should *not*
- * update the heap page's LSN.
+ * update the heap page's LSN.  PGRAC versioned heap changes do advance LSN,
+ * so they retain normal checkpoint-first FPI protection regardless of hints.
  */
 XLogRecPtr
 log_heap_visible(Relation rel, Buffer heap_buffer, Buffer vm_buffer,
@@ -21860,7 +21861,11 @@ log_heap_visible(Relation rel, Buffer heap_buffer, Buffer vm_buffer,
 					  0);
 
 	flags = REGBUF_STANDARD;
-	if (!XLogHintBitIsNeeded())
+	if (!XLogHintBitIsNeeded()
+#ifdef USE_PGRAC_CLUSTER
+		&& versions == NULL
+#endif
+		)
 		flags |= REGBUF_NO_IMAGE;
 	XLogRegisterBuffer(1, heap_buffer, flags);
 #ifdef USE_PGRAC_CLUSTER

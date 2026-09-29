@@ -651,8 +651,8 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 				 * WAL record inserted above, so it would be incorrect to
 				 * update the heap page's LSN.
 				 */
-				/* PGRAC: shared replay binds the heap's explicit version and
-				 * native visible delta even when a heap FPI is unnecessary. */
+				/* PGRAC: versioned heap changes retain normal FPI eligibility
+				 * in log_heap_visible even when hints need no WAL. */
 				if (XLogHintBitIsNeeded()
 #ifdef USE_PGRAC_CLUSTER
 					|| versioned

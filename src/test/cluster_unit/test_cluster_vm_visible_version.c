@@ -62,7 +62,7 @@ static unsigned edge_count, inserts, dirty[2], registered[2], lock_calls;
 static TransactionId expected_cutoff;
 static int nonpermanent_buffer;
 static uint8 register_flags[2];
-static bool begun, expecting_error;
+static bool begun, expecting_error, checksums;
 static jmp_buf error_jump;
 
 void
@@ -117,7 +117,7 @@ RecoveryInProgress(void)
 bool
 DataChecksumsEnabled(void)
 {
-	return false;
+	return checksums;
 }
 bool
 IsCatalogRelation(Relation rel)
@@ -269,7 +269,7 @@ run_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr, Bu
 	lock_calls = 0;
 	expected_cutoff = 70;
 	nonpermanent_buffer = 0;
-	begun = expecting_error = InRecovery = wal_log_hints = false;
+	begun = expecting_error = InRecovery = wal_log_hints = checksums = false;
 	next_token = 100;
 	edge_token = 0;
 	relation.rd_rel = &relform;
@@ -335,6 +335,22 @@ UT_TEST(test_nonshared_preserves_native_hint_lsn_rules)
 		UT_ASSERT_EQ(register_flags[0], 0);
 		UT_ASSERT_EQ(register_flags[1], REGBUF_STANDARD | (hints ? 0 : REGBUF_NO_IMAGE));
 		UT_ASSERT_EQ(PageGetLSN(pages[0].data), hints ? UINT64_C(0x9000) : 0);
+	}
+}
+UT_TEST(test_versioned_visible_keeps_heap_full_page_protection)
+{
+	for (int hints = 0; hints <= 1; hints++) {
+		for (int checksum = 0; checksum <= 1; checksum++) {
+			reset(true, false, 0);
+			wal_log_hints = hints;
+			checksums = checksum;
+			run_set(&relation, 0, 1, InvalidXLogRecPtr, 2, 70,
+					VISIBILITYMAP_VALID_BITS, &identity);
+			/* Advancing this LSN must not suppress checkpoint-first FPI. */
+			UT_ASSERT_EQ(PageGetLSN(pages[0].data), UINT64_C(0x9000));
+			UT_ASSERT_EQ(register_flags[1], REGBUF_STANDARD);
+			UT_ASSERT_EQ(edge_count, 2);
+		}
 	}
 }
 UT_TEST(test_visible_heap_flag_changes_only_after_capture)
@@ -438,10 +454,11 @@ UT_TEST(test_actual_empty_vacuum_does_not_acquire_vm_in_critical)
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(8);
 	UT_RUN(test_visible_exact_two_page_batch);
 	UT_RUN(test_no_change_allocates_no_version);
 	UT_RUN(test_nonshared_preserves_native_hint_lsn_rules);
+	UT_RUN(test_versioned_visible_keeps_heap_full_page_protection);
 	UT_RUN(test_visible_heap_flag_changes_only_after_capture);
 	UT_RUN(test_bad_component_refuses_before_either_page_changes);
 	UT_RUN(test_recovery_uses_record_lsn_without_runtime_identity_or_wal);
