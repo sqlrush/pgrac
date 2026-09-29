@@ -12,8 +12,9 @@
  *	  CORRECTNESS CONTRACT (8.A, R11 "极高"): for every supported record type
  *	  the result must be BYTE-FOR-BYTE identical to PG's real redo on that
  *	  block.  The original matrix has the crash-recovery differential in
- *	  src/test/cluster_tap/t/256; CONFIRM/LOCK/LOCK_UPDATED/INPLACE also have
- *	  real native-redo differential unit coverage. PANIC conditions in the original handler
+ *	  src/test/cluster_tap/t/256; retained heap/heap2 variants also have
+ *	  real native-redo differential unit coverage. PANIC conditions in the
+ *	  original handler
  *	  become fail-closed (FAILED): a page we cannot rebuild exactly is never
  *	  installed.  Record types / flag combinations not on the differential are
  *	  fail-closed (UNSUPPORTED), never a silent wrong-block install.
@@ -82,168 +83,6 @@ fix_infomask_from_infobits(uint8 infobits, uint16 *infomask, uint16 *infomask2)
 
 	if (infobits & XLHL_KEYS_UPDATED)
 		*infomask2 |= HEAP_KEYS_UPDATED;
-}
-
-/*
- * apply_heap_insert -- mirror heap_xlog_insert()'s BLK_NEEDS_REDO branch on a
- *		detached page.
- *
- *	The detached page already holds the FPI base and any prior deltas, so there
- *	is no buffer fetch; the visibility-map clear and FSM update are skipped
- *	(separable hints, re-established by the normal path after install).  PANIC
- *	conditions become fail-closed (8.A).
- *
- *	Off the starter matrix -> fail closed (UNSUPPORTED), not differential-proven:
- *	  - XLOG_HEAP_INIT_PAGE: reinitializes a fresh page; an FPI-base chain never
- *	    contains it (INIT records carry no image and start from an empty page).
- *	  - XLH_INSERT_ALL_VISIBLE_CLEARED: only set on the FIRST touch of an
- *	    all-visible page, which also bears the FPI and is handled by the FPI
- *	    path -- never reached here as a delta.
- */
-static ClusterBlkApplyResult
-apply_heap_insert(XLogReaderState *record, uint8 block_id, char *page)
-{
-	xl_heap_insert *xlrec = (xl_heap_insert *)XLogRecGetData(record);
-	BlockNumber blkno;
-	ItemPointerData target_tid;
-	char *data;
-	Size datalen;
-	xl_heap_header xlhdr;
-	union {
-		HeapTupleHeaderData hdr;
-		/* cppcheck-suppress unusedStructMember */
-		char data[MaxHeapTupleSize]; /* sizes the union for a max tuple */
-	} tbuf;
-	HeapTupleHeader htup;
-	uint32 newlen;
-	uint8 cluster_itl_replay_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
-	bool cluster_itl_replay_active = false;
-
-	/* A heap INSERT references only block 0. */
-	if (block_id != 0)
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-
-	/* Off the matrix (see header): fail closed. */
-	if (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE)
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-	if (xlrec->flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-
-	XLogRecGetBlockTag(record, 0, NULL, NULL, &blkno);
-	ItemPointerSetBlockNumber(&target_tid, blkno);
-	ItemPointerSetOffsetNumber(&target_tid, xlrec->offnum);
-
-	/* The base page must already exist and have room for this offset. */
-	if (PageGetMaxOffsetNumber(page) + 1 < xlrec->offnum)
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	data = XLogRecGetBlockData(record, 0, &datalen);
-	if (data == NULL || datalen <= SizeOfHeapHeader)
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	if (xlrec->flags & XLH_INSERT_ITL_DELTA) {
-		const char *itl_start = (char *)xlrec + SizeOfHeapInsert;
-
-		/* slot_idx is at offset 0 of both v1 and v2 ITL deltas. */
-		cluster_itl_replay_slot = (uint8)cluster_itl_wal_block_first_slot_idx(itl_start);
-		cluster_itl_replay_active = true;
-	}
-
-	newlen = datalen - SizeOfHeapHeader;
-	if (newlen > MaxHeapTupleSize)
-		return CLUSTER_BLKAPPLY_FAILED;
-	memcpy((char *)&xlhdr, data, SizeOfHeapHeader);
-	data += SizeOfHeapHeader;
-
-	htup = &tbuf.hdr;
-	memset((char *)htup, 0, SizeofHeapTupleHeader);
-	/* PG73FORMAT: get bitmap [+ padding] [+ oid] + data */
-	memcpy((char *)htup + SizeofHeapTupleHeader, data, newlen);
-	newlen += SizeofHeapTupleHeader;
-	htup->t_infomask2 = xlhdr.t_infomask2;
-	htup->t_infomask = xlhdr.t_infomask;
-	htup->t_hoff = xlhdr.t_hoff;
-	/* WAL header does not carry t_itl_slot_idx; mirror heap_xlog_insert. */
-	ClusterHeapTupleHeaderInitItlSlot(htup);
-	if (cluster_itl_replay_active)
-		htup->t_itl_slot_idx = cluster_itl_replay_slot;
-	HeapTupleHeaderSetXmin(htup, XLogRecGetXid(record));
-	HeapTupleHeaderSetCmin(htup, FirstCommandId);
-	htup->t_ctid = target_tid;
-
-	if (PageAddItem(page, (Item)htup, newlen, xlrec->offnum, true, true) == InvalidOffsetNumber)
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	/* Replay the block-local ITL delta array (spec-3.4a/3.4b), as redo does. */
-	if (xlrec->flags & XLH_INSERT_ITL_DELTA) {
-		const char *itl_start = (char *)xlrec + SizeOfHeapInsert;
-
-		cluster_itl_redo_apply_block_local_delta(page, htup, itl_start);
-	}
-
-	PageSetLSN(page, record->EndRecPtr);
-	return CLUSTER_BLKAPPLY_OK;
-}
-
-/*
- * apply_heap_delete -- mirror heap_xlog_delete()'s BLK_NEEDS_REDO branch on a
- *		detached page.  Marks the target tuple deleted (xmax/infomask/ctid),
- *		then replays the block-local ITL delta.
- *
- *	Off the starter matrix -> fail closed (UNSUPPORTED), not differential-proven:
- *	  - XLH_DELETE_ALL_VISIBLE_CLEARED (only on the FPI-bearing first touch),
- *	  - XLH_DELETE_IS_PARTITION_MOVE  (row movement; sets MovedPartitions),
- *	  - XLH_DELETE_IS_SUPER           (speculative-insert abort; clears xmin).
- */
-static ClusterBlkApplyResult
-apply_heap_delete(XLogReaderState *record, uint8 block_id, char *page)
-{
-	xl_heap_delete *xlrec = (xl_heap_delete *)XLogRecGetData(record);
-	BlockNumber blkno;
-	ItemPointerData target_tid;
-	ItemId lp;
-	HeapTupleHeader htup;
-
-	/* A heap DELETE references only block 0. */
-	if (block_id != 0)
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-
-	/* Off the matrix (see header): fail closed. */
-	if (xlrec->flags
-		& (XLH_DELETE_ALL_VISIBLE_CLEARED | XLH_DELETE_IS_PARTITION_MOVE | XLH_DELETE_IS_SUPER))
-		return CLUSTER_BLKAPPLY_UNSUPPORTED;
-
-	XLogRecGetBlockTag(record, 0, NULL, NULL, &blkno);
-	ItemPointerSetBlockNumber(&target_tid, blkno);
-	ItemPointerSetOffsetNumber(&target_tid, xlrec->offnum);
-
-	/* The target line pointer must exist and be a normal tuple. */
-	if (PageGetMaxOffsetNumber(page) < xlrec->offnum)
-		return CLUSTER_BLKAPPLY_FAILED;
-	lp = PageGetItemId(page, xlrec->offnum);
-	if (!ItemIdIsNormal(lp))
-		return CLUSTER_BLKAPPLY_FAILED;
-
-	htup = (HeapTupleHeader)PageGetItem(page, lp);
-	htup->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
-	htup->t_infomask2 &= ~HEAP_KEYS_UPDATED;
-	HeapTupleHeaderClearHotUpdated(htup);
-	fix_infomask_from_infobits(xlrec->infobits_set, &htup->t_infomask, &htup->t_infomask2);
-	HeapTupleHeaderSetXmax(htup, xlrec->xmax);
-	HeapTupleHeaderSetCmax(htup, FirstCommandId, false);
-	/* Mark the page as a candidate for pruning */
-	PageSetPrunable(page, XLogRecGetXid(record));
-	htup->t_ctid = target_tid;
-
-	/* Replay the block-local ITL delta array (spec-3.4a/3.4b), as redo does. */
-	if (xlrec->flags & XLH_DELETE_ITL_DELTA) {
-		const char *itl_start = (char *)xlrec + SizeOfHeapDelete;
-
-		cluster_itl_redo_apply_block_local_delta(page, htup, itl_start);
-	}
-
-	PageSetLSN(page, record->EndRecPtr);
-	return CLUSTER_BLKAPPLY_OK;
 }
 
 /*
@@ -480,10 +319,11 @@ heap_small_tuple(Page page, OffsetNumber offset)
 	return tuple;
 }
 
-/* LOCK producers emit a bounded lock-only array. Validate its extent before
- * the existing native ITL helper, which expects CRC-checked, complete WAL. */
+/* Validate the complete native ITL array before invoking its mutation helper.
+ * DELETE/UPDATE may append logical tuple bytes, so return the exact extent. */
 static bool
-heap_small_lock_delta_valid(Page page, const char *data, Size length)
+heap_delta_array_valid(Page page, const char *data, Size length, uint16 expected_flags,
+					   bool require_nonempty, Size *consumed)
 {
 	xl_heap_itl_delta_block header;
 	Size prefix = offsetof(xl_heap_itl_delta_block, deltas);
@@ -494,13 +334,14 @@ heap_small_lock_delta_valid(Page page, const char *data, Size length)
 		|| ((PageHeader)page)->pd_special > BLCKSZ - CLUSTER_ITL_SPECIAL_SIZE)
 		return false;
 	memcpy(&header, data, prefix);
-	if (header.reserved != 0 || header.ndeltas > CLUSTER_ITL_INITRANS_DEFAULT
+	if (header.reserved != 0 || (require_nonempty && header.ndeltas == 0)
+		|| header.ndeltas > CLUSTER_ITL_INITRANS_DEFAULT
 		|| header.format_version > CLUSTER_ITL_DELTA_FORMAT_V4)
 		return false;
 	width = header.format_version == CLUSTER_ITL_DELTA_FORMAT_V1   ? sizeof(xl_heap_itl_delta)
 			: header.format_version == CLUSTER_ITL_DELTA_FORMAT_V2 ? sizeof(xl_heap_itl_delta_v2)
 																   : sizeof(xl_heap_itl_delta_v3);
-	if (length != prefix + header.ndeltas * width)
+	if (length < prefix + header.ndeltas * width)
 		return false;
 	for (uint16 i = 0; i < header.ndeltas; i++) {
 		xl_heap_itl_delta delta;
@@ -509,8 +350,8 @@ heap_small_lock_delta_valid(Page page, const char *data, Size length)
 		/* Every format has the same first 16 bytes. */
 		memset(&delta, 0, sizeof(delta));
 		memcpy(&delta, entry, offsetof(xl_heap_itl_delta, commit_scn));
-		if (delta.slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT
-			|| delta.flags_after != ITL_FLAG_LOCK_ONLY_ACTIVE || !TransactionIdIsNormal(delta.xid))
+		if (delta.slot_idx >= CLUSTER_ITL_INITRANS_DEFAULT || delta.flags_after != expected_flags
+			|| !TransactionIdIsNormal(delta.xid))
 			return false;
 		if (header.format_version == CLUSTER_ITL_DELTA_FORMAT_V4) {
 			xl_heap_itl_delta_v3 retained;
@@ -529,6 +370,7 @@ heap_small_lock_delta_valid(Page page, const char *data, Size length)
 	for (OffsetNumber off = FirstOffsetNumber; off <= PageGetMaxOffsetNumber(page); off++)
 		if (ItemIdIsNormal(PageGetItemId(page, off)) && heap_small_tuple(page, off) == NULL)
 			return false;
+	*consumed = prefix + header.ndeltas * width;
 	return true;
 }
 
@@ -577,7 +419,11 @@ apply_heap_small(XLogReaderState *record, uint8 block_id, char *page, uint8 oper
 			return CLUSTER_BLKAPPLY_FAILED;
 		delta = main_data + base;
 		if (lock.flags & XLH_LOCK_ITL_DELTA) {
-			if (!heap_small_lock_delta_valid(scratch.data, delta, main_length - base))
+			Size consumed;
+
+			if (!heap_delta_array_valid(scratch.data, delta, main_length - base,
+										ITL_FLAG_LOCK_ONLY_ACTIVE, false, &consumed)
+				|| consumed != main_length - base)
 				return CLUSTER_BLKAPPLY_FAILED;
 		} else if (main_length != base)
 			return CLUSTER_BLKAPPLY_FAILED;
@@ -809,6 +655,201 @@ apply_heap_maintenance(XLogReaderState *record, uint8 block_id, char *page, uint
 	return CLUSTER_BLKAPPLY_OK;
 }
 
+/* INSERT and MULTI_INSERT differ only in native headers and tuple alignment.
+ * INIT_PAGE constructs a private native heap page; namespace/version proof is
+ * still the caller's obligation and cannot be inferred from an empty page. */
+static ClusterBlkApplyResult
+apply_heap_insert(XLogReaderState *record, uint8 block_id, char *page, bool multi)
+{
+	PGAlignedBlock scratch, tuple_space;
+	const DecodedBkpBlock *block = XLogRecGetBlock(record, block_id);
+	const char *main_data = XLogRecGetData(record);
+	Size main_length = XLogRecGetDataLen(record), length;
+	const char *data = XLogRecGetBlockData(record, block_id, &length);
+	bool init = (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) != 0;
+	xl_heap_insert single;
+	xl_heap_multi_insert multiple;
+	uint8 flags, itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
+	uint16 ntuples;
+	Size base, cursor = 0;
+	const char *delta;
+
+	if (block_id != 0 || block->forknum != MAIN_FORKNUM
+		|| init != ((block->flags & BKPBLOCK_WILL_INIT) != 0) || main_data == NULL || data == NULL)
+		return CLUSTER_BLKAPPLY_FAILED;
+	base = multi ? SizeOfHeapMultiInsert : SizeOfHeapInsert;
+	if (main_length < base)
+		return CLUSTER_BLKAPPLY_FAILED;
+	if (multi) {
+		memcpy(&multiple, main_data, base);
+		flags = multiple.flags;
+		ntuples = multiple.ntuples;
+		if (!init)
+			base += (Size)ntuples * sizeof(OffsetNumber);
+	} else {
+		memcpy(&single, main_data, base);
+		flags = single.flags;
+		ntuples = 1;
+	}
+	if (ntuples == 0 || ntuples > MaxHeapTuplesPerPage || main_length < base
+		|| (flags
+			& ~(XLH_INSERT_ALL_VISIBLE_CLEARED | XLH_INSERT_LAST_IN_MULTI
+				| XLH_INSERT_IS_SPECULATIVE | XLH_INSERT_CONTAINS_NEW_TUPLE
+				| XLH_INSERT_ON_TOAST_RELATION | XLH_INSERT_ALL_FROZEN_SET | XLH_INSERT_ITL_DELTA))
+		|| ((flags & XLH_INSERT_ALL_FROZEN_SET)
+			&& (!multi || (flags & XLH_INSERT_ALL_VISIBLE_CLEARED))))
+		return CLUSTER_BLKAPPLY_FAILED;
+	if (init)
+		PageInitHeapPage(scratch.data, BLCKSZ, 0);
+	else {
+		if (!heap_maintenance_page_valid(page))
+			return CLUSTER_BLKAPPLY_FAILED;
+		memcpy(scratch.data, page, BLCKSZ);
+	}
+	delta = main_data + base;
+	if (flags & XLH_INSERT_ITL_DELTA) {
+		Size consumed;
+
+		if (!heap_delta_array_valid(scratch.data, delta, main_length - base, ITL_FLAG_ACTIVE, true,
+									&consumed)
+			|| consumed != main_length - base)
+			return CLUSTER_BLKAPPLY_FAILED;
+		itl_slot = (uint8)cluster_itl_wal_block_first_slot_idx(delta);
+	} else if (main_length != base)
+		return CLUSTER_BLKAPPLY_FAILED;
+	for (uint16 i = 0; i < ntuples; i++) {
+		OffsetNumber off;
+		Size payload, tuple_length;
+		uint16 infomask, infomask2;
+		uint8 hoff;
+		HeapTupleHeader tuple = (HeapTupleHeader)tuple_space.data;
+
+		if (multi) {
+			xl_multi_insert_tuple header;
+
+			if (init)
+				off = FirstOffsetNumber + i;
+			else
+				memcpy(&off, main_data + SizeOfHeapMultiInsert + (Size)i * sizeof(off),
+					   sizeof(off));
+			cursor = SHORTALIGN(cursor);
+			if (cursor > length || length - cursor < SizeOfMultiInsertTuple)
+				return CLUSTER_BLKAPPLY_FAILED;
+			memcpy(&header, data + cursor, SizeOfMultiInsertTuple);
+			cursor += SizeOfMultiInsertTuple;
+			payload = header.datalen;
+			infomask = header.t_infomask;
+			infomask2 = header.t_infomask2;
+			hoff = header.t_hoff;
+		} else {
+			xl_heap_header header;
+
+			off = single.offnum;
+			if (length <= SizeOfHeapHeader)
+				return CLUSTER_BLKAPPLY_FAILED;
+			memcpy(&header, data, SizeOfHeapHeader);
+			cursor = SizeOfHeapHeader;
+			payload = length - cursor;
+			infomask = header.t_infomask;
+			infomask2 = header.t_infomask2;
+			hoff = header.t_hoff;
+		}
+		tuple_length = SizeofHeapTupleHeader + payload;
+		if (payload > length - cursor || tuple_length > MaxHeapTupleSize
+			|| hoff < SizeofHeapTupleHeader || hoff > tuple_length || off < FirstOffsetNumber
+			|| off > MaxHeapTuplesPerPage || off > PageGetMaxOffsetNumber(scratch.data) + 1
+			|| (off <= PageGetMaxOffsetNumber(scratch.data)
+				&& ItemIdIsUsed(PageGetItemId(scratch.data, off))))
+			return CLUSTER_BLKAPPLY_FAILED;
+		memset(tuple, 0, SizeofHeapTupleHeader);
+		memcpy((char *)tuple + SizeofHeapTupleHeader, data + cursor, payload);
+		cursor += payload;
+		tuple->t_infomask = infomask;
+		tuple->t_infomask2 = infomask2;
+		tuple->t_hoff = hoff;
+		ClusterHeapTupleHeaderInitItlSlot(tuple);
+		if (flags & XLH_INSERT_ITL_DELTA)
+			tuple->t_itl_slot_idx = itl_slot;
+		HeapTupleHeaderSetXmin(tuple, XLogRecGetXid(record));
+		HeapTupleHeaderSetCmin(tuple, FirstCommandId);
+		ItemPointerSet(&tuple->t_ctid, block->blkno, off);
+		if (PageAddItem(scratch.data, (Item)tuple, tuple_length, off, true, true)
+			== InvalidOffsetNumber)
+			return CLUSTER_BLKAPPLY_FAILED;
+	}
+	if (cursor != length)
+		return CLUSTER_BLKAPPLY_FAILED;
+	if (flags & XLH_INSERT_ITL_DELTA)
+		cluster_itl_redo_apply_block_local_delta(
+			scratch.data, multi ? NULL : (HeapTupleHeader)tuple_space.data, delta);
+	PageSetLSN(scratch.data, record->EndRecPtr);
+	if (flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
+		PageClearAllVisible(scratch.data);
+	if (flags & XLH_INSERT_ALL_FROZEN_SET)
+		PageSetAllVisible(scratch.data);
+	memcpy(page, scratch.data, BLCKSZ);
+	return CLUSTER_BLKAPPLY_OK;
+}
+
+static ClusterBlkApplyResult
+apply_heap_delete(XLogReaderState *record, uint8 block_id, char *page)
+{
+	PGAlignedBlock scratch;
+	xl_heap_delete rec;
+	const DecodedBkpBlock *block = XLogRecGetBlock(record, block_id);
+	const char *main_data = XLogRecGetData(record);
+	Size length = XLogRecGetDataLen(record), used = SizeOfHeapDelete;
+	const char *delta;
+	HeapTupleHeader tuple;
+
+	if (block_id != 0 || block->forknum != MAIN_FORKNUM || (block->flags & BKPBLOCK_WILL_INIT)
+		|| (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) || main_data == NULL || length < used)
+		return CLUSTER_BLKAPPLY_FAILED;
+	memcpy(&rec, main_data, used);
+	memcpy(scratch.data, page, BLCKSZ);
+	tuple = heap_small_tuple(scratch.data, rec.offnum);
+	if (tuple == NULL
+		|| (rec.flags
+			& ~(XLH_DELETE_ALL_VISIBLE_CLEARED | XLH_DELETE_CONTAINS_OLD | XLH_DELETE_IS_SUPER
+				| XLH_DELETE_IS_PARTITION_MOVE | XLH_DELETE_ITL_DELTA))
+		|| (rec.infobits_set
+			& ~(XLHL_XMAX_IS_MULTI | XLHL_XMAX_LOCK_ONLY | XLHL_XMAX_EXCL_LOCK
+				| XLHL_XMAX_KEYSHR_LOCK | XLHL_KEYS_UPDATED)))
+		return CLUSTER_BLKAPPLY_FAILED;
+	delta = main_data + used;
+	if (rec.flags & XLH_DELETE_ITL_DELTA) {
+		Size consumed;
+
+		if (!heap_delta_array_valid(scratch.data, delta, length - used, ITL_FLAG_ACTIVE, true,
+									&consumed))
+			return CLUSTER_BLKAPPLY_FAILED;
+		used += consumed;
+	}
+	if (!(rec.flags & XLH_DELETE_CONTAINS_OLD) && used != length)
+		return CLUSTER_BLKAPPLY_FAILED;
+	tuple->t_infomask &= ~(HEAP_XMAX_BITS | HEAP_MOVED);
+	tuple->t_infomask2 &= ~HEAP_KEYS_UPDATED;
+	HeapTupleHeaderClearHotUpdated(tuple);
+	fix_infomask_from_infobits(rec.infobits_set, &tuple->t_infomask, &tuple->t_infomask2);
+	if (rec.flags & XLH_DELETE_IS_SUPER)
+		HeapTupleHeaderSetXmin(tuple, InvalidTransactionId);
+	else
+		HeapTupleHeaderSetXmax(tuple, rec.xmax);
+	HeapTupleHeaderSetCmax(tuple, FirstCommandId, false);
+	PageSetPrunable(scratch.data, XLogRecGetXid(record));
+	if (rec.flags & XLH_DELETE_ALL_VISIBLE_CLEARED)
+		PageClearAllVisible(scratch.data);
+	if (rec.flags & XLH_DELETE_IS_PARTITION_MOVE)
+		HeapTupleHeaderSetMovedPartitions(tuple);
+	else
+		ItemPointerSet(&tuple->t_ctid, block->blkno, rec.offnum);
+	if (rec.flags & XLH_DELETE_ITL_DELTA)
+		cluster_itl_redo_apply_block_local_delta(scratch.data, tuple, delta);
+	PageSetLSN(scratch.data, record->EndRecPtr);
+	memcpy(page, scratch.data, BLCKSZ);
+	return CLUSTER_BLKAPPLY_OK;
+}
+
 /*
  * cluster_block_apply_heap -- dispatch a no-image heap delta to its per-record
  *		single-block applicator.  Record types not on the differential matrix
@@ -833,6 +874,8 @@ cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
 		switch (info) {
 		case XLOG_HEAP2_LOCK_UPDATED:
 			return apply_heap_small(record, block_id, page, XLOG_HEAP_LOCK, true);
+		case XLOG_HEAP2_MULTI_INSERT:
+			return apply_heap_insert(record, block_id, page, true);
 		case XLOG_HEAP2_PRUNE:
 		case XLOG_HEAP2_VACUUM:
 		case XLOG_HEAP2_FREEZE_PAGE:
@@ -850,7 +893,7 @@ cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
 		return apply_heap_small(record, block_id, page, info, false);
 
 	case XLOG_HEAP_INSERT:
-		return apply_heap_insert(record, block_id, page);
+		return apply_heap_insert(record, block_id, page, false);
 
 	case XLOG_HEAP_DELETE:
 		return apply_heap_delete(record, block_id, page);

@@ -64,6 +64,13 @@ XLogReadBufferForRedo(XLogReaderState *record, uint8 id, Buffer *buffer)
 	*buffer = 1;
 	return BLK_NEEDS_REDO;
 }
+Buffer
+XLogInitBufferForRedo(XLogReaderState *record, uint8 id)
+{
+	Buffer buffer;
+	(void)XLogReadBufferForRedo(record, id, &buffer);
+	return buffer;
+}
 XLogRedoAction
 XLogReadBufferForRedoExtended(XLogReaderState *record, uint8 id, ReadBufferMode mode, bool cleanup,
 							  Buffer *buffer)
@@ -110,7 +117,7 @@ visibilitymap_clear_redo(XLogReaderState *record, RelFileLocator locator, BlockN
 						 uint8 flags)
 {
 	UT_ASSERT(record == &reader && locator.relNumber == 900 && block == block_number);
-	UT_ASSERT(flags == 0 || flags == VISIBILITYMAP_ALL_FROZEN);
+	UT_ASSERT(flags == 0 || flags == VISIBILITYMAP_ALL_FROZEN || flags == VISIBILITYMAP_VALID_BITS);
 	vm_calls++;
 }
 char *
@@ -437,6 +444,217 @@ UT_TEST(test_bad_shapes_do_not_modify_output)
 static PGAlignedBlock maintenance_data;
 
 static void
+reset_insert(bool multi, bool init, int itl_format, uint8 flags)
+{
+	char delta[128];
+	Size delta_size, main_size, cursor = 0;
+	uint8 opcode = multi ? XLOG_HEAP2_MULTI_INSERT : XLOG_HEAP_INSERT;
+	reset(multi ? RM_HEAP2_ID : RM_HEAP_ID, opcode | (init ? XLOG_HEAP_INIT_PAGE : 0), itl_format);
+	delta_size = itl_format >= 0 ? decoded->main_data_len - SizeOfHeapLock : 0;
+	if (delta_size != 0) {
+		memcpy(delta, main_data.data + SizeOfHeapLock, delta_size);
+		((xl_heap_itl_delta *)(delta + offsetof(xl_heap_itl_delta_block, deltas)))->flags_after
+			= ITL_FLAG_ACTIVE;
+		flags |= XLH_INSERT_ITL_DELTA;
+	}
+	memset(&main_data, 0, sizeof(main_data));
+	memset(&maintenance_data, 0, sizeof(maintenance_data));
+	if (multi) {
+		xl_heap_multi_insert *rec = (xl_heap_multi_insert *)main_data.data;
+		rec->flags = flags;
+		rec->ntuples = 3;
+		main_size = SizeOfHeapMultiInsert;
+		if (!init) {
+			for (unsigned i = 0; i < 3; i++)
+				rec->offsets[i] = i + 2;
+			main_size += 3 * sizeof(OffsetNumber);
+		}
+	} else {
+		xl_heap_insert *rec = (xl_heap_insert *)main_data.data;
+		rec->flags = flags;
+		rec->offnum = init ? 1 : 2;
+		main_size = SizeOfHeapInsert;
+	}
+	if (delta_size != 0)
+		memcpy(main_data.data + main_size, delta, delta_size);
+	decoded->main_data_len = main_size + delta_size;
+	for (unsigned i = 0; i < (multi ? 3 : 1); i++) {
+		uint8 hoff = MAXALIGN(SizeofHeapTupleHeader);
+		Size payload = hoff - SizeofHeapTupleHeader + 5 + i;
+		if (multi) {
+			xl_multi_insert_tuple header;
+			memset(&header, 0, sizeof(header));
+			header.datalen = payload;
+			header.t_hoff = hoff;
+			header.t_infomask = HEAP_XMAX_INVALID;
+			header.t_infomask2 = 1;
+			cursor = SHORTALIGN(cursor);
+			memcpy(maintenance_data.data + cursor, &header, SizeOfMultiInsertTuple);
+			cursor += SizeOfMultiInsertTuple;
+		} else {
+			xl_heap_header header;
+			memset(&header, 0, sizeof(header));
+			header.t_hoff = hoff;
+			header.t_infomask = HEAP_XMAX_INVALID;
+			header.t_infomask2 = 1;
+			memcpy(maintenance_data.data, &header, SizeOfHeapHeader);
+			cursor = SizeOfHeapHeader;
+		}
+		memset(maintenance_data.data + cursor, 0xA0 + i, payload);
+		cursor += payload;
+	}
+	decoded->blocks[0].has_data = true;
+	decoded->blocks[0].data = maintenance_data.data;
+	decoded->blocks[0].data_len = cursor;
+	if (init) {
+		decoded->blocks[0].flags |= BKPBLOCK_WILL_INIT;
+		memset(&original, 0, sizeof(original));
+	} else if (flags & XLH_INSERT_ALL_VISIBLE_CLEARED)
+		PageSetAllVisible(original.data);
+	native_page = detached_page = original;
+}
+
+UT_TEST(test_insert_variants_match_native)
+{
+	for (int shared = 0; shared < 2; shared++)
+		for (int multi = 0; multi < 2; multi++)
+			for (int init = 0; init < 2; init++)
+				for (int format = -1; format <= 3; format++)
+					for (int visible = 0; visible < (multi ? 3 : 2); visible++) {
+						uint8 flags = visible == 1	 ? XLH_INSERT_ALL_VISIBLE_CLEARED
+									  : visible == 2 ? XLH_INSERT_ALL_FROZEN_SET
+													 : 0;
+						cluster_shared_config = shared;
+						reset_insert(multi, init, format, flags);
+						compare_native(multi ? heap_xlog_multi_insert : heap_xlog_insert);
+						UT_ASSERT_EQ(PageGetMaxOffsetNumber(native_page.data),
+									 (init ? 0 : 1) + (multi ? 3 : 1));
+					}
+}
+
+UT_TEST(test_delete_variants_match_native)
+{
+	for (int shared = 0; shared < 2; shared++)
+		for (int format = -1; format <= 3; format++)
+			for (int variant = 0; variant < 3; variant++) {
+				xl_heap_delete *rec;
+				cluster_shared_config = shared;
+				/* DELETE and LOCK share their fixed native layout. */
+				reset(RM_HEAP_ID, XLOG_HEAP_DELETE, format);
+				rec = (xl_heap_delete *)main_data.data;
+				rec->flags = XLH_DELETE_ALL_VISIBLE_CLEARED;
+				if (variant == 1)
+					rec->flags |= XLH_DELETE_IS_SUPER;
+				if (variant == 2)
+					rec->flags |= XLH_DELETE_IS_PARTITION_MOVE;
+				if (format >= 0) {
+					rec->flags |= XLH_DELETE_ITL_DELTA;
+					((xl_heap_itl_delta *)(main_data.data + SizeOfHeapDelete
+										   + offsetof(xl_heap_itl_delta_block, deltas)))
+						->flags_after = ITL_FLAG_ACTIVE;
+				}
+				PageSetAllVisible(original.data);
+				native_page = detached_page = original;
+				compare_native(heap_xlog_delete);
+				UT_ASSERT(!PageIsAllVisible(native_page.data));
+			}
+}
+
+UT_TEST(test_insert_reuses_unused_pointer_and_delete_logical_trailer)
+{
+	reset_insert(false, false, 3, XLH_INSERT_IS_SPECULATIVE);
+	((xl_heap_insert *)main_data.data)->offnum = 1;
+	ItemIdSetUnused(PageGetItemId(original.data, 1));
+	native_page = detached_page = original;
+	compare_native(heap_xlog_insert);
+	reset(RM_HEAP_ID, XLOG_HEAP_DELETE, -1);
+	((xl_heap_delete *)main_data.data)->flags = XLH_DELETE_CONTAINS_OLD_KEY;
+	memset(main_data.data + SizeOfHeapDelete, 0x33, 10);
+	decoded->main_data_len += 10;
+	compare_native(heap_xlog_delete);
+}
+
+UT_TEST(test_insert_delete_bad_shapes_do_not_modify_output)
+{
+	for (int bad = 0; bad < 18; bad++) {
+		PGAlignedBlock saved;
+		ClusterBlkApplyResult result;
+		reset_insert(false, false, 3, 0);
+		switch (bad) {
+		case 0:
+			decoded->main_data_len = 1;
+			break;
+		case 1:
+			((xl_heap_insert *)main_data.data)->offnum = 0;
+			break;
+		case 2:
+			((xl_heap_insert *)main_data.data)->offnum = 1;
+			break;
+		case 3:
+			((xl_heap_itl_delta_block *)(main_data.data + SizeOfHeapInsert))->ndeltas = 0;
+			break;
+		case 4:
+			((xl_heap_itl_delta_v3 *)(main_data.data + SizeOfHeapInsert
+									  + offsetof(xl_heap_itl_delta_block, deltas)))
+				->slot_idx = 8;
+			break;
+		case 5:
+			((xl_heap_itl_delta_block *)(main_data.data + SizeOfHeapInsert))->format_version = 4;
+			break;
+		case 6:
+			reset_insert(true, false, 3, 0);
+			((xl_heap_multi_insert *)main_data.data)->ntuples = 65535;
+			break;
+		case 7:
+			reset_insert(true, true, 3, 0);
+			decoded->blocks[0].data_len--;
+			break;
+		case 8:
+			reset_insert(true, false, 3, 0);
+			((xl_heap_multi_insert *)main_data.data)->offsets[2] = 2;
+			break;
+		case 9:
+			reset_insert(true, false, 3,
+						 XLH_INSERT_ALL_FROZEN_SET | XLH_INSERT_ALL_VISIBLE_CLEARED);
+			break;
+		case 10:
+			reset_insert(true, false, 3, 0);
+			((xl_multi_insert_tuple *)maintenance_data.data)->datalen = 65535;
+			break;
+		case 11:
+			reset_insert(true, false, 3, 0);
+			decoded->blocks[0].data_len++;
+			break;
+		case 12:
+			reset(RM_HEAP_ID, XLOG_HEAP_DELETE, -1);
+			((xl_heap_delete *)main_data.data)->offnum = 0;
+			break;
+		case 13:
+			reset(RM_HEAP_ID, XLOG_HEAP_DELETE, -1);
+			decoded->main_data_len--;
+			break;
+		case 14:
+			((xl_heap_header *)maintenance_data.data)->t_hoff = 255;
+			break;
+		case 15:
+			decoded->blocks[0].flags |= BKPBLOCK_WILL_INIT;
+			break;
+		case 16:
+			reset_insert(true, true, 3, 0);
+			decoded->blocks[0].flags &= ~BKPBLOCK_WILL_INIT;
+			break;
+		case 17:
+			decoded->main_data_len++;
+			break;
+		}
+		saved = detached_page;
+		result = cluster_block_apply_one(&reader, 0, detached_page.data);
+		UT_ASSERT(result == CLUSTER_BLKAPPLY_FAILED || result == CLUSTER_BLKAPPLY_UNSUPPORTED);
+		UT_ASSERT(memcmp(saved.data, detached_page.data, BLCKSZ) == 0);
+	}
+}
+
+static void
 reset_maintenance(uint8 opcode, bool itl_page)
 {
 	PGAlignedBlock tuple;
@@ -657,7 +875,7 @@ UT_TEST(test_bad_maintenance_does_not_modify_output)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(12);
 	UT_RUN(test_confirm_and_inplace_match_native);
 	UT_RUN(test_lock_and_updated_lock_match_native);
 	UT_RUN(test_zero_length_inplace_payload_matches_native);
@@ -666,6 +884,10 @@ main(void)
 	UT_RUN(test_maintenance_matches_native);
 	UT_RUN(test_maintenance_terminal_shapes_match_native);
 	UT_RUN(test_bad_maintenance_does_not_modify_output);
+	UT_RUN(test_insert_variants_match_native);
+	UT_RUN(test_delete_variants_match_native);
+	UT_RUN(test_insert_reuses_unused_pointer_and_delete_logical_trailer);
+	UT_RUN(test_insert_delete_bad_shapes_do_not_modify_output);
 	UT_DONE();
 	free(decoded);
 	return ut_failed_count != 0;
