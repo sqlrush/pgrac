@@ -78,7 +78,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_hw_handoff test_cluster_lms_native_probe \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
-        test_cluster_heap_lock_tuple test_cluster_heap_epq_wait test_cluster_heap_inplace test_cluster_heap_inplace_version test_cluster_perf_gates \
+        test_cluster_heap_lock_tuple test_cluster_heap_epq_wait test_cluster_heap_inplace test_cluster_heap_inplace_version test_cluster_heap_maintenance_version test_cluster_perf_gates \
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
@@ -423,7 +423,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1265,6 +1265,60 @@ test_cluster_page_install: test_cluster_page_install.c unit_test.h \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 CLUSTER_PAGE_PRODUCER_O = cluster_page_producer_test.o
+
+# PGRAC: native maintenance mutation/WAL bodies and tuple/page helpers.
+test_cluster_heap_prune_version.inc: $(top_srcdir)/src/backend/access/heap/pruneheap.c Makefile
+	awk '/Any error while applying the changes is critical/ { emit=1; found++ } \
+	     emit { print } emit && /END_CRIT_SECTION\(\);/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_prune_helpers.inc: $(top_srcdir)/src/backend/access/heap/pruneheap.c Makefile
+	awk '/^heap_page_prune_execute\(/ { print "void"; emit=1; found++ } \
+	     /^page_verify_redirects\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_body.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_freeze_execute_prepared\(/ { inside=1; found++ } \
+	     inside && /^{/ { emit=1 } emit { print } /^}/ { inside=emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_freeze_helpers.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_execute_freeze_tuple\(/ { print "static void"; emit=1; found++ } \
+	     /^heap_log_freeze_(cmp|plan)\(/ { print "static int"; emit=1; found++ } \
+	     /^heap_log_freeze_eq\(/ { print "static bool"; emit=1; found++ } \
+	     /^heap_log_freeze_new_plan\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_vacuum_version.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^lazy_vacuum_heap_page\(/ { inside=1 } \
+	     inside && /^\tupdate_vacuum_error_info\(/ { emit=1; found++ } \
+	     emit { print } emit && /END_CRIT_SECTION\(\);/ { emit=0; done++ } \
+	     /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_maintenance_identity.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/^\tvacrel->rel = rel;/ { emit=1; found++ } \
+	     emit && /^\tvac_open_indexes\(/ { emit=0; done++ } emit { print } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c unit_test.h \
+		test_cluster_heap_maintenance_identity.inc \
+		test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
+		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc \
+		test_cluster_heap_vacuum_version.inc test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: the real INSERT mutation/WAL block and native tuple/page insertion.
 test_cluster_heap_insert_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
@@ -3178,6 +3232,9 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_heap_maintenance_identity.inc
+	rm -f test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
+		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc test_cluster_heap_vacuum_version.inc
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
@@ -5415,8 +5472,9 @@ CLUSTER_HOT_PRUNE_TEST_O = test_cluster_hot_prune_product.o
 CLUSTER_HOT_BUFPAGE_TEST_O = test_cluster_hot_bufpage_product.o
 CLUSTER_HOT_HORIZON_O = $(top_builddir)/src/backend/cluster/cluster_undo_horizon.o
 
-$(CLUSTER_HOT_PRUNE_TEST_O): $(top_srcdir)/src/backend/access/heap/pruneheap.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+$(CLUSTER_HOT_PRUNE_TEST_O): $(top_srcdir)/src/backend/access/heap/pruneheap.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections \
+		-Dcluster_space_relation_get_identity=ut_prune_get_identity -c $< -o $@
 
 $(CLUSTER_HOT_BUFPAGE_TEST_O): $(top_srcdir)/src/backend/storage/page/bufpage.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
@@ -5738,6 +5796,7 @@ test_cluster_heap_update_temp_lock: test_cluster_heap_update_temp_lock.c unit_te
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
 
 test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		cluster_r4_activation_test_stubs.h \
 		$(CLUSTER_SEMANTIC_ACTIVATION_C) $(CLUSTER_SEMANTIC_ACTIVATION_H) \
 		$(CLUSTER_UNDO_ROOT_DESCRIPTOR_O) \
@@ -5753,6 +5812,7 @@ test_cluster_r4_lock_order: test_cluster_r4_lock_order.c unit_test.h \
 		$(CLUSTER_R4_HOT_VIS_TEST_O) $(CLUSTER_R4_EXEC_TUPLES_TEST_O) \
 		$(CLUSTER_R4_HEAPTUPLE_TEST_O) $(CLUSTER_WRITER_CHAIN_O) $(CLUSTER_VIS_VERDICT_O) \
 		$(CLUSTER_HOT_PRUNE_TEST_O) $(CLUSTER_HOT_BUFPAGE_TEST_O) $(CLUSTER_HOT_HORIZON_O) \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_CRYPTOHASH_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) $(filter -lssl -lcrypto,$(LIBS)) -o $@

@@ -65,6 +65,13 @@
 #include "utils/pg_rusage.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: native maintenance retains pre-lock relation version identity. */
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
+
 
 /*
  * Space/time tradeoff parameters: do these need to be user-tunable?
@@ -144,6 +151,10 @@ typedef struct LVRelState
 	Relation	rel;
 	Relation   *indrels;
 	int			nindexes;
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned;
+	ClusterSpaceIdentity identity;
+#endif
 
 	/* Buffer access strategy and parallel vacuum state */
 	BufferAccessStrategy bstrategy;
@@ -364,6 +375,15 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 
 	/* Set up high level stuff about rel and its indexes */
 	vacrel->rel = rel;
+#ifdef USE_PGRAC_CLUSTER
+	/* Copy before any heap content lock; the relation lifecycle lock stays held. */
+	vacrel->versioned = cluster_shared_config
+		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	if (vacrel->versioned && (!RelationNeedsWAL(rel)
+		|| !cluster_space_relation_get_identity(rel, &vacrel->identity)))
+		elog(ERROR, "PGRAC shared VACUUM requires exact SPACE identity");
+#endif
 	vac_open_indexes(vacrel->rel, RowExclusiveLock, &vacrel->nindexes,
 					 &vacrel->indrels);
 	vacrel->bstrategy = bstrategy;
@@ -1584,7 +1604,11 @@ retry:
 	tuples_deleted = heap_page_prune(rel, buf, vacrel->cutoffs.OldestXmin,
 									 vacrel->vistest,
 									 InvalidTransactionId, 0, &nnewlpdead,
-									 &vacrel->offnum);
+									 &vacrel->offnum
+#ifdef USE_PGRAC_CLUSTER
+									 , vacrel->versioned ? &vacrel->identity : NULL
+#endif
+									 );
 
 	/*
 	 * Now scan the page to collect LP_DEAD items and check for tuples
@@ -1849,7 +1873,11 @@ retry:
 			/* Execute all freeze plans for page as a single atomic action */
 			heap_freeze_execute_prepared(vacrel->rel, buf,
 										 snapshotConflictHorizon,
-										 frozen, tuples_frozen);
+										 frozen, tuples_frozen
+#ifdef USE_PGRAC_CLUSTER
+										 , vacrel->versioned ? &vacrel->identity : NULL
+#endif
+										 );
 		}
 	}
 	else
@@ -2504,6 +2532,9 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 	TransactionId visibility_cutoff_xid;
 	bool		all_frozen;
 	LVSavedErrInfo saved_err_info;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+#endif
 
 	Assert(vacrel->nindexes == 0 || vacrel->do_index_vacuuming);
 
@@ -2514,7 +2545,24 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 							 VACUUM_ERRCB_PHASE_VACUUM_HEAP, blkno,
 							 InvalidOffsetNumber);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (vacrel->versioned)
+	{
+		const uint8 block_id = 0;
+
+		if (!RelationNeedsWAL(vacrel->rel)
+			|| !RelFileLocatorEquals(vacrel->identity.key.locator, vacrel->rel->rd_locator)
+			|| !cluster_space_prepare_buffer_versions(&vacrel->identity, &buffer,
+				&block_id, 1, &version_batch))
+			elog(ERROR, "PGRAC shared heap vacuum requires exact SPACE identity");
+	}
+#endif
+
 	START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+	if (vacrel->versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC shared heap vacuum version changed before mutation");
+#endif
 
 	for (; index < dead_items->num_items; index++)
 	{
@@ -2555,6 +2603,10 @@ lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno, Buffer buffer,
 		XLogRegisterData((char *) &xlrec, SizeOfHeapVacuum);
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+#ifdef USE_PGRAC_CLUSTER
+		if (vacrel->versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC shared heap vacuum cannot register page version");
+#endif
 		XLogRegisterBufData(0, (char *) unused, nunused * sizeof(OffsetNumber));
 
 		recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VACUUM);

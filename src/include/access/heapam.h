@@ -324,7 +324,11 @@ extern bool heap_prepare_freeze_tuple(HeapTupleHeader tuple,
 									  HeapTupleFreeze *frz, bool *totally_frozen);
 extern void heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 										 TransactionId snapshotConflictHorizon,
-										 HeapTupleFreeze *tuples, int ntuples);
+										 HeapTupleFreeze *tuples, int ntuples
+#ifdef USE_PGRAC_CLUSTER
+										 , const struct ClusterSpaceIdentity *identity
+#endif
+										 );
 extern bool heap_freeze_tuple(HeapTupleHeader tuple,
 							  TransactionId relfrozenxid, TransactionId relminmxid,
 							  TransactionId FreezeLimit, TransactionId MultiXactCutoff);
@@ -351,7 +355,11 @@ extern int	heap_page_prune(Relation relation, Buffer buffer,
 							TransactionId old_snap_xmin,
 							TimestampTz old_snap_ts,
 							int *nnewlpdead,
-							OffsetNumber *off_loc);
+							OffsetNumber *off_loc
+#ifdef USE_PGRAC_CLUSTER
+							, const struct ClusterSpaceIdentity *identity
+#endif
+							);
 extern void heap_page_prune_execute(Buffer buffer,
 									OffsetNumber *redirected, int nredirected,
 									OffsetNumber *nowdead, int ndead,

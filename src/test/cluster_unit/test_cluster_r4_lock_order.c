@@ -32,6 +32,9 @@
 #include "cluster/cluster_mxid_stripe.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_wal_thread.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tx_enqueue.h"
 #include "cluster/cluster_tx_resolve.h"
@@ -85,6 +88,7 @@ ShmemInitStruct(const char *name pg_attribute_unused(), Size size pg_attribute_u
 UT_DEFINE_GLOBALS();
 
 static bool ut_capture_error;
+bool cluster_shared_config;
 static bool ut_capture_miss_log;
 static bool ut_finishing_miss_log;
 static int ut_miss_log_count;
@@ -712,6 +716,8 @@ BufferGetLSNAtomic(Buffer buffer pg_attribute_unused())
 bool
 BufferIsPermanent(Buffer buffer pg_attribute_unused())
 {
+	if (cluster_shared_config)
+		return true;
 	UT_ASSERT(false);
 	return false;
 }
@@ -1997,6 +2003,72 @@ static int ut_prune_wal_offset_bytes;
 bool cluster_enable_adg = false;
 bool cluster_undo_retention_horizon_enabled = true;
 int cluster_lmon_main_loop_interval = 1000;
+
+/* SPACE read is the I/O seam; the actual component/batch helpers are linked. */
+static bool ut_prune_identity_ready;
+static unsigned ut_prune_identity_reads, ut_prune_version_edges;
+static uint64 ut_prune_version_token;
+static RfPageVersionEdgeEntryV1 ut_prune_version_edge;
+bool ut_prune_get_identity(Relation relation, ClusterSpaceIdentity *out);
+
+bool
+ut_prune_get_identity(Relation relation, ClusterSpaceIdentity *out)
+{
+	UT_ASSERT(ut_prune_fixture_active && cluster_shared_config);
+	UT_ASSERT(!ut_hot_content_lock_held);
+	ut_prune_identity_reads++;
+	if (!ut_prune_identity_ready)
+		return false;
+	memset(out, 0, sizeof(*out));
+	out->key.system_identifier = 11;
+	out->key.database_incarnation = 12;
+	memset(out->key.storage_uuid, 13, 16);
+	out->key.locator = relation->rd_locator;
+	memset(out->incarnation, 30, 16);
+	out->sequence = 1;
+	out->operation = 40;
+	out->state = CLUSTER_SPACE_IDENTITY_LIVE;
+	return true;
+}
+int
+cluster_smgr_which_for(RelFileLocator locator, BackendId backend)
+{
+	UT_ASSERT(ut_prune_fixture_active && cluster_shared_config);
+	UT_ASSERT_EQ(locator.relNumber, ut_hot_product_fixture->expected_tag.relNumber);
+	UT_ASSERT_EQ(backend, InvalidBackendId);
+	return 1;
+}
+bool
+cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->claim.identity.system_identifier = 11;
+	out->claim.database_incarnation = 12;
+	memset(out->claim.identity.storage_uuid, 13, 16);
+	return true;
+}
+bool
+cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
+{
+	(void)out;
+	abort();
+}
+SCN
+cluster_scn_advance(void)
+{
+	UT_ASSERT(ut_prune_fixture_active && ut_hot_content_lock_held);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	return 101;
+}
+void
+XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *edges, uint8 count)
+{
+	UT_ASSERT(ut_prune_fixture_active && ut_hot_content_lock_held);
+	UT_ASSERT_EQ(count, 1);
+	ut_prune_version_edge = edges[0];
+	ut_prune_version_token = token;
+	ut_prune_version_edges++;
+}
 
 bool
 ActiveSnapshotSet(void)
@@ -6475,9 +6547,49 @@ static void
 ut_prune_end(void)
 {
 	UT_ASSERT(!ut_hot_content_lock_held);
+	cluster_shared_config = false;
 	ut_prune_fixture_active = false;
 	LockBuffer(UT_HOT_BUFFER, BUFFER_LOCK_EXCLUSIVE);
 	ut_itl_census_end();
+}
+
+UT_TEST(test_shared_hot_prune_captures_identity_before_cleanup)
+{
+	for (int ready = 0; ready <= 1; ready++) {
+		UtR4HotProductFixture fixture;
+		HeapHotSearchResult hot;
+		RelationData relation;
+		FormData_pg_class form;
+		PGAlignedBlock before;
+		Page page;
+
+		ut_prune_begin(&fixture, &hot, &relation, &form);
+		cluster_shared_config = true;
+		ut_prune_identity_ready = ready;
+		ut_prune_identity_reads = ut_prune_version_edges = 0;
+		ut_prune_version_token = 0;
+		relation.rd_locator
+			= (RelFileLocator){ fixture.expected_tag.spcOid, fixture.expected_tag.dbOid,
+								fixture.expected_tag.relNumber };
+		page = (Page)fixture.live_page;
+		((PageHeader)page)->pd_block_scn = 20;
+		memcpy(before.data, page, BLCKSZ);
+		heap_page_prune_opt(&relation, UT_HOT_BUFFER);
+		UT_ASSERT_EQ(ut_prune_identity_reads, 1);
+		UT_ASSERT_EQ(ut_prune_version_edges, ready);
+		UT_ASSERT_EQ(ut_prune_wal_records, ready);
+		if (ready) {
+			UT_ASSERT_EQ(ut_prune_reclaimed, 2);
+			UT_ASSERT_EQ(ut_prune_version_token, 101);
+			UT_ASSERT_EQ(ut_prune_version_edge.before.mutation_token, 20);
+			UT_ASSERT_EQ(((PageHeader)page)->pd_block_scn, 101);
+			UT_ASSERT_EQ(ItemIdGetRedirect(PageGetItemId(page, 1)), 3);
+		} else {
+			UT_ASSERT_EQ(ut_prune_cleanup_calls, 0);
+			UT_ASSERT(memcmp(before.data, page, BLCKSZ) == 0);
+		}
+		ut_prune_end();
+	}
 }
 
 UT_TEST(test_proved_hot_prune_reclaims_real_space_and_preserves_root_and_tail)
@@ -6983,7 +7095,8 @@ UT_TEST(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement)
 int
 main(void)
 {
-	UT_PLAN(139);
+	UT_PLAN(140);
+	UT_RUN(test_shared_hot_prune_captures_identity_before_cleanup);
 	UT_RUN(test_live_miss_evidence_preserves_result_and_rejects_unreadable_metadata);
 	UT_RUN(pinned_hot_slot_must_keep_selected_tuple_after_remote_image_replacement);
 	UT_RUN(test_real_hot_full_three_versions_preserve_statement_scn_polarity);

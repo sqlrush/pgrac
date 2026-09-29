@@ -20048,9 +20048,19 @@ heap_execute_freeze_tuple(HeapTupleHeader tuple, HeapTupleFreeze *frz)
 void
 heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 							 TransactionId snapshotConflictHorizon,
-							 HeapTupleFreeze *tuples, int ntuples)
+							 HeapTupleFreeze *tuples, int ntuples
+#ifdef USE_PGRAC_CLUSTER
+							 , const ClusterSpaceIdentity *identity
+#endif
+							 )
 {
 	Page		page = BufferGetPage(buffer);
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned = cluster_shared_config
+		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+#endif
 
 	Assert(ntuples > 0);
 
@@ -20100,7 +20110,24 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 		}
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	/* The VACUUM owner obtained this identity before taking content locks. */
+	if (versioned)
+	{
+		const uint8 block_id = 0;
+
+		if (!RelationNeedsWAL(rel) || identity == NULL
+			|| !RelFileLocatorEquals(identity->key.locator, rel->rd_locator)
+			|| !cluster_space_prepare_buffer_versions(identity, &buffer, &block_id, 1,
+				&version_batch))
+			elog(ERROR, "PGRAC shared heap freeze requires exact SPACE identity");
+	}
+#endif
 	START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC shared heap freeze version changed before mutation");
+#endif
 
 	for (int i = 0; i < ntuples; i++)
 	{
@@ -20139,6 +20166,10 @@ heap_freeze_execute_prepared(Relation rel, Buffer buffer,
 		 * whole buffer, the arrays need not be stored too.
 		 */
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC shared heap freeze cannot register page version");
+#endif
 		XLogRegisterBufData(0, (char *) plans,
 							nplans * sizeof(xl_heap_freeze_plan));
 		XLogRegisterBufData(0, (char *) offsets,
