@@ -2791,7 +2791,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib \
+	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
 		test_cluster_control_root_worker.inc \
 		test_cluster_ges_recovery_modes.inc \
 		test_cluster_cr_mvcc_gate.inc \
@@ -5712,11 +5712,16 @@ test_cluster_wal_publish_entry.inc: $(top_srcdir)/src/backend/access/transam/xlo
 	     END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_wal_durable_publish: test_cluster_wal_durable_publish.c unit_test.h \
+test_cluster_wal_durable_publish: test_cluster_wal_durable_publish.c
+bench_wal_publish_cost: bench_wal_publish_cost.c test_cluster_wal_durable_publish.c
+
+# PGRAC: the optional cost executable shares the real publisher fixture and
+# is never built into postgres. Author: SqlRush <sqlrush@gmail.com>
+test_cluster_wal_durable_publish bench_wal_publish_cost: unit_test.h \
 		$(top_srcdir)/src/backend/cluster/cluster_wal_durable_publish.c \
 		$(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) xlogreader_fs.o \
 		test_cluster_wal_publish_tail.inc test_cluster_wal_publish_callers.inc test_cluster_wal_publish_entry.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(srcdir)/$@.c $(CLUSTER_WAL_DURABLE_PREFIX_O) $(CLUSTER_WAL_CLAIM_O) \
 		xlogreader_fs.o $(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(LDFLAGS) $(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 

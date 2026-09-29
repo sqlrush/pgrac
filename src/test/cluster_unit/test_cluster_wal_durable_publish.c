@@ -59,6 +59,7 @@ static ClusterWalDurablePrefixRef restart_ref;
 static ClusterWalStartupImage startup_op;
 static ClusterControlRootResult startup_selection;
 static char scratch[MAXPGPATH], generation[MAXPGPATH], prefix_path[MAXPGPATH];
+static const char *scratch_parent = "/tmp";
 static int sync_calls, rename_calls, fail_sync, fail_rename, change_epoch;
 static bool fail_write, fail_readback, expect_panic;
 static sigjmp_buf native_error;
@@ -511,7 +512,9 @@ fixture(void)
 		pfree(cluster_wal_threads_dir);
 	if (DataDir)
 		pfree(DataDir);
-	strlcpy(scratch, "/tmp/pgrac-prefix-publish-XXXXXX", sizeof(scratch));
+	if (snprintf(scratch, sizeof(scratch), "%s/pgrac-prefix-publish-XXXXXX", scratch_parent)
+		>= sizeof(scratch))
+		abort();
 	if (!mkdtemp(scratch))
 		abort();
 	snprintf(walroot, sizeof(walroot), "%s/wal", scratch);
