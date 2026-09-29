@@ -16,6 +16,7 @@
  */
 #include "postgres.h"
 #include "cluster/cluster_config_channels.h"
+#include "cluster/cluster_cssd.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_router.h"
@@ -259,6 +260,79 @@ cluster_config_channels_stream_retiring(int32 peer)
 	if (!channel_local.active || channel_local.owner.pid != MyProcPid
 		|| (peer != -1
 			&& (peer < 0 || peer >= CLUSTER_MAX_NODES || !channel_local.peer[peer].active)))
+		return;
+	channel_invalid(cluster_shared_config_delivery_channels(&pid));
+}
+
+/* Exact maintenance traffic creates no ordinary module responsibility.
+ * This is not a serving exemption: the original parser/handler/capability
+ * checks still run. In particular, generic CONTROL and chunk wrappers are
+ * never exempt, even when an inner payload resembles a configuration frame. */
+static bool
+channel_maintenance_frame(int32 peer, const ClusterICEnvelope *env, Size payload_length,
+						  bool sending)
+{
+	if (env == NULL || peer < 0 || peer >= CLUSTER_MAX_NODES
+		|| !channel_member(channel_local.command.key.required, peer)
+		|| env->magic != PGRAC_IC_ENVELOPE_MAGIC || env->version != PGRAC_IC_ENVELOPE_VERSION_V1
+		|| env->source_node_id != (uint32)(sending ? cluster_node_id : peer)
+		|| env->dest_node_id != (uint32)(sending ? peer : cluster_node_id)
+		|| env->epoch != channel_local.command.key.epoch || env->payload_length != payload_length)
+		return false;
+	if (env->msg_type == PGRAC_IC_MSG_HEARTBEAT)
+		return payload_length == 0;
+	if (channel_local.index != 0)
+		return env->msg_type == PGRAC_IC_MSG_CONFIG_PREFIX_DATA
+			   && payload_length == CLUSTER_CONFIG_PREFIX_BYTES;
+	switch (env->msg_type) {
+	case PGRAC_IC_MSG_CSSD_HEARTBEAT:
+		return payload_length == sizeof(ClusterCssdHeartbeatPayload);
+	case PGRAC_IC_MSG_PEER_CAPS_REPLY:
+		return payload_length == PGRAC_IC_HELLO_BYTES;
+	case PGRAC_IC_MSG_CONFIG_MEMBERS:
+		return payload_length == CLUSTER_CONFIG_MEMBERS_BYTES;
+	case PGRAC_IC_MSG_CONFIG_PREFIX_CONTROL:
+		return payload_length == CLUSTER_CONFIG_PREFIX_BYTES;
+	default:
+		return false;
+	}
+}
+
+static bool
+channel_activity_relevant(void)
+{
+	/* No shared-memory touch or parsing on the ordinary inactive fast path.
+ * A fork must never publish over its parent's retained report. */
+	return channel_local.active && channel_local.owner.pid == MyProcPid
+		   && channel_local.report.phase != CHANNEL_INVALID;
+}
+
+/* Called BEFORE a new native send can write or enqueue bytes. A subsequent
+ * NOT_ADMITTED may conservatively dirty this attempt: the original producer
+ * still owns the work. Completion of an already queued tail is separate. */
+void
+cluster_config_channels_sending(int32 peer, const void *bytes, Size length)
+{
+	ClusterICEnvelope env;
+	int32 pid;
+	if (!channel_activity_relevant())
+		return;
+	if (bytes != NULL && length >= sizeof(env)) {
+		memcpy(&env, bytes, sizeof(env));
+		if (channel_maintenance_frame(peer, &env, length - sizeof(env), true))
+			return;
+	}
+	channel_invalid(cluster_shared_config_delivery_channels(&pid));
+}
+
+/* Original native verification precedes this callback. Invalidate before
+ * handing a whole frame to a handler or admitting its chunk responsibility,
+ * not at the next owner tick. Never consume, refuse or mutate the frame. */
+void
+cluster_config_channels_received(int32 peer, const ClusterICEnvelope *env, Size payload_length)
+{
+	int32 pid;
+	if (!channel_activity_relevant() || channel_maintenance_frame(peer, env, payload_length, false))
 		return;
 	channel_invalid(cluster_shared_config_delivery_channels(&pid));
 }

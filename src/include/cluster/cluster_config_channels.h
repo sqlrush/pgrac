@@ -87,6 +87,12 @@ extern void cluster_config_channels_tick(void);
 /* Native transport calls before retiring/replacing a stream; -1 means all.
  * Bounded publication only: no allocation, locking, send or resource release. */
 extern void cluster_config_channels_stream_retiring(int32 peer);
+/* Native Tier1 only: retire this owner's evidence before attempting a new
+ * frame or dispatching a verified received frame. Never changes transport
+ * ownership/results or drops old work; exact maintenance frames are exempt. */
+extern void cluster_config_channels_sending(int32 peer, const void *bytes, Size length);
+extern void cluster_config_channels_received(int32 peer, const ClusterICEnvelope *env,
+											 Size payload_length);
 extern void cluster_config_channels_ingress(const ClusterICEnvelope *env, const void *bytes);
 extern void cluster_config_channels_register(void);
 

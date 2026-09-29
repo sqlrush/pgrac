@@ -20,6 +20,7 @@
 #include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ic_chunk.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_sf_dep.h"
 #include "miscadmin.h"
@@ -601,10 +602,251 @@ UT_TEST(zero_capability_generation_is_still_rechecked)
 	UT_ASSERT_EQ(census.armed, 0);
 }
 
+static void
+complete_owners(void)
+{
+	arm_owners();
+	UT_ASSERT(cluster_config_channels_exchange());
+	for (int i = 0; i < 3; ++i) {
+		unsigned start = sends;
+		owner(i);
+		cluster_config_channels_tick();
+		reply(&sent[start], false);
+		reply(&sent[start + 1], false);
+		reply(&sent[start], true);
+		reply(&sent[start + 1], true);
+		cluster_config_channels_tick();
+	}
+	owner(0);
+}
+
+static ClusterICEnvelope
+activity_envelope(uint8 type, uint32 length, bool sending)
+{
+	ClusterICEnvelope env = { 0 };
+	env.magic = PGRAC_IC_ENVELOPE_MAGIC;
+	env.version = PGRAC_IC_ENVELOPE_VERSION_V1;
+	env.source_node_id = sending ? 0 : 1;
+	env.dest_node_id = sending ? 1 : 0;
+	env.epoch = members.formation_epoch;
+	env.msg_type = type;
+	env.payload_length = length;
+	return env;
+}
+
+static void
+activity_send(const ClusterICEnvelope *env)
+{
+	uint8 bytes[sizeof(*env) + CLUSTER_CONFIG_MEMBERS_BYTES] = { 0 };
+	UT_ASSERT(env->payload_length <= CLUSTER_CONFIG_MEMBERS_BYTES);
+	memcpy(bytes, env, sizeof(*env));
+	cluster_config_channels_sending(1, bytes, sizeof(*env) + env->payload_length);
+}
+
+UT_TEST(late_business_retires_completed_owner_before_next_tick)
+{
+	for (int i = 0; i < 3; ++i) {
+		for (unsigned sending = 0; sending < 2; ++sending) {
+			ClusterConfigChannelsCensus census;
+			ClusterICEnvelope env;
+			setup();
+			complete_owners();
+			UT_ASSERT(cluster_config_channels_observe(&census));
+			UT_ASSERT_EQ(census.complete, 7);
+			owner(i);
+			env = activity_envelope(PGRAC_IC_MSG_GES_REQUEST, 0, sending);
+			if (sending)
+				activity_send(&env);
+			else
+				cluster_config_channels_received(1, &env, 0);
+			owner(0);
+			/* No service/transport tick can be required to retire the proof. */
+			UT_ASSERT(cluster_config_channels_observe(&census));
+			UT_ASSERT_EQ(census.complete, 7 & ~(1u << i));
+			UT_ASSERT_EQ(census.invalid, 1u << i);
+			owner(i);
+			cluster_config_channels_tick();
+			reply(&sent[0], false);
+			owner(0);
+			UT_ASSERT(cluster_config_channels_observe(&census));
+			UT_ASSERT_EQ(census.invalid, 1u << i);
+		}
+	}
+}
+
+UT_TEST(activity_at_arm_prevents_starting_prefix_exchange)
+{
+	ClusterICEnvelope env;
+	setup();
+	arm_owners();
+	env = activity_envelope(PGRAC_IC_MSG_SCN_BROADCAST, 0, true);
+	activity_send(&env);
+	UT_ASSERT(!cluster_config_channels_exchange());
+	UT_ASSERT_EQ(sends, 0);
+}
+
+UT_TEST(exact_maintenance_frames_preserve_channel_proof)
+{
+	const struct {
+		int owner;
+		uint8 type;
+		uint32 length;
+	} cases[] = {
+		{ 0, PGRAC_IC_MSG_HEARTBEAT, 0 },
+		{ 1, PGRAC_IC_MSG_HEARTBEAT, 0 },
+		{ 0, 11, 12 }, /* literal CSSD heartbeat, independent wire expectation */
+		{ 0, PGRAC_IC_MSG_PEER_CAPS_REPLY, 64 },
+		{ 0, PGRAC_IC_MSG_CONFIG_MEMBERS, 352 },
+		{ 0, PGRAC_IC_MSG_CONFIG_PREFIX_CONTROL, 256 },
+		{ 1, PGRAC_IC_MSG_CONFIG_PREFIX_DATA, 256 },
+		{ 2, PGRAC_IC_MSG_CONFIG_PREFIX_DATA, 256 },
+	};
+	ClusterConfigChannelsCensus census;
+	setup();
+	complete_owners();
+	for (unsigned i = 0; i < lengthof(cases); ++i) {
+		ClusterICEnvelope env;
+		owner(cases[i].owner);
+		env = activity_envelope(cases[i].type, cases[i].length, true);
+		activity_send(&env);
+		env = activity_envelope(cases[i].type, cases[i].length, false);
+		cluster_config_channels_received(1, &env, cases[i].length);
+		owner(0);
+		UT_ASSERT(cluster_config_channels_observe(&census));
+		UT_ASSERT_EQ(census.complete, 7);
+		UT_ASSERT_EQ(census.invalid, 0);
+	}
+}
+
+UT_TEST(malformed_maintenance_cannot_hide_old_work)
+{
+	for (unsigned kind = 0; kind < 10; ++kind) {
+		ClusterICEnvelope env;
+		setup();
+		complete_owners();
+		env = activity_envelope(PGRAC_IC_MSG_CONFIG_PREFIX_CONTROL, 256, true);
+		switch (kind) {
+		case 0:
+			env.magic = 0;
+			break;
+		case 1:
+			env.version++;
+			break;
+		case 2:
+			env.source_node_id = 127;
+			break;
+		case 3:
+			env.dest_node_id = 127;
+			break;
+		case 4:
+			env.epoch--;
+			break;
+		case 5:
+			env.payload_length--;
+			break;
+		case 6:
+			env.msg_type = PGRAC_IC_MSG_CONFIG_PREFIX_DATA;
+			break;
+		case 7:
+			env.msg_type = PGRAC_IC_CHUNK_MSG_TYPE;
+			break;
+		case 8:
+			env.msg_type = 250;
+			break;
+		case 9:
+			env.dest_node_id = PGRAC_IC_BROADCAST;
+			break;
+		}
+		activity_send(&env);
+		UT_ASSERT_EQ(channel_local.report.phase, CHANNEL_INVALID);
+		UT_ASSERT_EQ(channel_local.report.complete[0], 0);
+	}
+	setup();
+	complete_owners();
+	cluster_config_channels_sending(1, NULL, 0);
+	UT_ASSERT_EQ(channel_local.report.phase, CHANNEL_INVALID);
+	setup();
+	complete_owners();
+	{
+		ClusterICEnvelope env = activity_envelope(PGRAC_IC_MSG_HEARTBEAT, 0, true);
+		cluster_config_channels_sending(1, &env, sizeof(env) - 1);
+		UT_ASSERT_EQ(channel_local.report.phase, CHANNEL_INVALID);
+	}
+}
+
+UT_TEST(receive_maintenance_validates_shape_and_peer)
+{
+	for (unsigned kind = 0; kind < 6; ++kind) {
+		ClusterICEnvelope env;
+		setup();
+		complete_owners();
+		owner(2);
+		env = activity_envelope(PGRAC_IC_MSG_CONFIG_PREFIX_DATA, 256, false);
+		switch (kind) {
+		case 0:
+			env.source_node_id = 127;
+			break;
+		case 1:
+			env.dest_node_id = 127;
+			break;
+		case 2:
+			env.epoch++;
+			break;
+		case 3:
+			env.payload_length--;
+			break;
+		case 4:
+			env.msg_type = PGRAC_IC_MSG_CONFIG_MEMBERS;
+			break;
+		case 5:
+			env.msg_type = PGRAC_IC_MSG_GCS_BLOCK_REPLY;
+			break;
+		}
+		cluster_config_channels_received(1, &env, 256);
+		UT_ASSERT_EQ(channel_local.report.phase, CHANNEL_INVALID);
+	}
+}
+
+UT_TEST(fork_and_inactive_observers_cannot_write_parent_report)
+{
+	ClusterICEnvelope env;
+	ClusterConfigChannelSlot before;
+	setup();
+	env = activity_envelope(PGRAC_IC_MSG_GES_REPLY, 0, true);
+	activity_send(&env);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&board.slots[0].sequence), 0);
+	complete_owners();
+	before = board.slots[0];
+	MyProcPid++;
+	activity_send(&env);
+	env = activity_envelope(PGRAC_IC_MSG_GES_REPLY, 0, false);
+	cluster_config_channels_received(1, &env, 0);
+	UT_ASSERT(memcmp(&before, &board.slots[0], sizeof(before)) == 0);
+}
+
+UT_TEST(activity_is_sticky_once_but_new_attempt_is_independent)
+{
+	ClusterICEnvelope env;
+	uint64 sequence;
+	setup();
+	complete_owners();
+	env = activity_envelope(PGRAC_IC_MSG_GES_REPLY, 0, true);
+	activity_send(&env);
+	UT_ASSERT_EQ(channel_local.report.phase, CHANNEL_INVALID);
+	sequence = pg_atomic_read_u64(&board.slots[0].sequence);
+	activity_send(&env);
+	UT_ASSERT_EQ(pg_atomic_read_u64(&board.slots[0].sequence), sequence);
+	cluster_config_channels_cancel();
+	episode[0]++;
+	arm_owners();
+	UT_ASSERT(cluster_config_channels_exchange());
+	UT_ASSERT_EQ(channel_local.report.phase, CHANNEL_ARMED);
+}
+
 int
 main(void)
 {
-	UT_PLAN(15);
+	UT_PLAN(22);
 	UT_RUN(arming_needs_every_owner_without_sending);
 	UT_RUN(all_peers_and_directions_precede_completion);
 	UT_RUN(missing_stream_is_pending_and_rebind_invalidates);
@@ -620,6 +862,13 @@ main(void)
 	UT_RUN(registration_retains_exact_native_planes);
 	UT_RUN(retired_stream_and_capability_cannot_leave_completion);
 	UT_RUN(zero_capability_generation_is_still_rechecked);
+	UT_RUN(late_business_retires_completed_owner_before_next_tick);
+	UT_RUN(activity_at_arm_prevents_starting_prefix_exchange);
+	UT_RUN(exact_maintenance_frames_preserve_channel_proof);
+	UT_RUN(malformed_maintenance_cannot_hide_old_work);
+	UT_RUN(receive_maintenance_validates_shape_and_peer);
+	UT_RUN(fork_and_inactive_observers_cannot_write_parent_report);
+	UT_RUN(activity_is_sticky_once_but_new_attempt_is_independent);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

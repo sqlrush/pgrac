@@ -168,6 +168,25 @@ cluster_ic_hello_set_worker_fields(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint8 wo
 static unsigned ut_config_retire_calls;
 static int32 ut_config_retire_peer;
 static uint64 ut_config_retire_serial;
+static void (*ut_config_send_hook)(int32, const void *, Size);
+static void (*ut_config_receive_hook)(int32, const ClusterICEnvelope *, Size);
+void cluster_config_channels_sending(int32 peer, const void *bytes, Size length);
+void cluster_config_channels_received(int32 peer, const ClusterICEnvelope *env, Size length);
+
+void
+cluster_config_channels_sending(int32 peer, const void *bytes, Size length)
+{
+	if (ut_config_send_hook != NULL)
+		ut_config_send_hook(peer, bytes, length);
+}
+
+void
+cluster_config_channels_received(int32 peer, const ClusterICEnvelope *env, Size length)
+{
+	if (ut_config_receive_hook != NULL)
+		ut_config_receive_hook(peer, env, length);
+}
+
 void
 cluster_config_channels_stream_retiring(int32 peer)
 {

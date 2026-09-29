@@ -1301,6 +1301,11 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		&& Tier1Shmem->peers[target_node_id].conn_epoch != cluster_epoch_get_current())
 		return CLUSTER_IC_SEND_HARD_ERROR;
 
+	/* PGRAC: withdraw a held configuration prefix before ordinary new bytes
+	 * can escape, including direct/fanout/chunk sends which bypass the router.
+	 * The caller's ownership and four-state send result remain unchanged. */
+	cluster_config_channels_sending(target_node_id, buf, len);
+
 	/*
 	 * Hardening v1.0.1 F1 (spec-2.2 v1.0.1 + spec-2.3 v1.0.1 L68):
 	 * per-peer outbound buffer for partial writes.  If a previous send
@@ -2943,6 +2948,10 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			}
 			/* OK -> fall through to dispatch */
 		}
+
+		/* PGRAC: a late old frame invalidates the held channel report before
+		 * handler/chunk work. Original envelope rejection remains above. */
+		cluster_config_channels_received(peer_id, &env, payload_len);
 
 		/* HEARTBEAT-specific bookkeeping. */
 		if (env.msg_type == PGRAC_IC_MSG_HEARTBEAT) {
