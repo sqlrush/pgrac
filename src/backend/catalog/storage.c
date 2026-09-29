@@ -39,7 +39,9 @@
 #include "catalog/storage_xlog.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_ko.h" /* PGRAC: spec-5.7 D6 object-reuse flush barrier */
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
 #endif
 #include "miscadmin.h"
 #include "storage/freespace.h"
@@ -519,9 +521,10 @@ RelationPreTruncate(Relation rel)
  *
  * Also note that this is frequently called via locutions such as
  *		RelationCopyStorage(RelationGetSmgr(rel), ...);
- * That's safe only because we perform only smgr and WAL operations here.
- * If we invoked anything else, a relcache flush could cause our SMgrRelation
- * argument to become a dangling pointer.
+ * That's safe because the loop performs only smgr and WAL operations. The
+ * PGRAC shared-copy identity read before the loop can access buffers, so it
+ * saves both locators first and reacquires handles afterward. A relcache
+ * flush must not leave an argument as a dangling SMgrRelation pointer.
  */
 void
 RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
@@ -533,6 +536,10 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 	bool		copying_initfork;
 	BlockNumber nblocks;
 	BlockNumber blkno;
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned_copy = false;
+	ClusterSpaceIdentity copy_identity;
+#endif
 
 	page = (Page) buf.data;
 
@@ -552,6 +559,28 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 	 */
 	use_wal = XLogIsNeeded() &&
 		(relpersistence == RELPERSISTENCE_PERMANENT || copying_initfork);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && relpersistence == RELPERSISTENCE_PERMANENT &&
+		cluster_smgr_which_for(dst->smgr_rlocator.locator, dst->smgr_rlocator.backend) == 1)
+	{
+		RelFileLocatorBackend src_locator = src->smgr_rlocator;
+		RelFileLocatorBackend dst_locator = dst->smgr_rlocator;
+
+		/* PGRAC: acquire the destination identity before the copy loop.
+		 * Native buffer access may invalidate old SMgr handles, so reacquire
+		 * both by their saved exact locators before dereferencing them. */
+		if (!use_wal || (forkNum != MAIN_FORKNUM && forkNum != FSM_FORKNUM &&
+						 forkNum != VISIBILITYMAP_FORKNUM) ||
+			!cluster_space_relation_read_identity(dst_locator.locator, &copy_identity))
+			elog(ERROR, "cannot bind new relation copy to exact SPACE identity");
+		src = smgropen(src_locator.locator, src_locator.backend);
+		dst = smgropen(dst_locator.locator, dst_locator.backend);
+		if (smgrnblocks(dst, forkNum) != 0)
+			elog(ERROR, "versioned relation copy requires an empty destination fork");
+		versioned_copy = true;
+	}
+#endif
 
 	nblocks = smgrnblocks(src, forkNum);
 
@@ -588,7 +617,22 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 		 * space.
 		 */
 		if (use_wal)
-			log_newpage(&dst->smgr_rlocator.locator, forkNum, blkno, page, false);
+		{
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned_copy)
+			{
+				XLogRecPtr copy_lsn;
+
+				if (!cluster_space_copy_page_wal(&copy_identity, forkNum, blkno,
+											   page, &copy_lsn))
+					elog(ERROR, "cannot WAL-log new SPACE page version");
+				/* PGRAC: the new DATA image never precedes its own WAL. */
+				XLogFlush(copy_lsn);
+			}
+			else
+#endif
+				log_newpage(&dst->smgr_rlocator.locator, forkNum, blkno, page, false);
+		}
 
 		PageSetChecksumInplace(page, blkno);
 

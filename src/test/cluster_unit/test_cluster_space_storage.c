@@ -265,7 +265,8 @@ BufferGetBlockNumber(Buffer buffer)
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	if (buffer != 1 || !pinned || locked || mode != BUFFER_LOCK_EXCLUSIVE)
+	if (buffer != 1 || !pinned || locked
+		|| (mode != BUFFER_LOCK_EXCLUSIVE && mode != BUFFER_LOCK_SHARE))
 		abort();
 	locked = true;
 }
@@ -516,6 +517,43 @@ UT_TEST(test_existing_identity_is_never_recreated)
 	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
 }
 
+UT_TEST(test_identity_read_is_exact_and_never_creates)
+{
+	ClusterSpaceIdentity out;
+	ClusterSpaceIdentity saved;
+	unsigned prior_creates;
+
+	reset();
+	memset(&out, 0xa5, sizeof(out));
+	saved = out;
+	UT_ASSERT(!cluster_space_relation_read_identity(locator, &out));
+	UT_ASSERT_EQ(create_calls, 0);
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT(cluster_space_relation_create(locator));
+	prior_creates = create_calls;
+	UT_ASSERT(cluster_space_relation_read_identity(locator, &out));
+	UT_ASSERT_EQ(out.state, CLUSTER_SPACE_IDENTITY_LIVE);
+	UT_ASSERT_EQ(out.incarnation[15], 0x45);
+	UT_ASSERT(!pinned && !locked);
+	saved = out;
+	ref.claim.database_incarnation++;
+	UT_ASSERT(!cluster_space_relation_read_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	ref.claim.database_incarnation--;
+	page.data[160] = 1;
+	UT_ASSERT(!cluster_space_relation_read_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT_EQ(create_calls, prior_creates);
+	UT_ASSERT(!pinned && !locked);
+	page.data[160] = 0;
+	out.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	UT_ASSERT(cluster_space_identity_page_encode(&out, 18, page.data, BLCKSZ));
+	out = saved;
+	UT_ASSERT(!cluster_space_relation_read_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
 UT_TEST(test_real_replay_exact_duplicate_and_preserved_token)
 {
 	DecodedXLogRecord decoded;
@@ -741,10 +779,11 @@ UT_TEST(test_subabort_forgets_drop_without_tombstoning)
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(12);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
+	UT_RUN(test_identity_read_is_exact_and_never_creates);
 	UT_RUN(test_real_replay_exact_duplicate_and_preserved_token);
 	UT_RUN(test_native_create_registers_abort_cleanup_before_space);
 	UT_RUN(test_native_descriptor_recognizes_typed_record);

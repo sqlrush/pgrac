@@ -15,6 +15,7 @@
 
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_producer.h"
@@ -54,6 +55,95 @@ space_set_lsn(Page page, XLogRecPtr lsn, uint64 token)
 {
 	PageSetLSN(page, lsn);
 	((PageHeader)page)->pd_block_scn = token;
+}
+
+bool
+cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
+{
+	ClusterSpaceIdentityKey expected;
+	ClusterSpaceIdentity identity;
+	SMgrRelation rel;
+	Buffer buffer;
+	bool valid;
+	uint64 token;
+
+	if (out == NULL || RecoveryInProgress() || !space_namespace(locator, false, &expected, NULL))
+		return false;
+	rel = smgropen(locator, InvalidBackendId);
+	if (!smgrexists(rel, SPACE_FORKNUM) || smgrnblocks(rel, SPACE_FORKNUM) != 1)
+		return false;
+	buffer = ReadBufferWithoutRelcache(locator, SPACE_FORKNUM, 0, RBM_NORMAL, NULL, true);
+	LockBuffer(buffer, BUFFER_LOCK_SHARE);
+	valid = BufferGetBlockNumber(buffer) == 0
+			&& cluster_space_identity_page_decode(BufferGetPage(buffer), BLCKSZ, SPACE_FORKNUM, 0,
+												  &expected, &identity, &token)
+			&& identity.state == CLUSTER_SPACE_IDENTITY_LIVE;
+	UnlockReleaseBuffer(buffer);
+	if (valid)
+		*out = identity;
+	return valid;
+}
+
+bool
+cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
+							BlockNumber block, void *page, XLogRecPtr *lsn)
+{
+	ClusterSpaceIdentityKey expected;
+	ClusterSpaceIdentity checked;
+	uint8 encoded[CLUSTER_SPACE_IDENTITY_BYTES];
+	RfPageProducerComponentV1 component;
+	RfPageProducerBatchV1 batch;
+	PGAlignedBlock result;
+	XLogRecPtr recptr;
+
+	if (identity == NULL || page == NULL || lsn == NULL || block == InvalidBlockNumber
+		|| RecoveryInProgress()
+		|| (forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM && forknum != FSM_FORKNUM)
+		|| !space_namespace(identity->key.locator, false, &expected, NULL)
+		|| !cluster_space_identity_encode(identity, encoded, sizeof(encoded))
+		|| !cluster_space_identity_decode(encoded, sizeof(encoded), &expected, &checked)
+		|| checked.state != CLUSTER_SPACE_IDENTITY_LIVE)
+		return false;
+	/* An unformatted ordinary source is not PRESENT. Its typed structural
+	 * replay must be supplied before that copy shape can be admitted. */
+	if ((((PageHeader)page)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0
+		|| (forknum != FSM_FORKNUM && PageIsNew(page)))
+		return false;
+	memset(&component, 0, sizeof(component));
+	memset(&result, 0, sizeof(result));
+	if (forknum == FSM_FORKNUM) {
+		component.page_class = RF_PAGE_CLASS_REBUILDABLE_FSM;
+		component.before_kind = RF_PAGE_STATE_REBUILDABLE;
+	} else {
+		component.page_class = RF_PAGE_CLASS_ORDINARY;
+		component.before_kind = RF_PAGE_STATE_ABSENT;
+		component.page = result.data;
+		memcpy(component.segment_incarnation, checked.incarnation, 16);
+	}
+	/* Capture the new destination's absent state before copying any source
+	 * bytes. The original relation owner, not this codec, proves an empty
+	 * destination fork and retains the object lifecycle lock. */
+	if (!rf_page_producer_prepare_v1(&component, 1, &batch))
+		return false;
+	memcpy(result.data, page, BLCKSZ);
+	if (forknum != FSM_FORKNUM)
+		((PageHeader)result.data)->pd_block_scn = 0;
+	if (!rf_page_producer_stamp_v1(&batch))
+		return false;
+	XLogBeginInsert();
+	XLogRegisterBlock(0, &checked.key.locator, forknum, block, result.data, REGBUF_FORCE_IMAGE);
+	if (!rf_page_producer_register_wal_v1(&batch))
+		elog(ERROR, "new SPACE page version changed before WAL registration");
+	recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+	if (!PageIsNew(result.data)) {
+		if (forknum == FSM_FORKNUM)
+			PageSetLSN(result.data, recptr);
+		else
+			space_set_lsn(result.data, recptr, batch.result_token);
+	}
+	memcpy(page, result.data, BLCKSZ);
+	*lsn = recptr;
+	return true;
 }
 
 bool

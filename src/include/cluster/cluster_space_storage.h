@@ -23,6 +23,18 @@
  * relation acquires a SPACE identity, and no existing identity is replaced. */
 extern bool cluster_space_relation_create(RelFileLocator locator);
 
+/* Original relation owner holds its lifecycle lock. Reads exact LIVE state
+ * through native buffers; never creates missing storage. Output unchanged
+ * on refusal. Caller must not hold a page content lock across this read. */
+extern bool cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out);
+
+/* New empty-fork copy owner only. A private source page becomes a new
+ * ABSENT->PRESENT version under the destination identity, logged as one
+ * FPI+version record. FSM has its explicit rebuildable class. The caller
+ * flushes returned WAL before DATA and retains its final native fsync. */
+extern bool cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
+										BlockNumber block, void *page, XLogRecPtr *lsn);
+
 /* Original recovery executor only, with its existing isolation and selected
  * WAL inputs. Decode/identity success is not recovery admission. False MUST
  * reject replay; an unsupported structural action is never silently skipped. */
