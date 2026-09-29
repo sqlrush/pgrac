@@ -78,7 +78,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_hw_handoff test_cluster_lms_native_probe \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
-        test_cluster_heap_lock_tuple test_cluster_heap_epq_wait test_cluster_heap_inplace test_cluster_perf_gates \
+        test_cluster_heap_lock_tuple test_cluster_heap_epq_wait test_cluster_heap_inplace test_cluster_heap_inplace_version test_cluster_perf_gates \
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
@@ -423,6 +423,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_replay_batch,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -3182,6 +3183,7 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
+		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
 		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
 		test_cluster_heap_confirm_capture.inc test_cluster_heap_spec_abort_capture.inc \
 		test_cluster_vm_version.inc test_cluster_vm_redo_consumers.inc test_cluster_heap_update_temp_version.inc \
@@ -5472,6 +5474,32 @@ test_cluster_heap_inplace: test_cluster_heap_inplace.c unit_test.h test_cluster_
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(CLUSTER_HOT_BUFPAGE_TEST_O) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+# PGRAC: run the actual native WAL-first inplace publisher, not a copied model.
+test_cluster_heap_inplace_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_inplace_update_and_unlock\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_inplace_legacy_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_inplace_update\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_inplace_itemptr_product.o: $(top_srcdir)/src/backend/storage/page/itemptr.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_heap_inplace_version: test_cluster_heap_inplace_version.c unit_test.h \
+		test_cluster_heap_inplace_version.inc test_cluster_heap_inplace_legacy_version.inc \
+		test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 test_cluster_heap_epq_consumer.inc: $(top_srcdir)/src/backend/access/heap/heapam_handler.c Makefile
 	awk '/^heapam_tuple_lock\(/ { print "static TM_Result"; emit=1; found++ } \

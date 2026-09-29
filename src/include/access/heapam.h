@@ -14,6 +14,13 @@
 #ifndef HEAPAM_H
 #define HEAPAM_H
 
+/*
+ * PGRAC MODIFICATIONS
+ *   Modified by: SqlRush <sqlrush@gmail.com>
+ *   Carry cluster successor proofs and inplace SPACE identities through
+ *   native heap consumers; non-cluster signatures remain unchanged.
+ */
+
 #include "access/relation.h"	/* for backward compatibility */
 #include "access/relscan.h"
 #include "access/sdir.h"
@@ -39,6 +46,9 @@
 typedef struct BulkInsertStateData *BulkInsertState;
 struct TupleTableSlot;
 struct VacuumCutoffs;
+#ifdef USE_PGRAC_CLUSTER
+struct ClusterSpaceIdentity;
+#endif
 
 #ifdef USE_PGRAC_CLUSTER
 /*
@@ -300,7 +310,11 @@ extern bool heap_inplace_lock(Relation relation,
 							  void (*release_callback) (void *), void *arg);
 extern void heap_inplace_update_and_unlock(Relation relation,
 										   HeapTuple oldtup, HeapTuple tuple,
-										   Buffer buffer);
+										   Buffer buffer
+#ifdef USE_PGRAC_CLUSTER
+										   , const struct ClusterSpaceIdentity *identity
+#endif
+										   );
 extern void heap_inplace_unlock(Relation relation,
 								HeapTuple oldtup, Buffer buffer);
 extern void heap_inplace_update(Relation relation, HeapTuple tuple);

@@ -34,6 +34,7 @@
  *   Modified by: SqlRush <sqlrush@gmail.com>
  *   Record bounded metadata for shared MVCC selection misses.
  *   Keep cluster-only VM acquisition plans out of non-cluster builds.
+ *   Bind inplace WAL private images and visible pages to one exact version.
  */
 #include "postgres.h"
 
@@ -18998,17 +18999,32 @@ inplace_decided:
  * bitmap (if any) don't change either.
  *
  * Since we hold LOCKTAG_TUPLE, no updater has a local copy of this tuple.
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: carry the begin owner's SPACE identity and version the WAL
+ * image before installing the same token on the visible page.
+ * Why: retain the native WAL-first publication and checkpoint-delay order.
  */
 void
 heap_inplace_update_and_unlock(Relation relation,
 							   HeapTuple oldtup, HeapTuple tuple,
-							   Buffer buffer)
+							   Buffer buffer
+#ifdef USE_PGRAC_CLUSTER
+							   , const ClusterSpaceIdentity *identity
+#endif
+							   )
 {
 	HeapTupleHeader htup = oldtup->t_data;
 	uint32		oldlen;
 	uint32		newlen;
 	char	   *dst;
 	char	   *src;
+#ifdef USE_PGRAC_CLUSTER
+	bool		cluster_page_versioned = cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1;
+	RfPageProducerBatchV1 cluster_page_versions;
+#endif
 
 	Assert(ItemPointerEquals(&oldtup->t_self, &tuple->t_self));
 	oldlen = oldtup->t_len - htup->t_hoff;
@@ -19018,6 +19034,22 @@ heap_inplace_update_and_unlock(Relation relation,
 
 	dst = (char *) htup + htup->t_hoff;
 	src = (char *) tuple->t_data + tuple->t_data->t_hoff;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the begin owner supplied this identity before content locking.
+	 * Capture without publishing: inplace must log before visible mutation. */
+	if (cluster_page_versioned)
+	{
+		const uint8 block_id = 0;
+
+		if (!RelationNeedsWAL(relation)
+			|| identity == NULL
+			|| !RelFileLocatorEquals(identity->key.locator, relation->rd_locator)
+			|| !cluster_space_prepare_buffer_versions(identity, &buffer,
+														 &block_id, 1, &cluster_page_versions))
+			elog(ERROR, "shared inplace update page identity is not provable");
+	}
+#endif
 
 	/*
 	 * Unlink relcache init files as needed.  If unlinking, acquire
@@ -19089,11 +19121,25 @@ heap_inplace_update_and_unlock(Relation relation,
 		memcpy(copied_buffer.data + upper, origdata + upper, BLCKSZ - upper);
 		dst_offset_in_block = dst - origdata;
 		memcpy(copied_buffer.data + dst_offset_in_block, src, newlen);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			/* PGRAC: stamp only the private image until XLogInsert succeeds. */
+			cluster_page_versions.ordinary_pages[0] = copied_buffer.data;
+			if (!rf_page_producer_stamp_v1(&cluster_page_versions))
+				elog(PANIC, "inplace update private page version changed");
+		}
+#endif
 		BufferGetTag(buffer, &rlocator, &forkno, &blkno);
 		Assert(forkno == MAIN_FORKNUM);
 		XLogRegisterBlock(0, &rlocator, forkno, blkno, copied_buffer.data,
 						  REGBUF_STANDARD);
 		XLogRegisterBufData(0, src, newlen);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned
+			&& !rf_page_producer_register_wal_v1(&cluster_page_versions))
+			elog(PANIC, "inplace update version WAL registration failed");
+#endif
 
 		/* inplace updates aren't decoded atm, don't log the origin */
 
@@ -19103,6 +19149,12 @@ heap_inplace_update_and_unlock(Relation relation,
 	}
 
 	memcpy(dst, src, newlen);
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_page_versioned)
+		((PageHeader) BufferGetPage(buffer))->pd_block_scn
+			= (SCN) cluster_page_versions.result_token;
+#endif
 
 	MarkBufferDirty(buffer);
 
@@ -19147,6 +19199,10 @@ heap_inplace_unlock(Relation relation,
  *
  * This exists only to keep modules working in back branches.  Affected
  * modules should migrate to systable_inplace_update_begin().
+ *
+ * PGRAC modifications by SqlRush <sqlrush@gmail.com>:
+ * What changed: capture and log shared page versions with the native record.
+ * Why: this compatibility producer must not leave an unversioned mutation.
  */
 void
 heap_inplace_update(Relation relation, HeapTuple tuple)
@@ -19158,6 +19214,11 @@ heap_inplace_update(Relation relation, HeapTuple tuple)
 	HeapTupleHeader htup;
 	uint32		oldlen;
 	uint32		newlen;
+#ifdef USE_PGRAC_CLUSTER
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
+#endif
 
 	/*
 	 * For now, we don't allow parallel updates.  Unlike a regular update,
@@ -19169,6 +19230,19 @@ heap_inplace_update(Relation relation, HeapTuple tuple)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("cannot update tuples during a parallel operation")));
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: even this compatibility entry cannot fetch SPACE under a lock. */
+	if (cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_get_identity(relation, &cluster_page_identity))
+			elog(ERROR, "shared inplace update requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
+#endif
 
 	buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(&(tuple->t_self)));
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -19188,8 +19262,24 @@ heap_inplace_update(Relation relation, HeapTuple tuple)
 	if (oldlen != newlen || htup->t_hoff != tuple->t_data->t_hoff)
 		elog(ERROR, "wrong tuple length");
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_page_versioned)
+	{
+		const uint8 block_id = 0;
+
+		if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+													 &buffer, &block_id, 1, &cluster_page_versions))
+			elog(ERROR, "shared inplace update page version is not provable");
+	}
+#endif
+
 	/* NO EREPORT(ERROR) from here till changes are logged */
 	START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_page_versioned && !rf_page_producer_stamp_v1(&cluster_page_versions))
+		elog(PANIC, "inplace update page version changed before publication");
+#endif
 
 	memcpy((char *) htup + htup->t_hoff,
 		   (char *) tuple->t_data + tuple->t_data->t_hoff,
@@ -19210,6 +19300,11 @@ heap_inplace_update(Relation relation, HeapTuple tuple)
 
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
 		XLogRegisterBufData(0, (char *) htup + htup->t_hoff, newlen);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned
+			&& !rf_page_producer_register_wal_v1(&cluster_page_versions))
+			elog(PANIC, "inplace update version WAL registration failed");
+#endif
 
 		/* inplace updates aren't decoded atm, don't log the origin */
 
