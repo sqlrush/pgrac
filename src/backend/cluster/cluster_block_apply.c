@@ -225,6 +225,8 @@ cluster_block_apply_delta(XLogReaderState *record, uint8 block_id, char *page)
 
 	case RM_SEQ_ID:
 		return cluster_block_apply_sequence(record, block_id, page);
+	case RM_BTREE_ID:
+		return cluster_block_apply_btree(record, block_id, page);
 
 	default:
 		return CLUSTER_BLKAPPLY_UNSUPPORTED;

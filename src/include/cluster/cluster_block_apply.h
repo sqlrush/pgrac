@@ -98,5 +98,7 @@ extern ClusterBlkApplyResult cluster_block_apply_one(struct XLogReaderState *rec
  */
 extern ClusterBlkApplyResult cluster_block_apply_heap(struct XLogReaderState *record,
 													  uint8 block_id, char *page);
+extern ClusterBlkApplyResult cluster_block_apply_btree(struct XLogReaderState *record,
+													   uint8 block_id, char *page);
 
 #endif /* CLUSTER_BLOCK_APPLY_H */

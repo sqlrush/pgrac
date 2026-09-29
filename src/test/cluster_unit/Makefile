@@ -431,6 +431,9 @@ TESTS += test_cluster_btree_structure_version
 TESTS += test_cluster_sequence_version
 TESTS += test_cluster_relation_wal_policy
 TESTS += test_cluster_heap_small_redo
+TESTS += test_cluster_btree_redo
+CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
+		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1309,6 +1312,39 @@ test_cluster_heap_small_redo: test_cluster_heap_small_redo.c unit_test.h \
 		test_cluster_heap_redo_uba_product.o test_cluster_ctrc_transam_product.o \
 		$(CLUSTER_BLOCK_APPLY_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+# PGRAC: native btree redo and page initializer for byte comparisons.
+test_cluster_btree_pageinit.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
+	awk '/^_bt_pageinit\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_redo_native.inc: $(top_srcdir)/src/backend/access/nbtree/nbtxlog.c Makefile
+	awk '/^(_bt_restore_page|_bt_restore_meta|_bt_clear_incomplete_split|btree_xlog_insert|btree_xlog_newroot|btree_xlog_split|btree_xlog_mark_page_halfdead|btree_xlog_unlink_page|btree_xlog_updates|btree_xlog_vacuum|btree_xlog_delete|btree_xlog_dedup)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 12) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_copytuple.inc: $(top_srcdir)/src/backend/access/common/indextuple.c Makefile
+	awk '/^CopyIndexTuple\(/ { print "IndexTuple"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_posting.inc: $(top_srcdir)/src/backend/access/nbtree/nbtdedup.c Makefile
+	awk '/^(_bt_swap_posting|_bt_form_posting)\(/ { print "IndexTuple"; emit=1; found++ } \
+	     /^(_bt_dedup_start_pending|_bt_update_posting)\(/ { print "void"; emit=1; found++ } \
+	     /^_bt_dedup_save_htid\(/ { print "bool"; emit=1; found++ } \
+	     /^_bt_dedup_finish_pending\(/ { print "Size"; emit=1; found++ } \
+	     /^_bt_posting_valid\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 7) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_redo: test_cluster_btree_redo.c unit_test.h test_cluster_btree_pageinit.inc \
+		test_cluster_btree_copytuple.inc test_cluster_btree_posting.inc test_cluster_inplace_itemptr_product.o \
+		test_cluster_btree_redo_native.inc test_cluster_space_bufpage_product.o \
+		$(CLUSTER_BLOCK_APPLY_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(CLUSTER_BLOCK_APPLY_O) $(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: actual shared/nonshared relation WAL-elision decisions.
 test_cluster_btree_structure_version test_cluster_btree_leaf_version \
@@ -3013,7 +3049,8 @@ test_cluster_undo_buf: test_cluster_undo_buf.c unit_test.h $(CLUSTER_UNDO_BUF_O)
 # (NOOP / UNSUPPORTED empty starter matrix / FPI restore) with fabricated
 # decoded records.  The byte-for-byte differential against PG real redo
 # (real WAL + heap delta handlers) lands as a cluster_tap in D3b/D6.
-CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o
+test_cluster_block_apply_btree_product.o: $(top_srcdir)/src/backend/cluster/cluster_block_apply_btree.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 test_cluster_block_apply: test_cluster_block_apply.c unit_test.h $(CLUSTER_BLOCK_APPLY_O) \
 		test_cluster_space_bufpage_product.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
@@ -3548,6 +3585,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc
 	rm -f test_cluster_relation_wal_types.inc test_cluster_relation_wal_native.inc
 	rm -f test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc
+	rm -f test_cluster_btree_redo_native.inc test_cluster_btree_pageinit.inc
+	rm -f test_cluster_btree_copytuple.inc test_cluster_btree_posting.inc
 	rm -f test_cluster_heap_maintenance_native.inc
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc

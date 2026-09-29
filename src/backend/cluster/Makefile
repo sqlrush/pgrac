@@ -142,6 +142,7 @@ OBJS = \
 	cluster_recovery_anchor.o \
 	cluster_block_apply.o \
 	cluster_block_apply_heap.o \
+	cluster_block_apply_btree.o \
 	cluster_block_apply_srf.o \
 	cluster_block_recovery.o \
 	cluster_block_recovery_srf.o \
