@@ -135,6 +135,50 @@ space_copy_prepare(const ClusterSpaceIdentity *identity, ForkNumber forknum, Blo
 	return rf_page_producer_stamp_v1(batch);
 }
 
+bool
+cluster_space_prepare_buffer_versions(const ClusterSpaceIdentity *identity, const Buffer *buffers,
+									  const uint8 *block_ids, uint8 count,
+									  RfPageProducerBatchV1 *batch)
+{
+	ClusterSpaceIdentityKey expected;
+	ClusterSpaceIdentity checked;
+	uint8 encoded[CLUSTER_SPACE_IDENTITY_BYTES];
+	RfPageProducerComponentV1 components[RF_PAGE_PRODUCER_MAX_COMPONENTS];
+	int i;
+
+	if (identity == NULL || buffers == NULL || block_ids == NULL || batch == NULL || count == 0
+		|| count > RF_PAGE_PRODUCER_MAX_COMPONENTS || RecoveryInProgress()
+		|| !space_namespace(identity->key.locator, false, &expected, NULL)
+		|| !cluster_space_identity_encode(identity, encoded, sizeof(encoded))
+		|| !cluster_space_identity_decode(encoded, sizeof(encoded), &expected, &checked)
+		|| checked.state != CLUSTER_SPACE_IDENTITY_LIVE)
+		return false;
+	memset(components, 0, sizeof(components));
+	for (i = 0; i < count; i++) {
+		RelFileLocator locator;
+		ForkNumber forknum;
+		BlockNumber block;
+		Page page;
+
+		if (!BufferIsValid(buffers[i]) || BufferIsLocal(buffers[i])
+			|| !BufferIsPermanent(buffers[i]))
+			return false;
+		BufferGetTag(buffers[i], &locator, &forknum, &block);
+		page = BufferGetPage(buffers[i]);
+		if (!RelFileLocatorEquals(locator, checked.key.locator) || block == InvalidBlockNumber
+			|| (forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM)
+			|| (((PageHeader)page)->pd_flags & (PD_SPACE_METADATA | PD_UNDO_SEG_HEADER)) != 0)
+			return false;
+		components[i].block_id = block_ids[i];
+		components[i].component_ordinal = i;
+		components[i].page_class = RF_PAGE_CLASS_ORDINARY;
+		components[i].before_kind = RF_PAGE_STATE_PRESENT;
+		components[i].page = page;
+		memcpy(components[i].segment_incarnation, checked.incarnation, 16);
+	}
+	return rf_page_producer_prepare_v1(components, count, batch);
+}
+
 static XLogRecPtr
 space_copy_insert(const ClusterSpaceIdentity *identity, ForkNumber forknum, BlockNumber block,
 				  Page result, const RfPageProducerBatchV1 *batch)

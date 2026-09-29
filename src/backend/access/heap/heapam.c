@@ -109,6 +109,8 @@
 #include "cluster/cluster_xnode_profile.h" /* diagnostic wait phase trace */
 #include "cluster/cluster_itl_touch.h"	/* xact-local touch list */
 #include "cluster/cluster_scn.h"		/* cluster_scn_advance / SCN */
+#include "cluster/cluster_space_storage.h" /* PGRAC: native page-version WAL */
+#include "cluster/storage/cluster_smgr.h"
 #include "storage/buf_internals.h"	/* GetBufferDescriptor */
 /* PGRAC (spec-3.4b D5): real UBA encode + xact-local TT binding. */
 #include "cluster/cluster_tt_local.h"	/* get_or_create_binding / peek_binding */
@@ -5798,6 +5800,10 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	bool		all_visible_cleared = false;
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
+	/* PGRAC: static shared profile; identity precedes every content lock. */
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
 	/* PGRAC (spec-3.4a D3 / spec-3.4b D5): hoisted to function scope per PG style. */
 	uint8		cluster_itl_slot = CLUSTER_ITL_SLOT_UNALLOCATED;
 	bool		cluster_itl_active = false;
@@ -5839,6 +5845,16 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 	heaptup = heap_prepare_insert(relation, tup, xid, cid, options);
 
 #ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_read_identity(relation->rd_locator,
+													&cluster_page_identity))
+			elog(ERROR, "shared heap insert requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_write_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -6044,6 +6060,20 @@ cluster_heap_insert_retry:
 	}
 
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: capture after the final VM acquisition, before receipt APPLY.
+	 * The native retry label rebuilds this private batch. No page token can
+	 * change until the no-retry boundary has consumed its exact fingerprints. */
+	if (cluster_page_versioned)
+	{
+		Buffer version_buffers[2] = {buffer, vmbuffer};
+		uint8 version_ids[2] = {0, 1};
+
+		if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+												   version_buffers, version_ids,
+												   vm_locked ? 2 : 1,
+												   &cluster_page_versions))
+			elog(ERROR, "shared heap insert cannot capture exact page versions");
+	}
 	MemSet(&cluster_itl_ctrc_handle, 0, sizeof(cluster_itl_ctrc_handle));
 	{
 		ClusterHeapPreparedUndoTargetPlan undo_plan;
@@ -6194,6 +6224,17 @@ cluster_heap_insert_retry:
 
 	START_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: successful APPLY is the existing no-retry boundary. */
+	if (cluster_page_versioned)
+	{
+		if (!rf_page_producer_stamp_v1(&cluster_page_versions))
+			elog(PANIC, "heap insert page version changed after receipt APPLY");
+		/* The VM token changes even if its visibility bit was already clear. */
+		if (cluster_page_versions.entry_count == 2)
+			MarkBufferDirty(vmbuffer);
+	}
+#endif
 	RelationPutHeapTuple(relation, buffer, heaptup,
 						 (options & HEAP_INSERT_SPECULATIVE) != 0);
 
@@ -6339,9 +6380,24 @@ cluster_heap_insert_retry:
 		/* filtering by origin on a row level is much more efficient */
 		XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			/* PGRAC: VM is an explicit ordinary component. Its bitmap occupies
+			 * the nominal page hole, so STANDARD would silently omit it. */
+			if (cluster_page_versions.entry_count == 2)
+				XLogRegisterBuffer(1, vmbuffer, REGBUF_FORCE_IMAGE);
+			if (!rf_page_producer_register_wal_v1(&cluster_page_versions))
+				elog(PANIC, "heap insert page-version WAL registration failed");
+		}
+#endif
 		recptr = XLogInsert(RM_HEAP_ID, info);
 
 		PageSetLSN(page, recptr);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned && cluster_page_versions.entry_count == 2)
+			PageSetLSN(BufferGetPage(vmbuffer), recptr);
+#endif
 	}
 
 	END_CRIT_SECTION();

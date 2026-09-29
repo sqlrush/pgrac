@@ -15,6 +15,7 @@
 #define CLUSTER_SPACE_STORAGE_H
 
 #include "access/xlogreader.h"
+#include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_identity.h"
 #include "storage/buf.h"
 
@@ -28,6 +29,16 @@ extern bool cluster_space_relation_create(RelFileLocator locator);
  * through native buffers; never creates missing storage. Output unchanged
  * on refusal. Caller must not hold a page content lock across this read. */
 extern bool cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out);
+
+/* Capture the original mutation owner's locked, initialized MAIN/VM pages.
+ * Identity was read before acquiring content locks; this call performs no
+ * storage I/O or buffer acquisition. It validates the whole batch before
+ * allocating one result token and never changes page bytes. Block IDs are
+ * those used by the native WAL record, in strictly increasing order. Caller
+ * retains all pins/content locks through stamp, native mutation and WAL. */
+extern bool cluster_space_prepare_buffer_versions(const ClusterSpaceIdentity *identity,
+												  const Buffer *buffers, const uint8 *block_ids,
+												  uint8 count, RfPageProducerBatchV1 *batch);
 
 /* New empty-fork copy owner only. A private source page becomes a new
  * ABSENT->PRESENT version under the destination identity, logged as one
