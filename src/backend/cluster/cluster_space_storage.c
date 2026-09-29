@@ -25,6 +25,64 @@
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/smgr.h"
+#include "utils/catcache.h"
+#include "utils/hsearch.h"
+#include "utils/inval.h"
+#include "utils/memutils.h"
+#include "utils/rel.h"
+
+/* Backend-private adjunct, like the native relfilenumber mapping cache.
+ * No cached pointer is persisted in a relcache initialization file. */
+typedef struct SpaceIdentityCacheEntry {
+	Oid relid;
+	ClusterSpaceIdentity identity;
+} SpaceIdentityCacheEntry;
+
+static HTAB *space_identity_cache;
+static uint64 space_identity_invalidations;
+
+static void
+space_identity_invalidate(Datum arg, Oid relid)
+{
+	Assert(space_identity_cache != NULL);
+	if (++space_identity_invalidations == 0)
+		elog(ERROR, "SPACE identity invalidation counter exhausted");
+	if (OidIsValid(relid))
+		hash_search(space_identity_cache, &relid, HASH_REMOVE, NULL);
+	else {
+		HASH_SEQ_STATUS scan;
+		SpaceIdentityCacheEntry *entry;
+
+		hash_seq_init(&scan, space_identity_cache);
+		while ((entry = hash_seq_search(&scan)) != NULL)
+			hash_search(space_identity_cache, &entry->relid, HASH_REMOVE, NULL);
+	}
+}
+
+static void
+space_identity_cache_init(void)
+{
+	HASHCTL ctl;
+
+	if (CacheMemoryContext == NULL)
+		CreateCacheMemoryContext();
+	memset(&ctl, 0, sizeof(ctl));
+	ctl.keysize = sizeof(Oid);
+	ctl.entrysize = sizeof(SpaceIdentityCacheEntry);
+	ctl.hcxt = CacheMemoryContext;
+	space_identity_cache
+		= hash_create("SPACE relation identities", 64, &ctl, HASH_ELEM | HASH_BLOBS | HASH_CONTEXT);
+	CacheRegisterRelcacheCallback(space_identity_invalidate, (Datum)0);
+}
+
+static bool
+space_identity_key_matches(const ClusterSpaceIdentityKey *a, const ClusterSpaceIdentityKey *b)
+{
+	return a->system_identifier == b->system_identifier
+		   && a->database_incarnation == b->database_incarnation
+		   && memcmp(a->storage_uuid, b->storage_uuid, sizeof(a->storage_uuid)) == 0
+		   && RelFileLocatorEquals(a->locator, b->locator);
+}
 
 static bool
 space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out, uint16 *thread)
@@ -82,6 +140,56 @@ cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentit
 	if (valid)
 		*out = identity;
 	return valid;
+}
+
+bool
+cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out)
+{
+	if (relation == NULL || out == NULL || relation->rd_rel == NULL
+		|| !OidIsValid(RelationGetRelid(relation)))
+		return false;
+
+	for (;;) {
+		ClusterSpaceIdentityKey expected, current;
+		ClusterSpaceIdentity identity;
+		SpaceIdentityCacheEntry *entry;
+		Oid relid = RelationGetRelid(relation);
+		uint64 invalidations;
+		bool valid;
+
+		CHECK_FOR_INTERRUPTS();
+		if (!relation->rd_isvalid) {
+			if (space_identity_cache != NULL)
+				space_identity_invalidate((Datum)0, relid);
+			return false;
+		}
+		if (RecoveryInProgress() || !RelationIsPermanent(relation) || !RelationNeedsWAL(relation)
+			|| !space_namespace(relation->rd_locator, false, &expected, NULL))
+			return false;
+		if (space_identity_cache == NULL)
+			space_identity_cache_init();
+		entry = hash_search(space_identity_cache, &relid, HASH_FIND, NULL);
+		if (entry != NULL && space_identity_key_matches(&entry->identity.key, &expected)) {
+			*out = entry->identity;
+			return true;
+		}
+		/* Never retain an entry or SMgr pointer across native buffer access:
+		 * it may process invalidations and remove the very entry just found. */
+		hash_search(space_identity_cache, &relid, HASH_REMOVE, NULL);
+		invalidations = space_identity_invalidations;
+		valid = cluster_space_relation_read_identity(expected.locator, &identity);
+		if (invalidations != space_identity_invalidations)
+			continue;
+		if (!valid || !relation->rd_isvalid || RelationGetRelid(relation) != relid
+			|| !space_namespace(relation->rd_locator, false, &current, NULL))
+			return false;
+		if (!space_identity_key_matches(&expected, &current))
+			continue;
+		entry = hash_search(space_identity_cache, &relid, HASH_ENTER, NULL);
+		entry->identity = identity;
+		*out = identity;
+		return true;
+	}
 }
 
 static bool

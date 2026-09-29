@@ -18,6 +18,7 @@
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_identity.h"
 #include "storage/buf.h"
+#include "utils/relcache.h"
 
 /* Caller is the original relation-create owner, after registering native
  * abort-time deletion (or under CREATE DATABASE's whole-directory cleanup).
@@ -29,6 +30,14 @@ extern bool cluster_space_relation_create(RelFileLocator locator);
  * through native buffers; never creates missing storage. Output unchanged
  * on refusal. Caller must not hold a page content lock across this read. */
 extern bool cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out);
+
+/* DML owner holds the original relation lifecycle lock and has consumed native
+ * relcache invalidations at its lock/statement boundary. Backend-private
+ * relcache adjunct: hits use memory only, misses use the exact reader above.
+ * Caller must not hold content locks even on an expected hit. A returned value
+ * is a copy, never a cache or SMgr pointer. Cross-node DDL must complete its
+ * existing reliable invalidation barrier before releasing lifecycle locks. */
+extern bool cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out);
 
 /* Capture the original mutation owner's locked, initialized MAIN/VM pages.
  * Identity was read before acquiring content locks; this call performs no

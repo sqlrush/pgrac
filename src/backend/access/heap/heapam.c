@@ -5850,7 +5850,7 @@ heap_insert(Relation relation, HeapTuple tup, CommandId cid,
 		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
 	{
 		if (!RelationNeedsWAL(relation)
-			|| !cluster_space_relation_read_identity(relation->rd_locator,
+			|| !cluster_space_relation_get_identity(relation,
 													&cluster_page_identity))
 			elog(ERROR, "shared heap insert requires a live SPACE identity");
 		cluster_page_versioned = true;
@@ -10649,7 +10649,7 @@ heap_delete(Relation relation, ItemPointer tid,
 		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
 	{
 		if (!RelationNeedsWAL(relation)
-			|| !cluster_space_relation_read_identity(relation->rd_locator,
+			|| !cluster_space_relation_get_identity(relation,
 													&cluster_page_identity))
 			elog(ERROR, "shared heap delete requires a live SPACE identity");
 		cluster_page_versioned = true;

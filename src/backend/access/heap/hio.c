@@ -738,15 +738,16 @@ RelationGetBufferForTuple(Relation relation, Size len,
 		cluster_hio_release_vm_pins(vmbuffer, vmbuffer_other);
 
 #ifdef USE_PGRAC_CLUSTER
-	/* Relation's original lifecycle lock protects this incarnation. Read it
-	 * before any heap/VM content lock; cache no SMgr handle across the read. */
+	/* Relation's original lifecycle lock protects this incarnation. Resolve
+	 * its relcache identity before any heap/VM content lock; a cache miss may
+	 * read SPACE, but repeated row allocations do no storage lookup. */
 	if (cluster_shared_config
 		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
 		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
 	{
 		if (!RelationNeedsWAL(relation)
-			|| !cluster_space_relation_read_identity(relation->rd_locator,
-													&page_identity_storage))
+			|| !cluster_space_relation_get_identity(relation,
+														&page_identity_storage))
 			elog(ERROR, "shared heap allocation requires a live SPACE identity");
 		page_identity = &page_identity_storage;
 	}
