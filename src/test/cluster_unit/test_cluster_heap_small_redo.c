@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_heap_small_redo.c
- *    Detached confirmation/lock/inplace replay versus native heap redo.
+ *    Detached small-record/maintenance replay versus native heap redo.
  *
  * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors
@@ -18,7 +18,10 @@
  */
 #include "postgres.h"
 
+#include "access/heapam.h"
 #include "access/heapam_xlog.h"
+#include "access/htup_details.h"
+#include "access/xlog.h"
 #include "access/visibilitymap.h"
 #include "access/xlogutils.h"
 #include "cluster/cluster_block_apply.h"
@@ -26,6 +29,8 @@
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_uba.h"
 #include "storage/bufmgr.h"
+#include "storage/freespace.h"
+#include "storage/standby.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -34,6 +39,7 @@ int cluster_node_id, NBuffers = 1, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
+HotStandbyState standbyState = STANDBY_DISABLED;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 static PGAlignedBlock native_page, detached_page, original, main_data;
 static XLogReaderState reader;
@@ -57,6 +63,28 @@ XLogReadBufferForRedo(XLogReaderState *record, uint8 id, Buffer *buffer)
 	locked = true;
 	*buffer = 1;
 	return BLK_NEEDS_REDO;
+}
+XLogRedoAction
+XLogReadBufferForRedoExtended(XLogReaderState *record, uint8 id, ReadBufferMode mode, bool cleanup,
+							  Buffer *buffer)
+{
+	UT_ASSERT(mode == RBM_NORMAL);
+	UT_ASSERT_EQ(cleanup, (XLogRecGetInfo(record) & XLOG_HEAP_OPMASK) == XLOG_HEAP2_PRUNE);
+	return XLogReadBufferForRedo(record, id, buffer);
+}
+void
+ResolveRecoveryConflictWithSnapshot(TransactionId xid, bool catalog, RelFileLocator locator)
+{
+	(void)xid;
+	(void)catalog;
+	(void)locator;
+	abort();
+}
+void
+XLogRecordPageWithFreeSpace(RelFileLocator locator, BlockNumber block, Size space)
+{
+	UT_ASSERT(locator.relNumber == 900 && block == block_number && !locked);
+	UT_ASSERT(space <= BLCKSZ);
 }
 BlockNumber
 BufferGetBlockNumber(Buffer buffer)
@@ -127,6 +155,9 @@ RestoreBlockImage(XLogReaderState *record, uint8 id, char *page)
 
 #include "test_cluster_heap_small_scn.inc"
 #include "test_cluster_heap_small_native.inc"
+static void page_verify_redirects(Page page);
+#include "test_cluster_heap_prune_helpers.inc"
+#include "test_cluster_heap_maintenance_native.inc"
 
 static HeapTupleHeader
 tuple_at(Page page)
@@ -403,15 +434,238 @@ UT_TEST(test_bad_shapes_do_not_modify_output)
 	}
 }
 
+static PGAlignedBlock maintenance_data;
+
+static void
+reset_maintenance(uint8 opcode, bool itl_page)
+{
+	PGAlignedBlock tuple;
+	HeapTupleHeader htup = (HeapTupleHeader)tuple.data;
+	reset(RM_HEAP2_ID, opcode, itl_page ? 3 : -1);
+	/* ITL special space is retained byte-for-byte, not a maintenance delta. */
+	memset(&main_data, 0, sizeof(main_data));
+	memset(&maintenance_data, 0, sizeof(maintenance_data));
+	memcpy(tuple.data, tuple_at(original.data), tuple_at(original.data)->t_hoff + 8);
+	for (OffsetNumber off = 2; off <= 4; off++) {
+		htup->t_infomask2 = off == 3 ? 1 : HEAP_ONLY_TUPLE | 1;
+		UT_ASSERT_EQ(
+			PageAddItem(original.data, (Item)tuple.data, htup->t_hoff + 8, off, false, true), off);
+	}
+	decoded->blocks[0].has_data = true;
+	decoded->blocks[0].data = maintenance_data.data;
+	if (opcode == XLOG_HEAP2_PRUNE) {
+		xl_heap_prune *rec = (xl_heap_prune *)main_data.data;
+		OffsetNumber offsets[] = { 1, 2, 3, 4 };
+		rec->nredirected = 1;
+		rec->ndead = 1;
+		decoded->main_data_len = SizeOfHeapPrune;
+		memcpy(maintenance_data.data, offsets, sizeof(offsets));
+		decoded->blocks[0].data_len = sizeof(offsets);
+	} else if (opcode == XLOG_HEAP2_VACUUM) {
+		xl_heap_vacuum *rec = (xl_heap_vacuum *)main_data.data;
+		OffsetNumber offsets[] = { 3, 4 };
+		rec->nunused = 2;
+		ItemIdSetDead(PageGetItemId(original.data, 3));
+		ItemIdSetDead(PageGetItemId(original.data, 4));
+		decoded->main_data_len = SizeOfHeapVacuum;
+		memcpy(maintenance_data.data, offsets, sizeof(offsets));
+		decoded->blocks[0].data_len = sizeof(offsets);
+	} else {
+		xl_heap_freeze_page *rec = (xl_heap_freeze_page *)main_data.data;
+		xl_heap_freeze_plan *plans = (xl_heap_freeze_plan *)maintenance_data.data;
+		OffsetNumber offsets[] = { 1, 2, 3 };
+		rec->nplans = 2;
+		plans[0].ntuples = 2;
+		plans[0].t_infomask = HEAP_XMIN_FROZEN | HEAP_XMAX_INVALID;
+		plans[0].t_infomask2 = 1;
+		plans[1] = plans[0];
+		plans[1].ntuples = 1;
+		plans[1].frzflags = XLH_INVALID_XVAC;
+		htup = (HeapTupleHeader)PageGetItem(original.data, PageGetItemId(original.data, 3));
+		htup->t_infomask |= HEAP_MOVED_OFF;
+		decoded->main_data_len = SizeOfHeapFreezePage;
+		memcpy(maintenance_data.data + 2 * sizeof(*plans), offsets, sizeof(offsets));
+		decoded->blocks[0].data_len = 2 * sizeof(*plans) + sizeof(offsets);
+	}
+	native_page = detached_page = original;
+}
+
+UT_TEST(test_maintenance_matches_native)
+{
+	for (int shared = 0; shared < 2; shared++)
+		for (int itl = 0; itl < 2; itl++) {
+			cluster_shared_config = shared;
+			reset_maintenance(XLOG_HEAP2_PRUNE, itl);
+			compare_native(heap_xlog_prune);
+			UT_ASSERT(ItemIdIsRedirected(PageGetItemId(native_page.data, 1)));
+			UT_ASSERT(ItemIdIsDead(PageGetItemId(native_page.data, 3)));
+			reset_maintenance(XLOG_HEAP2_VACUUM, itl);
+			compare_native(heap_xlog_vacuum);
+			UT_ASSERT_EQ(PageGetMaxOffsetNumber(native_page.data), 2);
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, itl);
+			compare_native(heap_xlog_freeze_page);
+			UT_ASSERT(HeapTupleHeaderXminFrozen(tuple_at(native_page.data)));
+		}
+}
+
+UT_TEST(test_maintenance_terminal_shapes_match_native)
+{
+	HeapTupleHeader tuple;
+	xl_heap_prune *prune;
+	OffsetNumber all[] = { 1, 2, 3, 4 };
+	reset_maintenance(XLOG_HEAP2_PRUNE, true);
+	/* The root was already redirected by an earlier prune cycle. */
+	ItemIdSetRedirect(PageGetItemId(original.data, 1), 4);
+	native_page = detached_page = original;
+	compare_native(heap_xlog_prune);
+	reset_maintenance(XLOG_HEAP2_PRUNE, true);
+	prune = (xl_heap_prune *)main_data.data;
+	prune->nredirected = 0;
+	prune->ndead = 4;
+	memcpy(maintenance_data.data, all, sizeof(all));
+	for (OffsetNumber off = 1; off <= 4; off++) {
+		tuple = (HeapTupleHeader)PageGetItem(original.data, PageGetItemId(original.data, off));
+		HeapTupleHeaderClearHeapOnly(tuple);
+	}
+	native_page = detached_page = original;
+	compare_native(heap_xlog_prune);
+	reset_maintenance(XLOG_HEAP2_VACUUM, true);
+	((xl_heap_vacuum *)main_data.data)->nunused = 4;
+	memcpy(maintenance_data.data, all, sizeof(all));
+	decoded->blocks[0].data_len = sizeof(all);
+	for (OffsetNumber off = 1; off <= 4; off++)
+		ItemIdSetDead(PageGetItemId(original.data, off));
+	native_page = detached_page = original;
+	compare_native(heap_xlog_vacuum);
+	/* Native truncation retains the first unused line pointer. */
+	UT_ASSERT_EQ(PageGetMaxOffsetNumber(native_page.data), 1);
+	UT_ASSERT(!ItemIdIsUsed(PageGetItemId(native_page.data, 1)));
+	reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+	((xl_heap_freeze_plan *)maintenance_data.data)[1].frzflags = XLH_FREEZE_XVAC;
+	compare_native(heap_xlog_freeze_page);
+}
+
+UT_TEST(test_bad_maintenance_does_not_modify_output)
+{
+	for (int bad = 0; bad < 22; bad++) {
+		PGAlignedBlock saved;
+		ClusterBlkApplyResult result;
+		reset_maintenance(XLOG_HEAP2_PRUNE, true);
+		switch (bad) {
+		case 0:
+			decoded->main_data_len--;
+			break;
+		case 1:
+			decoded->blocks[0].data_len--;
+			break;
+		case 2:
+			((xl_heap_prune *)main_data.data)->nredirected = 10;
+			break;
+		case 3:
+			((OffsetNumber *)maintenance_data.data)[0] = 0;
+			break;
+		case 4:
+			((OffsetNumber *)maintenance_data.data)[1] = 5;
+			break;
+		case 5:
+			((OffsetNumber *)maintenance_data.data)[3] = 2;
+			break;
+		case 6:
+			reset_maintenance(XLOG_HEAP2_VACUUM, true);
+			((OffsetNumber *)maintenance_data.data)[0] = 1;
+			break;
+		case 7:
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+			decoded->blocks[0].data_len--;
+			break;
+		case 8:
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+			((xl_heap_freeze_plan *)maintenance_data.data)[1].ntuples = 10;
+			break;
+		case 9:
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+			((OffsetNumber *)(maintenance_data.data + 2 * sizeof(xl_heap_freeze_plan)))[2] = 0;
+			break;
+		case 10:
+			((PageHeader)detached_page.data)->pd_pagesize_version = 0;
+			break;
+		case 11:
+			decoded->blocks[0].has_data = false;
+			break;
+		case 12:
+			/* Overlapping physical tuples must not reach native compaction. */
+			*PageGetItemId(detached_page.data, 3) = *PageGetItemId(detached_page.data, 2);
+			break;
+		case 13:
+			((OffsetNumber *)maintenance_data.data)[2] = 1;
+			break;
+		case 14:
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+			((OffsetNumber *)(maintenance_data.data + 2 * sizeof(xl_heap_freeze_plan)))[2] = 1;
+			break;
+		case 15:
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+			((xl_heap_freeze_plan *)maintenance_data.data)[1].frzflags = 128;
+			break;
+		case 16:
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+			decoded->blocks[0].data_len += 2;
+			break;
+		case 17:
+			reset_maintenance(XLOG_HEAP2_FREEZE_PAGE, true);
+			((xl_heap_freeze_plan *)maintenance_data.data)[0].frzflags = XLH_FREEZE_XVAC;
+			break;
+		case 18:
+			reset_maintenance(XLOG_HEAP2_VACUUM, true);
+			((OffsetNumber *)maintenance_data.data)[1] = 3;
+			break;
+		case 19:
+			((OffsetNumber *)maintenance_data.data)[0] = 65535;
+			break;
+		case 20:
+		case 21: {
+			PGAlignedBlock small;
+			HeapTupleHeader tuple = (HeapTupleHeader)small.data;
+			/* No native compaction in this RED: show its shared preflight
+			 * wrongly accepts more tuples than the native work-array limit. */
+			reset_maintenance(bad == 20 ? XLOG_HEAP2_VACUUM : XLOG_HEAP2_PRUNE, false);
+			PageInit(detached_page.data, BLCKSZ, 0);
+			memset(&small, 0, sizeof(small));
+			tuple->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
+			for (OffsetNumber off = 1; off <= MaxHeapTuplesPerPage + 2; off++)
+				UT_ASSERT_EQ(
+					PageAddItem(detached_page.data, (Item)tuple, tuple->t_hoff, off, false, false),
+					off);
+			if (bad == 20) {
+				ItemIdSetDead(PageGetItemId(detached_page.data, 3));
+				ItemIdSetDead(PageGetItemId(detached_page.data, 4));
+			} else {
+				((xl_heap_prune *)main_data.data)->nredirected = 0;
+				((xl_heap_prune *)main_data.data)->ndead = 1;
+				decoded->blocks[0].data_len = sizeof(OffsetNumber);
+			}
+			break;
+		}
+		}
+		saved = detached_page;
+		result = cluster_block_apply_one(&reader, 0, detached_page.data);
+		UT_ASSERT(result == CLUSTER_BLKAPPLY_FAILED || result == CLUSTER_BLKAPPLY_UNSUPPORTED);
+		UT_ASSERT(memcmp(saved.data, detached_page.data, BLCKSZ) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(5);
+	UT_PLAN(8);
 	UT_RUN(test_confirm_and_inplace_match_native);
 	UT_RUN(test_lock_and_updated_lock_match_native);
 	UT_RUN(test_zero_length_inplace_payload_matches_native);
 	UT_RUN(test_replaced_locker_refs_and_history_match_native);
 	UT_RUN(test_bad_shapes_do_not_modify_output);
+	UT_RUN(test_maintenance_matches_native);
+	UT_RUN(test_maintenance_terminal_shapes_match_native);
+	UT_RUN(test_bad_maintenance_does_not_modify_output);
 	UT_DONE();
 	free(decoded);
 	return ut_failed_count != 0;

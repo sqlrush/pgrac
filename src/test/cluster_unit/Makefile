@@ -1286,6 +1286,12 @@ test_cluster_heap_small_scn.inc: $(top_srcdir)/src/backend/cluster/cluster_scn.c
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_heap_maintenance_native.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_execute_freeze_tuple\(/ { print "static void"; emit=1; found++ } \
+	     /^heap_xlog_(prune|vacuum|freeze_page)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_block_apply_heap_product.o: $(top_srcdir)/src/backend/cluster/cluster_block_apply_heap.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -1294,6 +1300,7 @@ test_cluster_heap_redo_uba_product.o: $(top_srcdir)/src/backend/cluster/cluster_
 
 test_cluster_heap_small_redo: test_cluster_heap_small_redo.c unit_test.h \
 		test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc \
+		test_cluster_heap_maintenance_native.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_block_apply_heap_product.o test_cluster_space_bufpage_product.o \
 		test_cluster_ctrc_itl_roles_product.o test_cluster_heap_redo_uba_product.o \
 		test_cluster_ctrc_transam_product.o $(CLUSTER_BLOCK_APPLY_O) $(CLUSTER_UNIT_PORT_LIBS)
@@ -3537,6 +3544,7 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc
 	rm -f test_cluster_relation_wal_types.inc test_cluster_relation_wal_native.inc
 	rm -f test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc
+	rm -f test_cluster_heap_maintenance_native.inc
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc

@@ -442,6 +442,19 @@ apply_heap_update(XLogReaderState *record, uint8 block_id, char *page, bool hot_
 	return CLUSTER_BLKAPPLY_OK;
 }
 
+static bool
+heap_delta_page_header_valid(Page page)
+{
+	PageHeader header = (PageHeader)page;
+
+	return !PageIsNew(page) && PageGetPageSize(page) == BLCKSZ
+		   && PageGetPageLayoutVersion(page) == PG_PAGE_LAYOUT_VERSION
+		   && header->pd_lower >= SizeOfPageHeaderData && header->pd_lower <= header->pd_upper
+		   && header->pd_upper <= header->pd_special && header->pd_special <= BLCKSZ
+		   && header->pd_special == MAXALIGN(header->pd_special)
+		   && (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) == 0;
+}
+
 /* Validate a native heap item before any detached mutation or ITL scan. */
 static HeapTupleHeader
 heap_small_tuple(Page page, OffsetNumber offset)
@@ -452,13 +465,8 @@ heap_small_tuple(Page page, OffsetNumber offset)
 	Size start;
 	Size length;
 
-	if (PageIsNew(page) || PageGetPageSize(page) != BLCKSZ
-		|| PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION
-		|| header->pd_lower < SizeOfPageHeaderData || header->pd_lower > header->pd_upper
-		|| header->pd_upper > header->pd_special || header->pd_special > BLCKSZ
-		|| header->pd_special != MAXALIGN(header->pd_special)
-		|| (header->pd_lower - SizeOfPageHeaderData) % sizeof(ItemIdData) != 0
-		|| offset < FirstOffsetNumber || offset > PageGetMaxOffsetNumber(page))
+	if (!heap_delta_page_header_valid(page) || offset < FirstOffsetNumber
+		|| offset > PageGetMaxOffsetNumber(page))
 		return NULL;
 	item = PageGetItemId(page, offset);
 	start = ItemIdGetOffset(item);
@@ -613,6 +621,194 @@ apply_heap_small(XLogReaderState *record, uint8 block_id, char *page, uint8 oper
 	return CLUSTER_BLKAPPLY_OK;
 }
 
+/* PageRepairFragmentation assumes in-page, disjoint tuple extents. */
+static bool
+heap_maintenance_page_valid(Page page)
+{
+	bool occupied[BLCKSZ] = { false };
+
+	if (!heap_delta_page_header_valid(page) || PageGetMaxOffsetNumber(page) > MaxHeapTuplesPerPage)
+		return false;
+	for (OffsetNumber off = FirstOffsetNumber; off <= PageGetMaxOffsetNumber(page); off++) {
+		ItemId item = PageGetItemId(page, off);
+
+		if (ItemIdIsNormal(item)) {
+			Size start = ItemIdGetOffset(item);
+			Size end = start + MAXALIGN(ItemIdGetLength(item));
+
+			if (heap_small_tuple(page, off) == NULL || end > ((PageHeader)page)->pd_special)
+				return false;
+			for (Size byte = start; byte < end; byte++) {
+				if (occupied[byte])
+					return false;
+				occupied[byte] = true;
+			}
+		} else if (ItemIdHasStorage(item))
+			return false;
+	}
+	return true;
+}
+
+static bool
+heap_maintenance_redirects_valid(Page page)
+{
+	for (OffsetNumber off = FirstOffsetNumber; off <= PageGetMaxOffsetNumber(page); off++) {
+		ItemId item = PageGetItemId(page, off);
+
+		if (ItemIdIsRedirected(item)) {
+			HeapTupleHeader target = heap_small_tuple(page, ItemIdGetRedirect(item));
+
+			if (target == NULL || !HeapTupleHeaderIsHeapOnly(target))
+				return false;
+		}
+	}
+	return true;
+}
+
+/* The maintenance owner already decided which tuples are removable/frozen.
+ * Snapshot conflicts and FSM belong to the recovery orchestrator. */
+static ClusterBlkApplyResult
+apply_heap_maintenance(XLogReaderState *record, uint8 block_id, char *page, uint8 operation)
+{
+	PGAlignedBlock scratch;
+	const DecodedBkpBlock *block = XLogRecGetBlock(record, block_id);
+	const char *main_data = XLogRecGetData(record);
+	Size main_length = XLogRecGetDataLen(record);
+	Size length;
+	const char *data = XLogRecGetBlockData(record, block_id, &length);
+	bool modified[MaxOffsetNumber + 1] = { false };
+	OffsetNumber maxoff;
+
+	if (block_id != 0 || block->forknum != MAIN_FORKNUM || (block->flags & BKPBLOCK_WILL_INIT)
+		|| (XLogRecGetInfo(record) & XLOG_HEAP_INIT_PAGE) || main_data == NULL || data == NULL
+		|| length == 0 || length > BLCKSZ || !heap_maintenance_page_valid(page))
+		return CLUSTER_BLKAPPLY_FAILED;
+	memcpy(scratch.data, page, BLCKSZ);
+	maxoff = PageGetMaxOffsetNumber(scratch.data);
+	if (operation == XLOG_HEAP2_FREEZE_PAGE) {
+		xl_heap_freeze_page rec;
+		Size offsets_start, cursor;
+
+		if (main_length != SizeOfHeapFreezePage)
+			return CLUSTER_BLKAPPLY_FAILED;
+		memcpy(&rec, main_data, main_length);
+		offsets_start = (Size)rec.nplans * sizeof(xl_heap_freeze_plan);
+		if (rec.nplans == 0 || offsets_start > length
+			|| (length - offsets_start) % sizeof(OffsetNumber) != 0)
+			return CLUSTER_BLKAPPLY_FAILED;
+		cursor = offsets_start;
+		for (uint16 p = 0; p < rec.nplans; p++) {
+			xl_heap_freeze_plan plan;
+
+			memcpy(&plan, data + (Size)p * sizeof(plan), sizeof(plan));
+			if (plan.ntuples == 0 || (plan.frzflags & ~(XLH_FREEZE_XVAC | XLH_INVALID_XVAC)) != 0
+				|| (Size)plan.ntuples * sizeof(OffsetNumber) > length - cursor)
+				return CLUSTER_BLKAPPLY_FAILED;
+			for (uint16 t = 0; t < plan.ntuples; t++) {
+				OffsetNumber off;
+				HeapTupleHeader tuple;
+
+				memcpy(&off, data + cursor, sizeof(off));
+				cursor += sizeof(off);
+				tuple = heap_small_tuple(scratch.data, off);
+				if (tuple == NULL || modified[off]
+					|| (plan.frzflags != 0 && (tuple->t_infomask & HEAP_MOVED) == 0))
+					return CLUSTER_BLKAPPLY_FAILED;
+				modified[off] = true;
+				/* Exact heap_execute_freeze_tuple order, on private bytes. */
+				HeapTupleHeaderSetXmax(tuple, plan.xmax);
+				if (plan.frzflags & XLH_FREEZE_XVAC)
+					HeapTupleHeaderSetXvac(tuple, FrozenTransactionId);
+				if (plan.frzflags & XLH_INVALID_XVAC)
+					HeapTupleHeaderSetXvac(tuple, InvalidTransactionId);
+				tuple->t_infomask = plan.t_infomask;
+				tuple->t_infomask2 = plan.t_infomask2;
+			}
+		}
+		if (cursor != length)
+			return CLUSTER_BLKAPPLY_FAILED;
+	} else {
+		OffsetNumber offsets[MaxOffsetNumber];
+		uint16 nredirected = 0, ndead = 0;
+		Size count = length / sizeof(OffsetNumber);
+		Size cursor = 0;
+
+		if (length % sizeof(OffsetNumber) != 0 || length > sizeof(offsets))
+			return CLUSTER_BLKAPPLY_FAILED;
+		memcpy(offsets, data, length);
+		if (operation == XLOG_HEAP2_PRUNE) {
+			xl_heap_prune rec;
+
+			if (main_length != SizeOfHeapPrune)
+				return CLUSTER_BLKAPPLY_FAILED;
+			memcpy(&rec, main_data, main_length);
+			nredirected = rec.nredirected;
+			ndead = rec.ndead;
+			if ((Size)nredirected * 2 + ndead > count)
+				return CLUSTER_BLKAPPLY_FAILED;
+		} else {
+			xl_heap_vacuum rec;
+
+			if (main_length != SizeOfHeapVacuum)
+				return CLUSTER_BLKAPPLY_FAILED;
+			memcpy(&rec, main_data, main_length);
+			if (rec.nunused == 0 || rec.nunused != count)
+				return CLUSTER_BLKAPPLY_FAILED;
+		}
+		for (uint16 i = 0; i < nredirected; i++) {
+			OffsetNumber from = offsets[cursor++], to = offsets[cursor++];
+			HeapTupleHeader target = heap_small_tuple(scratch.data, to);
+			ItemId item;
+
+			if (from < FirstOffsetNumber || from > maxoff || modified[from] || from == to
+				|| target == NULL || !HeapTupleHeaderIsHeapOnly(target))
+				return CLUSTER_BLKAPPLY_FAILED;
+			item = PageGetItemId(scratch.data, from);
+			if ((!ItemIdIsRedirected(item)
+				 && (!ItemIdIsNormal(item)
+					 || HeapTupleHeaderIsHeapOnly(heap_small_tuple(scratch.data, from))))
+				|| (ItemIdIsRedirected(item) && ItemIdGetRedirect(item) == to))
+				return CLUSTER_BLKAPPLY_FAILED;
+			modified[from] = true;
+			ItemIdSetRedirect(item, to);
+		}
+		for (Size i = cursor; i < count; i++) {
+			OffsetNumber off = offsets[i];
+			ItemId item;
+
+			if (off < FirstOffsetNumber || off > maxoff || modified[off])
+				return CLUSTER_BLKAPPLY_FAILED;
+			modified[off] = true;
+			item = PageGetItemId(scratch.data, off);
+			if (operation == XLOG_HEAP2_VACUUM) {
+				if (!ItemIdIsDead(item) || ItemIdHasStorage(item))
+					return CLUSTER_BLKAPPLY_FAILED;
+				ItemIdSetUnused(item);
+			} else if (i - cursor < ndead) {
+				if (!ItemIdIsRedirected(item)
+					&& (!ItemIdIsNormal(item)
+						|| HeapTupleHeaderIsHeapOnly(heap_small_tuple(scratch.data, off))))
+					return CLUSTER_BLKAPPLY_FAILED;
+				ItemIdSetDead(item);
+			} else {
+				if (!ItemIdIsNormal(item)
+					|| !HeapTupleHeaderIsHeapOnly(heap_small_tuple(scratch.data, off)))
+					return CLUSTER_BLKAPPLY_FAILED;
+				ItemIdSetUnused(item);
+			}
+		}
+		if (!heap_maintenance_redirects_valid(scratch.data))
+			return CLUSTER_BLKAPPLY_FAILED;
+		if (operation == XLOG_HEAP2_PRUNE)
+			PageRepairFragmentation(scratch.data);
+		else
+			PageTruncateLinePointerArray(scratch.data);
+	}
+	PageSetLSN(scratch.data, record->EndRecPtr);
+	memcpy(page, scratch.data, BLCKSZ);
+	return CLUSTER_BLKAPPLY_OK;
+}
+
 /*
  * cluster_block_apply_heap -- dispatch a no-image heap delta to its per-record
  *		single-block applicator.  Record types not on the differential matrix
@@ -633,10 +829,18 @@ cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
 {
 	uint8 info = XLogRecGetInfo(record) & XLOG_HEAP_OPMASK;
 
-	if (XLogRecGetRmid(record) == RM_HEAP2_ID)
-		return info == XLOG_HEAP2_LOCK_UPDATED
-				   ? apply_heap_small(record, block_id, page, XLOG_HEAP_LOCK, true)
-				   : CLUSTER_BLKAPPLY_UNSUPPORTED;
+	if (XLogRecGetRmid(record) == RM_HEAP2_ID) {
+		switch (info) {
+		case XLOG_HEAP2_LOCK_UPDATED:
+			return apply_heap_small(record, block_id, page, XLOG_HEAP_LOCK, true);
+		case XLOG_HEAP2_PRUNE:
+		case XLOG_HEAP2_VACUUM:
+		case XLOG_HEAP2_FREEZE_PAGE:
+			return apply_heap_maintenance(record, block_id, page, info);
+		default:
+			return CLUSTER_BLKAPPLY_UNSUPPORTED;
+		}
+	}
 	if (XLogRecGetRmid(record) != RM_HEAP_ID)
 		return CLUSTER_BLKAPPLY_UNSUPPORTED;
 	switch (info) {
