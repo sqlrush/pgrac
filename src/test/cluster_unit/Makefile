@@ -1536,6 +1536,13 @@ test_cluster_heap_update_log.inc: $(top_srcdir)/src/backend/access/heap/heapam.c
 	mv $@.tmp $@
 
 # PGRAC: original row-lock and successor-lock mutation/WAL owners.
+test_cluster_heap_lock_vm_needed.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_heap_lock_vm_needs_clear\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_insert_version: test_cluster_heap_lock_vm_needed.inc
+
 test_cluster_heap_lock_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/PGRAC: tuple-lock versions are captured/ { emit=1; count++ } \
 	     emit { print } emit && /^\t}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
@@ -3367,6 +3374,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_heap_lock_vm_needed.inc
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc

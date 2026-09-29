@@ -69,13 +69,30 @@ static bool deleting, updating, temp_locking, tuple_locking, chain_locking;
 static bool confirming, spec_aborting;
 static bool multi_inserting;
 static unsigned vm_locks;
+static unsigned vm_shares;
+static bool vm_share_refused, vm_refresh_frozen;
 
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	if (buffer != 2 || mode != BUFFER_LOCK_EXCLUSIVE || CritSectionCount != 0)
+	if (buffer != 2 || (mode != BUFFER_LOCK_EXCLUSIVE && mode != BUFFER_LOCK_UNLOCK)
+		|| CritSectionCount != 0)
 		abort();
-	vm_locks++;
+	if (mode == BUFFER_LOCK_EXCLUSIVE)
+		vm_locks++;
+}
+
+bool
+ClusterLockBufferShareBarrierAware(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 2);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	vm_shares++;
+	if (vm_share_refused)
+		return false;
+	if (vm_refresh_frozen)
+		pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_VALID_BITS;
+	return true;
 }
 
 void
@@ -1030,6 +1047,8 @@ UT_TEST(test_final_update_recaptures_after_temp_lock_and_already_clear_vm)
 	UT_ASSERT_EQ(PageGetLSN(pages[1].data), 200);
 }
 
+#include "test_cluster_heap_lock_vm_needed.inc"
+
 static void
 run_tuple_lock(bool versioned, bool recomposed)
 {
@@ -1044,7 +1063,9 @@ run_tuple_lock(bool versioned, bool recomposed)
 	uint16 new_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK;
 	uint16 new_infomask2 = 0;
 	bool cleared_all_frozen = false, cluster_current_mx_recomposed = recomposed;
+	bool vm_locked = want_vm;
 	bool cluster_did_lock_stamp = true, cluster_page_versioned = versioned;
+	ClusterSpaceIdentity cluster_page_identity = identity;
 	uint8 cluster_lock_slot_idx = 0;
 	SCN cluster_lock_write_scn = 810;
 	UBA cluster_lock_uba = InvalidUba_init;
@@ -1065,6 +1086,8 @@ run_tuple_lock(bool versioned, bool recomposed)
 	(void)cluster_page_versioned;
 	(void)cluster_page_versions;
 	tuple_locking = true;
+#include "test_cluster_heap_lock_capture.inc"
+	prepared = cluster_page_versions;
 #include "test_cluster_heap_lock_version.inc"
 	tuple_locking = false;
 }
@@ -1080,6 +1103,7 @@ run_chain_lock(bool versioned, bool itl)
 	uint16 new_infomask = HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_EXCL_LOCK, new_infomask2 = 0;
 	bool cleared_all_frozen = false, cluster_chain_lock_stamp = itl;
 	bool cluster_chain_vm_locked = want_vm, cluster_page_versioned = versioned;
+	ClusterSpaceIdentity cluster_page_identity = identity;
 	uint8 cluster_chain_slot_idx = 0;
 	SCN cluster_chain_write_scn = 811;
 	UBA cluster_chain_uba = InvalidUba_init;
@@ -1090,6 +1114,12 @@ run_chain_lock(bool versioned, bool itl)
 	(void)cluster_page_versioned;
 	(void)cluster_page_versions;
 	chain_locking = true;
+	if (itl) {
+#include "test_cluster_heap_chain_capture.inc"
+	} else {
+#include "test_cluster_heap_chain_no_itl_capture.inc"
+	}
+	prepared = cluster_page_versions;
 #include "test_cluster_heap_chain_lock_version.inc"
 	chain_locking = false;
 }
@@ -1101,7 +1131,7 @@ check_lock_publication(bool vm, bool changed, bool itl, bool recomposed)
 		pages[0].data, PageGetItemId(pages[0].data, FirstOffsetNumber));
 
 	UT_ASSERT_EQ(inserts, 1);
-	UT_ASSERT_EQ(edge_count, vm ? 2 : 1);
+	UT_ASSERT_EQ(edge_count, changed ? 2 : 1);
 	UT_ASSERT_EQ(edge_token, prepared.result_token);
 	UT_ASSERT_EQ(edges[0].before.mutation_token, 100);
 	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, prepared.result_token);
@@ -1110,7 +1140,7 @@ check_lock_publication(bool vm, bool changed, bool itl, bool recomposed)
 	UT_ASSERT_EQ((heap_flags & XLH_LOCK_ALL_FROZEN_CLEARED) != 0, changed);
 	UT_ASSERT_EQ((heap_flags & XLH_LOCK_ITL_DELTA) != 0, itl);
 	UT_ASSERT(PageIsAllVisible(pages[0].data) == vm);
-	if (vm) {
+	if (changed) {
 		UT_ASSERT_EQ(edges[1].block_id, 1);
 		UT_ASSERT_EQ(edges[1].before.mutation_token, 31);
 		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, prepared.result_token);
@@ -1119,6 +1149,10 @@ check_lock_publication(bool vm, bool changed, bool itl, bool recomposed)
 		UT_ASSERT_EQ(images[1].data[BLCKSZ - 1], 42);
 		UT_ASSERT_EQ(pages[1].data[SizeOfPageHeaderData], VISIBILITYMAP_ALL_VISIBLE);
 		UT_ASSERT_EQ(PageGetLSN(pages[1].data), 200);
+	} else if (vm) {
+		UT_ASSERT(!dirty[1] && !registered[1]);
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, 31);
+		UT_ASSERT_EQ(PageGetLSN(pages[1].data), 0);
 	}
 }
 
@@ -1150,6 +1184,24 @@ UT_TEST(test_chain_lock_versions_heap_vm_with_or_without_itl)
 		}
 }
 
+UT_TEST(test_vm_clear_skip_requires_qualified_current_observation)
+{
+	for (int mode = 0; mode < 4; mode++) {
+		prepare_update(true, false, 1, true);
+		pages[1].data[SizeOfPageHeaderData] = mode == 0
+			? VISIBILITYMAP_VALID_BITS : VISIBILITYMAP_ALL_VISIBLE;
+		vm_locks = vm_shares = 0;
+		vm_share_refused = mode == 2;
+		vm_refresh_frozen = mode == 3;
+		UT_ASSERT_EQ(cluster_heap_lock_vm_needs_clear(&relation_data, blocks[0], 2),
+					 mode != 1);
+		UT_ASSERT_EQ(vm_shares, mode == 0 ? 0 : 1);
+		UT_ASSERT_EQ(vm_locks, 0);
+		UT_ASSERT(!dirty[1]);
+	}
+	vm_share_refused = vm_refresh_frozen = false;
+}
+
 UT_TEST(test_legacy_lock_owners_keep_original_wal_shape)
 {
 	int chain;
@@ -1173,16 +1225,21 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 	int owner, vm;
 
 	for (owner = 0; owner < 3; owner++)
-		for (vm = 0; vm < 2; vm++) {
+		for (vm = 0; vm < 3; vm++) {
 			Buffer buf = 1, *buffer = &buf, vmbuffer = vm ? 2 : InvalidBuffer;
+			Relation relation = &relation_data, rel = &relation_data;
+			BlockNumber block = 0;
 			bool vm_locked = vm != 0, cluster_chain_vm_locked = owner == 2 ? false : vm != 0;
 			bool cluster_page_versioned = true;
 			ClusterSpaceIdentity cluster_page_identity;
 			RfPageProducerBatchV1 cluster_page_versions = { 0 };
 			PGAlignedBlock before[4];
 
-			prepare_update(true, false, vm, true);
+			prepare_update(true, false, vm ? 1 : 0, true);
+			if (vm == 2)
+				pages[1].data[SizeOfPageHeaderData] = VISIBILITYMAP_ALL_VISIBLE;
 			cluster_page_identity = identity;
+			block = blocks[0];
 			memcpy(before, pages, sizeof(before));
 			vm_locks = 0;
 			if (owner == 0) {
@@ -1194,14 +1251,14 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 			}
 			UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
 			UT_ASSERT(!cluster_page_versions.stamped);
-			UT_ASSERT_EQ(cluster_page_versions.entry_count, vm ? 2 : 1);
-			UT_ASSERT_EQ(vm_locks, owner == 2 && vm ? 1 : 0);
+			UT_ASSERT_EQ(cluster_page_versions.entry_count, vm == 1 ? 2 : 1);
+			UT_ASSERT_EQ(vm_locks, owner == 2 && vm == 1 ? 1 : 0);
 			prepared = cluster_page_versions;
 			if (owner == 0)
 				run_tuple_lock(true, false);
 			else
 				run_chain_lock(true, owner == 1);
-			check_lock_publication(vm != 0, vm != 0, owner != 2, false);
+			check_lock_publication(vm != 0, vm == 1, owner != 2, false);
 		}
 }
 
@@ -1396,7 +1453,7 @@ UT_TEST(test_actual_multi_capture_leaves_both_pages_unchanged)
 int
 main(void)
 {
-	UT_PLAN(25);
+	UT_PLAN(26);
 	UT_RUN(test_native_multi_versions_actual_batch_and_frozen_option);
 	UT_RUN(test_nonshared_multi_keeps_native_wal_shape);
 	UT_RUN(test_actual_multi_capture_leaves_both_pages_unchanged);
@@ -1416,6 +1473,7 @@ main(void)
 	UT_RUN(test_final_update_recaptures_after_temp_lock_and_already_clear_vm);
 	UT_RUN(test_tuple_lock_versions_heap_vm_and_mx_planned_header);
 	UT_RUN(test_chain_lock_versions_heap_vm_with_or_without_itl);
+	UT_RUN(test_vm_clear_skip_requires_qualified_current_observation);
 	UT_RUN(test_legacy_lock_owners_keep_original_wal_shape);
 	UT_RUN(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm);
 	UT_RUN(test_speculative_confirm_versions_original_wal_and_ctid);

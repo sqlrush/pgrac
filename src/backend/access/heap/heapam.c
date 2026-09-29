@@ -10635,6 +10635,34 @@ cluster_heap_lock_with_vm_repin(Relation relation, BlockNumber heap_block, Buffe
 	}
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/*
+ * A tuple lock preserves all-visible and only clears all-frozen.  The caller
+ * holds heap content X and the exact VM pin.  A set bit conservatively asks
+ * for the original VM-X path.  A clear bit can skip that path only after a
+ * qualified current SHARE read; a clean nested-barrier refusal is not proof
+ * and falls back to the existing X acquisition/retry.  Heap X prevents this
+ * heap block's frozen bit from being set after the qualified observation.
+ */
+static bool
+cluster_heap_lock_vm_needs_clear(Relation relation, BlockNumber heap_block,
+								 Buffer vmbuffer)
+{
+	bool		needed;
+
+	Assert(BufferIsValid(vmbuffer) && visibilitymap_pin_ok(heap_block, vmbuffer));
+	if (visibilitymap_get_status(relation, heap_block, &vmbuffer)
+		& VISIBILITYMAP_ALL_FROZEN)
+		return true;
+	if (!ClusterLockBufferShareBarrierAware(vmbuffer))
+		return true;
+	needed = (visibilitymap_get_status(relation, heap_block, &vmbuffer)
+			  & VISIBILITYMAP_ALL_FROZEN) != 0;
+	LockBuffer(vmbuffer, BUFFER_LOCK_UNLOCK);
+	return needed;
+}
+#endif
+
 
 TM_Result
 heap_delete(Relation relation, ItemPointer tid,
@@ -16548,7 +16576,12 @@ failed:
 
 	/* PGRAC: pre-crit VM content lock — see heap_insert. */
 	vm_locked = false;
-	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer))
+	if (PageIsAllVisible(page) && BufferIsValid(vmbuffer)
+#ifdef USE_PGRAC_CLUSTER
+		&& (!cluster_page_versioned
+			|| cluster_heap_lock_vm_needs_clear(relation, block, vmbuffer))
+#endif
+		)
 	{
 #ifdef USE_PGRAC_CLUSTER
 		bool vm_pin_replaced = false;
@@ -16590,9 +16623,12 @@ failed:
 	{
 		Buffer version_buffers[2] = {*buffer, vmbuffer};
 		uint8 version_ids[2] = {0, 1};
+		bool vm_changes = vm_locked
+			&& (visibilitymap_get_status(relation, block, &vmbuffer)
+				& VISIBILITYMAP_ALL_FROZEN) != 0;
 
 		if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
-				version_buffers, version_ids, vm_locked ? 2 : 1,
+				version_buffers, version_ids, vm_changes ? 2 : 1,
 				&cluster_page_versions))
 			elog(ERROR, "shared heap tuple lock cannot capture exact page versions");
 	}
@@ -16825,7 +16861,7 @@ failed:
 	}
 
 	/* Clear only the all-frozen bit on visibility map if needed */
-	if (PageIsAllVisible(page) &&
+	if (vm_locked && PageIsAllVisible(page) &&
 		visibilitymap_clear_locked(relation, block, vmbuffer,
 								   VISIBILITYMAP_ALL_FROZEN))
 		cleared_all_frozen = true;
@@ -17997,7 +18033,9 @@ l4:
 			}
 
 			if (PageIsAllVisible(BufferGetPage(buf))
-				&& BufferIsValid(vmbuffer))
+				&& BufferIsValid(vmbuffer)
+				&& (!cluster_page_versioned
+					|| cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer)))
 			{
 				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 				cluster_chain_vm_locked = true;
@@ -18008,9 +18046,12 @@ l4:
 			{
 				Buffer version_buffers[2] = {buf, vmbuffer};
 				uint8 version_ids[2] = {0, 1};
+				bool vm_changes = cluster_chain_vm_locked
+					&& (visibilitymap_get_status(rel, block, &vmbuffer)
+						& VISIBILITYMAP_ALL_FROZEN) != 0;
 
 				if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
-						version_buffers, version_ids, cluster_chain_vm_locked ? 2 : 1,
+						version_buffers, version_ids, vm_changes ? 2 : 1,
 						&cluster_page_versions))
 					elog(ERROR, "shared heap update-chain lock cannot capture exact page versions");
 			}
@@ -18107,14 +18148,19 @@ l4:
 		{
 			Buffer version_buffers[2] = {buf, vmbuffer};
 			uint8 version_ids[2] = {0, 1};
+			bool vm_changes;
 
-			if (PageIsAllVisible(BufferGetPage(buf)) && BufferIsValid(vmbuffer))
+			if (PageIsAllVisible(BufferGetPage(buf)) && BufferIsValid(vmbuffer)
+				&& cluster_heap_lock_vm_needs_clear(rel, block, vmbuffer))
 			{
 				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
 				cluster_chain_vm_locked = true;
 			}
+			vm_changes = cluster_chain_vm_locked
+				&& (visibilitymap_get_status(rel, block, &vmbuffer)
+					& VISIBILITYMAP_ALL_FROZEN) != 0;
 			if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
-					version_buffers, version_ids, cluster_chain_vm_locked ? 2 : 1,
+					version_buffers, version_ids, vm_changes ? 2 : 1,
 					&cluster_page_versions))
 				elog(ERROR, "shared heap update-chain lock cannot capture exact page versions");
 		}
