@@ -51,6 +51,11 @@ cluster_config_producers_hold(const ClusterSharedConfigRef *selected, const uint
 							  ClusterConfigProducerStage stage);
 extern ClusterConfigProducerResult
 cluster_config_producers_observe(ClusterConfigProducerCensus *out);
+/* Original LMON's synchronous fresh entry only. FRONT holds periodic CF
+ * discovery; QUIET holds new asynchronous/automatic duties. Existing work
+ * must keep retiring. Reads actual family cuts, not a private owner flag;
+ * this is neither root authority nor permission to release any cut. */
+extern bool cluster_config_producers_fresh_allowed(ClusterConfigProducerStage stage);
 /* Bind real native common census to every future producer, with all cuts held.
  * This is NOT permission to APPLY or an all-member application certificate. */
 extern ClusterConfigProducerResult cluster_config_producers_bind(void);

@@ -25,6 +25,7 @@
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_config_members.h"
 #include "cluster/cluster_config_channels.h"
+#include "cluster/cluster_config_producers.h"
 
 static bool selection_pending;
 static ClusterR4MembershipSnapshot selection_members;
@@ -140,6 +141,11 @@ cluster_shared_config_delivery_lmon_tick(void)
 		return;
 	}
 	now = GetCurrentTimestamp();
+	/* Discovery is fresh work. An already owned CF request must continue to
+	 * its original terminal state even after the native FRONT cut closes. */
+	if (!selection_pending
+		&& !cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_FRONT))
+		return;
 	/* Prefix/service readiness is driven at the original LMON idle boundary,
 	 * not inside this CF selection duty or its retained work bracket. */
 	/* Scheduling, not a proof/expiry/deadline. A pending exact CF request is

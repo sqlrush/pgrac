@@ -21,6 +21,7 @@
 #include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_control_request.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 #include "miscadmin.h"
 #undef printf
 #include "unit_test.h"
@@ -59,12 +60,15 @@ enum {
 	LMD_GRAPH,
 	SINVAL,
 	KO,
+	XID_WRAP,
 	MODULES
 };
 static ClusterNormalStopPollResult answers[MODULES];
 static uint64 seen;
 static unsigned calls;
 static unsigned stop_close_calls, online_close_calls;
+static bool wrap_available = true, wrap_pending;
+static unsigned wrap_calls;
 
 static ClusterNormalStopPollResult
 answer(unsigned module, const char **reason)
@@ -75,6 +79,17 @@ answer(unsigned module, const char **reason)
 	++calls;
 	*reason = "fixture original owner";
 	return answers[module];
+}
+
+bool
+cluster_xid_wrap_barrier_observe(bool *pending)
+{
+	const char *reason;
+	ClusterNormalStopPollResult result = answer(XID_WRAP, &reason);
+	wrap_calls++;
+	*pending = wrap_pending || result == CLUSTER_NORMAL_STOP_PENDING;
+	return wrap_available
+		   && (result == CLUSTER_NORMAL_STOP_READY || result == CLUSTER_NORMAL_STOP_PENDING);
 }
 
 #define SIMPLE_POLL(name, index, type)                                                             \
@@ -166,6 +181,9 @@ reset(BackendType role, AuxProcType aux)
 	MyAuxProcType = aux;
 	seen = calls = 0;
 	stop_close_calls = online_close_calls = 0;
+	wrap_available = true;
+	wrap_pending = false;
+	wrap_calls = 0;
 	for (unsigned i = 0; i < MODULES; ++i)
 		answers[i] = CLUSTER_NORMAL_STOP_READY;
 }
@@ -178,7 +196,7 @@ typedef struct FixtureRole {
 } FixtureRole;
 #define BIT(m) (UINT64CONST(1) << (m))
 static const FixtureRole roles[]
-	= { { B_LMON, LmonProcess, (BIT(CONTROL_REQUEST + 1) - 1), 21 },
+	= { { B_LMON, LmonProcess, (BIT(CONTROL_REQUEST + 1) - 1) | BIT(XID_WRAP), 22 },
 		{ B_LMS, LmsProcess, BIT(CR) | BIT(PROBE) | BIT(GCS) | BIT(LMS_OUT) | BIT(IC), 5 },
 		{ B_LMS_WORKER, LmsWorker1Process, BIT(CR) | BIT(PROBE) | BIT(GCS) | BIT(LMS_OUT) | BIT(IC),
 		  5 },
@@ -186,6 +204,23 @@ static const FixtureRole roles[]
 		  5 },
 		{ B_LMD, LmdProcess, BIT(LMD) | BIT(LMD_PENDING) | BIT(LMD_GRAPH) | BIT(LMD_PROBE), 4 },
 		{ B_SINVAL_BCAST, SinvalBcastProcess, BIT(SINVAL) | BIT(KO), 2 } };
+
+UT_TEST(online_wrap_pending_is_not_idle_and_absent_state_is_not_empty)
+{
+	ClusterServiceObservation out;
+	reset(B_LMON, LmonProcess);
+	wrap_pending = true;
+	UT_ASSERT_EQ(cluster_service_observe(&out), CLUSTER_NORMAL_STOP_PENDING);
+	UT_ASSERT_EQ(wrap_calls, 1);
+	reset(B_LMON, LmonProcess);
+	wrap_available = false;
+	UT_ASSERT_EQ(cluster_service_observe(&out), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(wrap_calls, 1);
+	reset(B_LMON, LmonProcess);
+	wrap_pending = true;
+	UT_ASSERT_EQ(cluster_service_normal_stop_observe(&out), CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(wrap_calls, 0); /* Original shutdown census is unchanged. */
+}
 
 UT_TEST(native_fanouts_are_exact_without_shutdown)
 {
@@ -208,8 +243,8 @@ UT_TEST(shutdown_keeps_original_close_stage_instead_of_online_busy_rule)
 		ClusterServiceObservation out;
 		reset(roles[r].role, roles[r].aux);
 		UT_ASSERT_EQ(cluster_service_normal_stop_observe(&out), CLUSTER_NORMAL_STOP_READY);
-		UT_ASSERT_EQ(seen, roles[r].mask);
-		UT_ASSERT_EQ(calls, roles[r].count);
+		UT_ASSERT_EQ(seen, roles[r].mask & ~BIT(XID_WRAP));
+		UT_ASSERT_EQ(calls, roles[r].count - (roles[r].role == B_LMON ? 1 : 0));
 		UT_ASSERT_EQ(online_close_calls, 0);
 		UT_ASSERT_EQ(stop_close_calls, roles[r].role == B_LMON ? 1 : 0);
 	}
@@ -313,7 +348,8 @@ UT_TEST(original_transport_position_is_preserved)
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(online_wrap_pending_is_not_idle_and_absent_state_is_not_empty);
 	UT_RUN(native_fanouts_are_exact_without_shutdown);
 	UT_RUN(shutdown_keeps_original_close_stage_instead_of_online_busy_rule);
 	UT_RUN(every_original_pending_owner_prevents_ready);

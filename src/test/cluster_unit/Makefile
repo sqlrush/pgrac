@@ -457,7 +457,25 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_ir,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_use_gate,$(SIMPLE_TESTS))
+TESTS += test_cluster_config_lmon_fresh test_cluster_config_wrap_observe
 SIMPLE_TESTS := $(filter-out test_cluster_config_producers,$(SIMPLE_TESTS))
+
+# PGRAC: actual fresh LMON entry branches; no mirror of production predicates.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_auto_restore.inc: $(top_srcdir)/src/backend/cluster/cluster_backup.c
+	@awk '/^cluster_backup_maybe_auto_restore_point\(void\)/ { print "static void"; emit=1; starts++ } \
+	     emit { print } emit && /^}/ { emit=0; ends++ } \
+	     END { if (starts != 1 || ends != 1) exit 1 }' $< > $@.tmp && mv $@.tmp $@
+test_cluster_config_lmon_fresh: test_cluster_config_lmon_fresh.c unit_test.h \
+		test_cluster_config_auto_restore.inc \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_wrap_barrier.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_config_wrap_observe: test_cluster_config_wrap_observe.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: real ordered native cut controller and atomic gates, isolated native census.
 # Author: SqlRush <sqlrush@gmail.com>

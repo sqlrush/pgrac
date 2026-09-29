@@ -14,6 +14,7 @@
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_config_members.h"
 #include "cluster/cluster_config_channels.h"
+#include "cluster/cluster_config_producers.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_reconfig.h"
@@ -46,6 +47,14 @@ static bool members_available = true;
 static int change_during_poll;
 static unsigned member_polls, member_cancels;
 static unsigned channel_ticks, channel_cancels;
+static bool fresh_allowed = true;
+
+bool
+cluster_config_producers_fresh_allowed(ClusterConfigProducerStage stage)
+{
+	UT_ASSERT_EQ(stage, CLUSTER_CONFIG_PRODUCERS_FRONT);
+	return fresh_allowed;
+}
 
 /* Native channel adapter is tested separately with real prefix exchanges. */
 void
@@ -529,11 +538,42 @@ UT_TEST(cf_duty_does_not_publish_original_service_idle)
 	UT_ASSERT_EQ(channel_cancels, cancellations + 1);
 }
 
+UT_TEST(held_front_does_not_start_periodic_cf_work)
+{
+	unsigned before;
+	member_fixture();
+	cluster_shared_config_delivery_lmon_cancel();
+	fresh_allowed = false;
+	before = polls;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(polls, before);
+	fresh_allowed = true;
+}
+
+UT_TEST(held_front_still_retires_previously_started_cf_work)
+{
+	unsigned before;
+	member_fixture();
+	cluster_shared_config_delivery_lmon_cancel();
+	fresh_allowed = true;
+	busy = true;
+	cluster_shared_config_delivery_lmon_tick();
+	before = polls;
+	fresh_allowed = false;
+	busy = false;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(polls, before + 1);
+	now += 2000000;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(polls, before + 1);
+	fresh_allowed = true;
+}
+
 int
 main(void)
 {
 	seed_members();
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(select_and_deliver);
 	UT_RUN(lost_notification);
 	UT_RUN(parent_does_not_prove_children);
@@ -550,6 +590,8 @@ main(void)
 	UT_RUN(legal_overlay_needs_no_common_delivery);
 	UT_RUN(missing_common_observation_still_requests_delivery);
 	UT_RUN(cf_duty_does_not_publish_original_service_idle);
+	UT_RUN(held_front_does_not_start_periodic_cf_work);
+	UT_RUN(held_front_still_retires_previously_started_cf_work);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

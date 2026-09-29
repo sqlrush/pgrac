@@ -64,6 +64,7 @@ PG_FUNCTION_INFO_V1(cluster_get_pitr_status);
 
 #ifdef USE_PGRAC_CLUSTER
 
+#include "cluster/cluster_config_producers.h"
 #include "cluster/cluster_ic_envelope.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_lmon.h"
@@ -2416,6 +2417,10 @@ cluster_backup_maybe_auto_restore_point(void)
 	if (cluster_conf_has_peers())
 		return;
 	if (pg_atomic_read_u32(&cluster_backup_state->commit_fence_active) != 0)
+		return;
+	/* Original LMON automatic creation only; peer commands and already
+	 * admitted backup completion stay outside this fresh-work cut. */
+	if (!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET))
 		return;
 
 	now = GetCurrentTimestamp();

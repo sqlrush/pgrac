@@ -24,6 +24,7 @@
 #include "cluster/cluster_control_request.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 
 typedef enum ServiceModule {
 	SERVICE_GRD_WORK,
@@ -52,7 +53,8 @@ typedef enum ServiceModule {
 	SERVICE_LMD_PENDING,
 	SERVICE_LMD_GRAPH,
 	SERVICE_SINVAL,
-	SERVICE_KO
+	SERVICE_KO,
+	SERVICE_XID_WRAP
 } ServiceModule;
 
 static const ServiceModule lmon_modules[]
@@ -62,7 +64,8 @@ static const ServiceModule lmon_modules[]
 		SERVICE_CLOSE,		  SERVICE_REMOVE,		SERVICE_FENCE,
 		SERVICE_WRITE_FENCE,  SERVICE_CF,			SERVICE_RECOVERY,
 		SERVICE_BACKUP,		  SERVICE_MRP,			SERVICE_GCS_DEDUP,
-		SERVICE_GES_DEDUP,	  SERVICE_LMD_PROBE,	SERVICE_CONTROL_REQUEST };
+		SERVICE_GES_DEDUP,	  SERVICE_LMD_PROBE,	SERVICE_CONTROL_REQUEST,
+		SERVICE_XID_WRAP };
 static const ServiceModule lms_modules[] = { SERVICE_CR, SERVICE_NATIVE_PROBE, SERVICE_GCS_LOCAL,
 											 SERVICE_LMS_OUTBOUND, SERVICE_TRANSPORT };
 static const ServiceModule lmd_modules[]
@@ -153,6 +156,15 @@ service_observe_one(ServiceModule module, bool stopping, ClusterServiceObservati
 		result = cluster_ko_normal_stop_poll(&out->position, &out->reason);
 		out->slot = (int)out->position;
 		return result;
+	case SERVICE_XID_WRAP: {
+		bool pending;
+		out->domain = "XID_WRAP";
+		out->reason = "UNAVAILABLE";
+		if (!cluster_xid_wrap_barrier_observe(&pending))
+			return CLUSTER_NORMAL_STOP_INVALID;
+		out->reason = pending ? "ADMITTED_ROUND" : "NONE";
+		return pending ? CLUSTER_NORMAL_STOP_PENDING : CLUSTER_NORMAL_STOP_READY;
+	}
 	}
 	return CLUSTER_NORMAL_STOP_INVALID;
 }
@@ -183,6 +195,10 @@ service_observe(bool stopping, ClusterServiceObservation *out)
 	if (MyBackendType == B_LMON && AmLmonProcess()) {
 		modules = lmon_modules;
 		count = lengthof(lmon_modules);
+		/* Online configuration has a retained fresh-wrap cut. Do not silently
+		 * change the separate existing shutdown contract in this adapter. */
+		if (stopping)
+			--count;
 	} else if ((MyBackendType == B_LMS && AmLmsProcess())
 			   || (MyBackendType == B_LMS_WORKER && AmLmsWorkerProcess())) {
 		modules = lms_modules;

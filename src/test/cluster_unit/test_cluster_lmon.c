@@ -927,6 +927,13 @@ void cluster_xid_wrap_barrier_lmon_tick(void);
 void
 cluster_xid_wrap_barrier_lmon_tick(void)
 {}
+bool cluster_xid_wrap_barrier_observe(bool *pending);
+bool
+cluster_xid_wrap_barrier_observe(bool *pending)
+{
+	*pending = false;
+	return true; /* Explicit original wrap-state boundary in this loop fixture. */
+}
 void cluster_xid_wrap_barrier_register_ic_msg_types(void);
 void
 cluster_xid_wrap_barrier_register_ic_msg_types(void)

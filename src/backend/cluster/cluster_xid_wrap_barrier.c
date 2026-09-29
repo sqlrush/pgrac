@@ -47,6 +47,7 @@
 
 #include "access/transam.h"
 #include "cluster/cluster_conf.h"
+#include "cluster/cluster_config_producers.h"
 #include "cluster/cluster_cr.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_router.h"
@@ -309,6 +310,10 @@ cluster_xid_wrap_barrier_lmon_tick(void)
 
 	if (!cluster_xid_wrap_barrier_marked()) {
 		if (!wb_margin_reached())
+			return;
+		/* Only the first durable initiation is fresh work. Already marked
+		 * rounds, peer handlers and post-done repair retain their old duties. */
+		if (!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET))
 			return;
 
 		/*

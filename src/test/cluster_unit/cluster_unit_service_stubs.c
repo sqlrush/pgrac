@@ -20,6 +20,7 @@
 #include "postgres.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_control_request.h"
+#include "cluster/cluster_xid_stripe_boot.h"
 
 #define UNUSED_SIMPLE(name, type)                                                                  \
 	ClusterNormalStopPollResult __attribute__((weak)) name(                                        \
@@ -82,6 +83,12 @@ cluster_cf_normal_stop_poll(bool post_checkpoint pg_attribute_unused(),
 }
 bool __attribute__((weak))
 cluster_control_request_empty(void)
+{
+	abort();
+}
+
+bool __attribute__((weak))
+cluster_xid_wrap_barrier_observe(bool *pending pg_attribute_unused())
 {
 	abort();
 }

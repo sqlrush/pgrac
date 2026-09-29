@@ -100,6 +100,29 @@ producer_key(const ClusterSharedConfigRef *ref, ClusterConfigMembersKey *key)
 		   && cluster_config_members_make_key(ref, &members, key);
 }
 
+bool
+cluster_config_producers_fresh_allowed(ClusterConfigProducerStage stage)
+{
+	ClusterConfigChannelOwner owner;
+	ClusterConfigUseGate *gate;
+	bool failed = false;
+	if (stage != CLUSTER_CONFIG_PRODUCERS_FRONT && stage != CLUSTER_CONFIG_PRODUCERS_QUIET)
+		return false;
+	if (!cluster_enabled || !cluster_shared_config)
+		return true;
+	if (!producer_self(&owner))
+		return false;
+	/* The sole original LMON closes these gates in normal context. No second
+	 * local closer can race this same-process fresh entry. Read the family
+	 * gate even after a private owner is lost; replacement cannot undo CLOSE.
+	 * QUIET's first gate is WALWRITER, before any other periodic producer. */
+	gate = stage == CLUSTER_CONFIG_PRODUCERS_FRONT
+			   ? cluster_shared_config_delivery_native_gate()
+			   : cluster_shared_config_delivery_background_gate(CLUSTER_CONFIG_BACKGROUND_WALWRITER,
+																&failed);
+	return gate != NULL && !failed && !cluster_config_use_gate_read(gate).closed;
+}
+
 static bool
 producer_current(void)
 {

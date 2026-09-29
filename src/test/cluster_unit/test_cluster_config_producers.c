@@ -456,10 +456,76 @@ UT_TEST(bound_values_or_membership_cannot_change_before_release)
 	}
 }
 
+UT_TEST(fresh_duties_obey_actual_family_cut_not_private_memory)
+{
+	reset();
+	UT_ASSERT(cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_FRONT));
+	UT_ASSERT(cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+	UT_ASSERT_EQ(hold(1), CLUSTER_CONFIG_PRODUCERS_READY);
+	UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_FRONT));
+	UT_ASSERT(cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+	UT_ASSERT_EQ(hold(2), CLUSTER_CONFIG_PRODUCERS_READY);
+	UT_ASSERT(cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+	UT_ASSERT_EQ(hold(3), CLUSTER_CONFIG_PRODUCERS_READY);
+	UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+	memset(&producer_cut, 0, sizeof(producer_cut)); /* Actual family survives a private owner. */
+	UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_FRONT));
+	UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+}
+
+UT_TEST(fresh_duty_refuses_unknown_role_family_and_failed_gate)
+{
+	for (int bad = 0; bad < 7; ++bad) {
+		reset();
+		switch (bad) {
+		case 0:
+			family_ok = false;
+			break;
+		case 1:
+			MyBackendType = B_LMS;
+			break;
+		case 2:
+			register_ok = false;
+			break;
+		case 3:
+			lmon_pid++;
+			break;
+		case 4:
+			stopping = true;
+			break;
+		case 5:
+			MyAuxProcType = LmdProcess;
+			break;
+		case 6:
+			actual.registration = 0;
+			break;
+		}
+		UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_FRONT));
+		UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+	}
+	reset();
+	failed[4] = true;
+	UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+	UT_ASSERT(!cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_STORAGE));
+}
+
+UT_TEST(fresh_duty_resumes_after_exact_release_and_preserves_unmanaged_profile)
+{
+	reset();
+	quiet();
+	UT_ASSERT_EQ(cluster_config_producers_bind(), CLUSTER_CONFIG_PRODUCERS_READY);
+	UT_ASSERT(cluster_config_producers_release());
+	UT_ASSERT(cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_FRONT));
+	UT_ASSERT(cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_QUIET));
+	cluster_shared_config = false;
+	family_ok = false;
+	UT_ASSERT(cluster_config_producers_fresh_allowed(CLUSTER_CONFIG_PRODUCERS_FRONT));
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(11);
 	UT_RUN(front_owners_retire_before_background_is_held);
 	UT_RUN(stage_and_episode_are_not_caller_reset_tokens);
 	UT_RUN(unowned_closed_gate_and_partial_failure_stay_closed);
@@ -468,6 +534,9 @@ main(void)
 	UT_RUN(binding_needs_actual_complete_common_census);
 	UT_RUN(bind_actual_values_not_pending_counts_and_release_exact_cut);
 	UT_RUN(bound_values_or_membership_cannot_change_before_release);
+	UT_RUN(fresh_duties_obey_actual_family_cut_not_private_memory);
+	UT_RUN(fresh_duty_refuses_unknown_role_family_and_failed_gate);
+	UT_RUN(fresh_duty_resumes_after_exact_release_and_preserves_unmanaged_profile);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
