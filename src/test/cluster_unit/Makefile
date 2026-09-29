@@ -1286,6 +1286,31 @@ test_cluster_heap_delete_version.inc: $(top_srcdir)/src/backend/access/heap/heap
 	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# PGRAC: both native speculative finalization owners keep their original WAL.
+test_cluster_heap_confirm_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/PGRAC: speculative confirmation captures/ { emit=1; count++ } \
+	     emit { print } emit && /^\t}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_spec_abort_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/PGRAC: speculative abort captures/ { emit=1; count++ } \
+	     emit { print } emit && /^\t}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_confirm_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_finish_speculative\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { emit=1; starts++ } \
+	     emit { print } inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_spec_abort_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_abort_speculative\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { emit=1; starts++ } \
+	     emit { print } inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 # PGRAC: distinct pre-TOAST LOCK and final UPDATE publication from the real caller.
 test_cluster_heap_update_temp_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_update\(/ { inside=1 } \
@@ -1418,6 +1443,8 @@ test_cluster_vm_redo: test_cluster_vm_redo.c test_cluster_vm_redo_consumers.inc 
 
 test_cluster_heap_insert_version: test_cluster_heap_insert_version.c unit_test.h \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
+		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
+		test_cluster_heap_confirm_capture.inc test_cluster_heap_spec_abort_capture.inc \
 		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
 		test_cluster_heap_update_temp_version.inc test_cluster_heap_update_version.inc test_cluster_heap_update_log.inc \
 		test_cluster_heap_update_temp_capture.inc test_cluster_heap_update_capture.inc \
@@ -3135,6 +3162,8 @@ clean distclean maintainer-clean:
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
+		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
+		test_cluster_heap_confirm_capture.inc test_cluster_heap_spec_abort_capture.inc \
 		test_cluster_vm_version.inc test_cluster_vm_redo_consumers.inc test_cluster_heap_update_temp_version.inc \
 		test_cluster_heap_update_version.inc test_cluster_heap_update_log.inc \
 		test_cluster_heap_update_temp_capture.inc test_cluster_heap_update_capture.inc \

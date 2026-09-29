@@ -18421,6 +18421,22 @@ heap_finish_speculative(Relation relation, ItemPointer tid)
 	OffsetNumber offnum;
 	ItemId		lp = NULL;
 	HeapTupleHeader htup;
+#ifdef USE_PGRAC_CLUSTER
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
+
+	/* PGRAC: load the relation identity before the heap content lock. */
+	if (cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_get_identity(relation, &cluster_page_identity))
+			elog(ERROR, "shared speculative confirmation requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
+#endif
 
 	buffer = ReadBuffer(relation, ItemPointerGetBlockNumber(tid));
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
@@ -18435,10 +18451,27 @@ heap_finish_speculative(Relation relation, ItemPointer tid)
 
 	htup = (HeapTupleHeader) PageGetItem(page, lp);
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: speculative confirmation captures under the original X lock. */
+	if (cluster_page_versioned)
+	{
+		uint8 version_id = 0;
+
+		if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+				&buffer, &version_id, 1, &cluster_page_versions))
+			elog(ERROR, "shared speculative confirmation cannot capture its page version");
+	}
+#endif
+
 	/* NO EREPORT(ERROR) from here till changes are logged */
 	START_CRIT_SECTION();
 
 	Assert(HeapTupleHeaderIsSpeculative(htup));
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_page_versioned && !rf_page_producer_stamp_v1(&cluster_page_versions))
+		elog(PANIC, "shared speculative confirmation lost its page predecessor");
+#endif
 
 	MarkBufferDirty(buffer);
 
@@ -18463,6 +18496,12 @@ heap_finish_speculative(Relation relation, ItemPointer tid)
 
 		XLogRegisterData((char *) &xlrec, SizeOfHeapConfirm);
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
+
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned
+			&& !rf_page_producer_register_wal_v1(&cluster_page_versions))
+			elog(PANIC, "shared speculative confirmation cannot register its page version");
+#endif
 
 		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_CONFIRM);
 
@@ -18510,6 +18549,22 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 	BlockNumber block;
 	Buffer		buffer;
 	TransactionId prune_xid;
+#ifdef USE_PGRAC_CLUSTER
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
+
+	/* PGRAC: TOAST aborts use the same relation-cache identity contract. */
+	if (cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_get_identity(relation, &cluster_page_identity))
+			elog(ERROR, "shared speculative abort requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
+#endif
 
 	Assert(ItemPointerIsValid(tid));
 
@@ -18543,6 +18598,18 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 		elog(ERROR, "attempted to kill a non-speculative tuple");
 	Assert(!HeapTupleHeaderIsHeapOnly(tp.t_data));
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: speculative abort captures after the original tuple checks. */
+	if (cluster_page_versioned)
+	{
+		uint8 version_id = 0;
+
+		if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+				&buffer, &version_id, 1, &cluster_page_versions))
+			elog(ERROR, "shared speculative abort cannot capture its page version");
+	}
+#endif
+
 	/*
 	 * No need to check for serializable conflicts here.  There is never a
 	 * need for a combo CID, either.  No need to extract replica identity, or
@@ -18550,6 +18617,11 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 	 */
 
 	START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_page_versioned && !rf_page_producer_stamp_v1(&cluster_page_versions))
+		elog(PANIC, "shared speculative abort lost its page predecessor");
+#endif
 
 	/*
 	 * The tuple will become DEAD immediately.  Flag that this page is a
@@ -18606,6 +18678,12 @@ heap_abort_speculative(Relation relation, ItemPointer tid)
 		XLogRegisterBuffer(0, buffer, REGBUF_STANDARD);
 
 		/* No replica identity & replication origin logged */
+
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned
+			&& !rf_page_producer_register_wal_v1(&cluster_page_versions))
+			elog(PANIC, "shared speculative abort cannot register its page version");
+#endif
 
 		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_DELETE);
 

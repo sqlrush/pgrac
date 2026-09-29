@@ -66,6 +66,7 @@ static ForkNumber forks[4];
 static BlockNumber blocks[4];
 static bool permanent, claim_ready, recovering;
 static bool deleting, updating, temp_locking, tuple_locking, chain_locking;
+static bool confirming, spec_aborting;
 static unsigned vm_locks;
 
 void
@@ -278,16 +279,18 @@ XLogRegisterData(char *bytes, uint32 len)
 		abort();
 	if (data_calls++ == 0) {
 		if (len
-			!= (chain_locking					  ? SizeOfHeapLockUpdated
+			!= (confirming						  ? SizeOfHeapConfirm
+				: chain_locking					  ? SizeOfHeapLockUpdated
 				: (temp_locking || tuple_locking) ? SizeOfHeapLock
 				: updating						  ? SizeOfHeapUpdate
-				: deleting						  ? SizeOfHeapDelete
+				: (deleting || spec_aborting)	  ? SizeOfHeapDelete
 												  : SizeOfHeapInsert))
 			abort();
-		heap_flags = chain_locking					   ? ((xl_heap_lock_updated *)bytes)->flags
+		heap_flags = confirming						   ? 0
+					 : chain_locking				   ? ((xl_heap_lock_updated *)bytes)->flags
 					 : (temp_locking || tuple_locking) ? ((xl_heap_lock *)bytes)->flags
 					 : updating						   ? ((xl_heap_update *)bytes)->flags
-					 : deleting						   ? ((xl_heap_delete *)bytes)->flags
+					 : (deleting || spec_aborting)	   ? ((xl_heap_delete *)bytes)->flags
 													   : ((xl_heap_insert *)bytes)->flags;
 	}
 }
@@ -336,10 +339,12 @@ XLogInsert(RmgrId rmid, uint8 info)
 	uint8 operation = info & XLOG_HEAP_OPMASK;
 
 	if (!begun || rmid != (chain_locking ? RM_HEAP2_ID : RM_HEAP_ID)
-		|| (chain_locking					  ? operation != XLOG_HEAP2_LOCK_UPDATED
+		|| (confirming						  ? operation != XLOG_HEAP_CONFIRM
+			: chain_locking					  ? operation != XLOG_HEAP2_LOCK_UPDATED
 			: (temp_locking || tuple_locking) ? operation != XLOG_HEAP_LOCK
-			: updating ? operation != XLOG_HEAP_UPDATE && operation != XLOG_HEAP_HOT_UPDATE
-					   : operation != (deleting ? XLOG_HEAP_DELETE : XLOG_HEAP_INSERT)))
+			: updating
+				? operation != XLOG_HEAP_UPDATE && operation != XLOG_HEAP_HOT_UPDATE
+				: operation != ((deleting || spec_aborting) ? XLOG_HEAP_DELETE : XLOG_HEAP_INSERT)))
 		abort();
 	for (i = 0; i < 4; i++)
 		if (registered[i])
@@ -494,6 +499,7 @@ reset(bool versioned, bool vm, bool bit_set)
 	blocks[3] = 1;
 	permanent = claim_ready = true;
 	recovering = deleting = updating = temp_locking = tuple_locking = chain_locking = false;
+	confirming = spec_aborting = false;
 	NLocBuffer = 1;
 	BufferBlocks = pages[0].data;
 	PageInitHeapPage(pages[0].data, BLCKSZ, 0);
@@ -1191,10 +1197,116 @@ UT_TEST(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm)
 		}
 }
 
+static void
+run_speculative(bool versioned, bool aborting)
+{
+	Relation relation = &relation_data;
+	Buffer buffer = 1;
+	Page page = pages[0].data;
+	HeapTupleData tp = tuple;
+	ItemPointer tid = &tp.t_self;
+	HeapTupleHeader htup;
+	TransactionId xid = 500, TransactionXmin = 490, prune_xid;
+	bool cluster_page_versioned = versioned;
+	RfPageProducerBatchV1 cluster_page_versions = prepared;
+
+	tp.t_data = htup = (HeapTupleHeader)PageGetItem(page, PageGetItemId(page, FirstOffsetNumber));
+	HeapTupleHeaderSetSpeculativeToken(htup, 9);
+	HeapTupleHeaderSetXmin(htup, xid);
+	relform.relfrozenxid = 450;
+	(void)cluster_page_versioned;
+	(void)cluster_page_versions;
+	confirming = !aborting;
+	spec_aborting = aborting;
+	if (aborting) {
+#include "test_cluster_heap_spec_abort_version.inc"
+	} else {
+#include "test_cluster_heap_confirm_version.inc"
+	}
+}
+
+UT_TEST(test_speculative_confirm_versions_original_wal_and_ctid)
+{
+	HeapTupleHeader htup;
+
+	prepare_update(true, false, 0, true);
+	run_speculative(true, false);
+	htup = (HeapTupleHeader)PageGetItem(pages[0].data, PageGetItemId(pages[0].data, 1));
+	UT_ASSERT_EQ(edge_count, 1);
+	UT_ASSERT_EQ(edges[0].before.mutation_token, 100);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, edge_token);
+	UT_ASSERT_EQ(wal_info, XLOG_HEAP_CONFIRM);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(htup), 500);
+	UT_ASSERT(!HeapTupleHeaderIsSpeculative(htup));
+	UT_ASSERT_EQ(ItemPointerGetBlockNumber(&htup->t_ctid), blocks[0]);
+	UT_ASSERT_EQ(ItemPointerGetOffsetNumber(&htup->t_ctid), 1);
+	UT_ASSERT_EQ(PageGetLSN(pages[0].data), 200);
+}
+
+UT_TEST(test_speculative_abort_versions_original_super_delete)
+{
+	HeapTupleHeader htup;
+
+	prepare_update(true, false, 0, true);
+	run_speculative(true, true);
+	htup = (HeapTupleHeader)PageGetItem(pages[0].data, PageGetItemId(pages[0].data, 1));
+	UT_ASSERT_EQ(edge_count, 1);
+	UT_ASSERT_EQ(edges[0].before.mutation_token, 100);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, edge_token);
+	UT_ASSERT_EQ(wal_info, XLOG_HEAP_DELETE);
+	UT_ASSERT_EQ(heap_flags, XLH_DELETE_IS_SUPER);
+	UT_ASSERT_EQ(HeapTupleHeaderGetRawXmin(htup), InvalidTransactionId);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_prune_xid, 490);
+	UT_ASSERT(!HeapTupleHeaderIsSpeculative(htup));
+}
+
+UT_TEST(test_legacy_speculative_owners_keep_existing_tokens)
+{
+	int aborting;
+
+	for (aborting = 0; aborting < 2; aborting++) {
+		prepare_update(false, false, 0, true);
+		run_speculative(false, aborting != 0);
+		UT_ASSERT_EQ(edge_count, 0);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
+		UT_ASSERT_EQ(inserts, 1);
+	}
+}
+
+UT_TEST(test_actual_speculative_captures_leave_page_unchanged)
+{
+	int aborting;
+
+	for (aborting = 0; aborting < 2; aborting++) {
+		Buffer buffer = 1;
+		bool cluster_page_versioned = true;
+		ClusterSpaceIdentity cluster_page_identity;
+		RfPageProducerBatchV1 cluster_page_versions = { 0 };
+		PGAlignedBlock before;
+
+		prepare_update(true, false, 0, true);
+		cluster_page_identity = identity;
+		before = pages[0];
+		if (aborting) {
+#include "test_cluster_heap_spec_abort_capture.inc"
+		} else {
+#include "test_cluster_heap_confirm_capture.inc"
+		}
+		UT_ASSERT(memcmp(before.data, pages[0].data, BLCKSZ) == 0);
+		UT_ASSERT(!cluster_page_versions.stamped);
+		UT_ASSERT_EQ(cluster_page_versions.entry_count, 1);
+		UT_ASSERT_EQ(cluster_page_versions.entries[0].before.mutation_token, 100);
+		prepared = cluster_page_versions;
+		run_speculative(true, aborting != 0);
+		UT_ASSERT_EQ(edge_count, 1);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, cluster_page_versions.result_token);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(18);
+	UT_PLAN(22);
 	UT_RUN(test_native_insert_publishes_heap_edge_with_itl_delta);
 	UT_RUN(test_native_insert_covers_vm_even_when_bit_was_already_clear);
 	UT_RUN(test_legacy_insert_keeps_existing_wal_shape);
@@ -1213,6 +1325,10 @@ main(void)
 	UT_RUN(test_chain_lock_versions_heap_vm_with_or_without_itl);
 	UT_RUN(test_legacy_lock_owners_keep_original_wal_shape);
 	UT_RUN(test_actual_lock_capture_is_read_only_and_no_itl_locks_vm);
+	UT_RUN(test_speculative_confirm_versions_original_wal_and_ctid);
+	UT_RUN(test_speculative_abort_versions_original_super_delete);
+	UT_RUN(test_legacy_speculative_owners_keep_existing_tokens);
+	UT_RUN(test_actual_speculative_captures_leave_page_unchanged);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
