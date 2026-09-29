@@ -289,11 +289,16 @@ cluster_sq_instance_cache_begin_refill(const ClusterResId *resid, uint32 generat
 	LWLockAcquire(&sq_state->lwlock, LW_EXCLUSIVE);
 
 	entry = (ClusterSeqInstanceCache *)hash_search(sq_cache_htab, resid, HASH_FIND, NULL);
-	if (entry != NULL && entry->has_segment
+	if (entry != NULL && entry->generation == generation && entry->increment == increment
+		&& entry->has_segment
 		&& cluster_sq_cache_has_value(entry->local_next, entry->local_end, entry->increment)) {
 		/* Live value available -> slice and return (no page touch). */
 		*out_value = entry->local_next;
-		entry->local_next += entry->increment;
+		/* Consuming the inclusive endpoint must not wrap int64 and reissue. */
+		if (entry->local_next == entry->local_end)
+			entry->has_segment = false;
+		else
+			entry->local_next += entry->increment;
 		claim = CLUSTER_SQ_REFILL_SERVED;
 	} else if (entry != NULL && entry->refill_in_progress) {
 		/* Another backend on this node is already advancing the page. */

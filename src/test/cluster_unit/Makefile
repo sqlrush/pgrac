@@ -1334,26 +1334,30 @@ test_cluster_relation_wal_policy: test_cluster_relation_wal_policy.c unit_test.h
 
 # PGRAC: run native sequence producers with explicit external I/O fixtures.
 test_cluster_sequence_version_helpers.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
-	awk '/^cluster_sq_compute_write_scn\(/ { print "static uint64"; emit=1 } \
+	awk '/^cluster_seq_flush_if_shared\(/ { print "static void"; emit=1 } \
+	     /^cluster_sq_compute_write_scn\(/ { print "static uint64"; emit=1 } \
 	     /^cluster_seq_version_identity\(/ { print "static bool"; emit=1 } \
 	     /^cluster_seq_prepare_version\(/ { print "static void"; emit=1 } \
 	     emit { print } /^}/ { emit=0 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_sequence_version_native.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
-	awk '/^(cluster_sq_refill_page|fill_seq_fork_with_data|do_setval)\(/ { print "static void"; emit=1; found++ } \
+	awk '/^(cluster_sq_refill_page|cluster_sq_invalidate_if_managed|fill_seq_fork_with_data|do_setval)\(/ { print "static void"; emit=1; found++ } \
+	     /^cluster_sq_classify\(/ { print "static ClusterSqDisposition"; emit=1; found++ } \
+	     /^cluster_sq_nextval\(/ { print "static int64"; emit=1; found++ } \
 	     /^nextval_internal\(/ { print "int64"; emit=1; found++ } \
 	     /^seq_redo\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 8) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_sequence_version: test_cluster_sequence_version.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_sequence_shmem.c \
 		test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_SEQUENCE_O) \
 		$(CLUSTER_BLOCK_APPLY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(CLUSTER_SEQUENCE_O) $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_BLOCK_APPLY_O) \

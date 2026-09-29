@@ -42,6 +42,7 @@
 #include "utils/rel.h"
 #include "utils/syscache.h"
 #include "unit_test.h"
+#include "../../backend/cluster/cluster_sequence_shmem.c"
 
 UT_DEFINE_GLOBALS();
 bool cluster_enabled = true, cluster_shared_config = true;
@@ -51,6 +52,12 @@ Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
+bool IsUnderPostmaster;
+Oid MyDatabaseId = 5;
+BackendType MyBackendType;
+int cluster_sequence_refill_timeout_ms = 1000;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
 
 #define SEQ_LOG_VALS 32
 typedef struct SeqTableData {
@@ -86,9 +93,92 @@ static RfPageVersionEdgeEntryV1 edge;
 static xl_seq_rec wal_header;
 static FormData_pg_sequence_data wal_tuple;
 static unsigned wal_count, edge_count, data_count, dirties, flushes, identity_reads;
+static unsigned xid_count;
+static unsigned durable_wal_count, wal_flushes;
+static bool fail_wal_flush;
 static bool locked, begun, pcm_active, error_expected, identity_valid;
 static uint64 token;
 static jmp_buf error_jump;
+static ClusterSeqShared cache_state;
+static ClusterSeqInstanceCache entries[4];
+static bool entries_used[4], cache_lock;
+
+bool
+LWLockAcquire(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == &cache_state.lwlock && !cache_lock);
+	(void)mode;
+	cache_lock = true;
+	return true;
+}
+void
+LWLockRelease(LWLock *lock)
+{
+	UT_ASSERT(lock == &cache_state.lwlock && cache_lock);
+	cache_lock = false;
+}
+void *
+hash_search(HTAB *table, const void *key, HASHACTION action, bool *found)
+{
+	int free_slot = -1;
+	UT_ASSERT(table == sq_cache_htab && cache_lock);
+	for (int i = 0; i < 4; i++) {
+		if (!entries_used[i]) {
+			free_slot = i;
+			continue;
+		}
+		if (memcmp(key, &entries[i].resid, sizeof(ClusterResId)) == 0) {
+			if (found)
+				*found = true;
+			if (action == HASH_REMOVE)
+				entries_used[i] = false;
+			return &entries[i];
+		}
+	}
+	if (found)
+		*found = false;
+	if (action != HASH_ENTER_NULL || free_slot < 0)
+		return NULL;
+	entries_used[free_slot] = true;
+	memset(&entries[free_slot], 0, sizeof(entries[free_slot]));
+	memcpy(&entries[free_slot].resid, key, sizeof(ClusterResId));
+	return &entries[free_slot];
+}
+void
+ConditionVariablePrepareToSleep(ConditionVariable *cv)
+{
+	UT_ASSERT(cv == &cache_state.refill_cv);
+}
+bool
+ConditionVariableCancelSleep(void)
+{
+	return false;
+}
+void
+ConditionVariableBroadcast(ConditionVariable *cv)
+{
+	UT_ASSERT(cv == &cache_state.refill_cv && !cache_lock);
+}
+bool
+ConditionVariableTimedSleep(ConditionVariable *cv, long ms, uint32 event)
+{
+	(void)cv;
+	(void)ms;
+	(void)event;
+	abort();
+}
+TimestampTz
+GetCurrentTimestamp(void)
+{
+	return 1000000;
+}
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	longjmp(error_jump, 1);
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -144,6 +234,8 @@ errfinish(const char *file, int line, const char *fn)
 		printf("# unexpected error %s:%d %s\n", file, line, fn);
 		abort();
 	}
+	if (PG_exception_stack != NULL)
+		pg_re_throw();
 	longjmp(error_jump, 1);
 }
 void *
@@ -249,56 +341,27 @@ read_seq_tuple(Relation rel, Buffer *buffer, HeapTuple out)
 {
 	UT_ASSERT(rel == &relation_data && !locked);
 	if (cluster_shared_config)
-		UT_ASSERT_EQ(identity_reads, 1);
+		UT_ASSERT(identity_reads > 0);
 	locked = true;
 	*buffer = 1;
 	out->t_data = (HeapTupleHeader)PageGetItem(page_data.data, PageGetItemId(page_data.data, 1));
 	out->t_len = ItemIdGetLength(PageGetItemId(page_data.data, 1));
 	return (Form_pg_sequence_data)GETSTRUCT(out);
 }
-static ClusterSqDisposition
-cluster_sq_classify(Relation rel, ClusterResId *resid)
+void
+cluster_bufmgr_flush_seq_page_to_storage(Buffer buffer)
 {
-	(void)rel;
-	(void)resid;
-	return CLSQ_NATIVE;
-}
-static int64
-cluster_sq_nextval(Relation rel, const ClusterResId *resid, int64 i, int64 min, int64 max,
-				   int64 cache)
-{
-	(void)rel;
-	(void)resid;
-	(void)i;
-	(void)min;
-	(void)max;
-	(void)cache;
-	abort();
-}
-static void
-cluster_seq_flush_if_shared(Relation rel, Buffer buffer)
-{
-	(void)rel;
 	UT_ASSERT(buffer == 1 && locked && CritSectionCount == 0);
 	flushes++;
 }
-static void
-cluster_sq_invalidate_if_managed(Relation rel)
-{
-	(void)rel;
-}
 void
-cluster_sq_bump_page_writeback(void)
-{}
-void
-cluster_sq_bump_dup_guard_fail(void)
+XLogFlush(XLogRecPtr lsn)
 {
-	abort();
-}
-void
-cluster_sq_bump_cycle_rejected(void)
-{
-	abort();
+	UT_ASSERT(locked && CritSectionCount == 0 && lsn == PageGetLSN(page_data.data));
+	if (fail_wal_flush)
+		errfinish(__FILE__, __LINE__, __func__);
+	wal_flushes++;
+	durable_wal_count = wal_count;
 }
 HeapTuple
 SearchSysCache1(int cacheId, Datum key)
@@ -344,6 +407,7 @@ TransactionId
 GetTopTransactionId(void)
 {
 	UT_ASSERT_EQ(CritSectionCount, 0);
+	xid_count++;
 	return 3;
 }
 XLogRecPtr
@@ -471,7 +535,7 @@ cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
 void
 XLogRegisterPageVersionEdge(uint64 result, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
 {
-	UT_ASSERT(begun && result == 201 && count == 1);
+	UT_ASSERT(begun && result == token && count == 1);
 	edge = entries[0];
 	edge_count++;
 }
@@ -559,6 +623,200 @@ reset(bool fresh)
 	replaying = false;
 	CritSectionCount = 0;
 	token = 200;
+	xid_count = 0;
+	durable_wal_count = wal_flushes = 0;
+	fail_wal_flush = false;
+	PG_exception_stack = NULL;
+	cache_lock = false;
+	memset(&cache_state, 0, sizeof(cache_state));
+	memset(entries_used, 0, sizeof(entries_used));
+	sq_state = &cache_state;
+	sq_cache_htab = (HTAB *)&cache_state;
+}
+
+/* A CACHE 1 no-peer caller must not dirty/WAL-log on every issued value. */
+static void
+cache_one_wal_frequency(void)
+{
+	Form_pg_sequence params;
+	reset(false);
+	params = (Form_pg_sequence)GETSTRUCT(&params_tuple);
+	params->seqcache = 1;
+	for (int i = 0; i < 99; i++) {
+		memcpy(before.data, page_data.data, BLCKSZ);
+		UT_ASSERT_EQ(nextval_internal(20000, false), 6 + i);
+		UT_ASSERT_EQ(page_tuple()->last_value, 38 + (i / 33) * 33);
+		UT_ASSERT_EQ(wal_count, 1 + i / 33);
+		UT_ASSERT_EQ(durable_wal_count, wal_count);
+		UT_ASSERT_EQ(xid_count, wal_count);
+		UT_ASSERT_EQ(dirties, wal_count);
+		UT_ASSERT_EQ(identity_reads, wal_count);
+		UT_ASSERT(memcmp(&wal_tuple, page_tuple(), sizeof(wal_tuple)) == 0);
+	}
+	UT_ASSERT_EQ(wal_count, 3);
+}
+
+static void
+cache_one_native_wal_budget(void)
+{
+	Form_pg_sequence params;
+	reset(false);
+	cluster_shared_config = false;
+	params = (Form_pg_sequence)GETSTRUCT(&params_tuple);
+	params->seqcache = 1;
+	page_tuple()->log_cnt = 0;
+	for (int i = 0; i < 99; i++)
+		UT_ASSERT_EQ(nextval_internal(20000, false), 6 + i);
+	UT_ASSERT_EQ(wal_count, 3);
+	UT_ASSERT_EQ(xid_count, 3);
+}
+
+static void
+failed_wal_flush_never_publishes_grant(void)
+{
+	for (int active = 0; active <= 1; active++) {
+		reset(false);
+		pcm_active = active;
+		fail_wal_flush = error_expected = true;
+		if (setjmp(error_jump) == 0) {
+			(void)nextval_internal(20000, false);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(wal_count, 1);
+		UT_ASSERT_EQ(durable_wal_count, 0);
+		UT_ASSERT_EQ(flushes, 0);
+		UT_ASSERT(!cache_data.last_valid);
+		for (int i = 0; i < 4; i++)
+			if (entries_used[i]) {
+				UT_ASSERT(!entries[i].has_segment);
+				UT_ASSERT(!entries[i].refill_in_progress);
+			}
+		UT_ASSERT(!cache_lock && CritSectionCount == 0);
+	}
+}
+
+static void
+node_cache_tail_and_identity(void)
+{
+	ClusterResId key;
+	int64 value;
+	reset(false);
+	cluster_sq_resid_encode(5, 20000, 20000, &key);
+	cluster_sq_instance_cache_publish_and_take(&key, key.field3, 1, PG_INT64_MAX - 1, PG_INT64_MAX,
+											   &value);
+	UT_ASSERT_EQ(cluster_sq_instance_cache_begin_refill(&key, key.field3, 1, &value),
+				 CLUSTER_SQ_REFILL_SERVED);
+	UT_ASSERT_EQ(value, PG_INT64_MAX);
+	UT_ASSERT_EQ(cluster_sq_instance_cache_begin_refill(&key, key.field3, 1, &value),
+				 CLUSTER_SQ_REFILL_CLAIMED);
+	cluster_sq_instance_cache_abort_refill(&key);
+	cluster_sq_instance_cache_publish_and_take(&key, key.field3, 1, 1, 33, &value);
+	UT_ASSERT_EQ(cluster_sq_instance_cache_begin_refill(&key, key.field3 + 1, 1, &value),
+				 CLUSTER_SQ_REFILL_CLAIMED);
+	cluster_sq_instance_cache_abort_refill(&key);
+	cluster_sq_instance_cache_publish_and_take(&key, key.field3, 1, 1, 33, &value);
+	UT_ASSERT_EQ(cluster_sq_instance_cache_begin_refill(&key, key.field3, -1, &value),
+				 CLUSTER_SQ_REFILL_CLAIMED);
+}
+
+static void
+peer_transition_keeps_disjoint_reservations(void)
+{
+	Form_pg_sequence params;
+	reset(false);
+	params = (Form_pg_sequence)GETSTRUCT(&params_tuple);
+	params->seqcache = 1;
+	for (int i = 0; i < 66; i++) {
+		/* Model different backends with distinct SeqTableData, same real shmem. */
+		memset(&cache_data, 0, sizeof(cache_data));
+		pcm_active = i >= 11 && i < 55;
+		memcpy(before.data, page_data.data, BLCKSZ);
+		UT_ASSERT_EQ(nextval_internal(20000, false), 6 + i);
+	}
+	UT_ASSERT_EQ(wal_count, 2);
+	UT_ASSERT_EQ(xid_count, 2);
+	UT_ASSERT_EQ(page_tuple()->last_value, 71);
+}
+
+static void
+setval_and_new_locator_forget_reservations(void)
+{
+	for (int called = 0; called <= 1; called++) {
+		reset(false);
+		UT_ASSERT_EQ(nextval_internal(20000, false), 6);
+		memcpy(before.data, page_data.data, BLCKSZ);
+		do_setval(20000, 90, called);
+		memcpy(before.data, page_data.data, BLCKSZ);
+		UT_ASSERT_EQ(nextval_internal(20000, false), called ? 91 : 90);
+		UT_ASSERT_EQ(wal_count, 3);
+		/* An actual new relfilenumber selects a different instance-cache key.
+		 * Full ALTER/TRUNCATE catalog qualification is owned by P3. */
+		relation_data.rd_locator.relNumber++;
+		identity.key.locator = relation_data.rd_locator;
+		page_tuple()->last_value = 500;
+		page_tuple()->is_called = false;
+		memcpy(before.data, page_data.data, BLCKSZ);
+		UT_ASSERT_EQ(nextval_internal(20000, false), 500);
+		UT_ASSERT_EQ(wal_count, 4);
+	}
+}
+
+static void
+no_peer_cycle_and_active_refusal(void)
+{
+	for (int descending = 0; descending <= 1; descending++) {
+		Form_pg_sequence params;
+		reset(false);
+		params = (Form_pg_sequence)GETSTRUCT(&params_tuple);
+		params->seqcache = 1;
+		params->seqcycle = true;
+		params->seqincrement = descending ? -1 : 1;
+		params->seqmax = 7;
+		for (int i = 0; i < 21; i++) {
+			int64 expected = descending ? (10 - i % 7) % 7 + 1 : (5 + i) % 7 + 1;
+			memcpy(before.data, page_data.data, BLCKSZ);
+			UT_ASSERT_EQ(nextval_internal(20000, false), expected);
+		}
+		UT_ASSERT_EQ(wal_count, 4);
+		pcm_active = true;
+		error_expected = true;
+		memcpy(before.data, page_data.data, BLCKSZ);
+		if (setjmp(error_jump) == 0) {
+			(void)nextval_internal(20000, false);
+			UT_ASSERT(false);
+		}
+		UT_ASSERT_EQ(wal_count, 4);
+		UT_ASSERT(!locked);
+		UT_ASSERT(memcmp(before.data, page_data.data, BLCKSZ) == 0);
+	}
+}
+
+static void
+large_cache_and_descending_endpoint(void)
+{
+	Form_pg_sequence params;
+	reset(false);
+	params = (Form_pg_sequence)GETSTRUCT(&params_tuple);
+	params->seqcache = PG_INT64_MAX;
+	UT_ASSERT_EQ(nextval_internal(20000, false), 6);
+	UT_ASSERT_EQ(page_tuple()->last_value, 1000);
+	UT_ASSERT_EQ(wal_count, 1);
+	reset(false);
+	params = (Form_pg_sequence)GETSTRUCT(&params_tuple);
+	params->seqcache = 1;
+	params->seqincrement = -1;
+	params->seqmin = PG_INT64_MIN;
+	page_tuple()->last_value = PG_INT64_MIN + 2;
+	memcpy(before.data, page_data.data, BLCKSZ);
+	UT_ASSERT_EQ(nextval_internal(20000, false), PG_INT64_MIN + 1);
+	UT_ASSERT_EQ(nextval_internal(20000, false), PG_INT64_MIN);
+	UT_ASSERT_EQ(wal_count, 1);
+	error_expected = true;
+	if (setjmp(error_jump) == 0) {
+		(void)nextval_internal(20000, false);
+		UT_ASSERT(false);
+	}
+	UT_ASSERT_EQ(wal_count, 1);
 }
 static void
 check_version(uint8 before_kind)
@@ -567,7 +825,7 @@ check_version(uint8 before_kind)
 	UT_ASSERT_EQ(wal_count, 1);
 	UT_ASSERT_EQ(dirties, 1);
 	UT_ASSERT_EQ(identity_reads, 1);
-	UT_ASSERT_EQ(flushes, 1);
+	UT_ASSERT_EQ(flushes, pcm_active ? 1 : 0);
 	UT_ASSERT(!locked);
 	UT_ASSERT_EQ(edge.block_id, 0);
 	UT_ASSERT_EQ(edge.before_kind, before_kind);
@@ -592,11 +850,11 @@ refill_version(void)
 {
 	int64 first, last;
 	reset(false);
-	cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, &first, &last);
+	cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, false, &first, &last);
 	check_version(RF_PAGE_STATE_PRESENT);
 	UT_ASSERT_EQ(first, 6);
-	UT_ASSERT_EQ(last, 9);
-	UT_ASSERT_EQ(page_tuple()->last_value, 9);
+	UT_ASSERT_EQ(last, 41);
+	UT_ASSERT_EQ(page_tuple()->last_value, 41);
 	UT_ASSERT_EQ(page_tuple()->log_cnt, 0);
 }
 static void
@@ -616,7 +874,7 @@ native_cache_version(void)
 	reset(false);
 	UT_ASSERT_EQ(nextval_internal(20000, false), 6);
 	check_version(RF_PAGE_STATE_PRESENT);
-	UT_ASSERT_EQ(page_tuple()->last_value, 9);
+	UT_ASSERT_EQ(page_tuple()->last_value, 41);
 	UT_ASSERT_EQ(page_tuple()->log_cnt, 0);
 	UT_ASSERT_EQ(nextval_internal(20000, false), 7);
 	UT_ASSERT_EQ(wal_count, 1);
@@ -633,7 +891,7 @@ cache_boundaries(void)
 		if (scenario == 0) {
 			page_tuple()->is_called = false;
 			expected_first = 5;
-			expected_last = 8;
+			expected_last = 40;
 		} else if (scenario == 1) {
 			params->seqmax = 7;
 			expected_first = 6;
@@ -642,11 +900,12 @@ cache_boundaries(void)
 			params->seqincrement = -2;
 			params->seqmin = -100;
 			expected_first = 3;
-			expected_last = -3;
+			expected_last = -67;
 		} else {
 			page_tuple()->is_called = false;
 			params->seqcache = 1;
-			expected_first = expected_last = 5;
+			expected_first = 5;
+			expected_last = 37;
 		}
 		memcpy(before.data, page_data.data, BLCKSZ);
 		UT_ASSERT_EQ(nextval_internal(20000, false), expected_first);
@@ -719,7 +978,7 @@ rejected_boundary_is_not_cached(void)
 			else if (operation == 1)
 				do_setval(20000, 100, true);
 			else
-				cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, &start, &end);
+				cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, false, &start, &end);
 			UT_ASSERT(false);
 		}
 		UT_ASSERT(memcmp(before.data, page_data.data, BLCKSZ) == 0);
@@ -762,7 +1021,7 @@ exhausted_does_not_mutate(void)
 			if (operation == 0)
 				(void)nextval_internal(20000, false);
 			else
-				cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, &start, &end);
+				cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, false, &start, &end);
 			UT_ASSERT(false);
 		}
 		UT_ASSERT(memcmp(before.data, page_data.data, BLCKSZ) == 0);
@@ -783,7 +1042,7 @@ shared_minimal_wal(void)
 			if (operation == 0)
 				fill_seq_fork_with_data(&relation_data, &tuple, MAIN_FORKNUM);
 			else if (operation == 1)
-				cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, &start, &end);
+				cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, false, &start, &end);
 			else if (operation == 2)
 				do_setval(20000, 90, true);
 			else
@@ -828,7 +1087,7 @@ native_redo_differential(void)
 		if (operation == 0)
 			fill_seq_fork_with_data(&relation_data, &tuple, MAIN_FORKNUM);
 		else if (operation == 1)
-			cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, &start, &end);
+			cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, false, &start, &end);
 		else if (operation == 2)
 			do_setval(20000, 90, false);
 		else {
@@ -847,6 +1106,28 @@ native_redo_differential(void)
 		UT_ASSERT(memcmp(detached.data, page_data.data, BLCKSZ) == 0);
 		UT_ASSERT_EQ(page_tuple()->last_value, operation == 4 ? 41 : wal_tuple.last_value);
 	}
+}
+
+static void
+lost_cache_restarts_above_durable_grant(void)
+{
+	Form_pg_sequence params;
+	reset(false);
+	params = (Form_pg_sequence)GETSTRUCT(&params_tuple);
+	params->seqcache = 1;
+	UT_ASSERT_EQ(nextval_internal(20000, false), 6);
+	UT_ASSERT_EQ(page_tuple()->last_value, 38);
+	make_replay_record();
+	memset(page_data.data, 0, BLCKSZ);
+	memset(&cache_data, 0, sizeof(cache_data));
+	memset(entries_used, 0, sizeof(entries_used));
+	replaying = true;
+	seq_redo(&reader);
+	replaying = false;
+	memcpy(before.data, page_data.data, BLCKSZ);
+	UT_ASSERT_EQ(nextval_internal(20000, false), 39);
+	UT_ASSERT_EQ(page_tuple()->last_value, 71);
+	UT_ASSERT_EQ(wal_count, 2);
 }
 static void
 bad_redo_preserves_output(void)
@@ -910,7 +1191,16 @@ bad_redo_preserves_output(void)
 int
 main(void)
 {
-	UT_PLAN(13);
+	UT_PLAN(22);
+	UT_RUN(cache_one_wal_frequency);
+	UT_RUN(cache_one_native_wal_budget);
+	UT_RUN(failed_wal_flush_never_publishes_grant);
+	UT_RUN(node_cache_tail_and_identity);
+	UT_RUN(peer_transition_keeps_disjoint_reservations);
+	UT_RUN(setval_and_new_locator_forget_reservations);
+	UT_RUN(no_peer_cycle_and_active_refusal);
+	UT_RUN(large_cache_and_descending_endpoint);
+	UT_RUN(lost_cache_restarts_above_durable_grant);
 	UT_RUN(init_version);
 	UT_RUN(refill_version);
 	UT_RUN(setval_version);

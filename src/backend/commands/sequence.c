@@ -201,11 +201,11 @@ cluster_seq_prepare_version(const ClusterSpaceIdentity *identity, Buffer buffer,
 /*
  * PGRAC: spec-5.4 (v2.0 Q2-B, option B) — cluster sequence disposition.
  *
- *	CLSQ_NATIVE       not a cluster-managed sequence (single node / no peers /
- *	                  cluster off / a system or temp sequence) -> the PG-native
- *	                  nextval path is correct and unchanged.
- *	CLSQ_MANAGED      a user sequence on cluster shared storage in an active
- *	                  multi-node cluster -> the shared page is the single
+ *	CLSQ_NATIVE       not a shared-profile sequence and no active cluster,
+ *	                  or a nonshared system/temp sequence -> PG-native.
+ *	CLSQ_MANAGED      a permanent shared-profile sequence (also without peers),
+ *	                  or a shared user sequence in an active legacy cluster;
+ *	                  the shared page is the single
  *	                  cross-node allocation boundary; *resid is filled.
  *	CLSQ_UNSUPPORTED  a user sequence in an active multi-node cluster that is
  *	                  NOT on shared storage -> cross-node uniqueness cannot be
@@ -222,14 +222,20 @@ typedef enum ClusterSqDisposition
 static ClusterSqDisposition
 cluster_sq_classify(Relation seqrel, ClusterResId *resid)
 {
-	/* Single node / no peers / cluster disabled -> PG-native (no cross-node). */
-	if (!cluster_pcm_is_active())
+	/* PGRAC: temporary sequences never participate in shared reservation. */
+	if (RelationUsesLocalBuffers(seqrel))
 		return CLSQ_NATIVE;
 
-	/* System catalog or temp sequence -> not cross-node shared -> PG-native. */
-	if (seqrel->rd_locator.relNumber < FirstNormalObjectId
-		|| RelationUsesLocalBuffers(seqrel))
-		return CLSQ_NATIVE;
+	/* PGRAC: peer count must not change a shared sequence's allocation owner.
+	 * A durable node segment also amortizes CACHE 1 in the no-peer case. */
+	if (!(cluster_shared_config &&
+		  seqrel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT &&
+		  cluster_smgr_which_for(seqrel->rd_locator, InvalidBackendId) == 1))
+	{
+		if (!cluster_pcm_is_active() ||
+			seqrel->rd_locator.relNumber < FirstNormalObjectId)
+			return CLSQ_NATIVE;
+	}
 
 	/* User sequence in an active multi-node cluster: it must live on shared
 	 * storage so the single sequence page is the cross-node boundary. */
@@ -256,7 +262,7 @@ cluster_sq_classify(Relation seqrel, ClusterResId *resid)
  */
 static void
 cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
-					   int64 cache, int64 *out_start, int64 *out_end)
+					   int64 cache, bool cycle, int64 *out_start, int64 *out_end)
 {
 	Buffer		buf;
 	HeapTupleData seqtuple;
@@ -272,11 +278,22 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 	RfPageProducerBatchV1 versions;
 	bool		versioned = cluster_seq_version_identity(seqrel, &identity);
 
+	/* PGRAC: the extra PG prelog allowance is a real durable reservation here,
+	 * not a WAL tuple ahead of the page carrying the same result token. */
+	if (versioned)
+		cache += Min((int64) SEQ_LOG_VALS, PG_INT64_MAX - cache);
+
 	seq = read_seq_tuple(seqrel, &buf, &seqtuple);
 	page = BufferGetPage(buf);
 
 	st = cluster_sq_alloc_segment(seq->last_value, seq->is_called, incby, minv, maxv,
 								  cache, &gstart, &gend, &gcount, &new_boundary);
+	/* PGRAC: preserve no-peer CYCLE, without wrapping inside a cached segment.
+	 * Active-cluster CYCLE remains rejected by the original caller gate. */
+	if (st == CLUSTER_SQ_ALLOC_EXHAUSTED && cycle)
+		st = cluster_sq_alloc_segment(incby > 0 ? minv : maxv, false,
+									 incby, minv, maxv, cache,
+									 &gstart, &gend, &gcount, &new_boundary);
 	if (st == CLUSTER_SQ_ALLOC_EXHAUSTED)
 	{
 		UnlockReleaseBuffer(buf);
@@ -347,6 +364,13 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
 
 	END_CRIT_SECTION();
 
+	/* PGRAC: a different backend can commit a cache hit before the refill
+	 * transaction commits. Its commit cannot flush our WAL, so make the grant
+	 * durable before publishing it even with no peer or asynchronous commit.
+	 * The legacy DATA guard below is peer-gated, not this reservation proof. */
+	if (versioned)
+		XLogFlush(PageGetLSN(page));
+
 	/* WAL-before-grant + storage-current for the cross-node transfer. */
 	cluster_seq_flush_if_shared(seqrel, buf);
 	cluster_sq_bump_page_writeback(); /* boundary made durable + storage-visible */
@@ -368,7 +392,7 @@ cluster_sq_refill_page(Relation seqrel, int64 incby, int64 minv, int64 maxv,
  */
 static int64
 cluster_sq_nextval(Relation seqrel, const ClusterResId *resid,
-				   int64 incby, int64 minv, int64 maxv, int64 cache)
+				   int64 incby, int64 minv, int64 maxv, int64 cache, bool cycle)
 {
 	int64		v = 0;
 	int64		gstart = 0,
@@ -413,7 +437,7 @@ cluster_sq_nextval(Relation seqrel, const ClusterResId *resid,
 	/* This backend won the refill: advance the shared page, then publish. */
 	PG_TRY();
 	{
-		cluster_sq_refill_page(seqrel, incby, minv, maxv, cache, &gstart, &gend);
+		cluster_sq_refill_page(seqrel, incby, minv, maxv, cache, cycle, &gstart, &gend);
 	}
 	PG_CATCH();
 	{
@@ -1198,7 +1222,7 @@ nextval_internal(Oid relid, bool check_permissions)
 
 			/* Cluster CYCLE forward (spec §3.8 AL4): cross-node value reuse
 			 * conflicts with the uniqueness guarantee. */
-			if (cycle)
+			if (cycle && cluster_pcm_is_active())
 			{
 				cluster_sq_bump_cycle_rejected();
 				ereport(ERROR,
@@ -1209,7 +1233,7 @@ nextval_internal(Oid relid, bool check_permissions)
 								 "recreate the sequence with NO CYCLE.")));
 			}
 
-			sq_val = cluster_sq_nextval(seqrel, &sq_resid, incby, minv, maxv, cache);
+			sq_val = cluster_sq_nextval(seqrel, &sq_resid, incby, minv, maxv, cache, cycle);
 
 			elm->increment = incby;
 			elm->last = sq_val;
