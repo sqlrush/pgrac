@@ -19,6 +19,7 @@
 #include "catalog/pg_class.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_itl_slot.h"
+#include "cluster/cluster_space_storage.h"
 #include "storage/bufmgr.h"
 #include "storage/freespace.h"
 #include "storage/lmgr.h"
@@ -35,6 +36,8 @@ static bool storage_mode, remote_image, cancel_acquire;
 static int ordinary_acquires, direct_refusals, dirties, fsm_records;
 static uint32 extension_flags;
 static sigjmp_buf error_jump;
+static unsigned versioned_inits;
+static ClusterSpaceIdentity page_identity;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -44,6 +47,24 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 }
 
 #include "test_cluster_heap_extend_page.inc"
+
+/* The native caller is under test here. The separate SPACE test links the
+ * real initialization/WAL adapter; this boundary checks locked dispatch. */
+static bool
+fixture_versioned_init(const ClusterSpaceIdentity *identity, Buffer buffer)
+{
+	PGAlignedBlock zero;
+
+	memset(&zero, 0, sizeof(zero));
+	UT_ASSERT(identity == &page_identity);
+	UT_ASSERT(locked[buffer - 1] && pins[buffer - 1] > 0);
+	UT_ASSERT(memcmp(pages[buffer - 1].data, zero.data, BLCKSZ) == 0);
+	PageInitHeapPage(pages[buffer - 1].data, BLCKSZ, 0);
+	((PageHeader)pages[buffer - 1].data)->pd_block_scn = 91;
+	dirties++;
+	versioned_inits++;
+	return true;
+}
 
 static void
 fixture_error(void)
@@ -124,6 +145,7 @@ fixture_release(Buffer buffer)
 }
 
 #define cluster_storage_mode_enabled() storage_mode
+#define cluster_space_init_heap_buffer_wal fixture_versioned_init
 #define ExtendBufferedRelBy fixture_extend
 #define RelationExtensionLockWaiterCount(relation) 0
 #define LockBuffer fixture_lock
@@ -156,6 +178,7 @@ reset_fixture(bool cluster, bool remote, bool nonempty)
 	cancel_acquire = false;
 	ordinary_acquires = direct_refusals = dirties = fsm_records = 0;
 	extension_flags = UINT32_MAX;
+	versioned_inits = 0;
 	PageInitHeapPage(incoming.data, BLCKSZ, 0);
 	if (nonempty) {
 		PageHeader page = (PageHeader)incoming.data;
@@ -175,13 +198,24 @@ UT_TEST(cluster_fresh_extension_uses_ordinary_current_after_io)
 
 	reset_fixture(true, false, false);
 	if (sigsetjmp(error_jump, 0) == 0)
-		result = RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked);
+		result = RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked, NULL);
 	UT_ASSERT_EQ(result, 1);
 	UT_ASSERT_EQ(extension_flags, 0);
 	UT_ASSERT_EQ(ordinary_acquires, 1);
 	UT_ASSERT(unlocked && !locked[0] && pins[0] == 1 && valid[0]);
 	UT_ASSERT(PageHasItl(pages[0].data));
 	UT_ASSERT_EQ(dirties, 1);
+}
+
+UT_TEST(shared_extension_publishes_wal_version_before_unlock)
+{
+	bool unlocked = false;
+
+	reset_fixture(true, false, false);
+	UT_ASSERT_EQ(RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked, &page_identity), 1);
+	UT_ASSERT_EQ(versioned_inits, 1);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 91);
+	UT_ASSERT(unlocked && !locked[0] && pins[0] == 1);
 }
 
 UT_TEST(remote_initialized_heap_is_not_reinitialized)
@@ -194,7 +228,7 @@ UT_TEST(remote_initialized_heap_is_not_reinitialized)
 
 		reset_fixture(true, true, occupied != 0);
 		if (sigsetjmp(error_jump, 0) == 0)
-			result = RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked);
+			result = RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked, &page_identity);
 		UT_ASSERT_EQ(result, 1);
 		UT_ASSERT_EQ(direct_refusals, 0);
 		UT_ASSERT_EQ(ordinary_acquires, 1);
@@ -214,7 +248,7 @@ UT_TEST(noncluster_and_local_keep_locked_new_contract)
 		reset_fixture(local != 0, false, false);
 		if (local)
 			relation_class.relpersistence = RELPERSISTENCE_TEMP;
-		UT_ASSERT_EQ(RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked), 1);
+		UT_ASSERT_EQ(RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked, NULL), 1);
 		UT_ASSERT_EQ(extension_flags, EB_LOCK_FIRST);
 		UT_ASSERT_EQ(ordinary_acquires, 0);
 		UT_ASSERT(!unlocked && locked[0] && dirties == 1);
@@ -254,7 +288,7 @@ UT_TEST(malformed_current_heap_refuses_without_mutation)
 		}
 		preserved = incoming;
 		if (sigsetjmp(error_jump, 0) == 0) {
-			(void)RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked);
+			(void)RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked, &page_identity);
 			returned = true;
 		}
 		UT_ASSERT(!returned && dirties == 0);
@@ -271,7 +305,7 @@ UT_TEST(cancel_before_current_does_not_initialize)
 	reset_fixture(true, false, false);
 	cancel_acquire = true;
 	if (sigsetjmp(error_jump, 0) == 0) {
-		(void)RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked);
+		(void)RelationAddBlocks(&relation_data, NULL, 1, false, &unlocked, &page_identity);
 		returned = true;
 	}
 	UT_ASSERT(!returned && ordinary_acquires == 1 && dirties == 0);
@@ -288,7 +322,7 @@ UT_TEST(bulk_and_extra_pages_preserve_pin_and_fsm_accounting)
 		UT_ASSERT(false);
 		return;
 	}
-	UT_ASSERT_EQ(RelationAddBlocks(&relation_data, &bulk, 3, true, &unlocked), 1);
+	UT_ASSERT_EQ(RelationAddBlocks(&relation_data, &bulk, 3, true, &unlocked, &page_identity), 1);
 	UT_ASSERT(unlocked && !locked[0]);
 	UT_ASSERT(pins[0] == 2 && pins[1] == 0 && pins[2] == 0);
 	UT_ASSERT_EQ(bulk.current_buf, 1);
@@ -298,7 +332,7 @@ UT_TEST(bulk_and_extra_pages_preserve_pin_and_fsm_accounting)
 	UT_ASSERT_EQ(dirties, 0);
 	UT_ASSERT(memcmp(pages[0].data, preserved.data, BLCKSZ) == 0);
 	reset_fixture(true, false, false);
-	UT_ASSERT_EQ(RelationAddBlocks(&relation_data, NULL, 3, true, &unlocked), 1);
+	UT_ASSERT_EQ(RelationAddBlocks(&relation_data, NULL, 3, true, &unlocked, &page_identity), 1);
 	UT_ASSERT_EQ(fsm_records, 2);
 	UT_ASSERT(unlocked && pins[0] == 1 && pins[1] == 0 && pins[2] == 0);
 }
@@ -306,7 +340,8 @@ UT_TEST(bulk_and_extra_pages_preserve_pin_and_fsm_accounting)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(7);
+	UT_RUN(shared_extension_publishes_wal_version_before_unlock);
 	UT_RUN(cluster_fresh_extension_uses_ordinary_current_after_io);
 	UT_RUN(remote_initialized_heap_is_not_reinitialized);
 	UT_RUN(noncluster_and_local_keep_locked_new_contract);

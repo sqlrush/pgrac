@@ -208,6 +208,25 @@ cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *
 }
 
 bool
+cluster_space_init_heap_buffer_wal(const ClusterSpaceIdentity *identity, Buffer destination)
+{
+	PGAlignedBlock initialized;
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+
+	if (!BufferIsValid(destination) || BufferIsLocal(destination))
+		return false;
+	BufferGetTag(destination, &locator, &forknum, &block);
+	if (forknum != MAIN_FORKNUM)
+		return false;
+	/* Only private bytes change here. The existing buffered publisher captures
+	 * the actual all-zero predecessor before the first target mutation. */
+	PageInitHeapPage(initialized.data, BLCKSZ, 0);
+	return cluster_space_copy_buffer_wal(identity, initialized.data, destination);
+}
+
+bool
 cluster_space_relation_create(RelFileLocator locator)
 {
 	ClusterSpaceWalChange change;

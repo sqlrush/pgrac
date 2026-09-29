@@ -44,6 +44,12 @@ extern bool cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, Fo
 extern bool cluster_space_copy_buffer_wal(const ClusterSpaceIdentity *identity, const void *source,
 										  Buffer destination);
 
+/* Native heap allocation only. The identity was read before content locks;
+ * the locked MAIN target must still be entirely zero. Publish the original
+ * heap/ITL layout with its own UNFORMATTED edge before exposing it to callers. */
+extern bool cluster_space_init_heap_buffer_wal(const ClusterSpaceIdentity *identity,
+											   Buffer destination);
+
 /* Original recovery executor only, with its existing isolation and selected
  * WAL inputs. Decode/identity success is not recovery admission. False MUST
  * reject replay; an unsupported structural action is never silently skipped. */

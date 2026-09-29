@@ -11,6 +11,7 @@
 #include "access/visibilitymap.h"
 #include "catalog/pg_class.h"
 #include "cluster/cluster_pcm_lock.h"
+#include "cluster/cluster_space_storage.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "portability/instr_time.h"
@@ -29,6 +30,7 @@ bool cluster_recmerge_apply_foreign = false;
 uint64 cluster_recmerge_window_scn = 0;
 uint64 cluster_recmerge_window_own_lsn = 0;
 int cluster_node_id = 0;
+bool cluster_shared_config = false;
 
 #include "test_cluster_pcm_aux_page_space.inc"
 
@@ -975,7 +977,9 @@ UT_TEST(actual_pretoast_vm_retry_refreshes_predecessor_before_l2)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
+	UT_RUN(actual_shared_hio_reads_identity_before_locks_and_versions_existing_zero);
+	UT_RUN(actual_shared_hio_missing_identity_stops_before_page_access);
 	UT_RUN(actual_vm_consumer_requalifies_both_stages_without_replaying_clear);
 	UT_RUN(actual_vm_unchanged_clear_is_completed_not_retry);
 	UT_RUN(actual_consumer_rejects_stale_heap_proof_before_restoring_vm);

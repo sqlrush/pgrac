@@ -16,6 +16,8 @@
  *	    lease before the shared FSM (static space affinity).
  *	  - Shared heap extension completes I/O before ordinary current ownership;
  *	    preserve a remotely initialized page and requalify space under lock.
+ *	  - Bind shared-control heap initialization to its SPACE identity and WAL
+ *	    page version before the allocation owner releases its content lock.
  *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave d)
  *
  *-------------------------------------------------------------------------
@@ -29,8 +31,11 @@
 #include "access/htup_details.h"
 #include "access/visibilitymap.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw_lease.h"	/* PGRAC: spec-6.12d lease consume */
 #include "cluster/cluster_mode.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
 #endif
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
@@ -38,6 +43,8 @@
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
 
+/* Keep the native noncluster build independent of cluster header layout. */
+struct ClusterSpaceIdentity;
 
 #ifdef USE_PGRAC_CLUSTER
 /*
@@ -390,7 +397,8 @@ GetVisibilityMapPins(Relation relation, Buffer buffer1, Buffer buffer2,
  */
 static Buffer
 RelationAddBlocks(Relation relation, BulkInsertState bistate,
-				  int num_pages, bool use_fsm, bool *did_unlock)
+				  int num_pages, bool use_fsm, bool *did_unlock,
+				  const struct ClusterSpaceIdentity *page_identity)
 {
 #define MAX_BUFFERS_TO_EXTEND_BY 64
 	Buffer		victim_buffers[MAX_BUFFERS_TO_EXTEND_BY];
@@ -522,11 +530,20 @@ RelationAddBlocks(Relation relation, BulkInsertState bistate,
 	if (PageIsNew(page))
 	{
 #ifdef USE_PGRAC_CLUSTER
-		PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+		if (page_identity != NULL)
+		{
+			if (!cluster_space_init_heap_buffer_wal(page_identity, buffer))
+				elog(ERROR, "shared heap initialization version was refused");
+		}
+		else
+		{
+			PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+			MarkBufferDirty(buffer);
+		}
 #else
 		PageInit(page, BufferGetPageSize(buffer), 0);
-#endif
 		MarkBufferDirty(buffer);
+#endif
 	}
 #ifdef USE_PGRAC_CLUSTER
 	else
@@ -710,11 +727,30 @@ RelationGetBufferForTuple(Relation relation, Size len,
 	bool		unlockedTargetBuffer;
 	bool		recheckVmPins;
 	bool		cluster_vm_repin = cluster_hio_vm_repin_enabled(relation);
+	const struct ClusterSpaceIdentity *page_identity = NULL;
+#ifdef USE_PGRAC_CLUSTER
+	ClusterSpaceIdentity page_identity_storage;
+#endif
 
 	/* An UPDATE may pass the old page's VM pin into allocation. It must not
 	 * survive any target read, FSM search, heap wait or relation extension. */
 	if (cluster_vm_repin)
 		cluster_hio_release_vm_pins(vmbuffer, vmbuffer_other);
+
+#ifdef USE_PGRAC_CLUSTER
+	/* Relation's original lifecycle lock protects this incarnation. Read it
+	 * before any heap/VM content lock; cache no SMgr handle across the read. */
+	if (cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_read_identity(relation->rd_locator,
+													&page_identity_storage))
+			elog(ERROR, "shared heap allocation requires a live SPACE identity");
+		page_identity = &page_identity_storage;
+	}
+#endif
 
 	len = MAXALIGN(len);		/* be conservative */
 
@@ -929,11 +965,20 @@ loop:
 		{
 			/* PGRAC: heap page needs ITL slot array (stage 1.5). */
 #ifdef USE_PGRAC_CLUSTER
-			PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+			if (page_identity != NULL)
+			{
+				if (!cluster_space_init_heap_buffer_wal(page_identity, buffer))
+					elog(ERROR, "shared heap initialization version was refused");
+			}
+			else
+			{
+				PageInitHeapPage(page, BufferGetPageSize(buffer), 0);
+				MarkBufferDirty(buffer);
+			}
 #else
 			PageInit(page, BufferGetPageSize(buffer), 0);
-#endif
 			MarkBufferDirty(buffer);
+#endif
 		}
 
 		pageFreeSpace = PageGetHeapFreeSpace(page);
@@ -1025,7 +1070,7 @@ loop:
 
 	/* Have to extend the relation */
 	buffer = RelationAddBlocks(relation, bistate, num_pages, use_fsm,
-							   &unlockedTargetBuffer);
+							   &unlockedTargetBuffer, page_identity);
 
 	targetBlock = BufferGetBlockNumber(buffer);
 	page = BufferGetPage(buffer);
