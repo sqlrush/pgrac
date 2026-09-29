@@ -1110,7 +1110,10 @@ cluster_itl_stamp_active_internal(Buffer buf, uint8 slot_idx, TransactionId xid,
 	 * Hardening L213), which re-applies this watermark from the ITL delta on
 	 * crash recovery / standby replay; FPI redo restores it verbatim.
 	 */
-	if (SCN_VALID(write_scn))
+	/* The shared-control profile uses this field as an opaque PageVersion.
+	 * Its native WAL batch owns before/result; transaction time stays in
+	 * the ITL slot and must not silently overwrite that page identity. */
+	if (!cluster_shared_config && SCN_VALID(write_scn))
 		((PageHeader)page)->pd_block_scn = write_scn;
 	/*
 	 * spec-3.4c A2 / L194:  first_change_lsn is intentionally NOT populated.
@@ -1189,7 +1192,8 @@ cluster_itl_stamp_lock_active_with_history(Buffer buf, uint8 slot_idx, Transacti
 	slot->first_change_lsn = InvalidXLogRecPtr;
 	/* LOCK can carry an older DATA history head too. Match non-FPI redo's
 	 * page gate so the synchronous reader cannot skip this new history. */
-	if (SCN_VALID(write_scn) && scn_time_cmp(write_scn, ((PageHeader)page)->pd_block_scn) > 0)
+	if (!cluster_shared_config && SCN_VALID(write_scn)
+		&& scn_time_cmp(write_scn, ((PageHeader)page)->pd_block_scn) > 0)
 		((PageHeader)page)->pd_block_scn = write_scn;
 }
 
@@ -1401,7 +1405,9 @@ cluster_itl_redo_apply_block_local_delta(Page page, HeapTupleHeader htup,
 		 * carry InvalidScn or an unchanged write_scn) a no-op -- exactly
 		 * mirroring the stamp_active side, which only writes pd_block_scn
 		 * on a valid write_scn. */
-		if (SCN_VALID(d_write_scn)
+		/* Shared-control replay installs the record's exact result token,
+		 * not a maximum of transaction SCNs from its ITL payload. */
+		if (!cluster_shared_config && SCN_VALID(d_write_scn)
 			&& (!SCN_VALID(((PageHeader)page)->pd_block_scn)
 				|| scn_time_cmp(d_write_scn, ((PageHeader)page)->pd_block_scn) > 0))
 			((PageHeader)page)->pd_block_scn = d_write_scn;

@@ -93,6 +93,8 @@
 
 UT_DEFINE_GLOBALS();
 
+bool cluster_shared_config = false;
+
 /* The inverse witness overwrites a present tuple; re-adding a missing item
  * is outside this fixture and must not silently succeed. */
 OffsetNumber
@@ -1867,10 +1869,70 @@ UT_TEST(test_retained_lock_history_v4_redo_matches_primary)
 		UT_ASSERT(false);
 }
 
+UT_TEST(shared_data_stamp_preserves_page_version_token)
+{
+	Page page = build_itl_page();
+
+	cluster_shared_config = true;
+	((PageHeader)page)->pd_block_scn = 17;
+	cluster_itl_stamp_active_with_history(marker_buffer_for(page), 0, 101, 700,
+										  uba_encode(1, 7, 1, 0));
+	UT_ASSERT_EQ(((PageHeader)page)->pd_block_scn, 17);
+	UT_ASSERT_EQ(slot_at(page, 0)->write_scn, 700);
+	UT_ASSERT_EQ(slot_at(page, 0)->xid, 101);
+	UT_ASSERT_EQ(slot_at(page, 0)->flags, ITL_FLAG_ACTIVE);
+	cluster_shared_config = false;
+}
+
+UT_TEST(shared_lock_stamp_preserves_page_version_token)
+{
+	Page page = build_itl_page();
+
+	cluster_shared_config = true;
+	((PageHeader)page)->pd_block_scn = 5;
+	cluster_itl_stamp_lock_active_with_history(marker_buffer_for(page), 0, 101, 700,
+											   uba_encode(1, 7, 1, 0));
+	UT_ASSERT_EQ(((PageHeader)page)->pd_block_scn, 5);
+	UT_ASSERT_EQ(slot_at(page, 0)->write_scn, 700);
+	UT_ASSERT_EQ(slot_at(page, 0)->flags, ITL_FLAG_LOCK_ONLY_ACTIVE);
+	cluster_shared_config = false;
+}
+
+UT_TEST(shared_itl_redo_never_manufactures_or_overwrites_page_token)
+{
+	unsigned i;
+	uint64 tokens[] = { 0, 5, 1000 };
+
+	cluster_shared_config = true;
+	for (i = 0; i < lengthof(tokens); i++) {
+		Page page = build_itl_page();
+		xl_heap_itl_delta_block *header = (xl_heap_itl_delta_block *)redo_delta_buf;
+		xl_heap_itl_delta_v3 *delta = (xl_heap_itl_delta_v3 *)(redo_delta_buf + 8);
+
+		((PageHeader)page)->pd_block_scn = tokens[i];
+		memset(redo_delta_buf, 0, sizeof(redo_delta_buf));
+		header->ndeltas = 1;
+		header->format_version = CLUSTER_ITL_DELTA_FORMAT_V4;
+		delta->slot_idx = 0;
+		delta->flags_after = ITL_FLAG_ACTIVE;
+		delta->xid = 101;
+		delta->write_scn = 700;
+		delta->undo_segment_head = uba_encode(1, 7, 1, 0);
+		UT_ASSERT_EQ(cluster_itl_redo_apply_block_local_delta(page, NULL, redo_delta_buf), 40);
+		UT_ASSERT_EQ(((PageHeader)page)->pd_block_scn, tokens[i]);
+		UT_ASSERT_EQ(slot_at(page, 0)->write_scn, 700);
+		UT_ASSERT_EQ(slot_at(page, 0)->flags, ITL_FLAG_ACTIVE);
+	}
+	cluster_shared_config = false;
+}
+
 int
 main(void)
 {
-	UT_PLAN(72);
+	UT_PLAN(75);
+	UT_RUN(shared_data_stamp_preserves_page_version_token);
+	UT_RUN(shared_lock_stamp_preserves_page_version_token);
+	UT_RUN(shared_itl_redo_never_manufactures_or_overwrites_page_token);
 	UT_RUN(update_own_predecessor_lock_does_not_need_a_ninth_slot);
 	UT_RUN(update_handoff_refuses_unproved_or_still_referenced_lock_slot);
 	UT_RUN(update_handoff_keeps_ordinary_data_allocation_priority);

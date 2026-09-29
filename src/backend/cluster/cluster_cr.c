@@ -3740,11 +3740,15 @@ cluster_cr_satisfies_mvcc(HeapTuple htup, Snapshot snapshot, Buffer buffer, bool
 
 	phdr = (PageHeader)page;
 
-	/* Tier 1 (page gate): block already at/before snapshot -> not our case;
-	 * the existing visibility path / PG-native body handles it. */
-	if (!SCN_VALID(phdr->pd_block_scn) || !SCN_VALID(snapshot->read_scn))
+	/* A snapshot always needs a real transaction SCN. Shared-control page
+	 * headers instead carry opaque mutation tokens: never order those
+	 * against read_scn. Continue to the existing exact creator/ITL/origin
+	 * checks; removing a coarse shortcut does not grant visibility. */
+	if (!SCN_VALID(snapshot->read_scn))
 		return CLUSTER_CR_NOT_APPLICABLE;
-	if (scn_time_cmp(phdr->pd_block_scn, snapshot->read_scn) <= 0)
+	if (!cluster_shared_config
+		&& (!SCN_VALID(phdr->pd_block_scn)
+			|| scn_time_cmp(phdr->pd_block_scn, snapshot->read_scn) <= 0))
 		return CLUSTER_CR_NOT_APPLICABLE;
 
 	slot = &ClusterPageGetItlSlots(page)[itl_idx];
