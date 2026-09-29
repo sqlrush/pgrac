@@ -1326,13 +1326,20 @@ test_cluster_btree_leaf_version: test_cluster_btree_leaf_version.c unit_test.h \
 
 # PGRAC: native btree bulk writer; exact helpers linked without replacements.
 test_cluster_btree_build_writer.inc: $(top_srcdir)/src/backend/access/nbtree/nbtsort.c Makefile
-	awk '/^_bt_blwritepage\(/ { print "static void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^_bt_(blwritepage_data|blflushpages|blwritepage)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_btree_build_state.inc: $(top_srcdir)/src/backend/access/nbtree/nbtsort.c Makefile
 	awk '/^typedef struct BTWriteState/ { emit=1; found++ } emit { print } \
 	     /^} BTWriteState;/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_build_finish.inc: $(top_srcdir)/src/backend/access/nbtree/nbtsort.c Makefile
+	awk '/^_bt_load\(/ { inside=1 } \
+	     inside && /Close down final pages and write the metapage/ { emit=1; found++ } \
+	     /^}/ { if (emit) done++; inside=emit=0 } emit { print } \
 	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
@@ -1344,6 +1351,7 @@ test_cluster_btree_build_identity.inc: $(top_srcdir)/src/backend/access/nbtree/n
 
 test_cluster_btree_build_version: test_cluster_btree_build_version.c unit_test.h \
 		test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
+		test_cluster_btree_build_finish.inc \
 		test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
@@ -3378,7 +3386,8 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
-	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc
+	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
+		test_cluster_btree_build_finish.inc
 	rm -f test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc
 	rm -f test_cluster_btree_leaf_helpers.inc test_cluster_btree_leaf_dedup_helpers.inc
 	rm -f test_cluster_btree_build_identity.inc

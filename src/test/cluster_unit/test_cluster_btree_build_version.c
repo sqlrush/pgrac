@@ -51,11 +51,12 @@ static FormData_pg_class relform;
 static SMgrRelationData smgr;
 static ClusterSpaceIdentity identity;
 static BTWriteState state;
-static PGAlignedBlock pages[8], source, image, zero;
-static RfPageVersionEdgeEntryV1 entries[8];
+static PGAlignedBlock pages[64], source, pending[64], image, zero;
+static RfPageVersionEdgeEntryV1 entries[64];
 static uint64 token;
 static XLogRecPtr flushed;
 static unsigned count, writes, reads, wal_count, legacy_wal, edge_count, flush_count, free_count;
+static unsigned sync_count;
 static bool begun, expecting_error, fail_flush, checksums;
 static jmp_buf error_jump;
 
@@ -142,7 +143,10 @@ palloc_aligned(Size size, Size alignment, int flags)
 void
 pfree(void *ptr)
 {
-	UT_ASSERT(ptr == source.data);
+	bool known = ptr == source.data;
+	for (unsigned i = 0; i < lengthof(pending); i++)
+		known |= ptr == pending[i].data;
+	UT_ASSERT(known);
 	free_count++;
 }
 bool
@@ -157,7 +161,7 @@ smgrextend(SMgrRelation rel, ForkNumber forknum, BlockNumber block, const void *
 	Page page = (Page)data;
 	UT_ASSERT(rel == &smgr && forknum == MAIN_FORKNUM && skip_sync);
 	UT_ASSERT_EQ(block, count);
-	UT_ASSERT(block < 8);
+	UT_ASSERT(block < lengthof(pages));
 	if (cluster_shared_config && !PageIsNew(page))
 		UT_ASSERT(flushed >= PageGetLSN(page) && flushed != InvalidXLogRecPtr);
 	memcpy(pages[block].data, page, BLCKSZ);
@@ -187,7 +191,7 @@ log_newpage(RelFileLocator *locator, ForkNumber forknum, BlockNumber block, Page
 			bool standard)
 {
 	UT_ASSERT(RelFileLocatorEquals(*locator, relation.rd_locator));
-	UT_ASSERT(forknum == MAIN_FORKNUM && block < 8 && standard);
+	UT_ASSERT(forknum == MAIN_FORKNUM && block < lengthof(pages) && standard);
 	legacy_wal++;
 	PageSetLSN(page, 50);
 	return 50;
@@ -207,7 +211,7 @@ void
 XLogRegisterBlock(uint8 id, RelFileLocator *locator, ForkNumber forknum, BlockNumber block,
 				  Page page, uint8 flags)
 {
-	UT_ASSERT(begun && id == 0 && forknum == MAIN_FORKNUM && block < 8);
+	UT_ASSERT(begun && id == 0 && forknum == MAIN_FORKNUM && block < lengthof(pages));
 	UT_ASSERT(RelFileLocatorEquals(*locator, relation.rd_locator));
 	UT_ASSERT_EQ(flags, REGBUF_FORCE_IMAGE);
 	memcpy(image.data, page, BLCKSZ);
@@ -215,7 +219,7 @@ XLogRegisterBlock(uint8 id, RelFileLocator *locator, ForkNumber forknum, BlockNu
 void
 XLogRegisterPageVersionEdge(uint64 result, const RfPageVersionEdgeEntryV1 *edge, uint8 n)
 {
-	UT_ASSERT(begun && n == 1 && edge_count < 8);
+	UT_ASSERT(begun && n == 1 && edge_count < lengthof(entries));
 	UT_ASSERT_EQ(result, token);
 	entries[edge_count++] = edge[0];
 }
@@ -240,6 +244,30 @@ XLogFlush(XLogRecPtr lsn)
 
 #include "test_cluster_btree_build_writer.inc"
 
+void
+smgrimmedsync(SMgrRelation rel, ForkNumber forknum)
+{
+	UT_ASSERT(rel == &smgr && forknum == MAIN_FORKNUM);
+	UT_ASSERT_EQ(state.pending_count, 0);
+	UT_ASSERT_EQ(free_count, wal_count + legacy_wal);
+	sync_count++;
+}
+
+static void
+_bt_uppershutdown(BTWriteState *wstate, void *unused)
+{
+	/* Tuple construction is outside this I/O-order test. */
+	UT_ASSERT(wstate == &state && unused == NULL);
+}
+
+static void
+finish_build(void)
+{
+	BTWriteState *wstate = &state;
+	void *state = NULL;
+#include "test_cluster_btree_build_finish.inc"
+}
+
 static void
 reset(bool shared)
 {
@@ -250,6 +278,7 @@ reset(bool shared)
 	memset(pages, 0, sizeof(pages));
 	memset(entries, 0, sizeof(entries));
 	count = writes = reads = wal_count = legacy_wal = edge_count = flush_count = free_count = 0;
+	sync_count = 0;
 	begun = expecting_error = fail_flush = checksums = false;
 	flushed = InvalidXLogRecPtr;
 	token = 200;
@@ -278,6 +307,7 @@ UT_TEST(test_new_btree_page_is_versioned_before_data_write)
 {
 	reset(true);
 	_bt_blwritepage(&state, source.data, 0);
+	finish_build();
 	UT_ASSERT_EQ(edge_count, 1);
 	UT_ASSERT_EQ(entries[0].before_kind, RF_PAGE_STATE_ABSENT);
 	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 201);
@@ -285,15 +315,20 @@ UT_TEST(test_new_btree_page_is_versioned_before_data_write)
 	UT_ASSERT_EQ(flush_count, 1);
 	UT_ASSERT_EQ(legacy_wal, 0);
 	UT_ASSERT_EQ(free_count, 1);
+	UT_ASSERT_EQ(sync_count, 1);
 }
 UT_TEST(test_out_of_order_build_has_exact_zero_predecessor)
 {
 	reset(true);
-	_bt_blwritepage(&state, source.data, 3);
-	UT_ASSERT_EQ(count, 4);
+	pending[0] = source;
+	_bt_blwritepage(&state, pending[0].data, 3);
+	UT_ASSERT_EQ(count, 0);
 	PageInit(source.data, BLCKSZ, sizeof(BTPageOpaqueData));
 	BTPageGetOpaque(source.data)->btpo_flags = BTP_META;
 	_bt_blwritepage(&state, source.data, 0);
+	UT_ASSERT_EQ(count, 4);
+	UT_ASSERT_EQ(flush_count, 1);
+	finish_build();
 	UT_ASSERT_EQ(edge_count, 2);
 	UT_ASSERT_EQ(entries[0].before_kind, RF_PAGE_STATE_ABSENT);
 	UT_ASSERT_EQ(entries[1].before_kind, RF_PAGE_STATE_UNFORMATTED);
@@ -359,6 +394,7 @@ UT_TEST(test_wal_flush_failure_precedes_any_data_or_zero_fill)
 	fail_flush = expecting_error = true;
 	if (setjmp(error_jump) == 0) {
 		_bt_blwritepage(&state, source.data, 3);
+		finish_build();
 		UT_ASSERT(false);
 	}
 	expecting_error = false;
@@ -374,6 +410,7 @@ UT_TEST(test_native_checksum_is_applied_to_final_version_and_lsn)
 	reset(true);
 	checksums = true;
 	_bt_blwritepage(&state, source.data, 0);
+	finish_build();
 	expected = image;
 	PageSetLSN(expected.data, 101);
 	PageSetChecksumInplace(expected.data, 0);
@@ -381,10 +418,70 @@ UT_TEST(test_native_checksum_is_applied_to_final_version_and_lsn)
 	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 201);
 }
 
+UT_TEST(test_adjacent_pages_do_not_flush_or_write_one_at_a_time)
+{
+	reset(true);
+	for (unsigned i = 0; i < 3; i++) {
+		pending[i] = source;
+		_bt_blwritepage(&state, pending[i].data, i);
+	}
+	UT_ASSERT_EQ(wal_count, 3);
+	UT_ASSERT_EQ(flush_count, 0);
+	UT_ASSERT_EQ(writes + free_count, 0);
+	finish_build();
+	UT_ASSERT_EQ(flush_count, 1);
+	UT_ASSERT_EQ(writes, 3);
+	UT_ASSERT_EQ(free_count, 3);
+	UT_ASSERT_EQ(sync_count, 1);
+}
+
+UT_TEST(test_full_batch_and_final_partial_batch_preserve_each_page)
+{
+	reset(true);
+	checksums = true;
+	for (unsigned i = 0; i < 40; i++) {
+		pending[i] = source;
+		_bt_blwritepage(&state, pending[i].data, i);
+	}
+	UT_ASSERT_EQ(flush_count, 1);
+	UT_ASSERT_EQ(writes, 32);
+	UT_ASSERT_EQ(free_count, 32);
+	UT_ASSERT_EQ(state.pending_count, 8);
+	finish_build();
+	UT_ASSERT_EQ(flush_count, 2);
+	UT_ASSERT_EQ(writes, 40);
+	UT_ASSERT_EQ(free_count, 40);
+	UT_ASSERT_EQ(sync_count, 1);
+	for (unsigned i = 0; i < 40; i++) {
+		UT_ASSERT_EQ(PageGetLSN(pages[i].data), 101 + i);
+		UT_ASSERT_EQ(((PageHeader)pages[i].data)->pd_block_scn, 201 + i);
+		UT_ASSERT_EQ(((PageHeader)pages[i].data)->pd_checksum,
+					 pg_checksum_page(pages[i].data, i));
+	}
+}
+
+UT_TEST(test_revisiting_queued_page_cannot_overwrite_it_as_absent)
+{
+	reset(true);
+	pending[0] = source;
+	_bt_blwritepage(&state, pending[0].data, 0);
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		_bt_blwritepage(&state, source.data, 0);
+		UT_ASSERT(false);
+	}
+	expecting_error = false;
+	UT_ASSERT_EQ(wal_count, 1);
+	UT_ASSERT_EQ(writes, 1);
+	UT_ASSERT_EQ(free_count, 1);
+	UT_ASSERT_EQ(reads, 1);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 201);
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(10);
 	UT_RUN(test_new_btree_page_is_versioned_before_data_write);
 	UT_RUN(test_out_of_order_build_has_exact_zero_predecessor);
 	UT_RUN(test_nonshared_keeps_native_build_wal);
@@ -392,6 +489,9 @@ main(void)
 	UT_RUN(test_invalid_identity_allocates_no_version_or_data);
 	UT_RUN(test_wal_flush_failure_precedes_any_data_or_zero_fill);
 	UT_RUN(test_native_checksum_is_applied_to_final_version_and_lsn);
+	UT_RUN(test_adjacent_pages_do_not_flush_or_write_one_at_a_time);
+	UT_RUN(test_full_batch_and_final_partial_batch_preserve_each_page);
+	UT_RUN(test_revisiting_queued_page_cannot_overwrite_it_as_absent);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
