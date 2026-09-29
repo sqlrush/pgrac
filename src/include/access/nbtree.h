@@ -1231,9 +1231,17 @@ extern bool _bt_doinsert(Relation rel, IndexTuple itup,
 						 IndexUniqueCheck checkUnique, bool indexUnchanged,
 						 Relation heapRel);
 extern void _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf,
-							 BTStack stack);
+							 BTStack stack
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 extern Buffer _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack,
-							  BlockNumber child);
+							  BlockNumber child
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 
 /*
  * prototypes for functions in nbtsplitloc.c
@@ -1250,7 +1258,11 @@ extern void _bt_initmetapage(Page page, BlockNumber rootbknum, uint32 level,
 extern bool _bt_vacuum_needs_cleanup(Relation rel);
 extern void _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages);
 extern void _bt_upgrademetapage(Page page);
-extern Buffer _bt_getroot(Relation rel, Relation heaprel, int access);
+extern Buffer _bt_getroot(Relation rel, Relation heaprel, int access
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 extern Buffer _bt_gettrueroot(Relation rel);
 extern int	_bt_getrootheight(Relation rel);
 extern void _bt_metaversion(Relation rel, bool *heapkeyspace,
@@ -1284,8 +1296,11 @@ extern void _bt_delitems_delete_check(Relation rel, Buffer buf,
 /* PGRAC: identity loading may read storage; capture only reads locked bytes. */
 extern void _bt_get_version_identity(Relation rel, ClusterSpaceIdentity *identity);
 extern bool _bt_prepare_page_version(Relation rel, Buffer buf,
-									 const ClusterSpaceIdentity *identity,
-									 RfPageProducerBatchV1 *batch);
+									const ClusterSpaceIdentity *identity,
+									RfPageProducerBatchV1 *batch);
+extern bool _bt_prepare_page_versions(Relation rel, const ClusterSpaceIdentity *identity,
+									 const Buffer *buffers, const uint8 *block_ids,
+									 uint8 count, Buffer newbuf, RfPageProducerBatchV1 *batch);
 #endif
 extern void _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate);
 extern void _bt_pendingfsm_init(Relation rel, BTVacState *vstate,
@@ -1296,10 +1311,18 @@ extern void _bt_pendingfsm_finalize(Relation rel, BTVacState *vstate);
  * prototypes for functions in nbtsearch.c
  */
 extern BTStack _bt_search(Relation rel, Relation heaprel, BTScanInsert key,
-						  Buffer *bufP, int access, Snapshot snapshot);
+						  Buffer *bufP, int access, Snapshot snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 extern Buffer _bt_moveright(Relation rel, Relation heaprel, BTScanInsert key,
 							Buffer buf, bool forupdate, BTStack stack,
-							int access, Snapshot snapshot);
+							int access, Snapshot snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 extern OffsetNumber _bt_binsrch_insert(Relation rel, BTInsertState insertstate);
 extern int32 _bt_compare(Relation rel, BTScanInsert key, Page page, OffsetNumber offnum);
 extern bool _bt_first(IndexScanDesc scan, ScanDirection dir);

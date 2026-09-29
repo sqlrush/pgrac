@@ -427,6 +427,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap
 SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
+TESTS += test_cluster_btree_structure_version
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1269,6 +1270,68 @@ test_cluster_page_install: test_cluster_page_install.c unit_test.h \
 
 CLUSTER_PAGE_PRODUCER_O = cluster_page_producer_test.o
 
+# PGRAC: execute native allocation and structural mutation bodies.
+test_cluster_btree_structure_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
+	awk '/^_bt_(upgrademetapage|pageinit|get_version_identity)\(/ { print "void"; emit=1; found++ } \
+	     /^_bt_prepare_page_versions?\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_alloc.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
+	awk '/^_bt_allocbuf\(/ { print "Buffer"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_root.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
+	awk '/^_bt_getmeta\(/ { print "static BTMetaPageData *"; emit=1; found++ } \
+	     /^_bt_getroot\(/ { print "Buffer"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_delete.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
+	awk '/^_bt_(mark_page_halfdead|unlink_halfdead_page)\(/ { print "static bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_add.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^#define BTREE_FASTPATH_MIN_LEVEL/ { print } \
+	     /^_bt_pgaddtup\(/ { print "static inline bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_split.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_split\(/ { inside=1; found++ } \
+	     inside && /^{/ { emit=1 } emit { print } /^}/ { inside=emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_newlevel.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_newlevel\(/ { inside=1; found++ } \
+	     inside && /^{/ { emit=1 } emit { print } /^}/ { inside=emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_insert.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_insertonpg\(/ { inside=1; found++ } \
+	     inside && /^{/ { emit=1 } emit { print } /^}/ { inside=emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_structure_version: test_cluster_btree_structure_version.c unit_test.h \
+		test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
+		test_cluster_btree_structure_root.inc \
+		test_cluster_btree_structure_delete.inc \
+		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
+		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
+		test_cluster_space_storage_product.o test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_inplace_itemptr_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 # PGRAC: execute native btree maintenance bodies, not a second policy model.
 test_cluster_btree_leaf_meta.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
 	awk '/^_bt_set_cleanup_info\(/ { inside=1; found++ } \
@@ -1296,9 +1359,9 @@ test_cluster_btree_leaf_dedup.inc: $(top_srcdir)/src/backend/access/nbtree/nbtde
 
 test_cluster_btree_leaf_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
 	awk '/^_bt_(upgrademetapage|get_version_identity)\(/ { print "void"; emit=1; found++ } \
-	     /^_bt_prepare_page_version\(/ { print "bool"; emit=1; found++ } \
+	     /^_bt_prepare_page_versions?\(/ { print "bool"; emit=1; found++ } \
 	     /^_bt_delitems_update\(/ { print "static char *"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_btree_leaf_dedup_helpers.inc: $(top_srcdir)/src/backend/access/nbtree/nbtdedup.c Makefile
@@ -3383,6 +3446,11 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_heap_lock_vm_needed.inc
+	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
+		test_cluster_btree_structure_root.inc \
+		test_cluster_btree_structure_delete.inc \
+		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
+		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc
 	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
 	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc

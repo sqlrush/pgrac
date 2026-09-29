@@ -98,7 +98,11 @@ _bt_drop_lock_and_maybe_pin(IndexScanDesc scan, BTScanPos sp)
  */
 BTStack
 _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
-		   int access, Snapshot snapshot)
+		   int access, Snapshot snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	BTStack		stack_in = NULL;
 	int			page_access = BT_READ;
@@ -108,7 +112,11 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 	Assert(access == BT_READ || heaprel != NULL);
 
 	/* Get the root page to start with */
-	*bufP = _bt_getroot(rel, heaprel, access);
+	*bufP = _bt_getroot(rel, heaprel, access
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 
 	/* If index is empty and access = BT_READ, no root page is created. */
 	if (!BufferIsValid(*bufP))
@@ -138,7 +146,11 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 		 * opportunity to finish splits of internal pages too.
 		 */
 		*bufP = _bt_moveright(rel, heaprel, key, *bufP, (access == BT_WRITE),
-							  stack_in, page_access, snapshot);
+							  stack_in, page_access, snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 
 		/* if this is a leaf page, we're done */
 		page = BufferGetPage(*bufP);
@@ -199,7 +211,11 @@ _bt_search(Relation rel, Relation heaprel, BTScanInsert key, Buffer *bufP,
 		 * move right to its new sibling.  Do that.
 		 */
 		*bufP = _bt_moveright(rel, heaprel, key, *bufP, true, stack_in, BT_WRITE,
-							  snapshot);
+							  snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 	}
 
 	return stack_in;
@@ -248,7 +264,11 @@ _bt_moveright(Relation rel,
 			  bool forupdate,
 			  BTStack stack,
 			  int access,
-			  Snapshot snapshot)
+			  Snapshot snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	Page		page;
 	BTPageOpaque opaque;
@@ -299,7 +319,11 @@ _bt_moveright(Relation rel,
 			}
 
 			if (P_INCOMPLETE_SPLIT(opaque))
-				_bt_finish_split(rel, heaprel, buf, stack);
+				_bt_finish_split(rel, heaprel, buf, stack
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 			else
 				_bt_relbuf(rel, buf);
 
@@ -1374,7 +1398,11 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 	 * Use the manufactured insertion scan key to descend the tree and
 	 * position ourselves on the target leaf page.
 	 */
-	stack = _bt_search(rel, NULL, &inskey, &buf, BT_READ, scan->xs_snapshot);
+	stack = _bt_search(rel, NULL, &inskey, &buf, BT_READ, scan->xs_snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, NULL
+#endif
+			);
 
 	/* don't need to keep the stack around... */
 	_bt_freestack(stack);
@@ -1394,7 +1422,11 @@ _bt_first(IndexScanDesc scan, ScanDirection dir)
 		{
 			PredicateLockRelation(rel, scan->xs_snapshot);
 			stack = _bt_search(rel, NULL, &inskey, &buf, BT_READ,
-							   scan->xs_snapshot);
+							   scan->xs_snapshot
+#ifdef USE_PGRAC_CLUSTER
+							, NULL
+#endif
+			);
 			_bt_freestack(stack);
 		}
 
@@ -2343,7 +2375,11 @@ _bt_get_endpoint(Relation rel, uint32 level, bool rightmost,
 	 * smarter about intermediate levels.)
 	 */
 	if (level == 0)
-		buf = _bt_getroot(rel, NULL, BT_READ);
+		buf = _bt_getroot(rel, NULL, BT_READ
+#ifdef USE_PGRAC_CLUSTER
+							, NULL
+#endif
+			);
 	else
 		buf = _bt_gettrueroot(rel);
 

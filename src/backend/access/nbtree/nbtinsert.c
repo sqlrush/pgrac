@@ -43,6 +43,7 @@
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f reverse-key */
 #include "cluster/cluster_tx_enqueue.h" /* remote SnapshotDirty xmax wait */
 #include "cluster/cluster_xnode_profile.h" /* PGRAC: spec-5.59 D4 probe */
+#include "cluster/storage/cluster_smgr.h" /* PGRAC: shared page classification */
 #endif
 
 /* Minimum tree height for application of fastpath optimization */
@@ -77,14 +78,30 @@ static void _bt_insertonpg(Relation rel, Relation heaprel, BTScanInsert itup_key
 						   Size itemsz,
 						   OffsetNumber newitemoff,
 						   int postingoff,
-						   bool split_only_page);
+						   bool split_only_page
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 static Buffer _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key,
 						Buffer buf, Buffer cbuf, OffsetNumber newitemoff,
 						Size newitemsz, IndexTuple newitem, IndexTuple orignewitem,
-						IndexTuple nposting, uint16 postingoff);
+						IndexTuple nposting, uint16 postingoff
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 static void _bt_insert_parent(Relation rel, Relation heaprel, Buffer buf,
-							  Buffer rbuf, BTStack stack, bool isroot, bool isonly);
-static Buffer _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf);
+							  Buffer rbuf, BTStack stack, bool isroot, bool isonly
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
+static Buffer _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 static inline bool _bt_pgaddtup(Page page, Size itemsize, IndexTuple itup,
 								OffsetNumber itup_off, bool newfirstdataitem);
 static void _bt_delete_or_dedup_one_page(Relation rel, Relation heapRel,
@@ -397,7 +414,11 @@ search:
 									   indexUnchanged, stack, heapRel);
 		_bt_insertonpg(rel, heapRel, itup_key, insertstate.buf, InvalidBuffer,
 					   stack, itup, insertstate.itemsz, newitemoff,
-					   insertstate.postingoff, false);
+					   insertstate.postingoff, false
+#ifdef USE_PGRAC_CLUSTER
+							, &insertstate.version_identity
+#endif
+			);
 	}
 	else
 	{
@@ -516,7 +537,11 @@ _bt_search_insert(Relation rel, Relation heaprel, BTInsertState insertstate)
 
 	/* Cannot use optimization -- descend tree, return proper descent stack */
 	return _bt_search(rel, heaprel, insertstate->itup_key, &insertstate->buf,
-					  BT_WRITE, NULL);
+					  BT_WRITE, NULL
+#ifdef USE_PGRAC_CLUSTER
+							, &insertstate->version_identity
+#endif
+			);
 }
 
 /*
@@ -1260,7 +1285,11 @@ _bt_stepright(Relation rel, Relation heaprel, BTInsertState insertstate,
 		 */
 		if (P_INCOMPLETE_SPLIT(opaque))
 		{
-			_bt_finish_split(rel, heaprel, rbuf, stack);
+			_bt_finish_split(rel, heaprel, rbuf, stack
+#ifdef USE_PGRAC_CLUSTER
+							, &insertstate->version_identity
+#endif
+			);
 			rbuf = InvalidBuffer;
 			continue;
 		}
@@ -1320,7 +1349,11 @@ _bt_insertonpg(Relation rel,
 			   Size itemsz,
 			   OffsetNumber newitemoff,
 			   int postingoff,
-			   bool split_only_page)
+			   bool split_only_page
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	Page		page;
 	BTPageOpaque opaque;
@@ -1430,7 +1463,11 @@ _bt_insertonpg(Relation rel,
 
 		/* split the buffer into left and right halves */
 		rbuf = _bt_split(rel, heaprel, itup_key, buf, cbuf, newitemoff, itemsz,
-						 itup, origitup, nposting, postingoff);
+						 itup, origitup, nposting, postingoff
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 		PredicateLockPageSplit(rel,
 							   BufferGetBlockNumber(buf),
 							   BufferGetBlockNumber(rbuf));
@@ -1453,7 +1490,11 @@ _bt_insertonpg(Relation rel,
 		 * page.
 		 *----------
 		 */
-		_bt_insert_parent(rel, heaprel, buf, rbuf, stack, isroot, isonly);
+		_bt_insert_parent(rel, heaprel, buf, rbuf, stack, isroot, isonly
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 	}
 	else
 	{
@@ -1461,6 +1502,13 @@ _bt_insertonpg(Relation rel,
 		Page		metapg = NULL;
 		BTMetaPageData *metad = NULL;
 		BlockNumber blockcache;
+#ifdef USE_PGRAC_CLUSTER
+		RfPageProducerBatchV1 version_batch;
+		Buffer		version_buffers[3] = {buf};
+		uint8		version_ids[3] = {0};
+		uint8		version_count = 1;
+		bool		versioned;
+#endif
 
 		/*
 		 * If we are doing this insert because we split a page that was the
@@ -1486,8 +1534,27 @@ _bt_insertonpg(Relation rel,
 			}
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		if (!isleaf)
+		{
+			version_buffers[version_count] = cbuf;
+			version_ids[version_count++] = 1;
+		}
+		if (BufferIsValid(metabuf))
+		{
+			version_buffers[version_count] = metabuf;
+			version_ids[version_count++] = 2;
+		}
+		versioned = _bt_prepare_page_versions(rel, identity, version_buffers,
+												 version_ids, version_count,
+												 InvalidBuffer, &version_batch);
+#endif
 		/* Do the update.  No ereport(ERROR) until changes are logged */
 		START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+			elog(PANIC, "PGRAC btree insertion predecessor changed");
+#endif
 
 		if (postingoff != 0)
 			memcpy(oposting, nposting, MAXALIGN(IndexTupleSize(nposting)));
@@ -1601,6 +1668,10 @@ _bt_insertonpg(Relation rel,
 									IndexTupleSize(origitup));
 			}
 
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+				elog(PANIC, "PGRAC btree insertion version publication failed");
+#endif
 			recptr = XLogInsert(RM_BTREE_ID, xlinfo);
 
 			if (BufferIsValid(metabuf))
@@ -1681,7 +1752,11 @@ _bt_insertonpg(Relation rel,
 static Buffer
 _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 		  Buffer cbuf, OffsetNumber newitemoff, Size newitemsz, IndexTuple newitem,
-		  IndexTuple orignewitem, IndexTuple nposting, uint16 postingoff)
+		  IndexTuple orignewitem, IndexTuple nposting, uint16 postingoff
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	Buffer		rbuf;
 	Page		origpage;
@@ -1709,6 +1784,15 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	bool		newitemonleft,
 				isleaf,
 				isrightmost;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	Buffer		version_buffers[4];
+	uint8		version_ids[4] = {0, 1};
+	uint8		version_count = 2;
+	bool		versioned;
+	bool		private_right = cluster_shared_config && RelationIsPermanent(rel)
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+#endif
 
 	/*
 	 * origpage is the original page to be split.  leftpage is a temporary
@@ -1934,8 +2018,16 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	 */
 	rbuf = _bt_allocbuf(rel, heaprel);
 	rightpage = BufferGetPage(rbuf);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: leave the allocated predecessor intact until the native split. */
+	if (private_right)
+	{
+		rightpage = palloc0(BLCKSZ);
+		_bt_pageinit(rightpage, BLCKSZ);
+	}
+#endif
 	rightpagenumber = BufferGetBlockNumber(rbuf);
-	/* rightpage was initialized by _bt_getbuf */
+	/* rightpage is now initialized, privately for shared page versions */
 	ropaque = BTPageGetOpaque(rightpage);
 
 	/*
@@ -2136,6 +2228,23 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 			ropaque->btpo_flags |= BTP_SPLIT_END;
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	version_buffers[0] = buf;
+	version_buffers[1] = rbuf;
+	if (!isrightmost)
+	{
+		version_buffers[version_count] = sbuf;
+		version_ids[version_count++] = 2;
+	}
+	if (!isleaf)
+	{
+		version_buffers[version_count] = cbuf;
+		version_ids[version_count++] = 3;
+	}
+	versioned = _bt_prepare_page_versions(rel, identity, version_buffers,
+											 version_ids, version_count, rbuf,
+											 &version_batch);
+#endif
 	/*
 	 * Right sibling is locked, new siblings are prepared, but original page
 	 * is not updated yet.
@@ -2153,6 +2262,18 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 	 * original.  We need to do this before writing the WAL record, so that
 	 * XLogInsert can WAL log an image of the page if necessary.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned)
+	{
+		if (!rf_page_producer_stamp_v1(&version_batch))
+			elog(PANIC, "PGRAC btree split predecessor changed");
+		((PageHeader) leftpage)->pd_block_scn = version_batch.result_token;
+		((PageHeader) rightpage)->pd_block_scn = version_batch.result_token;
+		PageRestoreTempPage(rightpage, BufferGetPage(rbuf));
+		rightpage = BufferGetPage(rbuf);
+		ropaque = BTPageGetOpaque(rightpage);
+	}
+#endif
 	PageRestoreTempPage(leftpage, origpage);
 	/* leftpage, lopaque must not be used below here */
 
@@ -2266,6 +2387,10 @@ _bt_split(Relation rel, Relation heaprel, BTScanInsert itup_key, Buffer buf,
 							((PageHeader) rightpage)->pd_special - ((PageHeader) rightpage)->pd_upper);
 
 		xlinfo = newitemonleft ? XLOG_BTREE_SPLIT_L : XLOG_BTREE_SPLIT_R;
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree split version publication failed");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
 
 		PageSetLSN(origpage, recptr);
@@ -2317,7 +2442,11 @@ _bt_insert_parent(Relation rel,
 				  Buffer rbuf,
 				  BTStack stack,
 				  bool isroot,
-				  bool isonly)
+				  bool isonly
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	Assert(heaprel != NULL);
 
@@ -2341,7 +2470,11 @@ _bt_insert_parent(Relation rel,
 		Assert(stack == NULL);
 		Assert(isonly);
 		/* create a new root node one level up and update the metapage */
-		rootbuf = _bt_newlevel(rel, heaprel, buf, rbuf);
+		rootbuf = _bt_newlevel(rel, heaprel, buf, rbuf
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 		/* release the split buffers */
 		_bt_relbuf(rel, rootbuf);
 		_bt_relbuf(rel, rbuf);
@@ -2406,7 +2539,11 @@ _bt_insert_parent(Relation rel,
 		 * new downlink will be inserted at the correct offset. Even buf's
 		 * parent may have changed.
 		 */
-		pbuf = _bt_getstackbuf(rel, heaprel, stack, bknum);
+		pbuf = _bt_getstackbuf(rel, heaprel, stack, bknum
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 
 		/*
 		 * Unlock the right child.  The left child will be unlocked in
@@ -2432,7 +2569,11 @@ _bt_insert_parent(Relation rel,
 		/* Recursively insert into the parent */
 		_bt_insertonpg(rel, heaprel, NULL, pbuf, buf, stack->bts_parent,
 					   new_item, MAXALIGN(IndexTupleSize(new_item)),
-					   stack->bts_offset + 1, 0, isonly);
+					   stack->bts_offset + 1, 0, isonly
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 
 		/* be tidy */
 		pfree(new_item);
@@ -2453,7 +2594,11 @@ _bt_insert_parent(Relation rel,
  * allocating a new page if and when the parent page splits in turn.
  */
 void
-_bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack)
+_bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	Page		lpage = BufferGetPage(lbuf);
 	BTPageOpaque lpageop = BTPageGetOpaque(lpage);
@@ -2496,7 +2641,11 @@ _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack)
 	elog(DEBUG1, "finishing incomplete split of %u/%u",
 		 BufferGetBlockNumber(lbuf), BufferGetBlockNumber(rbuf));
 
-	_bt_insert_parent(rel, heaprel, lbuf, rbuf, stack, wasroot, wasonly);
+	_bt_insert_parent(rel, heaprel, lbuf, rbuf, stack, wasroot, wasonly
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 }
 
 /*
@@ -2531,7 +2680,11 @@ _bt_finish_split(Relation rel, Relation heaprel, Buffer lbuf, BTStack stack)
  *		offset number bts_offset + 1.
  */
 Buffer
-_bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack, BlockNumber child)
+_bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack, BlockNumber child
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	BlockNumber blkno;
 	OffsetNumber start;
@@ -2552,7 +2705,11 @@ _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack, BlockNumber child
 		Assert(heaprel != NULL);
 		if (P_INCOMPLETE_SPLIT(opaque))
 		{
-			_bt_finish_split(rel, heaprel, buf, stack->bts_parent);
+			_bt_finish_split(rel, heaprel, buf, stack->bts_parent
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 			continue;
 		}
 
@@ -2656,7 +2813,11 @@ _bt_getstackbuf(Relation rel, Relation heaprel, BTStack stack, BlockNumber child
  *		lbuf, rbuf & rootbuf.
  */
 static Buffer
-_bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
+_bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	Buffer		rootbuf;
 	Page		lpage,
@@ -2675,6 +2836,10 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
 	Buffer		metabuf;
 	Page		metapg;
 	BTMetaPageData *metad;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned;
+#endif
 
 	lbkno = BufferGetBlockNumber(lbuf);
 	rbkno = BufferGetBlockNumber(rbuf);
@@ -2712,8 +2877,27 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
 	right_item = CopyIndexTuple(item);
 	BTreeTupleSetDownLink(right_item, rbkno);
 
+#ifdef USE_PGRAC_CLUSTER
+	{
+		const Buffer buffers[3] = {rootbuf, lbuf, metabuf};
+		const uint8 ids[3] = {0, 1, 2};
+
+		versioned = _bt_prepare_page_versions(rel, identity, buffers, ids, 3,
+												 rootbuf, &version_batch);
+	}
+#endif
+
 	/* NO EREPORT(ERROR) from here till newroot op is logged */
 	START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned)
+	{
+		if (!rf_page_producer_stamp_v1(&version_batch))
+			elog(PANIC, "PGRAC btree new root predecessor changed");
+		_bt_pageinit(rootpage, BufferGetPageSize(rootbuf));
+		((PageHeader) rootpage)->pd_block_scn = version_batch.result_token;
+	}
+#endif
 
 	/* upgrade metapage if needed */
 	if (metad->btm_version < BTREE_NOVAC_VERSION)
@@ -2805,6 +2989,10 @@ _bt_newlevel(Relation rel, Relation heaprel, Buffer lbuf, Buffer rbuf)
 							((PageHeader) rootpage)->pd_special -
 							((PageHeader) rootpage)->pd_upper);
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree new root version publication failed");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT);
 
 		PageSetLSN(lpage, recptr);

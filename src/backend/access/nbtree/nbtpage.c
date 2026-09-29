@@ -57,7 +57,11 @@ static char *_bt_delitems_update(BTVacuumPosting *updatable, int nupdatable,
 								 OffsetNumber *updatedoffsets,
 								 Size *updatedbuflen, bool needswal);
 static bool _bt_mark_page_halfdead(Relation rel, Relation heaprel,
-								   Buffer leafbuf, BTStack stack);
+								   Buffer leafbuf, BTStack stack
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 static bool _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf,
 									 BlockNumber scanblkno,
 									 bool *rightsib_empty,
@@ -66,7 +70,11 @@ static bool _bt_lock_subtree_parent(Relation rel, Relation heaprel,
 									BlockNumber child, BTStack stack,
 									Buffer *subtreeparent, OffsetNumber *poffset,
 									BlockNumber *topparent,
-									BlockNumber *topparentrightsib);
+									BlockNumber *topparentrightsib
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	);
 static void _bt_pendingfsm_add(BTVacState *vstate, BlockNumber target,
 							   FullTransactionId safexid);
 
@@ -253,13 +261,44 @@ _bt_prepare_page_version(Relation rel, Buffer buf,
 {
 	const uint8 block_id = 0;
 
+	return _bt_prepare_page_versions(rel, identity, &buf, &block_id, 1,
+									InvalidBuffer, batch);
+}
+
+/* All buffers are pinned and write-locked; this performs no identity I/O. */
+bool
+_bt_prepare_page_versions(Relation rel, const ClusterSpaceIdentity *identity,
+						  const Buffer *buffers, const uint8 *block_ids,
+						  uint8 count, Buffer newbuf, RfPageProducerBatchV1 *batch)
+{
+	RfPageProducerComponentV1 components[4];
+	uint8		i;
+
 	if (!cluster_shared_config || !RelationIsPermanent(rel)
 		|| cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) != 1)
 		return false;
 	if (!RelationNeedsWAL(rel) || identity == NULL
 		|| !RelFileLocatorEquals(identity->key.locator, rel->rd_locator)
-		|| !cluster_space_prepare_buffer_versions(identity, &buf, &block_id, 1, batch))
+		|| count == 0 || count > lengthof(components))
 		elog(ERROR, "PGRAC shared btree mutation requires exact SPACE page version");
+	for (i = 0; i < count; i++)
+	{
+		if (!cluster_space_buffer_version_component(identity, buffers[i], block_ids[i],
+													i, &components[i]))
+			elog(ERROR, "PGRAC shared btree component requires exact SPACE identity");
+		if (buffers[i] == newbuf && PageIsNew(components[i].page))
+		{
+			Size		offset;
+
+			/* PageIsNew alone also accepts a torn, nonzero predecessor. */
+			for (offset = 0; offset < BLCKSZ; offset++)
+				if (components[i].page[offset] != 0)
+					elog(ERROR, "PGRAC shared btree new page is not all zero");
+			components[i].before_kind = RF_PAGE_STATE_UNFORMATTED;
+		}
+	}
+	if (!rf_page_producer_prepare_v1(components, count, batch))
+		elog(ERROR, "PGRAC shared btree mutation requires exact predecessor versions");
 	return true;
 }
 #endif
@@ -403,7 +442,11 @@ _bt_set_cleanup_info(Relation rel, BlockNumber num_delpages)
  *		The metadata page is not locked or pinned on exit.
  */
 Buffer
-_bt_getroot(Relation rel, Relation heaprel, int access)
+_bt_getroot(Relation rel, Relation heaprel, int access
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	Buffer		metabuf;
 	Buffer		rootbuf;
@@ -468,6 +511,10 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 	if (metad->btm_root == P_NONE)
 	{
 		Page		metapg;
+#ifdef USE_PGRAC_CLUSTER
+		RfPageProducerBatchV1 version_batch;
+		bool		versioned;
+#endif
 
 		/* If access = BT_READ, caller doesn't want us to create root yet */
 		if (access == BT_READ)
@@ -494,7 +541,11 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 			 * to optimize this case.)
 			 */
 			_bt_relbuf(rel, metabuf);
-			return _bt_getroot(rel, heaprel, access);
+			return _bt_getroot(rel, heaprel, access
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 		}
 
 		/*
@@ -505,16 +556,35 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 		rootbuf = _bt_allocbuf(rel, heaprel);
 		rootblkno = BufferGetBlockNumber(rootbuf);
 		rootpage = BufferGetPage(rootbuf);
+		/* Get raw page pointer for metapage */
+		metapg = BufferGetPage(metabuf);
+
+#ifdef USE_PGRAC_CLUSTER
+		{
+			const Buffer buffers[2] = {rootbuf, metabuf};
+			const uint8 ids[2] = {0, 2};
+
+			versioned = _bt_prepare_page_versions(rel, identity, buffers, ids, 2,
+													 rootbuf, &version_batch);
+		}
+#endif
+
+		/* NO ELOG(ERROR) till meta is updated */
+		START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned)
+		{
+			if (!rf_page_producer_stamp_v1(&version_batch))
+				elog(PANIC, "PGRAC btree first root predecessor changed");
+			_bt_pageinit(rootpage, BufferGetPageSize(rootbuf));
+			((PageHeader) rootpage)->pd_block_scn = version_batch.result_token;
+		}
+#endif
 		rootopaque = BTPageGetOpaque(rootpage);
 		rootopaque->btpo_prev = rootopaque->btpo_next = P_NONE;
 		rootopaque->btpo_flags = (BTP_LEAF | BTP_ROOT);
 		rootopaque->btpo_level = 0;
 		rootopaque->btpo_cycleid = 0;
-		/* Get raw page pointer for metapage */
-		metapg = BufferGetPage(metabuf);
-
-		/* NO ELOG(ERROR) till meta is updated */
-		START_CRIT_SECTION();
 
 		/* upgrade metapage if needed */
 		if (metad->btm_version < BTREE_NOVAC_VERSION)
@@ -557,6 +627,10 @@ _bt_getroot(Relation rel, Relation heaprel, int access)
 
 			XLogRegisterData((char *) &xlrec, SizeOfBtreeNewroot);
 
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+				elog(PANIC, "PGRAC btree first root version publication failed");
+#endif
 			recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_NEWROOT);
 
 			PageSetLSN(rootpage, recptr);
@@ -933,6 +1007,10 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 	Buffer		buf;
 	BlockNumber blkno;
 	Page		page;
+#ifdef USE_PGRAC_CLUSTER
+	bool		defer_init = cluster_shared_config && RelationIsPermanent(rel)
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+#endif
 
 	Assert(heaprel != NULL);
 
@@ -980,6 +1058,10 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 			if (PageIsNew(page))
 			{
 				/* Okay to use page.  Initialize and return it. */
+#ifdef USE_PGRAC_CLUSTER
+				/* PGRAC: final native opcode captures the untouched predecessor. */
+				if (!defer_init)
+#endif
 				_bt_pageinit(page, BufferGetPageSize(buf));
 				return buf;
 			}
@@ -1016,6 +1098,9 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 				}
 
 				/* Okay to use page.  Re-initialize and return it. */
+#ifdef USE_PGRAC_CLUSTER
+				if (!defer_init)
+#endif
 				_bt_pageinit(page, BufferGetPageSize(buf));
 				return buf;
 			}
@@ -1044,6 +1129,9 @@ _bt_allocbuf(Relation rel, Relation heaprel)
 	/* Initialize the new page before returning it */
 	page = BufferGetPage(buf);
 	Assert(PageIsNew(page));
+#ifdef USE_PGRAC_CLUSTER
+	if (!defer_init)
+#endif
 	_bt_pageinit(page, BufferGetPageSize(buf));
 
 	return buf;
@@ -2066,7 +2154,11 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 				/* find the leftmost leaf page with matching pivot/high key */
 				itup_key->pivotsearch = true;
 				stack = _bt_search(rel, NULL, itup_key, &sleafbuf, BT_READ,
-								   NULL);
+								   NULL
+#ifdef USE_PGRAC_CLUSTER
+							, NULL
+#endif
+			);
 				/* won't need a second lock or pin on leafbuf */
 				_bt_relbuf(rel, sleafbuf);
 
@@ -2098,7 +2190,11 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
 			 */
 			Assert(P_ISLEAF(opaque) && !P_IGNORE(opaque));
 			if (!_bt_mark_page_halfdead(rel, vstate->info->heaprel, leafbuf,
-										stack))
+										stack
+#ifdef USE_PGRAC_CLUSTER
+							, &vstate->version_identity
+#endif
+			))
 			{
 				_bt_relbuf(rel, leafbuf);
 				return;
@@ -2185,7 +2281,11 @@ _bt_pagedel(Relation rel, Buffer leafbuf, BTVacState *vstate)
  */
 static bool
 _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
-					   BTStack stack)
+					   BTStack stack
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	BlockNumber leafblkno;
 	BlockNumber leafrightsib;
@@ -2199,6 +2299,10 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	OffsetNumber nextoffset;
 	IndexTuple	itup;
 	IndexTupleData trunctuple;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned;
+#endif
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2247,7 +2351,11 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	topparentrightsib = leafrightsib;
 	if (!_bt_lock_subtree_parent(rel, heaprel, leafblkno, stack,
 								 &subtreeparent, &poffset,
-								 &topparent, &topparentrightsib))
+								 &topparent, &topparentrightsib
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			))
 		return false;
 
 	page = BufferGetPage(subtreeparent);
@@ -2296,8 +2404,21 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 	 */
 	PredicateLockPageCombine(rel, leafblkno, leafrightsib);
 
+#ifdef USE_PGRAC_CLUSTER
+	{
+		const Buffer buffers[2] = {leafbuf, subtreeparent};
+		const uint8 ids[2] = {0, 1};
+
+		versioned = _bt_prepare_page_versions(rel, identity, buffers, ids, 2,
+											 InvalidBuffer, &version_batch);
+	}
+#endif
 	/* No ereport(ERROR) until changes are logged */
 	START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC btree half-dead predecessor changed");
+#endif
 
 	/*
 	 * Update parent of subtree.  We want to delete the downlink to the top
@@ -2370,6 +2491,10 @@ _bt_mark_page_halfdead(Relation rel, Relation heaprel, Buffer leafbuf,
 
 		XLogRegisterData((char *) &xlrec, SizeOfBtreeMarkPageHalfDead);
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree half-dead version publication failed");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, XLOG_BTREE_MARK_PAGE_HALFDEAD);
 
 		page = BufferGetPage(subtreeparent);
@@ -2434,6 +2559,10 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	uint32		targetlevel;
 	IndexTuple	leafhikey;
 	BlockNumber leaftopparent;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 version_batch;
+	bool		versioned;
+#endif
 
 	page = BufferGetPage(leafbuf);
 	opaque = BTPageGetOpaque(page);
@@ -2690,8 +2819,42 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 	 * Here we begin doing the deletion.
 	 */
 
+#ifdef USE_PGRAC_CLUSTER
+	{
+		Buffer		buffers[4] = {buf};
+		uint8		ids[4] = {0};
+		uint8		count = 1;
+
+		/* A fast-root update is possible only without a left sibling. */
+		Assert(!BufferIsValid(lbuf) || !BufferIsValid(metabuf));
+		if (BufferIsValid(lbuf))
+		{
+			buffers[count] = lbuf;
+			ids[count++] = 1;
+		}
+		buffers[count] = rbuf;
+		ids[count++] = 2;
+		if (target != leafblkno)
+		{
+			buffers[count] = leafbuf;
+			ids[count++] = 3;
+		}
+		if (BufferIsValid(metabuf))
+		{
+			buffers[count] = metabuf;
+			ids[count++] = 4;
+		}
+		versioned = _bt_prepare_page_versions(rel, &vstate->version_identity,
+											 buffers, ids, count, InvalidBuffer,
+											 &version_batch);
+	}
+#endif
 	/* No ereport(ERROR) until changes are logged */
 	START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+		elog(PANIC, "PGRAC btree unlink predecessor changed");
+#endif
 
 	/*
 	 * Update siblings' side-links.  Note the target page's side-links will
@@ -2814,6 +2977,10 @@ _bt_unlink_halfdead_page(Relation rel, Buffer leafbuf, BlockNumber scanblkno,
 		else
 			xlinfo = XLOG_BTREE_UNLINK_PAGE;
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned && !rf_page_producer_register_wal_v1(&version_batch))
+			elog(PANIC, "PGRAC btree unlink version publication failed");
+#endif
 		recptr = XLogInsert(RM_BTREE_ID, xlinfo);
 
 		if (BufferIsValid(metabuf))
@@ -2912,7 +3079,11 @@ static bool
 _bt_lock_subtree_parent(Relation rel, Relation heaprel, BlockNumber child,
 						BTStack stack, Buffer *subtreeparent,
 						OffsetNumber *poffset, BlockNumber *topparent,
-						BlockNumber *topparentrightsib)
+						BlockNumber *topparentrightsib
+#ifdef USE_PGRAC_CLUSTER
+							, const ClusterSpaceIdentity *identity
+#endif
+	)
 {
 	BlockNumber parent,
 				leftsibparent;
@@ -2926,7 +3097,11 @@ _bt_lock_subtree_parent(Relation rel, Relation heaprel, BlockNumber child,
 	 * Locate the pivot tuple whose downlink points to "child".  Write lock
 	 * the parent page itself.
 	 */
-	pbuf = _bt_getstackbuf(rel, heaprel, stack, child);
+	pbuf = _bt_getstackbuf(rel, heaprel, stack, child
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 	if (pbuf == InvalidBuffer)
 	{
 		/*
@@ -3033,7 +3208,11 @@ _bt_lock_subtree_parent(Relation rel, Relation heaprel, BlockNumber child,
 	/* Recurse to examine child page's grandparent page */
 	return _bt_lock_subtree_parent(rel, heaprel, parent, stack->bts_parent,
 								   subtreeparent, poffset,
-								   topparent, topparentrightsib);
+								   topparent, topparentrightsib
+#ifdef USE_PGRAC_CLUSTER
+							, identity
+#endif
+			);
 }
 
 /*
