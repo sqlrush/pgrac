@@ -71,23 +71,81 @@
 #include "utils/syscache.h"
 
 #ifdef USE_PGRAC_CLUSTER
-/* PGRAC: shared catalog does not implement global concurrent-index phases.
+/* PGRAC: shared mode supports only builtin btree and no concurrent builds.
  * Author: SqlRush <sqlrush@gmail.com> */
 #include "cluster/cluster_guc.h"
 
+static void
+CheckClusterIndexAccessMethodName(const char *name)
+{
+	if (name != NULL && strcmp(name, DEFAULT_INDEX_TYPE) != 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared mode supports only btree indexes"),
+				 errdetail("Index access method \"%s\" is not supported in shared mode.", name)));
+}
+
 void
-CheckClusterIndexConcurrency(Node *statement)
+CheckClusterIndexAccessMethod(Oid accessMethodId)
+{
+	if ((cluster_shared_config || cluster_shared_catalog) && accessMethodId != BTREE_AM_OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared mode supports only btree indexes"),
+				 errdetail("Index access method OID %u is not the built-in btree method.", accessMethodId)));
+}
+
+void
+CheckClusterIndexSupport(Node *statement)
 {
 	bool concurrently = false;
+	ListCell *lc;
 
-	if (!cluster_shared_config && !cluster_shared_catalog)
+	if (statement == NULL || (!cluster_shared_config && !cluster_shared_catalog))
 		return;
+	check_stack_depth();
 	if (IsA(statement, IndexStmt))
+	{
+		CheckClusterIndexAccessMethodName(((IndexStmt *) statement)->accessMethod);
 		concurrently = ((IndexStmt *) statement)->concurrent;
+	}
+	else if (IsA(statement, Constraint))
+	{
+		Constraint *constraint = (Constraint *) statement;
+
+		if (constraint->contype == CONSTR_EXCLUSION
+			|| constraint->contype == CONSTR_PRIMARY
+			|| constraint->contype == CONSTR_UNIQUE)
+			CheckClusterIndexAccessMethodName(constraint->access_method);
+	}
+	else if (IsA(statement, ColumnDef))
+	{
+		foreach(lc, ((ColumnDef *) statement)->constraints)
+			CheckClusterIndexSupport((Node *) lfirst(lc));
+	}
+	else if (IsA(statement, CreateStmt))
+	{
+		CreateStmt *create = (CreateStmt *) statement;
+
+		foreach(lc, create->tableElts)
+			CheckClusterIndexSupport((Node *) lfirst(lc));
+		foreach(lc, create->constraints)
+			CheckClusterIndexSupport((Node *) lfirst(lc));
+	}
+	else if (IsA(statement, AlterTableStmt))
+	{
+		foreach(lc, ((AlterTableStmt *) statement)->cmds)
+			CheckClusterIndexSupport((Node *) lfirst(lc));
+	}
+	else if (IsA(statement, AlterTableCmd))
+		CheckClusterIndexSupport(((AlterTableCmd *) statement)->def);
+	else if (IsA(statement, CreateSchemaStmt))
+	{
+		foreach(lc, ((CreateSchemaStmt *) statement)->schemaElts)
+			CheckClusterIndexSupport((Node *) lfirst(lc));
+	}
 	else if (IsA(statement, ReindexStmt))
 	{
-		ListCell *lc;
-
 		foreach(lc, ((ReindexStmt *) statement)->params)
 		{
 			DefElem *opt = (DefElem *) lfirst(lc);
@@ -615,7 +673,7 @@ DefineIndex(Oid relationId,
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: also cover callers outside ProcessUtility, before any mutation. */
-	CheckClusterIndexConcurrency((Node *) stmt);
+	CheckClusterIndexSupport((Node *) stmt);
 #endif
 	root_save_nestlevel = NewGUCNestLevel();
 
@@ -885,6 +943,10 @@ DefineIndex(Oid relationId,
 	}
 	accessMethodForm = (Form_pg_am) GETSTRUCT(tuple);
 	accessMethodId = accessMethodForm->oid;
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the name check is not a substitute for the resolved AM identity. */
+	CheckClusterIndexAccessMethod(accessMethodId);
+#endif
 	amRoutine = GetIndexAmRoutine(accessMethodForm->amhandler);
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_ACCESS_METHOD_OID,
@@ -2757,7 +2819,7 @@ ExecReindex(ParseState *pstate, ReindexStmt *stmt, bool isTopLevel)
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: reject before native phase commits, locks or catalog writes. */
-	CheckClusterIndexConcurrency((Node *) stmt);
+	CheckClusterIndexSupport((Node *) stmt);
 #endif
 	if (concurrently)
 		PreventInTransactionBlock(isTopLevel,

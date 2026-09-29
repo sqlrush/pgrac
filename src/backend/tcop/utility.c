@@ -606,9 +606,9 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 	parsetree = pstmt->utilityStmt;
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: reject unsupported shared index phases before event triggers.
+	/* PGRAC: reject unsupported index AMs/constraints before event triggers.
 	 * Author: SqlRush <sqlrush@gmail.com> */
-	CheckClusterIndexConcurrency(parsetree);
+	CheckClusterIndexSupport(parsetree);
 #endif
 
 	/* Prohibit read/write commands in read-only states. */

@@ -455,7 +455,8 @@ test_cluster_fresh_boolean.inc: $(top_srcdir)/src/backend/commands/define.c Make
 	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 test_cluster_fresh_index.inc: $(top_srcdir)/src/backend/commands/indexcmds.c Makefile
-	awk '/^CheckClusterIndexConcurrency\(/ { print "void"; emit=1 } \
+	awk '/^CheckClusterIndexAccessMethodName\(/ { print "static void"; emit=1 } \
+	     /^CheckClusterIndex(AccessMethod|Support)\(/ { print "void"; emit=1 } \
 	     /^DefineIndex\(/ { print "ObjectAddress"; emit=1; create=1; count++ } \
 	     /^ExecReindex\(/ { print "void"; emit=1; reindex=1; count++ } \
 	     create && /root_save_nestlevel = NewGUCNestLevel/ { print "return InvalidObjectAddress; }"; emit=0; create=0 } \
@@ -468,9 +469,15 @@ test_cluster_fresh_utility.inc: $(top_srcdir)/src/backend/tcop/utility.c Makefil
 	     /readonly_flags = ClassifyUtilityCommandAsReadOnly/ { emit=0 } \
 	     emit { print } /^}/ { inside=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
+test_cluster_fresh_catalog_index.inc: $(top_srcdir)/src/backend/catalog/index.c Makefile
+	awk '/^index_create\(/ { print "Oid"; emit=1; count++ } \
+	     emit && /\/\* constraint flags can only be set/ { print "return InvalidOid; }"; emit=0 } \
+	     emit { print } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_fresh_scope: test_cluster_fresh_scope.c unit_test.h \
 		test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc
+		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_catalog_index.inc
 	$(CC) $(CFLAGS) -Wno-unused-variable -Wno-unused-but-set-variable $(CPPFLAGS) $< \
 		$(CLUSTER_UNIT_PORT_LIBS) $(LDFLAGS) -o $@
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
@@ -3088,7 +3095,8 @@ check_r11_source_removal_census:
 clean distclean maintainer-clean:
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
-		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc
+		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
+		test_cluster_fresh_catalog_index.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
 		test_cluster_vm_version.inc test_cluster_vm_redo_consumers.inc test_cluster_heap_update_temp_version.inc \
 		test_cluster_heap_update_version.inc test_cluster_heap_update_log.inc \

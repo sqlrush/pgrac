@@ -56,6 +56,11 @@
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "commands/event_trigger.h"
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: check the actual AM before allocating shared index storage/catalogs.
+ * Author: SqlRush <sqlrush@gmail.com> */
+#include "commands/defrem.h"
+#endif
 #include "commands/progress.h"
 #include "commands/tablecmds.h"
 #include "commands/tablespace.h"
@@ -749,6 +754,10 @@ index_create(Relation heapRelation,
 	TransactionId relfrozenxid;
 	MultiXactId relminmxid;
 	bool		create_storage = !RelFileNumberIsValid(relFileNumber);
+
+#ifdef USE_PGRAC_CLUSTER
+	CheckClusterIndexAccessMethod(accessMethodObjectId);
+#endif
 
 	/* constraint flags can only be set when a constraint is requested */
 	Assert((constr_flags == 0) ||
@@ -3657,6 +3666,11 @@ reindex_index(Oid indexId, bool skip_constraint_checks, char persistence,
 		table_close(heapRelation, NoLock);
 		return;
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: refuse unsupported old/internal AMs before replacing storage. */
+	CheckClusterIndexAccessMethod(iRel->rd_rel->relam);
+#endif
 
 	if (progress)
 		pgstat_progress_update_param(PROGRESS_CREATEIDX_ACCESS_METHOD_OID,

@@ -75,6 +75,9 @@ pfree(void *p)
 	free(p);
 }
 void
+check_stack_depth(void)
+{}
+void
 ExceptionalCondition(const char *c, const char *f, int line)
 {
 	fprintf(stderr, "%s %s:%d\n", c, f, line);
@@ -203,6 +206,7 @@ defGetString(DefElem *def)
 #include "test_cluster_fresh_startup.inc"
 #include "test_cluster_fresh_boolean.inc"
 #include "test_cluster_fresh_index.inc"
+#include "test_cluster_fresh_catalog_index.inc"
 
 static void
 sql_entry(Node *node)
@@ -421,10 +425,170 @@ UT_TEST(test_reindex_kinds_and_false_option)
 				}
 }
 
+static void
+one_element(List *list, ListCell *cell, void *value)
+{
+	memset(list, 0, sizeof(*list));
+	list->type = T_List;
+	list->length = list->max_length = 1;
+	list->elements = cell;
+	cell->ptr_value = value;
+}
+
+UT_TEST(test_shared_index_access_methods_refuse_before_utility_or_define)
+{
+	char *methods[] = { NULL, "btree", "hash", "gin", "gist", "spgist", "brin", "rtree", "custom" };
+	IndexStmt stmt = { 0 };
+	int caught;
+
+	stmt.type = T_IndexStmt;
+	for (int mode = 0; mode < 3; mode++)
+		for (unsigned am = 0; am < lengthof(methods); am++)
+			for (int entry = 0; entry < 2; entry++) {
+				cluster_shared_config = mode == 1;
+				cluster_shared_catalog = mode == 2;
+				stmt.accessMethod = methods[am];
+				reset_error();
+				caught = sigsetjmp(boundary, 1);
+				if (!caught) {
+					if (entry == 0)
+						sql_entry((Node *)&stmt);
+					else
+						DefineIndex(1, &stmt, 0, 0, 0, -1, false, false, false, false, false);
+				}
+				UT_ASSERT_EQ(caught, mode != 0 && am >= 2);
+				if (caught) {
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+					UT_ASSERT(strstr(error_message, "btree") != NULL);
+				}
+			}
+}
+
+UT_TEST(test_nonbtree_constraints_rejected_before_create_or_alter_table)
+{
+	Constraint constraint = { 0 };
+	ColumnDef column = { 0 };
+	CreateStmt create = { 0 };
+	AlterTableStmt alter = { 0 };
+	AlterTableCmd command = { 0 };
+	List constraints, tableelts, commands;
+	ListCell constraint_cell, table_cell, command_cell;
+	char *methods[] = { NULL, "btree", "hash", "gin", "gist", "spgist", "brin" };
+	int caught;
+
+	constraint.type = T_Constraint;
+	column.type = T_ColumnDef;
+	create.type = T_CreateStmt;
+	alter.type = T_AlterTableStmt;
+	command.type = T_AlterTableCmd;
+	one_element(&constraints, &constraint_cell, &constraint);
+	one_element(&commands, &command_cell, &command);
+	column.constraints = &constraints;
+	alter.cmds = &commands;
+	for (int mode = 0; mode < 3; mode++)
+		for (unsigned am = 0; am < lengthof(methods); am++)
+			for (int shape = 0; shape < 5; shape++) {
+				Node *stmt;
+
+				cluster_shared_config = mode == 1;
+				cluster_shared_catalog = mode == 2;
+				constraint.contype = CONSTR_EXCLUSION;
+				constraint.access_method = methods[am];
+				create.constraints = NIL;
+				create.tableElts = NIL;
+				if (shape <= 2) {
+					one_element(&tableelts, &table_cell,
+								shape == 0 ? (void *)&column : (void *)&constraint);
+					if (shape == 2)
+						create.constraints = &constraints;
+					else
+						create.tableElts = &tableelts;
+					stmt = (Node *)&create;
+				} else {
+					command.subtype = shape == 3 ? AT_AddConstraint : AT_AddColumn;
+					command.def = shape == 3 ? (Node *)&constraint : (Node *)&column;
+					stmt = (Node *)&alter;
+				}
+				reset_error();
+				caught = sigsetjmp(boundary, 1);
+				if (!caught)
+					sql_entry(stmt);
+				UT_ASSERT_EQ(caught, mode != 0 && am >= 2);
+				if (caught)
+					UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+			}
+}
+
+UT_TEST(test_schema_checks_nested_index_before_namespace_creation)
+{
+	CreateSchemaStmt schema = { 0 };
+	IndexStmt index = { 0 };
+	List children;
+	ListCell child;
+	int caught;
+
+	schema.type = T_CreateSchemaStmt;
+	index.type = T_IndexStmt;
+	index.accessMethod = "gin";
+	one_element(&children, &child, &index);
+	schema.schemaElts = &children;
+	cluster_shared_config = true;
+	cluster_shared_catalog = false;
+	reset_error();
+	caught = sigsetjmp(boundary, 1);
+	if (!caught)
+		sql_entry((Node *)&schema);
+	UT_ASSERT_EQ(caught, 1);
+	UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+}
+
+UT_TEST(test_native_index_create_requires_builtin_btree_oid)
+{
+	Oid methods[] = { BTREE_AM_OID,	 HASH_AM_OID, GIN_AM_OID, GIST_AM_OID,
+					  SPGIST_AM_OID, BRIN_AM_OID, 99999,	  InvalidOid };
+	RelationData relation = { 0 };
+	int caught;
+
+	for (int mode = 0; mode < 3; mode++)
+		for (unsigned am = 0; am < lengthof(methods); am++) {
+			cluster_shared_config = mode == 1;
+			cluster_shared_catalog = mode == 2;
+			reset_error();
+			caught = sigsetjmp(boundary, 1);
+			if (!caught)
+				index_create(&relation, "test", 0, 0, 0, 0, NULL, NIL, methods[am], 0, NULL, NULL,
+							 NULL, 0, 0, 0, false, false, NULL);
+			UT_ASSERT_EQ(caught, mode != 0 && am != 0);
+			if (caught)
+				UT_ASSERT_EQ(error_code, ERRCODE_FEATURE_NOT_SUPPORTED);
+		}
+}
+
+UT_TEST(test_primary_unique_and_nonindex_constraints_keep_native_admission)
+{
+	Constraint constraint = { 0 };
+	ConstrType kinds[] = { CONSTR_PRIMARY, CONSTR_UNIQUE,  CONSTR_EXCLUSION,
+						   CONSTR_CHECK,   CONSTR_DEFAULT, CONSTR_FOREIGN };
+	int caught;
+
+	constraint.type = T_Constraint;
+	cluster_shared_config = true;
+	cluster_shared_catalog = false;
+	for (unsigned i = 0; i < lengthof(kinds); i++) {
+		constraint.contype = kinds[i];
+		constraint.access_method = i < 3 ? "btree" : "ignored_nonindex_field";
+		reset_error();
+		caught = sigsetjmp(boundary, 1);
+		if (!caught)
+			sql_entry((Node *)&constraint);
+		UT_ASSERT_EQ(caught, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(7);
+	UT_PLAN(12);
 	UT_RUN(test_pre1_startup_refuses_before_root_and_without_writes);
 	UT_RUN(test_selected_pre1_image_and_corruption_are_distinct);
 	UT_RUN(test_nonshared_startup_remains_native);
@@ -432,6 +596,11 @@ main(void)
 	UT_RUN(test_bound_startup_does_not_consult_compatibility_projection);
 	UT_RUN(test_create_concurrently_refuses_before_native_mutation);
 	UT_RUN(test_reindex_kinds_and_false_option);
+	UT_RUN(test_shared_index_access_methods_refuse_before_utility_or_define);
+	UT_RUN(test_nonbtree_constraints_rejected_before_create_or_alter_table);
+	UT_RUN(test_schema_checks_nested_index_before_namespace_creation);
+	UT_RUN(test_native_index_create_requires_builtin_btree_oid);
+	UT_RUN(test_primary_unique_and_nonindex_constraints_keep_native_admission);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
