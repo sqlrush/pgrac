@@ -39,6 +39,7 @@
 #include "catalog/storage_xlog.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_ko.h" /* PGRAC: spec-5.7 D6 object-reuse flush barrier */
+#include "cluster/cluster_space_storage.h"
 #endif
 #include "miscadmin.h"
 #include "storage/freespace.h"
@@ -187,6 +188,16 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 		Assert(backend == InvalidBackendId);
 		AddPendingSync(&rlocator);
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: the native abort-delete owner is registered before any SPACE
+	 * creation, unless the caller owns whole-directory cleanup (CREATE
+	 * DATABASE). Temporary/unlogged relations keep their native contract. */
+	if (needs_wal && !cluster_space_relation_create(rlocator))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not create exact SPACE identity for relation %u", rlocator.relNumber)));
+#endif
 
 	return srel;
 }
@@ -1024,6 +1035,17 @@ smgr_redo(XLogReaderState *record)
 {
 	XLogRecPtr	lsn = record->EndRecPtr;
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: this typed owner validates namespace, payload and exact page
+	 * transition; ordinary block/FPI or numerical-LSN replay cannot handle it. */
+	if (info == XLOG_SMGR_SPACE_IDENTITY)
+	{
+		if (!cluster_space_relation_redo(record))
+			elog(PANIC, "smgr_redo: exact SPACE identity replay refused");
+		return;
+	}
+#endif
 
 	/* Backup blocks are not used in smgr records */
 	Assert(!XLogRecHasAnyBlockRefs(record));

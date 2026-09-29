@@ -73,5 +73,35 @@ cluster_space_identity_transition(const ClusterSpaceIdentity *current,
 								  const ClusterSpaceIdentity *expected,
 								  const ClusterSpaceIdentity *result);
 
+/* Main-data payload of the typed SMGR lifecycle record, not a disk struct.
+ * Decode validates representation; the original recovery owner must still
+ * bind the namespace, isolation and WAL record before installing anything. */
+#define CLUSTER_SPACE_WAL_BYTES 288
+#define CLUSTER_SPACE_WAL_MAGIC UINT32_C(0x31575350)
+typedef enum ClusterSpaceWalAction {
+	CLUSTER_SPACE_WAL_CREATE = 1,
+	CLUSTER_SPACE_WAL_TRUNCATE = 2,
+	CLUSTER_SPACE_WAL_TOMBSTONE = 3
+} ClusterSpaceWalAction;
+
+typedef struct ClusterSpaceWalChange {
+	ClusterSpaceWalAction action;
+	BlockNumber nblocks;
+	uint64 before_token;
+	uint64 result_token;
+	ClusterSpaceIdentity expected;
+	ClusterSpaceIdentity result;
+} ClusterSpaceWalChange;
+
+extern bool cluster_space_wal_encode(const ClusterSpaceWalChange *change, void *bytes,
+									 size_t length);
+extern bool cluster_space_wal_decode(const void *bytes, size_t length, ClusterSpaceWalChange *out);
+/* Byte transition only; no locks, I/O, WAL insertion, or implicit authority.
+ * Refusal and ALREADY leave the entire page unchanged. APPLY creates bytes
+ * whose LSN/origin the real WAL owner must stamp before making them visible. */
+extern ClusterSpaceIdentityTransition
+cluster_space_wal_apply(const ClusterSpaceWalChange *change,
+						const ClusterSpaceIdentityKey *expected_key, void *page, size_t length);
+
 #endif /* USE_PGRAC_CLUSTER */
 #endif /* CLUSTER_SPACE_IDENTITY_H */

@@ -29,6 +29,10 @@
 /* XLOG gives us high 4 bits */
 #define XLOG_SMGR_CREATE	0x10
 #define XLOG_SMGR_TRUNCATE	0x20
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: typed SPACE lifecycle payload; never an ordinary block/FPI record. */
+#define XLOG_SMGR_SPACE_IDENTITY 0x30
+#endif
 
 typedef struct xl_smgr_create
 {

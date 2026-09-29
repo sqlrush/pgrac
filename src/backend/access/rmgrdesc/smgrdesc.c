@@ -15,6 +15,9 @@
 #include "postgres.h"
 
 #include "catalog/storage_xlog.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_space_identity.h"
+#endif
 
 
 void
@@ -23,6 +26,22 @@ smgr_desc(StringInfo buf, XLogReaderState *record)
 	char	   *rec = XLogRecGetData(record);
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: describe the typed payload only after exact structural decode. */
+	if (info == XLOG_SMGR_SPACE_IDENTITY)
+	{
+		ClusterSpaceWalChange change;
+
+		if (cluster_space_wal_decode(rec, XLogRecGetDataLen(record), &change))
+			appendStringInfo(buf, "%u/%u/%u space action %u sequence " UINT64_FORMAT,
+				change.result.key.locator.spcOid, change.result.key.locator.dbOid,
+				change.result.key.locator.relNumber, (unsigned)change.action,
+				change.result.sequence);
+		else
+			appendStringInfoString(buf, "invalid SPACE identity");
+		return;
+	}
+#endif
 	if (info == XLOG_SMGR_CREATE)
 	{
 		xl_smgr_create *xlrec = (xl_smgr_create *) rec;
@@ -49,6 +68,11 @@ smgr_identify(uint8 info)
 
 	switch (info & ~XLR_INFO_MASK)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		case XLOG_SMGR_SPACE_IDENTITY:
+			id = "SPACE_IDENTITY";
+			break;
+#endif
 		case XLOG_SMGR_CREATE:
 			id = "CREATE";
 			break;

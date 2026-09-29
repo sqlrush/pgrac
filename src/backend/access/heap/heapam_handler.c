@@ -980,6 +980,11 @@ heapam_relation_copy_data(Relation rel, const RelFileLocator *newrlocator)
 	for (ForkNumber forkNum = MAIN_FORKNUM + 1;
 		 forkNum <= MAX_FORKNUM; forkNum++)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: creation owns the destination's new persistent identity. */
+		if (forkNum == SPACE_FORKNUM)
+			continue;
+#endif
 		if (smgrexists(RelationGetSmgr(rel), forkNum))
 		{
 			smgrcreate(dstrel, forkNum, false);

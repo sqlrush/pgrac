@@ -65,6 +65,7 @@ OBJS = \
 	cluster_page_version.o \
 	cluster_page_rmgr.o \
 	cluster_page_producer.o \
+	cluster_space_storage.o \
 	cluster_page_anchor_cache.o \
 	cluster_page_detached.o \
 	cluster_page_guard.o \

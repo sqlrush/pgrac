@@ -165,6 +165,7 @@
 #include "cluster/cluster_scn.h" /* PGRAC: spec-4.5a G6 checkpoint SCN seed */
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_space_identity.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -3267,6 +3268,21 @@ cluster_record_apply_class(XLogReaderState *r)
 	bool		has_block = XLogRecHasAnyBlockRefs(r);
 	bool		first_shared = false;
 	bool		same_routing = true;
+
+	/* PGRAC: typed SPACE lifecycle records never carry ordinary block refs.
+	 * Validate their complete shape before the generic block-ref route, so
+	 * malformed foreign WAL cannot bypass its typed owner or look ignorable. */
+	if (XLogRecGetRmid(r) == RM_SMGR_ID &&
+		(XLogRecGetInfo(r) & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY)
+	{
+		ClusterSpaceWalChange change;
+
+		if (has_block ||
+			!cluster_space_wal_decode(XLogRecGetData(r), XLogRecGetDataLen(r), &change))
+			return CLUSTER_RECMERGE_UNCLASSIFIABLE;
+		first_shared = (cluster_smgr_which_for(change.result.key.locator, InvalidBackendId) == 1);
+		return cluster_recovery_record_class(RM_SMGR_ID, false, first_shared, true);
+	}
 
 	if (has_block)
 	{

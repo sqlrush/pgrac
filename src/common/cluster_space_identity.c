@@ -273,4 +273,116 @@ cluster_space_identity_transition(const ClusterSpaceIdentity *current,
 		return CLUSTER_SPACE_IDENTITY_APPLY;
 	return CLUSTER_SPACE_IDENTITY_MISMATCH;
 }
+
+static bool
+identity_empty(const ClusterSpaceIdentity *identity)
+{
+	return identity->key.system_identifier == 0 && identity->key.database_incarnation == 0
+		   && all_zero(identity->key.storage_uuid, 16) && identity->key.locator.spcOid == 0
+		   && identity->key.locator.dbOid == 0 && identity->key.locator.relNumber == 0
+		   && all_zero(identity->incarnation, 16) && identity->sequence == 0
+		   && identity->operation == 0 && identity->state == 0;
+}
+
+static bool
+wal_change_valid(const ClusterSpaceWalChange *change)
+{
+	if (change == NULL || change->result_token == 0 || change->result_token == change->before_token
+		|| !identity_valid(&change->result))
+		return false;
+	if (change->action == CLUSTER_SPACE_WAL_CREATE)
+		return change->before_token == 0 && identity_empty(&change->expected)
+			   && change->nblocks == InvalidBlockNumber && change->result.sequence == 1
+			   && change->result.state == CLUSTER_SPACE_IDENTITY_LIVE;
+	if (change->before_token == 0
+		|| cluster_space_identity_transition(&change->expected, &change->expected, &change->result)
+			   != CLUSTER_SPACE_IDENTITY_APPLY)
+		return false;
+	if (change->action == CLUSTER_SPACE_WAL_TRUNCATE)
+		return change->result.state == CLUSTER_SPACE_IDENTITY_LIVE
+			   && change->nblocks != InvalidBlockNumber;
+	if (change->action == CLUSTER_SPACE_WAL_TOMBSTONE)
+		return change->result.state == CLUSTER_SPACE_IDENTITY_TOMBSTONED
+			   && change->nblocks == InvalidBlockNumber;
+	return false;
+}
+
+bool
+cluster_space_wal_encode(const ClusterSpaceWalChange *change, void *bytes, size_t length)
+{
+	uint8 encoded[CLUSTER_SPACE_WAL_BYTES];
+
+	if (bytes == NULL || length != sizeof(encoded) || !wal_change_valid(change))
+		return false;
+	memset(encoded, 0, sizeof(encoded));
+	put_le(encoded, CLUSTER_SPACE_WAL_MAGIC, 4);
+	put_le(encoded + 4, 1, 2);
+	put_le(encoded + 6, sizeof(encoded), 2);
+	put_le(encoded + 8, change->action, 4);
+	put_le(encoded + 12, change->nblocks, 4);
+	put_le(encoded + 16, change->before_token, 8);
+	put_le(encoded + 24, change->result_token, 8);
+	if (change->action != CLUSTER_SPACE_WAL_CREATE
+		&& !cluster_space_identity_encode(&change->expected, encoded + 32, 128))
+		return false;
+	if (!cluster_space_identity_encode(&change->result, encoded + 160, 128))
+		return false;
+	memcpy(bytes, encoded, sizeof(encoded));
+	return true;
+}
+
+bool
+cluster_space_wal_decode(const void *bytes, size_t length, ClusterSpaceWalChange *out)
+{
+	const uint8 *encoded = bytes;
+	ClusterSpaceWalChange decoded;
+
+	if (bytes == NULL || out == NULL || length != CLUSTER_SPACE_WAL_BYTES
+		|| get_le(encoded, 4) != CLUSTER_SPACE_WAL_MAGIC || get_le(encoded + 4, 2) != 1
+		|| get_le(encoded + 6, 2) != CLUSTER_SPACE_WAL_BYTES)
+		return false;
+	memset(&decoded, 0, sizeof(decoded));
+	decoded.action = (ClusterSpaceWalAction)get_le(encoded + 8, 4);
+	decoded.nblocks = (BlockNumber)get_le(encoded + 12, 4);
+	decoded.before_token = get_le(encoded + 16, 8);
+	decoded.result_token = get_le(encoded + 24, 8);
+	if (decoded.action == CLUSTER_SPACE_WAL_CREATE) {
+		if (!all_zero(encoded + 32, 128))
+			return false;
+	} else if (!decode_payload(encoded + 32, 128, &decoded.expected))
+		return false;
+	if (!decode_payload(encoded + 160, 128, &decoded.result) || !wal_change_valid(&decoded))
+		return false;
+	*out = decoded;
+	return true;
+}
+
+ClusterSpaceIdentityTransition
+cluster_space_wal_apply(const ClusterSpaceWalChange *change,
+						const ClusterSpaceIdentityKey *expected_key, void *page, size_t length)
+{
+	ClusterSpaceIdentity current;
+	uint64 current_token;
+
+	if (page == NULL || length != BLCKSZ || !key_valid(expected_key) || !wal_change_valid(change))
+		return CLUSTER_SPACE_IDENTITY_INVALID;
+	if (!key_equal(expected_key, &change->result.key))
+		return CLUSTER_SPACE_IDENTITY_MISMATCH;
+	if (all_zero(page, BLCKSZ)) {
+		if (change->action != CLUSTER_SPACE_WAL_CREATE)
+			return CLUSTER_SPACE_IDENTITY_MISMATCH;
+	} else {
+		if (!decode_page(page, BLCKSZ, &current, &current_token))
+			return CLUSTER_SPACE_IDENTITY_INVALID;
+		if (identity_equal(&current, &change->result) && current_token == change->result_token)
+			return CLUSTER_SPACE_IDENTITY_ALREADY;
+		if (change->action == CLUSTER_SPACE_WAL_CREATE
+			|| !identity_equal(&current, &change->expected)
+			|| current_token != change->before_token)
+			return CLUSTER_SPACE_IDENTITY_MISMATCH;
+	}
+	if (!cluster_space_identity_page_encode(&change->result, change->result_token, page, length))
+		return CLUSTER_SPACE_IDENTITY_INVALID;
+	return CLUSTER_SPACE_IDENTITY_APPLY;
+}
 #endif /* USE_PGRAC_CLUSTER */

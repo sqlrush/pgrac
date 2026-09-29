@@ -10143,6 +10143,11 @@ CreateAndCopyRelationData(RelFileLocator src_rlocator,
 	for (ForkNumber forkNum = MAIN_FORKNUM + 1;
 		 forkNum <= MAX_FORKNUM; forkNum++)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: creation owns the destination's new persistent identity. */
+		if (forkNum == SPACE_FORKNUM)
+			continue;
+#endif
 		if (smgrexists(smgropen(src_rlocator, InvalidBackendId), forkNum))
 		{
 			smgrcreate(smgropen(dst_rlocator, InvalidBackendId), forkNum, false);
