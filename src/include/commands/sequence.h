@@ -42,6 +42,13 @@ typedef FormData_pg_sequence_data *Form_pg_sequence_data;
 #define SEQ_COL_FIRSTCOL		SEQ_COL_LASTVAL
 #define SEQ_COL_LASTCOL			SEQ_COL_CALLED
 
+/* PGRAC: shared with the detached redo codec; native on-page layout unchanged. */
+#define SEQ_MAGIC 0x1717
+typedef struct sequence_magic
+{
+	uint32		magic;
+} sequence_magic;
+
 /* XLOG stuff */
 #define XLOG_SEQ_LOG			0x00
 

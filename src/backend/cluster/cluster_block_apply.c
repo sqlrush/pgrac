@@ -12,9 +12,9 @@
  *	  records, by rmgr into a per-rmgr handler.  The D3b apply matrix covers
  *	  RM_GENERIC_ID (cluster ITL-touch, applyPageRedo mirror, here) and
  *	  RM_HEAP_ID (insert/delete/update, cluster_block_apply_heap.c); record
- *	  types off the matrix fail closed (UNSUPPORTED).  Each matrix entry has
- *	  passed the byte-for-byte differential against PG real redo (t/256)
- *	  before joining -- never a silent wrong-block install (8.A / R11).
+ *	  types off the matrix fail closed (UNSUPPORTED). The native sequence
+ *	  boundary codec also has a C byte-for-byte differential using actual
+ *	  producer data and seq_redo; it does not authorize a recovery install.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
@@ -37,11 +37,13 @@
 #ifdef USE_PGRAC_CLUSTER
 
 #include "access/rmgr.h"
+#include "access/htup_details.h"
 #include "access/xlogreader.h"
 #include "access/xlogrecord.h"
 #include "storage/bufpage.h"
 #include "storage/off.h"
 #include "cluster/cluster_block_apply.h"
+#include "commands/sequence.h"
 
 /*
  * cluster_block_apply_fpi -- restore a full-page image onto a detached page.
@@ -148,17 +150,68 @@ cluster_block_apply_generic(XLogReaderState *record, uint8 block_id, char *page)
 }
 
 /*
- * cluster_block_apply_delta -- dispatch a no-image (delta) record to its
- *		per-rmgr single-block applicator.
- *
- *	Only record types whose single-block apply has passed the byte-for-byte
- *	differential against PG real redo (t/256) are on the matrix; everything
- *	else fails closed (UNSUPPORTED) -- never a silent wrong-block install
- *	(8.A / R11).  Notably RM_HEAP2_ID (multi-insert / prune / freeze / visible)
- *	DOES mutate heap-block bytes but is deliberately off the matrix: it falls
- *	through to UNSUPPORTED here, so such a block fails closed (unrecoverable)
- *	rather than risking a wrong-block install.
+ * PGRAC: SEQ/LOG contains the entire allocated boundary tuple, not an FPI.
+ * Mirror seq_redo into private memory, checking the decoded native shape
+ * before touching output. The caller still owns identity/dependency proof;
+ * successful byte construction alone never grants recovery authority.
  */
+static ClusterBlkApplyResult
+cluster_block_apply_sequence(XLogReaderState *record, uint8 block_id, char *page)
+{
+	PGAlignedBlock scratch;
+	xl_seq_rec xlrec;
+	HeapTupleHeaderData tuple;
+	const DecodedBkpBlock *block = XLogRecGetBlock(record, block_id);
+	const char *data = XLogRecGetData(record);
+	const char *item;
+	Size length = XLogRecGetDataLen(record);
+	Size itemsz;
+	Size data_size = offsetof(FormData_pg_sequence_data, is_called) + sizeof(bool);
+
+	if ((XLogRecGetInfo(record) & ~XLR_INFO_MASK) != XLOG_SEQ_LOG)
+		return CLUSTER_BLKAPPLY_UNSUPPORTED;
+	if (block_id != 0 || block->forknum != MAIN_FORKNUM || block->blkno != 0
+		|| (block->flags & BKPBLOCK_WILL_INIT) == 0 || data == NULL
+		|| length < sizeof(xlrec) + SizeofHeapTupleHeader)
+		return CLUSTER_BLKAPPLY_FAILED;
+	memcpy(&xlrec, data, sizeof(xlrec));
+	if (!RelFileLocatorEquals(block->rlocator, xlrec.locator))
+		return CLUSTER_BLKAPPLY_FAILED;
+	item = data + sizeof(xlrec);
+	itemsz = length - sizeof(xlrec);
+	memset(&tuple, 0, sizeof(tuple));
+	memcpy(&tuple, item, SizeofHeapTupleHeader);
+	if (tuple.t_hoff != MAXALIGN(SizeofHeapTupleHeader)
+		|| HeapTupleHeaderGetNatts(&tuple) != SEQ_COL_LASTCOL
+		|| (tuple.t_infomask & (HEAP_HASNULL | HEAP_HASVARWIDTH | HEAP_HASEXTERNAL)) != 0
+		|| itemsz < tuple.t_hoff + data_size
+		|| itemsz > tuple.t_hoff + sizeof(FormData_pg_sequence_data)
+		|| (uint8)item[tuple.t_hoff + offsetof(FormData_pg_sequence_data, is_called)] > 1)
+		return CLUSTER_BLKAPPLY_FAILED;
+	if (record->record->has_page_version_edge) {
+		const RfPageVersionEdgeV1 *versions = &record->record->page_version_edge;
+		const RfPageVersionEdgeEntryV1 *edge = &versions->entries[0];
+
+		if (versions->entry_count != 1 || versions->result_token == 0
+			|| versions->result_token != xlrec.write_scn || edge->block_id != 0
+			|| edge->page_class != RF_PAGE_CLASS_ORDINARY
+			|| edge->result_kind != RF_PAGE_STATE_PRESENT)
+			return CLUSTER_BLKAPPLY_FAILED;
+	}
+
+	PageInit(scratch.data, BLCKSZ, sizeof(sequence_magic));
+	((sequence_magic *)PageGetSpecialPointer(scratch.data))->magic = SEQ_MAGIC;
+	if (PageAddItem(scratch.data, (Item)item, itemsz, FirstOffsetNumber, false, false)
+		!= FirstOffsetNumber)
+		return CLUSTER_BLKAPPLY_FAILED;
+	((PageHeader)scratch.data)->pd_block_scn = (SCN)xlrec.write_scn;
+	PageSetLSN(scratch.data, record->EndRecPtr);
+	memcpy(page, scratch.data, BLCKSZ);
+	return CLUSTER_BLKAPPLY_OK;
+}
+
+/* Only verified detached handlers enter this dispatch. HEAP2/btree delta
+ * coverage remains separate work; their absence is never silent success. */
 static ClusterBlkApplyResult
 cluster_block_apply_delta(XLogReaderState *record, uint8 block_id, char *page)
 {
@@ -168,6 +221,9 @@ cluster_block_apply_delta(XLogReaderState *record, uint8 block_id, char *page)
 
 	case RM_HEAP_ID:
 		return cluster_block_apply_heap(record, block_id, page);
+
+	case RM_SEQ_ID:
+		return cluster_block_apply_sequence(record, block_id, page);
 
 	default:
 		return CLUSTER_BLKAPPLY_UNSUPPORTED;

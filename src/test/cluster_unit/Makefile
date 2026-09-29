@@ -1110,11 +1110,12 @@ CLUSTER_PAGE_INSTALL_O = cluster_page_install_test.o
 
 test_cluster_page_detached: test_cluster_page_detached.c unit_test.h \
 		$(CLUSTER_PAGE_DETACHED_O) $(CLUSTER_RF_ROUTE_O) \
-		$(CLUSTER_BLOCK_APPLY_O)
+		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_PAGE_DETACHED_O) \
 		$(CLUSTER_RF_ROUTE_O) $(CLUSTER_BLOCK_APPLY_O) \
+		test_cluster_space_bufpage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 CLUSTER_PAGE_REPLAY_BATCH_O = cluster_page_replay_batch_test.o
 
@@ -1282,17 +1283,20 @@ test_cluster_sequence_version_helpers.inc: $(top_srcdir)/src/backend/commands/se
 test_cluster_sequence_version_native.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
 	awk '/^(cluster_sq_refill_page|fill_seq_fork_with_data|do_setval)\(/ { print "static void"; emit=1; found++ } \
 	     /^nextval_internal\(/ { print "int64"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 4) exit 1 }' $< > $@.tmp
+	     /^seq_redo\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 5) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_sequence_version: test_cluster_sequence_version.c unit_test.h \
 		test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_SEQUENCE_O) \
+		$(CLUSTER_BLOCK_APPLY_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
 		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(CLUSTER_SEQUENCE_O) $(top_builddir)/src/common/libpgcommon_srv.a \
+		$(CLUSTER_BLOCK_APPLY_O) \
 		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: execute native allocation and structural mutation bodies.
@@ -2946,11 +2950,12 @@ test_cluster_undo_buf: test_cluster_undo_buf.c unit_test.h $(CLUSTER_UNDO_BUF_O)
 # decoded records.  The byte-for-byte differential against PG real redo
 # (real WAL + heap delta handlers) lands as a cluster_tap in D3b/D6.
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o
-test_cluster_block_apply: test_cluster_block_apply.c unit_test.h $(CLUSTER_BLOCK_APPLY_O)
+test_cluster_block_apply: test_cluster_block_apply.c unit_test.h $(CLUSTER_BLOCK_APPLY_O) \
+		test_cluster_space_bufpage_product.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(CLUSTER_BLOCK_APPLY_O) \
+		$(CLUSTER_BLOCK_APPLY_O) test_cluster_space_bufpage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(CLUSTER_UNIT_PORT_LIBS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # spec-4.11 D1: test_cluster_thread_apply links the real online thread-recovery
 # apply wrapper object and stubs cluster_block_apply_one (its byte-for-byte

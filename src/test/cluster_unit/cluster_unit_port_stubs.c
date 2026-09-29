@@ -79,6 +79,20 @@ errmsg_internal(const char *fmt pg_attribute_unused(), ...)
 	abort();
 }
 
+/* Native page helpers can report corruption. Standalone tests must provide
+ * an explicit boundary to exercise it, never turn it into a warning/pass. */
+int __attribute__((weak))
+errmsg(const char *fmt pg_attribute_unused(), ...)
+{
+	abort();
+}
+
+int __attribute__((weak))
+errcode(int sqlerrcode pg_attribute_unused())
+{
+	abort();
+}
+
 void __attribute__((weak))
 errfinish(const char *filename pg_attribute_unused(), int lineno pg_attribute_unused(),
 		  const char *funcname pg_attribute_unused())

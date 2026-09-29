@@ -24,8 +24,10 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogutils.h"
 #include "catalog/pg_sequence.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_block_apply.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_sequence.h"
@@ -51,10 +53,6 @@ bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 
 #define SEQ_LOG_VALS 32
-#define SEQ_MAGIC 0x1717
-typedef struct sequence_magic {
-	uint32 magic;
-} sequence_magic;
 typedef struct SeqTableData {
 	Oid relid;
 	RelFileNumber filenumber;
@@ -71,6 +69,14 @@ typedef enum ClusterSqDisposition {
 static SeqTable last_used_seq;
 
 static PGAlignedBlock page_data, before, tuple_data, params_data;
+static PGAlignedBlock wal_payload;
+static Size wal_payload_len;
+static bool replaying;
+static union {
+	DecodedXLogRecord decoded;
+	char bytes[sizeof(DecodedXLogRecord) + sizeof(DecodedBkpBlock)];
+} record_space;
+static XLogReaderState reader;
 static RelationData relation_data;
 static FormData_pg_class relform;
 static HeapTupleData tuple, params_tuple;
@@ -397,7 +403,7 @@ UnlockReleaseBuffer(Buffer buffer)
 void
 MarkBufferDirty(Buffer buffer)
 {
-	UT_ASSERT(buffer == 1 && locked && CritSectionCount == 1);
+	UT_ASSERT(buffer == 1 && locked && CritSectionCount == (replaying ? 0 : 1));
 	dirties++;
 }
 void
@@ -406,6 +412,7 @@ XLogBeginInsert(void)
 	UT_ASSERT(!begun);
 	begun = true;
 	data_count = 0;
+	wal_payload_len = 0;
 }
 void
 XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)
@@ -416,14 +423,50 @@ void
 XLogRegisterData(char *data, uint32 length)
 {
 	UT_ASSERT(begun);
+	Assert(wal_payload_len + length < BLCKSZ);
+	memcpy(wal_payload.data + wal_payload_len, data, length);
+	wal_payload_len += length;
 	if (data_count++ == 0) {
 		UT_ASSERT_EQ(length, sizeof(wal_header));
 		memcpy(&wal_header, data, length);
 	} else {
 		HeapTupleHeader hdr = (HeapTupleHeader)data;
-		UT_ASSERT(length >= hdr->t_hoff + sizeof(wal_tuple));
-		memcpy(&wal_tuple, data + hdr->t_hoff, sizeof(wal_tuple));
+		Size size = offsetof(FormData_pg_sequence_data, is_called) + sizeof(bool);
+		UT_ASSERT(length >= hdr->t_hoff + size);
+		memset(&wal_tuple, 0, sizeof(wal_tuple));
+		memcpy(&wal_tuple, data + hdr->t_hoff, size);
 	}
+}
+Buffer
+XLogInitBufferForRedo(XLogReaderState *record, uint8 block_id)
+{
+	UT_ASSERT(replaying && record == &reader && block_id == 0 && !locked);
+	locked = true;
+	return 1;
+}
+bool
+RestoreBlockImage(XLogReaderState *record, uint8 block_id, char *page)
+{
+	(void)record;
+	(void)block_id;
+	(void)page;
+	abort();
+}
+char *
+XLogRecGetBlockData(XLogReaderState *record, uint8 block_id, Size *length)
+{
+	(void)record;
+	(void)block_id;
+	(void)length;
+	abort();
+}
+ClusterBlkApplyResult
+cluster_block_apply_heap(XLogReaderState *record, uint8 block_id, char *page)
+{
+	(void)record;
+	(void)block_id;
+	(void)page;
+	abort();
 }
 void
 XLogRegisterPageVersionEdge(uint64 result, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
@@ -478,7 +521,9 @@ reset(bool fresh)
 	memset(&tuple_data, 0, sizeof(tuple_data));
 	tuple.t_data = (HeapTupleHeader)tuple_data.data;
 	tuple.t_data->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
-	tuple.t_len = tuple.t_data->t_hoff + sizeof(FormData_pg_sequence_data);
+	HeapTupleHeaderSetNatts(tuple.t_data, 3);
+	tuple.t_len
+		= tuple.t_data->t_hoff + offsetof(FormData_pg_sequence_data, is_called) + sizeof(bool);
 	data = (Form_pg_sequence_data)GETSTRUCT(&tuple);
 	data->last_value = 5;
 	data->is_called = true;
@@ -511,6 +556,7 @@ reset(bool fresh)
 	identity_valid = true;
 	cluster_shared_config = true;
 	wal_level = WAL_LEVEL_REPLICA;
+	replaying = false;
 	CritSectionCount = 0;
 	token = 200;
 }
@@ -747,10 +793,124 @@ shared_minimal_wal(void)
 			UT_ASSERT(false);
 	}
 }
+static void
+make_replay_record(void)
+{
+	DecodedXLogRecord *decoded = &record_space.decoded;
+	memset(&record_space, 0, sizeof(record_space));
+	memset(&reader, 0, sizeof(reader));
+	decoded->header.xl_rmid = RM_SEQ_ID;
+	decoded->header.xl_info = XLOG_SEQ_LOG;
+	decoded->main_data = wal_payload.data;
+	decoded->main_data_len = wal_payload_len;
+	decoded->max_block_id = 0;
+	decoded->blocks[0].in_use = true;
+	decoded->blocks[0].flags = BKPBLOCK_WILL_INIT;
+	decoded->blocks[0].rlocator = relation_data.rd_locator;
+	decoded->blocks[0].forknum = MAIN_FORKNUM;
+	decoded->blocks[0].blkno = 0;
+	decoded->has_page_version_edge = edge_count != 0;
+	if (edge_count != 0) {
+		decoded->page_version_edge.entry_count = 1;
+		decoded->page_version_edge.result_token = wal_header.write_scn;
+		decoded->page_version_edge.entries[0] = edge;
+	}
+	reader.record = decoded;
+	reader.EndRecPtr = 0x9000;
+}
+static void
+native_redo_differential(void)
+{
+	for (int operation = 0; operation < 5; operation++) {
+		PGAlignedBlock detached;
+		int64 start, end;
+		reset(operation == 0);
+		if (operation == 0)
+			fill_seq_fork_with_data(&relation_data, &tuple, MAIN_FORKNUM);
+		else if (operation == 1)
+			cluster_sq_refill_page(&relation_data, 1, 1, 1000, 4, &start, &end);
+		else if (operation == 2)
+			do_setval(20000, 90, false);
+		else {
+			if (operation == 4) {
+				cluster_shared_config = false;
+				page_tuple()->log_cnt = 0;
+			}
+			(void)nextval_internal(20000, false);
+		}
+		make_replay_record();
+		memset(detached.data, 0xa5, BLCKSZ);
+		memcpy(page_data.data, detached.data, BLCKSZ);
+		replaying = true;
+		seq_redo(&reader);
+		UT_ASSERT_EQ(cluster_block_apply_one(&reader, 0, detached.data), CLUSTER_BLKAPPLY_OK);
+		UT_ASSERT(memcmp(detached.data, page_data.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(page_tuple()->last_value, operation == 4 ? 41 : wal_tuple.last_value);
+	}
+}
+static void
+bad_redo_preserves_output(void)
+{
+	for (int scenario = 0; scenario < 13; scenario++) {
+		PGAlignedBlock detached, saved;
+		DecodedXLogRecord *decoded;
+		HeapTupleHeader header;
+		reset(true);
+		fill_seq_fork_with_data(&relation_data, &tuple, MAIN_FORKNUM);
+		make_replay_record();
+		decoded = reader.record;
+		header = (HeapTupleHeader)(wal_payload.data + sizeof(xl_seq_rec));
+		switch (scenario) {
+		case 0:
+			decoded->main_data_len = sizeof(xl_seq_rec) - 1;
+			break;
+		case 1:
+			decoded->main_data_len = sizeof(xl_seq_rec) + 4;
+			break;
+		case 2:
+			decoded->blocks[0].rlocator.relNumber++;
+			break;
+		case 3:
+			decoded->blocks[0].forknum = VISIBILITYMAP_FORKNUM;
+			break;
+		case 4:
+			decoded->blocks[0].blkno = 1;
+			break;
+		case 5:
+			header->t_hoff = 200;
+			break;
+		case 6:
+			decoded->page_version_edge.result_token++;
+			break;
+		case 7:
+			decoded->header.xl_info = 0x10;
+			break;
+		case 8:
+			header->t_infomask |= HEAP_HASNULL;
+			break;
+		case 9:
+			HeapTupleHeaderSetNatts(header, 2);
+			break;
+		case 10:
+			decoded->blocks[0].flags = 0;
+			break;
+		case 11:
+			((uint8 *)header)[header->t_hoff + offsetof(FormData_pg_sequence_data, is_called)] = 2;
+			break;
+		case 12:
+			decoded->main_data_len = BLCKSZ;
+			break;
+		}
+		memset(detached.data, 0xa5, BLCKSZ);
+		memcpy(saved.data, detached.data, BLCKSZ);
+		UT_ASSERT(cluster_block_apply_one(&reader, 0, detached.data) != CLUSTER_BLKAPPLY_OK);
+		UT_ASSERT(memcmp(saved.data, detached.data, BLCKSZ) == 0);
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(11);
+	UT_PLAN(13);
 	UT_RUN(init_version);
 	UT_RUN(refill_version);
 	UT_RUN(setval_version);
@@ -762,6 +922,8 @@ main(void)
 	UT_RUN(invalid_identity);
 	UT_RUN(exhausted_does_not_mutate);
 	UT_RUN(shared_minimal_wal);
+	UT_RUN(native_redo_differential);
+	UT_RUN(bad_redo_preserves_output);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }
