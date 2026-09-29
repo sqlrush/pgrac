@@ -15259,6 +15259,9 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 	bool		cleared_all_frozen = false;
 	TransactionId creation_xmin = InvalidTransactionId;
 #ifdef USE_PGRAC_CLUSTER
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	bool		cluster_did_lock_stamp = false;
 	uint64 cluster_writer_wait_deadline_us = 0;
@@ -15287,6 +15290,15 @@ heap_lock_tuple_internal(Relation relation, HeapTuple tuple,
 #ifdef USE_PGRAC_CLUSTER
 	if (next_successor != NULL)
 		memset(next_successor, 0, sizeof(*next_successor));
+	/* PGRAC: load the cached identity before acquiring any heap content lock. */
+	if (cluster_shared_config && RelationIsPermanent(relation)
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_get_identity(relation, &cluster_page_identity))
+			elog(ERROR, "shared heap tuple lock requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_lock_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -16512,6 +16524,17 @@ failed:
 
 #ifdef USE_PGRAC_CLUSTER
 	MemSet(&cluster_lock_ctrc_handle, 0, sizeof(cluster_lock_ctrc_handle));
+	/* PGRAC: tuple-lock versions are captured before the receipt APPLY. */
+	if (cluster_page_versioned)
+	{
+		Buffer version_buffers[2] = {*buffer, vmbuffer};
+		uint8 version_ids[2] = {0, 1};
+
+		if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+				version_buffers, version_ids, vm_locked ? 2 : 1,
+				&cluster_page_versions))
+			elog(ERROR, "shared heap tuple lock cannot capture exact page versions");
+	}
 	{
 		ClusterHeapPreparedUndoTargetPlan undo_plan;
 		ClusterHeapCurrentMxExactPublication mx_publication;
@@ -16687,6 +16710,17 @@ failed:
 
 	START_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: receipt and MX fingerprints have now been consumed. */
+	if (cluster_page_versioned)
+	{
+		if (!rf_page_producer_stamp_v1(&cluster_page_versions))
+			elog(PANIC, "heap tuple lock page version changed after receipt APPLY");
+		if (cluster_page_versions.entry_count == 2)
+			MarkBufferDirty(vmbuffer);
+	}
+#endif
+
 	/*
 	 * Store transaction information of xact locking the tuple.
 	 *
@@ -16814,9 +16848,23 @@ failed:
 		}
 #endif
 
+		/* PGRAC: VM and heap belong to this original LOCK record. */
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			if (cluster_page_versions.entry_count == 2)
+				XLogRegisterBuffer(1, vmbuffer, REGBUF_FORCE_IMAGE);
+			if (!rf_page_producer_register_wal_v1(&cluster_page_versions))
+				elog(PANIC, "heap tuple lock page version WAL registration failed");
+		}
+#endif
 		recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_LOCK);
 
 		PageSetLSN(page, recptr);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned && cluster_page_versions.entry_count == 2)
+			PageSetLSN(BufferGetPage(vmbuffer), recptr);
+#endif
 	}
 
 	END_CRIT_SECTION();
@@ -17405,6 +17453,9 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 	TransactionId creation_xmin = InvalidTransactionId;
 #ifdef USE_PGRAC_CLUSTER
 	PGAlignedBlock fetched_row;
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
 	bool		cluster_chain_lock_stamp = false;
 	bool		cluster_chain_needs_itl = false;
 	bool		cluster_chain_receipt_owned = false;
@@ -17421,6 +17472,15 @@ heap_lock_updated_tuple_rec(Relation rel, TransactionId priorXmax,
 
 	ItemPointerCopy(tid, &tupid);
 #ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: one cached relation identity, fresh page batch per successor. */
+	if (cluster_shared_config && RelationIsPermanent(rel)
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(rel)
+			|| !cluster_space_relation_get_identity(rel, &cluster_page_identity))
+			elog(ERROR, "shared heap update-chain lock requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
 	memset(&expected_successor, 0, sizeof(expected_successor));
 	if (initial_successor != NULL && initial_successor->valid)
 		expected_successor = *initial_successor;
@@ -17881,6 +17941,18 @@ l4:
 				cluster_chain_vm_locked = true;
 			}
 
+			/* PGRAC: chain-lock capture precedes its exact receipt APPLY. */
+			if (cluster_page_versioned)
+			{
+				Buffer version_buffers[2] = {buf, vmbuffer};
+				uint8 version_ids[2] = {0, 1};
+
+				if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+						version_buffers, version_ids, cluster_chain_vm_locked ? 2 : 1,
+						&cluster_page_versions))
+					elog(ERROR, "shared heap update-chain lock cannot capture exact page versions");
+			}
+
 			{
 				ClusterHeapPreparedUndoTargetPlan undo_plan;
 				ClusterUndoRecordTarget undo_target;
@@ -17968,6 +18040,22 @@ l4:
 				cluster_chain_lock_stamp = true;
 			}
 		}
+		/* PGRAC: no-ITL still has an ordinary heap/VM version obligation. */
+		else if (cluster_page_versioned)
+		{
+			Buffer version_buffers[2] = {buf, vmbuffer};
+			uint8 version_ids[2] = {0, 1};
+
+			if (PageIsAllVisible(BufferGetPage(buf)) && BufferIsValid(vmbuffer))
+			{
+				LockBuffer(vmbuffer, BUFFER_LOCK_EXCLUSIVE);
+				cluster_chain_vm_locked = true;
+			}
+			if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+					version_buffers, version_ids, cluster_chain_vm_locked ? 2 : 1,
+					&cluster_page_versions))
+				elog(ERROR, "shared heap update-chain lock cannot capture exact page versions");
+		}
 		else if (PageIsAllVisible(BufferGetPage(buf)) &&
 				 visibilitymap_clear(rel, block, vmbuffer,
 									 VISIBILITYMAP_ALL_FROZEN))
@@ -17980,6 +18068,16 @@ l4:
 #endif
 
 		START_CRIT_SECTION();
+
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			if (!rf_page_producer_stamp_v1(&cluster_page_versions))
+				elog(PANIC, "heap update-chain lock page version changed after receipt APPLY");
+			if (cluster_page_versions.entry_count == 2)
+				MarkBufferDirty(vmbuffer);
+		}
+#endif
 
 		/* ... and set them */
 		HeapTupleHeaderSetXmax(mytup.t_data, new_xmax);
@@ -18053,9 +18151,22 @@ l4:
 			}
 #endif
 
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_page_versioned)
+			{
+				if (cluster_page_versions.entry_count == 2)
+					XLogRegisterBuffer(1, vmbuffer, REGBUF_FORCE_IMAGE);
+				if (!rf_page_producer_register_wal_v1(&cluster_page_versions))
+					elog(PANIC, "heap update-chain lock page version WAL registration failed");
+			}
+#endif
 			recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_LOCK_UPDATED);
 
 			PageSetLSN(page, recptr);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_page_versioned && cluster_page_versions.entry_count == 2)
+				PageSetLSN(BufferGetPage(vmbuffer), recptr);
+#endif
 		}
 
 		END_CRIT_SECTION();

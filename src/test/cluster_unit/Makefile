@@ -1316,6 +1316,37 @@ test_cluster_heap_update_log.inc: $(top_srcdir)/src/backend/access/heap/heapam.c
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# PGRAC: original row-lock and successor-lock mutation/WAL owners.
+test_cluster_heap_lock_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/PGRAC: tuple-lock versions are captured/ { emit=1; count++ } \
+	     emit { print } emit && /^\t}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_chain_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/PGRAC: chain-lock capture precedes/ { emit=1; count++ } \
+	     emit { print } emit && /^\t\t\t}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_chain_no_itl_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/PGRAC: no-ITL still has/ { emit=1; count++ } \
+	     emit { line=$$0; sub(/else if/, "if", line); print line } \
+	     emit && /^\t\t}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_lock_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_tuple_internal\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { emit=1; starts++ } \
+	     emit { print } inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_chain_lock_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_lock_updated_tuple_rec\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { emit=1; starts++ } \
+	     emit { print } inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_infobits.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^compute_infobits\(/ { print "static uint8"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
@@ -1386,6 +1417,8 @@ test_cluster_heap_insert_version: test_cluster_heap_insert_version.c unit_test.h
 		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
 		test_cluster_heap_update_temp_version.inc test_cluster_heap_update_version.inc test_cluster_heap_update_log.inc \
 		test_cluster_heap_update_temp_capture.inc test_cluster_heap_update_capture.inc \
+		test_cluster_heap_lock_version.inc test_cluster_heap_chain_lock_version.inc \
+		test_cluster_heap_lock_capture.inc test_cluster_heap_chain_capture.inc test_cluster_heap_chain_no_itl_capture.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
@@ -3101,6 +3134,8 @@ clean distclean maintainer-clean:
 		test_cluster_vm_version.inc test_cluster_vm_redo_consumers.inc test_cluster_heap_update_temp_version.inc \
 		test_cluster_heap_update_version.inc test_cluster_heap_update_log.inc \
 		test_cluster_heap_update_temp_capture.inc test_cluster_heap_update_capture.inc \
+		test_cluster_heap_lock_version.inc test_cluster_heap_chain_lock_version.inc \
+		test_cluster_heap_lock_capture.inc test_cluster_heap_chain_capture.inc test_cluster_heap_chain_no_itl_capture.inc \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
 		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
 		test_cluster_control_root_worker.inc \
