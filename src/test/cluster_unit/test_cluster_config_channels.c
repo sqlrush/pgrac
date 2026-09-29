@@ -23,6 +23,7 @@
 #include "cluster/cluster_ic_chunk.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_service_observe.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "../../backend/cluster/cluster_config_channels.c"
@@ -31,6 +32,7 @@
 UT_DEFINE_GLOBALS();
 
 bool cluster_enabled = true, cluster_shared_config = true, cluster_lms_enabled = true;
+bool cluster_lmd_enabled = true;
 int cluster_lms_workers = 2, cluster_node_id;
 int cluster_interconnect_tier = CLUSTER_IC_TIER_1;
 bool IsUnderPostmaster = true;
@@ -49,18 +51,31 @@ PGPROC *MyProc;
 static ClusterR4MembershipSnapshot members;
 static ClusterConfigMembersKey expected_key;
 static uint8 episode[16];
-static ChannelLocal saved_local[CLUSTER_CONFIG_CHANNEL_OWNERS];
+static ChannelLocal saved_local[CLUSTER_CONFIG_SERVICE_OWNERS];
 static int selected_owner = -1;
 static bool family_available, membership_available, stopping, send_throws, stream_throws;
 static bool change_members_during_census;
 static bool change_caps_after_census;
 static unsigned pid_snapshots;
 static int32 lmon_pid;
-static uint64 streams[CLUSTER_CONFIG_CHANNEL_OWNERS][CLUSTER_MAX_NODES], random_id;
+static uint64 streams[CLUSTER_CONFIG_SERVICE_OWNERS][CLUSTER_MAX_NODES], random_id;
 static uint32 caps_generation;
 static unsigned sends, handlers;
 static ClusterConfigPrefixMessage sent[128];
 static ClusterICSendResult send_result;
+static ClusterNormalStopPollResult service_result[12];
+static bool service_throws, service_pending_after_send;
+
+/* Original module observations are fixture boundaries here. The real fanout
+ * and original CLOSE distinction run in test_cluster_service_observe. */
+ClusterNormalStopPollResult
+cluster_service_observe(ClusterServiceObservation *out)
+{
+	memset(out, 0, sizeof(*out));
+	if (service_throws)
+		pg_re_throw();
+	return service_result[selected_owner];
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -200,6 +215,8 @@ cluster_ic_send_envelope(uint8 type, int32 peer, const void *bytes, uint32 len)
 	UT_ASSERT_EQ(type, selected_owner == 0 ? PGRAC_IC_MSG_CONFIG_PREFIX_CONTROL
 										   : PGRAC_IC_MSG_CONFIG_PREFIX_DATA);
 	sends++;
+	if (service_pending_after_send)
+		service_result[selected_owner] = CLUSTER_NORMAL_STOP_PENDING;
 	if (send_throws)
 		pg_re_throw();
 	return send_result;
@@ -238,6 +255,8 @@ setup(void)
 	memset(saved_local, 0, sizeof(saved_local));
 	memset(&channel_local, 0, sizeof(channel_local));
 	memset(episode, 1, sizeof(episode));
+	for (unsigned i = 0; i < lengthof(service_result); ++i)
+		service_result[i] = CLUSTER_NORMAL_STOP_READY;
 	proc_hdr.allProcs = procs;
 	proc_hdr.allProcCount = lengthof(procs);
 	expected_key.ref.identity.system_identifier = 11;
@@ -257,15 +276,17 @@ setup(void)
 	members.admitted_incarnation[127] = 158;
 	family_available = membership_available = true;
 	cluster_enabled = cluster_shared_config = cluster_lms_enabled = IsUnderPostmaster = true;
+	cluster_lmd_enabled = true;
 	cluster_lms_workers = 2;
 	cluster_node_id = 0;
 	stopping = send_throws = stream_throws = change_members_during_census = false;
+	service_throws = service_pending_after_send = false;
 	change_caps_after_census = false;
 	pid_snapshots = 0;
 	caps_generation = 1;
 	sends = handlers = 0;
 	send_result = CLUSTER_IC_SEND_DONE;
-	for (int i = 0; i < CLUSTER_CONFIG_CHANNEL_OWNERS; ++i) {
+	for (int i = 0; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i) {
 		ClusterSharedConfigRegistration *r = &procs[i].cluster_config.value;
 		procs[i].pgprocno = i;
 		procs[i].pid = r->pid = 100 + i;
@@ -273,6 +294,13 @@ setup(void)
 		r->observed = true;
 		r->role = i == 0 ? B_LMON : (i == 1 ? B_LMS : B_LMS_WORKER);
 		r->aux_type = i == 0 ? LmonProcess : (i == 1 ? LmsProcess : LmsWorker1Process + i - 2);
+		if (i == CLUSTER_CONFIG_LMD_OWNER) {
+			r->role = B_LMD;
+			r->aux_type = LmdProcess;
+		} else if (i == CLUSTER_CONFIG_SINVAL_OWNER) {
+			r->role = B_SINVAL_BCAST;
+			r->aux_type = SinvalBcastProcess;
+		}
 		pg_atomic_init_u64(&procs[i].cluster_config.sequence, 2);
 		for (unsigned peer = 0; peer < CLUSTER_MAX_NODES; ++peer)
 			streams[i][peer] = 10 + peer;
@@ -290,6 +318,10 @@ arm_owners(void)
 	owner(0);
 	UT_ASSERT(cluster_config_channels_arm(&expected_key.ref, episode));
 	for (int i = 0; i <= cluster_lms_workers; ++i) {
+		owner(i);
+		cluster_config_channels_tick();
+	}
+	for (int i = CLUSTER_CONFIG_LMD_OWNER; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i) {
 		owner(i);
 		cluster_config_channels_tick();
 	}
@@ -332,9 +364,17 @@ UT_TEST(arming_needs_every_owner_without_sending)
 	owner(2);
 	cluster_config_channels_tick();
 	owner(0);
+	UT_ASSERT(!cluster_config_channels_exchange());
+	owner(CLUSTER_CONFIG_LMD_OWNER);
+	cluster_config_channels_tick();
+	owner(0);
+	UT_ASSERT(!cluster_config_channels_exchange());
+	owner(CLUSTER_CONFIG_SINVAL_OWNER);
+	cluster_config_channels_tick();
+	owner(0);
 	UT_ASSERT(cluster_config_channels_observe(&census));
-	UT_ASSERT_EQ(census.required, 7);
-	UT_ASSERT_EQ(census.armed, 7);
+	UT_ASSERT_EQ(census.required, 1543); /* LMON, two LMS, LMD, SINVAL. */
+	UT_ASSERT_EQ(census.armed, 1543);
 	UT_ASSERT_EQ(census.complete, 0);
 	UT_ASSERT_EQ(sends, 0);
 	UT_ASSERT(cluster_config_channels_exchange());
@@ -365,6 +405,49 @@ UT_TEST(all_peers_and_directions_precede_completion)
 	UT_ASSERT_EQ(sends, 12);
 	cluster_config_channels_tick();
 	UT_ASSERT_EQ(sends, 12);
+}
+
+UT_TEST(original_work_prevents_initial_channel_readiness)
+{
+	ClusterConfigChannelsCensus census;
+	setup();
+	service_result[1] = CLUSTER_NORMAL_STOP_PENDING;
+	arm_owners();
+	UT_ASSERT(!cluster_config_channels_exchange());
+	UT_ASSERT(cluster_config_channels_observe(&census));
+	UT_ASSERT_EQ(census.armed & 2, 0);
+	UT_ASSERT_EQ(sends, 0);
+}
+
+UT_TEST(non_transport_owners_cannot_be_absent)
+{
+	ClusterConfigChannelsCensus census;
+	setup();
+	arm_owners();
+	/* A complete set of TCP owners cannot speak for a missing process's
+	 * cancellation/graph/invalidation work. Keep its stale native report. */
+	procs[CLUSTER_CONFIG_LMD_OWNER].pid = 0;
+	UT_ASSERT(!cluster_config_channels_observe(&census));
+	UT_ASSERT(!cluster_config_channels_exchange());
+}
+
+UT_TEST(last_ack_cannot_publish_completion_from_ingress)
+{
+	setup();
+	arm_owners();
+	UT_ASSERT(cluster_config_channels_exchange());
+	cluster_config_channels_tick();
+	reply(&sent[0], false);
+	reply(&sent[1], false);
+	reply(&sent[0], true);
+	reply(&sent[1], true);
+	UT_ASSERT(channel_local.report.phase != CHANNEL_COMPLETE);
+	service_result[0] = CLUSTER_NORMAL_STOP_PENDING;
+	cluster_config_channels_tick();
+	UT_ASSERT(channel_local.report.phase != CHANNEL_COMPLETE);
+	service_result[0] = CLUSTER_NORMAL_STOP_READY;
+	cluster_config_channels_tick();
+	UT_ASSERT_EQ(channel_local.report.phase, CHANNEL_COMPLETE);
 }
 UT_TEST(missing_stream_is_pending_and_rebind_invalidates)
 {
@@ -476,8 +559,8 @@ UT_TEST(all_eight_data_workers_are_required)
 		procs[i].pid = 100 + i;
 	arm_owners();
 	UT_ASSERT(cluster_config_channels_observe(&census));
-	UT_ASSERT_EQ(census.required, 511);
-	UT_ASSERT_EQ(census.armed, 511);
+	UT_ASSERT_EQ(census.required, 2047);
+	UT_ASSERT_EQ(census.armed, 2047);
 	UT_ASSERT(cluster_config_channels_exchange());
 	owner(8);
 	cluster_config_channels_tick();
@@ -596,7 +679,7 @@ UT_TEST(zero_capability_generation_is_still_rechecked)
 	caps_generation = 0;
 	arm_owners();
 	UT_ASSERT(cluster_config_channels_observe(&census));
-	UT_ASSERT_EQ(census.armed, 7);
+	UT_ASSERT_EQ(census.armed, 1543);
 	change_caps_after_census = true;
 	UT_ASSERT(!cluster_config_channels_observe(&census));
 	UT_ASSERT_EQ(census.armed, 0);
@@ -617,7 +700,190 @@ complete_owners(void)
 		reply(&sent[start + 1], true);
 		cluster_config_channels_tick();
 	}
+	for (int i = CLUSTER_CONFIG_LMD_OWNER; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i) {
+		owner(i);
+		cluster_config_channels_tick();
+	}
 	owner(0);
+}
+
+UT_TEST(every_original_service_blocks_initial_arming)
+{
+	ClusterConfigChannelsCensus census;
+	for (int i = 0; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i) {
+		setup();
+		cluster_lms_workers = 8;
+		for (int j = 3; j < CLUSTER_CONFIG_CHANNEL_OWNERS; ++j)
+			procs[j].pid = 100 + j;
+		service_result[i] = CLUSTER_NORMAL_STOP_PENDING;
+		arm_owners();
+		UT_ASSERT(cluster_config_channels_observe(&census));
+		UT_ASSERT_EQ(census.armed & (1u << i), 0);
+		UT_ASSERT_EQ(census.complete, 0);
+		UT_ASSERT(!cluster_config_channels_exchange());
+		UT_ASSERT_EQ(sends, 0);
+		service_result[i] = CLUSTER_NORMAL_STOP_READY;
+		owner(i);
+		cluster_config_channels_tick();
+		owner(0);
+		UT_ASSERT(cluster_config_channels_exchange());
+	}
+}
+
+UT_TEST(non_transport_services_have_their_own_exact_completion)
+{
+	ClusterConfigChannelsCensus census;
+	setup();
+	complete_owners();
+	UT_ASSERT(cluster_config_channels_observe(&census));
+	UT_ASSERT_EQ(census.complete, 1543);
+	UT_ASSERT_EQ(census.invalid, 0);
+	UT_ASSERT_EQ(sends, 12); /* No MARK/ACK or fake channel from LMD/SINVAL. */
+	for (int i = CLUSTER_CONFIG_LMD_OWNER; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i) {
+		UT_ASSERT_EQ(board.slots[i].report.armed[0], 0);
+		UT_ASSERT_EQ(board.slots[i].report.armed[1], 0);
+		UT_ASSERT_EQ(board.slots[i].report.complete[0], 0);
+		UT_ASSERT_EQ(board.slots[i].report.complete[1], 0);
+	}
+}
+
+UT_TEST(stale_non_transport_registration_is_not_readiness)
+{
+	ClusterConfigChannelsCensus census;
+	for (int i = CLUSTER_CONFIG_LMD_OWNER; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i) {
+		setup();
+		arm_owners();
+		procs[i].cluster_config.value.registration++;
+		UT_ASSERT(!cluster_config_channels_observe(&census));
+		UT_ASSERT(!cluster_config_channels_exchange());
+		setup();
+		arm_owners();
+		procs[i].cluster_config.value.aux_type = LmsProcess;
+		UT_ASSERT(!cluster_config_channels_observe(&census));
+		UT_ASSERT(!cluster_config_channels_exchange());
+		setup();
+		arm_owners();
+		/* A second live process cannot impersonate the same auxiliary owner. */
+		procs[11] = procs[i];
+		procs[11].pgprocno = 11;
+		UT_ASSERT(!cluster_config_channels_observe(&census));
+	}
+}
+
+UT_TEST(completed_service_cannot_hide_new_owned_work)
+{
+	ClusterConfigChannelsCensus census;
+	static const int indices[] = { 0, 1, 2, CLUSTER_CONFIG_LMD_OWNER, CLUSTER_CONFIG_SINVAL_OWNER };
+	for (unsigned n = 0; n < lengthof(indices); ++n) {
+		int i = indices[n];
+		setup();
+		complete_owners();
+		service_result[i] = CLUSTER_NORMAL_STOP_PENDING;
+		owner(i);
+		cluster_config_channels_tick();
+		service_result[i] = CLUSTER_NORMAL_STOP_READY;
+		cluster_config_channels_tick();
+		owner(0);
+		UT_ASSERT(cluster_config_channels_observe(&census));
+		UT_ASSERT_EQ(census.invalid, 1u << i);
+		UT_ASSERT_EQ(census.complete & (1u << i), 0);
+	}
+}
+
+UT_TEST(invalid_service_and_error_withdraw_before_unwind)
+{
+	static const int indices[] = { 0, 1, 2, CLUSTER_CONFIG_LMD_OWNER, CLUSTER_CONFIG_SINVAL_OWNER };
+	for (unsigned n = 0; n < lengthof(indices); ++n) {
+		ClusterConfigChannelsCensus census;
+		int i = indices[n];
+		volatile bool caught = false;
+		setup();
+		service_result[i] = CLUSTER_NORMAL_STOP_INVALID;
+		arm_owners();
+		UT_ASSERT(cluster_config_channels_observe(&census));
+		UT_ASSERT_EQ(census.invalid, 1u << i);
+		UT_ASSERT(!cluster_config_channels_exchange());
+		UT_ASSERT_EQ(sends, 0);
+		setup();
+		complete_owners();
+		owner(i);
+		service_throws = true;
+		PG_TRY();
+		{
+			cluster_config_channels_tick();
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		service_throws = false;
+		UT_ASSERT(caught);
+		owner(0);
+		UT_ASSERT(cluster_config_channels_observe(&census));
+		UT_ASSERT_EQ(census.invalid, 1u << i);
+		UT_ASSERT_EQ(census.complete & (1u << i), 0);
+	}
+}
+
+UT_TEST(accepted_prefix_tail_is_pending_not_false_completion)
+{
+	ClusterConfigChannelsCensus census;
+	setup();
+	arm_owners();
+	UT_ASSERT(cluster_config_channels_exchange());
+	service_pending_after_send = true;
+	send_result = CLUSTER_IC_SEND_WOULD_BLOCK;
+	cluster_config_channels_tick();
+	UT_ASSERT_EQ(sends, 2);
+	reply(&sent[0], false);
+	reply(&sent[1], false);
+	reply(&sent[0], true);
+	reply(&sent[1], true);
+	cluster_config_channels_tick();
+	UT_ASSERT(cluster_config_channels_observe(&census));
+	UT_ASSERT_EQ(census.complete & 1, 0);
+	UT_ASSERT_EQ(census.invalid, 0);
+	UT_ASSERT_EQ(sends, 4);
+	/* The original transport retires its admitted tails, not this adapter. */
+	service_pending_after_send = false;
+	service_result[0] = CLUSTER_NORMAL_STOP_READY;
+	cluster_config_channels_tick();
+	UT_ASSERT(cluster_config_channels_observe(&census));
+	UT_ASSERT_EQ(census.complete & 1, 1);
+	UT_ASSERT_EQ(sends, 4);
+}
+
+UT_TEST(non_transport_pending_prevents_all_owner_completion)
+{
+	ClusterConfigChannelsCensus census;
+	setup();
+	arm_owners();
+	UT_ASSERT(cluster_config_channels_exchange());
+	service_result[CLUSTER_CONFIG_LMD_OWNER] = CLUSTER_NORMAL_STOP_PENDING;
+	owner(CLUSTER_CONFIG_LMD_OWNER);
+	cluster_config_channels_tick();
+	owner(CLUSTER_CONFIG_SINVAL_OWNER);
+	cluster_config_channels_tick();
+	owner(0);
+	UT_ASSERT(cluster_config_channels_observe(&census));
+	UT_ASSERT_EQ(census.complete, 1024);
+	UT_ASSERT_EQ(census.invalid, 0);
+	service_result[CLUSTER_CONFIG_LMD_OWNER] = CLUSTER_NORMAL_STOP_READY;
+	owner(CLUSTER_CONFIG_LMD_OWNER);
+	cluster_config_channels_tick();
+	owner(0);
+	UT_ASSERT(cluster_config_channels_observe(&census));
+	UT_ASSERT_EQ(census.complete, 1536);
+	UT_ASSERT_EQ(sends, 0);
+}
+
+UT_TEST(disabled_required_role_does_not_silently_reduce_roster)
+{
+	setup();
+	cluster_lmd_enabled = false;
+	UT_ASSERT(!cluster_config_channels_arm(&expected_key.ref, episode));
+	UT_ASSERT_EQ(pg_atomic_read_u64(&board.command_sequence), 0);
 }
 
 static ClusterICEnvelope
@@ -652,7 +918,7 @@ UT_TEST(late_business_retires_completed_owner_before_next_tick)
 			setup();
 			complete_owners();
 			UT_ASSERT(cluster_config_channels_observe(&census));
-			UT_ASSERT_EQ(census.complete, 7);
+			UT_ASSERT_EQ(census.complete, 1543);
 			owner(i);
 			env = activity_envelope(PGRAC_IC_MSG_GES_REQUEST, 0, sending);
 			if (sending)
@@ -662,7 +928,7 @@ UT_TEST(late_business_retires_completed_owner_before_next_tick)
 			owner(0);
 			/* No service/transport tick can be required to retire the proof. */
 			UT_ASSERT(cluster_config_channels_observe(&census));
-			UT_ASSERT_EQ(census.complete, 7 & ~(1u << i));
+			UT_ASSERT_EQ(census.complete, 1543 & ~(1u << i));
 			UT_ASSERT_EQ(census.invalid, 1u << i);
 			owner(i);
 			cluster_config_channels_tick();
@@ -713,7 +979,7 @@ UT_TEST(exact_maintenance_frames_preserve_channel_proof)
 		cluster_config_channels_received(1, &env, cases[i].length);
 		owner(0);
 		UT_ASSERT(cluster_config_channels_observe(&census));
-		UT_ASSERT_EQ(census.complete, 7);
+		UT_ASSERT_EQ(census.complete, 1543);
 		UT_ASSERT_EQ(census.invalid, 0);
 	}
 }
@@ -846,7 +1112,18 @@ UT_TEST(activity_is_sticky_once_but_new_attempt_is_independent)
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(33);
+	UT_RUN(every_original_service_blocks_initial_arming);
+	UT_RUN(non_transport_services_have_their_own_exact_completion);
+	UT_RUN(stale_non_transport_registration_is_not_readiness);
+	UT_RUN(completed_service_cannot_hide_new_owned_work);
+	UT_RUN(invalid_service_and_error_withdraw_before_unwind);
+	UT_RUN(accepted_prefix_tail_is_pending_not_false_completion);
+	UT_RUN(non_transport_pending_prevents_all_owner_completion);
+	UT_RUN(disabled_required_role_does_not_silently_reduce_roster);
+	UT_RUN(original_work_prevents_initial_channel_readiness);
+	UT_RUN(non_transport_owners_cannot_be_absent);
+	UT_RUN(last_ack_cannot_publish_completion_from_ingress);
 	UT_RUN(arming_needs_every_owner_without_sending);
 	UT_RUN(all_peers_and_directions_precede_completion);
 	UT_RUN(missing_stream_is_pending_and_rebind_invalidates);

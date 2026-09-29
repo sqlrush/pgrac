@@ -140,9 +140,8 @@ cluster_shared_config_delivery_lmon_tick(void)
 		return;
 	}
 	now = GetCurrentTimestamp();
-	/* Prefix traffic progresses independently of the paced CF selection probe.
-	 * Its real owner invalidates retained reports before ERROR unwinds. */
-	cluster_config_channels_tick();
+	/* Prefix/service readiness is driven at the original LMON idle boundary,
+	 * not inside this CF selection duty or its retained work bracket. */
 	/* Scheduling, not a proof/expiry/deadline. A pending exact CF request is
 	 * driven every tick; a backward clock step cannot strand maintenance. */
 	if (!selection_pending && now < next_probe && next_probe - now <= INT64CONST(1000000))

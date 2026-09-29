@@ -1977,6 +1977,7 @@ LmonMain(void)
 			PG_END_TRY();
 			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 				ereport(FATAL, (errmsg_internal("LMON normal-stop idle check failed")));
+			cluster_config_channels_tick();
 			n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
 										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
@@ -2162,6 +2163,7 @@ LmonMain(void)
 			PG_END_TRY();
 			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 				ereport(FATAL, (errmsg_internal("LMON normal-stop post-dispatch check failed")));
+			cluster_config_channels_tick();
 		}
 
 		/* Shutdown: close every fd we own + free WES. */
@@ -2350,6 +2352,7 @@ LmonMain(void)
 			PG_END_TRY();
 			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 				ereport(FATAL, (errmsg_internal("LMON normal-stop stub idle check failed")));
+			cluster_config_channels_tick();
 			rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						   cluster_lmon_main_loop_interval,
 						   WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);

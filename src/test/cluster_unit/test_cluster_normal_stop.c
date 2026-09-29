@@ -50,6 +50,7 @@ static bool test_found;
 static Size requested_size;
 static unsigned lock_initializations;
 static unsigned lock_holds, lock_acquisitions;
+static unsigned config_idle_ticks;
 static unsigned cleaner_wakes;
 static bool modifier_held;
 static LWLock *fixture_cleaner_lock;
@@ -98,7 +99,11 @@ cluster_cf_retirement_poll(void)
  * shutdown-loop fixtures do not publish a configuration channel command. */
 void
 cluster_config_channels_tick(void)
-{}
+{
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(lock_holds, 0);
+	++config_idle_ticks;
+}
 
 bool IsUnderPostmaster;
 bool IsPostmasterEnvironment;
@@ -1422,6 +1427,7 @@ run_actual_sinval_main(int scenario)
 	sinval_main_test = true;
 	sinval_scenario = scenario;
 	sinval_stage = sinval_passes = sinval_polls = ko_polls = 0;
+	config_idle_ticks = 0;
 	main_passes = main_waits = 0;
 	main_exit_code = -1;
 	main_early_shutdown = false;
@@ -1445,6 +1451,7 @@ UT_TEST(test_sinval_actual_main_wraps_full_work_not_sleep)
 	run_actual_sinval_main(0);
 	UT_ASSERT_EQ(main_exit_code, 0);
 	UT_ASSERT_EQ(sinval_passes, 2);
+	UT_ASSERT(config_idle_ticks > 0);
 	UT_ASSERT_EQ(sinval_polls, 0); /* Ordinary runtime adds no module scan. */
 	run_actual_sinval_main(5);
 	UT_ASSERT_EQ(main_exit_code, 0);

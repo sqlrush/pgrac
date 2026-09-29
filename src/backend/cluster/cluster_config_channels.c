@@ -21,6 +21,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic_router.h"
 #include "cluster/cluster_sf_dep.h"
+#include "cluster/cluster_service_observe.h"
 #include "miscadmin.h"
 #include "storage/proc.h"
 #include "utils/memutils.h"
@@ -54,7 +55,18 @@ channel_index(int role, int aux)
 		return 1;
 	if (role == B_LMS_WORKER && aux >= LmsWorker1Process && aux <= LmsWorker7Process)
 		return 2 + aux - LmsWorker1Process;
+	if (role == B_LMD && aux == LmdProcess)
+		return CLUSTER_CONFIG_LMD_OWNER;
+	if (role == B_SINVAL_BCAST && aux == SinvalBcastProcess)
+		return CLUSTER_CONFIG_SINVAL_OWNER;
 	return -1;
+}
+
+static bool
+channel_owner_required(int index, uint32 workers)
+{
+	return index >= 0 && index < CLUSTER_CONFIG_SERVICE_OWNERS
+		   && (index <= (int)workers || index >= CLUSTER_CONFIG_CHANNEL_OWNERS);
 }
 
 static bool
@@ -163,9 +175,9 @@ cluster_config_channels_arm(const ClusterSharedConfigRef *selected, const uint8 
 	int32 pid;
 	int index;
 	uint8 nonzero = 0;
-	if (selected == NULL || episode == NULL || !cluster_lms_enabled || cluster_lms_workers < 1
-		|| cluster_lms_workers >= CLUSTER_CONFIG_CHANNEL_OWNERS || cluster_normal_stop_requested()
-		|| !channel_self(&command.owner, &index) || index != 0
+	if (selected == NULL || episode == NULL || !cluster_lms_enabled || !cluster_lmd_enabled
+		|| cluster_lms_workers < 1 || cluster_lms_workers >= CLUSTER_CONFIG_CHANNEL_OWNERS
+		|| cluster_normal_stop_requested() || !channel_self(&command.owner, &index) || index != 0
 		|| (board = cluster_shared_config_delivery_channels(&pid)) == NULL || pid != MyProcPid
 		|| !cluster_reconfig_lmon_snapshot_r4_membership(&members)
 		|| !cluster_config_members_make_key(selected, &members, &command.key))
@@ -338,16 +350,17 @@ cluster_config_channels_received(int32 peer, const ClusterICEnvelope *env, Size 
 }
 
 static void
-channel_refresh(ClusterConfigChannelsBoard *board)
+channel_refresh(ClusterConfigChannelsBoard *board, bool service_ready)
 {
-	bool ready = true, complete = true;
+	bool ready = service_ready, complete = service_ready;
 	if (channel_local.report.phase == CHANNEL_INVALID) {
 		channel_report_write(board);
 		return;
 	}
 	memset(channel_local.report.armed, 0, sizeof(channel_local.report.armed));
 	memset(channel_local.report.complete, 0, sizeof(channel_local.report.complete));
-	for (unsigned peer = 0; peer < CLUSTER_MAX_NODES; ++peer) {
+	for (unsigned peer = 0;
+		 channel_local.index < CLUSTER_CONFIG_CHANNEL_OWNERS && peer < CLUSTER_MAX_NODES; ++peer) {
 		ClusterConfigPrefixExchange *exchange = &channel_local.peer[peer];
 		uint64 bit = UINT64CONST(1) << (peer % 64);
 		if (peer == (uint32)cluster_node_id
@@ -357,7 +370,7 @@ channel_refresh(ClusterConfigChannelsBoard *board)
 			ready = complete = false;
 			continue;
 		}
-		if (cluster_config_prefix_complete(exchange))
+		if (service_ready && cluster_config_prefix_complete(exchange))
 			channel_local.report.complete[peer / 64] |= bit;
 		else
 			complete = false;
@@ -375,6 +388,23 @@ channel_refresh(ClusterConfigChannelsBoard *board)
 	channel_report_write(board);
 }
 
+/* Only called at the original process's unlocked loop boundary, never from
+ * ingress. A module can own asynchronous work beyond the last received byte.
+ * Prefix-owned transport tails may be pending before first completion; the
+ * original poll must keep progressing them. Completed proof is not revived
+ * after new module work or an invalid observation. */
+static bool
+channel_service_ready(ClusterConfigChannelsBoard *board)
+{
+	ClusterServiceObservation observation;
+	ClusterNormalStopPollResult result = cluster_service_observe(&observation);
+	if ((result != CLUSTER_NORMAL_STOP_READY && result != CLUSTER_NORMAL_STOP_PENDING)
+		|| (result == CLUSTER_NORMAL_STOP_PENDING
+			&& channel_local.report.phase == CHANNEL_COMPLETE))
+		channel_invalid(board);
+	return result == CLUSTER_NORMAL_STOP_READY;
+}
+
 static bool
 channel_local_current(const ClusterConfigChannelsCommand *command)
 {
@@ -388,10 +418,19 @@ channel_local_current(const ClusterConfigChannelsCommand *command)
 static void
 channel_run(ClusterConfigChannelsBoard *board, const ClusterConfigChannelsCommand *command)
 {
+	bool ready;
 	if (channel_local.report.phase == CHANNEL_INVALID)
 		return;
 	channel_local.command.phase = command->phase;
-	for (unsigned peer = 0; peer < CLUSTER_MAX_NODES; ++peer) {
+	ready = channel_service_ready(board);
+	if (channel_local.report.phase == CHANNEL_INVALID)
+		return;
+	if (command->phase == CHANNEL_ARM && !ready) {
+		channel_refresh(board, false);
+		return;
+	}
+	for (unsigned peer = 0;
+		 channel_local.index < CLUSTER_CONFIG_CHANNEL_OWNERS && peer < CLUSTER_MAX_NODES; ++peer) {
 		ClusterConfigPrefixExchange *exchange = &channel_local.peer[peer];
 		if (peer == (uint32)cluster_node_id || !channel_member(command->key.required, peer))
 			continue;
@@ -404,14 +443,24 @@ channel_run(ClusterConfigChannelsBoard *board, const ClusterConfigChannelsComman
 											  command->incarnation[cluster_node_id],
 											  command->incarnation[peer]);
 		}
+		/* Validate every retained physical stream before sending on any one.
+		 * This check does not publish completion or depend on module idleness. */
+		if (exchange->active)
+			(void)cluster_config_prefix_complete(exchange);
+		if (exchange->failed) {
+			channel_invalid(board);
+			return;
+		}
 	}
-	channel_refresh(board);
-	if (channel_local.report.phase == CHANNEL_INVALID || command->phase != CHANNEL_EXCHANGE)
-		return;
-	for (unsigned peer = 0; peer < CLUSTER_MAX_NODES; ++peer)
-		if (channel_local.peer[peer].active)
-			cluster_config_prefix_poll(&channel_local.peer[peer]);
-	channel_refresh(board);
+	if (command->phase == CHANNEL_EXCHANGE) {
+		for (unsigned peer = 0; peer < CLUSTER_MAX_NODES; ++peer)
+			if (channel_local.peer[peer].active)
+				cluster_config_prefix_poll(&channel_local.peer[peer]);
+		/* Sending our own prefix can leave an accepted FIFO tail. Do not
+		 * confuse protocol acceptance with original transport/module idle. */
+		ready = channel_service_ready(board);
+	}
+	channel_refresh(board, ready);
 }
 
 /* Called by original loops outside their retained module-work brackets.
@@ -427,7 +476,7 @@ cluster_config_channels_tick(void)
 	int index;
 	board = cluster_shared_config_delivery_channels(&pid);
 	if (!channel_self(&actual, &index) || !channel_command_read(board, pid, &command, &sequence)
-		|| index > (int)command.workers || cluster_node_id < 0
+		|| !channel_owner_required(index, command.workers) || cluster_node_id < 0
 		|| cluster_node_id >= CLUSTER_MAX_NODES) {
 		/* A forked process must not publish through an inherited owner's slot. */
 		if (channel_local.active && channel_local.owner.pid == MyProcPid)
@@ -476,12 +525,16 @@ cluster_config_channels_ingress(const ClusterICEnvelope *env, const void *bytes)
 	if (env == NULL || env->source_node_id >= CLUSTER_MAX_NODES || cluster_normal_stop_requested()
 		|| (board = cluster_shared_config_delivery_channels(&pid)) == NULL
 		|| !channel_command_read(board, pid, &command, &sequence)
-		|| !channel_local_current(&command) || channel_local.report.phase == CHANNEL_INVALID)
+		|| !channel_local_current(&command) || channel_local.report.phase == CHANNEL_INVALID
+		|| channel_local.index >= CLUSTER_CONFIG_CHANNEL_OWNERS)
 		return;
 	PG_TRY();
 	{
 		(void)cluster_config_prefix_ingress(&channel_local.peer[env->source_node_id], env, bytes);
-		channel_refresh(board);
+		/* The last ACK is not a service-idle witness. Only the original idle
+		 * tick publishes completion; a broken stream is withdrawn immediately. */
+		if (channel_local.peer[env->source_node_id].failed)
+			channel_invalid(board);
 		if (sequence != pg_atomic_read_u64(&board->command_sequence))
 			channel_invalid(board);
 	}
@@ -514,9 +567,9 @@ channel_census(ClusterConfigChannelsBoard *board, const ClusterConfigChannelsCom
 			   ClusterConfigChannelsCensus *out)
 {
 	int32 *pids, *after;
-	uint64 report_sequence[CLUSTER_CONFIG_CHANNEL_OWNERS] = { 0 };
-	uint64 native_sequence[CLUSTER_CONFIG_CHANNEL_OWNERS] = { 0 };
-	int procno[CLUSTER_CONFIG_CHANNEL_OWNERS] = { 0 };
+	uint64 report_sequence[CLUSTER_CONFIG_SERVICE_OWNERS] = { 0 };
+	uint64 native_sequence[CLUSTER_CONFIG_SERVICE_OWNERS] = { 0 };
+	int procno[CLUSTER_CONFIG_SERVICE_OWNERS] = { 0 };
 	uint32 seen = 0;
 	uint32 capabilities[CLUSTER_MAX_NODES] = { 0 };
 	bool capability_seen[CLUSTER_MAX_NODES] = { false };
@@ -528,7 +581,8 @@ channel_census(ClusterConfigChannelsBoard *board, const ClusterConfigChannelsCom
 	after = pids + count;
 	if (!ProcConfigSnapshotPids(pids, count))
 		goto done;
-	out->required = (1u << (command->workers + 1)) - 1;
+	out->required = ((1u << (command->workers + 1)) - 1) | (1u << CLUSTER_CONFIG_LMD_OWNER)
+					| (1u << CLUSTER_CONFIG_SINVAL_OWNER);
 	out->serial = command->serial;
 	for (uint32 p = 0; p < count; ++p) {
 		ClusterSharedConfigRegistration reg;
@@ -542,10 +596,12 @@ channel_census(ClusterConfigChannelsBoard *board, const ClusterConfigChannelsCom
 			|| !cluster_shared_config_registration_read(&ProcGlobal->allProcs[p].cluster_config,
 														&reg))
 			goto done;
-		if (reg.role != B_LMON && reg.role != B_LMS && reg.role != B_LMS_WORKER)
+		if (reg.role != B_LMON && reg.role != B_LMS && reg.role != B_LMS_WORKER && reg.role != B_LMD
+			&& reg.role != B_SINVAL_BCAST)
 			continue;
-		if (!channel_owner_read(p, &actual, &index, &seq) || index > (int)command->workers
-			|| actual.pid != pids[p] || (seen & (1u << index)) != 0
+		if (!channel_owner_read(p, &actual, &index, &seq)
+			|| !channel_owner_required(index, command->workers) || actual.pid != pids[p]
+			|| (seen & (1u << index)) != 0
 			|| !channel_report_read(&board->slots[index], &report, &report_sequence[index])
 			|| report.serial != command->serial
 			|| memcmp(&report.owner, &actual, sizeof(actual)) != 0)
@@ -577,10 +633,12 @@ channel_census(ClusterConfigChannelsBoard *board, const ClusterConfigChannelsCom
 	if (seen != out->required || !ProcConfigSnapshotPids(after, count)
 		|| memcmp(pids, after, count * sizeof(*pids)) != 0)
 		goto done;
-	for (unsigned i = 0; i <= command->workers; ++i)
-		if (report_sequence[i] != pg_atomic_read_u64(&board->slots[i].sequence)
-			|| native_sequence[i]
-				   != pg_atomic_read_u64(&ProcGlobal->allProcs[procno[i]].cluster_config.sequence))
+	for (unsigned i = 0; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i)
+		if ((out->required & (1u << i)) != 0
+			&& (report_sequence[i] != pg_atomic_read_u64(&board->slots[i].sequence)
+				|| native_sequence[i]
+					   != pg_atomic_read_u64(
+						   &ProcGlobal->allProcs[procno[i]].cluster_config.sequence)))
 			goto done;
 	for (unsigned peer = 0; peer < CLUSTER_MAX_NODES; ++peer)
 		if (capability_seen[peer]

@@ -18,6 +18,9 @@
 #include "port/atomics.h"
 
 #define CLUSTER_CONFIG_CHANNEL_OWNERS (1 + CLUSTER_IC_TIER1_DATA_CHANNELS)
+#define CLUSTER_CONFIG_LMD_OWNER CLUSTER_CONFIG_CHANNEL_OWNERS
+#define CLUSTER_CONFIG_SINVAL_OWNER (CLUSTER_CONFIG_CHANNEL_OWNERS + 1)
+#define CLUSTER_CONFIG_SERVICE_OWNERS (CLUSTER_CONFIG_CHANNEL_OWNERS + 2)
 
 typedef struct ClusterConfigChannelOwner {
 	uint64 registration;
@@ -53,7 +56,7 @@ typedef struct ClusterConfigChannelSlot {
 typedef struct ClusterConfigChannelsBoard {
 	pg_atomic_uint64 command_sequence;
 	ClusterConfigChannelsCommand command;
-	ClusterConfigChannelSlot slots[CLUSTER_CONFIG_CHANNEL_OWNERS];
+	ClusterConfigChannelSlot slots[CLUSTER_CONFIG_SERVICE_OWNERS];
 } ClusterConfigChannelsBoard;
 
 typedef struct ClusterConfigChannelsCensus {
@@ -70,7 +73,7 @@ cluster_config_channels_init(ClusterConfigChannelsBoard *board)
 {
 	memset(board, 0, sizeof(*board));
 	pg_atomic_init_u64(&board->command_sequence, 0);
-	for (unsigned i = 0; i < CLUSTER_CONFIG_CHANNEL_OWNERS; ++i)
+	for (unsigned i = 0; i < CLUSTER_CONFIG_SERVICE_OWNERS; ++i)
 		pg_atomic_init_u64(&board->slots[i].sequence, 0);
 }
 extern ClusterConfigChannelsBoard *cluster_shared_config_delivery_channels(int32 *lmon_pid);
@@ -81,7 +84,9 @@ extern bool cluster_config_channels_arm(const ClusterSharedConfigRef *selected,
 										const uint8 episode[16]);
 extern bool cluster_config_channels_exchange(void);
 extern void cluster_config_channels_cancel(void);
-/* Bounded local observation only, never module retirement or application ACK. */
+/* Bounded local observation only, never global retirement or application ACK.
+ * LMD/SINVAL participate without a transport channel. Only original idle
+ * loops may publish completion after inspecting their module responsibilities. */
 extern bool cluster_config_channels_observe(ClusterConfigChannelsCensus *out);
 extern void cluster_config_channels_tick(void);
 /* Native transport calls before retiring/replacing a stream; -1 means all.

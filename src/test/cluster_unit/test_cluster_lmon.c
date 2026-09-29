@@ -118,6 +118,7 @@ static unsigned test_stop_lock_depth;
 static ClusterNormalStopPollResult test_stop_observation[21];
 bool cluster_shared_config;
 static unsigned test_control_owner_polls;
+static unsigned test_config_idle_ticks;
 
 /* Configuration coordination has separate real driver/channel tests. This
  * original-stop fixture has no selected image or channel command. */
@@ -127,6 +128,15 @@ cluster_config_members_register(void)
 void
 cluster_config_channels_register(void)
 {}
+void
+cluster_config_channels_tick(void)
+{
+	/* Actual LmonMain invokes this outside both original duty/dispatch work
+	 * brackets. This fixture supplies no report or configuration authority. */
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(test_stop_lock_depth, 0);
+	++test_config_idle_ticks;
+}
 void
 cluster_shared_config_delivery_lmon_tick(void)
 {}
@@ -1918,6 +1928,7 @@ test_run_normal_stop_lmon(bool transport, int scenario)
 	test_stop_exit_code = -1;
 	test_stop_duties = test_stop_events = test_stop_polls = test_stop_frees = 0;
 	test_control_owner_polls = 0;
+	test_config_idle_ticks = 0;
 	cluster_shared_config = scenario == 48;
 	test_stop_last_detail[0] = '\0';
 	test_stop_lock_depth = 0;
@@ -1997,6 +2008,7 @@ UT_TEST(test_stop_real_lmon_both_modes_work_wait_exit)
 	for (int mode = 0; mode < 2; mode++) {
 		test_run_normal_stop_lmon(mode, 0);
 		UT_ASSERT_EQ(test_stop_exit_code, 0);
+		UT_ASSERT(test_config_idle_ticks > 0);
 		UT_ASSERT_EQ(test_stop_duties, 1);
 		UT_ASSERT_EQ(test_stop_events, mode);
 		UT_ASSERT(test_stop_polls >= 12);

@@ -84,6 +84,7 @@
 #include "cluster/cluster_cancel_token.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_epoch.h"
@@ -1310,6 +1311,7 @@ LmdMain(void)
 		if (cluster_normal_stop_requested()
 			&& cluster_normal_stop_service_idle(LmdNormalStopPoll()) == CLUSTER_NORMAL_STOP_INVALID)
 			ereport(FATAL, (errmsg("LMD normal-stop idle observation failed")));
+		cluster_config_channels_tick();
 
 		if (current_submission_count > seen_submission_count) {
 			pg_atomic_fetch_add_u64(&cluster_lmd_state->lmd_wake_count, 1);

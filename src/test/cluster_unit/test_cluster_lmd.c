@@ -74,6 +74,7 @@
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_config_use_gate.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_shmem.h"
 #include "utils/guc.h"
@@ -118,11 +119,21 @@ static int test_main_exit_code, test_error_level;
 static pg_on_exit_callback test_exit_callback;
 static LWLock *test_locks[4];
 static unsigned test_lock_depth;
+static unsigned test_config_idle_ticks;
 static ClusterNormalStopPollResult test_graph_observation;
 static void test_stop_work(void);
 static int test_stop_wait(void);
 static void test_callback_late_work(void);
 #include "test_cluster_lmon_stop_service.inc"
+
+void
+cluster_config_channels_tick(void)
+{
+	/* Exercise actual original-loop placement, not an invented service ACK. */
+	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
+	UT_ASSERT_EQ(test_lock_depth, 0);
+	++test_config_idle_ticks;
+}
 
 
 /* ============================================================
@@ -1170,6 +1181,7 @@ run_stop_lmd_main(int scenario)
 	pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
 	test_main_case = scenario;
 	test_main_waits = test_main_scans = test_main_coord_scans = test_main_polls = 0;
+	test_config_idle_ticks = 0;
 	test_main_exit_code = -1;
 	test_exit_callback = NULL;
 	PG_exception_stack = NULL;
@@ -1195,6 +1207,7 @@ UT_TEST(test_lmd_actual_main_work_sleep_pending_and_ordinary)
 	for (int scenario = 1; scenario <= 3; scenario++) {
 		run_stop_lmd_main(scenario);
 		UT_ASSERT_EQ(test_main_exit_code, 0);
+		UT_ASSERT(test_config_idle_ticks > 0);
 		UT_ASSERT_EQ(test_main_waits, 2);
 		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
 		UT_ASSERT(scenario == 1 ? test_main_polls == 0 : test_main_polls >= 4);

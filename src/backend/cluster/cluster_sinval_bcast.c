@@ -31,6 +31,7 @@
 
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_service_observe.h"
+#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ko.h" /* cluster_ko_drain_inbound_and_apply (spec-5.7 D6) */
 #include "cluster/cluster_sinval.h"
@@ -245,6 +246,7 @@ SinvalBcastMain(void)
 			&& cluster_normal_stop_service_idle(SinvalBcastNormalStopPoll())
 				   == CLUSTER_NORMAL_STOP_INVALID)
 			ereport(FATAL, (errmsg("SI broadcaster normal-stop observation failed")));
+		cluster_config_channels_tick();
 
 		rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 					   cluster_sinval_broadcast_batch_timeout_ms, WAIT_EVENT_SINVAL_BROADCAST_SEND);
