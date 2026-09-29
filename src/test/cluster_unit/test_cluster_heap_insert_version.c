@@ -67,6 +67,7 @@ static BlockNumber blocks[4];
 static bool permanent, claim_ready, recovering;
 static bool deleting, updating, temp_locking, tuple_locking, chain_locking;
 static bool confirming, spec_aborting;
+static bool multi_inserting;
 static unsigned vm_locks;
 
 void
@@ -278,6 +279,12 @@ XLogRegisterData(char *bytes, uint32 len)
 	if (!begun)
 		abort();
 	if (data_calls++ == 0) {
+		if (multi_inserting) {
+			UT_ASSERT(len >= SizeOfHeapMultiInsert);
+			UT_ASSERT_EQ(((xl_heap_multi_insert *)bytes)->ntuples, 2);
+			heap_flags = ((xl_heap_multi_insert *)bytes)->flags;
+			return;
+		}
 		if (len
 			!= (confirming						  ? SizeOfHeapConfirm
 				: chain_locking					  ? SizeOfHeapLockUpdated
@@ -338,8 +345,9 @@ XLogInsert(RmgrId rmid, uint8 info)
 	int i;
 	uint8 operation = info & XLOG_HEAP_OPMASK;
 
-	if (!begun || rmid != (chain_locking ? RM_HEAP2_ID : RM_HEAP_ID)
-		|| (confirming						  ? operation != XLOG_HEAP_CONFIRM
+	if (!begun || rmid != ((chain_locking || multi_inserting) ? RM_HEAP2_ID : RM_HEAP_ID)
+		|| (multi_inserting					  ? operation != XLOG_HEAP2_MULTI_INSERT
+			: confirming					  ? operation != XLOG_HEAP_CONFIRM
 			: chain_locking					  ? operation != XLOG_HEAP2_LOCK_UPDATED
 			: (temp_locking || tuple_locking) ? operation != XLOG_HEAP_LOCK
 			: updating
@@ -499,7 +507,7 @@ reset(bool versioned, bool vm, bool bit_set)
 	blocks[3] = 1;
 	permanent = claim_ready = true;
 	recovering = deleting = updating = temp_locking = tuple_locking = chain_locking = false;
-	confirming = spec_aborting = false;
+	confirming = spec_aborting = multi_inserting = false;
 	NLocBuffer = 1;
 	BufferBlocks = pages[0].data;
 	PageInitHeapPage(pages[0].data, BLCKSZ, 0);
@@ -1303,10 +1311,95 @@ UT_TEST(test_actual_speculative_captures_leave_page_unchanged)
 	}
 }
 
+static void
+run_multi(bool versioned, bool frozen)
+{
+	Relation relation = &relation_data;
+	Buffer buffer = 1, vmbuffer = want_vm ? 2 : InvalidBuffer;
+	Page page = pages[0].data;
+	HeapTupleData second = tuple;
+	HeapTuple heaptuples[2] = { &tuple, &second };
+	PGAlignedBlock scratch;
+	bool all_visible_cleared = false, all_frozen_set = frozen;
+	bool needwal = true, need_cids = false, need_tuple_data = false;
+	bool starting_with_empty_page = PageGetMaxOffsetNumber(page) == 0;
+	int ndone = 0, ntuples = 2, nthispage, i;
+	int options = frozen ? HEAP_INSERT_FROZEN : 0;
+	Size saveFreeSpace = 0;
+	bool cluster_page_versioned pg_attribute_unused() = versioned;
+	RfPageProducerBatchV1 cluster_page_versions pg_attribute_unused() = prepared;
+
+	multi_inserting = true;
+#include "test_cluster_heap_multi_version.inc"
+}
+
+UT_TEST(test_native_multi_versions_actual_batch_and_frozen_option)
+{
+	for (int mode = 0; mode < 3; mode++) {
+		bool vm = mode == 1;
+		reset(true, vm, vm);
+		run_multi(true, mode == 2);
+		UT_ASSERT_EQ(edge_count, vm ? 2 : 1);
+		UT_ASSERT_EQ(edge_token, 100);
+		UT_ASSERT_EQ(edges[0].before.mutation_token, 17);
+		UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 100);
+		UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 2);
+		UT_ASSERT_EQ(itl_stamps, 0);
+		UT_ASSERT_EQ(inserts, 1);
+		UT_ASSERT_EQ(PageGetLSN(pages[0].data), 200);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+		if (vm) {
+			UT_ASSERT_EQ(edges[1].before.mutation_token, 31);
+			UT_ASSERT_EQ(PageGetLSN(pages[1].data), 200);
+			UT_ASSERT_EQ(register_flags[1], REGBUF_FORCE_IMAGE);
+			UT_ASSERT((heap_flags & XLH_INSERT_ALL_VISIBLE_CLEARED) != 0);
+		} else if (mode == 2) {
+			UT_ASSERT(PageIsAllVisible(pages[0].data));
+			UT_ASSERT((heap_flags & XLH_INSERT_ALL_FROZEN_SET) != 0);
+		}
+	}
+}
+UT_TEST(test_nonshared_multi_keeps_native_wal_shape)
+{
+	reset(false, true, true);
+	run_multi(false, false);
+	UT_ASSERT_EQ(edge_count, 0);
+	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 17);
+	UT_ASSERT_EQ(PageGetMaxOffsetNumber(pages[0].data), 2);
+	UT_ASSERT(!registered[1]);
+	UT_ASSERT_EQ(inserts, 1);
+}
+UT_TEST(test_actual_multi_capture_leaves_both_pages_unchanged)
+{
+	for (int vm = 0; vm <= 1; vm++) {
+		Buffer buffer = 1, vmbuffer = vm ? 2 : InvalidBuffer;
+		bool vm_locked = vm != 0, cluster_page_versioned = true;
+		ClusterSpaceIdentity cluster_page_identity;
+		RfPageProducerBatchV1 cluster_page_versions = { 0 };
+		PGAlignedBlock before[2];
+
+		reset(true, vm != 0, vm != 0);
+		cluster_page_identity = identity;
+		memcpy(before, pages, sizeof(before));
+#include "test_cluster_heap_multi_capture.inc"
+		UT_ASSERT(memcmp(before, pages, sizeof(before)) == 0);
+		UT_ASSERT(!cluster_page_versions.stamped);
+		UT_ASSERT_EQ(cluster_page_versions.entry_count, vm ? 2 : 1);
+		UT_ASSERT_EQ(cluster_page_versions.entries[0].before.mutation_token, 17);
+		prepared = cluster_page_versions;
+		run_multi(true, false);
+		UT_ASSERT_EQ(edge_token, cluster_page_versions.result_token);
+		UT_ASSERT_EQ(edge_count, vm ? 2 : 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(25);
+	UT_RUN(test_native_multi_versions_actual_batch_and_frozen_option);
+	UT_RUN(test_nonshared_multi_keeps_native_wal_shape);
+	UT_RUN(test_actual_multi_capture_leaves_both_pages_unchanged);
 	UT_RUN(test_native_insert_publishes_heap_edge_with_itl_delta);
 	UT_RUN(test_native_insert_covers_vm_even_when_bit_was_already_clear);
 	UT_RUN(test_legacy_insert_keeps_existing_wal_shape);

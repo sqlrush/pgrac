@@ -6566,6 +6566,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 	bool		starting_with_empty_page = false;
 	int			npages = 0;
 	int			npages_used = 0;
+#ifdef USE_PGRAC_CLUSTER
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_page_versions;
+#endif
 
 	/* currently not needed (thus unsupported) for heap_multi_insert() */
 	Assert(!(options & HEAP_INSERT_NO_LOGICAL));
@@ -6598,6 +6603,18 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			slots[i]->tts_tid = tuple->t_self;
 		}
 		return;
+	}
+
+	/* PGRAC: the native batch has no ITL producer, but every shared page
+	 * mutation still needs a version. Copy cached identity before page locks. */
+	if (cluster_shared_config
+		&& relation->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_get_identity(relation, &cluster_page_identity))
+			elog(ERROR, "shared heap multi-insert requires a live SPACE identity");
+		cluster_page_versioned = true;
 	}
 #endif
 
@@ -6699,8 +6716,30 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			vm_locked = true;
 		}
 
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: native multi-insert captures after its final VM lock. */
+		if (cluster_page_versioned)
+		{
+			Buffer version_buffers[2] = {buffer, vmbuffer};
+			uint8 version_ids[2] = {0, 1};
+
+			if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+					version_buffers, version_ids, vm_locked ? 2 : 1,
+					&cluster_page_versions))
+				elog(ERROR, "shared heap multi-insert cannot capture exact page versions");
+		}
+#endif
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			if (!rf_page_producer_stamp_v1(&cluster_page_versions))
+				elog(PANIC, "shared heap multi-insert page version changed before publication");
+			if (cluster_page_versions.entry_count == 2)
+				MarkBufferDirty(vmbuffer);
+		}
+#endif
 		/*
 		 * RelationGetBufferForTuple has ensured that the first tuple fits.
 		 * Put that on the page, and then as many other tuples as fit.
@@ -6859,6 +6898,15 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			XLogRegisterData((char *) xlrec, tupledata - scratch.data);
 
 			XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | bufflags);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_page_versioned)
+			{
+				if (cluster_page_versions.entry_count == 2)
+					XLogRegisterBuffer(1, vmbuffer, REGBUF_FORCE_IMAGE);
+				if (!rf_page_producer_register_wal_v1(&cluster_page_versions))
+					elog(PANIC, "shared heap multi-insert cannot register page versions");
+			}
+#endif
 
 			XLogRegisterBufData(0, tupledata, totaldatalen);
 
@@ -6868,6 +6916,10 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			recptr = XLogInsert(RM_HEAP2_ID, info);
 
 			PageSetLSN(page, recptr);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_page_versioned && cluster_page_versions.entry_count == 2)
+				PageSetLSN(BufferGetPage(vmbuffer), recptr);
+#endif
 		}
 
 		END_CRIT_SECTION();
@@ -6892,7 +6944,11 @@ heap_multi_insert(Relation relation, TupleTableSlot **slots, int ntuples,
 			visibilitymap_set(relation, BufferGetBlockNumber(buffer), buffer,
 							  InvalidXLogRecPtr, vmbuffer,
 							  InvalidTransactionId,
-							  VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN);
+							  VISIBILITYMAP_ALL_VISIBLE | VISIBILITYMAP_ALL_FROZEN
+#ifdef USE_PGRAC_CLUSTER
+							  , cluster_page_versioned ? &cluster_page_identity : NULL
+#endif
+							  );
 		}
 
 		UnlockReleaseBuffer(buffer);
@@ -21775,7 +21831,11 @@ bottomup_sort_and_shrink(TM_IndexDeleteOp *delstate)
  */
 XLogRecPtr
 log_heap_visible(Relation rel, Buffer heap_buffer, Buffer vm_buffer,
-				 TransactionId snapshotConflictHorizon, uint8 vmflags)
+				 TransactionId snapshotConflictHorizon, uint8 vmflags
+#ifdef USE_PGRAC_CLUSTER
+				 , const RfPageProducerBatchV1 *versions
+#endif
+				 )
 {
 	xl_heap_visible xlrec;
 	XLogRecPtr	recptr;
@@ -21791,12 +21851,22 @@ log_heap_visible(Relation rel, Buffer heap_buffer, Buffer vm_buffer,
 	XLogBeginInsert();
 	XLogRegisterData((char *) &xlrec, SizeOfHeapVisible);
 
-	XLogRegisterBuffer(0, vm_buffer, 0);
+	/* PGRAC: the VM bitmap is not STANDARD page payload. Preserve every
+	 * other heap block's bits in the shared version's complete image. */
+	XLogRegisterBuffer(0, vm_buffer,
+#ifdef USE_PGRAC_CLUSTER
+					  versions != NULL ? REGBUF_FORCE_IMAGE :
+#endif
+					  0);
 
 	flags = REGBUF_STANDARD;
 	if (!XLogHintBitIsNeeded())
 		flags |= REGBUF_NO_IMAGE;
 	XLogRegisterBuffer(1, heap_buffer, flags);
+#ifdef USE_PGRAC_CLUSTER
+	if (versions != NULL && !rf_page_producer_register_wal_v1(versions))
+		elog(PANIC, "shared VM visible cannot register page versions");
+#endif
 
 	recptr = XLogInsert(RM_HEAP2_ID, XLOG_HEAP2_VISIBLE);
 
@@ -22603,7 +22673,11 @@ heap_xlog_visible(XLogReaderState *record)
 		visibilitymap_pin(reln, blkno, &vmbuffer);
 
 		visibilitymap_set(reln, blkno, InvalidBuffer, lsn, vmbuffer,
-						  xlrec->snapshotConflictHorizon, vmbits);
+						  xlrec->snapshotConflictHorizon, vmbits
+#ifdef USE_PGRAC_CLUSTER
+						  , NULL
+#endif
+						  );
 
 		ReleaseBuffer(vmbuffer);
 		FreeFakeRelcacheEntry(reln);

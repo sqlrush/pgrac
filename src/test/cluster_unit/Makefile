@@ -78,7 +78,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_cluster_tt_slot_allocator test_cluster_itl_reader_real_triple \
         test_cluster_hw_handoff test_cluster_lms_native_probe \
         test_cluster_itl_cleanout test_cluster_visibility_inject test_cluster_itl_cleanout_perf \
-        test_cluster_heap_lock_tuple test_cluster_heap_epq_wait test_cluster_heap_inplace test_cluster_heap_inplace_version test_cluster_heap_maintenance_version test_cluster_perf_gates \
+        test_cluster_heap_lock_tuple test_cluster_heap_epq_wait test_cluster_heap_inplace test_cluster_heap_inplace_version test_cluster_heap_maintenance_version test_cluster_vm_visible_version test_cluster_perf_gates \
 	        test_cluster_subtrans test_cluster_multixact test_cluster_multixact_current test_cluster_multixact_current_stats test_cluster_multixact_served test_cluster_mxid_stripe \
 		test_cluster_r4_d10_hint_source test_cluster_r4_d10_tt_source test_cluster_r4_d10_multi_source \
         test_cluster_undo_format \
@@ -424,6 +424,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_page_install,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_producer test_cluster_space_fork test_cluster_space_identity test_cluster_space_page_verify test_cluster_space_table_size test_cluster_space_wal test_cluster_space_storage test_cluster_space_cache test_cluster_space_recovery_route test_cluster_space_copy test_cluster_space_copy_version test_cluster_heap_insert_version test_cluster_vm_version test_cluster_vm_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_redo,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_page_stable_base,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_side_xact,$(SIMPLE_TESTS))
@@ -1266,6 +1267,41 @@ test_cluster_page_install: test_cluster_page_install.c unit_test.h \
 
 CLUSTER_PAGE_PRODUCER_O = cluster_page_producer_test.o
 
+# PGRAC: native VM setter and its original heap-visible WAL logger.
+test_cluster_vm_visible_body.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^visibilitymap_set_locked\(/ { inside=1; found++ } \
+	     inside && /^{/ { emit=1 } emit { print } /^}/ { inside=emit=0 } \
+	     END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_visible_log.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^log_heap_visible\(/ { print "XLogRecPtr"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_visible_wrapper.inc: $(top_srcdir)/src/backend/access/heap/visibilitymap.c Makefile
+	awk '/^visibilitymap_set\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_visible_empty.inc: $(top_srcdir)/src/backend/access/heap/vacuumlazy.c Makefile
+	awk '/Unlike new pages, empty pages/ { inside=1; found++ } \
+	     inside && /if \(!PageIsAllVisible\(page\)\)/ { emit=1 } \
+	     emit && /freespace = PageGetHeapFreeSpace/ { emit=inside=0; done++ } \
+	     emit { print } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_vm_visible_version: test_cluster_vm_visible_version.c unit_test.h \
+		test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc \
+		test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
+		test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 # PGRAC: native maintenance mutation/WAL bodies and tuple/page helpers.
 test_cluster_heap_prune_version.inc: $(top_srcdir)/src/backend/access/heap/pruneheap.c Makefile
 	awk '/Any error while applying the changes is critical/ { emit=1; found++ } \
@@ -1321,6 +1357,19 @@ test_cluster_heap_maintenance_version: test_cluster_heap_maintenance_version.c u
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: the real INSERT mutation/WAL block and native tuple/page insertion.
+test_cluster_heap_multi_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_multi_insert\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { emit=1; starts++ } emit { print } \
+	     inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_multi_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/PGRAC: native multi-insert captures/ { emit=1; found++ } \
+	     emit { print } emit && /^\t\t}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_insert_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^heap_insert\(/ { inside=1 } \
 	     inside && /START_CRIT_SECTION\(\);/ { emit=1; starts++ } \
@@ -1498,6 +1547,7 @@ test_cluster_vm_redo: test_cluster_vm_redo.c test_cluster_vm_redo_consumers.inc 
 		$(filter-out -lpgcommon -lpgport,$(LIBS)) -o $@
 
 test_cluster_heap_insert_version: test_cluster_heap_insert_version.c unit_test.h \
+		test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
 		test_cluster_heap_confirm_version.inc test_cluster_heap_spec_abort_version.inc \
 		test_cluster_heap_confirm_capture.inc test_cluster_heap_spec_abort_capture.inc \
@@ -3232,6 +3282,9 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_heap_multi_version.inc test_cluster_heap_multi_capture.inc
+	rm -f test_cluster_vm_visible_body.inc test_cluster_vm_visible_log.inc
+	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_heap_maintenance_identity.inc
 	rm -f test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc test_cluster_heap_vacuum_version.inc

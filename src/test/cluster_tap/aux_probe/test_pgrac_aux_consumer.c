@@ -34,7 +34,10 @@
 #include "catalog/pg_type.h"
 #include "cluster/cluster_pcm_lock.h"
 #include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_write_fence.h"
+#include "cluster/storage/cluster_smgr.h"
 #include "executor/spi.h"
 #include "fmgr.h"
 #include "miscadmin.h"
@@ -266,6 +269,8 @@ aux_cycle_internal(FunctionCallInfo fcinfo, bool describe)
 	char *result;
 	uint64 sequence;
 	BlockNumber observed_block;
+	ClusterSpaceIdentity space_identity;
+	const ClusterSpaceIdentity *version_identity = NULL;
 
 	if (!superuser())
 		ereport(ERROR, (errmsg("auxiliary consumer probe requires superuser")));
@@ -280,6 +285,13 @@ aux_cycle_internal(FunctionCallInfo fcinfo, bool describe)
 		ereport(ERROR, (errmsg("auxiliary mutation requires the permanent aux_mutate fixture")));
 	if (block >= RelationGetNumberOfBlocks(relation))
 		ereport(ERROR, (errmsg("auxiliary mutation block is outside the existing heap")));
+	/* PGRAC: the real VM producer consumes a pre-lock identity value. */
+	if (cluster_shared_config && fork_arg == VISIBILITYMAP_FORKNUM
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1) {
+		if (!cluster_space_relation_get_identity(relation, &space_identity))
+			ereport(ERROR, (errmsg("auxiliary mutation requires a live SPACE identity")));
+		version_identity = &space_identity;
+	}
 	sequence = probe_next_operation();
 	observed_block = block < 16 ? (fork_arg == VISIBILITYMAP_FORKNUM ? 0 : 2) : InvalidBlockNumber;
 	probe_operation(relation, fork_arg, observed_block, RESOURCE_X_TRACE_OPERATION_BEGIN, sequence,
@@ -311,9 +323,9 @@ aux_cycle_internal(FunctionCallInfo fcinfo, bool describe)
 		/* The page is independently proven frozen under content-X.  Clearing
 		 * is conservative; only the existing WAL-producing set API restores it. */
 		MarkBufferDirty(heap_buffer);
-		while (!visibilitymap_set_retry_aware(relation, block, heap_buffer, InvalidXLogRecPtr,
-											  &vm_buffer, InvalidTransactionId,
-											  VISIBILITYMAP_VALID_BITS, &aux_context)) {
+		while (!visibilitymap_set_retry_aware(
+			relation, block, heap_buffer, InvalidXLogRecPtr, &vm_buffer, InvalidTransactionId,
+			VISIBILITYMAP_VALID_BITS, &aux_context, version_identity)) {
 			/* Clear already completed. Do not replay it or demand initial VM
 			 * bits again; only a freshly re-proven heap may restore the bits. */
 			LockBuffer(heap_buffer, BUFFER_LOCK_UNLOCK);

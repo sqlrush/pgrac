@@ -41,9 +41,17 @@ extern void visibilitymap_pin(Relation rel, BlockNumber heapBlk,
 extern bool visibilitymap_pin_recent(Relation rel, BlockNumber heapBlk,
 								 Buffer recent_buffer, Buffer *vmbuf);
 extern bool visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf);
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: callers copy this identity before acquiring page content locks. */
+struct ClusterSpaceIdentity;
+#endif
 extern void visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 							  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
-							  uint8 flags);
+							  uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+							  , const struct ClusterSpaceIdentity *identity
+#endif
+							  );
 struct ResourceXAuxiliaryAcquireContext;
 /* False means not executed; caller releases/requalifies its outer heap proof.
  * InvalidBuffer means the lower handoff already released the old pin. */
@@ -54,7 +62,11 @@ extern bool visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, B
 extern bool visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 										  XLogRecPtr recptr, Buffer *vmbuf,
 										  TransactionId cutoff_xid, uint8 flags,
-										  struct ResourceXAuxiliaryAcquireContext *context);
+										  struct ResourceXAuxiliaryAcquireContext *context
+#ifdef USE_PGRAC_CLUSTER
+										  , const struct ClusterSpaceIdentity *identity
+#endif
+										  );
 extern uint8 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf);
 extern void visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_frozen);
 extern BlockNumber visibilitymap_prepare_truncate(Relation rel,

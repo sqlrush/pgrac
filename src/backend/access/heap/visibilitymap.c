@@ -158,7 +158,11 @@ static Buffer vm_readbuf(Relation rel, BlockNumber blkno, bool extend);
 static Buffer vm_extend(Relation rel, BlockNumber vm_nblocks);
 static void visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 									 XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
-									 uint8 flags);
+									 uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+									 , const ClusterSpaceIdentity *identity
+#endif
+									 );
 
 
 /*
@@ -493,8 +497,10 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
  * when a page that is already all-visible is being marked all-frozen.
  *
  * Caller is expected to set the heap page's PD_ALL_VISIBLE bit before calling
- * this function. Except in recovery, caller should also pass the heap
- * buffer. When checksums are enabled and we're not in recovery, we must add
+ * this function, except that the PGRAC shared producer sets it together with
+ * the VM bit after capturing both page versions. Except in recovery, caller
+ * should also pass the heap buffer. When checksums are enabled and we're not
+ * in recovery, we must add
  * the heap buffer to the WAL chain to protect it from being torn.
  *
  * You must pass a buffer containing the correct map page to this function.
@@ -504,46 +510,76 @@ visibilitymap_pin_ok(BlockNumber heapBlk, Buffer vmbuf)
 void
 visibilitymap_set(Relation rel, BlockNumber heapBlk, Buffer heapBuf,
 				  XLogRecPtr recptr, Buffer vmBuf, TransactionId cutoff_xid,
-				  uint8 flags)
+				  uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+				  , const ClusterSpaceIdentity *identity
+#endif
+				  )
 {
 	if (!BufferIsValid(vmBuf) || !visibilitymap_pin_ok(heapBlk, vmBuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set");
 	LockBuffer(vmBuf, BUFFER_LOCK_EXCLUSIVE);
-	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, vmBuf, cutoff_xid, flags);
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, vmBuf, cutoff_xid, flags
+#ifdef USE_PGRAC_CLUSTER
+							 , identity
+#endif
+							 );
 	LockBuffer(vmBuf, BUFFER_LOCK_UNLOCK);
 }
 
 bool
 visibilitymap_set_retry_aware(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
 							  Buffer *vmbuf, TransactionId cutoff_xid, uint8 flags,
-							  struct ResourceXAuxiliaryAcquireContext *context)
+							  struct ResourceXAuxiliaryAcquireContext *context
+#ifdef USE_PGRAC_CLUSTER
+							  , const ClusterSpaceIdentity *identity
+#endif
+							  )
 {
 	Assert(vmbuf != NULL && context != NULL);
 	if (!BufferIsValid(*vmbuf) || !visibilitymap_pin_ok(heapBlk, *vmbuf))
 		elog(ERROR, "wrong VM buffer passed to visibilitymap_set_retry_aware");
 	if (!ClusterLockBufferExclusiveAuxiliaryAware(vmbuf, context))
 		return false;
-	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, *vmbuf, cutoff_xid, flags);
+	visibilitymap_set_locked(rel, heapBlk, heapBuf, recptr, *vmbuf, cutoff_xid, flags
+#ifdef USE_PGRAC_CLUSTER
+							 , identity
+#endif
+							 );
 	LockBuffer(*vmbuf, BUFFER_LOCK_UNLOCK);
 	return true;
 }
 
 static void
 visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLogRecPtr recptr,
-						 Buffer vmBuf, TransactionId cutoff_xid, uint8 flags)
+						 Buffer vmBuf, TransactionId cutoff_xid, uint8 flags
+#ifdef USE_PGRAC_CLUSTER
+						 , const ClusterSpaceIdentity *identity
+#endif
+						 )
 {
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
 	Page		page;
 	uint8	   *map;
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned = cluster_shared_config && !InRecovery
+		&& rel->rd_rel->relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1;
+	RfPageProducerBatchV1 versions;
+#endif
 
 #ifdef TRACE_VISIBILITYMAP
 	elog(DEBUG1, "vm_set %s %d", RelationGetRelationName(rel), heapBlk);
 #endif
 
 	Assert(InRecovery || XLogRecPtrIsInvalid(recptr));
-	Assert(InRecovery || PageIsAllVisible((Page) BufferGetPage(heapBuf)));
+	Assert(InRecovery
+#ifdef USE_PGRAC_CLUSTER
+		   || versioned
+#endif
+		   || PageIsAllVisible((Page) BufferGetPage(heapBuf)));
 	Assert((flags & VISIBILITYMAP_VALID_BITS) == flags);
 
 	/* Must never set all_frozen bit without also setting all_visible bit */
@@ -560,10 +596,38 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 	page = BufferGetPage(vmBuf);
 	map = (uint8 *)PageGetContents(page);
 
-	if (flags != (map[mapByte] >> mapOffset & VISIBILITYMAP_VALID_BITS))
+	if (flags != (map[mapByte] >> mapOffset & VISIBILITYMAP_VALID_BITS)
+#ifdef USE_PGRAC_CLUSTER
+		|| (versioned && !PageIsAllVisible((Page) BufferGetPage(heapBuf)))
+#endif
+		)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: no SPACE I/O or visible-bit publication before both exact
+		 * before versions are captured. The caller already holds the heap
+		 * content lock; the wrapper acquired the VM lock outside critical. */
+		if (versioned)
+		{
+			Buffer buffers[2] = {vmBuf, heapBuf};
+			uint8 ids[2] = {0, 1};
+
+			if (!RelationNeedsWAL(rel)
+				|| !cluster_space_prepare_buffer_versions(identity, buffers, ids, 2,
+														 &versions))
+				elog(ERROR, "shared VM visible cannot capture exact page versions");
+		}
+#endif
 		START_CRIT_SECTION();
 
+#ifdef USE_PGRAC_CLUSTER
+		if (versioned)
+		{
+			if (!rf_page_producer_stamp_v1(&versions))
+				elog(PANIC, "shared VM visible page version changed before publication");
+			PageSetAllVisible((Page) BufferGetPage(heapBuf));
+			MarkBufferDirty(heapBuf);
+		}
+#endif
 		map[mapByte] |= (flags << mapOffset);
 		MarkBufferDirty(vmBuf);
 
@@ -572,7 +636,11 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 			if (XLogRecPtrIsInvalid(recptr))
 			{
 				Assert(!InRecovery);
-				recptr = log_heap_visible(rel, heapBuf, vmBuf, cutoff_xid, flags);
+				recptr = log_heap_visible(rel, heapBuf, vmBuf, cutoff_xid, flags
+#ifdef USE_PGRAC_CLUSTER
+										 , versioned ? &versions : NULL
+#endif
+										 );
 
 				/*
 				 * If data checksums are enabled (or wal_log_hints=on), we
@@ -583,7 +651,13 @@ visibilitymap_set_locked(Relation rel, BlockNumber heapBlk, Buffer heapBuf, XLog
 				 * WAL record inserted above, so it would be incorrect to
 				 * update the heap page's LSN.
 				 */
-				if (XLogHintBitIsNeeded())
+				/* PGRAC: shared replay binds the heap's explicit version and
+				 * native visible delta even when a heap FPI is unnecessary. */
+				if (XLogHintBitIsNeeded()
+#ifdef USE_PGRAC_CLUSTER
+					|| versioned
+#endif
+					)
 				{
 					Page		heapPage = BufferGetPage(heapBuf);
 
