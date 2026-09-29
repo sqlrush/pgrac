@@ -1231,6 +1231,12 @@ test_cluster_space_catalog_product.o: $(top_srcdir)/src/backend/catalog/storage.
 test_cluster_space_smgrdesc_product.o: $(top_srcdir)/src/backend/access/rmgrdesc/smgrdesc.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
+# PGRAC: retain the real allocation/free calls made by truncate preparation.
+# Invalid-page bookkeeping remains an I/O boundary fixture in this test.
+test_cluster_space_xlogutils_product.o: $(top_srcdir)/src/backend/access/transam/xlogutils.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -DXLogTruncateRelation=space_unused_XLogTruncateRelation \
+		-ffunction-sections -fdata-sections -c $< -o $@
+
 # PGRAC: execute the original static classifier, with no test branch in it.
 test_cluster_space_recovery_route.inc: $(top_srcdir)/src/backend/access/transam/xlogrecovery.c Makefile
 	awk '/^cluster_record_apply_class\(/ { print "static ClusterRecoveryRecordClass"; emit=1; count++ } \
@@ -1243,10 +1249,12 @@ test_cluster_space_recovery_route: test_cluster_space_recovery_route.c test_clus
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_space_storage: test_cluster_space_storage.c unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
+		test_cluster_space_xlogutils_product.o \
 		$(top_builddir)/src/backend/cluster/cluster_space_storage.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		$(top_builddir)/src/backend/cluster/cluster_space_storage.o test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
+		test_cluster_space_xlogutils_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 

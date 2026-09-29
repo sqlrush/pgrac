@@ -1030,6 +1030,106 @@ AtSubAbort_smgr(void)
 	smgrDoPendingDeletes(false);
 }
 
+/* PGRAC: share the original physical truncation sequence with the typed
+ * SPACE owner. lsn remains a local recovery coordinate; this helper alone
+ * does not authorize a foreign-thread replay or prove its WAL durability. */
+void
+smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec)
+{
+	SMgrRelation reln;
+	Relation	rel;
+	ForkNumber	forks[MAX_FORKNUM];
+	BlockNumber blocks[MAX_FORKNUM];
+	BlockNumber old_blocks[MAX_FORKNUM];
+	int			nforks = 0;
+	bool		need_fsm_vacuum = false;
+
+	reln = smgropen(xlrec->rlocator, InvalidBackendId);
+
+	/*
+	 * Forcibly create relation if it doesn't exist (which suggests that
+	 * it was dropped somewhere later in the WAL sequence).  As in
+	 * XLogReadBufferForRedo, we prefer to recreate the rel and replay the
+	 * log as best we can until the drop is seen.
+	 */
+	smgrcreate(reln, MAIN_FORKNUM, true);
+
+	/*
+	 * Before we perform the truncation, update minimum recovery point to
+	 * cover this WAL record. Once the relation is truncated, there's no
+	 * going back. The buffer manager enforces the WAL-first rule for
+	 * normal updates to relation files, so that the minimum recovery
+	 * point is always updated before the corresponding change in the data
+	 * file is flushed to disk. We have to do the same manually here.
+	 *
+	 * Doing this before the truncation means that if the truncation fails
+	 * for some reason, you cannot start up the system even after restart,
+	 * until you fix the underlying situation so that the truncation will
+	 * succeed. Alternatively, we could update the minimum recovery point
+	 * after truncation, but that would leave a small window where the
+	 * WAL-first rule could be violated.
+	 */
+	XLogFlush(lsn);
+
+	/* Prepare for truncation of MAIN fork */
+	if ((xlrec->flags & SMGR_TRUNCATE_HEAP) != 0)
+	{
+		forks[nforks] = MAIN_FORKNUM;
+		old_blocks[nforks] = smgrnblocks(reln, MAIN_FORKNUM);
+		blocks[nforks] = xlrec->blkno;
+		nforks++;
+
+		/* Also tell xlogutils.c about it */
+		XLogTruncateRelation(xlrec->rlocator, MAIN_FORKNUM, xlrec->blkno);
+	}
+
+	/* Prepare for truncation of FSM and VM too */
+	rel = CreateFakeRelcacheEntry(xlrec->rlocator);
+
+	if ((xlrec->flags & SMGR_TRUNCATE_FSM) != 0 &&
+		smgrexists(reln, FSM_FORKNUM))
+	{
+		blocks[nforks] = FreeSpaceMapPrepareTruncateRel(rel, xlrec->blkno);
+		if (BlockNumberIsValid(blocks[nforks]))
+		{
+			forks[nforks] = FSM_FORKNUM;
+			old_blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
+			nforks++;
+			need_fsm_vacuum = true;
+		}
+	}
+	if ((xlrec->flags & SMGR_TRUNCATE_VM) != 0 &&
+		smgrexists(reln, VISIBILITYMAP_FORKNUM))
+	{
+		blocks[nforks] = visibilitymap_prepare_truncate(rel, xlrec->blkno);
+		if (BlockNumberIsValid(blocks[nforks]))
+		{
+			forks[nforks] = VISIBILITYMAP_FORKNUM;
+			old_blocks[nforks] = smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
+			nforks++;
+		}
+	}
+
+	/* Do the real work to truncate relation forks */
+	if (nforks > 0)
+	{
+		START_CRIT_SECTION();
+		smgrtruncate2(reln, forks, nforks, old_blocks, blocks);
+		END_CRIT_SECTION();
+	}
+
+	/*
+	 * Update upper-level FSM pages to account for the truncation. This is
+	 * important because the just-truncated pages were likely marked as
+	 * all-free, and would be preferentially selected.
+	 */
+	if (need_fsm_vacuum)
+		FreeSpaceMapVacuumRange(rel, xlrec->blkno,
+								InvalidBlockNumber);
+
+	FreeFakeRelcacheEntry(rel);
+}
+
 void
 smgr_redo(XLogReaderState *record)
 {
@@ -1061,98 +1161,8 @@ smgr_redo(XLogReaderState *record)
 	else if (info == XLOG_SMGR_TRUNCATE)
 	{
 		xl_smgr_truncate *xlrec = (xl_smgr_truncate *) XLogRecGetData(record);
-		SMgrRelation reln;
-		Relation	rel;
-		ForkNumber	forks[MAX_FORKNUM];
-		BlockNumber blocks[MAX_FORKNUM];
-		BlockNumber old_blocks[MAX_FORKNUM];
-		int			nforks = 0;
-		bool		need_fsm_vacuum = false;
 
-		reln = smgropen(xlrec->rlocator, InvalidBackendId);
-
-		/*
-		 * Forcibly create relation if it doesn't exist (which suggests that
-		 * it was dropped somewhere later in the WAL sequence).  As in
-		 * XLogReadBufferForRedo, we prefer to recreate the rel and replay the
-		 * log as best we can until the drop is seen.
-		 */
-		smgrcreate(reln, MAIN_FORKNUM, true);
-
-		/*
-		 * Before we perform the truncation, update minimum recovery point to
-		 * cover this WAL record. Once the relation is truncated, there's no
-		 * going back. The buffer manager enforces the WAL-first rule for
-		 * normal updates to relation files, so that the minimum recovery
-		 * point is always updated before the corresponding change in the data
-		 * file is flushed to disk. We have to do the same manually here.
-		 *
-		 * Doing this before the truncation means that if the truncation fails
-		 * for some reason, you cannot start up the system even after restart,
-		 * until you fix the underlying situation so that the truncation will
-		 * succeed. Alternatively, we could update the minimum recovery point
-		 * after truncation, but that would leave a small window where the
-		 * WAL-first rule could be violated.
-		 */
-		XLogFlush(lsn);
-
-		/* Prepare for truncation of MAIN fork */
-		if ((xlrec->flags & SMGR_TRUNCATE_HEAP) != 0)
-		{
-			forks[nforks] = MAIN_FORKNUM;
-			old_blocks[nforks] = smgrnblocks(reln, MAIN_FORKNUM);
-			blocks[nforks] = xlrec->blkno;
-			nforks++;
-
-			/* Also tell xlogutils.c about it */
-			XLogTruncateRelation(xlrec->rlocator, MAIN_FORKNUM, xlrec->blkno);
-		}
-
-		/* Prepare for truncation of FSM and VM too */
-		rel = CreateFakeRelcacheEntry(xlrec->rlocator);
-
-		if ((xlrec->flags & SMGR_TRUNCATE_FSM) != 0 &&
-			smgrexists(reln, FSM_FORKNUM))
-		{
-			blocks[nforks] = FreeSpaceMapPrepareTruncateRel(rel, xlrec->blkno);
-			if (BlockNumberIsValid(blocks[nforks]))
-			{
-				forks[nforks] = FSM_FORKNUM;
-				old_blocks[nforks] = smgrnblocks(reln, FSM_FORKNUM);
-				nforks++;
-				need_fsm_vacuum = true;
-			}
-		}
-		if ((xlrec->flags & SMGR_TRUNCATE_VM) != 0 &&
-			smgrexists(reln, VISIBILITYMAP_FORKNUM))
-		{
-			blocks[nforks] = visibilitymap_prepare_truncate(rel, xlrec->blkno);
-			if (BlockNumberIsValid(blocks[nforks]))
-			{
-				forks[nforks] = VISIBILITYMAP_FORKNUM;
-				old_blocks[nforks] = smgrnblocks(reln, VISIBILITYMAP_FORKNUM);
-				nforks++;
-			}
-		}
-
-		/* Do the real work to truncate relation forks */
-		if (nforks > 0)
-		{
-			START_CRIT_SECTION();
-			smgrtruncate2(reln, forks, nforks, old_blocks, blocks);
-			END_CRIT_SECTION();
-		}
-
-		/*
-		 * Update upper-level FSM pages to account for the truncation. This is
-		 * important because the just-truncated pages were likely marked as
-		 * all-free, and would be preferentially selected.
-		 */
-		if (need_fsm_vacuum)
-			FreeSpaceMapVacuumRange(rel, xlrec->blkno,
-									InvalidBlockNumber);
-
-		FreeFakeRelcacheEntry(rel);
+		smgr_redo_truncate(lsn, xlrec);
 	}
 	else
 		elog(PANIC, "smgr_redo: unknown op code %u", info);

@@ -57,6 +57,8 @@ typedef struct xl_smgr_truncate
 extern void log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum);
 
 extern void smgr_redo(XLogReaderState *record);
+/* PGRAC: native physical sequence; lsn is a local recovery coordinate. */
+extern void smgr_redo_truncate(XLogRecPtr lsn, const xl_smgr_truncate *xlrec);
 extern void smgr_desc(StringInfo buf, XLogReaderState *record);
 extern const char *smgr_identify(uint8 info);
 

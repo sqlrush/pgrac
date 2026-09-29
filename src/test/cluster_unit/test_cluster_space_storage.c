@@ -16,20 +16,25 @@
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xact.h"
+#include "access/xlogutils.h"
+#include "access/visibilitymap.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_tablespace_d.h"
 #include "catalog/storage.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_ko.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/freespace.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/memutils.h"
+#include "utils/rel.h"
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
@@ -59,6 +64,13 @@ static uint32 registered_len;
 static unsigned main_create_calls, unlink_calls;
 static bool native_owner, delete_registered;
 static RelFileLocator locator = { DEFAULTTABLESPACE_OID, 5, 16384 };
+static BlockNumber main_blocks;
+static unsigned truncate_calls, flush_calls, fsm_vacuums;
+static bool auxiliary_forks;
+static Relation fake_relation;
+static unsigned fake_allocations, fake_frees;
+static int nest_level;
+static unsigned ko_calls;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -119,7 +131,11 @@ smgropen(RelFileLocator tag, BackendId backend)
 bool
 smgrexists(SMgrRelation rel, ForkNumber forknum)
 {
-	if (rel != &storage || forknum != SPACE_FORKNUM)
+	if (rel != &storage)
+		abort();
+	if (recovering && (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM))
+		return auxiliary_forks;
+	if (forknum != SPACE_FORKNUM)
 		abort();
 	return exists;
 }
@@ -129,7 +145,7 @@ smgrcreate(SMgrRelation rel, ForkNumber forknum, bool is_redo)
 {
 	if (rel != &storage || is_redo != recovering)
 		abort();
-	if (forknum == MAIN_FORKNUM && native_owner) {
+	if (forknum == MAIN_FORKNUM && (native_owner || recovering)) {
 		main_create_calls++;
 		return;
 	}
@@ -142,9 +158,82 @@ smgrcreate(SMgrRelation rel, ForkNumber forknum, bool is_redo)
 BlockNumber
 smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 {
-	if (rel != &storage || forknum != SPACE_FORKNUM)
+	if (rel != &storage)
+		abort();
+	if (recovering && forknum == MAIN_FORKNUM)
+		return main_blocks;
+	if (recovering && auxiliary_forks && forknum == FSM_FORKNUM)
+		return 8;
+	if (recovering && auxiliary_forks && forknum == VISIBILITYMAP_FORKNUM)
+		return 3;
+	if (forknum != SPACE_FORKNUM)
 		abort();
 	return blocks;
+}
+
+void
+XLogFlush(XLogRecPtr lsn)
+{
+	if (!recovering || lsn != UINT64_C(0x20000200) || !locked)
+		abort();
+	flush_calls++;
+}
+
+void
+XLogTruncateRelation(RelFileLocator tag, ForkNumber forknum, BlockNumber count)
+{
+	if (!RelFileLocatorEquals(tag, locator) || forknum != MAIN_FORKNUM || count != 4)
+		abort();
+}
+
+void
+smgrclearowner(SMgrRelation *owner, SMgrRelation rel)
+{
+	if (rel != &storage || owner != &fake_relation->rd_smgr)
+		abort();
+	*owner = NULL;
+	rel->smgr_owner = NULL;
+}
+
+BlockNumber
+FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber count)
+{
+	if (rel != fake_relation || count != 4 || !auxiliary_forks
+		|| !RelFileLocatorEquals(rel->rd_locator, locator)
+		|| rel->rd_rel->relpersistence != RELPERSISTENCE_PERMANENT)
+		abort();
+	return 1;
+}
+BlockNumber
+visibilitymap_prepare_truncate(Relation rel, BlockNumber count)
+{
+	if (rel != fake_relation || count != 4 || !auxiliary_forks)
+		abort();
+	return 1;
+}
+void
+FreeSpaceMapVacuumRange(Relation rel, BlockNumber start, BlockNumber end)
+{
+	if (rel != fake_relation || start != 4 || end != InvalidBlockNumber || !auxiliary_forks
+		|| truncate_calls == 0)
+		abort();
+	fsm_vacuums++;
+}
+
+void
+smgrtruncate2(SMgrRelation rel, ForkNumber *forks, int nforks, BlockNumber *oldblocks,
+			  BlockNumber *newblocks)
+{
+	if (rel != &storage || nforks != (auxiliary_forks ? 3 : 1) || forks[0] != MAIN_FORKNUM
+		|| !locked || !pinned || CritSectionCount == 0 || flush_calls != truncate_calls + 1
+		|| oldblocks[0] != main_blocks || newblocks[0] != 4)
+		abort();
+	if (auxiliary_forks
+		&& (forks[1] != FSM_FORKNUM || forks[2] != VISIBILITYMAP_FORKNUM || oldblocks[1] != 8
+			|| oldblocks[2] != 3 || newblocks[1] != 1 || newblocks[2] != 1))
+		abort();
+	main_blocks = newblocks[0];
+	truncate_calls++;
 }
 
 Buffer
@@ -248,7 +337,7 @@ IsInParallelMode(void)
 int
 GetCurrentTransactionNestLevel(void)
 {
-	return 1;
+	return nest_level;
 }
 void *
 MemoryContextAlloc(MemoryContext context, Size size)
@@ -264,6 +353,19 @@ palloc(Size size)
 	return malloc(size);
 }
 void *
+palloc0(Size size)
+{
+	/* Real CreateFakeRelcacheEntry calls this boundary. Model a normal
+	 * recovery memory context, which disallows allocation in a critical
+	 * section, rather than masking the native allocation with a static rel. */
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	if (fake_relation != NULL || size < sizeof(RelationData))
+		abort();
+	fake_relation = calloc(1, size);
+	fake_allocations++;
+	return fake_relation;
+}
+void *
 repalloc(void *ptr, Size size)
 {
 	return realloc(ptr, size);
@@ -271,6 +373,10 @@ repalloc(void *ptr, Size size)
 void
 pfree(void *ptr)
 {
+	if (ptr == fake_relation) {
+		fake_frees++;
+		fake_relation = NULL;
+	}
 	free(ptr);
 }
 HTAB *
@@ -301,8 +407,17 @@ smgrdounlinkall(SMgrRelation *rels, int count, bool redo)
 void
 smgrclose(SMgrRelation rel)
 {
-	if (rel != &storage || unlink_calls != 1)
+	if (rel != &storage)
 		abort();
+	if (rel->smgr_owner != NULL)
+		*rel->smgr_owner = NULL;
+}
+void
+cluster_ko_flush_and_wait_ack(RelFileLocator tag, char persistence)
+{
+	if (!RelFileLocatorEquals(tag, locator) || persistence != RELPERSISTENCE_PERMANENT)
+		abort();
+	ko_calls++;
 }
 int
 errmsg(const char *fmt, ...)
@@ -320,6 +435,9 @@ errcode(int code)
 static void
 reset(void)
 {
+	if (fake_relation != NULL)
+		abort();
+	fake_allocations = fake_frees = 0;
 	memset(&page, 0, sizeof(page));
 	memset(&storage, 0, sizeof(storage));
 	memset(&ref, 0, sizeof(ref));
@@ -333,6 +451,11 @@ reset(void)
 	cluster_recmerge_window_active = cluster_recmerge_apply_foreign = false;
 	native_owner = delete_registered = false;
 	main_create_calls = unlink_calls = registered_len = 0;
+	main_blocks = 10;
+	truncate_calls = flush_calls = fsm_vacuums = 0;
+	auxiliary_forks = false;
+	nest_level = 1;
+	ko_calls = 0;
 	CritSectionCount = blocks = io_calls = create_calls = wal_calls = dirty_calls = release_calls
 		= 0;
 	BufferBlocks = page.data;
@@ -455,16 +578,181 @@ UT_TEST(test_native_descriptor_recognizes_typed_record)
 	UT_ASSERT(smgr_identify(0xf0) == NULL);
 }
 
+static void
+truncate_record(XLogReaderState *reader, DecodedXLogRecord *decoded)
+{
+	ClusterSpaceWalChange change;
+
+	if (!cluster_space_relation_create(locator)
+		|| !cluster_space_wal_decode(wal_bytes, sizeof(wal_bytes), &change))
+		abort();
+	change.action = CLUSTER_SPACE_WAL_TRUNCATE;
+	change.nblocks = 4;
+	change.expected = change.result;
+	change.before_token = change.result_token;
+	change.result.incarnation[0] ^= 1;
+	change.result.sequence++;
+	change.result.operation = ++change.result_token;
+	if (!cluster_space_wal_encode(&change, wal_bytes, sizeof(wal_bytes)))
+		abort();
+	memset(decoded, 0, sizeof(*decoded));
+	memset(reader, 0, sizeof(*reader));
+	decoded->header.xl_rmid = RM_SMGR_ID;
+	decoded->header.xl_info = XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE;
+	decoded->main_data = (char *)wal_bytes;
+	decoded->main_data_len = sizeof(wal_bytes);
+	decoded->max_block_id = -1;
+	reader->record = decoded;
+	reader->EndRecPtr = UINT64_C(0x20000200);
+	reader->cluster_expected_thread_id = 1;
+	recovering = true;
+}
+
+UT_TEST(test_truncate_replay_checks_identity_before_native_shrink)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	PGAlignedBlock saved;
+
+	reset();
+	truncate_record(&reader, &decoded);
+	smgr_redo(&reader);
+	UT_ASSERT_EQ(main_blocks, 4);
+	UT_ASSERT_EQ(truncate_calls, 1);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 18);
+	UT_ASSERT(!pinned && !locked);
+	saved = page;
+	UT_ASSERT(cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(truncate_calls, 2);
+	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
+	UT_ASSERT_EQ(dirty_calls, 2); /* CREATE and the first TRUNCATE only. */
+	UT_ASSERT_EQ(fake_allocations, 2);
+	UT_ASSERT_EQ(fake_frees, fake_allocations);
+}
+
+UT_TEST(test_truncate_mismatch_or_foreign_input_does_not_touch_files)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	PGAlignedBlock saved;
+
+	reset();
+	truncate_record(&reader, &decoded);
+	/* No claim that the legacy local minRecoveryPoint is a foreign-WAL
+	 * durability coordinate. The per-origin input binding is still required. */
+	cluster_recmerge_apply_foreign = true;
+	saved = page;
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(truncate_calls, 0);
+	UT_ASSERT_EQ(flush_calls, 0);
+	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
+	cluster_recmerge_apply_foreign = false;
+	reader.cluster_expected_thread_id = 2;
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(truncate_calls, 0);
+	UT_ASSERT_EQ(flush_calls, 0);
+	reader.cluster_expected_thread_id = 1;
+	((PageHeader)page.data)->pd_block_scn = 99;
+	saved = page;
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(truncate_calls, 0);
+	UT_ASSERT_EQ(main_blocks, 10);
+	UT_ASSERT_EQ(flush_calls, 0);
+	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_truncate_replay_preserves_native_auxiliary_forks)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+
+	reset();
+	truncate_record(&reader, &decoded);
+	auxiliary_forks = true;
+	smgr_redo(&reader);
+	UT_ASSERT_EQ(main_blocks, 4);
+	UT_ASSERT_EQ(truncate_calls, 1);
+	UT_ASSERT_EQ(fsm_vacuums, 1);
+	UT_ASSERT_EQ(blocks, 1); /* SPACE was not physically truncated. */
+	UT_ASSERT_EQ(fake_allocations, 1);
+	UT_ASSERT_EQ(fake_frees, fake_allocations);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 18);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_aborted_drop_keeps_existing_live_identity)
+{
+	RelationData rel;
+	FormData_pg_class form;
+	PGAlignedBlock saved;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	saved = page;
+	native_owner = true;
+	memset(&rel, 0, sizeof(rel));
+	memset(&form, 0, sizeof(form));
+	rel.rd_locator = locator;
+	rel.rd_backend = InvalidBackendId;
+	rel.rd_smgr = &storage;
+	rel.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	storage.smgr_owner = &rel.rd_smgr;
+	RelationDropStorage(&rel);
+	UT_ASSERT_EQ(ko_calls, 1);
+	UT_ASSERT_EQ(unlink_calls, 0);
+	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
+	smgrDoPendingDeletes(false);
+	UT_ASSERT_EQ(unlink_calls, 0);
+	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
+	UT_ASSERT_EQ(wal_calls, 1); /* No early irreversible tombstone. */
+}
+
+UT_TEST(test_subabort_forgets_drop_without_tombstoning)
+{
+	RelationData rel;
+	FormData_pg_class form;
+	PGAlignedBlock saved;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	saved = page;
+	native_owner = true;
+	nest_level = 2;
+	memset(&rel, 0, sizeof(rel));
+	memset(&form, 0, sizeof(form));
+	rel.rd_locator = locator;
+	rel.rd_backend = InvalidBackendId;
+	rel.rd_smgr = &storage;
+	rel.rd_rel = &form;
+	form.relpersistence = RELPERSISTENCE_PERMANENT;
+	storage.smgr_owner = &rel.rd_smgr;
+	RelationDropStorage(&rel);
+	AtSubAbort_smgr();
+	nest_level = 1;
+	smgrDoPendingDeletes(true);
+	UT_ASSERT_EQ(unlink_calls, 0);
+	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
+	UT_ASSERT_EQ(wal_calls, 1);
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(11);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
 	UT_RUN(test_real_replay_exact_duplicate_and_preserved_token);
 	UT_RUN(test_native_create_registers_abort_cleanup_before_space);
 	UT_RUN(test_native_descriptor_recognizes_typed_record);
+	UT_RUN(test_truncate_replay_checks_identity_before_native_shrink);
+	UT_RUN(test_truncate_mismatch_or_foreign_input_does_not_touch_files);
+	UT_RUN(test_truncate_replay_preserves_native_auxiliary_forks);
+	UT_RUN(test_aborted_drop_keeps_existing_live_identity);
+	UT_RUN(test_subabort_forgets_drop_without_tombstoning);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

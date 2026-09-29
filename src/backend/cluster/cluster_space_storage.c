@@ -26,7 +26,7 @@
 #include "storage/smgr.h"
 
 static bool
-space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out)
+space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out, uint16 *thread)
 {
 	ClusterWalDurablePrefixRef ref;
 
@@ -40,6 +40,8 @@ space_namespace(RelFileLocator locator, bool redo, ClusterSpaceIdentityKey *out)
 	out->database_incarnation = ref.claim.database_incarnation;
 	memcpy(out->storage_uuid, ref.claim.identity.storage_uuid, 16);
 	out->locator = locator;
+	if (thread != NULL)
+		*thread = ref.claim.identity.origin_thread_id;
 	return true;
 }
 
@@ -67,7 +69,7 @@ cluster_space_relation_create(RelFileLocator locator)
 	if (!cluster_shared_config || cluster_smgr_which_for(locator, InvalidBackendId) != 1)
 		return true;
 	memset(&change, 0, sizeof(change));
-	if (RecoveryInProgress() || !space_namespace(locator, false, &change.result.key))
+	if (RecoveryInProgress() || !space_namespace(locator, false, &change.result.key, NULL))
 		return false;
 	change.action = CLUSTER_SPACE_WAL_CREATE;
 	change.nblocks = InvalidBlockNumber;
@@ -119,26 +121,33 @@ cluster_space_relation_redo(XLogReaderState *record)
 	SMgrRelation rel;
 	BlockNumber blocks;
 	Buffer buffer;
+	uint16 local_thread;
 
 	if (record == NULL || record->record == NULL || !RecoveryInProgress()
 		|| XLogRecGetRmid(record) != RM_SMGR_ID
 		|| (XLogRecGetInfo(record) & ~XLR_INFO_MASK) != XLOG_SMGR_SPACE_IDENTITY
 		|| XLogRecHasAnyBlockRefs(record) || XLogRecPtrIsInvalid(record->EndRecPtr)
 		|| !cluster_space_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record), &change)
-		|| !space_namespace(change.result.key.locator, true, &expected))
+		|| !space_namespace(change.result.key.locator, true, &expected, &local_thread))
 		return false;
 	/* Independently selected namespace, not the untrusted WAL payload. */
 	if (!cluster_space_identity_encode(&change.result, check, sizeof(check))
 		|| !cluster_space_identity_decode(check, sizeof(check), &expected, &change.result))
 		return false;
-	/* These structural owners are wired separately before format activation.
-	 * Never treat their decoded record as an already-applied CREATE. */
-	if (change.action != CLUSTER_SPACE_WAL_CREATE)
+	/* Foreign structural replay requires its selected per-origin durability
+	 * input, not the recovering thread's minRecoveryPoint. Keep it closed
+	 * until that owner is wired; never flush a foreign numeric LSN locally. */
+	if (change.action != CLUSTER_SPACE_WAL_CREATE
+		&& (change.action != CLUSTER_SPACE_WAL_TRUNCATE || cluster_recmerge_apply_foreign
+			|| local_thread == 0 || record->cluster_expected_thread_id != local_thread))
 		return false;
 	rel = smgropen(expected.locator, InvalidBackendId);
-	smgrcreate(rel, SPACE_FORKNUM, true);
+	if (change.action == CLUSTER_SPACE_WAL_CREATE)
+		smgrcreate(rel, SPACE_FORKNUM, true);
+	else if (!smgrexists(rel, SPACE_FORKNUM))
+		return false;
 	blocks = smgrnblocks(rel, SPACE_FORKNUM);
-	if (blocks > 1)
+	if (blocks > 1 || (change.action != CLUSTER_SPACE_WAL_CREATE && blocks != 1))
 		return false;
 	buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, blocks == 0 ? P_NEW : 0,
 									   blocks == 0 ? RBM_ZERO_AND_LOCK : RBM_NORMAL, NULL, true);
@@ -150,6 +159,23 @@ cluster_space_relation_redo(XLogReaderState *record)
 	}
 	memcpy(result.data, BufferGetPage(buffer), BLCKSZ);
 	transition = cluster_space_wal_apply(&change, &expected, result.data, BLCKSZ);
+	if (transition != CLUSTER_SPACE_IDENTITY_APPLY
+		&& transition != CLUSTER_SPACE_IDENTITY_ALREADY) {
+		UnlockReleaseBuffer(buffer);
+		return false;
+	}
+	if (change.action == CLUSTER_SPACE_WAL_TRUNCATE) {
+		xl_smgr_truncate truncate;
+
+		truncate.rlocator = expected.locator;
+		truncate.blkno = change.nblocks;
+		truncate.flags = SMGR_TRUNCATE_ALL;
+		/* Native preparation allocates memory; only its physical shrink is
+		 * critical. Keep SPACE locked, finish the structural action first,
+		 * then publish identity. A restart can repeat a completed shrink even
+		 * when SPACE already has result, or still has expected identity. */
+		smgr_redo_truncate(record->EndRecPtr, &truncate);
+	}
 	if (transition == CLUSTER_SPACE_IDENTITY_APPLY) {
 		START_CRIT_SECTION();
 		memcpy(BufferGetPage(buffer), result.data, BLCKSZ);
