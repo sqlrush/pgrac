@@ -424,7 +424,7 @@ cluster_external_fence_rejoin_revalidate_root(PgracExternalFenceRejoinOpV1 *op,
 
 bool
 cluster_external_fence_rejoin_consume_nowait(PgracExternalFenceRejoinOpV1 *op,
-													 const ClusterReconfigRejoinPendingSnapshotV1 *pending,
+											 const ClusterReconfigRejoinPendingSnapshotV1 *pending,
 											 const ClusterJoinCommitMarker *marker,
 											 PgracExternalFenceDenyReason *reason)
 {
@@ -447,8 +447,8 @@ cluster_external_fence_rejoin_consume_nowait(PgracExternalFenceRejoinOpV1 *op,
 
 ClusterControlRootResult
 cluster_external_fence_rejoin_consume_terminal_history(PgracExternalFenceRejoinOpV1 *op,
-														 int32 candidate_node,
-														 uint64 candidate_incarnation)
+													   int32 candidate_node,
+													   uint64 candidate_incarnation)
 {
 	(void)op;
 	(void)candidate_node;
@@ -2727,6 +2727,37 @@ UT_TEST(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence)
 	ut_set_self_incarnation_sequence(UINT64_C(101), UINT64_C(101), UINT64_C(101));
 	UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
 	UT_ASSERT_EQ(snapshot.admitted_members_lo, 0);
+}
+
+UT_TEST(test_mount_membership_postmaster_never_queues_for_reconfig_lock)
+{
+	ClusterR4MembershipSnapshot snapshot, empty = { 0 };
+	static PGPROC backend;
+
+	/* Both the initial capture and final recheck can race the LMON writer.
+	 * The production function must refuse either busy observation, not enter
+	 * the native wait queue that requires a PGPROC. */
+	for (int cut = 1; cut <= 2; ++cut) {
+		ut_prepare_exact_r4_membership();
+		MyProc = NULL;
+		ut_lwlock_conditional_result = true;
+		ut_lwlock_conditional_calls = ut_lwlock_blocking_calls = 0;
+		ut_lwlock_conditional_fail_call = cut;
+		memset(&snapshot, 0xa5, sizeof(snapshot));
+		UT_ASSERT(!cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+		UT_ASSERT_EQ(ut_lwlock_blocking_calls, 0);
+		UT_ASSERT_EQ(ut_lwlock_conditional_calls, cut);
+		UT_ASSERT(memcmp(&snapshot, &empty, sizeof(empty)) == 0);
+	}
+	ut_lwlock_conditional_fail_call = 0;
+	UT_ASSERT(cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(snapshot.admitted_members_lo, 15);
+	ut_lwlock_conditional_calls = ut_lwlock_blocking_calls = 0;
+	MyProc = &backend;
+	UT_ASSERT(cluster_reconfig_lmon_snapshot_r4_membership(&snapshot));
+	UT_ASSERT_EQ(ut_lwlock_conditional_calls, 0);
+	UT_ASSERT_EQ(ut_lwlock_blocking_calls, 2);
+	MyProc = NULL;
 }
 
 /* A decoded phase-1 frame is only a purge candidate after the current local
@@ -6245,7 +6276,8 @@ UT_TEST(test_pre2_recovery_launch_waits_before_cf)
 	memset(&eligibility, 0xa5, sizeof(eligibility));
 	UT_ASSERT(!cluster_reconfig_thread_recovery_eligibility_consume(1, &eligibility));
 	UT_ASSERT_EQ(ut_recovery_root_calls, 0);
-	UT_ASSERT(memcmp(&eligibility, &(ClusterThreadRecLaunchEligibility){ 0 }, sizeof(eligibility)) == 0);
+	UT_ASSERT(memcmp(&eligibility, &(ClusterThreadRecLaunchEligibility){ 0 }, sizeof(eligibility))
+			  == 0);
 	cluster_shared_config = false;
 }
 
@@ -7170,7 +7202,7 @@ UT_TEST(test_stop_reconfig_actual_formation_owner)
 int
 main(void)
 {
-	UT_PLAN(129);
+	UT_PLAN(130);
 	UT_RUN(test_stop_membership_terminal_peer_is_not_online_admission);
 	UT_RUN(test_stop_membership_preserves_all_nonliveness_requirements);
 	UT_RUN(test_stop_reconfig_shared_owners);
@@ -7197,6 +7229,7 @@ main(void)
 	UT_RUN(test_self_join_admitted_no_pgproc_never_blocks_on_reconfig_lock);
 	UT_RUN(test_r4_membership_snapshot_captures_exact_current_four_node_view);
 	UT_RUN(test_r4_membership_snapshot_fails_closed_on_inexact_member_evidence);
+	UT_RUN(test_mount_membership_postmaster_never_queues_for_reconfig_lock);
 	UT_RUN(test_reconfig_replacement_episode_is_embedded_and_zero_initialized);
 	UT_RUN(test_reconfig_publish_increments_apply_counter);
 	UT_RUN(test_reconfig_publish_overwrites_event_seq_monotonically);

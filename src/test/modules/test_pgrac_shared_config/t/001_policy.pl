@@ -36,6 +36,18 @@ my $before = $node->safe_psql('postgres', q{
 	'cluster.shared_data_dir','cluster.ges_request_timeout_ms','shared_buffers')
 	ORDER BY name});
 
+for my $enabled ('on', 'true', '1', 'yes')
+{
+	like(entry(-1, 'track_commit_timestamp', $enabled, 'false'), qr/^0:4:/,
+		"shared commit-ts enable $enabled is outside the supported recovery profile");
+	like(entry(-1, 'track_commit_timestamp', $enabled, 'true'), qr/^0:4:/,
+		"online shared publication cannot stage commit-ts enable $enabled");
+}
+like(entry(-1, 'track_commit_timestamp', 'off', 'true'), qr/^1:0:1:1:/,
+	'shared commit-ts off remains an explicit static default');
+like(entry(-1, 'track_commit_timestamp', 'garbage', 'false'), qr/^0:8:/,
+	'invalid boolean is distinguished from an unsupported true value');
+
 like(entry(-1, 'statement_timeout', '5s', 'true'), qr/^1:0:1:0:0:/,
 	'native session parameter may have a shared default');
 like(entry(0, 'port', '6543', 'true'), qr/^1:0:1:1:0:/,

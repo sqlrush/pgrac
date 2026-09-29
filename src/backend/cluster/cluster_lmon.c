@@ -81,7 +81,6 @@
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_config_members.h"
-#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_hw.h" /* cluster_hw_register_ic_msg_types (spec-5.7 D1) */
@@ -227,7 +226,6 @@ cluster_lmon_shmem_init(void)
 		if (cluster_shared_config) {
 			cluster_startup_exit_register();
 			cluster_config_members_register();
-			cluster_config_channels_register();
 		}
 		heartbeat_registered = true;
 	}
@@ -1977,7 +1975,6 @@ LmonMain(void)
 			PG_END_TRY();
 			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 				ereport(FATAL, (errmsg_internal("LMON normal-stop idle check failed")));
-			cluster_config_channels_tick();
 			n_events = WaitEventSetWait(wes, wait_ms, ev, lengthof(ev),
 										WAIT_EVENT_CLUSTER_IC_HEARTBEAT_WAIT);
 
@@ -2163,7 +2160,6 @@ LmonMain(void)
 			PG_END_TRY();
 			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 				ereport(FATAL, (errmsg_internal("LMON normal-stop post-dispatch check failed")));
-			cluster_config_channels_tick();
 		}
 
 		/* Shutdown: close every fd we own + free WES. */
@@ -2352,7 +2348,6 @@ LmonMain(void)
 			PG_END_TRY();
 			if (lmon_normal_stop_idle() == CLUSTER_NORMAL_STOP_INVALID)
 				ereport(FATAL, (errmsg_internal("LMON normal-stop stub idle check failed")));
-			cluster_config_channels_tick();
 			rc = WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						   cluster_lmon_main_loop_interval,
 						   WAIT_EVENT_CLUSTER_BGPROC_LMON_MAIN_LOOP);

@@ -24,6 +24,7 @@
 #include "postmaster/interrupt.h"
 #include "postmaster/startup.h"
 #include "storage/latch.h"
+#include "cluster/cluster_config_members.h"
 #include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "utils/wait_event.h"
@@ -74,6 +75,17 @@ static EndOfWalRecoveryInfo input;
 static unsigned advance_calls, route_calls, bind_calls, writer_read_calls;
 static bool restart_ok, route_ok, bind_ok, writer_read_ok, writer_read_changed;
 static ClusterControlRootResult advance_returns[4];
+static ClusterConfigMountResult mount_result;
+static unsigned mount_waits;
+ClusterConfigMountResult
+cluster_config_members_mount_status(void)
+{
+	if (mount_waits > 0) {
+		--mount_waits;
+		return CLUSTER_CONFIG_MOUNT_UNPROVEN;
+	}
+	return mount_result;
+}
 
 void *
 palloc(Size n)
@@ -501,6 +513,8 @@ reset_fixture(void)
 	advance_calls = route_calls = bind_calls = writer_read_calls = 0;
 	restart_ok = route_ok = bind_ok = writer_read_ok = true;
 	writer_read_changed = false;
+	mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
+	mount_waits = 0;
 	InRecovery = ArchiveRecoveryRequested = false;
 }
 static bool
@@ -957,6 +971,37 @@ writer_begin(void)
 	return startup_first_native_site() ? writer_bind() : InvalidXLogRecPtr;
 }
 
+UT_TEST(static_common_wait_precedes_initializer_and_native_directory)
+{
+	writer_begin_fixture();
+	mount_waits = 2;
+	UT_ASSERT_EQ(writer_begin(), wal_segment_size);
+	UT_ASSERT_EQ(waits, 2);
+	UT_ASSERT_EQ(advance_calls, 1);
+	UT_ASSERT(!directory_before_selection);
+}
+UT_TEST(static_common_mismatch_or_cancel_never_writes)
+{
+	for (unsigned fault = 0; fault < 2; ++fault) {
+		writer_begin_fixture();
+		mount_result = fault == 0 ? CLUSTER_CONFIG_MOUNT_MISMATCH : CLUSTER_CONFIG_MOUNT_UNPROVEN;
+		cancel_on_wait = fault == 1;
+		UT_ASSERT(!startup_first_native_site());
+		UT_ASSERT_EQ(advance_calls | route_calls | bind_calls | startup_directory_calls, 0);
+		UT_ASSERT(!clusterStartupWriterSelected && !clusterStartupWriterBound);
+		UT_ASSERT_EQ(cf_mode, NoLock);
+	}
+}
+UT_TEST(static_common_is_rechecked_before_new_wal_binding)
+{
+	writer_begin_fixture();
+	UT_ASSERT(startup_first_native_site());
+	mount_result = CLUSTER_CONFIG_MOUNT_MISMATCH;
+	UT_ASSERT_EQ(writer_bind(), InvalidXLogRecPtr);
+	UT_ASSERT_EQ(route_calls | bind_calls | writer_read_calls, 0);
+	UT_ASSERT(!clusterStartupWriterBound);
+}
+
 UT_TEST(initializer_selection_precedes_first_native_side_effect)
 {
 	writer_begin_fixture();
@@ -1178,7 +1223,10 @@ UT_TEST(native_startup_insert_has_no_link_or_page_from_predecessor)
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(30);
+	UT_RUN(static_common_wait_precedes_initializer_and_native_directory);
+	UT_RUN(static_common_mismatch_or_cancel_never_writes);
+	UT_RUN(static_common_is_rechecked_before_new_wal_binding);
 	UT_RUN(prepare_uses_short_owned_read);
 	UT_RUN(prepare_refuses_unsupported_or_unproven_input);
 	UT_RUN(publish_retries_only_root_competition_before_projection);

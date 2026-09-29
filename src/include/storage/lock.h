@@ -598,12 +598,6 @@ extern void LockReleaseCurrentOwner(LOCALLOCK **locallocks, int nlocks);
 extern void LockReassignCurrentOwner(LOCALLOCK **locallocks, int nlocks);
 extern bool LockHeldByMe(const LOCKTAG *locktag, LOCKMODE lockmode);
 extern bool LockOrStrongerHeldByMe(const LOCKTAG *locktag, LOCKMODE lockmode);
-#ifdef USE_PGRAC_CLUSTER
-/* PGRAC: actual granted session ownership, not PROCLOCK's merged hold mask.
- * Read-only, process-local; safe before lock-table initialization.
- * Author: SqlRush <sqlrush@gmail.com> */
-extern bool LockHasSessionLocks(void);
-#endif
 #if defined(USE_ASSERT_CHECKING) || defined(USE_PGRAC_CLUSTER)
 /* PGRAC: also exported for the spec-4.6 D3 read-only LOCALLOCK walk. */
 extern HTAB *GetLockMethodLocalHash(void);

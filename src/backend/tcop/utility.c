@@ -16,10 +16,6 @@
  */
 #include "postgres.h"
 
-#ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_config_use_gate.h"
-#endif
-
 #include "access/htup_details.h"
 #include "access/reloptions.h"
 #include "access/twophase.h"
@@ -33,7 +29,6 @@
 #include "catalog/toasting.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_semantic_activation.h"
-#include "cluster/cluster_shared_config.h"
 #endif
 #include "commands/alter.h"
 #include "commands/async.h"
@@ -548,25 +543,10 @@ ProcessUtility(PlannedStmt *pstmt,
 			   DestReceiver *dest,
 			   QueryCompletion *qc)
 {
-#ifdef USE_PGRAC_CLUSTER
-	bool		config_work;
-#endif
 	Assert(IsA(pstmt, PlannedStmt));
 	Assert(pstmt->commandType == CMD_UTILITY);
 	Assert(queryString != NULL);	/* required as of 8.4 */
 	Assert(qc == NULL || qc->commandTag == CMDTAG_UNKNOWN);
-
-#ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: VACUUM/CIC/CALL can retain ownership across internal commits.
-	 * The whole hook chain is one command. Plain transaction commands retain
-	 * their native post-COMMIT retry; an enclosing CALL still owns its bracket.
-	 * Author: SqlRush <sqlrush@gmail.com>
-	 */
-	config_work = !IsA(pstmt->utilityStmt, TransactionStmt) &&
-		cluster_shared_config_delivery_work_enter();
-	PG_TRY();
-	{
-#endif
 
 	/*
 	 * We provide a function hook variable that lets loadable plugins get
@@ -581,16 +561,6 @@ ProcessUtility(PlannedStmt *pstmt,
 		standard_ProcessUtility(pstmt, queryString, readOnlyTree,
 								context, params, queryEnv,
 								dest, qc);
-#ifdef USE_PGRAC_CLUSTER
-	}
-	PG_FINALLY();
-	{
-		cluster_shared_config_delivery_work_leave(config_work);
-	}
-	PG_END_TRY();
-	/* PGRAC: successful whole-command return, never ERROR's PG_FINALLY. */
-	cluster_shared_config_use_idle();
-#endif
 }
 
 /*

@@ -141,6 +141,12 @@ bootstrap_common(const ClusterControlBootstrapBytes *bytes, const ControlRootIma
 	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
 		&& memcmp(bytes->data, canonical, sizeof(canonical)) != 0)
 		result = CLUSTER_CONTROL_ROOT_BAD_RESERVED;
+	/* PGRAC: valid bytes are not proof of supported optional recovery state. */
+	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY
+		&& (out->track_commit_timestamp
+			|| TransactionIdIsValid(out->checkPointCopy.oldestCommitTsXid)
+			|| TransactionIdIsValid(out->checkPointCopy.newestCommitTsXid)))
+		result = CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
 	return result;
 }
 
@@ -226,6 +232,12 @@ cluster_control_bootstrap_decode(const ClusterControlBootstrapInput *input,
 												&common, &snapshot.control);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 		goto done;
+	if (snapshot.control.track_commit_timestamp
+		|| TransactionIdIsValid(snapshot.control.checkPointCopy.oldestCommitTsXid)
+		|| TransactionIdIsValid(snapshot.control.checkPointCopy.newestCommitTsXid)) {
+		result = CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
+		goto done;
+	}
 	result = cluster_recovery_anchor_v2_thread_state(&anchor_ref, &before->records[input->node_id],
 													 &snapshot.control);
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)

@@ -22,7 +22,6 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_lms.h"
 #include "cluster/cluster_service_observe.h"
-#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_cr_server.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_ges_dedup.h"
@@ -50,7 +49,6 @@ static bool test_found;
 static Size requested_size;
 static unsigned lock_initializations;
 static unsigned lock_holds, lock_acquisitions;
-static unsigned config_idle_ticks;
 static unsigned cleaner_wakes;
 static bool modifier_held;
 static LWLock *fixture_cleaner_lock;
@@ -93,16 +91,6 @@ cluster_cf_retirement_poll(void)
 {
 	if (lock_holds != 0)
 		abort();
-}
-
-/* Native channel adapter has its separate real C/TCP tests. These original
- * shutdown-loop fixtures do not publish a configuration channel command. */
-void
-cluster_config_channels_tick(void)
-{
-	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
-	UT_ASSERT_EQ(lock_holds, 0);
-	++config_idle_ticks;
 }
 
 bool IsUnderPostmaster;
@@ -526,8 +514,10 @@ UT_TEST(test_online_close_observation_accepts_real_idle_without_shutdown)
 	before = test_region;
 	UT_ASSERT_EQ(cluster_clean_leave_normal_stop_local_poll(NULL, NULL),
 				 CLUSTER_NORMAL_STOP_INVALID);
-	UT_ASSERT_EQ(service_observe_one(SERVICE_CLOSE, false, &observation), CLUSTER_NORMAL_STOP_READY);
-	UT_ASSERT_EQ(service_observe_one(SERVICE_CLOSE, true, &observation), CLUSTER_NORMAL_STOP_INVALID);
+	UT_ASSERT_EQ(service_observe_one(SERVICE_CLOSE, false, &observation),
+				 CLUSTER_NORMAL_STOP_READY);
+	UT_ASSERT_EQ(service_observe_one(SERVICE_CLOSE, true, &observation),
+				 CLUSTER_NORMAL_STOP_INVALID);
 	UT_ASSERT_EQ(memcmp(&before, &test_region, sizeof(before)), 0);
 	UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
 }
@@ -545,21 +535,51 @@ UT_TEST(test_online_close_observation_keeps_actual_shared_and_private_work)
 		MyBackendType = B_LMON;
 		MyAuxProcType = LmonProcess;
 		switch (fault) {
-		case 0: pg_atomic_write_u32(&cl_normal_stop->requested, 1); break;
-		case 1: pg_atomic_write_u32(&cl_state->request_in_progress, 1); break;
-		case 2: pg_atomic_write_u32(&cl_state->phase, CLUSTER_LEAVE_REQUESTED); break;
-		case 3: cl_state->leaving_node_id = 1; break;
-		case 4: pg_atomic_write_u32(&cl_state->preflight_pending, 1); break;
-		case 5: pg_atomic_write_u32(&cl_state->preflight_sent, 1); break;
-		case 6: pg_atomic_write_u32(&cl_state->shutdown_driven, 1); break;
-		case 7: pg_atomic_write_u32(&cl_state->phase1_release_pending, 1); break;
-		case 8: pg_atomic_write_u64(&cl_state->marker_request_seq, 1); break;
-		case 9: cl_normal_stop_front_inbox[2].pending = true; break;
-		case 10: cl_normal_stop_front_inbox[2].ack_pending = true; break;
-		case 11: cl_normal_stop_front_inbox[2].release_pending[0] = true; break;
-		case 12: cl_normal_stop_front_inbox[2].release_pending[1] = true; break;
-		case 13: cl_normal_stop_front_inbox[2].release_ack_pending = true; break;
-		case 14: cl_phase1_post_stopped_request_ahead[2].valid = true; break;
+		case 0:
+			pg_atomic_write_u32(&cl_normal_stop->requested, 1);
+			break;
+		case 1:
+			pg_atomic_write_u32(&cl_state->request_in_progress, 1);
+			break;
+		case 2:
+			pg_atomic_write_u32(&cl_state->phase, CLUSTER_LEAVE_REQUESTED);
+			break;
+		case 3:
+			cl_state->leaving_node_id = 1;
+			break;
+		case 4:
+			pg_atomic_write_u32(&cl_state->preflight_pending, 1);
+			break;
+		case 5:
+			pg_atomic_write_u32(&cl_state->preflight_sent, 1);
+			break;
+		case 6:
+			pg_atomic_write_u32(&cl_state->shutdown_driven, 1);
+			break;
+		case 7:
+			pg_atomic_write_u32(&cl_state->phase1_release_pending, 1);
+			break;
+		case 8:
+			pg_atomic_write_u64(&cl_state->marker_request_seq, 1);
+			break;
+		case 9:
+			cl_normal_stop_front_inbox[2].pending = true;
+			break;
+		case 10:
+			cl_normal_stop_front_inbox[2].ack_pending = true;
+			break;
+		case 11:
+			cl_normal_stop_front_inbox[2].release_pending[0] = true;
+			break;
+		case 12:
+			cl_normal_stop_front_inbox[2].release_pending[1] = true;
+			break;
+		case 13:
+			cl_normal_stop_front_inbox[2].release_ack_pending = true;
+			break;
+		case 14:
+			cl_phase1_post_stopped_request_ahead[2].valid = true;
+			break;
 		}
 		before = test_region;
 		UT_ASSERT_EQ(cluster_clean_leave_service_poll(&observation.slot, &observation.reason),
@@ -570,8 +590,7 @@ UT_TEST(test_online_close_observation_keeps_actual_shared_and_private_work)
 		if (fault >= 9)
 			UT_ASSERT_EQ(observation.slot, 2);
 	}
-	memset(cl_phase1_post_stopped_request_ahead, 0,
-		   sizeof(cl_phase1_post_stopped_request_ahead));
+	memset(cl_phase1_post_stopped_request_ahead, 0, sizeof(cl_phase1_post_stopped_request_ahead));
 }
 
 UT_TEST(test_online_close_refuses_wrong_owner_missing_state_and_sticky_failure)
@@ -584,16 +603,31 @@ UT_TEST(test_online_close_refuses_wrong_owner_missing_state_and_sticky_failure)
 		MyBackendType = B_LMON;
 		MyAuxProcType = LmonProcess;
 		switch (fault) {
-		case 0: IsUnderPostmaster = false; break;
-		case 1: MyBackendType = B_BACKEND; break;
-		case 2: MyAuxProcType = LmsProcess; break;
-		case 3: cl_state = NULL; break;
-		case 4: cl_normal_stop = NULL; break;
-		case 5:
-			pg_atomic_write_u32(&cl_normal_stop->failure_reason, CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+		case 0:
+			IsUnderPostmaster = false;
 			break;
-		case 6: pg_atomic_write_u32(&cl_state->phase, UINT32_MAX); break;
-		case 7: pg_atomic_write_u32(&cl_normal_stop->phase, UINT32_MAX); break;
+		case 1:
+			MyBackendType = B_BACKEND;
+			break;
+		case 2:
+			MyAuxProcType = LmsProcess;
+			break;
+		case 3:
+			cl_state = NULL;
+			break;
+		case 4:
+			cl_normal_stop = NULL;
+			break;
+		case 5:
+			pg_atomic_write_u32(&cl_normal_stop->failure_reason,
+								CLUSTER_NORMAL_STOP_FAILURE_MODULE);
+			break;
+		case 6:
+			pg_atomic_write_u32(&cl_state->phase, UINT32_MAX);
+			break;
+		case 7:
+			pg_atomic_write_u32(&cl_normal_stop->phase, UINT32_MAX);
+			break;
 		}
 		before = cluster_normal_stop_failure();
 		UT_ASSERT_EQ(cluster_clean_leave_service_poll(NULL, NULL), CLUSTER_NORMAL_STOP_INVALID);
@@ -1427,7 +1461,6 @@ run_actual_sinval_main(int scenario)
 	sinval_main_test = true;
 	sinval_scenario = scenario;
 	sinval_stage = sinval_passes = sinval_polls = ko_polls = 0;
-	config_idle_ticks = 0;
 	main_passes = main_waits = 0;
 	main_exit_code = -1;
 	main_early_shutdown = false;
@@ -1451,7 +1484,6 @@ UT_TEST(test_sinval_actual_main_wraps_full_work_not_sleep)
 	run_actual_sinval_main(0);
 	UT_ASSERT_EQ(main_exit_code, 0);
 	UT_ASSERT_EQ(sinval_passes, 2);
-	UT_ASSERT(config_idle_ticks > 0);
 	UT_ASSERT_EQ(sinval_polls, 0); /* Ordinary runtime adds no module scan. */
 	run_actual_sinval_main(5);
 	UT_ASSERT_EQ(main_exit_code, 0);

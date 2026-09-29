@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * cluster_config_members.h
- *    Exact member configuration observations, never DATA permission.
+ *    Exact member startup-value observations, never application ACKs or DATA permission.
  *
  * Portions Copyright (c) 2026, pgrac contributors
  * Author: SqlRush <sqlrush@gmail.com>
@@ -17,7 +17,7 @@
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_shared_config.h"
 
-#define CLUSTER_CONFIG_MEMBERS_BYTES 352
+#define CLUSTER_CONFIG_MEMBERS_BYTES 288
 #define CLUSTER_CONFIG_MEMBERS_REQUEST 1
 #define CLUSTER_CONFIG_MEMBERS_REPLY 2
 #define CLUSTER_CONFIG_MEMBERS_OBSERVED 1
@@ -40,7 +40,7 @@ typedef struct ClusterConfigMembersMessage {
 	uint32 responder;
 	uint32 verb;
 	uint32 outcome;
-	ClusterSharedConfigCensus census;
+	ClusterSharedConfigActive common;
 } ClusterConfigMembersMessage;
 
 typedef struct ClusterConfigMembersObservation {
@@ -48,19 +48,33 @@ typedef struct ClusterConfigMembersObservation {
 	uint64 nonce;
 	uint64 observed[2];
 	uint64 unavailable[2];
-	ClusterSharedConfigCensus node[CLUSTER_MAX_NODES];
+	ClusterSharedConfigActive node[CLUSTER_MAX_NODES];
 } ClusterConfigMembersObservation;
+
+typedef enum ClusterConfigMountResult {
+	CLUSTER_CONFIG_MOUNT_UNPROVEN = 0,
+	CLUSTER_CONFIG_MOUNT_MATCH,
+	CLUSTER_CONFIG_MOUNT_MISMATCH
+} ClusterConfigMountResult;
+
+/* Transient value proof, owned by the original LMON/native family. It cannot
+ * grant fencing, membership, recovery or DATA authority on its own. */
+typedef struct ClusterConfigMountProof {
+	ClusterConfigMembersKey key;
+	ClusterSharedConfigActive common;
+	uint64 self_incarnation;
+	ClusterConfigMountResult result;
+} ClusterConfigMountProof;
+
+extern ClusterConfigMountResult cluster_config_members_mount_status(void);
+extern void cluster_shared_config_mount_publish(const ClusterConfigMountProof *proof);
+extern bool cluster_shared_config_mount_observe(ClusterConfigMountProof *proof);
 
 /* Refusal clears nonaliasing output; an alias leaves both carriers untouched. */
 extern bool cluster_config_members_encode(const ClusterConfigMembersMessage *message,
 										  uint8 bytes[CLUSTER_CONFIG_MEMBERS_BYTES]);
 extern bool cluster_config_members_decode(const void *bytes, Size length,
 										  ClusterConfigMembersMessage *out);
-
-/* Canonical local admitted-member key; output must not alias either input. */
-extern bool cluster_config_members_make_key(const ClusterSharedConfigRef *ref,
-											const ClusterR4MembershipSnapshot *members,
-											ClusterConfigMembersKey *key);
 
 /* LMON only, after actual CF selection/retirement at this member cut. One
  * observational round, retried by the existing delivery tick; no timeout ACK.

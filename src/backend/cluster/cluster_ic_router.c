@@ -53,7 +53,6 @@
 #include "utils/memutils.h"
 
 #include "cluster/cluster_conf.h"	  /* cluster_conf_lookup_node (spec-2.5 D2.5 fanout) */
-#include "cluster/cluster_config_prefix.h"
 #include "cluster/cluster_guc.h"	  /* cluster_node_id */
 #include "cluster/cluster_ic.h"		  /* cluster_ic_send_bytes (vtable) */
 #include "cluster/cluster_ic_chunk.h" /* PGRAC_IC_CHUNK_MSG_TYPE + chunk_dispatch_frame (v1.0.1 F1) */
@@ -152,19 +151,6 @@ cluster_ic_register_msg_type(const ClusterICMsgTypeInfo *info)
  * Send path.
  * ============================================================ */
 
-/* A fixed-size channel marker coordinates an already held configuration
- * episode; it does not acquire or modify data. Keep the existing transport
- * admission, registry, producer and plane checks, even while DATA is held.
- * Its original owner separately validates the full episode and stream.
- */
-static bool
-config_prefix_transport(uint8 msg_type, uint32 payload_length)
-{
-	return msg_type == PGRAC_IC_MSG_CONFIG_PREFIX_DATA
-		   && payload_length == CLUSTER_CONFIG_PREFIX_BYTES && cluster_shared_config
-		   && cluster_recovery_transport_is_current();
-}
-
 ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
 						 uint32 payload_len)
@@ -216,8 +202,7 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	/* Scheme A service split: DATA is an ordinary serving capability, not
 	 * implied by CSSD ALIVE, quorum, MEMBER, or recovery LMS transport. */
 	if (!is_chunk_wrap && (ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()
-		&& !config_prefix_transport(msg_type, payload_len))
+		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
 		return CLUSTER_IC_SEND_HARD_ERROR;
 
 	/* (3) dest = self -- short-circuit no-op success.  spec-2.2 stub
@@ -388,8 +373,7 @@ cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, 
 	 * because the authenticated peer connection is healthy; only the frame's
 	 * serving capability is absent. */
 	if ((ClusterICPlane)info->plane == CLUSTER_IC_PLANE_DATA
-		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current()
-		&& !config_prefix_transport(env->msg_type, env->payload_length))
+		&& cluster_authority_readiness_managed() && !cluster_serving_ready_is_current())
 		return true;
 
 	/*

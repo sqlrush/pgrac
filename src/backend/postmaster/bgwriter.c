@@ -35,13 +35,6 @@
 #include "access/xlog_internal.h"
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
-#ifdef USE_PGRAC_CLUSTER
-/* PGRAC: original background producer and control-retirement boundaries.
- * Author: SqlRush <sqlrush@gmail.com> */
-#include "cluster/cluster_cf_enqueue.h"
-#include "cluster/cluster_config_use_gate.h"
-#include "cluster/cluster_lock_owner.h"
-#endif
 #include "pgstat.h"
 #include "postmaster/bgwriter.h"
 #include "postmaster/interrupt.h"
@@ -235,103 +228,73 @@ BackgroundWriterMain(void)
 	{
 		bool		can_hibernate;
 		int			rc;
-#ifdef USE_PGRAC_CLUSTER
-		volatile bool config_pass_completed = false;
-#endif
 
 		/* Clear any already-pending wakeups */
 		ResetLatch(MyLatch);
 
 		HandleMainLoopInterrupts();
 
-#ifdef USE_PGRAC_CLUSTER
-		/* PGRAC: closing fresh work must not stop original control cleanup.
-		 * Author: SqlRush <sqlrush@gmail.com> */
-		cluster_cf_retirement_poll();
-		cluster_lock_owners_service_poll();
-		(void) cluster_shared_config_delivery_retry_idle();
-		if (!cluster_shared_config_background_begin())
+		/*
+		 * Do one cycle of dirty-buffer writing.
+		 */
+		can_hibernate = BgBufferSync(&wb_context);
+
+		/* Report pending statistics to the cumulative stats system */
+		pgstat_report_bgwriter();
+		pgstat_report_wal(true);
+
+		if (FirstCallSinceLastCheckpoint())
 		{
-			(void) WaitLatch(MyLatch,
-							 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
-							 100L, WAIT_EVENT_RECONFIG_SHARED_CONFIG_WAIT);
-			continue;
+			/*
+			 * After any checkpoint, close all smgr files.  This is so we
+			 * won't hang onto smgr references to deleted files indefinitely.
+			 */
+			smgrcloseall();
 		}
-		PG_TRY();
+
+		/*
+		 * Log a new xl_running_xacts every now and then so replication can
+		 * get into a consistent state faster (think of suboverflowed
+		 * snapshots) and clean up resources (locks, KnownXids*) more
+		 * frequently. The costs of this are relatively low, so doing it 4
+		 * times (LOG_SNAPSHOT_INTERVAL_MS) a minute seems fine.
+		 *
+		 * We assume the interval for writing xl_running_xacts is
+		 * significantly bigger than BgWriterDelay, so we don't complicate the
+		 * overall timeout handling but just assume we're going to get called
+		 * often enough even if hibernation mode is active. It's not that
+		 * important that LOG_SNAPSHOT_INTERVAL_MS is met strictly. To make
+		 * sure we're not waking the disk up unnecessarily on an idle system
+		 * we check whether there has been any WAL inserted since the last
+		 * time we've logged a running xacts.
+		 *
+		 * We do this logging in the bgwriter as it is the only process that
+		 * is run regularly and returns to its mainloop all the time. E.g.
+		 * Checkpointer, when active, is barely ever in its mainloop and thus
+		 * makes it hard to log regularly.
+		 */
+		if (XLogStandbyInfoActive() && !RecoveryInProgress())
 		{
-#endif
+			TimestampTz timeout = 0;
+			TimestampTz now = GetCurrentTimestamp();
+
+			timeout = TimestampTzPlusMilliseconds(last_snapshot_ts,
+												  LOG_SNAPSHOT_INTERVAL_MS);
 
 			/*
-			 * Do one cycle of dirty-buffer writing.
+			 * Only log if enough time has passed and interesting records have
+			 * been inserted since the last snapshot.  Have to compare with <=
+			 * instead of < because GetLastImportantRecPtr() points at the
+			 * start of a record, whereas last_snapshot_lsn points just past
+			 * the end of the record.
 			 */
-			can_hibernate = BgBufferSync(&wb_context);
-
-			/* Report pending statistics to the cumulative stats system */
-			pgstat_report_bgwriter();
-			pgstat_report_wal(true);
-
-			if (FirstCallSinceLastCheckpoint())
+			if (now >= timeout &&
+				last_snapshot_lsn <= GetLastImportantRecPtr())
 			{
-				/*
-				 * After any checkpoint, close all smgr files.  This is so we
-				 * won't hang onto smgr references to deleted files indefinitely.
-				 */
-				smgrcloseall();
+				last_snapshot_lsn = LogStandbySnapshot();
+				last_snapshot_ts = now;
 			}
-
-			/*
-			 * Log a new xl_running_xacts every now and then so replication can
-			 * get into a consistent state faster (think of suboverflowed
-			 * snapshots) and clean up resources (locks, KnownXids*) more
-			 * frequently. The costs of this are relatively low, so doing it 4
-			 * times (LOG_SNAPSHOT_INTERVAL_MS) a minute seems fine.
-			 *
-			 * We assume the interval for writing xl_running_xacts is
-			 * significantly bigger than BgWriterDelay, so we don't complicate the
-			 * overall timeout handling but just assume we're going to get called
-			 * often enough even if hibernation mode is active. It's not that
-			 * important that LOG_SNAPSHOT_INTERVAL_MS is met strictly. To make
-			 * sure we're not waking the disk up unnecessarily on an idle system
-			 * we check whether there has been any WAL inserted since the last
-			 * time we've logged a running xacts.
-			 *
-			 * We do this logging in the bgwriter as it is the only process that
-			 * is run regularly and returns to its mainloop all the time. E.g.
-			 * Checkpointer, when active, is barely ever in its mainloop and thus
-			 * makes it hard to log regularly.
-			 */
-			if (XLogStandbyInfoActive() && !RecoveryInProgress())
-			{
-				TimestampTz timeout = 0;
-				TimestampTz now = GetCurrentTimestamp();
-
-				timeout = TimestampTzPlusMilliseconds(last_snapshot_ts,
-													  LOG_SNAPSHOT_INTERVAL_MS);
-
-				/*
-				 * Only log if enough time has passed and interesting records have
-				 * been inserted since the last snapshot.  Have to compare with <=
-				 * instead of < because GetLastImportantRecPtr() points at the
-				 * start of a record, whereas last_snapshot_lsn points just past
-				 * the end of the record.
-				 */
-				if (now >= timeout &&
-					last_snapshot_lsn <= GetLastImportantRecPtr())
-				{
-					last_snapshot_lsn = LogStandbySnapshot();
-					last_snapshot_ts = now;
-				}
-			}
-
-#ifdef USE_PGRAC_CLUSTER
-			config_pass_completed = true;
 		}
-		PG_FINALLY();
-		{
-			cluster_shared_config_background_end(config_pass_completed);
-		}
-		PG_END_TRY();
-#endif
 
 		/*
 		 * Sleep until we are signaled or BgWriterDelay has elapsed.

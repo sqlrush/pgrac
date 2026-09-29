@@ -1,20 +1,23 @@
 /*-------------------------------------------------------------------------
+ *
  * test_cluster_config_delivery_driver.c
- *    Actual background driver with CF selection/native registration fixtures.
- *    CF identity/retirement and real native delivery have separate tests.
+ *    Real LMON delivery driver; native reload and CF proofs tested separately.
+ *
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 2026, pgrac contributors
+ *
  * Author: SqlRush <sqlrush@gmail.com>
+ *
+ * IDENTIFICATION
+ *    src/test/cluster_unit/test_cluster_config_delivery_driver.c
+ *
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
 #include <signal.h>
 #include "miscadmin.h"
-#include "storage/proc.h"
-#include "postmaster/syslogger.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_config_members.h"
-#include "cluster/cluster_config_channels.h"
-#include "cluster/cluster_config_producers.h"
 #include "cluster/cluster_clean_leave.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_reconfig.h"
@@ -23,50 +26,20 @@
 #include "unit_test.h"
 UT_DEFINE_GLOBALS();
 
-/* Active primary-profile native census configuration. */
-bool cluster_lms_enabled = true, cluster_lmd_enabled = true;
-int cluster_lms_workers = 2;
-
 bool cluster_shared_config = true, cluster_enabled = true;
 int cluster_node_id = 0;
 bool IsUnderPostmaster = true;
 BackendType MyBackendType = B_LMON;
 pid_t PostmasterPid = 120;
-bool Logging_collector = true;
-static PGPROC processes[32];
-static PROC_HDR procs;
-PROC_HDR *ProcGlobal = &procs;
 static ClusterSharedConfigProcess actual;
-static ClusterSharedConfigRegistration logger;
 static ClusterSharedConfigRef published;
 static TimestampTz now = 1000000;
-static unsigned polls, releases, sends, cancels, writes;
-static bool stop, leaving, publication = true, busy, publication_error;
+static unsigned polls, releases, sends, cancels, writes, member_polls, member_cancels;
+static bool stop, leaving, busy, publication, publication_error, signal_error;
+static bool members_available, actual_available;
+static uint64 selected_generation;
+static ClusterControlRootResult selection_result;
 static ClusterR4MembershipSnapshot members;
-static bool members_available = true;
-static int change_during_poll;
-static unsigned member_polls, member_cancels;
-static unsigned channel_ticks, channel_cancels;
-static bool fresh_allowed = true;
-
-bool
-cluster_config_producers_fresh_allowed(ClusterConfigProducerStage stage)
-{
-	UT_ASSERT_EQ(stage, CLUSTER_CONFIG_PRODUCERS_FRONT);
-	return fresh_allowed;
-}
-
-/* Native channel adapter is tested separately with real prefix exchanges. */
-void
-cluster_config_channels_tick(void)
-{
-	channel_ticks++;
-}
-void
-cluster_config_channels_cancel(void)
-{
-	channel_cancels++;
-}
 
 void
 cluster_config_members_poll(const ClusterSharedConfigRef *ref,
@@ -81,7 +54,6 @@ cluster_config_members_cancel(void)
 {
 	member_cancels++;
 }
-
 bool
 cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnapshot *out)
 {
@@ -91,44 +63,6 @@ cluster_reconfig_lmon_snapshot_r4_membership(ClusterR4MembershipSnapshot *out)
 	*out = members;
 	return true;
 }
-
-static void
-seed_members(void)
-{
-	memset(&members, 0, sizeof(members));
-	members.formation_epoch = 7;
-	members.admitted_members_lo = 3;
-	members.admitted_incarnation[0] = 100;
-	members.admitted_incarnation[1] = 101;
-	members.observed_generation[0] = 20;
-	members.observed_generation[1] = 21;
-	members.local_self_boot_incarnation = 100;
-}
-
-bool
-ProcConfigSnapshotPids(int32 *pids, uint32 capacity)
-{
-	if (capacity != lengthof(processes))
-		return false;
-	for (uint32 i = 0; i < capacity; ++i)
-		pids[i] = processes[i].pid;
-	return true;
-}
-
-void *
-palloc(Size size)
-{
-	void *ptr = malloc(size);
-	if (!ptr)
-		abort();
-	return ptr;
-}
-void
-pfree(void *ptr)
-{
-	free(ptr);
-}
-
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 void
@@ -157,22 +91,7 @@ bool
 cluster_shared_config_process_observe(ClusterSharedConfigProcess *out)
 {
 	*out = actual;
-	return true;
-}
-bool
-cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
-										ClusterSharedConfigRegistration *out)
-{
-	*out = slot->value;
-	return true;
-}
-bool
-cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRegistration *out,
-											   uint64 *sequence)
-{
-	*out = logger;
-	*sequence = 2;
-	return logger.pid != 0;
+	return actual_available;
 }
 void
 cluster_control_root_config_cancel(void)
@@ -185,22 +104,20 @@ cluster_control_root_config_poll(const ClusterSharedConfigRef *prior,
 								 ClusterSharedConfigImage *image)
 {
 	polls++;
-	if (change_during_poll == 1)
-		members.formation_epoch++;
-	if (change_during_poll == 2)
-		members.observed_generation[1]++;
 	UT_ASSERT_EQ(prior->identity.generation, actual.ref.identity.generation);
 	memset(image, 0, sizeof(*image));
 	if (busy)
 		return CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE;
+	if (selection_result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return selection_result;
 	memset(selected, 0, sizeof(*selected));
 	selected->ref = actual.ref;
-	selected->ref.identity.generation = 2;
+	selected->ref.identity.generation = selected_generation;
 	image->bytes = malloc(2);
 	image->bytes[0] = 'x';
 	image->bytes[1] = '\0';
 	image->len = 1;
-	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	return selection_result;
 }
 void
 cluster_shared_config_free(ClusterSharedConfigImage *image)
@@ -215,6 +132,7 @@ bool
 cluster_shared_config_delivery_publish(const ClusterSharedConfigRef *ref,
 									   const ClusterSharedConfigImage *image)
 {
+	UT_ASSERT(image->len == 1 && image->bytes[0] == 'x');
 	writes++;
 	if (publication_error)
 		siglongjmp(*PG_exception_stack, 1);
@@ -227,8 +145,9 @@ kill(pid_t pid, int signal)
 {
 	UT_ASSERT_EQ(pid, PostmasterPid);
 	UT_ASSERT_EQ(signal, SIGHUP);
+	UT_ASSERT_EQ(published.identity.generation, selected_generation);
 	sends++;
-	return 0;
+	return signal_error ? -1 : 0;
 }
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -236,151 +155,124 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 	printf("# %s %s:%d\n", condition, file, line);
 	abort();
 }
-
 static void
-target(ClusterSharedConfigRegistration *value, int pid)
+fixture(void)
 {
-	memset(value, 0, sizeof(*value));
-	value->pid = pid;
-	value->role = B_BACKEND;
-	value->aux_type = NotAnAuxProcess;
-	value->registration = 2;
-	value->observed = true;
-	value->process = actual;
-	value->process.ref = published;
-	value->active.version = CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
-	value->active.static_entries = 1;
-	value->active.dynamic_entries = 1;
-	value->common = value->active;
-	value->common.version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	cluster_shared_config_delivery_lmon_cancel();
+	memset(&actual, 0, sizeof(actual));
+	memset(&published, 0, sizeof(published));
+	memset(&members, 0, sizeof(members));
+	members.formation_epoch = 7;
+	members.admitted_members_lo = 3;
+	members.admitted_incarnation[0] = 100;
+	members.admitted_incarnation[1] = 101;
+	members.local_self_boot_incarnation = 100;
+	actual.ref.identity.generation = 1;
+	actual.ref.identity.configured[0] = 3;
+	actual.node_id = cluster_node_id = 0;
+	PostmasterPid = 120;
+	selected_generation = 2;
+	selection_result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	cluster_shared_config = cluster_enabled = true;
+	members_available = actual_available = publication = true;
+	stop = leaving = busy = publication_error = signal_error = false;
+	polls = releases = sends = cancels = writes = member_polls = member_cancels = 0;
+	now += 1000000;
 }
-
 static void
-native_services(void)
+next_tick(void)
 {
-	static const struct {
-		AuxProcType aux;
-		BackendType role;
-	} services[] = { { BgWriterProcess, B_BG_WRITER },
-					 { CheckpointerProcess, B_CHECKPOINTER },
-					 { WalWriterProcess, B_WAL_WRITER },
-					 { LmonProcess, B_LMON },
-					 { LckProcess, B_LCK },
-					 { CssdProcess, B_CSSD },
-					 { QvotecProcess, B_QVOTEC },
-					 { SinvalBcastProcess, B_SINVAL_BCAST },
-					 { LmsProcess, B_LMS },
-					 { LmdProcess, B_LMD },
-					 { LmsWorker1Process, B_LMS_WORKER },
-					 { UndoCleanerProcess, B_UNDO_CLEANER },
-					 { UndoCleanerWorker1Process, B_UNDO_CLEANER },
-					 { UndoCleanerWorker2Process, B_UNDO_CLEANER },
-					 { UndoCleanerWorker3Process, B_UNDO_CLEANER },
-					 { UndoCleanerWorker4Process, B_UNDO_CLEANER },
-					 { UndoCleanerWorker5Process, B_UNDO_CLEANER },
-					 { UndoCleanerWorker6Process, B_UNDO_CLEANER },
-					 { UndoCleanerWorker7Process, B_UNDO_CLEANER } };
-	for (unsigned i = 0; i < lengthof(services); ++i) {
-		PGPROC *proc = &processes[i + 1];
-		proc->pid = 201 + i;
-		target(&proc->cluster_config.value, proc->pid);
-		proc->cluster_config.value.role = services[i].role;
-		proc->cluster_config.value.aux_type = services[i].aux;
-	}
+	now += 1000000;
+	cluster_shared_config_delivery_lmon_tick();
 }
 
 UT_TEST(select_and_deliver)
 {
-	procs.allProcs = processes;
-	procs.allProcCount = lengthof(processes);
-	actual.ref.identity.generation = 1;
-	actual.ref.identity.configured[0] = 3;
-	actual.applier_pid = PostmasterPid;
+	fixture();
 	cluster_shared_config_delivery_lmon_tick();
 	UT_ASSERT(polls == 1 && releases == 1 && writes == 1 && sends == 1);
 	UT_ASSERT_EQ(member_polls, 1);
 }
-UT_TEST(lost_notification)
+UT_TEST(notification_is_not_application)
 {
+	fixture();
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(polls, 1);
-	now += 1000000;
-	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT(polls == 2 && sends == 2);
+	next_tick();
+	/* No process changes its application state in this test. */
+	UT_ASSERT_EQ(actual.ref.identity.generation, 1);
+	UT_ASSERT(polls == 2 && writes == 1 && sends == 1 && member_polls == 2);
 }
-UT_TEST(parent_does_not_prove_children)
+UT_TEST(failed_signal_retried)
 {
-	target(&procs.cluster_config_postmaster.value, PostmasterPid);
-	procs.cluster_config_postmaster.value.role = B_INVALID;
-	native_services();
-	target(&processes[0].cluster_config.value, 130);
-	processes[0].pid = 130;
-	processes[0].cluster_config.value.process.ref.identity.generation = 1;
-	now += 1000000;
+	fixture();
+	signal_error = true;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, 3);
-	target(&processes[0].cluster_config.value, 130);
-	now += 1000000;
-	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, 4);
-	target(&logger, 121);
-	logger.role = B_LOGGER;
-	now += 1000000;
-	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, 4);
+	signal_error = false;
+	next_tick();
+	UT_ASSERT(writes == 2 && sends == 2);
+	next_tick();
+	UT_ASSERT(writes == 2 && sends == 2);
 }
-UT_TEST(failed_and_parallel_not_applied)
+UT_TEST(missing_parent_retried)
 {
-	processes[0].cluster_config.value.process.failed = true;
-	now += 1000000;
+	fixture();
+	PostmasterPid = 0;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, 5);
-	processes[0].cluster_config.value.process.failed = false;
-	processes[0].cluster_config.value.process.parallel_snapshot = true;
-	now += 1000000;
+	UT_ASSERT(writes == 1 && sends == 0);
+	PostmasterPid = 120;
+	next_tick();
+	UT_ASSERT(writes == 2 && sends == 1);
+}
+UT_TEST(new_object_notified)
+{
+	fixture();
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, 6);
+	selected_generation++;
+	next_tick();
+	UT_ASSERT(writes == 2 && sends == 2);
+	/* Byte identity, not generation alone, is used for deduplication. */
+	actual.ref.identity.configured[1] = 1;
+	next_tick();
+	UT_ASSERT(writes == 3 && sends == 3);
 }
 UT_TEST(pending_not_paced)
 {
-	unsigned before = polls;
+	fixture();
 	busy = true;
-	now += 1000000;
 	cluster_shared_config_delivery_lmon_tick();
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(polls, before + 2);
+	UT_ASSERT(polls == 2 && writes == 0);
+	busy = false;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT(polls == 3 && writes == 1);
 }
 UT_TEST(stop_and_leave_cancel)
 {
-	unsigned before_cancel = cancels, before = polls;
-	unsigned before_members = member_cancels;
+	fixture();
 	stop = true;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT(cancels > before_cancel && polls == before);
-	UT_ASSERT(member_cancels > before_members);
+	UT_ASSERT(cancels == 1 && member_cancels == 1 && polls == 0);
 	stop = false;
 	leaving = true;
-	before_cancel = cancels;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT(cancels > before_cancel && polls == before);
+	UT_ASSERT(cancels == 2 && member_cancels == 2 && polls == 0);
 }
 UT_TEST(refused_delivery)
 {
-	unsigned before = sends;
-	unsigned before_member_polls = member_polls;
-	leaving = busy = false;
+	fixture();
 	publication = false;
-	cluster_shared_config_delivery_lmon_cancel();
-	now += 1000000;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, before);
-	UT_ASSERT_EQ(member_polls, before_member_polls);
+	UT_ASSERT(writes == 1 && sends == 0 && member_polls == 0 && releases == 1);
+	publication = true;
+	next_tick();
+	UT_ASSERT(writes == 2 && sends == 1);
 }
 UT_TEST(publication_error_cleanup)
 {
-	unsigned before = releases, before_cancel = cancels;
+	fixture();
 	publication_error = true;
-	now += 1000000;
 	PG_TRY();
 	{
 		cluster_shared_config_delivery_lmon_tick();
@@ -388,210 +280,112 @@ UT_TEST(publication_error_cleanup)
 	}
 	PG_CATCH();
 	{
-		UT_ASSERT(releases == before + 1 && cancels > before_cancel);
+		UT_ASSERT(releases == 1 && cancels == 1 && member_cancels == 1);
 	}
 	PG_END_TRY();
+	publication_error = false;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT(writes == 2 && sends == 1 && releases == 2);
 }
-
-static void
-member_fixture(void)
+UT_TEST(reload_without_online_membership)
 {
-	cluster_shared_config_delivery_lmon_cancel();
-	seed_members();
-	members_available = publication = true;
-	stop = leaving = busy = publication_error = false;
-	change_during_poll = 0;
-	cluster_node_id = 0;
-	actual.node_id = 0;
-	actual.ref.identity.configured[0] = 3;
-	actual.ref.identity.configured[1] = 0;
-	now += 1000000;
-}
-
-UT_TEST(no_membership_no_delivery)
-{
-	unsigned before;
-	member_fixture();
+	fixture();
 	members_available = false;
-	before = writes;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT(writes == 1 && sends == 1 && member_polls == 0 && member_cancels == 1);
 }
-
-UT_TEST(member_change_retires_pending_selection)
+UT_TEST(member_change_not_delivery_cut)
 {
-	for (int change = 0; change < 4; ++change) {
-		unsigned before, before_cancel, before_poll;
-		member_fixture();
-		busy = true;
-		cluster_shared_config_delivery_lmon_tick();
-		before = writes;
-		before_poll = polls;
-		before_cancel = cancels;
-		if (change == 0)
-			members.formation_epoch++;
-		if (change == 1) {
-			members.admitted_members_lo = 1;
-			members.admitted_incarnation[1] = 0;
-			members.observed_generation[1] = 0;
-		}
-		if (change == 2) {
-			members.local_self_boot_incarnation++;
-			members.admitted_incarnation[0]++;
-		}
-		if (change == 3)
-			members.admitted_incarnation[1]++;
-		busy = false;
-		cluster_shared_config_delivery_lmon_tick();
-		UT_ASSERT(writes == before && polls == before_poll && cancels > before_cancel);
-		/* A fresh attempt, not the old one relabeled, may progress. */
-		cluster_shared_config_delivery_lmon_tick();
-		UT_ASSERT_EQ(writes, before + 1);
-	}
-}
-
-UT_TEST(changed_completion_cannot_publish)
-{
-	unsigned before;
-	member_fixture();
-	change_during_poll = 1;
-	before = writes;
+	fixture();
+	busy = true;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(writes, before);
-}
-
-UT_TEST(undeclared_member_or_wrong_local_node)
-{
-	unsigned before;
-	member_fixture();
-	members.admitted_members_hi = 1;
-	members.admitted_incarnation[64] = 164;
-	members.observed_generation[64] = 80;
-	before = writes;
+	members.formation_epoch++;
+	members.admitted_incarnation[1]++;
+	busy = false;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(writes, before);
-	member_fixture();
+	/* Exact CF validation belongs to the root owner, not a second cut. */
+	UT_ASSERT(writes == 1 && sends == 1 && member_polls == 1);
+}
+UT_TEST(wrong_local_node_refuses)
+{
+	fixture();
 	actual.node_id = 1;
-	before = writes;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(writes, before);
+	UT_ASSERT(polls == 0 && writes == 0 && cancels == 1);
 }
-
-UT_TEST(observation_refresh_is_not_member_change)
+UT_TEST(root_refusal_cannot_publish)
 {
-	unsigned before;
-	member_fixture();
-	busy = true;
+	fixture();
+	selection_result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	cluster_shared_config_delivery_lmon_tick();
-	members.observed_generation[0]++;
-	members.observed_generation[1]++;
-	change_during_poll = 2;
-	busy = false;
-	before = writes;
-	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(writes, before + 1);
+	UT_ASSERT(polls == 1 && writes == 0 && sends == 0 && member_cancels == 1);
 }
-UT_TEST(legal_overlay_needs_no_common_delivery)
+UT_TEST(backward_clock_does_not_strand)
 {
-	unsigned before;
-	member_fixture();
-	target(&procs.cluster_config_postmaster.value, PostmasterPid);
-	procs.cluster_config_postmaster.value.role = B_INVALID;
-	native_services();
-	target(&processes[0].cluster_config.value, 130);
-	processes[0].pid = 130;
-	target(&logger, 121);
-	logger.role = B_LOGGER;
-	memset(&processes[0].cluster_config.value.active, 0, sizeof(logger.active));
-	before = sends;
+	fixture();
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, before);
-}
-UT_TEST(missing_common_observation_still_requests_delivery)
-{
-	unsigned before;
-	member_fixture();
-	target(&processes[0].cluster_config.value, 130);
-	memset(&processes[0].cluster_config.value.common, 0, sizeof(logger.active));
-	before = sends;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(sends, before + 1);
+	UT_ASSERT_EQ(polls, 1);
+	now -= 2000000;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT(polls == 2 && writes == 1);
 }
-UT_TEST(cf_duty_does_not_publish_original_service_idle)
+UT_TEST(non_lmon_cannot_deliver)
 {
-	unsigned ticks, cancellations;
+	fixture();
+	MyBackendType = B_BACKEND;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(polls, 0);
+	MyBackendType = B_LMON;
+	IsUnderPostmaster = false;
+	cluster_shared_config_delivery_lmon_tick();
+	UT_ASSERT_EQ(polls, 0);
+}
+UT_TEST(no_child_census_for_notification)
+{
+	fixture();
+	cluster_shared_config_delivery_lmon_tick();
+	/* No child registration or census fixtures are linked here. */
+	next_tick();
+	UT_ASSERT(sends == 1 && writes == 1);
+}
+UT_TEST(new_driver_redispatches)
+{
+	fixture();
+	cluster_shared_config_delivery_lmon_tick();
 	cluster_shared_config_delivery_lmon_cancel();
-	stop = leaving = busy = publication_error = false;
-	publication = true;
-	members_available = true;
-	change_during_poll = 0;
-	seed_members();
 	cluster_shared_config_delivery_lmon_tick();
-	ticks = channel_ticks;
-	cluster_shared_config_delivery_lmon_tick();
-	/* Module-idle proof belongs to the original LMON loop boundary, not to
-	 * this still-active CF selection duty. */
-	UT_ASSERT_EQ(channel_ticks, ticks);
-	cancellations = channel_cancels;
-	stop = true;
-	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(channel_cancels, cancellations + 1);
+	UT_ASSERT(writes == 2 && sends == 2);
 }
-
-UT_TEST(held_front_does_not_start_periodic_cf_work)
+UT_TEST(missing_actual_cancels)
 {
-	unsigned before;
-	member_fixture();
-	cluster_shared_config_delivery_lmon_cancel();
-	fresh_allowed = false;
-	before = polls;
+	fixture();
+	actual_available = false;
 	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(polls, before);
-	fresh_allowed = true;
+	UT_ASSERT(polls == 0 && writes == 0 && cancels == 1);
 }
-
-UT_TEST(held_front_still_retires_previously_started_cf_work)
-{
-	unsigned before;
-	member_fixture();
-	cluster_shared_config_delivery_lmon_cancel();
-	fresh_allowed = true;
-	busy = true;
-	cluster_shared_config_delivery_lmon_tick();
-	before = polls;
-	fresh_allowed = false;
-	busy = false;
-	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(polls, before + 1);
-	now += 2000000;
-	cluster_shared_config_delivery_lmon_tick();
-	UT_ASSERT_EQ(polls, before + 1);
-	fresh_allowed = true;
-}
-
 int
 main(void)
 {
-	seed_members();
 	UT_PLAN(18);
 	UT_RUN(select_and_deliver);
-	UT_RUN(lost_notification);
-	UT_RUN(parent_does_not_prove_children);
-	UT_RUN(failed_and_parallel_not_applied);
+	UT_RUN(notification_is_not_application);
+	UT_RUN(failed_signal_retried);
+	UT_RUN(missing_parent_retried);
+	UT_RUN(new_object_notified);
 	UT_RUN(pending_not_paced);
 	UT_RUN(stop_and_leave_cancel);
 	UT_RUN(refused_delivery);
 	UT_RUN(publication_error_cleanup);
-	UT_RUN(no_membership_no_delivery);
-	UT_RUN(member_change_retires_pending_selection);
-	UT_RUN(changed_completion_cannot_publish);
-	UT_RUN(undeclared_member_or_wrong_local_node);
-	UT_RUN(observation_refresh_is_not_member_change);
-	UT_RUN(legal_overlay_needs_no_common_delivery);
-	UT_RUN(missing_common_observation_still_requests_delivery);
-	UT_RUN(cf_duty_does_not_publish_original_service_idle);
-	UT_RUN(held_front_does_not_start_periodic_cf_work);
-	UT_RUN(held_front_still_retires_previously_started_cf_work);
+	UT_RUN(reload_without_online_membership);
+	UT_RUN(member_change_not_delivery_cut);
+	UT_RUN(wrong_local_node_refuses);
+	UT_RUN(root_refusal_cannot_publish);
+	UT_RUN(backward_clock_does_not_strand);
+	UT_RUN(non_lmon_cannot_deliver);
+	UT_RUN(no_child_census_for_notification);
+	UT_RUN(new_driver_redispatches);
+	UT_RUN(missing_actual_cancels);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

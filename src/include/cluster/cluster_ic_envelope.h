@@ -301,11 +301,8 @@ typedef enum ClusterICMsgType {
 	/* PGRAC: CONTROL prior-exit observation, never admission. */
 	PGRAC_IC_MSG_STARTUP_EXIT = 66,
 	/* PGRAC: CONTROL member config observation, never DATA permission. */
-	PGRAC_IC_MSG_CONFIG_MEMBERS = 67,
-	/* PGRAC: per-plane byte-prefix receipts, never application permission. */
-	PGRAC_IC_MSG_CONFIG_PREFIX_CONTROL = 68,
-	PGRAC_IC_MSG_CONFIG_PREFIX_DATA = 69
-	/* values 70..254 available; 255 is the chunk carrier */
+	PGRAC_IC_MSG_CONFIG_MEMBERS = 67
+	/* values 68..254 available; 255 is the chunk carrier */
 } ClusterICMsgType;
 
 /* Spec-8.4C D13 full-member semantic-activation acknowledgement carrier. */

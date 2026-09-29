@@ -279,7 +279,7 @@ cluster_shared_config_prepare_gucs(const char *shared_root, const char *bytes, s
 
 /* One online SET/RESET, with native old/changed/new policy before staging.
  * No-op leaves stage zero and reports changed=false. No assignment, SQL
- * privilege check, root CAS or application ACK; the publisher owns those.
+ * privilege check or root CAS; the publisher owns authorization and CAS.
  * Inputs/outputs must not alias. Refusal leaves stage/changed clear. */
 extern ClusterControlRootResult cluster_shared_config_prepare_change(
 	const char *shared_root, const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
@@ -305,6 +305,10 @@ extern ClusterControlRootResult
 cluster_control_root_config_change(const ClusterSharedConfigEntry *change,
 								   ClusterSharedConfigPublication *out,
 								   ClusterSharedConfigPolicyReport *report);
+
+/* Native SQL has already checked ACL, value and the object-access hook.
+ * NULL name (RESET ALL) is deliberately unsupported in the shared profile. */
+extern void cluster_shared_config_alter_system(const char *name, const char *value);
 
 /* PGRAC: process-local reload result, NOT a node/cluster application ACK.
  * A selected newer generation may skip intermediates; equal generation must
@@ -357,8 +361,8 @@ typedef struct ClusterSharedConfigProcess {
 } ClusterSharedConfigProcess;
 StaticAssertDecl(sizeof(ClusterSharedConfigProcess) == 128, "native config process outcome");
 
-/* Refusal clears out. Caller owns target selection, identity revalidation,
- * registration and admission. No lock/I/O/shared state or implicit restart.
+/* Refusal clears out. Caller owns target selection and identity revalidation.
+ * No lock/I/O/shared state or implicit restart.
  * Inputs/outputs must not overlap. Observe returns whether state exists, not
  * whether this process may serve. Unseeded or failed processes cannot reload.
  */
@@ -368,31 +372,15 @@ extern bool cluster_shared_config_process_observe(ClusterSharedConfigProcess *ou
 extern bool cluster_shared_config_process_copy(ClusterSharedConfigProcess *out,
 											   ClusterSharedConfigImage *image);
 extern void cluster_shared_config_process_parallel_restore(void);
-/* Read-only classification against actual retained defaults, not application
- * or permission. Only changed/removed common dynamic settings require an idle
- * transaction boundary. Validates full objects/native policy before returning;
- * native pending-static/session defaults are distinct. Refusal clears the
- * boolean; aliases refuse without changing either input/output carrier. */
-extern ClusterControlRootResult
-cluster_shared_config_process_reload_needs_idle(const char *bytes, size_t len,
-												const ClusterSharedConfigRef *ref, bool *needs_idle,
-												ClusterSharedConfigPolicyReport *report);
 extern ClusterControlRootResult cluster_shared_config_process_reload(
 	const char *bytes, size_t len, const ClusterSharedConfigRef *ref,
 	ClusterSharedConfigProcess *out, ClusterSharedConfigPolicyReport *report);
 
-/* Actual native process-lifetime observations, not a node census/ACK. A slot
- * is single-writer; readers never wait for its writer. Slot index plus the
- * registration serial, not PID alone, identifies a lifetime. Native shmem
- * initialization is the only sequence reset. No disk/wire representation.
- * Author: SqlRush <sqlrush@gmail.com>
- */
 /* PGRAC: actual native values, not selected defaults or data permission.
  * Version zero means unavailable. Hashes exclude instance/session defaults.
  * Memory-only, explicit canonical hash input; never serialize this struct.
  * Author: SqlRush <sqlrush@gmail.com>
  */
-#define CLUSTER_SHARED_CONFIG_ACTIVE_VERSION 1
 #define CLUSTER_SHARED_CONFIG_COMMON_VERSION 2
 typedef struct ClusterSharedConfigActive {
 	uint32 version;
@@ -402,94 +390,26 @@ typedef struct ClusterSharedConfigActive {
 	uint8 dynamic_sha256[32];
 } ClusterSharedConfigActive;
 StaticAssertDecl(sizeof(ClusterSharedConfigActive) == 76, "native active configuration");
-extern bool cluster_shared_config_active_profile(ClusterSharedConfigActive *out);
-/* Separate comparison of common POSTMASTER/SIGHUP values. Native session
- * overlays remain visible in active_profile, but are not required equality.
- * Neither profile grants permission or proves a stable producer cut. */
+/* Actual common values for boot/join equality, not online application ACKs.
+ * Native session defaults/overlays are outside this comparison. */
 extern bool cluster_shared_config_common_profile(ClusterSharedConfigActive *out);
+/* Native context override for managed common protocol values. Original
+ * registry contexts remain the stable profile partition. No hooks or I/O. */
 struct config_generic;
-/* Before covered native assignment/restoration, without allocation or hooks.
- * Invalidates observation only; does not alter PG values, ref or SET semantics. */
-extern void cluster_shared_config_native_value_changing(const struct config_generic *record);
-
-typedef struct ClusterSharedConfigRegistration {
-	uint64 registration;
-	int32 pid;
-	int32 role;
-	ClusterSharedConfigProcess process;
-	bool observed;
-	/* Actual native ordinal, not the shared LMS/cleaner display role. */
-	int16 aux_type;
-	ClusterSharedConfigActive active;
-	ClusterSharedConfigActive common;
-} ClusterSharedConfigRegistration;
-StaticAssertDecl(sizeof(ClusterSharedConfigRegistration) == 304, "config process registration");
-StaticAssertDecl(offsetof(ClusterSharedConfigRegistration, active) == 148,
-				 "native auxiliary ordinal must use existing registration padding");
-
-typedef struct ClusterSharedConfigSlot {
-	pg_atomic_uint64 sequence;
-	ClusterSharedConfigRegistration value;
-} ClusterSharedConfigSlot;
-StaticAssertDecl(sizeof(ClusterSharedConfigSlot) == 312, "config process observation slot");
-extern void cluster_shared_config_registration_init(ClusterSharedConfigSlot *slot);
-extern void cluster_shared_config_process_new_shmem(void);
-extern bool cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot);
-extern void cluster_shared_config_process_detach(void);
-/* Clear output on a busy/refused read. Input/output must not overlap; an
- * alias refuses without touching either carrier. An empty slot is observable,
- * but pid=0 / observed=false is never an active-process proof. */
-extern bool cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
-													ClusterSharedConfigRegistration *out);
-
-/* PGRAC: coherent local observation, not member admission or active-value
- * proof. Current means the selected defaults were fully consumed; pending
- * static/deferred values are counted separately and need not be active.
- * A changing native PID/slot makes the entire bounded census unavailable.
- * Author: SqlRush <sqlrush@gmail.com>
- */
-typedef struct ClusterSharedConfigCensus {
-	ClusterSharedConfigRef ref;
-	uint32 node_id;
-	uint32 participants;
-	uint32 current_processes;
-	uint32 waiting_processes;
-	uint32 failed_processes;
-	uint32 parallel_processes;
-	uint32 pending_processes;
-	uint32 deferred_processes;
-	uint64 pending_entries;
-	uint64 deferred_entries;
-	ClusterSharedConfigActive active; /* real parent's comparison reference */
-	uint32 active_missing_processes;
-	uint32 static_mismatch_processes;
-	uint32 dynamic_mismatch_processes;
-} ClusterSharedConfigCensus;
-/* Owner supplies a validated selected target. No CF/root/member selection.
- * Refusal clears out; aliases leave all storage unchanged. A successful scan
- * requires every configured primary-profile service ordinal when shared
- * configuration is enabled; it does not freeze future process births. */
-extern bool cluster_shared_config_node_census(const ClusterSharedConfigRef *target, int node_id,
-											  ClusterSharedConfigCensus *out);
-/* Same lifetime census, using common rather than raw active observations.
- * Version2 results must not be encoded as version1 diagnostic wire reports. */
-extern bool cluster_shared_config_node_common_census(const ClusterSharedConfigRef *target,
-													 int node_id, ClusterSharedConfigCensus *out);
+extern bool cluster_shared_config_restart_only(const struct config_generic *record);
+/* Immutable actual postmaster startup values from its inherited family
+ * carrier. Compare the stable database/storage/authority namespace, not an
+ * online config generation/application census. Refusal clears nonaliasing out. */
+extern bool cluster_shared_config_parent_profile(const ClusterSharedConfigRef *selected,
+												 int node_id, ClusterSharedConfigActive *out);
 
 /* Native family transport. Creation/reset are real postmaster-only, before
  * children start / after DATA children exit. No disk state or CF acquisition.
- * logger_started/reaped are called only at the actual native PID boundaries.
  */
 extern void cluster_shared_config_delivery_start(void);
 extern void cluster_shared_config_delivery_new_shmem(void);
 extern void cluster_shared_config_delivery_lmon_started(int32 pid);
 extern void cluster_shared_config_delivery_lmon_reaped(int32 pid);
-extern void cluster_shared_config_delivery_logger_started(int32 pid);
-extern void cluster_shared_config_delivery_logger_reaped(int32 pid);
-extern void cluster_shared_config_delivery_logger_attach(void);
-extern bool cluster_shared_config_delivery_logger_observe(ClusterSharedConfigRegistration *out);
-extern bool cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRegistration *out,
-														   uint64 *sequence);
 extern bool cluster_shared_config_delivery_publish(const ClusterSharedConfigRef *ref,
 												   const ClusterSharedConfigImage *image);
 extern bool cluster_shared_config_delivery_reload(void);
@@ -497,11 +417,6 @@ extern bool cluster_shared_config_delivery_reload(void);
  * already-delayed image; true means it was applied, not a DATA grant. Callers
  * with native shared-value side effects must propagate the new local values. */
 extern bool cluster_shared_config_delivery_retry_idle(void);
-/* Balanced native command lifetime, including internal transaction changes.
- * Enter before PG_TRY; pass its result to leave in PG_FINALLY. Leave never
- * applies an image. This is local scheduling, not distributed admission. */
-extern bool cluster_shared_config_delivery_work_enter(void);
-extern void cluster_shared_config_delivery_work_leave(bool entered);
 extern bool cluster_shared_config_delivery_parent_publish(void);
 extern void cluster_shared_config_delivery_lmon_tick(void);
 extern void cluster_shared_config_delivery_lmon_cancel(void);

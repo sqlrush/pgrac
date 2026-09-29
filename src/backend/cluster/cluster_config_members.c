@@ -81,26 +81,11 @@ key_valid(const ClusterConfigMembersKey *k)
 		   && nonzero(k->members_sha256, 32);
 }
 
+
 static bool
-census_valid(const ClusterSharedConfigCensus *c)
+profile_valid(const ClusterSharedConfigActive *a)
 {
-	uint64 exclusive = (uint64)c->current_processes + c->waiting_processes + c->failed_processes
-					   + c->parallel_processes;
-	const ClusterSharedConfigActive *a = &c->active;
-	if (c->participants == 0 || exclusive != c->participants
-		|| c->pending_processes > c->current_processes
-		|| c->deferred_processes > c->current_processes
-		|| c->active_missing_processes > c->current_processes
-		|| c->static_mismatch_processes > c->current_processes - c->active_missing_processes
-		|| c->dynamic_mismatch_processes > c->current_processes - c->active_missing_processes
-		|| c->pending_entries < c->pending_processes || c->deferred_entries < c->deferred_processes
-		|| c->pending_entries > (uint64)c->pending_processes * CLUSTER_SHARED_CONFIG_MAX_ENTRIES
-		|| c->deferred_entries > (uint64)c->deferred_processes * CLUSTER_SHARED_CONFIG_MAX_ENTRIES)
-		return false;
-	if (a->version == 0)
-		return !nonzero(a, sizeof(*a)) && c->static_mismatch_processes == 0
-			   && c->dynamic_mismatch_processes == 0;
-	return a->version == CLUSTER_SHARED_CONFIG_ACTIVE_VERSION && a->static_entries != 0
+	return a->version == CLUSTER_SHARED_CONFIG_COMMON_VERSION && a->static_entries != 0
 		   && a->dynamic_entries != 0
 		   && (uint64)a->static_entries + a->dynamic_entries <= CLUSTER_SHARED_CONFIG_MAX_ENTRIES
 		   && nonzero(a->static_sha256, 32) && nonzero(a->dynamic_sha256, 32);
@@ -114,14 +99,12 @@ message_valid(const ClusterConfigMembersMessage *m)
 		|| m->responder_incarnation == 0)
 		return false;
 	if (m->verb == CLUSTER_CONFIG_MEMBERS_REQUEST)
-		return m->outcome == 0 && !nonzero(&m->census, sizeof(m->census));
+		return m->outcome == 0 && !nonzero(&m->common, sizeof(m->common));
 	if (m->verb != CLUSTER_CONFIG_MEMBERS_REPLY)
 		return false;
 	if (m->outcome == CLUSTER_CONFIG_MEMBERS_UNAVAILABLE)
-		return !nonzero(&m->census, sizeof(m->census));
-	return m->outcome == CLUSTER_CONFIG_MEMBERS_OBSERVED && m->census.node_id == m->responder
-		   && memcmp(&m->census.ref, &m->key.ref, sizeof(m->key.ref)) == 0
-		   && census_valid(&m->census);
+		return !nonzero(&m->common, sizeof(m->common));
+	return m->outcome == CLUSTER_CONFIG_MEMBERS_OBSERVED && profile_valid(&m->common);
 }
 
 bool
@@ -129,8 +112,7 @@ cluster_config_members_encode(const ClusterConfigMembersMessage *message,
 							  uint8 bytes[CLUSTER_CONFIG_MEMBERS_BYTES])
 {
 	const ClusterSharedConfigIdentity *id;
-	const ClusterSharedConfigCensus *c;
-	uint32 counts[10];
+	const ClusterSharedConfigActive *c;
 	if (overlaps(message, sizeof(*message), bytes, CLUSTER_CONFIG_MEMBERS_BYTES))
 		return false;
 	if (bytes != NULL)
@@ -139,7 +121,7 @@ cluster_config_members_encode(const ClusterConfigMembersMessage *message,
 		return false;
 	id = &message->key.ref.identity;
 	memcpy(bytes, "PCSO", 4);
-	put_le(bytes + 4, 1, 2);
+	put_le(bytes + 4, 3, 2);
 	put_le(bytes + 6, CLUSTER_CONFIG_MEMBERS_BYTES, 2);
 	put_le(bytes + 8, message->verb, 4);
 	put_le(bytes + 12, message->collector, 4);
@@ -160,26 +142,12 @@ cluster_config_members_encode(const ClusterConfigMembersMessage *message,
 	put_le(bytes + 160, message->key.required[0], 8);
 	put_le(bytes + 168, message->key.required[1], 8);
 	memcpy(bytes + 176, message->key.members_sha256, 32);
-	c = &message->census;
-	counts[0] = c->participants;
-	counts[1] = c->current_processes;
-	counts[2] = c->waiting_processes;
-	counts[3] = c->failed_processes;
-	counts[4] = c->parallel_processes;
-	counts[5] = c->pending_processes;
-	counts[6] = c->deferred_processes;
-	counts[7] = c->active_missing_processes;
-	counts[8] = c->static_mismatch_processes;
-	counts[9] = c->dynamic_mismatch_processes;
-	for (unsigned i = 0; i < 10; ++i)
-		put_le(bytes + 208 + i * 4, counts[i], 4);
-	put_le(bytes + 248, c->pending_entries, 8);
-	put_le(bytes + 256, c->deferred_entries, 8);
-	put_le(bytes + 264, c->active.version, 4);
-	put_le(bytes + 268, c->active.static_entries, 4);
-	put_le(bytes + 272, c->active.dynamic_entries, 4);
-	memcpy(bytes + 276, c->active.static_sha256, 32);
-	memcpy(bytes + 308, c->active.dynamic_sha256, 32);
+	c = &message->common;
+	put_le(bytes + 208, c->version, 4);
+	put_le(bytes + 212, c->static_entries, 4);
+	put_le(bytes + 216, c->dynamic_entries, 4);
+	memcpy(bytes + 220, c->static_sha256, 32);
+	memcpy(bytes + 252, c->dynamic_sha256, 32);
 	return true;
 }
 
@@ -189,14 +157,14 @@ cluster_config_members_decode(const void *bytes, Size length, ClusterConfigMembe
 	const uint8 *b = bytes;
 	ClusterConfigMembersMessage m = { 0 };
 	ClusterSharedConfigIdentity *id = &m.key.ref.identity;
-	ClusterSharedConfigCensus *c = &m.census;
+	ClusterSharedConfigActive *c = &m.common;
 	if (overlaps(bytes, length, out, sizeof(*out)))
 		return false;
 	if (out != NULL)
 		memset(out, 0, sizeof(*out));
 	if (bytes == NULL || out == NULL || length != CLUSTER_CONFIG_MEMBERS_BYTES
-		|| memcmp(b, "PCSO", 4) != 0 || get_le(b + 4, 2) != 1
-		|| get_le(b + 6, 2) != CLUSTER_CONFIG_MEMBERS_BYTES || nonzero(b + 340, 12))
+		|| memcmp(b, "PCSO", 4) != 0 || get_le(b + 4, 2) != 3
+		|| get_le(b + 6, 2) != CLUSTER_CONFIG_MEMBERS_BYTES || nonzero(b + 284, 4))
 		return false;
 	m.verb = get_le(b + 8, 4);
 	m.collector = get_le(b + 12, 4);
@@ -218,26 +186,12 @@ cluster_config_members_decode(const void *bytes, Size length, ClusterConfigMembe
 	m.key.required[1] = get_le(b + 168, 8);
 	memcpy(m.key.members_sha256, b + 176, 32);
 	if (m.verb == CLUSTER_CONFIG_MEMBERS_REPLY && m.outcome == CLUSTER_CONFIG_MEMBERS_OBSERVED) {
-		c->ref = m.key.ref;
-		c->node_id = m.responder;
-		c->participants = get_le(b + 208, 4);
-		c->current_processes = get_le(b + 212, 4);
-		c->waiting_processes = get_le(b + 216, 4);
-		c->failed_processes = get_le(b + 220, 4);
-		c->parallel_processes = get_le(b + 224, 4);
-		c->pending_processes = get_le(b + 228, 4);
-		c->deferred_processes = get_le(b + 232, 4);
-		c->active_missing_processes = get_le(b + 236, 4);
-		c->static_mismatch_processes = get_le(b + 240, 4);
-		c->dynamic_mismatch_processes = get_le(b + 244, 4);
-		c->pending_entries = get_le(b + 248, 8);
-		c->deferred_entries = get_le(b + 256, 8);
-		c->active.version = get_le(b + 264, 4);
-		c->active.static_entries = get_le(b + 268, 4);
-		c->active.dynamic_entries = get_le(b + 272, 4);
-		memcpy(c->active.static_sha256, b + 276, 32);
-		memcpy(c->active.dynamic_sha256, b + 308, 32);
-	} else if (nonzero(b + 208, 132))
+		c->version = get_le(b + 208, 4);
+		c->static_entries = get_le(b + 212, 4);
+		c->dynamic_entries = get_le(b + 216, 4);
+		memcpy(c->static_sha256, b + 220, 32);
+		memcpy(c->dynamic_sha256, b + 252, 32);
+	} else if (nonzero(b + 208, 76))
 		return false;
 	if (!message_valid(&m))
 		return false;
@@ -245,10 +199,9 @@ cluster_config_members_decode(const void *bytes, Size length, ClusterConfigMembe
 	return true;
 }
 
-bool
-cluster_config_members_make_key(const ClusterSharedConfigRef *ref,
-								const ClusterR4MembershipSnapshot *members,
-								ClusterConfigMembersKey *key)
+static bool
+make_key(const ClusterSharedConfigRef *ref, const ClusterR4MembershipSnapshot *members,
+		 ClusterConfigMembersKey *key)
 {
 	static const uint8 domain[] = "PGRAC config admitted incarnations v1";
 	pg_sha256_ctx hash;
@@ -281,7 +234,7 @@ static bool
 local_role(void)
 {
 	return MyBackendType == B_LMON && cluster_enabled && cluster_shared_config
-		   && (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1) != 0;
+		   && (cluster_ic_local_capability_word() & PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3) != 0;
 }
 
 static bool
@@ -291,14 +244,14 @@ round_current(void)
 	ClusterConfigMembersKey key;
 	if (!local_role() || !member_round.active
 		|| !cluster_reconfig_lmon_snapshot_r4_membership(&members)
-		|| !cluster_config_members_make_key(&member_round.report.key.ref, &members, &key)
+		|| !make_key(&member_round.report.key.ref, &members, &key)
 		|| memcmp(&key, &member_round.report.key, sizeof(key)) != 0)
 		return false;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node)
 		if (in_set(key.required, node) && node != (uint32)cluster_node_id
 			&& (!cluster_ic_tier1_stream_current(&member_round.stream[node])
 				|| !cluster_sf_peer_capability_generation_matches(
-					node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1, member_round.connection[node])))
+					node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3, member_round.connection[node])))
 			return false;
 	return true;
 }
@@ -311,6 +264,56 @@ complete(void)
 			!= member_round.report.key.required[i])
 			return false;
 	return true;
+}
+
+ClusterConfigMountResult
+cluster_config_members_mount_status(void)
+{
+	ClusterConfigMountProof proof;
+	ClusterR4MembershipSnapshot members;
+	ClusterConfigMembersKey key;
+	ClusterSharedConfigActive common;
+	if (!cluster_shared_config_mount_observe(&proof)
+		|| !cluster_reconfig_lmon_snapshot_r4_membership(&members)
+		|| proof.self_incarnation != members.local_self_boot_incarnation
+		|| !make_key(&proof.key.ref, &members, &key) || memcmp(&key, &proof.key, sizeof(key)) != 0
+		|| !cluster_shared_config_common_profile(&common))
+		return CLUSTER_CONFIG_MOUNT_UNPROVEN;
+	if (memcmp(&common, &proof.common, sizeof(common)) != 0)
+		return CLUSTER_CONFIG_MOUNT_MISMATCH;
+	return proof.result;
+}
+
+/* Static parent values cannot change online. This boot/member observation
+ * needs no online producer hold. It never substitutes for DATA authority. */
+static void
+publish_mount_observation(void)
+{
+	ClusterConfigMountProof proof = { 0 };
+	const ClusterSharedConfigActive *local;
+	if (!round_current() || !complete() || member_round.report.unavailable[0]
+		|| member_round.report.unavailable[1])
+		goto done;
+	local = &member_round.report.node[cluster_node_id];
+	proof.key = member_round.report.key;
+	proof.self_incarnation = member_round.incarnation[cluster_node_id];
+	proof.common = *local;
+	proof.result = CLUSTER_CONFIG_MOUNT_MATCH;
+	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
+		const ClusterSharedConfigActive *c = &member_round.report.node[node];
+		if (!in_set(proof.key.required, node))
+			continue;
+		if (!profile_valid(c)) {
+			proof.result = CLUSTER_CONFIG_MOUNT_UNPROVEN;
+			break;
+		}
+		if (memcmp(c, &proof.common, sizeof(*c)) != 0)
+			proof.result = CLUSTER_CONFIG_MOUNT_MISMATCH;
+	}
+	if (!round_current())
+		memset(&proof, 0, sizeof(proof));
+done:
+	cluster_shared_config_mount_publish(&proof);
 }
 
 static ClusterConfigMembersMessage
@@ -336,10 +339,10 @@ observe_local(ClusterConfigMembersMessage *m)
 		|| m->collector_incarnation != member_round.incarnation[m->collector])
 		return false;
 	m->verb = CLUSTER_CONFIG_MEMBERS_REPLY;
-	if (cluster_shared_config_node_census(&m->key.ref, cluster_node_id, &m->census))
+	if (cluster_shared_config_parent_profile(&m->key.ref, cluster_node_id, &m->common))
 		m->outcome = CLUSTER_CONFIG_MEMBERS_OBSERVED;
 	else {
-		memset(&m->census, 0, sizeof(m->census));
+		memset(&m->common, 0, sizeof(m->common));
 		m->outcome = CLUSTER_CONFIG_MEMBERS_UNAVAILABLE;
 	}
 	return message_valid(m) && round_current();
@@ -353,7 +356,7 @@ accept_observation(const ClusterConfigMembersMessage *m)
 	if ((member_round.report.observed[word] | member_round.report.unavailable[word]) & bit)
 		return;
 	if (m->outcome == CLUSTER_CONFIG_MEMBERS_OBSERVED) {
-		member_round.report.node[m->responder] = m->census;
+		member_round.report.node[m->responder] = m->common;
 		member_round.report.observed[word] |= bit;
 	} else
 		member_round.report.unavailable[word] |= bit;
@@ -369,17 +372,15 @@ cluster_config_members_poll(const ClusterSharedConfigRef *selected,
 	ClusterICTier1Stream stream[CLUSTER_MAX_NODES] = { 0 };
 	if (!local_role())
 		return;
-	if (!cluster_config_members_make_key(selected, members, &key)
-		|| !cluster_reconfig_lmon_snapshot_r4_membership(&fresh)
-		|| !cluster_config_members_make_key(selected, &fresh, &current)
-		|| memcmp(&key, &current, sizeof(key)) != 0)
+	if (!make_key(selected, members, &key) || !cluster_reconfig_lmon_snapshot_r4_membership(&fresh)
+		|| !make_key(selected, &fresh, &current) || memcmp(&key, &current, sizeof(key)) != 0)
 		goto unavailable;
 	for (unsigned node = 0; node < CLUSTER_MAX_NODES; ++node) {
 		uint32 word;
 		if (in_set(key.required, node) && node != (uint32)cluster_node_id
 			&& (!cluster_ic_tier1_stream_capture(node, &stream[node])
 				|| !cluster_sf_peer_capability_word_sample(
-					node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1, &word, &connection[node])))
+					node, PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3, &word, &connection[node])))
 			goto unavailable;
 	}
 	if (!member_round.active || !round_current() || complete()
@@ -417,8 +418,10 @@ cluster_config_members_poll(const ClusterSharedConfigRef *selected,
 			(void)cluster_ic_send_envelope(PGRAC_IC_MSG_CONFIG_MEMBERS, node, bytes, sizeof(bytes));
 		/* Queue refusal retains this exact missing member for the next tick. */
 	}
-	if (round_current())
+	if (round_current()) {
+		publish_mount_observation();
 		return;
+	}
 unavailable:
 	cluster_config_members_cancel();
 }
@@ -426,8 +429,11 @@ unavailable:
 void
 cluster_config_members_cancel(void)
 {
-	if (MyBackendType == B_LMON)
+	if (MyBackendType == B_LMON) {
+		ClusterConfigMountProof empty = { 0 };
 		memset(&member_round, 0, sizeof(member_round));
+		cluster_shared_config_mount_publish(&empty);
+	}
 }
 
 bool
@@ -465,8 +471,10 @@ config_members_ingress_impl(const ClusterICEnvelope *env, const void *payload)
 		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_CONFIG_MEMBERS, m.collector, bytes,
 									   sizeof(bytes));
 	} else if (env->source_node_id == m.responder && m.collector == (uint32)cluster_node_id
-			   && m.nonce == member_round.report.nonce)
+			   && m.nonce == member_round.report.nonce) {
 		accept_observation(&m);
+		publish_mount_observation();
+	}
 }
 
 void

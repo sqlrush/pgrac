@@ -1,13 +1,5 @@
 -- PGRAC test-only functions, not part of the product catalog.
 -- Author: SqlRush <sqlrush@gmail.com>
-CREATE FUNCTION test_pgrac_config_work_state()
-RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_work_state'
-LANGUAGE C VOLATILE;
-REVOKE ALL ON FUNCTION test_pgrac_config_work_state() FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_work_launch()
-RETURNS integer AS 'MODULE_PATHNAME', 'test_pgrac_config_work_launch'
-LANGUAGE C VOLATILE;
-REVOKE ALL ON FUNCTION test_pgrac_config_work_launch() FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_delivery_receive()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_receive'
 LANGUAGE C VOLATILE;
@@ -28,22 +20,6 @@ CREATE FUNCTION test_pgrac_config_define_common(boolean)
 RETURNS void AS 'MODULE_PATHNAME', 'test_pgrac_config_define_common'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_define_common(boolean) FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_active_census()
-RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active_census'
-LANGUAGE C VOLATILE;
-REVOKE ALL ON FUNCTION test_pgrac_config_active_census() FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_active_census(boolean)
-RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_active_census'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_config_active_census(boolean) FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_delivery_state()
-RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_state'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_config_delivery_state() FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_census()
-RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_census'
-LANGUAGE C VOLATILE;
-REVOKE ALL ON FUNCTION test_pgrac_config_census() FROM PUBLIC;
 
 CREATE FUNCTION test_pgrac_config_delivery_refuse()
 RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery_refuse'
@@ -109,27 +85,14 @@ CREATE FUNCTION test_pgrac_config_process(integer, text)
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_process'
 LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_process(integer, text) FROM PUBLIC;
+CREATE FUNCTION test_pgrac_config_sql_mode(boolean)
+RETURNS void AS 'MODULE_PATHNAME', 'test_pgrac_config_sql_mode'
+LANGUAGE C STRICT;
+REVOKE ALL ON FUNCTION test_pgrac_config_sql_mode(boolean) FROM PUBLIC;
 CREATE FUNCTION test_pgrac_config_parallel_observe()
 RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_parallel_observe'
 LANGUAGE C STRICT PARALLEL SAFE;
 REVOKE ALL ON FUNCTION test_pgrac_config_parallel_observe() FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_enrollment(integer)
-RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_enrollment'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_config_enrollment(integer) FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_native_role(integer)
-RETURNS text AS 'MODULE_PATHNAME', 'test_pgrac_config_native_role'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_config_native_role(integer) FROM PUBLIC;
--- PGRAC: actual non-immediate native checkpoint, disposable test nodes only.
-CREATE FUNCTION test_pgrac_config_checkpoint_request(boolean)
-RETURNS void AS 'MODULE_PATHNAME', 'test_pgrac_config_checkpoint_request'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_config_checkpoint_request(boolean) FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_slot_probe(integer)
-RETURNS boolean AS 'MODULE_PATHNAME', 'test_pgrac_config_slot_probe'
-LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_config_slot_probe(integer) FROM PUBLIC;
 -- PGRAC: read-only native selected-input memory lifetime, no CF admission.
 -- Author: SqlRush <sqlrush@gmail.com>
 CREATE FUNCTION test_pgrac_config_selection_cleanup()
@@ -138,18 +101,3 @@ LANGUAGE C STRICT;
 REVOKE ALL ON FUNCTION test_pgrac_config_selection_cleanup() FROM PUBLIC;
 -- PGRAC: exact detached process observation; no runtime mutation capability.
 -- Author: SqlRush <sqlrush@gmail.com>
-CREATE FUNCTION test_pgrac_config_delivery() RETURNS text
-AS 'MODULE_PATHNAME', 'test_pgrac_config_delivery' LANGUAGE C;
-REVOKE ALL ON FUNCTION test_pgrac_config_delivery() FROM PUBLIC;
--- PGRAC: local native cut observation only; no distributed permission.
-CREATE FUNCTION test_pgrac_config_gate_state() RETURNS text
-AS 'MODULE_PATHNAME', 'test_pgrac_config_gate_state' LANGUAGE C;
-REVOKE ALL ON FUNCTION test_pgrac_config_gate_state() FROM PUBLIC;
-CREATE FUNCTION test_pgrac_config_future_launch() RETURNS integer
-AS 'MODULE_PATHNAME', 'test_pgrac_config_future_launch' LANGUAGE C;
-REVOKE ALL ON FUNCTION test_pgrac_config_future_launch() FROM PUBLIC;
--- PGRAC: disposable fixture control only, never production SQL authority.
--- Author: SqlRush <sqlrush@gmail.com>
-CREATE FUNCTION test_pgrac_config_background(integer, text, integer DEFAULT 0) RETURNS text
-AS 'MODULE_PATHNAME', 'test_pgrac_config_background' LANGUAGE C STRICT;
-REVOKE ALL ON FUNCTION test_pgrac_config_background(integer, text, integer) FROM PUBLIC;

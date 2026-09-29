@@ -1,8 +1,8 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_config_members.c
- *    Actual member observation codec/collector with transport/census boundaries.
- *    Native census/process behavior has separate real-C and native TAP tests.
+ *    Actual member observation codec/collector with transport/startup-profile boundaries.
+ *    Native parent/process behavior has separate real-C and native TAP tests.
  *    This program does not certify distributed authentication or admission.
  *
  * Portions Copyright (c) 2026, pgrac contributors
@@ -31,15 +31,42 @@ static ClusterSharedConfigRef target;
 static ClusterR4MembershipSnapshot live;
 static uint32 connections[CLUSTER_MAX_NODES];
 static uint64 streams[CLUSTER_MAX_NODES];
-static bool stream_available, stream_change_during_census;
-static bool member_available, census_available, change_during_census, caps_available, random_ok;
+static bool stream_available, stream_change_during_profile;
+static bool member_available, profile_available, change_during_profile, caps_available, random_ok;
 static unsigned sends, captures;
 static uint64 nonce_source;
 static ClusterICSendResult send_result;
 static ClusterConfigMembersMessage sent[CLUSTER_MAX_NODES];
 static ClusterConfigMembersObservation observation;
 static ClusterICMsgTypeInfo registered;
-static bool census_error, send_error;
+static bool profile_error, send_error;
+static ClusterConfigMountProof mount_proof;
+static bool local_profile_available = true, local_profile_changed;
+
+void
+cluster_shared_config_mount_publish(const ClusterConfigMountProof *proof)
+{
+	mount_proof = *proof;
+}
+bool
+cluster_shared_config_mount_observe(ClusterConfigMountProof *proof)
+{
+	*proof = mount_proof;
+	return mount_proof.result != CLUSTER_CONFIG_MOUNT_UNPROVEN;
+}
+bool
+cluster_shared_config_common_profile(ClusterSharedConfigActive *out)
+{
+	memset(out, 0, sizeof(*out));
+	out->version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
+	out->static_entries = 100;
+	out->dynamic_entries = 149;
+	memset(out->static_sha256, 0x33, 32);
+	memset(out->dynamic_sha256, 0x44, 32);
+	if (local_profile_changed)
+		out->static_sha256[0] ^= 1;
+	return local_profile_available;
+}
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 
@@ -101,34 +128,32 @@ pg_strong_random(void *out, size_t len)
 	memcpy(out, &nonce_source, len);
 	return random_ok;
 }
-static ClusterSharedConfigCensus
-census_for(unsigned node)
+static ClusterSharedConfigActive
+profile_for(unsigned node)
 {
-	ClusterSharedConfigCensus c = { 0 };
-	c.ref = target;
-	c.node_id = node;
-	c.participants = c.current_processes = 7;
-	c.active.version = 1;
-	c.active.static_entries = 100;
-	c.active.dynamic_entries = 149;
-	memset(c.active.static_sha256, 0x33, 32);
-	memset(c.active.dynamic_sha256, 0x44, 32);
+	ClusterSharedConfigActive c = { 0 };
+	(void)node;
+	c.version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
+	c.static_entries = 100;
+	c.dynamic_entries = 149;
+	memset(c.static_sha256, 0x33, 32);
+	memset(c.dynamic_sha256, 0x44, 32);
 	return c;
 }
 bool
-cluster_shared_config_node_census(const ClusterSharedConfigRef *ref, int node,
-								  ClusterSharedConfigCensus *out)
+cluster_shared_config_parent_profile(const ClusterSharedConfigRef *ref, int node,
+									 ClusterSharedConfigActive *out)
 {
 	++captures;
-	if (census_error)
+	if (profile_error)
 		pg_re_throw();
-	*out = census_for(node);
-	out->ref = *ref;
-	if (change_during_census)
+	*out = profile_for(node);
+	UT_ASSERT_EQ(ref->identity.system_identifier, target.identity.system_identifier);
+	if (change_during_profile)
 		++live.formation_epoch;
-	if (stream_change_during_census)
+	if (stream_change_during_profile)
 		++streams[3];
-	return census_available;
+	return profile_available;
 }
 ClusterICSendResult
 cluster_ic_send_envelope(uint8 type, int32 dest, const void *payload, uint32 len)
@@ -169,15 +194,18 @@ put64(uint8 *p, uint64 v)
 static void
 reset(void)
 {
+	memset(&mount_proof, 0, sizeof(mount_proof));
+	local_profile_available = true;
+	local_profile_changed = false;
 	MyBackendType = B_LMON;
 	cluster_config_members_cancel();
 	cluster_node_id = 0;
 	cluster_enabled = cluster_shared_config = true;
-	member_available = census_available = caps_available = random_ok = true;
-	change_during_census = false;
+	member_available = profile_available = caps_available = random_ok = true;
+	change_during_profile = false;
 	stream_available = true;
-	stream_change_during_census = false;
-	census_error = send_error = false;
+	stream_change_during_profile = false;
+	profile_error = send_error = false;
 	send_result = CLUSTER_IC_SEND_DONE;
 	sends = captures = 0;
 	memset(&live, 0, sizeof(live));
@@ -223,18 +251,18 @@ reply(unsigned node)
 	ClusterConfigMembersMessage m = sent[node];
 	m.verb = CLUSTER_CONFIG_MEMBERS_REPLY;
 	m.outcome = CLUSTER_CONFIG_MEMBERS_OBSERVED;
-	m.census = census_for(node);
+	m.common = profile_for(node);
 	return m;
 }
 
 UT_TEST(literal_request)
 {
-	uint8 b[352] = { 0 }, encoded[352];
+	uint8 b[288] = { 0 }, encoded[288];
 	ClusterConfigMembersMessage m = { 0 };
 	reset();
 	memcpy(b, "PCSO", 4);
-	b[4] = 1;
-	b[6] = 96;
+	b[4] = 3;
+	b[6] = 32;
 	b[7] = 1;
 	b[8] = 1;
 	b[16] = 3;
@@ -258,7 +286,7 @@ UT_TEST(literal_request)
 	UT_ASSERT(cluster_config_members_encode(&m, encoded));
 	UT_ASSERT(memcmp(b, encoded, sizeof(b)) == 0);
 	for (unsigned i = 0; i < 7; ++i) {
-		static const unsigned bad[] = { 0, 4, 6, 20, 208, 340, 351 };
+		static const unsigned bad[] = { 0, 4, 6, 20, 208, 284, 287 };
 		uint8 before = b[bad[i]];
 		b[bad[i]] ^= 4;
 		memset(&m, 0xa5, sizeof(m));
@@ -286,44 +314,34 @@ UT_TEST(sparse_members_and_retry)
 	deliver(&m, 3, 7);
 	UT_ASSERT(cluster_config_members_observe(&observation));
 	UT_ASSERT_EQ(observation.observed[0], 9);
-	UT_ASSERT_EQ(observation.node[3].participants, 7);
+	UT_ASSERT_EQ(observation.node[3].static_entries, 100);
 	cluster_config_members_poll(&target, &live);
 	UT_ASSERT(sent[3].nonce != nonce);
 }
 UT_TEST(reply_counts_and_profiles)
 {
-	uint8 b[352];
+	uint8 b[288];
 	ClusterConfigMembersMessage m, decoded;
 	reset();
 	cluster_config_members_poll(&target, &live);
 	m = reply(3);
-	m.census.current_processes = 3;
-	m.census.waiting_processes = 2;
-	m.census.failed_processes = m.census.parallel_processes = 1;
-	m.census.pending_processes = 2;
-	m.census.pending_entries = 5;
-	m.census.deferred_processes = 1;
-	m.census.deferred_entries = 2;
-	m.census.static_mismatch_processes = 1;
-	m.census.active_missing_processes = 1;
 	UT_ASSERT(cluster_config_members_encode(&m, b));
-	UT_ASSERT_EQ(b[208], 7);
-	UT_ASSERT_EQ(b[248], 5);
+	UT_ASSERT_EQ(b[208], CLUSTER_SHARED_CONFIG_COMMON_VERSION);
+	UT_ASSERT_EQ(b[212], 100);
+	UT_ASSERT_EQ(b[216], 149);
 	UT_ASSERT(cluster_config_members_decode(b, sizeof(b), &decoded));
-	UT_ASSERT_EQ(decoded.census.static_mismatch_processes, 1);
-	m.census.current_processes = 4;
+	UT_ASSERT(memcmp(&decoded.common, &m.common, sizeof(m.common)) == 0);
+	m.common.version = 1;
 	UT_ASSERT(!cluster_config_members_encode(&m, b));
 	UT_ASSERT(zero(b, sizeof(b)));
 	m = reply(3);
-	m.census.pending_processes = 8;
+	m.common.static_entries = 0;
 	UT_ASSERT(!cluster_config_members_encode(&m, b));
 	m = reply(3);
-	m.census.active.version = 2;
+	memset(m.common.dynamic_sha256, 0, 32);
 	UT_ASSERT(!cluster_config_members_encode(&m, b));
 	m = reply(3);
-	memset(&m.census.active, 0, sizeof(m.census.active));
-	UT_ASSERT(cluster_config_members_encode(&m, b));
-	m.census.active.static_entries = 1;
+	m.common.dynamic_entries = CLUSTER_SHARED_CONFIG_MAX_ENTRIES;
 	UT_ASSERT(!cluster_config_members_encode(&m, b));
 }
 UT_TEST(aliases_do_not_clobber)
@@ -334,7 +352,7 @@ UT_TEST(aliases_do_not_clobber)
 	m = before = sent[3];
 	UT_ASSERT(!cluster_config_members_encode(&m, (uint8 *)&m));
 	UT_ASSERT(memcmp(&m, &before, sizeof(m)) == 0);
-	UT_ASSERT(!cluster_config_members_decode(&m, 352, &m));
+	UT_ASSERT(!cluster_config_members_decode(&m, 288, &m));
 	UT_ASSERT(memcmp(&m, &before, sizeof(m)) == 0);
 }
 UT_TEST(wrong_identity_cannot_fill_slot)
@@ -356,30 +374,25 @@ UT_TEST(wrong_identity_cannot_fill_slot)
 			break;
 		case 3:
 			++m.key.ref.identity.generation;
-			m.census.ref = m.key.ref;
 			break;
 		case 4:
 			m.key.ref.sha256[0]++;
-			m.census.ref = m.key.ref;
 			break;
 		case 5:
 			m.key.members_sha256[0]++;
 			break;
 		case 6:
 			++m.key.ref.identity.database_incarnation;
-			m.census.ref = m.key.ref;
 			break;
 		case 7:
 			++m.key.epoch;
 			break;
 		case 8:
 			m.key.ref.identity.authority_uuid[0]++;
-			m.census.ref = m.key.ref;
 			break;
 		case 9:
 			m.collector = 3;
 			m.responder = 0;
-			m.census.node_id = 0;
 			break;
 		}
 		deliver(&m, 3, 7);
@@ -399,11 +412,11 @@ UT_TEST(duplicate_is_not_another_member_or_new_observation)
 	cluster_config_members_poll(&target, &live);
 	m = reply(3);
 	deliver(&m, 3, 7);
-	m.census.active.dynamic_sha256[0]++;
+	m.common.dynamic_sha256[0]++;
 	deliver(&m, 3, 7);
 	UT_ASSERT(cluster_config_members_observe(&observation));
 	UT_ASSERT_EQ(observation.observed[0], 9);
-	UT_ASSERT_EQ(observation.node[3].active.dynamic_sha256[0], 0x44);
+	UT_ASSERT_EQ(observation.node[3].dynamic_sha256[0], 0x44);
 }
 UT_TEST(unavailable_is_not_observed)
 {
@@ -412,7 +425,7 @@ UT_TEST(unavailable_is_not_observed)
 	cluster_config_members_poll(&target, &live);
 	m = reply(3);
 	m.outcome = CLUSTER_CONFIG_MEMBERS_UNAVAILABLE;
-	memset(&m.census, 0, sizeof(m.census));
+	memset(&m.common, 0, sizeof(m.common));
 	deliver(&m, 3, 7);
 	UT_ASSERT(cluster_config_members_observe(&observation));
 	UT_ASSERT_EQ(observation.observed[0], 1);
@@ -492,10 +505,10 @@ UT_TEST(no_native_stream_is_not_capability_proof)
 	UT_ASSERT_EQ(sends, 0);
 	UT_ASSERT(!cluster_config_members_observe(&observation));
 }
-UT_TEST(native_stream_changed_during_census_cannot_send)
+UT_TEST(native_stream_changed_during_profile_cannot_send)
 {
 	reset();
-	stream_change_during_census = true;
+	stream_change_during_profile = true;
 	cluster_config_members_poll(&target, &live);
 	UT_ASSERT_EQ(sends, 0);
 	UT_ASSERT(!cluster_config_members_observe(&observation));
@@ -549,10 +562,10 @@ UT_TEST(sparse_four_members_include_high_bitmap)
 	UT_ASSERT_EQ(observation.observed[0], 9);
 	UT_ASSERT_EQ(observation.observed[1], 3);
 }
-UT_TEST(census_identity_change_has_no_reply)
+UT_TEST(profile_identity_change_has_no_reply)
 {
 	reset();
-	change_during_census = true;
+	change_during_profile = true;
 	cluster_config_members_poll(&target, &live);
 	UT_ASSERT(!cluster_config_members_observe(&observation));
 	UT_ASSERT_EQ(sends, 0);
@@ -575,12 +588,12 @@ UT_TEST(responder_uses_own_selected_target)
 	UT_ASSERT_EQ(sends, before + 1);
 	UT_ASSERT_EQ(sent[0].verb, CLUSTER_CONFIG_MEMBERS_REPLY);
 	UT_ASSERT_EQ(sent[0].nonce, request.nonce);
-	UT_ASSERT_EQ(sent[0].census.node_id, 3);
+	UT_ASSERT_EQ(sent[0].responder, 3);
 	UT_ASSERT_EQ(sent[0].outcome, CLUSTER_CONFIG_MEMBERS_OBSERVED);
-	census_available = false;
+	profile_available = false;
 	deliver(&request, 0, 7);
 	UT_ASSERT_EQ(sent[0].outcome, CLUSTER_CONFIG_MEMBERS_UNAVAILABLE);
-	UT_ASSERT(zero(&sent[0].census, sizeof(sent[0].census)));
+	UT_ASSERT(zero(&sent[0].common, sizeof(sent[0].common)));
 }
 UT_TEST(cancel_and_role_guard)
 {
@@ -622,7 +635,7 @@ UT_TEST(ingress_error_retires_observation)
 		request.responder = 0;
 		request.collector_incarnation = 34;
 		request.responder_incarnation = 31;
-		census_error = fault == 0;
+		profile_error = fault == 0;
 		send_error = fault == 1;
 		PG_TRY();
 		{
@@ -636,16 +649,101 @@ UT_TEST(ingress_error_retires_observation)
 		UT_ASSERT(caught);
 		UT_ASSERT(!cluster_config_members_observe(&observation));
 		UT_ASSERT(zero(&observation, sizeof(observation)));
-		census_error = send_error = false;
+		profile_error = send_error = false;
 		cluster_config_members_poll(&target, &live);
 		UT_ASSERT(cluster_config_members_observe(&observation));
 		UT_ASSERT(observation.nonce != request.nonce);
 	}
 }
+UT_TEST(mount_requires_complete_common_values)
+{
+	ClusterConfigMembersMessage m;
+	reset();
+	cluster_config_members_poll(&target, &live);
+	UT_ASSERT_EQ(cluster_config_members_mount_status(), CLUSTER_CONFIG_MOUNT_UNPROVEN);
+	m = reply(3);
+	m.common.version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
+	deliver(&m, 3, 7);
+	UT_ASSERT_EQ(cluster_config_members_mount_status(), CLUSTER_CONFIG_MOUNT_MATCH);
+}
+
+UT_TEST(mount_pending_is_not_active_mismatch)
+{
+	ClusterConfigMembersMessage m;
+	reset();
+	cluster_config_members_poll(&target, &live);
+	m = reply(3);
+	/* Pending restart counts deliberately do not exist on this wire. */
+	deliver(&m, 3, 7);
+	UT_ASSERT_EQ(cluster_config_members_mount_status(), CLUSTER_CONFIG_MOUNT_MATCH);
+}
+UT_TEST(mount_mismatch_is_not_missing_evidence)
+{
+	for (unsigned kind = 0; kind < 2; ++kind) {
+		ClusterConfigMembersMessage m;
+		reset();
+		cluster_config_members_poll(&target, &live);
+		m = reply(3);
+		if (kind == 0)
+			m.common.static_sha256[0] ^= 1;
+		else
+			m.common.dynamic_sha256[0] ^= 1;
+		deliver(&m, 3, 7);
+		UT_ASSERT_EQ(cluster_config_members_mount_status(), CLUSTER_CONFIG_MOUNT_MISMATCH);
+	}
+}
+UT_TEST(mount_stale_identity_and_missing_profile_are_not_match)
+{
+	for (unsigned fault = 0; fault < 6; ++fault) {
+		ClusterConfigMembersMessage m;
+		reset();
+		cluster_config_members_poll(&target, &live);
+		m = reply(3);
+		deliver(&m, 3, 7);
+		UT_ASSERT_EQ(cluster_config_members_mount_status(), CLUSTER_CONFIG_MOUNT_MATCH);
+		switch (fault) {
+		case 0:
+			++live.formation_epoch;
+			break;
+		case 1:
+			++live.admitted_incarnation[3];
+			break;
+		case 2:
+			++live.admitted_incarnation[0];
+			break;
+		case 3:
+			member_available = false;
+			break;
+		case 4:
+			local_profile_available = false;
+			break;
+		case 5:
+			cluster_config_members_cancel();
+			break;
+		}
+		UT_ASSERT_EQ(cluster_config_members_mount_status(), CLUSTER_CONFIG_MOUNT_UNPROVEN);
+	}
+}
+UT_TEST(mount_own_value_contradiction_is_mismatch)
+{
+	ClusterConfigMembersMessage m;
+	reset();
+	cluster_config_members_poll(&target, &live);
+	m = reply(3);
+	deliver(&m, 3, 7);
+	local_profile_changed = true;
+	UT_ASSERT_EQ(cluster_config_members_mount_status(), CLUSTER_CONFIG_MOUNT_MISMATCH);
+}
+
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(27);
+	UT_RUN(mount_pending_is_not_active_mismatch);
+	UT_RUN(mount_mismatch_is_not_missing_evidence);
+	UT_RUN(mount_stale_identity_and_missing_profile_are_not_match);
+	UT_RUN(mount_own_value_contradiction_is_mismatch);
+	UT_RUN(mount_requires_complete_common_values);
 	UT_RUN(literal_request);
 	UT_RUN(sparse_members_and_retry);
 	UT_RUN(reply_counts_and_profiles);
@@ -658,12 +756,12 @@ main(void)
 	UT_RUN(connection_change_retires_round);
 	UT_RUN(native_stream_replacement_retires_same_capability_generation);
 	UT_RUN(no_native_stream_is_not_capability_proof);
-	UT_RUN(native_stream_changed_during_census_cannot_send);
+	UT_RUN(native_stream_changed_during_profile_cannot_send);
 	UT_RUN(ordinary_refresh_does_not_churn_identity);
 	UT_RUN(changed_selection_cancels_old_reply);
 	UT_RUN(no_partial_membership_or_missing_capability);
 	UT_RUN(sparse_four_members_include_high_bitmap);
-	UT_RUN(census_identity_change_has_no_reply);
+	UT_RUN(profile_identity_change_has_no_reply);
 	UT_RUN(responder_uses_own_selected_target);
 	UT_RUN(cancel_and_role_guard);
 	UT_RUN(register_control_owner);

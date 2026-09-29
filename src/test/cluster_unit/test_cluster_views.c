@@ -241,8 +241,7 @@ UT_TEST(test_cluster_wait_events_count_is_123)
 	 * together, and this test number must be bumped in lockstep.
 	 */
 	/* spec-7.2 D6: +2 LMS data-plane -> 120. */
-	/* PGRAC: +1 native shared-configuration producer-cut wait. */
-	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 124);
+	UT_ASSERT_EQ(CLUSTER_WAIT_EVENTS_COUNT, 123);
 }
 
 

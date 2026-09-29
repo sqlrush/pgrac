@@ -73,8 +73,6 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_lmd.h"
 #include "cluster/cluster_clean_leave.h"
-#include "cluster/cluster_config_use_gate.h"
-#include "cluster/cluster_config_channels.h"
 #include "cluster/cluster_cssd.h"
 #include "cluster/cluster_shmem.h"
 #include "utils/guc.h"
@@ -107,9 +105,6 @@ ErrorContextCallback *error_context_stack;
 static sigjmp_buf test_main_exit;
 static bool test_main_running;
 static bool test_probe_waiting;
-static bool test_config_probe_held;
-static unsigned test_config_probe_scans;
-static unsigned test_config_probe_owned;
 /* Legacy stop-loop fixture; PRE2 roster qualification uses the actual
  * production member-mask body in the normal-stop unit program. */
 bool cluster_shared_config = false;
@@ -119,21 +114,11 @@ static int test_main_exit_code, test_error_level;
 static pg_on_exit_callback test_exit_callback;
 static LWLock *test_locks[4];
 static unsigned test_lock_depth;
-static unsigned test_config_idle_ticks;
 static ClusterNormalStopPollResult test_graph_observation;
 static void test_stop_work(void);
 static int test_stop_wait(void);
 static void test_callback_late_work(void);
 #include "test_cluster_lmon_stop_service.inc"
-
-void
-cluster_config_channels_tick(void)
-{
-	/* Exercise actual original-loop placement, not an invented service ACK. */
-	UT_ASSERT_EQ(cl_normal_stop_service_depth, 0);
-	UT_ASSERT_EQ(test_lock_depth, 0);
-	++test_config_idle_ticks;
-}
 
 
 /* ============================================================
@@ -577,24 +562,6 @@ int cluster_node_id = 0;
 bool cluster_lmd_deadlock_detection_enabled = true;
 int cluster_lmd_global_dd_interval_ms = 2000;
 
-bool
-cluster_shared_config_service_producer_begin(ClusterConfigBackgroundKind kind)
-{
-	UT_ASSERT_EQ(kind, CLUSTER_CONFIG_BACKGROUND_DEADLOCK_PROBE);
-	UT_ASSERT_EQ(test_config_probe_owned, 0);
-	if (test_config_probe_held)
-		return false;
-	test_config_probe_owned++;
-	return true;
-}
-void
-cluster_shared_config_background_end(bool completed)
-{
-	UT_ASSERT(completed);
-	UT_ASSERT_EQ(test_config_probe_owned, 1);
-	test_config_probe_owned--;
-}
-
 int
 cluster_conf_node_count(void)
 {
@@ -610,7 +577,6 @@ cluster_cssd_get_peer_state(int32 peer_id pg_attribute_unused())
 void
 cluster_lmd_tarjan_run_coordinator_scan(int collect_timeout_ms pg_attribute_unused())
 {
-	test_config_probe_scans++;
 	if (test_main_running) {
 		test_main_coord_scans++;
 		UT_ASSERT_EQ(cl_normal_stop_service_depth, 1);
@@ -1181,7 +1147,6 @@ run_stop_lmd_main(int scenario)
 	pg_atomic_write_u32(&cl_normal_stop->phase, CLUSTER_NORMAL_STOP_DRAIN);
 	test_main_case = scenario;
 	test_main_waits = test_main_scans = test_main_coord_scans = test_main_polls = 0;
-	test_config_idle_ticks = 0;
 	test_main_exit_code = -1;
 	test_exit_callback = NULL;
 	PG_exception_stack = NULL;
@@ -1207,7 +1172,6 @@ UT_TEST(test_lmd_actual_main_work_sleep_pending_and_ordinary)
 	for (int scenario = 1; scenario <= 3; scenario++) {
 		run_stop_lmd_main(scenario);
 		UT_ASSERT_EQ(test_main_exit_code, 0);
-		UT_ASSERT(test_config_idle_ticks > 0);
 		UT_ASSERT_EQ(test_main_waits, 2);
 		UT_ASSERT_EQ(cluster_normal_stop_failure(), CLUSTER_NORMAL_STOP_FAILURE_NONE);
 		UT_ASSERT(scenario == 1 ? test_main_polls == 0 : test_main_polls >= 4);
@@ -1321,33 +1285,10 @@ UT_TEST(test_lmd_pending_zero_wait_seq_awaits_remote_revalidation_result)
 	UT_ASSERT_EQ(cluster_lmd_pending_normal_stop_poll(NULL, NULL), CLUSTER_NORMAL_STOP_READY);
 }
 
-UT_TEST(test_config_cut_stops_fresh_probe_without_consuming_cadence)
-{
-	ClusterLmdVertex local = test_stop_victim(0);
-	LmdPendingCancel *pending;
-	test_stop_lmd_reset();
-	local.cluster_epoch = 0;
-	pending = lmd_pending_cancel_add(&local, 123, 0, true, 42, &local, 1);
-	UT_ASSERT_NOT_NULL(pending);
-	test_marker = CLUSTER_CANCEL_MARKER_CONSUMED;
-	test_marker_id = 123;
-	lmd_last_coord_scan = 0;
-	test_config_probe_scans = 0;
-	test_config_probe_held = true;
-	cluster_lmd_run_coordinator_tick();
-	UT_ASSERT_EQ(test_config_probe_scans, 0);
-	UT_ASSERT_EQ(lmd_last_coord_scan, 0);
-	UT_ASSERT(!pending->active); /* Original cancel retirement is not held. */
-	test_config_probe_held = false;
-	cluster_lmd_run_coordinator_tick();
-	UT_ASSERT_EQ(test_config_probe_scans, 1);
-	UT_ASSERT_EQ(test_config_probe_owned, 0);
-}
-
 int
 main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 {
-	UT_PLAN(23);
+	UT_PLAN(22);
 
 	UT_RUN(test_lmd_auxproc_and_backend_type_surface);
 	UT_RUN(test_lmd_shmem_size_init_idempotent);
@@ -1371,7 +1312,6 @@ main(int argc pg_attribute_unused(), char *argv[] pg_attribute_unused())
 	UT_RUN(test_lmd_final_seal_rejects_new_queue_item_without_rewriting_existing);
 	UT_RUN(test_lmd_epoch_zero_is_owned_until_original_ack_not_invalid);
 	UT_RUN(test_lmd_pending_zero_wait_seq_awaits_remote_revalidation_result);
-	UT_RUN(test_config_cut_stops_fresh_probe_without_consuming_cadence);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

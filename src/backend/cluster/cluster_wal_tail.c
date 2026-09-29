@@ -211,6 +211,36 @@ wal_tail_paths_current(WalTailWork *work)
 	return true;
 }
 
+/* PGRAC: physical validity does not imply a supported shared recovery profile.
+ * Apply to both sealed recovery and checkpoint-less startup scans; a current
+ * off setting never makes historical optional SIDE effects disappear. */
+static ClusterControlRootResult
+wal_profile_supported(XLogReaderState *reader)
+{
+	const uint8 *data = (const uint8 *)XLogRecGetData(reader);
+	uint8 info = XLogRecGetInfo(reader) & ~XLR_INFO_MASK;
+	if (XLogRecGetRmid(reader) == RM_COMMIT_TS_ID)
+		return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
+	if (XLogRecGetRmid(reader) != RM_XLOG_ID)
+		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+	if (info == XLOG_PARAMETER_CHANGE) {
+		if (XLogRecGetDataLen(reader) != sizeof(xl_parameter_change)
+			|| data[offsetof(xl_parameter_change, track_commit_timestamp)] > 1)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		if (data[offsetof(xl_parameter_change, track_commit_timestamp)] != 0)
+			return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
+	} else if (info == XLOG_CHECKPOINT_SHUTDOWN || info == XLOG_CHECKPOINT_ONLINE) {
+		CheckPoint checkpoint;
+		if (XLogRecGetDataLen(reader) != sizeof(checkpoint))
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		memcpy(&checkpoint, data, sizeof(checkpoint));
+		if (TransactionIdIsValid(checkpoint.oldestCommitTsXid)
+			|| TransactionIdIsValid(checkpoint.newestCommitTsXid))
+			return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
+	}
+	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+}
+
 /* Fold every complete native parameter obligation, not only the latest one.
  * This is early sizing evidence, not permission to apply the configuration. */
 static ClusterControlRootResult
@@ -356,6 +386,9 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 	XLogBeginRead(work->reader, lower);
 	while ((record = XLogReadRecord(work->reader, &error)) != NULL) {
 		CHECK_FOR_INTERRUPTS();
+		result = wal_profile_supported(work->reader);
+		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			return result;
 		if (work->observed.records == 0 && work->reader->ReadRecPtr != lower)
 			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 		if (work->startup_mode) {

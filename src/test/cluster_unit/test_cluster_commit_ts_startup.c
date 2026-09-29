@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * test_cluster_commit_ts_startup.c
- *    Native commit-ts activation must not erase retained shared input.
+ *    Shared mode refuses commit-ts without erasing retained input.
  *
  * Actual production bodies; memory SLRU/lock/filesystem-presence boundaries.
  * No physical fsync, native recovery or configuration admission is simulated.
@@ -73,6 +73,11 @@ errmsg(const char *s pg_attribute_unused(), ...)
 	return 0;
 }
 int
+errdetail(const char *s pg_attribute_unused(), ...)
+{
+	return 0;
+}
+int
 errcode(int code pg_attribute_unused())
 {
 	return 0;
@@ -91,6 +96,13 @@ LWLockRelease(LWLock *lock)
 	int i = ((LWLockPadded *)lock) - locks;
 	UT_ASSERT(i >= 0 && i < 128 && held[i] == 1);
 	held[i]--;
+}
+/* Normal-XID comparison boundary; all fixtures use normal, nonwrapping IDs. */
+bool
+TransactionIdPrecedes(TransactionId a, TransactionId b)
+{
+	UT_ASSERT(TransactionIdIsNormal(a) && TransactionIdIsNormal(b));
+	return NormalTransactionIdPrecedes(a, b);
 }
 FullTransactionId
 ReadNextFullTransactionId(void)
@@ -133,6 +145,12 @@ SlruScanDirCbDeleteAll(SlruCtl ctl pg_attribute_unused(), char *name pg_attribut
 					   int seg pg_attribute_unused(), void *data pg_attribute_unused())
 {
 	abort();
+}
+void
+SimpleLruTruncate(SlruCtl ctl, int pageno pg_attribute_unused())
+{
+	UT_ASSERT(ctl == CommitTsCtl);
+	deletes++;
 }
 static void
 reset_fixture(bool clustered, TransactionId next)
@@ -186,14 +204,13 @@ UT_TEST(shared_deactivate_preserves_history_but_disables_answers)
 	UT_ASSERT_EQ(memcmp(before, page, BLCKSZ), 0);
 	UT_ASSERT_EQ(deletes + zeroes + writes, 0);
 }
-UT_TEST(shared_activate_reuses_current_page_and_bounds)
+UT_TEST(shared_activation_refuses_even_with_valid_existing_history)
 {
 	char before[BLCKSZ];
 	reset_fixture(true, 101);
 	memcpy(before, page, BLCKSZ);
-	StartupCommitTs();
-	CompleteCommitTsInitialization();
-	UT_ASSERT(ts_shared.commitTsActive);
+	UT_ASSERT(activate_refuses());
+	UT_ASSERT(!ts_shared.commitTsActive);
 	UT_ASSERT_EQ(variables.oldestCommitTsXid, 20);
 	UT_ASSERT_EQ(variables.newestCommitTsXid, 80);
 	UT_ASSERT_EQ(memcmp(before, page, BLCKSZ), 0);
@@ -207,12 +224,12 @@ UT_TEST(shared_missing_partial_page_is_not_reconstructed)
 	UT_ASSERT(!ts_shared.commitTsActive);
 	UT_ASSERT_EQ(deletes + zeroes + writes, 0);
 }
-UT_TEST(shared_unused_page_boundary_needs_no_startup_creation)
+UT_TEST(shared_unused_page_boundary_still_refuses_activation)
 {
 	reset_fixture(true, COMMIT_TS_XACTS_PER_PAGE);
 	physical_exists = false;
-	StartupCommitTs();
-	UT_ASSERT(ts_shared.commitTsActive);
+	UT_ASSERT(activate_refuses());
+	UT_ASSERT(!ts_shared.commitTsActive);
 	UT_ASSERT_EQ(deletes + zeroes + writes, 0);
 }
 UT_TEST(shared_wrong_owner_cannot_activate)
@@ -223,6 +240,72 @@ UT_TEST(shared_wrong_owner_cannot_activate)
 	UT_ASSERT(!ts_shared.commitTsActive);
 	UT_ASSERT_EQ(deletes + zeroes + writes, 0);
 }
+
+UT_TEST(shared_parameter_enable_refuses_before_any_side_effect)
+{
+	reset_fixture(true, 101);
+	expect_error = true;
+	if (setjmp(error_boundary) == 0) {
+		CommitTsParameterChange(true, false);
+		expect_error = false;
+		UT_ASSERT(false);
+	}
+	expect_error = false;
+	UT_ASSERT(!ts_shared.commitTsActive);
+	UT_ASSERT_EQ(variables.oldestCommitTsXid, 20);
+	UT_ASSERT_EQ(deletes + zeroes + writes, 0);
+}
+
+UT_TEST(shared_redo_refuses_both_records_even_with_feature_off)
+{
+	for (unsigned variant = 0; variant < 2; variant++) {
+		XLogReaderState reader = { 0 };
+		DecodedXLogRecord decoded = { 0 };
+		xl_commit_ts_truncate trunc = { 0, 90 };
+		int pageno = 0;
+		char before[BLCKSZ];
+
+		reset_fixture(true, 101);
+		track_commit_timestamp = false;
+		memcpy(before, page, BLCKSZ);
+		decoded.header.xl_info = variant ? COMMIT_TS_TRUNCATE : COMMIT_TS_ZEROPAGE;
+		decoded.max_block_id = -1;
+		decoded.main_data = variant ? (char *)&trunc : (char *)&pageno;
+		reader.record = &decoded;
+		expect_error = true;
+		if (setjmp(error_boundary) == 0) {
+			commit_ts_redo(&reader);
+			expect_error = false;
+			UT_ASSERT(false);
+		}
+		expect_error = false;
+		UT_ASSERT_EQ(memcmp(before, page, BLCKSZ), 0);
+		UT_ASSERT_EQ(deletes + zeroes + writes, 0);
+	}
+}
+UT_TEST(shared_already_active_history_is_not_silently_accepted)
+{
+	reset_fixture(true, 101);
+	ts_shared.commitTsActive = true;
+	expect_error = true;
+	if (setjmp(error_boundary) == 0) {
+		CommitTsParameterChange(true, true);
+		expect_error = false;
+		UT_ASSERT(false);
+	}
+	expect_error = false;
+	UT_ASSERT_EQ(deletes + zeroes + writes, 0);
+}
+
+UT_TEST(shared_disabled_parameter_change_remains_usable)
+{
+	reset_fixture(true, 101);
+	track_commit_timestamp = false;
+	CommitTsParameterChange(false, false);
+	UT_ASSERT(!ts_shared.commitTsActive);
+	UT_ASSERT_EQ(deletes + zeroes + writes, 0);
+}
+
 UT_TEST(ordinary_missing_page_and_disable_keep_native_behavior)
 {
 	reset_fixture(false, 101);
@@ -239,12 +322,16 @@ UT_TEST(ordinary_missing_page_and_disable_keep_native_behavior)
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(10);
 	UT_RUN(shared_deactivate_preserves_history_but_disables_answers);
-	UT_RUN(shared_activate_reuses_current_page_and_bounds);
+	UT_RUN(shared_activation_refuses_even_with_valid_existing_history);
 	UT_RUN(shared_missing_partial_page_is_not_reconstructed);
-	UT_RUN(shared_unused_page_boundary_needs_no_startup_creation);
+	UT_RUN(shared_unused_page_boundary_still_refuses_activation);
 	UT_RUN(shared_wrong_owner_cannot_activate);
+	UT_RUN(shared_parameter_enable_refuses_before_any_side_effect);
+	UT_RUN(shared_redo_refuses_both_records_even_with_feature_off);
+	UT_RUN(shared_already_active_history_is_not_silently_accepted);
+	UT_RUN(shared_disabled_parameter_change_remains_usable);
 	UT_RUN(ordinary_missing_page_and_disable_keep_native_behavior);
 	UT_DONE();
 	return ut_failed_count != 0;

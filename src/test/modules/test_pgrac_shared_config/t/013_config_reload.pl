@@ -123,6 +123,25 @@ is($node->safe_psql('postgres', call_sql(
 	"0:8:0:0:0:0\noff",
 	'late native hook error preserves no receipt, restores ownership, and admits partial assignment');
 
+# Public protocol settings use restart semantics even when originally SIGHUP.
+# Execute the real native setter/reset, not an imitation of its status bits.
+my $common_old = "common.cluster.read_scache='off'\n";
+my $common_new = "common.cluster.read_scache='on'\n";
+my $common_state = q{SELECT setting,pending_restart FROM pg_settings WHERE name='cluster.read_scache'};
+is($node->safe_psql('postgres', call_sql($common_old, $common_new) . $common_state),
+	"1:0:0:0:1:0\noff|t", 'common SIGHUP change is durable pending, never active online');
+is($node->safe_psql('postgres', call_sql($common_new, '') . $common_state),
+	"1:0:0:0:1:0\non|t", 'common SIGHUP RESET retains the running value until restart');
+is($node->safe_psql('postgres', call_sql($common_old, $common_new, 'totals')
+	. call_sql('', $new, 'totals') . $common_state),
+	"1:0:1:0\n1:0:1:0\noff|t", 'unrelated generation cannot erase common restart debt');
+is($node->safe_psql('postgres', call_sql($common_old, $common_new, 'totals')
+	. call_sql('', $common_old, 'totals') . $common_state),
+	"1:0:1:0\n1:0:0:0\noff|f", 'restoring the actual common value clears its own pending bit');
+is($node->safe_psql('postgres', call_sql($common_old, $common_new, 'totals')
+	. call_sql('', $new_port, 'totals') . call_sql('', $common_old, 'totals')),
+	"1:0:1:0\n1:0:2:0\n1:0:1:0", 'restoring one common value leaves another restart debt');
+
 # The factoring also runs in ordinary ProcessConfigFile. Prove its native
 # reload/remove path without shared configuration, not just the new consumer.
 $node->append_conf('postgresql.conf', "work_mem='9MB'");

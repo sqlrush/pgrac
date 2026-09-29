@@ -227,9 +227,6 @@ extern bool cluster_xid_wrap_barrier_marked(void);
 extern void cluster_xid_wrap_barrier_set_marked(void);
 extern void cluster_xid_wrap_barrier_note_ack(int32 node_id);
 extern uint64 cluster_xid_wrap_barrier_ack_bitmap(void);
-/* Read actual shared wrap ownership without IO. False means unavailable or
- * inconsistent state, never an empty owner. No retirement or grant effect. */
-extern bool cluster_xid_wrap_barrier_observe(bool *pending);
 extern uint64 cluster_xid_stripe_cluster_max_hwm(void);
 
 extern void cluster_xid_stripe_replay_note_join(uint64 floor_full, uint64 epoch, int slot);

@@ -34,10 +34,6 @@
  */
 #include "postgres.h"
 
-#ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_config_use_gate.h"
-#endif
-
 #include <signal.h>
 #include <unistd.h>
 #include <sys/time.h>
@@ -48,6 +44,7 @@
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_grd.h" /* spec-2.17 D28c — cluster_grd_alloc_generation */
 #include "cluster/cluster_guc.h" /* spec-2.17 — cluster_enabled */
+#include "cluster/cluster_shared_config.h" /* native family lifetime reset */
 #endif
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -177,7 +174,6 @@ InitProcGlobal(void)
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: a native new-shmem lifetime must not reuse the PM's old mapping. */
-	cluster_shared_config_process_new_shmem();
 	cluster_shared_config_delivery_new_shmem();
 #endif
 
@@ -304,8 +300,6 @@ InitProcGlobal(void)
 		pg_atomic_init_u32(&(proc->cluster_grd_registered_count), 0);
 #ifdef USE_PGRAC_CLUSTER
 		/* PGRAC: spec-5.8 D1d — per-proc cluster wait-state record. */
-		cluster_shared_config_registration_init(&proc->cluster_config);
-		pg_atomic_init_u32(&proc->cluster_config_use_epoch, 0);
 		cluster_lmd_wait_state_init(&(proc->cluster_lmd_wait));
 		/* PGRAC: spec-5.9 D3 — per-proc deadlock-cancel token. */
 		cluster_cancel_token_init(&(proc->cluster_cancel_token));
@@ -322,12 +316,6 @@ InitProcGlobal(void)
 	/* Create ProcStructLock spinlock, too */
 	ProcStructLock = (slock_t *) ShmemAlloc(sizeof(slock_t));
 	SpinLockInit(ProcStructLock);
-#ifdef USE_PGRAC_CLUSTER
-	cluster_shared_config_registration_init(&ProcGlobal->cluster_config_postmaster);
-	if (IsPostmasterEnvironment && !IsUnderPostmaster
-		&& !cluster_shared_config_process_attach(&ProcGlobal->cluster_config_postmaster))
-		elog(FATAL, "could not register postmaster configuration state");
-#endif
 }
 
 /*
@@ -494,10 +482,6 @@ InitProcess(void)
 	 * Arrange to clean up at backend exit.
 	 */
 	on_shmem_exit(ProcKill, 0);
-#ifdef USE_PGRAC_CLUSTER
-	if (!cluster_shared_config_process_attach(&MyProc->cluster_config))
-		elog(FATAL, "could not register backend configuration state");
-#endif
 
 	/*
 	 * Now that we have a PGPROC, we could try to acquire locks, so initialize
@@ -697,10 +681,6 @@ InitAuxiliaryProcess(void)
 	 * Arrange to clean up at process exit.
 	 */
 	on_shmem_exit(AuxiliaryProcKill, Int32GetDatum(proctype));
-#ifdef USE_PGRAC_CLUSTER
-	if (!cluster_shared_config_process_attach(&MyProc->cluster_config))
-		elog(FATAL, "could not register auxiliary configuration state");
-#endif
 }
 
 /*
@@ -760,57 +740,6 @@ HaveNFreeProcs(int n, int *nfree)
 
 	return (*nfree == n);
 }
-
-#ifdef USE_PGRAC_CLUSTER
-/*
- * PGRAC MODIFICATIONS by SqlRush <sqlrush@gmail.com>:
- * Capture native allocation, not just PGPROC.pid: ProcKill deliberately leaves
- * the old PID on a normal free-list entry.  Conversely, InitProcess removes a
- * slot from its list before it sets the new PID and configuration registration.
- * Zero means proven free; -1 means allocated but not yet initialized.  The
- * caller must separately validate registrations and recheck this snapshot.
- * No allocation, callbacks or error reporting while holding ProcStructLock.
- */
-bool
-ProcConfigSnapshotPids(int32 *pids, uint32 capacity)
-{
-	dlist_head *lists[4];
-	uint32 visited = 0;
-	bool valid = true;
-
-	if (pids == NULL || ProcGlobal == NULL || ProcGlobal->allProcs == NULL || ProcStructLock == NULL
-		|| MaxBackends <= 0 || capacity != ProcGlobal->allProcCount
-		|| capacity != (uint32)MaxBackends + NUM_AUXILIARY_PROCS)
-		return false;
-	lists[0] = &ProcGlobal->freeProcs;
-	lists[1] = &ProcGlobal->autovacFreeProcs;
-	lists[2] = &ProcGlobal->bgworkerFreeProcs;
-	lists[3] = &ProcGlobal->walsenderFreeProcs;
-	SpinLockAcquire(ProcStructLock);
-	for (uint32 i = 0; i < capacity; ++i) {
-		int32 pid = ((volatile PGPROC *)&ProcGlobal->allProcs[i])->pid;
-
-		pids[i] = (i < (uint32)MaxBackends && pid <= 0) ? -1 : pid;
-	}
-	for (unsigned i = 0; i < lengthof(lists) && valid; ++i) {
-		dlist_iter iter;
-
-		dlist_foreach(iter, lists[i])
-		{
-			PGPROC *proc = dlist_container(PGPROC, links, iter.cur);
-
-			if (++visited > capacity || proc->pgprocno >= (uint32)MaxBackends
-				|| proc != &ProcGlobal->allProcs[proc->pgprocno]) {
-				valid = false;
-				break;
-			}
-			pids[proc->pgprocno] = 0;
-		}
-	}
-	SpinLockRelease(ProcStructLock);
-	return valid;
-}
-#endif
 
 /*
  * Check if the current process is awaiting a lock.
@@ -971,13 +900,6 @@ ProcKill(int code, Datum arg)
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
 
-#ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: original resources are now gone, before PGPROC/lock-group reuse.
-	 * An early before_shmem_exit callback would retire this owner too soon.
-	 * Author: SqlRush <sqlrush@gmail.com> */
-	cluster_shared_config_use_exit();
-#endif
-
 	/*
 	 * Detach from any lock group of which we are a member.  If the leader
 	 * exits before all other group members, its PGPROC will remain allocated
@@ -1028,9 +950,6 @@ ProcKill(int code, Datum arg)
 
 	procgloballist = proc->procgloballist;
 	SpinLockAcquire(ProcStructLock);
-#ifdef USE_PGRAC_CLUSTER
-	cluster_shared_config_process_detach();
-#endif
 
 	/*
 	 * If we're still a member of a locking group, that means we're a leader
@@ -1103,9 +1022,6 @@ AuxiliaryProcKill(int code, Datum arg)
 	SpinLockAcquire(ProcStructLock);
 
 	/* Mark auxiliary proc no longer in use */
-#ifdef USE_PGRAC_CLUSTER
-	cluster_shared_config_process_detach();
-#endif
 	proc->pid = 0;
 
 	/* Update shared estimate of spins_per_delay */

@@ -162,39 +162,6 @@ cluster_ic_hello_set_worker_fields(uint8 out_buf[PGRAC_IC_HELLO_BYTES], uint8 wo
 #define UT_PEER2_ID 5
 #define UT_LISTEN_BACKLOG 4
 
-/* Explicit configuration-consumer boundary. Its actual report invalidation
- * has a separate production-C adapter test. Record the pre-retirement stamp
- * so the native transport test can prove callback ordering without a socket. */
-static unsigned ut_config_retire_calls;
-static int32 ut_config_retire_peer;
-static uint64 ut_config_retire_serial;
-static void (*ut_config_send_hook)(int32, const void *, Size);
-static void (*ut_config_receive_hook)(int32, const ClusterICEnvelope *, Size);
-void cluster_config_channels_sending(int32 peer, const void *bytes, Size length);
-void cluster_config_channels_received(int32 peer, const ClusterICEnvelope *env, Size length);
-
-void
-cluster_config_channels_sending(int32 peer, const void *bytes, Size length)
-{
-	if (ut_config_send_hook != NULL)
-		ut_config_send_hook(peer, bytes, length);
-}
-
-void
-cluster_config_channels_received(int32 peer, const ClusterICEnvelope *env, Size length)
-{
-	if (ut_config_receive_hook != NULL)
-		ut_config_receive_hook(peer, env, length);
-}
-
-void
-cluster_config_channels_stream_retiring(int32 peer)
-{
-	ut_config_retire_calls++;
-	ut_config_retire_peer = peer;
-	ut_config_retire_serial = tier1_stream_serial[peer < 0 ? UT_PEER_ID : peer];
-}
-
 static ClusterNodeInfo ut_peer_info;
 static bool ut_peer_declared = false;
 static ClusterNodeInfo ut_peer2_info;
@@ -203,7 +170,7 @@ static bool ut_peer2_declared = false;
 const ClusterNodeInfo *
 cluster_conf_lookup_node(int32 node_id)
 {
-#if defined(PGRAC_CONTROL_TRANSPORT_EMBEDDED) || defined(PGRAC_PREFIX_TRANSPORT_EMBEDDED)
+#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
 	static ClusterNodeInfo control_source;
 	if (node_id == 0)
 		return &control_source;
@@ -372,13 +339,13 @@ cstring_to_text(const char *s)
 	return NULL;
 }
 
-/* Router / envelope / chunk / smart-fusion boundaries. The prefix integration
- * fixture supplies the real envelope codec and its own actual ingress hook. */
+/* Router / envelope / chunk / smart-fusion deps of the recv paths —
+ * the test never receives an envelope, so these are vacuous. */
 bool cluster_ic_suppress_caps_reply = false;
 static uint64 ut_dispatch_count = 0;
 static bool ut_hello_valid;
 static ClusterICHelloMsg ut_hello;
-#if defined(PGRAC_CONTROL_TRANSPORT_EMBEDDED) || defined(PGRAC_PREFIX_TRANSPORT_EMBEDDED)
+#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
 static ClusterICSendResult (*ut_send_envelope_hook)(uint8, int32, const void *, uint32);
 #endif
 
@@ -400,7 +367,7 @@ ClusterICSendResult
 cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload,
 						 uint32 payload_len)
 {
-#if defined(PGRAC_CONTROL_TRANSPORT_EMBEDDED) || defined(PGRAC_PREFIX_TRANSPORT_EMBEDDED)
+#ifdef PGRAC_CONTROL_TRANSPORT_EMBEDDED
 	if (ut_send_envelope_hook != NULL)
 		return ut_send_envelope_hook(msg_type, dest_node_id, payload, payload_len);
 #endif
@@ -411,7 +378,6 @@ cluster_ic_send_envelope(uint8 msg_type, int32 dest_node_id, const void *payload
 	return CLUSTER_IC_SEND_DONE;
 }
 
-#ifndef PGRAC_PREFIX_TRANSPORT_EMBEDDED
 bool
 cluster_ic_dispatch_envelope(const ClusterICEnvelope *env, const void *payload, int32 peer_id)
 {
@@ -433,7 +399,6 @@ cluster_ic_envelope_accept_and_observe(const ClusterICEnvelope *env, const void 
 	(void)peer_id;
 	return CLUSTER_IC_ENVELOPE_OK;
 }
-#endif
 
 void
 cluster_ic_chunk_reset_peer(int32 peer_id)

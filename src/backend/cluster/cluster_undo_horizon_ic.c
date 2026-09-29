@@ -44,7 +44,6 @@
 
 #include "cluster/cluster_conf.h"
 #include "cluster/cluster_clean_leave.h"
-#include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
@@ -326,7 +325,6 @@ cluster_undo_horizon_lmon_tick(void)
 	uint64 now_us;
 	SCN report;
 	int pi;
-	volatile bool completed = false;
 
 	if (!cluster_enabled || cluster_node_id < 0 || UndoHorizonShmem == NULL)
 		return;
@@ -341,47 +339,42 @@ cluster_undo_horizon_lmon_tick(void)
 	if (last_sent_us != 0 && now_us - last_sent_us < (uint64)cluster_lmon_main_loop_interval * 1000)
 		return;
 
-	if (!cluster_shared_config_service_producer_begin(CLUSTER_CONFIG_BACKGROUND_HORIZON))
+	report = undo_horizon_sample_local_report();
+	if (report == InvalidScn)
 		return;
-	PG_TRY();
-	{
-		report = undo_horizon_sample_local_report();
-		if (report != InvalidScn) {
-			last_sent_us = now_us;
+	last_sent_us = now_us;
 
-			/* Idleness does not bound future snapshots by infinity. Retain the
-			 * finite pre-scan clock / snapshot minimum: a new reader cannot
-			 * precede this published floor even before the next report. */
+	/* Idleness at this instant does not bound a future snapshot by infinity.
+	 * Publish only the finite pre-scan clock / retained-snapshot minimum.
+	 * A new reader can then start before the next tick without a revoke
+	 * protocol; its read point cannot precede the previously published floor. */
 
-			wire.epoch = cluster_epoch_get_current();
-			wire.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
+	wire.epoch = cluster_epoch_get_current();
+	wire.sender_interval_ms = (uint32)cluster_lmon_main_loop_interval;
 
-			for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
-				if (pi == cluster_node_id)
-					continue;
-				if (cluster_conf_lookup_node(pi) == NULL)
-					continue; /* not declared */
+	for (pi = 0; pi < CLUSTER_MAX_NODES; pi++) {
+		if (pi == cluster_node_id)
+			continue;
+		if (cluster_conf_lookup_node(pi) == NULL)
+			continue; /* not declared */
 
-				/* Q1': only CURRENT-capable connections accept this type. An
-				 * older peer closes on an unregistered message; blind periodic
-				 * sends would cause reconnect storms rather than be ignored. */
-				if (!cluster_sf_peer_supports_undo_horizon(pi))
-					continue;
+		/*
+		 * Q1' amend hard gate: only send to a peer whose CURRENT
+		 * connection advertised UNDO_HORIZON_V1.  An old peer replies to
+		 * an unregistered msg_type by closing the connection
+		 * (cluster_ic_router.c inbound contract), so a blind send per
+		 * tick would be a reconnect storm, not "ignored".
+		 */
+		if (!cluster_sf_peer_supports_undo_horizon(pi))
+			continue;
 
-				wire.horizon_scn = (uint64)report;
+		wire.horizon_scn = (uint64)report;
 
-				(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, pi, &wire, sizeof(wire));
-				/* Fire-and-forget (L456): original transport owns accepted
-				 * tails/errors. Lost reports age into a conservative stall. */
-			}
-		}
-		completed = true;
+		(void)cluster_ic_send_envelope(PGRAC_IC_MSG_UNDO_HORIZON, pi, &wire, sizeof(wire));
+		/* fire-and-forget (L456): transport retention / errors surface
+		 * through the transport's own paths; a lost report just ages the
+		 * peer's view of us into a stall. */
 	}
-	PG_FINALLY();
-	{
-		cluster_shared_config_background_end(completed);
-	}
-	PG_END_TRY();
 }
 
 /* ---------------- cleaner-side sampling (reader) ---------------------- */

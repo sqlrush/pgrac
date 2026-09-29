@@ -41,6 +41,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "miscadmin.h"
 #include "cluster/cluster_update_trace.h"
 
 #include "cluster/cluster_catalog_stats.h" /* spec-6.14 D10b catalog counter stubs */
@@ -93,6 +94,7 @@ static int captured_pi_retire_accessor_calls;
 /* Link-only startup/config stubs.  cluster_startup_phase.o is part of this
  * standalone binary, while the owning GUC/LMS/qvotec objects are not. */
 bool cluster_controlfile_shared_authority = false;
+BackendType MyBackendType = B_BACKEND;
 bool cluster_lms_enabled = false;
 char *cluster_wal_threads_dir = NULL;
 
@@ -3655,6 +3657,28 @@ char *cluster_voting_disks = NULL;
 #include "cluster/cluster_qvotec.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_config_members.h"
+
+/* Link-only admission boundaries. Counter/dump tests must not admit service. */
+ClusterConfigMountResult
+cluster_config_members_mount_status(void)
+{
+	abort();
+}
+
+bool
+cluster_grd_control_acquire_allowed(const ClusterResId *resid pg_attribute_unused(),
+									LOCKMODE mode pg_attribute_unused())
+{
+	abort();
+}
+
+bool
+cluster_grd_control_recovery_ready(const ClusterResId *resid pg_attribute_unused(),
+								   LOCKMODE mode pg_attribute_unused())
+{
+	abort();
+}
 
 PGPROC *MyProc = NULL;
 

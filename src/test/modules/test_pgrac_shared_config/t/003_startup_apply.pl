@@ -81,6 +81,19 @@ sub refused
 	like($log, $reason, "$name reports the exact refusal");
 	unlike($log, qr/test shared configuration applied:/, "$name emits no application receipt");
 }
+refused('apply_commit_ts_on', "common.track_commit_timestamp='on'\n", 0, '',
+	qr/shared configuration object is not applicable/);
+refused('apply_inherited_commit_ts_on', "common.work_mem='6MB'\n", 0,
+	"track_commit_timestamp=on\n",
+	qr/shared configuration requires track_commit_timestamp=off/);
+my $standalone = PostgreSQL::Test::Cluster->new('native_commit_ts_on');
+$standalone->init;
+$standalone->append_conf('postgresql.conf', "track_commit_timestamp=on\n");
+$standalone->start;
+is($standalone->safe_psql('postgres', 'SHOW track_commit_timestamp'), 'on',
+	'ordinary non-shared native PG can still enable commit-ts');
+$standalone->stop('fast');
+
 refused('apply_bad_hash', $body, 0, "test_pgrac_shared_config.bad_hash=on\n",
 	qr/shared configuration object is not applicable/);
 refused('apply_bad_node', $body, 2, '', qr/shared configuration node is not configured/);

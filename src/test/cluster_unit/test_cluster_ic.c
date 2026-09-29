@@ -1013,12 +1013,10 @@ UT_TEST(test_hello_build_truncates_long_name)
 UT_TEST(test_config_members_capability_profile)
 {
 	uint32 baseline = cluster_ic_local_capability_word();
-	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1, 0);
-	/* Codec reservation is not an installed/armed native prefix service. */
-	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_CONFIG_PREFIX_V1, 0);
+	UT_ASSERT_EQ(baseline & PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3, 0);
 	cluster_shared_config = true;
-	UT_ASSERT_EQ(cluster_ic_local_capability_word(), baseline | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V1
-														 | PGRAC_IC_HELLO_CAP_CONFIG_PREFIX_V1);
+	UT_ASSERT_EQ(cluster_ic_local_capability_word(),
+				 baseline | PGRAC_IC_HELLO_CAP_CONFIG_MEMBERS_V3);
 	cluster_shared_config = false;
 	UT_ASSERT_EQ(cluster_ic_local_capability_word(), baseline);
 }

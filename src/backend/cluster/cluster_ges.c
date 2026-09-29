@@ -212,6 +212,14 @@ ges_readiness_allows_protocol_request(uint32 opcode, const ClusterResId *resid, 
 		return true;
 	if (opcode == GES_REQ_OPCODE_REDECLARE)
 		return ges_readiness_allows_redeclare(resid, mode);
+	/* PGRAC: the configuration reader can complete and retire CF-S while
+	 * StartupXLOG hands off to pre-SERVING phase 4. No CF-X or DATA is opened.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if ((opcode == GES_REQ_OPCODE_REQUEST
+		 && cluster_configuration_read_transport_is_current(resid, mode))
+		|| (opcode == GES_REQ_OPCODE_RELEASE
+			&& cluster_configuration_read_transport_is_current(resid, ShareLock)))
+		return true;
 	if (opcode == GES_REQ_OPCODE_REQUEST && cluster_grd_control_recovery_ready(resid, mode))
 		return cluster_recovery_transport_is_current();
 	if (!cluster_recovery_authority_is_current())
@@ -258,6 +266,9 @@ ges_readiness_allows_grant(const ClusterGrdGrantIdentity *grant, const ClusterRe
 		return false;
 	if (grant->request_opcode == GES_REQ_OPCODE_REDECLARE)
 		return ges_readiness_allows_redeclare(resid, grant->mode);
+	if (grant->request_opcode == GES_REQ_OPCODE_REQUEST
+		&& cluster_configuration_read_transport_is_current(resid, grant->mode))
+		return true;
 	if (grant->request_opcode == GES_REQ_OPCODE_REQUEST
 		&& cluster_grd_control_recovery_ready(resid, grant->mode))
 		return cluster_recovery_transport_is_current();

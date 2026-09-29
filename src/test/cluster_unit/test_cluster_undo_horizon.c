@@ -29,7 +29,6 @@
 
 #include "cluster/cluster_undo_horizon.h"
 #include "cluster/cluster_clean_leave.h"
-#include "cluster/cluster_config_use_gate.h"
 #include "cluster/cluster_epoch.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ic.h"
@@ -59,39 +58,7 @@ static unsigned test_horizon_sends;
 static bool test_horizon_cut;
 static bool test_horizon_seal;
 static bool test_horizon_capable = true;
-static bool test_horizon_config_held;
-static unsigned test_horizon_config_owned;
-static bool test_horizon_config_failed, test_horizon_send_error;
-sigjmp_buf *PG_exception_stack;
-ErrorContextCallback *error_context_stack;
 static ClusterUndoHorizonWire test_horizon_last;
-
-bool
-cluster_shared_config_service_producer_begin(ClusterConfigBackgroundKind kind)
-{
-	UT_ASSERT_EQ(kind, CLUSTER_CONFIG_BACKGROUND_HORIZON);
-	UT_ASSERT_EQ(test_horizon_config_owned, 0);
-	if (test_horizon_config_held)
-		return false;
-	test_horizon_config_owned++;
-	return true;
-}
-void
-cluster_shared_config_background_end(bool completed)
-{
-	UT_ASSERT_EQ(test_horizon_config_owned, 1);
-	if (completed)
-		test_horizon_config_owned--;
-	else
-		test_horizon_config_failed = true;
-}
-void
-pg_re_throw(void)
-{
-	if (PG_exception_stack != NULL)
-		siglongjmp(*PG_exception_stack, 1);
-	abort();
-}
 
 TimestampTz
 GetCurrentTimestamp(void)
@@ -144,8 +111,6 @@ cluster_ic_send_envelope(uint8 type, int32 destination, const void *payload, uin
 {
 	Assert(type == PGRAC_IC_MSG_UNDO_HORIZON && destination > 0 && destination < 4);
 	Assert(length == sizeof(test_horizon_last));
-	if (test_horizon_send_error)
-		siglongjmp(*PG_exception_stack, 1);
 	memcpy(&test_horizon_last, payload, length);
 	test_horizon_sends++;
 	return CLUSTER_IC_SEND_DONE;
@@ -177,46 +142,6 @@ UT_TEST(test_original_horizon_sender_stops_only_after_all_checkpoint_cut)
 	test_horizon_now += 1000001;
 	cluster_undo_horizon_lmon_tick();
 	UT_ASSERT_EQ(test_horizon_sends, 6);
-}
-
-UT_TEST(test_horizon_config_cut_preserves_cadence_and_original_report)
-{
-	unsigned before = test_horizon_sends;
-	ClusterUndoHorizonWire original = test_horizon_last;
-	test_horizon_capable = true;
-	test_horizon_now += 1000001;
-	test_horizon_config_held = true;
-	cluster_undo_horizon_lmon_tick();
-	UT_ASSERT_EQ(test_horizon_sends, before);
-	UT_ASSERT_EQ(memcmp(&original, &test_horizon_last, sizeof(original)), 0);
-	test_horizon_config_held = false;
-	/* Same clock: a refused producer must not consume its rate slot. */
-	cluster_undo_horizon_lmon_tick();
-	UT_ASSERT_EQ(test_horizon_sends, before + 3);
-	UT_ASSERT_EQ(test_horizon_config_owned, 0);
-}
-
-UT_TEST(test_horizon_original_error_does_not_sign_producer_completion)
-{
-	volatile bool caught = false;
-	test_horizon_now += 1000001;
-	test_horizon_send_error = true;
-	PG_TRY();
-	{
-		cluster_undo_horizon_lmon_tick();
-	}
-	PG_CATCH();
-	{
-		caught = true;
-	}
-	PG_END_TRY();
-	UT_ASSERT(caught && test_horizon_config_failed);
-	UT_ASSERT_EQ(test_horizon_config_owned, 1);
-	/* Fixture lifetime ends here; product failure retirement is tested by
-	 * the actual native-family gate tests, not this owner-boundary stub. */
-	test_horizon_send_error = false;
-	test_horizon_config_failed = false;
-	test_horizon_config_owned = 0;
 }
 
 void
@@ -720,7 +645,7 @@ UT_TEST(test_reason_names)
 int
 main(void)
 {
-	UT_PLAN(24);
+	UT_PLAN(22);
 
 	UT_RUN(test_u1_no_required_peer);
 	UT_RUN(test_u2_all_fresh_min);
@@ -744,8 +669,6 @@ main(void)
 	UT_RUN(test_u17b_idle_sentinel_still_proven);
 	UT_RUN(test_reason_names);
 	UT_RUN(test_original_horizon_sender_stops_only_after_all_checkpoint_cut);
-	UT_RUN(test_horizon_config_cut_preserves_cadence_and_original_report);
-	UT_RUN(test_horizon_original_error_does_not_sign_producer_completion);
 
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;

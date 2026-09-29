@@ -51,7 +51,7 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
         test_pgrac_fenced_target_command test_pgrac_fenced_target_reply test_pgrac_fenced_target_client \
         test_pgrac_fenced_target_request \
         test_pgrac_fenced_pacemaker_owned \
-        test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_use_gate test_cluster_config_producers \
+        test_cluster_update_trace test_cluster_cr_dependency test_cluster_startup_exit test_cluster_config_members test_cluster_config_mount \
         test_cluster_heap_prepare_diagnostic \
         test_cluster_r4_production_reachability test_cluster_heap_update_temp_lock test_cluster_heap_dml_lifetime \
         test_cluster_gcs_reqid test_cluster_ctrc_cleaner test_cluster_ctrc_dispatch test_cluster_heap_receipt \
@@ -129,14 +129,9 @@ TESTS = test_cluster_basic test_cluster_version test_cluster_backend_types test_
 		test_cluster_shared_config \
 		test_cluster_config_delivery_driver \
 		test_cluster_config_delivery_route \
-		test_cluster_config_delivery_work \
 		test_cluster_service_observe \
-		test_cluster_background_config \
-		test_cluster_config_prefix test_cluster_config_prefix_transport test_cluster_config_channels test_cluster_config_stream_retire \
-		test_cluster_config_census \
 		test_cluster_control_root \
 		test_cluster_checkpoint_native \
-		test_cluster_checkpoint_config \
 		test_cluster_checkpoint_buffers \
 		test_cluster_wal_retention \
 		test_cluster_recovery_duty \
@@ -436,18 +431,12 @@ SIMPLE_TESTS := $(filter-out test_cluster_r4_tx_enqueue,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_shared_config,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_driver,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_route,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_config_delivery_work,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_service_observe,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_background_config,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_config_prefix test_cluster_config_prefix_transport,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_config_channels,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_config_stream_retire,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_config_census,$(SIMPLE_TESTS))
 # PGRAC: shared frontend/backend binding codec uses its real common library.
 SIMPLE_TESTS := $(filter-out test_pgrac_control_binding,$(SIMPLE_TESTS))
 # PGRAC: link the real durable-prefix codec/reader, not a test copy.
 SIMPLE_TESTS := $(filter-out test_cluster_wal_restart_read test_cluster_wal_durable_prefix test_cluster_wal_durable_publish test_cluster_thread_tail,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers test_cluster_checkpoint_config,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_checkpoint_native test_cluster_checkpoint_buffers,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_request,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_retire_master,$(SIMPLE_TESTS))
@@ -456,42 +445,14 @@ SIMPLE_TESTS := $(filter-out test_cluster_control_walr,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_control_ir,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_startup_exit,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_config_members,$(SIMPLE_TESTS))
-SIMPLE_TESTS := $(filter-out test_cluster_config_use_gate,$(SIMPLE_TESTS))
-TESTS += test_cluster_config_lmon_fresh test_cluster_config_wrap_observe
-SIMPLE_TESTS := $(filter-out test_cluster_config_producers,$(SIMPLE_TESTS))
+SIMPLE_TESTS := $(filter-out test_cluster_config_mount,$(SIMPLE_TESTS))
 
-# PGRAC: actual fresh LMON entry branches; no mirror of production predicates.
+# PGRAC: real native-family mount carrier, with process lifecycle boundaries.
 # Author: SqlRush <sqlrush@gmail.com>
-test_cluster_config_auto_restore.inc: $(top_srcdir)/src/backend/cluster/cluster_backup.c
-	@awk '/^cluster_backup_maybe_auto_restore_point\(void\)/ { print "static void"; emit=1; starts++ } \
-	     emit { print } emit && /^}/ { emit=0; ends++ } \
-	     END { if (starts != 1 || ends != 1) exit 1 }' $< > $@.tmp && mv $@.tmp $@
-test_cluster_config_lmon_fresh: test_cluster_config_lmon_fresh.c unit_test.h \
-		test_cluster_config_auto_restore.inc \
-		$(top_srcdir)/src/backend/cluster/cluster_xid_wrap_barrier.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) -I. -ffunction-sections -fdata-sections $< \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
-
-test_cluster_config_wrap_observe: test_cluster_config_wrap_observe.c unit_test.h \
-		$(top_srcdir)/src/backend/cluster/cluster_xid_stripe_boot.c
+test_cluster_config_mount: test_cluster_config_mount.c unit_test.h \
+		$(top_srcdir)/src/backend/cluster/cluster_shared_config_delivery.c cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
-
-# PGRAC: real ordered native cut controller and atomic gates, isolated native census.
-# Author: SqlRush <sqlrush@gmail.com>
-test_cluster_config_producers: test_cluster_config_producers.c unit_test.h \
-		$(top_srcdir)/src/backend/cluster/cluster_config_producers.c \
-		$(top_srcdir)/src/include/cluster/cluster_config_producers.h \
-		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
-
-# PGRAC: real atomic producer cut, including fork-shared entry/close races.
-# Author: SqlRush <sqlrush@gmail.com>
-test_cluster_config_use_gate: test_cluster_config_use_gate.c unit_test.h \
-		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: actual member observation codec/collector; native census tested separately.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -501,13 +462,6 @@ test_cluster_config_members: test_cluster_config_members.c unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_config_members.h cluster_unit_port_stubs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/backend/cluster/cluster_config_members.o \
 		$(top_builddir)/src/common/sha2_srv.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
-
-# PGRAC: actual prefix codec/driver, explicit native transport boundaries.
-# Author: SqlRush <sqlrush@gmail.com>
-test_cluster_config_prefix: test_cluster_config_prefix.c unit_test.h \
-		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: actual native-owner adapter with explicit process/transport fixtures.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -520,33 +474,6 @@ test_cluster_service_observe: test_cluster_service_observe.c unit_test.h \
 # Author: SqlRush <sqlrush@gmail.com>
 cluster_unit_service_stubs.o: cluster_unit_service_stubs.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -c $< -o $@
-
-# PGRAC: actual native-owner adapter with explicit process/transport fixtures.
-# Author: SqlRush <sqlrush@gmail.com>
-test_cluster_config_channels: test_cluster_config_channels.c unit_test.h \
-		$(top_srcdir)/src/backend/cluster/cluster_config_channels.c \
-		$(top_srcdir)/src/include/cluster/cluster_config_channels.h \
-		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
-
-# PGRAC: real native stream/FIFO/parser plus prefix and envelope production objects.
-# Author: SqlRush <sqlrush@gmail.com>
-test_cluster_config_stream_retire: test_cluster_config_stream_retire.c test_cluster_ic_tier1_partial.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) $(CLUSTER_UNIT_PORT_LIBS) -o $@
-
-# PGRAC: real native stream/FIFO/parser plus prefix and envelope production objects.
-# Author: SqlRush <sqlrush@gmail.com>
-test_cluster_config_prefix_transport: test_cluster_config_prefix_transport.c test_cluster_ic_tier1_partial.c unit_test.h \
-		$(CLUSTER_VERSION_O) $(top_builddir)/src/backend/cluster/cluster_config_prefix.o \
-		$(top_builddir)/src/backend/cluster/cluster_ic_envelope.o \
-		$(top_srcdir)/src/backend/cluster/cluster_ic_tier1.c \
-		$(top_srcdir)/src/backend/cluster/cluster_ic_mux.c
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_VERSION_O) \
-		$(top_builddir)/src/backend/cluster/cluster_config_prefix.o \
-		$(top_builddir)/src/backend/cluster/cluster_ic_envelope.o \
-		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: actual evidence codec/collector with transport/producer boundary fixtures.
 # Author: SqlRush <sqlrush@gmail.com>
@@ -840,38 +767,15 @@ test_cluster_checkpointer_stop.inc: $(top_srcdir)/src/backend/postmaster/checkpo
 
 # PGRAC: execute the native adapter, not source-string assertions.
 # Author: SqlRush <sqlrush@gmail.com>
-test_cluster_checkpoint_config.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^CreateCheckPoint\(/ { print "void"; emit=1; count++ } \
-	     /^CreateRestartPoint\(/ { print "bool"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
-	mv $@.tmp $@
-
-test_cluster_checkpoint_config: test_cluster_checkpoint_config.c test_cluster_checkpoint_config.inc unit_test.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
-
-# PGRAC: execute the complete original loop body; only the test scheduler
-# bounds it to one iteration. Native IO/control calls are explicit boundaries.
-# Author: SqlRush <sqlrush@gmail.com>
-test_cluster_background_%.inc: $(top_srcdir)/src/backend/postmaster/%.c Makefile
-	awk '/^\tfor \(;;\)/ && !seen { seen=1; emit=1; print "for (; native_next_iteration(); )"; next } \
-	     emit && /^}/ { emit=0; done++ } emit { print } \
-	     END { if (seen != 1 || done != 1) exit 1 }' $< > $@.tmp
-	mv $@.tmp $@
-
-test_cluster_background_config: test_cluster_background_config.c unit_test.h \
-		test_cluster_background_checkpointer.inc test_cluster_background_bgwriter.inc \
-		test_cluster_background_walwriter.inc
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
-
 test_cluster_checkpoint_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
 	awk '/^Cluster(CheckpointV3|StartupCheckpoint)(Prepare|Publish)\(/ { print "static void"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 4) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_startup_writer_native.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^ClusterStartupWriterSelect\(/ { print "static void"; emit=1; count++ } \
+	awk '/^ClusterStartupConfigurationRequire\(/ || /^ClusterStartupWriterSelect\(/ { print "static void"; emit=1; count++ } \
 	     /^ClusterStartupWriterBegin\(/ { print "static XLogRecPtr"; emit=1; count++ } \
-	     emit { print } /^}/ { emit=0 } END { if (count != 2) exit 1 }' $< > $@.tmp
+	     emit { print } /^}/ { emit=0 } END { if (count != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 # PGRAC: execute the real earliest startup-directory mutation call site.
@@ -908,7 +812,7 @@ test_cluster_startup_reserve_native.inc: $(top_srcdir)/src/backend/access/transa
 	mv $@.tmp $@
 
 test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^CreateCheckPointInternal\(/ { owner=1 } owner && /Update the control file\./ { pending=1 } \
+	awk '/^CreateCheckPoint\(/ { owner=1 } owner && /Update the control file\./ { pending=1 } \
 	     owner && pending && /LWLockAcquire\(ControlFileLock/ { emit=1; count++; pending=0 } \
 	     emit { print; if (/LWLockRelease\(ControlFileLock/) emit=0 } /^}/ { owner=0 } \
 	     END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
@@ -917,7 +821,7 @@ test_cluster_checkpoint_candidate.inc: $(top_srcdir)/src/backend/access/transam/
 # PGRAC: execute the early shutdown-control branch too, before WAL creation.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_checkpoint_shutdown_begin.inc: $(top_srcdir)/src/backend/access/transam/xlog.c Makefile
-	awk '/^CreateCheckPointInternal\(/ { owner=1 } \
+	awk '/^CreateCheckPoint\(/ { owner=1 } \
 	     owner && /START_CRIT_SECTION\(\)/ && !seen { emit=1; seen=1; count++ } \
 	     /Begin filling in the checkpoint WAL record/ { emit=0 } \
 	     emit { print } /^}/ { owner=0 } \
@@ -1606,27 +1510,11 @@ test_cluster_config_delivery_route.inc: $(top_srcdir)/src/backend/utils/misc/guc
 test_cluster_config_delivery_route: test_cluster_config_delivery_route.c unit_test.h test_cluster_config_delivery_route.inc
 	$(CC) $(CFLAGS) $(CPPFLAGS) -I. $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-# PGRAC: whole production delivery module; only external runtime boundaries
-# are isolated. Native tests separately cover real assignment and inheritance.
-test_cluster_config_delivery_work: test_cluster_config_delivery_work.c unit_test.h \
-		$(top_srcdir)/src/backend/cluster/cluster_shared_config_delivery.c \
-		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o \
-		$(top_srcdir)/src/include/cluster/cluster_shared_config.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
-		$(top_builddir)/src/backend/cluster/cluster_config_use_gate.o \
-		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(CLUSTER_UNIT_PORT_LIBS) -o $@
-
 test_cluster_config_delivery_driver: test_cluster_config_delivery_driver.c unit_test.h \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
+		$(top_builddir)/src/backend/cluster/cluster_shared_config_lmon.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-test_cluster_config_census: test_cluster_config_census.c unit_test.h \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
-		$(top_builddir)/src/backend/cluster/cluster_shared_config_census.o $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_shared_config: test_cluster_shared_config.c unit_test.h $(CLUSTER_SHARED_CONFIG_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SHARED_CONFIG_O) \
@@ -2766,7 +2654,20 @@ test_cluster_smgr: test_cluster_smgr.c unit_test.h \
 # lookups; behavior tests (transition rejection, Postmaster-once
 # Assert) live in TAP t/060_postmaster_phases.pl where postmaster
 # orchestration is real.
-test_cluster_startup_phase: test_cluster_startup_phase.c unit_test.h \
+# PGRAC: exercise the actual CF caller and GES admission with real startup
+# readiness, so a passing configuration consumer cannot hide a closed producer.
+# Author: SqlRush <sqlrush@gmail.com>
+test_cluster_config_s1_native.inc: $(top_srcdir)/src/backend/cluster/cluster_lock_acquire.c Makefile
+	awk '/^cluster_lock_acquire_s1_entry\(/ { print "ClusterLockAcquireResult"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_config_ges_native.inc: $(top_srcdir)/src/backend/cluster/cluster_ges.c Makefile
+	awk '/^ges_(recovery_release_resid_allowed|readiness_allows_(redeclare|protocol_request|grant|local_origin|local_release_origin))\(/ { print "static bool"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 6) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_startup_phase: test_cluster_startup_phase.c unit_test.h test_cluster_config_s1_native.inc test_cluster_config_ges_native.inc \
 		$(CLUSTER_VERSION_O) $(CLUSTER_STARTUP_PHASE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		-DSTARTUP_PHASE_SOURCE_PATH='"$(abspath $(top_srcdir))/src/backend/cluster/cluster_startup_phase.c"' \
@@ -3302,6 +3203,7 @@ $(HW_HANDOFF_OBJECTS): hw_handoff_%.o: $(top_srcdir)/src/backend/cluster/%.c \
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_hw_handoff: test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
+        test_cluster_grd_stop_types.inc \
         $(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -3312,12 +3214,14 @@ test_cluster_hw_handoff: test_cluster_hw_handoff.c test_cluster_grd.c unit_test.
 # PGRAC: exact control retirement uses the same production GRD/GES objects.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_control_retire_master: test_cluster_control_retire_master.c test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
+        test_cluster_grd_stop_types.inc \
 		$(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_control_cf_poll: test_cluster_control_cf_poll.c test_cluster_hw_handoff.c test_cluster_grd.c unit_test.h \
+        test_cluster_grd_stop_types.inc \
 		$(HW_HANDOFF_OBJECTS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections $< \
 		$(HW_HANDOFF_OBJECTS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) \
@@ -6128,5 +6032,5 @@ test_cluster_control_root test_cluster_thread_recovery_authority: \
 # PGRAC: native configuration carriers must match the linked production ABI.
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_shared_config test_cluster_config_delivery_driver \
-test_cluster_config_census test_cluster_control_root test_cluster_cf_authority: \
+test_cluster_control_root test_cluster_cf_authority: \
 	$(top_srcdir)/src/include/cluster/cluster_shared_config.h

@@ -72,33 +72,6 @@ static TimestampTz test_sf_now;
 static LWLock *test_sf_held_lock;
 static bool test_sf_control_sealed;
 static bool test_sf_all_checkpoint_proved;
-static bool test_sf_config_held;
-static unsigned test_sf_config_owned;
-sigjmp_buf *PG_exception_stack;
-ErrorContextCallback *error_context_stack;
-
-bool
-cluster_shared_config_service_producer_begin(ClusterConfigBackgroundKind kind)
-{
-	UT_ASSERT_EQ(kind, CLUSTER_CONFIG_BACKGROUND_DURABILITY);
-	UT_ASSERT_EQ(test_sf_config_owned, 0);
-	if (test_sf_config_held)
-		return false;
-	test_sf_config_owned++;
-	return true;
-}
-void
-cluster_shared_config_background_end(bool completed)
-{
-	UT_ASSERT(completed);
-	UT_ASSERT_EQ(test_sf_config_owned, 1);
-	test_sf_config_owned--;
-}
-void
-pg_re_throw(void)
-{
-	abort();
-}
 
 bool
 cluster_normal_stop_pi_retirement_allowed(void)
@@ -884,23 +857,6 @@ UT_TEST(test_durable_tick_observes_background_flush_without_commit)
 	UT_ASSERT_EQ(cluster_sf_observed_origin_durable_lsn(0), 4700);
 }
 
-UT_TEST(test_durable_config_cut_keeps_direct_completion_and_fresh_cadence)
-{
-	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
-						  | PGRAC_IC_HELLO_CAP_MULTIXACT_CTRC_V1);
-	test_sf_now = INT64CONST(300000000);
-	test_sf_config_held = true;
-	cluster_sf_origin_durable_lmon_tick();
-	UT_ASSERT_EQ(test_sf_sends, 0);
-	UT_ASSERT_EQ(test_sf_flush_reads, 0);
-	/* This original nonperiodic publisher remains available to old WAL work. */
-	cluster_sf_publish_origin_durable_lsn();
-	UT_ASSERT_EQ(test_sf_sends, 1);
-	test_sf_config_held = false;
-	cluster_sf_origin_durable_lmon_tick();
-	UT_ASSERT_EQ(test_sf_sends, 2);
-}
-
 UT_TEST(test_durable_zero_flush_does_not_send_positive_proof)
 {
 	test_sf_publish_setup(PGRAC_IC_HELLO_CAP_MULTIXACT_CURRENT_V1
@@ -1104,7 +1060,7 @@ UT_TEST(test_sf_stop_satisfied_cache_invalid_residue_and_lock_order)
 int
 main(void)
 {
-	UT_PLAN(34);
+	UT_PLAN(33);
 	UT_RUN(test_a89_capability_record_snapshot_distinguishes_unavailable_and_drift);
 	UT_RUN(test_sf_stop_requires_initialized_store_even_when_disabled);
 	UT_RUN(test_sf_stop_real_install_and_durable_cut_are_read_only);
@@ -1132,7 +1088,6 @@ main(void)
 	UT_RUN(test_durable_publisher_requires_declared_current_capability);
 	UT_RUN(test_durable_tick_retries_idle_loss_without_changing_deadlines);
 	UT_RUN(test_durable_tick_observes_background_flush_without_commit);
-	UT_RUN(test_durable_config_cut_keeps_direct_completion_and_fresh_cadence);
 	UT_RUN(test_durable_zero_flush_does_not_send_positive_proof);
 	UT_RUN(test_existing_smart_fusion_peer_still_receives_durability);
 	UT_RUN(test_publisher_waits_for_recovery_before_reading_flush);

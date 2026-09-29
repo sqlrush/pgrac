@@ -133,6 +133,7 @@ static bool test_config_policy_refuse;
 static unsigned test_config_prepares;
 static bool test_config_release_throw;
 static LOCKMODE test_actual_cf;
+static bool test_config_failed_acquire_retains;
 static const void *test_cf_local_caller;
 static bool test_cf_tagged_retiring;
 static unsigned test_history_sync_count, test_history_fail_sync;
@@ -499,6 +500,8 @@ cluster_cf_held(LOCKMODE mode)
 	(void)mode;
 	if (MyBackendType == B_LMON || MyBackendType == B_LMS)
 		return test_actual_cf == mode;
+	if (MyBackendType == B_BACKEND && test_reserve_mode)
+		return test_actual_cf == mode || (test_checkpoint_mode && test_checkpoint_outer_cf);
 	if (test_checkpoint_mode)
 		return test_checkpoint_outer_cf;
 	abort();
@@ -985,7 +988,7 @@ cluster_cf_lock(LOCKMODE mode pg_attribute_unused())
 		test_stop_share_hook();
 	if (mode == ExclusiveLock && test_checkpoint_x_hook != NULL)
 		test_checkpoint_x_hook();
-	if (test_cf_grant) {
+	if (test_cf_grant || test_config_failed_acquire_retains) {
 		test_actual_cf = mode;
 		test_cf_cookie++;
 	}
@@ -13119,6 +13122,39 @@ bootstrap_replace_anchor(BootstrapFixture *f)
 	memcpy(f->after, f->before, sizeof(f->after));
 }
 
+UT_TEST(test_bootstrap_refuses_native_commit_ts_profile)
+{
+	for (unsigned variant = 0; variant < 3; variant++) {
+		BootstrapFixture f;
+		bootstrap_fixture(&f, 0);
+		if (variant < 2) {
+			f.local_anchor.track_commit_timestamp = variant == 0;
+			if (variant == 1) {
+				f.local_anchor.checkpoint_copy.oldestCommitTsXid = 20;
+				f.local_anchor.checkpoint_copy.newestCommitTsXid = 80;
+			}
+			bootstrap_replace_anchor(&f);
+		} else {
+			ControlFileData control;
+			ControlRootImage root;
+			memcpy(&control, f.common, sizeof(control));
+			control.track_commit_timestamp = true;
+			UT_ASSERT_EQ(cluster_cf_control_image_encode(&control, f.common), 0);
+			UT_ASSERT_EQ(cluster_control_root_v2_decode(f.before, sizeof(f.before), v2_storage,
+														TEST_SYSID, &root),
+						 0);
+			sha256_bytes(f.common, sizeof(f.common), root.header.v2.control_image_sha256);
+			UT_ASSERT_EQ(cluster_control_root_v2_encode(&root), 0);
+			memcpy(f.before, root.bytes, sizeof(f.before));
+			memcpy(f.after, root.bytes, sizeof(f.after));
+		}
+		UT_ASSERT_EQ(bootstrap_refused(&f.input), CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		if (ut_current_failed)
+			return;
+	}
+}
+
 UT_TEST(test_bootstrap_thread_lifecycle_overrides_old_clean_anchor)
 {
 	for (int life = 1; life <= 5; ++life) {
@@ -13556,6 +13592,50 @@ UT_TEST(test_native_side_observation_reads_origin_and_preserves_bytes)
 	}
 	native_side_authority_cleanup(&f);
 	bootstrap_side_cleanup(&f);
+}
+
+UT_TEST(test_native_side_refuses_valid_commit_ts_history_without_erasing_it)
+{
+	for (unsigned variant = 0; variant < 2; variant++) {
+		BootstrapSideFixture f;
+		ControlFileData control = { 0 };
+		ClusterNativeSideObservation out;
+		char page[BLCKSZ] = { 0 }, stored[BLCKSZ], path[MAXPGPATH];
+		const char *files[] = { "pg_xact/0000", "pg_subtrans/0000", "pg_multixact/offsets/0000",
+								"pg_commit_ts/0000" };
+		uint32 value = 5;
+		bootstrap_side_fixture(&f, 0);
+		native_side_authority(&f, 100, true);
+		control.checkPointCopy.nextXid = FullTransactionIdFromU64(101);
+		control.checkPointCopy.nextMulti = control.checkPointCopy.oldestMulti = 3;
+		control.checkPointCopy.nextMultiOffset = value;
+		control.track_commit_timestamp = variant == 0;
+		if (variant == 1) {
+			control.checkPointCopy.oldestCommitTsXid = 20;
+			control.checkPointCopy.newestCommitTsXid = 80;
+		}
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			memset(page, 0, sizeof(page));
+			if (i == 2)
+				memcpy(page + 3 * sizeof(value), &value, sizeof(value));
+			if (i == 3)
+				memset(page, 0x55, sizeof(page));
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			write_all_or_abort(path, page, sizeof(page));
+		}
+		memset(&out, 0xa5, sizeof(out));
+		UT_ASSERT_EQ(cluster_control_native_side_observe(f.shared, 0, &control, &out),
+					 CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
+		UT_ASSERT(v2_zero(&out, sizeof(out)));
+		read_all_or_abort(path, stored, sizeof(stored));
+		UT_ASSERT_EQ(memcmp(page, stored, sizeof(page)), 0);
+		for (unsigned i = 0; i < lengthof(files); i++) {
+			snprintf(path, sizeof(path), "%s/%s", f.origin, files[i]);
+			UT_ASSERT_EQ(unlink(path), 0);
+		}
+		native_side_authority_cleanup(&f);
+		bootstrap_side_cleanup(&f);
+	}
 }
 
 UT_TEST(test_native_side_observation_refuses_missing_contradictory_or_aliased_pages)
@@ -14370,7 +14450,8 @@ bootstrap_source_paths(const uint8 root_bytes[66048], uint32 node, char claim[MA
 }
 
 static void
-bootstrap_history_files(BootstrapFixture *f, uint32 node, uint32 count, char paths[3][MAXPGPATH])
+bootstrap_history_files_profile(BootstrapFixture *f, uint32 node, uint32 count,
+								char paths[3][MAXPGPATH], bool commit_ts)
 {
 	uint8 bytes[65604], source[66048];
 	ControlRootImage root;
@@ -14409,7 +14490,8 @@ bootstrap_history_files(BootstrapFixture *f, uint32 node, uint32 count, char pat
 		/* Modes are not quantities to fold into a maximum. */
 		a.wal_level = i % 3;
 		a.wal_log_hints = (i % 2) != 0;
-		a.track_commit_timestamp = !a.wal_log_hints;
+		/* Optional commit-ts is not a supported positive recovery profile. */
+		a.track_commit_timestamp = commit_ts;
 		v2_anchor_object(source, &a, &a.identity, paths[2]);
 		bootstrap_source_paths(source, node, paths[1], paths[2]);
 		memcpy(bytes + 64 + i * 512, record, 512);
@@ -14426,6 +14508,22 @@ bootstrap_history_files(BootstrapFixture *f, uint32 node, uint32 count, char pat
 	write_all_or_abort(paths[0], bytes, len);
 	v2_checksums(f->before);
 	v2_write_roots(f->before);
+}
+
+static void
+bootstrap_history_files(BootstrapFixture *f, uint32 node, uint32 count, char paths[3][MAXPGPATH])
+{
+	bootstrap_history_files_profile(f, node, count, paths, false);
+}
+
+UT_TEST(test_bootstrap_capacity_refuses_foreign_retained_commit_ts)
+{
+	BootstrapFixture f;
+	char paths[3][MAXPGPATH];
+	bootstrap_read_fixture(&f, 0);
+	bootstrap_history_files_profile(&f, 127, 2, paths, true);
+	UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
+	UT_ASSERT_EQ(test_cf_lock_calls, 0);
 }
 
 UT_TEST(test_bootstrap_capacity_includes_every_current_and_retained_source)
@@ -16649,6 +16747,50 @@ UT_TEST(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor)
 	}
 }
 
+UT_TEST(test_bootstrap_initializing_refuses_commit_ts_wal)
+{
+	for (unsigned variant = 0; variant < 2; variant++) {
+		BootstrapFixture f;
+		ControlRootImage root;
+		ClusterWalStartupImage operation;
+		uint8 startup[CLUSTER_WAL_STARTUP_BYTES], page[XLOG_BLCKSZ];
+		XLogRecord record = { 0 };
+		char paths[3][MAXPGPATH], path[MAXPGPATH];
+		uint8 *bytes = page + SizeOfXLogLongPHD;
+		xl_parameter_change parameters = { 1401, 31, 17, 9, 101, WAL_LEVEL_REPLICA, false, true };
+		uint32 pageno = 0;
+		size_t len = variant ? sizeof(pageno) : sizeof(parameters);
+		bootstrap_initializing_wal_fixture(&f, true, paths);
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage,
+													TEST_SYSID, &root),
+					 0);
+		read_all_or_abort(paths[0], startup, sizeof(startup));
+		UT_ASSERT_EQ(cluster_control_root_v3_startup_decode(startup, sizeof(startup), &root, 127,
+															&operation),
+					 0);
+		v2_checkpoint_wal_path(&operation.claim.identity, operation.first_segment_lsn,
+							   operation.timeline, path);
+		read_all_or_abort(path, page, sizeof(page));
+		memset(bytes, 0, sizeof(page) - SizeOfXLogLongPHD);
+		record.xl_tot_len = SizeOfXLogRecord + 2 + len;
+		record.xl_info = variant ? 0 : XLOG_PARAMETER_CHANGE;
+		record.xl_rmid = variant ? RM_COMMIT_TS_ID : RM_XLOG_ID;
+		bytes[SizeOfXLogRecord] = XLR_BLOCK_ID_DATA_SHORT;
+		bytes[SizeOfXLogRecord + 1] = len;
+		memcpy(bytes + SizeOfXLogRecord + 2, variant ? (void *)&pageno : (void *)&parameters, len);
+		INIT_CRC32C(record.xl_crc);
+		COMP_CRC32C(record.xl_crc, bytes + SizeOfXLogRecord, 2 + len);
+		COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+		FIN_CRC32C(record.xl_crc);
+		memcpy(bytes, &record, sizeof(record));
+		write_all_or_abort(path, page, sizeof(page));
+		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
+		UT_ASSERT_EQ(test_cf_lock_calls, 0);
+		if (ut_current_failed)
+			return;
+	}
+}
+
 UT_TEST(test_bootstrap_initializing_refuses_malformed_native_metadata)
 {
 	for (int fault = 0; fault < 2; ++fault) {
@@ -18079,6 +18221,26 @@ UT_TEST(test_config_selected_does_not_depend_on_data_writer_permission)
 	v2_assert_primary_unchanged(before);
 }
 
+UT_TEST(test_config_failed_acquire_retires_before_retry)
+{
+	uint8 before[66048];
+	ClusterSharedConfigEntry change = { -1, "statement_timeout", "250" };
+	ClusterSharedConfigPublication published;
+	ClusterSharedConfigPolicyReport policy;
+	config_publish_fixture(before);
+	test_cf_grant = false;
+	test_config_failed_acquire_retains = true;
+	UT_ASSERT_EQ(cluster_control_root_config_change(&change, &published, &policy),
+				 CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE);
+	test_config_failed_acquire_retains = false;
+	UT_ASSERT_EQ(test_actual_cf, NoLock);
+	UT_ASSERT(v2_zero(&published, sizeof(published)));
+	v2_assert_primary_unchanged(before);
+	test_cf_grant = true;
+	UT_ASSERT_EQ(cluster_control_root_config_change(&change, &published, &policy), 0);
+	UT_ASSERT(published.changed);
+}
+
 UT_TEST(test_config_selected_rejects_identity_and_generation_drift)
 {
 	for (int fault = 0; fault < 8; ++fault) {
@@ -18171,8 +18333,12 @@ UT_TEST(test_config_selected_rejects_non_online_root)
 		UT_ASSERT_EQ(cluster_control_root_v3_encode(&root), 0);
 		v2_write_roots(root.bytes);
 		UT_ASSERT_EQ(cluster_control_root_config_read_locked(&prior, &selected, &image),
-					 CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID);
-		UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+					 fault == 0 ? CLUSTER_CONTROL_ROOT_LIFECYCLE_INVALID
+								: CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		if (fault == 0)
+			UT_ASSERT(v2_zero(&selected, sizeof(selected)) && v2_zero(&image, sizeof(image)));
+		else
+			cluster_shared_config_free(&image);
 	}
 }
 
@@ -18415,7 +18581,8 @@ main(int argc, char **argv)
 		UT_DONE();
 		return ut_failed_count ? 1 : 0;
 	}
-	UT_PLAN(338);
+	UT_PLAN(343);
+	UT_RUN(test_config_failed_acquire_retires_before_retry);
 	UT_RUN(test_config_poll_delivers_only_after_its_exact_release);
 	UT_RUN(test_config_poll_cut_or_prior_drift_discards_retained_observation);
 	UT_RUN(test_config_poll_error_hands_exact_cleanup_to_retirement);
@@ -18443,6 +18610,7 @@ main(int argc, char **argv)
 	UT_RUN(test_native_inputs_recheck_namespace_and_release_fds);
 	UT_RUN(test_bootstrap_side_routes_require_exact_origin);
 	UT_RUN(test_native_side_observation_reads_origin_and_preserves_bytes);
+	UT_RUN(test_native_side_refuses_valid_commit_ts_history_without_erasing_it);
 	UT_RUN(test_native_side_observation_refuses_missing_contradictory_or_aliased_pages);
 	UT_RUN(test_native_side_census_requires_sealed_xid_horizon_and_uses_raised_cursor);
 	UT_RUN(test_bootstrap_side_rejects_local_foreign_and_unsafe_aliases);
@@ -18488,6 +18656,7 @@ main(int argc, char **argv)
 	UT_RUN(test_v3_clean_exit_cut_keeps_complete_root_roster);
 	UT_RUN(test_v3_clean_exit_cut_never_shrinks_missing_members);
 	UT_RUN(test_bootstrap_initializing_counts_actual_wal_not_unselected_anchor);
+	UT_RUN(test_bootstrap_initializing_refuses_commit_ts_wal);
 	UT_RUN(test_bootstrap_initializing_refuses_malformed_native_metadata);
 	UT_RUN(test_bootstrap_terminal_preserves_actual_wal_capacity_without_active_intent);
 	UT_RUN(test_terminal_selected_reader_and_bootstrap_refuse_incomplete_evidence);
@@ -18730,6 +18899,7 @@ main(int argc, char **argv)
 	UT_RUN(test_runtime_v3_runtime_native_inplace_identity_is_never_cleared);
 	UT_RUN(test_v2_view_requires_exact_config_object);
 	UT_RUN(test_bootstrap_composes_exact_threads_without_admission);
+	UT_RUN(test_bootstrap_refuses_native_commit_ts_profile);
 	UT_RUN(test_bootstrap_thread_lifecycle_overrides_old_clean_anchor);
 	UT_RUN(test_bootstrap_closed_thread_requires_clean_anchor);
 	UT_RUN(test_bootstrap_every_local_root_identity_must_match);
@@ -18751,6 +18921,7 @@ main(int argc, char **argv)
 	UT_RUN(test_bootstrap_read_pinned_directory_is_not_replacement);
 	UT_RUN(test_bootstrap_read_close_failure_never_returns_partial_success);
 	UT_RUN(test_bootstrap_capacity_includes_every_current_and_retained_source);
+	UT_RUN(test_bootstrap_capacity_refuses_foreign_retained_commit_ts);
 	UT_RUN(test_bootstrap_capacity_does_not_skip_retired_or_unconfigured_origin);
 	UT_RUN(test_bootstrap_capacity_requires_nonlocal_and_history_objects);
 	UT_RUN(test_bootstrap_capacity_reobserves_after_collection);

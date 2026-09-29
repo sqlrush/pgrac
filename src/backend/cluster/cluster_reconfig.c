@@ -7827,7 +7827,8 @@ cluster_reconfig_r4_membership_observations_current(
 	return true;
 }
 
-/* Formation-LMON-only exact projection of the admitted MEMBER SSOT.  This
+/* Exact projection of the admitted MEMBER SSOT, also used by initial mount.
+ * A postmaster observer must never queue without a PGPROC. This
  * helper is observation-only: it copies under the reconfiguration lock,
  * validates QVOTEC currentness outside the lock, then byte-revalidates the
  * shared tuple and the same receiver-local observations. */
@@ -7852,7 +7853,8 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 	if (candidate.local_self_boot_incarnation == 0)
 		return false;
 
-	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (!cluster_reconfig_handoff_lock_acquire(LW_SHARED))
+		return false;
 	candidate.formation_epoch = cluster_epoch_get_current();
 	for (node = 0; node < CLUSTER_MAX_NODES; node++) {
 		uint64 floor;
@@ -7881,7 +7883,8 @@ cluster_reconfig_lmon_snapshot_r4_membership_internal(
 																stop_root))
 		return false;
 
-	LWLockAcquire(&ReconfigShmem->lock, LW_SHARED);
+	if (!cluster_reconfig_handoff_lock_acquire(LW_SHARED))
+		return false;
 	if (cluster_epoch_get_current() != candidate.formation_epoch)
 		exact = false;
 	for (node = 0; exact && node < CLUSTER_MAX_NODES; node++) {

@@ -629,6 +629,13 @@ CompleteCommitTsInitialization(void)
 void
 CommitTsParameterChange(bool newvalue, bool oldvalue)
 {
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: historical enablement is unsupported, not a record to skip. */
+	if (cluster_shared_config && (newvalue || oldvalue))
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared recovery cannot apply commit timestamp history"),
+						errdetail("PGRAC_FAMILY=SHARED_RECOVERY PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
+#endif
 	/*
 	 * If the commit_ts module is disabled in this server and we get word from
 	 * the primary server that it is enabled there, activate it so that we can
@@ -681,11 +688,12 @@ ActivateCommitTs(void)
 		return;
 
 #ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: activation consumes native startup input, not a backend repair. */
-	if (cluster_shared_config
-		&& (MyBackendType != B_STARTUP
-			|| !TransactionIdIsNormal(XidFromFullTransactionId(ShmemVariableCache->nextXid))))
-		ereport(FATAL, (errmsg("shared commit timestamp activation requires native startup")));
+	/* PGRAC: optional native timestamps are not part of shared recovery.
+	 * Reject before touching SLRU state, including already active history. */
+	if (cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared configuration requires track_commit_timestamp=off"),
+						errdetail("PGRAC_FAMILY=SHARED_RECOVERY PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
 #endif
 
 	/* If we've done this already, there's nothing to do */
@@ -731,26 +739,13 @@ ActivateCommitTs(void)
 	/* Create the current segment file, if necessary */
 	if (!SimpleLruDoesPhysicalPageExist(CommitTsCtl, pageno))
 	{
-#ifdef USE_PGRAC_CLUSTER
-		/*
-		 * PGRAC: an absent partial page may be lost retained history.  Never
-		 * reconstruct it as zeros.  At an unused page boundary the ordinary
-		 * WAL-logged ExtendCommitTs call will create the page on allocation.
-		 */
-		if (cluster_shared_config) {
-			if (TransactionIdToCTsEntry(xid) != 0)
-				ereport(FATAL, (errmsg("shared commit timestamp input page is missing")));
-		} else
-#endif
-		{
-			int slotno;
+		int			slotno;
 
-			LWLockAcquire(CommitTsSLRULock, LW_EXCLUSIVE);
-			slotno = ZeroCommitTsPage(pageno, false);
-			SimpleLruWritePage(CommitTsCtl, slotno);
-			Assert(!CommitTsCtl->shared->page_dirty[slotno]);
-			LWLockRelease(CommitTsSLRULock);
-		}
+		LWLockAcquire(CommitTsSLRULock, LW_EXCLUSIVE);
+		slotno = ZeroCommitTsPage(pageno, false);
+		SimpleLruWritePage(CommitTsCtl, slotno);
+		Assert(!CommitTsCtl->shared->page_dirty[slotno]);
+		LWLockRelease(CommitTsSLRULock);
 	}
 
 	/* Change the activation status in shared memory. */
@@ -1010,6 +1005,14 @@ void
 commit_ts_redo(XLogReaderState *record)
 {
 	uint8		info = XLogRecGetInfo(record) & ~XLR_INFO_MASK;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: off in the new configuration cannot erase historical obligations. */
+	if (cluster_shared_config)
+		ereport(FATAL, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared recovery cannot apply commit timestamp history"),
+						errdetail("PGRAC_FAMILY=SHARED_RECOVERY PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
+#endif
 
 	/* Backup blocks are not used in commit_ts records */
 	Assert(!XLogRecHasAnyBlockRefs(record));

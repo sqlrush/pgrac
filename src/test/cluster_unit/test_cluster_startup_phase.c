@@ -54,6 +54,9 @@
 #include "cluster/cluster_recovery_duty.h"
 #include "cluster/cluster_reconfig.h"
 #include "cluster/cluster_startup_phase.h"
+#include "cluster/cluster_config_members.h"
+#include "cluster/cluster_lock_acquire.h"
+#include "cluster/cluster_ges.h"
 #include "cluster/cluster_wal_retention.h"
 #include "storage/proc.h"
 
@@ -124,6 +127,8 @@ cluster_injection_run(const char *name pg_attribute_unused())
 /* miscadmin: HC1 Assert reads IsUnderPostmaster. */
 bool IsUnderPostmaster = false;
 PGPROC *MyProc = NULL;
+BackendType MyBackendType = B_INVALID;
+AuxProcType MyAuxProcType = NotAnAuxProcess;
 
 /* cluster_phase legacy mirror (HC2 derived).  Real backend gets it from
  * cluster_elog.o; the unit test provides a local writable storage so
@@ -359,6 +364,12 @@ cluster_write_fence_startup_self_check(void)
 static char phase4_events[512];
 static int phase4_event_count = 0;
 static bool phase4_test_in_quorum = true;
+static ClusterConfigMountResult test_mount_result;
+ClusterConfigMountResult
+cluster_config_members_mount_status(void)
+{
+	return test_mount_result;
+}
 static int phase4_quorum_check_calls = 0;
 static ClusterCssdStatus phase_test_cssd_status = CLUSTER_CSSD_DOWN;
 static ClusterQvotecStatus phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
@@ -915,10 +926,12 @@ cluster_lms_is_ready(void)
 static void
 reset_phase_service_fixture(bool formed_registry)
 {
+	MyBackendType = B_INVALID;
 	phase4_event_count = 0;
 	phase4_events[0] = '\0';
 	phase4_test_now = 0;
 	phase4_test_in_quorum = true;
+	test_mount_result = CLUSTER_CONFIG_MOUNT_UNPROVEN;
 	phase4_quorum_check_calls = 0;
 	phase_test_cssd_status = CLUSTER_CSSD_DOWN;
 	phase_test_qvotec_status = CLUSTER_QVOTEC_DOWN;
@@ -1653,6 +1666,27 @@ UT_TEST(test_pre2_survivor_reconstruction_rechecks_event)
 	UT_ASSERT(!cluster_recovery_transport_is_current());
 }
 
+/* Real serving publisher, with the member observation as an explicit boundary.
+ * No full-cluster startup certification is inferred from this test. */
+UT_TEST(test_static_common_blocks_serving_without_destroying_recovery)
+{
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+	cluster_shared_config = true;
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+	test_mount_result = CLUSTER_CONFIG_MOUNT_UNPROVEN;
+	UT_ASSERT(!cluster_authority_readiness_publish_serving());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MISMATCH;
+	UT_ASSERT(!cluster_authority_readiness_publish_serving());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_RECOVERY_READY);
+	test_mount_result = CLUSTER_CONFIG_MOUNT_MATCH;
+	UT_ASSERT(cluster_authority_readiness_publish_serving());
+	UT_ASSERT_EQ(cluster_authority_readiness_get(), CLUSTER_AUTHORITY_SERVING_READY);
+	reset_phase_service_fixture(true);
+}
+
 UT_TEST(test_rf_a1_readiness_is_monotone_and_generation_bound)
 {
 	ClusterResId recovery_resid;
@@ -1713,6 +1747,108 @@ UT_TEST(test_pre2_startup_cf_x_needs_sealed_owner)
 	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, AccessExclusiveLock, true));
 	phase_test_control_acquire_ready = false;
 	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, true));
+	reset_phase_service_fixture(true);
+}
+
+UT_TEST(test_config_lmon_can_read_before_startup_and_cannot_write)
+{
+	ClusterResId cf = { .type = CLUSTER_CF_RESID_TYPE, .lockmethodid = DEFAULT_LOCKMETHOD };
+	ClusterResId wal = { .type = CLUSTER_WAL_RETENTION_RESID_TYPE,
+						 .field1 = 1,
+						 .lockmethodid = DEFAULT_LOCKMETHOD };
+	static PGPROC lmon_proc;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	MyProc = &lmon_proc;
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ExclusiveLock, false));
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&wal, ExclusiveLock, false));
+	cf.field1 = 1;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	cf.field1 = 0;
+	MyBackendType = B_BACKEND;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	MyBackendType = B_LMON;
+	MyProc = NULL;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	MyProc = &lmon_proc;
+	phase_test_control_acquire_ready = false;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = false;
+	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+	IsUnderPostmaster = true;
+	UT_ASSERT(cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	phase_test_lms_generation++;
+	UT_ASSERT(!cluster_recovery_authority_request_allowed(&cf, ShareLock, false));
+	MyProc = NULL;
+	IsUnderPostmaster = false;
+	reset_phase_service_fixture(true);
+}
+
+static pg_atomic_uint64 stub_s1_entry_count;
+static void
+ensure_counter_initialized(void)
+{
+	pg_atomic_init_u64(&stub_s1_entry_count, 0);
+}
+
+#include "test_cluster_config_s1_native.inc"
+#include "test_cluster_config_ges_native.inc"
+
+UT_TEST(test_config_read_crosses_real_s1_and_ges_admission_before_serving)
+{
+	ClusterLockAcquireRequest req = { 0 };
+	ClusterGrdGrantIdentity grant = { 0 };
+	static PGPROC lmon_proc;
+
+	reset_phase_service_fixture(true);
+	cluster_run_startup_sequence();
+	cluster_shared_config = true;
+	phase_test_control_acquire_ready = true;
+	IsUnderPostmaster = true;
+	MyBackendType = B_LMON;
+	MyProc = &lmon_proc;
+	req.resid.type = CLUSTER_CF_RESID_TYPE;
+	req.resid.lockmethodid = DEFAULT_LOCKMETHOD;
+	req.lockmode = ShareLock;
+	grant.mode = ShareLock;
+	grant.request_opcode = GES_REQ_OPCODE_REQUEST;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(
+		ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock, NoLock));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
+	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+	UT_ASSERT(!cluster_serving_ready_is_current());
+	req.lockmode = ExclusiveLock;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_FAIL_LMS_UNAVAILABLE);
+	UT_ASSERT(!ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock,
+												 NoLock));
+	IsUnderPostmaster = false;
+	cluster_advance_phase(CLUSTER_PHASE_4_NORMAL);
+	IsUnderPostmaster = true;
+	req.lockmode = ShareLock;
+	UT_ASSERT_EQ(cluster_lock_acquire_s1_entry(&req), CLUSTER_LOCK_ACQUIRE_OK_GRANTED);
+	UT_ASSERT(
+		ges_readiness_allows_local_origin(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock, NoLock));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ShareLock));
+	UT_ASSERT(ges_readiness_allows_grant(&grant, &req.resid));
+	UT_ASSERT(ges_readiness_allows_local_release_origin(&req.resid));
+	UT_ASSERT(ges_readiness_allows_protocol_request(GES_REQ_OPCODE_RELEASE, &req.resid, NoLock));
+	UT_ASSERT(
+		!ges_readiness_allows_protocol_request(GES_REQ_OPCODE_REQUEST, &req.resid, ExclusiveLock));
+	grant.mode = ExclusiveLock;
+	UT_ASSERT(!ges_readiness_allows_grant(&grant, &req.resid));
+	MyProc = NULL;
+	IsUnderPostmaster = false;
 	reset_phase_service_fixture(true);
 }
 
@@ -2085,7 +2221,8 @@ UT_TEST(test_join_readonly_rebuild_binds_generation_once_per_iteration)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(44);
+	UT_RUN(test_static_common_blocks_serving_without_destroying_recovery);
 	UT_RUN(test_phase_enum_values_frozen);
 	UT_RUN(test_phase_last_is_shutdown);
 	UT_RUN(test_phase_history_ring_size_is_eight);
@@ -2114,6 +2251,8 @@ main(void)
 	UT_RUN(test_rf_a1_finalize_never_runs_self_fence_or_active_from_postmaster);
 	UT_RUN(test_rf_a1_readiness_is_monotone_and_generation_bound);
 	UT_RUN(test_pre2_startup_cf_x_needs_sealed_owner);
+	UT_RUN(test_config_lmon_can_read_before_startup_and_cannot_write);
+	UT_RUN(test_config_read_crosses_real_s1_and_ges_admission_before_serving);
 	UT_RUN(test_pre2_startup_cf_x_cannot_use_components_only);
 	UT_RUN(test_rf_a1_transport_stale_clear_skips_mid_bind_gen_zero);
 	UT_RUN(test_rf_a1_missing_authoritative_grd_stops_before_recovery);

@@ -46,7 +46,6 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
-#include "cluster/cluster_config_channels.h"
 
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -220,25 +219,15 @@ static uint64 tier1_stream_serial[CLUSTER_MAX_NODES];
 static bool tier1_stream_exhausted;
 
 static void
-tier1_stream_forget_all(void)
-{
-	/* PGRAC: revoke published prefix evidence before destroying its lifetime.
-	 * Author: SqlRush <sqlrush@gmail.com> */
-	cluster_config_channels_stream_retiring(-1);
-	memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
-}
-
-static void
 tier1_stream_bind(int32 peer)
 {
 	pid_t self = getpid();
-	cluster_config_channels_stream_retiring(peer);
 	if (tier1_stream_owner != self) {
 		/* Inherited parent descriptors/stamps are not this child's proof. */
 		tier1_stream_owner = self;
 		tier1_stream_next = 0;
 		tier1_stream_exhausted = false;
-		tier1_stream_forget_all();
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 	}
 	if (tier1_stream_next == PG_UINT64_MAX)
 		tier1_stream_exhausted = true;
@@ -834,7 +823,7 @@ cluster_ic_tier1_set_my_plane(ClusterICPlane plane)
 
 	Assert(plane >= 0 && plane < CLUSTER_IC_PLANE_N);
 	if (plane != tier1_my_plane)
-		tier1_stream_forget_all();
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 	tier1_my_plane = plane;
 	/* set_my_plane alone keeps the DATA channel at its current value (0 =
 	 * worker 0 by default);  set_my_data_channel selects a worker channel. */
@@ -860,7 +849,7 @@ cluster_ic_tier1_set_my_data_channel(int channel, int n_workers)
 
 	if (tier1_my_plane != CLUSTER_IC_PLANE_DATA || tier1_my_data_channel != channel
 		|| tier1_my_n_workers != n_workers)
-		tier1_stream_forget_all();
+		memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 	tier1_my_plane = CLUSTER_IC_PLANE_DATA;
 	tier1_my_data_channel = channel;
 	tier1_my_n_workers = n_workers;
@@ -1301,11 +1290,6 @@ tier1_send_bytes(int32 target_node_id, const void *buf, size_t len)
 		&& Tier1Shmem->peers[target_node_id].conn_epoch != cluster_epoch_get_current())
 		return CLUSTER_IC_SEND_HARD_ERROR;
 
-	/* PGRAC: withdraw a held configuration prefix before ordinary new bytes
-	 * can escape, including direct/fanout/chunk sends which bypass the router.
-	 * The caller's ownership and four-state send result remain unchanged. */
-	cluster_config_channels_sending(target_node_id, buf, len);
-
 	/*
 	 * Hardening v1.0.1 F1 (spec-2.2 v1.0.1 + spec-2.3 v1.0.1 L68):
 	 * per-peer outbound buffer for partial writes.  If a previous send
@@ -1706,7 +1690,7 @@ tier1_tier_shutdown(void)
 	int i;
 
 	peer_fds_lazy_init();
-	tier1_stream_forget_all();
+	memset(tier1_stream_serial, 0, sizeof(tier1_stream_serial));
 
 	for (i = 0; i < CLUSTER_MAX_NODES; i++) {
 		if (tier1_peer_fds[i] >= 0) {
@@ -2010,8 +1994,8 @@ cluster_ic_tier1_connect_one(int32 peer_id, int *out_peer_fd)
 		return false;
 	}
 
-	tier1_stream_bind(peer_id);
 	tier1_peer_fds[peer_id] = fd;
+	tier1_stream_bind(peer_id);
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTING;
 	if (out_peer_fd != NULL)
 		*out_peer_fd = fd;
@@ -2432,8 +2416,8 @@ cluster_ic_tier1_recv_and_verify_hello(int32 peer_id, int peer_fd)
 	/* On accept side peer_id was -1 until now; bind fd to learned peer. */
 	if (peer_id < 0) {
 		peer_id = msg.source_node_id;
-		tier1_stream_bind(peer_id);
 		tier1_peer_fds[peer_id] = peer_fd;
+		tier1_stream_bind(peer_id);
 	}
 
 	Tier1Shmem->peers[peer_id].state = (int32)CLUSTER_IC_PEER_CONNECTED;
@@ -2654,8 +2638,8 @@ cluster_ic_tier1_continue_hello_recv(int anon_slot, int peer_fd, int32 *out_lear
 
 	/* Bind learned peer_id; record state CONNECTED. */
 	learned = msg.source_node_id;
-	tier1_stream_bind(learned);
 	tier1_peer_fds[learned] = peer_fd;
+	tier1_stream_bind(learned);
 	if (Tier1Shmem != NULL) {
 		peer_record_error(learned, 0, "", "%s", ""); /* clear any prior */
 		Tier1Shmem->peers[learned].state = (int32)CLUSTER_IC_PEER_CONNECTED;
@@ -2949,10 +2933,6 @@ cluster_ic_tier1_recv_heartbeat_drain(int32 peer_id, int peer_fd)
 			/* OK -> fall through to dispatch */
 		}
 
-		/* PGRAC: a late old frame invalidates the held channel report before
-		 * handler/chunk work. Original envelope rejection remains above. */
-		cluster_config_channels_received(peer_id, &env, payload_len);
-
 		/* HEARTBEAT-specific bookkeeping. */
 		if (env.msg_type == PGRAC_IC_MSG_HEARTBEAT) {
 			pg_atomic_add_fetch_u64(&Tier1Shmem->peers[peer_id].heartbeat_recv_count, 1);
@@ -3004,7 +2984,6 @@ cluster_ic_tier1_close_peer(int32 peer_id, const char *reason)
 
 	if (peer_id < 0 || peer_id >= CLUSTER_MAX_NODES)
 		return;
-	cluster_config_channels_stream_retiring(peer_id);
 	tier1_stream_serial[peer_id] = 0;
 
 	if (tier1_peer_fds[peer_id] >= 0) {

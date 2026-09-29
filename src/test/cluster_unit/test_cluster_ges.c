@@ -382,6 +382,15 @@ cluster_recovery_authority_is_current(void)
 }
 
 bool
+cluster_configuration_read_transport_is_current(const ClusterResId *resid pg_attribute_unused(),
+												LOCKMODE mode pg_attribute_unused())
+{
+	/* Startup-phase tests exercise the actual positive predicate. These
+	 * existing protocol cases must not gain a configuration-only permission. */
+	return false;
+}
+
+bool
 cluster_recovery_transport_is_current(void)
 {
 	return stub_recovery_transport_ready || stub_recovery_ready || stub_survivor_protocol_ready;

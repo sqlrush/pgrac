@@ -1451,23 +1451,6 @@ cluster_xid_wrap_barrier_passed(void)
 	return StripeBootShmem != NULL && pg_atomic_read_u32(&StripeBootShmem->wrap_barrier_done) != 0;
 }
 
-bool
-cluster_xid_wrap_barrier_observe(bool *pending)
-{
-	bool marked, done;
-	if (pending == NULL)
-		return false;
-	*pending = true;
-	if (StripeBootShmem == NULL)
-		return false;
-	marked = pg_atomic_read_u32(&StripeBootShmem->wrap_barrier_marked) != 0;
-	done = pg_atomic_read_u32(&StripeBootShmem->wrap_barrier_done) != 0;
-	if (done && !marked)
-		return false;
-	*pending = marked && !done;
-	return true;
-}
-
 void
 cluster_xid_wrap_barrier_set_done(void)
 {

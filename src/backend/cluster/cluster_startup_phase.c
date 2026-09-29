@@ -57,6 +57,7 @@
 
 #include "cluster/cluster_elog.h" /* cluster_phase legacy mirror (HC2) */
 #include "cluster/cluster_cf_enqueue.h"
+#include "cluster/cluster_config_members.h"
 #include "cluster/cluster_hw_remaster.h" /* contract: worker CF(S) admission */
 #include "cluster/cluster_cf_phase2.h"	 /* RF-ROOT P6: storage contract verify */
 #include "cluster/cluster_cssd.h"		 /* cluster_cssd_start / wait_for_ready (2.5 Sprint A) */
@@ -777,6 +778,26 @@ cluster_recovery_authority_is_current(void)
 	return current;
 }
 
+/* PGRAC: static configuration comparison is an input to SERVING. The exact
+ * sealed recovery binding survives the phase-3 to phase-4 handoff; only its
+ * CF read transport may continue across that boundary. Do not broaden the
+ * recovery/DATA predicate or admit a components-only configuration read.
+ * Author: SqlRush <sqlrush@gmail.com> */
+bool
+cluster_configuration_read_transport_is_current(const ClusterResId *resid, LOCKMODE mode)
+{
+	ClusterAuthorityBindingLocal binding;
+	ClusterStartupPhase phase = cluster_current_phase();
+
+	return cluster_shared_config && resid != NULL && resid->type == CLUSTER_CF_RESID_TYPE
+		   && mode == ShareLock && cluster_recovery_authority_resid_mode_allowed(resid, mode)
+		   && (phase == CLUSTER_PHASE_3_RECOVERY || phase == CLUSTER_PHASE_4_NORMAL)
+		   && cluster_authority_binding_copy(&binding)
+		   && binding.state == CLUSTER_AUTHORITY_RECOVERY_READY
+		   && cluster_authority_binding_components_current(&binding, false)
+		   && cluster_lms_is_recovery_ready();
+}
+
 bool
 cluster_authority_readiness_publish_serving(void)
 {
@@ -795,6 +816,13 @@ cluster_authority_readiness_publish_serving(void)
 	if (!cluster_authority_binding_copy(&binding)
 		|| binding.state != CLUSTER_AUTHORITY_RECOVERY_READY
 		|| cluster_current_phase() != CLUSTER_PHASE_4_NORMAL)
+		return false;
+	/* PGRAC: actual common boot values, not a published/pending generation.
+	 * Missing evidence waits without destroying the valid recovery binding.
+	 * This is initial admission only; an online pending value never evicts
+	 * an already serving instance. */
+	if (cluster_shared_config
+		&& cluster_config_members_mount_status() != CLUSTER_CONFIG_MOUNT_MATCH)
 		return false;
 	/* Validate every generation component while service is still unpublished. */
 	cssd_ready = cluster_cssd_get_status() == CLUSTER_CSSD_READY;
@@ -1011,6 +1039,15 @@ cluster_recovery_authority_request_allowed(const ClusterResId *resid, LOCKMODE m
 			   && cluster_current_phase() == CLUSTER_PHASE_3_RECOVERY
 			   && cluster_recovery_authority_resid_mode_allowed(resid, mode)
 			   && cluster_recovery_authority_is_current();
+	/* PGRAC: the original LMON must read the selected configuration before
+	 * StartupXLOG can prove compatible static values. It has a real PGPROC
+	 * and the same CF acquisition/retirement path, unlike the postmaster.
+	 * Require the existing sealed recovery authority, not just components;
+	 * this admits only singleton CF-S and never root mutation or DATA.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	if (IsUnderPostmaster && MyBackendType == B_LMON && MyProc != NULL
+		&& cluster_configuration_read_transport_is_current(resid, mode))
+		return true;
 	if (cluster_grd_control_recovery_ready(resid, mode))
 		return cluster_recovery_transport_is_current();
 	/*

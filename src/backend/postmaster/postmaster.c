@@ -196,6 +196,7 @@
 #include "cluster/cluster_mrp.h"   /* cluster_mrp_should_start (spec-6.4 D1) */
 #include "cluster/cluster_rfs.h"   /* cluster_rfs_should_start (spec-6.4 D3) */
 #include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_shared_config.h" /* native family delivery, no process census */
 #include "cluster/cluster_startup_phase.h"
 #include "cluster/cluster_undo_cleaner.h"
 #endif
@@ -4003,10 +4004,6 @@ process_pm_child_exit(void)
 
 		/* Was it the system logger?  If so, try to start a new one */
 		if (pid == SysLoggerPID) {
-#ifdef USE_PGRAC_CLUSTER
-			/* Native waitpid, not an age or a main-shmem reset, ends this lifetime. */
-			cluster_shared_config_delivery_logger_reaped(pid);
-#endif
 			SysLoggerPID = 0;
 			/* for safety's sake, launch new logger *first* */
 			SysLoggerPID = SysLogger_Start();

@@ -68,8 +68,6 @@
 #include "utils/timeout.h"
 
 #ifdef USE_PGRAC_CLUSTER
-#include "cluster/cluster_config_use_gate.h"
-#include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_grd.h" /* spec-2.24 D7 cleanup_on_backend_exit_callback */
 #include "cluster/cluster_gcs_block_dedup.h" /* spec-6.14 D11 eager exit-hook registration */
 #include "cluster/cluster_tx_enqueue.h" /* spec-8.4 D9 exact wait exit cleanup */
@@ -737,9 +735,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	char	   *fullpath;
 	char		dbname[NAMEDATALEN];
 	int			nfree = 0;
-#ifdef USE_PGRAC_CLUSTER
-	bool		config_init_work;
-#endif
 
 	elog(DEBUG3, "InitPostgres");
 
@@ -818,12 +813,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	 * We must do this before starting a transaction because transaction abort
 	 * would try to touch these hashtables.
 	 */
-#ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: hold the whole real startup, before any catalog/relation use.
-	 * FATAL/ERROR retains the owner until native ProcKill resource retirement.
-	 * Author: SqlRush <sqlrush@gmail.com> */
-	config_init_work = cluster_shared_config_delivery_work_enter();
-#endif
 	RelationCacheInitialize();
 	InitCatalogCache();
 	InitPlanCache();
@@ -895,7 +884,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		/* report this backend in the PgBackendStatus array */
 		pgstat_bestart();
 
-		goto config_init_done;
+		return;
 	}
 
 	/*
@@ -1051,7 +1040,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 		/* close the transaction we started above */
 		CommitTransactionCommand();
 
-		goto config_init_done;
+		return;
 	}
 
 	/*
@@ -1092,7 +1081,7 @@ InitPostgres(const char *in_dbname, Oid dboid,
 			pgstat_bestart();
 			CommitTransactionCommand();
 		}
-		goto config_init_done;
+		return;
 	}
 
 	/*
@@ -1294,13 +1283,6 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	/* close the transaction we started above */
 	if (!bootstrap)
 		CommitTransactionCommand();
-
-config_init_done:
-#ifdef USE_PGRAC_CLUSTER
-	cluster_shared_config_delivery_work_leave(config_init_work);
-	cluster_shared_config_use_idle();
-#endif
-	return;
 }
 
 /*

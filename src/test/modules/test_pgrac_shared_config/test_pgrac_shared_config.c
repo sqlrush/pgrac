@@ -10,7 +10,6 @@
 #include "catalog/pg_control.h"
 #include "fmgr.h"
 #include "miscadmin.h"
-#include "postmaster/bgwriter.h"
 #include "storage/fd.h"
 #include "storage/proc.h"
 #include "utils/builtins.h"
@@ -18,7 +17,7 @@
 #include "utils/memutils.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_cf_authority.h"
-#include "cluster/cluster_config_use_gate.h"
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_shared_config.h"
 #include "cluster/cluster_wal_claim.h"
 #include "cluster/cluster_wal_durable_prefix.h"
@@ -38,21 +37,14 @@ PG_FUNCTION_INFO_V1(test_pgrac_config_object);
 PG_FUNCTION_INFO_V1(test_pgrac_config_change);
 PG_FUNCTION_INFO_V1(test_pgrac_config_reload);
 PG_FUNCTION_INFO_V1(test_pgrac_config_process);
+PG_FUNCTION_INFO_V1(test_pgrac_config_sql_mode);
 PG_FUNCTION_INFO_V1(test_pgrac_config_parallel_observe);
-PG_FUNCTION_INFO_V1(test_pgrac_config_enrollment);
-PG_FUNCTION_INFO_V1(test_pgrac_config_native_role);
-PG_FUNCTION_INFO_V1(test_pgrac_config_checkpoint_request);
-PG_FUNCTION_INFO_V1(test_pgrac_config_slot_probe);
 PG_FUNCTION_INFO_V1(test_pgrac_config_registration);
 PG_FUNCTION_INFO_V1(test_pgrac_config_selection_cleanup);
-PG_FUNCTION_INFO_V1(test_pgrac_config_delivery);
-PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_state);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_refuse);
 PG_FUNCTION_INFO_V1(test_pgrac_config_delivery_receive);
-PG_FUNCTION_INFO_V1(test_pgrac_config_census);
 PG_FUNCTION_INFO_V1(test_pgrac_config_active);
 PG_FUNCTION_INFO_V1(test_pgrac_config_define_common);
-PG_FUNCTION_INFO_V1(test_pgrac_config_active_census);
 PG_FUNCTION_INFO_V1(test_pgrac_config_backend_apply);
 PG_FUNCTION_INFO_V1(test_pgrac_config_bootstrap);
 PG_FUNCTION_INFO_V1(test_pgrac_control_image);
@@ -61,8 +53,18 @@ PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_fixture);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_late);
 PG_FUNCTION_INFO_V1(test_pgrac_bootstrap_control_late);
 PGDLLEXPORT void _PG_init(void);
-extern void test_pgrac_config_gate_init(void);
-extern void test_pgrac_config_work_init(void);
+
+/* Select only the SQL routing branch, never manufacture CF authority. */
+Datum
+test_pgrac_config_sql_mode(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR, (errmsg("test configuration routing requires superuser")));
+#ifdef USE_PGRAC_CLUSTER
+	cluster_shared_config = PG_GETARG_BOOL(0);
+#endif
+	PG_RETURN_VOID();
+}
 
 Datum
 test_pgrac_config_define_common(PG_FUNCTION_ARGS)
@@ -90,35 +92,6 @@ test_pgrac_config_define_common(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 }
 
-Datum
-test_pgrac_config_active_census(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test native active census requires superuser")));
-#ifdef USE_PGRAC_CLUSTER
-	{
-		ClusterSharedConfigProcess actual;
-		ClusterSharedConfigCensus census;
-		bool observed;
-		if (!cluster_shared_config_process_observe(&actual))
-			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		if (PG_NARGS() > 0 && PG_GETARG_BOOL(0))
-			observed
-				= cluster_shared_config_node_common_census(&actual.ref, actual.node_id, &census);
-		else
-			observed = cluster_shared_config_node_census(&actual.ref, actual.node_id, &census);
-		if (!observed)
-			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		if (census.participants != census.current_processes)
-			PG_RETURN_TEXT_P(cstring_to_text("not-current"));
-		PG_RETURN_TEXT_P(cstring_to_text(
-			psprintf("%u:%u:%u:%u", census.active.version, census.active_missing_processes,
-					 census.static_mismatch_processes, census.dynamic_mismatch_processes)));
-	}
-#else
-	PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-#endif
-}
 
 /* Actual native values or the actual backend's published observation. This
  * does not mutate a value, grant permission, or fabricate a process role.
@@ -132,25 +105,14 @@ test_pgrac_config_active(PG_FUNCTION_ARGS)
 #ifdef USE_PGRAC_CLUSTER
 	{
 		ClusterSharedConfigActive active;
-		ClusterSharedConfigRegistration registration;
+		ClusterSharedConfigProcess process;
 		char static_hex[65], dynamic_hex[65];
 		static const char hex[] = "0123456789abcdef";
-		bool common = PG_NARGS() > 1 && PG_GETARG_BOOL(1);
-		uint32 version
-			= common ? CLUSTER_SHARED_CONFIG_COMMON_VERSION : CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
 		if (PG_GETARG_BOOL(0)) {
-			if (MyProc == NULL
-				|| !cluster_shared_config_registration_read(&MyProc->cluster_config, &registration))
+			if (!cluster_shared_config_process_observe(&process)
+				|| !cluster_shared_config_parent_profile(&process.ref, process.node_id, &active))
 				PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-			active = registration.active;
-			if (common)
-				active = registration.common;
-		} else if (common) {
-			if (!cluster_shared_config_common_profile(&active))
-				PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		} else if (!cluster_shared_config_active_profile(&active))
-			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		if (active.version != version)
+		} else if (!cluster_shared_config_common_profile(&active))
 			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
 		for (int i = 0; i < 32; ++i) {
 			static_hex[2 * i] = hex[active.static_sha256[i] >> 4];
@@ -339,7 +301,6 @@ static int test_process_generation;
 static int test_process_failure;
 static bool test_process_defer;
 static bool test_process_delivery;
-static int test_logger_failure;
 
 static void
 bootstrap_test_path(char path[MAXPGPATH], const char *suffix)
@@ -626,12 +587,6 @@ reload_test_assign(int value, void *extra)
 		ereport(ERROR, (errmsg("test native reload assignment failure")));
 }
 
-static void
-logger_test_assign(int value, void *extra)
-{
-	if (value == 2 && IsUnderPostmaster && MyBackendType == B_LOGGER)
-		ereport(ERROR, (errmsg("test detached logger assignment failure")));
-}
 
 /* Test-only driver into the actual consumer in a real postmaster/child.
  * This does not select a CF root, publish an ACK or change process roles. */
@@ -652,17 +607,7 @@ process_test_reload(int generation, void *extra)
 	if (generation < 2 || test_process_defer)
 		return;
 	if (test_process_delivery && IsUnderPostmaster) {
-		ClusterSharedConfigProcess before, after;
-		bool checkpoint = MyBackendType == B_CHECKPOINTER;
-		bool observed = checkpoint && cluster_shared_config_process_observe(&before);
 		(void)cluster_shared_config_delivery_reload();
-		if (observed && cluster_shared_config_process_observe(&after))
-			ereport(
-				LOG,
-				(errmsg("test checkpoint configuration: target=%d before=%llu after=%llu owned=%d",
-						generation, (unsigned long long)before.ref.identity.generation,
-						(unsigned long long)after.ref.identity.generation,
-						cluster_shared_config_delivery_work_pending())));
 		return;
 	}
 	snprintf(path, sizeof(path), "%s/test_config.reload", DataDir);
@@ -695,8 +640,6 @@ _PG_init(void)
 #ifdef USE_PGRAC_CLUSTER
 	if (!process_shared_preload_libraries_in_progress || IsUnderPostmaster)
 		return;
-	test_pgrac_config_work_init();
-	test_pgrac_config_gate_init();
 	DefineCustomIntVariable("test_pgrac_shared_config.apply_node", "Test startup application.",
 							NULL, &test_apply_node, -1, -1, 127, PGC_POSTMASTER, 0, NULL, NULL,
 							NULL);
@@ -724,10 +667,7 @@ _PG_init(void)
 							 NULL);
 	DefineCustomIntVariable("cluster.native_config_process_failure",
 							"Test-only partial process application.", NULL, &test_process_failure,
-							0, 0, 2, PGC_SIGHUP, 0, NULL, reload_test_assign, NULL);
-	DefineCustomIntVariable(
-		"cluster.native_config_logger_failure", "Test-only detached logger assignment failure.",
-		NULL, &test_logger_failure, 0, 0, 2, PGC_SIGHUP, 0, NULL, logger_test_assign, NULL);
+							0, 0, 2, PGC_SUSET, 0, NULL, reload_test_assign, NULL);
 	if (test_prepare_bootstrap)
 		bootstrap_test_prepare();
 	if (test_apply_node >= 0) {
@@ -778,68 +718,6 @@ _PG_init(void)
 #endif
 }
 
-Datum
-test_pgrac_config_delivery(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test delivery inspection requires superuser")));
-#ifdef USE_PGRAC_CLUSTER
-	{
-		ClusterSharedConfigRegistration out;
-		if (!cluster_shared_config_delivery_logger_observe(&out))
-			PG_RETURN_TEXT_P(cstring_to_text("none"));
-		PG_RETURN_TEXT_P(cstring_to_text(
-			psprintf("%llu:%llu:%d:%d", (unsigned long long)out.process.ref.identity.generation,
-					 (unsigned long long)out.registration, out.pid, out.role == B_LOGGER)));
-	}
-#else
-	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
-#endif
-}
-
-Datum
-test_pgrac_config_delivery_state(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test delivery inspection requires superuser")));
-#ifdef USE_PGRAC_CLUSTER
-	{
-		ClusterSharedConfigRegistration out;
-		if (!cluster_shared_config_delivery_logger_observe(&out))
-			PG_RETURN_TEXT_P(cstring_to_text("none"));
-		PG_RETURN_TEXT_P(cstring_to_text(
-			psprintf("%llu:%d", (unsigned long long)out.process.ref.identity.generation,
-					 out.process.failed)));
-	}
-#else
-	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
-#endif
-}
-
-Datum
-test_pgrac_config_census(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test configuration census requires superuser")));
-#ifdef USE_PGRAC_CLUSTER
-	{
-		ClusterSharedConfigProcess actual;
-		ClusterSharedConfigCensus out;
-		if (!cluster_shared_config_process_observe(&actual)
-			|| !cluster_shared_config_node_census(&actual.ref, actual.node_id, &out))
-			PG_RETURN_TEXT_P(cstring_to_text("busy"));
-		/* Test-only view of an actual census. This process's actual inherited
-		 * target is not a CF selection or member/common-value admission. */
-		PG_RETURN_TEXT_P(cstring_to_text(psprintf(
-			"%u:%u:%u:%u:%u:%u:%u:%llu:%llu", out.participants, out.current_processes,
-			out.waiting_processes, out.failed_processes, out.parallel_processes,
-			out.pending_processes, out.deferred_processes, (unsigned long long)out.pending_entries,
-			(unsigned long long)out.deferred_entries)));
-	}
-#else
-	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
-#endif
-}
 
 Datum
 test_pgrac_config_delivery_receive(PG_FUNCTION_ARGS)
@@ -1391,7 +1269,7 @@ test_pgrac_config_reload(PG_FUNCTION_ARGS)
 		if (strcmp(fault, "assign") == 0)
 			DefineCustomIntVariable(
 				"cluster.native_config_reload_failure", "Disposable native assignment failure.",
-				NULL, &reload_test_value, 0, 0, 2, PGC_SIGHUP, 0, NULL, reload_test_assign, NULL);
+				NULL, &reload_test_value, 0, 0, 2, PGC_SUSET, 0, NULL, reload_test_assign, NULL);
 		old_bytes = application_fixture_generation(text_to_cstring(PG_GETARG_TEXT_PP(0)),
 												   strcmp(fault, "backwards") == 0 ? 4 : 1,
 												   &old_ref, &old_len);
@@ -1512,150 +1390,5 @@ test_pgrac_config_parallel_observe(PG_FUNCTION_ARGS)
 	}
 #else
 	PG_RETURN_TEXT_P(cstring_to_text("plain"));
-#endif
-}
-
-/* Diagnostics only: native slots, never fabricate a process or target. */
-Datum
-test_pgrac_config_enrollment(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test enrollment inspection requires superuser")));
-#ifdef USE_PGRAC_CLUSTER
-	{
-		ClusterSharedConfigRegistration state;
-		int pid = PG_GETARG_INT32(0);
-		int index = ProcGlobal->allProcCount;
-		ClusterSharedConfigSlot *slot = &ProcGlobal->cluster_config_postmaster;
-		if (pid != -1) {
-			for (index = 0; index < ProcGlobal->allProcCount; ++index)
-				if (ProcGlobal->allProcs[index].pid == pid)
-					break;
-			if (index == ProcGlobal->allProcCount)
-				PG_RETURN_TEXT_P(cstring_to_text("absent"));
-			slot = &ProcGlobal->allProcs[index].cluster_config;
-		}
-		if (!cluster_shared_config_registration_read(slot, &state))
-			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		/* A freed native PGPROC can retain its old pid. The registration's
-		 * real exit is the observation, not the stale diagnostic pid field. */
-		if (state.pid == 0)
-			PG_RETURN_TEXT_P(cstring_to_text("absent"));
-		if (pid != -1 && state.pid != pid)
-			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		PG_RETURN_TEXT_P(cstring_to_text(
-			psprintf("%d:%llu:%llu:%d:%d", index, (unsigned long long)state.registration,
-					 (unsigned long long)state.process.ref.identity.generation,
-					 state.process.failed, state.process.parallel_snapshot)));
-	}
-#else
-	PG_RETURN_TEXT_P(cstring_to_text("plain"));
-#endif
-}
-
-/* Exercise the real native checkpoint request queue without waiting in the
- * requesting backend. This test helper creates no configuration permission. */
-Datum
-test_pgrac_config_checkpoint_request(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test checkpoint request requires superuser")));
-	RequestCheckpoint(CHECKPOINT_FORCE | (PG_GETARG_BOOL(0) ? CHECKPOINT_IMMEDIATE : 0));
-	PG_RETURN_VOID();
-}
-
-/* Actual native role observation only; never synthesize process enrollment. */
-Datum
-test_pgrac_config_native_role(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test native role inspection requires superuser")));
-#ifdef USE_PGRAC_CLUSTER
-	{
-		ClusterSharedConfigRegistration state;
-		int pid = PG_GETARG_INT32(0);
-		bool found = false;
-		if (pid == -1)
-			found = cluster_shared_config_registration_read(&ProcGlobal->cluster_config_postmaster,
-															&state);
-		else if (pid == -2)
-			found = cluster_shared_config_delivery_logger_observe(&state);
-		else {
-			int32 *pids = palloc(sizeof(*pids) * ProcGlobal->allProcCount);
-			if (ProcConfigSnapshotPids(pids, ProcGlobal->allProcCount))
-				for (unsigned i = 0; i < ProcGlobal->allProcCount; ++i)
-					if (pids[i] == pid && pid > 0) {
-						found = cluster_shared_config_registration_read(
-									&ProcGlobal->allProcs[i].cluster_config, &state)
-								&& state.pid == pid;
-						break;
-					}
-			pfree(pids);
-		}
-		if (!found || state.pid <= 0 || state.registration == 0)
-			PG_RETURN_TEXT_P(cstring_to_text("unavailable"));
-		PG_RETURN_TEXT_P(cstring_to_text(psprintf("%d:%d", state.role, state.aux_type)));
-	}
-#else
-	PG_RETURN_TEXT_P(cstring_to_text("plain"));
-#endif
-}
-
-/* Slot boundary tests complement (not replace) the real process TAP. */
-Datum
-test_pgrac_config_slot_probe(PG_FUNCTION_ARGS)
-{
-	if (!superuser())
-		ereport(ERROR, (errmsg("test slot inspection requires superuser")));
-#ifdef USE_PGRAC_CLUSTER
-	{
-		ClusterSharedConfigSlot slot;
-		ClusterSharedConfigRegistration out, before;
-		int mode = PG_GETARG_INT32(0);
-		bool result;
-		if (mode == 4) {
-			ClusterSharedConfigSlot *previous = palloc(sizeof(*previous));
-			ClusterSharedConfigSlot *replacement = palloc(sizeof(*replacement));
-			ClusterSharedConfigProcess original, current;
-			bool attached, first;
-			if (!cluster_shared_config_process_observe(&original))
-				ereport(ERROR, (errmsg("relocation test needs an actual native image")));
-			cluster_shared_config_process_detach();
-			cluster_shared_config_registration_init(previous);
-			first = cluster_shared_config_process_attach(previous);
-			/* Distinct simultaneously live allocations deterministically model
-			 * a relocated replacement mapping; no address-reuse assumption. */
-			cluster_shared_config_process_new_shmem();
-			cluster_shared_config_registration_init(replacement);
-			attached = cluster_shared_config_process_attach(replacement);
-			result = first && attached && cluster_shared_config_process_observe(&current)
-					 && memcmp(&original, &current, sizeof(original)) == 0;
-			cluster_shared_config_process_detach();
-			if (!cluster_shared_config_process_attach(&MyProc->cluster_config))
-				ereport(ERROR, (errmsg("could not restore actual native test registration")));
-			pfree(previous);
-			pfree(replacement);
-			PG_RETURN_BOOL(result);
-		}
-		cluster_shared_config_registration_init(&slot);
-		slot.value.pid = 17;
-		slot.value.registration = 2;
-		slot.value.observed = true;
-		before = slot.value;
-		memset(&out, 0xa5, sizeof(out));
-		if (mode == 2) {
-			result = cluster_shared_config_registration_read(&slot, &slot.value);
-			PG_RETURN_BOOL(!result && memcmp(&before, &slot.value, sizeof(before)) == 0);
-		}
-		if (mode == 1 || mode == 3)
-			pg_atomic_write_u64(&slot.sequence, mode == 1 ? 1 : PG_UINT64_MAX);
-		result = cluster_shared_config_registration_read(&slot, &out);
-		if (mode == 0)
-			PG_RETURN_BOOL(result && memcmp(&before, &out, sizeof(out)) == 0);
-		PG_RETURN_BOOL(!result
-					   && memcmp(&out, &(ClusterSharedConfigRegistration){ 0 }, sizeof(out)) == 0);
-	}
-#else
-	PG_RETURN_BOOL(false);
 #endif
 }

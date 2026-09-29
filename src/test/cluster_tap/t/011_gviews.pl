@@ -15,7 +15,7 @@
 #
 #    What this test verifies:
 #      - The global view exists and is queryable.
-#      - It returns exactly 124 rows (1 node x 124 cluster wait events).
+#      - It returns exactly 123 rows (1 node x 123 cluster wait events).
 #      - It exposes exactly 1 distinct node_id at 0.17 (placeholder).
 #      - The single node_id matches the cluster.node_id GUC.
 #      - Per-class row counts match docs/wait-events-design.md §2.1.
@@ -62,8 +62,8 @@ my $node_id = $node->safe_psql('postgres', 'SHOW cluster.node_id');
 # ----------
 is($node->safe_psql('postgres',
 		'SELECT count(*) FROM pg_stat_gcluster_wait_events'),
-	'124',
-	'pg_stat_gcluster_wait_events returns 124 rows including native configuration wait');
+	'123',
+	'pg_stat_gcluster_wait_events returns 123 rows (spec-6.13 RDMA + spec-5.22b D2-6 undo grant-plane +3 + spec-7.2 LMS data-plane +2; merge sum 118+3+2)');
 
 is($node->safe_psql(
 		'postgres',
@@ -99,7 +99,7 @@ my %expected = (
 	'Cluster: PCM' => 24,	# spec-6.2 D10: +4 Smart Fusion authority waits
 	'Cluster: BufferShip' => 5,
 	'Cluster: SCN' => 4,
-	'Cluster: Reconfig' => 9,    # PGRAC: +ReconfigSharedConfigWait
+	'Cluster: Reconfig' => 8,    # spec-5.18 D12: +ReconfigNodeRemoveCleanupWait
 	'Cluster: Recovery' => 7,    # spec-4.12 D6: +ClusterWriteFenceVerify
 	'Cluster: Sinval' => 6,
 	'Cluster: Interconnect' => 11,	# spec-6.13: +busypoll + inline send waits; spec-7.2 D6: +LmsDataRecv/Send

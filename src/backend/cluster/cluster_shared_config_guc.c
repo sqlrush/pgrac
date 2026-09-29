@@ -5,16 +5,23 @@
  */
 #include "postgres.h"
 #include <math.h>
+#include "access/commit_ts.h"
 #include "catalog/pg_authid_d.h"
 #include "common/cryptohash.h"
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_epoch.h"
+#include "cluster/cluster_qvotec.h"
+#include "cluster/cluster_cf_enqueue.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
+#include "storage/latch.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/guc_tables.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
+#include "utils/wait_event.h"
 #include "cluster_control_root_private.h"
 
 #define POLICY_COMMON 1
@@ -28,146 +35,8 @@
  * shared target/barrier can overwrite the process's actual old image. */
 static ClusterSharedConfigImage config_process_image;
 static ClusterSharedConfigProcess config_process_state;
-static ClusterSharedConfigSlot *config_process_slot;
-static int32 config_process_slot_pid;
-static uint64 config_process_registration;
 static bool reload_overlap(const void *a, size_t na, const void *b, size_t nb);
 static void startup_config_release(ResourceOwner owner, ResourceOwner saved_owner, bool success);
-StaticAssertDecl(NUM_AUXPROCTYPES <= PG_INT16_MAX, "native auxiliary registration ordinal");
-
-/* Only the real native owner writes a slot. A reader makes one bounded
- * attempt, including in the PM: no child-owned lock can strand the parent.
- * The sequence is never reset on reuse and an odd/exhausted sequence cannot
- * yield an observation. No hook, allocation, I/O or interrupt in the copy.
- * Author: SqlRush <sqlrush@gmail.com>
- */
-static bool
-config_registration_write(ClusterSharedConfigSlot *slot,
-						  const ClusterSharedConfigRegistration *value)
-{
-	uint64 sequence = pg_atomic_read_u64(&slot->sequence);
-	if ((sequence & 1) || sequence > PG_UINT64_MAX - 2) {
-		pg_atomic_write_u64(&slot->sequence, PG_UINT64_MAX);
-		return false;
-	}
-	pg_atomic_write_u64(&slot->sequence, sequence + 1);
-	pg_write_barrier();
-	slot->value = *value;
-	pg_write_barrier();
-	pg_atomic_write_u64(&slot->sequence, sequence + 2);
-	return true;
-}
-
-bool
-cluster_shared_config_registration_read(ClusterSharedConfigSlot *slot,
-										ClusterSharedConfigRegistration *out)
-{
-	ClusterSharedConfigRegistration snapshot;
-	uint64 sequence;
-	if (out == NULL)
-		return false;
-	/* A reader must never clear any part of the live registration it reads. */
-	if (reload_overlap(slot, sizeof(*slot), out, sizeof(*out)))
-		return false;
-	memset(out, 0, sizeof(*out));
-	if (slot == NULL)
-		return false;
-	sequence = pg_atomic_read_u64(&slot->sequence);
-	if (sequence & 1)
-		return false;
-	pg_read_barrier();
-	snapshot = slot->value;
-	pg_read_barrier();
-	if (pg_atomic_read_u64(&slot->sequence) != sequence)
-		return false;
-	*out = snapshot;
-	return true;
-}
-
-void
-cluster_shared_config_registration_init(ClusterSharedConfigSlot *slot)
-{
-	memset(&slot->value, 0, sizeof(slot->value));
-	pg_atomic_init_u64(&slot->sequence, 0);
-}
-
-void
-cluster_shared_config_process_new_shmem(void)
-{
-	/* The PM can recreate shmem without restarting itself. Its old mapping
-	 * need not have the same address: discard the attachment without touching
-	 * it, but retain the actual native image/outcome the PM still owns. */
-	config_process_slot = NULL;
-	config_process_slot_pid = 0;
-	config_process_registration = 0;
-}
-
-bool
-cluster_shared_config_process_attach(ClusterSharedConfigSlot *slot)
-{
-	ClusterSharedConfigRegistration value;
-	uint64 sequence;
-	if (slot == NULL || MyProcPid <= 0
-		|| (config_process_slot != NULL && config_process_slot_pid == MyProcPid))
-		return false;
-	if (!cluster_shared_config_registration_read(slot, &value) || value.pid != 0)
-		return false;
-	sequence = pg_atomic_read_u64(&slot->sequence);
-	if (sequence > PG_UINT64_MAX - 2) {
-		pg_atomic_write_u64(&slot->sequence, PG_UINT64_MAX);
-		return false;
-	}
-	memset(&value, 0, sizeof(value));
-	value.registration = sequence + 2;
-	value.pid = MyProcPid;
-	value.role = MyBackendType;
-	value.aux_type = MyAuxProcType;
-	value.observed = cluster_shared_config_process_observe(&value.process);
-	(void)cluster_shared_config_active_profile(&value.active);
-	(void)cluster_shared_config_common_profile(&value.common);
-	if (!config_registration_write(slot, &value))
-		return false;
-	config_process_slot = slot;
-	config_process_slot_pid = MyProcPid;
-	config_process_registration = value.registration;
-	return true;
-}
-
-static void
-config_process_report(void)
-{
-	ClusterSharedConfigRegistration value;
-	/* Check the local PID BEFORE dereferencing: a newly forked process (in
-	 * particular the detached logger) must not touch the parent's slot. */
-	if (config_process_slot == NULL || config_process_slot_pid != MyProcPid)
-		return;
-	if (!cluster_shared_config_registration_read(config_process_slot, &value)
-		|| value.pid != MyProcPid || value.registration != config_process_registration)
-		return;
-	value.role = MyBackendType;
-	value.aux_type = MyAuxProcType;
-	value.observed = cluster_shared_config_process_observe(&value.process);
-	(void)cluster_shared_config_active_profile(&value.active);
-	(void)cluster_shared_config_common_profile(&value.common);
-	(void)config_registration_write(config_process_slot, &value);
-}
-
-void
-cluster_shared_config_process_detach(void)
-{
-	ClusterSharedConfigRegistration value;
-	if (config_process_slot == NULL || config_process_slot_pid != MyProcPid)
-		return;
-	if (cluster_shared_config_registration_read(config_process_slot, &value)
-		&& value.pid == MyProcPid && value.registration == config_process_registration) {
-		memset(&value, 0, sizeof(value));
-		value.registration = config_process_registration;
-		(void)config_registration_write(config_process_slot, &value);
-	}
-	config_process_slot = NULL;
-	config_process_slot_pid = 0;
-	config_process_registration = 0;
-}
 
 /* Native scalar defaults are common unless explicitly classified here.
  * Strings require an explicit entry: never persist arbitrary command strings,
@@ -222,6 +91,62 @@ config_policy_flags(const char *name)
 	return POLICY_COMMON;
 }
 
+/* SQL owns only persistence. The existing background delivery owner still
+ * runs if this backend exits immediately after the root becomes durable. */
+void
+cluster_shared_config_alter_system(const char *name, const char *value)
+{
+	ClusterSharedConfigEntry change;
+	ClusterSharedConfigPublication published;
+	ClusterSharedConfigPolicyReport report;
+	ClusterControlRootResult result;
+	uint64 epoch = cluster_epoch_get_current();
+	uint64 incarnation = cluster_qvotec_get_self_incarnation();
+	char *canonical;
+	if (name == NULL)
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("shared ALTER SYSTEM RESET ALL is not supported")));
+	/* A nested caller cannot retire somebody else's CF request. In particular
+	 * do not turn this precondition into an endless LOCK_UNAVAILABLE retry. */
+	if (cluster_cf_held(ShareLock) || cluster_cf_held(ExclusiveLock))
+		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+						errmsg("shared configuration publication requires an idle CF owner"),
+						errdetail("PGRAC_REASON=CONFIG_PUBLICATION_CF_BUSY")));
+	canonical = pstrdup(name);
+	for (char *p = canonical; *p != '\0'; ++p)
+		if (*p >= 'A' && *p <= 'Z')
+			*p += 'a' - 'A';
+	change.name = canonical;
+	change.value = value == NULL ? NULL : pg_server_to_any(value, strlen(value), PG_UTF8);
+	change.node_id = (config_policy_flags(canonical) & POLICY_INSTANCE)
+						 ? cluster_node_id
+						 : CLUSTER_SHARED_CONFIG_COMMON;
+	for (;;) {
+		CHECK_FOR_INTERRUPTS();
+		if (cluster_epoch_get_current() != epoch
+			|| cluster_qvotec_get_self_incarnation() != incarnation)
+			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		else
+			result = cluster_control_root_config_change(&change, &published, &report);
+		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+			break;
+		if (result != CLUSTER_CONTROL_ROOT_CAS_CONFLICT
+			&& result != CLUSTER_CONTROL_ROOT_LOCK_UNAVAILABLE)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("shared configuration publication refused"),
+							errdetail("PGRAC_REASON=CONFIG_PUBLICATION_REFUSED result=%d target=%d",
+									  (int)result, change.node_id)));
+		/* No CF is held here. This is retry scheduling, never a success ACK
+		 * or a deadline that turns healthy contention into an SQL error. */
+		ResetLatch(MyLatch);
+		(void)WaitLatch(MyLatch, WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH, 10L,
+						PG_WAIT_EXTENSION);
+	}
+	if (change.value != value)
+		pfree((void *)change.value);
+	pfree(canonical);
+}
+
 /* This is the common protocol/recovery observation set, not the broader
  * COMMON namespace of session defaults. Unknown common cluster scalars are
  * included conservatively; unsupported/test/instance entries are not. No
@@ -266,23 +191,15 @@ config_common_use_record(const struct config_generic *record)
 		   && (record->context == PGC_POSTMASTER || record->context == PGC_SIGHUP);
 }
 
-void
-cluster_shared_config_native_value_changing(const struct config_generic *record)
+bool
+cluster_shared_config_restart_only(const struct config_generic *record)
 {
-	ClusterSharedConfigRegistration value;
-	/* A forked child must not dereference its parent's attachment. This path
-	 * is also called during abort: no allocation, crypto, hooks or wait. */
-	if (config_process_image.bytes == NULL || config_process_slot == NULL
-		|| config_process_slot_pid != MyProcPid || !config_common_active_record(record))
-		return;
-	if (!cluster_shared_config_registration_read(config_process_slot, &value)
-		|| value.pid != MyProcPid || value.registration != config_process_registration)
-		return;
-	memset(&value.active, 0, sizeof(value.active));
-	if (config_common_use_record(record))
-		memset(&value.common, 0, sizeof(value.common));
-	(void)config_registration_write(config_process_slot, &value);
+	/* Shared FILE ownership also covers the real process-local applier before
+	 * full native startup admission. Ordinary non-shared PG is unchanged. */
+	return record != NULL && (cluster_shared_config || (record->status & GUC_SHARED_FILE))
+		   && config_common_use_record(record);
 }
+
 
 static bool
 config_active_u32(pg_cryptohash_ctx *hash, uint32 value)
@@ -342,12 +259,9 @@ config_active_value(pg_cryptohash_ctx *hash, const struct config_generic *record
 }
 
 static bool
-config_active_build(ClusterSharedConfigActive *out, bool common)
+config_active_build(ClusterSharedConfigActive *out)
 {
-	static const char *const raw_domains[]
-		= { "PGRAC-common-static-v1", "PGRAC-common-dynamic-v1" };
-	static const char *const common_domains[] = { "PGRAC-use-static-v2", "PGRAC-use-dynamic-v2" };
-	const char *const *domains = common ? common_domains : raw_domains;
+	static const char *const domains[] = { "PGRAC-use-static-v2", "PGRAC-use-dynamic-v2" };
 	pg_cryptohash_ctx *hash[2] = { NULL, NULL };
 	struct config_generic **records;
 	uint32 counts[2] = { 0, 0 };
@@ -366,7 +280,7 @@ config_active_build(ClusterSharedConfigActive *out, bool common)
 	for (int i = 0; i < count; ++i) {
 		struct config_generic *record = records[i];
 		int part;
-		if (!(common ? config_common_use_record(record) : config_common_active_record(record)))
+		if (!config_common_use_record(record))
 			continue;
 		part = record->context == PGC_POSTMASTER ? 0 : 1;
 		if (strlen(record->name) > CLUSTER_SHARED_CONFIG_MAX_NAME
@@ -378,8 +292,7 @@ config_active_build(ClusterSharedConfigActive *out, bool common)
 		if (counts[i] == 0 || !config_active_u32(hash[i], counts[i])
 			|| pg_cryptohash_final(hash[i], digests[i], sizeof(digests[i])) != 0)
 			goto done;
-	out->version
-		= common ? CLUSTER_SHARED_CONFIG_COMMON_VERSION : CLUSTER_SHARED_CONFIG_ACTIVE_VERSION;
+	out->version = CLUSTER_SHARED_CONFIG_COMMON_VERSION;
 	out->static_entries = counts[0];
 	out->dynamic_entries = counts[1];
 	memcpy(out->static_sha256, digests[0], 32);
@@ -394,7 +307,7 @@ done:
 }
 
 static bool
-config_native_profile(ClusterSharedConfigActive *out, bool common)
+config_native_profile(ClusterSharedConfigActive *out)
 {
 	ClusterSharedConfigActive result = { 0 };
 	ResourceOwner saved_owner = CurrentResourceOwner, owner;
@@ -414,7 +327,7 @@ config_native_profile(ClusterSharedConfigActive *out, bool common)
 	CurrentResourceOwner = owner;
 	PG_TRY();
 	{
-		valid = config_active_build(&result, common);
+		valid = config_active_build(&result);
 	}
 	PG_CATCH();
 	{
@@ -432,16 +345,11 @@ config_native_profile(ClusterSharedConfigActive *out, bool common)
 	return valid;
 }
 
-bool
-cluster_shared_config_active_profile(ClusterSharedConfigActive *out)
-{
-	return config_native_profile(out, false);
-}
 
 bool
 cluster_shared_config_common_profile(ClusterSharedConfigActive *out)
 {
-	return config_native_profile(out, true);
+	return config_native_profile(out);
 }
 
 static void
@@ -566,6 +474,16 @@ policy_check(const ClusterSharedConfigEntry *entry, bool online_change, bool nat
 		|| ((policy & POLICY_UUID) && !policy_uuid_valid(entry->value)))
 		return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_REFERENCE);
 
+	/* PGRAC: the shared recovery profile does not implement this optional
+	 * native SIDE. Refuse persistence too, not just its later activation. */
+	if (strcmp(entry->name, "track_commit_timestamp") == 0) {
+		bool enabled;
+		if (!parse_bool(entry->value, &enabled))
+			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_VALUE);
+		if (enabled)
+			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_UNSUPPORTED);
+	}
+
 	/* Native parsing/ranges/enums/check hooks, including cross-GUC safety hooks.
 	 * changeVal=false does not assign, push a GUC stack, set pending_restart or
 	 * alter reset/source. Check hooks can inspect current process globals; this
@@ -585,7 +503,7 @@ policy_check(const ClusterSharedConfigEntry *entry, bool online_change, bool nat
 			return policy_refuse(report, entry, CLUSTER_CONFIG_POLICY_SCOPE);
 	}
 	++report->checked_entries;
-	if (record->context == PGC_POSTMASTER)
+	if (record->context == PGC_POSTMASTER || config_common_use_record(record))
 		++report->restart_entries;
 	if (policy & POLICY_COLD)
 		++report->cold_entries;
@@ -650,7 +568,7 @@ cluster_shared_config_check_gucs(const char *bytes, size_t len, const ClusterSha
 }
 
 /* Observation only: failed/pending state and an inherited PID never grant
- * admission. The caller must compare the exact required ref and registration.
+ * admission. Ordinary parameter delivery follows native SIGHUP semantics.
  * Author: SqlRush <sqlrush@gmail.com>
  */
 bool
@@ -689,10 +607,9 @@ cluster_shared_config_process_copy(ClusterSharedConfigProcess *out, ClusterShare
 }
 
 /* The parallel leader's active GUCs are not the image inherited from the PM.
- * Revoke that receipt BEFORE native reset/assign hooks can run or fail. Query
- * semantics remain native; the enrollment owner must wait for real worker
- * exit when a common-dependent change cannot tolerate this deferred state.
- * No current target is substituted and no new image/reload proof is invented.
+ * Discard the copied image BEFORE native reset/assign hooks can run or fail.
+ * Query semantics remain native; this worker does not certify application of
+ * the selected root. Static common values remain fixed until full restart.
  * Author: SqlRush <sqlrush@gmail.com>
  */
 void
@@ -707,7 +624,6 @@ cluster_shared_config_process_parallel_restore(void)
 	config_process_state.node_id = node_id;
 	config_process_state.failed = failed;
 	config_process_state.parallel_snapshot = true;
-	config_process_report();
 }
 
 ClusterControlRootResult
@@ -740,7 +656,6 @@ cluster_shared_config_process_reload(const char *bytes, size_t len,
 			return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_REFERENCE);
 		/* No hooks, source changes or false child-only deferred obligation when
 		 * this exact default was already inherited/applied in this process. */
-		config_process_report();
 		*out = config_process_state;
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
@@ -763,14 +678,12 @@ cluster_shared_config_process_reload(const char *bytes, size_t len,
 		 * this potentially partially modified process. The control owner must
 		 * retain its retirement/repair lane while dependent data is held. */
 		config_process_state.failed = true;
-		config_process_report();
 		pfree(replacement);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
 	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
 		config_process_state.failed = true;
-		config_process_report();
 		pfree(replacement);
 		return result;
 	}
@@ -781,7 +694,6 @@ cluster_shared_config_process_reload(const char *bytes, size_t len,
 	config_process_state.pending_restart_total = applied.pending_restart_total;
 	config_process_state.deferred_total = applied.deferred_total;
 	config_process_state.applier_pid = MyProcPid;
-	config_process_report();
 	*out = config_process_state;
 	return result;
 }
@@ -1113,6 +1025,7 @@ startup_config_visit(const ClusterSharedConfigEntry *entry, void *arg)
 		}
 		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 	}
+	record->status |= GUC_SHARED_FILE;
 	if (set_config_option_ext(entry->name, entry->value, PGC_POSTMASTER, PGC_S_FILE,
 							  BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, true, DEBUG1, false)
 			!= 1
@@ -1206,6 +1119,13 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 	}
 	PG_END_TRY();
 	startup_config_release(owner, saved_owner, true);
+	/* Check actual inherited/command-line values even if the selected object
+	 * omitted the parameter. Never publish a successful shared application. */
+	if (track_commit_timestamp)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("shared configuration requires track_commit_timestamp=off"),
+				 errdetail("PGRAC_FAMILY=SHARED_CONFIG PGRAC_REASON=COMMIT_TS_UNSUPPORTED")));
 	if (config_process_image.bytes != NULL)
 		pfree(config_process_image.bytes);
 	config_process_image.bytes = remembered;
@@ -1214,14 +1134,13 @@ cluster_shared_config_apply_startup(const char *bytes, size_t len,
 	config_process_state.ref = *ref;
 	config_process_state.node_id = node_id;
 	config_process_state.applier_pid = MyProcPid;
-	config_process_report();
 	out->ref = *ref;
 	out->node_id = node_id;
 	out->applied_entries = context.applied;
 }
 
-/* PGRAC: native online application only. The distributed owner must separately
- * select/revalidate the root, close admission and collect all process outcomes.
+/* PGRAC: native online application only. LMON separately selects/revalidates
+ * the root and notifies the parent; native reload has no application census.
  * Author: SqlRush <sqlrush@gmail.com>
  */
 typedef struct ConfigReloadItem {
@@ -1329,93 +1248,6 @@ reload_collect_pair(const char *old_bytes, size_t old_len, const ClusterSharedCo
 	return result;
 }
 
-ClusterControlRootResult
-cluster_shared_config_process_reload_needs_idle(const char *bytes, size_t len,
-												const ClusterSharedConfigRef *ref, bool *needs_idle,
-												ClusterSharedConfigPolicyReport *report)
-{
-	ClusterSharedConfigIdentity identity;
-	ClusterControlRootResult result;
-	ConfigReloadList old, next;
-	MemoryContext saved_context = CurrentMemoryContext, context;
-	ResourceOwner saved_owner = CurrentResourceOwner, owner;
-	bool required = false;
-	const void *inputs[] = { bytes, ref };
-	size_t sizes[] = { len, sizeof(*ref) };
-
-	if (reload_overlap(needs_idle, sizeof(*needs_idle), report, sizeof(*report)))
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	for (size_t i = 0; i < lengthof(inputs); ++i)
-		if (reload_overlap(inputs[i], sizes[i], needs_idle, sizeof(*needs_idle))
-			|| reload_overlap(inputs[i], sizes[i], report, sizeof(*report)))
-			return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	if (needs_idle != NULL)
-		*needs_idle = false;
-	if (report != NULL)
-		policy_clear(report);
-	if (needs_idle == NULL || report == NULL || ref == NULL || bytes == NULL || len == 0
-		|| len > CLUSTER_SHARED_CONFIG_MAX_BYTES || config_process_image.bytes == NULL
-		|| config_process_state.failed || config_process_state.parallel_snapshot
-		|| config_process_state.applier_pid <= 0)
-		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
-	identity = ref->identity;
-	identity.generation = config_process_state.ref.identity.generation;
-	if (memcmp(&identity, &config_process_state.ref.identity, sizeof(identity)) != 0
-		|| ref->identity.generation < identity.generation)
-		return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_REFERENCE);
-	if (ref->identity.generation == identity.generation) {
-		if (memcmp(ref, &config_process_state.ref, sizeof(*ref)) != 0
-			|| len != config_process_image.len || memcmp(bytes, config_process_image.bytes, len))
-			return policy_refuse(report, NULL, CLUSTER_CONFIG_POLICY_REFERENCE);
-		return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
-	}
-
-	context = AllocSetContextCreate(saved_context, "shared configuration idle classification",
-									ALLOCSET_DEFAULT_SIZES);
-	owner = ResourceOwnerCreate(saved_owner, "shared configuration idle classification");
-	CurrentResourceOwner = owner;
-	MemoryContextSwitchTo(context);
-	PG_TRY();
-	{
-		result
-			= reload_collect_pair(config_process_image.bytes, config_process_image.len,
-								  &config_process_state.ref, bytes, len, ref, &old, &next, report);
-		/* Only after the entire old/new pair and changed-entry policy passed.
-		 * A partial scan cannot hide a bad later entry behind an early match. */
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY) {
-			ConfigReloadList *lists[] = { &old, &next };
-			for (size_t which = 0; which < lengthof(lists); ++which) {
-				for (uint32 i = 0; i < lists[which]->count; ++i) {
-					ConfigReloadItem *item = &lists[which]->items[i];
-					struct config_generic *record;
-					if (!(which == 0 ? item->removed : item->changed)
-						|| !reload_selected(&item->entry, config_process_state.node_id))
-						continue;
-					/* The policy above already proved this exact registered name. */
-					record = find_option(item->entry.name, false, true, DEBUG1);
-					if (record != NULL && record->context != PGC_POSTMASTER
-						&& config_common_active_record(record))
-						required = true;
-				}
-			}
-		}
-	}
-	PG_CATCH();
-	{
-		MemoryContextSwitchTo(saved_context);
-		startup_config_release(owner, saved_owner, false);
-		MemoryContextDelete(context);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	MemoryContextSwitchTo(saved_context);
-	startup_config_release(owner, saved_owner, result == CLUSTER_CONTROL_ROOT_OK_PRIMARY);
-	MemoryContextDelete(context);
-	if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-		*needs_idle = required;
-	return result;
-}
-
 static ClusterControlRootResult
 reload_assign(ConfigReloadList *old, ConfigReloadList *next, int node_id,
 			  ClusterSharedConfigReload *applied, ClusterSharedConfigPolicyReport *report)
@@ -1460,7 +1292,8 @@ reload_assign(ConfigReloadList *old, ConfigReloadList *next, int node_id,
 		record->status |= GUC_SHARED_FILE;
 		result = set_config_option_ext(entry->name, entry->value, PGC_SIGHUP, PGC_S_FILE,
 									   BOOTSTRAP_SUPERUSERID, GUC_ACTION_SET, true, DEBUG1, false);
-		if (record->context == PGC_POSTMASTER && (record->status & GUC_PENDING_RESTART)) {
+		if ((record->context == PGC_POSTMASTER || cluster_shared_config_restart_only(record))
+			&& (record->status & GUC_PENDING_RESTART)) {
 			++applied->pending_restart_entries;
 			continue;
 		}

@@ -18,24 +18,14 @@
 #ifndef WIN32
 #include <sys/mman.h>
 #endif
-#include "access/xact.h"
 #include "miscadmin.h"
 #include "postmaster/interrupt.h"
 #include "portability/mem.h"
 #include "storage/ipc.h"
-#include "storage/lock.h"
-#include "storage/proc.h"
 #include "utils/memutils.h"
 #include "utils/resowner.h"
-#include "cluster/cluster_clean_leave.h"
-#include "cluster/cluster_config_channels.h"
-#include "cluster/cluster_config_use_gate.h"
-#include "cluster/cluster_cr_server.h"
-#include "cluster/cluster_gcs_block.h"
-#include "cluster/cluster_semantic_activation.h"
-#include "cluster/cluster_service_observe.h"
 #include "cluster/cluster_shared_config.h"
-#include "cluster/cluster_terminal_ref_census.h"
+#include "cluster/cluster_config_members.h"
 
 /* Not main shmem: the native logger deliberately detaches that mapping. This
  * unnamed carrier dies with the last native family process. Neither its bytes
@@ -46,19 +36,14 @@ typedef struct ConfigDeliveryFamily {
 	int32 postmaster_pid;
 	pg_atomic_uint64 generation;
 	pg_atomic_uint32 lmon_pid;
-	pg_atomic_uint32 logger_pid;
-	ClusterConfigUseGate native_use;
-	ClusterConfigUseTarget native_target;
-	ClusterConfigUseGate cleaner_producer;
-	ClusterConfigUseTarget cleaner_target;
-	pg_atomic_uint32 cleaner_failed;
-	ClusterConfigUseGate background[CLUSTER_CONFIG_BACKGROUND_COUNT];
-	ClusterConfigUseTarget background_target[CLUSTER_CONFIG_BACKGROUND_COUNT];
-	pg_atomic_uint32 background_failed[CLUSTER_CONFIG_BACKGROUND_COUNT];
 	ClusterSharedConfigDeliverySlot incoming;
 	ClusterSharedConfigDeliverySlot accepted;
-	ClusterSharedConfigSlot logger;
-	ClusterConfigChannelsBoard channels;
+	/* Written once before the first fork; no child application registrations. */
+	ClusterSharedConfigIdentity startup_identity;
+	uint32 startup_node_id;
+	ClusterSharedConfigActive startup_common;
+	pg_atomic_uint64 mount_sequence;
+	ClusterConfigMountProof mount;
 } ConfigDeliveryFamily;
 
 static ConfigDeliveryFamily *delivery_family;
@@ -66,11 +51,6 @@ static uint64 delivery_generation;
 /* Scheduling only, never a retained target. Native fork starts from a parent
  * which owns no transaction and therefore never sets this indication. */
 static bool delivery_waiting_for_idle;
-/* A utility or maintenance command may own work across native transactions.
- * This local nesting count is not a target, node ACK or DATA permission. */
-static uint32 delivery_work_depth;
-static bool delivery_cleaner_owned;
-static ClusterConfigBackgroundKind delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
 
 static void
 delivery_release_owner(ResourceOwner owner, ResourceOwner saved, bool success)
@@ -98,300 +78,6 @@ delivery_is_family(void)
 		   && delivery_family->postmaster_pid == PostmasterPid;
 }
 
-ClusterConfigUseGate *
-cluster_shared_config_delivery_native_gate(void)
-{
-	if (!delivery_is_family()
-		|| pg_atomic_read_u64(&delivery_family->generation) != delivery_generation)
-		return NULL;
-	return &delivery_family->native_use;
-}
-
-ClusterConfigUseTarget *
-cluster_shared_config_delivery_native_target(void)
-{
-	return cluster_shared_config_delivery_native_gate() != NULL ? &delivery_family->native_target
-																: NULL;
-}
-
-ClusterConfigChannelsBoard *
-cluster_shared_config_delivery_channels(int32 *lmon_pid)
-{
-	if (lmon_pid == NULL)
-		return NULL;
-	*lmon_pid = 0;
-	if (cluster_shared_config_delivery_native_gate() == NULL)
-		return NULL;
-	*lmon_pid = (int32)pg_atomic_read_u32(&delivery_family->lmon_pid);
-	return &delivery_family->channels;
-}
-
-ClusterConfigUseGate *
-cluster_shared_config_delivery_cleaner_gate(bool *failed)
-{
-	if (failed == NULL)
-		return NULL;
-	*failed = true;
-	if (cluster_shared_config_delivery_native_gate() == NULL)
-		return NULL;
-	*failed = pg_atomic_read_u32(&delivery_family->cleaner_failed) != 0;
-	return &delivery_family->cleaner_producer;
-}
-
-ClusterConfigUseTarget *
-cluster_shared_config_delivery_cleaner_target(void)
-{
-	return cluster_shared_config_delivery_native_gate() != NULL ? &delivery_family->cleaner_target
-																: NULL;
-}
-
-bool
-cluster_shared_config_cleaner_begin(void)
-{
-	ClusterConfigUseGate *gate;
-	ClusterConfigUseTarget *target;
-	ClusterSharedConfigRegistration actual;
-	uint64 sequence;
-	uint32 epoch;
-	bool failed;
-	if (delivery_cleaner_owned)
-		return false;
-	if (delivery_family == NULL)
-		return true; /* Original non-shared path has no managed owner. */
-	if (!IsUnderPostmaster || MyProc == NULL || MyBackendType != B_UNDO_CLEANER
-		|| ClusterUndoCleanerWorkerIdForType(MyAuxProcType) != 0
-		|| (gate = cluster_shared_config_delivery_cleaner_gate(&failed)) == NULL || failed
-		|| !cluster_config_use_gate_enter(gate, false, &epoch))
-		return false;
-	target = &delivery_family->cleaner_target;
-	sequence = pg_atomic_read_u64(&MyProc->cluster_config.sequence);
-	if (target->epoch == 0
-		|| (cluster_shared_config_registration_read(&MyProc->cluster_config, &actual)
-			&& actual.pid == MyProcPid && actual.role == B_UNDO_CLEANER
-			&& actual.aux_type == UndoCleanerProcess
-			&& sequence == pg_atomic_read_u64(&MyProc->cluster_config.sequence)
-			&& cluster_config_use_target_matches(target, epoch, &actual))) {
-		delivery_cleaner_owned = true;
-		return true;
-	}
-	/* Only this provisional reservation is retired; original async terminal
-	 * work is neither skipped nor certified by a common-target mismatch. */
-	if (!cluster_config_use_gate_leave(gate))
-		elog(PANIC, "configuration cleaner provisional count is inconsistent");
-	ConfigReloadPending = true;
-	delivery_waiting_for_idle = true;
-	return false;
-}
-
-void
-cluster_shared_config_cleaner_end(bool completed)
-{
-	ClusterConfigUseGate *gate;
-	bool failed;
-	if (!delivery_cleaner_owned)
-		return;
-	gate = cluster_shared_config_delivery_cleaner_gate(&failed);
-	if (gate == NULL)
-		elog(PANIC, "configuration cleaner producer lost its native family");
-	if (!completed || failed) {
-		/* Original cleanup may still own guards/admission after ERROR. Neither
-		 * a replacement worker nor a second end(true) certifies retirement.
-		 * Actual all-old-child family reset is the sole recovery boundary. */
-		pg_atomic_write_u32(&delivery_family->cleaner_failed, 1);
-		return;
-	}
-	if (!cluster_config_use_gate_leave(gate))
-		elog(PANIC, "configuration cleaner producer count is inconsistent");
-	delivery_cleaner_owned = false;
-}
-
-ClusterConfigUseGate *
-cluster_shared_config_delivery_background_gate(ClusterConfigBackgroundKind kind, bool *failed)
-{
-	if (failed == NULL)
-		return NULL;
-	*failed = true;
-	if (kind < 0 || kind >= CLUSTER_CONFIG_BACKGROUND_COUNT
-		|| cluster_shared_config_delivery_native_gate() == NULL)
-		return NULL;
-	*failed = pg_atomic_read_u32(&delivery_family->background_failed[kind]) != 0;
-	return &delivery_family->background[kind];
-}
-
-ClusterConfigUseTarget *
-cluster_shared_config_delivery_background_target(ClusterConfigBackgroundKind kind)
-{
-	bool failed;
-	return cluster_shared_config_delivery_background_gate(kind, &failed) != NULL
-			   ? &delivery_family->background_target[kind]
-			   : NULL;
-}
-
-static ClusterConfigBackgroundKind
-delivery_background_kind(void)
-{
-	if (IsUnderPostmaster && MyProc != NULL) {
-		if (MyBackendType == B_CHECKPOINTER && MyAuxProcType == CheckpointerProcess)
-			return CLUSTER_CONFIG_BACKGROUND_CHECKPOINTER;
-		if (MyBackendType == B_BG_WRITER && MyAuxProcType == BgWriterProcess)
-			return CLUSTER_CONFIG_BACKGROUND_BGWRITER;
-		if (MyBackendType == B_WAL_WRITER && MyAuxProcType == WalWriterProcess)
-			return CLUSTER_CONFIG_BACKGROUND_WALWRITER;
-	}
-	return CLUSTER_CONFIG_BACKGROUND_COUNT;
-}
-
-static bool
-delivery_background_role_valid(ClusterConfigBackgroundKind kind)
-{
-	if (!IsUnderPostmaster || MyProc == NULL)
-		return false;
-	if (kind >= 0 && kind < CLUSTER_CONFIG_BACKGROUND_NATIVE_COUNT)
-		return delivery_background_kind() == kind;
-	if (kind == CLUSTER_CONFIG_BACKGROUND_HORIZON || kind == CLUSTER_CONFIG_BACKGROUND_DURABILITY)
-		return MyBackendType == B_LMON && AmLmonProcess();
-	return kind == CLUSTER_CONFIG_BACKGROUND_DEADLOCK_PROBE && MyBackendType == B_LMD
-		   && AmLmdProcess();
-}
-
-static bool
-delivery_background_enter(ClusterConfigBackgroundKind kind)
-{
-	ClusterConfigUseGate *gate;
-	ClusterConfigUseTarget *target;
-	ClusterSharedConfigRegistration actual;
-	uint64 sequence;
-	uint32 epoch;
-	bool failed;
-	if (delivery_background_owned != CLUSTER_CONFIG_BACKGROUND_COUNT)
-		return false;
-	if (delivery_family == NULL)
-		return true; /* Original non-shared loop is unmanaged. */
-	if (!delivery_background_role_valid(kind))
-		return false;
-	gate = cluster_shared_config_delivery_background_gate(kind, &failed);
-	if (gate == NULL || failed || !cluster_config_use_gate_enter(gate, false, &epoch))
-		return false;
-	/* Counted reservation keeps the target immutable, including concurrent
-	 * CLOSE. This provisional owner has not started a native pass yet. */
-	delivery_background_owned = kind;
-	target = &delivery_family->background_target[kind];
-	if (target->epoch == 0)
-		return true; /* Guarded integration only, never global application proof. */
-	sequence = pg_atomic_read_u64(&MyProc->cluster_config.sequence);
-	if (cluster_shared_config_registration_read(&MyProc->cluster_config, &actual)
-		&& actual.pid == MyProcPid && actual.role == (int32)MyBackendType
-		&& sequence == pg_atomic_read_u64(&MyProc->cluster_config.sequence)
-		&& cluster_config_use_target_matches(target, epoch, &actual))
-		return true;
-	cluster_shared_config_background_end(true);
-	/* Let the next original signal/idle path apply the accepted image. No
-	 * assignment, lock wait or target change inside the reservation boundary. */
-	ConfigReloadPending = true;
-	delivery_waiting_for_idle = true;
-	return false;
-}
-
-bool
-cluster_shared_config_background_begin(void)
-{
-	return delivery_background_enter(delivery_background_kind());
-}
-
-bool
-cluster_shared_config_service_producer_begin(ClusterConfigBackgroundKind kind)
-{
-	if (kind < CLUSTER_CONFIG_BACKGROUND_HORIZON || kind >= CLUSTER_CONFIG_BACKGROUND_COUNT)
-		return false;
-	return delivery_background_enter(kind);
-}
-
-void
-cluster_shared_config_background_end(bool completed)
-{
-	ClusterConfigUseGate *gate;
-	bool failed;
-	if (delivery_background_owned == CLUSTER_CONFIG_BACKGROUND_COUNT)
-		return;
-	gate = cluster_shared_config_delivery_background_gate(delivery_background_owned, &failed);
-	if (gate == NULL || !delivery_background_role_valid(delivery_background_owned))
-		elog(PANIC, "configuration background producer lost its native owner");
-	if (!completed || failed) {
-		/* ERROR does not certify asynchronous CF/WALR or IO retirement. Keep
-		 * the original count through later passes and auxiliary replacement. */
-		pg_atomic_write_u32(&delivery_family->background_failed[delivery_background_owned], 1);
-		return;
-	}
-	if (!cluster_config_use_gate_leave(gate))
-		elog(PANIC, "configuration background producer count is inconsistent");
-	delivery_background_owned = CLUSTER_CONFIG_BACKGROUND_COUNT;
-}
-
-bool
-cluster_shared_config_delivery_work_pending(void)
-{
-	return delivery_work_depth != 0;
-}
-
-bool
-cluster_shared_config_delivery_work_enter(void)
-{
-	if (!IsUnderPostmaster || !delivery_is_family())
-		return false;
-	if (delivery_work_depth == PG_UINT32_MAX)
-		ereport(ERROR, (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-						errmsg("configuration work nesting limit exceeded")));
-	cluster_shared_config_use_enter();
-	++delivery_work_depth;
-	return true;
-}
-
-void
-cluster_shared_config_delivery_work_leave(bool entered)
-{
-	if (entered) {
-		Assert(delivery_work_depth > 0);
-		--delivery_work_depth;
-	}
-	/* PG_FINALLY can run during ERROR cleanup. Do not assign, allocate, wait,
-	 * or invoke hooks here. The next actual idle boundary owns the retry. */
-}
-
-/* Returning to a service loop is not completion of its asynchronous work.
- * Observe the original owners, without sealing, parking or cancelling them.
- * This is only a local deferral condition, not a cluster drain certificate:
- * shared producers and transport obligations require their separate cut.
- * Author: SqlRush <sqlrush@gmail.com>
- */
-static bool
-delivery_has_owned_work(void)
-{
-	int slot;
-	const char *reason;
-	ClusterServiceObservation service;
-
-	if (delivery_work_depth != 0 || delivery_cleaner_owned
-		|| delivery_background_owned != CLUSTER_CONFIG_BACKGROUND_COUNT || IsTransactionState()
-		|| IsTransactionOrTransactionBlock() || cluster_shared_config_use_session_owned()
-		|| cluster_semantic_activation_backend_has_admission())
-		return true;
-	if ((AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess())
-		&& cluster_gcs_block_normal_stop_local_poll(&slot, &reason) != CLUSTER_NORMAL_STOP_READY)
-		return true;
-	if (AmLmsProcess() && !cluster_cr_server_r4_worker0_drained())
-		return true;
-	if (AmUndoCleanerProcess() && !cluster_ctrc_cleaner_local_idle())
-		return true;
-	/* Private contexts being empty does not retire already accepted shared
-	 * queues or original control owners. This is a local deferral condition;
-	 * an online all-member cut still has to hold producers and drain channels. */
-	if ((AmLmonProcess() || AmLmsProcess() || AmLmsWorkerProcess() || AmLmdProcess()
-		 || AmSinvalBcastProcess())
-		&& cluster_service_observe(&service) != CLUSTER_NORMAL_STOP_READY)
-		return true;
-	return false;
-}
-
 /* Main-shmem children cannot cross its native reset. The detached logger is
  * the exception: its actual lifetime spans that reset, but never proves DATA
  * convergence. A generation change during a copy is a refused observation.
@@ -408,6 +94,7 @@ delivery_current(uint64 *generation)
 void
 cluster_shared_config_delivery_start(void)
 {
+	ClusterSharedConfigProcess startup;
 	if (!delivery_is_parent())
 		ereport(FATAL, (errmsg("configuration delivery requires the native postmaster")));
 	if (delivery_family != NULL)
@@ -421,26 +108,19 @@ cluster_shared_config_delivery_start(void)
 		delivery_family = NULL;
 		ereport(FATAL, (errmsg("could not map native configuration delivery: %m")));
 	}
+	if (!cluster_shared_config_process_observe(&startup) || startup.ref.identity.generation == 0
+		|| startup.failed || startup.parallel_snapshot
+		|| !cluster_shared_config_common_profile(&delivery_family->startup_common))
+		ereport(FATAL, (errmsg("configuration delivery lacks actual startup values")));
+	delivery_family->startup_identity = startup.ref.identity;
+	delivery_family->startup_node_id = startup.node_id;
 	delivery_family->postmaster_pid = MyProcPid;
 	delivery_generation = 1;
 	pg_atomic_init_u64(&delivery_family->generation, delivery_generation);
 	pg_atomic_init_u32(&delivery_family->lmon_pid, 0);
-	pg_atomic_init_u32(&delivery_family->logger_pid, 0);
-	cluster_config_channels_init(&delivery_family->channels);
-	cluster_config_use_gate_init(&delivery_family->native_use);
-	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
-	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
-	memset(&delivery_family->cleaner_target, 0, sizeof(delivery_family->cleaner_target));
-	pg_atomic_init_u32(&delivery_family->cleaner_failed, 0);
-	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
-		cluster_config_use_gate_init(&delivery_family->background[i]);
-		memset(&delivery_family->background_target[i], 0,
-			   sizeof(delivery_family->background_target[i]));
-		pg_atomic_init_u32(&delivery_family->background_failed[i], 0);
-	}
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	cluster_shared_config_delivery_slot_init(&delivery_family->accepted);
-	cluster_shared_config_registration_init(&delivery_family->logger);
+	pg_atomic_init_u64(&delivery_family->mount_sequence, 0);
 	if (!cluster_shared_config_delivery_parent_publish())
 		ereport(FATAL, (errmsg("configuration delivery lacks native startup defaults")));
 #endif
@@ -462,18 +142,8 @@ cluster_shared_config_delivery_new_shmem(void)
 	 * parent's accepted sequence, which the detached logger can still read. */
 	cluster_shared_config_delivery_slot_init(&delivery_family->incoming);
 	pg_atomic_write_u32(&delivery_family->lmon_pid, 0);
-	cluster_config_use_gate_init(&delivery_family->native_use);
-	cluster_config_channels_init(&delivery_family->channels);
-	memset(&delivery_family->native_target, 0, sizeof(delivery_family->native_target));
-	cluster_config_use_gate_init(&delivery_family->cleaner_producer);
-	memset(&delivery_family->cleaner_target, 0, sizeof(delivery_family->cleaner_target));
-	pg_atomic_write_u32(&delivery_family->cleaner_failed, 0);
-	for (int i = 0; i < CLUSTER_CONFIG_BACKGROUND_COUNT; i++) {
-		cluster_config_use_gate_init(&delivery_family->background[i]);
-		memset(&delivery_family->background_target[i], 0,
-			   sizeof(delivery_family->background_target[i]));
-		pg_atomic_write_u32(&delivery_family->background_failed[i], 0);
-	}
+	pg_atomic_init_u64(&delivery_family->mount_sequence, 0);
+	memset(&delivery_family->mount, 0, sizeof(delivery_family->mount));
 	delivery_generation = generation + 1;
 	pg_atomic_write_u64(&delivery_family->generation, delivery_generation);
 	if (!cluster_shared_config_delivery_parent_publish())
@@ -502,98 +172,96 @@ cluster_shared_config_delivery_lmon_reaped(int32 pid)
 		ereport(FATAL, (errmsg("invalid configuration LMON reap registration")));
 	/* Actual waitpid, not mere SIGTERM or age, permits writer replacement. */
 	pg_atomic_write_u32(&delivery_family->lmon_pid, 0);
+	{
+		uint64 sequence = pg_atomic_read_u64(&delivery_family->mount_sequence);
+		pg_atomic_write_u64(&delivery_family->mount_sequence, sequence | UINT64CONST(1));
+		pg_write_barrier();
+		memset(&delivery_family->mount, 0, sizeof(delivery_family->mount));
+		pg_write_barrier();
+		pg_atomic_write_u64(&delivery_family->mount_sequence,
+							sequence > PG_UINT64_MAX - 2 ? PG_UINT64_MAX
+														 : (sequence | UINT64CONST(1)) + 1);
+	}
 	if (!cluster_shared_config_delivery_slot_retire(&delivery_family->incoming, pid))
 		ereport(LOG, (errmsg("configuration incoming lifetime could not be retired")));
 }
 
+/* Single original LMON writer; readers never wait on it. A reaped LMON or
+ * main-shmem replacement cannot lend its receipt to a replacement process. */
 void
-cluster_shared_config_delivery_logger_started(int32 pid)
+cluster_shared_config_mount_publish(const ClusterConfigMountProof *proof)
 {
-	if (delivery_family == NULL)
+	uint64 generation, sequence;
+	if (proof == NULL || MyBackendType != B_LMON || !delivery_current(&generation)
+		|| pg_atomic_read_u32(&delivery_family->lmon_pid) != (uint32)MyProcPid)
 		return;
-	if (!delivery_is_parent() || !delivery_is_family() || pid <= 0
-		|| pg_atomic_read_u32(&delivery_family->logger_pid) != 0)
-		ereport(FATAL, (errmsg("invalid configuration logger fork registration")));
-	/* The child may attach before this store. Observers require both sides. */
-	pg_atomic_write_u32(&delivery_family->logger_pid, (uint32)pid);
-}
-
-void
-cluster_shared_config_delivery_logger_reaped(int32 pid)
-{
-	ClusterSharedConfigSlot *slot;
-	uint64 sequence;
-	if (delivery_family == NULL)
-		return;
-	if (!delivery_is_parent() || !delivery_is_family() || pid <= 0
-		|| pg_atomic_read_u32(&delivery_family->logger_pid) != (uint32)pid)
-		ereport(FATAL, (errmsg("invalid configuration logger reap registration")));
-	/* Actual waitpid has proven this writer dead. This alone permits retiring
-	 * even an interrupted odd copy; age or main-shmem reset never does. Keep
-	 * sequence monotonic so PID reuse cannot recycle an old registration. */
-	pg_atomic_write_u32(&delivery_family->logger_pid, 0);
-	slot = &delivery_family->logger;
-	sequence = pg_atomic_read_u64(&slot->sequence);
-	if (sequence > PG_UINT64_MAX - 2) {
-		pg_atomic_write_u64(&slot->sequence, PG_UINT64_MAX);
+	sequence = pg_atomic_read_u64(&delivery_family->mount_sequence);
+	if ((sequence & 1) || sequence > PG_UINT64_MAX - 2) {
+		pg_atomic_write_u64(&delivery_family->mount_sequence, PG_UINT64_MAX);
 		return;
 	}
-	pg_atomic_write_u64(&slot->sequence, sequence | UINT64CONST(1));
+	pg_atomic_write_u64(&delivery_family->mount_sequence, sequence + 1);
 	pg_write_barrier();
-	memset(&slot->value, 0, sizeof(slot->value));
+	delivery_family->mount = *proof;
 	pg_write_barrier();
-	pg_atomic_write_u64(&slot->sequence, (sequence | UINT64CONST(1)) + 1);
-}
-
-static void
-delivery_logger_exit(int code, Datum arg)
-{
-	(void)code;
-	(void)arg;
-	cluster_shared_config_process_detach();
-}
-
-void
-cluster_shared_config_delivery_logger_attach(void)
-{
-	if (delivery_family == NULL)
-		return;
-	if (!delivery_is_family() || !IsUnderPostmaster || MyBackendType != B_LOGGER
-		|| !cluster_shared_config_process_attach(&delivery_family->logger))
-		ereport(FATAL, (errmsg("could not enroll native configuration logger")));
-	on_proc_exit(delivery_logger_exit, (Datum)0);
+	pg_atomic_write_u64(&delivery_family->mount_sequence, sequence + 2);
 }
 
 bool
-cluster_shared_config_delivery_logger_observe(ClusterSharedConfigRegistration *out)
+cluster_shared_config_mount_observe(ClusterConfigMountProof *proof)
 {
-	uint64 sequence;
-	return cluster_shared_config_delivery_logger_snapshot(out, &sequence);
-}
-
-bool
-cluster_shared_config_delivery_logger_snapshot(ClusterSharedConfigRegistration *out,
-											   uint64 *sequence)
-{
-	ClusterSharedConfigRegistration value;
+	uint64 generation, after, sequence;
 	uint32 pid;
-	uint64 before;
-	if (out == NULL || sequence == NULL)
+	if (proof == NULL)
+		return false;
+	memset(proof, 0, sizeof(*proof));
+	if (!delivery_current(&generation) || MyBackendType == B_LOGGER)
+		return false;
+	pid = pg_atomic_read_u32(&delivery_family->lmon_pid);
+	sequence = pg_atomic_read_u64(&delivery_family->mount_sequence);
+	if (pid == 0 || sequence == 0 || (sequence & 1))
+		return false;
+	pg_read_barrier();
+	*proof = delivery_family->mount;
+	pg_read_barrier();
+	if (!delivery_current(&after) || after != generation
+		|| pg_atomic_read_u32(&delivery_family->lmon_pid) != pid
+		|| pg_atomic_read_u64(&delivery_family->mount_sequence) != sequence) {
+		memset(proof, 0, sizeof(*proof));
+		return false;
+	}
+	return proof->result == CLUSTER_CONFIG_MOUNT_MATCH
+		   || proof->result == CLUSTER_CONFIG_MOUNT_MISMATCH;
+}
+
+/* Static common values are captured after native startup application, before
+ * any child fork. Reload never changes them. The carrier outlives main shmem,
+ * but a stale main-shmem child must not read across that lifetime boundary.
+ * A pending ordinary image is not a missing mount proof or application ACK. */
+bool
+cluster_shared_config_parent_profile(const ClusterSharedConfigRef *selected, int node_id,
+									 ClusterSharedConfigActive *out)
+{
+	const ClusterSharedConfigIdentity *actual;
+	uint64 generation;
+	uintptr_t a = (uintptr_t)selected, b = (uintptr_t)out;
+	if (out == NULL
+		|| (selected != NULL && (a <= b ? b - a < sizeof(*selected) : a - b < sizeof(*out))))
 		return false;
 	memset(out, 0, sizeof(*out));
-	*sequence = 0;
-	if (!delivery_is_family())
+	if (selected == NULL || !delivery_current(&generation) || node_id < 0 || node_id >= 128
+		|| delivery_family->startup_node_id != (uint32)node_id || selected->identity.generation == 0
+		|| !(selected->identity.configured[node_id / 64] & (UINT64CONST(1) << (node_id % 64)))
+		|| delivery_family->startup_common.version != CLUSTER_SHARED_CONFIG_COMMON_VERSION)
 		return false;
-	pid = pg_atomic_read_u32(&delivery_family->logger_pid);
-	before = pg_atomic_read_u64(&delivery_family->logger.sequence);
-	if (pid == 0 || (before & 1)
-		|| !cluster_shared_config_registration_read(&delivery_family->logger, &value)
-		|| value.pid != (int32)pid || value.role != B_LOGGER || !value.observed
-		|| pg_atomic_read_u64(&delivery_family->logger.sequence) != before
-		|| pg_atomic_read_u32(&delivery_family->logger_pid) != pid)
+	actual = &delivery_family->startup_identity;
+	if (actual->system_identifier == 0 || actual->database_incarnation == 0
+		|| actual->system_identifier != selected->identity.system_identifier
+		|| actual->database_incarnation != selected->identity.database_incarnation
+		|| memcmp(actual->storage_uuid, selected->identity.storage_uuid, 16) != 0
+		|| memcmp(actual->authority_uuid, selected->identity.authority_uuid, 16) != 0)
 		return false;
-	*out = value;
-	*sequence = before;
+	*out = delivery_family->startup_common;
 	return true;
 }
 
@@ -692,27 +360,9 @@ cluster_shared_config_delivery_reload(void)
 	{
 		if (cluster_shared_config_delivery_slot_read(slot, generation, &ref, &image)
 			&& pg_atomic_read_u64(&delivery_family->generation) == generation) {
-			bool can_apply = true;
-			if (IsUnderPostmaster && delivery_has_owned_work()) {
-				bool needs_idle;
-				can_apply = cluster_shared_config_process_reload_needs_idle(
-								image.bytes, image.len, &ref, &needs_idle, &report)
-							== CLUSTER_CONTROL_ROOT_OK_PRIMARY;
-				if (can_apply && needs_idle) {
-					/* No waiting inside this callback, and no half application.
-					 * COMMIT/ROLLBACK must run with their old native values. The
-					 * next normal command/service loop retries the then-current
-					 * accepted image, not a pointer to this delayed generation.
-					 * Do not signal a latch here and spin an active transaction. */
-					ConfigReloadPending = true;
-					delivery_waiting_for_idle = true;
-					can_apply = false;
-				}
-			}
-			if (can_apply)
-				result = cluster_shared_config_process_reload(image.bytes, image.len, &ref,
-															  &process, &report)
-						 == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+			result = cluster_shared_config_process_reload(image.bytes, image.len, &ref, &process,
+														  &report)
+					 == CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 			if (result && delivery_is_parent())
 				result = cluster_shared_config_delivery_parent_publish();
 		}
@@ -732,8 +382,9 @@ cluster_shared_config_delivery_reload(void)
 	MemoryContextSwitchTo(caller);
 	delivery_release_owner(owner, saved, result);
 	MemoryContextDelete(context);
-	if (result)
-		delivery_waiting_for_idle = false;
+	/* An unavailable/changed slot is retried at the native idle boundary.
+	 * Common protocol values themselves never change during this process. */
+	delivery_waiting_for_idle = !result;
 	return result;
 }
 
@@ -746,7 +397,7 @@ cluster_shared_config_delivery_reload(void)
 bool
 cluster_shared_config_delivery_retry_idle(void)
 {
-	if (!delivery_waiting_for_idle || !IsUnderPostmaster || delivery_has_owned_work())
+	if (!delivery_waiting_for_idle || !IsUnderPostmaster)
 		return false;
 	/* Prevent recursive native hooks from entering this retry again. */
 	delivery_waiting_for_idle = false;

@@ -57,6 +57,7 @@
 #include "utils/timestamp.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_shared_config.h"
+#include "cluster/cluster_guc.h"
 #endif
 
 
@@ -319,7 +320,7 @@ ClusterResetConfigFileSetting(const char *name)
 
 	if (gconf == NULL)
 		return GUC_FILE_RESET_FAILED;
-	if (gconf->context < PGC_SIGHUP)
+	if (gconf->context < PGC_SIGHUP || cluster_shared_config_restart_only(gconf))
 	{
 		gconf->status |= GUC_PENDING_RESTART;
 		return GUC_FILE_RESET_PENDING_RESTART;
@@ -1691,12 +1692,6 @@ InitializeGUCOptionsFromEnvironment(void)
 static void
 InitializeOneGUCOption(struct config_generic *gconf)
 {
-#ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: late native registry insertion/restoration changes the complete
-	 * common profile too. Revoke before default hooks, without allocating.
-	 * Author: SqlRush <sqlrush@gmail.com> */
-	cluster_shared_config_native_value_changing(gconf);
-#endif
 	gconf->status = 0;
 	gconf->source = PGC_S_DEFAULT;
 	gconf->reset_source = PGC_S_DEFAULT;
@@ -2079,12 +2074,6 @@ ResetAllOptions(void)
 		/* Save old value to support transaction abort */
 		push_old_value(gconf, GUC_ACTION_SET);
 
-#ifdef USE_PGRAC_CLUSTER
-		/* PGRAC: revoke covered value observation before hooks/restoration.
-		 * No hash, allocation, wait or change to native SET semantics here.
-		 * Author: SqlRush <sqlrush@gmail.com> */
-		cluster_shared_config_native_value_changing(gconf);
-#endif
 		switch (gconf->vartype)
 		{
 			case PGC_BOOL:
@@ -2447,12 +2436,6 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 					newsrole = stack->srole;
 				}
 
-#ifdef USE_PGRAC_CLUSTER
-				/* PGRAC: abort/function/LOCAL restoration is also a native
-				 * value mutation, before any potentially fallible assign hook.
-				 * Author: SqlRush <sqlrush@gmail.com> */
-				cluster_shared_config_native_value_changing(gconf);
-#endif
 				switch (gconf->vartype)
 				{
 					case PGC_BOOL:
@@ -3483,7 +3466,15 @@ set_config_option_ext(const char *name, const char *value,
 	 * Check if the option can be set at this time. See guc.h for the precise
 	 * rules.
 	 */
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: common protocol values are persistent-only until cold restart.
+	 * Reuse native canonical comparison/pending bits without changing the
+	 * registry context used by the configuration profile ABI.
+	 * Author: SqlRush <sqlrush@gmail.com> */
+	switch (cluster_shared_config_restart_only(record) ? PGC_POSTMASTER : record->context)
+#else
 	switch (record->context)
+#endif
 	{
 		case PGC_INTERNAL:
 			if (context != PGC_INTERNAL)
@@ -3715,13 +3706,6 @@ set_config_option_ext(const char *name, const char *value,
 	/*
 	 * Evaluate value and set variable.
 	 */
-#ifdef USE_PGRAC_CLUSTER
-	/* PGRAC: check-only and pending static values do not change current
-	 * values. A real assignment must invalidate before its native hook.
-	 * Author: SqlRush <sqlrush@gmail.com> */
-	if (changeVal && !prohibitValueChange)
-		cluster_shared_config_native_value_changing(record);
-#endif
 	switch (record->vartype)
 	{
 		case PGC_BOOL:
@@ -4724,6 +4708,21 @@ AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt)
 						 errmsg("parameter value for ALTER SYSTEM must not contain a newline")));
 		}
 	}
+
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: retain native privilege/value/audit checks, but never publish a
+	 * second local authority when this database uses root-selected defaults.
+	 * Author: SqlRush <sqlrush@gmail.com>
+	 */
+	if (cluster_shared_config)
+	{
+		InvokeObjectPostAlterHookArgStr(ParameterAclRelationId, name,
+										ACL_ALTER_SYSTEM,
+										altersysstmt->setstmt->kind, false);
+		cluster_shared_config_alter_system(resetall ? NULL : name, value);
+		return;
+	}
+#endif
 
 	/*
 	 * PG_AUTOCONF_FILENAME and its corresponding temporary file are always in

@@ -58,32 +58,8 @@ static ClusterCtrcCapacityProbeResult test_proof;
 static TransactionId test_xid = 100;
 static bool test_maintenance_cut, test_ctrc_progress;
 static unsigned test_ctrc_passes, test_gc_passes, test_modifier_entries, test_modifier_leaves;
-static bool test_config_cut, test_gc_error;
-static unsigned test_config_entries, test_config_finishes, test_config_failures;
 bool cluster_undo_record_segment_commit_on_rollover;
 int cluster_undo_cleaner_batch_segments = 8;
-
-/* This fixture supplies only the local configuration producer admission.
- * The real family gate is tested with its production atomics separately.
- * The included original outer pass must keep receipt completion runnable. */
-bool
-cluster_shared_config_cleaner_begin(void)
-{
-	if (test_config_cut)
-		return false;
-	++test_config_entries;
-	return true;
-}
-
-void
-cluster_shared_config_cleaner_end(bool completed)
-{
-	if (completed) {
-		UT_ASSERT_EQ(test_modifier_entries, test_modifier_leaves);
-		++test_config_finishes;
-	} else
-		++test_config_failures;
-}
 
 /* The normal-stop state observer is a boundary input here. Its real shared
  * state/identity tests live in test_cluster_normal_stop. The complete actual
@@ -138,8 +114,6 @@ cluster_tt_slot_gc_current_pass(SCN horizon, uint64 epoch, ClusterUndoCleanerPas
 	if (horizon != 1000 || epoch != 13 || stats == NULL || test_lock_depth != 0)
 		abort();
 	test_gc_passes++;
-	if (test_gc_error)
-		siglongjmp(*PG_exception_stack, 1);
 	/* A finite existing GC refusal exercises the real pass's token release. */
 	return false;
 }
@@ -674,72 +648,16 @@ UT_TEST(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance)
 	}
 }
 
-UT_TEST(test_config_cut_preserves_terminal_supply_and_original_shutdown_cut)
-{
-	for (int worker = 0; worker < 8; ++worker) {
-		for (int progress = 0; progress < 2; ++progress) {
-			bool remaining = false;
-			reset_wait_fixture();
-			undo_cleaner_worker = worker;
-			test_maintenance_cut = false;
-			test_config_cut = true;
-			test_ctrc_progress = progress != 0;
-			test_ctrc_passes = test_gc_passes = test_modifier_entries = test_modifier_leaves = 0;
-			test_config_entries = test_config_finishes = test_config_failures = 0;
-			(void)undo_cleaner_run_pass(&remaining);
-			UT_ASSERT_EQ(test_ctrc_passes, 1);
-			UT_ASSERT_EQ(remaining, progress != 0);
-			UT_ASSERT_EQ(test_gc_passes, 0);
-			UT_ASSERT_EQ(test_modifier_entries, 0);
-			UT_ASSERT_EQ(test_config_entries + test_config_finishes + test_config_failures, 0);
-		}
-	}
-	test_config_cut = false;
-}
-
-UT_TEST(test_config_producer_retires_after_original_modifier_not_error)
-{
-	for (int failure = 0; failure < 2; ++failure) {
-		bool remaining = false;
-		volatile bool caught = false;
-		reset_wait_fixture();
-		undo_cleaner_worker = 0;
-		test_maintenance_cut = test_config_cut = false;
-		test_ctrc_progress = false;
-		test_gc_error = failure != 0;
-		test_modifier_entries = test_modifier_leaves = 0;
-		test_config_entries = test_config_finishes = test_config_failures = 0;
-		PG_TRY();
-		{
-			(void)undo_cleaner_run_pass(&remaining);
-		}
-		PG_CATCH();
-		{
-			caught = true;
-		}
-		PG_END_TRY();
-		UT_ASSERT_EQ(caught, failure != 0);
-		UT_ASSERT_EQ(test_config_entries, 1);
-		UT_ASSERT_EQ(test_modifier_entries, 1);
-		UT_ASSERT_EQ(test_config_finishes, failure ? 0 : 1);
-		UT_ASSERT_EQ(test_modifier_leaves, failure ? 0 : 1);
-		UT_ASSERT_EQ(test_config_failures, failure ? 1 : 0);
-	}
-	test_gc_error = false;
-}
-
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(6);
 	UT_RUN(test_capacity_wait_retries_signals_and_cadence_without_authorizing_free);
 	UT_RUN(test_capacity_every_blocking_hold_refuses_without_sleep);
 	UT_RUN(test_heavyweight_lock_identity_and_mode_are_exact);
 	UT_RUN(test_capacity_cancellation_and_missing_supply_keep_original_outcome);
 	UT_RUN(test_worker_lifecycle_rows_and_pid_inventory_are_independent);
 	UT_RUN(test_outer_pass_keeps_terminal_supply_but_cuts_new_optional_maintenance);
-	UT_RUN(test_config_cut_preserves_terminal_supply_and_original_shutdown_cut);
-	UT_RUN(test_config_producer_retires_after_original_modifier_not_error);
 	free(undo_cleaner_state);
 	UT_DONE();
 	return ut_failed_count != 0;

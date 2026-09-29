@@ -574,7 +574,7 @@ read_native_page(int dir, uint32 family, uint32 page_no, uint8 page[BLCKSZ],
 	int fd;
 
 	snprintf(name, sizeof(name), "%04X", page_no / SLRU_PAGES_PER_SEGMENT);
-		fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+	fd = openat(dir, name, O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
 	if (fd < 0)
 		return read_error();
 	if (fstat(fd, &before) != 0 || !read_owned(&before, false) || before.st_nlink != 1)
@@ -649,11 +649,11 @@ read_native_horizon(int root, const ControlFileData *input, ControlFileData *eff
 			= read_bytes(global, "pgrac_xid_authority", sizeof(auth), sizeof(auth), bytes, &length);
 	if (result == 0 && sync) {
 		int fd = openat(global, "pgrac_xid_authority",
-			O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
+						O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK | PG_BINARY);
 		struct stat pinned;
-		if (fd < 0 || fstat(fd, &pinned) != 0 || !read_owned(&pinned, false)
-			|| pinned.st_nlink != 1 || pinned.st_dev != before.st_dev
-			|| pinned.st_ino != before.st_ino || pinned.st_size != before.st_size)
+		if (fd < 0 || fstat(fd, &pinned) != 0 || !read_owned(&pinned, false) || pinned.st_nlink != 1
+			|| pinned.st_dev != before.st_dev || pinned.st_ino != before.st_ino
+			|| pinned.st_size != before.st_size)
 			result = CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 		else if (pg_fsync(fd) != 0)
 			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
@@ -708,11 +708,16 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 	uint8 page[BLCKSZ];
 	ClusterControlRootResult result;
 
+	/* PGRAC: do not adopt or clear retained timestamp state just because the
+	 * target configuration disables it. This optional SIDE is unsupported. */
+	if (input->track_commit_timestamp || TransactionIdIsValid(cp->oldestCommitTsXid)
+		|| TransactionIdIsValid(cp->newestCommitTsXid))
+		return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
 	if (!TransactionIdIsNormal(next) || !MultiXactIdIsValid(cp->oldestMulti))
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
 	if (next % CLUSTER_NATIVE_CLOG_PER_PAGE != 0) {
-		result
-			= read_native_page(dirs[3], 1, next / CLUSTER_NATIVE_CLOG_PER_PAGE, page, hash, reads, sync);
+		result = read_native_page(dirs[3], 1, next / CLUSTER_NATIVE_CLOG_PER_PAGE, page, hash,
+								  reads, sync);
 		if (result != 0)
 			return result;
 		if (!cluster_native_clog_suffix_unused((const char *)page, next))
@@ -756,40 +761,13 @@ read_native_cursors(const int dirs[9], const ControlFileData *input, pg_cryptoha
 		if (result != 0)
 			return result;
 	}
-	/* Native activation requires the partial next page; disabling must not
-	 * erase existing retained timestamp ranges. At a boundary we do not
-	 * create or infer the contents of the as-yet unallocated next page. */
-	if (input->track_commit_timestamp && next % CLUSTER_NATIVE_COMMIT_TS_PER_PAGE != 0) {
-		result = read_native_page(dirs[6], 5, next / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page, hash,
-								  reads, sync);
-		if (result != 0)
-			return result;
-	}
-	if (TransactionIdIsValid(cp->oldestCommitTsXid) != TransactionIdIsValid(cp->newestCommitTsXid))
-		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
-	if (TransactionIdIsValid(cp->oldestCommitTsXid)) {
-		if (!TransactionIdIsNormal(cp->oldestCommitTsXid)
-			|| !TransactionIdIsNormal(cp->newestCommitTsXid)
-			|| NormalTransactionIdPrecedes(cp->newestCommitTsXid, cp->oldestCommitTsXid))
-			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
-		result = read_native_page(dirs[6], 5,
-								  cp->oldestCommitTsXid / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page,
-								  hash, reads, sync);
-		if (result != 0)
-			return result;
-		result = read_native_page(dirs[6], 5,
-								  cp->newestCommitTsXid / CLUSTER_NATIVE_COMMIT_TS_PER_PAGE, page,
-								  hash, reads, sync);
-		if (result != 0)
-			return result;
-	}
 	return CLUSTER_CONTROL_ROOT_OK_PRIMARY;
 }
 #endif
 
 static ClusterControlRootResult
-native_side_inspect(const char *shared_root, uint32 node_id,
-		const ControlFileData *input, ClusterNativeSideObservation *out, bool sync)
+native_side_inspect(const char *shared_root, uint32 node_id, const ControlFileData *input,
+					ClusterNativeSideObservation *out, bool sync)
 {
 	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 #if !defined(WIN32) && defined(O_NOFOLLOW) && defined(O_DIRECTORY) && defined(O_CLOEXEC)           \
@@ -864,14 +842,14 @@ done:
 
 ClusterControlRootResult
 cluster_control_native_side_observe(const char *shared_root, uint32 node_id,
-	const ControlFileData *input, ClusterNativeSideObservation *out)
+									const ControlFileData *input, ClusterNativeSideObservation *out)
 {
 	return native_side_inspect(shared_root, node_id, input, out, false);
 }
 
 ClusterControlRootResult
 cluster_control_native_side_sync(const char *shared_root, uint32 node_id,
-	const ControlFileData *input, ClusterNativeSideObservation *out)
+								 const ControlFileData *input, ClusterNativeSideObservation *out)
 {
 	return native_side_inspect(shared_root, node_id, input, out, true);
 }
@@ -1081,6 +1059,11 @@ read_source_capacity(BootstrapReadWork *work, const char *shared_root, const cha
 											   &anchor_ref, &anchor);
 	if (result != 0)
 		return result;
+	/* Applies to current, retained and pending origins, not just this node. */
+	if (anchor.track_commit_timestamp
+		|| TransactionIdIsValid(anchor.checkpoint_copy.oldestCommitTsXid)
+		|| TransactionIdIsValid(anchor.checkpoint_copy.newestCommitTsXid))
+		return CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED;
 	if (anchor.backup_start != InvalidXLogRecPtr || anchor.backup_end != InvalidXLogRecPtr
 		|| anchor.backup_end_required)
 		return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
