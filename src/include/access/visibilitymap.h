@@ -18,6 +18,7 @@
 #include "access/xlogdefs.h"
 #include "storage/block.h"
 #include "storage/buf.h"
+#include "storage/relfilelocator.h"
 #include "utils/relcache.h"
 
 /* Macros for visibilitymap test */
@@ -28,6 +29,10 @@
 
 extern bool visibilitymap_clear(Relation rel, BlockNumber heapBlk,
 								Buffer vmbuf, uint8 flags);
+/* PGRAC: original heap WAL consumers; never use runtime version initialization. */
+struct XLogReaderState;
+extern void visibilitymap_clear_redo(struct XLogReaderState *record,
+									 RelFileLocator locator, BlockNumber heapBlk, uint8 flags);
 /* PGRAC: in-crit variant, map page content lock held by the caller. */
 extern bool visibilitymap_clear_locked(Relation rel, BlockNumber heapBlk,
 									   Buffer vmbuf, uint8 flags);

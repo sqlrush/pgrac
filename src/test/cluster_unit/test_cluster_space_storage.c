@@ -71,6 +71,8 @@ static Relation fake_relation;
 static unsigned fake_allocations, fake_frees;
 static int nest_level;
 static unsigned ko_calls;
+static unsigned current_ref_reads, restart_ref_reads;
+static bool reject_current_ref;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -95,14 +97,17 @@ rf_page_mutation_token_next(void)
 bool
 cluster_wal_thread_current_v2_ref(ClusterWalDurablePrefixRef *out)
 {
+	current_ref_reads++;
 	*out = ref;
-	return have_ref;
+	return have_ref && !reject_current_ref;
 }
 
 bool
 cluster_wal_thread_restart_v2_ref(ClusterWalDurablePrefixRef *out)
 {
-	return cluster_wal_thread_current_v2_ref(out);
+	restart_ref_reads++;
+	*out = ref;
+	return have_ref;
 }
 
 bool
@@ -457,6 +462,8 @@ reset(void)
 	auxiliary_forks = false;
 	nest_level = 1;
 	ko_calls = 0;
+	current_ref_reads = restart_ref_reads = 0;
+	reject_current_ref = false;
 	CritSectionCount = blocks = io_calls = create_calls = wal_calls = dirty_calls = release_calls
 		= 0;
 	BufferBlocks = page.data;
@@ -551,6 +558,39 @@ UT_TEST(test_identity_read_is_exact_and_never_creates)
 	out = saved;
 	UT_ASSERT(!cluster_space_relation_read_identity(locator, &out));
 	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_recovery_identity_uses_only_restart_namespace)
+{
+	ClusterSpaceIdentity out, saved;
+	unsigned writes;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	writes = wal_calls;
+	memset(&out, 0xa5, sizeof(out));
+	saved = out;
+	current_ref_reads = restart_ref_reads = 0;
+	UT_ASSERT(!cluster_space_relation_read_redo_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT_EQ(restart_ref_reads, 0);
+	recovering = reject_current_ref = true;
+	UT_ASSERT(!cluster_space_relation_read_identity(locator, &out));
+	UT_ASSERT(cluster_space_relation_read_redo_identity(locator, &out));
+	UT_ASSERT_EQ(current_ref_reads, 0);
+	UT_ASSERT_EQ(restart_ref_reads, 1);
+	UT_ASSERT_EQ(out.state, CLUSTER_SPACE_IDENTITY_LIVE);
+	UT_ASSERT_EQ(out.incarnation[15], 0x45);
+	saved = out;
+	ref.claim.database_incarnation++;
+	UT_ASSERT(!cluster_space_relation_read_redo_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	ref.claim.database_incarnation--;
+	have_ref = false;
+	UT_ASSERT(!cluster_space_relation_read_redo_identity(locator, &out));
+	UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+	UT_ASSERT_EQ(wal_calls, writes);
 	UT_ASSERT(!pinned && !locked);
 }
 
@@ -779,11 +819,12 @@ UT_TEST(test_subabort_forgets_drop_without_tombstoning)
 int
 main(void)
 {
-	UT_PLAN(12);
+	UT_PLAN(13);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
 	UT_RUN(test_identity_read_is_exact_and_never_creates);
+	UT_RUN(test_recovery_identity_uses_only_restart_namespace);
 	UT_RUN(test_real_replay_exact_duplicate_and_preserved_token);
 	UT_RUN(test_native_create_registers_abort_cleanup_before_space);
 	UT_RUN(test_native_descriptor_recognizes_typed_record);

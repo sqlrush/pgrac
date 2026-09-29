@@ -31,6 +31,12 @@ extern bool cluster_space_relation_create(RelFileLocator locator);
  * on refusal. Caller must not hold a page content lock across this read. */
 extern bool cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out);
 
+/* Recovery executor, under its existing isolation and selected restart input.
+ * Uses restart namespace, never current writer/relcache or identity creation.
+ * Same output/locking contract as the runtime raw reader; not admission. */
+extern bool cluster_space_relation_read_redo_identity(RelFileLocator locator,
+													  ClusterSpaceIdentity *out);
+
 /* DML owner holds the original relation lifecycle lock and has consumed native
  * relcache invalidations at its lock/statement boundary. Backend-private
  * relcache adjunct: hits use memory only, misses use the exact reader above.

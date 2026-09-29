@@ -115,8 +115,8 @@ space_set_lsn(Page page, XLogRecPtr lsn, uint64 token)
 	((PageHeader)page)->pd_block_scn = token;
 }
 
-bool
-cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
+static bool
+space_read_identity(RelFileLocator locator, bool redo, ClusterSpaceIdentity *out)
 {
 	ClusterSpaceIdentityKey expected;
 	ClusterSpaceIdentity identity;
@@ -125,7 +125,8 @@ cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentit
 	bool valid;
 	uint64 token;
 
-	if (out == NULL || RecoveryInProgress() || !space_namespace(locator, false, &expected, NULL))
+	if (out == NULL || RecoveryInProgress() != redo
+		|| !space_namespace(locator, redo, &expected, NULL))
 		return false;
 	rel = smgropen(locator, InvalidBackendId);
 	if (!smgrexists(rel, SPACE_FORKNUM) || smgrnblocks(rel, SPACE_FORKNUM) != 1)
@@ -140,6 +141,18 @@ cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentit
 	if (valid)
 		*out = identity;
 	return valid;
+}
+
+bool
+cluster_space_relation_read_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
+{
+	return space_read_identity(locator, false, out);
+}
+
+bool
+cluster_space_relation_read_redo_identity(RelFileLocator locator, ClusterSpaceIdentity *out)
+{
+	return space_read_identity(locator, true, out);
 }
 
 bool

@@ -192,6 +192,154 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	return cleared;
 }
 
+#ifdef USE_PGRAC_CLUSTER
+/* PGRAC: VM has no items, special area, or ITL. The bitmap fills the page. */
+static bool
+vm_redo_page_valid(Page page)
+{
+	PageHeader header = (PageHeader) page;
+
+	return PageGetPageSize(page) == BLCKSZ &&
+		PageGetPageLayoutVersion(page) == PG_PAGE_LAYOUT_VERSION &&
+		header->pd_lower == MAXALIGN(SizeOfPageHeaderData) &&
+		header->pd_upper == BLCKSZ && header->pd_special == BLCKSZ &&
+		header->pd_prune_xid == InvalidTransactionId &&
+		(header->pd_flags & ~(PD_CLUSTER_FORCE_FPI | PD_LSN_ORIGIN_VALID | PD_LSN_ORIGIN_MASK)) == 0 &&
+		((header->pd_flags & PD_LSN_ORIGIN_VALID) != 0 ||
+		 (header->pd_flags & PD_LSN_ORIGIN_MASK) == 0) &&
+		header->pd_block_scn != 0;
+}
+
+/* PGRAC: apply the already-selected VM edge, not a runtime mutation. Global
+ * recovery isolation/dependency selection remain the executor's obligation.
+ * No numeric token/foreign LSN comparison, new identity, token, or WAL. */
+static void
+vm_clear_versioned_redo(XLogReaderState *record, RelFileLocator locator,
+						BlockNumber heapBlk, uint8 flags)
+{
+	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
+	ClusterSpaceIdentity identity;
+	const RfPageVersionEdgeV1 *edge;
+	const RfPageVersionEdgeEntryV1 *entry = NULL;
+	PGAlignedBlock image;
+	Buffer buffer;
+	Page page;
+	int block_id = -1;
+	int i;
+	uint8 mask = flags << HEAPBLK_TO_OFFSET(heapBlk);
+
+	for (i = 0; i <= XLogRecMaxBlockId(record); i++)
+	{
+		DecodedBkpBlock *block;
+
+		if (!XLogRecHasBlockRef(record, i))
+			continue;
+		block = XLogRecGetBlock(record, i);
+		if (block->forknum != VISIBILITYMAP_FORKNUM || block->blkno != mapBlock ||
+			!RelFileLocatorEquals(block->rlocator, locator))
+			continue;
+		if (block_id != -1)
+			elog(ERROR, "shared VM redo has duplicate target images");
+		block_id = i;
+	}
+	/* A heap record can carry only a heap edge. Conversely, a pinned VM can
+	 * have a new recorded version even when its bits were already clear. */
+	if (block_id < 0 && flags == 0)
+		return;
+	if (!RecoveryInProgress() || !XLogRecHasPageVersionEdge(record) ||
+		XLogRecPtrIsInvalid(record->EndRecPtr) ||
+		!cluster_space_relation_read_redo_identity(locator, &identity))
+		elog(ERROR, "shared VM redo requires restart SPACE identity and version edge");
+	edge = XLogRecGetPageVersionEdge(record);
+	for (i = 0; i < edge->entry_count; i++)
+	{
+		if (edge->entries[i].block_id != block_id)
+			continue;
+		if (entry != NULL)
+			elog(ERROR, "shared VM redo has duplicate version edges");
+		entry = &edge->entries[i];
+	}
+	if (block_id < 0 || entry == NULL ||
+		entry->page_class != RF_PAGE_CLASS_ORDINARY ||
+		entry->before_kind != RF_PAGE_STATE_PRESENT ||
+		entry->result_kind != RF_PAGE_STATE_PRESENT ||
+		entry->edge_flags != (RF_PAGE_EDGE_FULL_IMAGE_APPLY | RF_PAGE_EDGE_FULL_COVERAGE) ||
+		entry->component_ordinal != XLogRecGetBlock(record, block_id)->component_ordinal ||
+		entry->before.mutation_token == 0 || edge->result_token == 0 ||
+		entry->before.mutation_token == edge->result_token ||
+		memcmp(entry->before.segment_incarnation, identity.incarnation, 16) != 0 ||
+		memcmp(entry->result_incarnation, identity.incarnation, 16) != 0 ||
+		!XLogRecHasBlockImage(record, block_id) || !XLogRecBlockImageApply(record, block_id) ||
+		(XLogRecGetBlock(record, block_id)->flags & BKPBLOCK_WILL_INIT) != 0 ||
+		!RestoreBlockImage(record, block_id, image.data) || !vm_redo_page_valid(image.data) ||
+		((PageHeader) image.data)->pd_block_scn != edge->result_token ||
+		(PageGetContents(image.data)[HEAPBLK_TO_MAPBYTE(heapBlk)] & mask) != 0)
+		elog(ERROR, "shared VM redo has no exact recorded result image");
+
+	/* Unlike XLogReadBufferForRedo, this cannot restore the FPI before checking
+	 * its predecessor. Missing/zero/torn bases require the separate recovery
+	 * base/initialization owner; do not invent one from a fake Relation. */
+	buffer = XLogReadBufferExtended(locator, VISIBILITYMAP_FORKNUM, mapBlock,
+								   RBM_NORMAL, InvalidBuffer);
+	if (!BufferIsValid(buffer))
+		elog(ERROR, "shared VM redo is missing its versioned predecessor");
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	page = BufferGetPage(buffer);
+	if (!vm_redo_page_valid(page) ||
+		(((PageHeader) page)->pd_block_scn != entry->before.mutation_token &&
+		 ((PageHeader) page)->pd_block_scn != edge->result_token))
+	{
+		UnlockReleaseBuffer(buffer);
+		elog(ERROR, "shared VM redo predecessor version does not match");
+	}
+	if (((PageHeader) page)->pd_block_scn == edge->result_token)
+	{
+		/* LSN, origin and checksum can legitimately differ after replay/write;
+		 * a matching token with different bitmap bytes is not an idempotent hit. */
+		bool same = memcmp(PageGetContents(page), PageGetContents(image.data), MAPSIZE) == 0;
+
+		UnlockReleaseBuffer(buffer);
+		if (!same)
+			elog(ERROR, "shared VM redo result token has different contents");
+		return;
+	}
+	START_CRIT_SECTION();
+	memcpy(page, image.data, BLCKSZ);
+	PageSetLSN(page, record->EndRecPtr);
+	/* The legacy merged-recovery LSN hook must not replace the result token. */
+	((PageHeader) page)->pd_block_scn = edge->result_token;
+	MarkBufferDirty(buffer);
+	END_CRIT_SECTION();
+	UnlockReleaseBuffer(buffer);
+}
+#endif
+
+void
+visibilitymap_clear_redo(XLogReaderState *record, RelFileLocator locator,
+						 BlockNumber heapBlk, uint8 flags)
+{
+	Relation rel;
+	Buffer buffer = InvalidBuffer;
+
+	Assert(RecoveryInProgress());
+	Assert(flags == 0 || flags == VISIBILITYMAP_VALID_BITS || flags == VISIBILITYMAP_ALL_FROZEN);
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && cluster_smgr_which_for(locator, InvalidBackendId) == 1)
+	{
+		vm_clear_versioned_redo(record, locator, heapBlk, flags);
+		return;
+	}
+#endif
+	if (flags == 0)
+		return;
+	/* Preserve the native unversioned profile's implicit, conservative clear. */
+	rel = CreateFakeRelcacheEntry(locator);
+	visibilitymap_pin(rel, heapBlk, &buffer);
+	visibilitymap_clear(rel, heapBlk, buffer, flags);
+	ReleaseBuffer(buffer);
+	FreeFakeRelcacheEntry(rel);
+}
+
 bool
 visibilitymap_clear_retry_aware(Relation rel, BlockNumber heapBlk, Buffer *vmbuf, uint8 flags,
 								struct ResourceXAuxiliaryAcquireContext *context, bool *cleared)
