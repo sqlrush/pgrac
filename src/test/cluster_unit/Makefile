@@ -1275,6 +1275,40 @@ test_cluster_heap_delete_version.inc: $(top_srcdir)/src/backend/access/heap/heap
 	     /^}/ { inside=0 } END { if (starts != 1 || ends != 1 || emit) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+# PGRAC: distinct pre-TOAST LOCK and final UPDATE publication from the real caller.
+test_cluster_heap_update_temp_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { inside=1 } \
+	     inside && /PGRAC: capture before APPLY/ { emit=1; count++ } \
+	     emit { print } emit && /^\t\t}/ { exit } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_capture.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { inside=1 } \
+	     inside && /PGRAC: capture again after TOAST/ { emit=1; count++ } \
+	     emit { print } emit && /^\t}/ { exit } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_temp_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { starts++; if (starts == 1) emit=1 } \
+	     emit { print } \
+	     inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 2 || ends != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_version.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { inside=1 } \
+	     inside && /START_CRIT_SECTION\(\);/ { starts++; if (starts == 2) emit=1 } \
+	     emit { print } \
+	     inside && /END_CRIT_SECTION\(\);/ { emit=0; ends++ } \
+	     /^}/ { inside=0 } END { if (starts != 2 || ends != 2 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_heap_update_log.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^log_heap_update\(/ { print "static XLogRecPtr"; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_heap_infobits.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^compute_infobits\(/ { print "static uint8"; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } END { if (count != 1 || emit) exit 1 }' $< > $@.tmp
@@ -1343,6 +1377,8 @@ test_cluster_vm_redo: test_cluster_vm_redo.c test_cluster_vm_redo_consumers.inc 
 test_cluster_heap_insert_version: test_cluster_heap_insert_version.c unit_test.h \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
 		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
+		test_cluster_heap_update_temp_version.inc test_cluster_heap_update_version.inc test_cluster_heap_update_log.inc \
+		test_cluster_heap_update_temp_capture.inc test_cluster_heap_update_capture.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
@@ -1373,6 +1409,11 @@ test_cluster_space_cache_delete.inc: $(top_srcdir)/src/backend/access/heap/heapa
 	     emit { print } emit && /^\t}/ { exit } END { if (count != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_space_cache_update.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^heap_update\(/ { inside=1 } inside && /if \(cluster_shared_config && RelationIsPermanent/ { emit=1; count++ } \
+	     emit { print } emit && /^\t}/ { exit } END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_space_cache_allocation.inc: $(top_srcdir)/src/backend/access/heap/hio.c Makefile
 	awk '/^RelationGetBufferForTuple\(/ { inside=1 } inside && /if \(cluster_shared_config$$/ { emit=1; count++ } \
 	     emit { print } emit && /^\t}/ { exit } END { if (count != 1) exit 1 }' $< > $@.tmp
@@ -1383,6 +1424,7 @@ test_cluster_space_cache_hash.o: $(top_srcdir)/src/backend/utils/hash/dynahash.c
 
 test_cluster_space_cache: test_cluster_space_cache.c unit_test.h \
 		test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc \
+		test_cluster_space_cache_update.inc \
 		test_cluster_space_cache_hash.o test_cluster_space_storage_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_storage_product.o test_cluster_space_cache_hash.o \
@@ -3044,11 +3086,13 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc
+	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc
 	rm -f $(TESTS) pgrac_fenced_live_rejoin_client probe_pgrac_fenced_cib bench_wal_publish_cost \
-		test_cluster_vm_version.inc test_cluster_vm_redo_consumers.inc \
+		test_cluster_vm_version.inc test_cluster_vm_redo_consumers.inc test_cluster_heap_update_temp_version.inc \
+		test_cluster_heap_update_version.inc test_cluster_heap_update_log.inc \
+		test_cluster_heap_update_temp_capture.inc test_cluster_heap_update_capture.inc \
 		test_cluster_heap_insert_version.inc test_cluster_heap_put_tuple.inc \
 		test_cluster_heap_delete_version.inc test_cluster_heap_infobits.inc test_cluster_space_xid_precedes.inc \
 		test_cluster_control_root_worker.inc \

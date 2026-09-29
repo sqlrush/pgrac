@@ -2342,6 +2342,8 @@ static XLogRecPtr log_heap_update(Relation reln, Buffer oldbuf,
 								  , bool cluster_itl_new_active, uint8 cluster_itl_new_slot
 								  /* spec-3.4b D6 — shared xact-local UBA */
 								  , UBA cluster_itl_uba
+								  , const RfPageProducerBatchV1 *cluster_versions
+								  , Buffer cluster_vm_old, Buffer cluster_vm_new
 #endif
 								  );
 #ifdef USE_ASSERT_CHECKING
@@ -11782,6 +11784,11 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 #ifdef USE_PGRAC_CLUSTER
 	ResourceXAuxiliaryAcquireContext cluster_vm_context = { 0 };
 	ResourceXAuxiliaryAcquireContext cluster_vm_new_context = { 0 };
+	/* PGRAC: TEMP_LOCK and final UPDATE are distinct WAL/version batches. */
+	bool		cluster_page_versioned = false;
+	ClusterSpaceIdentity cluster_page_identity;
+	RfPageProducerBatchV1 cluster_temp_lock_versions;
+	RfPageProducerBatchV1 cluster_page_versions;
 #endif
 	CommandId	pgrac_entry_cid = cid;	/* PGRAC: restored on barrier requalify */
 	bool		need_toast;
@@ -11906,6 +11913,14 @@ heap_update(Relation relation, ItemPointer otid, HeapTuple newtup,
 	interesting_attrs = bms_add_members(interesting_attrs, id_attrs);
 
 #ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config && RelationIsPermanent(relation)
+		&& cluster_smgr_which_for(relation->rd_locator, InvalidBackendId) == 1)
+	{
+		if (!RelationNeedsWAL(relation)
+			|| !cluster_space_relation_get_identity(relation, &cluster_page_identity))
+			elog(ERROR, "shared heap update requires a live SPACE identity");
+		cluster_page_versioned = true;
+	}
 	canonical_xid = GetTopTransactionId();
 	if (cluster_itl_write_path_enabled(relation)
 		&& !cluster_tt_local_prepare_canonical_active(
@@ -12766,6 +12781,17 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 		}
 
 #ifdef USE_PGRAC_CLUSTER
+		/* PGRAC: capture before APPLY without changing receipt fingerprints. */
+		if (cluster_page_versioned)
+		{
+			Buffer version_buffers[2] = {buffer, vmbuffer};
+			uint8 version_ids[2] = {0, 1};
+
+			if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+					version_buffers, version_ids, vm_locked ? 2 : 1,
+					&cluster_temp_lock_versions))
+				elog(ERROR, "shared heap update cannot capture TEMP_LOCK versions");
+		}
 		if (cluster_current_mx_recomposed)
 		{
 			MemSet(&temp_lock_publication, 0,
@@ -12849,6 +12875,13 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 
 		/* Clear obsolete visibility flags ... */
 #ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			if (!rf_page_producer_stamp_v1(&cluster_temp_lock_versions))
+				elog(PANIC, "heap TEMP_LOCK version changed after receipt APPLY");
+			if (cluster_temp_lock_versions.entry_count == 2)
+				MarkBufferDirty(vmbuffer);
+		}
 		if (cluster_current_mx_recomposed)
 			memcpy(oldtup.t_data, cluster_current_mx_temp_lock_header,
 				SizeofHeapTupleHeader);
@@ -12897,8 +12930,21 @@ cluster_writer_terminal:				/* PGRAC: spec-7.1a D0 chained result */
 			xlrec.flags =
 				cleared_all_frozen ? XLH_LOCK_ALL_FROZEN_CLEARED : 0;
 			XLogRegisterData((char *) &xlrec, SizeOfHeapLock);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_page_versioned)
+			{
+				if (cluster_temp_lock_versions.entry_count == 2)
+					XLogRegisterBuffer(1, vmbuffer, REGBUF_FORCE_IMAGE);
+				if (!rf_page_producer_register_wal_v1(&cluster_temp_lock_versions))
+					elog(PANIC, "heap TEMP_LOCK page-version WAL registration failed");
+			}
+#endif
 			recptr = XLogInsert(RM_HEAP_ID, XLOG_HEAP_LOCK);
 			PageSetLSN(page, recptr);
+#ifdef USE_PGRAC_CLUSTER
+			if (cluster_page_versioned && cluster_temp_lock_versions.entry_count == 2)
+				PageSetLSN(BufferGetPage(vmbuffer), recptr);
+#endif
 		}
 
 		END_CRIT_SECTION();
@@ -13968,6 +14014,35 @@ l_pgrac_reacquire:
 
 #ifdef USE_PGRAC_CLUSTER
 	MemSet(cluster_itl_ctrc_handles, 0, sizeof(cluster_itl_ctrc_handles));
+	/* PGRAC: capture again after TOAST/reacquisition, never reuse TEMP_LOCK.
+	 * Native WAL keeps new heap0/old heap1. VM2/VM3 are explicit full images. */
+	if (cluster_page_versioned)
+	{
+		Buffer version_buffers[4];
+		uint8 version_ids[4];
+		uint8 count = 0;
+
+		version_buffers[count] = newbuf;
+		version_ids[count++] = 0;
+		if (newbuf != buffer)
+		{
+			version_buffers[count] = buffer;
+			version_ids[count++] = 1;
+		}
+		if (vm_locked)
+		{
+			version_buffers[count] = vmbuffer;
+			version_ids[count++] = 2;
+		}
+		if (vm_locked_new && (!vm_locked || vmbuffer_new != vmbuffer))
+		{
+			version_buffers[count] = vmbuffer_new;
+			version_ids[count++] = 3;
+		}
+		if (!cluster_space_prepare_buffer_versions(&cluster_page_identity,
+				version_buffers, version_ids, count, &cluster_page_versions))
+			elog(ERROR, "shared heap update cannot capture exact final versions");
+	}
 	{
 		ClusterHeapPreparedUndoTargetPlan undo_plans[2];
 		ClusterHeapCurrentMxExactPublication mx_publications[2];
@@ -14289,6 +14364,15 @@ l_pgrac_reacquire:
 #ifdef USE_PGRAC_CLUSTER
 	/* spec-3.4a D4: stamp ACTIVE inside critical section.
 	 * spec-3.4b D5: both stamps carry the same cluster_itl_uba (F11). */
+	if (cluster_page_versioned)
+	{
+		if (!rf_page_producer_stamp_v1(&cluster_page_versions))
+			elog(PANIC, "heap update page version changed after receipt APPLY");
+		if (vm_locked)
+			MarkBufferDirty(vmbuffer);
+		if (vm_locked_new && (!vm_locked || vmbuffer_new != vmbuffer))
+			MarkBufferDirty(vmbuffer_new);
+	}
 	if (cluster_itl_old_active)
 	{
 		cluster_itl_stamp_active_with_history(buffer, cluster_itl_old_slot, canonical_xid,
@@ -14508,6 +14592,9 @@ l_pgrac_reacquire:
 								 , cluster_itl_old_active, cluster_itl_old_slot
 								 , cluster_itl_new_active, cluster_itl_new_slot
 								 , cluster_itl_uba
+								 , cluster_page_versioned ? &cluster_page_versions : NULL
+								 , vm_locked ? vmbuffer : InvalidBuffer
+								 , vm_locked_new ? vmbuffer_new : InvalidBuffer
 #endif
 								 );
 		if (newbuf != buffer)
@@ -14515,6 +14602,15 @@ l_pgrac_reacquire:
 			PageSetLSN(BufferGetPage(newbuf), recptr);
 		}
 		PageSetLSN(BufferGetPage(buffer), recptr);
+#ifdef USE_PGRAC_CLUSTER
+		if (cluster_page_versioned)
+		{
+			if (vm_locked)
+				PageSetLSN(BufferGetPage(vmbuffer), recptr);
+			if (vm_locked_new && (!vm_locked || vmbuffer_new != vmbuffer))
+				PageSetLSN(BufferGetPage(vmbuffer_new), recptr);
+		}
+#endif
 	}
 
 	END_CRIT_SECTION();
@@ -21400,6 +21496,8 @@ log_heap_update(Relation reln, Buffer oldbuf,
 				, bool cluster_itl_old_active, uint8 cluster_itl_old_slot
 				, bool cluster_itl_new_active, uint8 cluster_itl_new_slot
 				, UBA cluster_itl_uba
+				, const RfPageProducerBatchV1 *cluster_versions
+				, Buffer cluster_vm_old, Buffer cluster_vm_new
 #endif
 				)
 {
@@ -21704,6 +21802,17 @@ log_heap_update(Relation reln, Buffer oldbuf,
 	/* filtering by origin on a row level is much more efficient */
 	XLogSetRecordFlags(XLOG_INCLUDE_ORIGIN);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_versions != NULL)
+	{
+		if (BufferIsValid(cluster_vm_old))
+			XLogRegisterBuffer(2, cluster_vm_old, REGBUF_FORCE_IMAGE);
+		if (BufferIsValid(cluster_vm_new) && cluster_vm_new != cluster_vm_old)
+			XLogRegisterBuffer(3, cluster_vm_new, REGBUF_FORCE_IMAGE);
+		if (!rf_page_producer_register_wal_v1(cluster_versions))
+			elog(PANIC, "heap update page-version WAL registration failed");
+	}
+#endif
 	recptr = XLogInsert(RM_HEAP_ID, info);
 
 	return recptr;

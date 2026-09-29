@@ -259,7 +259,7 @@ UnlockReleaseBuffer(Buffer buffer)
 	}
 }
 
-/* Original INSERT, DELETE and allocation prologues; no copied routing policy. */
+/* Original DML and allocation prologues; no copied routing policy. */
 static ClusterSpaceIdentity
 insert_identity(Relation relation)
 {
@@ -281,6 +281,19 @@ delete_identity(Relation relation)
 
 	memset(&cluster_page_identity, 0, sizeof(cluster_page_identity));
 #include "test_cluster_space_cache_delete.inc"
+	if (!cluster_page_versioned)
+		abort();
+	return cluster_page_identity;
+}
+
+static ClusterSpaceIdentity
+update_identity(Relation relation)
+{
+	ClusterSpaceIdentity cluster_page_identity;
+	bool cluster_page_versioned = false;
+
+	memset(&cluster_page_identity, 0, sizeof(cluster_page_identity));
+#include "test_cluster_space_cache_update.inc"
 	if (!cluster_page_versioned)
 		abort();
 	return cluster_page_identity;
@@ -344,8 +357,12 @@ UT_TEST(test_insert_allocation_and_delete_share_one_identity_read)
 	UT_ASSERT_EQ(insert.incarnation[0], 0x45);
 	UT_ASSERT_EQ(allocation.sequence, 1);
 	UT_ASSERT_EQ(deletion.operation, 19);
-	for (i = 0; i < 100; i++)
-		(void)insert_identity(&relation_data);
+	for (i = 0; i < 100; i++) {
+		ClusterSpaceIdentity repeated
+			= i % 2 ? update_identity(&relation_data) : insert_identity(&relation_data);
+
+		UT_ASSERT_EQ(repeated.incarnation[0], 0x45);
+	}
 	UT_ASSERT_EQ(exists_calls, 1);
 	UT_ASSERT_EQ(size_calls, 1);
 	UT_ASSERT_EQ(read_calls, 1);
