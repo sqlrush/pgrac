@@ -46,6 +46,7 @@
  *	  - _bt_build_callback: byte-reverse the leading key when building a
  *	    reverse-key index over existing heap tuples.
  *	    Spec: spec-6.12-crossnode-cache-fusion-perf-optimization.md (wave f)
+ *	  - Shared bulk-build FPI records carry exact SPACE/page versions.
  *
  *-------------------------------------------------------------------------
  */
@@ -58,6 +59,9 @@
 #include "access/table.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f validate */
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
+#include "cluster/storage/cluster_smgr.h"
 #endif
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -266,6 +270,10 @@ typedef struct BTWriteState
 	BlockNumber btws_pages_alloced; /* # pages allocated */
 	BlockNumber btws_pages_written; /* # pages written out */
 	Page		btws_zeropage;	/* workspace for filling zeroes */
+#ifdef USE_PGRAC_CLUSTER
+	bool		versioned;
+	ClusterSpaceIdentity identity;	/* PGRAC: copied before page construction */
+#endif
 } BTWriteState;
 
 
@@ -590,6 +598,15 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 	/* _bt_mkscankey() won't set allequalimage without metapage */
 	wstate.inskey->allequalimage = _bt_allequalimage(wstate.index, true);
 	wstate.btws_use_wal = RelationNeedsWAL(wstate.index);
+#ifdef USE_PGRAC_CLUSTER
+	/* PGRAC: one cached identity value for the native new-index writer. */
+	wstate.versioned = cluster_shared_config && RelationIsPermanent(wstate.index)
+		&& cluster_smgr_which_for(wstate.index->rd_locator, InvalidBackendId) == 1;
+	if (wstate.versioned
+		&& (!wstate.btws_use_wal
+			|| !cluster_space_relation_get_identity(wstate.index, &wstate.identity)))
+		elog(ERROR, "shared btree build requires a live SPACE identity");
+#endif
 
 	/* reserve the metapage */
 	wstate.btws_pages_alloced = BTREE_METAPAGE + 1;
@@ -682,8 +699,32 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 	/* XLOG stuff */
 	if (wstate->btws_use_wal)
 	{
-		/* We use the XLOG_FPI record type for this */
-		log_newpage(&wstate->index->rd_locator, MAIN_FORKNUM, blkno, page, true);
+#ifdef USE_PGRAC_CLUSTER
+		if (wstate->versioned)
+		{
+			PGAlignedBlock before;
+			const void *zero_before = NULL;
+			XLogRecPtr recptr;
+
+			/* The original builder may have filled a gap before its parent
+			 * or metapage is ready. Prove those existing bytes are still zero
+			 * rather than calling that allocated page ABSENT. */
+			if (blkno < wstate->btws_pages_written)
+			{
+				smgrread(RelationGetSmgr(wstate->index), MAIN_FORKNUM, blkno, before.data);
+				zero_before = before.data;
+			}
+			if (!cluster_space_btree_build_page_wal(&wstate->identity, blkno, page,
+													   zero_before, &recptr))
+				elog(ERROR, "shared btree build cannot capture exact new page version");
+			XLogFlush(recptr);
+		}
+		else
+#endif
+		{
+			/* We use the XLOG_FPI record type for this */
+			log_newpage(&wstate->index->rd_locator, MAIN_FORKNUM, blkno, page, true);
+		}
 	}
 
 	/*

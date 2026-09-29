@@ -311,6 +311,23 @@ allocation_identity(Relation relation)
 	return *page_identity;
 }
 
+static ClusterSpaceIdentity
+btree_build_identity(Relation relation)
+{
+	struct {
+		Relation index;
+		bool btws_use_wal, versioned;
+		ClusterSpaceIdentity identity;
+	} wstate;
+
+	memset(&wstate, 0, sizeof(wstate));
+	wstate.index = relation;
+	wstate.btws_use_wal = RelationNeedsWAL(relation);
+#include "test_cluster_btree_build_identity.inc"
+	UT_ASSERT(wstate.versioned);
+	return wstate.identity;
+}
+
 static void
 setup(void)
 {
@@ -509,10 +526,24 @@ UT_TEST(test_missing_corrupt_and_tombstoned_identity_never_poison_cache)
 	UT_ASSERT(!pinned && !locked);
 }
 
+UT_TEST(test_btree_build_captures_one_cached_identity_value)
+{
+	ClusterSpaceIdentity first, second;
+
+	setup();
+	first = btree_build_identity(&relation_data);
+	second = btree_build_identity(&relation_data);
+	UT_ASSERT_EQ(read_calls, 1);
+	UT_ASSERT(memcmp(&first, &second, sizeof(first)) == 0);
+	invalidate((Datum)0, RelationGetRelid(&relation_data));
+	UT_ASSERT(memcmp(&first, &disk_identity, sizeof(first)) == 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
 	UT_RUN(test_insert_allocation_and_delete_share_one_identity_read);
 	UT_RUN(test_targeted_invalidation_reloads_new_incarnation);
 	UT_RUN(test_unrelated_invalidation_preserves_hit_global_reset_drops_it);
@@ -521,6 +552,7 @@ main(void)
 	UT_RUN(test_invalid_relcache_cannot_resurrect_a_stale_entry);
 	UT_RUN(test_unavailable_authority_and_recovery_do_not_reuse_cache);
 	UT_RUN(test_missing_corrupt_and_tombstoned_identity_never_poison_cache);
+	UT_RUN(test_btree_build_captures_one_cached_identity_value);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

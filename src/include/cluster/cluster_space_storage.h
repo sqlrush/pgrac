@@ -69,6 +69,15 @@ extern bool cluster_space_prepare_buffer_versions(const ClusterSpaceIdentity *id
 extern bool cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
 										BlockNumber block, void *page, XLogRecPtr *lsn);
 
+/* Native btree bulk-build owner, under the original new-index lifecycle lock.
+ * A NULL before denotes a not-yet-extended target; otherwise caller has read
+ * the exact previously zero-filled target. Validate all zero bytes before
+ * publishing its UNFORMATTED edge. Source/result are private construction
+ * bytes; caller flushes returned WAL before DATA and retains final fsync. */
+extern bool cluster_space_btree_build_page_wal(const ClusterSpaceIdentity *identity,
+											   BlockNumber block, void *page,
+											   const void *zero_before, XLogRecPtr *lsn);
+
 /* Original new-fork buffer-copy owner only: source content is share-locked,
  * destination is pinned/exclusively content-locked and must be entirely zero
  * after native extension. Captures UNFORMATTED before copying; emits the same

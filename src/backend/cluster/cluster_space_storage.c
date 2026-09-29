@@ -332,16 +332,18 @@ space_copy_insert(const ClusterSpaceIdentity *identity, ForkNumber forknum, Bloc
 	return recptr;
 }
 
-bool
-cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
-							BlockNumber block, void *page, XLogRecPtr *lsn)
+static bool
+space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum, BlockNumber block,
+					void *page, const void *zero_before, XLogRecPtr *lsn)
 {
 	RfPageProducerBatchV1 batch;
 	PGAlignedBlock result;
 	XLogRecPtr recptr;
 
 	if (lsn == NULL
-		|| !space_copy_prepare(identity, forknum, block, page, NULL, RF_PAGE_STATE_ABSENT,
+		|| !space_copy_prepare(identity, forknum, block, page, (Page)zero_before,
+							   zero_before == NULL ? RF_PAGE_STATE_ABSENT
+												   : RF_PAGE_STATE_UNFORMATTED,
 							   result.data, &batch))
 		return false;
 	XLogBeginInsert();
@@ -349,6 +351,20 @@ cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber for
 	memcpy(page, result.data, BLCKSZ);
 	*lsn = recptr;
 	return true;
+}
+
+bool
+cluster_space_copy_page_wal(const ClusterSpaceIdentity *identity, ForkNumber forknum,
+							BlockNumber block, void *page, XLogRecPtr *lsn)
+{
+	return space_copy_page_wal(identity, forknum, block, page, NULL, lsn);
+}
+
+bool
+cluster_space_btree_build_page_wal(const ClusterSpaceIdentity *identity, BlockNumber block,
+								   void *page, const void *zero_before, XLogRecPtr *lsn)
+{
+	return space_copy_page_wal(identity, MAIN_FORKNUM, block, page, zero_before, lsn);
 }
 
 bool
