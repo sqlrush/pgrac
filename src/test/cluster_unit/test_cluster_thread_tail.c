@@ -100,7 +100,7 @@ volatile sig_atomic_t InterruptPending;
 volatile uint32 InterruptHoldoffCount, CritSectionCount;
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
-static int read_action, close_action;
+static int read_action, close_action, suffix_read_action;
 static XLogRecPtr mutation_position;
 static ClusterWalDurablePrefix changed_prefix;
 static ssize_t tail_test_pread(int fd, void *bytes, size_t len, off_t offset);
@@ -194,7 +194,7 @@ fixture(void)
 	snprintf(path, sizeof(path), "%s/pgrac_thread.claim", generation);
 	bytes_write(path, bytes, sizeof(bytes));
 	cluster_shared_config = false;
-	read_action = close_action = 0;
+	read_action = close_action = suffix_read_action = 0;
 	InterruptPending = false;
 }
 
@@ -297,6 +297,11 @@ tail_test_pread(int fd, void *bytes, size_t len, off_t offset)
 	ssize_t n;
 	int action = read_action;
 	read_action = 0;
+	/* Exercise the later-header scan, not the preceding native WAL reads. */
+	if (suffix_read_action != 0 && len == SizeOfXLogLongPHD && offset == 0) {
+		action = suffix_read_action;
+		suffix_read_action = 0;
+	}
 	if (action == 1) {
 		errno = EIO;
 		return -1;
@@ -608,6 +613,131 @@ UT_TEST(exact_segment_end_allows_missing_unacknowledged_next_segment)
 	UT_ASSERT_EQ(p.exclusive_end, 2 * wal_segment_size);
 	UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	UT_ASSERT_EQ(out.complete_end, p.exclusive_end);
+}
+
+UT_TEST(missing_unpromised_middle_segment_is_not_a_tail)
+{
+	char path[MAXPGPATH];
+	ClusterWalDurablePrefix p;
+	ClusterWalTailObservation out;
+	size_t usable;
+	fixture();
+	usable = wal_segment_size - SizeOfXLogLongPHD
+			 - (wal_segment_size / XLOG_BLCKSZ - 1) * SizeOfXLogShortPHD;
+	p = record_write(generation, wal_segment_size + SizeOfXLogLongPHD, 0,
+					 usable - SizeOfXLogRecord - 5);
+	prefix_write(p);
+	UT_ASSERT_EQ(p.exclusive_end, 2 * wal_segment_size);
+	(void)record_write(generation, p.exclusive_end + SizeOfXLogLongPHD, p.record_start,
+					   2 * wal_segment_size);
+	segment_path(p.exclusive_end, path);
+	UT_ASSERT_EQ(unlink(path), 0);
+	UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+}
+
+UT_TEST(unwritten_suffix_does_not_hide_initialized_later_segment)
+{
+	ClusterWalDurablePrefix p;
+	ClusterWalTailObservation out;
+	fixture();
+	p = base_record();
+	/* No record continues the first segment, but the later exact-address
+	 * header proves the stream did not actually end at that zero padding. */
+	(void)record_write(generation, 3 * wal_segment_size + SizeOfXLogLongPHD, p.record_start, 40);
+	UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+}
+
+UT_TEST(preallocated_and_recycled_later_segments_are_not_redo_evidence)
+{
+	for (int recycled = 0; recycled < 2; recycled++) {
+		char path[MAXPGPATH], old_path[MAXPGPATH];
+		ClusterWalDurablePrefix p;
+		ClusterWalTailObservation out;
+		int fd;
+		fixture();
+		p = base_record();
+		segment_path(4 * wal_segment_size, path);
+		if (recycled) {
+			/* Native recycling renames a segment without rewriting its pages. */
+			(void)record_write(generation, 2 * wal_segment_size + SizeOfXLogLongPHD, p.record_start,
+							   40);
+			segment_path(2 * wal_segment_size, old_path);
+			UT_ASSERT_EQ(rename(old_path, path), 0);
+		} else {
+			fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+			UT_ASSERT(fd >= 0);
+			UT_ASSERT_EQ(ftruncate(fd, wal_segment_size), 0);
+			UT_ASSERT_EQ(close(fd), 0);
+		}
+		UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(out.complete_end, p.exclusive_end);
+		UT_ASSERT_EQ(out.records, 1);
+	}
+}
+
+UT_TEST(incomplete_final_record_can_span_initialized_segments)
+{
+	char path[MAXPGPATH];
+	ClusterWalDurablePrefix p, next;
+	ClusterWalTailObservation out;
+	fixture();
+	p = base_record();
+	next = record_write(generation, p.exclusive_end, p.record_start, 2 * wal_segment_size);
+	segment_path(next.exclusive_end - 1, path);
+	UT_ASSERT_EQ(truncate(path, (next.exclusive_end - 1) % wal_segment_size - 16), 0);
+	UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+	UT_ASSERT_EQ(out.complete_end, p.exclusive_end);
+}
+
+UT_TEST(later_segment_must_match_exact_source_identity)
+{
+	uint64 foreign = 12345678;
+	ClusterWalDurablePrefix p;
+	ClusterWalTailObservation out;
+	fixture();
+	p = base_record();
+	(void)record_write(generation, 3 * wal_segment_size + SizeOfXLogLongPHD, p.record_start, 40);
+	overwrite(3 * wal_segment_size + offsetof(XLogLongPageHeaderData, xlp_sysid), &foreign,
+			  sizeof(foreign));
+	UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH);
+}
+
+UT_TEST(later_segment_scan_preserves_failure_cleanup_and_namespace)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		char path[MAXPGPATH];
+		ClusterWalDurablePrefix p;
+		ClusterWalTailObservation out, zero = { 0 };
+		volatile bool caught = false;
+		int fd, before;
+		fixture();
+		p = base_record();
+		mutation_position = 4 * wal_segment_size;
+		segment_path(mutation_position, path);
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0600);
+		UT_ASSERT(fd >= 0);
+		UT_ASSERT_EQ(ftruncate(fd, wal_segment_size), 0);
+		UT_ASSERT_EQ(close(fd), 0);
+		suffix_read_action = fault == 0 ? 1 : fault == 1 ? 3 : fault == 2 ? 4 : 5;
+		before = fd_count();
+		memset(&out, 0xa5, sizeof(out));
+		PG_TRY();
+		{
+			ClusterControlRootResult result = observe(p.exclusive_end, &out);
+			UT_ASSERT(fault != 3);
+			UT_ASSERT_EQ(result, fault == 0 ? CLUSTER_CONTROL_ROOT_IO_ERROR
+											: CLUSTER_CONTROL_ROOT_STALE_TOKEN);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT_EQ(caught, fault == 3);
+		UT_ASSERT_EQ(suffix_read_action, 0);
+		UT_ASSERT_EQ(fd_count(), before);
+		UT_ASSERT_EQ(memcmp(&out, &zero, sizeof(out)), 0);
+	}
 }
 
 UT_TEST(checkpoint_floor_and_claim_cannot_be_substituted)
@@ -955,7 +1085,7 @@ UT_TEST(startup_empty_is_actual_input_not_ordinary_tail_authority)
 UT_TEST(startup_scans_complete_records_even_after_empty_promise)
 {
 	ClusterWalStartupObservation out;
-	xl_parameter_change parameters = { 900, 31, 17, 9, 81, WAL_LEVEL_REPLICA, false, true };
+	xl_parameter_change parameters = { 900, 31, 17, 9, 81, WAL_LEVEL_REPLICA, false, false };
 	ClusterWalDurablePrefix first, next;
 	fixture();
 	first = parameter_record(wal_segment_size + SizeOfXLogLongPHD, 0, parameters, false);
@@ -1006,7 +1136,7 @@ UT_TEST(startup_rejects_nonindependent_stream_and_malformed_parameters)
 {
 	for (int fault = 0; fault < 5; fault++) {
 		ClusterWalStartupObservation out;
-		xl_parameter_change parameters = { 900, 31, 17, 9, 81, WAL_LEVEL_REPLICA, false, true };
+		xl_parameter_change parameters = { 900, 31, 17, 9, 81, WAL_LEVEL_REPLICA, false, false };
 		ClusterWalDurablePrefix first;
 		fixture();
 		if (fault == 1)
@@ -1020,6 +1150,15 @@ UT_TEST(startup_rejects_nonindependent_stream_and_malformed_parameters)
 		prefix_write(first);
 		UT_ASSERT(startup_observe(&out) != CLUSTER_CONTROL_ROOT_OK_PRIMARY);
 	}
+}
+
+UT_TEST(startup_commit_ts_history_still_refuses)
+{
+	ClusterWalStartupObservation out;
+	xl_parameter_change parameters = { 900, 31, 17, 9, 81, WAL_LEVEL_REPLICA, false, true };
+	fixture();
+	prefix_write(parameter_record(wal_segment_size + SizeOfXLogLongPHD, 0, parameters, false));
+	UT_ASSERT_EQ(startup_observe(&out), CLUSTER_CONTROL_ROOT_PROFILE_UNSUPPORTED);
 }
 
 UT_TEST(startup_preserves_physical_failure_and_cancellation_boundaries)
@@ -1234,7 +1373,14 @@ UT_TEST(sealed_reader_refuses_changed_cut_and_discards_provisional_output)
 int
 main(void)
 {
-	UT_PLAN(38);
+	UT_PLAN(45);
+	UT_RUN(later_segment_must_match_exact_source_identity);
+	UT_RUN(later_segment_scan_preserves_failure_cleanup_and_namespace);
+	UT_RUN(missing_unpromised_middle_segment_is_not_a_tail);
+	UT_RUN(unwritten_suffix_does_not_hide_initialized_later_segment);
+	UT_RUN(preallocated_and_recycled_later_segments_are_not_redo_evidence);
+	UT_RUN(incomplete_final_record_can_span_initialized_segments);
+	UT_RUN(startup_commit_ts_history_still_refuses);
 	UT_RUN(sealed_reader_accepts_promoted_empty_but_not_missing_promise);
 	UT_RUN(sealed_reader_refuses_changed_cut_and_discards_provisional_output);
 	UT_RUN(startup_sync_preserves_actual_promise_and_closes_all_fds);

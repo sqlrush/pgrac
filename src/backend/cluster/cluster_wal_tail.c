@@ -2,6 +2,7 @@
  * Author: SqlRush <sqlrush@gmail.com>
  */
 #include "postgres.h"
+#include <dirent.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -26,6 +27,9 @@ typedef struct WalTailWork {
 	int dirs[3];
 	int segment_fd;
 	int prefix_dir;
+	int suffix_fd;
+	DIR *suffix_scan;
+	XLogRecPtr last_page_requested;
 	WalTailSegment *segments;
 	WalTailSegment *current;
 	XLogReaderState *reader;
@@ -112,6 +116,7 @@ wal_tail_page(XLogReaderState *reader, XLogRecPtr pageptr, int required,
 		work->result = CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 		return XLREAD_FAIL;
 	}
+	work->last_page_requested = Max(work->last_page_requested, pageptr);
 	XLByteToSeg(pageptr, number, reader->segcxt.ws_segsize);
 	if (work->segment_fd < 0 || work->current->number != number) {
 		char filename[MAXFNAMELEN];
@@ -209,6 +214,102 @@ wal_tail_paths_current(WalTailWork *work)
 		if (!wal_tail_segment_current(work, s))
 			return false;
 	return true;
+}
+
+/* A missing/invalid tail page is not EOF if a later segment has actually
+ * been initialized at its own address. Filenames alone are insufficient:
+ * native preallocation is zero-filled and recycling retains old addresses.
+ * Do not count headers traversed while reading an incomplete final record.
+ * This scan only refuses known gaps; it never skips a hole or supplies redo.
+ * Author: SqlRush <sqlrush@gmail.com> */
+static ClusterControlRootResult
+wal_tail_no_written_successor(WalTailWork *work, XLogRecPtr lower)
+{
+	XLogSegNo last_segment;
+	int scan_fd;
+	ClusterControlRootResult result = CLUSTER_CONTROL_ROOT_OK_PRIMARY;
+
+	XLByteToSeg(Max(lower, work->last_page_requested), last_segment,
+				work->reader->segcxt.ws_segsize);
+	scan_fd = openat(work->dirs[2], ".", O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+	if (scan_fd < 0)
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	work->suffix_scan = fdopendir(scan_fd);
+	if (work->suffix_scan == NULL) {
+		(void)close(scan_fd);
+		return CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	for (;;) {
+		struct dirent *entry;
+		struct stat before, after, named;
+		XLogLongPageHeaderData header;
+		XLogSegNo number;
+		TimeLineID timeline;
+		char canonical[MAXFNAMELEN];
+		size_t used = 0;
+		int fd;
+
+		CHECK_FOR_INTERRUPTS();
+		errno = 0;
+		entry = readdir(work->suffix_scan);
+		if (entry == NULL) {
+			if (errno != 0)
+				result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+			break;
+		}
+		if (!IsXLogFileName(entry->d_name))
+			continue;
+		XLogFromFileName(entry->d_name, &timeline, &number, work->reader->segcxt.ws_segsize);
+		if (timeline != work->ref.timeline || number <= last_segment)
+			continue;
+		XLogFileName(canonical, timeline, number, work->reader->segcxt.ws_segsize);
+		if (strcmp(canonical, entry->d_name) != 0
+			|| number > PG_UINT64_MAX / work->reader->segcxt.ws_segsize)
+			return CLUSTER_CONTROL_ROOT_RANGE_INVALID;
+		work->suffix_fd = openat(work->dirs[2], entry->d_name,
+								 O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC | PG_BINARY);
+		if (work->suffix_fd < 0 || fstat(work->suffix_fd, &before) != 0
+			|| !wal_tail_owned(&before, false) || before.st_size > work->reader->segcxt.ws_segsize)
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		while (used < SizeOfXLogLongPHD) {
+			ssize_t n;
+			CHECK_FOR_INTERRUPTS();
+			n = pread(work->suffix_fd, (char *)&header + used, SizeOfXLogLongPHD - used, used);
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n < 0)
+				return CLUSTER_CONTROL_ROOT_IO_ERROR;
+			if (n == 0)
+				break;
+			used += n;
+		}
+		if (fstat(work->suffix_fd, &after) != 0
+			|| fstatat(work->dirs[2], entry->d_name, &named, AT_SYMLINK_NOFOLLOW) != 0
+			|| !wal_tail_same(&before, &after, false) || !wal_tail_same(&before, &named, false))
+			return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
+		fd = work->suffix_fd;
+		work->suffix_fd = -1;
+		if (close(fd) != 0)
+			return CLUSTER_CONTROL_ROOT_IO_ERROR;
+		if (used == SizeOfXLogLongPHD && header.std.xlp_magic == XLOG_PAGE_MAGIC
+			&& (header.std.xlp_info & XLP_LONG_HEADER) != 0
+			&& header.std.xlp_pageaddr == number * work->reader->segcxt.ws_segsize) {
+			if (header.std.xlp_tli != work->ref.timeline
+				|| header.std.xlp_thread_id != work->ref.claim.identity.origin_thread_id
+				|| header.xlp_sysid != work->ref.claim.identity.system_identifier
+				|| header.xlp_seg_size != work->reader->segcxt.ws_segsize
+				|| header.xlp_xlog_blcksz != XLOG_BLCKSZ)
+				return CLUSTER_CONTROL_ROOT_IDENTITY_MISMATCH;
+			return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
+		}
+	}
+	{
+		DIR *scan = work->suffix_scan;
+		work->suffix_scan = NULL;
+		if (closedir(scan) != 0)
+			result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	}
+	return result;
 }
 
 /* PGRAC: physical validity does not imply a supported shared recovery profile.
@@ -438,6 +539,9 @@ wal_tail_scan(WalTailWork *work, int segment_size, XLogRecPtr lower, XLogRecPtr 
 		return CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC;
 	if (!wal_tail_close_segment(work))
 		return work->result;
+	result = wal_tail_no_written_successor(work, lower);
+	if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
+		return result;
 	if (!wal_tail_paths_current(work))
 		return CLUSTER_CONTROL_ROOT_STALE_TOKEN;
 	if (work->sync_inputs) {
@@ -533,6 +637,12 @@ wal_startup_sync_inputs(WalTailWork *work)
 static ClusterControlRootResult
 wal_tail_release(WalTailWork *work, ClusterControlRootResult result)
 {
+	if (work->suffix_fd >= 0 && close(work->suffix_fd) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	work->suffix_fd = -1;
+	if (work->suffix_scan != NULL && closedir(work->suffix_scan) != 0)
+		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
+	work->suffix_scan = NULL;
 	if (work->segment_fd >= 0 && close(work->segment_fd) != 0)
 		result = CLUSTER_CONTROL_ROOT_IO_ERROR;
 	work->segment_fd = -1;
@@ -591,6 +701,7 @@ wal_tail_observe_common(const char *wal_root, const ClusterWalDurablePrefixRef *
 	work->checkpoint_crc = checkpoint_crc;
 	work->segment_fd = -1;
 	work->prefix_dir = -1;
+	work->suffix_fd = -1;
 	for (size_t i = 0; i < lengthof(work->dirs); ++i)
 		work->dirs[i] = -1;
 	PG_TRY();
