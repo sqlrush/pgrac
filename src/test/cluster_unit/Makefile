@@ -2305,7 +2305,18 @@ test_cluster_side_route: test_cluster_side_route.c unit_test.h \
 
 # RF-SIDE D-SIDE-02: TT/undo decode + preflight primitives (single
 # parser; malformed/unknown -> BLOCKED pre-mutation).
-CLUSTER_SIDE_UNDO_O = $(top_builddir)/src/backend/cluster/cluster_side_undo.o
+CLUSTER_SIDE_UNDO_O = test_cluster_side_xact_undo_product.o
+
+# Use the original transition tables, never mock their decisions in typed
+# header preparation tests. The extracted functions retain their real bodies.
+test_cluster_undo_tt_transition.inc: $(top_srcdir)/src/backend/cluster/cluster_tt_durable.c Makefile
+	awk 'BEGIN { print "#include \"postgres.h\""; print "#include \"cluster/cluster_tt_durable.h\""; \
+	             print "#include \"cluster/cluster_uba.h\"" } \
+	     /^cluster_tt_durable_redo_decide\(/ { print "ClusterTTRedoDecision"; emit=1; found++ } \
+	     /^cluster_tt_active_transition_decide\(/ { print "ClusterTTActiveTransitionDecision"; emit=1; found++ } \
+	     /^cluster_tt_terminal_transition_decide\(/ { print "ClusterTTTerminalTransitionDecision"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
 test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
 	awk '/^(cluster_undo_emit_[a-z_]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
 	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
@@ -2322,6 +2333,11 @@ test_cluster_undo_lifecycle_native.inc: $(top_srcdir)/src/backend/cluster/storag
 	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_undo_bind_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^cluster_tt_durable_redo_bind_slot\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_undo_header_identity.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
 	awk '/^cluster_undo_segment_header_identity_ok\(/ { print "bool"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
@@ -2329,6 +2345,7 @@ test_cluster_undo_header_identity.inc: $(top_srcdir)/src/backend/cluster/storage
 
 test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_test.h \
 		test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc \
+		test_cluster_undo_bind_native.inc \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
@@ -2373,10 +2390,12 @@ $(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_TT_2PC_RECORD_O = $(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o
 test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
+		test_cluster_undo_tt_transition.inc \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) -include test_cluster_undo_tt_transition.inc \
+		-ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_side_xact: test_cluster_side_xact.c unit_test.h \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \

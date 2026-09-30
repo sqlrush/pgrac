@@ -839,11 +839,11 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segm
 {
 	char path[MAXPGPATH];
 	int fd;
-	PGAlignedBlock blockbuf;
+	PGAlignedBlock blockbuf, prepared;
 	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)blockbuf.data;
-	TTSlot *predecessor;
 	TTSlot successor;
-	ClusterTTActiveTransitionDecision decision;
+	ClusterUndoDecoded decoded = {0};
+	ClusterUndoHeaderPrepareResultV1 decision;
 	uint32 offset;
 	ssize_t nread;
 
@@ -884,22 +884,24 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segm
 				 errmsg("undo segment \"%s\" identity mismatch during TT ACTIVE redo", path)));
 	}
 
-	predecessor = &header->tt_slots[slot_offset];
-	decision = cluster_tt_active_transition_decide(predecessor, header->wrap_count,
-												   segment_generation, xid, wrap, true);
+	decoded.kind = CLUSTER_UNDO_KIND_TT_BIND;
+	decoded.opcode = XLOG_UNDO_TT_SLOT_BIND;
+	decoded.instance = instance;
+	decoded.segment_id = segment_id;
+	decoded.expected_generation = segment_generation;
+	decoded.slot_offset = slot_offset;
+	decoded.wrap = wrap;
+	decoded.xid = xid;
+	decoded.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	decision = cluster_undo_prepare_header_v1(&decoded, NULL, 0, blockbuf.data, prepared.data);
 	switch (decision) {
-	case CLUSTER_TT_ACTIVE_STALE:
+	case CLUSTER_UNDO_HEADER_SKIP_STALE:
 		cluster_vis_bump_recovery_undo_redo_skips();
 		break;
-	case CLUSTER_TT_ACTIVE_IDEMPOTENT:
+	case CLUSTER_UNDO_HEADER_ALREADY:
 		break;
-	case CLUSTER_TT_ACTIVE_APPLY:
-		memset(&successor, 0, sizeof(successor));
-		successor.xid = xid;
-		successor.wrap = wrap;
-		successor.status = TT_SLOT_ACTIVE;
-		successor.commit_scn = InvalidScn;
-		successor.first_undo_block = InvalidUbaVal;
+	case CLUSTER_UNDO_HEADER_APPLY:
+		successor = ((UndoSegmentHeaderData *)prepared.data)->tt_slots[slot_offset];
 		offset = (uint32)offsetof(UndoSegmentHeaderData, tt_slots)
 				 + (uint32)slot_offset * (uint32)sizeof(TTSlot);
 		if (pg_pwrite(fd, &successor, sizeof(successor), (off_t)offset) != sizeof(successor)) {
@@ -922,8 +924,7 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segm
 		}
 		cluster_vis_bump_recovery_undo_redo_applies();
 		break;
-	case CLUSTER_TT_ACTIVE_CONFLICT:
-	case CLUSTER_TT_ACTIVE_CORRUPT:
+	case CLUSTER_UNDO_HEADER_BLOCKED:
 	default:
 		close(fd);
 		ereport(

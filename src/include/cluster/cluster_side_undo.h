@@ -130,13 +130,16 @@ extern bool cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
 typedef enum ClusterUndoHeaderPrepareResultV1 {
 	CLUSTER_UNDO_HEADER_BLOCKED = 0,
 	CLUSTER_UNDO_HEADER_APPLY,
-	CLUSTER_UNDO_HEADER_SKIP_STALE
+	CLUSTER_UNDO_HEADER_SKIP_STALE,
+	CLUSTER_UNDO_HEADER_ALREADY
 } ClusterUndoHeaderPrepareResultV1;
 
-/* Native lifecycle preparation, not recovery authority. INIT/REUSE validate
+/* Native lifecycle/TT preparation, not recovery authority. INIT/REUSE validate
  * header identity, allocated state and generation; RECYCLE needs a valid base.
  * Native generation decisions are preserved, including REUSE's torn-header
- * repair. Only APPLY changes out; base and out may alias. */
+ * repair. TT records use the existing exact generation/slot transition tables
+ * and preserve all unrelated header bytes. Only APPLY changes out; base and
+ * out may alias. ALREADY is a byte-identical TT result, not a stale generation. */
 extern ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
 							   Size payload_length, const char *base, char *out);
