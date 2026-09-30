@@ -37,9 +37,11 @@ side_owner_end_protected_set(void *arg, bool complete)
 
 	if (owner == NULL || !owner->protected_set_active)
 		return;
-	owner->protected_set_complete = complete && side_owner_authority_fresh(owner);
+	/* Drop writer scope even if the final authority observation throws. */
+	owner->protected_set_complete = false;
 	owner->protected_set_active = false;
 	cluster_remote_xact_online_writer_pop();
+	owner->protected_set_complete = complete && side_owner_authority_fresh(owner);
 }
 
 static bool

@@ -25,6 +25,17 @@
 
 UT_DEFINE_GLOBALS();
 
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
 void
 ExceptionalCondition(const char *conditionName pg_attribute_unused(),
 					 const char *fileName pg_attribute_unused(),
@@ -1751,10 +1762,84 @@ UT_TEST(test_online_plan_denies_nonempty_abort_without_undo_completion)
 	rf_side_online_plan_destroy_v1(&plan);
 }
 
+static bool
+raise_owner_error(void *arg pg_attribute_unused(),
+				  const RfSideOnlineOperationV1 *operation pg_attribute_unused())
+{
+	pg_re_throw();
+}
+
+UT_TEST(test_protected_set_released_on_preflight_or_apply_error)
+{
+	FakeXactRecord fake;
+	RfDetachedRecordPlanV1 record_plan;
+	RfPageOnlineRecordIdentityV1 identity;
+	RfSideOnlinePlanRequestV1 request = {0};
+	RfSideOnlinePlanV1 *plan = NULL;
+	RfContributorStreamCutV1 cut = {0};
+	RfSideOnlineApplyOpsV1 ops = {0};
+	ApplyCapture *capture = calloc(1, sizeof(*capture));
+	uint8 storage_uuid[16];
+
+	memset(storage_uuid, 0x42, sizeof(storage_uuid));
+	(void)make_commit(&fake, 800, UINT64_C(901), INT64_C(123456), false);
+	identity = make_identity(&fake, storage_uuid);
+	record_plan = make_record_plan(&fake);
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	request.system_identifier = identity.record.system_identifier;
+	memcpy(request.storage_uuid, storage_uuid, sizeof(storage_uuid));
+	request.physical_cuts = &cut;
+	request.participant_count = 1;
+	UT_ASSERT_EQ(rf_side_online_plan_create_v1(&request, &plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record_plan, &identity), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	ops.arg = capture;
+	ops.begin_protected_set = capture_begin;
+	ops.end_protected_set = capture_end;
+	for (int cutpoint = 0; cutpoint < 3; cutpoint++) {
+		volatile bool caught = false;
+
+		memset(capture, 0, sizeof(*capture));
+		ops.preflight_xact = cutpoint == 2 ? accept_preflight : raise_owner_error;
+		ops.apply_xact = cutpoint == 2 ? raise_owner_error : capture_apply;
+		PG_TRY();
+		{
+			if (cutpoint == 0)
+				(void)rf_side_online_plan_preflight_v1(plan, &ops);
+			else
+				(void)rf_side_online_plan_apply_v1(plan, &ops);
+		}
+		PG_CATCH();
+		{
+			caught = true;
+		}
+		PG_END_TRY();
+		UT_ASSERT(caught);
+		UT_ASSERT_EQ(capture->begin_count, 1);
+		UT_ASSERT_EQ(capture->end_count, 1);
+		UT_ASSERT(!capture->end_complete);
+		UT_ASSERT_EQ(capture->count, 0);
+		UT_ASSERT(PG_exception_stack == NULL);
+		/* A clean retry must acquire/release its own scope normally. */
+		ops.preflight_xact = accept_preflight;
+		ops.apply_xact = capture_apply;
+		UT_ASSERT_EQ(rf_side_online_plan_apply_v1(plan, &ops), RF_PAGE_PROOF_DETAIL_OK);
+		UT_ASSERT_EQ(capture->begin_count, 2);
+		UT_ASSERT_EQ(capture->end_count, 2);
+		UT_ASSERT(capture->end_complete);
+	}
+	rf_side_online_plan_destroy_v1(&plan);
+	free(capture);
+}
+
 int
 main(void)
 {
-	UT_PLAN(23);
+	UT_PLAN(24);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);
@@ -1778,6 +1863,7 @@ main(void)
 	UT_RUN(test_online_plan_denies_abort_terminal_missing_tt_abort);
 	UT_RUN(test_online_plan_accepts_exact_preceding_tt_abort_dependency);
 	UT_RUN(test_online_plan_denies_nonempty_abort_without_undo_completion);
+	UT_RUN(test_protected_set_released_on_preflight_or_apply_error);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

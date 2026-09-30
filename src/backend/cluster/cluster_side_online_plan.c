@@ -635,29 +635,28 @@ rf_side_online_plan_preflight_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnl
 		return RF_PAGE_PROOF_DETAIL_OK;
 	if (!ops->begin_protected_set(ops->arg))
 		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-	detail = side_plan_preflight_active(plan, ops);
-	/* A preflight-only pass never publishes a complete protected set. */
-	ops->end_protected_set(ops->arg, false);
+	PG_TRY();
+	{
+		detail = side_plan_preflight_active(plan, ops);
+	}
+	PG_FINALLY();
+	{
+		/* A preflight-only pass never publishes a complete protected set. */
+		ops->end_protected_set(ops->arg, false);
+	}
+	PG_END_TRY();
 	return detail;
 }
 
-RfPageProofDetailV1
-rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOpsV1 *ops)
+static RfPageProofDetailV1
+side_plan_apply_active(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOpsV1 *ops)
 {
 	RfPageProofDetailV1 detail;
 	uint32 i;
 
-	if (!side_plan_apply_ops_valid(plan, ops))
-		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
-	if (plan->operation_count == 0)
-		return RF_PAGE_PROOF_DETAIL_OK;
-	if (!ops->begin_protected_set(ops->arg))
-		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 	detail = side_plan_preflight_active(plan, ops);
-	if (detail != RF_PAGE_PROOF_DETAIL_OK) {
-		ops->end_protected_set(ops->arg, false);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
 		return detail;
-	}
 	for (i = 0; i < plan->operation_count; i++) {
 		RfSideOnlineOperationV1 operation = plan->operations[i];
 		bool applied;
@@ -670,13 +669,35 @@ rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineA
 			applied = ops->apply_undo(ops->arg, &operation);
 		else
 			applied = ops->apply_projection(ops->arg, &operation);
-		if (!applied) {
-			ops->end_protected_set(ops->arg, false);
+		if (!applied)
 			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
-		}
 	}
-	ops->end_protected_set(ops->arg, true);
 	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_apply_v1(const RfSideOnlinePlanV1 *plan, const RfSideOnlineApplyOpsV1 *ops)
+{
+	RfPageProofDetailV1 detail;
+	volatile bool complete = false;
+
+	if (!side_plan_apply_ops_valid(plan, ops))
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (plan->operation_count == 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
+	if (!ops->begin_protected_set(ops->arg))
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	PG_TRY();
+	{
+		detail = side_plan_apply_active(plan, ops);
+		complete = detail == RF_PAGE_PROOF_DETAIL_OK;
+	}
+	PG_FINALLY();
+	{
+		ops->end_protected_set(ops->arg, complete);
+	}
+	PG_END_TRY();
+	return detail;
 }
 void
 rf_side_online_plan_destroy_v1(RfSideOnlinePlanV1 **plan_address)

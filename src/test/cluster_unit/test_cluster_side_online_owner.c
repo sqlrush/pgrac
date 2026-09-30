@@ -11,6 +11,17 @@
 
 UT_DEFINE_GLOBALS();
 
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
 void
 ExceptionalCondition(const char *condition_name pg_attribute_unused(),
 					 const char *file_name pg_attribute_unused(),
@@ -23,6 +34,7 @@ typedef struct OwnerCapture {
 	uint32 plan_operation_count;
 	uint32 authority_calls;
 	uint32 authority_fail_call;
+	uint32 authority_throw_call;
 	uint32 pushes;
 	uint32 pops;
 	uint32 xact_preflights;
@@ -48,6 +60,8 @@ fresh_authority(void *arg)
 	OwnerCapture *state = (OwnerCapture *)arg;
 
 	state->authority_calls++;
+	if (state->authority_throw_call == state->authority_calls)
+		pg_re_throw();
 	return state->authority_fail_call == 0 || state->authority_calls != state->authority_fail_call;
 }
 
@@ -281,14 +295,41 @@ UT_TEST(test_empty_plan_requires_fresh_closure_authority)
 	UT_ASSERT(!owner.protected_set_complete);
 }
 
+UT_TEST(test_completion_authority_error_cannot_keep_writer_scope)
+{
+	RfSideOnlineProductionOwnerV1 *owner = calloc(1, sizeof(*owner));
+	RfSideOnlinePlanV1 *plan = (RfSideOnlinePlanV1 *)(uintptr_t)1;
+	volatile bool caught = false;
+
+	memset(&capture, 0, sizeof(capture));
+	capture.plan_operation_count = 3;
+	capture.authority_throw_call = 8; /* begin + 3 preflights + 3 applies + end */
+	UT_ASSERT(rf_side_online_production_owner_init_v1(owner, &capture, fresh_authority, 19, true));
+	PG_TRY();
+	{
+		(void)rf_side_online_production_apply_v1(plan, owner);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT_EQ(capture.pushes, 1);
+	UT_ASSERT_EQ(capture.pops, 1);
+	UT_ASSERT(!owner->protected_set_active && !owner->protected_set_complete);
+	free(owner);
+}
+
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_owner_runs_all_preflights_before_fresh_gated_mutations);
 	UT_RUN(test_stale_authority_before_first_mutation_closes_whole_set);
 	UT_RUN(test_empty_plan_closes_without_writer_barrier_or_mutation);
 	UT_RUN(test_empty_plan_requires_fresh_closure_authority);
+	UT_RUN(test_completion_authority_error_cannot_keep_writer_scope);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }
