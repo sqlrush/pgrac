@@ -101,6 +101,20 @@ extern RfPageProofDetailV1 rf_side_online_plan_prepare_space_v1(
 	const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *expected,
 	const void *identity_page, const void *reservation_page, uint32 *order,
 	uint32 capacity, uint32 *out_count, ClusterSpaceRecoveryImage *out);
+
+typedef struct RfSideUndoHeaderImageV1 {
+	PGAlignedBlock page;
+	uint32 source_index;
+	uint32 operation_count;
+} RfSideUndoHeaderImageV1;
+
+/* Evolve a private segment header through its source-ordered lifecycle and
+ * TT records, including folded XACT COMMIT. The target read, physical UNDO
+ * blocks, installation and durability remain separate protected obligations.
+ * No output change on refusal. UINT32_MAX source means no byte change. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_header_v1(
+	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
+	const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
 extern bool rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 											 RfSideOnlineOperationV1 *out_operation);

@@ -19,6 +19,7 @@
 #include "cluster/cluster_side_online_plan.h"
 #include "cluster/cluster_side_undo.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_tt_2pc.h"
 #include "cluster/cluster_xid_stripe.h"
 #include "cluster/storage/cluster_undo_xlog.h"
@@ -26,6 +27,8 @@
 #include "unit_test.h"
 
 UT_DEFINE_GLOBALS();
+
+#include "test_cluster_undo_header_identity.inc"
 
 sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
@@ -286,7 +289,7 @@ cluster_remote_commit_timestamp(int origin_node pg_attribute_unused(),
 
 typedef struct FakeXactRecord {
 	XLogReaderState reader;
-	uint8 data[1024];
+	uint8 data[BLCKSZ + 1024];
 	union {
 		DecodedXLogRecord decoded;
 		char pad[sizeof(DecodedXLogRecord) + 2 * sizeof(DecodedBkpBlock)];
@@ -312,7 +315,7 @@ make_commit(FakeXactRecord *fake, TransactionId xid, SCN scn, TimestampTz timest
 	xinfo.xinfo = XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT;
 	wal_scn.scn = scn;
 	tt.instance = 3;
-	tt.segment_id = 9;
+	tt.segment_id = 513;
 	tt.segment_generation = 11;
 	tt.slot_offset = 4;
 	tt.wrap = 7;
@@ -2042,10 +2045,141 @@ UT_TEST(test_space_plan_rejects_unbound_native_shapes)
 	}
 }
 
+static void
+undo_header_feed(RfSideOnlinePlanV1 *plan, FakeXactRecord *fake, XLogRecPtr begin)
+{
+	uint8 uuid[16];
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+
+	memset(uuid, 0x44, sizeof(uuid));
+	identity = make_identity(fake, uuid);
+	set_identity_range(fake, &identity, begin, begin + 100);
+	record = fake->u.decoded.header.xl_rmid == RM_CLUSTER_UNDO_ID
+		? make_undo_record_plan(fake) : make_record_plan(fake);
+	UT_ASSERT_EQ(rf_side_online_plan_feed_record_v1(plan, &record, &identity),
+		RF_PAGE_PROOF_DETAIL_OK);
+	memset(fake->data, 0xee, sizeof(fake->data));
+}
+
+static void
+undo_header_bind(FakeXactRecord *fake, uint32 generation)
+{
+	xl_undo_tt_slot_bind bind = {0};
+
+	bind.instance = 3;
+	bind.segment_id = 513;
+	bind.segment_generation = generation;
+	bind.slot_offset = 4;
+	bind.wrap = 7;
+	bind.xid = 802;
+	bind.format_version = CLUSTER_UNDO_TT_BIND_VERSION;
+	make_projection_record(fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_TT_SLOT_BIND,
+		&bind, sizeof(bind));
+}
+
+static void
+undo_header_commit(FakeXactRecord *fake, uint32 generation, TransactionId xid)
+{
+	xl_xact_tt_commit delta;
+	uint32 offset;
+
+	make_commit(fake, xid, 999, 12345, false);
+	offset = fake->u.decoded.main_data_len - sizeof(delta);
+	memcpy(&delta, fake->data + offset, sizeof(delta));
+	delta.segment_id = 513;
+	delta.segment_generation = generation;
+	memcpy(fake->data + offset, &delta, sizeof(delta));
+}
+
+UT_TEST(test_online_undo_header_evolves_init_bind_and_folded_commit)
+{
+	RfSideOnlinePlanV1 *plan = space_online_plan(500);
+	FakeXactRecord fake;
+	RfSideUndoHeaderImageV1 image, repeated;
+	PGAlignedBlock base;
+	struct { xl_cluster_undo_segment_init record; uint8 page[BLCKSZ]; } init = {0};
+
+	init.record.instance = 3;
+	init.record.segment_id = 513;
+	cluster_undo_segment_make_header_bytes(513, 3, (char *)init.page);
+	make_projection_record(&fake, RM_CLUSTER_UNDO_ID, XLOG_UNDO_SEGMENT_INIT,
+		&init, sizeof(init));
+	undo_header_feed(plan, &fake, 100);
+	undo_header_bind(&fake, 0);
+	undo_header_feed(plan, &fake, 200);
+	make_undo_delta(&fake);
+	undo_header_feed(plan, &fake, 300);
+	undo_header_commit(&fake, 0, 802);
+	undo_header_feed(plan, &fake, 400);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	memset(&image, 0x7a, sizeof(image));
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, NULL, &image),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(image.operation_count, 3);
+	UT_ASSERT_EQ(image.source_index, 3);
+	UT_ASSERT_EQ(((UndoSegmentHeaderData *)image.page.data)->tt_slots[4].status,
+		TT_SLOT_COMMITTED);
+	UT_ASSERT_EQ(((UndoSegmentHeaderData *)image.page.data)->tt_slots[4].commit_scn, 999);
+	base = image.page;
+	UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &repeated),
+		RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(memcmp(repeated.page.data, image.page.data, BLCKSZ) == 0);
+	UT_ASSERT(memcmp(base.data, image.page.data, BLCKSZ) == 0);
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_online_undo_header_private_base_and_late_failure)
+{
+	for (int fault = 0; fault < 3; fault++) {
+		RfSideOnlinePlanV1 *plan = space_online_plan(300);
+		FakeXactRecord fake;
+		PGAlignedBlock base, saved;
+		RfSideUndoHeaderImageV1 image, unchanged;
+
+		cluster_undo_segment_make_header_bytes(513, 3, base.data);
+		saved = base;
+		undo_header_bind(&fake, 0);
+		undo_header_feed(plan, &fake, 100);
+		undo_header_commit(&fake, fault == 1 ? 1 : 0, fault == 2 ? 803 : 802);
+		undo_header_feed(plan, &fake, 200);
+		UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+		memset(&unchanged, 0xa9, sizeof(unchanged));
+		image = unchanged;
+		UT_ASSERT_EQ(rf_side_online_plan_prepare_undo_header_v1(plan, 3, 513, base.data, &image),
+			fault == 0 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT(memcmp(base.data, saved.data, BLCKSZ) == 0);
+		if (fault != 0) UT_ASSERT(memcmp(&image, &unchanged, sizeof(image)) == 0);
+		else {
+			UT_ASSERT_EQ(image.operation_count, 2);
+			UT_ASSERT_EQ(image.source_index, 1);
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_folded_commit_segment_must_belong_to_source_origin)
+{
+	FakeXactRecord fake;
+	xl_xact_tt_commit delta;
+	RfSideXactOperationV1 operation;
+	uint32 offset;
+
+	make_commit(&fake, 802, 999, 12345, false);
+	offset = fake.u.decoded.main_data_len - sizeof(delta);
+	memcpy(&delta, fake.data + offset, sizeof(delta));
+	delta.segment_id = 9;
+	memcpy(fake.data + offset, &delta, sizeof(delta));
+	UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, UINT64_C(0x11223344), 3, &operation));
+}
+
 int
 main(void)
 {
-	UT_PLAN(27);
+	UT_PLAN(30);
+	UT_RUN(test_folded_commit_segment_must_belong_to_source_origin);
+	UT_RUN(test_online_undo_header_evolves_init_bind_and_folded_commit);
+	UT_RUN(test_online_undo_header_private_base_and_late_failure);
 	UT_RUN(test_commit_decodes_to_immutable_truth_operation);
 	UT_RUN(test_commit_tt_conflict_is_blocked_before_apply);
 	UT_RUN(test_non_xact_and_missing_tt_are_blocked);

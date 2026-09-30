@@ -144,6 +144,12 @@ extern ClusterUndoHeaderPrepareResultV1
 cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
 							   Size payload_length, const char *base, char *out);
 
+/* The ordinary XACT COMMIT's folded exact TT delta uses the same native
+ * generation/terminal decision. Only APPLY changes out. */
+extern ClusterUndoHeaderPrepareResultV1 cluster_undo_prepare_commit_v1(
+	uint8 instance, uint32 segment_id, uint32 generation, uint16 slot_offset,
+	uint16 wrap, TransactionId xid, SCN commit_scn, const char *base, char *out);
+
 typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,
 	CLUSTER_UNDO_APPLY_BLOCKED = 1,

@@ -271,6 +271,7 @@ side_xact_tt_delta_valid(const xl_xact_tt_commit *delta, uint16 origin_thread, T
 						 SCN scn)
 {
 	return delta != NULL && delta->instance == origin_thread && delta->segment_id != 0
+		   && ((delta->segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 == origin_thread
 		   && delta->segment_generation != UINT32_MAX && delta->slot_offset < TT_SLOTS_PER_SEGMENT
 		   && delta->wrap != TT_WRAP_INVALID && delta->xid == xid
 		   && delta->format_version == CLUSTER_XACT_TT_COMMIT_VERSION && delta->flags == 0

@@ -1081,8 +1081,7 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 	int fd;
 	PGAlignedBlock blockbuf;
 	UndoSegmentHeaderData *header;
-	TTSlot *slot;
-	ClusterTTTerminalTransitionDecision decision;
+	ClusterUndoHeaderPrepareResultV1 decision;
 	ssize_t nread;
 
 	if (instance == 0 || segment_id == 0 || segment_generation == UINT32_MAX
@@ -1120,20 +1119,15 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 				(errcode(ERRCODE_DATA_CORRUPTED),
 				 errmsg("undo segment \"%s\" has conflicting exact TT commit header", path)));
 	}
-	slot = &header->tt_slots[slot_offset];
-	decision = cluster_tt_terminal_transition_decide(slot, header->wrap_count, segment_generation,
-													 xid, wrap, TT_SLOT_COMMITTED, commit_scn);
-	if (decision == CLUSTER_TT_TERMINAL_STALE) {
+	decision = cluster_undo_prepare_commit_v1(instance, segment_id, segment_generation,
+		slot_offset, wrap, xid, commit_scn, blockbuf.data, blockbuf.data);
+	if (decision == CLUSTER_UNDO_HEADER_SKIP_STALE) {
 		cluster_vis_bump_recovery_undo_redo_skips();
-	} else if (decision == CLUSTER_TT_TERMINAL_IDEMPOTENT) {
+	} else if (decision == CLUSTER_UNDO_HEADER_ALREADY) {
 		/* Byte-identical exact replay. */
-	} else if (decision == CLUSTER_TT_TERMINAL_APPLY) {
+	} else if (decision == CLUSTER_UNDO_HEADER_APPLY) {
 		ssize_t written;
 
-		slot->status = TT_SLOT_COMMITTED;
-		slot->flags = TT_FLAGS_RESERVED;
-		slot->commit_scn = commit_scn;
-		slot->first_undo_block = InvalidUbaVal;
 		written = pg_pwrite(fd, blockbuf.data, BLCKSZ, 0);
 		if (written != BLCKSZ) {
 			int save_errno = errno;

@@ -2334,8 +2334,8 @@ test_cluster_undo_lifecycle_native.inc: $(top_srcdir)/src/backend/cluster/storag
 	mv $@.tmp $@
 
 test_cluster_undo_bind_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
-	awk '/^cluster_tt_durable_redo_bind_slot\(/ { print "void"; emit=1; found++ } \
-	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	awk '/^cluster_tt_durable_redo_(bind_slot|stamp_slot_exact)\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
 test_cluster_undo_header_identity.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
@@ -2397,7 +2397,7 @@ test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster
 	$(CC) $(CFLAGS) $(CPPFLAGS) -include test_cluster_undo_tt_transition.inc \
 		-ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_side_xact: test_cluster_side_xact.c unit_test.h \
+test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_header_identity.inc \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \

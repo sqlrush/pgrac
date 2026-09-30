@@ -12,6 +12,7 @@
 #include "access/multixact.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_side_online_plan.h"
+#include "cluster/storage/cluster_undo_alloc.h"
 
 #ifdef RF_SIDE_ONLINE_TESTING
 #include <stdlib.h>
@@ -657,6 +658,64 @@ done:
 	if (indices != NULL) side_free(indices);
 	if (inputs != NULL) side_free(inputs);
 	return detail;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan,
+	uint8 instance, uint32 segment_id, const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	RfSideUndoHeaderImageV1 prepared;
+	const char *current = base;
+	Size scratch = sizeof(prepared) + 2 * BLCKSZ;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| out == NULL || instance == 0 || instance > 128 || segment_id == 0
+		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (scratch > plan->memory_budget || plan->memory_used > plan->memory_budget - scratch)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	memset(&prepared, 0, sizeof(prepared));
+	prepared.source_index = UINT32_MAX;
+	if (base != NULL)
+		memcpy(prepared.page.data, base, BLCKSZ);
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		ClusterUndoHeaderPrepareResultV1 result;
+
+		if (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO) {
+			const ClusterUndoDecoded *undo = &op->undo;
+			const uint8 *payload = op->owned_payload_length == 0 ? NULL
+				: plan->owned_payload + op->owned_payload_offset;
+
+			if (undo->instance != instance || undo->segment_id != segment_id
+				|| undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				|| undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+				continue;
+			result = cluster_undo_prepare_header_v1(undo, payload, op->owned_payload_length,
+				current, prepared.page.data);
+		} else if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT
+			&& op->xact.kind == RF_SIDE_XACT_COMMIT && op->xact.has_tt_delta) {
+			const xl_xact_tt_commit *delta = &op->xact.tt_delta;
+
+			if (delta->instance != instance || delta->segment_id != segment_id)
+				continue;
+			result = cluster_undo_prepare_commit_v1(delta->instance, delta->segment_id,
+				delta->segment_generation, delta->slot_offset, delta->wrap, delta->xid,
+				delta->commit_scn, current, prepared.page.data);
+		} else
+			continue;
+		if (result == CLUSTER_UNDO_HEADER_BLOCKED)
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		if (result == CLUSTER_UNDO_HEADER_APPLY) {
+			current = prepared.page.data;
+			prepared.source_index = i;
+		}
+		prepared.operation_count++;
+	}
+	if (current == NULL || prepared.operation_count == 0)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	*out = prepared;
+	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1

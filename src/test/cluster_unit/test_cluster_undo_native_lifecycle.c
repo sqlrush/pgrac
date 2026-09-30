@@ -131,6 +131,7 @@ fixture_dir_sync(const char *path, bool isdir)
 #define cluster_vis_bump_recovery_undo_redo_skips() (skips++)
 #include "test_cluster_undo_lifecycle_native.inc"
 #define cluster_undo_redo_open_segment(instance_, segment_, path_, create_) fixture_open(path_, 0)
+#define cluster_tt_durable_count_redo_apply() ((void)0)
 #include "test_cluster_undo_bind_native.inc"
 
 static void
@@ -573,10 +574,46 @@ UT_TEST(test_native_recycle_fsync_failure_does_not_report_completion)
 	UT_ASSERT_EQ(applies + skips + dirsyncs, 0);
 }
 
+UT_TEST(test_native_exact_commit_rejects_bad_header_before_write)
+{
+	for (int fault = 0; fault < 4; fault++) {
+		PGAlignedBlock before;
+		UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)disk.data;
+
+		cluster_undo_segment_make_header_bytes(513, 3, disk.data);
+		header->wrap_count = 8;
+		header->tt_slots[4].xid = 802;
+		header->tt_slots[4].wrap = 7;
+		header->tt_slots[4].status = TT_SLOT_ACTIVE;
+		if (fault == 1) header->pd_pagesize_version = 0;
+		if (fault == 2) header->segment_size_bytes = 0;
+		if (fault == 3) header->pd_flags &= ~PD_UNDO_SEG_HEADER;
+		before = disk;
+		reset_io();
+		expect_panic = fault != 0;
+		if (setjmp(panic_jump) == 0) {
+			cluster_tt_durable_redo_stamp_slot_exact(3, 513, 8, 4, 7, 802, 999);
+			UT_ASSERT_EQ(fault, 0);
+		}
+		expect_panic = false;
+		if (fault != 0) {
+			UT_ASSERT_EQ(writes + syncs + applies, 0);
+			UT_ASSERT(memcmp(disk.data, before.data, BLCKSZ) == 0);
+		} else {
+			UT_ASSERT_EQ(header->tt_slots[4].status, TT_SLOT_COMMITTED);
+			UT_ASSERT_EQ(header->tt_slots[4].commit_scn, 999);
+			UT_ASSERT_EQ(writes, 1);
+			UT_ASSERT_EQ(syncs, 1);
+		}
+		UT_ASSERT_EQ(closes, 1);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(10);
+	UT_RUN(test_native_exact_commit_rejects_bad_header_before_write);
 	UT_RUN(test_private_abort_head_release_and_exact_stale_results);
 	UT_RUN(test_native_bind_uses_complete_header_identity_and_durable_slot);
 	UT_RUN(test_private_tt_header_sequence_and_unrelated_bytes);
