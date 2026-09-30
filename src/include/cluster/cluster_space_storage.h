@@ -45,6 +45,26 @@ extern bool cluster_space_relation_read_redo_identity(RelFileLocator locator,
  * existing reliable invalidation barrier before releasing lifecycle locks. */
 extern bool cluster_space_relation_get_identity(Relation relation, ClusterSpaceIdentity *out);
 
+typedef enum ClusterSpaceHintResult
+{
+	CLUSTER_SPACE_HINT_NATIVE,
+	CLUSTER_SPACE_HINT_SKIPPED,
+	CLUSTER_SPACE_HINT_VERSIONED
+} ClusterSpaceHintResult;
+
+/* Original hint owner, before its first byte change. Shared permanent MAIN/VM
+ * requires content-X, existing write authority and an already populated SPACE
+ * cache entry; this never reads SPACE, upgrades a lock or allocates a cache.
+ * VERSIONED enters a critical section and stamps a captured before/result.
+ * The caller must perform its bounded mutation and finish without releasing
+ * the content lock. SKIPPED leaves everything untouched: optional hints may
+ * return, but required transaction normalization must refuse the operation.
+ * NATIVE keeps the original nonshared/rebuildable hint path. */
+extern ClusterSpaceHintResult cluster_space_hint_begin(Buffer buffer,
+													RfPageProducerBatchV1 *batch);
+extern void cluster_space_hint_finish(Buffer buffer, bool standard,
+									 const RfPageProducerBatchV1 *batch);
+
 /* Memory-only single-component capture for native owners whose WAL batch can
  * span relations. Same locked-buffer/identity contract as prepare below, but
  * no token allocation; the owner prepares one token for the complete batch. */

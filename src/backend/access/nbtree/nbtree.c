@@ -30,6 +30,7 @@
 #include "access/nbtxlog.h"
 #include "access/relscan.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_control.h"
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f reverse-key */
 #endif
 #include "access/xlog.h"
@@ -1348,15 +1349,44 @@ backtrack:
 			 * takes care of this.)  This ensures we won't process the page
 			 * again.
 			 *
-			 * We treat this like a hint-bit update because there's no need to
-			 * WAL-log it.
+			 * Shared permanent pages bind the physical hint image to its page
+			 * version. Other relations keep the native hint-bit update.
 			 */
 			Assert(nhtidsdead == 0);
 			if (vstate->cycleid != 0 &&
 				opaque->btpo_cycleid == vstate->cycleid)
 			{
+#ifdef USE_PGRAC_CLUSTER
+				RfPageProducerBatchV1 version_batch;
+				bool versioned = _bt_prepare_page_version(rel, buf,
+					&vstate->version_identity, &version_batch);
+
+				if (versioned)
+					START_CRIT_SECTION();
+				if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+					elog(PANIC, "PGRAC shared btree hint version changed before mutation");
+#endif
 				opaque->btpo_cycleid = 0;
+#ifdef USE_PGRAC_CLUSTER
+				if (versioned)
+				{
+					XLogRecPtr recptr;
+
+					MarkBufferDirty(buf);
+					XLogBeginInsert();
+					XLogRegisterBuffer(0, buf, REGBUF_STANDARD | REGBUF_FORCE_IMAGE);
+					if (!rf_page_producer_register_wal_v1(&version_batch))
+						elog(PANIC, "PGRAC shared btree hint cannot register page version");
+					recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
+					PageSetLSN(page, recptr);
+				}
+				else
+#endif
 				MarkBufferDirtyHint(buf, true);
+#ifdef USE_PGRAC_CLUSTER
+				if (versioned)
+					END_CRIT_SECTION();
+#endif
 			}
 		}
 

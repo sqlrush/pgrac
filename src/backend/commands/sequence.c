@@ -1916,6 +1916,14 @@ read_seq_tuple(Relation rel, Buffer *buf, HeapTuple seqdatatuple)
 	Assert(!(seqdatatuple->t_data->t_infomask & HEAP_XMAX_IS_MULTI));
 	if (HeapTupleHeaderGetRawXmax(seqdatatuple->t_data) != InvalidTransactionId)
 	{
+#ifdef USE_PGRAC_CLUSTER
+		/* Shared storage admits only freshly initialized sequence tuples;
+		 * a legacy xmax is not an authorized page-repair input. */
+		if (cluster_shared_config && RelationIsPermanent(rel)
+			&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+			ereport(ERROR, (errcode(ERRCODE_DATA_CORRUPTED),
+							errmsg("shared sequence contains an unexpected legacy xmax")));
+#endif
 		HeapTupleHeaderSetXmax(seqdatatuple->t_data, InvalidTransactionId);
 		seqdatatuple->t_data->t_infomask &= ~HEAP_XMAX_COMMITTED;
 		seqdatatuple->t_data->t_infomask |= HEAP_XMAX_INVALID;

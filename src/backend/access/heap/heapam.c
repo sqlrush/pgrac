@@ -1338,6 +1338,8 @@ cluster_heap_itl_apply_terminal_census(
 	bool current_page_authorized = false;
 	bool tuple_refs_changed = false;
 	uint8 terminal_flags[CLUSTER_ITL_INITRANS_DEFAULT] = {0};
+	RfPageProducerBatchV1 hint_batch;
+	ClusterSpaceHintResult hint_result = CLUSTER_SPACE_HINT_NATIVE;
 	uint8 i;
 
 	if (!census->admission_owned
@@ -1373,6 +1375,11 @@ cluster_heap_itl_apply_terminal_census(
 	if (!cluster_semantic_activation_recheck_r4_terminal_census(
 			&census->admission))
 		return result;
+	if (cluster_shared_config) {
+		hint_result = cluster_space_hint_begin(buffer, &hint_batch);
+		if (hint_result == CLUSTER_SPACE_HINT_SKIPPED)
+			return result;
+	}
 	for (i = 0; i < CLUSTER_ITL_INITRANS_DEFAULT; i++)
 	{
 		ClusterItlSlotData *slot;
@@ -1391,7 +1398,10 @@ cluster_heap_itl_apply_terminal_census(
 	}
 	Assert(result.stamped_count > 0);
 	Assert(result.stamped_count == census->terminal_count);
-	MarkBufferDirtyHint(buffer, true);
+	if (hint_result == CLUSTER_SPACE_HINT_VERSIONED)
+		cluster_space_hint_finish(buffer, true, &hint_batch);
+	else
+		MarkBufferDirtyHint(buffer, true);
 	/* Even our own hint cleanup can invalidate the DML owner's tuple plan. */
 	result.kind = tuple_refs_changed ? CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X
 									 : CLUSTER_HEAP_ITL_BATCH_EXACT_STAMPED;
@@ -5673,8 +5683,18 @@ UpdateXmaxHintBits(HeapTupleHeader tuple, Buffer buffer, TransactionId xid)
 			HeapTupleSetHintBits(tuple, buffer, HEAP_XMAX_COMMITTED,
 								 xid);
 		else
+		{
+#ifdef USE_PGRAC_CLUSTER
+			/* A waited local abort/locker must be normalized before the
+			 * caller can compose its new xmax.  This is not an optional
+			 * read hint; preserve the foreign-xid authority restriction. */
+			if (cluster_shared_config && !cluster_xid_foreign_class_cheap(xid))
+				cluster_heap_stamp_released_xmax_invalid(tuple, buffer);
+			else
+#endif
 			HeapTupleSetHintBits(tuple, buffer, HEAP_XMAX_INVALID,
 								 InvalidTransactionId);
+		}
 	}
 }
 

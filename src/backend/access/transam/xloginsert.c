@@ -41,7 +41,10 @@
 #include "storage/proc.h"
 #include "utils/memutils.h"
 #ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
 #include "cluster/cluster_page_anchor_cache.h"
+#include "cluster/cluster_page_producer.h"
+#include "cluster/storage/cluster_smgr.h"
 #endif
 
 static bool
@@ -1392,6 +1395,25 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 	XLogRecPtr	recptr = InvalidXLogRecPtr;
 	XLogRecPtr	lsn;
 	XLogRecPtr	RedoRecPtr;
+#ifdef USE_PGRAC_CLUSTER
+	bool rebuildable = false;
+	RfPageProducerBatchV1 hint_batch;
+
+	if (cluster_shared_config && !BufferIsLocal(buffer) && BufferIsPermanent(buffer))
+	{
+		RelFileLocator locator;
+		ForkNumber forknum;
+		BlockNumber block;
+
+		BufferGetTag(buffer, &locator, &forknum, &block);
+		if (cluster_smgr_which_for(locator, InvalidBackendId) == 1)
+		{
+			if (forknum != FSM_FORKNUM)
+				elog(ERROR, "shared page hint requires a prepared page version");
+			rebuildable = true;
+		}
+	}
+#endif
 
 	/*
 	 * Ensure no checkpoint can change our view of RedoRecPtr.
@@ -1420,6 +1442,19 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 		ForkNumber	forkno;
 		BlockNumber blkno;
 
+#ifdef USE_PGRAC_CLUSTER
+		if (rebuildable)
+		{
+			RfPageProducerComponentV1 component = {0};
+
+			component.page_class = RF_PAGE_CLASS_REBUILDABLE_FSM;
+			component.before_kind = RF_PAGE_STATE_REBUILDABLE;
+			if (!rf_page_producer_prepare_v1(&component, 1, &hint_batch)
+				|| !rf_page_producer_stamp_v1(&hint_batch))
+				elog(ERROR, "cannot prepare rebuildable FSM hint component");
+		}
+#endif
+
 		/*
 		 * Copy buffer so we don't have to worry about concurrent hint bit or
 		 * lsn updates. We assume pd_lower/upper cannot be changed without an
@@ -1445,6 +1480,10 @@ XLogSaveBufferForHint(Buffer buffer, bool buffer_std)
 
 		BufferGetTag(buffer, &rlocator, &forkno, &blkno);
 		XLogRegisterBlock(0, &rlocator, forkno, blkno, copied_buffer.data, flags);
+#ifdef USE_PGRAC_CLUSTER
+		if (rebuildable && !rf_page_producer_register_wal_v1(&hint_batch))
+			elog(ERROR, "cannot register rebuildable FSM hint component");
+#endif
 
 		recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
 	}

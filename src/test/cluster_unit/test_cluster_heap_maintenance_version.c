@@ -30,6 +30,7 @@
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
@@ -205,7 +206,8 @@ XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)
 	UT_ASSERT(begun);
 	UT_ASSERT_EQ(id, 0);
 	UT_ASSERT_EQ(buffer, 1);
-	UT_ASSERT_EQ(flags, REGBUF_STANDARD);
+	UT_ASSERT_EQ(flags, REGBUF_STANDARD
+		| (expected_info == XLOG_FPI_FOR_HINT ? REGBUF_FORCE_IMAGE : 0));
 	memcpy(wal_image.data, current_page.data, BLCKSZ);
 }
 void
@@ -227,7 +229,7 @@ XLogRecPtr
 XLogInsert(RmgrId rmgr, uint8 info)
 {
 	UT_ASSERT(begun);
-	UT_ASSERT_EQ(rmgr, RM_HEAP2_ID);
+	UT_ASSERT_EQ(rmgr, expected_info == XLOG_FPI_FOR_HINT ? RM_XLOG_ID : RM_HEAP2_ID);
 	UT_ASSERT_EQ(info, expected_info);
 	begun = false;
 	inserts++;
@@ -426,14 +428,47 @@ UT_TEST(test_nonshared_native_maintenance)
 		check_publication(false);
 	}
 }
-UT_TEST(test_prune_hint_only_has_no_version_or_wal)
+UT_TEST(test_prune_hint_only_versions_actual_change)
 {
 	reset(XLOG_HEAP2_PRUNE, true);
+	expected_info = XLOG_FPI_FOR_HINT;
+	run_prune(false, &space_identity);
+	check_publication(true);
+	UT_ASSERT_EQ(hints, 0);
+	UT_ASSERT(!PageIsFull(current_page.data));
+	UT_ASSERT_EQ(((PageHeader) current_page.data)->pd_prune_xid, InvalidTransactionId);
+	for (int i = 1; i <= 3; i++)
+		UT_ASSERT(ItemIdIsNormal(PageGetItemId(current_page.data, i)));
+}
+UT_TEST(test_prune_hint_nonshared_keeps_native_behavior)
+{
+	reset(XLOG_HEAP2_PRUNE, false);
 	run_prune(false, NULL);
 	UT_ASSERT_EQ(hints, 1);
 	UT_ASSERT_EQ(dirties + inserts + edges, 0);
 	UT_ASSERT_EQ(next_token, 100);
 	UT_ASSERT_EQ(((PageHeader)current_page.data)->pd_block_scn, 20);
+}
+UT_TEST(test_prune_hint_no_change_has_no_version_or_wal)
+{
+	reset(XLOG_HEAP2_FREEZE_PAGE, true);
+	run_prune(false, NULL);
+	UT_ASSERT_EQ(hints + dirties + inserts + edges, 0);
+	UT_ASSERT_EQ(next_token, 100);
+	UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+}
+UT_TEST(test_prune_hint_missing_identity_refuses_before_mutation)
+{
+	reset(XLOG_HEAP2_PRUNE, true);
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		run_prune(false, NULL);
+		UT_ASSERT(false);
+	}
+	expecting_error = false;
+	UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(hints + dirties + inserts + edges + CritSectionCount, 0);
+	UT_ASSERT_EQ(next_token, 100);
 }
 
 UT_TEST(test_invalid_identity_refuses_before_mutation)
@@ -554,12 +589,15 @@ UT_TEST(test_vacuum_native_entry_refuses_missing_identity)
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(12);
 	UT_RUN(test_prune_native_plan_and_version);
 	UT_RUN(test_freeze_native_tuple_and_version);
 	UT_RUN(test_vacuum_native_unused_and_version);
 	UT_RUN(test_nonshared_native_maintenance);
-	UT_RUN(test_prune_hint_only_has_no_version_or_wal);
+	UT_RUN(test_prune_hint_only_versions_actual_change);
+	UT_RUN(test_prune_hint_nonshared_keeps_native_behavior);
+	UT_RUN(test_prune_hint_no_change_has_no_version_or_wal);
+	UT_RUN(test_prune_hint_missing_identity_refuses_before_mutation);
 	UT_RUN(test_invalid_identity_refuses_before_mutation);
 	UT_RUN(test_freeze_preserves_native_transaction_sanity_gate);
 	UT_RUN(test_vacuum_native_entry_copies_prelock_identity);

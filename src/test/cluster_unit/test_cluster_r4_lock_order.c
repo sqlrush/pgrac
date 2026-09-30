@@ -722,6 +722,17 @@ BufferIsPermanent(Buffer buffer pg_attribute_unused())
 	return false;
 }
 
+/* This fixture supplies SPACE through its existing pre-lock I/O seam. The
+ * backend cache/hint producer is exercised by test_cluster_space_cache. */
+void hash_seq_init(HASH_SEQ_STATUS *scan, HTAB *table) { abort(); }
+void *hash_seq_search(HASH_SEQ_STATUS *scan) { abort(); }
+void hash_seq_term(HASH_SEQ_STATUS *scan) { abort(); }
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	return mode == LW_EXCLUSIVE && LWLockHeldByMe(lock);
+}
+
 bool
 XLogNeedsFlush(XLogRecPtr record pg_attribute_unused())
 {

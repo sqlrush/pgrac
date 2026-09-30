@@ -59,6 +59,7 @@
 #include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_space_storage.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -126,6 +127,20 @@ int NBuffers = CLUSTER_ITL_INITRANS_DEFAULT;
 int NLocBuffer = 0;
 char *BufferBlocks = NULL;
 Block *LocalBufferBlockPointers = NULL;
+bool cluster_shared_config = false;
+
+/* Guard-only fixture: shared publication is exercised with the real cache
+ * and WAL producer in test_cluster_space_cache. It must not be reached here. */
+ClusterSpaceHintResult
+cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
+{
+	abort();
+}
+void
+cluster_space_hint_finish(Buffer buffer, bool standard, const RfPageProducerBatchV1 *batch)
+{
+	abort();
+}
 
 bool
 ConditionalLockBuffer(Buffer buffer pg_attribute_unused())

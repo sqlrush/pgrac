@@ -8,10 +8,10 @@
  *	  spec-3.4c F1/F2/F3 hard rules:
  *
  *	    F1  HeapTupleSatisfiesMVCC has no Relation, so this helper
- *	        MUST NOT emit generic WAL.  It uses MarkBufferDirtyHint
- *	        (hint-style; PG may still emit a hint FPI when checksums or
- *	        wal_log_hints require it).  Crash may lose the hint; the
- *	        overlay path guarantees correctness.
+ *	        MUST NOT emit generic WAL. Shared permanent pages use an
+ *	        exact native hint FPI only with preloaded SPACE identity and
+ *	        content-X; other profiles retain MarkBufferDirtyHint. A reader
+ *	        that cannot publish this optional hint uses the overlay.
  *
  *	    F2  expected_xid is required to defend against the L189 slot
  *	        recycle race.  can_stamp() verifies xid, flags, and that
@@ -44,6 +44,8 @@
 #include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_itl_slot.h"
 #include "cluster/cluster_scn.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_space_storage.h"
 #include "storage/buf.h"
 #include "storage/bufmgr.h"
 #include "storage/bufpage.h"
@@ -94,6 +96,8 @@ cluster_itl_cleanout_lazy(Buffer buf, uint8 slot_idx, TransactionId expected_xid
 {
 	Page page;
 	ClusterItlSlotData *slot;
+	RfPageProducerBatchV1 hint_batch;
+	ClusterSpaceHintResult hint_result = CLUSTER_SPACE_HINT_NATIVE;
 
 	if (!BufferIsValid(buf))
 		return false;
@@ -129,7 +133,14 @@ cluster_itl_cleanout_lazy(Buffer buf, uint8 slot_idx, TransactionId expected_xid
 		return false;
 	}
 
-	/* Hint-style page mutation: stamp + dirty-hint, no generic WAL (F1). */
+	if (cluster_shared_config) {
+		hint_result = cluster_space_hint_begin(buf, &hint_batch);
+		if (hint_result == CLUSTER_SPACE_HINT_SKIPPED) {
+			LockBuffer(buf, BUFFER_LOCK_UNLOCK);
+			return false;
+		}
+	}
+	/* Native hint image, never a generic cleanup owner. */
 	slot->commit_scn = expected_commit_scn;
 	slot->flags = ITL_FLAG_COMMITTED;
 
@@ -153,7 +164,10 @@ cluster_itl_cleanout_lazy(Buffer buf, uint8 slot_idx, TransactionId expected_xid
 	 * (cluster_undo_buf.c).  So an ITL hint lost to eviction never produces a
 	 * false-visible result;  it only costs a one-time overlay re-resolve.
 	 */
-	MarkBufferDirtyHint(buf, true);
+	if (hint_result == CLUSTER_SPACE_HINT_VERSIONED)
+		cluster_space_hint_finish(buf, true, &hint_batch);
+	else
+		MarkBufferDirtyHint(buf, true);
 
 	LockBuffer(buf, BUFFER_LOCK_UNLOCK);
 	return true;

@@ -18,12 +18,14 @@
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "storage/smgr.h"
 #include "utils/catcache.h"
 #include "utils/hsearch.h"
@@ -254,6 +256,73 @@ space_copy_prepare(const ClusterSpaceIdentity *identity, ForkNumber forknum, Blo
 	if (forknum != FSM_FORKNUM)
 		((PageHeader)result)->pd_block_scn = 0;
 	return rf_page_producer_stamp_v1(batch);
+}
+
+ClusterSpaceHintResult
+cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
+{
+	RelFileLocator locator;
+	ForkNumber forknum;
+	BlockNumber block;
+	ClusterSpaceIdentityKey expected;
+	ClusterSpaceIdentity identity;
+	SpaceIdentityCacheEntry *entry;
+	HASH_SEQ_STATUS scan;
+	const uint8 block_id = 0;
+	bool found = false;
+
+	if (!BufferIsValid(buffer) || batch == NULL)
+		return CLUSTER_SPACE_HINT_SKIPPED;
+	if (!cluster_shared_config || BufferIsLocal(buffer) || !BufferIsPermanent(buffer))
+		return CLUSTER_SPACE_HINT_NATIVE;
+	BufferGetTag(buffer, &locator, &forknum, &block);
+	if (cluster_smgr_which_for(locator, InvalidBackendId) != 1 || forknum == FSM_FORKNUM)
+		return CLUSTER_SPACE_HINT_NATIVE;
+	if ((forknum != MAIN_FORKNUM && forknum != VISIBILITYMAP_FORKNUM)
+		|| RecoveryInProgress() || CritSectionCount != 0
+		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
+							   LW_EXCLUSIVE)
+		|| !cluster_bufmgr_block_write_permitted(buffer)
+		|| space_identity_cache == NULL
+		|| !space_namespace(locator, false, &expected, NULL))
+		return CLUSTER_SPACE_HINT_SKIPPED;
+
+	/* The relation owner filled this cache before taking content locks and
+	 * retains the lifecycle lock. A miss is never repaired while locked. */
+	hash_seq_init(&scan, space_identity_cache);
+	while ((entry = hash_seq_search(&scan)) != NULL) {
+		if (space_identity_key_matches(&entry->identity.key, &expected)) {
+			identity = entry->identity;
+			found = true;
+			hash_seq_term(&scan);
+			break;
+		}
+	}
+	if (!found || !cluster_space_prepare_buffer_versions(&identity, &buffer, &block_id, 1, batch))
+		return CLUSTER_SPACE_HINT_SKIPPED;
+	START_CRIT_SECTION();
+	if (!rf_page_producer_stamp_v1(batch))
+		elog(PANIC, "shared hint page version changed before mutation");
+	return CLUSTER_SPACE_HINT_VERSIONED;
+}
+
+void
+cluster_space_hint_finish(Buffer buffer, bool standard, const RfPageProducerBatchV1 *batch)
+{
+	XLogRecPtr lsn;
+
+	if (CritSectionCount == 0 || batch == NULL || !batch->stamped
+		|| batch->entry_count != 1 || batch->entries[0].block_id != 0
+		|| batch->ordinary_pages[0] != BufferGetPage(buffer))
+		elog(PANIC, "shared hint has no exact prepared page version");
+	MarkBufferDirty(buffer);
+	XLogBeginInsert();
+	XLogRegisterBuffer(0, buffer, REGBUF_FORCE_IMAGE | (standard ? REGBUF_STANDARD : 0));
+	if (!rf_page_producer_register_wal_v1(batch))
+		elog(PANIC, "shared hint cannot register page version");
+	lsn = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
+	PageSetLSN(BufferGetPage(buffer), lsn);
+	END_CRIT_SECTION();
 }
 
 bool

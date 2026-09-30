@@ -34,6 +34,10 @@
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "cluster/cluster_guc.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
 
 
 typedef struct BTSortArrayContext
@@ -1762,6 +1766,14 @@ _bt_killitems(IndexScanDesc scan)
 	 * pages.
 	 */
 	so->numKilled = 0;
+
+#ifdef USE_PGRAC_CLUSTER
+	/* This optional scan hint owns only content-SHARE. The insertion and
+	 * VACUUM owners perform versioned cleanup under their original X locks. */
+	if (cluster_shared_config && RelationIsPermanent(scan->indexRelation)
+		&& cluster_smgr_which_for(scan->indexRelation->rd_locator, InvalidBackendId) == 1)
+		return;
+#endif
 
 	if (BTScanPosIsPinned(so->currPos))
 	{

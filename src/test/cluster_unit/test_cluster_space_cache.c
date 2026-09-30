@@ -12,16 +12,31 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include <setjmp.h>
 
 #include "access/xlog.h"
 #include "access/xact.h"
+#include "access/htup_details.h"
+#include "access/xloginsert.h"
+#include "catalog/pg_control.h"
 #include "catalog/pg_class.h"
 #include "cluster/cluster_guc.h"
+#include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_itl_cleanout.h"
+#include "cluster/cluster_itl.h"
+#include "cluster/cluster_pcm_own.h"
+#include "cluster/cluster_semantic_activation.h"
+#include "cluster/cluster_tx_resolve.h"
+#include "cluster/cluster_xid_stripe.h"
+#include "access/heapam.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
+#include "storage/proc.h"
+#include "storage/fsm_internals.h"
 #include "storage/smgr.h"
 #include "storage/shmem.h"
 #include "storage/s_lock.h"
@@ -56,6 +71,207 @@ static ClusterWalSourceRef ref;
 static ClusterSpaceIdentity disk_identity;
 static unsigned exists_calls, size_calls, read_calls;
 static bool pinned, locked, recovering, have_ref, have_space, invalidate_on_release;
+volatile uint32 CritSectionCount;
+bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
+uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
+static bool content_x, writer_allowed = true, commit_pending, foreign_xid;
+static bool xmax_committed;
+static unsigned hint_calls, dirty_calls, wal_calls, version_edges;
+static uint64 next_token;
+static RfPageVersionEdgeEntryV1 recorded_edge;
+static PGAlignedBlock hint_before, hint_image;
+static bool expected_error;
+static jmp_buf error_jump;
+static bool lazy_lock_available;
+static unsigned lazy_unlocks;
+static bool native_hint_fpi;
+static ForkNumber hint_fork = MAIN_FORKNUM;
+static PGPROC process;
+PGPROC *MyProc = &process;
+static bool truncate_hints_needed;
+bool InRecovery;
+static uint8 expected_xlog_info = XLOG_FPI_FOR_HINT;
+static BufferDescPadded hint_descriptor[1];
+BufferDescPadded *BufferDescriptors = hint_descriptor;
+
+bool
+LWLockHeldByMeInMode(LWLock *lock, LWLockMode mode)
+{
+	UT_ASSERT(lock == BufferDescriptorGetContentLock(GetBufferDescriptor(0)));
+	UT_ASSERT_EQ(mode, LW_EXCLUSIVE);
+	return content_x;
+}
+
+bool
+cluster_xid_foreign_class_cheap(TransactionId xid)
+{
+	return foreign_xid;
+}
+bool
+cluster_bufmgr_block_write_permitted(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return writer_allowed && (!cluster_shared_config || content_x);
+}
+bool
+BufferIsPermanent(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return true;
+}
+void
+BufferGetTag(Buffer buffer, RelFileLocator *locator, ForkNumber *forknum, BlockNumber *block)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	*locator = relation_data.rd_locator;
+	*forknum = hint_fork;
+	*block = 7;
+}
+XLogRecPtr
+TransactionIdGetCommitLSN(TransactionId xid)
+{
+	return 100;
+}
+bool
+TransactionIdDidCommit(TransactionId xid)
+{
+	return xmax_committed;
+}
+bool
+XLogNeedsFlush(XLogRecPtr lsn)
+{
+	return commit_pending;
+}
+XLogRecPtr
+BufferGetLSNAtomic(Buffer buffer)
+{
+	return PageGetLSN(page.data);
+}
+SCN
+cluster_scn_advance(void)
+{
+	UT_ASSERT((content_x || hint_fork == FSM_FORKNUM) && CritSectionCount == 0);
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	return ++next_token;
+}
+void
+MarkBufferDirtyHint(Buffer buffer, bool standard)
+{
+	UT_ASSERT(buffer == 1 && standard);
+	hint_calls++;
+}
+void
+MarkBufferDirty(Buffer buffer)
+{
+	UT_ASSERT(buffer == 1 && content_x && CritSectionCount == 1);
+	dirty_calls++;
+}
+void
+XLogBeginInsert(void)
+{
+	if (native_hint_fpi)
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	else
+		UT_ASSERT(CritSectionCount == 1 && dirty_calls == wal_calls + 1);
+}
+void
+XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)
+{
+	UT_ASSERT(id == 0 && buffer == 1);
+	UT_ASSERT_EQ(flags, REGBUF_FORCE_IMAGE | (hint_fork == FSM_FORKNUM ? 0 : REGBUF_STANDARD));
+	hint_image = page;
+}
+void
+XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *entries, uint8 count)
+{
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT_EQ(token, 101);
+	recorded_edge = entries[0];
+	version_edges++;
+}
+void
+XLogRegisterBlock(uint8 id, RelFileLocator *locator, ForkNumber forknum, BlockNumber block,
+				  char *data, uint8 flags)
+{
+	UT_ASSERT(native_hint_fpi && id == 0 && flags == 0);
+	UT_ASSERT_EQ(forknum, hint_fork);
+	UT_ASSERT(RelFileLocatorEquals(*locator, relation_data.rd_locator));
+	memcpy(hint_image.data, data, BLCKSZ);
+}
+XLogRecPtr
+GetRedoRecPtr(void)
+{
+	return 1000;
+}
+XLogRecPtr
+XLogInsert(RmgrId rmid, uint8 info)
+{
+	UT_ASSERT(rmid == RM_XLOG_ID && info == expected_xlog_info);
+	wal_calls++;
+	return 200;
+}
+XLogRecPtr
+log_newpage_buffer(Buffer buffer, bool standard)
+{
+	UT_ASSERT(buffer == 1 && !standard);
+	hint_image = page;
+	wal_calls++;
+	PageSetLSN(page.data, 200);
+	return 200;
+}
+int
+errdetail(const char *fmt, ...)
+{
+	return 0;
+}
+bool errstart(int level, const char *domain) { return level >= ERROR; }
+bool errstart_cold(int level, const char *domain) { return errstart(level, domain); }
+int errmsg_internal(const char *fmt, ...) { return 0; }
+void errfinish(const char *file, int line, const char *func)
+{
+	if (!expected_error)
+		abort();
+	longjmp(error_jump, 1);
+}
+#include "test_cluster_space_hint_owners.inc"
+#include "test_cluster_space_xmax_hint.inc"
+#include "test_cluster_space_fsm_hint.inc"
+
+static void
+fsm_truncate_publication(void)
+{
+	Relation rel = &relation_data;
+	Buffer buf = 1;
+	uint16 first_removed_slot = 3;
+	RfPageProducerBatchV1 hint_batch;
+	bool versioned;
+
+#undef XLogHintBitIsNeeded
+#define XLogHintBitIsNeeded() truncate_hints_needed
+#include "test_cluster_space_fsm_truncate.inc"
+#undef XLogHintBitIsNeeded
+}
+#include "test_cluster_space_census_types.inc"
+
+bool
+cluster_semantic_activation_recheck_r4_terminal_census(const ClusterSemanticAdmissionToken *token)
+{
+	return true;
+}
+
+/* Actual publication after census qualification, covered by the native
+ * lock-order fixture. Slot and tuple publication here is production code. */
+static ClusterHeapItlTerminalBatchApplyResult
+terminal_census_publish(Buffer buffer, const ClusterHeapItlTerminalCensus *census,
+						 const uint8 *terminal_flags)
+{
+	ClusterHeapItlTerminalBatchApplyResult result = {CLUSTER_HEAP_ITL_BATCH_REFUSED, 0, 0};
+	RfPageProducerBatchV1 hint_batch pg_attribute_unused();
+	ClusterSpaceHintResult hint_result pg_attribute_unused() = CLUSTER_SPACE_HINT_NATIVE;
+	bool tuple_refs_changed = false;
+	uint8 i;
+#include "test_cluster_space_census_mutation.inc"
+}
 
 void
 ProcessInterrupts(void)
@@ -136,13 +352,13 @@ s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
 int
 errcode(int sqlerrcode)
 {
-	abort();
+	return 0;
 }
 
 int
 errmsg(const char *fmt, ...)
 {
-	abort();
+	return 0;
 }
 
 void
@@ -229,9 +445,22 @@ ReadBufferWithoutRelcache(RelFileLocator locator, ForkNumber forknum, BlockNumbe
 void
 LockBuffer(Buffer buffer, int mode)
 {
+	if (mode == BUFFER_LOCK_UNLOCK && content_x && !pinned) {
+		content_x = false;
+		lazy_unlocks++;
+		return;
+	}
 	if (buffer != 1 || !pinned || locked || mode != BUFFER_LOCK_SHARE)
 		abort();
 	locked = true;
+}
+
+bool
+ConditionalLockBuffer(Buffer buffer)
+{
+	UT_ASSERT(buffer == 1 && !content_x);
+	content_x = lazy_lock_available;
+	return content_x;
 }
 
 BlockNumber
@@ -331,6 +560,7 @@ btree_build_identity(Relation relation)
 static void
 setup(void)
 {
+	cluster_shared_config = true;
 	if (invalidate != NULL)
 		invalidate(invalidate_arg, InvalidOid);
 	memset(&relation_data, 0, sizeof(relation_data));
@@ -540,10 +770,288 @@ UT_TEST(test_btree_build_captures_one_cached_identity_value)
 	UT_ASSERT(!pinned && !locked);
 }
 
+static HeapTupleHeader
+hint_setup(bool cache)
+{
+	HeapTupleHeader tuple;
+	setup();
+	if (cache)
+		(void) insert_identity(&relation_data);
+	PageInitHeapPage(page.data, BLCKSZ, 0);
+	((PageHeader) page.data)->pd_block_scn = 20;
+	tuple = (HeapTupleHeader) (page.data + MAXALIGN(SizeOfPageHeaderData));
+	HeapTupleHeaderSetXmin(tuple, 77);
+	HeapTupleHeaderSetXmax(tuple, 78);
+	((PageHeader) page.data)->pd_lower += MAXALIGN(SizeofHeapTupleHeader);
+	hint_before = page;
+	hint_calls = dirty_calls = wal_calls = version_edges = 0;
+	next_token = 100;
+	content_x = writer_allowed = true;
+	commit_pending = foreign_xid = false;
+	xmax_committed = false;
+	CritSectionCount = 0;
+	expected_error = false;
+	lazy_lock_available = true;
+	lazy_unlocks = 0;
+	native_hint_fpi = false;
+	hint_fork = MAIN_FORKNUM;
+	InRecovery = false;
+	truncate_hints_needed = true;
+	expected_xlog_info = XLOG_FPI_FOR_HINT;
+	return tuple;
+}
+
+static void
+check_hint_version(void)
+{
+	UT_ASSERT_EQ(version_edges, 1);
+	UT_ASSERT_EQ(wal_calls, 1);
+	UT_ASSERT_EQ(dirty_calls, 1);
+	UT_ASSERT_EQ(hint_calls, 0);
+	UT_ASSERT_EQ(next_token, 101);
+	UT_ASSERT_EQ(recorded_edge.before.mutation_token, 20);
+	UT_ASSERT(memcmp(recorded_edge.result_incarnation, disk_identity.incarnation, 16) == 0);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 101);
+	UT_ASSERT_EQ(((PageHeader)hint_image.data)->pd_block_scn, 101);
+	UT_ASSERT_EQ(PageGetLSN(page.data), 200);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT_EQ(read_calls, 1);
+}
+
+UT_TEST(test_hint_share_lock_never_changes_shared_page)
+{
+	HeapTupleHeader tuple = hint_setup(true);
+	content_x = false;
+	SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges, 0);
+	UT_ASSERT_EQ(read_calls, 1);
+}
+UT_TEST(test_hint_exclusive_cached_identity_versions_before_store)
+{
+	HeapTupleHeader tuple = hint_setup(true);
+	SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
+	check_hint_version();
+	UT_ASSERT(HeapTupleHeaderXminCommitted(tuple));
+	SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
+	check_hint_version();
+}
+UT_TEST(test_hint_refusal_has_no_io_or_mutation)
+{
+	for (int bad = 0; bad < 6; bad++) {
+		HeapTupleHeader tuple = hint_setup(bad != 0);
+		switch (bad) {
+		case 0: break;
+		case 1: invalidate(invalidate_arg, relation_data.rd_id); break;
+		case 2: ref.claim.database_incarnation++; break;
+		case 3: writer_allowed = false; break;
+		case 4: recovering = true; break;
+		case 5: CritSectionCount = 1; break;
+		}
+		SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
+		UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges, 0);
+		UT_ASSERT_EQ(read_calls, bad != 0 ? 1 : 0);
+		UT_ASSERT_EQ(next_token, 100);
+		CritSectionCount = 0;
+	}
+}
+UT_TEST(test_released_xmax_is_not_skipped_with_shared_identity)
+{
+	HeapTupleHeader tuple = hint_setup(true);
+	cluster_heap_stamp_released_xmax_invalid(tuple, 1);
+	check_hint_version();
+	UT_ASSERT(tuple->t_infomask & HEAP_XMAX_INVALID);
+}
+UT_TEST(test_hint_native_and_commit_interlock_remain)
+{
+	HeapTupleHeader tuple = hint_setup(false);
+	cluster_shared_config = false;
+	content_x = false;
+	SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, 77);
+	UT_ASSERT(HeapTupleHeaderXminCommitted(tuple));
+	UT_ASSERT_EQ(hint_calls, 1);
+	UT_ASSERT_EQ(dirty_calls + wal_calls + version_edges + read_calls, 0);
+	tuple = hint_setup(true);
+	commit_pending = true;
+	SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, 77);
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	commit_pending = false;
+	foreign_xid = true;
+	SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges, 0);
+}
+UT_TEST(test_required_xmax_missing_identity_refuses_before_store)
+{
+	HeapTupleHeader tuple = hint_setup(false);
+	expected_error = true;
+	if (setjmp(error_jump) == 0) {
+		cluster_heap_stamp_released_xmax_invalid(tuple, 1);
+		UT_ASSERT(false);
+	}
+	expected_error = false;
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges + read_calls, 0);
+}
+UT_TEST(test_native_waited_xmax_cannot_silently_skip_required_hint)
+{
+	HeapTupleHeader tuple = hint_setup(false);
+	expected_error = true;
+	if (setjmp(error_jump) == 0) {
+		UpdateXmaxHintBits(tuple, 1, 78);
+		UT_ASSERT(false);
+	}
+	expected_error = false;
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges + read_calls, 0);
+
+	tuple = hint_setup(true);
+	UpdateXmaxHintBits(tuple, 1, 78);
+	UT_ASSERT(tuple->t_infomask & HEAP_XMAX_INVALID);
+	check_hint_version();
+
+	tuple = hint_setup(false);
+	xmax_committed = commit_pending = true;
+	UpdateXmaxHintBits(tuple, 1, 78);
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges + read_calls, 0);
+}
+UT_TEST(test_lazy_cleanout_versions_only_qualified_exclusive_hint)
+{
+	for (int bad = 0; bad < 5; bad++) {
+		ClusterItlSlotData *slot;
+		bool stamped;
+		(void) hint_setup(bad != 1);
+		content_x = false;
+		slot = &ClusterPageGetItlSlots(page.data)[0];
+		slot->flags = ITL_FLAG_ACTIVE;
+		slot->xid = 77;
+		slot->commit_scn = InvalidScn;
+		if (bad == 2) lazy_lock_available = false;
+		if (bad == 3) slot->xid++;
+		if (bad == 4) writer_allowed = false;
+		hint_before = page;
+		stamped = cluster_itl_cleanout_lazy(1, 0, 77, 80);
+		UT_ASSERT_EQ(stamped, bad == 0);
+		UT_ASSERT(!content_x);
+		if (bad == 0) {
+			check_hint_version();
+			UT_ASSERT_EQ(slot->flags, ITL_FLAG_COMMITTED);
+			UT_ASSERT_EQ(slot->commit_scn, 80);
+		} else {
+			UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges, 0);
+			UT_ASSERT_EQ(read_calls, bad == 1 ? 0 : 1);
+		}
+		UT_ASSERT_EQ(lazy_unlocks, bad == 2 ? 0 : 1);
+	}
+}
+UT_TEST(test_terminal_census_preserves_required_cleanup_and_versions_it)
+{
+	for (int missing = 0; missing < 2; missing++) {
+		ClusterHeapItlTerminalCensus census = {0};
+		ClusterHeapItlTerminalBatchApplyResult result;
+		uint8 terminal_flags[CLUSTER_ITL_INITRANS_DEFAULT] = {ITL_FLAG_LOCK_ONLY_COMMITTED};
+		ClusterItlSlotData *slot;
+		HeapTupleHeader tuple;
+		PGAlignedBlock tuple_bytes;
+
+		(void) hint_setup(!missing);
+		PageInitHeapPage(page.data, BLCKSZ, 0);
+		((PageHeader) page.data)->pd_block_scn = 20;
+		memset(&tuple_bytes, 0, sizeof(tuple_bytes));
+		tuple = (HeapTupleHeader) tuple_bytes.data;
+		tuple->t_hoff = MAXALIGN(SizeofHeapTupleHeader);
+		tuple->t_infomask = HEAP_XMIN_COMMITTED | HEAP_XMAX_LOCK_ONLY | HEAP_XMAX_KEYSHR_LOCK;
+		HeapTupleHeaderSetXmax(tuple, 77);
+		UT_ASSERT_EQ(PageAddItem(page.data, (Item) tuple, 64, 1, false, true), 1);
+		slot = &ClusterPageGetItlSlots(page.data)[0];
+		slot->flags = ITL_FLAG_LOCK_ONLY_ACTIVE;
+		slot->xid = 77;
+		slot->wrap = 2;
+		census.terminal_mask = 1;
+		census.terminal_count = 1;
+		census.outcomes[0] = CLUSTER_TX_COMMITTED;
+		census.resolutions[0].commit_scn = 80;
+		hint_before = page;
+		result = terminal_census_publish(1, &census, terminal_flags);
+		if (missing) {
+			UT_ASSERT_EQ(result.kind, CLUSTER_HEAP_ITL_BATCH_REFUSED);
+			UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges + read_calls, 0);
+		} else {
+			check_hint_version();
+			UT_ASSERT_EQ(result.kind, CLUSTER_HEAP_ITL_BATCH_STALE_CURRENT_X);
+			UT_ASSERT_EQ(result.stamped_count, 1);
+			UT_ASSERT_EQ(slot->flags, ITL_FLAG_LOCK_ONLY_COMMITTED);
+			tuple = (HeapTupleHeader) PageGetItem(page.data, PageGetItemId(page.data, 1));
+			UT_ASSERT(tuple->t_infomask & HEAP_XMAX_INVALID);
+		}
+	}
+}
+UT_TEST(test_fsm_hint_uses_explicit_rebuildable_component)
+{
+	(void) hint_setup(false);
+	hint_fork = FSM_FORKNUM;
+	native_hint_fpi = true;
+	content_x = false;
+	MyProc->delayChkptFlags = DELAY_CHKPT_START;
+	UT_ASSERT_EQ(XLogSaveBufferForHint(1, false), 200);
+	UT_ASSERT_EQ(wal_calls, 1);
+	UT_ASSERT_EQ(version_edges, 1);
+	UT_ASSERT_EQ(recorded_edge.page_class, RF_PAGE_CLASS_REBUILDABLE_FSM);
+	UT_ASSERT_EQ(recorded_edge.before_kind, RF_PAGE_STATE_REBUILDABLE);
+	UT_ASSERT_EQ(recorded_edge.result_kind, RF_PAGE_STATE_REBUILDABLE);
+	UT_ASSERT_EQ(read_calls + dirty_calls + hint_calls, 0);
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+	UT_ASSERT(memcmp(hint_before.data, hint_image.data, BLCKSZ) == 0);
+}
+UT_TEST(test_unprepared_shared_hint_cannot_emit_native_fpi)
+{
+	(void) hint_setup(true);
+	native_hint_fpi = true;
+	MyProc->delayChkptFlags = DELAY_CHKPT_START;
+	expected_error = true;
+	if (setjmp(error_jump) == 0) {
+		(void) XLogSaveBufferForHint(1, false);
+		UT_ASSERT(false);
+	}
+	expected_error = false;
+	UT_ASSERT_EQ(wal_calls + version_edges + dirty_calls + hint_calls, 0);
+	UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+}
+UT_TEST(test_fsm_truncate_fpi_keeps_rebuildable_class)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		(void) hint_setup(false);
+		cluster_shared_config = shared;
+		hint_fork = FSM_FORKNUM;
+		expected_xlog_info = XLOG_FPI;
+		PageInit(page.data, BLCKSZ, 0);
+		UT_ASSERT(fsm_set_avail(page.data, 2, 99));
+		UT_ASSERT(fsm_set_avail(page.data, 5, 100));
+		hint_before = page;
+		fsm_truncate_publication();
+		UT_ASSERT_EQ(fsm_get_avail(page.data, 2), 99);
+		UT_ASSERT_EQ(fsm_get_avail(page.data, 5), 0);
+		UT_ASSERT_EQ(wal_calls, 1);
+		UT_ASSERT_EQ(dirty_calls, 1);
+		UT_ASSERT_EQ(version_edges, shared ? 1 : 0);
+		UT_ASSERT_EQ(next_token, shared ? 101 : 100);
+		UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 0);
+		UT_ASSERT_EQ(PageGetLSN(page.data), 200);
+		UT_ASSERT_EQ(CritSectionCount + read_calls, 0);
+		if (shared) {
+			UT_ASSERT_EQ(recorded_edge.page_class, RF_PAGE_CLASS_REBUILDABLE_FSM);
+			UT_ASSERT_EQ(recorded_edge.result_kind, RF_PAGE_STATE_REBUILDABLE);
+		}
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(9);
+	UT_PLAN(21);
 	UT_RUN(test_insert_allocation_and_delete_share_one_identity_read);
 	UT_RUN(test_targeted_invalidation_reloads_new_incarnation);
 	UT_RUN(test_unrelated_invalidation_preserves_hit_global_reset_drops_it);
@@ -553,6 +1061,18 @@ main(void)
 	UT_RUN(test_unavailable_authority_and_recovery_do_not_reuse_cache);
 	UT_RUN(test_missing_corrupt_and_tombstoned_identity_never_poison_cache);
 	UT_RUN(test_btree_build_captures_one_cached_identity_value);
+	UT_RUN(test_hint_share_lock_never_changes_shared_page);
+	UT_RUN(test_hint_exclusive_cached_identity_versions_before_store);
+	UT_RUN(test_hint_refusal_has_no_io_or_mutation);
+	UT_RUN(test_released_xmax_is_not_skipped_with_shared_identity);
+	UT_RUN(test_hint_native_and_commit_interlock_remain);
+	UT_RUN(test_required_xmax_missing_identity_refuses_before_store);
+	UT_RUN(test_native_waited_xmax_cannot_silently_skip_required_hint);
+	UT_RUN(test_lazy_cleanout_versions_only_qualified_exclusive_hint);
+	UT_RUN(test_terminal_census_preserves_required_cleanup_and_versions_it);
+	UT_RUN(test_fsm_hint_uses_explicit_rebuildable_component);
+	UT_RUN(test_unprepared_shared_hint_cannot_emit_native_fpi);
+	UT_RUN(test_fsm_truncate_fpi_keeps_rebuildable_class);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

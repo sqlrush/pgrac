@@ -21,11 +21,13 @@
 #include <setjmp.h>
 
 #include "access/nbtree.h"
+#include "access/relscan.h"
 #include "access/nbtxlog.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
@@ -49,7 +51,7 @@ static FormData_pg_class relform;
 static FormData_pg_index indexform;
 static ClusterSpaceIdentity space_identity;
 static RfPageVersionEdgeEntryV1 edge;
-static unsigned inserts, edges, dirties, identity_reads, releases;
+static unsigned inserts, edges, dirties, identity_reads, releases, hints;
 static uint64 next_token, edge_token;
 static uint8 expected_info;
 static bool begun, expecting_error, content_locked;
@@ -201,7 +203,7 @@ void
 _bt_lockbuf(Relation rel, Buffer buffer, int access)
 {
 	(void)rel;
-	UT_ASSERT(buffer == 1 && !content_locked && access == BT_WRITE);
+	UT_ASSERT(buffer == 1 && !content_locked && (access == BT_WRITE || access == BT_READ));
 	content_locked = true;
 }
 void
@@ -217,6 +219,12 @@ MarkBufferDirty(Buffer buffer)
 	dirties++;
 }
 void
+MarkBufferDirtyHint(Buffer buffer, bool standard)
+{
+	UT_ASSERT(buffer == 1 && content_locked && standard);
+	hints++;
+}
+void
 XLogBeginInsert(void)
 {
 	UT_ASSERT(!begun && dirties == 1 && CritSectionCount == 1);
@@ -228,7 +236,8 @@ XLogRegisterBuffer(uint8 id, Buffer buffer, uint8 flags)
 	UT_ASSERT(begun && id == 0 && buffer == 1);
 	UT_ASSERT_EQ(flags, expected_info == XLOG_BTREE_META_CLEANUP
 							? REGBUF_WILL_INIT | REGBUF_STANDARD
-							: REGBUF_STANDARD);
+							: REGBUF_STANDARD
+							  | (expected_info == XLOG_FPI_FOR_HINT ? REGBUF_FORCE_IMAGE : 0));
 	memcpy(wal_image.data, current_page.data, BLCKSZ);
 }
 void
@@ -252,7 +261,8 @@ XLogRegisterPageVersionEdge(uint64 token, const RfPageVersionEdgeEntryV1 *entrie
 XLogRecPtr
 XLogInsert(RmgrId rmgr, uint8 info)
 {
-	UT_ASSERT(begun && rmgr == RM_BTREE_ID && info == expected_info);
+	UT_ASSERT(begun && info == expected_info);
+	UT_ASSERT_EQ(rmgr, expected_info == XLOG_FPI_FOR_HINT ? RM_XLOG_ID : RM_BTREE_ID);
 	begun = false;
 	inserts++;
 	return UINT64_C(0x9000);
@@ -294,13 +304,55 @@ run_meta(Relation rel, BlockNumber num_delpages)
 								  const ClusterSpaceIdentity *identity pg_attribute_unused())
 #include "test_cluster_btree_leaf_dedup.inc"
 
+XLogRecPtr
+BufferGetLSNAtomic(Buffer buffer)
+{
+	UT_ASSERT_EQ(buffer, 1);
+	return PageGetLSN(current_page.data);
+}
+#include "test_cluster_btree_scan_hint.inc"
+
+static void
+run_unique_hint(bool neighbor)
+{
+	Relation rel pg_attribute_unused() = &relation_data;
+	Buffer nbuf = neighbor ? 1 : InvalidBuffer;
+	BTInsertStateData state = {0}, *insertstate = &state;
+	Page page pg_attribute_unused() = current_page.data;
+	ItemId curitemid = PageGetItemId(page, 1);
+	IndexTuple curitup = (IndexTuple) PageGetItem(page, curitemid);
+	BTPageOpaque opaque = BTPageGetOpaque(page);
+	bool all_dead = true, inposting = false, prevalldead = false;
+	int curposti = 0;
+	insertstate->buf = 1;
+	insertstate->version_identity = space_identity;
+	if (false) {}
+#include "test_cluster_btree_unique_hint.inc"
+}
+
+static void
+run_cycle(BTCycleId cycleid, const ClusterSpaceIdentity *identity)
+{
+	Relation rel pg_attribute_unused() = &relation_data;
+	Buffer buf = 1;
+	Page page pg_attribute_unused() = current_page.data;
+	BTPageOpaque opaque = BTPageGetOpaque(page);
+	BTVacState state = {0}, *vstate = &state;
+	int nhtidsdead = 0;
+
+	vstate->cycleid = cycleid;
+	if (identity != NULL)
+		vstate->version_identity = *identity;
+#include "test_cluster_btree_leaf_cycle.inc"
+}
+
 				static void reset(uint8 info, bool shared)
 {
 	IndexTupleData tuple[2];
 	BTPageOpaque opaque;
 	cluster_shared_config = shared;
 	CritSectionCount = 0;
-	inserts = edges = dirties = identity_reads = releases = 0;
+	inserts = edges = dirties = identity_reads = releases = hints = 0;
 	next_token = 200;
 	edge_token = 0;
 	expected_info = info;
@@ -543,10 +595,95 @@ UT_TEST(test_posting_updates_keep_native_tid_and_wal_semantics)
 		pfree(update);
 	}
 }
+UT_TEST(test_vacuum_cycle_hint_publishes_exact_image)
+{
+	reset(XLOG_FPI_FOR_HINT, true);
+	run_cycle(9, &space_identity);
+	check_version();
+	UT_ASSERT_EQ(BTPageGetOpaque(current_page.data)->btpo_cycleid, 0);
+	UT_ASSERT_EQ(hints, 0);
+	UT_ASSERT_EQ(PageGetMaxOffsetNumber(current_page.data), 3);
+}
+UT_TEST(test_vacuum_cycle_hint_native_and_unchanged)
+{
+	reset(XLOG_FPI_FOR_HINT, false);
+	run_cycle(9, NULL);
+	UT_ASSERT_EQ(BTPageGetOpaque(current_page.data)->btpo_cycleid, 0);
+	UT_ASSERT_EQ(hints, 1);
+	UT_ASSERT_EQ(inserts + dirties + edges, 0);
+	UT_ASSERT_EQ(next_token, 200);
+	for (int cycleid = 0; cycleid < 9; cycleid++) {
+		reset(XLOG_FPI_FOR_HINT, true);
+		run_cycle(cycleid, NULL);
+		UT_ASSERT_EQ(inserts + dirties + edges + hints, 0);
+		UT_ASSERT_EQ(next_token, 200);
+		UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+	}
+}
+UT_TEST(test_vacuum_cycle_hint_identity_precedes_mutation)
+{
+	reset(XLOG_FPI_FOR_HINT, true);
+	space_identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	expecting_error = true;
+	if (setjmp(error_jump) == 0) {
+		run_cycle(9, &space_identity);
+		UT_ASSERT(false);
+	}
+	expecting_error = false;
+	UT_ASSERT_EQ(inserts + dirties + edges + hints + CritSectionCount, 0);
+	UT_ASSERT_EQ(next_token, 200);
+	UT_ASSERT(memcmp(current_page.data, before_page.data, BLCKSZ) == 0);
+}
+UT_TEST(test_unique_hint_versions_x_and_preserves_neighbor_read_image)
+{
+	reset(XLOG_FPI_FOR_HINT, true);
+	run_unique_hint(false);
+	check_version();
+	UT_ASSERT(ItemIdIsDead(PageGetItemId(current_page.data, 1)));
+	UT_ASSERT_EQ(hints, 0);
+	reset(XLOG_FPI_FOR_HINT, true);
+	run_unique_hint(true);
+	UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+	UT_ASSERT_EQ(hints + inserts + edges + dirties, 0);
+	reset(XLOG_FPI_FOR_HINT, false);
+	run_unique_hint(true);
+	UT_ASSERT(ItemIdIsDead(PageGetItemId(current_page.data, 1)));
+	UT_ASSERT_EQ(hints, 1);
+	UT_ASSERT_EQ(inserts + edges + dirties, 0);
+}
+UT_TEST(test_read_scan_hint_clears_scan_state_without_shared_mutation)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		IndexScanDescData scan = {0};
+		BTScanOpaque so = calloc(1, sizeof(BTScanOpaqueData));
+		int killed = 0;
+		reset(XLOG_FPI_FOR_HINT, shared);
+		content_locked = false;
+		scan.indexRelation = &relation_data;
+		scan.opaque = so;
+		so->currPos.buf = 1;
+		so->currPos.currPage = 7;
+		so->currPos.firstItem = so->currPos.lastItem = 0;
+		so->currPos.items[0].indexOffset = 1;
+		ItemPointerSet(&so->currPos.items[0].heapTid, 2, 1);
+		so->numKilled = 1;
+		so->killedItems = &killed;
+		_bt_killitems(&scan);
+		UT_ASSERT_EQ(so->numKilled, 0);
+		UT_ASSERT(!content_locked);
+		UT_ASSERT_EQ(hints, shared ? 0 : 1);
+		UT_ASSERT_EQ(inserts + edges + dirties, 0);
+		if (shared)
+			UT_ASSERT(memcmp(before_page.data, current_page.data, BLCKSZ) == 0);
+		else
+			UT_ASSERT(ItemIdIsDead(PageGetItemId(current_page.data, 1)));
+		free(so);
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(13);
 	UT_RUN(test_meta_cleanup_publishes_exact_version);
 	UT_RUN(test_vacuum_publishes_exact_version);
 	UT_RUN(test_delete_publishes_exact_version_preserves_cycle);
@@ -555,6 +692,11 @@ main(void)
 	UT_RUN(test_nonshared_keeps_native_behavior);
 	UT_RUN(test_noop_allocates_no_token_or_wal);
 	UT_RUN(test_posting_updates_keep_native_tid_and_wal_semantics);
+	UT_RUN(test_vacuum_cycle_hint_publishes_exact_image);
+	UT_RUN(test_vacuum_cycle_hint_native_and_unchanged);
+	UT_RUN(test_vacuum_cycle_hint_identity_precedes_mutation);
+	UT_RUN(test_unique_hint_versions_x_and_preserves_neighbor_read_image);
+	UT_RUN(test_read_scan_hint_clears_scan_state_without_shared_mutation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

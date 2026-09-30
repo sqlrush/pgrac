@@ -39,6 +39,7 @@
 #include "storage/smgr.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h" /* exact TX wait enable/timeout */
 #include "cluster/cluster_reverse_key.h" /* PGRAC: spec-6.12f reverse-key */
 #include "cluster/cluster_tx_enqueue.h" /* remote SnapshotDirty xmax wait */
@@ -915,17 +916,51 @@ _bt_check_unique(Relation rel, BTInsertState insertstate, Relation heapRel,
 					 * all posting list TIDs) is dead to everyone, so mark the
 					 * index entry killed.
 					 */
-					ItemIdMarkDead(curitemid);
-					opaque->btpo_flags |= BTP_HAS_GARBAGE;
+					bool apply_hint = !ItemIdIsDead(curitemid);
+#ifdef USE_PGRAC_CLUSTER
+					RfPageProducerBatchV1 hint_batch;
+					bool versioned = false;
 
-					/*
-					 * Mark buffer with a dirty hint, since state is not
-					 * crucial. Be sure to mark the proper buffer dirty.
-					 */
-					if (nbuf != InvalidBuffer)
-						MarkBufferDirtyHint(nbuf, true);
-					else
-						MarkBufferDirtyHint(insertstate->buf, true);
+					if (cluster_shared_config && RelationIsPermanent(rel)
+						&& cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1)
+					{
+						/* The neighboring page is only read-locked. */
+						apply_hint = apply_hint && nbuf == InvalidBuffer;
+						if (apply_hint)
+							versioned = _bt_prepare_page_version(rel, insertstate->buf,
+								&insertstate->version_identity, &hint_batch);
+					}
+#endif
+					if (apply_hint)
+					{
+#ifdef USE_PGRAC_CLUSTER
+						if (versioned)
+						{
+							START_CRIT_SECTION();
+							if (!rf_page_producer_stamp_v1(&hint_batch))
+								elog(PANIC, "PGRAC shared btree hint changed before mutation");
+						}
+#endif
+						ItemIdMarkDead(curitemid);
+						opaque->btpo_flags |= BTP_HAS_GARBAGE;
+#ifdef USE_PGRAC_CLUSTER
+						if (versioned)
+						{
+							XLogRecPtr recptr;
+
+							MarkBufferDirty(insertstate->buf);
+							XLogBeginInsert();
+							XLogRegisterBuffer(0, insertstate->buf, REGBUF_STANDARD | REGBUF_FORCE_IMAGE);
+							if (!rf_page_producer_register_wal_v1(&hint_batch))
+								elog(PANIC, "PGRAC shared btree hint cannot register page version");
+							recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
+							PageSetLSN(page, recptr);
+							END_CRIT_SECTION();
+						}
+						else
+#endif
+							MarkBufferDirtyHint(nbuf != InvalidBuffer ? nbuf : insertstate->buf, true);
+					}
 				}
 
 				/*

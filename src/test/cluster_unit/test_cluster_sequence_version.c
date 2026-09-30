@@ -99,6 +99,14 @@ static bool fail_wal_flush;
 static bool locked, begun, pcm_active, error_expected, identity_valid;
 static uint64 token;
 static jmp_buf error_jump;
+static unsigned hint_calls;
+
+void
+MarkBufferDirtyHint(Buffer buffer, bool standard)
+{
+	UT_ASSERT(buffer == 1 && standard);
+	hint_calls++;
+}
 static ClusterSeqShared cache_state;
 static ClusterSeqInstanceCache entries[4];
 static bool entries_used[4], cache_lock;
@@ -339,6 +347,8 @@ init_sequence(Oid relid, SeqTable *elm, Relation *rel)
 static Form_pg_sequence_data
 read_seq_tuple(Relation rel, Buffer *buffer, HeapTuple out)
 {
+	Buffer *buf pg_attribute_unused() = buffer;
+	HeapTuple seqdatatuple = out;
 	UT_ASSERT(rel == &relation_data && !locked);
 	if (cluster_shared_config)
 		UT_ASSERT(identity_reads > 0);
@@ -346,6 +356,7 @@ read_seq_tuple(Relation rel, Buffer *buffer, HeapTuple out)
 	*buffer = 1;
 	out->t_data = (HeapTupleHeader)PageGetItem(page_data.data, PageGetItemId(page_data.data, 1));
 	out->t_len = ItemIdGetLength(PageGetItemId(page_data.data, 1));
+#include "test_cluster_sequence_hint.inc"
 	return (Form_pg_sequence_data)GETSTRUCT(out);
 }
 /* The native sequence helper's header is extracted below this fixture. */
@@ -1190,10 +1201,42 @@ bad_redo_preserves_output(void)
 		UT_ASSERT(memcmp(saved.data, detached.data, BLCKSZ) == 0);
 	}
 }
+UT_TEST(test_shared_fresh_sequence_refuses_legacy_xmax_repair)
+{
+	for (int shared = 0; shared < 2; shared++) {
+		HeapTupleData out;
+		Buffer buffer;
+		HeapTupleHeader header;
+		ClusterSpaceIdentity captured;
+
+		reset(false);
+		cluster_shared_config = shared;
+		(void) cluster_seq_version_identity(&relation_data, &captured);
+		header = (HeapTupleHeader) PageGetItem(page_data.data, PageGetItemId(page_data.data, 1));
+		HeapTupleHeaderSetXmax(header, 77);
+		before = page_data;
+		hint_calls = 0;
+		error_expected = shared;
+		if (setjmp(error_jump) == 0) {
+			(void) read_seq_tuple(&relation_data, &buffer, &out);
+			UT_ASSERT(!shared);
+		}
+		error_expected = false;
+		if (shared) {
+			UT_ASSERT(memcmp(before.data, page_data.data, BLCKSZ) == 0);
+			UT_ASSERT_EQ(hint_calls, 0);
+		} else {
+			UT_ASSERT_EQ(HeapTupleHeaderGetRawXmax(header), InvalidTransactionId);
+			UT_ASSERT(header->t_infomask & HEAP_XMAX_INVALID);
+			UT_ASSERT_EQ(hint_calls, 1);
+		}
+		UT_ASSERT_EQ(edge_count + wal_count + dirties, 0);
+	}
+}
 int
 main(void)
 {
-	UT_PLAN(22);
+	UT_PLAN(23);
 	UT_RUN(cache_one_wal_frequency);
 	UT_RUN(cache_one_native_wal_budget);
 	UT_RUN(failed_wal_flush_never_publishes_grant);
@@ -1216,6 +1259,7 @@ main(void)
 	UT_RUN(shared_minimal_wal);
 	UT_RUN(native_redo_differential);
 	UT_RUN(bad_redo_preserves_output);
+	UT_RUN(test_shared_fresh_sequence_refuses_legacy_xmax_repair);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

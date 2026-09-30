@@ -29,6 +29,7 @@
 #include "utils/rel.h"
 
 #ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_control.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_mode.h"
 #include "cluster/cluster_mxid_stripe.h"
@@ -823,8 +824,9 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 
 	/* Any error while applying the changes is critical */
 #ifdef USE_PGRAC_CLUSTER
-	/* Capture only real pruning, never the scheduling hints below. */
-	if (versioned && (prstate.nredirected > 0 || prstate.ndead > 0 || prstate.nunused > 0))
+	/* Both logical pruning and a physical hint image need an exact before. */
+	if (versioned && (prstate.nredirected > 0 || prstate.ndead > 0 || prstate.nunused > 0
+		|| ((PageHeader) page)->pd_prune_xid != prstate.new_prune_xid || PageIsFull(page)))
 	{
 		const uint8 block_id = 0;
 
@@ -918,7 +920,8 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 		/*
 		 * If we didn't prune anything, but have found a new value for the
 		 * pd_prune_xid field, update it and mark the buffer dirty. This is
-		 * treated as a non-WAL-logged hint.
+		 * normally treated as a non-WAL-logged hint. Shared permanent pages
+		 * publish the physical hint image with their exact page version.
 		 *
 		 * Also clear the "page is full" flag if it is set, since there's no
 		 * point in repeating the prune/defrag process until something else
@@ -927,8 +930,27 @@ heap_page_prune_internal(Relation relation, Buffer buffer,
 		if (((PageHeader) page)->pd_prune_xid != prstate.new_prune_xid ||
 			PageIsFull(page))
 		{
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned && !rf_page_producer_stamp_v1(&version_batch))
+				elog(PANIC, "PGRAC shared heap prune hint version changed before mutation");
+#endif
 			((PageHeader) page)->pd_prune_xid = prstate.new_prune_xid;
 			PageClearFull(page);
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned)
+			{
+				XLogRecPtr recptr;
+
+				MarkBufferDirty(buffer);
+				XLogBeginInsert();
+				XLogRegisterBuffer(0, buffer, REGBUF_STANDARD | REGBUF_FORCE_IMAGE);
+				if (!rf_page_producer_register_wal_v1(&version_batch))
+					elog(PANIC, "PGRAC shared heap prune hint cannot register page version");
+				recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI_FOR_HINT);
+				PageSetLSN(page, recptr);
+			}
+			else
+#endif
 			MarkBufferDirtyHint(buffer, true);
 		}
 	}

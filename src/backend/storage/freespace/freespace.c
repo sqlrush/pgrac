@@ -31,6 +31,12 @@
 #include "storage/fsm_internals.h"
 #include "storage/lmgr.h"
 #include "storage/smgr.h"
+#ifdef USE_PGRAC_CLUSTER
+#include "catalog/pg_control.h"
+#include "cluster/cluster_guc.h"
+#include "cluster/cluster_page_producer.h"
+#include "cluster/storage/cluster_smgr.h"
+#endif
 
 
 /*
@@ -278,6 +284,10 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 	FSMAddress	first_removed_address;
 	uint16		first_removed_slot;
 	Buffer		buf;
+#ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 hint_batch;
+	bool versioned;
+#endif
 
 	/*
 	 * If no FSM has been created yet for this relation, there's nothing to
@@ -303,6 +313,23 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 										 * smaller */
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
 
+		/* Prepare the optional rebuildable WAL component before mutation. */
+#ifdef USE_PGRAC_CLUSTER
+		versioned = cluster_shared_config && RelationIsPermanent(rel) &&
+			cluster_smgr_which_for(rel->rd_locator, InvalidBackendId) == 1 &&
+			!InRecovery && RelationNeedsWAL(rel) && XLogHintBitIsNeeded();
+
+		if (versioned)
+		{
+			RfPageProducerComponentV1 component = {0};
+
+			component.page_class = RF_PAGE_CLASS_REBUILDABLE_FSM;
+			component.before_kind = RF_PAGE_STATE_REBUILDABLE;
+			if (!rf_page_producer_prepare_v1(&component, 1, &hint_batch) ||
+				!rf_page_producer_stamp_v1(&hint_batch))
+				elog(ERROR, "cannot prepare rebuildable FSM truncate component");
+		}
+#endif
 		/* NO EREPORT(ERROR) from here till changes are logged */
 		START_CRIT_SECTION();
 
@@ -329,7 +356,23 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 		 * flush, redo will return here.
 		 */
 		if (!InRecovery && RelationNeedsWAL(rel) && XLogHintBitIsNeeded())
+		{
+#ifdef USE_PGRAC_CLUSTER
+			if (versioned)
+			{
+				XLogRecPtr recptr;
+
+				XLogBeginInsert();
+				XLogRegisterBuffer(0, buf, REGBUF_FORCE_IMAGE);
+				if (!rf_page_producer_register_wal_v1(&hint_batch))
+					elog(ERROR, "cannot register rebuildable FSM truncate component");
+				recptr = XLogInsert(RM_XLOG_ID, XLOG_FPI);
+				PageSetLSN(BufferGetPage(buf), recptr);
+			}
+			else
+#endif
 			log_newpage_buffer(buf, false);
+		}
 
 		END_CRIT_SECTION();
 

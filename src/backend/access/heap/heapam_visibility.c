@@ -113,6 +113,7 @@
 #include "cluster/cluster_epoch.h"				/* cluster_epoch_get_current (spec-3.3 D10) */
 #include "cluster/cluster_guc.h"				/* cluster_enabled, cluster_node_id */
 #include "cluster/cluster_gcs_block.h"			/* current block write permission */
+#include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_itl.h"				/* cluster_itl_get_tt_ref */
 #include "cluster/cluster_itl_cleanout.h"		/* cluster_itl_cleanout_lazy (spec-3.4c D4) */
 #include "cluster/cluster_itl_slot.h"			/* CLUSTER_ITL_SLOT_UNALLOCATED */
@@ -242,6 +243,9 @@ static inline void
 SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId xid)
 {
 #ifdef USE_PGRAC_CLUSTER
+	RfPageProducerBatchV1 hint_batch;
+	ClusterSpaceHintResult hint_result = CLUSTER_SPACE_HINT_NATIVE;
+
 	/*
 	 * PGRAC: spec-6.15 D7 — never stamp a hint whose truth this node cannot
 	 * know: commit/abort bits for another node's xid class come from native
@@ -271,7 +275,21 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId
 		}
 	}
 
+#ifdef USE_PGRAC_CLUSTER
+	if (cluster_shared_config) {
+		if ((tuple->t_infomask & infomask) == infomask)
+			return;
+		hint_result = cluster_space_hint_begin(buffer, &hint_batch);
+		if (hint_result == CLUSTER_SPACE_HINT_SKIPPED)
+			return;
+	}
+#endif
 	tuple->t_infomask |= infomask;
+#ifdef USE_PGRAC_CLUSTER
+	if (hint_result == CLUSTER_SPACE_HINT_VERSIONED)
+		cluster_space_hint_finish(buffer, true, &hint_batch);
+	else
+#endif
 	MarkBufferDirtyHint(buffer, true);
 }
 
@@ -295,6 +313,9 @@ SetHintBits(HeapTupleHeader tuple, Buffer buffer, uint16 infomask, TransactionId
 void
 cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple, Buffer buffer)
 {
+	RfPageProducerBatchV1 hint_batch;
+	ClusterSpaceHintResult hint_result = CLUSTER_SPACE_HINT_NATIVE;
+
 	/* A proved terminal transaction is not itself permission to mutate a
 	 * retained/read image.  MarkBufferDirtyHint's refusal comes too late to
 	 * protect tuple bytes; check the existing writer gate before the store. */
@@ -305,7 +326,18 @@ cluster_heap_stamp_released_xmax_invalid(HeapTupleHeader tuple, Buffer buffer)
 								  "PGRAC_REASON=RELEASED_XMAX_WRITE_NOT_PERMITTED "
 								  "PGRAC_NODE=%d PGRAC_ATTEMPT=0",
 								  cluster_node_id)));
+	if (tuple->t_infomask & HEAP_XMAX_INVALID)
+		return;
+	if (cluster_shared_config) {
+		hint_result = cluster_space_hint_begin(buffer, &hint_batch);
+		if (hint_result == CLUSTER_SPACE_HINT_SKIPPED)
+			ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+							errmsg("released xmax requires a pre-lock SPACE identity and content-X")));
+	}
 	tuple->t_infomask |= HEAP_XMAX_INVALID;
+	if (hint_result == CLUSTER_SPACE_HINT_VERSIONED)
+		cluster_space_hint_finish(buffer, true, &hint_batch);
+	else
 	MarkBufferDirtyHint(buffer, true);
 }
 #endif

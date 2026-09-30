@@ -1370,6 +1370,13 @@ test_cluster_relation_wal_policy: test_cluster_relation_wal_policy.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 # PGRAC: run native sequence producers with explicit external I/O fixtures.
+test_cluster_sequence_hint.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
+	awk '/^read_seq_tuple\(/ { inside=1 } \
+	     inside && /^\tAssert\(!\(seqdatatuple/ { emit=1; found++ } \
+	     emit && /^\tseq =/ { emit=0; done++ } emit { print } \
+	     /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_sequence_version_helpers.inc: $(top_srcdir)/src/backend/commands/sequence.c Makefile
 	awk '/^cluster_seq_flush_if_shared\(/ { print "static void"; emit=1 } \
 	     /^cluster_sq_compute_write_scn\(/ { print "static uint64"; emit=1 } \
@@ -1388,6 +1395,7 @@ test_cluster_sequence_version_native.inc: $(top_srcdir)/src/backend/commands/seq
 	mv $@.tmp $@
 
 test_cluster_sequence_version: test_cluster_sequence_version.c unit_test.h \
+		test_cluster_sequence_hint.inc \
 		$(top_srcdir)/src/backend/cluster/cluster_sequence_shmem.c \
 		test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc \
 		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
@@ -1463,6 +1471,24 @@ test_cluster_btree_structure_version: test_cluster_btree_structure_version.c uni
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: execute native btree maintenance bodies, not a second policy model.
+test_cluster_btree_unique_hint.inc: $(top_srcdir)/src/backend/access/nbtree/nbtinsert.c Makefile
+	awk '/^_bt_check_unique\(/ { inside=1 } \
+	     inside && /else if \(all_dead &&/ { emit=1; found++ } \
+	     emit { print } emit && /^\t\t\t\t}/ { emit=0; done++ } \
+	     /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_scan_hint.inc: $(top_srcdir)/src/backend/access/nbtree/nbtutils.c Makefile
+	awk '/^_bt_killitems\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_btree_leaf_cycle.inc: $(top_srcdir)/src/backend/access/nbtree/nbtree.c Makefile
+	awk '/Assert\(nhtidsdead == 0\)/ { emit=1; found++ } \
+	     emit && /^\t\t}/ { emit=0; done++ } emit { print } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_btree_leaf_meta.inc: $(top_srcdir)/src/backend/access/nbtree/nbtpage.c Makefile
 	awk '/^_bt_set_cleanup_info\(/ { inside=1; found++ } \
 	     inside && /^{/ { emit=1 } emit { print } /^}/ { inside=emit=0 } \
@@ -1505,6 +1531,8 @@ test_cluster_btree_leaf_dedup_helpers.inc: $(top_srcdir)/src/backend/access/nbtr
 	mv $@.tmp $@
 
 test_cluster_btree_leaf_version: test_cluster_btree_leaf_version.c unit_test.h \
+		test_cluster_btree_leaf_cycle.inc \
+		test_cluster_btree_unique_hint.inc test_cluster_btree_scan_hint.inc \
 		test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc \
 		test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc \
 		test_cluster_btree_leaf_helpers.inc test_cluster_btree_leaf_dedup_helpers.inc \
@@ -1894,14 +1922,67 @@ test_cluster_space_cache_allocation.inc: $(top_srcdir)/src/backend/access/heap/h
 test_cluster_space_cache_hash.o: $(top_srcdir)/src/backend/utils/hash/dynahash.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
-test_cluster_space_cache: test_cluster_space_cache.c unit_test.h \
+test_cluster_space_hint_owners.inc: $(top_srcdir)/src/backend/access/heap/heapam_visibility.c Makefile
+	awk '/^SetHintBits\(/ { print "static void"; emit=1; found++ } \
+	     /^cluster_heap_stamp_released_xmax_invalid\(/ { print "void"; emit=1; found++ } \
+	     /^HeapTupleSetHintBits\(/ { print "void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_xmax_hint.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^UpdateXmaxHintBits\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_census_types.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^typedef (struct|enum) ClusterHeapItlTerminal(Census|BatchApplyKind|BatchApplyResult)$$/ { emit=1; found++ } \
+	     /^#define CLUSTER_HEAP_ITL_SLOT_BIT/ { print; macro++ } emit { print } \
+	     /^} ClusterHeapItlTerminal(Census|BatchApplyKind|BatchApplyResult);/ { emit=0 } \
+	     END { if (found != 3 || macro != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_census_mutation.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
+	awk '/^cluster_heap_itl_apply_terminal_census\(/ { inside=1 } \
+	     inside && /^\tif \(!cluster_semantic_activation_recheck_r4_terminal_census/ { emit=1; found++ } \
+	     emit && /^}/ { emit=inside=0; done++ } emit { print } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_fsm_hint.inc: $(top_srcdir)/src/backend/access/transam/xloginsert.c Makefile
+	awk '/^XLogSaveBufferForHint\(/ { print "XLogRecPtr"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_fsm_truncate.inc: $(top_srcdir)/src/backend/storage/freespace/freespace.c Makefile
+	awk '/^FreeSpaceMapPrepareTruncateRel\(/ { inside=1 } \
+	     inside && /Prepare the optional rebuildable WAL component/ { emit=1; found++ } emit { print } \
+	     emit && /END_CRIT_SECTION\(\);/ { emit=0; done++ } \
+	     /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_fsm_product.o: $(top_srcdir)/src/backend/storage/freespace/fsmpage.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
+
+test_cluster_space_cache: test_cluster_space_cache.c unit_test.h test_cluster_space_hint_owners.inc \
+		test_cluster_space_xmax_hint.inc \
+		test_cluster_space_fsm_hint.inc \
+		test_cluster_space_fsm_truncate.inc test_cluster_space_fsm_product.o \
+		test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc \
 		test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc \
 		test_cluster_space_cache_update.inc test_cluster_btree_build_identity.inc \
 		test_cluster_space_cache_hash.o test_cluster_space_storage_product.o \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
+		test_cluster_space_cleanout_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_storage_product.o test_cluster_space_cache_hash.o \
+		test_cluster_space_fsm_product.o \
+		test_cluster_space_bufpage_product.o test_cluster_space_producer_product.o \
+		test_cluster_space_cleanout_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_space_cleanout_product.o: $(top_srcdir)/src/backend/cluster/cluster_itl_cleanout.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_space_storage_product.o: $(top_srcdir)/src/backend/cluster/cluster_space_storage.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
@@ -3583,7 +3664,7 @@ clean distclean maintainer-clean:
 		test_cluster_btree_structure_delete.inc \
 		test_cluster_btree_structure_add.inc test_cluster_btree_structure_split.inc \
 		test_cluster_btree_structure_newlevel.inc test_cluster_btree_structure_insert.inc
-	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc
+	rm -f test_cluster_sequence_version_helpers.inc test_cluster_sequence_version_native.inc test_cluster_sequence_hint.inc
 	rm -f test_cluster_relation_wal_types.inc test_cluster_relation_wal_native.inc
 	rm -f test_cluster_heap_small_native.inc test_cluster_heap_small_scn.inc
 	rm -f test_cluster_btree_redo_native.inc test_cluster_btree_pageinit.inc
@@ -3594,13 +3675,18 @@ clean distclean maintainer-clean:
 	rm -f test_cluster_vm_visible_wrapper.inc test_cluster_vm_visible_empty.inc
 	rm -f test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc
-	rm -f test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc
+	rm -f test_cluster_btree_leaf_meta.inc test_cluster_btree_leaf_vacuum.inc test_cluster_btree_leaf_delete.inc test_cluster_btree_leaf_dedup.inc test_cluster_btree_leaf_cycle.inc
+	rm -f test_cluster_btree_unique_hint.inc test_cluster_btree_scan_hint.inc
 	rm -f test_cluster_btree_leaf_helpers.inc test_cluster_btree_leaf_dedup_helpers.inc
 	rm -f test_cluster_btree_build_identity.inc
 	rm -f test_cluster_heap_maintenance_identity.inc
 	rm -f test_cluster_heap_prune_version.inc test_cluster_heap_prune_helpers.inc \
 		test_cluster_heap_freeze_body.inc test_cluster_heap_freeze_helpers.inc test_cluster_heap_vacuum_version.inc
 	rm -f test_cluster_space_cache_insert.inc test_cluster_space_cache_delete.inc test_cluster_space_cache_allocation.inc test_cluster_space_cache_update.inc
+	rm -f test_cluster_space_hint_owners.inc test_cluster_space_census_types.inc test_cluster_space_census_mutation.inc test_cluster_space_cleanout_product.o
+	rm -f test_cluster_space_fsm_hint.inc
+	rm -f test_cluster_space_fsm_truncate.inc test_cluster_space_fsm_product.o
+	rm -f test_cluster_space_xmax_hint.inc
 	rm -f test_cluster_fresh_control.inc test_cluster_fresh_startup.inc test_cluster_fresh_read.inc \
 		test_cluster_fresh_boolean.inc test_cluster_fresh_index.inc test_cluster_fresh_utility.inc \
 		test_cluster_fresh_catalog_index.inc test_cluster_shared_utility.inc
