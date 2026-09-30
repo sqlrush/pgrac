@@ -1,0 +1,78 @@
+/*-------------------------------------------------------------------------
+ * cluster_space_reservation.h
+ *    Canonical main-fork sequential reservations in SPACE block one.
+ *
+ * Portions Copyright (c) 2026, pgrac contributors
+ * Author: SqlRush <sqlrush@gmail.com>
+ *-------------------------------------------------------------------------
+ */
+#ifndef CLUSTER_SPACE_RESERVATION_H
+#define CLUSTER_SPACE_RESERVATION_H
+
+#include "cluster/cluster_space_identity.h"
+
+#ifdef USE_PGRAC_CLUSTER
+
+#define CLUSTER_SPACE_RESERVATION_PROFILE 2
+#define CLUSTER_SPACE_RESERVATION_BLOCK 1
+#define CLUSTER_SPACE_RESERVATION_BYTES 160
+#define CLUSTER_SPACE_RESERVATION_MAGIC UINT32_C(0x31525350)
+#define CLUSTER_SPACE_RESERVATION_FORMAT 1
+#define CLUSTER_SPACE_RESERVATION_WAL_BYTES 368
+#define CLUSTER_SPACE_RESERVATION_WAL_MAGIC UINT32_C(0x31565350)
+
+/* In-memory fields, never copied as a disk/wire structure. InvalidBlockNumber
+ * is a valid exhausted exclusive upper bound, not an allocatable block. */
+typedef struct ClusterSpaceReservation {
+	ClusterSpaceIdentity identity;
+	BlockNumber next_block;
+} ClusterSpaceReservation;
+
+typedef enum ClusterSpaceReservationAction {
+	CLUSTER_SPACE_RESERVATION_INIT = 1,
+	CLUSTER_SPACE_RESERVATION_ADVANCE = 2,
+	CLUSTER_SPACE_RESERVATION_RESET = 3,
+	CLUSTER_SPACE_RESERVATION_TOMBSTONE = 4
+} ClusterSpaceReservationAction;
+
+typedef struct ClusterSpaceReservationChange {
+	ClusterSpaceReservationAction action;
+	BlockNumber first_block;
+	uint32 granted;
+	uint64 before_token;
+	uint64 result_token;
+	ClusterSpaceReservation before;
+	ClusterSpaceReservation result;
+} ClusterSpaceReservationChange;
+
+/* Pure representation and byte transitions only. No allocation, authority,
+ * I/O, WAL insertion, grant, durability or retention decision. Every refusal
+ * leaves output unchanged. Decode accepts unaligned input. */
+extern bool cluster_space_reservation_encode(const ClusterSpaceReservation *state,
+											  void *bytes, size_t length);
+extern bool cluster_space_reservation_decode(const void *bytes, size_t length,
+											  const ClusterSpaceIdentityKey *expected,
+											  ClusterSpaceReservation *out);
+extern bool cluster_space_reservation_page_encode(const ClusterSpaceReservation *state,
+												   uint64 token, void *page, size_t length);
+extern bool cluster_space_reservation_page_decode(const void *page, size_t length,
+												   ForkNumber forknum, BlockNumber block,
+												   const ClusterSpaceIdentityKey *expected,
+												   ClusterSpaceReservation *out, uint64 *token);
+extern bool cluster_space_reservation_page_valid(const void *page, size_t length);
+extern bool cluster_space_reservation_wal_encode(const ClusterSpaceReservationChange *change,
+												  void *bytes, size_t length);
+extern bool cluster_space_reservation_wal_decode(const void *bytes, size_t length,
+												  ClusterSpaceReservationChange *out);
+
+/* RESET/TOMBSTONE require their original structural owner and all-component
+ * preflight; this helper never truncates/drops a relation. ALREADY requires
+ * identical full typed result, not numeric ordering. Caller stamps WAL LSN/
+ * origin on APPLY and owns write/fsync/post-read before recovery readiness. */
+extern ClusterSpaceIdentityTransition
+cluster_space_reservation_apply(const ClusterSpaceReservationChange *change,
+								const ClusterSpaceIdentityKey *expected,
+								void *page, size_t length);
+
+#endif
+#endif

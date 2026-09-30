@@ -16,6 +16,7 @@
 #include "access/xlog.h"
 #include "catalog/pg_tablespace_d.h"
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_space_reservation.h"
 #include "pgstat.h"
 #include "storage/bufpage.h"
 #include "storage/checksum.h"
@@ -136,19 +137,51 @@ UT_TEST(test_fork_bound_read_rejects_swapped_page_types)
 	/* Native unformatted extension is not an identity; typed decode refuses it. */
 	UT_ASSERT(PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 0, 0));
 	UT_ASSERT(!cluster_space_identity_page_valid(page.data, BLCKSZ));
-	UT_ASSERT(!PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 1, 0));
+	UT_ASSERT(PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 1, 0));
+	UT_ASSERT(!cluster_space_reservation_page_valid(page.data, BLCKSZ));
+	UT_ASSERT(!PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 2, 0));
 	UT_ASSERT(!PageIsVerifiedForFork(page.data, InvalidForkNumber, 0, 0));
 	UT_ASSERT(!PageIsVerifiedForFork(page.data, MAX_FORKNUM + 1, 0, 0));
+}
+
+UT_TEST(test_reservation_page_has_its_own_block_and_integrity)
+{
+	PGAlignedBlock page;
+	ClusterSpaceReservation reservation = {0};
+	ClusterSpaceIdentityKey key = {0};
+	uint64 token;
+
+	checksums = false;
+	make_page(&page);
+	key.system_identifier = key.database_incarnation = 1;
+	key.storage_uuid[0] = 1;
+	key.locator = (RelFileLocator){DEFAULTTABLESPACE_OID, 5, 16384};
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+		&key, &reservation.identity, &token));
+	reservation.next_block = 11;
+	UT_ASSERT(cluster_space_reservation_page_encode(&reservation, 9, page.data, BLCKSZ));
+	UT_ASSERT(PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 1, 0));
+	UT_ASSERT(!PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 0, 0));
+	UT_ASSERT(!PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 2, 0));
+	UT_ASSERT(!PageIsVerifiedForFork(page.data, MAIN_FORKNUM, 1, 0));
+	checksums = true;
+	ignore_checksum_failure = true;
+	((PageHeader)page.data)->pd_checksum = pg_checksum_page(page.data, 1);
+	UT_ASSERT(PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 1, 0));
+	page.data[32 + 16] ^= 1;
+	UT_ASSERT(!PageIsVerifiedForFork(page.data, SPACE_FORKNUM, 1, 0));
+	ignore_checksum_failure = false;
 }
 
 int
 main(void)
 {
-	UT_PLAN(4);
+	UT_PLAN(5);
 	UT_RUN(test_native_read_checks_payload_even_without_checksums);
 	UT_RUN(test_ignore_checksum_failure_cannot_bypass_structure);
 	UT_RUN(test_native_page_stays_native);
 	UT_RUN(test_fork_bound_read_rejects_swapped_page_types);
+	UT_RUN(test_reservation_page_has_its_own_block_and_integrity);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

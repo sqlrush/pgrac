@@ -435,6 +435,7 @@ TESTS += test_cluster_btree_redo
 TESTS += test_cluster_page_dependency
 TESTS += test_cluster_undo_producer
 TESTS += test_cluster_undo_native_lifecycle
+TESTS += test_cluster_space_reservation
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -1921,7 +1922,7 @@ test_cluster_space_fork: test_cluster_space_fork.c unit_test.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@
 
-test_cluster_space_identity test_cluster_space_wal: %: %.c unit_test.h \
+test_cluster_space_identity test_cluster_space_wal test_cluster_space_reservation: %: %.c unit_test.h \
 		$(top_builddir)/src/common/libpgcommon.a
 	$(CC) $(CFLAGS) $(CPPFLAGS) -DFRONTEND $< \
 		$(top_builddir)/src/common/libpgcommon.a $(top_builddir)/src/port/libpgport.a -o $@

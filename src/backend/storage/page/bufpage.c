@@ -98,6 +98,7 @@
 
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_space_identity.h" /* PGRAC: typed metadata validation */
+#include "cluster/cluster_space_reservation.h" /* PGRAC: SPACE block one */
 #include "cluster/cluster_itl_slot.h" /* PageInitHeapPage placeholder writes (stage 1.5) */
 #include "cluster/cluster_undo_segment.h"  /* UndoSegmentHeaderData (stage 1.21) */
 #include "cluster/cluster_undo_segment_init.h" /* shared header bytes helper (stage 1.22 D14c) */
@@ -370,9 +371,11 @@ PageIsVerifiedExtended(Page page, BlockNumber blkno, int flags)
 #ifdef USE_PGRAC_CLUSTER
 		/* PGRAC: metadata integrity is mandatory even with checksums disabled
 		 * or ignore_checksum_failure set.  Generic header bounds do not
-		 * validate the independently versioned identity payload. */
+		 * validate the independently versioned identity/reservation payloads. */
 		if ((p->pd_flags & PD_SPACE_METADATA) != 0 &&
-			(blkno != 0 || !cluster_space_identity_page_valid(page, BLCKSZ)))
+			!((blkno == 0 && cluster_space_identity_page_valid(page, BLCKSZ)) ||
+			  (blkno == CLUSTER_SPACE_RESERVATION_BLOCK &&
+			   cluster_space_reservation_page_valid(page, BLCKSZ))))
 			header_sane = false;
 #endif
 
@@ -425,7 +428,7 @@ PageIsVerifiedForFork(Page page, ForkNumber forknum, BlockNumber blkno, int flag
 	PageHeader	p = (PageHeader) page;
 
 	if (forknum < MAIN_FORKNUM || forknum > MAX_FORKNUM ||
-		(forknum == SPACE_FORKNUM && blkno != 0))
+		(forknum == SPACE_FORKNUM && blkno > CLUSTER_SPACE_RESERVATION_BLOCK))
 		return false;
 	/* An unformatted extension is not a typed identity.  The generic
 	 * verifier still requires every byte to be zero in that case. */
