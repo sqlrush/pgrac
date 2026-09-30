@@ -121,10 +121,13 @@ cluster_recovery_record_class(RmgrId rmid, bool has_block_ref, bool first_block_
 			 * pre-arm these fell through to U and 53RA3'd the merge.) */
 			return CLUSTER_RECMERGE_GLOBAL;
 		case RM_XLOG_ID:
-		case RM_RELMAP_ID:
-			/* XLOG housekeeping (checkpoint/fpw/...) + relmap are
-			 * node-local on a foreign stream. */
+			/* XLOG housekeeping (checkpoint/fpw/...) is node-local. */
 			return CLUSTER_RECMERGE_LOCAL;
+		case RM_RELMAP_ID:
+			/* A foreign relation-map update can change shared catalog
+			 * routing. Until its shared owner is available it must block
+			 * recovery, never disappear as local housekeeping. */
+			return CLUSTER_RECMERGE_UNCLASSIFIABLE;
 		case RM_SMGR_ID:
 			/* smgr create/truncate name their relfile in the payload;
 			 * the caller resolves its routing through the same smgr
