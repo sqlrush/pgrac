@@ -50,6 +50,9 @@ typedef struct OwnerCapture {
 	uint32 scope_enters, scope_leaves, target_reads;
 	bool canonical_batch, bad_commit, scope_denied;
 	uint16 legacy_terminal;
+	uint32 header_writes, header_syncs, covered_commits;
+	bool write_failure, post_read_mismatch;
+	bool authority_throw_after_pop;
 	Size scratch_budget;
 } OwnerCapture;
 
@@ -57,6 +60,37 @@ static OwnerCapture capture;
 static ClusterThreadRecoveryAuthorityV1 canonical_authority;
 static ClusterUndoRecoveryScopeV1 *active_scope;
 static PGAlignedBlock canonical_header;
+
+/* Immutable-planner boundary; the real planner's source/slot proof is covered
+ * by test_cluster_side_xact. This fixture supplies one predetermined result. */
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_header_v1(const RfSideOnlinePlanV1 *plan,
+	uint8 instance, uint32 segment, const char *base, RfSideUndoHeaderImageV1 *out)
+{
+	TTSlot *slot;
+
+	UT_ASSERT(plan != NULL && instance == 3 && segment == 513);
+	if (capture.bad_commit) return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	memset(out, 0, sizeof(*out));
+	memcpy(out->page.data, base, BLCKSZ);
+	slot = &((UndoSegmentHeaderData *)out->page.data)->tt_slots[4];
+	memset(slot, 0, sizeof(*slot));
+	slot->xid = 802;
+	slot->wrap = 7;
+	slot->status = capture.legacy_terminal == XLOG_UNDO_TT_SLOT_ABORT
+		? TT_SLOT_ABORTED : TT_SLOT_COMMITTED;
+	slot->commit_scn = slot->status == TT_SLOT_COMMITTED ? 999 : InvalidScn;
+	out->operation_count = 2;
+	out->source_index = 1;
+	return RF_PAGE_PROOF_DETAIL_OK;
+}
+
+bool
+rf_side_online_plan_contains_commit_v1(const RfSideOnlinePlanV1 *plan,
+	const RfSideXactOperationV1 *operation)
+{
+	return plan != NULL && operation->kind == RF_SIDE_XACT_COMMIT && operation->has_tt_delta;
+}
 
 Size
 rf_side_online_plan_scratch_available_v1(const RfSideOnlinePlanV1 *plan)
@@ -96,7 +130,41 @@ cluster_undo_smgr_read_block(ClusterUndoPathIntent intent, uint32 segment,
 	UT_ASSERT_EQ(block, 0);
 	capture.target_reads++;
 	memcpy(out, canonical_header.data, BLCKSZ);
+	if (capture.post_read_mismatch && capture.header_writes != 0) out[128] ^= 1;
 	return true;
+}
+
+bool
+cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 segment,
+	uint8 instance, uint32 block, const char *data, bool sync)
+{
+	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
+	UT_ASSERT(active_scope != NULL && segment == 513 && instance == 3 && block == 0 && sync);
+	/* All target checks must precede even the first canonical write. */
+	UT_ASSERT_EQ(capture.projection_preflights, 1);
+	capture.header_writes++;
+	if (capture.write_failure) return false;
+	memcpy(canonical_header.data, data, BLCKSZ);
+	capture.header_syncs++;
+	return true;
+}
+
+bool
+cluster_undo_smgr_fsync_segment_file(uint32 segment, uint8 instance)
+{
+	UT_ASSERT(active_scope != NULL && segment == 513 && instance == 3);
+	capture.header_syncs++;
+	return !capture.write_failure;
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation,
+	void *arg, bool (*verify)(void *, const RfSideXactOperationV1 *))
+{
+	if (!verify(arg, operation)) return RF_SIDE_XACT_APPLY_BLOCKED;
+	UT_ASSERT_EQ(capture.header_syncs, 1);
+	capture.covered_commits++;
+	return RF_SIDE_XACT_APPLY_OK;
 }
 
 uint32
@@ -112,7 +180,8 @@ fresh_authority(void *arg)
 	OwnerCapture *state = (OwnerCapture *)arg;
 
 	state->authority_calls++;
-	if (state->authority_throw_call == state->authority_calls)
+	if (state->authority_throw_call == state->authority_calls
+		|| (state->authority_throw_after_pop && state->pops != 0))
 		pg_re_throw();
 	return state->authority_fail_call == 0 || state->authority_calls != state->authority_fail_call;
 }
@@ -437,13 +506,15 @@ UT_TEST(test_canonical_owner_evolves_private_header_before_any_apply)
 		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &canonical_authority));
 		UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner),
 			fault == 0 ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
-		UT_ASSERT_EQ(capture.xact_applies + capture.undo_applies, fault == 0 ? 2 : 0);
+		UT_ASSERT_EQ(capture.xact_applies + capture.undo_applies, 0);
+		UT_ASSERT_EQ(capture.header_writes, fault == 0 ? 1 : 0);
 		UT_ASSERT_EQ(capture.scope_enters, fault == 3 ? 0 : 1);
 		UT_ASSERT_EQ(capture.scope_leaves, capture.scope_enters);
-		UT_ASSERT_EQ(capture.target_reads, fault < 2 ? 1 : 0);
+		if (fault == 0) UT_ASSERT(capture.target_reads >= 3);
+		else UT_ASSERT_EQ(capture.target_reads, fault == 1 ? 1 : 0);
 		UT_ASSERT(active_scope == NULL && owner.undo_headers == NULL);
 		UT_ASSERT_EQ(capture.pushes, capture.pops);
-		UT_ASSERT(memcmp(canonical_header.data, saved.data, BLCKSZ) == 0);
+		if (fault != 0) UT_ASSERT(memcmp(canonical_header.data, saved.data, BLCKSZ) == 0);
 	}
 }
 
@@ -457,7 +528,7 @@ UT_TEST(test_canonical_owner_error_releases_qualified_scope_and_headers)
 	capture.plan_operation_count = 3;
 	capture.canonical_batch = true;
 	capture.scratch_budget = RF_SIDE_ONLINE_PLAN_MAX_BYTES;
-	capture.authority_throw_call = 8;
+	capture.authority_throw_after_pop = true;
 	cluster_undo_segment_make_header_bytes(513, 3, canonical_header.data);
 	UT_ASSERT(rf_side_online_production_owner_init_v1(owner, &canonical_authority,
 		canonical_fresh, 19, true));
@@ -501,16 +572,50 @@ UT_TEST(test_legacy_terminal_preflight_preserves_exact_apply_admission)
 			UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &canonical_authority));
 			UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), wrong_xid
 				? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_OK);
-			UT_ASSERT_EQ(capture.undo_applies, wrong_xid ? 0 : 2);
+			UT_ASSERT_EQ(capture.undo_applies, 0);
+			UT_ASSERT_EQ(capture.header_writes, wrong_xid ? 0 : 1);
 			UT_ASSERT_EQ(capture.projection_applies, wrong_xid ? 0 : 1);
 			UT_ASSERT(active_scope == NULL && owner.undo_headers == NULL);
 		}
 }
 
+UT_TEST(test_canonical_header_install_precedes_covered_commit_and_is_repeatable)
+{
+	for (int failure = 0; failure < 3; failure++) {
+		RfSideOnlineProductionOwnerV1 owner;
+		RfSideOnlinePlanV1 *plan = (RfSideOnlinePlanV1 *)(uintptr_t)1;
+
+		memset(&capture, 0, sizeof(capture));
+		capture.plan_operation_count = 3;
+		capture.canonical_batch = true;
+		capture.scratch_budget = RF_SIDE_ONLINE_PLAN_MAX_BYTES;
+		capture.write_failure = failure == 1;
+		capture.post_read_mismatch = failure == 2;
+		cluster_undo_segment_make_header_bytes(513, 3, canonical_header.data);
+		UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &canonical_authority,
+			canonical_fresh, 19, true));
+		UT_ASSERT(rf_side_online_production_bind_undo_v1(&owner, &canonical_authority));
+		UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), failure == 0
+			? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+		UT_ASSERT_EQ(capture.header_writes, 1);
+		UT_ASSERT_EQ(capture.covered_commits, failure == 0 ? 1 : 0);
+		UT_ASSERT_EQ(capture.undo_applies + capture.xact_applies, 0);
+		UT_ASSERT(active_scope == NULL && owner.undo_headers == NULL);
+		if (failure == 0) {
+			capture.header_syncs = capture.covered_commits = 0;
+			UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(capture.header_writes, 1);
+			UT_ASSERT_EQ(capture.header_syncs, 1);
+			UT_ASSERT_EQ(capture.covered_commits, 1);
+		}
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(8);
+	UT_PLAN(9);
+	UT_RUN(test_canonical_header_install_precedes_covered_commit_and_is_repeatable);
 	UT_RUN(test_legacy_terminal_preflight_preserves_exact_apply_admission);
 	UT_RUN(test_canonical_owner_error_releases_qualified_scope_and_headers);
 	UT_RUN(test_canonical_owner_evolves_private_header_before_any_apply);

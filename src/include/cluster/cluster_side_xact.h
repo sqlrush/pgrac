@@ -97,6 +97,11 @@ typedef struct RfSideXactAbortPreparedRequirementsV1 {
 
 /* Apply one already-decoded operation.  This function never reads WAL. */
 extern RfSideXactApplyResultV1 rf_side_xact_apply_v1(const RfSideXactOperationV1 *operation);
+/* Reconstruct only the derived terminal projection after the original owner
+ * verifies this immutable COMMIT is covered by its durable canonical header. */
+typedef bool (*RfSideXactVerifyCommitCoverageV1)(void *arg, const RfSideXactOperationV1 *operation);
+extern RfSideXactApplyResultV1 rf_side_xact_apply_covered_commit_v1(
+	const RfSideXactOperationV1 *operation, void *arg, RfSideXactVerifyCommitCoverageV1 verify);
 extern RfSideXactApplyResultV1
 rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 									   const uint8 *owned_payload, uint32 owned_payload_length);

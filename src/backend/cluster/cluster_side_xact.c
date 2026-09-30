@@ -600,33 +600,14 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 }
 
 static RfSideXactApplyResultV1
-side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
+side_xact_project_commit_v1(const RfSideXactOperationV1 *operation)
 {
 	ClusterRemoteXactMutationV2 mutation;
 	ClusterRemoteXactOutcome outcome;
 	TimestampTz timestamp;
 	SCN post_scn;
-	SCN durable_scn;
 	uint16 post_wrap;
-	uint16 durable_segment;
-	uint16 durable_slot;
-	uint16 durable_wrap;
 	bool post_wrap_valid;
-
-	/* Canonical TT truth first, using only the frozen typed delta. */
-	cluster_tt_durable_redo_stamp_slot_exact(
-		operation->tt_delta.instance, operation->tt_delta.segment_id,
-		operation->tt_delta.segment_generation, operation->tt_delta.slot_offset,
-		operation->tt_delta.wrap, operation->tt_delta.xid, operation->tt_delta.commit_scn);
-	if (cluster_tt_slot_durable_resolve_by_xid_origin(
-			operation->origin_thread - 1, operation->xid, operation->tt_delta.wrap, &durable_scn,
-			&durable_segment, &durable_slot, &durable_wrap)
-			!= CLUSTER_TT_DURABLE_RESOLVED_SCN
-		|| durable_scn != operation->terminal_scn
-		|| durable_segment != operation->tt_delta.segment_id
-		|| durable_slot != operation->tt_delta.slot_offset
-		|| durable_wrap != operation->tt_delta.wrap)
-		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
 
 	cluster_scn_recovery_replay_observe(operation->terminal_scn);
 	mutation = cluster_remote_xact_store_terminal_v2(
@@ -647,6 +628,38 @@ side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
 		|| timestamp != operation->terminal_timestamp)
 		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
 	return RF_SIDE_XACT_APPLY_OK;
+}
+
+static RfSideXactApplyResultV1
+side_xact_apply_commit_v1(const RfSideXactOperationV1 *operation)
+{
+	SCN durable_scn;
+	uint16 durable_segment, durable_slot, durable_wrap;
+
+	cluster_tt_durable_redo_stamp_slot_exact(
+		operation->tt_delta.instance, operation->tt_delta.segment_id,
+		operation->tt_delta.segment_generation, operation->tt_delta.slot_offset,
+		operation->tt_delta.wrap, operation->tt_delta.xid, operation->tt_delta.commit_scn);
+	if (cluster_tt_slot_durable_resolve_by_xid_origin(
+			operation->origin_thread - 1, operation->xid, operation->tt_delta.wrap, &durable_scn,
+			&durable_segment, &durable_slot, &durable_wrap) != CLUSTER_TT_DURABLE_RESOLVED_SCN
+		|| durable_scn != operation->terminal_scn
+		|| durable_segment != operation->tt_delta.segment_id
+		|| durable_slot != operation->tt_delta.slot_offset
+		|| durable_wrap != operation->tt_delta.wrap)
+		return RF_SIDE_XACT_APPLY_POST_READ_FAILED;
+	return side_xact_project_commit_v1(operation);
+}
+
+RfSideXactApplyResultV1
+rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation,
+	void *arg, RfSideXactVerifyCommitCoverageV1 verify)
+{
+	if (operation == NULL || operation->kind != RF_SIDE_XACT_COMMIT || verify == NULL
+		|| rf_side_xact_target_preflight_owned_v1(operation, NULL, 0) != RF_SIDE_XACT_APPLY_OK
+		|| !verify(arg, operation))
+		return RF_SIDE_XACT_APPLY_BLOCKED;
+	return side_xact_project_commit_v1(operation);
 }
 
 static RfSideXactApplyResultV1

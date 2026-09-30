@@ -2430,11 +2430,13 @@ test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster
 		-ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_header_identity.inc \
+		test_cluster_side_online_owner_product.o \
 		$(CLUSTER_SIDE_XACT_O) $(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_XACTDESC_O) $(SIDE_XACT_TT_2PC_RECORD_O) \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_XACT_O) \
+		test_cluster_side_online_owner_product.o \
 		$(CLUSTER_SIDE_ONLINE_PLAN_TEST_O) $(SIDE_XACT_XACTDESC_O) \
 		$(CLUSTER_REMOTE_XACT_IDENTITY_O) \
 		$(SIDE_XACT_TT_2PC_RECORD_O) test_cluster_side_xact_undo_product.o \

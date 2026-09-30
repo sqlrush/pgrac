@@ -23,7 +23,9 @@ typedef struct SideUndoHeader {
 	struct SideUndoHeader *next;
 	uint32 segment_id;
 	uint8 instance;
-	PGAlignedBlock page;
+	bool installed;
+	PGAlignedBlock base;
+	RfSideUndoHeaderImageV1 final;
 } SideUndoHeader;
 
 static SideUndoHeader *
@@ -34,8 +36,8 @@ side_owner_undo_header(RfSideOnlineProductionOwnerV1 *owner, uint8 instance, uin
 	for (header = owner->undo_headers; header != NULL; header = header->next)
 		if (header->instance == instance && header->segment_id == segment_id)
 			return header;
-	/* The two private pages used by typed preparation share this budget. */
-	if (owner->undo_bytes_remaining < sizeof(*header) + 2 * BLCKSZ)
+	/* Include typed preparation, stable reads and their bounded stack pages. */
+	if (owner->undo_bytes_remaining < sizeof(*header) + 8 * BLCKSZ)
 		return NULL;
 	header = owner_alloc(sizeof(*header));
 	if (header == NULL)
@@ -47,7 +49,9 @@ side_owner_undo_header(RfSideOnlineProductionOwnerV1 *owner, uint8 instance, uin
 	owner->undo_bytes_remaining -= sizeof(*header);
 	/* Link before I/O so the protected-set ERROR cleanup also owns it. */
 	if (!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, segment_id,
-		instance, 0, header->page.data))
+		instance, 0, header->base.data)
+		|| rf_side_online_plan_prepare_undo_header_v1(owner->protected_plan, instance,
+			segment_id, header->base.data, &header->final) != RF_PAGE_PROOF_DETAIL_OK)
 		return NULL;
 	return header;
 }
@@ -72,6 +76,51 @@ side_owner_authority_fresh(RfSideOnlineProductionOwnerV1 *owner)
 {
 	return owner != NULL && owner->revalidate_authority != NULL
 		   && owner->revalidate_authority(owner->authority_arg);
+}
+
+static bool
+side_owner_install_header(RfSideOnlineProductionOwnerV1 *owner, SideUndoHeader *header)
+{
+	PGAlignedBlock current;
+
+	if (header == NULL || !side_owner_authority_fresh(owner)
+		|| !cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, header->segment_id,
+			header->instance, 0, current.data))
+		return false;
+	if (header->installed)
+		return memcmp(current.data, header->final.page.data, BLCKSZ) == 0;
+	if (memcmp(current.data, header->base.data, BLCKSZ) != 0
+		|| !side_owner_authority_fresh(owner))
+		return false;
+	if (memcmp(current.data, header->final.page.data, BLCKSZ) != 0) {
+		if (!cluster_undo_smgr_write_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, header->segment_id,
+			header->instance, 0, header->final.page.data, true))
+			return false;
+	} else if (!cluster_undo_smgr_fsync_segment_file(header->segment_id, header->instance))
+		return false;
+	if (!side_owner_authority_fresh(owner)
+		|| !cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, header->segment_id,
+			header->instance, 0, current.data)
+		|| memcmp(current.data, header->final.page.data, BLCKSZ) != 0)
+		return false;
+	header->installed = true;
+	return true;
+}
+
+static bool
+side_owner_commit_covered(void *arg, const RfSideXactOperationV1 *operation)
+{
+	RfSideOnlineProductionOwnerV1 *owner = arg;
+	SideUndoHeader *header;
+
+	if (owner == NULL || !owner->protected_set_active || owner->undo_authority == NULL
+		|| !rf_side_online_plan_contains_commit_v1(owner->protected_plan, operation))
+		return false;
+	for (header = owner->undo_headers; header != NULL; header = header->next)
+		if (header->instance == operation->tt_delta.instance
+			&& header->segment_id == operation->tt_delta.segment_id)
+			return header->installed && side_owner_install_header(owner, header);
+	return false;
 }
 
 static bool
@@ -122,14 +171,9 @@ side_owner_preflight_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 		return false;
 	if (owner->undo_authority != NULL && operation->xact.kind == RF_SIDE_XACT_COMMIT) {
 		const xl_xact_tt_commit *delta = &operation->xact.tt_delta;
-		SideUndoHeader *header;
-
 		if (!operation->xact.has_tt_delta)
 			return false;
-		header = side_owner_undo_header(owner, delta->instance, delta->segment_id);
-		return header != NULL && cluster_undo_prepare_commit_v1(delta->instance, delta->segment_id,
-			delta->segment_generation, delta->slot_offset, delta->wrap, delta->xid,
-			delta->commit_scn, header->page.data, header->page.data) != CLUSTER_UNDO_HEADER_BLOCKED;
+		return side_owner_undo_header(owner, delta->instance, delta->segment_id) != NULL;
 	}
 	return true;
 }
@@ -145,7 +189,6 @@ side_owner_preflight_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 		return false;
 	if (owner->undo_authority != NULL) {
 		const ClusterUndoDecoded *undo = &operation->undo;
-		SideUndoHeader *header;
 
 		/* Physical blocks and lifecycle installation keep their separate gate. */
 		if (undo->kind != CLUSTER_UNDO_KIND_TT_BIND && undo->kind != CLUSTER_UNDO_KIND_TT_COMMIT
@@ -154,19 +197,7 @@ side_owner_preflight_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 			return false;
 		if (operation->owned_payload != NULL || operation->owned_payload_length != 0)
 			return false;
-		header = side_owner_undo_header(owner, undo->instance, undo->segment_id);
-		if (header != NULL && (undo->kind == CLUSTER_UNDO_KIND_TT_COMMIT
-			|| undo->kind == CLUSTER_UNDO_KIND_TT_SET_HEAD
-			|| (undo->kind == CLUSTER_UNDO_KIND_TT_ABORT && undo->format_version == 0))) {
-			const UndoSegmentHeaderData *data = (const UndoSegmentHeaderData *)header->page.data;
-
-			if (undo->slot_offset >= TT_SLOTS_PER_SEGMENT
-				|| cluster_undo_preflight_legacy_slot_v1(undo, &data->tt_slots[undo->slot_offset])
-					== CLUSTER_UNDO_TARGET_BLOCKED)
-				return false;
-		}
-		return header != NULL && cluster_undo_prepare_header_v1(undo, NULL, 0,
-			header->page.data, header->page.data) != CLUSTER_UNDO_HEADER_BLOCKED;
+		return side_owner_undo_header(owner, undo->instance, undo->segment_id) != NULL;
 	}
 	target = cluster_undo_preflight_tt_target_v1(&operation->undo);
 	return target == CLUSTER_UNDO_TARGET_APPLY || target == CLUSTER_UNDO_TARGET_PROVED_NOOP;
@@ -186,6 +217,16 @@ side_owner_apply_xact(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
 
+	if (owner != NULL && owner->protected_set_active && owner->undo_authority != NULL
+		&& operation != NULL && operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
+		&& operation->xact.kind == RF_SIDE_XACT_COMMIT) {
+		const xl_xact_tt_commit *d = &operation->xact.tt_delta;
+
+		if (!side_owner_install_header(owner, side_owner_undo_header(owner, d->instance, d->segment_id)))
+			return false;
+		return rf_side_xact_apply_covered_commit_v1(&operation->xact, owner, side_owner_commit_covered)
+			== RF_SIDE_XACT_APPLY_OK;
+	}
 	return owner != NULL && owner->protected_set_active && side_owner_authority_fresh(owner)
 		   && operation != NULL && operation->kind == RF_SIDE_ONLINE_OPERATION_XACT
 		   && rf_side_xact_apply_owned_v1(&operation->xact, operation->owned_payload,
@@ -198,6 +239,10 @@ side_owner_apply_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 {
 	RfSideOnlineProductionOwnerV1 *owner = (RfSideOnlineProductionOwnerV1 *)arg;
 
+	if (owner != NULL && owner->protected_set_active && owner->undo_authority != NULL
+		&& operation != NULL && operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO)
+		return side_owner_install_header(owner, side_owner_undo_header(owner,
+			operation->undo.instance, operation->undo.segment_id));
 	return owner != NULL && owner->protected_set_active && side_owner_authority_fresh(owner)
 		   && operation != NULL && operation->kind == RF_SIDE_ONLINE_OPERATION_UNDO
 		   && cluster_undo_apply_tt_v1(&operation->undo) == CLUSTER_UNDO_APPLY_OK;
