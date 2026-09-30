@@ -273,6 +273,7 @@ typedef struct BTWriteState
 #ifdef USE_PGRAC_CLUSTER
 	bool		versioned;
 	ClusterSpaceIdentity identity;	/* PGRAC: copied before page construction */
+	BlockNumber reserved_blocks;	/* exclusive bound granted to this build */
 	/* PGRAC: bounded private pages, not an alternate shared buffer cache. */
 	struct
 	{
@@ -623,6 +624,7 @@ _bt_leafbuild(BTSpool *btspool, BTSpool *btspool2)
 #ifdef USE_PGRAC_CLUSTER
 	wstate.pending_count = 0;
 	wstate.pending_lsn = InvalidXLogRecPtr;
+	wstate.reserved_blocks = 0;
 #endif
 
 	pgstat_progress_update_param(PROGRESS_CREATEIDX_SUBPHASE,
@@ -783,6 +785,22 @@ _bt_blwritepage(BTWriteState *wstate, Page page, BlockNumber blkno)
 		XLogRecPtr recptr;
 
 		Assert(wstate->btws_use_wal);
+		/* Reserve before emitting any page version. The unpublished build
+		 * owns these ranges under its original lifecycle lock. A bounded
+		 * batch also covers out-of-order zero fills; unused reservations
+		 * stay consumed and are never inferred from physical file size. */
+		if (blkno == InvalidBlockNumber)
+			elog(ERROR, "invalid shared btree build block number");
+		if (blkno >= wstate->reserved_blocks)
+		{
+			uint32 want = Max((uint32)lengthof(wstate->pending),
+							  blkno - wstate->reserved_blocks + 1);
+
+			want = Min(want, InvalidBlockNumber - wstate->reserved_blocks);
+			if (!cluster_space_reserve_exact(&wstate->identity, wstate->reserved_blocks, want))
+				elog(ERROR, "cannot reserve shared btree build block range");
+			wstate->reserved_blocks += want;
+		}
 		/*
 		 * Parent and metapage backfills must inspect real predecessor bytes.
 		 * Finish earlier writes before reading a gap or revisiting a block;

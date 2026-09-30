@@ -85,6 +85,12 @@ cluster_hw_master_process(const HwAllocRequest *req, HwAllocReply *reply)
 	memset(reply, 0, sizeof(*reply));
 	reply->request_id = req->request_id;
 	reply->source_procno = req->source_procno;
+	/* The shared profile owns reservations in canonical SPACE pages.
+	 * Legacy requests cannot advance a second counter or emit old WAL. */
+	if (cluster_shared_config) {
+		reply->status = HW_ALLOC_REPLY_FAIL_NOT_READY;
+		return;
+	}
 
 	rloc.spcOid = req->spcOid;
 	rloc.dbOid = req->dbOid;
@@ -150,6 +156,8 @@ cluster_hw_allocate(RelFileLocator rloc, ForkNumber fork, uint32 want, BlockNumb
 	Assert(granted != NULL);
 	Assert(want > 0);
 	*granted = 0;
+	if (cluster_shared_config)
+		return InvalidBlockNumber;
 
 	cluster_hw_resid_encode(rloc, fork, &resid);
 

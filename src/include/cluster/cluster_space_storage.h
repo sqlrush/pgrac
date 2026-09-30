@@ -122,4 +122,20 @@ extern bool cluster_space_init_vm_buffer_wal(const ClusterSpaceIdentity *identit
  * reject replay; an unsupported structural action is never silently skipped. */
 extern bool cluster_space_relation_redo(XLogReaderState *record);
 
+struct HwLock;
+
+/* Original extension owner holds relation lifecycle protection and this
+ * exact HW(X). The identity was resolved before ordinary content locks.
+ * Uses the existing GCS current-X SPACE page, never FileSize or a second
+ * master counter. WAL is flushed before a nonempty range is returned.
+ * Refusal returns InvalidBlockNumber and zero granted. */
+extern BlockNumber cluster_space_reserve(const ClusterSpaceIdentity *identity,
+										 const struct HwLock *lock, uint32 want, uint32 *granted);
+
+/* Original unpublished build/copy owner only, under its lifecycle lock.
+ * Acquire HW(X) and reserve exactly the requested next range. A mismatched
+ * grant is consumed but refused; it never licenses overwriting prior blocks. */
+extern bool cluster_space_reserve_exact(const ClusterSpaceIdentity *identity,
+									   BlockNumber first, uint32 count);
+
 #endif /* CLUSTER_SPACE_STORAGE_H */

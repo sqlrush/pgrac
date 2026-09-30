@@ -3284,6 +3284,18 @@ cluster_record_apply_class(XLogReaderState *r)
 		first_shared = (cluster_smgr_which_for(change.identity.result.key.locator, InvalidBackendId) == 1);
 		return cluster_recovery_record_class(RM_SMGR_ID, false, first_shared, true);
 	}
+	if (XLogRecGetRmid(r) == RM_SMGR_ID &&
+		(XLogRecGetInfo(r) & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_RESERVATION)
+	{
+		ClusterSpaceReservationChange change;
+
+		if (has_block ||
+			!cluster_space_reservation_wal_decode(XLogRecGetData(r), XLogRecGetDataLen(r), &change) ||
+			change.action != CLUSTER_SPACE_RESERVATION_ADVANCE)
+			return CLUSTER_RECMERGE_UNCLASSIFIABLE;
+		first_shared = (cluster_smgr_which_for(change.result.identity.key.locator, InvalidBackendId) == 1);
+		return cluster_recovery_record_class(RM_SMGR_ID, false, first_shared, true);
+	}
 
 	if (has_block)
 	{

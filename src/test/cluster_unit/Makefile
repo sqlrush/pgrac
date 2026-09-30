@@ -426,6 +426,7 @@ SIMPLE_TESTS := $(filter-out test_cluster_generic_version test_cluster_generic_r
 SIMPLE_TESTS := $(filter-out test_cluster_heap_inplace_version test_cluster_heap_maintenance_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_vm_visible_version,$(SIMPLE_TESTS))
 SIMPLE_TESTS := $(filter-out test_cluster_btree_build_version,$(SIMPLE_TESTS))
+TESTS += test_cluster_space_extend
 SIMPLE_TESTS := $(filter-out test_cluster_btree_leaf_version,$(SIMPLE_TESTS))
 TESTS += test_cluster_btree_structure_version
 TESTS += test_cluster_sequence_version
@@ -1606,10 +1607,10 @@ test_cluster_btree_build_version: test_cluster_btree_build_version.c unit_test.h
 		test_cluster_btree_build_writer.inc test_cluster_btree_build_state.inc \
 		test_cluster_btree_build_finish.inc \
 		test_cluster_space_bufpage_product.o \
-		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_bufpage_product.o \
-		test_cluster_space_producer_product.o test_cluster_space_storage_product.o \
+		test_cluster_space_producer_product.o test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -2054,12 +2055,16 @@ test_cluster_space_copy_buffer.inc: $(top_srcdir)/src/backend/storage/buffer/buf
 
 test_cluster_space_copy_version: test_cluster_space_copy_version.c test_cluster_space_copy_buffer.inc \
 		test_cluster_heap_extend_page.inc unit_test.h \
-		test_cluster_space_catalog_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
+		test_cluster_space_copy_catalog_product.o test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_catalog_product.o \
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_space_copy_catalog_product.o \
 		test_cluster_space_storage_product.o test_cluster_space_producer_product.o \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+test_cluster_space_copy_catalog_product.o: $(top_srcdir)/src/backend/catalog/storage.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) -Dcluster_space_reserve_exact=fixture_copy_reserve \
+		-ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_space_smgrdesc_product.o: $(top_srcdir)/src/backend/access/rmgrdesc/smgrdesc.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
@@ -2083,12 +2088,25 @@ test_cluster_space_recovery_route: test_cluster_space_recovery_route.c test_clus
 
 test_cluster_space_storage: test_cluster_space_storage.c unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
 		test_cluster_space_xlogutils_product.o \
-		test_cluster_space_storage_product.o \
+		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		test_cluster_space_storage_product.o test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
-		test_cluster_space_xlogutils_product.o \
+		test_cluster_space_xlogutils_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
+# Execute the real extension caller through its allocation decision; physical
+# extension after this point remains the native buffer/I/O implementation.
+test_cluster_space_extend.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^ExtendBufferedRelShared\(/ { print "static BlockNumber"; emit=1; found++ } \
+	     emit { print } emit && /^\tfirst_block = smgrnblocks\(bmr.smgr, fork\);/ \
+	     { print "\t*extended_by = extend_by; return first_block; }"; emit=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_extend: test_cluster_space_extend.c test_cluster_space_extend.inc unit_test.h $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_HW_O) $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # PGRAC: the three native relation-copy callers, no copied fork-loop policy.
@@ -3741,6 +3759,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_space_extend.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc

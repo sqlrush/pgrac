@@ -24,6 +24,8 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_ko.h"
+#include "cluster/cluster_hw.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_reservation.h"
@@ -31,6 +33,7 @@
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
+#include "storage/buf_internals.h"
 #include "storage/freespace.h"
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
@@ -76,6 +79,54 @@ static int nest_level;
 static unsigned ko_calls;
 static unsigned current_ref_reads, restart_ref_reads;
 static bool reject_current_ref;
+static uint64 next_token;
+static bool reserve_owner, writer_allowed, revoke_on_flush;
+static bool hw_held, fail_hw_lock, throw_reserve_flush;
+sigjmp_buf *PG_exception_stack;
+ErrorContextCallback *error_context_stack;
+static BufferDescPadded descriptors[2];
+BufferDescPadded *BufferDescriptors = descriptors;
+
+void
+pg_re_throw(void)
+{
+	if (PG_exception_stack != NULL)
+		siglongjmp(*PG_exception_stack, 1);
+	abort();
+}
+
+bool
+cluster_hw_lock(const ClusterResId *resid, HwLock *lock)
+{
+	ClusterResId expected;
+
+	UT_ASSERT(!hw_held);
+	cluster_hw_resid_encode(locator, MAIN_FORKNUM, &expected);
+	UT_ASSERT(memcmp(resid, &expected, sizeof(expected)) == 0);
+	memset(lock, 0, sizeof(*lock));
+	if (fail_hw_lock)
+		return false;
+	lock->req.resid = *resid;
+	lock->req.lockmode = ExclusiveLock;
+	lock->held = lock->coordinated = hw_held = true;
+	return true;
+}
+
+void
+cluster_hw_unlock(HwLock *lock)
+{
+	UT_ASSERT(hw_held && lock->held);
+	lock->held = lock->coordinated = hw_held = false;
+}
+
+bool
+cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buffer)
+{
+	UT_ASSERT(reserve_owner);
+	UT_ASSERT(buffer == GetBufferDescriptor(1));
+	UT_ASSERT_EQ(locked, 2);
+	return writer_allowed;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -94,7 +145,7 @@ pg_strong_random(void *bytes, size_t len)
 uint64
 rf_page_mutation_token_next(void)
 {
-	return 17;
+	return next_token++;
 }
 
 bool
@@ -182,6 +233,16 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 void
 XLogFlush(XLogRecPtr lsn)
 {
+	if (reserve_owner) {
+		if (recovering || lsn != UINT64_C(0x10000200) || locked != 2 || CritSectionCount != 0)
+			abort();
+		flush_calls++;
+		if (throw_reserve_flush)
+			pg_re_throw();
+		if (revoke_on_flush)
+			writer_allowed = false;
+		return;
+	}
 	if (!recovering || lsn != UINT64_C(0x20000200) || locked != 3)
 		abort();
 	flush_calls++;
@@ -316,7 +377,8 @@ XLogRegisterData(char *bytes, uint32 len)
 	registered_len = len;
 	if (native_owner && len == sizeof(xl_smgr_create) && CritSectionCount == 0)
 		return;
-	if ((len != sizeof(wal_bytes) && len != CLUSTER_SPACE_WAL_BYTES) || CritSectionCount != 1)
+	if ((len != sizeof(wal_bytes) && len != CLUSTER_SPACE_WAL_BYTES
+		&& len != CLUSTER_SPACE_RESERVATION_WAL_BYTES) || CritSectionCount != 1)
 		abort();
 	memcpy(wal_bytes, bytes, len);
 }
@@ -333,6 +395,20 @@ XLogInsert(RmgrId rmid, uint8 info)
 	if (native_owner && info == (XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE)
 		&& registered_len == sizeof(xl_smgr_create) && rmid == RM_SMGR_ID)
 		return UINT64_C(0x10000100);
+	if (reserve_owner && info == (XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE)) {
+		ClusterSpaceReservationChange advance;
+
+		if (rmid != RM_SMGR_ID || CritSectionCount != 1 || registered_len != CLUSTER_SPACE_RESERVATION_WAL_BYTES
+			|| !cluster_space_reservation_wal_decode(wal_bytes, registered_len, &advance)
+			|| !cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+				&advance.result.identity.key, &reservation, &token)
+			|| advance.action != CLUSTER_SPACE_RESERVATION_ADVANCE || token != advance.result_token
+			|| reservation.next_block != advance.result.next_block)
+			abort();
+		wal_calls++;
+		wal_info = info;
+		return UINT64_C(0x10000200);
+	}
 	if (rmid != RM_SMGR_ID || CritSectionCount != 1
 		|| !cluster_space_wal_decode(wal_bytes, CLUSTER_SPACE_WAL_BYTES, &change)
 		|| !cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
@@ -482,6 +558,10 @@ reset(void)
 	ko_calls = 0;
 	current_ref_reads = restart_ref_reads = 0;
 	reject_current_ref = false;
+	next_token = 17;
+	reserve_owner = revoke_on_flush = false;
+	hw_held = fail_hw_lock = throw_reserve_flush = false;
+	writer_allowed = true;
 	CritSectionCount = blocks = io_calls = create_calls = wal_calls = dirty_calls = release_calls
 		= 0;
 	BufferBlocks = page.data;
@@ -943,11 +1023,273 @@ UT_TEST(test_truncate_partial_restart_finishes_original_physical_owner)
 	}
 }
 
+static void
+reservation_owner(ClusterSpaceIdentity *identity, HwLock *lock)
+{
+	ClusterSpaceStructureChange creation;
+
+	reset();
+	if (!cluster_space_relation_create(locator)
+		|| !cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &creation))
+		abort();
+	*identity = creation.identity.result;
+	memset(lock, 0, sizeof(*lock));
+	lock->held = lock->coordinated = true;
+	lock->req.lockmode = ExclusiveLock;
+	cluster_hw_resid_encode(locator, MAIN_FORKNUM, &lock->req.resid);
+	reserve_owner = true;
+}
+
+UT_TEST(test_reservation_owner_uses_exact_page_and_flushes_before_grant)
+{
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservationChange advance = {0};
+	HwLock lock;
+	uint32 granted = 99;
+
+	reservation_owner(&identity, &lock);
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 7, &granted), 0);
+	UT_ASSERT_EQ(granted, 7);
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(wal_calls, 2);
+	UT_ASSERT_EQ(wal_info, XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE);
+	UT_ASSERT(cluster_space_reservation_wal_decode(wal_bytes, registered_len, &advance));
+	UT_ASSERT_EQ(advance.before_token, 17);
+	UT_ASSERT_EQ(advance.result_token, 18);
+	UT_ASSERT_EQ(advance.before.next_block, 0);
+	UT_ASSERT_EQ(advance.result.next_block, 7);
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 3, &granted), 7);
+	UT_ASSERT_EQ(granted, 3);
+	UT_ASSERT_EQ(flush_calls, 2);
+	UT_ASSERT_EQ(blocks, 2);
+	UT_ASSERT_EQ(main_blocks, 10); /* Caller still owns DATA extension. */
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_reservation_owner_requires_identity_hw_and_exact_pcm_permission)
+{
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterSpaceIdentity identity;
+		HwLock lock;
+		PGAlignedBlock saved[2];
+		uint32 granted = 99;
+
+		reservation_owner(&identity, &lock);
+		memcpy(saved, pages, sizeof(pages));
+		if (variant == 0) lock.held = false;
+		if (variant == 1) lock.coordinated = false;
+		if (variant == 2) lock.req.resid.field2++;
+		if (variant == 3) identity.incarnation[15]++;
+		if (variant == 4) writer_allowed = false;
+		if (variant == 5) ref.claim.database_incarnation++;
+		UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 7, &granted), InvalidBlockNumber);
+		UT_ASSERT_EQ(granted, 0);
+		UT_ASSERT_EQ(wal_calls, 1);
+		UT_ASSERT_EQ(flush_calls, 0);
+		UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
+		UT_ASSERT(!pinned && !locked);
+	}
+}
+
+UT_TEST(test_revoked_after_flush_never_grants_or_reuses_the_reservation)
+{
+	ClusterSpaceIdentity identity;
+	HwLock lock;
+	uint32 granted = 99;
+
+	reservation_owner(&identity, &lock);
+	revoke_on_flush = true;
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 4, &granted), InvalidBlockNumber);
+	UT_ASSERT_EQ(granted, 0);
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(wal_calls, 2);
+	/* The durable but unreturned range is not rolled back. A subsequent
+	 * legitimate current-X owner continues after it. */
+	revoke_on_flush = false;
+	writer_allowed = true;
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 2, &granted), 4);
+	UT_ASSERT_EQ(granted, 2);
+	UT_ASSERT_EQ(flush_calls, 2);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_reservation_owner_last_block_then_exhausted)
+{
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservation state = {0};
+	HwLock lock;
+	uint32 granted = 99;
+
+	reservation_owner(&identity, &lock);
+	state.identity = identity;
+	state.next_block = MaxBlockNumber;
+	UT_ASSERT(cluster_space_reservation_page_encode(&state, 17, pages[1].data, BLCKSZ));
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 2, &granted), MaxBlockNumber);
+	UT_ASSERT_EQ(granted, 1);
+	UT_ASSERT_EQ(cluster_space_reserve(&identity, &lock, 2, &granted), InvalidBlockNumber);
+	UT_ASSERT_EQ(granted, 0);
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(wal_calls, 2);
+}
+
+static void
+reservation_record(XLogReaderState *reader, DecodedXLogRecord *decoded)
+{
+	ClusterSpaceIdentity identity;
+	HwLock lock;
+	PGAlignedBlock before;
+	uint32 granted;
+
+	reservation_owner(&identity, &lock);
+	before = pages[1];
+	if (cluster_space_reserve(&identity, &lock, 7, &granted) != 0 || granted != 7)
+		abort();
+	pages[1] = before;
+	memset(reader, 0, sizeof(*reader));
+	memset(decoded, 0, sizeof(*decoded));
+	decoded->header.xl_rmid = RM_SMGR_ID;
+	decoded->header.xl_info = XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE;
+	decoded->main_data = (char *)wal_bytes;
+	decoded->main_data_len = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
+	decoded->max_block_id = -1;
+	reader->record = decoded;
+	reader->EndRecPtr = UINT64_C(0x20000400);
+	reader->cluster_expected_thread_id = 1;
+	recovering = reject_current_ref = true;
+	dirty_calls = flush_calls = wal_calls = 0;
+}
+
+UT_TEST(test_reservation_native_replay_exact_before_and_duplicate)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	PGAlignedBlock identity, result;
+	ClusterSpaceReservation reservation;
+	ClusterSpaceReservationChange change;
+	uint64 token;
+
+	reservation_record(&reader, &decoded);
+	identity = page;
+	UT_ASSERT(cluster_space_reservation_wal_decode(wal_bytes,
+		CLUSTER_SPACE_RESERVATION_WAL_BYTES, &change));
+	/* Numeric LSN order must not hide an exact predecessor. */
+	PageSetLSN(pages[1].data, reader.EndRecPtr + 1000);
+	UT_ASSERT(cluster_space_relation_redo(&reader));
+	UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM,
+		1, &change.result.identity.key, &reservation, &token));
+	UT_ASSERT_EQ(reservation.next_block, 7);
+	UT_ASSERT_EQ(token, 18);
+	UT_ASSERT_EQ(PageGetLSN(pages[1].data), reader.EndRecPtr);
+	UT_ASSERT_EQ(dirty_calls, 1);
+	UT_ASSERT_EQ(flush_calls + wal_calls + truncate_calls, 0);
+	UT_ASSERT(memcmp(identity.data, page.data, BLCKSZ) == 0);
+	result = pages[1];
+	/* Also exercise the real rmgr dispatcher for the already-result case. */
+	if (token == 18)
+		smgr_redo(&reader);
+	UT_ASSERT_EQ(dirty_calls, 1);
+	UT_ASSERT(memcmp(result.data, pages[1].data, BLCKSZ) == 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_reservation_replay_refusal_never_changes_target)
+{
+	for (int variant = 0; variant < 8; variant++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		PGAlignedBlock saved[2];
+
+		reservation_record(&reader, &decoded);
+		if (variant == 0) ref.claim.database_incarnation++;
+		if (variant == 1) reader.cluster_expected_thread_id = 2;
+		if (variant == 2) cluster_recmerge_apply_foreign = true;
+		if (variant == 3) decoded.max_block_id = 0;
+		if (variant == 4) decoded.main_data_len = 24;
+		if (variant == 5) ((PageHeader)pages[1].data)->pd_block_scn++;
+		if (variant == 6) writer_allowed = false;
+		if (variant == 7) blocks = 1;
+		memcpy(saved, pages, sizeof(pages));
+		UT_ASSERT(!cluster_space_relation_redo(&reader));
+		UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
+		UT_ASSERT_EQ(dirty_calls + wal_calls + flush_calls + truncate_calls, 0);
+		UT_ASSERT(!pinned && !locked);
+	}
+}
+
+UT_TEST(test_reservation_opcode_cannot_perform_structural_init)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	ClusterSpaceStructureChange pair;
+	PGAlignedBlock saved[2];
+	const char *name = smgr_identify(XLOG_SMGR_SPACE_RESERVATION);
+
+	UT_ASSERT(name != NULL);
+	if (name != NULL) UT_ASSERT(strcmp(name, "SPACE_RESERVATION") == 0);
+	reservation_record(&reader, &decoded);
+	recovering = reserve_owner = reject_current_ref = false;
+	exists = false;
+	blocks = 0;
+	memset(pages, 0, sizeof(pages));
+	UT_ASSERT(cluster_space_relation_create(locator));
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &pair));
+	UT_ASSERT(cluster_space_reservation_wal_encode(&pair.reservation, wal_bytes,
+		CLUSTER_SPACE_RESERVATION_WAL_BYTES));
+	recovering = reserve_owner = true;
+	dirty_calls = wal_calls = 0;
+	memcpy(saved, pages, sizeof(pages));
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
+	UT_ASSERT_EQ(dirty_calls + wal_calls + flush_calls, 0);
+}
+
+UT_TEST(test_private_owner_requires_exact_range_and_releases_hw)
+{
+	ClusterSpaceIdentity identity;
+	HwLock lock;
+
+	reservation_owner(&identity, &lock);
+	fail_hw_lock = true;
+	UT_ASSERT(!cluster_space_reserve_exact(&identity, 0, 4));
+	UT_ASSERT_EQ(wal_calls, 1);
+	fail_hw_lock = false;
+	UT_ASSERT(cluster_space_reserve_exact(&identity, 0, 4));
+	UT_ASSERT(!hw_held);
+	/* Another range can never be mistaken for an empty destination. */
+	UT_ASSERT(!cluster_space_reserve_exact(&identity, 0, 4));
+	UT_ASSERT(!hw_held);
+	UT_ASSERT(cluster_space_reserve_exact(&identity, 8, 1));
+	UT_ASSERT(!hw_held);
+	UT_ASSERT_EQ(flush_calls, 3);
+}
+
+UT_TEST(test_private_owner_releases_hw_on_wal_flush_error)
+{
+	ClusterSpaceIdentity identity;
+	HwLock lock;
+	volatile bool caught = false;
+
+	reservation_owner(&identity, &lock);
+	throw_reserve_flush = true;
+	PG_TRY();
+	{
+		(void)cluster_space_reserve_exact(&identity, 0, 4);
+	}
+	PG_CATCH();
+	{
+		caught = true;
+	}
+	PG_END_TRY();
+	UT_ASSERT(caught);
+	UT_ASSERT(!hw_held);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(16);
+	UT_PLAN(25);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
@@ -964,6 +1306,15 @@ main(void)
 	UT_RUN(test_create_partial_restart_validates_before_extending);
 	UT_RUN(test_truncate_bad_reservation_cannot_change_identity_or_files);
 	UT_RUN(test_truncate_partial_restart_finishes_original_physical_owner);
+	UT_RUN(test_reservation_owner_uses_exact_page_and_flushes_before_grant);
+	UT_RUN(test_reservation_owner_requires_identity_hw_and_exact_pcm_permission);
+	UT_RUN(test_revoked_after_flush_never_grants_or_reuses_the_reservation);
+	UT_RUN(test_reservation_owner_last_block_then_exhausted);
+	UT_RUN(test_reservation_native_replay_exact_before_and_duplicate);
+	UT_RUN(test_reservation_replay_refusal_never_changes_target);
+	UT_RUN(test_reservation_opcode_cannot_perform_structural_init);
+	UT_RUN(test_private_owner_requires_exact_range_and_releases_hw);
+	UT_RUN(test_private_owner_releases_hw_on_wal_flush_error);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -595,6 +595,20 @@ RelationCopyStorage(SMgrRelation src, SMgrRelation dst,
 
 	nblocks = smgrnblocks(src, forkNum);
 
+#ifdef USE_PGRAC_CLUSTER
+	if (versioned_copy && forkNum == MAIN_FORKNUM && nblocks != 0)
+	{
+		RelFileLocatorBackend src_locator = src->smgr_rlocator;
+		RelFileLocatorBackend dst_locator = dst->smgr_rlocator;
+
+		if (!cluster_space_reserve_exact(&copy_identity, 0, nblocks))
+			elog(ERROR, "cannot reserve new relation copy block range");
+		/* SPACE current acquisition can invalidate either SMgr handle. */
+		src = smgropen(src_locator.locator, src_locator.backend);
+		dst = smgropen(dst_locator.locator, dst_locator.backend);
+	}
+#endif
+
 	for (blkno = 0; blkno < nblocks; blkno++)
 	{
 		/* If we got a cancel signal during the copy of the data, quit */
@@ -1194,10 +1208,10 @@ smgr_redo(XLogReaderState *record)
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: this typed owner validates namespace, payload and exact page
 	 * transition; ordinary block/FPI or numerical-LSN replay cannot handle it. */
-	if (info == XLOG_SMGR_SPACE_IDENTITY)
+	if (info == XLOG_SMGR_SPACE_IDENTITY || info == XLOG_SMGR_SPACE_RESERVATION)
 	{
 		if (!cluster_space_relation_redo(record))
-			elog(PANIC, "smgr_redo: exact SPACE identity replay refused");
+			elog(PANIC, "smgr_redo: exact SPACE replay refused");
 		return;
 	}
 #endif

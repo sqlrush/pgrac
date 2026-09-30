@@ -42,6 +42,19 @@ smgr_desc(StringInfo buf, XLogReaderState *record)
 			appendStringInfoString(buf, "invalid SPACE identity");
 		return;
 	}
+	if (info == XLOG_SMGR_SPACE_RESERVATION)
+	{
+		ClusterSpaceReservationChange change;
+
+		if (cluster_space_reservation_wal_decode(rec, XLogRecGetDataLen(record), &change)
+			&& change.action == CLUSTER_SPACE_RESERVATION_ADVANCE)
+			appendStringInfo(buf, "%u/%u/%u reserve %u blocks from %u",
+				change.result.identity.key.locator.spcOid, change.result.identity.key.locator.dbOid,
+				change.result.identity.key.locator.relNumber, change.granted, change.first_block);
+		else
+			appendStringInfoString(buf, "invalid SPACE reservation");
+		return;
+	}
 #endif
 	if (info == XLOG_SMGR_CREATE)
 	{
@@ -72,6 +85,9 @@ smgr_identify(uint8 info)
 #ifdef USE_PGRAC_CLUSTER
 		case XLOG_SMGR_SPACE_IDENTITY:
 			id = "SPACE_IDENTITY";
+			break;
+		case XLOG_SMGR_SPACE_RESERVATION:
+			id = "SPACE_RESERVATION";
 			break;
 #endif
 		case XLOG_SMGR_CREATE:

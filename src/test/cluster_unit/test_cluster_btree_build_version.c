@@ -58,6 +58,9 @@ static XLogRecPtr flushed;
 static unsigned count, writes, reads, wal_count, legacy_wal, edge_count, flush_count, free_count;
 static unsigned sync_count;
 static bool begun, expecting_error, fail_flush, checksums;
+static BlockNumber reserved;
+static unsigned reservations;
+static bool fail_reserve;
 static jmp_buf error_jump;
 
 void
@@ -162,6 +165,8 @@ smgrextend(SMgrRelation rel, ForkNumber forknum, BlockNumber block, const void *
 	UT_ASSERT(rel == &smgr && forknum == MAIN_FORKNUM && skip_sync);
 	UT_ASSERT_EQ(block, count);
 	UT_ASSERT(block < lengthof(pages));
+	if (cluster_shared_config)
+		UT_ASSERT(block < reserved);
 	if (cluster_shared_config && !PageIsNew(page))
 		UT_ASSERT(flushed >= PageGetLSN(page) && flushed != InvalidXLogRecPtr);
 	memcpy(pages[block].data, page, BLCKSZ);
@@ -212,6 +217,7 @@ XLogRegisterBlock(uint8 id, RelFileLocator *locator, ForkNumber forknum, BlockNu
 				  Page page, uint8 flags)
 {
 	UT_ASSERT(begun && id == 0 && forknum == MAIN_FORKNUM && block < lengthof(pages));
+	UT_ASSERT(block < reserved);
 	UT_ASSERT(RelFileLocatorEquals(*locator, relation.rd_locator));
 	UT_ASSERT_EQ(flags, REGBUF_FORCE_IMAGE);
 	memcpy(image.data, page, BLCKSZ);
@@ -242,7 +248,21 @@ XLogFlush(XLogRecPtr lsn)
 	flush_count++;
 }
 
+/* The real reservation owner has its own WAL/buffer fixture. Here its
+ * durable-grant boundary checks the native bulk caller's ordering. */
+static bool
+fixture_reserve(const ClusterSpaceIdentity *id, BlockNumber first, uint32 want)
+{
+	UT_ASSERT(want > 0);
+	if (fail_reserve || first != reserved || memcmp(id, &identity, sizeof(identity)) != 0)
+		return false;
+	reserved += want;
+	reservations++;
+	return true;
+}
+#define cluster_space_reserve_exact fixture_reserve
 #include "test_cluster_btree_build_writer.inc"
+#undef cluster_space_reserve_exact
 
 void
 smgrimmedsync(SMgrRelation rel, ForkNumber forknum)
@@ -279,6 +299,8 @@ reset(bool shared)
 	memset(entries, 0, sizeof(entries));
 	count = writes = reads = wal_count = legacy_wal = edge_count = flush_count = free_count = 0;
 	sync_count = 0;
+	reserved = reservations = 0;
+	fail_reserve = false;
 	begun = expecting_error = fail_flush = checksums = false;
 	flushed = InvalidXLogRecPtr;
 	token = 200;
@@ -478,10 +500,43 @@ UT_TEST(test_revisiting_queued_page_cannot_overwrite_it_as_absent)
 	UT_ASSERT_EQ(((PageHeader)pages[0].data)->pd_block_scn, 201);
 }
 
+UT_TEST(test_bulk_reservations_cover_batches_and_backfills)
+{
+	reset(true);
+	for (unsigned i = 0; i < 40; i++) {
+		pending[i] = source;
+		_bt_blwritepage(&state, pending[i].data, i);
+	}
+	finish_build();
+	UT_ASSERT_EQ(reservations, 2);
+	UT_ASSERT_EQ(reserved, 64);
+	UT_ASSERT_EQ(writes, 40);
+}
+
+UT_TEST(test_bulk_refuses_before_wal_or_data_without_reservation)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		PGAlignedBlock saved;
+
+		reset(true);
+		fail_reserve = variant == 0;
+		if (variant == 1) reserved = 1;
+		saved = source;
+		expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			_bt_blwritepage(&state, source.data, 3);
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT(memcmp(source.data, saved.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(wal_count + edge_count + writes + free_count + reservations, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(12);
 	UT_RUN(test_new_btree_page_is_versioned_before_data_write);
 	UT_RUN(test_out_of_order_build_has_exact_zero_predecessor);
 	UT_RUN(test_nonshared_keeps_native_build_wal);
@@ -492,6 +547,8 @@ main(void)
 	UT_RUN(test_adjacent_pages_do_not_flush_or_write_one_at_a_time);
 	UT_RUN(test_full_batch_and_final_partial_batch_preserve_each_page);
 	UT_RUN(test_revisiting_queued_page_cannot_overwrite_it_as_absent);
+	UT_RUN(test_bulk_reservations_cover_batches_and_backfills);
+	UT_RUN(test_bulk_refuses_before_wal_or_data_without_reservation);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

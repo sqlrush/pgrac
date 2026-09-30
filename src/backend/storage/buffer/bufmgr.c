@@ -6925,11 +6925,10 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * size (first_block = smgrnblocks).  In a multi-node cluster that is unsafe:
 	 * two nodes can read the same stale-low size (non-coherent storage, L368)
 	 * and allocate the same block range -> silent corruption.  For a GLOBALIZE
-	 * relation the range comes from the cluster authority (cluster_hw_allocate
-	 * under HW(X)) instead.
+	 * relation the range comes from canonical SPACE under HW(X), or from the
+	 * legacy cluster authority outside the shared configuration profile.
 	 *
-	 * Scope (only the genuinely racy case is globalized; everything else stays
-	 * PG-native):
+	 * Legacy scope outside the shared configuration profile:
 	 *   - fork == MAIN_FORKNUM only.  FSM/VM forks use positional extend-to (a
 	 *     block addresses a fixed heap range) and are page-coordinated by Cache
 	 *     Fusion, so the sequential authority does not apply to them.
@@ -6944,6 +6943,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 *     the authority via HW_RESERVE redo.
 	 * An unlogged relation in a multi-node cluster classifies FAIL_CLOSED and is
 	 * rejected here (53RA6), before any buffer/lock work.
+	 * Shared-profile permanent MAIN files always consume canonical reservations,
+	 * including single-live and private-copy callers; the gate below enforces it.
 	 *----------
 	 */
 	ClusterHwClass hwc = CLUSTER_HW_NATIVE_LOCAL;
@@ -6951,6 +6952,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	ClusterResId hw_resid;
 	uint32		hw_lease_tail = 0;	/* spec-6.12d: parked grant tail */
 	uint32		aux_pin_waits = 0;
+	ClusterSpaceIdentity space_identity;
+	bool		space_reservation = false;
 
 	if (cluster_relation_extend_lock_enabled && bmr.rel != NULL && cluster_node_id >= 0
 		&& fork == MAIN_FORKNUM && !RecoveryInProgress()
@@ -6994,6 +6997,24 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		 * engage == NATIVE: no alive peer to coordinate with -> hwc stays
 		 * CLUSTER_HW_NATIVE_LOCAL and the relation extends PG-natively.
 		 */
+	}
+
+	/* PGRAC: every new-profile permanent MAIN extension consumes canonical
+	 * reservations, including one-live-node and private BMR_SMGR callers.
+	 * Resolve identity before any content/extension locks, and reopen SMgr
+	 * after a read that may process invalidations. Never seed from FileSize. */
+	if (cluster_shared_config && fork == MAIN_FORKNUM && !RecoveryInProgress()
+		&& bmr.relpersistence == RELPERSISTENCE_PERMANENT
+		&& cluster_smgr_which_for(bmr.smgr->smgr_rlocator.locator, InvalidBackendId) == 1)
+	{
+		RelFileLocator locator = bmr.smgr->smgr_rlocator.locator;
+
+		if (!(bmr.rel != NULL ? cluster_space_relation_get_identity(bmr.rel, &space_identity)
+			: cluster_space_relation_read_identity(locator, &space_identity)))
+			elog(ERROR, "cannot bind shared extension to exact SPACE identity");
+		bmr.smgr = smgropen(locator, InvalidBackendId);
+		hwc = CLUSTER_HW_GLOBALIZE;
+		space_reservation = true;
 	}
 #endif
 
@@ -7043,11 +7064,12 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 	 * load.  HW is held only across the allocate; it is a synthetic resid
 	 * (not auto-released by LockReleaseAll), so the brief window relies on
 	 * reconfig-revoke (AD-013) + backend-exit cleanup as the backstop on an
-	 * error path, mirroring CF (spec-5.6).
+	 * error path, mirroring CF (spec-5.6). Allocation below now releases HW
+	 * in PG_FINALLY, including a SPACE current-read or WAL-flush exception.
 	 */
 	if (hwc == CLUSTER_HW_GLOBALIZE)
 	{
-		cluster_hw_resid_encode(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork, &hw_resid);
+		cluster_hw_resid_encode(bmr.smgr->smgr_rlocator.locator, fork, &hw_resid);
 		if (!cluster_hw_lock(&hw_resid, &hwlk))
 		{
 			/* release the victim buffers pinned above (the extension lock is not
@@ -7063,7 +7085,7 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			ereport(ERROR,
 					(errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
 					 errmsg("could not acquire the cluster relation-extend lock for \"%s\"",
-							RelationGetRelationName(bmr.rel))));
+							bmr.rel != NULL ? RelationGetRelationName(bmr.rel) : "shared relation")));
 		}
 	}
 #endif
@@ -7099,9 +7121,15 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		 * non-authority path (private build, sequence create) from its true
 		 * EOF; for an established resid the master ignores it and the
 		 * authority counter is the sole source (FileSize never read again).
+		 * The shared profile instead reads the canonical SPACE page and
+		 * never supplies a file-size seed.
 		 */
-		bmr.smgr->smgr_cached_nblocks[fork] = InvalidBlockNumber;
-		seed_nblocks = smgrnblocks(bmr.smgr, fork);
+		seed_nblocks = 0;
+		if (!space_reservation)
+		{
+			bmr.smgr->smgr_cached_nblocks[fork] = InvalidBlockNumber;
+			seed_nblocks = smgrnblocks(bmr.smgr, fork);
+		}
 
 		/*
 		 * The block range is the cluster authority's, not the file size.
@@ -7122,16 +7150,29 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 		{
 			uint32		hw_want = extend_by;
 
-			if (cluster_hw_lease_active() &&
+			if (bmr.rel != NULL && cluster_hw_lease_active() &&
 				extend_upto == InvalidBlockNumber &&
 				bmr.rel->rd_rel->relkind == RELKIND_RELATION &&
 				(uint32) cluster_space_lease_blocks > extend_by)
 				hw_want = (uint32) cluster_space_lease_blocks;
 
-			first_block = cluster_hw_allocate(RelationGetSmgr(bmr.rel)->smgr_rlocator.locator, fork,
-											  hw_want, seed_nblocks, &hw_granted);
+			PG_TRY();
+			{
+				if (space_reservation)
+					first_block = cluster_space_reserve(&space_identity, &hwlk, hw_want, &hw_granted);
+				else
+					first_block = cluster_hw_allocate(bmr.smgr->smgr_rlocator.locator, fork,
+													  hw_want, seed_nblocks, &hw_granted);
+			}
+			PG_FINALLY();
+			{
+				cluster_hw_unlock(&hwlk);
+			}
+			PG_END_TRY();
 		}
-		cluster_hw_unlock(&hwlk);
+		/* The SPACE current read can close SMgr handles via invalidation. */
+		if (space_reservation)
+			bmr.smgr = smgropen(space_identity.key.locator, InvalidBackendId);
 
 		if (first_block == InvalidBlockNumber || hw_granted == 0)
 		{
@@ -7148,9 +7189,8 @@ ExtendBufferedRelShared(BufferManagerRelation bmr,
 			}
 			ereport(ERROR, (errcode(ERRCODE_CLUSTER_RELATION_EXTEND_UNAVAILABLE),
 							errmsg("cluster relation-extend authority unavailable for \"%s\"",
-								   RelationGetRelationName(bmr.rel)),
-							errhint("The HW_ALLOC round trip to the resource master could not be "
-									"proven; retry.")));
+								   bmr.rel != NULL ? RelationGetRelationName(bmr.rel) : "shared relation"),
+							errhint("An exact durable block reservation could not be established; retry.")));
 		}
 
 		if (hw_granted < extend_by)
@@ -10089,6 +10129,8 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 			elog(ERROR, "cannot bind new buffer copy to exact SPACE identity");
 		if (smgrnblocks(smgropen(dstlocator, InvalidBackendId), forkNum) != 0)
 			elog(ERROR, "versioned buffer copy requires an empty destination fork");
+		if (forkNum == MAIN_FORKNUM && !cluster_space_reserve_exact(&copy_identity, 0, nblocks))
+			elog(ERROR, "cannot reserve new buffer copy block range");
 		versioned_copy = true;
 	}
 #endif

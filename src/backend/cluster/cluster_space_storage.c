@@ -19,6 +19,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_gcs_block.h"
+#include "cluster/cluster_hw.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
@@ -574,6 +575,156 @@ done:
 	return success;
 }
 
+BlockNumber
+cluster_space_reserve(const ClusterSpaceIdentity *identity, const struct HwLock *lock,
+					  uint32 want, uint32 *granted)
+{
+	ClusterSpaceIdentityKey expected;
+	ClusterSpaceIdentity checked;
+	ClusterSpaceReservationChange change = {0};
+	ClusterResId resid;
+	PGAlignedBlock result;
+	uint8 expected_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint8 before_identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	uint8 bytes[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+	BlockNumber first = InvalidBlockNumber;
+	Buffer buffer;
+	XLogRecPtr lsn;
+
+	if (granted == NULL)
+		return InvalidBlockNumber;
+	*granted = 0;
+	if (identity == NULL || lock == NULL || !lock->held || !lock->coordinated
+		|| lock->req.lockmode != ExclusiveLock || want == 0 || RecoveryInProgress()
+		|| !space_namespace(identity->key.locator, false, &expected, NULL)
+		|| !cluster_space_identity_encode(identity, expected_identity, sizeof(expected_identity))
+		|| !cluster_space_identity_decode(expected_identity, sizeof(expected_identity), &expected, &checked)
+		|| checked.state != CLUSTER_SPACE_IDENTITY_LIVE)
+		return InvalidBlockNumber;
+	cluster_hw_resid_encode(expected.locator, MAIN_FORKNUM, &resid);
+	if (memcmp(&resid, &lock->req.resid, sizeof(resid)) != 0)
+		return InvalidBlockNumber;
+
+	/* Existing HW(X) serializes reservations; existing GCS current/content-X
+	 * protects the canonical bytes. No separate master counter or raw-DATA
+	 * channel can grant space. A missing/unformatted target never seeds zero. */
+	buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM,
+		CLUSTER_SPACE_RESERVATION_BLOCK, RBM_NORMAL, NULL, true);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (BufferIsLocal(buffer) || BufferGetBlockNumber(buffer) != CLUSTER_SPACE_RESERVATION_BLOCK
+		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1))
+		|| !cluster_space_reservation_page_decode(BufferGetPage(buffer), BLCKSZ, SPACE_FORKNUM,
+			CLUSTER_SPACE_RESERVATION_BLOCK, &expected, &change.before, &change.before_token)
+		|| !cluster_space_identity_encode(&change.before.identity, before_identity, sizeof(before_identity))
+		|| memcmp(before_identity, expected_identity, sizeof(before_identity)) != 0)
+		goto done;
+	change.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
+	change.result = change.before;
+	change.first_block = cluster_hw_alloc_segment(change.before.next_block, want,
+		&change.granted, &change.result.next_block);
+	if (change.granted == 0)
+		goto done;
+	change.result_token = rf_page_mutation_token_next();
+	if (!cluster_space_reservation_wal_encode(&change, bytes, sizeof(bytes)))
+		goto done;
+	memcpy(result.data, BufferGetPage(buffer), BLCKSZ);
+	if (cluster_space_reservation_apply(&change, &expected, result.data, BLCKSZ)
+		!= CLUSTER_SPACE_IDENTITY_APPLY)
+		goto done;
+	XLogBeginInsert();
+	START_CRIT_SECTION();
+	memcpy(BufferGetPage(buffer), result.data, BLCKSZ);
+	MarkBufferDirty(buffer);
+	XLogRegisterData((char *)bytes, sizeof(bytes));
+	lsn = XLogInsert(RM_SMGR_ID, XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE);
+	space_set_lsn(BufferGetPage(buffer), lsn, change.result_token);
+	END_CRIT_SECTION();
+	XLogFlush(lsn);
+	/* A membership/activation fence during the flush may deny the grant.
+	 * Its durable reservation remains consumed; never roll it back or re-use
+	 * its range. The original checkpoint owns eventual DATA durability. */
+	if (cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1))) {
+		first = change.first_block;
+		*granted = change.granted;
+	}
+done:
+	UnlockReleaseBuffer(buffer);
+	return first;
+}
+
+bool
+cluster_space_reserve_exact(const ClusterSpaceIdentity *identity, BlockNumber first, uint32 count)
+{
+	ClusterResId resid;
+	HwLock lock;
+	BlockNumber reserved;
+	uint32 granted = 0;
+
+	if (identity == NULL || count == 0 || first == InvalidBlockNumber
+		|| (uint64)first + count > InvalidBlockNumber)
+		return false;
+	cluster_hw_resid_encode(identity->key.locator, MAIN_FORKNUM, &resid);
+	if (!cluster_hw_lock(&resid, &lock))
+		return false;
+	PG_TRY();
+	{
+		reserved = cluster_space_reserve(identity, &lock, count, &granted);
+	}
+	PG_FINALLY();
+	{
+		cluster_hw_unlock(&lock);
+	}
+	PG_END_TRY();
+	return reserved == first && granted == count;
+}
+
+static bool
+space_reservation_redo(XLogReaderState *record)
+{
+	ClusterSpaceReservationChange change;
+	ClusterSpaceIdentityKey expected;
+	ClusterSpaceIdentity checked;
+	ClusterSpaceIdentityTransition transition;
+	uint8 identity[CLUSTER_SPACE_IDENTITY_BYTES];
+	PGAlignedBlock result;
+	SMgrRelation rel;
+	Buffer buffer;
+	uint16 local_thread;
+	bool success = false;
+
+	if (!RecoveryInProgress() || cluster_recmerge_apply_foreign
+		|| XLogRecHasAnyBlockRefs(record) || XLogRecPtrIsInvalid(record->EndRecPtr)
+		|| !cluster_space_reservation_wal_decode(XLogRecGetData(record), XLogRecGetDataLen(record), &change)
+		|| change.action != CLUSTER_SPACE_RESERVATION_ADVANCE
+		|| !space_namespace(change.result.identity.key.locator, true, &expected, &local_thread)
+		|| local_thread == 0 || record->cluster_expected_thread_id != local_thread
+		|| !cluster_space_identity_encode(&change.result.identity, identity, sizeof(identity))
+		|| !cluster_space_identity_decode(identity, sizeof(identity), &expected, &checked))
+		return false;
+	rel = smgropen(expected.locator, InvalidBackendId);
+	if (!smgrexists(rel, SPACE_FORKNUM) || smgrnblocks(rel, SPACE_FORKNUM) != 2)
+		return false;
+	buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM,
+		CLUSTER_SPACE_RESERVATION_BLOCK, RBM_NORMAL, NULL, true);
+	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
+	if (BufferIsLocal(buffer) || BufferGetBlockNumber(buffer) != CLUSTER_SPACE_RESERVATION_BLOCK
+		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1)))
+		goto done;
+	memcpy(result.data, BufferGetPage(buffer), BLCKSZ);
+	transition = cluster_space_reservation_apply(&change, &expected, result.data, BLCKSZ);
+	if (transition == CLUSTER_SPACE_IDENTITY_APPLY) {
+		START_CRIT_SECTION();
+		memcpy(BufferGetPage(buffer), result.data, BLCKSZ);
+		MarkBufferDirty(buffer);
+		space_set_lsn(BufferGetPage(buffer), record->EndRecPtr, change.result_token);
+		END_CRIT_SECTION();
+	}
+	success = transition == CLUSTER_SPACE_IDENTITY_APPLY || transition == CLUSTER_SPACE_IDENTITY_ALREADY;
+done:
+	UnlockReleaseBuffer(buffer);
+	return success;
+}
+
 bool
 cluster_space_relation_redo(XLogReaderState *record)
 {
@@ -591,6 +742,9 @@ cluster_space_relation_redo(XLogReaderState *record)
 	uint8 apply_mask;
 	bool exists, success = false;
 
+	if (record != NULL && record->record != NULL && XLogRecGetRmid(record) == RM_SMGR_ID
+		&& (XLogRecGetInfo(record) & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_RESERVATION)
+		return space_reservation_redo(record);
 	if (record == NULL || record->record == NULL || !RecoveryInProgress()
 		|| XLogRecGetRmid(record) != RM_SMGR_ID
 		|| (XLogRecGetInfo(record) & ~XLR_INFO_MASK) != XLOG_SMGR_SPACE_IDENTITY

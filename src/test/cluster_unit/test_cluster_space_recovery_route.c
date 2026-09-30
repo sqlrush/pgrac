@@ -145,13 +145,48 @@ UT_TEST(test_block_reference_cannot_bypass_typed_validation)
 	UT_ASSERT_EQ(routes, 0);
 }
 
+UT_TEST(test_reservation_opcode_routes_only_complete_advance)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterSpaceStructureChange pair;
+	ClusterSpaceReservationChange change;
+
+	record_init(&reader, &decoded, bytes);
+	UT_ASSERT(cluster_space_structure_wal_decode(bytes, sizeof(bytes), &pair));
+	change = pair.reservation;
+	decoded.header.xl_info = XLOG_SMGR_SPACE_RESERVATION | XLR_SPECIAL_REL_UPDATE;
+	decoded.main_data_len = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
+	UT_ASSERT(cluster_space_reservation_wal_encode(&change, bytes, decoded.main_data_len));
+	/* A valid INIT subrecord still needs its structural owner. */
+	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
+	change.action = CLUSTER_SPACE_RESERVATION_ADVANCE;
+	change.before = change.result;
+	change.before_token = change.result_token;
+	change.result_token++;
+	change.granted = change.result.next_block = 7;
+	UT_ASSERT(cluster_space_reservation_wal_encode(&change, bytes, decoded.main_data_len));
+	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_SHARED);
+	shared = false;
+	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_LOCAL);
+	UT_ASSERT_EQ(routes, 2);
+	decoded.main_data_len = 24;
+	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
+	decoded.main_data_len = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
+	decoded.max_block_id = 0;
+	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
+	UT_ASSERT_EQ(routes, 2);
+}
+
 int
 main(void)
 {
-	UT_PLAN(3);
+	UT_PLAN(4);
 	UT_RUN(test_typed_locator_routes_foreign_wal);
 	UT_RUN(test_invalid_typed_record_is_not_local_or_shared);
 	UT_RUN(test_block_reference_cannot_bypass_typed_validation);
+	UT_RUN(test_reservation_opcode_routes_only_complete_advance);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

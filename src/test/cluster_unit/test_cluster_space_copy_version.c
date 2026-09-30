@@ -66,6 +66,29 @@ static RelFileLocator buffer_locator;
 static bool expecting_error;
 static jmp_buf error_jump;
 static char last_error[256];
+static unsigned reservations;
+static bool reservation_refused, invalidate_on_reserve;
+
+bool fixture_copy_reserve(const ClusterSpaceIdentity *id, BlockNumber first, uint32 count);
+
+bool
+fixture_copy_reserve(const ClusterSpaceIdentity *id, BlockNumber first, uint32 count)
+{
+	UT_ASSERT(!pinned && !locked && !data_pins[0] && !data_pins[1]);
+	UT_ASSERT_EQ(first, 0);
+	UT_ASSERT_EQ(count, 1);
+	UT_ASSERT(memcmp(id, &identity, sizeof(identity)) == 0);
+	UT_ASSERT_EQ(writes + new_wal, 0);
+	if (reservation_refused)
+		return false;
+	if (invalidate_on_reserve) {
+		memset(&source, 0xa5, sizeof(source));
+		memset(&destination, 0xa5, sizeof(destination));
+		handles_retired = true;
+	}
+	reservations++;
+	return true;
+}
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -199,6 +222,8 @@ smgrextend(SMgrRelation rel, ForkNumber forknum, BlockNumber block, const void *
 	if (rel != (handles_retired ? &reopened_destination : &destination) || forknum != test_fork
 		|| block != 0 || !skip)
 		abort();
+	if (cluster_shared_config && forknum == MAIN_FORKNUM)
+		UT_ASSERT_EQ(reservations, 1);
 	if (buffered) {
 		PGAlignedBlock zero;
 
@@ -464,7 +489,9 @@ errhint(const char *fmt, ...)
 }
 
 /* Exact original buffer-copy body, not a fixture reimplementation. */
+#define cluster_space_reserve_exact fixture_copy_reserve
 #include "test_cluster_space_copy_buffer.inc"
+#undef cluster_space_reserve_exact
 
 static void
 reset(ForkNumber forknum)
@@ -515,6 +542,8 @@ reset(ForkNumber forknum)
 	invalidate_on_read = handles_retired = false;
 	reopens = 0;
 	old_wal = new_wal = edges = writes = syncs = flushes = space_reads = 0;
+	reservations = 0;
+	reservation_refused = invalidate_on_reserve = false;
 	cluster_shared_config = true;
 	test_fork = forknum;
 	token = 99;
@@ -608,7 +637,7 @@ UT_TEST(test_native_copy_reopens_handles_after_identity_buffer_read)
 	invalidate_on_read = true;
 	RelationCopyStorage(&source, &destination, test_fork, RELPERSISTENCE_PERMANENT);
 	UT_ASSERT(handles_retired);
-	UT_ASSERT_EQ(reopens, 2);
+	UT_ASSERT_EQ(reopens, 4); /* Identity and reservation reads each retire handles. */
 	UT_ASSERT_EQ(new_wal, 1);
 	UT_ASSERT_EQ(writes, 1);
 	UT_ASSERT_EQ(syncs, 1);
@@ -853,10 +882,46 @@ UT_TEST(test_minimal_wal_copy_uses_versioned_producers)
 	minimal_wal_copy = false;
 }
 
+UT_TEST(test_copy_reserves_before_data_and_reopens_after_current_read)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		reset(MAIN_FORKNUM);
+		buffered = variant != 0;
+		invalidate_on_reserve = true;
+		if (buffered)
+			RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+				destination.smgr_rlocator.locator, MAIN_FORKNUM, true);
+		else
+			RelationCopyStorage(&source, &destination, MAIN_FORKNUM, RELPERSISTENCE_PERMANENT);
+		UT_ASSERT_EQ(reservations, 1);
+		UT_ASSERT_EQ(writes, 1);
+		UT_ASSERT(reopens >= 1);
+	}
+}
+
+UT_TEST(test_copy_refuses_before_any_zero_fill_or_wal_without_reservation)
+{
+	for (int variant = 0; variant < 2; variant++) {
+		reset(MAIN_FORKNUM);
+		buffered = variant != 0;
+		reservation_refused = expecting_error = true;
+		if (setjmp(error_jump) == 0) {
+			if (buffered)
+				RelationCopyStorageUsingBuffer(source.smgr_rlocator.locator,
+					destination.smgr_rlocator.locator, MAIN_FORKNUM, true);
+			else
+				RelationCopyStorage(&source, &destination, MAIN_FORKNUM, RELPERSISTENCE_PERMANENT);
+			UT_ASSERT(false);
+		}
+		expecting_error = false;
+		UT_ASSERT_EQ(writes + new_wal + flushes + reservations, 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(16);
+	UT_PLAN(18);
 	UT_RUN(test_vm_init_versions_zero_before_without_heap_layout);
 	UT_RUN(test_vm_init_refuses_nonzero_before_and_wrong_fork);
 	UT_RUN(test_minimal_wal_copy_uses_versioned_producers);
@@ -873,6 +938,8 @@ main(void)
 	UT_RUN(test_buffer_refusal_never_changes_target_or_emits_wal);
 	UT_RUN(test_nonempty_destination_refused_before_bulk_extension);
 	UT_RUN(test_buffer_copy_reopens_after_identity_read);
+	UT_RUN(test_copy_reserves_before_data_and_reopens_after_current_read);
+	UT_RUN(test_copy_refuses_before_any_zero_fill_or_wal_without_reservation);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

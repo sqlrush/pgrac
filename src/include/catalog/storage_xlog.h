@@ -32,6 +32,8 @@
 #ifdef USE_PGRAC_CLUSTER
 /* PGRAC: typed SPACE lifecycle payload; never an ordinary block/FPI record. */
 #define XLOG_SMGR_SPACE_IDENTITY 0x30
+/* PGRAC: exact main-fork sequential ADVANCE, no structural action. */
+#define XLOG_SMGR_SPACE_RESERVATION 0x40
 #endif
 
 typedef struct xl_smgr_create
