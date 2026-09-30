@@ -15,6 +15,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "cluster/cluster_side_xact.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_scn.h"
 #include "cluster/cluster_tt_durable.h"
 #include "cluster/cluster_tt_slot.h"
@@ -27,7 +28,7 @@
 	(XACT_XINFO_HAS_DBINFO | XACT_XINFO_HAS_SUBXACTS | XACT_XINFO_HAS_RELFILELOCATORS              \
 	 | XACT_XINFO_HAS_INVALS | XACT_XINFO_HAS_TWOPHASE | XACT_XINFO_HAS_ORIGIN                     \
 	 | XACT_XINFO_HAS_AE_LOCKS | XACT_XINFO_HAS_GID | XACT_XINFO_HAS_DROPPED_STATS                 \
-	 | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT)
+	 | XACT_XINFO_HAS_SCN | XACT_XINFO_HAS_TT_COMMIT | XACT_XINFO_HAS_SPACE_DROP)
 #define RF_SIDE_XACT_TWOPHASE_MAGIC UINT32_C(0x57F94534)
 
 typedef struct RfSideXactCursorV1 {
@@ -214,7 +215,7 @@ side_xact_completion_shape_valid(XLogReaderState *record, bool commit)
 	}
 	if ((xinfo & ~RF_SIDE_XACT_KNOWN_XINFO) != 0
 		|| ((xinfo & XACT_XINFO_HAS_GID) != 0 && (xinfo & XACT_XINFO_HAS_TWOPHASE) == 0)
-		|| (!commit && (xinfo & XACT_XINFO_HAS_TT_COMMIT) != 0))
+		|| (!commit && (xinfo & (XACT_XINFO_HAS_TT_COMMIT | XACT_XINFO_HAS_SPACE_DROP)) != 0))
 		return false;
 	if ((xinfo & XACT_XINFO_HAS_DBINFO) != 0
 		&& !side_xact_take(&cursor, sizeof(xl_xact_dbinfo), NULL))
@@ -250,6 +251,9 @@ side_xact_completion_shape_valid(XLogReaderState *record, bool commit)
 	if (commit && (xinfo & XACT_XINFO_HAS_TT_COMMIT) != 0
 		&& !side_xact_take(&cursor, sizeof(xl_xact_tt_commit), NULL))
 		return false;
+	if (commit && (xinfo & XACT_XINFO_HAS_SPACE_DROP) != 0
+		&& !side_xact_take_counted(&cursor, CLUSTER_SPACE_STRUCTURE_WAL_BYTES))
+		return false;
 	return cursor.position == cursor.end;
 }
 
@@ -257,7 +261,48 @@ static bool
 side_xact_no_commit_effects(const xl_xact_parsed_commit *parsed)
 {
 	return parsed->nsubxacts == 0 && parsed->nrels == 0 && parsed->nstats == 0
-		   && parsed->nmsgs == 0;
+		   && parsed->nmsgs == 0 && parsed->nspace_drops == 0;
+}
+
+/* This validates source membership, not the right to unlink any target.
+ * Preserve native side effects in the owned COMMIT for their actual owners. */
+static bool
+side_xact_space_drops_valid(const xl_xact_parsed_commit *parsed, uint64 system_identifier)
+{
+	RelFileLocator previous = {0};
+
+	if (parsed->nspace_drops == 0 || parsed->nrels <= 0
+		|| parsed->nspace_drops > (uint32)parsed->nrels || parsed->space_drops == NULL)
+		return false;
+	for (uint32 i = 0; i < parsed->nspace_drops; i++) {
+		ClusterSpaceStructureChange drop;
+		RelFileLocator locator;
+		bool found = false;
+
+		if (!cluster_space_structure_wal_decode(parsed->space_drops
+			+ (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES, CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop)
+			|| drop.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+			|| drop.identity.result.key.system_identifier != system_identifier)
+			return false;
+		locator = drop.identity.result.key.locator;
+		if (i != 0 && (locator.spcOid < previous.spcOid
+			|| (locator.spcOid == previous.spcOid && (locator.dbOid < previous.dbOid
+				|| (locator.dbOid == previous.dbOid && locator.relNumber <= previous.relNumber)))))
+			return false;
+		for (int j = 0; j < parsed->nrels; j++) {
+			RelFileLocator member;
+
+			memcpy(&member, &parsed->xlocators[j], sizeof(member));
+			if (RelFileLocatorEquals(locator, member)) {
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			return false;
+		previous = locator;
+	}
+	return true;
 }
 
 static bool
@@ -416,6 +461,17 @@ rf_side_xact_structural_preflight_v1(const RfSideXactOperationV1 *operation)
 	for (i = 0; i < sizeof(operation->reserved49); i++)
 		if (operation->reserved49[i] != 0)
 			return false;
+	if (operation->space_drop_count != 0) {
+		if (operation->kind != RF_SIDE_XACT_COMMIT
+			|| (operation->xinfo & XACT_XINFO_HAS_SPACE_DROP) == 0
+			|| operation->space_drop_offset < MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(uint32)
+			|| operation->space_drop_offset > operation->completion_payload_length
+			|| (uint64)operation->space_drop_count * CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+				!= operation->completion_payload_length - operation->space_drop_offset)
+			return false;
+	} else if (operation->completion_payload_length != 0 || operation->space_drop_offset != 0
+		|| (operation->xinfo & XACT_XINFO_HAS_SPACE_DROP) != 0)
+		return false;
 	for (i = 0; i < sizeof(operation->prepare_binding); i++)
 		binding_seen |= operation->prepare_binding[i];
 	gid_end = memchr(operation->prepare_gid, '\0', sizeof(operation->prepare_gid));
@@ -486,7 +542,9 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
 			XLogRecGetDataLen(record), &parsed))
 			return false;
-		if (!side_xact_no_commit_effects(&parsed) || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0
+		if ((!side_xact_no_commit_effects(&parsed)
+				&& !side_xact_space_drops_valid(&parsed, system_identifier))
+			|| (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0
 			|| !SCN_VALID(parsed.scn) || side_xact_commit_timestamp(&parsed) == 0
 			|| !parsed.has_tt_commit
 			|| !side_xact_tt_delta_valid(&parsed.tt_commit, origin_thread, xid, parsed.scn))
@@ -499,6 +557,13 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 		candidate.terminal_timestamp = side_xact_commit_timestamp(&parsed);
 		candidate.has_tt_delta = true;
 		candidate.tt_delta = parsed.tt_commit;
+		if (parsed.nspace_drops != 0) {
+			if (XLogRecHasAnyBlockRefs(record))
+				return false;
+			candidate.completion_payload_length = XLogRecGetDataLen(record);
+			candidate.space_drop_count = parsed.nspace_drops;
+			candidate.space_drop_offset = (uint32)(parsed.space_drops - XLogRecGetData(record));
+		}
 		break;
 	}
 	case XLOG_XACT_ABORT: {
@@ -1047,7 +1112,8 @@ rf_side_xact_target_preflight_owned_v1(const RfSideXactOperationV1 *operation,
 
 	if (!rf_side_xact_structural_preflight_v1(operation)
 		|| operation->system_identifier != GetSystemIdentifier()
-		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1)
+		|| cluster_xid_origin_slot(operation->xid) != (int)operation->origin_thread - 1
+		|| operation->space_drop_count != 0)
 		return RF_SIDE_XACT_APPLY_BLOCKED;
 
 	if (operation->kind == RF_SIDE_XACT_COMMIT)

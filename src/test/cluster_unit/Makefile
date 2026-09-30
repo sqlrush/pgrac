@@ -2461,7 +2461,9 @@ SIDE_OWNER_TEST_CPPFLAGS = -DRF_SIDE_OWNER_TESTING \
 	-Dcluster_undo_preflight_tt_target_v1=fixture_preflight_tt_target \
 	-Dcluster_undo_apply_tt_v1=fixture_apply_tt
 $(CLUSTER_SIDE_ONLINE_OWNER_O): $(top_srcdir)/src/backend/cluster/cluster_side_online_owner.c \
-		$(top_srcdir)/src/include/cluster/cluster_side_online_owner.h
+		$(top_srcdir)/src/include/cluster/cluster_side_online_owner.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_plan.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_xact.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(SIDE_OWNER_TEST_CPPFLAGS) \
 		-ffunction-sections -fdata-sections -c $< -o $@
 test_cluster_side_online_owner: test_cluster_side_online_owner.c unit_test.h test_cluster_undo_header_identity.inc \

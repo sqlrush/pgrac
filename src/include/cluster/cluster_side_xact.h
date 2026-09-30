@@ -41,6 +41,11 @@ typedef struct RfSideXactOperationV1 {
 	bool has_tt_delta;
 	uint8 reserved49[7];
 	xl_xact_tt_commit tt_delta;
+	/* Native COMMIT with structural effects: retain the entire payload and
+	 * its typed tail. TT-only consumers cannot discharge these effects. */
+	uint32 completion_payload_length;
+	uint32 space_drop_count;
+	uint32 space_drop_offset;
 	uint8 prepare_binding[CLUSTER_REMOTE_XACT_PREPARE_DIGEST_BYTES];
 	char prepare_gid[GIDSIZE];
 	uint16 prepared_record_version;

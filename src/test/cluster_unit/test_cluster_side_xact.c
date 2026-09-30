@@ -100,6 +100,7 @@ static bool canonical_file_io_error, canonical_materialize_failure;
 static XLogRecPtr canonical_expected_block_lsn = 400;
 ClusterUndoTargetPreflightV1 fixture_preflight_tt_target(const ClusterUndoDecoded *d);
 ClusterUndoApplyResultV1 fixture_apply_tt(const ClusterUndoDecoded *d);
+static bool canonical_authority_fresh(void *arg);
 
 bool
 cluster_undo_recovery_scope_enter_v1(ClusterUndoRecoveryScopeV1 *scope,
@@ -2068,6 +2069,78 @@ space_online_plan(uint64 end)
 	return plan;
 }
 
+static ClusterSpaceStructureChange
+space_drop_fixture(uint32 relnumber)
+{
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	ClusterSpaceStructureChange drop = {0};
+
+	drop.identity.action = CLUSTER_SPACE_WAL_TOMBSTONE;
+	drop.identity.nblocks = InvalidBlockNumber;
+	drop.identity.expected = advance.result.identity;
+	drop.identity.expected.key.locator.relNumber = relnumber;
+	drop.identity.result = drop.identity.expected;
+	drop.identity.result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+	drop.identity.result.sequence++;
+	drop.identity.result.operation++;
+	drop.identity.before_token = 123;
+	drop.identity.result_token = 70;
+	drop.reservation.action = CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+	drop.reservation.before = advance.result;
+	drop.reservation.before.identity = drop.identity.expected;
+	drop.reservation.result = drop.reservation.before;
+	drop.reservation.result.identity = drop.identity.result;
+	drop.reservation.before_token = advance.result_token;
+	drop.reservation.result_token = drop.identity.result_token;
+	return drop;
+}
+
+static void
+make_space_commit(FakeXactRecord *fake, const ClusterSpaceStructureChange *drops, uint32 count)
+{
+	uint32 prefix = MinSizeOfXactCommit + sizeof(xl_xact_xinfo);
+	uint32 locator_bytes = sizeof(int) + count * sizeof(RelFileLocator);
+	uint32 old_len;
+	uint32 xinfo;
+	int nrels = (int)count;
+
+	make_commit(fake, 802, 901, 123456, false);
+	fake->u.decoded.max_block_id = -1;
+	old_len = fake->u.decoded.main_data_len;
+	UT_ASSERT(old_len + locator_bytes + sizeof(count)
+		+ count * CLUSTER_SPACE_STRUCTURE_WAL_BYTES <= sizeof(fake->data));
+	memmove(fake->data + prefix + locator_bytes, fake->data + prefix, old_len - prefix);
+	memcpy(&xinfo, fake->data + MinSizeOfXactCommit, sizeof(xinfo));
+	xinfo |= XACT_XINFO_HAS_RELFILELOCATORS | XACT_XINFO_HAS_SPACE_DROP;
+	memcpy(fake->data + MinSizeOfXactCommit, &xinfo, sizeof(xinfo));
+	memcpy(fake->data + prefix, &nrels, sizeof(nrels));
+	for (uint32 i = 0; i < count; i++)
+		memcpy(fake->data + prefix + sizeof(nrels) + i * sizeof(RelFileLocator),
+			&drops[i].identity.result.key.locator, sizeof(RelFileLocator));
+	fake->u.decoded.main_data_len += locator_bytes;
+	memcpy(fake->data + fake->u.decoded.main_data_len, &count, sizeof(count));
+	fake->u.decoded.main_data_len += sizeof(count);
+	for (uint32 i = 0; i < count; i++) {
+		UT_ASSERT(cluster_space_structure_wal_encode(&drops[i],
+			fake->data + fake->u.decoded.main_data_len, CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+		fake->u.decoded.main_data_len += CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+	}
+}
+
+static RfPageProofDetailV1
+space_commit_feed(RfSideOnlinePlanV1 *plan, FakeXactRecord *fake, XLogRecPtr begin)
+{
+	uint8 uuid[16];
+	RfPageOnlineRecordIdentityV1 identity;
+	RfDetachedRecordPlanV1 record;
+
+	memset(uuid, 0x44, sizeof(uuid));
+	identity = make_identity(fake, uuid);
+	set_identity_range(fake, &identity, begin, begin + 100);
+	record = make_record_plan(fake);
+	return rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+}
+
 static RfPageProofDetailV1
 space_online_feed(RfSideOnlinePlanV1 *plan, uint8 info, const void *wal, uint32 length,
 	XLogRecPtr begin, bool block_ref)
@@ -2084,6 +2157,171 @@ space_online_feed(RfSideOnlinePlanV1 *plan, uint8 info, const void *wal, uint32 
 	set_identity_range(&fake, &identity, begin, begin + 100);
 	record = make_projection_record_plan(&fake);
 	return rf_side_online_plan_feed_record_v1(plan, &record, &identity);
+}
+
+UT_TEST(test_space_commit_owned_multiple_targets_close_exact_source_chains)
+{
+	ClusterSpaceReservationChange advance = space_advance_fixture();
+	ClusterSpaceStructureChange drops[2] = {space_drop_fixture(16384), space_drop_fixture(16385)};
+	FakeXactRecord fake;
+	RfSideOnlinePlanV1 *plan = space_online_plan(300);
+	RfSideOnlineOperationV1 operation;
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+	PGAlignedBlock pages[2];
+	ClusterSpaceRecoveryImage out;
+	uint32 order[2], count;
+	RfPageProofDetailV1 detail;
+
+	reset_prepare_apply();
+	UT_ASSERT(cluster_space_reservation_wal_encode(&advance, wal, sizeof(wal)));
+	UT_ASSERT_EQ(space_online_feed(plan, XLOG_SMGR_SPACE_RESERVATION, wal, sizeof(wal), 100, false),
+		RF_PAGE_PROOF_DETAIL_OK);
+	make_space_commit(&fake, drops, 2);
+	detail = space_commit_feed(plan, &fake, 200);
+	UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+	if (detail != RF_PAGE_PROOF_DETAIL_OK)
+		goto done;
+	/* The native decoder buffer is reused immediately after feeding. */
+	memset(fake.data, 0xee, sizeof(fake.data));
+	UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 43));
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 2);
+	for (int i = 0; i < 2; i++) {
+		ClusterSpaceReservation result;
+		uint64 token;
+
+		UT_ASSERT(cluster_space_identity_page_encode(&drops[i].identity.expected, 123,
+			pages[0].data, BLCKSZ));
+		UT_ASSERT(cluster_space_reservation_page_encode(i == 0 ? &advance.before : &drops[i].reservation.before,
+			i == 0 ? advance.before_token : drops[i].reservation.before_token, pages[1].data, BLCKSZ));
+		detail = rf_side_online_plan_prepare_space_v1(plan, &drops[i].identity.result.key,
+			pages[0].data, pages[1].data, order, 2, &count, &out);
+		UT_ASSERT_EQ(detail, RF_PAGE_PROOF_DETAIL_OK);
+		if (detail != RF_PAGE_PROOF_DETAIL_OK)
+			goto done;
+		UT_ASSERT_EQ(count, i == 0 ? 2 : 1);
+		UT_ASSERT_EQ(order[count - 1], 1);
+		UT_ASSERT_EQ(out.source_index[0], 1);
+		UT_ASSERT_EQ(out.source_index[1], 1);
+		UT_ASSERT(cluster_space_reservation_page_decode(out.pages[1].data, BLCKSZ,
+			SPACE_FORKNUM, 1, &drops[i].identity.result.key, &result, &token));
+		UT_ASSERT_EQ(result.identity.state, CLUSTER_SPACE_IDENTITY_TOMBSTONED);
+		UT_ASSERT_EQ(result.next_block, 7);
+		UT_ASSERT_EQ(token, 70);
+	}
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 1, &operation));
+	/* A source plan cannot silently apply TT/projection and drop its structural effects. */
+	UT_ASSERT_EQ(rf_side_xact_apply_owned_v1(&operation.xact, operation.owned_payload,
+		operation.owned_payload_length), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(rf_side_xact_apply_v1(&operation.xact), RF_SIDE_XACT_APPLY_BLOCKED);
+	UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+done:
+	rf_side_online_plan_destroy_v1(&plan);
+}
+
+UT_TEST(test_space_commit_rejects_unowned_duplicate_or_malformed_drop_inputs)
+{
+	for (int fault = 0; fault < 10; fault++) {
+		ClusterSpaceStructureChange drops[2] = {space_drop_fixture(16384), space_drop_fixture(16385)};
+		RfSideOnlinePlanV1 *plan = space_online_plan(200);
+		FakeXactRecord fake;
+		uint32 prefix = MinSizeOfXactCommit + sizeof(xl_xact_xinfo) + sizeof(int);
+
+		if (fault == 1) drops[1] = drops[0];
+		if (fault == 2) {
+			ClusterSpaceStructureChange tmp = drops[0];
+
+			drops[0] = drops[1];
+			drops[1] = tmp;
+		}
+		if (fault == 6 || fault == 7 || fault == 8) {
+			ClusterSpaceIdentityKey *key = &drops[1].identity.expected.key;
+
+			if (fault == 6) key->system_identifier++;
+			if (fault == 7) key->storage_uuid[0]++;
+			if (fault == 8) key->database_incarnation++;
+			drops[1].identity.result.key = *key;
+			drops[1].reservation.before.identity.key = *key;
+			drops[1].reservation.result.identity.key = *key;
+		}
+		make_space_commit(&fake, drops, 2);
+		if (fault == 0) {
+			RelFileLocator wrong = {DEFAULTTABLESPACE_OID, 5, 99999};
+
+			memcpy(fake.data + prefix, &wrong, sizeof(wrong));
+		}
+		if (fault == 3) fake.u.decoded.main_data_len--;
+		if (fault == 4) {
+			uint32 count = UINT32_MAX;
+
+			memcpy(fake.data + fake.u.decoded.main_data_len
+				- 2 * CLUSTER_SPACE_STRUCTURE_WAL_BYTES - sizeof(count), &count, sizeof(count));
+		}
+		if (fault == 5) fake.u.decoded.max_block_id = 0;
+		if (fault == 9) fake.u.decoded.header.xl_info = XLOG_XACT_COMMIT_PREPARED | XLOG_XACT_HAS_INFO;
+		if (fault == 8) {
+			UT_ASSERT_EQ(space_commit_feed(plan, &fake, 100), RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 42));
+			UT_ASSERT(!rf_side_online_plan_bind_database_v1(plan, 43));
+			UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+		} else {
+			UT_ASSERT(space_commit_feed(plan, &fake, 100) != RF_PAGE_PROOF_DETAIL_OK);
+			UT_ASSERT_EQ(rf_side_online_plan_operation_count_v1(plan), 0);
+		}
+		rf_side_online_plan_destroy_v1(&plan);
+	}
+}
+
+UT_TEST(test_space_commit_retains_all_native_side_effects_and_refuses_tt_only_owner)
+{
+	ClusterSpaceStructureChange drop = space_drop_fixture(16384);
+	RfSideOnlinePlanV1 *plan = space_online_plan(200);
+	FakeXactRecord fake;
+	RfSideOnlineOperationV1 operation;
+	xl_xact_parsed_commit parsed;
+	uint8 saved[sizeof(fake.data)];
+	TransactionId subxid = 818;
+	uint32 prefix = MinSizeOfXactCommit + sizeof(xl_xact_xinfo);
+	uint32 xinfo, added = sizeof(int) + sizeof(subxid), len;
+	int count = 1;
+	RfSideOnlineProductionOwnerV1 owner;
+	bool fresh = true;
+
+	reset_prepare_apply();
+	make_space_commit(&fake, &drop, 1);
+	memmove(fake.data + prefix + added, fake.data + prefix, fake.u.decoded.main_data_len - prefix);
+	memcpy(fake.data + prefix, &count, sizeof(count));
+	memcpy(fake.data + prefix + sizeof(count), &subxid, sizeof(subxid));
+	memcpy(&xinfo, fake.data + MinSizeOfXactCommit, sizeof(xinfo));
+	xinfo |= XACT_XINFO_HAS_SUBXACTS;
+	memcpy(fake.data + MinSizeOfXactCommit, &xinfo, sizeof(xinfo));
+	fake.u.decoded.main_data_len += added;
+	len = fake.u.decoded.main_data_len;
+	memcpy(saved, fake.data, len);
+	UT_ASSERT_EQ(space_commit_feed(plan, &fake, 100), RF_PAGE_PROOF_DETAIL_OK);
+	memset(fake.data, 0xee, sizeof(fake.data));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH);
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(plan, 42));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(plan), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_operation_v1(plan, 0, &operation));
+	UT_ASSERT_EQ(operation.owned_payload_length, len);
+	UT_ASSERT(memcmp(operation.owned_payload, saved, len) == 0);
+	UT_ASSERT(ParseCommitRecord(operation.identity.record.info,
+		(xl_xact_commit *)operation.owned_payload, operation.owned_payload_length, &parsed));
+	UT_ASSERT_EQ(parsed.nsubxacts, 1);
+	UT_ASSERT_EQ(parsed.nrels, 1);
+	UT_ASSERT_EQ(parsed.nspace_drops, 1);
+	UT_ASSERT_EQ(parsed.subxacts[0], subxid);
+	UT_ASSERT_EQ(parsed.tt_commit.xid, 802);
+	UT_ASSERT_EQ(parsed.scn, 901);
+	UT_ASSERT(rf_side_online_production_owner_init_v1(&owner, &fresh,
+		canonical_authority_fresh, 9, true));
+	UT_ASSERT_EQ(rf_side_online_production_apply_v1(plan, &owner), RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE);
+	UT_ASSERT_EQ(prepare_apply.tt_stamps, 0);
+	UT_ASSERT_EQ(prepare_apply.terminal_projection_stores, 0);
+	rf_side_online_plan_destroy_v1(&plan);
 }
 
 UT_TEST(test_space_plan_owns_exact_chain_and_requires_observed_namespace)
@@ -2914,7 +3152,7 @@ UT_TEST(test_sealed_source_match_requires_observed_namespace_and_exact_cut)
 int
 main(void)
 {
-	UT_PLAN(41);
+	UT_PLAN(44);
 	UT_RUN(test_reuse_owner_covers_retired_commit_only_after_new_physical_and_tt);
 	UT_RUN(test_init_owner_repairs_short_segment_before_header_and_commit);
 	UT_RUN(test_lifecycle_header_requires_known_generation_and_complete_source_chain);
@@ -2956,6 +3194,9 @@ main(void)
 	UT_RUN(test_space_plan_owns_exact_chain_and_requires_observed_namespace);
 	UT_RUN(test_space_plan_rejects_unbound_native_shapes);
 	UT_RUN(test_space_plan_structural_pair_and_standalone_tombstone);
+	UT_RUN(test_space_commit_owned_multiple_targets_close_exact_source_chains);
+	UT_RUN(test_space_commit_rejects_unowned_duplicate_or_malformed_drop_inputs);
+	UT_RUN(test_space_commit_retains_all_native_side_effects_and_refuses_tt_only_owner);
 	UT_DONE();
 	return ut_failed_count == 0 ? 0 : 1;
 }

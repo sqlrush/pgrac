@@ -179,6 +179,14 @@ side_ensure_payload_capacity(RfSideOnlinePlanV1 *plan, uint32 additional)
 }
 
 static bool
+side_space_key_matches_plan(const RfSideOnlinePlanV1 *plan, const ClusterSpaceIdentityKey *key)
+{
+	return key->system_identifier == plan->system_identifier
+		&& memcmp(key->storage_uuid, plan->storage_uuid, 16) == 0
+		&& (plan->database_incarnation == 0 || key->database_incarnation == plan->database_incarnation);
+}
+
+static bool
 side_space_decode(const RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *record_plan,
 				  RfSideOnlineOperationV1 *candidate)
 {
@@ -204,13 +212,55 @@ side_space_decode(const RfSideOnlinePlanV1 *plan, const RfDetachedRecordPlanV1 *
 		key = change.result.identity.key;
 	} else
 		return false;
-	if (key.system_identifier != plan->system_identifier
-		|| memcmp(key.storage_uuid, plan->storage_uuid, 16) != 0
-		|| (plan->database_incarnation != 0 && key.database_incarnation != plan->database_incarnation))
+	if (!side_space_key_matches_plan(plan, &key))
 		return false;
 	candidate->kind = RF_SIDE_ONLINE_OPERATION_SPACE;
 	candidate->space_key = key;
 	candidate->owned_payload_length = XLogRecGetDataLen(record);
+	return true;
+}
+
+static uint32
+side_operation_space_count(const RfSideOnlineOperationV1 *op)
+{
+	return op->kind == RF_SIDE_ONLINE_OPERATION_SPACE ? 1
+		: op->kind == RF_SIDE_ONLINE_OPERATION_XACT ? op->xact.space_drop_count : 0;
+}
+
+/* A COMMIT can own several different locators. Each still points to this
+ * original record, never to a synthetic standalone structural operation. */
+static bool
+side_operation_space_input(const RfSideOnlinePlanV1 *plan, const RfSideOnlineOperationV1 *op,
+	uint32 item, ClusterSpaceIdentityKey *key, ClusterSpaceRecoveryInput *input)
+{
+	ClusterSpaceRecoveryInput candidate;
+	ClusterSpaceIdentityKey identity;
+
+	if (item >= side_operation_space_count(op)
+		|| op->owned_payload_offset > plan->owned_payload_bytes
+		|| op->owned_payload_length > plan->owned_payload_bytes - op->owned_payload_offset)
+		return false;
+	candidate = (ClusterSpaceRecoveryInput){plan->owned_payload + op->owned_payload_offset,
+		op->owned_payload_length};
+	if (op->kind == RF_SIDE_ONLINE_OPERATION_XACT) {
+		ClusterSpaceStructureChange drop;
+
+		if (op->owned_payload_length != op->xact.completion_payload_length
+			|| !rf_side_xact_structural_preflight_v1(&op->xact))
+			return false;
+		candidate.data = (const uint8 *)candidate.data + op->xact.space_drop_offset
+			+ (Size)item * CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+		candidate.length = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+		if (!cluster_space_structure_wal_decode(candidate.data, candidate.length, &drop)
+			|| drop.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE)
+			return false;
+		identity = drop.identity.result.key;
+	} else
+		identity = op->space_key;
+	if (!side_space_key_matches_plan(plan, &identity))
+		return false;
+	*key = identity;
+	*input = candidate;
 	return true;
 }
 
@@ -491,10 +541,21 @@ rf_side_online_plan_feed_record_v1(RfSideOnlinePlanV1 *plan,
 										identity->record.origin_thread, &candidate.xact))
 				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 			candidate.kind = RF_SIDE_ONLINE_OPERATION_XACT;
-			if (candidate.xact.kind == RF_SIDE_XACT_PREPARE) {
+			if (candidate.xact.kind == RF_SIDE_XACT_PREPARE || candidate.xact.space_drop_count != 0) {
 				uint32 record_length = XLogRecGetDataLen(record_plan->source_record);
+				uint32 expected_length = candidate.xact.kind == RF_SIDE_XACT_PREPARE
+					? candidate.xact.prepare_payload_length : candidate.xact.completion_payload_length;
 
-				if (record_length == 0 || record_length != candidate.xact.prepare_payload_length
+				for (uint32 i = 0; i < candidate.xact.space_drop_count; i++) {
+					ClusterSpaceStructureChange drop;
+
+					if (!cluster_space_structure_wal_decode(XLogRecGetData(record_plan->source_record)
+						+ candidate.xact.space_drop_offset + (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+						CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &drop)
+						|| !side_space_key_matches_plan(plan, &drop.identity.result.key))
+						return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+				}
+				if (record_length == 0 || record_length != expected_length
 					|| !side_ensure_operation_capacity(plan)
 					|| !side_ensure_payload_capacity(plan, record_length))
 					return RF_PAGE_PROOF_DETAIL_CAPACITY;
@@ -583,9 +644,14 @@ rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database_i
 		|| (plan->database_incarnation != 0 && plan->database_incarnation != database_incarnation))
 		return false;
 	for (uint32 i = 0; i < plan->operation_count; i++)
-		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
-			&& plan->operations[i].space_key.database_incarnation != database_incarnation)
-			return false;
+		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+			ClusterSpaceIdentityKey key;
+			ClusterSpaceRecoveryInput input;
+
+			if (!side_operation_space_input(plan, &plan->operations[i], j, &key, &input)
+				|| key.database_incarnation != database_incarnation)
+				return false;
+		}
 	plan->database_incarnation = database_incarnation;
 	return true;
 }
@@ -630,9 +696,15 @@ rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
 		|| memcmp(expected->storage_uuid, plan->storage_uuid, 16) != 0)
 		return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
 	for (uint32 i = 0; i < plan->operation_count; i++)
-		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
-			&& RelFileLocatorEquals(plan->operations[i].space_key.locator, expected->locator))
-			count++;
+		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+			ClusterSpaceIdentityKey key;
+			ClusterSpaceRecoveryInput input;
+
+			if (!side_operation_space_input(plan, &plan->operations[i], j, &key, &input))
+				return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+			if (RelFileLocatorEquals(key.locator, expected->locator))
+				count++;
+		}
 	if (count == 0)
 		return RF_PAGE_PROOF_DETAIL_COMPONENT_INCOMPLETE;
 	bytes = (Size)count * (sizeof(*inputs) + sizeof(*indices) + sizeof(*sorted));
@@ -653,12 +725,17 @@ rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
 	for (uint32 i = 0; i < plan->operation_count; i++) {
 		const RfSideOnlineOperationV1 *op = &plan->operations[i];
 
-		if (op->kind != RF_SIDE_ONLINE_OPERATION_SPACE
-			|| !RelFileLocatorEquals(op->space_key.locator, expected->locator))
-			continue;
-		inputs[next] = (ClusterSpaceRecoveryInput){plan->owned_payload + op->owned_payload_offset,
-			op->owned_payload_length};
-		indices[next++] = i;
+		for (uint32 j = 0; j < side_operation_space_count(op); j++) {
+			ClusterSpaceIdentityKey key;
+			ClusterSpaceRecoveryInput input;
+
+			if (!side_operation_space_input(plan, op, j, &key, &input))
+				goto done;
+			if (!RelFileLocatorEquals(key.locator, expected->locator))
+				continue;
+			inputs[next] = input;
+			indices[next++] = i;
+		}
 	}
 	if (!cluster_space_recovery_prepare(inputs, count, expected, identity_page,
 		reservation_page, sorted, &prepared))
@@ -1015,10 +1092,14 @@ rf_side_online_plan_seal_v1(RfSideOnlinePlanV1 *plan)
 	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || plan->sealed)
 		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
 	for (i = 0; i < plan->operation_count; i++)
-		if (plan->operations[i].kind == RF_SIDE_ONLINE_OPERATION_SPACE
-			&& (plan->database_incarnation == 0
-				|| plan->operations[i].space_key.database_incarnation != plan->database_incarnation))
-			return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		for (uint32 j = 0; j < side_operation_space_count(&plan->operations[i]); j++) {
+			ClusterSpaceIdentityKey key;
+			ClusterSpaceRecoveryInput input;
+
+			if (plan->database_incarnation == 0
+				|| !side_operation_space_input(plan, &plan->operations[i], j, &key, &input))
+				return RF_PAGE_PROOF_DETAIL_IDENTITY_MISMATCH;
+		}
 	for (i = 0; i < plan->participant_count; i++) {
 		const RfContributorStreamCutV1 *cut = &plan->physical_cuts[i];
 		bool empty = (cut->flags & RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY) != 0;
