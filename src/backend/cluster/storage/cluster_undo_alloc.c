@@ -220,28 +220,7 @@ bool
 cluster_undo_segment_header_identity_ok(const char *blockbuf, uint32 segment_id,
 										uint8 owner_instance)
 {
-	PageHeader ph = (PageHeader)blockbuf;
-	const UndoSegmentHeaderData *hdr = (const UndoSegmentHeaderData *)blockbuf;
-
-	if ((ph->pd_flags & PD_UNDO_SEG_HEADER) == 0)
-		return false;
-	if (PageGetPageSize((Page)blockbuf) != BLCKSZ
-		|| PageGetPageLayoutVersion((Page)blockbuf) != PG_PAGE_LAYOUT_VERSION)
-		return false;
-
-	if (hdr->segment_id != segment_id || hdr->segment_size_bytes != UNDO_SEGMENT_SIZE_BYTES
-		|| hdr->owner_instance != owner_instance || hdr->tt_slots_count != TT_SLOTS_PER_SEGMENT)
-		return false;
-
-	switch (hdr->segment_state) {
-	case SEGMENT_ALLOCATED:
-	case SEGMENT_ACTIVE:
-	case SEGMENT_COMMITTED:
-	case SEGMENT_RECYCLABLE:
-		return true;
-	default:
-		return false;
-	}
+	return UndoSegmentHeader_identity_matches(blockbuf, segment_id, owner_instance);
 }
 
 

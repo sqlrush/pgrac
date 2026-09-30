@@ -127,6 +127,20 @@ extern bool cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
 										 const uint8 *payload, Size payload_length,
 										 XLogRecPtr replay_end, const char *base, char *out);
 
+typedef enum ClusterUndoHeaderPrepareResultV1 {
+	CLUSTER_UNDO_HEADER_BLOCKED = 0,
+	CLUSTER_UNDO_HEADER_APPLY,
+	CLUSTER_UNDO_HEADER_SKIP_STALE
+} ClusterUndoHeaderPrepareResultV1;
+
+/* Native lifecycle preparation, not recovery authority. INIT/REUSE validate
+ * header identity, allocated state and generation; RECYCLE needs a valid base.
+ * Native generation decisions are preserved, including REUSE's torn-header
+ * repair. Only APPLY changes out; base and out may alias. */
+extern ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+							   Size payload_length, const char *base, char *out);
+
 typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,
 	CLUSTER_UNDO_APPLY_BLOCKED = 1,

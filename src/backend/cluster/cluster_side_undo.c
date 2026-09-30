@@ -424,7 +424,8 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 			return false;
 		break;
 	case CLUSTER_UNDO_KIND_SEGMENT_REUSE:
-		if (decoded->new_generation != decoded->expected_generation + 1 || !decoded->has_fpi
+		if (decoded->expected_generation == UINT32_MAX
+			|| decoded->new_generation != decoded->expected_generation + 1 || !decoded->has_fpi
 			|| decoded->payload_length != BLCKSZ)
 			return false;
 		break;
@@ -491,6 +492,70 @@ cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
 	((UndoBlockHeader *)prepared.data)->block_lsn = replay_end;
 	memcpy(out, prepared.data, BLCKSZ);
 	return true;
+}
+
+ClusterUndoHeaderPrepareResultV1
+cluster_undo_prepare_header_v1(const ClusterUndoDecoded *decoded, const uint8 *payload,
+							   Size payload_length, const char *base, char *out)
+{
+	PGAlignedBlock prepared, prior;
+	UndoSegmentHeaderData *header = (UndoSegmentHeaderData *)prepared.data;
+	const UndoSegmentHeaderData *before = (const UndoSegmentHeaderData *)prior.data;
+	bool base_valid = false;
+
+	if (decoded == NULL || out == NULL || !cluster_undo_preflight(decoded)
+		|| decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode))
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	if (base != NULL) {
+		memcpy(prior.data, base, BLCKSZ);
+		base_valid = UndoSegmentHeader_identity_matches(prior.data, decoded->segment_id,
+														decoded->instance);
+	}
+	if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE) {
+		xl_undo_segment_recycle record = {0};
+		ClusterUndoSegRecycleRedo decision;
+
+		if (!base_valid || decoded->has_payload || decoded->has_fpi || payload_length != 0)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		record.expected_generation = decoded->expected_generation;
+		record.old_state = decoded->old_state;
+		record.new_state = decoded->new_state;
+		decision = cluster_undo_segment_recycle_redo_decide(before->wrap_count,
+															before->segment_state, &record);
+		if (decision == CLUSTER_SEGRECYCLE_REDO_SKIP_STALE)
+			return CLUSTER_UNDO_HEADER_SKIP_STALE;
+		if (decision != CLUSTER_SEGRECYCLE_REDO_APPLY)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		prepared = prior;
+		header->segment_state = decoded->new_state;
+	} else if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+			   || decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
+		if (payload == NULL || payload_length != BLCKSZ || !decoded->has_payload)
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		memcpy(prepared.data, payload, BLCKSZ);
+		if (!UndoSegmentHeader_identity_matches(prepared.data, decoded->segment_id,
+												   decoded->instance)
+			|| header->segment_state != SEGMENT_ALLOCATED
+			|| header->wrap_count != (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+										 ? 0 : decoded->new_generation))
+			return CLUSTER_UNDO_HEADER_BLOCKED;
+		if (decoded->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE) {
+			xl_undo_segment_reuse record = {0};
+			ClusterUndoSegReuseRedo decision;
+
+			record.old_generation = decoded->expected_generation;
+			record.new_generation = decoded->new_generation;
+			decision = cluster_undo_segment_reuse_redo_decide(base_valid,
+								base_valid ? before->wrap_count : 0, &record);
+			if (decision == CLUSTER_SEGREUSE_REDO_SKIP_STALE)
+				return CLUSTER_UNDO_HEADER_SKIP_STALE;
+			if (decision != CLUSTER_SEGREUSE_REDO_APPLY)
+				return CLUSTER_UNDO_HEADER_BLOCKED;
+		}
+	} else
+		return CLUSTER_UNDO_HEADER_BLOCKED;
+	memcpy(out, prepared.data, BLCKSZ);
+	return CLUSTER_UNDO_HEADER_APPLY;
 }
 
 static bool

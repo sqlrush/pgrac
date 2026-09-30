@@ -434,6 +434,7 @@ TESTS += test_cluster_heap_small_redo
 TESTS += test_cluster_btree_redo
 TESTS += test_cluster_page_dependency
 TESTS += test_cluster_undo_producer
+TESTS += test_cluster_undo_native_lifecycle
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -2275,6 +2276,26 @@ test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cl
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_undo_lifecycle_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^cluster_undo_redo_segment_(init|recycle|reuse)\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_header_identity.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_alloc.c Makefile
+	awk '/^cluster_undo_segment_header_identity_ok\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_native_lifecycle: test_cluster_undo_native_lifecycle.c unit_test.h \
+		test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
+		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
+
 test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
 		test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
@@ -2312,6 +2333,7 @@ $(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
 SIDE_XACT_TT_2PC_RECORD_O = $(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o
 test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
 		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/cluster_undo_segment.h \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
@@ -3719,6 +3741,7 @@ check_r11_source_removal_census:
 # ----------
 clean distclean maintainer-clean:
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
+	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
 		test_cluster_btree_structure_root.inc \
