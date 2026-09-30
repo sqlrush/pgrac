@@ -43,6 +43,7 @@
 #include "access/xlogreader.h"
 #include "cluster/cluster_scn.h"	  /* SCN */
 #include "cluster/cluster_itl_slot.h" /* UBA */
+#include "cluster/cluster_tt_slot.h"
 #include "storage/itemptr.h"		  /* TransactionId */
 
 typedef enum ClusterUndoDecodedKind {
@@ -161,6 +162,10 @@ typedef enum ClusterUndoTargetPreflightV1 {
 	CLUSTER_UNDO_TARGET_PROVED_NOOP = 1,
 	CLUSTER_UNDO_TARGET_BLOCKED = 2
 } ClusterUndoTargetPreflightV1;
+
+/* The legacy terminal/set-head admission shared by virtual and durable slots. */
+extern ClusterUndoTargetPreflightV1
+cluster_undo_preflight_legacy_slot_v1(const ClusterUndoDecoded *decoded, const TTSlot *slot);
 
 /* Classify the exact durable TT target without mutating it. */
 extern ClusterUndoTargetPreflightV1

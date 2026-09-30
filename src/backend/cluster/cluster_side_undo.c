@@ -779,32 +779,37 @@ cluster_undo_preflight_tt_target_v1(const ClusterUndoDecoded *decoded)
 												   decoded->xid, decoded->wrap, &slot))
 		return CLUSTER_UNDO_TARGET_BLOCKED;
 
+	return cluster_undo_preflight_legacy_slot_v1(decoded, &slot);
+}
+
+ClusterUndoTargetPreflightV1
+cluster_undo_preflight_legacy_slot_v1(const ClusterUndoDecoded *decoded, const TTSlot *slot)
+{
+	if (!cluster_undo_preflight(decoded) || slot == NULL
+		|| slot->status > TT_SLOT_RECYCLABLE || slot->xid != decoded->xid
+		|| slot->wrap != decoded->wrap)
+		return CLUSTER_UNDO_TARGET_BLOCKED;
 	switch (decoded->kind) {
-	case CLUSTER_UNDO_KIND_TT_BIND:
-		cluster_tt_durable_redo_bind_slot(decoded->instance, decoded->segment_id,
-										  decoded->expected_generation, decoded->slot_offset,
-										  decoded->wrap, decoded->xid);
-		break;
 	case CLUSTER_UNDO_KIND_TT_COMMIT:
-		if (slot.status == TT_SLOT_COMMITTED && slot.commit_scn == decoded->commit_scn
-			&& UBA_is_invalid(slot.first_undo_block))
+		if (slot->status == TT_SLOT_COMMITTED && slot->commit_scn == decoded->commit_scn
+			&& UBA_is_invalid(slot->first_undo_block))
 			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
-		if (slot.status == TT_SLOT_ACTIVE && !SCN_VALID(slot.commit_scn))
+		if (slot->status == TT_SLOT_ACTIVE && !SCN_VALID(slot->commit_scn))
 			return CLUSTER_UNDO_TARGET_APPLY;
 		break;
 	case CLUSTER_UNDO_KIND_TT_ABORT:
-		if (slot.status == TT_SLOT_ABORTED && !SCN_VALID(slot.commit_scn)
-			&& UBA_is_invalid(slot.first_undo_block))
+		if (slot->status == TT_SLOT_ABORTED && !SCN_VALID(slot->commit_scn)
+			&& UBA_is_invalid(slot->first_undo_block))
 			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
-		if (slot.status == TT_SLOT_ACTIVE && !SCN_VALID(slot.commit_scn))
+		if (slot->status == TT_SLOT_ACTIVE && !SCN_VALID(slot->commit_scn))
 			return CLUSTER_UNDO_TARGET_APPLY;
 		break;
 	case CLUSTER_UNDO_KIND_TT_SET_HEAD:
-		if (slot.status != TT_SLOT_ABORTED || SCN_VALID(slot.commit_scn))
+		if (slot->status != TT_SLOT_ABORTED || SCN_VALID(slot->commit_scn))
 			break;
-		if (memcmp(&slot.first_undo_block, &decoded->first_undo_block, sizeof(UBA)) == 0)
+		if (memcmp(&slot->first_undo_block, &decoded->first_undo_block, sizeof(UBA)) == 0)
 			return CLUSTER_UNDO_TARGET_PROVED_NOOP;
-		if (UBA_is_invalid(slot.first_undo_block))
+		if (UBA_is_invalid(slot->first_undo_block))
 			return CLUSTER_UNDO_TARGET_APPLY;
 		break;
 	default:

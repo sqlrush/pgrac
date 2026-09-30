@@ -278,7 +278,8 @@ cluster_thread_recovery_fabric_apply_v1(const ClusterThreadRecoveryFabricPlanV1 
 
 	if (!rf_side_online_production_owner_init_v1(&side_owner, (void *)authority,
 												 fabric_apply_authority_fresh,
-												 (uint32)current_epoch, retained_source_current)) {
+												 (uint32)current_epoch, retained_source_current)
+		|| !rf_side_online_production_bind_undo_v1(&side_owner, authority)) {
 		detail = RF_PAGE_PROOF_DETAIL_ROOT_STALE;
 		goto done;
 	}

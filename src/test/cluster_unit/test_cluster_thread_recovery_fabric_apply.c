@@ -237,6 +237,16 @@ rf_side_online_production_owner_init_v1(RfSideOnlineProductionOwnerV1 *owner, vo
 			  && revalidate_authority(authority_arg) && cluster_epoch == 9
 			  && failed_origin_redo_retained);
 	memset(owner, 0, sizeof(*owner));
+	owner->authority_arg = authority_arg;
+	return true;
+}
+
+bool
+rf_side_online_production_bind_undo_v1(RfSideOnlineProductionOwnerV1 *owner,
+	const ClusterThreadRecoveryAuthorityV1 *authority)
+{
+	UT_ASSERT(owner->authority_arg == authority);
+	owner->undo_authority = authority;
 	return true;
 }
 
@@ -245,6 +255,7 @@ rf_side_online_production_preflight_v1(const RfSideOnlinePlanV1 *plan,
 									   RfSideOnlineProductionOwnerV1 *owner)
 {
 	UT_ASSERT(plan == (const RfSideOnlinePlanV1 *)&side_plan_object && owner != NULL);
+	UT_ASSERT(owner->undo_authority != NULL && owner->undo_authority == owner->authority_arg);
 	side_preflight_step = ++step;
 	return side_preflight_ok ? RF_PAGE_PROOF_DETAIL_OK : RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
 }

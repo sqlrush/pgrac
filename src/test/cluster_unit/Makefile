@@ -2443,12 +2443,21 @@ test_cluster_side_xact: test_cluster_side_xact.c unit_test.h test_cluster_undo_h
 		$(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) $(LDFLAGS) -lssl -lcrypto -o $@
 
-CLUSTER_SIDE_ONLINE_OWNER_O = \
-	$(top_builddir)/src/backend/cluster/cluster_side_online_owner.o
-test_cluster_side_online_owner: test_cluster_side_online_owner.c unit_test.h \
-		$(CLUSTER_SIDE_ONLINE_OWNER_O)
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_ONLINE_OWNER_O) \
-		$(CLUSTER_UNIT_PORT_LIBS) -o $@
+CLUSTER_SIDE_ONLINE_OWNER_O = test_cluster_side_online_owner_product.o
+SIDE_OWNER_TEST_CPPFLAGS = -DRF_SIDE_OWNER_TESTING \
+	-Dcluster_undo_preflight_tt_target_v1=fixture_preflight_tt_target \
+	-Dcluster_undo_apply_tt_v1=fixture_apply_tt
+$(CLUSTER_SIDE_ONLINE_OWNER_O): $(top_srcdir)/src/backend/cluster/cluster_side_online_owner.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_online_owner.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SIDE_OWNER_TEST_CPPFLAGS) \
+		-ffunction-sections -fdata-sections -c $< -o $@
+test_cluster_side_online_owner: test_cluster_side_online_owner.c unit_test.h test_cluster_undo_header_identity.inc \
+		$(CLUSTER_SIDE_ONLINE_OWNER_O) test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(SIDE_OWNER_TEST_CPPFLAGS) $< $(CLUSTER_SIDE_ONLINE_OWNER_O) \
+		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
 # RF-SIDE D-SIDE-03: PREPARED/in-doubt binding + RECO-style resolution
 # judgements.

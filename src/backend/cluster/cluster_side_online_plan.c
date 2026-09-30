@@ -770,6 +770,13 @@ rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan)
 			   : 0;
 }
 
+Size
+rf_side_online_plan_scratch_available_v1(const RfSideOnlinePlanV1 *plan)
+{
+	return plan != NULL && plan->magic == RF_SIDE_ONLINE_PLAN_MAGIC && plan->sealed
+		&& plan->memory_used <= plan->memory_budget ? plan->memory_budget - plan->memory_used : 0;
+}
+
 bool
 rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 								 RfSideOnlineOperationV1 *out_operation)

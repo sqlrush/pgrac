@@ -120,6 +120,7 @@ extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_header_v1(
 	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
 	const char *base, RfSideUndoHeaderImageV1 *out);
 extern uint32 rf_side_online_plan_operation_count_v1(const RfSideOnlinePlanV1 *plan);
+extern Size rf_side_online_plan_scratch_available_v1(const RfSideOnlinePlanV1 *plan);
 extern bool rf_side_online_plan_operation_v1(const RfSideOnlinePlanV1 *plan, uint32 index,
 											 RfSideOnlineOperationV1 *out_operation);
 extern RfPageProofDetailV1 rf_side_online_plan_preflight_v1(const RfSideOnlinePlanV1 *plan,
