@@ -2847,7 +2847,6 @@ read_recovery_subject_locked(uint16 thread_id, const uint8 storage_uuid[16],
 		const ClusterWalStartupImage *op = &inputs->pending;
 		ClusterWalDurablePrefixRef ref = { 0 };
 		ClusterWalThreadClaimV2 claim;
-		ClusterWalDurablePrefix prefix;
 		uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES];
 		if ((op->phase != CLUSTER_WAL_STARTUP_INITIALIZING
 			 && op->phase != CLUSTER_WAL_STARTUP_DURABLE)
@@ -2867,10 +2866,11 @@ read_recovery_subject_locked(uint16 thread_id, const uint8 storage_uuid[16],
 			goto done;
 		}
 		result = cluster_wal_claim_v2_read(cluster_wal_threads_dir, &ref.claim, &claim);
-		if (result == CLUSTER_CONTROL_ROOT_OK_PRIMARY)
-			result = cluster_wal_durable_prefix_read(cluster_wal_threads_dir, &ref, &prefix);
 		if (result != CLUSTER_CONTROL_ROOT_OK_PRIMARY)
 			goto done;
+		/* Discover the exact obligation, not whether its WAL is empty or
+		 * complete. The isolated recovery owner performs that census; an
+		 * obsolete group-flush prefix is not an identity prerequisite. */
 		out->kind = CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER;
 		out->duty = op->claim.identity;
 		out->pending.file = token;

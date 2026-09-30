@@ -404,18 +404,15 @@ read_wal_routes(const char *pgdata, const char *wal_root, const ClusterWalDurabl
 	char thread[32], generation[2][48];
 	struct stat expected[2], routed, current;
 	int selected = -1;
-	ClusterWalDurablePrefix prefix;
-	ClusterWalDurablePrefix empty = { .sequence = 1 };
 	ClusterWalThreadClaimV2 claim;
-	uint8 check[CLUSTER_WAL_DURABLE_PREFIX_BYTES];
 	uint8 claim_bytes[2][CLUSTER_WAL_CLAIM_V2_BYTES + 1];
 	size_t claim_len[2] = { 0, 0 };
 
-	if (!read_path_valid(pgdata, NULL) || !read_path_valid(wal_root, NULL)
-		|| cluster_wal_durable_prefix_encode(ref, &empty, check) != 0)
+	if (!read_path_valid(pgdata, NULL) || !read_path_valid(wal_root, NULL) || ref == NULL
+		|| ref->timeline == 0 || !cluster_wal_claim_v2_ref_valid(&ref->claim))
 		return result;
 	if (pending != NULL
-		&& (cluster_wal_durable_prefix_encode(pending, &empty, check) != 0
+		&& (pending->timeline == 0 || !cluster_wal_claim_v2_ref_valid(&pending->claim)
 			|| pending->claim.identity.origin_node_id != ref->claim.identity.origin_node_id
 			|| pending->claim.identity.origin_thread_id != ref->claim.identity.origin_thread_id
 			|| pending->claim.identity.system_identifier != ref->claim.identity.system_identifier
@@ -473,10 +470,9 @@ read_wal_routes(const char *pgdata, const char *wal_root, const ClusterWalDurabl
 							&claim_len[i]);
 		if (result != 0)
 			goto done;
-		/* Allocation-free exact reader; all its descriptors close locally. */
-		result = cluster_wal_durable_prefix_read(wal_root, refs[i], &prefix);
-		if (result != 0)
-			goto done;
+		/* The exact claim is decoded below after all raw descriptors close.
+		 * Routing is not a durability or EMPTY observation; recovery owns
+		 * actual WAL validation independently of a group-flush side file. */
 	}
 	result = read_same_dir(AT_FDCWD, pgdata, dirs[0]);
 	if (result == 0)

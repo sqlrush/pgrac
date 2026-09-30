@@ -52,8 +52,8 @@ claim_identity_valid(const ClusterControlRootIdentity *id)
 		   && !claim_zero(id->storage_uuid, 16) && !claim_zero(id->authority_uuid, 16);
 }
 
-static bool
-claim_ref_valid(const ClusterWalThreadClaimRefV2 *ref)
+bool
+cluster_wal_claim_v2_ref_valid(const ClusterWalThreadClaimRefV2 *ref)
 {
 	return ref != NULL && claim_identity_valid(&ref->identity) && ref->database_incarnation != 0
 		   && ref->max_config_generation != 0 && !claim_zero(ref->claim_sha256, 32);
@@ -135,7 +135,7 @@ cluster_wal_claim_v2_decode(const uint8 *bytes, size_t len, const ClusterWalThre
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
-	if (bytes == NULL || !claim_ref_valid(ref))
+	if (bytes == NULL || !cluster_wal_claim_v2_ref_valid(ref))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	if (len != CLUSTER_WAL_CLAIM_V2_BYTES)
 		return CLUSTER_CONTROL_ROOT_BAD_SIZE;
@@ -210,7 +210,7 @@ cluster_wal_claim_v2_read(const char *wal_root, const ClusterWalThreadClaimRefV2
 	if (out == NULL)
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	memset(out, 0, sizeof(*out));
-	if (wal_root == NULL || wal_root[0] == '\0' || !claim_ref_valid(ref))
+	if (wal_root == NULL || wal_root[0] == '\0' || !cluster_wal_claim_v2_ref_valid(ref))
 		return CLUSTER_CONTROL_ROOT_INVALID_ARGUMENT;
 	snprintf(thread, sizeof(thread), "thread_%u", ref->identity.origin_thread_id);
 	snprintf(generation, sizeof(generation), "generation_" UINT64_FORMAT,

@@ -6376,6 +6376,34 @@ v2_checkpoint_wal_record(const ClusterControlRootIdentity *self, ControlFileData
 	v2_checkpoint_prefix_write();
 }
 
+/* Each fixture selects a fresh logical stream at the same test-only pathname.
+ * Do not retain initialized future segments from an earlier cross-segment
+ * case: those correctly prove a known WAL gap to the production tail reader.
+ * Only this harness's exact generation and regular WAL files are removed. */
+static void
+v2_checkpoint_clear_segments(const ClusterControlRootIdentity *self)
+{
+	char generation[MAXPGPATH];
+	struct dirent *entry;
+	DIR *dir;
+	int fd;
+	v2_claim_path(self, generation);
+	*strrchr(generation, '/') = '\0';
+	fd = open(generation, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+	if (fd < 0 || (dir = fdopendir(fd)) == NULL)
+		abort();
+	while ((entry = readdir(dir)) != NULL) {
+		struct stat st;
+		if (!IsXLogFileName(entry->d_name))
+			continue;
+		if (fstatat(fd, entry->d_name, &st, AT_SYMLINK_NOFOLLOW) != 0 || !S_ISREG(st.st_mode)
+			|| st.st_uid != geteuid() || st.st_nlink != 1 || unlinkat(fd, entry->d_name, 0) != 0)
+			abort();
+	}
+	if (closedir(dir) != 0)
+		abort();
+}
+
 static void
 v2_checkpoint_fixture(uint8 before[66048], ClusterControlRootIdentity *self,
 					  ControlFileData *candidate)
@@ -6387,6 +6415,7 @@ v2_checkpoint_fixture(uint8 before[66048], ClusterControlRootIdentity *self,
 
 	v2_thread_fixture(before, anchors);
 	*self = anchors[0].identity;
+	v2_checkpoint_clear_segments(self);
 	UT_ASSERT_EQ(cluster_control_root_v2_read_thread_locked(self, &root, candidate, &token), 0);
 	memset(&test_checkpoint_prefix_ref, 0, sizeof(test_checkpoint_prefix_ref));
 	test_checkpoint_prefix_ref.claim.identity = *self;
@@ -10919,6 +10948,8 @@ UT_TEST(test_runtime_pending_observation_is_separate_and_requires_actual_inputs)
 					 0);
 		if (ut_current_failed)
 			return;
+		path_for(path, sizeof(path), CLUSTER_CONTROL_ROOT_REL_PATH);
+		read_all_or_abort(path, before, sizeof(before));
 		cluster_node_id = 127;
 		test_self_incarnation = 991;
 		UT_ASSERT_EQ(cluster_control_root_read_recovery_subject(1, &op.claim.identity, &subject),
@@ -10946,6 +10977,18 @@ UT_TEST(test_runtime_pending_observation_is_separate_and_requires_actual_inputs)
 						 test_root, subject.pending.generation, hash);
 			}
 			UT_ASSERT_EQ(unlink(path), 0);
+			if (fault == 2) {
+				/* Discovery selects an obligation; it does not certify EMPTY
+				 * or depend on a removed group-flush prefix file. */
+				UT_ASSERT_EQ(
+					cluster_control_root_read_recovery_subject(1, &op.claim.identity, &subject), 0);
+				UT_ASSERT_EQ(subject.kind, CLUSTER_CONTROL_RECOVERY_PENDING_INITIALIZER);
+				UT_ASSERT(v2_zero(&subject.current, sizeof(subject.current)));
+				UT_ASSERT(v2_zero(&subject.current_token, sizeof(subject.current_token)));
+				v2_assert_primary_unchanged(before);
+				v2_claim_path(&op.claim.identity, path);
+				UT_ASSERT_EQ(unlink(path), 0);
+			}
 			UT_ASSERT(cluster_control_root_read_recovery_subject(1, &op.claim.identity, &subject)
 					  != 0);
 		}
@@ -14046,7 +14089,9 @@ UT_TEST(test_bootstrap_wal_route_exact_generation_and_refusals)
 			UT_ASSERT_EQ(mkfifo(current, 0600), 0);
 		bootstrap_wal_route_race = fault == 9;
 		bootstrap_close_fail_at = fault == 10 ? 1 : 0;
-		if (fault == 0)
+		/* The route check has no durability/EMPTY meaning. An absent,
+		 * corrupt, wrong-timeline or nonregular obsolete PGWP is irrelevant. */
+		if (fault == 0 || fault == 3 || fault == 4 || fault == 5 || fault == 8)
 			UT_ASSERT_EQ(cluster_control_bootstrap_wal_route(
 							 bootstrap_local, cluster_wal_threads_dir, &snapshot.wal),
 						 0);
@@ -17081,6 +17126,16 @@ UT_TEST(test_bootstrap_pending_route_never_masks_bad_inputs_or_namespace)
 			else
 				out.snapshot.pending_wal.claim.identity.origin_owner_incarnation
 					= out.snapshot.wal.claim.identity.origin_owner_incarnation;
+			if (fault == 2 || fault == 3) {
+				UT_ASSERT_EQ(cluster_control_bootstrap_wal_startup_route(pgdata, test_wal_root,
+																		 &out.snapshot),
+							 0);
+				/* Both selected claims remain mandatory, even when pg_wal
+				 * currently points at the other generation. */
+				v2_claim_path(fault == 2 ? &op.predecessor.snapshot.identity : &op.claim.identity,
+							  path);
+				UT_ASSERT_EQ(unlink(path), 0);
+			}
 			UT_ASSERT(
 				cluster_control_bootstrap_wal_startup_route(pgdata, test_wal_root, &out.snapshot)
 				!= 0);

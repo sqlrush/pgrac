@@ -25,6 +25,10 @@ typedef struct ClusterWalThreadClaimRefV2 {
 	uint8 claim_sha256[32];
 } ClusterWalThreadClaimRefV2;
 
+/* Logical input shape only; neither authenticates the claim file nor grants
+ * writer/recovery authority. Shared by exact namespace consumers. */
+extern bool cluster_wal_claim_v2_ref_valid(const ClusterWalThreadClaimRefV2 *ref);
+
 extern ClusterControlRootResult
 cluster_wal_claim_v2_encode(const ClusterWalThreadClaimV2 *claim,
 							uint8 bytes[CLUSTER_WAL_CLAIM_V2_BYTES]);
