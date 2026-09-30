@@ -93,6 +93,26 @@ extern bool cluster_undo_smgr_write_block(ClusterUndoPathIntent intent, uint32 s
 /* Register the per-backend fd-cache cleanup before temporary exit hooks. */
 extern void cluster_undo_smgr_ensure_exit_hook(void);
 
+/* Private recovery observation, not persisted authority. All entries require
+ * the active qualified RECOVERY_SHARED scope. Short files are distinct from
+ * I/O errors; the full-image caller may restore size before publishing block0. */
+typedef struct ClusterUndoSmgrRecoveryFileV1 {
+	uint64 device;
+	uint64 inode;
+	uint64 size;
+	bool exists;
+} ClusterUndoSmgrRecoveryFileV1;
+
+extern bool cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
+	ClusterUndoSmgrRecoveryFileV1 *file, char block0[BLCKSZ]);
+extern bool cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance,
+	uint32 block, const ClusterUndoSmgrRecoveryFileV1 *expected, char out[BLCKSZ]);
+/* Only a source-proved INIT/REUSE owner may call materialize. It preserves all
+ * existing bytes through the target size and does not publish a new header. */
+extern bool cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
+	const ClusterUndoSmgrRecoveryFileV1 *expected, const char block0[BLCKSZ],
+	const char final_header[BLCKSZ]);
+
 
 /*
  * cluster_undo_smgr_read_header_bytes / _write_header_bytes (spec-3.11 D2)

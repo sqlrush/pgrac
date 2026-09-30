@@ -25,6 +25,8 @@ typedef struct SideUndoHeader {
 	uint32 block_no;
 	uint8 instance;
 	bool installed;
+	bool file_ready;
+	ClusterUndoSmgrRecoveryFileV1 file;
 	PGAlignedBlock base;
 	RfSideUndoHeaderImageV1 final;
 } SideUndoHeader;
@@ -51,14 +53,24 @@ side_owner_undo_target(RfSideOnlineProductionOwnerV1 *owner, uint8 instance,
 	owner->undo_headers = header;
 	owner->undo_bytes_remaining -= sizeof(*header);
 	/* Link before I/O so the protected-set ERROR cleanup also owns it. */
-	if (!cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, segment_id,
-		instance, block_no, header->base.data))
-		return NULL;
+	if (block_no == 0) {
+		if (!cluster_undo_smgr_recovery_probe_v1(segment_id, instance, &header->file, header->base.data))
+			return NULL;
+	} else {
+		SideUndoHeader *segment = side_owner_undo_target(owner, instance, segment_id, 0);
+
+		if (segment == NULL || !cluster_undo_smgr_recovery_read_block_v1(segment_id,
+			instance, block_no, &segment->file, header->base.data))
+			return NULL;
+	}
 	if ((block_no == 0
 		? rf_side_online_plan_prepare_undo_header_v1(owner->protected_plan, instance,
 			segment_id, header->base.data, &header->final)
 		: rf_side_online_plan_prepare_undo_block_v1(owner->protected_plan, instance,
 			segment_id, block_no, &header->final)) != RF_PAGE_PROOF_DETAIL_OK)
+		return NULL;
+	if (block_no == 0 && !header->final.has_full_image
+		&& (!header->file.exists || header->file.size != UNDO_SEGMENT_SIZE_BYTES))
 		return NULL;
 	return header;
 }
@@ -119,6 +131,17 @@ side_owner_install_data(RfSideOnlineProductionOwnerV1 *owner)
 {
 	SideUndoHeader *target;
 
+	for (target = owner->undo_headers; target != NULL; target = target->next) {
+		if (target->block_no != 0 || target->file_ready)
+			continue;
+		if (!side_owner_authority_fresh(owner))
+			return false;
+		if (target->final.has_full_image && !cluster_undo_smgr_recovery_materialize_v1(
+			target->segment_id, target->instance, &target->file, target->base.data,
+			target->final.page.data))
+			return false;
+		target->file_ready = true;
+	}
 	for (target = owner->undo_headers; target != NULL; target = target->next)
 		if (target->block_no != 0 && !side_owner_install_target(owner, target))
 			return false;
@@ -211,7 +234,10 @@ side_owner_preflight_undo(void *arg, const RfSideOnlineOperationV1 *operation)
 		if (undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE || undo->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
 			return side_owner_undo_target(owner, undo->instance, undo->segment_id, 0) != NULL
 				&& side_owner_undo_target(owner, undo->instance, undo->segment_id, undo->block_no) != NULL;
-		/* File lifecycle installation keeps its separate gate. */
+		if (undo->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT
+			|| undo->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE
+			|| undo->kind == CLUSTER_UNDO_KIND_SEGMENT_RECYCLE)
+			return side_owner_undo_target(owner, undo->instance, undo->segment_id, 0) != NULL;
 		if (undo->kind != CLUSTER_UNDO_KIND_TT_BIND && undo->kind != CLUSTER_UNDO_KIND_TT_COMMIT
 			&& undo->kind != CLUSTER_UNDO_KIND_TT_ABORT && undo->kind != CLUSTER_UNDO_KIND_TT_SET_HEAD
 			&& undo->kind != CLUSTER_UNDO_KIND_TT_CTRC_RELEASE)

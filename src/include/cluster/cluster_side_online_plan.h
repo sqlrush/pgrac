@@ -112,6 +112,7 @@ typedef struct RfSideUndoHeaderImageV1 {
 	PGAlignedBlock page;
 	uint32 source_index;
 	uint32 operation_count;
+	bool has_full_image;
 } RfSideUndoHeaderImageV1;
 
 typedef RfSideUndoHeaderImageV1 RfSideUndoBlockImageV1;

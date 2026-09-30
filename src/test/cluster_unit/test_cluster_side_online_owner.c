@@ -165,6 +165,32 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment, uint8 instance)
 	return !capture.write_failure;
 }
 
+bool
+cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
+	ClusterUndoSmgrRecoveryFileV1 *file, char out[BLCKSZ])
+{
+	memset(file, 0, sizeof(*file));
+	file->exists = true;
+	file->size = UNDO_SEGMENT_SIZE_BYTES;
+	return cluster_undo_smgr_read_block(CLUSTER_UNDO_PATH_RECOVERY_SHARED, segment, instance, 0, out);
+}
+
+bool
+cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance, uint32 block,
+	const ClusterUndoSmgrRecoveryFileV1 *file, char out[BLCKSZ])
+{
+	UT_ASSERT(false);
+	return false;
+}
+
+bool
+cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
+	const ClusterUndoSmgrRecoveryFileV1 *file, const char base[BLCKSZ], const char final[BLCKSZ])
+{
+	UT_ASSERT(false);
+	return false;
+}
+
 RfSideXactApplyResultV1
 rf_side_xact_apply_covered_commit_v1(const RfSideXactOperationV1 *operation,
 	void *arg, bool (*verify)(void *, const RfSideXactOperationV1 *))

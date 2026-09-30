@@ -40,6 +40,7 @@
 #include <unistd.h>
 
 #include "miscadmin.h"
+#include "common/file_perm.h"
 #include "storage/fd.h"
 #include "storage/ipc.h" /* before_shmem_exit (fd cache cleanup) */
 #include "utils/elog.h"
@@ -239,6 +240,163 @@ void
 cluster_undo_smgr_fd_cache_reset(void)
 {
 	fd_cache_close();
+}
+
+static bool
+undo_recovery_file_stat(int fd, ClusterUndoSmgrRecoveryFileV1 *file)
+{
+	struct stat st;
+
+	if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size < 0)
+		return false;
+	memset(file, 0, sizeof(*file));
+	file->exists = true;
+	file->device = st.st_dev;
+	file->inode = st.st_ino;
+	file->size = st.st_size;
+	return true;
+}
+
+static bool
+undo_recovery_file_same(const ClusterUndoSmgrRecoveryFileV1 *a,
+	const ClusterUndoSmgrRecoveryFileV1 *b)
+{
+	return a->exists == b->exists && a->device == b->device
+		&& a->inode == b->inode && a->size == b->size;
+}
+
+static bool
+undo_recovery_read(int fd, uint64 size, uint32 block, char out[BLCKSZ])
+{
+	uint64 offset = (uint64)block * BLCKSZ;
+	Size length = size <= offset ? 0 : Min(size - offset, BLCKSZ);
+
+	memset(out, 0, BLCKSZ);
+	if (length == 0)
+		return true;
+	/* Known EOF is zero extension. An unexpected short/error read is not. */
+	return pg_pread(fd, out, length, (off_t)offset) == (ssize_t)length;
+}
+
+bool
+cluster_undo_smgr_recovery_probe_v1(uint32 segment, uint8 instance,
+	ClusterUndoSmgrRecoveryFileV1 *file, char block0[BLCKSZ])
+{
+	ClusterUndoSmgrRecoveryFileV1 observed = {0};
+	PGAlignedBlock page = {0};
+	char path[MAXPGPATH];
+	int flags = O_RDONLY | PG_BINARY;
+	int fd;
+	bool ok;
+
+	if (file == NULL || block0 == NULL || cluster_undo_path_resolve(
+		CLUSTER_UNDO_PATH_RECOVERY_SHARED, instance, segment, path, sizeof(path)) != 0)
+		return false;
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0) {
+		if (errno != ENOENT)
+			return false;
+	} else {
+		ok = undo_recovery_file_stat(fd, &observed)
+			&& undo_recovery_read(fd, observed.size, 0, page.data);
+		if (close(fd) != 0)
+			ok = false;
+		if (!ok)
+			return false;
+	}
+	*file = observed;
+	memcpy(block0, page.data, BLCKSZ);
+	return true;
+}
+
+bool
+cluster_undo_smgr_recovery_read_block_v1(uint32 segment, uint8 instance,
+	uint32 block, const ClusterUndoSmgrRecoveryFileV1 *expected, char out[BLCKSZ])
+{
+	ClusterUndoSmgrRecoveryFileV1 observed;
+	PGAlignedBlock page;
+	char path[MAXPGPATH];
+	int flags = O_RDONLY | PG_BINARY;
+	int fd;
+	bool ok;
+
+	if (expected == NULL || out == NULL || block >= UNDO_BLOCKS_PER_SEGMENT
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
+			instance, segment, path, sizeof(path)) != 0)
+		return false;
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0) {
+		if (errno != ENOENT || expected->exists)
+			return false;
+		memset(out, 0, BLCKSZ);
+		return true;
+	}
+	ok = undo_recovery_file_stat(fd, &observed) && undo_recovery_file_same(expected, &observed)
+		&& undo_recovery_read(fd, observed.size, block, page.data);
+	if (close(fd) != 0)
+		ok = false;
+	if (ok)
+		memcpy(out, page.data, BLCKSZ);
+	return ok;
+}
+
+bool
+cluster_undo_smgr_recovery_materialize_v1(uint32 segment, uint8 instance,
+	const ClusterUndoSmgrRecoveryFileV1 *expected, const char block0[BLCKSZ],
+	const char final_header[BLCKSZ])
+{
+	ClusterUndoSmgrRecoveryFileV1 observed;
+	PGAlignedBlock page;
+	char path[MAXPGPATH], checked[MAXPGPATH], parent[MAXPGPATH];
+	int flags = O_RDWR | PG_BINARY;
+	int fd;
+	bool ok;
+
+	if (expected == NULL || block0 == NULL || final_header == NULL
+		|| !cluster_undo_segment_header_identity_ok(final_header, segment, instance)
+		|| cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
+			instance, segment, path, sizeof(path)) != 0)
+		return false;
+	fd_cache_close();
+	strlcpy(parent, path, sizeof(parent));
+	get_parent_directory(parent);
+	if (!expected->exists) {
+		/* The canonical undo root already exists; create only this instance's
+		 * native directory, never an alternative local root. */
+		if (mkdir(parent, pg_dir_create_mode) != 0 && errno != EEXIST)
+			return false;
+		flags |= O_CREAT | O_EXCL;
+	}
+#ifdef O_NOFOLLOW
+	flags |= O_NOFOLLOW;
+#endif
+	if (cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
+		instance, segment, checked, sizeof(checked)) != 0 || strcmp(path, checked) != 0)
+		return false;
+	fd = BasicOpenFile(path, flags);
+	if (fd < 0)
+		return false;
+	ok = undo_recovery_file_stat(fd, &observed);
+	if (ok && expected->exists)
+		ok = undo_recovery_file_same(expected, &observed)
+			&& undo_recovery_read(fd, observed.size, 0, page.data)
+			&& memcmp(page.data, block0, BLCKSZ) == 0;
+	if (ok)
+		ok = cluster_undo_path_resolve(CLUSTER_UNDO_PATH_RECOVERY_SHARED,
+			instance, segment, checked, sizeof(checked)) == 0 && strcmp(path, checked) == 0;
+	if (ok)
+		ok = ftruncate(fd, UNDO_SEGMENT_SIZE_BYTES) == 0 && pg_fsync(fd) == 0;
+	if (close(fd) != 0)
+		ok = false;
+	/* Sync both the file name and the possibly newly created instance dir.
+	 * Do this on retries too: a previous directory sync may have failed. */
+	return ok && provision_fsync_parent(path) && provision_fsync_parent(parent);
 }
 
 
