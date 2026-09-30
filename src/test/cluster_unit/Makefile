@@ -433,6 +433,7 @@ TESTS += test_cluster_relation_wal_policy
 TESTS += test_cluster_heap_small_redo
 TESTS += test_cluster_btree_redo
 TESTS += test_cluster_page_dependency
+TESTS += test_cluster_undo_producer
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
 SIMPLE_TESTS := $(filter-out test_cluster_page_anchor_cache,$(SIMPLE_TESTS))
@@ -2263,6 +2264,22 @@ test_cluster_side_route: test_cluster_side_route.c unit_test.h \
 # RF-SIDE D-SIDE-02: TT/undo decode + preflight primitives (single
 # parser; malformed/unknown -> BLOCKED pre-mutation).
 CLUSTER_SIDE_UNDO_O = $(top_builddir)/src/backend/cluster/cluster_side_undo.o
+test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^(cluster_undo_emit_[a-z_]+|cluster_hw_emit_reserve|cluster_undo_xlog_insert_tt_ctrc_release)\(/ \
+	     { print "XLogRecPtr"; emit=1; found++ } emit { print } /^}/ { emit=0 } \
+	     END { if (found != 12) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
+		test_cluster_undo_producer_owner.inc \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
+		xlogreader_fs.o
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
+		$(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) xlogreader_fs.o \
+		$(top_builddir)/src/common/libpgcommon.a $(CLUSTER_UNIT_PORT_LIBS) \
+		$(LDFLAGS) $(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -lssl -lcrypto -llz4 -lzstd -o $@
+
 test_cluster_side_undo: test_cluster_side_undo.c unit_test.h \
 		$(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_SIDE_UNDO_O) $(CLUSTER_SIDE_ROUTE_O) \
@@ -3693,6 +3710,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_undo_producer_owner.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
 		test_cluster_btree_structure_root.inc \
