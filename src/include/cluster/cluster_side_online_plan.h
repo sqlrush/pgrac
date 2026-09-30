@@ -114,6 +114,13 @@ typedef struct RfSideUndoHeaderImageV1 {
 	uint32 operation_count;
 } RfSideUndoHeaderImageV1;
 
+typedef RfSideUndoHeaderImageV1 RfSideUndoBlockImageV1;
+/* Physical replay starts at a source FPI in each segment incarnation, never
+ * at an inferred DATA LSN. Installation remains the original owner's duty. */
+extern RfPageProofDetailV1 rf_side_online_plan_prepare_undo_block_v1(
+	const RfSideOnlinePlanV1 *plan, uint8 instance, uint32 segment_id,
+	uint32 block_no, RfSideUndoBlockImageV1 *out);
+
 /* Evolve a private segment header through its source-ordered lifecycle and
  * TT records, including folded XACT COMMIT. The target read, physical UNDO
  * blocks, installation and durability remain separate protected obligations.

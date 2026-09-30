@@ -813,7 +813,63 @@ side_plan_prepare_slots(const RfSideOnlinePlanV1 *plan, uint8 instance,
 				prepared->source_index = last_source;
 		}
 	}
-	return prepared->operation_count == 0 ? RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE : RF_PAGE_PROOF_DETAIL_OK;
+	if (prepared->operation_count != 0)
+		return RF_PAGE_PROOF_DETAIL_OK;
+	/* A physical-only cut still needs this existing, fully identified header. */
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+
+		if (op->kind == RF_SIDE_ONLINE_OPERATION_UNDO && op->undo.instance == instance
+			&& op->undo.segment_id == segment
+			&& (op->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE
+				|| op->undo.kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI))
+			return RF_PAGE_PROOF_DETAIL_OK;
+	}
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan,
+	uint8 instance, uint32 segment_id, uint32 block_no, RfSideUndoBlockImageV1 *out)
+{
+	RfSideUndoBlockImageV1 prepared;
+	bool anchored = false;
+	Size scratch = sizeof(prepared) + BLCKSZ;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| out == NULL || instance == 0 || instance > 128 || segment_id == 0
+		|| ((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1 != instance
+		|| block_no == 0 || block_no >= UNDO_BLOCKS_PER_SEGMENT)
+		return RF_PAGE_PROOF_DETAIL_INVALID_ARGUMENT;
+	if (scratch > plan->memory_budget || plan->memory_used > plan->memory_budget - scratch)
+		return RF_PAGE_PROOF_DETAIL_CAPACITY;
+	memset(&prepared, 0, sizeof(prepared));
+	prepared.source_index = UINT32_MAX;
+	for (uint32 i = 0; i < plan->operation_count; i++) {
+		const RfSideOnlineOperationV1 *op = &plan->operations[i];
+		const ClusterUndoDecoded *d = &op->undo;
+
+		if (op->kind != RF_SIDE_ONLINE_OPERATION_UNDO || d->instance != instance
+			|| d->segment_id != segment_id)
+			continue;
+		if (d->kind == CLUSTER_UNDO_KIND_SEGMENT_INIT || d->kind == CLUSTER_UNDO_KIND_SEGMENT_REUSE)
+			anchored = false;
+		if ((d->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE && d->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+			|| d->block_no != block_no)
+			continue;
+		if ((!anchored && !d->has_fpi) || op->owned_payload_length == 0
+			|| !cluster_undo_prepare_block_v1(d, plan->owned_payload + op->owned_payload_offset,
+				op->owned_payload_length, op->identity.record.end_rec_ptr,
+				anchored ? prepared.page.data : NULL, prepared.page.data))
+			return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+		anchored = true;
+		prepared.source_index = i;
+		prepared.operation_count++;
+	}
+	if (prepared.operation_count == 0)
+		return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+	*out = prepared;
+	return RF_PAGE_PROOF_DETAIL_OK;
 }
 
 RfPageProofDetailV1

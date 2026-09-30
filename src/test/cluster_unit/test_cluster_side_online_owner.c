@@ -61,6 +61,14 @@ static ClusterThreadRecoveryAuthorityV1 canonical_authority;
 static ClusterUndoRecoveryScopeV1 *active_scope;
 static PGAlignedBlock canonical_header;
 
+RfPageProofDetailV1
+rf_side_online_plan_prepare_undo_block_v1(const RfSideOnlinePlanV1 *plan,
+	uint8 instance, uint32 segment, uint32 block, RfSideUndoBlockImageV1 *out)
+{
+	UT_ASSERT(false); /* This fixture contains TT records only. */
+	return RF_PAGE_PROOF_DETAIL_SIDE_INCOMPLETE;
+}
+
 /* Immutable-planner boundary; the real planner's source/slot proof is covered
  * by test_cluster_side_xact. This fixture supplies one predetermined result. */
 RfPageProofDetailV1
