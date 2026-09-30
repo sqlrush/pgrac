@@ -45,6 +45,7 @@
 #include "cluster/cluster_scn.h"	  /* SCN_MAX_VALID_NODE_ID */
 #include "cluster/cluster_undo_gcs.h" /* path intent + shared-root decision */
 #include "cluster/cluster_undo_segment.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_undo_segment_init.h"
 #include "cluster/cluster_undo_record_api.h" /* reuse counter note (3.13) */
 #include "cluster/cluster_undo_smgr.h"
@@ -93,6 +94,8 @@ cluster_undo_path_resolve(ClusterUndoPathIntent intent, uint8 owner_instance, ui
 
 	if (buf == NULL || buf_size == 0)
 		return -1;
+	if (intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED)
+		return cluster_undo_recovery_path_resolve_v1(owner_instance, segment_id, buf, buf_size);
 	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
 
 	/*
@@ -993,7 +996,7 @@ cluster_undo_segment_file_exists(uint8 owner_instance, uint32 segment_id)
 
 	if (owner_instance < 1 || owner_instance > UNDO_OWNER_INSTANCE_MAX)
 		return false;
-	if (cluster_undo_path_resolve(cluster_undo_intent_for_owner(owner_instance), owner_instance,
+	if (cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(owner_instance), owner_instance,
 								  segment_id, path, sizeof(path))
 		!= 0)
 		return false;

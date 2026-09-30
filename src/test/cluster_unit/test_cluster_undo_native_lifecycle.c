@@ -39,6 +39,7 @@ ExceptionalCondition(const char *condition, const char *file, int line)
 static int
 fixture_path(int intent, uint8 instance, uint32 segment, char *path, size_t length)
 {
+	UT_ASSERT_EQ(intent, CLUSTER_UNDO_PATH_RECOVERY_SHARED);
 	UT_ASSERT_EQ(instance, 3);
 	UT_ASSERT_EQ(segment, 513);
 	strlcpy(path, "undo/instance_2/seg_513.dat", length);
@@ -116,7 +117,7 @@ fixture_dir_sync(const char *path, bool isdir)
 #define ereport(level_, rest_) \
 	do { if (expect_panic) longjmp(panic_jump, 1); abort(); } while (0)
 #define build_undo_segment_path fixture_path
-#define cluster_undo_intent_for_owner(instance_) 0
+#define cluster_undo_recovery_intent_for_owner(instance_) CLUSTER_UNDO_PATH_RECOVERY_SHARED
 #define ensure_undo_instance_subdir(instance_) (mkdirs++)
 #define BasicOpenFile fixture_open
 #define ftruncate fixture_extend

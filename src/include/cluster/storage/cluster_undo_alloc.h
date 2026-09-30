@@ -113,8 +113,9 @@
 typedef enum ClusterUndoPathIntent {
 	CLUSTER_UNDO_PATH_RUNTIME_SHARED,	  /* own live undo; shared under peer-mode+coherence */
 	CLUSTER_UNDO_PATH_MATERIALIZED_LOCAL, /* dead-origin materialized copy; always local */
-	CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0 /* D4: authority reads a dead owner's
+	CLUSTER_UNDO_PATH_RUNTIME_SHARED_AUTHORITY_BLOCK0, /* D4: authority reads a dead owner's
 													   * shared block0 (read-only, foreign) */
+	CLUSTER_UNDO_PATH_RECOVERY_SHARED /* exact failed-origin IR/root/fence/retention scope */
 } ClusterUndoPathIntent;
 
 /* cluster_node_id owns the +1 sentinel offset: owner_instance == node_id + 1. */

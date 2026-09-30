@@ -260,6 +260,7 @@ OBJS = \
 	cluster_undo_authority.o \
 	cluster_undo_authority_snapshot.o \
 	cluster_undo_gcs.o \
+	cluster_undo_recovery.o \
 	cluster_undo_gcs_grant.o \
 	cluster_undo_gcs_stat.o \
 	cluster_undo_horizon.o \

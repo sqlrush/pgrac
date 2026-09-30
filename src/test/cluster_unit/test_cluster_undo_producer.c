@@ -154,7 +154,7 @@ fixture_close(int fd)
 }
 
 #define build_undo_segment_path fixture_path
-#define cluster_undo_intent_for_owner(instance_) 0
+#define cluster_undo_recovery_intent_for_owner(instance_) CLUSTER_UNDO_PATH_RECOVERY_SHARED
 #define cluster_undo_redo_open_segment fixture_open
 #undef pg_pread
 #undef pg_pwrite
@@ -165,7 +165,7 @@ fixture_close(int fd)
 #define cluster_vis_bump_recovery_undo_redo_applies() (native_applies++)
 #include "test_cluster_undo_block_native.inc"
 #undef build_undo_segment_path
-#undef cluster_undo_intent_for_owner
+#undef cluster_undo_recovery_intent_for_owner
 #undef cluster_undo_redo_open_segment
 #undef pg_pread
 #undef pg_pwrite

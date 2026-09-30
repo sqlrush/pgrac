@@ -32,6 +32,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_recovery.h"
 
 #include <dirent.h>
 #include <fcntl.h>
@@ -197,6 +198,16 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 {
 	char path[MAXPGPATH];
 	int fd;
+	bool resolved = false;
+
+	/* A cached descriptor carries no recovery authority. */
+	if (intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED) {
+		if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0) {
+			fd_cache_close();
+			return -1;
+		}
+		resolved = true;
+	}
 
 	if (cached_fd >= 0 && cached_fd_segment == segment_id && cached_fd_owner == owner_instance
 		&& cached_fd_intent == intent)
@@ -204,7 +215,8 @@ get_segment_fd(ClusterUndoPathIntent intent, uint32 segment_id, uint8 owner_inst
 
 	fd_cache_close(); /* miss: drop the stale fd first */
 
-	if (cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
+	if (!resolved
+		&& cluster_undo_path_resolve(intent, owner_instance, segment_id, path, sizeof(path)) != 0)
 		return -1;
 	fd = BasicOpenFile(path, O_RDWR | PG_BINARY);
 	if (fd < 0)
@@ -820,7 +832,7 @@ cluster_undo_smgr_fsync_segment_file(uint32 segment_id, uint8 owner_instance)
 {
 	int fd;
 
-	fd = get_segment_fd(cluster_undo_intent_for_owner(owner_instance), segment_id, owner_instance);
+	fd = get_segment_fd(cluster_undo_recovery_intent_for_owner(owner_instance), segment_id, owner_instance);
 	if (fd < 0)
 		return false;
 

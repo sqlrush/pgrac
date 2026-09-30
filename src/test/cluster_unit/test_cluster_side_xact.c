@@ -2173,10 +2173,51 @@ UT_TEST(test_folded_commit_segment_must_belong_to_source_origin)
 	UT_ASSERT(!rf_side_xact_decode_v1(&fake.reader, UINT64_C(0x11223344), 3, &operation));
 }
 
+UT_TEST(test_sealed_source_match_requires_observed_namespace_and_exact_cut)
+{
+	RfSideOnlinePlanV1 *p = space_online_plan(200);
+	FakeXactRecord fake;
+	RfContributorStreamCutV1 cut = {0};
+	uint8 uuid[16];
+
+	memset(uuid, 0x44, sizeof(uuid));
+	cut.failed_thread = 3;
+	cut.timeline_id = 7;
+	cut.flags = RF_CONTRIBUTOR_CUT_COMPLETE;
+	cut.scan_begin_inclusive = 100;
+	cut.scan_end_exclusive = 200;
+	make_undo_delta(&fake);
+	undo_header_feed(p, &fake, 100);
+	UT_ASSERT(!rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
+	UT_ASSERT(rf_side_online_plan_bind_database_v1(p, 42));
+	UT_ASSERT(!rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(p), RF_PAGE_PROOF_DETAIL_OK);
+	UT_ASSERT(rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
+	for (int fault = 0; fault < 6; fault++) {
+		RfContributorStreamCutV1 bad = cut;
+		if (fault == 0) bad.failed_thread++;
+		if (fault == 1) bad.timeline_id++;
+		if (fault == 2) bad.scan_begin_inclusive++;
+		if (fault == 3) bad.scan_end_exclusive++;
+		if (fault == 4) bad.flags = RF_CONTRIBUTOR_CUT_EXPLICIT_EMPTY;
+		if (fault == 5) uuid[0] ^= 1;
+		UT_ASSERT(!rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &bad));
+	}
+	rf_side_online_plan_destroy_v1(&p);
+	p = space_online_plan(200);
+	make_undo_delta(&fake);
+	undo_header_feed(p, &fake, 100);
+	UT_ASSERT_EQ(rf_side_online_plan_seal_v1(p), RF_PAGE_PROOF_DETAIL_OK);
+	memset(uuid, 0x44, sizeof(uuid));
+	UT_ASSERT(!rf_side_online_plan_source_matches_v1(p, UINT64_C(0x11223344), uuid, &cut));
+	rf_side_online_plan_destroy_v1(&p);
+}
+
 int
 main(void)
 {
-	UT_PLAN(30);
+	UT_PLAN(31);
+	UT_RUN(test_sealed_source_match_requires_observed_namespace_and_exact_cut);
 	UT_RUN(test_folded_commit_segment_must_belong_to_source_origin);
 	UT_RUN(test_online_undo_header_evolves_init_bind_and_folded_commit);
 	UT_RUN(test_online_undo_header_private_base_and_late_failure);

@@ -590,6 +590,24 @@ rf_side_online_plan_bind_database_v1(RfSideOnlinePlanV1 *plan, uint64 database_i
 	return true;
 }
 
+bool
+rf_side_online_plan_source_matches_v1(const RfSideOnlinePlanV1 *plan,
+	uint64 system_identifier, const uint8 storage_uuid[16], const RfContributorStreamCutV1 *cut)
+{
+	const RfContributorStreamCutV1 *source;
+
+	if (plan == NULL || plan->magic != RF_SIDE_ONLINE_PLAN_MAGIC || !plan->sealed
+		|| plan->database_incarnation == 0 || plan->participant_count != 1
+		|| system_identifier != plan->system_identifier || storage_uuid == NULL || cut == NULL
+		|| memcmp(storage_uuid, plan->storage_uuid, 16) != 0)
+		return false;
+	source = &plan->physical_cuts[0];
+	return cut->flags == RF_CONTRIBUTOR_CUT_COMPLETE && cut->flags == source->flags
+		&& cut->failed_thread == source->failed_thread && cut->timeline_id == source->timeline_id
+		&& cut->scan_begin_inclusive == source->scan_begin_inclusive
+		&& cut->scan_end_exclusive == source->scan_end_exclusive;
+}
+
 RfPageProofDetailV1
 rf_side_online_plan_prepare_space_v1(const RfSideOnlinePlanV1 *plan,
 	const ClusterSpaceIdentityKey *expected, const void *identity_page, const void *reservation_page,

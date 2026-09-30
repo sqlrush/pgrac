@@ -52,8 +52,16 @@
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_terminal_ref_census.h"
 #include "cluster/cluster_tt_durable.h"
+#include "cluster/cluster_undo_recovery.h"
 #include "cluster/cluster_tt_status.h"
 #include "cluster/cluster_undo_cleaner.h" /* scan-pass stats (spec-3.13 D2-B) */
+
+/* This fixture exercises ordinary TT owners outside a recovery scope. */
+ClusterUndoPathIntent
+cluster_undo_recovery_intent_for_owner(uint8 owner)
+{
+	return cluster_undo_intent_for_owner(owner);
+}
 
 /* spec-3.13 D2-B stub: scan pass compares commit_scn vs horizon. */
 int

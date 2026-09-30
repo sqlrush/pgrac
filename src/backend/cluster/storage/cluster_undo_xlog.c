@@ -34,6 +34,7 @@
  *-------------------------------------------------------------------------
  */
 #include "postgres.h"
+#include "cluster/cluster_undo_recovery.h"
 
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -104,8 +105,20 @@ ensure_undo_instance_subdir(uint8 owner_instance)
 {
 	char path[MAXPGPATH];
 	int ret;
+	ClusterUndoPathIntent intent = cluster_undo_recovery_intent_for_owner(owner_instance);
 
 	Assert(owner_instance >= 1 && owner_instance <= UNDO_OWNER_INSTANCE_MAX);
+	if (intent == CLUSTER_UNDO_PATH_RECOVERY_SHARED) {
+		uint32 segment = ((uint32)owner_instance - 1) * CLUSTER_UNDO_SEGS_PER_INSTANCE + 1;
+
+		if (cluster_undo_recovery_path_resolve_v1(owner_instance, segment, path, sizeof(path)) != 0)
+			ereport(PANIC, (errmsg("canonical undo recovery directory authority is unavailable")));
+		get_parent_directory(path);
+		if (pg_mkdir_p(path, pg_dir_create_mode) != 0 && errno != EEXIST)
+			ereport(PANIC, (errcode_for_file_access(),
+				errmsg("could not create canonical undo recovery directory \"%s\": %m", path)));
+		return;
+	}
 
 	/*
 	 * spec-5.22b D2-2: own-instance redo under coherence materializes the
@@ -114,7 +127,7 @@ ensure_undo_instance_subdir(uint8 owner_instance)
 	 * foreign owner (dead-origin materialization) stays on the local DataDir
 	 * (裁决 A), so only own redo under coherence takes the shared branch.
 	 */
-	if (cluster_undo_path_uses_shared_root(cluster_undo_intent_for_owner(owner_instance),
+	if (cluster_undo_path_uses_shared_root(intent,
 										   cluster_peer_mode_enabled(),
 										   cluster_undo_gcs_coherence)) {
 		if (cluster_shared_fs_undo_instance_dir_resolve(owner_instance, path, sizeof(path)) != 0)
@@ -744,7 +757,7 @@ cluster_undo_redo_segment_init(const ClusterUndoDecoded *decoded, const uint8 *p
 									 NULL, prepared.data) != CLUSTER_UNDO_HEADER_APPLY)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo segment initialization image")));
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(decoded->instance),
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
 								decoded->instance, decoded->segment_id)));
@@ -853,7 +866,7 @@ cluster_tt_durable_redo_bind_slot(uint8 instance, uint32 segment_id, uint32 segm
 		|| (uint8)(((segment_id - 1) / CLUSTER_UNDO_SEGS_PER_INSTANCE) + 1) != instance)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid canonical TT ACTIVE identity during redo")));
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance), instance, segment_id, path,
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance, segment_id, path,
 								sizeof(path))
 		!= 0)
 		ereport(PANIC, (errmsg("undo segment path too long for TT ACTIVE redo: instance=%u seg=%u",
@@ -987,7 +1000,7 @@ cluster_tt_durable_redo_stamp_slot(uint8 instance, uint32 segment_id, uint16 slo
 		ereport(PANIC, (errmsg("TT slot commit redo: slot_offset %u out of range (max %d)",
 							   slot_offset, TT_SLOTS_PER_SEGMENT - 1)));
 
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance), instance, segment_id, path,
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance, segment_id, path,
 								sizeof(path))
 		!= 0)
 		ereport(PANIC,
@@ -1089,7 +1102,7 @@ cluster_tt_durable_redo_stamp_slot_exact(uint8 instance, uint32 segment_id,
 		|| !TransactionIdIsNormal(xid) || !SCN_VALID(commit_scn))
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid exact canonical TT commit redo identity")));
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(instance), instance, segment_id, path,
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(instance), instance, segment_id, path,
 								sizeof(path))
 		!= 0)
 		ereport(PANIC,
@@ -1278,7 +1291,7 @@ cluster_undo_redo_segment_recycle(const ClusterUndoDecoded *decoded)
 	ClusterUndoHeaderPrepareResultV1 decision;
 	ssize_t nread;
 
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(decoded->instance),
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
 								decoded->instance, decoded->segment_id)));
@@ -1349,7 +1362,7 @@ cluster_undo_redo_segment_reuse(const ClusterUndoDecoded *decoded, const uint8 *
 									 NULL, prepared.data) != CLUSTER_UNDO_HEADER_APPLY)
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo segment reuse image")));
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(decoded->instance),
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
 								decoded->instance, decoded->segment_id)));
@@ -1428,7 +1441,7 @@ cluster_undo_redo_block_write(const ClusterUndoDecoded *decoded,
 		ereport(PANIC, (errcode(ERRCODE_DATA_CORRUPTED),
 						errmsg("invalid typed undo full-image operation")));
 
-	if (build_undo_segment_path(cluster_undo_intent_for_owner(decoded->instance),
+	if (build_undo_segment_path(cluster_undo_recovery_intent_for_owner(decoded->instance),
 								decoded->instance, decoded->segment_id, path, sizeof(path)) != 0)
 		ereport(PANIC, (errmsg("undo segment path too long: instance=%u seg=%u",
 							   decoded->instance, decoded->segment_id)));
