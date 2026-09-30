@@ -95,5 +95,31 @@ cluster_space_structure_apply(const ClusterSpaceStructureChange *change,
 							  void *identity_page, void *reservation_page,
 							  size_t length, uint8 *apply_mask);
 
+/* Closed retained inputs for one exact namespace/locator. The caller binds
+ * each payload to its real WAL owner (in particular COMMIT for TOMBSTONE).
+ * This representation carries no source, lifecycle or mutation authority. */
+typedef struct ClusterSpaceRecoveryInput {
+	const void *data;
+	size_t length;
+} ClusterSpaceRecoveryInput;
+
+typedef struct ClusterSpaceRecoveryImage {
+	PGAlignedBlock pages[2];
+	/* Input responsible for each final page, UINT32_MAX if unchanged by WAL. */
+	uint32 source_index[2];
+	uint8 apply_mask;
+} ClusterSpaceRecoveryImage;
+
+/* Validate one complete, nonbranching exact chain, then prepare both pages.
+ * order has count entries and preserves every structural action, even when
+ * both pages already match the final result. Unknown targets and gaps refuse;
+ * no numeric token/LSN ordering is evidence. All outputs stay intact on refusal.
+ * The original owner still performs physical actions, WAL/source revalidation,
+ * write/fsync/post-read and contribution publication under its protected set. */
+extern bool cluster_space_recovery_prepare(const ClusterSpaceRecoveryInput *inputs,
+										  uint32 count, const ClusterSpaceIdentityKey *expected,
+										  const void *identity_page, const void *reservation_page,
+										  uint32 *order, ClusterSpaceRecoveryImage *out);
+
 #endif
 #endif

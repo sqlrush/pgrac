@@ -952,8 +952,10 @@ space_drop_prepare_replay(const ClusterSpaceStructureChange *change,
 						  const ClusterSpaceIdentityKey *expected)
 {
 	ClusterSpaceTruncateState *entry = palloc0(sizeof(*entry));
-	ClusterSpaceIdentityTransition transition;
-	uint8 apply_mask;
+	ClusterSpaceRecoveryImage prepared;
+	uint8 wal[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterSpaceRecoveryInput input = {wal, sizeof(wal)};
+	uint32 order;
 
 	for (int i = 0; i < 2; i++) {
 		entry->buffers[i] = ReadBufferWithoutRelcache(expected->locator, SPACE_FORKNUM, i,
@@ -965,10 +967,11 @@ space_drop_prepare_replay(const ClusterSpaceStructureChange *change,
 			goto refused;
 		memcpy(entry->result[i].data, BufferGetPage(entry->buffers[i]), BLCKSZ);
 	}
-	transition = cluster_space_structure_apply(change, expected,
-		entry->result[0].data, entry->result[1].data, BLCKSZ, &apply_mask);
-	if (transition != CLUSTER_SPACE_IDENTITY_APPLY && transition != CLUSTER_SPACE_IDENTITY_ALREADY)
+	if (!cluster_space_structure_wal_encode(change, wal, sizeof(wal))
+		|| !cluster_space_recovery_prepare(&input, 1, expected,
+			entry->result[0].data, entry->result[1].data, &order, &prepared))
 		goto refused;
+	memcpy(entry->result, prepared.pages, sizeof(entry->result));
 	entry->token = change->identity.result_token;
 	return entry;
 refused:
@@ -1069,11 +1072,12 @@ space_reservation_redo(XLogReaderState *record)
 	ClusterSpaceReservationChange change;
 	ClusterSpaceIdentityKey expected;
 	ClusterSpaceIdentity checked;
-	ClusterSpaceIdentityTransition transition;
 	uint8 identity[CLUSTER_SPACE_IDENTITY_BYTES];
-	PGAlignedBlock result;
+	ClusterSpaceRecoveryImage prepared;
+	ClusterSpaceRecoveryInput input = {XLogRecGetData(record), XLogRecGetDataLen(record)};
+	uint32 order;
 	SMgrRelation rel;
-	Buffer buffer;
+	Buffer buffer, identity_buffer;
 	uint16 local_thread;
 	bool success = false;
 
@@ -1089,24 +1093,33 @@ space_reservation_redo(XLogReaderState *record)
 	rel = smgropen(expected.locator, InvalidBackendId);
 	if (!smgrexists(rel, SPACE_FORKNUM) || smgrnblocks(rel, SPACE_FORKNUM) != 2)
 		return false;
+	/* Keep the independently versioned identity stable while checking and
+	 * installing its reservation. Recovery follows the same block lock order
+	 * as structural owners, but never mutates block zero for ADVANCE. */
+	identity_buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, 0,
+		RBM_NORMAL, NULL, true);
+	LockBuffer(identity_buffer, BUFFER_LOCK_SHARE);
 	buffer = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM,
 		CLUSTER_SPACE_RESERVATION_BLOCK, RBM_NORMAL, NULL, true);
 	LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
-	if (BufferIsLocal(buffer) || BufferGetBlockNumber(buffer) != CLUSTER_SPACE_RESERVATION_BLOCK
+	if (BufferIsLocal(identity_buffer) || BufferGetBlockNumber(identity_buffer) != 0
+		|| BufferIsLocal(buffer) || BufferGetBlockNumber(buffer) != CLUSTER_SPACE_RESERVATION_BLOCK
 		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1)))
 		goto done;
-	memcpy(result.data, BufferGetPage(buffer), BLCKSZ);
-	transition = cluster_space_reservation_apply(&change, &expected, result.data, BLCKSZ);
-	if (transition == CLUSTER_SPACE_IDENTITY_APPLY) {
+	if (!cluster_space_recovery_prepare(&input, 1, &expected, BufferGetPage(identity_buffer),
+		BufferGetPage(buffer), &order, &prepared) || (prepared.apply_mask & 1) != 0)
+		goto done;
+	if (prepared.apply_mask & 2) {
 		START_CRIT_SECTION();
-		memcpy(BufferGetPage(buffer), result.data, BLCKSZ);
+		memcpy(BufferGetPage(buffer), prepared.pages[1].data, BLCKSZ);
 		MarkBufferDirty(buffer);
 		space_set_lsn(BufferGetPage(buffer), record->EndRecPtr, change.result_token);
 		END_CRIT_SECTION();
 	}
-	success = transition == CLUSTER_SPACE_IDENTITY_APPLY || transition == CLUSTER_SPACE_IDENTITY_ALREADY;
+	success = true;
 done:
 	UnlockReleaseBuffer(buffer);
+	UnlockReleaseBuffer(identity_buffer);
 	return success;
 }
 
@@ -1116,7 +1129,9 @@ cluster_space_relation_redo(XLogReaderState *record)
 	ClusterSpaceStructureChange change;
 	ClusterSpaceWalChange *identity = &change.identity;
 	ClusterSpaceIdentityKey expected;
-	ClusterSpaceIdentityTransition transition;
+	ClusterSpaceRecoveryInput input;
+	ClusterSpaceRecoveryImage prepared;
+	uint32 order;
 	PGAlignedBlock result[2] = {{0}};
 	PGAlignedBlock zero = {0};
 	uint8 check[CLUSTER_SPACE_IDENTITY_BYTES];
@@ -1169,11 +1184,12 @@ cluster_space_relation_redo(XLogReaderState *record)
 			goto done;
 		memcpy(result[i].data, BufferGetPage(buffers[i]), BLCKSZ);
 	}
-	transition = cluster_space_structure_apply(&change, &expected, result[0].data, result[1].data,
-											   BLCKSZ, &apply_mask);
-	if (transition != CLUSTER_SPACE_IDENTITY_APPLY
-		&& transition != CLUSTER_SPACE_IDENTITY_ALREADY)
+	input = (ClusterSpaceRecoveryInput){XLogRecGetData(record), XLogRecGetDataLen(record)};
+	if (!cluster_space_recovery_prepare(&input, 1, &expected, result[0].data, result[1].data,
+		&order, &prepared))
 		goto done;
+	apply_mask = prepared.apply_mask;
+	memcpy(result, prepared.pages, sizeof(result));
 	if (!exists)
 		smgrcreate(rel, SPACE_FORKNUM, true);
 	for (BlockNumber i = blocks; i < 2; i++) {
@@ -1195,7 +1211,7 @@ cluster_space_relation_redo(XLogReaderState *record)
 		 * when SPACE already has result, or still has expected identity. */
 		smgr_redo_truncate(record->EndRecPtr, &truncate);
 	}
-	if (transition == CLUSTER_SPACE_IDENTITY_APPLY) {
+	if (apply_mask != 0) {
 		START_CRIT_SECTION();
 		for (int i = 0; i < 2; i++) {
 			if (!(apply_mask & (1 << i)))

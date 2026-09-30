@@ -175,7 +175,7 @@ cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buffer)
 	UT_ASSERT(reserve_owner);
 	if (!truncate_owner) {
 		UT_ASSERT(buffer == GetBufferDescriptor(1));
-		UT_ASSERT_EQ(locked, 2);
+		UT_ASSERT(locked == 2 || (recovering && locked == 3));
 	} else
 		UT_ASSERT(locked & (1 << buffer->buf_id));
 	return writer_allowed;
@@ -1399,7 +1399,7 @@ UT_TEST(test_reservation_native_replay_exact_before_and_duplicate)
 
 UT_TEST(test_reservation_replay_refusal_never_changes_target)
 {
-	for (int variant = 0; variant < 8; variant++) {
+	for (int variant = 0; variant < 12; variant++) {
 		XLogReaderState reader;
 		DecodedXLogRecord decoded;
 		PGAlignedBlock saved[2];
@@ -1413,6 +1413,21 @@ UT_TEST(test_reservation_replay_refusal_never_changes_target)
 		if (variant == 5) ((PageHeader)pages[1].data)->pd_block_scn++;
 		if (variant == 6) writer_allowed = false;
 		if (variant == 7) blocks = 1;
+		if (variant >= 8) {
+			ClusterSpaceIdentity wrong;
+			uint64 token;
+			ClusterSpaceReservationChange c;
+
+			UT_ASSERT(cluster_space_reservation_wal_decode(wal_bytes,
+				CLUSTER_SPACE_RESERVATION_WAL_BYTES, &c));
+			UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ,
+				SPACE_FORKNUM, 0, &c.result.identity.key, &wrong, &token));
+			if (variant == 8) wrong.incarnation[15]++;
+			if (variant == 9) wrong.sequence++;
+			UT_ASSERT(cluster_space_identity_page_encode(&wrong, token, page.data, BLCKSZ));
+			if (variant == 10) memset(page.data, 0, BLCKSZ);
+			if (variant == 11) page.data[BLCKSZ - 1] = 1;
+		}
 		memcpy(saved, pages, sizeof(pages));
 		UT_ASSERT(!cluster_space_relation_redo(&reader));
 		UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);

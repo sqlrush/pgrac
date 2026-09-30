@@ -385,10 +385,233 @@ UT_TEST(test_structural_partial_restart_and_init)
 	}
 }
 
+typedef struct RecoveryFixture {
+	uint8 wal[5][CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	ClusterSpaceRecoveryInput input[5];
+	ClusterSpaceReservationChange changes[5];
+	ClusterSpaceWalChange identities[5];
+	PGAlignedBlock pages[6][2];
+} RecoveryFixture;
+
+static void
+recovery_fixture(RecoveryFixture *f)
+{
+	const uint64 tokens[] = {901, 80, 1200, 55, 12};
+	uint64 identity_token = 0;
+	const uint32 permutation[] = {2, 4, 1, 3, 0};
+
+	memset(f, 0, sizeof(*f));
+	for (uint32 i = 0; i < 5; i++) {
+		ClusterSpaceReservationChange *c = &f->changes[i];
+		ClusterSpaceWalChange *id = &f->identities[i];
+		size_t len;
+
+		c->result_token = tokens[i];
+		if (i == 0) {
+			c->action = CLUSTER_SPACE_RESERVATION_INIT;
+			c->result = state();
+			id->action = CLUSTER_SPACE_WAL_CREATE;
+		} else {
+			c->before = f->changes[i - 1].result;
+			c->before_token = tokens[i - 1];
+			c->result = c->before;
+			if (i == 1 || i == 3) {
+				c->action = CLUSTER_SPACE_RESERVATION_ADVANCE;
+				c->first_block = c->before.next_block;
+				c->granted = 9;
+				c->result.next_block += 9;
+			} else {
+				c->result.identity.sequence++;
+				c->result.identity.operation++;
+				if (i == 2) {
+					c->action = CLUSTER_SPACE_RESERVATION_RESET;
+					c->result.identity.incarnation[15]++;
+					c->first_block = c->result.next_block = 3;
+					id->action = CLUSTER_SPACE_WAL_TRUNCATE;
+				} else {
+					c->action = CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+					c->result.identity.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
+					id->action = CLUSTER_SPACE_WAL_TOMBSTONE;
+				}
+			}
+		}
+		f->pages[i + 1][0] = f->pages[i][0];
+		if (id->action != 0) {
+			ClusterSpaceStructureChange both;
+
+			id->expected = c->before.identity;
+			id->result = c->result.identity;
+			id->before_token = identity_token;
+			id->result_token = c->result_token;
+			id->nblocks = i == 2 ? c->result.next_block : InvalidBlockNumber;
+			identity_token = c->result_token;
+			both.identity = *id;
+			both.reservation = *c;
+			len = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+			if (!cluster_space_structure_wal_encode(&both, f->wal[i], len)
+				|| !cluster_space_identity_page_encode(&id->result, identity_token,
+					f->pages[i + 1][0].data, BLCKSZ))
+				abort();
+		} else {
+			len = CLUSTER_SPACE_RESERVATION_WAL_BYTES;
+			if (!cluster_space_reservation_wal_encode(c, f->wal[i], len))
+				abort();
+		}
+		if (!cluster_space_reservation_page_encode(&c->result, c->result_token,
+			f->pages[i + 1][1].data, BLCKSZ))
+			abort();
+		for (uint32 j = 0; j < 5; j++)
+			if (permutation[j] == i)
+				f->input[j] = (ClusterSpaceRecoveryInput){f->wal[i], len};
+	}
+}
+
+UT_TEST(test_recovery_closed_chain_and_independent_partial_pages)
+{
+	RecoveryFixture f;
+	const uint32 expected_order[] = {4, 2, 0, 3, 1};
+	ClusterSpaceRecoveryImage out = {0};
+	uint32 order[5] = {0};
+
+	recovery_fixture(&f);
+	for (int id = 0; id < 6; id++)
+		for (int reservation = 0; reservation < 6; reservation++) {
+			UT_ASSERT(cluster_space_recovery_prepare(f.input, 5,
+				&f.changes[0].result.identity.key, f.pages[id][0].data,
+				f.pages[reservation][1].data, order, &out));
+			UT_ASSERT(memcmp(order, expected_order, sizeof(order)) == 0);
+			UT_ASSERT(memcmp(out.pages, f.pages[5], sizeof(out.pages)) == 0);
+			UT_ASSERT_EQ(out.apply_mask, (id == 5 ? 0 : 1) | (reservation == 5 ? 0 : 2));
+			UT_ASSERT_EQ(out.source_index[0], 1);
+			UT_ASSERT_EQ(out.source_index[1], 1);
+		}
+}
+
+UT_TEST(test_recovery_missing_duplicate_fork_and_cycle_refuse)
+{
+	RecoveryFixture f;
+	ClusterSpaceRecoveryImage out, saved;
+	uint32 order[5], saved_order[5];
+	ClusterSpaceReservationChange extra;
+	uint8 wal[CLUSTER_SPACE_RESERVATION_WAL_BYTES];
+
+	memset(&saved, 0xa5, sizeof(saved));
+	memset(saved_order, 0x5a, sizeof(saved_order));
+	for (int variant = 0; variant < 5; variant++) {
+		uint32 count = 5;
+
+		recovery_fixture(&f);
+		if (variant == 0) { f.input[0] = f.input[4]; count = 4; } /* missing RESET */
+		if (variant == 1) f.input[0] = f.input[1]; /* duplicate */
+		if (variant >= 2) {
+			extra = f.changes[1];
+			if (variant == 2) extra.result_token = 999; /* same before: fork */
+			if (variant == 3) { extra.before_token = 12; extra.result_token = 901; } /* cycle */
+			if (variant == 4) extra.result_token = 1200; /* same result: merge */
+			UT_ASSERT(cluster_space_reservation_wal_encode(&extra, wal, sizeof(wal)));
+			f.input[4] = (ClusterSpaceRecoveryInput){wal, sizeof(wal)};
+		}
+		out = saved;
+		memcpy(order, saved_order, sizeof(order));
+		UT_ASSERT(!cluster_space_recovery_prepare(f.input, count,
+			&f.changes[0].result.identity.key, f.pages[1][0].data,
+			f.pages[1][1].data, order, &out));
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(order, saved_order, sizeof(order)) == 0);
+	}
+}
+
+UT_TEST(test_recovery_unknown_target_and_namespace_preserve_outputs)
+{
+	RecoveryFixture f;
+	ClusterSpaceRecoveryImage out, saved;
+	uint32 order[5], saved_order[5];
+
+	memset(&saved, 0xc7, sizeof(saved));
+	memset(saved_order, 0xa1, sizeof(saved_order));
+	for (int variant = 0; variant < 6; variant++) {
+		ClusterSpaceIdentityKey key;
+		PGAlignedBlock target[2];
+		ClusterSpaceReservation wrong;
+
+		recovery_fixture(&f);
+		key = f.changes[0].result.identity.key;
+		memcpy(target, f.pages[3], sizeof(target));
+		wrong = f.changes[2].result;
+		if (variant == 0) key.database_incarnation++;
+		if (variant == 1) ((PageHeader)target[1].data)->pd_block_scn = UINT64_MAX;
+		if (variant == 2) {
+			wrong.next_block++;
+			UT_ASSERT(cluster_space_reservation_page_encode(&wrong, 1200, target[1].data, BLCKSZ));
+		}
+		if (variant == 3) {
+			wrong.identity.operation++;
+			UT_ASSERT(cluster_space_identity_page_encode(&wrong.identity, 1200, target[0].data, BLCKSZ));
+		}
+		if (variant == 4) target[1].data[BLCKSZ - 1] = 1;
+		if (variant == 5) f.wal[1][8] = CLUSTER_SPACE_RESERVATION_INIT;
+		out = saved;
+		memcpy(order, saved_order, sizeof(order));
+		UT_ASSERT(!cluster_space_recovery_prepare(f.input, 5, &key,
+			target[0].data, target[1].data, order, &out));
+		UT_ASSERT(memcmp(&out, &saved, sizeof(out)) == 0);
+		UT_ASSERT(memcmp(order, saved_order, sizeof(order)) == 0);
+	}
+}
+
+UT_TEST(test_recovery_advance_suffix_preserves_unchanged_identity)
+{
+	RecoveryFixture f;
+	ClusterSpaceRecoveryImage out;
+	uint32 order[1];
+	PGAlignedBlock identity;
+
+	recovery_fixture(&f);
+	identity = f.pages[1][0];
+	((PageHeader)identity.data)->pd_block_scn = 8001;
+	PageXLogRecPtrSet(((PageHeader)identity.data)->pd_lsn, UINT64_C(0x9000));
+	for (int target = 1; target <= 2; target++) {
+		UT_ASSERT(cluster_space_recovery_prepare(&f.input[2], 1,
+			&f.changes[0].result.identity.key, identity.data,
+			f.pages[target][1].data, order, &out));
+		UT_ASSERT(memcmp(out.pages[0].data, identity.data, BLCKSZ) == 0);
+		UT_ASSERT(memcmp(out.pages[1].data, f.pages[2][1].data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(out.source_index[0], UINT32_MAX);
+		UT_ASSERT_EQ(out.source_index[1], 0);
+		UT_ASSERT_EQ(out.apply_mask, target == 2 ? 0 : 2);
+	}
+	UT_ASSERT(!cluster_space_recovery_prepare(&f.input[2], 1,
+		&f.changes[0].result.identity.key, f.pages[3][0].data,
+		f.pages[1][1].data, order, &out));
+}
+
+UT_TEST(test_recovery_requires_both_typed_before_chains)
+{
+	RecoveryFixture f;
+	ClusterSpaceRecoveryImage out;
+	ClusterSpaceStructureChange wrong;
+	uint32 order[5];
+
+	recovery_fixture(&f);
+	wrong.identity = f.identities[2];
+	wrong.reservation = f.changes[2];
+	wrong.identity.before_token = 777;
+	UT_ASSERT(cluster_space_structure_wal_encode(&wrong, f.wal[2], sizeof(f.wal[2])));
+	UT_ASSERT(!cluster_space_recovery_prepare(f.input, 5, &wrong.identity.result.key,
+		f.pages[1][0].data, f.pages[1][1].data, order, &out));
+	recovery_fixture(&f);
+	wrong.identity = f.identities[2];
+	wrong.reservation = f.changes[2];
+	wrong.reservation.before.next_block++;
+	UT_ASSERT(cluster_space_structure_wal_encode(&wrong, f.wal[2], sizeof(f.wal[2])));
+	UT_ASSERT(!cluster_space_recovery_prepare(f.input, 5, &wrong.identity.result.key,
+		f.pages[1][0].data, f.pages[1][1].data, order, &out));
+}
+
 int
 main(void)
 {
-	UT_PLAN(10);
+	UT_PLAN(15);
 	UT_RUN(test_literal_unaligned_payload_and_wal);
 	UT_RUN(test_crc_reserved_namespace_and_refusal_atomicity);
 	UT_RUN(test_exact_page_class_and_header);
@@ -399,6 +622,11 @@ main(void)
 	UT_RUN(test_structural_record_binds_both_identities_and_actions);
 	UT_RUN(test_structural_preflight_never_partially_changes_outputs);
 	UT_RUN(test_structural_partial_restart_and_init);
+	UT_RUN(test_recovery_closed_chain_and_independent_partial_pages);
+	UT_RUN(test_recovery_missing_duplicate_fork_and_cycle_refuse);
+	UT_RUN(test_recovery_unknown_target_and_namespace_preserve_outputs);
+	UT_RUN(test_recovery_advance_suffix_preserves_unchanged_identity);
+	UT_RUN(test_recovery_requires_both_typed_before_chains);
 	UT_DONE();
 	return ut_failed_count != 0;
 }
