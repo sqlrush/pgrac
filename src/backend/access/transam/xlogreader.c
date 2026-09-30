@@ -788,6 +788,7 @@ XLogDecodeNextRecord(XLogReaderState *state, bool nonblocking)
 
 	/* reset error state */
 	state->errormsg_buf[0] = '\0';
+	state->cluster_record_crc_failed = false;
 	decoded = NULL;
 
 	state->abortedRecPtr = InvalidXLogRecPtr;
@@ -1506,6 +1507,7 @@ ValidXLogRecord(XLogReaderState *state, XLogRecord *record, XLogRecPtr recptr)
 
 	if (!EQ_CRC32C(record->xl_crc, crc))
 	{
+		state->cluster_record_crc_failed = true;
 		report_invalid_record(state,
 							  "incorrect resource manager data checksum in record at %X/%X",
 							  LSN_FORMAT_ARGS(recptr));
@@ -1706,6 +1708,7 @@ XLogReaderResetError(XLogReaderState *state)
 {
 	state->errormsg_buf[0] = '\0';
 	state->errormsg_deferred = false;
+	state->cluster_record_crc_failed = false;
 }
 
 /*
@@ -1957,6 +1960,7 @@ ResetDecoder(XLogReaderState *state)
 	/* Clear error state. */
 	state->errormsg_buf[0] = '\0';
 	state->errormsg_deferred = false;
+	state->cluster_record_crc_failed = false;
 }
 
 /*

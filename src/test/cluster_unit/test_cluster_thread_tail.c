@@ -107,6 +107,7 @@ static WalTestRecord changed_prefix;
 static ssize_t tail_test_pread(int fd, void *bytes, size_t len, off_t offset);
 static int tail_test_close(int fd);
 static void overwrite(XLogRecPtr position, const void *bytes, size_t len);
+static ClusterControlRootResult startup_observe(ClusterWalStartupObservation *out);
 
 void
 pg_re_throw(void)
@@ -447,8 +448,65 @@ UT_TEST(unacknowledged_torn_tail_is_not_lost_commit)
 	UT_ASSERT_EQ(out.complete_end, p.exclusive_end);
 }
 
-/* A complete corrupt record is positive evidence of broken input, even when
- * a prior record has already satisfied the selected lower bound. */
+UT_TEST(full_size_segment_partial_last_record_is_native_eof)
+{
+	/* XLogWrite writes whole pages. A later inserter may have copied its
+	 * valid header (including CRC) but not its body when that page is flushed.
+	 * Keep the segment at full size; a truncate/short-read test misses this. */
+	for (unsigned copied = 0; copied < 3; copied++) {
+		WalTestRecord p, partial;
+		ClusterWalTailObservation out;
+		ClusterWalStartupObservation startup;
+		char path[MAXPGPATH];
+		struct stat st;
+		char zeros[256] = {0};
+		size_t prefix = copied == 0 ? 0 : copied == 1 ? 5 : 103;
+		XLogRecPtr incomplete;
+		fixture();
+		p = base_record();
+		partial = record_write(generation, p.exclusive_end, p.record_start, 200);
+		incomplete = partial.record_start + SizeOfXLogRecord + prefix;
+		overwrite(incomplete, zeros, partial.exclusive_end - incomplete);
+		segment_path(partial.record_start, path);
+		UT_ASSERT_EQ(stat(path, &st), 0);
+		UT_ASSERT_EQ(st.st_size, wal_segment_size);
+		UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(out.complete_end, p.exclusive_end);
+		UT_ASSERT_EQ(out.records, 1);
+		UT_ASSERT_EQ(cluster_wal_tail_observe_checkpoint(scratch, &ref, wal_segment_size,
+			p.record_start, p.exclusive_end, p.record_start, p.record_crc, &out),
+			CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(startup_observe(&startup), CLUSTER_CONTROL_ROOT_OK_PRIMARY);
+		UT_ASSERT_EQ(startup.tail.complete_end, p.exclusive_end);
+		UT_ASSERT_EQ(startup.tail.records, 1);
+		/* An exact known bound or initialized successor makes this a gap,
+		 * even though native end-of-log heuristics alone cannot tell. */
+		UT_ASSERT_EQ(observe(partial.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+		(void)record_write(generation, wal_segment_size + XLOG_BLCKSZ + SizeOfXLogShortPHD,
+						 partial.record_start, 40);
+		UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+		UT_ASSERT_EQ(startup_observe(&startup), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+	}
+}
+
+UT_TEST(crc_failure_before_same_page_valid_successor_is_not_eof)
+{
+	WalTestRecord a, b, c;
+	ClusterWalTailObservation out;
+	ClusterWalStartupObservation startup;
+	uint8 damaged = 0x72;
+	fixture();
+	a = base_record();
+	b = record_write(generation, a.exclusive_end, a.record_start, 40);
+	c = record_write(generation, b.exclusive_end, b.record_start, 40);
+	UT_ASSERT_EQ(a.record_start / XLOG_BLCKSZ, c.exclusive_end / XLOG_BLCKSZ);
+	overwrite(b.record_start + SizeOfXLogRecord + 2, &damaged, 1);
+	UT_ASSERT_EQ(observe(a.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+	UT_ASSERT_EQ(startup_observe(&startup), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+}
+
+/* A CRC failure before a known bound is broken input. Physical file length
+ * alone does not prove that a later inserter completed its record body. */
 UT_TEST(complete_corrupt_suffix_is_not_a_normal_tail)
 {
 	for (int fault = 0; fault < 4; ++fault) {
@@ -468,7 +526,8 @@ UT_TEST(complete_corrupt_suffix_is_not_a_normal_tail)
 			uint32 zero_length = 0;
 			overwrite(next.record_start, &zero_length, sizeof(zero_length));
 		}
-		UT_ASSERT_EQ(observe(p.exclusive_end, &out), CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
+		UT_ASSERT_EQ(observe(fault == 0 ? next.exclusive_end : p.exclusive_end, &out),
+					 CLUSTER_CONTROL_ROOT_BAD_RECORD_CRC);
 	}
 }
 
@@ -1241,6 +1300,9 @@ UT_TEST(startup_preserves_physical_failure_and_cancellation_boundaries)
 		} else if (fault == 1) {
 			uint8 damaged = 0x73;
 			overwrite(first.record_start + SizeOfXLogRecord + 2, &damaged, 1);
+			/* Without a known successor this can be the first torn insert. */
+			(void)record_write(generation, wal_segment_size + XLOG_BLCKSZ + SizeOfXLogShortPHD,
+							 first.record_start, 24);
 		}
 		else if (fault == 2) {
 			changed_prefix = record_write(generation, first.exclusive_end, first.record_start, 40);
@@ -1440,7 +1502,7 @@ UT_TEST(sealed_reader_refuses_changed_cut_and_discards_provisional_output)
 int
 main(void)
 {
-	UT_PLAN(49);
+	UT_PLAN(51);
 	UT_RUN(later_segment_must_match_exact_source_identity);
 	UT_RUN(later_segment_scan_preserves_failure_cleanup_and_namespace);
 	UT_RUN(missing_unpromised_middle_segment_is_not_a_tail);
@@ -1469,6 +1531,8 @@ main(void)
 	UT_RUN(native_tail_needs_claim_and_wal_without_a_flush_sidefile);
 	UT_RUN(loss_beyond_every_known_bound_is_a_media_failure_boundary);
 	UT_RUN(unacknowledged_torn_tail_is_not_lost_commit);
+	UT_RUN(full_size_segment_partial_last_record_is_native_eof);
+	UT_RUN(crc_failure_before_same_page_valid_successor_is_not_eof);
 	UT_RUN(complete_corrupt_suffix_is_not_a_normal_tail);
 	UT_RUN(unwritten_gap_before_initialized_page_is_not_a_tail);
 	UT_RUN(whole_segment_loss_refuses_a_known_root_bound);

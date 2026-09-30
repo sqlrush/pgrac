@@ -6368,6 +6368,62 @@ v2_checkpoint_wal_record(const ClusterControlRootIdentity *self, ControlFileData
 	v2_checkpoint_prefix_write();
 }
 
+/* A full-size segment and full page write with a valid last record header,
+ * but only five body bytes copied by its inserter.  This is deliberately not
+ * a short read or a substituted XLogReader result. */
+static void
+v2_incomplete_wal_tail(const ClusterControlRootIdentity *self, TimeLineID tli,
+					   uint32 segment_size, XLogRecPtr start, XLogRecPtr previous)
+{
+	uint8 page[XLOG_BLCKSZ], body[66];
+	XLogRecord record = { 0 };
+	XLogLongPageHeaderData header = { 0 };
+	XLogRecPtr page_start = start - start % XLOG_BLCKSZ;
+	XLogSegNo segno;
+	char path[MAXPGPATH], filename[MAXFNAMELEN];
+	struct stat st;
+	int fd;
+
+	UT_ASSERT(start % XLOG_BLCKSZ + SizeOfXLogRecord + sizeof(body) < XLOG_BLCKSZ);
+	XLByteToSeg(start, segno, segment_size);
+	XLogFileName(filename, tli, segno, segment_size);
+	snprintf(path, sizeof(path), "%s/thread_%u/generation_" UINT64_FORMAT "/%s",
+			 cluster_wal_threads_dir, self->origin_thread_id, self->origin_owner_incarnation,
+			 filename);
+	fd = open(path, O_RDWR | O_CREAT, 0600);
+	UT_ASSERT(fd >= 0);
+	UT_ASSERT_EQ(ftruncate(fd, segment_size), 0);
+	UT_ASSERT_EQ(pread(fd, page, sizeof(page), page_start % segment_size), sizeof(page));
+	if (((XLogPageHeader)page)->xlp_magic == 0) {
+		header.std.xlp_magic = XLOG_PAGE_MAGIC;
+		header.std.xlp_info = page_start % segment_size == 0 ? XLP_LONG_HEADER : 0;
+		header.std.xlp_tli = tli;
+		header.std.xlp_thread_id = self->origin_thread_id;
+		header.std.xlp_pageaddr = page_start;
+		header.xlp_sysid = self->system_identifier;
+		header.xlp_seg_size = segment_size;
+		header.xlp_xlog_blcksz = XLOG_BLCKSZ;
+		memcpy(page, &header, XLogPageHeaderSize(&header.std));
+	}
+	memset(body, 0x53, sizeof(body));
+	body[0] = XLR_BLOCK_ID_DATA_SHORT;
+	body[1] = sizeof(body) - 2;
+	record.xl_tot_len = SizeOfXLogRecord + sizeof(body);
+	record.xl_prev = previous;
+	record.xl_rmid = RM_XLOG_ID;
+	record.xl_info = XLOG_NOOP;
+	INIT_CRC32C(record.xl_crc);
+	COMP_CRC32C(record.xl_crc, body, sizeof(body));
+	COMP_CRC32C(record.xl_crc, &record, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(record.xl_crc);
+	memcpy(page + start % XLOG_BLCKSZ, &record, SizeOfXLogRecord);
+	memcpy(page + start % XLOG_BLCKSZ + SizeOfXLogRecord, body, 5);
+	UT_ASSERT_EQ(pwrite(fd, page, sizeof(page), page_start % segment_size), sizeof(page));
+	UT_ASSERT_EQ(fstat(fd, &st), 0);
+	UT_ASSERT_EQ(st.st_size, segment_size);
+	UT_ASSERT_EQ(close(fd), 0);
+}
+
 /* Each fixture selects a fresh logical stream at the same test-only pathname.
  * Do not retain initialized future segments from an earlier cross-segment
  * case: those correctly prove a known WAL gap to the production tail reader.
@@ -11255,7 +11311,7 @@ pending_worker_interrupt_after_first_sync(void)
 
 UT_TEST(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_horizon)
 {
-	for (unsigned fault = 0; fault < 6; fault++) {
+	for (unsigned fault = 0; fault < 7; fault++) {
 		ClusterRecoverySerialGuard serial;
 		ClusterWalInitializerInput out;
 		char path[MAXPGPATH];
@@ -11280,9 +11336,12 @@ UT_TEST(test_runtime_pending_native_inspection_uses_selected_origin_and_sealed_h
 			path_for(path, sizeof(path), "native_side/origin_0/pg_subtrans/0000");
 			UT_ASSERT_EQ(unlink(path), 0);
 			UT_ASSERT_EQ(symlink("../pg_xact/0000", path), 0);
+		} else if (fault == 6) {
+			v2_incomplete_wal_tail(&op.claim.identity, op.timeline, op.segment_size,
+							   op.first_segment_lsn + SizeOfXLogLongPHD, 0);
 		}
 		memset(&out, 0xa5, sizeof(out));
-		if (fault == 0) {
+		if (fault == 0 || fault == 6) {
 			ControlRootImage current;
 			ControlFileData projected;
 			ClusterControlRootFileToken token;
@@ -11648,6 +11707,11 @@ UT_TEST(test_runtime_pending_owner_reads_actual_empty_and_checkpoint_wal)
 			UT_ASSERT(fd >= 0);
 			UT_ASSERT_EQ(pwrite(fd, &damaged, 1, SizeOfXLogLongPHD + SizeOfXLogRecord + 2), 1);
 			UT_ASSERT_EQ(close(fd), 0);
+			/* INITIALIZING does not claim this first checkpoint completed.
+			 * A later initialized page is the positive missing-input proof. */
+			v2_incomplete_wal_tail(&op.claim.identity, op.timeline, op.segment_size,
+							   op.first_segment_lsn + XLOG_BLCKSZ + SizeOfXLogShortPHD,
+							   op.first_segment_lsn + SizeOfXLogLongPHD);
 		}
 		if (scenario == 2) {
 			UT_ASSERT(cluster_control_root_v3_initializer_observe(
@@ -12004,6 +12068,8 @@ UT_TEST(test_runtime_v3_failure_worker_seals_then_acquires_fresh_replay_owners)
 	ClusterControlRootReadToken token;
 	v2_failure_fixture(before, &request, false);
 	runtime_fixture_version3(before);
+	v2_incomplete_wal_tail(&request.duty, test_checkpoint_prefix_ref.timeline, wal_segment_size,
+						   test_checkpoint_end, test_checkpoint_prefix.record_start);
 	memset(&eligibility, 0, sizeof(eligibility));
 	eligibility.origin_thread = 1;
 	eligibility.attempt_stamp = 123;
@@ -17076,6 +17142,19 @@ UT_TEST(test_bootstrap_v3_pending_is_never_missing_from_capacity)
 		UT_ASSERT_EQ(bootstrap_read_refused(0), CLUSTER_CONTROL_ROOT_ABSENT);
 	}
 	bootstrap_pending_fixture(&f, CLUSTER_WAL_STARTUP_INITIALIZING, paths);
+	{
+		ControlRootImage root;
+		ClusterWalStartupImage pending;
+		UT_ASSERT_EQ(cluster_control_root_v3_decode(f.before, sizeof(f.before), v2_storage,
+													 TEST_SYSID, &root), 0);
+		test_cf_grant = true;
+		test_cf_mode = ShareLock;
+		UT_ASSERT_EQ(cluster_wal_startup_read_locked(&root, 127, &pending), 0);
+		test_cf_grant = false;
+		test_cf_mode = NoLock;
+		v2_incomplete_wal_tail(&pending.claim.identity, pending.timeline, pending.segment_size,
+							   pending.first_segment_lsn + SizeOfXLogLongPHD, 0);
+	}
 	/* Discovery includes another origin's pending capacity without inferring
 	 * EMPTY or reading a flush sidefile. Its runtime owner checks native WAL. */
 	UT_ASSERT_EQ(cluster_control_bootstrap_read(bootstrap_local, test_root, test_wal_root, 0, &out), 0);

@@ -216,10 +216,42 @@ wal_tail_page(XLogReaderState *reader, XLogRecPtr pageptr, int required,
 	return (int)used;
 }
 
-/* The decoder also stops at a zero record header within an initialized page.
- * Accept only an entirely unwritten suffix; an invalid length, previous link,
- * CRC or decoded body is not an incomplete final write. No message matching
- * or stale read buffer is used to classify a decoder error. */
+/* A CRC-valid successor linked to the failed record is positive evidence of
+ * written input even within the same page.  This is only a refusal witness,
+ * never permission to decode/apply the successor or skip the damaged record. */
+static bool
+wal_tail_has_same_page_successor(const WalTailWork *work, size_t offset)
+{
+	const char *page = work->reader->readBuf;
+	XLogRecord failed, next;
+	size_t successor;
+	pg_crc32c crc;
+
+	if (work->page_bytes - offset < SizeOfXLogRecord)
+		return false;
+	memcpy(&failed, page + offset, SizeOfXLogRecord);
+	if (failed.xl_tot_len < SizeOfXLogRecord
+		|| failed.xl_tot_len > work->page_bytes - offset)
+		return false;
+	successor = MAXALIGN(offset + failed.xl_tot_len);
+	if (successor > work->page_bytes || work->page_bytes - successor < SizeOfXLogRecord)
+		return false;
+	memcpy(&next, page + successor, SizeOfXLogRecord);
+	if (next.xl_prev != work->page_read_at + offset || next.xl_tot_len < SizeOfXLogRecord
+		|| next.xl_tot_len > work->page_bytes - successor)
+		return false;
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, page + successor + SizeOfXLogRecord, next.xl_tot_len - SizeOfXLogRecord);
+	COMP_CRC32C(crc, page + successor, offsetof(XLogRecord, xl_crc));
+	FIN_CRC32C(crc);
+	return EQ_CRC32C(next.xl_crc, crc);
+}
+
+/* XLogWrite writes whole pages: a later inserter can leave a valid record
+ * header but an incomplete body in the last initialized page.  Native CRC
+ * failure there can be EOF, just like an entirely unwritten record suffix.
+ * Known input bounds and initialized successor pages are checked separately.
+ * Invalid headers/links and CRC-valid malformed bodies remain refusals. */
 static bool
 wal_tail_normal_end(const WalTailWork *work)
 {
@@ -239,8 +271,11 @@ wal_tail_normal_end(const WalTailWork *work)
 	header_size = XLogPageHeaderSize(header);
 	if (offset == 0)
 		offset = header_size;
-	return offset >= header_size && offset < work->page_bytes
-		   && wal_tail_zero(reader->readBuf + offset, work->page_bytes - offset);
+	if (offset < header_size || offset >= work->page_bytes)
+		return false;
+	if (reader->cluster_record_crc_failed)
+		return !wal_tail_has_same_page_successor(work, offset);
+	return wal_tail_zero(reader->readBuf + offset, work->page_bytes - offset);
 }
 
 static bool
