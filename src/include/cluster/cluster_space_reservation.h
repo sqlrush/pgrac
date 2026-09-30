@@ -20,6 +20,7 @@
 #define CLUSTER_SPACE_RESERVATION_FORMAT 1
 #define CLUSTER_SPACE_RESERVATION_WAL_BYTES 368
 #define CLUSTER_SPACE_RESERVATION_WAL_MAGIC UINT32_C(0x31565350)
+#define CLUSTER_SPACE_STRUCTURE_WAL_BYTES (CLUSTER_SPACE_WAL_BYTES + CLUSTER_SPACE_RESERVATION_WAL_BYTES)
 
 /* In-memory fields, never copied as a disk/wire structure. InvalidBlockNumber
  * is a valid exhausted exclusive upper bound, not an allocatable block. */
@@ -44,6 +45,11 @@ typedef struct ClusterSpaceReservationChange {
 	ClusterSpaceReservation before;
 	ClusterSpaceReservation result;
 } ClusterSpaceReservationChange;
+
+typedef struct ClusterSpaceStructureChange {
+	ClusterSpaceWalChange identity;
+	ClusterSpaceReservationChange reservation;
+} ClusterSpaceStructureChange;
 
 /* Pure representation and byte transitions only. No allocation, authority,
  * I/O, WAL insertion, grant, durability or retention decision. Every refusal
@@ -73,6 +79,21 @@ extern ClusterSpaceIdentityTransition
 cluster_space_reservation_apply(const ClusterSpaceReservationChange *change,
 								const ClusterSpaceIdentityKey *expected,
 								void *page, size_t length);
+
+/* One structural record binds both independently versioned SPACE pages.
+ * Both private images must pass before either output changes. Exact result
+ * on just one component is a restartable partial installation, not permission
+ * to skip the other component or the original owner's physical action.
+ * apply_mask bit0/bit1 identifies changed pages; output is untouched on refusal. */
+extern bool cluster_space_structure_wal_encode(const ClusterSpaceStructureChange *change,
+											void *bytes, size_t length);
+extern bool cluster_space_structure_wal_decode(const void *bytes, size_t length,
+											ClusterSpaceStructureChange *out);
+extern ClusterSpaceIdentityTransition
+cluster_space_structure_apply(const ClusterSpaceStructureChange *change,
+							  const ClusterSpaceIdentityKey *expected,
+							  void *identity_page, void *reservation_page,
+							  size_t length, uint8 *apply_mask);
 
 #endif
 #endif

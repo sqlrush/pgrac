@@ -341,4 +341,91 @@ cluster_space_reservation_apply(const ClusterSpaceReservationChange *change,
 		return CLUSTER_SPACE_IDENTITY_INVALID;
 	return CLUSTER_SPACE_IDENTITY_APPLY;
 }
+
+/* Both subrecords have already passed their own codec. Compare canonical
+ * identity bytes, including all UUID bytes, never in-memory struct padding. */
+static bool
+structure_matches(const ClusterSpaceStructureChange *change, const uint8 *encoded)
+{
+	const ClusterSpaceWalChange *id = &change->identity;
+	const ClusterSpaceReservationChange *r = &change->reservation;
+	const uint8 *reservation = encoded + CLUSTER_SPACE_WAL_BYTES;
+
+	if (id->result_token != r->result_token
+		|| memcmp(encoded + 160, reservation + 208 + 24, CLUSTER_SPACE_IDENTITY_BYTES) != 0)
+		return false;
+	if (id->action == CLUSTER_SPACE_WAL_CREATE)
+		return r->action == CLUSTER_SPACE_RESERVATION_INIT;
+	if (memcmp(encoded + 32, reservation + 48 + 24, CLUSTER_SPACE_IDENTITY_BYTES) != 0)
+		return false;
+	if (id->action == CLUSTER_SPACE_WAL_TRUNCATE)
+		return r->action == CLUSTER_SPACE_RESERVATION_RESET && id->nblocks == r->result.next_block;
+	return id->action == CLUSTER_SPACE_WAL_TOMBSTONE
+		&& r->action == CLUSTER_SPACE_RESERVATION_TOMBSTONE;
+}
+
+bool
+cluster_space_structure_wal_encode(const ClusterSpaceStructureChange *change,
+									void *bytes, size_t length)
+{
+	uint8 encoded[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+
+	if (change == NULL || bytes == NULL || length != sizeof(encoded)
+		|| !cluster_space_wal_encode(&change->identity, encoded, CLUSTER_SPACE_WAL_BYTES)
+		|| !cluster_space_reservation_wal_encode(&change->reservation,
+			encoded + CLUSTER_SPACE_WAL_BYTES, CLUSTER_SPACE_RESERVATION_WAL_BYTES)
+		|| !structure_matches(change, encoded))
+		return false;
+	memcpy(bytes, encoded, sizeof(encoded));
+	return true;
+}
+
+bool
+cluster_space_structure_wal_decode(const void *bytes, size_t length, ClusterSpaceStructureChange *out)
+{
+	const uint8 *encoded = bytes;
+	ClusterSpaceStructureChange decoded = {0};
+
+	if (bytes == NULL || out == NULL || length != CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+		|| !cluster_space_wal_decode(encoded, CLUSTER_SPACE_WAL_BYTES, &decoded.identity)
+		|| !cluster_space_reservation_wal_decode(encoded + CLUSTER_SPACE_WAL_BYTES,
+			CLUSTER_SPACE_RESERVATION_WAL_BYTES, &decoded.reservation)
+		|| !structure_matches(&decoded, encoded))
+		return false;
+	*out = decoded;
+	return true;
+}
+
+ClusterSpaceIdentityTransition
+cluster_space_structure_apply(const ClusterSpaceStructureChange *change,
+							  const ClusterSpaceIdentityKey *expected,
+							  void *identity_page, void *reservation_page, size_t length, uint8 *apply_mask)
+{
+	PGAlignedBlock prepared[2];
+	ClusterSpaceIdentityTransition id, reservation;
+	uint8 encoded[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+	uintptr_t a = (uintptr_t) identity_page, b = (uintptr_t) reservation_page;
+	uint8 mask;
+
+	if (identity_page == NULL || reservation_page == NULL || length != BLCKSZ || apply_mask == NULL
+		|| (a <= b ? b - a : a - b) < BLCKSZ
+		|| !cluster_space_structure_wal_encode(change, encoded, sizeof(encoded)))
+		return CLUSTER_SPACE_IDENTITY_INVALID;
+	memcpy(prepared[0].data, identity_page, BLCKSZ);
+	memcpy(prepared[1].data, reservation_page, BLCKSZ);
+	id = cluster_space_wal_apply(&change->identity, expected, prepared[0].data, BLCKSZ);
+	if (id != CLUSTER_SPACE_IDENTITY_APPLY && id != CLUSTER_SPACE_IDENTITY_ALREADY)
+		return id;
+	reservation = cluster_space_reservation_apply(&change->reservation, expected, prepared[1].data, BLCKSZ);
+	if (reservation != CLUSTER_SPACE_IDENTITY_APPLY && reservation != CLUSTER_SPACE_IDENTITY_ALREADY)
+		return reservation;
+	mask = (id == CLUSTER_SPACE_IDENTITY_APPLY ? 1 : 0)
+		| (reservation == CLUSTER_SPACE_IDENTITY_APPLY ? 2 : 0);
+	if (mask & 1)
+		memcpy(identity_page, prepared[0].data, BLCKSZ);
+	if (mask & 2)
+		memcpy(reservation_page, prepared[1].data, BLCKSZ);
+	*apply_mask = mask;
+	return mask == 0 ? CLUSTER_SPACE_IDENTITY_ALREADY : CLUSTER_SPACE_IDENTITY_APPLY;
+}
 #endif

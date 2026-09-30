@@ -449,7 +449,7 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 	if (rel != &smgr || forknum != SPACE_FORKNUM)
 		abort();
 	size_calls++;
-	return 1;
+	return 2;
 }
 
 Buffer

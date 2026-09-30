@@ -17,6 +17,7 @@
 #include "catalog/storage_xlog.h"
 #ifdef USE_PGRAC_CLUSTER
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_space_reservation.h"
 #endif
 
 
@@ -30,13 +31,13 @@ smgr_desc(StringInfo buf, XLogReaderState *record)
 	/* PGRAC: describe the typed payload only after exact structural decode. */
 	if (info == XLOG_SMGR_SPACE_IDENTITY)
 	{
-		ClusterSpaceWalChange change;
+		ClusterSpaceStructureChange change;
 
-		if (cluster_space_wal_decode(rec, XLogRecGetDataLen(record), &change))
-			appendStringInfo(buf, "%u/%u/%u space action %u sequence " UINT64_FORMAT,
-				change.result.key.locator.spcOid, change.result.key.locator.dbOid,
-				change.result.key.locator.relNumber, (unsigned)change.action,
-				change.result.sequence);
+		if (cluster_space_structure_wal_decode(rec, XLogRecGetDataLen(record), &change))
+			appendStringInfo(buf, "%u/%u/%u space action %u sequence " UINT64_FORMAT " reserved %u",
+				change.identity.result.key.locator.spcOid, change.identity.result.key.locator.dbOid,
+				change.identity.result.key.locator.relNumber, (unsigned)change.identity.action,
+				change.identity.result.sequence, change.reservation.result.next_block);
 		else
 			appendStringInfoString(buf, "invalid SPACE identity");
 		return;

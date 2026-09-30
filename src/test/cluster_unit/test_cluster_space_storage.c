@@ -26,6 +26,7 @@
 #include "cluster/cluster_ko.h"
 #include "cluster/cluster_page_producer.h"
 #include "cluster/cluster_space_storage.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
@@ -41,7 +42,7 @@ UT_DEFINE_GLOBALS();
 
 bool cluster_shared_config = true, cluster_enabled = true;
 int cluster_node_id = 0;
-int NBuffers = 1, NLocBuffer;
+int NBuffers = 2, NLocBuffer;
 char *BufferBlocks;
 Block *LocalBufferBlockPointers;
 volatile uint32 CritSectionCount;
@@ -52,13 +53,15 @@ BackendId MyBackendId = 1, ParallelLeaderBackendId = InvalidBackendId;
 MemoryContext TopMemoryContext = (MemoryContext)1;
 MemoryContext TopTransactionContext = (MemoryContext)2;
 
-static PGAlignedBlock page;
+static PGAlignedBlock pages[2];
+#define page pages[0]
 static SMgrRelationData storage;
 static ClusterWalSourceRef ref;
-static bool have_ref, shared, exists, recovering, pinned, locked;
+static bool have_ref, shared, exists, recovering;
+static uint8 pinned, locked;
 static unsigned io_calls, create_calls, wal_calls, dirty_calls, release_calls;
 static BlockNumber blocks;
-static uint8 wal_bytes[CLUSTER_SPACE_WAL_BYTES];
+static uint8 wal_bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 static uint8 wal_info;
 static uint32 registered_len;
 static unsigned main_create_calls, unlink_calls;
@@ -179,7 +182,7 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 void
 XLogFlush(XLogRecPtr lsn)
 {
-	if (!recovering || lsn != UINT64_C(0x20000200) || !locked)
+	if (!recovering || lsn != UINT64_C(0x20000200) || locked != 3)
 		abort();
 	flush_calls++;
 }
@@ -230,7 +233,7 @@ smgrtruncate2(SMgrRelation rel, ForkNumber *forks, int nforks, BlockNumber *oldb
 			  BlockNumber *newblocks)
 {
 	if (rel != &storage || nforks != (auxiliary_forks ? 3 : 1) || forks[0] != MAIN_FORKNUM
-		|| !locked || !pinned || CritSectionCount == 0 || flush_calls != truncate_calls + 1
+		|| locked != 3 || pinned != 3 || CritSectionCount == 0 || flush_calls != truncate_calls + 1
 		|| oldblocks[0] != main_blocks || newblocks[0] != 4)
 		abort();
 	if (auxiliary_forks
@@ -246,50 +249,56 @@ ReadBufferWithoutRelcache(RelFileLocator tag, ForkNumber forknum, BlockNumber bl
 						  ReadBufferMode mode, BufferAccessStrategy strategy, bool permanent)
 {
 	if (!RelFileLocatorEquals(tag, locator) || forknum != SPACE_FORKNUM || strategy != NULL
-		|| !permanent || pinned)
+		|| !permanent)
 		abort();
 	if (block == P_NEW) {
-		if (blocks != 0 || mode != RBM_ZERO_AND_LOCK)
+		if (blocks > 1 || mode != RBM_ZERO_AND_LOCK)
 			abort();
-		blocks = 1;
-		locked = true;
-	} else if (block != 0 || blocks != 1 || mode != RBM_NORMAL)
+		block = blocks++;
+		locked |= 1 << block;
+	} else if (block > 1 || block >= blocks || mode != RBM_NORMAL)
 		abort();
-	pinned = true;
-	return 1;
+	if (pinned & (1 << block))
+		abort();
+	pinned |= 1 << block;
+	return block + 1;
 }
 
 BlockNumber
 BufferGetBlockNumber(Buffer buffer)
 {
-	if (buffer != 1 || !pinned)
+	if (buffer < 1 || buffer > 2 || !(pinned & (1 << (buffer - 1))))
 		abort();
-	return 0;
+	return buffer - 1;
 }
 
 void
 LockBuffer(Buffer buffer, int mode)
 {
-	if (buffer != 1 || !pinned || locked
+	if (buffer < 1 || buffer > 2 || !(pinned & (1 << (buffer - 1))) || (locked & (1 << (buffer - 1)))
 		|| (mode != BUFFER_LOCK_EXCLUSIVE && mode != BUFFER_LOCK_SHARE))
 		abort();
-	locked = true;
+	locked |= 1 << (buffer - 1);
 }
 
 void
 UnlockReleaseBuffer(Buffer buffer)
 {
-	if (buffer != 1 || !pinned || !locked || CritSectionCount != 0)
+	if (buffer < 1 || buffer > 2 || !(pinned & (1 << (buffer - 1)))
+		|| !(locked & (1 << (buffer - 1))) || CritSectionCount != 0)
 		abort();
-	pinned = locked = false;
+	pinned &= ~(1 << (buffer - 1));
+	locked &= ~(1 << (buffer - 1));
 	release_calls++;
 }
 
 void
 MarkBufferDirty(Buffer buffer)
 {
-	if (buffer != 1 || !pinned || !locked || CritSectionCount != 1
-		|| !cluster_space_identity_page_valid(page.data, BLCKSZ))
+	if (buffer < 1 || buffer > 2 || !(pinned & (1 << (buffer - 1)))
+		|| !(locked & (1 << (buffer - 1))) || CritSectionCount != 1
+		|| (buffer == 1 ? !cluster_space_identity_page_valid(page.data, BLCKSZ)
+			: !cluster_space_reservation_page_valid(pages[1].data, BLCKSZ)))
 		abort();
 	dirty_calls++;
 }
@@ -307,7 +316,7 @@ XLogRegisterData(char *bytes, uint32 len)
 	registered_len = len;
 	if (native_owner && len == sizeof(xl_smgr_create) && CritSectionCount == 0)
 		return;
-	if (len != sizeof(wal_bytes) || CritSectionCount != 1)
+	if ((len != sizeof(wal_bytes) && len != CLUSTER_SPACE_WAL_BYTES) || CritSectionCount != 1)
 		abort();
 	memcpy(wal_bytes, bytes, len);
 }
@@ -316,17 +325,25 @@ XLogRecPtr
 XLogInsert(RmgrId rmid, uint8 info)
 {
 	ClusterSpaceWalChange change;
+	ClusterSpaceStructureChange pair;
 	ClusterSpaceIdentity id;
+	ClusterSpaceReservation reservation;
 	uint64 token;
 
 	if (native_owner && info == (XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE)
 		&& registered_len == sizeof(xl_smgr_create) && rmid == RM_SMGR_ID)
 		return UINT64_C(0x10000100);
 	if (rmid != RM_SMGR_ID || CritSectionCount != 1
-		|| !cluster_space_wal_decode(wal_bytes, sizeof(wal_bytes), &change)
+		|| !cluster_space_wal_decode(wal_bytes, CLUSTER_SPACE_WAL_BYTES, &change)
 		|| !cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
 											   &change.result.key, &id, &token)
 		|| token != change.result_token)
+		abort();
+	if (registered_len == CLUSTER_SPACE_STRUCTURE_WAL_BYTES
+		&& (!cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &pair)
+			|| !cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+				&change.result.key, &reservation, &token) || token != change.result_token
+			|| reservation.next_block != 0))
 		abort();
 	wal_calls++;
 	wal_info = info;
@@ -444,7 +461,8 @@ reset(void)
 	if (fake_relation != NULL)
 		abort();
 	fake_allocations = fake_frees = 0;
-	memset(&page, 0, sizeof(page));
+	memset(pages, 0, sizeof(pages));
+	memset(wal_bytes, 0, sizeof(wal_bytes));
 	memset(&storage, 0, sizeof(storage));
 	memset(&ref, 0, sizeof(ref));
 	ref.claim.identity.system_identifier = 1;
@@ -472,22 +490,26 @@ reset(void)
 
 UT_TEST(test_real_create_binds_selected_namespace_and_wal)
 {
-	ClusterSpaceWalChange change;
+	ClusterSpaceStructureChange change = {0};
 
 	reset();
 	UT_ASSERT(cluster_space_relation_create(locator));
 	UT_ASSERT_EQ(create_calls, 1);
 	UT_ASSERT_EQ(wal_calls, 1);
-	UT_ASSERT_EQ(dirty_calls, 1);
-	UT_ASSERT_EQ(release_calls, 1);
+	UT_ASSERT_EQ(dirty_calls, 2);
+	UT_ASSERT_EQ(release_calls, 2);
+	UT_ASSERT_EQ(blocks, 2);
+	UT_ASSERT_EQ(registered_len, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
 	UT_ASSERT(!pinned && !locked);
 	UT_ASSERT_EQ(wal_info, 0x30 | XLR_SPECIAL_REL_UPDATE);
 	UT_ASSERT_EQ(PageGetLSN(page.data), UINT64_C(0x10000200));
 	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 17);
-	UT_ASSERT(cluster_space_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
-	UT_ASSERT_EQ(change.result.key.database_incarnation, 2);
-	UT_ASSERT_EQ(change.result.key.storage_uuid[15], 3);
-	UT_ASSERT_EQ(change.result.incarnation[15], 0x45);
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
+	UT_ASSERT_EQ(change.identity.result.key.database_incarnation, 2);
+	UT_ASSERT_EQ(change.identity.result.key.storage_uuid[15], 3);
+	UT_ASSERT_EQ(change.identity.result.incarnation[15], 0x45);
+	UT_ASSERT(cluster_space_reservation_page_valid(pages[1].data, BLCKSZ));
+	UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x10000200));
 }
 
 UT_TEST(test_no_create_on_legacy_or_unproved_namespace)
@@ -613,7 +635,7 @@ UT_TEST(test_real_replay_exact_duplicate_and_preserved_token)
 	reader.EndRecPtr = UINT64_C(0x20000200);
 	reader.cluster_expected_thread_id = 1;
 	recovering = true;
-	memset(&page, 0, sizeof(page));
+	memset(pages, 0, sizeof(pages));
 	blocks = 0;
 	dirty_calls = 0;
 	/* Legacy merge's SCN stamp must not replace the typed result token. */
@@ -621,10 +643,10 @@ UT_TEST(test_real_replay_exact_duplicate_and_preserved_token)
 	cluster_recmerge_window_scn = 999;
 	UT_ASSERT(cluster_space_relation_redo(&reader));
 	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 17);
-	UT_ASSERT_EQ(dirty_calls, 1);
+	UT_ASSERT_EQ(dirty_calls, 2);
 	saved = page;
 	UT_ASSERT(cluster_space_relation_redo(&reader));
-	UT_ASSERT_EQ(dirty_calls, 1);
+	UT_ASSERT_EQ(dirty_calls, 2);
 	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
 	ref.claim.database_incarnation++;
 	UT_ASSERT(!cluster_space_relation_redo(&reader));
@@ -659,19 +681,29 @@ UT_TEST(test_native_descriptor_recognizes_typed_record)
 static void
 truncate_record(XLogReaderState *reader, DecodedXLogRecord *decoded)
 {
-	ClusterSpaceWalChange change;
+	ClusterSpaceStructureChange pair;
+	ClusterSpaceWalChange *change = &pair.identity;
+	ClusterSpaceReservationChange *reservation = &pair.reservation;
 
 	if (!cluster_space_relation_create(locator)
-		|| !cluster_space_wal_decode(wal_bytes, sizeof(wal_bytes), &change))
+		|| !cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &pair))
 		abort();
-	change.action = CLUSTER_SPACE_WAL_TRUNCATE;
-	change.nblocks = 4;
-	change.expected = change.result;
-	change.before_token = change.result_token;
-	change.result.incarnation[0] ^= 1;
-	change.result.sequence++;
-	change.result.operation = ++change.result_token;
-	if (!cluster_space_wal_encode(&change, wal_bytes, sizeof(wal_bytes)))
+	change->action = CLUSTER_SPACE_WAL_TRUNCATE;
+	change->nblocks = 4;
+	change->expected = change->result;
+	change->before_token = change->result_token;
+	change->result.incarnation[0] ^= 1;
+	change->result.sequence++;
+	change->result.operation = ++change->result_token;
+	reservation->action = CLUSTER_SPACE_RESERVATION_RESET;
+	reservation->before = reservation->result;
+	reservation->before.next_block = 10;
+	reservation->before_token = 99;
+	reservation->result.identity = change->result;
+	reservation->result_token = change->result_token;
+	reservation->first_block = reservation->result.next_block = 4;
+	if (!cluster_space_reservation_page_encode(&reservation->before, 99, pages[1].data, BLCKSZ)
+		|| !cluster_space_structure_wal_encode(&pair, wal_bytes, sizeof(wal_bytes)))
 		abort();
 	memset(decoded, 0, sizeof(*decoded));
 	memset(reader, 0, sizeof(*reader));
@@ -703,7 +735,7 @@ UT_TEST(test_truncate_replay_checks_identity_before_native_shrink)
 	UT_ASSERT(cluster_space_relation_redo(&reader));
 	UT_ASSERT_EQ(truncate_calls, 2);
 	UT_ASSERT(memcmp(&page, &saved, BLCKSZ) == 0);
-	UT_ASSERT_EQ(dirty_calls, 2); /* CREATE and the first TRUNCATE only. */
+	UT_ASSERT_EQ(dirty_calls, 4); /* Two pages, CREATE and first TRUNCATE only. */
 	UT_ASSERT_EQ(fake_allocations, 2);
 	UT_ASSERT_EQ(fake_frees, fake_allocations);
 }
@@ -752,7 +784,7 @@ UT_TEST(test_truncate_replay_preserves_native_auxiliary_forks)
 	UT_ASSERT_EQ(main_blocks, 4);
 	UT_ASSERT_EQ(truncate_calls, 1);
 	UT_ASSERT_EQ(fsm_vacuums, 1);
-	UT_ASSERT_EQ(blocks, 1); /* SPACE was not physically truncated. */
+	UT_ASSERT_EQ(blocks, 2); /* SPACE was not physically truncated. */
 	UT_ASSERT_EQ(fake_allocations, 1);
 	UT_ASSERT_EQ(fake_frees, fake_allocations);
 	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 18);
@@ -816,10 +848,106 @@ UT_TEST(test_subabort_forgets_drop_without_tombstoning)
 	UT_ASSERT_EQ(wal_calls, 1);
 }
 
+UT_TEST(test_create_partial_restart_validates_before_extending)
+{
+	XLogReaderState reader = {0};
+	DecodedXLogRecord decoded = {0};
+	PGAlignedBlock saved;
+	unsigned creates;
+
+	reset();
+	UT_ASSERT(cluster_space_relation_create(locator));
+	decoded.header.xl_rmid = RM_SMGR_ID;
+	decoded.header.xl_info = XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE;
+	decoded.main_data = (char *)wal_bytes;
+	decoded.main_data_len = sizeof(wal_bytes);
+	decoded.max_block_id = -1;
+	reader.record = &decoded;
+	reader.EndRecPtr = UINT64_C(0x20000200);
+	reader.cluster_expected_thread_id = 1;
+	recovering = true;
+	blocks = 1;
+	memset(&pages[1], 0, BLCKSZ);
+	((PageHeader)page.data)->pd_block_scn = 999;
+	saved = page;
+	creates = create_calls;
+	dirty_calls = 0;
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(blocks, 1);
+	UT_ASSERT_EQ(create_calls, creates);
+	UT_ASSERT_EQ(dirty_calls, 0);
+	UT_ASSERT(memcmp(&saved, &page, BLCKSZ) == 0);
+	((PageHeader)page.data)->pd_block_scn = 17;
+	saved = page;
+	UT_ASSERT(cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(blocks, 2);
+	UT_ASSERT_EQ(dirty_calls, 1);
+	UT_ASSERT(memcmp(&saved, &page, BLCKSZ) == 0);
+	UT_ASSERT(cluster_space_reservation_page_valid(pages[1].data, BLCKSZ));
+	decoded.main_data_len = CLUSTER_SPACE_WAL_BYTES;
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(dirty_calls, 1);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_truncate_bad_reservation_cannot_change_identity_or_files)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	ClusterSpaceStructureChange change;
+	PGAlignedBlock saved[2];
+	unsigned dirties;
+
+	reset();
+	truncate_record(&reader, &decoded);
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
+	change.reservation.before.next_block++;
+	UT_ASSERT(cluster_space_reservation_page_encode(&change.reservation.before,
+		change.reservation.before_token, pages[1].data, BLCKSZ));
+	memcpy(saved, pages, sizeof(pages));
+	dirties = dirty_calls;
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT_EQ(truncate_calls, 0);
+	UT_ASSERT_EQ(flush_calls, 0);
+	UT_ASSERT_EQ(dirty_calls, dirties);
+	UT_ASSERT_EQ(main_blocks, 10);
+	UT_ASSERT(memcmp(saved, pages, sizeof(pages)) == 0);
+	UT_ASSERT(!pinned && !locked);
+}
+
+UT_TEST(test_truncate_partial_restart_finishes_original_physical_owner)
+{
+	for (unsigned installed = 0; installed < 4; installed++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		ClusterSpaceStructureChange change;
+
+		reset();
+		truncate_record(&reader, &decoded);
+		UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, sizeof(wal_bytes), &change));
+		if (installed & 1)
+			UT_ASSERT(cluster_space_identity_page_encode(&change.identity.result,
+				change.identity.result_token, page.data, BLCKSZ));
+		if (installed & 2)
+			UT_ASSERT(cluster_space_reservation_page_encode(&change.reservation.result,
+				change.reservation.result_token, pages[1].data, BLCKSZ));
+		dirty_calls = 0;
+		UT_ASSERT(cluster_space_relation_redo(&reader));
+		UT_ASSERT_EQ(truncate_calls, 1);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(main_blocks, 4);
+		UT_ASSERT_EQ(dirty_calls, 2 - ((installed & 1) != 0) - ((installed & 2) != 0));
+		UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, change.identity.result_token);
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, change.reservation.result_token);
+		UT_ASSERT(!pinned && !locked);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(13);
+	setvbuf(stdout, NULL, _IONBF, 0);
+	UT_PLAN(16);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
@@ -833,6 +961,9 @@ main(void)
 	UT_RUN(test_truncate_replay_preserves_native_auxiliary_forks);
 	UT_RUN(test_aborted_drop_keeps_existing_live_identity);
 	UT_RUN(test_subabort_forgets_drop_without_tombstoning);
+	UT_RUN(test_create_partial_restart_validates_before_extending);
+	UT_RUN(test_truncate_bad_reservation_cannot_change_identity_or_files);
+	UT_RUN(test_truncate_partial_restart_finishes_original_physical_owner);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

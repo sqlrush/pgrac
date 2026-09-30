@@ -164,7 +164,7 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 	if (rel != current_src && rel != current_dst)
 		abort();
 	if (rel == current_dst && forknum == SPACE_FORKNUM)
-		return 1;
+		return 2;
 	if (forknum != test_fork)
 		abort();
 	return rel == current_src ? 1 : writes;

@@ -166,6 +166,7 @@
 #include "cluster/cluster_tt_slot.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_recovery_worker.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -3275,12 +3276,12 @@ cluster_record_apply_class(XLogReaderState *r)
 	if (XLogRecGetRmid(r) == RM_SMGR_ID &&
 		(XLogRecGetInfo(r) & ~XLR_INFO_MASK) == XLOG_SMGR_SPACE_IDENTITY)
 	{
-		ClusterSpaceWalChange change;
+		ClusterSpaceStructureChange change;
 
 		if (has_block ||
-			!cluster_space_wal_decode(XLogRecGetData(r), XLogRecGetDataLen(r), &change))
+			!cluster_space_structure_wal_decode(XLogRecGetData(r), XLogRecGetDataLen(r), &change))
 			return CLUSTER_RECMERGE_UNCLASSIFIABLE;
-		first_shared = (cluster_smgr_which_for(change.result.key.locator, InvalidBackendId) == 1);
+		first_shared = (cluster_smgr_which_for(change.identity.result.key.locator, InvalidBackendId) == 1);
 		return cluster_recovery_record_class(RM_SMGR_ID, false, first_shared, true);
 	}
 

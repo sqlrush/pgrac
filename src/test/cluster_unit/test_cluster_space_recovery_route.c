@@ -17,6 +17,7 @@
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_recovery_merge.h"
 #include "cluster/cluster_space_identity.h"
+#include "cluster/cluster_space_reservation.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "unit_test.h"
 
@@ -63,6 +64,7 @@ static void
 record_init(XLogReaderState *reader, DecodedXLogRecord *decoded, uint8 *bytes)
 {
 	ClusterSpaceWalChange change;
+	ClusterSpaceStructureChange pair = {0};
 
 	memset(&change, 0, sizeof(change));
 	change.action = CLUSTER_SPACE_WAL_CREATE;
@@ -76,7 +78,11 @@ record_init(XLogReaderState *reader, DecodedXLogRecord *decoded, uint8 *bytes)
 	change.result.sequence = 1;
 	change.result.operation = 17;
 	change.result.state = CLUSTER_SPACE_IDENTITY_LIVE;
-	if (!cluster_space_wal_encode(&change, bytes, CLUSTER_SPACE_WAL_BYTES))
+	pair.identity = change;
+	pair.reservation.action = CLUSTER_SPACE_RESERVATION_INIT;
+	pair.reservation.result.identity = change.result;
+	pair.reservation.result_token = change.result_token;
+	if (!cluster_space_structure_wal_encode(&pair, bytes, CLUSTER_SPACE_STRUCTURE_WAL_BYTES))
 		abort();
 	memset(reader, 0, sizeof(*reader));
 	memset(decoded, 0, sizeof(*decoded));
@@ -84,7 +90,7 @@ record_init(XLogReaderState *reader, DecodedXLogRecord *decoded, uint8 *bytes)
 	decoded->header.xl_info = XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE;
 	decoded->max_block_id = -1;
 	decoded->main_data = (char *)bytes;
-	decoded->main_data_len = CLUSTER_SPACE_WAL_BYTES;
+	decoded->main_data_len = CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
 	reader->record = decoded;
 	shared = true;
 	routes = 0;
@@ -94,7 +100,7 @@ UT_TEST(test_typed_locator_routes_foreign_wal)
 {
 	XLogReaderState reader;
 	DecodedXLogRecord decoded;
-	uint8 bytes[CLUSTER_SPACE_WAL_BYTES];
+	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
 	record_init(&reader, &decoded, bytes);
 	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_SHARED);
@@ -108,7 +114,7 @@ UT_TEST(test_invalid_typed_record_is_not_local_or_shared)
 {
 	XLogReaderState reader;
 	DecodedXLogRecord decoded;
-	uint8 bytes[CLUSTER_SPACE_WAL_BYTES];
+	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
 	record_init(&reader, &decoded, bytes);
 	decoded.main_data_len--;
@@ -117,13 +123,21 @@ UT_TEST(test_invalid_typed_record_is_not_local_or_shared)
 	bytes[240] ^= 1;
 	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
 	UT_ASSERT_EQ(routes, 0);
+	record_init(&reader, &decoded, bytes);
+	decoded.main_data_len = CLUSTER_SPACE_WAL_BYTES;
+	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
+	UT_ASSERT_EQ(routes, 0);
+	record_init(&reader, &decoded, bytes);
+	bytes[CLUSTER_SPACE_WAL_BYTES + 208 + 16] ^= 1;
+	UT_ASSERT_EQ(cluster_record_apply_class(&reader), CLUSTER_RECMERGE_UNCLASSIFIABLE);
+	UT_ASSERT_EQ(routes, 0);
 }
 
 UT_TEST(test_block_reference_cannot_bypass_typed_validation)
 {
 	XLogReaderState reader;
 	DecodedXLogRecord decoded;
-	uint8 bytes[CLUSTER_SPACE_WAL_BYTES];
+	uint8 bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
 
 	record_init(&reader, &decoded, bytes);
 	decoded.max_block_id = 0;
