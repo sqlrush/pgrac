@@ -8,6 +8,8 @@
  */
 #include "postgres.h"
 
+#include <setjmp.h>
+
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "cluster/cluster_side_undo.h"
@@ -28,6 +30,8 @@ static bool writeback, full_page_writes;
 static XLogRecPtr checkpoint_redo;
 static PGPROC test_proc;
 PGPROC *MyProc = &test_proc;
+static jmp_buf panic_jump;
+static bool expect_panic;
 
 void
 ExceptionalCondition(const char *condition, const char *file, int line)
@@ -82,8 +86,92 @@ GetRedoRecPtr(void)
 }
 
 #undef ereport
-#define ereport(level_, rest_) abort()
+#define ereport(level_, rest_) \
+	do { if (expect_panic) longjmp(panic_jump, 1); abort(); } while (0)
 #include "test_cluster_undo_producer_owner.inc"
+
+/* Execute the actual native block writer; only path and physical I/O are
+ * fixture boundaries. The production dispatcher supplies decoded fields. */
+static PGAlignedBlock native_disk;
+static uint32 native_reads, native_writes, native_syncs, native_closes, native_applies;
+
+static int
+fixture_path(int intent, uint8 instance, uint32 segment, char *path, size_t length)
+{
+	UT_ASSERT_EQ(instance, 3);
+	UT_ASSERT_EQ(segment, 513);
+	strlcpy(path, "owned-undo-segment", length);
+	return 0;
+}
+
+static int
+fixture_open(uint8 instance, uint32 segment, const char *path, bool create)
+{
+	UT_ASSERT_EQ(instance, 3);
+	UT_ASSERT_EQ(segment, 513);
+	return 42;
+}
+
+static ssize_t
+fixture_read(int fd, void *buffer, size_t length, off_t offset)
+{
+	UT_ASSERT_EQ(fd, 42);
+	UT_ASSERT_EQ(length, BLCKSZ);
+	UT_ASSERT_EQ(offset, 2 * BLCKSZ);
+	native_reads++;
+	memcpy(buffer, native_disk.data, BLCKSZ);
+	return BLCKSZ;
+}
+
+static ssize_t
+fixture_write(int fd, const void *buffer, size_t length, off_t offset)
+{
+	UT_ASSERT_EQ(fd, 42);
+	UT_ASSERT_EQ(length, BLCKSZ);
+	UT_ASSERT_EQ(offset, 2 * BLCKSZ);
+	UT_ASSERT_EQ(native_syncs, 0);
+	native_writes++;
+	memcpy(native_disk.data, buffer, BLCKSZ);
+	return BLCKSZ;
+}
+
+static int
+fixture_sync(int fd)
+{
+	UT_ASSERT_EQ(fd, 42);
+	UT_ASSERT_EQ(native_writes, 1);
+	UT_ASSERT_EQ(native_closes, 0);
+	native_syncs++;
+	return 0;
+}
+
+static int
+fixture_close(int fd)
+{
+	UT_ASSERT_EQ(fd, 42);
+	native_closes++;
+	return 0;
+}
+
+#define build_undo_segment_path fixture_path
+#define cluster_undo_intent_for_owner(instance_) 0
+#define cluster_undo_redo_open_segment fixture_open
+#undef pg_pread
+#undef pg_pwrite
+#define pg_pread fixture_read
+#define pg_pwrite fixture_write
+#define pg_fsync fixture_sync
+#define close fixture_close
+#define cluster_vis_bump_recovery_undo_redo_applies() (native_applies++)
+#include "test_cluster_undo_block_native.inc"
+#undef build_undo_segment_path
+#undef cluster_undo_intent_for_owner
+#undef cluster_undo_redo_open_segment
+#undef pg_pread
+#undef pg_pwrite
+#undef pg_fsync
+#undef close
+#undef cluster_vis_bump_recovery_undo_redo_applies
 
 static ClusterUndoDecoded
 decode_emitted(bool accepted)
@@ -247,6 +335,7 @@ check_block_producer(bool multi)
 	for (Size i = 0; i < lengthof(cases); i++) {
 		ClusterUndoDecoded out;
 		const char *body;
+		PGAlignedBlock base, prepared, expected;
 		writeback = cases[i].writeback;
 		full_page_writes = cases[i].fpw;
 		if (multi)
@@ -272,6 +361,21 @@ check_block_producer(bool multi)
 			UT_ASSERT(memcmp(body, image + rec_off, rec_len) == 0);
 			UT_ASSERT(memcmp(body + rec_len, image + slot_off, slot_len) == 0);
 		}
+		memset(base.data, 0x5c, BLCKSZ);
+		((UndoBlockHeader *)base.data)->block_lsn = 13;
+		expected = base;
+		if (out.has_fpi)
+			memcpy(expected.data, image, BLCKSZ);
+		else {
+			memcpy(expected.data, image, UNDO_BLOCK_HDR_PREFIX_LEN);
+			memcpy(expected.data + rec_off, image + rec_off, rec_len);
+			memcpy(expected.data + slot_off, image + slot_off, slot_len);
+		}
+		((UndoBlockHeader *)expected.data)->block_lsn = 0x900;
+		UT_ASSERT(cluster_undo_prepare_block_v1(&out,
+			(const uint8 *)payload + out.payload_offset, out.payload_length,
+			0x900, out.has_fpi ? NULL : base.data, prepared.data));
+		UT_ASSERT(memcmp(prepared.data, expected.data, BLCKSZ) == 0);
 	}
 }
 
@@ -296,16 +400,92 @@ UT_TEST(test_unowned_segment_and_hwm_do_not_gain_authority)
 	UT_ASSERT_EQ(out.block_no, 128);
 }
 
+UT_TEST(test_private_block_preparation_refusal_is_atomic)
+{
+	PGAlignedBlock image, output, before;
+	ClusterUndoDecoded decoded;
+
+	memset(image.data, 0x4d, BLCKSZ);
+	writeback = full_page_writes = true;
+	checkpoint_redo = 100;
+	cluster_undo_emit_block_write_multi(3, 513, 2, image.data, 101,
+									  sizeof(UndoBlockHeader), 73, BLCKSZ - 16, 16);
+	decoded = decode_emitted(true);
+	for (int variant = 0; variant < 5; variant++) {
+		ClusterUndoDecoded bad = decoded;
+		Size length = bad.payload_length;
+		XLogRecPtr end = 0x900;
+		const char *base;
+
+		memset(output.data, 0x5c, BLCKSZ);
+		((UndoBlockHeader *)output.data)->block_lsn = 13;
+		base = output.data;
+		if (variant == 0) base = NULL;
+		if (variant == 1) ((UndoBlockHeader *)output.data)->block_lsn = 0;
+		if (variant == 2) length--;
+		if (variant == 3) bad.slot_off = bad.rec_off + bad.rec_len - 1;
+		if (variant == 4) end = 0;
+		before = output;
+		UT_ASSERT(!cluster_undo_prepare_block_v1(&bad,
+			(const uint8 *)payload + bad.payload_offset, length, end, base, output.data));
+		UT_ASSERT(memcmp(output.data, before.data, BLCKSZ) == 0);
+	}
+}
+
+UT_TEST(test_native_block_writer_uses_typed_preparation_before_write_and_sync)
+{
+	PGAlignedBlock image, expected;
+	ClusterUndoDecoded decoded;
+
+	memset(image.data, 0x4d, BLCKSZ);
+	writeback = full_page_writes = true;
+	checkpoint_redo = 100;
+	for (int variant = 0; variant < 3; variant++) {
+		const uint8 *body;
+		cluster_undo_emit_block_write_multi(3, 513, 2, image.data,
+			variant == 0 ? 0 : 101, sizeof(UndoBlockHeader), 73, BLCKSZ - 16, 16);
+		decoded = decode_emitted(true);
+		body = (const uint8 *)payload + decoded.payload_offset;
+		memset(native_disk.data, 0x5c, BLCKSZ);
+		((UndoBlockHeader *)native_disk.data)->block_lsn = variant == 2 ? 0 : 13;
+		expected = native_disk;
+		native_reads = native_writes = native_syncs = native_closes = native_applies = 0;
+		if (variant != 2) {
+			UT_ASSERT(cluster_undo_prepare_block_v1(&decoded, body, decoded.payload_length,
+												  0x900, native_disk.data, expected.data));
+			cluster_undo_redo_block_write(&decoded, body, 0x900);
+			UT_ASSERT_EQ(native_reads, variant == 0 ? 0 : 1);
+			UT_ASSERT_EQ(native_writes, 1);
+			UT_ASSERT_EQ(native_syncs, 1);
+			UT_ASSERT_EQ(native_applies, 1);
+		} else {
+			expect_panic = true;
+			if (setjmp(panic_jump) == 0) {
+				cluster_undo_redo_block_write(&decoded, body, 0x900);
+				UT_ASSERT(false);
+			}
+			expect_panic = false;
+			UT_ASSERT_EQ(native_writes, 0);
+			UT_ASSERT_EQ(native_syncs, 0);
+			UT_ASSERT_EQ(native_applies, 0);
+		}
+		UT_ASSERT_EQ(native_closes, 1);
+		UT_ASSERT(memcmp(native_disk.data, expected.data, BLCKSZ) == 0);
+	}
+}
+
 int
 main(void)
 {
-	UT_PLAN(6);
+	UT_PLAN(8);
 	UT_RUN(test_segment_lifecycle_producer_payloads);
 	UT_RUN(test_tt_producer_identity_and_polarity);
 	UT_RUN(test_ctrc_release_producer_certificate);
 	UT_RUN(test_block_write_producer_checkpoint_boundary);
 	UT_RUN(test_block_write_multi_producer_checkpoint_boundary);
 	UT_RUN(test_unowned_segment_and_hwm_do_not_gain_authority);
+	UT_RUN(test_private_block_preparation_refusal_is_atomic);
+	UT_RUN(test_native_block_writer_uses_typed_preparation_before_write_and_sync);
 	UT_DONE();
 	return ut_failed_count != 0;
 }

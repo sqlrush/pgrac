@@ -119,6 +119,14 @@ extern bool cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out
  */
 extern bool cluster_undo_preflight(const ClusterUndoDecoded *decoded);
 
+/* Prepare one typed data block from owned immutable payload. Caller proves
+ * source/target generation, isolation and durability; this is not authority.
+ * Delta needs a nonzero-LSN base. No output change on refusal; base may equal
+ * out. The returned block still requires the caller's write/fsync/post-read. */
+extern bool cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
+										 const uint8 *payload, Size payload_length,
+										 XLogRecPtr replay_end, const char *base, char *out);
+
 typedef enum ClusterUndoApplyResultV1 {
 	CLUSTER_UNDO_APPLY_OK = 0,
 	CLUSTER_UNDO_APPLY_BLOCKED = 1,

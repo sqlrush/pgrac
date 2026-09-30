@@ -36,6 +36,15 @@
 #include "cluster/storage/cluster_undo_alloc.h"
 #include "cluster/storage/cluster_undo_xlog.h"
 
+static bool
+undo_delta_ranges_valid(uint16 rec_off, uint16 rec_len, uint16 slot_off, uint16 slot_len)
+{
+	return rec_off >= sizeof(UndoBlockHeader) && rec_len != 0
+		   && (uint32)rec_off + rec_len <= slot_off
+		   && slot_len != 0 && slot_len % sizeof(UndoSlotDirEntry) == 0
+		   && (uint32)slot_off + slot_len <= BLCKSZ;
+}
+
 static ClusterUndoDecodedKind
 cluster_undo_kind_for_opcode(uint16 opcode)
 {
@@ -245,10 +254,8 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 		} else {
 			uint32 expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len + sizeof(UndoSlotDirEntry);
 
-			if (rec.rec_off < sizeof(UndoBlockHeader) || rec.rec_len == 0
-				|| (uint32)rec.rec_off + rec.rec_len > BLCKSZ
-				|| rec.slot_off < sizeof(UndoBlockHeader)
-				|| (uint32)rec.slot_off + sizeof(UndoSlotDirEntry) > BLCKSZ || body_len != expected)
+			if (!undo_delta_ranges_valid(rec.rec_off, rec.rec_len, rec.slot_off,
+									 sizeof(UndoSlotDirEntry)) || body_len != expected)
 				return false;
 		}
 		out->instance = rec.instance;
@@ -281,11 +288,8 @@ cluster_undo_decode(XLogReaderState *record, ClusterUndoDecoded *out)
 		} else {
 			uint32 expected = UNDO_BLOCK_HDR_PREFIX_LEN + rec.rec_len + rec.slot_len;
 
-			if (rec.rec_off < sizeof(UndoBlockHeader) || rec.rec_len == 0
-				|| (uint32)rec.rec_off + rec.rec_len > BLCKSZ
-				|| rec.slot_off < sizeof(UndoBlockHeader) || rec.slot_len == 0
-				|| rec.slot_len % sizeof(UndoSlotDirEntry) != 0
-				|| (uint32)rec.slot_off + rec.slot_len > BLCKSZ || body_len != expected)
+			if (!undo_delta_ranges_valid(rec.rec_off, rec.rec_len, rec.slot_off, rec.slot_len)
+				|| body_len != expected)
 				return false;
 		}
 		out->instance = rec.instance;
@@ -436,6 +440,56 @@ cluster_undo_preflight(const ClusterUndoDecoded *decoded)
 	default:
 		break;
 	}
+	return true;
+}
+
+/* Byte preparation only. The caller supplies the exact origin's retained WAL,
+ * target/base and mutation authority; no LSN comparison here can prove any of
+ * those facts. Keep the native nonzero delta-base interlock and make refusal
+ * leave the caller's output untouched, including in-place preparation. */
+bool
+cluster_undo_prepare_block_v1(const ClusterUndoDecoded *decoded,
+							  const uint8 *payload, Size payload_length,
+							  XLogRecPtr replay_end, const char *base, char *out)
+{
+	PGAlignedBlock prepared;
+	bool multi;
+	uint16 slot_length;
+
+	if (decoded == NULL || payload == NULL || out == NULL
+		|| XLogRecPtrIsInvalid(replay_end) || !cluster_undo_preflight(decoded)
+		|| (decoded->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE
+			&& decoded->kind != CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI)
+		|| decoded->kind != cluster_undo_kind_for_opcode(decoded->opcode)
+		|| !decoded->has_payload || payload_length != decoded->payload_length)
+		return false;
+	multi = decoded->kind == CLUSTER_UNDO_KIND_BLOCK_WRITE_MULTI;
+	slot_length = multi ? decoded->slot_len : sizeof(UndoSlotDirEntry);
+	if (decoded->has_fpi) {
+		if (payload_length != BLCKSZ || decoded->rec_off != 0 || decoded->rec_len != 0
+			|| decoded->slot_off != 0 || decoded->slot_len != (multi ? 0 : slot_length))
+			return false;
+		memcpy(prepared.data, payload, BLCKSZ);
+	} else {
+		UndoBlockHeader header;
+
+		if (base == NULL || decoded->slot_len != slot_length
+			|| !undo_delta_ranges_valid(decoded->rec_off, decoded->rec_len,
+									   decoded->slot_off, slot_length)
+			|| payload_length != UNDO_BLOCK_HDR_PREFIX_LEN + decoded->rec_len + slot_length)
+			return false;
+		memcpy(&header, base, sizeof(header));
+		if (XLogRecPtrIsInvalid(header.block_lsn))
+			return false;
+		memcpy(prepared.data, base, BLCKSZ);
+		memcpy(prepared.data, payload, UNDO_BLOCK_HDR_PREFIX_LEN);
+		memcpy(prepared.data + decoded->rec_off, payload + UNDO_BLOCK_HDR_PREFIX_LEN,
+			   decoded->rec_len);
+		memcpy(prepared.data + decoded->slot_off,
+			   payload + UNDO_BLOCK_HDR_PREFIX_LEN + decoded->rec_len, slot_length);
+	}
+	((UndoBlockHeader *)prepared.data)->block_lsn = replay_end;
+	memcpy(out, prepared.data, BLCKSZ);
 	return true;
 }
 

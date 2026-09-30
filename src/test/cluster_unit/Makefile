@@ -2270,9 +2270,15 @@ test_cluster_undo_producer_owner.inc: $(top_srcdir)/src/backend/cluster/storage/
 	     END { if (found != 12) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_undo_block_native.inc: $(top_srcdir)/src/backend/cluster/storage/cluster_undo_xlog.c Makefile
+	awk '/^cluster_undo_redo_block_write\(/ { print "static void"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_undo_producer: test_cluster_undo_producer.c unit_test.h \
-		test_cluster_undo_producer_owner.inc \
+		test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc \
 		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
 		test_cluster_side_xact_undo_product.o $(CLUSTER_SIDE_ROUTE_O) $(CLUSTER_RF_ROUTE_O) \
 		xlogreader_fs.o
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< test_cluster_side_xact_undo_product.o \
@@ -2304,7 +2310,9 @@ SIDE_XACT_XACTDESC_O = test_cluster_side_xact_xactdesc.o
 $(SIDE_XACT_XACTDESC_O): $(top_srcdir)/src/backend/access/rmgrdesc/xactdesc.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 SIDE_XACT_TT_2PC_RECORD_O = $(top_builddir)/src/backend/cluster/cluster_tt_2pc_record.o
-test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c
+test_cluster_side_xact_undo_product.o: $(top_srcdir)/src/backend/cluster/cluster_side_undo.c \
+		$(top_srcdir)/src/include/cluster/cluster_side_undo.h \
+		$(top_srcdir)/src/include/cluster/storage/cluster_undo_xlog.h
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_side_xact: test_cluster_side_xact.c unit_test.h \
@@ -3710,7 +3718,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
-	rm -f test_cluster_undo_producer_owner.inc
+	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_heap_lock_vm_needed.inc
 	rm -f test_cluster_btree_structure_helpers.inc test_cluster_btree_structure_alloc.inc \
 		test_cluster_btree_structure_root.inc \
