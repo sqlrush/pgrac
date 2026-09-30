@@ -135,7 +135,7 @@ typedef struct SlruCtlData
 	 * Dir is set during SimpleLruInit and does not change thereafter. Since
 	 * it's always the same, it doesn't need to be in shared memory.
 	 */
-	char		Dir[64];
+	char		Dir[MAXPGPATH]; /* PGRAC: canonical per-origin shared paths. */
 } SlruCtlData;
 
 typedef SlruCtlData *SlruCtl;

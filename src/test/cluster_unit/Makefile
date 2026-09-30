@@ -437,6 +437,7 @@ TESTS += test_cluster_page_dependency
 TESTS += test_cluster_undo_producer
 TESTS += test_cluster_undo_native_lifecycle
 TESTS += test_cluster_undo_recovery
+TESTS += test_cluster_remote_xact_directory
 TESTS += test_cluster_space_reservation
 CLUSTER_BLOCK_APPLY_O = $(top_builddir)/src/backend/cluster/cluster_block_apply.o \
 		test_cluster_block_apply_btree_product.o
@@ -777,15 +778,25 @@ CLUSTER_CLEAN_LEAVE_POLICY_O = $(top_builddir)/src/backend/cluster/cluster_clean
 # Author: SqlRush <sqlrush@gmail.com>
 test_cluster_remote_xact_writer.inc: $(top_srcdir)/src/backend/cluster/cluster_remote_xact.c Makefile
 	awk '/^#define CLUSTER_REMOTE_XACT_DIR_V2/ { print } \
-	     /^typedef struct RemoteXactTruncateContextV2/ { emit=1; types++ } \
-	     /^(remote_xact_open_page|remote_xact_force_durable|remote_xact_mutation_from_transition|remote_xact_truncate_origin_callback|remote_xact_writer_permitted|cluster_remote_xact_online_writer_push|cluster_remote_xact_online_writer_pop|cluster_remote_xact_online_writer_depth|cluster_remote_xact_store_prepared_v2|cluster_remote_xact_store_terminal_v2|cluster_remote_xact_pending_matches_v2|cluster_remote_xact_range_empty_v2|cluster_remote_xact_reset_range_v2|cluster_remote_xact_truncate_before_v2|cluster_remote_xact_flush)\(/ { print prev; emit=1; count++ } \
+	     /^typedef struct (RemoteXactTruncateContextV2|RemoteXactAccessV1)/ { emit=1; types++ } \
+	     /^(remote_xact_ctl|remote_xact_cache_discard|remote_xact_access_begin|remote_xact_access_end|remote_xact_open_page|remote_xact_force_durable|remote_xact_mutation_from_transition|remote_xact_truncate_origin_callback|remote_xact_writer_permitted|remote_xact_origin_writer_permitted|cluster_remote_xact_online_writer_push|cluster_remote_xact_online_writer_pop|cluster_remote_xact_online_writer_depth|cluster_remote_xact_store_prepared_v2|cluster_remote_xact_store_prepared_v2_active|cluster_remote_xact_store_terminal_v2|cluster_remote_xact_store_terminal_v2_active|cluster_remote_xact_pending_matches_v2|cluster_remote_xact_pending_matches_v2_active|cluster_remote_xact_range_empty_v2|cluster_remote_xact_range_empty_v2_active|cluster_remote_xact_reset_range_v2|cluster_remote_xact_reset_range_v2_active|cluster_remote_xact_truncate_before_v2|cluster_remote_xact_truncate_before_v2_active|cluster_remote_commit_outcome_ex|cluster_remote_commit_outcome_ex_active|cluster_remote_commit_timestamp|cluster_remote_commit_timestamp_active|cluster_remote_xact_flush)\(/ { print prev; emit=1; count++ } \
 	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
-	     END { if (count != 15 || types != 1) exit 1 }' $< > $@.tmp
+	     END { if (count != 30 || types != 2) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
-test_cluster_remote_xact_writer: test_cluster_remote_xact_writer.c test_cluster_remote_xact_writer.inc unit_test.h \
+test_cluster_remote_xact_writer: test_cluster_remote_xact_writer.c test_cluster_remote_xact_writer.inc test_cluster_remote_xact_directory.inc unit_test.h \
 		$(top_srcdir)/src/include/cluster/cluster_remote_xact.h
-	$(CC) $(CFLAGS) $(CPPFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
+
+test_cluster_remote_xact_directory.inc: $(top_srcdir)/src/backend/cluster/cluster_remote_xact.c Makefile
+	awk '/^#define CLUSTER_REMOTE_XACT_DIR_V2/ { print } \
+	     /^remote_xact_directory_ready\(/ { print prev; emit=1; count++ } \
+	     emit { print } /^}/ { emit=0 } { prev=$$0 } \
+	     END { if (count != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_remote_xact_directory: test_cluster_remote_xact_directory.c test_cluster_remote_xact_directory.inc unit_test.h
+	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(CLUSTER_UNIT_PORT_LIBS) -o $@
 
 test_cluster_postmaster_stop.inc: $(top_srcdir)/src/backend/postmaster/postmaster.c Makefile
 	awk '/^\/\* NORMAL_STOP_POSTMASTER_BEGIN/ { emit=1; count++ } \

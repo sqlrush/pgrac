@@ -34,6 +34,11 @@
  *	  fsyncs its exact SLRU segment before returning.  A crash mid-recovery
  *	  simply reruns the retained WAL and takes the idempotent transition; the
  *	  SLRU remains rebuildable materialization, never redo authority.
+ *	  With shared_config, each origin uses its canonical native_side
+ *	  directory. Cached projection pages live only for one local operation;
+ *	  reads refresh from shared storage and writes require the original
+ *	  sealed-source recovery scope. The local-directory route is used only
+ *	  when shared_config is disabled.
  *
  *
  * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group

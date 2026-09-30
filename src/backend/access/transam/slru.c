@@ -192,6 +192,11 @@ SimpleLruInit(SlruCtl ctl, const char *name, int nslots, int nlsns,
 	SlruShared	shared;
 	bool		found;
 
+	/* PGRAC: never silently route a shared SLRU through a truncated path.
+	 * Reserve the segment-name suffix used by SlruFileName(). */
+	if (subdir == NULL || strlen(subdir) >= sizeof(ctl->Dir) - 16)
+		ereport(ERROR, (errmsg("SLRU directory path is too long")));
+
 	shared = (SlruShared) ShmemInitStruct(name,
 										  SimpleLruShmemSize(nslots, nlsns),
 										  &found);

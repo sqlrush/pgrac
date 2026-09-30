@@ -91,6 +91,14 @@ cluster_undo_recovery_intent_for_owner(uint8 owner)
 		: cluster_undo_intent_for_owner(owner);
 }
 
+bool
+cluster_undo_recovery_origin_authorized_v1(int origin_node)
+{
+	return origin_node >= 0 && origin_node < 128 && active_scope != NULL
+		&& active_scope->duty.origin_thread_id == origin_node + 1
+		&& undo_scope_current(active_scope);
+}
+
 int
 cluster_undo_recovery_path_resolve_v1(uint8 owner, uint32 segment, char *path, size_t size)
 {

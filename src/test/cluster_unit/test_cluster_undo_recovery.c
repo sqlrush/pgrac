@@ -249,6 +249,10 @@ UT_TEST(test_stale_scope_never_falls_back_to_local_path)
 			return;
 		}
 		UT_ASSERT(!cluster_undo_recovery_scope_enter_v1(&other, &authority, plan));
+		UT_ASSERT(cluster_undo_recovery_origin_authorized_v1(2));
+		UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(3));
+		UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(-1));
+		UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(128));
 		cluster_undo_recovery_scope_leave_v1(&other);
 		if (fault == 0) authority_result = CLUSTER_THREAD_AUTHORITY_FENCE_STALE;
 		if (fault == 1) duty.root_lineage_seq++;
@@ -258,6 +262,7 @@ UT_TEST(test_stale_scope_never_falls_back_to_local_path)
 		if (fault == 5) serial.mode = CLUSTER_RECOVERY_SERIAL_INPUT_SEAL;
 		if (fault == 6) source_ok = false;
 		if (fault == 7) cluster_undo_gcs_coherence = false;
+		UT_ASSERT(!cluster_undo_recovery_origin_authorized_v1(2));
 		strlcpy(path, "unchanged", sizeof(path));
 		UT_ASSERT_EQ(cluster_undo_path_resolve(cluster_undo_recovery_intent_for_owner(3),
 			3, 513, path, sizeof(path)), -1);
