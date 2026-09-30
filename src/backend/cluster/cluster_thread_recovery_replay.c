@@ -288,7 +288,9 @@ missing_forget_dropped(ClusterThreadMissingRels *missing, XLogReaderState *reade
 	int i;
 
 	if (info == XLOG_XACT_COMMIT || info == XLOG_XACT_COMMIT_PREPARED) {
-		ParseCommitRecord(XLogRecGetInfo(reader), (xl_xact_commit *)XLogRecGetData(reader), &pc);
+		if (!ParseCommitRecord(XLogRecGetInfo(reader), (xl_xact_commit *)XLogRecGetData(reader),
+			XLogRecGetDataLen(reader), &pc))
+			elog(ERROR, "thread recovery: invalid commit payload");
 		locs = pc.xlocators;
 		nlocs = pc.nrels;
 	} else if (info == XLOG_XACT_ABORT || info == XLOG_XACT_ABORT_PREPARED) {

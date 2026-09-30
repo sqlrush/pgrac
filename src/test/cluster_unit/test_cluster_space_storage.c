@@ -30,8 +30,10 @@
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_space_reservation.h"
 #include "cluster/cluster_wal_thread.h"
+#include "cluster/cluster_xnode_profile.h"
 #include "cluster/storage/cluster_smgr.h"
 #include "miscadmin.h"
+#include "replication/origin.h"
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/freespace.h"
@@ -67,6 +69,8 @@ static uint8 pinned, locked;
 static unsigned io_calls, create_calls, wal_calls, dirty_calls, release_calls;
 static BlockNumber blocks;
 static uint8 wal_bytes[CLUSTER_SPACE_STRUCTURE_WAL_BYTES];
+static uint8 commit_bytes[4096];
+static uint32 commit_len;
 static uint8 wal_info;
 static uint32 registered_len;
 static unsigned main_create_calls, unlink_calls;
@@ -88,10 +92,50 @@ sigjmp_buf *PG_exception_stack;
 ErrorContextCallback *error_context_stack;
 static BufferDescPadded descriptors[2];
 BufferDescPadded *BufferDescriptors = descriptors;
-static bool truncate_owner, expecting_error;
+static bool truncate_owner, drop_owner, deleted_all, expecting_error;
 static unsigned relation_flushes, fork_syncs, invalidations, random_calls;
 static PGPROC proc;
 PGPROC *MyProc = &proc;
+XLogRecPtr XactLastRecEnd;
+int MyXactFlags;
+bool cluster_smart_fusion = false;
+static unsigned native_commits, commit_decisions;
+static bool plain_commit_emitter;
+static bool forceSyncCommit;
+int synchronous_commit = SYNCHRONOUS_COMMIT_OFF;
+Oid MyDatabaseId = 5, MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
+RepOriginId replorigin_session_origin = InvalidRepOriginId;
+XLogRecPtr replorigin_session_origin_lsn;
+TimestampTz replorigin_session_origin_timestamp;
+
+/* The two real native commit critical-region fragments below retain their
+ * WAL/decision/checkpoint ordering. Profiling and unrelated observers are
+ * boundaries; the SPACE owner is the real linked product implementation. */
+#define cluster_xp_begin(scope, bucket) ((void)0)
+#define cluster_xp_end(scope) ((void)0)
+void cluster_backup_pending_commit_exit(void) {}
+bool cluster_scn_durable_pending_fill_lsn(SCN scn, XLogRecPtr lsn) { abort(); }
+void cluster_sf_publish_origin_durable_lsn(void) { abort(); }
+bool cluster_scn_pending_commit_clear(SCN scn) { return true; }
+XLogRecPtr cluster_adg_emit_thread_barrier(void) { abort(); }
+bool cluster_scn_durable_pending_discharge_scn(SCN scn) { abort(); }
+TimestampTz GetCurrentTransactionStopTimestamp(void) { return 1; }
+void XLogSetAsyncXactLSN(XLogRecPtr lsn) { abort(); }
+void TransactionIdAsyncCommitTree(TransactionId xid, int count, TransactionId *children,
+								 XLogRecPtr lsn) { abort(); }
+void TransactionIdCommitTree(TransactionId xid, int count, TransactionId *children)
+{
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(native_commits, 1);
+	UT_ASSERT_EQ(CritSectionCount, 1);
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 17);
+	commit_decisions++;
+}
+
+#define CLUSTER_INJECTION_POINT(name) ((void)0)
+#include "test_cluster_space_commit_emit.inc"
+
+void XLogSetRecordFlags(uint8 flags) { UT_ASSERT_EQ(flags, XLOG_INCLUDE_ORIGIN); }
 
 void
 pg_re_throw(void)
@@ -201,6 +245,8 @@ smgrexists(SMgrRelation rel, ForkNumber forknum)
 {
 	if (rel != &storage)
 		abort();
+	if (deleted_all)
+		return false;
 	if ((recovering || truncate_owner) && (forknum == FSM_FORKNUM || forknum == VISIBILITYMAP_FORKNUM))
 		return auxiliary_forks;
 	if (truncate_owner && forknum == MAIN_FORKNUM)
@@ -244,6 +290,13 @@ smgrnblocks(SMgrRelation rel, ForkNumber forknum)
 void
 XLogFlush(XLogRecPtr lsn)
 {
+	if (drop_owner) {
+		UT_ASSERT_EQ(lsn, UINT64_C(0x10000300));
+		UT_ASSERT_EQ(CritSectionCount, recovering ? 0 : 1);
+		UT_ASSERT_EQ(locked, deleted_all ? 0 : 3);
+		flush_calls++;
+		return;
+	}
 	if (truncate_owner) {
 		UT_ASSERT_EQ(lsn, UINT64_C(0x10000200));
 		UT_ASSERT_EQ(CritSectionCount, 1);
@@ -263,6 +316,12 @@ XLogFlush(XLogRecPtr lsn)
 	if (!recovering || lsn != UINT64_C(0x20000200) || locked != 3)
 		abort();
 	flush_calls++;
+}
+
+bool XLogNeedsFlush(XLogRecPtr lsn)
+{
+	UT_ASSERT(drop_owner && lsn == UINT64_C(0x10000300));
+	return flush_calls == 0;
 }
 
 void
@@ -392,6 +451,8 @@ MarkBufferDirty(Buffer buffer)
 void
 XLogBeginInsert(void)
 {
+	if (drop_owner)
+		commit_len = 0;
 	if (truncate_owner) {
 		UT_ASSERT_EQ(CritSectionCount, 1);
 		return;
@@ -403,6 +464,14 @@ XLogBeginInsert(void)
 void
 XLogRegisterData(char *bytes, uint32 len)
 {
+	if (drop_owner) {
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		if (len > sizeof(commit_bytes) - commit_len)
+			abort();
+		memcpy(commit_bytes + commit_len, bytes, len);
+		commit_len += len;
+		return;
+	}
 	registered_len = len;
 	if (native_owner && len == sizeof(xl_smgr_create) && CritSectionCount == 0)
 		return;
@@ -425,6 +494,35 @@ XLogInsert(RmgrId rmid, uint8 info)
 	ClusterSpaceReservation reservation;
 	uint64 token;
 
+	if (drop_owner) {
+		xl_xact_parsed_commit parsed;
+
+		UT_ASSERT_EQ(CritSectionCount, 1);
+		UT_ASSERT(MyProc->delayChkptFlags & DELAY_CHKPT_START);
+		UT_ASSERT_EQ(rmid, RM_XACT_ID);
+		if (plain_commit_emitter) {
+			wal_info = info;
+			wal_calls++;
+			return XactLastRecEnd = UINT64_C(0x10000300);
+		}
+		UT_ASSERT_EQ(info, XLOG_XACT_COMMIT | XLOG_XACT_HAS_INFO | XLR_SPECIAL_REL_UPDATE);
+		UT_ASSERT_EQ(locked, 3);
+		UT_ASSERT_EQ(dirty_calls, 2);
+		UT_ASSERT(ParseCommitRecord(info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		UT_ASSERT_EQ(parsed.nspace_drops, 1);
+		UT_ASSERT(RelFileLocatorEquals(parsed.xlocators[0], locator));
+		UT_ASSERT(cluster_space_structure_wal_decode(parsed.space_drops,
+			CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &pair));
+		memcpy(wal_bytes, parsed.space_drops, sizeof(wal_bytes));
+		registered_len = sizeof(wal_bytes);
+		UT_ASSERT_EQ(pair.identity.action, CLUSTER_SPACE_WAL_TOMBSTONE);
+		UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, pair.identity.before_token);
+		UT_ASSERT_EQ(((PageHeader)pages[1].data)->pd_block_scn, pair.reservation.before_token);
+		wal_info = info;
+		wal_calls++;
+		native_commits++;
+		return XactLastRecEnd = UINT64_C(0x10000300);
+	}
 	if (truncate_owner) {
 		UT_ASSERT_EQ(CritSectionCount, 1);
 		UT_ASSERT_EQ(rmid, RM_SMGR_ID);
@@ -493,6 +591,8 @@ GetCurrentTransactionNestLevel(void)
 void *
 MemoryContextAlloc(MemoryContext context, Size size)
 {
+	if (drop_owner && recovering && context == TopMemoryContext)
+		return malloc(size);
 	if (context != TopMemoryContext || !native_owner)
 		abort();
 	delete_registered = true;
@@ -557,6 +657,12 @@ smgrdounlinkall(SMgrRelation *rels, int count, bool redo)
 {
 	if (count != 1 || rels[0] != &storage || redo || !delete_registered)
 		abort();
+	if (drop_owner) {
+		UT_ASSERT_EQ(commit_decisions, 1);
+		UT_ASSERT_EQ(locked | pinned | CritSectionCount | MyProc->delayChkptFlags, 0);
+		UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 18);
+		UT_ASSERT_EQ(PageGetLSN(page.data), UINT64_C(0x10000300));
+	}
 	unlink_calls++;
 }
 void
@@ -625,8 +731,14 @@ reset(void)
 	if (fake_relation != NULL)
 		abort();
 	fake_allocations = fake_frees = 0;
-	truncate_owner = expecting_error = false;
+	truncate_owner = drop_owner = deleted_all = expecting_error = false;
 	relation_flushes = fork_syncs = invalidations = random_calls = 0;
+	native_commits = commit_decisions = 0;
+	plain_commit_emitter = false;
+	commit_len = 0;
+	forceSyncCommit = false;
+	replorigin_session_origin = InvalidRepOriginId;
+	wal_level = WAL_LEVEL_REPLICA;
 	memset(&proc, 0, sizeof(proc));
 	descriptors[0].bufferdesc.buf_id = 0;
 	descriptors[1].bufferdesc.buf_id = 1;
@@ -1451,11 +1563,396 @@ UT_TEST(test_native_truncate_bad_pair_refuses_before_physical_change)
 	FreeFakeRelcacheEntry(rel);
 }
 
+static void
+emit_drop_commit(ClusterSpaceDropState *state, const RelFileLocator *deletes, int count)
+{
+	uint32 len;
+	const char *data = cluster_space_drop_wal(state, &len);
+
+	cluster_space_drop_mark_dirty(state);
+	XactLogCommitRecord(1, 0, NULL, count, unconstify(RelFileLocator *, deletes),
+		0, NULL, 0, NULL, false, 0, InvalidTransactionId, NULL, InvalidScn, NULL, data, len);
+}
+
+UT_TEST(test_drop_pair_stays_live_until_native_commit_is_durable)
+{
+	Relation rel = native_truncate_relation();
+	RelFileLocator deletes[2] = {locator, locator};
+	ClusterSpaceDropState *state;
+	ClusterSpaceStructureChange change;
+	ClusterSpaceIdentity identity;
+	ClusterSpaceReservation reservation;
+	PGAlignedBlock saved[2];
+	uint64 token;
+
+	drop_owner = true;
+	memcpy(saved, pages, sizeof(saved));
+	state = cluster_space_drop_prepare(deletes, 2);
+	UT_ASSERT(state != NULL);
+	if (state == NULL) { FreeFakeRelcacheEntry(rel); return; }
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	UT_ASSERT_EQ(wal_calls + dirty_calls, 0);
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	emit_drop_commit(state, deletes, 2);
+	UT_ASSERT_EQ(wal_calls, 1); /* Native pending delete can contain duplicates. */
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	XLogFlush(UINT64_C(0x10000300)); /* Original forced COMMIT flush. */
+	cluster_space_drop_publish(state, UINT64_C(0x10000300));
+	UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+		&change.identity.result.key, &identity, &token));
+	UT_ASSERT_EQ(identity.state, CLUSTER_SPACE_IDENTITY_TOMBSTONED);
+	UT_ASSERT_EQ(identity.sequence, 2);
+	UT_ASSERT_EQ(token, change.identity.result_token);
+	UT_ASSERT(memcmp(identity.incarnation, change.identity.expected.incarnation, 16) == 0);
+	UT_ASSERT(cluster_space_reservation_page_decode(pages[1].data, BLCKSZ, SPACE_FORKNUM, 1,
+		&identity.key, &reservation, &token));
+	UT_ASSERT_EQ(reservation.next_block, 10);
+	UT_ASSERT_EQ(PageGetLSN(page.data), UINT64_C(0x10000300));
+	UT_ASSERT_EQ(PageGetLSN(pages[1].data), UINT64_C(0x10000300));
+	MyProc->delayChkptFlags &= ~DELAY_CHKPT_START;
+	END_CRIT_SECTION();
+	cluster_space_drop_finish(state);
+	UT_ASSERT_EQ(unlink_calls + truncate_calls + fork_syncs + relation_flushes, 0);
+	UT_ASSERT(!locked && !pinned);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_drop_precommit_failure_or_abandonment_preserves_live_pages)
+{
+	for (int corrupt = 0; corrupt <= 1; corrupt++) {
+		Relation rel = native_truncate_relation();
+		ClusterSpaceDropState *state;
+		PGAlignedBlock saved[2];
+
+		drop_owner = true;
+		if (corrupt)
+			pages[1].data[BLCKSZ - 1] = 1;
+		memcpy(saved, pages, sizeof(saved));
+		state = cluster_space_drop_prepare(&locator, 1);
+		UT_ASSERT((state != NULL) == !corrupt);
+		if (state != NULL)
+			cluster_space_drop_finish(state);
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		UT_ASSERT_EQ(unlink_calls + truncate_calls + wal_calls + dirty_calls, 0);
+		UT_ASSERT(!locked && !pinned);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_native_commit_logs_decides_and_publishes_before_checkpoint_release)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *space_drop;
+	const char *space_drop_data;
+	uint32 space_drop_len;
+	bool wrote_xlog = true, markXidCommitted = true, forceSyncCommit = false;
+	bool RelcacheInitFileInval = false, has_tt_fold = false, commit_record_flushed = false;
+	int nchildren = 0, nrels = 1, ndroppedstats = 0, nmsgs = 0;
+	int synchronous_commit = SYNCHRONOUS_COMMIT_OFF;
+	TransactionId xid = 501, *children = NULL;
+	RelFileLocator *rels = &locator;
+	xl_xact_stats_item *droppedstats = NULL;
+	SharedInvalidationMessage *invalMessages = NULL;
+	SCN commit_scn = InvalidScn, tt_commit_scn = InvalidScn;
+	xl_xact_tt_commit tt_fold = {0};
+	ClusterSpaceIdentity identity;
+	ClusterSpaceIdentityKey expected;
+	uint64 token;
+
+	drop_owner = true;
+	UT_ASSERT(cluster_space_relation_read_identity(locator, &identity));
+	expected = identity.key;
+	native_owner = true;
+	storage.smgr_owner = &rel->rd_smgr;
+	RelationDropStorage(rel);
+	nrels = smgrGetPendingDeletes(true, &rels);
+	UT_ASSERT_EQ(nrels, 1);
+	space_drop = cluster_space_drop_prepare(rels, nrels);
+	UT_ASSERT(space_drop != NULL);
+	if (space_drop == NULL) { FreeFakeRelcacheEntry(rel); return; }
+	space_drop_data = cluster_space_drop_wal(space_drop, &space_drop_len);
+#include "test_cluster_space_commit.inc"
+	UT_ASSERT_EQ(native_commits, 1);
+	UT_ASSERT_EQ(commit_decisions, 1);
+	UT_ASSERT(commit_record_flushed);
+	UT_ASSERT_EQ(MyProc->delayChkptFlags, 0);
+	UT_ASSERT_EQ(CritSectionCount, 0);
+	UT_ASSERT(space_drop == NULL);
+	UT_ASSERT(!pinned && !locked);
+	UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+		&expected, &identity, &token));
+	UT_ASSERT_EQ(identity.state, CLUSTER_SPACE_IDENTITY_TOMBSTONED);
+	if (space_drop != NULL)
+		cluster_space_drop_finish(space_drop); /* Release the pre-fix RED fixture. */
+	smgrDoPendingDeletes(true);
+	UT_ASSERT_EQ(unlink_calls, 1);
+	pfree(rels);
+	FreeFakeRelcacheEntry(rel);
+}
+
+static Relation
+drop_replay_record(XLogReaderState *reader, DecodedXLogRecord *decoded)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+
+	drop_owner = true;
+	state = cluster_space_drop_prepare(&locator, 1);
+	if (state == NULL)
+		abort();
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	emit_drop_commit(state, &locator, 1);
+	/* Crash cut after COMMIT WAL, before publishing SPACE or unlinking.
+	 * Restart begins at this record with no preceding intent state. */
+	MyProc->delayChkptFlags = 0;
+	END_CRIT_SECTION();
+	cluster_space_drop_finish(state);
+	memset(reader, 0, sizeof(*reader));
+	memset(decoded, 0, sizeof(*decoded));
+	decoded->header.xl_rmid = RM_XACT_ID;
+	decoded->header.xl_info = wal_info;
+	decoded->header.xl_xid = 501;
+	decoded->main_data = (char *)commit_bytes;
+	decoded->main_data_len = commit_len;
+	decoded->max_block_id = -1;
+	reader->record = decoded;
+	reader->system_identifier = 1;
+	reader->ReadRecPtr = UINT64_C(0x10000200);
+	reader->EndRecPtr = UINT64_C(0x10000300);
+	reader->cluster_expected_thread_id = 1;
+	recovering = reject_current_ref = true;
+	dirty_calls = wal_calls = flush_calls = 0;
+	return rel;
+}
+
+static void
+native_commit_redo_prefix(XLogReaderState *record, xl_xact_parsed_commit *parsed,
+						  TransactionId xid)
+{
+#include "test_cluster_space_commit_redo.inc"
+}
+
+UT_TEST(test_atomic_drop_commit_replays_all_partial_tombstones)
+{
+	for (unsigned mask = 0; mask < 4; mask++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		ClusterSpaceStructureChange change;
+		ClusterSpaceIdentity identity;
+		xl_xact_parsed_commit parsed;
+		uint64 token;
+
+		UT_ASSERT(cluster_space_structure_wal_decode(wal_bytes, registered_len, &change));
+		if (mask & 1)
+			UT_ASSERT(cluster_space_identity_page_encode(&change.identity.result,
+				change.identity.result_token, page.data, BLCKSZ));
+		if (mask & 2)
+			UT_ASSERT(cluster_space_reservation_page_encode(&change.reservation.result,
+				change.reservation.result_token, pages[1].data, BLCKSZ));
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		memset(wal_bytes, 0xEE, sizeof(wal_bytes)); /* No prior record retained. */
+		native_commit_redo_prefix(&reader, &parsed, 501);
+		UT_ASSERT(cluster_space_identity_page_decode(page.data, BLCKSZ, SPACE_FORKNUM, 0,
+			&change.identity.result.key, &identity, &token));
+		UT_ASSERT_EQ(identity.state, CLUSTER_SPACE_IDENTITY_TOMBSTONED);
+		UT_ASSERT_EQ(token, change.identity.result_token);
+		UT_ASSERT_EQ(PageGetLSN(page.data), reader.EndRecPtr);
+		UT_ASSERT_EQ(flush_calls, 1);
+		UT_ASSERT_EQ(dirty_calls, 2);
+		UT_ASSERT(!pinned && !locked);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_drop_commit_refuses_missing_or_unbound_payload_before_mutation)
+{
+	for (int bad = 0; bad < 11; bad++) {
+		XLogReaderState reader;
+		DecodedXLogRecord decoded;
+		Relation rel = drop_replay_record(&reader, &decoded);
+		PGAlignedBlock saved[2];
+		xl_xact_parsed_commit parsed;
+		uint32 xinfo, count;
+		char *tail;
+
+		UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+		tail = unconstify(char *, parsed.space_drops) - sizeof(uint32);
+		switch (bad) {
+		case 0:
+			memcpy(&xinfo, commit_bytes + MinSizeOfXactCommit, sizeof(xinfo));
+			xinfo &= ~XACT_XINFO_HAS_SPACE_DROP;
+			memcpy(commit_bytes + MinSizeOfXactCommit, &xinfo, sizeof(xinfo));
+			decoded.main_data_len = tail - (char *)commit_bytes;
+			break;
+		case 1: decoded.header.xl_xid++; break;
+		case 2: reader.cluster_expected_thread_id++; break;
+		case 3: cluster_recmerge_apply_foreign = true; break;
+		case 4: pages[1].data[BLCKSZ - 1] = 1; break;
+		case 5: exists = false; break; /* Missing SPACE is not proof MAIN is absent. */
+		case 6: /* Valid but duplicate typed payload cannot name one deletion twice. */
+			memcpy(commit_bytes + commit_len, parsed.space_drops, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+			decoded.main_data_len += CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+			count = 2; memcpy(tail, &count, sizeof(count)); break;
+		case 7: count = UINT32_MAX; memcpy(tail, &count, sizeof(count)); break;
+		case 8: tail[sizeof(uint32)] ^= 1; break; /* Invalid typed magic. */
+		case 9: {
+			ClusterSpaceStructureChange foreign;
+
+			UT_ASSERT(cluster_space_structure_wal_decode(parsed.space_drops,
+				CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &foreign));
+			foreign.identity.expected.key.locator.relNumber++;
+			foreign.identity.result.key.locator.relNumber++;
+			foreign.reservation.before.identity.key.locator.relNumber++;
+			foreign.reservation.result.identity.key.locator.relNumber++;
+			UT_ASSERT(cluster_space_structure_wal_encode(&foreign,
+				unconstify(char *, parsed.space_drops), CLUSTER_SPACE_STRUCTURE_WAL_BYTES));
+			break;
+		}
+		case 10: reader.system_identifier++; break;
+		}
+		memcpy(saved, pages, sizeof(saved));
+		UT_ASSERT(!cluster_space_drop_replay_commit(&reader, 501));
+		UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+		UT_ASSERT_EQ(dirty_calls + flush_calls + truncate_calls + unlink_calls, 0);
+		UT_ASSERT(!pinned && !locked);
+		FreeFakeRelcacheEntry(rel);
+	}
+}
+
+UT_TEST(test_standalone_tombstone_has_no_commit_authority)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+	PGAlignedBlock saved[2];
+
+	memcpy(saved, pages, sizeof(saved));
+	decoded.header.xl_rmid = RM_SMGR_ID;
+	decoded.header.xl_info = XLOG_SMGR_SPACE_IDENTITY | XLR_SPECIAL_REL_UPDATE;
+	decoded.main_data = (char *)wal_bytes;
+	decoded.main_data_len = sizeof(wal_bytes);
+	UT_ASSERT(!cluster_space_relation_redo(&reader));
+	UT_ASSERT(memcmp(saved, pages, sizeof(saved)) == 0);
+	UT_ASSERT(!cluster_space_drop_replay_commit(&reader, 501));
+	UT_ASSERT_EQ(dirty_calls + flush_calls + unlink_calls, 0);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_drop_replay_accepts_only_complete_physical_absence)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+
+	deleted_all = true;
+	UT_ASSERT(cluster_space_drop_replay_commit(&reader, 501));
+	UT_ASSERT_EQ(flush_calls, 1);
+	UT_ASSERT_EQ(dirty_calls + unlink_calls, 0);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_checkpoint_redo_may_begin_at_drop_commit)
+{
+	XLogReaderState reader;
+	DecodedXLogRecord decoded;
+	Relation rel = drop_replay_record(&reader, &decoded);
+
+	/* CreateCheckPoint selects redo before waiting DELAY_CHKPT_START.
+	 * The preceding intent may therefore be outside restart input. */
+	UT_ASSERT(cluster_space_drop_replay_commit(&reader, 501));
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 18);
+	UT_ASSERT(!pinned && !locked);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_native_commit_optional_tail_and_bounded_parser)
+{
+	Relation rel = native_truncate_relation();
+	ClusterSpaceDropState *state;
+	xl_xact_parsed_commit parsed, sentinel;
+	TransactionId children[2] = {502, 503};
+	xl_xact_stats_item stats = {0};
+	SharedInvalidationMessage msg = {0};
+	xl_xact_tt_commit tt = {0};
+	uint32 len;
+	const char *data;
+
+	drop_owner = true;
+	state = cluster_space_drop_prepare(&locator, 1);
+	UT_ASSERT(state != NULL);
+	if (state == NULL) { FreeFakeRelcacheEntry(rel); return; }
+	data = cluster_space_drop_wal(state, &len);
+	forceSyncCommit = true;
+	replorigin_session_origin = 7;
+	replorigin_session_origin_lsn = 456;
+	replorigin_session_origin_timestamp = 789;
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags |= DELAY_CHKPT_START;
+	cluster_space_drop_mark_dirty(state);
+	XactLogCommitRecord(123, 2, children, 1, &locator, 1, &stats, 1, &msg,
+		true, XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK, InvalidTransactionId, NULL,
+		42, &tt, data, len);
+	MyProc->delayChkptFlags = 0;
+	END_CRIT_SECTION();
+	cluster_space_drop_finish(state);
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	UT_ASSERT_EQ(parsed.nsubxacts, 2);
+	UT_ASSERT_EQ(parsed.nstats, 1);
+	UT_ASSERT_EQ(parsed.nmsgs, 1);
+	UT_ASSERT_EQ(parsed.scn, 42);
+	UT_ASSERT_EQ(parsed.origin_timestamp, 789);
+	UT_ASSERT(parsed.has_tt_commit && parsed.nspace_drops == 1);
+	memset(&sentinel, 0xAA, sizeof(sentinel));
+	for (Size truncated = 0; truncated < commit_len; truncated++) {
+		parsed = sentinel;
+		UT_ASSERT(!ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, truncated, &parsed));
+		UT_ASSERT(memcmp(&parsed, &sentinel, sizeof(parsed)) == 0);
+	}
+	UT_ASSERT(!ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len + 1, &parsed));
+	UT_ASSERT(!ParseCommitRecord(wal_info | XLOG_XACT_COMMIT_PREPARED,
+		(xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	UT_ASSERT_EQ(((PageHeader)page.data)->pd_block_scn, 17);
+	UT_ASSERT_EQ(flush_calls + unlink_calls, 0);
+	FreeFakeRelcacheEntry(rel);
+}
+
+UT_TEST(test_native_prepared_commit_preserves_empty_gid)
+{
+	Relation rel = native_truncate_relation();
+	xl_xact_parsed_commit parsed;
+
+	drop_owner = plain_commit_emitter = true;
+	wal_level = WAL_LEVEL_LOGICAL;
+	START_CRIT_SECTION();
+	MyProc->delayChkptFlags = DELAY_CHKPT_START;
+	XactLogCommitRecord(123, 0, NULL, 0, NULL, 0, NULL, 0, NULL, false,
+		0, 501, "", InvalidScn, NULL, NULL, 0);
+	MyProc->delayChkptFlags = 0;
+	END_CRIT_SECTION();
+	memset(&parsed, 0, sizeof(parsed));
+	UT_ASSERT(ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	UT_ASSERT_EQ(parsed.twophase_xid, 501);
+	UT_ASSERT(parsed.twophase_gid[0] == '\0' && parsed.nspace_drops == 0);
+	/* The native redo prefix has no SPACE work for this prepared commit. */
+	native_commit_redo_prefix(NULL, &parsed, 501);
+	UT_ASSERT_EQ(wal_calls, 1);
+	UT_ASSERT_EQ(dirty_calls + flush_calls, 0);
+	commit_bytes[commit_len - 1] = 'x';
+	UT_ASSERT(!ParseCommitRecord(wal_info, (xl_xact_commit *)commit_bytes, commit_len, &parsed));
+	FreeFakeRelcacheEntry(rel);
+}
+
 int
 main(void)
 {
 	setvbuf(stdout, NULL, _IONBF, 0);
-	UT_PLAN(27);
+	UT_PLAN(37);
 	UT_RUN(test_real_create_binds_selected_namespace_and_wal);
 	UT_RUN(test_no_create_on_legacy_or_unproved_namespace);
 	UT_RUN(test_existing_identity_is_never_recreated);
@@ -1483,6 +1980,16 @@ main(void)
 	UT_RUN(test_private_owner_releases_hw_on_wal_flush_error);
 	UT_RUN(test_native_truncate_logs_pair_after_durable_base_before_publish);
 	UT_RUN(test_native_truncate_bad_pair_refuses_before_physical_change);
+	UT_RUN(test_drop_pair_stays_live_until_native_commit_is_durable);
+	UT_RUN(test_drop_precommit_failure_or_abandonment_preserves_live_pages);
+	UT_RUN(test_native_commit_logs_decides_and_publishes_before_checkpoint_release);
+	UT_RUN(test_atomic_drop_commit_replays_all_partial_tombstones);
+	UT_RUN(test_drop_commit_refuses_missing_or_unbound_payload_before_mutation);
+	UT_RUN(test_standalone_tombstone_has_no_commit_authority);
+	UT_RUN(test_drop_replay_accepts_only_complete_physical_absence);
+	UT_RUN(test_checkpoint_redo_may_begin_at_drop_commit);
+	UT_RUN(test_native_commit_optional_tail_and_bounded_parser);
+	UT_RUN(test_native_prepared_commit_preserves_empty_gid);
 	UT_DONE();
 	return ut_failed_count ? 1 : 0;
 }

@@ -987,7 +987,8 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		TimestampTz commit_timestamp;
 		ClusterRemoteXactMutationV2 mutation;
 
-		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
+		if (!ParseCommitRecord(XLogRecGetInfo(record), xlrec, XLogRecGetDataLen(record), &parsed))
+			elog(ERROR, "merged recovery: invalid foreign commit payload");
 
 		/*
 		 * P1-1 hard rule: only a pure outcome may materialize.  Every
@@ -1075,7 +1076,8 @@ cluster_remote_xact_apply(int origin_node, XLogReaderState *record, bool online)
 		TimestampTz commit_timestamp;
 		ClusterRemoteXactMutationV2 mutation;
 
-		ParseCommitRecord(XLogRecGetInfo(record), xlrec, &parsed);
+		if (!ParseCommitRecord(XLogRecGetInfo(record), xlrec, XLogRecGetDataLen(record), &parsed))
+			elog(ERROR, "merged recovery: invalid foreign prepared commit payload");
 		xid = parsed.twophase_xid;
 		if (!TransactionIdIsNormal(xid) || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) == 0)
 			ereport(blocked_elevel, (errcode(ERRCODE_CLUSTER_MERGED_RECOVERY_BLOCKED),

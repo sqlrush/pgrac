@@ -3152,7 +3152,7 @@ RecordTransactionCommitPrepared(TransactionId xid, int nchildren, TransactionId 
 								 ninvalmsgs, invalmsgs, initfileinval,
 								 MyXactFlags | XACT_FLAGS_ACQUIREDACCESSEXCLUSIVELOCK, xid, gid,
 								 commit_scn,	/* PGRAC: spec-1.18 */
-								 NULL);			/* PGRAC: spec-3.18 D4.1: 2PC keeps standalone 0x30 */
+								 NULL, NULL, 0); /* 2PC retains its original owner. */
 
 #ifdef USE_PGRAC_CLUSTER
 	/* PGRAC: spec-7.4 D1 -- record the commit-record LSN on the durable

@@ -482,8 +482,9 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 
 		if (!side_xact_completion_shape_valid(record, true) || !TransactionIdIsNormal(xid))
 			return false;
-		ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
-						  &parsed);
+		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+			XLogRecGetDataLen(record), &parsed))
+			return false;
 		if (!side_xact_no_commit_effects(&parsed) || (parsed.xinfo & XACT_XINFO_HAS_TWOPHASE) != 0
 			|| !SCN_VALID(parsed.scn) || side_xact_commit_timestamp(&parsed) == 0
 			|| !parsed.has_tt_commit
@@ -541,8 +542,9 @@ rf_side_xact_decode_v1(XLogReaderState *record, uint64 system_identifier, uint16
 
 		if (!side_xact_completion_shape_valid(record, true))
 			return false;
-		ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
-						  &parsed);
+		if (!ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+			XLogRecGetDataLen(record), &parsed))
+			return false;
 		xid = parsed.twophase_xid;
 		if (!TransactionIdIsNormal(xid) || !side_xact_no_commit_effects(&parsed)
 			|| (parsed.xinfo

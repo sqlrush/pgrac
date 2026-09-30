@@ -15,6 +15,7 @@
 
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xact.h"
 #include "catalog/pg_control.h"
 #include "catalog/storage_xlog.h"
 #include "cluster/cluster_guc.h"
@@ -30,6 +31,7 @@
 #include "storage/bufmgr.h"
 #include "storage/buf_internals.h"
 #include "storage/smgr.h"
+#include "storage/proc.h"
 #include "utils/catcache.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -686,6 +688,17 @@ struct ClusterSpaceTruncateState {
 	XLogRecPtr lsn;
 };
 
+struct ClusterSpaceDropState {
+	int count;
+	bool published;
+	char *wal;
+	uint32 wal_len;
+	ClusterSpaceTruncateState *entries[FLEXIBLE_ARRAY_MEMBER];
+};
+
+StaticAssertDecl(XACT_SPACE_DROP_RECORD_BYTES == CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+	"native COMMIT and SPACE structural formats must agree");
+
 static void
 space_truncate_release(ClusterSpaceTruncateState *state)
 {
@@ -695,38 +708,24 @@ space_truncate_release(ClusterSpaceTruncateState *state)
 	pfree(state);
 }
 
-ClusterSpaceTruncateState *
-cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
+static ClusterSpaceTruncateState *
+space_structure_prepare(const ClusterSpaceIdentityKey *expected,
+						ClusterSpaceWalAction action, BlockNumber nblocks)
 {
 	ClusterSpaceTruncateState *state;
-	ClusterSpaceIdentityKey expected;
 	ClusterSpaceStructureChange change = {0};
 	ClusterSpaceWalChange *identity = &change.identity;
 	ClusterSpaceReservationChange *reservation = &change.reservation;
 	SMgrRelation smgr;
 	uint8 apply_mask;
 
-	if (rel == NULL || RecoveryInProgress() || !RelationIsPermanent(rel)
-		|| !RelationNeedsWAL(rel) || nblocks == InvalidBlockNumber
-		|| !space_namespace(rel->rd_locator, false, &expected, NULL))
-		return NULL;
-	smgr = smgropen(expected.locator, InvalidBackendId);
+	Assert(action == CLUSTER_SPACE_WAL_TRUNCATE || action == CLUSTER_SPACE_WAL_TOMBSTONE);
+	smgr = smgropen(expected->locator, InvalidBackendId);
 	if (!smgrexists(smgr, SPACE_FORKNUM) || smgrnblocks(smgr, SPACE_FORKNUM) != 2)
 		return NULL;
-	/* KO has drained peer buffers. Finish this instance's writeback and
-	 * fsync all surviving forks before binding their bytes to a new UUID.
-	 * No SPACE content lock is held during buffer traversal or SMgr reopen. */
-	FlushRelationBuffers(rel);
-	for (ForkNumber fork = MAIN_FORKNUM; fork <= SPACE_FORKNUM; fork++) {
-		if (fork == INIT_FORKNUM)
-			continue;
-		smgr = smgropen(expected.locator, InvalidBackendId);
-		if (smgrexists(smgr, fork))
-			smgrimmedsync(smgr, fork);
-	}
 	state = palloc0(sizeof(*state));
 	for (int i = 0; i < 2; i++) {
-		state->buffers[i] = ReadBufferWithoutRelcache(expected.locator, SPACE_FORKNUM, i,
+		state->buffers[i] = ReadBufferWithoutRelcache(expected->locator, SPACE_FORKNUM, i,
 			RBM_NORMAL, NULL, true);
 		LockBuffer(state->buffers[i], BUFFER_LOCK_EXCLUSIVE);
 		if (BufferIsLocal(state->buffers[i]) || BufferGetBlockNumber(state->buffers[i]) != i
@@ -736,25 +735,32 @@ cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
 		memcpy(state->result[i].data, BufferGetPage(state->buffers[i]), BLCKSZ);
 	}
 	if (!cluster_space_identity_page_decode(state->result[0].data, BLCKSZ, SPACE_FORKNUM, 0,
-			&expected, &identity->expected, &identity->before_token)
+			expected, &identity->expected, &identity->before_token)
 		|| !cluster_space_reservation_page_decode(state->result[1].data, BLCKSZ, SPACE_FORKNUM, 1,
-			&expected, &reservation->before, &reservation->before_token)
+			expected, &reservation->before, &reservation->before_token)
 		|| identity->expected.state != CLUSTER_SPACE_IDENTITY_LIVE
-		|| identity->expected.sequence == UINT64_MAX || nblocks > reservation->before.next_block)
+		|| identity->expected.sequence == UINT64_MAX
+		|| (action == CLUSTER_SPACE_WAL_TRUNCATE && nblocks > reservation->before.next_block))
 		goto refused;
-	identity->action = CLUSTER_SPACE_WAL_TRUNCATE;
+	identity->action = action;
 	identity->nblocks = nblocks;
 	identity->result = identity->expected;
 	identity->result.sequence++;
-	if (!pg_strong_random(identity->result.incarnation, sizeof(identity->result.incarnation)))
-		goto refused;
+	if (action == CLUSTER_SPACE_WAL_TRUNCATE) {
+		if (!pg_strong_random(identity->result.incarnation, sizeof(identity->result.incarnation)))
+			goto refused;
+	} else
+		identity->result.state = CLUSTER_SPACE_IDENTITY_TOMBSTONED;
 	identity->result.operation = identity->result_token = rf_page_mutation_token_next();
-	reservation->action = CLUSTER_SPACE_RESERVATION_RESET;
+	reservation->action = action == CLUSTER_SPACE_WAL_TRUNCATE
+		? CLUSTER_SPACE_RESERVATION_RESET : CLUSTER_SPACE_RESERVATION_TOMBSTONE;
 	reservation->result.identity = identity->result;
-	reservation->first_block = reservation->result.next_block = nblocks;
+	reservation->first_block = action == CLUSTER_SPACE_WAL_TRUNCATE ? nblocks : 0;
+	reservation->result.next_block = action == CLUSTER_SPACE_WAL_TRUNCATE
+		? nblocks : reservation->before.next_block;
 	reservation->result_token = identity->result_token;
 	if (!cluster_space_structure_wal_encode(&change, state->wal, sizeof(state->wal))
-		|| cluster_space_structure_apply(&change, &expected, state->result[0].data,
+		|| cluster_space_structure_apply(&change, expected, state->result[0].data,
 			state->result[1].data, BLCKSZ, &apply_mask) != CLUSTER_SPACE_IDENTITY_APPLY
 		|| apply_mask != 3)
 		goto refused;
@@ -765,8 +771,34 @@ refused:
 	return NULL;
 }
 
-XLogRecPtr
-cluster_space_truncate_log(ClusterSpaceTruncateState *state)
+ClusterSpaceTruncateState *
+cluster_space_truncate_prepare(Relation rel, BlockNumber nblocks)
+{
+	ClusterSpaceIdentityKey expected;
+	SMgrRelation smgr;
+
+	if (rel == NULL || RecoveryInProgress() || !RelationIsPermanent(rel)
+		|| !RelationNeedsWAL(rel) || nblocks == InvalidBlockNumber
+		|| !space_namespace(rel->rd_locator, false, &expected, NULL))
+		return NULL;
+	smgr = smgropen(expected.locator, InvalidBackendId);
+	if (!smgrexists(smgr, SPACE_FORKNUM) || smgrnblocks(smgr, SPACE_FORKNUM) != 2)
+		return NULL;
+	/* KO has drained peer buffers. No SPACE content lock is held while
+	 * finishing writeback/fsync of the base inherited by the new UUID. */
+	FlushRelationBuffers(rel);
+	for (ForkNumber fork = MAIN_FORKNUM; fork <= SPACE_FORKNUM; fork++) {
+		if (fork == INIT_FORKNUM)
+			continue;
+		smgr = smgropen(expected.locator, InvalidBackendId);
+		if (smgrexists(smgr, fork))
+			smgrimmedsync(smgr, fork);
+	}
+	return space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TRUNCATE, nblocks);
+}
+
+static XLogRecPtr
+space_structure_log(ClusterSpaceTruncateState *state)
 {
 	Assert(state != NULL && CritSectionCount > 0);
 	/* Mark before WAL insertion so a concurrent checkpoint cannot advance
@@ -779,14 +811,26 @@ cluster_space_truncate_log(ClusterSpaceTruncateState *state)
 	return state->lsn;
 }
 
+static void
+space_structure_publish(ClusterSpaceTruncateState *state, XLogRecPtr lsn)
+{
+	Assert(state != NULL && CritSectionCount > 0 && !XLogRecPtrIsInvalid(lsn));
+	for (int i = 0; i < 2; i++) {
+		memcpy(BufferGetPage(state->buffers[i]), state->result[i].data, BLCKSZ);
+		space_set_lsn(BufferGetPage(state->buffers[i]), lsn, state->token);
+	}
+}
+
+XLogRecPtr
+cluster_space_truncate_log(ClusterSpaceTruncateState *state)
+{
+	return space_structure_log(state);
+}
+
 void
 cluster_space_truncate_publish(ClusterSpaceTruncateState *state)
 {
-	Assert(state != NULL && CritSectionCount > 0 && !XLogRecPtrIsInvalid(state->lsn));
-	for (int i = 0; i < 2; i++) {
-		memcpy(BufferGetPage(state->buffers[i]), state->result[i].data, BLCKSZ);
-		space_set_lsn(BufferGetPage(state->buffers[i]), state->lsn, state->token);
-	}
+	space_structure_publish(state, state->lsn);
 }
 
 void
@@ -797,6 +841,226 @@ cluster_space_truncate_finish(ClusterSpaceTruncateState *state, Relation rel)
 	if (space_identity_cache != NULL)
 		space_identity_invalidate((Datum)0, RelationGetRelid(rel));
 	CacheInvalidateRelcache(rel);
+}
+
+static int
+space_locator_compare(const void *a, const void *b)
+{
+	const RelFileLocator *left = a, *right = b;
+
+	if (left->spcOid != right->spcOid)
+		return left->spcOid < right->spcOid ? -1 : 1;
+	if (left->dbOid != right->dbOid)
+		return left->dbOid < right->dbOid ? -1 : 1;
+	if (left->relNumber != right->relNumber)
+		return left->relNumber < right->relNumber ? -1 : 1;
+	return 0;
+}
+
+ClusterSpaceDropState *
+cluster_space_drop_prepare(const RelFileLocator *locators, int count)
+{
+	ClusterSpaceDropState *state;
+	RelFileLocator *sorted;
+
+	if (!cluster_shared_config || RecoveryInProgress() || count <= 0 || locators == NULL
+		|| (Size)count > (MaxAllocSize - sizeof(*state))
+			/ (sizeof(*sorted) + sizeof(*state->entries))
+		|| (Size)count > (MaxAllocSize - sizeof(uint32)) / CLUSTER_SPACE_STRUCTURE_WAL_BYTES)
+		return NULL;
+	state = palloc0(sizeof(*state) + (Size)count * sizeof(*state->entries));
+	sorted = palloc((Size)count * sizeof(*sorted));
+	memcpy(sorted, locators, (Size)count * sizeof(*sorted));
+	qsort(sorted, count, sizeof(*sorted), space_locator_compare);
+	for (int i = 0; i < count; i++) {
+		ClusterSpaceIdentityKey expected;
+		ClusterSpaceTruncateState *entry;
+
+		if ((i != 0 && RelFileLocatorEquals(sorted[i], sorted[i - 1]))
+			|| cluster_smgr_which_for(sorted[i], InvalidBackendId) != 1)
+			continue;
+		if (!space_namespace(sorted[i], false, &expected, NULL))
+			goto refused;
+		entry = space_structure_prepare(&expected, CLUSTER_SPACE_WAL_TOMBSTONE,
+			InvalidBlockNumber);
+		if (entry == NULL)
+			goto refused;
+		state->entries[state->count++] = entry;
+	}
+	if (state->count != 0) {
+		uint32 n = state->count;
+
+		state->wal_len = sizeof(n) + n * CLUSTER_SPACE_STRUCTURE_WAL_BYTES;
+		state->wal = palloc(state->wal_len);
+		memcpy(state->wal, &n, sizeof(n));
+		for (int i = 0; i < state->count; i++)
+			memcpy(state->wal + sizeof(n) + (Size)i * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+				state->entries[i]->wal, CLUSTER_SPACE_STRUCTURE_WAL_BYTES);
+	}
+	pfree(sorted);
+	return state;
+refused:
+	pfree(sorted);
+	cluster_space_drop_finish(state);
+	return NULL;
+}
+
+const char *
+cluster_space_drop_wal(const ClusterSpaceDropState *state, uint32 *len)
+{
+	*len = state == NULL ? 0 : state->wal_len;
+	return state == NULL ? NULL : state->wal;
+}
+
+void
+cluster_space_drop_mark_dirty(ClusterSpaceDropState *state)
+{
+	Assert(state != NULL && CritSectionCount > 0);
+	Assert(MyProc->delayChkptFlags & DELAY_CHKPT_START);
+	for (int i = 0; i < state->count; i++)
+		for (int j = 0; j < 2; j++)
+			MarkBufferDirty(state->entries[i]->buffers[j]);
+}
+
+void
+cluster_space_drop_publish(ClusterSpaceDropState *state, XLogRecPtr commit_lsn)
+{
+	Assert(state != NULL && CritSectionCount > 0 && !state->published);
+	Assert(MyProc->delayChkptFlags & DELAY_CHKPT_START);
+	Assert(!XLogRecPtrIsInvalid(commit_lsn) && !XLogNeedsFlush(commit_lsn));
+	for (int i = 0; i < state->count; i++) {
+		space_structure_publish(state->entries[i], commit_lsn);
+	}
+	state->published = true;
+}
+
+void
+cluster_space_drop_finish(ClusterSpaceDropState *state)
+{
+	Assert(state != NULL && CritSectionCount == 0);
+	for (int i = state->count - 1; i >= 0; i--)
+		space_truncate_release(state->entries[i]);
+	if (state->published && state->count != 0 && space_identity_cache != NULL)
+		space_identity_invalidate((Datum)0, InvalidOid);
+	if (state->wal != NULL)
+		pfree(state->wal);
+	pfree(state);
+}
+
+static ClusterSpaceTruncateState *
+space_drop_prepare_replay(const ClusterSpaceStructureChange *change,
+						  const ClusterSpaceIdentityKey *expected)
+{
+	ClusterSpaceTruncateState *entry = palloc0(sizeof(*entry));
+	ClusterSpaceIdentityTransition transition;
+	uint8 apply_mask;
+
+	for (int i = 0; i < 2; i++) {
+		entry->buffers[i] = ReadBufferWithoutRelcache(expected->locator, SPACE_FORKNUM, i,
+			RBM_NORMAL, NULL, true);
+		LockBuffer(entry->buffers[i], BUFFER_LOCK_EXCLUSIVE);
+		if (BufferIsLocal(entry->buffers[i]) || BufferGetBlockNumber(entry->buffers[i]) != i
+			|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(
+				GetBufferDescriptor(entry->buffers[i] - 1)))
+			goto refused;
+		memcpy(entry->result[i].data, BufferGetPage(entry->buffers[i]), BLCKSZ);
+	}
+	transition = cluster_space_structure_apply(change, expected,
+		entry->result[0].data, entry->result[1].data, BLCKSZ, &apply_mask);
+	if (transition != CLUSTER_SPACE_IDENTITY_APPLY && transition != CLUSTER_SPACE_IDENTITY_ALREADY)
+		goto refused;
+	entry->token = change->identity.result_token;
+	return entry;
+refused:
+	space_truncate_release(entry);
+	return NULL;
+}
+
+bool
+cluster_space_drop_replay_commit(XLogReaderState *record, TransactionId xid)
+{
+	ClusterSpaceDropState *state;
+	RelFileLocator *sorted;
+	xl_xact_parsed_commit parsed;
+	int count;
+	uint32 consumed = 0;
+
+	if (record == NULL || record->record == NULL || !RecoveryInProgress()
+		|| !TransactionIdIsNormal(xid) || XLogRecGetRmid(record) != RM_XACT_ID
+		|| (XLogRecGetInfo(record) & XLOG_XACT_OPMASK) != XLOG_XACT_COMMIT
+		|| XLogRecGetXid(record) != xid || XLogRecHasAnyBlockRefs(record)
+		|| XLogRecPtrIsInvalid(record->ReadRecPtr) || record->EndRecPtr <= record->ReadRecPtr
+		|| !ParseCommitRecord(XLogRecGetInfo(record), (xl_xact_commit *)XLogRecGetData(record),
+			XLogRecGetDataLen(record), &parsed))
+		return false;
+	count = parsed.nrels;
+	if (count == 0)
+		return parsed.nspace_drops == 0;
+	if (cluster_recmerge_apply_foreign || (Size)count > (MaxAllocSize - sizeof(*state))
+		/ (sizeof(*sorted) + sizeof(*state->entries)))
+		return false;
+	state = palloc0(sizeof(*state) + (Size)count * sizeof(*state->entries));
+	sorted = palloc((Size)count * sizeof(*sorted));
+	memcpy(sorted, parsed.xlocators, (Size)count * sizeof(*sorted));
+	qsort(sorted, count, sizeof(*sorted), space_locator_compare);
+	for (int i = 0; i < count; i++) {
+		ClusterSpaceIdentityKey expected;
+		ClusterSpaceStructureChange change;
+		ClusterSpaceTruncateState *entry;
+		SMgrRelation smgr;
+		uint16 local_thread;
+
+		if ((i != 0 && RelFileLocatorEquals(sorted[i], sorted[i - 1]))
+			|| cluster_smgr_which_for(sorted[i], InvalidBackendId) != 1)
+			continue;
+		if (!space_namespace(sorted[i], true, &expected, &local_thread) || local_thread == 0
+			|| local_thread != record->cluster_expected_thread_id
+			|| record->system_identifier != expected.system_identifier)
+			goto refused;
+		if (consumed >= parsed.nspace_drops
+			|| !cluster_space_structure_wal_decode(parsed.space_drops
+				+ (Size)consumed * CLUSTER_SPACE_STRUCTURE_WAL_BYTES,
+				CLUSTER_SPACE_STRUCTURE_WAL_BYTES, &change)
+			|| change.identity.action != CLUSTER_SPACE_WAL_TOMBSTONE
+			|| !space_identity_key_matches(&expected, &change.identity.result.key))
+			goto refused;
+		consumed++;
+		smgr = smgropen(expected.locator, InvalidBackendId);
+		if (!smgrexists(smgr, SPACE_FORKNUM)) {
+			/* Native unlink removes SPACE last. A missing identity alone
+			 * cannot authorize deletion of some other extant generation. */
+			for (ForkNumber fork = MAIN_FORKNUM; fork <= MAX_FORKNUM; fork++)
+				if (smgrexists(smgr, fork))
+					goto refused;
+			continue;
+		}
+		if (smgrnblocks(smgr, SPACE_FORKNUM) != 2)
+			goto refused;
+		entry = space_drop_prepare_replay(&change, &expected);
+		if (entry == NULL)
+			goto refused;
+		state->entries[state->count++] = entry;
+	}
+	if (consumed != parsed.nspace_drops)
+		goto refused;
+	pfree(sorted);
+	/* All targets were checked privately. Bind minRecoveryPoint to this
+	 * same local stream's COMMIT before any tombstone becomes dirty. */
+	XLogFlush(record->EndRecPtr);
+	START_CRIT_SECTION();
+	for (int i = 0; i < state->count; i++) {
+		MarkBufferDirty(state->entries[i]->buffers[0]);
+		MarkBufferDirty(state->entries[i]->buffers[1]);
+		space_structure_publish(state->entries[i], record->EndRecPtr);
+	}
+	state->published = true;
+	END_CRIT_SECTION();
+	cluster_space_drop_finish(state);
+	return true;
+refused:
+	pfree(sorted);
+	cluster_space_drop_finish(state);
+	return false;
 }
 
 static bool
@@ -876,6 +1140,9 @@ cluster_space_relation_redo(XLogReaderState *record)
 	/* Independently selected namespace, not the untrusted WAL payload. */
 	if (!cluster_space_identity_encode(&identity->result, check, sizeof(check))
 		|| !cluster_space_identity_decode(check, sizeof(check), &expected, &identity->result))
+		return false;
+	/* A standalone structural record has no transaction commit decision. */
+	if (identity->action == CLUSTER_SPACE_WAL_TOMBSTONE)
 		return false;
 	/* Foreign structural replay requires its selected per-origin durability
 	 * input, not the recovering thread's minRecoveryPoint. Keep it closed

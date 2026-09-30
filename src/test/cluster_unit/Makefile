@@ -2086,13 +2086,35 @@ test_cluster_space_recovery_route: test_cluster_space_recovery_route.c test_clus
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< $(top_builddir)/src/common/libpgcommon_srv.a \
 		$(CLUSTER_UNIT_PORT_LIBS) -o $@
 
-test_cluster_space_storage: test_cluster_space_storage.c unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
+test_cluster_space_commit.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^RecordTransactionCommit\(/ { inside=1 } \
+	     inside && /^\t\tSTART_CRIT_SECTION\(\);/ { emit=1; parts++ } \
+	     emit && /^\t\tif \(replorigin\)/ { emit=0 } \
+	     inside && /^\tif \(\(wrote_xlog && markXidCommitted &&/ { emit=1; parts++ } \
+	     emit && /^\t\/\* Compute latestXid/ { emit=0; done++ } \
+	     emit { print } /^}/ { inside=0 } END { if (parts != 2 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_commit_redo.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^xact_redo_commit\(/ { inside=1 } \
+	     inside && /^\tAssert\(TransactionIdIsValid\(xid\)\);/ { emit=1; found++ } \
+	     emit && /^\tcluster_scn_recovery_replay_observe/ { print "#endif"; emit=0; done++ } \
+	     emit { print } /^}/ { inside=0 } END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_commit_emit.inc: $(top_srcdir)/src/backend/access/transam/xact.c Makefile
+	awk '/^XactLogCommitRecord\(/ { print "XLogRecPtr"; emit=1; found++ } \
+	     emit { print } emit && /^}/ { emit=0; done++ } \
+	     END { if (found != 1 || done != 1) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
+test_cluster_space_storage: test_cluster_space_storage.c test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc unit_test.h test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o test_cluster_side_xact_xactdesc.o \
 		test_cluster_space_xlogutils_product.o \
 		test_cluster_space_storage_product.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $< \
 		test_cluster_space_storage_product.o test_cluster_space_catalog_product.o test_cluster_space_smgrdesc_product.o \
-		test_cluster_space_xlogutils_product.o $(CLUSTER_HW_O) \
+		test_cluster_space_xlogutils_product.o test_cluster_side_xact_xactdesc.o $(CLUSTER_HW_O) \
 		$(top_builddir)/src/common/libpgcommon_srv.a $(CLUSTER_UNIT_PORT_LIBS) \
 		$(R4_RUNTIME_VIS_TEST_DEAD_STRIP) -o $@
 
@@ -3759,6 +3781,7 @@ check_r11_source_removal_census:
 # Standard PG targets
 # ----------
 clean distclean maintainer-clean:
+	rm -f test_cluster_space_commit.inc test_cluster_space_commit_redo.inc test_cluster_space_commit_emit.inc
 	rm -f test_cluster_space_extend.inc
 	rm -f test_cluster_undo_producer_owner.inc test_cluster_undo_block_native.inc
 	rm -f test_cluster_undo_lifecycle_native.inc test_cluster_undo_header_identity.inc

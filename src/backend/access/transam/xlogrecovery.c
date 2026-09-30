@@ -4165,9 +4165,8 @@ recoveryStopsBefore(XLogReaderState *record)
 		xl_xact_parsed_commit parsed;
 
 		isCommit = true;
-		ParseCommitRecord(XLogRecGetInfo(record),
-						  xlrec,
-						  &parsed);
+		if (!ParseCommitRecord(XLogRecGetInfo(record), xlrec, XLogRecGetDataLen(record), &parsed))
+			elog(PANIC, "recovery: invalid prepared commit payload");
 		recordXid = parsed.twophase_xid;
 	}
 	else if (xact_info == XLOG_XACT_ABORT)
@@ -4338,9 +4337,8 @@ recoveryStopsAfter(XLogReaderState *record)
 			xl_xact_commit *xlrec = (xl_xact_commit *) XLogRecGetData(record);
 			xl_xact_parsed_commit parsed;
 
-			ParseCommitRecord(XLogRecGetInfo(record),
-							  xlrec,
-							  &parsed);
+			if (!ParseCommitRecord(XLogRecGetInfo(record), xlrec, XLogRecGetDataLen(record), &parsed))
+				elog(PANIC, "recovery: invalid prepared commit payload");
 			recordXid = parsed.twophase_xid;
 		}
 		else if (xact_info == XLOG_XACT_ABORT_PREPARED)
