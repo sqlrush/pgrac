@@ -20,6 +20,7 @@
 #include "cluster/cluster_guc.h"
 #include "cluster/cluster_gcs_block.h"
 #include "cluster/cluster_page_producer.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_space_storage.h"
 #include "cluster/cluster_wal_thread.h"
 #include "cluster/storage/cluster_smgr.h"
@@ -282,7 +283,7 @@ cluster_space_hint_begin(Buffer buffer, RfPageProducerBatchV1 *batch)
 		|| RecoveryInProgress() || CritSectionCount != 0
 		|| !LWLockHeldByMeInMode(BufferDescriptorGetContentLock(GetBufferDescriptor(buffer - 1)),
 							   LW_EXCLUSIVE)
-		|| !cluster_bufmgr_block_write_permitted(buffer)
+		|| !cluster_bufmgr_pcm_x_content_holder_write_permitted(GetBufferDescriptor(buffer - 1))
 		|| space_identity_cache == NULL
 		|| !space_namespace(locator, false, &expected, NULL))
 		return CLUSTER_SPACE_HINT_SKIPPED;

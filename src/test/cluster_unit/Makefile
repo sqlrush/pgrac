@@ -1945,6 +1945,11 @@ test_cluster_space_hint_owners.inc: $(top_srcdir)/src/backend/access/heap/heapam
 	     emit { print } /^}/ { emit=0 } END { if (found != 3) exit 1 }' $< > $@.tmp
 	mv $@.tmp $@
 
+test_cluster_space_hint_write_gate.inc: $(top_srcdir)/src/backend/storage/buffer/bufmgr.c Makefile
+	awk '/^cluster_bufmgr_(pcm_x_content_holder_write_permitted|block_write_permitted)\(/ { print "bool"; emit=1; found++ } \
+	     emit { print } /^}/ { emit=0 } END { if (found != 2) exit 1 }' $< > $@.tmp
+	mv $@.tmp $@
+
 test_cluster_space_xmax_hint.inc: $(top_srcdir)/src/backend/access/heap/heapam.c Makefile
 	awk '/^UpdateXmaxHintBits\(/ { print "static void"; emit=1; found++ } \
 	     emit { print } /^}/ { emit=0 } END { if (found != 1) exit 1 }' $< > $@.tmp
@@ -1980,6 +1985,7 @@ test_cluster_space_fsm_product.o: $(top_srcdir)/src/backend/storage/freespace/fs
 	$(CC) $(CFLAGS) $(CPPFLAGS) -ffunction-sections -fdata-sections -c $< -o $@
 
 test_cluster_space_cache: test_cluster_space_cache.c unit_test.h test_cluster_space_hint_owners.inc \
+		test_cluster_space_hint_write_gate.inc $(top_srcdir)/src/include/cluster/cluster_pcm_x_bufmgr.h \
 		test_cluster_space_xmax_hint.inc \
 		test_cluster_space_fsm_hint.inc \
 		test_cluster_space_fsm_truncate.inc test_cluster_space_fsm_product.o \

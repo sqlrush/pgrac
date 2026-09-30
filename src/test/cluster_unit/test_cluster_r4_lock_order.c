@@ -757,6 +757,12 @@ cluster_bufmgr_block_write_permitted(Buffer buffer)
 }
 
 bool
+cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf)
+{
+	return cluster_bufmgr_block_write_permitted(BufferDescriptorGetBuffer(buf));
+}
+
+bool
 TransactionIdIsCurrentTransactionId(TransactionId xid)
 {
 	return xid == GetTopTransactionId();

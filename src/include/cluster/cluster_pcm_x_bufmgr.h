@@ -829,6 +829,9 @@ extern ClusterPcmOwnResult cluster_bufmgr_pcm_own_direct_init_snapshot_by_tag_ex
  * source REVOKING lifecycle or retained PI+VALID descriptor is not. */
 extern bool cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf);
 extern bool cluster_bufmgr_pcm_x_ordinary_content_write_permitted(BufferDesc *buf);
+/* Caller continuously holds content X.  Shares MarkBufferDirty's exact
+ * activation/retention gate, including an already-admitted revoke predecessor. */
+extern bool cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf);
 extern void cluster_bufmgr_pcm_own_republish_grant_pending_image(BufferDesc *buf);
 /* Called only after the requester has proved the exact remote master's S->N
  * RELEASE application ACK.  Atomically normalizes the matching descriptor

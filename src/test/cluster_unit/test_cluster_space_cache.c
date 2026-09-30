@@ -25,6 +25,7 @@
 #include "cluster/cluster_itl_cleanout.h"
 #include "cluster/cluster_itl.h"
 #include "cluster/cluster_pcm_own.h"
+#include "cluster/cluster_pcm_x_bufmgr.h"
 #include "cluster/cluster_semantic_activation.h"
 #include "cluster/cluster_tx_resolve.h"
 #include "cluster/cluster_xid_stripe.h"
@@ -75,6 +76,8 @@ volatile uint32 CritSectionCount;
 bool cluster_recmerge_window_active, cluster_recmerge_apply_foreign;
 uint64 cluster_recmerge_window_scn, cluster_recmerge_window_own_lsn;
 static bool content_x, writer_allowed = true, commit_pending, foreign_xid;
+static uint32 hint_own_flags;
+static uint64 hint_writer_token, hint_activation_generation;
 static bool xmax_committed;
 static unsigned hint_calls, dirty_calls, wal_calls, version_edges;
 static uint64 next_token;
@@ -107,12 +110,31 @@ cluster_xid_foreign_class_cheap(TransactionId xid)
 {
 	return foreign_xid;
 }
-bool
-cluster_bufmgr_block_write_permitted(Buffer buffer)
+uint32
+LockBufHdr(BufferDesc *desc)
 {
-	UT_ASSERT_EQ(buffer, 1);
-	return writer_allowed && (!cluster_shared_config || content_x);
+	uint32 state = pg_atomic_read_u32(&desc->state);
+	UT_ASSERT(desc == GetBufferDescriptor(0));
+	UT_ASSERT(!(state & BM_LOCKED));
+	pg_atomic_write_u32(&desc->state, state | BM_LOCKED);
+	return state;
 }
+/* Runtime authority is the fixture boundary. Both production samplers and
+ * their shared mutation predicate execute unchanged. */
+bool cluster_read_scache;
+#define cluster_pcm_is_active() true
+#define cluster_bufmgr_should_pcm_track(buf) true
+#define cluster_bufmgr_pcm_x_retained_image_locked(buf, state) (!writer_allowed)
+#define cluster_pcm_own_flags_get(id) hint_own_flags
+#define cluster_pcm_own_writer_activation_token_get(id) hint_writer_token
+#define cluster_pcm_own_resource_x_activation_generation_get(id) hint_activation_generation
+#include "test_cluster_space_hint_write_gate.inc"
+#undef cluster_pcm_is_active
+#undef cluster_bufmgr_should_pcm_track
+#undef cluster_bufmgr_pcm_x_retained_image_locked
+#undef cluster_pcm_own_flags_get
+#undef cluster_pcm_own_writer_activation_token_get
+#undef cluster_pcm_own_resource_x_activation_generation_get
 bool
 BufferIsPermanent(Buffer buffer)
 {
@@ -787,6 +809,9 @@ hint_setup(bool cache)
 	hint_calls = dirty_calls = wal_calls = version_edges = 0;
 	next_token = 100;
 	content_x = writer_allowed = true;
+	hint_descriptor[0].bufferdesc.pcm_state = PCM_STATE_X;
+	hint_own_flags = 0;
+	hint_writer_token = hint_activation_generation = 0;
 	commit_pending = foreign_xid = false;
 	xmax_committed = false;
 	CritSectionCount = 0;
@@ -855,6 +880,38 @@ UT_TEST(test_hint_refusal_has_no_io_or_mutation)
 		UT_ASSERT_EQ(next_token, 100);
 		CritSectionCount = 0;
 	}
+}
+UT_TEST(test_hint_rejects_dirty_gate_difference_before_critical_section)
+{
+	for (int bad = 0; bad < 5; bad++) {
+		HeapTupleHeader tuple = hint_setup(true);
+		BufferDesc *desc = GetBufferDescriptor(0);
+
+		switch (bad) {
+		case 0: desc->pcm_state = PCM_STATE_N; break;
+		case 1: desc->pcm_state = PCM_STATE_S; break;
+		case 2: hint_writer_token = 1; break;
+		case 3: hint_activation_generation = 1; break;
+		case 4: hint_own_flags = PCM_OWN_FLAG_GRANT_PENDING; break;
+		}
+		UT_ASSERT(cluster_bufmgr_block_write_permitted(1));
+		UT_ASSERT(!cluster_pcm_x_content_holder_mutation_allowed(
+			true, true, false, desc->pcm_state, hint_own_flags,
+			hint_writer_token, hint_activation_generation));
+		SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
+		UT_ASSERT(memcmp(hint_before.data, page.data, BLCKSZ) == 0);
+		UT_ASSERT_EQ(hint_calls + dirty_calls + wal_calls + version_edges, 0);
+		UT_ASSERT_EQ(next_token, 100);
+		UT_ASSERT_EQ(CritSectionCount, 0);
+	}
+}
+UT_TEST(test_hint_existing_content_holder_can_finish_revoking_x)
+{
+	HeapTupleHeader tuple = hint_setup(true);
+	hint_own_flags = PCM_OWN_FLAG_REVOKING;
+	SetHintBits(tuple, 1, HEAP_XMIN_COMMITTED, InvalidTransactionId);
+	check_hint_version();
+	UT_ASSERT(HeapTupleHeaderXminCommitted(tuple));
 }
 UT_TEST(test_released_xmax_is_not_skipped_with_shared_identity)
 {
@@ -1051,7 +1108,7 @@ UT_TEST(test_fsm_truncate_fpi_keeps_rebuildable_class)
 int
 main(void)
 {
-	UT_PLAN(21);
+	UT_PLAN(23);
 	UT_RUN(test_insert_allocation_and_delete_share_one_identity_read);
 	UT_RUN(test_targeted_invalidation_reloads_new_incarnation);
 	UT_RUN(test_unrelated_invalidation_preserves_hit_global_reset_drops_it);
@@ -1064,6 +1121,8 @@ main(void)
 	UT_RUN(test_hint_share_lock_never_changes_shared_page);
 	UT_RUN(test_hint_exclusive_cached_identity_versions_before_store);
 	UT_RUN(test_hint_refusal_has_no_io_or_mutation);
+	UT_RUN(test_hint_rejects_dirty_gate_difference_before_critical_section);
+	UT_RUN(test_hint_existing_content_holder_can_finish_revoking_x);
 	UT_RUN(test_released_xmax_is_not_skipped_with_shared_identity);
 	UT_RUN(test_hint_native_and_commit_interlock_remain);
 	UT_RUN(test_required_xmax_missing_identity_refuses_before_store);

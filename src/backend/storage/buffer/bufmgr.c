@@ -1093,6 +1093,25 @@ cluster_bufmgr_pcm_x_content_write_permitted(BufferDesc *buf)
 }
 
 bool
+cluster_bufmgr_pcm_x_content_holder_write_permitted(BufferDesc *buf)
+{
+	bool permitted;
+	uint32 buf_state;
+
+	if (buf == NULL)
+		return false;
+	buf_state = LockBufHdr(buf);
+	permitted = cluster_pcm_x_content_holder_mutation_allowed(
+		cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(buf),
+		cluster_bufmgr_pcm_x_retained_image_locked(buf, buf_state), buf->pcm_state,
+		cluster_pcm_own_flags_get(buf->buf_id),
+		cluster_pcm_own_writer_activation_token_get(buf->buf_id),
+		cluster_pcm_own_resource_x_activation_generation_get(buf->buf_id));
+	UnlockBufHdr(buf, buf_state);
+	return permitted;
+}
+
+bool
 cluster_bufmgr_pcm_x_ordinary_content_write_permitted(BufferDesc *buf)
 {
 	bool permitted;
@@ -7494,15 +7513,8 @@ MarkBufferDirty(Buffer buffer)
 	 * opened both activation fences; retained and non-X tracked images remain
 	 * non-writable as before.
 	 */
-	buf_state = LockBufHdr(bufHdr);
-	if (!cluster_pcm_x_content_holder_mutation_allowed(
-			cluster_pcm_is_active(), cluster_bufmgr_should_pcm_track(bufHdr),
-			cluster_bufmgr_pcm_x_retained_image_locked(bufHdr, buf_state),
-			bufHdr->pcm_state, cluster_pcm_own_flags_get(bufHdr->buf_id),
-			cluster_pcm_own_writer_activation_token_get(bufHdr->buf_id),
-			cluster_pcm_own_resource_x_activation_generation_get(bufHdr->buf_id)))
+	if (!cluster_bufmgr_pcm_x_content_holder_write_permitted(bufHdr))
 	{
-		UnlockBufHdr(bufHdr, buf_state);
 		ereport(ERROR, (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 						errmsg("cannot dirty a fenced cluster PCM image"),
 						errdetail("PGRAC_FAMILY=RESOURCE_X PGRAC_REASON=CALLER_CAUSE_UNPROVEN "
@@ -7510,7 +7522,6 @@ MarkBufferDirty(Buffer buffer)
 								  "buffer=%d",
 								  cluster_node_id, bufHdr->buf_id)));
 	}
-	UnlockBufHdr(bufHdr, buf_state);
 #endif
 
 	old_buf_state = pg_atomic_read_u32(&bufHdr->state);
